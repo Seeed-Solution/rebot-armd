@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+mkdir -p /userdata/local/apps
+cp -f /usr/share/rebot-teleop/rebot-teleop.json /userdata/local/apps/rebot-teleop.json
+cp -f /usr/share/rebot-teleop/rebot-teleop.zh.md /userdata/local/apps/rebot-teleop.zh.md 2>/dev/null || true
+cp -f /usr/share/rebot-teleop/rebot-teleop.md /userdata/local/apps/rebot-teleop.md 2>/dev/null || true
+
+mkdir -p /userdata/datasets
+
+# 修正安装文件所有权为 root
+chown -R root:root /etc/init.d/K92rebot-teleop /usr/local/bin/armd /userdata/local/apps/ 2>/dev/null || true
+
+# 刷新 overlayfs 缓存，确保 supervisor 立即感知到 /etc/init.d/K92rebot-teleop
+sync
+echo 2 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+exit 0

@@ -1,0 +1,29 @@
+# Rust compilation artifacts
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Debian packages and packaging build staging
+*.deb
+*.deb.part
+/dist
+/packaging/rebot-teleop/pkg_staging
+
+# Datasets and runtime telemetry
+/data
+*.parquet
+/userdata
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Editor, OS and temporary files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

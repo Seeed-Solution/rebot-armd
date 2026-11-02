@@ -1,0 +1,227 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          rebot-teleop
+# Required-Start:    $network $local_fs
+# Required-Stop:     $network $local_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: reBot Teleop and Robotic Arm Daemon for reCamera
+### END INIT INFO
+
+NAME=rebot-teleop
+DAEMON=/usr/local/bin/armd
+PIDFILE=/var/run/$NAME.pid
+LOGFILE=/var/log/$NAME.log
+
+# 默认配置参数
+FOLLOWER_MODEL="so-arm101"
+FOLLOWER_PORT="/dev/ttyS1"
+PORT="8765"
+AP_SSID="reCamera-Arm-Teleop"
+AP_PASS="12345678"
+AP_IP="192.168.16.1"
+STA_SSID=""
+STA_PASS=""
+
+# 读取 supervisor 或系统覆盖配置
+CONFIG_JSON="/userdata/local/apps/$NAME.config.json"
+if [ -f "$CONFIG_JSON" ] && which python3 >/dev/null 2>&1; then
+    eval $(python3 -c "
+import json
+try:
+    with open('$CONFIG_JSON') as f:
+        cfg = json.load(f)
+    arm = cfg.get('arm', {})
+    net = cfg.get('network', {})
+    if 'follower_model' in arm and arm['follower_model']: print(f\"FOLLOWER_MODEL='{arm['follower_model']}'\")
+    if 'serial_port' in arm and arm['serial_port']: print(f\"FOLLOWER_PORT='{arm['serial_port']}'\")
+    if 'port' in cfg and cfg['port']: print(f\"PORT='{cfg['port']}'\")
+    if 'ap_ssid' in net and net['ap_ssid']: print(f\"AP_SSID='{net['ap_ssid']}'\")
+    if 'ap_password' in net and net['ap_password']: print(f\"AP_PASS='{net['ap_password']}'\")
+    if 'ap_ip' in net and net['ap_ip']: print(f\"AP_IP='{net['ap_ip']}'\")
+    if 'sta_ssid' in net: print(f\"STA_SSID='{net['sta_ssid']}'\")
+    if 'sta_password' in net: print(f\"STA_PASS='{net['sta_password']}'\")
+except Exception:
+    pass
+" 2>/dev/null)
+fi
+
+start_wifi() {
+    # 1. 启动 STA 外部 WiFi（如果配置了 sta_ssid）
+    if [ -n "$STA_SSID" ]; then
+        echo "[rebot-teleop] Connecting to external Wi-Fi: $STA_SSID..."
+        if ! pidof wpa_supplicant >/dev/null 2>&1; then
+            wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.conf >/dev/null 2>&1 || true
+            sleep 1
+        fi
+        NID=$(wpa_cli -i wlan0 add_network 2>/dev/null | tail -n 1)
+        if [ -n "$NID" ] && [ "$NID" -ge 0 ] 2>/dev/null; then
+            wpa_cli -i wlan0 set_network "$NID" ssid "\"$STA_SSID\"" >/dev/null 2>&1 || true
+            if [ -n "$STA_PASS" ]; then
+                wpa_cli -i wlan0 set_network "$NID" psk "\"$STA_PASS\"" >/dev/null 2>&1 || true
+            else
+                wpa_cli -i wlan0 set_network "$NID" key_mgmt NONE >/dev/null 2>&1 || true
+            fi
+            wpa_cli -i wlan0 enable_network "$NID" >/dev/null 2>&1 || true
+            wpa_cli -i wlan0 select_network "$NID" >/dev/null 2>&1 || true
+        fi
+    fi
+
+    # 2. 确保虚拟网卡 wlan1 存在
+    if [ -z "$(ifconfig wlan1 2>/dev/null)" ] && [ -n "$(ifconfig wlan0 2>/dev/null)" ]; then
+        iw dev wlan0 interface add wlan1 type __ap 2>/dev/null || true
+    fi
+
+    # 3. 启动 AP 热点（绑定在 wlan1 上）
+    if ! pidof hostapd >/dev/null 2>&1; then
+        echo "[rebot-teleop] Starting Wi-Fi AP Hotspot (SSID: $AP_SSID on wlan1)..."
+        AP_CONF="/var/run/hostapd_arm.conf"
+        cat <<EOF > "$AP_CONF"
+interface=wlan1
+driver=nl80211
+ssid=$AP_SSID
+hw_mode=g
+channel=6
+ieee80211n=1
+wmm_enabled=1
+macaddr_acl=0
+auth_algs=1
+wpa=2
+wpa_passphrase=$AP_PASS
+wpa_key_mgmt=WPA-PSK
+wpa_pairwise=CCMP
+rsn_pairwise=CCMP
+EOF
+
+        # hostapd 参数 -B 必须置于配置文件路径之前
+        hostapd -B "$AP_CONF" >/dev/null 2>&1 || true
+        sleep 1
+        ifconfig wlan1 "$AP_IP" netmask 255.255.255.0 up 2>/dev/null || true
+
+        # 重启 dnsmasq 以使 wlan1 的 DHCP 分配生效
+        if [ -f /etc/init.d/S80dnsmasq ]; then
+            /etc/init.d/S80dnsmasq restart >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+start() {
+    echo "Starting $NAME..."
+    if [ -f $PIDFILE ]; then
+        PID=$(cat $PIDFILE 2>/dev/null)
+        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+            echo "$NAME is already running (PID: $PID)"
+            return 1
+        fi
+        rm -f $PIDFILE
+    fi
+
+    # 启动 WiFi (STA 外部连接 + AP 热点双并发)
+    start_wifi
+
+    # 探测实际串口设备
+    if [ ! -e "$FOLLOWER_PORT" ]; then
+        if [ -e "/dev/ttyUSB0" ]; then
+            FOLLOWER_PORT="/dev/ttyUSB0"
+        elif [ -e "/dev/ttyACM0" ]; then
+            FOLLOWER_PORT="/dev/ttyACM0"
+        fi
+    fi
+
+    DAEMON_OPTS="--follower $FOLLOWER_MODEL --follower-port $FOLLOWER_PORT --port $PORT"
+
+    start-stop-daemon -S -b -m -p $PIDFILE -a /bin/sh -- -c "exec $DAEMON $DAEMON_OPTS >> $LOGFILE 2>&1"
+    if [ $? -ne 0 ]; then
+        echo "$NAME failed to start (start-stop-daemon error)"
+        rm -f $PIDFILE
+        return 1
+    fi
+
+    # 稳定性验证
+    sleep 1
+    i=0
+    while [ $i -lt 3 ]; do
+        PID=$(cat $PIDFILE 2>/dev/null)
+        if [ -z "$PID" ] || [ ! -d "/proc/$PID" ]; then
+            echo "$NAME exited immediately after start"
+            rm -f $PIDFILE
+            return 1
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+
+    echo "OK"
+    return 0
+}
+
+stop() {
+    echo "Stopping $NAME..."
+    if [ ! -f $PIDFILE ]; then
+        killall -q armd 2>/dev/null || true
+        echo "$NAME is not running"
+        return 0
+    fi
+
+    PID=$(cat $PIDFILE 2>/dev/null)
+    if [ -z "$PID" ]; then
+        rm -f $PIDFILE
+        killall -q armd 2>/dev/null || true
+        echo "$NAME is not running"
+        return 0
+    fi
+
+    # 优雅 SIGTERM，等待最多 8 秒让 armd 卸载电机与闭环下电
+    start-stop-daemon -K -p $PIDFILE -s TERM 2>/dev/null || true
+    i=0
+    while [ $i -lt 16 ]; do
+        if [ ! -d "/proc/$PID" ]; then
+            rm -f $PIDFILE
+            echo "OK"
+            return 0
+        fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+
+    # 强制杀死
+    kill -KILL "$PID" 2>/dev/null || true
+    j=0
+    while [ $j -lt 6 ]; do
+        if [ ! -d "/proc/$PID" ]; then
+            rm -f $PIDFILE
+            echo "OK"
+            return 0
+        fi
+        sleep 0.5
+        j=$((j + 1))
+    done
+
+    killall -9 -q armd 2>/dev/null || true
+    rm -f $PIDFILE
+    echo "OK"
+    return 0
+}
+
+status() {
+    if [ -f $PIDFILE ]; then
+        PID=$(cat $PIDFILE 2>/dev/null)
+        if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+            echo "$NAME is running (PID: $PID)"
+            return 0
+        fi
+        rm -f $PIDFILE
+    fi
+    echo "$NAME is not running"
+    return 1
+}
+
+case "$1" in
+    start) start; exit $? ;;
+    stop) stop; exit $? ;;
+    restart) stop; sleep 2; start; exit $? ;;
+    status) status; exit $? ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
+
+exit 0

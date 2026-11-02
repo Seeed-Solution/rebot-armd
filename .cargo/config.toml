@@ -1,0 +1,8 @@
+[target.riscv64gc-unknown-linux-musl]
+rustflags = [
+    "-C", "linker=rust-lld",
+    "-C", "target-feature=+crt-static",
+    "-L", "${RECAMERA_TOOLCHAIN}/lib/gcc/riscv64-unknown-linux-musl/10.2.0/lib64v0p7_xthead/lp64d",
+    "-L", "${RECAMERA_TOOLCHAIN}/sysroot/lib64v0p7_xthead/lp64d",
+    "-L", "${RECAMERA_TOOLCHAIN}/sysroot/usr/lib64v0p7_xthead/lp64d",
+]

@@ -1,0 +1,36 @@
+[package]
+name = "armd"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal robotic arm daemon with LeRobot parquet recording and real-time safety control"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws", "json", "http1"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+futures-util = "0.3"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+arrow = { version = "60", default-features = false }
+parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tempfile = "3"
+serialport = { version = "4", default-features = false }
+
+[dev-dependencies]
+tokio-tungstenite = "0.29"
+reqwest = { version = "0.12", features = ["json"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = "z"
+strip = true
+panic = "abort"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socketcan = { version = "4", default-features = false }

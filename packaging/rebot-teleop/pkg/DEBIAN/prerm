@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+if [ -x /etc/init.d/K92rebot-teleop ]; then
+    /etc/init.d/K92rebot-teleop stop || true
+fi
+
+rm -f /userdata/local/apps/rebot-teleop.json
+rm -f /userdata/local/apps/rebot-teleop.zh.md
+rm -f /userdata/local/apps/rebot-teleop.md
+
+sync
+echo 2 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+exit 0

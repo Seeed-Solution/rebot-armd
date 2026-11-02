@@ -1,0 +1,1216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#070d18">
+<title>reBot Teleop · 机械臂遥控</title>
+<style>
+/* ---------------------------------------------------------------
+   reBot Teleop — offline single-file UI (no external resources)
+   --------------------------------------------------------------- */
+:root {
+  --bg0: #070d18;
+  --bg1: #0c1526;
+  --bg2: #111d33;
+  --bg3: #18263f;
+  --line: rgba(56, 189, 248, 0.14);
+  --line-strong: rgba(56, 189, 248, 0.35);
+  --accent: #38bdf8;
+  --accent-dim: rgba(56, 189, 248, 0.16);
+  --ok: #22c55e;
+  --ok-dim: rgba(34, 197, 94, 0.16);
+  --warn: #f59e0b;
+  --warn-dim: rgba(245, 158, 11, 0.16);
+  --danger: #ef4444;
+  --danger-dim: rgba(239, 68, 68, 0.18);
+  --text: #e6edf7;
+  --text2: #8fa3bf;
+  --text3: #5b6e8a;
+  --r: 12px;
+  --r-sm: 8px;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Roboto Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  --stick: 132px;
+  --knob: 52px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+html, body {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: var(--bg0);
+}
+body {
+  position: fixed; inset: 0;
+  color: var(--text);
+  font: 14px/1.35 var(--sans);
+  -webkit-user-select: none; user-select: none;
+  -webkit-touch-callout: none;
+  background:
+    radial-gradient(1200px 600px at 20% -10%, rgba(56,189,248,0.08), transparent 60%),
+    linear-gradient(rgba(56,189,248,0.035) 1px, transparent 1px) 0 0 / 28px 28px,
+    linear-gradient(90deg, rgba(56,189,248,0.035) 1px, transparent 1px) 0 0 / 28px 28px,
+    var(--bg0);
+}
+button { font: inherit; color: inherit; border: 0; background: none; cursor: pointer; }
+input { font: inherit; color: inherit; -webkit-user-select: text; user-select: text; }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+/* ---------- app grid (mobile portrait is the base layout) ---------- */
+.app {
+  height: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
+  grid-template-areas: "head" "stage" "joints" "safe" "ctrl";
+  gap: 8px;
+  padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+}
+.card {
+  background: linear-gradient(180deg, rgba(17,29,51,0.92), rgba(12,21,38,0.92));
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  box-shadow: 0 1px 0 rgba(255,255,255,0.03) inset, 0 8px 24px rgba(0,0,0,0.25);
+}
+.card-title {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--text2); padding: 10px 12px 6px;
+}
+.card-title b { color: var(--accent); font-weight: 600; }
+
+/* ---------- header ---------- */
+header {
+  grid-area: head;
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px; min-height: 44px;
+}
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 700; letter-spacing: .02em; white-space: nowrap; }
+.brand svg { width: 22px; height: 22px; }
+.brand small { color: var(--text3); font-weight: 500; font-size: 11px; }
+.head-stats { display: flex; align-items: center; gap: 10px; margin-left: auto; font-size: 12px; color: var(--text2); white-space: nowrap; }
+.link { display: flex; align-items: center; gap: 6px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text3); box-shadow: 0 0 0 3px rgba(91,110,138,0.2); }
+.dot.ok { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-dim), 0 0 10px var(--ok); animation: pulse 1.6s infinite; }
+.dot.bad { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-dim); }
+@keyframes pulse { 50% { box-shadow: 0 0 0 5px rgba(34,197,94,0.05), 0 0 4px var(--ok); } }
+.badge {
+  padding: 3px 9px; border-radius: 999px; font: 600 11px var(--mono); letter-spacing: .06em;
+  border: 1px solid currentColor; background: rgba(143,163,191,0.1); color: var(--text2); white-space: nowrap;
+}
+.badge.s-armed { color: var(--ok); background: var(--ok-dim); }
+.badge.s-moving { color: var(--accent); background: var(--accent-dim); }
+.badge.s-estop, .badge.s-fault { color: var(--danger); background: var(--danger-dim); animation: blink 1s steps(2) infinite; }
+@keyframes blink { 50% { opacity: .55; } }
+.icon-btn {
+  width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center;
+  border: 1px solid var(--line); background: var(--bg2); color: var(--text2);
+}
+.icon-btn:active { transform: scale(.94); }
+.icon-btn svg { width: 18px; height: 18px; }
+
+/* ---------- stage: video + arm view ---------- */
+.stage { grid-area: stage; position: relative; display: grid; gap: 8px; min-height: 0; }
+.video {
+  position: relative; overflow: hidden; border-radius: var(--r);
+  background: #000; border: 1px solid var(--line);
+  aspect-ratio: 16 / 9; max-height: 42vh; width: 100%; margin: 0 auto;
+}
+.video img, .video canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+.video .hud {
+  position: absolute; left: 8px; top: 8px; display: flex; gap: 6px; flex-wrap: wrap; pointer-events: none;
+}
+.chip {
+  font: 600 10px var(--mono); letter-spacing: .05em; padding: 3px 7px; border-radius: 6px;
+  background: rgba(7,13,24,0.72); border: 1px solid var(--line); color: var(--accent);
+}
+.chip.rec { color: var(--danger); border-color: rgba(239,68,68,0.5); display: none; }
+.chip.rec::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--danger); margin-right: 5px; animation: blink 1s steps(2) infinite; }
+body.recording .chip.rec { display: inline-block; }
+.armview { position: relative; overflow: hidden; border-radius: var(--r); }
+.armview canvas { display: block; width: 100%; height: 100%; }
+.armview .tag { position: absolute; left: 10px; top: 8px; font-size: 10px; letter-spacing: .12em; color: var(--text2); text-transform: uppercase; pointer-events: none; }
+/* mobile: arm view as picture-in-picture over the video */
+.stage .armview {
+  position: absolute; right: 8px; bottom: 8px; width: 38%; max-width: 220px; aspect-ratio: 4 / 3;
+  background: rgba(7,13,24,0.72); border: 1px solid var(--line-strong);
+  backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+}
+.stage .armview .tag { display: none; }
+.banner {
+  position: absolute; inset: 0; display: none; place-items: center; z-index: 3;
+  background: rgba(7,13,24,0.55); color: var(--danger); font: 700 13px var(--mono); letter-spacing: .14em; pointer-events: none;
+}
+body.offline .banner { display: grid; }
+
+/* ---------- joints ---------- */
+.joints { grid-area: joints; }
+.joints .card-title { display: none; }
+.jgrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; padding: 8px; }
+.jcard {
+  position: relative; background: rgba(7,13,24,0.55); border: 1px solid var(--line);
+  border-radius: var(--r-sm); padding: 6px 8px 8px; min-width: 0;
+  transition: border-color .2s, box-shadow .2s;
+}
+.jcard.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset, 0 0 16px rgba(56,189,248,0.18); }
+.jcard.near { border-color: var(--warn); }
+.jhead { display: flex; justify-content: space-between; align-items: baseline; gap: 4px; }
+.jname { font-size: 10px; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.jname b { color: var(--text); font-weight: 600; margin-right: 3px; }
+.jvel { font-size: 9px; color: var(--text3); }
+.jval { font: 600 17px var(--mono); font-variant-numeric: tabular-nums; color: var(--accent); margin: 2px 0 4px; }
+.jval small { font-size: 11px; color: var(--text2); }
+.jbar { position: relative; height: 4px; border-radius: 2px; background: rgba(143,163,191,0.15); }
+.jbar i { position: absolute; top: -3px; width: 3px; height: 10px; border-radius: 2px; background: var(--accent); box-shadow: 0 0 6px var(--accent); transform: translateX(-50%); }
+.jbar::after { content: ""; position: absolute; left: 50%; top: -2px; width: 1px; height: 8px; background: var(--text3); }
+.jcard.near .jbar i { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+.jstep { display: none; }
+
+/* ---------- safety / actions ---------- */
+.safe { grid-area: safe; display: grid; grid-template-columns: 1.1fr 1.4fr .8fr .8fr; gap: 8px; }
+.btn {
+  position: relative; overflow: hidden; border-radius: var(--r);
+  min-height: 52px; padding: 6px 10px; font-weight: 700; letter-spacing: .04em;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px;
+  border: 1px solid var(--line); background: var(--bg2); color: var(--text);
+  transition: transform .12s, background .2s, border-color .2s, box-shadow .2s, opacity .2s;
+}
+.btn small { font-weight: 500; font-size: 10px; color: var(--text2); letter-spacing: .02em; }
+.btn:active { transform: scale(.96); }
+.btn:disabled { opacity: .4; pointer-events: none; }
+.btn-estop {
+  background: radial-gradient(120% 140% at 50% 0%, #f87171, #dc2626 55%, #991b1b);
+  border-color: #fca5a5; color: #fff; font-size: 17px; letter-spacing: .1em;
+  box-shadow: 0 0 0 3px rgba(239,68,68,0.25), 0 6px 22px rgba(239,68,68,0.35), 0 1px 0 rgba(255,255,255,0.35) inset;
+}
+.btn-estop small { color: rgba(255,255,255,0.8); }
+.btn-estop:active { transform: scale(.94); box-shadow: 0 0 0 6px rgba(239,68,68,0.35); }
+.btn-enable { border-color: rgba(34,197,94,0.45); color: var(--ok); }
+.btn-enable .fill { position: absolute; inset: 0; background: var(--ok-dim); transform-origin: left; transform: scaleX(0); }
+.btn-enable.holding .fill { transform: scaleX(1); transition: transform .6s linear; }
+.btn-enable > span, .btn-enable > small { position: relative; }
+.btn-enable.on { background: var(--ok-dim); color: #bbf7d0; box-shadow: 0 0 18px rgba(34,197,94,0.25); }
+.btn-enable.clear { border-color: rgba(245,158,11,0.6); color: var(--warn); background: var(--warn-dim); }
+.btn-ghost { color: var(--accent); border-color: var(--line-strong); }
+.home-spd { display: contents; }
+
+/* ---------- controls ---------- */
+.ctrl {
+  grid-area: ctrl; min-height: 0; touch-action: none;
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 8px 10px;
+}
+.stick-wrap { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.stick-label { font-size: 10px; color: var(--text2); letter-spacing: .04em; white-space: nowrap; }
+.stick-label b { color: var(--accent); font-weight: 600; }
+.pad { position: relative; touch-action: none; cursor: grab; }
+.pad.xy {
+  width: var(--stick); height: var(--stick); border-radius: 50%;
+  background:
+    radial-gradient(circle, transparent 38%, rgba(56,189,248,0.06) 39%, transparent 40%),
+    radial-gradient(circle, transparent 68%, rgba(56,189,248,0.10) 69%, transparent 70%),
+    radial-gradient(circle at 50% 40%, var(--bg3), var(--bg1));
+  border: 1px solid var(--line-strong);
+  box-shadow: inset 0 6px 18px rgba(0,0,0,0.5), 0 0 0 4px rgba(56,189,248,0.04);
+}
+.pad.xy::before, .pad.xy::after { content: ""; position: absolute; background: rgba(56,189,248,0.12); }
+.pad.xy::before { left: 50%; top: 12%; bottom: 12%; width: 1px; }
+.pad.xy::after { top: 50%; left: 12%; right: 12%; height: 1px; }
+.pad.y {
+  width: 40px; height: var(--stick); border-radius: 20px;
+  background: linear-gradient(180deg, var(--bg3), var(--bg1)); border: 1px solid var(--line-strong);
+  box-shadow: inset 0 4px 12px rgba(0,0,0,0.5);
+}
+.pad.y.spring::after { content: ""; position: absolute; left: 8px; right: 8px; top: 50%; height: 1px; background: var(--line-strong); }
+.knob {
+  position: absolute; left: 50%; top: 50%; width: var(--knob); height: var(--knob); margin: calc(var(--knob) / -2) 0 0 calc(var(--knob) / -2);
+  border-radius: 50%; pointer-events: none;
+  background: radial-gradient(circle at 35% 30%, #bae6fd, var(--accent) 45%, #0369a1);
+  box-shadow: 0 6px 16px rgba(0,0,0,0.55), 0 0 0 3px rgba(56,189,248,0.18), 0 0 18px rgba(56,189,248,0.35);
+  transition: transform .38s cubic-bezier(.34, 1.56, .64, 1), box-shadow .2s;
+}
+.pad.y .knob { --knob: 32px; }
+.pad.grip .knob { background: radial-gradient(circle at 35% 30%, #fde68a, var(--warn) 50%, #b45309); box-shadow: 0 4px 12px rgba(0,0,0,0.5), 0 0 14px rgba(245,158,11,0.4); }
+.pad.dragging { cursor: grabbing; border-color: var(--accent); }
+.pad.dragging .knob { transition: none; box-shadow: 0 6px 16px rgba(0,0,0,0.55), 0 0 0 5px rgba(56,189,248,0.25), 0 0 26px rgba(56,189,248,0.6); }
+.pad.grip.dragging .knob, .pad.grip .knob { transition: none; }
+body.locked .pad { opacity: .45; }
+.center { display: flex; justify-content: center; align-items: flex-end; gap: 12px; min-width: 0; }
+.vctl { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.vctl .stick-label { font-size: 9px; }
+.vctl .val { font: 600 10px var(--mono); color: var(--text2); }
+.kbd-help, .speed-desk { display: none; }
+
+/* ---------- side panel (telemetry + recording) ---------- */
+.side { display: none; }
+body.drawer-open .side {
+  display: flex; flex-direction: column; gap: 8px;
+  position: fixed; left: 8px; right: 8px; bottom: 8px; max-height: 72%; overflow: auto; z-index: 20;
+  padding: 8px; background: rgba(7,13,24,0.96); border: 1px solid var(--line-strong); border-radius: 16px;
+  box-shadow: 0 -10px 40px rgba(0,0,0,0.6); animation: sheet .22s ease-out;
+}
+@keyframes sheet { from { transform: translateY(24px); opacity: 0; } }
+.scrim { display: none; }
+body.drawer-open .scrim { display: block; position: fixed; inset: 0; z-index: 19; background: rgba(0,0,0,0.45); }
+.kv { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; padding: 0 10px 10px; }
+.kv div { background: rgba(7,13,24,0.55); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 6px 8px; min-width: 0; }
+.kv span { display: block; font-size: 10px; color: var(--text2); }
+.kv b { font: 600 15px var(--mono); font-variant-numeric: tabular-nums; color: var(--text); white-space: nowrap; }
+.kv b.good { color: var(--ok); } .kv b.warn { color: var(--warn); } .kv b.bad { color: var(--danger); }
+.fsm { display: flex; align-items: center; gap: 4px; padding: 0 10px 10px; flex-wrap: wrap; }
+.fsm span {
+  font: 600 10px var(--mono); padding: 4px 7px; border-radius: 6px; color: var(--text3);
+  border: 1px solid rgba(91,110,138,0.35); transition: all .2s;
+}
+.fsm i { color: var(--text3); font-style: normal; font-size: 10px; }
+.fsm span.on { color: var(--bg0); background: var(--accent); border-color: var(--accent); box-shadow: 0 0 12px rgba(56,189,248,0.4); }
+.fsm span.on[data-s="Armed"] { background: var(--ok); border-color: var(--ok); box-shadow: 0 0 12px rgba(34,197,94,0.4); }
+.fsm span.on[data-s="EStop"], .fsm span.on[data-s="Fault"] { background: var(--danger); border-color: var(--danger); color: #fff; box-shadow: 0 0 12px rgba(239,68,68,0.5); }
+.fsm .sep { flex-basis: 100%; height: 0; }
+.fault-msg { margin: 0 10px 10px; padding: 8px 10px; border-radius: var(--r-sm); background: var(--danger-dim); border: 1px solid rgba(239,68,68,0.4); color: #fecaca; font-size: 12px; display: none; }
+.fault-msg.show { display: block; }
+.rec-body { padding: 0 10px 10px; display: grid; gap: 8px; }
+.field { display: grid; gap: 4px; font-size: 11px; color: var(--text2); }
+.field input {
+  height: 36px; border-radius: var(--r-sm); border: 1px solid var(--line); background: var(--bg0);
+  padding: 0 10px; font: 13px var(--mono); outline: none;
+}
+.field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+.rec-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.rec-row .btn { min-height: 42px; }
+.btn-rec { color: #fecaca; border-color: rgba(239,68,68,0.5); background: rgba(239,68,68,0.12); }
+.btn-rec::before { content: ""; width: 10px; height: 10px; border-radius: 50%; background: var(--danger); box-shadow: 0 0 8px var(--danger); position: absolute; left: 12px; top: 50%; margin-top: -5px; }
+body.recording .btn-rec::before { border-radius: 2px; animation: blink 1s steps(2) infinite; }
+.rec-stat { display: flex; justify-content: space-between; font-size: 12px; color: var(--text2); }
+.rec-stat b { font-family: var(--mono); color: var(--text); }
+.rec-last { font: 11px var(--mono); color: var(--text2); word-break: break-all; min-height: 1em; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { padding: 3px 8px; font: 600 10px var(--mono); color: var(--text2); }
+.seg button.on { background: var(--accent-dim); color: var(--accent); }
+
+/* ---------- toast ---------- */
+.toasts { position: fixed; left: 50%; top: 56px; transform: translateX(-50%); z-index: 50; display: grid; gap: 6px; width: min(92vw, 420px); pointer-events: none; }
+.toast {
+  padding: 9px 12px; border-radius: 10px; font-size: 12px; background: rgba(12,21,38,0.96);
+  border: 1px solid var(--line-strong); box-shadow: 0 8px 24px rgba(0,0,0,0.5); animation: sheet .2s ease-out;
+}
+.toast.err { border-color: rgba(239,68,68,0.6); color: #fecaca; }
+.toast.ok { border-color: rgba(34,197,94,0.6); color: #bbf7d0; }
+.toast code { font-family: var(--mono); color: var(--text2); margin-left: 6px; }
+
+/* =================================================================
+   Desktop workstation (>= 1024px)
+   ================================================================= */
+@media (min-width: 1024px) {
+  :root { --stick: 150px; --knob: 56px; }
+  .app {
+    grid-template-columns: minmax(0, 1fr) 380px;
+    grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "head head"
+      "stage safe"
+      "stage joints"
+      "stage side"
+      "ctrl side";
+    gap: 10px; padding: 12px;
+  }
+  .stage { grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); align-items: stretch; }
+  .video { aspect-ratio: auto; max-height: none; height: 100%; min-height: 240px; }
+  .stage .armview {
+    position: relative; right: auto; bottom: auto; width: auto; max-width: none; aspect-ratio: auto;
+    min-height: 240px; backdrop-filter: none; -webkit-backdrop-filter: none;
+    background: linear-gradient(180deg, rgba(17,29,51,0.92), rgba(12,21,38,0.92)); border-color: var(--line);
+  }
+  .stage .armview .tag { display: block; }
+  .head-toggle { display: none; }
+  .safe { grid-template-columns: 1fr 1.3fr; grid-template-rows: auto auto; }
+  .safe .btn-estop { grid-row: span 2; min-height: 110px; font-size: 22px; grid-column: 2; grid-row: 1 / span 2; }
+  .safe .btn-enable { grid-column: 1; grid-row: 1; }
+  .safe .home-spd { grid-column: 1; grid-row: 2; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .joints .card-title { display: flex; }
+  .jgrid { grid-template-columns: 1fr; gap: 5px; padding: 0 10px 10px; }
+  .jcard { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: 10px; padding: 6px 8px; }
+  .jcard .jinfo { min-width: 0; }
+  .jhead { justify-content: flex-start; gap: 8px; }
+  .jval { font-size: 15px; margin: 0 0 4px; }
+  .jstep { display: flex; gap: 4px; }
+  .jstep button {
+    width: 32px; height: 32px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg1);
+    font: 700 15px var(--mono); color: var(--accent);
+  }
+  .jstep button:hover { border-color: var(--accent); background: var(--accent-dim); }
+  .jstep button:active { transform: scale(.92); }
+  .side { display: flex; flex-direction: column; gap: 10px; grid-area: side; min-height: 0; overflow: auto; }
+  .side > .card { flex: none; }
+  .ctrl { grid-template-columns: auto minmax(0, 1fr) auto; padding: 12px 18px; gap: 18px; }
+  .center { justify-content: space-evenly; align-items: center; }
+  .kbd-help {
+    display: grid; grid-template-columns: auto auto; gap: 3px 10px; font-size: 11px; color: var(--text2); align-content: center;
+  }
+  .kbd-help kbd {
+    font: 600 10px var(--mono); color: var(--text); background: var(--bg1); border: 1px solid var(--line-strong);
+    border-bottom-width: 2px; border-radius: 5px; padding: 1px 5px; margin-right: 2px;
+  }
+}
+@media (min-width: 1024px) and (max-height: 760px) {
+  :root { --stick: 120px; --knob: 46px; }
+  .jcard { padding: 4px 8px; }
+  .jval { font-size: 13px; }
+  .safe .btn-estop { min-height: 96px; }
+}
+
+/* =================================================================
+   Phone landscape HUD (< 1024px wide, short viewport)
+   ================================================================= */
+@media (max-width: 1023px) and (orientation: landscape) and (max-height: 600px) {
+  :root { --stick: 118px; --knob: 46px; }
+  .app {
+    grid-template-columns: minmax(0, 1fr) minmax(250px, 34%);
+    grid-template-rows: auto auto auto minmax(0, 1fr);
+    grid-template-areas: "head head" "stage safe" "stage joints" "stage .";
+    gap: 6px; padding: 6px max(8px, env(safe-area-inset-right)) 6px max(8px, env(safe-area-inset-left));
+  }
+  header { min-height: 36px; padding: 3px 8px; }
+  .stage { min-height: 0; }
+  .video { aspect-ratio: auto; max-height: none; height: 100%; }
+  .stage .armview { right: auto; left: 8px; top: 34px; bottom: auto; width: 30%; max-width: 170px; }
+  .safe { grid-template-columns: 1fr 1.3fr 1fr; gap: 6px; }
+  .safe .btn { min-height: 44px; }
+  .safe .home-spd { display: grid; grid-template-rows: 1fr 1fr; gap: 6px; }
+  .safe .home-spd .btn { min-height: 0; padding: 2px; font-size: 11px; }
+  .safe .home-spd .btn small { display: none; }
+  .jgrid { padding: 6px; gap: 4px; }
+  .jcard { padding: 3px 6px 5px; }
+  .jval { font-size: 13px; margin: 0 0 3px; }
+  .jvel { display: none; }
+  /* controls float over video (left thumb) and the panel (right thumb) */
+  .ctrl {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 10; pointer-events: none;
+    background: none; border: 0; box-shadow: none;
+    padding: 0 max(14px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
+    grid-template-columns: auto minmax(0, 1fr) auto; align-items: end;
+  }
+  .ctrl .pad, .ctrl .vctl { pointer-events: auto; }
+  .ctrl .stick-label { text-shadow: 0 1px 3px #000; }
+  .ctrl .center { justify-content: flex-end; padding-right: 8px; }
+  .ctrl .vctl { background: rgba(7,13,24,0.66); padding: 6px; border-radius: 14px; border: 1px solid var(--line); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+  .pad.xy { background: radial-gradient(circle at 50% 40%, rgba(24,38,63,0.72), rgba(12,21,38,0.72)); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); }
+  .pad.y { height: 96px; }
+  .toasts { top: 44px; }
+}
+@media (max-width: 1023px) and (orientation: landscape) and (max-height: 600px) {
+  /* keep joints clear of the right thumb stick */
+  .joints { margin-bottom: calc(var(--stick) + 26px); }
+}
+@media (max-width: 420px) {
+  .brand small { display: none; }
+  .head-stats { gap: 7px; }
+}
+@media (max-width: 380px) {
+  :root { --stick: 116px; --knob: 46px; }
+  .pad.y { width: 34px; }
+  .jval { font-size: 15px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+</style>
+</head>
+<body class="offline locked">
+<div class="app">
+
+  <!-- ===== header ===== -->
+  <header class="card">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 20h8"/><path d="M8 20v-4"/><circle cx="8" cy="15" r="1.6"/><path d="M8 15l5-6"/><circle cx="13" cy="9" r="1.6"/><path d="M13 9l5 2"/><path d="M18 11l2-2M18 11l2 2"/>
+      </svg>
+      <span>reBot Teleop <small>armd</small></span>
+    </div>
+    <div class="head-stats">
+      <span class="link"><i class="dot" id="link-dot"></i><span class="mono" id="hz-head">-- Hz</span></span>
+      <span class="mono" id="rtt-head">-- ms</span>
+      <span class="badge" id="state-badge">OFFLINE</span>
+      <button class="icon-btn head-toggle" id="btn-drawer" aria-label="遥测与录制">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 18V12M9 18V6M14 18v-8M19 18V9"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ===== stage: camera + arm pose ===== -->
+  <section class="stage">
+    <div class="video">
+      <canvas id="video-canvas"></canvas>
+      <div class="hud">
+        <span class="chip" id="cam-chip">CAM</span>
+        <span class="chip" id="det-chip">DET --</span>
+        <span class="chip rec" id="rec-chip">REC 00:00</span>
+      </div>
+      <div class="banner">LINK LOST · 控制已锁定</div>
+    </div>
+    <div class="armview" id="armview">
+      <span class="tag">侧视姿态 · 示意</span>
+      <canvas id="arm-canvas"></canvas>
+    </div>
+  </section>
+
+  <!-- ===== joints ===== -->
+  <section class="joints card">
+    <div class="card-title"><span>关节 <b>6 DOF</b></span>
+      <span class="seg" id="step-seg"><button data-step="1">1°</button><button data-step="5" class="on">5°</button><button data-step="15">15°</button></span>
+    </div>
+    <div class="jgrid" id="jgrid"></div>
+  </section>
+
+  <!-- ===== safety ===== -->
+  <section class="safe">
+    <button class="btn btn-enable" id="btn-enable"><i class="fill"></i><span id="enable-txt">按住使能</span><small id="enable-sub">HOLD · ENABLE</small></button>
+    <button class="btn btn-estop" id="btn-estop">E-STOP<small>急停 · Space</small></button>
+    <div class="home-spd">
+      <button class="btn btn-ghost" id="btn-home">HOME<small>回零 · H</small></button>
+      <button class="btn btn-ghost" id="btn-speed"><span id="speed-txt">50%</span><small>速度</small></button>
+    </div>
+  </section>
+
+  <!-- ===== touch / mouse controls ===== -->
+  <section class="ctrl card" id="ctrl">
+    <div class="stick-wrap">
+      <div class="pad xy" id="pad-left"><i class="knob"></i></div>
+      <div class="stick-label"><b>↔</b> J1 底座 · <b>↕</b> J2 肩</div>
+    </div>
+    <div class="center">
+      <div class="kbd-help">
+        <span><kbd>A</kbd><kbd>D</kbd></span><span>J1 底座</span>
+        <span><kbd>W</kbd><kbd>S</kbd></span><span>J2 肩</span>
+        <span><kbd>↑</kbd><kbd>↓</kbd></span><span>J3 肘</span>
+        <span><kbd>Q</kbd><kbd>E</kbd></span><span>J4 腕俯仰</span>
+        <span><kbd>←</kbd><kbd>→</kbd></span><span>J5 腕旋转</span>
+        <span><kbd>G</kbd></span><span>夹爪开/合</span>
+        <span><kbd>Space</kbd></span><span>急停</span>
+      </div>
+      <div class="vctl">
+        <div class="pad y spring" id="pad-wrist"><i class="knob"></i></div>
+        <div class="stick-label">J4 腕</div>
+      </div>
+      <div class="vctl">
+        <div class="pad y grip" id="pad-grip"><i class="knob"></i></div>
+        <div class="stick-label">夹爪 <span class="val" id="grip-val">--%</span></div>
+      </div>
+    </div>
+    <div class="stick-wrap">
+      <div class="pad xy" id="pad-right"><i class="knob"></i></div>
+      <div class="stick-label"><b>↕</b> J3 肘 · <b>↔</b> J5 腕转</div>
+    </div>
+  </section>
+
+  <!-- ===== side: telemetry + dataset ===== -->
+  <aside class="side" id="side">
+    <div class="card">
+      <div class="card-title"><span>遥测 <b>Telemetry</b></span><span class="mono" id="epoch-txt">epoch --</span></div>
+      <div class="kv">
+        <div><span>遥测帧率</span><b id="t-hz">--</b></div>
+        <div><span>RTT</span><b id="t-rtt">--</b></div>
+        <div><span>力矩</span><b id="t-torque">--</b></div>
+        <div><span>最大速度</span><b id="t-vel">--</b></div>
+        <div><span>最大电流/力矩</span><b id="t-eff">--</b></div>
+        <div><span>最高温度</span><b id="t-temp">--</b></div>
+      </div>
+      <div class="fsm" id="fsm">
+        <span data-s="Booting">BOOT</span><i>›</i><span data-s="Idle">IDLE</span><i>›</i><span data-s="Armed">ARMED</span><i>›</i><span data-s="Moving">MOVING</span>
+        <span class="sep"></span>
+        <span data-s="EStop">E-STOP</span><span data-s="Fault">FAULT</span>
+      </div>
+      <div class="fault-msg" id="fault-msg"></div>
+    </div>
+    <div class="card">
+      <div class="card-title"><span>数据集录制 <b>LeRobot</b></span><span class="mono" id="rec-state">IDLE</span></div>
+      <div class="rec-body">
+        <label class="field">Episode ID<input id="rec-id" spellcheck="false" autocomplete="off"></label>
+        <div class="rec-stat"><span>时长 <b id="rec-time">00:00</b></span><span>估计帧数 <b id="rec-frames">0</b></span></div>
+        <div class="rec-row">
+          <button class="btn btn-rec" id="btn-rec">开始录制</button>
+          <button class="btn" id="btn-discard" disabled>丢弃</button>
+        </div>
+        <div class="rec-last" id="rec-last"></div>
+      </div>
+    </div>
+  </aside>
+</div>
+<div class="scrim" id="scrim"></div>
+<div class="toasts" id="toasts"></div>
+
+<script>
+'use strict';
+/* =================================================================
+   Configuration
+   ================================================================= */
+const CFG = {
+  servoPeriodMs: 50,          // 20 Hz servo streaming while a stick / key is active
+  heartbeatMs: 150,           // WS heartbeat, lease timeout on armd is 500 ms
+  staleMs: 400,               // telemetry older than this locks the controls
+  deadzone: 0.08,
+  maxLead: 0.35,              // rad, servo target may lead measured position by at most this
+  limitMargin: 0.02,          // rad, keep targets inside soft limits
+  gripClosed: 0.0,            // J6 rad at 0 %
+  gripOpen: 1.57,             // J6 rad at 100 %
+  speeds: [0.15, 0.3, 0.5, 0.8], // fraction of joint max velocity
+  joints: [
+    { key: 'J1', name: '底座' }, { key: 'J2', name: '肩' }, { key: 'J3', name: '肘' },
+    { key: 'J4', name: '腕俯仰' }, { key: 'J5', name: '腕旋转' }, { key: 'J6', name: '夹爪' },
+  ],
+};
+const DEG = 180 / Math.PI;
+const CLIENT_ID = 'web-' + Math.random().toString(36).slice(2, 8);
+const $ = (id) => document.getElementById(id);
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+/* =================================================================
+   State
+   ================================================================= */
+const S = {
+  obs: null, obsAt: 0, epoch: null,
+  dof: 6,
+  limits: [
+    { min_position: -3.14159, max_position: 3.14159, max_velocity: 2.0 },
+    { min_position: -2.0944, max_position: 2.0944, max_velocity: 2.0 },
+    { min_position: -2.61799, max_position: 2.61799, max_velocity: 2.0 },
+    { min_position: -3.14159, max_position: 3.14159, max_velocity: 3.0 },
+    { min_position: -2.0944, max_position: 2.0944, max_velocity: 3.0 },
+    { min_position: -6.28318, max_position: 6.28318, max_velocity: 4.0 },
+  ],
+  ws: null, wsCount: 0, hz: 0,
+  rtt: null, lastReqAt: 0,
+  state: 'Offline', fault: '',
+  speedIdx: 1,
+  step: 5,
+  axes: { l: [0, 0], r: [0, 0], wrist: 0 },
+  keys: new Set(),
+  grip: null,                 // 0..1 user gripper command, null until first telemetry
+  servoTarget: null, servoLastAt: 0, servoInflight: false,
+  rec: { active: false, startedAt: 0 },
+  detections: null,
+};
+
+/* =================================================================
+   Helpers
+   ================================================================= */
+function toast(msg, kind = '', code = '') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind;
+  el.textContent = msg;
+  if (code) { const c = document.createElement('code'); c.textContent = code; el.appendChild(c); }
+  $('toasts').appendChild(el);
+  setTimeout(() => el.remove(), kind === 'err' ? 4200 : 2600);
+  while ($('toasts').children.length > 3) $('toasts').firstChild.remove();
+}
+function buzz(ms) { if (navigator.vibrate) try { navigator.vibrate(ms); } catch (_) {} }
+
+async function api(path, body, { quiet = false, method = 'POST' } = {}) {
+  const t0 = performance.now();
+  S.lastReqAt = Date.now();
+  let res;
+  try {
+    res = await fetch(path, {
+      method,
+      headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    if (!quiet) toast('请求失败：无法连接 armd', 'err', path);
+    throw e;
+  }
+  const dt = performance.now() - t0;
+  S.rtt = S.rtt == null ? dt : S.rtt * 0.8 + dt * 0.2;
+  let data = null;
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok) {
+    const err = new Error((data && data.error) || ('HTTP ' + res.status));
+    err.code = (data && data.code) || String(res.status);
+    if (!quiet) toast(err.message, 'err', err.code);
+    throw err;
+  }
+  if (data && typeof data.epoch_id === 'number') S.epoch = data.epoch_id;
+  return data;
+}
+
+function parseState(s) {
+  if (typeof s === 'string') return { name: s, detail: '' };
+  if (s && typeof s === 'object') {
+    const name = Object.keys(s)[0];
+    if (name !== 'Fault') return { name, detail: '' };
+    const r = s.Fault;
+    if (typeof r === 'string') return { name, detail: r };
+    const kind = Object.keys(r || {})[0] || 'Unknown';
+    const v = r[kind];
+    let detail = kind;
+    if (kind === 'JointLimitExceeded' && v) detail = `关节超限 ${v.joint_name}: ${(v.value * DEG).toFixed(1)}°`;
+    else if (kind === 'ThermalTrip' && v) detail = `过温 J${v.joint_idx + 1}: ${Number(v.temperature).toFixed(1)}°C / ${v.limit}°C`;
+    else if (kind === 'Other') detail = String(v);
+    return { name, detail };
+  }
+  return { name: 'Unknown', detail: '' };
+}
+const isLive = () => S.obs && Date.now() - S.obsAt < CFG.staleMs;
+const isOperational = () => S.state === 'Armed' || S.state === 'Moving';
+const isStopped = () => S.state === 'EStop' || S.state === 'Fault';
+
+/* =================================================================
+   Telemetry WebSocket (50 Hz) + heartbeat
+   ================================================================= */
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/api/v1/ws`);
+  S.ws = ws;
+  ws.onmessage = (ev) => {
+    let o; try { o = JSON.parse(ev.data); } catch (_) { return; }
+    if (!Array.isArray(o.positions)) return;
+    S.obs = o; S.obsAt = Date.now(); S.wsCount++;
+    if (typeof o.epoch_id === 'number') S.epoch = o.epoch_id;
+    const st = parseState(o.safety_state);
+    S.state = st.name; S.fault = st.detail;
+    if (Array.isArray(o.detections)) S.detections = o.detections;
+    if (S.grip == null && o.positions.length >= 6) {
+      S.grip = clamp((o.positions[5] - CFG.gripClosed) / (CFG.gripOpen - CFG.gripClosed), 0, 1);
+      setGripKnob(S.grip);
+    }
+  };
+  ws.onclose = () => { S.ws = null; setTimeout(connectWS, 1500); };
+  ws.onerror = () => { try { ws.close(); } catch (_) {} };
+}
+setInterval(() => {
+  // Lease renewal. Stops when the tab is hidden so armd's watchdog can take over.
+  if (S.ws && S.ws.readyState === 1 && S.epoch != null && !document.hidden) {
+    S.ws.send(JSON.stringify({ type: 'heartbeat', client_id: CLIENT_ID, epoch_id: S.epoch }));
+  }
+}, CFG.heartbeatMs);
+setInterval(() => { S.hz = S.wsCount; S.wsCount = 0; }, 1000);
+setInterval(() => {
+  // RTT probe when no other request has measured it recently
+  if (Date.now() - S.lastReqAt > 1500 && !document.hidden) api('/api/v1/observation', undefined, { quiet: true, method: 'GET' }).catch(() => {});
+}, 2000);
+
+async function loadSchema() {
+  try {
+    const sc = await api('/api/v1/observation/schema', undefined, { quiet: true, method: 'GET' });
+    if (sc && Array.isArray(sc.limits) && sc.limits.length) { S.limits = sc.limits; S.dof = sc.dof || sc.limits.length; }
+  } catch (_) { setTimeout(loadSchema, 3000); }
+}
+
+/* =================================================================
+   Multi-touch pads (Touch.identifier per pad) + mouse fallback
+   ================================================================= */
+const pads = [];
+class Pad {
+  constructor(el, { axes = 'xy', spring = true, onChange }) {
+    this.el = el; this.knob = el.querySelector('.knob');
+    this.axes = axes; this.spring = spring; this.onChange = onChange;
+    this.touchId = null; this.mouse = false; this.value = [0, 0];
+    el.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      if (this.touchId !== null) return;
+      const t = e.changedTouches[0];
+      this.touchId = t.identifier; this.begin(t.clientX, t.clientY);
+    }, { passive: false });
+    el.addEventListener('mousedown', (e) => { e.preventDefault(); this.mouse = true; this.begin(e.clientX, e.clientY); });
+    pads.push(this);
+  }
+  begin(x, y) {
+    if (document.body.classList.contains('locked') && this.spring) { toast(lockReason(), 'err'); this.touchId = null; this.mouse = false; return; }
+    this.el.classList.add('dragging'); this.move(x, y);
+  }
+  geom() {
+    const r = this.el.getBoundingClientRect(), k = this.knob.offsetWidth;
+    return { cx: r.left + r.width / 2, cy: r.top + r.height / 2, rx: (r.width - k) / 2, ry: (r.height - k) / 2 };
+  }
+  move(x, y) {
+    const g = this.geom();
+    let dx = x - g.cx, dy = y - g.cy;
+    if (this.axes === 'xy') {
+      const d = Math.hypot(dx, dy) || 1, m = Math.min(d, g.rx);
+      dx = dx / d * m; dy = dy / d * m;
+      this.value = [dx / g.rx, -dy / g.rx];
+    } else {
+      dx = 0; dy = clamp(dy, -g.ry, g.ry);
+      this.value = [0, -dy / g.ry];
+    }
+    this.knob.style.transform = `translate(${dx}px, ${dy}px)`;
+    this.onChange(this.value, true);
+  }
+  end() {
+    this.touchId = null; this.mouse = false; this.el.classList.remove('dragging');
+    if (this.spring) {
+      this.value = [0, 0];
+      this.knob.style.transform = 'translate(0px, 0px)'; // CSS spring curve animates the return
+    }
+    this.onChange(this.value, false);
+  }
+  active() { return this.touchId !== null || this.mouse; }
+}
+function findTouch(list, id) { for (const t of list) if (t.identifier === id) return t; return null; }
+window.addEventListener('touchmove', (e) => {
+  let used = false;
+  for (const p of pads) {
+    if (p.touchId === null) continue;
+    const t = findTouch(e.changedTouches, p.touchId);
+    if (t) { p.move(t.clientX, t.clientY); used = true; }
+  }
+  if (used || e.target.closest('.ctrl')) e.preventDefault();
+}, { passive: false });
+const touchEnd = (e) => { for (const p of pads) if (p.touchId !== null && findTouch(e.changedTouches, p.touchId)) p.end(); };
+window.addEventListener('touchend', touchEnd);
+window.addEventListener('touchcancel', touchEnd);
+window.addEventListener('mousemove', (e) => { for (const p of pads) if (p.mouse) p.move(e.clientX, e.clientY); });
+window.addEventListener('mouseup', () => { for (const p of pads) if (p.mouse) p.end(); });
+
+const shape = (v) => { const a = Math.abs(v); return a < CFG.deadzone ? 0 : Math.sign(v) * ((a - CFG.deadzone) / (1 - CFG.deadzone)) ** 1.6; };
+new Pad($('pad-left'), { onChange: (v) => { S.axes.l = v; } });
+new Pad($('pad-right'), { onChange: (v) => { S.axes.r = v; } });
+new Pad($('pad-wrist'), { axes: 'y', onChange: (v) => { S.axes.wrist = v[1]; } });
+const gripPad = new Pad($('pad-grip'), {
+  axes: 'y', spring: false,
+  onChange: (v, dragging) => {
+    S.grip = (v[1] + 1) / 2;
+    $('grip-val').textContent = Math.round(S.grip * 100) + '%';
+    if (!dragging) commandGrip();
+  },
+});
+function setGripKnob(g) {
+  const r = gripPad.geom();
+  gripPad.knob.style.transform = `translate(0px, ${-(g * 2 - 1) * r.ry}px)`;
+  $('grip-val').textContent = Math.round(g * 100) + '%';
+}
+
+/* =================================================================
+   Keyboard
+   ================================================================= */
+const KEYMAP = { a: [0, -1], d: [0, 1], w: [1, 1], s: [1, -1], arrowup: [2, 1], arrowdown: [2, -1], q: [3, 1], e: [3, -1], arrowleft: [4, -1], arrowright: [4, 1] };
+window.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key.toLowerCase();
+  if (k === ' ') { e.preventDefault(); eStop(); return; }
+  if (e.repeat) { if (KEYMAP[k]) e.preventDefault(); return; }
+  if (KEYMAP[k]) { e.preventDefault(); S.keys.add(k); return; }
+  if (k === 'g') { S.grip = (S.grip ?? 0) > 0.5 ? 0 : 1; setGripKnob(S.grip); commandGrip(); }
+  if (k === 'h') home();
+});
+window.addEventListener('keyup', (e) => S.keys.delete(e.key.toLowerCase()));
+function releaseAll() { S.keys.clear(); for (const p of pads) if (p.active() && p.spring) p.end(); }
+window.addEventListener('blur', releaseAll);
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); });
+
+/* =================================================================
+   Motion commands
+   ================================================================= */
+function velocityVector() {
+  const v = [shape(S.axes.l[0]), shape(S.axes.l[1]), shape(S.axes.r[1]), shape(S.axes.wrist), shape(S.axes.r[0]), 0];
+  for (const k of S.keys) { const [j, s] = KEYMAP[k]; v[j] = clamp(v[j] + s, -1, 1); }
+  return v;
+}
+function gripRad() { return CFG.gripClosed + (S.grip ?? 0) * (CFG.gripOpen - CFG.gripClosed); }
+function clampTarget(t) {
+  return t.map((x, i) => { const L = S.limits[i]; return L ? clamp(x, L.min_position + CFG.limitMargin, L.max_position - CFG.limitMargin) : x; });
+}
+function lockReason() {
+  if (!isLive()) return '遥测断开，控制已锁定';
+  if (isStopped()) return '急停 / 故障中，先复位';
+  return '未使能：按住「使能」0.6 秒';
+}
+
+// Continuous joint-velocity teleop via /motion/servo (20 Hz)
+setInterval(() => {
+  const v = velocityVector();
+  const moving = v.some((x) => x !== 0);
+  const now = performance.now();
+  if (!moving || !isLive() || !isOperational() || S.epoch == null) { S.servoTarget = null; return; }
+  const pos = S.obs.positions;
+  if (!S.servoTarget || now - S.servoLastAt > 300) S.servoTarget = pos.slice(0, S.dof);
+  const dt = Math.min(0.1, (now - (S.servoLastAt || now - CFG.servoPeriodMs)) / 1000);
+  S.servoLastAt = now;
+  const scale = CFG.speeds[S.speedIdx];
+  let t = S.servoTarget.map((x, i) => {
+    if (i === 5) return gripRad();
+    const nx = x + v[i] * (S.limits[i]?.max_velocity ?? 1) * scale * dt;
+    return clamp(nx, pos[i] - CFG.maxLead, pos[i] + CFG.maxLead);
+  });
+  t = clampTarget(t);
+  S.servoTarget = t;
+  if (S.servoInflight) return; // next tick sends the accumulated target
+  S.servoInflight = true;
+  api('/api/v1/motion/servo', { targets: t, epoch_id: S.epoch }, { quiet: true })
+    .catch((e) => { if (e.code && e.code !== 'EPOCH_MISMATCH') toastOnce(e); })
+    .finally(() => { S.servoInflight = false; });
+}, CFG.servoPeriodMs);
+let lastErrAt = 0;
+function toastOnce(e) { if (Date.now() - lastErrAt > 2000) { lastErrAt = Date.now(); toast(e.message, 'err', e.code); } }
+
+function jogTo(target) {
+  if (!isLive()) return toast(lockReason(), 'err');
+  return api('/api/v1/motion/jog', { target_positions: clampTarget(target), epoch_id: S.epoch }).catch(() => {});
+}
+function stepJoint(j, dir) {
+  if (!S.obs) return;
+  const t = S.obs.positions.slice(0, S.dof);
+  t[j] += dir * S.step / DEG;
+  jogTo(t);
+}
+function commandGrip() {
+  if (!S.obs || !isOperational() || S.servoTarget) return; // while streaming, servo carries J6
+  const t = S.obs.positions.slice(0, S.dof);
+  t[5] = gripRad();
+  jogTo(t);
+}
+function home() {
+  if (!isOperational()) return toast(lockReason(), 'err');
+  api('/api/v1/motion/home', { epoch_id: S.epoch }).then(() => toast('回零中', 'ok')).catch(() => {});
+}
+function eStop() {
+  buzz([30, 40, 30]);
+  releaseAll();
+  api('/api/v1/safety/e_stop').then(() => toast('急停已锁定', 'err')).catch(() => {});
+}
+$('btn-estop').addEventListener('pointerdown', (e) => { e.preventDefault(); eStop(); });
+$('btn-home').addEventListener('click', home);
+$('btn-speed').addEventListener('click', () => { S.speedIdx = (S.speedIdx + 1) % CFG.speeds.length; renderSpeed(); });
+function renderSpeed() { $('speed-txt').textContent = Math.round(CFG.speeds[S.speedIdx] * 100) + '%'; }
+$('step-seg').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  S.step = Number(b.dataset.step);
+  for (const x of $('step-seg').children) x.classList.toggle('on', x === b);
+});
+
+// Enable: hold 600 ms to arm. Disable: single tap. Clear fault: single tap.
+(() => {
+  const btn = $('btn-enable');
+  let timer = null;
+  const cancel = () => { clearTimeout(timer); timer = null; btn.classList.remove('holding'); };
+  btn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    if (isStopped()) {
+      api('/api/v1/safety/clear_fault').then(() => toast('已复位，重新使能后可控制', 'ok')).catch(() => {});
+      return;
+    }
+    if (S.obs && S.obs.is_torqued) {
+      api('/api/v1/torque', { enable: false }).then(() => toast('已失能')).catch(() => {});
+      return;
+    }
+    if (!isLive()) return toast(lockReason(), 'err');
+    btn.classList.add('holding');
+    timer = setTimeout(() => {
+      cancel(); buzz(20);
+      api('/api/v1/torque', { enable: true }).then(() => toast('已使能', 'ok')).catch(() => {});
+    }, 600);
+  });
+  for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) btn.addEventListener(ev, cancel);
+  btn.addEventListener('contextmenu', (e) => e.preventDefault());
+})();
+
+/* =================================================================
+   Dataset recording
+   ================================================================= */
+function defaultEpisodeId() {
+  const d = new Date(), p = (n) => String(n).padStart(2, '0');
+  return `teleop_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+$('rec-id').value = defaultEpisodeId();
+function setRecording(on) {
+  S.rec.active = on; S.rec.startedAt = on ? Date.now() : 0;
+  document.body.classList.toggle('recording', on);
+  $('btn-rec').textContent = on ? '停止并保存' : '开始录制';
+  $('btn-discard').disabled = !on;
+  $('rec-id').disabled = on;
+  $('rec-state').textContent = on ? 'RECORDING' : 'IDLE';
+}
+$('btn-rec').addEventListener('click', async () => {
+  if (!S.rec.active) {
+    const id = $('rec-id').value.trim() || defaultEpisodeId();
+    try { await api('/api/v1/dataset/record/start', { episode_id: id }); setRecording(true); toast('开始录制 ' + id, 'ok'); } catch (_) {}
+  } else {
+    try {
+      const r = await api('/api/v1/dataset/record/save');
+      setRecording(false);
+      $('rec-last').textContent = `已保存 ${r.frame_count ?? '?'} 帧 → ${r.path ?? ''}`;
+      toast(`已保存 ${r.frame_count ?? '?'} 帧`, 'ok');
+      $('rec-id').value = defaultEpisodeId();
+    } catch (_) {}
+  }
+});
+$('btn-discard').addEventListener('click', async () => {
+  try { await api('/api/v1/dataset/record/discard'); setRecording(false); $('rec-last').textContent = '已丢弃'; } catch (_) {}
+});
+
+/* drawer (mobile) */
+$('btn-drawer').addEventListener('click', () => document.body.classList.toggle('drawer-open'));
+$('scrim').addEventListener('click', () => document.body.classList.remove('drawer-open'));
+
+/* =================================================================
+   Joint cards
+   ================================================================= */
+const jEls = CFG.joints.map((j, i) => {
+  const card = document.createElement('div');
+  card.className = 'jcard';
+  card.innerHTML = `<div class="jinfo"><div class="jhead"><span class="jname"><b>${j.key}</b>${j.name}</span><span class="jvel mono"></span></div>
+    <div class="jval">--<small>°</small></div><div class="jbar"><i></i></div></div>
+    <div class="jstep"><button data-d="-1" aria-label="${j.key} -">−</button><button data-d="1" aria-label="${j.key} +">+</button></div>`;
+  card.querySelector('.jstep').addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (b) stepJoint(i, Number(b.dataset.d));
+  });
+  $('jgrid').appendChild(card);
+  return { card, val: card.querySelector('.jval'), vel: card.querySelector('.jvel'), bar: card.querySelector('.jbar i') };
+});
+
+/* =================================================================
+   Arm pose canvas (side view, planar J2/J3/J4 chain + J1/J5/J6 gauges)
+   ================================================================= */
+const arm = { cv: $('arm-canvas'), ctx: null, w: 0, h: 0 };
+arm.ctx = arm.cv.getContext('2d');
+function fitCanvas(c, box) {
+  const r = box.getBoundingClientRect(), dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.round(r.width * dpr)), h = Math.max(1, Math.round(r.height * dpr));
+  if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+  return { w, h, dpr };
+}
+function drawArm(q) {
+  const { w, h, dpr } = fitCanvas(arm.cv, $('armview'));
+  const g = arm.ctx; g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, w, h);
+  const small = w < 300 * dpr;
+  const L = [0.16, 0.30, 0.26, 0.12]; // base height, upper arm, forearm, hand (relative)
+  const reach = L[1] + L[2] + L[3];
+  const s = Math.min(w / (2 * reach + 0.1), h / (reach + L[0] + 0.12)) * 0.95;
+  const bx = w / 2, by = h - h * 0.08;
+  const P = (x, y) => [bx + x * s, by - y * s];
+
+  // floor grid + reach envelope
+  g.strokeStyle = 'rgba(56,189,248,0.10)'; g.lineWidth = dpr;
+  for (let x = -1; x <= 1.01; x += 0.25) { const [px] = P(x, 0); g.beginPath(); g.moveTo(px, by); g.lineTo(px, by + 6 * dpr); g.stroke(); }
+  g.strokeStyle = 'rgba(56,189,248,0.3)'; g.beginPath(); g.moveTo(0, by); g.lineTo(w, by); g.stroke();
+  g.setLineDash([4 * dpr, 6 * dpr]); g.strokeStyle = 'rgba(56,189,248,0.14)';
+  const [sx, sy] = P(0, L[0]);
+  g.beginPath(); g.arc(sx, sy, reach * s, Math.PI, 2 * Math.PI); g.stroke(); g.setLineDash([]);
+
+  // forward kinematics in the sagittal plane (0 rad = upright)
+  const a1 = Math.PI / 2 - (q[1] || 0);
+  const a2 = a1 - (q[2] || 0);
+  const a3 = a2 - (q[3] || 0);
+  const p0 = [0, 0], p1 = [0, L[0]];
+  const p2 = [p1[0] + L[1] * Math.cos(a1), p1[1] + L[1] * Math.sin(a1)];
+  const p3 = [p2[0] + L[2] * Math.cos(a2), p2[1] + L[2] * Math.sin(a2)];
+  const p4 = [p3[0] + L[3] * Math.cos(a3), p3[1] + L[3] * Math.sin(a3)];
+
+  // base pedestal
+  const [b0x, b0y] = P(-0.07, 0), bw = 0.14 * s, bh = L[0] * s * 0.55;
+  g.fillStyle = '#16233b'; g.strokeStyle = 'rgba(56,189,248,0.45)'; g.lineWidth = 1.5 * dpr;
+  g.beginPath(); g.roundRect ? g.roundRect(b0x, b0y - bh, bw, bh, 4 * dpr) : g.rect(b0x, b0y - bh, bw, bh); g.fill(); g.stroke();
+
+  const link = (a, b, width, color) => {
+    const [ax, ay] = P(...a), [bx2, by2] = P(...b);
+    g.lineCap = 'round';
+    g.strokeStyle = 'rgba(0,0,0,0.45)'; g.lineWidth = width + 4 * dpr; g.beginPath(); g.moveTo(ax, ay); g.lineTo(bx2, by2); g.stroke();
+    const grad = g.createLinearGradient(ax, ay, bx2, by2); grad.addColorStop(0, color); grad.addColorStop(1, '#0ea5e9');
+    g.strokeStyle = grad; g.lineWidth = width; g.beginPath(); g.moveTo(ax, ay); g.lineTo(bx2, by2); g.stroke();
+  };
+  const jw = (small ? 7 : 11) * dpr;
+  link(p0, p1, jw * 1.2, '#1e3a5f');
+  link(p1, p2, jw, '#38bdf8');
+  link(p2, p3, jw * 0.85, '#38bdf8');
+  link(p3, p4, jw * 0.6, '#7dd3fc');
+
+  // gripper fingers, opening from J6
+  const open = clamp(((q[5] || 0) - CFG.gripClosed) / (CFG.gripOpen - CFG.gripClosed), 0, 1);
+  const [tx, ty] = P(...p4), fl = 0.07 * s, spread = (0.15 + open * 0.55);
+  g.strokeStyle = '#f59e0b'; g.lineWidth = 3 * dpr; g.lineCap = 'round';
+  for (const sgn of [-1, 1]) {
+    const ang = -a3 + sgn * spread;
+    g.beginPath(); g.moveTo(tx, ty); g.lineTo(tx + Math.cos(ang) * fl, ty + Math.sin(ang) * fl); g.stroke();
+  }
+
+  // joints
+  const joint = (p, label, r) => {
+    const [x, y] = P(...p);
+    g.fillStyle = '#070d18'; g.strokeStyle = '#38bdf8'; g.lineWidth = 2 * dpr;
+    g.shadowColor = 'rgba(56,189,248,0.8)'; g.shadowBlur = 8 * dpr;
+    g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); g.stroke(); g.shadowBlur = 0;
+    if (!small) { g.fillStyle = '#8fa3bf'; g.font = `${10 * dpr}px ui-monospace, Menlo, monospace`; g.fillText(label, x + r + 4 * dpr, y - r); }
+  };
+  joint(p1, 'J2', 5 * dpr); joint(p2, 'J3', 4.5 * dpr); joint(p3, 'J4', 4 * dpr);
+
+  // J5 roll gauge at wrist
+  const [wx, wy] = P(...p3), rr = 9 * dpr;
+  g.strokeStyle = 'rgba(245,158,11,0.9)'; g.lineWidth = 2 * dpr;
+  g.beginPath(); g.arc(wx, wy, rr, -Math.PI / 2, -Math.PI / 2 + (q[4] || 0), (q[4] || 0) < 0); g.stroke();
+
+  // J1 top-view yaw dial
+  const dr = (small ? 16 : 26) * dpr, dx = w - dr - 10 * dpr, dy = dr + (small ? 8 : 26) * dpr;
+  g.strokeStyle = 'rgba(56,189,248,0.3)'; g.lineWidth = 1.2 * dpr;
+  g.beginPath(); g.arc(dx, dy, dr, 0, Math.PI * 2); g.stroke();
+  const yaw = -(q[0] || 0) - Math.PI / 2;
+  g.strokeStyle = '#38bdf8'; g.lineWidth = 2.5 * dpr; g.lineCap = 'round';
+  g.beginPath(); g.moveTo(dx, dy); g.lineTo(dx + Math.cos(yaw) * dr * 0.85, dy + Math.sin(yaw) * dr * 0.85); g.stroke();
+  g.fillStyle = '#8fa3bf'; g.font = `${(small ? 8 : 10) * dpr}px ui-monospace, Menlo, monospace`; g.textAlign = 'center';
+  g.fillText('J1 ' + ((q[0] || 0) * DEG).toFixed(0) + '°', dx, dy + dr + 12 * dpr);
+  g.textAlign = 'left';
+
+  // tool point readout
+  if (!small) {
+    g.fillStyle = '#5b6e8a'; g.font = `${10 * dpr}px ui-monospace, Menlo, monospace`;
+    g.fillText(`TCP r=${(p4[0]).toFixed(2)} z=${(p4[1]).toFixed(2)}  (相对比例)`, 10 * dpr, h - 8 * dpr);
+  }
+}
+
+/* =================================================================
+   Video canvas: placeholder + optional MJPEG (?video=URL) + detections
+   ================================================================= */
+const vid = { cv: $('video-canvas'), ctx: null, img: null, t0: performance.now() };
+vid.ctx = vid.cv.getContext('2d');
+(() => {
+  const src = new URLSearchParams(location.search).get('video');
+  if (!src) { $('cam-chip').textContent = 'CAM · 无视频源'; return; }
+  const img = document.createElement('img');
+  img.alt = ''; img.src = src;
+  img.onload = () => { $('cam-chip').textContent = 'CAM · LIVE'; };
+  img.onerror = () => { $('cam-chip').textContent = 'CAM · 视频源错误'; };
+  $('video-canvas').before(img);
+  vid.img = img;
+})();
+function drawVideo() {
+  const { w, h, dpr } = fitCanvas(vid.cv, vid.cv.parentElement);
+  const g = vid.ctx; g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, w, h);
+  if (!vid.img) {
+    g.fillStyle = '#05090f'; g.fillRect(0, 0, w, h);
+    const t = (performance.now() - vid.t0) / 1000;
+    g.strokeStyle = 'rgba(56,189,248,0.06)'; g.lineWidth = dpr;
+    const step = 32 * dpr;
+    for (let x = (t * 6 * dpr) % step; x < w; x += step) { g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke(); }
+    for (let y = 0; y < h; y += step) { g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke(); }
+    const sy = ((t * 0.25) % 1) * h;
+    const sg = g.createLinearGradient(0, sy - 40 * dpr, 0, sy); sg.addColorStop(0, 'rgba(56,189,248,0)'); sg.addColorStop(1, 'rgba(56,189,248,0.10)');
+    g.fillStyle = sg; g.fillRect(0, sy - 40 * dpr, w, 40 * dpr);
+    g.textAlign = 'center'; g.fillStyle = '#38bdf8';
+    g.font = `600 ${Math.max(11, Math.min(16, w / dpr / 30)) * dpr}px ui-monospace, Menlo, monospace`;
+    g.fillText('NO VIDEO SOURCE', w / 2, h / 2 - 6 * dpr);
+    g.fillStyle = '#5b6e8a'; g.font = `${Math.max(9, Math.min(12, w / dpr / 42)) * dpr}px ui-monospace, Menlo, monospace`;
+    g.fillText('RTSP rtsp://' + location.hostname + ':8554/live0 · 浏览器需 MJPEG: ?video=<url>', w / 2, h / 2 + 14 * dpr);
+    g.textAlign = 'left';
+  }
+  // crosshair + corner brackets
+  g.strokeStyle = 'rgba(56,189,248,0.35)'; g.lineWidth = 1.2 * dpr;
+  const c = 10 * dpr, m = 10 * dpr;
+  g.beginPath(); g.moveTo(w / 2 - c, h / 2); g.lineTo(w / 2 + c, h / 2); g.moveTo(w / 2, h / 2 - c); g.lineTo(w / 2, h / 2 + c); g.stroke();
+  const br = 18 * dpr;
+  g.beginPath();
+  g.moveTo(m, m + br); g.lineTo(m, m); g.lineTo(m + br, m);
+  g.moveTo(w - m - br, m); g.lineTo(w - m, m); g.lineTo(w - m, m + br);
+  g.moveTo(m, h - m - br); g.lineTo(m, h - m); g.lineTo(m + br, h - m);
+  g.moveTo(w - m - br, h - m); g.lineTo(w - m, h - m); g.lineTo(w - m, h - m - br);
+  g.stroke();
+  // detections: [{bbox:[x,y,w,h] normalized 0..1, label, score}]
+  const dets = S.detections;
+  $('det-chip').textContent = dets ? `DET ${dets.length}` : 'DET --';
+  if (dets) {
+    g.font = `600 ${11 * dpr}px ui-monospace, Menlo, monospace`;
+    for (const d of dets) {
+      if (!Array.isArray(d.bbox) || d.bbox.length < 4) continue;
+      const [x, y, bw, bh] = [d.bbox[0] * w, d.bbox[1] * h, d.bbox[2] * w, d.bbox[3] * h];
+      g.strokeStyle = '#22c55e'; g.lineWidth = 2 * dpr; g.strokeRect(x, y, bw, bh);
+      const label = `${d.label ?? 'obj'} ${d.score != null ? Number(d.score).toFixed(2) : ''}`;
+      const tw = g.measureText(label).width + 8 * dpr;
+      g.fillStyle = 'rgba(34,197,94,0.85)'; g.fillRect(x, y - 16 * dpr, tw, 16 * dpr);
+      g.fillStyle = '#04120a'; g.fillText(label, x + 4 * dpr, y - 4 * dpr);
+    }
+  }
+}
+
+/* =================================================================
+   Render loop
+   ================================================================= */
+const STATE_CLASS = { Armed: 's-armed', Moving: 's-moving', EStop: 's-estop', Fault: 's-fault' };
+function fmtTime(ms) { const s = Math.floor(ms / 1000); return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); }
+function setText(el, txt) { if (el.textContent !== txt) el.textContent = txt; }
+let lastUi = 0;
+function frame(ts) {
+  requestAnimationFrame(frame);
+  const live = isLive();
+  const q = S.obs ? S.obs.positions : [0, 0, 0, 0, 0, 0];
+  drawArm(q);
+  drawVideo();
+  if (ts - lastUi < 60) return; // DOM updates at ~16 Hz
+  lastUi = ts;
+
+  const body = document.body;
+  body.classList.toggle('offline', !live);
+  body.classList.toggle('locked', !live || !isOperational());
+  $('link-dot').className = 'dot ' + (live ? 'ok' : 'bad');
+  setText($('hz-head'), live ? S.hz + ' Hz' : 'OFFLINE');
+  setText($('rtt-head'), S.rtt == null ? '-- ms' : Math.round(S.rtt) + ' ms');
+
+  const badge = $('state-badge');
+  const st = live ? S.state : 'Offline';
+  setText(badge, ({ EStop: 'E-STOP', Offline: 'OFFLINE' })[st] || st.toUpperCase());
+  badge.className = 'badge ' + (STATE_CLASS[st] || '');
+
+  // enable button morphs: hold-to-enable / tap-to-disable / tap-to-clear
+  const eb = $('btn-enable');
+  const torqued = !!(S.obs && S.obs.is_torqued);
+  eb.classList.toggle('on', torqued && !isStopped());
+  eb.classList.toggle('clear', isStopped());
+  setText($('enable-txt'), isStopped() ? '复位' : torqued ? '失能' : '按住使能');
+  setText($('enable-sub'), isStopped() ? 'CLEAR FAULT' : torqued ? 'TAP · DISABLE' : 'HOLD · ENABLE');
+  eb.disabled = !live;
+
+  // joints
+  const vel = S.obs ? S.obs.velocities || [] : [];
+  const v = velocityVector();
+  jEls.forEach((e, i) => {
+    const L = S.limits[i];
+    const p = q[i] ?? 0;
+    setText(e.val.firstChild, (p * DEG >= 0 ? '+' : '') + (p * DEG).toFixed(1));
+    setText(e.vel, ((vel[i] || 0) * DEG).toFixed(0) + '°/s');
+    if (L) {
+      const f = clamp((p - L.min_position) / (L.max_position - L.min_position), 0, 1);
+      e.bar.style.left = (f * 100).toFixed(1) + '%';
+      e.card.classList.toggle('near', f < 0.05 || f > 0.95);
+    }
+    e.card.classList.toggle('active', v[i] !== 0 && isOperational());
+  });
+
+  // telemetry
+  setText($('t-hz'), live ? S.hz + ' Hz' : '--');
+  $('t-hz').className = !live ? 'bad' : S.hz >= 45 ? 'good' : 'warn';
+  setText($('t-rtt'), S.rtt == null ? '--' : Math.round(S.rtt) + ' ms');
+  $('t-rtt').className = S.rtt == null ? '' : S.rtt < 40 ? 'good' : S.rtt < 120 ? 'warn' : 'bad';
+  setText($('t-torque'), torqued ? 'ON' : 'OFF');
+  $('t-torque').className = torqued ? 'good' : '';
+  const vmax = vel.length ? Math.max(...vel.map(Math.abs)) * DEG : 0;
+  setText($('t-vel'), vmax.toFixed(0) + '°/s');
+  const tq = S.obs && S.obs.torques ? S.obs.torques : [];
+  setText($('t-eff'), tq.length ? Math.max(...tq.map(Math.abs)).toFixed(2) : '--');
+  const temps = S.obs && S.obs.temperatures ? S.obs.temperatures : [];
+  const tmax = temps.length ? Math.max(...temps) : null;
+  setText($('t-temp'), tmax == null ? '--' : tmax.toFixed(1) + '°C');
+  $('t-temp').className = tmax == null ? '' : tmax < 55 ? 'good' : tmax < 65 ? 'warn' : 'bad';
+  setText($('epoch-txt'), 'epoch ' + (S.epoch ?? '--'));
+  for (const sp of $('fsm').querySelectorAll('span[data-s]')) sp.classList.toggle('on', live && sp.dataset.s === S.state);
+  const fm = $('fault-msg');
+  const showFault = live && isStopped();
+  fm.classList.toggle('show', showFault);
+  if (showFault) setText(fm, S.state === 'EStop' ? '急停已锁定。点击「复位」回到 IDLE，再按住「使能」。' : '故障：' + (S.fault || '未知') + '。点击「复位」后重新使能。');
+
+  // recording
+  if (S.rec.active) {
+    const el = Date.now() - S.rec.startedAt;
+    setText($('rec-time'), fmtTime(el));
+    setText($('rec-frames'), '~' + Math.round(el / 1000 * 50));
+    setText($('rec-chip'), 'REC ' + fmtTime(el));
+  }
+}
+
+/* =================================================================
+   Boot
+   ================================================================= */
+renderSpeed();
+loadSchema();
+connectWS();
+requestAnimationFrame(frame);
+window.addEventListener('resize', () => { if (S.grip != null) setGripKnob(S.grip); });
+</script>
+</body>
+</html>
