@@ -1290,7 +1290,7 @@ const CFG = {
     { key: 'J6', part: '夹爪', motion: '开合抓取', en: 'Gripper', neg: '张开', pos: '闭合夹紧', kn: 'Z', kp: 'X' },
   ],
   video: {
-    host: QS.get('go2rtc') || (location.hostname + ':1984'), // go2rtc API host:port
+    host: QS.get('go2rtc') || location.host, // single-origin unified gateway on port 8765
     src: QS.get('cam') || 'live0',                          // go2rtc stream name
     mjpeg: QS.get('video') || '',                           // explicit MJPEG URL overrides go2rtc
   },
@@ -1663,7 +1663,7 @@ function acquireLease(ws) {
 setInterval(() => {
   // Lease renewal. Stops when the tab is hidden so armd's watchdog can take over.
   if (S.ws && S.ws.readyState === 1 && S.epoch != null && !document.hidden) {
-    S.ws.send(JSON.stringify({ type: 'heartbeat', client_id: CLIENT_ID, epoch_id: S.epoch }));
+    S.ws.send(JSON.stringify({ type: 'heartbeat', client_id: CLIENT_ID, epoch_id: S.epoch, timestamp_ms: Date.now() }));
     S.hb.n++; S.hb.at = Date.now();
   }
 }, CFG.heartbeatMs);
@@ -1868,17 +1868,30 @@ function parseDetections(rawData, refRes) {
   return results;
 }
 
+let detWsRetryCount = 0;
+let detWsRetryTimer = null;
+function scheduleDetWsRetry() {
+  if (detWsRetryTimer) { clearTimeout(detWsRetryTimer); detWsRetryTimer = null; }
+  detWsRetryCount++;
+  const delay = Math.min(15000, Math.round(2000 * Math.pow(1.5, Math.min(detWsRetryCount, 5))));
+  detWsRetryTimer = setTimeout(connectDetectionWS, delay);
+}
+
 function connectDetectionWS() {
-  const host = QS.get('det_ws') || (location.hostname + ':8001');
+  if (detWsRetryTimer) { clearTimeout(detWsRetryTimer); detWsRetryTimer = null; }
+  const host = QS.get('det_ws') || location.host;
+  const rawPath = QS.get('det_path') || '/api/v1/detection/ws';
+  const path = rawPath.startsWith('/') ? rawPath : '/' + rawPath;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   let ws;
   try {
-    ws = new WebSocket(`${proto}//${host}/results`);
+    ws = new WebSocket(`${proto}//${host}${path}`);
   } catch (_) {
-    setTimeout(connectDetectionWS, 3000);
+    scheduleDetWsRetry();
     return;
   }
   ws.onmessage = (ev) => {
+    detWsRetryCount = 0; // Reset backoff only upon receiving active data from upstream
     try {
       const data = JSON.parse(ev.data);
       const srcW = V.mode === 'mjpeg' ? (mjpegEl ? mjpegEl.naturalWidth : 0) : (videoEl ? videoEl.videoWidth : 0);
@@ -1896,7 +1909,7 @@ function connectDetectionWS() {
       S.detLastReceivedAt = 0;
       clearOverlayCanvas();
     }
-    setTimeout(connectDetectionWS, 2000);
+    scheduleDetWsRetry();
   };
   ws.onerror = () => {
     if (S.detSource === 'det_ws') {

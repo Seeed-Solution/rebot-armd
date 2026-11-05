@@ -41,6 +41,8 @@ pub struct HomeRequest {
 pub struct HeartbeatRequest {
     pub client_id: String,
     pub epoch_id: u64,
+    #[serde(default)]
+    pub timestamp_ms: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -222,11 +224,50 @@ pub async fn set_torque(
     }
 }
 
+pub fn try_sync_system_time(timestamp_ms: Option<u64>) {
+    static SYNC_FAILED_REPORTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    if let Some(ts_ms) = timestamp_ms {
+        let ts_sec = ts_ms / 1000;
+        // Bounded valid window: 2024-01-01 to 2035-01-01
+        if ts_sec >= 1_704_067_200 && ts_sec <= 2_051_222_400 {
+            let now_sec = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            if now_sec < 1_704_067_200 {
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    let ts = libc::timespec {
+                        tv_sec: ts_sec as libc::time_t,
+                        tv_nsec: ((ts_ms % 1000) * 1_000_000) as libc::c_long,
+                    };
+                    if libc::clock_settime(libc::CLOCK_REALTIME, &ts) == 0 {
+                        SYNC_FAILED_REPORTED.store(false, std::sync::atomic::Ordering::Relaxed);
+                        tracing::info!(
+                            "System time synchronized from client: {} (was epoch {})",
+                            ts_sec,
+                            now_sec
+                        );
+                    } else if !SYNC_FAILED_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::warn!(
+                            "Passive clock synchronization failed (errno: {})",
+                            std::io::Error::last_os_error()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// POST /api/v1/heartbeat
 pub async fn heartbeat(
     State(supervisor): State<Arc<ArmSupervisor>>,
     Json(payload): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, ApiError> {
+    try_sync_system_time(payload.timestamp_ms);
+
     supervisor
         .heartbeat(&payload.client_id, payload.epoch_id)
         .await

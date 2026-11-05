@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -557,9 +557,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         }
         let limit = Duration::from_millis(250);
         let mut all_valid = true;
-        let now_sec = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+        // Use monotonic process uptime to prevent clock-jump discontinuities on RTC synchronization
+        static MONOTONIC_START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+        let now_sec = MONOTONIC_START.elapsed().as_secs();
         let last_warn = self.last_warn_sec.load(Ordering::Relaxed);
         let should_warn = now_sec.saturating_sub(last_warn) >= 3;
 
@@ -567,7 +567,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             let ok = opt.map_or(false, |instant| instant.elapsed() <= limit);
             if !ok {
                 all_valid = false;
-                if should_warn {
+                if should_warn && (self.is_enabled || self.is_enabling) {
                     tracing::warn!(
                         "Damiao Joint {} (CAN ID 0x{:X}) feedback stale or missing: elapsed={:?} > {:?}",
                         i,
@@ -578,7 +578,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 }
             }
         }
-        if !all_valid && should_warn {
+        if !all_valid && should_warn && (self.is_enabled || self.is_enabling) {
             self.last_warn_sec.store(now_sec, Ordering::Relaxed);
         }
         all_valid

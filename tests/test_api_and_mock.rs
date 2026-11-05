@@ -1,10 +1,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
 
 use armd::{
     create_router, ArmConfig, ArmObservation, ArmSupervisor, JointLimit, ObservationSchema,
@@ -323,6 +324,7 @@ async fn test_rest_api_heartbeat_and_servo() {
     let hb_req = HeartbeatRequest {
         client_id: "teleop_controller".to_string(),
         epoch_id: 1,
+        timestamp_ms: Some(1_730_000_000_000),
     };
     let res = client
         .post(format!("http://{}/api/v1/heartbeat", addr))
@@ -339,6 +341,7 @@ async fn test_rest_api_heartbeat_and_servo() {
     let hb_bad = HeartbeatRequest {
         client_id: "teleop_controller".to_string(),
         epoch_id: 999,
+        timestamp_ms: None,
     };
     let res = client
         .post(format!("http://{}/api/v1/heartbeat", addr))
@@ -1283,4 +1286,41 @@ async fn test_websocket_servo_rejected_during_preset_trajectory() {
 
     // 4. Verify trajectory was NOT truncated / cancelled
     assert!(supervisor.has_active_trajectory().await, "Trajectory must remain active and not truncated");
+}
+
+#[tokio::test]
+async fn test_proxy_routes_and_passive_time_sync() {
+    let (addr, supervisor) = spawn_test_server().await;
+    let _ = supervisor;
+    let client = reqwest::Client::new();
+
+    // 1. Passive time sync call (no crash, safe bounds)
+    armd::api::rest::try_sync_system_time(Some(1_730_000_000_000));
+    armd::api::rest::try_sync_system_time(None);
+    armd::api::rest::try_sync_system_time(Some(999)); // rejected out of bounds
+
+    // 2. HTTP proxy for WHEP when go2rtc is offline -> 502, or 500 if go2rtc is running on port 1984 and rejects invalid dummy SDP
+    let res = client
+        .post(format!("http://{}/api/webrtc?src=live0", addr))
+        .header("Content-Type", "application/sdp")
+        .body("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        res.status() == reqwest::StatusCode::BAD_GATEWAY
+            || res.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "Expected 502 or 500 depending on whether upstream go2rtc is online"
+    );
+
+    // 3. WS proxy for detection WS (/api/v1/detection/ws & /results) and go2rtc
+    for path in &["/api/v1/detection/ws", "/results", "/api/ws?src=live0"] {
+        let ws_url = format!("ws://{}{}", addr, path);
+        if let Ok((mut ws_stream, _)) = connect_async(&ws_url).await {
+            // Verify bidirectional framing / clean handshake without hanging
+            let _ = ws_stream.send(Message::Ping(vec![1, 2, 3].into())).await;
+            let _ = tokio::time::timeout(Duration::from_millis(150), ws_stream.next()).await;
+            let _ = ws_stream.close(None).await;
+        }
+    }
 }

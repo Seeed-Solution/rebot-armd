@@ -138,6 +138,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>) {
                             });
                             let _ = out_tx_recv.try_send(Message::Text(sync_msg.to_string().into()));
                         } else if msg_type == Some("heartbeat") {
+                            let ts_ms = val.get("timestamp_ms").and_then(|t| t.as_u64());
+                            crate::api::rest::try_sync_system_time(ts_ms);
+
                             let client_id = val
                                 .get("client_id")
                                 .and_then(|c| c.as_str())
