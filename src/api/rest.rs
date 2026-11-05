@@ -310,13 +310,6 @@ pub async fn motion_home(
 pub async fn motion_unload(
     State(supervisor): State<Arc<ArmSupervisor>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if supervisor.is_lease_active().await {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "Active client lease exists, HTTP unload conflict".to_string(),
-            "LEASE_ACTIVE".to_string(),
-        ));
-    }
     let obs = supervisor.get_observation().await;
     if obs.safety_state.is_stopped() {
         return Err(ApiError(

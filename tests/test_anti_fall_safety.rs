@@ -112,70 +112,108 @@ async fn test_is_at_safe_resting_pose_criteria() {
     // 1. Initial pose at [0.0, 0.0, 0.0] with v=0: must be at safe resting pose
     assert!(supervisor.is_at_safe_resting_pose().await);
 
-    // 2. Geometry check: each joint deviation <= 0.04
-    // Set positions to [0.03, 0.03, 0.01]: each <= 0.04, sum = 0.07 <= 0.08 -> OK
+    // 2. Geometry check: each joint deviation <= 0.08, sum <= 0.16
+    // Set positions to [0.06, 0.05, 0.04]: each <= 0.08, sum = 0.15 <= 0.16 -> OK
     {
         let mut inner = supervisor.inner().write().await;
-        inner.measured_positions = vec![0.03, 0.03, 0.01];
+        inner.measured_positions = vec![0.06, 0.05, 0.04];
         inner.measured_velocities = vec![0.0, 0.0, 0.0];
     }
     assert!(supervisor.is_at_safe_resting_pose().await);
 
-    // Set one joint to 0.045 (> 0.04) -> must fail geometry check
+    // Set one joint to 0.085 (> 0.08) -> must fail geometry check
     {
         let mut inner = supervisor.inner().write().await;
-        inner.measured_positions = vec![0.045, 0.0, 0.0];
+        inner.measured_positions = vec![0.085, 0.0, 0.0];
     }
     assert!(!supervisor.is_at_safe_resting_pose().await);
 
-    // Set positions to [0.035, 0.035, 0.02]: each <= 0.04, but sum = 0.09 > 0.08 -> must fail
+    // Set positions to [0.06, 0.06, 0.05]: each <= 0.08, but sum = 0.17 > 0.16 -> must fail
     {
         let mut inner = supervisor.inner().write().await;
-        inner.measured_positions = vec![0.035, 0.035, 0.02];
+        inner.measured_positions = vec![0.06, 0.06, 0.05];
     }
     assert!(!supervisor.is_at_safe_resting_pose().await);
 
-    // 3. Velocity check: all velocities <= 0.01 rad/s
+    // 3. Velocity check: all velocities <= 0.015 rad/s
     {
         let mut inner = supervisor.inner().write().await;
         inner.measured_positions = vec![0.0, 0.0, 0.0];
-        inner.measured_velocities = vec![0.005, 0.005, -0.008];
+        inner.measured_velocities = vec![0.012, -0.010, 0.005];
     }
     assert!(supervisor.is_at_safe_resting_pose().await);
 
-    // Any joint velocity > 0.01 -> must fail
+    // Any joint velocity > 0.015 -> must fail
     {
         let mut inner = supervisor.inner().write().await;
-        inner.measured_velocities = vec![0.015, 0.0, 0.0];
+        inner.measured_velocities = vec![0.018, 0.0, 0.0];
     }
     assert!(!supervisor.is_at_safe_resting_pose().await);
 
-    // 4. Torque check with physical driver: J2 (idx 1) / J3 (idx 2) ext torque <= 1.0 N·m
+    // 4. Torque check with physical driver: J2 (idx 1) <= 1.5 N·m, J3 (idx 2) <= 4.5 N·m
     let dummy = DummyDriver::new(vec![
         JointState { position: 0.0, velocity: 0.0, torque: 0.2, temperature: 25.0 },
         JointState { position: 0.0, velocity: 0.0, torque: 0.8, temperature: 25.0 },
-        JointState { position: 0.0, velocity: 0.0, torque: 0.5, temperature: 25.0 },
+        JointState { position: 0.0, velocity: 0.0, torque: 3.2, temperature: 25.0 },
     ]);
     let supervisor_hw = ArmSupervisor::new(config.clone());
     supervisor_hw.set_driver(Box::new(dummy)).await;
     supervisor_hw.set_torque(true).await.unwrap();
 
-    // J2 torque = 0.8 <= 1.0, J3 torque = 0.5 <= 1.0 -> OK
+    // J2 torque = 0.8 <= 1.5, J3 torque = 3.2 <= 4.5 -> OK
     assert!(supervisor_hw.is_at_safe_resting_pose().await);
 
-    // If J2 torque exceeds 1.0 N·m (e.g. 1.5 N·m) -> fails
+    // If J2 torque exceeds 1.5 N·m (e.g. 1.8 N·m) -> fails
     {
         let mut inner = supervisor_hw.inner().write().await;
-        inner.torques = vec![0.2, 1.5, 0.5];
+        inner.torques = vec![0.2, 1.8, 0.5];
     }
     assert!(!supervisor_hw.is_at_safe_resting_pose().await);
 
-    // If J3 torque exceeds 1.0 N·m (e.g. -1.2 N·m) -> fails
+    // If J3 torque exceeds 4.5 N·m (e.g. -5.0 N·m) -> fails
     {
         let mut inner = supervisor_hw.inner().write().await;
-        inner.torques = vec![0.2, 0.5, -1.2];
+        inner.torques = vec![0.2, 0.5, -5.0];
     }
     assert!(!supervisor_hw.is_at_safe_resting_pose().await);
+
+    // Even if gravity compensation is active and model predicts large gravity torques,
+    // measured torque within limits must pass without subtracting gravity torque (verifying bug fix)
+    {
+        let mut inner = supervisor_hw.inner().write().await;
+        inner.torques = vec![0.1, 0.4, -3.2];
+        inner.gravity_compensated = true;
+        inner.gravity_torques = vec![0.0, -7.5, -3.2];
+    }
+    assert!(supervisor_hw.is_at_safe_resting_pose().await);
+
+    // Missing torque data when hardware driver mounted must fail-safe (not pass)
+    {
+        let mut inner = supervisor_hw.inner().write().await;
+        inner.torques = vec![];
+    }
+    assert!(!supervisor_hw.is_at_safe_resting_pose().await, "Missing torque data must fail safe");
+
+    // 5. 7-DOF reBot-DM configuration & J7 gripper exemption
+    let rebot_cfg = ArmConfig::rebot_dm();
+    assert_eq!(rebot_cfg.home_positions, vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0]);
+    let supervisor_rebot = ArmSupervisor::new(rebot_cfg);
+    supervisor_rebot.set_torque(true).await.unwrap();
+    {
+        let mut inner = supervisor_rebot.inner().write().await;
+        // Exact hardware readings from docs: [0.049, 0.011, 0.027, 0.024, 0.001, 1.574, 0.052]
+        inner.measured_positions = vec![0.049, 0.011, 0.027, 0.024, 0.001, 1.574, 0.052];
+        inner.measured_velocities = vec![0.003; 7];
+        inner.torques = vec![0.02; 7];
+    }
+    assert!(supervisor_rebot.is_at_safe_resting_pose().await, "Real robot resting readings must pass");
+
+    // Gripper J7 deviation (e.g. 0.15 rad vs 0.0 home) must NOT block safe resting pose
+    {
+        let mut inner = supervisor_rebot.inner().write().await;
+        inner.measured_positions[6] = 0.15;
+    }
+    assert!(supervisor_rebot.is_at_safe_resting_pose().await, "J7 gripper deviation must not block resting pose");
 }
 
 #[tokio::test]
@@ -442,4 +480,53 @@ async fn test_clear_fault_hardware_failure_rejected_and_latch_retained() {
     assert!(res_ok.is_ok());
     let obs_ok = supervisor.get_observation().await;
     assert_eq!(obs_ok.safety_state, SafetyState::Idle);
+}
+
+#[tokio::test]
+async fn test_normal_unload_settle_and_power_off_closed_loop() {
+    let mut config = ArmConfig::default();
+    config.dof = 2;
+    config.home_positions = vec![0.0, 0.0];
+    config.limits = vec![
+        JointLimit::new("j1", -3.0, 3.0, 2.0, 5.0),
+        JointLimit::new("j2", -3.0, 3.0, 2.0, 5.0),
+    ];
+
+    let supervisor = ArmSupervisor::new(config);
+    supervisor.set_torque(true).await.unwrap();
+
+    // 1. Arm is torqued, jog to an extended pose
+    supervisor.jog(vec![0.5, 0.5], Some(0.3), None).await.unwrap();
+    for _ in 0..10 {
+        supervisor.tick(0.02).await;
+    }
+    assert!(supervisor.get_observation().await.is_torqued);
+
+    // 2. Trigger NormalUnload stop policy
+    supervisor.apply_stop_policy(StopPolicy::NormalUnload).await;
+    assert!(supervisor.is_unloading().await);
+
+    // 3. Step until trajectory finishes
+    while supervisor.has_active_trajectory().await {
+        supervisor.tick(0.02).await;
+    }
+
+    // Trajectory is finished; arm is at home positions and settling window (40 ticks = 800ms) has started
+    assert!(supervisor.get_observation().await.is_torqued, "Torque must be maintained during settle window");
+    assert!(supervisor.is_unloading().await, "Must report unloading during settle window");
+
+    // Advance 39 ticks: still within the 40-tick settle window
+    for _ in 0..39 {
+        supervisor.tick(0.02).await;
+        assert!(supervisor.get_observation().await.is_torqued, "Torque must still be held during settle window");
+    }
+
+    // Advance 2 more ticks: torque cut is triggered
+    supervisor.tick(0.02).await;
+    supervisor.tick(0.02).await;
+
+    let obs_done = supervisor.get_observation().await;
+    assert!(!obs_done.is_torqued, "Torque must be cut after 40 stable resting ticks");
+    assert_eq!(obs_done.safety_state, SafetyState::Idle, "Must transition to Idle state");
+    assert!(!supervisor.is_unloading().await, "Must no longer be unloading");
 }

@@ -1297,16 +1297,18 @@ const CFG = {
   simpleSpeed: 0.3,           // simple mode: one fixed speed fraction (expert mode uses the 1-4 selector)
   // Quick presets, URDF model radians J1..J4 (mapped through CFG.cart.sign/off), J5 = 0.
   // inspect: TCP x 250 mm, z 300 mm, tool 60 deg below horizontal (IK solution).
-  // park: folded zero pose, gripper closed, torque released once the arm arrives
+  // park: folded resting pose (J1~J5=0, J6=1.5707963, gripper=0), torque released once the arm arrives
   //       (same sequence armd runs on shutdown). Override with ?inspect=deg,deg,deg,deg / ?park=...
   presets: {
     inspect: [0, -1.167, -1.565, 1.435],
-    park: [0, 0, 0, 0],
+    park: [0, 0, 0, 0, 0, 1.5707963, 0],
   },
 };
 for (const k of ['inspect', 'park']) {
   const a = (QS.get(k) || '').split(',').map(Number);
-  if (a.length === 4 && a.every(Number.isFinite)) CFG.presets[k] = a.map((d) => d * Math.PI / 180);
+  if ((a.length === 4 || a.length === 6 || a.length === 7) && a.every(Number.isFinite)) {
+    CFG.presets[k] = a.map((d) => d * Math.PI / 180);
+  }
 }
 (() => {
   const s = QS.get('sign');
@@ -2304,7 +2306,7 @@ function toastOnce(e) { if (Date.now() - lastErrAt > 2000) { lastErrAt = Date.no
    5-DOF cartesian teleop: XYZ + wrist pitch -> client IK -> joint stream
    ================================================================= */
 const toModel = (pos) => [0, 1, 2, 3].map((i) => (pos[i] - CFG.cart.off[i]) / CFG.cart.sign[i]);
-const toMotor = (q) => q.map((x, i) => CFG.cart.sign[i] * x + CFG.cart.off[i]);
+const toMotor = (q) => q.map((x, i) => (CFG.cart.sign[i] ?? 1) * x + (CFG.cart.off[i] ?? 0));
 function inMotorLimits(q) {
   const m = toMotor(q);
   const curM = (S.obs && Array.isArray(S.obs.positions)) ? S.obs.positions : null;
@@ -2770,8 +2772,8 @@ function clearFault() {
     .catch(() => {}); // api() already toasted
 }
 
-/* Controlled stow: unload to the lowest safe rest pose, wait until the arm settles,
-   and maintain holding torque. Never cuts torque while the arm is still moving. */
+/* Controlled stow: return to safe resting pose, wait until the arm settles,
+   and safely cut power/torque. Never cuts torque while the arm is still moving. */
 let unloading = false;
 async function controlledUnload() {
   if (unloading) return;
@@ -2785,12 +2787,20 @@ async function controlledUnload() {
       await new Promise((r) => setTimeout(r, 200));
       if (!S.obs || isStopped()) return;
       const pos = S.obs.positions;
-      const moved = last ? Math.max(...pos.slice(0, 5).map((x, i) => Math.abs(x - last[i]))) : 1;
+      const moved = last ? Math.max(...pos.slice(0, S.dof).map((x, i) => Math.abs(x - last[i]))) : 1;
       last = pos.slice();
-      if (moved < 0.005) { if (!stableSince) stableSince = Date.now(); else if (Date.now() - stableSince > 1000) break; }
-      else stableSince = 0;
+      if (moved < 0.005) {
+        if (!stableSince) stableSince = Date.now();
+        else if (!S.obs.is_torqued || Date.now() - stableSince > 2000) break;
+      } else {
+        stableSince = 0;
+      }
     }
-    toast('已收纳到位并保持锁定', 'ok');
+    if (S.obs && !S.obs.is_torqued) {
+      toast('已收纳到位并安全断电', 'ok');
+    } else {
+      toast('已收纳到位，力矩保持中', 'ok');
+    }
   } catch (e) {
     if (e.status) toast('收起失败: ' + (e.message || '请检查机械臂状态'), 'err');
   } finally { unloading = false; }
@@ -2804,7 +2814,7 @@ async function disableTorque({ fallback = true } = {}) {
     toast('已收纳并关闭力矩', 'ok');
     return true;
   } catch (e) {
-    const notAtRest = e.status === 409 && (e.code === 'ArmNotAtRestingPose' || /ArmNotAtRestingPose/i.test(e.message || ''));
+    const notAtRest = e.status === 409 && (e.code === 'ARM_NOT_AT_RESTING_POSE' || e.code === 'ArmNotAtRestingPose' || /ArmNotAtRestingPose/i.test(e.message || ''));
     if (notAtRest && fallback) {
       toast('机械臂悬空中，为防下坠已阻止直接断电。正在执行受控收纳...', 'err');
       controlledUnload();
@@ -2929,13 +2939,10 @@ function presetTarget(name) {
   const pos = (S.obs && Array.isArray(S.obs.positions)) ? S.obs.positions : [];
   let t = pos.slice(0, S.dof);
   while (t.length < S.dof) t.push(0);
-  const m = toMotor(CFG.presets[name]);
-  for (let i = 0; i < 4; i++) t[i] = m[i];
-  if (t.length > 4 && pos.length > 4) t[4] = pos[4];
-  if (t.length > 5 && pos.length > 5) t[5] = pos[5];
+  const m = toMotor(CFG.presets[name] || []);
+  for (let i = 0; i < m.length && i < t.length; i++) t[i] = m[i];
   if (name === 'park') {
-    if (t.length > 4) t[4] = 0;
-    if (t.length > 5) t[5] = 0;
+    if (t.length > 5) t[5] = 1.5707963;
     if (t.length > GRIP) { t[GRIP] = CFG.gripClosed; S.grip = 0; S.gripCmdAt = Date.now(); }
   }
   return clampTarget(t);

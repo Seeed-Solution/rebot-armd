@@ -223,8 +223,8 @@ async fn test_supervisor_stop_policies() {
         supervisor.tick(0.05).await;
     }
     let obs = supervisor.get_observation().await;
-    assert_eq!(obs.safety_state, SafetyState::Armed);
-    assert!(obs.is_torqued, "NormalUnload must maintain holding torque at home position");
+    assert_eq!(obs.safety_state, SafetyState::Idle);
+    assert!(!obs.is_torqued, "NormalUnload must safely cut torque at home position after settling");
     assert!((obs.positions[0] - 0.0).abs() < 1e-4);
     assert!((obs.positions[1] - 0.0).abs() < 1e-4);
 }

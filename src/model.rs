@@ -145,7 +145,7 @@ impl ArmConfig {
             JointLimit::new("gripper", -0.05, 0.16, 2.0, 5.0),
         ];
 
-        let home_positions = vec![0.0; dof];
+        let home_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0];
 
         Self {
             dof,

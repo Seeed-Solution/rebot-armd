@@ -195,55 +195,50 @@ impl SupervisorInner {
             }
         }
 
-        // 判定1 (几何): 各关节与 home_positions 偏差 abs <= 0.04 rad，且全关节偏差绝对值之和 <= 0.08 rad
+        // 判定1 (几何): 遍历 J1~J6（若 dof > 6，前 6 轴为主臂体轴），逐轴偏差 abs <= 0.08 rad，且前 6 轴绝对偏差之和 <= 0.16 rad；
+        // 若存在第 7 轴（夹爪），不阻塞主体安全支撑判定。
+        let arm_dof = dof.min(6);
         let mut total_deviation = 0.0f32;
-        for i in 0..dof {
+        for i in 0..arm_dof {
             let p = self.measured_positions[i];
             let h = self.config.home_positions[i];
             if !p.is_finite() || !h.is_finite() {
                 return false;
             }
             let dev = (p - h).abs();
-            if dev > 0.04 {
+            if dev > 0.08 {
                 return false;
             }
             total_deviation += dev;
         }
-        if total_deviation > 0.08 {
+        if total_deviation > 0.16 {
             return false;
         }
 
-        // 判定2 (静止): 所有关节实测速度 abs <= 0.01 rad/s
+        // 判定2 (静止): 各轴实测速度绝对值 <= 0.015 rad/s
         if self.measured_velocities.len() < dof {
             return false;
         }
         for i in 0..dof {
             let v = self.measured_velocities[i];
-            if !v.is_finite() || v.abs() > 0.01 {
+            if !v.is_finite() || v.abs() > 0.015 {
                 return false;
             }
         }
 
-        // 判定3 (力矩): 如果开启了重力补偿或有实测力矩，J2/J3 的实测外力矩绝对值 <= 1.0 N·m (或在仿真环境下视为满足)
+        // 判定3 (力矩): 检查主承重俯仰轴 J2 与 J3 的实测力矩绝对值
+        // 原位折叠就位时: J2 受底座直接承托实测力矩 <= 1.5 N·m (悬空约为 1.1~2.5 N·m)
+        //                 J3 小臂折叠受托实测力矩 <= 4.5 N·m (悬空全伸出时重力矩高达 7.65 N·m)
+        // 若是仿真驱动 (driver.is_none())，视为满足
         if self.driver.is_none() {
             return true;
         }
 
-        let j2_j3_indices = [1usize, 2usize];
-        for &idx in &j2_j3_indices {
+        let j2_j3_limits = [(1usize, 1.5f32), (2usize, 4.5f32)];
+        for &(idx, max_tau) in &j2_j3_limits {
             if idx < dof {
-                let measured_tau = self.torques.get(idx).copied().unwrap_or(0.0);
-                if !measured_tau.is_finite() {
-                    return false;
-                }
-                let ext_tau = if self.gravity_compensated && idx < self.gravity_torques.len() {
-                    let g_tau = self.gravity_torques[idx];
-                    let g_finite = if g_tau.is_finite() { g_tau } else { 0.0 };
-                    (measured_tau - g_finite).abs()
-                } else {
-                    measured_tau.abs()
-                };
-                if ext_tau > 1.0 {
+                let measured_tau = self.torques.get(idx).copied().unwrap_or(f32::NAN);
+                if !measured_tau.is_finite() || measured_tau.abs() > max_tau {
                     return false;
                 }
             }
@@ -1069,12 +1064,7 @@ impl SupervisorInner {
 
         // 3.1 Handle pending normal unload settling phase
         if self.pending_normal_unload && self.active_trajectory.is_none() {
-            let at_home_and_still = self.driver.is_none() || (
-                self.measured_positions.iter().zip(self.config.home_positions.iter()).all(|(p, h)| (p - h).abs() <= 0.015)
-                // Damiao velocity feedback is quantized to roughly 0.0073 rad/s;
-                // a 0.005 rad/s threshold can therefore never be observed.
-                && self.measured_velocities.iter().all(|v| v.abs() <= 0.015)
-            );
+            let at_home_and_still = self.is_at_safe_resting_pose();
 
             let ticks = self.unload_settle_ticks.get_or_insert(40); // 40 ticks = 800ms
             if at_home_and_still {
@@ -1083,12 +1073,11 @@ impl SupervisorInner {
                 } else {
                     self.unload_settle_ticks = None;
                     self.pending_normal_unload = false;
-                    tracing::info!("Arm settled cleanly at home position (positions within 0.015 rad, velocities <= 0.015 rad/s for 800ms); holding torque maintained.");
-                    self.is_torqued = true;
-                    self.commanded_positions = self.config.home_positions.clone();
-                    self.target_positions = self.config.home_positions.clone();
-                    self.commanded_velocities = vec![0.0; self.config.dof];
-                    self.safety.mark_motion_finished();
+                    tracing::info!("Arm settled cleanly at home position for 800ms; safely cutting torque to Standby/Idle.");
+                    if let Err(e) = self.set_torque(false) {
+                        tracing::warn!("Failed to cut torque after normal unload settle: {}", e);
+                        self.safety.mark_motion_finished();
+                    }
                 }
             } else {
                 // If not yet stably at rest within tolerances, reset settle tick window and clamp targets
