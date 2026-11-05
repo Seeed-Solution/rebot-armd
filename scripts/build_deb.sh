@@ -66,6 +66,7 @@ STAGING_DIR="${REPO_ROOT}/target/deb_staging/rebot-teleop"
 rm -rf "${STAGING_DIR}"
 mkdir -p "${STAGING_DIR}/DEBIAN"
 mkdir -p "${STAGING_DIR}/etc/init.d"
+mkdir -p "${STAGING_DIR}/usr/bin"
 mkdir -p "${STAGING_DIR}/usr/local/bin"
 mkdir -p "${STAGING_DIR}/usr/share/rebot-teleop"
 
@@ -74,13 +75,52 @@ echo "[2/4] Assembling rootfs staging structure..."
 # Copy runtime files
 cp -f "${PACKAGING_DIR}/rootfs/etc/init.d/K92rebot-teleop" "${STAGING_DIR}/etc/init.d/K92rebot-teleop"
 chmod 0755 "${STAGING_DIR}/etc/init.d/K92rebot-teleop"
+ln -sf /etc/init.d/K92rebot-teleop "${STAGING_DIR}/etc/init.d/S92rebot-teleop"
 
 cp -r "${PACKAGING_DIR}/rootfs/usr/share/rebot-teleop/"* "${STAGING_DIR}/usr/share/rebot-teleop/"
+
+# Ensure web UI index.html is present in usr/share/rebot-teleop
+if [ -f "${REPO_ROOT}/src/api/index.html" ]; then
+    cp -f "${REPO_ROOT}/src/api/index.html" "${STAGING_DIR}/usr/share/rebot-teleop/index.html"
+fi
 find "${STAGING_DIR}/usr/share/rebot-teleop" -type f -exec chmod 0644 {} +
 
-# Copy compiled binary
-cp -f "${BIN_PATH}" "${STAGING_DIR}/usr/local/bin/armd"
-chmod 0755 "${STAGING_DIR}/usr/local/bin/armd"
+# Copy compiled binary to usr/bin/armd and provide backward-compatible symlink at usr/local/bin/armd
+cp -f "${BIN_PATH}" "${STAGING_DIR}/usr/bin/armd"
+chmod 0755 "${STAGING_DIR}/usr/bin/armd"
+ln -sf /usr/bin/armd "${STAGING_DIR}/usr/local/bin/armd"
+
+# Copy go2rtc RISC-V binary if present (or download if missing)
+GO2RTC_BIN="${REPO_ROOT}/third_party/go2rtc"
+if [ ! -f "${GO2RTC_BIN}" ] || [ ! -s "${GO2RTC_BIN}" ] || [ $(wc -c < "${GO2RTC_BIN}") -lt 1000000 ]; then
+    echo "      go2rtc not found or invalid in third_party, attempting download for riscv64..."
+    mkdir -p "${REPO_ROOT}/third_party"
+    DOWNLOAD_URL="https://github.com/AlexxIT/go2rtc/releases/download/v1.9.4/go2rtc_linux_riscv64"
+    if [ -n "${GH_PROXY}" ]; then
+        DOWNLOAD_URL="${GH_PROXY}${DOWNLOAD_URL}"
+    fi
+    curl -fsSL -o "${GO2RTC_BIN}.tmp" "${DOWNLOAD_URL}" || true
+    if [ -f "${GO2RTC_BIN}.tmp" ] && [ $(wc -c < "${GO2RTC_BIN}.tmp") -gt 1000000 ]; then
+        mv "${GO2RTC_BIN}.tmp" "${GO2RTC_BIN}"
+        chmod +x "${GO2RTC_BIN}"
+    else
+        rm -f "${GO2RTC_BIN}.tmp"
+        echo "      Warning: go2rtc download failed or incomplete, skipping bundling"
+    fi
+fi
+if [ -f "${GO2RTC_BIN}" ] && [ $(wc -c < "${GO2RTC_BIN}") -gt 1000000 ]; then
+    echo "      Including go2rtc RISC-V binary: ${GO2RTC_BIN}"
+    cp -f "${GO2RTC_BIN}" "${STAGING_DIR}/usr/local/bin/go2rtc"
+    chmod 0755 "${STAGING_DIR}/usr/local/bin/go2rtc"
+fi
+
+# Copy go2rtc configuration
+if [ -f "${PACKAGING_DIR}/go2rtc.yaml" ]; then
+    echo "      Including go2rtc.yaml configuration..."
+    mkdir -p "${STAGING_DIR}/etc"
+    cp -f "${PACKAGING_DIR}/go2rtc.yaml" "${STAGING_DIR}/etc/go2rtc.yaml"
+    chmod 0644 "${STAGING_DIR}/etc/go2rtc.yaml"
+fi
 
 # Copy debian control scripts
 cp -f "${PACKAGING_DIR}/debian/postinst" "${STAGING_DIR}/DEBIAN/postinst"

@@ -77,11 +77,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting armd (Minimal Robotic Arm Daemon) - M0");
 
     let cli = parse_cli_args();
-    let config = ArmConfig::default();
+    let follower_name = cli.follower.as_deref().unwrap_or("mock");
+    let config = match follower_name {
+        "rebot-dm" => ArmConfig::rebot_dm(),
+        _ => ArmConfig::default(),
+    };
     let hz = config.control_frequency_hz;
     let period_ms = 1000 / hz as u64;
 
     let supervisor = Arc::new(ArmSupervisor::new(config));
+    info!(
+        "ArmSupervisor initialized: gravity_compensated={}",
+        supervisor.is_gravity_compensated().await
+    );
 
     // Mount hardware driver from CLI arguments if specified
     if let Some(ref follower) = cli.follower {
@@ -111,10 +119,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let port = cli.follower_port.as_deref().unwrap_or("can0");
                     match armd::transport::SocketCanTransport::open(port) {
                         Ok(can) => {
-                            let motor_ids = vec![1, 2, 3, 4, 5, 6];
+                            let motor_ids = vec![1, 2, 3, 4, 5, 6, 7];
                             let driver = armd::driver::DamiaoArmDriver::new(can, motor_ids);
                             supervisor.set_driver(Box::new(driver)).await;
-                            info!("Mounted Damiao (reBot Arm B601-DM) follower driver on {}", port);
+                            info!("Mounted Damiao (reBot Arm B601-DM, 7-axis POS_VEL mode) follower driver on {}", port);
                         }
                         Err(e) => warn!("Failed to open SocketCAN port {}: {}", port, e),
                     }
@@ -177,16 +185,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     let sup_shutdown = supervisor.clone();
+    let sup_shutdown_task = sup_shutdown.clone();
     let server = axum::serve(listener, router).with_graceful_shutdown(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("Shutdown signal received. Initiating NormalUnload...");
-        sup_shutdown.apply_stop_policy(StopPolicy::NormalUnload).await;
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("Failed to bind SIGTERM listener");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("SIGINT (Ctrl+C) received. Initiating NormalUnload...");
+                }
+                _ = sigterm.recv() => {
+                    info!("SIGTERM received. Initiating NormalUnload...");
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Shutdown signal received. Initiating NormalUnload...");
+        }
+        sup_shutdown_task.apply_stop_policy(StopPolicy::NormalUnload).await;
     });
 
     if let Err(e) = server.await {
         warn!("Server terminated with error: {}", e);
     }
 
+    // Allow control loop to complete NormalUnload trajectory and settling before terminating
+    let start_wait = std::time::Instant::now();
+    while sup_shutdown.is_unloading().await && start_wait.elapsed() < Duration::from_secs(6) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let obs = sup_shutdown.get_observation().await;
+    let config = sup_shutdown.get_config().await;
+    let at_home = obs.positions.iter().zip(config.home_positions.iter()).all(|(p, h)| (p - h).abs() < 0.20);
+    if at_home {
+        info!("Arm arrived safely at home position; powering off motors.");
+        let _ = sup_shutdown.set_torque(false).await;
+    } else if !obs.is_torqued {
+        info!("Arm is already unpowered; shutting down cleanly.");
+    } else {
+        warn!("Daemon exiting while arm is at an extended pose (is_torqued=true); maintaining hardware holding torque to prevent gravitational collapse.");
+    }
     control_handle.abort();
     info!("armd daemon stopped cleanly");
     Ok(())

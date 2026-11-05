@@ -9,7 +9,7 @@ use crate::transport::{CanFrame, CanTransport, TransportError};
 #[cfg(target_os = "linux")]
 pub struct SocketCanTransport {
     socket: CanSocket,
-    iface: String,
+    _iface: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -19,55 +19,93 @@ impl SocketCanTransport {
         let socket = CanSocket::open(iface).map_err(|e| {
             TransportError::Can(format!("Failed to open SocketCAN interface '{}': {}", iface, e))
         })?;
-        // Set short 1ms read timeout to avoid stalling 50Hz/100Hz control loop
+        // Set non-blocking mode to ensure the real-time control loop never blocks on recv
+        socket.set_nonblocking(true).map_err(|e| {
+            TransportError::Can(format!("Failed to set SocketCAN non-blocking mode: {}", e))
+        })?;
         let _ = socket.set_read_timeout(Some(std::time::Duration::from_millis(1)));
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = socket.as_raw_fd();
+            unsafe {
+                let zero: libc::c_int = 0;
+                // Linux kernel CAN RAW socket options:
+                // SOL_CAN_RAW = 101
+                // CAN_RAW_FILTER = 1
+                // CAN_RAW_ERR_FILTER = 2
+                // CAN_RAW_LOOPBACK = 3
+                // CAN_RAW_RECV_OWN_MSGS = 4
+                let res1 = libc::setsockopt(
+                    fd,
+                    101, /* SOL_CAN_RAW */
+                    4,   /* CAN_RAW_RECV_OWN_MSGS */
+                    &zero as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&zero) as libc::socklen_t,
+                );
+                if res1 < 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(TransportError::Can(format!(
+                        "Failed to set CAN_RAW_RECV_OWN_MSGS: {}",
+                        err
+                    )));
+                }
+
+                let res2 = libc::setsockopt(
+                    fd,
+                    101, /* SOL_CAN_RAW */
+                    3,   /* CAN_RAW_LOOPBACK */
+                    &zero as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&zero) as libc::socklen_t,
+                );
+                if res2 < 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(TransportError::Can(format!(
+                        "Failed to set CAN_RAW_LOOPBACK: {}",
+                        err
+                    )));
+                }
+            }
+        }
 
         Ok(Self {
             socket,
-            iface: iface.to_string(),
+            _iface: iface.to_string(),
         })
     }
+}
 
-    pub fn iface(&self) -> &str {
-        &self.iface
-    }
+#[cfg(not(target_os = "linux"))]
+pub struct SocketCanTransport;
 
-    pub fn set_timeout(&mut self, timeout: Option<std::time::Duration>) -> Result<(), TransportError> {
-        self.socket
-            .set_read_timeout(timeout)
-            .map_err(|e| TransportError::Can(format!("Failed to set read timeout: {}", e)))
-    }
-
-    pub fn with_timeout(self, timeout: std::time::Duration) -> Result<Self, TransportError> {
-        self.socket
-            .set_read_timeout(Some(timeout))
-            .map_err(|e| TransportError::Can(format!("Failed to set read timeout: {}", e)))?;
-        Ok(self)
+#[cfg(not(target_os = "linux"))]
+impl SocketCanTransport {
+    pub fn open(_iface: &str) -> Result<Self, TransportError> {
+        Err(TransportError::Can(
+            "SocketCAN is only supported on Linux targets".to_string(),
+        ))
     }
 }
 
 #[cfg(target_os = "linux")]
 impl CanTransport for SocketCanTransport {
     fn transmit(&mut self, frame: &CanFrame) -> Result<(), TransportError> {
-        let can_id = if frame.is_extended {
-            Id::Extended(
-                ExtendedId::new(frame.id & 0x1FFFFFFF)
-                    .ok_or_else(|| TransportError::Can("Invalid extended ID".to_string()))?,
-            )
+        let sk_frame = if frame.is_extended {
+            let id = ExtendedId::new(frame.id)
+                .ok_or_else(|| TransportError::Can(format!("Invalid extended CAN ID: {:#x}", frame.id)))?;
+            CanDataFrame::new(id, &frame.data[..frame.dlc as usize])
+                .ok_or_else(|| TransportError::Can("Failed to create extended CanDataFrame".to_string()))?
         } else {
-            Id::Standard(
-                StandardId::new((frame.id & 0x7FF) as u16)
-                    .ok_or_else(|| TransportError::Can("Invalid standard ID".to_string()))?,
-            )
+            let id = StandardId::new(frame.id as u16)
+                .ok_or_else(|| TransportError::Can(format!("Invalid standard CAN ID: {:#x}", frame.id)))?;
+            CanDataFrame::new(id, &frame.data[..frame.dlc as usize])
+                .ok_or_else(|| TransportError::Can("Failed to create standard CanDataFrame".to_string()))?
         };
 
-        let sk_frame = CanDataFrame::new(can_id, frame.data_slice()).ok_or_else(|| {
-            TransportError::Can("Failed to construct socketcan CanDataFrame".to_string())
-        })?;
-
         self.socket
-            .write_frame(&sk_frame)
-            .map_err(|e| TransportError::Can(format!("SocketCAN write failed: {}", e)))?;
+            .write_frame(&SkCanFrame::Data(sk_frame))
+            .map_err(|e| TransportError::Can(format!("SocketCAN send failed: {}", e)))?;
 
         Ok(())
     }
@@ -122,6 +160,25 @@ impl CanTransport for SocketCanTransport {
                 Err(TransportError::Can(format!("CAN bus error frame: {:?}", ef)))
             }
         }
+    }
+
+    fn flush(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl CanTransport for SocketCanTransport {
+    fn transmit(&mut self, _frame: &CanFrame) -> Result<(), TransportError> {
+        Err(TransportError::Can(
+            "SocketCAN is only supported on Linux targets".to_string(),
+        ))
+    }
+
+    fn receive(&mut self) -> Result<CanFrame, TransportError> {
+        Err(TransportError::Can(
+            "SocketCAN is only supported on Linux targets".to_string(),
+        ))
     }
 
     fn flush(&mut self) -> Result<(), TransportError> {

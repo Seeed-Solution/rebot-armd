@@ -1,5 +1,6 @@
 pub mod api;
 pub mod driver;
+pub mod gravity;
 pub mod model;
 pub mod protocol;
 pub mod recording;
@@ -13,13 +14,14 @@ pub use driver::{
     ArmDriver, ArmDriverError, DamiaoArmDriver, FashionStarArmDriver, FeetechArmDriver,
     JointTarget, RobStrideArmDriver,
 };
+pub use gravity::{compute_gravity_torques, verify_urdf_sha256, GravityError};
 pub use model::{ArmConfig, ArmObservation, JointLimit, JointState, ObservationSchema};
 pub use recording::{
     lerobot_arrow_schema, read_frames_from_parquet, write_frames_to_parquet, EpisodeRecorder,
     EpisodeState, RecordFrame,
 };
 pub use safety::{FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
-pub use supervisor::{ArmError, ArmSupervisor};
+pub use supervisor::{ArmError, ArmSupervisor, SupervisorInner};
 pub use trajectory::{
     MultiJointQuinticTrajectory, QuinticPolynomial, TrajectoryError, TrajectoryPlanner,
     TrajectoryPoint,

@@ -223,8 +223,8 @@ async fn test_supervisor_stop_policies() {
         supervisor.tick(0.05).await;
     }
     let obs = supervisor.get_observation().await;
-    assert_eq!(obs.safety_state, SafetyState::Idle);
-    assert!(!obs.is_torqued);
+    assert_eq!(obs.safety_state, SafetyState::Armed);
+    assert!(obs.is_torqued, "NormalUnload must maintain holding torque at home position");
     assert!((obs.positions[0] - 0.0).abs() < 1e-4);
     assert!((obs.positions[1] - 0.0).abs() < 1e-4);
 }
@@ -337,14 +337,16 @@ async fn test_supervisor_torque_disable_and_estop_state_clearing() {
     supervisor.jog(vec![2.0], Some(1.0), None).await.unwrap();
     supervisor.tick(0.1).await;
 
-    // Disabling torque must immediately clear active trajectory, pending normal unload, and zero velocities
-    supervisor.set_torque(false).await.unwrap();
+    // Disabling torque while moving / mid-air must be rejected with ArmNotAtRestingPose
+    let res = supervisor.set_torque(false).await;
+    assert!(matches!(
+        res,
+        Err(ArmError::Safety(SafetyError::ArmNotAtRestingPose { .. }))
+    ));
     let obs = supervisor.get_observation().await;
-    assert!(!obs.is_torqued);
-    assert_eq!(obs.velocities[0], 0.0);
+    assert!(obs.is_torqued, "Torque must remain enabled when not at resting pose");
 
     // 2. Normal unload interrupted by E-Stop latch
-    supervisor.set_torque(true).await.unwrap();
     supervisor.apply_stop_policy(StopPolicy::NormalUnload).await;
     // Interrupt with E-Stop
     supervisor.execute_stop(StopPolicy::EStopLatch).await;
@@ -369,14 +371,19 @@ async fn test_supervisor_servo_high_frequency_teleop() {
         Err(ArmError::Safety(SafetyError::EpochMismatch { .. }))
     ));
 
-    // High frequency teleop target to 0.5 (current is 0.0) with valid epoch_id = 1
-    // max_velocity = 2.0 rad/s, dt = 0.02s => max_step = 0.04 rad per tick
-    supervisor.servo(vec![0.5], 1).await.unwrap();
+    // High frequency teleop target to 0.10 (current is 0.0) with valid epoch_id = 1 (within 0.15 rad jump limit)
+    // Acceleration is bounded at 5 rad/s², so the first 20ms step is 0.002 rad
+    // at 0.1 rad/s rather than an instantaneous 2 rad/s velocity jump.
+    supervisor.servo(vec![0.10], 1).await.unwrap();
     let obs = supervisor.tick(0.02).await;
     assert!(obs.safety_state.is_operational());
-    // Truncated step
-    assert!((obs.positions[0] - 0.04).abs() < 1e-4);
-    assert!((obs.velocities[0] - 2.0).abs() < 1e-3);
+    assert!((obs.positions[0] - 0.002).abs() < 1e-4);
+    assert!((obs.velocities[0] - 0.1).abs() < 1e-3);
+
+    // Dirty frame with instantaneous jump > 0.15 rad must be dropped
+    supervisor.servo(vec![0.5], 1).await.unwrap();
+    let obs_dirty = supervisor.tick(0.02).await;
+    assert!(obs_dirty.positions[0] < 0.15, "Dirty frame > 0.15 rad must be discarded");
 }
 
 #[derive(Clone)]
@@ -795,5 +802,5 @@ async fn test_stale_feedback_triggers_bus_loss_fallback() {
     // Next tick must immediately trigger BusLossFallback
     let obs_tick = supervisor.tick(0.02).await;
     assert_eq!(obs_tick.safety_state, SafetyState::Fault(FaultReason::BusLoss));
-    assert!(!obs_tick.is_torqued);
+    assert!(obs_tick.is_torqued, "BusLossFallback must maintain holding torque to prevent dropping");
 }

@@ -42,6 +42,7 @@ dependencies = [
  "axum",
  "chrono",
  "futures-util",
+ "libc",
  "parquet",
  "reqwest",
  "serde",

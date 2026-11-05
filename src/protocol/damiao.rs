@@ -147,6 +147,25 @@ pub fn build_pos_vel_frame(base_id: u16, motor_id: u16, pos: f32, vel: f32) -> C
     CanFrame::new_standard(base_id + motor_id, &data).unwrap()
 }
 
+/// Raw velocity command for DamiAO J7 gripper in Position-Force mode.
+///
+/// Unit: 0.01 rad/s (2000 corresponds to 20.00 rad/s).
+pub const DAMIAO_GRIPPER_POSFORCE_VEL_RAW: u16 = 2000;
+
+/// Build Position-Force mode CAN frame (CAN ID = base_id + motor_id, float32 pos, u16 vel_raw, u16 i_des)
+///
+/// `vel_raw` is in units of 0.01 rad/s (e.g. `DAMIAO_GRIPPER_POSFORCE_VEL_RAW` = 2000 for 20.00 rad/s).
+pub fn build_pos_force_frame(base_id: u16, motor_id: u16, pos: f32, vel_raw: u16, i_des: u16) -> CanFrame {
+    let p_bytes = pos.to_le_bytes();
+    let v_bytes = vel_raw.to_le_bytes();
+    let i_bytes = i_des.to_le_bytes();
+    let mut data = [0u8; 8];
+    data[0..4].copy_from_slice(&p_bytes);
+    data[4..6].copy_from_slice(&v_bytes);
+    data[6..8].copy_from_slice(&i_bytes);
+    CanFrame::new_standard(base_id + motor_id, &data).unwrap()
+}
+
 /// Unpack feedback frame from Damiao motor
 pub fn unpack_feedback_frame(
     frame: &CanFrame,

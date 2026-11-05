@@ -21,7 +21,9 @@ Cargo.lock.bak
 *.local
 
 # Editor, OS and temporary files
+.cache/
 .DS_Store
+third_party/
 Thumbs.db
 .idea/
 .vscode/

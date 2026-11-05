@@ -1,0 +1,12 @@
+api:
+  listen: ":1984"
+  origin: "*"
+
+rtsp:
+  listen: ""
+
+webrtc:
+  listen: ":8555"
+
+streams:
+  live0: rtsp://127.0.0.1:8554/live0

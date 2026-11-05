@@ -121,6 +121,14 @@ pub fn build_stop_frame(motor_id: u8, master_id: u8) -> CanFrame {
     CanFrame::new_extended(ext_id, &[0u8; 8]).unwrap()
 }
 
+/// Build RobStride actuator clear faults frame
+pub fn build_clear_fault_frame(motor_id: u8, master_id: u8) -> CanFrame {
+    let ext_id = make_extended_id(TYPE_STOP, master_id as u16, motor_id);
+    let mut data = [0u8; 8];
+    data[0] = 1; // Clear fault flag in RobStride protocol
+    CanFrame::new_extended(ext_id, &data).unwrap()
+}
+
 /// Build RobStride Type-1 motion control CAN frame:
 /// Extended CAN ID:
 ///   - comm_type = 1 (bits 28..24)

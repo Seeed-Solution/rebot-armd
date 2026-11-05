@@ -8,8 +8,11 @@ cp -f /usr/share/rebot-teleop/rebot-teleop.md /userdata/local/apps/rebot-teleop.
 
 mkdir -p /userdata/datasets
 
+# 建立开机启动与管理软链接 S92rebot-teleop -> K92rebot-teleop
+ln -sf /etc/init.d/K92rebot-teleop /etc/init.d/S92rebot-teleop 2>/dev/null || true
+
 # 修正安装文件所有权为 root
-chown -R root:root /etc/init.d/K92rebot-teleop /usr/local/bin/armd /userdata/local/apps/ 2>/dev/null || true
+chown -R root:root /etc/init.d/K92rebot-teleop /etc/init.d/S92rebot-teleop /usr/bin/armd /usr/local/bin/armd /userdata/local/apps/ 2>/dev/null || true
 
 # 刷新 overlayfs 缓存，确保 supervisor 立即感知到 /etc/init.d/K92rebot-teleop
 sync

@@ -34,3 +34,4 @@ panic = "abort"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 socketcan = { version = "4", default-features = false }
+libc = "0.2"

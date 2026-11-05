@@ -23,15 +23,15 @@
             "type": "select",
             "title": "Arm Model",
             "title_zh": "机械臂型号",
-            "options": ["so-arm101", "rebot-rs", "rebot-dm", "mock"],
-            "default": "so-arm101"
+            "options": ["rebot-dm", "so-arm101", "rebot-rs", "mock"],
+            "default": "rebot-dm"
           },
           {
             "key": "serial_port",
             "type": "serial_port",
-            "title": "Serial Port",
-            "title_zh": "从手串口端口",
-            "default": "/dev/ttyS1"
+            "title": "Port / CAN Interface",
+            "title_zh": "从手通信端口/CAN接口",
+            "default": "can0"
           },
           {
             "key": "baud_rate",

@@ -90,6 +90,12 @@ pub enum SafetyError {
 
     #[error("Invalid non-finite float value (NaN or Inf) encountered")]
     InvalidValue,
+
+    #[error("Arm is not at resting pose (current: {current:?}, expected: {expected:?})")]
+    ArmNotAtRestingPose { current: Vec<f32>, expected: Vec<f32> },
+
+    #[error("Motion forbidden in fault/estop state: {0}")]
+    MotionForbiddenInFaultState(String),
 }
 
 /// Safety Manager tracking safety state machine and command generation ID
@@ -151,6 +157,11 @@ impl SafetyManager {
     /// Set torque enabled/disabled
     pub fn set_torque(&mut self, enable: bool) -> Result<SafetyState, SafetyError> {
         if self.state.is_stopped() {
+            if !enable {
+                return Err(SafetyError::MotionForbiddenInFaultState(
+                    "Cannot disable torque in EStop or Fault. Call clear_fault first.".into(),
+                ));
+            }
             if let SafetyState::Fault(ref reason) = self.state {
                 return Err(SafetyError::FaultActive(reason.clone()));
             }

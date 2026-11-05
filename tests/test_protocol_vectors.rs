@@ -513,12 +513,21 @@ fn test_damiao_driver_mock_loopback() {
     let motor_ids = vec![1, 2];
     let mut driver = DamiaoArmDriver::new(mock_can, motor_ids.clone());
 
-    // 1. Set torque enable
+    // 1. Set torque enable: provide motor enable feedback frames (state=1)
+    let mut d1_en = [0u8; 8];
+    d1_en[0] = 0x11; // state=1 (enabled), motor_id=1
+    let mut d2_en = [0u8; 8];
+    d2_en[0] = 0x12; // state=1 (enabled), motor_id=2
+    driver.can_mut().provide_rx_frame(CanFrame::new_standard(0x11, &d1_en).unwrap());
+    driver.can_mut().provide_rx_frame(CanFrame::new_standard(0x12, &d2_en).unwrap());
+
     driver.set_torque(true).unwrap();
     let tx = driver.can_mut().take_tx_frames();
     assert_eq!(tx.len(), 2);
     assert_eq!(tx[0].id, 1);
     assert_eq!(tx[0].data, CMD_ENABLE);
+    assert_eq!(tx[1].id, 2);
+    assert_eq!(tx[1].data, CMD_ENABLE);
 
     // 2. Write joint targets
     let targets = vec![
@@ -542,6 +551,29 @@ fn test_damiao_driver_mock_loopback() {
     let states = driver.read_joint_states().unwrap();
     assert!((states[0].position - 1.0).abs() < 0.005);
     assert_eq!(states[0].temperature, 45.0);
+
+    // Also test feedback frame with real hardware master CAN ID: 0x10 + motor_id (0x11, 0x12)
+    let p2 = damiao::float_to_uint(0.5, limits.p_min, limits.p_max, 16);
+    let mut d1_master = [0u8; 8];
+    d1_master[0] = 0x11; // state=1 (enabled), motor_id=1
+    d1_master[1] = (p2 >> 8) as u8;
+    d1_master[2] = (p2 & 0xFF) as u8;
+    d1_master[6] = 48;
+
+    let mut d2_master = [0u8; 8];
+    d2_master[0] = 0x12; // state=1 (enabled), motor_id=2
+    d2_master[1] = (p2 >> 8) as u8;
+    d2_master[2] = (p2 & 0xFF) as u8;
+    d2_master[6] = 46;
+
+    driver.can_mut().provide_rx_frame(CanFrame::new_standard(0x11, &d1_master).unwrap());
+    driver.can_mut().provide_rx_frame(CanFrame::new_standard(0x12, &d2_master).unwrap());
+    let states = driver.read_joint_states().unwrap();
+    assert!((states[0].position - 0.5).abs() < 0.005);
+    assert_eq!(states[0].temperature, 48.0);
+    assert!((states[1].position - 0.5).abs() < 0.005);
+    assert_eq!(states[1].temperature, 46.0);
+    assert!(driver.is_feedback_valid());
 
     // 4. Test filtering of invalid CAN ID and out-of-range motor ID
     let mut bad_d = [0u8; 8];
@@ -813,6 +845,11 @@ fn test_e2e_damiao_over_slcan_mock_serial() {
 
     let slcan = SlcanTransport::new(mock_serial);
     let mut arm = DamiaoArmDriver::new(slcan, vec![1]);
+
+    // Pre-inject motor 1 feedback frame with state=1 (enabled)
+    // Motor 1 feedback: CAN ID 0x11, DLC 8, data[0] = 0x11 (enabled, motor_id=1)
+    // In SLCAN format: t01181100000000002823\r
+    arm.can_mut().inner_mut().provide_rx(b"t01181100000000002823\r");
 
     // Command arm torque
     arm.set_torque(true).unwrap();

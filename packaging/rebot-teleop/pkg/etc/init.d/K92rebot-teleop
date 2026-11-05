@@ -14,8 +14,8 @@ PIDFILE=/var/run/$NAME.pid
 LOGFILE=/var/log/$NAME.log
 
 # 默认配置参数
-FOLLOWER_MODEL="so-arm101"
-FOLLOWER_PORT="/dev/ttyS1"
+FOLLOWER_MODEL="rebot-dm"
+FOLLOWER_PORT="can0"
 PORT="8765"
 AP_SSID="reCamera-Arm-Teleop"
 AP_PASS="12345678"
@@ -119,8 +119,14 @@ start() {
     # 启动 WiFi (STA 外部连接 + AP 热点双并发)
     start_wifi
 
-    # 探测实际串口设备
-    if [ ! -e "$FOLLOWER_PORT" ]; then
+    # 探测实际端口与 CAN 总线初始化
+    if [ "$FOLLOWER_PORT" = "can0" ]; then
+        echo "[rebot-teleop] Ensuring can0 interface is up (1Mbps, restart-ms 100, qlen 1000)..."
+        ip link set can0 down 2>/dev/null || true
+        ip link set can0 type can bitrate 1000000 restart-ms 100 2>/dev/null || true
+        ip link set can0 txqueuelen 1000 2>/dev/null || true
+        ip link set can0 up 2>/dev/null || true
+    elif [ ! -e "$FOLLOWER_PORT" ]; then
         if [ -e "/dev/ttyUSB0" ]; then
             FOLLOWER_PORT="/dev/ttyUSB0"
         elif [ -e "/dev/ttyACM0" ]; then
@@ -152,11 +158,22 @@ start() {
     done
 
     echo "OK"
+
+    # 启动 go2rtc 实时流服务 (如果安装)
+    if [ -x /usr/local/bin/go2rtc ] && [ -f /etc/go2rtc.yaml ]; then
+        if ! pidof go2rtc >/dev/null 2>&1; then
+            echo "[rebot-teleop] Starting go2rtc WebRTC stream service..."
+            start-stop-daemon -S -b -m -p /var/run/go2rtc.pid -a /bin/sh -- -c "exec /usr/local/bin/go2rtc -config /etc/go2rtc.yaml >> /var/log/go2rtc.log 2>&1" || true
+        fi
+    fi
+
     return 0
 }
 
 stop() {
     echo "Stopping $NAME..."
+    killall -q go2rtc 2>/dev/null || true
+    rm -f /var/run/go2rtc.pid 2>/dev/null || true
     if [ ! -f $PIDFILE ]; then
         killall -q armd 2>/dev/null || true
         echo "$NAME is not running"
@@ -198,7 +215,9 @@ stop() {
     done
 
     killall -9 -q armd 2>/dev/null || true
+    killall -9 -q go2rtc 2>/dev/null || true
     rm -f $PIDFILE
+    rm -f /var/run/go2rtc.pid 2>/dev/null || true
     echo "OK"
     return 0
 }
