@@ -128,6 +128,13 @@ impl From<ArmError> for ApiError {
     fn from(err: ArmError) -> Self {
         match err {
             ArmError::Safety(safety_err) => match safety_err {
+                crate::safety::SafetyError::HandoverSettling => ApiError {
+                    status: StatusCode::CONFLICT,
+                    error: "HANDOVER_SETTLING".to_string(),
+                    message: safety_err.to_string(),
+                    code: Some("HANDOVER_SETTLING".to_string()),
+                    safety_state: None,
+                },
                 crate::safety::SafetyError::ArmNotAtRestingPose { .. } => ApiError {
                     status: StatusCode::CONFLICT,
                     error: "ArmNotAtRestingPose".to_string(),

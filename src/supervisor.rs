@@ -29,6 +29,12 @@ pub enum ArmError {
     Internal(String),
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
+pub enum PreemptError {
+    #[error("Preemption cooldown active: {0}ms remaining")]
+    Cooldown(u64),
+}
+
 /// Active WebSocket client lease record
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActiveLease {
@@ -84,6 +90,8 @@ pub struct SupervisorInner {
     pub last_can_feedback_instant: Option<Instant>,
     pub bus_loss_instant: Option<Instant>,
     pub e_stop_latched: Arc<AtomicBool>,
+    pub last_preemption: Option<Instant>,
+    pub handover_settling_since: Option<Instant>,
 }
 
 impl SupervisorInner {
@@ -165,6 +173,8 @@ impl SupervisorInner {
             last_can_feedback_instant: None,
             bus_loss_instant: None,
             e_stop_latched: Arc::new(AtomicBool::new(false)),
+            last_preemption: None,
+            handover_settling_since: None,
         }
     }
 
@@ -220,7 +230,14 @@ impl SupervisorInner {
         if let Some(ref d) = self.driver {
             let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
             drv.set_torque(false).map_err(|e| SafetyError::ClearFaultRejected(format!("Torque disable transmission failed: {e}")))?;
-            let _ = drv.read_joint_states();
+            let poll_start = Instant::now();
+            while poll_start.elapsed() < Duration::from_millis(25) {
+                let _ = drv.read_joint_states();
+                if drv.is_feedback_valid() && drv.enable_state() == EnableState::Disabled {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
             if !drv.is_feedback_valid() || drv.enable_state() != EnableState::Disabled {
                 return Err(SafetyError::ClearFaultRejected("Torque disable has not been confirmed by fresh hardware feedback".into()));
             }
@@ -288,6 +305,9 @@ impl SupervisorInner {
 
     pub fn set_torque(&mut self, enable: bool) -> Result<SafetyState, SafetyError> {
         if enable {
+            if self.handover_settling_since.is_some() {
+                return Err(SafetyError::HandoverSettling);
+            }
             if self.disable_pending { return Err(SafetyError::ClearFaultRejected("Torque disable is still pending".into())); }
             // Atomic e-stop check
             if self.e_stop_latched.load(Ordering::SeqCst) {
@@ -447,6 +467,10 @@ impl SupervisorInner {
         self.servo_settled_ticks.fill(0);
         match policy {
             StopPolicy::NormalUnload => {
+                if self.handover_settling_since.is_some() {
+                    tracing::warn!("NormalUnload rejected while handover settling; maintaining holding torque");
+                    return;
+                }
                 // If in EStop or Fault: strictly forbid planning motion, maintain holding torque if torqued!
                 if self.safety.state().is_stopped() || self.e_stop_latched.load(Ordering::SeqCst) {
                     tracing::warn!("NormalUnload rejected in EStop or Fault state; maintaining holding torque");
@@ -639,6 +663,7 @@ impl SupervisorInner {
         self.following_error_since = None;
         self.bus_loss_instant = None;
         let state = self.safety.clear_fault()?;
+        self.handover_settling_since = None;
         self.e_stop_latched.store(false, Ordering::SeqCst);
         self.last_heartbeat = Instant::now();
         self.last_motion_frame = Instant::now();
@@ -649,9 +674,115 @@ impl SupervisorInner {
         if self.disable_pending { return false; }
         match &self.driver {
             None => !self.is_torqued,
-            Some(driver) => self.hardware_feedback_fresh(Duration::from_millis(250))
-                && driver.lock().map_or(false, |drv| drv.enable_state() == EnableState::Disabled),
+            Some(driver) => !self.is_torqued
+                && driver.lock().map_or(false, |drv| {
+                    if !drv.capabilities().enable_feedback {
+                        true
+                    } else {
+                        drv.enable_state() == EnableState::Disabled
+                    }
+                }),
         }
+    }
+
+    pub fn is_fully_settled_hold(&self) -> bool {
+        // Safe condition 1: Confirmed disabled (torque off, Idle, not disable pending)
+        if !self.is_torqued && matches!(self.safety.state(), SafetyState::Idle) && !self.disable_pending {
+            return true;
+        }
+
+        let (has_velocity_capability, is_valid) = match &self.driver {
+            None => (true, true),
+            Some(driver) => driver.lock().map_or((false, false), |drv| (drv.capabilities().velocity_feedback, drv.is_feedback_valid())),
+        };
+
+        if !is_valid {
+            return false;
+        }
+
+        let velocity_settled = if has_velocity_capability {
+            self.measured_velocities.len() == self.config.dof
+                && self.measured_velocities.iter().all(|v| v.is_finite() && v.abs() <= 0.05)
+        } else {
+            true
+        };
+
+        (self.safety.state() == &SafetyState::Armed || self.safety.state() == &SafetyState::Idle)
+            && self.active_trajectory.is_none()
+            && self.servo_target.is_none()
+            && self.commanded_velocities.len() == self.config.dof
+            && self.commanded_velocities.iter().all(|v| *v == 0.0)
+            && self.hardware_feedback_fresh(Duration::from_millis(100))
+            && velocity_settled
+    }
+
+    pub fn is_fully_settled_armed_hold(&self) -> bool {
+        self.is_fully_settled_hold()
+    }
+
+    pub fn preempt_lease(&mut self, conn: &str, label: &str) -> Result<(u64, Option<(String, u64)>), PreemptError> {
+        let now = Instant::now();
+        if let Some(ref active) = self.active_lease {
+            let is_expired = active.acquired_at.elapsed() >= self.lease_timeout;
+            if active.client_id == conn && !is_expired {
+                return Ok((active.generation, None));
+            }
+
+            if active.client_id != conn {
+                let cooldown = Duration::from_secs(3);
+                if let Some(last) = self.last_preemption {
+                    let elapsed = last.elapsed();
+                    if elapsed < cooldown {
+                        let remaining_ms = (cooldown.saturating_sub(elapsed).as_millis() as u64).max(1);
+                        return Err(PreemptError::Cooldown(remaining_ms));
+                    }
+                }
+            }
+        }
+
+        // Four-category state categorization (strictly fail-closed, no unwrap/panic, driver lock poison returns false)
+        let confirmed_hardware_disabled = match &self.driver {
+            None => !self.is_torqued && !self.disable_pending && self.safety.state() == &SafetyState::Idle,
+            Some(driver) => !self.is_torqued
+                && !self.disable_pending
+                && self.safety.state() == &SafetyState::Idle
+                && driver.lock().map_or(false, |drv| {
+                    if !drv.capabilities().enable_feedback {
+                        true
+                    } else {
+                        drv.enable_state() == EnableState::Disabled
+                    }
+                }),
+        };
+
+        if confirmed_hardware_disabled {
+            self.handover_settling_since = None;
+        } else if self.safety.state().is_stopped() {
+            self.handover_settling_since = None;
+        } else if self.is_fully_settled_armed_hold() {
+            self.handover_settling_since = None;
+        } else {
+            self.stop_motion();
+            self.handover_settling_since = Some(now);
+        }
+
+        let evicted = self.active_lease.as_ref().filter(|a| a.client_id != conn).map(|a| (a.client_id.clone(), a.generation));
+
+        self.lease_generation_counter += 1;
+        let gen = self.lease_generation_counter;
+        self.active_lease = Some(ActiveLease {
+            client_id: conn.to_string(),
+            generation: gen,
+            acquired_at: now,
+            last_valid_motion_instant: None,
+        });
+        self.last_heartbeat = now;
+        if evicted.is_some() {
+            self.last_preemption = Some(now);
+        }
+
+        tracing::info!("Preempted lease for connection {} (label {}), generation {}, evicted: {:?}", conn, label, gen, evicted);
+        Ok((gen, evicted))
     }
 
     pub fn acquire_lease(&mut self, client_id: &str) -> Result<u64, (String, u64)> {
@@ -732,6 +863,10 @@ impl SupervisorInner {
     }
 
     pub fn servo(&mut self, targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
+        if self.handover_settling_since.is_some() {
+            return Err(SafetyError::HandoverSettling);
+        }
+
         if self.e_stop_latched.load(Ordering::SeqCst) {
             return Err(SafetyError::EStopActive);
         }
@@ -788,6 +923,10 @@ impl SupervisorInner {
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
     ) -> Result<u64, ArmError> {
+        if self.handover_settling_since.is_some() {
+            return Err(ArmError::Safety(SafetyError::HandoverSettling));
+        }
+
         if self.e_stop_latched.load(Ordering::SeqCst) {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
@@ -1449,6 +1588,21 @@ impl SupervisorInner {
             self.measured_velocities = self.commanded_velocities.clone();
         }
 
+        if let Some(settling_since) = self.handover_settling_since {
+            if self.safety.state().is_stopped() {
+                // If arm entered Stopped (Fault, e.g. ThermalTrip, BusLoss, or EStop), terminate
+                // handover settling immediately and preserve the existing fault reason!
+                self.handover_settling_since = None;
+            } else if self.is_fully_settled_armed_hold() {
+                self.handover_settling_since = None;
+            } else if settling_since.elapsed() > Duration::from_millis(1500) {
+                self.stop_motion();
+                self.commanded_velocities = vec![0.0; self.config.dof];
+                self.safety.trigger_fault(FaultReason::Other("Handover settling timeout".into()));
+                self.handover_settling_since = None;
+            }
+        }
+
         let obs = self.current_observation();
 
         // 5. Record frame if episode recording is active
@@ -1555,6 +1709,16 @@ impl ArmSupervisor {
     pub async fn acquire_lease(&self, client_id: &str) -> Result<u64, (String, u64)> {
         let mut inner = self.inner.write().await;
         inner.acquire_lease(client_id)
+    }
+
+    pub async fn preempt_lease(&self, conn: &str, label: &str) -> Result<(u64, Option<(String, u64)>), PreemptError> {
+        let mut inner = self.inner.write().await;
+        inner.preempt_lease(conn, label)
+    }
+
+    pub async fn is_handover_settling(&self) -> bool {
+        let inner = self.inner.read().await;
+        inner.handover_settling_since.is_some()
     }
 
     pub async fn release_lease(&self, client_id: &str, generation: u64) -> bool {

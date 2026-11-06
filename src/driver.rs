@@ -645,17 +645,29 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn enable_state(&self) -> EnableState {
-        if self.awaiting_rx_boundary || !self.is_feedback_valid() || self.last_feedback_instant.iter().any(|t| {
+        if self.awaiting_rx_boundary {
+            return EnableState::Unknown;
+        }
+        if self.last_feedback_instant.iter().any(|t| {
             self.last_enable_command.map_or(false, |command| t.map_or(true, |sample| sample < command))
         }) {
             return EnableState::Unknown;
         }
-        if self.motor_status.iter().all(|&state| state == 1) {
-            EnableState::Enabled
-        } else if self.motor_status.iter().all(|&state| state == 0) {
-            EnableState::Disabled
+        if self.is_enabled {
+            if !self.is_feedback_valid() {
+                return EnableState::Unknown;
+            }
+            if self.motor_status.iter().all(|&state| state == 1) {
+                EnableState::Enabled
+            } else {
+                EnableState::Unknown
+            }
         } else {
-            EnableState::Unknown
+            if self.motor_status.iter().all(|&state| state == 0) {
+                EnableState::Disabled
+            } else {
+                EnableState::Unknown
+            }
         }
     }
 
@@ -766,7 +778,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             // Still send disable if draining times out: thermal protection must not
             // be blocked by traffic. Until a new empty-queue boundary, ignore ACKs.
             self.awaiting_rx_boundary = !self.drain_rx_before_command();
-            self.last_enable_command = Some(Instant::now());
+            let cmd_start = Instant::now();
+            self.last_enable_command = Some(cmd_start);
             let mut last_err = None;
             for &id in &self.motor_ids {
                 let frame = damiao::build_disable_frame(id);
@@ -785,8 +798,22 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.pending_rearm = true;
             self.last_target_frames.fill(None);
             self.last_query_instant = Some(Instant::now());
-            // Keep observed status until a post-command response confirms disable.
-            let _ = self.read_joint_states();
+            // Poll for responses confirming disable up to 25ms
+            let poll_start = Instant::now();
+            let mut check_count = 0;
+            while poll_start.elapsed() < Duration::from_millis(25) && check_count < 10 {
+                check_count += 1;
+                let _ = self.read_joint_states();
+                let all_fresh = !self.last_feedback_instant.is_empty()
+                    && self.last_feedback_instant.iter().all(|opt| {
+                        opt.map_or(false, |t| t >= cmd_start)
+                    });
+                if all_fresh && self.motor_status.iter().all(|&st| st == 0) {
+                    tracing::info!("All Damiao motors confirmed disabled (state=0) in {:?}", poll_start.elapsed());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
             Ok(())
         } else {
             // Fast-path: only if !pending_rearm && is_enabled && feedback_valid && all state == 1

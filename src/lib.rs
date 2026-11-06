@@ -21,7 +21,7 @@ pub use recording::{
     EpisodeState, RecordFrame,
 };
 pub use safety::{FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
-pub use supervisor::{ArmError, ArmSupervisor, SupervisorInner};
+pub use supervisor::{ArmError, ArmSupervisor, PreemptError, SupervisorInner};
 pub use trajectory::{
     MultiJointQuinticTrajectory, QuinticPolynomial, TrajectoryError, TrajectoryPlanner,
     TrajectoryPoint,

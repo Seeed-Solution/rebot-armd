@@ -96,6 +96,9 @@ pub enum SafetyError {
 
     #[error("Motion forbidden in fault/estop state: {0}")]
     MotionForbiddenInFaultState(String),
+
+    #[error("Arm is coming to a safe stop from previous session; motion gate locked")]
+    HandoverSettling,
 }
 
 /// Safety Manager tracking safety state machine and command generation ID
