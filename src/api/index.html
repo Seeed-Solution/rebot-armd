@@ -163,6 +163,9 @@ body.ui-simple .only-expert, body.ui-expert .only-simple { display: none !import
 .speed-pill:focus-visible { outline: 2px solid var(--sc-color-primary, #2563eb); outline-offset: 2px; }
 .fs-btn { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; padding: 0; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral); background: #fff; color: var(--sc-color-text-secondary); cursor: pointer; touch-action: manipulation; transition: background .15s, color .15s, border-color .15s; }
 .fs-btn[hidden] { display: none; }
+.lang-btn { flex: none; display: inline-flex; align-items: center; justify-content: center; height: 36px; min-width: 36px; padding: 0 10px; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral); background: #fff; color: var(--sc-color-text-secondary); font: 600 12px/1 inherit; font-family: inherit; white-space: nowrap; cursor: pointer; touch-action: manipulation; transition: background .15s, color .15s, border-color .15s; }
+.lang-btn:hover { color: var(--sc-color-text-primary); border-color: var(--sc-color-primary); }
+.lang-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
 .fs-btn svg { width: 18px; height: 18px; }
 .fs-btn .ic-exit, .fs-btn.on .ic-enter { display: none; }
 .fs-btn.on .ic-exit { display: block; }
@@ -607,6 +610,12 @@ kbd { display: inline-block; min-width: 20px; padding: 1px 5px; margin-right: 2p
   .brand-text small, .brand-text .full { display: none; }
   .ui-switch button { min-width: 0; padding: 0 12px; }
   .head-stats #link-badge { display: none; }
+  .brand { display: none; }
+  .topbar { gap: 6px; }
+  .ui-switch { margin: 0; }
+  .ui-switch button { padding: 0 8px; }
+  .lang-btn { padding: 0 6px; }
+  .head-stats { gap: 4px; margin-left: auto; }
   .safety { padding: 12px; }
   .btn-estop { min-height: 64px; }
   .sw { min-height: 64px; }
@@ -763,6 +772,7 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   .brand-text small { display: none; }
   .fs-btn { width: 28px; height: 28px; flex-shrink: 0; display: inline-flex !important; }
   .fs-btn svg { width: 16px; height: 16px; }
+  .lang-btn { height: 28px; min-width: 28px; padding: 0 8px; flex-shrink: 0; }
   /* touch controls: no scroll/zoom gestures, no text selection, no double-tap zoom */
   .disc, .pose-btn, .grip-key, .preset, .sw, .btn-estop, .fs-btn, .pad, .cluster, .knob {
     touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
@@ -804,6 +814,7 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   body.ui-simple .ui-switch .full { display: none; }
   body.ui-simple .ui-switch .short { display: inline; }
   body.ui-simple .fs-btn { width: 26px; height: 26px; border-radius: 13px; border-color: transparent; background: rgba(255,255,255,0.6); color: #1f2937; flex-shrink: 0; display: inline-flex !important; }
+  body.ui-simple .lang-btn { height: 26px; min-width: 26px; padding: 0 8px; border-radius: 13px; border-color: transparent; background: rgba(255,255,255,0.6); color: #1f2937; font-size: 12px; }
   body.ui-simple .fs-btn.on { background: var(--sc-color-primary); color: #fff; }
   body.ui-simple .head-stats .sc-status-badge { display: inline-flex; height: 24px; border-radius: 12px; background: rgba(255,255,255,0.75); }
   body.ui-simple .speed-pill { height: 24px; border-radius: 12px; border-color: transparent; background: rgba(255,255,255,0.75); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); color: #1f2937; margin: 0; text-align: center; }
@@ -972,21 +983,22 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
           <path d="M4 20h8"/><path d="M8 20v-4"/><path d="M8 16l5-6"/><path d="M13 10l5 2"/><path d="M18 12l2-2M18 12l2 2"/>
         </svg>
       </span>
-      <span class="brand-text">reBot<span class="full"> 机械臂遥控</span><small>SenseCraft · armd</small></span>
+      <span class="brand-text">reBot<span class="full" data-i18n="brand.sub"> 机械臂遥控</span><small>SenseCraft · armd</small></span>
     </div>
-    <div class="seg ui-switch" id="ui-seg" role="radiogroup" aria-label="界面模式">
-      <button data-ui="simple" role="radio"><span class="full">简化模式</span><span class="short">简</span></button>
-      <button data-ui="expert" role="radio"><span class="full">专家模式</span><span class="short">专</span></button>
+    <div class="seg ui-switch" id="ui-seg" role="radiogroup" data-i18n-aria="ui.mode" aria-label="界面模式">
+      <button data-ui="simple" role="radio"><span class="full" data-i18n="ui.simple">简化模式</span><span class="short" data-i18n="ui.simple.s">简</span></button>
+      <button data-ui="expert" role="radio"><span class="full" data-i18n="ui.expert">专家模式</span><span class="short" data-i18n="ui.expert.s">专</span></button>
     </div>
     <div class="head-stats">
-      <button class="speed-pill" id="speed-pill" aria-label="速度调节">60% ▾</button>
+      <button class="speed-pill" id="speed-pill" data-i18n-aria="speed.adjust" aria-label="速度调节">60% ▾</button>
       <span class="sc-status-badge" id="link-badge">-- Hz</span>
-      <span class="sc-status-badge" id="state-badge">离线</span>
+      <span class="sc-status-badge" id="state-badge" data-i18n="st.Offline">离线</span>
     </div>
-    <button class="fs-btn" id="btn-fs" type="button" aria-pressed="false" aria-label="进入全屏" title="全屏" hidden>
+    <button class="fs-btn" id="btn-fs" type="button" aria-pressed="false" aria-label="进入全屏" title="全屏" data-i18n-aria="fs.enter" data-i18n-title="fs.title" hidden>
       <svg class="ic-enter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
       <svg class="ic-exit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h3a2 2 0 0 0 2-2V3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M21 16h-3a2 2 0 0 0-2 2v3"/></svg>
     </button>
+    <button class="lang-btn" id="btn-lang" type="button" aria-label="Switch language">EN</button>
   </header>
 
   <main class="main">
@@ -1001,68 +1013,68 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
             <div class="vhint-icon">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3"/></svg>
             </div>
-            <div class="vhint-title" id="vhint-title">正在连接摄像头…</div>
+            <div class="vhint-title" id="vhint-title" data-i18n="v.connecting">正在连接摄像头…</div>
             <div class="vhint-sub" id="vhint-sub"></div>
-            <button class="btn vhint-btn" id="vhint-retry">立即重试</button>
+            <button class="btn vhint-btn" id="vhint-retry" data-i18n="v.retry">立即重试</button>
           </div>
         </div>
         <div class="hud">
-          <span class="sc-status-badge" id="cam-chip">连接中</span>
+          <span class="sc-status-badge" id="cam-chip" data-i18n="v.chip.connecting">连接中</span>
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
-          <span class="sc-status-badge plain" id="det-chip" hidden>检测 --</span>
-          <span class="sc-status-badge is-danger" id="rec-chip">录制 00:00</span>
+          <span class="sc-status-badge plain" id="det-chip" data-i18n="det.none" hidden>检测 --</span>
+          <span class="sc-status-badge is-danger" id="rec-chip" data-i18n="rec.chip0">录制 00:00</span>
         </div>
         <div class="armview only-expert" id="armview">
-          <span class="tag">姿态示意 · 侧视</span>
+          <span class="tag" data-i18n="armview.tag">姿态示意 · 侧视</span>
           <canvas id="arm-canvas"></canvas>
         </div>
-        <div class="banner">遥测断开 · 控制已锁定</div>
+        <div class="banner" data-i18n="banner.lock">遥测断开 · 控制已锁定</div>
       </div>
     </section>
 
     <!-- ===== expert: fine control ===== -->
     <section class="ops only-expert">
       <div class="toolbar">
-        <div class="seg" id="mode-seg" role="radiogroup" aria-label="控制方式">
+        <div class="seg" id="mode-seg" role="radiogroup" data-i18n-aria="ctl.mode" aria-label="控制方式">
           <button data-mode="joint" class="on" role="radio">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/><path d="M8 4v4M16 10v4M10 16v4"/></svg>
-            关节点动
+            <span data-i18n="mode.joint">关节点动</span>
           </button>
           <button data-mode="cart" role="radio">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 13V3M12 13l8 4.5M12 13l-8 4.5"/><path d="M9.5 5.5L12 3l2.5 2.5"/></svg>
-            空间位姿
+            <span data-i18n="mode.cart">空间位姿</span>
           </button>
         </div>
         <div class="tool-group">
-          <span class="cap">速度</span>
-          <div class="seg seg-sm" id="speed-seg" role="radiogroup" aria-label="速度倍率"></div>
+          <span class="cap" data-i18n="speed">速度</span>
+          <div class="seg seg-sm" id="speed-seg" role="radiogroup" data-i18n-aria="speed.mult" aria-label="速度倍率"></div>
         </div>
         <span class="grow"></span>
         <button class="btn" id="btn-home">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11l8-7 8 7"/><path d="M6 10v10h12V10"/></svg>
-          回零
+          <span data-i18n="home">回零</span>
         </button>
       </div>
 
       <div class="panel sc-card">
         <div class="panel-head">
           <div class="ph-title" id="ph-title"></div>
-          <div class="seg seg-sm" id="input-seg" role="radiogroup" aria-label="输入方式">
-            <button data-input="btn" class="on" role="radio">按键</button>
-            <button data-input="stick" role="radio">摇杆</button>
+          <div class="seg seg-sm" id="input-seg" role="radiogroup" data-i18n-aria="input.mode" aria-label="输入方式">
+            <button data-input="btn" class="on" role="radio" data-i18n="input.btn">按键</button>
+            <button data-input="stick" role="radio" data-i18n="input.stick">摇杆</button>
           </div>
         </div>
 
         <!-- cartesian: XYZ + pitch via IK, roll = J5, yaw follows J1 -->
         <div class="cart-zone" id="cart-zone">
           <div class="cart-read">
-            <div><span>X 前后 mm</span><b id="c-x">--</b></div>
-            <div><span>Y 左右 mm</span><b id="c-y">--</b></div>
-            <div><span>Z 高度 mm</span><b id="c-z">--</b></div>
-            <div><span>Roll 腕转</span><b id="c-r5">--</b></div>
-            <div><span>Pitch 俯仰</span><b id="c-p">--</b></div>
-            <div><span>Yaw 朝向</span><b id="c-yaw">--</b></div>
-            <div class="reach" id="c-reach"><span>臂展 R / <em id="c-rmax">520</em> mm</span><b id="c-r">--</b><i class="rbar"><i id="c-rfill"></i></i></div>
+            <div><span data-i18n="c.x">X 前后 mm</span><b id="c-x">--</b></div>
+            <div><span data-i18n="c.y">Y 左右 mm</span><b id="c-y">--</b></div>
+            <div><span data-i18n="c.z">Z 高度 mm</span><b id="c-z">--</b></div>
+            <div><span data-i18n="c.roll">Roll 腕转</span><b id="c-r5">--</b></div>
+            <div><span data-i18n="c.pitch">Pitch 俯仰</span><b id="c-p">--</b></div>
+            <div><span data-i18n="c.yaw">Yaw 朝向</span><b id="c-yaw">--</b></div>
+            <div class="reach" id="c-reach"><span><span data-i18n="c.reach">臂展 R /</span> <em id="c-rmax">520</em> mm</span><b id="c-r">--</b><i class="rbar"><i id="c-rfill"></i></i></div>
           </div>
           <div class="ik-line">
             <span class="sc-status-badge" id="ik-badge">IK --</span>
@@ -1072,43 +1084,43 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
           <div class="cart-ctl">
             <div class="cart-steps">
               <div class="dpad" id="dpad-xy"><span class="hub">XY</span></div>
-              <div class="vcol" id="vcol-z"><span class="vlab"><b>高度</b>Z</span></div>
-              <div class="vcol" id="vcol-p"><span class="vlab"><b>俯仰</b>Pitch</span></div>
-              <div class="vcol" id="vcol-r"><span class="vlab"><b>腕转</b>Roll</span></div>
+              <div class="vcol" id="vcol-z"><span class="vlab"><b data-i18n="vl.height">高度</b>Z</span></div>
+              <div class="vcol" id="vcol-p"><span class="vlab"><b data-i18n="vl.pitch">俯仰</b>Pitch</span></div>
+              <div class="vcol" id="vcol-r"><span class="vlab"><b data-i18n="vl.roll">腕转</b>Roll</span></div>
             </div>
             <div class="cart-sticks">
               <div class="stick-wrap">
                 <div class="pad xy" id="pad-cxy">
-                  <span class="dir t" data-ax="x" data-s="1">前</span>
-                  <span class="dir b" data-ax="x" data-s="-1">后</span>
-                  <span class="dir l" data-ax="y" data-s="1">左</span>
-                  <span class="dir r" data-ax="y" data-s="-1">右</span>
+                  <span class="dir t" data-ax="x" data-s="1" data-i18n="d.fwd">前</span>
+                  <span class="dir b" data-ax="x" data-s="-1" data-i18n="d.back">后</span>
+                  <span class="dir l" data-ax="y" data-s="1" data-i18n="d.left">左</span>
+                  <span class="dir r" data-ax="y" data-s="-1" data-i18n="d.right">右</span>
                   <i class="knob"></i>
                 </div>
-                <div class="stick-cap"><span class="ttl">水平平移</span><b>↕</b> X <b>↔</b> Y</div>
+                <div class="stick-cap"><span class="ttl" data-i18n="st.pan">水平平移</span><b>↕</b> X <b>↔</b> Y</div>
               </div>
               <div class="stick-wrap">
                 <div class="pad y" id="pad-cz">
-                  <span class="dir t" data-ax="z" data-s="1">升</span>
-                  <span class="dir b" data-ax="z" data-s="-1">降</span>
+                  <span class="dir t" data-ax="z" data-s="1" data-i18n="d.rise">升</span>
+                  <span class="dir b" data-ax="z" data-s="-1" data-i18n="d.lower">降</span>
                   <i class="knob"></i>
                 </div>
-                <div class="stick-cap"><span class="ttl">高度</span>Z</div>
+                <div class="stick-cap"><span class="ttl" data-i18n="vl.height">高度</span>Z</div>
               </div>
               <div class="stick-wrap">
                 <div class="pad y" id="pad-cp">
-                  <span class="dir t" data-ax="p" data-s="-1">抬</span>
-                  <span class="dir b" data-ax="p" data-s="1">压</span>
+                  <span class="dir t" data-ax="p" data-s="-1" data-i18n="d.lift">抬</span>
+                  <span class="dir b" data-ax="p" data-s="1" data-i18n="d.press">压</span>
                   <i class="knob"></i>
                 </div>
-                <div class="stick-cap"><span class="ttl">俯仰</span>Pitch</div>
+                <div class="stick-cap"><span class="ttl" data-i18n="vl.pitch">俯仰</span>Pitch</div>
               </div>
             </div>
             <div class="cart-side">
-              <div class="tool-group"><span class="cap">步长</span><div class="seg seg-sm" id="step-seg" role="radiogroup" aria-label="步长"></div></div>
+              <div class="tool-group"><span class="cap" data-i18n="step">步长</span><div class="seg seg-sm" id="step-seg" role="radiogroup" data-i18n-aria="step" aria-label="步长"></div></div>
               <label class="grip-slider">
-                <span><b>J6</b>夹爪</span>
-                <input type="range" id="grip-range" min="0" max="100" step="1" value="0" aria-label="夹爪开度">
+                <span><b>J6</b><span data-i18n="grip">夹爪</span></span>
+                <input type="range" id="grip-range" min="0" max="100" step="1" value="0" data-i18n-aria="grip.opening" aria-label="夹爪开度">
                 <output id="grip-pct">--%</output>
               </label>
             </div>
@@ -1122,36 +1134,36 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
         <div class="stick-zone" id="stick-zone">
           <div class="stick-wrap">
             <div class="pad xy" id="pad-left">
-              <span class="dir t" data-j="1" data-s="1">前倾</span>
-              <span class="dir b" data-j="1" data-s="-1">后仰</span>
-              <span class="dir l" data-j="0" data-s="-1">逆转</span>
-              <span class="dir r" data-j="0" data-s="1">顺转</span>
+              <span class="dir t" data-j="1" data-s="1" data-i18n="dj.lean">前倾</span>
+              <span class="dir b" data-j="1" data-s="-1" data-i18n="dj.back">后仰</span>
+              <span class="dir l" data-j="0" data-s="-1" data-i18n="dj.ccw">逆转</span>
+              <span class="dir r" data-j="0" data-s="1" data-i18n="dj.cw">顺转</span>
               <i class="knob"></i>
             </div>
-            <div class="stick-cap"><span class="ttl">左摇杆</span><b>↕</b> J2 大臂 <b>↔</b> J1 底座</div>
+            <div class="stick-cap"><span class="ttl" data-i18n="stick.left">左摇杆</span><b>↕</b> <span data-i18n="stick.j2">J2 大臂</span> <b>↔</b> <span data-i18n="stick.j1">J1 底座</span></div>
           </div>
           <div class="stick-center">
             <div class="stick-wrap">
               <div class="pad y" id="pad-wrist">
-                <span class="dir t" data-j="3" data-s="1">上翘</span>
-                <span class="dir b" data-j="3" data-s="-1">下倾</span>
+                <span class="dir t" data-j="3" data-s="1" data-i18n="dj.up">上翘</span>
+                <span class="dir b" data-j="3" data-s="-1" data-i18n="dj.down">下倾</span>
                 <i class="knob"></i>
               </div>
-              <div class="stick-cap"><span class="ttl">手腕</span>J4</div>
+              <div class="stick-cap"><span class="ttl" data-i18n="part.wrist">手腕</span>J4</div>
             </div>
             <div class="grip-col" id="grip-col">
-              <div class="stick-cap"><span class="ttl">夹爪 J6</span></div>
+              <div class="stick-cap"><span class="ttl" data-i18n="stick.grip6">夹爪 J6</span></div>
             </div>
           </div>
           <div class="stick-wrap">
             <div class="pad xy" id="pad-right">
-              <span class="dir t" data-j="2" data-s="1">抬高</span>
-              <span class="dir b" data-j="2" data-s="-1">下压</span>
-              <span class="dir l" data-j="4" data-s="-1">旋左</span>
-              <span class="dir r" data-j="4" data-s="1">旋右</span>
+              <span class="dir t" data-j="2" data-s="1" data-i18n="dj.raise">抬高</span>
+              <span class="dir b" data-j="2" data-s="-1" data-i18n="dj.lower">下压</span>
+              <span class="dir l" data-j="4" data-s="-1" data-i18n="dj.rl">旋左</span>
+              <span class="dir r" data-j="4" data-s="1" data-i18n="dj.rr">旋右</span>
               <i class="knob"></i>
             </div>
-            <div class="stick-cap"><span class="ttl">右摇杆</span><b>↕</b> J3 小臂 <b>↔</b> J5 腕转</div>
+            <div class="stick-cap"><span class="ttl" data-i18n="stick.right">右摇杆</span><b>↕</b> <span data-i18n="stick.j3">J3 小臂</span> <b>↔</b> <span data-i18n="stick.j5">J5 腕转</span></div>
           </div>
         </div>
       </div>
@@ -1164,20 +1176,20 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
         <div class="safety-row">
           <button class="sw" id="btn-enable" role="switch" aria-checked="false">
             <span class="sw-track"><i class="fill"></i><i class="thumb"></i></span>
-            <span class="sw-text"><b id="enable-txt">使能</b><small id="enable-sub">按住 0.6 秒</small></span>
+            <span class="sw-text"><b id="enable-txt" data-i18n="en.enable">使能</b><small id="enable-sub" data-i18n="en.hold">按住 0.6 秒</small></span>
           </button>
-          <button class="btn-estop" id="btn-estop" aria-label="紧急停止">
+          <button class="btn-estop" id="btn-estop" data-i18n-aria="estop.aria" aria-label="紧急停止">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M8 2.5h8l5.5 5.5v8L16 21.5H8L2.5 16V8z"/><path d="M8 12h8" stroke-linecap="round" stroke-width="2.6"/></svg>
-            <span>急停<small>E-STOP</small></span>
+            <span><span data-i18n="estop">急停</span><small>E-STOP</small></span>
           </button>
         </div>
         <div class="lock-note" id="lock-note">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
-          <span id="lock-txt">遥测断开，控制已锁定</span>
+          <span id="lock-txt" data-i18n="lock.offline">遥测断开，控制已锁定</span>
         </div>
         <button class="btn btn-preempt" id="btn-preempt" hidden>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h11l-3-3"/><path d="M17 17H6l3 3"/></svg>
-          <span>接管控制权</span>
+          <span data-i18n="preempt.btn">接管控制权</span>
         </button>
       </div>
 
@@ -1188,38 +1200,38 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
         <div class="ck-top">
           <div class="presets">
             <button class="preset" data-preset="home">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11l8-7 8 7"/><path d="M6 10v10h12V10"/></svg><span class="pt">原点<small>回到配置零位</small></span>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11l8-7 8 7"/><path d="M6 10v10h12V10"/></svg><span class="pt"><span data-i18n="pre.home">原点</span><small data-i18n="pre.home.d">回到配置零位</small></span>
             </button>
             <button class="preset" data-preset="inspect">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg><span class="pt">观察<small>俯视工作区</small></span>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg><span class="pt"><span data-i18n="pre.inspect">观察</span><small data-i18n="pre.inspect.d">俯视工作区</small></span>
             </button>
             <button class="preset" data-preset="park">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7l9-4 9 4-9 4z"/><path d="M3 7v10l9 4 9-4V7"/><path d="M12 11v10"/></svg><span class="pt">收纳<small>折叠后断电</small></span>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7l9-4 9 4-9 4z"/><path d="M3 7v10l9 4 9-4V7"/><path d="M12 11v10"/></svg><span class="pt"><span data-i18n="pre.park">收纳</span><small data-i18n="pre.park.d">折叠后断电</small></span>
             </button>
           </div>
-          <span class="grip-state">夹爪 <em id="s-grip-state" style="font-style:normal">--</em><i class="gbar"><i id="s-grip-bar"></i></i><b id="s-grip-pct">--%</b></span>
+          <span class="grip-state"><span data-i18n="grip">夹爪</span> <em id="s-grip-state" style="font-style:normal">--</em><i class="gbar"><i id="s-grip-bar"></i></i><b id="s-grip-pct">--%</b></span>
         </div>
         <div class="ck-mid">
           <div class="ck-left">
-            <button class="pose-btn" id="btn-pose" type="button" aria-pressed="false" aria-label="姿态模式（点击锁定，按住 Shift 临时切换）">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 18l8-13 8 13z"/><path d="M12 5v13"/></svg><span>姿态 / Pose</span>
+            <button class="pose-btn" id="btn-pose" type="button" aria-pressed="false" data-i18n-aria="pose.aria" aria-label="姿态模式（点击锁定，按住 Shift 临时切换）">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 18l8-13 8 13z"/><path d="M12 5v13"/></svg><span data-i18n="pose.btn">姿态 / Pose</span>
             </button>
-            <div class="disc" id="pad-sxy" aria-label="移动摇杆">
-              <span class="dir t" id="s-dir-t" data-ax="x" data-s="1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M6 11l6-6 6 6"/></svg><span class="lbl">前</span></span>
-              <span class="dir b" id="s-dir-b" data-ax="x" data-s="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M6 13l6 6 6-6"/></svg><span class="lbl">后</span></span>
-              <span class="dir l" id="s-dir-l" data-ax="y" data-s="1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg><span class="lbl">左</span></span>
-              <span class="dir r" id="s-dir-r" data-ax="y" data-s="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg><span class="lbl">右</span></span>
+            <div class="disc" id="pad-sxy" data-i18n-aria="pad.move" aria-label="移动摇杆">
+              <span class="dir t" id="s-dir-t" data-ax="x" data-s="1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M6 11l6-6 6 6"/></svg><span class="lbl" data-i18n="d.fwd">前</span></span>
+              <span class="dir b" id="s-dir-b" data-ax="x" data-s="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M6 13l6 6 6-6"/></svg><span class="lbl" data-i18n="d.back">后</span></span>
+              <span class="dir l" id="s-dir-l" data-ax="y" data-s="1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg><span class="lbl" data-i18n="d.left">左</span></span>
+              <span class="dir r" id="s-dir-r" data-ax="y" data-s="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg><span class="lbl" data-i18n="d.right">右</span></span>
               <i class="knob"></i>
             </div>
           </div>
           <div class="ck-right">
-            <div class="disc vslot" id="pad-sz" role="slider" aria-orientation="vertical" aria-label="升降滑杆" aria-valuemin="-1" aria-valuemax="1" aria-valuenow="0">
-              <span class="vz t" data-ax="z" data-s="1" aria-hidden="true">升</span><span class="vz b" data-ax="z" data-s="-1" aria-hidden="true">降</span>
+            <div class="disc vslot" id="pad-sz" role="slider" aria-orientation="vertical" data-i18n-aria="pad.z" aria-label="升降滑杆" aria-valuemin="-1" aria-valuemax="1" aria-valuenow="0">
+              <span class="vz t" data-ax="z" data-s="1" aria-hidden="true" data-i18n="d.rise">升</span><span class="vz b" data-ax="z" data-s="-1" aria-hidden="true" data-i18n="d.lower">降</span>
               <i class="knob"></i>
             </div>
             <div class="cluster">
-              <div class="disc vslot" id="pad-sgrip" role="slider" aria-orientation="vertical" aria-label="夹爪连续点动滑杆" aria-valuemin="-1" aria-valuemax="1" aria-valuenow="0">
-                <span class="vz t" data-ax="grip" data-s="1" aria-hidden="true">开</span><span class="vz b" data-ax="grip" data-s="-1" aria-hidden="true">闭</span>
+              <div class="disc vslot" id="pad-sgrip" role="slider" aria-orientation="vertical" data-i18n-aria="pad.grip" aria-label="夹爪连续点动滑杆" aria-valuemin="-1" aria-valuemax="1" aria-valuenow="0">
+                <span class="vz t" data-ax="grip" data-s="1" aria-hidden="true" data-i18n="d.open">开</span><span class="vz b" data-ax="grip" data-s="-1" aria-hidden="true" data-i18n="d.close">闭</span>
                 <i class="knob"></i>
               </div>
               <div class="grip-jog-readout" id="s-grip-readout">
@@ -1234,14 +1246,14 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
 
       <!-- expert: telemetry -->
       <div class="sc-card only-expert">
-        <div class="sc-card-title"><span>通信与状态</span><span class="mono" style="font-size:12px;color:var(--sc-color-text-tertiary)" id="epoch-txt">epoch --</span></div>
+        <div class="sc-card-title"><span data-i18n="comm.title">通信与状态</span><span class="mono" style="font-size:12px;color:var(--sc-color-text-tertiary)" id="epoch-txt">epoch --</span></div>
         <div class="kv">
-          <div><span>遥测帧率 (WS)</span><b id="t-hz">--</b></div>
+          <div><span data-i18n="kv.hz">遥测帧率 (WS)</span><b id="t-hz">--</b></div>
           <div><span>REST RTT</span><b id="t-rtt">--</b></div>
-          <div><span>租约心跳</span><b id="t-lease">--</b></div>
-          <div><span>CAN 总线（按遥测推断）</span><b id="t-can">--</b></div>
-          <div><span>力矩输出</span><b id="t-torque">--</b></div>
-          <div><span>最高温度</span><b id="t-temp">--</b></div>
+          <div><span data-i18n="kv.lease">租约心跳</span><b id="t-lease">--</b></div>
+          <div><span data-i18n="kv.can">CAN 总线（按遥测推断）</span><b id="t-can">--</b></div>
+          <div><span data-i18n="kv.torque">力矩输出</span><b id="t-torque">--</b></div>
+          <div><span data-i18n="kv.temp">最高温度</span><b id="t-temp">--</b></div>
         </div>
         <div class="fsm" id="fsm">
           <span data-s="Booting">BOOT</span><span data-s="Idle">IDLE</span><span data-s="Armed">ARMED</span><span data-s="Moving">MOVING</span>
@@ -1253,22 +1265,22 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
 
       <!-- expert: joints -->
       <div class="sc-card only-expert">
-        <div class="sc-card-title"><span>关节状态<small>角度 / 弧度 / 速度 / 力矩 / 温度</small></span></div>
+        <div class="sc-card-title"><span><span data-i18n="jt.title">关节状态</span><small data-i18n="jt.sub">角度 / 弧度 / 速度 / 力矩 / 温度</small></span></div>
         <table class="jtable">
-          <thead><tr><th>关节</th><th>角度°</th><th>rad</th><th>°/s</th><th>力矩</th><th>°C</th></tr></thead>
+          <thead><tr><th data-i18n="jt.joint">关节</th><th data-i18n="jt.deg">角度°</th><th>rad</th><th>°/s</th><th data-i18n="jt.torque">力矩</th><th>°C</th></tr></thead>
           <tbody id="jtable-body"></tbody>
         </table>
       </div>
 
       <!-- expert: dataset -->
       <div class="sc-card only-expert">
-        <div class="sc-card-title"><span>数据集录制<small>LeRobot</small></span><span class="sc-status-badge" id="rec-state">空闲</span></div>
+        <div class="sc-card-title"><span><span data-i18n="rec.title">数据集录制</span><small>LeRobot</small></span><span class="sc-status-badge" id="rec-state" data-i18n="rec.idle">空闲</span></div>
         <div class="rec-body">
           <label class="field">Episode ID<input id="rec-id" spellcheck="false" autocomplete="off"></label>
-          <div class="rec-stat"><span>时长 <b id="rec-time">00:00</b></span><span>估计帧数 <b id="rec-frames">0</b></span></div>
+          <div class="rec-stat"><span><span data-i18n="rec.dur">时长</span> <b id="rec-time">00:00</b></span><span><span data-i18n="rec.frames">估计帧数</span> <b id="rec-frames">0</b></span></div>
           <div class="rec-row">
-            <button class="btn btn-primary" id="btn-rec">开始录制</button>
-            <button class="btn" id="btn-discard" disabled>丢弃</button>
+            <button class="btn btn-primary" id="btn-rec" data-i18n="rec.start">开始录制</button>
+            <button class="btn" id="btn-discard" data-i18n="rec.discard" disabled>丢弃</button>
           </div>
           <div class="rec-last" id="rec-last"></div>
         </div>
@@ -1276,25 +1288,25 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
 
       <!-- expert: keyboard -->
       <div class="sc-card only-expert">
-        <div class="sc-card-title"><span>键盘快捷键</span></div>
+        <div class="sc-card-title"><span data-i18n="kb.title">键盘快捷键</span></div>
         <div class="kbd-help">
-          <span class="sub">关节点动</span>
-          <span><kbd>A</kbd><kbd>D</kbd></span><span>J1 底座 逆 / 顺时针</span>
-          <span><kbd>S</kbd><kbd>W</kbd></span><span>J2 大臂 后仰 / 前倾</span>
-          <span><kbd>↓</kbd><kbd>↑</kbd></span><span>J3 小臂 下压 / 抬高</span>
-          <span><kbd>Q</kbd><kbd>E</kbd></span><span>J4 手腕 下倾 / 上翘</span>
-          <span><kbd>←</kbd><kbd>→</kbd></span><span>J5 手腕 旋左 / 旋右</span>
-          <span><kbd>Z</kbd><kbd>X</kbd></span><span>J6 夹爪 张开 / 夹紧（G 切换）</span>
-          <span class="sub">空间位姿 / 简化模式</span>
-          <span><kbd>W</kbd><kbd>S</kbd></span><span>X 前 / 后</span>
-          <span><kbd>A</kbd><kbd>D</kbd></span><span>Y 左 / 右</span>
-          <span><kbd>↑</kbd><kbd>↓</kbd></span><span>Z 升 / 降</span>
-          <span><kbd>E</kbd><kbd>Q</kbd></span><span>俯仰 上抬 / 下压</span>
-          <span><kbd>←</kbd><kbd>→</kbd></span><span>腕转 Roll</span>
-          <span class="sub">通用</span>
-          <span><kbd>1</kbd>–<kbd>4</kbd></span><span>速度 15 / 30 / 50 / 80 %（专家模式）</span>
-          <span><kbd>H</kbd></span><span>回零</span>
-          <span><kbd>Space</kbd></span><span>急停</span>
+          <span class="sub" data-i18n="mode.joint">关节点动</span>
+          <span><kbd>A</kbd><kbd>D</kbd></span><span data-i18n="kb.j1">J1 底座 逆 / 顺时针</span>
+          <span><kbd>S</kbd><kbd>W</kbd></span><span data-i18n="kb.j2">J2 大臂 后仰 / 前倾</span>
+          <span><kbd>↓</kbd><kbd>↑</kbd></span><span data-i18n="kb.j3">J3 小臂 下压 / 抬高</span>
+          <span><kbd>Q</kbd><kbd>E</kbd></span><span data-i18n="kb.j4">J4 手腕 下倾 / 上翘</span>
+          <span><kbd>←</kbd><kbd>→</kbd></span><span data-i18n="kb.j5">J5 手腕 旋左 / 旋右</span>
+          <span><kbd>Z</kbd><kbd>X</kbd></span><span data-i18n="kb.j6">J6 夹爪 张开 / 夹紧（G 切换）</span>
+          <span class="sub" data-i18n="kb.cartsub">空间位姿 / 简化模式</span>
+          <span><kbd>W</kbd><kbd>S</kbd></span><span data-i18n="kb.x">X 前 / 后</span>
+          <span><kbd>A</kbd><kbd>D</kbd></span><span data-i18n="kb.y">Y 左 / 右</span>
+          <span><kbd>↑</kbd><kbd>↓</kbd></span><span data-i18n="kb.z">Z 升 / 降</span>
+          <span><kbd>E</kbd><kbd>Q</kbd></span><span data-i18n="kb.p">俯仰 上抬 / 下压</span>
+          <span><kbd>←</kbd><kbd>→</kbd></span><span data-i18n="kb.r">腕转 Roll</span>
+          <span class="sub" data-i18n="kb.common">通用</span>
+          <span><kbd>1</kbd>–<kbd>4</kbd></span><span data-i18n="kb.speed">速度 15 / 30 / 50 / 80 %（专家模式）</span>
+          <span><kbd>H</kbd></span><span data-i18n="home">回零</span>
+          <span><kbd>Space</kbd></span><span data-i18n="estop">急停</span>
         </div>
       </div>
     </aside>
@@ -1303,18 +1315,204 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
 <div class="toasts" id="toasts"></div>
 <div class="preempt-modal" id="preempt-modal" hidden>
   <div class="preempt-dialog" role="dialog" aria-modal="true" aria-labelledby="preempt-title">
-    <h3 id="preempt-title">接管控制权确认</h3>
-    <p>当前有其他设备或窗口持有控制权。确认接管机械臂控制权？接管后原控制窗口将切换为观察模式，正在进行的运动将被平稳悬停保持。</p>
+    <h3 id="preempt-title" data-i18n="preempt.title">接管控制权确认</h3>
+    <p data-i18n="preempt.body">当前有其他设备或窗口持有控制权。确认接管机械臂控制权？接管后原控制窗口将切换为观察模式，正在进行的运动将被平稳悬停保持。</p>
     <p class="preempt-cooldown" id="preempt-cooldown" hidden></p>
     <div class="preempt-actions">
-      <button class="btn" id="preempt-cancel">取消</button>
-      <button class="btn btn-primary" id="preempt-confirm">确认接管</button>
+      <button class="btn" id="preempt-cancel" data-i18n="cancel">取消</button>
+      <button class="btn btn-primary" id="preempt-confirm" data-i18n="preempt.confirm">确认接管</button>
     </div>
   </div>
 </div>
 
 <script>
 'use strict';
+/* =================================================================
+   i18n: zh / en dictionary. Server-returned text is never translated.
+   ================================================================= */
+const I18N = {
+  zh: {
+    'doc.title': 'reBot Teleop · 机械臂遥控',
+    'brand.sub': ' 机械臂遥控',
+    'ui.mode': '界面模式', 'ui.simple': '简化模式', 'ui.simple.s': '简', 'ui.expert': '专家模式', 'ui.expert.s': '专',
+    'lang.btn': 'EN', 'lang.aria': '切换语言',
+    'speed': '速度', 'speed.adjust': '速度调节', 'speed.mult': '速度倍率',
+    'fs.enter': '进入全屏', 'fs.title': '全屏', 'fs.exit': '退出全屏 / 展开布局', 'fs.hud': '全屏 HUD 沉浸模式',
+    'st.EStop': '急停', 'st.Offline': '离线', 'st.Armed': '已使能', 'st.Moving': '运动中', 'st.Idle': '未使能', 'st.Booting': '启动中', 'st.Fault': '故障', 'st.unconfirmed': '使能状态未确认',
+    'no_telemetry': '无遥测', 'unknown': '未知', 'unknown_reason': '未知原因',
+    'v.connecting': '正在连接摄像头…', 'v.retry': '立即重试', 'v.chip.connecting': '连接中', 'v.live': '实时',
+    'v.noservice': '未连接到视频服务', 'v.dropped': '视频流中断，正在重连…', 'v.cant_open': '视频源无法打开',
+    'v.retry_sub': '网络抖动或视频暂未就绪 · {sec} 秒后自动重试（亦可点击重试）',
+    'det.none': '检测 --', 'det.n': '检测 {n}',
+    'rec.chip0': '录制 00:00', 'rec.chip': '录制 ',
+    'armview.tag': '姿态示意 · 侧视', 'banner.lock': '遥测断开 · 控制已锁定',
+    'ctl.mode': '控制方式', 'mode.joint': '关节点动', 'mode.cart': '空间位姿', 'home': '回零',
+    'input.mode': '输入方式', 'input.btn': '按键', 'input.stick': '摇杆',
+    'c.x': 'X 前后 mm', 'c.y': 'Y 左右 mm', 'c.z': 'Z 高度 mm', 'c.roll': 'Roll 腕转', 'c.pitch': 'Pitch 俯仰', 'c.yaw': 'Yaw 朝向', 'c.reach': '臂展 R /',
+    'vl.height': '高度', 'vl.pitch': '俯仰', 'vl.roll': '腕转',
+    'd.fwd': '前', 'd.back': '后', 'd.left': '左', 'd.right': '右', 'd.rise': '升', 'd.lower': '降', 'd.lift': '抬', 'd.press': '压', 'd.open': '开', 'd.close': '闭',
+    'cb.pup': '上抬', 'cb.pdn': '下压', 'cb.rr': '右旋', 'cb.rl': '左旋',
+    'pl.up': '仰', 'pl.dn': '俯', 'pl.rl': '左滚', 'pl.rr': '右滚',
+    'st.pan': '水平平移', 'step': '步长', 'step.title': '每次点按 {n} mm / {n}°',
+    'grip': '夹爪', 'grip.opening': '夹爪开度', 'stick.grip6': '夹爪 J6',
+    'dj.lean': '前倾', 'dj.back': '后仰', 'dj.ccw': '逆转', 'dj.cw': '顺转', 'dj.up': '上翘', 'dj.down': '下倾', 'dj.raise': '抬高', 'dj.lower': '下压', 'dj.rl': '旋左', 'dj.rr': '旋右',
+    'stick.left': '左摇杆', 'stick.right': '右摇杆', 'stick.j2': 'J2 大臂', 'stick.j1': 'J1 底座', 'stick.j3': 'J3 小臂', 'stick.j5': 'J5 腕转', 'part.wrist': '手腕',
+    'en.enable': '使能', 'en.holding': '保持中 · 按住恢复', 'en.hold': '按住 0.6 秒', 'en.reset_estop': '⚠️ 点击复位急停', 'en.clear_fault': '⚠️ 点击清除故障', 'en.on_unconfirmed': '控制已开启 · 未确认',
+    'en.sub_reset': '复位后再长按使能', 'en.sub_off': '按住 0.6 秒失能',
+    'estop': '急停', 'estop.aria': '紧急停止',
+    'lock.offline': '遥测断开，控制已锁定', 'lock.observer': '当前为观察模式，其他页面可能正在控制',
+    'lock.estop': '⚠️ 急停已锁定：点击「复位急停」，再长按「使能」', 'lock.fault': '⚠️ 故障：点击「清除故障」后长按「使能」', 'lock.disabled': '未使能：按住「使能」0.6 秒后即可控制',
+    'preempt.btn': '接管控制权', 'preempt.title': '接管控制权确认',
+    'preempt.body': '当前有其他设备或窗口持有控制权。确认接管机械臂控制权？接管后原控制窗口将切换为观察模式，正在进行的运动将被平稳悬停保持。',
+    'preempt.confirm': '确认接管', 'preempt.taking': '接管中…', 'preempt.cool': '刚刚发生过控制权交接，请 {s} 秒后再试', 'cancel': '取消',
+    'pre.home': '原点', 'pre.home.d': '回到配置零位', 'pre.inspect': '观察', 'pre.inspect.d': '俯视工作区', 'pre.park': '收纳', 'pre.park.d': '折叠后断电',
+    'pn.home': '复位原点', 'pn.inspect': '观察位', 'pn.park': '收纳位', 'pn.default': '预设目标',
+    'pose.btn': '姿态 / Pose', 'pose.aria': '姿态模式（点击锁定，按住 Shift 临时切换）', 'pose.locked': '姿态已锁定，点击返回平移', 'pose.shift': '松开 Shift 返回平移', 'pose.hint': '点击锁定姿态模式；按住 Shift 临时切换',
+    'pad.move': '移动摇杆（前后 / 左右）', 'pad.pose': '姿态摇杆（俯仰 / 翻滚）', 'pad.z': '升降滑杆', 'pad.grip': '夹爪连续点动滑杆',
+    'grip.openPct': '开 {n}%', 'grip.open': '张开', 'grip.close': '闭合', 'grip.open_aria': '打开夹爪', 'grip.close_aria': '闭合夹爪', 'grip.is_open': '已张开', 'grip.is_closed': '已闭合', 'grip.half': '半开',
+    'comm.title': '通信与状态', 'kv.hz': '遥测帧率 (WS)', 'kv.lease': '租约心跳', 'kv.can': 'CAN 总线（按遥测推断）', 'kv.torque': '力矩输出', 'kv.temp': '最高温度',
+    'tq.on': '已确认开启', 'tq.off': '已确认关闭', 'tq.unknown': '未确认', 'can.fresh': '反馈新鲜', 'can.stale': '反馈缺失或过期',
+    'jt.title': '关节状态', 'jt.sub': '角度 / 弧度 / 速度 / 力矩 / 温度', 'jt.joint': '关节', 'jt.deg': '角度°', 'jt.torque': '力矩',
+    'rec.title': '数据集录制', 'rec.idle': '空闲', 'rec.recording': '录制中', 'rec.dur': '时长', 'rec.frames': '估计帧数', 'rec.start': '开始录制', 'rec.stop': '停止并保存', 'rec.discard': '丢弃',
+    'rec.saved': '已保存 {n} 帧 → {path}', 'rec.saved_toast': '已保存 {n} 帧', 'rec.discarded': '已丢弃',
+    'fm.estop': '⚠️ 急停已锁定，点击此处复位急停，再长按「使能」。', 'fm.fault': '⚠️ 故障：{d}。点击此处清除故障，再长按「使能」。',
+    'kb.title': '键盘快捷键', 'kb.j1': 'J1 底座 逆 / 顺时针', 'kb.j2': 'J2 大臂 后仰 / 前倾', 'kb.j3': 'J3 小臂 下压 / 抬高', 'kb.j4': 'J4 手腕 下倾 / 上翘', 'kb.j5': 'J5 手腕 旋左 / 旋右',
+    'kb.j6': 'J6 夹爪 张开 / 夹紧（G 切换）', 'kb.cartsub': '空间位姿 / 简化模式', 'kb.x': 'X 前 / 后', 'kb.y': 'Y 左 / 右', 'kb.z': 'Z 升 / 降', 'kb.p': '俯仰 上抬 / 下压', 'kb.r': '腕转 Roll',
+    'kb.common': '通用', 'kb.speed': '速度 15 / 30 / 50 / 80 %（专家模式）',
+    'ph.joint': '关节独立控制', 'ph.cart': '末端空间位姿 · 前端解析 IK · Yaw 随 J1',
+    'jd.base.part': '底座', 'jd.base.motion': '水平旋转', 'jd.base.neg': '逆时针转', 'jd.base.pos': '顺时针转',
+    'jd.shoulder.part': '肩部', 'jd.shoulder.motion': '大臂俯仰', 'jd.shoulder.neg': '后仰', 'jd.shoulder.pos': '前倾伸展',
+    'jd.elbow.part': '肘部', 'jd.elbow.motion': '小臂升降', 'jd.elbow.neg': '下压', 'jd.elbow.pos': '抬高升起',
+    'jd.wpitch.part': '手腕', 'jd.wpitch.motion': '俯仰调姿', 'jd.wpitch.neg': '腕下倾', 'jd.wpitch.pos': '腕上翘',
+    'jd.wroll.part': '手腕', 'jd.wroll.motion': '轴向自转', 'jd.wroll.neg': '旋左', 'jd.wroll.pos': '旋右',
+    'jd.wyaw.part': '手腕', 'jd.wyaw.motion': '末端摆动', 'jd.wyaw.neg': '摆左', 'jd.wyaw.pos': '摆右',
+    'jd.grip.part': '夹爪', 'jd.grip.motion': '开合抓取', 'jd.grip.neg': '张开', 'jd.grip.pos': '闭合夹紧', 'jd.grip.pos2': '夹紧',
+    'ik.reach': '超出臂展范围，该方向已停止', 'ik.singular': '接近奇异位形（完全伸直或折叠），该方向已停止', 'ik.limit': '目标需要超出关节限位，该方向已停止',
+    'ik.jump': '该位姿需要翻转关节构型，已拒绝', 'ik.floor': '已到达安装平面高度下限', 'ik.lag': '电机响应滞后过大(>0.4rad)，已安全停机',
+    'ik.blocked': 'IK 拦截', 'ik.stream': 'IK 流式 {hz}Hz', 'ik.ready': 'IK 就绪', 'ik.per_solve': ' µs/次',
+    'cart.enable_first': '使能后可控制末端位姿', 'cart.following': '目标跟随实测位姿 · 分支 {branch} · {tx}', 'cart.tx_ws': 'WS 流', 'cart.tx_rest': 'REST 伺服',
+    'wait_arm': '等待机械臂连接', 'wait_telemetry': '等待遥测', 'ready': '电机就绪 · 可以操控',
+    'fault.limit': '关节超限 {name}: {val}°', 'fault.thermal': '过温 J{j}: {temp}°C / {limit}°C',
+    'err.epoch': '控制状态已变化，请检查状态后重新操作', 'err.settling': '机械臂正在交接停稳中，请稍候片刻再操作', 'err.settling2': '机械臂正在交接停稳中，请稍候...', 'err.settling3': '机械臂正在交接停稳中，请稍候再试',
+    'err.park_unsupported': '当前机械臂缺少自动收纳所需配置或反馈能力，未启动收纳；可使用回零功能，力矩仍需现场确认',
+    'err.preset_unsupported': '当前机械臂不支持自动收纳，未启动运动；可使用回零功能，力矩仍需现场确认',
+    'err.rejected': '指令被拒绝', 'err.nolease': '当前页面没有控制权，请等待控制连接就绪', 'err.cmdtimeout': '设备未在时限内确认指令，请检查实际状态',
+    'err.reqfail': '请求失败：无法连接 armd', 'err.servo_reject': '控制指令被拒绝: ', 'err.preset_reject': '预设指令被拒绝: ', 'err.state_limit': '状态或限位不符', 'err.disconnected': '控制连接已断开或控制权已变化',
+    'toast.lease_lost': '⚠️ 控制权已被其他设备接管，当前页面已切换为观察模式', 'toast.goto': '正在前往{name}', 'toast.took': '已成功接管控制权', 'toast.take_failed': '接管未成功，控制权仍由其他设备持有',
+    'toast.take_rejected': '接管请求被拒绝: ', 'toast.take_timeout': '接管响应超时，正在对账控制权...', 'toast.ws_not_ready': '控制连接未就绪，请稍后再试',
+    'toast.homing': '回零中', 'toast.estop_unconfirmed': '无法确认急停，请使用现场安全装置并检查机械臂状态', 'toast.estop_confirmed': '设备已确认急停锁定，仍可能保持力矩', 'toast.estop_timeout': '急停状态未确认，请检查现场安全装置',
+    'toast.reset_ok': '已成功复位，请长按使能开启控制', 'toast.parked': '已收纳到位并安全断电', 'toast.unload_unconfirmed': '尚未确认安全卸载，力矩可能仍保持，请检查状态',
+    'toast.stow_failed': '收起失败: ', 'toast.stow_unconfirmed': '设备未确认收纳，请检查机械臂状态', 'toast.parked_off': '已收纳并关闭力矩',
+    'toast.in_air': '机械臂悬空中，为防下坠已阻止直接断电。正在执行受控收纳...', 'toast.not_at_rest': '机械臂仍未到达收纳位，力矩保持开启', 'toast.torque_off_fail': '关闭力矩失败',
+    'toast.torque_off_unconfirmed': '关闭力矩请求未确认，请检查连接和机械臂状态', 'toast.stowing': '正在平稳回零收起...', 'toast.enabled': '控制已开启，请确认机械臂反馈状态',
+    'toast.enable_fail': '使能失败：', 'toast.enable_fail_def': '电机未就绪/通讯超时', 'toast.preset_fail': '预设指令执行失败: ', 'toast.rec_start': '开始录制 ',
+  },
+  en: {
+    'doc.title': 'reBot Teleop',
+    'brand.sub': ' Arm Teleop',
+    'ui.mode': 'UI mode', 'ui.simple': 'Simple', 'ui.simple.s': 'S', 'ui.expert': 'Expert', 'ui.expert.s': 'E',
+    'lang.btn': '中文', 'lang.aria': 'Switch language',
+    'speed': 'Speed', 'speed.adjust': 'Adjust speed', 'speed.mult': 'Speed multiplier',
+    'fs.enter': 'Enter fullscreen', 'fs.title': 'Fullscreen', 'fs.exit': 'Exit fullscreen / restore layout', 'fs.hud': 'Fullscreen HUD mode',
+    'st.EStop': 'E-Stop', 'st.Offline': 'Offline', 'st.Armed': 'Enabled', 'st.Moving': 'Moving', 'st.Idle': 'Disabled', 'st.Booting': 'Booting', 'st.Fault': 'Fault', 'st.unconfirmed': 'Enable unconfirmed',
+    'no_telemetry': 'No telemetry', 'unknown': 'unknown', 'unknown_reason': 'unknown reason',
+    'v.connecting': 'Connecting to camera…', 'v.retry': 'Retry now', 'v.chip.connecting': 'Connecting', 'v.live': 'Live',
+    'v.noservice': 'Video service not reachable', 'v.dropped': 'Video stream lost, reconnecting…', 'v.cant_open': 'Cannot open video source',
+    'v.retry_sub': 'Network glitch or video not ready · retrying in {sec} s (or tap Retry)',
+    'det.none': 'Det --', 'det.n': 'Det {n}',
+    'rec.chip0': 'REC 00:00', 'rec.chip': 'REC ',
+    'armview.tag': 'Pose preview · side view', 'banner.lock': 'Telemetry lost · controls locked',
+    'ctl.mode': 'Control mode', 'mode.joint': 'Joint jog', 'mode.cart': 'Cartesian', 'home': 'Home',
+    'input.mode': 'Input type', 'input.btn': 'Buttons', 'input.stick': 'Sticks',
+    'c.x': 'X fwd/back mm', 'c.y': 'Y left/right mm', 'c.z': 'Z height mm', 'c.roll': 'Roll', 'c.pitch': 'Pitch', 'c.yaw': 'Yaw', 'c.reach': 'Reach R /',
+    'vl.height': 'Height', 'vl.pitch': 'Pitch', 'vl.roll': 'Roll',
+    'd.fwd': 'Fwd', 'd.back': 'Back', 'd.left': 'Left', 'd.right': 'Right', 'd.rise': 'Up', 'd.lower': 'Down', 'd.lift': 'Up', 'd.press': 'Down', 'd.open': 'Open', 'd.close': 'Close',
+    'cb.pup': 'Up', 'cb.pdn': 'Down', 'cb.rr': 'Roll R', 'cb.rl': 'Roll L',
+    'pl.up': 'Up', 'pl.dn': 'Down', 'pl.rl': 'Roll L', 'pl.rr': 'Roll R',
+    'st.pan': 'Horizontal', 'step': 'Step', 'step.title': '{n} mm / {n}° per tap',
+    'grip': 'Gripper', 'grip.opening': 'Gripper opening', 'stick.grip6': 'Gripper J6',
+    'dj.lean': 'Lean fwd', 'dj.back': 'Lean back', 'dj.ccw': 'CCW', 'dj.cw': 'CW', 'dj.up': 'Tilt up', 'dj.down': 'Tilt down', 'dj.raise': 'Raise', 'dj.lower': 'Lower', 'dj.rl': 'Rot. L', 'dj.rr': 'Rot. R',
+    'stick.left': 'Left stick', 'stick.right': 'Right stick', 'stick.j2': 'J2 Shoulder', 'stick.j1': 'J1 Base', 'stick.j3': 'J3 Elbow', 'stick.j5': 'J5 Wrist roll', 'part.wrist': 'Wrist',
+    'en.enable': 'Enable', 'en.holding': 'Holding · hold to resume', 'en.hold': 'Hold 0.6 s', 'en.reset_estop': '⚠️ Tap to reset E-Stop', 'en.clear_fault': '⚠️ Tap to clear fault', 'en.on_unconfirmed': 'On · unconfirmed',
+    'en.sub_reset': 'Then hold to enable', 'en.sub_off': 'Hold 0.6 s to disable',
+    'estop': 'E-Stop', 'estop.aria': 'Emergency stop',
+    'lock.offline': 'Telemetry lost, controls locked', 'lock.observer': 'Observer mode: another page may be in control',
+    'lock.estop': '⚠️ E-Stop latched: tap "Reset E-Stop", then hold "Enable"', 'lock.fault': '⚠️ Fault: tap "Clear fault", then hold "Enable"', 'lock.disabled': 'Disabled: hold "Enable" for 0.6 s to take control',
+    'preempt.btn': 'Take over control', 'preempt.title': 'Confirm take over',
+    'preempt.body': 'Another device or window holds control. Take over control of the arm? The previous window will switch to observer mode and any motion in progress will be held steady.',
+    'preempt.confirm': 'Take over', 'preempt.taking': 'Taking over…', 'preempt.cool': 'Control was just handed over. Try again in {s} s', 'cancel': 'Cancel',
+    'pre.home': 'Home', 'pre.home.d': 'Go to zero pose', 'pre.inspect': 'Inspect', 'pre.inspect.d': 'Look down at workspace', 'pre.park': 'Park', 'pre.park.d': 'Fold, then power off',
+    'pn.home': 'home pose', 'pn.inspect': 'inspect pose', 'pn.park': 'park pose', 'pn.default': 'preset',
+    'pose.btn': 'Pose', 'pose.aria': 'Pose mode (tap to lock, hold Shift to toggle temporarily)', 'pose.locked': 'Pose locked, tap to return to translate', 'pose.shift': 'Release Shift to return to translate', 'pose.hint': 'Tap to lock pose mode; hold Shift to toggle temporarily',
+    'pad.move': 'Move stick (fwd/back, left/right)', 'pad.pose': 'Pose stick (pitch / roll)', 'pad.z': 'Height slider', 'pad.grip': 'Gripper jog slider',
+    'grip.openPct': 'Open {n}%', 'grip.open': 'Open', 'grip.close': 'Close', 'grip.open_aria': 'Open gripper', 'grip.close_aria': 'Close gripper', 'grip.is_open': 'Open', 'grip.is_closed': 'Closed', 'grip.half': 'Half open',
+    'comm.title': 'Link & status', 'kv.hz': 'Telemetry rate (WS)', 'kv.lease': 'Lease heartbeat', 'kv.can': 'CAN bus (inferred)', 'kv.torque': 'Torque output', 'kv.temp': 'Max temperature',
+    'tq.on': 'Confirmed on', 'tq.off': 'Confirmed off', 'tq.unknown': 'Unconfirmed', 'can.fresh': 'Feedback fresh', 'can.stale': 'Feedback missing or stale',
+    'jt.title': 'Joint state', 'jt.sub': 'angle / rad / velocity / torque / temp', 'jt.joint': 'Joint', 'jt.deg': 'Angle°', 'jt.torque': 'Torque',
+    'rec.title': 'Dataset recording', 'rec.idle': 'Idle', 'rec.recording': 'Recording', 'rec.dur': 'Duration', 'rec.frames': 'Est. frames', 'rec.start': 'Start recording', 'rec.stop': 'Stop & save', 'rec.discard': 'Discard',
+    'rec.saved': 'Saved {n} frames → {path}', 'rec.saved_toast': 'Saved {n} frames', 'rec.discarded': 'Discarded',
+    'fm.estop': '⚠️ E-Stop latched. Tap here to reset it, then hold "Enable".', 'fm.fault': '⚠️ Fault: {d}. Tap here to clear it, then hold "Enable".',
+    'kb.title': 'Keyboard shortcuts', 'kb.j1': 'J1 Base CCW / CW', 'kb.j2': 'J2 Shoulder back / forward', 'kb.j3': 'J3 Elbow down / up', 'kb.j4': 'J4 Wrist tilt down / up', 'kb.j5': 'J5 Wrist rotate L / R',
+    'kb.j6': 'J6 Gripper open / close (G toggles)', 'kb.cartsub': 'Cartesian / Simple mode', 'kb.x': 'X fwd / back', 'kb.y': 'Y left / right', 'kb.z': 'Z up / down', 'kb.p': 'Pitch up / down', 'kb.r': 'Wrist Roll',
+    'kb.common': 'General', 'kb.speed': 'Speed 15 / 30 / 50 / 80 % (Expert mode)',
+    'ph.joint': 'Independent joint control', 'ph.cart': 'End-effector pose · browser-side IK · Yaw follows J1',
+    'jd.base.part': 'Base', 'jd.base.motion': 'Yaw rotation', 'jd.base.neg': 'CCW', 'jd.base.pos': 'CW',
+    'jd.shoulder.part': 'Shoulder', 'jd.shoulder.motion': 'Upper-arm pitch', 'jd.shoulder.neg': 'Lean back', 'jd.shoulder.pos': 'Lean fwd',
+    'jd.elbow.part': 'Elbow', 'jd.elbow.motion': 'Forearm lift', 'jd.elbow.neg': 'Lower', 'jd.elbow.pos': 'Raise',
+    'jd.wpitch.part': 'Wrist', 'jd.wpitch.motion': 'Pitch adjust', 'jd.wpitch.neg': 'Tilt down', 'jd.wpitch.pos': 'Tilt up',
+    'jd.wroll.part': 'Wrist', 'jd.wroll.motion': 'Axial roll', 'jd.wroll.neg': 'Roll left', 'jd.wroll.pos': 'Roll right',
+    'jd.wyaw.part': 'Wrist', 'jd.wyaw.motion': 'End swing', 'jd.wyaw.neg': 'Swing L', 'jd.wyaw.pos': 'Swing R',
+    'jd.grip.part': 'Gripper', 'jd.grip.motion': 'Open / close', 'jd.grip.neg': 'Open', 'jd.grip.pos': 'Close', 'jd.grip.pos2': 'Close',
+    'ik.reach': 'Out of reach, motion in this direction stopped', 'ik.singular': 'Near singularity (fully extended or folded), motion in this direction stopped', 'ik.limit': 'Target exceeds joint limits, motion in this direction stopped',
+    'ik.jump': 'Pose needs a joint configuration flip, rejected', 'ik.floor': 'Reached the mounting-plane height limit', 'ik.lag': 'Motor lag too large (>0.4 rad), safely stopped',
+    'ik.blocked': 'IK blocked', 'ik.stream': 'IK stream {hz} Hz', 'ik.ready': 'IK ready', 'ik.per_solve': ' µs/solve',
+    'cart.enable_first': 'Enable to control end-effector pose', 'cart.following': 'Target follows measured pose · branch {branch} · {tx}', 'cart.tx_ws': 'WS stream', 'cart.tx_rest': 'REST servo',
+    'wait_arm': 'Waiting for arm connection', 'wait_telemetry': 'Waiting for telemetry', 'ready': 'Motors ready · ready to control',
+    'fault.limit': 'Joint limit exceeded {name}: {val}°', 'fault.thermal': 'Over-temperature J{j}: {temp}°C / {limit}°C',
+    'err.epoch': 'Control state changed, check the state and retry', 'err.settling': 'Arm is settling after handover, wait a moment and retry', 'err.settling2': 'Arm is settling after handover, please wait...', 'err.settling3': 'Arm is settling after handover, retry shortly',
+    'err.park_unsupported': 'This arm lacks the configuration or feedback needed for auto-park; park not started. Use Home instead; confirm torque state on site',
+    'err.preset_unsupported': 'This arm does not support auto-park; no motion started. Use Home instead; confirm torque state on site',
+    'err.rejected': 'Command rejected', 'err.nolease': 'This page has no control lease, wait for the control connection', 'err.cmdtimeout': 'Device did not confirm the command in time, check the actual state',
+    'err.reqfail': 'Request failed: cannot reach armd', 'err.servo_reject': 'Control command rejected: ', 'err.preset_reject': 'Preset command rejected: ', 'err.state_limit': 'state or limits mismatch', 'err.disconnected': 'Control connection lost or lease changed',
+    'toast.lease_lost': '⚠️ Control was taken over by another device, this page is now an observer', 'toast.goto': 'Moving to {name}', 'toast.took': 'Control taken over', 'toast.take_failed': 'Take over failed, another device still holds control',
+    'toast.take_rejected': 'Take over rejected: ', 'toast.take_timeout': 'Take over timed out, reconciling lease...', 'toast.ws_not_ready': 'Control connection not ready, try again shortly',
+    'toast.homing': 'Homing', 'toast.estop_unconfirmed': 'E-Stop not confirmed, use the on-site safety device and check the arm', 'toast.estop_confirmed': 'Device confirmed E-Stop latch; torque may still be held', 'toast.estop_timeout': 'E-Stop state not confirmed, check the on-site safety device',
+    'toast.reset_ok': 'Reset done, hold Enable to take control', 'toast.parked': 'Parked and powered off safely', 'toast.unload_unconfirmed': 'Safe unload not confirmed, torque may still be held, check the state',
+    'toast.stow_failed': 'Stow failed: ', 'toast.stow_unconfirmed': 'Device did not confirm park, check the arm', 'toast.parked_off': 'Parked and torque off',
+    'toast.in_air': 'Arm is in the air; direct power-off blocked to prevent a drop. Running controlled park...', 'toast.not_at_rest': 'Arm has not reached the park pose, torque stays on', 'toast.torque_off_fail': 'Failed to turn torque off',
+    'toast.torque_off_unconfirmed': 'Torque-off request not confirmed, check the connection and the arm', 'toast.stowing': 'Smoothly homing and stowing...', 'toast.enabled': 'Control enabled, verify arm feedback',
+    'toast.enable_fail': 'Enable failed: ', 'toast.enable_fail_def': 'motors not ready / communication timeout', 'toast.preset_fail': 'Preset failed: ', 'toast.rec_start': 'Recording started ',
+  },
+};
+let LANG = (() => {
+  const saved = store('lang');
+  if (saved === 'zh' || saved === 'en') return saved;
+  return /^zh/i.test(navigator.language || '') ? 'zh' : 'en';
+})();
+function t(key, vars) {
+  let s = I18N[LANG][key];
+  if (s === undefined) s = I18N.zh[key];
+  if (s === undefined) return key;
+  return vars ? s.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? vars[k] : m)) : s;
+}
+const i18nHooks = [];
+function ikText(m) { return m && I18N.zh[m] !== undefined ? t(m) : m; }
+function applyI18n() {
+  document.documentElement.lang = LANG === 'zh' ? 'zh-CN' : 'en';
+  document.title = t('doc.title');
+  for (const el of document.querySelectorAll('[data-i18n]')) el.textContent = t(el.dataset.i18n);
+  for (const [attr, ds] of [['title', 'i18nTitle'], ['aria-label', 'i18nAria'], ['placeholder', 'i18nPlaceholder']]) {
+    for (const el of document.querySelectorAll('[data-i18n-' + attr.replace('aria-label', 'aria') + ']')) el.setAttribute(attr, t(el.dataset[ds]));
+  }
+  const lb = document.getElementById('btn-lang');
+  if (lb) { lb.textContent = t('lang.btn'); lb.setAttribute('aria-label', t('lang.aria')); }
+  for (const h of i18nHooks) h();
+}
+function setLang(l) {
+  LANG = l === 'en' ? 'en' : 'zh'; store('lang', LANG);
+  const tc = document.getElementById('toasts'); if (tc) tc.textContent = ''; // transient toasts are in the old language
+  applyI18n();
+}
 /* =================================================================
    Configuration
    ================================================================= */
@@ -1338,12 +1536,12 @@ const CFG = {
   // flip it here or at runtime via ?sign=-1,1,-1,-1,1 (J1..J5).
   jogSign: [-1, 1, -1, -1, 1],
   joints: [
-    { key: 'J1', part: '底座', motion: '水平旋转', en: 'Base Yaw', neg: '逆时针转', pos: '顺时针转', kn: 'A', kp: 'D' },
-    { key: 'J2', part: '肩部', motion: '大臂俯仰', en: 'Shoulder Pitch', neg: '后仰', pos: '前倾伸展', kn: 'S', kp: 'W' },
-    { key: 'J3', part: '肘部', motion: '小臂升降', en: 'Elbow Pitch', neg: '下压', pos: '抬高升起', kn: '↓', kp: '↑' },
-    { key: 'J4', part: '手腕', motion: '俯仰调姿', en: 'Wrist Pitch', neg: '腕下倾', pos: '腕上翘', kn: 'Q', kp: 'E' },
-    { key: 'J5', part: '手腕', motion: '轴向自转', en: 'Wrist Roll', neg: '旋左', pos: '旋右', kn: '←', kp: '→' },
-    { key: 'J6', part: '夹爪', motion: '开合抓取', en: 'Gripper', neg: '张开', pos: '闭合夹紧', kn: 'Z', kp: 'X' },
+    { key: 'J1', part: 'jd.base.part', motion: 'jd.base.motion', en: 'Base Yaw', neg: 'jd.base.neg', pos: 'jd.base.pos', kn: 'A', kp: 'D' },
+    { key: 'J2', part: 'jd.shoulder.part', motion: 'jd.shoulder.motion', en: 'Shoulder Pitch', neg: 'jd.shoulder.neg', pos: 'jd.shoulder.pos', kn: 'S', kp: 'W' },
+    { key: 'J3', part: 'jd.elbow.part', motion: 'jd.elbow.motion', en: 'Elbow Pitch', neg: 'jd.elbow.neg', pos: 'jd.elbow.pos', kn: '↓', kp: '↑' },
+    { key: 'J4', part: 'jd.wpitch.part', motion: 'jd.wpitch.motion', en: 'Wrist Pitch', neg: 'jd.wpitch.neg', pos: 'jd.wpitch.pos', kn: 'Q', kp: 'E' },
+    { key: 'J5', part: 'jd.wroll.part', motion: 'jd.wroll.motion', en: 'Wrist Roll', neg: 'jd.wroll.neg', pos: 'jd.wroll.pos', kn: '←', kp: '→' },
+    { key: 'J6', part: 'jd.grip.part', motion: 'jd.grip.motion', en: 'Gripper', neg: 'jd.grip.neg', pos: 'jd.grip.pos', kn: 'Z', kp: 'X' },
   ],
   video: {
     host: QS.get('go2rtc') || location.host, // single-origin unified gateway on port 8765
@@ -1557,29 +1755,29 @@ function rejectPendingCommands(message) {
 }
 function syncEpoch(epoch) {
   if (typeof epoch !== 'number') return;
-  if (S.epoch != null && S.epoch !== epoch) rejectPendingCommands('控制状态已变化，请检查状态后重新操作');
+  if (S.epoch != null && S.epoch !== epoch) rejectPendingCommands(t('err.epoch'));
   S.epoch = epoch;
 }
 function rpcError(response) {
   let message;
   if (response.code === 'HANDOVER_SETTLING') {
-    message = '机械臂正在交接停稳中，请稍候片刻再操作';
+    message = t('err.settling');
   } else if (response.code === 'UNSUPPORTED') {
-    message = '当前机械臂缺少自动收纳所需配置或反馈能力，未启动收纳；可使用回零功能，力矩仍需现场确认';
+    message = t('err.park_unsupported');
   } else {
-    message = response.message || response.error || '指令被拒绝';
+    message = response.message || response.error || t('err.rejected');
   }
   return Object.assign(new Error(message), { code: response.code, status: response.status });
 }
 function commandRPC(path, body) {
   if (!S.ws || S.ws.readyState !== 1 || S.leaseGeneration == null || S.epoch == null) {
-    return Promise.reject(Object.assign(new Error('当前页面没有控制权，请等待控制连接就绪'), { code: 'LEASE_REQUIRED' }));
+    return Promise.reject(Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' }));
   }
   const request_id = ++nextRequestId, ws = S.ws;
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pendingCommands.delete(request_id);
-      reject(Object.assign(new Error('设备未在时限内确认指令，请检查实际状态'), { code: 'COMMAND_TIMEOUT' }));
+      reject(Object.assign(new Error(t('err.cmdtimeout')), { code: 'COMMAND_TIMEOUT' }));
     }, 2000);
     pendingCommands.set(request_id, { resolve, reject, timer, ws });
     try { ws.send(JSON.stringify({ type: 'command', request_id, path, body: body || {}, generation: S.leaseGeneration, epoch_id: S.epoch, client_id: CLIENT_ID })); }
@@ -1604,7 +1802,7 @@ async function api(path, body, { quiet = false, method = 'POST' } = {}) {
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   } catch (e) {
-    if (!quiet) toast('请求失败：无法连接 armd', 'err', path);
+    if (!quiet) toast(t('err.reqfail'), 'err', path);
     throw e;
   } finally { clearTimeout(requestTimeout); }
   const dt = performance.now() - t0;
@@ -1632,8 +1830,8 @@ function parseState(s) {
     const kind = Object.keys(r || {})[0] || 'Unknown';
     const v = r[kind];
     let detail = kind;
-    if (kind === 'JointLimitExceeded' && v) detail = `关节超限 ${v.joint_name}: ${(v.value * DEG).toFixed(1)}°`;
-    else if (kind === 'ThermalTrip' && v) detail = `过温 J${v.joint_idx + 1}: ${Number(v.temperature).toFixed(1)}°C / ${v.limit}°C`;
+    if (kind === 'JointLimitExceeded' && v) detail = t('fault.limit', { name: v.joint_name, val: (v.value * DEG).toFixed(1) });
+    else if (kind === 'ThermalTrip' && v) detail = t('fault.thermal', { j: v.joint_idx + 1, temp: Number(v.temperature).toFixed(1), limit: v.limit });
     else if (kind === 'Other') detail = String(v);
     return { name, detail };
   }
@@ -1682,7 +1880,7 @@ function connectWS() {
       // Only a loss of the generation this page holds demotes it; a stale notice for an older generation is ignored.
       if (o.generation != null ? o.generation === S.leaseGeneration : S.leaseGeneration != null) {
         resetLease();
-        toast('⚠️ 控制权已被其他设备接管，当前页面已切换为观察模式', 'warn');
+        toast(t('toast.lease_lost'), 'warn');
         scheduleLeaseRetry(ws, CFG.leaseRetryMs);
       }
       return;
@@ -1698,14 +1896,14 @@ function connectWS() {
     if (o.type === 'servo_reject') {
       syncEpoch(o.epoch_id);
       const msg = o.code === 'HANDOVER_SETTLING'
-        ? '机械臂正在交接停稳中，请稍候...'
-        : '控制指令被拒绝: ' + (o.message || o.error || '状态或限位不符');
+        ? t('err.settling2')
+        : t('err.servo_reject') + (o.message || o.error || t('err.state_limit'));
       toastOnce({ message: msg, code: o.code || 'SERVO_REJECT' });
       return;
     }
     if (o.type === 'preset_ack') {
       syncEpoch(o.epoch_id);
-      toast('正在前往' + (PRESET_NAME[o.name] || o.name || '预设目标'), 'ok');
+      toast(t('toast.goto', { name: presetName(o.name) || o.name || t('pn.default') }), 'ok');
       return;
     }
     if (o.type === 'preset_reject') {
@@ -1713,8 +1911,8 @@ function connectWS() {
       S.presetRunning = false;
       S.preset = null;
       const msg = o.code === 'HANDOVER_SETTLING'
-        ? '机械臂正在交接停稳中，请稍候再试'
-        : (o.code === 'UNSUPPORTED' ? '当前机械臂不支持自动收纳，未启动运动；可使用回零功能，力矩仍需现场确认' : '预设指令被拒绝: ' + (o.message || o.error || o.reason || '状态或限位不符'));
+        ? t('err.settling3')
+        : (o.code === 'UNSUPPORTED' ? t('err.preset_unsupported') : t('err.preset_reject') + (o.message || o.error || o.reason || t('err.state_limit')));
       toast(msg, 'err');
       return;
     }
@@ -1771,7 +1969,7 @@ function onSocketClose(ws) {
 }
 // Lease state: not held + no pending retry timer. An in-flight acquire is owned by activeAcquire.
 function resetLease() {
-  rejectPendingCommands('控制连接已断开或控制权已变化');
+  rejectPendingCommands(t('err.disconnected'));
   S.streamActive = false;
   S.servoTarget = null;
   S.leaseGeneration = null;
@@ -1815,7 +2013,7 @@ function onAcquireResponse(ws, msg) {
     const wasHeld = S.leaseGeneration != null;
     S.leaseGeneration = msg.generation;
     closePreemptModal();
-    if (req.force || !wasHeld) toast('已成功接管控制权', 'ok');
+    if (req.force || !wasHeld) toast(t('toast.took'), 'ok');
     return;
   }
   // lease_rejected
@@ -1828,12 +2026,12 @@ function onAcquireResponse(ws, msg) {
     return;
   }
   if (msg.error === 'controller_busy') {
-    if (req.force) { closePreemptModal(); toast('接管未成功，控制权仍由其他设备持有', 'err'); }
+    if (req.force) { closePreemptModal(); toast(t('toast.take_failed'), 'err'); }
     scheduleLeaseRetry(ws, CFG.leaseRetryMs);
     renderPreemptModal();
     return;
   }
-  if (req.force) { closePreemptModal(); toast('接管请求被拒绝: ' + (msg.message || msg.error || '未知原因'), 'err'); }
+  if (req.force) { closePreemptModal(); toast(t('toast.take_rejected') + (msg.message || msg.error || t('unknown_reason')), 'err'); }
   scheduleLeaseRetry(ws, CFG.leaseRetryMs);
   renderPreemptModal();
 }
@@ -1847,7 +2045,7 @@ function onAcquireTimeout(req) {
   // Forced acquire timed out: the server may or may not have granted it. Reconcile with a plain
   // acquire (idempotent lease_granted if we own it, controller_busy otherwise); never retry force.
   closePreemptModal();
-  toast('接管响应超时，正在对账控制权...', 'warn');
+  toast(t('toast.take_timeout'), 'warn');
   startAcquire(req.ws, false);
 }
 function scheduleLeaseRetry(ws, delay) {
@@ -1879,9 +2077,9 @@ function renderPreemptModal() {
   const btn = $('preempt-confirm');
   const note = $('preempt-cooldown');
   btn.disabled = left > 0 || forcing;
-  setText(btn, forcing ? '接管中…' : '确认接管');
+  setText(btn, forcing ? t('preempt.taking') : t('preempt.confirm'));
   note.hidden = left <= 0;
-  if (left > 0) setText(note, `刚刚发生过控制权交接，请 ${Math.ceil(left / 1000)} 秒后再试`);
+  if (left > 0) setText(note, t('preempt.cool', { s: Math.ceil(left / 1000) }));
 }
 $('btn-preempt').addEventListener('click', () => {
   if (S.leaseGeneration != null) return;
@@ -1892,7 +2090,7 @@ $('preempt-modal').addEventListener('click', (e) => { if (e.target === e.current
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('preempt-modal').hidden) closePreemptModal(); });
 $('preempt-confirm').addEventListener('click', () => {
   if (S.preemptCooldownUntil > Date.now() || (activeAcquire && activeAcquire.force)) return;
-  if (!S.ws || S.ws.readyState !== 1) { toast('控制连接未就绪，请稍后再试', 'err'); return; }
+  if (!S.ws || S.ws.readyState !== 1) { toast(t('toast.ws_not_ready'), 'err'); return; }
   startAcquire(S.ws, true);
 });
 setInterval(() => {
@@ -2174,11 +2372,11 @@ async function loadSchema() {
 }
 
 function lockReason() {
-  if (!isLive()) return '遥测断开，控制已锁定';
-  if (S.leaseGeneration == null) return '当前为观察模式，其他页面可能正在控制';
-  if (S.state === 'EStop') return '⚠️ 急停已锁定：点击「复位急停」，再长按「使能」';
-  if (S.state === 'Fault') return '⚠️ 故障：点击「清除故障」后长按「使能」';
-  return '未使能：按住「使能」0.6 秒后即可控制';
+  if (!isLive()) return t('lock.offline');
+  if (S.leaseGeneration == null) return t('lock.observer');
+  if (S.state === 'EStop') return t('lock.estop');
+  if (S.state === 'Fault') return t('lock.fault');
+  return t('lock.disabled');
 }
 function flashLock() {
   const n = $('lock-note');
@@ -2261,13 +2459,13 @@ function jogButton(j, s, label, key) {
 }
 
 const JOINTS_7DOF = [
-  { key: 'J1', part: '底座', motion: '水平旋转', en: 'Base Yaw', neg: '逆时针转', pos: '顺时针转', kn: 'A', kp: 'D' },
-  { key: 'J2', part: '肩部', motion: '大臂俯仰', en: 'Shoulder Pitch', neg: '后仰', pos: '前倾伸展', kn: 'S', kp: 'W' },
-  { key: 'J3', part: '肘部', motion: '小臂升降', en: 'Elbow Pitch', neg: '下压', pos: '抬高升起', kn: '↓', kp: '↑' },
-  { key: 'J4', part: '手腕', motion: '俯仰调姿', en: 'Wrist Pitch', neg: '腕下倾', pos: '腕上翘', kn: 'Q', kp: 'E' },
-  { key: 'J5', part: '手腕', motion: '轴向自转', en: 'Wrist Roll', neg: '旋左', pos: '旋右', kn: '←', kp: '→' },
-  { key: 'J6', part: '手腕', motion: '末端摆动', en: 'Wrist Yaw', neg: '摆左', pos: '摆右', kn: 'R', kp: 'F' },
-  { key: 'J7', part: '夹爪', motion: '开合抓取', en: 'Gripper', neg: '张开', pos: '闭合夹紧', kn: 'Z', kp: 'X' },
+  { key: 'J1', part: 'jd.base.part', motion: 'jd.base.motion', en: 'Base Yaw', neg: 'jd.base.neg', pos: 'jd.base.pos', kn: 'A', kp: 'D' },
+  { key: 'J2', part: 'jd.shoulder.part', motion: 'jd.shoulder.motion', en: 'Shoulder Pitch', neg: 'jd.shoulder.neg', pos: 'jd.shoulder.pos', kn: 'S', kp: 'W' },
+  { key: 'J3', part: 'jd.elbow.part', motion: 'jd.elbow.motion', en: 'Elbow Pitch', neg: 'jd.elbow.neg', pos: 'jd.elbow.pos', kn: '↓', kp: '↑' },
+  { key: 'J4', part: 'jd.wpitch.part', motion: 'jd.wpitch.motion', en: 'Wrist Pitch', neg: 'jd.wpitch.neg', pos: 'jd.wpitch.pos', kn: 'Q', kp: 'E' },
+  { key: 'J5', part: 'jd.wroll.part', motion: 'jd.wroll.motion', en: 'Wrist Roll', neg: 'jd.wroll.neg', pos: 'jd.wroll.pos', kn: '←', kp: '→' },
+  { key: 'J6', part: 'jd.wyaw.part', motion: 'jd.wyaw.motion', en: 'Wrist Yaw', neg: 'jd.wyaw.neg', pos: 'jd.wyaw.pos', kn: 'R', kp: 'F' },
+  { key: 'J7', part: 'jd.grip.part', motion: 'jd.grip.motion', en: 'Gripper', neg: 'jd.grip.neg', pos: 'jd.grip.pos', kn: 'Z', kp: 'X' },
 ];
 
 /* ---------- jog rows (dynamically rendered) ---------- */
@@ -2285,12 +2483,12 @@ function renderJogRows() {
     mid.className = 'jmid';
     mid.innerHTML = `<div class="jtop">
         <span class="jicon">${partIcon(Math.min(i, 5))}</span>
-        <span class="jtitle"><span class="l1"><b>${jd.key}</b>${jd.part}</span><span class="l2">${jd.motion} · ${jd.en}</span></span>
+        <span class="jtitle"><span class="l1"><b>${jd.key}</b>${t(jd.part)}</span><span class="l2">${LANG === 'zh' ? t(jd.motion) + ' · ' + jd.en : jd.en}</span></span>
         <span class="jval"><span class="n">--</span><small>${i === GRIP ? '%' : '°'}</small></span>
       </div>
       <div class="jgauge"><i class="fill"></i><i class="zero"></i><i class="mark"></i></div>`;
-    const neg = jogButton(i, -1, jd.neg, jd.kn);
-    const pos = jogButton(i, 1, jd.pos, jd.kp);
+    const neg = jogButton(i, -1, t(jd.neg), jd.kn);
+    const pos = jogButton(i, 1, t(jd.pos), jd.kp);
     row.append(neg, mid, pos);
     container.appendChild(row);
     return {
@@ -2306,9 +2504,9 @@ renderJogRows();
 function renderGripCol() {
   const col = $('grip-col');
   if (!col) return;
-  col.innerHTML = `<div class="stick-cap"><span class="ttl">夹爪 ${S.dof === 7 ? 'J7' : 'J6'}</span></div>`;
-  const open = jogButton(GRIP, -1, '张开', 'Z');
-  const close = jogButton(GRIP, 1, '夹紧', 'X');
+  col.innerHTML = `<div class="stick-cap"><span class="ttl">${t('grip')} ${S.dof === 7 ? 'J7' : 'J6'}</span></div>`;
+  const open = jogButton(GRIP, -1, t('jd.grip.neg'), 'Z');
+  const close = jogButton(GRIP, 1, t('jd.grip.pos2'), 'X');
   const val = document.createElement('div');
   val.className = 'gval'; val.id = 'grip-val'; val.textContent = '--%';
   col.append(open, val, close);
@@ -2589,8 +2787,8 @@ function inMotorLimits(q) {
   return true;
 }
 const IK_MSG = {
-  reach: '超出臂展范围，该方向已停止', singular: '接近奇异位形（完全伸直或折叠），该方向已停止',
-  limit: '目标需要超出关节限位，该方向已停止', jump: '该位姿需要翻转关节构型，已拒绝', floor: '已到达安装平面高度下限',
+  reach: 'ik.reach', singular: 'ik.singular',
+  limit: 'ik.limit', jump: 'ik.jump', floor: 'ik.floor',
 };
 function cartSync(pos) {
   C.q = toModel(pos);
@@ -2601,7 +2799,7 @@ function cartSync(pos) {
 }
 function cartReject(err) {
   C.goal = { ...C.cmd };
-  if (C.status !== err) { buzz(30); toastOnce({ message: IK_MSG[err] || err, code: 'IK' }); }
+  if (C.status !== err) { buzz(30); toastOnce({ message: ikText(IK_MSG[err] || err), code: 'IK' }); }
   C.status = err; C.msg = IK_MSG[err] || err;
 }
 // UI command in base-frame semantics: x forward, y left, z up, p = pitch down (+)
@@ -2750,7 +2948,7 @@ function cartTick() {
     else if (now - C.stallSince > 500) {
       C.goal = { ...C.cmd };
       C.status = 'stall';
-      C.msg = '电机响应滞后过大(>0.4rad)，已安全停机';
+      C.msg = 'ik.lag';
     }
   } else {
     C.stallSince = 0;
@@ -2810,8 +3008,11 @@ function cartButton(parent, ax, s, label, sub, arrow) {
   const b = document.createElement('button');
   b.className = 'jbtn cbtn';
   b.dataset.ax = ax; b.dataset.s = s;
-  b.setAttribute('aria-label', label + ' ' + sub);
-  b.innerHTML = `${ARROW[arrow]}<span>${label}</span><b>${sub}</b>`;
+  const render = () => {
+    b.setAttribute('aria-label', t(label) + ' ' + sub);
+    b.innerHTML = `${ARROW[arrow]}<span>${t(label)}</span><b>${sub}</b>`;
+  };
+  render(); i18nHooks.push(render);
   let pid = null, timer = null, held = false;
   const idx = s > 0 ? 1 : 0;
   const stop = () => {
@@ -2836,25 +3037,26 @@ function cartButton(parent, ax, s, label, sub, arrow) {
 }
 (() => {
   const xy = $('dpad-xy');
-  cartButton(xy, 'x', 1, '前', 'X+', 'up');
-  cartButton(xy, 'x', -1, '后', 'X−', 'down');
-  cartButton(xy, 'y', 1, '左', 'Y+', 'left');
-  cartButton(xy, 'y', -1, '右', 'Y−', 'right');
+  cartButton(xy, 'x', 1, 'd.fwd', 'X+', 'up');
+  cartButton(xy, 'x', -1, 'd.back', 'X−', 'down');
+  cartButton(xy, 'y', 1, 'd.left', 'Y+', 'left');
+  cartButton(xy, 'y', -1, 'd.right', 'Y−', 'right');
   const z = $('vcol-z'), zl = z.firstElementChild;
-  cartButton(z, 'z', 1, '升', 'Z+', 'up'); z.appendChild(zl);
-  cartButton(z, 'z', -1, '降', 'Z−', 'down');
+  cartButton(z, 'z', 1, 'd.rise', 'Z+', 'up'); z.appendChild(zl);
+  cartButton(z, 'z', -1, 'd.lower', 'Z−', 'down');
   const p = $('vcol-p'), pl = p.firstElementChild;
-  cartButton(p, 'p', -1, '上抬', 'P−', 'up'); p.appendChild(pl);
-  cartButton(p, 'p', 1, '下压', 'P+', 'down');
+  cartButton(p, 'p', -1, 'cb.pup', 'P−', 'up'); p.appendChild(pl);
+  cartButton(p, 'p', 1, 'cb.pdn', 'P+', 'down');
   const r = $('vcol-r'), rl = r.firstElementChild;
-  cartButton(r, 'r', 1, '右旋', 'R+', 'up'); r.appendChild(rl);
-  cartButton(r, 'r', -1, '左旋', 'R−', 'down');
+  cartButton(r, 'r', 1, 'cb.rr', 'R+', 'up'); r.appendChild(rl);
+  cartButton(r, 'r', -1, 'cb.rl', 'R−', 'down');
 
   const seg = $('step-seg');
   CFG.cart.steps.forEach((n, i) => {
     const b = document.createElement('button');
     b.dataset.i = i; b.textContent = n + ' mm'; b.setAttribute('role', 'radio');
-    b.title = `每次点按 ${n} mm / ${n}°`;
+    b.dataset.n = n; b.title = t('step.title', { n });
+    i18nHooks.push(() => { b.title = t('step.title', { n }); });
     seg.appendChild(b);
   });
   seg.addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) setStep(Number(b.dataset.i)); });
@@ -2932,7 +3134,7 @@ function commandGrip() {
 }
 function home() {
   if (!isOperational()) { toast(lockReason(), 'err'); flashLock(); return; }
-  api('/api/v1/motion/home', { epoch_id: S.epoch }).then(() => toast('回零中', 'ok')).catch(() => {});
+  api('/api/v1/motion/home', { epoch_id: S.epoch }).then(() => toast(t('toast.homing'), 'ok')).catch(() => {});
 }
 function eStop() {
   buzz([30, 40, 30]);
@@ -2948,16 +3150,16 @@ function eStop() {
       .then(() => {})
       .catch((e) => {
         if (retries > 0) setTimeout(() => sendRestEstop(retries - 1), 100);
-        else toast('无法确认急停，请使用现场安全装置并检查机械臂状态', 'err');
+        else toast(t('toast.estop_unconfirmed'), 'err');
       });
   };
   sendRestEstop();
   const started = Date.now();
   const confirmation = setInterval(() => {
     if (isLive() && S.state === 'EStop' && S.obsAt >= started) {
-      clearInterval(confirmation); toast('设备已确认急停锁定，仍可能保持力矩', 'err');
+      clearInterval(confirmation); toast(t('toast.estop_confirmed'), 'err');
     } else if (Date.now() - started > 1800) {
-      clearInterval(confirmation); toast('急停状态未确认，请检查现场安全装置', 'err');
+      clearInterval(confirmation); toast(t('toast.estop_timeout'), 'err');
     }
   }, 50);
 }
@@ -2978,7 +3180,7 @@ $('btn-home').addEventListener('click', home);
     const on = isNativeFs || isHud;
     btn.classList.toggle('on', on);
     btn.setAttribute('aria-pressed', String(on));
-    const label = on ? '退出全屏 / 展开布局' : '全屏 HUD 沉浸模式';
+    const label = on ? t('fs.exit') : t('fs.hud');
     btn.setAttribute('aria-label', label); btn.title = label;
     if (isNativeFs) document.body.classList.add('is-fs');
     try {
@@ -3008,6 +3210,7 @@ $('btn-home').addEventListener('click', home);
       } catch (_) {}
     }
   });
+  i18nHooks.push(sync);
   document.addEventListener('fullscreenchange', sync);
   document.addEventListener('webkitfullscreenchange', sync);
   sync();
@@ -3046,8 +3249,8 @@ function setSpeed(i) {
 /* control mode */
 // ctl: joint | cart (top segmented control); input: btn | stick (panel toggle, shared by both)
 const PH_TITLE = {
-  joint: '<b>J1–J6</b>关节独立控制',
-  cart: '<b>X Y Z · Roll · Pitch</b>末端空间位姿 · 前端解析 IK · Yaw 随 J1',
+  joint: () => '<b>J1–J6</b>' + t('ph.joint'),
+  cart: () => '<b>X Y Z · Roll · Pitch</b>' + t('ph.cart'),
 };
 function setMode(ctl, input = S.input) {
   ctl = ctl === 'cart' ? 'cart' : 'joint';
@@ -3061,7 +3264,7 @@ function setMode(ctl, input = S.input) {
   body.classList.toggle('mode-cart', ctl === 'cart');
   body.classList.toggle('mode-stick', S.mode === 'stick');
   body.classList.toggle('input-stick', input === 'stick');
-  $('ph-title').innerHTML = PH_TITLE[ctl];
+  $('ph-title').innerHTML = PH_TITLE[ctl]();
   for (const b of $('mode-seg').children) {
     const on = b.dataset.mode === ctl;
     b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on));
@@ -3081,7 +3284,7 @@ $('input-seg').addEventListener('click', (e) => { const b = e.target.closest('bu
 /* clear E-stop / fault (shared by the enable button and the status bar) */
 function clearFault() {
   return api('/api/v1/safety/clear_fault')
-    .then(() => toast('已成功复位，请长按使能开启控制', 'ok'))
+    .then(() => toast(t('toast.reset_ok'), 'ok'))
     .catch(() => {}); // api() already toasted
 }
 
@@ -3110,12 +3313,12 @@ async function controlledUnload() {
       }
     }
     if (S.obs && !S.obs.is_torqued) {
-      toast('已收纳到位并安全断电', 'ok');
+      toast(t('toast.parked'), 'ok');
     } else {
-      toast('尚未确认安全卸载，力矩可能仍保持，请检查状态', 'err');
+      toast(t('toast.unload_unconfirmed'), 'err');
     }
   } catch (e) {
-    toast('收起失败: ' + (e.message || '设备未确认收纳，请检查机械臂状态'), 'err', e.code);
+    toast(t('toast.stow_failed') + (e.message || t('toast.stow_unconfirmed')), 'err', e.code);
   } finally { unloading = false; }
 }
 
@@ -3124,17 +3327,17 @@ async function controlledUnload() {
 async function disableTorque({ fallback = true } = {}) {
   try {
     await api('/api/v1/torque', { enable: false }, { quiet: true });
-    toast('已收纳并关闭力矩', 'ok');
+    toast(t('toast.parked_off'), 'ok');
     return true;
   } catch (e) {
     const notAtRest = e.status === 409 && (e.code === 'ARM_NOT_AT_RESTING_POSE' || e.code === 'ArmNotAtRestingPose' || /ArmNotAtRestingPose/i.test(e.message || ''));
     if (notAtRest && fallback) {
-      toast('机械臂悬空中，为防下坠已阻止直接断电。正在执行受控收纳...', 'err');
+      toast(t('toast.in_air'), 'err');
       controlledUnload();
     } else if (e.status) {
-      toast(notAtRest ? '机械臂仍未到达收纳位，力矩保持开启' : (e.message || '关闭力矩失败'), 'err', e.code);
+      toast(notAtRest ? t('toast.not_at_rest') : (e.message || t('toast.torque_off_fail')), 'err', e.code);
     } else {
-      toast(e.message || '关闭力矩请求未确认，请检查连接和机械臂状态', 'err', e.code);
+      toast(e.message || t('toast.torque_off_unconfirmed'), 'err', e.code);
     }
     return false;
   }
@@ -3166,13 +3369,13 @@ async function disableTorque({ fallback = true } = {}) {
       const targetEnable = !isOperational();
       if (!targetEnable) {
         releaseAll();
-        toast('正在平稳回零收起...', 'info');
+        toast(t('toast.stowing'), 'info');
         controlledUnload();
       } else {
         if (S.obs?.positions?.length > GRIP && S.grip == null) S.grip = gripFrac(S.obs.positions[GRIP]);
         api('/api/v1/torque', { enable: true }, { quiet: true })
-          .then(() => toast('控制已开启，请确认机械臂反馈状态', 'ok'))
-          .catch((e) => toast('使能失败：' + (e.message || '电机未就绪/通讯超时'), 'err', e.code));
+          .then(() => toast(t('toast.enabled'), 'ok'))
+          .catch((e) => toast(t('toast.enable_fail') + (e.message || t('toast.enable_fail_def')), 'err', e.code));
       }
       setTimeout(() => { inflight = false; }, 300);
     }, 600);
@@ -3185,21 +3388,21 @@ async function disableTorque({ fallback = true } = {}) {
    Simple mode: pose toggle (click = lock, Shift = momentary), gripper toggle
    ================================================================= */
 const POSE_LABELS = {
-  move: { t: ['x', 1, '前'], b: ['x', -1, '后'], l: ['y', 1, '左'], r: ['y', -1, '右'] },
-  pose: { t: ['p', -1, '仰'], b: ['p', 1, '俯'], l: ['r', -1, '左滚'], r: ['r', 1, '右滚'] },
+  move: { t: ['x', 1, 'd.fwd'], b: ['x', -1, 'd.back'], l: ['y', 1, 'd.left'], r: ['y', -1, 'd.right'] },
+  pose: { t: ['p', -1, 'pl.up'], b: ['p', 1, 'pl.dn'], l: ['r', -1, 'pl.rl'], r: ['r', 1, 'pl.rr'] },
 };
 function renderPoseUi() {
   const btn = $('btn-pose');
   btn.classList.toggle('on', S.poseMode);
   btn.setAttribute('aria-pressed', String(S.poseMode));
-  btn.title = S.poseLocked ? '姿态已锁定，点击返回平移' : S.shiftHeld ? '松开 Shift 返回平移' : '点击锁定姿态模式；按住 Shift 临时切换';
+  btn.title = S.poseLocked ? t('pose.locked') : S.shiftHeld ? t('pose.shift') : t('pose.hint');
   const set = POSE_LABELS[S.poseMode ? 'pose' : 'move'];
   for (const k of ['t', 'b', 'l', 'r']) {
     const el = $('s-dir-' + k), [ax, sg, txt] = set[k];
     el.dataset.ax = ax; el.dataset.s = String(sg);
-    el.querySelector('.lbl').textContent = txt;
+    el.querySelector('.lbl').textContent = t(txt);
   }
-  $('pad-sxy').setAttribute('aria-label', S.poseMode ? '姿态摇杆（俯仰 / 翻滚）' : '移动摇杆（前后 / 左右）');
+  $('pad-sxy').setAttribute('aria-label', S.poseMode ? t('pad.pose') : t('pad.move'));
 }
 function syncPoseMode() {
   const next = S.poseLocked || S.shiftHeld;
@@ -3249,7 +3452,8 @@ if ($('s-grip')) {
   });
 }
 
-const PRESET_NAME = { home: '复位原点', inspect: '观察位', park: '收纳位' };
+const PRESET_NAME = { home: 'pn.home', inspect: 'pn.inspect', park: 'pn.park' };
+function presetName(n) { return PRESET_NAME[n] ? t(PRESET_NAME[n]) : ''; }
 function presetTarget(name) {
   const pos = (S.obs && Array.isArray(S.obs.positions)) ? S.obs.positions : [];
   let t = pos.slice(0, S.dof);
@@ -3291,17 +3495,17 @@ async function runPreset(name) {
     } else {
       if (name === 'home') {
         await api('/api/v1/motion/home', { epoch_id: S.epoch });
-        toast('正在前往' + PRESET_NAME[name], 'ok');
+        toast(t('toast.goto', { name: presetName(name) }), 'ok');
       } else if (name === 'park') {
         await controlledUnload();
       } else {
         await api('/api/v1/motion/jog', { target_positions: presetTarget(name), epoch_id: S.epoch });
-        toast('正在前往' + PRESET_NAME[name], 'ok');
+        toast(t('toast.goto', { name: presetName(name) }), 'ok');
       }
     }
   } catch (err) {
     resetPresetRunning();
-    toast('预设指令执行失败: ' + (err.message || err), 'err');
+    toast(t('toast.preset_fail') + (err.message || err), 'err');
   }
 }
 for (const b of document.querySelectorAll('.preset')) b.addEventListener('click', () => runPreset(b.dataset.preset));
@@ -3337,31 +3541,35 @@ function defaultEpisodeId() {
   return `teleop_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 $('rec-id').value = defaultEpisodeId();
+function renderRecLast() {
+  const r = S.recLast;
+  $('rec-last').textContent = !r ? '' : r === 'discarded' ? t('rec.discarded') : t('rec.saved', r);
+}
 function setRecording(on) {
   S.rec.active = on; S.rec.startedAt = on ? Date.now() : 0;
   document.body.classList.toggle('recording', on);
-  $('btn-rec').textContent = on ? '停止并保存' : '开始录制';
+  $('btn-rec').textContent = on ? t('rec.stop') : t('rec.start');
   $('btn-discard').disabled = !on;
   $('rec-id').disabled = on;
-  $('rec-state').textContent = on ? '录制中' : '空闲';
+  $('rec-state').textContent = on ? t('rec.recording') : t('rec.idle');
   $('rec-state').className = 'sc-status-badge' + (on ? ' is-danger' : '');
 }
 $('btn-rec').addEventListener('click', async () => {
   if (!S.rec.active) {
     const id = $('rec-id').value.trim() || defaultEpisodeId();
-    try { await api('/api/v1/dataset/record/start', { episode_id: id }); setRecording(true); toast('开始录制 ' + id, 'ok'); } catch (_) {}
+    try { await api('/api/v1/dataset/record/start', { episode_id: id }); setRecording(true); toast(t('toast.rec_start') + id, 'ok'); } catch (_) {}
   } else {
     try {
       const r = await api('/api/v1/dataset/record/save');
       setRecording(false);
-      $('rec-last').textContent = `已保存 ${r.frame_count ?? '?'} 帧 → ${r.path ?? ''}`;
-      toast(`已保存 ${r.frame_count ?? '?'} 帧`, 'ok');
+      S.recLast = { n: r.frame_count ?? '?', path: r.path ?? '' }; renderRecLast();
+      toast(t('rec.saved_toast', { n: r.frame_count ?? '?' }), 'ok');
       $('rec-id').value = defaultEpisodeId();
     } catch (_) {}
   }
 });
 $('btn-discard').addEventListener('click', async () => {
-  try { await api('/api/v1/dataset/record/discard'); setRecording(false); $('rec-last').textContent = '已丢弃'; } catch (_) {}
+  try { await api('/api/v1/dataset/record/discard'); setRecording(false); S.recLast = 'discarded'; renderRecLast(); } catch (_) {}
 });
 
 
@@ -3382,12 +3590,15 @@ const whepURL = () => `${httpBase()}/api/webrtc?src=${encodeURIComponent(CFG.vid
 const wsURL = () => `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${CFG.video.host}/api/ws?src=${encodeURIComponent(CFG.video.src)}`;
 const MODE_LABEL = { webrtc: 'WebRTC·WHEP', mse: 'MSE', mp4: 'MP4', mjpeg: 'MJPEG' };
 
+let lastHint = null;
 function videoHint(kind, title, sub) {
+  lastHint = [kind, title, sub];
   const h = $('vhint');
   h.classList.toggle('hide', kind === 'hide');
   h.classList.toggle('connecting', kind === 'connecting');
-  if (title) $('vhint-title').textContent = title;
-  $('vhint-sub').textContent = sub || '';
+  const r = (x) => typeof x === 'function' ? x() : x;
+  if (title) $('vhint-title').textContent = r(title);
+  $('vhint-sub').textContent = r(sub) || '';
 }
 function videoTeardown() {
   V.gen++;
@@ -3590,7 +3801,7 @@ async function videoStart() {
   const chain = [['webrtc', 7000, setupWebRTC], ['mse', 6000, setupMSE], ['mp4', 6000, setupMP4]];
   for (const [kind, timeout, setup] of chain) {
     if (gen !== V.gen) return;
-    videoHint('connecting', '正在连接摄像头…', `${MODE_LABEL[kind]} · ${CFG.video.host} · ${CFG.video.src}`);
+    videoHint('connecting', () => t('v.connecting'), `${MODE_LABEL[kind]} · ${CFG.video.host} · ${CFG.video.src}`);
     try {
       await attempt(kind, timeout, setup);
       if (gen !== V.gen) return;
@@ -3607,12 +3818,12 @@ async function videoStart() {
     }
   }
   if (gen !== V.gen) return;
-  scheduleVideoRetry('未连接到视频服务');
+  scheduleVideoRetry(() => t('v.noservice'));
 }
 function scheduleVideoRetry(title) {
   const gen = V.gen;
   const sec = Math.round(V.retryDelay / 1000);
-  videoHint('idle', title, `网络抖动或视频暂未就绪 · ${sec} 秒后自动重试（亦可点击重试）`);
+  videoHint('idle', title, () => t('v.retry_sub', { sec }));
   clearTimeout(V.retryTimer);
   V.retryTimer = setTimeout(() => { if (gen === V.gen) videoStart(); }, V.retryDelay);
   V.retryDelay = Math.min(30000, V.retryDelay * 2);
@@ -3620,18 +3831,18 @@ function scheduleVideoRetry(title) {
 function videoDropped() {
   if (!V.playing) return;
   videoTeardown();
-  scheduleVideoRetry('视频流中断，正在重连…');
+  scheduleVideoRetry(() => t('v.dropped'));
 }
 function startMJPEG() {
   const gen = V.gen;
-  videoHint('connecting', '正在连接摄像头…', 'MJPEG · ' + CFG.video.mjpeg);
+  videoHint('connecting', () => t('v.connecting'), 'MJPEG · ' + CFG.video.mjpeg);
   mjpegEl.style.display = 'block';
   videoEl.style.display = 'none';
   mjpegEl.onload = () => { if (gen !== V.gen) return; V.mode = 'mjpeg'; V.playing = true; videoHint('hide'); };
   mjpegEl.onerror = () => {
     if (gen !== V.gen) return;
     V.playing = false;
-    videoHint('idle', '视频源无法打开', 'MJPEG · ' + CFG.video.mjpeg);
+    videoHint('idle', () => t('v.cant_open'), 'MJPEG · ' + CFG.video.mjpeg);
     clearTimeout(V.retryTimer);
     V.retryTimer = setTimeout(() => { if (gen === V.gen) mjpegEl.src = CFG.video.mjpeg + (CFG.video.mjpeg.includes('?') ? '&' : '?') + '_=' + Date.now(); }, 5000);
   };
@@ -3984,7 +4195,7 @@ const jtab = CFG.joints.map((jd, i) => {
    ================================================================= */
 // four ui-kit states: normal / warning / danger / disabled ('')
 const STATE_BADGE = { Armed: 'is-ok', Moving: 'is-ok', Idle: '', Booting: 'is-warn', EStop: 'is-danger', Fault: 'is-danger', Offline: '' };
-const STATE_TEXT = { EStop: '急停', Offline: '离线', Armed: '已使能', Moving: '运动中', Idle: '未使能', Booting: '启动中', Fault: '故障' };
+const STATE_TEXT = { EStop: 'st.EStop', Offline: 'st.Offline', Armed: 'st.Armed', Moving: 'st.Moving', Idle: 'st.Idle', Booting: 'st.Booting', Fault: 'st.Fault' };
 function fmtTime(ms) { const s = Math.floor(ms / 1000); return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); }
 function setText(el, txt) { if (el.textContent !== txt) el.textContent = txt; }
 function setCls(el, cls) { if (el.className !== cls) el.className = cls; }
@@ -4013,12 +4224,12 @@ function frame(ts) {
   setText($('lock-txt'), lockReason());
 
   const lb = $('link-badge');
-  setText(lb, live ? `${S.hz} Hz · ${S.rtt == null ? '--' : Math.round(S.rtt)} ms` : '无遥测');
+  setText(lb, live ? `${S.hz} Hz · ${S.rtt == null ? '--' : Math.round(S.rtt)} ms` : t('no_telemetry'));
   setCls(lb, 'sc-status-badge ' + (!live ? '' : S.hz >= 45 ? 'is-ok' : 'is-warn'));
   const st = live ? S.state : 'Offline';
   const badge = $('state-badge');
   const enableUnknown = S.obs?.enable_state === 'Unknown';
-  setText(badge, enableUnknown && torqued && (st === 'Armed' || st === 'Moving') ? '使能状态未确认' : STATE_TEXT[st] || String(st).toUpperCase());
+  setText(badge, enableUnknown && torqued && (st === 'Armed' || st === 'Moving') ? t('st.unconfirmed') : STATE_TEXT[st] ? t(STATE_TEXT[st]) : String(st).toUpperCase());
   setCls(badge, 'sc-status-badge ' + (STATE_BADGE[st] ?? ''));
 
   // enable button morphs: hold-to-enable / tap-to-disable / tap-to-clear
@@ -4027,8 +4238,10 @@ function frame(ts) {
   eb.classList.toggle('on', op);
   eb.classList.toggle('clear', stopped);
   eb.setAttribute('aria-checked', String(op));
-  setText($('enable-txt'), stopped ? (S.state === 'EStop' ? '⚠️ 点击复位急停' : '⚠️ 点击清除故障') : op ? (enableUnknown ? '控制已开启 · 未确认' : '已使能') : '使能');
-  setText($('enable-sub'), stopped ? '复位后再长按使能' : op ? '按住 0.6 秒失能' : '按住 0.6 秒使能');
+  // After a fault is cleared the motors may still hold the arm (safety Idle, torque on): say so.
+  const holdingIdle = live && !stopped && !op && S.state === 'Idle' && torqued;
+  setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop') : t('en.clear_fault')) : op ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
+  setText($('enable-sub'), stopped ? t('en.sub_reset') : op ? t('en.sub_off') : t('en.hold'));
   eb.disabled = !live || S.leaseGeneration == null;
   $('btn-preempt').hidden = !live || !(S.ws && S.ws.readyState === 1) || S.leaseGeneration != null;
 
@@ -4040,7 +4253,7 @@ function frame(ts) {
       const f = gripFrac(p);
       setText(r.val, live ? String(Math.round(f * 100)) : '--');
       r.fill.style.left = '0%'; r.fill.style.width = (f * 100).toFixed(1) + '%';
-      setText($('grip-val'), live ? `开 ${Math.round(f * 100)}%` : '--%');
+      setText($('grip-val'), live ? t('grip.openPct', { n: Math.round(f * 100) }) : '--%');
       r.neg.classList.toggle('at-limit', f > 0.98);
       r.pos.classList.toggle('at-limit', f < 0.02);
     } else {
@@ -4070,8 +4283,8 @@ function frame(ts) {
   // video HUD
   const cam = $('cam-chip');
   const simple = S.ui === 'simple';
-  if (V.playing) { setText(cam, simple ? '实时' : '实时 · ' + (MODE_LABEL[V.mode] || '')); setCls(cam, 'sc-status-badge is-ok'); }
-  else { setText(cam, '连接中'); setCls(cam, 'sc-status-badge is-warn'); }
+  if (V.playing) { setText(cam, simple ? t('v.live') : t('v.live') + ' · ' + (MODE_LABEL[V.mode] || '')); setCls(cam, 'sc-status-badge is-ok'); }
+  else { setText(cam, t('v.chip.connecting')); setCls(cam, 'sc-status-badge is-warn'); }
   const vs = $('vstat');
   vs.hidden = !V.playing || (V.mode === 'mjpeg' && simple);
   if (V.playing) {
@@ -4082,7 +4295,7 @@ function frame(ts) {
   const detAge = S.detLastReceivedAt ? (performance.now() - S.detLastReceivedAt) : Infinity;
   const detActive = !!(dets && dets.length > 0 && detAge <= 400);
   $('det-chip').hidden = !detActive;
-  if (detActive) setText($('det-chip'), `检测 ${dets.length}`);
+  if (detActive) setText($('det-chip'), t('det.n', { n: dets.length }));
 
   // telemetry
   const vel = S.obs ? S.obs.velocities || [] : [];
@@ -4090,14 +4303,14 @@ function frame(ts) {
   $('t-hz').className = !live ? 'bad' : S.hz >= 45 ? 'good' : 'warn';
   setText($('t-rtt'), S.rtt == null ? '--' : Math.round(S.rtt) + ' ms');
   $('t-rtt').className = S.rtt == null ? '' : S.rtt < 40 ? 'good' : S.rtt < 120 ? 'warn' : 'bad';
-  setText($('t-torque'), S.obs?.enable_state === 'Enabled' ? '已确认开启' : S.obs?.enable_state === 'Disabled' ? '已确认关闭' : '未确认');
+  setText($('t-torque'), S.obs?.enable_state === 'Enabled' ? t('tq.on') : S.obs?.enable_state === 'Disabled' ? t('tq.off') : t('tq.unknown'));
   $('t-torque').className = torqued ? 'good' : '';
   const hbAge = S.hb.at ? Date.now() - S.hb.at : null;
   setText($('t-lease'), hbAge == null ? '--' : `${S.hb.hz} Hz · ${hbAge} ms`);
   $('t-lease').className = hbAge == null ? '' : hbAge < 300 ? 'good' : hbAge < 500 ? 'warn' : 'bad';
   const ages = S.obs?.feedback_age_ms || [];
   const feedbackFresh = live && ages.length === S.dof && ages.every((age) => Number.isFinite(age) && age <= 250);
-  setText($('t-can'), !live ? '无遥测' : feedbackFresh ? '反馈新鲜' : '反馈缺失或过期');
+  setText($('t-can'), !live ? t('no_telemetry') : feedbackFresh ? t('can.fresh') : t('can.stale'));
   $('t-can').className = feedbackFresh ? 'good' : 'bad';
   const cap = S.obs?.driver_capabilities || {};
   const freshJoint = (i) => live && Number.isFinite(S.obs?.feedback_age_ms?.[i]) && S.obs.feedback_age_ms[i] <= 250;
@@ -4124,13 +4337,13 @@ function frame(ts) {
   const fm = $('fault-msg');
   const showFault = live && isStopped();
   fm.classList.toggle('show', showFault);
-  if (showFault) setText(fm, S.state === 'EStop' ? '⚠️ 急停已锁定，点击此处复位急停，再长按「使能」。' : '⚠️ 故障：' + (S.fault || '未知') + '。点击此处清除故障，再长按「使能」。');
+  if (showFault) setText(fm, S.state === 'EStop' ? t('fm.estop') : t('fm.fault', { d: S.fault || t('unknown') }));
 
   if (S.rec.active) {
     const el = Date.now() - S.rec.startedAt;
     setText($('rec-time'), fmtTime(el));
     setText($('rec-frames'), '~' + Math.round(el / 1000 * 50));
-    setText($('rec-chip'), '录制 ' + fmtTime(el));
+    setText($('rec-chip'), t('rec.chip') + fmtTime(el));
   }
   if (simple) renderSimple(live, op);
 }
@@ -4141,15 +4354,15 @@ function renderSimple(live, op) {
   const travelling = Date.now() - S.gripCmdAt < 1500 && S.grip != null;
   const ref = travelling ? S.grip : f;
   const isOpen = ref != null && ref > 0.5;
-  if ($('s-grip-txt')) setText($('s-grip-txt'), isOpen ? '闭合' : '张开');
+  if ($('s-grip-txt')) setText($('s-grip-txt'), isOpen ? t('grip.close') : t('grip.open'));
   if ($('s-grip')) {
-    $('s-grip').setAttribute('aria-label', isOpen ? '闭合夹爪' : '打开夹爪');
+    $('s-grip').setAttribute('aria-label', isOpen ? t('grip.close_aria') : t('grip.open_aria'));
     $('s-grip').style.setProperty('--g', ((f ?? 0) * 100).toFixed(1));
   }
   const ico = isOpen ? 'close' : 'open';
   const ie = $('s-grip-ico');
   if (ie && ie.dataset.k !== ico) { ie.dataset.k = ico; ie.innerHTML = GRIP_ICON[ico]; }
-  setText($('s-grip-state'), f == null ? '--' : f > 0.9 ? '已张开' : f < 0.1 ? '已闭合' : '半开');
+  setText($('s-grip-state'), f == null ? '--' : f > 0.9 ? t('grip.is_open') : f < 0.1 ? t('grip.is_closed') : t('grip.half'));
   setText($('s-grip-pct'), f == null ? '--%' : Math.round(f * 100) + '%');
   if ($('s-grip-bar')) $('s-grip-bar').style.width = ((f ?? 0) * 100).toFixed(1) + '%';
 
@@ -4160,12 +4373,12 @@ function renderSimple(live, op) {
 
   const rd = $('s-ready');
   setCls(rd, 'ready' + (op ? ' ok' : live && isStopped() ? ' bad' : ''));
-  setText($('s-ready-txt'), !live ? '等待机械臂连接' : op ? '电机就绪 · 可以操控' : lockReason());
+  setText($('s-ready-txt'), !live ? t('wait_arm') : op ? t('ready') : lockReason());
   if (S.preset && Date.now() > S.preset.until) { S.preset = null; S.presetRunning = false; }
   for (const b of document.querySelectorAll('.preset')) b.classList.toggle('busy', !!S.preset && S.preset.name === b.dataset.preset);
   const bad = C.status !== 'ok' && C.status !== 'idle';
   const hint = $('s-hint');
-  setText(hint, !live ? '等待机械臂连接' : !op ? lockReason() : bad ? C.msg : '');
+  setText(hint, !live ? t('wait_arm') : !op ? lockReason() : bad ? ikText(C.msg) : '');
   hint.classList.toggle('bad', live && op && bad);
   hint.classList.toggle('lock', !(live && op && bad));
 }
@@ -4183,12 +4396,12 @@ function renderCart(live, op) {
   setText($('c-yaw'), p ? fmtDeg(Math.atan2(p.y, p.x)) + '°' : '--');
   const bad = C.status !== 'ok' && C.status !== 'idle';
   const badge = $('ik-badge');
-  setText(badge, !live ? 'IK --' : bad ? 'IK 拦截' : C.sending ? 'IK 流式 ' + CFG.cart.hz + 'Hz' : 'IK 就绪');
+  setText(badge, !live ? 'IK --' : bad ? t('ik.blocked') : C.sending ? t('ik.stream', { hz: CFG.cart.hz }) : t('ik.ready'));
   setCls(badge, 'sc-status-badge ' + (!live ? '' : bad ? 'is-warn' : C.sending ? 'is-info' : 'is-ok'));
   const msg = $('ik-msg');
-  setText(msg, !live ? '等待遥测' : bad ? C.msg : !op ? '使能后可控制末端位姿' : `目标跟随实测位姿 · 分支 ${C.branch ?? '-'} · ${CFG.cart.tx === 'ws' ? 'WS 流' : 'REST 伺服'}`);
+  setText(msg, !live ? t('wait_telemetry') : bad ? ikText(C.msg) : !op ? t('cart.enable_first') : t('cart.following', { branch: C.branch ?? '-', tx: CFG.cart.tx === 'ws' ? t('cart.tx_ws') : t('cart.tx_rest') }));
   msg.classList.toggle('bad', bad);
-  setText($('ik-us'), C.solveUs == null ? '' : 'IK ' + (C.solveUs < 1 ? C.solveUs.toFixed(2) : C.solveUs.toFixed(1)) + ' µs/次');
+  setText($('ik-us'), C.solveUs == null ? '' : 'IK ' + (C.solveUs < 1 ? C.solveUs.toFixed(2) : C.solveUs.toFixed(1)) + t('ik.per_solve'));
   const gr = $('grip-range');
   if (S.grip != null && !C.gripDrag) {
     const g = Math.round(S.grip * 100);
@@ -4263,6 +4476,20 @@ connectWS();
 connectDetectionWS();
 videoStart();
 requestAnimationFrame(frame);
+
+/* i18n: re-render dynamic UI on language change */
+i18nHooks.push(
+  renderJogRows, renderGripCol, renderPoseUi,
+  () => setMode(S.ctl, S.input),
+  () => { if (lastHint) videoHint(...lastHint); },
+  () => {
+    $('btn-rec').textContent = S.rec.active ? t('rec.stop') : t('rec.start');
+    $('rec-state').textContent = S.rec.active ? t('rec.recording') : t('rec.idle');
+    renderRecLast();
+  },
+);
+$('btn-lang').addEventListener('click', () => setLang(LANG === 'zh' ? 'en' : 'zh'));
+applyI18n();
 </script>
 </body>
 </html>
