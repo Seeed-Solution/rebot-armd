@@ -673,3 +673,31 @@ async fn test_clear_fault_mutually_exclusive_branches() {
         assert!(count_after > count_before, "Branch C: holding output must continue to be sent to surviving motors");
     }
 }
+
+#[tokio::test]
+async fn test_gripper_stall_calibration_and_idle_immunity() {
+    let rebot_cfg = ArmConfig::rebot_dm();
+    let supervisor = ArmSupervisor::new(rebot_cfg);
+    supervisor.set_torque(true).await.unwrap();
+
+    // 1. Idle friction of -0.22 Nm (actual hardware observation) must NOT trigger stall
+    supervisor.set_torques(vec![0.1, -0.1, -3.8, -1.7, -0.2, 0.1, -0.22]).await;
+    for _ in 0..10 {
+        supervisor.tick(0.02).await;
+    }
+    assert!(!supervisor.is_gripper_stalled().await, "Idle friction of -0.22 Nm must not trigger stall");
+
+    // 2. Clamping torque >= 0.80 Nm for 6 consecutive ticks triggers stall
+    supervisor.set_torques(vec![0.1, -0.1, -3.8, -1.7, -0.2, 0.1, -0.85]).await;
+    for _ in 0..6 {
+        supervisor.tick(0.02).await;
+    }
+    assert!(supervisor.is_gripper_stalled().await, "Clamping torque >= 0.80 Nm must trigger stall");
+
+    // 3. Torque falling below 0.40 Nm for 6 consecutive ticks automatically clears stall
+    supervisor.set_torques(vec![0.1, -0.1, -3.8, -1.7, -0.2, 0.1, -0.25]).await;
+    for _ in 0..6 {
+        supervisor.tick(0.02).await;
+    }
+    assert!(!supervisor.is_gripper_stalled().await, "Relaxed torque < 0.40 Nm must clear stall");
+}

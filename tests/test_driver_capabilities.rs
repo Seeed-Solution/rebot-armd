@@ -28,6 +28,8 @@ fn capabilities_follow_active_protocol_and_do_not_claim_estimates_as_measurement
     );
     assert_eq!(dm.max_command_velocity(0), Some(1.2));
     assert_eq!(dm.max_command_velocity(1), None);
+    let dm7 = DamiaoArmDriver::new(MockCanTransport::new(), (1..=7).collect()).with_vlim(1.5);
+    assert_eq!(dm7.max_command_velocity(6), Some(1.5), "J7 gripper PosVel must declare command velocity");
     let mit = DamiaoArmDriver::new(MockCanTransport::new(), vec![1])
         .with_control_mode(DamiaoControlMode::Mit);
     assert!(mit.capabilities().torque_feedforward);

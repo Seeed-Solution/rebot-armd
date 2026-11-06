@@ -113,7 +113,7 @@ fn stale_mit_recovery_uses_mit_frame_id() {
 }
 
 #[test]
-fn stale_posvel_gripper_recovery_uses_posforce_frame() {
+fn stale_posvel_gripper_recovery_uses_posvel_frame() {
     let motor_ids: Vec<u16> = (1..=7).collect();
     let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), motor_ids);
     for id in 1..=7 {
@@ -126,7 +126,7 @@ fn stale_posvel_gripper_recovery_uses_posforce_frame() {
     let _ = driver.read_joint_states().unwrap();
     let frames = driver.can_mut().take_tx_frames();
     assert_eq!(frames.len(), 7);
-    let gripper = frames.iter().find(|frame| frame.id == 0x307).unwrap();
+    let gripper = frames.iter().find(|frame| frame.id == 0x107).unwrap();
     assert_eq!(gripper.dlc, 8);
 }
 
