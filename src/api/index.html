@@ -1349,6 +1349,7 @@ const CFG = {
     host: QS.get('go2rtc') || location.host, // single-origin unified gateway on port 8765
     src: QS.get('cam') || 'live0',                          // go2rtc stream name
     mjpeg: QS.get('video') || '',                           // explicit MJPEG URL overrides go2rtc
+    maxLagMs: 1500,                                         // reconnect WebRTC when playout delay stays above this
   },
   simpleSpeed: 0.3,           // simple mode: one fixed speed fraction (expert mode uses the 1-4 selector)
   // Quick presets, URDF model radians J1..J4 (mapped through CFG.cart.sign/off), J5 = 0.
@@ -3455,6 +3456,12 @@ function setupWebRTC(fail, gen) {
     }
   }
   pc.ontrack = (ev) => {
+    // Teleop wants the newest frame, not smoothness: ask for the smallest jitter buffer.
+    // jitterBufferTarget is in ms (Chrome 114+); playoutDelayHint is the older seconds-based hint.
+    try {
+      if ('jitterBufferTarget' in ev.receiver) ev.receiver.jitterBufferTarget = 0;
+      else if ('playoutDelayHint' in ev.receiver) ev.receiver.playoutDelayHint = 0;
+    } catch (_) {}
     const ms = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
     if (videoEl.srcObject !== ms) { videoEl.srcObject = ms; playVideo(); }
   };
@@ -3693,8 +3700,20 @@ setInterval(async () => {
       });
       if (jb != null || rtt != null) V.lat = ((jb || 0) + (rtt || 0) / 2) * 1000;
     } catch (_) {}
+    // A burst of stale frames (e.g. after the RTSP source reconnects) can push the
+    // WebRTC playout delay to seconds and it only decays slowly. Teleop needs live
+    // video: if the delay stays above the limit, reconnect to start from live.
+    V.lagSec = V.lat != null && V.lat > CFG.video.maxLagMs ? (V.lagSec || 0) + 1 : 0;
+    if (V.lagSec >= 3 && Date.now() - (V.lagResetAt || 0) > 10000) {
+      V.lagSec = 0; V.lagResetAt = Date.now();
+      videoTeardown(); videoStart();
+      return;
+    }
   } else if (videoEl.buffered && videoEl.buffered.length) {
-    V.lat = Math.max(0, videoEl.buffered.end(videoEl.buffered.length - 1) - videoEl.currentTime) * 1000;
+    const end = videoEl.buffered.end(videoEl.buffered.length - 1);
+    V.lat = Math.max(0, end - videoEl.currentTime) * 1000;
+    // MSE/MP4 keeps playing whatever is buffered; jump to the live edge when behind.
+    if (V.lat > 600) { try { videoEl.currentTime = Math.max(0, end - 0.1); } catch (_) {} }
   }
 }, 1000);
 
