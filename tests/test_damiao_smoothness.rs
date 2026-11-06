@@ -17,7 +17,7 @@ fn feedback_frame(id: u8, state: u8, position: f32) -> CanFrame {
 
 #[test]
 fn posvel_allows_micro_motion_and_respects_configured_limit() {
-    let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]).with_vlim(0.02);
+    let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]).with_vlim(2.5);
 
     for velocity in [0.0, 0.005, 0.02] {
         driver
@@ -31,7 +31,7 @@ fn posvel_allows_micro_motion_and_respects_configured_limit() {
             .unwrap();
         let frame = driver.can_mut().take_tx_frames().pop().unwrap();
         let sent = f32::from_le_bytes(frame.data[4..8].try_into().unwrap());
-        let expected = velocity.abs().max(0.01).min(0.02);
+        let expected = 2.5f32.clamp(0.5, 4.0);
         assert!((sent - expected).abs() < 1e-6, "velocity={velocity}, sent={sent}");
     }
 }

@@ -332,8 +332,18 @@ body.stopped .lock-note { color: var(--sc-status-danger-fg); background: var(--s
 }
 .disc.dragging { cursor: grabbing; }
 
-/* right-thumb cluster: gripper key (Z lives on the #pad-sz slider) */
-.cluster { position: relative; width: var(--gk); height: var(--gk); flex: none; }
+/* right-thumb cluster: continuous gripper rate jog matching #pad-sz + live readout */
+.cluster {
+  position: relative; display: flex; flex-direction: column; align-items: center; gap: 8px; width: 54px; flex: none;
+}
+.grip-jog-readout {
+  display: flex; flex-direction: column; align-items: center; gap: 2px; width: 54px;
+  background: var(--sc-color-bg-sunken); border: 1px solid var(--sc-color-border-neutral); border-radius: 8px;
+  padding: 3px 4px;
+}
+.grip-jog-readout .pct { font: 600 11px var(--mono); color: var(--sc-color-text); }
+.grip-jog-readout .gbar { display: block; width: 100%; height: 4px; border-radius: 2px; background: #e5ecd9; overflow: hidden; }
+.grip-jog-readout .gbar i { display: block; height: 100%; width: 0%; border-radius: 2px; background: var(--sc-color-primary); transition: width .1s ease; }
 .grip-key {
   --g: 0;
   position: absolute; left: 0; top: 0; width: var(--gk); height: var(--gk); border-radius: 50%;
@@ -833,14 +843,20 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   }
 
   /* right thumb: skill cluster */
-  body.ui-simple .cluster { position: fixed; z-index: 150; right: max(16px, env(safe-area-inset-right)); bottom: 16px; }
-  body.ui-simple .grip-key {
-    background:
-      radial-gradient(closest-side, rgba(140,192,32,0.78) calc(100% - 4px), transparent calc(100% - 3px)),
-      conic-gradient(rgba(255,255,255,0.95) calc(var(--g) * 1%), rgba(255,255,255,0.3) 0);
-    text-shadow: 0 1px 2px rgba(0,0,0,0.3); box-shadow: 0 8px 32px rgba(0,0,0,0.18), 0 0 24px rgba(140,192,32,0.3);
+  body.ui-simple .cluster {
+    position: fixed; z-index: 150; right: max(16px, env(safe-area-inset-right)); bottom: 16px;
+    display: flex; flex-direction: column; align-items: center; gap: 8px; width: 54px; height: auto;
   }
-  body.ui-simple .grip-key svg { filter: drop-shadow(0 1px 1px rgba(0,0,0,0.35)); }
+  body.ui-simple .cluster #pad-sgrip { position: relative; }
+  body.ui-simple .grip-jog-readout {
+    display: flex; flex-direction: column; align-items: center; gap: 2px; width: 54px;
+    background: rgba(255,255,255,0.22); border: 1px solid rgba(255,255,255,0.45); border-radius: 10px;
+    padding: 3px 4px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  }
+  body.ui-simple .grip-jog-readout .pct { font: 600 11px var(--mono); color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.4); }
+  body.ui-simple .grip-jog-readout .gbar { display: block; width: 100%; height: 4px; border-radius: 2px; background: rgba(255,255,255,0.25); overflow: hidden; }
+  body.ui-simple .grip-jog-readout .gbar i { display: block; height: 100%; width: 0%; border-radius: 2px; background: #8CC020; transition: width .1s ease; }
 
   /* status hint: glass line under the island */
   body.ui-simple .move-hint {
@@ -902,9 +918,12 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
     box-shadow: 0 8px 32px rgba(0,0,0,0.18), inset 0 1px 0 rgba(255,255,255,0.35);
   }
   body.ui-simple .pose-btn.on { background: rgba(140,192,32,0.85); border-color: rgba(217,249,157,0.9); box-shadow: 0 0 24px rgba(140,192,32,0.45), inset 0 1px 0 rgba(255,255,255,0.5); }
-  body.ui-simple .disc.vslot {
+  body.ui-simple .disc.vslot#pad-sz {
     left: auto; top: auto; bottom: 16px; width: 54px; height: 160px; border-radius: 27px;
-    right: calc(max(16px, env(safe-area-inset-right)) + var(--gk) + 14px);
+    right: calc(max(16px, env(safe-area-inset-right)) + 54px + 14px);
+  }
+  body.ui-simple .cluster #pad-sgrip {
+    width: 54px; height: 160px; border-radius: 27px;
   }
   body.ui-simple .disc.vslot::before { background: rgba(255,255,255,0.7); }
   body.ui-simple .disc.vslot::after { background: rgba(255,255,255,0.25); box-shadow: none; }
@@ -1180,7 +1199,14 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
               <i class="knob"></i>
             </div>
             <div class="cluster">
-              <button class="grip-key" id="s-grip"><span id="s-grip-ico"></span><span id="s-grip-txt">张开</span></button>
+              <div class="disc vslot" id="pad-sgrip" role="slider" aria-orientation="vertical" aria-label="夹爪连续点动滑杆" aria-valuemin="-1" aria-valuemax="1" aria-valuenow="0">
+                <span class="vz t" data-ax="grip" data-s="1" aria-hidden="true">开</span><span class="vz b" data-ax="grip" data-s="-1" aria-hidden="true">闭</span>
+                <i class="knob"></i>
+              </div>
+              <div class="grip-jog-readout" id="s-grip-readout">
+                <span class="pct" id="s-grip-cmd-pct">--%</span>
+                <i class="gbar"><i id="s-grip-jog-bar"></i></i>
+              </div>
             </div>
           </div>
         </div>
@@ -1270,7 +1296,7 @@ const CFG = {
   leaseAckTimeoutMs: 2000,    // no lease_granted/rejected within this window -> clear pending and retry
   staleMs: 2000,              // telemetry older than this locks the controls (tolerance for Wi-Fi AP jitter)
   deadzone: 0.08,
-  maxLead: 0.12,              // rad, servo target may lead measured position by at most this (avoids backend >0.15rad discard)
+  maxLead: 0.20,              // rad, servo target may lead measured position by at most this (safe margin under backend 0.35rad threshold)
   gripLead: 0.6,              // rad, same for the gripper
   gripRate: 1.6,              // gripper stroke fraction per second at 100 % speed
   limitMargin: 0.02,          // rad, keep targets inside soft limits
@@ -1399,7 +1425,7 @@ const IK = (() => {
 
 CFG.cart = {
   hz: clamp(Number(QS.get('carthz')) || 40, 30, 50), // joint-target stream rate while moving
-  vmax: 0.25,                 // m/s TCP speed at 100 % speed
+  vmax: 0.30,                 // m/s TCP speed at 100 % speed
   wmax: 1.5,                  // rad/s wrist pitch rate at 100 % speed
   steps: [1, 5, 10],          // tap step: mm for XYZ, degrees for pitch
   holdDelay: 350,             // ms before a held step button turns into continuous motion
@@ -1471,7 +1497,8 @@ const C = {
   hold: { x: [0, 0], y: [0, 0], z: [0, 0], p: [0, 0], r: [0, 0] }, // continuous holds per axis [neg, pos]
   axes: { xy: [0, 0], z: 0, p: 0, sxy: [0, 0], sz: 0, sp: 0, sr: 0 }, // s*: simple cockpit (sxy = X/Y, sz = lift, sp/sr = pitch/roll in pose mode)
   stepIdx: 1,
-  lastTick: 0, lastInput: 0, tailUntil: 0,
+  lastTick: 0, lastInput: 0, tailUntil: 0, stallSince: 0,
+  gripJog: 0,                 // -1 (close) .. +1 (open) continuous rate jog
   status: 'idle', msg: '', solveUs: null, inflight: false, sending: false, gripDrag: false,
 };
 
@@ -2084,9 +2111,9 @@ renderGripCol();
    ================================================================= */
 const pads = [];
 class Pad {
-  constructor(el, { axes = 'xy', onChange }) {
+  constructor(el, { axes = 'xy', onChange, onEnd }) {
     this.el = el; this.knob = el.querySelector('.knob');
-    this.axes = axes; this.onChange = onChange;
+    this.axes = axes; this.onChange = onChange; this.onEnd = onEnd;
     this.touchId = null; this.mouse = false; this.value = [0, 0];
     el.addEventListener('touchstart', (e) => {
       e.preventDefault();
@@ -2130,6 +2157,7 @@ class Pad {
     this.value = [0, 0];
     this.knob.style.transform = 'translate(0px, 0px)'; // CSS spring curve animates the return
     this.onChange(this.value);
+    if (this.onEnd) this.onEnd();
   }
   active() { return this.touchId !== null || this.mouse; }
 }
@@ -2205,6 +2233,7 @@ window.addEventListener('keyup', (e) => {
 });
 function releaseAll() {
   S.keys.clear();
+  C.gripJog = 0;
   for (const p of pads) if (p.active()) p.end();
   for (const h of holdButtons) h.stop();
   for (const h of S.hold) { h[0] = 0; h[1] = 0; }
@@ -2389,7 +2418,10 @@ function cartVelocity() {
   }
   return v;
 }
-function cartGripVel() { return (S.keys.has('KeyX') ? 1 : 0) - (S.keys.has('KeyZ') ? 1 : 0); } // + = close
+function cartGripVel() {
+  const keyVel = (S.keys.has('KeyX') ? -1 : 0) + (S.keys.has('KeyZ') ? 1 : 0); // +1 = open, -1 = close
+  return clamp(keyVel + (C.gripJog || 0), -1, 1);
+}
 function clampJ5(x) {
   const L = S.limits[4];
   let v = L ? clamp(x, L.min_position + CFG.limitMargin, L.max_position - CFG.limitMargin) : x;
@@ -2447,7 +2479,10 @@ function cartTick() {
   }
   const v = cartVelocity();
   const gv = cartGripVel();
-  const input = v.x || v.y || v.z || v.p || v.r || gv;
+  const gripErr = pos.length > GRIP ? Math.abs(gripRad() - pos[GRIP]) : 0;
+  const gripStalled = Date.now() - S.gripCmdAt > 1200;
+  const gripMoving = (gripErr > 0.015 && !gripStalled) || gv !== 0;
+  const input = v.x || v.y || v.z || v.p || v.r || gripMoving;
   if (input) cartKick();
   const settling = now - C.lastInput < CFG.cart.settleMs;
   const pending = !C.goal || C.goal.x !== C.cmd.x || C.goal.y !== C.cmd.y || C.goal.z !== C.cmd.z || C.goal.pitch !== C.cmd.pitch;
@@ -2463,6 +2498,15 @@ function cartTick() {
   C.goal.pitch += v.p * wl * dt;
   if (v.r) C.j5 = clampJ5(C.j5 + v.r * wl * dt);
 
+  // Anti-windup: do not let C.goal drift more than 0.25 m away from current C.cmd while dragging/streaming
+  const gDist = Math.hypot(C.goal.x - C.cmd.x, C.goal.y - C.cmd.y, C.goal.z - C.cmd.z);
+  if (gDist > 0.25) {
+    const r = 0.25 / gDist;
+    C.goal.x = C.cmd.x + (C.goal.x - C.cmd.x) * r;
+    C.goal.y = C.cmd.y + (C.goal.y - C.cmd.y) * r;
+    C.goal.z = C.cmd.z + (C.goal.z - C.cmd.z) * r;
+  }
+
   // rate-limited follower: step taps and joystick input both reach the arm as a smooth ramp
   const dx = C.goal.x - C.cmd.x, dy = C.goal.y - C.cmd.y, dz = C.goal.z - C.cmd.z;
   const d = Math.hypot(dx, dy, dz);
@@ -2473,11 +2517,21 @@ function cartTick() {
   const mq = toMotor(C.q);
   const lag = Math.max(...mq.map((x, i) => Math.abs(x - pos[i])));
 
-  const threshold = 0.12;
-  const margin = lag - threshold;
-  const factor = margin <= 0 ? 1.0 : Math.max(0.0, 1.0 - margin / threshold);
+  const a = 0.20, b = 0.35;
+  const factor = clamp(1.0 - (lag - a) / (b - a), 0.0, 1.0);
   f *= factor; dp *= factor;
-  if (lag > threshold * 1.4) { C.goal.x = C.cmd.x; C.goal.y = C.cmd.y; C.goal.z = C.cmd.z; C.goal.pitch = C.cmd.pitch; }
+
+  // Hard stall & collision protection: if lag > 0.40 rad continuously for > 500 ms, emergency stop goal
+  if (lag > 0.40) {
+    if (!C.stallSince) C.stallSince = now;
+    else if (now - C.stallSince > 500) {
+      C.goal = { ...C.cmd };
+      C.status = 'stall';
+      C.msg = '电机响应滞后过大(>0.4rad)，已安全停机';
+    }
+  } else {
+    C.stallSince = 0;
+  }
   const cand = { x: C.cmd.x + dx * f, y: C.cmd.y + dy * f, z: C.cmd.z + dz * f, pitch: C.cmd.pitch + dp };
 
   if (d > 1e-7 || Math.abs(dp) > 1e-7) {
@@ -2496,10 +2550,10 @@ function cartTick() {
     cartSync(pos);
   }
 
-  // gripper (keys Z / X; the slider writes S.grip directly)
+  // gripper (keys Z / X; rate jog or slider writes S.grip)
   if (pos.length > GRIP && gv) {
     const cur = S.grip ?? gripFrac(pos[GRIP]);
-    S.grip = clamp(cur - gv * CFG.gripRate * scale * dt, 0, 1);
+    S.grip = clamp(cur + gv * CFG.gripRate * scale * dt, 0, 1);
     S.gripCmdAt = Date.now();
   }
 
@@ -2603,9 +2657,9 @@ function setStep(i) {
     b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on));
   }
 }
-new Pad($('pad-cxy'), { onChange: (v) => { C.axes.xy = v; } });
-new Pad($('pad-cz'), { axes: 'y', onChange: (v) => { C.axes.z = v[1]; } });
-new Pad($('pad-cp'), { axes: 'y', onChange: (v) => { C.axes.p = v[1]; } });
+new Pad($('pad-cxy'), { onChange: (v) => { C.axes.xy = v; }, onEnd: () => { if (C.goal && C.cmd) C.goal = { ...C.cmd }; } });
+new Pad($('pad-cz'), { axes: 'y', onChange: (v) => { C.axes.z = v[1]; }, onEnd: () => { if (C.goal && C.cmd) C.goal = { ...C.cmd }; } });
+new Pad($('pad-cp'), { axes: 'y', onChange: (v) => { C.axes.p = v[1]; }, onEnd: () => { if (C.goal && C.cmd) C.goal = { ...C.cmd }; } });
 // Pose state machine: S.poseMode = S.poseLocked || S.shiftHeld.  A mode flip zeroes every simple-cockpit axis
 // and holds the left stick at zero until it is back near centre or re-touched, so the old stick
 // position never carries over into the new mapping.
@@ -2622,8 +2676,23 @@ padSxy = new Pad($('pad-sxy'), { onChange: (v) => {
   }
   if (!S.poseMode) C.axes.sxy = v;
   else { C.axes.sp = v[1]; C.axes.sr = v[0]; }
+}, onEnd: () => {
+  if (C.goal && C.cmd) C.goal = { ...C.cmd };
 } });
 new Pad($('pad-sz'), { axes: 'y', onChange: (v) => { C.axes.sz = v[1]; } });
+new Pad($('pad-sgrip'), {
+  axes: 'y',
+  onChange: (v) => {
+    C.gripJog = v[1]; // +1 is open, -1 is close
+    if (v[1] !== 0) {
+      S.gripCmdAt = Date.now();
+      cartKick();
+    }
+  },
+  onEnd: () => {
+    C.gripJog = 0;
+  }
+});
 
 function jogTo(target) {
   if (!isLive()) return toast(lockReason(), 'err');
@@ -2937,15 +3006,17 @@ const GRIP_ICON = {
   close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="9" width="12" height="7" rx="2.5"/><path d="M8 9V7.5M11 9V7M14 9V7.5"/><path d="M17 12h1.5a1.5 1.5 0 0 1 0 3H17"/><path d="M7 16v2.5A2.5 2.5 0 0 0 9.5 21h4a2.5 2.5 0 0 0 2.5-2.5V16"/></svg>',
 };
 const gripOpenNow = () => (S.obs && S.obs.positions.length > GRIP ? gripFrac(S.obs.positions[GRIP]) : (S.grip ?? 0));
-$('s-grip').addEventListener('click', () => {
-  if (isLocked()) { toast(lockReason(), 'err'); flashLock(); return; }
-  // target follows the last command while it is still travelling, otherwise the measured state
-  const ref = S.grip != null ? S.grip : gripOpenNow();
-  S.grip = ref > 0.5 ? 0 : 1;
-  buzz(10);
-  const k = $('s-grip'); k.classList.remove('pulse'); void k.offsetWidth; k.classList.add('pulse');
-  commandGrip();
-});
+if ($('s-grip')) {
+  $('s-grip').addEventListener('click', () => {
+    if (isLocked()) { toast(lockReason(), 'err'); flashLock(); return; }
+    // target follows the last command while it is still travelling, otherwise the measured state
+    const ref = S.grip != null ? S.grip : gripOpenNow();
+    S.grip = ref > 0.5 ? 0 : 1;
+    buzz(10);
+    const k = $('s-grip'); k.classList.remove('pulse'); void k.offsetWidth; k.classList.add('pulse');
+    commandGrip();
+  });
+}
 
 const PRESET_NAME = { home: '复位原点', inspect: '观察位', park: '收纳位' };
 function presetTarget(name) {
@@ -3765,15 +3836,23 @@ function renderSimple(live, op) {
   const travelling = Date.now() - S.gripCmdAt < 1500 && S.grip != null;
   const ref = travelling ? S.grip : f;
   const isOpen = ref != null && ref > 0.5;
-  setText($('s-grip-txt'), isOpen ? '闭合' : '张开');
-  $('s-grip').setAttribute('aria-label', isOpen ? '闭合夹爪' : '打开夹爪');
+  if ($('s-grip-txt')) setText($('s-grip-txt'), isOpen ? '闭合' : '张开');
+  if ($('s-grip')) {
+    $('s-grip').setAttribute('aria-label', isOpen ? '闭合夹爪' : '打开夹爪');
+    $('s-grip').style.setProperty('--g', ((f ?? 0) * 100).toFixed(1));
+  }
   const ico = isOpen ? 'close' : 'open';
   const ie = $('s-grip-ico');
-  if (ie.dataset.k !== ico) { ie.dataset.k = ico; ie.innerHTML = GRIP_ICON[ico]; }
+  if (ie && ie.dataset.k !== ico) { ie.dataset.k = ico; ie.innerHTML = GRIP_ICON[ico]; }
   setText($('s-grip-state'), f == null ? '--' : f > 0.9 ? '已张开' : f < 0.1 ? '已闭合' : '半开');
   setText($('s-grip-pct'), f == null ? '--%' : Math.round(f * 100) + '%');
-  $('s-grip').style.setProperty('--g', ((f ?? 0) * 100).toFixed(1));
-  $('s-grip-bar').style.width = ((f ?? 0) * 100).toFixed(1) + '%';
+  if ($('s-grip-bar')) $('s-grip-bar').style.width = ((f ?? 0) * 100).toFixed(1) + '%';
+
+  // Dual readout in rate control jog: commanded % and live measured bar
+  const cmdFrac = S.grip != null ? S.grip : f;
+  setText($('s-grip-cmd-pct'), cmdFrac == null ? '--%' : Math.round(cmdFrac * 100) + '%');
+  if ($('s-grip-jog-bar')) $('s-grip-jog-bar').style.width = ((f ?? 0) * 100).toFixed(1) + '%';
+
   const rd = $('s-ready');
   setCls(rd, 'ready' + (op ? ' ok' : live && isStopped() ? ' bad' : ''));
   setText($('s-ready-txt'), !live ? '等待机械臂连接' : op ? '电机就绪 · 可以操控' : lockReason());

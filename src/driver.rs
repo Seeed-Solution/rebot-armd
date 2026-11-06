@@ -734,14 +734,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         self.can.transmit(&frame)?;
                         self.last_target_frames[i] = Some(frame);
                     } else {
-                        let configured_vlim = self.default_vlim.abs().max(0.01);
-                        let vlim = target
-                            .velocity
-                            .map(|v| {
-                                let abs_v = if v.is_finite() { v.abs() } else { 0.0 };
-                                abs_v.clamp(0.01, configured_vlim)
-                            })
-                            .unwrap_or(configured_vlim);
+                        let vlim = self.default_vlim.abs().clamp(0.1, 4.0);
                         let frame = damiao::build_pos_vel_frame(
                             0x100,
                             self.motor_ids[i],

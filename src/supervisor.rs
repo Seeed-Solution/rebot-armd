@@ -1093,11 +1093,11 @@ impl SupervisorInner {
                 self.servo_target = None;
                 self.servo_settled_ticks.fill(0);
             } else {
-                // Check if any target joint has instantaneous jump > 0.25 rad relative to commanded_positions
+                // Check if any target joint has instantaneous jump > 0.35 rad relative to commanded_positions
                 let has_dirty_jump = target.iter().enumerate().any(|(i, &tgt)| {
                     if i < self.commanded_positions.len() {
                         let jump = (tgt - self.commanded_positions[i]).abs();
-                        jump > 0.25
+                        jump > 0.35
                     } else {
                         false
                     }
@@ -1105,7 +1105,7 @@ impl SupervisorInner {
 
                 if has_dirty_jump {
                     tracing::warn!(
-                        "Discarding dirty servo target frame: instantaneous jump exceeds 0.25 rad relative to commanded_positions"
+                        "Discarding dirty servo target frame: instantaneous jump exceeds 0.35 rad relative to commanded_positions"
                     );
                     self.servo_target = None;
                     self.servo_settled_ticks.fill(0);

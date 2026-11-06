@@ -98,9 +98,15 @@ EOF
         sleep 1
         ifconfig wlan1 "$AP_IP" netmask 255.255.255.0 up 2>/dev/null || true
 
-        # 重启 dnsmasq 以使 wlan1 的 DHCP 分配生效
-        if [ -f /etc/init.d/S80dnsmasq ]; then
-            /etc/init.d/S80dnsmasq restart >/dev/null 2>&1 || true
+        # 重启 dnsmasq 以使 wlan1 的 DHCP 分配生效（优雅停机并重试，防止 cold-boot 竞争）
+        start-stop-daemon -K -p /var/run/dnsmasq.pid -s TERM 2>/dev/null || killall -TERM dnsmasq 2>/dev/null || true
+        w=0
+        while [ $w -lt 4 ] && pidof dnsmasq >/dev/null 2>&1; do sleep 0.25; w=$((w + 1)); done
+        if pidof dnsmasq >/dev/null 2>&1; then killall -9 dnsmasq 2>/dev/null || true; sleep 0.2; fi
+        if [ -f /etc/dnsmasq/usb_wlan1.conf ]; then
+            /usr/sbin/dnsmasq -C /etc/dnsmasq/usb_wlan1.conf >/dev/null 2>&1 || true
+        elif [ -f /etc/init.d/S80dnsmasq ]; then
+            /etc/init.d/S80dnsmasq start >/dev/null 2>&1 || true
         fi
     fi
 }

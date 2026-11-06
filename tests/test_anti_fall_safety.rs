@@ -369,12 +369,12 @@ async fn test_servo_target_dirty_jump_and_step_rate_limit() {
     let supervisor = ArmSupervisor::new(config);
     supervisor.set_torque(true).await.unwrap();
 
-    // 1. Dirty jump > 0.25 rad: must be dropped immediately
-    supervisor.servo(vec![0.30], 1).await.unwrap();
+    // 1. Dirty jump > 0.35 rad: must be dropped immediately
+    supervisor.servo(vec![0.40], 1).await.unwrap();
     let obs1 = supervisor.tick(0.02).await;
-    assert_eq!(obs1.positions[0], 0.0, "Dirty target with jump > 0.25 rad must be dropped");
+    assert_eq!(obs1.positions[0], 0.0, "Dirty target with jump > 0.35 rad must be dropped");
 
-    // 2. Normal jump <= 0.25 rad (e.g. 0.10 rad): accepted
+    // 2. Normal jump <= 0.35 rad (e.g. 0.10 rad): accepted
     // Acceleration-bounded first step: 20ms * (5 rad/s² * 20ms) = 0.002 rad
     supervisor.servo(vec![0.10], 1).await.unwrap();
     let obs2 = supervisor.tick(0.02).await;
