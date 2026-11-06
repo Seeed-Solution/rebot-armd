@@ -282,37 +282,61 @@ impl SupervisorInner {
     }
 
     pub fn is_at_safe_resting_pose(&self) -> bool {
+        self.resting_pose_violation().is_none()
+    }
+
+    /// The first resting-pose condition that fails, or `None` when the arm may be released.
+    fn resting_pose_violation(&self) -> Option<String> {
         let dof = self.config.dof;
-        if self.measured_positions.len() != dof || self.measured_velocities.len() != dof { return false; }
+        if self.measured_positions.len() != dof || self.measured_velocities.len() != dof {
+            return Some("feedback length does not match dof".into());
+        }
         let simulation_policy = RestingPosePolicy::rebot_dm();
         let policy = match &self.config.resting_pose {
             Some(policy) => policy,
             None if self.driver.is_none() => &simulation_policy,
-            None => return false,
+            None => return Some("no resting pose configured".into()),
         };
         if let Some(ref d) = self.driver {
-            let Ok(drv) = d.lock() else { return false; };
+            let Ok(drv) = d.lock() else { return Some("driver lock poisoned".into()); };
             let caps = drv.capabilities();
-            if !caps.velocity_feedback || !caps.torque_feedback || !caps.enable_feedback
-                || drv.enable_state() != EnableState::Enabled || self.safety.state().is_stopped() { return false; }
+            if !caps.velocity_feedback || !caps.torque_feedback || !caps.enable_feedback {
+                return Some("driver lacks velocity/torque/enable feedback".into());
+            }
+            let enable = drv.enable_state();
+            if enable != EnableState::Enabled { return Some(format!("enable state {enable:?}")); }
+            if self.safety.state().is_stopped() { return Some(format!("safety state {:?}", self.safety.state())); }
             drop(drv);
-            if !self.hardware_feedback_fresh(Duration::from_millis(policy.feedback_max_age_ms)) { return false; }
+            if !self.hardware_feedback_fresh(Duration::from_millis(policy.feedback_max_age_ms)) {
+                return Some(format!("feedback older than {} ms", policy.feedback_max_age_ms));
+            }
         }
         let mut total = 0.0;
         for (i, tolerance) in policy.position_tolerances.iter().enumerate().take(dof) {
             let dev = (self.measured_positions[i] - self.config.home_positions[i]).abs();
-            if !dev.is_finite() || dev > *tolerance { return false; }
+            if !dev.is_finite() || dev > *tolerance {
+                return Some(format!("joint {} off home by {dev:.4} rad (limit {tolerance})", i + 1));
+            }
             total += dev;
         }
-        if total > policy.max_total_deviation || self.measured_velocities.iter().any(|v| !v.is_finite() || v.abs() > policy.max_velocity) { return false; }
+        if total > policy.max_total_deviation {
+            return Some(format!("total deviation {total:.4} rad (limit {})", policy.max_total_deviation));
+        }
+        if let Some((i, v)) = self.measured_velocities.iter().enumerate()
+            .find(|(_, v)| !v.is_finite() || v.abs() > policy.max_velocity)
+        {
+            return Some(format!("joint {} moving at {v:.4} rad/s (limit {})", i + 1, policy.max_velocity));
+        }
         if self.driver.is_some() {
             for &(i, max_tau) in &policy.support_torque_limits {
-                if i >= dof { return false; }
+                if i >= dof { return Some(format!("support torque index {i} out of range")); }
                 let tau = self.torques.get(i).copied().unwrap_or(f32::NAN);
-                if !tau.is_finite() || tau.abs() > max_tau { return false; }
+                if !tau.is_finite() || tau.abs() > max_tau {
+                    return Some(format!("joint {} torque {tau:.2} Nm (limit {max_tau})", i + 1));
+                }
             }
         }
-        true
+        None
     }
 
     pub fn set_torque(&mut self, enable: bool) -> Result<SafetyState, SafetyError> {
@@ -435,7 +459,8 @@ impl SupervisorInner {
                 ));
             }
 
-            if !self.is_at_safe_resting_pose() {
+            if let Some(reason) = self.resting_pose_violation() {
+                tracing::warn!("Torque off refused, not at resting pose: {reason}");
                 return Err(SafetyError::ArmNotAtRestingPose {
                     current: self.measured_positions.clone(),
                     expected: self.config.home_positions.clone(),
