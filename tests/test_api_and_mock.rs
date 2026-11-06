@@ -12,9 +12,7 @@ use armd::{
     SafetyState,
 };
 use armd::api::rest::{
-    HeartbeatRequest, HeartbeatResponse, JogRequest, MotionResponse,
-    RecordActionResponse, SafetyResponse, ServoRequest, StartRecordRequest, TorqueRequest,
-    TorqueResponse,
+    JogRequest, RecordActionResponse, SafetyResponse, ServoRequest, StartRecordRequest,
 };
 
 async fn spawn_test_server() -> (SocketAddr, Arc<ArmSupervisor>) {
@@ -39,6 +37,28 @@ async fn spawn_test_server() -> (SocketAddr, Arc<ArmSupervisor>) {
     });
 
     (addr, supervisor)
+}
+
+
+type TestSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+async fn ws_reply(ws: &mut TestSocket, message: serde_json::Value, expected: &[&str]) -> serde_json::Value {
+    ws.send(Message::Text(message.to_string().into())).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if expected.iter().any(|kind| value["type"] == *kind) { return value; }
+        }
+    }).await.expect("Timed out waiting for control response")
+}
+async fn controller(addr: SocketAddr) -> (TestSocket, u64) {
+    let (mut ws, _) = connect_async(format!("ws://{}/api/v1/ws", addr)).await.unwrap();
+    let reply = ws_reply(&mut ws, serde_json::json!({"type":"acquire_lease", "client_id":"test_controller"}), &["lease_granted"]).await;
+    (ws, reply["generation"].as_u64().unwrap())
+}
+async fn rpc(ws: &mut TestSocket, generation: u64, epoch: u64, path: &str, body: serde_json::Value) -> serde_json::Value {
+    static REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    ws_reply(ws, serde_json::json!({"type":"command", "request_id":REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed), "generation":generation, "epoch_id":epoch, "path":path, "body":body}), &["command_ack", "command_reject"]).await
 }
 
 #[tokio::test]
@@ -74,157 +94,49 @@ async fn test_rest_api_observation_and_schema() {
 
 #[tokio::test]
 async fn test_rest_api_torque_and_motion() {
-    let (addr, _) = spawn_test_server().await;
+    let (addr, supervisor) = spawn_test_server().await;
     let client = reqwest::Client::new();
-
-    // 1. Try jog before torque enabled -> Precondition Failed (NotArmed)
-    let jog_req = JogRequest {
-        target_positions: vec![0.5, 0.5],
-        duration_secs: Some(1.0),
-        epoch_id: Some(1),
-    };
-    let res = client
-        .post(format!("http://{}/api/v1/motion/jog", addr))
-        .json(&jog_req)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::PRECONDITION_FAILED);
-
-    // 2. Enable torque -> POST /api/v1/torque
-    let torque_req = TorqueRequest { enable: true };
-    let res = client
-        .post(format!("http://{}/api/v1/torque", addr))
-        .json(&torque_req)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-    let torque_res: TorqueResponse = res.json().await.unwrap();
-    assert!(torque_res.is_torqued);
-    assert_eq!(torque_res.safety_state, SafetyState::Armed);
-
-    // 3. Jog with valid target -> Success
-    let res = client
-        .post(format!("http://{}/api/v1/motion/jog", addr))
-        .json(&jog_req)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-    let motion_res: MotionResponse = res.json().await.unwrap();
-    assert_eq!(motion_res.status, "accepted");
-    assert_eq!(motion_res.epoch_id, 1);
-
-    // 4. Jog exceeding soft limit (joint_1 max is 1.0, sending 2.5) -> Bad Request
-    let bad_jog = JogRequest {
-        target_positions: vec![2.5, 0.0],
-        duration_secs: Some(1.0),
-        epoch_id: Some(1),
-    };
-    let res = client
-        .post(format!("http://{}/api/v1/motion/jog", addr))
-        .json(&bad_jog)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::BAD_REQUEST);
-
-    // 5. Jog with mismatched epoch -> Conflict (409)
-    let stale_jog = JogRequest {
-        target_positions: vec![0.2, 0.2],
-        duration_secs: Some(1.0),
-        epoch_id: Some(999), // wrong epoch
-    };
-    let res = client
-        .post(format!("http://{}/api/v1/motion/jog", addr))
-        .json(&stale_jog)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::CONFLICT);
-
-    // 6. Home command -> Success
-    let home_req = armd::api::rest::HomeRequest {
-        duration_secs: Some(0.5),
-        epoch_id: Some(1),
-    };
-    let res = client
-        .post(format!("http://{}/api/v1/motion/home", addr))
-        .json(&home_req)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-
-    // 7. Unload command -> Success
-    let res = client
-        .post(format!("http://{}/api/v1/motion/unload", addr))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    // HTTP actuator requests cannot bypass connection ownership, even before a lease exists.
+    for (path, body) in [
+        ("torque", serde_json::json!({"enable":true})),
+        ("motion/jog", serde_json::json!({"target_positions":[0.1,0.1],"epoch_id":1})),
+        ("motion/home", serde_json::json!({"epoch_id":1})),
+        ("motion/unload", serde_json::json!({})),
+        ("safety/clear_fault", serde_json::json!({})),
+    ] {
+        let response = client.post(format!("http://{}/api/v1/{}",addr,path)).json(&body).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+        assert_eq!(response.json::<serde_json::Value>().await.unwrap()["code"], "LEASE_REQUIRED");
+    }
+    let (mut ws,generation) = controller(addr).await;
+    let jog = serde_json::json!({"target_positions":[0.5,0.5],"duration_secs":1.0});
+    assert_eq!(rpc(&mut ws,generation,1,"/api/v1/motion/jog",jog.clone()).await["type"],"command_reject");
+    assert_eq!(rpc(&mut ws,generation,1,"/api/v1/torque",serde_json::json!({"enable":true})).await["type"],"command_ack");
+    assert!(supervisor.get_observation().await.is_torqued);
+    assert_eq!(rpc(&mut ws,generation,1,"/api/v1/motion/jog",jog).await["type"],"command_ack");
+    assert_eq!(rpc(&mut ws,generation,1,"/api/v1/motion/jog",serde_json::json!({"target_positions":[2.5,0.0]})).await["type"],"command_reject");
+    assert_eq!(rpc(&mut ws,generation,999,"/api/v1/motion/home",serde_json::json!({})).await["code"],"EPOCH_MISMATCH");
+    assert_eq!(rpc(&mut ws,generation,1,"/api/v1/motion/home",serde_json::json!({})).await["type"],"command_ack");
+    assert_eq!(rpc(&mut ws,generation,1,"/api/v1/motion/unload",serde_json::json!({})).await["type"],"command_ack");
 }
 
 #[tokio::test]
 async fn test_rest_api_safety_estop_lifecycle() {
-    let (addr, _) = spawn_test_server().await;
-    let client = reqwest::Client::new();
-
-    // Arm arm first
-    client
-        .post(format!("http://{}/api/v1/torque", addr))
-        .json(&TorqueRequest { enable: true })
-        .send()
-        .await
-        .unwrap();
-
-    // 1. POST /api/v1/safety/e_stop
-    let res = client
-        .post(format!("http://{}/api/v1/safety/e_stop", addr))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-    let estop_res: SafetyResponse = res.json().await.unwrap();
-    assert_eq!(estop_res.safety_state, SafetyState::EStop);
-    assert_eq!(estop_res.epoch_id, 2);
-
-    // 2. Motion while in EStop -> Conflict (409)
-    let jog_req = JogRequest {
-        target_positions: vec![0.1, 0.1],
-        duration_secs: Some(1.0),
-        epoch_id: Some(2),
-    };
-    let res = client
-        .post(format!("http://{}/api/v1/motion/jog", addr))
-        .json(&jog_req)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::CONFLICT);
-
-    // Disarm while in EStop -> Conflict (409)
-    let res_disarm = client
-        .post(format!("http://{}/api/v1/torque", addr))
-        .json(&TorqueRequest { enable: false })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res_disarm.status(), reqwest::StatusCode::CONFLICT);
-    let disarm_err: serde_json::Value = res_disarm.json().await.unwrap();
-    assert_eq!(disarm_err["error"], "MotionForbiddenInFaultState");
-
-    // 3. POST /api/v1/safety/clear_fault
-    let res = client
-        .post(format!("http://{}/api/v1/safety/clear_fault", addr))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-    let clear_res: SafetyResponse = res.json().await.unwrap();
-    assert_eq!(clear_res.safety_state, SafetyState::Idle);
-    assert_eq!(clear_res.epoch_id, 3);
+    let (addr,supervisor) = spawn_test_server().await;
+    let (mut ws,generation) = controller(addr).await;
+    assert_eq!(rpc(&mut ws,generation,1,"/api/v1/torque",serde_json::json!({"enable":true})).await["type"],"command_ack");
+    let response = reqwest::Client::new().post(format!("http://{}/api/v1/safety/e_stop",addr)).send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let stopped: SafetyResponse = response.json().await.unwrap();
+    assert_eq!(stopped.safety_state,SafetyState::EStop);
+    assert_eq!(rpc(&mut ws,generation,stopped.epoch_id,"/api/v1/motion/jog",serde_json::json!({"target_positions":[0.1,0.1]})).await["type"],"command_reject");
+    assert_eq!(rpc(&mut ws,generation,stopped.epoch_id,"/api/v1/torque",serde_json::json!({"enable":false})).await["type"],"command_reject");
+    let clear = rpc(&mut ws,generation,stopped.epoch_id,"/api/v1/safety/clear_fault",serde_json::json!({})).await;
+    assert_eq!(clear["type"],"command_ack");
+    assert_eq!(clear["safety_state"],"Idle");
+    assert_eq!(rpc(&mut ws,generation,stopped.epoch_id,"/api/v1/torque",serde_json::json!({"enable":true})).await["code"],"EPOCH_MISMATCH");
+    let epoch = supervisor.get_observation().await.epoch_id;
+    assert_eq!(rpc(&mut ws,generation,epoch,"/api/v1/torque",serde_json::json!({"enable":true})).await["type"],"command_ack");
 }
 
 #[tokio::test]
@@ -317,107 +229,22 @@ async fn test_websocket_telemetry_stream() {
 
 #[tokio::test]
 async fn test_rest_api_heartbeat_and_servo() {
-    let (addr, supervisor) = spawn_test_server().await;
+    let (addr,supervisor) = spawn_test_server().await;
     let client = reqwest::Client::new();
-
-    // 1. Valid heartbeat -> 200 OK
-    let hb_req = HeartbeatRequest {
-        client_id: "teleop_controller".to_string(),
-        epoch_id: 1,
-        timestamp_ms: Some(1_730_000_000_000),
-    };
-    let res = client
-        .post(format!("http://{}/api/v1/heartbeat", addr))
-        .json(&hb_req)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-    let hb_res: HeartbeatResponse = res.json().await.unwrap();
-    assert_eq!(hb_res.status, "ok");
-    assert_eq!(hb_res.epoch_id, 1);
-
-    // 2. Epoch mismatch heartbeat -> 409 Conflict
-    let hb_bad = HeartbeatRequest {
-        client_id: "teleop_controller".to_string(),
-        epoch_id: 999,
-        timestamp_ms: None,
-    };
-    let res = client
-        .post(format!("http://{}/api/v1/heartbeat", addr))
-        .json(&hb_bad)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::CONFLICT);
-
-    // 3. Servo before arming -> 412 Precondition Failed (NotArmed)
-    let servo_req = ServoRequest {
-        targets: vec![0.1, -0.2],
-        epoch_id: Some(1),
-    };
-    let res = client
-        .post(format!("http://{}/api/v1/motion/servo", addr))
-        .json(&servo_req)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::PRECONDITION_FAILED);
-
-    // 4. Arm arm
+    let response = client.post(format!("http://{}/api/v1/heartbeat",addr)).json(&serde_json::json!({"client_id":"test_controller","epoch_id":1})).send().await.unwrap();
+    assert_eq!(response.status(),reqwest::StatusCode::CONFLICT);
+    let (mut ws,generation) = controller(addr).await;
+    let servo = serde_json::json!({"targets":[0.1,-0.2]});
+    assert_eq!(rpc(&mut ws,generation,1,"/api/v1/motion/servo",servo.clone()).await["type"],"command_reject");
     supervisor.set_torque(true).await.unwrap();
-
-    // 5. Valid servo command -> 200 OK
-    let res = client
-        .post(format!("http://{}/api/v1/motion/servo", addr))
-        .json(&servo_req)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-    let motion_res: MotionResponse = res.json().await.unwrap();
-    assert_eq!(motion_res.status, "accepted");
-    assert_eq!(motion_res.epoch_id, 1);
-
-    // Check that observation targets updated
-    let obs = supervisor.get_observation().await;
-    assert!((obs.positions[0] - 0.0).abs() < 0.2);
-
-    // 6. Servo with soft limit exceeded -> 400 Bad Request
-    let servo_bad = ServoRequest {
-        targets: vec![50.0, 0.0],
-        epoch_id: Some(1),
-    };
-    let res = client
-        .post(format!("http://{}/api/v1/motion/servo", addr))
-        .json(&servo_bad)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::BAD_REQUEST);
-
-    // 7. WebSocket bi-directional heartbeat test
-    use futures_util::SinkExt;
-    let ws_url = format!("ws://{}/api/v1/ws", addr);
-    let (mut ws_stream, _) = connect_async(&ws_url).await.expect("Failed to connect WS");
-
-    // Send heartbeat text frame over WS
-    let ws_hb = serde_json::json!({
-        "type": "heartbeat",
-        "client_id": "ws_client",
-        "epoch_id": 1
-    });
-    ws_stream
-        .send(tokio_tungstenite::tungstenite::Message::Text(ws_hb.to_string().into()))
-        .await
-        .unwrap();
-
-    // Give WS handler task a moment to process the message
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Tick supervisor and ensure state is operational
-    let obs = supervisor.tick(0.02).await;
-    assert!(obs.safety_state.is_operational());
+    assert_eq!(rpc(&mut ws,generation,1,"/api/v1/motion/servo",servo).await["type"],"command_ack");
+    assert_eq!(rpc(&mut ws,generation,1,"/api/v1/motion/servo",serde_json::json!({"targets":[50.0,0.0]})).await["type"],"command_reject");
+    let before = supervisor.inner().read().await.last_heartbeat;
+    ws.send(Message::Text(serde_json::json!({"type":"heartbeat","generation":generation,"epoch_id":1}).to_string().into())).await.unwrap();
+    // The following acknowledged command is an ordering barrier for the heartbeat.
+    assert_eq!(rpc(&mut ws,generation,1,"/api/v1/motion/stop",serde_json::json!({})).await["type"],"command_ack");
+    assert!(supervisor.inner().read().await.last_heartbeat > before);
+    assert!(supervisor.inner().read().await.servo_target.is_none());
 }
 
 #[tokio::test]
@@ -466,8 +293,8 @@ async fn test_websocket_lease_handshake_generation_and_http_conflict() {
         if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) = ws2.next().await {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
                 if val.get("type").and_then(|t| t.as_str()) == Some("lease_rejected") {
-                    assert_eq!(val["client_id"], "client_2");
-                    assert_eq!(val["owner"], "client_1");
+                    assert!(val.get("owner").is_none());
+                    assert!(val.get("generation").is_none());
                     rejected = true;
                     break;
                 }
@@ -840,62 +667,19 @@ async fn test_ws_connection_drop_ensures_lease_release() {
 
 #[tokio::test]
 async fn test_rest_api_airborne_torque_off_rejected_409() {
-    let mut config = ArmConfig::default();
-    config.dof = 1;
-    config.joint_names = vec!["joint_1".to_string()];
-    config.limits = vec![JointLimit::new("joint_1", -1.0, 1.0, 2.0, 5.0)];
-    config.home_positions = vec![0.0];
-    let supervisor = Arc::new(ArmSupervisor::new(config));
-    let app = create_router(supervisor.clone());
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    let client = reqwest::Client::new();
-    let base_url = format!("http://{}", addr);
-
-    // 1. Arm the robot
-    let res = client
-        .post(format!("{}/api/v1/torque", base_url))
-        .json(&serde_json::json!({"enable": true}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), reqwest::StatusCode::OK);
-
-    // 2. Move arm away from home position so it is airborne (e.g. jog to 0.5 rad)
-    let res_jog = client
-        .post(format!("{}/api/v1/motion/jog", base_url))
-        .json(&serde_json::json!({"target_positions": [0.5], "epoch_id": 1}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res_jog.status(), reqwest::StatusCode::OK);
-
-    // Tick to move position
-    for _ in 0..25 {
-        supervisor.tick(0.02).await;
-    }
-    let obs = supervisor.get_observation().await;
-    assert!(obs.positions[0] > 0.1, "Arm must have moved away from home position");
-
-    // 3. Attempting to disable torque while airborne must be rejected with 409 Conflict
-    let res_torque_off = client
-        .post(format!("{}/api/v1/torque", base_url))
-        .json(&serde_json::json!({"enable": false}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res_torque_off.status(), reqwest::StatusCode::CONFLICT);
-    let body: serde_json::Value = res_torque_off.json().await.unwrap();
-    assert_eq!(body["error"], "ArmNotAtRestingPose");
-
-    // 4. Verify arm torque remains actively engaged (is_torqued == true)
-    let obs_after = supervisor.get_observation().await;
-    assert!(obs_after.is_torqued, "Torque must NOT be disabled when arm is airborne!");
+    let (addr,supervisor) = spawn_test_server().await;
+    let (mut ws,generation) = controller(addr).await;
+    assert_eq!(rpc(&mut ws,generation,1,"/api/v1/torque",serde_json::json!({"enable":true})).await["type"],"command_ack");
+    assert_eq!(rpc(&mut ws,generation,1,"/api/v1/motion/jog",serde_json::json!({"target_positions":[0.5,-0.5]})).await["type"],"command_ack");
+    for _ in 0..25 { supervisor.tick(0.02).await; }
+    assert!(supervisor.get_observation().await.positions[0] > 0.1);
+    let rejection = rpc(&mut ws,generation,1,"/api/v1/torque",serde_json::json!({"enable":false})).await;
+    assert_eq!(rejection["type"],"command_reject");
+    assert_eq!(rejection["status"], 409);
+    assert_eq!(rejection["code"], "ARM_NOT_AT_RESTING_POSE");
+    assert_eq!(rejection["error"], "ArmNotAtRestingPose");
+    assert!(rejection["message"].as_str().unwrap().contains("resting pose"));
+    assert!(supervisor.get_observation().await.is_torqued);
 }
 
 #[tokio::test]
@@ -1323,4 +1107,192 @@ async fn test_proxy_routes_and_passive_time_sync() {
             let _ = ws_stream.close(None).await;
         }
     }
+}
+
+#[tokio::test]
+async fn connection_identity_cannot_be_copied_and_expired_heartbeat_cannot_revive() {
+    let (addr, supervisor) = spawn_test_server().await;
+    let (mut owner, generation) = controller(addr).await;
+    let (mut stranger, _) = connect_async(format!("ws://{}/api/v1/ws", addr)).await.unwrap();
+    let denied = ws_reply(&mut stranger, serde_json::json!({"type":"acquire_lease", "client_id":"test_controller"}), &["lease_rejected"]).await;
+    assert!(denied.get("generation").is_none());
+    assert!(denied.get("owner").is_none());
+    let heartbeat_before = supervisor.inner().read().await.last_heartbeat;
+    let fake = serde_json::json!({"type":"heartbeat","client_id":"test_controller","generation":generation,"epoch_id":1});
+    assert_eq!(ws_reply(&mut stranger,fake,&["lease_lost"]).await["type"],"lease_lost");
+    assert_eq!(supervisor.inner().read().await.last_heartbeat,heartbeat_before);
+    assert_eq!(rpc(&mut stranger,generation,1,"/api/v1/torque",serde_json::json!({"enable":true})).await["code"],"LEASE_LOST");
+    assert!(!supervisor.get_observation().await.is_torqued);
+    let released = ws_reply(&mut stranger,serde_json::json!({"type":"release_lease","client_id":"test_controller","generation":generation}),&["lease_released"]).await;
+    assert_eq!(released["success"],false);
+    assert!(supervisor.is_lease_active().await);
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.active_lease.as_mut().unwrap().acquired_at = std::time::Instant::now() - Duration::from_secs(2);
+    }
+    let old = supervisor.inner().read().await.active_lease.as_ref().unwrap().acquired_at;
+    assert_eq!(ws_reply(&mut owner,serde_json::json!({"type":"heartbeat","generation":generation,"epoch_id":1}),&["lease_lost"]).await["type"],"lease_lost");
+    assert_eq!(supervisor.inner().read().await.active_lease.as_ref().unwrap().acquired_at,old);
+}
+
+#[tokio::test]
+async fn lease_replacement_before_command_lock_prevents_actuation() {
+    let (addr,supervisor) = spawn_test_server().await;
+    let (mut owner,generation) = controller(addr).await;
+    let mut inner = supervisor.inner().write().await;
+    owner.send(Message::Text(serde_json::json!({"type":"command","request_id":1,"generation":generation,"epoch_id":1,"path":"/api/v1/torque","body":{"enable":true}}).to_string().into())).await.unwrap();
+    let identity = inner.active_lease.as_ref().unwrap().client_id.clone();
+    assert!(inner.release_lease(&identity,generation));
+    inner.acquire_lease("replacement").unwrap();
+    drop(inner);
+    let response = tokio::time::timeout(Duration::from_secs(2),owner.next()).await.unwrap().unwrap().unwrap();
+    let response:serde_json::Value = serde_json::from_str(&response.into_text().unwrap()).unwrap();
+    assert_eq!(response["type"],"command_reject");
+    assert_eq!(response["code"],"LEASE_LOST");
+    assert!(!supervisor.get_observation().await.is_torqued);
+}
+
+#[tokio::test]
+async fn cross_origin_control_is_rejected_but_same_origin_estop_remains_available() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let (addr,supervisor) = spawn_test_server().await;
+    let client=reqwest::Client::new();
+    let response=client.post(format!("http://{}/api/v1/safety/e_stop",addr)).header("Origin","http://evil.invalid").send().await.unwrap();
+    assert_eq!(response.status(),reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(supervisor.get_observation().await.safety_state,SafetyState::Idle);
+    let mut request=format!("ws://{}/api/v1/ws",addr).into_client_request().unwrap();
+    request.headers_mut().insert("Origin","http://evil.invalid".parse().unwrap());
+    assert!(connect_async(request).await.is_err());
+    let response=client.post(format!("http://{}/api/v1/safety/e_stop",addr)).header("Origin",format!("http://{}",addr)).send().await.unwrap();
+    assert_eq!(response.status(),reqwest::StatusCode::OK);
+    assert!(response.headers().get("access-control-allow-origin").is_none());
+    assert_eq!(supervisor.get_observation().await.safety_state,SafetyState::EStop);
+}
+
+#[tokio::test]
+async fn repeated_rpc_is_rejected_and_lease_handover_cancels_old_trajectory() {
+    let (addr,supervisor)=spawn_test_server().await;
+    let (mut ws,generation)=controller(addr).await;
+    let command=serde_json::json!({"type":"command","request_id":1,"generation":generation,"epoch_id":1,"path":"/api/v1/torque","body":{"enable":true}});
+    assert_eq!(ws_reply(&mut ws,command.clone(), &["command_ack"]).await["type"],"command_ack");
+    let duplicate=ws_reply(&mut ws,command,&["command_reject"]).await;
+    assert_eq!(duplicate["request_id"],1);
+    assert_eq!(duplicate["code"],"INVALID_COMMAND");
+    supervisor.jog(vec![0.5,-0.5],Some(1.0),Some(1)).await.unwrap();
+    let mut inner=supervisor.inner().write().await;
+    assert!(inner.active_trajectory.is_some());
+    inner.active_lease.as_mut().unwrap().acquired_at=std::time::Instant::now()-Duration::from_secs(2);
+    inner.acquire_lease("next_controller").unwrap();
+    assert!(inner.active_trajectory.is_none());
+    assert!(inner.servo_target.is_none());
+}
+
+struct UnloadCapabilityDriver {
+    capabilities: armd::driver::DriverCapabilities,
+}
+impl armd::driver::ArmDriver for UnloadCapabilityDriver {
+    fn capabilities(&self) -> armd::driver::DriverCapabilities { self.capabilities }
+    fn enable_state(&self) -> armd::driver::EnableState {
+        if self.capabilities.enable_feedback { armd::driver::EnableState::Enabled }
+        else { armd::driver::EnableState::Unknown }
+    }
+    fn is_feedback_valid(&self) -> bool { true }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 2] }
+    fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, armd::driver::ArmDriverError> {
+        Ok(vec![armd::model::JointState::default(); 2])
+    }
+    fn write_joint_targets(&mut self, _: &[armd::driver::JointTarget]) -> Result<(), armd::driver::ArmDriverError> { Ok(()) }
+    fn set_torque(&mut self, _: bool) -> Result<(), armd::driver::ArmDriverError> { Ok(()) }
+}
+
+#[tokio::test]
+async fn unsupported_automatic_unload_rejects_without_motion_but_home_remains_available() {
+    use armd::driver::DriverCapabilities;
+    let full = DriverCapabilities { velocity_feedback: true, torque_feedback: true,
+        temperature_feedback: true, torque_feedforward: false, enable_feedback: true };
+    for missing in ["velocity", "torque", "enable", "profile"] {
+        let (addr, supervisor) = spawn_test_server().await;
+        let mut capabilities = full;
+        match missing {
+            "velocity" => capabilities.velocity_feedback = false,
+            "torque" => capabilities.torque_feedback = false,
+            "enable" => capabilities.enable_feedback = false,
+            _ => {},
+        }
+        supervisor.set_driver(Box::new(UnloadCapabilityDriver { capabilities })).await;
+        {
+            let mut inner = supervisor.inner().write().await;
+            inner.config.resting_pose = if missing == "profile" { None } else { Some(armd::model::RestingPosePolicy {
+                position_tolerances: vec![0.08; 2], max_total_deviation: 0.16, max_velocity: 0.015,
+                support_torque_limits: vec![(1, 1.0)], feedback_max_age_ms: 100,
+            }) };
+            // Arrange an operational controller with a queued target, so a rejected
+            // unload must not secretly cancel or replace an existing command.
+            inner.safety.set_torque(true).unwrap();
+            inner.is_torqued = true;
+            inner.commanded_positions = vec![0.2, -0.2];
+            inner.target_positions = vec![0.25, -0.25];
+            inner.servo_target = Some(vec![0.25, -0.25]);
+            assert!(!inner.supports_automatic_unload(), "missing {missing}");
+            inner.apply_stop_policy(armd::safety::StopPolicy::NormalUnload);
+            assert_eq!(inner.target_positions, vec![0.25, -0.25]);
+            assert_eq!(inner.servo_target, Some(vec![0.25, -0.25]));
+            assert!(!inner.pending_normal_unload && inner.active_trajectory.is_none());
+        }
+        let (mut ws, generation) = controller(addr).await;
+        let response = rpc(&mut ws, generation, 1, "/api/v1/motion/unload", serde_json::json!({})).await;
+        assert_eq!(response["type"], "command_reject");
+        assert_eq!(response["code"], "UNSUPPORTED", "missing {missing}");
+        assert_eq!(response["status"], 422);
+        for name in ["park", "unload"] {
+            let response = ws_reply(&mut ws, serde_json::json!({"type":"preset", "name":name, "generation":generation, "epoch_id":1}), &["preset_reject"]).await;
+            assert_eq!(response["code"], "UNSUPPORTED");
+        }
+        {
+            let inner = supervisor.inner().read().await;
+            assert!(!inner.pending_normal_unload && inner.active_trajectory.is_none());
+            assert_eq!(inner.commanded_positions, vec![0.2, -0.2]);
+            assert_eq!(inner.target_positions, vec![0.25, -0.25]);
+            assert_eq!(inner.servo_target, Some(vec![0.25, -0.25]));
+        }
+        assert_eq!(rpc(&mut ws, generation, 1, "/api/v1/motion/home", serde_json::json!({})).await["type"], "command_ack");
+        assert!(supervisor.has_active_trajectory().await);
+    }
+
+    let (_, supervisor) = spawn_test_server().await;
+    assert!(supervisor.inner().read().await.supports_automatic_unload(), "Mock remains supported without a physical resting profile");
+    supervisor.set_driver(Box::new(UnloadCapabilityDriver { capabilities: full })).await;
+    let mut inner = supervisor.inner().write().await;
+    inner.config.resting_pose = Some(armd::model::RestingPosePolicy {
+        position_tolerances: vec![0.08; 2], max_total_deviation: 0.16, max_velocity: 0.015,
+        support_torque_limits: vec![(1, 1.0)], feedback_max_age_ms: 100,
+    });
+    inner.safety.set_torque(true).unwrap();
+    inner.is_torqued = true;
+    inner.measured_positions = vec![0.5, -0.5];
+    inner.commanded_positions = vec![0.5, -0.5];
+    assert!(inner.supports_automatic_unload(), "Capability is independent of current pose");
+    inner.apply_stop_policy(armd::safety::StopPolicy::NormalUnload);
+    assert!(inner.pending_normal_unload && inner.active_trajectory.is_some());
+}
+
+#[tokio::test]
+async fn websocket_business_rejections_preserve_status_code_and_message() {
+    let (addr, _) = spawn_test_server().await;
+    let (mut ws, generation) = controller(addr).await;
+    for (path, body, message) in [
+        ("/api/v1/torque", serde_json::json!({"enable":"yes"}), "enable must be boolean"),
+        ("/api/v1/motion/jog", serde_json::json!({"target_positions":true}), "Malformed positions array"),
+        ("/api/v1/motion/home", serde_json::json!({"duration_secs":"slow"}), "duration_secs must be numeric"),
+        ("/api/v1/not_a_command", serde_json::json!({}), "Unknown actuator command"),
+    ] {
+        let response = rpc(&mut ws, generation, 1, path, body).await;
+        assert_eq!(response["type"], "command_reject");
+        assert_eq!(response["status"], 400);
+        assert_eq!(response["code"], "INVALID_COMMAND");
+        assert_eq!(response["message"], message);
+    }
+    let not_armed = rpc(&mut ws, generation, 1, "/api/v1/motion/home", serde_json::json!({})).await;
+    assert_eq!(not_armed["status"], 412);
+    assert_eq!(not_armed["code"], "NOT_ARMED");
 }

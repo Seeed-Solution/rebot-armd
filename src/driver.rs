@@ -69,8 +69,38 @@ pub enum ArmDriverError {
     Timeout(u8),
 }
 
+/// Hardware enable state confirmed by fresh telemetry, not by a successful write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnableState {
+    Enabled,
+    Disabled,
+    #[default]
+    Unknown,
+}
+
+/// Telemetry and command features implemented by a driver in its active mode.
+/// A false feedback flag means the numeric placeholder is not a measurement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriverCapabilities {
+    pub velocity_feedback: bool,
+    pub torque_feedback: bool,
+    pub temperature_feedback: bool,
+    pub torque_feedforward: bool,
+    pub enable_feedback: bool,
+}
+
 /// Universal robotic arm hardware driver trait
 pub trait ArmDriver: Send {
+    fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
+
+    fn enable_state(&self) -> EnableState { EnableState::Unknown }
+
+    /// Age of the last received sample for each joint. Reading a cache does not refresh it.
+    fn feedback_ages(&self) -> Vec<Option<Duration>> { Vec::new() }
+
+    /// Fixed device-side velocity ceiling, when the active output mode has one.
+    fn max_command_velocity(&self, _joint: usize) -> Option<f32> { None }
+
     /// Read real-time telemetry / joint states for all joints
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError>;
 
@@ -82,7 +112,7 @@ pub trait ArmDriver: Send {
 
     /// Check if real physical telemetry feedback has been received for all joints
     fn is_feedback_valid(&self) -> bool {
-        true
+        false
     }
 
     /// Check if any motor hardware fault is reported
@@ -97,8 +127,19 @@ pub trait ArmDriver: Send {
 
     /// Check whether driver / hardware is actively enabled and online
     fn is_enabled(&self) -> bool {
-        true
+        false
     }
+
+    /// Return per-joint motor status or error code if supported by the driver
+    fn motor_status(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Update internal software enabled flag without transmitting physical frames
+    fn set_torque_flag(&mut self, _enabled: bool) {}
+
+    /// Update pending_rearm flag to force full hardware handshake on next enable
+    fn set_pending_rearm(&mut self, _pending: bool) {}
 }
 
 // =========================================================================
@@ -140,6 +181,12 @@ impl<T: Transport> FeetechArmDriver<T> {
 }
 
 impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
+    fn capabilities(&self) -> DriverCapabilities { DriverCapabilities { velocity_feedback: true, temperature_feedback: true, ..DriverCapabilities::default() } }
+
+    fn feedback_ages(&self) -> Vec<Option<Duration>> {
+        self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
+    }
+
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
             return false;
@@ -328,6 +375,12 @@ impl<T: Transport> FashionStarArmDriver<T> {
 }
 
 impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
+    fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
+
+    fn feedback_ages(&self) -> Vec<Option<Duration>> {
+        self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
+    }
+
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
             return false;
@@ -492,7 +545,10 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     last_feedback_instant: Vec<Option<Instant>>,
     motor_status: Vec<u8>,
     is_enabled: bool,
+    pending_rearm: bool,
     last_query_instant: Option<Instant>,
+    last_enable_command: Option<Instant>,
+    awaiting_rx_boundary: bool,
     is_enabling: bool,
     last_warn_sec: AtomicU64,
 }
@@ -514,7 +570,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             last_feedback_instant: vec![None; dof],
             motor_status: vec![0; dof],
             is_enabled: false,
+            pending_rearm: true,
             last_query_instant: None,
+            last_enable_command: None,
+            awaiting_rx_boundary: false,
             is_enabling: false,
             last_warn_sec: AtomicU64::new(0),
         }
@@ -544,11 +603,91 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     pub fn can_mut(&mut self) -> &mut C {
         &mut self.can
     }
+
+    /// A command acknowledgement must be separated from buffered pre-command telemetry.
+    fn drain_rx_before_command(&mut self) -> bool {
+        let start = Instant::now();
+        for _ in 0..128 {
+            if start.elapsed() >= Duration::from_millis(5) { return false; }
+            match self.can.receive() {
+                Ok(_) => {},
+                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => return true,
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    pub fn transmit_with_retry(&mut self, frame: &CanFrame) -> Result<(), ArmDriverError> {
+        let mut retries = 0;
+        loop {
+            match self.can.transmit(frame) {
+                Ok(()) => return Ok(()),
+                Err(TransportError::WouldBlock) if retries < 3 => {
+                    retries += 1;
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
 }
 
 impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
+    fn capabilities(&self) -> DriverCapabilities {
+        DriverCapabilities {
+            velocity_feedback: true,
+            torque_feedback: true,
+            temperature_feedback: true,
+            torque_feedforward: self.control_mode == DamiaoControlMode::Mit,
+            enable_feedback: true,
+        }
+    }
+
+    fn enable_state(&self) -> EnableState {
+        if self.awaiting_rx_boundary || !self.is_feedback_valid() || self.last_feedback_instant.iter().any(|t| {
+            self.last_enable_command.map_or(false, |command| t.map_or(true, |sample| sample < command))
+        }) {
+            return EnableState::Unknown;
+        }
+        if self.motor_status.iter().all(|&state| state == 1) {
+            EnableState::Enabled
+        } else if self.motor_status.iter().all(|&state| state == 0) {
+            EnableState::Disabled
+        } else {
+            EnableState::Unknown
+        }
+    }
+
+    fn feedback_ages(&self) -> Vec<Option<Duration>> {
+        self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
+    }
+
+    fn max_command_velocity(&self, joint: usize) -> Option<f32> {
+        if joint >= self.motor_ids.len() || self.control_mode != DamiaoControlMode::PosVel
+            || (joint == 6 && self.motor_ids[joint] == 7) {
+            return None;
+        }
+        Some(self.default_vlim.abs().clamp(0.1, 4.0))
+    }
+
     fn is_enabled(&self) -> bool {
-        self.is_enabled
+        self.is_enabled && self.enable_state() == EnableState::Enabled
+    }
+
+    fn motor_status(&self) -> Option<Vec<u8>> {
+        Some(self.motor_status.clone())
+    }
+
+    fn set_torque_flag(&mut self, enabled: bool) {
+        self.is_enabled = enabled;
+        if !enabled {
+            self.pending_rearm = true;
+        }
+    }
+
+    fn set_pending_rearm(&mut self, pending: bool) {
+        self.pending_rearm = pending;
     }
 
     fn is_feedback_valid(&self) -> bool {
@@ -608,7 +747,6 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn clear_fault(&mut self) -> Result<(), ArmDriverError> {
-        self.is_enabled = false;
         let mut err = None;
         for &id in &self.motor_ids {
             let frame = damiao::build_clear_faults_frame(id);
@@ -616,11 +754,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 err = Some(e);
             }
         }
-        let _ = self.can.flush();
-        let now = Instant::now();
-        for opt in self.last_feedback_instant.iter_mut() {
-            *opt = Some(now);
-        }
+        if let Err(e) = self.can.flush() { err = Some(e); }
         if let Some(e) = err {
             Err(ArmDriverError::HardwareFault(e.to_string()))
         } else {
@@ -630,8 +764,10 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
         if !enabled {
-            self.is_enabled = false;
-            self.last_target_frames.fill(None);
+            // Still send disable if draining times out: thermal protection must not
+            // be blocked by traffic. Until a new empty-queue boundary, ignore ACKs.
+            self.awaiting_rx_boundary = !self.drain_rx_before_command();
+            self.last_enable_command = Some(Instant::now());
             let mut last_err = None;
             for &id in &self.motor_ids {
                 let frame = damiao::build_disable_frame(id);
@@ -642,25 +778,57 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             if let Err(e) = self.can.flush() {
                 last_err = Some(e.into());
             }
-            // Reset status to 0 (disabled)
-            for st in self.motor_status.iter_mut() {
-                *st = 0;
-            }
-            self.last_query_instant = Some(Instant::now());
             if let Some(e) = last_err {
+                // A failed or partial write cannot establish the physical power state.
                 return Err(e);
             }
+            self.is_enabled = false;
+            self.pending_rearm = true;
+            self.last_target_frames.fill(None);
+            self.last_query_instant = Some(Instant::now());
+            // Keep observed status until a post-command response confirms disable.
+            let _ = self.read_joint_states();
             Ok(())
         } else {
-            if self.is_enabled {
+            // Fast-path: only if !pending_rearm && is_enabled && feedback_valid && all state == 1
+            if !self.pending_rearm
+                && self.is_enabled
+                && self.is_feedback_valid()
+                && self.motor_status.iter().all(|&st| st == 1)
+            {
                 return Ok(());
             }
+
             self.is_enabling = true;
+
+            if !self.drain_rx_before_command() {
+                self.awaiting_rx_boundary = true;
+                self.is_enabling = false;
+                self.is_enabled = false;
+                self.pending_rearm = true;
+                return Err(ArmDriverError::HardwareFault("CAN RX buffer not drained before handshake".to_string()));
+            }
+            self.awaiting_rx_boundary = false;
+
+            let handshake_start = Instant::now();
+            self.last_enable_command = Some(handshake_start);
+            self.last_feedback_instant.fill(None);
+
             for &id in &self.motor_ids {
                 let frame = damiao::build_enable_frame(id);
-                self.can.transmit(&frame)?;
+                if let Err(e) = self.can.transmit(&frame) {
+                    self.is_enabling = false;
+                    self.is_enabled = false;
+                    self.pending_rearm = true;
+                    return Err(e.into());
+                }
             }
-            self.can.flush()?;
+            if let Err(e) = self.can.flush() {
+                self.is_enabling = false;
+                self.is_enabled = false;
+                self.pending_rearm = true;
+                return Err(e.into());
+            }
 
             // Wait and poll for responses up to 80ms, max 30 checks
             let poll_start = Instant::now();
@@ -670,9 +838,19 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             while poll_start.elapsed() < Duration::from_millis(80) && check_count < 30 {
                 check_count += 1;
                 let _ = self.read_joint_states();
-                if self.is_feedback_valid() {
+                let all_fresh = !self.last_feedback_instant.is_empty()
+                    && self.last_feedback_instant.iter().all(|opt| {
+                        opt.map_or(false, |t| t >= handshake_start)
+                    });
+
+                if all_fresh {
                     // Check if any motor reported a fault
-                    self.check_hardware_status()?;
+                    if let Err(e) = self.check_hardware_status() {
+                        self.is_enabling = false;
+                        self.is_enabled = false;
+                        self.pending_rearm = true;
+                        return Err(e);
+                    }
                     // Check if all motors report enabled (state == 1)
                     if self.motor_status.iter().all(|&st| st == 1) {
                         all_enabled = true;
@@ -684,13 +862,19 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 // If not all enabled after 25ms or 10 checks, retry once for motors that have not responded or are not enabled
                 if !retried && (poll_start.elapsed() >= Duration::from_millis(25) || check_count >= 10) {
                     for (i, &id) in self.motor_ids.iter().enumerate() {
-                        if self.motor_status[i] != 1 {
+                        let motor_fresh_and_enabled = self.last_feedback_instant.get(i).copied().flatten().map_or(false, |t| t >= handshake_start)
+                            && self.motor_status.get(i).copied() == Some(1);
+                        if !motor_fresh_and_enabled {
                             tracing::debug!("Retrying enable for motor {} (CAN ID 0x{:X})", i, id);
                             let frame = damiao::build_enable_frame(id);
-                            let _ = self.can.transmit(&frame);
+                            if let Err(e) = self.can.transmit(&frame) {
+                                tracing::warn!("Retry transmit enable frame failed for motor {}: {:?}", id, e);
+                            }
                         }
                     }
-                    let _ = self.can.flush();
+                    if let Err(e) = self.can.flush() {
+                        tracing::warn!("Retry flush failed: {:?}", e);
+                    }
                     retried = true;
                 }
 
@@ -701,12 +885,14 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
             if !all_enabled {
                 self.is_enabled = false;
+                self.pending_rearm = true;
                 return Err(ArmDriverError::HardwareFault(format!(
                     "Not all Damiao motors entered enabled state within 80ms: feedback_valid={}, status={:?}",
                     self.is_feedback_valid(), self.motor_status
                 )));
             }
             self.is_enabled = true;
+            self.pending_rearm = false;
             Ok(())
         }
     }
@@ -731,7 +917,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             damiao::DAMIAO_GRIPPER_POSFORCE_VEL_RAW,
                             220,
                         );
-                        self.can.transmit(&frame)?;
+                        self.transmit_with_retry(&frame)?;
                         self.last_target_frames[i] = Some(frame);
                     } else {
                         let vlim = self.default_vlim.abs().clamp(0.1, 4.0);
@@ -741,7 +927,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             target.position,
                             vlim,
                         );
-                        self.can.transmit(&frame)?;
+                        self.transmit_with_retry(&frame)?;
                         self.last_target_frames[i] = Some(frame);
                     }
                 }
@@ -765,7 +951,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         torque,
                         &self.limits,
                     );
-                    self.can.transmit(&frame)?;
+                    self.transmit_with_retry(&frame)?;
                     self.last_target_frames[i] = Some(frame);
                 }
             }
@@ -775,13 +961,18 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        const MAX_RX_DURATION: Duration = Duration::from_millis(5);
         let t0 = Instant::now();
         let mut frames_processed = 0;
         let mut rx_drained = false;
-        while frames_processed < 64 && t0.elapsed() < Duration::from_micros(2000) {
+        while frames_processed < 64 && t0.elapsed() < MAX_RX_DURATION {
             match self.can.receive() {
                 Ok(frame) => {
                     frames_processed += 1;
+                    if self.awaiting_rx_boundary {
+                        if frames_processed >= 64 || t0.elapsed() >= MAX_RX_DURATION { break; }
+                        continue;
+                    }
                     // Ignore transmit commands: on SocketCAN with local echo enabled,
                     // host transmit frames for PosVel are 0x100 + tx_id, gripper echo 0x300 + tx_id,
                     // or special 0x7FF, or command frames.
@@ -795,7 +986,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         || frame.data == damiao::CMD_CLEAR_FAULTS
                         || frame.data == damiao::CMD_SET_ZERO
                     {
-                        if frames_processed >= 64 || t0.elapsed() >= Duration::from_micros(2000) {
+                        if frames_processed >= 64 || t0.elapsed() >= MAX_RX_DURATION {
                             break;
                         }
                         continue;
@@ -810,7 +1001,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                 .iter()
                                 .any(|&m| frame.id == m as u32 || frame.id == (0x10 + m as u32));
                         if !is_valid_feedback_id {
-                            if frames_processed >= 64 || t0.elapsed() >= Duration::from_micros(2000) {
+                            if frames_processed >= 64 || t0.elapsed() >= MAX_RX_DURATION {
                                 break;
                             }
                             continue;
@@ -826,19 +1017,24 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                                     position: feedback.position,
                                     velocity: feedback.velocity,
                                     torque: feedback.torque,
-                                    temperature: feedback.t_mos,
+                                    temperature: feedback.t_mos.max(feedback.t_rotor),
                                 };
                                 self.last_feedback_instant[idx] = Some(Instant::now());
                                 self.motor_status[idx] = feedback.state_or_error;
                             }
                         }
                     }
-                    if frames_processed >= 64 || t0.elapsed() >= Duration::from_micros(2000) {
+                    if frames_processed >= 64 || t0.elapsed() >= MAX_RX_DURATION {
                         break;
                     }
                 }
-                Err(TransportError::Timeout) => {
+                Err(TransportError::Timeout) | Err(TransportError::WouldBlock) => {
                     rx_drained = true;
+                    if self.awaiting_rx_boundary {
+                        self.awaiting_rx_boundary = false;
+                        self.last_feedback_instant.fill(None);
+                        self.last_enable_command = Some(Instant::now());
+                    }
                     break;
                 }
                 Err(_) => break,
@@ -848,7 +1044,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         // Evaluate feedback age only after receive() explicitly reports an empty
         // queue. If the bounded budget expires first, defer recovery to the next
         // tick so a frame beyond the budget cannot be mistaken for a bus timeout.
-        if rx_drained && self.is_enabled && !self.is_enabling {
+        if rx_drained && self.is_enabled && !self.is_enabling
+            && self.enable_state() == EnableState::Enabled {
             for (i, &id) in self.motor_ids.iter().enumerate() {
                 let stale = self
                     .last_feedback_instant
@@ -859,11 +1056,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     continue;
                 }
 
-                if let Some(frame) = self.last_target_frames.get(i).and_then(|f| *f) {
-                    let _ = self.can.transmit(&frame);
-                    continue;
-                }
-
+                // Recovery never replays a queued motion target. A still-fresh,
+                // confirmed enabled joint may only hold its last measured pose.
                 let p = self.cached_states.get(i).map_or(0.0, |s| s.position);
                 match self.control_mode {
                     DamiaoControlMode::Mit => {
@@ -951,6 +1145,12 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
 }
 
 impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
+    fn capabilities(&self) -> DriverCapabilities { DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: true, enable_feedback: false } }
+
+    fn feedback_ages(&self) -> Vec<Option<Duration>> {
+        self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
+    }
+
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
             return false;
@@ -982,10 +1182,9 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
                 err = Some(e);
             }
         }
-        let _ = self.can.flush();
-        for f in self.fault_flags.iter_mut() {
-            *f = 0;
-        }
+        if let Err(e) = self.can.flush() { err = Some(e); }
+        // A sent reset is not proof that the reported fault has cleared.
+        // The next telemetry response updates fault_flags.
         if let Some(e) = err {
             Err(ArmDriverError::HardwareFault(e.to_string()))
         } else {

@@ -29,13 +29,13 @@
 - ❌ **延迟抖动与通信不稳定**：Python GIL 与垃圾回收机制在高频（50Hz~100Hz）总线通信和多轴数据对齐时容易出现帧丢失；
 - ❌ **硬件接入碎片化**：达妙（Damiao MIT 阻抗）、飞特（Feetech 串口总线）、RobStride 等不同总线协议难以统一解耦。
 
-### 🚀 `rebot-armd` 的破局点：
-> **将整套遥操作（Teleoperation）、安全状态机与 LeRobot Parquet 录制器压缩进一个 3.3MB 的独立静态二进制！**
+### `rebot-armd` 的运行范围：
+> **提供统一驱动、安全状态机、WebSocket 控制租约与 LeRobot Parquet 录制接口。** 二进制大小、循环抖动和工业确定性取决于构建与现场环境，需单独测量。
 
 无需配置任何 Python 环境，哪怕是在售价几十元、内存仅 256MB 的边缘 RISC-V 芯片（如 **Seeed reCamera SG2002**）或微型单板电脑上，插上机械臂即可独立运行：
 1. **零 Python 依赖录制**：通过纯 Rust 流式将 50Hz 关节角度和控制指令压入标准 `.parquet` 文件，**采集完毕直接扔给 LeRobot 即可启动 ACT / Diffusion 训练**；
 2. **零安装触控驾驶舱**：内置单文件 Web 前端，手机连上 Wi-Fi 热点即可通过虚拟双摇杆远程遥控，配合 2D 正向运动学（FK）骨骼姿态可视化与一键 E-Stop；
-3. **工业级确定性安全**：硬件级看门狗心跳、五次多项式软限位插值与过温熔断，彻底避免机器人失控飞臂与脱缰。
+3. **有边界的安全策略**：控制租约、软限位、跟随误差、温度检查和 E-Stop；它们不能替代急停回路、机械限位或现场风险评估。
 
 ---
 
@@ -58,13 +58,14 @@ open http://localhost:8765
 cargo run --release -- --follower rebot-dm --follower-port can0
 ```
 
-### 3. 主从示教模式 (Leader-Follower Teleoperation)
+### 3. 主从示教模式 (Leader-Follower Teleoperation，未实现)
 连接主动臂（Leader）与从动臂（Follower）进行实时镜像同步与 LeRobot 示教：
 ```bash
 cargo run --release -- \
   --leader star-arm102 --leader-port /dev/ttyACM0 \
   --follower so-arm100 --follower-port /dev/ttyUSB0
 ```
+上述 `--leader`/`--leader-port` 参数会被明确拒绝；主从示教尚未实现，不要按此命令运行。
 
 ---
 
@@ -80,21 +81,21 @@ cargo run --release -- \
 
 | 电机品牌/型号 | 物理总线 | 默认通信速率 | 控制模式 | 核心数据帧特性 |
 | :--- | :--- | :--- | :--- | :--- |
-| **达妙 (Damiao / DM-J 系列)** | CAN 2.0A | 1 Mbps | MIT 阻抗控制 / 位置速度 | 8 字节标准帧，16-bit 位置量化，12-bit 速度、力矩、$K_p$、$K_d$ 阻抗参数 |
-| **飞特 (Feetech / STS3215)** | 半双工 UART 异步串口 | 1,000,000 bps | 位置伺服 / 扭矩控制 | 帧头 `0xFF 0xFF`，支持 `PING`、`READ`、`WRITE`、`SYNC_WRITE`，累加和反码校验 |
-| **RobStride (RS00/01/02)** | CAN 2.0B (29-bit 扩展帧) | 1 Mbps | MIT 模式 / 运控反馈 | 29-bit CAN ID 封装指令类型、主控 ID 与从机 ID；8 字节负载量化位置、速度与刚度 |
-| **FashionStar (方成串口总线)** | 半双工 UART 异步串口 | 115,200 bps | 角度控制 / 阻尼模式 | 请求帧头 `0x12 0x4C`，响应帧头 `0x05 0x1C`，0.1° 整数分辨率 |
+| **达妙 (Damiao / DM-J 系列)** | CAN 2.0A | 1 Mbps | 默认 POS_VEL；可选 MIT | 位置/速度/力矩/温度/使能反馈；默认 POS_VEL 不发送重力力矩前馈，MIT 才支持重力前馈 |
+| **飞特 (Feetech / STS3215)** | 半双工 UART | 1,000,000 bps | 位置伺服 | 位置、速度、温度反馈；驱动能力不含使能状态确认、力矩反馈或力矩前馈 |
+| **RobStride (RS00/01/02)** | CAN 2.0B (29-bit 扩展帧) | 1 Mbps | MIT 模式 | 位置、速度、力矩、温度反馈与力矩前馈；使能状态确认能力为 false |
+| **FashionStar (方成串口总线)** | 半双工 UART | 115,200 bps | 角度控制 | 当前驱动能力声明为空；数值占位不等于已测得反馈，不能据此自动失能或清故障 |
 
 ---
 
 ## 📊 LeRobot 数据集录制 (Native Parquet)
 
-`rebot-armd` 彻底摆脱了复杂的 Python 录制脚本，在底层直接集成 Apache Arrow 与 Parquet 库，以微秒级时间戳将每帧动作流式压缩写入存储卡。
+`rebot-armd` 在底层集成 Apache Arrow 与 Parquet 库，将动作帧写入 Parquet；与 Python/LeRobot 的兼容性仍应按实际数据集验证。
 
 ```
 [遥操作示教 / 摇杆直驱]
          │
-         ▼ (50Hz 确定性控制循环)
+         ▼ (按配置频率运行的控制循环)
 ┌─────────────────────────────────────────────────────────────┐
 │ rebot-armd 原生 Parquet 录制器 (Snappy 压缩)                │
 │                                                             │
@@ -111,7 +112,7 @@ cargo run --release -- \
 │       --policy.type act \                                   │
 │       --dataset.repo_id /data/episode_001.parquet           │
 │                                                             │
-│   🚀 无缝送入 ACT / Diffusion Policy 进行具身策略离线训练!   │
+│   将数据集交给 ACT / Diffusion Policy 前请按项目格式核验。 │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -157,22 +158,29 @@ Seeed reCamera Gimbal 扩展底板（B4）板载 MCP2518FD 工业 SPI-CAN 控制
 
 ## 📡 REST & WebSocket API 接口
 
-默认端口：`8765`（支持 CORS 跨域与移动端 Web 遥测）。
+默认端口：`8765`（支持 CORS 跨域与移动端 Web 遥测）。观测可用 REST；执行器动作必须使用持有租约的 WebSocket。REST 执行器端点返回结构化错误，不会绕过租约；E-Stop 不需要租约。
 
 | 路径 | 方法 | 功能描述 | 请求参数示例 |
 | :--- | :--- | :--- | :--- |
 | `/api/v1/observation` | `GET` | 50Hz 遥测状态（位置、速度、力矩、温度、安全状态） | 无 |
 | `/api/v1/observation/schema` | `GET` | 自由度配置与物理软限位极值查询 | 无 |
-| `/api/v1/torque` | `POST` | 开启/释放机械臂所有关节力矩 | `{"enable": true}` |
-| `/api/v1/heartbeat` | `POST` | 客户端心跳续期（超时自动降速安全停机） | `{"client_id": "web", "epoch_id": 42}` |
-| `/api/v1/motion/jog` | `POST` | 五次多项式平滑轨迹插值运动 | `{"target_positions": [...], "duration_secs": 2.0}` |
-| `/api/v1/motion/servo`| `POST` | 高频直接伺服控制（摇杆/示教器直驱） | `{"targets": [...]}` |
-| `/api/v1/motion/home` | `POST` | 一键安全平滑回零位 | `{"duration_secs": 3.0}` |
+| `/api/v1/torque`、`/heartbeat`、`/motion/*` | `POST` | REST 执行器端点；返回 `LEASE_REQUIRED`/`LEASE_ACTIVE` 错误并提示改用 WebSocket | 不执行动作 |
 | `/api/v1/safety/e_stop` | `POST` | 紧急制动并切入 EStop 锁死状态 | 无 |
-| `/api/v1/safety/clear_fault` | `POST` | 故障确认并复位恢复 | 无 |
+| `/api/v1/safety/clear_fault` | `POST` | REST 返回租约错误；通过 WebSocket command 执行，仍需新鲜反馈与非 Unknown 使能状态 |
 | `/api/v1/dataset/record/start` | `POST` | 开启 LeRobot 数据集片段录制 | `{"output_path": "episode_01.parquet"}` |
 | `/api/v1/dataset/record/save` | `POST` | 停止并持久化 Parquet 数据文件 | 无 |
 | `/api/v1/ws` | `WS` | 50Hz 双向实时流（下行遥测、上行心跳） | WebSocket 连接 |
+
+WebSocket 控制流程（`epoch_id` 为当前观测中的值，`generation` 由服务端返回）：
+
+```json
+{"type":"acquire_lease","client_id":"web"}
+{"type":"heartbeat","client_id":"web","generation":7,"epoch_id":42}
+{"type":"command","request_id":1,"generation":7,"epoch_id":42,"path":"/api/v1/motion/servo","body":{"targets":[0,0,0,0,0,0]}}
+{"type":"command_ack","request_id":1,"status":"accepted","epoch_id":42,"safety_state":"Armed","is_torqued":true}
+```
+
+服务端先返回 `lease_granted`（含 `generation`）；心跳应持续发送并带当前 `epoch_id`。`request_id` 必须严格递增。E-Stop 可直接发送 `{"type":"estop"}`，返回 `epoch_sync`，之后须重新同步 epoch；租约丢失、epoch 不匹配或拒绝时返回 `command_reject`。
 
 ---
 
@@ -212,13 +220,17 @@ USAGE:
     armd [OPTIONS]
 
 OPTIONS:
-    --follower <MODEL>       Follower arm model: rebot-rs, rebot-dm, so-arm100, so-arm101, mock [default: mock]
+    --follower <MODEL>       Follower arm model: rebot-rs, rebot-dm, so-arm101, fashionstar, star-arm102, mock [default: mock]
     --follower-port <PORT>   Follower interface: can0, /dev/ttyUSB0, /dev/ttyS1
-    --leader <MODEL>         Leader teleop arm model: star-arm102, so-arm100
-    --leader-port <PORT>     Leader serial interface: /dev/ttyACM0, /dev/ttyUSB1
+    --leader <MODEL>         未实现；传入即拒绝启动
+    --leader-port <PORT>     未实现；传入即拒绝启动
     --port <PORT>            HTTP / WebSocket service port [default: 8765]
     -h, --help               Print help information
 ```
+
+`--config` 接受 JSON 文件路径，必须包含完整的 `ArmConfig` 核心字段：`dof`、`joint_names`、`limits`（每项含 `name`、`min_position`、`max_position`、`max_velocity`、`max_acceleration`）、`home_positions`、`lease_timeout_ms`、`max_temperature`、`control_frequency_hz`。可选字段为 `resting_pose`、`following_error`、`max_jerk`、`gravity_model`；若出现则必须满足对应校验。驱动 DOF 固定为：`rebot-dm=7`（6 轴加 gripper），`rebot-rs/so-arm101/fashionstar/star-arm102=6`，`mock` 不强制。配置 DOF 与 follower 不符会拒绝启动。
+
+停止动作只停止运动并保持 API 以便确认状态，不回零，也不强杀未确认失能的服务。三种串口/CAN 驱动的反馈和使能确认能力不同，必须以观测字段为准。
 
 ---
 

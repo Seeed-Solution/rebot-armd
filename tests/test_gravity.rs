@@ -74,7 +74,8 @@ fn test_invalid_angle_detection() {
 async fn test_supervisor_gravity_compensation_integration() {
     use armd::{ArmConfig, ArmSupervisor};
 
-    let config = ArmConfig::default();
+    let mut config = ArmConfig::default();
+    config.gravity_model = Some(armd::model::GravityModel::RebotDevArm);
     let supervisor = ArmSupervisor::new(config);
 
     // Assets exist in repo, so gravity_compensated must be true
@@ -106,8 +107,13 @@ async fn test_gravity_feedforward_torque_ramping_and_injection() {
         targets_log: Arc<Mutex<Vec<Vec<JointTarget>>>>,
     }
     impl ArmDriver for MockRecordingDriver {
+        fn capabilities(&self) -> armd::driver::DriverCapabilities {
+            armd::driver::DriverCapabilities { torque_feedforward: true, ..Default::default() }
+        }
+        fn feedback_ages(&self) -> Vec<Option<std::time::Duration>> { vec![Some(std::time::Duration::ZERO); 6] }
+
         fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
-            Ok(vec![JointState::default(); 7])
+            Ok(vec![JointState::default(); 6])
         }
         fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
             self.targets_log.lock().unwrap().push(targets.to_vec());
@@ -122,7 +128,8 @@ async fn test_gravity_feedforward_torque_ramping_and_injection() {
         targets_log: recorded.clone(),
     });
 
-    let config = ArmConfig::default();
+    let mut config = ArmConfig::default();
+    config.gravity_model = Some(armd::model::GravityModel::RebotDevArm);
     let supervisor = ArmSupervisor::new(config).with_driver(driver);
     supervisor.set_torque(true).await.unwrap();
 

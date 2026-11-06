@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use crate::safety::SafetyState;
+use crate::driver::{DriverCapabilities, EnableState};
 
 /// Limits for a single joint
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -49,6 +50,40 @@ impl Default for JointState {
     }
 }
 
+/// Hardware-specific evidence required before automatic torque release.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestingPosePolicy {
+    pub position_tolerances: Vec<f32>,
+    pub max_total_deviation: f32,
+    pub max_velocity: f32,
+    pub support_torque_limits: Vec<(usize, f32)>,
+    pub feedback_max_age_ms: u64,
+}
+
+impl RestingPosePolicy {
+    pub fn rebot_dm() -> Self {
+        Self {
+            position_tolerances: vec![0.15, 0.08, 0.08, 0.08, 0.08, 0.08],
+            max_total_deviation: 0.22,
+            max_velocity: 0.015,
+            support_torque_limits: vec![(1, 1.5), (2, 4.5)],
+            feedback_max_age_ms: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowingErrorPolicy {
+    pub max_error_rad: f32,
+    pub persistence_ms: u64,
+}
+impl Default for FollowingErrorPolicy {
+    fn default() -> Self { Self { max_error_rad: 0.5, persistence_ms: 500 } }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GravityModel { RebotDevArm }
+
 /// Robotic arm hardware/control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArmConfig {
@@ -59,6 +94,16 @@ pub struct ArmConfig {
     pub lease_timeout_ms: u64,
     pub max_temperature: f32,
     pub control_frequency_hz: u32,
+    /// None forbids automatic hardware torque release without a calibrated profile.
+    #[serde(default)]
+    pub resting_pose: Option<RestingPosePolicy>,
+    #[serde(default)]
+    pub following_error: FollowingErrorPolicy,
+    /// Soft jerk preference; braking/position constraints take precedence.
+    #[serde(default)]
+    pub max_jerk: Option<f32>,
+    #[serde(default)]
+    pub gravity_model: Option<GravityModel>,
 }
 
 impl Default for ArmConfig {
@@ -92,6 +137,10 @@ impl Default for ArmConfig {
             lease_timeout_ms: 2500,
             max_temperature: 70.0,
             control_frequency_hz: 50,
+            resting_pose: None,
+            following_error: FollowingErrorPolicy::default(),
+            max_jerk: None,
+            gravity_model: None,
         }
     }
 }
@@ -111,13 +160,33 @@ impl ArmConfig {
         if self.joint_names.len() != self.dof {
             self.joint_names.resize_with(self.dof, || "joint".to_string());
         }
+        if self.control_frequency_hz == 0 || self.control_frequency_hz > 1000
+            || !self.max_temperature.is_finite() || self.max_temperature <= 5.0
+            || !self.following_error.max_error_rad.is_finite() || self.following_error.max_error_rad <= 0.0
+            || self.following_error.persistence_ms == 0
+            || self.max_jerk.is_some_and(|j| !j.is_finite() || j <= 0.0) {
+            return Err("Invalid control, temperature, following-error or jerk configuration".into());
+        }
+        if let Some(policy) = &self.resting_pose {
+            if policy.position_tolerances.is_empty() || policy.position_tolerances.len() > self.dof
+                || policy.position_tolerances.iter().any(|v| !v.is_finite() || *v <= 0.0)
+                || !policy.max_total_deviation.is_finite() || policy.max_total_deviation <= 0.0
+                || !policy.max_velocity.is_finite() || policy.max_velocity <= 0.0
+                || policy.feedback_max_age_ms == 0
+                || policy.support_torque_limits.iter().any(|(i, t)| *i >= self.dof || !t.is_finite() || *t < 0.0) {
+                return Err("Invalid resting-pose policy".into());
+            }
+        }
         for (i, lim) in self.limits.iter().enumerate() {
-            if lim.min_position >= lim.max_position {
+            if !lim.min_position.is_finite() || !lim.max_position.is_finite() || lim.min_position >= lim.max_position {
                 return Err(format!("Joint {} min position >= max position", i));
             }
-            if lim.max_velocity <= 0.0 || !lim.max_velocity.is_finite() {
+            if lim.max_velocity <= 0.0 || !lim.max_velocity.is_finite() || lim.max_acceleration <= 0.0 || !lim.max_acceleration.is_finite() {
                 return Err(format!("Joint {} max_velocity must be positive finite", i));
             }
+        }
+        if self.home_positions.iter().zip(&self.limits).any(|(p, l)| !p.is_finite() || *p < l.min_position || *p > l.max_position) {
+            return Err("Home positions must be finite and within joint limits".into());
         }
         Ok(())
     }
@@ -155,6 +224,10 @@ impl ArmConfig {
             lease_timeout_ms: 2500,
             max_temperature: 70.0,
             control_frequency_hz: 50,
+            resting_pose: Some(RestingPosePolicy::rebot_dm()),
+            following_error: FollowingErrorPolicy::default(),
+            max_jerk: Some(50.0),
+            gravity_model: Some(GravityModel::RebotDevArm),
         }
     }
 }
@@ -174,6 +247,16 @@ pub struct ArmObservation {
     pub gravity_compensated: bool,
     #[serde(default)]
     pub gravity_torques: Vec<f32>,
+    #[serde(default)]
+    pub driver_capabilities: DriverCapabilities,
+    #[serde(default)]
+    pub enable_state: EnableState,
+    #[serde(default)]
+    pub feedback_age_ms: Vec<Option<u64>>,
+    #[serde(default)]
+    pub disable_pending: bool,
+    #[serde(default)]
+    pub feedback_valid: bool,
 }
 
 /// Field description in the observation schema

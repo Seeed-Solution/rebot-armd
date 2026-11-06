@@ -105,7 +105,13 @@ impl CanTransport for SocketCanTransport {
 
         self.socket
             .write_frame(&SkCanFrame::Data(sk_frame))
-            .map_err(|e| TransportError::Can(format!("SocketCAN send failed: {}", e)))?;
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    TransportError::WouldBlock
+                } else {
+                    TransportError::Can(format!("SocketCAN send failed: {}", e))
+                }
+            })?;
 
         Ok(())
     }

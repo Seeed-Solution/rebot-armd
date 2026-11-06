@@ -216,7 +216,7 @@ async fn test_supervisor_stop_policies() {
     supervisor.set_torque(true).await.unwrap();
     // Jog somewhere
     supervisor.jog(vec![1.0, 1.0], Some(0.5), None).await.unwrap();
-    supervisor.tick(0.2).await;
+    for _ in 0..10 { supervisor.tick(0.02).await; }
     supervisor.apply_stop_policy(StopPolicy::NormalUnload).await;
     // Step until trajectory finishes
     for _ in 0..100 {
@@ -335,7 +335,7 @@ async fn test_supervisor_torque_disable_and_estop_state_clearing() {
 
     // 1. Jog to start trajectory
     supervisor.jog(vec![2.0], Some(1.0), None).await.unwrap();
-    supervisor.tick(0.1).await;
+    for _ in 0..5 { supervisor.tick(0.02).await; }
 
     // Disabling torque while moving / mid-air must be rejected with ArmNotAtRestingPose
     let res = supervisor.set_torque(false).await;
@@ -432,6 +432,9 @@ impl MockDriver {
 }
 
 impl ArmDriver for MockDriver {
+    fn is_feedback_valid(&self) -> bool { true }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO)] }
+
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         self.read_calls.fetch_add(1, Ordering::SeqCst);
         Ok(vec![JointState {
@@ -489,7 +492,7 @@ async fn test_supervisor_hardware_driver_mounting_and_anti_gravity_holding() {
 
     // Advance until trajectory completes
     while supervisor.get_observation().await.safety_state == SafetyState::Moving {
-        supervisor.tick(0.1).await;
+        for _ in 0..5 { supervisor.tick(0.02).await; }
     }
     // One more tick in holding phase
     supervisor.tick(0.02).await;
@@ -631,8 +634,8 @@ async fn test_set_torque_fails_when_feedback_unavailable() {
 
     // Confirm arm remains un-torqued
     let obs = supervisor.get_observation().await;
-    assert!(!obs.is_torqued);
-    assert_eq!(obs.safety_state, SafetyState::Idle);
+    assert!(obs.is_torqued, "Missing feedback cannot confirm de-energization");
+    assert!(obs.disable_pending);
 }
 
 #[tokio::test]
@@ -744,9 +747,10 @@ async fn test_enable_hardware_failure_rolls_back_and_latches_fault() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     assert!(!last_state.load(Ordering::SeqCst));
 
-    // Confirm state is latched Fault and un-torqued
+    // Rollback write is not hardware confirmation; preserve the possible-powered state.
     let obs = supervisor.get_observation().await;
-    assert!(!obs.is_torqued);
+    assert!(obs.is_torqued);
+    assert!(obs.disable_pending);
     assert!(matches!(obs.safety_state, SafetyState::Fault(_)));
 }
 

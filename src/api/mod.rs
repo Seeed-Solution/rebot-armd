@@ -8,7 +8,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use tower_http::cors::{Any, CorsLayer};
+use axum::{body::Body, http::{Request, StatusCode}, middleware::{self, Next}, response::Response};
 use tower_http::trace::TraceLayer;
 
 use crate::supervisor::ArmSupervisor;
@@ -21,11 +21,6 @@ async fn serve_index() -> Html<&'static str> {
 
 /// Build the Axum router for the arm daemon
 pub fn create_router(supervisor: Arc<ArmSupervisor>) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
     Router::new()
         .route("/", get(serve_index))
         .route("/api/v1/observation", get(rest::get_observation))
@@ -50,7 +45,28 @@ pub fn create_router(supervisor: Arc<ArmSupervisor>) -> Router {
         .route("/api/webrtc", post(proxy::proxy_go2rtc_webrtc))
         .route("/api/stream.mp4", get(proxy::proxy_go2rtc_stream))
         .route("/api/stream.mjpeg", get(proxy::proxy_go2rtc_stream))
-        .layer(cors)
+        .layer(middleware::from_fn(same_origin))
         .layer(TraceLayer::new_for_http())
         .with_state(supervisor)
+}
+
+// Browser origin protection is not network authentication. Non-browser clients
+// remain suitable only for a trusted network or an authenticated reverse proxy.
+async fn same_origin(request: Request<Body>, next: Next) -> Response {
+    let protected = request.method() != axum::http::Method::GET
+        || request.headers().get("upgrade").and_then(|h| h.to_str().ok()).map_or(false, |h| h.eq_ignore_ascii_case("websocket"));
+    if protected {
+        if let Some(origin) = request.headers().get("origin") {
+            let host = request.headers().get("host").and_then(|h| h.to_str().ok());
+            let valid = origin.to_str().ok().and_then(|o| o.parse::<axum::http::Uri>().ok()).map_or(false, |uri| {
+                matches!(uri.scheme_str(), Some("http" | "https"))
+                    && uri.authority().map(|a| a.as_str()) == host
+                    && uri.path_and_query().map_or(true, |p| p.as_str() == "/")
+            });
+            if !valid {
+                return axum::response::IntoResponse::into_response((StatusCode::FORBIDDEN, "Cross-origin control requests are not allowed"));
+            }
+        }
+    }
+    next.run(request).await
 }

@@ -513,13 +513,13 @@ fn test_damiao_driver_mock_loopback() {
     let motor_ids = vec![1, 2];
     let mut driver = DamiaoArmDriver::new(mock_can, motor_ids.clone());
 
-    // 1. Set torque enable: provide motor enable feedback frames (state=1)
+    // 1. Receive enable feedback only after each enable command is transmitted.
     let mut d1_en = [0u8; 8];
     d1_en[0] = 0x11; // state=1 (enabled), motor_id=1
     let mut d2_en = [0u8; 8];
     d2_en[0] = 0x12; // state=1 (enabled), motor_id=2
-    driver.can_mut().provide_rx_frame(CanFrame::new_standard(0x11, &d1_en).unwrap());
-    driver.can_mut().provide_rx_frame(CanFrame::new_standard(0x12, &d2_en).unwrap());
+    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), CanFrame::new_standard(0x11, &d1_en).unwrap());
+    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(2), CanFrame::new_standard(0x12, &d2_en).unwrap());
 
     driver.set_torque(true).unwrap();
     let tx = driver.can_mut().take_tx_frames();
@@ -846,10 +846,10 @@ fn test_e2e_damiao_over_slcan_mock_serial() {
     let slcan = SlcanTransport::new(mock_serial);
     let mut arm = DamiaoArmDriver::new(slcan, vec![1]);
 
-    // Pre-inject motor 1 feedback frame with state=1 (enabled)
+    // Configure post-enable motor 1 feedback with state=1 (enabled)
     // Motor 1 feedback: CAN ID 0x11, DLC 8, data[0] = 0x11 (enabled, motor_id=1)
     // In SLCAN format: t01181100000000002823\r
-    arm.can_mut().inner_mut().provide_rx(b"t01181100000000002823\r");
+    arm.can_mut().inner_mut().respond_to_write(b"t0018FFFFFFFFFFFFFFFC\r", b"t01181100000000002823\r");
 
     // Command arm torque
     arm.set_torque(true).unwrap();

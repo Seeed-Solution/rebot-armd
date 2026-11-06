@@ -1,67 +1,76 @@
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use armd::{create_router, ArmConfig, ArmSupervisor, StopPolicy};
+use armd::{create_router, ArmConfig, ArmSupervisor, StopPolicy, SupervisorInner};
 
 #[derive(Debug, Default)]
 struct CliArgs {
     follower: Option<String>,
     follower_port: Option<String>,
-    leader: Option<String>,
-    leader_port: Option<String>,
     port: Option<u16>,
+    config: Option<String>,
 }
 
-fn parse_cli_args() -> CliArgs {
-    let args: Vec<String> = std::env::args().collect();
+fn parse_cli_args() -> Result<CliArgs, String> {
+    let mut args = std::env::args().skip(1);
     let mut cli = CliArgs::default();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--help" | "-h" => {
-                println!(
-                    "armd - Minimal Robotic Arm Daemon & Teleop HAL\n\n\
-                    USAGE:\n    \
-                        armd [OPTIONS]\n\n\
-                    OPTIONS:\n    \
-                        --follower <MODEL>       Follower arm model: rebot-rs, rebot-dm, so-arm101, mock [default: mock]\n    \
-                        --follower-port <PORT>   Follower interface: can0, /dev/ttyUSB0, /dev/ttyS1\n    \
-                        --leader <MODEL>         Leader teleop arm model: star-arm102, so-arm100\n    \
-                        --leader-port <PORT>     Leader serial interface: /dev/ttyACM0, /dev/ttyUSB1\n    \
-                        --port <PORT>            HTTP / WebSocket service port [default: 8765]\n    \
-                        -h, --help               Print help information\n"
-                );
-                std::process::exit(0);
+    while let Some(arg) = args.next() {
+        if arg == "--help" || arg == "-h" {
+            println!("armd - Robotic arm daemon\n\nUSAGE: armd [OPTIONS]\n\n\
+                --follower <MODEL>       rebot-rs, rebot-dm, so-arm101, fashionstar, star-arm102, mock (default)\n\
+                --follower-port <PORT>   CAN interface or serial device\n\
+                --config <JSON>          ArmConfig profile (must match follower joint count)\n\
+                --port <PORT>            HTTP / WebSocket port (default 8765)\n\
+                --help                   Print help\n\n\
+                Leader-following is not implemented. Hardware failures never fall back to mock.");
+            std::process::exit(0);
+        }
+        if arg == "--leader" || arg == "--leader-port" {
+            return Err(
+                "Leader-following is not implemented; refusing to start a simulated leader".into(),
+            );
+        }
+        if !matches!(
+            arg.as_str(),
+            "--follower" | "--follower-port" | "--port" | "--config"
+        ) {
+            return Err(format!("Unknown argument: {arg}"));
+        }
+        let value = args
+            .next()
+            .filter(|value| !value.starts_with("--"))
+            .ok_or_else(|| format!("Missing value for {arg}"))?;
+        match arg.as_str() {
+            "--follower" => cli.follower = Some(value),
+            "--follower-port" => cli.follower_port = Some(value),
+            "--config" => cli.config = Some(value),
+            "--port" => {
+                cli.port = Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| format!("Invalid port: {value}"))?,
+                )
             }
-            "--follower" if i + 1 < args.len() => {
-                cli.follower = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--follower-port" if i + 1 < args.len() => {
-                cli.follower_port = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--leader" if i + 1 < args.len() => {
-                cli.leader = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--leader-port" if i + 1 < args.len() => {
-                cli.leader_port = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--port" if i + 1 < args.len() => {
-                cli.port = args[i + 1].parse().ok();
-                i += 2;
-            }
-            _ => {
-                i += 1;
-            }
+            _ => unreachable!(),
         }
     }
-    cli
+    Ok(cli)
+}
+
+/// Called while holding the supervisor write lock so stop authority cannot race motion.
+fn request_shutdown(inner: &mut SupervisorInner) -> bool {
+    if inner.driver.is_none() || inner.shutdown_ready() {
+        inner.e_stop_latched.store(true, Ordering::SeqCst);
+        return true;
+    }
+    if !inner.safety.state().is_stopped() {
+        inner.execute_stop(StopPolicy::EStopLatch);
+    }
+    false
 }
 
 #[tokio::main]
@@ -74,161 +83,252 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    info!("Starting armd (Minimal Robotic Arm Daemon) - M0");
-
-    let cli = parse_cli_args();
-    let follower_name = cli.follower.as_deref().unwrap_or("mock");
-    let config = match follower_name {
-        "rebot-dm" => ArmConfig::rebot_dm(),
-        _ => ArmConfig::default(),
+    let cli = parse_cli_args()?;
+    let follower = cli.follower.as_deref().unwrap_or("mock");
+    let expected_dof = match follower {
+        "rebot-dm" => Some(7),
+        "rebot-rs" | "so-arm101" | "fashionstar" | "star-arm102" => Some(6),
+        "mock" => None,
+        other => return Err(format!("Unknown follower model: {other}").into()),
     };
-    let hz = config.control_frequency_hz;
-    let period_ms = 1000 / hz as u64;
-
+    if follower == "mock" && cli.follower_port.is_some() {
+        return Err("--follower-port requires a hardware follower".into());
+    }
+    let mut config = if let Some(path) = cli.config {
+        serde_json::from_reader::<_, ArmConfig>(std::fs::File::open(path)?)?
+    } else if follower == "rebot-dm" {
+        ArmConfig::rebot_dm()
+    } else {
+        ArmConfig::default()
+    };
+    config.validate()?;
+    if expected_dof.is_some_and(|dof| config.dof != dof) {
+        return Err(format!(
+            "Profile DOF {} does not match {follower} hardware DOF {}",
+            config.dof,
+            expected_dof.unwrap()
+        )
+        .into());
+    }
+    let period = Duration::from_secs_f64(1.0 / f64::from(config.control_frequency_hz));
+    let port = match cli.port {
+        Some(port) => port,
+        None => match std::env::var("PORT") {
+            Ok(value) => value
+                .parse::<u16>()
+                .map_err(|_| format!("Invalid PORT: {value}"))?,
+            Err(_) => 8765,
+        },
+    };
+    // Bind before mounting hardware; an unavailable API must not leave a hardware loop running.
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
     let supervisor = Arc::new(ArmSupervisor::new(config));
-    info!(
-        "ArmSupervisor initialized: gravity_compensated={}",
-        supervisor.is_gravity_compensated().await
-    );
-
-    // Mount hardware driver from CLI arguments if specified
-    if let Some(ref follower) = cli.follower {
-        match follower.as_str() {
-            "rebot-rs" => {
-                #[cfg(target_os = "linux")]
-                {
-                    let port = cli.follower_port.as_deref().unwrap_or("can0");
-                    match armd::transport::SocketCanTransport::open(port) {
-                        Ok(can) => {
-                            let motor_ids = vec![1, 2, 3, 4, 5, 6];
-                            let driver = armd::driver::RobStrideArmDriver::new(can, motor_ids);
-                            supervisor.set_driver(Box::new(driver)).await;
-                            info!("Mounted RobStride (reBot Arm B601-RS) follower driver on {}", port);
-                        }
-                        Err(e) => warn!("Failed to open SocketCAN port {}: {}", port, e),
-                    }
+    match follower {
+        "rebot-rs" | "rebot-dm" => {
+            #[cfg(target_os = "linux")]
+            {
+                let port = cli.follower_port.as_deref().unwrap_or("can0");
+                let can = armd::transport::SocketCanTransport::open(port)?;
+                if follower == "rebot-dm" {
+                    supervisor
+                        .set_driver(Box::new(armd::driver::DamiaoArmDriver::new(
+                            can,
+                            (1..=7).collect(),
+                        )))
+                        .await;
+                } else {
+                    supervisor
+                        .set_driver(Box::new(armd::driver::RobStrideArmDriver::new(
+                            can,
+                            (1..=6).collect(),
+                        )))
+                        .await;
                 }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    warn!("rebot-rs driver requires Linux SocketCAN");
-                }
+                info!("Mounted {} on {}", follower, port);
             }
-            "rebot-dm" => {
-                #[cfg(target_os = "linux")]
-                {
-                    let port = cli.follower_port.as_deref().unwrap_or("can0");
-                    match armd::transport::SocketCanTransport::open(port) {
-                        Ok(can) => {
-                            let motor_ids = vec![1, 2, 3, 4, 5, 6, 7];
-                            let driver = armd::driver::DamiaoArmDriver::new(can, motor_ids);
-                            supervisor.set_driver(Box::new(driver)).await;
-                            info!("Mounted Damiao (reBot Arm B601-DM, 7-axis POS_VEL mode) follower driver on {}", port);
-                        }
-                        Err(e) => warn!("Failed to open SocketCAN port {}: {}", port, e),
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    warn!("rebot-dm driver requires Linux SocketCAN");
-                }
-            }
-            "so-arm101" => {
-                let port = cli.follower_port.as_deref().unwrap_or("/dev/ttyUSB0");
-                match armd::transport::SerialTransport::open_default(port, 1_000_000) {
-                    Ok(transport) => {
-                        let servo_ids = vec![1, 2, 3, 4, 5, 6];
-                        let driver = armd::driver::FeetechArmDriver::new(transport, servo_ids);
-                        supervisor.set_driver(Box::new(driver)).await;
-                        info!("Mounted Feetech (SO-ARM 101) follower driver on {}", port);
-                    }
-                    Err(e) => warn!("Failed to open serial port {}: {}", port, e),
-                }
-            }
-            "mock" => {
-                info!("Follower configured as mock simulation");
-            }
-            other => {
-                warn!("Unknown follower type: {}", other);
-            }
+            #[cfg(not(target_os = "linux"))]
+            return Err(format!("{follower} requires Linux SocketCAN").into());
         }
+        "so-arm101" | "fashionstar" | "star-arm102" => {
+            let port = cli.follower_port.as_deref().unwrap_or("/dev/ttyUSB0");
+            let baud = if follower == "so-arm101" {
+                1_000_000
+            } else {
+                115_200
+            };
+            let transport = armd::transport::SerialTransport::open_default(port, baud)?;
+            if follower == "so-arm101" {
+                supervisor
+                    .set_driver(Box::new(armd::driver::FeetechArmDriver::new(
+                        transport,
+                        (1..=6).collect(),
+                    )))
+                    .await;
+            } else {
+                supervisor
+                    .set_driver(Box::new(armd::driver::FashionStarArmDriver::new(
+                        transport,
+                        (1..=6).collect(),
+                    )))
+                    .await;
+            }
+            info!("Mounted {} on {}", follower, port);
+        }
+        "mock" => info!("Follower configured as mock simulation"),
+        _ => unreachable!(),
     }
 
-    if let Some(ref leader) = cli.leader {
-        let port = cli.leader_port.as_deref().unwrap_or("/dev/ttyUSB1");
-        info!("Leader teleoperation device configured: {} on {}", leader, port);
-    }
-
-    // Spawn real-time control loop
-    let sup_clone = supervisor.clone();
+    let control_supervisor = supervisor.clone();
     let control_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(period_ms));
+        let mut interval = tokio::time::interval(period);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_tick = std::time::Instant::now();
         loop {
             interval.tick().await;
-            let dt = last_tick.elapsed().as_secs_f64().clamp(0.001, 0.05);
+            let dt = last_tick.elapsed().as_secs_f64();
             last_tick = std::time::Instant::now();
-            sup_clone.tick(dt).await;
+            // Preserve real elapsed time so the supervisor can detect stalled control ticks.
+            control_supervisor.tick(dt).await;
         }
     });
 
+    info!(
+        "armd API server listening on http://{}",
+        listener.local_addr()?
+    );
     let router = create_router(supervisor.clone());
+    let mut server_handle = tokio::spawn(async move { axum::serve(listener, router).await });
+    let mut server_finished = false;
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-    let port: u16 = cli
-        .port
-        .or_else(|| std::env::var("PORT").ok().and_then(|p| p.parse().ok()))
-        .unwrap_or(8765);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-
-    info!("armd API server listening on http://{}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-
-    let sup_shutdown = supervisor.clone();
-    let sup_shutdown_task = sup_shutdown.clone();
-    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate()).expect("Failed to bind SIGTERM listener");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    info!("SIGINT (Ctrl+C) received. Initiating NormalUnload...");
+    loop {
+        tokio::select! {
+            result = &mut server_handle, if !server_finished => {
+                server_finished = true;
+                warn!("HTTP server exited: {:?}", result);
+            }
+            _ = async {
+                #[cfg(unix)]
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = sigterm.recv() => {},
                 }
-                _ = sigterm.recv() => {
-                    info!("SIGTERM received. Initiating NormalUnload...");
-                }
+                #[cfg(not(unix))]
+                { let _ = tokio::signal::ctrl_c().await; }
+            } => {}
+        }
+
+        let mut inner = supervisor.inner().write().await;
+        if request_shutdown(&mut inner) {
+            break;
+        }
+        warn!("Shutdown refused: hardware disable is not confirmed. Stop is latched; control loop and API remain available. Explicit fault recovery and rearming are required before further motion.");
+    }
+
+    // A confirmed-safe exit must not wait indefinitely on connected WebSockets.
+    server_handle.abort();
+    control_handle.abort();
+    info!("armd stopped after shutdown readiness confirmation");
+    Ok(())
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget};
+    use armd::model::JointState;
+    use armd::safety::{FaultReason, SafetyState};
+
+    struct ConfirmedDriver(EnableState);
+    impl ArmDriver for ConfirmedDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: true,
+                temperature_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: true,
             }
         }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("Shutdown signal received. Initiating NormalUnload...");
+        fn enable_state(&self) -> EnableState {
+            self.0
         }
-        sup_shutdown_task.apply_stop_policy(StopPolicy::NormalUnload).await;
-    });
-
-    if let Err(e) = server.await {
-        warn!("Server terminated with error: {}", e);
+        fn is_enabled(&self) -> bool {
+            self.0 == EnableState::Enabled
+        }
+        fn is_feedback_valid(&self) -> bool {
+            true
+        }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> {
+            vec![Some(Duration::ZERO); 6]
+        }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            Ok(vec![JointState::default(); 6])
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> {
+            Ok(())
+        }
+        fn set_torque(&mut self, enable: bool) -> Result<(), ArmDriverError> {
+            self.0 = if enable {
+                EnableState::Enabled
+            } else {
+                EnableState::Disabled
+            };
+            Ok(())
+        }
     }
 
-    // Allow control loop to complete NormalUnload trajectory and settling before terminating
-    let start_wait = std::time::Instant::now();
-    while sup_shutdown.is_unloading().await && start_wait.elapsed() < Duration::from_secs(6) {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    fn physical(state: EnableState) -> SupervisorInner {
+        let mut inner = SupervisorInner::new(ArmConfig::default())
+            .with_driver(Box::new(ConfirmedDriver(state)));
+        if state == EnableState::Enabled {
+            inner.is_torqued = true;
+            inner.safety.set_torque(true).unwrap();
+        }
+        inner
     }
-    let obs = sup_shutdown.get_observation().await;
-    let config = sup_shutdown.get_config().await;
-    let at_home = obs.positions.iter().zip(config.home_positions.iter()).all(|(p, h)| (p - h).abs() < 0.20);
-    if at_home {
-        info!("Arm arrived safely at home position; powering off motors.");
-        let _ = sup_shutdown.set_torque(false).await;
-    } else if !obs.is_torqued {
-        info!("Arm is already unpowered; shutting down cleanly.");
-    } else {
-        warn!("Daemon exiting while arm is at an extended pose (is_torqued=true); maintaining hardware holding torque to prevent gravitational collapse.");
+
+    #[test]
+    fn refused_shutdown_latches_stop_until_explicit_recovery_and_rearm() {
+        let mut inner = physical(EnableState::Enabled);
+        let old_epoch = inner.safety.epoch_id();
+        inner.servo(vec![0.1; 6], old_epoch).unwrap();
+        assert!(!request_shutdown(&mut inner));
+        assert_eq!(inner.safety.state(), &SafetyState::EStop);
+        let new_epoch = inner.safety.epoch_id();
+        assert_ne!(new_epoch, old_epoch);
+        assert!(inner.servo(vec![0.1; 6], old_epoch).is_err());
+        assert!(inner.servo(vec![0.1; 6], new_epoch).is_err());
+        assert!(inner.set_torque(true).is_err());
+        inner.clear_fault().unwrap();
+        assert_eq!(inner.safety.state(), &SafetyState::Idle);
+        assert!(inner.servo(vec![0.1; 6], inner.safety.epoch_id()).is_err());
+        inner.set_torque(true).unwrap();
+        assert!(inner.servo(vec![0.1; 6], inner.safety.epoch_id()).is_ok());
     }
-    control_handle.abort();
-    info!("armd daemon stopped cleanly");
-    Ok(())
+
+    #[test]
+    fn refused_shutdown_preserves_existing_fault_and_epoch() {
+        let mut inner = physical(EnableState::Enabled);
+        inner.safety.trigger_fault(FaultReason::ThermalTrip {
+            joint_idx: 0,
+            temperature: 80.0,
+            limit: 70.0,
+        });
+        let fault = inner.safety.state().clone();
+        let epoch = inner.safety.epoch_id();
+        assert!(!request_shutdown(&mut inner));
+        assert_eq!(inner.safety.state(), &fault);
+        assert_eq!(inner.safety.epoch_id(), epoch);
+    }
+
+    #[test]
+    fn confirmed_disabled_hardware_can_exit_and_cannot_reenable_during_exit() {
+        let mut inner = physical(EnableState::Disabled);
+        assert!(request_shutdown(&mut inner));
+        assert!(inner.set_torque(true).is_err());
+        let mut unknown = physical(EnableState::Unknown);
+        assert!(!request_shutdown(&mut unknown));
+    }
 }

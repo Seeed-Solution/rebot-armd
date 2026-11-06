@@ -116,7 +116,7 @@ async fn expired_servo_brakes_at_both_limits_with_alternating_dt() {
             assert!(inner.servo_target.is_some());
         }
         let mut previous = supervisor.get_observation().await;
-        for h in [0.001, 0.1].into_iter().cycle().take(20) {
+        for h in [0.001, 0.06].into_iter().cycle().take(20) {
             let current = supervisor.tick(h).await;
             check_step(&previous, &current, h, 5.0, 2.0);
             assert!(current.velocities[0].abs() <= previous.velocities[0].abs());
@@ -134,7 +134,7 @@ async fn variable_dt_respects_small_acceleration_and_velocity_limits() {
     supervisor.servo(vec![0.001], 1).await.unwrap();
     let mut previous = supervisor.get_observation().await;
     let mut peak_v = 0.0_f32;
-    for h in [0.001, 0.01, 0.1, 0.003, 0.02, 0.05].into_iter().cycle().take(600) {
+    for h in [0.001, 0.01, 0.06, 0.003, 0.02, 0.05].into_iter().cycle().take(600) {
         let current = supervisor.tick(h).await;
         check_step(&previous, &current, h, 0.0002, 0.0005);
         peak_v = peak_v.max(current.velocities[0]);

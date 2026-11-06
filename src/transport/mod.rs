@@ -30,6 +30,9 @@ pub enum TransportError {
     #[error("Timeout error")]
     Timeout,
 
+    #[error("Operation would block")]
+    WouldBlock,
+
     #[error("Device not open")]
     NotOpen,
 

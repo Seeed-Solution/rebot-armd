@@ -196,7 +196,7 @@ body.ui-expert .main {
 .video .overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .vhint {
   position: absolute; inset: 0; display: grid; place-items: center; text-align: center; padding: 20px;
-  background: #eef4e4; transition: opacity .3s;
+  background: #eef4e4; transition: opacity .3s; pointer-events: none;
 }
 .vhint.hide { opacity: 0; pointer-events: none; }
 .vhint-inner { display: flex; flex-direction: column; align-items: center; gap: 8px; }
@@ -205,7 +205,8 @@ body.ui-expert .main {
 .vhint.connecting .vhint-icon { animation: breathe 1.4s ease-in-out infinite; }
 .vhint-title { font-size: 15px; font-weight: 600; }
 .vhint-sub { font-size: 12px; color: var(--sc-color-text-secondary); font-family: var(--mono); word-break: break-all; }
-.vhint-btn { margin-top: 4px; }
+.vhint-btn { margin-top: 4px; pointer-events: auto; }
+.vhint.hide .vhint-btn { visibility: hidden; pointer-events: none; }
 .vhint.connecting .vhint-btn { display: none; }
 @keyframes breathe { 50% { transform: scale(.92); opacity: .7; } }
 
@@ -754,7 +755,7 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   }
   body.ui-expert .app { height: 100vh; height: 100dvh; }
   body.ui-expert .main { overflow-y: auto; min-height: 0; }
-  body.ui-expert .video { aspect-ratio: auto; height: calc(100dvh - var(--head-h) - 24px); }
+  /* Expert video uses its stage grid row; a viewport height overlaps the controls below. */
 
   body.ui-simple { overflow: hidden; background: #0f172a; }
   body.ui-simple .app { height: 100dvh; }
@@ -1517,12 +1518,52 @@ function toast(msg, kind = '', code = '') {
 function buzz(ms) { if (navigator.vibrate) try { navigator.vibrate(ms); } catch (_) {} }
 function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (_) {} return null; }
 
+const actuatorPaths = new Set(['/api/v1/torque', '/api/v1/arm', '/api/v1/motion/home', '/api/v1/motion/jog', '/api/v1/motion/servo', '/api/v1/motion/unload', '/api/v1/motion/stop', '/api/v1/safety/clear_fault']);
+const pendingCommands = new Map();
+let nextRequestId = 0;
+function rejectPendingCommands(message) {
+  for (const pending of pendingCommands.values()) { clearTimeout(pending.timer); pending.reject(new Error(message)); }
+  pendingCommands.clear();
+}
+function syncEpoch(epoch) {
+  if (typeof epoch !== 'number') return;
+  if (S.epoch != null && S.epoch !== epoch) rejectPendingCommands('控制状态已变化，请检查状态后重新操作');
+  S.epoch = epoch;
+}
+function rpcError(response) {
+  const message = response.code === 'UNSUPPORTED'
+    ? '当前机械臂缺少自动收纳所需配置或反馈能力，未启动收纳；可使用回零功能，力矩仍需现场确认'
+    : response.message || response.error || '指令被拒绝';
+  return Object.assign(new Error(message), { code: response.code, status: response.status });
+}
+function commandRPC(path, body) {
+  if (!S.ws || S.ws.readyState !== 1 || S.leaseGeneration == null || S.epoch == null) {
+    return Promise.reject(Object.assign(new Error('当前页面没有控制权，请等待控制连接就绪'), { code: 'LEASE_REQUIRED' }));
+  }
+  const request_id = ++nextRequestId, ws = S.ws;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingCommands.delete(request_id);
+      reject(Object.assign(new Error('设备未在时限内确认指令，请检查实际状态'), { code: 'COMMAND_TIMEOUT' }));
+    }, 2000);
+    pendingCommands.set(request_id, { resolve, reject, timer, ws });
+    try { ws.send(JSON.stringify({ type: 'command', request_id, path, body: body || {}, generation: S.leaseGeneration, epoch_id: S.epoch, client_id: CLIENT_ID })); }
+    catch (error) { clearTimeout(timer); pendingCommands.delete(request_id); reject(error); }
+  });
+}
 async function api(path, body, { quiet = false, method = 'POST' } = {}) {
+  if (method === 'POST' && actuatorPaths.has(path)) {
+    try { const data = await commandRPC(path, body); syncEpoch(data.epoch_id); return data; }
+    catch (error) { if (!quiet) toast(error.message, 'err', error.code); throw error; }
+  }
   const t0 = performance.now();
   S.lastReqAt = Date.now();
   let res;
+  const controller = new AbortController();
+  const requestTimeout = setTimeout(() => controller.abort(), path === '/api/v1/safety/e_stop' ? 700 : 4000);
   try {
     res = await fetch(path, {
+      signal: controller.signal,
       method,
       headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
       body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -1530,19 +1571,19 @@ async function api(path, body, { quiet = false, method = 'POST' } = {}) {
   } catch (e) {
     if (!quiet) toast('请求失败：无法连接 armd', 'err', path);
     throw e;
-  }
+  } finally { clearTimeout(requestTimeout); }
   const dt = performance.now() - t0;
   S.rtt = S.rtt == null ? dt : S.rtt * 0.8 + dt * 0.2;
   let data = null;
   try { data = await res.json(); } catch (_) {}
   if (!res.ok) {
-    const err = new Error((data && data.error) || ('HTTP ' + res.status));
+    const err = new Error((data && (data.message || data.error)) || ('HTTP ' + res.status));
     err.code = (data && data.code) || String(res.status);
     err.status = res.status;
     if (!quiet) toast(err.message, 'err', err.code);
     throw err;
   }
-  if (data && typeof data.epoch_id === 'number') S.epoch = data.epoch_id;
+  if (data) syncEpoch(data.epoch_id);
   return data;
 }
 
@@ -1581,6 +1622,16 @@ function connectWS() {
   ws.onopen = () => acquireLease(ws);
   ws.onmessage = (ev) => {
     let o; try { o = JSON.parse(ev.data); } catch (_) { return; }
+    if (S.ws !== ws) return;
+    if (o.type === 'command_ack' || o.type === 'command_reject') {
+      const pending = pendingCommands.get(o.request_id);
+      if (!pending || pending.ws !== ws) return;
+      clearTimeout(pending.timer); pendingCommands.delete(o.request_id);
+      if (o.type === 'command_ack') pending.resolve(o);
+      else pending.reject(rpcError(o));
+      syncEpoch(o.epoch_id);
+      return;
+    }
     if (o.type === 'lease_granted') {
       if (S.ws === ws) {
         resetLease();
@@ -1590,7 +1641,7 @@ function connectWS() {
       return;
     }
     if (o.type === 'lease_rejected' || o.type === 'lease_lost') {
-      // Lease held by another client, or ours was revoked: drop it and retry; HTTP fallback covers the gap
+      // Observers may retry acquisition, but cannot preempt the current owner.
       if (S.ws === ws) {
         resetLease();
         scheduleLeaseRetry(ws, CFG.leaseRetryMs);
@@ -1598,7 +1649,7 @@ function connectWS() {
       return;
     }
     if (o.type === 'epoch_sync') {
-      if (typeof o.epoch_id === 'number') S.epoch = o.epoch_id;
+      syncEpoch(o.epoch_id);
       if (o.safety_state) {
         const st = parseState(o.safety_state);
         S.state = st.name; S.fault = st.detail;
@@ -1606,27 +1657,33 @@ function connectWS() {
       return;
     }
     if (o.type === 'servo_reject') {
-      if (typeof o.epoch_id === 'number') S.epoch = o.epoch_id;
-      toastOnce({ message: '控制指令被拒绝: ' + (o.error || '状态或限位不符'), code: 'SERVO_REJECT' });
+      syncEpoch(o.epoch_id);
+      toastOnce({ message: '控制指令被拒绝: ' + (o.message || o.error || '状态或限位不符'), code: 'SERVO_REJECT' });
       return;
     }
     if (o.type === 'preset_ack') {
-      if (typeof o.epoch_id === 'number') S.epoch = o.epoch_id;
+      syncEpoch(o.epoch_id);
       toast('正在前往' + (PRESET_NAME[o.name] || o.name || '预设目标'), 'ok');
       return;
     }
     if (o.type === 'preset_reject') {
-      if (typeof o.epoch_id === 'number') S.epoch = o.epoch_id;
+      syncEpoch(o.epoch_id);
       S.presetRunning = false;
       S.preset = null;
-      toast('预设指令被拒绝: ' + (o.error || o.reason || '状态或限位不符'), 'err');
+      toast(o.code === 'UNSUPPORTED' ? '当前机械臂不支持自动收纳，未启动运动；可使用回零功能，力矩仍需现场确认' : '预设指令被拒绝: ' + (o.message || o.error || o.reason || '状态或限位不符'), 'err');
       return;
     }
     if (!Array.isArray(o.positions)) return;
     S.obs = o; S.obsAt = Date.now(); S.wsCount++;
-    if (typeof o.epoch_id === 'number') S.epoch = o.epoch_id;
+    syncEpoch(o.epoch_id);
     const st = parseState(o.safety_state);
+    const wasStopped = isStopped();
     S.state = st.name; S.fault = st.detail;
+    if (isStopped() && !wasStopped) {
+      S.streamActive = false; S.servoTarget = null;
+      releaseAll(); resetPoseMode();
+      C.tailUntil = 0; C.lastInput = -Infinity; S.gripCmdAt = 0;
+    }
     if (S.presetRunning) {
       const presetAge = S.preset?.startedAt ? (Date.now() - S.preset.startedAt) : 0;
       const speedsNearZero = Array.isArray(o.velocities) && o.velocities.every((v) => Math.abs(v) < 0.05);
@@ -1666,7 +1723,14 @@ function connectWS() {
 }
 // Lease state: not held + no request in flight + no pending timer.
 function resetLease() {
+  rejectPendingCommands('控制连接已断开或控制权已变化');
+  S.streamActive = false;
+  S.servoTarget = null;
   S.leaseGeneration = null;
+  releaseAll();
+  resetPoseMode();
+  C.tailUntil = 0; C.lastInput = -Infinity;
+  S.gripCmdAt = 0;
   S.acquirePending = false;
   clearTimeout(S.leaseTimer);
   S.leaseTimer = null;
@@ -1689,8 +1753,8 @@ function acquireLease(ws) {
 }
 setInterval(() => {
   // Lease renewal. Stops when the tab is hidden so armd's watchdog can take over.
-  if (S.ws && S.ws.readyState === 1 && S.epoch != null && !document.hidden) {
-    S.ws.send(JSON.stringify({ type: 'heartbeat', client_id: CLIENT_ID, epoch_id: S.epoch, timestamp_ms: Date.now() }));
+  if (S.ws && S.ws.readyState === 1 && S.epoch != null && S.leaseGeneration != null && !document.hidden) {
+    S.ws.send(JSON.stringify({ type: 'heartbeat', client_id: CLIENT_ID, generation: S.leaseGeneration, epoch_id: S.epoch, timestamp_ms: Date.now() }));
     S.hb.n++; S.hb.at = Date.now();
   }
 }, CFG.heartbeatMs);
@@ -1967,6 +2031,7 @@ async function loadSchema() {
 
 function lockReason() {
   if (!isLive()) return '遥测断开，控制已锁定';
+  if (S.leaseGeneration == null) return '当前为观察模式，其他页面可能正在控制';
   if (S.state === 'EStop') return '⚠️ 急停已锁定：点击「复位急停」，再长按「使能」';
   if (S.state === 'Fault') return '⚠️ 故障：点击「清除故障」后长按「使能」';
   return '未使能：按住「使能」0.6 秒后即可控制';
@@ -2240,7 +2305,24 @@ function releaseAll() {
   for (const b of cartButtons) b.stop();
   for (const k in C.hold) { C.hold[k][0] = 0; C.hold[k][1] = 0; }
   if (C.cmd) C.goal = { ...C.cmd }; // drop any queued step that has not been executed yet
+  requestMotionStop();
 }
+function requestMotionStop() {
+  if (!S.streamActive || S.presetRunning) return;
+  S.streamActive = false;
+  S.servoTarget = null;
+  C.tailUntil = 0; C.lastInput = -Infinity;
+  S.gripCmdAt = 0;
+  if (S.obs && S.obs.positions.length >= 5) cartSync(S.obs.positions);
+  api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e));
+}
+function stopWhenInputsReleased() {
+  queueMicrotask(() => {
+    if (commandVector().some((v) => v !== 0) || Object.values(cartVelocity()).some((v) => v !== 0) || cartGripVel() !== 0) return;
+    requestMotionStop();
+  });
+}
+for (const event of ['pointerup', 'pointercancel', 'mouseup', 'touchend', 'touchcancel', 'keyup']) window.addEventListener(event, stopWhenInputsReleased);
 window.addEventListener('blur', () => { releaseAll(); resetPoseMode(); });
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
@@ -2333,13 +2415,8 @@ setInterval(() => {
   S.servoTarget = t;
   // Streaming path: one fire-and-forget frame per tick, no request/response round trip
   if (sendServoFrame(t)) return;
-  // Fallback until the WS lease handshake completes: single-flight HTTP servo
-  // (lease acquisition is driven by ws.onopen and the retry timer, not by this tick)
-  if (S.servoInflight) return; // next tick sends the accumulated target
-  S.servoInflight = true;
-  api('/api/v1/motion/servo', { targets: t, epoch_id: S.epoch }, { quiet: true })
-    .catch((e) => { if (e.code && e.code !== 'EPOCH_MISMATCH') toastOnce(e); })
-    .finally(() => { S.servoInflight = false; });
+  // No HTTP fallback: only the lease-owning socket may actuate.
+
 }, CFG.servoPeriodMs);
 let lastErrAt = 0;
 function toastOnce(e) { if (Date.now() - lastErrAt > 2000) { lastErrAt = Date.now(); toast(e.message, 'err', e.code); } }
@@ -2455,6 +2532,7 @@ function cartSend(t) {
 function sendServoFrame(positions) {
   if (!S.ws || S.ws.readyState !== 1) return false;
   if (S.leaseGeneration == null) return false;
+  S.streamActive = true;
   S.ws.send(JSON.stringify({
     type: 'servo',
     client_id: CLIENT_ID,
@@ -2722,13 +2800,21 @@ function eStop() {
   // Reliable-path: REST emergency stop with automatic retry
   const sendRestEstop = (retries = 2) => {
     api('/api/v1/safety/e_stop')
-      .then(() => toast('急停已锁定', 'err'))
+      .then(() => {})
       .catch((e) => {
         if (retries > 0) setTimeout(() => sendRestEstop(retries - 1), 100);
-        else toast('急停指令下发失败，请立即手动切断电源！', 'err');
+        else toast('无法确认急停，请使用现场安全装置并检查机械臂状态', 'err');
       });
   };
   sendRestEstop();
+  const started = Date.now();
+  const confirmation = setInterval(() => {
+    if (isLive() && S.state === 'EStop' && S.obsAt >= started) {
+      clearInterval(confirmation); toast('设备已确认急停锁定，仍可能保持力矩', 'err');
+    } else if (Date.now() - started > 1800) {
+      clearInterval(confirmation); toast('急停状态未确认，请检查现场安全装置', 'err');
+    }
+  }, 50);
 }
 $('btn-estop').addEventListener('pointerdown', (e) => { e.preventDefault(); eStop(); });
 $('btn-home').addEventListener('click', home);
@@ -2861,7 +2947,7 @@ async function controlledUnload() {
   if (unloading) return;
   unloading = true;
   try {
-    await api('/api/v1/motion/unload');
+    await api('/api/v1/motion/unload', undefined, { quiet: true });
     // Wait for the backend to finish or for the pose to be stable for ~1 s
     const t0 = Date.now();
     let last = null, stableSince = 0;
@@ -2881,10 +2967,10 @@ async function controlledUnload() {
     if (S.obs && !S.obs.is_torqued) {
       toast('已收纳到位并安全断电', 'ok');
     } else {
-      toast('已收纳到位，力矩保持中', 'ok');
+      toast('尚未确认安全卸载，力矩可能仍保持，请检查状态', 'err');
     }
   } catch (e) {
-    if (e.status) toast('收起失败: ' + (e.message || '请检查机械臂状态'), 'err');
+    toast('收起失败: ' + (e.message || '设备未确认收纳，请检查机械臂状态'), 'err', e.code);
   } finally { unloading = false; }
 }
 
@@ -2903,7 +2989,7 @@ async function disableTorque({ fallback = true } = {}) {
     } else if (e.status) {
       toast(notAtRest ? '机械臂仍未到达收纳位，力矩保持开启' : (e.message || '关闭力矩失败'), 'err', e.code);
     } else {
-      toast('请求失败：无法连接 armd', 'err');
+      toast(e.message || '关闭力矩请求未确认，请检查连接和机械臂状态', 'err', e.code);
     }
     return false;
   }
@@ -2939,9 +3025,9 @@ async function disableTorque({ fallback = true } = {}) {
         controlledUnload();
       } else {
         if (S.obs?.positions?.length > GRIP && S.grip == null) S.grip = gripFrac(S.obs.positions[GRIP]);
-        api('/api/v1/torque', { enable: true })
-          .then(() => toast('已使能，可以开始控制', 'ok'))
-          .catch((e) => toast(e.message || '使能失败', 'err'));
+        api('/api/v1/torque', { enable: true }, { quiet: true })
+          .then(() => toast('控制已开启，请确认机械臂反馈状态', 'ok'))
+          .catch((e) => toast('使能失败：' + (e.message || '电机未就绪/通讯超时'), 'err', e.code));
       }
       setTimeout(() => { inflight = false; }, 300);
     }, 600);
@@ -3697,7 +3783,7 @@ function frame(ts) {
   const live = isLive();
   const q = S.obs ? S.obs.positions : [0, 0, 0, 0, 0, 0];
   const v = commandVector();
-  const op = live && isOperational();
+  const op = live && isOperational() && S.leaseGeneration != null;
   const torqued = !!(S.obs && S.obs.is_torqued);
   const act = v.map((x) => op && x !== 0);
   if (S.mode === 'cart' && op && C.sending) { for (let i = 0; i < 4; i++) act[i] = true; act[GRIP] = Date.now() - S.gripCmdAt < 400; }
@@ -3719,7 +3805,8 @@ function frame(ts) {
   setCls(lb, 'sc-status-badge ' + (!live ? '' : S.hz >= 45 ? 'is-ok' : 'is-warn'));
   const st = live ? S.state : 'Offline';
   const badge = $('state-badge');
-  setText(badge, STATE_TEXT[st] || String(st).toUpperCase());
+  const enableUnknown = S.obs?.enable_state === 'Unknown';
+  setText(badge, enableUnknown && torqued && (st === 'Armed' || st === 'Moving') ? '使能状态未确认' : STATE_TEXT[st] || String(st).toUpperCase());
   setCls(badge, 'sc-status-badge ' + (STATE_BADGE[st] ?? ''));
 
   // enable button morphs: hold-to-enable / tap-to-disable / tap-to-clear
@@ -3728,9 +3815,9 @@ function frame(ts) {
   eb.classList.toggle('on', op);
   eb.classList.toggle('clear', stopped);
   eb.setAttribute('aria-checked', String(op));
-  setText($('enable-txt'), stopped ? (S.state === 'EStop' ? '⚠️ 点击复位急停' : '⚠️ 点击清除故障') : op ? '已使能' : '使能');
+  setText($('enable-txt'), stopped ? (S.state === 'EStop' ? '⚠️ 点击复位急停' : '⚠️ 点击清除故障') : op ? (enableUnknown ? '控制已开启 · 未确认' : '已使能') : '使能');
   setText($('enable-sub'), stopped ? '复位后再长按使能' : op ? '按住 0.6 秒失能' : '按住 0.6 秒使能');
-  eb.disabled = !live;
+  eb.disabled = !live || S.leaseGeneration == null;
 
   // jog rows
   rows.forEach((r, i) => {
@@ -3790,13 +3877,17 @@ function frame(ts) {
   $('t-hz').className = !live ? 'bad' : S.hz >= 45 ? 'good' : 'warn';
   setText($('t-rtt'), S.rtt == null ? '--' : Math.round(S.rtt) + ' ms');
   $('t-rtt').className = S.rtt == null ? '' : S.rtt < 40 ? 'good' : S.rtt < 120 ? 'warn' : 'bad';
-  setText($('t-torque'), torqued ? '开启' : '关闭');
+  setText($('t-torque'), S.obs?.enable_state === 'Enabled' ? '已确认开启' : S.obs?.enable_state === 'Disabled' ? '已确认关闭' : '未确认');
   $('t-torque').className = torqued ? 'good' : '';
   const hbAge = S.hb.at ? Date.now() - S.hb.at : null;
   setText($('t-lease'), hbAge == null ? '--' : `${S.hb.hz} Hz · ${hbAge} ms`);
   $('t-lease').className = hbAge == null ? '' : hbAge < 300 ? 'good' : hbAge < 500 ? 'warn' : 'bad';
-  setText($('t-can'), !live ? '无数据' : S.hz >= 45 ? '正常' : S.hz > 0 ? '降频' : '无帧');
-  $('t-can').className = !live ? 'bad' : S.hz >= 45 ? 'good' : 'warn';
+  const ages = S.obs?.feedback_age_ms || [];
+  const feedbackFresh = live && ages.length === S.dof && ages.every((age) => Number.isFinite(age) && age <= 250);
+  setText($('t-can'), !live ? '无遥测' : feedbackFresh ? '反馈新鲜' : '反馈缺失或过期');
+  $('t-can').className = feedbackFresh ? 'good' : 'bad';
+  const cap = S.obs?.driver_capabilities || {};
+  const freshJoint = (i) => live && Number.isFinite(S.obs?.feedback_age_ms?.[i]) && S.obs.feedback_age_ms[i] <= 250;
   const tq = S.obs && S.obs.torques ? S.obs.torques : [];
   const temps = S.obs && S.obs.temperatures ? S.obs.temperatures : [];
   if (!simple) {
@@ -3805,13 +3896,14 @@ function frame(ts) {
       const ok = live && p != null;
       setText(r.c[1], ok ? fmtDeg(p) : '--');
       setText(r.c[2], ok ? p.toFixed(3) : '--');
-      setText(r.c[3], live && vel[i] != null ? (vel[i] * DEG).toFixed(0) : '--');
-      setText(r.c[4], live && tq[i] != null ? tq[i].toFixed(2) : '--');
-      setText(r.c[5], live && temps[i] != null ? temps[i].toFixed(0) : '--');
+      setText(r.c[3], freshJoint(i) && cap.velocity_feedback && vel[i] != null ? (vel[i] * DEG).toFixed(0) : '--');
+      setText(r.c[4], freshJoint(i) && cap.torque_feedback && tq[i] != null ? tq[i].toFixed(2) : '--');
+      setText(r.c[5], freshJoint(i) && cap.temperature_feedback && temps[i] != null ? temps[i].toFixed(0) : '--');
       r.tr.classList.toggle('hot', act[i]);
     });
   }
-  const tmax = temps.length ? Math.max(...temps) : null;
+  const validTemps = cap.temperature_feedback ? temps.filter((v, i) => freshJoint(i) && Number.isFinite(v)) : [];
+  const tmax = validTemps.length ? Math.max(...validTemps) : null;
   setText($('t-temp'), tmax == null ? '--' : tmax.toFixed(1) + '°C');
   $('t-temp').className = tmax == null ? '' : tmax < 55 ? 'good' : tmax < 65 ? 'warn' : 'bad';
   setText($('epoch-txt'), 'epoch ' + (S.epoch ?? '--'));

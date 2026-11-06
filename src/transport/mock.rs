@@ -10,6 +10,7 @@ pub struct MockTransport {
     chunk_size_limit: Option<usize>,
     error_on_next_read: Option<String>,
     error_on_next_write: Option<String>,
+    write_responses: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl MockTransport {
@@ -21,6 +22,12 @@ impl MockTransport {
         let mut transport = Self::new();
         transport.provide_rx(bytes);
         transport
+    }
+
+    /// Opt-in response generated only after the matching write, for handshake tests.
+    pub fn respond_to_write(&mut self, request: &[u8], response: &[u8]) {
+        assert!(!request.is_empty());
+        self.write_responses.push((request.to_vec(), response.to_vec()));
     }
 
     pub fn provide_rx(&mut self, bytes: &[u8]) {
@@ -109,6 +116,12 @@ impl Transport for MockTransport {
             self.rx_buffer.extend(buf);
         }
 
+        for (request, response) in &self.write_responses {
+            if buf.windows(request.len()).any(|window| window == request) {
+                self.rx_buffer.extend(response);
+            }
+        }
+
         Ok(buf.len())
     }
 
@@ -139,11 +152,17 @@ pub struct MockCanTransport {
     loopback: bool,
     error_on_next_tx: Option<String>,
     error_on_next_rx: Option<String>,
+    transmit_responses: Vec<(CanFrame, CanFrame)>,
 }
 
 impl MockCanTransport {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Opt-in response generated after a matching transmit, never before it.
+    pub fn respond_to_transmit(&mut self, request: CanFrame, response: CanFrame) {
+        self.transmit_responses.push((request, response));
     }
 
     pub fn provide_rx_frame(&mut self, frame: CanFrame) {
@@ -200,6 +219,13 @@ impl CanTransport for MockCanTransport {
         if self.loopback {
             self.rx_frames.push_back(*frame);
         }
+
+        for (request, response) in &self.transmit_responses {
+            if frame == request {
+                self.rx_frames.push_back(*response);
+            }
+        }
+
         Ok(())
     }
 

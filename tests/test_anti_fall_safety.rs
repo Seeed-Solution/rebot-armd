@@ -14,10 +14,12 @@ struct DummyDriver {
     pub is_enabled: bool,
     pub feedback_valid: Arc<AtomicBool>,
     pub clear_fault_fail: Arc<AtomicBool>,
+    pub motor_status: Arc<Mutex<Vec<u8>>>,
 }
 
 impl DummyDriver {
     fn new(states: Vec<JointState>) -> Self {
+        let dof = states.len();
         Self {
             states,
             written_targets: Arc::new(Mutex::new(Vec::new())),
@@ -25,11 +27,29 @@ impl DummyDriver {
             is_enabled: true,
             feedback_valid: Arc::new(AtomicBool::new(true)),
             clear_fault_fail: Arc::new(AtomicBool::new(false)),
+            motor_status: Arc::new(Mutex::new(vec![1; dof])),
         }
     }
 }
 
 impl ArmDriver for DummyDriver {
+    fn capabilities(&self) -> armd::driver::DriverCapabilities {
+        armd::driver::DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true }
+    }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> {
+        vec![if self.feedback_valid.load(Ordering::SeqCst) { Some(Duration::ZERO) } else { None }; self.states.len()]
+    }
+    fn enable_state(&self) -> armd::driver::EnableState {
+        let statuses = self.motor_status.lock().unwrap();
+        if !self.feedback_valid.load(Ordering::SeqCst) { armd::driver::EnableState::Unknown }
+        else if statuses.iter().all(|s| *s == 1) { armd::driver::EnableState::Enabled }
+        else if statuses.iter().all(|s| *s == 0) { armd::driver::EnableState::Disabled }
+        else { armd::driver::EnableState::Unknown }
+    }
+    fn check_hardware_status(&self) -> Result<(), ArmDriverError> {
+        if self.clear_fault_fail.load(Ordering::SeqCst) { Err(ArmDriverError::HardwareFault("latched hardware fault".into())) } else { Ok(()) }
+    }
+
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         Ok(self.states.clone())
     }
@@ -43,6 +63,7 @@ impl ArmDriver for DummyDriver {
 
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
         self.is_enabled = enabled;
+        self.motor_status.lock().unwrap().fill(if enabled { 1 } else { 0 });
         Ok(())
     }
 
@@ -60,6 +81,14 @@ impl ArmDriver for DummyDriver {
 
     fn is_enabled(&self) -> bool {
         self.is_enabled
+    }
+
+    fn motor_status(&self) -> Option<Vec<u8>> {
+        Some(self.motor_status.lock().unwrap().clone())
+    }
+
+    fn set_torque_flag(&mut self, enabled: bool) {
+        self.is_enabled = enabled;
     }
 }
 
@@ -112,8 +141,8 @@ async fn test_is_at_safe_resting_pose_criteria() {
     // 1. Initial pose at [0.0, 0.0, 0.0] with v=0: must be at safe resting pose
     assert!(supervisor.is_at_safe_resting_pose().await);
 
-    // 2. Geometry check: each joint deviation <= 0.08, sum <= 0.16
-    // Set positions to [0.06, 0.05, 0.04]: each <= 0.08, sum = 0.15 <= 0.16 -> OK
+    // 2. Geometry check: J1 relaxed to 0.15 rad, J2..J6 strictly <= 0.08 rad, sum <= 0.22 rad
+    // Set positions to [0.06, 0.05, 0.04]: each <= limit, sum = 0.15 <= 0.22 -> OK
     {
         let mut inner = supervisor.inner().write().await;
         inner.measured_positions = vec![0.06, 0.05, 0.04];
@@ -121,17 +150,31 @@ async fn test_is_at_safe_resting_pose_criteria() {
     }
     assert!(supervisor.is_at_safe_resting_pose().await);
 
-    // Set one joint to 0.085 (> 0.08) -> must fail geometry check
+    // J1 deviation up to 0.12 <= 0.15 rad -> must pass relaxed J1 check
     {
         let mut inner = supervisor.inner().write().await;
-        inner.measured_positions = vec![0.085, 0.0, 0.0];
+        inner.measured_positions = vec![0.12, 0.0, 0.0];
+    }
+    assert!(supervisor.is_at_safe_resting_pose().await);
+
+    // J1 deviation 0.16 (> 0.15) -> must fail geometry check
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.measured_positions = vec![0.16, 0.0, 0.0];
     }
     assert!(!supervisor.is_at_safe_resting_pose().await);
 
-    // Set positions to [0.06, 0.06, 0.05]: each <= 0.08, but sum = 0.17 > 0.16 -> must fail
+    // Set J2 joint to 0.085 (> 0.08) -> must fail geometry check
     {
         let mut inner = supervisor.inner().write().await;
-        inner.measured_positions = vec![0.06, 0.06, 0.05];
+        inner.measured_positions = vec![0.0, 0.085, 0.0];
+    }
+    assert!(!supervisor.is_at_safe_resting_pose().await);
+
+    // Set positions to [0.14, 0.05, 0.05]: J1 <= 0.15, J2/J3 <= 0.08, but sum = 0.24 > 0.22 -> must fail
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.measured_positions = vec![0.14, 0.05, 0.05];
     }
     assert!(!supervisor.is_at_safe_resting_pose().await);
 
@@ -156,6 +199,10 @@ async fn test_is_at_safe_resting_pose_criteria() {
         JointState { position: 0.0, velocity: 0.0, torque: 0.8, temperature: 25.0 },
         JointState { position: 0.0, velocity: 0.0, torque: 3.2, temperature: 25.0 },
     ]);
+    config.resting_pose = Some(armd::model::RestingPosePolicy {
+        position_tolerances: vec![0.15, 0.08, 0.08], max_total_deviation: 0.22,
+        max_velocity: 0.015, support_torque_limits: vec![(1, 1.5), (2, 4.5)], feedback_max_age_ms: 100,
+    });
     let supervisor_hw = ArmSupervisor::new(config.clone());
     supervisor_hw.set_driver(Box::new(dummy)).await;
     supervisor_hw.set_torque(true).await.unwrap();
@@ -328,7 +375,7 @@ async fn test_clear_fault_synchronizes_positions_and_zeroes_velocities() {
         inner.safety.trigger_fault(FaultReason::BusLoss);
     }
 
-    // Call clear_fault: step must be slew-limited to clamp(-0.04, 0.04)
+    // Fault reset synchronizes the hold target exactly to fresh measured position
     supervisor.clear_fault().await.unwrap();
 
     let (cmd, tgt, vel) = {
@@ -339,8 +386,8 @@ async fn test_clear_fault_synchronizes_positions_and_zeroes_velocities() {
             inner.commanded_velocities.clone(),
         )
     };
-    assert!((cmd[0] - 1.16).abs() < 1e-4, "Commanded position 0 must be clamped to -0.04 rad");
-    assert!((cmd[1] - 0.06).abs() < 1e-4, "Commanded position 1 must be clamped to -0.04 rad");
+    assert!((cmd[0] - 0.75).abs() < 1e-4, "Reset must not retain an old target");
+    assert!((cmd[1] + 0.45).abs() < 1e-4, "Reset must match measured position");
     assert_eq!(tgt, cmd, "Target positions must match commanded positions");
     assert_eq!(vel, vec![0.0, 0.0], "Commanded velocities must be zeroed");
 
@@ -428,8 +475,8 @@ async fn test_bus_loss_fallback_duration_and_silence_after_3000ms() {
     supervisor.tick(0.02).await;
     let writes_after = write_count.load(Ordering::SeqCst);
     assert!(
-        writes_after > writes_before,
-        "Holding packets must CONTINUE to be sent after 3000ms in BusLossFallback to prevent dropping"
+        writes_after == writes_before,
+        "Stale feedback must suppress old control targets until feedback recovers"
     );
 }
 
@@ -529,4 +576,100 @@ async fn test_normal_unload_settle_and_power_off_closed_loop() {
     assert!(!obs_done.is_torqued, "Torque must be cut after 40 stable resting ticks");
     assert_eq!(obs_done.safety_state, SafetyState::Idle, "Must transition to Idle state");
     assert!(!supervisor.is_unloading().await, "Must no longer be unloading");
+}
+
+#[tokio::test]
+async fn test_clear_fault_mutually_exclusive_branches() {
+    let mut config = ArmConfig::default();
+    config.dof = 2;
+    config.home_positions = vec![0.0, 0.0];
+    config.limits = vec![
+        JointLimit::new("j1", -3.0, 3.0, 2.0, 5.0),
+        JointLimit::new("j2", -3.0, 3.0, 2.0, 5.0),
+    ];
+
+    // --- Branch A: Verified Active Holding ---
+    // Condition: feedback valid, all motor_status == 1
+    // Action: keep is_torqued = true, resync hold targets, state Idle
+    {
+        let dummy = DummyDriver::new(vec![
+            JointState { position: 0.1, velocity: 0.0, torque: 0.2, temperature: 25.0 },
+            JointState { position: -0.1, velocity: 0.0, torque: 0.3, temperature: 25.0 },
+        ]);
+        let motor_status = dummy.motor_status.clone();
+        *motor_status.lock().unwrap() = vec![1, 1];
+
+        let supervisor = ArmSupervisor::new(config.clone());
+        supervisor.set_driver(Box::new(dummy)).await;
+        supervisor.set_torque(true).await.unwrap();
+
+        supervisor.trigger_e_stop().await;
+        assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::EStop);
+
+        supervisor.clear_fault().await.unwrap();
+        let obs = supervisor.get_observation().await;
+        assert_eq!(obs.safety_state, SafetyState::Idle);
+        assert!(obs.is_torqued, "Branch A: must keep is_torqued = true");
+
+        let inner = supervisor.inner().read().await;
+        assert!((inner.commanded_positions[0] - 0.1).abs() < 1e-4);
+        assert!((inner.commanded_positions[1] - (-0.1)).abs() < 1e-4);
+    }
+
+    // --- Branch B: Verified Disarmed ---
+    // Condition: feedback valid, all motor_status == 0
+    // Action: is_torqued = false, driver.set_torque_flag(false), pending_rearm = true, state Idle
+    {
+        let dummy = DummyDriver::new(vec![
+            JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 25.0 },
+            JointState { position: 0.0, velocity: 0.0, torque: 0.0, temperature: 25.0 },
+        ]);
+        let motor_status = dummy.motor_status.clone();
+        let supervisor = ArmSupervisor::new(config.clone());
+        supervisor.set_driver(Box::new(dummy)).await;
+        supervisor.set_torque(true).await.unwrap();
+
+        *motor_status.lock().unwrap() = vec![0, 0];
+        supervisor.trigger_e_stop().await;
+        supervisor.clear_fault().await.unwrap();
+
+        let obs = supervisor.get_observation().await;
+        assert_eq!(obs.safety_state, SafetyState::Idle);
+        assert!(!obs.is_torqued, "Branch B: must mark is_torqued = false");
+
+        let inner = supervisor.inner().read().await;
+        assert!(inner.pending_rearm, "Branch B: must latch pending_rearm = true");
+    }
+
+    // --- Branch C: Unknown / Mixed / Degraded ---
+    // Condition: feedback invalid or mixed status (e.g. motor 0 is 1, motor 1 is 0)
+    // Action: pending_rearm = true, continuous holding output, state Idle
+    {
+        let dummy = DummyDriver::new(vec![
+            JointState { position: 0.25, velocity: 0.0, torque: 0.1, temperature: 25.0 },
+            JointState { position: -0.15, velocity: 0.0, torque: 0.1, temperature: 25.0 },
+        ]);
+        let motor_status = dummy.motor_status.clone();
+        let write_count = dummy.write_count.clone();
+        let supervisor = ArmSupervisor::new(config.clone());
+        supervisor.set_driver(Box::new(dummy)).await;
+        supervisor.set_torque(true).await.unwrap();
+
+        *motor_status.lock().unwrap() = vec![1, 0];
+        supervisor.trigger_e_stop().await;
+        assert!(supervisor.clear_fault().await.is_err());
+
+        let obs = supervisor.get_observation().await;
+        assert_eq!(obs.safety_state, SafetyState::EStop);
+
+        let inner = supervisor.inner().read().await;
+        assert!(inner.is_torqued, "Unknown state must not claim torque is off");
+        drop(inner);
+
+        // Control loop tick continues to output holding target to driver
+        let count_before = write_count.load(Ordering::SeqCst);
+        supervisor.tick(0.02).await;
+        let count_after = write_count.load(Ordering::SeqCst);
+        assert!(count_after > count_before, "Branch C: holding output must continue to be sent to surviving motors");
+    }
 }

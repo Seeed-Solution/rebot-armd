@@ -9,7 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::model::{ArmObservation, ObservationSchema};
-use crate::safety::{SafetyState, StopPolicy};
+use crate::safety::SafetyState;
 use crate::supervisor::{ArmError, ArmSupervisor};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -180,6 +180,9 @@ impl From<ArmError> for ApiError {
             ArmError::Recording(rec_err) => {
                 ApiError(StatusCode::BAD_REQUEST, rec_err.to_string(), "RECORDING_ERROR".to_string())
             }
+            ArmError::Unsupported(msg) => {
+                ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg, "UNSUPPORTED".to_string())
+            }
             ArmError::Internal(msg) => {
                 ApiError(StatusCode::INTERNAL_SERVER_ERROR, msg, "INTERNAL_ERROR".to_string())
             }
@@ -201,27 +204,21 @@ pub async fn get_observation_schema(
     Json(supervisor.get_schema().await)
 }
 
+
+// Actuator authority is bound to the WebSocket that acquired the lease. REST
+// cannot prove that identity using a caller-supplied client id or generation.
+async fn actuator_requires_connection_lease(supervisor: &ArmSupervisor) -> ApiError {
+    let code = if supervisor.is_lease_active().await { "LEASE_ACTIVE" } else { "LEASE_REQUIRED" };
+    ApiError(StatusCode::CONFLICT,
+        "Use actuator commands on the WebSocket connection holding the control lease".into(), code.into())
+}
+
 /// POST /api/v1/torque
 pub async fn set_torque(
     State(supervisor): State<Arc<ArmSupervisor>>,
-    Json(payload): Json<TorqueRequest>,
+    Json(_payload): Json<TorqueRequest>,
 ) -> Result<Json<TorqueResponse>, ApiError> {
-    let current_state = supervisor.get_observation().await.safety_state;
-    match supervisor.set_torque(payload.enable).await {
-        Ok(safety_state) => {
-            let obs = supervisor.get_observation().await;
-            Ok(Json(TorqueResponse {
-                is_torqued: payload.enable,
-                safety_state,
-                epoch_id: obs.epoch_id,
-            }))
-        }
-        Err(err) => {
-            let mut api_err = ApiError::from(err);
-            api_err.safety_state = Some(format!("{:?}", current_state));
-            Err(api_err)
-        }
-    }
+    Err(actuator_requires_connection_lease(&supervisor).await)
 }
 
 pub fn try_sync_system_time(timestamp_ms: Option<u64>) {
@@ -264,105 +261,40 @@ pub fn try_sync_system_time(timestamp_ms: Option<u64>) {
 /// POST /api/v1/heartbeat
 pub async fn heartbeat(
     State(supervisor): State<Arc<ArmSupervisor>>,
-    Json(payload): Json<HeartbeatRequest>,
+    Json(_payload): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, ApiError> {
-    try_sync_system_time(payload.timestamp_ms);
-
-    supervisor
-        .heartbeat(&payload.client_id, payload.epoch_id)
-        .await
-        .map_err(ArmError::Safety)?;
-    Ok(Json(HeartbeatResponse {
-        status: "ok".to_string(),
-        epoch_id: payload.epoch_id,
-    }))
+    Err(actuator_requires_connection_lease(&supervisor).await)
 }
 
 /// POST /api/v1/motion/servo
 pub async fn motion_servo(
     State(supervisor): State<Arc<ArmSupervisor>>,
-    Json(payload): Json<ServoRequest>,
+    Json(_payload): Json<ServoRequest>,
 ) -> Result<Json<MotionResponse>, ApiError> {
-    if supervisor.is_lease_active().await {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "Active client lease exists, HTTP servo conflict".to_string(),
-            "LEASE_ACTIVE".to_string(),
-        ));
-    }
-    let epoch_id = payload.epoch_id.ok_or_else(|| {
-        ApiError(
-            StatusCode::BAD_REQUEST,
-            "epoch_id is required for servo motion commands".to_string(),
-            "INVALID_COMMAND".to_string(),
-        )
-    })?;
-    supervisor.servo(payload.targets, epoch_id).await?;
-    let obs = supervisor.get_observation().await;
-    Ok(Json(MotionResponse {
-        status: "accepted".to_string(),
-        epoch_id: obs.epoch_id,
-    }))
+    Err(actuator_requires_connection_lease(&supervisor).await)
 }
 
 /// POST /api/v1/motion/jog
 pub async fn motion_jog(
     State(supervisor): State<Arc<ArmSupervisor>>,
-    Json(payload): Json<JogRequest>,
+    Json(_payload): Json<JogRequest>,
 ) -> Result<Json<MotionResponse>, ApiError> {
-    if supervisor.is_lease_active().await {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "Active client lease exists, HTTP jog conflict".to_string(),
-            "LEASE_ACTIVE".to_string(),
-        ));
-    }
-    let epoch_id = supervisor
-        .jog(payload.target_positions, payload.duration_secs, payload.epoch_id)
-        .await?;
-    Ok(Json(MotionResponse {
-        status: "accepted".to_string(),
-        epoch_id,
-    }))
+    Err(actuator_requires_connection_lease(&supervisor).await)
 }
 
 /// POST /api/v1/motion/home
 pub async fn motion_home(
     State(supervisor): State<Arc<ArmSupervisor>>,
-    Json(payload): Json<HomeRequest>,
+    Json(_payload): Json<HomeRequest>,
 ) -> Result<Json<MotionResponse>, ApiError> {
-    if supervisor.is_lease_active().await {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "Active client lease exists, HTTP home conflict".to_string(),
-            "LEASE_ACTIVE".to_string(),
-        ));
-    }
-    let epoch_id = supervisor
-        .home(payload.duration_secs, payload.epoch_id)
-        .await?;
-    Ok(Json(MotionResponse {
-        status: "accepted".to_string(),
-        epoch_id,
-    }))
+    Err(actuator_requires_connection_lease(&supervisor).await)
 }
 
 /// POST /api/v1/motion/unload
 pub async fn motion_unload(
     State(supervisor): State<Arc<ArmSupervisor>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let obs = supervisor.get_observation().await;
-    if obs.safety_state.is_stopped() {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "Cannot execute motion unload while in E-Stop or Fault state. Call clear_fault first.".to_string(),
-            "MOTION_FORBIDDEN_IN_FAULT_STATE".to_string(),
-        ));
-    }
-    supervisor.apply_stop_policy(StopPolicy::NormalUnload).await;
-    Ok(Json(serde_json::json!({
-        "status": "unloading"
-    })))
+    Err(actuator_requires_connection_lease(&supervisor).await)
 }
 
 /// POST /api/v1/safety/e_stop
@@ -380,12 +312,7 @@ pub async fn safety_e_stop(
 pub async fn safety_clear_fault(
     State(supervisor): State<Arc<ArmSupervisor>>,
 ) -> Result<Json<SafetyResponse>, ApiError> {
-    let safety_state = supervisor.clear_fault().await?;
-    let obs = supervisor.get_observation().await;
-    Ok(Json(SafetyResponse {
-        safety_state,
-        epoch_id: obs.epoch_id,
-    }))
+    Err(actuator_requires_connection_lease(&supervisor).await)
 }
 
 /// POST /api/v1/dataset/record/start

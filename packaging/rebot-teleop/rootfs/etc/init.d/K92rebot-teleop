@@ -122,6 +122,12 @@ start() {
         rm -f $PIDFILE
     fi
 
+    # Do not reconfigure CAN/network while an untracked controller may still hold an arm.
+    if ! command -v pidof >/dev/null 2>&1 || pidof armd >/dev/null 2>&1; then
+        echo "Cannot start: an armd process is untracked or process discovery is unavailable"
+        return 1
+    fi
+
     # 启动 WiFi (STA 外部连接 + AP 热点双并发)
     start_wifi
 
@@ -176,56 +182,69 @@ start() {
     return 0
 }
 
+# Stop only the video process owned by this application's pidfile.
+stop_video() {
+    VIDEO_PIDFILE=/var/run/go2rtc.pid
+    if [ -f "$VIDEO_PIDFILE" ]; then
+        VIDEO_PID=$(cat "$VIDEO_PIDFILE" 2>/dev/null)
+        case "$VIDEO_PID" in ''|*[!0-9]*) return 0 ;; esac
+        if [ "$(readlink "/proc/$VIDEO_PID/exe" 2>/dev/null)" = /usr/local/bin/go2rtc ]; then
+            kill -TERM "$VIDEO_PID" 2>/dev/null || true
+        fi
+    fi
+}
+
 stop() {
     echo "Stopping $NAME..."
-    killall -q go2rtc 2>/dev/null || true
-    rm -f /var/run/go2rtc.pid 2>/dev/null || true
-    if [ ! -f $PIDFILE ]; then
-        killall -q armd 2>/dev/null || true
+    if [ ! -f "$PIDFILE" ]; then
+        if ! command -v pidof >/dev/null 2>&1 || pidof armd >/dev/null 2>&1; then
+            echo "Cannot confirm armd stopped: pidfile missing; leaving processes untouched"
+            return 1
+        fi
         echo "$NAME is not running"
         return 0
     fi
 
-    PID=$(cat $PIDFILE 2>/dev/null)
-    if [ -z "$PID" ]; then
-        rm -f $PIDFILE
-        killall -q armd 2>/dev/null || true
-        echo "$NAME is not running"
+    PID=$(cat "$PIDFILE" 2>/dev/null)
+    case "$PID" in
+        ''|*[!0-9]*) echo "Invalid armd pidfile; refusing to signal any process"; return 1 ;;
+    esac
+    if [ ! -d "/proc/$PID" ]; then
+        if ! command -v pidof >/dev/null 2>&1 || pidof armd >/dev/null 2>&1; then
+            echo "Stale pidfile with untracked armd; refusing stop"
+            return 1
+        fi
+        rm -f "$PIDFILE"
+        stop_video
         return 0
     fi
+    PROC_EXE=$(readlink "/proc/$PID/exe" 2>/dev/null | sed 's/ (deleted)$//')
+    REAL_DAEMON=$(readlink -f "$DAEMON" 2>/dev/null || echo "$DAEMON")
+    if [ "$PROC_EXE" != "$DAEMON" ] && [ "$PROC_EXE" != "$REAL_DAEMON" ]; then
+        echo "PID $PID is not $DAEMON; refusing stop"
+        return 1
+    fi
 
-    # 优雅 SIGTERM，等待最多 8 秒让 armd 卸载电机与闭环下电
-    start-stop-daemon -K -p $PIDFILE -s TERM 2>/dev/null || true
+    # armd may refuse shutdown while hardware disable is unconfirmed.
+    kill -TERM "$PID" 2>/dev/null || return 1
     i=0
-    while [ $i -lt 16 ]; do
+    while [ "$i" -lt 16 ]; do
         if [ ! -d "/proc/$PID" ]; then
-            rm -f $PIDFILE
+            rm -f "$PIDFILE"
+            stop_video
             echo "OK"
             return 0
+        fi
+        PROC_EXE=$(readlink "/proc/$PID/exe" 2>/dev/null | sed 's/ (deleted)$//')
+        if [ -n "$PROC_EXE" ] && [ "$PROC_EXE" != "$DAEMON" ] && [ "$PROC_EXE" != "$REAL_DAEMON" ]; then
+            echo "PID identity changed while stopping; retaining pidfile for inspection"
+            return 1
         fi
         sleep 0.5
         i=$((i + 1))
     done
-
-    # 强制杀死
-    kill -KILL "$PID" 2>/dev/null || true
-    j=0
-    while [ $j -lt 6 ]; do
-        if [ ! -d "/proc/$PID" ]; then
-            rm -f $PIDFILE
-            echo "OK"
-            return 0
-        fi
-        sleep 0.5
-        j=$((j + 1))
-    done
-
-    killall -9 -q armd 2>/dev/null || true
-    killall -9 -q go2rtc 2>/dev/null || true
-    rm -f $PIDFILE
-    rm -f /var/run/go2rtc.pid 2>/dev/null || true
-    echo "OK"
-    return 0
+    echo "Stop not confirmed: armd remains active; support and unload the arm before retrying"
+    return 1
 }
 
 status() {
@@ -244,7 +263,7 @@ status() {
 case "$1" in
     start) start; exit $? ;;
     stop) stop; exit $? ;;
-    restart) stop; sleep 2; start; exit $? ;;
+    restart) stop || exit $?; sleep 2; start; exit $? ;;
     status) status; exit $? ;;
     *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
 esac

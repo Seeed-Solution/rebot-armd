@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
 use thiserror::Error;
 
-use crate::driver::{ArmDriver, JointTarget};
-use crate::model::{ArmConfig, ArmObservation, ObservationSchema};
+use crate::driver::{ArmDriver, JointTarget, EnableState, DriverCapabilities};
+use crate::model::{ArmConfig, ArmObservation, ObservationSchema, RestingPosePolicy};
 use crate::recording::{EpisodeRecorder, EpisodeState, RecordFrame, RecordingError};
 use crate::safety::{FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
 use crate::trajectory::{MultiJointQuinticTrajectory, TrajectoryError, TrajectoryPlanner};
@@ -21,6 +21,9 @@ pub enum ArmError {
 
     #[error("Recording error: {0}")]
     Recording(#[from] RecordingError),
+
+    #[error("Unsupported operation: {0}")]
+    Unsupported(String),
 
     #[error("Internal error: {0}")]
     Internal(String),
@@ -44,12 +47,19 @@ pub struct SupervisorInner {
     pub commanded_positions: Vec<f32>,
     pub commanded_velocities: Vec<f32>,
     pub last_commanded_velocities: Vec<f32>,
+    pub commanded_accelerations: Vec<f32>,
+    pub following_error_since: Option<Instant>,
+    pub disable_pending: bool,
+    pub last_disable_attempt: Option<Instant>,
+    pub output_suspended: bool,
+    pub feedback_numeric_valid: bool,
     pub torques: Vec<f32>,
     pub temperatures: Vec<f32>,
     pub target_positions: Vec<f32>,
     pub servo_target: Option<Vec<f32>>,
     pub servo_settled_ticks: Vec<u32>,
     pub is_torqued: bool,
+    pub pending_rearm: bool,
     pub active_trajectory: Option<MultiJointQuinticTrajectory>,
     pub last_heartbeat: Instant,
     pub last_motion_frame: Instant,
@@ -96,7 +106,7 @@ impl SupervisorInner {
             if std::path::Path::new(path).exists() {
                 match crate::gravity::verify_urdf_sha256(path) {
                     Ok(()) => {
-                        tracing::info!("URDF model verified ({}); gravity compensation enabled.", path);
+                        tracing::info!("URDF model verified ({}); output still requires an explicit model profile and compatible driver.", path);
                         gravity_compensated = true;
                         break;
                     }
@@ -118,12 +128,19 @@ impl SupervisorInner {
             commanded_positions: positions,
             commanded_velocities: vec![0.0; dof],
             last_commanded_velocities: vec![0.0; dof],
+            commanded_accelerations: vec![0.0; dof],
+            following_error_since: None,
+            disable_pending: false,
+            last_disable_attempt: None,
+            output_suspended: false,
+            feedback_numeric_valid: true,
             torques: vec![0.0; dof],
             temperatures: vec![25.0; dof],
             target_positions,
             servo_target: None,
             servo_settled_ticks: vec![0; dof],
             is_torqued: false,
+            pending_rearm: false,
             active_trajectory: None,
             last_heartbeat: now,
             last_motion_frame: now,
@@ -152,8 +169,66 @@ impl SupervisorInner {
     }
 
     pub fn with_driver(mut self, driver: Box<dyn ArmDriver>) -> Self {
+        self.apply_driver_limits(driver.as_ref());
         self.driver = Some(std::sync::Mutex::new(driver));
         self
+    }
+
+    fn apply_driver_limits(&mut self, driver: &dyn ArmDriver) {
+        for (i, limit) in self.config.limits.iter_mut().enumerate() {
+            if let Some(max) = driver.max_command_velocity(i) {
+                if max.is_finite() && max > 0.0 { limit.max_velocity = limit.max_velocity.min(max); }
+            }
+        }
+    }
+
+    fn gravity_output_enabled(&self) -> bool {
+        self.gravity_compensated && self.config.gravity_model.is_some() && matches!(self.config.dof, 6 | 7) && self.driver.as_ref().map_or(true, |d|
+            d.lock().map_or(false, |drv| drv.capabilities().torque_feedforward))
+    }
+
+    fn states_valid(states: &[crate::model::JointState], caps: DriverCapabilities, dof: usize) -> bool {
+        states.len() == dof && states.iter().all(|s| s.position.is_finite()
+            && (!caps.velocity_feedback || s.velocity.is_finite())
+            && (!caps.torque_feedback || s.torque.is_finite())
+            && (!caps.temperature_feedback || s.temperature.is_finite()))
+    }
+
+    pub fn hardware_feedback_fresh(&self, max_age: Duration) -> bool {
+        if !self.feedback_numeric_valid { return false; }
+        self.driver.as_ref().map_or(true, |d| d.lock().map_or(false, |drv| {
+            let ages = drv.feedback_ages();
+            drv.is_feedback_valid() && ages.len() == self.config.dof
+                && ages.iter().all(|a| a.is_some_and(|age| age <= max_age))
+        }))
+    }
+
+    /// Explicit user release uses the same bounded deceleration as a stream timeout.
+    pub fn stop_motion(&mut self) {
+        self.servo_target = None;
+        self.servo_settled_ticks.fill(0);
+        self.active_trajectory = None;
+        self.pending_normal_unload = false;
+        self.unload_settle_ticks = None;
+        self.target_positions = self.commanded_positions.clone();
+    }
+
+    /// A successful transport write is not confirmation that torque was removed.
+    fn request_disable(&mut self) -> Result<(), SafetyError> {
+        self.disable_pending = true;
+        self.last_disable_attempt = Some(Instant::now());
+        if let Some(ref d) = self.driver {
+            let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+            drv.set_torque(false).map_err(|e| SafetyError::ClearFaultRejected(format!("Torque disable transmission failed: {e}")))?;
+            let _ = drv.read_joint_states();
+            if !drv.is_feedback_valid() || drv.enable_state() != EnableState::Disabled {
+                return Err(SafetyError::ClearFaultRejected("Torque disable has not been confirmed by fresh hardware feedback".into()));
+            }
+        }
+        self.is_torqued = false;
+        self.pending_rearm = false;
+        self.disable_pending = false;
+        Ok(())
     }
 
     pub fn current_observation(&self) -> ArmObservation {
@@ -167,88 +242,53 @@ impl SupervisorInner {
             is_torqued: self.is_torqued,
             safety_state: self.safety.state().clone(),
             epoch_id: self.safety.epoch_id(),
-            gravity_compensated: self.gravity_compensated,
+            gravity_compensated: self.gravity_output_enabled(),
             gravity_torques: self.gravity_torques.clone(),
+            driver_capabilities: self.driver.as_ref().and_then(|d| d.lock().ok().map(|drv| drv.capabilities())).unwrap_or_default(),
+            enable_state: self.driver.as_ref().map_or(if self.is_torqued { EnableState::Enabled } else { EnableState::Disabled }, |d| d.lock().map_or(EnableState::Unknown, |drv| drv.enable_state())),
+            feedback_age_ms: self.driver.as_ref().and_then(|d| d.lock().ok().map(|drv| drv.feedback_ages().iter().map(|a| a.map(|v| v.as_millis().min(u64::MAX as u128) as u64)).collect())).unwrap_or_else(|| vec![Some(0); self.config.dof]),
+            disable_pending: self.disable_pending,
+            feedback_valid: self.hardware_feedback_fresh(Duration::from_millis(250)),
         }
     }
 
     pub fn is_at_safe_resting_pose(&self) -> bool {
         let dof = self.config.dof;
-        if self.measured_positions.len() < dof || self.config.home_positions.len() < dof {
-            return false;
-        }
-
-        // 硬件前置条件: 若挂载了真实硬件驱动，必须处于有效使能闭环且反馈新鲜，且非停止/故障态
+        if self.measured_positions.len() != dof || self.measured_velocities.len() != dof { return false; }
+        let simulation_policy = RestingPosePolicy::rebot_dm();
+        let policy = match &self.config.resting_pose {
+            Some(policy) => policy,
+            None if self.driver.is_none() => &simulation_policy,
+            None => return false,
+        };
         if let Some(ref d) = self.driver {
-            if let Ok(drv) = d.lock() {
-                if !drv.is_feedback_valid() || !drv.is_enabled() {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-            if self.safety.state().is_stopped() {
-                return false;
-            }
-            if self.last_can_feedback_instant.map_or(true, |t| t.elapsed() > Duration::from_millis(100)) {
-                return false;
-            }
+            let Ok(drv) = d.lock() else { return false; };
+            let caps = drv.capabilities();
+            if !caps.velocity_feedback || !caps.torque_feedback || !caps.enable_feedback
+                || drv.enable_state() != EnableState::Enabled || self.safety.state().is_stopped() { return false; }
+            drop(drv);
+            if !self.hardware_feedback_fresh(Duration::from_millis(policy.feedback_max_age_ms)) { return false; }
         }
-
-        // 判定1 (几何): 遍历 J1~J6（若 dof > 6，前 6 轴为主臂体轴），逐轴偏差 abs <= 0.08 rad，且前 6 轴绝对偏差之和 <= 0.16 rad；
-        // 若存在第 7 轴（夹爪），不阻塞主体安全支撑判定。
-        let arm_dof = dof.min(6);
-        let mut total_deviation = 0.0f32;
-        for i in 0..arm_dof {
-            let p = self.measured_positions[i];
-            let h = self.config.home_positions[i];
-            if !p.is_finite() || !h.is_finite() {
-                return false;
-            }
-            let dev = (p - h).abs();
-            if dev > 0.08 {
-                return false;
-            }
-            total_deviation += dev;
+        let mut total = 0.0;
+        for (i, tolerance) in policy.position_tolerances.iter().enumerate().take(dof) {
+            let dev = (self.measured_positions[i] - self.config.home_positions[i]).abs();
+            if !dev.is_finite() || dev > *tolerance { return false; }
+            total += dev;
         }
-        if total_deviation > 0.16 {
-            return false;
-        }
-
-        // 判定2 (静止): 各轴实测速度绝对值 <= 0.015 rad/s
-        if self.measured_velocities.len() < dof {
-            return false;
-        }
-        for i in 0..dof {
-            let v = self.measured_velocities[i];
-            if !v.is_finite() || v.abs() > 0.015 {
-                return false;
+        if total > policy.max_total_deviation || self.measured_velocities.iter().any(|v| !v.is_finite() || v.abs() > policy.max_velocity) { return false; }
+        if self.driver.is_some() {
+            for &(i, max_tau) in &policy.support_torque_limits {
+                if i >= dof { return false; }
+                let tau = self.torques.get(i).copied().unwrap_or(f32::NAN);
+                if !tau.is_finite() || tau.abs() > max_tau { return false; }
             }
         }
-
-        // 判定3 (力矩): 检查主承重俯仰轴 J2 与 J3 的实测力矩绝对值
-        // 原位折叠就位时: J2 受底座直接承托实测力矩 <= 1.5 N·m (悬空约为 1.1~2.5 N·m)
-        //                 J3 小臂折叠受托实测力矩 <= 4.5 N·m (悬空全伸出时重力矩高达 7.65 N·m)
-        // 若是仿真驱动 (driver.is_none())，视为满足
-        if self.driver.is_none() {
-            return true;
-        }
-
-        let j2_j3_limits = [(1usize, 1.5f32), (2usize, 4.5f32)];
-        for &(idx, max_tau) in &j2_j3_limits {
-            if idx < dof {
-                let measured_tau = self.torques.get(idx).copied().unwrap_or(f32::NAN);
-                if !measured_tau.is_finite() || measured_tau.abs() > max_tau {
-                    return false;
-                }
-            }
-        }
-
         true
     }
 
     pub fn set_torque(&mut self, enable: bool) -> Result<SafetyState, SafetyError> {
         if enable {
+            if self.disable_pending { return Err(SafetyError::ClearFaultRejected("Torque disable is still pending".into())); }
             // Atomic e-stop check
             if self.e_stop_latched.load(Ordering::SeqCst) {
                 return Err(SafetyError::EStopActive);
@@ -279,32 +319,48 @@ impl SupervisorInner {
                 if self.e_stop_latched.load(Ordering::SeqCst) {
                     return Err(SafetyError::EStopActive);
                 }
-                if let Err(_) = driver.set_torque(true) {
+                if let Err(e) = driver.set_torque(true) {
                     if !was_torqued {
-                        let _ = driver.set_torque(false);
-                        self.is_torqued = false;
+                        let sent = driver.set_torque(false).is_ok();
+                        let _ = driver.read_joint_states();
+                        let confirmed_off = sent && driver.is_feedback_valid() && driver.enable_state() == EnableState::Disabled;
+                        self.is_torqued = !confirmed_off;
+                        self.disable_pending = !confirmed_off;
+                        self.last_disable_attempt = Some(Instant::now());
                     }
-                    self.safety.trigger_fault(FaultReason::Other("Hardware torque enable failed".to_string()));
-                    return Err(SafetyError::FeedbackUnavailable);
+                    let err_msg = format!("Hardware torque enable failed: {}", e);
+                    self.safety.trigger_fault(FaultReason::Other(err_msg.clone()));
+                    return Err(SafetyError::ClearFaultRejected(err_msg));
                 }
                 let states = match driver.read_joint_states() {
                     Ok(s) => s,
                     Err(_) => {
                         if !was_torqued {
-                            let _ = driver.set_torque(false);
-                            self.is_torqued = false;
+                            let sent = driver.set_torque(false).is_ok();
+                            let _ = driver.read_joint_states();
+                            let confirmed_off = sent && driver.is_feedback_valid() && driver.enable_state() == EnableState::Disabled;
+                            self.is_torqued = !confirmed_off;
+                            self.disable_pending = !confirmed_off;
+                            self.last_disable_attempt = Some(Instant::now());
                         }
                         return Err(SafetyError::FeedbackUnavailable);
                     }
                 };
-                if !driver.is_feedback_valid() || states.len() < self.config.dof {
+                if !driver.is_feedback_valid() || !Self::states_valid(&states, driver.capabilities(), self.config.dof)
+                    || (driver.capabilities().enable_feedback && driver.enable_state() != EnableState::Enabled) {
                     if !was_torqued {
-                        let _ = driver.set_torque(false);
-                        self.is_torqued = false;
+                        let sent = driver.set_torque(false).is_ok();
+                        let _ = driver.read_joint_states();
+                        let confirmed_off = sent && driver.is_feedback_valid() && driver.enable_state() == EnableState::Disabled;
+                        self.is_torqued = !confirmed_off;
+                        self.disable_pending = !confirmed_off;
+                        self.last_disable_attempt = Some(Instant::now());
                     }
                     return Err(SafetyError::FeedbackUnavailable);
                 }
-                self.last_can_feedback_instant = Some(Instant::now());
+                self.feedback_numeric_valid = true;
+                self.last_can_feedback_instant = driver.feedback_ages().into_iter().collect::<Option<Vec<_>>>()
+                    .and_then(|ages| ages.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
                 for (i, state) in states.iter().enumerate() {
                     if i < self.config.dof {
                         self.measured_positions[i] = state.position;
@@ -325,7 +381,8 @@ impl SupervisorInner {
                 self.target_positions[grip_idx] = g_cmd;
             }
             self.commanded_velocities = vec![0.0; self.config.dof];
-            self.measured_velocities = vec![0.0; self.config.dof];
+            self.commanded_accelerations.fill(0.0);
+            if self.driver.is_none() { self.measured_velocities.fill(0.0); }
             self.active_trajectory = None;
             self.pending_normal_unload = false;
             self.unload_settle_ticks = None;
@@ -333,6 +390,8 @@ impl SupervisorInner {
 
             let state = self.safety.set_torque(true)?;
             self.is_torqued = true;
+            self.pending_rearm = false;
+            self.disable_pending = false;
             let now = Instant::now();
             self.last_heartbeat = now;
             self.last_motion_frame = now;
@@ -351,23 +410,28 @@ impl SupervisorInner {
                 });
             }
 
+            self.stop_motion();
+            self.commanded_velocities.fill(0.0);
+            if let Err(error) = self.request_disable() {
+                self.safety.trigger_fault(FaultReason::Other(error.to_string()));
+                return Err(error);
+            }
             let state = self.safety.set_torque(false)?;
-            self.active_trajectory = None;
-            self.pending_normal_unload = false;
-            self.unload_settle_ticks = None;
-            self.servo_target = None;
-            self.commanded_velocities = vec![0.0; self.config.dof];
-            if self.driver.is_none() {
-                self.measured_velocities = vec![0.0; self.config.dof];
-            }
-            if let Some(ref d) = self.driver {
-                if let Ok(mut driver) = d.lock() {
-                    let _ = driver.set_torque(false);
-                }
-            }
-            self.is_torqued = false;
+            if self.driver.is_none() { self.measured_velocities.fill(0.0); }
             Ok(state)
         }
+    }
+
+    /// Automatic unload requires a configured resting pose and observable
+    /// velocity, supporting torque and enable state. This is a capability check,
+    /// not a claim that the arm is currently resting or ready to disable.
+    pub fn supports_automatic_unload(&self) -> bool {
+        self.driver.as_ref().map_or(true, |driver| {
+            self.config.resting_pose.is_some() && driver.lock().map_or(false, |driver| {
+                let capabilities = driver.capabilities();
+                capabilities.velocity_feedback && capabilities.torque_feedback && capabilities.enable_feedback
+            })
+        })
     }
 
     pub fn execute_stop(&mut self, policy: StopPolicy) {
@@ -375,6 +439,10 @@ impl SupervisorInner {
     }
 
     pub fn apply_stop_policy(&mut self, policy: StopPolicy) {
+        if policy == StopPolicy::NormalUnload && !self.supports_automatic_unload() {
+            tracing::warn!("NormalUnload unsupported: resting pose or confirmed velocity/torque/enable feedback unavailable; no unload motion started");
+            return;
+        }
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         match policy {
@@ -393,7 +461,7 @@ impl SupervisorInner {
 
                 // Return to home position cleanly, then disable torque.
                 // Allow unload from Operational or Idle.
-                let can_unload = self.is_torqued && (
+                let can_unload = self.is_torqued && !self.pending_rearm && (
                     self.safety.state().is_operational()
                     || matches!(self.safety.state(), SafetyState::Idle)
                 );
@@ -482,33 +550,15 @@ impl SupervisorInner {
                 self.safety.trigger_e_stop();
             }
             StopPolicy::ThermalTrip => {
-                // Thermal trip: stop motion, disable torque immediately to protect motor coils, latch fault
-                self.pending_normal_unload = false;
-                self.unload_settle_ticks = None;
-                self.active_trajectory = None;
-                self.servo_target = None;
-                self.commanded_velocities = vec![0.0; self.config.dof];
-                if self.driver.is_none() {
-                    self.measured_velocities = vec![0.0; self.config.dof];
+                self.stop_motion();
+                self.commanded_velocities.fill(0.0);
+                self.commanded_accelerations.fill(0.0);
+                let (joint_idx, temperature) = self.temperatures.iter().copied().enumerate()
+                    .filter(|(_, t)| t.is_finite()).max_by(|a,b| a.1.total_cmp(&b.1)).unwrap_or((0, 0.0));
+                if !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. })) {
+                    self.safety.trigger_fault(FaultReason::ThermalTrip { joint_idx, temperature, limit: self.config.max_temperature });
                 }
-                self.is_torqued = false;
-                let _ = self.safety.set_torque(false);
-                if let Some(ref d) = self.driver {
-                    if let Ok(mut driver) = d.lock() {
-                        let _ = driver.set_torque(false);
-                    }
-                }
-                let max_temp = self
-                    .temperatures
-                    .iter()
-                    .copied()
-                    .max_by(|a, b| a.total_cmp(b))
-                    .unwrap_or(0.0);
-                self.safety.trigger_fault(FaultReason::ThermalTrip {
-                    joint_idx: 0,
-                    temperature: max_temp,
-                    limit: self.config.max_temperature,
-                });
+                if let Err(e) = self.request_disable() { tracing::error!("Thermal shutdown not confirmed: {e}"); }
             }
             StopPolicy::BusLossFallback => {
                 // Bus loss / disconnect: hold position locked, latch fault, advance epoch
@@ -537,59 +587,70 @@ impl SupervisorInner {
     }
 
     pub fn clear_fault(&mut self) -> Result<SafetyState, SafetyError> {
-        if self.safety.state().is_stopped() {
-            let is_driver_hardware_fault = matches!(self.safety.state(), SafetyState::Fault(FaultReason::Other(_)));
-            let is_thermal_trip = matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }));
-
-            if is_driver_hardware_fault {
-                // If clearing an active hardware Fault from physical motor driver, clear driver fault registers first
-                if let Some(ref d) = self.driver {
-                    if let Ok(mut driver) = d.lock() {
-                        if let Err(e) = driver.clear_fault() {
-                            tracing::error!("Failed to clear hardware driver fault: {:?}", e);
-                            return Err(SafetyError::ClearFaultRejected(e.to_string()));
-                        }
-                    }
-                }
-                self.is_torqued = false;
-            } else if is_thermal_trip {
-                // ThermalTrip has safely de-energized motors to prevent hardware burn.
-                // Keep torque disabled until operator explicitly re-enables via set_torque(true).
-                self.is_torqued = false;
+        if !self.safety.state().is_stopped() { return Ok(self.safety.state().clone()); }
+        if self.disable_pending { return Err(SafetyError::ClearFaultRejected("Torque disable is still unconfirmed".into())); }
+        let thermal = matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }));
+        let confirmed = if let Some(ref d) = self.driver {
+            let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
+            // Clearing a latched motor error requires a later feedback observation, not a cleared cache.
+            if drv.check_hardware_status().is_err() {
+                drv.clear_fault().map_err(|e| SafetyError::ClearFaultRejected(e.to_string()))?;
+                return Err(SafetyError::ClearFaultRejected("Hardware reset sent; wait for fresh fault-free feedback before retrying".into()));
             }
-
-            let new_state = self.safety.clear_fault()?;
-            self.e_stop_latched.store(false, Ordering::SeqCst);
-
-            // Slew-limited resynchronization instead of jumping if measured is displaced
-            if self.measured_positions.iter().all(|p| p.is_finite())
-                && self.measured_positions.len() == self.config.dof
-                && self.commanded_positions.len() == self.config.dof
-            {
-                let dof = self.config.dof;
-                for i in 0..dof {
-                    let delta = (self.measured_positions[i] - self.commanded_positions[i]).clamp(-0.04, 0.04);
-                    self.commanded_positions[i] += delta;
-                    self.target_positions[i] = self.commanded_positions[i];
-                }
+            let states = drv.read_joint_states().map_err(|e| SafetyError::ClearFaultRejected(e.to_string()))?;
+            let ages = drv.feedback_ages();
+            if !drv.is_feedback_valid() || ages.len() != self.config.dof
+                || ages.iter().any(|a| a.is_none_or(|t| t > Duration::from_millis(250)))
+                || !Self::states_valid(&states, drv.capabilities(), self.config.dof) {
+                return Err(SafetyError::ClearFaultRejected("Fresh feedback is required before resetting a fault".into()));
             }
-            self.commanded_velocities = vec![0.0; self.config.dof];
-            self.last_commanded_velocities = vec![0.0; self.config.dof];
-            self.active_trajectory = None;
-            self.servo_target = None;
-            self.servo_settled_ticks.fill(0);
-            self.bus_loss_instant = None;
-
-            // For recoverable software faults (Watchdog, BusLoss, JointLimitExceeded) or E-Stop:
-            // Maintain continuous holding torque if already torqued so arm does not fall under gravity.
-            let now = Instant::now();
-            self.last_heartbeat = now;
-            self.last_motion_frame = now;
-            self.pending_normal_unload = false;
-            self.unload_settle_ticks = None;
-            Ok(new_state)
+            drv.check_hardware_status().map_err(|e| SafetyError::ClearFaultRejected(e.to_string()))?;
+            if thermal && (!drv.capabilities().temperature_feedback || states.iter().any(|state|
+                !state.temperature.is_finite() || state.temperature > self.config.max_temperature - 5.0)) {
+                return Err(SafetyError::ClearFaultRejected("Temperature must be confirmed below the reset threshold".into()));
+            }
+            let state = drv.enable_state();
+            if state == EnableState::Unknown {
+                return Err(SafetyError::ClearFaultRejected("Hardware enable state is unknown; reset remains latched".into()));
+            }
+            self.feedback_numeric_valid = true;
+            for (i, state) in states.iter().enumerate() {
+                self.measured_positions[i] = state.position;
+                self.measured_velocities[i] = state.velocity;
+                self.torques[i] = state.torque;
+                self.temperatures[i] = state.temperature;
+            }
+            state
         } else {
-            Ok(self.safety.state().clone())
+            if thermal && self.temperatures.iter().any(|t| !t.is_finite() || *t > self.config.max_temperature - 5.0) {
+                return Err(SafetyError::ClearFaultRejected("Temperature is above the reset threshold".into()));
+            }
+            if self.is_torqued { EnableState::Enabled } else { EnableState::Disabled }
+        };
+        self.is_torqued = confirmed == EnableState::Enabled;
+        self.pending_rearm = true;
+        self.stop_motion();
+        // Reset at the measured position; never retain a residual old trajectory target.
+        self.commanded_positions = self.measured_positions.clone();
+        self.target_positions = self.measured_positions.clone();
+        self.commanded_velocities.fill(0.0);
+        self.last_commanded_velocities.fill(0.0);
+        self.commanded_accelerations.fill(0.0);
+        self.following_error_since = None;
+        self.bus_loss_instant = None;
+        let state = self.safety.clear_fault()?;
+        self.e_stop_latched.store(false, Ordering::SeqCst);
+        self.last_heartbeat = Instant::now();
+        self.last_motion_frame = Instant::now();
+        Ok(state)
+    }
+
+    pub fn shutdown_ready(&self) -> bool {
+        if self.disable_pending { return false; }
+        match &self.driver {
+            None => !self.is_torqued,
+            Some(driver) => self.hardware_feedback_fresh(Duration::from_millis(250))
+                && driver.lock().map_or(false, |drv| drv.enable_state() == EnableState::Disabled),
         }
     }
 
@@ -597,10 +658,13 @@ impl SupervisorInner {
         let now = Instant::now();
         if let Some(ref active) = self.active_lease {
             let is_expired = active.acquired_at.elapsed() >= self.lease_timeout;
-            if !is_expired && active.client_id != client_id {
+            if !is_expired {
+                if active.client_id == client_id { return Ok(active.generation); }
                 return Err((active.client_id.clone(), active.generation));
             }
         }
+        // A new controller never inherits an expired controller's queued motion.
+        if self.active_lease.is_some() { self.stop_motion(); }
         self.lease_generation_counter += 1;
         let gen = self.lease_generation_counter;
         self.active_lease = Some(ActiveLease {
@@ -652,7 +716,7 @@ impl SupervisorInner {
             });
         }
         if let Some(ref mut active) = self.active_lease {
-            if active.client_id == client_id {
+            if active.client_id == client_id && active.acquired_at.elapsed() < self.lease_timeout {
                 active.acquired_at = Instant::now();
                 self.last_heartbeat = Instant::now();
             } else {
@@ -679,7 +743,7 @@ impl SupervisorInner {
             });
         }
 
-        if self.active_trajectory.is_some() || self.pending_normal_unload {
+        if self.pending_rearm || self.active_trajectory.is_some() || self.pending_normal_unload {
             return Err(SafetyError::NotArmed(self.safety.state().clone()));
         }
 
@@ -718,6 +782,60 @@ impl SupervisorInner {
         Ok(())
     }
 
+    pub fn jog(
+        &mut self,
+        target_positions: Vec<f32>,
+        duration_secs: Option<f64>,
+        epoch_id: Option<u64>,
+    ) -> Result<u64, ArmError> {
+        if self.e_stop_latched.load(Ordering::SeqCst) {
+            return Err(ArmError::Safety(SafetyError::EStopActive));
+        }
+
+        if self.pending_rearm || self.pending_normal_unload {
+            return Err(ArmError::Safety(SafetyError::NotArmed(self.safety.state().clone())));
+        }
+        self.pending_normal_unload = false;
+
+        // 1. Validate command against single controller authority, safety state, and soft limits
+        self.safety.validate_motion_command(
+            epoch_id,
+            &target_positions,
+            &self.config.limits,
+        )?;
+
+        // J7 Gripper stall release check on reverse command
+        if self.config.dof >= 7 && self.gripper_stalled && target_positions.len() >= 7 {
+            let delta = target_positions[6] - self.commanded_positions[6];
+            let tau_7 = self.torques.get(6).copied().unwrap_or(0.0);
+            if (delta * tau_7 < -1e-4) || (delta * self.gripper_stall_sign < -1e-4) {
+                self.gripper_stalled = false;
+                self.gripper_high_torque_ticks = 0;
+                self.gripper_low_torque_ticks = 0;
+            }
+        }
+
+        // 2. Plan quintic polynomial trajectory from commanded state to target
+        let traj = TrajectoryPlanner::plan(
+            &self.commanded_positions,
+            &self.commanded_velocities,
+            &target_positions,
+            &vec![0.0; self.config.dof],
+            duration_secs,
+            &self.config.limits,
+        )?;
+
+        // 3. Only renew lease AFTER command validation and planning succeed
+        self.last_heartbeat = Instant::now();
+
+        self.servo_target = None;
+        self.target_positions = target_positions;
+        self.active_trajectory = Some(traj);
+        self.safety.mark_motion_started()?;
+
+        Ok(self.safety.epoch_id())
+    }
+
     /// Semi-implicit reference step: q_next = q + v_next * dt. All constraint
     /// arithmetic is f64; storage/CAN values remain f32 (and incur rounding).
     /// This bounds acceleration, not jerk. An infeasible initial state must
@@ -728,6 +846,13 @@ impl SupervisorInner {
         v_prev: f32,
         dt: f64,
         limit: &crate::model::JointLimit,
+    ) -> Option<(f32, f32, bool)> {
+        Self::bounded_servo_step_with_jerk(q, target, v_prev, dt, limit, 0.0, None)
+    }
+
+    pub fn bounded_servo_step_with_jerk(
+        q: f32, target: f32, v_prev: f32, dt: f64,
+        limit: &crate::model::JointLimit, previous_acceleration: f32, max_jerk: Option<f32>,
     ) -> Option<(f32, f32, bool)> {
         const POS_EPS: f64 = 1.0e-3;
 
@@ -787,7 +912,24 @@ impl SupervisorInner {
         // at least one of the acceleration or stopping-distance constraints.
         if lower > upper { return None; }
 
-        let v_next64 = desired.clamp(lower, upper);
+        let preferred = if let Some(jerk) = max_jerk {
+            if !jerk.is_finite() || jerk <= 0.0 || !previous_acceleration.is_finite() { return None; }
+            let acceleration = ((desired - v_prev64) / h).clamp(-amax, amax);
+            let previous = f64::from(previous_acceleration);
+            let da = f64::from(jerk) * h;
+            v_prev64 + acceleration.clamp(previous - da, previous + da) * h
+        } else { desired };
+        // Do not let acceleration history carry a stationary target past its braking
+        // envelope. This also removes the small limit cycle that a pure jerk filter
+        // creates near arrival. Changed targets can make this envelope infeasible;
+        // the final projection still gives acceleration and joint limits priority.
+        let preferred = if desired >= 0.0 && v_prev64 >= 0.0 {
+            preferred.clamp(0.0, desired)
+        } else if desired <= 0.0 && v_prev64 <= 0.0 {
+            preferred.clamp(desired, 0.0)
+        } else { preferred };
+        // Safety bounds override the comfort preference when braking space is short.
+        let v_next64 = preferred.clamp(lower, upper);
         let q_next64 = (q_projected + v_next64 * h).clamp(lo, hi);
         let v_final64 = if h > 0.0 {
             (q_next64 - q_projected) / h
@@ -821,19 +963,25 @@ impl SupervisorInner {
 
     pub fn tick(&mut self, dt: f64) -> ArmObservation {
         // Immediate atomic e-stop latch check before any processing
-        if self.e_stop_latched.load(Ordering::SeqCst) && !matches!(self.safety.state(), SafetyState::EStop) {
+        if self.e_stop_latched.load(Ordering::SeqCst) && !self.safety.state().is_stopped() {
             self.apply_stop_policy(StopPolicy::EStopLatch);
         }
 
-        // 0. Poll hardware driver telemetry if available (updates measured state only)
+        // Polling a cached sample never refreshes its hardware receive timestamp.
+        let mut invalid_feedback = false;
         if let Some(ref d) = self.driver {
+            self.feedback_numeric_valid = false;
             if let Ok(mut driver) = d.lock() {
                 if let Ok(states) = driver.read_joint_states() {
-                    if !states.is_empty() && driver.is_feedback_valid() {
-                        self.last_can_feedback_instant = Some(Instant::now());
-                    }
-                    for (i, state) in states.iter().enumerate() {
-                        if i < self.config.dof {
+                    self.feedback_numeric_valid = Self::states_valid(&states, driver.capabilities(), self.config.dof);
+                    invalid_feedback = !self.feedback_numeric_valid;
+                    let ages = driver.feedback_ages();
+                    if self.feedback_numeric_valid && ages.len() == self.config.dof && driver.is_feedback_valid() {
+                        self.last_can_feedback_instant = ages.iter().copied().collect::<Option<Vec<_>>>()
+                            .and_then(|ages| ages.into_iter().max()).and_then(|age| Instant::now().checked_sub(age));
+                    } else { self.last_can_feedback_instant = None; }
+                    if self.feedback_numeric_valid {
+                        for (i, state) in states.iter().enumerate() {
                             self.measured_positions[i] = state.position;
                             self.measured_velocities[i] = state.velocity;
                             self.torques[i] = state.torque;
@@ -843,12 +991,31 @@ impl SupervisorInner {
                 }
             }
         }
+        if invalid_feedback && self.is_torqued && !self.safety.state().is_stopped() {
+            self.stop_motion();
+            self.commanded_velocities.fill(0.0);
+            self.safety.trigger_fault(FaultReason::Other("Invalid hardware telemetry".into()));
+        }
+
+        if (!dt.is_finite() || dt <= 0.0 || dt > 0.080)
+            && self.is_torqued && self.safety.state().is_operational() {
+            self.stop_motion();
+            if self.measured_positions.iter().all(|p| p.is_finite()) {
+                self.commanded_positions = self.measured_positions.clone();
+                self.target_positions = self.measured_positions.clone();
+            }
+            self.commanded_velocities.fill(0.0);
+            self.commanded_accelerations.fill(0.0);
+            self.safety.trigger_fault(FaultReason::Other("Control loop deadline exceeded".into()));
+        }
+        let dt = if dt.is_finite() && dt > 0.0 { dt.min(0.080) } else { 0.020 };
+        let before_velocities = self.commanded_velocities.clone();
 
         // 0.1 Gripper stall protection state machine for J7 (joint 6)
         if self.config.dof >= 7 {
             let is_bus_fresh = if let Some(ref d) = self.driver {
                 if let Ok(driver) = d.lock() {
-                    self.last_can_feedback_instant.map_or(false, |t| t.elapsed() < Duration::from_millis(50)) && driver.is_feedback_valid()
+                    self.last_can_feedback_instant.map_or(false, |t| t.elapsed() < Duration::from_millis(50)) && driver.is_feedback_valid() && driver.capabilities().torque_feedback
                 } else {
                     false
                 }
@@ -895,12 +1062,9 @@ impl SupervisorInner {
         }
 
         // 0.2 Compute gravity torques if gravity compensation is enabled, driver feedback is valid, and measured positions available
-        let driver_feedback_ok = self
-            .driver
-            .as_ref()
-            .map_or(true, |d| d.lock().map_or(false, |drv| drv.is_feedback_valid()));
+        let driver_feedback_ok = self.hardware_feedback_fresh(Duration::from_millis(250));
 
-        if self.gravity_compensated && driver_feedback_ok && self.measured_positions.len() >= 6 {
+        if self.gravity_output_enabled() && driver_feedback_ok && self.measured_positions.len() >= 6 {
             let mut q = [0.0f32; 6];
             q.copy_from_slice(&self.measured_positions[0..6]);
             match crate::gravity::compute_gravity_torques(&q) {
@@ -929,7 +1093,7 @@ impl SupervisorInner {
         let dt_sec = (dt as f32).clamp(0.001, 0.1);
         let max_dtau = 15.0 * dt_sec; // Slew rate: 15.0 N·m/s (0.30 N·m/tick at 50Hz)
         for i in 0..self.config.dof {
-            let target_tau = if self.gravity_compensated && driver_feedback_ok && i < self.gravity_torques.len() {
+            let target_tau = if self.gravity_output_enabled() && driver_feedback_ok && i < self.gravity_torques.len() {
                 let raw = self.gravity_torques[i];
                 let raw_finite = if raw.is_finite() { raw } else { 0.0 };
                 let scaled = raw_finite * self.gravity_scale;
@@ -943,13 +1107,11 @@ impl SupervisorInner {
             self.gravity_torques_ramped[i] = if ramped.is_finite() { ramped } else { 0.0 };
         }
 
-        // Check telemetry freshness: trigger BusLossFallback if communication lost or feedback stale (>80ms)
+        // Check the driver's per-joint feedback deadline (250 ms for the bundled drivers).
         if self.is_torqued
             && !self.safety.state().is_stopped()
-            && self
-                .driver
-                .as_ref()
-                .map_or(false, |d| d.lock().map_or(true, |drv| !drv.is_feedback_valid()))
+            && self.driver.is_some()
+            && !self.hardware_feedback_fresh(Duration::from_millis(250))
         {
             self.execute_stop(StopPolicy::BusLossFallback);
         }
@@ -1006,38 +1168,43 @@ impl SupervisorInner {
             self.safety.trigger_fault(FaultReason::WatchdogTimeout);
         }
 
-        // 2. Check thermal limit (only check when torqued and not already stopped to prevent reentrant loop)
-        if self.is_torqued && !self.safety.state().is_stopped() {
-            for (i, &temp) in self.temperatures.iter().enumerate() {
-                if temp.is_finite() && temp > self.config.max_temperature {
-                    tracing::error!(
-                        "Thermal limit exceeded on joint {} (temp={:.1}°C > max={:.1}°C); de-energizing arm immediately!",
-                        i, temp, self.config.max_temperature
-                    );
-                    self.pending_normal_unload = false;
-                    self.unload_settle_ticks = None;
-                    self.active_trajectory = None;
-                    self.servo_target = None; self.servo_settled_ticks.fill(0);
-                    self.commanded_velocities = vec![0.0; self.config.dof];
-                    if self.driver.is_none() {
-                        self.measured_velocities = vec![0.0; self.config.dof];
-                    }
-                    self.is_torqued = false;
-                    let _ = self.safety.set_torque(false);
-                    if let Some(ref d) = self.driver {
-                        if let Ok(mut driver) = d.lock() {
-                            let _ = driver.set_torque(false);
-                        }
-                    }
-                    self.safety.trigger_fault(FaultReason::ThermalTrip {
-                        joint_idx: i,
-                        temperature: temp,
-                        limit: self.config.max_temperature,
-                    });
-                    break;
-                }
+        // Thermal protection remains active while stopped or shutdown is unconfirmed.
+        let temperature_available = self.driver.as_ref().map_or(true, |d| d.lock().map_or(false, |drv| drv.capabilities().temperature_feedback));
+        if (self.is_torqued || self.disable_pending) && temperature_available {
+            if self.temperatures.iter().any(|t| t.is_finite() && *t > self.config.max_temperature)
+                && !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. })) {
+                self.apply_stop_policy(StopPolicy::ThermalTrip);
             }
         }
+        if self.disable_pending {
+            let confirmed = self.driver.as_ref().map_or(true, |d| d.lock().map_or(false, |drv|
+                drv.is_feedback_valid() && drv.enable_state() == EnableState::Disabled));
+            if confirmed {
+                self.is_torqued = false;
+                self.pending_rearm = false;
+                self.disable_pending = false;
+            } else if self.last_disable_attempt.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) {
+                if let Err(e) = self.request_disable() { tracing::warn!("Torque shutdown remains unconfirmed: {e}"); }
+            }
+        }
+        // Detect sustained physical tracking error, never compare against stale samples.
+        if self.driver.is_some() && self.is_torqued && self.safety.state().is_operational()
+            && self.hardware_feedback_fresh(Duration::from_millis(100)) {
+            let threshold = self.config.following_error.max_error_rad;
+            let outside = self.commanded_positions.iter().zip(&self.measured_positions)
+                .any(|(q, measured)| !measured.is_finite() || (q - measured).abs() > threshold);
+            if outside {
+                let since = self.following_error_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_millis(self.config.following_error.persistence_ms) {
+                    self.stop_motion();
+                    self.commanded_positions = self.measured_positions.clone();
+                    self.target_positions = self.measured_positions.clone();
+                    self.commanded_velocities.fill(0.0);
+                    self.commanded_accelerations.fill(0.0);
+                    self.safety.trigger_fault(FaultReason::Other("Persistent joint tracking error".into()));
+                }
+            } else { self.following_error_since = None; }
+        } else { self.following_error_since = None; }
 
         // Use one integration interval and never integrate a reference twice in a tick.
         let servo_dt = dt.clamp(0.001, 0.1);
@@ -1124,12 +1291,14 @@ impl SupervisorInner {
                             } else {
                                 clamped_tgt
                             };
-                            let step = Self::bounded_servo_step(
+                            let step = Self::bounded_servo_step_with_jerk(
                                 next_positions[i],
                                 actual_tgt,
                                 next_velocities[i],
                                 servo_dt,
                                 limit,
+                                self.commanded_accelerations[i],
+                                self.config.max_jerk,
                             );
                             let Some((q_next, v_next, reached)) = step else {
                                 infeasible = Some(i);
@@ -1178,12 +1347,14 @@ impl SupervisorInner {
             let mut next_velocities = self.commanded_velocities.clone();
             let mut infeasible = None;
             for i in 0..self.config.dof {
-                let step = Self::bounded_servo_step(
+                let step = Self::bounded_servo_step_with_jerk(
                     self.commanded_positions[i],
                     self.commanded_positions[i],
                     self.commanded_velocities[i],
                     servo_dt,
                     &self.config.limits[i],
+                    self.commanded_accelerations[i],
+                    self.config.max_jerk,
                 );
                 let Some((q_next, v_next, _)) = step else {
                     infeasible = Some(i);
@@ -1204,40 +1375,72 @@ impl SupervisorInner {
             }
         }
 
+        for i in 0..self.config.dof {
+            self.commanded_accelerations[i] = if self.safety.state().is_stopped() { 0.0 }
+                else { (self.commanded_velocities[i] - before_velocities[i]) / servo_dt as f32 };
+        }
         self.last_commanded_velocities = self.commanded_velocities.clone();
 
-        // 4. Output commanded positions to hardware driver if torqued (generates anti-gravity restorative torque)
-        // Continuously output whenever is_torqued is true, maintaining rigid hold even during E-Stop, BusLossFallback or WatchdogTimeout
-        if self.is_torqued {
-            let send_to_bus = true;
+        let feedback_fresh = self.hardware_feedback_fresh(Duration::from_millis(250));
+        if self.driver.is_some() && self.is_torqued {
+            if !feedback_fresh { self.output_suspended = true; }
+            else if self.output_suspended {
+                self.stop_motion();
+                self.commanded_positions = self.measured_positions.clone();
+                self.target_positions = self.measured_positions.clone();
+                self.commanded_velocities.fill(0.0);
+                self.commanded_accelerations.fill(0.0);
+                self.output_suspended = false;
+                if !self.safety.state().is_stopped() {
+                    self.safety.trigger_fault(FaultReason::BusLoss);
+                }
+            }
+        }
+        let gravity_output_enabled = self.gravity_output_enabled();
+        // Hold only while torque may be active and fresh valid feedback permits output.
+        // Pending disable and invalid feedback suppress ordinary commands; reconnect resynchronizes first.
+        let mut output_error = None;
+        if self.is_torqued && !self.disable_pending {
+            let send_to_bus = feedback_fresh && self.driver.as_ref().map_or(true, |d|
+                d.lock().map_or(false, |drv| drv.enable_state() != EnableState::Disabled));
 
             if send_to_bus {
                 if let Some(ref d) = self.driver {
                     if let Ok(mut driver) = d.lock() {
-                        // Write commanded holding targets whenever driver is enabled
-                        if driver.is_enabled() {
-                            let targets: Vec<JointTarget> = self
-                                .commanded_positions
-                                .iter()
-                                .zip(self.commanded_velocities.iter())
-                                .enumerate()
-                                .map(|(i, (&p, &v))| JointTarget {
-                                    position: p,
-                                    velocity: Some(v),
-                                    torque: if self.gravity_compensated {
-                                        self.gravity_torques_ramped.get(i).copied()
-                                    } else {
-                                        Some(0.0)
-                                    },
-                                    kp: None,
-                                    kd: None,
-                                })
-                                .collect();
-                            let _ = driver.write_joint_targets(&targets);
-                        }
+                        let targets: Vec<JointTarget> = self
+                            .commanded_positions
+                            .iter()
+                            .zip(self.commanded_velocities.iter())
+                            .enumerate()
+                            .map(|(i, (&p, &v))| JointTarget {
+                                position: p,
+                                velocity: Some(v),
+                                torque: if gravity_output_enabled {
+                                    self.gravity_torques_ramped.get(i).copied()
+                                } else {
+                                    Some(0.0)
+                                },
+                                kp: None,
+                                kd: None,
+                            })
+                            .collect();
+                        if let Err(e) = driver.write_joint_targets(&targets) { output_error = Some(e.to_string()); }
                     }
                 }
             }
+        }
+
+        if let Some(error) = output_error {
+            self.stop_motion();
+            self.commanded_velocities.fill(0.0);
+            if self.measured_positions.iter().all(|q| q.is_finite()) {
+                self.commanded_positions = self.measured_positions.clone();
+                self.target_positions = self.measured_positions.clone();
+            }
+            if !self.safety.state().is_stopped() {
+                self.safety.trigger_fault(FaultReason::Other(format!("Control output failed: {error}")));
+            }
+            tracing::error!("Control output failed: {error}");
         }
 
         // If in simulation (no hardware driver attached), mirror commanded into measured
@@ -1319,11 +1522,13 @@ impl ArmSupervisor {
                 }
             }
         }
+        inner.apply_driver_limits(drv.as_ref());
         inner.driver = Some(std::sync::Mutex::new(drv));
     }
 
     pub fn with_driver(self, driver: Box<dyn ArmDriver>) -> Self {
         if let Ok(mut inner) = self.inner.try_write() {
+            inner.apply_driver_limits(driver.as_ref());
             inner.driver = Some(std::sync::Mutex::new(driver));
         }
         self
@@ -1379,7 +1584,7 @@ impl ArmSupervisor {
 
     pub async fn is_gravity_compensated(&self) -> bool {
         let inner = self.inner.read().await;
-        inner.gravity_compensated
+        inner.gravity_output_enabled()
     }
 
     pub async fn get_gravity_torques(&self) -> Vec<f32> {
@@ -1437,53 +1642,8 @@ impl ArmSupervisor {
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
     ) -> Result<u64, ArmError> {
-        if self.e_stop_latched.load(Ordering::SeqCst) {
-            return Err(ArmError::Safety(SafetyError::EStopActive));
-        }
         let mut inner = self.inner.write().await;
-
-        if inner.pending_normal_unload {
-            return Err(ArmError::Safety(SafetyError::NotArmed(inner.safety.state().clone())));
-        }
-        inner.pending_normal_unload = false;
-
-        // 1. Validate command against single controller authority, safety state, and soft limits
-        inner.safety.validate_motion_command(
-            epoch_id,
-            &target_positions,
-            &inner.config.limits,
-        )?;
-
-        // J7 Gripper stall release check on reverse command
-        if inner.config.dof >= 7 && inner.gripper_stalled && target_positions.len() >= 7 {
-            let delta = target_positions[6] - inner.commanded_positions[6];
-            let tau_7 = inner.torques.get(6).copied().unwrap_or(0.0);
-            if (delta * tau_7 < -1e-4) || (delta * inner.gripper_stall_sign < -1e-4) {
-                inner.gripper_stalled = false;
-                inner.gripper_high_torque_ticks = 0;
-                inner.gripper_low_torque_ticks = 0;
-            }
-        }
-
-        // 2. Plan quintic polynomial trajectory from commanded state to target
-        let traj = TrajectoryPlanner::plan(
-            &inner.commanded_positions,
-            &inner.commanded_velocities,
-            &target_positions,
-            &vec![0.0; inner.config.dof],
-            duration_secs,
-            &inner.config.limits,
-        )?;
-
-        // 3. Only renew lease AFTER command validation and planning succeed
-        inner.last_heartbeat = Instant::now();
-
-        inner.servo_target = None;
-        inner.target_positions = target_positions;
-        inner.active_trajectory = Some(traj);
-        inner.safety.mark_motion_started()?;
-
-        Ok(inner.safety.epoch_id())
+        inner.jog(target_positions, duration_secs, epoch_id)
     }
 
     pub async fn home(
@@ -1497,6 +1657,10 @@ impl ArmSupervisor {
         };
         self.jog(home_pos, duration_secs, epoch_id).await
     }
+
+    pub async fn stop_motion(&self) { self.inner.write().await.stop_motion(); }
+
+    pub async fn shutdown_ready(&self) -> bool { self.inner.read().await.shutdown_ready() }
 
     pub async fn is_at_safe_resting_pose(&self) -> bool {
         let inner = self.inner.read().await;
