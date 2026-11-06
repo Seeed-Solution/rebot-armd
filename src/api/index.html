@@ -3228,7 +3228,7 @@ const mjpegEl = $('video-mjpeg');
 const V = {
   gen: 0, mode: null, playing: false,
   ws: null, pc: null, retryTimer: null, retryDelay: 4000,
-  frames: 0, lastTotal: 0, fps: null, lat: null, stall: 0,
+  frames: 0, lastTotal: 0, lastTime: 0, fps: null, lat: null, stall: 0,
   jb: { delay: 0, count: 0 },
 };
 const MSE_CODECS = ['avc1.640029', 'avc1.64002A', 'avc1.640033', 'hvc1.1.6.L153.B0', 'mp4a.40.2', 'mp4a.40.5', 'flac', 'opus'];
@@ -3255,6 +3255,11 @@ function videoTeardown() {
   videoEl.srcObject = null;
   if (videoEl.getAttribute('src')) { videoEl.removeAttribute('src'); try { videoEl.load(); } catch (_) {} }
   V.lastTotal = 0;
+  V.lastTime = 0;
+  if (rvfcHandle != null && videoEl.cancelVideoFrameCallback) {
+    try { videoEl.cancelVideoFrameCallback(rvfcHandle); } catch (_) {}
+    rvfcHandle = null;
+  }
 }
 // One attempt = resolve on the first 'playing', reject on error/timeout.
 // `fail` is also used after success to report a dropped stream.
@@ -3296,7 +3301,15 @@ function setupWebRTC(fail, gen) {
   if (!window.RTCPeerConnection) throw new Error('WebRTC unsupported');
   const pc = new RTCPeerConnection({ bundlePolicy: 'max-bundle', iceServers: [] });
   V.pc = pc;
-  pc.addTransceiver('video', { direction: 'recvonly' });
+  const tc = pc.addTransceiver('video', { direction: 'recvonly' });
+  if (tc.setCodecPreferences && window.RTCRtpReceiver && RTCRtpReceiver.getCapabilities) {
+    const cap = RTCRtpReceiver.getCapabilities('video');
+    if (cap && cap.codecs) {
+      const h264 = cap.codecs.filter(c => c.mimeType && c.mimeType.toLowerCase() === 'video/h264');
+      const others = cap.codecs.filter(c => !c.mimeType || c.mimeType.toLowerCase() !== 'video/h264');
+      if (h264.length) tc.setCodecPreferences([...h264, ...others]);
+    }
+  }
   pc.ontrack = (ev) => {
     const ms = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
     if (videoEl.srcObject !== ms) { videoEl.srcObject = ms; playVideo(); }
@@ -3317,13 +3330,18 @@ function setupWebRTC(fail, gen) {
     else if (pc.iceConnectionState === 'disconnected') onDisc('disconnected');
   };
   (async () => {
-    await pc.setLocalDescription(await pc.createOffer());
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
     await waitIce(pc, 1000);
+    const sdp = pc.localDescription ? pc.localDescription.sdp : offer.sdp;
+    if (!sdp || !sdp.includes('a=ice-ufrag:')) {
+      throw new Error('WebRTC offer missing ice-ufrag');
+    }
     const ctl = new AbortController();
     const to = setTimeout(() => ctl.abort(), 4000);
     let res;
     try {
-      res = await fetch(whepURL(), { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp, signal: ctl.signal });
+      res = await fetch(whepURL(), { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: sdp, signal: ctl.signal });
     } finally { clearTimeout(to); }
     if (!res.ok) throw new Error('WHEP HTTP ' + res.status);
     const answer = await res.text();
@@ -3470,21 +3488,52 @@ function startMJPEG() {
 }
 $('vhint-retry').addEventListener('click', () => { V.retryDelay = 2000; if (CFG.video.mjpeg) { mjpegEl.src = CFG.video.mjpeg; } else videoStart(); });
 
-// frame counter
-const hasRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
-if (hasRVFC) { const cb = () => { V.frames++; videoEl.requestVideoFrameCallback(cb); }; videoEl.requestVideoFrameCallback(cb); }
+// frame counter & stall detector
+let rvfcHandle = null;
+function armRVFC() {
+  if (!('requestVideoFrameCallback' in HTMLVideoElement.prototype)) return;
+  if (rvfcHandle != null && videoEl.cancelVideoFrameCallback) {
+    try { videoEl.cancelVideoFrameCallback(rvfcHandle); } catch (_) {}
+    rvfcHandle = null;
+  }
+  const cb = () => {
+    V.frames++;
+    if (V.playing) {
+      rvfcHandle = videoEl.requestVideoFrameCallback(cb);
+    } else {
+      rvfcHandle = null;
+    }
+  };
+  rvfcHandle = videoEl.requestVideoFrameCallback(cb);
+}
+videoEl.addEventListener('playing', () => {
+  V.stall = 0;
+  V.lastTime = videoEl.currentTime;
+  armRVFC();
+});
+
 setInterval(async () => {
   if (!V.playing || V.mode === 'mjpeg') return;
   let n = 0;
-  if (hasRVFC) { n = V.frames; V.frames = 0; }
-  else if (videoEl.getVideoPlaybackQuality) {
-    const tot = videoEl.getVideoPlaybackQuality().totalVideoFrames;
-    n = Math.max(0, tot - V.lastTotal); V.lastTotal = tot;
+  if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+    n = V.frames;
+    V.frames = 0;
   }
+  if (videoEl.getVideoPlaybackQuality) {
+    const tot = videoEl.getVideoPlaybackQuality().totalVideoFrames;
+    if (typeof tot === 'number') {
+      const diff = Math.max(0, tot - V.lastTotal);
+      V.lastTotal = tot;
+      if (n === 0) n = diff;
+    }
+  }
+  const curTime = videoEl.currentTime;
+  const timeProgress = curTime > (V.lastTime || 0);
+  V.lastTime = curTime;
   V.fps = n;
   if (!document.hidden) {
-    V.stall = n === 0 ? V.stall + 1 : 0;
-    if (V.stall >= 6) { videoDropped(); return; }
+    V.stall = (n === 0 && !timeProgress) ? V.stall + 1 : 0;
+    if (V.stall >= 10) { videoDropped(); return; }
   }
   if (V.mode === 'webrtc' && V.pc) {
     try {
