@@ -1028,7 +1028,7 @@ impl SupervisorInner {
                 self.gripper_high_torque_ticks = 0;
                 self.gripper_low_torque_ticks = 0;
             } else if !self.gripper_stalled {
-                if tau_7.abs() >= 0.30 {
+                if tau_7.abs() >= 0.80 {
                     self.gripper_high_torque_ticks += 1;
                     if self.gripper_high_torque_ticks >= 6 {
                         self.gripper_stalled = true;
@@ -1048,8 +1048,8 @@ impl SupervisorInner {
                 }
             } else {
                 self.gripper_high_torque_ticks = 0;
-                // Exit condition B: |tau_7| < 0.15 for 6 consecutive ticks
-                if tau_7.abs() < 0.15 {
+                // Exit condition B: |tau_7| < 0.40 for 6 consecutive ticks
+                if tau_7.abs() < 0.40 {
                     self.gripper_low_torque_ticks += 1;
                     if self.gripper_low_torque_ticks >= 6 {
                         self.gripper_stalled = false;
