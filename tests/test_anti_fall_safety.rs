@@ -701,3 +701,38 @@ async fn test_gripper_stall_calibration_and_idle_immunity() {
     }
     assert!(!supervisor.is_gripper_stalled().await, "Relaxed torque < 0.40 Nm must clear stall");
 }
+
+#[tokio::test]
+async fn test_gripper_free_travel_friction_is_not_a_stall() {
+    // Hardware 2026-11-06: free travel reached |tau| 0.80 Nm at -0.36 rad/s mid-stroke.
+    // High torque while the jaw is still moving must not freeze the gripper.
+    let supervisor = ArmSupervisor::new(ArmConfig::rebot_dm());
+    supervisor.set_torque(true).await.unwrap();
+    supervisor.set_torques(vec![0.1, -0.1, -3.8, -1.7, -0.2, 0.1, -0.85]).await;
+    for _ in 0..10 {
+        supervisor.inner().write().await.measured_velocities[6] = -0.36;
+        supervisor.tick(0.02).await;
+    }
+    assert!(!supervisor.is_gripper_stalled().await, "moving gripper must not latch a stall");
+}
+
+#[tokio::test]
+async fn test_gripper_far_target_is_rate_limited_not_dropped() {
+    // The gripper needs a far POS_VEL target to reach speed; the jump guard must not drop
+    // the frame, while arm joints keep the 0.35 rad guard.
+    let supervisor = ArmSupervisor::new(ArmConfig::rebot_dm());
+    supervisor.set_torque(true).await.unwrap();
+    let epoch = supervisor.inner().read().await.safety.epoch_id();
+    let mut target = vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0];
+    target[6] = -0.8;
+    supervisor.servo(target.clone(), epoch).await.unwrap();
+    let obs = supervisor.tick(0.02).await;
+    assert!(obs.positions[6] < 0.0, "gripper must start moving toward a far target");
+    assert!(obs.positions[6] > -0.01, "gripper step must stay acceleration bounded");
+
+    target[6] = obs.positions[6];
+    target[0] = 0.40;
+    supervisor.servo(target, epoch).await.unwrap();
+    let obs = supervisor.tick(0.02).await;
+    assert_eq!(obs.positions[0], 0.0, "arm joint jump > 0.35 rad must still be dropped");
+}

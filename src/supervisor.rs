@@ -1179,7 +1179,10 @@ impl SupervisorInner {
                 self.gripper_high_torque_ticks = 0;
                 self.gripper_low_torque_ticks = 0;
             } else if !self.gripper_stalled {
-                if tau_7.abs() >= 0.80 {
+                // A stall is high torque with the jaw not moving. Torque alone also rises
+                // from friction during free travel over the 5.9 rad stroke.
+                let v_7 = self.measured_velocities.get(6).copied().unwrap_or(0.0);
+                if tau_7.abs() >= 0.80 && v_7.abs() < 0.10 {
                     self.gripper_high_torque_ticks += 1;
                     if self.gripper_high_torque_ticks >= 6 {
                         self.gripper_stalled = true;
@@ -1342,8 +1345,13 @@ impl SupervisorInner {
         if self.driver.is_some() && self.is_torqued && self.safety.state().is_operational()
             && self.hardware_feedback_fresh(Duration::from_millis(100)) {
             let threshold = self.config.following_error.max_error_rad;
-            let outside = self.commanded_positions.iter().zip(&self.measured_positions)
-                .any(|(q, measured)| !measured.is_finite() || (q - measured).abs() > threshold);
+            // The 7-DOF gripper is excluded: Damiao POS_VEL trails its command by about
+            // v / 2.2 rad (0.9 rad at 2 rad/s), and gripping an object leaves a lasting
+            // error by design. Its own stall detection covers it.
+            let gripper_idx = (self.config.dof >= 7).then_some(6);
+            let outside = self.commanded_positions.iter().zip(&self.measured_positions).enumerate()
+                .any(|(i, (q, measured))| Some(i) != gripper_idx
+                    && (!measured.is_finite() || (q - measured).abs() > threshold));
             if outside {
                 let since = self.following_error_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= Duration::from_millis(self.config.following_error.persistence_ms) {
@@ -1412,8 +1420,14 @@ impl SupervisorInner {
                 self.servo_settled_ticks.fill(0);
             } else {
                 // Check if any target joint has instantaneous jump > 0.35 rad relative to commanded_positions
+                // The 7-DOF gripper is exempt: its far targets are expected (POS_VEL needs a
+                // lead to reach speed) and the per-joint servo step below still bounds its
+                // velocity and acceleration.
+                let gripper_idx = (self.config.dof >= 7).then_some(6);
                 let has_dirty_jump = target.iter().enumerate().any(|(i, &tgt)| {
-                    if i < self.commanded_positions.len() {
+                    if Some(i) == gripper_idx {
+                        false
+                    } else if i < self.commanded_positions.len() {
                         let jump = (tgt - self.commanded_positions[i]).abs();
                         jump > 0.35
                     } else {

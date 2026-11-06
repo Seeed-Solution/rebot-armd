@@ -1327,11 +1327,11 @@ const CFG = {
   staleMs: 2000,              // telemetry older than this locks the controls (tolerance for Wi-Fi AP jitter)
   deadzone: 0.08,
   maxLead: 0.20,              // rad, servo target may lead measured position by at most this (safe margin under backend 0.35rad threshold)
-  gripLead: 0.6,              // rad, same for the gripper
-  gripRate: 1.6,              // gripper stroke fraction per second at 100 % speed
+  gripLead: 0.8,              // rad, gripper target lead; Damiao POS_VEL speed ~2.2/s x lead, so 0.8 rad ~ full 1.8 rad/s
+  gripRate: 0.35,             // gripper stroke fraction per second at 100 % speed (≈2 rad/s motor limit over 5.7 rad)
   limitMargin: 0.02,          // rad, keep targets inside soft limits
   gripClosed: 0.0,            // J6 rad at 0 % open
-  gripOpen: 0.15,             // J6 rad at 100 % open; hard cap, never command beyond 0.15 rad
+  gripOpen: -5.7,             // J7 rad at 100 % open (measured mechanical stop -5.87; open is negative)
   speeds: [0.3, 0.6, 1.0],    // fraction of joint max velocity
   // UI direction (+1 = right-hand button / stick right or up) -> joint rad sign.
   // Matches the side-view pose preview. If a joint moves opposite to its label on the real arm,
@@ -1643,6 +1643,12 @@ const isOperational = () => S.state === 'Armed' || S.state === 'Moving';
 const isStopped = () => S.state === 'EStop' || S.state === 'Fault';
 const gripFrac = (rad) => clamp((rad - CFG.gripClosed) / (CFG.gripOpen - CFG.gripClosed), 0, 1);
 const gripRad = () => CFG.gripClosed + (S.grip ?? 0) * (CFG.gripOpen - CFG.gripClosed);
+// While rate-jogging, keep the commanded opening within gripLead of the real jaw so
+// releasing stops promptly and a reversal acts at once (no wound-up target).
+const gripNoWindup = (frac, measuredRad) => {
+  const lead = CFG.gripLead / Math.abs(CFG.gripOpen - CFG.gripClosed), m = gripFrac(measuredRad);
+  return clamp(frac, m - lead, m + lead);
+};
 
 /* =================================================================
    Telemetry WebSocket (50 Hz) + heartbeat
@@ -2514,7 +2520,7 @@ function clampTarget(t) {
     let val = (i < t.length && Number.isFinite(t[i])) ? t[i] : (curPos[i] || 0);
     const L = S.limits[i];
     if (L) val = clamp(val, L.min_position + CFG.limitMargin, L.max_position - CFG.limitMargin);
-    if (i === GRIP) val = clamp(val, CFG.gripClosed, CFG.gripOpen);
+    if (i === GRIP) val = clamp(val, Math.min(CFG.gripClosed, CFG.gripOpen), Math.max(CFG.gripClosed, CFG.gripOpen));
     res[i] = val;
   }
   return res;
@@ -2539,7 +2545,7 @@ setInterval(() => {
   if (pos.length > GRIP && v[GRIP] !== 0) {
     // + = close (fraction toward 0), - = open
     const cur = S.grip ?? gripFrac(pos[GRIP]);
-    S.grip = clamp(cur - v[GRIP] * CFG.gripRate * scale * dt, 0, 1);
+    S.grip = gripNoWindup(clamp(cur - v[GRIP] * CFG.gripRate * scale * dt, 0, 1), pos[GRIP]);
     S.gripCmdAt = Date.now();
   }
   let t = S.servoTarget.map((x, i) => {
@@ -2695,7 +2701,8 @@ function cartTick() {
   const v = cartVelocity();
   const gv = cartGripVel();
   const gripErr = pos.length > GRIP ? Math.abs(gripRad() - pos[GRIP]) : 0;
-  const gripStalled = Date.now() - S.gripCmdAt > 1200;
+  // stopped = no new command for 1.2 s AND the jaw is no longer moving (a full stroke takes ~4 s)
+  const gripStalled = Date.now() - S.gripCmdAt > 1200 && Math.abs(S.obs.velocities?.[GRIP] ?? 0) < 0.05;
   const gripMoving = (gripErr > 0.015 && !gripStalled) || gv !== 0;
   const input = v.x || v.y || v.z || v.p || v.r || gripMoving;
   if (input) cartKick();
@@ -2768,7 +2775,7 @@ function cartTick() {
   // gripper (keys Z / X; rate jog or slider writes S.grip)
   if (pos.length > GRIP && gv) {
     const cur = S.grip ?? gripFrac(pos[GRIP]);
-    S.grip = clamp(cur + gv * CFG.gripRate * scale * dt, 0, 1);
+    S.grip = gripNoWindup(clamp(cur + gv * CFG.gripRate * scale * dt, 0, 1), pos[GRIP]);
     S.gripCmdAt = Date.now();
   }
 

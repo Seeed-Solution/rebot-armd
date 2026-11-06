@@ -242,6 +242,41 @@ async fn jerk_enabled_servo_settles_after_small_target() {
     assert!(obs.velocities[0].abs() < 1e-4, "velocity {}", obs.velocities[0]);
 }
 
+async fn setup7() -> (ArmSupervisor, Arc<Mutex<Hardware>>) {
+    let mut config = ArmConfig::default();
+    config.dof = 7;
+    config.home_positions = vec![0.0; 7];
+    config.limits = (0..7).map(|i| JointLimit::new(format!("j{i}"), -6.0, 6.0, 2.0, 5.0)).collect();
+    config.resting_pose = None;
+    let hardware = Arc::new(Mutex::new(Hardware { states: vec![JointState::default(); 7], age: Some(Duration::ZERO),
+        enabled: EnableState::Disabled, disable_fails: false, confirm_disable: true, write_fails: false,
+        disable_calls: 0, written: vec![] }));
+    let supervisor = ArmSupervisor::new(config).with_driver(Box::new(Driver {
+        hardware: hardware.clone(), capabilities: full_caps(), max_velocity: None,
+    }));
+    supervisor.set_lease_enabled(false).await;
+    supervisor.set_torque(true).await.unwrap();
+    (supervisor, hardware)
+}
+
+#[tokio::test]
+async fn gripper_trailing_its_command_does_not_latch_tracking_fault() {
+    // Park closes the gripper at up to 2 rad/s; Damiao POS_VEL trails by ~0.9 rad.
+    let (supervisor, _h) = setup7().await;
+    supervisor.inner().write().await.commanded_positions[6] = -0.9;
+    supervisor.tick(0.02).await;
+    supervisor.inner().write().await.following_error_since = Some(Instant::now() - Duration::from_millis(501));
+    let obs = supervisor.tick(0.02).await;
+    assert!(!obs.safety_state.is_stopped(), "gripper lag must not fault the arm: {:?}", obs.safety_state);
+
+    // An arm joint with the same error still latches.
+    supervisor.inner().write().await.commanded_positions[0] = 0.9;
+    supervisor.tick(0.02).await;
+    supervisor.inner().write().await.following_error_since = Some(Instant::now() - Duration::from_millis(501));
+    let obs = supervisor.tick(0.02).await;
+    assert!(obs.safety_state.is_stopped());
+}
+
 #[tokio::test]
 async fn short_feedback_gap_holds_but_long_gap_latches_bus_loss() {
     // ~260 ms CAN gaps were observed on the rig during 24 V sags; motors keep

@@ -211,7 +211,8 @@ impl ArmConfig {
             JointLimit::new("joint_4", -3.14159, 3.14159, 3.0, 8.0),
             JointLimit::new("joint_5", -2.0944, 2.0944, 3.0, 8.0),
             JointLimit::new("joint_6", -6.28318, 6.28318, 4.0, 10.0),
-            JointLimit::new("gripper", -0.05, 0.16, 2.0, 5.0),
+            // Measured on hardware 2026-11-06: closed +0.03 rad, mechanical full open -5.87 rad.
+            JointLimit::new("gripper", -5.75, 0.10, 2.0, 5.0),
         ];
 
         let home_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0];
