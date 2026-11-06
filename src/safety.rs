@@ -132,6 +132,9 @@ impl SafetyManager {
 
     /// Advance epoch and latch E-Stop immediately
     pub fn trigger_e_stop(&mut self) -> u64 {
+        if self.state != SafetyState::EStop {
+            tracing::warn!("Safety: {:?} -> EStop", self.state);
+        }
         self.state = SafetyState::EStop;
         self.epoch_id = self.epoch_id.wrapping_add(1);
         self.epoch_id
@@ -139,6 +142,7 @@ impl SafetyManager {
 
     /// Advance epoch and latch Fault immediately
     pub fn trigger_fault(&mut self, reason: FaultReason) -> u64 {
+        tracing::warn!("Safety: {:?} -> Fault({:?})", self.state, reason);
         self.state = SafetyState::Fault(reason);
         self.epoch_id = self.epoch_id.wrapping_add(1);
         self.epoch_id
@@ -149,6 +153,7 @@ impl SafetyManager {
     pub fn clear_fault(&mut self) -> Result<SafetyState, SafetyError> {
         match &self.state {
             SafetyState::EStop | SafetyState::Fault(_) => {
+                tracing::info!("Safety: {:?} cleared -> Idle", self.state);
                 self.state = SafetyState::Idle;
                 self.epoch_id = self.epoch_id.wrapping_add(1);
                 Ok(self.state.clone())
