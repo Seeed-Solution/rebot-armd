@@ -564,6 +564,20 @@ kbd { display: inline-block; min-width: 20px; padding: 1px 5px; margin-right: 2p
 .toast.err { border-color: #ffccc7; }
 .toast.err::before { background: #ff4d4f; }
 .toast code { font: 11px var(--mono); color: var(--sc-color-text-tertiary); }
+.toast.warn { border-color: #ffd591; }
+.toast.warn::before { background: #faad14; }
+
+/* ---------- lease preemption ---------- */
+.btn.btn-preempt { width: 100%; justify-content: center; margin-top: 8px; color: var(--sc-status-warning-fg); border-color: #ffd591; background: var(--sc-status-warning-bg); font-weight: 600; }
+.btn.btn-preempt:hover { color: var(--sc-status-warning-fg); border-color: #faad14; }
+.btn-preempt[hidden], .preempt-modal[hidden], .preempt-cooldown[hidden] { display: none; }
+.preempt-modal { position: fixed; inset: 0; z-index: 1050; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(15, 23, 42, 0.38); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); animation: tin .15s ease; }
+.preempt-dialog { width: min(420px, 100%); padding: 20px 20px 16px; border-radius: 16px; background: #fff; border: 1px solid var(--sc-color-border-neutral); box-shadow: 0 20px 48px rgba(0, 0, 0, 0.18); }
+.preempt-dialog h3 { margin: 0 0 10px; font-size: 17px; font-weight: 600; color: var(--sc-color-text); }
+.preempt-dialog p { margin: 0 0 12px; font-size: 14px; line-height: 1.6; color: var(--sc-color-text-secondary); }
+.preempt-cooldown { padding: 8px 10px; border-radius: var(--sc-radius-md); font-size: 13px !important; color: var(--sc-status-warning-fg) !important; background: var(--sc-status-warning-bg); }
+.preempt-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px; }
+.preempt-actions .btn { min-width: 96px; justify-content: center; }
 @keyframes tin { from { opacity: 0; transform: translateY(-6px); } }
 
 /* ---------- responsive: tablet / phone portrait (stacked, scrolling) ---------- */
@@ -1161,6 +1175,10 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
           <span id="lock-txt">遥测断开，控制已锁定</span>
         </div>
+        <button class="btn btn-preempt" id="btn-preempt" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h11l-3-3"/><path d="M17 17H6l3 3"/></svg>
+          <span>接管控制权</span>
+        </button>
       </div>
 
       <!-- simple: one integrated cockpit (safety block is moved in here by setUi) -->
@@ -1283,6 +1301,17 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
   </main>
 </div>
 <div class="toasts" id="toasts"></div>
+<div class="preempt-modal" id="preempt-modal" hidden>
+  <div class="preempt-dialog" role="dialog" aria-modal="true" aria-labelledby="preempt-title">
+    <h3 id="preempt-title">接管控制权确认</h3>
+    <p>当前有其他设备或窗口持有控制权。确认接管机械臂控制权？接管后原控制窗口将切换为观察模式，正在进行的运动将被平稳悬停保持。</p>
+    <p class="preempt-cooldown" id="preempt-cooldown" hidden></p>
+    <div class="preempt-actions">
+      <button class="btn" id="preempt-cancel">取消</button>
+      <button class="btn btn-primary" id="preempt-confirm">确认接管</button>
+    </div>
+  </div>
+</div>
 
 <script>
 'use strict';
@@ -1294,7 +1323,7 @@ const CFG = {
   servoPeriodMs: 50,          // 20 Hz servo streaming while a button / stick / key is held
   heartbeatMs: 150,           // WS heartbeat, lease timeout on armd is 2500 ms
   leaseRetryMs: 500,          // retry acquire_lease after lease_rejected / lease_lost
-  leaseAckTimeoutMs: 2000,    // no lease_granted/rejected within this window -> clear pending and retry
+  leaseAckTimeoutMs: 3000,    // no lease_granted/rejected for the current seq within this window -> onAcquireTimeout
   staleMs: 2000,              // telemetry older than this locks the controls (tolerance for Wi-Fi AP jitter)
   deadzone: 0.08,
   maxLead: 0.20,              // rad, servo target may lead measured position by at most this (safe margin under backend 0.35rad threshold)
@@ -1478,8 +1507,8 @@ const S = {
   gripCmdAt: 0,
   servoTarget: null, servoLastAt: 0, servoInflight: false,
   leaseGeneration: null,      // WS motion lease generation granted by armd (null = not held)
-  acquirePending: false,      // an acquire_lease request is in flight
-  leaseTimer: null,           // single pending lease retry / ack-timeout timer
+  leaseRetryTimer: null,      // single pending non-force acquire_lease retry timer
+  preemptCooldownUntil: 0,    // Date.now() until which the preempt confirm button stays disabled
   sequenceId: 0,              // per-connection monotonic servo frame id
   rec: { active: false, startedAt: 0 },
   detections: [],
@@ -1512,7 +1541,7 @@ function toast(msg, kind = '', code = '') {
   el.textContent = msg;
   if (code) { const c = document.createElement('code'); c.textContent = code; el.appendChild(c); }
   $('toasts').appendChild(el);
-  setTimeout(() => el.remove(), kind === 'err' ? 4200 : 2600);
+  setTimeout(() => el.remove(), kind === 'err' || kind === 'warn' ? 4200 : 2600);
   while ($('toasts').children.length > 3) $('toasts').firstChild.remove();
 }
 function buzz(ms) { if (navigator.vibrate) try { navigator.vibrate(ms); } catch (_) {} }
@@ -1531,9 +1560,14 @@ function syncEpoch(epoch) {
   S.epoch = epoch;
 }
 function rpcError(response) {
-  const message = response.code === 'UNSUPPORTED'
-    ? '当前机械臂缺少自动收纳所需配置或反馈能力，未启动收纳；可使用回零功能，力矩仍需现场确认'
-    : response.message || response.error || '指令被拒绝';
+  let message;
+  if (response.code === 'HANDOVER_SETTLING') {
+    message = '机械臂正在交接停稳中，请稍候片刻再操作';
+  } else if (response.code === 'UNSUPPORTED') {
+    message = '当前机械臂缺少自动收纳所需配置或反馈能力，未启动收纳；可使用回零功能，力矩仍需现场确认';
+  } else {
+    message = response.message || response.error || '指令被拒绝';
+  }
   return Object.assign(new Error(message), { code: response.code, status: response.status });
 }
 function commandRPC(path, body) {
@@ -1617,9 +1651,10 @@ function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${proto}//${location.host}/api/v1/ws`);
   S.ws = ws;
+  clearActiveAcquire();
   resetLease();
   S.sequenceId = 0;
-  ws.onopen = () => acquireLease(ws);
+  ws.onopen = () => startAcquire(ws, false);
   ws.onmessage = (ev) => {
     let o; try { o = JSON.parse(ev.data); } catch (_) { return; }
     if (S.ws !== ws) return;
@@ -1632,18 +1667,15 @@ function connectWS() {
       syncEpoch(o.epoch_id);
       return;
     }
-    if (o.type === 'lease_granted') {
-      if (S.ws === ws) {
-        resetLease();
-        if (typeof o.generation === 'number') S.leaseGeneration = o.generation;
-        else scheduleLeaseRetry(ws, CFG.leaseRetryMs);
-      }
+    if (o.type === 'lease_granted' || o.type === 'lease_rejected') {
+      onAcquireResponse(ws, o);
       return;
     }
-    if (o.type === 'lease_rejected' || o.type === 'lease_lost') {
-      // Observers may retry acquisition, but cannot preempt the current owner.
-      if (S.ws === ws) {
+    if (o.type === 'lease_lost') {
+      // Only a loss of the generation this page holds demotes it; a stale notice for an older generation is ignored.
+      if (o.generation != null ? o.generation === S.leaseGeneration : S.leaseGeneration != null) {
         resetLease();
+        toast('⚠️ 控制权已被其他设备接管，当前页面已切换为观察模式', 'warn');
         scheduleLeaseRetry(ws, CFG.leaseRetryMs);
       }
       return;
@@ -1658,7 +1690,10 @@ function connectWS() {
     }
     if (o.type === 'servo_reject') {
       syncEpoch(o.epoch_id);
-      toastOnce({ message: '控制指令被拒绝: ' + (o.message || o.error || '状态或限位不符'), code: 'SERVO_REJECT' });
+      const msg = o.code === 'HANDOVER_SETTLING'
+        ? '机械臂正在交接停稳中，请稍候...'
+        : '控制指令被拒绝: ' + (o.message || o.error || '状态或限位不符');
+      toastOnce({ message: msg, code: o.code || 'SERVO_REJECT' });
       return;
     }
     if (o.type === 'preset_ack') {
@@ -1670,7 +1705,10 @@ function connectWS() {
       syncEpoch(o.epoch_id);
       S.presetRunning = false;
       S.preset = null;
-      toast(o.code === 'UNSUPPORTED' ? '当前机械臂不支持自动收纳，未启动运动；可使用回零功能，力矩仍需现场确认' : '预设指令被拒绝: ' + (o.message || o.error || o.reason || '状态或限位不符'), 'err');
+      const msg = o.code === 'HANDOVER_SETTLING'
+        ? '机械臂正在交接停稳中，请稍候再试'
+        : (o.code === 'UNSUPPORTED' ? '当前机械臂不支持自动收纳，未启动运动；可使用回零功能，力矩仍需现场确认' : '预设指令被拒绝: ' + (o.message || o.error || o.reason || '状态或限位不符'));
+      toast(msg, 'err');
       return;
     }
     if (!Array.isArray(o.positions)) return;
@@ -1704,16 +1742,7 @@ function connectWS() {
       S.grip = gripFrac(o.positions[GRIP]);
     }
   };
-  ws.onclose = () => {
-    if (S.ws === ws) {
-      S.ws = null;
-      S.detections = [];
-      S.detLastReceivedAt = 0;
-      clearOverlayCanvas();
-      resetLease();
-      setTimeout(connectWS, 1500);
-    }
-  };
+  ws.onclose = () => onSocketClose(ws);
   ws.onerror = () => {
     S.detections = [];
     S.detLastReceivedAt = 0;
@@ -1721,7 +1750,19 @@ function connectWS() {
     try { ws.close(); } catch (_) {}
   };
 }
-// Lease state: not held + no request in flight + no pending timer.
+// A stale socket's late close must never reset the lease or close the modal of the current socket.
+function onSocketClose(ws) {
+  if (S.ws !== ws) return;
+  S.ws = null;
+  S.detections = [];
+  S.detLastReceivedAt = 0;
+  clearOverlayCanvas();
+  if (activeAcquire && activeAcquire.ws === ws) clearActiveAcquire();
+  closePreemptModal();
+  resetLease();
+  setTimeout(connectWS, 1500);
+}
+// Lease state: not held + no pending retry timer. An in-flight acquire is owned by activeAcquire.
 function resetLease() {
   rejectPendingCommands('控制连接已断开或控制权已变化');
   S.streamActive = false;
@@ -1731,26 +1772,122 @@ function resetLease() {
   resetPoseMode();
   C.tailUntil = 0; C.lastInput = -Infinity;
   S.gripCmdAt = 0;
-  S.acquirePending = false;
-  clearTimeout(S.leaseTimer);
-  S.leaseTimer = null;
+  clearTimeout(S.leaseRetryTimer);
+  S.leaseRetryTimer = null;
 }
-function scheduleLeaseRetry(ws, ms) {
-  clearTimeout(S.leaseTimer);
-  S.leaseTimer = setTimeout(() => { S.leaseTimer = null; acquireLease(ws); }, ms);
+
+/* ---------- acquire_lease lifecycle: one request in flight, matched by (ws, seq) ---------- */
+let acquireSeq = 0;
+let activeAcquire = null; // { ws, seq, force, timer }
+function clearActiveAcquire() {
+  if (activeAcquire && activeAcquire.timer) clearTimeout(activeAcquire.timer);
+  activeAcquire = null;
 }
-// Only called from ws.onopen and the retry timer; at most one acquire_lease in flight.
-function acquireLease(ws) {
-  if (S.ws !== ws || ws.readyState !== 1 || S.leaseGeneration != null || S.acquirePending) return;
-  S.acquirePending = true;
-  ws.send(JSON.stringify({ type: 'acquire_lease', client_id: CLIENT_ID }));
-  // Reply can be lost (armd drops outgoing frames when its queue is full): clear pending and retry
-  clearTimeout(S.leaseTimer);
-  S.leaseTimer = setTimeout(() => {
-    S.leaseTimer = null;
-    if (S.ws === ws && S.acquirePending) { S.acquirePending = false; acquireLease(ws); }
-  }, CFG.leaseAckTimeoutMs);
+// The only sender of acquire_lease. force=true only from the preempt confirm button.
+function startAcquire(ws, force = false) {
+  if (!ws || ws.readyState !== 1 || S.ws !== ws) return;
+  if (activeAcquire && activeAcquire.timer) clearTimeout(activeAcquire.timer);
+  if (S.leaseRetryTimer) {
+    clearTimeout(S.leaseRetryTimer);
+    S.leaseRetryTimer = null;
+  }
+  const seq = ++acquireSeq;
+  const req = { ws, seq, force, timer: null };
+  req.timer = setTimeout(() => onAcquireTimeout(req), CFG.leaseAckTimeoutMs);
+  activeAcquire = req;
+  ws.send(JSON.stringify({ type: 'acquire_lease', seq, client_id: CLIENT_ID, force }));
+  renderPreemptModal();
 }
+function onAcquireResponse(ws, msg) {
+  if (!activeAcquire || activeAcquire.ws !== ws || S.ws !== ws || activeAcquire.seq !== msg.seq) return;
+  const req = activeAcquire;
+  clearTimeout(activeAcquire.timer);
+  activeAcquire = null;
+  if (msg.type === 'lease_granted') {
+    if (typeof msg.generation !== 'number') { scheduleLeaseRetry(ws, CFG.leaseRetryMs); renderPreemptModal(); return; }
+    const wasHeld = S.leaseGeneration != null;
+    S.leaseGeneration = msg.generation;
+    closePreemptModal();
+    if (req.force || !wasHeld) toast('已成功接管控制权', 'ok');
+    return;
+  }
+  // lease_rejected
+  if (msg.error === 'preemption_cooldown') {
+    // Never auto-resend force: the operator confirms again after the countdown.
+    const remaining = Math.max(0, Number(msg.remaining_ms) || 0);
+    S.preemptCooldownUntil = Date.now() + remaining;
+    openPreemptModal();
+    scheduleLeaseRetry(ws, CFG.leaseRetryMs);
+    return;
+  }
+  if (msg.error === 'controller_busy') {
+    if (req.force) { closePreemptModal(); toast('接管未成功，控制权仍由其他设备持有', 'err'); }
+    scheduleLeaseRetry(ws, CFG.leaseRetryMs);
+    renderPreemptModal();
+    return;
+  }
+  if (req.force) { closePreemptModal(); toast('接管请求被拒绝: ' + (msg.message || msg.error || '未知原因'), 'err'); }
+  scheduleLeaseRetry(ws, CFG.leaseRetryMs);
+  renderPreemptModal();
+}
+function onAcquireTimeout(req) {
+  if (activeAcquire !== req || S.ws !== req.ws) return;
+  activeAcquire = null;
+  if (!req.force) {
+    scheduleLeaseRetry(req.ws, CFG.leaseRetryMs);
+    return;
+  }
+  // Forced acquire timed out: the server may or may not have granted it. Reconcile with a plain
+  // acquire (idempotent lease_granted if we own it, controller_busy otherwise); never retry force.
+  closePreemptModal();
+  toast('接管响应超时，正在对账控制权...', 'warn');
+  startAcquire(req.ws, false);
+}
+function scheduleLeaseRetry(ws, delay) {
+  if (S.ws !== ws || activeAcquire != null) return;
+  clearTimeout(S.leaseRetryTimer);
+  S.leaseRetryTimer = setTimeout(() => {
+    S.leaseRetryTimer = null;
+    if (S.ws !== ws || ws.readyState !== 1 || activeAcquire != null) return;
+    startAcquire(ws, false);
+  }, delay);
+}
+
+/* ---------- preempt confirmation modal ---------- */
+let preemptTick = null;
+function openPreemptModal() {
+  $('preempt-modal').hidden = false;
+  renderPreemptModal();
+  if (!preemptTick) preemptTick = setInterval(renderPreemptModal, 200);
+}
+function closePreemptModal() {
+  $('preempt-modal').hidden = true;
+  clearInterval(preemptTick);
+  preemptTick = null;
+}
+function renderPreemptModal() {
+  if ($('preempt-modal').hidden) return;
+  const left = S.preemptCooldownUntil - Date.now();
+  const forcing = !!(activeAcquire && activeAcquire.force);
+  const btn = $('preempt-confirm');
+  const note = $('preempt-cooldown');
+  btn.disabled = left > 0 || forcing;
+  setText(btn, forcing ? '接管中…' : '确认接管');
+  note.hidden = left <= 0;
+  if (left > 0) setText(note, `刚刚发生过控制权交接，请 ${Math.ceil(left / 1000)} 秒后再试`);
+}
+$('btn-preempt').addEventListener('click', () => {
+  if (S.leaseGeneration != null) return;
+  openPreemptModal();
+});
+$('preempt-cancel').addEventListener('click', closePreemptModal);
+$('preempt-modal').addEventListener('click', (e) => { if (e.target === e.currentTarget) closePreemptModal(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('preempt-modal').hidden) closePreemptModal(); });
+$('preempt-confirm').addEventListener('click', () => {
+  if (S.preemptCooldownUntil > Date.now() || (activeAcquire && activeAcquire.force)) return;
+  if (!S.ws || S.ws.readyState !== 1) { toast('控制连接未就绪，请稍后再试', 'err'); return; }
+  startAcquire(S.ws, true);
+});
 setInterval(() => {
   // Lease renewal. Stops when the tab is hidden so armd's watchdog can take over.
   if (S.ws && S.ws.readyState === 1 && S.epoch != null && S.leaseGeneration != null && !document.hidden) {
@@ -3867,6 +4004,7 @@ function frame(ts) {
   setText($('enable-txt'), stopped ? (S.state === 'EStop' ? '⚠️ 点击复位急停' : '⚠️ 点击清除故障') : op ? (enableUnknown ? '控制已开启 · 未确认' : '已使能') : '使能');
   setText($('enable-sub'), stopped ? '复位后再长按使能' : op ? '按住 0.6 秒失能' : '按住 0.6 秒使能');
   eb.disabled = !live || S.leaseGeneration == null;
+  $('btn-preempt').hidden = !live || !(S.ws && S.ws.readyState === 1) || S.leaseGeneration != null;
 
   // jog rows
   rows.forEach((r, i) => {
