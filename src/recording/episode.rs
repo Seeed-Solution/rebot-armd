@@ -115,6 +115,15 @@ impl EpisodeRecorder {
 
     /// Commit the recording and save to Parquet file
     pub fn save(&mut self) -> Result<PathBuf, RecordingError> {
+        let (path, frames) = self.begin_save()?;
+        let result = write_frames_to_parquet(&path, &frames);
+        self.finish_save(frames, result)
+    }
+
+    /// First half of a save: move to `Finalizing` and hand out the buffered
+    /// frames, so the caller can write them without holding the recorder (or any
+    /// lock around it). Must be followed by [`finish_save`](Self::finish_save).
+    pub fn begin_save(&mut self) -> Result<(PathBuf, Vec<RecordFrame>), RecordingError> {
         if self.state != EpisodeState::Recording {
             return Err(RecordingError::InvalidState {
                 action: "save".to_string(),
@@ -127,15 +136,22 @@ impl EpisodeRecorder {
         }
 
         self.state = EpisodeState::Finalizing;
+        Ok((self.output_path.clone(), std::mem::take(&mut self.frames)))
+    }
 
-        // Write to parquet
-        match write_frames_to_parquet(&self.output_path, &self.frames) {
+    /// Second half of a save: put the frames back and record the write outcome.
+    pub fn finish_save(
+        &mut self,
+        frames: Vec<RecordFrame>,
+        result: Result<(), ParquetRecordingError>,
+    ) -> Result<PathBuf, RecordingError> {
+        self.frames = frames;
+        match result {
             Ok(()) => {
                 self.state = EpisodeState::Committed;
                 Ok(self.output_path.clone())
             }
             Err(e) => {
-                // Return to recording or discarded on failure
                 self.state = EpisodeState::Discarded;
                 Err(RecordingError::Parquet(e))
             }

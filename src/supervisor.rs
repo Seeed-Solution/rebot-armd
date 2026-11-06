@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,7 +7,10 @@ use thiserror::Error;
 
 use crate::driver::{ArmDriver, JointTarget, EnableState, DriverCapabilities};
 use crate::model::{ArmConfig, ArmObservation, ObservationSchema, RestingPosePolicy};
-use crate::recording::{EpisodeRecorder, EpisodeState, RecordFrame, RecordingError};
+use crate::recording::{
+    write_frames_to_parquet, EpisodeRecorder, EpisodeState, ParquetRecordingError, RecordFrame,
+    RecordingError,
+};
 use crate::safety::{FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
 use crate::trajectory::{MultiJointQuinticTrajectory, TrajectoryError, TrajectoryPlanner};
 
@@ -1898,9 +1901,30 @@ impl ArmSupervisor {
     }
 
     pub async fn save_recording(&self) -> Result<PathBuf, ArmError> {
-        let mut inner = self.inner.write().await;
-        let path = inner.recorder.save()?;
-        Ok(path)
+        self.save_recording_with(write_frames_to_parquet).await
+    }
+
+    /// Save with a caller-supplied writer. The lock is held only to move the
+    /// frames out and to record the outcome; the write itself runs on a blocking
+    /// thread so a slow disk cannot stall the control tick, which needs the same lock.
+    #[doc(hidden)]
+    pub async fn save_recording_with<W>(&self, write: W) -> Result<PathBuf, ArmError>
+    where
+        W: FnOnce(&Path, &[RecordFrame]) -> Result<(), ParquetRecordingError> + Send + 'static,
+    {
+        let (path, frames) = self.inner.write().await.recorder.begin_save()?;
+        let (frames, result) = tokio::task::spawn_blocking(move || {
+            let result = write(&path, &frames);
+            (frames, result)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            // Frames are lost with the panicked task; leave Finalizing so a new
+            // recording can start.
+            let err = std::io::Error::other(format!("recording writer panicked: {e}"));
+            (Vec::new(), Err(ParquetRecordingError::Io(err)))
+        });
+        Ok(self.inner.write().await.recorder.finish_save(frames, result)?)
     }
 
     pub async fn discard_recording(&self) -> Result<(), ArmError> {

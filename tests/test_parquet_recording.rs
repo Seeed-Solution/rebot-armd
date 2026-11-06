@@ -113,3 +113,95 @@ fn test_episode_recorder_discard() {
     assert_eq!(recorder.frame_count(), 0);
     assert!(!file_path.exists());
 }
+
+// ---------------------------------------------------------------------------
+// Saving must not hold the supervisor lock across the disk write: the control
+// tick takes the same lock, so a slow write would stall control cycles.
+// ---------------------------------------------------------------------------
+
+fn recording_supervisor() -> std::sync::Arc<armd::ArmSupervisor> {
+    let config = armd::ArmConfig {
+        dof: 2,
+        joint_names: vec!["joint_1".to_string(), "joint_2".to_string()],
+        limits: vec![
+            armd::JointLimit::new("joint_1", -2.0, 2.0, 2.0, 5.0),
+            armd::JointLimit::new("joint_2", -2.0, 2.0, 2.0, 5.0),
+        ],
+        home_positions: vec![0.0, 0.0],
+        ..Default::default()
+    };
+    std::sync::Arc::new(armd::ArmSupervisor::new(config))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_slow_save_does_not_block_control_tick() {
+    use std::time::{Duration, Instant};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("slow.parquet");
+    let supervisor = recording_supervisor();
+    supervisor.start_recording(Some("slow".into()), Some(path.clone())).await.unwrap();
+    for _ in 0..5 {
+        supervisor.tick(0.02).await;
+    }
+
+    let saver = supervisor.clone();
+    let save = tokio::spawn(async move {
+        saver
+            .save_recording_with(|p, frames| {
+                std::thread::sleep(Duration::from_millis(200));
+                write_frames_to_parquet(p, frames)
+            })
+            .await
+    });
+
+    // Let the save reach the writer, then tick while it sleeps.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(supervisor.get_recording_state().await.0, EpisodeState::Finalizing);
+    let mut worst = Duration::ZERO;
+    for _ in 0..5 {
+        let t = Instant::now();
+        supervisor.tick(0.02).await;
+        worst = worst.max(t.elapsed());
+    }
+    assert!(!save.is_finished(), "writer should still be sleeping while ticks run");
+    assert!(worst < Duration::from_millis(50), "tick blocked by save for {worst:?}");
+
+    let saved = save.await.unwrap().unwrap();
+    assert_eq!(saved, path);
+    let (state, count) = supervisor.get_recording_state().await;
+    assert_eq!(state, EpisodeState::Committed);
+    // Ticks during Finalizing are not recorded, matching the old locked save.
+    assert_eq!(count, 5);
+    assert_eq!(read_frames_from_parquet(&path).unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn test_failed_save_leaves_finalizing() {
+    let dir = tempdir().unwrap();
+    let supervisor = recording_supervisor();
+    supervisor
+        .start_recording(Some("fail".into()), Some(dir.path().join("fail.parquet")))
+        .await
+        .unwrap();
+    supervisor.tick(0.02).await;
+
+    let err = supervisor
+        .save_recording_with(|_, _| Err(armd::recording::ParquetRecordingError::EmptyFrames))
+        .await;
+    assert!(err.is_err());
+    assert_eq!(supervisor.get_recording_state().await.0, EpisodeState::Discarded);
+    // A new recording can start after the failure.
+    supervisor.start_recording(Some("next".into()), None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_panicking_writer_does_not_wedge_recorder() {
+    let supervisor = recording_supervisor();
+    supervisor.start_recording(Some("panic".into()), None).await.unwrap();
+    supervisor.tick(0.02).await;
+
+    let err = supervisor.save_recording_with(|_, _| panic!("writer bug")).await;
+    assert!(err.is_err());
+    assert_eq!(supervisor.get_recording_state().await.0, EpisodeState::Discarded);
+}
