@@ -696,7 +696,7 @@ fn test_dormant_disabled_arm_with_stale_feedback_preempts_without_handover_fault
     }
 
     let mut inner = SupervisorInner::new(test_config())
-        .with_driver(Box::new(DormantDriver { motor_status: vec![0, 0] }));
+        .with_driver(Box::new(DormantDriver { _motor_status: vec![0, 0] }));
 
     // Verify initial conditions: unpowered, idle, dormant stale feedback
     assert!(!inner.is_torqued);
