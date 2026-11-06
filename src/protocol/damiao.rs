@@ -107,6 +107,13 @@ pub fn build_clear_faults_frame(motor_id: u16) -> CanFrame {
     CanFrame::new_standard(motor_id, &CMD_CLEAR_FAULTS).unwrap()
 }
 
+/// Build Damiao read-only status refresh frame (0x7FF, [id_l, id_h, 0xCC, 0..]).
+/// The motor answers with a normal feedback frame and keeps its enable state.
+pub fn build_refresh_frame(motor_id: u16) -> CanFrame {
+    let [lo, hi] = motor_id.to_le_bytes();
+    CanFrame::new_standard(0x7FF, &[lo, hi, 0xCC, 0, 0, 0, 0, 0]).unwrap()
+}
+
 /// Build Damiao MIT mode control CAN frame
 /// Packs: position (16-bit), velocity (12-bit), Kp (12-bit), Kd (12-bit), Torque (12-bit)
 pub fn build_mit_frame(

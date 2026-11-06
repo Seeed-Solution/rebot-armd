@@ -551,6 +551,7 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     awaiting_rx_boundary: bool,
     is_enabling: bool,
     last_warn_sec: AtomicU64,
+    last_refresh_instant: Option<Instant>,
 }
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
@@ -576,6 +577,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             awaiting_rx_boundary: false,
             is_enabling: false,
             last_warn_sec: AtomicU64::new(0),
+            last_refresh_instant: None,
         }
     }
 
@@ -656,6 +658,11 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         if self.is_enabled {
             if !self.is_feedback_valid() {
                 return EnableState::Unknown;
+            }
+            // Fresh feedback from every motor reporting state 0 is physical proof of
+            // torque-off (e.g. motor power dip), whatever the cached enable flag says.
+            if self.motor_status.iter().all(|&state| state == 0) {
+                return EnableState::Disabled;
             }
             if self.motor_status.iter().all(|&state| state == 1) {
                 EnableState::Enabled
@@ -1097,6 +1104,25 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         let _ = self.can.transmit(&frame);
                     }
                 }
+            }
+        }
+        // Damiao motors only transmit in reply to a frame. When feedback goes stale
+        // (idle, bus glitch, motor power dip) nothing would ever refresh it, so a
+        // fault could never be cleared. Poll stale motors with the read-only 0xCC
+        // refresh; it does not change enable state or targets.
+        const REFRESH_AFTER: Duration = Duration::from_millis(100);
+        if rx_drained && !self.awaiting_rx_boundary && !self.is_enabling
+            && self.last_refresh_instant.is_none_or(|t| t.elapsed() >= REFRESH_AFTER)
+        {
+            let stale: Vec<u16> = self.motor_ids.iter().zip(&self.last_feedback_instant)
+                .filter(|(_, t)| t.is_none_or(|t| t.elapsed() >= REFRESH_AFTER))
+                .map(|(&id, _)| id).collect();
+            if !stale.is_empty() {
+                for id in stale {
+                    let _ = self.can.transmit(&damiao::build_refresh_frame(id));
+                }
+                let _ = self.can.flush();
+                self.last_refresh_instant = Some(Instant::now());
             }
         }
         Ok(self.cached_states.clone())

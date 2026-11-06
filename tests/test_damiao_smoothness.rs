@@ -1,7 +1,7 @@
 use std::thread;
 use std::time::Duration;
 
-use armd::driver::{ArmDriver, DamiaoArmDriver, DamiaoControlMode, JointTarget};
+use armd::driver::{ArmDriver, DamiaoArmDriver, DamiaoControlMode, EnableState, JointTarget};
 use armd::protocol::damiao::{self, DamiaoLimits, CMD_ENABLE};
 use armd::transport::{CanFrame, MockCanTransport};
 
@@ -222,8 +222,29 @@ fn expired_feedback_does_not_replay_old_motion_on_recovery() {
     driver.can_mut().take_tx_frames();
     thread::sleep(Duration::from_millis(260));
     driver.read_joint_states().unwrap();
-    assert!(driver.can_mut().take_tx_frames().is_empty(), "unknown feedback must not resend cached target");
+    let tx = driver.can_mut().take_tx_frames();
+    assert!(tx.iter().all(is_refresh), "unknown feedback must not resend cached target: {tx:?}");
+    assert!(tx.iter().any(is_refresh), "stale feedback must be re-requested with a read-only refresh");
     driver.can_mut().provide_rx_frame(feedback_frame(1, 1, 0.1));
     driver.read_joint_states().unwrap();
-    assert!(driver.can_mut().take_tx_frames().is_empty(), "first restored sample must not resume motion");
+    let tx = driver.can_mut().take_tx_frames();
+    assert!(tx.iter().all(is_refresh), "first restored sample must not resume motion: {tx:?}");
+}
+
+fn is_refresh(frame: &CanFrame) -> bool {
+    frame.id == 0x7FF && frame.data[2] == 0xCC
+}
+
+#[test]
+fn all_motors_reporting_disabled_override_cached_enable_flag() {
+    // Motor power dip: motors reboot disabled while the driver still caches "enabled".
+    let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), vec![1]);
+    driver.can_mut().respond_to_transmit(damiao::build_enable_frame(1), feedback_frame(1, 1, 0.0));
+    driver.set_torque(true).unwrap();
+    driver.read_joint_states().unwrap();
+    assert_eq!(driver.enable_state(), EnableState::Enabled);
+    thread::sleep(Duration::from_millis(5));
+    driver.can_mut().provide_rx_frame(feedback_frame(1, 0, 0.0));
+    driver.read_joint_states().unwrap();
+    assert_eq!(driver.enable_state(), EnableState::Disabled);
 }
