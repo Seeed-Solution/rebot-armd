@@ -1136,7 +1136,10 @@ impl SupervisorInner {
             self.safety.trigger_fault(FaultReason::Other("Invalid hardware telemetry".into()));
         }
 
-        if (!dt.is_finite() || dt <= 0.0 || dt > 0.080)
+        // A single late tick only shortens integration (dt is clamped below); the motors
+        // keep holding their last POS_VEL target meanwhile. Fault on a real stall, using
+        // the same 250 ms bound as the hardware feedback deadline.
+        if (!dt.is_finite() || dt <= 0.0 || dt > 0.250)
             && self.is_torqued && self.safety.state().is_operational() {
             self.stop_motion();
             if self.measured_positions.iter().all(|p| p.is_finite()) {

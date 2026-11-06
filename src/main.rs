@@ -73,6 +73,24 @@ fn request_shutdown(inner: &mut SupervisorInner) -> bool {
     false
 }
 
+fn set_realtime_priority() {
+    #[cfg(target_os = "linux")]
+    {
+        // musl adds sporadic-server fields; zero them and set only the priority.
+        // SAFETY: sched_param is plain old data, all-zero is a valid value.
+        let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+        param.sched_priority = 50;
+        // SAFETY: plain syscall on the calling thread with a valid param struct.
+        // musl stubs sched_setscheduler() with ENOSYS; the pthread call is implemented.
+        let rc = unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) };
+        if rc == 0 {
+            info!("Control loop running at SCHED_FIFO priority 50");
+        } else {
+            warn!("Control loop real-time priority unavailable ({}); using normal scheduling", std::io::Error::from_raw_os_error(rc));
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
@@ -178,19 +196,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => unreachable!(),
     }
 
+    // The control loop runs on its own OS thread at real-time priority. On the
+    // single-core SG2002 a tokio task shares one worker with HTTP/WS/video proxies
+    // and with yolo-detector, so a tick could slip past the stall deadline.
     let control_supervisor = supervisor.clone();
-    let control_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(period);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let control_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let control_stop_flag = control_stop.clone();
+    let runtime = tokio::runtime::Handle::current();
+    std::thread::Builder::new().name("armd-control".into()).spawn(move || {
+        set_realtime_priority();
+        let mut next = std::time::Instant::now() + period;
         let mut last_tick = std::time::Instant::now();
-        loop {
-            interval.tick().await;
+        let mut last_late_log: Option<std::time::Instant> = None;
+        while !control_stop_flag.load(Ordering::SeqCst) {
+            let now = std::time::Instant::now();
+            if next > now { std::thread::sleep(next - now); }
+            next += period;
+            let now = std::time::Instant::now();
+            if next < now { next = now + period; } // skip missed ticks
             let dt = last_tick.elapsed().as_secs_f64();
-            last_tick = std::time::Instant::now();
+            last_tick = now;
+            if dt > 0.080 && last_late_log.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
+                warn!("Control tick late: {:.0} ms since previous tick", dt * 1000.0);
+                last_late_log = Some(now);
+            }
             // Preserve real elapsed time so the supervisor can detect stalled control ticks.
-            control_supervisor.tick(dt).await;
+            runtime.block_on(control_supervisor.tick(dt));
         }
-    });
+    })?;
 
     info!(
         "armd API server listening on http://{}",
@@ -228,7 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // A confirmed-safe exit must not wait indefinitely on connected WebSockets.
     server_handle.abort();
-    control_handle.abort();
+    control_stop.store(true, Ordering::SeqCst);
     info!("armd stopped after shutdown readiness confirmation");
     Ok(())
 }

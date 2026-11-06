@@ -190,10 +190,20 @@ async fn control_loop_stall_latches_instead_of_advancing_old_trajectory() {
     let supervisor = ArmSupervisor::new(ArmConfig::default());
     supervisor.set_torque(true).await.unwrap();
     supervisor.jog(vec![0.3; 6], Some(1.0), None).await.unwrap();
-    let obs = supervisor.tick(0.100).await;
+    let obs = supervisor.tick(0.300).await;
     assert!(obs.safety_state.is_stopped());
     assert_eq!(obs.positions, vec![0.0; 6]);
     assert!(supervisor.inner().read().await.active_trajectory.is_none());
+}
+
+#[tokio::test]
+async fn single_late_tick_below_stall_bound_keeps_arm_operational() {
+    // One 100 ms scheduling hiccup on a loaded single-core host must not fault the arm.
+    let supervisor = ArmSupervisor::new(ArmConfig::default());
+    supervisor.set_torque(true).await.unwrap();
+    supervisor.jog(vec![0.3; 6], Some(1.0), None).await.unwrap();
+    let obs = supervisor.tick(0.100).await;
+    assert!(!obs.safety_state.is_stopped(), "state: {:?}", obs.safety_state);
 }
 
 #[test]
