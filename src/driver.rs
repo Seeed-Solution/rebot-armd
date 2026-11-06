@@ -664,8 +664,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     }
 
     fn max_command_velocity(&self, joint: usize) -> Option<f32> {
-        if joint >= self.motor_ids.len() || self.control_mode != DamiaoControlMode::PosVel
-            || (joint == 6 && self.motor_ids[joint] == 7) {
+        if joint >= self.motor_ids.len() || self.control_mode != DamiaoControlMode::PosVel {
             return None;
         }
         Some(self.default_vlim.abs().clamp(0.1, 4.0))
@@ -908,28 +907,15 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         match self.control_mode {
             DamiaoControlMode::PosVel => {
                 for (i, target) in targets.iter().enumerate() {
-                    let is_gripper_j7 = i == 6 && self.motor_ids[i] == 7;
-                    if is_gripper_j7 {
-                        let frame = damiao::build_pos_force_frame(
-                            0x300,
-                            self.motor_ids[i],
-                            target.position,
-                            damiao::DAMIAO_GRIPPER_POSFORCE_VEL_RAW,
-                            220,
-                        );
-                        self.transmit_with_retry(&frame)?;
-                        self.last_target_frames[i] = Some(frame);
-                    } else {
-                        let vlim = self.default_vlim.abs().clamp(0.1, 4.0);
-                        let frame = damiao::build_pos_vel_frame(
-                            0x100,
-                            self.motor_ids[i],
-                            target.position,
-                            vlim,
-                        );
-                        self.transmit_with_retry(&frame)?;
-                        self.last_target_frames[i] = Some(frame);
-                    }
+                    let vlim = self.default_vlim.abs().clamp(0.1, 4.0);
+                    let frame = damiao::build_pos_vel_frame(
+                        0x100,
+                        self.motor_ids[i],
+                        target.position,
+                        vlim,
+                    );
+                    self.transmit_with_retry(&frame)?;
+                    self.last_target_frames[i] = Some(frame);
                 }
             }
             DamiaoControlMode::Mit => {
@@ -1075,23 +1061,12 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         let _ = self.can.transmit(&frame);
                     }
                     DamiaoControlMode::PosVel => {
-                        let is_gripper_j7 = i == 6 && id == 7;
-                        let frame = if is_gripper_j7 {
-                            damiao::build_pos_force_frame(
-                                0x300,
-                                id,
-                                p,
-                                damiao::DAMIAO_GRIPPER_POSFORCE_VEL_RAW,
-                                220,
-                            )
-                        } else {
-                            damiao::build_pos_vel_frame(
-                                0x100,
-                                id,
-                                p,
-                                self.default_vlim.abs().max(0.01),
-                            )
-                        };
+                        let frame = damiao::build_pos_vel_frame(
+                            0x100,
+                            id,
+                            p,
+                            self.default_vlim.abs().clamp(0.1, 4.0),
+                        );
                         let _ = self.can.transmit(&frame);
                     }
                 }
