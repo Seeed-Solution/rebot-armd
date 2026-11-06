@@ -241,3 +241,18 @@ async fn jerk_enabled_servo_settles_after_small_target() {
     assert!((obs.positions[0] - 0.1).abs() < 1e-4, "position {}", obs.positions[0]);
     assert!(obs.velocities[0].abs() < 1e-4, "velocity {}", obs.velocities[0]);
 }
+
+#[tokio::test]
+async fn short_feedback_gap_holds_but_long_gap_latches_bus_loss() {
+    // ~260 ms CAN gaps were observed on the rig during 24 V sags; motors keep
+    // holding through them, so only a gap beyond BUS_LOSS_TIMEOUT latches.
+    let (supervisor, h) = setup(full_caps(), None).await;
+    h.lock().unwrap().age = Some(Duration::from_millis(300));
+    let obs = supervisor.tick(0.02).await;
+    assert!(!obs.safety_state.is_stopped(), "300 ms gap must not fault: {:?}", obs.safety_state);
+    h.lock().unwrap().age = Some(Duration::ZERO);
+    assert!(!supervisor.tick(0.02).await.safety_state.is_stopped(), "recovery after a short gap must not fault");
+    h.lock().unwrap().age = Some(Duration::from_millis(600));
+    let obs = supervisor.tick(0.02).await;
+    assert!(matches!(obs.safety_state, SafetyState::Fault(FaultReason::BusLoss)), "{:?}", obs.safety_state);
+}

@@ -35,6 +35,13 @@ pub enum PreemptError {
     Cooldown(u64),
 }
 
+/// Feedback gap that latches BusLoss while torqued. The Damiao motors run with
+/// CAN TIMEOUT=0 and keep holding their last POS_VEL target through a gap, so a
+/// short interruption is not a hazard by itself. 500 ms tolerates the ~260 ms
+/// CAN gaps observed on the reBot rig (2026-11-06, coinciding with 24 V sags);
+/// a real power loss drops the arm regardless of this bound.
+pub const BUS_LOSS_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Active WebSocket client lease record
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActiveLease {
@@ -207,8 +214,10 @@ impl SupervisorInner {
     pub fn hardware_feedback_fresh(&self, max_age: Duration) -> bool {
         if !self.feedback_numeric_valid { return false; }
         self.driver.as_ref().map_or(true, |d| d.lock().map_or(false, |drv| {
+            // Ages alone decide: drivers' is_feedback_valid() hard-codes 250 ms,
+            // which would silently cap callers asking for a longer bound.
             let ages = drv.feedback_ages();
-            drv.is_feedback_valid() && ages.len() == self.config.dof
+            ages.len() == self.config.dof
                 && ages.iter().all(|a| a.is_some_and(|age| age <= max_age))
         }))
     }
@@ -1249,11 +1258,11 @@ impl SupervisorInner {
             self.gravity_torques_ramped[i] = if ramped.is_finite() { ramped } else { 0.0 };
         }
 
-        // Check the driver's per-joint feedback deadline (250 ms for the bundled drivers).
+        // Bus loss: no fresh feedback from every joint within BUS_LOSS_TIMEOUT.
         if self.is_torqued
             && !self.safety.state().is_stopped()
             && self.driver.is_some()
-            && !self.hardware_feedback_fresh(Duration::from_millis(250))
+            && !self.hardware_feedback_fresh(BUS_LOSS_TIMEOUT)
         {
             self.execute_stop(StopPolicy::BusLossFallback);
         }
@@ -1523,7 +1532,7 @@ impl SupervisorInner {
         }
         self.last_commanded_velocities = self.commanded_velocities.clone();
 
-        let feedback_fresh = self.hardware_feedback_fresh(Duration::from_millis(250));
+        let feedback_fresh = self.hardware_feedback_fresh(BUS_LOSS_TIMEOUT);
         if self.driver.is_some() && self.is_torqued {
             if !feedback_fresh { self.output_suspended = true; }
             else if self.output_suspended {
