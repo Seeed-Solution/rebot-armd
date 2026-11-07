@@ -55,10 +55,6 @@ pub fn create_router(supervisor: Arc<ArmSupervisor>) -> Router {
         // Single-Origin Reverse Proxy Routes
         .route("/api/v1/detection/ws", get(proxy::proxy_detection_ws))
         .route("/results", get(proxy::proxy_detection_ws))
-        .route("/api/ws", get(proxy::proxy_go2rtc_ws))
-        .route("/api/webrtc", post(proxy::proxy_go2rtc_webrtc))
-        .route("/api/stream.mp4", get(proxy::proxy_go2rtc_stream))
-        .route("/api/stream.mjpeg", get(proxy::proxy_go2rtc_stream))
         .layer(middleware::from_fn(same_origin))
         .layer(TraceLayer::new_for_http())
         .with_state(supervisor)

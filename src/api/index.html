@@ -1547,11 +1547,8 @@ const CFG = {
     { key: 'J6', part: 'jd.grip.part', motion: 'jd.grip.motion', en: 'Gripper', neg: 'jd.grip.neg', pos: 'jd.grip.pos', kn: 'Z', kp: 'X' },
   ],
   video: {
-    host: QS.get('go2rtc') || location.host, // single-origin unified gateway on port 8765
-    src: QS.get('cam') || 'live0',                          // go2rtc stream name
-    mjpeg: QS.get('video') || '',                           // explicit MJPEG URL overrides go2rtc
-    maxLagMs: 1500,                                         // reconnect WebRTC when playout delay stays above this
-    // Camera app H.264-over-WebSocket (debug_stream, --stream-mode ws): tried before go2rtc.
+    mjpeg: QS.get('video') || '',                           // explicit MJPEG URL overrides the ws stream
+    // Camera app H.264-over-WebSocket (debug_stream, --stream-mode ws).
     ws: QS.get('ws') || `ws://${location.hostname}:${QS.get('wsport') || 8001}/`,
   },
   simpleSpeed: 0.3,           // simple mode: one fixed speed fraction (expert mode uses the 1-4 selector)
@@ -3579,22 +3576,16 @@ $('btn-discard').addEventListener('click', async () => {
 
 
 /* =================================================================
-   Live video: camera WS H.264 (JMuxer) -> go2rtc WebRTC/WHEP -> MSE -> progressive MP4
-   (or ?video= MJPEG)
+   Live video: camera WS H.264 (JMuxer), or ?video= MJPEG
    ================================================================= */
 const videoEl = $('video-stream');
 const mjpegEl = $('video-mjpeg');
 const V = {
   gen: 0, mode: null, playing: false,
-  ws: null, pc: null, jmx: null, wsWatch: null, wsRetries: 0, retryTimer: null, retryDelay: 4000,
+  ws: null, jmx: null, wsWatch: null, wsRetries: 0, retryTimer: null, retryDelay: 4000,
   frames: 0, lastTotal: 0, lastTime: 0, fps: null, lat: null, stall: 0,
-  jb: { delay: 0, count: 0 },
 };
-const MSE_CODECS = ['avc1.640029', 'avc1.64002A', 'avc1.640033', 'hvc1.1.6.L153.B0', 'mp4a.40.2', 'mp4a.40.5', 'flac', 'opus'];
-const httpBase = () => `${location.protocol === 'https:' ? 'https:' : 'http:'}//${CFG.video.host}`;
-const whepURL = () => `${httpBase()}/api/webrtc?src=${encodeURIComponent(CFG.video.src)}`;
-const wsURL = () => `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${CFG.video.host}/api/ws?src=${encodeURIComponent(CFG.video.src)}`;
-const MODE_LABEL = { ws: 'WS·H.264', webrtc: 'WebRTC·WHEP', mse: 'MSE', mp4: 'MP4', mjpeg: 'MJPEG' };
+const MODE_LABEL = { ws: 'WS·H.264', mjpeg: 'MJPEG' };
 // ws mode thresholds, same as the supervisor console (useDebugStream.ts).
 const WS_LIVE_EDGE_CHECK_MS = 500;  // live-edge keeper period
 const WS_LIVE_EDGE_MAX_LAG = 0.6;   // s behind buffered end before snapping
@@ -3619,10 +3610,8 @@ function videoHint(kind, title, sub) {
 function videoTeardown() {
   V.gen++;
   V.playing = false; V.mode = null; V.fps = null; V.lat = null; V.stall = 0;
-  V.jb = { delay: 0, count: 0 };
   clearTimeout(V.retryTimer);
   if (V.ws) { try { V.ws.onclose = null; V.ws.close(); } catch (_) {} V.ws = null; }
-  if (V.pc) { try { V.pc.close(); } catch (_) {} V.pc = null; }
   wsPlayerClose();
   try { videoEl.pause(); } catch (_) {}
   videoEl.srcObject = null;
@@ -3703,191 +3692,27 @@ function setupWS(fail, gen) {
   playVideo();
 }
 
-// WHEP (go2rtc: POST /api/webrtc?src=<name>, body = SDP offer, response = SDP answer).
-// Non-trickle: gather host candidates first (LAN / AP, no STUN), then one HTTP round trip.
-function waitIce(pc, ms) {
-  if (pc.iceGatheringState === 'complete') return Promise.resolve();
-  return new Promise((resolve) => {
-    const done = () => { clearTimeout(t); pc.removeEventListener('icegatheringstatechange', chk); resolve(); };
-    const chk = () => { if (pc.iceGatheringState === 'complete') done(); };
-    const t = setTimeout(done, ms);
-    pc.addEventListener('icegatheringstatechange', chk);
-  });
-}
-function setupWebRTC(fail, gen) {
-  if (!window.RTCPeerConnection) throw new Error('WebRTC unsupported');
-  const pc = new RTCPeerConnection({ bundlePolicy: 'max-bundle', iceServers: [] });
-  V.pc = pc;
-  const tc = pc.addTransceiver('video', { direction: 'recvonly' });
-  if (tc.setCodecPreferences && window.RTCRtpReceiver && RTCRtpReceiver.getCapabilities) {
-    const cap = RTCRtpReceiver.getCapabilities('video');
-    if (cap && cap.codecs) {
-      const h264 = cap.codecs.filter(c => c.mimeType && c.mimeType.toLowerCase() === 'video/h264');
-      const others = cap.codecs.filter(c => !c.mimeType || c.mimeType.toLowerCase() !== 'video/h264');
-      if (h264.length) tc.setCodecPreferences([...h264, ...others]);
-    }
-  }
-  pc.ontrack = (ev) => {
-    // Teleop wants the newest frame, not smoothness: ask for the smallest jitter buffer.
-    // jitterBufferTarget is in ms (Chrome 114+); playoutDelayHint is the older seconds-based hint.
-    try {
-      if ('jitterBufferTarget' in ev.receiver) ev.receiver.jitterBufferTarget = 0;
-      else if ('playoutDelayHint' in ev.receiver) ev.receiver.playoutDelayHint = 0;
-    } catch (_) {}
-    const ms = ev.streams && ev.streams[0] ? ev.streams[0] : new MediaStream([ev.track]);
-    if (videoEl.srcObject !== ms) { videoEl.srcObject = ms; playVideo(); }
-  };
-  let discTimer = null;
-  const onDisc = (st) => {
-    clearTimeout(discTimer);
-    if (st === 'failed' || st === 'closed') fail(new Error('WebRTC ' + st));
-    else if (st === 'disconnected') discTimer = setTimeout(() => {
-      if (pc.connectionState === 'disconnected' || pc.iceConnectionState === 'disconnected') {
-        fail(new Error('WebRTC disconnected'));
-      }
-    }, 5000);
-  };
-  pc.onconnectionstatechange = () => onDisc(pc.connectionState);
-  pc.oniceconnectionstatechange = () => {
-    if (pc.iceConnectionState === 'failed') fail(new Error('WebRTC ICE failed'));
-    else if (pc.iceConnectionState === 'disconnected') onDisc('disconnected');
-  };
-  (async () => {
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await waitIce(pc, 1000);
-    const sdp = pc.localDescription ? pc.localDescription.sdp : offer.sdp;
-    if (!sdp || !sdp.includes('a=ice-ufrag:')) {
-      throw new Error('WebRTC offer missing ice-ufrag');
-    }
-    const ctl = new AbortController();
-    const to = setTimeout(() => ctl.abort(), 4000);
-    let res;
-    try {
-      res = await fetch(whepURL(), { method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: sdp, signal: ctl.signal });
-    } finally { clearTimeout(to); }
-    if (!res.ok) throw new Error('WHEP HTTP ' + res.status);
-    const answer = await res.text();
-    if (gen !== V.gen || pc.signalingState === 'closed') return;
-    await pc.setRemoteDescription({ type: 'answer', sdp: answer });
-  })().catch((e) => fail(e));
-}
-
-function setupMSE(fail) {
-  const MMS = window.ManagedMediaSource;
-  const MS = MMS || window.MediaSource;
-  if (!MS) throw new Error('MSE unsupported');
-  const ms = new MS();
-  ms.addEventListener('sourceopen', () => {
-    const ws = new WebSocket(wsURL());
-    ws.binaryType = 'arraybuffer';
-    V.ws = ws;
-    let sb = null;
-    const queue = [];
-    const pump = () => {
-      if (!sb || sb.updating || !queue.length || ms.readyState !== 'open') return;
-      try {
-        sb.appendBuffer(queue.shift());
-      } catch (e) {
-        if (e.name === 'QuotaExceededError') {
-          queue.length = 0;
-          if (videoEl.currentTime <= 2.0 || !sb.buffered.length) {
-            fail(e);
-            return;
-          }
-          try {
-            const start = Math.max(0, sb.buffered.start(0));
-            const removeEnd = Math.max(0, videoEl.currentTime - 1.0);
-            if (removeEnd > start) {
-              sb.remove(start, removeEnd);
-            } else {
-              fail(e);
-            }
-          } catch (err) {
-            fail(err);
-          }
-        } else {
-          fail(e);
-        }
-      }
-    };
-    const trim = () => {
-      if (!sb || sb.updating || !sb.buffered.length) return;
-      const safeMargin = 6.0;
-      const start = Math.max(0, sb.buffered.start(0));
-      const removeEnd = videoEl.currentTime - safeMargin;
-      if (removeEnd > start + 1.0 && removeEnd > 0) {
-        try { sb.remove(start, removeEnd); } catch (_) {}
-      }
-    };
-    ws.onopen = () => {
-      const codecs = MSE_CODECS.filter((c) => MS.isTypeSupported(`video/mp4; codecs="${c}"`)).join();
-      ws.send(JSON.stringify({ type: 'mse', value: codecs }));
-    };
-    ws.onmessage = (ev) => {
-      if (typeof ev.data === 'string') {
-        let m; try { m = JSON.parse(ev.data); } catch (_) { return; }
-        if (m.type === 'mse') {
-          try {
-            sb = ms.addSourceBuffer(m.value);
-            sb.mode = 'segments';
-            sb.addEventListener('updateend', () => { trim(); pump(); });
-          } catch (e) { fail(e); }
-        } else if (m.type === 'error') fail(new Error(String(m.value)));
-        return;
-      }
-      queue.push(ev.data);
-      pump();
-    };
-    ws.onerror = () => fail(new Error('go2rtc unreachable'));
-    ws.onclose = () => fail(new Error('MSE socket closed'));
-  }, { once: true });
-  if (MMS && MS === MMS) { videoEl.disableRemotePlayback = true; videoEl.srcObject = ms; }
-  else videoEl.src = URL.createObjectURL(ms);
-  playVideo();
-}
-
-function setupMP4(fail) {
-  const onErr = () => fail(new Error('MP4 stream error'));
-  videoEl.addEventListener('error', onErr, { once: true });
-  videoEl.addEventListener('ended', onErr, { once: true });
-  videoEl.src = `${httpBase()}/api/stream.mp4?src=${encodeURIComponent(CFG.video.src)}`;
-  playVideo();
-}
-
-// wsOnly: reconnect after a working ws stream dropped; the go2rtc chain runs only
-// once WS_RECONNECT_GRACE ws retries have failed.
+// wsOnly: reconnect after a working ws stream dropped (shows the "dropped" hint and
+// the retry count); otherwise a failed attempt falls back to the backoff retry.
 async function videoStart(wsOnly = false) {
   videoTeardown();
   const gen = V.gen;
   if (CFG.video.mjpeg) return startMJPEG();
-  const go2rtc = [['webrtc', 7000, setupWebRTC], ['mse', 6000, setupMSE], ['mp4', 6000, setupMP4]];
-  // 6 s: at 10 fps MSE takes ~3 s from the first IDR to 'playing'.
-  const chain = [['ws', 6000, setupWS], ...(wsOnly ? [] : go2rtc)];
-  for (const [kind, timeout, setup] of chain) {
+  const retry = wsOnly ? ` · ${V.wsRetries}/${WS_RECONNECT_GRACE}` : '';
+  videoHint('connecting', () => t(wsOnly ? 'v.dropped' : 'v.connecting'), `${MODE_LABEL.ws} · ${CFG.video.ws}${retry}`);
+  try {
+    // 6 s: at 10 fps MSE takes ~3 s from the first IDR to 'playing'.
+    await attempt('ws', 6000, setupWS);
     if (gen !== V.gen) return;
-    const where = kind === 'ws' ? CFG.video.ws : `${CFG.video.host} · ${CFG.video.src}`;
-    const retry = kind === 'ws' && wsOnly ? ` · ${V.wsRetries}/${WS_RECONNECT_GRACE}` : '';
-    videoHint('connecting', () => t(wsOnly ? 'v.dropped' : 'v.connecting'), `${MODE_LABEL[kind]} · ${where}${retry}`);
-    try {
-      await attempt(kind, timeout, setup);
-      if (gen !== V.gen) return;
-      V.mode = kind; V.playing = true; V.retryDelay = 4000;
-      if (kind === 'ws') V.wsRetries = 0;
-      videoHint('hide');
-      return;
-    } catch (_) {
-      if (gen !== V.gen) return;
-      // reset only the transport, keep the generation for the next link in the chain
-      if (V.ws) { try { V.ws.onclose = null; V.ws.close(); } catch (_) {} V.ws = null; }
-      if (V.pc) { try { V.pc.close(); } catch (_) {} V.pc = null; }
-      wsPlayerClose();
-      if (kind === 'ws' && wsOnly) { videoWsRetry(() => videoStart()); return; }
-      videoEl.srcObject = null;
-      if (videoEl.getAttribute('src')) { videoEl.removeAttribute('src'); try { videoEl.load(); } catch (_) {} }
-    }
+    V.mode = 'ws'; V.playing = true; V.retryDelay = 4000; V.wsRetries = 0;
+    videoHint('hide');
+    return;
+  } catch (_) {
+    if (gen !== V.gen) return;
+    if (V.ws) { try { V.ws.onclose = null; V.ws.close(); } catch (_) {} V.ws = null; }
+    wsPlayerClose();
+    if (wsOnly) { videoWsRetry(() => videoStart()); return; }
   }
-  if (gen !== V.gen) return;
   scheduleVideoRetry(() => t('v.noservice'));
 }
 function scheduleVideoRetry(title) {
@@ -3898,8 +3723,8 @@ function scheduleVideoRetry(title) {
   V.retryTimer = setTimeout(() => { if (gen === V.gen) videoStart(); }, V.retryDelay);
   V.retryDelay = Math.min(30000, V.retryDelay * 2);
 }
-// After a working ws stream drops: retry ws alone with backoff, then hand over to
-// `exhausted` (the full chain, which tries ws once more and then go2rtc).
+// After a working ws stream drops: retry ws quickly a few times, then hand over to
+// `exhausted` (one more attempt, then the slower scheduleVideoRetry backoff).
 function videoWsRetry(exhausted) {
   if (V.wsRetries >= WS_RECONNECT_GRACE) { V.wsRetries = 0; exhausted(); return; }
   V.wsRetries++;
@@ -3956,7 +3781,7 @@ videoEl.addEventListener('playing', () => {
   armRVFC();
 });
 
-setInterval(async () => {
+setInterval(() => {
   if (!V.playing || V.mode === 'mjpeg') return;
   let n = 0;
   if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
@@ -3979,35 +3804,10 @@ setInterval(async () => {
     V.stall = (n === 0 && !timeProgress) ? V.stall + 1 : 0;
     if (V.stall >= 10) { videoDropped(); return; }
   }
-  if (V.mode === 'webrtc' && V.pc) {
-    try {
-      const stats = await V.pc.getStats();
-      let jb = null, rtt = null;
-      stats.forEach((r) => {
-        if (r.type === 'inbound-rtp' && r.kind === 'video' && r.jitterBufferEmittedCount) {
-          const dd = r.jitterBufferDelay - V.jb.delay, dc = r.jitterBufferEmittedCount - V.jb.count;
-          if (dc > 0) jb = dd / dc;
-          V.jb = { delay: r.jitterBufferDelay, count: r.jitterBufferEmittedCount };
-        }
-        if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated && typeof r.currentRoundTripTime === 'number') rtt = r.currentRoundTripTime;
-      });
-      if (jb != null || rtt != null) V.lat = ((jb || 0) + (rtt || 0) / 2) * 1000;
-    } catch (_) {}
-    // A burst of stale frames (e.g. after the RTSP source reconnects) can push the
-    // WebRTC playout delay to seconds and it only decays slowly. Teleop needs live
-    // video: if the delay stays above the limit, reconnect to start from live.
-    V.lagSec = V.lat != null && V.lat > CFG.video.maxLagMs ? (V.lagSec || 0) + 1 : 0;
-    if (V.lagSec >= 3 && Date.now() - (V.lagResetAt || 0) > 10000) {
-      V.lagSec = 0; V.lagResetAt = Date.now();
-      videoTeardown(); videoStart();
-      return;
-    }
-  } else if (videoEl.buffered && videoEl.buffered.length) {
+  if (videoEl.buffered && videoEl.buffered.length) {
     const end = videoEl.buffered.end(videoEl.buffered.length - 1);
+    // ws mode keeps the live edge with its own 500 ms keeper in setupWS.
     V.lat = Math.max(0, end - videoEl.currentTime) * 1000;
-    // MSE/MP4 keeps playing whatever is buffered; jump to the live edge when behind.
-    // ws mode runs its own 500 ms keeper in setupWS.
-    if (V.mode !== 'ws' && V.lat > 600) { try { videoEl.currentTime = Math.max(0, end - 0.1); } catch (_) {} }
   }
 }, 1000);
 

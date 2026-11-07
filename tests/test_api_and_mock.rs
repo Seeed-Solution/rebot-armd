@@ -1083,22 +1083,16 @@ async fn test_proxy_routes_and_passive_time_sync() {
     armd::api::rest::try_sync_system_time(None);
     armd::api::rest::try_sync_system_time(Some(999)); // rejected out of bounds
 
-    // 2. HTTP proxy for WHEP when go2rtc is offline -> 502, or 500 if go2rtc is running on port 1984 and rejects invalid dummy SDP
-    let res = client
-        .post(format!("http://{}/api/webrtc?src=live0", addr))
-        .header("Content-Type", "application/sdp")
-        .body("v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n")
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        res.status() == reqwest::StatusCode::BAD_GATEWAY
-            || res.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-        "Expected 502 or 500 depending on whether upstream go2rtc is online"
-    );
+    // 2. The go2rtc proxy routes are gone.
+    let res = client.post(format!("http://{}/api/webrtc?src=live0", addr)).send().await.unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
+    for path in &["/api/stream.mp4?src=live0", "/api/stream.mjpeg?src=live0", "/api/ws?src=live0"] {
+        let res = client.get(format!("http://{}{}", addr, path)).send().await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+    }
 
-    // 3. WS proxy for detection WS (/api/v1/detection/ws & /results) and go2rtc
-    for path in &["/api/v1/detection/ws", "/results", "/api/ws?src=live0"] {
+    // 3. WS proxy for detection WS (/api/v1/detection/ws & /results)
+    for path in &["/api/v1/detection/ws", "/results"] {
         let ws_url = format!("ws://{}{}", addr, path);
         if let Ok((mut ws_stream, _)) = connect_async(&ws_url).await {
             // Verify bidirectional framing / clean handshake without hanging
