@@ -171,25 +171,25 @@ start() {
 
     echo "OK"
 
-    # 启动 go2rtc 实时流服务 (如果安装)
-    if [ -x /usr/local/bin/go2rtc ] && [ -f /etc/go2rtc.yaml ]; then
-        if ! pidof go2rtc >/dev/null 2>&1; then
-            echo "[rebot-teleop] Starting go2rtc WebRTC stream service..."
-            start-stop-daemon -S -b -m -p /var/run/go2rtc.pid -a /bin/sh -- -c "exec /usr/local/bin/go2rtc -config /etc/go2rtc.yaml >> /var/log/go2rtc.log 2>&1" || true
-        fi
-    fi
+    # 停止旧版本遗留的 go2rtc（视频已改由摄像头 WebSocket 直出）
+    stop_video
 
     return 0
 }
 
-# Stop only the video process owned by this application's pidfile.
+# Stop only the video process owned by this application's pidfile: the go2rtc
+# that older packages started. Best effort, SIGTERM only.
 stop_video() {
     VIDEO_PIDFILE=/var/run/go2rtc.pid
     if [ -f "$VIDEO_PIDFILE" ]; then
         VIDEO_PID=$(cat "$VIDEO_PIDFILE" 2>/dev/null)
         case "$VIDEO_PID" in ''|*[!0-9]*) return 0 ;; esac
-        if [ "$(readlink "/proc/$VIDEO_PID/exe" 2>/dev/null)" = /usr/local/bin/go2rtc ]; then
+        # The upgrade removes the binary, so a leftover process reports "(deleted)".
+        if [ "$(readlink "/proc/$VIDEO_PID/exe" 2>/dev/null | sed 's/ (deleted)$//')" = /usr/local/bin/go2rtc ]; then
             kill -TERM "$VIDEO_PID" 2>/dev/null || true
+            rm -f "$VIDEO_PIDFILE"
+        elif [ ! -d "/proc/$VIDEO_PID" ]; then
+            rm -f "$VIDEO_PIDFILE"
         fi
     fi
 }
