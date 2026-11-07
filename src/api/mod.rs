@@ -19,10 +19,24 @@ async fn serve_index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
+// JMuxer 2.1.0 (MIT), vendored; plays the camera's H.264-over-WebSocket stream.
+static JMUXER_JS: &str = include_str!("vendor/jmuxer.min.js");
+
+async fn serve_jmuxer() -> impl axum::response::IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        JMUXER_JS,
+    )
+}
+
 /// Build the Axum router for the arm daemon
 pub fn create_router(supervisor: Arc<ArmSupervisor>) -> Router {
     Router::new()
         .route("/", get(serve_index))
+        .route("/assets/jmuxer.min.js", get(serve_jmuxer))
         .route("/api/v1/observation", get(rest::get_observation))
         .route("/api/v1/observation/schema", get(rest::get_observation_schema))
         .route("/api/v1/torque", post(rest::set_torque))

@@ -1296,3 +1296,17 @@ async fn websocket_business_rejections_preserve_status_code_and_message() {
     assert_eq!(not_armed["status"], 412);
     assert_eq!(not_armed["code"], "NOT_ARMED");
 }
+
+#[tokio::test]
+async fn test_jmuxer_asset_served_as_javascript() {
+    let (addr, _) = spawn_test_server().await;
+    let res = reqwest::get(format!("http://{}/assets/jmuxer.min.js", addr)).await.unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let ct = res.headers().get(reqwest::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+    assert!(ct.starts_with("application/javascript"), "content-type: {ct}");
+    let cc = res.headers().get(reqwest::header::CACHE_CONTROL).unwrap().to_str().unwrap().to_string();
+    assert!(cc.contains("max-age="), "cache-control: {cc}");
+    let body = res.text().await.unwrap();
+    assert!(body.contains("JMuxer 2.1.0"));
+    assert!(body.contains("global.JMuxer = factory"));
+}
