@@ -220,6 +220,14 @@ body.ui-expert .main {
 .hud .sc-status-badge.is-warn { color: var(--sc-status-warning-fg); }
 .hud .sc-status-badge.is-danger { color: var(--sc-status-danger-fg); }
 #rec-chip { display: none; }
+/* Detect toggle: first item of the video HUD row (stays put as chips come and go), the .btn style at HUD chip scale */
+.det-ctl { display: inline-flex; align-self: center; pointer-events: auto; }
+.det-ctl[hidden] { display: none; }
+.det-btn { min-height: 28px; padding: 0 12px; gap: 6px; font-size: 12px; font-weight: 600; border-radius: 14px; background: rgba(255,255,255,0.8); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 2px 8px rgba(0,0,0,0.08); cursor: pointer; touch-action: manipulation; }
+.det-btn::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--sc-status-disabled-fg); }
+.det-btn.btn-primary { background: var(--sc-color-primary-dark); }
+.det-btn.btn-primary::before { background: #fff; }
+.det-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
 body.recording #rec-chip { display: inline-flex; }
 .banner {
   position: absolute; left: 12px; right: 12px; bottom: 12px; display: none; text-align: center;
@@ -1019,6 +1027,7 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
           </div>
         </div>
         <div class="hud">
+          <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button></span>
           <span class="sc-status-badge" id="cam-chip" data-i18n="v.chip.connecting">连接中</span>
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
           <span class="sc-status-badge plain" id="det-chip" data-i18n="det.none" hidden>检测 --</span>
@@ -1347,6 +1356,9 @@ const I18N = {
     'v.noservice': '未连接到视频服务', 'v.dropped': '视频流中断，正在重连…', 'v.cant_open': '视频源无法打开',
     'v.retry_sub': '网络抖动或视频暂未就绪 · {sec} 秒后自动重试（亦可点击重试）',
     'det.none': '检测 --', 'det.n': '检测 {n}',
+    'det.on': '识别 · 开', 'det.off': '识别 · 关', 'det.na': '识别 · 不可用',
+    'det.tip.on': '物体识别已开启，点击关闭', 'det.tip.off': '物体识别已关闭，点击开启',
+    'det.tip.na': '识别服务不可用（检测程序未运行或版本过旧）', 'det.fail': '切换识别失败',
     'rec.chip0': '录制 00:00', 'rec.chip': '录制 ',
     'armview.tag': '姿态示意 · 侧视', 'banner.lock': '遥测断开 · 控制已锁定',
     'ctl.mode': '控制方式', 'mode.joint': '关节点动', 'mode.cart': '空间位姿', 'home': '回零',
@@ -1423,6 +1435,9 @@ const I18N = {
     'v.noservice': 'Video service not reachable', 'v.dropped': 'Video stream lost, reconnecting…', 'v.cant_open': 'Cannot open video source',
     'v.retry_sub': 'Network glitch or video not ready · retrying in {sec} s (or tap Retry)',
     'det.none': 'Det --', 'det.n': 'Det {n}',
+    'det.on': 'Detect · On', 'det.off': 'Detect · Off', 'det.na': 'Detect · N/A',
+    'det.tip.on': 'Object detection is on. Click to turn it off', 'det.tip.off': 'Object detection is off. Click to turn it on',
+    'det.tip.na': 'Detection service unavailable (detector not running or too old)', 'det.fail': 'Could not switch detection',
     'rec.chip0': 'REC 00:00', 'rec.chip': 'REC ',
     'armview.tag': 'Pose preview · side view', 'banner.lock': 'Telemetry lost · controls locked',
     'ctl.mode': 'Control mode', 'mode.joint': 'Joint jog', 'mode.cart': 'Cartesian', 'home': 'Home',
@@ -2327,6 +2342,7 @@ function connectDetectionWS() {
   }
   ws.onmessage = (ev) => {
     detWsRetryCount = 0; // Reset backoff only upon receiving active data from upstream
+    if (DET.avail && !DET.enabled) return; // inference off: draw nothing, even if a stale frame arrives
     try {
       const data = JSON.parse(ev.data);
       const srcW = V.mode === 'mjpeg' ? (mjpegEl ? mjpegEl.naturalWidth : 0) : (videoEl ? videoEl.videoWidth : 0);
@@ -2354,6 +2370,77 @@ function connectDetectionWS() {
     }
     try { ws.close(); } catch (_) {}
   };
+}
+
+/* Detect toggle: on-demand inference via /api/v1/detection/inference (armd proxies the detector).
+   Plain fetch, not api(): this is not arm control and must not feed the RTT telemetry. */
+const DET = { avail: null, enabled: false, busy: false, timer: null };
+async function detRequest(method, body) {
+  const ctl = new AbortController();
+  const tm = setTimeout(() => ctl.abort(), 4000);
+  try {
+    const res = await fetch('/api/v1/detection/inference', {
+      method, signal: ctl.signal, cache: 'no-store',
+      headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+    if (!res.ok || !data || typeof data.enabled !== 'boolean') {
+      const e = new Error((data && data.error) || 'HTTP ' + res.status); e.status = res.status; throw e;
+    }
+    return data;
+  } finally { clearTimeout(tm); }
+}
+function detClearOverlay() {
+  S.detections = [];
+  S.detLastReceivedAt = 0;
+  clearOverlayCanvas();
+}
+function detApply(data) {
+  DET.avail = !!data;
+  DET.enabled = !!(data && data.enabled);
+  if (DET.avail && !DET.enabled) detClearOverlay();
+  renderDetToggle();
+}
+function renderDetToggle() {
+  const wrap = $('det-ctl'), btn = $('btn-det');
+  if (!wrap || !btn) return;
+  wrap.hidden = DET.avail === null;
+  const key = !DET.avail ? 'na' : DET.enabled ? 'on' : 'off';
+  setText(btn, t('det.' + key));
+  btn.disabled = !DET.avail || DET.busy;
+  btn.classList.toggle('btn-primary', !!(DET.avail && DET.enabled));
+  btn.setAttribute('aria-pressed', String(!!(DET.avail && DET.enabled)));
+  // A disabled button gets no hover events, so the tooltip lives on the wrapper.
+  wrap.title = t('det.tip.' + key);
+  btn.setAttribute('aria-label', t('det.tip.' + key));
+}
+async function refreshDetState() {
+  if (DET.busy) return;
+  try { detApply(await detRequest('GET')); }
+  catch (_) { detApply(null); }
+}
+async function toggleDet() {
+  if (!DET.avail || DET.busy) return;
+  DET.busy = true; renderDetToggle();
+  try { const data = await detRequest('POST', { enabled: !DET.enabled }); DET.busy = false; detApply(data); }
+  catch (e) {
+    DET.busy = false;
+    toast(t('det.fail'), 'err', e.status ? String(e.status) : '');
+    if (e.status === 502 || e.status === 404) detApply(null); else renderDetToggle();
+  }
+}
+function initDetToggle() {
+  $('btn-det').addEventListener('click', toggleDet);
+  i18nHooks.push(renderDetToggle);
+  // Polling picks up a detector that starts later and toggles made by agents over the API.
+  // Slower while unavailable: each failed probe is a 502 that armd logs.
+  const poll = async () => {
+    if (!document.hidden) await refreshDetState();
+    DET.timer = setTimeout(poll, DET.avail ? 10000 : 30000);
+  };
+  poll();
 }
 
 async function loadSchema() {
@@ -4357,6 +4444,7 @@ window.V = V;
 loadSchema();
 connectWS();
 connectDetectionWS();
+initDetToggle();
 videoStart();
 requestAnimationFrame(frame);
 

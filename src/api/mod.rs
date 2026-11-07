@@ -32,8 +32,14 @@ async fn serve_jmuxer() -> impl axum::response::IntoResponse {
     )
 }
 
-/// Build the Axum router for the arm daemon
+/// Build the Axum router for the arm daemon. The detector control API upstream is
+/// `ARMD_DETECTOR_URL` (default `http://127.0.0.1:8090`).
 pub fn create_router(supervisor: Arc<ArmSupervisor>) -> Router {
+    create_router_with_detector(supervisor, proxy::DetectorUpstream::from_env())
+}
+
+/// [`create_router`] with an explicit detector control API upstream.
+pub fn create_router_with_detector(supervisor: Arc<ArmSupervisor>, detector: proxy::DetectorUpstream) -> Router {
     Router::new()
         .route("/", get(serve_index))
         .route("/assets/jmuxer.min.js", get(serve_jmuxer))
@@ -55,6 +61,12 @@ pub fn create_router(supervisor: Arc<ArmSupervisor>) -> Router {
         // Single-Origin Reverse Proxy Routes
         .route("/api/v1/detection/ws", get(proxy::proxy_detection_ws))
         .route("/results", get(proxy::proxy_detection_ws))
+        .route(
+            "/api/v1/detection/inference",
+            get(proxy::get_detection_inference).post(proxy::post_detection_inference),
+        )
+        .route("/api/v1/detection/latest", get(proxy::get_detection_latest))
+        .layer(axum::Extension(detector))
         .layer(middleware::from_fn(same_origin))
         .layer(TraceLayer::new_for_http())
         .with_state(supervisor)
