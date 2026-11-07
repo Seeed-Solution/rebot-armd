@@ -3602,6 +3602,9 @@ const WS_LIVE_EDGE_TARGET = 0.15;   // s from the edge to land on after a snap
 const WS_RECONNECT_GRACE = 3;       // ws-only retries after a working ws stream drops
 const WS_RECONNECT_MAX_MS = 5000;   // backoff: min(1500 * n, max)
 const WS_FRAME_GAP_MS = 3000;       // no frame for this long on a live ws stream = dropped
+const WS_DEFAULT_FRAME_MS = 33;     // first frame, before a timestamp delta exists
+const WS_MIN_FRAME_MS = 10;         // clamp for the timestamp-derived frame duration
+const WS_MAX_FRAME_MS = 200;
 
 let lastHint = null;
 function videoHint(kind, title, sub) {
@@ -3671,10 +3674,18 @@ function setupWS(fail, gen) {
   ws.binaryType = 'arraybuffer';
   V.ws = ws;
   let lastFrame = 0;
+  let lastTs = null;
   ws.onmessage = (ev) => {
     if (gen !== V.gen || !(ev.data instanceof ArrayBuffer) || ev.data.byteLength <= 8) return;
     lastFrame = performance.now();
-    if (V.jmx) V.jmx.feed({ video: new Uint8Array(ev.data, 0, ev.data.byteLength - 8) });
+    // Frame duration from the device timestamps: the sensor may run below the
+    // nominal 30 fps (ISP at 10 fps), and a fixed 1/30 s would make playback
+    // drift to a third of real time between live-edge snaps.
+    const n = ev.data.byteLength - 8;
+    const ts = Number(new DataView(ev.data, n, 8).getBigUint64(0, true));
+    const duration = lastTs === null ? WS_DEFAULT_FRAME_MS : Math.min(WS_MAX_FRAME_MS, Math.max(WS_MIN_FRAME_MS, ts - lastTs));
+    lastTs = ts;
+    if (V.jmx) V.jmx.feed({ video: new Uint8Array(ev.data, 0, n), duration });
   };
   ws.onerror = () => fail(new Error('ws unreachable'));
   ws.onclose = () => fail(new Error('ws closed'));
@@ -3851,7 +3862,8 @@ async function videoStart(wsOnly = false) {
   const gen = V.gen;
   if (CFG.video.mjpeg) return startMJPEG();
   const go2rtc = [['webrtc', 7000, setupWebRTC], ['mse', 6000, setupMSE], ['mp4', 6000, setupMP4]];
-  const chain = [['ws', 4000, setupWS], ...(wsOnly ? [] : go2rtc)];
+  // 6 s: at 10 fps MSE takes ~3 s from the first IDR to 'playing'.
+  const chain = [['ws', 6000, setupWS], ...(wsOnly ? [] : go2rtc)];
   for (const [kind, timeout, setup] of chain) {
     if (gen !== V.gen) return;
     const where = kind === 'ws' ? CFG.video.ws : `${CFG.video.host} · ${CFG.video.src}`;
