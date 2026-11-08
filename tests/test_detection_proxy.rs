@@ -19,6 +19,8 @@ struct SeenRequest {
 /// Raw-TCP mock of the detector control API. Behaviour by path:
 /// - GET/POST /api/inference: JSON state; POST with a body lacking `enabled` -> 400
 /// - GET /api/results/latest: sleeps `wait_ms`/10 ms (chunked reply), or 3 s with `slow=1`
+/// - POST /api/trigger: sleeps `wait_ms`/10 ms (default wait 2500), or 3 s with `slow=1`;
+///   `miss=1` -> `{"success":false,"timeout":true}`. Any other path (e.g. under a base path) -> 404
 async fn spawn_mock_upstream() -> (SocketAddr, Arc<Mutex<Vec<SeenRequest>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -75,6 +77,18 @@ async fn spawn_mock_upstream() -> (SocketAddr, Arc<Mutex<Vec<SeenRequest>>>) {
                         let body = serde_json::json!({"enabled": true, "frame_id": 7, "ts_ms": 1, "age_ms": 2, "inference_time_ms": 30,
                             "detections": [{"label": "cup", "score": 0.9, "bbox": [1, 2, 3, 4]}]});
                         ("200 OK", body.to_string(), true)
+                    }
+                    ("POST", "/api/trigger") => {
+                        let wait = query.split('&').find_map(|kv| kv.strip_prefix("wait_ms=")).map(|v| v.parse::<u64>().unwrap()).unwrap_or(2500);
+                        let delay = if query.contains("slow=1") { 3000 } else { wait / 10 };
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        let body = if query.contains("miss=1") {
+                            serde_json::json!({"success": false, "timeout": true, "count": 0, "markers": []})
+                        } else {
+                            serde_json::json!({"success": true, "frame_id": 9, "ts_ms": 1, "age_ms": 3, "inference_time_ms": 12.5, "count": 1,
+                                "markers": [{"id": 4, "corners": [[1, 2], [3, 2], [3, 4], [1, 4]]}]})
+                        };
+                        ("200 OK", body.to_string(), false)
                     }
                     _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string(), false),
                 };
@@ -193,6 +207,83 @@ async fn cross_origin_post_is_rejected_like_other_control_routes() {
         .post(format!("http://{addr}/api/v1/detection/inference"))
         .header("origin", "http://evil.example")
         .json(&serde_json::json!({"enabled": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn trigger_forwards_query_and_leaves_inference_state_alone() {
+    let (up, seen) = spawn_mock_upstream().await;
+    let addr = spawn_armd(&format!("http://{up}")).await;
+    let c = reqwest::Client::new();
+    let t0 = Instant::now();
+    let r = c.post(format!("http://{addr}/api/v1/detection/trigger?wait_ms=3000")).send().await.unwrap();
+    let dt = t0.elapsed();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["cache-control"], "no-store");
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["success"], true);
+    assert_eq!(v["frame_id"], 9);
+    assert_eq!(v["markers"][0]["id"], 4);
+    assert!(dt >= Duration::from_millis(300), "long-poll delay not observed: {dt:?}");
+
+    let r = c.post(format!("http://{addr}/api/v1/detection/trigger?wait_ms=500&miss=1")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.json::<serde_json::Value>().await.unwrap(), serde_json::json!({"success": false, "timeout": true, "count": 0, "markers": []}));
+
+    let r = c.post(format!("http://{addr}/api/v1/detection/trigger")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+
+    let seen = seen.lock().unwrap().clone();
+    let targets: Vec<_> = seen.iter().map(|s| (s.method.as_str(), s.target.as_str())).collect();
+    assert_eq!(
+        targets,
+        vec![("POST", "/api/trigger?wait_ms=3000"), ("POST", "/api/trigger?wait_ms=500&miss=1"), ("POST", "/api/trigger")]
+    );
+    // Trigger never touches the continuous-inference toggle.
+    assert!(seen.iter().all(|s| s.target != "/api/inference"));
+}
+
+#[tokio::test]
+async fn trigger_passes_through_404_from_old_detector() {
+    let (up, seen) = spawn_mock_upstream().await;
+    // Under a base path the mock knows no routes, standing in for a detector without /api/trigger.
+    let addr = spawn_armd(&format!("http://{up}/old")).await;
+    let r = reqwest::Client::new().post(format!("http://{addr}/api/v1/detection/trigger?wait_ms=100")).send().await.unwrap();
+    assert_eq!(r.status(), 404);
+    assert_eq!(r.json::<serde_json::Value>().await.unwrap(), serde_json::json!({"error": "not found"}));
+    assert_eq!(seen.lock().unwrap()[0].target, "/old/api/trigger?wait_ms=100");
+}
+
+#[tokio::test]
+async fn trigger_times_out_after_wait_plus_margin_and_502_when_down() {
+    let (up, _) = spawn_mock_upstream().await;
+    let addr = spawn_armd(&format!("http://{up}")).await;
+    let c = reqwest::Client::new();
+    // wait_ms=0 -> 2 s budget; the mock answers after 3 s.
+    let t0 = Instant::now();
+    let r = c.post(format!("http://{addr}/api/v1/detection/trigger?slow=1&wait_ms=0")).send().await.unwrap();
+    let dt = t0.elapsed();
+    assert_eq!(r.status(), 502);
+    assert!(dt >= Duration::from_millis(1900) && dt < Duration::from_millis(2900), "timeout {dt:?}");
+
+    let port = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+    let addr = spawn_armd(&format!("http://127.0.0.1:{port}")).await;
+    let r = c.post(format!("http://{addr}/api/v1/detection/trigger?wait_ms=100")).send().await.unwrap();
+    assert_eq!(r.status(), 502);
+    assert_eq!(r.json::<serde_json::Value>().await.unwrap(), serde_json::json!({"error": "detector unreachable"}));
+}
+
+#[tokio::test]
+async fn cross_origin_trigger_is_rejected() {
+    let (up, seen) = spawn_mock_upstream().await;
+    let addr = spawn_armd(&format!("http://{up}")).await;
+    let r = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/detection/trigger"))
+        .header("origin", "http://evil.example")
         .send()
         .await
         .unwrap();

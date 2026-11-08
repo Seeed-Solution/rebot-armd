@@ -66,6 +66,7 @@ pub fn create_router_with_detector(supervisor: Arc<ArmSupervisor>, detector: pro
             get(proxy::get_detection_inference).post(proxy::post_detection_inference),
         )
         .route("/api/v1/detection/latest", get(proxy::get_detection_latest))
+        .route("/api/v1/detection/trigger", post(proxy::post_detection_trigger))
         .layer(axum::Extension(detector))
         .layer(middleware::from_fn(same_origin))
         .layer(TraceLayer::new_for_http())

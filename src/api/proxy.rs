@@ -326,13 +326,18 @@ fn detector_unreachable() -> Response {
 
 /// `wait_ms` from a raw query string, clamped to the upstream cap.
 fn wait_ms_from_query(query: Option<&str>) -> u64 {
+    wait_ms_or(query, 0)
+}
+
+/// `wait_ms` from a raw query string (`default` if absent or invalid), clamped to the upstream cap.
+fn wait_ms_or(query: Option<&str>, default: u64) -> u64 {
     query
         .into_iter()
         .flat_map(|q| q.split('&'))
         .filter_map(|kv| kv.split_once('='))
         .find(|(k, _)| *k == "wait_ms")
         .and_then(|(_, v)| v.parse::<u64>().ok())
-        .unwrap_or(0)
+        .unwrap_or(default)
         .min(MAX_WAIT_MS)
 }
 
@@ -359,6 +364,24 @@ pub async fn get_detection_latest(
     forward(&up, Method::GET, path, None, timeout).await
 }
 
+/// Upstream `/api/trigger` waits this long when the query has no `wait_ms`.
+const TRIGGER_DEFAULT_WAIT_MS: u64 = 2500;
+
+/// POST /api/v1/detection/trigger -> upstream POST /api/trigger (query passed through).
+/// Single-shot inference on a frame newer than the call; does not change the continuous
+/// `enabled` state. Detector builds without the route answer 404, which is passed through.
+pub async fn post_detection_trigger(
+    Extension(up): Extension<DetectorUpstream>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let timeout = Duration::from_millis(wait_ms_or(query.as_deref(), TRIGGER_DEFAULT_WAIT_MS)) + TIMEOUT_MARGIN;
+    let path = match &query {
+        Some(q) if !q.is_empty() => format!("/api/trigger?{q}"),
+        _ => "/api/trigger".to_string(),
+    };
+    forward(&up, Method::POST, path, Some(Bytes::new()), timeout).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +402,9 @@ mod tests {
         assert_eq!(wait_ms_from_query(Some("after=3&wait_ms=3000")), 3000);
         assert_eq!(wait_ms_from_query(Some("wait_ms=99999")), 5000);
         assert_eq!(wait_ms_from_query(Some("wait_ms=abc")), 0);
+        assert_eq!(wait_ms_or(None, TRIGGER_DEFAULT_WAIT_MS), 2500);
+        assert_eq!(wait_ms_or(Some("wait_ms=9000"), TRIGGER_DEFAULT_WAIT_MS), 5000);
+        assert_eq!(wait_ms_or(Some("wait_ms=800"), TRIGGER_DEFAULT_WAIT_MS), 800);
     }
 
     #[test]

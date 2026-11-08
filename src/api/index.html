@@ -2582,7 +2582,8 @@ function connectDetectionWS() {
 
 /* Detect toggle: on-demand inference via /api/v1/detection/inference (armd proxies the detector).
    Plain fetch, not api(): this is not arm control and must not feed the RTT telemetry. */
-const DET = { avail: null, enabled: false, busy: false, timer: null, snap: false, fps: null, activeFps: null, idleFps: null };
+// trigCap: does the detector have POST /api/trigger? null = not probed yet, false = 404 (older build).
+const DET = { avail: null, enabled: false, busy: false, timer: null, snap: false, fps: null, activeFps: null, idleFps: null, trigCap: null };
 async function detRequest(method, body) {
   const ctl = new AbortController();
   const tm = setTimeout(() => ctl.abort(), 4000);
@@ -2608,6 +2609,7 @@ function detClearOverlay() {
 }
 function detApply(data) {
   DET.avail = !!data;
+  if (!data) DET.trigCap = null; // re-probe once the detector (possibly upgraded) comes back
   DET.enabled = !!(data && data.enabled);
   const n = (v) => (Number.isFinite(Number(v)) && v !== null ? Number(v) : null);
   DET.fps = n(data && data.fps); DET.activeFps = n(data && data.active_fps); DET.idleFps = n(data && data.idle_fps);
@@ -2650,10 +2652,13 @@ function renderDetToggle() {
   }
 }
 
-/* Single-shot detection. The contract has no dedicated trigger, so it is composed from the existing calls:
-   (if off) POST enabled:true -> GET /detection/latest?wait_ms (newer than the pre-trigger result) -> POST enabled:false.
+/* Single-shot detection. Primary: POST /detection/trigger, which runs inference on a frame newer than the call
+   without touching the continuous `enabled` flag, so other clients that enabled inference are unaffected.
+   Fallback for detector builds that answer 404 (cached in DET.trigCap): (if off) POST enabled:true ->
+   GET /detection/latest?wait_ms (newer than the pre-trigger result) -> POST enabled:false.
    A result taken while inference was off stays on screen for SNAP_HOLD_MS. Resolves to the parsed detections. */
 const SNAP_HOLD_MS = 4000;
+const TRIG_WAIT_MS = 3000;
 async function detLatest(query) {
   const ctl = new AbortController();
   const tm = setTimeout(() => ctl.abort(), 6500);
@@ -2665,35 +2670,71 @@ async function detLatest(query) {
     return data;
   } finally { clearTimeout(tm); }
 }
+async function detTriggerReq(waitMs) {
+  const ctl = new AbortController();
+  // armd waits wait_ms + 2 s for the detector; allow a little more for the browser round trip.
+  const tm = setTimeout(() => ctl.abort(), waitMs + 3500);
+  try {
+    const res = await fetch('/api/v1/detection/trigger?wait_ms=' + waitMs, { method: 'POST', signal: ctl.signal, cache: 'no-store' });
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+    if (!res.ok || data == null) { const e = new Error((data && data.error) || 'HTTP ' + res.status); e.status = res.status; throw e; }
+    return data;
+  } finally { clearTimeout(tm); }
+}
 const detSeq = (d) => (d && typeof d === 'object' ? (d.seq ?? d.frame_id ?? d.timestamp ?? d.ts ?? null) : null);
+/* Fallback single shot for detectors without /api/trigger. Sets ctx.enabledByUs when it turned inference on. */
+async function detComposedShot(wasOn, ctx) {
+  let base = null;
+  try { base = detSeq(await detLatest('')); } catch (_) {}
+  if (!wasOn) {
+    ctx.enabledByUs = true; // set first: if the reply is lost the enable may still have applied, so restore anyway
+    await detRequest('POST', { enabled: true });
+  }
+  const query = '?wait_ms=' + TRIG_WAIT_MS + (base != null ? '&after=' + encodeURIComponent(base) : '');
+  const data = await detLatest(query);
+  if (!data || data.timeout || data.frame_id === 0) {
+    throw new Error('Detection timeout: no fresh frame received');
+  }
+  if (base != null) {
+    const curSeq = detSeq(data);
+    if (curSeq != null && Number(curSeq) <= Number(base)) {
+      throw new Error('Detection stale: frame ID not newer than baseline');
+    }
+  }
+  return data;
+}
 async function triggerDet({ quiet = false } = {}) {
   if (!DET.avail || DET.busy || DET.snap) return null;
   DET.snap = true; renderDetToggle();
   const wasOn = DET.enabled;
+  const ctx = { enabledByUs: false };
   let parsed = null, err = null, parsedReceivedAt = 0;
   try {
-    let base = null;
-    try { base = detSeq(await detLatest('')); } catch (_) {}
-    if (!wasOn) {
-      await detRequest('POST', { enabled: true });
-    }
-    const query = '?wait_ms=3000' + (base != null ? '&after=' + encodeURIComponent(base) : '');
-    const data = await detLatest(query);
-    if (!data || data.timeout || data.frame_id === 0) {
-      throw new Error('Detection timeout: no fresh frame received');
-    }
-    if (base != null) {
-      const curSeq = detSeq(data);
-      if (curSeq != null && Number(curSeq) <= Number(base)) {
-        throw new Error('Detection stale: frame ID not newer than baseline');
+    let data = null, viaTrigger = false;
+    if (DET.trigCap !== false) {
+      try {
+        data = await detTriggerReq(TRIG_WAIT_MS);
+        DET.trigCap = true; viaTrigger = true;
+      } catch (e) {
+        if (e.status !== 404) throw e;
+        DET.trigCap = false;
       }
+    }
+    if (viaTrigger) {
+      // The detector already guarantees frame_id > the pre-call frame; success=false means no fresh frame in time.
+      if (data.success !== true || data.timeout || !data.frame_id) {
+        throw new Error('Detection timeout: no fresh frame received');
+      }
+    } else {
+      data = await detComposedShot(wasOn, ctx);
     }
     const receivedAt = performance.now();
     parsed = parseDetections(data, videoSrcRes());
     parsedReceivedAt = receivedAt;
   } catch (e) { err = e; }
   let restoreFailed = false;
-  if (!wasOn) {
+  if (ctx.enabledByUs) {
     try { detApply(await detRequest('POST', { enabled: false })); }
     catch (_) { restoreFailed = true; }
   }
