@@ -1431,7 +1431,7 @@ const I18N = {
     'det.tip.on': '物体识别已开启，点击关闭', 'det.tip.off': '物体识别已关闭，点击开启',
     'det.tip.na': '识别服务不可用（检测程序未运行或版本过旧）', 'det.fail': '切换识别失败',
     'det.trig': '单次识别', 'det.trig.busy': '识别中…', 'det.trig.tip': '临时开启识别，抓拍一帧结果后恢复原状态',
-    'det.trig.none': '单次识别未返回目标', 'det.trig.ok': '单次识别：{n} 个目标', 'det.trig.fail': '单次识别失败',
+    'det.trig.none': '单次识别未返回目标', 'det.trig.ok': '单次识别：{n} 个目标', 'det.trig.fail': '单次识别失败', 'det.restore.fail': '识别未能关闭，请手动关闭持续识别',
     'det.fps.idle': '待机 {n} FPS', 'det.fps.work': '工作 {n} FPS', 'det.fps.snap': '抓拍中', 'det.fps.tip': '相机推理帧率：待机 {idle} FPS / 工作 {active} FPS',
     'calib.open': '手眼标定', 'calib.title': '手眼标定', 'calib.close': '关闭',
     'calib.hint': '眼在手外：相机固定，ArUco 标记贴在夹爪末端（标记中心与 TCP 重合）。每次把机械臂移到不同位置并静止后采集一次，点位尽量分散在工作空间。',
@@ -1523,7 +1523,7 @@ const I18N = {
     'det.tip.on': 'Object detection is on. Click to turn it off', 'det.tip.off': 'Object detection is off. Click to turn it on',
     'det.tip.na': 'Detection service unavailable (detector not running or too old)', 'det.fail': 'Could not switch detection',
     'det.trig': 'Snapshot', 'det.trig.busy': 'Detecting…', 'det.trig.tip': 'Turn detection on briefly, grab one result, then restore the previous state',
-    'det.trig.none': 'Snapshot returned no targets', 'det.trig.ok': 'Snapshot: {n} targets', 'det.trig.fail': 'Snapshot failed',
+    'det.trig.none': 'Snapshot returned no targets', 'det.trig.ok': 'Snapshot: {n} targets', 'det.trig.fail': 'Snapshot failed', 'det.restore.fail': 'Could not switch detection back off, turn it off manually',
     'det.fps.idle': 'Idle {n} FPS', 'det.fps.work': 'Active {n} FPS', 'det.fps.snap': 'Capturing', 'det.fps.tip': 'Camera inference rate: idle {idle} FPS / active {active} FPS',
     'calib.open': 'Hand-Eye Cal', 'calib.title': 'Hand-Eye Calibration', 'calib.close': 'Close',
     'calib.hint': 'Eye-to-hand: the camera is fixed and an ArUco marker is mounted on the gripper tip (marker centre at the TCP). Move the arm to a new pose, wait until it stops, then capture. Spread the poses across the workspace.',
@@ -2684,9 +2684,14 @@ async function detTriggerReq(waitMs) {
 }
 const detSeq = (d) => (d && typeof d === 'object' ? (d.seq ?? d.frame_id ?? d.timestamp ?? d.ts ?? null) : null);
 /* Fallback single shot for detectors without /api/trigger. Sets ctx.enabledByUs when it turned inference on. */
-async function detComposedShot(wasOn, ctx) {
+async function detComposedShot(ctx) {
   let base = null;
   try { base = detSeq(await detLatest('')); } catch (_) {}
+  // without a baseline `latest` would return a cached old result immediately
+  if (base == null) throw new Error('Detection baseline unavailable');
+  // fresh device state, not the page's cached 10 s poll
+  let wasOn;
+  try { wasOn = ctx.wasOn = (await detRequest('GET')).enabled; } catch (_) { throw new Error('Detection state unavailable'); }
   if (!wasOn) {
     ctx.enabledByUs = true; // set first: if the reply is lost the enable may still have applied, so restore anyway
     await detRequest('POST', { enabled: true });
@@ -2708,7 +2713,7 @@ async function triggerDet({ quiet = false } = {}) {
   if (!DET.avail || DET.busy || DET.snap) return null;
   DET.snap = true; renderDetToggle();
   const wasOn = DET.enabled;
-  const ctx = { enabledByUs: false };
+  const ctx = { enabledByUs: false, wasOn };
   let parsed = null, err = null, parsedReceivedAt = 0;
   try {
     let data = null, viaTrigger = false;
@@ -2727,7 +2732,7 @@ async function triggerDet({ quiet = false } = {}) {
         throw new Error('Detection timeout: no fresh frame received');
       }
     } else {
-      data = await detComposedShot(wasOn, ctx);
+      data = await detComposedShot(ctx);
     }
     const receivedAt = performance.now();
     parsed = parseDetections(data, videoSrcRes());
@@ -2735,16 +2740,20 @@ async function triggerDet({ quiet = false } = {}) {
   } catch (e) { err = e; }
   let restoreFailed = false;
   if (ctx.enabledByUs) {
-    try { detApply(await detRequest('POST', { enabled: false })); }
-    catch (_) { restoreFailed = true; }
+    restoreFailed = true;
+    for (let i = 0; i < 3 && restoreFailed; i++) {
+      try { detApply(await detRequest('POST', { enabled: false })); restoreFailed = false; }
+      catch (_) {}
+    }
   }
   DET.snap = false;
   if (restoreFailed) {
     refreshDetState();
+    toast(t('det.restore.fail'), 'warn');
   }
   if (parsed) {
     S.detections = parsed; S.detSource = 'snapshot'; S.detLastReceivedAt = parsedReceivedAt || performance.now();
-    if (!wasOn) S.detHoldUntil = performance.now() + SNAP_HOLD_MS;
+    if (!ctx.wasOn) S.detHoldUntil = performance.now() + SNAP_HOLD_MS;
     if (!quiet) toast(parsed.length ? t('det.trig.ok', { n: parsed.length }) : t('det.trig.none'), parsed.length ? '' : 'warn');
   } else if (!quiet) toast(t('det.trig.fail'), 'err', err && err.status ? String(err.status) : '');
   renderDetToggle();
