@@ -103,21 +103,22 @@ async function run() {
         label: 'ID:0', score: 1.0,
         aruco: {
           id: 0,
-          corners: [[350, 300], [550, 300], [550, 500], [350, 500]],
+          corners: [[0.35, 0.30], [0.55, 0.30], [0.55, 0.50], [0.35, 0.50]],
           t: [0.045, -0.012, 0.354],
           rpy: [-1.2, 3.4, 45.0],
           error: 0.001
         }
       }];
       S.detLastReceivedAt = performance.now();
+      S.detHoldUntil = performance.now() + 10000;
       S.detSource = 'mock_aruco';
-      if (typeof renderOverlayCanvas === 'function') {
-        renderOverlayCanvas();
+      if (typeof drawOverlay === 'function') {
+        drawOverlay();
       }
     }
   });
 
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(200);
   await page.screenshot({ path: path.join(outDir, '04_aruco_3d_ar_overlay.png') });
   console.log('[+] Saved 04_aruco_3d_ar_overlay.png');
 

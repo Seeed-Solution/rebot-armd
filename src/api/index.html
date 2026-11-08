@@ -2886,7 +2886,13 @@ async function calCapture() {
   CAL.busy = true; calRender();
   try {
     let m = calMarker({ freshOnly: true });
-    if (!m && DET.avail) { await triggerDet({ quiet: true }); m = calMarker({ freshOnly: true }); }
+    if (!m && DET.avail) {
+      const parsed = await triggerDet({ quiet: true });
+      if (Array.isArray(parsed)) {
+        const ms = parsed.filter((d) => d.aruco && d.aruco.t);
+        m = ms.find((d) => CAL.markerId != null && String(d.aruco.id) === String(CAL.markerId)) || (CAL.markerId == null ? ms[0] : null) || null;
+      }
+    }
     if (!m) { toast(t('calib.e.nomarker'), 'warn'); return; }
     // Re-verify telemetry validity and velocity after async detection trigger
     if (!isLive() || !S.obs || !Array.isArray(S.obs.positions) || S.obs.positions.length < 4) { toast(t('calib.e.offline'), 'warn'); return; }
