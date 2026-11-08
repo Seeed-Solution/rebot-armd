@@ -2673,15 +2673,20 @@ async function triggerDet({ quiet = false } = {}) {
   let parsed = null, err = null;
   try {
     let base = null;
+    try { base = detSeq(await detLatest('')); } catch (_) {}
     if (!wasOn) {
-      try { base = detSeq(await detLatest('')); } catch (_) {}
       await detRequest('POST', { enabled: true });
     }
-    let data;
-    try { data = await detLatest('?wait_ms=3000' + (base != null ? '&after=' + encodeURIComponent(base) : '')); }
-    catch (e) { if (base == null) throw e; data = await detLatest('?wait_ms=3000'); }
-    if (data && (data.timeout || data.frame_id === 0)) {
+    const query = '?wait_ms=3000' + (base != null ? '&after=' + encodeURIComponent(base) : '');
+    const data = await detLatest(query);
+    if (!data || data.timeout || data.frame_id === 0) {
       throw new Error('Detection timeout: no fresh frame received');
+    }
+    if (base != null) {
+      const curSeq = detSeq(data);
+      if (curSeq != null && Number(curSeq) <= Number(base)) {
+        throw new Error('Detection stale: frame ID not newer than baseline');
+      }
     }
     parsed = parseDetections(data, videoSrcRes());
   } catch (e) { err = e; }
