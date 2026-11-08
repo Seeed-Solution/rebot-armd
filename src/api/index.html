@@ -2670,7 +2670,7 @@ async function triggerDet({ quiet = false } = {}) {
   if (!DET.avail || DET.busy || DET.snap) return null;
   DET.snap = true; renderDetToggle();
   const wasOn = DET.enabled;
-  let parsed = null, err = null;
+  let parsed = null, err = null, parsedReceivedAt = 0;
   try {
     let base = null;
     try { base = detSeq(await detLatest('')); } catch (_) {}
@@ -2688,14 +2688,21 @@ async function triggerDet({ quiet = false } = {}) {
         throw new Error('Detection stale: frame ID not newer than baseline');
       }
     }
+    const receivedAt = performance.now();
     parsed = parseDetections(data, videoSrcRes());
+    parsedReceivedAt = receivedAt;
   } catch (e) { err = e; }
+  let restoreFailed = false;
   if (!wasOn) {
-    try { detApply(await detRequest('POST', { enabled: false })); } catch (_) { refreshDetState(); }
+    try { detApply(await detRequest('POST', { enabled: false })); }
+    catch (_) { restoreFailed = true; }
   }
   DET.snap = false;
+  if (restoreFailed) {
+    refreshDetState();
+  }
   if (parsed) {
-    S.detections = parsed; S.detSource = 'snapshot'; S.detLastReceivedAt = performance.now();
+    S.detections = parsed; S.detSource = 'snapshot'; S.detLastReceivedAt = parsedReceivedAt || performance.now();
     if (!wasOn) S.detHoldUntil = performance.now() + SNAP_HOLD_MS;
     if (!quiet) toast(parsed.length ? t('det.trig.ok', { n: parsed.length }) : t('det.trig.none'), parsed.length ? '' : 'warn');
   } else if (!quiet) toast(t('det.trig.fail'), 'err', err && err.status ? String(err.status) : '');
