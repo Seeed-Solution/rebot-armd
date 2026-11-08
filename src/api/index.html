@@ -228,6 +228,51 @@ body.ui-expert .main {
 .det-btn.btn-primary { background: var(--sc-color-primary-dark); }
 .det-btn.btn-primary::before { background: #fff; }
 .det-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+.det-ctl { gap: 6px; flex-wrap: wrap; }
+.det-btn.det-trig::before { background: var(--sc-color-primary-dark); border-radius: 2px; }
+.det-btn.det-trig.busy::before { animation: breathe 0.9s ease-in-out infinite; }
+/* camera power-state pill: idle (grey) / working (green) / snapshot (amber) */
+.fps-pill { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border-radius: 14px; font-size: 12px; font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums;
+  background: rgba(255,255,255,0.8); color: var(--sc-status-disabled-fg); border: 1px solid rgba(255,255,255,0.6); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+.fps-pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.fps-pill.is-work { color: var(--sc-status-normal-fg); background: rgba(239,252,232,0.92); }
+.fps-pill.is-snap { color: var(--sc-status-warning-fg); background: rgba(255,247,230,0.92); }
+.fps-pill.is-snap::before { animation: breathe 0.9s ease-in-out infinite; }
+
+/* ---------- hand-eye calibration drawer ---------- */
+.calib-mask { position: fixed; inset: 0; z-index: 1040; display: flex; justify-content: flex-end; background: rgba(15, 23, 42, 0.32); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); animation: cfade .18s ease; }
+.calib-drawer { width: min(440px, 100%); height: 100%; display: flex; flex-direction: column; gap: 14px; padding: max(18px, env(safe-area-inset-top)) max(18px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) 18px;
+  background: var(--sc-color-bg-container); border-left: 1px solid var(--sc-color-border); box-shadow: -12px 0 40px rgba(31,41,55,0.16); overflow-y: auto; overscroll-behavior: contain; animation: cslide .22s cubic-bezier(.2,.8,.2,1); }
+.calib-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.calib-head h3 { font-size: 17px; font-weight: 600; color: var(--sc-color-text); }
+.calib-x { width: 48px; min-height: 48px; padding: 0; font-size: 22px; line-height: 1; }
+.calib-hint { font-size: 13px; line-height: 1.6; color: var(--sc-color-text-secondary); padding: 10px 12px; border-radius: var(--sc-radius-md); background: var(--sc-color-bg-sunken); border: 1px solid var(--sc-color-border); }
+.calib-prog { display: grid; gap: 8px; }
+.calib-count { font-size: 15px; font-weight: 600; color: var(--sc-color-text); }
+.calib-bar { height: 8px; border-radius: 4px; background: var(--sc-color-bg-sunken); overflow: hidden; border: 1px solid var(--sc-color-border); }
+.calib-bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--sc-color-primary-dark), var(--sc-color-primary)); transition: width .25s; }
+.calib-live { font-size: 12px; padding: 8px 10px; border-radius: var(--sc-radius-md); background: var(--sc-status-disabled-bg); color: var(--sc-status-disabled-fg); }
+.calib-live.ok { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); }
+.calib-list { list-style: none; display: grid; gap: 4px; max-height: 210px; overflow-y: auto; font-size: 12px; color: var(--sc-color-text-secondary); }
+.calib-list li { display: flex; justify-content: space-between; gap: 8px; padding: 6px 10px; border-radius: var(--sc-radius-base); background: var(--sc-color-bg-sunken); }
+.calib-list li b { color: var(--sc-color-text); font-weight: 600; }
+.calib-list li.bad { background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); }
+.calib-result { display: grid; gap: 6px; padding: 12px; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-primary); background: var(--sc-color-primary-soft); font-size: 13px; }
+.calib-result .row { display: flex; justify-content: space-between; gap: 10px; }
+.calib-result .row span:first-child { color: var(--sc-color-text-secondary); }
+.calib-result.warn { border-color: #ffd591; background: var(--sc-status-warning-bg); }
+.calib-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: auto; padding-top: 4px; }
+.calib-actions .btn { min-height: 52px; font-size: 15px; touch-action: manipulation; }
+.calib-actions #calib-cap { grid-column: 1 / -1; }
+.calib-actions .calib-reset { color: var(--sc-status-danger-fg); }
+.calib-actions .calib-reset.armed { background: var(--sc-status-danger-bg); border-color: #ffccc7; }
+@keyframes cfade { from { opacity: 0; } }
+@keyframes cslide { from { transform: translateX(32px); opacity: 0; } }
+@media (max-width: 640px) {
+  .calib-mask { align-items: flex-end; }
+  .calib-drawer { width: 100%; height: auto; max-height: 92dvh; border-left: 0; border-top: 1px solid var(--sc-color-border); border-radius: 16px 16px 0 0; animation-name: cup; }
+  @keyframes cup { from { transform: translateY(32px); opacity: 0; } }
+}
 body.recording #rec-chip { display: inline-flex; }
 .banner {
   position: absolute; left: 12px; right: 12px; bottom: 12px; display: none; text-align: center;
@@ -1027,7 +1072,7 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
           </div>
         </div>
         <div class="hud">
-          <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button></span>
+          <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button><button class="btn det-btn det-trig" id="btn-trigger" type="button" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span></span>
           <span class="sc-status-badge" id="cam-chip" data-i18n="v.chip.connecting">连接中</span>
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
           <span class="sc-status-badge plain" id="det-chip" data-i18n="det.none" hidden>检测 --</span>
@@ -1059,6 +1104,10 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
           <div class="seg seg-sm" id="speed-seg" role="radiogroup" data-i18n-aria="speed.mult" aria-label="速度倍率"></div>
         </div>
         <span class="grow"></span>
+        <button class="btn" id="btn-calib" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><path d="M14 4h6v6"/><path d="M20 4l-6 6"/><circle cx="17" cy="17" r="3.5"/><path d="M6.5 14v6M3.5 17h6"/></svg>
+          <span data-i18n="calib.open">手眼标定</span>
+        </button>
         <button class="btn" id="btn-home">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11l8-7 8 7"/><path d="M6 10v10h12V10"/></svg>
           <span data-i18n="home">回零</span>
@@ -1337,6 +1386,28 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
 <!-- JMuxer 2.1.0 (MIT), served by armd from src/api/vendor/jmuxer.min.js;
      upstream dist/jmuxer.min.js sha256 89d303163126ea725048aa90436aab92aaabda28a79a9e09669cb95aa6643ae0 -->
 <script src="/assets/jmuxer.min.js"></script>
+<div class="calib-mask" id="calib" hidden>
+  <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="calib-title">
+    <div class="calib-head">
+      <h3 id="calib-title" data-i18n="calib.title">手眼标定</h3>
+      <button class="btn calib-x" id="calib-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+    </div>
+    <p class="calib-hint" data-i18n="calib.hint">眼在手外：相机固定，ArUco 标记贴在夹爪末端（标记中心与 TCP 重合）。每次把机械臂移到不同位置并静止后采集一次，点位尽量分散在工作空间。</p>
+    <div class="calib-prog">
+      <div class="calib-count mono" id="calib-count">已采集位姿: 0 / 9</div>
+      <div class="calib-bar"><i id="calib-bar"></i></div>
+    </div>
+    <div class="calib-live mono" id="calib-live">--</div>
+    <ol class="calib-list mono" id="calib-list"></ol>
+    <div class="calib-result mono" id="calib-result" hidden></div>
+    <div class="calib-actions">
+      <button class="btn btn-primary" id="calib-cap" type="button" data-i18n="calib.cap">采集当前点位</button>
+      <button class="btn" id="calib-solve" type="button" data-i18n="calib.solve">求解标定</button>
+      <button class="btn" id="calib-export" type="button" data-i18n="calib.export">导出配置</button>
+      <button class="btn calib-reset" id="calib-reset" type="button" data-i18n="calib.reset">重置</button>
+    </div>
+  </aside>
+</div>
 <script>
 'use strict';
 /* =================================================================
@@ -1359,6 +1430,19 @@ const I18N = {
     'det.on': '识别 · 开', 'det.off': '识别 · 关', 'det.na': '识别 · 不可用',
     'det.tip.on': '物体识别已开启，点击关闭', 'det.tip.off': '物体识别已关闭，点击开启',
     'det.tip.na': '识别服务不可用（检测程序未运行或版本过旧）', 'det.fail': '切换识别失败',
+    'det.trig': '单次识别', 'det.trig.busy': '识别中…', 'det.trig.tip': '临时开启识别，抓拍一帧结果后恢复原状态',
+    'det.trig.none': '单次识别未返回目标', 'det.trig.ok': '单次识别：{n} 个目标', 'det.trig.fail': '单次识别失败',
+    'det.fps.idle': '待机 {n} FPS', 'det.fps.work': '工作 {n} FPS', 'det.fps.snap': '抓拍中', 'det.fps.tip': '相机推理帧率：待机 {idle} FPS / 工作 {active} FPS',
+    'calib.open': '手眼标定', 'calib.title': '手眼标定', 'calib.close': '关闭',
+    'calib.hint': '眼在手外：相机固定，ArUco 标记贴在夹爪末端（标记中心与 TCP 重合）。每次把机械臂移到不同位置并静止后采集一次，点位尽量分散在工作空间。',
+    'calib.count': '已采集位姿: {n} / {total}', 'calib.cap': '采集当前点位', 'calib.cap.busy': '采集中…', 'calib.solve': '求解标定', 'calib.export': '导出配置',
+    'calib.reset': '重置', 'calib.reset.confirm': '再点一次确认重置',
+    'calib.live.none': '未识别到带 3D 位姿的标记 · 采集时会自动单次识别', 'calib.live.ok': '标记 ID {id} · Z {z} m',
+    'calib.e.offline': '遥测未连接，无法读取关节状态', 'calib.e.moving': '机械臂仍在运动，请静止后再采集', 'calib.e.nomarker': '未识别到带 3D 位姿的 ArUco 标记',
+    'calib.e.dup': '与第 {i} 个点位距离不足 1 cm，请移到新位置', 'calib.e.few': '至少需要 3 个点位', 'calib.e.degenerate': '点位共线或过于集中，请扩大分布',
+    'calib.ok.cap': '已采集第 {n} 个点位', 'calib.ok.solve': '标定完成，RMSE {rmse} mm', 'calib.rmse.warn': '残差偏大，检查标记是否与 TCP 重合、点位是否静止',
+    'calib.r.t': '平移 T (mm)', 'calib.r.e': '欧拉角 RPY (°)', 'calib.r.rmse': '残差 RMSE', 'calib.r.n': '样本数', 'calib.r.max': '最大残差',
+    'calib.need_more': '已可求解；建议采满 {total} 个', 'calib.del': '删除',
     'rec.chip0': '录制 00:00', 'rec.chip': '录制 ',
     'armview.tag': '姿态示意 · 侧视', 'banner.lock': '遥测断开 · 控制已锁定',
     'ctl.mode': '控制方式', 'mode.joint': '关节点动', 'mode.cart': '空间位姿', 'home': '回零',
@@ -1438,6 +1522,19 @@ const I18N = {
     'det.on': 'Detect · On', 'det.off': 'Detect · Off', 'det.na': 'Detect · N/A',
     'det.tip.on': 'Object detection is on. Click to turn it off', 'det.tip.off': 'Object detection is off. Click to turn it on',
     'det.tip.na': 'Detection service unavailable (detector not running or too old)', 'det.fail': 'Could not switch detection',
+    'det.trig': 'Snapshot', 'det.trig.busy': 'Detecting…', 'det.trig.tip': 'Turn detection on briefly, grab one result, then restore the previous state',
+    'det.trig.none': 'Snapshot returned no targets', 'det.trig.ok': 'Snapshot: {n} targets', 'det.trig.fail': 'Snapshot failed',
+    'det.fps.idle': 'Idle {n} FPS', 'det.fps.work': 'Active {n} FPS', 'det.fps.snap': 'Capturing', 'det.fps.tip': 'Camera inference rate: idle {idle} FPS / active {active} FPS',
+    'calib.open': 'Hand-Eye Cal', 'calib.title': 'Hand-Eye Calibration', 'calib.close': 'Close',
+    'calib.hint': 'Eye-to-hand: the camera is fixed and an ArUco marker is mounted on the gripper tip (marker centre at the TCP). Move the arm to a new pose, wait until it stops, then capture. Spread the poses across the workspace.',
+    'calib.count': 'Poses captured: {n} / {total}', 'calib.cap': 'Capture pose', 'calib.cap.busy': 'Capturing…', 'calib.solve': 'Solve', 'calib.export': 'Export JSON',
+    'calib.reset': 'Reset', 'calib.reset.confirm': 'Tap again to reset',
+    'calib.live.none': 'No marker with a 3D pose · capture will run a snapshot', 'calib.live.ok': 'Marker ID {id} · Z {z} m',
+    'calib.e.offline': 'Telemetry offline, joint state unavailable', 'calib.e.moving': 'Arm is still moving, wait until it stops', 'calib.e.nomarker': 'No ArUco marker with a 3D pose detected',
+    'calib.e.dup': 'Less than 1 cm from pose {i}, move to a new position', 'calib.e.few': 'At least 3 poses are required', 'calib.e.degenerate': 'Poses are collinear or too close together, spread them out',
+    'calib.ok.cap': 'Captured pose {n}', 'calib.ok.solve': 'Calibration solved, RMSE {rmse} mm', 'calib.rmse.warn': 'High residual: check the marker sits on the TCP and the arm was still',
+    'calib.r.t': 'Translation T (mm)', 'calib.r.e': 'Euler RPY (°)', 'calib.r.rmse': 'Residual RMSE', 'calib.r.n': 'Samples', 'calib.r.max': 'Max residual',
+    'calib.need_more': 'Solvable; {total} poses recommended', 'calib.del': 'Delete',
     'rec.chip0': 'REC 00:00', 'rec.chip': 'REC ',
     'armview.tag': 'Pose preview · side view', 'banner.lock': 'Telemetry lost · controls locked',
     'ctl.mode': 'Control mode', 'mode.joint': 'Joint jog', 'mode.cart': 'Cartesian', 'home': 'Home',
@@ -1954,7 +2051,7 @@ function connectWS() {
         S.preset = null;
       }
     }
-    if (o.detections) {
+    if (o.detections && !(performance.now() < (S.detHoldUntil || 0))) {
       const parsed = parseDetections(o.detections, [o.width, o.height]);
       S.detections = parsed;
       S.detSource = 'telemetry_ws';
@@ -2126,8 +2223,92 @@ setInterval(() => {
 /* =================================================================
    YOLO / SSCMA Detections Parser
    ================================================================= */
+/* ArUco / 6-DoF pose fields on a detection item (top level, item.pose or item.detail).
+   Returns { id, cornersRaw, t: [x,y,z] m | null, R: 3x3 camera-frame rotation | null } or null. */
+const POSE = (() => {
+  const num3 = (v) => {
+    if (Array.isArray(v)) { const a = v.flat(2).slice(0, 3).map(Number); return a.length === 3 && a.every(Number.isFinite) ? a : null; }
+    if (v && typeof v === 'object' && v.x !== undefined) { const a = [Number(v.x), Number(v.y), Number(v.z)]; return a.every(Number.isFinite) ? a : null; }
+    return null;
+  };
+  const rodrigues = (r) => {
+    const th = Math.hypot(r[0], r[1], r[2]);
+    if (th < 1e-12) return [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+    const [x, y, z] = [r[0] / th, r[1] / th, r[2] / th], c = Math.cos(th), sn = Math.sin(th), C1 = 1 - c;
+    return [[c + x * x * C1, x * y * C1 - z * sn, x * z * C1 + y * sn],
+            [y * x * C1 + z * sn, c + y * y * C1, y * z * C1 - x * sn],
+            [z * x * C1 - y * sn, z * y * C1 + x * sn, c + z * z * C1]];
+  };
+  const quatR = (w, x, y, z) => {
+    const n = Math.hypot(w, x, y, z) || 1; w /= n; x /= n; y /= n; z /= n;
+    return [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]];
+  };
+  // R = Rz(yaw) * Ry(pitch) * Rx(roll), angles in radians
+  const eulerR = (r, p, y) => {
+    const cr = Math.cos(r), sr = Math.sin(r), cp = Math.cos(p), sp = Math.sin(p), cy = Math.cos(y), sy = Math.sin(y);
+    return [[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr]];
+  };
+  // inverse of eulerR, degrees [roll, pitch, yaw]
+  const rpyDeg = (R) => {
+    const D = 180 / Math.PI;
+    return [Math.atan2(R[2][1], R[2][2]) * D, Math.asin(clamp(-R[2][0], -1, 1)) * D, Math.atan2(R[1][0], R[0][0]) * D];
+  };
+  function fromItem(it) {
+    if (!it || typeof it !== 'object' || Array.isArray(it)) return null;
+    const det = it.detail && typeof it.detail === 'object' ? it.detail : {};
+    const pose = [it.pose, it.pose3d, it.pose_3d, det.pose].find((v) => v && typeof v === 'object') || {};
+    const pick = (...ks) => { for (const src of [pose, it, det]) for (const k of ks) if (src[k] != null) return src[k]; return undefined; };
+
+    let cornersRaw = null;
+    const cr = pick('corners', 'corner', 'polygon');
+    if (Array.isArray(cr)) {
+      const f = cr.flat(2).map((v) => (v && typeof v === 'object' ? [v.x, v.y] : v)).flat().map(Number);
+      if (f.length >= 8 && f.slice(0, 8).every(Number.isFinite)) cornersRaw = [[f[0], f[1]], [f[2], f[3]], [f[4], f[5]], [f[6], f[7]]];
+    }
+
+    // translation: tvec / translation / position, or x/y/z inside pose/detail (never the item's own bbox x/y)
+    let t = num3(pick('tvec', 'translation', 'position', 'xyz'));
+    if (!t) for (const src of [pose, det]) if (!t && src.z !== undefined) t = num3(src);
+    if (t) {
+      const unit = String(pick('unit', 'units') || '').toLowerCase();
+      if (unit === 'mm' || (unit !== 'm' && Math.abs(t[2]) > 20)) t = t.map((v) => v / 1000); // > 20 "m" in front of a camera is mm
+    }
+
+    let R = null;
+    const Rm = pick('R', 'rotation_matrix', 'rmat');
+    if (Array.isArray(Rm)) { const f = Rm.flat().map(Number); if (f.length === 9 && f.every(Number.isFinite)) R = [f.slice(0, 3), f.slice(3, 6), f.slice(6, 9)]; }
+    if (!R) { const rv = num3(pick('rvec', 'rotation_vector', 'rotvec')); if (rv) R = rodrigues(rv); }
+    if (!R) {
+      const q = pick('quaternion', 'quat', 'orientation');
+      if (Array.isArray(q) && q.length >= 4 && q.every((v) => Number.isFinite(Number(v)))) R = quatR(Number(q[3]), Number(q[0]), Number(q[1]), Number(q[2])); // [x, y, z, w]
+      else if (q && typeof q === 'object' && q.w !== undefined) R = quatR(Number(q.w), Number(q.x), Number(q.y), Number(q.z));
+    }
+    if (!R) {
+      const rad = String(pick('angle_unit') || '').toLowerCase().startsWith('rad');
+      const k = rad ? 1 : Math.PI / 180;
+      let e = num3(pick('rpy', 'euler'));
+      if (!e) { const r = [pick('roll', 'rx'), pick('pitch', 'ry'), pick('yaw', 'rz')].map(Number); if (r.every(Number.isFinite)) e = r; }
+      if (e) R = eulerR(e[0] * k, e[1] * k, e[2] * k);
+    }
+    if (R && !R.flat().every(Number.isFinite)) R = null;
+    if (!cornersRaw && !t && !R) return null;
+    const id = pick('marker_id', 'aruco_id', 'id');
+    return { id: id != null ? id : null, cornersRaw, t, R };
+  }
+  return { fromItem, rpyDeg };
+})();
+
 function parseDetections(rawData, refRes) {
   if (!rawData) return [];
+  // detector envelopes: { result: {...} } / { results: {...} }
+  if (!Array.isArray(rawData) && typeof rawData === 'object') {
+    const inner = rawData.result || (rawData.results && !Array.isArray(rawData.results) ? rawData.results : null);
+    if (inner && typeof inner === 'object' && !rawData.boxes && !rawData.detections) return parseDetections(inner, refRes || (rawData.width && rawData.height ? [rawData.width, rawData.height] : null));
+  }
   let items = [];
   let refW = null;
   let refH = null;
@@ -2151,6 +2332,13 @@ function parseDetections(rawData, refRes) {
       items = rawData.data.detections;
     } else if (Array.isArray(rawData.data)) {
       items = rawData.data;
+    } else if (Array.isArray(rawData.results)) {
+      items = rawData.results;
+    }
+    // ArUco markers may arrive in a separate list next to (or instead of) the boxes
+    for (const k of ['markers', 'aruco']) {
+      const m = Array.isArray(rawData[k]) ? rawData[k] : (rawData.data && Array.isArray(rawData.data[k]) ? rawData.data[k] : null);
+      if (m) items = items.concat(m.map((x) => (x && typeof x === 'object' && !Array.isArray(x) ? { label: 'aruco', ...x } : x)));
     }
 
     refW = rawData.width || rawData.w || (rawData.data && (rawData.data.width || rawData.data.w));
@@ -2180,6 +2368,7 @@ function parseDetections(rawData, refRes) {
   const results = [];
   for (const item of items) {
     let rawCx, rawCy, rawW, rawH, score, label, track_id = null;
+    const aru = POSE.fromItem(item);
 
     if (Array.isArray(item) && item.length >= 5) {
       // 格式 A：Seeed SSCMA 官方原生数组格式 [cx, cy, w, h, score, target] (中心点坐标)
@@ -2198,10 +2387,17 @@ function parseDetections(rawData, refRes) {
       if (item[6] !== undefined) track_id = item[6];
     } else if (item !== null && typeof item === 'object' && !Array.isArray(item)) {
       // 格式 B：标准通用字典格式
-      const fmt = item.format;
-      if (fmt !== 'xywh_center' && fmt !== 'xyxy' && fmt !== 'xywh_top_left') continue;
+      // A marker without a bbox format takes its box from the corner hull.
+      const fmt = item.format || (aru && aru.cornersRaw ? 'corners' : undefined);
+      if (fmt !== 'xywh_center' && fmt !== 'xyxy' && fmt !== 'xywh_top_left' && fmt !== 'corners') continue;
 
-      if (fmt === 'xywh_center') {
+      if (fmt === 'corners') {
+        const xs = aru.cornersRaw.map((c) => c[0]), ys = aru.cornersRaw.map((c) => c[1]);
+        const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+        if (x1 <= x0 || y1 <= y0) continue;
+        rawW = x1 - x0; rawH = y1 - y0;
+        rawCx = xs.reduce((a, b) => a + b, 0) / 4; rawCy = ys.reduce((a, b) => a + b, 0) / 4;
+      } else if (fmt === 'xywh_center') {
         const cx = Number(item.cx ?? item.x);
         const cy = Number(item.cy ?? item.y);
         const w = Number(item.w ?? item.width);
@@ -2254,8 +2450,8 @@ function parseDetections(rawData, refRes) {
         rawCx = x0 + w / 2;
         rawCy = y0 + h / 2;
       }
-      score = Number(item.score ?? item.confidence ?? 0);
-      label = item.label ?? item.name ?? item.target ?? item.class_name ?? 'obj';
+      score = Number(item.score ?? item.confidence ?? (aru ? 1 : 0)); // marker decoders report no score
+      label = item.label ?? item.name ?? item.target ?? item.class_name ?? (aru ? 'aruco' : 'obj');
       track_id = item.track_id ?? item.id ?? null;
     } else {
       continue;
@@ -2307,15 +2503,29 @@ function parseDetections(rawData, refRes) {
     const cx = Math.max(0.0, Math.min(1.0, normCx));
     const cy = Math.max(0.0, Math.min(1.0, normCy));
 
+    // ArUco: corners share the bbox unit; normalise them with it (no clamp, so the polygon keeps its shape)
+    let aruco = null;
+    if (aru) {
+      const corners = aru.cornersRaw ? aru.cornersRaw.map(([u, v]) => (isPixelUnit ? [u / refW, v / refH] : [u, v])) : null;
+      aruco = { id: aru.id != null ? aru.id : track_id, corners, t: aru.t, R: aru.R, rpy: aru.R ? POSE.rpyDeg(aru.R) : null };
+    }
+
     results.push({
       x0, y0, x1, y1,
       cx, cy, w, h,
       label: String(label),
       score,
-      track_id: track_id != null ? track_id : null
+      track_id: track_id != null ? track_id : null,
+      aruco
     });
   }
   return results;
+}
+
+function videoSrcRes() {
+  const srcW = V.mode === 'mjpeg' ? (mjpegEl ? mjpegEl.naturalWidth : 0) : (videoEl ? videoEl.videoWidth : 0);
+  const srcH = V.mode === 'mjpeg' ? (mjpegEl ? mjpegEl.naturalHeight : 0) : (videoEl ? videoEl.videoHeight : 0);
+  return (srcW && srcH) ? [srcW, srcH] : null;
 }
 
 let detWsRetryCount = 0;
@@ -2343,12 +2553,10 @@ function connectDetectionWS() {
   ws.onmessage = (ev) => {
     detWsRetryCount = 0; // Reset backoff only upon receiving active data from upstream
     if (DET.avail && !DET.enabled) return; // inference off: draw nothing, even if a stale frame arrives
+    if (performance.now() < (S.detHoldUntil || 0)) return; // a snapshot result is on screen
     try {
       const data = JSON.parse(ev.data);
-      const srcW = V.mode === 'mjpeg' ? (mjpegEl ? mjpegEl.naturalWidth : 0) : (videoEl ? videoEl.videoWidth : 0);
-      const srcH = V.mode === 'mjpeg' ? (mjpegEl ? mjpegEl.naturalHeight : 0) : (videoEl ? videoEl.videoHeight : 0);
-      const refFallback = (srcW && srcH) ? [srcW, srcH] : null;
-      const parsed = parseDetections(data, refFallback);
+      const parsed = parseDetections(data, videoSrcRes());
       S.detections = parsed;
       S.detSource = 'det_ws';
       S.detLastReceivedAt = performance.now();
@@ -2374,7 +2582,7 @@ function connectDetectionWS() {
 
 /* Detect toggle: on-demand inference via /api/v1/detection/inference (armd proxies the detector).
    Plain fetch, not api(): this is not arm control and must not feed the RTT telemetry. */
-const DET = { avail: null, enabled: false, busy: false, timer: null };
+const DET = { avail: null, enabled: false, busy: false, timer: null, snap: false, fps: null, activeFps: null, idleFps: null };
 async function detRequest(method, body) {
   const ctl = new AbortController();
   const tm = setTimeout(() => ctl.abort(), 4000);
@@ -2393,6 +2601,7 @@ async function detRequest(method, body) {
   } finally { clearTimeout(tm); }
 }
 function detClearOverlay() {
+  S.detHoldUntil = 0;
   S.detections = [];
   S.detLastReceivedAt = 0;
   clearOverlayCanvas();
@@ -2400,6 +2609,8 @@ function detClearOverlay() {
 function detApply(data) {
   DET.avail = !!data;
   DET.enabled = !!(data && data.enabled);
+  const n = (v) => (Number.isFinite(Number(v)) && v !== null ? Number(v) : null);
+  DET.fps = n(data && data.fps); DET.activeFps = n(data && data.active_fps); DET.idleFps = n(data && data.idle_fps);
   if (DET.avail && !DET.enabled) detClearOverlay();
   renderDetToggle();
 }
@@ -2415,16 +2626,86 @@ function renderDetToggle() {
   // A disabled button gets no hover events, so the tooltip lives on the wrapper.
   wrap.title = t('det.tip.' + key);
   btn.setAttribute('aria-label', t('det.tip.' + key));
+  btn.disabled = btn.disabled || DET.snap;
+
+  const trig = $('btn-trigger');
+  if (trig) {
+    setText(trig, t(DET.snap ? 'det.trig.busy' : 'det.trig'));
+    trig.disabled = !DET.avail || DET.busy || DET.snap;
+    trig.classList.toggle('busy', DET.snap);
+    trig.title = t('det.trig.tip');
+  }
+  const pill = $('fps-pill');
+  if (pill) {
+    pill.hidden = !DET.avail;
+    const idle = DET.idleFps ?? 1, active = DET.activeFps ?? '--';
+    const cur = DET.fps;
+    let cls = 'fps-pill', txt;
+    if (DET.snap) { cls += ' is-snap'; txt = t('det.fps.snap'); }
+    else if (DET.enabled) { cls += ' is-work'; txt = t('det.fps.work', { n: cur && cur > idle ? cur : active }); }
+    else txt = t('det.fps.idle', { n: cur != null && cur <= idle ? cur : idle });
+    setCls(pill, cls);
+    setText(pill, txt);
+    pill.title = t('det.fps.tip', { idle, active });
+  }
+}
+
+/* Single-shot detection. The contract has no dedicated trigger, so it is composed from the existing calls:
+   (if off) POST enabled:true -> GET /detection/latest?wait_ms (newer than the pre-trigger result) -> POST enabled:false.
+   A result taken while inference was off stays on screen for SNAP_HOLD_MS. Resolves to the parsed detections. */
+const SNAP_HOLD_MS = 4000;
+async function detLatest(query) {
+  const ctl = new AbortController();
+  const tm = setTimeout(() => ctl.abort(), 6500);
+  try {
+    const res = await fetch('/api/v1/detection/latest' + query, { signal: ctl.signal, cache: 'no-store' });
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+    if (!res.ok || data == null) { const e = new Error((data && data.error) || 'HTTP ' + res.status); e.status = res.status; throw e; }
+    return data;
+  } finally { clearTimeout(tm); }
+}
+const detSeq = (d) => (d && typeof d === 'object' ? (d.seq ?? d.frame_id ?? d.timestamp ?? d.ts ?? null) : null);
+async function triggerDet({ quiet = false } = {}) {
+  if (!DET.avail || DET.busy || DET.snap) return null;
+  DET.snap = true; renderDetToggle();
+  const wasOn = DET.enabled;
+  let parsed = null, err = null;
+  try {
+    let base = null;
+    if (!wasOn) {
+      try { base = detSeq(await detLatest('')); } catch (_) {}
+      await detRequest('POST', { enabled: true });
+    }
+    let data;
+    try { data = await detLatest('?wait_ms=3000' + (base != null ? '&after=' + encodeURIComponent(base) : '')); }
+    catch (e) { if (base == null) throw e; data = await detLatest('?wait_ms=3000'); }
+    if (data && (data.timeout || data.frame_id === 0)) {
+      throw new Error('Detection timeout: no fresh frame received');
+    }
+    parsed = parseDetections(data, videoSrcRes());
+  } catch (e) { err = e; }
+  if (!wasOn) {
+    try { detApply(await detRequest('POST', { enabled: false })); } catch (_) { refreshDetState(); }
+  }
+  DET.snap = false;
+  if (parsed) {
+    S.detections = parsed; S.detSource = 'snapshot'; S.detLastReceivedAt = performance.now();
+    if (!wasOn) S.detHoldUntil = performance.now() + SNAP_HOLD_MS;
+    if (!quiet) toast(parsed.length ? t('det.trig.ok', { n: parsed.length }) : t('det.trig.none'), parsed.length ? '' : 'warn');
+  } else if (!quiet) toast(t('det.trig.fail'), 'err', err && err.status ? String(err.status) : '');
+  renderDetToggle();
+  return parsed;
 }
 async function refreshDetState() {
-  if (DET.busy) return;
+  if (DET.busy || DET.snap) return;
   try { detApply(await detRequest('GET')); }
   catch (_) { detApply(null); }
 }
 async function toggleDet() {
-  if (!DET.avail || DET.busy) return;
+  if (!DET.avail || DET.busy || DET.snap) return;
   DET.busy = true; renderDetToggle();
-  try { const data = await detRequest('POST', { enabled: !DET.enabled }); DET.busy = false; detApply(data); }
+  try { const data = await detRequest('POST', { enabled: !DET.enabled }); DET.busy = false; S.detHoldUntil = 0; detApply(data); }
   catch (e) {
     DET.busy = false;
     toast(t('det.fail'), 'err', e.status ? String(e.status) : '');
@@ -2433,6 +2714,7 @@ async function toggleDet() {
 }
 function initDetToggle() {
   $('btn-det').addEventListener('click', toggleDet);
+  $('btn-trigger').addEventListener('click', () => triggerDet());
   i18nHooks.push(renderDetToggle);
   // Polling picks up a detector that starts later and toggles made by agents over the API.
   // Slower while unavailable: each failed probe is a 502 that armd logs.
@@ -2441,6 +2723,228 @@ function initDetToggle() {
     DET.timer = setTimeout(poll, DET.avail ? 10000 : 30000);
   };
   poll();
+}
+
+/* =================================================================
+   Hand-eye calibration (eye-to-hand, marker centre at the TCP)
+   Each sample pairs the marker position in the camera frame (ArUco tvec) with the TCP position in the
+   base frame (IK.fk of the measured joints). T_cam_to_base is the rigid transform p_base = R p_cam + t
+   that best fits all pairs (Horn 1987 closed-form quaternion solution); RMSE is the 3D point residual.
+   ================================================================= */
+const CAL = { samples: [], target: 9, result: null, markerId: null, resetArmedUntil: 0, busy: false, liveTimer: null };
+(() => {
+  try {
+    const sv = JSON.parse(store('rebot.calib') || 'null');
+    if (sv && Array.isArray(sv.samples)) { CAL.samples = sv.samples; CAL.markerId = sv.markerId ?? null; }
+  } catch (_) {}
+})();
+const calSave = () => store('rebot.calib', JSON.stringify({ samples: CAL.samples, markerId: CAL.markerId }));
+
+// symmetric 4x4 Jacobi eigen-decomposition -> eigenvector of the largest eigenvalue
+function maxEigVec4(A) {
+  const a = A.map((r) => r.slice()), V = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]];
+  for (let sweep = 0; sweep < 60; sweep++) {
+    let off = 0;
+    for (let i = 0; i < 4; i++) for (let j = i + 1; j < 4; j++) off += a[i][j] * a[i][j];
+    if (off < 1e-22) break;
+    for (let p = 0; p < 3; p++) for (let q = p + 1; q < 4; q++) {
+      if (Math.abs(a[p][q]) < 1e-30) continue;
+      const th = (a[q][q] - a[p][p]) / (2 * a[p][q]);
+      const tt = Math.sign(th || 1) / (Math.abs(th) + Math.sqrt(th * th + 1));
+      const c = 1 / Math.sqrt(tt * tt + 1), sn = tt * c;
+      for (let k = 0; k < 4; k++) { // A <- A J
+        const akp = a[k][p], akq = a[k][q];
+        a[k][p] = c * akp - sn * akq; a[k][q] = sn * akp + c * akq;
+      }
+      for (let k = 0; k < 4; k++) { // A <- J^T A
+        const apk = a[p][k], aqk = a[q][k];
+        a[p][k] = c * apk - sn * aqk; a[q][k] = sn * apk + c * aqk;
+      }
+      for (let k = 0; k < 4; k++) {
+        const vkp = V[k][p], vkq = V[k][q];
+        V[k][p] = c * vkp - sn * vkq; V[k][q] = sn * vkp + c * vkq;
+      }
+    }
+  }
+  let best = 0;
+  for (let i = 1; i < 4; i++) if (a[i][i] > a[best][best]) best = i;
+  return [V[0][best], V[1][best], V[2][best], V[3][best]];
+}
+// p_base = R p_cam + t over point pairs; returns { R, t, rmse, maxErr, residuals } or { err }
+function solveRigid(cam, base) {
+  const n = cam.length;
+  if (n < 3) return { err: 'calib.e.few' };
+  const mean = (P) => [0, 1, 2].map((k) => P.reduce((s2, p) => s2 + p[k], 0) / n);
+  const ca = mean(cam), cb = mean(base);
+  const A = cam.map((p) => p.map((v, k) => v - ca[k])), B = base.map((p) => p.map((v, k) => v - cb[k]));
+  // non-collinear: largest triangle area in the camera set must exceed 1 cm^2
+  let area = 0;
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) for (let k = j + 1; k < n; k++) {
+    const u = A[j].map((v, m) => v - A[i][m]), w = A[k].map((v, m) => v - A[i][m]);
+    area = Math.max(area, Math.hypot(u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]) / 2);
+  }
+  if (area < 1e-4) return { err: 'calib.e.degenerate' };
+  const M = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  for (let i = 0; i < n; i++) for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) M[r][c] += A[i][r] * B[i][c];
+  const [[Sxx, Sxy, Sxz], [Syx, Syy, Syz], [Szx, Szy, Szz]] = M;
+  const N = [
+    [Sxx + Syy + Szz, Syz - Szy, Szx - Sxz, Sxy - Syx],
+    [Syz - Szy, Sxx - Syy - Szz, Sxy + Syx, Szx + Sxz],
+    [Szx - Sxz, Sxy + Syx, -Sxx + Syy - Szz, Syz + Szy],
+    [Sxy - Syx, Szx + Sxz, Syz + Szy, -Sxx - Syy + Szz],
+  ];
+  let [w, x, y, z] = maxEigVec4(N);
+  const qn = Math.hypot(w, x, y, z) || 1; w /= qn; x /= qn; y /= qn; z /= qn;
+  const R = [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+             [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+             [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]];
+  const mul = (p) => [0, 1, 2].map((r) => R[r][0] * p[0] + R[r][1] * p[1] + R[r][2] * p[2]);
+  const Rca = mul(ca), t = [0, 1, 2].map((k) => cb[k] - Rca[k]);
+  const residuals = cam.map((p, i) => { const q = mul(p); return Math.hypot(q[0] + t[0] - base[i][0], q[1] + t[1] - base[i][1], q[2] + t[2] - base[i][2]); });
+  const rmse = Math.sqrt(residuals.reduce((s2, e) => s2 + e * e, 0) / n);
+  return { R, t, rmse, maxErr: Math.max(...residuals), residuals };
+}
+
+// freshest marker with a 3D position (prefers the locked marker ID)
+// with freshOnly=true, ignores S.detHoldUntil and enforces arrival within 500ms
+function calMarker({ freshOnly = false } = {}) {
+  const age = S.detLastReceivedAt ? performance.now() - S.detLastReceivedAt : Infinity;
+  if (freshOnly) {
+    if (age > 500) return null;
+  } else {
+    if (!(performance.now() < (S.detHoldUntil || 0)) && age > 600) return null;
+  }
+  const ms = (S.detections || []).filter((d) => d.aruco && d.aruco.t);
+  return ms.find((d) => CAL.markerId != null && String(d.aruco.id) === String(CAL.markerId)) || (CAL.markerId == null ? ms[0] : null) || null;
+}
+function calRender() {
+  const n = CAL.samples.length;
+  setText($('calib-count'), t('calib.count', { n, total: CAL.target }));
+  $('calib-bar').style.width = Math.min(100, n / CAL.target * 100) + '%';
+  const list = $('calib-list');
+  list.textContent = '';
+  CAL.samples.forEach((sm, i) => {
+    const li = document.createElement('li');
+    const res = CAL.result && CAL.result.residuals ? CAL.result.residuals[i] : null;
+    if (res != null && CAL.result.rmse > 0 && res > 2.5 * CAL.result.rmse && res > 0.005) li.className = 'bad';
+    const b = document.createElement('b'); b.textContent = '#' + (i + 1);
+    const a = document.createElement('span');
+    a.textContent = 'TCP ' + sm.p_base.map((v) => (v * 1000).toFixed(0)).join(',') + ' · Zc ' + sm.p_cam[2].toFixed(3) + 'm' + (res != null ? ' · ' + (res * 1000).toFixed(1) + 'mm' : '');
+    const x = document.createElement('button');
+    x.type = 'button'; x.className = 'btn'; x.style.cssText = 'min-height:40px;padding:0 12px;font-size:12px';
+    x.textContent = t('calib.del');
+    x.addEventListener('click', () => { CAL.samples.splice(i, 1); CAL.result = null; calSave(); calRender(); });
+    li.append(b, a, x);
+    list.appendChild(li);
+  });
+  $('calib-solve').disabled = n < 3 || CAL.busy;
+  $('calib-export').disabled = n === 0;
+  $('calib-cap').disabled = CAL.busy;
+  setText($('calib-cap'), t(CAL.busy ? 'calib.cap.busy' : 'calib.cap'));
+  const rb = $('calib-reset'), armed = Date.now() < CAL.resetArmedUntil;
+  rb.classList.toggle('armed', armed);
+  setText(rb, t(armed ? 'calib.reset.confirm' : 'calib.reset'));
+  rb.disabled = n === 0 && !CAL.result;
+
+  const box = $('calib-result');
+  box.hidden = !CAL.result;
+  if (CAL.result) {
+    const r = CAL.result, warn = r.rmse > 0.01;
+    box.className = 'calib-result mono' + (warn ? ' warn' : '');
+    box.textContent = '';
+    const row = (k, v) => { const d = document.createElement('div'); d.className = 'row'; const a = document.createElement('span'); a.textContent = k; const b = document.createElement('span'); b.textContent = v; d.append(a, b); box.appendChild(d); };
+    row(t('calib.r.t'), r.t.map((v) => (v * 1000).toFixed(1)).join(', '));
+    row(t('calib.r.e'), r.rpy.map((v) => v.toFixed(2)).join(', '));
+    row(t('calib.r.rmse'), (r.rmse * 1000).toFixed(2) + ' mm');
+    row(t('calib.r.max'), (r.maxErr * 1000).toFixed(2) + ' mm');
+    row(t('calib.r.n'), String(r.n) + (r.n < CAL.target ? ' · ' + t('calib.need_more', { total: CAL.target }) : ''));
+    if (warn) { const p2 = document.createElement('div'); p2.textContent = t('calib.rmse.warn'); box.appendChild(p2); }
+  }
+  calLive();
+}
+function calLive() {
+  const el = $('calib-live'), m = calMarker();
+  el.classList.toggle('ok', !!m);
+  setText(el, m ? t('calib.live.ok', { id: m.aruco.id ?? '?', z: m.aruco.t[2].toFixed(3) }) : t('calib.live.none'));
+}
+async function calCapture() {
+  if (CAL.busy) return;
+  if (!isLive() || !S.obs || !Array.isArray(S.obs.positions) || S.obs.positions.length < 4) { toast(t('calib.e.offline'), 'warn'); return; }
+  if (Array.isArray(S.obs.velocities) && S.obs.velocities.some((v) => Math.abs(v) > 0.02)) { toast(t('calib.e.moving'), 'warn'); return; }
+  CAL.busy = true; calRender();
+  try {
+    let m = calMarker({ freshOnly: true });
+    if (!m && DET.avail) { await triggerDet({ quiet: true }); m = calMarker({ freshOnly: true }); }
+    if (!m) { toast(t('calib.e.nomarker'), 'warn'); return; }
+    // Re-verify telemetry validity and velocity after async detection trigger
+    if (!isLive() || !S.obs || !Array.isArray(S.obs.positions) || S.obs.positions.length < 4) { toast(t('calib.e.offline'), 'warn'); return; }
+    if (Array.isArray(S.obs.velocities) && S.obs.velocities.some((v) => Math.abs(v) > 0.02)) { toast(t('calib.e.moving'), 'warn'); return; }
+    const pos = S.obs.positions.slice();
+    const tcp = IK.fk(toModel(pos));
+    const p_base = [tcp.x, tcp.y, tcp.z];
+    const dup = CAL.samples.findIndex((sm) => Math.hypot(...sm.p_base.map((v, k) => v - p_base[k])) < 0.01);
+    if (dup >= 0) { toast(t('calib.e.dup', { i: dup + 1 }), 'warn'); return; }
+    if (CAL.markerId == null && m.aruco.id != null) CAL.markerId = m.aruco.id;
+    CAL.samples.push({
+      joints: pos, p_base, tcp_pitch: tcp.pitch,
+      marker_id: m.aruco.id, p_cam: m.aruco.t.slice(),
+      R_cam: m.aruco.R, rpy_cam_deg: m.aruco.rpy, corners: m.aruco.corners,
+      ts: new Date().toISOString(),
+    });
+    CAL.result = null; calSave();
+    buzz(15);
+    toast(t('calib.ok.cap', { n: CAL.samples.length }));
+  } finally { CAL.busy = false; calRender(); }
+}
+function calSolve() {
+  const r = solveRigid(CAL.samples.map((sm) => sm.p_cam), CAL.samples.map((sm) => sm.p_base));
+  if (r.err) { toast(t(r.err), 'warn'); return; }
+  CAL.result = { ...r, rpy: POSE.rpyDeg(r.R), n: CAL.samples.length, at: new Date().toISOString() };
+  calRender();
+  toast(t('calib.ok.solve', { rmse: (r.rmse * 1000).toFixed(2) }), r.rmse > 0.01 ? 'warn' : '');
+}
+function calExport() {
+  const r = CAL.result;
+  const out = {
+    version: 1, kind: 'hand_eye_calibration', setup: 'eye_to_hand', method: 'point_registration_horn',
+    assumption: 'ArUco marker centre coincides with the TCP; TCP from the UI forward kinematics (IK.fk, URDF b601dm)',
+    units: { length: 'm', angle: 'deg' }, created: new Date().toISOString(), marker_id: CAL.markerId,
+    result: r ? {
+      T_cam_to_base: [...r.R.map((row, i) => [...row, r.t[i]]), [0, 0, 0, 1]],
+      translation_m: r.t, euler_rpy_deg: r.rpy, euler_convention: 'R = Rz(yaw) Ry(pitch) Rx(roll)',
+      rmse_m: r.rmse, max_error_m: r.maxErr, residuals_m: r.residuals, samples: r.n, solved_at: r.at,
+    } : null,
+    samples: CAL.samples,
+  };
+  const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'rebot_hand_eye_' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '.json';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+function calReset() {
+  // two-tap confirm against accidental touches
+  if (Date.now() >= CAL.resetArmedUntil) { CAL.resetArmedUntil = Date.now() + 3000; calRender(); setTimeout(calRender, 3050); return; }
+  CAL.resetArmedUntil = 0; CAL.samples = []; CAL.result = null; CAL.markerId = null; calSave(); calRender();
+}
+function calOpen(open) {
+  const m = $('calib');
+  m.hidden = !open;
+  clearInterval(CAL.liveTimer); CAL.liveTimer = null;
+  if (open) { calRender(); CAL.liveTimer = setInterval(calLive, 250); $('calib-cap').focus({ preventScroll: true }); }
+  else $('btn-calib').focus({ preventScroll: true });
+}
+function initCalib() {
+  $('btn-calib').addEventListener('click', () => calOpen(true));
+  $('calib-close').addEventListener('click', () => calOpen(false));
+  $('calib').addEventListener('click', (e) => { if (e.target === e.currentTarget) calOpen(false); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('calib').hidden) calOpen(false); });
+  $('calib-cap').addEventListener('click', calCapture);
+  $('calib-solve').addEventListener('click', calSolve);
+  $('calib-export').addEventListener('click', calExport);
+  $('calib-reset').addEventListener('click', calReset);
+  i18nHooks.push(() => { if (!$('calib').hidden) calRender(); });
 }
 
 async function loadSchema() {
@@ -3966,7 +4470,10 @@ function drawOverlay() {
   const g = ov.ctx;
   if (cssW <= 0 || cssH <= 0) return;
 
-  const age = S.detLastReceivedAt ? (performance.now() - S.detLastReceivedAt) : Infinity;
+  // A single-shot result is held on screen (S.detHoldUntil) instead of fading after 400 ms.
+  const now = performance.now();
+  const held = now < (S.detHoldUntil || 0);
+  const age = held ? 0 : S.detLastReceivedAt ? (now - S.detLastReceivedAt) : Infinity;
   if (!S.detections || S.detections.length === 0 || age > 400 || !isFinite(age)) {
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.clearRect(0, 0, cssW, cssH);
@@ -3992,6 +4499,7 @@ function drawOverlay() {
     const bw = d.w * rect.w;
     const bh = d.h * rect.h;
     const color = getLabelColor(d.label);
+    if (d.aruco) { drawAruco(g, d, rect, alpha, color); continue; }
 
     g.save();
     g.globalAlpha = alpha;
@@ -4071,6 +4579,117 @@ function drawOverlay() {
 
     g.restore();
   }
+}
+
+/* ArUco AR overlay: corner polygon with indices 0-3, projected XYZ axes, ID / depth / attitude HUD.
+   Axes use a weak-perspective projection: with the OpenCV camera frame (x right, y down, z forward)
+   a marker axis R[:,i] maps to the image direction (R[0][i], R[1][i]); the out-of-plane part foreshortens it. */
+const AXIS_COLORS = ['#ef4444', '#22c55e', '#3b82f6'];
+function drawAruco(g, d, rect, alpha, color) {
+  const a = d.aruco;
+  const P = (u, v) => [rect.x + u * rect.w, rect.y + v * rect.h];
+  const pts = a.corners ? a.corners.map(([u, v]) => P(u, v)) : null;
+  g.save();
+  g.globalAlpha = alpha;
+  g.lineJoin = 'round';
+
+  // 1. outline: corner polygon (fallback: bbox)
+  g.beginPath();
+  if (pts) { g.moveTo(...pts[0]); for (let i = 1; i < 4; i++) g.lineTo(...pts[i]); g.closePath(); }
+  else g.rect(rect.x + d.x0 * rect.w, rect.y + d.y0 * rect.h, d.w * rect.w, d.h * rect.h);
+  g.fillStyle = color; g.globalAlpha = alpha * 0.12; g.fill(); g.globalAlpha = alpha;
+  g.strokeStyle = 'rgba(255,255,255,0.85)'; g.lineWidth = 4; g.stroke();
+  g.strokeStyle = color; g.lineWidth = 2; g.stroke();
+
+  // centre: diagonal intersection when corners are known
+  let c = P(d.cx, d.cy), L = Math.max(18, Math.min(d.w * rect.w, d.h * rect.h) * 0.6);
+  if (pts) {
+    const [p0, , p2] = pts, [, p1, , p3] = pts;
+    const den = (p0[0] - p2[0]) * (p1[1] - p3[1]) - (p0[1] - p2[1]) * (p1[0] - p3[0]);
+    if (Math.abs(den) > 1e-6) {
+      const tt = ((p0[0] - p1[0]) * (p1[1] - p3[1]) - (p0[1] - p1[1]) * (p1[0] - p3[0])) / den;
+      c = [p0[0] + tt * (p2[0] - p0[0]), p0[1] + tt * (p2[1] - p0[1])];
+    }
+    let side = 0;
+    for (let i = 0; i < 4; i++) side += Math.hypot(pts[(i + 1) % 4][0] - pts[i][0], pts[(i + 1) % 4][1] - pts[i][1]);
+    L = Math.max(18, side / 4 * 0.75);
+  }
+
+  // 2. axes (screen vectors, px)
+  let axes = null;
+  if (a.R) axes = [0, 1, 2].map((i) => [a.R[0][i] * L, a.R[1][i] * L]);
+  else if (pts) { // corners only: in-plane X (0->1) and Y (3->0, ArUco +Y is up); Z unknown
+    const unit = (v) => { const n = Math.hypot(v[0], v[1]) || 1; return [v[0] / n * L, v[1] / n * L]; };
+    axes = [unit([pts[1][0] - pts[0][0] + pts[2][0] - pts[3][0], pts[1][1] - pts[0][1] + pts[2][1] - pts[3][1]]),
+            unit([pts[0][0] - pts[3][0] + pts[1][0] - pts[2][0], pts[0][1] - pts[3][1] + pts[1][1] - pts[2][1]]), null];
+  }
+  if (axes) {
+    // draw the axis pointing most away from the viewer first so nearer ones stay on top
+    const order = [0, 1, 2].filter((i) => axes[i]).sort((i, j) => (a.R ? a.R[2][j] - a.R[2][i] : 0));
+    g.lineCap = 'round';
+    for (const i of order) {
+      const [vx, vy] = axes[i], ex = c[0] + vx, ey = c[1] + vy, len = Math.hypot(vx, vy);
+      g.strokeStyle = 'rgba(255,255,255,0.9)'; g.lineWidth = 5;
+      g.beginPath(); g.moveTo(...c); g.lineTo(ex, ey); g.stroke();
+      g.strokeStyle = AXIS_COLORS[i]; g.lineWidth = 3;
+      g.beginPath(); g.moveTo(...c); g.lineTo(ex, ey); g.stroke();
+      if (len > 6) { // arrow head
+        const ux = vx / len, uy = vy / len, hs = Math.min(8, len * 0.35);
+        g.fillStyle = AXIS_COLORS[i];
+        g.beginPath(); g.moveTo(ex, ey);
+        g.lineTo(ex - ux * hs - uy * hs * 0.55, ey - uy * hs + ux * hs * 0.55);
+        g.lineTo(ex - ux * hs + uy * hs * 0.55, ey - uy * hs - ux * hs * 0.55);
+        g.closePath(); g.fill();
+      }
+      g.font = '700 10px ui-monospace, Menlo, monospace'; g.textBaseline = 'middle'; g.textAlign = 'center';
+      g.fillStyle = AXIS_COLORS[i];
+      g.fillText('XYZ'[i], ex + (len > 1 ? vx / len * 9 : 9), ey + (len > 1 ? vy / len * 9 : 0));
+    }
+    g.textAlign = 'left';
+  }
+  if (!a.R) { // Z out of the image plane: "⊙"
+    g.strokeStyle = AXIS_COLORS[2]; g.lineWidth = 2;
+    g.beginPath(); g.arc(c[0], c[1], 5, 0, Math.PI * 2); g.stroke();
+  }
+  g.fillStyle = '#fff'; g.beginPath(); g.arc(c[0], c[1], 2, 0, Math.PI * 2); g.fill();
+
+  // 3. corner dots + indices (0 = marker top-left, ring-highlighted to show orientation)
+  if (pts) {
+    g.font = '700 10px ui-monospace, Menlo, monospace'; g.textBaseline = 'middle'; g.textAlign = 'center';
+    pts.forEach((p, i) => {
+      const ox = p[0] - c[0], oy = p[1] - c[1], on = Math.hypot(ox, oy) || 1;
+      const lx = p[0] + ox / on * 11, ly = p[1] + oy / on * 11;
+      g.fillStyle = i === 0 ? '#facc15' : color;
+      g.strokeStyle = '#fff'; g.lineWidth = 1.5;
+      g.beginPath(); g.arc(p[0], p[1], i === 0 ? 4.5 : 3.5, 0, Math.PI * 2); g.fill(); g.stroke();
+      g.fillStyle = 'rgba(0,0,0,0.7)'; g.beginPath(); g.arc(lx, ly, 7, 0, Math.PI * 2); g.fill();
+      g.fillStyle = '#fff'; g.fillText(String(i), lx, ly + 0.5);
+    });
+    g.textAlign = 'left';
+  }
+
+  // 4. HUD tag: ID / depth Z / attitude
+  const lines = ['ID ' + (a.id != null ? a.id : '?')];
+  if (a.t) lines.push('Z ' + a.t[2].toFixed(3) + ' m');
+  if (a.rpy) lines.push('R ' + a.rpy[0].toFixed(1) + '° P ' + a.rpy[1].toFixed(1) + '° Y ' + a.rpy[2].toFixed(1) + '°');
+  g.font = '600 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+  g.textBaseline = 'middle';
+  const lh = 15, padX = 7, tw = Math.max(...lines.map((l) => g.measureText(l).width)) + padX * 2, th = lines.length * lh + 6;
+  const xs = pts ? pts.map((p) => p[0]) : [rect.x + d.x1 * rect.w], ys = pts ? pts.map((p) => p[1]) : [rect.y + d.y0 * rect.h];
+  // first slot that does not cover the marker: right, left, above, below (then clamp into the frame)
+  const mx0 = Math.min(...xs), mx1 = Math.max(...xs), my0 = Math.min(...ys), my1 = Math.max(...ys), mcx = (mx0 + mx1) / 2;
+  const slots = [[mx1 + 12, my0 - 4], [mx0 - tw - 12, my0 - 4], [mcx - tw / 2, my0 - th - 14], [mcx - tw / 2, my1 + 14]];
+  const top = Math.max(rect.y + 2, 44); // keep clear of the HUD chip row
+  const fits = ([x, y]) => x >= rect.x + 2 && x + tw <= rect.x + rect.w - 2 && y >= top && y + th <= rect.y + rect.h - 2;
+  const fitsX = ([x]) => x >= rect.x + 2 && x + tw <= rect.x + rect.w - 2;
+  let [hx, hy] = slots.find(fits) || slots.find(fitsX) || slots[0];
+  hx = clamp(hx, rect.x + 2, rect.x + rect.w - tw - 2);
+  hy = clamp(hy, top, Math.max(top, rect.y + rect.h - th - 2));
+  g.fillStyle = 'rgba(0, 0, 0, 0.75)';
+  g.beginPath(); if (g.roundRect) g.roundRect(hx, hy, tw, th, 5); else g.rect(hx, hy, tw, th); g.fill();
+  g.strokeStyle = color; g.lineWidth = 1; g.stroke();
+  lines.forEach((l, i) => { g.fillStyle = i === 0 ? color : '#fff'; g.fillText(l, hx + padX, hy + 3 + lh / 2 + i * lh); });
+  g.restore();
 }
 
 /* =================================================================
@@ -4445,6 +5064,7 @@ loadSchema();
 connectWS();
 connectDetectionWS();
 initDetToggle();
+initCalib();
 videoStart();
 requestAnimationFrame(frame);
 
