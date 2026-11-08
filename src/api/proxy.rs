@@ -194,15 +194,9 @@ struct UpstreamResponse {
     body: Vec<u8>,
 }
 
-async fn upstream_request(
-    up: &DetectorUpstream,
-    method: Method,
-    path_and_query: &str,
-    body: Option<&[u8]>,
-) -> Result<UpstreamResponse, String> {
-    let mut stream = tokio::net::TcpStream::connect((up.host.as_str(), up.port))
-        .await
-        .map_err(|e| format!("connect: {e}"))?;
+/// Raw HTTP/1.1 request bytes. A request with a body always carries `Content-Type: application/json`
+/// (the detector rejects other content types on POST /api/trigger and /api/inference).
+fn build_request(up: &DetectorUpstream, method: &Method, path_and_query: &str, body: Option<&[u8]>) -> Vec<u8> {
     let mut req = format!(
         "{method} {}{path_and_query} HTTP/1.1\r\nHost: {}:{}\r\nAccept: application/json\r\nConnection: close\r\n",
         up.base_path, up.host, up.port
@@ -215,6 +209,24 @@ async fn upstream_request(
     if let Some(b) = body {
         out.extend_from_slice(b);
     }
+    out
+}
+
+/// Empty or whitespace-only client bodies become `{}` so the upstream always gets valid JSON.
+fn json_body(body: Bytes) -> Bytes {
+    if body.iter().all(|b| b.is_ascii_whitespace()) { Bytes::from_static(b"{}") } else { body }
+}
+
+async fn upstream_request(
+    up: &DetectorUpstream,
+    method: Method,
+    path_and_query: &str,
+    body: Option<&[u8]>,
+) -> Result<UpstreamResponse, String> {
+    let mut stream = tokio::net::TcpStream::connect((up.host.as_str(), up.port))
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    let out = build_request(up, &method, path_and_query, body);
     stream.write_all(&out).await.map_err(|e| format!("write: {e}"))?;
 
     let mut raw = Vec::new();
@@ -348,7 +360,7 @@ pub async fn get_detection_inference(Extension(up): Extension<DetectorUpstream>)
 
 /// POST /api/v1/detection/inference -> upstream POST /api/inference (body passed through)
 pub async fn post_detection_inference(Extension(up): Extension<DetectorUpstream>, body: Bytes) -> Response {
-    forward(&up, Method::POST, "/api/inference".into(), Some(body), TIMEOUT_MARGIN).await
+    forward(&up, Method::POST, "/api/inference".into(), Some(json_body(body)), TIMEOUT_MARGIN).await
 }
 
 /// GET /api/v1/detection/latest -> upstream GET /api/results/latest (query passed through)
@@ -379,7 +391,7 @@ pub async fn post_detection_trigger(
         Some(q) if !q.is_empty() => format!("/api/trigger?{q}"),
         _ => "/api/trigger".to_string(),
     };
-    forward(&up, Method::POST, path, Some(Bytes::new()), timeout).await
+    forward(&up, Method::POST, path, Some(json_body(Bytes::new())), timeout).await
 }
 
 #[cfg(test)]
@@ -405,6 +417,20 @@ mod tests {
         assert_eq!(wait_ms_or(None, TRIGGER_DEFAULT_WAIT_MS), 2500);
         assert_eq!(wait_ms_or(Some("wait_ms=9000"), TRIGGER_DEFAULT_WAIT_MS), 5000);
         assert_eq!(wait_ms_or(Some("wait_ms=800"), TRIGGER_DEFAULT_WAIT_MS), 800);
+    }
+
+    #[test]
+    fn post_bodies_are_json_with_content_type() {
+        let up = DetectorUpstream::parse("http://127.0.0.1:8090").unwrap();
+        assert_eq!(json_body(Bytes::new()), Bytes::from_static(b"{}"));
+        assert_eq!(json_body(Bytes::from_static(b" \n")), Bytes::from_static(b"{}"));
+        assert_eq!(json_body(Bytes::from_static(b"{\"enabled\":true}")), Bytes::from_static(b"{\"enabled\":true}"));
+        let r = String::from_utf8(build_request(&up, &Method::POST, "/api/trigger", Some(b"{}"))).unwrap();
+        assert!(r.contains("Content-Type: application/json\r\n"));
+        assert!(r.contains("Content-Length: 2\r\n"));
+        assert!(r.ends_with("\r\n\r\n{}"));
+        let g = String::from_utf8(build_request(&up, &Method::GET, "/api/inference", None)).unwrap();
+        assert!(!g.contains("Content-Type"));
     }
 
     #[test]
