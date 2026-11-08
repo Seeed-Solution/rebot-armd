@@ -1438,7 +1438,7 @@ const I18N = {
     'calib.count': '已采集位姿: {n} / {total}', 'calib.cap': '采集当前点位', 'calib.cap.busy': '采集中…', 'calib.solve': '求解标定', 'calib.export': '导出配置',
     'calib.reset': '重置', 'calib.reset.confirm': '再点一次确认重置',
     'calib.live.none': '未识别到带 3D 位姿的标记 · 采集时会自动单次识别', 'calib.live.ok': '标记 ID {id} · Z {z} m',
-    'calib.e.offline': '遥测未连接，无法读取关节状态', 'calib.e.moving': '机械臂仍在运动，请静止后再采集', 'calib.e.nomarker': '未识别到带 3D 位姿的 ArUco 标记',
+    'calib.e.offline': '遥测未连接，无法读取关节状态', 'calib.e.moving': '机械臂仍在运动，请静止后再采集', 'calib.e.shifted': '识别期间机械臂位置有变化，请保持静止后重试', 'calib.e.nomarker': '未识别到带 3D 位姿的 ArUco 标记',
     'calib.e.dup': '与第 {i} 个点位距离不足 1 cm，请移到新位置', 'calib.e.few': '至少需要 3 个点位', 'calib.e.degenerate': '点位共线或过于集中，请扩大分布',
     'calib.ok.cap': '已采集第 {n} 个点位', 'calib.ok.solve': '标定完成，RMSE {rmse} mm', 'calib.rmse.warn': '残差偏大，检查标记是否与 TCP 重合、点位是否静止',
     'calib.r.t': '平移 T (mm)', 'calib.r.e': '欧拉角 RPY (°)', 'calib.r.rmse': '残差 RMSE', 'calib.r.n': '样本数', 'calib.r.max': '最大残差',
@@ -1530,7 +1530,7 @@ const I18N = {
     'calib.count': 'Poses captured: {n} / {total}', 'calib.cap': 'Capture pose', 'calib.cap.busy': 'Capturing…', 'calib.solve': 'Solve', 'calib.export': 'Export JSON',
     'calib.reset': 'Reset', 'calib.reset.confirm': 'Tap again to reset',
     'calib.live.none': 'No marker with a 3D pose · capture will run a snapshot', 'calib.live.ok': 'Marker ID {id} · Z {z} m',
-    'calib.e.offline': 'Telemetry offline, joint state unavailable', 'calib.e.moving': 'Arm is still moving, wait until it stops', 'calib.e.nomarker': 'No ArUco marker with a 3D pose detected',
+    'calib.e.offline': 'Telemetry offline, joint state unavailable', 'calib.e.moving': 'Arm is still moving, wait until it stops', 'calib.e.shifted': 'Arm pose changed during detection, hold still and retry', 'calib.e.nomarker': 'No ArUco marker with a 3D pose detected',
     'calib.e.dup': 'Less than 1 cm from pose {i}, move to a new position', 'calib.e.few': 'At least 3 poses are required', 'calib.e.degenerate': 'Poses are collinear or too close together, spread them out',
     'calib.ok.cap': 'Captured pose {n}', 'calib.ok.solve': 'Calibration solved, RMSE {rmse} mm', 'calib.rmse.warn': 'High residual: check the marker sits on the TCP and the arm was still',
     'calib.r.t': 'Translation T (mm)', 'calib.r.e': 'Euler RPY (°)', 'calib.r.rmse': 'Residual RMSE', 'calib.r.n': 'Samples', 'calib.r.max': 'Max residual',
@@ -2682,6 +2682,13 @@ async function detTriggerReq(waitMs) {
     return data;
   } finally { clearTimeout(tm); }
 }
+/* Frame age from the device result (age_ms, or ts_ms against now_ms); null when the result carries neither. */
+function detFrameAgeMs(d) {
+  if (!d || typeof d !== 'object') return null;
+  if (Number.isFinite(d.age_ms)) return d.age_ms;
+  if (Number.isFinite(d.ts_ms) && Number.isFinite(d.now_ms)) return d.now_ms - d.ts_ms;
+  return null;
+}
 const detSeq = (d) => (d && typeof d === 'object' ? (d.seq ?? d.frame_id ?? d.timestamp ?? d.ts ?? null) : null);
 /* Fallback single shot for detectors without /api/trigger. Sets ctx.enabledByUs when it turned inference on. */
 async function detComposedShot(ctx) {
@@ -2714,7 +2721,7 @@ async function triggerDet({ quiet = false } = {}) {
   DET.snap = true; renderDetToggle();
   const wasOn = DET.enabled;
   const ctx = { enabledByUs: false, wasOn };
-  let parsed = null, err = null, parsedReceivedAt = 0;
+  let parsed = null, err = null, parsedReceivedAt = 0, devAge = null;
   try {
     let data = null, viaTrigger = false;
     if (DET.trigCap !== false) {
@@ -2737,6 +2744,8 @@ async function triggerDet({ quiet = false } = {}) {
     const receivedAt = performance.now();
     parsed = parseDetections(data, videoSrcRes());
     parsedReceivedAt = receivedAt;
+    const ageMs = detFrameAgeMs(data);
+    devAge = ageMs == null ? null : { age: ageMs, rx: receivedAt };
   } catch (e) { err = e; }
   let restoreFailed = false;
   if (ctx.enabledByUs) {
@@ -2753,6 +2762,7 @@ async function triggerDet({ quiet = false } = {}) {
   }
   if (parsed) {
     S.detections = parsed; S.detSource = 'snapshot'; S.detLastReceivedAt = parsedReceivedAt || performance.now();
+    S.detDevAge = devAge;
     if (!ctx.wasOn) S.detHoldUntil = performance.now() + SNAP_HOLD_MS;
     if (!quiet) toast(parsed.length ? t('det.trig.ok', { n: parsed.length }) : t('det.trig.none'), parsed.length ? '' : 'warn');
   } else if (!quiet) toast(t('det.trig.fail'), 'err', err && err.status ? String(err.status) : '');
@@ -2870,7 +2880,9 @@ function solveRigid(cam, base) {
 // freshest marker with a 3D position (prefers the locked marker ID)
 // with freshOnly=true, ignores S.detHoldUntil and enforces arrival within 500ms
 function calMarker({ freshOnly = false } = {}) {
-  const age = S.detLastReceivedAt ? performance.now() - S.detLastReceivedAt : Infinity;
+  let age = S.detLastReceivedAt ? performance.now() - S.detLastReceivedAt : Infinity;
+  // device-reported frame age (at receive) + time since receive beats the browser receive time alone
+  if (freshOnly && S.detDevAge && S.detDevAge.rx === S.detLastReceivedAt) age = S.detDevAge.age + (performance.now() - S.detDevAge.rx);
   if (freshOnly) {
     if (age > 500) return null;
   } else {
@@ -2935,6 +2947,7 @@ async function calCapture() {
   if (Array.isArray(S.obs.velocities) && S.obs.velocities.some((v) => Math.abs(v) > 0.02)) { toast(t('calib.e.moving'), 'warn'); return; }
   CAL.busy = true; calRender();
   try {
+    const pos = S.obs.positions.slice(); // snapshot before the (1-4 s) detection so frame and pose belong together
     let m = calMarker({ freshOnly: true });
     if (!m && DET.avail) {
       const parsed = await triggerDet({ quiet: true });
@@ -2947,7 +2960,7 @@ async function calCapture() {
     // Re-verify telemetry validity and velocity after async detection trigger
     if (!isLive() || !S.obs || !Array.isArray(S.obs.positions) || S.obs.positions.length < 4) { toast(t('calib.e.offline'), 'warn'); return; }
     if (Array.isArray(S.obs.velocities) && S.obs.velocities.some((v) => Math.abs(v) > 0.02)) { toast(t('calib.e.moving'), 'warn'); return; }
-    const pos = S.obs.positions.slice();
+    if (pos.slice(0, 6).some((v, i) => !Number.isFinite(S.obs.positions[i]) || Math.abs(S.obs.positions[i] - v) > 0.003)) { toast(t('calib.e.shifted'), 'warn'); return; }
     const tcp = IK.fk(toModel(pos));
     const p_base = [tcp.x, tcp.y, tcp.z];
     const dup = CAL.samples.findIndex((sm) => Math.hypot(...sm.p_base.map((v, k) => v - p_base[k])) < 0.01);
