@@ -14,6 +14,41 @@ visible 640x360 band of the same frame. All modes share one inference rate (`fps
 continuous inference off the inference channel stands by at 1 fps and `POST /api/trigger` runs the
 current mode once.
 
+## Frame rate and triggers
+
+- The inference channel (CH0) runs at 15 fps in VPSS hardware in every state. Its hardware
+  frame-rate control is set once at start-up (sscma-example `components/sophgo/video/video.c`
+  `setGrpChn`); a runtime rate change only reaches the camera callback's software gate
+  (`ma_camera_sg200x.cpp` `vpssCallback`). 1.2.0 started CH0 at `vision.json` `fps` (5), so
+  `fps` 10 and 15 still gave about 5 results/s.
+- The camera gate bounds the CPU copies of CH0 frames: 1 fps in standby, twice `fps` up to 7 fps,
+  every frame above that, every frame while a trigger waits (`VisionControl::camera_gate_fps`).
+  The gate passes a frame once 90 % of its period has passed since the last one, so it is not
+  used to set the rate: `RateGate` picks `fps` frames per second by due time, which holds the
+  rate under arrival jitter.
+- Results per second = `min(fps, 15, 1000 / pipeline ms)`. `GET /api/mode` reports
+  `measured.input_fps` (CH0 frames reaching rebot-vision) and `measured.result_fps`.
+- A trigger opens the gate at once (the gate rate is written to the camera directly, because the
+  frame thread is blocked in `retrieveFrame` until the old gate passes a frame) and is served by the
+  first frame that arrives after the request: one CH0 frame (up to 67 ms) plus the pipelines.
+- With the forked `cv181x_vpss.ko` (online frame-rate control) the ISP runs at the fastest
+  channel's rate, `max(stream_fps, 15)`; with `stream_fps` 15 (default) that is unchanged.
+
+## ArUco cost
+
+- Pose: `main/tag_pose.cpp` runs apriltag's orthogonal iteration (2 x 50 steps per marker) with
+  fixed-size arithmetic. apriltag's `estimate_tag_pose` allocates matrix temporaries in every
+  step, about 26 000 heap calls per marker. Same corners give the same pose (host benchmark).
+- Detector: `min_white_black_diff` 20 instead of apriltag's 5, so sensor noise in flat areas is
+  not segmented; other settings as aruco-detector 0.1.3 (decimate 2, refine edges, 1 thread).
+- Host benchmark (`tests/aruco_bench.cpp`, built when `SSCMA_ROOT` is set; ctest `aruco_bench`
+  checks recall, false positives, corner error and pose against the 0.1.3 settings):
+
+```sh
+SSCMA_ROOT=<sscma-example-sg200x> cmake -S kits/recamera-b601dm/vision/tests -B target/vision-tests
+cmake --build target/vision-tests && target/vision-tests/aruco_bench --scenes 400 --reps 3
+```
+
 Design: [docs/dev_flow_spec_vision_runtime.md](../../../docs/dev_flow_spec_vision_runtime.md).
 Differences from the spec are listed at the end of this file.
 

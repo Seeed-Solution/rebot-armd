@@ -43,8 +43,8 @@ The single-shot button and calibration capture call `/api/v1/detection/trigger`.
 
 - `mode`: which pipelines run on a processed frame. `yolo` = YOLO on the TPU, `aruco` = ArUco markers on the CPU, `both` = both on the same frame (one result carries both lists), `off` = none. 每帧运行的流水线；`both` 在同一帧上同时运行两者，一个结果同时包含两个列表。
 - `enabled`: continuous inference. With `enabled:false` the camera's inference channel stands by at `idle_fps` (1) and nothing runs until a trigger. `{"mode":"off"}` also sets `enabled:false`; `POST /api/v1/detection/inference {"enabled":true}` while the mode is `off` selects `last_active_mode` (default `yolo`). 持续推理开关；关闭时推理通道以 1 fps 待机，只有单次触发才运行。`off` 同时关闭推理；在 `off` 时开启推理会恢复上次的模式。
-- `fps`: one inference rate for every mode (`active_fps`, 1..15, default 5 from `vision.json`); `fps` in the response is the current channel rate (`idle_fps` in standby). 所有模式共用一个推理帧率。
-- Trigger: `POST /api/v1/detection/trigger` runs the current mode once on a frame captured after the call (in `off` it runs `last_active_mode`), returns that result and leaves `mode` and `enabled` unchanged. 单次触发在每种模式下都可用，不改变模式和推理开关。
+- `fps`: one inference rate for every mode (`active_fps`, 1..15, default 5 from `vision.json`): results per second while enabled, as long as the pipelines keep up (`measured.result_fps`). `fps` in the response is the current rate (`idle_fps` in standby). `camera_fps` is the camera frame gate behind it (1 in standby, 30 during a trigger), `measured.input_fps` / `measured.result_fps` the frames reaching rebot-vision and the results published per second over the last 2 s. 所有模式共用一个推理帧率，即持续推理时每秒结果数（流水线跟得上时）；`measured` 为最近 2 秒实测的输入帧率与结果率。
+- Trigger: `POST /api/v1/detection/trigger` runs the current mode once on the first frame that arrives after the call (in `off` it runs `last_active_mode`), returns that result and leaves `mode` and `enabled` unchanged. From standby the camera gate opens for the trigger, so the wait is one camera frame (15 fps) plus the pipelines, then the idle rate returns. 单次触发在每种模式下都可用，不改变模式和推理开关；待机时触发会临时放开取帧，等待约一帧（15 fps）加处理时间，之后恢复待机帧率。
 - A mode change applies from the next processed frame; the YOLO model stays loaded, so no reload. 模式切换在下一帧生效，模型常驻，无需重新加载。
 
 `GET /api/v1/vision/mode`:
@@ -52,7 +52,8 @@ The single-shot button and calibration capture call `/api/v1/detection/trigger`.
 ```json
 {"api_version":1,"mode":"both","modes":["off","yolo","aruco","both"],
  "pipelines":{"yolo":true,"aruco":true},"last_active_mode":"both","enabled":true,"processing":true,
- "fps":5,"active_fps":5,"idle_fps":1,"fps_range":[1,15],"trigger":true,
+ "fps":5,"active_fps":5,"idle_fps":1,"fps_range":[1,15],"camera_fps":10,
+ "measured":{"input_fps":7.5,"result_fps":5.0},"trigger":true,
  "available":{"yolo":true,"aruco":true},
  "model":{"name":"yolo11n_detection_cv181x_int8","path":"/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel"},
  "family":"aruco4x4_50"}
