@@ -34,9 +34,12 @@ either expressed or implied, of the Regents of The University of Michigan.
  * from sscma-example-sg200x components/apriltag/apriltag.c at commit 9af8118:
  * - edge refinement runs as one pass before the decode tasks and is time-stamped "refine";
  *   the decode tasks are stamped "decode".
+ * - apriltag_detector_create() / _copy() allocate rebot-vision options after the detector
+ *   (rv_apriltag.h); apriltag_detector_destroy() frees the reuse_buffers scratch.
  */
 
 #include "apriltag.h"
+#include "rv_apriltag.h"
 
 #define _USE_MATH_DEFINES
 #include <math.h>
@@ -375,9 +378,27 @@ void apriltag_detector_clear_families(apriltag_detector_t *td)
     zarray_clear(td->tag_families);
 }
 
+// rebot-vision: options stored after the detector (rv_apriltag.h).
+struct rv_detector_block {
+    apriltag_detector_t td;
+    rv_apriltag_options_t opts;
+    struct rv_quad_scratch *scratch;  // reuse_buffers; owned by the detector
+};
+
+rv_apriltag_options_t *rv_apriltag_options(apriltag_detector_t *td)
+{
+    return &((struct rv_detector_block *)td)->opts;
+}
+
+struct rv_quad_scratch **rv_apriltag_scratch(apriltag_detector_t *td)
+{
+    return &((struct rv_detector_block *)td)->scratch;
+}
+
 apriltag_detector_t *apriltag_detector_create()
 {
-    apriltag_detector_t *td = (apriltag_detector_t*) calloc(1, sizeof(apriltag_detector_t));
+    // rebot-vision: the detector is the first member of a block that holds its options
+    apriltag_detector_t *td = (apriltag_detector_t*) calloc(1, sizeof(struct rv_detector_block));
 
     td->nthreads = 1;
     td->quad_decimate = 2.0;
@@ -417,6 +438,7 @@ void apriltag_detector_destroy(apriltag_detector_t *td)
     apriltag_detector_clear_families(td);
 
     zarray_destroy(td->tag_families);
+    rv_quad_scratch_destroy(*rv_apriltag_scratch(td));
     free(td);
 }
 
@@ -1553,9 +1575,10 @@ zarray_t* apriltag_detections_copy(zarray_t* detections)
 
 apriltag_detector_t *apriltag_detector_copy(apriltag_detector_t *src)
 {
-    apriltag_detector_t *dst = (apriltag_detector_t *)malloc(sizeof(apriltag_detector_t));
-    // Shallow copy of all scalar fields
-    *dst = *src;
+    apriltag_detector_t *dst = (apriltag_detector_t *)malloc(sizeof(struct rv_detector_block));
+    // Shallow copy of all scalar fields (rebot-vision: and the options)
+    *(struct rv_detector_block *)dst = *(struct rv_detector_block *)src;
+    *rv_apriltag_scratch(dst) = NULL;
 
     // Reinitialize pointer fields to independent default values to avoid shared ownership and double-free issues
     dst->tag_families = zarray_create(sizeof(apriltag_family_t *));

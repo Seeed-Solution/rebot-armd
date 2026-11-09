@@ -155,6 +155,12 @@ void load_config_file(const std::string& path) {
     num("min_margin", g_cfg.aruco.filter.min_margin);
     num("min_side", g_cfg.aruco.filter.min_side_px);
     num("aruco_stats_every", g_cfg.aruco_stats_every);
+    auto boolean = [&](const char* k, bool& dst) {
+        auto it = j.find(k);
+        if (it != j.end() && it->is_boolean()) dst = it->get<bool>();
+    };
+    boolean("lazy_clusters", g_cfg.aruco.lazy_clusters);
+    boolean("reuse_buffers", g_cfg.aruco.reuse_buffers);
     if (auto it = j.find("ids"); it != j.end() && it->is_string()) {
         std::string err;
         if (!aruco::parse_id_list(it->get<std::string>(), g_cfg.aruco.filter.ids, &err))

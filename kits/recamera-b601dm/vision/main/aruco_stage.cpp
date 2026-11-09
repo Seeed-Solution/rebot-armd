@@ -13,6 +13,7 @@
 #include "apriltag.h"
 #include "apriltag_pose.h"
 #include "common/timeprofile.h"
+#include "rv_apriltag.h"
 #include "aruco/tagAruco4x4_100.h"
 #include "aruco/tagAruco4x4_250.h"
 #include "aruco/tagAruco4x4_50.h"
@@ -102,6 +103,8 @@ bool ArucoStage::init(const ArucoConfig& cfg) {
     td_->qtp.min_cluster_pixels = cfg.min_cluster_pixels;
     td_->qtp.max_nmaxima = cfg.max_nmaxima;
     td_->qtp.max_line_fit_mse = cfg.max_line_fit_mse;
+    rv_apriltag_options(td_)->lazy_clusters = cfg.lazy_clusters;
+    rv_apriltag_options(td_)->reuse_buffers = cfg.reuse_buffers;
     td_->nthreads = 1;
     return true;
 }

@@ -30,6 +30,12 @@ struct ArucoConfig {
     int min_cluster_pixels = 24;   ///< min boundary pixels of a candidate quad (decimated image)
     int max_nmaxima = 10;
     float max_line_fit_mse = 10.0f;
+    /// Gradient clusters: test the neighbour colours before the union-find lookups (same
+    /// result, fewer random memory reads; apriltag_patched/).
+    bool lazy_clusters = true;
+    /// Keep apriltag's union-find, cluster hash map and cluster point arrays from frame to
+    /// frame and build the clusters in one pass (apriltag_patched/).
+    bool reuse_buffers = true;
     /// Pose with apriltag's estimate_tag_pose() instead of tag_pose_estimate() (same result,
     /// ~26k heap calls per marker); for the host benchmark's baseline.
     bool apriltag_pose = false;
