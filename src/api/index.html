@@ -1439,7 +1439,7 @@ const I18N = {
     'calib.count': '已采集位姿: {n} / {total}', 'calib.cap': '采集当前点位', 'calib.cap.busy': '采集中…', 'calib.solve': '求解标定', 'calib.export': '导出配置',
     'calib.reset': '重置', 'calib.reset.confirm': '再点一次确认重置',
     'calib.live.none': '未识别到带 3D 位姿的标记 · 采集时会自动单次识别', 'calib.live.ok': '标记 ID {id} · Z {z} m',
-    'calib.e.offline': '遥测未连接，无法读取关节状态', 'calib.e.moving': '机械臂仍在运动，请静止后再采集', 'calib.e.shifted': '识别期间机械臂位置有变化，请保持静止后重试', 'calib.e.j5': '手腕 J5/J6 偏离初始位置超过 1°，标定计算按手腕初始位置处理，请先回到初始位置', 'calib.e.nomarker': '未识别到带 3D 位姿的 ArUco 标记',
+    'calib.e.offline': '遥测未连接，无法读取关节状态', 'calib.e.moving': '机械臂仍在运动，请静止后再采集', 'calib.e.shifted': '识别期间机械臂位置有变化，请保持静止后重试', 'calib.e.nomarker': '未识别到带 3D 位姿的 ArUco 标记',
     'calib.e.dup': '与第 {i} 个点位距离不足 1 cm，请移到新位置', 'calib.e.few': '至少需要 3 个点位', 'calib.e.degenerate': '点位共线或过于集中，请扩大分布',
     'calib.ok.cap': '已采集第 {n} 个点位', 'calib.ok.solve': '标定完成，RMSE {rmse} mm', 'calib.rmse.warn': '残差偏大，检查标记是否与 TCP 重合、点位是否静止',
     'calib.r.t': '平移 T (mm)', 'calib.r.e': '欧拉角 RPY (°)', 'calib.r.rmse': '残差 RMSE', 'calib.r.n': '样本数', 'calib.r.max': '最大残差',
@@ -1533,7 +1533,7 @@ const I18N = {
     'calib.count': 'Poses captured: {n} / {total}', 'calib.cap': 'Capture pose', 'calib.cap.busy': 'Capturing…', 'calib.solve': 'Solve', 'calib.export': 'Export JSON',
     'calib.reset': 'Reset', 'calib.reset.confirm': 'Tap again to reset',
     'calib.live.none': 'No marker with a 3D pose · capture will run a snapshot', 'calib.live.ok': 'Marker ID {id} · Z {z} m',
-    'calib.e.offline': 'Telemetry offline, joint state unavailable', 'calib.e.moving': 'Arm is still moving, wait until it stops', 'calib.e.shifted': 'Arm pose changed during detection, hold still and retry', 'calib.e.j5': 'Wrist J5/J6 is more than 1° off its home position, which calibration assumes; return the wrist to home first', 'calib.e.nomarker': 'No ArUco marker with a 3D pose detected',
+    'calib.e.offline': 'Telemetry offline, joint state unavailable', 'calib.e.moving': 'Arm is still moving, wait until it stops', 'calib.e.shifted': 'Arm pose changed during detection, hold still and retry', 'calib.e.nomarker': 'No ArUco marker with a 3D pose detected',
     'calib.e.dup': 'Less than 1 cm from pose {i}, move to a new position', 'calib.e.few': 'At least 3 poses are required', 'calib.e.degenerate': 'Poses are collinear or too close together, spread them out',
     'calib.ok.cap': 'Captured pose {n}', 'calib.ok.solve': 'Calibration solved, RMSE {rmse} mm', 'calib.rmse.warn': 'High residual: check the marker sits on the TCP and the arm was still',
     'calib.r.t': 'Translation T (mm)', 'calib.r.e': 'Euler RPY (°)', 'calib.r.rmse': 'Residual RMSE', 'calib.r.n': 'Samples', 'calib.r.max': 'Max residual',
@@ -2808,7 +2808,7 @@ function initDetToggle() {
 /* =================================================================
    Hand-eye calibration (eye-to-hand, marker centre at the TCP)
    Each sample pairs the marker position in the camera frame (ArUco tvec) with the TCP position in the
-   base frame (IK.fk of the measured joints). T_cam_to_base is the rigid transform p_base = R p_cam + t
+   base frame (full URDF FK J1..J6 of the measured joints, CALM.fk). T_cam_to_base is the rigid transform p_base = R p_cam + t
    that best fits all pairs (Horn 1987 closed-form quaternion solution); RMSE is the 3D point residual.
    ================================================================= */
 const CAL = { samples: [], target: 9, result: null, markerId: null, resetArmedUntil: 0, busy: false, liveTimer: null };
@@ -2819,6 +2819,9 @@ const CAL = { samples: [], target: 9, result: null, markerId: null, resetArmedUn
   } catch (_) {}
 })();
 const calSave = () => store('rebot.calib', JSON.stringify({ samples: CAL.samples, markerId: CAL.markerId }));
+// T_base_gripper from raw motor positions: J1..J4 through toModel (CFG.cart sign / offset), index 4 = URDF
+// joint5 and, on 7-DOF arms, index 5 = URDF joint6, 1:1 (index 5 is the gripper on 6-DOF arms)
+const calGripper = (pos) => CALM.fk([...toModel(pos), pos[4] || 0, S.dof === 7 ? pos[5] || 0 : 0]);
 
 /* CALIB-MATH-BEGIN */
 // Pure hand-eye calibration math: no DOM and no page state. scripts/calib_selftest.mjs evaluates this
@@ -3127,11 +3130,6 @@ async function calCapture() {
   if (CAL.busy) return;
   if (!isLive() || !S.obs || !Array.isArray(S.obs.positions) || S.obs.positions.length < 4) { toast(t('calib.e.offline'), 'warn'); return; }
   if (Array.isArray(S.obs.velocities) && S.obs.velocities.some((v) => Math.abs(v) > 0.02)) { toast(t('calib.e.moving'), 'warn'); return; }
-  // J5 (index 4) is not part of IK.fk (J1-J4 only); a rotated J5 would corrupt the TCP of the sample
-  // IK.fk models J1-J4 with the wrist at its home values (J5 = 0, J6 = pi/2 on 7-DOF arms);
-  // reject samples taken with either wrist joint moved off home.
-  const wristHome = [0, Math.PI / 2];
-  if ([4, 5].some((j, k) => (j === 4 || S.dof === 7) && S.obs.positions.length > j && Math.abs((S.obs.positions[j] || 0) - wristHome[k]) > Math.PI / 180)) { toast(t('calib.e.j5'), 'warn'); return; }
   CAL.busy = true; calRender();
   try {
     const pos = S.obs.positions.slice(); // snapshot before the (1-4 s) detection so frame and pose belong together
@@ -3148,15 +3146,14 @@ async function calCapture() {
     if (!isLive() || !S.obs || !Array.isArray(S.obs.positions) || S.obs.positions.length < 4) { toast(t('calib.e.offline'), 'warn'); return; }
     if (Array.isArray(S.obs.velocities) && S.obs.velocities.some((v) => Math.abs(v) > 0.02)) { toast(t('calib.e.moving'), 'warn'); return; }
     if (pos.slice(0, 6).some((v, i) => !Number.isFinite(S.obs.positions[i]) || Math.abs(S.obs.positions[i] - v) > 0.003)) { toast(t('calib.e.shifted'), 'warn'); return; }
-    const tcp = IK.fk(toModel(pos));
-    const p_base = [tcp.x, tcp.y, tcp.z];
+    const G = calGripper(pos), p_base = CALM.posOf(G);
     const dup = CAL.samples.findIndex((sm) => Math.hypot(...sm.p_base.map((v, k) => v - p_base[k])) < 0.01);
     if (dup >= 0) { toast(t('calib.e.dup', { i: dup + 1 }), 'warn'); return; }
     if (CAL.markerId == null && m.aruco.id != null) CAL.markerId = m.aruco.id;
     CAL.samples.push({
-      joints: pos, p_base, tcp_pitch: tcp.pitch,
+      joints: pos, p_base, T_base_gripper: G,
       marker_id: m.aruco.id, p_cam: m.aruco.t.slice(),
-      R_cam: m.aruco.R, rpy_cam_deg: m.aruco.rpy, corners: m.aruco.corners,
+      R_cam: m.aruco.R, rpy_cam_deg: m.aruco.rpy, T_cam_marker: m.aruco.R ? CALM.make(m.aruco.R, m.aruco.t) : null, corners: m.aruco.corners,
       ts: new Date().toISOString(),
     });
     CAL.result = null; calSave();
@@ -3167,23 +3164,12 @@ async function calCapture() {
 function calSolve() {
   const r = solveRigid(CAL.samples.map((sm) => sm.p_cam), CAL.samples.map((sm) => sm.p_base));
   if (r.err) { toast(t(r.err), 'warn'); return; }
-  CAL.result = { ...r, rpy: POSE.rpyDeg(r.R), n: CAL.samples.length, at: new Date().toISOString() };
+  CAL.result = { ...r, rpy: CALM.rpyDeg(r.R), n: CAL.samples.length, at: new Date().toISOString() };
   calRender();
   toast(t('calib.ok.solve', { rmse: (r.rmse * 1000).toFixed(2) }), r.rmse > 0.01 ? 'warn' : '');
 }
 function calExport() {
-  const r = CAL.result;
-  const out = {
-    version: 1, kind: 'hand_eye_calibration', setup: 'eye_to_hand', method: 'point_registration_horn',
-    assumption: 'ArUco marker centre coincides with the TCP; TCP from the UI forward kinematics (IK.fk, URDF b601dm)',
-    units: { length: 'm', angle: 'deg' }, created: new Date().toISOString(), marker_id: CAL.markerId,
-    result: r ? {
-      T_cam_to_base: [...r.R.map((row, i) => [...row, r.t[i]]), [0, 0, 0, 1]],
-      translation_m: r.t, euler_rpy_deg: r.rpy, euler_convention: 'R = Rz(yaw) Ry(pitch) Rx(roll)',
-      rmse_m: r.rmse, max_error_m: r.maxErr, residuals_m: r.residuals, samples: r.n, solved_at: r.at,
-    } : null,
-    samples: CAL.samples,
-  };
+  const out = CALM.buildExport({ mode: 'eye_to_hand', samples: CAL.samples, result: CAL.result, markerId: CAL.markerId });
   const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
