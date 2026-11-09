@@ -28,6 +28,8 @@ The existing `/api/v1/motion/jog`, `/motion/home`, `/motion/unload` commands and
 | `/api/v1/action/move_to` | `{"position":[x,y,z], "orientation": {"rpy":[r,p,y]} \| {"quat":[w,x,y,z]} \| null, "speed": {"linear":m/s, "angular":rad/s}?, "tag": str?}` |
 | `/api/v1/action/move_relative` | `{"frame":"base"\|"tool"\|"camera", "d":[dx,dy,dz]?, "dyaw":rad?, "dpitch":rad?, "droll":rad?, "level":bool?, "speed"?, "tag"?}` |
 | `/api/v1/action/gripper` | `{"command":"open"\|"close"\|"move", "fraction":0..1? (move only; 0 closed, 1 open), "grasp":bool? (close only, default true), "speed":rad/s? (≤2.0, default 1.0), "timeout_s":? (default 6, ≤30), "tag"?}` |
+| `/api/v1/action/grasp` | `{"label":str, "box_norm":[x0,y0,x1,y1], "frame_id":int?, "ts_ms":number?, "overrides":{setup fields}?, "tag"?}` — see [Grasp](#grasp--点框抓取) |
+| `/api/v1/grasp/setup` | grasp setup patch, see [Grasp setup](#grasp-setup--抓取设置) (not an action: acknowledged without `action_id`) |
 
 - Poses are the end_link pose in base_link, metres and radians (URDF `assets/reBot-DevArm_gripper.urdf`; end_link x is the tool axis). `rpy` is URDF fixed-axis R = Rz(yaw)·Ry(pitch)·Rx(roll). `orientation: null` keeps the current orientation.
 - Motor angle = URDF model angle for J1..J6 (the cockpit's `?iksign` / `?ikoff` overrides are not applied).
@@ -74,7 +76,7 @@ Every observation carries `action` (latest record) and, for 2 s after a newer ac
            "holding":null, "gripper_gap_rad":null, "settled":null}
 ```
 
-`kind`: `move_to`, `move_relative`, `gripper`, `joint_move`, `home`, `park`. `state`: `running`, `done`, `failed`, `cancelled`. `started_at` / `finished_at` use the observation `timestamp` clock. Clients block by waiting until `action.id == action_id` and `state != "running"`, or until `previous_action.id == action_id`.
+`kind`: `move_to`, `move_relative`, `gripper`, `grasp`, `joint_move`, `home`, `park`. A `grasp` record also carries `phase`, `iteration` and `error_px` (null for other kinds). `state`: `running`, `done`, `failed`, `cancelled`. `started_at` / `finished_at` use the observation `timestamp` clock. Clients block by waiting until `action.id == action_id` and `state != "running"`, or until `previous_action.id == action_id`.
 
 A running action ends when its reference goes away:
 
@@ -90,6 +92,97 @@ A running action ends when its reference goes away:
 
 Servo frames while an action runs are rejected with `MOTION_BUSY`. Jog, preset, home and park are accepted and supersede it.
 
+## Grasp / 点框抓取
+
+`/api/v1/action/grasp` picks up an object the user selected in the camera image. The request names a detection box (normalised `box_norm` from the detector, its `label`, optionally the frame); the action does the rest and ends with the object lifted, or with a failure code.
+
+`/api/v1/action/grasp` 抓取用户在画面中选中的物体：请求给出检测框（归一化 `box_norm`、类别 `label`，可选帧号），动作完成后物体被抬起，或以失败码结束。
+
+Needs a 7-DOF profile with `kinematics`, `gripper_policy` and `grasp` (the built-in `rebot-dm` has all three); otherwise `UNSUPPORTED`.
+
+### Before the ack / 应答之前
+
+Under the lock: lease, epoch, request_id, body, then the same preconditions as other actions (`MOTION_BUSY` etc.). Outside the lock: the box centre ray (setup intrinsics, current commanded pose, `camera_mount`) is intersected with the plane z = `table_z_m + grasp_height_m` to estimate the target; the look-down approach pose above it is planned with the gripper open. A planning failure is a `command_reject` with the planner's code (`IK_UNREACHABLE`, `IK_BRANCH_FLIP`, `WORKSPACE_VIOLATION`, 422); a ray that does not meet the table in front of the camera is `INVALID_COMMAND`. Then the action begins and the ack carries `action_id` and a rough `expected_duration_s`.
+
+锁内校验租约、epoch、request_id、请求体和动作前置条件；锁外用框中心射线与平面 z = `table_z_m + grasp_height_m` 求交估计目标位置，并以夹爪张开状态规划俯视接近位姿。规划失败直接 `command_reject`（`IK_UNREACHABLE` / `IK_BRANCH_FLIP` / `WORKSPACE_VIOLATION`，422）；射线不与桌面相交返回 `INVALID_COMMAND`。
+
+### Phases / 阶段
+
+An async task outside the supervisor lock and the control tick runs the phases; `action.phase` and `action.progress` report them:
+
+| phase | what happens |
+|---|---|
+| `open` | gripper `open` |
+| `approach` | move_to above the estimate at `table_z_m + approach_height_m`, tool axis (end_link x) straight down, heading kept (minimal rotation) |
+| `centring` | closed loop: wait for frames captured `settle_delay_s` after the last motion settled, match the target, take the median centre of `median_frames` frames; done when within `centre_tol_px` of the grip pixel for `stable_frames` consecutive frames; otherwise step = `servo_gain` × (table point of the box centre − table point of the grip pixel), at most `max_step_m`, as a base-frame move_relative. `iteration` = corrections made, `error_px` = latest error. More than `max_iterations` corrections → `CENTRING_FAILED` |
+| `align` | when the box's long / short side ratio ≥ `align_min_aspect` and the jaws (end_link y in the image) would close across the long side: roll ±90° about the tool axis (the sign that keeps J6 inside its limits) |
+| `descend` | straight down to `table_z_m + grasp_height_m` at `descend_speed_mps` |
+| `close` | gripper `close` with grasp detection; `holding` per `gripper_policy` |
+| `release` | not holding: gripper `open`, then `lift`, then `failed` / `NOT_HOLDING` (`holding:false`); no retry |
+| `lift` | straight up to `table_z_m + lift_height_m` |
+| `done` | `state:"done"`, `holding:true`, `gripper_gap_rad`; the jaw keeps its hold target in `commanded_positions[6]` |
+
+由锁外异步任务按阶段执行，`action.phase` / `action.progress` 报告当前阶段。对中阶段只用运动停稳之后拍到的帧；像素误差按粗略内参和 FK 已知高度换算为米，再乘保守增益，所以内参或安装角不准只会多走几步，不会发散。
+
+Target tracking: same label, centre within `match_dist_px` of the predicted centre or IoU > `match_iou`; the first match after the approach uses the wider `acquire_dist_px` around the projection of the estimate. No match in `lost_frames` fresh frames or for `lost_timeout_s` → `TARGET_LOST`. No frames at all for max(3 s, `lost_timeout_s`) → `TARGET_LOST`; a detector error → `DETECTION_UNAVAILABLE`. If inference was off, the grasp turns it on and turns it off again when it ends (any outcome).
+
+Every motion is a sub-motion of the one grasp record: it is installed under the lock only while the grasp is still the running action of the same lease and epoch, and sub-motion results go to the orchestrator, not to `action`. A motion longer than its planned duration × 2 + 5 s (gripper: expected duration + 10 s), capped at `phase_timeout_s`,, or the whole grasp longer than `timeout_s`, stops the motion and ends as `GRASP_TIMEOUT`. Sub-motion failures (`TRACKING_STALL`, `GRIPPER_TIMEOUT`, planner codes) end the grasp with that code.
+
+Ending a grasp from outside:
+
+| cause | state / code |
+|---|---|
+| `/motion/stop` (during a motion or between motions) | `cancelled` / `STOPPED` |
+| new jog / preset / home / park / action | `cancelled` / `SUPERSEDED` |
+| lease released, preempted or connection closed | `cancelled` / `LEASE_LOST` |
+| E-stop / Fault / lease watchdog | `failed` / `ESTOP_ACTIVE` / `FAULT` / `WATCHDOG` |
+
+The record ends in the same tick; a sub-motion still carrying the grasp is stopped, and the orchestrator issues nothing more. Servo frames are rejected with `MOTION_BUSY` for the whole grasp, including the waits between motions.
+
+外部停止（停止、急停、租约丢失、被新指令替代）在同一 tick 内结束动作记录，仍在执行的子运动被停止，编排任务不再下发任何运动。抓取期间（包括两次运动之间的等待）servo 帧一律返回 `MOTION_BUSY`。
+
+Example / 示例:
+
+```json
+{"type":"command", "request_id":51, "generation":7, "epoch_id":3, "path":"/api/v1/action/grasp",
+ "body":{"label":"cup", "box_norm":[0.31,0.39,0.47,0.72], "ts_ms":1762650000000, "tag":"pick",
+         "overrides":{"approach_height_m":0.17}}}
+```
+
+```json
+"action": {"id":9, "kind":"grasp", "tag":"pick", "state":"running", "phase":"centring", "iteration":2, "error_px":14.3,
+           "progress":0.3, "code":null, "holding":null, ...}
+```
+
+### Grasp setup / 抓取设置
+
+`ArmConfig.grasp` holds the defaults; the runtime setup is read with `GET /api/v1/grasp/setup` (`{"supported":bool, "setup":{...}, "path":str|null}`) and changed with the WS command `/api/v1/grasp/setup` (body = fields to change; unknown fields, non-finite or out-of-range values → `INVALID_COMMAND`). `{"table_z_from_tcp": true}` sets `table_z_m` to the current commanded end_link height (jog the jaw tips onto the table first). The ack carries the new `setup` and `persisted: true|false` (`persist_error` on failure). Every field can also be overridden for one grasp with `overrides`.
+
+Persistence: `ARMD_GRASP_SETUP` (default `/userdata/rebot-teleop/grasp_setup.json`), written atomically (temp file + rename, directory created). At startup a missing file keeps the defaults; an unreadable, malformed or invalid file is logged and ignored (defaults kept, file untouched); a partial file overrides only its fields.
+
+`camera_tilt_deg` is `camera_mount.tilt_deg`: setting it changes the mount used by camera-frame moves and published in the schema. For the default mount (`flip:false`) a negative tilt turns the optical axis toward the jaws (image down).
+
+设置默认值来自 `ArmConfig.grasp`；运行时用 `GET /api/v1/grasp/setup` 读取，用 WS 指令 `/api/v1/grasp/setup` 修改（`table_z_from_tcp: true` 以当前夹爪尖高度作为桌面高度），保存到 `ARMD_GRASP_SETUP`（默认 `/userdata/rebot-teleop/grasp_setup.json`）。文件缺失用默认值；文件损坏或数值无效时记日志并忽略。`camera_tilt_deg` 即 `camera_mount.tilt_deg`；默认安装（`flip:false`）下负值表示光轴朝夹爪方向（画面下方）倾斜。
+
+| field | default | meaning |
+|---|---|---|
+| `table_z_m` | 0.0 | table surface, base frame (m) |
+| `approach_height_m` / `grasp_height_m` / `lift_height_m` | 0.15 / 0.015 / 0.12 | TCP (end_link origin = jaw tips) above the table (m) |
+| `grip_pixel_norm` | [0.5, 0.5] | where the table point under the jaw tips appears at approach height, looking down |
+| `camera_tilt_deg` | `camera_mount.tilt_deg` | camera tilt (deg) |
+| `image_size_px`, `fx_px`, `fy_px` | [640, 360], 600, 600 | rough intrinsics for pixel → metric steps (placeholders) |
+| `centre_tol_px`, `stable_frames`, `median_frames`, `max_iterations` | 10, 3, 3, 10 | centring done / give up |
+| `servo_gain`, `max_step_m` | 0.6, 0.03 | step = gain × estimated error, at most max_step |
+| `match_dist_px`, `match_iou`, `acquire_dist_px` | 35, 0.45, 160 | target matching gates |
+| `lost_timeout_s`, `lost_frames`, `settle_delay_s` | 1.0, 5, 0.1 | target loss and frame freshness |
+| `align_j6`, `align_min_aspect` | true, 1.2 | J6 alignment |
+| `approach_speed_mps`, `descend_speed_mps` | 0.05, 0.03 | linear speeds |
+| `phase_timeout_s`, `timeout_s` | 25, 120 | timeouts |
+
+The cockpit (`src/api/index.html`) uses this API: with Detect on, tap a box, confirm "Grasp"; the "Grasp setup" HUD button opens the setup drawer. After any `gripper` or `grasp` action the cockpit takes its gripper target from `commanded_positions[6]`, so taking over by teleop does not move the jaw.
+
+驾驶舱：开启「识别」后点框并确认「抓取」；HUD 上的「抓取设置」打开设置抽屉。任何 `gripper` / `grasp` 动作之后，驾驶舱从 `commanded_positions[6]` 同步夹爪目标，遥操作接管时夹爪不会被拉回原开度。
+
 ## Errors / 错误码
 
 | code | status |
@@ -99,7 +192,7 @@ Servo frames while an action runs are rejected with `MOTION_BUSY`. Jog, preset, 
 | `INVALID_COMMAND` (bad or missing params, path too long) | 400 |
 | `UNSUPPORTED` | 422 |
 
-Codes that only appear in `action.code`: `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `ESTOP_ACTIVE`, `FAULT`, `WATCHDOG`, `LEASE_LOST`, `STOPPED`, `SUPERSEDED`, `UNLOAD_FAILED`.
+Codes that only appear in `action.code`: `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `ESTOP_ACTIVE`, `FAULT`, `WATCHDOG`, `LEASE_LOST`, `STOPPED`, `SUPERSEDED`, `UNLOAD_FAILED`; for `grasp` also `TARGET_LOST`, `CENTRING_FAILED`, `NOT_HOLDING`, `GRASP_TIMEOUT`, `DETECTION_UNAVAILABLE`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a later phase.
 
 ## Needs verification on the device / 需实机核实
 
@@ -107,3 +200,4 @@ Codes that only appear in `action.code`: `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `E
 - `squeeze_rad` 0.15 and `holding_torque_nm` 0.12 come from the MIT-mode project; grip torque under POS_VEL depends on the motor's internal gains.
 - `camera_mount` (`flip`, `tilt_deg`, `offset_m`) for camera-frame moves.
 - Planning time on the SG2002: `cargo test --release --test test_actions bench_plan -- --ignored --nocapture`.
+- Grasp: `camera_tilt_deg` sign and value for the new mount, `camera_mount.offset_m`, `grip_pixel_norm`, `table_z_m`; detection rate and latency (`settle_delay_s`, `lost_*`); the jaw closing axis (assumed end_link y) for J6 alignment; `centre_tol_px` against detector jitter; `holding` thresholds under POS_VEL. Simulated-camera tests: `cargo test --test test_grasp -- --nocapture`.
