@@ -21,9 +21,12 @@ struct ArucoConfig {
     double quad_decimate = 2.0;
     double quad_sigma = 0.0;
     bool refine_edges = true;
-    // Quad detector tuning (apriltag defaults, as aruco-detector 0.1.3).
+    // Quad detector tuning. apriltag defaults (aruco-detector 0.1.3) except the contrast
+    // threshold: 5 lets sensor noise in flat areas through the threshold step, and every
+    // noise blob costs union-find, clustering and quad fitting. 20 keeps recall and false
+    // positives at the 0.1.3 level on the host benchmark (tests/aruco_bench.cpp).
     double decode_sharpening = 0.25;
-    int min_white_black_diff = 5;  ///< min contrast of a black/white component pair (0..255)
+    int min_white_black_diff = 20;  ///< min contrast of a black/white component pair (0..255)
     int min_cluster_pixels = 24;   ///< min boundary pixels of a candidate quad (decimated image)
     int max_nmaxima = 10;
     float max_line_fit_mse = 10.0f;
