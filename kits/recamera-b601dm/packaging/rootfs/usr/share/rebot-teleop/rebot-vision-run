@@ -1,0 +1,60 @@
+#!/bin/sh
+# rebot-vision-run: keeps rebot-vision (the kit's camera process) running. Started by
+# /etc/init.d/K92rebot-teleop with its pid in /var/run/rebot-vision.pid.
+# - rebot-vision runs at nice 10 so armd's control loop wins CPU contention.
+# - After an exit it restarts with backoff 1, 2, 4 ... 30 s (back to 1 s after a run longer
+#   than 60 s) and gives up after 10 starts within 5 minutes.
+# - SIGTERM: forwards SIGTERM (never SIGKILL: a killed camera holder leaves VPSS groups
+#   allocated) to rebot-vision, waits for it and exits.
+BIN=${REBOT_VISION_BIN:-/usr/bin/rebot-vision}
+CONF=${REBOT_VISION_CONF:-/userdata/rebot-teleop/vision.json}
+LOG=${REBOT_VISION_LOG:-/var/log/rebot-vision.log}
+export LD_LIBRARY_PATH=/mnt/system/lib:/mnt/system/usr/lib:/mnt/system/usr/lib/3rd:/mnt/system/lib/3rd:/lib:/usr/lib
+
+NICE="nice -n 10"
+command -v nice >/dev/null 2>&1 || NICE=""
+
+child=""
+stopping=0
+on_term() {
+    stopping=1
+    [ -n "$child" ] && kill -TERM "$child" 2>/dev/null
+}
+trap on_term TERM INT
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [rebot-vision-run] $*" >> "$LOG"; }
+
+starts=""
+delay=1
+while [ "$stopping" -eq 0 ]; do
+    now=$(date +%s)
+    recent=""
+    n=0
+    for s in $starts; do
+        if [ $((now - s)) -lt 300 ]; then recent="$recent $s"; n=$((n + 1)); fi
+    done
+    starts="$recent"
+    if [ "$n" -ge 10 ]; then
+        log "10 starts within 5 minutes; giving up (see the messages above)"
+        exit 1
+    fi
+    starts="$starts $now"
+    $NICE "$BIN" --config "$CONF" >> "$LOG" 2>&1 &
+    child=$!
+    wait "$child"
+    rc=$?
+    # a trapped SIGTERM interrupts wait: wait again until rebot-vision has exited
+    while kill -0 "$child" 2>/dev/null; do
+        wait "$child"
+        rc=$?
+    done
+    child=""
+    [ "$stopping" -eq 1 ] && break
+    if [ $(( $(date +%s) - now )) -gt 60 ]; then delay=1; fi
+    log "rebot-vision exited ($rc); restarting in ${delay}s"
+    sleep "$delay" &
+    wait $!
+    delay=$((delay * 2))
+    [ "$delay" -gt 30 ] && delay=30
+done
+exit 0

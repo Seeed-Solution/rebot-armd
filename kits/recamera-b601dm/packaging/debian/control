@@ -1,5 +1,5 @@
 Package: rebot-teleop
-Version: 1.1.0
+Version: 1.2.0
 Architecture: riscv64
 Maintainer: Seeed Studio <support@seeed.cc>
 Installed-Size: 3450
@@ -7,8 +7,12 @@ Depends:
 Section: misc
 Priority: optional
 Homepage: https://github.com/Seeed-Solution/rebot-armd
-Description: reBot B601-DM arm control daemon (armd) and web cockpit for reCamera
+Description: reBot B601-DM arm control daemon (armd), camera vision and web cockpit for reCamera
  Runs armd on the reCamera SG2002 with the arm on the B4 board CAN bus
  (Damiao motors), starts a Wi-Fi access point, and serves a browser
- cockpit for teleoperation, object detection overlay, hand-eye calibration
- and tap-to-grasp. Records joint state and commands to Parquet files.
+ cockpit for teleoperation, hand-eye calibration and tap-to-grasp.
+ Includes rebot-vision, the camera process: H.264 video over WebSocket,
+ YOLO object detection and ArUco markers (modes off / yolo / aruco / both),
+ so no other camera app is needed. YOLO models are not included; the model
+ already on the device is used. Records joint state and commands to
+ Parquet files.

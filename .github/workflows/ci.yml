@@ -48,6 +48,9 @@ jobs:
       - name: Init script syntax
         run: |
           for f in kits/recamera-b601dm/packaging/rootfs/etc/init.d/* \
+                   kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/rebot-vision-run \
+                   kits/recamera-b601dm/packaging/debian/postinst \
+                   kits/recamera-b601dm/packaging/debian/prerm \
                    kits/_template/packaging/etc/init.d/*; do
             sh -n "$f" && echo "ok $f"
           done

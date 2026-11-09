@@ -8,12 +8,26 @@
 # Short-Description: reBot Teleop and Robotic Arm Daemon for reCamera
 ### END INIT INFO
 
+# Starts armd (arm control, cockpit on :8765) and rebot-vision (camera: H.264 on :8001,
+# YOLO / ArUco API on :8090). The arm is the app: start/status/stop results follow armd;
+# vision failing to start is logged and leaves armd running.
+
 NAME=rebot-teleop
 DAEMON=/usr/local/bin/armd
 PIDFILE=/var/run/$NAME.pid
 LOGFILE=/var/log/$NAME.log
 # B601-DM arm profile (kit data, equal to armd's built-in rebot-dm profile)
 PROFILE=/usr/share/$NAME/profile/rebot-b601dm.json
+
+# Camera process, kept running by a respawn loop whose pid is in VISION_PIDFILE
+VISION_DAEMON=/usr/bin/rebot-vision
+VISION_RUNNER=/usr/share/$NAME/rebot-vision-run
+VISION_PIDFILE=/var/run/rebot-vision.pid
+VISION_CONF=/userdata/rebot-teleop/vision.json
+VISION_CONF_DEFAULT=/usr/share/$NAME/vision.json.default
+# Gallery apps that hold the camera. Only ones running from their own pidfile are stopped,
+# with their own init script; nothing is disabled or uninstalled.
+CAMERA_APPS="yolo-detector aruco-detector face-analysis face-recognition detection-blur ppocr-reader retail-vision qrcode-reader trigger-inspection-demo microduck-pose-qa fall-detection"
 
 # 默认配置参数
 FOLLOWER_MODEL="rebot-dm"
@@ -151,13 +165,82 @@ start_wifi() {
     fi
 }
 
+# PID of the vision respawn loop from its pidfile, if that process is the loop.
+vision_pid() {
+    VPID=$(cat "$VISION_PIDFILE" 2>/dev/null)
+    case "$VPID" in ''|*[!0-9]*) return 1 ;; esac
+    [ -d "/proc/$VPID" ] || return 1
+    tr '\000' ' ' < "/proc/$VPID/cmdline" 2>/dev/null | grep -q "$VISION_RUNNER" || return 1
+    echo "$VPID"
+}
+
+# Stop gallery apps that currently hold the camera (running from their pidfile).
+stop_camera_holders() {
+    STOPPED=""
+    for app in $CAMERA_APPS; do
+        APID=$(cat "/var/run/$app.pid" 2>/dev/null)
+        case "$APID" in ''|*[!0-9]*) continue ;; esac
+        [ -d "/proc/$APID" ] || continue
+        for script in /etc/init.d/[SK]??"$app"; do
+            [ -x "$script" ] || continue
+            "$script" stop >/dev/null 2>&1 || true
+            echo "[rebot-teleop] stopped camera holder $app"
+            logger -t "$NAME" "stopped camera holder $app" 2>/dev/null || true
+            STOPPED="$STOPPED $app"
+            break
+        done
+    done
+    # VPSS needs a moment to release the camera, as the console waits between apps
+    [ -n "$STOPPED" ] && sleep 2
+    return 0
+}
+
+port_busy() {
+    command -v netstat >/dev/null 2>&1 || return 1
+    netstat -ltn 2>/dev/null | grep -q "[:.]$1 "
+}
+
+# Start rebot-vision under its respawn loop at nice 10. Never fails the app start.
+start_vision() {
+    if [ ! -x "$VISION_DAEMON" ] || [ ! -f "$VISION_RUNNER" ]; then
+        echo "[rebot-teleop] rebot-vision not installed; camera features unavailable"
+        return 0
+    fi
+    if VPID=$(vision_pid); then
+        echo "[rebot-teleop] rebot-vision is already running (PID: $VPID)"
+        return 0
+    fi
+    rm -f "$VISION_PIDFILE"
+    stop_camera_holders
+    for port in 8001 8090; do
+        if port_busy "$port"; then
+            echo "[rebot-teleop] port $port is in use by another program; rebot-vision not started"
+            logger -t "$NAME" "port $port busy ($(netstat -ltnp 2>/dev/null | grep "[:.]$port " | head -n 1)); rebot-vision not started" 2>/dev/null || true
+            return 0
+        fi
+    done
+    if [ ! -f "$VISION_CONF" ] && [ -f "$VISION_CONF_DEFAULT" ]; then
+        mkdir -p "$(dirname "$VISION_CONF")" && cp -f "$VISION_CONF_DEFAULT" "$VISION_CONF" 2>/dev/null || true
+    fi
+    REBOT_VISION_CONF="$VISION_CONF" start-stop-daemon -S -b -m -p "$VISION_PIDFILE" -a /bin/sh -- "$VISION_RUNNER"
+    sleep 0.5
+    if VPID=$(vision_pid); then
+        echo "[rebot-teleop] rebot-vision started (PID: $VPID, log /var/log/rebot-vision.log)"
+    else
+        echo "[rebot-teleop] rebot-vision did not start; see /var/log/rebot-vision.log"
+    fi
+    return 0
+}
+
 start() {
     echo "Starting $NAME..."
     if [ -f $PIDFILE ]; then
         PID=$(cat $PIDFILE 2>/dev/null)
         if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
+            # armd already up (boot S92 then a console switch, or app_restore): make sure vision runs too
             echo "$NAME is already running (PID: $PID)"
-            return 1
+            start_vision
+            return 0
         fi
         rm -f $PIDFILE
     fi
@@ -218,6 +301,7 @@ start() {
     # 停止旧版本遗留的 go2rtc（视频已改由摄像头 WebSocket 直出）
     stop_video
 
+    start_vision
     return 0
 }
 
@@ -238,8 +322,27 @@ stop_video() {
     fi
 }
 
+# Stop the vision respawn loop from its pidfile (SIGTERM only; the loop forwards it to
+# rebot-vision and exits after it). A pidfile naming another process is left alone.
+stop_vision() {
+    [ -n "$VISION_PIDFILE" ] && [ -f "$VISION_PIDFILE" ] || return 0
+    VPID=$(cat "$VISION_PIDFILE" 2>/dev/null)
+    case "$VPID" in ''|*[!0-9]*) rm -f "$VISION_PIDFILE"; return 0 ;; esac
+    if [ ! -d "/proc/$VPID" ]; then rm -f "$VISION_PIDFILE"; return 0; fi
+    if ! tr '\000' ' ' < "/proc/$VPID/cmdline" 2>/dev/null | grep -q "$VISION_RUNNER"; then
+        echo "PID $VPID is not $VISION_RUNNER; leaving it"
+        return 0
+    fi
+    kill -TERM "$VPID" 2>/dev/null || true
+    w=0
+    while [ "$w" -lt 12 ] && [ -d "/proc/$VPID" ]; do sleep 0.25; w=$((w + 1)); done
+    [ -d "/proc/$VPID" ] && echo "rebot-vision still stopping (PID $VPID)" || rm -f "$VISION_PIDFILE"
+    return 0
+}
+
 stop() {
     echo "Stopping $NAME..."
+    stop_vision
     if [ ! -f "$PIDFILE" ]; then
         if ! command -v pidof >/dev/null 2>&1 || pidof armd >/dev/null 2>&1; then
             echo "Cannot confirm armd stopped: pidfile missing; leaving processes untouched"
@@ -292,6 +395,7 @@ stop() {
 }
 
 status() {
+    if VPID=$(vision_pid); then echo "rebot-vision is running (PID: $VPID)"; else echo "rebot-vision is not running"; fi
     if [ -f $PIDFILE ]; then
         PID=$(cat $PIDFILE 2>/dev/null)
         if [ -n "$PID" ] && [ -d "/proc/$PID" ]; then
