@@ -6,8 +6,12 @@
 //
 //   aruco_bench [--scenes N] [--reps N] [--check] [--variant baseline|tuned|both]
 //               [--wb N] [--cluster N] [--decimate F] [--sigma F] [--sharpen F] [--nmax N]
-//               [--refine 0|1] [--no-filter]
+//               [--refine 0|1] [--no-filter] [--sweep 1,1.5,2,...]
 //
+// --sweep: one table row per quad_decimate value (rv defaults otherwise), see run_sweep();
+// with --check it fails when the default decimate loses more than 3 points of recall for
+// markers of 40 px and larger at normal contrast against the first value of the list, or
+// more than 0.15 px of corner accuracy.
 // "baseline" = the aruco-detector 0.1.3 detector settings; "tuned" = rv::ArucoConfig
 // defaults (with rv::tag_pose_estimate; baseline uses apriltag's estimate_tag_pose).
 // --check (ctest) fails when tuned recall is below baseline recall, tuned has more false
@@ -52,6 +56,8 @@ struct Truth {
     double cx, cy;
     double side;          // shortest edge of the black border in pixels
     double corners[4][2];  // black-border corners in the image
+    double contrast = 0;   // rendered white minus black level (0..255)
+    double tilt_deg = 0;   // larger of the two out-of-plane tilts
 };
 
 struct Scene {
@@ -300,7 +306,8 @@ private:
         boxes.push_back({bx0, by0, bx1, by1});
         double tcx, tcy;
         apply(h, tw / 2, tw / 2, tcx, tcy);
-        Truth tr{id, tcx, tcy, min_side, {}};
+        Truth tr{id, tcx, tcy, min_side, {}, hi_v - lo,
+                 std::max(std::fabs(tilt_x), std::fabs(tilt_y)) * 180.0 / M_PI};
         for (int i = 0; i < 4; ++i) {
             tr.corners[i][0] = bc[i][0];
             tr.corners[i][1] = bc[i][1];
@@ -342,7 +349,7 @@ struct Stats {
 int bucket(double side) { return side < 20 ? 0 : side < 40 ? 1 : side < 80 ? 2 : 3; }
 
 Stats run_variant(const rv::ArucoConfig& cfg, const std::vector<Scene>& scenes, int reps,
-                  std::vector<std::vector<rv::MarkerOut>>& outs) {
+                  std::vector<std::vector<rv::MarkerOut>>& outs, std::vector<std::vector<int>>* match = nullptr) {
     rv::ArucoStage stage;
     Stats st;
     if (!stage.init(cfg)) {
@@ -365,13 +372,16 @@ Stats run_variant(const rv::ArucoConfig& cfg, const std::vector<Scene>& scenes, 
         }
         outs.push_back(out);
         std::vector<bool> used(out.size(), false);
-        for (const Truth& t : s.truth) {
+        if (match) match->emplace_back(s.truth.size(), -1);
+        for (size_t ti = 0; ti < s.truth.size(); ++ti) {
+            const Truth& t = s.truth[ti];
             ++st.truth;
             ++st.bucket_truth[bucket(t.side)];
             for (size_t i = 0; i < out.size(); ++i) {
                 if (used[i] || out[i].id != t.id) continue;
                 if (std::hypot(out[i].c[0] - t.cx, out[i].c[1] - t.cy) > std::max(3.0, 0.25 * t.side)) continue;
                 used[i] = true;
+                if (match) match->back()[ti] = static_cast<int>(i);
                 ++st.found;
                 // mean corner distance to the truth, best of the 4 cyclic orders and both windings
                 double best = 1e9;
@@ -416,6 +426,140 @@ void print(const char* name, const rv::ArucoConfig& c, const Stats& s) {
                 s.bucket_truth[1], s.bucket_found[2], s.bucket_truth[2], s.bucket_found[3], s.bucket_truth[3], s.fp);
 }
 
+// --sweep: one row per quad_decimate (rv defaults otherwise). Recall by marker side (shortest
+// black-border edge in px; at fx 600 a marker of S m is 600 * S / z px at z m, e.g. 5 cm at
+// 40 cm = 75 px, 2 cm at 40 cm = 30 px), the smallest side found, the smallest side bucket
+// from which every larger bucket keeps >= 95 % recall, corner error vs the rendered corners,
+// and the pose difference vs the first value of the list for markers both find.
+constexpr int kSweepBuckets = 7;
+constexpr double kLowContrast = 90;  // the generator's low-contrast prints and dim light
+const double kSweepEdges[kSweepBuckets + 1] = {14, 20, 25, 30, 40, 60, 80, 1e9};
+int sweep_bucket(double side) {
+    int b = 0;
+    while (b + 1 < kSweepBuckets && side >= kSweepEdges[b + 1]) ++b;
+    return b;
+}
+
+struct SweepRow {
+    double decimate = 0;
+    Stats st;
+    int truth[kSweepBuckets] = {}, found[kSweepBuckets] = {};
+    // markers of 40 px and larger by rendered contrast (white - black >= kLowContrast or below)
+    int big_truth[2] = {}, big_found[2] = {};
+    double min_found_side = 0;
+    std::vector<std::vector<rv::MarkerOut>> outs;
+    std::vector<std::vector<int>> match;
+};
+
+double rot_diff_deg(const rv::MarkerOut& a, const rv::MarkerOut& b) {
+    double dr = 0;
+    for (int k = 0; k < 3; ++k) {
+        const double d = std::fabs(a.r_deg[k] - b.r_deg[k]);
+        dr = std::max(dr, std::min(d, 360 - d));
+    }
+    return dr;
+}
+
+double recall_from(const SweepRow& r, int first_bucket) {
+    int t = 0, f = 0;
+    for (int b = first_bucket; b < kSweepBuckets; ++b) t += r.truth[b], f += r.found[b];
+    return t ? static_cast<double>(f) / t : 1.0;
+}
+
+int run_sweep(const std::vector<double>& decimates, const rv::ArucoConfig& base, const std::vector<Scene>& scenes,
+              int reps, bool check) {
+    std::vector<SweepRow> rows;
+    for (double d : decimates) {
+        rv::ArucoConfig c = base;
+        c.quad_decimate = d;
+        SweepRow r;
+        r.decimate = d;
+        r.st = run_variant(c, scenes, reps, r.outs, &r.match);
+        r.min_found_side = 1e9;
+        for (size_t s = 0; s < scenes.size(); ++s) {
+            for (size_t ti = 0; ti < scenes[s].truth.size(); ++ti) {
+                const double side = scenes[s].truth[ti].side;
+                const int b = sweep_bucket(side);
+                const bool big = side >= 40, low = scenes[s].truth[ti].contrast < kLowContrast;
+                ++r.truth[b];
+                if (big) ++r.big_truth[low];
+                if (r.match[s][ti] >= 0) {
+                    ++r.found[b];
+                    if (big) ++r.big_found[low];
+                    r.min_found_side = std::min(r.min_found_side, side);
+                }
+            }
+        }
+        rows.push_back(std::move(r));
+    }
+    std::printf("\n| decimate | ms/frame mean | median | detect ms | recall | 14-20 px | 20-25 | 25-30 | 30-40 | 40-60 "
+                "| 60-80 | >=80 | >=40 px contrast >=90 | >=40 px contrast <90 | smallest found | >=95%% from | false pos. | corner err px | vs %.1f: |dt| mm median / p95 / max "
+                "| rot deg median / p95 / max | rot > 5 deg |\n",
+                rows[0].decimate);
+    std::printf("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    for (const SweepRow& r : rows) {
+        // pose difference vs the first row for truths both find
+        std::vector<double> dts, drs;
+        for (size_t s = 0; s < scenes.size(); ++s) {
+            for (size_t ti = 0; ti < scenes[s].truth.size(); ++ti) {
+                const int a = rows[0].match[s][ti], b = r.match[s][ti];
+                if (a < 0 || b < 0) continue;
+                const rv::MarkerOut& ma = rows[0].outs[s][a];
+                const rv::MarkerOut& mb = r.outs[s][b];
+                dts.push_back(1000 * std::sqrt(std::pow(ma.t[0] - mb.t[0], 2) + std::pow(ma.t[1] - mb.t[1], 2) +
+                                               std::pow(ma.t[2] - mb.t[2], 2)));
+                drs.push_back(rot_diff_deg(ma, mb));
+            }
+        }
+        std::sort(dts.begin(), dts.end());
+        std::sort(drs.begin(), drs.end());
+        auto med = [](const std::vector<double>& v) { return v.empty() ? 0.0 : v[v.size() / 2]; };
+        auto mx = [](const std::vector<double>& v) { return v.empty() ? 0.0 : v.back(); };
+        auto p95 = [](const std::vector<double>& v) { return v.empty() ? 0.0 : v[v.size() * 95 / 100]; };
+        int from = kSweepBuckets;
+        while (from > 0 && recall_from(r, from - 1) >= 0.95 &&
+               (r.truth[from - 1] == 0 || static_cast<double>(r.found[from - 1]) / r.truth[from - 1] >= 0.95))
+            --from;
+        std::printf("| %.1f | %.2f | %.2f | %.2f | %.1f%% |", r.decimate, r.st.mean_ms, r.st.median_ms, r.st.detect_ms,
+                    100.0 * r.st.found / std::max(1, r.st.truth));
+        for (int b = 0; b < kSweepBuckets; ++b)
+            std::printf(" %d/%d |", r.found[b], r.truth[b]);
+        for (int low = 0; low < 2; ++low)
+            std::printf(" %.1f%% |", 100.0 * r.big_found[low] / std::max(1, r.big_truth[low]));
+        const size_t flips = static_cast<size_t>(drs.end() - std::upper_bound(drs.begin(), drs.end(), 5.0));
+        std::printf(" %.1f px | %s | %d | %.3f | %.2f / %.2f / %.0f | %.2f / %.2f / %.0f | %zu/%zu |\n", r.min_found_side,
+                    from == kSweepBuckets ? "none" : (std::to_string(static_cast<int>(kSweepEdges[from])) + " px").c_str(),
+                    r.st.fp, r.st.corner_err_sum / std::max(1, r.st.found), med(dts), p95(dts), mx(dts), med(drs),
+                    p95(drs), mx(drs), flips, drs.size());
+    }
+    if (!check) return 0;
+    // The default decimate (rv::ArucoConfig) must keep, against the first value of the list,
+    // the recall of markers of 40 px and larger at normal contrast within 3 points, and the
+    // corner error (the pose input; corners are refined at full resolution) within 0.15 px.
+    const rv::ArucoConfig defaults;
+    const SweepRow* def = nullptr;
+    for (const SweepRow& r : rows)
+        if (std::fabs(r.decimate - defaults.quad_decimate) < 1e-9) def = &r;
+    if (!def) {
+        std::printf("FAIL: the sweep does not include the default decimate %.1f\n", defaults.quad_decimate);
+        return 1;
+    }
+    auto big_recall = [](const SweepRow& r) { return static_cast<double>(r.big_found[0]) / std::max(1, r.big_truth[0]); };
+    const double ref = big_recall(rows[0]), got = big_recall(*def);
+    const double ref_err = rows[0].st.corner_err_sum / std::max(1, rows[0].st.found);
+    const double def_err = def->st.corner_err_sum / std::max(1, def->st.found);
+    if (got < ref - 0.03 || def_err > ref_err + 0.15) {
+        std::printf("FAIL: decimate %.1f: recall >= 40 px at contrast >= %.0f %.1f%% (decimate %.1f: %.1f%%), "
+                    "corner error %.3f (%.3f) px\n",
+                    def->decimate, kLowContrast, 100 * got, rows[0].decimate, 100 * ref, def_err, ref_err);
+        return 1;
+    }
+    std::printf("OK: default decimate %.1f: recall >= 40 px at contrast >= %.0f %.1f%% (decimate %.1f: %.1f%%), "
+                "corner error %.3f (%.3f) px\n",
+                def->decimate, kLowContrast, 100 * got, rows[0].decimate, 100 * ref, def_err, ref_err);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -425,6 +569,7 @@ int main(int argc, char** argv) {
     rv::ArucoConfig tuned;  // rv defaults
     bool custom = false;
     bool no_filter = false;  // diagnostics: count raw detections (margin/side filter off)
+    std::vector<double> sweep;  // --sweep 1,1.5,2: one table row per quad_decimate
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* {
@@ -446,6 +591,19 @@ int main(int argc, char** argv) {
         else if (a == "--sigma") tuned.quad_sigma = std::atof(next()), custom = true;
         else if (a == "--refine") tuned.refine_edges = std::atoi(next()) != 0, custom = true;
         else if (a == "--no-filter") no_filter = true;
+        else if (a == "--sweep") {
+            std::string list = next();
+            for (size_t pos = 0; pos <= list.size();) {
+                const size_t comma = std::min(list.find(',', pos), list.size());
+                const double d = std::atof(list.substr(pos, comma - pos).c_str());
+                if (d < 1.0) {
+                    std::fprintf(stderr, "--sweep: decimate values must be >= 1\n");
+                    return 2;
+                }
+                sweep.push_back(d);
+                pos = comma + 1;
+            }
+        }
         else {
             std::fprintf(stderr, "unknown option %s\n", a.c_str());
             return 2;
@@ -475,6 +633,8 @@ int main(int argc, char** argv) {
     for (int i = 0; i < scenes_n; ++i) scenes.push_back(gen.make());
     std::printf("%d scenes 640x360 (stride %d), %d reps each, filter margin>=%.0f side>=%.0fpx\n", scenes_n,
                 kFrameW * 3, reps, baseline.filter.min_margin, baseline.filter.min_side_px);
+
+    if (!sweep.empty()) return run_sweep(sweep, tuned, scenes, reps, check);
 
     Stats b, t;
     std::vector<std::vector<rv::MarkerOut>> bo, to;
