@@ -25,6 +25,7 @@ VISION_RUNNER=/usr/share/$NAME/rebot-vision-run
 VISION_PIDFILE=/var/run/rebot-vision.pid
 VISION_CONF=/userdata/rebot-teleop/vision.json
 VISION_CONF_DEFAULT=/usr/share/$NAME/vision.json.default
+VISION_STOP_TICKS=40  # stop_vision waits up to 40 x 0.25 s for rebot-vision to exit
 # Gallery apps that hold the camera. Only ones running from their own pidfile are stopped,
 # with their own init script; nothing is disabled or uninstalled.
 CAMERA_APPS="yolo-detector aruco-detector face-analysis face-recognition detection-blur ppocr-reader retail-vision qrcode-reader trigger-inspection-demo microduck-pose-qa fall-detection"
@@ -256,8 +257,20 @@ start_vision() {
         return 0
     fi
     if VPID=$(vision_pid); then
-        echo "[rebot-teleop] rebot-vision is already running (PID: $VPID)"
-        return 0
+        # A loop always has a child (rebot-vision, or sleep between restarts). One without a
+        # child for 1 s is hung (see stop_vision): stop it and start a new one.
+        c=0
+        while [ "$c" -lt 4 ] && ! has_child "$VPID"; do sleep 0.25; c=$((c + 1)); done
+        if [ "$c" -lt 4 ]; then
+            echo "[rebot-teleop] rebot-vision is already running (PID: $VPID)"
+            return 0
+        fi
+        echo "[rebot-teleop] rebot-vision loop (PID: $VPID) has no child; restarting it"
+        stop_vision
+        if vision_pid >/dev/null; then
+            echo "[rebot-teleop] rebot-vision loop (PID: $VPID) did not stop; rebot-vision not started"
+            return 0
+        fi
     fi
     rm -f "$VISION_PIDFILE"
     stop_camera_holders
@@ -373,8 +386,23 @@ stop_video() {
     fi
 }
 
-# Stop the vision respawn loop from its pidfile (SIGTERM only; the loop forwards it to
-# rebot-vision and exits after it). A pidfile naming another process is left alone.
+# A process whose parent is $1 (a TGID under /proc; threads are not listed there).
+has_child() {
+    grep -qs "^PPid:[[:space:]]*$1\$" /proc/[0-9]*/status
+}
+
+# Process $1 exists and has not exited (a zombie waiting for its parent counts as exited).
+proc_alive() {
+    [ -d "/proc/$1" ] && ! grep -qs "^State:[[:space:]]*Z" "/proc/$1/status"
+}
+
+# Stop the vision respawn loop from its pidfile: SIGTERM, which the loop forwards to
+# rebot-vision before it exits. rebot-vision may take a few seconds to release the camera,
+# so this waits up to VISION_STOP_TICKS x 0.25 s while the loop still has a child. A loop
+# that stays alive for 1 s with no child left has nothing to wait for (1.2.1 could hang
+# like this after an upgrade, at 100 % CPU) and is stopped with SIGKILL: no camera holder
+# is involved then. rebot-vision itself is never sent SIGKILL (a killed camera holder
+# leaves VPSS groups allocated). A pidfile naming another process is left alone.
 stop_vision() {
     [ -n "$VISION_PIDFILE" ] && [ -f "$VISION_PIDFILE" ] || return 0
     VPID=$(cat "$VISION_PIDFILE" 2>/dev/null)
@@ -386,8 +414,21 @@ stop_vision() {
     fi
     kill -TERM "$VPID" 2>/dev/null || true
     w=0
-    while [ "$w" -lt 12 ] && [ -d "/proc/$VPID" ]; do sleep 0.25; w=$((w + 1)); done
-    [ -d "/proc/$VPID" ] && echo "rebot-vision still stopping (PID $VPID)" || rm -f "$VISION_PIDFILE"
+    childless=0
+    while [ "$w" -lt "${VISION_STOP_TICKS:-40}" ] && proc_alive "$VPID"; do
+        if has_child "$VPID"; then childless=0; else childless=$((childless + 1)); fi
+        if [ "$childless" -ge 4 ]; then
+            echo "rebot-vision loop (PID $VPID) has no child left but did not exit; sending SIGKILL"
+            logger -t "$NAME" "vision loop $VPID did not exit without a child; SIGKILL" 2>/dev/null || true
+            kill -KILL "$VPID" 2>/dev/null || true
+            k=0
+            while [ "$k" -lt 8 ] && proc_alive "$VPID"; do sleep 0.25; k=$((k + 1)); done
+            break
+        fi
+        sleep 0.25
+        w=$((w + 1))
+    done
+    proc_alive "$VPID" && echo "rebot-vision still stopping (PID $VPID)" || rm -f "$VISION_PIDFILE"
     return 0
 }
 
@@ -465,7 +506,8 @@ case "$1" in
     restart) stop || exit $?; sleep 2; start; exit $? ;;
     status) status; exit $? ;;
     register) register_active_app; exit $? ;;
-    *) echo "Usage: $0 {start|stop|restart|status|register}"; exit 1 ;;
+    stop-vision) stop_vision; exit $? ;;
+    *) echo "Usage: $0 {start|stop|restart|status|register|stop-vision}"; exit 1 ;;
 esac
 
 exit 0

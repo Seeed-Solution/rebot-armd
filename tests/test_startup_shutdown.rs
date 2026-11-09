@@ -291,29 +291,204 @@ fn init_stops_only_running_camera_holders_with_their_own_scripts() {
 #[test]
 fn init_stop_vision_signals_only_its_respawn_loop() {
     let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
-    for (cmdline, expect_signal) in [("/bin/sh\0/usr/share/rebot-teleop/rebot-vision-run\0", true), ("/usr/bin/other\0", false)] {
+    // (cmdline of pid 777, a child of 777 exists, expected signals)
+    for (cmdline, with_child, expected) in [
+        ("/bin/sh\0/usr/share/rebot-teleop/rebot-vision-run\0", true, Some("-TERM 777")),
+        // alive without a child for 1 s after SIGTERM: hung, SIGKILL to the loop only
+        ("/bin/sh\0/usr/share/rebot-teleop/rebot-vision-run\0", false, Some("-TERM 777\n-KILL 777")),
+        ("/usr/bin/other\0", false, None),
+    ] {
         let temp = tempfile::tempdir().unwrap();
         let proc_root = temp.path().join("proc");
         std::fs::create_dir_all(proc_root.join("777")).unwrap();
         std::fs::write(proc_root.join("777/cmdline"), cmdline).unwrap();
+        std::fs::write(proc_root.join("777/status"), "Name:\tsh\nPPid:\t1\n").unwrap();
+        if with_child {
+            std::fs::create_dir_all(proc_root.join("778")).unwrap();
+            std::fs::write(proc_root.join("778/status"), "Name:\trebot-vision\nPPid:\t777\n").unwrap();
+        }
         let pidfile = temp.path().join("vision.pid");
         std::fs::write(&pidfile, "777\n").unwrap();
         let signals = temp.path().join("signals");
-        let functions = init_section(source, "stop_vision() {", "\nstop() {").replace("/proc/", &format!("{}/", proc_root.display()));
+        let functions = init_section(source, "has_child() {", "\nstop() {").replace("/proc/", &format!("{}/", proc_root.display()));
         let script = format!(
-            "VISION_PIDFILE='{}'\nVISION_RUNNER=/usr/share/rebot-teleop/rebot-vision-run\nkill() {{ echo \"$*\" >> '{}'; }}\nsleep() {{ :; }}\n{functions}\nstop_vision\n",
+            "NAME=test\nVISION_PIDFILE='{}'\nVISION_RUNNER=/usr/share/rebot-teleop/rebot-vision-run\nVISION_STOP_TICKS=8\nkill() {{ echo \"$*\" >> '{}'; }}\nsleep() {{ :; }}\nlogger() {{ :; }}\n{functions}\nstop_vision\n",
             pidfile.display(),
             signals.display()
         );
         let out = Command::new("sh").args(["-c", &script]).output().unwrap();
         assert!(out.status.success());
-        if expect_signal {
-            assert_eq!(std::fs::read_to_string(&signals).unwrap().trim(), "-TERM 777");
-        } else {
-            assert!(!signals.exists(), "a pidfile naming another process must not be signalled");
-            assert!(pidfile.exists());
+        match expected {
+            Some(e) => assert_eq!(std::fs::read_to_string(&signals).unwrap().trim(), e, "child: {with_child}"),
+            None => {
+                assert!(!signals.exists(), "a pidfile naming another process must not be signalled");
+                assert!(pidfile.exists());
+            }
         }
     }
+}
+
+/// `busybox ash` (the reCamera /bin/sh) when the host has busybox, else `sh`.
+#[cfg(unix)]
+fn device_shell() -> Command {
+    if Command::new("busybox").arg("true").status().map(|s| s.success()).unwrap_or(false) {
+        let mut c = Command::new("busybox");
+        c.arg("ash");
+        c
+    } else {
+        Command::new("sh")
+    }
+}
+
+/// utime + stime of a process in clock ticks (/proc/<pid>/stat fields 14 and 15).
+#[cfg(target_os = "linux")]
+fn cpu_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<&str> = stat[stat.rfind(')')? + 2..].split_whitespace().collect();
+    Some(fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_exit(child: &mut std::process::Child, secs: u64) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            return Some(s);
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The device state after the 1.2.1 upgrade: the vision loop alive at 100 % CPU, no child,
+/// SIGTERM without effect. `stop` must end it (SIGKILL to the loop, which holds no camera)
+/// instead of reporting "still stopping" forever, and must leave a loop that still waits for
+/// rebot-vision alone (no SIGKILL while a child exists).
+#[cfg(target_os = "linux")]
+#[test]
+fn init_stop_vision_kills_a_hung_loop_without_a_child_only() {
+    let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
+    let functions = init_section(source, "has_child() {", "\nstop() {");
+    for hung in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = temp.path().join("rebot-vision-run");
+        let body = if hung {
+            "trap '' TERM\nwhile :; do :; done\n"
+        } else {
+            // still waiting for a rebot-vision that takes long to exit
+            "trap '' TERM\nsleep 30 &\nwhile :; do wait; done\n"
+        };
+        std::fs::write(&runner, body).unwrap();
+        let mut loop_proc = Command::new("sh").arg(&runner).spawn().unwrap();
+        let pid = loop_proc.id();
+        std::thread::sleep(Duration::from_millis(300));
+        let pidfile = temp.path().join("vision.pid");
+        std::fs::write(&pidfile, format!("{pid}\n")).unwrap();
+        let script = format!(
+            "NAME=test\nVISION_PIDFILE='{}'\nVISION_RUNNER='{}'\nVISION_STOP_TICKS=12\nlogger() {{ :; }}\n{functions}\nstop_vision\n",
+            pidfile.display(),
+            runner.display()
+        );
+        let out = Command::new("sh").args(["-c", &script]).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(out.status.success());
+        if hung {
+            let status = wait_exit(&mut loop_proc, 3);
+            assert!(status.is_some(), "hung loop still running after stop: {stdout}");
+            assert!(stdout.contains("sending SIGKILL"), "{stdout}");
+            assert!(!pidfile.exists());
+        } else {
+            assert!(wait_exit(&mut loop_proc, 0).is_none(), "a loop with a child must not be killed: {stdout}");
+            assert!(stdout.contains("still stopping"), "{stdout}");
+            assert!(pidfile.exists());
+            // clean up the loop and its sleep
+            let _ = Command::new("pkill").args(["-KILL", "-P", &pid.to_string()]).status();
+            let _ = loop_proc.kill();
+            let _ = loop_proc.wait();
+        }
+    }
+}
+
+/// The runner is parsed whole before its loop starts: replacing the file in place while it
+/// runs (as an upgrade can) changes nothing, SIGTERM still stops it.
+#[cfg(target_os = "linux")]
+#[test]
+fn vision_runner_ignores_a_replaced_script_file() {
+    let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/rebot-vision-run");
+    let temp = tempfile::tempdir().unwrap();
+    let runner = temp.path().join("rebot-vision-run");
+    std::fs::write(&runner, source).unwrap();
+    let marks = temp.path().join("marks");
+    let bin = temp.path().join("fake-vision");
+    std::fs::write(&bin, format!("#!/bin/sh\necho start >> '{0}'\ntrap 'echo term >> \"{0}\"; exit 0' TERM\nwhile :; do sleep 0.05; done\n", marks.display())).unwrap();
+    std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut child = device_shell()
+        .arg(&runner)
+        .env("REBOT_VISION_BIN", &bin)
+        .env("REBOT_VISION_CONF", temp.path().join("vision.json"))
+        .env("REBOT_VISION_LOG", temp.path().join("log"))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !std::fs::read_to_string(&marks).unwrap_or_default().contains("start") {
+        assert!(Instant::now() < deadline, "fake vision never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // in-place rewrite (same inode): text that would spin if the shell read it
+    let garbage = "while :; do :; done\n".repeat(source.len() / 20 + 200);
+    std::fs::write(&runner, garbage).unwrap();
+    Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    let status = wait_exit(&mut child, 5);
+    let ticks = cpu_ticks(child.id());
+    if status.is_none() {
+        let _ = child.kill();
+        panic!("runner did not exit after its file was replaced (cpu ticks {ticks:?})");
+    }
+    assert!(status.unwrap().success());
+    assert_eq!(std::fs::read_to_string(&marks).unwrap(), "start\nterm\n");
+}
+
+/// While rebot-vision takes its time to exit after SIGTERM (camera release), the runner
+/// waits without spinning, and exits once it is gone.
+#[cfg(target_os = "linux")]
+#[test]
+fn vision_runner_waits_without_spinning_while_rebot_vision_stops() {
+    let runner = concat!(env!("CARGO_MANIFEST_DIR"), "/kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/rebot-vision-run");
+    let temp = tempfile::tempdir().unwrap();
+    let marks = temp.path().join("marks");
+    let bin = temp.path().join("fake-vision");
+    // exits 2 s after the first SIGTERM; further SIGTERMs are ignored
+    std::fs::write(
+        &bin,
+        format!("#!/bin/sh\necho start >> '{0}'\nt=0\ntrap 't=1' TERM\nwhile [ $t = 0 ]; do sleep 0.05; done\ntrap '' TERM\nsleep 2\necho done >> '{0}'\n", marks.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut child = device_shell()
+        .arg(runner)
+        .env("REBOT_VISION_BIN", &bin)
+        .env("REBOT_VISION_CONF", temp.path().join("vision.json"))
+        .env("REBOT_VISION_LOG", temp.path().join("log"))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !std::fs::read_to_string(&marks).unwrap_or_default().contains("start") {
+        assert!(Instant::now() < deadline, "fake vision never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let before = cpu_ticks(child.id()).unwrap();
+    for _ in 0..3 {
+        Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::thread::sleep(Duration::from_millis(800));
+    let during = cpu_ticks(child.id()).unwrap();
+    let status = wait_exit(&mut child, 6);
+    assert!(status.is_some_and(|s| s.success()), "runner did not exit after rebot-vision");
+    assert_eq!(std::fs::read_to_string(&marks).unwrap(), "start\ndone\n");
+    assert!(during - before < 20, "runner used {} cpu ticks in 1.7 s while waiting", during - before);
 }
 
 #[cfg(unix)]

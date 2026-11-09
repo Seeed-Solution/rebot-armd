@@ -14,6 +14,14 @@ if [ ! -f /userdata/rebot-teleop/vision.json ]; then
     cp -f /usr/share/rebot-teleop/vision.json.default /userdata/rebot-teleop/vision.json 2>/dev/null || true
 fi
 
+# An upgrade runs the old package's prerm (init stop) before the files are replaced. A vision
+# loop of the old package still running now (still waiting for rebot-vision, or hung without
+# a child as 1.2.1 could after an upgrade) is stopped by the new init script, which waits for
+# rebot-vision and sends SIGKILL only to a loop that has no child left.
+if [ -x /etc/init.d/K92rebot-teleop ]; then
+    /etc/init.d/K92rebot-teleop stop-vision || true
+fi
+
 # Boot start. With the reCamera console, app_restore starts the active app (state.json) at
 # boot; an S?? link as well would start a second camera holder when another camera app is
 # active. So: with the console, remove every S??rebot-teleop link (older installs left S92 or
