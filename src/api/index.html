@@ -5704,6 +5704,7 @@ const GR = {
   sending: false,
   stopAt: 0,        // last stop request (ms)
   toasted: 0,       // last grasp id whose result was shown
+  gripSynced: 0,    // last gripper / grasp action id S.grip was synced from
   pickGrip: false,  // next video tap records the grip pixel
   setup: null, path: null, supported: null,
 };
@@ -5724,7 +5725,21 @@ function graspRPC(path, body) {
     throw e;
   });
 }
+// After a gripper or grasp action the page's gripper target must equal the commanded jaw
+// position, or the next teleop frame would drive the jaw back to the old S.grip.
+function graspSyncGrip(o) {
+  const cmd = o.commanded_positions;
+  if (!Array.isArray(cmd) || cmd.length <= GRIP) return;
+  for (const a of [o.action, o.previous_action]) {
+    if (!a || (a.kind !== 'gripper' && a.kind !== 'grasp')) continue;
+    if (a.state === 'running' || GR.gripSynced !== a.id) {
+      S.grip = gripFrac(cmd[GRIP]);
+      if (a.state !== 'running' && a === o.action) GR.gripSynced = a.id;
+    }
+  }
+}
 function graspOnObs(o) {
+  graspSyncGrip(o);
   const a = o.action, p = o.previous_action;
   for (const r of [a, p]) {
     if (!r || r.kind !== 'grasp' || r.state === 'running' || r.id === GR.toasted) continue;

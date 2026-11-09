@@ -7,7 +7,7 @@
 // the running phase, opens the grasp setup drawer, and writes PNGs (default .cache/grasp-shots/).
 // Asserts: selection + confirm bar, the grasp command body, phase text and stop button, stop on key
 // input / stop button, the E-stop frame, result toasts, the setup drawer reads and writes, grip-pixel
-// picking, no horizontal scroll.
+// picking, S.grip synced from commanded_positions[6] after gripper / grasp actions, no horizontal scroll.
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -187,13 +187,22 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
   const stops2 = (await sent(page, '/api/v1/motion/stop')).length;
   check(`${tag} stop button stops`, stops2 > stops1, `${stops1} -> ${stops2}`);
 
-  // 3. done holding: toast, bar closes
-  await page.evaluate(() => { Object.assign(window.__action, { state: 'done', phase: 'done', progress: 1, holding: true, finished_at: performance.now() / 1000 }); });
+  // 3. done holding: toast + gripper handover sync (S.grip from commanded_positions[6])
+  await page.evaluate(() => { S.grip = 1; window.__cmd7 = -1.5; Object.assign(window.__action, { state: 'done', phase: 'done', progress: 1, holding: true, finished_at: performance.now() / 1000 }); });
   await page.waitForTimeout(250);
-  info = await page.evaluate(() => ({ toast: [...document.querySelectorAll('#toasts .toast')].map((e) => e.textContent), bar: !document.getElementById('grasp-bar').hidden, gid: GR.id }));
+  info = await page.evaluate(() => ({ grip: S.grip, toast: [...document.querySelectorAll('#toasts .toast')].map((e) => e.textContent), bar: !document.getElementById('grasp-bar').hidden, gid: GR.id }));
   check(`${tag} result toast`, info.toast.some((x) => x.includes(L.ok)), JSON.stringify(info.toast));
+  check(`${tag} grip synced after grasp`, Math.abs(info.grip - 1.5 / 5.7) < 0.01, `S.grip ${info.grip}`);
   check(`${tag} bar closed after grasp`, !info.bar && info.gid === null, JSON.stringify(info));
   if (lang === 'zh' && vp === '375x812') { file = path.join(out, `grasp_done_${tag}.png`); await page.screenshot({ path: file }); shots.push(file); }
+
+  // a teleop gripper change afterwards is not overridden; a later gripper action syncs again
+  await page.evaluate(() => { S.grip = 0.9; });
+  await page.waitForTimeout(150);
+  check(`${tag} grip not re-synced for the same action`, Math.abs(await page.evaluate(() => S.grip) - 0.9) < 1e-9);
+  await page.evaluate(() => { window.__prev = window.__action; window.__cmd7 = -5.61; window.__action = { id: 43, kind: 'gripper', state: 'done', progress: 1, finished_at: performance.now() / 1000 }; });
+  await page.waitForTimeout(150);
+  check(`${tag} grip synced after gripper action`, Math.abs(await page.evaluate(() => S.grip) - 5.61 / 5.7) < 0.01, String(await page.evaluate(() => S.grip)));
 
   // failed grasp from an agent: toast with the code text
   await page.evaluate(() => { window.__prev = null; window.__action = { id: 44, kind: 'grasp', state: 'failed', code: 'TARGET_LOST', message: 'x', progress: 0.3, finished_at: performance.now() / 1000 }; });
