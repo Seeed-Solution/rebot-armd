@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -57,7 +58,7 @@ static VisionControl::Options opts(Mode m, bool enabled = false, int fps = 10, b
     return o;
 }
 
-/** Simulated frame thread: runs frame_pipelines() at `period`, like on_frame. */
+/** Simulated frame thread: runs frame_plan() at `period`, like on_frame. */
 class FakeCamera {
 public:
     FakeCamera(VisionControl& c, int period_ms) : c_(c), period_(period_ms) {
@@ -74,10 +75,12 @@ private:
         uint32_t id = 0;
         while (!stop_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(period_));
-            const Pipelines p = c_.frame_pipelines();
+            const uint64_t frame_ms = mono_ms();
+            const Pipelines p = c_.frame_plan(frame_ms);
             if (!p.any()) continue;
             VisionResult r;
             r.frame_id = ++id;
+            r.frame_ms = frame_ms;
             r.ts_ms = 1000000 + id;
             r.mode = c_.mode();
             r.ran_yolo = p.yolo;
@@ -100,7 +103,7 @@ static void test_modes() {
     VisionControl c(opts(Mode::Yolo), calls.fn());
     CHECK(calls.v.size() == 1 && calls.v[0] == std::make_pair(false, 1));
     CHECK(c.mode() == Mode::Yolo && !c.continuous_enabled() && !c.processing());
-    CHECK(!c.frame_pipelines().any());
+    CHECK(!c.frame_plan(mono_ms()).any());
 
     json m = req(c, "GET", "/api/mode");
     CHECK(m["api_version"] == kApiVersion);
@@ -111,14 +114,15 @@ static void test_modes() {
     // mode + enabled in one call; rate follows
     m = req(c, "POST", "/api/mode", R"({"mode":"both","enabled":true})");
     CHECK(m["mode"] == "both" && m["enabled"] == true && m["fps"] == 10);
-    CHECK(c.frame_pipelines() == (Pipelines{true, true}));
-    CHECK(calls.v.back() == std::make_pair(true, 10));
+    CHECK(c.frame_plan(mono_ms()) == (Pipelines{true, true}));
+    CHECK(calls.v.back() == std::make_pair(true, VisionControl::kOpenGateFps));  // 10 fps: gate fully open
+    CHECK(m["camera_fps"] == VisionControl::kOpenGateFps && m["measured"]["input_fps"].is_number());
 
     // switching between active modes does not touch the camera rate
     const size_t n = calls.v.size();
     CHECK(c.set_mode(Mode::Aruco) == VisionControl::Status::Ok);
     CHECK(calls.v.size() == n);
-    CHECK(c.frame_pipelines() == (Pipelines{false, true}));
+    CHECK(c.frame_plan(mono_ms() + 1000) == (Pipelines{false, true}));
 
     // off forces enabled false, idle rate
     m = req(c, "POST", "/api/mode", R"({"mode":"off"})");
@@ -136,7 +140,7 @@ static void test_modes() {
     // shared rate is runtime configurable
     m = req(c, "POST", "/api/mode", R"({"fps":5})");
     CHECK(m["fps"] == 5 && m["active_fps"] == 5);
-    CHECK(calls.v.back() == std::make_pair(true, 5));
+    CHECK(calls.v.back() == std::make_pair(true, 10));  // gate at twice the rate
 
     int st = 0;
     json e = req(c, "POST", "/api/mode", R"({"mode":"video"})", &st);
@@ -221,6 +225,141 @@ static void test_trigger_timeout_and_continuous() {
     int st = 0;
     req(c, "POST", "/api/trigger?wait_ms=x", "", &st);
     CHECK(st == 400);
+}
+
+
+static void test_rate_gate() {
+    // Exact long-run rate out of a 15 fps stream with +-12 ms arrival jitter, for every rate.
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<double> jit(-12.0, 12.0);
+    for (int fps = 1; fps <= 15; ++fps) {
+        RateGate g;
+        int n = 0;
+        for (int i = 0; i < 15 * 60; ++i) {  // 60 s
+            const double t = 1000.0 + i * (1000.0 / 15) + jit(rng);
+            n += g.accept(static_cast<uint64_t>(t), fps) ? 1 : 0;
+        }
+        CHECK(std::abs(n - fps * 60) <= 1);
+    }
+    // Input slower than the rate: every frame passes.
+    RateGate g;
+    int n = 0;
+    for (int i = 0; i < 100; ++i) n += g.accept(1000 + i * 200, 10) ? 1 : 0;
+    CHECK(n == 100);
+    // reset: the next frame passes at once.
+    CHECK(g.accept(30000, 1));
+    CHECK(!g.accept(30100, 1));
+    g.reset();
+    CHECK(g.accept(30150, 1));
+
+    RateMeter m;
+    for (int i = 0; i < 40; ++i) m.add(10000 + i * 100);  // 10 / s for 4 s
+    CHECK(std::abs(m.rate(14000) - 10.0) < 0.6);
+    CHECK(m.rate(20000) == 0.0);
+}
+
+/**
+ * Model of the frame path: VPSS CH0 delivering `hw_fps` (arrivals with jitter), the camera
+ * callback's gate (passes a frame once 90 % of 1/gate has passed since the last one it
+ * passed), then optionally RateGate. Returns frames processed per second.
+ */
+static double model_rate(int hw_fps, int gate_fps, int rate_gate_fps, double jitter_ms, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> jit(-jitter_ms, jitter_ms);
+    RateGate rg;
+    double last = -1e9;
+    int n = 0;
+    const int secs = 60;
+    for (int i = 0; i < hw_fps * secs; ++i) {
+        const double t = 1000.0 + i * (1000.0 / hw_fps) + jit(rng);
+        if (t - last < 0.9 * (1000 / gate_fps)) continue;  // integer period as in ma_camera_sg200x.cpp
+        last = t;
+        if (rate_gate_fps > 0 && !rg.accept(static_cast<uint64_t>(t), rate_gate_fps)) continue;
+        ++n;
+    }
+    return static_cast<double>(n) / secs;
+}
+
+static void test_rate_model() {
+    // 1.2.0: CH0 VPSS rate fixed at the start rate (vision.json fps 5), gate = fps, no RateGate.
+    // 1.2.1: CH0 VPSS at 15, gate = camera_gate_fps(), RateGate at fps.
+    for (double jitter : {10.0, 30.0}) {
+        std::printf("rate model (CH0 arrivals +-%.0f ms jitter): fps -> 1.2.0 / 1.2.1 results/s\n", jitter);
+        for (int fps : {1, 2, 3, 5, 8, 10, 12, 15}) {
+            const double before = model_rate(5, fps, 0, jitter, 11);
+            const double after = model_rate(VisionControl::kMaxFps, VisionControl::camera_gate_fps(true, false, fps),
+                                            fps, jitter, 11);
+            std::printf("  %2d -> %5.2f / %5.2f\n", fps, before, after);
+            // at +-30 ms (arrivals can be < 1 gate period apart) rates near the channel rate lose frames
+            if (jitter <= 10.0 || fps <= 10) CHECK(std::abs(after - fps) <= 0.05 * fps + 0.02);
+        }
+    }
+    // gate rates
+    CHECK(VisionControl::camera_gate_fps(false, false, 10) == VisionControl::kIdleFps);
+    CHECK(VisionControl::camera_gate_fps(true, true, 2) == VisionControl::kOpenGateFps);
+    CHECK(VisionControl::camera_gate_fps(true, false, 5) == 10);
+    CHECK(VisionControl::camera_gate_fps(true, false, 8) == VisionControl::kOpenGateFps);
+}
+
+static void test_trigger_gate_and_freshness() {
+    // Standby -> trigger opens the camera gate fully, then back to idle.
+    Calls calls;
+    VisionControl c(opts(Mode::Aruco, false, 5), calls.fn());
+    CHECK(c.camera_fps() == VisionControl::kIdleFps);
+    {
+        const uint64_t req = 5000;
+        auto scope = c.trigger_scope(req);
+        CHECK(c.processing() && c.camera_fps() == VisionControl::kOpenGateFps);
+        CHECK(calls.v.back() == std::make_pair(true, VisionControl::kOpenGateFps));
+        CHECK(!c.frame_plan(4999).any());                      // frame from before the request
+        CHECK(c.frame_plan(5000) == (Pipelines{false, true}));  // first frame not older than it
+    }
+    CHECK(!c.processing() && c.camera_fps() == VisionControl::kIdleFps);
+    CHECK(calls.v.back() == std::make_pair(false, VisionControl::kIdleFps));
+
+    // wait_fresh ignores a newer result from a frame older than the request.
+    VisionResult old;
+    old.frame_id = 1;
+    old.frame_ms = 100;
+    c.publish(old);
+    VisionResult out;
+    CHECK(c.wait_fresh(0, 200, 30, out));  // timeout
+    std::thread th([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        VisionResult r;
+        r.frame_id = 2;
+        r.frame_ms = 250;
+        c.publish(r);
+    });
+    CHECK(!c.wait_fresh(0, 200, 2000, out) && out.frame_id == 2);
+    th.join();
+
+    // Continuous at 1 fps: the rate gate would skip the next frame, a trigger runs it anyway.
+    VisionControl k(opts(Mode::Yolo, true, 1), nullptr);
+    CHECK(k.frame_plan(10000).any());
+    CHECK(!k.frame_plan(10066).any());
+    {
+        auto scope = k.trigger_scope(10100);
+        CHECK(!k.frame_plan(10099).any());
+        CHECK(k.frame_plan(10133) == (Pipelines{true, false}));
+    }
+    CHECK(!k.frame_plan(10200).any());
+}
+
+static void test_trigger_latency() {
+    // Frame thread at 15 fps (camera at kMaxFps): a trigger from standby is served by the next
+    // frame, not after an idle period.
+    for (Mode m : {Mode::Yolo, Mode::Aruco, Mode::Both}) {
+        VisionControl c(opts(m, false, 5), nullptr);
+        FakeCamera cam(c, 1000 / VisionControl::kMaxFps);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto t0 = clk::now();
+        json r = req(c, "POST", "/api/trigger?wait_ms=2000");
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk::now() - t0).count();
+        CHECK(r["success"] == true);
+        CHECK(ms < 200);
+        CHECK(c.camera_fps() == VisionControl::kIdleFps && !c.processing());
+    }
 }
 
 static void test_latest() {
@@ -342,6 +481,10 @@ int main() {
     test_yolo_unavailable();
     test_trigger_each_mode();
     test_trigger_timeout_and_continuous();
+    test_rate_gate();
+    test_rate_model();
+    test_trigger_gate_and_freshness();
+    test_trigger_latency();
     test_latest();
     test_result_json();
     test_http_server();

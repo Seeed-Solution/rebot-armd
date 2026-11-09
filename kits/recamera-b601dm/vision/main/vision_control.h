@@ -9,6 +9,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace rv {
 
@@ -28,10 +29,45 @@ Pipelines pipelines_of(Mode m) noexcept;
 const char* mode_name(Mode m) noexcept;
 bool parse_mode(const std::string& s, Mode& out) noexcept;
 
+/** Monotonic milliseconds (steady_clock), the clock of frame and trigger times. */
+uint64_t mono_ms() noexcept;
+
+/**
+ * Picks `fps` frames per second out of a faster frame stream by due time. A frame is taken
+ * when it is at most half a period early; the next due time then advances by one period,
+ * so the long-run rate is exactly `fps` whatever the input rate and its jitter (as long as
+ * the input is at least that fast), and a late frame does not cost a whole period. After
+ * falling a full period behind it restarts from the current frame.
+ */
+class RateGate {
+public:
+    void reset() noexcept { started_ = false; }
+    bool accept(uint64_t t_ms, int fps) noexcept;
+
+private:
+    bool started_ = false;
+    double next_due_ = 0;
+};
+
+/** Events per second over the last `kWindowMs`. */
+class RateMeter {
+public:
+    static constexpr uint64_t kWindowMs = 2000;
+    void add(uint64_t t_ms) noexcept;
+    double rate(uint64_t now_ms) const noexcept;
+
+private:
+    static constexpr size_t kCap = 64;
+    uint64_t t_[kCap] = {};
+    size_t n_ = 0;
+    size_t head_ = 0;
+};
+
 /** One processed frame. JSON fragments are built by the frame thread (result_json.h). */
 struct VisionResult {
     uint32_t frame_id = 0;  ///< 0: no result produced yet
     uint64_t ts_ms = 0;     ///< frame capture time, Unix epoch ms
+    uint64_t frame_ms = 0;  ///< mono_ms() the frame is known to be newer than (frame_plan())
     float inference_ms = 0;
     Mode mode = Mode::Off;  ///< base mode when the frame ran
     bool ran_yolo = false;
@@ -53,9 +89,23 @@ public:
     static constexpr int kMaxWaitMs = 5000;
     static constexpr int kMinFps = 1;
     static constexpr int kMaxFps = 15;
+    /** Camera gate rate that passes every frame of a channel at up to kMaxFps (see camera_gate_fps). */
+    static constexpr int kOpenGateFps = 30;
 
-    /** Called with the processing state and inference channel rate whenever either changes. */
-    using OnChange = std::function<void(bool processing, int fps)>;
+    /**
+     * Rate for the camera callback's frame gate (sscma-micro ma_camera_sg200x.cpp
+     * vpssCallback, set through Camera kFps). The gate passes a frame once 90 % of 1/rate has
+     * passed since the last frame it passed, measured on arrival. On the 15 fps inference
+     * channel (66.7 ms) a gate at the target rate halves it when arrivals jitter (5 fps needs
+     * 180 ms, three frames are 200 ms) and cannot give 8..14 fps at all (one frame is too
+     * early, two give 7.5 fps). So the gate only bounds the CPU copies, RateGate picks the
+     * frames: idle 1 fps; a pending trigger opens it fully (next frame); up to 7 fps it passes
+     * at least every other frame (>= 7.5 fps), above that every frame.
+     */
+    static int camera_gate_fps(bool processing, bool trigger_pending, int fps) noexcept;
+
+    /** Called with the processing state and the camera gate rate whenever either changes. */
+    using OnChange = std::function<void(bool processing, int camera_fps)>;
 
     struct Options {
         int fps = 5;
@@ -71,19 +121,20 @@ public:
 
     class TriggerScope {
     public:
-        explicit TriggerScope(VisionControl& c) : c_(&c) { c_->trigger_begin(); }
+        TriggerScope(VisionControl& c, uint64_t request_ms) : c_(&c), req_(request_ms) { c_->trigger_begin(req_); }
         ~TriggerScope() { release(); }
         TriggerScope(const TriggerScope&) = delete;
         TriggerScope& operator=(const TriggerScope&) = delete;
         void release() {
             if (c_) {
-                c_->trigger_end();
+                c_->trigger_end(req_);
                 c_ = nullptr;
             }
         }
 
     private:
         VisionControl* c_;
+        uint64_t req_;
     };
 
     VisionControl(const Options& opt, OnChange on_change);
@@ -101,8 +152,19 @@ public:
     const std::string& model_path() const noexcept { return model_path_; }
     const std::string& family() const noexcept { return family_; }
 
-    /** Frame thread: pipelines for the next frame (empty when standing by). */
-    Pipelines frame_pipelines() const;
+    /** Camera gate rate requested last (camera_gate_fps for the current state). */
+    int camera_fps() const;
+
+    /**
+     * Frame thread, once per frame: the pipelines to run on it (empty: skip). frame_ms is a
+     * mono_ms() the frame is known to be newer than. Runs continuous processing at the
+     * active rate (RateGate) and every trigger requested at or before frame_ms.
+     */
+    Pipelines frame_plan(uint64_t frame_ms);
+
+    /** Frames offered to frame_plan() and results published, per second (last 2 s). */
+    double input_fps(uint64_t now_ms) const;
+    double result_fps(uint64_t now_ms) const;
 
     /**
      * Change any of mode / continuous enable / rate in one step. Mode off forces enabled
@@ -112,20 +174,28 @@ public:
     Status set_mode(Mode m) { return apply(&m, nullptr, nullptr); }
     bool set_enabled(bool on);
 
-    void trigger_begin();
-    void trigger_end();
-    TriggerScope trigger_scope() { return TriggerScope(*this); }
+    void trigger_begin(uint64_t request_ms);
+    void trigger_end(uint64_t request_ms);
+    TriggerScope trigger_scope(uint64_t request_ms) { return TriggerScope(*this, request_ms); }
 
     void publish(const VisionResult& r);
     /** As aruco-detector: returns true when no result exists or the wait was not satisfied. */
     bool latest(bool has_after, uint32_t after, int wait_ms, VisionResult& out);
+    /**
+     * Wait for a result newer than `after` from a frame newer than request_ms (a trigger's
+     * result). Returns true on timeout.
+     */
+    bool wait_fresh(uint32_t after, uint64_t request_ms, int wait_ms, VisionResult& out);
     void shutdown();
 
 private:
     bool processing_locked() const noexcept {
-        return (continuous_ && mode_ != Mode::Off) || triggers_ > 0;
+        return (continuous_ && mode_ != Mode::Off) || !triggers_.empty();
     }
     int fps_locked() const noexcept { return processing_locked() ? fps_ : kIdleFps; }
+    int gate_locked() const noexcept { return camera_gate_fps(processing_locked(), !triggers_.empty(), fps_); }
+    /** Report a processing / gate change to on_change_ (called with mu_ held). */
+    void notify_locked();
 
     const bool yolo_available_;
     const std::string model_name_;
@@ -138,7 +208,12 @@ private:
     Mode last_active_ = Mode::Yolo;
     bool continuous_ = false;
     int fps_ = 5;
-    size_t triggers_ = 0;
+    std::vector<uint64_t> triggers_;  ///< request times of the pending triggers
+    bool reported_proc_ = false;
+    int reported_gate_ = 0;
+    RateGate gate_;
+    RateMeter input_meter_;
+    RateMeter result_meter_;
     VisionResult latest_;
     bool stopping_ = false;
 };

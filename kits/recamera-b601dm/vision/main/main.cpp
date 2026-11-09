@@ -301,6 +301,16 @@ float ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+/** The camera singleton that af::App's CameraHub drives (CH0 is its selected channel). */
+ma::Camera* device_camera() {
+    ma::Device* dev = ma::Device::getInstance();
+    if (dev == nullptr) return nullptr;
+    for (auto* sensor : dev->getSensors()) {
+        if (sensor->getType() == ma::Sensor::Type::kCamera) return static_cast<ma::Camera*>(sensor);
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -342,7 +352,12 @@ int main(int argc, char** argv) {
     af::CameraOptions cam;
     cam.width = static_cast<uint16_t>(g_cfg.inference_w);
     cam.height = static_cast<uint16_t>(g_cfg.inference_h);
-    cam.fps = static_cast<uint8_t>(g_cfg.fps);
+    // CH0's hardware frame-rate control (VPSS) is fixed at this start rate; a later
+    // set_camera_fps() only moves the camera callback's software gate, which cannot pass more
+    // frames than VPSS delivers. Start at the highest inference rate so every rate up to it
+    // is reachable at runtime; VisionControl sets the gate (idle 1 fps) and RateGate picks
+    // the frames.
+    cam.fps = static_cast<uint8_t>(rv::VisionControl::kMaxFps);
     cam.physical = false;
     cam.idle_fps = rv::VisionControl::kIdleFps;
     af::StreamOptions stream;
@@ -360,9 +375,20 @@ int main(int argc, char** argv) {
     vo.model_name = yolo_ok ? base_name(model) : "";
     vo.model_path = yolo_ok ? model : "";
     vo.family = g_cfg.aruco.family;
-    rv::VisionControl ctl(vo, [&app](bool on, int fps) {
-        app.set_camera_fps(static_cast<uint8_t>(fps));
-        MA_LOGI(TAG, "Processing %s (inference channel %d fps)", on ? "ON" : "OFF", fps);
+    ma::Camera* camera = device_camera();
+    rv::VisionControl ctl(vo, [&app, camera](bool on, int gate_fps) {
+        // set_camera_fps() is applied by the frame thread at its next loop, but that thread
+        // is blocked in retrieveFrame() until the old gate passes a frame (up to 1 s in
+        // standby). Writing the gate rate directly lets the next CH0 frame through, so a
+        // trigger or an enable is served within one frame. Both writes go to the same int
+        // (CameraSG200X channel fps), in the same order under VisionControl's lock.
+        app.set_camera_fps(static_cast<uint8_t>(gate_fps));
+        if (camera != nullptr) {
+            ma::Camera::CtrlValue v{};
+            v.i32 = gate_fps;
+            camera->commandCtrl(ma::Camera::CtrlType::kFps, ma::Camera::CtrlMode::kWrite, v);
+        }
+        MA_LOGI(TAG, "Processing %s (camera gate %d fps)", on ? "ON" : "OFF", gate_fps);
     });
     MA_LOGI(TAG, "Start: mode %s, inference %s, fps %d", rv::mode_name(ctl.mode()),
             ctl.continuous_enabled() ? "on" : "standby", ctl.active_fps());
@@ -386,9 +412,18 @@ int main(int argc, char** argv) {
     std::vector<rv::MarkerOut> markers;
     std::string extra;
     uint32_t frame_id = 0;
+    // Frame age for triggers and the rate gate. retrieveFrame() returns the newest queued
+    // frame: if the grab waited, the frame arrived during the wait (now); if one was already
+    // queued, it arrived after the previous grab.
+    uint64_t before_grab_ms = 0;
+    uint64_t last_grab_ms = 0;
 
-    app.on_started(set_ae_fixed_frame_rate).on_frame([&](const af::VideoFrame& frame, af::Result& r) {
-        const rv::Pipelines p = ctl.frame_pipelines();
+    app.on_started(set_ae_fixed_frame_rate).on_before_grab([&] { before_grab_ms = rv::mono_ms(); });
+    app.on_frame([&](const af::VideoFrame& frame, af::Result& r) {
+        const uint64_t grab_ms = rv::mono_ms();
+        const uint64_t frame_ms = grab_ms > before_grab_ms ? grab_ms : last_grab_ms;
+        last_grab_ms = grab_ms;
+        const rv::Pipelines p = ctl.frame_plan(frame_ms);
         if (!p.any() || !frame.valid() || !frame.cpu_accessible()) {
             r.publish = false;  // standby: no /results; the stream and snapshot keep running
             return;
@@ -396,6 +431,7 @@ int main(int argc, char** argv) {
         const auto t_frame = std::chrono::steady_clock::now();
         rv::VisionResult vr;
         vr.frame_id = ++frame_id;
+        vr.frame_ms = frame_ms;
         vr.ts_ms = capture_unix_ms(frame.ts_ms);
         vr.mode = ctl.mode();
         vr.width = crop.w;

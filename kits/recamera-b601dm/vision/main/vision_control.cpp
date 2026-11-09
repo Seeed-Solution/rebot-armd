@@ -38,6 +38,40 @@ bool parse_mode(const std::string& s, Mode& out) noexcept {
     return true;
 }
 
+uint64_t mono_ms() noexcept {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+bool RateGate::accept(uint64_t t_ms, int fps) noexcept {
+    const double period = 1000.0 / (fps > 0 ? fps : 1);
+    const double t = static_cast<double>(t_ms);
+    if (!started_) {
+        started_ = true;
+        next_due_ = t + period;
+        return true;
+    }
+    if (t + period / 2 < next_due_) return false;
+    next_due_ = (t - next_due_ >= period) ? t + period : next_due_ + period;
+    return true;
+}
+
+void RateMeter::add(uint64_t t_ms) noexcept {
+    t_[(head_ + n_) % kCap] = t_ms;
+    if (n_ < kCap) ++n_;
+    else head_ = (head_ + 1) % kCap;
+}
+
+double RateMeter::rate(uint64_t now_ms) const noexcept {
+    size_t k = 0;
+    for (size_t i = 0; i < n_; ++i) {
+        const uint64_t t = t_[(head_ + i) % kCap];
+        if (t <= now_ms && now_ms - t < kWindowMs) ++k;
+    }
+    return static_cast<double>(k) * 1000.0 / kWindowMs;
+}
+
 static uint64_t get_unix_ms() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
@@ -62,7 +96,29 @@ VisionControl::VisionControl(const Options& opt, OnChange on_change)
     last_active_ = m != Mode::Off ? m : (yolo_available_ ? Mode::Yolo : Mode::Aruco);
     continuous_ = opt.enabled && m != Mode::Off;
     latest_.mode = mode_;
-    if (on_change_) on_change_(processing_locked(), fps_locked());
+    reported_proc_ = processing_locked();
+    reported_gate_ = gate_locked();
+    if (on_change_) on_change_(reported_proc_, reported_gate_);
+}
+
+int VisionControl::camera_gate_fps(bool processing, bool trigger_pending, int fps) noexcept {
+    if (!processing) return kIdleFps;
+    if (trigger_pending) return kOpenGateFps;
+    return fps <= 7 ? 2 * fps : kOpenGateFps;
+}
+
+void VisionControl::notify_locked() {
+    const bool proc = processing_locked();
+    const int gate = gate_locked();
+    if (proc == reported_proc_ && gate == reported_gate_) return;
+    reported_proc_ = proc;
+    reported_gate_ = gate;
+    if (on_change_) on_change_(proc, gate);
+}
+
+int VisionControl::camera_fps() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return reported_gate_;
 }
 
 Mode VisionControl::mode() const {
@@ -95,11 +151,24 @@ int VisionControl::current_fps() const {
     return fps_locked();
 }
 
-Pipelines VisionControl::frame_pipelines() const {
+Pipelines VisionControl::frame_plan(uint64_t frame_ms) {
     std::lock_guard<std::mutex> lk(mu_);
-    if (continuous_ && mode_ != Mode::Off) return pipelines_of(mode_);
-    if (triggers_ > 0) return pipelines_of(mode_ != Mode::Off ? mode_ : last_active_);
+    input_meter_.add(frame_ms);
+    if (continuous_ && mode_ != Mode::Off && gate_.accept(frame_ms, fps_)) return pipelines_of(mode_);
+    for (uint64_t req : triggers_) {
+        if (req <= frame_ms) return pipelines_of(mode_ != Mode::Off ? mode_ : last_active_);
+    }
     return {};
+}
+
+double VisionControl::input_fps(uint64_t now_ms) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return input_meter_.rate(now_ms);
+}
+
+double VisionControl::result_fps(uint64_t now_ms) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return result_meter_.rate(now_ms);
 }
 
 VisionControl::Status VisionControl::apply(const Mode* mode, const bool* enabled, const int* fps) {
@@ -107,8 +176,8 @@ VisionControl::Status VisionControl::apply(const Mode* mode, const bool* enabled
     if (mode && pipelines_of(*mode).yolo && !yolo_available_) return Status::YoloUnavailable;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        const bool old_proc = processing_locked();
-        const int old_fps = fps_locked();
+        const bool old_cont = continuous_ && mode_ != Mode::Off;
+        const int old_fps = fps_;
         if (fps) fps_ = *fps;
         if (mode) {
             mode_ = *mode;
@@ -119,9 +188,9 @@ VisionControl::Status VisionControl::apply(const Mode* mode, const bool* enabled
             if (*enabled && mode_ == Mode::Off) mode_ = last_active_;
             continuous_ = *enabled;
         }
-        const bool new_proc = processing_locked();
-        const int new_fps = fps_locked();
-        if ((old_proc != new_proc || old_fps != new_fps) && on_change_) on_change_(new_proc, new_fps);
+        // Continuous processing (re)starts, or a new rate: the next frame is processed.
+        if (old_cont != (continuous_ && mode_ != Mode::Off) || old_fps != fps_) gate_.reset();
+        notify_locked();
     }
     cv_.notify_all();
     return Status::Ok;
@@ -133,22 +202,25 @@ bool VisionControl::set_enabled(bool on) {
     return was != on;
 }
 
-void VisionControl::trigger_begin() {
+void VisionControl::trigger_begin(uint64_t request_ms) {
     {
         std::lock_guard<std::mutex> lk(mu_);
-        const bool old_proc = processing_locked();
-        ++triggers_;
-        if (!old_proc && on_change_) on_change_(true, fps_);
+        triggers_.push_back(request_ms);
+        notify_locked();
     }
     cv_.notify_all();
 }
 
-void VisionControl::trigger_end() {
+void VisionControl::trigger_end(uint64_t request_ms) {
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (triggers_ == 0) return;
-        --triggers_;
-        if (!processing_locked() && on_change_) on_change_(false, kIdleFps);
+        for (auto it = triggers_.begin(); it != triggers_.end(); ++it) {
+            if (*it == request_ms) {
+                triggers_.erase(it);
+                break;
+            }
+        }
+        notify_locked();
     }
     cv_.notify_all();
 }
@@ -157,8 +229,19 @@ void VisionControl::publish(const VisionResult& r) {
     {
         std::lock_guard<std::mutex> lk(mu_);
         latest_ = r;
+        result_meter_.add(r.frame_ms);
     }
     cv_.notify_all();
+}
+
+bool VisionControl::wait_fresh(uint32_t after, uint64_t request_ms, int wait_ms, VisionResult& out) {
+    if (wait_ms < 0) wait_ms = 0;
+    if (wait_ms > kMaxWaitMs) wait_ms = kMaxWaitMs;
+    std::unique_lock<std::mutex> lk(mu_);
+    auto fresh = [&] { return latest_.frame_id > after && latest_.frame_ms >= request_ms; };
+    cv_.wait_for(lk, std::chrono::milliseconds(wait_ms), [&] { return fresh() || stopping_; });
+    out = latest_;
+    return !fresh();
 }
 
 bool VisionControl::latest(bool has_after, uint32_t after, int wait_ms, VisionResult& out) {
@@ -203,6 +286,7 @@ static std::string inference_body(const VisionControl& ctl) {
 }
 
 static std::string mode_body(const VisionControl& ctl) {
+    const uint64_t now = mono_ms();
     const Mode m = ctl.mode();
     const Pipelines p = pipelines_of(m);
     nlohmann::json j = {
@@ -217,6 +301,8 @@ static std::string mode_body(const VisionControl& ctl) {
         {"active_fps", ctl.active_fps()},
         {"idle_fps", VisionControl::kIdleFps},
         {"fps_range", {VisionControl::kMinFps, VisionControl::kMaxFps}},
+        {"camera_fps", ctl.camera_fps()},
+        {"measured", {{"input_fps", ctl.input_fps(now)}, {"result_fps", ctl.result_fps(now)}}},
         {"trigger", true},
         {"available", {{"yolo", ctl.yolo_available()}, {"aruco", true}}},
         {"model", {{"name", ctl.model_name()}, {"path", ctl.model_path()}}},
@@ -311,11 +397,13 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, uin
     ctl.latest(false, 0, 0, current);
     const uint32_t baseline = current.frame_id;
 
+    // Served by the first frame newer than this request; the camera gate opens meanwhile.
+    const uint64_t request_ms = mono_ms();
     VisionResult r;
     bool timeout = false;
     {
-        auto scope = ctl.trigger_scope();
-        timeout = ctl.latest(true, baseline, wait_ms, r);
+        auto scope = ctl.trigger_scope(request_ms);
+        timeout = ctl.wait_fresh(baseline, request_ms, wait_ms, r);
     }
     std::ostringstream s;
     s << "{\"api_version\":" << kApiVersion;
