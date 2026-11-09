@@ -1106,6 +1106,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
           <span class="sc-status-badge plain" id="det-chip" data-i18n="det.none" hidden>检测 --</span>
           <span class="sc-status-badge is-danger" id="rec-chip" data-i18n="rec.chip0">录制 00:00</span>
+          <span class="sc-status-badge" id="act-chip" role="status" aria-live="polite" hidden></span>
         </div>
         <div class="armview only-expert" id="armview">
           <span class="tag" data-i18n="armview.tag">姿态示意 · 侧视</span>
@@ -1570,7 +1571,7 @@ const I18N = {
     'err.park_unsupported': '当前机械臂缺少自动收纳所需配置或反馈能力，未启动收纳；可使用回零功能，力矩仍需现场确认',
     'err.preset_unsupported': '当前机械臂不支持自动收纳，未启动运动；可使用回零功能，力矩仍需现场确认',
     'err.rejected': '指令被拒绝', 'err.nolease': '当前页面没有控制权，请等待控制连接就绪', 'err.cmdtimeout': '设备未在时限内确认指令，请检查实际状态',
-    'err.reqfail': '请求失败：无法连接 armd', 'err.servo_reject': '控制指令被拒绝: ', 'err.preset_reject': '预设指令被拒绝: ', 'err.state_limit': '状态或限位不符', 'err.workspace': '目标超出安全工作空间（地面/边界），已拒绝', 'err.disconnected': '控制连接已断开或控制权已变化',
+    'err.reqfail': '请求失败：无法连接 armd', 'err.servo_reject': '控制指令被拒绝: ', 'err.preset_reject': '预设指令被拒绝: ', 'err.state_limit': '状态或限位不符', 'err.workspace': '目标超出安全工作空间（地面/边界），已拒绝', 'act.running': '外部控制：移动中', 'act.done': '外部控制：完成', 'act.failed': '外部控制：失败（{code}）', 'act.cancelled': '外部控制：已取消（{code}）', 'err.disconnected': '控制连接已断开或控制权已变化',
     'toast.lease_lost': '⚠️ 控制权已被其他设备接管，当前页面已切换为观察模式', 'toast.goto': '正在前往{name}', 'toast.took': '已成功接管控制权', 'toast.take_failed': '接管未成功，控制权仍由其他设备持有',
     'toast.take_rejected': '接管请求被拒绝: ', 'toast.take_timeout': '接管响应超时，正在对账控制权...', 'toast.ws_not_ready': '控制连接未就绪，请稍后再试',
     'toast.homing': '回零中', 'toast.estop_unconfirmed': '无法确认急停，请使用现场安全装置并检查机械臂状态', 'toast.estop_confirmed': '设备已确认急停锁定，仍可能保持力矩', 'toast.estop_timeout': '急停状态未确认，请检查现场安全装置',
@@ -1681,7 +1682,7 @@ const I18N = {
     'err.park_unsupported': 'This arm lacks the configuration or feedback needed for auto-park; park not started. Use Home instead; confirm torque state on site',
     'err.preset_unsupported': 'This arm does not support auto-park; no motion started. Use Home instead; confirm torque state on site',
     'err.rejected': 'Command rejected', 'err.nolease': 'This page has no control lease, wait for the control connection', 'err.cmdtimeout': 'Device did not confirm the command in time, check the actual state',
-    'err.reqfail': 'Request failed: cannot reach armd', 'err.servo_reject': 'Control command rejected: ', 'err.preset_reject': 'Preset command rejected: ', 'err.state_limit': 'state or limits mismatch', 'err.workspace': 'Target outside the safe workspace (floor/boundary), rejected', 'err.disconnected': 'Control connection lost or lease changed',
+    'err.reqfail': 'Request failed: cannot reach armd', 'err.servo_reject': 'Control command rejected: ', 'err.preset_reject': 'Preset command rejected: ', 'err.state_limit': 'state or limits mismatch', 'err.workspace': 'Target outside the safe workspace (floor/boundary), rejected', 'act.running': 'External control: moving', 'act.done': 'External control: done', 'act.failed': 'External control: failed ({code})', 'act.cancelled': 'External control: cancelled ({code})', 'err.disconnected': 'Control connection lost or lease changed',
     'toast.lease_lost': '⚠️ Control was taken over by another device, this page is now an observer', 'toast.goto': 'Moving to {name}', 'toast.took': 'Control taken over', 'toast.take_failed': 'Take over failed, another device still holds control',
     'toast.take_rejected': 'Take over rejected: ', 'toast.take_timeout': 'Take over timed out, reconciling lease...', 'toast.ws_not_ready': 'Control connection not ready, try again shortly',
     'toast.homing': 'Homing', 'toast.estop_unconfirmed': 'E-Stop not confirmed, use the on-site safety device and check the arm', 'toast.estop_confirmed': 'Device confirmed E-Stop latch; torque may still be held', 'toast.estop_timeout': 'E-Stop state not confirmed, check the on-site safety device',
@@ -2153,6 +2154,7 @@ function connectWS() {
     }
     if (!Array.isArray(o.positions)) return;
     S.obs = o; S.obsAt = Date.now(); S.wsCount++;
+    renderActionChip(o);
     syncEpoch(o.epoch_id);
     const st = parseState(o.safety_state);
     const wasStopped = isStopped();
@@ -2166,7 +2168,7 @@ function connectWS() {
       const presetAge = S.preset?.startedAt ? (Date.now() - S.preset.startedAt) : 0;
       const speedsNearZero = Array.isArray(o.velocities) && o.velocities.every((v) => Math.abs(v) < 0.05);
       const isArmed = st.name === 'Armed';
-      const noTraj = !o.active_trajectory;
+      const noTraj = o.action?.state !== 'running';
       if (st.name === 'EStop' || st.name === 'Fault' || (isArmed && noTraj && presetAge > 500) || (presetAge > 1000 && speedsNearZero)) {
         S.presetRunning = false;
         S.preset = null;
@@ -4019,6 +4021,22 @@ function cartSync(pos) {
 function cartHoldStill() {
   if (C.goal && C.cmd) C.goal = { ...C.cmd };
   if (C.T) C.Tg = C.T;
+}
+// HUD line for actions started by an external client (agent / MCP); hidden 5 s after they end
+function renderActionChip(o) {
+  const el = $('act-chip');
+  if (!el) return;
+  const a = o.action;
+  const external = a && !['joint_move', 'home', 'park'].includes(a.kind);
+  const recent = external && (a.state === 'running' || !(o.timestamp - (a.finished_at ?? o.timestamp) > 5));
+  el.hidden = !recent;
+  if (!recent) return;
+  const key = { running: 'act.running', done: 'act.done', failed: 'act.failed', cancelled: 'act.cancelled' }[a.state] || 'act.running';
+  const text = t(key, { code: a.code || '' });
+  if (el.textContent !== text) el.textContent = text;
+  el.classList.toggle('is-warn', a.state === 'running');
+  el.classList.toggle('is-ok', a.state === 'done');
+  el.classList.toggle('is-danger', a.state === 'failed' || a.state === 'cancelled');
 }
 function cartReject(err) {
   C.goal = { ...C.cmd };
