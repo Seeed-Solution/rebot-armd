@@ -1,0 +1,314 @@
+{
+  "profile_version": 1,
+  "dof": 7,
+  "joint_names": [
+    "joint_1",
+    "joint_2",
+    "joint_3",
+    "joint_4",
+    "joint_5",
+    "joint_6",
+    "gripper"
+  ],
+  "limits": [
+    {
+      "name": "joint_1",
+      "min_position": -3.14159,
+      "max_position": 3.14159,
+      "max_velocity": 2.0,
+      "max_acceleration": 5.0
+    },
+    {
+      "name": "joint_2",
+      "min_position": -2.0944,
+      "max_position": 2.0944,
+      "max_velocity": 2.0,
+      "max_acceleration": 5.0
+    },
+    {
+      "name": "joint_3",
+      "min_position": -2.61799,
+      "max_position": 2.61799,
+      "max_velocity": 2.0,
+      "max_acceleration": 5.0
+    },
+    {
+      "name": "joint_4",
+      "min_position": -3.14159,
+      "max_position": 3.14159,
+      "max_velocity": 3.0,
+      "max_acceleration": 8.0
+    },
+    {
+      "name": "joint_5",
+      "min_position": -2.0944,
+      "max_position": 2.0944,
+      "max_velocity": 3.0,
+      "max_acceleration": 8.0
+    },
+    {
+      "name": "joint_6",
+      "min_position": -6.28318,
+      "max_position": 6.28318,
+      "max_velocity": 4.0,
+      "max_acceleration": 10.0
+    },
+    {
+      "name": "gripper",
+      "min_position": -5.75,
+      "max_position": 0.1,
+      "max_velocity": 2.0,
+      "max_acceleration": 5.0
+    }
+  ],
+  "home_positions": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    1.5707963,
+    0.0
+  ],
+  "lease_timeout_ms": 2500,
+  "max_temperature": 70.0,
+  "control_frequency_hz": 50,
+  "resting_pose": {
+    "position_tolerances": [
+      0.15,
+      0.08,
+      0.08,
+      0.08,
+      0.08,
+      0.08
+    ],
+    "max_total_deviation": 0.22,
+    "max_velocity": 0.015,
+    "joint_max_velocities": [
+      0.005,
+      0.005,
+      0.005,
+      0.015,
+      0.015,
+      0.015,
+      0.015
+    ],
+    "support_torque_limits": [
+      [
+        1,
+        2.333
+      ],
+      [
+        2,
+        7.0
+      ]
+    ],
+    "feedback_max_age_ms": 100
+  },
+  "following_error": {
+    "max_error_rad": 0.5,
+    "persistence_ms": 500
+  },
+  "max_jerk": 50.0,
+  "gravity_model": "RebotDevArm",
+  "planned_max_velocity": 0.45,
+  "kinematics": "RebotDevArm",
+  "workspace": {
+    "floor_z_m": 0.0,
+    "box_min_m": [
+      -0.6,
+      -0.6,
+      -1.0
+    ],
+    "box_max_m": [
+      0.6,
+      0.6,
+      0.8
+    ],
+    "max_reach_m": 0.52,
+    "check_points_end_m": [
+      [
+        -0.16,
+        -0.0925,
+        -0.0347
+      ],
+      [
+        -0.16,
+        -0.0925,
+        0.0347
+      ],
+      [
+        -0.16,
+        0.0925,
+        -0.0347
+      ],
+      [
+        -0.16,
+        0.0925,
+        0.0347
+      ],
+      [
+        0.0,
+        -0.0925,
+        -0.0347
+      ],
+      [
+        0.0,
+        -0.0925,
+        0.0347
+      ],
+      [
+        0.0,
+        0.0925,
+        -0.0347
+      ],
+      [
+        0.0,
+        0.0925,
+        0.0347
+      ]
+    ]
+  },
+  "camera_mount": {
+    "flip": false,
+    "rot_deg": 0.0,
+    "tilt_deg": 0.0,
+    "offset_m": null
+  },
+  "gripper_policy": {
+    "closed_rad": 0.0,
+    "open_rad": -5.7,
+    "holding_gap_rad": 0.3,
+    "holding_torque_nm": 0.0667,
+    "squeeze_rad": 0.15,
+    "settle_ms": 300
+  },
+  "grasp": {
+    "table_z_m": 0.0,
+    "approach_height_m": 0.15,
+    "grasp_height_m": 0.015,
+    "lift_height_m": 0.12,
+    "grip_pixel_norm": [
+      0.5,
+      0.5
+    ],
+    "camera_tilt_deg": 0.0,
+    "image_size_px": [
+      640.0,
+      360.0
+    ],
+    "fx_px": 600.0,
+    "fy_px": 600.0,
+    "centre_tol_px": 10.0,
+    "stable_frames": 3,
+    "median_frames": 3,
+    "max_iterations": 10,
+    "servo_gain": 0.6,
+    "max_step_m": 0.03,
+    "match_dist_px": 35.0,
+    "match_iou": 0.45,
+    "acquire_dist_px": 160.0,
+    "lost_timeout_s": 1.0,
+    "lost_frames": 5,
+    "settle_delay_s": 0.1,
+    "align_min_aspect": 1.2,
+    "align_j6": true,
+    "approach_speed_mps": 0.05,
+    "descend_speed_mps": 0.03,
+    "phase_timeout_s": 25.0,
+    "timeout_s": 120.0
+  },
+  "gravity_comp": {
+    "ramp_in_s": 1.0,
+    "scale": 1.0,
+    "scale_range": [
+      0.5,
+      1.2
+    ],
+    "damping_kd": [
+      0.4,
+      0.6,
+      0.5,
+      0.35,
+      0.15,
+      0.1
+    ],
+    "damping_kd_max": 2.0,
+    "torque_limits_nm": [
+      2.0,
+      12.0,
+      8.5,
+      3.0,
+      1.5,
+      0.5
+    ],
+    "max_speed_rad_s": 1.5,
+    "joint_max_speed_rad_s": [
+      1.5,
+      1.5,
+      1.5,
+      3.0,
+      3.0,
+      3.0
+    ],
+    "overspeed_ticks": 3,
+    "hold_kp": [
+      30.0,
+      30.0,
+      30.0,
+      15.0,
+      10.0,
+      8.0
+    ],
+    "hold_kd": [
+      1.0,
+      1.0,
+      1.0,
+      0.5,
+      0.3,
+      0.2
+    ],
+    "exit_hold_ms": 100,
+    "entry_max_velocity": 0.05,
+    "feedback_max_age_ms": 100,
+    "joint_limit_margin_rad": 0.05,
+    "ramp_max_deviation_rad": 0.15
+  },
+  "damiao_ranges": [
+    {
+      "p_max": 12.5,
+      "v_max": 10.0,
+      "t_max": 28.0
+    },
+    {
+      "p_max": 12.5,
+      "v_max": 10.0,
+      "t_max": 28.0
+    },
+    {
+      "p_max": 12.5,
+      "v_max": 10.0,
+      "t_max": 28.0
+    },
+    {
+      "p_max": 12.5,
+      "v_max": 30.0,
+      "t_max": 10.0
+    },
+    {
+      "p_max": 12.5,
+      "v_max": 30.0,
+      "t_max": 10.0
+    },
+    {
+      "p_max": 12.5,
+      "v_max": 30.0,
+      "t_max": 10.0
+    },
+    {
+      "p_max": 12.5,
+      "v_max": 30.0,
+      "t_max": 10.0
+    }
+  ]
+}

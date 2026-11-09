@@ -12,6 +12,8 @@ NAME=rebot-teleop
 DAEMON=/usr/local/bin/armd
 PIDFILE=/var/run/$NAME.pid
 LOGFILE=/var/log/$NAME.log
+# B601-DM arm profile (kit data, equal to armd's built-in rebot-dm profile)
+PROFILE=/usr/share/$NAME/profile/rebot-b601dm.json
 
 # 默认配置参数
 FOLLOWER_MODEL="rebot-dm"
@@ -185,6 +187,10 @@ start() {
     fi
 
     DAEMON_OPTS="--follower $FOLLOWER_MODEL --follower-port $FOLLOWER_PORT --port $PORT"
+    # The profile is for the 7-joint B601-DM only; other followers keep their built-in profile.
+    if [ "$FOLLOWER_MODEL" = "rebot-dm" ] && [ -f "$PROFILE" ]; then
+        DAEMON_OPTS="$DAEMON_OPTS --config $PROFILE"
+    fi
 
     start-stop-daemon -S -b -m -p $PIDFILE -a /bin/sh -- -c "exec $DAEMON $DAEMON_OPTS >> $LOGFILE 2>&1"
     if [ $? -ne 0 ]; then

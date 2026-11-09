@@ -19,7 +19,7 @@ pub use driver::{
     JointMode, JointTarget, RobStrideArmDriver,
 };
 pub use gravity::{compute_gravity_torques, verify_urdf_sha256, GravityError};
-pub use model::{ArmConfig, ArmObservation, JointLimit, JointState, ObservationSchema};
+pub use model::{ArmConfig, ArmObservation, ARM_PROFILE_VERSION, JointLimit, JointState, ObservationSchema};
 pub use recording::{
     lerobot_arrow_schema, read_frames_from_parquet, write_frames_to_parquet, EpisodeRecorder,
     EpisodeState, RecordFrame,

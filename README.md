@@ -401,10 +401,15 @@ default `/userdata/rebot-teleop/grasp_setup.json`).
 
 Without `--config`, `rebot-dm` uses the built-in B601-DM profile (`ArmConfig::rebot_dm()` in
 `src/model.rs`) and the other followers a generic 6-joint profile. A `--config` file is a
-complete `ArmConfig` JSON; excerpt with the rebot-dm values:
+complete `ArmConfig` JSON. The same B601-DM profile is shipped as data in
+[`kits/recamera-b601dm/profile/rebot-b601dm.json`](kits/recamera-b601dm/profile/rebot-b601dm.json)
+(a test keeps it equal to `rebot_dm()`); the deb installs it at
+`/usr/share/rebot-teleop/profile/rebot-b601dm.json` and the init script passes it with
+`--config` when the follower is `rebot-dm`. Excerpt with the rebot-dm values:
 
 ```json
 {
+  "profile_version": 1,
   "dof": 7,
   "joint_names": ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"],
   "control_frequency_hz": 50,

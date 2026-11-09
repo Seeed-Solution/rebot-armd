@@ -297,10 +297,11 @@ armd [OPTIONS]
 
 环境变量：`RUST_LOG`（日志过滤，默认 `armd=info,tower_http=info`）、`PORT`、`ARMD_DETECTOR_URL`（默认 `http://127.0.0.1:8090`）、`ARMD_GRASP_SETUP`（抓取设置文件，默认 `/userdata/rebot-teleop/grasp_setup.json`）。
 
-不带 `--config` 时，`rebot-dm` 使用内置 B601-DM profile（`src/model.rs` 中的 `ArmConfig::rebot_dm()`），其他 follower 使用通用 6 关节 profile。`--config` 文件是完整的 `ArmConfig` JSON；以下为 rebot-dm 取值的节选：
+不带 `--config` 时，`rebot-dm` 使用内置 B601-DM profile（`src/model.rs` 中的 `ArmConfig::rebot_dm()`），其他 follower 使用通用 6 关节 profile。`--config` 文件是完整的 `ArmConfig` JSON。同一份 B601-DM profile 以数据形式放在 [`kits/recamera-b601dm/profile/rebot-b601dm.json`](kits/recamera-b601dm/profile/rebot-b601dm.json)（有测试保证它与 `rebot_dm()` 一致）；deb 把它安装到 `/usr/share/rebot-teleop/profile/rebot-b601dm.json`，follower 为 `rebot-dm` 时 init 脚本用 `--config` 传入。以下为 rebot-dm 取值的节选：
 
 ```json
 {
+  "profile_version": 1,
   "dof": 7,
   "joint_names": ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"],
   "control_frequency_hz": 50,

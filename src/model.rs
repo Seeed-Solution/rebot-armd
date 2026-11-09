@@ -315,9 +315,20 @@ impl DamiaoRange {
 /// on hardware (record |commanded - measured| during presets to fit it).
 pub const POSVEL_LAG_GAIN: f32 = 1.5; // measured 2026-11-09: J3 trailed 0.458 rad at a 0.7 rad/s jog
 
+/// Version of the arm profile contract (the `ArmConfig` JSON read by `--config`).
+/// A profile without `profile_version` is version 1; armd refuses newer versions.
+pub const ARM_PROFILE_VERSION: u32 = 1;
+
+fn default_profile_version() -> u32 {
+    1
+}
+
 /// Robotic arm hardware/control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArmConfig {
+    /// Arm profile contract version; missing in older profiles, which are version 1.
+    #[serde(default = "default_profile_version")]
+    pub profile_version: u32,
     pub dof: usize,
     pub joint_names: Vec<String>,
     pub limits: Vec<JointLimit>,
@@ -388,6 +399,7 @@ impl Default for ArmConfig {
         let home_positions = vec![0.0; dof];
 
         Self {
+            profile_version: ARM_PROFILE_VERSION,
             dof,
             joint_names,
             limits,
@@ -414,6 +426,12 @@ impl Default for ArmConfig {
 impl ArmConfig {
     /// Validate configuration invariants and auto-normalize joint names
     pub fn validate(&mut self) -> Result<(), String> {
+        if self.profile_version == 0 || self.profile_version > ARM_PROFILE_VERSION {
+            return Err(format!(
+                "profile_version {} is not supported (this armd reads 1..={ARM_PROFILE_VERSION})",
+                self.profile_version
+            ));
+        }
         if self.dof == 0 {
             return Err("DOF cannot be zero".into());
         }
@@ -534,6 +552,7 @@ impl ArmConfig {
         let home_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0];
 
         Self {
+            profile_version: ARM_PROFILE_VERSION,
             dof,
             joint_names,
             limits,

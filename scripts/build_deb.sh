@@ -150,6 +150,10 @@ ln -sf /etc/init.d/K92rebot-teleop "${STAGING_DIR}/etc/init.d/S92rebot-teleop"
 
 cp -r "${PACKAGING_DIR}/rootfs/usr/share/rebot-teleop/"* "${STAGING_DIR}/usr/share/rebot-teleop/"
 
+# Arm profile of the kit (loaded by the init script with --config)
+mkdir -p "${STAGING_DIR}/usr/share/rebot-teleop/profile"
+cp -f "${REPO_ROOT}/kits/recamera-b601dm/profile/rebot-b601dm.json" "${STAGING_DIR}/usr/share/rebot-teleop/profile/rebot-b601dm.json"
+
 # Ensure web UI index.html is present in usr/share/rebot-teleop
 if [ -f "${REPO_ROOT}/src/api/index.html" ]; then
     cp -f "${REPO_ROOT}/src/api/index.html" "${STAGING_DIR}/usr/share/rebot-teleop/index.html"
