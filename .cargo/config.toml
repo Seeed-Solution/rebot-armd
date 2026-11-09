@@ -1,8 +1,12 @@
+# Cross-compile settings for the reCamera (SG2002, RISC-V T-Head C906).
+# Host builds (`cargo build`, `cargo test`) do not use this section.
+#
+# Linking also needs the T-Head musl libraries from the SG2002 toolchain
+# (sophgo host-tools, riscv64-linux-musl-x86_64). scripts/build_deb.sh adds
+# their -L paths from RECAMERA_TOOLCHAIN; see the README, "Cross-compile".
+# Note: a RUSTFLAGS environment variable replaces this list.
 [target.riscv64gc-unknown-linux-musl]
 rustflags = [
     "-C", "linker=rust-lld",
     "-C", "target-feature=+crt-static",
-    "-L", "${RECAMERA_TOOLCHAIN}/lib/gcc/riscv64-unknown-linux-musl/10.2.0/lib64v0p7_xthead/lp64d",
-    "-L", "${RECAMERA_TOOLCHAIN}/sysroot/lib64v0p7_xthead/lp64d",
-    "-L", "${RECAMERA_TOOLCHAIN}/sysroot/usr/lib64v0p7_xthead/lp64d",
 ]

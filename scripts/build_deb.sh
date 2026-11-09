@@ -10,9 +10,10 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PACKAGING_DIR="${REPO_ROOT}/packaging/rebot-teleop"
 TARGET_TRIPLE="riscv64gc-unknown-linux-musl"
 
-# Default toolchain sysroot search paths for SG2002 RISC-V musl
-DEFAULT_SYSROOT="${RECAMERA_TOOLCHAIN}"
-TOOLCHAIN_ROOT="${REC_TOOLCHAIN:-${RISCV_SYSROOT:-$DEFAULT_SYSROOT}}"
+# SG2002 RISC-V musl toolchain (sophgo host-tools: gcc/riscv64-linux-musl-x86_64).
+# Only its T-Head (lib64v0p7_xthead/lp64d) libraries are used; rust-lld links.
+# REC_TOOLCHAIN and RISCV_SYSROOT are accepted as older names.
+TOOLCHAIN_ROOT="${RECAMERA_TOOLCHAIN:-${REC_TOOLCHAIN:-${RISCV_SYSROOT:-}}}"
 
 # Target version (from CLI arg, or debian/control, or Cargo.toml)
 CUSTOM_VERSION="${1:-}"
@@ -39,10 +40,23 @@ if ! command -v dpkg-deb >/dev/null 2>&1; then
     exit 1
 fi
 
-# Configure linker flags if not already provided via RUSTFLAGS or .cargo/config.toml
-if [ -z "${RUSTFLAGS:-}" ] && [ -d "$TOOLCHAIN_ROOT" ]; then
+# Linker flags: either RUSTFLAGS is set by the caller, or they are built from
+# RECAMERA_TOOLCHAIN. RUSTFLAGS replaces the rustflags in .cargo/config.toml,
+# so the full list is given here.
+if [ -z "${RUSTFLAGS:-}" ]; then
+    if [ -z "$TOOLCHAIN_ROOT" ] || [ ! -d "$TOOLCHAIN_ROOT" ]; then
+        echo "Error: set RECAMERA_TOOLCHAIN to the riscv64-linux-musl-x86_64 toolchain directory" >&2
+        echo "       (from https://github.com/sophgo/host-tools, gcc/riscv64-linux-musl-x86_64)," >&2
+        echo "       or set RUSTFLAGS with the linker search paths yourself." >&2
+        exit 1
+    fi
+    GCC_LIB_DIR="$(ls -d "${TOOLCHAIN_ROOT}"/lib/gcc/riscv64-unknown-linux-musl/*/lib64v0p7_xthead/lp64d 2>/dev/null | head -n1)"
+    if [ -z "$GCC_LIB_DIR" ]; then
+        echo "Error: no lib/gcc/riscv64-unknown-linux-musl/<version>/lib64v0p7_xthead/lp64d under ${TOOLCHAIN_ROOT}" >&2
+        exit 1
+    fi
     export RUSTFLAGS="-C linker=rust-lld -C target-feature=+crt-static \
--L ${TOOLCHAIN_ROOT}/lib/gcc/riscv64-unknown-linux-musl/10.2.0/lib64v0p7_xthead/lp64d \
+-L ${GCC_LIB_DIR} \
 -L ${TOOLCHAIN_ROOT}/sysroot/lib64v0p7_xthead/lp64d \
 -L ${TOOLCHAIN_ROOT}/sysroot/usr/lib64v0p7_xthead/lp64d"
 fi
