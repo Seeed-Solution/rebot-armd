@@ -55,4 +55,17 @@ jobs:
             sh -n "$f" && echo "ok $f"
           done
       - name: Build script syntax
-        run: bash -n scripts/build_deb.sh
+        run: bash -n scripts/build_deb.sh && bash -n scripts/build_vision.sh
+
+  vision-host-tests:
+    # Portable parts of rebot-vision (kits/recamera-b601dm/vision/tests), no SG2002 SDK.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nlohmann-json
+        run: sudo apt-get update && sudo apt-get install -y nlohmann-json3-dev
+      - name: Build and run
+        run: |
+          cmake -S kits/recamera-b601dm/vision/tests -B build/vision-tests
+          cmake --build build/vision-tests -j
+          ctest --test-dir build/vision-tests --output-on-failure
