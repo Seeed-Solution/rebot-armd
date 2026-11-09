@@ -37,6 +37,10 @@ pub enum ArmError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// Request refused with a specific code (gravity compensation mode changes).
+    #[error("{code}: {message}")]
+    Rejected { status: u16, code: String, message: String },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
@@ -132,6 +136,9 @@ pub struct SupervisorInner {
     pub e_stop_latched: Arc<AtomicBool>,
     pub last_preemption: Option<Instant>,
     pub handover_settling_since: Option<Instant>,
+    /// Running gravity-compensation session (`src/gravity_comp.rs`).
+    pub gravity_comp: Option<crate::gravity_comp::GravityCompRun>,
+    pub gravity_comp_last_exit: Option<crate::model::GravityCompExit>,
 }
 
 impl SupervisorInner {
@@ -224,6 +231,8 @@ impl SupervisorInner {
             e_stop_latched: Arc::new(AtomicBool::new(false)),
             last_preemption: None,
             handover_settling_since: None,
+            gravity_comp: None,
+            gravity_comp_last_exit: None,
         }
     }
 
@@ -370,6 +379,8 @@ impl SupervisorInner {
             commanded_positions: self.commanded_positions.clone(),
             action: self.last_action.clone(),
             previous_action: self.previous_action.as_ref().filter(|(_, until)| timestamp < *until).map(|(a, _)| a.clone()),
+            control_mode: if self.gravity_comp.is_some() { crate::model::ControlMode::GravityComp } else { crate::model::ControlMode::Position },
+            gravity_comp: self.gravity_comp_observation(),
         }
     }
 
@@ -432,6 +443,8 @@ impl SupervisorInner {
     }
 
     pub fn set_torque(&mut self, enable: bool) -> Result<SafetyState, SafetyError> {
+        // Torque changes and re-arming are refused in gravity compensation: exit first.
+        self.gravity_comp_servo_busy()?;
         if enable {
             if self.handover_settling_since.is_some() {
                 return Err(SafetyError::HandoverSettling);
@@ -688,6 +701,7 @@ impl SupervisorInner {
             }
             StopPolicy::EStopLatch => {
                 self.e_stop_latched.store(true, Ordering::SeqCst);
+                self.exit_gravity_comp("ESTOP", "E-stop");
                 // Immediate rigid lock at current position, latch E-Stop, advance epoch
                 // Maintain active restorative torque hold: do NOT cut power or set is_torqued=false
                 self.pending_normal_unload = false;
@@ -721,6 +735,7 @@ impl SupervisorInner {
                 if let Err(e) = self.request_disable() { tracing::error!("Thermal shutdown not confirmed: {e}"); }
             }
             StopPolicy::BusLossFallback => {
+                self.exit_gravity_comp("BUS_LOSS", "CAN feedback lost");
                 // Bus loss / disconnect: hold position locked, latch fault, advance epoch
                 // Maintain holding torque: DO NOT disable hardware torque to prevent gravitational collapse!
                 self.pending_normal_unload = false;
@@ -748,6 +763,9 @@ impl SupervisorInner {
 
     pub fn clear_fault(&mut self) -> Result<SafetyState, SafetyError> {
         if !self.safety.state().is_stopped() { return Ok(self.safety.state().clone()); }
+        if self.gravity_comp_blocks_clear() {
+            return Err(SafetyError::ClearFaultRejected("Gravity compensation: the switch back to POS_VEL is not confirmed yet".into()));
+        }
         if self.disable_pending { return Err(SafetyError::ClearFaultRejected("Torque disable is still unconfirmed".into())); }
         let thermal = matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }));
         let confirmed = if let Some(ref d) = self.driver {
@@ -822,6 +840,7 @@ impl SupervisorInner {
     }
 
     pub fn is_fully_settled_hold(&self) -> bool {
+        if self.gravity_comp.is_some() { return false; }
         // Safe condition 1: Confirmed disabled (torque off, Idle, not disable pending)
         if !self.is_torqued && matches!(self.safety.state(), SafetyState::Idle) && !self.disable_pending {
             return true;
@@ -1062,6 +1081,7 @@ impl SupervisorInner {
     }
 
     pub fn servo(&mut self, targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
+        self.gravity_comp_servo_busy()?;
         if self.handover_settling_since.is_some() {
             return Err(SafetyError::HandoverSettling);
         }
@@ -1140,6 +1160,7 @@ impl SupervisorInner {
         epoch_id: Option<u64>,
         kind: &str,
     ) -> Result<(u64, u64, f64), ArmError> {
+        self.gravity_comp_motion_busy()?;
         if self.handover_settling_since.is_some() {
             return Err(ArmError::Safety(SafetyError::HandoverSettling));
         }
@@ -1284,6 +1305,7 @@ impl SupervisorInner {
             return Err(MotionError::Unsupported("Cartesian actions need a 7-DOF profile with a kinematics model".into()).into());
         }
         self.action_preconditions()?;
+        self.gravity_comp_motion_busy()?;
         Ok(PlanInput {
             q0: crate::kinematics::q6(&self.commanded_positions),
             j7: self.commanded_positions[6],
@@ -1881,8 +1903,13 @@ impl SupervisorInner {
             }
         }
 
+        // 0.3 Gravity compensation: exits (to a hold) on any safety event before the
+        // watchdog below may start a park, which then runs from position mode.
+        self.gravity_comp_tick(dt);
+
         // 1. Check lease watchdog (skip during autonomous stow/unload)
         if self.lease_enabled
+            && self.gravity_comp.is_none()
             && self.is_torqued
             && self.safety.state().is_operational()
             && !self.pending_normal_unload
@@ -2150,6 +2177,7 @@ impl SupervisorInner {
             && self.servo_target.is_none()
             && self.active_trajectory.is_none()
             && !self.pending_normal_unload
+            && self.gravity_comp.is_none()
             && !self.safety.state().is_stopped()
         {
             // A stale/dropped target requests zero velocity. The same feasible
@@ -2212,7 +2240,18 @@ impl SupervisorInner {
         // Hold only while torque may be active and fresh valid feedback permits output.
         // Pending disable and invalid feedback suppress ordinary commands; reconnect resynchronizes first.
         let mut output_error = None;
-        if self.is_torqued && !self.disable_pending {
+        if self.is_torqued && !self.disable_pending && self.gravity_comp.is_some() {
+            // Gravity compensation (any phase): MIT targets for J1-J6. Sent without the
+            // feedback-freshness gate so that an exit hold reaches the motors even when
+            // feedback is late; a floating phase never outlives fresh feedback (it exits).
+            if let (Some(targets), Some(d)) = (self.gravity_comp_targets(), self.driver.as_ref()) {
+                if let Ok(mut driver) = d.lock() {
+                    if driver.enable_state() != EnableState::Disabled {
+                        if let Err(e) = driver.write_joint_targets(&targets) { output_error = Some(e.to_string()); }
+                    }
+                }
+            }
+        } else if self.is_torqued && !self.disable_pending {
             let send_to_bus = feedback_fresh && self.driver.as_ref().is_none_or(|d|
                 d.lock().is_ok_and(|drv| drv.enable_state() != EnableState::Disabled));
 

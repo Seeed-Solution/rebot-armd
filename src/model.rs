@@ -171,6 +171,91 @@ impl GripperPolicy {
     }
 }
 
+/// Gravity compensation ("hand-guiding") parameters. J1-J6 run in MIT mode with kp = 0,
+/// damping `damping_kd` and the URDF gravity torque times `scale` as feed-forward; the
+/// gripper stays position-controlled. Values are software defaults for the B601-DM and
+/// have not been verified on hardware. Arrays have one entry per arm joint (J1-J6).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GravityCompPolicy {
+    /// Time over which the model feed-forward is faded in (and the hold stiffness out), s.
+    pub ramp_in_s: f32,
+    /// Default multiplier on the model gravity torque.
+    pub scale: f32,
+    /// Allowed range for a per-session `scale` override.
+    pub scale_range: [f32; 2],
+    /// Joint damping while floating (N·m·s/rad).
+    pub damping_kd: Vec<f32>,
+    /// Upper bound for a per-session damping override (N·m·s/rad).
+    pub damping_kd_max: f32,
+    /// Per-joint clamp on the feed-forward torque (N·m).
+    pub torque_limits_nm: Vec<f32>,
+    /// A joint faster than this (rad/s) ...
+    pub max_speed_rad_s: f32,
+    /// ... for this many consecutive ticks ends the mode with GRAVITY_COMP_OVERSPEED.
+    pub overspeed_ticks: u32,
+    /// MIT stiffness used while entering (faded out) and while exiting (N·m/rad).
+    pub hold_kp: Vec<f32>,
+    /// MIT damping used with `hold_kp` (N·m·s/rad).
+    pub hold_kd: Vec<f32>,
+    /// MIT stiff hold at the captured pose before switching back to POS_VEL (ms).
+    pub exit_hold_ms: u64,
+    /// Entry requires every arm joint slower than this (rad/s).
+    pub entry_max_velocity: f32,
+    /// Feedback older than this ends the mode (ms).
+    pub feedback_max_age_ms: u64,
+    /// The mode ends when a joint comes this close to its soft limit (rad).
+    pub joint_limit_margin_rad: f32,
+    /// During the ramp-in the arm should stay where it was: a joint moving further than
+    /// this from the entry pose ends the mode with GRAVITY_COMP_SAG (rad).
+    pub ramp_max_deviation_rad: f32,
+}
+
+impl GravityCompPolicy {
+    /// B601-DM defaults. The torque limits sit above the model torque over the usual
+    /// workspace (URDF maxima on a joint grid: J2 16.3, J3 7.8, J4 2.2, J5 0.8 N·m), so
+    /// J2 is not fully supported when the arm is stretched out horizontally.
+    pub fn rebot_dm() -> Self {
+        Self {
+            ramp_in_s: 1.0,
+            scale: 1.0,
+            scale_range: [0.5, 1.2],
+            damping_kd: vec![0.4, 0.6, 0.5, 0.2, 0.15, 0.1],
+            damping_kd_max: 2.0,
+            torque_limits_nm: vec![2.0, 12.0, 8.5, 3.0, 1.5, 0.5],
+            max_speed_rad_s: 1.5,
+            overspeed_ticks: 3,
+            hold_kp: vec![30.0, 30.0, 30.0, 15.0, 10.0, 8.0],
+            hold_kd: vec![1.0, 1.0, 1.0, 0.5, 0.3, 0.2],
+            exit_hold_ms: 100,
+            entry_max_velocity: 0.05,
+            feedback_max_age_ms: 100,
+            joint_limit_margin_rad: 0.05,
+            ramp_max_deviation_rad: 0.15,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let six = |v: &Vec<f32>| v.len() == 6 && v.iter().all(|x| x.is_finite() && *x >= 0.0);
+        let pos = |x: f32| x.is_finite() && x > 0.0;
+        let [lo, hi] = self.scale_range;
+        if !pos(self.ramp_in_s) || self.ramp_in_s > 10.0
+            || !(lo.is_finite() && hi.is_finite() && lo > 0.0 && lo <= hi && hi <= 2.0)
+            || !(lo..=hi).contains(&self.scale)
+            || !six(&self.damping_kd) || !pos(self.damping_kd_max) || self.damping_kd_max > 5.0
+            || self.damping_kd.iter().any(|k| *k > self.damping_kd_max)
+            || !six(&self.torque_limits_nm) || self.torque_limits_nm.iter().any(|t| *t > 18.0)
+            || !pos(self.max_speed_rad_s) || self.overspeed_ticks == 0
+            || !six(&self.hold_kp) || self.hold_kp.iter().any(|k| *k > 500.0)
+            || !six(&self.hold_kd) || self.hold_kd.iter().any(|k| *k > 5.0)
+            || self.exit_hold_ms > 2000 || !pos(self.entry_max_velocity) || self.feedback_max_age_ms == 0
+            || !self.joint_limit_margin_rad.is_finite() || self.joint_limit_margin_rad < 0.0
+            || !pos(self.ramp_max_deviation_rad) {
+            return Err("Invalid gravity_comp policy (6 values per array, kp <= 500, kd <= 5, torque <= 18 N·m, scale inside scale_range)".into());
+        }
+        Ok(())
+    }
+}
+
 /// Estimated Damiao POS_VEL lag gain: tracking error ~= v / POSVEL_LAG_GAIN rad at
 /// v rad/s. Estimate from the 2026-11 tracking-fault analysis; needs verification
 /// on hardware (record |commanded - measured| during presets to fit it).
@@ -215,6 +300,9 @@ pub struct ArmConfig {
     /// Tap-to-grasp setup; None disables `/api/v1/action/grasp`.
     #[serde(default)]
     pub grasp: Option<crate::grasp::GraspSetup>,
+    /// Gravity compensation (hand-guiding); None means unsupported.
+    #[serde(default)]
+    pub gravity_comp: Option<GravityCompPolicy>,
 }
 
 impl Default for ArmConfig {
@@ -259,6 +347,7 @@ impl Default for ArmConfig {
             camera_mount: CameraMount::default(),
             gripper_policy: None,
             grasp: None,
+            gravity_comp: None,
         }
     }
 }
@@ -313,6 +402,12 @@ impl ArmConfig {
                 || !(0.0..=0.5).contains(&g.squeeze_rad) || g.settle_ms == 0 || g.settle_ms > 5000 {
                 return Err("Invalid gripper policy (needs dof 7, open/closed inside the J7 limits, 0 <= squeeze_rad <= 0.5)".into());
             }
+        }
+        if let Some(gc) = &self.gravity_comp {
+            if self.dof != 7 || self.gravity_model.is_none() {
+                return Err("gravity_comp requires dof == 7 and a gravity_model".into());
+            }
+            gc.validate()?;
         }
         if let Some(g) = &self.grasp { g.validate().map_err(|e| format!("Invalid grasp setup: {e}"))?; }
         if let Some(policy) = &self.resting_pose {
@@ -384,6 +479,7 @@ impl ArmConfig {
             camera_mount: CameraMount::default(),
             gripper_policy: Some(GripperPolicy::rebot_dm()),
             grasp: Some(crate::grasp::GraspSetup::default()),
+            gravity_comp: Some(GravityCompPolicy::rebot_dm()),
         }
     }
 }
@@ -422,6 +518,53 @@ pub struct ArmObservation {
     /// The action a newer one replaced, published for 2 s after the replacement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_action: Option<crate::motion::ActionStatus>,
+    /// `position` (POS_VEL hold / motion) or `gravity_comp` (hand-guiding, any phase).
+    #[serde(default)]
+    pub control_mode: ControlMode,
+    #[serde(default)]
+    pub gravity_comp: GravityCompObservation,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlMode {
+    #[default]
+    Position,
+    GravityComp,
+}
+
+/// A code with a human-readable message (entry blocker or exit reason).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModeReason {
+    pub code: String,
+    pub message: String,
+}
+
+/// Why the last gravity-compensation session ended.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GravityCompExit {
+    pub code: String,
+    pub message: String,
+    /// Observation timestamp of the exit (s).
+    pub at: f64,
+}
+
+/// Gravity-compensation state published with every observation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GravityCompObservation {
+    /// The profile and driver support the mode.
+    pub supported: bool,
+    /// Why entering is refused right now (None when allowed or already active).
+    pub blocker: Option<ModeReason>,
+    /// `ramp_in`, `active`, `exiting` or `exit_failed`; None in position mode.
+    pub phase: Option<String>,
+    /// Feed-forward fade-in progress, 0..1.
+    pub ramp: f32,
+    pub scale: f32,
+    pub damping_kd: Vec<f32>,
+    /// Feed-forward torque sent to J1-J6 this tick (N·m).
+    pub tau_ff: Vec<f32>,
+    pub last_exit: Option<GravityCompExit>,
 }
 
 /// Field description in the observation schema

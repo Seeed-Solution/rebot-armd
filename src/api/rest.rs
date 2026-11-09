@@ -205,6 +205,9 @@ impl From<ArmError> for ApiError {
             ArmError::Unsupported(msg) => {
                 ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg, "UNSUPPORTED".to_string())
             }
+            ArmError::Rejected { status, code, message } => {
+                ApiError(StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT), message, code)
+            }
             ArmError::Internal(msg) => {
                 ApiError(StatusCode::INTERNAL_SERVER_ERROR, msg, "INTERNAL_ERROR".to_string())
             }

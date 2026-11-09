@@ -2,6 +2,7 @@ pub mod api;
 pub mod driver;
 pub mod grasp;
 pub mod gravity;
+pub mod gravity_comp;
 pub mod kinematics;
 pub mod model;
 pub mod motion;
