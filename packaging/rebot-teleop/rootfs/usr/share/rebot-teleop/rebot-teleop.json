@@ -11,6 +11,7 @@
   "rtsp_url": "rtsp://{host}:8554/live0",
   "web_port": 8765,
   "models": [],
+  "requires": ["can"],
   "config_schema": {
     "groups": [
       {
