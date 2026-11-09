@@ -412,7 +412,8 @@ fn f(v: &Value, keys: &[&str]) -> Option<f64> {
 
 /// Detector boxes → normalised boxes. Accepts `[cx, cy, w, h, score, label]` arrays and
 /// objects with `box_norm`, or `format` `xyxy` / `xywh_center` / `xywh_top_left` (as the
-/// cockpit's `parseDetections`). Values above 1.05 are pixels of `size`.
+/// cockpit's `parseDetections`), or centre `x`, `y`, `w`, `h` without `format` (rebot-vision
+/// 1.2). Values above 1.05 are pixels of `size`.
 pub fn parse_detections(raw: &Value, size: [f64; 2]) -> Vec<Detection> {
     let Some(items) = raw.as_array() else { return Vec::new(); };
     let mut out = Vec::new();
@@ -461,6 +462,11 @@ pub fn parse_detections(raw: &Value, size: [f64; 2]) -> Vec<Detection> {
                             },
                         };
                         (label, score, x0 + w / 2.0, y0 + h / 2.0, w, h)
+                    }
+                    // rebot-vision 1.2 (perception API 1) sent centre x, y, w, h without `format`
+                    None if bb.is_none() => {
+                        let (Some(cx), Some(cy), Some(w), Some(h)) = (f(item, &["cx", "x"]), f(item, &["cy", "y"]), f(item, &["w"]), f(item, &["h"])) else { continue };
+                        (label, score, cx, cy, w, h)
                     }
                     _ => continue,
                 }
@@ -1087,10 +1093,13 @@ mod tests {
             [320.0, 180.0, 64.0, 36.0, 0.9, "cup"],
             {"label": "bottle", "score": 0.8, "format": "xyxy", "bbox": [0.1, 0.2, 0.3, 0.4]},
             {"label": "x", "score": 0.5, "bbox": [1, 2, 3, 4]},
-            {"label": "mouse", "score": 0.7, "box_norm": [0.5, 0.5, 0.6, 0.7]}
+            {"label": "mouse", "score": 0.7, "box_norm": [0.5, 0.5, 0.6, 0.7]},
+            {"class_id": 39, "class_name": "bottle", "confidence": 0.71, "x": 0.42, "y": 0.55, "w": 0.08, "h": 0.2}
         ]);
         let d = parse_detections(&raw, [640.0, 360.0]);
-        assert_eq!(d.len(), 3, "{d:?}");
+        assert_eq!(d.len(), 4, "{d:?}");
+        assert_eq!(d[3].label, "bottle", "rebot-vision 1.2 detections carry no format");
+        assert!(d[3].box_norm.iter().zip([0.38, 0.45, 0.46, 0.65]).all(|(a, b)| (a - b).abs() < 1e-9), "{:?}", d[3].box_norm);
         assert_eq!(d[0].label, "cup");
         assert!((d[0].box_norm[0] - 0.45).abs() < 1e-9 && (d[0].box_norm[3] - 0.55).abs() < 1e-9);
         assert!(d[1].box_norm.iter().zip([0.1, 0.2, 0.3, 0.4]).all(|(a, b)| (a - b).abs() < 1e-9));
