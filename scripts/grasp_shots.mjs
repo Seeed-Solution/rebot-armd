@@ -8,6 +8,8 @@
 // Asserts: selection + confirm bar, the grasp command body, phase text and stop button, stop on key
 // input / stop button, the E-stop frame, result toasts, the setup drawer reads and writes, grip-pixel
 // picking, S.grip synced from commanded_positions[6] after gripper / grasp actions, no horizontal scroll.
+// Vision (perception API 2 mock): Detect creates this page's overlay subscription with ["yolo"] and keeps
+// it alive; the grasp (armd triggers its own frames) changes neither the global mode nor the subscription.
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -22,6 +24,7 @@ const LIMITS = [[-3.14159, 3.14159, 2], [-2.0944, 2.0944, 2], [-2.61799, 2.61799
   .map(([a, b, v]) => ({ min_position: a, max_position: b, max_velocity: v }));
 const SETUP = { table_z_m: 0.012, approach_height_m: 0.15, grasp_height_m: 0.015, lift_height_m: 0.12, grip_pixel_norm: [0.52, 0.64], camera_tilt_deg: -20,
   image_size_px: [640, 360], fx_px: 600, fy_px: 600, centre_tol_px: 10 };
+const VCALLS = []; // /api/v1/vision/* requests: [method, path, body]
 const json = (res, o) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
 const srv = http.createServer((req, res) => {
   const u = req.url.split('?')[0];
@@ -30,7 +33,18 @@ const srv = http.createServer((req, res) => {
   if (u === '/api/v1/grasp/setup') return json(res, { supported: true, setup: SETUP, path: '/userdata/rebot-teleop/grasp_setup.json' });
   if (u === '/api/v1/safety/e_stop') return json(res, { safety_state: 'EStop', epoch_id: 2 });
   if (u === '/api/v1/detection/inference') return json(res, { enabled: true, fps: 5, active_fps: 5, idle_fps: 1 });
-  if (u === '/api/v1/vision/mode') return json(res, { api_version: 1, mode: 'yolo', modes: ['off', 'yolo', 'aruco', 'both'], enabled: true, fps: 5, active_fps: 5, idle_fps: 1, available: { yolo: true, aruco: true } });
+  if (u.startsWith('/api/v1/vision/')) {
+    let b = '';
+    req.on('data', (c) => { b += c; });
+    req.on('end', () => {
+      VCALLS.push([req.method, u, b ? JSON.parse(b) : null]);
+      if (u === '/api/v1/vision/mode') return json(res, { api_version: 2, mode: 'off', modes: ['off', 'yolo', 'aruco', 'both'], enabled: false, fps: 5, active_fps: 5, idle_fps: 1,
+        per_request_pipelines: true, subscriptions: true, available: { yolo: true, aruco: true } });
+      if (u === '/api/v1/vision/subscribe') { const j = JSON.parse(b); return json(res, { api_version: 2, id: 's1', client: j.client, pipelines: j.pipelines, fps: 5, ttl_ms: j.ttl_ms }); }
+      return json(res, { api_version: 2, id: 's1' });
+    });
+    return;
+  }
   res.writeHead(404); res.end();
 }).listen(0, '127.0.0.1');
 await new Promise((r) => srv.once('listening', r));
@@ -102,7 +116,6 @@ const feed = (setup) => {
     S.detections = parseDetections(dets, [640, 360]); S.detLastReceivedAt = performance.now();
     const vh = document.getElementById('vhint'); if (vh) vh.classList.add('hide');
   }, 30);
-  detApply({ enabled: true, fps: 5, active_fps: 5, idle_fps: 1 });
 };
 
 const shots = [];
@@ -132,6 +145,13 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
   await page.goto(base + (ui === 'expert' ? '?ui=expert' : ''), { waitUntil: 'domcontentloaded' });
   await page.evaluate(feed, SETUP);
   await page.waitForTimeout(700);
+  // overlay on: this page's subscription with the selected (default YOLO) pipelines
+  VCALLS.length = 0;
+  await page.click('#btn-det');
+  await page.waitForTimeout(300);
+  const sub0 = VCALLS.find(([m, u]) => m === 'POST' && u === '/api/v1/vision/subscribe');
+  check(`${tag} overlay subscription`, sub0 && JSON.stringify(sub0[2].pipelines) === '["yolo"]' && /^cockpit-overlay-/.test(sub0[2].client)
+    && await page.evaluate(() => DET.enabled), JSON.stringify(VCALLS));
 
   // 1. tap the cup box
   const [cx, cy] = await videoPoint(page, 250 / 640, 200 / 360);
@@ -193,6 +213,8 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
   await page.waitForTimeout(250);
   info = await page.evaluate(() => ({ grip: S.grip, toast: [...document.querySelectorAll('#toasts .toast')].map((e) => e.textContent), bar: !document.getElementById('grasp-bar').hidden, gid: GR.id }));
   check(`${tag} result toast`, info.toast.some((x) => x.includes(L.ok)), JSON.stringify(info.toast));
+  const vAfter = VCALLS.filter(([m, u]) => !(m === 'POST' && u === '/api/v1/vision/subscribe/s1/keepalive') && !(m === 'GET'));
+  check(`${tag} grasp leaves vision alone`, vAfter.length === 1 && vAfter[0] === sub0 && VCALLS.some(([, u]) => u.endsWith('/keepalive')), JSON.stringify(VCALLS.filter(([m]) => m !== 'GET')));
   check(`${tag} grip synced after grasp`, Math.abs(info.grip - 1.5 / 5.7) < 0.01, `S.grip ${info.grip}`);
   check(`${tag} bar closed after grasp`, !info.bar && info.gid === null, JSON.stringify(info));
   if (lang === 'zh' && vp === '375x812') { file = path.join(out, `grasp_done_${tag}.png`); await page.screenshot({ path: file }); shots.push(file); }

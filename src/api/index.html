@@ -1596,7 +1596,7 @@ const I18N = {
     'det.tip.on': '物体识别已开启，点击关闭', 'det.tip.off': '物体识别已关闭，点击开启',
     'det.tip.na': '识别服务不可用（检测程序未运行或版本过旧）', 'det.fail': '切换识别失败',
     'vm.label': '视觉模式', 'vm.off': '关', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco', 'vm.both': '两者',
-    'vm.tip': '视觉模式：YOLO 识别物体，ArUco 识别标记，或两者同时运行。选择后开启持续识别，「关」停止识别',
+    'vm.tip': '视觉模式：YOLO 识别物体，ArUco 识别标记，或两者同时运行。选择后本页开启持续识别，「关」停止；不影响其他客户端',
     'vm.tip.na': '视觉模式不可用（视觉服务未运行）', 'vm.fail': '切换视觉模式失败', 'vm.noyolo': 'YOLO 模型未加载，只能使用 ArUco',
     'det.trig': '单次识别', 'det.trig.busy': '识别中…', 'det.trig.tip': '临时开启识别，抓拍一帧结果后恢复原状态',
     'det.trig.none': '单次识别未返回目标', 'det.trig.ok': '单次识别：{n} 个目标', 'det.trig.fail': '单次识别失败', 'det.restore.fail': '识别未能关闭，请手动关闭持续识别',
@@ -1740,7 +1740,7 @@ const I18N = {
     'det.tip.on': 'Object detection is on. Click to turn it off', 'det.tip.off': 'Object detection is off. Click to turn it on',
     'det.tip.na': 'Detection service unavailable (detector not running or too old)', 'det.fail': 'Could not switch detection',
     'vm.label': 'Vision mode', 'vm.off': 'Off', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco', 'vm.both': 'Both',
-    'vm.tip': 'Vision mode: YOLO for objects, ArUco for markers, or both at once. Selecting one turns continuous detection on; Off stops it',
+    'vm.tip': 'Vision mode: YOLO for objects, ArUco for markers, or both at once. Selecting one turns continuous detection on for this page; Off stops it. Other clients are not affected',
     'vm.tip.na': 'Vision mode unavailable (vision service not running)', 'vm.fail': 'Could not switch the vision mode', 'vm.noyolo': 'YOLO model not loaded; only ArUco is available',
     'det.trig': 'Snapshot', 'det.trig.busy': 'Detecting…', 'det.trig.tip': 'Turn detection on briefly, grab one result, then restore the previous state',
     'det.trig.none': 'Snapshot returned no targets', 'det.trig.ok': 'Snapshot: {n} targets', 'det.trig.fail': 'Snapshot failed', 'det.restore.fail': 'Could not switch detection back off, turn it off manually',
@@ -2863,7 +2863,7 @@ function connectDetectionWS() {
   }
   ws.onmessage = (ev) => {
     detWsRetryCount = 0; // Reset backoff only upon receiving active data from upstream
-    if (DET.avail && !DET.enabled) return; // inference off: draw nothing, even if a stale frame arrives
+    if (DET.avail && !DET.enabled && !CALSUB.id) return; // overlay off: draw nothing, even if a stale frame arrives
     if (performance.now() < (S.detHoldUntil || 0)) return; // a snapshot result is on screen
     try {
       const data = JSON.parse(ev.data);
@@ -2921,7 +2921,8 @@ function detClearOverlay() {
 function detApply(data) {
   DET.avail = !!data;
   if (!data) DET.trigCap = null; // re-probe once the detector (possibly upgraded) comes back
-  DET.enabled = !!(data && data.enabled);
+  // perception API 2: "enabled" is this page's overlay subscription, not the provider's default one
+  DET.enabled = VM.subs ? !!(data && OV.on) : !!(data && data.enabled);
   const n = (v) => (Number.isFinite(Number(v)) && v !== null ? Number(v) : null);
   DET.fps = n(data && data.fps); DET.activeFps = n(data && data.active_fps); DET.idleFps = n(data && data.idle_fps);
   if (DET.avail && !DET.enabled) detClearOverlay();
@@ -2982,12 +2983,16 @@ async function detLatest(query) {
     return data;
   } finally { clearTimeout(tm); }
 }
-async function detTriggerReq(waitMs) {
+async function detTriggerReq(waitMs, pipelines) {
   const ctl = new AbortController();
   // armd waits wait_ms + 2 s for the detector; allow a little more for the browser round trip.
   const tm = setTimeout(() => ctl.abort(), waitMs + 3500);
   try {
-    const res = await fetch('/api/v1/detection/trigger?wait_ms=' + waitMs, { method: 'POST', signal: ctl.signal, cache: 'no-store' });
+    // perception API 2 runs exactly these pipelines on the frame; older providers ignore the body
+    const res = await fetch('/api/v1/detection/trigger?wait_ms=' + waitMs, {
+      method: 'POST', signal: ctl.signal, cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(pipelines ? { pipelines } : {}),
+    });
     let data = null;
     try { data = await res.json(); } catch (_) {}
     if (!res.ok || data == null) { const e = new Error((data && data.error) || 'HTTP ' + res.status); e.status = res.status; throw e; }
@@ -3028,7 +3033,7 @@ async function detComposedShot(ctx) {
   }
   return data;
 }
-async function triggerDet({ quiet = false } = {}) {
+async function triggerDet({ quiet = false, pipelines = null } = {}) {
   if (!DET.avail || DET.busy || DET.snap) return null;
   DET.snap = true; renderDetToggle();
   const wasOn = DET.enabled;
@@ -3038,7 +3043,7 @@ async function triggerDet({ quiet = false } = {}) {
     let data = null, viaTrigger = false;
     if (DET.trigCap !== false) {
       try {
-        data = await detTriggerReq(TRIG_WAIT_MS);
+        data = await detTriggerReq(TRIG_WAIT_MS, pipelines || (VM.subs ? vmPipelines(OV.pipes) : null));
         DET.trigCap = true; viaTrigger = true;
       } catch (e) {
         if (e.status !== 404) throw e;
@@ -3089,6 +3094,7 @@ async function refreshDetState() {
 }
 async function toggleDet() {
   if (!DET.avail || DET.busy || DET.snap) return;
+  if (VM.subs) { ovSet(!OV.on); return; }
   DET.busy = true; renderDetToggle();
   try {
     const data = await detRequest('POST', { enabled: !DET.enabled }); DET.busy = false; S.detHoldUntil = 0; detApply(data);
@@ -3118,7 +3124,89 @@ function initDetToggle() {
    mode API, selector hidden). Selecting a mode other than Off also turns continuous inference on; the
    reply carries enabled/fps like /detection/inference and updates the Detect toggle. */
 const VM_MODES = ['off', 'yolo', 'aruco', 'both'];
-const VM = { state: null, mode: null, yolo: true, busy: false };
+// subs: the provider has per-request pipelines and subscriptions (perception API 2); the selector
+// then picks this page's overlay pipelines instead of the provider's global mode
+const VM = { state: null, mode: null, yolo: true, busy: false, subs: false };
+const vmPipelines = (m) => (m === 'both' ? ['yolo', 'aruco'] : [m]);
+
+/* Vision subscriptions (perception API 2): continuous inference per caller, kept alive every
+   SUB_KEEP_MS and expiring SUB_TTL_MS after the last keep-alive (a closed or sleeping tab stops
+   on its own). The overlay holds OVSUB while it is on and the page is visible; the calibration
+   drawer holds CALSUB (ArUco) while it is open. One subscription per client id. */
+const SUB_TTL_MS = 3000, SUB_KEEP_MS = 1000;
+const PAGE_ID = Math.random().toString(36).slice(2, 10);
+const subOf = (name) => ({ client: name + '-' + PAGE_ID, id: null, pipelines: null, timer: null, task: Promise.resolve() });
+const OVSUB = subOf('cockpit-overlay'), CALSUB = subOf('cockpit-calib');
+// overlay preference: on/off and the pipelines the selector picked
+const OV = { on: false, pipes: ['yolo', 'aruco', 'both'].includes(store('rebot.vision.pipes')) ? store('rebot.vision.pipes') : 'yolo' };
+async function subRequest(method, path, body, keepalive = false) {
+  const ctl = new AbortController();
+  const tm = setTimeout(() => ctl.abort(), 4000);
+  try {
+    const res = await fetch('/api/v1/vision/' + path, {
+      method, signal: ctl.signal, cache: 'no-store', keepalive,
+      headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+    if (!res.ok || !data) { const e = new Error((data && data.error) || 'HTTP ' + res.status); e.status = res.status; throw e; }
+    return data;
+  } finally { clearTimeout(tm); }
+}
+async function subPost(sub, pipelines) {
+  const data = await subRequest('POST', 'subscribe', { client: sub.client, pipelines, ttl_ms: SUB_TTL_MS });
+  sub.id = data.id; sub.pipelines = pipelines;
+  return data;
+}
+async function subKeep(sub) {
+  if (!sub.id) return;
+  try { await subRequest('POST', 'subscribe/' + encodeURIComponent(sub.id) + '/keepalive', {}); }
+  catch (e) {
+    // expired (tab asleep, provider restarted): subscribe again under the same client
+    if (e.status === 404 && sub.pipelines) { sub.id = null; try { await subPost(sub, sub.pipelines); } catch (_) {} }
+  }
+}
+/* Hold `sub` with these pipelines (create, or update in place), or drop it with null. Serialised per
+   subscription. Resolves to the error of a failed create, else null. */
+function subHold(sub, pipelines) {
+  sub.task = sub.task.then(async () => {
+    if (!pipelines) {
+      clearInterval(sub.timer); sub.timer = null;
+      const id = sub.id; sub.id = null; sub.pipelines = null;
+      if (id) { try { await subRequest('DELETE', 'subscribe/' + encodeURIComponent(id)); } catch (_) {} }
+      return null;
+    }
+    if (sub.id && sub.pipelines && sub.pipelines.join() === pipelines.join()) return null;
+    try { await subPost(sub, pipelines); } catch (e) { return e; }
+    if (!sub.timer) sub.timer = setInterval(() => { sub.task = sub.task.then(() => subKeep(sub)); }, SUB_KEEP_MS);
+    return null;
+  });
+  return sub.task;
+}
+/* Page closing: fire-and-forget DELETEs that outlive the page (fetch keepalive). */
+function subDropNow(sub) {
+  clearInterval(sub.timer); sub.timer = null;
+  if (sub.id) { subRequest('DELETE', 'subscribe/' + encodeURIComponent(sub.id), undefined, true).catch(() => {}); sub.id = null; }
+}
+/* Bring OVSUB in line with the overlay preference and the page's visibility. */
+async function ovSync() {
+  const want = VM.subs && OV.on && !document.hidden;
+  const err = await subHold(OVSUB, want ? vmPipelines(OV.pipes) : null);
+  if (err && OV.on) {
+    OV.on = false;
+    toast(t(err.status === 409 ? 'vm.noyolo' : 'vm.fail'), 'err', err.status ? String(err.status) : '');
+    await subHold(OVSUB, null);
+  }
+  DET.enabled = !!(DET.avail && OV.on);
+  if (!DET.enabled) detClearOverlay();
+  renderDetToggle();
+}
+function ovSet(on, pipes) {
+  if (pipes) { OV.pipes = pipes; store('rebot.vision.pipes', pipes); }
+  OV.on = on; S.detHoldUntil = 0;
+  return ovSync();
+}
 async function vmRequest(method, body, keepalive = false) {
   const ctl = new AbortController();
   const tm = setTimeout(() => ctl.abort(), 4000);
@@ -3138,6 +3226,8 @@ async function vmRequest(method, body, keepalive = false) {
 }
 function vmApply(data) {
   VM.state = 'ok';
+  const subs = data.subscriptions === true && data.per_request_pipelines === true;
+  if (subs !== VM.subs) { VM.subs = subs; if (subs) ovSync(); }
   VM.mode = VM_MODES.includes(data.mode) ? data.mode : null;
   VM.yolo = !(data.available && data.available.yolo === false);
   if (typeof data.enabled === 'boolean') detApply({ enabled: data.enabled, fps: data.fps, active_fps: data.active_fps, idle_fps: data.idle_fps });
@@ -3156,14 +3246,21 @@ function renderVisionMode() {
   wrap.hidden = VM.state === null || VM.state === 'none';
   const ok = VM.state === 'ok';
   wrap.title = t(ok ? 'vm.tip' : 'vm.tip.na');
+  // perception API 2: the selector shows this page's overlay, Off = overlay off
+  const shown = VM.subs ? (OV.on ? OV.pipes : 'off') : VM.mode;
   for (const b of wrap.querySelectorAll('button[data-vm]')) {
-    const m = b.dataset.vm, on = ok && m === VM.mode;
+    const m = b.dataset.vm, on = ok && m === shown;
     b.classList.toggle('on', on);
     b.setAttribute('aria-checked', String(on));
     b.disabled = !ok || VM.busy || DET.snap || (!VM.yolo && (m === 'yolo' || m === 'both'));
   }
 }
 async function setVisionMode(mode) {
+  if (VM.state === 'ok' && VM.subs && !VM.busy) {
+    VM.busy = true; renderVisionMode();
+    try { await (mode === 'off' ? ovSet(false) : ovSet(true, mode)); } finally { VM.busy = false; renderVisionMode(); }
+    return;
+  }
   if (VM.state !== 'ok' || VM.busy || mode === VM.mode && (mode === 'off' || DET.enabled)) return;
   VM.busy = true; renderVisionMode();
   try {
@@ -3175,10 +3272,20 @@ async function setVisionMode(mode) {
     if (e.status === 502 || e.status === 404) vmFailed(e); else renderVisionMode();
   }
 }
-/* Hand-eye calibration needs markers: while the drawer is open the camera runs ArUco (Both when YOLO
-   was on) with continuous inference, and the previous mode is restored on close or page hide. */
-const CALVM = { prev: null, task: Promise.resolve() };
+/* Hand-eye calibration needs markers for its live preview. Perception API 2: the drawer holds its own
+   ArUco subscription while it is open and the page is visible; nothing global changes. API 1: the
+   camera runs ArUco (Both when YOLO was on) with continuous inference, and the previous mode is
+   restored on close or page hide. */
+const CALVM = { prev: null, task: Promise.resolve(), open: false };
 function calVisionMode(open) {
+  CALVM.open = open;
+  if (VM.subs) {
+    CALVM.task = CALVM.task.then(async () => {
+      const err = await subHold(CALSUB, open && !document.hidden ? ['aruco'] : null);
+      if (err) toast(t('vm.fail'), 'warn', err.status ? String(err.status) : '');
+    });
+    return CALVM.task;
+  }
   CALVM.task = CALVM.task.then(async () => {
     if (open) {
       if (CALVM.prev) return;
@@ -3199,8 +3306,17 @@ function calVisionMode(open) {
 function initVisionMode() {
   $('vmode').addEventListener('click', (e) => { const b = e.target.closest('button[data-vm]'); if (b) setVisionMode(b.dataset.vm); });
   i18nHooks.push(renderVisionMode);
-  // a closed tab must not leave the camera in the calibration mode
-  window.addEventListener('pagehide', () => { if (CALVM.prev) { vmRequest('POST', CALVM.prev, true).catch(() => {}); CALVM.prev = null; } });
+  // a closed tab must not leave the camera in the calibration mode, nor keep its subscriptions
+  window.addEventListener('pagehide', () => {
+    if (CALVM.prev) { vmRequest('POST', CALVM.prev, true).catch(() => {}); CALVM.prev = null; }
+    subDropNow(OVSUB); subDropNow(CALSUB);
+  });
+  // a hidden page infers nothing for itself: drop the subscriptions, take them again when visible
+  document.addEventListener('visibilitychange', () => {
+    if (!VM.subs) return;
+    ovSync();
+    subHold(CALSUB, CALVM.open && !document.hidden ? ['aruco'] : null);
+  });
 }
 
 /* =================================================================
@@ -3755,7 +3871,7 @@ async function calCapture() {
     const pos = S.obs.positions.slice(); // snapshot before the (1-4 s) detection so frame and pose belong together
     let pk = calMarker({ freshOnly: true }), source = 'stream';
     if (!pk.m && DET.avail) {
-      const parsed = await triggerDet({ quiet: true });
+      const parsed = await triggerDet({ quiet: true, pipelines: ['aruco'] });
       if (Array.isArray(parsed)) { pk = { ...calPick(parsed), age: null }; source = 'snapshot'; }
     }
     const m = pk.m;
@@ -6484,7 +6600,7 @@ function renderCart(live, op) {
 
 // Expose core detection & overlay symbols for testing and telemetry inspection
 window.parseDetections = parseDetections;
-window.__vision = { VM, CALVM, calVisionMode, setVisionMode, vmRefresh };
+window.__vision = { VM, CALVM, OV, OVSUB, CALSUB, calVisionMode, setVisionMode, vmRefresh, ovSet };
 window.getVideoContentRect = getVideoContentRect;
 window.fitCanvas = fitCanvas;
 window.drawOverlay = drawOverlay;
