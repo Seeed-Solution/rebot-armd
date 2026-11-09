@@ -197,6 +197,9 @@ static void test_trigger_each_mode() {
         CHECK(!c.processing() && !c.continuous_enabled() && c.mode() == m);
         CHECK(c.current_fps() == 1);
         CHECK(calls.v.back() == std::make_pair(false, 1));
+        // the frame that served the trigger (or one planned just before trigger_end) can still
+        // be counting; after that nothing runs
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
         const int after = cam.processed;
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
         CHECK(cam.processed == after);
