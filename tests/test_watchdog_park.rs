@@ -47,7 +47,7 @@ async fn lease_expiry_while_torqued_parks_then_cuts_torque_to_idle() {
     assert!(!obs.safety_state.is_stopped(), "healthy arm must park, not fault: {:?}", obs.safety_state);
     {
         let inner = supervisor.inner().read().await;
-        assert!(inner.pending_normal_unload && inner.watchdog_park_deadline.is_some());
+        assert!(inner.pending_normal_unload && inner.watchdog_park.is_some());
         assert_eq!(inner.target_positions, vec![0.0, 0.0]);
     }
     for _ in 0..200 { supervisor.tick(0.05).await; }
@@ -55,7 +55,7 @@ async fn lease_expiry_while_torqued_parks_then_cuts_torque_to_idle() {
     assert_eq!(obs.safety_state, SafetyState::Idle);
     assert!(!obs.is_torqued, "park must end with torque off");
     assert!(obs.positions.iter().all(|p| p.abs() < 1e-3), "torque cut only at home: {:?}", obs.positions);
-    assert!(supervisor.inner().read().await.watchdog_park_deadline.is_none());
+    assert!(supervisor.inner().read().await.watchdog_park.is_none());
 }
 
 #[tokio::test]
@@ -86,7 +86,7 @@ async fn new_lease_during_park_takes_over_and_can_move() {
         assert!(inner.pending_normal_unload);
         inner.acquire_lease("client-b").expect("lease must not be refused during a park");
         assert!(!inner.pending_normal_unload && inner.active_trajectory.is_none());
-        assert!(inner.watchdog_park_deadline.is_none());
+        assert!(inner.watchdog_park.is_none());
     }
     for _ in 0..50 {
         supervisor.heartbeat("client-b", supervisor.get_observation().await.epoch_id).await.unwrap();
@@ -105,7 +105,7 @@ async fn preempting_lease_during_park_cancels_it() {
     let mut inner = supervisor.inner().write().await;
     assert!(inner.pending_normal_unload);
     inner.preempt_lease("conn-c", "cockpit").expect("preempt must not be refused during a park");
-    assert!(!inner.pending_normal_unload && inner.watchdog_park_deadline.is_none());
+    assert!(!inner.pending_normal_unload && inner.watchdog_park.is_none());
     assert!(inner.is_torqued && !inner.safety.state().is_stopped());
 }
 
@@ -194,7 +194,7 @@ async fn park_that_cannot_reach_rest_falls_back_to_fault_without_cutting_torque(
     assert!(supervisor.inner().read().await.pending_normal_unload);
     for _ in 0..120 { supervisor.tick(0.02).await; }
     assert!(supervisor.get_observation().await.is_torqued, "never torque-off away from the resting pose");
-    supervisor.inner().write().await.watchdog_park_deadline = Some(Instant::now());
+    supervisor.inner().write().await.watchdog_park = Some(armd::supervisor::WatchdogPark { elapsed_s: 10.0, budget_s: 10.0, grace_granted: false });
     let obs = supervisor.tick(0.02).await;
     assert!(matches!(obs.safety_state, SafetyState::Fault(FaultReason::WatchdogTimeout)), "{:?}", obs.safety_state);
     assert!(obs.is_torqued);
@@ -239,7 +239,7 @@ async fn closing_socket_after_lease_expired_does_not_cancel_watchdog_park() {
     let mut ws = ws_lease(addr).await;
     let obs = expire_lease(&supervisor).await;
     assert!(!obs.safety_state.is_stopped(), "{:?}", obs.safety_state);
-    assert!(supervisor.inner().read().await.watchdog_park_deadline.is_some(), "watchdog park started");
+    assert!(supervisor.inner().read().await.watchdog_park.is_some(), "watchdog park started");
     for _ in 0..3 { supervisor.tick(0.02).await; }
 
     ws.close(None).await.unwrap();
@@ -249,7 +249,7 @@ async fn closing_socket_after_lease_expired_does_not_cancel_watchdog_park() {
     {
         let inner = supervisor.inner().read().await;
         assert!(inner.pending_normal_unload, "socket close of an expired lease cancelled the watchdog park");
-        assert!(inner.watchdog_park_deadline.is_some());
+        assert!(inner.watchdog_park.is_some());
     }
     for _ in 0..200 { supervisor.tick(0.05).await; }
     let obs = supervisor.get_observation().await;
@@ -291,7 +291,7 @@ async fn lease_expiry_mid_action_then_close_still_parks_to_idle() {
     for _ in 0..5 { supervisor.tick(0.02).await; }
     let obs = expire_lease(&supervisor).await;
     assert_eq!(obs.action.as_ref().map(|a| a.state.as_str()), Some("failed"));
-    assert!(supervisor.inner().read().await.watchdog_park_deadline.is_some());
+    assert!(supervisor.inner().read().await.watchdog_park.is_some());
     for _ in 0..3 { supervisor.tick(0.02).await; }
     drop(ws);
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -341,7 +341,7 @@ async fn ws_heartbeats_renew_lease_across_jog_unload_torque_cycles() {
             ws.send(tokio_tungstenite::tungstenite::Message::Text(hb.to_string().into())).await.unwrap();
             for _ in 0..3 { supervisor.tick(0.05).await; tokio::time::sleep(Duration::from_millis(16)).await; }
             let inner = supervisor.inner().read().await;
-            assert!(inner.watchdog_park_deadline.is_none() && !inner.safety.state().is_stopped(),
+            assert!(inner.watchdog_park.is_none() && !inner.safety.state().is_stopped(),
                 "lease watchdog fired: {:?}", inner.safety.state());
         }
     }

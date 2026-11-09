@@ -65,10 +65,55 @@ pub const GRIPPER_STALL_RELEASE_NM: f32 = 0.2223;
 /// a real power loss drops the arm regardless of this bound.
 pub const BUS_LOSS_TIMEOUT: Duration = Duration::from_millis(500);
 /// Lower bound for the automatic park started by an expired lease (trajectory + settle).
-/// The actual deadline is `max(WATCHDOG_PARK_TIMEOUT, planned duration + WATCHDOG_PARK_MARGIN)`.
+/// The actual budget is `max(WATCHDOG_PARK_TIMEOUT, deceleration + planned duration +
+/// UNLOAD_SETTLE_HOLD + WATCHDOG_PARK_MARGIN)`, counted in control-loop time.
 pub const WATCHDOG_PARK_TIMEOUT: Duration = Duration::from_secs(10);
-/// Settle and slack added to the planned park duration for the watchdog deadline.
+/// Tracking lag and slack added to the watchdog park budget.
 pub const WATCHDOG_PARK_MARGIN: Duration = Duration::from_secs(3);
+/// Extra time granted once when the watchdog park budget runs out with the arm at the
+/// resting pose (position, support torque, enable and feedback all pass) and only the
+/// stationary check pending. A blocked or unsupported arm gets no grace.
+pub const WATCHDOG_PARK_SETTLE_GRACE: Duration = Duration::from_secs(5);
+/// Time the arm must stay at the resting pose before an unload cuts torque.
+pub const UNLOAD_SETTLE_HOLD: Duration = Duration::from_millis(800);
+/// Stationary evidence over the settle hold window, per joint: max - min measured
+/// position (rad). 4 mrad in 0.8 s bounds the average speed at 0.005 rad/s.
+pub const UNLOAD_STILL_POSITION_SPAN_RAD: f32 = 0.004;
+/// Per-sample |velocity| bound during the settle hold, as a multiple of the joint's
+/// resting-pose velocity limit (J1-J3: 0.02 rad/s = 4 LSB at VMAX 10). The window mean
+/// must stay within the limit itself.
+pub const UNLOAD_STILL_VELOCITY_PEAK_FACTOR: f32 = 4.0;
+/// The mean velocity over this most recent part of the settle window must also stay within
+/// the resting-pose limit, so motion starting late in the window blocks the release
+/// before it accumulates the position span.
+pub const UNLOAD_STILL_RECENT: Duration = Duration::from_millis(300);
+/// A settle pending longer than the hold plus this logs its blocker, at most once per second.
+const UNLOAD_SETTLE_REPORT_AFTER_S: f64 = 1.0;
+
+/// Settle phase of a NormalUnload after its trajectory finished.
+#[derive(Debug, Clone, Default)]
+pub struct UnloadSettle {
+    /// Time in the settle phase (s, control-loop time).
+    pub pending_s: f64,
+    /// Time from the first to the latest sample of the current run of samples that met
+    /// the static resting-pose conditions (s).
+    pub held_s: f64,
+    /// `pending_s` of the first sample of that run.
+    pub held_since_s: Option<f64>,
+    /// (time, positions, velocities) over the last [`UNLOAD_SETTLE_HOLD`] while held.
+    pub samples: std::collections::VecDeque<(f64, Vec<f32>, Vec<f32>)>,
+    /// `pending_s` of the last blocker report.
+    pub last_report_s: Option<f64>,
+}
+
+/// Park started by the lease watchdog: elapsed control-loop time against its budget.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatchdogPark {
+    pub elapsed_s: f64,
+    pub budget_s: f64,
+    /// True once [`WATCHDOG_PARK_SETTLE_GRACE`] was added to the budget.
+    pub grace_granted: bool,
+}
 
 /// Active WebSocket client lease record
 #[derive(Debug, Clone, PartialEq)]
@@ -128,9 +173,9 @@ pub struct SupervisorInner {
     pub gripper_low_torque_ticks: u32,
     pub gripper_stall_sign: f32,
     pub pending_normal_unload: bool,
-    pub unload_settle_ticks: Option<u32>,
-    /// Set while a park started by the lease watchdog is running; its deadline.
-    pub watchdog_park_deadline: Option<Instant>,
+    pub unload_settle: Option<UnloadSettle>,
+    /// Set while a park started by the lease watchdog is running.
+    pub watchdog_park: Option<WatchdogPark>,
     /// Duration of the most recently planned NormalUnload trajectory (s).
     pub unload_planned_duration: Option<f64>,
     pub recorder: EpisodeRecorder,
@@ -225,8 +270,8 @@ impl SupervisorInner {
             gripper_low_torque_ticks: 0,
             gripper_stall_sign: 1.0,
             pending_normal_unload: false,
-            unload_settle_ticks: None,
-            watchdog_park_deadline: None,
+            unload_settle: None,
+            watchdog_park: None,
             unload_planned_duration: None,
             recorder: EpisodeRecorder::new(),
             start_time: now,
@@ -338,7 +383,7 @@ impl SupervisorInner {
         self.servo_settled_ticks.fill(0);
         self.active_trajectory = None;
         self.pending_normal_unload = false;
-        self.unload_settle_ticks = None;
+        self.unload_settle = None;
         self.target_positions = self.commanded_positions.clone();
     }
 
@@ -398,18 +443,35 @@ impl SupervisorInner {
         self.resting_pose_violation().is_none()
     }
 
-    /// The first resting-pose condition that fails, or `None` when the arm may be released.
+    /// The resting-pose conditions that fail on the current sample, or `None` when the arm
+    /// may be released. Velocity is judged on this one sample.
     fn resting_pose_violation(&self) -> Option<String> {
+        self.resting_pose_static_violation().or_else(|| {
+            let policy = self.resting_policy()?;
+            let moving: Vec<String> = self.measured_velocities.iter().enumerate()
+                .filter(|(i, v)| !v.is_finite() || v.abs() > policy.max_velocity_of(*i))
+                .map(|(i, v)| format!("joint {} moving at {v:.4} rad/s (limit {})", i + 1, policy.max_velocity_of(i)))
+                .collect();
+            (!moving.is_empty()).then(|| moving.join("; "))
+        })
+    }
+
+    fn resting_policy(&self) -> Option<RestingPosePolicy> {
+        match &self.config.resting_pose {
+            Some(policy) => Some(policy.clone()),
+            None if self.driver.is_none() => Some(RestingPosePolicy::rebot_dm()),
+            None => None,
+        }
+    }
+
+    /// Every resting-pose condition except stationarity: feedback, enable state, position,
+    /// support torque. Lists every failing joint with its value.
+    fn resting_pose_static_violation(&self) -> Option<String> {
         let dof = self.config.dof;
         if self.measured_positions.len() != dof || self.measured_velocities.len() != dof {
             return Some("feedback length does not match dof".into());
         }
-        let simulation_policy = RestingPosePolicy::rebot_dm();
-        let policy = match &self.config.resting_pose {
-            Some(policy) => policy,
-            None if self.driver.is_none() => &simulation_policy,
-            None => return Some("no resting pose configured".into()),
-        };
+        let Some(policy) = self.resting_policy() else { return Some("no resting pose configured".into()); };
         if let Some(ref d) = self.driver {
             let Ok(drv) = d.lock() else { return Some("driver lock poisoned".into()); };
             let caps = drv.capabilities();
@@ -424,32 +486,70 @@ impl SupervisorInner {
                 return Some(format!("feedback older than {} ms", policy.feedback_max_age_ms));
             }
         }
+        let mut failures = Vec::new();
         let mut total = 0.0;
         for (i, tolerance) in policy.position_tolerances.iter().enumerate().take(dof) {
             let dev = (self.measured_positions[i] - self.config.home_positions[i]).abs();
             if !dev.is_finite() || dev > *tolerance {
-                return Some(format!("joint {} off home by {dev:.4} rad (limit {tolerance})", i + 1));
+                failures.push(format!("joint {} off home by {dev:.4} rad (limit {tolerance})", i + 1));
             }
             total += dev;
         }
-        if total > policy.max_total_deviation {
-            return Some(format!("total deviation {total:.4} rad (limit {})", policy.max_total_deviation));
-        }
-        if let Some((i, v)) = self.measured_velocities.iter().enumerate()
-            .find(|(i, v)| !v.is_finite() || v.abs() > policy.max_velocity_of(*i))
-        {
-            return Some(format!("joint {} moving at {v:.4} rad/s (limit {})", i + 1, policy.max_velocity_of(i)));
+        if failures.is_empty() && total > policy.max_total_deviation {
+            failures.push(format!("total deviation {total:.4} rad (limit {})", policy.max_total_deviation));
         }
         if self.driver.is_some() {
             for &(i, max_tau) in &policy.support_torque_limits {
                 if i >= dof { return Some(format!("support torque index {i} out of range")); }
                 let tau = self.torques.get(i).copied().unwrap_or(f32::NAN);
                 if !tau.is_finite() || tau.abs() > max_tau {
-                    return Some(format!("joint {} torque {tau:.2} Nm (limit {max_tau})", i + 1));
+                    failures.push(format!("joint {} torque {tau:.2} Nm (limit {max_tau})", i + 1));
                 }
             }
         }
-        None
+        (!failures.is_empty()).then(|| failures.join("; "))
+    }
+
+    /// Stationary check over the settle hold window: per joint, the position span, the
+    /// mean velocity over the window and over its last [`UNLOAD_STILL_RECENT`], and every
+    /// velocity sample. A single quantized velocity sample above
+    /// the resting-pose limit is noise when the position does not move and the mean holds.
+    fn unload_still_violation(&self, settle: &UnloadSettle) -> Option<String> {
+        let policy = self.resting_policy()?;
+        let hold = UNLOAD_SETTLE_HOLD.as_secs_f64();
+        if settle.held_s + 1e-6 < hold || settle.samples.is_empty() {
+            return Some(format!("held {:.2} s of {hold:.2} s", settle.held_s));
+        }
+        let n = settle.samples.len() as f32;
+        let recent_from = settle.pending_s - UNLOAD_STILL_RECENT.as_secs_f64() - 1e-6;
+        let mut failures = Vec::new();
+        for i in 0..self.config.dof {
+            let (mut lo, mut hi, mut sum, mut peak) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f32, 0.0f32);
+            let (mut recent_sum, mut recent_n) = (0.0f32, 0u32);
+            for (t, q, v) in &settle.samples {
+                let (q, v) = (q.get(i).copied().unwrap_or(f32::NAN), v.get(i).copied().unwrap_or(f32::NAN));
+                if !q.is_finite() || !v.is_finite() { return Some(format!("joint {} non-finite feedback", i + 1)); }
+                lo = lo.min(q); hi = hi.max(q); sum += v; peak = peak.max(v.abs());
+                if *t >= recent_from { recent_sum += v; recent_n += 1; }
+            }
+            let limit = policy.max_velocity_of(i);
+            let (span, mean) = (hi - lo, sum / n);
+            let recent = recent_sum / recent_n.max(1) as f32;
+            if recent.abs() > limit {
+                failures.push(format!("joint {} mean velocity over the last {} ms {recent:.4} rad/s (limit {limit})",
+                    i + 1, UNLOAD_STILL_RECENT.as_millis()));
+            }
+            if span > UNLOAD_STILL_POSITION_SPAN_RAD {
+                failures.push(format!("joint {} moved {span:.4} rad in {hold:.1} s (limit {UNLOAD_STILL_POSITION_SPAN_RAD})", i + 1));
+            }
+            if mean.abs() > limit {
+                failures.push(format!("joint {} mean velocity {mean:.4} rad/s (limit {limit})", i + 1));
+            }
+            if peak > limit * UNLOAD_STILL_VELOCITY_PEAK_FACTOR {
+                failures.push(format!("joint {} velocity peak {peak:.4} rad/s (limit {})", i + 1, limit * UNLOAD_STILL_VELOCITY_PEAK_FACTOR));
+            }
+        }
+        (!failures.is_empty()).then(|| failures.join("; "))
     }
 
     pub fn set_torque(&mut self, enable: bool) -> Result<SafetyState, SafetyError> {
@@ -556,8 +656,8 @@ impl SupervisorInner {
             if self.driver.is_none() { self.measured_velocities.fill(0.0); }
             self.active_trajectory = None;
             self.pending_normal_unload = false;
-            self.unload_settle_ticks = None;
-            self.watchdog_park_deadline = None;
+            self.unload_settle = None;
+            self.watchdog_park = None;
             self.servo_target = None;
 
             let state = self.safety.set_torque(true)?;
@@ -569,30 +669,38 @@ impl SupervisorInner {
             self.last_motion_frame = now;
             Ok(state)
         } else {
-            if self.safety.state().is_stopped() || self.e_stop_latched.load(Ordering::SeqCst) {
-                return Err(SafetyError::MotionForbiddenInFaultState(
-                    "Cannot disable torque in EStop or Fault. Call clear_fault first.".into(),
-                ));
-            }
-
-            if let Some(reason) = self.resting_pose_violation() {
-                tracing::warn!("Torque off refused, not at resting pose: {reason}");
-                return Err(SafetyError::ArmNotAtRestingPose {
-                    current: self.measured_positions.clone(),
-                    expected: self.config.home_positions.clone(),
-                });
-            }
-
-            self.stop_motion();
-            self.commanded_velocities.fill(0.0);
-            if let Err(error) = self.request_disable() {
-                self.safety.trigger_fault(FaultReason::Other(error.to_string()));
-                return Err(error);
-            }
-            let state = self.safety.set_torque(false)?;
-            if self.driver.is_none() { self.measured_velocities.fill(0.0); }
-            Ok(state)
+            self.torque_off(false)
         }
+    }
+
+    /// Torque off at the resting pose. `stillness_verified` is set by the unload settle,
+    /// which judged stationarity over its hold window; otherwise the current velocity
+    /// sample must be within the resting-pose limit.
+    fn torque_off(&mut self, stillness_verified: bool) -> Result<SafetyState, SafetyError> {
+        if self.safety.state().is_stopped() || self.e_stop_latched.load(Ordering::SeqCst) {
+            return Err(SafetyError::MotionForbiddenInFaultState(
+                "Cannot disable torque in EStop or Fault. Call clear_fault first.".into(),
+            ));
+        }
+
+        let violation = if stillness_verified { self.resting_pose_static_violation() } else { self.resting_pose_violation() };
+        if let Some(reason) = violation {
+            tracing::warn!("Torque off refused, not at resting pose: {reason}");
+            return Err(SafetyError::ArmNotAtRestingPose {
+                current: self.measured_positions.clone(),
+                expected: self.config.home_positions.clone(),
+            });
+        }
+
+        self.stop_motion();
+        self.commanded_velocities.fill(0.0);
+        if let Err(error) = self.request_disable() {
+            self.safety.trigger_fault(FaultReason::Other(error.to_string()));
+            return Err(error);
+        }
+        let state = self.safety.set_torque(false)?;
+        if self.driver.is_none() { self.measured_velocities.fill(0.0); }
+        Ok(state)
     }
 
     /// Automatic unload requires a configured resting pose and observable
@@ -629,7 +737,7 @@ impl SupervisorInner {
                     tracing::warn!("NormalUnload rejected in EStop or Fault state; maintaining holding torque");
                     if self.is_torqued {
                         self.pending_normal_unload = false;
-                        self.unload_settle_ticks = None;
+                        self.unload_settle = None;
                         self.active_trajectory = None;
                         self.servo_target = None;
                     }
@@ -676,7 +784,7 @@ impl SupervisorInner {
                         self.active_trajectory = Some(ActiveTrajectory::quintic(traj, None));
                         self.target_positions = home;
                         self.pending_normal_unload = true;
-                        self.unload_settle_ticks = None;
+                        self.unload_settle = None;
                         let now = Instant::now();
                         self.last_heartbeat = now;
                         self.last_motion_frame = now;
@@ -688,14 +796,14 @@ impl SupervisorInner {
                 if self.is_torqued {
                     tracing::warn!("NormalUnload cannot plan motion or arm not operational; maintaining holding torque to prevent dropping arm");
                     self.pending_normal_unload = false;
-                    self.unload_settle_ticks = None;
+                    self.unload_settle = None;
                     self.active_trajectory = None;
                     self.servo_target = None;
                     return;
                 }
                 // If not torqued, ensure state is clean
                 self.pending_normal_unload = false;
-                self.unload_settle_ticks = None;
+                self.unload_settle = None;
                 self.is_torqued = false;
                 self.active_trajectory = None;
                 self.commanded_velocities = vec![0.0; self.config.dof];
@@ -715,7 +823,7 @@ impl SupervisorInner {
                 // Immediate rigid lock at current position, latch E-Stop, advance epoch
                 // Maintain active restorative torque hold: do NOT cut power or set is_torqued=false
                 self.pending_normal_unload = false;
-                self.unload_settle_ticks = None;
+                self.unload_settle = None;
                 self.active_trajectory = None;
                 self.servo_target = None;
                 let hold_pos = if self.measured_positions.iter().all(|p| p.is_finite())
@@ -749,7 +857,7 @@ impl SupervisorInner {
                 // Bus loss / disconnect: hold position locked, latch fault, advance epoch
                 // Maintain holding torque: DO NOT disable hardware torque to prevent gravitational collapse!
                 self.pending_normal_unload = false;
-                self.unload_settle_ticks = None;
+                self.unload_settle = None;
                 self.active_trajectory = None;
                 self.servo_target = None;
                 let hold_pos = if self.measured_positions.iter().all(|p| p.is_finite())
@@ -978,19 +1086,56 @@ impl SupervisorInner {
     /// A new lease owner takes over from a running watchdog park: the park's
     /// motion is cancelled like any other queued motion and the arm brakes to a hold.
     fn cancel_watchdog_park_for_new_lease(&mut self, client_id: &str) {
-        if self.watchdog_park_deadline.take().is_some() && self.pending_normal_unload {
+        if self.watchdog_park.take().is_some() && self.pending_normal_unload {
             tracing::info!("Watchdog park cancelled: new lease acquired by {client_id}; holding position");
             self.stop_motion();
         }
     }
 
-    /// Deadline for a watchdog park: the planned park duration plus settle margin,
-    /// never less than [`WATCHDOG_PARK_TIMEOUT`].
+    /// Budget for a watchdog park, in control-loop time: deceleration of the physical arm
+    /// from its measured velocity (max over joints of |v| / planning acceleration), the
+    /// planned park duration (which already starts from the commanded velocity), the
+    /// settle hold and [`WATCHDOG_PARK_MARGIN`]; never less than [`WATCHDOG_PARK_TIMEOUT`].
     pub fn watchdog_park_timeout(&self) -> Duration {
+        let decel = self.measured_velocities.iter().zip(self.planning_limits())
+            .filter(|(v, l)| v.is_finite() && l.max_acceleration > 1e-6)
+            .map(|(v, l)| f64::from(v.abs() / l.max_acceleration))
+            .fold(0.0, f64::max);
         let planned = self.unload_planned_duration
             .filter(|d| d.is_finite() && *d >= 0.0)
-            .map_or(Duration::ZERO, |d| Duration::from_secs_f64(d.min(3600.0)) + WATCHDOG_PARK_MARGIN);
+            .map_or(Duration::ZERO, |d| Duration::from_secs_f64((decel + d).min(3600.0)) + UNLOAD_SETTLE_HOLD + WATCHDOG_PARK_MARGIN);
         planned.max(WATCHDOG_PARK_TIMEOUT)
+    }
+
+    /// Advance a running watchdog park by `dt`. When the budget runs out with the arm at the
+    /// resting pose and only the stationary check pending, the budget is extended once by
+    /// [`WATCHDOG_PARK_SETTLE_GRACE`]; otherwise torque is held and WatchdogTimeout latched.
+    fn supervise_watchdog_park(&mut self, dt: f64) {
+        let Some(mut park) = self.watchdog_park.take() else { return; };
+        if !self.pending_normal_unload {
+            tracing::warn!("Watchdog park interrupted (safety state {:?})", self.safety.state());
+            if self.is_torqued && !self.safety.state().is_stopped() {
+                self.latch_watchdog_fault();
+            }
+            return;
+        }
+        if dt.is_finite() && dt > 0.0 { park.elapsed_s += dt; }
+        if park.elapsed_s < park.budget_s {
+            self.watchdog_park = Some(park);
+            return;
+        }
+        let blocker = self.unload_settle_blocker().unwrap_or_else(|| "settle pending".into());
+        let at_pose = self.active_trajectory.is_none() && self.resting_pose_static_violation().is_none();
+        if at_pose && !park.grace_granted {
+            tracing::warn!("Watchdog park at the resting pose after {:.2} s but not settled ({blocker}); waiting up to {:?} more",
+                park.elapsed_s, WATCHDOG_PARK_SETTLE_GRACE);
+            park.budget_s += WATCHDOG_PARK_SETTLE_GRACE.as_secs_f64();
+            park.grace_granted = true;
+            self.watchdog_park = Some(park);
+            return;
+        }
+        tracing::warn!("Watchdog park did not finish within {:.2} s ({blocker}); holding torque and latching WatchdogTimeout", park.budget_s);
+        self.latch_watchdog_fault();
     }
 
     /// Conditions for parking automatically when the lease watchdog expires.
@@ -1019,9 +1164,9 @@ impl SupervisorInner {
         } else {
             self.commanded_positions.clone()
         };
-        self.watchdog_park_deadline = None;
+        self.watchdog_park = None;
         self.pending_normal_unload = false;
-        self.unload_settle_ticks = None;
+        self.unload_settle = None;
         self.active_trajectory = None;
         self.servo_target = None; self.servo_settled_ticks.fill(0);
         self.target_positions = hold_pos.clone();
@@ -1499,7 +1644,7 @@ impl SupervisorInner {
             SafetyState::EStop => Some(("failed", "ESTOP_ACTIVE", "E-stop latched".into())),
             SafetyState::Fault(FaultReason::WatchdogTimeout) => Some(("failed", "WATCHDOG", "Lease watchdog expired".into())),
             SafetyState::Fault(r) => Some(("failed", "FAULT", match r { FaultReason::Other(m) => m.clone(), r => format!("{r:?}") })),
-            _ if kind != "park" && self.watchdog_park_deadline.is_some() => Some(("failed", "WATCHDOG", "Lease watchdog expired; parking".into())),
+            _ if kind != "park" && self.watchdog_park.is_some() => Some(("failed", "WATCHDOG", "Lease watchdog expired; parking".into())),
             _ if lease_now != self.action_lease_generation => Some(("cancelled", "LEASE_LOST", "Control lease lost or released".into())),
             _ => None,
         };
@@ -1726,6 +1871,64 @@ impl SupervisorInner {
         self.safety.trigger_fault(reason);
     }
 
+    /// One control tick of the unload settle: the static resting-pose conditions must hold
+    /// continuously for [`UNLOAD_SETTLE_HOLD`] and the arm must be stationary over that
+    /// window ([`Self::unload_still_violation`]); then torque is cut. A settle pending past
+    /// the hold logs which condition blocks it, at most once per second.
+    fn step_unload_settle(&mut self, dt: f64) {
+        let mut settle = self.unload_settle.take().unwrap_or_default();
+        settle.pending_s += dt;
+        let static_violation = self.resting_pose_static_violation();
+        if static_violation.is_none() {
+            let since = *settle.held_since_s.get_or_insert(settle.pending_s);
+            settle.held_s = settle.pending_s - since;
+            settle.samples.push_back((settle.pending_s, self.measured_positions.clone(), self.measured_velocities.clone()));
+            let oldest = settle.pending_s - UNLOAD_SETTLE_HOLD.as_secs_f64() - 1e-6;
+            while settle.samples.front().is_some_and(|(t, _, _)| *t < oldest) { settle.samples.pop_front(); }
+        } else {
+            settle.held_s = 0.0;
+            settle.held_since_s = None;
+            settle.samples.clear();
+        }
+        let blocker = static_violation.or_else(|| self.unload_still_violation(&settle));
+        let Some(blocker) = blocker else {
+            self.pending_normal_unload = false;
+            tracing::info!("Arm settled cleanly at home position for {} ms after {:.2} s; safely cutting torque to Standby/Idle.",
+                UNLOAD_SETTLE_HOLD.as_millis(), settle.pending_s);
+            let watchdog_park = self.watchdog_park.take().is_some();
+            match self.torque_off(true) {
+                Ok(_) if watchdog_park => tracing::info!("Watchdog park complete: torque off at resting pose"),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("Failed to cut torque after normal unload settle: {}", e);
+                    self.safety.mark_motion_finished();
+                    if watchdog_park && self.is_torqued && !self.safety.state().is_stopped() {
+                        tracing::warn!("Watchdog park failed at torque off; holding torque and latching WatchdogTimeout");
+                        self.latch_watchdog_fault();
+                    }
+                }
+            }
+            return;
+        };
+        let report_after = UNLOAD_SETTLE_HOLD.as_secs_f64() + UNLOAD_SETTLE_REPORT_AFTER_S;
+        if settle.pending_s >= report_after && settle.last_report_s.is_none_or(|t| settle.pending_s - t >= 1.0) {
+            tracing::warn!("Unload settle pending for {:.1} s: {blocker}", settle.pending_s);
+            settle.last_report_s = Some(settle.pending_s);
+        }
+        // Not yet stably at rest: hold the home target.
+        self.commanded_positions = self.config.home_positions.clone();
+        self.target_positions = self.config.home_positions.clone();
+        self.commanded_velocities = vec![0.0; self.config.dof];
+        self.unload_settle = Some(settle);
+    }
+
+    /// Blocker of a pending unload settle, for watchdog reporting.
+    fn unload_settle_blocker(&self) -> Option<String> {
+        if self.active_trajectory.is_some() { return Some("park trajectory still running".into()); }
+        self.resting_pose_static_violation()
+            .or_else(|| self.unload_settle.as_ref().and_then(|s| self.unload_still_violation(s)))
+    }
+
     pub fn tick(&mut self, dt: f64) -> ArmObservation {
         // Immediate atomic e-stop latch check before any processing
         if self.e_stop_latched.load(Ordering::SeqCst) && !self.safety.state().is_stopped() {
@@ -1901,7 +2104,7 @@ impl SupervisorInner {
                             self.commanded_positions.clone()
                         };
                         self.pending_normal_unload = false;
-                        self.unload_settle_ticks = None;
+                        self.unload_settle = None;
                         self.active_trajectory = None;
                         self.servo_target = None; self.servo_settled_ticks.fill(0);
                         self.target_positions = hold_pos.clone();
@@ -1933,7 +2136,9 @@ impl SupervisorInner {
                     tracing::warn!("Watchdog: lease expired while torqued, parking");
                     self.apply_stop_policy(StopPolicy::NormalUnload);
                     if self.pending_normal_unload {
-                        self.watchdog_park_deadline = Some(Instant::now() + self.watchdog_park_timeout());
+                        let budget = self.watchdog_park_timeout();
+                        tracing::info!("Watchdog park budget {:.2} s (planned {:.2} s)", budget.as_secs_f64(), self.unload_planned_duration.unwrap_or(0.0));
+                        self.watchdog_park = Some(WatchdogPark { elapsed_s: 0.0, budget_s: budget.as_secs_f64(), grace_granted: false });
                     } else {
                         tracing::warn!("Watchdog park could not be planned; holding torque and latching WatchdogTimeout");
                         self.latch_watchdog_fault();
@@ -1947,19 +2152,8 @@ impl SupervisorInner {
         }
 
         // Watchdog park supervision: a park that stops without completing, or runs past
-        // its deadline, falls back to the hold + Fault(WatchdogTimeout) behaviour.
-        if let Some(deadline) = self.watchdog_park_deadline {
-            if !self.pending_normal_unload {
-                self.watchdog_park_deadline = None;
-                tracing::warn!("Watchdog park interrupted (safety state {:?})", self.safety.state());
-                if self.is_torqued && !self.safety.state().is_stopped() {
-                    self.latch_watchdog_fault();
-                }
-            } else if Instant::now() >= deadline {
-                tracing::warn!("Watchdog park did not finish within {:?}; holding torque and latching WatchdogTimeout", self.watchdog_park_timeout());
-                self.latch_watchdog_fault();
-            }
-        }
+        // its budget, falls back to the hold + Fault(WatchdogTimeout) behaviour.
+        self.supervise_watchdog_park(dt);
 
         // Thermal protection remains active while stopped or shutdown is unconfirmed.
         let temperature_available = self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().temperature_feedback));
@@ -2061,37 +2255,7 @@ impl SupervisorInner {
 
         // 3.1 Handle pending normal unload settling phase
         if self.pending_normal_unload && self.active_trajectory.is_none() {
-            let at_home_and_still = self.is_at_safe_resting_pose();
-
-            let ticks = self.unload_settle_ticks.get_or_insert(40); // 40 ticks = 800ms
-            if at_home_and_still {
-                if *ticks > 0 {
-                    *ticks -= 1;
-                } else {
-                    self.unload_settle_ticks = None;
-                    self.pending_normal_unload = false;
-                    tracing::info!("Arm settled cleanly at home position for 800ms; safely cutting torque to Standby/Idle.");
-                    let watchdog_park = self.watchdog_park_deadline.take().is_some();
-                    match self.set_torque(false) {
-                        Ok(_) if watchdog_park => tracing::info!("Watchdog park complete: torque off at resting pose"),
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!("Failed to cut torque after normal unload settle: {}", e);
-                            self.safety.mark_motion_finished();
-                            if watchdog_park && self.is_torqued && !self.safety.state().is_stopped() {
-                                tracing::warn!("Watchdog park failed at torque off; holding torque and latching WatchdogTimeout");
-                                self.latch_watchdog_fault();
-                            }
-                        }
-                    }
-                }
-            } else {
-                // If not yet stably at rest within tolerances, reset settle tick window and clamp targets
-                *ticks = 40;
-                self.commanded_positions = self.config.home_positions.clone();
-                self.target_positions = self.config.home_positions.clone();
-                self.commanded_velocities = vec![0.0; self.config.dof];
-            }
+            self.step_unload_settle(servo_dt);
         } else if let Some(ref target) = self.servo_target.clone() {
             // Check continuous motion frame timeout:
             // If > 200ms without a new pose frame, clear servo_target to begin controlled smooth deceleration
@@ -2574,7 +2738,7 @@ impl ArmSupervisor {
 
     pub async fn is_unloading(&self) -> bool {
         let inner = self.inner.read().await;
-        inner.pending_normal_unload || inner.active_trajectory.is_some() || inner.unload_settle_ticks.is_some()
+        inner.pending_normal_unload || inner.active_trajectory.is_some() || inner.unload_settle.is_some()
     }
 
     pub async fn has_active_trajectory(&self) -> bool {

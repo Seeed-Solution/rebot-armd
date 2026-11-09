@@ -1,11 +1,11 @@
 //! Planned joint speed cap (spec 1c): jog / home / presets / park are planned with
 //! `planning_limits()`, so Damiao POS_VEL lag stays below the following-error bound.
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget};
 use armd::model::{ArmConfig, JointState, ObservationSchema};
 use armd::safety::FaultReason;
-use armd::supervisor::{WATCHDOG_PARK_MARGIN, WATCHDOG_PARK_TIMEOUT};
+use armd::supervisor::{UNLOAD_SETTLE_HOLD, WATCHDOG_PARK_MARGIN, WATCHDOG_PARK_TIMEOUT};
 use armd::{ArmSupervisor, SafetyState};
 
 const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
@@ -197,16 +197,18 @@ async fn watchdog_park_from_far_j6_gets_an_extended_deadline_and_completes() {
         let planned = inner.unload_planned_duration.unwrap();
         assert!((planned - 1.875 * 4.7 / 0.45).abs() < 0.05, "planned {planned}");
         let timeout = inner.watchdog_park_timeout();
-        assert_eq!(timeout, (Duration::from_secs_f64(planned) + WATCHDOG_PARK_MARGIN).max(WATCHDOG_PARK_TIMEOUT));
+        // The arm is at rest when the park starts: the deceleration term is ~0.
+        let expected = (Duration::from_secs_f64(planned) + UNLOAD_SETTLE_HOLD + WATCHDOG_PARK_MARGIN).max(WATCHDOG_PARK_TIMEOUT);
+        assert!(timeout.abs_diff(expected) < Duration::from_millis(1), "{timeout:?} vs {expected:?}");
         assert!(timeout > Duration::from_secs(15));
-        let remaining = inner.watchdog_park_deadline.unwrap() - Instant::now();
-        assert!(remaining > Duration::from_secs(15), "deadline extended: {remaining:?}");
+        let park = inner.watchdog_park.as_ref().unwrap();
+        assert!(park.budget_s > 15.0 && park.elapsed_s < 0.1, "budget extended: {park:?}");
     }
     for _ in 0..600 { supervisor.tick(0.05).await; }
     let obs = supervisor.get_observation().await;
     assert_eq!(obs.safety_state, SafetyState::Idle, "watchdog park completes");
     assert!(!obs.is_torqued);
-    assert!(supervisor.inner().read().await.watchdog_park_deadline.is_none());
+    assert!(supervisor.inner().read().await.watchdog_park.is_none());
 }
 
 #[test]
