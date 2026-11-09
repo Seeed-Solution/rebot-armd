@@ -1123,7 +1123,7 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
           </div>
         </div>
 
-        <!-- cartesian: XYZ + pitch via IK, roll = J5, yaw follows J1 -->
+        <!-- cartesian: XYZ + pitch via IK, wrist control = J5 (swing on the 7-DOF arm), yaw follows J1 -->
         <div class="cart-zone" id="cart-zone">
           <div class="cart-read">
             <div><span data-i18n="c.x">X 前后 mm</span><b id="c-x">--</b></div>
@@ -1144,7 +1144,7 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
               <div class="dpad" id="dpad-xy"><span class="hub">XY</span></div>
               <div class="vcol" id="vcol-z"><span class="vlab"><b data-i18n="vl.height">高度</b>Z</span></div>
               <div class="vcol" id="vcol-p"><span class="vlab"><b data-i18n="vl.pitch">俯仰</b>Pitch</span></div>
-              <div class="vcol" id="vcol-r"><span class="vlab"><b data-i18n="vl.roll">腕转</b>Roll</span></div>
+              <div class="vcol" id="vcol-r"><span class="vlab"><b data-i18n="vl.roll">腕转</b><span data-i18n="vl.roll.sub">Roll</span></span></div>
             </div>
             <div class="cart-sticks">
               <div class="stick-wrap">
@@ -1448,7 +1448,9 @@ const I18N = {
     'ctl.mode': '控制方式', 'mode.joint': '关节点动', 'mode.cart': '空间位姿', 'home': '回零',
     'input.mode': '输入方式', 'input.btn': '按键', 'input.stick': '摇杆',
     'c.x': 'X 前后 mm', 'c.y': 'Y 左右 mm', 'c.z': 'Z 高度 mm', 'c.roll': 'Roll 腕转', 'c.pitch': 'Pitch 俯仰', 'c.yaw': 'Yaw 朝向', 'c.reach': '臂展 R /',
-    'vl.height': '高度', 'vl.pitch': '俯仰', 'vl.roll': '腕转',
+    'vl.height': '高度', 'vl.pitch': '俯仰', 'vl.roll': '腕转', 'vl.roll.sub': 'Roll',
+    // 7-DOF arm: J5 swings the wrist sideways, J6 rolls the tool (variants picked by t() when dof = 7).
+    'c.roll@7': 'Swing 腕摆', 'vl.roll@7': '腕摆', 'vl.roll.sub@7': 'Swing', 'stick.j5@7': 'J5 腕摆', 'kb.j5@7': 'J5 手腕 摆左 / 摆右', 'kb.r@7': '腕摆 Swing', 'pad.pose@7': '姿态摇杆（俯仰 / 腕摆）',
     'd.fwd': '前', 'd.back': '后', 'd.left': '左', 'd.right': '右', 'd.rise': '升', 'd.lower': '降', 'd.lift': '抬', 'd.press': '压', 'd.open': '开', 'd.close': '闭',
     'cb.pup': '上抬', 'cb.pdn': '下压', 'cb.rr': '右旋', 'cb.rl': '左旋',
     'pl.up': '仰', 'pl.dn': '俯', 'pl.rl': '左滚', 'pl.rr': '右滚',
@@ -1540,7 +1542,8 @@ const I18N = {
     'ctl.mode': 'Control mode', 'mode.joint': 'Joint jog', 'mode.cart': 'Cartesian', 'home': 'Home',
     'input.mode': 'Input type', 'input.btn': 'Buttons', 'input.stick': 'Sticks',
     'c.x': 'X fwd/back mm', 'c.y': 'Y left/right mm', 'c.z': 'Z height mm', 'c.roll': 'Roll', 'c.pitch': 'Pitch', 'c.yaw': 'Yaw', 'c.reach': 'Reach R /',
-    'vl.height': 'Height', 'vl.pitch': 'Pitch', 'vl.roll': 'Roll',
+    'vl.height': 'Height', 'vl.pitch': 'Pitch', 'vl.roll': 'Roll', 'vl.roll.sub': 'Roll',
+    'c.roll@7': 'Swing', 'vl.roll@7': 'Swing', 'vl.roll.sub@7': 'Swing', 'stick.j5@7': 'J5 Wrist swing', 'kb.j5@7': 'J5 Wrist swing L / R', 'kb.r@7': 'Wrist Swing', 'pad.pose@7': 'Pose stick (pitch / swing)',
     'd.fwd': 'Fwd', 'd.back': 'Back', 'd.left': 'Left', 'd.right': 'Right', 'd.rise': 'Up', 'd.lower': 'Down', 'd.lift': 'Up', 'd.press': 'Down', 'd.open': 'Open', 'd.close': 'Close',
     'cb.pup': 'Up', 'cb.pdn': 'Down', 'cb.rr': 'Roll R', 'cb.rl': 'Roll L',
     'pl.up': 'Up', 'pl.dn': 'Down', 'pl.rl': 'Roll L', 'pl.rr': 'Roll R',
@@ -1604,8 +1607,11 @@ let LANG = (() => {
   if (saved === 'zh' || saved === 'en') return saved;
   return /^zh/i.test(navigator.language || '') ? 'zh' : 'en';
 })();
+// '@7' when the arm reports 7 DOF: keys with a 7-DOF variant resolve to it.
+let I18N_VARIANT = '';
 function t(key, vars) {
-  let s = I18N[LANG][key];
+  let s = I18N_VARIANT && (I18N[LANG][key + I18N_VARIANT] ?? I18N.zh[key + I18N_VARIANT]);
+  if (s === undefined || s === '') s = I18N[LANG][key];
   if (s === undefined) s = I18N.zh[key];
   if (s === undefined) return key;
   return vars ? s.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? vars[k] : m)) : s;
@@ -1692,7 +1698,8 @@ const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 
 /* IK-BEGIN */
-// 5-DOF analytic IK for reBot B601-DM (J1 yaw, J2/J3/J4 pitch chain, J5 held, J6 gripper).
+// Analytic IK for reBot B601-DM (J1 yaw, J2/J3/J4 pitch chain; J5 wrist swing held at 0;
+// J6 wrist roll and J7 gripper are not part of the IK).
 // Model angles follow the URDF (rebot-arm-workspace/assets/urdf_b601dm): metres, radians,
 // base frame x forward / y left / z up. Lateral link offsets cancel to < 0.1 mm and are ignored.
 // Pitch = tool axis angle below horizontal (0 = level, +pi/2 = pointing down).
@@ -1836,9 +1843,9 @@ const C = {
   goal: null,                 // pose the operator asked for {x, y, z, pitch}
   cmd: null,                  // rate-limited pose that last solved; streamed as joint targets
   q: null, branch: null,      // IK solution (model J1..J4) for cmd
-  j5: 0,                      // wrist roll, held while in this mode
+  j5: 0,                      // J5 (wrist swing on the 7-DOF arm), held while in this mode
   hold: { x: [0, 0], y: [0, 0], z: [0, 0], p: [0, 0], r: [0, 0] }, // continuous holds per axis [neg, pos]
-  axes: { xy: [0, 0], z: 0, p: 0, sxy: [0, 0], sz: 0, sp: 0, sr: 0 }, // s*: simple cockpit (sxy = X/Y, sz = lift, sp/sr = pitch/roll in pose mode)
+  axes: { xy: [0, 0], z: 0, p: 0, sxy: [0, 0], sz: 0, sp: 0, sr: 0 }, // s*: simple cockpit (sxy = X/Y, sz = lift, sp/sr = pitch/J5 wrist in pose mode)
   stepIdx: 1,
   lastTick: 0, lastInput: 0, tailUntil: 0, stallSince: 0,
   gripJog: 0,                 // -1 (close) .. +1 (open) continuous rate jog
@@ -3043,8 +3050,10 @@ async function loadSchema() {
       GRIP = S.dof - 1;
       S.hold = Array.from({ length: S.dof }, () => [0, 0]);
       if (oldDof !== S.dof) {
+        I18N_VARIANT = S.dof === 7 ? '@7' : '';
         renderJogRows();
         renderGripCol();
+        applyI18n();
       }
     }
   } catch (_) { setTimeout(loadSchema, 3000); }
@@ -3142,8 +3151,8 @@ const JOINTS_7DOF = [
   { key: 'J2', part: 'jd.shoulder.part', motion: 'jd.shoulder.motion', en: 'Shoulder Pitch', neg: 'jd.shoulder.neg', pos: 'jd.shoulder.pos', kn: 'S', kp: 'W' },
   { key: 'J3', part: 'jd.elbow.part', motion: 'jd.elbow.motion', en: 'Elbow Pitch', neg: 'jd.elbow.neg', pos: 'jd.elbow.pos', kn: '↓', kp: '↑' },
   { key: 'J4', part: 'jd.wpitch.part', motion: 'jd.wpitch.motion', en: 'Wrist Pitch', neg: 'jd.wpitch.neg', pos: 'jd.wpitch.pos', kn: 'Q', kp: 'E' },
-  { key: 'J5', part: 'jd.wroll.part', motion: 'jd.wroll.motion', en: 'Wrist Roll', neg: 'jd.wroll.neg', pos: 'jd.wroll.pos', kn: '←', kp: '→' },
-  { key: 'J6', part: 'jd.wyaw.part', motion: 'jd.wyaw.motion', en: 'Wrist Yaw', neg: 'jd.wyaw.neg', pos: 'jd.wyaw.pos', kn: 'R', kp: 'F' },
+  { key: 'J5', part: 'jd.wyaw.part', motion: 'jd.wyaw.motion', en: 'Wrist Swing', neg: 'jd.wyaw.neg', pos: 'jd.wyaw.pos', kn: '←', kp: '→' },
+  { key: 'J6', part: 'jd.wroll.part', motion: 'jd.wroll.motion', en: 'Wrist Roll', neg: 'jd.wroll.neg', pos: 'jd.wroll.pos', kn: 'R', kp: 'F' },
   { key: 'J7', part: 'jd.grip.part', motion: 'jd.grip.motion', en: 'Gripper', neg: 'jd.grip.neg', pos: 'jd.grip.pos', kn: 'Z', kp: 'X' },
 ];
 
@@ -3498,7 +3507,7 @@ function cartVelocity() {
     vx = shape(C.axes.sxy[1]);
     vy = -shape(C.axes.sxy[0]);
     vz = shape(C.axes.sz);
-    // translation is normalised below; pitch / roll are separate angular rates, clamped on their own
+    // translation is normalised below; pitch / J5 wrist are separate angular rates, clamped on their own
     vp = -shape(C.axes.sp);
     vr = shape(C.axes.sr);
   }
