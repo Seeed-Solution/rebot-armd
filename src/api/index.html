@@ -246,6 +246,8 @@ body.ui-expert .main {
 .calib-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .calib-head h3 { font-size: 17px; font-weight: 600; color: var(--sc-color-text); }
 .calib-x { width: 48px; min-height: 48px; padding: 0; font-size: 22px; line-height: 1; }
+.calib-mode { display: flex; }
+.calib-mode button { flex: 1 1 0; white-space: normal; line-height: 1.3; padding-block: 5px; }
 .calib-hint { font-size: 13px; line-height: 1.6; color: var(--sc-color-text-secondary); padding: 10px 12px; border-radius: var(--sc-radius-md); background: var(--sc-color-bg-sunken); border: 1px solid var(--sc-color-border); }
 .calib-prog { display: grid; gap: 8px; }
 .calib-count { font-size: 15px; font-weight: 600; color: var(--sc-color-text); }
@@ -253,7 +255,7 @@ body.ui-expert .main {
 .calib-bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--sc-color-primary-dark), var(--sc-color-primary)); transition: width .25s; }
 .calib-live { font-size: 12px; padding: 8px 10px; border-radius: var(--sc-radius-md); background: var(--sc-status-disabled-bg); color: var(--sc-status-disabled-fg); }
 .calib-live.ok { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); }
-.calib-list { list-style: none; display: grid; gap: 4px; max-height: 210px; overflow-y: auto; font-size: 12px; color: var(--sc-color-text-secondary); }
+.calib-list { flex-shrink: 0; list-style: none; display: grid; gap: 4px; max-height: 210px; overflow-y: auto; font-size: 12px; color: var(--sc-color-text-secondary); }
 .calib-list li { display: flex; justify-content: space-between; gap: 8px; padding: 6px 10px; border-radius: var(--sc-radius-base); background: var(--sc-color-bg-sunken); }
 .calib-list li b { color: var(--sc-color-text); font-weight: 600; }
 .calib-list li.bad { background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); }
@@ -1393,7 +1395,11 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
       <h3 id="calib-title" data-i18n="calib.title">手眼标定</h3>
       <button class="btn calib-x" id="calib-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
     </div>
-    <p class="calib-hint" data-i18n="calib.hint">眼在手外：相机固定，ArUco 标记贴在夹爪末端（标记中心与 TCP 重合）。每次把机械臂移到不同位置并静止后采集一次，点位尽量分散在工作空间。</p>
+    <div class="seg calib-mode" id="calib-mode" role="radiogroup" data-i18n-aria="calib.mode" aria-label="相机安装方式">
+      <button type="button" data-mode="eye_in_hand" class="on" role="radio" aria-checked="true" data-i18n="calib.mode.eih">相机在夹爪上（眼在手上）</button>
+      <button type="button" data-mode="eye_to_hand" role="radio" aria-checked="false" data-i18n="calib.mode.eth">相机固定（眼在手外）</button>
+    </div>
+    <p class="calib-hint" id="calib-hint">眼在手上：相机装在夹爪上，把一个 ArUco 标记固定在桌面上不动。</p>
     <div class="calib-prog">
       <div class="calib-count mono" id="calib-count">已采集位姿: 0 / 9</div>
       <div class="calib-bar"><i id="calib-bar"></i></div>
@@ -1444,6 +1450,17 @@ const I18N = {
     'calib.ok.cap': '已采集第 {n} 个点位', 'calib.ok.solve': '标定完成，RMSE {rmse} mm', 'calib.rmse.warn': '残差偏大，检查标记是否与 TCP 重合、点位是否静止',
     'calib.r.t': '平移 T (mm)', 'calib.r.e': '欧拉角 RPY (°)', 'calib.r.rmse': '残差 RMSE', 'calib.r.n': '样本数', 'calib.r.max': '最大残差',
     'calib.need_more': '已可求解；建议采满 {total} 个', 'calib.del': '删除',
+    'calib.mode': '相机安装方式', 'calib.mode.eih': '相机在夹爪上（眼在手上）', 'calib.mode.eth': '相机固定（眼在手外）',
+    'calib.mode.confirm': '切换模式会清空已采集的 {n} 个位姿，再点一次确认',
+    'calib.hint.eih': '眼在手上：相机装在夹爪上，把一个 ArUco 标记固定在桌面上不动。每次把机械臂移到新位姿，从明显不同的角度看向标记（至少绕两个不同的轴转动，组合使用 J1、J4、J5、J6），标记保持完整在画面内，静止后采集一次，至少采 9 个位姿。',
+    'calib.live.none.eih': '未识别到带 6D 位姿（位置+姿态）的标记 · 采集时会自动单次识别',
+    'calib.e.nomarker6': '未识别到带 6D 位姿（位置+姿态）的 ArUco 标记', 'calib.e.otherid': '画面里是标记 ID {id}，本次标定使用 ID {lock}，请只让同一个标记在画面内',
+    'calib.e.dup.eih': '与第 {i} 个位姿几乎相同（位置差不足 1 cm 且角度差不足 3°），请换一个角度', 'calib.e.few5': '至少需要 5 个位姿（建议 9 个）',
+    'calib.e.rot_small': '位姿之间转动太小（最大 {deg}°）：至少要有两对位姿之间转动 10° 以上，请从差别更大的角度采集',
+    'calib.e.rot_axis': '所有位姿都绕同一个轴转动，无法求解：请再绕另一个轴转动（例如除 J1 外再用 J4 或 J5）后补采',
+    'calib.e.singular': '这些位姿无法确定平移，请补采转动更大的位姿',
+    'calib.ok.solve.eih': '标定完成，位置 RMSE {rmse} mm，姿态 RMSE {rot}°', 'calib.rmse.warn.eih': '残差偏大：检查标记是否固定不动、采集时机械臂是否静止，删除标黄的位姿后重新求解',
+    'calib.r.frame': '结果', 'calib.r.rmse_pos': '位置残差 RMSE', 'calib.r.rmse_rot': '姿态残差 RMSE',
     'rec.chip0': '录制 00:00', 'rec.chip': '录制 ',
     'armview.tag': '姿态示意 · 侧视', 'banner.lock': '遥测断开 · 控制已锁定',
     'ctl.mode': '控制方式', 'mode.joint': '关节点动', 'mode.cart': '空间位姿', 'home': '回零',
@@ -1538,6 +1555,17 @@ const I18N = {
     'calib.ok.cap': 'Captured pose {n}', 'calib.ok.solve': 'Calibration solved, RMSE {rmse} mm', 'calib.rmse.warn': 'High residual: check the marker sits on the TCP and the arm was still',
     'calib.r.t': 'Translation T (mm)', 'calib.r.e': 'Euler RPY (°)', 'calib.r.rmse': 'Residual RMSE', 'calib.r.n': 'Samples', 'calib.r.max': 'Max residual',
     'calib.need_more': 'Solvable; {total} poses recommended', 'calib.del': 'Delete',
+    'calib.mode': 'Camera mounting', 'calib.mode.eih': 'Camera on gripper (eye-in-hand)', 'calib.mode.eth': 'Camera fixed (eye-to-hand)',
+    'calib.mode.confirm': 'Switching mode clears the {n} captured poses; tap again to confirm',
+    'calib.hint.eih': 'Eye-in-hand: the camera is mounted on the gripper and one ArUco marker is fixed on the table. Move the arm to a new pose and view the marker from a clearly different angle (rotate about at least two different axes; combine J1, J4, J5 and J6), keep the whole marker in view, wait until the arm stops, then capture. Capture 9 or more poses.',
+    'calib.live.none.eih': 'No marker with a 6-D pose (position + orientation) · capture will run a snapshot',
+    'calib.e.nomarker6': 'No ArUco marker with a 6-D pose (position + orientation) detected', 'calib.e.otherid': 'Marker ID {id} is in view, this calibration uses ID {lock}; keep only that marker in view',
+    'calib.e.dup.eih': 'Nearly the same as pose {i} (less than 1 cm and 3° apart), view the marker from a new angle', 'calib.e.few5': 'At least 5 poses are required (9 recommended)',
+    'calib.e.rot_small': 'Too little rotation between poses (max {deg}°): at least two pose pairs must differ by 10° or more; capture from more different angles',
+    'calib.e.rot_axis': 'All poses rotate about one axis only, which cannot be solved; also rotate about another axis (e.g. J4 or J5 besides J1) and capture more',
+    'calib.e.singular': 'The translation cannot be determined from these poses; add poses with larger rotations',
+    'calib.ok.solve.eih': 'Calibration solved, position RMSE {rmse} mm, rotation RMSE {rot}°', 'calib.rmse.warn.eih': 'High residual: check the marker is fixed and the arm was still; delete the highlighted poses and solve again',
+    'calib.r.frame': 'Result', 'calib.r.rmse_pos': 'Position RMSE', 'calib.r.rmse_rot': 'Rotation RMSE',
     'rec.chip0': 'REC 00:00', 'rec.chip': 'REC ',
     'armview.tag': 'Pose preview · side view', 'banner.lock': 'Telemetry lost · controls locked',
     'ctl.mode': 'Control mode', 'mode.joint': 'Joint jog', 'mode.cart': 'Cartesian', 'home': 'Home',
@@ -2806,23 +2834,36 @@ function initDetToggle() {
 }
 
 /* =================================================================
-   Hand-eye calibration (eye-to-hand, marker centre at the TCP)
-   Each sample pairs the marker position in the camera frame (ArUco tvec) with the TCP position in the
-   base frame (full URDF FK J1..J6 of the measured joints, CALM.fk). T_cam_to_base is the rigid transform p_base = R p_cam + t
-   that best fits all pairs (Horn 1987 closed-form quaternion solution); RMSE is the 3D point residual.
+   Hand-eye calibration, two setups (CAL.mode):
+   - eye_in_hand: camera on the gripper, one ArUco marker fixed on the table. Each sample pairs
+     T_base_gripper (full URDF FK J1..J6, CALM.fk) with the marker's 6-D pose T_cam_marker; Park & Martin
+     AX = XB over all sample pairs gives T_cam_to_gripper. Quality: T_base_marker = G X M per sample must
+     be constant (position / rotation RMSE about the mean).
+   - eye_to_hand: camera fixed, marker centre at the TCP. Marker position in the camera frame vs TCP
+     position in the base frame (CALM.fk); T_cam_to_base = rigid fit p_base = R p_cam + t (Horn 1987).
    ================================================================= */
-const CAL = { samples: [], target: 9, result: null, markerId: null, resetArmedUntil: 0, busy: false, liveTimer: null };
+const CAL_MODES = ['eye_in_hand', 'eye_to_hand'];
+const CAL = { mode: 'eye_in_hand', samples: [], target: 9, result: null, markerId: null, resetArmedUntil: 0, modeArmedUntil: 0, busy: false, liveTimer: null };
 (() => {
+  const pref = store('rebot.calib.mode');
+  if (CAL_MODES.includes(pref)) CAL.mode = pref;
   try {
     const sv = JSON.parse(store('rebot.calib') || 'null');
-    if (sv && Array.isArray(sv.samples)) { CAL.samples = sv.samples; CAL.markerId = sv.markerId ?? null; }
+    if (sv && Array.isArray(sv.samples)) {
+      CAL.samples = sv.samples; CAL.markerId = sv.markerId ?? null;
+      // saved samples keep the mode they were taken in (saves without a mode predate eye_in_hand)
+      if (sv.samples.length) CAL.mode = CAL_MODES.includes(sv.mode) ? sv.mode : 'eye_to_hand';
+    }
   } catch (_) {}
 })();
-const calSave = () => store('rebot.calib', JSON.stringify({ samples: CAL.samples, markerId: CAL.markerId }));
+const calSave = () => store('rebot.calib', JSON.stringify({ mode: CAL.mode, samples: CAL.samples, markerId: CAL.markerId }));
+const calEih = () => CAL.mode === 'eye_in_hand';
+const calMin = () => (calEih() ? 5 : 3);
+// eye_in_hand quality limits: position RMSE 5 mm, rotation RMSE 1 deg; eye_to_hand: point RMSE 10 mm
+const calWarn = (r) => (r.rotRmse != null ? r.rmse > 0.005 || r.rotRmse > 1 : r.rmse > 0.01);
 // T_base_gripper from raw motor positions: J1..J4 through toModel (CFG.cart sign / offset), index 4 = URDF
 // joint5 and, on 7-DOF arms, index 5 = URDF joint6, 1:1 (index 5 is the gripper on 6-DOF arms)
 const calGripper = (pos) => CALM.fk([...toModel(pos), pos[4] || 0, S.dof === 7 ? pos[5] || 0 : 0]);
-
 /* CALIB-MATH-BEGIN */
 // Pure hand-eye calibration math: no DOM and no page state. scripts/calib_selftest.mjs evaluates this
 // block in Node and checks it against the rebot-companion SDK. 4x4 transforms are row-major nested
@@ -3062,41 +3103,55 @@ const CALM = (() => {
 })();
 /* CALIB-MATH-END */
 
-// freshest marker with a 3D position (prefers the locked marker ID)
+// markers usable in the current mode (eye_in_hand needs the full 6-D pose); prefers the locked marker ID.
+// Returns { m, other }: other = a usable marker with a different ID than the locked one.
+function calPick(list) {
+  const ms = (list || []).filter((d) => d.aruco && d.aruco.t && (!calEih() || d.aruco.R));
+  if (CAL.markerId == null) return { m: ms[0] || null, other: null };
+  return { m: ms.find((d) => String(d.aruco.id) === String(CAL.markerId)) || null, other: ms[0] || null };
+}
+// freshest detections -> calPick result plus the frame age (ms)
 // with freshOnly=true, ignores S.detHoldUntil and enforces arrival within 500ms
 function calMarker({ freshOnly = false } = {}) {
   let age = S.detLastReceivedAt ? performance.now() - S.detLastReceivedAt : Infinity;
   // device-reported frame age (at receive) + time since receive beats the browser receive time alone
   if (freshOnly && S.detDevAge && S.detDevAge.rx === S.detLastReceivedAt) age = S.detDevAge.age + (performance.now() - S.detDevAge.rx);
+  const none = { m: null, other: null, age };
   if (freshOnly) {
-    if (age > 500) return null;
+    if (age > 500) return none;
   } else {
-    if (!(performance.now() < (S.detHoldUntil || 0)) && age > 600) return null;
+    if (!(performance.now() < (S.detHoldUntil || 0)) && age > 600) return none;
   }
-  const ms = (S.detections || []).filter((d) => d.aruco && d.aruco.t);
-  return ms.find((d) => CAL.markerId != null && String(d.aruco.id) === String(CAL.markerId)) || (CAL.markerId == null ? ms[0] : null) || null;
+  return { ...calPick(S.detections), age };
 }
 function calRender() {
-  const n = CAL.samples.length;
+  const n = CAL.samples.length, eih = calEih();
+  for (const b of $('calib-mode').children) {
+    const on = b.dataset.mode === CAL.mode;
+    b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on));
+  }
+  setText($('calib-hint'), t(eih ? 'calib.hint.eih' : 'calib.hint'));
   setText($('calib-count'), t('calib.count', { n, total: CAL.target }));
   $('calib-bar').style.width = Math.min(100, n / CAL.target * 100) + '%';
   const list = $('calib-list');
   list.textContent = '';
+  const r = CAL.result;
   CAL.samples.forEach((sm, i) => {
     const li = document.createElement('li');
-    const res = CAL.result && CAL.result.residuals ? CAL.result.residuals[i] : null;
-    if (res != null && CAL.result.rmse > 0 && res > 2.5 * CAL.result.rmse && res > 0.005) li.className = 'bad';
+    const res = r && r.residuals ? r.residuals[i] : null, rot = r && r.rotResiduals ? r.rotResiduals[i] : null;
+    if ((res != null && r.rmse > 0 && res > 2.5 * r.rmse && res > 0.005) || (rot != null && r.rotRmse > 0 && rot > 2.5 * r.rotRmse && rot > 1)) li.className = 'bad';
     const b = document.createElement('b'); b.textContent = '#' + (i + 1);
     const a = document.createElement('span');
-    a.textContent = 'TCP ' + sm.p_base.map((v) => (v * 1000).toFixed(0)).join(',') + ' · Zc ' + sm.p_cam[2].toFixed(3) + 'm' + (res != null ? ' · ' + (res * 1000).toFixed(1) + 'mm' : '');
+    a.textContent = 'TCP ' + sm.p_base.map((v) => (v * 1000).toFixed(0)).join(',') + ' · Zc ' + sm.p_cam[2].toFixed(3) + 'm'
+      + (res != null ? ' · ' + (res * 1000).toFixed(1) + 'mm' : '') + (rot != null ? ' ' + rot.toFixed(2) + '°' : '');
     const x = document.createElement('button');
     x.type = 'button'; x.className = 'btn'; x.style.cssText = 'min-height:40px;padding:0 12px;font-size:12px';
     x.textContent = t('calib.del');
-    x.addEventListener('click', () => { CAL.samples.splice(i, 1); CAL.result = null; calSave(); calRender(); });
+    x.addEventListener('click', () => { CAL.samples.splice(i, 1); CAL.result = null; if (!CAL.samples.length) CAL.markerId = null; calSave(); calRender(); });
     li.append(b, a, x);
     list.appendChild(li);
   });
-  $('calib-solve').disabled = n < 3 || CAL.busy;
+  $('calib-solve').disabled = n < calMin() || CAL.busy;
   $('calib-export').disabled = n === 0;
   $('calib-cap').disabled = CAL.busy;
   setText($('calib-cap'), t(CAL.busy ? 'calib.cap.busy' : 'calib.cap'));
@@ -3106,54 +3161,67 @@ function calRender() {
   rb.disabled = n === 0 && !CAL.result;
 
   const box = $('calib-result');
-  box.hidden = !CAL.result;
-  if (CAL.result) {
-    const r = CAL.result, warn = r.rmse > 0.01;
+  box.hidden = !r;
+  if (r) {
+    const warn = calWarn(r);
     box.className = 'calib-result mono' + (warn ? ' warn' : '');
     box.textContent = '';
     const row = (k, v) => { const d = document.createElement('div'); d.className = 'row'; const a = document.createElement('span'); a.textContent = k; const b = document.createElement('span'); b.textContent = v; d.append(a, b); box.appendChild(d); };
+    row(t('calib.r.frame'), eih ? 'T_cam_to_gripper' : 'T_cam_to_base');
     row(t('calib.r.t'), r.t.map((v) => (v * 1000).toFixed(1)).join(', '));
     row(t('calib.r.e'), r.rpy.map((v) => v.toFixed(2)).join(', '));
-    row(t('calib.r.rmse'), (r.rmse * 1000).toFixed(2) + ' mm');
-    row(t('calib.r.max'), (r.maxErr * 1000).toFixed(2) + ' mm');
+    if (eih) {
+      row(t('calib.r.rmse_pos'), (r.rmse * 1000).toFixed(2) + ' mm');
+      row(t('calib.r.rmse_rot'), r.rotRmse.toFixed(2) + '°');
+      row(t('calib.r.max'), (r.maxErr * 1000).toFixed(2) + ' mm · ' + r.maxRotErr.toFixed(2) + '°');
+    } else {
+      row(t('calib.r.rmse'), (r.rmse * 1000).toFixed(2) + ' mm');
+      row(t('calib.r.max'), (r.maxErr * 1000).toFixed(2) + ' mm');
+    }
     row(t('calib.r.n'), String(r.n) + (r.n < CAL.target ? ' · ' + t('calib.need_more', { total: CAL.target }) : ''));
-    if (warn) { const p2 = document.createElement('div'); p2.textContent = t('calib.rmse.warn'); box.appendChild(p2); }
+    if (warn) { const p2 = document.createElement('div'); p2.textContent = t(eih ? 'calib.rmse.warn.eih' : 'calib.rmse.warn'); box.appendChild(p2); }
   }
   calLive();
 }
 function calLive() {
-  const el = $('calib-live'), m = calMarker();
+  const el = $('calib-live'), { m } = calMarker();
   el.classList.toggle('ok', !!m);
-  setText(el, m ? t('calib.live.ok', { id: m.aruco.id ?? '?', z: m.aruco.t[2].toFixed(3) }) : t('calib.live.none'));
+  setText(el, m ? t('calib.live.ok', { id: m.aruco.id ?? '?', z: m.aruco.t[2].toFixed(3) }) : t(calEih() ? 'calib.live.none.eih' : 'calib.live.none'));
 }
 async function calCapture() {
   if (CAL.busy) return;
   if (!isLive() || !S.obs || !Array.isArray(S.obs.positions) || S.obs.positions.length < 4) { toast(t('calib.e.offline'), 'warn'); return; }
   if (Array.isArray(S.obs.velocities) && S.obs.velocities.some((v) => Math.abs(v) > 0.02)) { toast(t('calib.e.moving'), 'warn'); return; }
+  const eih = calEih();
   CAL.busy = true; calRender();
   try {
     const pos = S.obs.positions.slice(); // snapshot before the (1-4 s) detection so frame and pose belong together
-    let m = calMarker({ freshOnly: true });
-    if (!m && DET.avail) {
+    let pk = calMarker({ freshOnly: true }), source = 'stream';
+    if (!pk.m && DET.avail) {
       const parsed = await triggerDet({ quiet: true });
-      if (Array.isArray(parsed)) {
-        const ms = parsed.filter((d) => d.aruco && d.aruco.t);
-        m = ms.find((d) => CAL.markerId != null && String(d.aruco.id) === String(CAL.markerId)) || (CAL.markerId == null ? ms[0] : null) || null;
-      }
+      if (Array.isArray(parsed)) { pk = { ...calPick(parsed), age: null }; source = 'snapshot'; }
     }
-    if (!m) { toast(t('calib.e.nomarker'), 'warn'); return; }
+    const m = pk.m;
+    if (!m) {
+      if (pk.other) toast(t('calib.e.otherid', { id: pk.other.aruco.id ?? '?', lock: CAL.markerId }), 'warn');
+      else toast(t(eih ? 'calib.e.nomarker6' : 'calib.e.nomarker'), 'warn');
+      return;
+    }
     // Re-verify telemetry validity and velocity after async detection trigger
     if (!isLive() || !S.obs || !Array.isArray(S.obs.positions) || S.obs.positions.length < 4) { toast(t('calib.e.offline'), 'warn'); return; }
     if (Array.isArray(S.obs.velocities) && S.obs.velocities.some((v) => Math.abs(v) > 0.02)) { toast(t('calib.e.moving'), 'warn'); return; }
     if (pos.slice(0, 6).some((v, i) => !Number.isFinite(S.obs.positions[i]) || Math.abs(S.obs.positions[i] - v) > 0.003)) { toast(t('calib.e.shifted'), 'warn'); return; }
     const G = calGripper(pos), p_base = CALM.posOf(G);
-    const dup = CAL.samples.findIndex((sm) => Math.hypot(...sm.p_base.map((v, k) => v - p_base[k])) < 0.01);
-    if (dup >= 0) { toast(t('calib.e.dup', { i: dup + 1 }), 'warn'); return; }
+    const near = (sm) => Math.hypot(...sm.p_base.map((v, k) => v - p_base[k])) < 0.01;
+    // eye_in_hand: a new pose may share the position if the view angle differs by >= 3 deg
+    const dup = CAL.samples.findIndex((sm) => near(sm) && (!eih || !sm.T_base_gripper || CALM.angDeg(CALM.mul(CALM.rotOf(CALM.inv(sm.T_base_gripper)), CALM.rotOf(G))) < 3));
+    if (dup >= 0) { toast(t(eih ? 'calib.e.dup.eih' : 'calib.e.dup', { i: dup + 1 }), 'warn'); return; }
     if (CAL.markerId == null && m.aruco.id != null) CAL.markerId = m.aruco.id;
     CAL.samples.push({
       joints: pos, p_base, T_base_gripper: G,
       marker_id: m.aruco.id, p_cam: m.aruco.t.slice(),
       R_cam: m.aruco.R, rpy_cam_deg: m.aruco.rpy, T_cam_marker: m.aruco.R ? CALM.make(m.aruco.R, m.aruco.t) : null, corners: m.aruco.corners,
+      frame_source: source, frame_age_ms: pk.age != null && Number.isFinite(pk.age) ? Math.round(pk.age) : null,
       ts: new Date().toISOString(),
     });
     CAL.result = null; calSave();
@@ -3162,20 +3230,38 @@ async function calCapture() {
   } finally { CAL.busy = false; calRender(); }
 }
 function calSolve() {
+  const n = CAL.samples.length, at = new Date().toISOString();
+  if (calEih()) {
+    const r = CALM.solveEyeInHand(CAL.samples.map((sm) => sm.T_base_gripper), CAL.samples.map((sm) => sm.T_cam_marker));
+    if (r.err) { toast(t(r.err, { deg: r.div ? r.div.maxDeg.toFixed(1) : '0' }), 'warn'); return; }
+    CAL.result = { ...r, rpy: CALM.rpyDeg(r.R), n, at };
+    calRender();
+    toast(t('calib.ok.solve.eih', { rmse: (r.rmse * 1000).toFixed(2), rot: r.rotRmse.toFixed(2) }), calWarn(CAL.result) ? 'warn' : '');
+    return;
+  }
   const r = solveRigid(CAL.samples.map((sm) => sm.p_cam), CAL.samples.map((sm) => sm.p_base));
   if (r.err) { toast(t(r.err), 'warn'); return; }
-  CAL.result = { ...r, rpy: CALM.rpyDeg(r.R), n: CAL.samples.length, at: new Date().toISOString() };
+  CAL.result = { ...r, rpy: CALM.rpyDeg(r.R), n, at };
   calRender();
-  toast(t('calib.ok.solve', { rmse: (r.rmse * 1000).toFixed(2) }), r.rmse > 0.01 ? 'warn' : '');
+  toast(t('calib.ok.solve', { rmse: (r.rmse * 1000).toFixed(2) }), calWarn(CAL.result) ? 'warn' : '');
 }
 function calExport() {
-  const out = CALM.buildExport({ mode: 'eye_to_hand', samples: CAL.samples, result: CAL.result, markerId: CAL.markerId });
+  const out = CALM.buildExport({ mode: CAL.mode, samples: CAL.samples, result: CAL.result, markerId: CAL.markerId });
   const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'rebot_hand_eye_' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '.json';
+  a.download = 'rebot_hand_eye_' + (calEih() ? 'eih_' : '') + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '.json';
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+// switching setups invalidates the samples: with samples, the first tap warns, a second tap within 3 s clears
+function calSetMode(mode) {
+  if (!CAL_MODES.includes(mode) || mode === CAL.mode || CAL.busy) return;
+  if (CAL.samples.length || CAL.result) {
+    if (Date.now() >= CAL.modeArmedUntil) { CAL.modeArmedUntil = Date.now() + 3000; toast(t('calib.mode.confirm', { n: CAL.samples.length }), 'warn'); return; }
+    CAL.samples = []; CAL.result = null; CAL.markerId = null;
+  }
+  CAL.modeArmedUntil = 0; CAL.mode = mode; store('rebot.calib.mode', mode); calSave(); calRender();
 }
 function calReset() {
   // two-tap confirm against accidental touches
@@ -3198,6 +3284,7 @@ function initCalib() {
   $('calib-solve').addEventListener('click', calSolve);
   $('calib-export').addEventListener('click', calExport);
   $('calib-reset').addEventListener('click', calReset);
+  $('calib-mode').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) calSetMode(b.dataset.mode); });
   i18nHooks.push(() => { if (!$('calib').hidden) calRender(); });
 }
 
