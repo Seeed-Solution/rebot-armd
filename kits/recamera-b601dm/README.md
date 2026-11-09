@@ -11,7 +11,7 @@ and kits fit together: [docs/architecture.md](../../docs/architecture.md).
 |---|---|---|
 | [`profile/`](profile/) | `rebot-b601dm.json`, the arm profile (equal to the built-in `ArmConfig::rebot_dm()`) | arm profile, `profile_version` 1 |
 | [`packaging/`](packaging/) | `rebot-teleop` deb sources: init script, vision respawn loop, gallery manifest `rebot-teleop.json`, URDF, control files | packaging, deb 1.2.2 |
-| [`vision/`](vision/) | `rebot-vision`, the kit's camera process (YOLO + ArUco, modes off / yolo / aruco / both) | perception provider API v1 |
+| [`vision/`](vision/) | `rebot-vision`, the kit's camera process (YOLO + ArUco on demand: per-request pipelines, subscriptions) | perception provider API v2 |
 | [`hardware/`](hardware/) | camera mount CAD v5 and v7_tilt (CERN-OHL-W-2.0) | - |
 | [`calibration/`](calibration/) | camera tilt per mount, placeholder intrinsics, grasp setup defaults | - |
 | [`docs/`](docs/README.md) | wiring, assembly, verified capabilities | - |

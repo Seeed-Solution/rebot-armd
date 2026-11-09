@@ -87,18 +87,24 @@ differs from `rebot_dm()`.
 armd does not run inference. It proxies a detector's HTTP API under its own port so the
 cockpit and agents use one origin (`src/api/proxy.rs`, [detection_api.md](detection_api.md)).
 
-- Version: the provider reports `"api_version"` in every `:8090` body; **1** is the API of the
-  kit's `rebot-vision` (modes, trigger in every mode, combined result). Providers without the
-  field (yolo-detector, aruco-detector) are version 0: the routes below without `/api/mode`.
-  armd publishes the provider's version as `capabilities.vision.api_version`.
+- Version: the provider reports `"api_version"` in every `:8090` body. **2** is the API of the
+  kit's `rebot-vision` from `rebot-teleop` 1.3.0: vision on demand per caller (triggers name their
+  pipelines, continuous inference through subscriptions that expire without keep-alive, the mode
+  as a default subscription). **1** is `rebot-vision` 1.2 (one global mode, trigger in every mode,
+  combined result). Providers without the field (yolo-detector, aruco-detector) are version 0:
+  the routes below without `/api/mode` and the subscription routes. armd publishes the
+  provider's version as `capabilities.vision.api_version`.
 - Upstream: `ARMD_DETECTOR_URL` (default `http://127.0.0.1:8090`).
 
 | armd route | Upstream | Purpose |
 |---|---|---|
 | `GET` / `POST /api/v1/detection/inference` | `/api/inference` | continuous inference on / off, rates |
 | `GET /api/v1/detection/latest` | `/api/results/latest?after=&wait_ms=` | latest result, long poll |
-| `POST /api/v1/detection/trigger` | `/api/trigger?wait_ms=` | one inference on a fresh frame, `enabled` unchanged |
-| `GET` / `POST /api/v1/vision/mode` | `/api/mode` | mode `off` / `yolo` / `aruco` / `both`, continuous on / off and the shared rate in one request (version 1) |
+| `POST /api/v1/detection/trigger` | `/api/trigger?wait_ms=` (JSON body passed through) | one inference on a fresh frame; version 2 runs the body's `pipelines`; no continuous state changes |
+| `GET` / `POST /api/v1/vision/mode` | `/api/mode` | mode `off` / `yolo` / `aruco` / `both`, continuous on / off and the rate in one request (version 1); in version 2 the default subscription, and `fps` is the cap of every subscription |
+| `POST /api/v1/vision/subscribe` | `/api/subscribe` | start or update a caller's continuous inference (version 2) |
+| `POST /api/v1/vision/subscribe/{id}/keepalive`, `DELETE /api/v1/vision/subscribe/{id}` | `/api/subscribe/{id}[/keepalive]` | keep a subscription alive, end it (version 2) |
+| `GET /api/v1/vision/subscriptions` | `/api/subscriptions` | active subscriptions and what runs (version 2) |
 | `GET /api/v1/detection/ws`, `/results` | `ws://127.0.0.1:8001/results` | detection stream (fixed address) |
 
 Status and body pass through; an unreachable upstream gives 502. Video is not proxied: the
@@ -106,14 +112,19 @@ cockpit plays the camera's H.264 WebSocket stream (`ws://<host>:8001/`) directly
 reCamera the provider is today the camera's `yolo-detector` (or `aruco-detector`) service,
 not part of the kit. The kit's own provider is `rebot-vision`
 (`kits/recamera-b601dm/vision/`, design in [dev_flow_spec_vision_runtime.md](dev_flow_spec_vision_runtime.md)),
-shipped in `rebot-teleop` 1.2.0: one process owns the camera, runs YOLO (TPU) and ArUco (CPU) on
-the same frame by mode, at one inference rate for every mode, and runs `/api/trigger` in every
-mode. Results always carry both `detections` and `markers`.
+shipped in `rebot-teleop` 1.2.0: one process owns the camera and runs YOLO (TPU) and ArUco (CPU)
+on the same frame. From 1.3.0 (version 2) it infers nothing without a caller: a trigger runs the
+pipelines it names, and continuous inference runs the union of the active subscriptions'
+pipelines at their highest rate, capped at the configured rate. Results always carry both
+`detections` and `markers`.
 
-armd uses the mode API itself: the grasp action switches to `yolo` (`both` when ArUco was on)
-with inference on for its duration and restores the previous mode and inference state after
-every outcome; providers without `/api/mode` (404) get the old inference on / off toggle. The
-cockpit's hand-eye calibration drawer switches to `aruco` (`both` when YOLO was on) while open.
+Callers do not change the global mode any more (with one global mode, the caller that restored
+last won). The grasp action triggers `{"pipelines": ["yolo"]}` per centring step; the cockpit's
+overlay holds its own subscription while it is on and the page is visible; the hand-eye
+calibration drawer holds an ArUco subscription while open and captures with one `["aruco"]`
+trigger per pose. With a version 1 provider the grasp still switches to `yolo` (`both` when
+ArUco was on) and restores the previous mode afterwards, and the cockpit uses the mode; providers
+without `/api/mode` (404) get the old inference on / off toggle.
 
 ### 3. Capability discovery
 
@@ -121,8 +132,9 @@ cockpit's hand-eye calibration drawer switches to `aruco` (`both` when YOLO was 
 the cockpit and MCP clients can adapt without probing routes. Schemas from older armd versions
 have no `capabilities` object; it parses as all false, `version` 0.
 
-- Version: `capabilities.version`, currently **2** (`CAPABILITIES_VERSION`). Version 2 added
-  the `vision.*` fields after `detection_proxy`.
+- Version: `capabilities.version`, currently **3** (`CAPABILITIES_VERSION`). Version 2 added
+  the `vision.*` fields after `detection_proxy`; version 3 added `vision.per_request_pipelines`
+  and `vision.subscriptions`.
 
 | Field | True when |
 |---|---|
@@ -139,8 +151,11 @@ have no `capabilities` object; it parses as all false, `version` 0.
 | `vision.mode` | (string or null) the provider's current base mode |
 | `vision.api_version` | (number or null) the provider's perception API version |
 | `vision.trigger`, `vision.yolo_available` | (bool or null) trigger in every mode; YOLO model loaded |
+| `vision.per_request_pipelines` | the provider runs the pipelines a trigger names (version 2) |
+| `vision.subscriptions` | the provider serves `/api/v1/vision/subscribe` (version 2) |
 
-The `vision.modes` / `mode` / `api_version` / `trigger` / `yolo_available` values come from the
+The `vision.modes` / `mode` / `api_version` / `trigger` / `yolo_available` /
+`per_request_pipelines` / `subscriptions` values come from the
 provider's `GET /api/mode`: the schema handler uses the body of the last mode request proxied
 through armd, or asks the provider (500 ms timeout) when that is older than 2 s.
 
