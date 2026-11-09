@@ -41,6 +41,23 @@ struct ArucoConfig {
     /// off when min_side_px <= kSizeGateSlackPx).
     bool size_gate = true;
     static constexpr double kSizeGateSlackPx = 2.0;
+    /// Adaptive decimation (0 = off): use this quad_decimate while the previous frame accepted
+    /// markers and all of them had a shortest side >= adaptive_min_side_px. Back to
+    /// quad_decimate for adaptive_hold_frames after a frame accepts fewer markers than the one
+    /// before, and every adaptive_full_every-th frame (to pick up new small markers).
+    double adaptive_decimate = 0.0;
+    double adaptive_min_side_px = 40.0;
+    int adaptive_hold_frames = 10;
+    int adaptive_full_every = 10;
+    /// ROI tracking (subscriptions only; run(..., full_scan = true) always scans the whole
+    /// image): detect in the box around the last frame's accepted markers, padded by
+    /// roi_pad times the largest marker side plus roi_pad_px. The whole image is scanned when
+    /// the last frame accepted no marker, after a frame that accepted fewer markers than the
+    /// one before, and every roi_full_every-th frame.
+    bool roi_tracking = false;
+    double roi_pad = 1.0;
+    double roi_pad_px = 16.0;
+    int roi_full_every = 10;
     /// Pose with apriltag's estimate_tag_pose() instead of tag_pose_estimate() (same result,
     /// ~26k heap calls per marker); for the host benchmark's baseline.
     bool apriltag_pose = false;
@@ -71,6 +88,8 @@ struct ArucoTiming {
     double filter_ms = 0;     ///< false-positive filter and copying the accepted markers
     double pose_ms = 0;       ///< undistortion and pose of the accepted markers
     int quads = 0;            ///< candidate quads (before the size gate)
+    double quad_decimate = 0; ///< quad_decimate used for this frame
+    int roi_w = 0, roi_h = 0; ///< detected region (the whole image without ROI tracking)
 };
 
 /** {"gray":..,"decimate":..,...}: the stages of t in ms, one decimal. */
@@ -88,9 +107,11 @@ public:
 
     /**
      * Detect markers on a packed RGB888 image (stride in bytes, e.g. a sub_frame of CH0).
-     * Fills accepted markers; returns the number rejected by the filter.
+     * Fills accepted markers; returns the number rejected by the filter. full_scan: ignore
+     * ROI tracking for this frame (a trigger's frame).
      */
-    int run(const uint8_t* rgb, int width, int height, int stride, std::vector<MarkerOut>& out);
+    int run(const uint8_t* rgb, int width, int height, int stride, std::vector<MarkerOut>& out,
+            bool full_scan = false);
     const ArucoTiming& last_timing() const noexcept { return timing_; }
 
 private:
@@ -102,6 +123,16 @@ private:
     apriltag_detector* td_ = nullptr;
     std::vector<uint8_t> gray_;
     ArucoTiming timing_;
+    // adaptive decimation state (previous frame)
+    int last_accepted_ = 0;
+    double last_min_side_ = 0;
+    int hold_ = 0;
+    int since_full_ = 0;
+    // ROI tracking state: box of the last frame's accepted markers (pixels), largest side
+    double box_[4] = {0, 0, 0, 0};
+    double box_side_ = 0;
+    int roi_since_full_ = 0;
+    bool roi_rescan_ = false;
 };
 
 }  // namespace rv

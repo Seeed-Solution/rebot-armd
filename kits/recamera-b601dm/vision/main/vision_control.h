@@ -195,9 +195,10 @@ public:
      * Frame thread, once per frame: the pipelines to run on it (empty: skip). frame_ms is a
      * mono_ms() the frame is known to be newer than. Drops subscriptions expired by frame_ms,
      * runs the continuous pipelines at their rate (RateGate) and adds the pipelines of every
-     * trigger requested at or before frame_ms.
+     * trigger requested at or before frame_ms. triggered (optional): the pipelines of those
+     * triggers alone.
      */
-    Pipelines frame_plan(uint64_t frame_ms);
+    Pipelines frame_plan(uint64_t frame_ms, Pipelines* triggered = nullptr);
 
     /** Frames offered to frame_plan() and results published, per second (last 2 s). */
     double input_fps(uint64_t now_ms) const;

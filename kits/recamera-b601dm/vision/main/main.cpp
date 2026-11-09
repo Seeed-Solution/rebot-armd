@@ -162,6 +162,9 @@ void load_config_file(const std::string& path) {
     boolean("lazy_clusters", g_cfg.aruco.lazy_clusters);
     boolean("reuse_buffers", g_cfg.aruco.reuse_buffers);
     boolean("size_gate", g_cfg.aruco.size_gate);
+    num("adaptive_decimate", g_cfg.aruco.adaptive_decimate);
+    num("adaptive_min_side", g_cfg.aruco.adaptive_min_side_px);
+    boolean("roi_tracking", g_cfg.aruco.roi_tracking);
     if (auto it = j.find("ids"); it != j.end() && it->is_string()) {
         std::string err;
         if (!aruco::parse_id_list(it->get<std::string>(), g_cfg.aruco.filter.ids, &err))
@@ -464,7 +467,8 @@ int main(int argc, char** argv) {
         const uint64_t grab_ms = rv::mono_ms();
         const uint64_t frame_ms = grab_ms > before_grab_ms ? grab_ms : last_grab_ms;
         last_grab_ms = grab_ms;
-        const rv::Pipelines p = ctl.frame_plan(frame_ms);
+        rv::Pipelines triggered;
+        const rv::Pipelines p = ctl.frame_plan(frame_ms, &triggered);
         if (!p.any() || !frame.valid() || !frame.cpu_accessible()) {
             r.publish = false;  // standby: no /results; the stream and snapshot keep running
             return;
@@ -505,7 +509,9 @@ int main(int argc, char** argv) {
             const auto t0 = std::chrono::steady_clock::now();
             const af::VideoFrame sub = frame.sub_frame(crop);
             if (sub.valid()) {
-                vr.rejected = aruco_stage.run(sub.data(), sub.width, sub.height, static_cast<int>(sub.stride()), markers);
+                // a trigger's frame is always scanned whole (ROI tracking is for subscriptions)
+                vr.rejected = aruco_stage.run(sub.data(), sub.width, sub.height, static_cast<int>(sub.stride()), markers,
+                                              triggered.aruco);
             }
             vr.ran_aruco = true;
             vr.aruco_ms = ms_since(t0);

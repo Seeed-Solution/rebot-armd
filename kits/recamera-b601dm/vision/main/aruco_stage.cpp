@@ -111,27 +111,59 @@ bool ArucoStage::init(const ArucoConfig& cfg) {
     return true;
 }
 
-int ArucoStage::run(const uint8_t* rgb, int width, int height, int stride, std::vector<MarkerOut>& out) {
+int ArucoStage::run(const uint8_t* rgb, int width, int height, int stride, std::vector<MarkerOut>& out,
+                    bool full_scan) {
     out.clear();
     timing_ = ArucoTiming{};
     if (!td_ || !rgb || width <= 0 || height <= 0) return 0;
     using clock = std::chrono::steady_clock;
     auto ms = [](clock::time_point a, clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     const auto t0 = clock::now();
-    const size_t total = static_cast<size_t>(width) * height;
+    // ROI tracking: the region around the last frame's markers, aligned to 8 px so the
+    // decimated grid and apriltag's 4x4 threshold tiles (at decimate 2) match the full image's.
+    int rx = 0, ry = 0, rw = width, rh = height;
+    const bool roi = cfg_.roi_tracking && !full_scan && !roi_rescan_ && last_accepted_ > 0 &&
+                     roi_since_full_ + 1 < cfg_.roi_full_every;
+    if (roi) {
+        const double pad = cfg_.roi_pad * box_side_ + cfg_.roi_pad_px;
+        rx = std::max(0, static_cast<int>(std::floor(box_[0] - pad)) & ~7);
+        ry = std::max(0, static_cast<int>(std::floor(box_[1] - pad)) & ~7);
+        const int x1 = std::min(width, static_cast<int>(std::ceil(box_[2] + pad)));
+        const int y1 = std::min(height, static_cast<int>(std::ceil(box_[3] + pad)));
+        rw = std::max(0, x1 - rx);
+        rh = std::max(0, y1 - ry);
+        if (rw < 32 || rh < 32) rx = 0, ry = 0, rw = width, rh = height;
+    }
+    roi_since_full_ = (rw < width || rh < height) ? roi_since_full_ + 1 : 0;
+    roi_rescan_ = false;
+    timing_.roi_w = rw;
+    timing_.roi_h = rh;
+
+    const size_t total = static_cast<size_t>(rw) * rh;
     if (gray_.size() < total) gray_.resize(total);
 
     // RGB888 -> 8-bit gray, integer fixpoint (as aruco-detector), row by row for the crop stride
     uint8_t* gray = gray_.data();
-    for (int y = 0; y < height; ++y) {
-        const uint8_t* src = rgb + static_cast<size_t>(y) * stride;
-        uint8_t* dst = gray + static_cast<size_t>(y) * width;
-        for (int x = 0; x < width; ++x) {
+    for (int y = 0; y < rh; ++y) {
+        const uint8_t* src = rgb + static_cast<size_t>(y + ry) * stride + 3 * static_cast<size_t>(rx);
+        uint8_t* dst = gray + static_cast<size_t>(y) * rw;
+        for (int x = 0; x < rw; ++x) {
             const uint32_t r = src[3 * x], g = src[3 * x + 1], b = src[3 * x + 2];
             dst[x] = static_cast<uint8_t>((r * 77 + g * 150 + b * 29) >> 8);
         }
     }
-    image_u8_t im = {width, height, width, gray};
+    image_u8_t im = {rw, rh, rw, gray};
+
+    // Adaptive decimation: the coarse setting only while every marker of the last frame was large.
+    bool coarse = false;
+    if (cfg_.adaptive_decimate > cfg_.quad_decimate) {
+        coarse = hold_ == 0 && last_accepted_ > 0 && last_min_side_ >= cfg_.adaptive_min_side_px &&
+                 since_full_ + 1 < cfg_.adaptive_full_every;
+        since_full_ = coarse ? since_full_ + 1 : 0;
+        if (hold_ > 0) --hold_;
+    }
+    td_->quad_decimate = static_cast<float>(coarse ? cfg_.adaptive_decimate : cfg_.quad_decimate);
+    timing_.quad_decimate = td_->quad_decimate;
 
     const auto t1 = clock::now();
     zarray_t* detections = apriltag_detector_detect(td_, &im);
@@ -146,6 +178,15 @@ int ArucoStage::run(const uint8_t* rgb, int width, int height, int stride, std::
         apriltag_detection_t* det = nullptr;
         zarray_get(detections, i, &det);
         if (!det) continue;
+        if (rx || ry) {  // ROI -> image pixels: corners, centre and H' = T(rx, ry) * H
+            for (int p = 0; p < 4; ++p) det->p[p][0] += rx, det->p[p][1] += ry;
+            det->c[0] += rx;
+            det->c[1] += ry;
+            for (int j = 0; j < 3; ++j) {
+                MATD_EL(det->H, 0, j) += rx * MATD_EL(det->H, 2, j);
+                MATD_EL(det->H, 1, j) += ry * MATD_EL(det->H, 2, j);
+            }
+        }
 
         const aruco::FilterVerdict verdict =
             aruco::classify_marker(cfg_.filter, det->id, det->decision_margin, det->p);
@@ -214,6 +255,32 @@ int ArucoStage::run(const uint8_t* rgb, int width, int height, int stride, std::
         if (H_u) matd_destroy(H_u);
     }
     apriltag_detections_destroy(detections);
+    if (cfg_.roi_tracking) {
+        const int accepted = static_cast<int>(out.size());
+        if (accepted < last_accepted_) roi_rescan_ = true;  // lost one (or it left the ROI): full scan next
+        box_[0] = box_[1] = 1e9;
+        box_[2] = box_[3] = -1e9;
+        box_side_ = 0;
+        for (const MarkerOut& m : out) {
+            for (int p = 0; p < 4; ++p) {
+                box_[0] = std::min(box_[0], m.p[p][0]);
+                box_[1] = std::min(box_[1], m.p[p][1]);
+                box_[2] = std::max(box_[2], m.p[p][0]);
+                box_[3] = std::max(box_[3], m.p[p][1]);
+            }
+            for (int p = 0; p < 4; ++p) {
+                const int q = (p + 1) & 3;
+                box_side_ = std::max(box_side_, std::hypot(m.p[q][0] - m.p[p][0], m.p[q][1] - m.p[p][1]));
+            }
+        }
+    }
+    if (cfg_.adaptive_decimate > cfg_.quad_decimate || cfg_.roi_tracking) {
+        const int accepted = static_cast<int>(out.size());
+        if (coarse && accepted < last_accepted_) hold_ = cfg_.adaptive_hold_frames;  // lost one: fine scans
+        last_accepted_ = accepted;
+        last_min_side_ = 1e9;
+        for (const MarkerOut& m : out) last_min_side_ = std::min(last_min_side_, aruco::min_quad_side(m.p));
+    }
     const auto t3 = clock::now();
     timing_.gray_ms = ms(t0, t1);
     timing_.detect_ms = ms(t1, t2);
@@ -249,9 +316,10 @@ std::string aruco_stages_json(const ArucoTiming& t) {
     std::snprintf(b, sizeof(b),
                   "{\"gray\":%.1f,\"decimate\":%.1f,\"threshold\":%.1f,\"unionfind\":%.1f,\"clusters\":%.1f,"
                   "\"quad_fit\":%.1f,\"refine\":%.1f,\"decode\":%.1f,\"detect_other\":%.1f,\"filter\":%.1f,"
-                  "\"pose\":%.1f,\"quads\":%d}",
+                  "\"pose\":%.1f,\"quads\":%d,\"quad_decimate\":%.1f,\"roi\":[%d,%d]}",
                   t.gray_ms, t.decimate_ms, t.threshold_ms, t.unionfind_ms, t.clusters_ms, t.quad_fit_ms,
-                  t.refine_ms, t.decode_ms, t.detect_other_ms, t.filter_ms, t.pose_ms, t.quads);
+                  t.refine_ms, t.decode_ms, t.detect_other_ms, t.filter_ms, t.pose_ms, t.quads, t.quad_decimate,
+                  t.roi_w, t.roi_h);
     return b;
 }
 

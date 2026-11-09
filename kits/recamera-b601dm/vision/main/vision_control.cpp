@@ -201,7 +201,7 @@ int VisionControl::current_fps() const {
     return fps_locked();
 }
 
-Pipelines VisionControl::frame_plan(uint64_t frame_ms) {
+Pipelines VisionControl::frame_plan(uint64_t frame_ms, Pipelines* triggered) {
     bool expired = false;
     Pipelines p;
     {
@@ -213,9 +213,12 @@ Pipelines VisionControl::frame_plan(uint64_t frame_ms) {
         }
         const Continuous c = continuous_locked();
         if (c.active() && gate_.accept(frame_ms, c.fps)) p = c.pipelines;
+        Pipelines tp;
         for (const Trigger& t : triggers_) {
-            if (t.request_ms <= frame_ms) p = p | t.pipelines;
+            if (t.request_ms <= frame_ms) tp = tp | t.pipelines;
         }
+        p = p | tp;
+        if (triggered) *triggered = tp;
     }
     if (expired) cv_.notify_all();
     return p;
