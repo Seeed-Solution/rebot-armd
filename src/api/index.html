@@ -1396,8 +1396,8 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
       <button class="btn calib-x" id="calib-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
     </div>
     <div class="seg calib-mode" id="calib-mode" role="radiogroup" data-i18n-aria="calib.mode" aria-label="相机安装方式">
-      <button type="button" data-mode="eye_in_hand" class="on" role="radio" aria-checked="true" data-i18n="calib.mode.eih">相机在夹爪上（眼在手上）</button>
-      <button type="button" data-mode="eye_to_hand" role="radio" aria-checked="false" data-i18n="calib.mode.eth">相机固定（眼在手外）</button>
+      <button type="button" data-mode="eye_in_hand" class="on" role="radio" aria-checked="true" data-i18n="calib.mode.eih">相机在夹爪上</button>
+      <button type="button" data-mode="eye_to_hand" role="radio" aria-checked="false" data-i18n="calib.mode.eth">相机固定</button>
     </div>
     <p class="calib-hint" id="calib-hint">眼在手上：相机装在夹爪上，把一个 ArUco 标记固定在桌面上不动。</p>
     <div class="calib-prog">
@@ -1450,7 +1450,7 @@ const I18N = {
     'calib.ok.cap': '已采集第 {n} 个点位', 'calib.ok.solve': '标定完成，RMSE {rmse} mm', 'calib.rmse.warn': '残差偏大，检查标记是否与 TCP 重合、点位是否静止',
     'calib.r.t': '平移 T (mm)', 'calib.r.e': '欧拉角 RPY (°)', 'calib.r.rmse': '残差 RMSE', 'calib.r.n': '样本数', 'calib.r.max': '最大残差',
     'calib.need_more': '已可求解；建议采满 {total} 个', 'calib.del': '删除',
-    'calib.mode': '相机安装方式', 'calib.mode.eih': '相机在夹爪上（眼在手上）', 'calib.mode.eth': '相机固定（眼在手外）',
+    'calib.mode': '相机安装方式', 'calib.mode.eih': '相机在夹爪上', 'calib.mode.eth': '相机固定',
     'calib.mode.confirm': '切换模式会清空已采集的 {n} 个位姿，再点一次确认',
     'calib.hint.eih': '眼在手上：相机装在夹爪上，把一个 ArUco 标记固定在桌面上不动。每次把机械臂移到新位姿，从明显不同的角度看向标记（至少绕两个不同的轴转动，组合使用 J1、J4、J5、J6），标记保持完整在画面内，静止后采集一次，至少采 9 个位姿。',
     'calib.live.none.eih': '未识别到带 6D 位姿（位置+姿态）的标记 · 采集时会自动单次识别',
@@ -1555,7 +1555,7 @@ const I18N = {
     'calib.ok.cap': 'Captured pose {n}', 'calib.ok.solve': 'Calibration solved, RMSE {rmse} mm', 'calib.rmse.warn': 'High residual: check the marker sits on the TCP and the arm was still',
     'calib.r.t': 'Translation T (mm)', 'calib.r.e': 'Euler RPY (°)', 'calib.r.rmse': 'Residual RMSE', 'calib.r.n': 'Samples', 'calib.r.max': 'Max residual',
     'calib.need_more': 'Solvable; {total} poses recommended', 'calib.del': 'Delete',
-    'calib.mode': 'Camera mounting', 'calib.mode.eih': 'Camera on gripper (eye-in-hand)', 'calib.mode.eth': 'Camera fixed (eye-to-hand)',
+    'calib.mode': 'Camera mounting', 'calib.mode.eih': 'Camera on gripper', 'calib.mode.eth': 'Fixed camera',
     'calib.mode.confirm': 'Switching mode clears the {n} captured poses; tap again to confirm',
     'calib.hint.eih': 'Eye-in-hand: the camera is mounted on the gripper and one ArUco marker is fixed on the table. Move the arm to a new pose and view the marker from a clearly different angle (rotate about at least two different axes; combine J1, J4, J5 and J6), keep the whole marker in view, wait until the arm stops, then capture. Capture 9 or more poses.',
     'calib.live.none.eih': 'No marker with a 6-D pose (position + orientation) · capture will run a snapshot',
