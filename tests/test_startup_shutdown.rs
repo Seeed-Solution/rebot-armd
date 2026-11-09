@@ -184,10 +184,6 @@ async fn mock_shutdown_does_not_wait_for_an_open_websocket() {
 #[test]
 fn init_stop_refuses_unknown_or_uncooperative_processes_without_killing() {
     let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
-    assert_eq!(
-        source,
-        include_str!("../kits/recamera-b601dm/packaging/pkg/etc/init.d/K92rebot-teleop")
-    );
     assert!(source.contains("restart) stop || exit $?;"));
     let start = source.find("stop_video() {").unwrap();
     let end = source.find("\nstatus() {").unwrap();

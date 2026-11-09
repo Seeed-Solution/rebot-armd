@@ -149,8 +149,7 @@ The official kit's package (`kits/recamera-b601dm/packaging/`, deb `rebot-teleop
 | `/usr/share/rebot-teleop/rebot-teleop.json` (+ `.md`, `.zh.md`) | gallery manifest for the reCamera console, `"requires": ["can"]` |
 | `DEBIAN/control`, `postinst`, `prerm` | `packaging/debian/` |
 
-`packaging/pkg/` is an older copy of the same layout; a test checks that its init script equals
-the one in `rootfs/`. The init script passes `--config` only for the `rebot-dm` follower and
+The init script passes `--config` only for the `rebot-dm` follower and
 only when the profile file exists.
 
 ## Repository layout
