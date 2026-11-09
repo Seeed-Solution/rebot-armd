@@ -410,7 +410,7 @@ static void test_result_json() {
     // a box centred on the content band centre stays centred; height scales by 640/360
     std::vector<DetBox> d = {{0.5f, 0.5f, 0.1f, 0.18f, 0.71f, 39, "bottle"}};
     json j = json::parse(detections_json(d, content_rect(640, 640, 1280, 720), 640, 640));
-    CHECK(j.size() == 1 && j[0]["class_name"] == "bottle" && j[0]["class_id"] == 39);
+    CHECK(j.size() == 1 && j[0]["class_name"] == "bottle" && j[0]["class_id"] == 39 && j[0]["format"] == "xywh_center");
     CHECK(std::abs(j[0]["x"].get<double>() - 0.5) < 1e-3 && std::abs(j[0]["y"].get<double>() - 0.5) < 1e-3);
     CHECK(std::abs(j[0]["h"].get<double>() - 0.32) < 1e-3 && std::abs(j[0]["w"].get<double>() - 0.1) < 1e-3);
     // top of the content band (model y = 140/640) maps to 0

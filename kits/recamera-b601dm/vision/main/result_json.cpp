@@ -40,7 +40,7 @@ std::string detections_json(const std::vector<DetBox>& dets, const ContentRect& 
         const float y = (d.y * inference_h - rect.y) / rh;
         const float w = d.w * inference_w / rw;
         const float h = d.h * inference_h / rh;
-        s << "{\"class_id\":" << d.class_id << ",\"class_name\":\"";
+        s << "{\"class_id\":" << d.class_id << ",\"format\":\"xywh_center\",\"class_name\":\"";
         json_escape(s, d.class_name);
         s << "\",\"confidence\":" << std::setprecision(3) << d.confidence << ",\"x\":" << std::setprecision(4) << x
           << ",\"y\":" << y << ",\"w\":" << w << ",\"h\":" << h << '}';
