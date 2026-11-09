@@ -207,6 +207,10 @@ pub struct GravityCompPolicy {
     pub torque_limits_nm: Vec<f32>,
     /// A joint faster than this (rad/s) ...
     pub max_speed_rad_s: f32,
+    /// Optional per-joint overspeed limits (rad/s) for J1..J6; empty uses `max_speed_rad_s` for all.
+    /// The light wrist joints move faster than 1.5 rad/s under normal hand guiding.
+    #[serde(default)]
+    pub joint_max_speed_rad_s: Vec<f32>,
     /// ... for this many consecutive ticks ends the mode with GRAVITY_COMP_OVERSPEED.
     pub overspeed_ticks: u32,
     /// MIT stiffness used while entering (faded out) and while exiting (N·m/rad).
@@ -227,6 +231,13 @@ pub struct GravityCompPolicy {
 }
 
 impl GravityCompPolicy {
+    /// Overspeed limit for arm joint `i` (0-based, J1..J6).
+    pub fn speed_limit(&self, i: usize) -> f32 {
+        self.joint_max_speed_rad_s.get(i).copied().unwrap_or(self.max_speed_rad_s)
+    }
+}
+
+impl GravityCompPolicy {
     /// B601-DM defaults. The torque limits sit above the model torque over the usual
     /// workspace (URDF maxima on a joint grid: J2 16.3, J3 7.8, J4 2.2, J5 0.8 N·m), so
     /// J2 is not fully supported when the arm is stretched out horizontally.
@@ -235,10 +246,12 @@ impl GravityCompPolicy {
             ramp_in_s: 1.0,
             scale: 1.0,
             scale_range: [0.5, 1.2],
-            damping_kd: vec![0.4, 0.6, 0.5, 0.2, 0.15, 0.1],
+            damping_kd: vec![0.4, 0.6, 0.5, 0.35, 0.15, 0.1],
             damping_kd_max: 2.0,
             torque_limits_nm: vec![2.0, 12.0, 8.5, 3.0, 1.5, 0.5],
             max_speed_rad_s: 1.5,
+            // measured 2026-11-09: a hand flick of the wrist reached 2.5 rad/s on J4
+            joint_max_speed_rad_s: vec![1.5, 1.5, 1.5, 3.0, 3.0, 3.0],
             overspeed_ticks: 3,
             hold_kp: vec![30.0, 30.0, 30.0, 15.0, 10.0, 8.0],
             hold_kd: vec![1.0, 1.0, 1.0, 0.5, 0.3, 0.2],
@@ -261,6 +274,7 @@ impl GravityCompPolicy {
             || self.damping_kd.iter().any(|k| *k > self.damping_kd_max)
             || !six(&self.torque_limits_nm) || self.torque_limits_nm.iter().any(|t| *t > 18.0)
             || !pos(self.max_speed_rad_s) || self.overspeed_ticks == 0
+            || !(self.joint_max_speed_rad_s.is_empty() || (six(&self.joint_max_speed_rad_s) && self.joint_max_speed_rad_s.iter().all(|v| pos(*v))))
             || !six(&self.hold_kp) || self.hold_kp.iter().any(|k| *k > 500.0)
             || !six(&self.hold_kd) || self.hold_kd.iter().any(|k| *k > 5.0)
             || self.exit_hold_ms > 2000 || !pos(self.entry_max_velocity) || self.feedback_max_age_ms == 0

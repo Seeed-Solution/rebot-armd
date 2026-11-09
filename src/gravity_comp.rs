@@ -361,7 +361,7 @@ impl SupervisorInner {
             let reported = self.measured_velocities.get(i).copied().unwrap_or(0.0).abs();
             let differenced = prev.map_or(0.0, |p| ((measured[i] - p[i]) / dt.max(1e-3) as f32).abs());
             let speed = reported.max(differenced);
-            if speed > policy.max_speed_rad_s && fastest.is_none_or(|(_, s)| speed > s) { fastest = Some((i, speed)); }
+            if speed > policy.speed_limit(i) && fastest.is_none_or(|(_, s)| speed > s) { fastest = Some((i, speed)); }
         }
         let run = self.gravity_comp.as_mut()?;
         run.prev_measured = Some(measured);
@@ -370,7 +370,7 @@ impl SupervisorInner {
                 run.overspeed_count += 1;
                 if run.overspeed_count >= policy.overspeed_ticks {
                     return Some(("GRAVITY_COMP_OVERSPEED", format!(
-                        "Joint {} at {speed:.2} rad/s for {} ticks (limit {} rad/s)", i + 1, run.overspeed_count, policy.max_speed_rad_s)));
+                        "Joint {} at {speed:.2} rad/s for {} ticks (limit {} rad/s)", i + 1, run.overspeed_count, policy.speed_limit(i))));
                 }
             }
             None => run.overspeed_count = 0,

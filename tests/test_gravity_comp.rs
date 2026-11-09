@@ -315,7 +315,7 @@ async fn ramp_in_fades_stiffness_out_and_model_in_then_exit_holds() {
         let i = r.sup.inner().read().await;
         let run = i.gravity_comp_run().unwrap();
         assert!(run.kp.iter().all(|k| *k == 0.0), "kp 0 when floating: {:?}", run.kp);
-        assert_eq!(run.kd.to_vec(), vec![0.4, 0.6, 0.5, 0.2, 0.15, 0.1]);
+        assert_eq!(run.kd.to_vec(), vec![0.4, 0.6, 0.5, 0.35, 0.15, 0.1]);
     }
     let drift = max_dev(&r.q(), &entry);
     println!("SIM exact model: drift after 1.1 s ramp = {drift:.4} rad");
@@ -624,4 +624,55 @@ async fn motion_commands_are_busy_while_floating() {
     assert!(matches!(i.plan_input().unwrap_err(), ArmError::Motion(armd::motion::MotionError::MotionBusy(_))));
     assert_eq!(i.set_torque(false).unwrap_err(), armd::SafetyError::MotionBusy);
     assert_eq!(i.gravity_comp_run().unwrap().phase.name(), "active", "rejections do not end the mode");
+}
+
+// ---------------------------------------------------------------- per-joint overspeed limits
+
+#[tokio::test]
+async fn fast_wrist_hand_motion_does_not_exit_but_fast_elbow_does() {
+    // Real arm 2026-11-09: a hand flick of the wrist reached 2.5 rad/s on J4 and ended the
+    // mode with the single 1.5 rad/s limit. rebot-dm now allows 3.0 rad/s on J4..J6.
+    let r = rig(0.0).await;
+    r.enter().await.unwrap();
+    r.ticks(60).await;
+    { let mut s = r.sim.lock().unwrap(); s.user_torque[3] = 0.8; }
+    let mut peak = 0.0f32;
+    for _ in 0..40 {
+        let obs = r.ticks(1).await;
+        peak = peak.max(obs.velocities[3].abs());
+        assert_eq!(obs.control_mode, ControlMode::GravityComp, "wrist hand motion must not end the mode");
+    }
+    { let mut s = r.sim.lock().unwrap(); s.user_torque = [0.0; 6]; }
+    println!("SIM wrist push: J4 peak {peak:.2} rad/s");
+    assert!(peak > 1.5 && peak < 3.0, "test must exercise the band between the old and new limit: {peak}");
+    r.ticks(30).await;
+
+    // the elbow keeps the 1.5 rad/s fall detection
+    { let mut s = r.sim.lock().unwrap(); s.user_torque[2] = -6.0; }
+    let mut exited = false;
+    for _ in 0..100 {
+        let obs = r.ticks(1).await;
+        if obs.gravity_comp.phase.as_deref() == Some("exiting") || obs.control_mode != ControlMode::GravityComp { exited = true; break; }
+    }
+    { let mut s = r.sim.lock().unwrap(); s.user_torque = [0.0; 6]; }
+    assert!(exited, "fast J3 must still end the mode");
+    let obs = r.sup.get_observation().await;
+    let exit = obs.gravity_comp.last_exit.as_ref().unwrap();
+    assert_eq!(exit.code, "GRAVITY_COMP_OVERSPEED");
+    assert!(exit.message.contains("Joint 3"), "{}", exit.message);
+}
+
+#[test]
+fn per_joint_speed_limits_validate() {
+    let mut config = ArmConfig::rebot_dm();
+    let gc = config.gravity_comp.as_ref().unwrap();
+    assert_eq!((0..6).map(|i| gc.speed_limit(i)).collect::<Vec<_>>(), vec![1.5, 1.5, 1.5, 3.0, 3.0, 3.0]);
+    assert!(config.validate().is_ok());
+    config.gravity_comp.as_mut().unwrap().joint_max_speed_rad_s = vec![1.5; 5];
+    assert!(config.validate().is_err(), "wrong length");
+    config.gravity_comp.as_mut().unwrap().joint_max_speed_rad_s = vec![1.5, 1.5, 1.5, 0.0, 3.0, 3.0];
+    assert!(config.validate().is_err(), "zero limit");
+    config.gravity_comp.as_mut().unwrap().joint_max_speed_rad_s = vec![];
+    assert!(config.validate().is_ok(), "empty falls back to max_speed_rad_s");
+    assert_eq!(config.gravity_comp.as_ref().unwrap().speed_limit(4), 1.5);
 }
