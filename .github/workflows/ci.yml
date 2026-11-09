@@ -39,3 +39,18 @@ jobs:
         run: node scripts/calib_selftest.mjs
       - name: RPC error contract
         run: node tests/test_rpc_error_contract.js
+
+  kits:
+    # Shell syntax of the kit init scripts (the deb itself needs the SG2002 toolchain).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init script syntax
+        run: |
+          for f in kits/recamera-b601dm/packaging/rootfs/etc/init.d/* \
+                   kits/recamera-b601dm/packaging/pkg/etc/init.d/* \
+                   kits/_template/packaging/etc/init.d/*; do
+            sh -n "$f" && echo "ok $f"
+          done
+      - name: Build script syntax
+        run: bash -n scripts/build_deb.sh
