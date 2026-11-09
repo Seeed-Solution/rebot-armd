@@ -95,6 +95,13 @@ Damiao motors map the 16-bit position and 12-bit velocity / torque fields of fee
 | Cockpit joint table torque / velocity columns | — | unchanged | Display only; values are now real units |
 | Recorded episodes (`observation.state` torques / velocities) | — | — | Recordings made before this change carry the old scaling on J1–J7 torque and J1–J3 velocity |
 
+**Hardware checks still to do (B601-DM):**
+1. Start `armd`; the log shows `Damiao mapping ranges of 7 motors match the configuration` and the observation has `driver_range_check.status` = `passed` with `ctrl_mode` 2 on every joint.
+2. Jog J3 at a known speed (for example 0.45 rad/s planned): the reported J1–J3 velocity is about 1/3 of the value before this change and matches the position difference per second.
+3. Close the gripper on an object: the stall latches and releases as before (reported |τ7| about 0.556× the former reading).
+4. Park: torque is released at the resting pose as before (J2 / J3 torque reads about 1.56× the former value, inside 2.333 / 7.0 N·m).
+5. Gravity compensation entry is no longer refused by the MIT range readback.
+
 达妙电机把反馈帧与 MIT 帧中 16 位位置、12 位速度 / 力矩字段映射到 ±PMAX、±VMAX、±TMAX（21–23 号寄存器）。B601-DM 各电机读出的值（2026-11-09；请求为 `0x7FF` 上的 `[id, 0, 0x33, rid, 0, 0, 0, 0]`，应答为 `0x10 + id` 上的 `[id, 0, 0x33, rid, 值 小端]`）：J1–J3 CTRL_MODE 2、PMAX 12.5、VMAX 10、TMAX 28；J4–J7 CTRL_MODE 2、PMAX 12.5、VMAX 30、TMAX 10。rebot-dm profile 把它们写在 `damiao_ranges` 中，反馈解码与 MIT 编码按关节使用各自范围。此前所有电机都按 12.5 / 30 / 18 解码：J1–J3 速度读数为实际值的 3 倍，J1–J3 力矩为 0.643 倍，J4–J7 力矩为 1.8 倍。基于这些读数整定的阈值已换算（见下表）。
 
 - **启动量程检查**：`armd` 挂载 rebot-dm 驱动时，在任何使能之前读取每个电机的 10、21、22、23 号寄存器（读寄存器不改变使能状态，不发送使能帧）。每个电机最多等 20 ms：全部应答时约为 7 ×（4 帧 + 应答），七个电机都不应答时最多 140 ms。结果在每帧观测中以 `driver_range_check` 发布（`status` 为 `passed` | `mismatch` | `unverified`，另有 `message`、`duration_ms`，以及每个关节的 `joint`、`motor_id`、`status`、`ctrl_mode`、`reported` [PMAX, VMAX, TMAX] 或 null、`configured`）。
@@ -129,6 +136,13 @@ Damiao motors map the 16-bit position and 12-bit velocity / torque fields of fee
 | 驾驶舱夹爪“已堵转” `\|v7\| < 0.05` | 0.05 rad/s | 不变 | J7 解码不变 |
 | 驾驶舱关节表力矩 / 速度列 | — | 不变 | 仅显示，数值现为实际单位 |
 | 录制数据（`observation.state` 中的力矩 / 速度） | — | — | 此前录制的数据中 J1–J7 力矩与 J1–J3 速度仍是旧缩放 |
+
+**待做的实机检查（B601-DM）**：
+1. 启动 `armd`；日志出现 `Damiao mapping ranges of 7 motors match the configuration`，观测中 `driver_range_check.status` 为 `passed`，每个关节 `ctrl_mode` 为 2。
+2. 以已知速度点动 J3（例如规划速度 0.45 rad/s）：J1–J3 上报速度约为改动前的 1/3，并与每秒位置差一致。
+3. 夹爪夹住物体：堵转锁存与解除与之前一致（上报 |τ7| 约为旧读数的 0.556 倍）。
+4. 收纳：到达收纳位后照常断力矩（J2 / J3 力矩读数约为旧值的 1.56 倍，在 2.333 / 7.0 N·m 以内）。
+5. 进入重力补偿时不再被 MIT 范围读回拒绝。
 
 ## Gravity compensation (hand-guiding) / 重力补偿（拖动示教）
 

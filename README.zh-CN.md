@@ -223,7 +223,7 @@ export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 
 | 路径 | 方法 | 用途 |
 |---|---|---|
-| `/api/v1/observation` | GET | 位置、速度、力矩、温度、安全状态、`commanded_positions`、最近的 `action`、驱动能力 |
+| `/api/v1/observation` | GET | 位置、速度、力矩、温度、安全状态、`commanded_positions`、最近的 `action`、驱动能力、`driver_range_check`（启动时从电机读出的达妙映射范围） |
 | `/api/v1/observation/schema` | GET | 自由度、关节名、限位、工作空间、相机安装参数 |
 | `/api/v1/ws` | WS | 租约（`acquire_lease`、`heartbeat`）、`command` / `command_ack` / `command_reject`、遥测 |
 | `/api/v1/safety/e_stop` | POST | 急停，不需要租约 |

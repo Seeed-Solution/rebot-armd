@@ -301,7 +301,7 @@ WebSocket that holds the lease.
 
 | Path | Method | Purpose |
 |---|---|---|
-| `/api/v1/observation` | GET | positions, velocities, torques, temperatures, safety state, `commanded_positions`, latest `action`, driver capabilities |
+| `/api/v1/observation` | GET | positions, velocities, torques, temperatures, safety state, `commanded_positions`, latest `action`, driver capabilities, `driver_range_check` (Damiao mapping ranges read from the motors at startup) |
 | `/api/v1/observation/schema` | GET | DOF, joint names, limits, workspace, camera mount |
 | `/api/v1/ws` | WS | lease (`acquire_lease`, `heartbeat`), `command` / `command_ack` / `command_reject`, telemetry |
 | `/api/v1/safety/e_stop` | POST | E-stop, no lease needed |
