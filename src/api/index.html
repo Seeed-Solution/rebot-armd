@@ -3050,9 +3050,11 @@ async function loadSchema() {
       S.dof = sc.dof || sc.limits.length;
       GRIP = S.dof - 1;
       S.hold = Array.from({ length: S.dof }, () => [0, 0]);
-      if (oldDof !== S.dof) {
-        I18N_VARIANT = S.dof === 7 ? '@7' : '';
-        document.querySelectorAll('.kb-dof7').forEach((el) => { el.hidden = S.dof !== 7; });
+      // S.dof defaults to 7, so the 7-DOF text variant is set on every schema load, not only on a DOF change.
+      const variant = S.dof === 7 ? '@7' : '';
+      document.querySelectorAll('.kb-dof7').forEach((el) => { el.hidden = S.dof !== 7; });
+      if (oldDof !== S.dof || variant !== I18N_VARIANT) {
+        I18N_VARIANT = variant;
         renderJogRows();
         renderGripCol();
         applyI18n();
