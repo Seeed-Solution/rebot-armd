@@ -191,8 +191,8 @@ copy it to the camera and install it. `192.168.42.1` is the reCamera's address o
 when connected to the access point that this package starts, the camera is `192.168.16.1`.
 
 ```bash
-scp dist/rebot-teleop_1.3.0_riscv64.deb root@192.168.42.1:/tmp/
-ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.3.0_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
+scp dist/rebot-teleop_1.3.1_riscv64.deb root@192.168.42.1:/tmp/
+ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.3.1_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
 ```
 
 The package installs:
@@ -268,9 +268,9 @@ git clone --depth 1 https://github.com/sophgo/host-tools
 export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 
 RECAMERA_DOCKER=tpuc_recamera \
-./scripts/build_deb.sh 1.3.0          # version argument optional (default: debian/control)
+./scripts/build_deb.sh 1.3.1          # version argument optional (default: debian/control)
 # -> target/riscv64gc-unknown-linux-musl/release/armd
-# -> dist/rebot-teleop_1.3.0_riscv64.deb
+# -> dist/rebot-teleop_1.3.1_riscv64.deb
 
 ./scripts/build_deb.sh --flavor lite  # armd only, no reCamera kit files
 # -> dist/armd-lite_0.1.0_riscv64.tar.gz (armd, LICENSE, THIRD_PARTY_NOTICES.md)
