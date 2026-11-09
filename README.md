@@ -61,7 +61,7 @@ the Debian package that installs it on the reCamera is `rebot-teleop` (init scri
 
 ## Hardware
 
-Tested:
+Verified on real hardware:
 
 | Item | Details |
 |---|---|
@@ -69,21 +69,28 @@ Tested:
 | Controller | Seeed reCamera (SG2002) with the B4 CAN board, `can0` at 1 Mbit/s (the init script configures it) |
 | Motor mode | Damiao `POS_VEL` (position and velocity limit), the default and only mode selectable from the CLI |
 
-Present in the source but **not tested on hardware**:
+Under verification (drivers exist in the code; not run on a real arm, not supported yet):
 
 | `--follower` | Driver | Bus | Notes |
 |---|---|---|---|
 | `rebot-rs` | RobStride (MIT mode, 29-bit CAN IDs) | SocketCAN | 6 joints; no enable confirmation, so automatic disable and fault clearing are refused |
 | `so-arm101` | Feetech STS (SO-ARM101) | serial, 1,000,000 baud | 6 joints; position, velocity and temperature feedback, no torque or enable feedback |
 | `fashionstar`, `star-arm102` | FashionStar | serial, 115,200 baud | 6 joints; the driver declares no feedback capabilities |
-| `mock` | in-process simulation | — | default; used by the tests and for UI work without an arm |
 
-The protocol encoders of these drivers are covered by unit tests (`tests/test_protocol_vectors.rs`,
-`tests/test_driver_capabilities.rs`), not by runs on a real arm. They use the generic 6-joint
-profile without kinematics or a workspace, so Cartesian actions return `UNSUPPORTED`. The
-Damiao driver also has an MIT mode with gravity feed-forward, but it can only be enabled from
-code (`DamiaoArmDriver::with_control_mode`), not from the CLI or a profile. Leader-follower
-teleoperation is not implemented; `--leader` / `--leader-port` are rejected.
+`mock` (in-process simulation, the default) is used by the tests and for UI work without an arm.
+
+The protocol encoders of the drivers under verification are covered by unit tests
+(`tests/test_protocol_vectors.rs`, `tests/test_driver_capabilities.rs`). They use the generic
+6-joint profile without kinematics or a workspace, so Cartesian actions return `UNSUPPORTED`.
+The Damiao driver also has an MIT mode with gravity feed-forward, but it can only be enabled
+from code (`DamiaoArmDriver::with_control_mode`), not from the CLI or a profile.
+
+TODO / roadmap:
+
+- [ ] Verify `rebot-rs` (RobStride), `so-arm101` (Feetech STS) and `fashionstar` / `star-arm102`
+      (FashionStar) on real arms, with profiles that include kinematics and a workspace.
+- [ ] Make the Damiao MIT mode (gravity feed-forward) selectable and verify it on the B601-DM.
+- [ ] Leader-follower teleoperation (not implemented; `--leader` / `--leader-port` are rejected).
 
 ---
 

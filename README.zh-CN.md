@@ -54,7 +54,7 @@
 
 ## 硬件
 
-已测试：
+已在真机上验证：
 
 | 项目 | 说明 |
 |---|---|
@@ -62,16 +62,23 @@
 | 控制器 | Seeed reCamera（SG2002）+ B4 CAN 底板，`can0` 1 Mbit/s（由 init 脚本配置） |
 | 电机模式 | 达妙 `POS_VEL`（位置 + 速度上限），默认模式，也是命令行唯一可选的模式 |
 
-源码中存在但**未在硬件上测试**：
+验证中（代码中已有驱动，未在真实机械臂上运行，暂不属于支持范围）：
 
 | `--follower` | 驱动 | 总线 | 说明 |
 |---|---|---|---|
 | `rebot-rs` | RobStride（MIT 模式，29 位 CAN ID） | SocketCAN | 6 关节；无使能确认，因此自动断力矩和清除故障会被拒绝 |
 | `so-arm101` | 飞特 STS（SO-ARM101） | 串口，1,000,000 波特 | 6 关节；有位置、速度、温度反馈，无力矩与使能反馈 |
 | `fashionstar`、`star-arm102` | FashionStar | 串口，115,200 波特 | 6 关节；驱动未声明任何反馈能力 |
-| `mock` | 进程内仿真 | — | 默认值；用于测试和无机械臂时的界面开发 |
 
-这些驱动的协议编码由单元测试覆盖（`tests/test_protocol_vectors.rs`、`tests/test_driver_capabilities.rs`），没有在真实机械臂上运行过。它们使用通用 6 关节 profile，没有运动学和工作空间，笛卡尔动作返回 `UNSUPPORTED`。达妙驱动另有带重力前馈的 MIT 模式，但只能在代码中启用（`DamiaoArmDriver::with_control_mode`），命令行和 profile 都不能选择。主从示教未实现，`--leader` / `--leader-port` 会被拒绝。
+`mock`（进程内仿真，默认值）用于测试和无机械臂时的界面开发。
+
+验证中驱动的协议编码由单元测试覆盖（`tests/test_protocol_vectors.rs`、`tests/test_driver_capabilities.rs`）。它们使用通用 6 关节 profile，没有运动学和工作空间，笛卡尔动作返回 `UNSUPPORTED`。达妙驱动另有带重力前馈的 MIT 模式，但只能在代码中启用（`DamiaoArmDriver::with_control_mode`），命令行和 profile 都不能选择。
+
+TODO / 路线图：
+
+- [ ] 在真实机械臂上验证 `rebot-rs`（RobStride）、`so-arm101`（飞特 STS）和 `fashionstar` / `star-arm102`（FashionStar），并提供带运动学和工作空间的 profile。
+- [ ] 支持选择达妙 MIT 模式（重力前馈）并在 B601-DM 上验证。
+- [ ] 主从示教（未实现；`--leader` / `--leader-port` 会被拒绝）。
 
 ---
 
