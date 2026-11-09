@@ -4263,7 +4263,8 @@ function cartTickView() {
   // lag guard over J1..J6: do not let the command run ahead of a slow / blocked arm
   const mq = toMotor6(C.q6);
   const lag = Math.max(...mq.map((x, i) => Math.abs(x - pos[i])));
-  const a = 0.20, b = 0.35;
+  // tighter than base mode: a camera-frame move often needs one slow joint (J1) to cover most of the path
+  const a = 0.08, b = 0.20;
   const factor = clamp(1.0 - (lag - a) / (b - a), 0.0, 1.0);
   if (lag > 0.40) {
     if (!C.stallSince) C.stallSince = now;
@@ -4292,8 +4293,8 @@ function cartTickView() {
       C.T = cand; C.q6 = sol.q;
       if (C.status !== 'ok') { C.status = 'ok'; C.msg = ''; }
     }
-  } else if (lag > 0.05 && now > C.tailUntil) {
-    cartSync(pos);
+  } else if (lag > 0.05 && !settling) {
+    cartSync(pos); // still off after the settle window: the arm is blocked, give up the rest of the move
   }
 
   if (pos.length > GRIP && gv) {
@@ -4308,7 +4309,12 @@ function cartTickView() {
   if (t.length > GRIP) t[GRIP] = gripRad();
   t = clampTarget(t);
   const converging = t.some((x, i) => Math.abs(x - pos[i]) > 0.02);
-  t = t.map((x, i) => clamp(x, pos[i] - (i === GRIP ? CFG.gripLead : CFG.maxLead), pos[i] + (i === GRIP ? CFG.gripLead : CFG.maxLead)));
+  // one shared lead factor for J1..J6: clamping each joint on its own lets the fast wrist joints arrive
+  // while J1 trails, which turns a straight camera-frame move into a rotation
+  const lead = Math.max(...t.slice(0, 6).map((x, i) => Math.abs(x - pos[i])));
+  const k = lead > CFG.maxLead ? CFG.maxLead / lead : 1;
+  for (let i = 0; i < 6; i++) t[i] = pos[i] + (t[i] - pos[i]) * k;
+  if (t.length > GRIP) t[GRIP] = clamp(t[GRIP], pos[GRIP] - CFG.gripLead, pos[GRIP] + CFG.gripLead);
   if (now <= C.tailUntil || (settling && converging)) { C.sending = true; if (!S.presetRunning) cartSend(t); }
 }
 setInterval(cartTick, Math.round(1000 / CFG.cart.hz));
