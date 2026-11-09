@@ -229,6 +229,40 @@ impl SupervisorInner {
         limits
     }
 
+    /// Workspace policy and camera mount when the Cartesian check applies
+    /// (workspace and kinematics configured, 7-DOF arm).
+    pub fn workspace_policy(&self) -> Option<(&crate::model::WorkspacePolicy, &crate::model::CameraMount)> {
+        match (&self.config.workspace, self.config.kinematics) {
+            (Some(ws), Some(_)) if self.config.dof == 7 => Some((ws, &self.config.camera_mount)),
+            _ => None,
+        }
+    }
+
+    /// Reject a move whose samples leave the workspace further than `start` already is.
+    pub fn check_workspace_path<'a>(
+        &self,
+        start: &[f32],
+        samples: impl IntoIterator<Item = &'a [f32]>,
+    ) -> Result<(), SafetyError> {
+        let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
+        let v0 = crate::kinematics::workspace_violation(start, ws, cam);
+        for q in samples {
+            let v = crate::kinematics::workspace_violation(q, ws, cam);
+            if crate::kinematics::workspace_rejects(&v, &v0) {
+                let w = v.worst.unwrap_or(crate::kinematics::ViolationDetail { point: 0, limit: "invalid", value: f64::NAN, bound: 0.0 });
+                return Err(SafetyError::WorkspaceViolation {
+                    point: w.point, limit: w.limit.to_string(), value: w.value as f32, bound: w.bound as f32,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The planner's 21 verification points of a trajectory.
+    fn trajectory_samples(traj: &MultiJointQuinticTrajectory) -> Vec<Vec<f32>> {
+        (0..=20).map(|k| traj.sample(traj.duration * f64::from(k) / 20.0).positions).collect()
+    }
+
     fn gravity_output_enabled(&self) -> bool {
         self.gravity_compensated && self.config.gravity_model.is_some() && matches!(self.config.dof, 6 | 7) && self.driver.as_ref().map_or(true, |d|
             d.lock().map_or(false, |drv| drv.capabilities().torque_feedforward))
@@ -578,6 +612,11 @@ impl SupervisorInner {
                         Some(1.5),
                         &self.planning_limits(),
                     ) {
+                        // Park is exempt from the workspace check: it must always remain possible.
+                        let samples = Self::trajectory_samples(&traj);
+                        if let Err(e) = self.check_workspace_path(&clamped_start, samples.iter().map(Vec::as_slice)) {
+                            tracing::warn!("Park path leaves the workspace ({e}); parking anyway");
+                        }
                         let _ = self.safety.set_torque(true);
                         let _ = self.safety.mark_motion_started();
                         self.unload_planned_duration = Some(traj.duration);
@@ -1015,6 +1054,9 @@ impl SupervisorInner {
             &self.config.limits,
         )?;
 
+        // 1b. Cartesian workspace: the target may not leave the box further than now.
+        self.check_workspace_path(&self.commanded_positions, [targets.as_slice()])?;
+
         // Only renew lease and motion frame timestamp AFTER command validation succeeds
         self.last_heartbeat = Instant::now();
         self.last_motion_frame = Instant::now();
@@ -1089,6 +1131,8 @@ impl SupervisorInner {
             duration_secs,
             &self.planning_limits(),
         )?;
+        let samples = Self::trajectory_samples(&traj);
+        self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
 
         // 3. Only renew lease AFTER command validation and planning succeed
         self.last_heartbeat = Instant::now();

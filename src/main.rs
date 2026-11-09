@@ -113,7 +113,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--follower-port requires a hardware follower".into());
     }
     let mut config = if let Some(path) = cli.config {
-        serde_json::from_reader::<_, ArmConfig>(std::fs::File::open(path)?)?
+        let config = serde_json::from_reader::<_, ArmConfig>(std::fs::File::open(&path)?)?;
+        if config.kinematics.is_none() || config.workspace.is_none() {
+            tracing::warn!("Profile {path} has no kinematics/workspace: the Cartesian workspace check and Cartesian actions are off");
+        }
+        config
     } else if follower == "rebot-dm" {
         ArmConfig::rebot_dm()
     } else {

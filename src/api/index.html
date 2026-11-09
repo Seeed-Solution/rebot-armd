@@ -1570,7 +1570,7 @@ const I18N = {
     'err.park_unsupported': '当前机械臂缺少自动收纳所需配置或反馈能力，未启动收纳；可使用回零功能，力矩仍需现场确认',
     'err.preset_unsupported': '当前机械臂不支持自动收纳，未启动运动；可使用回零功能，力矩仍需现场确认',
     'err.rejected': '指令被拒绝', 'err.nolease': '当前页面没有控制权，请等待控制连接就绪', 'err.cmdtimeout': '设备未在时限内确认指令，请检查实际状态',
-    'err.reqfail': '请求失败：无法连接 armd', 'err.servo_reject': '控制指令被拒绝: ', 'err.preset_reject': '预设指令被拒绝: ', 'err.state_limit': '状态或限位不符', 'err.disconnected': '控制连接已断开或控制权已变化',
+    'err.reqfail': '请求失败：无法连接 armd', 'err.servo_reject': '控制指令被拒绝: ', 'err.preset_reject': '预设指令被拒绝: ', 'err.state_limit': '状态或限位不符', 'err.workspace': '目标超出安全工作空间（地面/边界），已拒绝', 'err.disconnected': '控制连接已断开或控制权已变化',
     'toast.lease_lost': '⚠️ 控制权已被其他设备接管，当前页面已切换为观察模式', 'toast.goto': '正在前往{name}', 'toast.took': '已成功接管控制权', 'toast.take_failed': '接管未成功，控制权仍由其他设备持有',
     'toast.take_rejected': '接管请求被拒绝: ', 'toast.take_timeout': '接管响应超时，正在对账控制权...', 'toast.ws_not_ready': '控制连接未就绪，请稍后再试',
     'toast.homing': '回零中', 'toast.estop_unconfirmed': '无法确认急停，请使用现场安全装置并检查机械臂状态', 'toast.estop_confirmed': '设备已确认急停锁定，仍可能保持力矩', 'toast.estop_timeout': '急停状态未确认，请检查现场安全装置',
@@ -1681,7 +1681,7 @@ const I18N = {
     'err.park_unsupported': 'This arm lacks the configuration or feedback needed for auto-park; park not started. Use Home instead; confirm torque state on site',
     'err.preset_unsupported': 'This arm does not support auto-park; no motion started. Use Home instead; confirm torque state on site',
     'err.rejected': 'Command rejected', 'err.nolease': 'This page has no control lease, wait for the control connection', 'err.cmdtimeout': 'Device did not confirm the command in time, check the actual state',
-    'err.reqfail': 'Request failed: cannot reach armd', 'err.servo_reject': 'Control command rejected: ', 'err.preset_reject': 'Preset command rejected: ', 'err.state_limit': 'state or limits mismatch', 'err.disconnected': 'Control connection lost or lease changed',
+    'err.reqfail': 'Request failed: cannot reach armd', 'err.servo_reject': 'Control command rejected: ', 'err.preset_reject': 'Preset command rejected: ', 'err.state_limit': 'state or limits mismatch', 'err.workspace': 'Target outside the safe workspace (floor/boundary), rejected', 'err.disconnected': 'Control connection lost or lease changed',
     'toast.lease_lost': '⚠️ Control was taken over by another device, this page is now an observer', 'toast.goto': 'Moving to {name}', 'toast.took': 'Control taken over', 'toast.take_failed': 'Take over failed, another device still holds control',
     'toast.take_rejected': 'Take over rejected: ', 'toast.take_timeout': 'Take over timed out, reconciling lease...', 'toast.ws_not_ready': 'Control connection not ready, try again shortly',
     'toast.homing': 'Homing', 'toast.estop_unconfirmed': 'E-Stop not confirmed, use the on-site safety device and check the arm', 'toast.estop_confirmed': 'Device confirmed E-Stop latch; torque may still be held', 'toast.estop_timeout': 'E-Stop state not confirmed, check the on-site safety device',
@@ -2123,6 +2123,12 @@ function connectWS() {
     }
     if (o.type === 'servo_reject') {
       syncEpoch(o.epoch_id);
+      if (o.code === 'WORKSPACE_VIOLATION') {
+        // server-side Cartesian safety box (floor / boundary incl. the gripper envelope)
+        if (S.mode === 'cart') cartReject('floor');
+        else toastOnce({ message: t('err.workspace'), code: o.code });
+        return;
+      }
       const msg = o.code === 'HANDOVER_SETTLING'
         ? t('err.settling2')
         : t('err.servo_reject') + (o.message || o.error || t('err.state_limit'));
@@ -2140,6 +2146,7 @@ function connectWS() {
       S.preset = null;
       const msg = o.code === 'HANDOVER_SETTLING'
         ? t('err.settling3')
+        : o.code === 'WORKSPACE_VIOLATION' ? t('err.workspace')
         : (o.code === 'UNSUPPORTED' ? t('err.preset_unsupported') : t('err.preset_reject') + (o.message || o.error || o.reason || t('err.state_limit')));
       toast(msg, 'err');
       return;
@@ -3560,6 +3567,8 @@ async function loadSchema() {
       const oldDof = S.dof;
       S.limits = sc.limits;
       S.dof = sc.dof || sc.limits.length;
+      // mirror the server's Cartesian floor so the cockpit stops at the same height
+      if (sc.workspace && Number.isFinite(sc.workspace.floor_z_m)) CFG.cart.zMin = sc.workspace.floor_z_m;
       GRIP = S.dof - 1;
       S.hold = Array.from({ length: S.dof }, () => [0, 0]);
       // S.dof defaults to 7, so the 7-DOF text variant is set on every schema load, not only on a DOF change.

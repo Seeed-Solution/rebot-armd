@@ -163,6 +163,9 @@ impl From<ArmError> for ApiError {
                     code: Some("ESTOP_ACTIVE".to_string()),
                     safety_state: Some("EStop".to_string()),
                 },
+                crate::safety::SafetyError::WorkspaceViolation { .. } => {
+                    ApiError(StatusCode::UNPROCESSABLE_ENTITY, safety_err.to_string(), "WORKSPACE_VIOLATION".to_string())
+                }
                 crate::safety::SafetyError::EpochMismatch { .. } => {
                     ApiError(StatusCode::CONFLICT, safety_err.to_string(), "EPOCH_MISMATCH".to_string())
                 }

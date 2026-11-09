@@ -408,3 +408,77 @@ pub fn shoulder_reach(p: &Vec3) -> f64 {
     let r = (p[0] * p[0] + p[1] * p[1]).sqrt();
     ((r - SHOULDER_RZ[0]).powi(2) + (p[2] - SHOULDER_RZ[1]).powi(2)).sqrt()
 }
+
+// ---- Cartesian workspace check ----
+
+/// The largest single excess of a workspace check.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViolationDetail {
+    /// 0 = end_link origin, 1..=n = `check_points_end_m[i - 1]`, n + 1 = camera (`offset_m`).
+    pub point: usize,
+    /// `floor`, `box_x_min`, `box_x_max`, ..., `box_z_max` or `reach`.
+    pub limit: &'static str,
+    /// Coordinate (m) of the point along the violated limit (reach: distance to the shoulder axis).
+    pub value: f64,
+    pub bound: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Violation {
+    /// Sum of the positive excesses over all points and limits (m).
+    pub total: f64,
+    pub worst: Option<ViolationDetail>,
+}
+
+/// Tolerance used by the workspace rule (m).
+pub const WORKSPACE_EPS: f64 = 1e-4;
+
+const BOX_LIMITS: [[&str; 2]; 3] = [["box_x_min", "box_x_max"], ["box_y_min", "box_y_max"], ["box_z_min", "box_z_max"]];
+
+/// Workspace excess for joint positions `q` (at least J1..J6, model = motor angles).
+pub fn workspace_violation(q: &[f32], ws: &crate::model::WorkspacePolicy, cam: &crate::model::CameraMount) -> Violation {
+    if q.len() < 6 || q[..6].iter().any(|v| !v.is_finite()) {
+        return Violation { total: f64::INFINITY, worst: Some(ViolationDetail { point: 0, limit: "invalid", value: f64::NAN, bound: 0.0 }) };
+    }
+    workspace_violation_pose(&fk(&q6(q)), ws, cam)
+}
+
+pub fn workspace_violation_pose(pose: &Pose, ws: &crate::model::WorkspacePolicy, cam: &crate::model::CameraMount) -> Violation {
+    let mut v = Violation::default();
+    let mut note = |excess: f64, point: usize, limit: &'static str, value: f64, bound: f64| {
+        if excess > 0.0 {
+            v.total += excess;
+            if v.worst.is_none_or(|w| excess > (w.value - w.bound).abs()) {
+                v.worst = Some(ViolationDetail { point, limit, value, bound });
+            }
+        }
+    };
+    let floor = f64::from(ws.floor_z_m);
+    let lo = ws.box_min_m.map(f64::from);
+    let hi = ws.box_max_m.map(f64::from);
+    let n = ws.check_points_end_m.len();
+    let points = std::iter::once((0, [0.0f32; 3]))
+        .chain(ws.check_points_end_m.iter().enumerate().map(|(i, p)| (i + 1, *p)))
+        .chain(cam.offset_m.map(|o| (n + 1, o)));
+    for (idx, local) in points {
+        let p = pose.transform_point(&local.map(f64::from));
+        note(floor - p[2], idx, "floor", p[2], floor);
+        for k in 0..3 {
+            note(lo[k] - p[k], idx, BOX_LIMITS[k][0], p[k], lo[k]);
+            note(p[k] - hi[k], idx, BOX_LIMITS[k][1], p[k], hi[k]);
+        }
+        if idx == 0 {
+            if let Some(reach) = ws.max_reach_m {
+                let d = shoulder_reach(&p);
+                note(d - f64::from(reach), 0, "reach", d, f64::from(reach));
+            }
+        }
+    }
+    v
+}
+
+/// The workspace rule: a target is rejected when it violates and is worse than the start.
+/// A move from an already-violating pose that does not make the violation worse is allowed.
+pub fn workspace_rejects(target: &Violation, start: &Violation) -> bool {
+    target.total > WORKSPACE_EPS && target.total > start.total + WORKSPACE_EPS
+}

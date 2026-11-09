@@ -84,6 +84,69 @@ impl Default for FollowingErrorPolicy {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GravityModel { RebotDevArm }
 
+/// Kinematic model used for the Cartesian workspace check and Cartesian actions.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KinematicsModel { RebotDevArm }
+
+/// Server-side Cartesian safety box, checked on the end_link pose (src/kinematics.rs).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkspacePolicy {
+    /// No check point may go below this height (m, base frame).
+    pub floor_z_m: f32,
+    pub box_min_m: [f32; 3],
+    pub box_max_m: [f32; 3],
+    /// Maximum distance from the shoulder (J2) axis to the end_link origin (m).
+    #[serde(default)]
+    pub max_reach_m: Option<f32>,
+    /// Points in end_link coordinates (m) that must stay inside the box and above the floor.
+    pub check_points_end_m: Vec<[f32; 3]>,
+}
+
+impl WorkspacePolicy {
+    pub fn rebot_dm() -> Self {
+        // Corners of the URDF gripper envelope in end_link: X[-0.160, 0], Y[+-0.0925], Z[+-0.0347].
+        let mut corners = Vec::with_capacity(8);
+        for x in [-0.160f32, 0.0] {
+            for y in [-0.0925f32, 0.0925] {
+                for z in [-0.0347f32, 0.0347] { corners.push([x, y, z]); }
+            }
+        }
+        Self {
+            floor_z_m: 0.0,
+            box_min_m: [-0.60, -0.60, -1.0],
+            box_max_m: [0.60, 0.60, 0.80],
+            max_reach_m: Some(0.52),
+            check_points_end_m: corners,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let finite3 = |v: &[f32; 3]| v.iter().all(|x| x.is_finite());
+        if !self.floor_z_m.is_finite() || !finite3(&self.box_min_m) || !finite3(&self.box_max_m)
+            || self.box_min_m.iter().zip(&self.box_max_m).any(|(lo, hi)| lo >= hi)
+            || self.max_reach_m.is_some_and(|r| !r.is_finite() || r <= 0.0)
+            || self.check_points_end_m.is_empty() || self.check_points_end_m.len() > 16
+            || !self.check_points_end_m.iter().all(finite3) {
+            return Err("Invalid workspace policy: finite values, box_min < box_max, 1..16 check points".into());
+        }
+        Ok(())
+    }
+}
+
+/// Camera mount relative to end_link (see `kinematics::cam_mount`). Defaults match the
+/// cockpit defaults (`CFG.view.camFlip = false`, `camRotDeg = 0`); `tilt_deg` 0 means the
+/// optical axis is end_link x.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CameraMount {
+    pub flip: bool,
+    pub rot_deg: f32,
+    pub tilt_deg: f32,
+    /// Camera position in end_link (m). When set it is added to the workspace check points.
+    /// No default: the real position needs measuring.
+    pub offset_m: Option<[f32; 3]>,
+}
+
 /// Estimated Damiao POS_VEL lag gain: tracking error ~= v / POSVEL_LAG_GAIN rad at
 /// v rad/s. Estimate from the 2026-11 tracking-fault analysis; needs verification
 /// on hardware (record |commanded - measured| during presets to fit it).
@@ -114,6 +177,14 @@ pub struct ArmConfig {
     /// Keeps POS_VEL lag below the following-error bound. None = no extra cap.
     #[serde(default)]
     pub planned_max_velocity: Option<f32>,
+    /// Kinematic model; None disables the workspace check and Cartesian actions.
+    #[serde(default)]
+    pub kinematics: Option<KinematicsModel>,
+    /// Cartesian safety box; None disables the workspace check.
+    #[serde(default)]
+    pub workspace: Option<WorkspacePolicy>,
+    #[serde(default)]
+    pub camera_mount: CameraMount,
 }
 
 impl Default for ArmConfig {
@@ -152,6 +223,9 @@ impl Default for ArmConfig {
             max_jerk: None,
             gravity_model: None,
             planned_max_velocity: None,
+            kinematics: None,
+            workspace: None,
+            camera_mount: CameraMount::default(),
         }
     }
 }
@@ -187,6 +261,15 @@ impl ArmConfig {
                     "planned_max_velocity {cap} rad/s implies an expected lag {:.3} rad at or above the following-error bound {} rad",
                     cap / POSVEL_LAG_GAIN, self.following_error.max_error_rad));
             }
+        }
+        if self.kinematics.is_some() && self.dof != 7 {
+            return Err("kinematics requires dof == 7 (6 arm joints + gripper)".into());
+        }
+        if let Some(ws) = &self.workspace { ws.validate()?; }
+        let cam = &self.camera_mount;
+        if !cam.rot_deg.is_finite() || !cam.tilt_deg.is_finite()
+            || cam.offset_m.is_some_and(|o| o.iter().any(|v| !v.is_finite())) {
+            return Err("Invalid camera mount".into());
         }
         if let Some(policy) = &self.resting_pose {
             if policy.position_tolerances.is_empty() || policy.position_tolerances.len() > self.dof
@@ -251,6 +334,9 @@ impl ArmConfig {
             max_jerk: Some(50.0),
             gravity_model: Some(GravityModel::RebotDevArm),
             planned_max_velocity: Some(0.7),
+            kinematics: Some(KinematicsModel::RebotDevArm),
+            workspace: Some(WorkspacePolicy::rebot_dm()),
+            camera_mount: CameraMount::default(),
         }
     }
 }
@@ -301,6 +387,13 @@ pub struct ObservationSchema {
     pub joint_names: Vec<String>,
     pub fields: Vec<SchemaField>,
     pub limits: Vec<JointLimit>,
+    /// Cartesian safety box enforced by the server (None = not checked).
+    #[serde(default)]
+    pub workspace: Option<WorkspacePolicy>,
+    #[serde(default)]
+    pub camera_mount: CameraMount,
+    #[serde(default)]
+    pub kinematics: Option<KinematicsModel>,
 }
 
 impl ObservationSchema {
@@ -371,6 +464,9 @@ impl ObservationSchema {
                 },
             ],
             limits: config.limits.clone(),
+            workspace: config.workspace.clone(),
+            camera_mount: config.camera_mount.clone(),
+            kinematics: config.kinematics,
         }
     }
 }
