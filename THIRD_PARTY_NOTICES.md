@@ -47,8 +47,9 @@ DEALINGS IN THE SOFTWARE.
 - License: CERN Open Hardware Licence Version 2 - Weakly Reciprocal (CERN-OHL-W-2.0), the
   license of the upstream repository. Full text: https://ohwr.org/cern_ohl_w_v2.txt
 - Modifications: the arm chain (`base_link` .. `end_link`) is taken from the upstream
-  fixed-end URDF. A parallel-jaw gripper (`gripper_body`, `left_finger`, `right_finger` and
-  their joints) is appended, and the header comment describes the additions. These files
+  fixed-end URDF. The `end_link` visual is replaced by a gripper body mesh, and two
+  prismatic fingers (`left_finger`, `right_finger` and their joints) are appended; the
+  header comment describes the additions. These files
   are not covered by the MIT License of this repository.
 - The URDF refers to mesh files (`package://reBot-DevArm_description_fixend/meshes/*.STL`)
   that are not included here; armd does not load meshes. They are available from the
