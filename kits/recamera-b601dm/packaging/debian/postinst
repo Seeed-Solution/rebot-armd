@@ -14,13 +14,19 @@ if [ ! -f /userdata/rebot-teleop/vision.json ]; then
     cp -f /usr/share/rebot-teleop/vision.json.default /userdata/rebot-teleop/vision.json 2>/dev/null || true
 fi
 
-# Boot start. With the reCamera console, app_restore starts the active app at boot; an S92 link
-# as well would start a second camera holder when another camera app is active. So S92 only
-# without the console, and an S92 link of ours is removed when the console is present.
+# Boot start. With the reCamera console, app_restore starts the active app (state.json) at
+# boot; an S?? link as well would start a second camera holder when another camera app is
+# active. So: with the console, remove every S??rebot-teleop link (older installs left S92 or
+# S94) and record rebot-teleop as the console's active app, as a console switch would (the
+# camera app that was active keeps running until the next boot or a start of rebot-teleop,
+# which stops it; nothing is disabled or uninstalled). Without the console, an S92 link.
 if [ -x /usr/share/supervisor/scripts/main.sh ]; then
-    if [ -L /etc/init.d/S92rebot-teleop ] && [ "$(readlink /etc/init.d/S92rebot-teleop)" = /etc/init.d/K92rebot-teleop ]; then
-        rm -f /etc/init.d/S92rebot-teleop
-    fi
+    for link in /etc/init.d/S??rebot-teleop; do
+        if [ -L "$link" ]; then
+            rm -f "$link"
+        fi
+    done
+    /etc/init.d/K92rebot-teleop register || true
 else
     ln -sf /etc/init.d/K92rebot-teleop /etc/init.d/S92rebot-teleop 2>/dev/null || true
 fi

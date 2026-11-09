@@ -29,6 +29,11 @@ VISION_CONF_DEFAULT=/usr/share/$NAME/vision.json.default
 # with their own init script; nothing is disabled or uninstalled.
 CAMERA_APPS="yolo-detector aruco-detector face-analysis face-recognition detection-blur ppocr-reader retail-vision qrcode-reader trigger-inspection-demo microduck-pose-qa fall-detection"
 
+# reCamera console (supervisor): its app registry, read by app_restore at boot
+SUPERVISOR_MAIN=/usr/share/supervisor/scripts/main.sh
+APPS_STATE=/userdata/local/apps/state.json
+INIT_SCRIPT=/etc/init.d/K92$NAME
+
 # 默认配置参数
 FOLLOWER_MODEL="rebot-dm"
 FOLLOWER_PORT="can0"
@@ -195,6 +200,50 @@ stop_camera_holders() {
     return 0
 }
 
+# Record rebot-teleop as the console's active app in state.json (active_app, active_script,
+# updated_at; every other field, e.g. models, is kept), as the console does after a switch,
+# so app_restore starts this app at boot and not the camera app that was active before.
+# Written with the console's app_write_state (atomic tmp + sync + rename; its one argument
+# after the function name is the JSON). No-op without the console or when already recorded.
+register_active_app() {
+    [ -x "$SUPERVISOR_MAIN" ] || return 0
+    STATE='{"active_app": null, "active_script": null, "models": {}, "updated_at": 0}'
+    if [ -s "$APPS_STATE" ] && grep -q '{' "$APPS_STATE"; then
+        STATE=$(cat "$APPS_STATE")
+    fi
+    if printf '%s\n' "$STATE" | grep -q "\"active_app\"[[:space:]]*:[[:space:]]*\"$NAME\"" &&
+        printf '%s\n' "$STATE" | grep -q "\"active_script\"[[:space:]]*:[[:space:]]*\"$INIT_SCRIPT\""; then
+        return 0
+    fi
+    NEW=$(printf '%s\n' "$STATE" | sed \
+        -e "s|\"active_app\"[[:space:]]*:[[:space:]]*null|\"active_app\": \"$NAME\"|" \
+        -e "s|\"active_app\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"active_app\": \"$NAME\"|" \
+        -e "s|\"active_script\"[[:space:]]*:[[:space:]]*null|\"active_script\": \"$INIT_SCRIPT\"|" \
+        -e "s|\"active_script\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"active_script\": \"$INIT_SCRIPT\"|" \
+        -e "s|\"updated_at\"[[:space:]]*:[[:space:]]*[0-9][0-9]*|\"updated_at\": $(date +%s)|")
+    # keys the file does not have yet go first in the object
+    for kv in "active_script:$INIT_SCRIPT" "active_app:$NAME"; do
+        k=${kv%%:*}
+        printf '%s\n' "$NEW" | grep -q "\"$k\"" && continue
+        NEW=$(printf '%s\n' "$NEW" | awk -v ins="\"$k\": \"${kv#*:}\", " \
+            '!done && sub(/\{/, "{" ins) { done = 1; sub(/, *\}/, "}") } { print }')
+    done
+    if command -v bash >/dev/null 2>&1 && [ "$(bash "$SUPERVISOR_MAIN" app_write_state "$NEW" 2>/dev/null)" = OK ]; then
+        :
+    else
+        # same write as app_write_state when it is unavailable
+        TMP="$(dirname "$APPS_STATE")/.state.json.tmp"
+        if ! { mkdir -p "$(dirname "$APPS_STATE")" && printf '%s' "$NEW" > "$TMP" && sync && mv -f "$TMP" "$APPS_STATE"; }; then
+            rm -f "$TMP"
+            echo "[rebot-teleop] could not record $NAME as the console's active app"
+            return 1
+        fi
+    fi
+    echo "[rebot-teleop] recorded $NAME as the console's active app"
+    logger -t "$NAME" "recorded as the console's active app in $APPS_STATE" 2>/dev/null || true
+    return 0
+}
+
 port_busy() {
     command -v netstat >/dev/null 2>&1 || return 1
     netstat -ltn 2>/dev/null | grep -q "[:.]$1 "
@@ -240,6 +289,7 @@ start() {
             # armd already up (boot S92 then a console switch, or app_restore): make sure vision runs too
             echo "$NAME is already running (PID: $PID)"
             start_vision
+            register_active_app || true
             return 0
         fi
         rm -f $PIDFILE
@@ -302,6 +352,7 @@ start() {
     stop_video
 
     start_vision
+    register_active_app || true
     return 0
 }
 
@@ -413,7 +464,8 @@ case "$1" in
     stop) stop; exit $? ;;
     restart) stop || exit $?; sleep 2; start; exit $? ;;
     status) status; exit $? ;;
-    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+    register) register_active_app; exit $? ;;
+    *) echo "Usage: $0 {start|stop|restart|status|register}"; exit 1 ;;
 esac
 
 exit 0

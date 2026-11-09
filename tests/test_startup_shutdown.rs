@@ -349,3 +349,186 @@ fn vision_runner_forwards_sigterm_and_exits() {
     assert!(status.success());
     assert_eq!(std::fs::read_to_string(&marks).unwrap(), "start\nterm\n", "child got SIGTERM once and was not restarted");
 }
+
+/// A reCamera root in a temp dir: postinst and K92rebot-teleop with their absolute paths moved
+/// under it, a supervisor main.sh stub, and a log of the stub's calls.
+#[cfg(unix)]
+struct PackageRoot {
+    dir: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl PackageRoot {
+    const INIT: &'static str = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
+    const POSTINST: &'static str = include_str!("../kits/recamera-b601dm/packaging/debian/postinst");
+
+    fn new(console: bool) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let root = PackageRoot { dir: tempfile::tempdir().unwrap() };
+        for d in ["etc/init.d", "userdata/local/apps", "usr/share/rebot-teleop", "usr/share/supervisor/scripts"] {
+            std::fs::create_dir_all(root.p(d)).unwrap();
+        }
+        std::fs::write(root.p("usr/share/rebot-teleop/rebot-teleop.json"), "{}").unwrap();
+        std::fs::write(root.p("usr/share/rebot-teleop/vision.json.default"), "{}").unwrap();
+        let init = root.p("etc/init.d/K92rebot-teleop");
+        std::fs::write(&init, root.rebase(Self::INIT)).unwrap();
+        std::fs::set_permissions(&init, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if console {
+            // Same dispatch ("$1 "$@"") and argument use ($2) as the console's main.sh.
+            let stub = format!(
+                "#!/bin/bash\nSTATE='{}'\nfunction app_write_state() {{\n  echo \"app_write_state $#\" >> '{}'\n  local content=\"$2\"\n  [ -z \"$content\" ] && {{ echo Failed; return 1; }}\n  printf '%s' \"$content\" > \"$STATE.tmp\" && mv -f \"$STATE.tmp\" \"$STATE\" && echo OK\n}}\n$1 \"$@\"\n",
+                root.p("userdata/local/apps/state.json").display(),
+                root.p("calls").display()
+            );
+            let main = root.p("usr/share/supervisor/scripts/main.sh");
+            std::fs::write(&main, stub).unwrap();
+            std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        root
+    }
+
+    fn p(&self, rel: &str) -> std::path::PathBuf {
+        self.dir.path().join(rel)
+    }
+
+    /// Absolute device paths in a script -> paths under this root.
+    fn rebase(&self, script: &str) -> String {
+        let r = self.dir.path().display().to_string();
+        script
+            .replace("/etc/init.d/", &format!("{r}/etc/init.d/"))
+            .replace("/userdata/", &format!("{r}/userdata/"))
+            .replace("/usr/share/", &format!("{r}/usr/share/"))
+            .replace("/usr/bin/", &format!("{r}/usr/bin/"))
+            .replace("/usr/local/bin/", &format!("{r}/usr/local/bin/"))
+            .replace("/proc/sys/", &format!("{r}/proc/sys/"))
+    }
+
+    fn init_path(&self) -> String {
+        self.p("etc/init.d/K92rebot-teleop").display().to_string()
+    }
+
+    fn run(&self, script: &str) -> std::process::Output {
+        let path = self.p("script.sh");
+        std::fs::write(&path, self.rebase(script)).unwrap();
+        // logger / chown stubs keep the run inside the temp root
+        let wrapped = format!(
+            "logger() {{ :; }}\nchown() {{ :; }}\nsync() {{ :; }}\n. '{}'\n",
+            path.display()
+        );
+        Command::new("sh").args(["-c", &wrapped]).output().unwrap()
+    }
+
+    fn postinst(&self) -> std::process::Output {
+        self.run(Self::POSTINST)
+    }
+
+    fn register(&self) -> std::process::Output {
+        Command::new("sh").arg(self.init_path()).arg("register").output().unwrap()
+    }
+
+    fn state(&self) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(self.p("userdata/local/apps/state.json")).unwrap()).unwrap()
+    }
+
+    fn calls(&self) -> String {
+        std::fs::read_to_string(self.p("calls")).unwrap_or_default()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn postinst_with_console_removes_every_boot_link_and_registers_the_app() {
+    let root = PackageRoot::new(true);
+    let init = root.init_path();
+    for link in ["S92rebot-teleop", "S94rebot-teleop"] {
+        std::os::unix::fs::symlink(&init, root.p(&format!("etc/init.d/{link}"))).unwrap();
+    }
+    // another app's boot link and init script stay as they are
+    std::fs::write(root.p("etc/init.d/K92yolo-detector"), "#!/bin/sh\n").unwrap();
+    std::os::unix::fs::symlink(root.p("etc/init.d/K92yolo-detector"), root.p("etc/init.d/S92yolo-detector")).unwrap();
+    // the console's state.json format (nlohmann dump(2)) with a model selection
+    std::fs::write(
+        root.p("userdata/local/apps/state.json"),
+        "{\n  \"active_app\": \"yolo-detector\",\n  \"active_script\": \"/etc/init.d/K92yolo-detector\",\n  \"models\": {\n    \"yolo-detector\": \"/userdata/local/models/yolo26n_cv181x_int8.cvimodel\"\n  },\n  \"updated_at\": 1762600000\n}",
+    )
+    .unwrap();
+
+    let out = root.postinst();
+    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!root.p("etc/init.d/S92rebot-teleop").exists() && root.p("etc/init.d/S92rebot-teleop").symlink_metadata().is_err());
+    assert!(root.p("etc/init.d/S94rebot-teleop").symlink_metadata().is_err(), "S94 link from an old install must go");
+    assert!(root.p("etc/init.d/K92rebot-teleop").is_file());
+    assert!(root.p("etc/init.d/S92yolo-detector").symlink_metadata().unwrap().file_type().is_symlink());
+    assert!(root.p("etc/init.d/K92yolo-detector").is_file());
+
+    let s = root.state();
+    assert_eq!(s["active_app"], "rebot-teleop");
+    assert_eq!(s["active_script"], init.as_str());
+    assert_eq!(s["models"]["yolo-detector"], "/userdata/local/models/yolo26n_cv181x_int8.cvimodel");
+    assert!(s["updated_at"].as_u64().unwrap() > 1762600000);
+    assert_eq!(s.as_object().unwrap().len(), 4);
+    // written through the console's app_write_state with exactly one JSON argument
+    assert_eq!(root.calls(), "app_write_state 2\n");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("recorded rebot-teleop as the console's active app"));
+}
+
+#[cfg(unix)]
+#[test]
+fn postinst_without_console_creates_the_s92_link_and_leaves_state_alone() {
+    let root = PackageRoot::new(false);
+    std::fs::write(root.p("userdata/local/apps/state.json"), "{\"active_app\": \"yolo-detector\"}").unwrap();
+    let out = root.postinst();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let link = root.p("etc/init.d/S92rebot-teleop");
+    assert_eq!(std::fs::read_link(&link).unwrap().display().to_string(), root.init_path());
+    assert_eq!(std::fs::read_to_string(root.p("userdata/local/apps/state.json")).unwrap(), "{\"active_app\": \"yolo-detector\"}");
+    // register is a no-op without the console
+    assert!(root.register().status.success());
+    assert_eq!(std::fs::read_to_string(root.p("userdata/local/apps/state.json")).unwrap(), "{\"active_app\": \"yolo-detector\"}");
+}
+
+#[cfg(unix)]
+#[test]
+fn register_handles_every_state_shape_and_is_idempotent() {
+    for (name, content) in [
+        ("missing", None),
+        ("one line", Some("{\"active_app\": null, \"active_script\": null, \"models\": {\"a\": \"b\"}, \"updated_at\": 0}")),
+        ("empty object", Some("{}")),
+        ("only models", Some("{\n  \"models\": {}\n}")),
+        ("corrupt", Some("garbage")),
+    ] {
+        let root = PackageRoot::new(true);
+        if let Some(c) = content {
+            std::fs::write(root.p("userdata/local/apps/state.json"), c).unwrap();
+        }
+        let out = root.register();
+        assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stdout));
+        let s = root.state();
+        assert_eq!(s["active_app"], "rebot-teleop", "{name}");
+        assert_eq!(s["active_script"], root.init_path().as_str(), "{name}");
+        if name == "one line" {
+            assert_eq!(s["models"]["a"], "b");
+        }
+        // already recorded: no second write
+        assert_eq!(root.calls().lines().count(), 1, "{name}");
+        assert!(root.register().status.success());
+        assert_eq!(root.calls().lines().count(), 1, "{name}: second register must not rewrite");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn register_falls_back_to_an_atomic_write_when_the_console_write_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = PackageRoot::new(true);
+    let main = root.p("usr/share/supervisor/scripts/main.sh");
+    std::fs::write(&main, "#!/bin/bash\necho Failed\n").unwrap();
+    std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(root.p("userdata/local/apps/state.json"), "{\"active_app\": \"face-recognition\", \"active_script\": \"/etc/init.d/K92face-recognition\", \"models\": {}, \"updated_at\": 5}").unwrap();
+    let out = root.register();
+    assert!(out.status.success());
+    let s = root.state();
+    assert_eq!(s["active_app"], "rebot-teleop");
+    assert_eq!(s["active_script"], root.init_path().as_str());
+    assert!(!root.p("userdata/local/apps/.state.json.tmp").exists());
+}
