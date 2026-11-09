@@ -1507,7 +1507,7 @@ const I18N = {
     'jd.wyaw.part': '手腕', 'jd.wyaw.motion': '末端摆动', 'jd.wyaw.neg': '摆左', 'jd.wyaw.pos': '摆右',
     'jd.grip.part': '夹爪', 'jd.grip.motion': '开合抓取', 'jd.grip.neg': '张开', 'jd.grip.pos': '闭合夹紧', 'jd.grip.pos2': '夹紧',
     'ik.reach': '超出臂展范围，该方向已停止', 'ik.singular': '接近奇异位形（完全伸直或折叠），该方向已停止', 'ik.limit': '目标需要超出关节限位，该方向已停止',
-    'ik.jump': '该位姿需要翻转关节构型，已拒绝', 'ik.floor': '已到达安装平面高度下限', 'ik.lag': '电机响应滞后过大(>0.4rad)，已安全停机',
+    'ik.jump': '该位姿需要翻转关节构型，已拒绝', 'ik.pose': '该姿态超出可达范围，已拒绝', 'ik.floor': '已到达安装平面高度下限', 'ik.lag': '电机响应滞后过大(>0.4rad)，已安全停机',
     'ik.blocked': 'IK 拦截', 'ik.stream': 'IK 流式 {hz}Hz', 'ik.ready': 'IK 就绪', 'ik.per_solve': ' µs/次',
     'cart.enable_first': '使能后可控制末端位姿', 'cart.following': '目标跟随实测位姿 · 分支 {branch} · {tx}', 'cart.tx_ws': 'WS 流', 'cart.tx_rest': 'REST 伺服',
     'wait_arm': '等待机械臂连接', 'wait_telemetry': '等待遥测', 'ready': '电机就绪 · 可以操控',
@@ -1611,7 +1611,7 @@ const I18N = {
     'jd.wyaw.part': 'Wrist', 'jd.wyaw.motion': 'End swing', 'jd.wyaw.neg': 'Swing L', 'jd.wyaw.pos': 'Swing R',
     'jd.grip.part': 'Gripper', 'jd.grip.motion': 'Open / close', 'jd.grip.neg': 'Open', 'jd.grip.pos': 'Close', 'jd.grip.pos2': 'Close',
     'ik.reach': 'Out of reach, motion in this direction stopped', 'ik.singular': 'Near singularity (fully extended or folded), motion in this direction stopped', 'ik.limit': 'Target exceeds joint limits, motion in this direction stopped',
-    'ik.jump': 'Pose needs a joint configuration flip, rejected', 'ik.floor': 'Reached the mounting-plane height limit', 'ik.lag': 'Motor lag too large (>0.4 rad), safely stopped',
+    'ik.jump': 'Pose needs a joint configuration flip, rejected', 'ik.pose': 'Pose out of reach, rejected', 'ik.floor': 'Reached the mounting-plane height limit', 'ik.lag': 'Motor lag too large (>0.4 rad), safely stopped',
     'ik.blocked': 'IK blocked', 'ik.stream': 'IK stream {hz} Hz', 'ik.ready': 'IK ready', 'ik.per_solve': ' µs/solve',
     'cart.enable_first': 'Enable to control end-effector pose', 'cart.following': 'Target follows measured pose · branch {branch} · {tx}', 'cart.tx_ws': 'WS stream', 'cart.tx_rest': 'REST servo',
     'wait_arm': 'Waiting for arm connection', 'wait_telemetry': 'Waiting for telemetry', 'ready': 'Motors ready · ready to control',
@@ -1825,6 +1825,17 @@ CFG.cart = {
   const of = (QS.get('ikoff') || '').split(',').map(Number);
   if (of.length === 4 && of.every(Number.isFinite)) CFG.cart.off = of.map((d) => d / 180 * Math.PI);
 })();
+// camera-view cartesian frame (7-DOF arm only). camFlip / camRotDeg tune the camera mount on the real arm
+// (?camflip=1 flips the image vertical, ?camrot=<deg> adds a roll about the optical axis).
+CFG.view = {
+  wmax: 0.8,                  // rad/s look-around / pitch rate at 100 % speed
+  camFlip: QS.get('camflip') === '1',
+  camRotDeg: Number(QS.get('camrot')) || 0,
+  levelCos: Math.cos(15 * Math.PI / 180), // no auto-level while the optical axis is within 15 deg of vertical
+  wPos: 0.2,                  // m/rad, orientation weight in the IK error
+  maxRot: 30 * Math.PI / 180, // anti-windup: goal orientation at most this far from the solved pose
+  Rec: null,                  // R_end_cam, set once VIK is defined
+};
 
 /* =================================================================
    State
@@ -1873,6 +1884,9 @@ const C = {
   cmd: null,                  // rate-limited pose that last solved; streamed as joint targets
   q: null, branch: null,      // IK solution (model J1..J4) for cmd
   j5: 0,                      // J5 (wrist swing on the 7-DOF arm), held while in this mode
+  frame: store('rebot.cart.frame') === 'base' ? 'base' : 'view', // view (camera frame, 7-DOF only) | base
+  T: null, Tg: null,          // view frame: solved / goal end_link pose (4x4, base frame)
+  q6: null,                   // view frame: IK solution (model J1..J6) for T
   hold: { x: [0, 0], y: [0, 0], z: [0, 0], p: [0, 0], r: [0, 0] }, // continuous holds per axis [neg, pos]
   axes: { xy: [0, 0], z: 0, p: 0, sxy: [0, 0], sz: 0, sp: 0, sr: 0 }, // s*: simple cockpit (sxy = X/Y, sz = lift, sp/sr = pitch/J5 wrist in pose mode)
   stepIdx: 1,
@@ -3773,6 +3787,7 @@ function releaseAll() {
   for (const b of cartButtons) b.stop();
   for (const k in C.hold) { C.hold[k][0] = 0; C.hold[k][1] = 0; }
   if (C.cmd) C.goal = { ...C.cmd }; // drop any queued step that has not been executed yet
+  if (C.T) C.Tg = C.T;
   requestMotionStop();
 }
 function requestMotionStop() {
@@ -3914,17 +3929,26 @@ function inMotorLimits(q) {
 }
 const IK_MSG = {
   reach: 'ik.reach', singular: 'ik.singular',
-  limit: 'ik.limit', jump: 'ik.jump', floor: 'ik.floor',
+  limit: 'ik.limit', jump: 'ik.jump', floor: 'ik.floor', pose: 'ik.pose',
 };
+// camera-view frame: only on the 7-DOF arm (index 4 = URDF joint5, index 5 = joint6)
+const viewActive = () => S.dof === 7 && C.frame === 'view';
 function cartSync(pos) {
   C.q = toModel(pos);
   C.cmd = IK.fk(C.q);
   C.goal = { ...C.cmd };
   C.j5 = pos[4] ?? 0;
   C.branch = null;
+  if (pos.length >= 6) { C.q6 = [...C.q, pos[4], pos[5]]; C.T = C.Tg = VIK.fk(C.q6); }
+}
+// drop queued motion: the goal snaps back to the last solved pose (both frames)
+function cartHoldStill() {
+  if (C.goal && C.cmd) C.goal = { ...C.cmd };
+  if (C.T) C.Tg = C.T;
 }
 function cartReject(err) {
   C.goal = { ...C.cmd };
+  if (C.T) C.Tg = C.T;
   if (C.status !== err) { buzz(30); toastOnce({ message: ikText(IK_MSG[err] || err), code: 'IK' }); }
   C.status = err; C.msg = IK_MSG[err] || err;
 }
@@ -3976,6 +4000,14 @@ function clampJ5(x) {
 }
 function cartKick() { C.lastInput = performance.now(); C.tailUntil = C.lastInput + CFG.cart.tailMs; }
 function cartStep(ax, s) {
+  if (viewActive()) {
+    if (!C.Tg) return;
+    const n = CFG.cart.steps[C.stepIdx], v = { x: 0, y: 0, z: 0, p: 0, r: 0 };
+    v[ax] = s; // one tap: n mm along the camera axis / world Z, or n degrees of pitch / look-around
+    C.Tg = VIK.integrate(C.Tg, v, 1, { vl: n / 1000, wl: n / DEG, Rec: CFG.view.Rec, levelCos: CFG.view.levelCos });
+    cartKick();
+    return;
+  }
   if (!C.goal) return;
   const n = CFG.cart.steps[C.stepIdx];
   if (ax === 'p') C.goal.pitch += s * n / DEG;
@@ -4015,6 +4047,7 @@ function sendServoFrame(positions) {
 function cartTick() {
   C.sending = false;
   if (S.mode !== 'cart' || !S.obs || S.obs.positions.length < 5) return;
+  if (viewActive() && S.obs.positions.length >= 6) { cartTickView(); return; }
   const pos = S.obs.positions;
   const now = performance.now();
   const dt = Math.min(0.1, (now - (C.lastTick || now)) / 1000);
@@ -4115,6 +4148,104 @@ function cartTick() {
   t = t.map((x, i) => clamp(x, pos[i] - (i === GRIP ? CFG.gripLead : CFG.maxLead), pos[i] + (i === GRIP ? CFG.gripLead : CFG.maxLead)));
   if (now <= C.tailUntil || (settling && converging)) { C.sending = true; if (!S.presetRunning) cartSend(t); }
 }
+CFG.view.Rec = VIK.camMount(CFG.view.camFlip, CFG.view.camRotDeg);
+// model-space limits for J1..J6: motor soft limits minus the margin, J1..J4 through sign / offset
+function modelLimits6() {
+  const lo = [], hi = [];
+  for (let i = 0; i < 6; i++) {
+    const L = S.limits[i];
+    if (!L) { lo.push(-Infinity); hi.push(Infinity); continue; }
+    let a = L.min_position + CFG.limitMargin, b = L.max_position - CFG.limitMargin;
+    if (i < 4) { a = (a - CFG.cart.off[i]) / CFG.cart.sign[i]; b = (b - CFG.cart.off[i]) / CFG.cart.sign[i]; }
+    lo.push(Math.min(a, b)); hi.push(Math.max(a, b));
+  }
+  return { lo, hi };
+}
+const toMotor6 = (q) => [...toMotor(q.slice(0, 4)), q[4], q[5]];
+// Camera-view frame: left stick = forward (optical axis) / strafe (image x), lift = world Z, right stick =
+// pitch about x_cam / look-around about world Z (centred on end_link), auto-level. Same guards as cartTick.
+function cartTickView() {
+  const pos = S.obs.positions;
+  const now = performance.now();
+  const dt = Math.min(0.1, (now - (C.lastTick || now)) / 1000);
+  C.lastTick = now;
+  if (!isLive() || !isOperational() || S.epoch == null || !C.q6) {
+    cartSync(pos); C.tailUntil = 0; C.status = 'idle'; C.msg = '';
+    return;
+  }
+  const v = cartVelocity();
+  const gv = cartGripVel();
+  const gripErr = pos.length > GRIP ? Math.abs(gripRad() - pos[GRIP]) : 0;
+  const gripStalled = Date.now() - S.gripCmdAt > 1200 && Math.abs(S.obs.velocities?.[GRIP] ?? 0) < 0.05;
+  const gripMoving = (gripErr > 0.015 && !gripStalled) || gv !== 0;
+  const motion = v.x || v.y || v.z || v.p || v.r;
+  const input = motion || gripMoving;
+  if (input) cartKick();
+  const settling = now - C.lastInput < CFG.cart.settleMs;
+  const pending = C.Tg !== C.T;
+  if (!C.Tg || (!input && !pending && !settling && now > C.tailUntil)) {
+    cartSync(pos); // idle: track the real arm so the next command starts from where it is
+    if (C.status !== 'ok' && C.status !== 'idle' && now - C.lastInput > 1500) { C.status = 'idle'; C.msg = ''; }
+    return;
+  }
+
+  const scale = speedScale();
+  const vl = CFG.cart.vmax * scale, wl = CFG.view.wmax * scale;
+  if (motion) C.Tg = VIK.integrate(C.Tg, v, dt, { vl, wl, Rec: CFG.view.Rec, levelCos: CFG.view.levelCos });
+  // anti-windup: goal at most 0.25 m / 30 deg away from the solved pose
+  C.Tg = VIK.clampGoal(C.T, C.Tg, 0.25, CFG.view.maxRot);
+
+  // lag guard over J1..J6: do not let the command run ahead of a slow / blocked arm
+  const mq = toMotor6(C.q6);
+  const lag = Math.max(...mq.map((x, i) => Math.abs(x - pos[i])));
+  const a = 0.20, b = 0.35;
+  const factor = clamp(1.0 - (lag - a) / (b - a), 0.0, 1.0);
+  if (lag > 0.40) {
+    if (!C.stallSince) C.stallSince = now;
+    else if (now - C.stallSince > 500) {
+      C.Tg = C.T;
+      C.status = 'stall';
+      C.msg = 'ik.lag';
+    }
+  } else {
+    C.stallSince = 0;
+  }
+  // rate-limited follower: position <= vl dt, orientation <= wl dt (geodesic)
+  const cand = VIK.approach(C.T, C.Tg, vl * dt * factor, wl * dt * factor);
+  const step = VIK.diff(C.T, cand);
+
+  if (step.d > 1e-7 || step.a > 1e-7) {
+    const { lo, hi } = modelLimits6();
+    const sol = VIK.solve(cand, C.q6, { lo, hi, w: CFG.view.wPos });
+    const p1 = CALM.posOf(cand), p0 = CALM.posOf(C.T);
+    const r1 = IK.reach({ x: p1[0], y: p1[1], z: p1[2] }), r0 = IK.reach({ x: p0[0], y: p0[1], z: p0[2] });
+    if (!sol.ok) cartReject(sol.err);
+    else if (r1 > CFG.cart.reachMax && r1 > r0) cartReject('reach');
+    else if (p1[2] < CFG.cart.zMin && p1[2] < p0[2]) cartReject('floor'); // end_link origin (camera origin later)
+    else if (Math.max(...sol.q.map((x, i) => Math.abs(x - C.q6[i]))) > CFG.cart.maxJump) cartReject('jump');
+    else {
+      C.T = cand; C.q6 = sol.q;
+      if (C.status !== 'ok') { C.status = 'ok'; C.msg = ''; }
+    }
+  } else if (lag > 0.05 && now > C.tailUntil) {
+    cartSync(pos);
+  }
+
+  if (pos.length > GRIP && gv) {
+    const cur = S.grip ?? gripFrac(pos[GRIP]);
+    S.grip = gripNoWindup(clamp(cur + gv * CFG.gripRate * scale * dt, 0, 1), pos[GRIP]);
+    S.gripCmdAt = Date.now();
+  }
+
+  const m = toMotor6(C.q6);
+  let t = pos.slice(0, S.dof);
+  for (let i = 0; i < 6; i++) t[i] = m[i];
+  if (t.length > GRIP) t[GRIP] = gripRad();
+  t = clampTarget(t);
+  const converging = t.some((x, i) => Math.abs(x - pos[i]) > 0.02);
+  t = t.map((x, i) => clamp(x, pos[i] - (i === GRIP ? CFG.gripLead : CFG.maxLead), pos[i] + (i === GRIP ? CFG.gripLead : CFG.maxLead)));
+  if (now <= C.tailUntil || (settling && converging)) { C.sending = true; if (!S.presetRunning) cartSend(t); }
+}
 setInterval(cartTick, Math.round(1000 / CFG.cart.hz));
 // performance.now() is clamped to ~100 us in browsers, so time a batch once at boot instead of per call
 setTimeout(() => {
@@ -4144,7 +4275,7 @@ function cartButton(parent, ax, s, label, sub, arrow) {
   const stop = () => {
     if (pid === null) return;
     pid = null; clearTimeout(timer); b.classList.remove('pressed');
-    if (held) { held = false; C.hold[ax][idx] = Math.max(0, C.hold[ax][idx] - 1); C.goal && C.cmd && (C.goal = { ...C.cmd }); }
+    if (held) { held = false; C.hold[ax][idx] = Math.max(0, C.hold[ax][idx] - 1); cartHoldStill(); }
   };
   b.addEventListener('pointerdown', (e) => {
     e.preventDefault();
@@ -4208,9 +4339,9 @@ function setStep(i) {
     b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on));
   }
 }
-new Pad($('pad-cxy'), { onChange: (v) => { C.axes.xy = v; }, onEnd: () => { if (C.goal && C.cmd) C.goal = { ...C.cmd }; } });
-new Pad($('pad-cz'), { axes: 'y', onChange: (v) => { C.axes.z = v[1]; }, onEnd: () => { if (C.goal && C.cmd) C.goal = { ...C.cmd }; } });
-new Pad($('pad-cp'), { axes: 'y', onChange: (v) => { C.axes.p = v[1]; }, onEnd: () => { if (C.goal && C.cmd) C.goal = { ...C.cmd }; } });
+new Pad($('pad-cxy'), { onChange: (v) => { C.axes.xy = v; }, onEnd: cartHoldStill });
+new Pad($('pad-cz'), { axes: 'y', onChange: (v) => { C.axes.z = v[1]; }, onEnd: cartHoldStill });
+new Pad($('pad-cp'), { axes: 'y', onChange: (v) => { C.axes.p = v[1]; }, onEnd: cartHoldStill });
 // Pose state machine: S.poseMode = S.poseLocked || S.shiftHeld.  A mode flip zeroes every simple-cockpit axis
 // and holds the left stick at zero until it is back near centre or re-touched, so the old stick
 // position never carries over into the new mapping.
@@ -4227,9 +4358,7 @@ padSxy = new Pad($('pad-sxy'), { onChange: (v) => {
   }
   if (!S.poseMode) C.axes.sxy = v;
   else { C.axes.sp = v[1]; C.axes.sr = v[0]; }
-}, onEnd: () => {
-  if (C.goal && C.cmd) C.goal = { ...C.cmd };
-} });
+}, onEnd: cartHoldStill });
 new Pad($('pad-sz'), { axes: 'y', onChange: (v) => { C.axes.sz = v[1]; } });
 new Pad($('pad-sgrip'), {
   axes: 'y',
@@ -4531,11 +4660,11 @@ function renderPoseUi() {
   $('pad-sxy').setAttribute('aria-label', S.poseMode ? t('pad.pose') : t('pad.move'));
 }
 function syncPoseMode() {
-  const next = S.poseLocked || S.shiftHeld;
+  const next = !viewActive() && (S.poseLocked || S.shiftHeld); // view frame: rotation has its own stick
   if (next === S.poseMode) return;
   S.poseMode = next;
   C.axes.sxy = [0, 0]; C.axes.sp = 0; C.axes.sr = 0;
-  if (C.goal && C.cmd) C.goal = { ...C.cmd }; // drop motion queued under the old mapping
+  cartHoldStill(); // drop motion queued under the old mapping
   leftPadRequiresNeutral = true;
   renderPoseUi();
 }
