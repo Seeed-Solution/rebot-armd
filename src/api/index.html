@@ -2820,35 +2820,62 @@ const CAL = { samples: [], target: 9, result: null, markerId: null, resetArmedUn
 })();
 const calSave = () => store('rebot.calib', JSON.stringify({ samples: CAL.samples, markerId: CAL.markerId }));
 
-// symmetric 4x4 Jacobi eigen-decomposition -> eigenvector of the largest eigenvalue
-function maxEigVec4(A) {
-  const a = A.map((r) => r.slice()), V = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]];
+/* CALIB-MATH-BEGIN */
+// Pure hand-eye calibration math: no DOM and no page state. scripts/calib_selftest.mjs evaluates this
+// block in Node and checks it against the rebot-companion SDK. 4x4 transforms are row-major nested
+// arrays; T_a_b maps frame-b coordinates into frame a.
+
+// symmetric n x n Jacobi eigen-decomposition -> { vals, vecs }, eigenvector i is column i of vecs
+function symEig(A) {
+  const n = A.length, a = A.map((r) => r.slice()), V = A.map((_, i) => A.map((__, j) => (i === j ? 1 : 0)));
   for (let sweep = 0; sweep < 60; sweep++) {
     let off = 0;
-    for (let i = 0; i < 4; i++) for (let j = i + 1; j < 4; j++) off += a[i][j] * a[i][j];
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) off += a[i][j] * a[i][j];
     if (off < 1e-22) break;
-    for (let p = 0; p < 3; p++) for (let q = p + 1; q < 4; q++) {
+    for (let p = 0; p < n - 1; p++) for (let q = p + 1; q < n; q++) {
       if (Math.abs(a[p][q]) < 1e-30) continue;
       const th = (a[q][q] - a[p][p]) / (2 * a[p][q]);
       const tt = Math.sign(th || 1) / (Math.abs(th) + Math.sqrt(th * th + 1));
       const c = 1 / Math.sqrt(tt * tt + 1), sn = tt * c;
-      for (let k = 0; k < 4; k++) { // A <- A J
+      for (let k = 0; k < n; k++) { // A <- A J
         const akp = a[k][p], akq = a[k][q];
         a[k][p] = c * akp - sn * akq; a[k][q] = sn * akp + c * akq;
       }
-      for (let k = 0; k < 4; k++) { // A <- J^T A
+      for (let k = 0; k < n; k++) { // A <- J^T A
         const apk = a[p][k], aqk = a[q][k];
         a[p][k] = c * apk - sn * aqk; a[q][k] = sn * apk + c * aqk;
       }
-      for (let k = 0; k < 4; k++) {
+      for (let k = 0; k < n; k++) {
         const vkp = V[k][p], vkq = V[k][q];
         V[k][p] = c * vkp - sn * vkq; V[k][q] = sn * vkp + c * vkq;
       }
     }
   }
+  return { vals: a.map((r, i) => r[i]), vecs: V };
+}
+// eigenvector of the largest eigenvalue
+function maxEigVec4(A) {
+  const { vals, vecs } = symEig(A);
   let best = 0;
-  for (let i = 1; i < 4; i++) if (a[i][i] > a[best][best]) best = i;
-  return [V[0][best], V[1][best], V[2][best], V[3][best]];
+  for (let i = 1; i < vals.length; i++) if (vals[i] > vals[best]) best = i;
+  return vecs.map((r) => r[best]);
+}
+// Horn (1987): rotation R minimising sum |R src_i - dst_i|^2 (closed-form quaternion)
+function hornR(src, dst) {
+  const M = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  for (let i = 0; i < src.length; i++) for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) M[r][c] += src[i][r] * dst[i][c];
+  const [[Sxx, Sxy, Sxz], [Syx, Syy, Syz], [Szx, Szy, Szz]] = M;
+  const N = [
+    [Sxx + Syy + Szz, Syz - Szy, Szx - Sxz, Sxy - Syx],
+    [Syz - Szy, Sxx - Syy - Szz, Sxy + Syx, Szx + Sxz],
+    [Szx - Sxz, Sxy + Syx, -Sxx + Syy - Szz, Syz + Szy],
+    [Sxy - Syx, Szx + Sxz, Syz + Szy, -Sxx - Syy + Szz],
+  ];
+  let [w, x, y, z] = maxEigVec4(N);
+  const qn = Math.hypot(w, x, y, z) || 1; w /= qn; x /= qn; y /= qn; z /= qn;
+  return [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+          [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+          [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]];
 }
 // p_base = R p_cam + t over point pairs; returns { R, t, rmse, maxErr, residuals } or { err }
 function solveRigid(cam, base) {
@@ -2864,26 +2891,173 @@ function solveRigid(cam, base) {
     area = Math.max(area, Math.hypot(u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]) / 2);
   }
   if (area < 1e-4) return { err: 'calib.e.degenerate' };
-  const M = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-  for (let i = 0; i < n; i++) for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) M[r][c] += A[i][r] * B[i][c];
-  const [[Sxx, Sxy, Sxz], [Syx, Syy, Syz], [Szx, Szy, Szz]] = M;
-  const N = [
-    [Sxx + Syy + Szz, Syz - Szy, Szx - Sxz, Sxy - Syx],
-    [Syz - Szy, Sxx - Syy - Szz, Sxy + Syx, Szx + Sxz],
-    [Szx - Sxz, Sxy + Syx, -Sxx + Syy - Szz, Syz + Szy],
-    [Sxy - Syx, Szx + Sxz, Syz + Szy, -Sxx - Syy + Szz],
-  ];
-  let [w, x, y, z] = maxEigVec4(N);
-  const qn = Math.hypot(w, x, y, z) || 1; w /= qn; x /= qn; y /= qn; z /= qn;
-  const R = [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-             [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-             [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]];
+  const R = hornR(A, B);
   const mul = (p) => [0, 1, 2].map((r) => R[r][0] * p[0] + R[r][1] * p[1] + R[r][2] * p[2]);
   const Rca = mul(ca), t = [0, 1, 2].map((k) => cb[k] - Rca[k]);
   const residuals = cam.map((p, i) => { const q = mul(p); return Math.hypot(q[0] + t[0] - base[i][0], q[1] + t[1] - base[i][1], q[2] + t[2] - base[i][2]); });
   const rmse = Math.sqrt(residuals.reduce((s2, e) => s2 + e * e, 0) / n);
   return { R, t, rmse, maxErr: Math.max(...residuals), residuals };
 }
+
+const CALM = (() => {
+  const D = 180 / Math.PI;
+  const mul = (A, B) => A.map((r) => B[0].map((_, c) => r.reduce((s, v, k) => s + v * B[k][c], 0)));
+  const tr = (A) => A[0].map((_, c) => A.map((r) => r[c]));
+  const mv = (R, v) => R.map((r) => r[0] * v[0] + r[1] * v[1] + r[2] * v[2]);
+  const rotOf = (T) => T.slice(0, 3).map((r) => r.slice(0, 3));
+  const posOf = (T) => T.slice(0, 3).map((r) => r[3]);
+  const make = (R, t) => [...R.map((r, i) => [...r, t[i]]), [0, 0, 0, 1]];
+  const inv = (T) => { const Rt = tr(rotOf(T)), p = mv(Rt, posOf(T)); return make(Rt, p.map((v) => -v)); };
+  // R = Rz(yaw) Ry(pitch) Rx(roll), radians (URDF rpy and the detector r_deg convention)
+  const rpyR = (r, p, y) => {
+    const cr = Math.cos(r), sr = Math.sin(r), cp = Math.cos(p), sp = Math.sin(p), cy = Math.cos(y), sy = Math.sin(y);
+    return [[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr]];
+  };
+  // inverse of rpyR, degrees [roll, pitch, yaw]
+  const rpyDeg = (R) => [Math.atan2(R[2][1], R[2][2]) * D, Math.asin(Math.min(1, Math.max(-1, -R[2][0]))) * D, Math.atan2(R[1][0], R[0][0]) * D];
+  const axisR = (k, a) => { // Rodrigues, unit axis k
+    const c = Math.cos(a), s = Math.sin(a), C = 1 - c, [x, y, z] = k;
+    return [[c + x * x * C, x * y * C - z * s, x * z * C + y * s],
+            [y * x * C + z * s, c + y * y * C, y * z * C - x * s],
+            [z * x * C - y * s, z * y * C + x * s, c + z * z * C]];
+  };
+  // URDF chain base_link -> joint1..joint6 -> end_joint -> end_link of assets/reBot-DevArm_gripper.urdf
+  // (same table as rebot_companion.kinematics.URDF_CHAIN): origin xyz, origin rpy, joint axis (null = fixed)
+  const CHAIN = [
+    [[-8.416e-05, 0.0, 0.08465], [0.0, 0.0, 0.0], [0, 0, 1]],
+    [[0.020084, 0.031625, 0.05555], [-1.5708, 0.0, 0.0], [0, 0, -1]],
+    [[-0.264, 0.0, 0.0], [0.0, 0.0, 0.0], [0, 0, 1]],
+    [[0.2426, -0.054, -0.001625], [0.0, 0.0, 0.0], [0, 0, 1]],
+    [[0.078308, -0.0375, -0.03], [-1.5708, 0.0, 0.0], [0, 0, 1]],
+    [[0.028008, 0.0, 0.04], [0.0, 1.5708, 0.0], [0, 0, 1]],
+    [[0.0, 0.0, 0.15539], [0.0, -1.5708, 3.1415], null],
+  ].map(([xyz, rpy, axis]) => [make(rpyR(...rpy), xyz), axis]);
+  // URDF model angles [q1..q6] (rad; missing = 0) -> T_base_gripper (end_link in base_link, x = tool axis)
+  function fk(q) {
+    let M = make([[1, 0, 0], [0, 1, 0], [0, 0, 1]], [0, 0, 0]), i = 0;
+    for (const [F, axis] of CHAIN) {
+      M = mul(M, F);
+      if (axis) M = make(mul(rotOf(M), axisR(axis, Number(q[i++]) || 0)), posOf(M));
+    }
+    return M;
+  }
+  // rotation matrix -> unit quaternion [w, x, y, z] with w >= 0 (Shepperd)
+  function quat(R) {
+    const s0 = R[0][0] + R[1][1] + R[2][2];
+    let q;
+    if (s0 > 0) { const s = Math.sqrt(s0 + 1) * 2; q = [s / 4, (R[2][1] - R[1][2]) / s, (R[0][2] - R[2][0]) / s, (R[1][0] - R[0][1]) / s]; }
+    else if (R[0][0] > R[1][1] && R[0][0] > R[2][2]) { const s = Math.sqrt(1 + R[0][0] - R[1][1] - R[2][2]) * 2; q = [(R[2][1] - R[1][2]) / s, s / 4, (R[0][1] + R[1][0]) / s, (R[0][2] + R[2][0]) / s]; }
+    else if (R[1][1] > R[2][2]) { const s = Math.sqrt(1 + R[1][1] - R[0][0] - R[2][2]) * 2; q = [(R[0][2] - R[2][0]) / s, (R[0][1] + R[1][0]) / s, s / 4, (R[1][2] + R[2][1]) / s]; }
+    else { const s = Math.sqrt(1 + R[2][2] - R[0][0] - R[1][1]) * 2; q = [(R[1][0] - R[0][1]) / s, (R[0][2] + R[2][0]) / s, (R[1][2] + R[2][1]) / s, s / 4]; }
+    const n = Math.hypot(...q) * (q[0] < 0 ? -1 : 1);
+    return q.map((v) => v / n);
+  }
+  const quatR = ([w, x, y, z]) => {
+    const n = Math.hypot(w, x, y, z) || 1; w /= n; x /= n; y /= n; z /= n;
+    return [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]];
+  };
+  // rotation matrix -> rotation vector (axis * angle, rad)
+  function logR(R) {
+    const [w, x, y, z] = quat(R), s = Math.hypot(x, y, z);
+    if (s < 1e-12) return [2 * x, 2 * y, 2 * z];
+    const th = 2 * Math.atan2(s, w);
+    return [x / s * th, y / s * th, z / s * th];
+  }
+  const expR = (v) => { const th = Math.hypot(...v); return th < 1e-15 ? [[1, 0, 0], [0, 1, 0], [0, 0, 1]] : axisR(v.map((c) => c / th), th); };
+  const angDeg = (R) => Math.hypot(...logR(R)) * D;
+  // chordal L2 mean rotation (same as scipy Rotation.mean): top eigenvector of sum q q^T
+  function meanR(Rs) {
+    const M = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]];
+    for (const R of Rs) { const q = quat(R); for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) M[i][j] += q[i] * q[j]; }
+    return quatR(maxEigVec4(M));
+  }
+  const solve3 = (A, b) => { // Cramer's rule; null when singular
+    const det = (M) => M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+    const d = det(A), scale = Math.max(...A.flat().map(Math.abs));
+    if (!(Math.abs(d) > 1e-9 * scale * scale * scale)) return null;
+    return [0, 1, 2].map((c) => det(A.map((r, i) => r.map((v, j) => (j === c ? b[i] : v)))) / d);
+  };
+  // relative gripper rotations over all sample pairs (A_ij = G_j^-1 G_i): AX = XB needs at least two of
+  // them >= minDeg and about non-parallel axes (singular-value ratio of the unit axes >= 0.1, as the SDK)
+  function rotDiversity(G, minDeg = 10) {
+    const alpha = [];
+    for (let i = 0; i < G.length; i++) for (let j = i + 1; j < G.length; j++) alpha.push(logR(mul(tr(rotOf(G[j])), rotOf(G[i]))));
+    const ang = alpha.map((a) => Math.hypot(...a) * D);
+    const maxDeg = Math.max(0, ...ang);
+    const big = alpha.filter((_, k) => ang[k] >= minDeg);
+    if (big.length < 2) return { ok: false, err: 'calib.e.rot_small', maxDeg, ratio: 0 };
+    const S = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    for (const a of big) { const n = Math.hypot(...a); for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) S[i][j] += a[i] * a[j] / (n * n); }
+    const vals = symEig(S).vals.sort((x, y) => y - x);
+    const ratio = Math.sqrt(Math.max(0, vals[1]) / vals[0]);
+    return ratio < 0.1 ? { ok: false, err: 'calib.e.rot_axis', maxDeg, ratio } : { ok: true, maxDeg, ratio };
+  }
+  // Eye-in-hand, Park & Martin (1994) AX = XB over all pairs (rebot_companion.calibration, mode eye_in_hand):
+  // G_i = T_base_gripper, M_i = T_cam_marker, A = G_j^-1 G_i, B = M_j M_i^-1, X = T_gripper_cam
+  // ("T_cam_to_gripper"). Quality: T_base_marker_i = G_i X M_i must be constant; residuals are the
+  // per-sample position / rotation distance from their mean Y.
+  function solveEyeInHand(G, M) {
+    const n = G.length;
+    if (n < 5) return { err: 'calib.e.few5' };
+    const div = rotDiversity(G);
+    if (!div.ok) return { err: div.err, div };
+    const As = [], Bs = [];
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) { As.push(mul(inv(G[j]), G[i])); Bs.push(mul(M[j], inv(M[i]))); }
+    const R = hornR(Bs.map((B) => logR(rotOf(B))), As.map((A) => logR(rotOf(A)))); // log A = R log B
+    const N = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], b = [0, 0, 0];
+    As.forEach((A, k) => { // (R_A - I) t = R t_B - t_A, normal equations
+      const C = rotOf(A).map((r, i) => r.map((v, j) => v - (i === j ? 1 : 0)));
+      const RtB = mv(R, posOf(Bs[k])), tA = posOf(A), d = RtB.map((v, i) => v - tA[i]);
+      for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) { N[i][j] += C.reduce((s, r) => s + r[i] * r[j], 0); }
+      for (let i = 0; i < 3; i++) b[i] += C.reduce((s, r, m) => s + r[i] * d[m], 0);
+    });
+    const t = solve3(N, b);
+    if (!t) return { err: 'calib.e.singular', div };
+    const X = make(R, t);
+    const Tbm = G.map((Gi, i) => mul(mul(Gi, X), M[i]));
+    const pm = [0, 1, 2].map((k) => Tbm.reduce((s, T) => s + T[k][3], 0) / n);
+    const Y = make(meanR(Tbm.map(rotOf)), pm);
+    const RYt = tr(rotOf(Y));
+    const residuals = Tbm.map((T) => Math.hypot(...posOf(T).map((v, k) => v - pm[k])));
+    const rotResiduals = Tbm.map((T) => angDeg(mul(RYt, rotOf(T))));
+    const rms = (a) => Math.sqrt(a.reduce((s, e) => s + e * e, 0) / a.length);
+    return { R, t, X, Y, residuals, rotResiduals, rmse: rms(residuals), rotRmse: rms(rotResiduals),
+             maxErr: Math.max(...residuals), maxRotErr: Math.max(...rotResiduals), div };
+  }
+  const ASSUMPTION = {
+    eye_to_hand: 'ArUco marker centre coincides with the TCP; TCP from URDF forward kinematics (J1..J6)',
+    eye_in_hand: 'ArUco marker fixed in the base frame; camera rigidly attached to the gripper',
+  };
+  // calibration file, loadable by rebot_companion.calibration.HandEyeCalibration.load_result / load_samples
+  function buildExport({ mode, samples, result: r, markerId }) {
+    const eih = mode === 'eye_in_hand';
+    let result = null;
+    if (r) {
+      result = {
+        [eih ? 'T_cam_to_gripper' : 'T_cam_to_base']: make(r.R, r.t),
+        translation_m: r.t, euler_rpy_deg: rpyDeg(r.R), euler_convention: 'R = Rz(yaw) Ry(pitch) Rx(roll)',
+        rmse_m: r.rmse, max_error_m: r.maxErr, residuals_m: r.residuals, samples: r.n, solved_at: r.at,
+      };
+      if (eih) Object.assign(result, {
+        rot_residuals_deg: r.rotResiduals, rot_rmse_deg: r.rotRmse, T_marker_to_base: r.Y,
+        residual_definition: 'distance of each T_base_marker = T_base_gripper * T_cam_to_gripper * T_cam_marker from their mean (T_marker_to_base)',
+      });
+    }
+    return {
+      version: 1, kind: 'hand_eye_calibration', setup: eih ? 'eye_in_hand' : 'eye_to_hand',
+      method: eih ? 'axxb_park_martin' : 'point_registration_horn', assumption: ASSUMPTION[eih ? 'eye_in_hand' : 'eye_to_hand'],
+      kinematics: 'URDF reBot-DevArm_gripper.urdf base_link -> end_link, J1..J6',
+      units: { length: 'm', angle: 'deg' }, created: new Date().toISOString(), marker_id: markerId,
+      result, samples,
+    };
+  }
+  return { mul, inv, make, rotOf, posOf, rpyR, rpyDeg, axisR, expR, logR, angDeg, fk, rotDiversity, solveEyeInHand, buildExport };
+})();
+/* CALIB-MATH-END */
 
 // freshest marker with a 3D position (prefers the locked marker ID)
 // with freshOnly=true, ignores S.detHoldUntil and enforces arrival within 500ms
