@@ -3,7 +3,7 @@ use thiserror::Error;
 
 /// Expected SHA256 checksum of assets/reBot-DevArm_gripper.urdf
 pub const EXPECTED_URDF_SHA256: &str =
-    "d749bb6b2c35126e50d2e732be5c1bafafd57fc8ed340ad84a4b3dbaa3d3ce08";
+    "bc1b3d490deb795b3e259ac8ec36a6be6342cffc3d4e145c2529eac76abdcb62";
 
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum GravityError {
