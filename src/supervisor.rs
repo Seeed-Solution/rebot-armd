@@ -44,8 +44,11 @@ pub enum PreemptError {
 /// CAN gaps observed on the reBot rig (2026-11-06, coinciding with 24 V sags);
 /// a real power loss drops the arm regardless of this bound.
 pub const BUS_LOSS_TIMEOUT: Duration = Duration::from_millis(500);
-/// Upper bound for the automatic park started by an expired lease (trajectory + settle).
+/// Lower bound for the automatic park started by an expired lease (trajectory + settle).
+/// The actual deadline is `max(WATCHDOG_PARK_TIMEOUT, planned duration + WATCHDOG_PARK_MARGIN)`.
 pub const WATCHDOG_PARK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Settle and slack added to the planned park duration for the watchdog deadline.
+pub const WATCHDOG_PARK_MARGIN: Duration = Duration::from_secs(3);
 
 /// Active WebSocket client lease record
 #[derive(Debug, Clone, PartialEq)]
@@ -94,6 +97,8 @@ pub struct SupervisorInner {
     pub unload_settle_ticks: Option<u32>,
     /// Set while a park started by the lease watchdog is running; its deadline.
     pub watchdog_park_deadline: Option<Instant>,
+    /// Duration of the most recently planned NormalUnload trajectory (s).
+    pub unload_planned_duration: Option<f64>,
     pub recorder: EpisodeRecorder,
     pub start_time: Instant,
     pub driver: Option<std::sync::Mutex<Box<dyn ArmDriver>>>,
@@ -178,6 +183,7 @@ impl SupervisorInner {
             pending_normal_unload: false,
             unload_settle_ticks: None,
             watchdog_park_deadline: None,
+            unload_planned_duration: None,
             recorder: EpisodeRecorder::new(),
             start_time: now,
             driver: None,
@@ -205,6 +211,22 @@ impl SupervisorInner {
                 if max.is_finite() && max > 0.0 { limit.max_velocity = limit.max_velocity.min(max); }
             }
         }
+    }
+
+    /// Joint limits used for planning and servo stepping: `config.limits` with
+    /// `max_velocity` capped at `config.planned_max_velocity` for every joint
+    /// except the 7-DOF gripper (index 6).
+    pub fn planning_limits(&self) -> Vec<crate::model::JointLimit> {
+        let mut limits = self.config.limits.clone();
+        if let Some(cap) = self.config.planned_max_velocity {
+            let gripper_idx = (self.config.dof >= 7).then_some(6);
+            for (i, limit) in limits.iter_mut().enumerate() {
+                if Some(i) != gripper_idx {
+                    limit.max_velocity = limit.max_velocity.min(cap);
+                }
+            }
+        }
+        limits
     }
 
     fn gravity_output_enabled(&self) -> bool {
@@ -283,6 +305,7 @@ impl SupervisorInner {
             feedback_age_ms: self.driver.as_ref().and_then(|d| d.lock().ok().map(|drv| drv.feedback_ages().iter().map(|a| a.map(|v| v.as_millis().min(u64::MAX as u128) as u64)).collect())).unwrap_or_else(|| vec![Some(0); self.config.dof]),
             disable_pending: self.disable_pending,
             feedback_valid: self.hardware_feedback_fresh(Duration::from_millis(250)),
+            commanded_positions: self.commanded_positions.clone(),
         }
     }
 
@@ -553,10 +576,11 @@ impl SupervisorInner {
                         &home,
                         &vec![0.0; self.config.dof],
                         Some(1.5),
-                        &self.config.limits,
+                        &self.planning_limits(),
                     ) {
                         let _ = self.safety.set_torque(true);
                         let _ = self.safety.mark_motion_started();
+                        self.unload_planned_duration = Some(traj.duration);
                         self.active_trajectory = Some(traj);
                         self.target_positions = home;
                         self.pending_normal_unload = true;
@@ -863,6 +887,15 @@ impl SupervisorInner {
         }
     }
 
+    /// Deadline for a watchdog park: the planned park duration plus settle margin,
+    /// never less than [`WATCHDOG_PARK_TIMEOUT`].
+    pub fn watchdog_park_timeout(&self) -> Duration {
+        let planned = self.unload_planned_duration
+            .filter(|d| d.is_finite() && *d >= 0.0)
+            .map_or(Duration::ZERO, |d| Duration::from_secs_f64(d.min(3600.0)) + WATCHDOG_PARK_MARGIN);
+        planned.max(WATCHDOG_PARK_TIMEOUT)
+    }
+
     /// Conditions for parking automatically when the lease watchdog expires.
     /// Returns the reason the park is not allowed, or `None` when it is.
     fn watchdog_park_blocker(&self) -> Option<String> {
@@ -1054,7 +1087,7 @@ impl SupervisorInner {
             &target_positions,
             &vec![0.0; self.config.dof],
             duration_secs,
-            &self.config.limits,
+            &self.planning_limits(),
         )?;
 
         // 3. Only renew lease AFTER command validation and planning succeed
@@ -1395,7 +1428,7 @@ impl SupervisorInner {
                     tracing::warn!("Watchdog: lease expired while torqued, parking");
                     self.apply_stop_policy(StopPolicy::NormalUnload);
                     if self.pending_normal_unload {
-                        self.watchdog_park_deadline = Some(Instant::now() + WATCHDOG_PARK_TIMEOUT);
+                        self.watchdog_park_deadline = Some(Instant::now() + self.watchdog_park_timeout());
                     } else {
                         tracing::warn!("Watchdog park could not be planned; holding torque and latching WatchdogTimeout");
                         self.latch_watchdog_fault();
@@ -1418,7 +1451,7 @@ impl SupervisorInner {
                     self.latch_watchdog_fault();
                 }
             } else if Instant::now() >= deadline {
-                tracing::warn!("Watchdog park did not finish within {:?}; holding torque and latching WatchdogTimeout", WATCHDOG_PARK_TIMEOUT);
+                tracing::warn!("Watchdog park did not finish within {:?}; holding torque and latching WatchdogTimeout", self.watchdog_park_timeout());
                 self.latch_watchdog_fault();
             }
         }
@@ -1451,9 +1484,10 @@ impl SupervisorInner {
             // error by design. Its own stall detection covers it.
             let gripper_idx = (self.config.dof >= 7).then_some(6);
             let outside = self.commanded_positions.iter().zip(&self.measured_positions).enumerate()
-                .any(|(i, (q, measured))| Some(i) != gripper_idx
-                    && (!measured.is_finite() || (q - measured).abs() > threshold));
-            if outside {
+                .find(|(i, (q, measured))| Some(*i) != gripper_idx
+                    && (!measured.is_finite() || (*q - *measured).abs() > threshold))
+                .map(|(i, (q, measured))| (i, *q, *measured));
+            if let Some((joint, cmd, meas)) = outside {
                 let since = self.following_error_since.get_or_insert_with(Instant::now);
                 if since.elapsed() >= Duration::from_millis(self.config.following_error.persistence_ms) {
                     self.stop_motion();
@@ -1461,7 +1495,8 @@ impl SupervisorInner {
                     self.target_positions = self.measured_positions.clone();
                     self.commanded_velocities.fill(0.0);
                     self.commanded_accelerations.fill(0.0);
-                    self.safety.trigger_fault(FaultReason::Other("Persistent joint tracking error".into()));
+                    self.safety.trigger_fault(FaultReason::Other(format!(
+                        "Persistent joint tracking error: joint {} cmd {cmd:.3} meas {meas:.3} rad", joint + 1)));
                 }
             } else { self.following_error_since = None; }
         } else { self.following_error_since = None; }
@@ -1557,9 +1592,10 @@ impl SupervisorInner {
                     let mut next_positions = self.commanded_positions.clone();
                     let mut next_velocities = self.commanded_velocities.clone();
                     let mut infeasible = None;
+                    let step_limits = self.planning_limits();
                     for (i, &tgt) in target.iter().enumerate() {
                         if i < self.config.dof {
-                            let limit = &self.config.limits[i];
+                            let limit = &step_limits[i];
                             let clamped_tgt = tgt.clamp(limit.min_position, limit.max_position);
                             let actual_tgt = if i == 6 && self.gripper_stalled {
                                 self.commanded_positions[6]
@@ -1621,13 +1657,14 @@ impl SupervisorInner {
             let mut next_positions = self.commanded_positions.clone();
             let mut next_velocities = self.commanded_velocities.clone();
             let mut infeasible = None;
+            let step_limits = self.planning_limits();
             for i in 0..self.config.dof {
                 let step = Self::bounded_servo_step_with_jerk(
                     self.commanded_positions[i],
                     self.commanded_positions[i],
                     self.commanded_velocities[i],
                     servo_dt,
-                    &self.config.limits[i],
+                    &step_limits[i],
                     self.commanded_accelerations[i],
                     self.config.max_jerk,
                 );

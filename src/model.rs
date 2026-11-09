@@ -84,6 +84,11 @@ impl Default for FollowingErrorPolicy {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GravityModel { RebotDevArm }
 
+/// Estimated Damiao POS_VEL lag gain: tracking error ~= v / POSVEL_LAG_GAIN rad at
+/// v rad/s. Estimate from the 2026-11 tracking-fault analysis; needs verification
+/// on hardware (record |commanded - measured| during presets to fit it).
+pub const POSVEL_LAG_GAIN: f32 = 2.2;
+
 /// Robotic arm hardware/control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArmConfig {
@@ -104,6 +109,11 @@ pub struct ArmConfig {
     pub max_jerk: Option<f32>,
     #[serde(default)]
     pub gravity_model: Option<GravityModel>,
+    /// Joint speed cap (rad/s) for planned motion (jog, home, presets, park) and
+    /// servo stepping. Applies to every joint except the 7-DOF gripper (index 6).
+    /// Keeps POS_VEL lag below the following-error bound. None = no extra cap.
+    #[serde(default)]
+    pub planned_max_velocity: Option<f32>,
 }
 
 impl Default for ArmConfig {
@@ -141,6 +151,7 @@ impl Default for ArmConfig {
             following_error: FollowingErrorPolicy::default(),
             max_jerk: None,
             gravity_model: None,
+            planned_max_velocity: None,
         }
     }
 }
@@ -166,6 +177,16 @@ impl ArmConfig {
             || self.following_error.persistence_ms == 0
             || self.max_jerk.is_some_and(|j| !j.is_finite() || j <= 0.0) {
             return Err("Invalid control, temperature, following-error or jerk configuration".into());
+        }
+        if let Some(cap) = self.planned_max_velocity {
+            if !cap.is_finite() || cap <= 0.0 {
+                return Err("planned_max_velocity must be positive finite".into());
+            }
+            if cap / POSVEL_LAG_GAIN >= self.following_error.max_error_rad {
+                return Err(format!(
+                    "planned_max_velocity {cap} rad/s implies an expected lag {:.3} rad at or above the following-error bound {} rad",
+                    cap / POSVEL_LAG_GAIN, self.following_error.max_error_rad));
+            }
         }
         if let Some(policy) = &self.resting_pose {
             if policy.position_tolerances.is_empty() || policy.position_tolerances.len() > self.dof
@@ -229,6 +250,7 @@ impl ArmConfig {
             following_error: FollowingErrorPolicy::default(),
             max_jerk: Some(50.0),
             gravity_model: Some(GravityModel::RebotDevArm),
+            planned_max_velocity: Some(0.7),
         }
     }
 }
@@ -258,6 +280,9 @@ pub struct ArmObservation {
     pub disable_pending: bool,
     #[serde(default)]
     pub feedback_valid: bool,
+    /// Reference positions sent to the motors this tick (rad).
+    #[serde(default)]
+    pub commanded_positions: Vec<f32>,
 }
 
 /// Field description in the observation schema
@@ -292,6 +317,12 @@ impl ObservationSchema {
                 },
                 SchemaField {
                     name: "positions".to_string(),
+                    dtype: "float32".to_string(),
+                    shape: vec![config.dof],
+                    unit: Some("radians".to_string()),
+                },
+                SchemaField {
+                    name: "commanded_positions".to_string(),
                     dtype: "float32".to_string(),
                     shape: vec![config.dof],
                     unit: Some("radians".to_string()),
