@@ -68,6 +68,7 @@ fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch:
             return Ok(Some((id, duration)));
         }
         "/api/v1/motion/unload" => {
+            inner.gravity_comp_motion_busy().map_err(ArmError::from)?;
             if inner.handover_settling_since.is_some() {
                 return Err(ArmError::Safety(SafetyError::HandoverSettling).into());
             }
@@ -81,10 +82,38 @@ fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch:
             let duration = inner.active_trajectory.as_ref().map_or(0.0, |t| t.duration()) + 0.8;
             return Ok(id.map(|id| (id, duration)));
         }
-        "/api/v1/motion/stop" => { inner.stop_motion(); inner.request_grasp_stop(); }
+        "/api/v1/motion/stop" => {
+            inner.exit_gravity_comp("STOPPED", "Stop command");
+            inner.stop_motion();
+            inner.request_grasp_stop();
+        }
+        "/api/v1/mode/gravity_comp" => {
+            let enable = body.get("enable").and_then(Value::as_bool)
+                .ok_or_else(|| invalid_command("enable must be boolean"))?;
+            if enable {
+                inner.enter_gravity_comp(gravity_comp_request(body)?)?;
+            } else {
+                inner.exit_gravity_comp("REQUESTED", "Exit requested");
+            }
+        }
         _ => return Err(invalid_command("Unknown actuator command")),
     }
     Ok(None)
+}
+
+/// `scale` (number) and `damping_kd` (number for all six arm joints, or six numbers).
+fn gravity_comp_request(body: &Value) -> Result<crate::gravity_comp::GravityCompRequest, ApiError> {
+    let scale = match body.get("scale") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_f64().filter(|x| x.is_finite()).ok_or_else(|| invalid_command("scale must be a number"))? as f32),
+    };
+    let damping_kd = match body.get("damping_kd") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => Some(vec![n.as_f64().unwrap_or(f64::NAN) as f32; 6]),
+        Some(Value::Array(a)) => Some(a.iter().map(|v| v.as_f64().map_or(f32::NAN, |x| x as f32)).collect()),
+        Some(_) => return Err(invalid_command("damping_kd must be a number or an array of 6 numbers")),
+    };
+    Ok(crate::gravity_comp::GravityCompRequest { scale, damping_kd })
 }
 
 /// A Cartesian action waiting for its plan (computed outside the lock).
@@ -120,7 +149,8 @@ fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: 
 }
 
 fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) -> Value {
-    let mut ack = json!({"type":"command_ack", "request_id":request_id, "status":"accepted", "epoch_id":inner.safety.epoch_id(), "safety_state":inner.safety.state(), "is_torqued":inner.is_torqued});
+    let control_mode = if inner.gravity_comp_active() { "gravity_comp" } else { "position" };
+    let mut ack = json!({"type":"command_ack", "request_id":request_id, "status":"accepted", "epoch_id":inner.safety.epoch_id(), "safety_state":inner.safety.state(), "is_torqued":inner.is_torqued, "control_mode":control_mode});
     if let Some((id, duration)) = started {
         ack["action_id"] = json!(id);
         ack["expected_duration_s"] = json!(duration);

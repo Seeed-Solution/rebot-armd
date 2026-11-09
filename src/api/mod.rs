@@ -62,6 +62,7 @@ pub fn create_router_with(supervisor: Arc<ArmSupervisor>, detector: proxy::Detec
         .route("/api/v1/action/move_relative", post(rest::action_requires_lease))
         .route("/api/v1/action/gripper", post(rest::action_requires_lease))
         .route("/api/v1/action/grasp", post(rest::action_requires_lease))
+        .route("/api/v1/mode/gravity_comp", post(rest::action_requires_lease))
         .route("/api/v1/grasp/setup", get(rest::get_grasp_setup))
         .route("/api/v1/safety/e_stop", post(rest::safety_e_stop))
         .route("/api/v1/safety/clear_fault", post(rest::safety_clear_fault))
