@@ -58,6 +58,34 @@ on the CPU on a zero-copy crop of the visible 640x360 band of the same frame.
 
   `both` stops gaining above about 7 results/s: the ArUco pipeline (`pipelines.aruco.ms` 60-75 ms
   at decimate 2) and YOLO share the frame thread.
+- Measured on the device with 1.3.1 (perception API 2, arm torque off, two runs of 15 s
+  windows, on-device node script against `127.0.0.1:8090`):
+
+  | state | whole-chip CPU | rebot-vision CPU | results/s |
+  |---|---|---|---|
+  | standby (no subscription) | 20-26 % | 6 % | 0 |
+  | subscription yolo @ 5 | 34 % | 16 % | 5.1-5.2 |
+  | subscription aruco @ 5 | 53 % | 33 % | 4.9-5.0 |
+  | subscriptions yolo @ 5 + aruco @ 5 (union) | 54-55 % | 39-40 % | 5.3-5.4 |
+
+  The standby whole-chip figure moves between runs with other system services; the rebot-vision
+  share does not. Subscription expiry: 10.01-10.02 s after the last keep-alive with `ttl_ms` 10000.
+
+  Trigger from standby, end to end (5 per set, ms):
+
+  | pipelines | end to end | pipeline ms |
+  |---|---|---|
+  | `["yolo"]` | 101-607 | yolo 45-48 (one 177) |
+  | `["aruco"]` | 108-170 | aruco 45-71 |
+  | `["yolo","aruco"]` | 124-221 | yolo 45-48, aruco 43-59 |
+
+  Open issues seen in these runs, not yet investigated:
+  - 4 of 10 YOLO triggers took 286-607 ms while YOLO itself took 47 ms; with 1.3.0 all YOLO
+    triggers returned in 96-137 ms. The extra time is outside the pipeline (frame wait or
+    request handling).
+  - ArUco in a trigger frame takes 56-67 ms against 37 ms per frame in a subscription.
+  - A shell loop polling the API with `curl` every 100 ms on the device raises ArUco wall time
+    to about 170 ms (one core); measure with process CPU ticks or a low-overhead script.
 
 ## ArUco cost
 
@@ -222,5 +250,5 @@ answer 409 and ArUco works.
 - No `vision` group in the console `config_schema` (the console restarts the whole app, armd
   included, on a config change); the rate cap is set over the API (`POST /api/mode {"fps"}`) or in
   `vision.json`.
-- Default rate 5 fps, from the device measurements under "Frame rate and triggers" (both @ 5:
-  58 % whole-chip CPU; @ 10 or 15: 75 % for 7.2 results/s).
+- Default rate 5 fps, from the device measurements under "Frame rate and triggers" (1.2.1 both @ 5:
+  58 % whole-chip CPU; @ 10 or 15: 75 % for 7.2 results/s; 1.3.1 yolo + aruco @ 5: 55 %).
