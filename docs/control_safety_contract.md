@@ -47,16 +47,49 @@ When enable confirmation is unavailable or remains `Unknown`, automatic disable,
 ## Planned speed, workspace and actions / 规划速度、工作空间与动作
 
 - `planned_max_velocity` (rebot-dm 0.45 rad/s, default unset) caps every joint except the 7-DOF gripper for planned motion: jog, home, presets, park (including watchdog park) and high-level actions. It keeps the Damiao POS_VEL lag (≈ v / 1.5 rad, `POSVEL_LAG_GAIN`, measured 2026-11-09: J3 trailed 0.458 rad at 0.7 rad/s) below the 0.5 rad following-error bound; `validate()` rejects a cap whose expected lag reaches the bound. Servo streaming and stream braking keep the joint limits (≤ 2.0 rad/s): stream clients bound their own lead (the cockpit keeps it under 0.2 rad).
-- The watchdog park deadline is max(10 s, planned park duration + 3 s), so a park from a far J6 pose is not cut short.
+- The watchdog park budget is max(10 s, deceleration + planned park duration + 0.8 s settle hold + 3 s), counted in control-loop time; see "Unload settle" below.
 - The tracking-error fault names the joint: `Persistent joint tracking error: joint N cmd … meas … rad`. Observations carry `commanded_positions`.
 - Cartesian workspace (`workspace` + `kinematics`, 7-DOF only): the end_link origin, the 8 gripper-envelope corners and the optional camera point must stay above `floor_z_m`, inside the box and within `max_reach_m` of the shoulder axis. A servo target, or any of the 21 planner samples of a jog / home / preset, is rejected with `422 WORKSPACE_VIOLATION` when it violates and is worse than the start; moving out of a violation is allowed. Park is exempt and only logged. The schema publishes `workspace` and `camera_mount`. A `--config` profile without these fields runs without the check and logs a warning at startup.
 - Actions (`docs/agent_action_api.md`): `move_to`, `move_relative` and `gripper` over the WS lease; every observation carries `action`. Servo frames during an action return `409 MOTION_BUSY`. Action paths slow down when lag exceeds 0.38 rad and end as `TRACKING_STALL` after 1 s at 0.45 rad, so a blocked action path ends before the generic tracking fault would latch.
 
 - `planned_max_velocity`（rebot-dm 为 0.45 rad/s，默认不设）限制除 7 轴夹爪外所有关节在规划运动中的速度：jog、home、预设、收纳（含看门狗收纳）和高层动作，使达妙 POS_VEL 滞后（约 v / 1.5 rad，2026-11-09 实测：0.7 rad/s 时 J3 滞后 0.458 rad）低于 0.5 rad 跟随误差阈值；预计滞后达到阈值的配置会被 `validate()` 拒绝。servo 流式控制及其制动仍用关节限位（≤ 2.0 rad/s），由客户端自行限制领先量（驾驶舱保持在 0.2 rad 以内）。
-- 看门狗收纳期限为 max(10 s, 规划时长 + 3 s)。
+- 看门狗收纳时限为 max(10 s, 减速时间 + 规划时长 + 0.8 s 稳定保持 + 3 s)，按控制循环时间计；见下文“收纳稳定判定”。
 - 跟踪误差故障信息包含关节号与指令/实测值；观测数据包含 `commanded_positions`。
 - 笛卡尔工作空间（需 `workspace` 与 `kinematics`，仅 7 轴）：end_link 原点、夹爪包络 8 个角点及可选相机点须高于 `floor_z_m`、位于包围盒内且距肩轴不超过 `max_reach_m`。servo 目标或 jog / home / 预设轨迹的 21 个采样点越界且比起点更差时返回 `422 WORKSPACE_VIOLATION`；从越界位姿向外移动允许。收纳不受限，只记日志。schema 公开 `workspace` 与 `camera_mount`。未配置这些字段的 `--config` profile 不做检查，启动时告警。
 - 动作接口见 `docs/agent_action_api.md`。动作运行时 servo 帧返回 `409 MOTION_BUSY`；动作路径在滞后超过 0.38 rad 时降速，0.45 rad 持续 1 s 结束为 `TRACKING_STALL`。
+
+## Unload settle / 收纳稳定判定
+
+A normal unload and the watchdog park plan a trajectory to the resting pose (at least 1.5 s, also from rest), then cut torque only after the settle check passes (`src/supervisor.rs` `step_unload_settle`):
+
+- **Static conditions, every tick:** fresh feedback, enable state `Enabled`, no stop state, each joint within its `position_tolerances` of home, total deviation within `max_total_deviation`, J2 / J3 support torque within `support_torque_limits`. Any failure restarts the hold.
+- **Hold:** the static conditions hold for 800 ms (`UNLOAD_SETTLE_HOLD`, measured from the first to the latest sample).
+- **Stationary over the hold window, per joint:** position span (max − min) ≤ 4 mrad (`UNLOAD_STILL_POSITION_SPAN_RAD`; average speed ≤ 0.005 rad/s); mean velocity over the window and over its last 300 ms (`UNLOAD_STILL_RECENT`) within the resting-pose velocity limit (J1–J3 0.005, J4–J7 0.015 rad/s); every sample ≤ 4 × that limit (`UNLOAD_STILL_VELOCITY_PEAK_FACTOR`; J1–J3 0.02 rad/s).
+- **Why not per-sample velocity:** Damiao velocity has no zero code. At VMAX 10 (J1–J3) raw 2047 / 2048 decode to ∓0.00244 rad/s and raw 2046 / 2049 to ∓0.00733 rad/s, so the 0.005 rad/s limit accepts only the two centre codes; the same two codes as the former 0.015 limit at the old VMAX 30 decoding (both admit |raw − 2047.5| < 1.024). Until 2026-11-09 the settle required 40 consecutive ticks with every sample within the limit, and one sample of ±1.5 LSB restarted it. In `tests/test_park_settle_noise.rs` (rebot-dm, DamiaoArmDriver over mock CAN, Gaussian velocity noise on J1–J3 clipped at ±3 LSB, torque noise σ 2 LSB, 20 seeds), the settle after the trajectory took:
+
+  | Velocity noise σ (LSB) | 0 | 0.3 | 0.5 | 0.75 | 1.0 | 1.5 | 2.0 |
+  |---|---|---|---|---|---|---|---|
+  | Per-sample rule: settled within 20 s | 20/20 | 20/20 | 6/20 | 0/20 | 0/20 | 0/20 | 0/20 |
+  | Per-sample rule: median / max (s) | 0.80 / 0.80 | 0.80 / 1.40 | 9.00 / 17.12 | — | — | — | — |
+  | Window rule: settled within 20 s | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 | 20/20 |
+  | Window rule: median / max (s) | 0.80 / 0.80 | 0.80 / 0.80 | 0.80 / 0.80 | 0.80 / 0.80 | 0.80 / 0.80 | 0.80 / 0.80 | 0.80 / 0.94 |
+
+  The noise level of the real motors at rest is not measured; the settle report below shows which condition blocks on hardware.
+- **Torque off:** after the window check the torque-off path re-checks the static conditions on the current sample; the per-sample velocity check is replaced by the window check only on this path. `set_torque(false)` from the API still uses the per-sample check.
+- **Settle report:** a settle pending longer than 1.8 s logs `Unload settle pending for N s: …` once per second, listing every failing condition per joint with its value and limit (for example `joint 2 torque 7.40 Nm (limit 7)`, `joint 1 velocity peak 0.0415 rad/s (limit 0.02)`, `joint 3 moved 0.0061 rad in 0.8 s (limit 0.004)`).
+- **Watchdog park budget**, in control-loop time (the sum of tick `dt`): max(10 s, deceleration + planned duration + 0.8 s + 3 s). Deceleration is max over joints of |measured velocity| / planning acceleration; the planned duration already starts from the commanded velocity of a jog in progress. The log prints `Watchdog park budget …` when the park starts. Example: planned 9.43 s (the 2026-11-09 incident, inferred from its 12.43 s deadline), J3 at 0.45 rad/s with 5 rad/s² → 0.09 + 9.43 + 0.8 + 3 = 13.32 s, previously 12.43 s.
+- **Settle grace:** when the budget runs out with the trajectory finished and every static condition met (only the stationary check pending), the park gets 5 s more once (`WATCHDOG_PARK_SETTLE_GRACE`, warning with the blocker). Otherwise, and when the grace runs out, torque is held and `Fault(WatchdogTimeout)` latched; a blocked arm or one above the support-torque limit gets no grace.
+
+正常卸载与看门狗收纳先规划到收纳位的轨迹（至少 1.5 s，从静止开始也是如此），稳定判定通过后才断力矩（`src/supervisor.rs` `step_unload_settle`）：
+
+- **静态条件，每个 tick 检查**：反馈新鲜、使能状态为 `Enabled`、不处于停止状态、各关节与收纳位偏差在 `position_tolerances` 内、总偏差在 `max_total_deviation` 内、J2 / J3 支撑力矩在 `support_torque_limits` 内。任一失败则保持计时重新开始。
+- **保持**：静态条件持续 800 ms（`UNLOAD_SETTLE_HOLD`，从首个样本到最新样本计时）。
+- **保持窗口内静止，逐关节**：位置跨度（最大 − 最小）≤ 4 mrad（`UNLOAD_STILL_POSITION_SPAN_RAD`，平均速度 ≤ 0.005 rad/s）；整个窗口和最近 300 ms（`UNLOAD_STILL_RECENT`）的平均速度不超过收纳位速度限值（J1–J3 0.005、J4–J7 0.015 rad/s）；每个样本 ≤ 该限值的 4 倍（`UNLOAD_STILL_VELOCITY_PEAK_FACTOR`，J1–J3 为 0.02 rad/s）。
+- **不再逐样本判速度的原因**：达妙速度没有零值编码。VMAX 10（J1–J3）时原始值 2047 / 2048 解码为 ∓0.00244 rad/s，2046 / 2049 为 ∓0.00733 rad/s，0.005 rad/s 限值只接受中间两个编码；与旧的 VMAX 30 解码下 0.015 限值接受的两个编码相同（两者都是 |raw − 2047.5| < 1.024）。2026-11-09 之前稳定判定要求连续 40 个 tick 每个样本都在限值内，一个 ±1.5 LSB 的样本就重新计时。`tests/test_park_settle_noise.rs`（rebot-dm，DamiaoArmDriver 接 mock CAN，J1–J3 速度加高斯噪声并截断在 ±3 LSB，力矩噪声 σ 2 LSB，20 个随机种子）中轨迹结束后的稳定用时见上表（Per-sample rule = 旧规则，Window rule = 新规则；settled within 20 s = 20 s 内完成的次数，median / max = 中位数 / 最大值）。电机静止时的实际噪声水平尚未测量；下文的稳定报告日志会给出实机上卡住的条件。
+- **断力矩**：窗口判定通过后，断力矩路径对当前样本复查静态条件；只有这条路径用窗口判定代替逐样本速度判定。API 的 `set_torque(false)` 仍逐样本判速度。
+- **稳定报告**：稳定判定超过 1.8 s 未完成时，每秒记录一次 `Unload settle pending for N s: …`，逐关节列出所有未满足的条件及数值和限值（例如 `joint 2 torque 7.40 Nm (limit 7)`、`joint 1 velocity peak 0.0415 rad/s (limit 0.02)`、`joint 3 moved 0.0061 rad in 0.8 s (limit 0.004)`）。
+- **看门狗收纳时限**，按控制循环时间（各 tick `dt` 之和）计：max(10 s, 减速时间 + 规划时长 + 0.8 s + 3 s)。减速时间取各关节 |实测速度| / 规划加速度的最大值；进行中的 jog 的指令速度已包含在规划时长中。收纳开始时日志输出 `Watchdog park budget …`。例：规划 9.43 s（2026-11-09 事件，由其 12.43 s 期限推得），J3 0.45 rad/s、加速度 5 rad/s² → 0.09 + 9.43 + 0.8 + 3 = 13.32 s，原为 12.43 s。
+- **稳定宽限**：时限用完时若轨迹已结束且静态条件全部满足（只剩静止判定未通过），收纳一次性延长 5 s（`WATCHDOG_PARK_SETTLE_GRACE`，记录 warning 及卡住的条件）。否则，或宽限也用完时，保持力矩并锁存 `Fault(WatchdogTimeout)`；被卡住或超过支撑力矩限值的机械臂不获宽限。
 
 ## Damiao mapping ranges / 达妙电机映射范围
 

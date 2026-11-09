@@ -452,7 +452,9 @@ own risk; the MIT License comes without warranty.
 - Lease watchdog: if the lease holder stops sending heartbeats for 2.5 s while the arm is
   torqued, armd parks the arm and turns torque off when the arm is healthy and has a resting
   pose; otherwise it holds position with torque on and latches `Fault(WatchdogTimeout)`. The
-  park deadline is max(10 s, planned park duration + 3 s).
+  park budget is max(10 s, deceleration + planned park duration + 0.8 s settle + 3 s), plus 5 s
+  once when the arm is at the resting pose and only the stationary check is pending
+  (`docs/control_safety_contract.md`, "Unload settle").
 - Torque is not cut away from the resting pose (`ARM_NOT_AT_RESTING_POSE`); use park.
 - Workspace box: on rebot-dm, servo targets and planned motion samples must keep the end_link
   origin, the 8 gripper-envelope corners and the camera point above the floor (`floor_z_m`),
