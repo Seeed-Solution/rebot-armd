@@ -152,10 +152,10 @@ ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.1.0_riscv64.deb && /etc/init.
 |---|---|
 | `/usr/bin/armd`（软链接 `/usr/local/bin/armd`） | 守护进程 |
 | `/etc/init.d/K92rebot-teleop`（软链接 `S92rebot-teleop`） | init 脚本：Wi-Fi、`can0` 配置、启动 / 停止 |
-| `/usr/share/rebot-teleop/` | 驾驶舱 `index.html`、URDF、reCamera 应用列表用的应用清单 `rebot-teleop.json` |
+| `/usr/share/rebot-teleop/` | 驾驶舱 `index.html`、URDF、reCamera 应用列表用的应用清单 `rebot-teleop.json`、机械臂 profile `profile/rebot-b601dm.json` |
 | `/userdata/local/apps/rebot-teleop.json` | 由 `postinst` 复制 |
 
-init 脚本启动 `armd --follower rebot-dm --follower-port can0 --port 8765`，把 `can0` 设为 1 Mbit/s，并在 `wlan1` 上启动 Wi-Fi 热点（SSID `reCamera-Arm-Teleop`，默认密码 `12345678`，地址 `192.168.16.1`），也可以连接已有的 Wi-Fi 网络。这些值从 `/userdata/local/apps/rebot-teleop.config.json` 读取（`arm.follower_model`、`arm.serial_port`、`port`、`network.ap_ssid`、`network.ap_password`、`network.ap_ip`、`network.ap_band`、`network.ap_channel`、`network.sta_ssid`、`network.sta_password`）。在实验室以外使用前，**请修改默认热点密码**。日志在 `/var/log/rebot-teleop.log`。
+init 脚本启动 `armd --follower rebot-dm --follower-port can0 --port 8765`（该文件存在时再加 `--config /usr/share/rebot-teleop/profile/rebot-b601dm.json`），把 `can0` 设为 1 Mbit/s，并在 `wlan1` 上启动 Wi-Fi 热点（SSID `reCamera-Arm-Teleop`，默认密码 `12345678`，地址 `192.168.16.1`），也可以连接已有的 Wi-Fi 网络。这些值从 `/userdata/local/apps/rebot-teleop.config.json` 读取（`arm.follower_model`、`arm.serial_port`、`port`、`network.ap_ssid`、`network.ap_password`、`network.ap_ip`、`network.ap_band`、`network.ap_channel`、`network.sta_ssid`、`network.sta_password`）。在实验室以外使用前，**请修改默认热点密码**。日志在 `/var/log/rebot-teleop.log`。
 
 热点默认使用 5 GHz（`network.ap_band: "5g"`，信道 44，802.11n/ac，20 MHz 带宽）。把 `network.ap_band` 设为 `"2g4"` 改用 2.4 GHz（信道 6）。`network.ap_channel` 指定信道，`0` 或不设置时使用默认信道。启动后若 hostapd 未在 5 GHz 信道上运行（用 `iw dev wlan1 info` 检查），init 脚本改用 2.4 GHz 信道 6 重新启动，并把回退记录到 syslog。
 
@@ -322,28 +322,7 @@ armd [OPTIONS]
 
 ## 接线（reCamera B4 CAN 底板）
 
-以下信息来自 B4 底板资料，本仓库未做验证。请以手中底板版本的丝印为准。
-
-```text
-              reCamera B4 CAN 底板
-     [ 按键 RST/BOOT ]               [ 丝印 CAN&POWER ]
-    ┌─────────────────────────────────────────────────┐
-    │              J2（白色 6-Pin 插座）               │
-    │         ┌───┬───┬───┬───┬───────┬───────┐       │
-    │         │ 1 │ 2 │ 3 │ 4 │   5   │   6   │       │
-    │         └───┴───┴───┴───┴───┬───┴───┬───┘       │
-    └─────────────────────────────┼───────┼───────────┘
-                                CAN_H   CAN_L
-```
-
-J2（SM06B-SRSS-TB，JST SH 1.0 mm，6 Pin）：
-
-- Pin 1 / 2：`VIN`（12-24 V 直流输入）
-- Pin 3 / 4：`GND`
-- Pin 5：`CAN_H`（接机械臂红线）
-- Pin 6：`CAN_L`（接机械臂黑线）
-
-底板带 MCP2518FD SPI-CAN 控制器、MCP2558FD 收发器和 124 Ω 终端电阻。电机动力线不要触碰 Pin 5/6，并将 reCamera 与机械臂电源的地（Pin 3/4）连通。
+B4 CAN 底板引脚（J2：电源、地、`CAN_H`、`CAN_L`）见 reCamera 套件文档：[kits/recamera-b601dm/docs/](kits/recamera-b601dm/docs/README.md#接线recamera-b4-can-底板)。
 
 ---
 

@@ -1,0 +1,35 @@
+{
+  "table_z_m": 0.0,
+  "approach_height_m": 0.15,
+  "grasp_height_m": 0.015,
+  "lift_height_m": 0.12,
+  "grip_pixel_norm": [
+    0.5,
+    0.5
+  ],
+  "camera_tilt_deg": 0.0,
+  "image_size_px": [
+    640.0,
+    360.0
+  ],
+  "fx_px": 600.0,
+  "fy_px": 600.0,
+  "centre_tol_px": 10.0,
+  "stable_frames": 3,
+  "median_frames": 3,
+  "max_iterations": 10,
+  "servo_gain": 0.6,
+  "max_step_m": 0.03,
+  "match_dist_px": 35.0,
+  "match_iou": 0.45,
+  "acquire_dist_px": 160.0,
+  "lost_timeout_s": 1.0,
+  "lost_frames": 5,
+  "settle_delay_s": 0.1,
+  "align_min_aspect": 1.2,
+  "align_j6": true,
+  "approach_speed_mps": 0.05,
+  "descend_speed_mps": 0.03,
+  "phase_timeout_s": 25.0,
+  "timeout_s": 120.0
+}

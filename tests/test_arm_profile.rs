@@ -117,3 +117,31 @@ async fn armd_serves_the_kit_profile_from_config_flag() {
     assert_eq!(schema["limits"], builtin["limits"]);
     assert_eq!(schema["workspace"], builtin["workspace"]);
 }
+
+const KIT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/kits/recamera-b601dm");
+
+/// calibration/grasp_setup.default.json is the profile's grasp section, in the format
+/// armd reads from ARMD_GRASP_SETUP.
+#[test]
+fn kit_grasp_defaults_equal_profile_grasp() {
+    let text = std::fs::read_to_string(format!("{KIT}/calibration/grasp_setup.default.json")).unwrap();
+    let setup: armd::grasp::GraspSetup = serde_json::from_str(&text).unwrap();
+    assert_eq!(Some(setup), ArmConfig::rebot_dm().grasp);
+}
+
+/// calibration/camera_mounts.json: every entry is a valid camera_mount; v5 is the
+/// profile's default mount.
+#[test]
+fn kit_camera_mounts_parse() {
+    let text = std::fs::read_to_string(format!("{KIT}/calibration/camera_mounts.json")).unwrap();
+    let mounts: std::collections::BTreeMap<String, serde_json::Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(mounts.len(), 4);
+    for (name, entry) in &mounts {
+        let mount: armd::model::CameraMount = serde_json::from_value(entry["camera_mount"].clone()).unwrap();
+        let pitch = entry["pitch_down_deg"].as_f64().unwrap() as f32;
+        assert_eq!(mount.tilt_deg, -pitch, "{name}");
+        assert!(std::path::Path::new(&format!("{KIT}/{}", entry["mount_dir"].as_str().unwrap())).is_dir(), "{name}");
+    }
+    let v5: armd::model::CameraMount = serde_json::from_value(mounts["v5"]["camera_mount"].clone()).unwrap();
+    assert_eq!(v5, ArmConfig::rebot_dm().camera_mount);
+}

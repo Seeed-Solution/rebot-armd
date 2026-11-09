@@ -189,10 +189,11 @@ The package installs:
 |---|---|
 | `/usr/bin/armd` (symlink `/usr/local/bin/armd`) | the daemon |
 | `/etc/init.d/K92rebot-teleop` (symlink `S92rebot-teleop`) | init script: Wi-Fi, `can0` setup, start / stop |
-| `/usr/share/rebot-teleop/` | cockpit `index.html`, URDF, app manifest `rebot-teleop.json` for the reCamera app list |
+| `/usr/share/rebot-teleop/` | cockpit `index.html`, URDF, app manifest `rebot-teleop.json` for the reCamera app list, arm profile `profile/rebot-b601dm.json` |
 | `/userdata/local/apps/rebot-teleop.json` | copied by `postinst` |
 
-The init script starts `armd --follower rebot-dm --follower-port can0 --port 8765`, sets
+The init script starts `armd --follower rebot-dm --follower-port can0 --port 8765` (plus
+`--config /usr/share/rebot-teleop/profile/rebot-b601dm.json` when that file exists), sets
 `can0` to 1 Mbit/s and starts a Wi-Fi access point on `wlan1` (SSID `reCamera-Arm-Teleop`,
 default password `12345678`, address `192.168.16.1`). It can also join an existing Wi-Fi
 network. These values are read from `/userdata/local/apps/rebot-teleop.config.json`
@@ -432,31 +433,8 @@ without Cartesian actions; armd logs a warning at startup. Field list:
 
 ## Wiring (reCamera B4 CAN board)
 
-From the B4 board documentation; this repository does not verify it. Check the silkscreen of
-your board revision.
-
-```text
-              reCamera B4 CAN board
-     [ RST/BOOT buttons ]             [ silkscreen CAN&POWER ]
-    ┌─────────────────────────────────────────────────┐
-    │              J2 (white 6-pin connector)          │
-    │         ┌───┬───┬───┬───┬───────┬───────┐       │
-    │         │ 1 │ 2 │ 3 │ 4 │   5   │   6   │       │
-    │         └───┴───┴───┴───┴───┬───┴───┬───┘       │
-    └─────────────────────────────┼───────┼───────────┘
-                                CAN_H   CAN_L
-```
-
-J2 (SM06B-SRSS-TB, JST SH 1.0 mm, 6 pins):
-
-- Pin 1 / 2: `VIN` (12-24 V DC in)
-- Pin 3 / 4: `GND`
-- Pin 5: `CAN_H` (arm red wire)
-- Pin 6: `CAN_L` (arm black wire)
-
-The board has an MCP2518FD SPI-CAN controller, an MCP2558FD transceiver and a 124 Ω
-termination resistor. Keep motor power wiring away from pins 5/6 and connect the grounds of
-the reCamera and the arm power supply (pins 3/4).
+The B4 CAN board pinout (J2: power, ground, `CAN_H`, `CAN_L`) is part of the reCamera kit
+documentation: [kits/recamera-b601dm/docs/](kits/recamera-b601dm/docs/README.md#wiring-recamera-b4-can-board).
 
 ---
 
