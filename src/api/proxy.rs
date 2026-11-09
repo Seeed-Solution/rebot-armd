@@ -138,7 +138,8 @@ use axum::{
     http::{header, HeaderValue, Method, StatusCode},
     response::IntoResponse,
 };
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Default detector control API base URL. Override with `ARMD_DETECTOR_URL`.
@@ -307,6 +308,33 @@ fn decode_chunked(mut data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// One upstream exchange with a deadline; `None` (logged) when unreachable or timed out.
+async fn fetch(
+    up: &DetectorUpstream,
+    method: Method,
+    path_and_query: &str,
+    body: Option<&[u8]>,
+    timeout: Duration,
+) -> Option<UpstreamResponse> {
+    match tokio::time::timeout(timeout, upstream_request(up, method, path_and_query, body)).await {
+        Ok(Ok(r)) => Some(r),
+        Ok(Err(e)) => {
+            tracing::debug!("detector upstream {path_and_query} failed: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::debug!("detector upstream {path_and_query} timed out after {timeout:?}");
+            None
+        }
+    }
+}
+
+fn passthrough(r: UpstreamResponse) -> Response {
+    let ct = r.content_type.unwrap_or_else(|| HeaderValue::from_static("application/json"));
+    (r.status, [(header::CONTENT_TYPE, ct), (header::CACHE_CONTROL, HeaderValue::from_static("no-store"))], r.body)
+        .into_response()
+}
+
 async fn forward(
     up: &DetectorUpstream,
     method: Method,
@@ -314,21 +342,9 @@ async fn forward(
     body: Option<Bytes>,
     timeout: Duration,
 ) -> Response {
-    let res = tokio::time::timeout(timeout, upstream_request(up, method, &path_and_query, body.as_deref())).await;
-    match res {
-        Ok(Ok(r)) => {
-            let ct = r.content_type.unwrap_or_else(|| HeaderValue::from_static("application/json"));
-            (r.status, [(header::CONTENT_TYPE, ct), (header::CACHE_CONTROL, HeaderValue::from_static("no-store"))], r.body)
-                .into_response()
-        }
-        Ok(Err(e)) => {
-            tracing::debug!("detector upstream {path_and_query} failed: {e}");
-            detector_unreachable()
-        }
-        Err(_) => {
-            tracing::debug!("detector upstream {path_and_query} timed out after {timeout:?}");
-            detector_unreachable()
-        }
+    match fetch(up, method, &path_and_query, body.as_deref(), timeout).await {
+        Some(r) => passthrough(r),
+        None => detector_unreachable(),
     }
 }
 
@@ -349,6 +365,31 @@ pub(crate) async fn request_json(
         return Err(format!("detector returned {}", r.status));
     }
     serde_json::from_slice(&r.body).map_err(|e| format!("detector returned invalid JSON: {e}"))
+}
+
+/// As [`request_json`], but a 404 (provider without the route) is `Ok(None)`.
+pub(crate) async fn request_json_opt(
+    up: &DetectorUpstream,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<Option<serde_json::Value>, String> {
+    let m = Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
+    let r = tokio::time::timeout(timeout, upstream_request(up, m, path_and_query, body))
+        .await
+        .map_err(|_| "detector timed out".to_string())??;
+    if r.status == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !r.status.is_success() {
+        let detail = serde_json::from_slice::<serde_json::Value>(&r.body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        return Err(format!("detector returned {} {detail}", r.status).trim_end().to_string());
+    }
+    serde_json::from_slice(&r.body).map(Some).map_err(|e| format!("detector returned invalid JSON: {e}"))
 }
 
 fn detector_unreachable() -> Response {
@@ -411,6 +452,96 @@ pub async fn post_detection_trigger(
         _ => "/api/trigger".to_string(),
     };
     forward(&up, Method::POST, path, Some(json_body(Bytes::new())), timeout).await
+}
+
+// ---------------------------------------------------------------------------
+// Vision mode (rebot-vision `/api/mode`): off | yolo | aruco | both
+// ---------------------------------------------------------------------------
+
+/// Last `/api/mode` body seen from the provider, for `capabilities.vision`.
+#[derive(Clone, Default)]
+pub struct VisionCache(Arc<Mutex<Option<(Instant, serde_json::Value)>>>);
+
+/// The schema reuses a cached mode body this young instead of asking the provider.
+const VISION_CACHE_MAX_AGE: Duration = Duration::from_secs(2);
+/// Schema requests wait at most this long for the provider.
+const VISION_SCHEMA_TIMEOUT: Duration = Duration::from_millis(500);
+
+impl VisionCache {
+    fn store(&self, body: &[u8]) {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+            if v.get("mode").and_then(|m| m.as_str()).is_some() {
+                *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), v));
+            }
+        }
+    }
+    fn clear(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    fn fresh(&self) -> Option<serde_json::Value> {
+        let g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().filter(|(t, _)| t.elapsed() < VISION_CACHE_MAX_AGE).map(|(_, v)| v.clone())
+    }
+
+    /// Provider mode body: a fresh cached one, else `GET /api/mode` (short timeout).
+    /// `None` when the provider is unreachable or has no mode API (lite, older detectors).
+    pub async fn status(&self, up: &DetectorUpstream) -> Option<serde_json::Value> {
+        if let Some(v) = self.fresh() {
+            return Some(v);
+        }
+        match fetch(up, Method::GET, "/api/mode", None, VISION_SCHEMA_TIMEOUT).await {
+            Some(r) if r.status.is_success() => {
+                self.store(&r.body);
+                self.fresh()
+            }
+            _ => {
+                self.clear();
+                None
+            }
+        }
+    }
+}
+
+/// Fills the provider-reported fields of `capabilities.vision` from a `/api/mode` body.
+pub fn apply_vision_status(caps: &mut crate::model::VisionCapabilities, v: &serde_json::Value) {
+    caps.mode = v.get("mode").and_then(|m| m.as_str()).map(str::to_string);
+    caps.modes = v
+        .get("modes")
+        .and_then(|m| m.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    caps.api_version = v.get("api_version").and_then(|n| n.as_u64()).and_then(|n| u32::try_from(n).ok());
+    caps.trigger = v.get("trigger").and_then(|b| b.as_bool());
+    caps.yolo_available = v.get("available").and_then(|a| a.get("yolo")).and_then(|b| b.as_bool());
+}
+
+async fn forward_mode(up: &DetectorUpstream, cache: &VisionCache, method: Method, body: Option<Bytes>) -> Response {
+    match fetch(up, method, "/api/mode", body.as_deref(), TIMEOUT_MARGIN).await {
+        Some(r) => {
+            if r.status.is_success() {
+                cache.store(&r.body);
+            }
+            passthrough(r)
+        }
+        None => {
+            cache.clear();
+            detector_unreachable()
+        }
+    }
+}
+
+/// GET /api/v1/vision/mode -> upstream GET /api/mode
+pub async fn get_vision_mode(Extension(up): Extension<DetectorUpstream>, Extension(cache): Extension<VisionCache>) -> Response {
+    forward_mode(&up, &cache, Method::GET, None).await
+}
+
+/// POST /api/v1/vision/mode -> upstream POST /api/mode (body `{"mode"?, "enabled"?, "fps"?}` passed through)
+pub async fn post_vision_mode(
+    Extension(up): Extension<DetectorUpstream>,
+    Extension(cache): Extension<VisionCache>,
+    body: Bytes,
+) -> Response {
+    forward_mode(&up, &cache, Method::POST, Some(json_body(body))).await
 }
 
 #[cfg(test)]

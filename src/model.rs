@@ -677,7 +677,7 @@ pub struct SchemaField {
 }
 
 /// Version of the capability summary in the observation schema (`capabilities`).
-pub const CAPABILITIES_VERSION: u32 = 1;
+pub const CAPABILITIES_VERSION: u32 = 2;
 
 /// Vision features armd offers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -686,7 +686,24 @@ pub struct VisionCapabilities {
     /// armd proxies a detector's API under `/api/v1/detection/*` (upstream
     /// `ARMD_DETECTOR_URL`). Whether a detector is reachable is not checked here.
     pub detection_proxy: bool,
+    /// armd proxies the provider's mode API at this route (`GET`/`POST`). Present from
+    /// capabilities version 2; whether the provider has it shows in `modes`.
+    pub mode_endpoint: String,
+    /// Modes the provider reports (`off`, `yolo`, `aruco`, `both` for rebot-vision);
+    /// empty when the provider is unreachable or has no mode API.
+    pub modes: Vec<String>,
+    /// The provider's current base mode, when it reports one.
+    pub mode: Option<String>,
+    /// The provider's perception API version (`api_version`), when it reports one.
+    pub api_version: Option<u32>,
+    /// The provider runs `/api/trigger` in every mode, when it reports so.
+    pub trigger: Option<bool>,
+    /// Whether the provider loaded its YOLO model, when it reports so.
+    pub yolo_available: Option<bool>,
 }
+
+/// armd's route for the vision mode API.
+pub const VISION_MODE_ENDPOINT: &str = "/api/v1/vision/mode";
 
 /// What this armd instance supports, derived from the profile and the driver, so clients
 /// can adapt without probing routes. Missing in schemas from older armd versions.
@@ -729,7 +746,7 @@ impl Capabilities {
             grasp: seven && kin && config.gripper_policy.is_some() && config.grasp.is_some(),
             gravity_comp: seven && config.gravity_model.is_some() && config.gravity_comp.is_some(),
             damiao_ranges: config.damiao_ranges.is_some(),
-            vision: VisionCapabilities { detection_proxy: true },
+            vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }
 }

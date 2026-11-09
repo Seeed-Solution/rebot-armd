@@ -12,6 +12,8 @@ async fn rebot_dm_schema_declares_its_features() {
     assert_eq!(caps.profile_version, ARM_PROFILE_VERSION);
     assert!(caps.cartesian && caps.workspace_check && caps.gripper && caps.grasp && caps.damiao_ranges);
     assert!(caps.vision.detection_proxy);
+    assert_eq!(caps.vision.mode_endpoint, "/api/v1/vision/mode");
+    assert!(caps.vision.modes.is_empty() && caps.vision.mode.is_none(), "provider fields come from the API layer");
     // Same source as the observation (profile, URDF check, driver).
     assert_eq!(caps.gravity_comp, supervisor.get_observation().await.gravity_comp.supported);
 }

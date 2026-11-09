@@ -223,10 +223,17 @@ pub async fn get_observation(
 }
 
 /// GET /api/v1/observation/schema
+/// `capabilities.vision` carries the provider's modes and current mode when it reports them.
 pub async fn get_observation_schema(
     State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::Extension(up): axum::Extension<crate::api::proxy::DetectorUpstream>,
+    axum::Extension(vision): axum::Extension<crate::api::proxy::VisionCache>,
 ) -> Json<ObservationSchema> {
-    Json(supervisor.get_schema().await)
+    let mut schema = supervisor.get_schema().await;
+    if let Some(v) = vision.status(&up).await {
+        crate::api::proxy::apply_vision_status(&mut schema.capabilities.vision, &v);
+    }
+    Json(schema)
 }
 
 

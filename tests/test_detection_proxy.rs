@@ -26,12 +26,14 @@ async fn spawn_mock_upstream() -> (SocketAddr, Arc<Mutex<Vec<SeenRequest>>>) {
     let addr = listener.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let enabled = Arc::new(Mutex::new(false));
+    let mode = Arc::new(Mutex::new("yolo".to_string()));
     let log = seen.clone();
     tokio::spawn(async move {
         loop {
             let (mut sock, _) = listener.accept().await.unwrap();
             let log = log.clone();
             let enabled = enabled.clone();
+            let mode = mode.clone();
             tokio::spawn(async move {
                 let mut raw = Vec::new();
                 let mut buf = [0u8; 4096];
@@ -61,7 +63,23 @@ async fn spawn_mock_upstream() -> (SocketAddr, Arc<Mutex<Vec<SeenRequest>>>) {
                 let path = req.target.split('?').next().unwrap();
                 let query = req.target.split_once('?').map(|(_, q)| q).unwrap_or("");
                 let state = |on: bool| serde_json::json!({"enabled": on, "fps": if on {10} else {1}, "active_fps": 10, "idle_fps": 1}).to_string();
+                let mode_body = |m: &str, on: bool| serde_json::json!({"api_version": 1, "mode": m, "modes": ["off", "yolo", "aruco", "both"],
+                    "enabled": on, "fps": if on {10} else {1}, "trigger": true, "available": {"yolo": true, "aruco": true}}).to_string();
                 let (status, payload, chunked) = match (req.method.as_str(), path) {
+                    ("GET", "/api/mode") => ("200 OK", mode_body(&mode.lock().unwrap(), *enabled.lock().unwrap()), false),
+                    ("POST", "/api/mode") => {
+                        let v: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
+                        match v["mode"].as_str() {
+                            Some("nomodel") => ("409 Conflict", r#"{"api_version":1,"error":"yolo unavailable"}"#.to_string(), false),
+                            Some(m @ ("off" | "yolo" | "aruco" | "both")) => {
+                                *mode.lock().unwrap() = m.to_string();
+                                if let Some(on) = v["enabled"].as_bool() { *enabled.lock().unwrap() = on && m != "off"; }
+                                if m == "off" { *enabled.lock().unwrap() = false; }
+                                ("200 OK", mode_body(m, *enabled.lock().unwrap()), false)
+                            }
+                            _ => ("400 Bad Request", r#"{"api_version":1,"error":"bad mode"}"#.to_string(), false),
+                        }
+                    }
                     ("GET", "/api/inference") => ("200 OK", state(*enabled.lock().unwrap()), false),
                     ("POST", "/api/inference") => match serde_json::from_str::<serde_json::Value>(&req.body).ok().and_then(|v| v["enabled"].as_bool()) {
                         Some(on) => {
@@ -289,4 +307,94 @@ async fn cross_origin_trigger_is_rejected() {
         .unwrap();
     assert_eq!(r.status(), 403);
     assert!(seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn vision_mode_get_and_post_pass_through() {
+    let (up, seen) = spawn_mock_upstream().await;
+    let addr = spawn_armd(&format!("http://{up}")).await;
+    let c = reqwest::Client::new();
+    let url = format!("http://{addr}/api/v1/vision/mode");
+
+    let r = c.get(&url).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["cache-control"], "no-store");
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!((v["mode"].as_str(), v["api_version"].as_u64()), (Some("yolo"), Some(1)));
+
+    let r = c.post(&url).json(&serde_json::json!({"mode": "both", "enabled": true})).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!((v["mode"].as_str(), v["enabled"].as_bool()), (Some("both"), Some(true)));
+
+    // upstream 400 / 409 bodies pass through unchanged
+    let r = c.post(&url).json(&serde_json::json!({"mode": "video"})).send().await.unwrap();
+    assert_eq!(r.status(), 400);
+    let r = c.post(&url).json(&serde_json::json!({"mode": "nomodel"})).send().await.unwrap();
+    assert_eq!(r.status(), 409);
+    assert_eq!(r.json::<serde_json::Value>().await.unwrap()["error"], "yolo unavailable");
+
+    // empty POST body becomes {} for the upstream
+    let _ = c.post(&url).send().await.unwrap();
+    let seen = seen.lock().unwrap().clone();
+    let t: Vec<_> = seen.iter().map(|s| (s.method.as_str(), s.target.as_str(), s.body.as_str())).collect();
+    assert_eq!(t[0], ("GET", "/api/mode", ""));
+    assert_eq!((t[1].0, t[1].1), ("POST", "/api/mode"));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(t[1].2).unwrap(), serde_json::json!({"mode": "both", "enabled": true}));
+    assert_eq!(t.last().unwrap().2, "{}");
+}
+
+#[tokio::test]
+async fn vision_mode_502_when_down_404_when_old_and_cross_origin_403() {
+    // port 1: nothing listens (a freed ephemeral port could be reused by a parallel test)
+    let addr = spawn_armd("http://127.0.0.1:1").await;
+    let c = reqwest::Client::new();
+    for req in [c.get(format!("http://{addr}/api/v1/vision/mode")), c.post(format!("http://{addr}/api/v1/vision/mode")).json(&serde_json::json!({"mode": "aruco"}))] {
+        let r = req.send().await.unwrap();
+        assert_eq!(r.status(), 502);
+        assert_eq!(r.json::<serde_json::Value>().await.unwrap(), serde_json::json!({"error": "detector unreachable"}));
+    }
+
+    let (up, seen) = spawn_mock_upstream().await;
+    let old = spawn_armd(&format!("http://{up}/old")).await;
+    assert_eq!(c.get(format!("http://{old}/api/v1/vision/mode")).send().await.unwrap().status(), 404);
+
+    let addr = spawn_armd(&format!("http://{up}")).await;
+    let n = seen.lock().unwrap().len();
+    let r = c.post(format!("http://{addr}/api/v1/vision/mode")).header("origin", "http://evil.example")
+        .json(&serde_json::json!({"mode": "off"})).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+    assert_eq!(seen.lock().unwrap().len(), n);
+}
+
+#[tokio::test]
+async fn schema_capabilities_report_provider_modes() {
+    let c = reqwest::Client::new();
+    // provider with the mode API
+    let (up, _) = spawn_mock_upstream().await;
+    let addr = spawn_armd(&format!("http://{up}")).await;
+    let v: serde_json::Value = c.get(format!("http://{addr}/api/v1/observation/schema")).send().await.unwrap().json().await.unwrap();
+    let vis = &v["capabilities"]["vision"];
+    assert_eq!(v["capabilities"]["version"], armd::model::CAPABILITIES_VERSION);
+    assert_eq!(vis["detection_proxy"], true);
+    assert_eq!(vis["mode_endpoint"], "/api/v1/vision/mode");
+    assert_eq!(vis["modes"], serde_json::json!(["off", "yolo", "aruco", "both"]));
+    assert_eq!((vis["mode"].as_str(), vis["api_version"].as_u64(), vis["trigger"].as_bool()), (Some("yolo"), Some(1), Some(true)));
+    assert_eq!(vis["yolo_available"], true);
+
+    // a mode change through armd shows up in the next schema (cache updated by the proxied reply)
+    c.post(format!("http://{addr}/api/v1/vision/mode")).json(&serde_json::json!({"mode": "aruco"})).send().await.unwrap();
+    let v: serde_json::Value = c.get(format!("http://{addr}/api/v1/observation/schema")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(v["capabilities"]["vision"]["mode"], "aruco");
+
+    // older detector (404) and no provider: no modes, no current mode
+    let old = spawn_armd(&format!("http://{up}/old")).await;
+    let none = spawn_armd("http://127.0.0.1:1").await;
+    for a in [old, none] {
+        let v: serde_json::Value = c.get(format!("http://{a}/api/v1/observation/schema")).send().await.unwrap().json().await.unwrap();
+        let vis = &v["capabilities"]["vision"];
+        assert_eq!(vis["modes"], serde_json::json!([]));
+        assert!(vis["mode"].is_null() && vis["api_version"].is_null());
+        assert_eq!(vis["mode_endpoint"], "/api/v1/vision/mode");
+    }
 }
