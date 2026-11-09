@@ -1438,7 +1438,7 @@ const I18N = {
     'calib.count': '已采集位姿: {n} / {total}', 'calib.cap': '采集当前点位', 'calib.cap.busy': '采集中…', 'calib.solve': '求解标定', 'calib.export': '导出配置',
     'calib.reset': '重置', 'calib.reset.confirm': '再点一次确认重置',
     'calib.live.none': '未识别到带 3D 位姿的标记 · 采集时会自动单次识别', 'calib.live.ok': '标记 ID {id} · Z {z} m',
-    'calib.e.offline': '遥测未连接，无法读取关节状态', 'calib.e.moving': '机械臂仍在运动，请静止后再采集', 'calib.e.shifted': '识别期间机械臂位置有变化，请保持静止后重试', 'calib.e.j5': '关节5偏离零位超过 1°，当前正向运动学未计入 J5，请先将其回零', 'calib.e.nomarker': '未识别到带 3D 位姿的 ArUco 标记',
+    'calib.e.offline': '遥测未连接，无法读取关节状态', 'calib.e.moving': '机械臂仍在运动，请静止后再采集', 'calib.e.shifted': '识别期间机械臂位置有变化，请保持静止后重试', 'calib.e.j5': '手腕 J5/J6 偏离初始位置超过 1°，标定计算按手腕初始位置处理，请先回到初始位置', 'calib.e.nomarker': '未识别到带 3D 位姿的 ArUco 标记',
     'calib.e.dup': '与第 {i} 个点位距离不足 1 cm，请移到新位置', 'calib.e.few': '至少需要 3 个点位', 'calib.e.degenerate': '点位共线或过于集中，请扩大分布',
     'calib.ok.cap': '已采集第 {n} 个点位', 'calib.ok.solve': '标定完成，RMSE {rmse} mm', 'calib.rmse.warn': '残差偏大，检查标记是否与 TCP 重合、点位是否静止',
     'calib.r.t': '平移 T (mm)', 'calib.r.e': '欧拉角 RPY (°)', 'calib.r.rmse': '残差 RMSE', 'calib.r.n': '样本数', 'calib.r.max': '最大残差',
@@ -1530,7 +1530,7 @@ const I18N = {
     'calib.count': 'Poses captured: {n} / {total}', 'calib.cap': 'Capture pose', 'calib.cap.busy': 'Capturing…', 'calib.solve': 'Solve', 'calib.export': 'Export JSON',
     'calib.reset': 'Reset', 'calib.reset.confirm': 'Tap again to reset',
     'calib.live.none': 'No marker with a 3D pose · capture will run a snapshot', 'calib.live.ok': 'Marker ID {id} · Z {z} m',
-    'calib.e.offline': 'Telemetry offline, joint state unavailable', 'calib.e.moving': 'Arm is still moving, wait until it stops', 'calib.e.shifted': 'Arm pose changed during detection, hold still and retry', 'calib.e.j5': 'Joint 5 is more than 1° off zero and the current kinematics ignore it; return it to zero first', 'calib.e.nomarker': 'No ArUco marker with a 3D pose detected',
+    'calib.e.offline': 'Telemetry offline, joint state unavailable', 'calib.e.moving': 'Arm is still moving, wait until it stops', 'calib.e.shifted': 'Arm pose changed during detection, hold still and retry', 'calib.e.j5': 'Wrist J5/J6 is more than 1° off its home position, which calibration assumes; return the wrist to home first', 'calib.e.nomarker': 'No ArUco marker with a 3D pose detected',
     'calib.e.dup': 'Less than 1 cm from pose {i}, move to a new position', 'calib.e.few': 'At least 3 poses are required', 'calib.e.degenerate': 'Poses are collinear or too close together, spread them out',
     'calib.ok.cap': 'Captured pose {n}', 'calib.ok.solve': 'Calibration solved, RMSE {rmse} mm', 'calib.rmse.warn': 'High residual: check the marker sits on the TCP and the arm was still',
     'calib.r.t': 'Translation T (mm)', 'calib.r.e': 'Euler RPY (°)', 'calib.r.rmse': 'Residual RMSE', 'calib.r.n': 'Samples', 'calib.r.max': 'Max residual',
@@ -2946,7 +2946,10 @@ async function calCapture() {
   if (!isLive() || !S.obs || !Array.isArray(S.obs.positions) || S.obs.positions.length < 4) { toast(t('calib.e.offline'), 'warn'); return; }
   if (Array.isArray(S.obs.velocities) && S.obs.velocities.some((v) => Math.abs(v) > 0.02)) { toast(t('calib.e.moving'), 'warn'); return; }
   // J5 (index 4) is not part of IK.fk (J1-J4 only); a rotated J5 would corrupt the TCP of the sample
-  if (Math.abs(S.obs.positions[4] || 0) > Math.PI / 180) { toast(t('calib.e.j5'), 'warn'); return; }
+  // IK.fk models J1-J4 with the wrist at its home values (J5 = 0, J6 = pi/2 on 7-DOF arms);
+  // reject samples taken with either wrist joint moved off home.
+  const wristHome = [0, Math.PI / 2];
+  if ([4, 5].some((j, k) => (j === 4 || S.dof === 7) && S.obs.positions.length > j && Math.abs((S.obs.positions[j] || 0) - wristHome[k]) > Math.PI / 180)) { toast(t('calib.e.j5'), 'warn'); return; }
   CAL.busy = true; calRender();
   try {
     const pos = S.obs.positions.slice(); // snapshot before the (1-4 s) detection so frame and pose belong together
