@@ -2554,7 +2554,9 @@ impl ArmSupervisor {
 
     pub async fn get_schema(&self) -> ObservationSchema {
         let inner = self.inner.read().await;
-        ObservationSchema::from_config(&inner.config)
+        let mut schema = ObservationSchema::from_config(&inner.config);
+        schema.capabilities.gravity_comp = inner.gravity_comp_support().is_ok();
+        schema
     }
 
     pub async fn get_config(&self) -> ArmConfig {

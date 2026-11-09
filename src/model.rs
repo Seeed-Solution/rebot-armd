@@ -676,6 +676,64 @@ pub struct SchemaField {
     pub unit: Option<String>,
 }
 
+/// Version of the capability summary in the observation schema (`capabilities`).
+pub const CAPABILITIES_VERSION: u32 = 1;
+
+/// Vision features armd offers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct VisionCapabilities {
+    /// armd proxies a detector's API under `/api/v1/detection/*` (upstream
+    /// `ARMD_DETECTOR_URL`). Whether a detector is reachable is not checked here.
+    pub detection_proxy: bool,
+}
+
+/// What this armd instance supports, derived from the profile and the driver, so clients
+/// can adapt without probing routes. Missing in schemas from older armd versions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Capabilities {
+    /// [`CAPABILITIES_VERSION`]; 0 when the schema has no `capabilities` object.
+    pub version: u32,
+    /// `profile_version` of the loaded arm profile.
+    pub profile_version: u32,
+    /// Cartesian actions (`/api/v1/action/move_*`): 7-DOF profile with a kinematics model.
+    pub cartesian: bool,
+    /// Cartesian workspace check: kinematics model and workspace box.
+    pub workspace_check: bool,
+    /// `/api/v1/action/gripper`: gripper policy on a profile with a 7th (gripper) joint.
+    pub gripper: bool,
+    /// `/api/v1/action/grasp`: 7-DOF, kinematics, gripper policy and grasp setup.
+    pub grasp: bool,
+    /// Gravity-compensation mode; same value as `observation.gravity_comp.supported`.
+    pub gravity_comp: bool,
+    /// The profile sets per-joint Damiao mapping ranges (`damiao_ranges`); the startup
+    /// range check result is `observation.driver_range_check`.
+    pub damiao_ranges: bool,
+    pub vision: VisionCapabilities,
+}
+
+impl Capabilities {
+    /// Capabilities that follow from the profile alone. `gravity_comp` also depends on
+    /// the driver and the URDF check; this sets it from the profile only.
+    pub fn from_config(config: &ArmConfig) -> Self {
+        let seven = config.dof == 7;
+        let kin = config.kinematics.is_some();
+        let gripper = config.dof >= 7 && config.gripper_policy.is_some();
+        Self {
+            version: CAPABILITIES_VERSION,
+            profile_version: config.profile_version,
+            cartesian: seven && kin,
+            workspace_check: kin && config.workspace.is_some(),
+            gripper,
+            grasp: seven && kin && config.gripper_policy.is_some() && config.grasp.is_some(),
+            gravity_comp: seven && config.gravity_model.is_some() && config.gravity_comp.is_some(),
+            damiao_ranges: config.damiao_ranges.is_some(),
+            vision: VisionCapabilities { detection_proxy: true },
+        }
+    }
+}
+
 /// Observation schema for clients
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservationSchema {
@@ -690,6 +748,8 @@ pub struct ObservationSchema {
     pub camera_mount: CameraMount,
     #[serde(default)]
     pub kinematics: Option<KinematicsModel>,
+    #[serde(default)]
+    pub capabilities: Capabilities,
 }
 
 impl ObservationSchema {
@@ -763,6 +823,7 @@ impl ObservationSchema {
             workspace: config.workspace.clone(),
             camera_mount: config.camera_mount.clone(),
             kinematics: config.kinematics,
+            capabilities: Capabilities::from_config(config),
         }
     }
 }
