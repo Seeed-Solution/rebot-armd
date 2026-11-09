@@ -197,8 +197,15 @@ The init script starts `armd --follower rebot-dm --follower-port can0 --port 876
 default password `12345678`, address `192.168.16.1`). It can also join an existing Wi-Fi
 network. These values are read from `/userdata/local/apps/rebot-teleop.config.json`
 (`arm.follower_model`, `arm.serial_port`, `port`, `network.ap_ssid`, `network.ap_password`,
-`network.ap_ip`, `network.sta_ssid`, `network.sta_password`). **Change the default access
-point password** before using the arm outside a lab. Logs go to `/var/log/rebot-teleop.log`.
+`network.ap_ip`, `network.ap_band`, `network.ap_channel`, `network.sta_ssid`,
+`network.sta_password`). **Change the default access point password** before using the arm
+outside a lab. Logs go to `/var/log/rebot-teleop.log`.
+
+The access point uses 5 GHz by default (`network.ap_band: "5g"`, channel 44, 802.11n/ac,
+20 MHz). Set `network.ap_band` to `"2g4"` for 2.4 GHz (channel 6). `network.ap_channel`
+overrides the channel; `0` or unset keeps the default. If hostapd is not running on the 5 GHz
+channel after start (checked with `iw dev wlan1 info`), the init script restarts it on
+2.4 GHz channel 6 and writes the fallback to syslog.
 
 Open the cockpit at `http://<camera-address>:8765/`.
 

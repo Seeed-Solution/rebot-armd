@@ -20,6 +20,8 @@ PORT="8765"
 AP_SSID="reCamera-Arm-Teleop"
 AP_PASS="12345678"
 AP_IP="192.168.16.1"
+AP_BAND="5g"     # 5g | 2g4
+AP_CHANNEL=""    # empty: 44 on 5g, 6 on 2g4
 STA_SSID=""
 STA_PASS=""
 
@@ -39,12 +41,57 @@ try:
     if 'ap_ssid' in net and net['ap_ssid']: print(f\"AP_SSID='{net['ap_ssid']}'\")
     if 'ap_password' in net and net['ap_password']: print(f\"AP_PASS='{net['ap_password']}'\")
     if 'ap_ip' in net and net['ap_ip']: print(f\"AP_IP='{net['ap_ip']}'\")
+    if net.get('ap_band') in ('5g', '2g4'): print(f\"AP_BAND='{net['ap_band']}'\")
+    if str(net.get('ap_channel', '')).isdigit() and int(net['ap_channel']) > 0: print(f\"AP_CHANNEL='{int(net['ap_channel'])}'\")
     if 'sta_ssid' in net: print(f\"STA_SSID='{net['sta_ssid']}'\")
     if 'sta_password' in net: print(f\"STA_PASS='{net['sta_password']}'\")
 except Exception:
     pass
 " 2>/dev/null)
 fi
+
+# Write the hostapd config for band $1 (5g | 2g4) on channel $2 and start hostapd.
+# Succeeds when hostapd is running and `iw dev wlan1 info` reports that channel.
+start_ap() {
+    if [ "$1" = "5g" ]; then
+        AP_HW="hw_mode=a
+channel=$2
+ieee80211n=1
+ieee80211ac=1"
+        AP_BAND_LABEL="5 GHz"
+    else
+        AP_HW="hw_mode=g
+channel=$2
+ieee80211n=1"
+        AP_BAND_LABEL="2.4 GHz"
+    fi
+    echo "[rebot-teleop] Starting Wi-Fi AP Hotspot (SSID: $AP_SSID on wlan1, $AP_BAND_LABEL channel $2)..."
+    cat <<EOF > "$AP_CONF"
+interface=wlan1
+driver=nl80211
+ssid=$AP_SSID
+$AP_HW
+wmm_enabled=1
+macaddr_acl=0
+auth_algs=1
+wpa=2
+wpa_passphrase=$AP_PASS
+wpa_key_mgmt=WPA-PSK
+wpa_pairwise=CCMP
+rsn_pairwise=CCMP
+EOF
+
+    # hostapd 参数 -B 必须置于配置文件路径之前
+    hostapd -B -P "$AP_PIDFILE" "$AP_CONF" >/dev/null 2>&1 || true
+    w=0
+    while [ $w -lt 6 ]; do
+        sleep 0.5
+        pidof hostapd >/dev/null 2>&1 || return 1
+        iw dev wlan1 info 2>/dev/null | grep -q "channel $2 " && return 0
+        w=$((w + 1))
+    done
+    return 1
+}
 
 start_wifi() {
     # 1. 启动 STA 外部 WiFi（如果配置了 sta_ssid）
@@ -72,30 +119,21 @@ start_wifi() {
         iw dev wlan0 interface add wlan1 type __ap 2>/dev/null || true
     fi
 
-    # 3. 启动 AP 热点（绑定在 wlan1 上）
+    # 3. 启动 AP 热点（绑定在 wlan1 上）；5 GHz 起不来时回退到 2.4 GHz 信道 6
     if ! pidof hostapd >/dev/null 2>&1; then
-        echo "[rebot-teleop] Starting Wi-Fi AP Hotspot (SSID: $AP_SSID on wlan1)..."
         AP_CONF="/var/run/hostapd_arm.conf"
-        cat <<EOF > "$AP_CONF"
-interface=wlan1
-driver=nl80211
-ssid=$AP_SSID
-hw_mode=g
-channel=6
-ieee80211n=1
-wmm_enabled=1
-macaddr_acl=0
-auth_algs=1
-wpa=2
-wpa_passphrase=$AP_PASS
-wpa_key_mgmt=WPA-PSK
-wpa_pairwise=CCMP
-rsn_pairwise=CCMP
-EOF
-
-        # hostapd 参数 -B 必须置于配置文件路径之前
-        hostapd -B "$AP_CONF" >/dev/null 2>&1 || true
-        sleep 1
+        AP_PIDFILE="/var/run/hostapd_arm.pid"
+        if [ "$AP_BAND" = "2g4" ]; then
+            start_ap 2g4 "${AP_CHANNEL:-6}" || true
+        elif ! start_ap 5g "${AP_CHANNEL:-44}"; then
+            echo "[rebot-teleop] 5 GHz AP did not come up on channel ${AP_CHANNEL:-44}; falling back to 2.4 GHz channel 6"
+            logger -t "$NAME" "5 GHz AP failed on channel ${AP_CHANNEL:-44}; fell back to 2.4 GHz channel 6" 2>/dev/null || true
+            # Stop only the hostapd started above (its pidfile), then retry on 2.4 GHz.
+            AP_PID=$(cat "$AP_PIDFILE" 2>/dev/null)
+            case "$AP_PID" in ''|*[!0-9]*) ;; *) kill -TERM "$AP_PID" 2>/dev/null || true; sleep 1 ;; esac
+            rm -f "$AP_PIDFILE"
+            start_ap 2g4 6 || true
+        fi
         ifconfig wlan1 "$AP_IP" netmask 255.255.255.0 up 2>/dev/null || true
 
         # 重启 dnsmasq 以使 wlan1 的 DHCP 分配生效（优雅停机并重试，防止 cold-boot 竞争）

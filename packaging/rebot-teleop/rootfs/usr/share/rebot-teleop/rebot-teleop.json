@@ -69,6 +69,21 @@
             "default": "192.168.16.1"
           },
           {
+            "key": "ap_band",
+            "type": "select",
+            "title": "AP Band (5g = 5 GHz, 2g4 = 2.4 GHz; 5 GHz falls back to 2.4 GHz channel 6 if it fails to start)",
+            "title_zh": "热点频段（5g = 5 GHz，2g4 = 2.4 GHz；5 GHz 启动失败时自动改用 2.4 GHz 信道 6）",
+            "options": ["5g", "2g4"],
+            "default": "5g"
+          },
+          {
+            "key": "ap_channel",
+            "type": "number",
+            "title": "AP Channel (0 = default: 44 on 5 GHz, 6 on 2.4 GHz)",
+            "title_zh": "热点信道（0 = 默认：5 GHz 用 44，2.4 GHz 用 6）",
+            "default": 0
+          },
+          {
             "key": "sta_ssid",
             "type": "text",
             "title": "External Wi-Fi SSID",
