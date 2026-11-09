@@ -158,7 +158,7 @@ export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 
 `build_deb.sh` 需要 `cargo` 和 `dpkg-deb`。它根据 `RECAMERA_TOOLCHAIN` 生成 `RUSTFLAGS`（旧变量名 `REC_TOOLCHAIN` / `RISCV_SYSROOT` 仍可用）；如果自行设置了 `RUSTFLAGS`，则按原样使用。`.cargo/config.toml` 只保存目标级的链接器设置。
 
-编写本文档时实测的构建大小（release profile：`opt-level = "z"`、fat LTO、strip）：`armd` 4,327,440 字节（4.1 MiB），`.deb` 2,090,578 字节（2.0 MiB，gzip）。设备上的内存占用未测。
+编写本文档时实测的构建大小（release profile：`opt-level = "z"`、fat LTO、strip）：`armd` 4,327,440 字节（4.1 MiB），`.deb` 2,090,568 字节（2.0 MiB，gzip）。设备上的内存占用未测。
 
 ---
 

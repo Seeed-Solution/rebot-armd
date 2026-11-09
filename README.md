@@ -205,7 +205,7 @@ export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 yourself it is used as is. `.cargo/config.toml` only holds the target-wide linker settings.
 
 Sizes measured on the build for this README (release profile: `opt-level = "z"`, fat LTO,
-stripped): `armd` 4,327,440 bytes (4.1 MiB), `.deb` 2,090,578 bytes (2.0 MiB, gzip). Memory
+stripped): `armd` 4,327,440 bytes (4.1 MiB), `.deb` 2,090,568 bytes (2.0 MiB, gzip). Memory
 use on the device has not been measured for this README.
 
 ---
