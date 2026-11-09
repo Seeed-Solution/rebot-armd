@@ -109,6 +109,8 @@ Result envelope of `latest` and `trigger` (versions 1 and 2; `requested` on a tr
    "pose":{"t":[-0.0921,0.0213,0.4502],"r_deg":[178.20,1.50,3.00],"error":0.0004}}]}
 ```
 
+From `rebot-teleop` 1.3.1, `pipelines.aruco` also has `"stages"`: ms per ArUco stage on that frame (`gray`, `decimate`, `threshold`, `unionfind`, `clusters`, `quad_fit`, `refine`, `decode`, `detect_other`, `filter`, `pose`), the candidate quad count `quads`, the `quad_decimate` used and the scanned region `roi` `[w,h]`. 自 `rebot-teleop` 1.3.1 起 `pipelines.aruco` 另含 `"stages"`：该帧 ArUco 各阶段耗时（ms）、候选四边形数 `quads`、所用 `quad_decimate` 与检测区域 `roi` `[w,h]`。
+
 `latest` has `"enabled"` in place of `"success"`, and `"timeout":true` when no newer frame arrived within `wait_ms`. The trigger timeout body is `{"api_version":2,"success":false,"timeout":true,"count":0,"detections":[],"markers":[]}`.
 
 Coordinate change against yolo-detector: the inference frame is 640x640 with the 16:9 camera image letterboxed into the band y = 140..500. yolo-detector normalised boxes to the whole 640x640 frame; `rebot-vision` normalises them to the visible 640x360 band, the image size the grasp and the cockpit assume. Markers are detected on that band (same pixels and intrinsics as aruco-detector's 640x360 channel). The debug stream `/results` (video overlay) is unchanged for boxes (display pixels) and adds `"mode"` and `"markers"` in display pixels.
