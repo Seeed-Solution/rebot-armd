@@ -275,6 +275,36 @@ body.ui-expert .main {
   .calib-drawer { width: 100%; height: auto; max-height: 92dvh; border-left: 0; border-top: 1px solid var(--sc-color-border); border-radius: 16px 16px 0 0; animation-name: cup; }
   @keyframes cup { from { transform: translateY(32px); opacity: 0; } }
 }
+/* ---------- tap-to-grasp: confirm / progress bar on the video, setup drawer ---------- */
+.grasp-bar { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 5; display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px 10px;
+  width: max-content; max-width: calc(100% - 24px); padding: 8px 10px; border-radius: 16px; background: rgba(255,255,255,0.9); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255,255,255,0.6); box-shadow: 0 6px 20px rgba(0,0,0,0.16); }
+@media (orientation: landscape) and (max-height: 1200px) { body.ui-simple .grasp-bar { bottom: 60px; } }
+@media (max-width: 480px) {
+  .grasp-bar { bottom: 8px; padding: 6px 8px; gap: 6px 8px; max-width: calc(100% - 16px); }
+  .grasp-acts .btn { min-height: 36px; padding: 0 12px; }
+  .grasp-prog { min-width: 120px; }
+}
+.grasp-bar[hidden], .grasp-pick[hidden], .grasp-prog[hidden], .grasp-info[hidden], .grasp-acts .btn[hidden], .det-btn[hidden] { display: none; }
+.grasp-info { display: flex; align-items: baseline; gap: 6px; min-width: 0; font-size: 14px; }
+.grasp-info b { font-weight: 600; color: var(--sc-color-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px; }
+.grasp-info span { font-size: 12px; color: var(--sc-color-text-secondary); }
+.grasp-prog { display: grid; gap: 5px; min-width: 160px; font-size: 13px; font-weight: 500; color: var(--sc-color-text); }
+.grasp-prog .calib-bar { height: 6px; }
+.grasp-acts { display: flex; gap: 8px; }
+.grasp-acts .btn { min-height: 40px; padding: 0 16px; touch-action: manipulation; }
+.grasp-acts .grasp-stop { color: #fff; background: var(--sc-estop); border-color: var(--sc-estop); }
+.grasp-pick { position: absolute; left: 50%; top: 52px; transform: translateX(-50%); z-index: 5; display: flex; align-items: center; gap: 10px; width: max-content; max-width: calc(100% - 24px);
+  padding: 6px 6px 6px 12px; border-radius: 16px; font-size: 13px; font-weight: 500; color: var(--sc-status-warning-fg); background: rgba(255,247,230,0.95); border: 1px solid #ffd591; box-shadow: 0 4px 14px rgba(0,0,0,0.12); }
+.grasp-pick .btn { min-height: 34px; padding: 0 12px; flex-shrink: 0; }
+.det-btn.det-gset::before { background: var(--sc-color-primary); border-radius: 2px; transform: rotate(45deg); }
+.gset-row { display: grid; gap: 8px; padding: 12px; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border); }
+.gset-k { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 14px; color: var(--sc-color-text); }
+.gset-k b { font-size: 15px; font-weight: 600; }
+.gset-row small { font-size: 12px; line-height: 1.5; color: var(--sc-color-text-secondary); }
+.gset-row .btn { min-height: 44px; touch-action: manipulation; }
+.gset-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.gset-grid .field input { width: 100%; min-width: 0; }
 body.recording #rec-chip { display: inline-flex; }
 .banner {
   position: absolute; left: 12px; right: 12px; bottom: 12px; display: none; text-align: center;
@@ -1101,7 +1131,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           </div>
         </div>
         <div class="hud">
-          <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button><button class="btn det-btn det-trig" id="btn-trigger" type="button" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span></span>
+          <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button><button class="btn det-btn det-trig" id="btn-trigger" type="button" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span><button class="btn det-btn det-gset" id="btn-gset" type="button" data-i18n="gset.open" hidden>抓取设置</button></span>
           <span class="sc-status-badge" id="cam-chip" data-i18n="v.chip.connecting">连接中</span>
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
           <span class="sc-status-badge plain" id="det-chip" data-i18n="det.none" hidden>检测 --</span>
@@ -1112,6 +1142,16 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           <span class="tag" data-i18n="armview.tag">姿态示意 · 侧视</span>
           <canvas id="arm-canvas"></canvas>
         </div>
+        <div class="grasp-bar" id="grasp-bar" role="group" data-i18n-aria="grasp.aria" aria-label="点框抓取" hidden>
+          <div class="grasp-info" id="grasp-info"><b id="grasp-label">--</b><span class="mono" id="grasp-score">--</span></div>
+          <div class="grasp-prog" id="grasp-prog" hidden><span id="grasp-phase">--</span><div class="calib-bar"><i id="grasp-fill"></i></div></div>
+          <div class="grasp-acts">
+            <button class="btn btn-primary" id="grasp-go" type="button" data-i18n="grasp.go">抓取</button>
+            <button class="btn" id="grasp-cancel" type="button" data-i18n="grasp.cancel">取消</button>
+            <button class="btn grasp-stop" id="grasp-stop" type="button" data-i18n="grasp.stop" hidden>停止</button>
+          </div>
+        </div>
+        <div class="grasp-pick" id="grasp-pick" role="status" hidden><span data-i18n="gset.grip.tap">点击画面中夹爪之间物体的中心</span><button class="btn" id="grasp-pick-x" type="button" data-i18n="grasp.cancel">取消</button></div>
         <div class="banner" data-i18n="banner.lock">遥测断开 · 控制已锁定</div>
       </div>
     </section>
@@ -1462,6 +1502,35 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     </div>
   </aside>
 </div>
+<div class="calib-mask" id="gset" hidden>
+  <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="gset-title">
+    <div class="calib-head">
+      <h3 id="gset-title" data-i18n="gset.title">抓取设置</h3>
+      <button class="btn calib-x" id="gset-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+    </div>
+    <p class="calib-hint" data-i18n="gset.hint">开启「识别」后点画面里的框即可抓取。下面三项每次换桌面或相机支架后设置一次，保存在机械臂上。</p>
+    <div class="gset-row">
+      <div class="gset-k"><span data-i18n="gset.table">桌面高度</span><b class="mono" id="gset-table">--</b></div>
+      <button class="btn" id="gset-table-tcp" type="button" data-i18n="gset.table.tcp">用当前夹爪尖高度</button>
+      <small data-i18n="gset.table.hint">先把夹爪尖慢慢点动到刚好碰到桌面，再点上面的按钮。</small>
+    </div>
+    <div class="gset-row">
+      <div class="gset-k"><span data-i18n="gset.grip">夹爪位置（画面）</span><b class="mono" id="gset-grip">--</b></div>
+      <button class="btn" id="gset-grip-pick" type="button" data-i18n="gset.grip.pick">在画面上点选</button>
+      <small data-i18n="gset.grip.hint">夹爪朝下停在接近高度，张开，把物体放在桌面上两指正中间，然后点画面上物体的中心。</small>
+    </div>
+    <div class="gset-grid">
+      <label class="field"><span data-i18n="gset.approach">接近高度 mm</span><input type="number" id="gset-approach" inputmode="decimal" step="5" min="30" max="400"></label>
+      <label class="field"><span data-i18n="gset.grasp">抓取高度 mm</span><input type="number" id="gset-grasp" inputmode="decimal" step="1" min="5" max="200"></label>
+      <label class="field"><span data-i18n="gset.tilt">相机俯角 °</span><input type="number" id="gset-tilt" inputmode="decimal" step="1" min="-60" max="60"></label>
+    </div>
+    <div class="calib-live mono" id="gset-status">--</div>
+    <div class="calib-actions">
+      <button class="btn btn-primary" id="gset-save" type="button" data-i18n="gset.save">保存高度</button>
+      <button class="btn" id="gset-reload" type="button" data-i18n="gset.reload">重新读取</button>
+    </div>
+  </aside>
+</div>
 <script>
 'use strict';
 /* =================================================================
@@ -1487,6 +1556,19 @@ const I18N = {
     'det.trig': '单次识别', 'det.trig.busy': '识别中…', 'det.trig.tip': '临时开启识别，抓拍一帧结果后恢复原状态',
     'det.trig.none': '单次识别未返回目标', 'det.trig.ok': '单次识别：{n} 个目标', 'det.trig.fail': '单次识别失败', 'det.restore.fail': '识别未能关闭，请手动关闭持续识别',
     'det.fps.idle': '待机 {n} FPS', 'det.fps.work': '工作 {n} FPS', 'det.fps.snap': '抓拍中', 'det.fps.tip': '相机推理帧率：待机 {idle} FPS / 工作 {active} FPS',
+    'grasp.aria': '点框抓取', 'grasp.go': '抓取', 'grasp.cancel': '取消', 'grasp.stop': '停止',
+    'grasp.ph.start': '准备', 'grasp.ph.open': '张开夹爪', 'grasp.ph.approach': '移到目标上方', 'grasp.ph.centring': '对准目标', 'grasp.ph.centring.n': '对准目标 · 第 {n} 次 · {px} px',
+    'grasp.ph.align': '转动夹爪', 'grasp.ph.descend': '下降', 'grasp.ph.close': '夹紧', 'grasp.ph.release': '未夹住，张开', 'grasp.ph.lift': '抬起', 'grasp.ph.done': '完成',
+    'grasp.res.ok': '已抓住，交还手动控制', 'grasp.res.fail': '抓取失败：{why}', 'grasp.res.cancel': '抓取已停止：{why}', 'grasp.stopped': '已停止抓取',
+    'grasp.code.TARGET_LOST': '目标丢失', 'grasp.code.CENTRING_FAILED': '对不准目标', 'grasp.code.NOT_HOLDING': '没有夹住物体，已张开并抬起', 'grasp.code.GRASP_TIMEOUT': '超时',
+    'grasp.code.DETECTION_UNAVAILABLE': '识别服务不可用', 'grasp.code.IK': '目标超出机械臂可达范围', 'grasp.code.WORKSPACE_VIOLATION': '目标超出安全工作空间（地面/边界）',
+    'grasp.code.TRACKING_STALL': '机械臂跟不上轨迹', 'grasp.code.ESTOP_ACTIVE': '急停', 'grasp.code.LEASE_LOST': '控制权已变化', 'grasp.code.STOPPED': '手动停止', 'grasp.code.SUPERSEDED': '被新的操作替代',
+    'grasp.code.WATCHDOG': '控制连接超时', 'grasp.code.FAULT': '故障', 'grasp.code.MOTION_BUSY': '机械臂正在运动', 'grasp.code.UNSUPPORTED': '当前配置不支持抓取', 'grasp.code.INVALID_COMMAND': '参数无效',
+    'gset.open': '抓取设置', 'gset.title': '抓取设置', 'gset.hint': '开启「识别」后点画面里的框即可抓取。下面三项每次换桌面或相机支架后设置一次，保存在机械臂上。',
+    'gset.table': '桌面高度', 'gset.table.tcp': '用当前夹爪尖高度', 'gset.table.hint': '先把夹爪尖慢慢点动到刚好碰到桌面，再点上面的按钮。',
+    'gset.grip': '夹爪位置（画面）', 'gset.grip.pick': '在画面上点选', 'gset.grip.hint': '夹爪朝下停在接近高度，张开，把物体放在桌面上两指正中间，然后点画面上物体的中心。', 'gset.grip.tap': '点击画面中夹爪之间物体的中心',
+    'gset.approach': '接近高度 mm', 'gset.grasp': '抓取高度 mm', 'gset.tilt': '相机俯角 °', 'gset.save': '保存高度', 'gset.reload': '重新读取',
+    'gset.saved': '抓取设置已保存', 'gset.unsaved': '已生效，但未能写入文件：{e}', 'gset.loading': '读取中…', 'gset.na': '当前配置不支持抓取', 'gset.err': '读取失败：{e}', 'gset.path': '保存位置：{p}', 'gset.bad': '请输入有效数字',
     'calib.open': '手眼标定', 'calib.title': '手眼标定', 'calib.close': '关闭',
     'calib.hint': '眼在手外：相机固定，ArUco 标记贴在夹爪末端（标记中心与 TCP 重合）。每次把机械臂移到不同位置并静止后采集一次，点位尽量分散在工作空间。',
     'calib.count': '已采集位姿: {n} / {total}', 'calib.cap': '采集当前点位', 'calib.cap.busy': '采集中…', 'calib.solve': '求解标定', 'calib.export': '导出配置',
@@ -1600,6 +1682,19 @@ const I18N = {
     'det.trig': 'Snapshot', 'det.trig.busy': 'Detecting…', 'det.trig.tip': 'Turn detection on briefly, grab one result, then restore the previous state',
     'det.trig.none': 'Snapshot returned no targets', 'det.trig.ok': 'Snapshot: {n} targets', 'det.trig.fail': 'Snapshot failed', 'det.restore.fail': 'Could not switch detection back off, turn it off manually',
     'det.fps.idle': 'Idle {n} FPS', 'det.fps.work': 'Active {n} FPS', 'det.fps.snap': 'Capturing', 'det.fps.tip': 'Camera inference rate: idle {idle} FPS / active {active} FPS',
+    'grasp.aria': 'Tap to grasp', 'grasp.go': 'Grasp', 'grasp.cancel': 'Cancel', 'grasp.stop': 'Stop',
+    'grasp.ph.start': 'Starting', 'grasp.ph.open': 'Opening gripper', 'grasp.ph.approach': 'Moving above target', 'grasp.ph.centring': 'Centring on target', 'grasp.ph.centring.n': 'Centring · step {n} · {px} px',
+    'grasp.ph.align': 'Turning gripper', 'grasp.ph.descend': 'Descending', 'grasp.ph.close': 'Closing', 'grasp.ph.release': 'Missed, opening', 'grasp.ph.lift': 'Lifting', 'grasp.ph.done': 'Done',
+    'grasp.res.ok': 'Object held, manual control is back', 'grasp.res.fail': 'Grasp failed: {why}', 'grasp.res.cancel': 'Grasp stopped: {why}', 'grasp.stopped': 'Grasp stopped',
+    'grasp.code.TARGET_LOST': 'target lost', 'grasp.code.CENTRING_FAILED': 'could not centre on the target', 'grasp.code.NOT_HOLDING': 'nothing held, jaws reopened and lifted', 'grasp.code.GRASP_TIMEOUT': 'timed out',
+    'grasp.code.DETECTION_UNAVAILABLE': 'detection service unavailable', 'grasp.code.IK': 'target out of reach', 'grasp.code.WORKSPACE_VIOLATION': 'target outside the safe workspace (floor/boundary)',
+    'grasp.code.TRACKING_STALL': 'arm could not follow the path', 'grasp.code.ESTOP_ACTIVE': 'E-Stop', 'grasp.code.LEASE_LOST': 'control lease changed', 'grasp.code.STOPPED': 'stopped by user', 'grasp.code.SUPERSEDED': 'replaced by another command',
+    'grasp.code.WATCHDOG': 'control connection timed out', 'grasp.code.FAULT': 'fault', 'grasp.code.MOTION_BUSY': 'arm is moving', 'grasp.code.UNSUPPORTED': 'this profile cannot grasp', 'grasp.code.INVALID_COMMAND': 'invalid parameters',
+    'gset.open': 'Grasp setup', 'gset.title': 'Grasp setup', 'gset.hint': 'Turn on Detect, then tap a box in the video to grasp it. Set the three items below once per table or camera mount; they are stored on the arm.',
+    'gset.table': 'Table height', 'gset.table.tcp': 'Use current TCP height', 'gset.table.hint': 'First jog the jaw tips down until they just touch the table, then tap the button above.',
+    'gset.grip': 'Grip point (image)', 'gset.grip.pick': 'Tap on the image', 'gset.grip.hint': 'With the gripper pointing down at approach height and open, put an object on the table centred between the jaws, then tap its centre in the video.', 'gset.grip.tap': 'Tap the centre of the object between the jaws',
+    'gset.approach': 'Approach mm', 'gset.grasp': 'Grasp mm', 'gset.tilt': 'Camera tilt °', 'gset.save': 'Save heights', 'gset.reload': 'Reload',
+    'gset.saved': 'Grasp setup saved', 'gset.unsaved': 'Applied but not written to file: {e}', 'gset.loading': 'Loading…', 'gset.na': 'This profile cannot grasp', 'gset.err': 'Read failed: {e}', 'gset.path': 'Stored at: {p}', 'gset.bad': 'Enter valid numbers',
     'calib.open': 'Hand-Eye Cal', 'calib.title': 'Hand-Eye Calibration', 'calib.close': 'Close',
     'calib.hint': 'Eye-to-hand: the camera is fixed and an ArUco marker is mounted on the gripper tip (marker centre at the TCP). Move the arm to a new pose, wait until it stops, then capture. Spread the poses across the workspace.',
     'calib.count': 'Poses captured: {n} / {total}', 'calib.cap': 'Capture pose', 'calib.cap.busy': 'Capturing…', 'calib.solve': 'Solve', 'calib.export': 'Export JSON',
@@ -2155,6 +2250,7 @@ function connectWS() {
     if (!Array.isArray(o.positions)) return;
     S.obs = o; S.obsAt = Date.now(); S.wsCount++;
     renderActionChip(o);
+    graspOnObs(o);
     syncEpoch(o.epoch_id);
     const st = parseState(o.safety_state);
     const wasStopped = isStopped();
@@ -4027,7 +4123,8 @@ function renderActionChip(o) {
   const el = $('act-chip');
   if (!el) return;
   const a = o.action;
-  const external = a && !['joint_move', 'home', 'park'].includes(a.kind);
+  // grasp status has its own bar on the video (#grasp-bar)
+  const external = a && !['joint_move', 'home', 'park', 'grasp'].includes(a.kind);
   const recent = external && (a.state === 'running' || !(o.timestamp - (a.finished_at ?? o.timestamp) > 5));
   el.hidden = !recent;
   if (!recent) return;
@@ -5284,6 +5381,8 @@ function drawOverlay() {
   if (!S.detections || S.detections.length === 0 || age > 400 || !isFinite(age)) {
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.clearRect(0, 0, cssW, cssH);
+    const r = getVideoContentRect(cssW, cssH);
+    if (r) graspDraw(g, r, false);
     return;
   }
 
@@ -5386,6 +5485,7 @@ function drawOverlay() {
 
     g.restore();
   }
+  graspDraw(g, rect, true);
 }
 
 /* ArUco AR overlay: corner polygon with indices 0-3, projected XYZ axes, ID / depth / attitude HUD.
@@ -5593,6 +5693,254 @@ const jtab = CFG.joints.map((jd, i) => {
 const STATE_BADGE = { Armed: 'is-ok', Moving: 'is-ok', Idle: '', Booting: 'is-warn', EStop: 'is-danger', Fault: 'is-danger', Offline: '' };
 const STATE_TEXT = { EStop: 'st.EStop', Offline: 'st.Offline', Armed: 'st.Armed', Moving: 'st.Moving', Idle: 'st.Idle', Booting: 'st.Booting', Fault: 'st.Fault' };
 function fmtTime(ms) { const s = Math.floor(ms / 1000); return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); }
+/* =================================================================
+   Tap-to-grasp (docs/agent_action_api.md, /api/v1/action/grasp): with Detect on, a tapped
+   box is selected and tracked; "Grasp" sends the action; any control input, the stop
+   button or the E-stop stops it. The setup drawer reads / writes the armd grasp setup.
+   ================================================================= */
+const GR = {
+  sel: null,        // {label, score, box:[x0,y0,x1,y1], seenAt}
+  id: null,         // action id of the grasp this page started
+  sending: false,
+  stopAt: 0,        // last stop request (ms)
+  toasted: 0,       // last grasp id whose result was shown
+  pickGrip: false,  // next video tap records the grip pixel
+  setup: null, path: null, supported: null,
+};
+const graspCodeKey = (code) => (/^IK_/.test(code || '') ? 'IK' : code);
+function graspCodeText(code, message) {
+  const k = 'grasp.code.' + graspCodeKey(code);
+  const s = t(k);
+  return s !== k ? s : (message || code || t('err.rejected'));
+}
+function graspRunningAction() {
+  const a = S.obs && S.obs.action;
+  return a && a.kind === 'grasp' && a.state === 'running' ? a : null;
+}
+const graspDetOn = () => S.dof === 7 && DET.avail && DET.enabled;
+function graspRPC(path, body) {
+  return commandRPC(path, body).then((d) => { syncEpoch(d.epoch_id); return d; }, (e) => {
+    toast(e.code && e.code !== 'LEASE_REQUIRED' && e.code !== 'COMMAND_TIMEOUT' ? graspCodeText(e.code, e.message) : e.message, 'err', e.code || '');
+    throw e;
+  });
+}
+function graspOnObs(o) {
+  const a = o.action, p = o.previous_action;
+  for (const r of [a, p]) {
+    if (!r || r.kind !== 'grasp' || r.state === 'running' || r.id === GR.toasted) continue;
+    // results of grasps started here, or finished within the last 3 s (agent-started)
+    if (r.id !== GR.id && !(o.timestamp - (r.finished_at ?? -1e9) < 3)) continue;
+    GR.toasted = r.id;
+    if (r.id === GR.id) { GR.id = null; GR.sel = null; }
+    if (r.state === 'done') toast(t('grasp.res.ok'), 'ok');
+    else toast(t(r.state === 'failed' ? 'grasp.res.fail' : 'grasp.res.cancel', { why: graspCodeText(r.code, r.message) }), r.state === 'failed' ? 'err' : 'warn', r.code || '');
+  }
+}
+function graspStop(reason) {
+  if (!graspRunningAction() && !GR.sending) return;
+  const now = Date.now();
+  if (now - GR.stopAt < 400) return;
+  GR.stopAt = now;
+  api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e));
+  if (reason === 'button') toast(t('grasp.stopped'), 'warn');
+}
+// Stick / key / jog input while a grasp runs stops it (checked every frame).
+function graspCheckInput(v) {
+  if (!graspRunningAction()) return;
+  const cart = S.mode === 'cart' && (Object.values(cartVelocity()).some((x) => x !== 0) || cartGripVel() !== 0);
+  if (v.some((x) => x !== 0) || cart || C.gripJog) graspStop('input');
+}
+window.addEventListener('keydown', (e) => {
+  if (!graspRunningAction() || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (['Shift', 'Control', 'Meta', 'Alt', 'Tab'].includes(e.key)) return;
+  if (e.target && e.target.closest && e.target.closest('input, textarea, #gset')) return;
+  graspStop('input');
+}, true);
+document.addEventListener('pointerdown', (e) => {
+  if (!graspRunningAction()) return;
+  const el = e.target && e.target.closest ? e.target : null;
+  if (el && el.closest('.cockpit, .ops, .safety') && !el.closest('#grasp-bar')) graspStop('input');
+}, true);
+
+function graspVideoPoint(e) {
+  const box = $('video-box'), r = box.getBoundingClientRect();
+  const rect = getVideoContentRect(r.width, r.height);
+  if (!rect) return null;
+  const u = (e.clientX - r.left - rect.x) / rect.w, v = (e.clientY - r.top - rect.y) / rect.h;
+  return u >= 0 && u <= 1 && v >= 0 && v <= 1 ? [u, v] : null;
+}
+$('video-box').addEventListener('click', (e) => {
+  if (e.target.closest && e.target.closest('.hud, .grasp-bar, .grasp-pick, .vhint-btn')) return;
+  const pt = graspVideoPoint(e);
+  if (!pt) return;
+  if (GR.pickGrip) { graspSetGrip(pt); return; }
+  if (!graspDetOn() || graspRunningAction() || GR.sending) return;
+  const [u, v] = pt;
+  const hits = (S.detections || []).filter((d) => !d.aruco && u >= d.x0 && u <= d.x1 && v >= d.y0 && v <= d.y1)
+    .sort((a, b) => a.w * a.h - b.w * b.h);
+  const d = hits[0];
+  GR.sel = d ? { label: d.label, score: d.score, box: [d.x0, d.y0, d.x1, d.y1], seenAt: performance.now() } : null;
+  if (d) buzz(10);
+  renderGrasp();
+});
+function graspIou(a, b) {
+  const w = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0])), h = Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
+  const u = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - w * h;
+  return u > 0 ? (w * h) / u : 0;
+}
+// Follow the selected box across frames: same label, best IoU, or nearest centre within 8 % of the image.
+function graspTrack() {
+  const s = GR.sel;
+  if (!s || !S.detections) return;
+  const c = [(s.box[0] + s.box[2]) / 2, (s.box[1] + s.box[3]) / 2];
+  let best = null, score = 0;
+  for (const d of S.detections) {
+    if (d.aruco || d.label !== s.label) continue;
+    const b = [d.x0, d.y0, d.x1, d.y1];
+    const iou = graspIou(b, s.box), dist = Math.hypot(d.cx - c[0], d.cy - c[1]);
+    const sc = iou > 0.3 ? 1 + iou : dist < 0.08 ? 1 - dist : 0;
+    if (sc > score) { score = sc; best = { b, d }; }
+  }
+  if (best) { s.box = best.b; s.score = best.d.score; s.seenAt = performance.now(); }
+}
+function graspDraw(g, rect, fresh) {
+  if (fresh) graspTrack();
+  const s = GR.sel;
+  if (s) {
+    const stale = performance.now() - s.seenAt > 800;
+    const x = rect.x + s.box[0] * rect.w, y = rect.y + s.box[1] * rect.h, w = (s.box[2] - s.box[0]) * rect.w, h = (s.box[3] - s.box[1]) * rect.h;
+    g.save();
+    g.setLineDash(stale ? [6, 5] : []);
+    g.lineWidth = 5; g.strokeStyle = 'rgba(255,255,255,0.95)'; g.strokeRect(x - 2, y - 2, w + 4, h + 4);
+    g.lineWidth = 3; g.strokeStyle = '#8CC020'; g.strokeRect(x - 2, y - 2, w + 4, h + 4);
+    g.restore();
+  }
+  // grip point marker while selecting, grasping or picking it
+  const gp = GR.setup && GR.setup.grip_pixel_norm;
+  if (gp && (s || GR.pickGrip || graspRunningAction() || !$('gset').hidden)) {
+    const x = rect.x + gp[0] * rect.w, y = rect.y + gp[1] * rect.h;
+    g.save();
+    g.lineWidth = 2; g.strokeStyle = 'rgba(255,255,255,0.9)';
+    g.beginPath(); g.arc(x, y, 9, 0, Math.PI * 2); g.stroke();
+    g.strokeStyle = '#8CC020';
+    g.beginPath(); g.moveTo(x - 14, y); g.lineTo(x - 4, y); g.moveTo(x + 4, y); g.lineTo(x + 14, y);
+    g.moveTo(x, y - 14); g.lineTo(x, y - 4); g.moveTo(x, y + 4); g.lineTo(x, y + 14); g.stroke();
+    g.restore();
+  }
+}
+async function graspGo() {
+  const s = GR.sel;
+  if (!s || GR.sending) return;
+  if (isLocked()) { toast(lockReason(), 'err'); flashLock(); return; }
+  releaseAll();
+  GR.sending = true; renderGrasp();
+  try {
+    const b = s.box.map((v) => Math.round(Math.min(1, Math.max(0, v)) * 10000) / 10000);
+    const ack = await graspRPC('/api/v1/action/grasp', { label: s.label, box_norm: b, ts_ms: Date.now(), tag: 'cockpit' });
+    GR.id = ack.action_id ?? null;
+    if (GR.setup == null) graspLoadSetup(true);
+  } catch (_) {
+    // the selection stays so the user can retry or cancel
+  } finally { GR.sending = false; renderGrasp(); }
+}
+function renderGrasp() {
+  const bar = $('grasp-bar');
+  if (!bar) return;
+  const run = graspRunningAction();
+  if (!run && !graspDetOn() && GR.sel && !GR.sending) GR.sel = null;
+  const show = !!(run || (GR.sel && graspDetOn()) || GR.sending);
+  bar.hidden = !show || GR.pickGrip;
+  $('grasp-pick').hidden = !GR.pickGrip;
+  const gs = $('btn-gset');
+  if (gs) gs.hidden = S.dof !== 7;
+  if (!show) return;
+  $('grasp-info').hidden = !GR.sel;
+  if (GR.sel) {
+    setText($('grasp-label'), GR.sel.label);
+    setText($('grasp-score'), Math.round(GR.sel.score * 100) + '%');
+  }
+  $('grasp-prog').hidden = !run;
+  $('grasp-go').hidden = !!run;
+  $('grasp-cancel').hidden = !!run;
+  $('grasp-stop').hidden = !run;
+  $('grasp-go').disabled = GR.sending || !GR.sel;
+  if (run) {
+    const ph = run.phase || 'start';
+    const txt = ph === 'centring' && run.iteration != null && run.error_px != null
+      ? t('grasp.ph.centring.n', { n: run.iteration, px: Math.round(run.error_px) }) : t('grasp.ph.' + ph);
+    setText($('grasp-phase'), txt);
+    $('grasp-fill').style.width = Math.round(Math.min(1, Math.max(0, run.progress || 0)) * 100) + '%';
+  }
+}
+$('grasp-go').addEventListener('click', graspGo);
+$('grasp-cancel').addEventListener('click', () => { GR.sel = null; renderGrasp(); });
+$('grasp-stop').addEventListener('click', () => graspStop('button'));
+
+// ---- grasp setup drawer ----
+const mm = (m) => (Number.isFinite(m) ? Math.round(m * 1000) : null);
+function gsetRender(status) {
+  const s = GR.setup;
+  setText($('gset-table'), s ? (mm(s.table_z_m) + ' mm') : '--');
+  setText($('gset-grip'), s ? s.grip_pixel_norm.map((v) => Math.round(v * 100) + '%').join(' , ') : '--');
+  for (const [id, v] of [['gset-approach', s && mm(s.approach_height_m)], ['gset-grasp', s && mm(s.grasp_height_m)], ['gset-tilt', s && s.camera_tilt_deg]]) {
+    const el = $(id);
+    if (document.activeElement !== el) el.value = v == null ? '' : String(v);
+    el.disabled = !s;
+  }
+  for (const id of ['gset-table-tcp', 'gset-grip-pick', 'gset-save']) $(id).disabled = !s;
+  if (status !== undefined) {
+    const st = $('gset-status');
+    setText(st, status);
+    st.classList.toggle('ok', !!s && status === t('gset.saved'));
+  }
+}
+async function graspLoadSetup(quiet) {
+  if (!quiet) gsetRender(t('gset.loading'));
+  try {
+    const res = await fetch('/api/v1/grasp/setup', { cache: 'no-store' });
+    const d = await res.json();
+    if (!res.ok) throw new Error(d && (d.message || d.error) || 'HTTP ' + res.status);
+    GR.supported = !!d.supported; GR.setup = d.setup || null; GR.path = d.path || null;
+    if (!quiet) gsetRender(!GR.supported ? t('gset.na') : GR.path ? t('gset.path', { p: GR.path }) : '--');
+  } catch (e) {
+    if (!quiet) gsetRender(t('gset.err', { e: e.message }));
+  }
+}
+async function gsetWrite(patch) {
+  try {
+    const ack = await graspRPC('/api/v1/grasp/setup', patch);
+    if (ack.setup) GR.setup = ack.setup;
+    const msg = ack.persisted === false ? t('gset.unsaved', { e: ack.persist_error || '' }) : t('gset.saved');
+    gsetRender(msg);
+    toast(msg, ack.persisted === false ? 'warn' : 'ok');
+    return true;
+  } catch (e) { gsetRender(e.message); return false; }
+}
+function gsetOpen(open) {
+  $('gset').hidden = !open;
+  if (open) { gsetRender(); graspLoadSetup(false); $('gset-close').focus({ preventScroll: true }); }
+}
+function graspSetGrip(pt) {
+  GR.pickGrip = false;
+  renderGrasp();
+  gsetWrite({ grip_pixel_norm: pt.map((v) => Math.round(v * 10000) / 10000) }).finally(() => gsetOpen(true));
+}
+$('btn-gset').addEventListener('click', () => gsetOpen(true));
+$('gset-close').addEventListener('click', () => gsetOpen(false));
+$('gset').addEventListener('click', (e) => { if (e.target === e.currentTarget) gsetOpen(false); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('gset').hidden) gsetOpen(false); });
+$('gset-reload').addEventListener('click', () => graspLoadSetup(false));
+$('gset-table-tcp').addEventListener('click', () => gsetWrite({ table_z_from_tcp: true }));
+$('gset-grip-pick').addEventListener('click', () => { gsetOpen(false); GR.pickGrip = true; renderGrasp(); });
+$('grasp-pick-x').addEventListener('click', () => { GR.pickGrip = false; renderGrasp(); gsetOpen(true); });
+$('gset-save').addEventListener('click', () => {
+  const a = Number($('gset-approach').value), g = Number($('gset-grasp').value), tl = Number($('gset-tilt').value);
+  if (![a, g, tl].every(Number.isFinite) || $('gset-approach').value === '' || $('gset-grasp').value === '' || $('gset-tilt').value === '') { gsetRender(t('gset.bad')); return; }
+  gsetWrite({ approach_height_m: a / 1000, grasp_height_m: g / 1000, camera_tilt_deg: tl });
+});
+i18nHooks.push(() => { renderGrasp(); if (!$('gset').hidden) gsetRender(); });
+graspLoadSetup(true);
+
 function setText(el, txt) { if (el.textContent !== txt) el.textContent = txt; }
 function setCls(el, cls) { if (el.className !== cls) el.className = cls; }
 const fmtDeg = (rad) => { const d = rad * DEG; return (d >= 0 ? '+' : '−') + Math.abs(d).toFixed(1); };
@@ -5608,8 +5956,10 @@ function frame(ts) {
   if (S.mode === 'cart' && op && C.sending) { for (let i = 0; i < 4; i++) act[i] = true; act[GRIP] = Date.now() - S.gripCmdAt < 400; }
   drawArm(q, act);
   drawOverlay();
+  graspCheckInput(v);
   if (ts - lastUi < 60) return; // DOM updates at ~16 Hz
   lastUi = ts;
+  renderGrasp();
 
   const body = document.body;
   body.classList.toggle('offline', !live);
