@@ -24,7 +24,7 @@ fn rebot_dm_inspect_jog_is_capped_at_planned_speed() {
         supervisor.set_torque(true).await.unwrap();
         supervisor.jog(INSPECT.to_vec(), None, None).await.unwrap();
         let duration = supervisor.inner().read().await.active_trajectory.as_ref().unwrap().duration();
-        assert!((duration - 1.875 * 1.565 / 0.7).abs() < 0.01, "duration {duration}");
+        assert!((duration - 1.875 * 1.565 / 0.45).abs() < 0.01, "duration {duration}");
         let mut peak = [0.0f32; 7];
         for _ in 0..400 {
             let obs = supervisor.tick(DT).await;
@@ -33,9 +33,9 @@ fn rebot_dm_inspect_jog_is_capped_at_planned_speed() {
             assert_eq!(obs.commanded_positions, inner.commanded_positions);
         }
         for (i, p) in peak.iter().take(6).enumerate() {
-            assert!(*p <= 0.7 + 1e-3, "joint {} commanded peak {p}", i + 1);
+            assert!(*p <= 0.45 + 1e-3, "joint {} commanded peak {p}", i + 1);
         }
-        assert!(peak[2] > 0.69, "J3 sets the duration: {}", peak[2]);
+        assert!(peak[2] > 0.44, "J3 sets the duration: {}", peak[2]);
         let obs = supervisor.get_observation().await;
         assert!(obs.positions.iter().zip(INSPECT).all(|(a, b)| (a - b).abs() < 1e-3));
     });
@@ -45,14 +45,14 @@ fn rebot_dm_inspect_jog_is_capped_at_planned_speed() {
 fn planning_limits_skip_the_gripper_and_keep_lower_limits() {
     let inner = armd::SupervisorInner::new(ArmConfig::rebot_dm());
     let limits = inner.planning_limits();
-    for l in &limits[..6] { assert_eq!(l.max_velocity, 0.7); }
+    for l in &limits[..6] { assert_eq!(l.max_velocity, 0.45); }
     assert_eq!(limits[6].max_velocity, 2.0);
     let mut config = ArmConfig::default();
-    config.planned_max_velocity = Some(1.0);
+    config.planned_max_velocity = Some(0.6);
     config.limits[0].max_velocity = 0.5;
     let inner = armd::SupervisorInner::new(config);
     assert_eq!(inner.planning_limits()[0].max_velocity, 0.5, "cap never raises a limit");
-    assert_eq!(inner.planning_limits()[5].max_velocity, 1.0, "6-DOF arm has no gripper exemption");
+    assert_eq!(inner.planning_limits()[5].max_velocity, 0.6, "6-DOF arm has no gripper exemption");
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn validate_rejects_bad_speed_caps() {
     }
     let mut config = ArmConfig::rebot_dm();
     assert!(config.validate().is_ok());
-    assert_eq!(config.planned_max_velocity, Some(0.7));
+    assert_eq!(config.planned_max_velocity, Some(0.45));
     assert_eq!(ArmConfig::default().planned_max_velocity, None);
 }
 
@@ -82,7 +82,7 @@ fn schema_and_observation_carry_commanded_positions() {
     assert!(parsed.commanded_positions.is_empty());
 }
 
-// ---- first-order POS_VEL lag model: v = clamp((cmd - meas) * 2.2, +-2), meas += v * dt ----
+// ---- first-order POS_VEL lag model: v = clamp((cmd - meas) * 1.5, +-2), gain measured on the real arm, meas += v * dt ----
 
 struct LagArm { q: [f32; 7], v: [f32; 7], enabled: EnableState }
 struct LagDriver(Arc<Mutex<LagArm>>);
@@ -102,7 +102,7 @@ impl ArmDriver for LagDriver {
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         let mut arm = self.0.lock().unwrap();
         for (i, t) in targets.iter().enumerate().take(7) {
-            let v = ((t.position - arm.q[i]) * 2.2).clamp(-2.0, 2.0);
+            let v = ((t.position - arm.q[i]) * 1.5).clamp(-2.0, 2.0);
             arm.v[i] = v;
             arm.q[i] += v * DT as f32;
         }
@@ -144,14 +144,14 @@ async fn run(supervisor: &ArmSupervisor, sim_seconds: f64) -> (armd::ArmObservat
 
 #[tokio::test]
 async fn lag_model_inspect_then_park_has_no_tracking_fault_with_cap() {
-    let (supervisor, arm) = lag_arm(Some(0.7)).await;
+    let (supervisor, arm) = lag_arm(Some(0.45)).await;
     supervisor.jog(INSPECT.to_vec(), None, None).await.unwrap();
-    let (obs, err_inspect) = run(&supervisor, 6.0).await;
+    let (obs, err_inspect) = run(&supervisor, 9.0).await;
     assert!(!obs.safety_state.is_stopped(), "inspect faulted: {:?}", obs.safety_state);
     assert!(err_inspect.iter().all(|e| *e < 0.4), "lag {err_inspect:?}");
     supervisor.apply_stop_policy(armd::StopPolicy::NormalUnload).await;
     assert!(supervisor.inner().read().await.pending_normal_unload);
-    let (obs, err_park) = run(&supervisor, 9.0).await;
+    let (obs, err_park) = run(&supervisor, 14.0).await;
     assert!(!obs.safety_state.is_stopped(), "park faulted: {:?}", obs.safety_state);
     assert!(err_park.iter().all(|e| *e < 0.4), "lag {err_park:?}");
     assert_eq!(obs.safety_state, SafetyState::Idle, "park ends torque-off");
@@ -195,14 +195,14 @@ async fn watchdog_park_from_far_j6_gets_an_extended_deadline_and_completes() {
         let inner = supervisor.inner().read().await;
         assert!(inner.pending_normal_unload);
         let planned = inner.unload_planned_duration.unwrap();
-        assert!((planned - 1.875 * 4.7 / 0.7).abs() < 0.05, "planned {planned}");
+        assert!((planned - 1.875 * 4.7 / 0.45).abs() < 0.05, "planned {planned}");
         let timeout = inner.watchdog_park_timeout();
         assert_eq!(timeout, (Duration::from_secs_f64(planned) + WATCHDOG_PARK_MARGIN).max(WATCHDOG_PARK_TIMEOUT));
         assert!(timeout > Duration::from_secs(15));
         let remaining = inner.watchdog_park_deadline.unwrap() - Instant::now();
         assert!(remaining > Duration::from_secs(15), "deadline extended: {remaining:?}");
     }
-    for _ in 0..400 { supervisor.tick(0.05).await; }
+    for _ in 0..600 { supervisor.tick(0.05).await; }
     let obs = supervisor.get_observation().await;
     assert_eq!(obs.safety_state, SafetyState::Idle, "watchdog park completes");
     assert!(!obs.is_torqued);

@@ -174,7 +174,7 @@ impl GripperPolicy {
 /// Estimated Damiao POS_VEL lag gain: tracking error ~= v / POSVEL_LAG_GAIN rad at
 /// v rad/s. Estimate from the 2026-11 tracking-fault analysis; needs verification
 /// on hardware (record |commanded - measured| during presets to fit it).
-pub const POSVEL_LAG_GAIN: f32 = 2.2;
+pub const POSVEL_LAG_GAIN: f32 = 1.5; // measured 2026-11-09: J3 trailed 0.458 rad at a 0.7 rad/s jog
 
 /// Robotic arm hardware/control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,7 +371,7 @@ impl ArmConfig {
             following_error: FollowingErrorPolicy::default(),
             max_jerk: Some(50.0),
             gravity_model: Some(GravityModel::RebotDevArm),
-            planned_max_velocity: Some(0.7),
+            planned_max_velocity: Some(0.45),
             kinematics: Some(KinematicsModel::RebotDevArm),
             workspace: Some(WorkspacePolicy::rebot_dm()),
             camera_mount: CameraMount::default(),

@@ -1953,7 +1953,9 @@ impl SupervisorInner {
                     let mut next_positions = self.commanded_positions.clone();
                     let mut next_velocities = self.commanded_velocities.clone();
                     let mut infeasible = None;
-                    let step_limits = self.planning_limits();
+                    // teleop streaming keeps the raw joint limits: clients bound their own lead (the cockpit keeps
+                    // it under 0.2 rad), so the tracking error cannot approach the fault threshold here
+                    let step_limits = self.config.limits.clone();
                     for (i, &tgt) in target.iter().enumerate() {
                         if i < self.config.dof {
                             let limit = &step_limits[i];
@@ -2018,7 +2020,7 @@ impl SupervisorInner {
             let mut next_positions = self.commanded_positions.clone();
             let mut next_velocities = self.commanded_velocities.clone();
             let mut infeasible = None;
-            let step_limits = self.planning_limits();
+            let step_limits = self.config.limits.clone(); // braking a stream: same limits as streaming
             for i in 0..self.config.dof {
                 let step = Self::bounded_servo_step_with_jerk(
                     self.commanded_positions[i],

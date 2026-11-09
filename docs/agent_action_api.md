@@ -48,9 +48,9 @@ The camera rotation is R_base_cam = R_base_end · R_end_cam, R_end_cam from `con
 
 ### Speed / 速度
 
-Defaults linear 0.05 m/s (max 0.15), angular 0.5 rad/s (max 1.0). Joint speed is capped by `planned_max_velocity` (0.7 rad/s on rebot-dm), joint acceleration by min(limit, 3.0 rad/s²).
+Defaults linear 0.05 m/s (max 0.15), angular 0.5 rad/s (max 1.0). Joint speed is capped by `planned_max_velocity` (0.45 rad/s on rebot-dm), joint acceleration by min(limit, 3.0 rad/s²).
 
-默认线速度 0.05 m/s（上限 0.15），角速度 0.5 rad/s（上限 1.0）。关节速度受 `planned_max_velocity`（rebot-dm 0.7 rad/s）限制，加速度上限 min(限位, 3.0 rad/s²)。
+默认线速度 0.05 m/s（上限 0.15），角速度 0.5 rad/s（上限 1.0）。关节速度受 `planned_max_velocity`（rebot-dm 0.45 rad/s）限制，加速度上限 min(限位, 3.0 rad/s²)。
 
 ## Planning and execution / 规划与执行
 
@@ -103,7 +103,7 @@ Codes that only appear in `action.code`: `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `E
 
 ## Needs verification on the device / 需实机核实
 
-- POS_VEL lag gain K = 2.2 (basis of the 0.7 rad/s cap and the 0.38 / 0.45 rad band).
+- POS_VEL lag gain K = 1.5, measured 2026-11-09 (basis of the 0.45 rad/s cap and the 0.38 / 0.45 rad band).
 - `squeeze_rad` 0.15 and `holding_torque_nm` 0.12 come from the MIT-mode project; grip torque under POS_VEL depends on the motor's internal gains.
 - `camera_mount` (`flip`, `tilt_deg`, `offset_m`) for camera-frame moves.
 - Planning time on the SG2002: `cargo test --release --test test_actions bench_plan -- --ignored --nocapture`.
