@@ -2,9 +2,9 @@
 
 <div align="center">
 
-### Arm control daemon and web cockpit for the reBot B601-DM arm on a Seeed reCamera
+### A minimal Rust runtime for robot arm control
 
-**A Rust daemon (`armd`) that drives the arm over CAN, enforces a lease-based safety model, serves a browser cockpit and records episodes to Parquet**
+**One static binary (`armd`) that drives the arm's motors, enforces a lease-based safety model, serves a browser cockpit and agent actions, and records episodes to Parquet. Reference platform: a Seeed reCamera driving a reBot B601-DM.**
 
 [![Rust](https://img.shields.io/badge/Rust-2021_Edition-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
@@ -20,9 +20,17 @@ English | [中文](./README.zh-CN.md)
 
 ---
 
-`armd` runs on the reCamera (SG2002, RISC-V) next to the camera's own services. It talks to
-the arm's Damiao motors on the CAN bus of the reCamera B4 board, runs a fixed-rate control
-loop with a safety supervisor, and exposes the arm over HTTP and WebSocket on port 8765:
+`armd` is an arm-control runtime: a fixed-rate control loop with a safety supervisor, motor
+drivers, and an HTTP/WebSocket server on port 8765, built as a single static binary (4.1 MiB
+for RISC-V). It needs no Python, ROS or GPU on the controller.
+
+The reference platform shows how small that controller can be: `armd` runs on a Seeed
+reCamera (SG2002 RISC-V SoC, about 180 MB of RAM available to Linux) next to the camera's own
+video and detection services, and drives the 7 Damiao motors of a reBot B601-DM over the CAN
+bus of the reCamera B4 board. The same code builds and passes its tests on x86_64 Linux (CI);
+other hosts and arms are listed under [Hardware](#hardware) with their verification status.
+
+`armd` provides:
 
 - a single-file web cockpit for phones, tablets and desktops (joysticks, Cartesian control,
   camera video, detection overlay, hand-eye calibration, tap-to-grasp);
@@ -60,6 +68,16 @@ the Debian package that installs it on the reCamera is `rebot-teleop` (init scri
 ---
 
 ## Hardware
+
+### Platforms
+
+| Platform | Status |
+|---|---|
+| Seeed reCamera (SG2002, RISC-V, musl static build) with the B4 CAN board | verified with a reBot B601-DM (reference platform) |
+| x86_64 Linux | builds and passes `cargo test` in CI, with the `mock` follower; not run against a real arm |
+| Other Linux hosts with a SocketCAN interface (for example a USB-CAN adapter that appears as `can0`) or a serial bus | expected to work from the code; not verified |
+
+### Arms
 
 Verified on real hardware:
 

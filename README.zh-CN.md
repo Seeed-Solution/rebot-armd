@@ -2,9 +2,9 @@
 
 <div align="center">
 
-### 运行在 Seeed reCamera 上的 reBot B601-DM 机械臂控制守护进程与网页驾驶舱
+### 极简的机械臂控制运行时（Rust）
 
-**Rust 守护进程 `armd`：经 CAN 驱动机械臂，执行基于租约的安全模型，提供浏览器驾驶舱，并把示教片段录制为 Parquet**
+**单个静态二进制 `armd`：驱动机械臂电机，执行基于租约的安全模型，提供浏览器驾驶舱和面向 agent 的动作，并把示教片段录制为 Parquet。参考平台：用一台 Seeed reCamera 驱动 reBot B601-DM。**
 
 [![Rust](https://img.shields.io/badge/Rust-2021_Edition-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
@@ -20,7 +20,11 @@
 
 ---
 
-`armd` 与摄像头自带的服务一起运行在 reCamera（SG2002，RISC-V）上。它通过 reCamera B4 底板的 CAN 总线与机械臂的达妙电机通信，以固定周期运行控制循环和安全监督器，并在 8765 端口通过 HTTP 与 WebSocket 提供：
+`armd` 是一个机械臂控制运行时：固定周期的控制循环与安全监督器、电机驱动、8765 端口上的 HTTP/WebSocket 服务，打包为单个静态二进制（RISC-V 版 4.1 MiB）。控制器上不需要 Python、ROS 或 GPU。
+
+参考平台展示了控制器可以小到什么程度：`armd` 与摄像头自带的视频和检测服务一起运行在 Seeed reCamera（SG2002 RISC-V SoC，Linux 可用内存约 180 MB）上，通过 reCamera B4 底板的 CAN 总线驱动 reBot B601-DM 的 7 个达妙电机。同一份代码可在 x86_64 Linux 上编译并通过测试（CI）；其他主机与机械臂的验证状态见 [硬件](#硬件)。
+
+`armd` 提供：
 
 - 单文件网页驾驶舱，适用于手机、平板和桌面（摇杆、笛卡尔控制、摄像头视频、识别叠加、手眼标定、点框抓取）；
 - 用于观测的 REST API 和用于控制的 WebSocket API，执行器指令只接受持有控制租约的连接；
@@ -53,6 +57,16 @@
 ---
 
 ## 硬件
+
+### 平台
+
+| 平台 | 状态 |
+|---|---|
+| Seeed reCamera（SG2002，RISC-V，musl 静态编译）+ B4 CAN 底板 | 已用 reBot B601-DM 真机验证（参考平台） |
+| x86_64 Linux | CI 中可编译并通过 `cargo test`（使用 `mock` 从动臂）；未接真机运行 |
+| 其他带 SocketCAN 接口（例如显示为 `can0` 的 USB-CAN 适配器）或串口总线的 Linux 主机 | 按代码应可运行；未验证 |
+
+### 机械臂
 
 已在真机上验证：
 
