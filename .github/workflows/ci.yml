@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # cargo fmt --check is not run: the code base is not rustfmt-formatted yet.
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --locked
+
+  web:
+    # Self-tests of the web cockpit (src/api/index.html), run in Node without a browser.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: View-frame IK self-test
+        run: node scripts/view_ik_selftest.mjs
+      - name: Hand-eye calibration self-test
+        # part c (rebot-companion round-trip) is skipped when ../rebot-companion is absent
+        run: node scripts/calib_selftest.mjs
+      - name: RPC error contract
+        run: node tests/test_rpc_error_contract.js
