@@ -114,7 +114,7 @@ async fn spawn_mock_upstream() -> (SocketAddr, Arc<Mutex<Vec<SeenRequest>>>) {
                             serde_json::json!({"api_version": 2, "success": true, "frame_id": 9, "ts_ms": 1, "age_ms": 3, "inference_time_ms": 12.5,
                                 "width": 640, "height": 360,
                                 "pipelines": {"yolo": {"ran": want("yolo")}, "aruco": {"ran": want("aruco")}},
-                                "detections": if want("yolo") { serde_json::json!([{"class_name": "cup", "confidence": 0.9, "x": 0.5, "y": 0.5, "w": 0.1, "h": 0.2}]) } else { serde_json::json!([]) },
+                                "detections": if want("yolo") { serde_json::json!([{"class_name": "cup", "confidence": 0.9, "format": "xywh_center", "x": 0.5, "y": 0.5, "w": 0.1, "h": 0.2}]) } else { serde_json::json!([]) },
                                 "count": 1, "markers": [{"id": 4, "corners": [[1, 2], [3, 2], [3, 4], [1, 4]]}]})
                         };
                         ("200 OK", body.to_string(), false)
@@ -493,4 +493,23 @@ async fn vision_subscriptions_pass_through() {
     assert_eq!(seen.lock().unwrap().len(), n);
     let down = spawn_armd("http://127.0.0.1:1").await;
     assert_eq!(c.get(format!("http://{down}/api/v1/vision/subscriptions")).send().await.unwrap().status(), 502);
+}
+
+#[tokio::test]
+async fn http_detection_source_triggers_with_pipelines() {
+    use armd::grasp::{DetectionSource, HttpDetectionSource, GRASP_PIPELINES};
+    let (up, seen) = spawn_mock_upstream().await;
+    let src = HttpDetectionSource { upstream: DetectorUpstream::parse(&format!("http://{up}")).unwrap(), image_size_px: [640.0, 360.0] };
+    assert!(src.per_request_pipelines().await.unwrap());
+    let f = src.trigger(GRASP_PIPELINES, 300).await.unwrap().expect("a frame");
+    assert_eq!(f.frame_id, 9);
+    assert_eq!(f.detections.len(), 1);
+    assert_eq!(f.detections[0].label, "cup");
+    let seen = seen.lock().unwrap().clone();
+    let t = seen.iter().find(|s| s.target == "/api/trigger").expect("trigger sent");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&t.body).unwrap(), serde_json::json!({"pipelines": ["yolo"], "wait_ms": 300}));
+    assert!(seen.iter().all(|s| s.target != "/api/mode" || s.method == "GET"), "no mode change");
+    // older provider (no /api/mode): no per-request pipelines
+    let old = HttpDetectionSource { upstream: DetectorUpstream::parse(&format!("http://{up}/old")).unwrap(), image_size_px: [640.0, 360.0] };
+    assert!(!old.per_request_pipelines().await.unwrap());
 }

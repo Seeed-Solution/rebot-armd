@@ -296,8 +296,23 @@ pub fn grasp_mode(current: &str) -> &'static str {
     }
 }
 
+/// Pipelines a grasp triggers per centring step. A marker target would add `"aruco"`.
+pub const GRASP_PIPELINES: &[&str] = &["yolo"];
+/// How long one centring trigger waits for a fresh frame.
+const TRIGGER_WAIT_MS: u64 = 1000;
+
 /// Where the orchestrator gets detections; tests inject a simulated camera.
 pub trait DetectionSource: Send + Sync {
+    /// The provider runs the pipelines a trigger names (perception API 2). The grasp then
+    /// triggers [`GRASP_PIPELINES`] per centring step and leaves the vision mode alone.
+    fn per_request_pipelines(&self) -> BoxFuture<'_, Result<bool, String>> {
+        Box::pin(async { Ok(false) })
+    }
+    /// One inference running exactly `pipelines` on a frame newer than the call, waiting up to
+    /// `wait_ms`. `Ok(None)` = no fresh frame in time.
+    fn trigger(&self, _pipelines: &'static [&'static str], _wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
+        Box::pin(async { Err("per-request pipelines not supported".to_string()) })
+    }
     fn inference_enabled(&self) -> BoxFuture<'_, Result<bool, String>>;
     fn set_inference(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>>;
     /// The provider's vision mode; `Ok(None)` when it has no mode API (older detectors),
@@ -321,7 +336,39 @@ pub struct HttpDetectionSource {
     pub image_size_px: [f64; 2],
 }
 
+impl HttpDetectionSource {
+    /// A result envelope (`latest` or `trigger`) as a frame; `None` when it carries no new frame.
+    fn frame(&self, v: &Value, after: Option<u64>, received: Instant) -> Option<DetectionFrame> {
+        if v.get("timeout").and_then(Value::as_bool) == Some(true) || v.get("success").and_then(Value::as_bool) == Some(false) {
+            return None;
+        }
+        let frame_id = v.get("frame_id").and_then(Value::as_u64)?;
+        if after.is_some_and(|a| frame_id <= a) { return None; }
+        let age = v.get("age_ms").and_then(Value::as_f64).filter(|a| a.is_finite() && *a >= 0.0).unwrap_or(0.0);
+        let captured_at = received.checked_sub(Duration::from_secs_f64(age / 1000.0)).unwrap_or(received);
+        let size = match (v.get("width").and_then(Value::as_f64), v.get("height").and_then(Value::as_f64)) {
+            (Some(w), Some(h)) if w > 0.0 && h > 0.0 => [w, h],
+            _ => self.image_size_px,
+        };
+        Some(DetectionFrame { frame_id, captured_at, detections: parse_detections(v.get("detections").unwrap_or(&Value::Null), size) })
+    }
+}
+
 impl DetectionSource for HttpDetectionSource {
+    fn per_request_pipelines(&self) -> BoxFuture<'_, Result<bool, String>> {
+        Box::pin(async move {
+            let v = crate::api::proxy::request_json_opt(&self.upstream, "GET", "/api/mode", None, Duration::from_secs(2)).await?;
+            Ok(v.and_then(|v| v.get("per_request_pipelines").and_then(Value::as_bool)) == Some(true))
+        })
+    }
+    fn trigger(&self, pipelines: &'static [&'static str], wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
+        Box::pin(async move {
+            let wait_ms = wait_ms.min(5000);
+            let body = serde_json::json!({"pipelines": pipelines, "wait_ms": wait_ms}).to_string();
+            let v = crate::api::proxy::request_json(&self.upstream, "POST", "/api/trigger", Some(body.as_bytes()), Duration::from_millis(wait_ms + 2000)).await?;
+            Ok(self.frame(&v, None, Instant::now()))
+        })
+    }
     fn inference_enabled(&self) -> BoxFuture<'_, Result<bool, String>> {
         Box::pin(async move {
             let v = crate::api::proxy::request_json(&self.upstream, "GET", "/api/inference", None, Duration::from_secs(2)).await?;
@@ -354,17 +401,7 @@ impl DetectionSource for HttpDetectionSource {
             let wait_ms = wait_ms.min(5000);
             let path = format!("/api/results/latest?after={}&wait_ms={wait_ms}", after.unwrap_or(0));
             let v = crate::api::proxy::request_json(&self.upstream, "GET", &path, None, Duration::from_millis(wait_ms + 2000)).await?;
-            let received = Instant::now();
-            if v.get("timeout").and_then(Value::as_bool) == Some(true) { return Ok(None); }
-            let Some(frame_id) = v.get("frame_id").and_then(Value::as_u64) else { return Ok(None); };
-            if after.is_some_and(|a| frame_id <= a) { return Ok(None); }
-            let age = v.get("age_ms").and_then(Value::as_f64).filter(|a| a.is_finite() && *a >= 0.0).unwrap_or(0.0);
-            let captured_at = received.checked_sub(Duration::from_secs_f64(age / 1000.0)).unwrap_or(received);
-            let size = match (v.get("width").and_then(Value::as_f64), v.get("height").and_then(Value::as_f64)) {
-                (Some(w), Some(h)) if w > 0.0 && h > 0.0 => [w, h],
-                _ => self.image_size_px,
-            };
-            Ok(Some(DetectionFrame { frame_id, captured_at, detections: parse_detections(v.get("detections").unwrap_or(&Value::Null), size) }))
+            Ok(self.frame(&v, after, Instant::now()))
         })
     }
 }
@@ -733,6 +770,9 @@ struct Orchestrator {
     setup: GraspSetup,
     cam: CamModel,
     deadline: Instant,
+    /// Each centring step triggers its own frame (perception API 2) instead of reading the
+    /// continuous results.
+    triggered: bool,
 }
 
 impl Orchestrator {
@@ -811,8 +851,18 @@ impl Orchestrator {
             self.check().await?;
             let source = self.source.clone();
             let a = *after;
+            let triggered = self.triggered;
+            let get = async move {
+                if triggered {
+                    // the triggered frame is taken once the arm has settled
+                    tokio::time::sleep(not_before.saturating_duration_since(Instant::now())).await;
+                    source.trigger(GRASP_PIPELINES, TRIGGER_WAIT_MS).await
+                } else {
+                    source.next_frame(a, 200).await
+                }
+            };
             let next = tokio::select! {
-                r = source.next_frame(a, 200) => r,
+                r = get => r,
                 _ = async { loop { tokio::time::sleep(POLL).await; if !self.alive().await { break; } } } => return Err(Stop::Cancelled),
             };
             let frame = match next {
@@ -958,9 +1008,18 @@ impl Orchestrator {
 async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64, planned: PlannedGrasp) {
     let setup = planned.request.setup.clone();
     let cam = CamModel::assumed(&setup, &planned.input.cam);
-    let orch = Orchestrator { sup: sup.clone(), source: source.clone(), id, deadline: Instant::now() + Duration::from_secs_f64(setup.timeout_s), setup, cam };
-    let result = match source.vision_mode().await {
-        // rebot-vision: YOLO (both when ArUco was running) with inference on for the duration
+    let deadline = Instant::now() + Duration::from_secs_f64(setup.timeout_s);
+    let per_request = source.per_request_pipelines().await;
+    let triggered = per_request == Ok(true);
+    let orch = Orchestrator { sup: sup.clone(), source: source.clone(), id, deadline, setup, cam, triggered };
+    let result = if let Err(e) = per_request {
+        Err(fail("DETECTION_UNAVAILABLE", format!("Cannot reach the vision provider: {e}")))
+    } else if triggered {
+        // perception API 2: a ["yolo"] trigger per centring step, no mode change to restore
+        orch.run(&planned).await
+    } else { match source.vision_mode().await {
+        // perception API 1 (rebot-vision 1.2): YOLO (both when ArUco was running) with inference
+        // on for the duration, then the previous mode
         Ok(Some(prev)) => {
             let want = VisionMode { mode: grasp_mode(&prev.mode).to_string(), enabled: true };
             if want == prev {
@@ -995,7 +1054,7 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
             r
         }
         Err(e) => Err(fail("DETECTION_UNAVAILABLE", format!("Cannot read the vision mode: {e}"))),
-    };
+    } };
     let mut inner = sup.inner().write().await;
     match result {
         Ok((holding, gap)) => inner.finish_grasp(id, "done", None, None, Some(holding), gap),

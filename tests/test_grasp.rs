@@ -36,6 +36,10 @@ struct SimCamera {
     mode_calls: Mutex<Vec<VisionMode>>,
     /// `/api/mode` rejects YOLO modes (no model loaded).
     no_yolo: AtomicBool,
+    /// Perception API 2: triggers name their pipelines.
+    per_request: AtomicBool,
+    trigger_calls: Mutex<Vec<Vec<String>>>,
+    next_frame_calls: AtomicU64,
 }
 
 impl SimCamera {
@@ -49,6 +53,19 @@ impl SimCamera {
 }
 
 impl SimCamera {
+    /// One frame through the measured pose.
+    async fn frame_now(&self) -> DetectionFrame {
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let q = self.sup.inner().read().await.measured_positions.clone();
+        let pose = kinematics::fk(&kinematics::q6(&q));
+        let mut detections = vec![Detection { label: "person".into(), score: 0.5, box_norm: [0.0, 0.0, 0.08, 0.1] }];
+        if self.visible.load(Ordering::SeqCst) {
+            if let Some(b) = self.project_box(&pose) { detections.push(Detection { label: self.label.clone(), score: 0.9, box_norm: b }); }
+        }
+        let frame_id = self.frame.fetch_add(1, Ordering::SeqCst) + 1;
+        DetectionFrame { frame_id, captured_at: Instant::now(), detections }
+    }
+
     fn project_box(&self, pose: &Pose) -> Option<[f64; 4]> {
         let o = &self.object;
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
@@ -90,19 +107,25 @@ impl DetectionSource for SimCamera {
     }
     fn next_frame(&self, _after: Option<u64>, wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
         Box::pin(async move {
+            self.next_frame_calls.fetch_add(1, Ordering::SeqCst);
             if !self.yolo_running() {
                 tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                 return Ok(None);
             }
-            tokio::time::sleep(Duration::from_millis(15)).await;
-            let q = self.sup.inner().read().await.measured_positions.clone();
-            let pose = kinematics::fk(&kinematics::q6(&q));
-            let mut detections = vec![Detection { label: "person".into(), score: 0.5, box_norm: [0.0, 0.0, 0.08, 0.1] }];
-            if self.visible.load(Ordering::SeqCst) {
-                if let Some(b) = self.project_box(&pose) { detections.push(Detection { label: self.label.clone(), score: 0.9, box_norm: b }); }
+            Ok(Some(self.frame_now().await))
+        })
+    }
+    fn per_request_pipelines(&self) -> BoxFuture<'_, Result<bool, String>> {
+        Box::pin(async move { Ok(self.per_request.load(Ordering::SeqCst)) })
+    }
+    fn trigger(&self, pipelines: &'static [&'static str], _wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
+        Box::pin(async move {
+            self.trigger_calls.lock().unwrap().push(pipelines.iter().map(|p| p.to_string()).collect());
+            if self.no_yolo.load(Ordering::SeqCst) && pipelines.contains(&"yolo") {
+                return Err("detector returned 409 Conflict yolo unavailable".into());
             }
-            let frame_id = self.frame.fetch_add(1, Ordering::SeqCst) + 1;
-            Ok(Some(DetectionFrame { frame_id, captured_at: Instant::now(), detections }))
+            // runs whatever the global mode is: no continuous inference needed
+            Ok(Some(self.frame_now().await))
         })
     }
 }
@@ -169,6 +192,7 @@ async fn rig(setup: GraspSetup, truth: Truth, start_tilt_deg: f64, offset_xy: [f
         sup: sup.clone(), cam, object: Object { centre: object, half: [0.025, 0.015], height: 0.05 }, label: "cup".into(),
         visible: AtomicBool::new(true), enabled: AtomicBool::new(false), frame: AtomicU64::new(0), inference_calls: Mutex::new(Vec::new()),
         vision: Mutex::new(None), mode_calls: Mutex::new(Vec::new()), no_yolo: AtomicBool::new(false),
+        per_request: AtomicBool::new(false), trigger_calls: Mutex::new(Vec::new()), next_frame_calls: AtomicU64::new(0),
     });
     let hold = Arc::new(AtomicBool::new(true));
     let (ticker, hold_t) = (sup.clone(), hold.clone());
@@ -637,4 +661,54 @@ async fn grasp_without_yolo_model_fails_detection_unavailable() {
     assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("DETECTION_UNAVAILABLE")), "{a:?}");
     assert_eq!(rig.sim.vision.lock().unwrap().clone(), Some(vm("aruco", false)), "mode untouched");
     assert_idle_after(&rig.sup, id).await;
+}
+
+/// Perception API 2: a trigger with ["yolo"] per centring step; the global mode (here the
+/// cockpit's ArUco, standby) is neither changed nor restored, and no continuous results are read.
+#[tokio::test]
+async fn grasp_triggers_yolo_per_step_without_touching_the_mode() {
+    let setup = GraspSetup { camera_tilt_deg: -20.0, ..GraspSetup::default() };
+    for before in [vm("aruco", true), vm("off", false), vm("yolo", false)] {
+        let rig = rig(setup.clone(), Truth::same(), 0.0, [0.0, 0.0], false).await;
+        let start_r = start_pose(&rig).await.r;
+        let mut s = setup.clone();
+        s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+        rig.sup.inner().write().await.set_grasp_setup(s.clone());
+        *rig.sim.vision.lock().unwrap() = Some(before.clone());
+        rig.sim.per_request.store(true, Ordering::SeqCst);
+        let o = run_grasp(&rig).await;
+        assert_holding_done(&o, &s, &rig.object, 0.004);
+        let calls = rig.sim.trigger_calls.lock().unwrap().clone();
+        assert!(!calls.is_empty() && calls.iter().all(|p| p == &["yolo".to_string()]), "{calls:?}");
+        assert!(calls.len() as u32 >= o.status.iteration.unwrap(), "one trigger per centring step at least");
+        assert!(rig.sim.mode_calls.lock().unwrap().is_empty(), "no mode switch");
+        assert!(rig.sim.inference_calls.lock().unwrap().is_empty(), "no inference toggle");
+        assert_eq!(rig.sim.next_frame_calls.load(Ordering::SeqCst), 0, "no continuous results read");
+        assert_eq!(rig.sim.vision.lock().unwrap().clone(), Some(before));
+    }
+}
+
+#[tokio::test]
+async fn grasp_triggers_fail_target_lost_and_without_model() {
+    let rig1 = rig(GraspSetup::default(), Truth::same(), 0.0, [0.01, 0.01], false).await;
+    rig1.sim.per_request.store(true, Ordering::SeqCst);
+    *rig1.sim.vision.lock().unwrap() = Some(vm("aruco", true));
+    let (id, _) = grasp::start(&rig1.sup, rig1.sim.clone(), &tap(&rig1).await).await.unwrap();
+    wait_phase(&rig1.sup, id, "centring", None).await;
+    rig1.sim.visible.store(false, Ordering::SeqCst);
+    let a = wait_done(&rig1.sup, id, 10.0, |_| {}).await;
+    assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("TARGET_LOST")), "{a:?}");
+    assert!(rig1.sim.mode_calls.lock().unwrap().is_empty());
+    assert_eq!(rig1.sim.vision.lock().unwrap().clone(), Some(vm("aruco", true)));
+    assert_idle_after(&rig1.sup, id).await;
+
+    let rig2 = rig(GraspSetup::default(), Truth::same(), 0.0, [0.0, 0.0], false).await;
+    rig2.sim.per_request.store(true, Ordering::SeqCst);
+    rig2.sim.no_yolo.store(true, Ordering::SeqCst);
+    *rig2.sim.vision.lock().unwrap() = Some(vm("aruco", false));
+    let (id, _) = grasp::start(&rig2.sup, rig2.sim.clone(), &tap(&rig2).await).await.unwrap();
+    let a = wait_done(&rig2.sup, id, 10.0, |_| {}).await;
+    assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("DETECTION_UNAVAILABLE")), "{a:?}");
+    assert!(rig2.sim.mode_calls.lock().unwrap().is_empty());
+    assert_idle_after(&rig2.sup, id).await;
 }
