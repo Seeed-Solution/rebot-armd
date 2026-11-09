@@ -278,3 +278,77 @@ pub fn decode_serial_bridge_frame(buf: &[u8]) -> Result<(CanFrame, usize), Damia
 
     Ok((frame, header_pos + 14))
 }
+
+// =========================================================================
+// Register access (0x7FF): control mode and the MIT mapping ranges
+// =========================================================================
+//
+// Layout as used by Damiao's DM_CAN reference library (not verified on the
+// B601-DM yet): request on CAN ID 0x7FF, `[id_l, id_h, op, rid, d0, d1, d2, d3]`
+// with op 0x33 = read and 0x55 = write (RAM only; 0xAA would store to flash).
+// The motor answers on its feedback ID with the same layout and the current
+// value. Integer registers (such as CTRL_MODE) are u32, the others f32, both
+// little-endian.
+
+/// Register read opcode.
+pub const REG_READ: u8 = 0x33;
+/// Register write opcode (RAM, lost at power-off).
+pub const REG_WRITE: u8 = 0x55;
+/// Control mode register: 1 = MIT, 2 = POS_VEL, 3 = VEL, 4 = POS_FORCE.
+pub const RID_CTRL_MODE: u8 = 10;
+/// Position mapping range of the MIT frame and of feedback (rad, f32).
+pub const RID_PMAX: u8 = 21;
+/// Velocity mapping range (rad/s, f32).
+pub const RID_VMAX: u8 = 22;
+/// Torque mapping range (N·m, f32).
+pub const RID_TMAX: u8 = 23;
+pub const CTRL_MODE_MIT: u32 = 1;
+pub const CTRL_MODE_POS_VEL: u32 = 2;
+
+/// Build a register read request (`0x7FF`, `[id_l, id_h, 0x33, rid, 0, 0, 0, 0]`).
+pub fn build_read_register_frame(motor_id: u16, rid: u8) -> CanFrame {
+    let [lo, hi] = motor_id.to_le_bytes();
+    CanFrame::new_standard(0x7FF, &[lo, hi, REG_READ, rid, 0, 0, 0, 0]).unwrap()
+}
+
+/// Build a RAM register write (`0x7FF`, `[id_l, id_h, 0x55, rid, value LE]`).
+pub fn build_write_register_frame(motor_id: u16, rid: u8, value: [u8; 4]) -> CanFrame {
+    let [lo, hi] = motor_id.to_le_bytes();
+    let [v0, v1, v2, v3] = value;
+    CanFrame::new_standard(0x7FF, &[lo, hi, REG_WRITE, rid, v0, v1, v2, v3]).unwrap()
+}
+
+/// Build a CTRL_MODE write.
+pub fn build_set_control_mode_frame(motor_id: u16, mode: u32) -> CanFrame {
+    build_write_register_frame(motor_id, RID_CTRL_MODE, mode.to_le_bytes())
+}
+
+/// Reply to a register read or write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisterReply {
+    pub motor_id: u16,
+    pub write: bool,
+    pub rid: u8,
+    pub value: [u8; 4],
+}
+
+impl RegisterReply {
+    pub fn as_u32(&self) -> u32 { u32::from_le_bytes(self.value) }
+    pub fn as_f32(&self) -> f32 { f32::from_le_bytes(self.value) }
+}
+
+/// Parse a register reply. A feedback frame has `(state << 4) | id` in byte 0 and the
+/// position high byte in byte 1; byte 1 = 0 would mean a position below -12.1 rad, so a
+/// frame with id_h = 0 in byte 1 and a register opcode in byte 2 is taken as a reply.
+/// Callers must still check `motor_id` and `rid` against what they asked for.
+pub fn parse_register_reply(frame: &CanFrame) -> Option<RegisterReply> {
+    if frame.is_extended || frame.is_rtr || frame.dlc != 8 { return None; }
+    let d = &frame.data;
+    if d[1] != 0 || !(d[2] == REG_READ || d[2] == REG_WRITE) { return None; }
+    Some(RegisterReply {
+        motor_id: u16::from_le_bytes([d[0], d[1]]),
+        write: d[2] == REG_WRITE,
+        rid: d[3],
+        value: [d[4], d[5], d[6], d[7]],
+    })
+}

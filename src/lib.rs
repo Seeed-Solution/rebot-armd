@@ -15,7 +15,7 @@ pub mod transport;
 pub use api::create_router;
 pub use driver::{
     ArmDriver, ArmDriverError, DamiaoArmDriver, FashionStarArmDriver, FeetechArmDriver,
-    JointTarget, RobStrideArmDriver,
+    JointMode, JointTarget, RobStrideArmDriver,
 };
 pub use gravity::{compute_gravity_torques, verify_urdf_sha256, GravityError};
 pub use model::{ArmConfig, ArmObservation, JointLimit, JointState, ObservationSchema};
