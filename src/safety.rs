@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use crate::model::JointLimit;
 
-/// Stop policy strategy (review)
+/// Stop policy strategy
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopPolicy {
     /// Return to stow/home position cleanly, then disable torque
@@ -224,7 +224,7 @@ impl SafetyManager {
             SafetyState::Armed | SafetyState::Moving => {}
         }
 
-        // 2. Epoch generation ID validation (review: single authority & epoch latch)
+        // 2. Epoch generation ID validation (single authority & epoch latch)
         if let Some(cmd_epoch) = cmd_epoch_id {
             if cmd_epoch != self.epoch_id {
                 return Err(SafetyError::EpochMismatch {

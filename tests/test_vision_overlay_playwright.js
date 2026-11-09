@@ -13,7 +13,7 @@ const { execSync } = require('child_process');
   } catch (_) {}
 
   const browser = await chromium.launch({
-    executablePath: '/snap/bin/chromium',
+    executablePath: process.env.CHROME || undefined,
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });

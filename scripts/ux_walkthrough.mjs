@@ -1,4 +1,4 @@
-import { chromium } from '/usr/local/lib/node_modules/@playwright/cli/node_modules/playwright-core/index.mjs';
+const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
 import fs from 'fs';
 import path from 'path';
 
@@ -8,7 +8,7 @@ fs.mkdirSync(outDir, { recursive: true });
 async function run() {
   console.log('[*] Launching Chromium (iPad landscape 1024x768)...');
   const browser = await chromium.launch({
-    executablePath: 'chrome',
+    executablePath: process.env.CHROME || undefined,
     headless: true,
   });
 

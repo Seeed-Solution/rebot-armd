@@ -3,10 +3,11 @@ const path = require('path');
 const fs = require('fs');
 
 (async () => {
-  const artifactDir = path.resolve('tests/artifacts');
+  const artifactDir = path.resolve(__dirname, 'artifacts');
+  fs.mkdirSync(artifactDir, { recursive: true });
   
   const browser = await chromium.launch({
-    executablePath: '/snap/bin/chromium',
+    executablePath: process.env.CHROME || undefined,
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });

@@ -29,3 +29,6 @@ Thumbs.db
 .vscode/
 *.swp
 *~
+
+# Screenshots and logs written by the Playwright test scripts
+/tests/artifacts/

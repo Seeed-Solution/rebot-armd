@@ -4,7 +4,7 @@ const fs = require('fs');
 
 (async () => {
   const browser = await chromium.launch({
-    executablePath: '/snap/bin/chromium',
+    executablePath: process.env.CHROME || undefined,
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
@@ -43,7 +43,9 @@ const fs = require('fs');
   console.log('Client State Extracted:', JSON.stringify(state, null, 2));
 
   // Take screenshot
-  const shotPath = 'tests/artifacts/playwright_single_origin_gateway_verified.png';
+  const shotDir = path.resolve(__dirname, 'artifacts');
+  fs.mkdirSync(shotDir, { recursive: true });
+  const shotPath = path.join(shotDir, 'playwright_single_origin_gateway_verified.png');
   await page.screenshot({ path: shotPath, fullPage: true });
   console.log('Screenshot saved to:', shotPath);
 
