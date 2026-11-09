@@ -989,6 +989,20 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
 .vz.b { bottom: 5px; }
 .vz.hot { color: var(--sc-color-primary-dark); }
 @media (max-width: 360px) { .ck-mid { --disc: 140px; } }
+/* camera-view frame: look stick next to the move stick, pose toggle not needed */
+.ck-rot { display: flex; flex: none; }
+body:not(.cart-view) .ck-rot { display: none; }
+body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-view { display: none; }
+.frame-seg[hidden], .frame-row[hidden] { display: none !important; }
+.frame-row { flex-wrap: wrap; }
+/* two-character look labels: stack arrow over text on the sides too so they clear the knob */
+#pad-srot .dir.l, #pad-srot .dir.r { flex-direction: column; gap: 0; }
+@media (max-width: 639px) {
+  /* two sticks share the first row; sliders sit on the right of the second */
+  body.cart-view .ck-mid { justify-content: space-around; align-items: flex-end; }
+  body.cart-view .ck-right { margin-left: auto; }
+  body.cart-view .ck-mid { --disc: min(160px, calc((100vw - 64px) / 2)); }
+}
 
 @media (orientation: landscape) and (max-height: 1200px), body.is-fs.ui-simple, body.is-hud.ui-simple {
   body.ui-simple .ck-left, body.ui-simple .ck-right { display: contents; }
@@ -999,6 +1013,19 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
     box-shadow: 0 8px 32px rgba(0,0,0,0.18), inset 0 1px 0 rgba(255,255,255,0.35);
   }
   body.ui-simple .pose-btn.on { background: rgba(140,192,32,0.85); border-color: rgba(217,249,157,0.9); box-shadow: 0 0 24px rgba(140,192,32,0.45), inset 0 1px 0 rgba(255,255,255,0.5); }
+  body.ui-simple .ck-rot { display: contents; }
+  body.ui-simple:not(.cart-view) .ck-rot #pad-srot { display: none; }
+  body.ui-simple #pad-srot { left: auto; right: calc(max(16px, env(safe-area-inset-right)) + 54px + 14px + 54px + 18px); }
+  /* frame toggle: above the pose button (base) or in its place (view) */
+  body.ui-simple .frame-seg {
+    position: fixed; z-index: 150; left: calc(max(16px, env(safe-area-inset-left)) + (var(--disc) - 112px) / 2); width: 112px;
+    bottom: calc(16px + var(--disc) + 10px + 44px + 8px); display: flex;
+    background: rgba(255,255,255,0.22); border: 1px solid rgba(255,255,255,0.45); box-shadow: 0 8px 32px rgba(0,0,0,0.18), inset 0 1px 0 rgba(255,255,255,0.35);
+    backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
+  }
+  body.ui-simple.cart-view .frame-seg { bottom: calc(16px + var(--disc) + 10px); }
+  body.ui-simple .frame-seg button { flex: 1; padding: 0 6px; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.4); }
+  body.ui-simple .frame-seg button.on { color: #1f2937; text-shadow: none; }
   body.ui-simple .disc.vslot#pad-sz {
     left: auto; top: auto; bottom: 16px; width: 54px; height: 160px; border-radius: 27px;
     right: calc(max(16px, env(safe-area-inset-right)) + 54px + 14px);
@@ -1127,6 +1154,12 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
 
         <!-- cartesian: XYZ + pitch via IK, wrist control = J5 (swing on the 7-DOF arm), yaw follows J1 -->
         <div class="cart-zone" id="cart-zone">
+          <div class="tool-group frame-row" id="frame-row-e" hidden><span class="cap" data-i18n="frame">坐标系</span>
+            <div class="seg seg-sm frame-seg" id="frame-seg-e" role="radiogroup" data-i18n-aria="frame" aria-label="坐标系" hidden>
+              <button data-frame="view" role="radio" data-i18n="frame.view">视角</button>
+              <button data-frame="base" role="radio" data-i18n="frame.base">底座</button>
+            </div>
+          </div>
           <div class="cart-read">
             <div><span data-i18n="c.x">X 前后 mm</span><b id="c-x">--</b></div>
             <div><span data-i18n="c.y">Y 左右 mm</span><b id="c-y">--</b></div>
@@ -1143,7 +1176,7 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
           </div>
           <div class="cart-ctl">
             <div class="cart-steps">
-              <div class="dpad" id="dpad-xy"><span class="hub">XY</span></div>
+              <div class="dpad" id="dpad-xy"><span class="hub" data-i18n="hub.xy">XY</span></div>
               <div class="vcol" id="vcol-z"><span class="vlab"><b data-i18n="vl.height">高度</b>Z</span></div>
               <div class="vcol" id="vcol-p"><span class="vlab"><b data-i18n="vl.pitch">俯仰</b>Pitch</span></div>
               <div class="vcol" id="vcol-r"><span class="vlab"><b data-i18n="vl.roll">腕转</b><span data-i18n="vl.roll.sub">Roll</span></span></div>
@@ -1157,7 +1190,7 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
                   <span class="dir r" data-ax="y" data-s="-1" data-i18n="d.right">右</span>
                   <i class="knob"></i>
                 </div>
-                <div class="stick-cap"><span class="ttl" data-i18n="st.pan">水平平移</span><b>↕</b> X <b>↔</b> Y</div>
+                <div class="stick-cap"><span class="ttl" data-i18n="st.pan">水平平移</span><span class="cap-base"><b>↕</b> X <b>↔</b> Y</span><span class="cap-view"><b>↕</b> <span data-i18n="cap.fb">前后</span> <b>↔</b> <span data-i18n="cap.lr">左右</span></span></div>
               </div>
               <div class="stick-wrap">
                 <div class="pad y" id="pad-cz">
@@ -1273,6 +1306,10 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
         </div>
         <div class="ck-mid">
           <div class="ck-left">
+            <div class="seg seg-sm frame-seg" id="frame-seg-s" role="radiogroup" data-i18n-aria="frame" aria-label="坐标系" hidden>
+              <button data-frame="view" role="radio" data-i18n="frame.view">视角</button>
+              <button data-frame="base" role="radio" data-i18n="frame.base">底座</button>
+            </div>
             <button class="pose-btn" id="btn-pose" type="button" aria-pressed="false" data-i18n-aria="pose.aria" aria-label="姿态模式（点击锁定，按住 Shift 临时切换）">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 18l8-13 8 13z"/><path d="M12 5v13"/></svg><span data-i18n="pose.btn">姿态 / Pose</span>
             </button>
@@ -1281,6 +1318,15 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
               <span class="dir b" id="s-dir-b" data-ax="x" data-s="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M6 13l6 6 6-6"/></svg><span class="lbl" data-i18n="d.back">后</span></span>
               <span class="dir l" id="s-dir-l" data-ax="y" data-s="1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg><span class="lbl" data-i18n="d.left">左</span></span>
               <span class="dir r" id="s-dir-r" data-ax="y" data-s="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg><span class="lbl" data-i18n="d.right">右</span></span>
+              <i class="knob"></i>
+            </div>
+          </div>
+          <div class="ck-rot">
+            <div class="disc" id="pad-srot" data-i18n-aria="pad.rot" aria-label="视角摇杆（抬头低头 / 左转右转）">
+              <span class="dir t" data-ax="p" data-s="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M6 11l6-6 6 6"/></svg><span class="lbl" data-i18n="vr.up">抬头</span></span>
+              <span class="dir b" data-ax="p" data-s="1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M6 13l6 6 6-6"/></svg><span class="lbl" data-i18n="vr.dn">低头</span></span>
+              <span class="dir l" data-ax="r" data-s="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg><span class="lbl" data-i18n="vr.l">左转</span></span>
+              <span class="dir r" data-ax="r" data-s="1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg><span class="lbl" data-i18n="vr.r">右转</span></span>
               <i class="knob"></i>
             </div>
           </div>
@@ -1473,6 +1519,14 @@ const I18N = {
     'cb.pup': '上抬', 'cb.pdn': '下压', 'cb.rr': '右旋', 'cb.rl': '左旋',
     'pl.up': '仰', 'pl.dn': '俯', 'pl.rl': '左滚', 'pl.rr': '右滚',
     'st.pan': '水平平移', 'step': '步长', 'step.title': '每次点按 {n} mm / {n}°',
+    // camera-view cartesian frame (keys ending in @view win over @7 and the plain key while it is active)
+    'frame': '坐标系', 'frame.view': '视角', 'frame.base': '底座', 'hub.xy': 'XY', 'hub.xy@view': '视角',
+    'vr.up': '抬头', 'vr.dn': '低头', 'vr.l': '左转', 'vr.r': '右转', 'pad.rot': '视角摇杆（抬头低头 / 左转右转）',
+    'pad.move@view': '移动摇杆（沿视线前进后退 / 画面左右平移）', 'st.pan@view': '视角移动', 'cap.fb': '前后', 'cap.lr': '左右',
+    'd.lift@view': '抬头', 'd.press@view': '低头', 'cb.pup@view': '抬头', 'cb.pdn@view': '低头', 'cb.rr@view': '右转', 'cb.rl@view': '左转',
+    'vl.roll@view': '环视', 'vl.roll.sub@view': 'Yaw', 'c.roll@view': 'Roll 腕转',
+    'kb.cartsub@view': '空间位姿 / 简化模式（视角坐标）', 'kb.x@view': '前进 / 后退（沿视线）', 'kb.y@view': '左移 / 右移（画面水平）',
+    'kb.p@view': '抬头 / 低头', 'kb.r@view': '左转 / 右转（环视）',
     'grip': '夹爪', 'grip.opening': '夹爪开度', 'stick.grip6': '夹爪 J6',
     'dj.lean': '前倾', 'dj.back': '后仰', 'dj.ccw': '逆转', 'dj.cw': '顺转', 'dj.up': '上翘', 'dj.down': '下倾', 'dj.raise': '抬高', 'dj.lower': '下压', 'dj.rl': '旋左', 'dj.rr': '旋右',
     'stick.left': '左摇杆', 'stick.right': '右摇杆', 'stick.j2': 'J2 大臂', 'stick.j1': 'J1 底座', 'stick.j3': 'J3 小臂', 'stick.j5': 'J5 腕转', 'part.wrist': '手腕',
@@ -1577,6 +1631,13 @@ const I18N = {
     'cb.pup': 'Up', 'cb.pdn': 'Down', 'cb.rr': 'Roll R', 'cb.rl': 'Roll L',
     'pl.up': 'Up', 'pl.dn': 'Down', 'pl.rl': 'Roll L', 'pl.rr': 'Roll R',
     'st.pan': 'Horizontal', 'step': 'Step', 'step.title': '{n} mm / {n}° per tap',
+    'frame': 'Frame', 'frame.view': 'View', 'frame.base': 'Base', 'hub.xy': 'XY', 'hub.xy@view': 'View',
+    'vr.up': 'Up', 'vr.dn': 'Down', 'vr.l': 'Left', 'vr.r': 'Right', 'pad.rot': 'Look stick (look up / down, turn left / right)',
+    'pad.move@view': 'Move stick (forward / back along the view, left / right in the image)', 'st.pan@view': 'View move', 'cap.fb': 'Fwd/Back', 'cap.lr': 'Left/Right',
+    'd.lift@view': 'Up', 'd.press@view': 'Down', 'cb.pup@view': 'Look up', 'cb.pdn@view': 'Look down', 'cb.rr@view': 'Turn R', 'cb.rl@view': 'Turn L',
+    'vl.roll@view': 'Look', 'vl.roll.sub@view': 'Yaw', 'c.roll@view': 'Roll',
+    'kb.cartsub@view': 'Cartesian / Simple mode (view frame)', 'kb.x@view': 'Forward / back (along the view)', 'kb.y@view': 'Left / right (image horizontal)',
+    'kb.p@view': 'Look up / down', 'kb.r@view': 'Turn left / right (look around)',
     'grip': 'Gripper', 'grip.opening': 'Gripper opening', 'stick.grip6': 'Gripper J6',
     'dj.lean': 'Lean fwd', 'dj.back': 'Lean back', 'dj.ccw': 'CCW', 'dj.cw': 'CW', 'dj.up': 'Tilt up', 'dj.down': 'Tilt down', 'dj.raise': 'Raise', 'dj.lower': 'Lower', 'dj.rl': 'Rot. L', 'dj.rr': 'Rot. R',
     'stick.left': 'Left stick', 'stick.right': 'Right stick', 'stick.j2': 'J2 Shoulder', 'stick.j1': 'J1 Base', 'stick.j3': 'J3 Elbow', 'stick.j5': 'J5 Wrist roll', 'part.wrist': 'Wrist',
@@ -1638,8 +1699,11 @@ let LANG = (() => {
 })();
 // '@7' when the arm reports 7 DOF: keys with a 7-DOF variant resolve to it.
 let I18N_VARIANT = '';
+// true while the camera-view cartesian frame is active: '@view' keys win over '@7' and the plain key
+let I18N_VIEW = false;
 function t(key, vars) {
-  let s = I18N_VARIANT && (I18N[LANG][key + I18N_VARIANT] ?? I18N.zh[key + I18N_VARIANT]);
+  let s = I18N_VIEW ? (I18N[LANG][key + '@view'] ?? I18N.zh[key + '@view']) : undefined;
+  if (s === undefined || s === '') s = I18N_VARIANT && (I18N[LANG][key + I18N_VARIANT] ?? I18N.zh[key + I18N_VARIANT]);
   if (s === undefined || s === '') s = I18N[LANG][key];
   if (s === undefined) s = I18N.zh[key];
   if (s === undefined) return key;
@@ -3507,6 +3571,7 @@ async function loadSchema() {
         renderGripCol();
         applyI18n();
       }
+      applyFrame();
     }
   } catch (_) { setTimeout(loadSchema, 3000); }
 }
@@ -3729,7 +3794,7 @@ new Pad($('pad-left'), { onChange: (v) => { S.axes.l = v; } });
 new Pad($('pad-right'), { onChange: (v) => { S.axes.r = v; } });
 new Pad($('pad-wrist'), { axes: 'y', onChange: (v) => { S.axes.wrist = v[1]; } });
 const padDirs = Array.from(document.querySelectorAll('#stick-zone .pad .dir'));
-const cartDirs = Array.from(document.querySelectorAll('.cart-sticks .pad .dir, #pad-sxy .dir, #pad-sz .vz'));
+const cartDirs = Array.from(document.querySelectorAll('.cart-sticks .pad .dir, #pad-sxy .dir, #pad-srot .dir, #pad-sz .vz'));
 
 /* =================================================================
    Keyboard: [joint, direction] keyed by e.code for OS/layout immunity
@@ -4261,13 +4326,16 @@ const ARROW = {
   down: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 9l7 7 7-7"/></svg>',
   left: CHEV_L, right: CHEV_R,
 };
+// step-button axis tags in the view frame: camera axes (Zc forward, Xc right), world Z, yaw (CCW +)
+const VIEW_SUB = { 'X+': 'Zc+', 'X−': 'Zc−', 'Y+': 'Xc−', 'Y−': 'Xc+', 'R+': 'Yaw−', 'R−': 'Yaw+' };
 function cartButton(parent, ax, s, label, sub, arrow) {
   const b = document.createElement('button');
   b.className = 'jbtn cbtn';
   b.dataset.ax = ax; b.dataset.s = s;
   const render = () => {
-    b.setAttribute('aria-label', t(label) + ' ' + sub);
-    b.innerHTML = `${ARROW[arrow]}<span>${t(label)}</span><b>${sub}</b>`;
+    const sb = (viewActive() && VIEW_SUB[sub]) || sub;
+    b.setAttribute('aria-label', t(label) + ' ' + sb);
+    b.innerHTML = `${ARROW[arrow]}<span>${t(label)}</span><b>${sb}</b>`;
   };
   render(); i18nHooks.push(render);
   let pid = null, timer = null, held = false;
@@ -4373,6 +4441,49 @@ new Pad($('pad-sgrip'), {
     C.gripJog = 0;
   }
 });
+
+// view frame look stick: up = look up, right = turn right (C.axes.sp / sr, same signs as the pose stick)
+let rotPadRequiresNeutral = false;
+const padSrot = new Pad($('pad-srot'), { onChange: (v) => {
+  if (rotPadRequiresNeutral) {
+    if (Math.hypot(v[0], v[1]) >= CFG.deadzone) return;
+    rotPadRequiresNeutral = false;
+  }
+  if (!viewActive()) return;
+  C.axes.sp = v[1]; C.axes.sr = v[0];
+}, onEnd: cartHoldStill });
+for (const ev of ['touchstart', 'mousedown']) {
+  $('pad-srot').addEventListener(ev, () => { if (!padSrot.active()) rotPadRequiresNeutral = false; });
+}
+// frame toggle (view = camera frame, base = base frame); only offered on the 7-DOF arm
+function applyFrame() {
+  const dof7 = S.dof === 7, view = viewActive();
+  document.body.classList.toggle('cart-view', view);
+  for (const id of ['frame-seg-s', 'frame-seg-e']) $(id).hidden = !dof7;
+  $('frame-row-e').hidden = !dof7;
+  for (const id of ['frame-seg-s', 'frame-seg-e']) for (const b of $(id).children) {
+    const on = b.dataset.frame === (view ? 'view' : 'base');
+    b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on));
+  }
+  if (I18N_VIEW !== view) { I18N_VIEW = view; applyI18n(); }
+  syncPoseMode(); renderPoseUi();
+}
+function setFrame(f) {
+  f = f === 'base' ? 'base' : 'view';
+  if (f === C.frame) return;
+  releaseAll(); // drop keys, holds and sticks of the old mapping
+  C.frame = f;
+  store('rebot.cart.frame', f);
+  C.axes.xy = [0, 0]; C.axes.z = 0; C.axes.p = 0; C.axes.sxy = [0, 0]; C.axes.sz = 0; C.axes.sp = 0; C.axes.sr = 0;
+  leftPadRequiresNeutral = true; rotPadRequiresNeutral = true;
+  resetPoseMode();
+  if (S.obs && S.obs.positions.length >= 5) cartSync(S.obs.positions);
+  C.status = 'idle'; C.msg = '';
+  applyFrame();
+}
+for (const id of ['frame-seg-s', 'frame-seg-e']) {
+  $(id).addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { buzz(8); setFrame(b.dataset.frame); } });
+}
 
 function jogTo(target) {
   if (!isLive()) return toast(lockReason(), 'err');
@@ -4689,6 +4800,7 @@ window.addEventListener('keyup', (e) => {
   S.shiftHeld = false; syncPoseMode(); renderPoseUi();
 });
 renderPoseUi();
+applyFrame();
 
 const GRIP_ICON = {
   open: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V5.5a1.5 1.5 0 0 1 3 0V12"/><path d="M11 11.5v-7a1.5 1.5 0 0 1 3 0V12"/><path d="M14 11.5V6a1.5 1.5 0 0 1 3 0v8"/><path d="M8 12.5V10a1.5 1.5 0 0 0-3 0v4a7 7 0 0 0 7 7h1a5 5 0 0 0 4-2.5"/></svg>',
@@ -5635,7 +5747,11 @@ function renderSimple(live, op) {
 }
 
 function renderCart(live, op) {
-  const p = C.cmd;
+  // readouts from the full FK of the commanded joints: view = solved pose, base = IK J1..J4 + J5 + measured J6
+  const view = viewActive();
+  const pos6 = S.obs && S.obs.positions;
+  const T = view ? C.T : (C.cmd && C.q ? VIK.fk([...C.q, C.j5, (pos6 && pos6[5]) || 0]) : null);
+  const p = T ? { x: T[0][3], y: T[1][3], z: T[2][3], pitch: Math.asin(clamp(-T[2][0], -1, 1)), yaw: Math.atan2(T[1][0], T[0][0]) } : null;
   const mm = (m) => (m >= 0 ? '+' : '−') + Math.abs(m * 1000).toFixed(1);
   setText($('c-x'), p ? mm(p.x) : '--'); setText($('c-y'), p ? mm(p.y) : '--');
   setText($('c-z'), p ? mm(p.z) : '--'); setText($('c-p'), p ? fmtDeg(p.pitch) + '°' : '--');
@@ -5643,14 +5759,14 @@ function renderCart(live, op) {
   setText($('c-r'), R == null ? '--' : Math.round(R * 1000) + ' mm');
   $('c-rfill').style.width = (clamp(frac, 0, 1) * 100).toFixed(1) + '%';
   setCls($('c-reach'), 'reach' + (frac > 1 ? ' bad' : frac > 0.92 ? ' warn' : ''));
-  setText($('c-r5'), live ? fmtDeg(C.j5) + '°' : '--');
-  setText($('c-yaw'), p ? fmtDeg(Math.atan2(p.y, p.x)) + '°' : '--');
+  setText($('c-r5'), !live ? '--' : view ? (C.q6 ? fmtDeg(C.q6[5]) + '°' : '--') : fmtDeg(C.j5) + '°');
+  setText($('c-yaw'), p ? fmtDeg(p.yaw) + '°' : '--');
   const bad = C.status !== 'ok' && C.status !== 'idle';
   const badge = $('ik-badge');
   setText(badge, !live ? 'IK --' : bad ? t('ik.blocked') : C.sending ? t('ik.stream', { hz: CFG.cart.hz }) : t('ik.ready'));
   setCls(badge, 'sc-status-badge ' + (!live ? '' : bad ? 'is-warn' : C.sending ? 'is-info' : 'is-ok'));
   const msg = $('ik-msg');
-  setText(msg, !live ? t('wait_telemetry') : bad ? ikText(C.msg) : !op ? t('cart.enable_first') : t('cart.following', { branch: C.branch ?? '-', tx: CFG.cart.tx === 'ws' ? t('cart.tx_ws') : t('cart.tx_rest') }));
+  setText(msg, !live ? t('wait_telemetry') : bad ? ikText(C.msg) : !op ? t('cart.enable_first') : t('cart.following', { branch: view ? 'DLS' : (C.branch ?? '-'), tx: CFG.cart.tx === 'ws' ? t('cart.tx_ws') : t('cart.tx_rest') }));
   msg.classList.toggle('bad', bad);
   setText($('ik-us'), C.solveUs == null ? '' : 'IK ' + (C.solveUs < 1 ? C.solveUs.toFixed(2) : C.solveUs.toFixed(1)) + t('ik.per_solve'));
   const gr = $('grip-range');
