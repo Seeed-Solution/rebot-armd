@@ -999,11 +999,16 @@ impl SupervisorInner {
         self.safety.trigger_fault(FaultReason::WatchdogTimeout);
     }
 
+    /// Drops the lease if `client_id`/`generation` own it. Returns true only when the
+    /// lease was still valid: callers stop motion on true. An expired lease is dropped
+    /// without that, because its expiry may already have started a watchdog park that a
+    /// client without a valid lease must not cancel.
     pub fn release_lease(&mut self, client_id: &str, generation: u64) -> bool {
         if let Some(ref active) = self.active_lease {
             if active.client_id == client_id && active.generation == generation {
+                let valid = active.acquired_at.elapsed() < self.lease_timeout;
                 self.active_lease = None;
-                return true;
+                return valid;
             }
         }
         false

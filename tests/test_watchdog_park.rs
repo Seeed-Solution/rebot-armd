@@ -201,3 +201,103 @@ async fn park_that_cannot_reach_rest_falls_back_to_fault_without_cutting_torque(
     assert_eq!(hw.lock().unwrap().enabled, EnableState::Enabled);
     assert!(!supervisor.inner().read().await.pending_normal_unload);
 }
+
+// ---- WebSocket close after the lease expired (real-arm incident, armd fce83ff) ----
+
+/// Serve `supervisor` over the real router (no control loop: the test ticks it).
+async fn serve(supervisor: Arc<ArmSupervisor>) -> std::net::SocketAddr {
+    let router = armd::api::create_router(supervisor);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+    addr
+}
+
+async fn ws_lease(addr: std::net::SocketAddr) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use futures_util::{SinkExt, StreamExt};
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+    let acquire = serde_json::json!({"type":"acquire_lease", "seq":1, "client_id":"sdk"});
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(acquire.to_string().into())).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if v["type"] == "lease_granted" { return; }
+        }
+    }).await.expect("lease_granted");
+    ws
+}
+
+/// The lease holder stops heartbeating (transport stall), the watchdog parks, then the
+/// client closes its socket. The close must not cancel the park: on the real arm the
+/// close-time `release_lease` + `stop_motion` left it holding torque mid-way and
+/// latched Fault(WatchdogTimeout) ("Watchdog park interrupted (safety state Moving)").
+#[tokio::test]
+async fn closing_socket_after_lease_expired_does_not_cancel_watchdog_park() {
+    let supervisor = Arc::new(sim_torqued_away_from_home(true).await);
+    let addr = serve(supervisor.clone()).await;
+    let mut ws = ws_lease(addr).await;
+    let obs = expire_lease(&supervisor).await;
+    assert!(!obs.safety_state.is_stopped(), "{:?}", obs.safety_state);
+    assert!(supervisor.inner().read().await.watchdog_park_deadline.is_some(), "watchdog park started");
+    for _ in 0..3 { supervisor.tick(0.02).await; }
+
+    ws.close(None).await.unwrap();
+    drop(ws);
+    // Let the server observe the close and run its disconnect cleanup.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    {
+        let inner = supervisor.inner().read().await;
+        assert!(inner.pending_normal_unload, "socket close of an expired lease cancelled the watchdog park");
+        assert!(inner.watchdog_park_deadline.is_some());
+    }
+    for _ in 0..200 { supervisor.tick(0.05).await; }
+    let obs = supervisor.get_observation().await;
+    assert_eq!(obs.safety_state, SafetyState::Idle, "park completes");
+    assert!(!obs.is_torqued);
+}
+
+/// A socket close by a client that still holds a valid lease keeps stopping its motion.
+#[tokio::test]
+async fn closing_socket_with_valid_lease_still_stops_motion() {
+    let supervisor = Arc::new(ArmSupervisor::new({ let mut c = sim_config(true); c.lease_timeout_ms = 5_000; c }));
+    supervisor.set_torque(true).await.unwrap();
+    let addr = serve(supervisor.clone()).await;
+    let ws = ws_lease(addr).await;
+    supervisor.jog(vec![1.0, 0.5], Some(2.0), None).await.unwrap();
+    supervisor.tick(0.02).await;
+    assert!(supervisor.inner().read().await.active_trajectory.is_some());
+    drop(ws);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let inner = supervisor.inner().read().await;
+    assert!(inner.active_trajectory.is_none(), "disconnect of the lease holder stops its motion");
+    assert!(inner.active_lease.is_none());
+}
+
+/// Same incident shape: the lease expires mid joint_move action. The action is failed
+/// with WATCHDOG, and neither the action bookkeeping nor the later socket close may
+/// cancel the park.
+#[tokio::test]
+async fn lease_expiry_mid_action_then_close_still_parks_to_idle() {
+    let supervisor = Arc::new(ArmSupervisor::new(sim_config(true)));
+    supervisor.set_torque(true).await.unwrap();
+    let addr = serve(supervisor.clone()).await;
+    let ws = ws_lease(addr).await;
+    {
+        let mut inner = supervisor.inner().write().await;
+        let epoch = inner.safety.epoch_id();
+        inner.jog_action(vec![1.0, 0.5], Some(2.0), Some(epoch), "joint_move").unwrap();
+    }
+    for _ in 0..5 { supervisor.tick(0.02).await; }
+    let obs = expire_lease(&supervisor).await;
+    assert_eq!(obs.action.as_ref().map(|a| a.state.as_str()), Some("failed"));
+    assert!(supervisor.inner().read().await.watchdog_park_deadline.is_some());
+    for _ in 0..3 { supervisor.tick(0.02).await; }
+    drop(ws);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(supervisor.inner().read().await.pending_normal_unload, "park cancelled");
+    for _ in 0..300 { supervisor.tick(0.05).await; }
+    let obs = supervisor.get_observation().await;
+    assert_eq!(obs.safety_state, SafetyState::Idle, "park completes");
+    assert!(!obs.is_torqued);
+}
