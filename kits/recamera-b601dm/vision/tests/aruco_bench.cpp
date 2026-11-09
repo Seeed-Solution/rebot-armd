@@ -621,6 +621,9 @@ int main(int argc, char** argv) {
     baseline.max_nmaxima = 10;
     baseline.max_line_fit_mse = 10.0f;
     baseline.apriltag_pose = true;
+    baseline.lazy_clusters = false;
+    baseline.reuse_buffers = false;
+    baseline.size_gate = false;
 
     if (no_filter) {
         baseline.filter.min_margin = baseline.filter.min_side_px = 0;
