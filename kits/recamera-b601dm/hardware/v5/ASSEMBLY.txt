@@ -1,0 +1,28 @@
+v5 enclosed holder — engineering fit-test draft
+
+Print body and top_bar separately. The four reCamera internal assembly holes
+are NOT used and are not reproduced in the holder.
+
+Retention: rear stop, front lower lip, front side guards, removable top bar.
+Remove top bar, lower camera into holder, insert square nuts from outer sides,
+then attach top bar using the two fasteners in PRINTED ears only.
+Clearance holes: 3.2 mm diameter. Side-open nut pockets: 5.8 mm along depth,
+2.6 mm height. Verify actual square nut and screw fit/length before tightening.
+Do not drive screws into the camera. Thin non-slip pads may take up the nominal
+0.3 mm clearance; do not force an interference fit against the enclosure.
+
+Camera is rolled 90 degrees relative to v4, while optical axis remains forward.
+CAN cover original -X side faces up, +/-Y sides face left/right. Rear-depth
+region remains open on these three faces. Image orientation may require
+software rotation. Do not install in the old v4 roll orientation.
+
+Validated: both parts one valid solid, camera/CAN-cover collision zero,
+original retained interface added/lost volume zero, full upward camera swept
+volume clear with lid removed; printed fastener axes clear. Left/right/upward
+connector keep-out boxes extending 20 mm are clear over rear depth 3.6..16.9 mm.
+Actual cable overmolds and bend radii have not been measured.
+
+Not validated: real fasteners, physical print fit, retention under arm loads,
+lens/FOV edge occlusion, and actual mating/installation of the robot clamp.
+Preview uses genuine CAN rear cover plus simplified full-camera envelope.
+This does not supersede the unresolved robot-clamp fit question.

@@ -47,4 +47,6 @@ samples). rebot-companion ports the same kinematics.
 ## License
 
 By contributing you agree that your contributions are licensed under the MIT License
-(see `LICENSE`). Files listed in `THIRD_PARTY_NOTICES.md` stay under their own licenses.
+(see `LICENSE`), except contributions to `kits/*/hardware/`, which are licensed under the
+licence in that directory (CERN-OHL-W-2.0 for `kits/recamera-b601dm/hardware/`). Files
+listed in `THIRD_PARTY_NOTICES.md` stay under their own licenses.

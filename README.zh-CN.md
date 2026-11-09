@@ -393,4 +393,4 @@ Playwright 脚本（`scripts/*_shots.mjs`、`scripts/ux_walkthrough.mjs`、`test
 
 ## 许可证
 
-MIT，见 [LICENSE](LICENSE)。第三方文件保留各自的许可证，列于 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)：JMuxer（MIT）和 reBot-DevArm URDF（CERN-OHL-W-2.0）。
+代码：MIT，见 [LICENSE](LICENSE)。套件硬件：[`kits/recamera-b601dm/hardware/`](kits/recamera-b601dm/hardware/) 中的相机支架 CAD 采用 CERN-OHL-W-2.0（单独的 [LICENSE](kits/recamera-b601dm/hardware/LICENSE)）。第三方文件保留各自的许可证，列于 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)：JMuxer（MIT）和 reBot-DevArm URDF（CERN-OHL-W-2.0）。

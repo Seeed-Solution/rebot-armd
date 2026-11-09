@@ -1,7 +1,9 @@
 # Third-party notices
 
-rebot-armd is licensed under the MIT License (see `LICENSE`). The files listed below come
-from other projects and stay under their original licenses.
+rebot-armd code is licensed under the MIT License (see `LICENSE`). The kit hardware in
+`kits/recamera-b601dm/hardware/` is licensed under CERN-OHL-W-2.0 (see that directory's
+`LICENSE`). The files listed below come from other projects and stay under their original
+licenses.
 
 ## JMuxer
 
@@ -54,6 +56,18 @@ DEALINGS IN THE SOFTWARE.
 - The URDF refers to mesh files (`package://reBot-DevArm_description_fixend/meshes/*.STL`)
   that are not included here; armd does not load meshes. They are available from the
   upstream repository under the same license.
+
+## reCamera mount CAD (kit hardware)
+
+- Files: `kits/recamera-b601dm/hardware/` (v5 and v7_tilt STEP/STL, previews, generator,
+  preview and validation scripts).
+- Derived from: `hardware/camera-mounts/b601-camera-mounts/D435_Gemini2_Mount.step` of
+  https://github.com/Seeed-Projects/reBot-DevArm; the clamp interface is copied from it.
+- License: CERN-OHL-W-2.0, full text in `kits/recamera-b601dm/hardware/LICENSE` (official
+  text from https://ohwr.org/cern_ohl_w_v2.txt). Not covered by the MIT License of this
+  repository.
+- The reference files the scripts read (`D435_Gemini2_Mount.step`, `B3_CAN.step`, the
+  reBot-DevArm MJCF and meshes) are not included; see the directory's `README.md`.
 
 ## Rust crates
 

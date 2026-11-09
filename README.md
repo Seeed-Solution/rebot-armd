@@ -540,6 +540,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Third-party files keep their own licenses, listed in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): JMuxer (MIT) and the reBot-DevArm URDF
-(CERN-OHL-W-2.0).
+Code: MIT, see [LICENSE](LICENSE). Kit hardware: the camera mount CAD in
+[`kits/recamera-b601dm/hardware/`](kits/recamera-b601dm/hardware/) is CERN-OHL-W-2.0
+(its own [LICENSE](kits/recamera-b601dm/hardware/LICENSE)). Third-party files keep their own
+licenses, listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): JMuxer (MIT) and the
+reBot-DevArm URDF (CERN-OHL-W-2.0).

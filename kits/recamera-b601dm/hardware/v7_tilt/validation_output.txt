@@ -1,0 +1,408 @@
+v7_tilt validation output, 2026-11-09T05:25Z
+Each run: timeout 600 uv run -q --python 3.11 --with build123d --with trimesh --with matplotlib --with scipy --with numpy --with manifold3d --with rtree python <script> <arg>
+
+##### validate_tilt.py (v5 baseline, 20, 25, 30) #####
+# timeout 600 uv run ... python validate_tilt.py v5
+=== TILT_DEG 0 (v5 STEP body + top bar) ===
+  -- A. B-rep checks (exact OCC booleans) --
+  body_solid_count: 1  body_valid: True
+  top_solid_count: 1  top_valid: True
+  interface_y_le_0_added_vs_reference_mm3: 0.000000
+  interface_y_le_0_lost_vs_reference_mm3: 0.000000
+  interface_y_le_0_added_vs_v5_body_mm3: 0.000000
+  interface_y_le_0_lost_vs_v5_body_mm3: 0.000000
+  body_camera_collision_mm3: 0.000000
+  top_camera_collision_mm3: 0.000000
+  body_CAN_collision_mm3: 0.000000
+  top_CAN_collision_mm3: 0.000000
+  top_body_overlap_mm3: 0.000000
+  top_hole_camera_collision_mm3: 0.000000
+  top_lift_along_tilted_axis_collision_mm3 (0.5,2,5,10,20 mm): [0.0, 0.0, 0.0, 0.0, 0.0]
+  top_bar_60mm_sweep_vs_body_mm3: 0.000000  vs_CAN_mm3: 0.000000
+  camera_insertion_path_max_collision_mm3: 0.000000
+  camera_90mm_insertion_sweep_vs_body_mm3: 0.000000
+  left_20mm_connector_keepout_collision_mm3: 0.000000
+  right_20mm_connector_keepout_collision_mm3: 0.000000
+  upper_20mm_connector_keepout_collision_mm3: 0.000000
+  retention_cradle_vs_v5_in_camera_frame_added_mm3: 0.000000
+  retention_cradle_vs_v5_in_camera_frame_lost_mm3: 0.000000
+  top_bar_vs_v5_in_camera_frame_symdiff_mm3: 0.000000
+  retention_region_volume_compared_mm3: new 21296.241 v5 21296.241
+  bottom_port_column_(tilted z -76.3..3.7)_body_material_mm3: 33.915 (material of bridge/interface below the opening, if any)
+  body_volume_mm3: 37983.837 (v5 37983.837)  top_volume_mm3: 4210.545 (v5 4210.545)
+  body_bbox: bbox: -27.073142639170012 <= x <= 28.115647175067, -20.86940774386004 <= y <= 44.869708451349005, -8.977528925596406 <= z <= 40.4236850155755
+  BREP_CHECKS: ALL PASS
+  [t=   3.8s] B-rep checks done
+  -- B. gripper clearance (openings [0, 25, 50] mm, sampling 0.5 mm + vertices, bbox prefilter 30 mm, exact refinement) --
+  body: watertight=True faces=3806
+  top_bar: watertight=True faces=524
+  camera_envelope: watertight=True faces=12
+  B3_CAN: watertight=True faces=9734
+  body_above_y0.5: watertight=True faces=1176
+  gripper meshes: pla7_green:watertight=False,pts=78665, cnc7:watertight=False,pts=68909, motor_7:watertight=False,pts=477780, pla_left:watertight=False,pts=83868, cnc_left:watertight=False,pts=41174, pla_right:watertight=False,pts=83868, cnc_right:watertight=False,pts=41174
+  contact body vs pla7_green opening=0mm: clearance=0.000 inside_pts=2617
+  contact body vs cnc7 opening=0mm: clearance=0.000 inside_pts=400
+  contact body vs motor_7 opening=0mm: clearance=0.003 inside_pts=366
+  RESULT body vs gripper (openings [0, 25, 50]): min_clearance_mm=0.000 (pla7_green@0mm) gripper_points_inside=3383
+  RESULT top_bar vs gripper (openings [0, 25, 50]): min_clearance_mm=>30 () gripper_points_inside=0
+  RESULT camera_envelope vs gripper (openings [0, 25, 50]): min_clearance_mm=11.563 (motor_7@0mm) gripper_points_inside=0
+  RESULT B3_CAN vs gripper (openings [0, 25, 50]): min_clearance_mm=11.563 (motor_7@0mm) gripper_points_inside=0
+  RESULT body_above_y0.5 vs gripper (openings [0, 25, 50]): min_clearance_mm=6.765 (motor_7@0mm) gripper_points_inside=0
+  [t= 130.6s] gripper clearance done
+  -- C. optics (pinhole, lens = centre of camera-envelope front face) --
+  lens_centre_gripper_mm: [-88.098, 0.455, 69.095]
+  optical_axis_gripper: [1.0, 0.0, 0.0]  pitch_below_horizontal_deg=-0.000
+  tip_from_lens_horizontal_deg_below: 38.107
+  tip_angle_to_axis_deg: 38.108 (vertical +38.107 below centre, horizontal +0.296)
+  half_vFOV 17: tip at 2.565 of half-height below centre -> OUTSIDE image (vertical/short axis)
+  half_vFOV 25: tip at 1.682 of half-height below centre -> OUTSIDE image (vertical/short axis)
+  finger_front_vertex opening=0mm: left x=-0.0 v=+38.20 h=+0.34 (v/17:2.574 v/25:1.687 h/40:+0.007); right x=-0.0 v=+38.20 h=+0.25 (v/17:2.574 v/25:1.687 h/40:+0.005)
+  finger_front_vertex opening=25mm: left x=0.0 v=+38.20 h=+16.16 (v/17:2.574 v/25:1.687 h/40:+0.345); right x=0.0 v=+38.20 h=-15.61 (v/17:2.574 v/25:1.687 h/40:-0.333)
+  finger_front_vertex opening=50mm: left x=0.0 v=+38.20 h=+29.84 (v/17:2.574 v/25:1.687 h/40:+0.684); right x=0.0 v=+38.20 h=-29.39 (v/17:2.574 v/25:1.687 h/40:-0.671)
+  line_of_sight_lens_to_tip vs body: clear (112.0 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs top_bar: clear (112.0 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs gripper@0mm: clear (112.0 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs gripper@25mm: clear (112.0 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs gripper@50mm: clear (112.0 mm, tip-end 1 mm excluded)
+  [t= 132.5s] optics done
+  -- D. FOV pyramid (exact mesh boolean, manifold3d) --
+  FOV_pyramid(+-25 vertical/short axis, +-40 horizontal/long axis, 250 mm) body_intrusion_mm3: 0.000000
+  FOV_pyramid(+-25 vertical/short axis, +-40 horizontal/long axis, 250 mm) top_bar_intrusion_mm3: 0.000000
+  FOV_margin_closest_body_or_top_point_deg: 41.600 (point v=58.62 h=81.60 deg, 3.00 mm ahead of lens plane; 0 of 15842 sampled points inside)
+  [t= 132.5s] FOV done
+[wall 136.92 s]
+[exit 0]
+
+# timeout 600 uv run ... python validate_tilt.py 20
+=== TILT_DEG 20 ===
+  -- A. B-rep checks (exact OCC booleans) --
+  body_solid_count: 1  body_valid: True
+  top_solid_count: 1  top_valid: True
+  interface_y_le_0_added_vs_reference_mm3: 0.000000
+  interface_y_le_0_lost_vs_reference_mm3: 0.000000
+  interface_y_le_0_added_vs_v5_body_mm3: 0.000000
+  interface_y_le_0_lost_vs_v5_body_mm3: 0.000000
+  body_camera_collision_mm3: 0.000000
+  top_camera_collision_mm3: 0.000000
+  body_CAN_collision_mm3: 0.000000
+  top_CAN_collision_mm3: 0.000000
+  top_body_overlap_mm3: 0.000000
+  top_hole_camera_collision_mm3: 0.000000
+  top_lift_along_tilted_axis_collision_mm3 (0.5,2,5,10,20 mm): [0.0, 0.0, 0.0, 0.0, 0.0]
+  top_bar_60mm_sweep_vs_body_mm3: 0.000000  vs_CAN_mm3: 0.000000
+  camera_insertion_path_max_collision_mm3: 0.000000
+  camera_90mm_insertion_sweep_vs_body_mm3: 0.000000
+  left_20mm_connector_keepout_collision_mm3: 0.000000
+  right_20mm_connector_keepout_collision_mm3: 0.000000
+  upper_20mm_connector_keepout_collision_mm3: 0.000000
+  retention_cradle_vs_v5_in_camera_frame_added_mm3: 0.000000
+  retention_cradle_vs_v5_in_camera_frame_lost_mm3: 0.000000
+  top_bar_vs_v5_in_camera_frame_symdiff_mm3: 0.000000
+  retention_region_volume_compared_mm3: new 21296.241 v5 21296.241
+  bottom_port_column_(tilted z -76.3..3.7)_body_material_mm3: 0.049 (material of bridge/interface below the opening, if any)
+  body_volume_mm3: 50435.300 (v5 37983.837)  top_volume_mm3: 4210.545 (v5 4210.545)
+  body_bbox: bbox: -26.946558126200962 <= x <= 28.312247476360124, -20.869407743865523 <= y <= 56.633006125748174, -8.494252598734224 <= z <= 49.92864218104519
+  BREP_CHECKS: ALL PASS
+  [t=   4.0s] B-rep checks done
+  -- B. gripper clearance (openings [0, 25, 50] mm, sampling 0.5 mm + vertices, bbox prefilter 30 mm, exact refinement) --
+  body: watertight=True faces=3802
+  top_bar: watertight=True faces=524
+  camera_envelope: watertight=True faces=12
+  B3_CAN: watertight=True faces=9734
+  body_above_y0.5: watertight=True faces=1172
+  gripper meshes: pla7_green:watertight=False,pts=78665, cnc7:watertight=False,pts=68909, motor_7:watertight=False,pts=477780, pla_left:watertight=False,pts=83868, cnc_left:watertight=False,pts=41174, pla_right:watertight=False,pts=83868, cnc_right:watertight=False,pts=41174
+  contact body vs pla7_green opening=0mm: clearance=0.000 inside_pts=2617
+  contact body vs cnc7 opening=0mm: clearance=0.000 inside_pts=400
+  contact body vs motor_7 opening=0mm: clearance=0.003 inside_pts=366
+  RESULT body vs gripper (openings [0, 25, 50]): min_clearance_mm=0.000 (pla7_green@0mm) gripper_points_inside=3383
+  RESULT top_bar vs gripper (openings [0, 25, 50]): min_clearance_mm=>30 () gripper_points_inside=0
+  RESULT camera_envelope vs gripper (openings [0, 25, 50]): min_clearance_mm=15.889 (pla7_green@0mm) gripper_points_inside=0
+  RESULT B3_CAN vs gripper (openings [0, 25, 50]): min_clearance_mm=24.522 (motor_7@0mm) gripper_points_inside=0
+  RESULT body_above_y0.5 vs gripper (openings [0, 25, 50]): min_clearance_mm=6.765 (motor_7@0mm) gripper_points_inside=0
+  [t= 145.2s] gripper clearance done
+  -- C. optics (pinhole, lens = centre of camera-envelope front face) --
+  lens_centre_gripper_mm: [-79.948, 0.455, 68.716]
+  optical_axis_gripper: [0.93969, 0.0, -0.34202]  pitch_below_horizontal_deg=20.000
+  tip_from_lens_horizontal_deg_below: 40.679
+  tip_angle_to_axis_deg: 20.681 (vertical +20.679 below centre, horizontal +0.264)
+  half_vFOV 17: tip at 1.235 of half-height below centre -> OUTSIDE image (vertical/short axis)
+  half_vFOV 25: tip at 0.809 of half-height below centre -> INSIDE image (vertical/short axis)
+  finger_front_vertex opening=0mm: left x=-0.0 v=+20.77 h=+0.31 (v/17:1.241 v/25:0.813 h/40:+0.006); right x=-0.0 v=+20.77 h=+0.22 (v/17:1.241 v/25:0.813 h/40:+0.005)
+  finger_front_vertex opening=25mm: left x=0.0 v=+20.77 h=+14.50 (v/17:1.241 v/25:0.813 h/40:+0.308); right x=0.0 v=+20.77 h=-14.00 (v/17:1.241 v/25:0.813 h/40:-0.297)
+  finger_front_vertex opening=50mm: left x=0.0 v=+20.77 h=+27.11 (v/17:1.241 v/25:0.813 h/40:+0.610); right x=0.0 v=+20.77 h=-26.69 (v/17:1.241 v/25:0.813 h/40:-0.599)
+  line_of_sight_lens_to_tip vs body: clear (105.4 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs top_bar: clear (105.4 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs gripper@0mm: clear (105.4 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs gripper@25mm: clear (105.4 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs gripper@50mm: clear (105.4 mm, tip-end 1 mm excluded)
+  [t= 147.3s] optics done
+  -- D. FOV pyramid (exact mesh boolean, manifold3d) --
+  FOV_pyramid(+-25 vertical/short axis, +-40 horizontal/long axis, 250 mm) body_intrusion_mm3: 0.000000
+  FOV_pyramid(+-25 vertical/short axis, +-40 horizontal/long axis, 250 mm) top_bar_intrusion_mm3: 0.000000
+  FOV_margin_closest_body_or_top_point_deg: 41.594 (point v=58.97 h=81.59 deg, 3.00 mm ahead of lens plane; 0 of 17296 sampled points inside)
+  [t= 147.4s] FOV done
+[wall 152.11 s]
+[exit 0]
+
+# timeout 600 uv run ... python validate_tilt.py 25
+=== TILT_DEG 25 ===
+  -- A. B-rep checks (exact OCC booleans) --
+  body_solid_count: 1  body_valid: True
+  top_solid_count: 1  top_valid: True
+  interface_y_le_0_added_vs_reference_mm3: 0.000000
+  interface_y_le_0_lost_vs_reference_mm3: 0.000000
+  interface_y_le_0_added_vs_v5_body_mm3: 0.000000
+  interface_y_le_0_lost_vs_v5_body_mm3: 0.000000
+  body_camera_collision_mm3: 0.000000
+  top_camera_collision_mm3: 0.000000
+  body_CAN_collision_mm3: 0.000000
+  top_CAN_collision_mm3: 0.000000
+  top_body_overlap_mm3: 0.000000
+  top_hole_camera_collision_mm3: 0.000000
+  top_lift_along_tilted_axis_collision_mm3 (0.5,2,5,10,20 mm): [0.0, 0.0, 0.0, 0.0, 0.0]
+  top_bar_60mm_sweep_vs_body_mm3: 0.000000  vs_CAN_mm3: 0.000000
+  camera_insertion_path_max_collision_mm3: 0.000000
+  camera_90mm_insertion_sweep_vs_body_mm3: 0.000000
+  left_20mm_connector_keepout_collision_mm3: 0.000000
+  right_20mm_connector_keepout_collision_mm3: 0.000000
+  upper_20mm_connector_keepout_collision_mm3: 0.000000
+  retention_cradle_vs_v5_in_camera_frame_added_mm3: 0.000000
+  retention_cradle_vs_v5_in_camera_frame_lost_mm3: 0.000000
+  top_bar_vs_v5_in_camera_frame_symdiff_mm3: 0.000000
+  retention_region_volume_compared_mm3: new 21296.241 v5 21296.241
+  bottom_port_column_(tilted z -76.3..3.7)_body_material_mm3: 0.000 (material of bridge/interface below the opening, if any)
+  body_volume_mm3: 53113.356 (v5 37983.837)  top_volume_mm3: 4210.545 (v5 4210.545)
+  body_bbox: bbox: -26.929933399905217 <= x <= 28.383545255485807, -20.869407743865523 <= y <= 58.702133823703775, -8.494252598734224 <= z <= 53.45914135290268
+  BREP_CHECKS: ALL PASS
+  [t=   5.1s] B-rep checks done
+  -- B. gripper clearance (openings [0, 25, 50] mm, sampling 0.5 mm + vertices, bbox prefilter 30 mm, exact refinement) --
+  body: watertight=True faces=3794
+  top_bar: watertight=True faces=524
+  camera_envelope: watertight=True faces=12
+  B3_CAN: watertight=True faces=9734
+  body_above_y0.5: watertight=True faces=1168
+  gripper meshes: pla7_green:watertight=False,pts=78665, cnc7:watertight=False,pts=68909, motor_7:watertight=False,pts=477780, pla_left:watertight=False,pts=83868, cnc_left:watertight=False,pts=41174, pla_right:watertight=False,pts=83868, cnc_right:watertight=False,pts=41174
+  contact body vs pla7_green opening=0mm: clearance=0.000 inside_pts=2617
+  contact body vs cnc7 opening=0mm: clearance=0.000 inside_pts=400
+  contact body vs motor_7 opening=0mm: clearance=0.003 inside_pts=366
+  RESULT body vs gripper (openings [0, 25, 50]): min_clearance_mm=0.000 (pla7_green@0mm) gripper_points_inside=3383
+  RESULT top_bar vs gripper (openings [0, 25, 50]): min_clearance_mm=>30 () gripper_points_inside=0
+  RESULT camera_envelope vs gripper (openings [0, 25, 50]): min_clearance_mm=16.021 (pla7_green@0mm) gripper_points_inside=0
+  RESULT B3_CAN vs gripper (openings [0, 25, 50]): min_clearance_mm=27.154 (cnc7@0mm) gripper_points_inside=0
+  RESULT body_above_y0.5 vs gripper (openings [0, 25, 50]): min_clearance_mm=7.121 (motor_7@0mm) gripper_points_inside=0
+  [t= 139.3s] gripper clearance done
+  -- C. optics (pinhole, lens = centre of camera-envelope front face) --
+  lens_centre_gripper_mm: [-77.97, 0.455, 68.18]
+  optical_axis_gripper: [0.90631, 0.0, -0.42262]  pitch_below_horizontal_deg=25.000
+  tip_from_lens_horizontal_deg_below: 41.167
+  tip_angle_to_axis_deg: 16.170 (vertical +16.168 below centre, horizontal +0.262)
+  half_vFOV 17: tip at 0.948 of half-height below centre -> INSIDE image (vertical/short axis)
+  half_vFOV 25: tip at 0.622 of half-height below centre -> INSIDE image (vertical/short axis)
+  finger_front_vertex opening=0mm: left x=-0.0 v=+16.26 h=+0.30 (v/17:0.954 v/25:0.626 h/40:+0.006); right x=-0.0 v=+16.26 h=+0.22 (v/17:0.954 v/25:0.626 h/40:+0.005)
+  finger_front_vertex opening=25mm: left x=0.0 v=+16.26 h=+14.38 (v/17:0.954 v/25:0.626 h/40:+0.306); right x=0.0 v=+16.26 h=-13.89 (v/17:0.954 v/25:0.626 h/40:-0.295)
+  finger_front_vertex opening=50mm: left x=0.0 v=+16.26 h=+26.91 (v/17:0.954 v/25:0.626 h/40:+0.605); right x=0.0 v=+16.26 h=-26.49 (v/17:0.954 v/25:0.626 h/40:-0.594)
+  line_of_sight_lens_to_tip vs body: clear (103.6 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs top_bar: clear (103.6 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs gripper@0mm: clear (103.6 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs gripper@25mm: clear (103.6 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs gripper@50mm: clear (103.6 mm, tip-end 1 mm excluded)
+  [t= 141.8s] optics done
+  -- D. FOV pyramid (exact mesh boolean, manifold3d) --
+  FOV_pyramid(+-25 vertical/short axis, +-40 horizontal/long axis, 250 mm) body_intrusion_mm3: 0.000000
+  FOV_pyramid(+-25 vertical/short axis, +-40 horizontal/long axis, 250 mm) top_bar_intrusion_mm3: 0.000000
+  FOV_margin_closest_body_or_top_point_deg: 41.594 (point v=52.77 h=81.59 deg, 3.00 mm ahead of lens plane; 0 of 17471 sampled points inside)
+  [t= 141.9s] FOV done
+[wall 146.65 s]
+[exit 0]
+
+# timeout 600 uv run ... python validate_tilt.py 30
+=== TILT_DEG 30 ===
+  -- A. B-rep checks (exact OCC booleans) --
+  body_solid_count: 1  body_valid: True
+  top_solid_count: 1  top_valid: True
+  interface_y_le_0_added_vs_reference_mm3: 0.000000
+  interface_y_le_0_lost_vs_reference_mm3: 0.000000
+  interface_y_le_0_added_vs_v5_body_mm3: 0.000000
+  interface_y_le_0_lost_vs_v5_body_mm3: 0.000000
+  body_camera_collision_mm3: 0.000000
+  top_camera_collision_mm3: 0.000000
+  body_CAN_collision_mm3: 0.000000
+  top_CAN_collision_mm3: 0.000000
+  top_body_overlap_mm3: 0.000000
+  top_hole_camera_collision_mm3: 0.000000
+  top_lift_along_tilted_axis_collision_mm3 (0.5,2,5,10,20 mm): [0.0, 0.0, 0.0, 0.0, 0.0]
+  top_bar_60mm_sweep_vs_body_mm3: 0.000000  vs_CAN_mm3: 0.000000
+  camera_insertion_path_max_collision_mm3: 0.000000
+  camera_90mm_insertion_sweep_vs_body_mm3: 0.000000
+  left_20mm_connector_keepout_collision_mm3: 0.000000
+  right_20mm_connector_keepout_collision_mm3: 0.000000
+  upper_20mm_connector_keepout_collision_mm3: 0.000000
+  retention_cradle_vs_v5_in_camera_frame_added_mm3: 0.000000
+  retention_cradle_vs_v5_in_camera_frame_lost_mm3: 0.000000
+  top_bar_vs_v5_in_camera_frame_symdiff_mm3: 0.000000
+  retention_region_volume_compared_mm3: new 21296.241 v5 21296.241
+  bottom_port_column_(tilted z -76.3..3.7)_body_material_mm3: 0.000 (material of bridge/interface below the opening, if any)
+  body_volume_mm3: 55712.682 (v5 37983.837)  top_volume_mm3: 4210.545 (v5 4210.545)
+  body_bbox: bbox: -26.909784183362515 <= x <= 28.4528589647531, -20.869407743865523 <= y <= 60.334124499406194, -8.494252598734224 <= z <= 56.85302220226588
+  BREP_CHECKS: ALL PASS
+  [t=   4.2s] B-rep checks done
+  -- B. gripper clearance (openings [0, 25, 50] mm, sampling 0.5 mm + vertices, bbox prefilter 30 mm, exact refinement) --
+  body: watertight=True faces=3798
+  top_bar: watertight=True faces=524
+  camera_envelope: watertight=True faces=12
+  B3_CAN: watertight=True faces=9734
+  body_above_y0.5: watertight=True faces=1172
+  gripper meshes: pla7_green:watertight=False,pts=78665, cnc7:watertight=False,pts=68909, motor_7:watertight=False,pts=477780, pla_left:watertight=False,pts=83868, cnc_left:watertight=False,pts=41174, pla_right:watertight=False,pts=83868, cnc_right:watertight=False,pts=41174
+  contact body vs pla7_green opening=0mm: clearance=0.000 inside_pts=2617
+  contact body vs cnc7 opening=0mm: clearance=0.000 inside_pts=400
+  contact body vs motor_7 opening=0mm: clearance=0.003 inside_pts=366
+  RESULT body vs gripper (openings [0, 25, 50]): min_clearance_mm=0.000 (pla7_green@0mm) gripper_points_inside=3383
+  RESULT top_bar vs gripper (openings [0, 25, 50]): min_clearance_mm=>30 () gripper_points_inside=0
+  RESULT camera_envelope vs gripper (openings [0, 25, 50]): min_clearance_mm=16.120 (pla7_green@0mm) gripper_points_inside=0
+  RESULT B3_CAN vs gripper (openings [0, 25, 50]): min_clearance_mm=28.898 (cnc7@0mm) gripper_points_inside=0
+  RESULT body_above_y0.5 vs gripper (openings [0, 25, 50]): min_clearance_mm=7.121 (motor_7@0mm) gripper_points_inside=0
+  [t= 145.1s] gripper clearance done
+  -- C. optics (pinhole, lens = centre of camera-envelope front face) --
+  lens_centre_gripper_mm: [-76.046, 0.455, 67.474]
+  optical_axis_gripper: [0.86603, 0.0, -0.5]  pitch_below_horizontal_deg=30.000
+  tip_from_lens_horizontal_deg_below: 41.581
+  tip_angle_to_axis_deg: 11.585 (vertical +11.582 below centre, horizontal +0.262)
+  half_vFOV 17: tip at 0.670 of half-height below centre -> INSIDE image (vertical/short axis)
+  half_vFOV 25: tip at 0.439 of half-height below centre -> INSIDE image (vertical/short axis)
+  finger_front_vertex opening=0mm: left x=-0.0 v=+11.68 h=+0.30 (v/17:0.676 v/25:0.443 h/40:+0.006); right x=-0.0 v=+11.68 h=+0.22 (v/17:0.676 v/25:0.443 h/40:+0.005)
+  finger_front_vertex opening=25mm: left x=0.0 v=+11.68 h=+14.36 (v/17:0.676 v/25:0.443 h/40:+0.305); right x=0.0 v=+11.68 h=-13.87 (v/17:0.676 v/25:0.443 h/40:-0.294)
+  finger_front_vertex opening=50mm: left x=0.0 v=+11.68 h=+26.87 (v/17:0.676 v/25:0.443 h/40:+0.604); right x=0.0 v=+11.68 h=-26.46 (v/17:0.676 v/25:0.443 h/40:-0.593)
+  line_of_sight_lens_to_tip vs body: clear (101.7 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs top_bar: clear (101.7 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs gripper@0mm: clear (101.7 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs gripper@25mm: clear (101.7 mm, tip-end 1 mm excluded)
+  line_of_sight_lens_to_tip vs gripper@50mm: clear (101.7 mm, tip-end 1 mm excluded)
+  [t= 146.3s] optics done
+  -- D. FOV pyramid (exact mesh boolean, manifold3d) --
+  FOV_pyramid(+-25 vertical/short axis, +-40 horizontal/long axis, 250 mm) body_intrusion_mm3: 0.000000
+  FOV_pyramid(+-25 vertical/short axis, +-40 horizontal/long axis, 250 mm) top_bar_intrusion_mm3: 0.000000
+  FOV_margin_closest_body_or_top_point_deg: 39.605 (point v=64.60 h=42.86 deg, 18.87 mm ahead of lens plane; 0 of 17858 sampled points inside)
+  [t= 146.4s] FOV done
+[wall 151.70 s]
+[exit 0]
+
+##### generate_recamera_mount.py (regeneration, 20, 25, 30) #####
+# timeout 600 uv run ... python generate_recamera_mount.py 20
+TILT_DEG: 20
+body.step: reCamera_B601_Mount_v7_tilt20_body.step
+body.stl: reCamera_B601_Mount_v7_tilt20_body.stl
+top_bar.step: reCamera_B601_Mount_v7_tilt20_top_bar.step
+top_bar.stl: reCamera_B601_Mount_v7_tilt20_top_bar.stl
+body_solid_count: 1  body_valid: True
+top_solid_count: 1  top_valid: True
+interface_y_le_0_added_vs_reference_mm3: 0.000000
+interface_y_le_0_lost_vs_reference_mm3: 0.000000
+interface_y_le_0_added_vs_v5_body_mm3: 0.000000
+interface_y_le_0_lost_vs_v5_body_mm3: 0.000000
+body_camera_collision_mm3: 0.000000
+top_camera_collision_mm3: 0.000000
+body_CAN_collision_mm3: 0.000000
+top_CAN_collision_mm3: 0.000000
+top_body_overlap_mm3: 0.000000
+top_hole_camera_collision_mm3: 0.000000
+top_lift_along_tilted_axis_collision_mm3 (0.5,2,5,10,20 mm): [0.0, 0.0, 0.0, 0.0, 0.0]
+top_bar_60mm_sweep_vs_body_mm3: 0.000000  vs_CAN_mm3: 0.000000
+camera_insertion_path_max_collision_mm3: 0.000000
+camera_90mm_insertion_sweep_vs_body_mm3: 0.000000
+left_20mm_connector_keepout_collision_mm3: 0.000000
+right_20mm_connector_keepout_collision_mm3: 0.000000
+upper_20mm_connector_keepout_collision_mm3: 0.000000
+retention_cradle_vs_v5_in_camera_frame_added_mm3: 0.000000
+retention_cradle_vs_v5_in_camera_frame_lost_mm3: 0.000000
+top_bar_vs_v5_in_camera_frame_symdiff_mm3: 0.000000
+retention_region_volume_compared_mm3: new 21296.241 v5 21296.241
+bottom_port_column_(tilted z -76.3..3.7)_body_material_mm3: 0.049 (material of bridge/interface below the opening, if any)
+body_volume_mm3: 50435.300 (v5 37983.837)  top_volume_mm3: 4210.545 (v5 4210.545)
+body_bbox: bbox: -26.946558126200962 <= x <= 28.312247476360124, -20.869407743865523 <= y <= 56.633006125748174, -8.494252598734224 <= z <= 49.92864218104519
+CHECKS: ALL PASS
+[exit 0]
+
+# timeout 600 uv run ... python generate_recamera_mount.py 25
+TILT_DEG: 25
+body.step: reCamera_B601_Mount_v7_tilt25_body.step
+body.stl: reCamera_B601_Mount_v7_tilt25_body.stl
+top_bar.step: reCamera_B601_Mount_v7_tilt25_top_bar.step
+top_bar.stl: reCamera_B601_Mount_v7_tilt25_top_bar.stl
+body_solid_count: 1  body_valid: True
+top_solid_count: 1  top_valid: True
+interface_y_le_0_added_vs_reference_mm3: 0.000000
+interface_y_le_0_lost_vs_reference_mm3: 0.000000
+interface_y_le_0_added_vs_v5_body_mm3: 0.000000
+interface_y_le_0_lost_vs_v5_body_mm3: 0.000000
+body_camera_collision_mm3: 0.000000
+top_camera_collision_mm3: 0.000000
+body_CAN_collision_mm3: 0.000000
+top_CAN_collision_mm3: 0.000000
+top_body_overlap_mm3: 0.000000
+top_hole_camera_collision_mm3: 0.000000
+top_lift_along_tilted_axis_collision_mm3 (0.5,2,5,10,20 mm): [0.0, 0.0, 0.0, 0.0, 0.0]
+top_bar_60mm_sweep_vs_body_mm3: 0.000000  vs_CAN_mm3: 0.000000
+camera_insertion_path_max_collision_mm3: 0.000000
+camera_90mm_insertion_sweep_vs_body_mm3: 0.000000
+left_20mm_connector_keepout_collision_mm3: 0.000000
+right_20mm_connector_keepout_collision_mm3: 0.000000
+upper_20mm_connector_keepout_collision_mm3: 0.000000
+retention_cradle_vs_v5_in_camera_frame_added_mm3: 0.000000
+retention_cradle_vs_v5_in_camera_frame_lost_mm3: 0.000000
+top_bar_vs_v5_in_camera_frame_symdiff_mm3: 0.000000
+retention_region_volume_compared_mm3: new 21296.241 v5 21296.241
+bottom_port_column_(tilted z -76.3..3.7)_body_material_mm3: 0.000 (material of bridge/interface below the opening, if any)
+body_volume_mm3: 53113.356 (v5 37983.837)  top_volume_mm3: 4210.545 (v5 4210.545)
+body_bbox: bbox: -26.929933399905217 <= x <= 28.383545255485807, -20.869407743865523 <= y <= 58.702133823703775, -8.494252598734224 <= z <= 53.45914135290268
+CHECKS: ALL PASS
+[exit 0]
+
+# timeout 600 uv run ... python generate_recamera_mount.py 30
+TILT_DEG: 30
+body.step: reCamera_B601_Mount_v7_tilt30_body.step
+body.stl: reCamera_B601_Mount_v7_tilt30_body.stl
+top_bar.step: reCamera_B601_Mount_v7_tilt30_top_bar.step
+top_bar.stl: reCamera_B601_Mount_v7_tilt30_top_bar.stl
+body_solid_count: 1  body_valid: True
+top_solid_count: 1  top_valid: True
+interface_y_le_0_added_vs_reference_mm3: 0.000000
+interface_y_le_0_lost_vs_reference_mm3: 0.000000
+interface_y_le_0_added_vs_v5_body_mm3: 0.000000
+interface_y_le_0_lost_vs_v5_body_mm3: 0.000000
+body_camera_collision_mm3: 0.000000
+top_camera_collision_mm3: 0.000000
+body_CAN_collision_mm3: 0.000000
+top_CAN_collision_mm3: 0.000000
+top_body_overlap_mm3: 0.000000
+top_hole_camera_collision_mm3: 0.000000
+top_lift_along_tilted_axis_collision_mm3 (0.5,2,5,10,20 mm): [0.0, 0.0, 0.0, 0.0, 0.0]
+top_bar_60mm_sweep_vs_body_mm3: 0.000000  vs_CAN_mm3: 0.000000
+camera_insertion_path_max_collision_mm3: 0.000000
+camera_90mm_insertion_sweep_vs_body_mm3: 0.000000
+left_20mm_connector_keepout_collision_mm3: 0.000000
+right_20mm_connector_keepout_collision_mm3: 0.000000
+upper_20mm_connector_keepout_collision_mm3: 0.000000
+retention_cradle_vs_v5_in_camera_frame_added_mm3: 0.000000
+retention_cradle_vs_v5_in_camera_frame_lost_mm3: 0.000000
+top_bar_vs_v5_in_camera_frame_symdiff_mm3: 0.000000
+retention_region_volume_compared_mm3: new 21296.241 v5 21296.241
+bottom_port_column_(tilted z -76.3..3.7)_body_material_mm3: 0.000 (material of bridge/interface below the opening, if any)
+body_volume_mm3: 55712.682 (v5 37983.837)  top_volume_mm3: 4210.545 (v5 4210.545)
+body_bbox: bbox: -26.909784183362515 <= x <= 28.4528589647531, -20.869407743865523 <= y <= 60.334124499406194, -8.494252598734224 <= z <= 56.85302220226588
+CHECKS: ALL PASS
+[exit 0]
+
+##### STL md5 before regeneration #####
+a3df795f4bde34c9bccb72e6b92d20b3  reCamera_B601_Mount_v7_tilt20_body.stl
+f25bbb466fd27763639e16342403c156  reCamera_B601_Mount_v7_tilt20_top_bar.stl
+4180ead4bd87a49aed201698d143315c  reCamera_B601_Mount_v7_tilt25_body.stl
+766c87c0bfa3658b486783da15dfd9a8  reCamera_B601_Mount_v7_tilt25_top_bar.stl
+e7dcc18d584611da1e41601b3a383529  reCamera_B601_Mount_v7_tilt30_body.stl
+8d8aef2cbf78dad89c3ce3bd132559b2  reCamera_B601_Mount_v7_tilt30_top_bar.stl
+##### STL md5 after regeneration #####
+a3df795f4bde34c9bccb72e6b92d20b3  reCamera_B601_Mount_v7_tilt20_body.stl
+f25bbb466fd27763639e16342403c156  reCamera_B601_Mount_v7_tilt20_top_bar.stl
+4180ead4bd87a49aed201698d143315c  reCamera_B601_Mount_v7_tilt25_body.stl
+766c87c0bfa3658b486783da15dfd9a8  reCamera_B601_Mount_v7_tilt25_top_bar.stl
+e7dcc18d584611da1e41601b3a383529  reCamera_B601_Mount_v7_tilt30_body.stl
+8d8aef2cbf78dad89c3ce3bd132559b2  reCamera_B601_Mount_v7_tilt30_top_bar.stl
