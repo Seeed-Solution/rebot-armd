@@ -7,7 +7,16 @@
 //   aruco_bench [--scenes N] [--reps N] [--check] [--variant baseline|tuned|both]
 //               [--wb N] [--cluster N] [--decimate F] [--sigma F] [--sharpen F] [--nmax N]
 //               [--refine 0|1] [--no-filter] [--sweep 1,1.5,2,...]
+//               [--rows "label:key=value,...;label:..."] [--check-same] [--pgm FILE]...
 //
+// --rows: one table row per variant (rv defaults plus the keys: decimate, lazy, reuse, gate, adaptive,
+// adaptive_side, roi, wb, refine); with --reps > 1 a scene is a static sequence, so the
+// frame-to-frame options (adaptive, roi) act from the second rep on; --first-rep-full scans
+// the first rep of every scene whole, as a trigger does (steady state after a scene change),
+// with the host stage split; --check-same fails when a row reports other markers or corners
+// than the first row (for changes that must not alter the result). --pgm (repeatable) runs
+// on 640x360 gray frames, e.g. saved from the device, instead of generated scenes (no
+// recall: there is no ground truth).
 // --sweep: one table row per quad_decimate value (rv defaults otherwise), see run_sweep();
 // with --check it fails when the default decimate loses more than 3 points of recall for
 // markers of 40 px and larger at normal contrast against the first value of the list, or
@@ -49,6 +58,7 @@ void* __wrap_realloc(void* p, size_t n) { ++g_allocs; return __real_realloc(p, n
 
 namespace {
 
+bool g_first_rep_full = false;  // --first-rep-full: the first rep of each scene is a full scan (a trigger)
 constexpr int kW = 640, kH = 360, kFrameW = 640, kFrameH = 640, kBandY = 140;
 
 struct Truth {
@@ -340,6 +350,7 @@ private:
 struct Stats {
     double mean_ms = 0, median_ms = 0, p90_ms = 0;
     double gray_ms = 0, detect_ms = 0, pose_ms = 0;  // means
+    rv::ArucoTiming stage_sum;                        // summed over frames (stage split)
     double allocs = 0;                                // heap calls per frame
     double corner_err_sum = 0, corner_err_max = 0;    // px, matched markers vs truth
     int truth = 0, found = 0, fp = 0;
@@ -363,12 +374,18 @@ Stats run_variant(const rv::ArucoConfig& cfg, const std::vector<Scene>& scenes, 
         for (int r = 0; r < reps; ++r) {
             const unsigned long a0 = g_allocs;
             const auto t0 = std::chrono::steady_clock::now();
-            stage.run(band, kW, kH, kFrameW * 3, out);
+            stage.run(band, kW, kH, kFrameW * 3, out, g_first_rep_full && r == 0);
             st.allocs += static_cast<double>(g_allocs - a0);
             times.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
             st.gray_ms += stage.last_timing().gray_ms;
             st.detect_ms += stage.last_timing().detect_ms;
             st.pose_ms += stage.last_timing().pose_ms;
+            const rv::ArucoTiming& lt = stage.last_timing();
+            rv::ArucoTiming& ss = st.stage_sum;
+            ss.gray_ms += lt.gray_ms, ss.decimate_ms += lt.decimate_ms, ss.threshold_ms += lt.threshold_ms;
+            ss.unionfind_ms += lt.unionfind_ms, ss.clusters_ms += lt.clusters_ms, ss.quad_fit_ms += lt.quad_fit_ms;
+            ss.refine_ms += lt.refine_ms, ss.decode_ms += lt.decode_ms, ss.detect_other_ms += lt.detect_other_ms;
+            ss.filter_ms += lt.filter_ms, ss.pose_ms += lt.pose_ms, ss.quads += lt.quads;
         }
         outs.push_back(out);
         std::vector<bool> used(out.size(), false);
@@ -411,6 +428,14 @@ Stats run_variant(const rv::ArucoConfig& cfg, const std::vector<Scene>& scenes, 
     st.detect_ms /= times.size();
     st.pose_ms /= times.size();
     st.allocs /= times.size();
+    {
+        rv::ArucoTiming& ss = st.stage_sum;
+        const double n = static_cast<double>(times.size());
+        for (double* v : {&ss.gray_ms, &ss.decimate_ms, &ss.threshold_ms, &ss.unionfind_ms, &ss.clusters_ms,
+                          &ss.quad_fit_ms, &ss.refine_ms, &ss.decode_ms, &ss.detect_other_ms, &ss.filter_ms, &ss.pose_ms})
+            *v /= n;
+        ss.quads = static_cast<int>(std::lround(ss.quads / n));
+    }
     st.median_ms = times[times.size() / 2];
     st.p90_ms = times[times.size() * 9 / 10];
     return st;
@@ -441,6 +466,8 @@ int sweep_bucket(double side) {
 }
 
 struct SweepRow {
+    std::string label;
+    rv::ArucoConfig cfg;
     double decimate = 0;
     Stats st;
     int truth[kSweepBuckets] = {}, found[kSweepBuckets] = {};
@@ -466,15 +493,16 @@ double recall_from(const SweepRow& r, int first_bucket) {
     return t ? static_cast<double>(f) / t : 1.0;
 }
 
-int run_sweep(const std::vector<double>& decimates, const rv::ArucoConfig& base, const std::vector<Scene>& scenes,
-              int reps, bool check) {
+// rows: (label, config); the first row is the reference of the pose columns.
+int run_sweep(const std::vector<std::pair<std::string, rv::ArucoConfig>>& variants, const std::vector<Scene>& scenes,
+              int reps, bool check, bool check_same) {
     std::vector<SweepRow> rows;
-    for (double d : decimates) {
-        rv::ArucoConfig c = base;
-        c.quad_decimate = d;
+    for (const auto& v : variants) {
         SweepRow r;
-        r.decimate = d;
-        r.st = run_variant(c, scenes, reps, r.outs, &r.match);
+        r.label = v.first;
+        r.cfg = v.second;
+        r.decimate = v.second.quad_decimate;
+        r.st = run_variant(v.second, scenes, reps, r.outs, &r.match);
         r.min_found_side = 1e9;
         for (size_t s = 0; s < scenes.size(); ++s) {
             for (size_t ti = 0; ti < scenes[s].truth.size(); ++ti) {
@@ -492,11 +520,11 @@ int run_sweep(const std::vector<double>& decimates, const rv::ArucoConfig& base,
         }
         rows.push_back(std::move(r));
     }
-    std::printf("\n| decimate | ms/frame mean | median | detect ms | recall | 14-20 px | 20-25 | 25-30 | 30-40 | 40-60 "
+    std::printf("\n| variant | decimate | ms/frame mean | median | detect ms | recall | 14-20 px | 20-25 | 25-30 | 30-40 | 40-60 "
                 "| 60-80 | >=80 | >=40 px contrast >=90 | >=40 px contrast <90 | smallest found | >=95%% from | false pos. | corner err px | vs %.1f: |dt| mm median / p95 / max "
                 "| rot deg median / p95 / max | rot > 5 deg |\n",
                 rows[0].decimate);
-    std::printf("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    std::printf("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     for (const SweepRow& r : rows) {
         // pose difference vs the first row for truths both find
         std::vector<double> dts, drs;
@@ -520,7 +548,7 @@ int run_sweep(const std::vector<double>& decimates, const rv::ArucoConfig& base,
         while (from > 0 && recall_from(r, from - 1) >= 0.95 &&
                (r.truth[from - 1] == 0 || static_cast<double>(r.found[from - 1]) / r.truth[from - 1] >= 0.95))
             --from;
-        std::printf("| %.1f | %.2f | %.2f | %.2f | %.1f%% |", r.decimate, r.st.mean_ms, r.st.median_ms, r.st.detect_ms,
+        std::printf("| %s | %.1f | %.2f | %.2f | %.2f | %.1f%% |", r.label.c_str(), r.decimate, r.st.mean_ms, r.st.median_ms, r.st.detect_ms,
                     100.0 * r.st.found / std::max(1, r.st.truth));
         for (int b = 0; b < kSweepBuckets; ++b)
             std::printf(" %d/%d |", r.found[b], r.truth[b]);
@@ -531,6 +559,40 @@ int run_sweep(const std::vector<double>& decimates, const rv::ArucoConfig& base,
                     from == kSweepBuckets ? "none" : (std::to_string(static_cast<int>(kSweepEdges[from])) + " px").c_str(),
                     r.st.fp, r.st.corner_err_sum / std::max(1, r.st.found), med(dts), p95(dts), mx(dts), med(drs),
                     p95(drs), mx(drs), flips, drs.size());
+    }
+    std::printf("\nHost stage split, mean ms per frame:\n\n| variant | gray | decimate | threshold | unionfind | clusters "
+                "| quad fit | refine | decode | other | filter | pose | quads | heap calls |\n"
+                "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    for (const SweepRow& r : rows) {
+        const rv::ArucoTiming& t = r.st.stage_sum;
+        std::printf("| %s | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f | %d | %.0f |\n",
+                    r.label.c_str(), t.gray_ms, t.decimate_ms, t.threshold_ms, t.unionfind_ms, t.clusters_ms,
+                    t.quad_fit_ms, t.refine_ms, t.decode_ms, t.detect_other_ms, t.filter_ms, t.pose_ms, t.quads,
+                    r.st.allocs);
+    }
+    if (check_same) {
+        // every row must report the markers of the first row, with the same corners
+        int diff = 0;
+        for (size_t i = 1; i < rows.size(); ++i) {
+            for (size_t sc = 0; sc < scenes.size(); ++sc) {
+                const auto& a = rows[0].outs[sc];
+                const auto& b = rows[i].outs[sc];
+                bool same = a.size() == b.size();
+                for (const auto& ma : a) {
+                    bool hit = false;
+                    for (const auto& mb : b) {
+                        double dc = 0;
+                        for (int k = 0; k < 4; ++k) dc = std::max(dc, std::hypot(ma.p[k][0] - mb.p[k][0], ma.p[k][1] - mb.p[k][1]));
+                        hit = hit || (ma.id == mb.id && dc < 1e-6);
+                    }
+                    same = same && hit;
+                }
+                diff += same ? 0 : 1;
+            }
+            std::printf("%s: %s: %d of %zu scenes report other markers or corners than %s\n", diff ? "FAIL" : "OK",
+                        rows[i].label.c_str(), diff, scenes.size(), rows[0].label.c_str());
+        }
+        if (diff) return 1;
     }
     if (!check) return 0;
     // The default decimate (rv::ArucoConfig) must keep, against the first value of the list,
@@ -570,6 +632,9 @@ int main(int argc, char** argv) {
     bool custom = false;
     bool no_filter = false;  // diagnostics: count raw detections (margin/side filter off)
     std::vector<double> sweep;  // --sweep 1,1.5,2: one table row per quad_decimate
+    std::vector<std::pair<std::string, rv::ArucoConfig>> rows;  // --rows
+    bool check_same = false;
+    std::vector<std::string> pgms;  // --pgm: real 640x360 gray frames instead of the generator
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* {
@@ -591,6 +656,45 @@ int main(int argc, char** argv) {
         else if (a == "--sigma") tuned.quad_sigma = std::atof(next()), custom = true;
         else if (a == "--refine") tuned.refine_edges = std::atoi(next()) != 0, custom = true;
         else if (a == "--no-filter") no_filter = true;
+        else if (a == "--check-same") check_same = true;
+        else if (a == "--first-rep-full") g_first_rep_full = true;
+        else if (a == "--pgm") pgms.push_back(next());
+        else if (a == "--rows") {
+            // "label:key=value,key=value;label2:..." on top of the rv defaults
+            const std::string list = next();
+            for (size_t pos = 0; pos < list.size();) {
+                const size_t semi = std::min(list.find(';', pos), list.size());
+                const std::string row = list.substr(pos, semi - pos);
+                pos = semi + 1;
+                const size_t colon = row.find(':');
+                rv::ArucoConfig c;
+                const std::string label = row.substr(0, colon);
+                std::string kvs = colon == std::string::npos ? "" : row.substr(colon + 1);
+                for (size_t q = 0; q < kvs.size();) {
+                    const size_t comma = std::min(kvs.find(',', q), kvs.size());
+                    const std::string kv = kvs.substr(q, comma - q);
+                    q = comma + 1;
+                    const size_t eq = kv.find('=');
+                    if (eq == std::string::npos) continue;
+                    const std::string k = kv.substr(0, eq);
+                    const double v = std::atof(kv.c_str() + eq + 1);
+                    if (k == "decimate") c.quad_decimate = v;
+                    else if (k == "lazy") c.lazy_clusters = v != 0;
+                    else if (k == "reuse") c.reuse_buffers = v != 0;
+                    else if (k == "gate") c.size_gate = v != 0;
+                    else if (k == "adaptive") c.adaptive_decimate = v;
+                    else if (k == "adaptive_side") c.adaptive_min_side_px = v;
+                    else if (k == "roi") c.roi_tracking = v != 0;
+                    else if (k == "wb") c.min_white_black_diff = static_cast<int>(v);
+                    else if (k == "refine") c.refine_edges = v != 0;
+                    else {
+                        std::fprintf(stderr, "--rows: unknown key %s\n", k.c_str());
+                        return 2;
+                    }
+                }
+                rows.emplace_back(label, c);
+            }
+        }
         else if (a == "--sweep") {
             std::string list = next();
             for (size_t pos = 0; pos <= list.size();) {
@@ -633,11 +737,50 @@ int main(int argc, char** argv) {
     SceneGen gen(20261109u);
     std::vector<Scene> scenes;
     scenes.reserve(scenes_n);
-    for (int i = 0; i < scenes_n; ++i) scenes.push_back(gen.make());
+    if (pgms.empty()) {
+        for (int i = 0; i < scenes_n; ++i) scenes.push_back(gen.make());
+    } else {
+        // gray -> R = G = B (the stage's fixpoint conversion maps it back exactly), no truth
+        for (const std::string& path : pgms) {
+            FILE* f = std::fopen(path.c_str(), "rb");
+            int w = 0, h = 0, mx = 0;
+            if (!f || std::fscanf(f, "P5 %d %d %d", &w, &h, &mx) != 3 || w != kW || h != kH || mx != 255) {
+                std::fprintf(stderr, "%s: need a binary 640x360 PGM\n", path.c_str());
+                return 2;
+            }
+            std::fgetc(f);
+            std::vector<uint8_t> g(static_cast<size_t>(kW) * kH);
+            const size_t got = std::fread(g.data(), 1, g.size(), f);
+            std::fclose(f);
+            if (got != g.size()) return 2;
+            Scene sc;
+            sc.rgb.assign(static_cast<size_t>(kFrameW) * kFrameH * 3, 0);
+            for (int y = 0; y < kH; ++y)
+                for (int x = 0; x < kW; ++x)
+                    for (int c = 0; c < 3; ++c)
+                        sc.rgb[(static_cast<size_t>(y + kBandY) * kFrameW + x) * 3 + c] = g[y * kW + x];
+            scenes.push_back(std::move(sc));
+        }
+        scenes_n = static_cast<int>(scenes.size());
+    }
     std::printf("%d scenes 640x360 (stride %d), %d reps each, filter margin>=%.0f side>=%.0fpx\n", scenes_n,
                 kFrameW * 3, reps, baseline.filter.min_margin, baseline.filter.min_side_px);
 
-    if (!sweep.empty()) return run_sweep(sweep, tuned, scenes, reps, check);
+    if (!sweep.empty()) {
+        for (double d : sweep) {
+            rv::ArucoConfig c = tuned;
+            c.quad_decimate = d;
+            char label[32];
+            std::snprintf(label, sizeof(label), "decimate %.1f", d);
+            rows.emplace_back(label, c);
+        }
+        return run_sweep(rows, scenes, reps, check, check_same);
+    }
+    if (!rows.empty()) {
+        if (no_filter)
+            for (auto& r : rows) r.second.filter.min_margin = r.second.filter.min_side_px = 0;
+        return run_sweep(rows, scenes, reps, false, check_same);
+    }
 
     Stats b, t;
     std::vector<std::vector<rv::MarkerOut>> bo, to;

@@ -78,4 +78,8 @@ if(SSCMA_ROOT AND EXISTS ${SSCMA_ROOT}/components/apriltag/apriltag.h)
     add_test(NAME aruco_bench COMMAND aruco_bench --scenes 200 --reps 1 --check)
     # quad_decimate default vs no decimation (recall >= 40 px, corner error)
     add_test(NAME aruco_decimate COMMAND aruco_bench --scenes 500 --reps 1 --sweep 1,2 --check)
+    # apriltag_patched lazy_clusters + reuse_buffers report the same markers and corners
+    # as the upstream code paths (two reps: the second runs on reused buffers)
+    add_test(NAME aruco_same COMMAND aruco_bench --scenes 200 --reps 2
+             --rows "upstream:lazy=0,reuse=0,gate=0;lazy+reuse:lazy=1,reuse=1,gate=0" --check-same)
 endif()
