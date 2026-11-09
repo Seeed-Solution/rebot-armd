@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use crate::safety::SafetyState;
-use crate::driver::{DriverCapabilities, EnableState};
+use crate::driver::{DriverCapabilities, DriverRangeCheck, EnableState};
 
 /// Limits for a single joint
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -568,6 +568,10 @@ pub struct ArmObservation {
     pub control_mode: ControlMode,
     #[serde(default)]
     pub gravity_comp: GravityCompObservation,
+    /// Startup check of the motors' mapping ranges (Damiao); null when the driver has
+    /// no such check or it has not run.
+    #[serde(default)]
+    pub driver_range_check: Option<DriverRangeCheck>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

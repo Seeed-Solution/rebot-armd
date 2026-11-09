@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use crate::driver::{EnableState, JointMode, JointTarget};
+use crate::driver::{EnableState, JointMode, JointTarget, RangeCheckStatus};
 use crate::model::{GravityCompExit, GravityCompObservation, GravityCompPolicy, ModeReason};
 use crate::motion::MotionError;
 use crate::safety::{FaultReason, SafetyError, SafetyState};
@@ -145,6 +145,14 @@ impl SupervisorInner {
     pub fn gravity_comp_blocker(&self) -> Option<ModeReason> {
         if let Err(r) = self.gravity_comp_support() { return Some(r); }
         if self.gravity_comp.is_some() { return None; }
+        // MIT torque commands are only as right as the mapping ranges: require the
+        // startup range check to have passed when the driver ran one.
+        let check = self.driver.as_ref().and_then(|d| d.lock().ok().and_then(|drv| drv.range_check()));
+        match check.as_ref().map(|c| c.status) {
+            Some(RangeCheckStatus::Mismatch) => return Some(reason("DRIVER_RANGE_MISMATCH", check.map(|c| c.message).unwrap_or_default())),
+            Some(RangeCheckStatus::Unverified) => return Some(reason("DRIVER_RANGE_UNVERIFIED", check.map(|c| c.message).unwrap_or_default())),
+            _ => {}
+        }
         let policy = self.gravity_comp_policy()?;
         if self.e_stop_latched.load(std::sync::atomic::Ordering::SeqCst) || self.safety.state() == &SafetyState::EStop {
             return Some(reason("ESTOP_ACTIVE", "E-stop is latched"));

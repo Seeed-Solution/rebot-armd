@@ -381,6 +381,7 @@ impl SupervisorInner {
             previous_action: self.previous_action.as_ref().filter(|(_, until)| timestamp < *until).map(|(a, _)| a.clone()),
             control_mode: if self.gravity_comp.is_some() { crate::model::ControlMode::GravityComp } else { crate::model::ControlMode::Position },
             gravity_comp: self.gravity_comp_observation(),
+            driver_range_check: self.driver.as_ref().and_then(|d| d.lock().ok().and_then(|drv| drv.range_check())),
         }
     }
 

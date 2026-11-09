@@ -156,6 +156,47 @@ pub trait ArmDriver: Send {
 
     /// At least one joint is in an unconfirmed control mode after a failed switch.
     fn joint_modes_uncertain(&self) -> bool { false }
+
+    /// Result of the startup check of the motors' mapping ranges against the
+    /// configured ones; None when the driver has no such check or it has not run.
+    fn range_check(&self) -> Option<DriverRangeCheck> { None }
+}
+
+/// Outcome of a mapping-range check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RangeCheckStatus {
+    /// Every motor answered and its ranges equal the configured ones.
+    Passed,
+    /// At least one motor reports a different range: arming is refused.
+    Mismatch,
+    /// At least one motor did not answer: the configured ranges are used unverified.
+    Unverified,
+}
+
+/// Registers read from one motor by the range check.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JointRangeReading {
+    /// 1-based joint number.
+    pub joint: usize,
+    pub motor_id: u16,
+    pub status: RangeCheckStatus,
+    /// CTRL_MODE register (1 = MIT, 2 = POS_VEL); None without a reply.
+    pub ctrl_mode: Option<u32>,
+    /// PMAX / VMAX / TMAX read from the motor; None without a reply.
+    pub reported: Option<[f32; 3]>,
+    /// PMAX / VMAX / TMAX the driver decodes and encodes this joint with.
+    pub configured: [f32; 3],
+}
+
+/// Startup check of the motors' mapping ranges (published as `driver_range_check`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DriverRangeCheck {
+    pub status: RangeCheckStatus,
+    pub message: String,
+    pub joints: Vec<JointRangeReading>,
+    /// Time the check took (ms).
+    pub duration_ms: u64,
 }
 
 /// Output mode of one joint on drivers that can switch at runtime.
@@ -584,10 +625,15 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     mit_limits_verified: Vec<bool>,
     /// Register replies seen by `read_joint_states` since the last clear.
     register_replies: Vec<damiao::RegisterReply>,
+    /// Last mapping-range check (`check_mapping_ranges`); None = not run.
+    range_check: Option<DriverRangeCheck>,
 }
 
 /// Time allowed for register replies (mode switch, range readback).
 const REGISTER_REPLY_TIMEOUT: Duration = Duration::from_millis(50);
+/// Time allowed per motor for the four register replies of the startup range check
+/// (7 silent motors: 140 ms).
+const RANGE_CHECK_REPLY_TIMEOUT: Duration = Duration::from_millis(20);
 
 impl<C: CanTransport> DamiaoArmDriver<C> {
     pub fn new(can: C, motor_ids: Vec<u16>) -> Self {
@@ -616,6 +662,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             joint_modes: vec![Some(DamiaoControlMode::PosVel); dof],
             mit_limits_verified: vec![false; dof],
             register_replies: Vec::new(),
+            range_check: None,
         }
     }
 
@@ -636,6 +683,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
     pub fn with_limits(mut self, limits: DamiaoLimits) -> Self {
         self.limits.fill(limits);
         self.mit_limits_verified.fill(false);
+        self.range_check = None;
         self
     }
 
@@ -646,7 +694,72 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
         self.limits = limits;
         self.mit_limits_verified.fill(false);
+        self.range_check = None;
         Ok(self)
+    }
+
+    /// Read CTRL_MODE, PMAX, VMAX and TMAX (registers 10, 21-23) from every motor and
+    /// compare the ranges with the configured ones. Register reads do not change the
+    /// enable state or the targets, so this is safe with the motors disabled; it sends
+    /// no enable frame. A mismatch makes `set_torque(true)` refuse to arm. A motor that
+    /// does not answer leaves the check `Unverified`: the configured ranges are used
+    /// and gravity compensation stays refused. A joint whose CTRL_MODE is not the base
+    /// mode is marked unconfirmed, so the enable handshake writes the base mode first.
+    pub fn check_mapping_ranges(&mut self) -> &DriverRangeCheck {
+        const RIDS: [u8; 4] = [damiao::RID_CTRL_MODE, damiao::RID_PMAX, damiao::RID_VMAX, damiao::RID_TMAX];
+        let start = Instant::now();
+        let base = Self::mode_value(self.control_mode);
+        let mut joints = Vec::with_capacity(self.motor_ids.len());
+        for i in 0..self.motor_ids.len() {
+            let id = self.motor_ids[i];
+            self.register_replies.clear();
+            let sent = RIDS.iter().all(|&rid| self.transmit_with_retry(&damiao::build_read_register_frame(id, rid)).is_ok());
+            let _ = self.can.flush();
+            let expected: Vec<(usize, bool, u8)> = RIDS.iter().map(|&rid| (i, false, rid)).collect();
+            let replies = if sent { self.await_register_replies_for(&expected, RANGE_CHECK_REPLY_TIMEOUT) } else { vec![None; RIDS.len()] };
+            let l = self.limits[i];
+            let configured = [l.p_max, l.v_max, l.t_max];
+            let ctrl_mode = replies[0].map(|r| r.as_u32());
+            let reported = match (replies[1], replies[2], replies[3]) {
+                (Some(p), Some(v), Some(t)) => Some([p.as_f32(), v.as_f32(), t.as_f32()]),
+                _ => None,
+            };
+            let status = match reported {
+                None => RangeCheckStatus::Unverified,
+                Some(r) if Self::ranges_match(&r, &configured) => RangeCheckStatus::Passed,
+                Some(_) => RangeCheckStatus::Mismatch,
+            };
+            self.mit_limits_verified[i] = status == RangeCheckStatus::Passed;
+            if ctrl_mode.is_some_and(|m| m != base) {
+                tracing::warn!("Damiao joint {} (CAN ID 0x{:X}) is in CTRL_MODE {}; the base mode {} is restored before enable",
+                    i + 1, id, ctrl_mode.unwrap_or(0), base);
+                self.joint_modes[i] = None;
+            }
+            joints.push(JointRangeReading { joint: i + 1, motor_id: id, status, ctrl_mode, reported, configured });
+        }
+        let fmt = |v: &[f32; 3]| format!("{:.3}/{:.3}/{:.3}", v[0], v[1], v[2]);
+        let mismatched: Vec<String> = joints.iter().filter(|j| j.status == RangeCheckStatus::Mismatch)
+            .map(|j| format!("J{} reports PMAX/VMAX/TMAX {} (configured {})", j.joint, fmt(&j.reported.unwrap_or_default()), fmt(&j.configured))).collect();
+        let silent: Vec<usize> = joints.iter().filter(|j| j.status == RangeCheckStatus::Unverified).map(|j| j.joint).collect();
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let (status, message) = if !mismatched.is_empty() {
+            let m = format!("Damiao mapping range mismatch: {}; arming refused until damiao_ranges matches the motors", mismatched.join("; "));
+            tracing::error!("{m}");
+            (RangeCheckStatus::Mismatch, m)
+        } else if !silent.is_empty() {
+            let m = format!("Damiao joints {silent:?} did not answer the range read; using the configured ranges unverified");
+            tracing::warn!("{m}");
+            (RangeCheckStatus::Unverified, m)
+        } else {
+            let m = format!("Damiao mapping ranges of {} motors match the configuration", joints.len());
+            tracing::info!("{m} ({duration_ms} ms)");
+            (RangeCheckStatus::Passed, m)
+        };
+        self.range_check.insert(DriverRangeCheck { status, message, joints, duration_ms })
+    }
+
+    fn ranges_match(got: &[f32; 3], want: &[f32; 3]) -> bool {
+        got.iter().zip(want).all(|(g, w)| g.is_finite() && (g - w).abs() <= 0.01 + w.abs() * 1e-3)
     }
 
     /// Mapping range used for each joint.
@@ -696,6 +809,10 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
 
     /// Poll feedback until every `(joint, write, rid)` has a reply or the timeout passes.
     fn await_register_replies(&mut self, expected: &[(usize, bool, u8)]) -> Vec<Option<damiao::RegisterReply>> {
+        self.await_register_replies_for(expected, REGISTER_REPLY_TIMEOUT)
+    }
+
+    fn await_register_replies_for(&mut self, expected: &[(usize, bool, u8)], timeout: Duration) -> Vec<Option<damiao::RegisterReply>> {
         let start = Instant::now();
         loop {
             let _ = self.read_joint_states();
@@ -704,7 +821,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                 self.register_replies.iter().rev().copied()
                     .find(|r| r.motor_id == id && r.write == write && r.rid == rid)
             }).collect();
-            if found.iter().all(Option::is_some) || start.elapsed() >= REGISTER_REPLY_TIMEOUT {
+            if found.iter().all(Option::is_some) || start.elapsed() >= timeout {
                 return found;
             }
             std::thread::sleep(Duration::from_micros(500));
@@ -732,8 +849,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
                     "Joint {} (CAN ID 0x{:X}) did not answer the PMAX/VMAX/TMAX register read", i + 1, self.motor_ids[i])));
             }
             let got: Vec<f32> = got.into_iter().flatten().collect();
-            let matches = got.iter().zip(&want).all(|(g, w)| g.is_finite() && (g - w).abs() <= 0.01 + w.abs() * 1e-3);
-            if !matches {
+            if !Self::ranges_match(&[got[0], got[1], got[2]], &want) {
                 return Err(ArmDriverError::HardwareFault(format!(
                     "Joint {} (CAN ID 0x{:X}) reports PMAX {:.3} VMAX {:.3} TMAX {:.3}; the driver maps MIT frames with {:.3} / {:.3} / {:.3}",
                     i + 1, self.motor_ids[i], got[0], got[1], got[2], want[0], want[1], want[2])));
@@ -944,6 +1060,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         self.joint_modes.iter().any(Option::is_none)
     }
 
+    fn range_check(&self) -> Option<DriverRangeCheck> { self.range_check.clone() }
+
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
             return false;
@@ -1066,6 +1184,17 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 && self.motor_status.iter().all(|&st| st == 1)
             {
                 return Ok(());
+            }
+
+            // A motor that did not answer the startup range read gets another (read-only)
+            // try before each enable; a range mismatch refuses arming.
+            if self.range_check.as_ref().is_some_and(|c| c.status == RangeCheckStatus::Unverified) {
+                self.check_mapping_ranges();
+            }
+            if let Some(check) = self.range_check.as_ref().filter(|c| c.status == RangeCheckStatus::Mismatch) {
+                self.is_enabled = false;
+                self.pending_rearm = true;
+                return Err(ArmDriverError::HardwareFault(check.message.clone()));
             }
 
             self.is_enabling = true;

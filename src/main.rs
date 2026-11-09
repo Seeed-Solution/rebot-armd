@@ -159,6 +159,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(limits) = damiao_limits {
                         driver = driver.with_joint_limits(limits)?;
                     }
+                    // Read-only register check before anything can enable the motors.
+                    driver.check_mapping_ranges();
                     supervisor.set_driver(Box::new(driver)).await;
                 } else {
                     supervisor

@@ -58,6 +58,24 @@ When enable confirmation is unavailable or remains `Unknown`, automatic disable,
 - 笛卡尔工作空间（需 `workspace` 与 `kinematics`，仅 7 轴）：end_link 原点、夹爪包络 8 个角点及可选相机点须高于 `floor_z_m`、位于包围盒内且距肩轴不超过 `max_reach_m`。servo 目标或 jog / home / 预设轨迹的 21 个采样点越界且比起点更差时返回 `422 WORKSPACE_VIOLATION`；从越界位姿向外移动允许。收纳不受限，只记日志。schema 公开 `workspace` 与 `camera_mount`。未配置这些字段的 `--config` profile 不做检查，启动时告警。
 - 动作接口见 `docs/agent_action_api.md`。动作运行时 servo 帧返回 `409 MOTION_BUSY`；动作路径在滞后超过 0.38 rad 时降速，0.45 rad 持续 1 s 结束为 `TRACKING_STALL`。
 
+## Damiao mapping ranges / 达妙电机映射范围
+
+Damiao motors map the 16-bit position and 12-bit velocity / torque fields of feedback and MIT frames onto ±PMAX, ±VMAX and ±TMAX (registers 21–23). The B601-DM motors report (read 2026-11-09, request `[id, 0, 0x33, rid, 0, 0, 0, 0]` on `0x7FF`, reply `[id, 0, 0x33, rid, value LE]` on `0x10 + id`): J1–J3 CTRL_MODE 2, PMAX 12.5, VMAX 10, TMAX 28; J4–J7 CTRL_MODE 2, PMAX 12.5, VMAX 30, TMAX 10. The rebot-dm profile sets these as `damiao_ranges`; feedback is decoded and MIT frames are encoded per joint. Before this, every motor was decoded with 12.5 / 30 / 18: J1–J3 velocity read 3× the real value, J1–J3 torque 0.643× and J4–J7 torque 1.8×. Thresholds tuned on those readings were converted (table below).
+
+- **Startup range check.** When `armd` mounts the rebot-dm driver it reads registers 10, 21, 22 and 23 from each motor before anything can enable them (register reads do not change the enable state; no enable frame is sent). Up to 20 ms per motor: about 7 × (4 frames + reply) when all answer, at most 140 ms with all seven silent. The result is published in every observation as `driver_range_check` (`status` `passed` | `mismatch` | `unverified`, `message`, `duration_ms`, and per joint `joint`, `motor_id`, `status`, `ctrl_mode`, `reported` [PMAX, VMAX, TMAX] or null, `configured`).
+  - `mismatch`: a motor reports a different range. Logged as an error; every enable (`/api/v1/torque`, arm) fails with a hardware fault naming the joints until the profile's `damiao_ranges` matches the motors and `armd` is restarted.
+  - `unverified`: a motor did not answer. Logged as a warning; the configured ranges are used. The check is read again before each enable and becomes `passed` (or `mismatch`) once every motor answers.
+  - A joint whose CTRL_MODE is not POS_VEL (left in MIT by an interrupted session) is marked unconfirmed; the enable handshake writes POS_VEL to it first.
+  - Gravity compensation is refused with `DRIVER_RANGE_MISMATCH` / `DRIVER_RANGE_UNVERIFIED` unless the check passed. The MIT range readback before the first switch to MIT is skipped for joints the startup check verified.
+
+达妙电机把反馈帧与 MIT 帧中 16 位位置、12 位速度 / 力矩字段映射到 ±PMAX、±VMAX、±TMAX（21–23 号寄存器）。B601-DM 各电机读出的值（2026-11-09；请求为 `0x7FF` 上的 `[id, 0, 0x33, rid, 0, 0, 0, 0]`，应答为 `0x10 + id` 上的 `[id, 0, 0x33, rid, 值 小端]`）：J1–J3 CTRL_MODE 2、PMAX 12.5、VMAX 10、TMAX 28；J4–J7 CTRL_MODE 2、PMAX 12.5、VMAX 30、TMAX 10。rebot-dm profile 把它们写在 `damiao_ranges` 中，反馈解码与 MIT 编码按关节使用各自范围。此前所有电机都按 12.5 / 30 / 18 解码：J1–J3 速度读数为实际值的 3 倍，J1–J3 力矩为 0.643 倍，J4–J7 力矩为 1.8 倍。基于这些读数整定的阈值已换算（见下表）。
+
+- **启动量程检查**：`armd` 挂载 rebot-dm 驱动时，在任何使能之前读取每个电机的 10、21、22、23 号寄存器（读寄存器不改变使能状态，不发送使能帧）。每个电机最多等 20 ms：全部应答时约为 7 ×（4 帧 + 应答），七个电机都不应答时最多 140 ms。结果在每帧观测中以 `driver_range_check` 发布（`status` 为 `passed` | `mismatch` | `unverified`，另有 `message`、`duration_ms`，以及每个关节的 `joint`、`motor_id`、`status`、`ctrl_mode`、`reported` [PMAX, VMAX, TMAX] 或 null、`configured`）。
+  - `mismatch`：有电机报告的范围不同。记录 error 日志；在 profile 的 `damiao_ranges` 与电机一致并重启 `armd` 之前，每次使能（`/api/v1/torque`、arm）都以注明关节的硬件故障失败。
+  - `unverified`：有电机未应答。记录 warning 日志，使用配置的范围。每次使能前重新读取，所有电机应答后变为 `passed`（或 `mismatch`）。
+  - CTRL_MODE 不是 POS_VEL 的关节（被中断的会话遗留在 MIT）标记为未确认，使能握手会先给它写 POS_VEL。
+  - 检查未通过时拒绝进入重力补偿（`DRIVER_RANGE_MISMATCH` / `DRIVER_RANGE_UNVERIFIED`）。启动检查已核对的关节，第一次切到 MIT 前不再重复读取范围。
+
 ## Gravity compensation (hand-guiding) / 重力补偿（拖动示教）
 
 Status: implemented and tested against a simulated arm (`tests/test_gravity_comp.rs`, `tests/test_gravity_comp_api.rs`, `tests/test_damiao_mode_switch.rs`). **Not verified on hardware.** Code: `src/gravity_comp.rs`; parameters: `ArmConfig.gravity_comp` (`GravityCompPolicy`, set for rebot-dm, `None` elsewhere = unsupported).
