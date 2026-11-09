@@ -12,7 +12,7 @@
   The arm chain (base_link .. link6 .. end_link) is COPIED VERBATIM from the
   fixend URDF — do not edit those numbers here; edit the pristine file and
   re-derive. Everything from the GRIPPER ADDITIONS marker onward is new and is
-  approximated / documented in gripper notes.
+  approximated from the gripper CAD.
 
   Gripper model summary (REAL CAD-extracted articulation):
     - end_link <visual> = gripper_body.stl : the FIXED gripper body (housing +
@@ -23,13 +23,13 @@
       prismatic jaws (independent joints, coupled Isaac-side). Each finger mesh is
       authored in the tool frame; joints sit at the tool origin.
     - Per-finger travel 0 .. 0.0425 m  =>  clear jaw span 0.085 m (= the SDK
-      "usable jaw limit", earlier grasping notes). Verified with
+      "usable jaw limit"). Verified with
       yourdfpy: closed gap ~0 mm, open clear gap 84.9 mm.
     - Envelope check: body + fingers reproduce the original end_link.STL Y/Z
       envelope EXACTLY (184.1 / 68.5 mm); X reaches 160.2 mm with the fingers
       fully modeled (the fused STL only showed 107 mm). Same gripper, articulated.
 
-  TCP / frame convention (kinematics notes §5, verified vs end_link.STL):
+  TCP / frame convention (verified vs end_link.STL):
     approach = tool -X (body & fingers extend toward -X),
     jaw open/close = tool +-Y,  thickness = tool +-Z.
     tool = world + (100.1, 0, -195) mm, identity rotation.
