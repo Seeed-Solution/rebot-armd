@@ -100,6 +100,9 @@ pub enum SafetyError {
     #[error("Arm is coming to a safe stop from previous session; motion gate locked")]
     HandoverSettling,
 
+    #[error("Motion busy: an action trajectory is running")]
+    MotionBusy,
+
     #[error("Target outside the safe workspace: check point {point} {limit} {value:.3} m beyond bound {bound:.3} m")]
     WorkspaceViolation { point: usize, limit: String, value: f32, bound: f32 },
 }

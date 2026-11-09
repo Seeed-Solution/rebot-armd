@@ -3,6 +3,7 @@ pub mod driver;
 pub mod gravity;
 pub mod kinematics;
 pub mod model;
+pub mod motion;
 pub mod protocol;
 pub mod recording;
 pub mod safety;

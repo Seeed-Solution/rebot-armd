@@ -147,6 +147,30 @@ pub struct CameraMount {
     pub offset_m: Option<[f32; 3]>,
 }
 
+/// Gripper action parameters (`/api/v1/action/gripper`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GripperPolicy {
+    /// J7 at 0 % open (rad).
+    pub closed_rad: f32,
+    /// J7 at 100 % open (rad).
+    pub open_rad: f32,
+    /// A grasp holds an object when the jaw stopped at least this far from closed (rad) ...
+    pub holding_gap_rad: f32,
+    /// ... and the median |tau7| over the squeeze window is at least this (N·m).
+    pub holding_torque_nm: f32,
+    /// Position offset past the contact point that produces the grip force under POS_VEL (rad).
+    pub squeeze_rad: f32,
+    /// Squeeze window before the holding verdict (ms).
+    pub settle_ms: u64,
+}
+
+impl GripperPolicy {
+    /// Thresholds from the MIT-mode project; holding torque and squeeze need verification in POS_VEL.
+    pub fn rebot_dm() -> Self {
+        Self { closed_rad: 0.0, open_rad: -5.7, holding_gap_rad: 0.30, holding_torque_nm: 0.12, squeeze_rad: 0.15, settle_ms: 300 }
+    }
+}
+
 /// Estimated Damiao POS_VEL lag gain: tracking error ~= v / POSVEL_LAG_GAIN rad at
 /// v rad/s. Estimate from the 2026-11 tracking-fault analysis; needs verification
 /// on hardware (record |commanded - measured| during presets to fit it).
@@ -185,6 +209,9 @@ pub struct ArmConfig {
     pub workspace: Option<WorkspacePolicy>,
     #[serde(default)]
     pub camera_mount: CameraMount,
+    /// Gripper action parameters; None disables `/api/v1/action/gripper`.
+    #[serde(default)]
+    pub gripper_policy: Option<GripperPolicy>,
 }
 
 impl Default for ArmConfig {
@@ -226,6 +253,7 @@ impl Default for ArmConfig {
             kinematics: None,
             workspace: None,
             camera_mount: CameraMount::default(),
+            gripper_policy: None,
         }
     }
 }
@@ -270,6 +298,16 @@ impl ArmConfig {
         if !cam.rot_deg.is_finite() || !cam.tilt_deg.is_finite()
             || cam.offset_m.is_some_and(|o| o.iter().any(|v| !v.is_finite())) {
             return Err("Invalid camera mount".into());
+        }
+        if let Some(g) = &self.gripper_policy {
+            let lim = if self.dof >= 7 { Some(&self.limits[6]) } else { None };
+            let in_lim = |v: f32| lim.is_some_and(|l| v >= l.min_position && v <= l.max_position);
+            if ![g.closed_rad, g.open_rad, g.holding_gap_rad, g.holding_torque_nm, g.squeeze_rad].iter().all(|v| v.is_finite())
+                || !in_lim(g.closed_rad) || !in_lim(g.open_rad) || (g.closed_rad - g.open_rad).abs() < 0.1
+                || g.holding_gap_rad < 0.0 || g.holding_torque_nm < 0.0
+                || !(0.0..=0.5).contains(&g.squeeze_rad) || g.settle_ms == 0 || g.settle_ms > 5000 {
+                return Err("Invalid gripper policy (needs dof 7, open/closed inside the J7 limits, 0 <= squeeze_rad <= 0.5)".into());
+            }
         }
         if let Some(policy) = &self.resting_pose {
             if policy.position_tolerances.is_empty() || policy.position_tolerances.len() > self.dof
@@ -337,6 +375,7 @@ impl ArmConfig {
             kinematics: Some(KinematicsModel::RebotDevArm),
             workspace: Some(WorkspacePolicy::rebot_dm()),
             camera_mount: CameraMount::default(),
+            gripper_policy: Some(GripperPolicy::rebot_dm()),
         }
     }
 }
@@ -369,6 +408,12 @@ pub struct ArmObservation {
     /// Reference positions sent to the motors this tick (rad).
     #[serde(default)]
     pub commanded_positions: Vec<f32>,
+    /// Most recent action (move_to, move_relative, gripper, joint_move, home, park).
+    #[serde(default)]
+    pub action: Option<crate::motion::ActionStatus>,
+    /// The action a newer one replaced, published for 2 s after the replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_action: Option<crate::motion::ActionStatus>,
 }
 
 /// Field description in the observation schema

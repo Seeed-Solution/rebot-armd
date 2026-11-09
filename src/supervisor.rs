@@ -13,6 +13,10 @@ use crate::recording::{
 };
 use crate::safety::{FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
 use crate::trajectory::{MultiJointQuinticTrajectory, TrajectoryError, TrajectoryPlanner};
+use crate::motion::{
+    ActionStatus, ActiveTrajectory, GripperMotion, GripperRequest, JointPath, MotionError, PathTrajectory,
+    PlanInput, Reference, Settle, StepCtx, StepOut, StepStatus,
+};
 
 #[derive(Debug, Error)]
 pub enum ArmError {
@@ -27,6 +31,9 @@ pub enum ArmError {
 
     #[error("Unsupported operation: {0}")]
     Unsupported(String),
+
+    #[error("Motion error: {0}")]
+    Motion(#[from] MotionError),
 
     #[error("Internal error: {0}")]
     Internal(String),
@@ -81,7 +88,19 @@ pub struct SupervisorInner {
     pub servo_settled_ticks: Vec<u32>,
     pub is_torqued: bool,
     pub pending_rearm: bool,
-    pub active_trajectory: Option<MultiJointQuinticTrajectory>,
+    pub active_trajectory: Option<ActiveTrajectory>,
+    /// Most recent action record (published as `observation.action`).
+    pub last_action: Option<ActionStatus>,
+    /// Record replaced by a newer action and the timestamp until which it is published.
+    pub previous_action: Option<(ActionStatus, f64)>,
+    pub next_action_id: u64,
+    /// Lease generation when the running action started (lease loss detection).
+    pub action_lease_generation: Option<u64>,
+    /// Settle phase of a finished joint_move / home quintic: (action id, settle state).
+    pub quintic_settle: Option<(u64, Settle)>,
+    /// Test hook run once by the WS action handler between planning and install.
+    #[doc(hidden)]
+    pub before_install_hook: Option<Box<dyn FnOnce(&mut SupervisorInner) + Send + Sync>>,
     pub last_heartbeat: Instant,
     pub last_motion_frame: Instant,
     pub motion_frame_timeout: Duration,
@@ -169,6 +188,12 @@ impl SupervisorInner {
             is_torqued: false,
             pending_rearm: false,
             active_trajectory: None,
+            last_action: None,
+            previous_action: None,
+            next_action_id: 0,
+            action_lease_generation: None,
+            quintic_settle: None,
+            before_install_hook: None,
             last_heartbeat: now,
             last_motion_frame: now,
             motion_frame_timeout,
@@ -259,7 +284,7 @@ impl SupervisorInner {
     }
 
     /// The planner's 21 verification points of a trajectory.
-    fn trajectory_samples(traj: &MultiJointQuinticTrajectory) -> Vec<Vec<f32>> {
+    pub fn trajectory_samples(traj: &MultiJointQuinticTrajectory) -> Vec<Vec<f32>> {
         (0..=20).map(|k| traj.sample(traj.duration * f64::from(k) / 20.0).positions).collect()
     }
 
@@ -340,6 +365,8 @@ impl SupervisorInner {
             disable_pending: self.disable_pending,
             feedback_valid: self.hardware_feedback_fresh(Duration::from_millis(250)),
             commanded_positions: self.commanded_positions.clone(),
+            action: self.last_action.clone(),
+            previous_action: self.previous_action.as_ref().filter(|(_, until)| timestamp < *until).map(|(a, _)| a.clone()),
         }
     }
 
@@ -620,7 +647,7 @@ impl SupervisorInner {
                         let _ = self.safety.set_torque(true);
                         let _ = self.safety.mark_motion_started();
                         self.unload_planned_duration = Some(traj.duration);
-                        self.active_trajectory = Some(traj);
+                        self.active_trajectory = Some(ActiveTrajectory::quintic(traj, None));
                         self.target_positions = home;
                         self.pending_normal_unload = true;
                         self.unload_settle_ticks = None;
@@ -1043,8 +1070,11 @@ impl SupervisorInner {
             });
         }
 
-        if self.pending_rearm || self.active_trajectory.is_some() || self.pending_normal_unload {
+        if self.pending_rearm || self.pending_normal_unload {
             return Err(SafetyError::NotArmed(self.safety.state().clone()));
+        }
+        if self.active_trajectory.is_some() {
+            return Err(SafetyError::MotionBusy);
         }
 
         // 1. Validate motion command against epoch, safety state, and soft limits
@@ -1091,6 +1121,18 @@ impl SupervisorInner {
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
     ) -> Result<u64, ArmError> {
+        self.jog_action(target_positions, duration_secs, epoch_id, "joint_move").map(|(epoch, _, _)| epoch)
+    }
+
+    /// Jog that records an action of `kind` (`joint_move` or `home`).
+    /// Returns (epoch, action id, planned duration).
+    pub fn jog_action(
+        &mut self,
+        target_positions: Vec<f32>,
+        duration_secs: Option<f64>,
+        epoch_id: Option<u64>,
+        kind: &str,
+    ) -> Result<(u64, u64, f64), ArmError> {
         if self.handover_settling_since.is_some() {
             return Err(ArmError::Safety(SafetyError::HandoverSettling));
         }
@@ -1139,10 +1181,249 @@ impl SupervisorInner {
 
         self.servo_target = None;
         self.target_positions = target_positions;
-        self.active_trajectory = Some(traj);
         self.safety.mark_motion_started()?;
+        let duration = traj.duration;
+        let id = self.begin_action(kind, None);
+        self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)));
 
-        Ok(self.safety.epoch_id())
+        Ok((self.safety.epoch_id(), id, duration))
+    }
+
+    // ---- actions ----
+
+    fn now_s(&self) -> f64 { self.start_time.elapsed().as_secs_f64() }
+
+    /// Start a new action record; a running one is cancelled as SUPERSEDED.
+    pub fn begin_action(&mut self, kind: &str, tag: Option<String>) -> u64 {
+        let now = self.now_s();
+        if let Some(mut old) = self.last_action.take() {
+            if old.is_running() {
+                old.state = "cancelled".into();
+                old.code = Some("SUPERSEDED".into());
+                old.message = Some(format!("Replaced by a new {kind} action"));
+                old.finished_at = Some(now);
+            }
+            self.previous_action = Some((old, now + 2.0));
+        }
+        self.next_action_id += 1;
+        let id = self.next_action_id;
+        self.last_action = Some(ActionStatus {
+            id, kind: kind.into(), tag, state: "running".into(), code: None, message: None, progress: 0.0,
+            started_at: now, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
+        });
+        self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
+        self.quintic_settle = None;
+        id
+    }
+
+    fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
+                     settled: Option<bool>, holding: Option<bool>, gap: Option<f32>) {
+        let now = self.now_s();
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
+            a.state = state.into();
+            a.code = code.map(Into::into);
+            a.message = message;
+            a.finished_at = Some(now);
+            if state == "done" { a.progress = 1.0; }
+            if settled.is_some() { a.settled = settled; }
+            if holding.is_some() { a.holding = holding; }
+            if gap.is_some() { a.gripper_gap_rad = gap; }
+            tracing::info!("Action {} ({}) {}{}", id, a.kind, state, code.map(|c| format!(" {c}")).unwrap_or_default());
+        }
+        if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
+    }
+
+    /// Start a park (NormalUnload) and record it as a `park` action. Returns its id when
+    /// the park started.
+    pub fn unload_action(&mut self) -> Option<u64> {
+        self.execute_stop(StopPolicy::NormalUnload);
+        if !self.pending_normal_unload { return None; }
+        let id = self.begin_action("park", None);
+        if let Some(active) = self.active_trajectory.as_mut() { active.action_id = Some(id); }
+        Some(id)
+    }
+
+    /// Preconditions shared by Cartesian and gripper actions.
+    fn action_preconditions(&self) -> Result<(), ArmError> {
+        if self.handover_settling_since.is_some() { return Err(SafetyError::HandoverSettling.into()); }
+        if self.e_stop_latched.load(Ordering::SeqCst) { return Err(SafetyError::EStopActive.into()); }
+        match self.safety.state() {
+            SafetyState::EStop => return Err(SafetyError::EStopActive.into()),
+            SafetyState::Fault(r) => return Err(SafetyError::FaultActive(r.clone()).into()),
+            s if !s.is_operational() => return Err(SafetyError::NotArmed(s.clone()).into()),
+            _ => {}
+        }
+        if self.pending_rearm || self.pending_normal_unload {
+            return Err(SafetyError::NotArmed(self.safety.state().clone()).into());
+        }
+        if let Some(reason) = self.busy_reason() { return Err(MotionError::MotionBusy(reason).into()); }
+        Ok(())
+    }
+
+    fn busy_reason(&self) -> Option<String> {
+        if self.active_trajectory.is_some() { return Some("a trajectory is running".into()); }
+        if self.servo_target.is_some() { return Some("servo streaming is active".into()); }
+        if self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) { return Some("the arm is still moving".into()); }
+        None
+    }
+
+    /// Snapshot for planning a Cartesian action outside the lock.
+    pub fn plan_input(&self) -> Result<PlanInput, ArmError> {
+        if self.config.kinematics.is_none() || self.config.dof != 7 {
+            return Err(MotionError::Unsupported("Cartesian actions need a 7-DOF profile with a kinematics model".into()).into());
+        }
+        self.action_preconditions()?;
+        Ok(PlanInput {
+            q0: crate::kinematics::q6(&self.commanded_positions),
+            j7: self.commanded_positions[6],
+            limits: self.planning_limits(),
+            ws: self.workspace_policy().map(|(ws, _)| ws.clone()),
+            cam: self.config.camera_mount.clone(),
+            epoch: self.safety.epoch_id(),
+        })
+    }
+
+    /// Install a planned path if nothing changed since `input` was taken.
+    /// Returns (action id, expected duration).
+    pub fn install_path(&mut self, input: &PlanInput, path: JointPath, kind: &str, tag: Option<String>) -> Result<(u64, f64), ArmError> {
+        if self.safety.epoch_id() != input.epoch {
+            return Err(MotionError::PlanStale("epoch changed while planning".into()).into());
+        }
+        match self.action_preconditions() {
+            Err(ArmError::Motion(MotionError::MotionBusy(reason))) => {
+                return Err(MotionError::PlanStale(format!("arm no longer idle ({reason})")).into());
+            }
+            other => other?,
+        }
+        let moved = (0..6).any(|i| (f64::from(self.commanded_positions[i]) - input.q0[i]).abs() >= 1e-4)
+            || (self.commanded_positions[6] - input.j7).abs() >= 1e-4;
+        if moved { return Err(MotionError::PlanStale("commanded positions changed while planning".into()).into()); }
+        let last = path.last().to_vec();
+        self.safety.validate_motion_command(Some(input.epoch), &last, &self.config.limits)?;
+        let duration = path.duration;
+        self.servo_target = None;
+        self.servo_settled_ticks.fill(0);
+        self.target_positions = last;
+        self.safety.mark_motion_started()?;
+        self.last_heartbeat = Instant::now();
+        let id = self.begin_action(kind, tag);
+        self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Path(PathTrajectory::new(path)) });
+        Ok((id, duration + 0.5))
+    }
+
+    /// Start a gripper action. Returns (action id, expected duration).
+    pub fn start_gripper(&mut self, request: GripperRequest, epoch: u64) -> Result<(u64, f64), ArmError> {
+        let Some(policy) = self.config.gripper_policy.clone().filter(|_| self.config.dof >= 7) else {
+            return Err(MotionError::Unsupported("Gripper actions need a 7-DOF profile with a gripper policy".into()).into());
+        };
+        if epoch != self.safety.epoch_id() {
+            return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
+        }
+        self.action_preconditions()?;
+        let motion = GripperMotion::new(request, policy, self.config.limits[6].clone(), self.commanded_positions[6]);
+        let duration = motion.expected_duration();
+        let tag = motion.request.tag.clone();
+        self.servo_target = None;
+        self.servo_settled_ticks.fill(0);
+        let mut target = self.commanded_positions.clone();
+        target[6] = motion.target;
+        self.target_positions = target;
+        self.safety.mark_motion_started()?;
+        self.last_heartbeat = Instant::now();
+        let id = self.begin_action("gripper", tag);
+        self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Gripper(motion) });
+        Ok((id, duration))
+    }
+
+    /// Single place that ends a running action whose reference went away (spec 2.3).
+    fn reconcile_action(&mut self, dt: f64) {
+        let Some(action) = self.last_action.as_ref().filter(|a| a.is_running()) else { return; };
+        let (id, kind) = (action.id, action.kind.clone());
+        let carried = self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id));
+        let lease_now = self.active_lease.as_ref().map(|l| l.generation);
+        let cause: Option<(&str, &str, String)> = match self.safety.state() {
+            SafetyState::EStop => Some(("failed", "ESTOP_ACTIVE", "E-stop latched".into())),
+            SafetyState::Fault(FaultReason::WatchdogTimeout) => Some(("failed", "WATCHDOG", "Lease watchdog expired".into())),
+            SafetyState::Fault(r) => Some(("failed", "FAULT", match r { FaultReason::Other(m) => m.clone(), r => format!("{r:?}") })),
+            _ if kind != "park" && self.watchdog_park_deadline.is_some() => Some(("failed", "WATCHDOG", "Lease watchdog expired; parking".into())),
+            _ if lease_now != self.action_lease_generation => Some(("cancelled", "LEASE_LOST", "Control lease lost or released".into())),
+            _ => None,
+        };
+        if let Some((state, code, message)) = cause {
+            self.finish_action(id, state, Some(code), Some(message), None, None, None);
+            return;
+        }
+        let superseded = (self.active_trajectory.is_some() && !carried) || self.servo_target.is_some();
+        if kind == "park" {
+            if self.pending_normal_unload {
+                let progress = self.active_trajectory.as_ref().and_then(|a| a.as_quintic()).map_or(1.0, |t| (t.elapsed / t.duration).min(1.0) as f32);
+                if let Some(a) = self.last_action.as_mut() { a.progress = progress; }
+            } else if !self.is_torqued && matches!(self.safety.state(), SafetyState::Idle) {
+                self.finish_action(id, "done", None, None, None, None, None);
+            } else if superseded {
+                self.finish_action(id, "cancelled", Some("SUPERSEDED"), Some("Replaced by new motion".into()), None, None, None);
+            } else {
+                self.finish_action(id, "failed", Some("UNLOAD_FAILED"), Some("Park ended with torque still on".into()), None, None, None);
+            }
+            return;
+        }
+        if carried { return; }
+        if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) {
+            if superseded {
+                self.finish_action(id, "cancelled", Some("SUPERSEDED"), Some("Replaced by new motion".into()), None, None, None);
+                return;
+            }
+            let (cmd, meas, vel) = (&self.commanded_positions, &self.measured_positions, &self.measured_velocities);
+            let result = self.quintic_settle.as_mut().and_then(|(_, settle)| settle.step(dt, cmd, meas, vel));
+            if let Some(settled) = result {
+                self.finish_action(id, "done", None, None, Some(settled), None, None);
+            }
+            return;
+        }
+        if superseded {
+            self.finish_action(id, "cancelled", Some("SUPERSEDED"), Some("Replaced by new motion".into()), None, None, None);
+        } else {
+            self.finish_action(id, "cancelled", Some("STOPPED"), Some("Motion stopped".into()), None, None, None);
+        }
+    }
+
+    /// Apply one executor step of a Path / Gripper reference.
+    fn apply_action_step(&mut self, action_id: Option<u64>, out: StepOut) {
+        self.commanded_positions = out.positions;
+        self.commanded_velocities = out.velocities;
+        if out.clear_gripper_stall {
+            self.gripper_stalled = false;
+            self.gripper_high_torque_ticks = 0;
+            self.gripper_low_torque_ticks = 0;
+        }
+        if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
+            if a.id == id && a.is_running() { a.progress = out.progress; }
+        }
+        match out.status {
+            StepStatus::Running => {}
+            StepStatus::Done { settled, holding, gripper_gap_rad } => {
+                self.active_trajectory = None;
+                self.commanded_velocities.fill(0.0);
+                self.target_positions = self.commanded_positions.clone();
+                self.safety.mark_motion_finished();
+                if let Some(id) = action_id { self.finish_action(id, "done", None, None, settled, holding, gripper_gap_rad); }
+            }
+            StepStatus::Failed { code, message } => {
+                if code == "TRACKING_STALL" {
+                    self.stop_motion();
+                    if self.measured_positions.iter().all(|q| q.is_finite()) {
+                        self.commanded_positions = self.measured_positions.clone();
+                    }
+                    self.commanded_accelerations.fill(0.0);
+                } else {
+                    self.active_trajectory = None;
+                }
+                self.commanded_velocities.fill(0.0);
+                self.target_positions = self.commanded_positions.clone();
+                self.safety.mark_motion_finished();
+                if let Some(id) = action_id { self.finish_action(id, "failed", Some(code), Some(message), None, None, None); }
+            }
+        }
     }
 
     /// Semi-implicit reference step: q_next = q + v_next * dt. All constraint
@@ -1553,17 +1834,48 @@ impl SupervisorInner {
         if self.pending_normal_unload {
             self.last_heartbeat = Instant::now();
         }
-        if let Some(ref mut traj) = self.active_trajectory {
-            reference_stepped = true;
-            let point = traj.step(dt);
-            self.commanded_positions = point.positions;
-            self.commanded_velocities = point.velocities;
-
-            if traj.is_finished() {
-                self.active_trajectory = None;
-                self.commanded_velocities = vec![0.0; self.config.dof];
-                if !self.pending_normal_unload {
-                    self.safety.mark_motion_finished();
+        enum Stepped { Quintic(crate::trajectory::TrajectoryPoint, bool, f32), Action(StepOut) }
+        let stepped = if let Some(active) = self.active_trajectory.as_mut() {
+            let ctx = StepCtx {
+                dt: servo_dt,
+                measured: &self.measured_positions,
+                measured_velocities: &self.measured_velocities,
+                commanded: &self.commanded_positions,
+                commanded_velocities: &self.commanded_velocities,
+                torques: &self.torques,
+                gripper_stalled: self.gripper_stalled,
+                gripper_stall_sign: self.gripper_stall_sign,
+            };
+            let out = match &mut active.reference {
+                Reference::Quintic(traj) => {
+                    let point = traj.step(dt);
+                    Stepped::Quintic(point, traj.is_finished(), (traj.elapsed / traj.duration).min(1.0) as f32)
+                }
+                Reference::Path(path) => Stepped::Action(path.step(&ctx)),
+                Reference::Gripper(grip) => Stepped::Action(grip.step(&ctx)),
+            };
+            Some((active.action_id, out))
+        } else { None };
+        match stepped {
+            None => {}
+            Some((action_id, Stepped::Action(out))) => {
+                reference_stepped = true;
+                self.apply_action_step(action_id, out);
+            }
+            Some((action_id, Stepped::Quintic(point, finished, progress))) => {
+                reference_stepped = true;
+                self.commanded_positions = point.positions;
+                self.commanded_velocities = point.velocities;
+                if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
+                    if a.id == id && a.is_running() { a.progress = progress; }
+                }
+                if finished {
+                    self.active_trajectory = None;
+                    self.commanded_velocities = vec![0.0; self.config.dof];
+                    if !self.pending_normal_unload {
+                        self.safety.mark_motion_finished();
+                        if let Some(id) = action_id { self.quintic_settle = Some((id, Settle::default())); }
+                    }
                 }
             }
         }
@@ -1820,6 +2132,7 @@ impl SupervisorInner {
             }
         }
 
+        self.reconcile_action(servo_dt);
         let obs = self.current_observation();
 
         // 5. Record frame if episode recording is active
@@ -2032,11 +2345,9 @@ impl ArmSupervisor {
         duration_secs: Option<f64>,
         epoch_id: Option<u64>,
     ) -> Result<u64, ArmError> {
-        let home_pos = {
-            let inner = self.inner.read().await;
-            inner.config.home_positions.clone()
-        };
-        self.jog(home_pos, duration_secs, epoch_id).await
+        let mut inner = self.inner.write().await;
+        let home_pos = inner.config.home_positions.clone();
+        inner.jog_action(home_pos, duration_secs, epoch_id, "home").map(|(epoch, _, _)| epoch)
     }
 
     pub async fn stop_motion(&self) { self.inner.write().await.stop_motion(); }

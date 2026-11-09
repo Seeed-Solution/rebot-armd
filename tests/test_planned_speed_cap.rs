@@ -23,7 +23,7 @@ fn rebot_dm_inspect_jog_is_capped_at_planned_speed() {
         supervisor.set_lease_enabled(false).await;
         supervisor.set_torque(true).await.unwrap();
         supervisor.jog(INSPECT.to_vec(), None, None).await.unwrap();
-        let duration = supervisor.inner().read().await.active_trajectory.as_ref().unwrap().duration;
+        let duration = supervisor.inner().read().await.active_trajectory.as_ref().unwrap().duration();
         assert!((duration - 1.875 * 1.565 / 0.7).abs() < 0.01, "duration {duration}");
         let mut peak = [0.0f32; 7];
         for _ in 0..400 {

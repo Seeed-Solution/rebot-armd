@@ -163,6 +163,9 @@ impl From<ArmError> for ApiError {
                     code: Some("ESTOP_ACTIVE".to_string()),
                     safety_state: Some("EStop".to_string()),
                 },
+                crate::safety::SafetyError::MotionBusy => {
+                    ApiError(StatusCode::CONFLICT, safety_err.to_string(), "MOTION_BUSY".to_string())
+                }
                 crate::safety::SafetyError::WorkspaceViolation { .. } => {
                     ApiError(StatusCode::UNPROCESSABLE_ENTITY, safety_err.to_string(), "WORKSPACE_VIOLATION".to_string())
                 }
@@ -189,6 +192,15 @@ impl From<ArmError> for ApiError {
             }
             ArmError::Recording(rec_err) => {
                 ApiError(StatusCode::BAD_REQUEST, rec_err.to_string(), "RECORDING_ERROR".to_string())
+            }
+            ArmError::Motion(motion_err) => {
+                use crate::motion::MotionError as M;
+                let status = match motion_err {
+                    M::MotionBusy(_) | M::PlanStale(_) => StatusCode::CONFLICT,
+                    M::InvalidCommand(_) => StatusCode::BAD_REQUEST,
+                    _ => StatusCode::UNPROCESSABLE_ENTITY,
+                };
+                ApiError(status, motion_err.to_string(), motion_err.code().to_string())
             }
             ArmError::Unsupported(msg) => {
                 ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg, "UNSUPPORTED".to_string())
