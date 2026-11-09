@@ -3099,9 +3099,196 @@ const CALM = (() => {
       result, samples,
     };
   }
-  return { mul, inv, make, rotOf, posOf, rpyR, rpyDeg, axisR, expR, logR, angDeg, fk, rotDiversity, solveEyeInHand, buildExport };
+  return { mul, inv, make, rotOf, posOf, rpyR, rpyDeg, axisR, expR, logR, angDeg, fk, rotDiversity, solveEyeInHand, buildExport, CHAIN };
 })();
 /* CALIB-MATH-END */
+
+/* VIEW-IK-BEGIN */
+// Camera-view cartesian frame (7-DOF arm): 6-joint damped-least-squares IK over URDF J1..J6 (model rad)
+// on the full chain of CALM.fk, plus the camera-frame motion helpers used by cartTickView().
+// Poses are 4x4 T_base_end in the CALM.fk convention (end_link x = tool axis). Camera frame: OpenCV
+// (x right, y down, z = optical axis = end_link x).
+const VIK = (() => {
+  const D = 180 / Math.PI;
+  // chain as flat row-major 3x3 + offset; every joint turns about its own +-z
+  const CH = CALM.CHAIN.map(([F, axis]) => {
+    if (axis && (axis[0] || axis[1])) throw new Error('VIK: joint axis must be +-z');
+    return { R: CALM.rotOf(F).flat(), p: CALM.posOf(F), s: axis ? axis[2] : 0 };
+  });
+  const m3 = (A, B) => [
+    A[0] * B[0] + A[1] * B[3] + A[2] * B[6], A[0] * B[1] + A[1] * B[4] + A[2] * B[7], A[0] * B[2] + A[1] * B[5] + A[2] * B[8],
+    A[3] * B[0] + A[4] * B[3] + A[5] * B[6], A[3] * B[1] + A[4] * B[4] + A[5] * B[7], A[3] * B[2] + A[4] * B[5] + A[5] * B[8],
+    A[6] * B[0] + A[7] * B[3] + A[8] * B[6], A[6] * B[1] + A[7] * B[4] + A[8] * B[7], A[6] * B[2] + A[7] * B[5] + A[8] * B[8]];
+  const mv = (R, v) => [R[0] * v[0] + R[1] * v[1] + R[2] * v[2], R[3] * v[0] + R[4] * v[1] + R[5] * v[2], R[6] * v[0] + R[7] * v[1] + R[8] * v[2]];
+  const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const norm = (a) => Math.hypot(a[0], a[1], a[2]);
+  const unit = (a) => { const n = norm(a) || 1; return [a[0] / n, a[1] / n, a[2] / n]; };
+  const flat = (T) => [T[0][0], T[0][1], T[0][2], T[1][0], T[1][1], T[1][2], T[2][0], T[2][1], T[2][2]];
+  const nest = (R) => [[R[0], R[1], R[2]], [R[3], R[4], R[5]], [R[6], R[7], R[8]]];
+  const T4 = (R, p) => [[R[0], R[1], R[2], p[0]], [R[3], R[4], R[5], p[1]], [R[6], R[7], R[8], p[2]], [0, 0, 0, 1]];
+  const posOf = (T) => [T[0][3], T[1][3], T[2][3]];
+  const rotAxis = (k, a) => flat(CALM.axisR(k, a));
+  // rotation vector of R (flat); fast path away from pi, CALM.logR near it
+  function logv(R) {
+    const c = (R[0] + R[4] + R[8] - 1) / 2;
+    if (c > 0.999999) return [(R[7] - R[5]) / 2, (R[2] - R[6]) / 2, (R[3] - R[1]) / 2];
+    if (c < -0.99) return CALM.logR(nest(R));
+    const th = Math.acos(c), k = th / (2 * Math.sin(th));
+    return [(R[7] - R[5]) * k, (R[2] - R[6]) * k, (R[3] - R[1]) * k];
+  }
+  const expv = (w) => { const th = norm(w); return th < 1e-15 ? [1, 0, 0, 0, 1, 0, 0, 0, 1] : rotAxis(w.map((c) => c / th), th); };
+  const mtR = (A, B) => [ // A * B^T
+    A[0] * B[0] + A[1] * B[1] + A[2] * B[2], A[0] * B[3] + A[1] * B[4] + A[2] * B[5], A[0] * B[6] + A[1] * B[7] + A[2] * B[8],
+    A[3] * B[0] + A[4] * B[1] + A[5] * B[2], A[3] * B[3] + A[4] * B[4] + A[5] * B[5], A[3] * B[6] + A[4] * B[7] + A[5] * B[8],
+    A[6] * B[0] + A[7] * B[1] + A[8] * B[2], A[6] * B[3] + A[7] * B[4] + A[8] * B[5], A[6] * B[6] + A[7] * B[7] + A[8] * B[8]];
+
+  // end pose + world joint axes / origins for q (model J1..J6)
+  function frames(q) {
+    let R = [1, 0, 0, 0, 1, 0, 0, 0, 1], p = [0, 0, 0], i = 0;
+    const a = [], o = [];
+    for (const L of CH) {
+      const d = mv(R, L.p);
+      p = [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
+      R = m3(R, L.R);
+      if (L.s) {
+        a.push([R[2] * L.s, R[5] * L.s, R[8] * L.s]); o.push(p);
+        const th = L.s * (Number(q[i++]) || 0), c = Math.cos(th), s = Math.sin(th);
+        R = [R[0] * c + R[1] * s, -R[0] * s + R[1] * c, R[2], R[3] * c + R[4] * s, -R[3] * s + R[4] * c, R[5], R[6] * c + R[7] * s, -R[6] * s + R[7] * c, R[8]];
+      }
+    }
+    return { R, p, a, o };
+  }
+  const fk = (q) => { const f = frames(q); return T4(f.R, f.p); };
+
+  // 6x6 SPD solve (Cholesky), A flat row-major; returns null if not positive definite
+  function chol6(A, b) {
+    const L = new Float64Array(36);
+    for (let i = 0; i < 6; i++) for (let j = 0; j <= i; j++) {
+      let s = A[i * 6 + j];
+      for (let k = 0; k < j; k++) s -= L[i * 6 + k] * L[j * 6 + k];
+      if (i === j) { if (!(s > 1e-18)) return null; L[i * 6 + i] = Math.sqrt(s); } else L[i * 6 + j] = s / L[j * 6 + j];
+    }
+    const y = [0, 0, 0, 0, 0, 0];
+    for (let i = 0; i < 6; i++) { let s = b[i]; for (let k = 0; k < i; k++) s -= L[i * 6 + k] * y[k]; y[i] = s / L[i * 6 + i]; }
+    for (let i = 5; i >= 0; i--) { let s = y[i]; for (let k = i + 1; k < 6; k++) s -= L[k * 6 + i] * y[k]; y[i] = s / L[i * 6 + i]; }
+    return y;
+  }
+  const PAR = { w: 0.2, lamMin: 0.01, lamMax: 0.05, iters: 10, tolPos: 1e-3, tolRot: 0.5 / D, maxStep: 0.5 };
+  // error twist [dp; w * log(Rg Rc^T)] and its parts
+  function poseErr(f, Rg, pg, w) {
+    const dp = [pg[0] - f.p[0], pg[1] - f.p[1], pg[2] - f.p[2]], dr = logv(mtR(Rg, f.R));
+    return { e: [dp[0], dp[1], dp[2], w * dr[0], w * dr[1], w * dr[2]], ep: norm(dp), er: norm(dr) };
+  }
+  // Tg: 4x4 goal; q0: model J1..J6 start (previous solution); opt.lo / opt.hi: model limits (6), widened to
+  // contain q0 so a joint already past its margin may stay but not go further.
+  // returns { ok, q, ep (m), er (rad), it } or { ok: false, err: 'pose', ... }; never throws on bad targets
+  function solve(Tg, q0, opt = {}) {
+    const w = opt.w ?? PAR.w, iters = opt.iters ?? PAR.iters;
+    const lo = [], hi = [];
+    for (let i = 0; i < 6; i++) {
+      const l = opt.lo ? opt.lo[i] : -Infinity, h = opt.hi ? opt.hi[i] : Infinity;
+      lo.push(Math.min(l, q0[i])); hi.push(Math.max(h, q0[i]));
+    }
+    const Rg = flat(Tg), pg = posOf(Tg);
+    let q = q0.slice(0, 6), f = frames(q), E = poseErr(f, Rg, pg, w), lam = PAR.lamMin, it = 0;
+    if (!(E.ep < Infinity && E.er < Infinity)) return { ok: false, err: 'pose', q: q0.slice(0, 6), ep: Infinity, er: Infinity, it };
+    // iterate to a 10x tighter tolerance while iterations remain (no tick-to-tick jitter inside the
+    // acceptance band); accept at tolPos / tolRot
+    while (it < iters && !(E.ep <= PAR.tolPos / 10 && E.er <= PAR.tolRot / 10)) {
+      it++;
+      // geometric Jacobian, angular rows scaled by w (6 x 6, column per joint)
+      const J = [];
+      for (let j = 0; j < 6; j++) {
+        const a = f.a[j], v = cross(a, [f.p[0] - f.o[j][0], f.p[1] - f.o[j][1], f.p[2] - f.o[j][2]]);
+        J.push([v[0], v[1], v[2], w * a[0], w * a[1], w * a[2]]);
+      }
+      const A = new Float64Array(36);
+      for (let r = 0; r < 6; r++) for (let c = r; c < 6; c++) {
+        let s = 0;
+        for (let j = 0; j < 6; j++) s += J[j][r] * J[j][c];
+        A[r * 6 + c] = A[c * 6 + r] = s;
+      }
+      for (let r = 0; r < 6; r++) A[r * 6 + r] += lam * lam;
+      const y = chol6(A, E.e);
+      if (!y) break;
+      const dq = J.map((col) => col.reduce((s, v, r) => s + v * y[r], 0));
+      const big = Math.max(...dq.map(Math.abs));
+      const k = big > PAR.maxStep ? PAR.maxStep / big : 1;
+      const qn = q.map((x, i) => Math.min(hi[i], Math.max(lo[i], x + k * dq[i])));
+      const fn = frames(qn), En = poseErr(fn, Rg, pg, w);
+      if (En.ep + w * En.er < E.ep + w * E.er) { q = qn; f = fn; E = En; lam = PAR.lamMin; }
+      else if (lam < PAR.lamMax) lam = PAR.lamMax; // adaptive damping: retry the step with heavier damping
+      else { q = qn; f = fn; E = En; }              // still worse with lamMax: take it (clamped) and continue
+    }
+    const ok = E.ep <= PAR.tolPos && E.er <= PAR.tolRot;
+    return ok ? { ok, q, ep: E.ep, er: E.er, it } : { ok, err: 'pose', q, ep: E.ep, er: E.er, it };
+  }
+
+  // camera mount R_end_cam (nested 3x3): z_cam = end_link x; y_cam = flip * J5 axis seen in end_link at
+  // q6 = pi/2 (x part removed); x_cam = y_cam x z_cam; then rotDeg about the optical axis.
+  function camMount(flip, rotDeg) {
+    const f = frames([0, 0, 0, 0, 0, Math.PI / 2]);
+    const aEnd = mv([f.R[0], f.R[3], f.R[6], f.R[1], f.R[4], f.R[7], f.R[2], f.R[5], f.R[8]], f.a[4]); // R^T a
+    const y = unit([0, aEnd[1] * (flip ? -1 : 1), aEnd[2] * (flip ? -1 : 1)]), z = [1, 0, 0], x = cross(y, z);
+    let R = [x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2]];
+    if (rotDeg) R = m3(R, rotAxis([0, 0, 1], rotDeg / D));
+    return nest(R);
+  }
+  // camera axes in the base frame for end pose T: { x, y, z } unit vectors
+  function camAxes(T, Rec) {
+    const R = m3(flat(T), flat(Rec));
+    return { x: [R[0], R[3], R[6]], y: [R[1], R[4], R[7]], z: [R[2], R[5], R[8]], R };
+  }
+  // auto-level: roll about the optical axis so x_cam is horizontal and y_cam points down (y_cam . Z <= 0);
+  // skipped when the optical axis is within acos(levelCos) of vertical
+  function level(T, Rec, levelCos) {
+    const c = camAxes(T, Rec);
+    if (Math.abs(c.z[2]) >= levelCos) return T;
+    const x = unit(cross(c.z, [0, 0, 1])), y = cross(c.z, x);
+    const Rc = [x[0], y[0], c.z[0], x[1], y[1], c.z[1], x[2], y[2], c.z[2]];
+    return T4(mtR(Rc, flat(Rec)), posOf(T)); // R_end = R_cam R_ec^T
+  }
+  // integrate operator input v = { x: forward, y: left (+), z: world up, p: look down (+), r: look right (+) }
+  // over dt: translation in the camera frame (+ world Z), unit-ball normalised x vl; pitch about x_cam and
+  // look-around about world Z (both centred on the end_link origin) x wl; then auto-level.
+  function integrate(T, v, dt, o) {
+    const c = camAxes(T, o.Rec);
+    const d = [0, 1, 2].map((k) => -v.y * c.x[k] + v.x * c.z[k]);
+    d[2] += v.z;
+    const dn = norm(d), ds = dn > 1 ? o.vl * dt / dn : o.vl * dt;
+    const p = posOf(T).map((x, k) => x + d[k] * ds);
+    let wp = -(v.p || 0), wr = -(v.r || 0);
+    const wn = Math.hypot(wp, wr);
+    if (wn > 1) { wp /= wn; wr /= wn; }
+    let R = flat(T);
+    if (wp) R = m3(rotAxis(c.x, wp * o.wl * dt), R);
+    if (wr) R = m3(rotAxis([0, 0, 1], wr * o.wl * dt), R);
+    return level(T4(R, p), o.Rec, o.levelCos);
+  }
+  // position (m) and rotation (rad) difference B relative to A
+  function diff(A, B) {
+    const pa = posOf(A), pb = posOf(B);
+    const dp = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]], dr = logv(mtR(flat(B), flat(A)));
+    return { dp, dr, d: norm(dp), a: norm(dr) };
+  }
+  // move from A toward B by at most dmax (m) / amax (rad); returns B itself when it is within reach
+  function approach(A, B, dmax, amax) {
+    const e = diff(A, B);
+    if (e.d <= dmax && e.a <= amax) return B;
+    const fp = e.d > dmax ? dmax / e.d : 1, fr = e.a > amax ? amax / e.a : 1;
+    const R = m3(expv(e.dr.map((x) => x * fr)), flat(A));
+    return T4(R, posOf(A).map((x, k) => x + e.dp[k] * fp));
+  }
+  // anti-windup: keep goal B within dmax / amax of A
+  function clampGoal(A, B, dmax, amax) {
+    const e = diff(A, B);
+    if (e.d <= dmax && e.a <= amax) return B;
+    return approach(A, B, dmax, amax);
+  }
+  return { fk, frames, solve, camMount, camAxes, level, integrate, diff, approach, clampGoal, PAR };
+})();
+/* VIEW-IK-END */
 
 // markers usable in the current mode (eye_in_hand needs the full 6-D pose); prefers the locked marker ID.
 // Returns { m, other }: other = a usable marker with a different ID than the locked one.
