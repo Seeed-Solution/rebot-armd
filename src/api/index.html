@@ -1354,6 +1354,7 @@ body .disc.vslot .knob { width: 44px; height: 44px; margin: -22px 0 0 -22px; z-i
           <span><kbd>↓</kbd><kbd>↑</kbd></span><span data-i18n="kb.j3">J3 小臂 下压 / 抬高</span>
           <span><kbd>Q</kbd><kbd>E</kbd></span><span data-i18n="kb.j4">J4 手腕 下倾 / 上翘</span>
           <span><kbd>←</kbd><kbd>→</kbd></span><span data-i18n="kb.j5">J5 手腕 旋左 / 旋右</span>
+          <span class="kb-dof7" hidden><kbd>R</kbd><kbd>F</kbd></span><span class="kb-dof7" data-i18n="kb.j6roll" hidden>J6 手腕 旋左 / 旋右</span>
           <span><kbd>Z</kbd><kbd>X</kbd></span><span data-i18n="kb.j6">J6 夹爪 张开 / 夹紧（G 切换）</span>
           <span class="sub" data-i18n="kb.cartsub">空间位姿 / 简化模式</span>
           <span><kbd>W</kbd><kbd>S</kbd></span><span data-i18n="kb.x">X 前 / 后</span>
@@ -1450,7 +1451,7 @@ const I18N = {
     'c.x': 'X 前后 mm', 'c.y': 'Y 左右 mm', 'c.z': 'Z 高度 mm', 'c.roll': 'Roll 腕转', 'c.pitch': 'Pitch 俯仰', 'c.yaw': 'Yaw 朝向', 'c.reach': '臂展 R /',
     'vl.height': '高度', 'vl.pitch': '俯仰', 'vl.roll': '腕转', 'vl.roll.sub': 'Roll',
     // 7-DOF arm: J5 swings the wrist sideways, J6 rolls the tool (variants picked by t() when dof = 7).
-    'c.roll@7': 'Swing 腕摆', 'vl.roll@7': '腕摆', 'vl.roll.sub@7': 'Swing', 'stick.j5@7': 'J5 腕摆', 'kb.j5@7': 'J5 手腕 摆左 / 摆右', 'kb.r@7': '腕摆 Swing', 'pad.pose@7': '姿态摇杆（俯仰 / 腕摆）',
+    'c.roll@7': 'Swing 腕摆', 'vl.roll@7': '腕摆', 'vl.roll.sub@7': 'Swing', 'stick.j5@7': 'J5 腕摆', 'kb.j5@7': 'J5 手腕 摆左 / 摆右', 'kb.j6roll': 'J6 手腕 旋左 / 旋右', 'kb.j6@7': 'J7 夹爪 张开 / 夹紧（G 切换）', 'kb.r@7': '腕摆 Swing', 'pad.pose@7': '姿态摇杆（俯仰 / 腕摆）',
     'd.fwd': '前', 'd.back': '后', 'd.left': '左', 'd.right': '右', 'd.rise': '升', 'd.lower': '降', 'd.lift': '抬', 'd.press': '压', 'd.open': '开', 'd.close': '闭',
     'cb.pup': '上抬', 'cb.pdn': '下压', 'cb.rr': '右旋', 'cb.rl': '左旋',
     'pl.up': '仰', 'pl.dn': '俯', 'pl.rl': '左滚', 'pl.rr': '右滚',
@@ -1543,7 +1544,7 @@ const I18N = {
     'input.mode': 'Input type', 'input.btn': 'Buttons', 'input.stick': 'Sticks',
     'c.x': 'X fwd/back mm', 'c.y': 'Y left/right mm', 'c.z': 'Z height mm', 'c.roll': 'Roll', 'c.pitch': 'Pitch', 'c.yaw': 'Yaw', 'c.reach': 'Reach R /',
     'vl.height': 'Height', 'vl.pitch': 'Pitch', 'vl.roll': 'Roll', 'vl.roll.sub': 'Roll',
-    'c.roll@7': 'Swing', 'vl.roll@7': 'Swing', 'vl.roll.sub@7': 'Swing', 'stick.j5@7': 'J5 Wrist swing', 'kb.j5@7': 'J5 Wrist swing L / R', 'kb.r@7': 'Wrist Swing', 'pad.pose@7': 'Pose stick (pitch / swing)',
+    'c.roll@7': 'Swing', 'vl.roll@7': 'Swing', 'vl.roll.sub@7': 'Swing', 'stick.j5@7': 'J5 Wrist swing', 'kb.j5@7': 'J5 Wrist swing L / R', 'kb.j6roll': 'J6 Wrist roll L / R', 'kb.j6@7': 'J7 Gripper open / close (G toggles)', 'kb.r@7': 'Wrist Swing', 'pad.pose@7': 'Pose stick (pitch / swing)',
     'd.fwd': 'Fwd', 'd.back': 'Back', 'd.left': 'Left', 'd.right': 'Right', 'd.rise': 'Up', 'd.lower': 'Down', 'd.lift': 'Up', 'd.press': 'Down', 'd.open': 'Open', 'd.close': 'Close',
     'cb.pup': 'Up', 'cb.pdn': 'Down', 'cb.rr': 'Roll R', 'cb.rl': 'Roll L',
     'pl.up': 'Up', 'pl.dn': 'Down', 'pl.rl': 'Roll L', 'pl.rr': 'Roll R',
@@ -3051,6 +3052,7 @@ async function loadSchema() {
       S.hold = Array.from({ length: S.dof }, () => [0, 0]);
       if (oldDof !== S.dof) {
         I18N_VARIANT = S.dof === 7 ? '@7' : '';
+        document.querySelectorAll('.kb-dof7').forEach((el) => { el.hidden = S.dof !== 7; });
         renderJogRows();
         renderGripCol();
         applyI18n();
