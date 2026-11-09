@@ -383,3 +383,17 @@ pub async fn dataset_record_discard(
         frame_count: Some(0),
     }))
 }
+
+/// GET /api/v1/grasp/setup: the runtime grasp setup (change it with the WS command
+/// `/api/v1/grasp/setup`).
+pub async fn get_grasp_setup(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>,
+) -> Response {
+    let setup = supervisor.inner().read().await.grasp_setup();
+    let path = deps.setup_path.as_ref().map(|p| p.display().to_string());
+    match setup {
+        Some(s) => Json(serde_json::json!({"supported": true, "setup": s, "path": path})).into_response(),
+        None => Json(serde_json::json!({"supported": false, "setup": null, "path": path})).into_response(),
+    }
+}

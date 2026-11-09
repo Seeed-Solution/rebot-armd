@@ -22,8 +22,9 @@ pub fn connection_registry() -> ConnectionRegistry {
 
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 
-pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSupervisor>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, supervisor))
+pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSupervisor>>,
+                        axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, supervisor, deps))
 }
 
 fn invalid_command(message: &str) -> ApiError {
@@ -80,7 +81,7 @@ fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch:
             let duration = inner.active_trajectory.as_ref().map_or(0.0, |t| t.duration()) + 0.8;
             return Ok(id.map(|id| (id, duration)));
         }
-        "/api/v1/motion/stop" => { inner.stop_motion(); }
+        "/api/v1/motion/stop" => { inner.stop_motion(); inner.request_grasp_stop(); }
         _ => return Err(invalid_command("Unknown actuator command")),
     }
     Ok(None)
@@ -96,7 +97,7 @@ struct PendingPlan {
     tag: Option<String>,
 }
 
-enum ActionStart { Started(u64, f64), Plan(PendingPlan) }
+enum ActionStart { Started(u64, f64), Plan(PendingPlan), Grasp(crate::grasp::PendingGrasp) }
 
 // Under the write lock, after lease / epoch / request_id checks.
 fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: u64, request_id: &Value) -> Result<ActionStart, ApiError> {
@@ -109,6 +110,7 @@ fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: 
             let (id, duration) = inner.start_gripper(request, epoch)?;
             return Ok(ActionStart::Started(id, duration));
         }
+        "/api/v1/action/grasp" => return Ok(ActionStart::Grasp(crate::grasp::prepare(inner, body, epoch)?)),
         _ => return Err(invalid_command("Unknown action")),
     };
     let (spec, speed, tag) = parsed.map_err(ArmError::from)?;
@@ -132,7 +134,7 @@ fn command_reject(inner: &SupervisorInner, request_id: &Value, error: ApiError) 
     reply
 }
 
-async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>) {
+async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: crate::grasp::GraspDeps) {
     let (mut sender, mut receiver) = socket.split();
     let mut telemetry = supervisor.subscribe_telemetry();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(64);
@@ -177,6 +179,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>) {
     let recv_supervisor = supervisor.clone();
     let recv_connection = connection.clone();
     let recv_generation = connection_generation.clone();
+    let recv_deps = deps;
     let mut recv_task = tokio::spawn(async move {
         let mut client_label: Option<String> = None;
         let mut last_sequence: Option<u64> = None;
@@ -191,6 +194,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>) {
             let mut response: Option<Value>;
             let mut evicted_notify: Option<(String, u64)> = None;
             let mut pending_plan: Option<(PendingPlan, u64)> = None;
+            let mut pending_grasp: Option<(Value, crate::grasp::PendingGrasp, u64)> = None;
+            let mut pending_save: Option<crate::grasp::GraspSetup> = None;
             if kind == "estop" || kind == "e_stop" {
                 let (state, epoch) = recv_supervisor.trigger_e_stop().await;
                 response = Some(json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":state}));
@@ -311,8 +316,19 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>) {
                                         response = match prepare_action(&mut inner, path, &value["body"], epoch, &value["request_id"]) {
                                             Ok(ActionStart::Started(id, duration)) => Some(command_ack(&inner, &value["request_id"], Some((id, duration)))),
                                             Ok(ActionStart::Plan(plan)) => { pending_plan = Some((plan, local_generation)); None }
+                                            Ok(ActionStart::Grasp(g)) => { pending_grasp = Some((value["request_id"].clone(), g, local_generation)); None }
                                             Err(error) => Some(command_reject(&inner, &value["request_id"], error)),
                                         };
+                                    } else if path == "/api/v1/grasp/setup" {
+                                        response = Some(match crate::grasp::update_setup(&mut inner, &value["body"]) {
+                                            Ok(setup) => {
+                                                let mut ack = command_ack(&inner, &value["request_id"], None);
+                                                ack["setup"] = json!(setup);
+                                                pending_save = Some(setup);
+                                                ack
+                                            }
+                                            Err(error) => command_reject(&inner, &value["request_id"], error.into()),
+                                        });
                                     } else {
                                         let result = execute_command(&mut inner, path, &value["body"], epoch);
                                         response = Some(match result {
@@ -383,6 +399,40 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>) {
                             }
                         }
                     });
+                }
+
+                // Grasp: the coarse approach is planned without the lock (feasibility check),
+                // then the action begins and the orchestrator task takes over.
+                if let Some((request_id, pending, generation)) = pending_grasp.take() {
+                    let planned = tokio::task::spawn_blocking(move || crate::grasp::plan(pending)).await;
+                    let mut inner = recv_supervisor.inner().write().await;
+                    response = Some(match planned {
+                        Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
+                        Ok(Err(error)) => command_reject(&inner, &request_id, error.into()),
+                        Ok(Ok(planned)) => {
+                            if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
+                                json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
+                            } else {
+                                match inner.begin_grasp(&planned.input, planned.request.tag.clone()) {
+                                    Ok(id) => {
+                                        let duration = crate::grasp::expected_duration(&planned);
+                                        crate::grasp::spawn(recv_supervisor.clone(), recv_deps.source.clone(), id, planned);
+                                        command_ack(&inner, &request_id, Some((id, duration)))
+                                    }
+                                    Err(error) => command_reject(&inner, &request_id, error.into()),
+                                }
+                            }
+                        }
+                    });
+                }
+                if let Some(setup) = pending_save.take() {
+                    if let (Some(path), Some(reply)) = (recv_deps.setup_path.clone(), response.as_mut()) {
+                        match tokio::task::spawn_blocking(move || crate::grasp::save_setup(&path, &setup)).await {
+                            Ok(Ok(())) => reply["persisted"] = json!(true),
+                            Ok(Err(e)) => { tracing::warn!("Grasp setup not saved: {e}"); reply["persisted"] = json!(false); reply["persist_error"] = json!(e.to_string()); }
+                            Err(e) => { reply["persisted"] = json!(false); reply["persist_error"] = json!(e.to_string()); }
+                        }
+                    }
                 }
 
                 if let Some((evicted_conn, evicted_gen)) = evicted_notify {

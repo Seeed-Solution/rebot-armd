@@ -1,5 +1,6 @@
 pub mod api;
 pub mod driver;
+pub mod grasp;
 pub mod gravity;
 pub mod kinematics;
 pub mod model;

@@ -145,6 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bind before mounting hardware; an unavailable API must not leave a hardware loop running.
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
     let supervisor = Arc::new(ArmSupervisor::new(config));
+    armd::grasp::load_into(&supervisor, &armd::grasp::setup_path_from_env()).await;
     match follower {
         "rebot-rs" | "rebot-dm" => {
             #[cfg(target_os = "linux")]

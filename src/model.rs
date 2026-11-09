@@ -212,6 +212,9 @@ pub struct ArmConfig {
     /// Gripper action parameters; None disables `/api/v1/action/gripper`.
     #[serde(default)]
     pub gripper_policy: Option<GripperPolicy>,
+    /// Tap-to-grasp setup; None disables `/api/v1/action/grasp`.
+    #[serde(default)]
+    pub grasp: Option<crate::grasp::GraspSetup>,
 }
 
 impl Default for ArmConfig {
@@ -254,6 +257,7 @@ impl Default for ArmConfig {
             workspace: None,
             camera_mount: CameraMount::default(),
             gripper_policy: None,
+            grasp: None,
         }
     }
 }
@@ -309,6 +313,7 @@ impl ArmConfig {
                 return Err("Invalid gripper policy (needs dof 7, open/closed inside the J7 limits, 0 <= squeeze_rad <= 0.5)".into());
             }
         }
+        if let Some(g) = &self.grasp { g.validate().map_err(|e| format!("Invalid grasp setup: {e}"))?; }
         if let Some(policy) = &self.resting_pose {
             if policy.position_tolerances.is_empty() || policy.position_tolerances.len() > self.dof
                 || policy.position_tolerances.iter().any(|v| !v.is_finite() || *v <= 0.0)
@@ -376,6 +381,7 @@ impl ArmConfig {
             workspace: Some(WorkspacePolicy::rebot_dm()),
             camera_mount: CameraMount::default(),
             gripper_policy: Some(GripperPolicy::rebot_dm()),
+            grasp: Some(crate::grasp::GraspSetup::default()),
         }
     }
 }

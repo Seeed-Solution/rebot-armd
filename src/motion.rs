@@ -661,7 +661,7 @@ impl ActiveTrajectory {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActionStatus {
     pub id: u64,
-    /// move_to | move_relative | gripper | joint_move | home | park
+    /// move_to | move_relative | gripper | grasp | joint_move | home | park
     pub kind: String,
     pub tag: Option<String>,
     /// running | done | failed | cancelled
@@ -674,6 +674,14 @@ pub struct ActionStatus {
     pub holding: Option<bool>,
     pub gripper_gap_rad: Option<f32>,
     pub settled: Option<bool>,
+    /// Grasp only: open | approach | centring | align | descend | close | release | lift | done.
+    #[serde(default)]
+    pub phase: Option<String>,
+    /// Grasp centring: corrections made so far and the latest pixel error.
+    #[serde(default)]
+    pub iteration: Option<u32>,
+    #[serde(default)]
+    pub error_px: Option<f32>,
 }
 
 impl ActionStatus {

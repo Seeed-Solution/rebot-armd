@@ -332,6 +332,25 @@ async fn forward(
     }
 }
 
+/// One JSON request to the detector for armd's own use (the grasp orchestrator).
+/// Non-2xx statuses and non-JSON bodies are errors.
+pub(crate) async fn request_json(
+    up: &DetectorUpstream,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    let method = Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
+    let r = tokio::time::timeout(timeout, upstream_request(up, method, path_and_query, body))
+        .await
+        .map_err(|_| "detector timed out".to_string())??;
+    if !r.status.is_success() {
+        return Err(format!("detector returned {}", r.status));
+    }
+    serde_json::from_slice(&r.body).map_err(|e| format!("detector returned invalid JSON: {e}"))
+}
+
 fn detector_unreachable() -> Response {
     (StatusCode::BAD_GATEWAY, axum::Json(serde_json::json!({"error": "detector unreachable"}))).into_response()
 }

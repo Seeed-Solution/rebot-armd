@@ -98,6 +98,8 @@ pub struct SupervisorInner {
     pub action_lease_generation: Option<u64>,
     /// Settle phase of a finished joint_move / home quintic: (action id, settle state).
     pub quintic_settle: Option<(u64, Settle)>,
+    /// Running tap-to-grasp orchestration (its sub-motions carry the grasp action id).
+    pub grasp_run: Option<crate::grasp::GraspRun>,
     /// Test hook run once by the WS action handler between planning and install.
     #[doc(hidden)]
     pub before_install_hook: Option<Box<dyn FnOnce(&mut SupervisorInner) + Send + Sync>>,
@@ -192,6 +194,7 @@ impl SupervisorInner {
             previous_action: None,
             next_action_id: 0,
             action_lease_generation: None,
+            grasp_run: None,
             quintic_settle: None,
             before_install_hook: None,
             last_heartbeat: now,
@@ -1078,7 +1081,7 @@ impl SupervisorInner {
         if self.pending_rearm || self.pending_normal_unload {
             return Err(SafetyError::NotArmed(self.safety.state().clone()));
         }
-        if self.active_trajectory.is_some() {
+        if self.active_trajectory.is_some() || self.grasp_run.is_some() {
             return Err(SafetyError::MotionBusy);
         }
 
@@ -1201,6 +1204,8 @@ impl SupervisorInner {
     /// Start a new action record; a running one is cancelled as SUPERSEDED.
     pub fn begin_action(&mut self, kind: &str, tag: Option<String>) -> u64 {
         let now = self.now_s();
+        // any new action ends a running grasp (its orchestrator sees the record cancelled)
+        self.grasp_run = None;
         if let Some(mut old) = self.last_action.take() {
             if old.is_running() {
                 old.state = "cancelled".into();
@@ -1215,6 +1220,7 @@ impl SupervisorInner {
         self.last_action = Some(ActionStatus {
             id, kind: kind.into(), tag, state: "running".into(), code: None, message: None, progress: 0.0,
             started_at: now, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
+            phase: None, iteration: None, error_px: None,
         });
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
         self.quintic_settle = None;
@@ -1236,6 +1242,7 @@ impl SupervisorInner {
             tracing::info!("Action {} ({}) {}{}", id, a.kind, state, code.map(|c| format!(" {c}")).unwrap_or_default());
         }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
+        if self.grasp_run.as_ref().is_some_and(|g| g.id == id) { self.grasp_run = None; }
     }
 
     /// Start a park (NormalUnload) and record it as a `park` action. Returns its id when
@@ -1291,6 +1298,15 @@ impl SupervisorInner {
     /// Install a planned path if nothing changed since `input` was taken.
     /// Returns (action id, expected duration).
     pub fn install_path(&mut self, input: &PlanInput, path: JointPath, kind: &str, tag: Option<String>) -> Result<(u64, f64), ArmError> {
+        self.check_plan_fresh(input)?;
+        let duration = self.start_path_motion(input, &path)?;
+        let id = self.begin_action(kind, tag);
+        self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Path(PathTrajectory::new(path)) });
+        Ok((id, duration + 0.5))
+    }
+
+    /// PLAN_STALE checks shared by every installed plan.
+    fn check_plan_fresh(&self, input: &PlanInput) -> Result<(), ArmError> {
         if self.safety.epoch_id() != input.epoch {
             return Err(MotionError::PlanStale("epoch changed while planning".into()).into());
         }
@@ -1303,17 +1319,119 @@ impl SupervisorInner {
         let moved = (0..6).any(|i| (f64::from(self.commanded_positions[i]) - input.q0[i]).abs() >= 1e-4)
             || (self.commanded_positions[6] - input.j7).abs() >= 1e-4;
         if moved { return Err(MotionError::PlanStale("commanded positions changed while planning".into()).into()); }
+        Ok(())
+    }
+
+    fn start_path_motion(&mut self, input: &PlanInput, path: &JointPath) -> Result<f64, ArmError> {
         let last = path.last().to_vec();
         self.safety.validate_motion_command(Some(input.epoch), &last, &self.config.limits)?;
-        let duration = path.duration;
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.target_positions = last;
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
-        let id = self.begin_action(kind, tag);
+        Ok(path.duration)
+    }
+
+    // ---- grasp ----
+
+    /// Runtime grasp setup (`config.grasp`, with the camera tilt taken from `camera_mount`).
+    /// None when the profile cannot grasp (no kinematics, gripper policy or grasp section).
+    pub fn grasp_setup(&self) -> Option<crate::grasp::GraspSetup> {
+        if self.config.dof != 7 || self.config.kinematics.is_none() || self.config.gripper_policy.is_none() { return None; }
+        let mut s = self.config.grasp.clone()?;
+        s.camera_tilt_deg = f64::from(self.config.camera_mount.tilt_deg);
+        Some(s)
+    }
+
+    /// Replace the runtime setup; `camera_tilt_deg` also sets `camera_mount.tilt_deg`.
+    pub fn set_grasp_setup(&mut self, setup: crate::grasp::GraspSetup) {
+        self.config.camera_mount.tilt_deg = setup.camera_tilt_deg as f32;
+        self.config.grasp = Some(setup);
+    }
+
+    /// Begin a `grasp` action after its approach was planned from `input`. Returns its id.
+    pub fn begin_grasp(&mut self, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
+        self.check_plan_fresh(input)?;
+        let id = self.begin_action("grasp", tag);
+        self.grasp_run = Some(crate::grasp::GraspRun { id, epoch: input.epoch, sub: crate::grasp::SubState::Idle, stop_requested: false });
+        self.set_grasp_phase(id, "start", 0.0, None, None);
+        Ok(id)
+    }
+
+    /// The grasp `id` is still the running action.
+    pub fn grasp_alive(&self, id: u64) -> bool {
+        self.grasp_run.as_ref().is_some_and(|g| g.id == id)
+            && self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running())
+    }
+
+    pub fn grasp_sub(&self, id: u64) -> Option<crate::grasp::SubState> {
+        self.grasp_run.as_ref().filter(|g| g.id == id).map(|g| g.sub.clone())
+    }
+
+    pub fn set_grasp_phase(&mut self, id: u64, phase: &str, progress: f32, iteration: Option<u32>, error_px: Option<f32>) {
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
+            a.phase = Some(phase.into());
+            a.progress = progress;
+            // centring stats stay in the record after the phase (result of the closed loop)
+            if iteration.is_some() { a.iteration = iteration; }
+            if error_px.is_some() { a.error_px = error_px; }
+        }
+    }
+
+    fn grasp_sub_ready(&self, id: u64) -> Result<u64, ArmError> {
+        let run = self.grasp_run.as_ref().filter(|g| g.id == id && self.grasp_alive(id))
+            .ok_or_else(|| ArmError::Internal("grasp is no longer running".into()))?;
+        if run.sub == crate::grasp::SubState::Running {
+            return Err(MotionError::MotionBusy("a grasp motion is running".into()).into());
+        }
+        Ok(run.epoch)
+    }
+
+    /// Install a planned sub-motion of grasp `id`. Returns its planned duration.
+    pub fn install_grasp_path(&mut self, id: u64, input: &PlanInput, path: JointPath) -> Result<f64, ArmError> {
+        let epoch = self.grasp_sub_ready(id)?;
+        if input.epoch != epoch { return Err(MotionError::PlanStale("epoch changed during the grasp".into()).into()); }
+        self.check_plan_fresh(input)?;
+        let duration = self.start_path_motion(input, &path)?;
         self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Path(PathTrajectory::new(path)) });
-        Ok((id, duration + 0.5))
+        if let Some(g) = self.grasp_run.as_mut() { g.sub = crate::grasp::SubState::Running; }
+        Ok(duration + 0.5)
+    }
+
+    /// Start a gripper sub-motion of grasp `id`. Returns its expected duration.
+    pub fn start_grasp_gripper(&mut self, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
+        let epoch = self.grasp_sub_ready(id)?;
+        let Some(policy) = self.config.gripper_policy.clone().filter(|_| self.config.dof >= 7) else {
+            return Err(MotionError::Unsupported("Gripper actions need a 7-DOF profile with a gripper policy".into()).into());
+        };
+        if epoch != self.safety.epoch_id() { return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into()); }
+        self.action_preconditions()?;
+        let motion = GripperMotion::new(request, policy, self.config.limits[6].clone(), self.commanded_positions[6]);
+        let duration = motion.expected_duration();
+        self.servo_target = None;
+        self.servo_settled_ticks.fill(0);
+        let mut target = self.commanded_positions.clone();
+        target[6] = motion.target;
+        self.target_positions = target;
+        self.safety.mark_motion_started()?;
+        self.last_heartbeat = Instant::now();
+        self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Gripper(motion) });
+        if let Some(g) = self.grasp_run.as_mut() { g.sub = crate::grasp::SubState::Running; }
+        Ok(duration)
+    }
+
+    /// End grasp `id` from its orchestrator (no-op when it already ended).
+    pub fn finish_grasp(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>, holding: Option<bool>, gap: Option<f32>) {
+        if !self.grasp_alive(id) { return; }
+        if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { self.stop_motion(); }
+        if state == "done" { self.set_grasp_phase(id, "done", 1.0, None, None); }
+        self.finish_action(id, state, code, message, None, holding, gap);
+    }
+
+    /// `/motion/stop`: also ends a grasp waiting between motions.
+    pub fn request_grasp_stop(&mut self) {
+        if let Some(g) = self.grasp_run.as_mut() { g.stop_requested = true; }
     }
 
     /// Start a gripper action. Returns (action id, expected duration).
@@ -1355,7 +1473,21 @@ impl SupervisorInner {
             _ => None,
         };
         if let Some((state, code, message)) = cause {
+            // a grasp sub-motion must not outlive its grasp
+            if kind == "grasp" && carried { self.stop_motion(); }
             self.finish_action(id, state, Some(code), Some(message), None, None, None);
+            return;
+        }
+        if kind == "grasp" {
+            if carried { return; }
+            let superseded = self.active_trajectory.is_some() || self.servo_target.is_some();
+            let ended: Option<(&str, &str, String)> = match self.grasp_run.as_ref().filter(|g| g.id == id) {
+                None => Some(("failed", "INTERNAL", "Grasp orchestrator ended".into())),
+                Some(_) if superseded => Some(("cancelled", "SUPERSEDED", "Replaced by new motion".into())),
+                Some(g) if g.sub == crate::grasp::SubState::Running || g.stop_requested => Some(("cancelled", "STOPPED", "Motion stopped".into())),
+                Some(_) => None,
+            };
+            if let Some((state, code, message)) = ended { self.finish_action(id, state, Some(code), Some(message), None, None, None); }
             return;
         }
         let superseded = (self.active_trajectory.is_some() && !carried) || self.servo_target.is_some();
@@ -1401,8 +1533,9 @@ impl SupervisorInner {
             self.gripper_high_torque_ticks = 0;
             self.gripper_low_torque_ticks = 0;
         }
+        let grasp_sub = self.grasp_run.as_ref().is_some_and(|g| Some(g.id) == action_id);
         if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
-            if a.id == id && a.is_running() { a.progress = out.progress; }
+            if a.id == id && a.is_running() && !grasp_sub { a.progress = out.progress; }
         }
         match out.status {
             StepStatus::Running => {}
@@ -1411,7 +1544,11 @@ impl SupervisorInner {
                 self.commanded_velocities.fill(0.0);
                 self.target_positions = self.commanded_positions.clone();
                 self.safety.mark_motion_finished();
-                if let Some(id) = action_id { self.finish_action(id, "done", None, None, settled, holding, gripper_gap_rad); }
+                if grasp_sub {
+                    if let Some(g) = self.grasp_run.as_mut() {
+                        g.sub = crate::grasp::SubState::Done(crate::grasp::SubDone { settled, holding, gripper_gap_rad, at: Instant::now() });
+                    }
+                } else if let Some(id) = action_id { self.finish_action(id, "done", None, None, settled, holding, gripper_gap_rad); }
             }
             StepStatus::Failed { code, message } => {
                 if code == "TRACKING_STALL" {
@@ -1426,7 +1563,9 @@ impl SupervisorInner {
                 self.commanded_velocities.fill(0.0);
                 self.target_positions = self.commanded_positions.clone();
                 self.safety.mark_motion_finished();
-                if let Some(id) = action_id { self.finish_action(id, "failed", Some(code), Some(message), None, None, None); }
+                if grasp_sub {
+                    if let Some(g) = self.grasp_run.as_mut() { g.sub = crate::grasp::SubState::Failed { code: code.into(), message }; }
+                } else if let Some(id) = action_id { self.finish_action(id, "failed", Some(code), Some(message), None, None, None); }
             }
         }
     }

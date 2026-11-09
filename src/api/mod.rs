@@ -40,6 +40,12 @@ pub fn create_router(supervisor: Arc<ArmSupervisor>) -> Router {
 
 /// [`create_router`] with an explicit detector control API upstream.
 pub fn create_router_with_detector(supervisor: Arc<ArmSupervisor>, detector: proxy::DetectorUpstream) -> Router {
+    let grasp = crate::grasp::GraspDeps::http(detector.clone(), Some(crate::grasp::setup_path_from_env()));
+    create_router_with(supervisor, detector, grasp)
+}
+
+/// [`create_router_with_detector`] with explicit grasp dependencies (detection source, setup file).
+pub fn create_router_with(supervisor: Arc<ArmSupervisor>, detector: proxy::DetectorUpstream, grasp: crate::grasp::GraspDeps) -> Router {
     Router::new()
         .route("/", get(serve_index))
         .route("/assets/jmuxer.min.js", get(serve_jmuxer))
@@ -55,6 +61,8 @@ pub fn create_router_with_detector(supervisor: Arc<ArmSupervisor>, detector: pro
         .route("/api/v1/action/move_to", post(rest::action_requires_lease))
         .route("/api/v1/action/move_relative", post(rest::action_requires_lease))
         .route("/api/v1/action/gripper", post(rest::action_requires_lease))
+        .route("/api/v1/action/grasp", post(rest::action_requires_lease))
+        .route("/api/v1/grasp/setup", get(rest::get_grasp_setup))
         .route("/api/v1/safety/e_stop", post(rest::safety_e_stop))
         .route("/api/v1/safety/clear_fault", post(rest::safety_clear_fault))
         .route("/api/v1/dataset/record/start", post(rest::dataset_record_start))
@@ -71,6 +79,7 @@ pub fn create_router_with_detector(supervisor: Arc<ArmSupervisor>, detector: pro
         .route("/api/v1/detection/latest", get(proxy::get_detection_latest))
         .route("/api/v1/detection/trigger", post(proxy::post_detection_trigger))
         .layer(axum::Extension(detector))
+        .layer(axum::Extension(grasp))
         .layer(middleware::from_fn(same_origin))
         .layer(TraceLayer::new_for_http())
         .with_state(supervisor)
