@@ -245,16 +245,16 @@ RECAMERA_DOCKER=tpuc_recamera \
   - 单帧：`POST /api/v1/detection/trigger {"pipelines": ["yolo"]}`、`["aruco"]` 或两者。抓取动作每轮对中发一次 YOLO 触发，标定每采集一个位姿发一次 ArUco 触发。
   - 连续：订阅（`/api/v1/vision/subscribe`），声明流水线和频率，由调用方保活，停止保活后失效。多个订阅按并集运行，默认最多 5 次结果/秒。驾驶舱叠加使用订阅。
 
-在 reCamera 上实测，机械臂未上力矩（rebot-teleop 1.3.0 / 1.3.1）：
+在 reCamera 上实测，机械臂未上力矩（rebot-teleop 1.3.1，两轮）：
 
 | | 运行在 | 每帧耗时 | 5 次结果/秒时整机 CPU |
 |---|---|---|---|
-| 待机（无调用方） | — | — | 约 30 %（视觉进程 5 %） |
-| YOLO | TPU | 47 ms | 42 % |
-| ArUco（640 × 360） | CPU | 37 ms | 52 % |
-| YOLO + ArUco | TPU + CPU | — | 60 %（1.3.0 实测，ArUco 提速前） |
+| 待机（无调用方） | — | — | 20–26 %（视觉进程 6 %） |
+| YOLO | TPU | 47 ms | 34 % |
+| ArUco（640 × 360） | CPU | 37 ms | 53 % |
+| YOLO + ArUco | TPU + CPU | — | 55 % |
 
-从待机发起单次触发，0.1–0.17 秒返回（1.3.0）。配置项、模型查找路径和 ArUco 分阶段耗时见 [vision README](kits/recamera-b601dm/vision/README.md)。
+从待机发起单次触发：ArUco 或两者 0.12–0.17 秒返回；YOLO 触发 0.1–0.6 秒。配置项、模型查找路径和 ArUco 分阶段耗时见 [vision README](kits/recamera-b601dm/vision/README.md)。
 
 ---
 

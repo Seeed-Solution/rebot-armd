@@ -360,16 +360,16 @@ in the `rebot-teleop` package. It owns the camera and provides:
     kept alive by the caller and dropped when keep-alives stop. Several subscriptions run as
     their union, at no more than 5 results/s by default. The cockpit overlay uses one.
 
-Measured on the reCamera with the arm's torque off (rebot-teleop 1.3.0 / 1.3.1):
+Measured on the reCamera with the arm's torque off (rebot-teleop 1.3.1, two runs):
 
 | | Runs on | Time per frame | Whole chip at 5 results/s |
 |---|---|---|---|
-| Standby (no caller) | — | — | about 30 % (vision process 5 %) |
-| YOLO | TPU | 47 ms | 42 % |
-| ArUco (640 × 360) | CPU | 37 ms | 52 % |
-| YOLO + ArUco | TPU + CPU | — | 60 % (measured on 1.3.0, before the ArUco speed-up) |
+| Standby (no caller) | — | — | 20–26 % (vision process 6 %) |
+| YOLO | TPU | 47 ms | 34 % |
+| ArUco (640 × 360) | CPU | 37 ms | 53 % |
+| YOLO + ArUco | TPU + CPU | — | 55 % |
 
-A single trigger from standby returns in 0.1–0.17 s (1.3.0). Settings, the model search path
+A single trigger from standby returns in 0.12–0.17 s for ArUco or both; YOLO triggers took 0.1–0.6 s. Settings, the model search path
 and the per-stage ArUco timing are in the
 [vision README](kits/recamera-b601dm/vision/README.md).
 
