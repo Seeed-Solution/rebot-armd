@@ -229,6 +229,13 @@ body.ui-expert .main {
 .det-btn.btn-primary::before { background: #fff; }
 .det-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
 .det-ctl { gap: 6px; flex-wrap: wrap; }
+/* vision mode selector (rebot-vision): HUD-scale segmented control next to Detect */
+.vmode { align-self: center; pointer-events: auto; padding: 2px; border-radius: 14px; background: rgba(255,255,255,0.9); border: 1px solid rgba(255,255,255,0.6); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+.vmode[hidden] { display: none; }
+.vmode button { min-height: 24px; padding: 0 9px; border-radius: 12px; font-size: 12px; font-weight: 600; color: var(--sc-color-text); cursor: pointer; touch-action: manipulation; }
+#vmode button.on { background: var(--sc-color-primary-dark); color: #fff; box-shadow: none; }
+.vmode button:disabled { opacity: 0.45; cursor: default; }
+.vmode button:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 1px; }
 .det-btn.det-trig::before { background: var(--sc-color-primary-dark); border-radius: 2px; }
 .det-btn.det-trig.busy::before { animation: breathe 0.9s ease-in-out infinite; }
 /* camera power-state pill: idle (grey) / working (green) / snapshot (amber) */
@@ -1152,7 +1159,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           </div>
         </div>
         <div class="hud">
-          <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button><button class="btn det-btn det-trig" id="btn-trigger" type="button" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span><button class="btn det-btn det-gset" id="btn-gset" type="button" data-i18n="gset.open" hidden>抓取设置</button></span>
+          <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button><span class="seg seg-sm vmode" id="vmode" role="radiogroup" data-i18n-aria="vm.label" aria-label="视觉模式" hidden><button type="button" role="radio" data-vm="off" data-i18n="vm.off">关</button><button type="button" role="radio" data-vm="yolo" data-i18n="vm.yolo">YOLO</button><button type="button" role="radio" data-vm="aruco" data-i18n="vm.aruco">ArUco</button><button type="button" role="radio" data-vm="both" data-i18n="vm.both">两者</button></span><button class="btn det-btn det-trig" id="btn-trigger" type="button" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span><button class="btn det-btn det-gset" id="btn-gset" type="button" data-i18n="gset.open" hidden>抓取设置</button></span>
           <span class="sc-status-badge" id="cam-chip" data-i18n="v.chip.connecting">连接中</span>
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
           <span class="sc-status-badge plain" id="det-chip" data-i18n="det.none" hidden>检测 --</span>
@@ -1543,7 +1550,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
       <h3 id="gset-title" data-i18n="gset.title">抓取设置</h3>
       <button class="btn calib-x" id="gset-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
     </div>
-    <p class="calib-hint" data-i18n="gset.hint">开启「识别」后点画面里的框即可抓取。下面三项每次换桌面或相机支架后设置一次，保存在机械臂上。</p>
+    <p class="calib-hint" data-i18n="gset.hint">选择 YOLO 或「两者」（或开启「识别」）后点画面里的框即可抓取。下面三项每次换桌面或相机支架后设置一次，保存在机械臂上。</p>
     <div class="gset-row">
       <div class="gset-k"><span data-i18n="gset.table">桌面高度</span><b class="mono" id="gset-table">--</b></div>
       <button class="btn" id="gset-table-tcp" type="button" data-i18n="gset.table.tcp">用当前夹爪尖高度</button>
@@ -1588,6 +1595,9 @@ const I18N = {
     'det.on': '识别 · 开', 'det.off': '识别 · 关', 'det.na': '识别 · 不可用',
     'det.tip.on': '物体识别已开启，点击关闭', 'det.tip.off': '物体识别已关闭，点击开启',
     'det.tip.na': '识别服务不可用（检测程序未运行或版本过旧）', 'det.fail': '切换识别失败',
+    'vm.label': '视觉模式', 'vm.off': '关', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco', 'vm.both': '两者',
+    'vm.tip': '视觉模式：YOLO 识别物体，ArUco 识别标记，或两者同时运行。选择后开启持续识别，「关」停止识别',
+    'vm.tip.na': '视觉模式不可用（视觉服务未运行）', 'vm.fail': '切换视觉模式失败', 'vm.noyolo': 'YOLO 模型未加载，只能使用 ArUco',
     'det.trig': '单次识别', 'det.trig.busy': '识别中…', 'det.trig.tip': '临时开启识别，抓拍一帧结果后恢复原状态',
     'det.trig.none': '单次识别未返回目标', 'det.trig.ok': '单次识别：{n} 个目标', 'det.trig.fail': '单次识别失败', 'det.restore.fail': '识别未能关闭，请手动关闭持续识别',
     'det.fps.idle': '待机 {n} FPS', 'det.fps.work': '工作 {n} FPS', 'det.fps.snap': '抓拍中', 'det.fps.tip': '相机推理帧率：待机 {idle} FPS / 工作 {active} FPS',
@@ -1599,7 +1609,7 @@ const I18N = {
     'grasp.code.DETECTION_UNAVAILABLE': '识别服务不可用', 'grasp.code.IK': '目标超出机械臂可达范围', 'grasp.code.WORKSPACE_VIOLATION': '目标超出安全工作空间（地面/边界）',
     'grasp.code.TRACKING_STALL': '机械臂跟不上轨迹', 'grasp.code.ESTOP_ACTIVE': '急停', 'grasp.code.LEASE_LOST': '控制权已变化', 'grasp.code.STOPPED': '手动停止', 'grasp.code.SUPERSEDED': '被新的操作替代',
     'grasp.code.WATCHDOG': '控制连接超时', 'grasp.code.FAULT': '故障', 'grasp.code.MOTION_BUSY': '机械臂正在运动', 'grasp.code.UNSUPPORTED': '当前配置不支持抓取', 'grasp.code.INVALID_COMMAND': '参数无效',
-    'gset.open': '抓取设置', 'gset.title': '抓取设置', 'gset.hint': '开启「识别」后点画面里的框即可抓取。下面三项每次换桌面或相机支架后设置一次，保存在机械臂上。',
+    'gset.open': '抓取设置', 'gset.title': '抓取设置', 'gset.hint': '选择 YOLO 或「两者」（或开启「识别」）后点画面里的框即可抓取。下面三项每次换桌面或相机支架后设置一次，保存在机械臂上。',
     'gset.table': '桌面高度', 'gset.table.tcp': '用当前夹爪尖高度', 'gset.table.hint': '先把夹爪尖慢慢点动到刚好碰到桌面，再点上面的按钮。',
     'gset.grip': '夹爪位置（画面）', 'gset.grip.pick': '在画面上点选', 'gset.grip.hint': '夹爪朝下停在接近高度，张开，把物体放在桌面上两指正中间，然后点画面上物体的中心。', 'gset.grip.tap': '点击画面中夹爪之间物体的中心',
     'gset.approach': '接近高度 mm', 'gset.grasp': '抓取高度 mm', 'gset.tilt': '相机俯角 °', 'gset.save': '保存高度', 'gset.reload': '重新读取',
@@ -1729,6 +1739,9 @@ const I18N = {
     'det.on': 'Detect · On', 'det.off': 'Detect · Off', 'det.na': 'Detect · N/A',
     'det.tip.on': 'Object detection is on. Click to turn it off', 'det.tip.off': 'Object detection is off. Click to turn it on',
     'det.tip.na': 'Detection service unavailable (detector not running or too old)', 'det.fail': 'Could not switch detection',
+    'vm.label': 'Vision mode', 'vm.off': 'Off', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco', 'vm.both': 'Both',
+    'vm.tip': 'Vision mode: YOLO for objects, ArUco for markers, or both at once. Selecting one turns continuous detection on; Off stops it',
+    'vm.tip.na': 'Vision mode unavailable (vision service not running)', 'vm.fail': 'Could not switch the vision mode', 'vm.noyolo': 'YOLO model not loaded; only ArUco is available',
     'det.trig': 'Snapshot', 'det.trig.busy': 'Detecting…', 'det.trig.tip': 'Turn detection on briefly, grab one result, then restore the previous state',
     'det.trig.none': 'Snapshot returned no targets', 'det.trig.ok': 'Snapshot: {n} targets', 'det.trig.fail': 'Snapshot failed', 'det.restore.fail': 'Could not switch detection back off, turn it off manually',
     'det.fps.idle': 'Idle {n} FPS', 'det.fps.work': 'Active {n} FPS', 'det.fps.snap': 'Capturing', 'det.fps.tip': 'Camera inference rate: idle {idle} FPS / active {active} FPS',
@@ -1740,7 +1753,7 @@ const I18N = {
     'grasp.code.DETECTION_UNAVAILABLE': 'detection service unavailable', 'grasp.code.IK': 'target out of reach', 'grasp.code.WORKSPACE_VIOLATION': 'target outside the safe workspace (floor/boundary)',
     'grasp.code.TRACKING_STALL': 'arm could not follow the path', 'grasp.code.ESTOP_ACTIVE': 'E-Stop', 'grasp.code.LEASE_LOST': 'control lease changed', 'grasp.code.STOPPED': 'stopped by user', 'grasp.code.SUPERSEDED': 'replaced by another command',
     'grasp.code.WATCHDOG': 'control connection timed out', 'grasp.code.FAULT': 'fault', 'grasp.code.MOTION_BUSY': 'arm is moving', 'grasp.code.UNSUPPORTED': 'this profile cannot grasp', 'grasp.code.INVALID_COMMAND': 'invalid parameters',
-    'gset.open': 'Grasp setup', 'gset.title': 'Grasp setup', 'gset.hint': 'Turn on Detect, then tap a box in the video to grasp it. Set the three items below once per table or camera mount; they are stored on the arm.',
+    'gset.open': 'Grasp setup', 'gset.title': 'Grasp setup', 'gset.hint': 'Select YOLO or Both (or turn on Detect), then tap a box in the video to grasp it. Set the three items below once per table or camera mount; they are stored on the arm.',
     'gset.table': 'Table height', 'gset.table.tcp': 'Use current TCP height', 'gset.table.hint': 'First jog the jaw tips down until they just touch the table, then tap the button above.',
     'gset.grip': 'Grip point (image)', 'gset.grip.pick': 'Tap on the image', 'gset.grip.hint': 'With the gripper pointing down at approach height and open, put an object on the table centred between the jaws, then tap its centre in the video.', 'gset.grip.tap': 'Tap the centre of the object between the jaws',
     'gset.approach': 'Approach mm', 'gset.grasp': 'Grasp mm', 'gset.tilt': 'Camera tilt °', 'gset.save': 'Save heights', 'gset.reload': 'Reload',
@@ -2948,6 +2961,7 @@ function renderDetToggle() {
     setText(pill, txt);
     pill.title = t('det.fps.tip', { idle, active });
   }
+  if (typeof renderVisionMode === 'function') renderVisionMode();
 }
 
 /* Single-shot detection. Primary: POST /detection/trigger, which runs inference on a frame newer than the call
@@ -3071,11 +3085,15 @@ async function refreshDetState() {
   if (DET.busy || DET.snap) return;
   try { detApply(await detRequest('GET')); }
   catch (_) { detApply(null); }
+  if (!VM.busy) await vmRefresh();
 }
 async function toggleDet() {
   if (!DET.avail || DET.busy || DET.snap) return;
   DET.busy = true; renderDetToggle();
-  try { const data = await detRequest('POST', { enabled: !DET.enabled }); DET.busy = false; S.detHoldUntil = 0; detApply(data); }
+  try {
+    const data = await detRequest('POST', { enabled: !DET.enabled }); DET.busy = false; S.detHoldUntil = 0; detApply(data);
+    if (VM.state === 'ok') vmRefresh(); // enabling while Off selects the last active mode
+  }
   catch (e) {
     DET.busy = false;
     toast(t('det.fail'), 'err', e.status ? String(e.status) : '');
@@ -3093,6 +3111,96 @@ function initDetToggle() {
     DET.timer = setTimeout(poll, DET.avail ? 10000 : 30000);
   };
   poll();
+}
+
+/* Vision mode (rebot-vision): GET/POST /api/v1/vision/mode, off | yolo | aruco | both.
+   VM.state: null = not probed, 'ok', 'na' (route failed, shown disabled), 'none' (404: provider has no
+   mode API, selector hidden). Selecting a mode other than Off also turns continuous inference on; the
+   reply carries enabled/fps like /detection/inference and updates the Detect toggle. */
+const VM_MODES = ['off', 'yolo', 'aruco', 'both'];
+const VM = { state: null, mode: null, yolo: true, busy: false };
+async function vmRequest(method, body, keepalive = false) {
+  const ctl = new AbortController();
+  const tm = setTimeout(() => ctl.abort(), 4000);
+  try {
+    const res = await fetch('/api/v1/vision/mode', {
+      method, signal: ctl.signal, cache: 'no-store', keepalive,
+      headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+    if (!res.ok || !data || typeof data.mode !== 'string') {
+      const e = new Error((data && data.error) || 'HTTP ' + res.status); e.status = res.status; throw e;
+    }
+    return data;
+  } finally { clearTimeout(tm); }
+}
+function vmApply(data) {
+  VM.state = 'ok';
+  VM.mode = VM_MODES.includes(data.mode) ? data.mode : null;
+  VM.yolo = !(data.available && data.available.yolo === false);
+  if (typeof data.enabled === 'boolean') detApply({ enabled: data.enabled, fps: data.fps, active_fps: data.active_fps, idle_fps: data.idle_fps });
+  renderVisionMode();
+}
+function vmFailed(e) {
+  VM.state = e && e.status === 404 ? 'none' : 'na';
+  renderVisionMode();
+}
+async function vmRefresh() {
+  try { vmApply(await vmRequest('GET')); } catch (e) { vmFailed(e); }
+}
+function renderVisionMode() {
+  const wrap = $('vmode');
+  if (!wrap) return;
+  wrap.hidden = VM.state === null || VM.state === 'none';
+  const ok = VM.state === 'ok';
+  wrap.title = t(ok ? 'vm.tip' : 'vm.tip.na');
+  for (const b of wrap.querySelectorAll('button[data-vm]')) {
+    const m = b.dataset.vm, on = ok && m === VM.mode;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-checked', String(on));
+    b.disabled = !ok || VM.busy || DET.snap || (!VM.yolo && (m === 'yolo' || m === 'both'));
+  }
+}
+async function setVisionMode(mode) {
+  if (VM.state !== 'ok' || VM.busy || mode === VM.mode && (mode === 'off' || DET.enabled)) return;
+  VM.busy = true; renderVisionMode();
+  try {
+    const data = await vmRequest('POST', mode === 'off' ? { mode } : { mode, enabled: true });
+    VM.busy = false; S.detHoldUntil = 0; vmApply(data);
+  } catch (e) {
+    VM.busy = false;
+    toast(t(e.status === 409 ? 'vm.noyolo' : 'vm.fail'), 'err', e.status ? String(e.status) : '');
+    if (e.status === 502 || e.status === 404) vmFailed(e); else renderVisionMode();
+  }
+}
+/* Hand-eye calibration needs markers: while the drawer is open the camera runs ArUco (Both when YOLO
+   was on) with continuous inference, and the previous mode is restored on close or page hide. */
+const CALVM = { prev: null, task: Promise.resolve() };
+function calVisionMode(open) {
+  CALVM.task = CALVM.task.then(async () => {
+    if (open) {
+      if (CALVM.prev) return;
+      let cur;
+      try { cur = await vmRequest('GET'); vmApply(cur); } catch (e) { vmFailed(e); return; }
+      const want = cur.mode === 'yolo' ? 'both' : cur.mode === 'off' ? 'aruco' : cur.mode;
+      if (want === cur.mode && cur.enabled) return;
+      CALVM.prev = { mode: cur.mode, enabled: !!cur.enabled };
+      try { vmApply(await vmRequest('POST', { mode: want, enabled: true })); }
+      catch (e) { CALVM.prev = null; toast(t(e.status === 409 ? 'vm.noyolo' : 'vm.fail'), 'warn', e.status ? String(e.status) : ''); }
+    } else if (CALVM.prev) {
+      const prev = CALVM.prev; CALVM.prev = null;
+      try { vmApply(await vmRequest('POST', prev)); } catch (e) { toast(t('vm.fail'), 'warn', e.status ? String(e.status) : ''); }
+    }
+  });
+  return CALVM.task;
+}
+function initVisionMode() {
+  $('vmode').addEventListener('click', (e) => { const b = e.target.closest('button[data-vm]'); if (b) setVisionMode(b.dataset.vm); });
+  i18nHooks.push(renderVisionMode);
+  // a closed tab must not leave the camera in the calibration mode
+  window.addEventListener('pagehide', () => { if (CALVM.prev) { vmRequest('POST', CALVM.prev, true).catch(() => {}); CALVM.prev = null; } });
 }
 
 /* =================================================================
@@ -3723,6 +3831,7 @@ function calOpen(open) {
   clearInterval(CAL.liveTimer); CAL.liveTimer = null;
   if (open) { calRender(); CAL.liveTimer = setInterval(calLive, 250); $('calib-cap').focus({ preventScroll: true }); }
   else $('btn-calib').focus({ preventScroll: true });
+  if (open !== calOpen.was) { calOpen.was = open; calVisionMode(open); }
 }
 function initCalib() {
   $('btn-calib').addEventListener('click', () => calOpen(true));
@@ -6375,6 +6484,7 @@ function renderCart(live, op) {
 
 // Expose core detection & overlay symbols for testing and telemetry inspection
 window.parseDetections = parseDetections;
+window.__vision = { VM, CALVM, calVisionMode, setVisionMode, vmRefresh };
 window.getVideoContentRect = getVideoContentRect;
 window.fitCanvas = fitCanvas;
 window.drawOverlay = drawOverlay;
@@ -6435,6 +6545,7 @@ loadSchema();
 connectWS();
 connectDetectionWS();
 initDetToggle();
+initVisionMode();
 initCalib();
 videoStart();
 requestAnimationFrame(frame);

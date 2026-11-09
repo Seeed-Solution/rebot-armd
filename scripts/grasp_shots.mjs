@@ -30,6 +30,7 @@ const srv = http.createServer((req, res) => {
   if (u === '/api/v1/grasp/setup') return json(res, { supported: true, setup: SETUP, path: '/userdata/rebot-teleop/grasp_setup.json' });
   if (u === '/api/v1/safety/e_stop') return json(res, { safety_state: 'EStop', epoch_id: 2 });
   if (u === '/api/v1/detection/inference') return json(res, { enabled: true, fps: 5, active_fps: 5, idle_fps: 1 });
+  if (u === '/api/v1/vision/mode') return json(res, { api_version: 1, mode: 'yolo', modes: ['off', 'yolo', 'aruco', 'both'], enabled: true, fps: 5, active_fps: 5, idle_fps: 1, available: { yolo: true, aruco: true } });
   res.writeHead(404); res.end();
 }).listen(0, '127.0.0.1');
 await new Promise((r) => srv.once('listening', r));
