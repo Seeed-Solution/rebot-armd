@@ -343,6 +343,31 @@ body.offline .armview { bottom: 56px; }
 .sw-text b { font-size: 15px; font-weight: 600; }
 .sw-text small { font-size: 11px; line-height: 1.3; color: var(--sc-color-text-secondary); }
 .sw.on { border-color: var(--sc-color-primary); background: var(--sc-color-primary-soft); }
+/* gravity compensation (hand-guiding): hold-to-confirm switch, status banner */
+.gc-sw { width: 100%; }
+.gc-sw .sw-track .fill { background: #d48806; }
+.gc-sw.on .sw-track { background: #d48806; }
+.gc-sw.on { border-color: #d48806; background: var(--sc-status-warning-bg); }
+.gc-sw.blocked { opacity: .55; }
+.gc-sw.blocked:hover { border-color: #e3e8dc; }
+.gc-sw .sw-text small { white-space: normal; }
+.gc-banner { display: grid; gap: 8px; padding: 12px; border-radius: var(--sc-radius-lg); border: 2px solid #d48806; background: var(--sc-status-warning-bg); color: #613400; order: -3; }
+.gc-banner[hidden] { display: none; }
+.gc-head { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 15px; }
+.gc-head svg { width: 20px; height: 20px; flex: none; }
+.gc-phase { margin-left: auto; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.gc-ramp { height: 6px; border-radius: 3px; background: rgba(212,136,6,0.22); overflow: hidden; }
+.gc-ramp i { display: block; height: 100%; width: 0; background: #d48806; transition: width .12s linear; }
+.gc-banner.active .gc-ramp i { background: var(--sc-color-primary); }
+.gc-hint { font-size: 12px; line-height: 1.4; }
+.gc-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.gc-actions .btn { flex: 1 1 auto; min-height: 40px; justify-content: center; }
+.gc-banner .btn.btn-gc-exit { background: #d48806; border-color: #d48806; color: #fff; font-weight: 700; }
+.gc-banner .btn.gc-rec { background: #fff; color: #1f2937; }
+.gc-banner .btn.gc-rec.rec-on { color: var(--sc-status-danger-fg); border-color: var(--sc-status-danger-fg); }
+#gc-chip { display: none; background: #d48806; color: #fff; }
+body.gc #gc-chip { display: inline-flex; }
+body.gc .disc:not(#pad-sgrip), body.gc .pad, body.gc .preset, body.gc .pose-btn, body.gc .jrow:not(.grip) .jbtn, body.gc .cart-zone .jbtn { opacity: .35; filter: saturate(.3); }
 .sw.on .sw-text b { color: var(--sc-color-primary-dark); }
 .sw.clear { border-color: #ffd591; background: var(--sc-status-warning-bg); }
 .sw.clear .sw-text b { color: var(--sc-status-warning-fg); }
@@ -926,6 +951,12 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   body.ui-simple .sw.clear { background: rgba(255,247,230,0.85); }
   body.ui-simple .btn-estop { min-height: 40px; padding: 0 14px; border-radius: 20px; font-size: 14px; background: rgba(220,38,38,0.85); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); box-shadow: 0 4px 14px rgba(220,38,38,0.35); }
   body.ui-simple .btn-estop svg { width: 18px; height: 18px; }
+  body.ui-simple .safety { flex-direction: column; align-items: stretch; }
+  body.ui-simple .gc-sw .sw-text small { display: none; }
+  body.ui-simple .gc-sw.blocked .sw-text small { display: block; font-size: 10px; color: #1f2937; }
+  body.ui-simple .gc-banner { position: fixed; z-index: 170; top: 50px; left: 50%; transform: translateX(-50%); width: min(92vw, 420px);
+    backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%); background: rgba(255,247,230,0.92); box-shadow: 0 6px 18px rgba(0,0,0,0.25); }
+  body.ui-simple.gc .gc-sw { display: none; }
   body.ui-simple .btn-estop small { display: none; }
 
   /* presets: small pills on the right edge */
@@ -1136,6 +1167,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
           <span class="sc-status-badge plain" id="det-chip" data-i18n="det.none" hidden>检测 --</span>
           <span class="sc-status-badge is-danger" id="rec-chip" data-i18n="rec.chip0">录制 00:00</span>
+          <span class="sc-status-badge" id="gc-chip" data-i18n="gc.chip">拖动示教</span>
           <span class="sc-status-badge" id="act-chip" role="status" aria-live="polite" hidden></span>
         </div>
         <div class="armview only-expert" id="armview">
@@ -1317,6 +1349,10 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
             <span><span data-i18n="estop">急停</span><small>E-STOP</small></span>
           </button>
         </div>
+        <button class="sw gc-sw" id="btn-gc" role="switch" aria-checked="false" hidden>
+          <span class="sw-track"><i class="fill"></i><i class="thumb"></i></span>
+          <span class="sw-text"><b data-i18n="gc.title">重力补偿 / 拖动示教</b><small id="gc-sub" data-i18n="gc.hold">按住 0.6 秒进入</small></span>
+        </button>
         <div class="lock-note" id="lock-note">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
           <span id="lock-txt" data-i18n="lock.offline">遥测断开，控制已锁定</span>
@@ -1327,6 +1363,19 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
         </button>
       </div>
 
+      <!-- gravity compensation status: top of the cockpit (simple) or below the safety card (expert), moved by setUi -->
+        <div class="sc-card gc-banner" id="gc-banner" role="status" aria-live="polite" hidden>
+          <div class="gc-head">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 11V6a2 2 0 0 0-4 0v5"/><path d="M14 10V4a2 2 0 0 0-4 0v6"/><path d="M10 10.5V6a2 2 0 0 0-4 0v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></svg>
+            <span data-i18n="gc.active">拖动示教中</span><span class="gc-phase" id="gc-phase">--</span>
+          </div>
+          <div class="gc-ramp" role="progressbar" aria-valuemin="0" aria-valuemax="100" id="gc-ramp"><i id="gc-ramp-bar"></i></div>
+          <div class="gc-hint" id="gc-hint" data-i18n="gc.hint">用手扶住机械臂移动。摇杆和按键已停用，夹爪可用。</div>
+          <div class="gc-actions">
+            <button class="btn gc-rec" id="btn-gc-rec" type="button"></button>
+            <button class="btn btn-gc-exit" id="btn-gc-exit" type="button" data-i18n="gc.exit">退出并锁定位置</button>
+          </div>
+        </div>
       <!-- simple: one integrated cockpit (safety block is moved in here by setUi) -->
       <div class="sc-card cockpit only-simple" id="cockpit">
         <div id="ck-safety"></div>
@@ -1613,6 +1662,19 @@ const I18N = {
     'grip': '夹爪', 'grip.opening': '夹爪开度', 'stick.grip6': '夹爪 J6',
     'dj.lean': '前倾', 'dj.back': '后仰', 'dj.ccw': '逆转', 'dj.cw': '顺转', 'dj.up': '上翘', 'dj.down': '下倾', 'dj.raise': '抬高', 'dj.lower': '下压', 'dj.rl': '旋左', 'dj.rr': '旋右',
     'stick.left': '左摇杆', 'stick.right': '右摇杆', 'stick.j2': 'J2 大臂', 'stick.j1': 'J1 底座', 'stick.j3': 'J3 小臂', 'stick.j5': 'J5 腕转', 'part.wrist': '手腕',
+    'gc.title': '重力补偿 / 拖动示教', 'gc.hold': '按住 0.6 秒进入', 'gc.active': '拖动示教中', 'gc.chip': '拖动示教', 'gc.exit': '退出并锁定位置',
+    'gc.hint': '用手扶住机械臂移动。摇杆和按键已停用，夹爪可用。', 'gc.hint.ramp': '正在建立重力补偿，请先扶稳，不要松手。',
+    'gc.ph.ramp_in': '建立补偿 {n}%', 'gc.ph.active': '可以拖动', 'gc.ph.exiting': '正在锁定位置…', 'gc.ph.exit_failed': '锁定未确认 · 刚性保持',
+    'gc.rec.start': '● 开始录制', 'gc.rec.on': '■ 停止录制 {t}', 'gc.entering': '正在进入拖动示教…', 'gc.entered': '已进入拖动示教：扶稳机械臂，补偿建立后即可拖动', 'gc.enter_fail': '无法进入拖动示教：',
+    'gc.sticks_off': '拖动示教中摇杆已停用，请用手移动机械臂（夹爪可用）',
+    'gc.b.NOT_ARMED': '先使能机械臂', 'gc.b.MOTION_BUSY': '等机械臂停稳', 'gc.b.LEASE_REQUIRED': '需要控制权', 'gc.b.GRAVITY_COMP_NOT_STATIONARY': '机械臂还在运动',
+    'gc.b.FEEDBACK_STALE': '电机反馈超时', 'gc.b.ESTOP_ACTIVE': '急停已锁定', 'gc.b.FAULT_ACTIVE': '存在故障', 'gc.b.HANDOVER_SETTLING': '控制权交接中',
+    'gc.b.GRAVITY_COMP_JOINT_LIMIT': '有关节靠近限位', 'gc.b.GRAVITY_MODEL_UNAVAILABLE': '重力模型不可用', 'gc.b.observer': '观察模式，需先接管控制权', 'gc.b.offline': '遥测断开',
+    'gc.x.REQUESTED': '已退出拖动示教，位置已锁定', 'gc.x.STOPPED': '已停止拖动示教，位置已锁定', 'gc.x.ESTOP': '急停：已退出拖动示教并锁定位置',
+    'gc.x.FAULT': '故障：已退出拖动示教并锁定位置', 'gc.x.BUS_LOSS': 'CAN 总线中断：已退出拖动示教', 'gc.x.FEEDBACK_STALE': '电机反馈超时：已退出拖动示教并锁定位置',
+    'gc.x.WATCHDOG': '心跳超时：已退出拖动示教并锁定位置', 'gc.x.LEASE_LOST': '控制权丢失：已退出拖动示教并锁定位置', 'gc.x.TORQUE_LOST': '电机已失能：拖动示教结束',
+    'gc.x.GRAVITY_COMP_OVERSPEED': '关节速度过快（可能在下坠）：已锁定位置', 'gc.x.GRAVITY_COMP_SAG': '补偿不足，机械臂在下沉：已锁定位置',
+    'gc.x.GRAVITY_COMP_JOINT_LIMIT': '关节接近限位：已锁定位置', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': '重力模型不可用：已锁定位置', 'gc.x.other': '已退出拖动示教：{m}',
     'en.enable': '使能', 'en.holding': '保持中 · 按住恢复', 'en.hold': '按住 0.6 秒', 'en.reset_estop': '⚠️ 点击复位急停', 'en.clear_fault': '⚠️ 点击清除故障', 'en.on_unconfirmed': '控制已开启 · 未确认',
     'en.sub_reset': '复位后再长按使能', 'en.sub_off': '按住 0.6 秒失能',
     'estop': '急停', 'estop.aria': '紧急停止',
@@ -1737,6 +1799,19 @@ const I18N = {
     'grip': 'Gripper', 'grip.opening': 'Gripper opening', 'stick.grip6': 'Gripper J6',
     'dj.lean': 'Lean fwd', 'dj.back': 'Lean back', 'dj.ccw': 'CCW', 'dj.cw': 'CW', 'dj.up': 'Tilt up', 'dj.down': 'Tilt down', 'dj.raise': 'Raise', 'dj.lower': 'Lower', 'dj.rl': 'Rot. L', 'dj.rr': 'Rot. R',
     'stick.left': 'Left stick', 'stick.right': 'Right stick', 'stick.j2': 'J2 Shoulder', 'stick.j1': 'J1 Base', 'stick.j3': 'J3 Elbow', 'stick.j5': 'J5 Wrist roll', 'part.wrist': 'Wrist',
+    'gc.title': 'Gravity comp / Hand-guide', 'gc.hold': 'Hold 0.6 s to enter', 'gc.active': 'Hand-guiding', 'gc.chip': 'Hand-guide', 'gc.exit': 'Exit and hold pose',
+    'gc.hint': 'Move the arm by hand. Sticks and keys are off; the gripper still works.', 'gc.hint.ramp': 'Building up gravity compensation. Keep a hand on the arm.',
+    'gc.ph.ramp_in': 'Ramping {n}%', 'gc.ph.active': 'Free to move', 'gc.ph.exiting': 'Locking pose…', 'gc.ph.exit_failed': 'Lock not confirmed · stiff hold',
+    'gc.rec.start': '● Start recording', 'gc.rec.on': '■ Stop recording {t}', 'gc.entering': 'Entering hand-guiding…', 'gc.entered': 'Hand-guiding on: keep a hand on the arm until the ramp completes', 'gc.enter_fail': 'Cannot enter hand-guiding: ',
+    'gc.sticks_off': 'Sticks are off while hand-guiding; move the arm by hand (gripper still works)',
+    'gc.b.NOT_ARMED': 'Enable the arm first', 'gc.b.MOTION_BUSY': 'Wait until the arm stops', 'gc.b.LEASE_REQUIRED': 'Control lease required', 'gc.b.GRAVITY_COMP_NOT_STATIONARY': 'Arm is still moving',
+    'gc.b.FEEDBACK_STALE': 'Motor feedback is late', 'gc.b.ESTOP_ACTIVE': 'E-Stop latched', 'gc.b.FAULT_ACTIVE': 'Fault active', 'gc.b.HANDOVER_SETTLING': 'Control handover settling',
+    'gc.b.GRAVITY_COMP_JOINT_LIMIT': 'A joint is near its limit', 'gc.b.GRAVITY_MODEL_UNAVAILABLE': 'Gravity model unavailable', 'gc.b.observer': 'Observer mode, take over control first', 'gc.b.offline': 'Telemetry offline',
+    'gc.x.REQUESTED': 'Hand-guiding off, pose held', 'gc.x.STOPPED': 'Hand-guiding stopped, pose held', 'gc.x.ESTOP': 'E-Stop: hand-guiding ended, pose held',
+    'gc.x.FAULT': 'Fault: hand-guiding ended, pose held', 'gc.x.BUS_LOSS': 'CAN bus lost: hand-guiding ended', 'gc.x.FEEDBACK_STALE': 'Motor feedback late: hand-guiding ended, pose held',
+    'gc.x.WATCHDOG': 'Heartbeat timeout: hand-guiding ended, pose held', 'gc.x.LEASE_LOST': 'Control lost: hand-guiding ended, pose held', 'gc.x.TORQUE_LOST': 'Motors disabled: hand-guiding ended',
+    'gc.x.GRAVITY_COMP_OVERSPEED': 'Joint too fast (falling?): pose held', 'gc.x.GRAVITY_COMP_SAG': 'Compensation too weak, the arm sagged: pose held',
+    'gc.x.GRAVITY_COMP_JOINT_LIMIT': 'Joint near its limit: pose held', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': 'Gravity model unavailable: pose held', 'gc.x.other': 'Hand-guiding ended: {m}',
     'en.enable': 'Enable', 'en.holding': 'Holding · hold to resume', 'en.hold': 'Hold 0.6 s', 'en.reset_estop': '⚠️ Tap to reset E-Stop', 'en.clear_fault': '⚠️ Tap to clear fault', 'en.on_unconfirmed': 'On · unconfirmed',
     'en.sub_reset': 'Then hold to enable', 'en.sub_off': 'Hold 0.6 s to disable',
     'estop': 'E-Stop', 'estop.aria': 'Emergency stop',
@@ -2070,7 +2145,7 @@ function toast(msg, kind = '', code = '') {
 function buzz(ms) { if (navigator.vibrate) try { navigator.vibrate(ms); } catch (_) {} }
 function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (_) {} return null; }
 
-const actuatorPaths = new Set(['/api/v1/torque', '/api/v1/arm', '/api/v1/motion/home', '/api/v1/motion/jog', '/api/v1/motion/servo', '/api/v1/motion/unload', '/api/v1/motion/stop', '/api/v1/safety/clear_fault']);
+const actuatorPaths = new Set(['/api/v1/mode/gravity_comp', '/api/v1/torque', '/api/v1/arm', '/api/v1/motion/home', '/api/v1/motion/jog', '/api/v1/motion/servo', '/api/v1/motion/unload', '/api/v1/motion/stop', '/api/v1/safety/clear_fault']);
 const pendingCommands = new Map();
 let nextRequestId = 0;
 function rejectPendingCommands(message) {
@@ -2249,6 +2324,7 @@ function connectWS() {
     }
     if (!Array.isArray(o.positions)) return;
     S.obs = o; S.obsAt = Date.now(); S.wsCount++;
+    gcOnObs(o);
     renderActionChip(o);
     graspOnObs(o);
     syncEpoch(o.epoch_id);
@@ -4044,6 +4120,7 @@ setInterval(() => {
   const moving = v.some((x) => x !== 0);
   const now = performance.now();
   if (S.presetRunning) return;
+  if (gcOn()) { S.servoTarget = null; gcInput(v); return; } // hand-guiding: no servo frames
   if (!moving || !isLive() || !isOperational() || S.epoch == null) { S.servoTarget = null; return; }
   const pos = S.obs.positions;
   if (!S.servoTarget || now - S.servoLastAt > 300) {
@@ -4219,6 +4296,7 @@ function cartSend(t) {
 
 // The only WS servo sender. Never sends without a granted lease generation.
 function sendServoFrame(positions) {
+  if (gcOn()) return false; // the server would answer MOTION_BUSY
   if (!S.ws || S.ws.readyState !== 1) return false;
   if (S.leaseGeneration == null) return false;
   S.streamActive = true;
@@ -4235,6 +4313,11 @@ function sendServoFrame(positions) {
 
 function cartTick() {
   C.sending = false;
+  if (gcOn()) {
+    if (Object.values(cartVelocity()).some((x) => x !== 0)) gcSticksOff();
+    if (S.obs && S.obs.positions.length >= 5) cartSync(S.obs.positions);
+    C.tailUntil = 0; return;
+  }
   if (S.mode !== 'cart' || !S.obs || S.obs.positions.length < 5) return;
   if (viewActive() && S.obs.positions.length >= 6) { cartTickView(); return; }
   const pos = S.obs.positions;
@@ -4620,6 +4703,7 @@ function jogTo(target) {
   return api('/api/v1/motion/jog', { target_positions: clampTarget(target), epoch_id: S.epoch }).catch(() => {});
 }
 function commandGrip() {
+  if (gcOn()) { gcGrip(S.grip > 0.5 ? -1 : 1); return; }
   if (!S.obs || !isOperational()) { flashLock(); return; }
   if (S.mode === 'cart') { S.gripCmdAt = Date.now(); cartKick(); return; } // the cartesian stream carries J6
   if (S.servoTarget) return; // while streaming, servo carries J6
@@ -4629,6 +4713,7 @@ function commandGrip() {
   jogTo(t);
 }
 function home() {
+  if (gcOn()) { gcSticksOff(); return; }
   if (!isOperational()) { toast(lockReason(), 'err'); flashLock(); return; }
   api('/api/v1/motion/home', { epoch_id: S.epoch }).then(() => toast(t('toast.homing'), 'ok')).catch(() => {});
 }
@@ -4881,6 +4966,105 @@ async function disableTorque({ fallback = true } = {}) {
 })();
 
 /* =================================================================
+   Gravity compensation (hand-guiding): hold 600 ms to enter, tap to exit
+   ================================================================= */
+const gcOn = () => S.obs?.control_mode === 'gravity_comp';
+function gcBlockText() {
+  if (!isLive()) return t('gc.b.offline');
+  if (S.leaseGeneration == null) return t('gc.b.observer');
+  const b = S.obs?.gravity_comp?.blocker;
+  if (!b) return null;
+  const k = 'gc.b.' + b.code;
+  return t(k) !== k ? t(k) : (b.message || b.code);
+}
+function gcExit() {
+  api('/api/v1/mode/gravity_comp', { enable: false }, { quiet: true }).catch((e) => toast(e.message, 'err', e.code));
+}
+let gcHintAt = 0;
+function gcSticksOff() { if (Date.now() - gcHintAt > 2500) { gcHintAt = Date.now(); toast(t('gc.sticks_off'), 'warn'); } }
+// Gripper while hand-guiding: one open / close action per press (servo frames are refused).
+let gcGripDir = 0;
+function gcGrip(dir) {
+  if (!dir || dir === gcGripDir) return;
+  gcGripDir = dir;
+  S.grip = dir > 0 ? 0 : 1; S.gripCmdAt = Date.now();
+  commandRPC('/api/v1/action/gripper', dir > 0 ? { command: 'close' } : { command: 'open' })
+    .then((r) => syncEpoch(r.epoch_id))
+    .catch((e) => { if (e.code !== 'MOTION_BUSY') toast(e.message, 'err', e.code); });
+}
+function gcInput(v) {
+  const g = S.mode === 'cart' ? -cartGripVel() : (v[GRIP] || 0);
+  if (g === 0) gcGripDir = 0; else gcGrip(Math.sign(g));
+  if (v.some((x, i) => i !== GRIP && x !== 0)) gcSticksOff();
+}
+(() => {
+  const btn = $('btn-gc');
+  let timer = null, inflight = false;
+  const cancel = () => { clearTimeout(timer); timer = null; btn.classList.remove('holding'); };
+  btn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    if (inflight) return;
+    if (gcOn()) { gcExit(); return; } // leaving is a single tap
+    const why = gcBlockText();
+    if (why) { toast(t('gc.enter_fail') + why, 'err', S.obs?.gravity_comp?.blocker?.code || ''); return; }
+    btn.classList.add('holding');
+    timer = setTimeout(() => {
+      cancel(); buzz(20);
+      inflight = true;
+      releaseAll();
+      toast(t('gc.entering'), 'info');
+      api('/api/v1/mode/gravity_comp', { enable: true }, { quiet: true })
+        .then(() => toast(t('gc.entered'), 'ok'))
+        .catch((err) => {
+          const k = 'gc.b.' + err.code;
+          toast(t('gc.enter_fail') + (t(k) !== k ? t(k) : err.message), 'err', err.code);
+        })
+        .finally(() => { setTimeout(() => { inflight = false; }, 300); });
+    }, 600);
+  });
+  for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) btn.addEventListener(ev, cancel);
+  btn.addEventListener('contextmenu', (e) => e.preventDefault());
+  $('btn-gc-exit').addEventListener('click', gcExit);
+  $('btn-gc-rec').addEventListener('click', () => $('btn-rec').click());
+})();
+// Exit reason toast: once per new `last_exit` (not for an exit that predates this page).
+function gcOnObs(o) {
+  const x = o.gravity_comp?.last_exit;
+  if (S.gcExitAt === undefined) { S.gcExitAt = x ? x.at : null; return; }
+  if (!x || x.at === S.gcExitAt) return;
+  S.gcExitAt = x.at;
+  const k = 'gc.x.' + x.code;
+  const calm = x.code === 'REQUESTED' || x.code === 'STOPPED';
+  toast(t(k) !== k ? t(k) : t('gc.x.other', { m: x.message || x.code }), calm ? 'ok' : 'warn', calm ? '' : x.code);
+}
+function renderGc() {
+  const gc = S.obs?.gravity_comp, on = gcOn(), live = isLive();
+  document.body.classList.toggle('gc', on && live);
+  const sw = $('btn-gc');
+  sw.hidden = !gc || !gc.supported;
+  const why = on ? null : gcBlockText();
+  sw.classList.toggle('on', on);
+  sw.classList.toggle('blocked', !on && !!why);
+  sw.setAttribute('aria-checked', String(on));
+  sw.setAttribute('aria-disabled', String(!on && !!why));
+  setText($('gc-sub'), on ? t('gc.exit') : why || t('gc.hold'));
+  const banner = $('gc-banner');
+  banner.hidden = !on || !live;
+  if (!on) return;
+  const phase = gc.phase || 'active';
+  const pct = Math.round((phase === 'ramp_in' ? gc.ramp : phase === 'active' ? 1 : 1) * 100);
+  banner.classList.toggle('active', phase === 'active');
+  setText($('gc-phase'), t('gc.ph.' + phase, { n: Math.round((gc.ramp || 0) * 100) }));
+  $('gc-ramp-bar').style.width = pct + '%';
+  $('gc-ramp').setAttribute('aria-valuenow', String(pct));
+  setText($('gc-hint'), phase === 'ramp_in' ? t('gc.hint.ramp') : t('gc.hint'));
+  const rb = $('btn-gc-rec');
+  rb.classList.toggle('rec-on', !!S.rec.active);
+  setText(rb, S.rec.active ? t('gc.rec.on', { t: fmtTime(Date.now() - S.rec.startedAt) }) : t('gc.rec.start'));
+  setText($('gc-chip'), phase === 'ramp_in' ? t('gc.chip') + ' ' + pct + '%' : t('gc.chip'));
+}
+
+/* =================================================================
    Simple mode: pose toggle (click = lock, Shift = momentary), gripper toggle
    ================================================================= */
 const POSE_LABELS = {
@@ -5022,6 +5206,8 @@ function setUi(ui) {
   // simple: safety lives inside the cockpit; expert: first card of the side column
   if (ui === 'simple') $('ck-safety').appendChild($('safety'));
   else $('side').insertBefore($('safety'), $('side').firstChild);
+  if (ui === 'simple') $('cockpit').insertBefore($('gc-banner'), $('cockpit').firstChild);
+  else $('side').insertBefore($('gc-banner'), $('safety').nextSibling);
   if (ui === 'simple') setMode('cart', 'btn');
   else {
     const legacy = store('rebot.mode'); // pre-cartesian builds stored jog | stick
@@ -5983,6 +6169,7 @@ function frame(ts) {
   const cartHeld = Object.values(C.hold).some((h) => h[0] || h[1]);
   if (!op && (S.keys.size || cartHeld || S.hold.some((h) => h[0] || h[1]) || pads.some((p) => p.active()))) releaseAll();
   setText($('lock-txt'), lockReason());
+  renderGc();
 
   const lb = $('link-badge');
   setText(lb, live ? `${S.hz} Hz · ${S.rtt == null ? '--' : Math.round(S.rtt)} ms` : t('no_telemetry'));
