@@ -1,0 +1,45 @@
+#!/bin/sh
+# Skeleton init script for a third-party kit (BusyBox / SysV style, POSIX sh).
+# Replace my-kit, the follower model, the bus and the paths. Starts armd with the kit
+# profile and an optional perception sidecar; stops both. Not used by any official build.
+
+NAME=my-kit
+DAEMON=/usr/bin/armd                       # from an armd release artifact (lite tarball)
+PROFILE=/usr/share/$NAME/profile/my-arm.json
+FOLLOWER_MODEL=mock                        # rebot-dm, rebot-rs, so-arm101, fashionstar, star-arm102, mock
+FOLLOWER_PORT=""                           # e.g. can0 or /dev/ttyUSB0 (not used with mock)
+PORT=8765
+PIDFILE=/var/run/$NAME.pid
+LOGFILE=/var/log/$NAME.log
+# Optional perception provider (see ../vision/README.md); armd proxies it.
+VISION_DAEMON=""                           # e.g. /usr/bin/my-vision
+VISION_PIDFILE=/var/run/$NAME-vision.pid
+export ARMD_DETECTOR_URL=http://127.0.0.1:8090
+
+start() {
+    if [ -n "$VISION_DAEMON" ] && [ -x "$VISION_DAEMON" ]; then
+        start-stop-daemon -S -b -m -p "$VISION_PIDFILE" -x "$VISION_DAEMON"
+    fi
+    OPTS="--follower $FOLLOWER_MODEL --port $PORT --config $PROFILE"
+    if [ -n "$FOLLOWER_PORT" ]; then
+        OPTS="$OPTS --follower-port $FOLLOWER_PORT"
+    fi
+    start-stop-daemon -S -b -m -p "$PIDFILE" -a /bin/sh -- -c "exec $DAEMON $OPTS >> $LOGFILE 2>&1"
+}
+
+stop() {
+    # armd may refuse shutdown while hardware disable is unconfirmed. The official kit's
+    # init script (kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop) checks
+    # the pid's identity and waits for the stop to be confirmed; copy that for real hardware.
+    start-stop-daemon -K -p "$PIDFILE" -s TERM
+    if [ -n "$VISION_DAEMON" ]; then
+        start-stop-daemon -K -p "$VISION_PIDFILE" -s TERM
+    fi
+}
+
+case "$1" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; start ;;
+    *) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac

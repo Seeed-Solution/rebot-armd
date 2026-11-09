@@ -145,3 +145,17 @@ fn kit_camera_mounts_parse() {
     let v5: armd::model::CameraMount = serde_json::from_value(mounts["v5"]["camera_mount"].clone()).unwrap();
     assert_eq!(v5, ArmConfig::rebot_dm().camera_mount);
 }
+
+/// kits/_template/profile/example.json (written from `ArmConfig::default()` with
+/// UPDATE_PROFILE=1) loads and validates like a `--config` profile.
+#[test]
+fn template_profile_is_a_valid_profile() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/kits/_template/profile/example.json");
+    if std::env::var_os("UPDATE_PROFILE").is_some() {
+        std::fs::write(path, serde_json::to_string_pretty(&ArmConfig::default()).unwrap() + "\n").unwrap();
+    }
+    let mut config: ArmConfig = serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap();
+    config.validate().unwrap();
+    assert_eq!(config.profile_version, ARM_PROFILE_VERSION);
+    assert_eq!(config.dof, 6);
+}

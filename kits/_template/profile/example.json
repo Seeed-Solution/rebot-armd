@@ -1,0 +1,87 @@
+{
+  "profile_version": 1,
+  "dof": 6,
+  "joint_names": [
+    "joint_1",
+    "joint_2",
+    "joint_3",
+    "joint_4",
+    "joint_5",
+    "joint_6"
+  ],
+  "limits": [
+    {
+      "name": "joint_1",
+      "min_position": -3.14159,
+      "max_position": 3.14159,
+      "max_velocity": 2.0,
+      "max_acceleration": 5.0
+    },
+    {
+      "name": "joint_2",
+      "min_position": -2.0944,
+      "max_position": 2.0944,
+      "max_velocity": 2.0,
+      "max_acceleration": 5.0
+    },
+    {
+      "name": "joint_3",
+      "min_position": -2.61799,
+      "max_position": 2.61799,
+      "max_velocity": 2.0,
+      "max_acceleration": 5.0
+    },
+    {
+      "name": "joint_4",
+      "min_position": -3.14159,
+      "max_position": 3.14159,
+      "max_velocity": 3.0,
+      "max_acceleration": 8.0
+    },
+    {
+      "name": "joint_5",
+      "min_position": -2.0944,
+      "max_position": 2.0944,
+      "max_velocity": 3.0,
+      "max_acceleration": 8.0
+    },
+    {
+      "name": "joint_6",
+      "min_position": -6.28318,
+      "max_position": 6.28318,
+      "max_velocity": 4.0,
+      "max_acceleration": 10.0
+    }
+  ],
+  "home_positions": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "lease_timeout_ms": 2500,
+  "max_temperature": 70.0,
+  "control_frequency_hz": 50,
+  "resting_pose": null,
+  "following_error": {
+    "max_error_rad": 0.5,
+    "persistence_ms": 500
+  },
+  "max_jerk": null,
+  "gravity_model": null,
+  "planned_max_velocity": null,
+  "kinematics": null,
+  "workspace": null,
+  "camera_mount": {
+    "flip": false,
+    "rot_deg": 0.0,
+    "tilt_deg": 0.0,
+    "offset_m": null
+  },
+  "gripper_policy": null,
+  "grasp": null,
+  "gravity_comp": null,
+  "damiao_ranges": null
+}
