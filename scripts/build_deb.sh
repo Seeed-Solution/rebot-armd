@@ -7,9 +7,13 @@ set -euo pipefail
 # Usage: build_deb.sh [--flavor recamera|lite] [VERSION]
 #
 #   --flavor recamera  (default) core + kits/recamera-b601dm: the rebot-teleop
-#                      deb (init script, Wi-Fi AP, CAN setup, cockpit, URDF,
-#                      gallery manifest) -> dist/rebot-teleop_<VERSION>_riscv64.deb
+#                      deb (armd, rebot-vision, init script, Wi-Fi AP, CAN setup,
+#                      cockpit, URDF, gallery manifest)
+#                      -> dist/rebot-teleop_<VERSION>_riscv64.deb
 #                      VERSION default: kits/recamera-b601dm/packaging/debian/control
+#                      rebot-vision: REBOT_VISION_BIN=<prebuilt binary>, or
+#                      RECAMERA_DOCKER=<tpuc_dev container> to build it with
+#                      scripts/build_vision.sh (see that script for the paths)
 #   --flavor lite      core only: the armd binary with LICENSE and
 #                      THIRD_PARTY_NOTICES.md, no init script, no kit files
 #                      -> dist/armd-lite_<VERSION>_riscv64.tar.gz
@@ -27,7 +31,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --flavor) FLAVOR="${2:-}"; shift 2 ;;
         --flavor=*) FLAVOR="${1#--flavor=}"; shift ;;
-        -h|--help) sed -n '4,17p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help) sed -n '4,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
         -*) echo "Error: unknown option $1" >&2; exit 1 ;;
         *) CUSTOM_VERSION="$1"; shift ;;
     esac
@@ -70,6 +74,12 @@ if [ "$FLAVOR" = "recamera" ] && ! command -v dpkg-deb >/dev/null 2>&1; then
     exit 1
 fi
 
+if [ "$FLAVOR" = "recamera" ] && [ -z "${REBOT_VISION_BIN:-}" ] && [ -z "${RECAMERA_DOCKER:-}" ]; then
+    echo "Error: the recamera flavor needs rebot-vision: set RECAMERA_DOCKER=<tpuc_dev container>" >&2
+    echo "       to build it (scripts/build_vision.sh), or REBOT_VISION_BIN=<prebuilt binary>." >&2
+    exit 1
+fi
+
 # Linker flags: either RUSTFLAGS is set by the caller, or they are built from
 # RECAMERA_TOOLCHAIN. RUSTFLAGS replaces the rustflags in .cargo/config.toml,
 # so the full list is given here.
@@ -92,7 +102,7 @@ if [ -z "${RUSTFLAGS:-}" ]; then
 fi
 
 # 1. Compile armd binary for RISC-V musl
-echo "[1/4] Compiling armd for ${TARGET_TRIPLE} (release mode)..."
+if [ "$FLAVOR" = "lite" ]; then echo "[1/3] Compiling armd for ${TARGET_TRIPLE} (release mode)..."; else echo "[1/5] Compiling armd for ${TARGET_TRIPLE} (release mode)..."; fi
 cd "${REPO_ROOT}"
 cargo build --release --target "${TARGET_TRIPLE}"
 
@@ -132,7 +142,21 @@ if [ "$FLAVOR" = "lite" ]; then
     exit 0
 fi
 
-# 2. Prepare staging directory
+# 2. rebot-vision (C++, SG2002 SDK)
+if [ -n "${REBOT_VISION_BIN:-}" ]; then
+    VISION_BIN="${REBOT_VISION_BIN}"
+    echo "[2/5] Using prebuilt rebot-vision: ${VISION_BIN}"
+else
+    echo "[2/5] Building rebot-vision in container ${RECAMERA_DOCKER}..."
+    "${SCRIPT_DIR}/build_vision.sh"
+    VISION_BIN="${REPO_ROOT}/target/vision-riscv/rebot-vision"
+fi
+if [ ! -f "${VISION_BIN}" ]; then
+    echo "Error: rebot-vision binary not found at ${VISION_BIN}" >&2
+    exit 1
+fi
+
+# 3. Prepare staging directory
 STAGING_DIR="${REPO_ROOT}/target/deb_staging/rebot-teleop"
 rm -rf "${STAGING_DIR}"
 mkdir -p "${STAGING_DIR}/DEBIAN"
@@ -140,13 +164,14 @@ mkdir -p "${STAGING_DIR}/etc/init.d"
 mkdir -p "${STAGING_DIR}/usr/bin"
 mkdir -p "${STAGING_DIR}/usr/local/bin"
 mkdir -p "${STAGING_DIR}/usr/share/rebot-teleop"
+mkdir -p "${STAGING_DIR}/usr/share/doc/rebot-teleop"
 
-echo "[2/4] Assembling rootfs staging structure..."
+echo "[3/5] Assembling rootfs staging structure..."
 
 # Copy runtime files
 cp -f "${PACKAGING_DIR}/rootfs/etc/init.d/K92rebot-teleop" "${STAGING_DIR}/etc/init.d/K92rebot-teleop"
 chmod 0755 "${STAGING_DIR}/etc/init.d/K92rebot-teleop"
-ln -sf /etc/init.d/K92rebot-teleop "${STAGING_DIR}/etc/init.d/S92rebot-teleop"
+# No S92 link in the package: postinst creates it only on devices without the reCamera console.
 
 cp -r "${PACKAGING_DIR}/rootfs/usr/share/rebot-teleop/"* "${STAGING_DIR}/usr/share/rebot-teleop/"
 
@@ -159,6 +184,14 @@ if [ -f "${REPO_ROOT}/src/api/index.html" ]; then
     cp -f "${REPO_ROOT}/src/api/index.html" "${STAGING_DIR}/usr/share/rebot-teleop/index.html"
 fi
 find "${STAGING_DIR}/usr/share/rebot-teleop" -type f -exec chmod 0644 {} +
+chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-vision-run"
+
+# rebot-vision and the licence notices for the code it contains
+cp -f "${VISION_BIN}" "${STAGING_DIR}/usr/bin/rebot-vision"
+chmod 0755 "${STAGING_DIR}/usr/bin/rebot-vision"
+cp -f "${REPO_ROOT}/LICENSE" "${REPO_ROOT}/THIRD_PARTY_NOTICES.md" \
+    "${REPO_ROOT}/kits/recamera-b601dm/vision/LICENSE-APACHE" "${STAGING_DIR}/usr/share/doc/rebot-teleop/"
+chmod 0644 "${STAGING_DIR}/usr/share/doc/rebot-teleop/"*
 
 # Copy compiled binary to usr/bin/armd and provide backward-compatible symlink at usr/local/bin/armd
 cp -f "${BIN_PATH}" "${STAGING_DIR}/usr/bin/armd"
@@ -180,14 +213,14 @@ sed -e "s/^Version:.*/Version: ${VERSION}/" \
 chmod 0644 "${STAGING_DIR}/DEBIAN/control"
 
 # 3. Build deb package with gzip compression & root ownership (opkg/dpkg compliant)
-echo "[3/4] Packaging deb archive with dpkg-deb..."
+echo "[4/5] Packaging deb archive with dpkg-deb..."
 DEB_NAME="rebot-teleop_${VERSION}_riscv64.deb"
 OUTPUT_DEB="${DIST_DIR}/${DEB_NAME}"
 
 dpkg-deb -Zgzip --root-owner-group --build "${STAGING_DIR}" "${OUTPUT_DEB}"
 
 # 4. Verify output package
-echo "[4/4] Verifying generated deb package..."
+echo "[5/5] Verifying generated deb package..."
 dpkg-deb -I "${OUTPUT_DEB}"
 echo "---------------------------------------------------------------------"
 dpkg-deb -c "${OUTPUT_DEB}"
