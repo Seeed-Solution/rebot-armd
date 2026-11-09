@@ -2,10 +2,13 @@
 
 <div align="center">
 
-### 极简的机械臂控制运行时（Rust）
+### 用一颗 40 mm 的摄像头驱动 7 电机机械臂
 
-**单个静态二进制 `armd`：驱动机械臂电机，执行基于租约的安全模型，提供浏览器驾驶舱和面向 agent 的动作，并把示教片段录制为 Parquet。参考平台：用一台 Seeed reCamera 驱动 reBot B601-DM。**
+**`armd` 是一个 4 MB 的 Rust 运行时。在单核 RISC-V 的摄像头芯片上，它以 50 Hz 控住全部 7 个电机，只用 7 % 的 CPU 和 3.7 MB 内存，同时提供网页驾驶舱和 AI Agent 接口；同一颗芯片还在推视频流、跑目标检测。**
 
+[![Binary](https://img.shields.io/badge/binary-4.1_MB_static-brightgreen.svg?style=flat-square)](#hardware)
+[![RAM](https://img.shields.io/badge/RAM-3.7_MB-brightgreen.svg?style=flat-square)](#hardware)
+[![CPU](https://img.shields.io/badge/CPU-7%25_of_1_RISC--V_core-brightgreen.svg?style=flat-square)](#hardware)
 [![Rust](https://img.shields.io/badge/Rust-2021_Edition-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/Seeed-Solution/rebot-armd/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/Seeed-Solution/rebot-armd/actions)
@@ -23,6 +26,16 @@
 `armd` 是一个机械臂控制运行时：固定周期的控制循环与安全监督器、电机驱动、8765 端口上的 HTTP/WebSocket 服务，打包为单个静态二进制（RISC-V 版 4.1 MiB）。控制器上不需要 Python、ROS 或 GPU。
 
 参考平台展示了控制器可以小到什么程度：`armd` 与摄像头自带的视频和检测服务一起运行在 Seeed reCamera（SG2002 RISC-V SoC，Linux 可用内存约 180 MB）上，通过 reCamera B4 底板的 CAN 总线驱动 reBot B601-DM 的 7 个达妙电机。同一份代码可在 x86_64 Linux 上编译并通过测试（CI）；其他主机与机械臂的验证状态见 [硬件](#硬件)。
+
+| | 参考平台实测（Seeed reCamera + reBot B601-DM） |
+|---|---|
+| 控制器 | Seeed reCamera：SG2002，**1 个 RISC-V 核**（SoC 规格 1 GHz），Linux 可见内存 **180 MB**，机身 40 × 40 mm |
+| `armd` 二进制 | **4.1 MB**，静态链接，无需 Python、ROS 或 GPU；安装包 `.deb` **2.0 MB** |
+| `armd` 内存 | 常驻 **3.7 MB**（VmRSS） |
+| `armd` CPU | 7 个电机全部上力矩、50 Hz 保持时占 **7.0 %**；未上力矩时 4.5 %（均为 10 s 平均） |
+| 整颗芯片（上力矩时） | 忙碌 **31 %**，包括摄像头的视频与检测，约 69 % 的 CPU 空闲 |
+| 机械臂 | **7** 个达妙电机（6 关节 + 夹爪），CAN 1 Mbit/s，控制循环 **50 Hz** |
+| 同一颗芯片同时运行 | 摄像头自带服务的 H.264 视频流与 YOLO 目标检测 |
 
 `armd` 提供：
 

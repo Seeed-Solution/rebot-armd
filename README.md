@@ -2,10 +2,13 @@
 
 <div align="center">
 
-### A minimal Rust runtime for robot arm control
+### Drive a 7-motor robot arm from a 40 mm camera
 
-**One static binary (`armd`) that drives the arm's motors, enforces a lease-based safety model, serves a browser cockpit and agent actions, and records episodes to Parquet. Reference platform: a Seeed reCamera driving a reBot B601-DM.**
+**`armd` is a 4 MB Rust runtime. On a single-core RISC-V camera chip it holds all 7 motors at 50 Hz with 7 % of the core and 3.7 MB of RAM, and serves a web cockpit and an AI-agent API, while the same chip streams video and runs object detection.**
 
+[![Binary](https://img.shields.io/badge/binary-4.1_MB_static-brightgreen.svg?style=flat-square)](#hardware)
+[![RAM](https://img.shields.io/badge/RAM-3.7_MB-brightgreen.svg?style=flat-square)](#hardware)
+[![CPU](https://img.shields.io/badge/CPU-7%25_of_1_RISC--V_core-brightgreen.svg?style=flat-square)](#hardware)
 [![Rust](https://img.shields.io/badge/Rust-2021_Edition-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/Seeed-Solution/rebot-armd/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/Seeed-Solution/rebot-armd/actions)
@@ -29,6 +32,16 @@ reCamera (SG2002 RISC-V SoC, about 180 MB of RAM available to Linux) next to the
 video and detection services, and drives the 7 Damiao motors of a reBot B601-DM over the CAN
 bus of the reCamera B4 board. The same code builds and passes its tests on x86_64 Linux (CI);
 other hosts and arms are listed under [Hardware](#hardware) with their verification status.
+
+| | Measured on the reference platform (Seeed reCamera + reBot B601-DM) |
+|---|---|
+| Controller | Seeed reCamera: SG2002, **1 RISC-V core** (1 GHz per SoC spec), **180 MB** RAM visible to Linux, 40 × 40 mm camera body |
+| `armd` binary | **4.1 MB**, static, no Python, ROS or GPU; installed as a **2.0 MB** `.deb` |
+| `armd` memory | **3.7 MB** resident (VmRSS) |
+| `armd` CPU | **7.0 %** of the core with all 7 motors torqued at 50 Hz; 4.5 % with torque off (10 s averages) |
+| Whole chip, arm torqued | **31 %** busy, including the camera's video and detection, so about 69 % of the core is idle |
+| Arm | **7** Damiao motors (6 joints + gripper) on CAN at 1 Mbit/s, **50 Hz** control loop |
+| Same chip, same time | H.264 video stream and YOLO object detection from the camera's own services |
 
 `armd` provides:
 
