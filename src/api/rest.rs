@@ -319,6 +319,14 @@ pub async fn motion_unload(
     Err(actuator_requires_connection_lease(&supervisor).await)
 }
 
+/// POST /api/v1/action/{move_to,move_relative,gripper}: actions run only on the
+/// WebSocket that holds the lease (`docs/agent_action_api.md`).
+pub async fn action_requires_lease(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Err(actuator_requires_connection_lease(&supervisor).await)
+}
+
 /// POST /api/v1/safety/e_stop
 pub async fn safety_e_stop(
     State(supervisor): State<Arc<ArmSupervisor>>,

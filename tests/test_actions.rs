@@ -296,3 +296,251 @@ fn bench_plan() {
         println!("bench_plan {name}: {n} samples, {:.2} ms per plan", t.elapsed().as_secs_f64() * 1000.0 / runs as f64);
     }
 }
+
+// ---- WS contract (spec 2.1 / tests 4.4) ----
+
+use serde_json::json;
+use std::sync::Arc as StdArc;
+
+struct WsRig { ws: common::TestSocket, generation: u64, epoch: u64, supervisor: StdArc<armd::ArmSupervisor>, addr: std::net::SocketAddr }
+
+async fn ws_rig() -> WsRig {
+    let (addr, supervisor) = common::spawn_server(ArmConfig::rebot_dm()).await;
+    let ticker = supervisor.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
+        loop { interval.tick().await; ticker.tick(DT).await; }
+    });
+    let (mut ws, generation) = common::controller(addr).await;
+    let epoch = supervisor.get_observation().await.epoch_id;
+    let ack = common::rpc(&mut ws, generation, epoch, "/api/v1/torque", json!({"enable": true})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.measured_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+    }
+    let epoch = supervisor.get_observation().await.epoch_id;
+    WsRig { ws, generation, epoch, supervisor, addr }
+}
+
+/// Reads telemetry (heartbeating) until the observation shows action `id` in a terminal state.
+async fn wait_action(rig: &mut WsRig, id: u64, max_s: f64) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs_f64(max_s);
+    let mut last_hb = Instant::now();
+    let mut saw_running = false;
+    loop {
+        assert!(Instant::now() < deadline, "action {id} not finished");
+        if last_hb.elapsed() > Duration::from_millis(200) {
+            common::send(&mut rig.ws, json!({"type":"heartbeat", "generation":rig.generation, "epoch_id":rig.epoch})).await;
+            last_hb = Instant::now();
+        }
+        common::drain(&mut rig.ws, 5).await;
+        let obs = rig.supervisor.get_observation().await;
+        if let Some(a) = obs.action.as_ref().filter(|a| a.id == id) {
+            if a.state == "running" { saw_running = true; } else {
+                let mut v = serde_json::to_value(a).unwrap();
+                v["saw_running"] = json!(saw_running);
+                return v;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn move_to(rig: &mut WsRig, p: [f64; 3]) -> serde_json::Value {
+    common::rpc(&mut rig.ws, rig.generation, rig.epoch, "/api/v1/action/move_to",
+        json!({"position": p, "orientation": null, "speed": {"linear": 0.15}, "tag": "pick"})).await
+}
+
+#[tokio::test]
+async fn ws_move_to_acks_with_action_id_and_reaches_the_goal() {
+    let mut rig = ws_rig().await;
+    let p0 = tcp(&INSPECT).p;
+    let goal = [p0[0] + 0.04, p0[1] - 0.03, p0[2] + 0.02];
+    let ack = move_to(&mut rig, goal).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let id = ack["action_id"].as_u64().expect("action_id");
+    assert!(ack["expected_duration_s"].as_f64().unwrap() > 0.2);
+    let a = wait_action(&mut rig, id, 6.0).await;
+    assert_eq!(a["state"], "done", "{a}");
+    assert_eq!(a["kind"], "move_to");
+    assert_eq!(a["tag"], "pick");
+    assert_eq!(a["saw_running"], true);
+    let obs = rig.supervisor.get_observation().await;
+    let err = kinematics::norm(&kinematics::sub(&tcp(&obs.positions).p, &goal));
+    assert!(err < 1e-3, "TCP within 1 mm of the goal: {err}");
+    // telemetry JSON carries the action
+    let text = serde_json::to_value(&obs).unwrap();
+    assert_eq!(text["action"]["id"], id);
+    assert_eq!(text["commanded_positions"].as_array().unwrap().len(), 7);
+}
+
+#[tokio::test]
+async fn ws_rejections_unreachable_busy_stale_and_unsupported() {
+    let mut rig = ws_rig().await;
+    let p0 = tcp(&INSPECT).p;
+    let reply = move_to(&mut rig, [p0[0] + 0.5, p0[1], p0[2]]).await;
+    assert_eq!((reply["type"].as_str(), reply["code"].as_str(), reply["status"].as_u64()), (Some("command_reject"), Some("IK_UNREACHABLE"), Some(422)), "{reply}");
+    assert!(rig.supervisor.get_observation().await.action.is_none(), "no motion");
+
+    // bad params
+    let reply = common::rpc(&mut rig.ws, rig.generation, rig.epoch, "/api/v1/action/move_to", json!({"position": [0.1, 0.2]})).await;
+    assert_eq!((reply["code"].as_str(), reply["status"].as_u64()), (Some("INVALID_COMMAND"), Some(400)));
+    let reply = common::rpc(&mut rig.ws, rig.generation, rig.epoch, "/api/v1/action/move_relative", json!({"frame": "base", "d": [0.0, 0.0, 0.01], "speed": {"linear": 0.5}})).await;
+    assert_eq!(reply["code"], "INVALID_COMMAND", "speed above max: {reply}");
+    let reply = common::rpc(&mut rig.ws, rig.generation, rig.epoch, "/api/v1/action/gripper", json!({"command": "move", "width_m": 0.04})).await;
+    assert_eq!((reply["code"].as_str(), reply["status"].as_u64()), (Some("UNSUPPORTED"), Some(422)));
+
+    // MOTION_BUSY while servo streaming
+    let mut lead = INSPECT.to_vec();
+    lead[0] += 0.2;
+    common::servo(&mut rig.ws, rig.generation, rig.epoch, &lead).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let reply = move_to(&mut rig, [p0[0] + 0.02, p0[1], p0[2]]).await;
+    assert_eq!((reply["code"].as_str(), reply["status"].as_u64()), (Some("MOTION_BUSY"), Some(409)), "{reply}");
+    // let the servo target settle and the arm stop
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        common::send(&mut rig.ws, json!({"type":"heartbeat", "generation":rig.generation, "epoch_id":rig.epoch})).await;
+        let inner = rig.supervisor.inner().read().await;
+        if inner.servo_target.is_none() && inner.commanded_velocities.iter().all(|v| v.abs() < 1e-3) { break; }
+    }
+
+    // PLAN_STALE: a jog lands between plan and install
+    {
+        let mut inner = rig.supervisor.inner().write().await;
+        inner.before_install_hook = Some(Box::new(|inner: &mut SupervisorInner| {
+            let mut q = inner.commanded_positions.clone();
+            q[0] += 0.05;
+            inner.jog(q, None, None).unwrap();
+        }));
+    }
+    let p = tcp(&rig.supervisor.get_observation().await.commanded_positions).p;
+    let reply = move_to(&mut rig, [p[0] + 0.02, p[1], p[2]]).await;
+    assert_eq!((reply["code"].as_str(), reply["status"].as_u64()), (Some("PLAN_STALE"), Some(409)), "{reply}");
+
+    // servo during an action -> MOTION_BUSY
+    let id = wait_idle_then_move(&mut rig).await;
+    let q = rig.supervisor.get_observation().await.commanded_positions;
+    common::servo(&mut rig.ws, rig.generation, rig.epoch, &q).await;
+    let reject = common::servo_reject_within(&mut rig.ws, 500).await.expect("servo_reject");
+    assert_eq!(reject["code"], "MOTION_BUSY", "{reject}");
+    let a = wait_action(&mut rig, id, 6.0).await;
+    assert_eq!(a["state"], "done");
+}
+
+async fn wait_idle_then_move(rig: &mut WsRig) -> u64 {
+    for _ in 0..200 {
+        common::send(&mut rig.ws, json!({"type":"heartbeat", "generation":rig.generation, "epoch_id":rig.epoch})).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let inner = rig.supervisor.inner().read().await;
+        if inner.active_trajectory.is_none() && inner.servo_target.is_none() && inner.commanded_velocities.iter().all(|v| v.abs() < 1e-3) { break; }
+    }
+    let p = tcp(&rig.supervisor.get_observation().await.commanded_positions).p;
+    let ack = move_to(rig, [p[0] + 0.03, p[1], p[2]]).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    ack["action_id"].as_u64().unwrap()
+}
+
+#[tokio::test]
+async fn ws_move_relative_camera_forward_moves_along_z_cam() {
+    let mut rig = ws_rig().await;
+    let start = tcp(&INSPECT);
+    let z_cam = kinematics::column(&kinematics::cam_rotation(&start, &kinematics::cam_mount(false, 0.0, 0.0)), 2);
+    let ack = common::rpc(&mut rig.ws, rig.generation, rig.epoch, "/api/v1/action/move_relative",
+        json!({"frame": "camera", "d": [0.0, 0.0, 0.04], "level": false, "speed": {"linear": 0.15}})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let a = wait_action(&mut rig, ack["action_id"].as_u64().unwrap(), 6.0).await;
+    assert_eq!((a["state"].as_str(), a["kind"].as_str()), (Some("done"), Some("move_relative")));
+    let end = tcp(&rig.supervisor.get_observation().await.positions);
+    let d = kinematics::sub(&end.p, &start.p);
+    assert!((kinematics::norm(&d) - 0.04).abs() < 1e-3 && kinematics::dot(&d, &z_cam) / kinematics::norm(&d) > 0.999, "{d:?}");
+}
+
+#[tokio::test]
+async fn ws_estop_stop_preset_and_close_end_the_action() {
+    let p_of = |q: &[f32]| { let p = tcp(q).p; [p[0] + 0.06, p[1], p[2]] };
+    // E-stop mid-path
+    let mut rig = ws_rig().await;
+    let ack = common::rpc(&mut rig.ws, rig.generation, rig.epoch, "/api/v1/action/move_to", json!({"position": p_of(&INSPECT)})).await;
+    let id = ack["action_id"].as_u64().unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let sync = common::ws_reply(&mut rig.ws, json!({"type":"estop"}), &["epoch_sync"]).await;
+    rig.epoch = sync["epoch_id"].as_u64().unwrap();
+    let a = wait_action(&mut rig, id, 2.0).await;
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("ESTOP_ACTIVE")), "{a}");
+
+    // stop
+    let mut rig = ws_rig().await;
+    let ack = common::rpc(&mut rig.ws, rig.generation, rig.epoch, "/api/v1/action/move_to", json!({"position": p_of(&INSPECT)})).await;
+    let id = ack["action_id"].as_u64().unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let stop = common::rpc(&mut rig.ws, rig.generation, rig.epoch, "/api/v1/motion/stop", json!({})).await;
+    assert_eq!(stop["type"], "command_ack");
+    let a = wait_action(&mut rig, id, 2.0).await;
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("cancelled"), Some("STOPPED")), "{a}");
+
+    // preset during the action
+    let mut rig = ws_rig().await;
+    let ack = common::rpc(&mut rig.ws, rig.generation, rig.epoch, "/api/v1/action/move_to", json!({"position": p_of(&INSPECT)})).await;
+    let id = ack["action_id"].as_u64().unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let preset = common::preset(&mut rig.ws, rig.generation, rig.epoch, "inspect", Some(INSPECT.to_vec())).await;
+    assert_eq!(preset["type"], "preset_ack", "{preset}");
+    let new_id = preset["action_id"].as_u64().expect("preset_ack carries action_id");
+    assert!(new_id > id);
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let obs = rig.supervisor.get_observation().await;
+    let prev = obs.previous_action.expect("superseded action is published");
+    assert_eq!((prev.id, prev.state.as_str(), prev.code.as_deref()), (id, "cancelled", Some("SUPERSEDED")));
+    assert_eq!(obs.action.unwrap().kind, "joint_move");
+
+    // WS close
+    let mut rig = ws_rig().await;
+    let ack = common::rpc(&mut rig.ws, rig.generation, rig.epoch, "/api/v1/action/move_to", json!({"position": p_of(&INSPECT)})).await;
+    let id = ack["action_id"].as_u64().unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    rig.ws.close(None).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let a = rig.supervisor.get_observation().await.action.unwrap();
+        if a.state != "running" {
+            assert_eq!((a.id, a.state.as_str(), a.code.as_deref()), (id, "cancelled", Some("LEASE_LOST")), "{a:?}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "action not ended after close");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn ws_gripper_action_and_home_park_records() {
+    let mut rig = ws_rig().await;
+    let ack = common::rpc(&mut rig.ws, rig.generation, rig.epoch, "/api/v1/action/gripper", json!({"command": "move", "fraction": 0.2, "speed": 2.0})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let a = wait_action(&mut rig, ack["action_id"].as_u64().unwrap(), 5.0).await;
+    assert_eq!((a["state"].as_str(), a["kind"].as_str()), (Some("done"), Some("gripper")), "{a}");
+    let ack = common::rpc(&mut rig.ws, rig.generation, rig.epoch, "/api/v1/motion/home", json!({})).await;
+    let id = ack["action_id"].as_u64().expect("home ack carries action_id");
+    let a = wait_action(&mut rig, id, 10.0).await;
+    assert_eq!((a["state"].as_str(), a["kind"].as_str()), (Some("done"), Some("home")), "{a}");
+    let preset = common::preset(&mut rig.ws, rig.generation, rig.epoch, "park", None).await;
+    let id = preset["action_id"].as_u64().expect("park preset carries action_id");
+    let a = wait_action(&mut rig, id, 6.0).await;
+    assert_eq!((a["state"].as_str(), a["kind"].as_str()), (Some("done"), Some("park")), "{a}");
+    assert!(!rig.supervisor.get_observation().await.is_torqued);
+}
+
+#[tokio::test]
+async fn rest_action_paths_require_the_ws_lease() {
+    let rig = ws_rig().await;
+    let client = reqwest::Client::new();
+    for path in ["move_to", "move_relative", "gripper"] {
+        let res = client.post(format!("http://{}/api/v1/action/{path}", rig.addr)).json(&json!({})).send().await.unwrap();
+        assert_eq!(res.status(), 409);
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(body["code"], "LEASE_ACTIVE", "{body}");
+    }
+}

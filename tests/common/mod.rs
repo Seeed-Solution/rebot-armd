@@ -69,3 +69,8 @@ pub async fn servo(ws: &mut TestSocket, generation: u64, epoch: u64, positions: 
 pub async fn servo_reject_within(ws: &mut TestSocket, ms: u64) -> Option<serde_json::Value> {
     tokio::time::timeout(Duration::from_millis(ms), next_of(ws, &["servo_reject"])).await.ok()
 }
+
+/// Reads and drops whatever is already queued (telemetry), waiting at most `ms` per message.
+pub async fn drain(ws: &mut TestSocket, ms: u64) {
+    while let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_millis(ms), ws.next()).await {}
+}

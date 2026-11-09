@@ -6,7 +6,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
-use crate::safety::{SafetyError, StopPolicy};
+use crate::motion::{self, PlanInput};
+use crate::safety::SafetyError;
 use crate::api::rest::ApiError;
 use axum::http::StatusCode;
 
@@ -40,8 +41,11 @@ fn positions(value: Option<&Value>) -> Result<Vec<f32>, ApiError> {
         .ok_or_else(|| ApiError::from(ArmError::Safety(SafetyError::InvalidValue)))).collect()
 }
 
+/// Action started by a command: (action id, expected duration in s).
+type Started = Option<(u64, f64)>;
+
 // The caller holds the same write lock used to verify lease and epoch.
-fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: u64) -> Result<(), ApiError> {
+fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: u64) -> Result<Started, ApiError> {
     if !body.is_object() { return Err(invalid_command("Command body must be an object")); }
     if let Some(duration) = body.get("duration_secs").filter(|v| !v.is_null()) {
         if duration.as_f64().is_none() { return Err(invalid_command("duration_secs must be numeric")); }
@@ -55,10 +59,12 @@ fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch:
         "/api/v1/safety/clear_fault" => { inner.clear_fault().map_err(ArmError::from)?; }
         "/api/v1/motion/servo" => { inner.servo(positions(body.get("targets"))?, epoch).map_err(ArmError::from)?; }
         "/api/v1/motion/jog" => {
-            inner.jog(positions(body.get("target_positions"))?, body.get("duration_secs").and_then(Value::as_f64), Some(epoch))?;
+            let (_, id, duration) = inner.jog_action(positions(body.get("target_positions"))?, body.get("duration_secs").and_then(Value::as_f64), Some(epoch), "joint_move")?;
+            return Ok(Some((id, duration)));
         }
         "/api/v1/motion/home" => {
-            inner.jog(inner.config.home_positions.clone(), body.get("duration_secs").and_then(Value::as_f64), Some(epoch))?;
+            let (_, id, duration) = inner.jog_action(inner.config.home_positions.clone(), body.get("duration_secs").and_then(Value::as_f64), Some(epoch), "home")?;
+            return Ok(Some((id, duration)));
         }
         "/api/v1/motion/unload" => {
             if inner.handover_settling_since.is_some() {
@@ -70,12 +76,60 @@ fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch:
             if !inner.safety.state().is_operational() {
                 return Err(ArmError::Safety(SafetyError::NotArmed(inner.safety.state().clone())).into());
             }
-            inner.execute_stop(StopPolicy::NormalUnload);
+            let id = inner.unload_action();
+            let duration = inner.active_trajectory.as_ref().map_or(0.0, |t| t.duration()) + 0.8;
+            return Ok(id.map(|id| (id, duration)));
         }
         "/api/v1/motion/stop" => { inner.stop_motion(); }
         _ => return Err(invalid_command("Unknown actuator command")),
     }
-    Ok(())
+    Ok(None)
+}
+
+/// A Cartesian action waiting for its plan (computed outside the lock).
+struct PendingPlan {
+    request_id: Value,
+    kind: &'static str,
+    input: PlanInput,
+    goal: crate::kinematics::Pose,
+    speed: crate::motion::Speed,
+    tag: Option<String>,
+}
+
+enum ActionStart { Started(u64, f64), Plan(PendingPlan) }
+
+// Under the write lock, after lease / epoch / request_id checks.
+fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: u64, request_id: &Value) -> Result<ActionStart, ApiError> {
+    if !body.is_object() { return Err(invalid_command("Command body must be an object")); }
+    let (kind, parsed) = match path {
+        "/api/v1/action/move_to" => ("move_to", motion::parse_move_to(body)),
+        "/api/v1/action/move_relative" => ("move_relative", motion::parse_move_relative(body)),
+        "/api/v1/action/gripper" => {
+            let request = motion::parse_gripper(body).map_err(ArmError::from)?;
+            let (id, duration) = inner.start_gripper(request, epoch)?;
+            return Ok(ActionStart::Started(id, duration));
+        }
+        _ => return Err(invalid_command("Unknown action")),
+    };
+    let (spec, speed, tag) = parsed.map_err(ArmError::from)?;
+    let input = inner.plan_input()?;
+    let goal = motion::resolve_goal(&input, &spec);
+    Ok(ActionStart::Plan(PendingPlan { request_id: request_id.clone(), kind, input, goal, speed, tag }))
+}
+
+fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) -> Value {
+    let mut ack = json!({"type":"command_ack", "request_id":request_id, "status":"accepted", "epoch_id":inner.safety.epoch_id(), "safety_state":inner.safety.state(), "is_torqued":inner.is_torqued});
+    if let Some((id, duration)) = started {
+        ack["action_id"] = json!(id);
+        ack["expected_duration_s"] = json!(duration);
+    }
+    ack
+}
+
+fn command_reject(inner: &SupervisorInner, request_id: &Value, error: ApiError) -> Value {
+    let mut reply = rejection(error, "command_reject", inner.safety.epoch_id());
+    reply["request_id"] = request_id.clone();
+    reply
 }
 
 async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>) {
@@ -134,8 +188,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>) {
             };
             let Ok(value) = serde_json::from_str::<Value>(&text) else { continue; };
             let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
-            let response: Option<Value>;
+            let mut response: Option<Value>;
             let mut evicted_notify: Option<(String, u64)> = None;
+            let mut pending_plan: Option<(PendingPlan, u64)> = None;
             if kind == "estop" || kind == "e_stop" {
                 let (state, epoch) = recv_supervisor.trigger_e_stop().await;
                 response = Some(json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":state}));
@@ -251,15 +306,20 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>) {
                                     response = Some(json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"}));
                                 } else {
                                     last_request = request_id;
-                                    let result = execute_command(&mut inner, value.get("path").and_then(Value::as_str).unwrap_or(""), &value["body"], epoch);
-                                    response = Some(match result {
-                                        Ok(()) => json!({"type":"command_ack", "request_id":value["request_id"], "status":"accepted", "epoch_id":inner.safety.epoch_id(), "safety_state":inner.safety.state(), "is_torqued":inner.is_torqued}),
-                                        Err(error) => {
-                                            let mut reply = rejection(error, "command_reject", inner.safety.epoch_id());
-                                            reply["request_id"] = value["request_id"].clone();
-                                            reply
-                                        },
-                                    });
+                                    let path = value.get("path").and_then(Value::as_str).unwrap_or("");
+                                    if path.starts_with("/api/v1/action/") {
+                                        response = match prepare_action(&mut inner, path, &value["body"], epoch, &value["request_id"]) {
+                                            Ok(ActionStart::Started(id, duration)) => Some(command_ack(&inner, &value["request_id"], Some((id, duration)))),
+                                            Ok(ActionStart::Plan(plan)) => { pending_plan = Some((plan, local_generation)); None }
+                                            Err(error) => Some(command_reject(&inner, &value["request_id"], error)),
+                                        };
+                                    } else {
+                                        let result = execute_command(&mut inner, path, &value["body"], epoch);
+                                        response = Some(match result {
+                                            Ok(started) => command_ack(&inner, &value["request_id"], started),
+                                            Err(error) => command_reject(&inner, &value["request_id"], error),
+                                        });
+                                    }
                                 }
                             } else if kind == "preset" {
                                 let name = value.get("name").and_then(Value::as_str).unwrap_or("");
@@ -269,7 +329,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>) {
                                     _ => ("/api/v1/motion/jog", json!({"target_positions":value.get("positions")})),
                                 };
                                 response = Some(match execute_command(&mut inner, path, &body, epoch) {
-                                    Ok(()) => json!({"type":"preset_ack", "name":name, "epoch_id":inner.safety.epoch_id()}),
+                                    Ok(started) => {
+                                        let mut ack = json!({"type":"preset_ack", "name":name, "epoch_id":inner.safety.epoch_id()});
+                                        if let Some((id, _)) = started { ack["action_id"] = json!(id); }
+                                        ack
+                                    }
                                     Err(error) => {
                                         let mut reply = rejection(error, "preset_reject", inner.safety.epoch_id());
                                         reply["name"] = json!(name);
@@ -293,6 +357,32 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>) {
                             } else { response = None; }
                         }
                     }
+                }
+
+                // Cartesian plan: IK runs on a blocking thread without the supervisor lock,
+                // so the control tick is never blocked by it; install re-checks everything.
+                if let Some((plan, generation)) = pending_plan.take() {
+                    let PendingPlan { request_id, kind, input, goal, speed, tag } = plan;
+                    let planned = tokio::task::spawn_blocking(move || {
+                        let result = motion::plan_cartesian(&input, goal, speed);
+                        (input, result)
+                    }).await;
+                    let mut inner = recv_supervisor.inner().write().await;
+                    if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
+                    response = Some(match planned {
+                        Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
+                        Ok((_, Err(error))) => command_reject(&inner, &request_id, ArmError::from(error).into()),
+                        Ok((input, Ok(path))) => {
+                            if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
+                                json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
+                            } else {
+                                match inner.install_path(&input, path, kind, tag) {
+                                    Ok(started) => command_ack(&inner, &request_id, Some(started)),
+                                    Err(error) => command_reject(&inner, &request_id, error.into()),
+                                }
+                            }
+                        }
+                    });
                 }
 
                 if let Some((evicted_conn, evicted_gen)) = evicted_notify {

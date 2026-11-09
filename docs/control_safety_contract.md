@@ -44,8 +44,22 @@ When enable confirmation is unavailable or remains `Unknown`, automatic disable,
 - 达妙 profile 设置 `max_jerk = 50.0`；这是软偏好，不覆盖制动和位置约束，其他默认 profile 不设置该值。
 - 这些是软件默认值，不是工业时序保证。
 
+## Planned speed, workspace and actions / 规划速度、工作空间与动作
+
+- `planned_max_velocity` (rebot-dm 0.7 rad/s, default unset) caps every joint except the 7-DOF gripper for jog, home, presets, park (including watchdog park) and servo stepping. It keeps the expected Damiao POS_VEL lag (≈ v / 2.2 rad, `POSVEL_LAG_GAIN`, an estimate) below the 0.5 rad following-error bound; `validate()` rejects a cap whose expected lag reaches the bound. Non-cockpit servo clients (for example the companion `servo_stream`) are bounded by the same cap.
+- The watchdog park deadline is max(10 s, planned park duration + 3 s), so a park from a far J6 pose is not cut short.
+- The tracking-error fault names the joint: `Persistent joint tracking error: joint N cmd … meas … rad`. Observations carry `commanded_positions`.
+- Cartesian workspace (`workspace` + `kinematics`, 7-DOF only): the end_link origin, the 8 gripper-envelope corners and the optional camera point must stay above `floor_z_m`, inside the box and within `max_reach_m` of the shoulder axis. A servo target, or any of the 21 planner samples of a jog / home / preset, is rejected with `422 WORKSPACE_VIOLATION` when it violates and is worse than the start; moving out of a violation is allowed. Park is exempt and only logged. The schema publishes `workspace` and `camera_mount`. A `--config` profile without these fields runs without the check and logs a warning at startup.
+- Actions (`docs/agent_action_api.md`): `move_to`, `move_relative` and `gripper` over the WS lease; every observation carries `action`. Servo frames during an action return `409 MOTION_BUSY`. Action paths slow down when lag exceeds 0.38 rad and end as `TRACKING_STALL` after 1 s at 0.45 rad, so a blocked action path ends before the generic tracking fault would latch.
+
+- `planned_max_velocity`（rebot-dm 为 0.7 rad/s，默认不设）限制除 7 轴夹爪外所有关节在 jog、home、预设、收纳（含看门狗收纳）和 servo 步进中的速度，使达妙 POS_VEL 预计滞后（约 v / 2.2 rad，估计值）低于 0.5 rad 跟随误差阈值；预计滞后达到阈值的配置会被 `validate()` 拒绝。非驾驶舱的 servo 客户端同样受此限制。
+- 看门狗收纳期限为 max(10 s, 规划时长 + 3 s)。
+- 跟踪误差故障信息包含关节号与指令/实测值；观测数据包含 `commanded_positions`。
+- 笛卡尔工作空间（需 `workspace` 与 `kinematics`，仅 7 轴）：end_link 原点、夹爪包络 8 个角点及可选相机点须高于 `floor_z_m`、位于包围盒内且距肩轴不超过 `max_reach_m`。servo 目标或 jog / home / 预设轨迹的 21 个采样点越界且比起点更差时返回 `422 WORKSPACE_VIOLATION`；从越界位姿向外移动允许。收纳不受限，只记日志。schema 公开 `workspace` 与 `camera_mount`。未配置这些字段的 `--config` profile 不做检查，启动时告警。
+- 动作接口见 `docs/agent_action_api.md`。动作运行时 servo 帧返回 `409 MOTION_BUSY`；动作路径在滞后超过 0.38 rad 时降速，0.45 rad 持续 1 s 结束为 `TRACKING_STALL`。
+
 ## Configuration / 配置
 
-`--config` loads a complete `ArmConfig` JSON. Core fields are `dof`, `joint_names`, `limits`, `home_positions`, `lease_timeout_ms`, `max_temperature`, and `control_frequency_hz`; optional fields are `resting_pose`, `following_error`, `max_jerk`, and `gravity_model`. Follower DOF is fixed by model (`rebot-dm=7`; `rebot-rs`, `so-arm101`, `fashionstar`, and `star-arm102=6`), and mismatches are rejected. `--leader` and `--leader-port` are rejected because leader-following is not implemented.
+`--config` loads a complete `ArmConfig` JSON. Core fields are `dof`, `joint_names`, `limits`, `home_positions`, `lease_timeout_ms`, `max_temperature`, and `control_frequency_hz`; optional fields are `resting_pose`, `following_error`, `max_jerk`, `gravity_model`, `planned_max_velocity`, `kinematics`, `workspace`, `camera_mount`, and `gripper_policy`. Follower DOF is fixed by model (`rebot-dm=7`; `rebot-rs`, `so-arm101`, `fashionstar`, and `star-arm102=6`), and mismatches are rejected. `--leader` and `--leader-port` are rejected because leader-following is not implemented.
 
-`--config` 加载完整 `ArmConfig` JSON。核心字段为 `dof`、`joint_names`、`limits`、`home_positions`、`lease_timeout_ms`、`max_temperature`、`control_frequency_hz`；可选字段为 `resting_pose`、`following_error`、`max_jerk`、`gravity_model`。follower 的 DOF 按型号固定（`rebot-dm=7`；`rebot-rs`、`so-arm101`、`fashionstar`、`star-arm102=6`），不匹配会拒绝启动。`--leader` 与 `--leader-port` 因主从功能未实现而被拒绝。
+`--config` 加载完整 `ArmConfig` JSON。核心字段为 `dof`、`joint_names`、`limits`、`home_positions`、`lease_timeout_ms`、`max_temperature`、`control_frequency_hz`；可选字段为 `resting_pose`、`following_error`、`max_jerk`、`gravity_model`、`planned_max_velocity`、`kinematics`、`workspace`、`camera_mount`、`gripper_policy`。follower 的 DOF 按型号固定（`rebot-dm=7`；`rebot-rs`、`so-arm101`、`fashionstar`、`star-arm102=6`），不匹配会拒绝启动。`--leader` 与 `--leader-port` 因主从功能未实现而被拒绝。
