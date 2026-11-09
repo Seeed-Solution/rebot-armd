@@ -1,6 +1,7 @@
 pub mod api;
 pub mod driver;
 pub mod gravity;
+pub mod kinematics;
 pub mod model;
 pub mod protocol;
 pub mod recording;

@@ -225,7 +225,7 @@ pub const AXES: [[f64; 3]; 9] = [
 
 // 3D vector and matrix helper routines
 #[inline]
-fn rot_axis(axis: &[f64; 3], angle: f64) -> [[f64; 3]; 3] {
+pub(crate) fn rot_axis(axis: &[f64; 3], angle: f64) -> [[f64; 3]; 3] {
     let c = angle.cos();
     let s = angle.sin();
     let len = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
@@ -242,7 +242,7 @@ fn rot_axis(axis: &[f64; 3], angle: f64) -> [[f64; 3]; 3] {
 }
 
 #[inline]
-fn mat3_mul(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+pub(crate) fn mat3_mul(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
     let mut res = [[0.0; 3]; 3];
     for r in 0..3 {
         for c in 0..3 {
@@ -253,7 +253,7 @@ fn mat3_mul(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
 }
 
 #[inline]
-fn mat3_vec3_mul(m: &[[f64; 3]; 3], v: &[f64; 3]) -> [f64; 3] {
+pub(crate) fn mat3_vec3_mul(m: &[[f64; 3]; 3], v: &[f64; 3]) -> [f64; 3] {
     [
         m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
         m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
