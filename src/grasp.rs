@@ -279,10 +279,36 @@ pub struct DetectionFrame {
     pub detections: Vec<Detection>,
 }
 
+/// A provider's vision mode (`GET /api/mode` of rebot-vision).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisionMode {
+    /// `off`, `yolo`, `aruco` or `both`.
+    pub mode: String,
+    /// Continuous inference on.
+    pub enabled: bool,
+}
+
+/// The mode a grasp needs: YOLO, plus ArUco when it was running.
+pub fn grasp_mode(current: &str) -> &'static str {
+    match current {
+        "aruco" | "both" => "both",
+        _ => "yolo",
+    }
+}
+
 /// Where the orchestrator gets detections; tests inject a simulated camera.
 pub trait DetectionSource: Send + Sync {
     fn inference_enabled(&self) -> BoxFuture<'_, Result<bool, String>>;
     fn set_inference(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>>;
+    /// The provider's vision mode; `Ok(None)` when it has no mode API (older detectors),
+    /// in which case the grasp only switches inference on and off.
+    fn vision_mode(&self) -> BoxFuture<'_, Result<Option<VisionMode>, String>> {
+        Box::pin(async { Ok(None) })
+    }
+    /// Sets mode and continuous inference in one request.
+    fn set_vision_mode(&self, _mode: &VisionMode) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async { Err("vision mode not supported".to_string()) })
+    }
     /// The next frame with `frame_id > after` (any frame when `after` is None), waiting up to
     /// `wait_ms`. `Ok(None)` = no new frame in time.
     fn next_frame(&self, after: Option<u64>, wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>>;
@@ -306,6 +332,21 @@ impl DetectionSource for HttpDetectionSource {
         Box::pin(async move {
             let body = serde_json::json!({"enabled": enabled}).to_string();
             crate::api::proxy::request_json(&self.upstream, "POST", "/api/inference", Some(body.as_bytes()), Duration::from_secs(2)).await.map(|_| ())
+        })
+    }
+    fn vision_mode(&self) -> BoxFuture<'_, Result<Option<VisionMode>, String>> {
+        Box::pin(async move {
+            let Some(v) = crate::api::proxy::request_json_opt(&self.upstream, "GET", "/api/mode", None, Duration::from_secs(2)).await? else {
+                return Ok(None);
+            };
+            let mode = v.get("mode").and_then(Value::as_str).ok_or_else(|| "vision mode missing".to_string())?;
+            Ok(Some(VisionMode { mode: mode.to_string(), enabled: v.get("enabled").and_then(Value::as_bool).unwrap_or(false) }))
+        })
+    }
+    fn set_vision_mode(&self, m: &VisionMode) -> BoxFuture<'_, Result<(), String>> {
+        let body = serde_json::json!({"mode": m.mode, "enabled": m.enabled}).to_string();
+        Box::pin(async move {
+            crate::api::proxy::request_json(&self.upstream, "POST", "/api/mode", Some(body.as_bytes()), Duration::from_secs(2)).await.map(|_| ())
         })
     }
     fn next_frame(&self, after: Option<u64>, wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
@@ -918,19 +959,43 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
     let setup = planned.request.setup.clone();
     let cam = CamModel::assumed(&setup, &planned.input.cam);
     let orch = Orchestrator { sup: sup.clone(), source: source.clone(), id, deadline: Instant::now() + Duration::from_secs_f64(setup.timeout_s), setup, cam };
-    // detection on for the duration
-    let enabled_by_us = match source.inference_enabled().await {
-        Ok(true) => Ok(false),
-        Ok(false) => source.set_inference(true).await.map(|_| true),
-        Err(e) => Err(e),
+    let result = match source.vision_mode().await {
+        // rebot-vision: YOLO (both when ArUco was running) with inference on for the duration
+        Ok(Some(prev)) => {
+            let want = VisionMode { mode: grasp_mode(&prev.mode).to_string(), enabled: true };
+            if want == prev {
+                orch.run(&planned).await
+            } else {
+                match source.set_vision_mode(&want).await {
+                    Ok(()) => {
+                        let r = orch.run(&planned).await;
+                        if let Err(e) = source.set_vision_mode(&prev).await {
+                            tracing::warn!("Grasp could not restore vision mode {} (enabled {}): {e}", prev.mode, prev.enabled);
+                        }
+                        r
+                    }
+                    Err(e) => Err(fail("DETECTION_UNAVAILABLE", format!("Cannot switch the camera to {}: {e}", want.mode))),
+                }
+            }
+        }
+        // older detectors: inference on for the duration
+        Ok(None) => {
+            let enabled_by_us = match source.inference_enabled().await {
+                Ok(true) => Ok(false),
+                Ok(false) => source.set_inference(true).await.map(|_| true),
+                Err(e) => Err(e),
+            };
+            let r = match &enabled_by_us {
+                Ok(_) => orch.run(&planned).await,
+                Err(e) => Err(fail("DETECTION_UNAVAILABLE", format!("Cannot read the detection state: {e}"))),
+            };
+            if enabled_by_us == Ok(true) {
+                if let Err(e) = source.set_inference(false).await { tracing::warn!("Grasp could not restore detection off: {e}"); }
+            }
+            r
+        }
+        Err(e) => Err(fail("DETECTION_UNAVAILABLE", format!("Cannot read the vision mode: {e}"))),
     };
-    let result = match &enabled_by_us {
-        Ok(_) => orch.run(&planned).await,
-        Err(e) => Err(fail("DETECTION_UNAVAILABLE", format!("Cannot read the detection state: {e}"))),
-    };
-    if enabled_by_us == Ok(true) {
-        if let Err(e) = source.set_inference(false).await { tracing::warn!("Grasp could not restore detection off: {e}"); }
-    }
     let mut inner = sup.inner().write().await;
     match result {
         Ok((holding, gap)) => inner.finish_grasp(id, "done", None, None, Some(holding), gap),

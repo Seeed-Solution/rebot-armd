@@ -398,3 +398,21 @@ async fn schema_capabilities_report_provider_modes() {
         assert_eq!(vis["mode_endpoint"], "/api/v1/vision/mode");
     }
 }
+
+#[tokio::test]
+async fn http_detection_source_reads_and_sets_vision_mode() {
+    use armd::grasp::{DetectionSource, HttpDetectionSource, VisionMode};
+    let (up, seen) = spawn_mock_upstream().await;
+    let src = HttpDetectionSource { upstream: DetectorUpstream::parse(&format!("http://{up}")).unwrap(), image_size_px: [640.0, 360.0] };
+    assert_eq!(src.vision_mode().await.unwrap(), Some(VisionMode { mode: "yolo".into(), enabled: false }));
+    src.set_vision_mode(&VisionMode { mode: "both".into(), enabled: true }).await.unwrap();
+    assert_eq!(src.vision_mode().await.unwrap(), Some(VisionMode { mode: "both".into(), enabled: true }));
+    let e = src.set_vision_mode(&VisionMode { mode: "nomodel".into(), enabled: true }).await.unwrap_err();
+    assert!(e.contains("409"), "{e}");
+    assert_eq!(seen.lock().unwrap()[1].target, "/api/mode");
+    // older detector: no mode API
+    let old = HttpDetectionSource { upstream: DetectorUpstream::parse(&format!("http://{up}/old")).unwrap(), image_size_px: [640.0, 360.0] };
+    assert_eq!(old.vision_mode().await.unwrap(), None);
+    let down = HttpDetectionSource { upstream: DetectorUpstream::parse("http://127.0.0.1:1").unwrap(), image_size_px: [640.0, 360.0] };
+    assert!(down.vision_mode().await.is_err());
+}

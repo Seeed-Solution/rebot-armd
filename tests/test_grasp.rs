@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use armd::grasp::{self, BoxFuture, CamModel, Detection, DetectionFrame, DetectionSource, GraspDeps, GraspSetup};
+use armd::grasp::{self, BoxFuture, CamModel, Detection, DetectionFrame, DetectionSource, GraspDeps, GraspSetup, VisionMode};
 use armd::kinematics::{self, Pose, Vec3};
 use armd::model::CameraMount;
 use armd::{ArmConfig, ArmSupervisor};
@@ -31,6 +31,21 @@ struct SimCamera {
     enabled: AtomicBool,
     frame: AtomicU64,
     inference_calls: Mutex<Vec<bool>>,
+    /// rebot-vision mode API; None = an older detector without `/api/mode`.
+    vision: Mutex<Option<VisionMode>>,
+    mode_calls: Mutex<Vec<VisionMode>>,
+    /// `/api/mode` rejects YOLO modes (no model loaded).
+    no_yolo: AtomicBool,
+}
+
+impl SimCamera {
+    /// YOLO boxes come out: inference on, and with the mode API a YOLO mode.
+    fn yolo_running(&self) -> bool {
+        match &*self.vision.lock().unwrap() {
+            Some(v) => v.enabled && matches!(v.mode.as_str(), "yolo" | "both"),
+            None => self.enabled.load(Ordering::SeqCst),
+        }
+    }
 }
 
 impl SimCamera {
@@ -59,9 +74,23 @@ impl DetectionSource for SimCamera {
             Ok(())
         })
     }
+    fn vision_mode(&self) -> BoxFuture<'_, Result<Option<VisionMode>, String>> {
+        Box::pin(async move { Ok(self.vision.lock().unwrap().clone()) })
+    }
+    fn set_vision_mode(&self, m: &VisionMode) -> BoxFuture<'_, Result<(), String>> {
+        let m = m.clone();
+        Box::pin(async move {
+            if self.no_yolo.load(Ordering::SeqCst) && matches!(m.mode.as_str(), "yolo" | "both") {
+                return Err("detector returned 409 Conflict yolo unavailable".into());
+            }
+            self.mode_calls.lock().unwrap().push(m.clone());
+            *self.vision.lock().unwrap() = Some(m);
+            Ok(())
+        })
+    }
     fn next_frame(&self, _after: Option<u64>, wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
         Box::pin(async move {
-            if !self.enabled.load(Ordering::SeqCst) {
+            if !self.yolo_running() {
                 tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                 return Ok(None);
             }
@@ -139,6 +168,7 @@ async fn rig(setup: GraspSetup, truth: Truth, start_tilt_deg: f64, offset_xy: [f
     let sim = Arc::new(SimCamera {
         sup: sup.clone(), cam, object: Object { centre: object, half: [0.025, 0.015], height: 0.05 }, label: "cup".into(),
         visible: AtomicBool::new(true), enabled: AtomicBool::new(false), frame: AtomicU64::new(0), inference_calls: Mutex::new(Vec::new()),
+        vision: Mutex::new(None), mode_calls: Mutex::new(Vec::new()), no_yolo: AtomicBool::new(false),
     });
     let hold = Arc::new(AtomicBool::new(true));
     let (ticker, hold_t) = (sup.clone(), hold.clone());
@@ -541,4 +571,70 @@ async fn grasp_setup_persists_round_trip() {
     std::fs::write(&part, "{\"lift_height_m\": 0.2}").unwrap();
     let (s, outcome) = grasp::load_setup(&part, &base);
     assert_eq!((s.lift_height_m, s.approach_height_m, outcome), (0.2, base.approach_height_m, grasp::LoadOutcome::Loaded));
+}
+
+fn vm(mode: &str, enabled: bool) -> VisionMode { VisionMode { mode: mode.into(), enabled } }
+
+#[test]
+fn grasp_mode_adds_yolo_and_keeps_aruco() {
+    assert_eq!(grasp::grasp_mode("off"), "yolo");
+    assert_eq!(grasp::grasp_mode("yolo"), "yolo");
+    assert_eq!(grasp::grasp_mode("aruco"), "both");
+    assert_eq!(grasp::grasp_mode("both"), "both");
+}
+
+#[tokio::test]
+async fn grasp_ensures_vision_mode_and_restores_it() {
+    let setup = GraspSetup { camera_tilt_deg: -20.0, ..GraspSetup::default() };
+    for (before, during) in [(vm("aruco", false), vm("both", true)), (vm("off", false), vm("yolo", true)), (vm("yolo", false), vm("yolo", true))] {
+        let rig = rig(setup.clone(), Truth::same(), 0.0, [0.0, 0.0], false).await;
+        let start_r = start_pose(&rig).await.r;
+        let mut s = setup.clone();
+        s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+        rig.sup.inner().write().await.set_grasp_setup(s.clone());
+        *rig.sim.vision.lock().unwrap() = Some(before.clone());
+        let o = run_grasp(&rig).await;
+        assert_holding_done(&o, &s, &rig.object, 0.004);
+        assert_eq!(*rig.sim.mode_calls.lock().unwrap(), vec![during, before.clone()], "mode for the grasp, then the previous one");
+        assert_eq!(rig.sim.vision.lock().unwrap().clone(), Some(before));
+        assert!(rig.sim.inference_calls.lock().unwrap().is_empty(), "mode API used instead of the inference toggle");
+    }
+}
+
+#[tokio::test]
+async fn grasp_leaves_a_running_yolo_mode_alone_and_restores_after_failure() {
+    let setup = GraspSetup::default();
+    // already yolo with inference on: no mode request at all
+    let rig1 = rig(setup.clone(), Truth::same(), 0.0, [0.01, 0.01], false).await;
+    *rig1.sim.vision.lock().unwrap() = Some(vm("both", true));
+    let (id, _) = grasp::start(&rig1.sup, rig1.sim.clone(), &tap(&rig1).await).await.unwrap();
+    wait_phase(&rig1.sup, id, "centring", None).await;
+    rig1.sim.visible.store(false, Ordering::SeqCst);
+    let a = wait_done(&rig1.sup, id, 10.0, |_| {}).await;
+    assert_eq!(a.code.as_deref(), Some("TARGET_LOST"));
+    assert!(rig1.sim.mode_calls.lock().unwrap().is_empty());
+
+    // aruco base mode: restored after a failure as well
+    let rig2 = rig(setup.clone(), Truth::same(), 0.0, [0.01, 0.01], false).await;
+    *rig2.sim.vision.lock().unwrap() = Some(vm("aruco", true));
+    let (id, _) = grasp::start(&rig2.sup, rig2.sim.clone(), &tap(&rig2).await).await.unwrap();
+    wait_phase(&rig2.sup, id, "centring", None).await;
+    assert_eq!(rig2.sim.vision.lock().unwrap().clone(), Some(vm("both", true)));
+    rig2.sim.visible.store(false, Ordering::SeqCst);
+    let a = wait_done(&rig2.sup, id, 10.0, |_| {}).await;
+    assert_eq!(a.code.as_deref(), Some("TARGET_LOST"));
+    assert_eq!(rig2.sim.vision.lock().unwrap().clone(), Some(vm("aruco", true)));
+    assert_idle_after(&rig2.sup, id).await;
+}
+
+#[tokio::test]
+async fn grasp_without_yolo_model_fails_detection_unavailable() {
+    let rig = rig(GraspSetup::default(), Truth::same(), 0.0, [0.0, 0.0], false).await;
+    *rig.sim.vision.lock().unwrap() = Some(vm("aruco", false));
+    rig.sim.no_yolo.store(true, Ordering::SeqCst);
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+    let a = wait_done(&rig.sup, id, 10.0, |_| {}).await;
+    assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("DETECTION_UNAVAILABLE")), "{a:?}");
+    assert_eq!(rig.sim.vision.lock().unwrap().clone(), Some(vm("aruco", false)), "mode untouched");
+    assert_idle_after(&rig.sup, id).await;
 }
