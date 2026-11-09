@@ -10,8 +10,17 @@ function source(name) {
   const start = html.slice(plain - 6, plain) === 'async ' ? plain - 6 : plain;
   return html.slice(start, html.indexOf('\n}', plain) + 2);
 }
+// The handlers translate their messages with t(); load the real dictionary (Chinese UI).
+function i18nSource() {
+  const start = html.indexOf('const I18N = {');
+  assert.notEqual(start, -1, 'I18N');
+  return html.slice(start, html.indexOf('\n};', start) + 3);
+}
 const context = vm.createContext({ console });
 vm.runInContext(`
+${i18nSource()}
+let LANG = 'zh', I18N_VARIANT = '', I18N_VIEW = false;
+${source('t')}
 let unloading = false;
 let messages = [], unloadCalls = 0, rejection;
 const toast = (...args) => messages.push(args);
