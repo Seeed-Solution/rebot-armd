@@ -21,5 +21,12 @@ HTTP API so the cockpit and agents use one port (8765). Current routes (full con
   `ws://<host>:8001/` directly (JMuxer).
 
 `capabilities.vision.detection_proxy` in the schema is `true` in every armd build (the routes
-exist); it does not tell whether your process is reachable. Vision modes in `capabilities`
-are planned (phase 2, docs/dev_flow_spec_vision_runtime.md).
+exist); it does not tell whether your process is reachable.
+
+Optional, perception API version 2 (the reCamera kit's `rebot-vision` implements it): serve
+`GET /api/mode` with `"api_version": 2, "per_request_pipelines": true, "subscriptions": true`,
+run the `{"pipelines": [...]}` a trigger body names, and serve `/api/subscribe`,
+`/api/subscribe/{id}/keepalive`, `DELETE /api/subscribe/{id}` and `/api/subscriptions`. armd then
+reports `capabilities.vision.per_request_pipelines` / `subscriptions`, the grasp triggers
+`["yolo"]` per centring step, and the cockpit holds its own subscriptions instead of setting a
+global mode. Contract: [docs/detection_api.md](../../../docs/detection_api.md).
