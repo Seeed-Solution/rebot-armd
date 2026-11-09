@@ -2582,7 +2582,7 @@ const POSE = (() => {
     }
 
     // translation: tvec / translation / position, or x/y/z inside pose/detail (never the item's own bbox x/y)
-    let t = num3(pick('tvec', 'translation', 'position', 'xyz'));
+    let t = num3(pick('tvec', 'translation', 'position', 'xyz', 't')); // rebot-vision / aruco-detector: pose.t (m)
     if (!t) for (const src of [pose, det]) if (!t && src.z !== undefined) t = num3(src);
     if (t) {
       const unit = String(pick('unit', 'units') || '').toLowerCase();
