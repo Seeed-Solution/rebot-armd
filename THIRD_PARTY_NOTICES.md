@@ -103,6 +103,11 @@ from the projects below.
 (AprilTag, BSD-2-Clause, Copyright (C) 2013-2016 The Regents of The University of Michigan;
 licence text below).
 
+`apriltag_patched/` holds modified copies of files of `components/apriltag` of the same
+checkout (AprilTag, BSD-2-Clause, licence text below); the build uses them in place of the
+SDK's files of the same name. Each file keeps its licence header and lists its changes below
+it.
+
 ### Components compiled into the binary (not in this repository)
 
 The build uses an `sscma-example-sg200x` checkout as an SDK (`SSCMA_ROOT`, pinned in

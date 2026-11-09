@@ -525,7 +525,9 @@ static void put_result(std::ostringstream& s, const VisionResult& r, const std::
       << ",\"ts_ms\":" << r.ts_ms << ",\"age_ms\":" << (age < 0 ? 0 : age) << ",\"inference_time_ms\":"
       << std::setprecision(1) << r.inference_ms << ",\"width\":" << r.width << ",\"height\":" << r.height
       << ",\"pipelines\":{\"yolo\":{\"ran\":" << (r.ran_yolo ? "true" : "false") << ",\"ms\":" << r.yolo_ms
-      << "},\"aruco\":{\"ran\":" << (r.ran_aruco ? "true" : "false") << ",\"ms\":" << r.aruco_ms << "}}"
+      << "},\"aruco\":{\"ran\":" << (r.ran_aruco ? "true" : "false") << ",\"ms\":" << r.aruco_ms;
+    if (!r.aruco_stages_json.empty()) s << ",\"stages\":" << r.aruco_stages_json;
+    s << "}}"
       << ",\"detections\":" << r.detections_json << ",\"count\":" << r.count << ",\"family\":\"" << family
       << "\",\"undistorted\":" << (r.undistorted ? "true" : "false") << ",\"rejected\":" << r.rejected
       << ",\"markers\":" << r.markers_json;

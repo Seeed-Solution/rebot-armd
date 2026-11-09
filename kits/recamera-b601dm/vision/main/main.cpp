@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -56,6 +57,7 @@ struct Config {
     int control_port = 8090;
 
     rv::ArucoConfig aruco;
+    int aruco_stats_every = 200;  ///< log p50/p95 of the ArUco stages every N ArUco frames (0 = off)
     bool verbose = false;
 } g_cfg;
 
@@ -64,6 +66,35 @@ const char* kDefaultModels[] = {
     "/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel",
     "/userdata/local/models/yolo11n_detection_cv181x_int8.cvimodel",
     "/userdata/local/models/yolo11n_cv181x_int8.cvimodel",
+};
+
+/** Collects ArUco frame timings and logs p50/p95 per stage every n frames. */
+class ArucoStats {
+public:
+    void add(double total_ms, const rv::ArucoTiming& t, int n) {
+        if (n <= 0) return;
+        const double v[kN] = {total_ms,       t.gray_ms,   t.decimate_ms, t.threshold_ms, t.unionfind_ms,
+                              t.clusters_ms,  t.quad_fit_ms, t.refine_ms,  t.decode_ms,    t.detect_other_ms,
+                              t.filter_ms,    t.pose_ms,   static_cast<double>(t.quads)};
+        for (int i = 0; i < kN; ++i) col_[i].push_back(v[i]);
+        if (static_cast<int>(col_[0].size()) < n) return;
+        static const char* names[kN] = {"total", "gray", "decimate", "threshold", "unionfind", "clusters", "quad_fit",
+                                        "refine", "decode", "detect_other", "filter", "pose", "quads"};
+        std::string line;
+        char b[64];
+        for (int i = 0; i < kN; ++i) {
+            std::vector<double>& c = col_[i];
+            std::sort(c.begin(), c.end());
+            std::snprintf(b, sizeof(b), " %s=%.1f/%.1f", names[i], c[c.size() / 2], c[(c.size() * 95) / 100]);
+            line += b;
+            c.clear();
+        }
+        MA_LOGI(TAG, "ArUco p50/p95 ms over %d frames:%s", n, line.c_str());
+    }
+
+private:
+    static constexpr int kN = 13;
+    std::vector<double> col_[kN];
 };
 
 bool file_exists(const std::string& p) {
@@ -123,6 +154,7 @@ void load_config_file(const std::string& path) {
     num("k3", g_cfg.aruco.cam.k3);
     num("min_margin", g_cfg.aruco.filter.min_margin);
     num("min_side", g_cfg.aruco.filter.min_side_px);
+    num("aruco_stats_every", g_cfg.aruco_stats_every);
     if (auto it = j.find("ids"); it != j.end() && it->is_string()) {
         std::string err;
         if (!aruco::parse_id_list(it->get<std::string>(), g_cfg.aruco.filter.ids, &err))
@@ -411,6 +443,7 @@ int main(int argc, char** argv) {
     std::vector<af::Box> boxes;
     std::vector<rv::DetBox> dets;
     std::vector<rv::MarkerOut> markers;
+    ArucoStats aruco_stats;
     std::string extra;
     uint32_t frame_id = 0;
     // Frame age for triggers and the rate gate. retrieveFrame() returns the newest queued
@@ -469,6 +502,8 @@ int main(int argc, char** argv) {
             }
             vr.ran_aruco = true;
             vr.aruco_ms = ms_since(t0);
+            vr.aruco_stages_json = rv::aruco_stages_json(aruco_stage.last_timing());
+            aruco_stats.add(vr.aruco_ms, aruco_stage.last_timing(), g_cfg.aruco_stats_every);
             vr.count = static_cast<int>(markers.size());
             vr.undistorted = aruco_stage.undistorted();
             vr.markers_json = rv::markers_json(markers);

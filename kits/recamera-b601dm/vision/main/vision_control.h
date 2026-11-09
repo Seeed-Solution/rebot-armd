@@ -106,6 +106,7 @@ struct VisionResult {
     int rejected = 0;                    ///< markers dropped by the false-positive filter
     bool undistorted = false;
     std::string markers_json = "[]";  ///< pixels in width x height
+    std::string aruco_stages_json;    ///< pipelines.aruco.stages object (ms per stage); empty: omitted
 };
 
 class VisionControl {

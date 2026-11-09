@@ -41,12 +41,29 @@ struct ArucoConfig {
 
 bool aruco_family_supported(const std::string& name);
 
-/** Split of the last run() in milliseconds (CPU wall time on the frame thread). */
+/**
+ * Split of the last run() in milliseconds (CPU wall time on the frame thread). The detect
+ * stages come from apriltag's time profile (td->tp, stamps in apriltag_detector_detect and
+ * apriltag_quad_thresh); detect_ms is the whole apriltag_detector_detect() call.
+ */
 struct ArucoTiming {
-    double gray_ms = 0;    ///< RGB888 -> 8-bit gray
-    double detect_ms = 0;  ///< apriltag quad detection and decoding
-    double pose_ms = 0;    ///< filter, undistortion and pose of the accepted markers
+    double gray_ms = 0;       ///< RGB888 -> 8-bit gray
+    double decimate_ms = 0;   ///< quad_decimate downsampling
+    double threshold_ms = 0;  ///< tile min/max and adaptive threshold
+    double unionfind_ms = 0;  ///< connected components
+    double clusters_ms = 0;   ///< boundary clusters between black and white components
+    double quad_fit_ms = 0;   ///< line fits and quads per cluster
+    double refine_ms = 0;     ///< edge refinement on the full-resolution image
+    double decode_ms = 0;     ///< homography and bit decoding per quad
+    double detect_other_ms = 0;  ///< blur/sharpen, freeing the clusters, reconcile, cleanup
+    double detect_ms = 0;     ///< apriltag_detector_detect() in total
+    double filter_ms = 0;     ///< false-positive filter and copying the accepted markers
+    double pose_ms = 0;       ///< undistortion and pose of the accepted markers
+    int quads = 0;            ///< candidate quads
 };
+
+/** {"gray":..,"decimate":..,...}: the stages of t in ms, one decimal. */
+std::string aruco_stages_json(const ArucoTiming& t);
 
 class ArucoStage {
 public:
@@ -66,6 +83,8 @@ public:
     const ArucoTiming& last_timing() const noexcept { return timing_; }
 
 private:
+    void split_detect(ArucoTiming& t) const;
+
     ArucoConfig cfg_;
     bool undistort_ = false;
     apriltag_family* tf_ = nullptr;

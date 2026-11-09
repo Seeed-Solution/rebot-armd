@@ -7,9 +7,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 
 #include "apriltag.h"
 #include "apriltag_pose.h"
+#include "common/timeprofile.h"
 #include "aruco/tagAruco4x4_100.h"
 #include "aruco/tagAruco4x4_250.h"
 #include "aruco/tagAruco4x4_50.h"
@@ -128,6 +131,9 @@ int ArucoStage::run(const uint8_t* rgb, int width, int height, int stride, std::
     const auto t1 = clock::now();
     zarray_t* detections = apriltag_detector_detect(td_, &im);
     const auto t2 = clock::now();
+    split_detect(timing_);
+    timing_.quads = static_cast<int>(td_->nquads);
+    double pose_ms = 0;
     const int n = zarray_size(detections);
     int rejected = 0;
     out.reserve(n);
@@ -175,10 +181,12 @@ int ArucoStage::run(const uint8_t* rgb, int width, int height, int stride, std::
         info.cx = cfg_.cam.cx;
         info.cy = cfg_.cam.cy;
 
+        const auto tp0 = clock::now();
         apriltag_pose_t pose;
         const double err = cfg_.apriltag_pose ? estimate_tag_pose(&info, &pose) : tag_pose_estimate(&info, &pose);
         double roll = 0, pitch = 0, yaw = 0;
         rot_to_euler(pose.R, roll, pitch, yaw);
+        pose_ms += ms(tp0, clock::now());
 
         MarkerOut m;
         m.id = det->id;
@@ -204,8 +212,42 @@ int ArucoStage::run(const uint8_t* rgb, int width, int height, int stride, std::
     const auto t3 = clock::now();
     timing_.gray_ms = ms(t0, t1);
     timing_.detect_ms = ms(t1, t2);
-    timing_.pose_ms = ms(t2, t3);
+    timing_.pose_ms = pose_ms;
+    timing_.filter_ms = std::max(0.0, ms(t2, t3) - pose_ms);
     return rejected;
+}
+
+// Stamps of the detect call that just ran (apriltag's time profile): each stamp's time is
+// the time since the previous one.
+void ArucoStage::split_detect(ArucoTiming& t) const {
+    const timeprofile_t* tp = td_->tp;
+    int64_t last = tp->utime;
+    for (int i = 0; i < zarray_size(tp->stamps); ++i) {
+        struct timeprofile_entry* e = nullptr;
+        zarray_get_volatile(tp->stamps, i, &e);
+        const double d = static_cast<double>(e->utime - last) / 1000.0;
+        last = e->utime;
+        const char* n = e->name;
+        if (!std::strcmp(n, "decimate")) t.decimate_ms += d;
+        else if (!std::strcmp(n, "threshold")) t.threshold_ms += d;
+        else if (!std::strcmp(n, "unionfind")) t.unionfind_ms += d;
+        else if (!std::strcmp(n, "make clusters")) t.clusters_ms += d;
+        else if (!std::strcmp(n, "fit quads to clusters")) t.quad_fit_ms += d;
+        else if (!std::strcmp(n, "refine")) t.refine_ms += d;
+        else if (!std::strcmp(n, "decode")) t.decode_ms += d;
+        else t.detect_other_ms += d;
+    }
+}
+
+std::string aruco_stages_json(const ArucoTiming& t) {
+    char b[384];
+    std::snprintf(b, sizeof(b),
+                  "{\"gray\":%.1f,\"decimate\":%.1f,\"threshold\":%.1f,\"unionfind\":%.1f,\"clusters\":%.1f,"
+                  "\"quad_fit\":%.1f,\"refine\":%.1f,\"decode\":%.1f,\"detect_other\":%.1f,\"filter\":%.1f,"
+                  "\"pose\":%.1f,\"quads\":%d}",
+                  t.gray_ms, t.decimate_ms, t.threshold_ms, t.unionfind_ms, t.clusters_ms, t.quad_fit_ms,
+                  t.refine_ms, t.decode_ms, t.detect_other_ms, t.filter_ms, t.pose_ms, t.quads);
+    return b;
 }
 
 }  // namespace rv

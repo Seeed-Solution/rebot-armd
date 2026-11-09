@@ -58,13 +58,14 @@ target_compile_options(capture_time_test PRIVATE -Wall -Wextra)
 add_test(NAME capture_time COMMAND capture_time_test)
 
 # ArUco stage benchmark (time per frame and recall, baseline vs tuned detector settings):
-# needs the apriltag sources from SSCMA_ROOT/components/apriltag, so it is only built
-# when SSCMA_ROOT is set. Built with -O2 so the times compare the settings, not -O0 code.
+# needs the apriltag sources from SSCMA_ROOT/components/apriltag (with the patched files of
+# ../apriltag_patched), so it is only built when SSCMA_ROOT is set. Built with -O2 so
+# the times compare the settings, not -O0 code.
 if(SSCMA_ROOT AND EXISTS ${SSCMA_ROOT}/components/apriltag/apriltag.h)
-    set(AT ${SSCMA_ROOT}/components/apriltag)
-    file(GLOB AT_SRCS ${AT}/*.c ${AT}/common/*.c ${AT}/aruco/*.c)
-    add_library(rv_apriltag STATIC ${AT_SRCS})
-    target_include_directories(rv_apriltag PUBLIC ${AT} ${AT}/common ${AT}/aruco)
+    set(RV_APRILTAG_SDK ${SSCMA_ROOT}/components/apriltag)
+    include(${CMAKE_CURRENT_LIST_DIR}/../apriltag_patched/apriltag.cmake)
+    add_library(rv_apriltag STATIC ${RV_APRILTAG_SRCS})
+    target_include_directories(rv_apriltag PUBLIC ${RV_APRILTAG_INCLUDE_DIRS})
     target_compile_options(rv_apriltag PRIVATE -O2 -w)
     target_link_libraries(rv_apriltag PUBLIC Threads::Threads m)
 
