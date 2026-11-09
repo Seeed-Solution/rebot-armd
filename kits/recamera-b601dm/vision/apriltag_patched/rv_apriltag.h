@@ -20,6 +20,9 @@ typedef struct rv_apriltag_options {
      * clusters in one pass (nthreads == 1 only). Same markers; candidate quads may come in
      * another order. */
     bool reuse_buffers;
+    /* Drop candidate quads whose shortest side (full-resolution pixels, before edge
+     * refinement) is below this before refining and decoding them (0 = off). */
+    double min_quad_side;
 } rv_apriltag_options_t;
 
 /* Options of a detector from apriltag_detector_create() / apriltag_detector_copy() of this

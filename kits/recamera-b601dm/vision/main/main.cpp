@@ -161,6 +161,7 @@ void load_config_file(const std::string& path) {
     };
     boolean("lazy_clusters", g_cfg.aruco.lazy_clusters);
     boolean("reuse_buffers", g_cfg.aruco.reuse_buffers);
+    boolean("size_gate", g_cfg.aruco.size_gate);
     if (auto it = j.find("ids"); it != j.end() && it->is_string()) {
         std::string err;
         if (!aruco::parse_id_list(it->get<std::string>(), g_cfg.aruco.filter.ids, &err))

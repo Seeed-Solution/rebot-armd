@@ -105,6 +105,8 @@ bool ArucoStage::init(const ArucoConfig& cfg) {
     td_->qtp.max_line_fit_mse = cfg.max_line_fit_mse;
     rv_apriltag_options(td_)->lazy_clusters = cfg.lazy_clusters;
     rv_apriltag_options(td_)->reuse_buffers = cfg.reuse_buffers;
+    const double gate = cfg.filter.min_side_px - ArucoConfig::kSizeGateSlackPx;
+    rv_apriltag_options(td_)->min_quad_side = cfg.size_gate && gate > 0 ? gate : 0.0;
     td_->nthreads = 1;
     return true;
 }

@@ -36,6 +36,7 @@ either expressed or implied, of the Regents of The University of Michigan.
  *   the decode tasks are stamped "decode".
  * - apriltag_detector_create() / _copy() allocate rebot-vision options after the detector
  *   (rv_apriltag.h); apriltag_detector_destroy() frees the reuse_buffers scratch.
+ * - min_quad_side option: candidate quads smaller than it are dropped before refinement.
  */
 
 #include "apriltag.h"
@@ -1208,6 +1209,28 @@ zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig)
     // rebot-vision: refine the quad edges first, in one pass on this thread (they do not
     // depend on the tag family), and stamp it as "refine"; upstream refines inside each
     // decode task.
+    const double min_side = rv_apriltag_options(td)->min_quad_side;
+    if (min_side > 0) {
+        // rebot-vision: size gate before refine and decode (rv_apriltag.h)
+        int kept = 0;
+        for (int i = 0; i < zarray_size(quads); i++) {
+            struct quad *q;
+            zarray_get_volatile(quads, i, &q);
+            double m = 1e30;
+            for (int j = 0; j < 4; j++) {
+                const int k = (j + 1) & 3;
+                const double s = hypot(q->p[k][0] - q->p[j][0], q->p[k][1] - q->p[j][1]);
+                if (s < m)
+                    m = s;
+            }
+            if (m < min_side)
+                continue;  // no homography yet: nothing to free
+            if (kept != i)
+                zarray_set(quads, kept, q, NULL);
+            kept++;
+        }
+        zarray_truncate(quads, kept);
+    }
     if (td->refine_edges) {
         for (int i = 0; i < zarray_size(quads); i++) {
             struct quad *q;

@@ -36,6 +36,11 @@ struct ArucoConfig {
     /// Keep apriltag's union-find, cluster hash map and cluster point arrays from frame to
     /// frame and build the clusters in one pass (apriltag_patched/).
     bool reuse_buffers = true;
+    /// Drop candidate quads before edge refinement and decoding when their shortest side is
+    /// below filter.min_side_px - kSizeGateSlackPx (refinement moves corners by about a pixel;
+    /// off when min_side_px <= kSizeGateSlackPx).
+    bool size_gate = true;
+    static constexpr double kSizeGateSlackPx = 2.0;
     /// Pose with apriltag's estimate_tag_pose() instead of tag_pose_estimate() (same result,
     /// ~26k heap calls per marker); for the host benchmark's baseline.
     bool apriltag_pose = false;
@@ -65,7 +70,7 @@ struct ArucoTiming {
     double detect_ms = 0;     ///< apriltag_detector_detect() in total
     double filter_ms = 0;     ///< false-positive filter and copying the accepted markers
     double pose_ms = 0;       ///< undistortion and pose of the accepted markers
-    int quads = 0;            ///< candidate quads
+    int quads = 0;            ///< candidate quads (before the size gate)
 };
 
 /** {"gray":..,"decimate":..,...}: the stages of t in ms, one decimal. */
