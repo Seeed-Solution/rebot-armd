@@ -2298,7 +2298,7 @@ const POSE = (() => {
     if (!R) {
       const rad = String(pick('angle_unit') || '').toLowerCase().startsWith('rad');
       const k = rad ? 1 : Math.PI / 180;
-      let e = num3(pick('rpy', 'euler'));
+      let e = num3(pick('rpy', 'euler', 'r_deg')); // reCamera detector: pose.r_deg (degrees)
       if (!e) { const r = [pick('roll', 'rx'), pick('pitch', 'ry'), pick('yaw', 'rz')].map(Number); if (r.every(Number.isFinite)) e = r; }
       if (e) R = eulerR(e[0] * k, e[1] * k, e[2] * k);
     }
