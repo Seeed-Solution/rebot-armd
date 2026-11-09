@@ -44,6 +44,8 @@ pub enum PreemptError {
 /// CAN gaps observed on the reBot rig (2026-11-06, coinciding with 24 V sags);
 /// a real power loss drops the arm regardless of this bound.
 pub const BUS_LOSS_TIMEOUT: Duration = Duration::from_millis(500);
+/// Upper bound for the automatic park started by an expired lease (trajectory + settle).
+pub const WATCHDOG_PARK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Active WebSocket client lease record
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +92,8 @@ pub struct SupervisorInner {
     pub gripper_stall_sign: f32,
     pub pending_normal_unload: bool,
     pub unload_settle_ticks: Option<u32>,
+    /// Set while a park started by the lease watchdog is running; its deadline.
+    pub watchdog_park_deadline: Option<Instant>,
     pub recorder: EpisodeRecorder,
     pub start_time: Instant,
     pub driver: Option<std::sync::Mutex<Box<dyn ArmDriver>>>,
@@ -173,6 +177,7 @@ impl SupervisorInner {
             gripper_stall_sign: 1.0,
             pending_normal_unload: false,
             unload_settle_ticks: None,
+            watchdog_park_deadline: None,
             recorder: EpisodeRecorder::new(),
             start_time: now,
             driver: None,
@@ -442,6 +447,7 @@ impl SupervisorInner {
             self.active_trajectory = None;
             self.pending_normal_unload = false;
             self.unload_settle_ticks = None;
+            self.watchdog_park_deadline = None;
             self.servo_target = None;
 
             let state = self.safety.set_torque(true)?;
@@ -777,6 +783,8 @@ impl SupervisorInner {
             }
         }
 
+        self.cancel_watchdog_park_for_new_lease(conn);
+
         // Four-category state categorization (strictly fail-closed, no unwrap/panic, driver lock poison returns false)
         let confirmed_hardware_disabled = match &self.driver {
             None => !self.is_torqued && !self.disable_pending && self.safety.state() == &SafetyState::Idle,
@@ -831,7 +839,9 @@ impl SupervisorInner {
                 return Err((active.client_id.clone(), active.generation));
             }
         }
-        // A new controller never inherits an expired controller's queued motion.
+        // A new controller never inherits an expired controller's queued motion,
+        // nor a watchdog park started after the previous lease was released.
+        self.cancel_watchdog_park_for_new_lease(client_id);
         if self.active_lease.is_some() { self.stop_motion(); }
         self.lease_generation_counter += 1;
         let gen = self.lease_generation_counter;
@@ -842,6 +852,52 @@ impl SupervisorInner {
             last_valid_motion_instant: None,
         });
         Ok(gen)
+    }
+
+    /// A new lease owner takes over from a running watchdog park: the park's
+    /// motion is cancelled like any other queued motion and the arm brakes to a hold.
+    fn cancel_watchdog_park_for_new_lease(&mut self, client_id: &str) {
+        if self.watchdog_park_deadline.take().is_some() && self.pending_normal_unload {
+            tracing::info!("Watchdog park cancelled: new lease acquired by {client_id}; holding position");
+            self.stop_motion();
+        }
+    }
+
+    /// Conditions for parking automatically when the lease watchdog expires.
+    /// Returns the reason the park is not allowed, or `None` when it is.
+    fn watchdog_park_blocker(&self) -> Option<String> {
+        let Some(policy) = &self.config.resting_pose else { return Some("no resting pose configured".into()); };
+        if !self.supports_automatic_unload() { return Some("driver lacks velocity/torque/enable feedback".into()); }
+        if self.e_stop_latched.load(Ordering::SeqCst) { return Some("E-stop latched".into()); }
+        if !self.safety.state().is_operational() { return Some(format!("safety state {:?}", self.safety.state())); }
+        if self.pending_rearm || self.disable_pending || self.output_suspended || self.handover_settling_since.is_some() {
+            return Some("re-arm, disable, output suspension or handover pending".into());
+        }
+        if !self.hardware_feedback_fresh(Duration::from_millis(policy.feedback_max_age_ms)) {
+            return Some(format!("feedback older than {} ms", policy.feedback_max_age_ms));
+        }
+        None
+    }
+
+    /// Previous watchdog behaviour: rigid hold at the measured (or commanded) position
+    /// and latch Fault(WatchdogTimeout). Torque stays on.
+    fn latch_watchdog_fault(&mut self) {
+        let hold_pos = if self.measured_positions.iter().all(|p| p.is_finite())
+            && self.measured_positions.len() == self.config.dof
+        {
+            self.measured_positions.clone()
+        } else {
+            self.commanded_positions.clone()
+        };
+        self.watchdog_park_deadline = None;
+        self.pending_normal_unload = false;
+        self.unload_settle_ticks = None;
+        self.active_trajectory = None;
+        self.servo_target = None; self.servo_settled_ticks.fill(0);
+        self.target_positions = hold_pos.clone();
+        self.commanded_positions = hold_pos;
+        self.commanded_velocities = vec![0.0; self.config.dof];
+        self.safety.trigger_fault(FaultReason::WatchdogTimeout);
     }
 
     pub fn release_lease(&mut self, client_id: &str, generation: u64) -> bool {
@@ -1331,23 +1387,40 @@ impl SupervisorInner {
             && !self.pending_normal_unload
             && self.last_heartbeat.elapsed() > self.lease_timeout
         {
-            // Watchdog expired: rigid lock at current measured/commanded position, latch fault
-            // Maintain torque hold: do NOT cut power or disable torque
-            let hold_pos = if self.measured_positions.iter().all(|p| p.is_finite())
-                && self.measured_positions.len() == self.config.dof
-            {
-                self.measured_positions.clone()
-            } else {
-                self.commanded_positions.clone()
-            };
-            self.pending_normal_unload = false;
-            self.unload_settle_ticks = None;
-            self.active_trajectory = None;
-            self.servo_target = None; self.servo_settled_ticks.fill(0);
-            self.target_positions = hold_pos.clone();
-            self.commanded_positions = hold_pos;
-            self.commanded_velocities = vec![0.0; self.config.dof];
-            self.safety.trigger_fault(FaultReason::WatchdogTimeout);
+            // Watchdog expired with torque on. When the arm is healthy and has a resting
+            // pose, run the normal unload (park at home, settle, torque off). Otherwise
+            // rigid lock at the current position and latch the fault, keeping torque on.
+            match self.watchdog_park_blocker() {
+                None => {
+                    tracing::warn!("Watchdog: lease expired while torqued, parking");
+                    self.apply_stop_policy(StopPolicy::NormalUnload);
+                    if self.pending_normal_unload {
+                        self.watchdog_park_deadline = Some(Instant::now() + WATCHDOG_PARK_TIMEOUT);
+                    } else {
+                        tracing::warn!("Watchdog park could not be planned; holding torque and latching WatchdogTimeout");
+                        self.latch_watchdog_fault();
+                    }
+                }
+                Some(reason) => {
+                    tracing::warn!("Watchdog: lease expired while torqued, not parking ({reason}); holding torque and latching WatchdogTimeout");
+                    self.latch_watchdog_fault();
+                }
+            }
+        }
+
+        // Watchdog park supervision: a park that stops without completing, or runs past
+        // its deadline, falls back to the hold + Fault(WatchdogTimeout) behaviour.
+        if let Some(deadline) = self.watchdog_park_deadline {
+            if !self.pending_normal_unload {
+                self.watchdog_park_deadline = None;
+                tracing::warn!("Watchdog park interrupted (safety state {:?})", self.safety.state());
+                if self.is_torqued && !self.safety.state().is_stopped() {
+                    self.latch_watchdog_fault();
+                }
+            } else if Instant::now() >= deadline {
+                tracing::warn!("Watchdog park did not finish within {:?}; holding torque and latching WatchdogTimeout", WATCHDOG_PARK_TIMEOUT);
+                self.latch_watchdog_fault();
+            }
         }
 
         // Thermal protection remains active while stopped or shutdown is unconfirmed.
@@ -1428,9 +1501,18 @@ impl SupervisorInner {
                     self.unload_settle_ticks = None;
                     self.pending_normal_unload = false;
                     tracing::info!("Arm settled cleanly at home position for 800ms; safely cutting torque to Standby/Idle.");
-                    if let Err(e) = self.set_torque(false) {
-                        tracing::warn!("Failed to cut torque after normal unload settle: {}", e);
-                        self.safety.mark_motion_finished();
+                    let watchdog_park = self.watchdog_park_deadline.take().is_some();
+                    match self.set_torque(false) {
+                        Ok(_) if watchdog_park => tracing::info!("Watchdog park complete: torque off at resting pose"),
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("Failed to cut torque after normal unload settle: {}", e);
+                            self.safety.mark_motion_finished();
+                            if watchdog_park && self.is_torqued && !self.safety.state().is_stopped() {
+                                tracing::warn!("Watchdog park failed at torque off; holding torque and latching WatchdogTimeout");
+                                self.latch_watchdog_fault();
+                            }
+                        }
                     }
                 }
             } else {
