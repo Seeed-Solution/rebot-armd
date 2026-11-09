@@ -677,7 +677,7 @@ pub struct SchemaField {
 }
 
 /// Version of the capability summary in the observation schema (`capabilities`).
-pub const CAPABILITIES_VERSION: u32 = 2;
+pub const CAPABILITIES_VERSION: u32 = 3;
 
 /// Vision features armd offers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -700,6 +700,12 @@ pub struct VisionCapabilities {
     pub trigger: Option<bool>,
     /// Whether the provider loaded its YOLO model, when it reports so.
     pub yolo_available: Option<bool>,
+    /// The provider runs the pipelines a trigger names (`{"pipelines": [...]}`, perception
+    /// API 2). Present from capabilities version 3; false when the provider does not report it.
+    pub per_request_pipelines: bool,
+    /// The provider serves continuous inference per caller through `/api/v1/vision/subscribe`
+    /// (perception API 2). Present from capabilities version 3.
+    pub subscriptions: bool,
 }
 
 /// armd's route for the vision mode API.

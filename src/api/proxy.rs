@@ -134,7 +134,7 @@ pub async fn proxy_detection_ws(ws: WebSocketUpgrade) -> Response {
 
 use axum::{
     body::Bytes,
-    extract::{Extension, RawQuery},
+    extract::{Extension, Path, RawQuery},
     http::{header, HeaderValue, Method, StatusCode},
     response::IntoResponse,
 };
@@ -439,19 +439,67 @@ pub async fn get_detection_latest(
 /// Upstream `/api/trigger` waits this long when the query has no `wait_ms`.
 const TRIGGER_DEFAULT_WAIT_MS: u64 = 2500;
 
-/// POST /api/v1/detection/trigger -> upstream POST /api/trigger (query passed through).
-/// Single-shot inference on a frame newer than the call; does not change the continuous
-/// `enabled` state. Detector builds without the route answer 404, which is passed through.
+/// POST /api/v1/detection/trigger -> upstream POST /api/trigger (query and JSON body passed
+/// through; perception API 2 reads `{"pipelines": [...]}` from the body). Single-shot inference
+/// on a frame newer than the call; does not change any continuous inference. Detector builds
+/// without the route answer 404, which is passed through.
 pub async fn post_detection_trigger(
     Extension(up): Extension<DetectorUpstream>,
     RawQuery(query): RawQuery,
+    body: Bytes,
 ) -> Response {
-    let timeout = Duration::from_millis(wait_ms_or(query.as_deref(), TRIGGER_DEFAULT_WAIT_MS)) + TIMEOUT_MARGIN;
+    let wait = trigger_body_wait_ms(&body).unwrap_or_else(|| wait_ms_or(query.as_deref(), TRIGGER_DEFAULT_WAIT_MS));
+    let timeout = Duration::from_millis(wait) + TIMEOUT_MARGIN;
     let path = match &query {
         Some(q) if !q.is_empty() => format!("/api/trigger?{q}"),
         _ => "/api/trigger".to_string(),
     };
-    forward(&up, Method::POST, path, Some(json_body(Bytes::new())), timeout).await
+    forward(&up, Method::POST, path, Some(json_body(body)), timeout).await
+}
+
+/// `wait_ms` from a trigger's JSON body, clamped to the upstream cap (the body wins over the query).
+fn trigger_body_wait_ms(body: &[u8]) -> Option<u64> {
+    serde_json::from_slice::<serde_json::Value>(body).ok()?.get("wait_ms")?.as_u64().map(|w| w.min(MAX_WAIT_MS))
+}
+
+// ---------------------------------------------------------------------------
+// Vision subscriptions (perception API 2): continuous inference per caller
+// ---------------------------------------------------------------------------
+
+/// Subscription ids are short tokens from the provider (`s12`); anything else is not forwarded.
+fn valid_subscription_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn bad_subscription_id() -> Response {
+    (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "invalid subscription id"}))).into_response()
+}
+
+/// POST /api/v1/vision/subscribe -> upstream POST /api/subscribe
+/// (body `{"client", "pipelines", "fps"?, "ttl_ms"?, "id"?}` passed through)
+pub async fn post_vision_subscribe(Extension(up): Extension<DetectorUpstream>, body: Bytes) -> Response {
+    forward(&up, Method::POST, "/api/subscribe".into(), Some(json_body(body)), TIMEOUT_MARGIN).await
+}
+
+/// POST /api/v1/vision/subscribe/{id}/keepalive -> upstream POST /api/subscribe/{id}/keepalive
+pub async fn post_vision_keepalive(Extension(up): Extension<DetectorUpstream>, Path(id): Path<String>) -> Response {
+    if !valid_subscription_id(&id) {
+        return bad_subscription_id();
+    }
+    forward(&up, Method::POST, format!("/api/subscribe/{id}/keepalive"), Some(json_body(Bytes::new())), TIMEOUT_MARGIN).await
+}
+
+/// DELETE /api/v1/vision/subscribe/{id} -> upstream DELETE /api/subscribe/{id}
+pub async fn delete_vision_subscribe(Extension(up): Extension<DetectorUpstream>, Path(id): Path<String>) -> Response {
+    if !valid_subscription_id(&id) {
+        return bad_subscription_id();
+    }
+    forward(&up, Method::DELETE, format!("/api/subscribe/{id}"), None, TIMEOUT_MARGIN).await
+}
+
+/// GET /api/v1/vision/subscriptions -> upstream GET /api/subscriptions
+pub async fn get_vision_subscriptions(Extension(up): Extension<DetectorUpstream>) -> Response {
+    forward(&up, Method::GET, "/api/subscriptions".into(), None, TIMEOUT_MARGIN).await
 }
 
 // ---------------------------------------------------------------------------
@@ -513,6 +561,8 @@ pub fn apply_vision_status(caps: &mut crate::model::VisionCapabilities, v: &serd
     caps.api_version = v.get("api_version").and_then(|n| n.as_u64()).and_then(|n| u32::try_from(n).ok());
     caps.trigger = v.get("trigger").and_then(|b| b.as_bool());
     caps.yolo_available = v.get("available").and_then(|a| a.get("yolo")).and_then(|b| b.as_bool());
+    caps.per_request_pipelines = v.get("per_request_pipelines").and_then(|b| b.as_bool()) == Some(true);
+    caps.subscriptions = v.get("subscriptions").and_then(|b| b.as_bool()) == Some(true);
 }
 
 async fn forward_mode(up: &DetectorUpstream, cache: &VisionCache, method: Method, body: Option<Bytes>) -> Response {
@@ -581,6 +631,18 @@ mod tests {
         assert!(r.ends_with("\r\n\r\n{}"));
         let g = String::from_utf8(build_request(&up, &Method::GET, "/api/inference", None)).unwrap();
         assert!(!g.contains("Content-Type"));
+    }
+
+    #[test]
+    fn trigger_wait_from_body_and_subscription_ids() {
+        assert_eq!(trigger_body_wait_ms(br#"{"pipelines":["yolo"],"wait_ms":800}"#), Some(800));
+        assert_eq!(trigger_body_wait_ms(br#"{"wait_ms":90000}"#), Some(5000));
+        assert_eq!(trigger_body_wait_ms(br#"{"pipelines":["aruco"]}"#), None);
+        assert_eq!(trigger_body_wait_ms(b""), None);
+        assert!(valid_subscription_id("s12") && valid_subscription_id("a-b_C9"));
+        for id in ["", "s1/keepalive", "..", "s 1", "s1?x=1", &"x".repeat(33)] {
+            assert!(!valid_subscription_id(id), "{id:?}");
+        }
     }
 
     #[test]

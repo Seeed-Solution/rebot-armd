@@ -20,7 +20,12 @@ struct SeenRequest {
 /// - GET/POST /api/inference: JSON state; POST with a body lacking `enabled` -> 400
 /// - GET /api/results/latest: sleeps `wait_ms`/10 ms (chunked reply), or 3 s with `slow=1`
 /// - POST /api/trigger: sleeps `wait_ms`/10 ms (default wait 2500), or 3 s with `slow=1`;
-///   `miss=1` -> `{"success":false,"timeout":true}`. Any other path (e.g. under a base path) -> 404
+///   `miss=1` -> `{"success":false,"timeout":true}`; body `pipelines` sets `pipelines.*.ran`
+///   (YOLO adds a "cup" detection)
+/// - GET/POST /api/mode: perception API 2 (`per_request_pipelines`, `subscriptions`)
+/// - POST /api/subscribe, POST /api/subscribe/s1/keepalive, DELETE /api/subscribe/s1,
+///   GET /api/subscriptions: one subscription `s1`; other ids -> 404.
+///   Any other path (e.g. under a base path) -> 404
 async fn spawn_mock_upstream() -> (SocketAddr, Arc<Mutex<Vec<SeenRequest>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -63,8 +68,9 @@ async fn spawn_mock_upstream() -> (SocketAddr, Arc<Mutex<Vec<SeenRequest>>>) {
                 let path = req.target.split('?').next().unwrap();
                 let query = req.target.split_once('?').map(|(_, q)| q).unwrap_or("");
                 let state = |on: bool| serde_json::json!({"enabled": on, "fps": if on {10} else {1}, "active_fps": 10, "idle_fps": 1}).to_string();
-                let mode_body = |m: &str, on: bool| serde_json::json!({"api_version": 1, "mode": m, "modes": ["off", "yolo", "aruco", "both"],
-                    "enabled": on, "fps": if on {10} else {1}, "trigger": true, "available": {"yolo": true, "aruco": true}}).to_string();
+                let mode_body = |m: &str, on: bool| serde_json::json!({"api_version": 2, "mode": m, "modes": ["off", "yolo", "aruco", "both"],
+                    "enabled": on, "fps": if on {10} else {1}, "trigger": true, "per_request_pipelines": true, "subscriptions": true,
+                    "available": {"yolo": true, "aruco": true}}).to_string();
                 let (status, payload, chunked) = match (req.method.as_str(), path) {
                     ("GET", "/api/mode") => ("200 OK", mode_body(&mode.lock().unwrap(), *enabled.lock().unwrap()), false),
                     ("POST", "/api/mode") => {
@@ -100,14 +106,29 @@ async fn spawn_mock_upstream() -> (SocketAddr, Arc<Mutex<Vec<SeenRequest>>>) {
                         let wait = query.split('&').find_map(|kv| kv.strip_prefix("wait_ms=")).map(|v| v.parse::<u64>().unwrap()).unwrap_or(2500);
                         let delay = if query.contains("slow=1") { 3000 } else { wait / 10 };
                         tokio::time::sleep(Duration::from_millis(delay)).await;
+                        let v: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
+                        let want = |p: &str| v["pipelines"].as_array().is_none_or(|a| a.iter().any(|x| x == p));
                         let body = if query.contains("miss=1") {
                             serde_json::json!({"success": false, "timeout": true, "count": 0, "markers": []})
                         } else {
-                            serde_json::json!({"success": true, "frame_id": 9, "ts_ms": 1, "age_ms": 3, "inference_time_ms": 12.5, "count": 1,
-                                "markers": [{"id": 4, "corners": [[1, 2], [3, 2], [3, 4], [1, 4]]}]})
+                            serde_json::json!({"api_version": 2, "success": true, "frame_id": 9, "ts_ms": 1, "age_ms": 3, "inference_time_ms": 12.5,
+                                "width": 640, "height": 360,
+                                "pipelines": {"yolo": {"ran": want("yolo")}, "aruco": {"ran": want("aruco")}},
+                                "detections": if want("yolo") { serde_json::json!([{"class_name": "cup", "confidence": 0.9, "x": 0.5, "y": 0.5, "w": 0.1, "h": 0.2}]) } else { serde_json::json!([]) },
+                                "count": 1, "markers": [{"id": 4, "corners": [[1, 2], [3, 2], [3, 4], [1, 4]]}]})
                         };
                         ("200 OK", body.to_string(), false)
                     }
+                    ("POST", "/api/subscribe") => {
+                        let v: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
+                        let body = serde_json::json!({"api_version": 2, "id": "s1", "client": v["client"], "pipelines": v["pipelines"],
+                            "fps": 5, "ttl_ms": 3000, "expires_in_ms": 3000});
+                        ("200 OK", body.to_string(), false)
+                    }
+                    ("POST", "/api/subscribe/s1/keepalive") => ("200 OK", r#"{"api_version":2,"id":"s1","expires_in_ms":3000}"#.to_string(), false),
+                    ("DELETE", "/api/subscribe/s1") => ("200 OK", r#"{"api_version":2,"deleted":"s1"}"#.to_string(), false),
+                    ("GET", "/api/subscriptions") => ("200 OK", r#"{"api_version":2,"subscriptions":[{"id":"s1"}]}"#.to_string(), false),
+                    (_, p) if p.starts_with("/api/subscribe/") => ("404 Not Found", r#"{"api_version":2,"error":"no such subscription"}"#.to_string(), false),
                     _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string(), false),
                 };
                 let resp = if chunked {
@@ -320,7 +341,7 @@ async fn vision_mode_get_and_post_pass_through() {
     assert_eq!(r.status(), 200);
     assert_eq!(r.headers()["cache-control"], "no-store");
     let v: serde_json::Value = r.json().await.unwrap();
-    assert_eq!((v["mode"].as_str(), v["api_version"].as_u64()), (Some("yolo"), Some(1)));
+    assert_eq!((v["mode"].as_str(), v["api_version"].as_u64()), (Some("yolo"), Some(2)));
 
     let r = c.post(&url).json(&serde_json::json!({"mode": "both", "enabled": true})).send().await.unwrap();
     assert_eq!(r.status(), 200);
@@ -379,8 +400,9 @@ async fn schema_capabilities_report_provider_modes() {
     assert_eq!(vis["detection_proxy"], true);
     assert_eq!(vis["mode_endpoint"], "/api/v1/vision/mode");
     assert_eq!(vis["modes"], serde_json::json!(["off", "yolo", "aruco", "both"]));
-    assert_eq!((vis["mode"].as_str(), vis["api_version"].as_u64(), vis["trigger"].as_bool()), (Some("yolo"), Some(1), Some(true)));
+    assert_eq!((vis["mode"].as_str(), vis["api_version"].as_u64(), vis["trigger"].as_bool()), (Some("yolo"), Some(2), Some(true)));
     assert_eq!(vis["yolo_available"], true);
+    assert_eq!((vis["per_request_pipelines"].as_bool(), vis["subscriptions"].as_bool()), (Some(true), Some(true)));
 
     // a mode change through armd shows up in the next schema (cache updated by the proxied reply)
     c.post(format!("http://{addr}/api/v1/vision/mode")).json(&serde_json::json!({"mode": "aruco"})).send().await.unwrap();
@@ -395,6 +417,7 @@ async fn schema_capabilities_report_provider_modes() {
         let vis = &v["capabilities"]["vision"];
         assert_eq!(vis["modes"], serde_json::json!([]));
         assert!(vis["mode"].is_null() && vis["api_version"].is_null());
+        assert_eq!((vis["per_request_pipelines"].as_bool(), vis["subscriptions"].as_bool()), (Some(false), Some(false)));
         assert_eq!(vis["mode_endpoint"], "/api/v1/vision/mode");
     }
 }
@@ -415,4 +438,59 @@ async fn http_detection_source_reads_and_sets_vision_mode() {
     assert_eq!(old.vision_mode().await.unwrap(), None);
     let down = HttpDetectionSource { upstream: DetectorUpstream::parse("http://127.0.0.1:1").unwrap(), image_size_px: [640.0, 360.0] };
     assert!(down.vision_mode().await.is_err());
+}
+
+#[tokio::test]
+async fn trigger_forwards_the_pipelines_body() {
+    let (up, seen) = spawn_mock_upstream().await;
+    let addr = spawn_armd(&format!("http://{up}")).await;
+    let c = reqwest::Client::new();
+    let r = c.post(format!("http://{addr}/api/v1/detection/trigger?wait_ms=500"))
+        .json(&serde_json::json!({"pipelines": ["aruco"]})).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!((v["pipelines"]["yolo"]["ran"].as_bool(), v["pipelines"]["aruco"]["ran"].as_bool()), (Some(false), Some(true)));
+    // wait_ms in the body sets armd's upstream deadline too (1500 + 2 s margin > the mock's 150 ms)
+    let r = c.post(format!("http://{addr}/api/v1/detection/trigger"))
+        .json(&serde_json::json!({"pipelines": ["yolo", "aruco"], "wait_ms": 1500})).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!((seen[0].method.as_str(), seen[0].target.as_str()), ("POST", "/api/trigger?wait_ms=500"));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&seen[0].body).unwrap(), serde_json::json!({"pipelines": ["aruco"]}));
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&seen[1].body).unwrap(), serde_json::json!({"pipelines": ["yolo", "aruco"], "wait_ms": 1500}));
+}
+
+#[tokio::test]
+async fn vision_subscriptions_pass_through() {
+    let (up, seen) = spawn_mock_upstream().await;
+    let addr = spawn_armd(&format!("http://{up}")).await;
+    let c = reqwest::Client::new();
+    let base = format!("http://{addr}/api/v1/vision");
+
+    let r = c.post(format!("{base}/subscribe")).json(&serde_json::json!({"client": "agent-1", "pipelines": ["yolo"], "fps": 3})).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!((v["id"].as_str(), v["client"].as_str()), (Some("s1"), Some("agent-1")));
+    assert_eq!(c.post(format!("{base}/subscribe/s1/keepalive")).send().await.unwrap().status(), 200);
+    assert_eq!(c.get(format!("{base}/subscriptions")).send().await.unwrap().json::<serde_json::Value>().await.unwrap()["subscriptions"][0]["id"], "s1");
+    assert_eq!(c.delete(format!("{base}/subscribe/s1")).send().await.unwrap().status(), 200);
+    // unknown id: the provider's 404 passes through; a malformed id is not forwarded
+    assert_eq!(c.post(format!("{base}/subscribe/s9/keepalive")).send().await.unwrap().status(), 404);
+    assert_eq!(c.delete(format!("{base}/subscribe/s%2F1")).send().await.unwrap().status(), 400);
+    let t: Vec<_> = seen.lock().unwrap().iter().map(|s| (s.method.clone(), s.target.clone(), s.body.clone())).collect();
+    let want = [("POST", "/api/subscribe"), ("POST", "/api/subscribe/s1/keepalive"), ("GET", "/api/subscriptions"),
+        ("DELETE", "/api/subscribe/s1"), ("POST", "/api/subscribe/s9/keepalive")];
+    assert_eq!(t.iter().map(|(m, p, _)| (m.as_str(), p.as_str())).collect::<Vec<_>>(), want);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&t[0].2).unwrap(), serde_json::json!({"client": "agent-1", "pipelines": ["yolo"], "fps": 3}));
+    assert_eq!(t[1].2, "{}", "keep-alive sends a JSON body (the provider requires application/json on POST)");
+
+    // cross-origin writes are refused before the provider; provider down -> 502
+    let n = seen.lock().unwrap().len();
+    for r in [c.post(format!("{base}/subscribe")).header("origin", "http://evil.example").json(&serde_json::json!({"client": "x", "pipelines": ["yolo"]})),
+              c.delete(format!("{base}/subscribe/s1")).header("origin", "http://evil.example")] {
+        assert_eq!(r.send().await.unwrap().status(), 403);
+    }
+    assert_eq!(seen.lock().unwrap().len(), n);
+    let down = spawn_armd("http://127.0.0.1:1").await;
+    assert_eq!(c.get(format!("http://{down}/api/v1/vision/subscriptions")).send().await.unwrap().status(), 502);
 }
