@@ -38,7 +38,7 @@ DEALINGS IN THE SOFTWARE.
 
 - Files:
   - `assets/reBot-DevArm_gripper.urdf`
-  - `packaging/rebot-teleop/rootfs/usr/share/rebot-teleop/assets/reBot-DevArm_gripper.urdf`
+  - `kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/assets/reBot-DevArm_gripper.urdf`
     (same file, installed by the `.deb`). armd does not parse it at runtime: it checks the
     file's sha256 at startup, and the gravity model in `src/gravity.rs` uses link
     parameters taken from it.

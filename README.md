@@ -248,7 +248,15 @@ export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 ./scripts/build_deb.sh 1.1.0          # version argument optional (default: debian/control)
 # -> target/riscv64gc-unknown-linux-musl/release/armd
 # -> dist/rebot-teleop_1.1.0_riscv64.deb
+
+./scripts/build_deb.sh --flavor lite  # armd only, no reCamera kit files
+# -> dist/armd-lite_0.1.0_riscv64.tar.gz (armd, LICENSE, THIRD_PARTY_NOTICES.md)
 ```
+
+`--flavor recamera` (the default) builds the reCamera runtime: armd plus the files of the
+[reCamera B601-DM kit](kits/recamera-b601dm/) (init script, gallery manifest, URDF; sources in
+`kits/recamera-b601dm/packaging/`). `--flavor lite` builds the minimal runtime: the same
+`armd` binary in a tarball, without init script or kit files (version default: `Cargo.toml`).
 
 `build_deb.sh` needs `cargo` and `dpkg-deb`. It builds `RUSTFLAGS` from `RECAMERA_TOOLCHAIN`
 (the older names `REC_TOOLCHAIN` / `RISCV_SYSROOT` also work); if you set `RUSTFLAGS`

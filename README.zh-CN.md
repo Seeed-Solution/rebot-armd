@@ -191,7 +191,12 @@ export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 ./scripts/build_deb.sh 1.1.0          # 版本参数可省略（默认取 debian/control）
 # -> target/riscv64gc-unknown-linux-musl/release/armd
 # -> dist/rebot-teleop_1.1.0_riscv64.deb
+
+./scripts/build_deb.sh --flavor lite  # 只含 armd，不含 reCamera 套件文件
+# -> dist/armd-lite_0.1.0_riscv64.tar.gz（armd、LICENSE、THIRD_PARTY_NOTICES.md）
 ```
+
+`--flavor recamera`（默认）构建 reCamera 运行时：armd 加上 [reCamera B601-DM 套件](kits/recamera-b601dm/)的文件（init 脚本、应用列表 manifest、URDF；源文件在 `kits/recamera-b601dm/packaging/`）。`--flavor lite` 构建最小运行时：同一个 `armd` 二进制打成 tarball，不含 init 脚本和套件文件（版本默认取 `Cargo.toml`）。
 
 `build_deb.sh` 需要 `cargo` 和 `dpkg-deb`。它根据 `RECAMERA_TOOLCHAIN` 生成 `RUSTFLAGS`（旧变量名 `REC_TOOLCHAIN` / `RISCV_SYSROOT` 仍可用）；如果自行设置了 `RUSTFLAGS`，则按原样使用。`.cargo/config.toml` 只保存目标级的链接器设置。
 

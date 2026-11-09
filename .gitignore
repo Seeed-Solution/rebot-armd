@@ -7,7 +7,7 @@ Cargo.lock.bak
 *.deb
 *.deb.part
 /dist
-/packaging/rebot-teleop/pkg_staging
+/kits/recamera-b601dm/packaging/pkg_staging
 
 # Datasets and runtime telemetry
 /data

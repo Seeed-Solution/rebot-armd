@@ -2,31 +2,61 @@
 set -euo pipefail
 
 # ==============================================================================
-# build_deb.sh - Automated RISC-V Debian package builder for rebot-teleop (armd)
+# build_deb.sh - RISC-V (reCamera SG2002) build of armd
+#
+# Usage: build_deb.sh [--flavor recamera|lite] [VERSION]
+#
+#   --flavor recamera  (default) core + kits/recamera-b601dm: the rebot-teleop
+#                      deb (init script, Wi-Fi AP, CAN setup, cockpit, URDF,
+#                      gallery manifest) -> dist/rebot-teleop_<VERSION>_riscv64.deb
+#                      VERSION default: kits/recamera-b601dm/packaging/debian/control
+#   --flavor lite      core only: the armd binary with LICENSE and
+#                      THIRD_PARTY_NOTICES.md, no init script, no kit files
+#                      -> dist/armd-lite_<VERSION>_riscv64.tar.gz
+#                      VERSION default: Cargo.toml
 # ==============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PACKAGING_DIR="${REPO_ROOT}/packaging/rebot-teleop"
+PACKAGING_DIR="${REPO_ROOT}/kits/recamera-b601dm/packaging"
 TARGET_TRIPLE="riscv64gc-unknown-linux-musl"
+
+FLAVOR="recamera"
+CUSTOM_VERSION=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --flavor) FLAVOR="${2:-}"; shift 2 ;;
+        --flavor=*) FLAVOR="${1#--flavor=}"; shift ;;
+        -h|--help) sed -n '4,17p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -*) echo "Error: unknown option $1" >&2; exit 1 ;;
+        *) CUSTOM_VERSION="$1"; shift ;;
+    esac
+done
+case "$FLAVOR" in
+    recamera|lite) ;;
+    *) echo "Error: --flavor must be recamera or lite (got '${FLAVOR}')" >&2; exit 1 ;;
+esac
 
 # SG2002 RISC-V musl toolchain (sophgo host-tools: gcc/riscv64-linux-musl-x86_64).
 # Only its T-Head (lib64v0p7_xthead/lp64d) libraries are used; rust-lld links.
 # REC_TOOLCHAIN and RISCV_SYSROOT are accepted as older names.
 TOOLCHAIN_ROOT="${RECAMERA_TOOLCHAIN:-${REC_TOOLCHAIN:-${RISCV_SYSROOT:-}}}"
 
-# Target version (from CLI arg, or debian/control, or Cargo.toml)
-CUSTOM_VERSION="${1:-}"
+# Target version (from CLI arg, or debian/control for recamera, or Cargo.toml)
 if [ -n "$CUSTOM_VERSION" ]; then
     VERSION="$CUSTOM_VERSION"
-elif [ -f "${PACKAGING_DIR}/debian/control" ]; then
+elif [ "$FLAVOR" = "recamera" ] && [ -f "${PACKAGING_DIR}/debian/control" ]; then
     VERSION="$(grep -m1 '^Version:' "${PACKAGING_DIR}/debian/control" | awk '{print $2}')"
 else
     VERSION="$(grep -m1 '^version = ' "${REPO_ROOT}/Cargo.toml" | cut -d '"' -f 2)"
 fi
 
 echo "====================================================================="
-echo "Building rebot-teleop debian package v${VERSION} (${TARGET_TRIPLE})"
+if [ "$FLAVOR" = "lite" ]; then
+    echo "Building armd lite tarball v${VERSION} (${TARGET_TRIPLE})"
+else
+    echo "Building rebot-teleop debian package v${VERSION} (${TARGET_TRIPLE})"
+fi
 echo "====================================================================="
 
 # Check toolchain availability
@@ -35,7 +65,7 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! command -v dpkg-deb >/dev/null 2>&1; then
+if [ "$FLAVOR" = "recamera" ] && ! command -v dpkg-deb >/dev/null 2>&1; then
     echo "Error: dpkg-deb is not installed or not in PATH" >&2
     exit 1
 fi
@@ -74,6 +104,33 @@ fi
 
 BIN_SIZE=$(ls -lh "${BIN_PATH}" | awk '{print $5}')
 echo "      Binary successfully compiled: ${BIN_PATH} (${BIN_SIZE})"
+
+DIST_DIR="${REPO_ROOT}/dist"
+mkdir -p "${DIST_DIR}"
+
+# Lite flavor: core only. Deterministic tarball (sorted, root-owned, fixed mtime).
+if [ "$FLAVOR" = "lite" ]; then
+    LITE_NAME="armd-lite_${VERSION}_riscv64"
+    LITE_STAGING="${REPO_ROOT}/target/lite_staging/${LITE_NAME}"
+    rm -rf "${LITE_STAGING}"
+    mkdir -p "${LITE_STAGING}"
+    echo "[2/3] Assembling ${LITE_NAME}..."
+    cp -f "${BIN_PATH}" "${LITE_STAGING}/armd"
+    chmod 0755 "${LITE_STAGING}/armd"
+    cp -f "${REPO_ROOT}/LICENSE" "${REPO_ROOT}/THIRD_PARTY_NOTICES.md" "${LITE_STAGING}/"
+    chmod 0644 "${LITE_STAGING}/LICENSE" "${LITE_STAGING}/THIRD_PARTY_NOTICES.md"
+    OUTPUT_TAR="${DIST_DIR}/${LITE_NAME}.tar.gz"
+    echo "[3/3] Packing ${OUTPUT_TAR}..."
+    tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@0' \
+        -C "${LITE_STAGING}/.." -cf - "${LITE_NAME}" | gzip -n -9 > "${OUTPUT_TAR}"
+    tar -tvzf "${OUTPUT_TAR}"
+    echo "====================================================================="
+    echo "Build complete!"
+    echo "Lite artifact: ${OUTPUT_TAR}"
+    echo "Size:          $(ls -lh "${OUTPUT_TAR}" | awk '{print $5}')"
+    echo "====================================================================="
+    exit 0
+fi
 
 # 2. Prepare staging directory
 STAGING_DIR="${REPO_ROOT}/target/deb_staging/rebot-teleop"
@@ -120,8 +177,6 @@ chmod 0644 "${STAGING_DIR}/DEBIAN/control"
 
 # 3. Build deb package with gzip compression & root ownership (opkg/dpkg compliant)
 echo "[3/4] Packaging deb archive with dpkg-deb..."
-DIST_DIR="${REPO_ROOT}/dist"
-mkdir -p "${DIST_DIR}"
 DEB_NAME="rebot-teleop_${VERSION}_riscv64.deb"
 OUTPUT_DEB="${DIST_DIR}/${DEB_NAME}"
 

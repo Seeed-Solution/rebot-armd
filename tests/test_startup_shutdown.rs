@@ -183,10 +183,10 @@ async fn mock_shutdown_does_not_wait_for_an_open_websocket() {
 #[cfg(unix)]
 #[test]
 fn init_stop_refuses_unknown_or_uncooperative_processes_without_killing() {
-    let source = include_str!("../packaging/rebot-teleop/rootfs/etc/init.d/K92rebot-teleop");
+    let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
     assert_eq!(
         source,
-        include_str!("../packaging/rebot-teleop/pkg/etc/init.d/K92rebot-teleop")
+        include_str!("../kits/recamera-b601dm/packaging/pkg/etc/init.d/K92rebot-teleop")
     );
     assert!(source.contains("restart) stop || exit $?;"));
     let start = source.find("stop_video() {").unwrap();
@@ -239,7 +239,7 @@ fn init_stop_refuses_unknown_or_uncooperative_processes_without_killing() {
 #[cfg(unix)]
 #[test]
 fn init_start_does_not_reconfigure_buses_while_an_untracked_daemon_exists() {
-    let source = include_str!("../packaging/rebot-teleop/rootfs/etc/init.d/K92rebot-teleop");
+    let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
     let start = source.find("start() {").unwrap();
     let end = source.find("\n# Stop only the video process").unwrap();
     let temp = tempfile::tempdir().unwrap();
