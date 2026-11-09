@@ -319,7 +319,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 json!({"type":"command_reject", "request_id":value.get("request_id"), "status":409, "code":"LEASE_LOST", "message":"This connection does not own an active lease", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
                             } else if kind == "release_lease" {
                                 json!({"type":"lease_released", "success":false})
-                            } else { json!({"type":"lease_lost", "generation":local_generation}) });
+                            } else if local_generation == 0 {
+                                json!({"type":"lease_lost", "generation":0})
+                            } else {
+                                json!({"type":"lease_lost", "generation":local_generation, "reason":inner.lease_loss_reason(&recv_connection, local_generation)})
+                            });
                         } else if kind == "release_lease" {
                             let released = inner.release_lease(&recv_connection, local_generation);
                             recv_generation.store(0, Ordering::SeqCst);

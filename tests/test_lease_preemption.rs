@@ -718,3 +718,41 @@ fn test_dormant_disabled_arm_with_stale_feedback_preempts_without_handover_fault
     assert!(!matches!(inner.safety.state(), SafetyState::Fault(_)));
     assert!(inner.shutdown_ready(), "Dormant idle arm must be ready for safe shutdown");
 }
+
+#[test]
+fn test_lease_loss_reason_distinguishes_preemption_from_expiry() {
+    let mut inner = SupervisorInner::new(test_config());
+    let g1 = inner.acquire_lease("c1").unwrap();
+    assert_eq!(inner.lease_loss_reason("c1", g1), "expired");
+    let (g2, evicted) = inner.preempt_lease("c2", "label-2").unwrap();
+    assert_eq!(evicted, Some(("c1".to_string(), g1)));
+    assert_eq!(inner.lease_loss_reason("c1", g1), "preempted");
+    // The new holder losing its own lease later is not a preemption.
+    assert_eq!(inner.lease_loss_reason("c2", g2), "expired");
+}
+
+#[tokio::test]
+async fn test_websocket_lease_lost_reason_after_expiry_and_preemption() {
+    let (addr, _) = spawn_test_server().await;
+
+    // Expiry: no heartbeats for longer than lease_timeout_ms (1000 ms in this config).
+    let (mut ws1, _) = connect_async(format!("ws://{}/api/v1/ws", addr)).await.unwrap();
+    let g1 = ws_reply(&mut ws1, json!({"type":"acquire_lease", "client_id":"c1"}), &["lease_granted"]).await["generation"].as_u64().unwrap();
+    tokio::time::sleep(Duration::from_millis(1150)).await;
+    let lost = ws_reply(&mut ws1, json!({"type":"heartbeat", "generation":g1, "epoch_id":1}), &["lease_lost"]).await;
+    assert_eq!(lost["generation"], g1);
+    assert_eq!(lost["reason"], "expired");
+
+    // Preemption: the evicted connection's next message also reports "preempted",
+    // so a dropped eviction notice still yields the right reason.
+    let g1b = ws_reply(&mut ws1, json!({"type":"acquire_lease", "client_id":"c1"}), &["lease_granted"]).await["generation"].as_u64().unwrap();
+    let (mut ws2, _) = connect_async(format!("ws://{}/api/v1/ws", addr)).await.unwrap();
+    ws_reply(&mut ws2, json!({"type":"acquire_lease", "client_id":"c2", "force":true}), &["lease_granted"]).await;
+    let mut reasons = Vec::new();
+    for _ in 0..2 {
+        let msg = ws_reply(&mut ws1, json!({"type":"heartbeat", "generation":g1b, "epoch_id":1}), &["lease_lost"]).await;
+        assert_eq!(msg["generation"], g1b);
+        reasons.push(msg["reason"].clone());
+    }
+    assert!(reasons.iter().all(|r| r == "preempted"), "{reasons:?}");
+}

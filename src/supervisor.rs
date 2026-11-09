@@ -189,6 +189,8 @@ pub struct SupervisorInner {
     pub bus_loss_instant: Option<Instant>,
     pub e_stop_latched: Arc<AtomicBool>,
     pub last_preemption: Option<Instant>,
+    /// Connection and generation most recently evicted by a forced acquire.
+    pub last_evicted: Option<(String, u64)>,
     pub handover_settling_since: Option<Instant>,
     /// Running gravity-compensation session (`src/gravity_comp.rs`).
     pub gravity_comp: Option<crate::gravity_comp::GravityCompRun>,
@@ -284,6 +286,7 @@ impl SupervisorInner {
             bus_loss_instant: None,
             e_stop_latched: Arc::new(AtomicBool::new(false)),
             last_preemption: None,
+            last_evicted: None,
             handover_settling_since: None,
             gravity_comp: None,
             gravity_comp_last_exit: None,
@@ -1053,6 +1056,7 @@ impl SupervisorInner {
         self.last_heartbeat = now;
         if evicted.is_some() {
             self.last_preemption = Some(now);
+            self.last_evicted = evicted.clone();
         }
 
         tracing::info!("Preempted lease for connection {} (label {}), generation {}, evicted: {:?}", conn, label, gen, evicted);
@@ -1188,6 +1192,15 @@ impl SupervisorInner {
             }
         }
         false
+    }
+
+    /// Why `client_id` no longer holds `generation`: "preempted" when a forced acquire
+    /// evicted exactly that lease, otherwise "expired" (heartbeats stopped arriving).
+    pub fn lease_loss_reason(&self, client_id: &str, generation: u64) -> &'static str {
+        match &self.last_evicted {
+            Some((conn, gen)) if conn == client_id && *gen == generation => "preempted",
+            _ => "expired",
+        }
     }
 
     pub fn is_lease_active(&self) -> bool {

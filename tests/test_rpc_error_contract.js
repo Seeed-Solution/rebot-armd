@@ -60,4 +60,31 @@ ${source('disableTorque')}
   assert.match(vm.runInContext('messages[0][0]', context), /未启动收纳/);
   assert.equal(vm.runInContext('messages[0][2]', context), 'UNSUPPORTED');
   console.log('PASS: typed RPC errors drive unload fallback and business-error UI; no network misclassification');
+
+  // Lease loss: the toast follows armd's reason; a missing reason (older armd) means expiry.
+  vm.runInContext(`
+    const CFG = { leaseRetryMs: 500 };
+    const S = { leaseGeneration: null };
+    let resets = 0, retries = 0;
+    const resetLease = () => { resets++; S.leaseGeneration = null; };
+    const scheduleLeaseRetry = () => { retries++; };
+    ${source('leaseLossKey')}
+    ${source('onLeaseLost')}
+  `, context);
+  const lost = (lang, reason, generation = 7) => vm.runInContext(`
+    LANG = ${JSON.stringify(lang)}; messages = []; S.leaseGeneration = 7;
+    onLeaseLost({}, ${JSON.stringify({ type: 'lease_lost', generation, reason })});
+    messages.length ? messages[0][0] : null`, context);
+  assert.match(lost('zh', 'preempted'), /其他设备接管/);
+  assert.match(lost('zh', 'expired'), /连接中断/);
+  assert.doesNotMatch(lost('zh', 'expired'), /其他设备/);
+  assert.match(lost('zh', undefined), /连接中断/);
+  assert.match(lost('zh', 'released'), /本页面已释放/);
+  assert.match(lost('en', 'preempted'), /another device/);
+  assert.match(lost('en', 'expired'), /Connection dropped/);
+  assert.doesNotMatch(lost('en', 'expired'), /another device/);
+  assert.match(lost('en', 'released'), /This page released/);
+  assert.equal(lost('zh', 'preempted', 3), null, 'stale generation is ignored');
+  assert.equal(vm.runInContext('S.leaseGeneration', context), 7);
+  console.log('PASS: lease_lost reason selects preempted / connection-dropped / released wording');
 })().catch(error => { console.error(error); process.exitCode = 1; });

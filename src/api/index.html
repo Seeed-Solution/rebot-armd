@@ -1716,7 +1716,9 @@ const I18N = {
     'err.preset_unsupported': '当前机械臂不支持自动收纳，未启动运动；可使用回零功能，力矩仍需现场确认',
     'err.rejected': '指令被拒绝', 'err.nolease': '当前页面没有控制权，请等待控制连接就绪', 'err.cmdtimeout': '设备未在时限内确认指令，请检查实际状态',
     'err.reqfail': '请求失败：无法连接 armd', 'err.servo_reject': '控制指令被拒绝: ', 'err.preset_reject': '预设指令被拒绝: ', 'err.state_limit': '状态或限位不符', 'err.workspace': '目标超出安全工作空间（地面/边界），已拒绝', 'act.running': '外部控制：移动中', 'act.done': '外部控制：完成', 'act.failed': '外部控制：失败（{code}）', 'act.cancelled': '外部控制：已取消（{code}）', 'err.disconnected': '控制连接已断开或控制权已变化',
-    'toast.lease_lost': '⚠️ 控制权已被其他设备接管，当前页面已切换为观察模式', 'toast.goto': '正在前往{name}', 'toast.took': '已成功接管控制权', 'toast.take_failed': '接管未成功，控制权仍由其他设备持有',
+    'toast.lease_preempted': '⚠️ 控制权已被其他设备接管，当前页面已切换为观察模式',
+    'toast.lease_expired': '⚠️ 连接中断，控制权已释放；机械臂若处于上电状态会自动收回停靠',
+    'toast.lease_released': '本页面已释放控制权', 'toast.goto': '正在前往{name}', 'toast.took': '已成功接管控制权', 'toast.take_failed': '接管未成功，控制权仍由其他设备持有',
     'toast.take_rejected': '接管请求被拒绝: ', 'toast.take_timeout': '接管响应超时，正在对账控制权...', 'toast.ws_not_ready': '控制连接未就绪，请稍后再试',
     'toast.homing': '回零中', 'toast.estop_unconfirmed': '无法确认急停，请使用现场安全装置并检查机械臂状态', 'toast.estop_confirmed': '设备已确认急停锁定，仍可能保持力矩', 'toast.estop_timeout': '急停状态未确认，请检查现场安全装置',
     'toast.reset_ok': '已成功复位，请长按使能开启控制', 'toast.parked': '已收纳到位并安全断电', 'toast.unload_unconfirmed': '尚未确认安全卸载，力矩可能仍保持，请检查状态',
@@ -1853,7 +1855,9 @@ const I18N = {
     'err.preset_unsupported': 'This arm does not support auto-park; no motion started. Use Home instead; confirm torque state on site',
     'err.rejected': 'Command rejected', 'err.nolease': 'This page has no control lease, wait for the control connection', 'err.cmdtimeout': 'Device did not confirm the command in time, check the actual state',
     'err.reqfail': 'Request failed: cannot reach armd', 'err.servo_reject': 'Control command rejected: ', 'err.preset_reject': 'Preset command rejected: ', 'err.state_limit': 'state or limits mismatch', 'err.workspace': 'Target outside the safe workspace (floor/boundary), rejected', 'act.running': 'External control: moving', 'act.done': 'External control: done', 'act.failed': 'External control: failed ({code})', 'act.cancelled': 'External control: cancelled ({code})', 'err.disconnected': 'Control connection lost or lease changed',
-    'toast.lease_lost': '⚠️ Control was taken over by another device, this page is now an observer', 'toast.goto': 'Moving to {name}', 'toast.took': 'Control taken over', 'toast.take_failed': 'Take over failed, another device still holds control',
+    'toast.lease_preempted': '⚠️ Control was taken over by another device, this page is now an observer',
+    'toast.lease_expired': '⚠️ Connection dropped, so control was released. If the arm was torqued, it parked itself',
+    'toast.lease_released': 'This page released control', 'toast.goto': 'Moving to {name}', 'toast.took': 'Control taken over', 'toast.take_failed': 'Take over failed, another device still holds control',
     'toast.take_rejected': 'Take over rejected: ', 'toast.take_timeout': 'Take over timed out, reconciling lease...', 'toast.ws_not_ready': 'Control connection not ready, try again shortly',
     'toast.homing': 'Homing', 'toast.estop_unconfirmed': 'E-Stop not confirmed, use the on-site safety device and check the arm', 'toast.estop_confirmed': 'Device confirmed E-Stop latch; torque may still be held', 'toast.estop_timeout': 'E-Stop state not confirmed, check the on-site safety device',
     'toast.reset_ok': 'Reset done, hold Enable to take control', 'toast.parked': 'Parked and powered off safely', 'toast.unload_unconfirmed': 'Safe unload not confirmed, torque may still be held, check the state',
@@ -2276,12 +2280,7 @@ function connectWS() {
       return;
     }
     if (o.type === 'lease_lost') {
-      // Only a loss of the generation this page holds demotes it; a stale notice for an older generation is ignored.
-      if (o.generation != null ? o.generation === S.leaseGeneration : S.leaseGeneration != null) {
-        resetLease();
-        toast(t('toast.lease_lost'), 'warn');
-        scheduleLeaseRetry(ws, CFG.leaseRetryMs);
-      }
+      onLeaseLost(ws, o);
       return;
     }
     if (o.type === 'epoch_sync') {
@@ -2364,9 +2363,27 @@ function connectWS() {
     try { ws.close(); } catch (_) {}
   };
 }
+// Toast key for a lost lease. armd sends reason "preempted" (forced acquire by another
+// client) or "expired" (no heartbeat within the lease timeout); older armd builds omit the
+// reason except on preemption, so a missing reason means the lease ran out.
+function leaseLossKey(reason) {
+  if (reason === 'preempted') return 'toast.lease_preempted';
+  if (reason === 'released') return 'toast.lease_released';
+  return 'toast.lease_expired';
+}
+function onLeaseLost(ws, o) {
+  // Only a loss of the generation this page holds demotes it; a stale notice for an older generation is ignored.
+  if (o.generation != null ? o.generation === S.leaseGeneration : S.leaseGeneration != null) {
+    resetLease();
+    toast(t(leaseLossKey(o.reason)), 'warn');
+    scheduleLeaseRetry(ws, CFG.leaseRetryMs);
+  }
+}
 // A stale socket's late close must never reset the lease or close the modal of the current socket.
 function onSocketClose(ws) {
   if (S.ws !== ws) return;
+  // armd drops a lease when its socket closes; the arm parks itself if it was torqued.
+  if (S.leaseGeneration != null) toast(t('toast.lease_expired'), 'warn');
   S.ws = null;
   S.detections = [];
   S.detLastReceivedAt = 0;
