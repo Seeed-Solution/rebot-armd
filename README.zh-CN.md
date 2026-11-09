@@ -35,7 +35,7 @@
 | `armd` CPU | 7 个电机全部上力矩、50 Hz 保持时占 **7.0 %**；未上力矩时 4.5 %（均为 10 s 平均） |
 | 整颗芯片（上力矩时） | 忙碌 **31 %**，包括摄像头的视频与检测，约 69 % 的 CPU 空闲 |
 | 机械臂 | **7** 个达妙电机（6 关节 + 夹爪），CAN 1 Mbit/s，控制循环 **50 Hz** |
-| 同一颗芯片同时运行 | 摄像头自带服务的 H.264 视频流与 YOLO 目标检测 |
+| 同一颗芯片同时运行 | `rebot-vision` 提供的 H.264 视频、YOLO 目标检测与 ArUco 标记，按需运行（见[视觉](#视觉recamera-套件)） |
 
 `armd` 提供：
 
@@ -43,7 +43,8 @@
 - 用于观测的 REST API 和用于控制的 WebSocket API，执行器指令只接受持有控制租约的连接；
 - 面向 agent 的高层动作（`move_to`、`move_relative`、`gripper`、`grasp`），由 [rebot-companion](https://github.com/Seeed-Solution/rebot-companion) 及其 MCP 服务器使用；
 - 把关节状态与指令录制为 Parquet 文件；
-- 用于拖动示教的重力补偿模式（已实现并在仿真中测试，未经实机验证）。
+- 目标检测（YOLO，跑在 TPU）与带 3D 位姿的 ArUco 标记（跑在 CPU），只在调用方请求时运行（[视觉](#视觉recamera-套件)）；
+- 用于拖动示教的重力补偿模式，已在 B601-DM 上实机验证。
 
 > 本软件会驱动真实的机械臂。在硬件上运行前请先阅读 [安全](#安全)。
 
@@ -58,6 +59,7 @@
 - [在 reCamera 上安装](#在-recamera-上安装)
 - [从源码构建](#从源码构建)
 - [网页驾驶舱](#网页驾驶舱)
+- [视觉（reCamera 套件）](#视觉recamera-套件)
 - [API 概览](#api-概览)
 - [Agent 与 MCP 集成](#agent-与-mcp-集成)
 - [示教片段录制（Parquet）](#示教片段录制parquet)
@@ -100,12 +102,12 @@
 
 `mock`（进程内仿真，默认值）用于测试和无机械臂时的界面开发。
 
-验证中驱动的协议编码由单元测试覆盖（`tests/test_protocol_vectors.rs`、`tests/test_driver_capabilities.rs`）。它们使用通用 6 关节 profile，没有运动学和工作空间，笛卡尔动作返回 `UNSUPPORTED`。达妙驱动另有带重力前馈的 MIT 模式，但只能在代码中启用（`DamiaoArmDriver::with_control_mode`），命令行和 profile 都不能选择。重力补偿模式在运行时把 J1–J6 切到 MIT 再切回（见[网页驾驶舱](#网页驾驶舱)），该切换未经实机验证。
+验证中驱动的协议编码由单元测试覆盖（`tests/test_protocol_vectors.rs`、`tests/test_driver_capabilities.rs`）。它们使用通用 6 关节 profile，没有运动学和工作空间，笛卡尔动作返回 `UNSUPPORTED`。达妙驱动另有带重力前馈的 MIT 模式，但只能在代码中启用（`DamiaoArmDriver::with_control_mode`），命令行和 profile 都不能选择。重力补偿模式在运行时把 J1–J6 切到 MIT 再切回（见[网页驾驶舱](#网页驾驶舱)），该切换已在 B601-DM 上实机验证。
 
 TODO / 路线图：
 
 - [ ] 在真实机械臂上验证 `rebot-rs`（RobStride）、`so-arm101`（飞特 STS）和 `fashionstar` / `star-arm102`（FashionStar），并提供带运动学和工作空间的 profile。
-- [ ] 在 B601-DM 上验证重力补偿模式（达妙 MIT 切换、重力前馈）（[核实清单](docs/control_safety_contract.md#hardware-verification-checklist--实机核实清单)）。
+- [x] 在 B601-DM 上验证重力补偿模式（达妙 MIT 切换、重力前馈）（[核实清单](docs/control_safety_contract.md#hardware-verification-checklist--实机核实清单)）。
 - [ ] 主从示教（未实现；`--leader` / `--leader-port` 会被拒绝）。
 
 ---
@@ -168,7 +170,7 @@ armd 之后 init 脚本启动 `rebot-vision`（nice 10，由 `/usr/share/rebot-t
 
 驾驶舱地址：`http://<摄像头地址>:8765/`。
 
-驾驶舱的识别功能需要摄像头上的检测服务（`yolo-detector`，默认 `http://127.0.0.1:8090`，可用 `ARMD_DETECTOR_URL` 修改），它不包含在本包中。
+armd 通过 `http://127.0.0.1:8090` 访问视觉进程（可用 `ARMD_DETECTOR_URL` 修改）。`--flavor lite` 不含视觉进程，此时识别、标定和抓取不可用，驾驶舱其他功能正常。
 
 ---
 
@@ -224,13 +226,35 @@ RECAMERA_DOCKER=tpuc_recamera \
   - *视角坐标系*：方向跟随摄像头画面（摄像头安装在 J6 之后），在浏览器中用 6 关节 IK 求解；
   - *基座坐标系*：方向跟随机械臂基座坐标轴。
   目标跟随实测位姿，经 WebSocket 租约流式发送。
-- **识别叠加**：在视频上绘制摄像头检测服务输出的检测框；识别开关与单次快照。
+- **识别叠加**：在视频上绘制 YOLO 检测框和 ArUco 标记，可选 YOLO、ArUco 或两者；只有叠加开启且页面可见时，页面才持有视觉订阅。另有单次快照。
 - **手眼标定抽屉**：眼在手上（摄像头装在夹爪上）或眼在手外（固定摄像头），使用 ArUco 标记；采集位姿、求解、导出 rebot-companion 的 `HandEyeCalibration.load_result` 可读取的 JSON。
 - **点框抓取**：开启识别后点一个框并确认，armd 执行 `grasp` 动作（张开、俯视接近、闭环图像对中、J6 对齐 0° / 90°、下降、夹紧并判定、抬起）。任何摇杆、按键、停止或急停都会中止。抓取设置（桌面高度、夹爪位置像素、接近与抓取高度、相机俯角）由 armd 保存。目前只在仿真和截图测试中验证过；需要在真机上确认的项目见 [docs/plan_tap_to_grasp.md](docs/plan_tap_to_grasp.md)。
-- **重力补偿 / 拖动示教**：按住开关 0.6 秒，J1–J6 进入漂浮状态（MIT 模式，kp = 0，带阻尼，以 URDF 重力力矩为前馈，1 秒内渐入）；夹爪保持位置控制。开启期间摇杆、按键和预设不发送指令，夹爪按键发送张开 / 闭合动作，横幅显示渐入进度、录制开关和退出按钮。退出、停止、急停、租约丢失、故障、反馈超时、超速（1.5 rad/s）等退出原因都会在实测位姿锁定机械臂，并以提示条显示原因。目前只在仿真和截图测试中验证（`tests/test_gravity_comp.rs`、`scripts/gravity_comp_shots.mjs`），未经实机验证。
+- **重力补偿 / 拖动示教**：按住开关 0.6 秒，J1–J6 进入漂浮状态（MIT 模式，kp = 0，带阻尼，以 URDF 重力力矩为前馈，1 秒内渐入）；夹爪保持位置控制。开启期间摇杆、按键和预设不发送指令，夹爪按键发送张开 / 闭合动作，横幅显示渐入进度、录制开关和退出按钮。退出、停止、急停、租约丢失、故障、反馈超时、超速等退出原因都会在实测位姿锁定机械臂，并以提示条显示原因。超速阈值：J1–J3 为 1.5 rad/s，J4–J6 为 3.0 rad/s。在 B601-DM 上测试的五种退出方式（退出、停止、接管、急停、客户端断开）均把机械臂保持在 1.5 mrad 以内；一段 30 秒拖动示教录制得到 1509 帧。
 - **急停**按钮、故障显示与清除、长按使能力矩、收纳。
 
 其他客户端持有租约时，驾驶舱切换为观察模式，并提供需确认的接管操作。
+
+## 视觉（reCamera 套件）
+
+`rebot-vision`（[kits/recamera-b601dm/vision](kits/recamera-b601dm/vision/)）是 `rebot-teleop` 包中的 C++ 进程，独占摄像头，提供：
+
+- **视频**：H.264，经 `ws://<host>:8001/` 推送，由驾驶舱播放。
+- **目标检测**：YOLO，跑在 SG2002 的 TPU 上，使用设备上已有的 YOLO11n 模型。
+- **ArUco 标记**：字典 `aruco4x4_50`，每个标记给出相机坐标系下的 3D 位姿（标记边长 `marker_size`，默认 5 cm），手眼标定使用它。标记可以比所贴的物体小很多。
+- **按需运行**：没有调用方请求时不做推理。
+  - 单帧：`POST /api/v1/detection/trigger {"pipelines": ["yolo"]}`、`["aruco"]` 或两者。抓取动作每轮对中发一次 YOLO 触发，标定每采集一个位姿发一次 ArUco 触发。
+  - 连续：订阅（`/api/v1/vision/subscribe`），声明流水线和频率，由调用方保活，停止保活后失效。多个订阅按并集运行，默认最多 5 次结果/秒。驾驶舱叠加使用订阅。
+
+在 reCamera 上实测，机械臂未上力矩（rebot-teleop 1.3.0 / 1.3.1）：
+
+| | 运行在 | 每帧耗时 | 5 次结果/秒时整机 CPU |
+|---|---|---|---|
+| 待机（无调用方） | — | — | 约 30 %（视觉进程 5 %） |
+| YOLO | TPU | 47 ms | 42 % |
+| ArUco（640 × 360） | CPU | 37 ms | 52 % |
+| YOLO + ArUco | TPU + CPU | — | 60 %（1.3.0 实测，ArUco 提速前） |
+
+从待机发起单次触发，0.1–0.17 秒返回（1.3.0）。配置项、模型查找路径和 ArUco 分阶段耗时见 [vision README](kits/recamera-b601dm/vision/README.md)。
 
 ---
 
@@ -347,7 +371,7 @@ armd 驱动的真实机械臂有足以伤人和损坏物品的力量。使用风
 - 工作空间盒：rebot-dm 上，servo 目标和规划运动采样点必须使 end_link 原点、夹爪包络 8 个角点和相机点高于地面（`floor_z_m`）、位于包围盒内且在 `max_reach_m` 之内；越界时返回 `422 WORKSPACE_VIOLATION`。包围盒是粗略限制，不检测与桌面物体的碰撞。
 - 限速：rebot-dm 上规划运动与动作的单关节速度上限为 0.45 rad/s；动作默认 0.05 m/s（最大 0.15 m/s）和 0.5 rad/s（最大 1.0 rad/s）。
 - 跟踪误差故障：跟随误差超过 0.5 rad 持续 500 ms 时锁存故障，信息中包含关节号；动作会更早以 `TRACKING_STALL` 结束。
-- 重力补偿（未经实机验证）：进入要求已使能、静止、持有租约且反馈新鲜。所有退出都先在实测位姿保持（力矩不断），再切回 POS_VEL；租约看门狗收纳在此之后才开始。例外：过温保护仍会断力矩；CAN 总线完全中断时，电机继续执行最后一条 MIT 指令（重力前馈加阻尼），直到总线恢复。详见 [docs/control_safety_contract.md](docs/control_safety_contract.md#gravity-compensation-hand-guiding--重力补偿拖动示教)。
+- 重力补偿：进入要求已使能、静止、持有租约且反馈新鲜。所有退出都先在实测位姿保持（力矩不断），再切回 POS_VEL；租约看门狗收纳在此之后才开始。例外：过温保护仍会断力矩；CAN 总线完全中断时，电机继续执行最后一条 MIT 指令（重力前馈加阻尼），直到总线恢复。详见 [docs/control_safety_contract.md](docs/control_safety_contract.md#gravity-compensation-hand-guiding--重力补偿拖动示教)。
 - 默认热点密码（`12345678`）和未鉴权的 HTTP/WebSocket API 使该网络上的任何人都能控制机械臂和开始录制。请修改密码，并只在可信网络上运行。
 
 以上数值是源码中的软件默认值（`src/model.rs`、`src/supervisor.rs`），不是经过认证的安全功能。

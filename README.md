@@ -41,7 +41,7 @@ other hosts and arms are listed under [Hardware](#hardware) with their verificat
 | `armd` CPU | **7.0 %** of the core with all 7 motors torqued at 50 Hz; 4.5 % with torque off (10 s averages) |
 | Whole chip, arm torqued | **31 %** busy, including the camera's video and detection, so about 69 % of the core is idle |
 | Arm | **7** Damiao motors (6 joints + gripper) on CAN at 1 Mbit/s, **50 Hz** control loop |
-| Same chip, same time | H.264 video stream and YOLO object detection from the camera's own services |
+| Same chip, same time | H.264 video, YOLO object detection and ArUco markers from `rebot-vision`, on demand (see [Vision](#vision-recamera-kit)) |
 
 `armd` provides:
 
@@ -52,8 +52,9 @@ other hosts and arms are listed under [Hardware](#hardware) with their verificat
 - high-level actions for agents (`move_to`, `move_relative`, `gripper`, `grasp`), used by
   [rebot-companion](https://github.com/Seeed-Solution/rebot-companion) and its MCP server;
 - recording of joint state and commands to Parquet files;
-- a gravity-compensation mode for hand-guided demonstrations (implemented and tested in
-  simulation, not verified on hardware).
+- object detection (YOLO, on the TPU) and ArUco markers with 3D pose (on the CPU), run only
+  when a caller asks for them ([Vision](#vision-recamera-kit));
+- a gravity-compensation mode for hand-guided demonstrations, verified on the B601-DM.
 
 > This software moves a real arm. Read [Safety](#safety) before running it on hardware.
 
@@ -70,6 +71,7 @@ the Debian package that installs it on the reCamera is `rebot-teleop` (init scri
 - [Install on reCamera](#install-on-recamera)
 - [Build from source](#build-from-source)
 - [Web cockpit](#web-cockpit)
+- [Vision (reCamera kit)](#vision-recamera-kit)
 - [API overview](#api-overview)
 - [Agent and MCP integration](#agent-and-mcp-integration)
 - [Episode recording (Parquet)](#episode-recording-parquet)
@@ -118,13 +120,13 @@ The protocol encoders of the drivers under verification are covered by unit test
 The Damiao driver also has an MIT mode with gravity feed-forward, but it can only be enabled
 from code (`DamiaoArmDriver::with_control_mode`), not from the CLI or a profile. The
 gravity-compensation mode switches J1–J6 to MIT at runtime and back (see
-[Web cockpit](#web-cockpit)); that switch is not verified on hardware.
+[Web cockpit](#web-cockpit)); that switch is verified on the B601-DM.
 
 TODO / roadmap:
 
 - [ ] Verify `rebot-rs` (RobStride), `so-arm101` (Feetech STS) and `fashionstar` / `star-arm102`
       (FashionStar) on real arms, with profiles that include kinematics and a workspace.
-- [ ] Verify the gravity-compensation mode (Damiao MIT switch, gravity feed-forward) on the B601-DM
+- [x] Verify the gravity-compensation mode (Damiao MIT switch, gravity feed-forward) on the B601-DM
       ([checklist](docs/control_safety_contract.md#hardware-verification-checklist--实机核实清单)).
 - [ ] Leader-follower teleoperation (not implemented; `--leader` / `--leader-port` are rejected).
 
@@ -231,9 +233,9 @@ channel after start (checked with `iw dev wlan1 info`), the init script restarts
 
 Open the cockpit at `http://<camera-address>:8765/`.
 
-Object detection in the cockpit needs the camera's detector service (`yolo-detector`,
-`http://127.0.0.1:8090` by default, `ARMD_DETECTOR_URL` to change it); it is not part of this
-package.
+armd reaches the vision process at `http://127.0.0.1:8090` (`ARMD_DETECTOR_URL` to change it).
+With `--flavor lite` there is no vision process; detection, calibration and grasp are then
+unavailable and the rest of the cockpit works.
 
 ---
 
@@ -314,8 +316,9 @@ Chinese and English (language switch in the header).
     with a 6-joint IK in the browser;
   - *base frame*: directions follow the arm's base axes.
   The target follows the measured pose and is streamed over the WebSocket lease.
-- **Detection overlay**: boxes from the camera's detector drawn on the video; detection on /
-  off and single-shot snapshot.
+- **Detection overlay**: YOLO boxes and ArUco markers drawn on the video. Choose YOLO, ArUco
+  or both; the page holds a vision subscription only while the overlay is on and the page is
+  visible. Single-shot snapshot.
 - **Hand-eye calibration drawer**: eye-in-hand (camera on the gripper) or eye-to-hand (fixed
   camera) with an ArUco marker; capture poses, solve, export JSON that rebot-companion's
   `HandEyeCalibration.load_result` reads.
@@ -329,14 +332,46 @@ Chinese and English (language switch in the header).
   mode, kp = 0, damping, URDF gravity torque as feed-forward, ramped in over 1 s); the gripper
   stays position-controlled. While it is on, sticks, keys and presets send nothing, the gripper
   keys send open / close actions, and a banner shows the ramp, the recording toggle and an exit
-  button. Exit, stop, E-stop, lease loss, faults, stale feedback, overspeed (1.5 rad/s) and the
-  other exit causes lock the arm at the measured pose; the reason is shown as a toast. Tested
-  in simulation and screenshot tests only (`tests/test_gravity_comp.rs`,
-  `scripts/gravity_comp_shots.mjs`); not verified on hardware.
+  button. Exit, stop, E-stop, lease loss, faults, stale feedback, overspeed and the
+  other exit causes lock the arm at the measured pose; the reason is shown as a toast.
+  Overspeed limits are 1.5 rad/s for J1–J3 and 3.0 rad/s for J4–J6. On the B601-DM, all five
+  exit paths tested (exit, stop, takeover, E-stop, client disconnect) held the arm within
+  1.5 mrad, and a 30 s hand-guided recording gave 1509 frames.
 - **E-stop** button, fault display and clear, torque enable by press-and-hold, park.
 
 When another client holds the lease, the cockpit switches to observer mode and offers a
 takeover with confirmation.
+
+## Vision (reCamera kit)
+
+`rebot-vision` ([kits/recamera-b601dm/vision](kits/recamera-b601dm/vision/)) is a C++ process
+in the `rebot-teleop` package. It owns the camera and provides:
+
+- **Video**: H.264 over `ws://<host>:8001/`, played by the cockpit.
+- **Object detection**: YOLO on the SG2002 TPU, using the YOLO11n model already on the device.
+- **ArUco markers**: dictionary `aruco4x4_50`, each with its 3D pose in the camera frame (marker
+  size `marker_size`, 5 cm by default). Hand-eye calibration uses them. A marker can be much
+  smaller than the object it is stuck on.
+- **On demand**: nothing is inferred until a caller asks.
+  - One frame: `POST /api/v1/detection/trigger {"pipelines": ["yolo"]}`, `["aruco"]` or
+    both. The grasp action sends one YOLO trigger per centring step, and calibration one
+    ArUco trigger per captured pose.
+  - Continuous: a subscription (`/api/v1/vision/subscribe`) with its pipelines and rate,
+    kept alive by the caller and dropped when keep-alives stop. Several subscriptions run as
+    their union, at no more than 5 results/s by default. The cockpit overlay uses one.
+
+Measured on the reCamera with the arm's torque off (rebot-teleop 1.3.0 / 1.3.1):
+
+| | Runs on | Time per frame | Whole chip at 5 results/s |
+|---|---|---|---|
+| Standby (no caller) | — | — | about 30 % (vision process 5 %) |
+| YOLO | TPU | 47 ms | 42 % |
+| ArUco (640 × 360) | CPU | 37 ms | 52 % |
+| YOLO + ArUco | TPU + CPU | — | 60 % (measured on 1.3.0, before the ArUco speed-up) |
+
+A single trigger from standby returns in 0.1–0.17 s (1.3.0). Settings, the model search path
+and the per-stage ArUco timing are in the
+[vision README](kits/recamera-b601dm/vision/README.md).
 
 ---
 
@@ -493,7 +528,7 @@ own risk; the MIT License comes without warranty.
   actions default to 0.05 m/s (max 0.15 m/s) and 0.5 rad/s (max 1.0 rad/s).
 - Tracking-error fault: a following error above 0.5 rad for 500 ms latches a fault that names
   the joint; actions end earlier as `TRACKING_STALL`.
-- Gravity compensation (not verified on hardware): entry needs an armed, stationary arm, the
+- Gravity compensation: entry needs an armed, stationary arm, the
   lease and fresh feedback. Every exit holds the measured pose with torque on, then switches
   back to POS_VEL; the lease watchdog park starts only after that. Exceptions: a thermal trip
   still disables torque, and with a complete CAN bus loss the motors keep their last MIT
