@@ -194,7 +194,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         const FRESHNESS_LIMIT: Duration = Duration::from_millis(250);
         self.last_feedback_instant
             .iter()
-            .all(|opt| opt.map_or(false, |instant| instant.elapsed() <= FRESHNESS_LIMIT))
+            .all(|opt| opt.is_some_and(|instant| instant.elapsed() <= FRESHNESS_LIMIT))
     }
 
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
@@ -388,7 +388,7 @@ impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
         const FRESHNESS_LIMIT: Duration = Duration::from_millis(250);
         self.last_feedback_instant
             .iter()
-            .all(|opt| opt.map_or(false, |instant| instant.elapsed() <= FRESHNESS_LIMIT))
+            .all(|opt| opt.is_some_and(|instant| instant.elapsed() <= FRESHNESS_LIMIT))
     }
 
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
@@ -651,7 +651,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             return EnableState::Unknown;
         }
         if self.last_feedback_instant.iter().any(|t| {
-            self.last_enable_command.map_or(false, |command| t.map_or(true, |sample| sample < command))
+            self.last_enable_command.is_some_and(|command| t.is_none_or(|sample| sample < command))
         }) {
             return EnableState::Unknown;
         }
@@ -721,7 +721,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
         let should_warn = now_sec.saturating_sub(last_warn) >= 3;
 
         for (i, opt) in self.last_feedback_instant.iter().enumerate() {
-            let ok = opt.map_or(false, |instant| instant.elapsed() <= limit);
+            let ok = opt.is_some_and(|instant| instant.elapsed() <= limit);
             if !ok {
                 all_valid = false;
                 if should_warn && (self.is_enabled || self.is_enabling) {
@@ -813,7 +813,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 let _ = self.read_joint_states();
                 let all_fresh = !self.last_feedback_instant.is_empty()
                     && self.last_feedback_instant.iter().all(|opt| {
-                        opt.map_or(false, |t| t >= cmd_start)
+                        opt.is_some_and(|t| t >= cmd_start)
                     });
                 if all_fresh && self.motor_status.iter().all(|&st| st == 0) {
                     tracing::info!("All Damiao motors confirmed disabled (state=0) in {:?}", poll_start.elapsed());
@@ -873,7 +873,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 let _ = self.read_joint_states();
                 let all_fresh = !self.last_feedback_instant.is_empty()
                     && self.last_feedback_instant.iter().all(|opt| {
-                        opt.map_or(false, |t| t >= handshake_start)
+                        opt.is_some_and(|t| t >= handshake_start)
                     });
 
                 if all_fresh {
@@ -895,7 +895,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 // If not all enabled after 25ms or 10 checks, retry once for motors that have not responded or are not enabled
                 if !retried && (poll_start.elapsed() >= Duration::from_millis(25) || check_count >= 10) {
                     for (i, &id) in self.motor_ids.iter().enumerate() {
-                        let motor_fresh_and_enabled = self.last_feedback_instant.get(i).copied().flatten().map_or(false, |t| t >= handshake_start)
+                        let motor_fresh_and_enabled = self.last_feedback_instant.get(i).copied().flatten().is_some_and(|t| t >= handshake_start)
                             && self.motor_status.get(i).copied() == Some(1);
                         if !motor_fresh_and_enabled {
                             tracing::debug!("Retrying enable for motor {} (CAN ID 0x{:X})", i, id);
@@ -1071,7 +1071,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     .last_feedback_instant
                     .get(i)
                     .and_then(|&opt| opt)
-                    .map_or(true, |t| t.elapsed() >= Duration::from_millis(45));
+                    .is_none_or(|t| t.elapsed() >= Duration::from_millis(45));
                 if !stale {
                     continue;
                 }
@@ -1186,7 +1186,7 @@ impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
         const FRESHNESS_LIMIT: Duration = Duration::from_millis(250);
         self.last_feedback_instant
             .iter()
-            .all(|opt| opt.map_or(false, |instant| instant.elapsed() <= FRESHNESS_LIMIT))
+            .all(|opt| opt.is_some_and(|instant| instant.elapsed() <= FRESHNESS_LIMIT))
     }
 
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> {

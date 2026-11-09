@@ -26,7 +26,7 @@ fn test_golden_vector_zero() {
 #[test]
 fn test_golden_vector_test_pose() {
     let q_test = [0.0, -0.5, 0.5, 0.0, 0.0, 0.0];
-    let expected = [0.0, -2.142779, -5.518330, -1.358455, -0.000252, 0.000168];
+    let expected = [0.0, -2.142779, -5.518_33, -1.358455, -0.000252, 0.000168];
 
     let tau = compute_gravity_torques(&q_test).expect("Failed to compute gravity torque at test pose");
 

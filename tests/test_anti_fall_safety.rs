@@ -1,3 +1,5 @@
+// Test vectors use the same rounded angle values as the joint limits and the URDF.
+#![allow(clippy::approx_constant)]
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};

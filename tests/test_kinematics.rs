@@ -1,3 +1,5 @@
+// Test vectors use the same rounded angle values as the joint limits and the URDF.
+#![allow(clippy::approx_constant)]
 //! Rust kinematics (src/kinematics.rs) vs the companion FK fixture and the cockpit's JS VIK.
 use std::time::Instant;
 use armd::kinematics::{self, Mat3, Pose};

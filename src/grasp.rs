@@ -974,6 +974,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn ray_and_projection_round_trip() {
         let setup = GraspSetup { camera_tilt_deg: 20.0, ..Default::default() };
         let cam = CamModel::assumed(&setup, &CameraMount::default());

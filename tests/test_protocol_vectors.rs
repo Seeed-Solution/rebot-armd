@@ -1,3 +1,5 @@
+// Test vectors use the same rounded angle values as the joint limits and the URDF.
+#![allow(clippy::approx_constant)]
 use std::f32::consts::PI;
 use armd::driver::{
     ArmDriver, ArmDriverError, DamiaoArmDriver, FashionStarArmDriver, FeetechArmDriver,

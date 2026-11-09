@@ -250,7 +250,7 @@ pub fn try_sync_system_time(timestamp_ms: Option<u64>) {
     if let Some(ts_ms) = timestamp_ms {
         let ts_sec = ts_ms / 1000;
         // Bounded valid window: 2024-01-01 to 2035-01-01
-        if ts_sec >= 1_704_067_200 && ts_sec <= 2_051_222_400 {
+        if (1_704_067_200..=2_051_222_400).contains(&ts_sec) {
             let now_sec = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());

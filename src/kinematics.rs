@@ -22,6 +22,8 @@ pub const IDENTITY: Mat3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 /// end_joint origin (URDF xyz 0 0 0.15539).
 pub const END_TRANS: Vec3 = [0.0, 0.0, 0.15539];
 /// end_joint origin rpy (URDF 0 -1.5708 3.1415), fixed-axis R = Rz(y) Ry(p) Rx(r).
+// The URDF values are rounded; keeping them as written keeps FK equal to the URDF.
+#[allow(clippy::approx_constant)]
 pub const END_RPY: Vec3 = [0.0, -1.5708, 3.1415];
 static END_ROT: LazyLock<Mat3> = LazyLock::new(|| rpy_to_r(END_RPY[0], END_RPY[1], END_RPY[2]));
 
@@ -276,6 +278,8 @@ fn chol6(a: &[f64; 36], b: &[f64; 6]) -> Option<[f64; 6]> {
             let mut s = a[i * 6 + j];
             for k in 0..j { s -= l[i * 6 + k] * l[j * 6 + k]; }
             if i == j {
+                // Also rejects NaN.
+                #[allow(clippy::neg_cmp_op_on_partial_ord)]
                 if !(s > 1e-18) { return None; }
                 l[i * 6 + i] = s.sqrt();
             } else {

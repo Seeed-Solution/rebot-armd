@@ -26,17 +26,17 @@ async fn bridge_websocket(client_ws: WebSocketUpgrade, upstream_url: String) -> 
                                 }
                             }
                             Ok(WsMessage::Binary(b)) => {
-                                if upstream_tx.send(TungMessage::Binary(b.into())).await.is_err() {
+                                if upstream_tx.send(TungMessage::Binary(b)).await.is_err() {
                                     break;
                                 }
                             }
                             Ok(WsMessage::Ping(p)) => {
-                                if upstream_tx.send(TungMessage::Ping(p.into())).await.is_err() {
+                                if upstream_tx.send(TungMessage::Ping(p)).await.is_err() {
                                     break;
                                 }
                             }
                             Ok(WsMessage::Pong(p)) => {
-                                if upstream_tx.send(TungMessage::Pong(p.into())).await.is_err() {
+                                if upstream_tx.send(TungMessage::Pong(p)).await.is_err() {
                                     break;
                                 }
                             }
@@ -63,17 +63,17 @@ async fn bridge_websocket(client_ws: WebSocketUpgrade, upstream_url: String) -> 
                                 }
                             }
                             Ok(TungMessage::Binary(b)) => {
-                                if client_tx.send(WsMessage::Binary(b.into())).await.is_err() {
+                                if client_tx.send(WsMessage::Binary(b)).await.is_err() {
                                     break;
                                 }
                             }
                             Ok(TungMessage::Ping(p)) => {
-                                if client_tx.send(WsMessage::Ping(p.into())).await.is_err() {
+                                if client_tx.send(WsMessage::Ping(p)).await.is_err() {
                                     break;
                                 }
                             }
                             Ok(TungMessage::Pong(p)) => {
-                                if client_tx.send(WsMessage::Pong(p.into())).await.is_err() {
+                                if client_tx.send(WsMessage::Pong(p)).await.is_err() {
                                     break;
                                 }
                             }

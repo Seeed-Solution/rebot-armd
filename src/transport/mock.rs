@@ -75,8 +75,7 @@ impl MockTransport {
 impl Transport for MockTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
         if let Some(err_msg) = self.error_on_next_read.take() {
-            return Err(TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(TransportError::Io(std::io::Error::other(
                 err_msg,
             )));
         }
@@ -105,8 +104,7 @@ impl Transport for MockTransport {
 
     fn write(&mut self, buf: &[u8]) -> Result<usize, TransportError> {
         if let Some(err_msg) = self.error_on_next_write.take() {
-            return Err(TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(TransportError::Io(std::io::Error::other(
                 err_msg,
             )));
         }

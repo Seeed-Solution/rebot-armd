@@ -292,8 +292,8 @@ impl SupervisorInner {
     }
 
     fn gravity_output_enabled(&self) -> bool {
-        self.gravity_compensated && self.config.gravity_model.is_some() && matches!(self.config.dof, 6 | 7) && self.driver.as_ref().map_or(true, |d|
-            d.lock().map_or(false, |drv| drv.capabilities().torque_feedforward))
+        self.gravity_compensated && self.config.gravity_model.is_some() && matches!(self.config.dof, 6 | 7) && self.driver.as_ref().is_none_or(|d|
+            d.lock().is_ok_and(|drv| drv.capabilities().torque_feedforward))
     }
 
     fn states_valid(states: &[crate::model::JointState], caps: DriverCapabilities, dof: usize) -> bool {
@@ -305,7 +305,7 @@ impl SupervisorInner {
 
     pub fn hardware_feedback_fresh(&self, max_age: Duration) -> bool {
         if !self.feedback_numeric_valid { return false; }
-        self.driver.as_ref().map_or(true, |d| d.lock().map_or(false, |drv| {
+        self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| {
             // Ages alone decide: drivers' is_feedback_valid() hard-codes 250 ms,
             // which would silently cap callers asking for a longer bound.
             let ages = drv.feedback_ages();
@@ -576,8 +576,8 @@ impl SupervisorInner {
     /// velocity, supporting torque and enable state. This is a capability check,
     /// not a claim that the arm is currently resting or ready to disable.
     pub fn supports_automatic_unload(&self) -> bool {
-        self.driver.as_ref().map_or(true, |driver| {
-            self.config.resting_pose.is_some() && driver.lock().map_or(false, |driver| {
+        self.driver.as_ref().is_none_or(|driver| {
+            self.config.resting_pose.is_some() && driver.lock().is_ok_and(|driver| {
                 let capabilities = driver.capabilities();
                 capabilities.velocity_feedback && capabilities.torque_feedback && capabilities.enable_feedback
             })
@@ -811,7 +811,7 @@ impl SupervisorInner {
         match &self.driver {
             None => !self.is_torqued,
             Some(driver) => !self.is_torqued
-                && driver.lock().map_or(false, |drv| {
+                && driver.lock().is_ok_and(|drv| {
                     if !drv.capabilities().enable_feedback {
                         true
                     } else {
@@ -884,7 +884,7 @@ impl SupervisorInner {
             Some(driver) => !self.is_torqued
                 && !self.disable_pending
                 && self.safety.state() == &SafetyState::Idle
-                && driver.lock().map_or(false, |drv| {
+                && driver.lock().is_ok_and(|drv| {
                     if !drv.capabilities().enable_feedback {
                         true
                     } else {
@@ -893,11 +893,10 @@ impl SupervisorInner {
                 }),
         };
 
-        if confirmed_hardware_disabled {
-            self.handover_settling_since = None;
-        } else if self.safety.state().is_stopped() {
-            self.handover_settling_since = None;
-        } else if self.is_fully_settled_armed_hold() {
+        if confirmed_hardware_disabled
+            || self.safety.state().is_stopped()
+            || self.is_fully_settled_armed_hold()
+        {
             self.handover_settling_since = None;
         } else {
             self.stop_motion();
@@ -1752,7 +1751,7 @@ impl SupervisorInner {
         if self.config.dof >= 7 {
             let is_bus_fresh = if let Some(ref d) = self.driver {
                 if let Ok(driver) = d.lock() {
-                    self.last_can_feedback_instant.map_or(false, |t| t.elapsed() < Duration::from_millis(50)) && driver.is_feedback_valid() && driver.capabilities().torque_feedback
+                    self.last_can_feedback_instant.is_some_and(|t| t.elapsed() < Duration::from_millis(50)) && driver.is_feedback_valid() && driver.capabilities().torque_feedback
                 } else {
                     false
                 }
@@ -1926,15 +1925,14 @@ impl SupervisorInner {
         }
 
         // Thermal protection remains active while stopped or shutdown is unconfirmed.
-        let temperature_available = self.driver.as_ref().map_or(true, |d| d.lock().map_or(false, |drv| drv.capabilities().temperature_feedback));
-        if (self.is_torqued || self.disable_pending) && temperature_available {
-            if self.temperatures.iter().any(|t| t.is_finite() && *t > self.config.max_temperature)
+        let temperature_available = self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv| drv.capabilities().temperature_feedback));
+        if (self.is_torqued || self.disable_pending) && temperature_available
+            && self.temperatures.iter().any(|t| t.is_finite() && *t > self.config.max_temperature)
                 && !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. })) {
                 self.apply_stop_policy(StopPolicy::ThermalTrip);
             }
-        }
         if self.disable_pending {
-            let confirmed = self.driver.as_ref().map_or(true, |d| d.lock().map_or(false, |drv|
+            let confirmed = self.driver.as_ref().is_none_or(|d| d.lock().is_ok_and(|drv|
                 drv.is_feedback_valid() && drv.enable_state() == EnableState::Disabled));
             if confirmed {
                 self.is_torqued = false;
@@ -2215,8 +2213,8 @@ impl SupervisorInner {
         // Pending disable and invalid feedback suppress ordinary commands; reconnect resynchronizes first.
         let mut output_error = None;
         if self.is_torqued && !self.disable_pending {
-            let send_to_bus = feedback_fresh && self.driver.as_ref().map_or(true, |d|
-                d.lock().map_or(false, |drv| drv.enable_state() != EnableState::Disabled));
+            let send_to_bus = feedback_fresh && self.driver.as_ref().is_none_or(|d|
+                d.lock().is_ok_and(|drv| drv.enable_state() != EnableState::Disabled));
 
             if send_to_bus {
                 if let Some(ref d) = self.driver {

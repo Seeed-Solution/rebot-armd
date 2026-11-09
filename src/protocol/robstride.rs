@@ -134,6 +134,7 @@ pub fn build_clear_fault_frame(motor_id: u8, master_id: u8) -> CanFrame {
 ///   - comm_type = 1 (bits 28..24)
 ///   - torque T quantized as 16-bit unsigned integer (0..65535, zero torque at 32768, bits 23..8)
 ///   - motor_id (bits 7..0)
+///
 /// 8-byte Data Payload: 4 x 16-bit big-endian unsigned integers:
 ///   - byte 0-1: p_des (16-bit be)
 ///   - byte 2-3: v_des (16-bit be)
@@ -182,6 +183,7 @@ pub fn build_feedback_extended_id(fault_flags: u8, motor_id: u8, master_id: u8) 
 ///   - bit 23..16: fault_flags
 ///   - bit 15..8:  motor_id
 ///   - bit 7..0:   master_id
+///
 /// Data Payload:
 ///   - byte 0-1: position (16-bit be)
 ///   - byte 2-3: velocity (16-bit be)

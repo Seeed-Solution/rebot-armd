@@ -218,6 +218,7 @@ pub struct ArmConfig {
 }
 
 impl Default for ArmConfig {
+    #[allow(clippy::approx_constant)] // joint limits use the rounded values from the motor profile
     fn default() -> Self {
         let dof = 6;
         let joint_names = vec![
@@ -339,6 +340,7 @@ impl ArmConfig {
     }
 
     /// Factory for reBot Arm B601-DM with 6 arm joints + 1 gripper joint (7 DOF total)
+    #[allow(clippy::approx_constant)] // joint limits use the rounded values from the motor profile
     pub fn rebot_dm() -> Self {
         let dof = 7;
         let joint_names = vec![

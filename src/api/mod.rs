@@ -89,14 +89,14 @@ pub fn create_router_with(supervisor: Arc<ArmSupervisor>, detector: proxy::Detec
 // remain suitable only for a trusted network or an authenticated reverse proxy.
 async fn same_origin(request: Request<Body>, next: Next) -> Response {
     let protected = request.method() != axum::http::Method::GET
-        || request.headers().get("upgrade").and_then(|h| h.to_str().ok()).map_or(false, |h| h.eq_ignore_ascii_case("websocket"));
+        || request.headers().get("upgrade").and_then(|h| h.to_str().ok()).is_some_and(|h| h.eq_ignore_ascii_case("websocket"));
     if protected {
         if let Some(origin) = request.headers().get("origin") {
             let host = request.headers().get("host").and_then(|h| h.to_str().ok());
-            let valid = origin.to_str().ok().and_then(|o| o.parse::<axum::http::Uri>().ok()).map_or(false, |uri| {
+            let valid = origin.to_str().ok().and_then(|o| o.parse::<axum::http::Uri>().ok()).is_some_and(|uri| {
                 matches!(uri.scheme_str(), Some("http" | "https"))
                     && uri.authority().map(|a| a.as_str()) == host
-                    && uri.path_and_query().map_or(true, |p| p.as_str() == "/")
+                    && uri.path_and_query().is_none_or(|p| p.as_str() == "/")
             });
             if !valid {
                 return axum::response::IntoResponse::into_response((StatusCode::FORBIDDEN, "Cross-origin control requests are not allowed"));

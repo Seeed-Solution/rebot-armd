@@ -47,7 +47,7 @@ impl SlcanCodec {
 
         // Validate that if raw_line contained line terminators, there are no invalid trailing or embedded characters
         if raw_line.contains('\r') || raw_line.contains('\n') {
-            let without_endings = raw_line.trim_end_matches(|c| c == '\r' || c == '\n');
+            let without_endings = raw_line.trim_end_matches(['\r', '\n']);
             if without_endings != trimmed_line {
                 return Err(TransportError::Protocol(format!(
                     "Malformed trailing characters in SLCAN frame: {:?}",

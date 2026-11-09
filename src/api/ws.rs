@@ -277,7 +277,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     } else {
                         let local_generation = recv_generation.load(Ordering::SeqCst);
                         let generation = value.get("generation").and_then(Value::as_u64).unwrap_or(0);
-                        let label_matches = value.get("client_id").map_or(true, |id| id.as_str() == client_label.as_deref());
+                        let label_matches = value.get("client_id").is_none_or(|id| id.as_str() == client_label.as_deref());
                         // Heartbeat from legacy clients may omit generation; connection still must own it.
                         let supplied_generation_ok = generation == local_generation || (kind == "heartbeat" && generation == 0);
                         let authorized = local_generation != 0 && supplied_generation_ok && label_matches
@@ -307,7 +307,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 response = None;
                             } else if kind == "command" {
                                 let request_id = value.get("request_id").and_then(Value::as_u64);
-                                if request_id.is_none() || last_request.map_or(false, |last| request_id.unwrap() <= last) {
+                                if request_id.is_none() || last_request.is_some_and(|last| request_id.unwrap() <= last) {
                                     response = Some(json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"}));
                                 } else {
                                     last_request = request_id;
@@ -359,7 +359,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             } else if kind == "servo" || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream") || value.get("positions").is_some() {
                                 match value.get("sequence_id").and_then(Value::as_u64) {
                                     None => response = Some(json!({"type":"servo_reject", "reason":"missing_sequence_id"})),
-                                    Some(sequence) if last_sequence.map_or(false, |last| { let delta = sequence.wrapping_sub(last); delta == 0 || delta > 1000 }) => {
+                                    Some(sequence) if last_sequence.is_some_and(|last| { let delta = sequence.wrapping_sub(last); delta == 0 || delta > 1000 }) => {
                                         response = Some(json!({"type":"servo_reject", "reason":"invalid_sequence_id"}));
                                     }
                                     Some(sequence) => {

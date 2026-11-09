@@ -111,11 +111,11 @@ pub fn read_frames_from_parquet(
 ) -> Result<Vec<RecordFrame>, ParquetRecordingError> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let mut reader = builder.build()?;
+    let reader = builder.build()?;
 
     let mut frames = Vec::new();
 
-    while let Some(batch_res) = reader.next() {
+    for batch_res in reader {
         let batch = batch_res?;
         let num_rows = batch.num_rows();
 

@@ -23,6 +23,16 @@ serialport = { version = "4", default-features = false }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 libc = "0.2"
 
+# Style lints that the code base does not follow; everything else is denied in CI
+# (`cargo clippy --all-targets -- -D warnings`).
+[lints.clippy]
+# index loops where several per-joint arrays share the index
+needless_range_loop = "allow"
+# tests build an ArmConfig from Default and then set the fields under test
+field_reassign_with_default = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
 [dev-dependencies]
 tokio-tungstenite = "0.29"
 reqwest = { version = "0.12", features = ["json"] }
