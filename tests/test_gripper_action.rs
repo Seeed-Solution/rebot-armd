@@ -11,7 +11,7 @@ const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FR
 
 /// First-order lag arm; J7 is blocked by an object (or the closed stop) at `block`,
 /// producing torque `stiffness * (cmd - q)` while pressed.
-struct Rig { q: [f32; 7], v: [f32; 7], tau: [f32; 7], block: Option<f32>, frozen_j7: bool, enabled: EnableState }
+struct Rig { q: [f32; 7], v: [f32; 7], tau: [f32; 7], block: Option<f32>, frozen_j7: bool, open_stop: Option<f32>, enabled: EnableState }
 struct RigDriver(Arc<Mutex<Rig>>);
 const STIFFNESS: f32 = 3.0;
 impl ArmDriver for RigDriver {
@@ -34,6 +34,7 @@ impl ArmDriver for RigDriver {
             let mut vv = v;
             r.tau[i] = 0.0;
             if i == 6 {
+                if let Some(o) = r.open_stop { if q <= o { q = o; vv = 0.0; } }
                 if let Some(b) = r.block {
                     if q >= b { q = b; vv = 0.0; r.tau[6] = (STIFFNESS * (t.position - b)).max(0.0); }
                 }
@@ -52,7 +53,7 @@ impl ArmDriver for RigDriver {
 fn rig(j7: f32, block: Option<f32>, frozen_j7: bool) -> (SupervisorInner, Arc<Mutex<Rig>>) {
     let mut q = INSPECT;
     q[6] = j7;
-    let rig = Arc::new(Mutex::new(Rig { q, v: [0.0; 7], tau: [0.0; 7], block, frozen_j7, enabled: EnableState::Disabled }));
+    let rig = Arc::new(Mutex::new(Rig { q, v: [0.0; 7], tau: [0.0; 7], block, frozen_j7, open_stop: None, enabled: EnableState::Disabled }));
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(RigDriver(rig.clone())));
     inner.lease_enabled = false;
     inner.tick(DT);
@@ -157,4 +158,26 @@ fn gripper_action_needs_a_policy_and_an_idle_arm() {
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());
     let err = inner.start_gripper(request(GripperCommand::Open, None, false, 6.0), inner.safety.epoch_id()).unwrap_err();
     assert!(matches!(err, armd::ArmError::Safety(armd::SafetyError::NotArmed(_))), "torque off: {err:?}");
+}
+
+#[test]
+fn open_that_stops_short_of_the_target_is_done() {
+    // real arm 2026-11-09: commanded -5.70, the jaw stopped at -5.611
+    let (mut inner, rig) = rig(-1.0, None, false);
+    rig.lock().unwrap().open_stop = Some(-5.611);
+    let epoch = inner.safety.epoch_id();
+    let (id, _) = inner.start_gripper(request(GripperCommand::Open, None, false, 10.0), epoch).unwrap();
+    let a = run(&mut inner, id, 12.0);
+    assert_eq!(a.state, "done", "{a:?}");
+    assert!((inner.measured_positions[6] + 5.611).abs() < 1e-3);
+}
+
+#[test]
+fn open_blocked_far_from_the_target_still_times_out() {
+    let (mut inner, rig) = rig(-1.0, None, false);
+    rig.lock().unwrap().open_stop = Some(-4.0);
+    let epoch = inner.safety.epoch_id();
+    let (id, _) = inner.start_gripper(request(GripperCommand::Open, None, false, 8.0), epoch).unwrap();
+    let a = run(&mut inner, id, 10.0);
+    assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("GRIPPER_TIMEOUT")), "{a:?}");
 }

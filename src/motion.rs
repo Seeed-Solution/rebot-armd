@@ -422,6 +422,8 @@ pub const LAG_STOP: f64 = 0.45;
 pub const STALL_TIMEOUT_S: f64 = 1.0;
 pub const SETTLE_POS_RAD: f64 = 0.05;
 pub const SETTLE_VEL: f64 = 0.05;
+/// An open / move gripper action that stops within this distance of its target counts as done.
+pub const GRIPPER_STOP_SHORT_RAD: f32 = 0.25;
 pub const SETTLE_HOLD_S: f64 = 0.2;
 pub const SETTLE_MAX_S: f64 = 2.0;
 
@@ -614,7 +616,10 @@ impl GripperMotion {
             positions[6] = q7;
             velocities[6] = 0.0;
             done(None, Some((self.policy.closed_rad - m7) * self.close_dir()))
-        } else if (m7 - self.target).abs() < SETTLE_POS_RAD as f32 && still {
+        } else if still && ((m7 - self.target).abs() < SETTLE_POS_RAD as f32
+            || (cmd_at_target && (m7 - self.target).abs() < GRIPPER_STOP_SHORT_RAD)) {
+            // the jaw stopped close to the target: the real gripper opens to about -5.61 against a
+            // -5.70 command (mechanical stop / POS_VEL offset); stopping farther away is a jam -> timeout
             done(None, Some((self.policy.closed_rad - m7) * self.close_dir()))
         } else { StepStatus::Running };
         StepOut { positions, velocities, status, progress: progress_of(m7), clear_gripper_stall: clear }
