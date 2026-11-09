@@ -2,8 +2,10 @@
 // Apache-2.0): family table, gray conversion, detection, filter and pose moved into a stage;
 // rows are read with a stride so the stage runs on a zero-copy crop of the 640x640 frame.
 #include "aruco_stage.h"
+#include "tag_pose.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 #include "apriltag.h"
@@ -16,7 +18,14 @@
 #include "tag16h5.h"
 #include "tag36h11.h"
 
+#if __has_include(<sscma.h>)
 #include <sscma.h>
+#else  // host build (tests/aruco_bench): no SDK logging
+#include <cstdio>
+#define MA_LOGE(tag, ...) (std::fprintf(stderr, "E %s: ", tag), std::fprintf(stderr, __VA_ARGS__), std::fputc('\n', stderr))
+#define MA_LOGW MA_LOGE
+#define MA_LOGI MA_LOGE
+#endif
 
 #define TAG "rebot-vision-aruco"
 
@@ -85,13 +94,22 @@ bool ArucoStage::init(const ArucoConfig& cfg) {
     td_->quad_decimate = static_cast<float>(cfg.quad_decimate);
     td_->quad_sigma = static_cast<float>(cfg.quad_sigma);
     td_->refine_edges = cfg.refine_edges ? 1 : 0;
+    td_->decode_sharpening = cfg.decode_sharpening;
+    td_->qtp.min_white_black_diff = cfg.min_white_black_diff;
+    td_->qtp.min_cluster_pixels = cfg.min_cluster_pixels;
+    td_->qtp.max_nmaxima = cfg.max_nmaxima;
+    td_->qtp.max_line_fit_mse = cfg.max_line_fit_mse;
     td_->nthreads = 1;
     return true;
 }
 
 int ArucoStage::run(const uint8_t* rgb, int width, int height, int stride, std::vector<MarkerOut>& out) {
     out.clear();
+    timing_ = ArucoTiming{};
     if (!td_ || !rgb || width <= 0 || height <= 0) return 0;
+    using clock = std::chrono::steady_clock;
+    auto ms = [](clock::time_point a, clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    const auto t0 = clock::now();
     const size_t total = static_cast<size_t>(width) * height;
     if (gray_.size() < total) gray_.resize(total);
 
@@ -107,7 +125,9 @@ int ArucoStage::run(const uint8_t* rgb, int width, int height, int stride, std::
     }
     image_u8_t im = {width, height, width, gray};
 
+    const auto t1 = clock::now();
     zarray_t* detections = apriltag_detector_detect(td_, &im);
+    const auto t2 = clock::now();
     const int n = zarray_size(detections);
     int rejected = 0;
     out.reserve(n);
@@ -156,7 +176,7 @@ int ArucoStage::run(const uint8_t* rgb, int width, int height, int stride, std::
         info.cy = cfg_.cam.cy;
 
         apriltag_pose_t pose;
-        const double err = estimate_tag_pose(&info, &pose);
+        const double err = cfg_.apriltag_pose ? estimate_tag_pose(&info, &pose) : tag_pose_estimate(&info, &pose);
         double roll = 0, pitch = 0, yaw = 0;
         rot_to_euler(pose.R, roll, pitch, yaw);
 
@@ -181,6 +201,10 @@ int ArucoStage::run(const uint8_t* rgb, int width, int height, int stride, std::
         if (H_u) matd_destroy(H_u);
     }
     apriltag_detections_destroy(detections);
+    const auto t3 = clock::now();
+    timing_.gray_ms = ms(t0, t1);
+    timing_.detect_ms = ms(t1, t2);
+    timing_.pose_ms = ms(t2, t3);
     return rejected;
 }
 

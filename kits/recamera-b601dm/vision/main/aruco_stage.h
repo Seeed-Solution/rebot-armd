@@ -21,6 +21,15 @@ struct ArucoConfig {
     double quad_decimate = 2.0;
     double quad_sigma = 0.0;
     bool refine_edges = true;
+    // Quad detector tuning (apriltag defaults, as aruco-detector 0.1.3).
+    double decode_sharpening = 0.25;
+    int min_white_black_diff = 5;  ///< min contrast of a black/white component pair (0..255)
+    int min_cluster_pixels = 24;   ///< min boundary pixels of a candidate quad (decimated image)
+    int max_nmaxima = 10;
+    float max_line_fit_mse = 10.0f;
+    /// Pose with apriltag's estimate_tag_pose() instead of tag_pose_estimate() (same result,
+    /// ~26k heap calls per marker); for the host benchmark's baseline.
+    bool apriltag_pose = false;
     double marker_size = 0.05;  // m
     aruco::CameraModel cam;     // intrinsics at the content image size (640x360)
     aruco::MarkerFilter filter;
@@ -28,6 +37,13 @@ struct ArucoConfig {
 };
 
 bool aruco_family_supported(const std::string& name);
+
+/** Split of the last run() in milliseconds (CPU wall time on the frame thread). */
+struct ArucoTiming {
+    double gray_ms = 0;    ///< RGB888 -> 8-bit gray
+    double detect_ms = 0;  ///< apriltag quad detection and decoding
+    double pose_ms = 0;    ///< filter, undistortion and pose of the accepted markers
+};
 
 class ArucoStage {
 public:
@@ -44,6 +60,7 @@ public:
      * Fills accepted markers; returns the number rejected by the filter.
      */
     int run(const uint8_t* rgb, int width, int height, int stride, std::vector<MarkerOut>& out);
+    const ArucoTiming& last_timing() const noexcept { return timing_; }
 
 private:
     ArucoConfig cfg_;
@@ -51,6 +68,7 @@ private:
     apriltag_family* tf_ = nullptr;
     apriltag_detector* td_ = nullptr;
     std::vector<uint8_t> gray_;
+    ArucoTiming timing_;
 };
 
 }  // namespace rv

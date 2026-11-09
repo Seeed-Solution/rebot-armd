@@ -5,6 +5,7 @@ set(srcs
     ${CMAKE_CURRENT_LIST_DIR}/result_json.cpp
     ${CMAKE_CURRENT_LIST_DIR}/http_control.cpp
     ${CMAKE_CURRENT_LIST_DIR}/aruco_stage.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tag_pose.cpp
     ${CMAKE_CURRENT_LIST_DIR}/marker_filter.cpp
     ${CMAKE_CURRENT_LIST_DIR}/camera_model.cpp
     ${CMAKE_CURRENT_LIST_DIR}/detector.cpp

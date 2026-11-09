@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(rebot-vision-host-tests LANGUAGES CXX)
+project(rebot-vision-host-tests LANGUAGES C CXX)
 
 # Host-only: no SSCMA SDK, CVI or camera. Builds the portable parts of rebot-vision
 # (mode/trigger control, HTTP server, result JSON, marker filter, camera model).
@@ -16,7 +16,8 @@ find_package(Threads REQUIRED)
 
 set(MAIN ${CMAKE_CURRENT_LIST_DIR}/../main)
 if(NOT SSCMA_ROOT AND DEFINED ENV{SSCMA_ROOT})
-    set(SSCMA_ROOT $ENV{SSCMA_ROOT})
+    # cached, so a re-configure triggered by the build keeps it
+    set(SSCMA_ROOT $ENV{SSCMA_ROOT} CACHE PATH "sscma-example-sg200x checkout")
 endif()
 if(SSCMA_ROOT AND EXISTS ${SSCMA_ROOT}/components/json/json.hpp)
     add_library(rv_json INTERFACE)
@@ -55,3 +56,23 @@ add_executable(capture_time_test ${CMAKE_CURRENT_LIST_DIR}/capture_time_test.cpp
 target_include_directories(capture_time_test PRIVATE ${MAIN})
 target_compile_options(capture_time_test PRIVATE -Wall -Wextra)
 add_test(NAME capture_time COMMAND capture_time_test)
+
+# ArUco stage benchmark (time per frame and recall, baseline vs tuned detector settings):
+# needs the apriltag sources from SSCMA_ROOT/components/apriltag, so it is only built
+# when SSCMA_ROOT is set. Built with -O2 so the times compare the settings, not -O0 code.
+if(SSCMA_ROOT AND EXISTS ${SSCMA_ROOT}/components/apriltag/apriltag.h)
+    set(AT ${SSCMA_ROOT}/components/apriltag)
+    file(GLOB AT_SRCS ${AT}/*.c ${AT}/common/*.c ${AT}/aruco/*.c)
+    add_library(rv_apriltag STATIC ${AT_SRCS})
+    target_include_directories(rv_apriltag PUBLIC ${AT} ${AT}/common ${AT}/aruco)
+    target_compile_options(rv_apriltag PRIVATE -O2 -w)
+    target_link_libraries(rv_apriltag PUBLIC Threads::Threads m)
+
+    add_executable(aruco_bench ${CMAKE_CURRENT_LIST_DIR}/aruco_bench.cpp ${MAIN}/aruco_stage.cpp
+                               ${MAIN}/tag_pose.cpp ${MAIN}/marker_filter.cpp ${MAIN}/camera_model.cpp)
+    target_include_directories(aruco_bench PRIVATE ${MAIN})
+    target_compile_options(aruco_bench PRIVATE -O2 -Wall -Wextra)
+    target_link_libraries(aruco_bench PRIVATE rv_apriltag rv_json)
+    target_link_options(aruco_bench PRIVATE -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc)
+    add_test(NAME aruco_bench COMMAND aruco_bench --scenes 200 --reps 1 --check)
+endif()

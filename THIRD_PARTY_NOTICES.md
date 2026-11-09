@@ -98,6 +98,11 @@ from the projects below.
 | `tests/marker_filter_test.cpp`, `tests/camera_model_test.cpp`, `tests/capture_time_test.cpp` | `aruco-detector/tests/` | unchanged |
 | `tests/vision_control_test.cpp` | `aruco-detector/tests/inference_control_test.cpp` | modified |
 
+`main/tag_pose.h`, `main/tag_pose.cpp` are a port of `orthogonal_iteration()` and
+`estimate_tag_pose()` from `components/apriltag/apriltag_pose.c` of the same checkout
+(AprilTag, BSD-2-Clause, Copyright (C) 2013-2016 The Regents of The University of Michigan;
+licence text below).
+
 ### Components compiled into the binary (not in this repository)
 
 The build uses an `sscma-example-sg200x` checkout as an SDK (`SSCMA_ROOT`, pinned in
