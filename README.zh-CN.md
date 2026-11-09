@@ -146,8 +146,8 @@ TODO / 路线图：
 构建安装包（见 [交叉编译](#交叉编译到-recamera)）或使用发布的 `.deb`，复制到摄像头并安装。`192.168.42.1` 是 reCamera 的 USB 网络地址；连接本包启动的 Wi-Fi 热点时，摄像头地址为 `192.168.16.1`。
 
 ```bash
-scp dist/rebot-teleop_1.2.0_riscv64.deb root@192.168.42.1:/tmp/
-ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.2.0_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
+scp dist/rebot-teleop_1.2.1_riscv64.deb root@192.168.42.1:/tmp/
+ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.2.1_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
 ```
 
 安装内容：
@@ -196,9 +196,9 @@ git clone --depth 1 https://github.com/sophgo/host-tools
 export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 
 RECAMERA_DOCKER=tpuc_recamera \
-./scripts/build_deb.sh 1.2.0          # 版本参数可省略（默认取 debian/control）
+./scripts/build_deb.sh 1.2.1          # 版本参数可省略（默认取 debian/control）
 # -> target/riscv64gc-unknown-linux-musl/release/armd
-# -> dist/rebot-teleop_1.2.0_riscv64.deb
+# -> dist/rebot-teleop_1.2.1_riscv64.deb
 
 ./scripts/build_deb.sh --flavor lite  # 只含 armd，不含 reCamera 套件文件
 # -> dist/armd-lite_0.1.0_riscv64.tar.gz（armd、LICENSE、THIRD_PARTY_NOTICES.md）
