@@ -135,6 +135,10 @@ TODO / 路线图：
 - **租约**：执行器权限属于发送了 `acquire_lease` 并持续发送 `heartbeat` 的 WebSocket 连接（租约超时 2500 ms）。每条 `command` 都带租约 `generation`、当前安全 `epoch_id` 和严格递增的 `request_id`。REST 执行器路由（`torque`、`motion/*`、`action/*`、`clear_fault`）返回 `409 LEASE_REQUIRED`，不执行动作。急停例外：REST 与 WebSocket 都不需要租约。其他客户端可用 `force` 接管，接管后在机械臂稳定前拒绝运动（`HANDOVER_SETTLING`）。
 - **安全层**（详见 [docs/control_safety_contract.md](docs/control_safety_contract.md)）：关节位置、速度、加速度限位；`max_temperature` 温度保护（内置 profile 为 70 °C）；反馈新鲜度（250 ms）；跟随误差故障（`max_error_rad` 0.5，持续 500 ms）及动作的 `TRACKING_STALL`；规划运动限速（`planned_max_velocity`，rebot-dm 为 0.45 rad/s）；笛卡尔工作空间检查（地面、包围盒、伸展范围）；租约看门狗自动收纳；不在收纳位时拒绝断力矩（`ARM_NOT_AT_RESTING_POSE`），避免机械臂下坠。
 
+### 核心、套件与 agent
+
+仓库分三层：**核心**（`armd`，即本 crate）；**套件**，把核心适配到一种 控制器 + 机械臂 + 相机 + 支架 组合（`kits/recamera-b601dm/` 是官方参考套件，`kits/_template/` 是第三方套件的起点）；**agent 层**（rebot-companion、驾驶舱），只使用 armd 的 API。核心与套件通过四个带版本的契约交互：机械臂 profile JSON（`--config`，`profile_version` 1）、感知服务 API（检测代理）、能力发现（观测 schema 中的 `capabilities`，版本 1）和打包。`./scripts/build_deb.sh --flavor lite` 只构建核心，默认的 `--flavor recamera` 构建核心加 reCamera 套件。详见 [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md)。
+
 ---
 
 ## 在 reCamera 上安装
@@ -347,14 +351,14 @@ armd 驱动的真实机械臂有足以伤人和损坏物品的力量。使用风
 ## 开发
 
 ```bash
-cargo test                                 # 272 个测试（1 个 ignored），使用仿真机械臂，不需要硬件
+cargo test                                 # 316 个测试（2 个 ignored），使用仿真机械臂，不需要硬件
 cargo clippy --all-targets -- -D warnings
 node scripts/view_ik_selftest.mjs          # 驾驶舱视角坐标系 IK
 node scripts/calib_selftest.mjs            # 驾驶舱手眼标定（c 部分需要 ../rebot-companion 和 uv）
 node tests/test_rpc_error_contract.js      # 驾驶舱 RPC 错误处理
 ```
 
-CI（`.github/workflows/ci.yml`）运行以上检查。未强制 `cargo fmt --check`：代码尚未按 rustfmt 格式化。RISC-V 交叉编译不在 CI 中，因为它需要 SG2002 工具链的库文件。`test_damiao_smoothness::stale_posvel_gripper_recovery_uses_posvel_frame` 对时序敏感，机器负载高时可能失败，重跑即可。
+CI（`.github/workflows/ci.yml`）运行以上检查，并对套件 init 脚本执行 `sh -n`。未强制 `cargo fmt --check`：代码尚未按 rustfmt 格式化。RISC-V 交叉编译不在 CI 中，因为它需要 SG2002 工具链的库文件。`test_damiao_smoothness::stale_posvel_gripper_recovery_uses_posvel_frame` 对时序敏感，机器负载高时可能失败，重跑即可。
 
 Playwright 脚本（`scripts/*_shots.mjs`、`scripts/ux_walkthrough.mjs`、`tests/test_*_playwright.js`、`tests/test_single_origin_e2e.js`）用于驾驶舱截图；需要 Playwright（可用 `PLAYWRIGHT=<模块路径>` 指定）和 Chromium（`CHROME=<路径>`），部分脚本需要运行中的 armd。`scripts/*_shots.mjs` 写到 `.cache/`（或 `OUT`），`tests/*.js` 写到 `tests/artifacts/`，两者都已被 git 忽略。`scripts/` 中的 Python 脚本用于台架诊断：有的直接向电机发送 CAN 帧，有的通过 API 驱动运行中的 armd。只在机械臂有支撑、工作区已清空时运行。
 

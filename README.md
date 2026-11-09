@@ -170,6 +170,18 @@ TODO / roadmap:
   reach); lease watchdog that parks the arm; refusal to cut torque away from the resting pose
   (`ARM_NOT_AT_RESTING_POSE`), so the arm is not dropped.
 
+### Core, kits and agents
+
+The repository has three layers: the **core** (`armd`, this crate), **kits** that adapt it to
+one controller + arm + camera + mount (`kits/recamera-b601dm/` is the official reference kit,
+`kits/_template/` the start for third-party kits), and the **agent layer**
+(rebot-companion, the cockpit) that uses only armd's API. Core and kits interact through four
+versioned contracts: the arm profile JSON (`--config`, `profile_version` 1), the perception
+provider API (the detection proxy), capability discovery (`capabilities` in the observation
+schema, version 1) and packaging. `./scripts/build_deb.sh --flavor lite` builds the core
+alone, the default `--flavor recamera` the core with the reCamera kit. Details:
+[docs/architecture.md](docs/architecture.md).
+
 ---
 
 ## Install on reCamera
@@ -482,14 +494,14 @@ not certified safety functions.
 ## Development
 
 ```bash
-cargo test                                 # 272 tests (1 ignored), mock arm, no hardware
+cargo test                                 # 316 tests (2 ignored), mock arm, no hardware
 cargo clippy --all-targets -- -D warnings
 node scripts/view_ik_selftest.mjs          # cockpit view-frame IK
 node scripts/calib_selftest.mjs            # cockpit hand-eye calibration (part c needs ../rebot-companion and uv)
 node tests/test_rpc_error_contract.js      # cockpit RPC error handling
 ```
 
-CI (`.github/workflows/ci.yml`) runs these. `cargo fmt --check` is not enforced: the code is
+CI (`.github/workflows/ci.yml`) runs these, plus `sh -n` on the kit init scripts. `cargo fmt --check` is not enforced: the code is
 not rustfmt-formatted yet. The RISC-V cross build is not in CI because it needs the SG2002
 toolchain libraries. `test_damiao_smoothness::stale_posvel_gripper_recovery_uses_posvel_frame`
 is timing-sensitive and can fail on a loaded machine; rerun it.
