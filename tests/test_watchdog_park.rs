@@ -301,3 +301,60 @@ async fn lease_expiry_mid_action_then_close_still_parks_to_idle() {
     assert_eq!(obs.safety_state, SafetyState::Idle, "park completes");
     assert!(!obs.is_torqued);
 }
+
+/// Problem-1 candidate check: heartbeats on the WS keep renewing the lease through
+/// jog action -> unload (park, torque off) -> torque on -> jog action, i.e. neither an
+/// action, a park, nor a torque off/on cycle stops lease renewal.
+#[tokio::test]
+async fn ws_heartbeats_renew_lease_across_jog_unload_torque_cycles() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let lease_ms = 300u64;
+    let supervisor = Arc::new(ArmSupervisor::new({ let mut c = sim_config(true); c.lease_timeout_ms = lease_ms; c }));
+    let addr = serve(supervisor.clone()).await;
+    let mut ws = ws_lease(addr).await;
+    let mut request_id = 0u64;
+    let generation = supervisor.inner().read().await.active_lease.as_ref().unwrap().generation;
+    let mut command = async |ws: &mut _, path: &str, body: serde_json::Value| {
+        let ws: &mut tokio_tungstenite::WebSocketStream<_> = ws;
+        request_id += 1;
+        let epoch = supervisor.inner().read().await.safety.epoch_id();
+        let msg = serde_json::json!({"type":"command", "request_id":request_id, "path":path, "body":body,
+            "generation":generation, "epoch_id":epoch, "client_id":"sdk"});
+        ws.send(Message::Text(msg.to_string().into())).await.unwrap();
+        loop {
+            let text = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if v["type"] == "command_ack" || v["type"] == "command_reject" {
+                assert_eq!(v["type"], "command_ack", "{path}: {v}");
+                return;
+            }
+        }
+    };
+    // Heartbeat + tick for `secs` of wall time (lease timeout is real time).
+    async fn run(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, supervisor: &ArmSupervisor, generation: u64, secs: f64) {
+        use futures_util::SinkExt;
+        let end = Instant::now() + Duration::from_secs_f64(secs);
+        while Instant::now() < end {
+            let epoch = supervisor.inner().read().await.safety.epoch_id();
+            let hb = serde_json::json!({"type":"heartbeat", "client_id":"sdk", "generation":generation, "epoch_id":epoch});
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(hb.to_string().into())).await.unwrap();
+            for _ in 0..3 { supervisor.tick(0.05).await; tokio::time::sleep(Duration::from_millis(16)).await; }
+            let inner = supervisor.inner().read().await;
+            assert!(inner.watchdog_park_deadline.is_none() && !inner.safety.state().is_stopped(),
+                "lease watchdog fired: {:?}", inner.safety.state());
+        }
+    }
+    for _ in 0..2 {
+        command(&mut ws, "/api/v1/torque", serde_json::json!({"enable":true})).await;
+        command(&mut ws, "/api/v1/motion/jog", serde_json::json!({"target_positions":[1.0, 0.5], "duration_secs":0.5})).await;
+        run(&mut ws, &supervisor, generation, 1.0).await;
+        command(&mut ws, "/api/v1/motion/unload", serde_json::json!({})).await;
+        run(&mut ws, &supervisor, generation, 2.0).await;
+        assert!(!supervisor.get_observation().await.is_torqued, "unload ends with torque off");
+    }
+    command(&mut ws, "/api/v1/torque", serde_json::json!({"enable":true})).await;
+    command(&mut ws, "/api/v1/motion/jog", serde_json::json!({"target_positions":[1.0, 0.5], "duration_secs":0.5})).await;
+    run(&mut ws, &supervisor, generation, 1.5).await;
+    assert!(supervisor.inner().read().await.is_lease_active());
+}
