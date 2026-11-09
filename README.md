@@ -179,8 +179,8 @@ copy it to the camera and install it. `192.168.42.1` is the reCamera's address o
 when connected to the access point that this package starts, the camera is `192.168.16.1`.
 
 ```bash
-scp dist/rebot-teleop_1.0.0_riscv64.deb root@192.168.42.1:/tmp/
-ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.0.0_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
+scp dist/rebot-teleop_1.1.0_riscv64.deb root@192.168.42.1:/tmp/
+ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.1.0_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
 ```
 
 The package installs:
@@ -245,9 +245,9 @@ rustup target add riscv64gc-unknown-linux-musl
 git clone --depth 1 https://github.com/sophgo/host-tools
 export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 
-./scripts/build_deb.sh 1.0.0          # version argument optional (default: debian/control)
+./scripts/build_deb.sh 1.1.0          # version argument optional (default: debian/control)
 # -> target/riscv64gc-unknown-linux-musl/release/armd
-# -> dist/rebot-teleop_1.0.0_riscv64.deb
+# -> dist/rebot-teleop_1.1.0_riscv64.deb
 ```
 
 `build_deb.sh` needs `cargo` and `dpkg-deb`. It builds `RUSTFLAGS` from `RECAMERA_TOOLCHAIN`
