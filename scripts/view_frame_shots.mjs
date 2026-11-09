@@ -1,11 +1,13 @@
 #!/usr/bin/env node
-// Headless check of the camera-view / base frame toggle in the cartesian cockpit (no armd needed).
+// Headless check of the camera-view / base frame in the cartesian cockpit (no armd needed).
 //   PLAYWRIGHT=/path/to/playwright/index.mjs CHROME=/path/to/chrome OUT=/dir node scripts/view_frame_shots.mjs
 // Serves src/api/index.html with a mocked 7-DOF /api/v1/observation/schema, feeds a synthetic observation
 // (state Armed, positions follow the streamed targets), and for simple / expert x zh / en x 1280x800 / 375x812
-// x view / base frame writes a PNG (default .cache/view-shots/) and asserts: the frame toggle is visible,
-// pad-srot is visible only in view mode, btn-pose is hidden only in view mode, no horizontal page scroll.
-// Then drives W / A / ArrowRight / E in both frames and checks the motion direction of the commanded pose.
+// writes a PNG (default .cache/view-shots/). Simple mode (stored rebot.cart.frame = base) must use the view
+// frame with no frame toggle, pad-srot visible and btn-pose hidden. Expert mode, for view / base frame, must
+// show the toggle with the matching option on and no pad-srot. No horizontal page scroll anywhere.
+// Then drives W / A / ArrowRight / E in simple mode (view frame) and W / A in expert base frame and checks
+// the motion direction of the commanded pose.
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -43,22 +45,25 @@ let bad = 0;
 const fail = (m) => { bad++; console.log('  FAIL ' + m); };
 for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (const [vp, viewport] of [['1280x800', { width: 1280, height: 800 }], ['375x812', { width: 375, height: 812 }]]) {
   const ctx = await browser.newContext({ viewport, deviceScaleFactor: 1 });
-  await ctx.addInitScript(([l]) => { try { localStorage.clear(); localStorage.setItem('lang', l); localStorage.setItem('rebot.ctl', 'cart'); } catch (_) {} }, [lang]);
+  // a stored base frame from expert mode must not leak into simple mode
+  await ctx.addInitScript(([l]) => { try { localStorage.clear(); localStorage.setItem('lang', l); localStorage.setItem('rebot.ctl', 'cart'); localStorage.setItem('rebot.cart.frame', 'base'); } catch (_) {} }, [lang]);
   const page = await ctx.newPage();
   const errs = [];
   page.on('pageerror', (e) => errs.push(e.message));
   await page.goto(base + (ui === 'expert' ? '?ui=expert' : ''), { waitUntil: 'domcontentloaded' });
   await page.evaluate(feed);
   await page.waitForTimeout(600);
-  for (const frame of ['view', 'base']) {
-    await page.evaluate((f) => { setFrame(f); }, frame);
+  for (const frame of ui === 'simple' ? ['view'] : ['view', 'base']) {
+    if (ui === 'expert') await page.evaluate((f) => { setFrame(f); }, frame);
     await page.waitForTimeout(300);
     const info = await page.evaluate((ui) => {
-      const vis = (id) => { const el = document.getElementById(id); if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden'; };
-      const seg = document.getElementById(ui === 'simple' ? 'frame-seg-s' : 'frame-seg-e');
+      const visEl = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden'; };
+      const vis = (id) => { const el = document.getElementById(id); return !!el && visEl(el); };
+      const seg = document.getElementById('frame-seg-e');
       return {
         dof: S.dof, frame: C.frame, view: viewActive(),
-        toggle: vis(seg.id), segOn: [...seg.children].filter((b) => b.classList.contains('on')).map((b) => b.dataset.frame),
+        toggle: [...document.querySelectorAll('.frame-seg, [data-frame]')].some(visEl),
+        segOn: [...seg.children].filter((b) => b.classList.contains('on')).map((b) => b.dataset.frame),
         srot: vis('pad-srot'), pose: vis('btn-pose'),
         sw: document.scrollingElement.scrollWidth, iw: window.innerWidth,
         label: document.querySelector(ui === 'simple' ? '#pad-srot .dir.t .lbl' : '#vcol-r .vlab b').textContent,
@@ -71,25 +76,28 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
     shots.push(file);
     const exp = frame === 'view';
     if (info.dof !== 7) fail(`${tag} dof ${info.dof}`);
-    if (!info.toggle || info.segOn.length !== 1 || info.segOn[0] !== frame) fail(`${tag} frame toggle ${info.toggle} ${info.segOn}`);
+    if (info.view !== exp) fail(`${tag} viewActive=${info.view}`);
+    if (ui === 'simple' && info.toggle) fail(`${tag} frame toggle visible in simple mode`);
+    if (ui === 'expert' && (!info.toggle || info.segOn.length !== 1 || info.segOn[0] !== frame)) fail(`${tag} frame toggle ${info.toggle} ${info.segOn}`);
     if (ui === 'simple' && info.srot !== exp) fail(`${tag} pad-srot visible=${info.srot}`);
     if (ui === 'simple' && info.pose === exp) fail(`${tag} btn-pose visible=${info.pose}`);
     if (ui === 'expert' && info.srot) fail(`${tag} pad-srot visible in expert`);
     if (info.sw > info.iw) fail(`${tag} horizontal scroll ${info.sw} > ${info.iw}`);
-    console.log(`${tag}  toggle=${info.toggle} on=${info.segOn} pad-srot=${info.srot} btn-pose=${info.pose} scrollWidth=${info.sw}<=${info.iw} label="${info.label}" kb.x="${info.kb}"`);
+    console.log(`${tag}  view=${info.view} toggle=${info.toggle} on=${info.segOn} pad-srot=${info.srot} btn-pose=${info.pose} scrollWidth=${info.sw}<=${info.iw} label="${info.label}" kb.x="${info.kb}"`);
   }
   if (errs.length) fail(`page errors (${ui}/${lang}/${vp}): ${[...new Set(errs)].join(' | ').slice(0, 300)}`);
   await ctx.close();
 }
 
-// motion directions (simple, zh, desktop): hold a key 400 ms, compare the commanded pose before / after
-{
+// motion directions (zh, desktop): hold a key 400 ms, compare the commanded pose before / after.
+// view frame in simple mode (stored frame = base, ignored there), base frame in expert mode.
+for (const [ui, frame] of [['simple', 'view'], ['expert', 'base']]) {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-  await ctx.addInitScript(() => { try { localStorage.clear(); localStorage.setItem('lang', 'zh'); } catch (_) {} });
+  await ctx.addInitScript(() => { try { localStorage.clear(); localStorage.setItem('lang', 'zh'); localStorage.setItem('rebot.ctl', 'cart'); localStorage.setItem('rebot.cart.frame', 'base'); } catch (_) {} });
   const page = await ctx.newPage();
   const errs = [];
   page.on('pageerror', (e) => errs.push(e.message));
-  await page.goto(base, { waitUntil: 'domcontentloaded' });
+  await page.goto(base + (ui === 'expert' ? '?ui=expert' : ''), { waitUntil: 'domcontentloaded' });
   await page.evaluate(feed);
   await page.waitForTimeout(600);
   const snap = () => page.evaluate(() => {
@@ -104,10 +112,12 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
   };
   const sub = (a, b) => a.map((v, k) => v - b[k]), dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2], nrm = (a) => Math.hypot(...a);
   const check = (name, ok, d) => { console.log(`${ok ? 'PASS' : 'FAIL'}  motion ${name}  ${d}`); if (!ok) bad++; };
-  for (const frame of ['view', 'base']) {
-    // each frame starts from the inspect pose (J5 = 0: the base-frame IK holds J5 and assumes it at 0)
-    await page.evaluate((f) => { window.__sim = [0, -1.167, -1.565, 1.435, 0, Math.PI / 2, 0.2]; setFrame(f); }, frame);
+  {
+    // start from the inspect pose (J5 = 0: the base-frame IK holds J5 and assumes it at 0)
+    await page.evaluate(() => { window.__sim = [0, -1.167, -1.565, 1.435, 0, Math.PI / 2, 0.2]; cartSync(window.__sim); });
     await page.waitForTimeout(300);
+    const active = await page.evaluate(() => viewActive());
+    check(`${ui} uses the ${frame} frame`, active === (frame === 'view'), `viewActive=${active}`);
     let s0 = await snap(); await hold('KeyW'); let s1 = await snap();
     let d = sub(s1.p, s0.p);
     if (frame === 'view') check('view W = forward along z_cam', nrm(d) > 0.005 && dot(d, s0.z) / nrm(d) > 0.99, `moved ${(nrm(d) * 1000).toFixed(1)} mm, cos(d, z_cam) ${(dot(d, s0.z) / nrm(d)).toFixed(4)}, frames sent ${s1.sent - s0.sent}`);

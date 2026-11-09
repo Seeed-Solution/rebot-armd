@@ -259,9 +259,10 @@ use on the device has not been measured for this README.
 and served at `/`. JMuxer (`/assets/jmuxer.min.js`) plays the camera video. The UI is in
 Chinese and English (language switch in the header).
 
-- **Simple / expert mode**: simple shows the video with the joysticks and the view / base
-  frame switch on top; expert adds the joint / Cartesian mode switch, a side-view pose preview,
-  link status, the joint state table, dataset recording and keyboard shortcuts.
+- **Simple / expert mode**: simple shows the video with the joysticks on top and, on the
+  7-DOF arm, always drives in the view frame; expert adds the view / base frame switch, the
+  joint / Cartesian mode switch, a side-view pose preview, link status, the joint state table,
+  dataset recording and keyboard shortcuts.
 - **Joint jog**: two virtual joysticks (J1/J2, J3/J5, gripper) and the keyboard.
 - **Cartesian control** in two frames:
   - *view frame*: directions follow the camera image (the camera is mounted after J6), solved

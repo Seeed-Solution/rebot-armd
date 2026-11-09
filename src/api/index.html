@@ -1077,16 +1077,6 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
   body.ui-simple .ck-rot { display: contents; }
   body.ui-simple:not(.cart-view) .ck-rot #pad-srot { display: none; }
   body.ui-simple #pad-srot { left: auto; right: calc(max(16px, env(safe-area-inset-right)) + 54px + 14px + 54px + 18px); }
-  /* frame toggle: above the pose button (base) or in its place (view) */
-  body.ui-simple .frame-seg {
-    position: fixed; z-index: 150; left: calc(max(16px, env(safe-area-inset-left)) + (var(--disc) - 112px) / 2); width: 112px;
-    bottom: calc(16px + var(--disc) + 10px + 44px + 8px); display: flex;
-    background: rgba(255,255,255,0.22); border: 1px solid rgba(255,255,255,0.45); box-shadow: 0 8px 32px rgba(0,0,0,0.18), inset 0 1px 0 rgba(255,255,255,0.35);
-    backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
-  }
-  body.ui-simple.cart-view .frame-seg { bottom: calc(16px + var(--disc) + 10px); }
-  body.ui-simple .frame-seg button { flex: 1; padding: 0 6px; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.4); }
-  body.ui-simple .frame-seg button.on { color: #1f2937; text-shadow: none; }
   body.ui-simple .disc.vslot#pad-sz {
     left: auto; top: auto; bottom: 16px; width: 54px; height: 160px; border-radius: 27px;
     right: calc(max(16px, env(safe-area-inset-right)) + 54px + 14px);
@@ -1396,10 +1386,6 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
         </div>
         <div class="ck-mid">
           <div class="ck-left">
-            <div class="seg seg-sm frame-seg" id="frame-seg-s" role="radiogroup" data-i18n-aria="frame" aria-label="坐标系" hidden>
-              <button data-frame="view" role="radio" data-i18n="frame.view">视角</button>
-              <button data-frame="base" role="radio" data-i18n="frame.base">底座</button>
-            </div>
             <button class="pose-btn" id="btn-pose" type="button" aria-pressed="false" data-i18n-aria="pose.aria" aria-label="姿态模式（点击锁定，按住 Shift 临时切换）">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 18l8-13 8 13z"/><path d="M12 5v13"/></svg><span data-i18n="pose.btn">姿态 / Pose</span>
             </button>
@@ -4197,8 +4183,9 @@ const IK_MSG = {
   reach: 'ik.reach', singular: 'ik.singular',
   limit: 'ik.limit', jump: 'ik.jump', floor: 'ik.floor', pose: 'ik.pose',
 };
-// camera-view frame: only on the 7-DOF arm (index 4 = URDF joint5, index 5 = joint6)
-const viewActive = () => S.dof === 7 && C.frame === 'view';
+// camera-view frame: only on the 7-DOF arm (index 4 = URDF joint5, index 5 = joint6).
+// Simple mode always uses it; the stored view/base choice applies to expert mode only.
+const viewActive = () => S.dof === 7 && (S.ui === 'simple' || C.frame === 'view');
 function cartSync(pos) {
   C.q = toModel(pos);
   C.cmd = IK.fk(C.q);
@@ -4685,14 +4672,14 @@ const padSrot = new Pad($('pad-srot'), { onChange: (v) => {
 for (const ev of ['touchstart', 'mousedown']) {
   $('pad-srot').addEventListener(ev, () => { if (!padSrot.active()) rotPadRequiresNeutral = false; });
 }
-// frame toggle (view = camera frame, base = base frame); only offered on the 7-DOF arm
+// frame toggle (view = camera frame, base = base frame); expert mode on the 7-DOF arm only
 function applyFrame() {
   const dof7 = S.dof === 7, view = viewActive();
   document.body.classList.toggle('cart-view', view);
-  for (const id of ['frame-seg-s', 'frame-seg-e']) $(id).hidden = !dof7;
+  $('frame-seg-e').hidden = !dof7;
   $('frame-row-e').hidden = !dof7;
-  for (const id of ['frame-seg-s', 'frame-seg-e']) for (const b of $(id).children) {
-    const on = b.dataset.frame === (view ? 'view' : 'base');
+  for (const b of $('frame-seg-e').children) {
+    const on = b.dataset.frame === (C.frame === 'view' ? 'view' : 'base');
     b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on));
   }
   if (I18N_VIEW !== view) { I18N_VIEW = view; applyI18n(); }
@@ -4704,6 +4691,10 @@ function setFrame(f) {
   releaseAll(); // drop keys, holds and sticks of the old mapping
   C.frame = f;
   store('rebot.cart.frame', f);
+  onFrameChange();
+}
+// Effective frame changed (toggle, or a UI-mode switch with expert set to base): restart input mapping.
+function onFrameChange() {
   C.axes.xy = [0, 0]; C.axes.z = 0; C.axes.p = 0; C.axes.sxy = [0, 0]; C.axes.sz = 0; C.axes.sp = 0; C.axes.sr = 0;
   leftPadRequiresNeutral = true; rotPadRequiresNeutral = true;
   resetPoseMode();
@@ -4711,9 +4702,7 @@ function setFrame(f) {
   C.status = 'idle'; C.msg = '';
   applyFrame();
 }
-for (const id of ['frame-seg-s', 'frame-seg-e']) {
-  $(id).addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { buzz(8); setFrame(b.dataset.frame); } });
-}
+$('frame-seg-e').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { buzz(8); setFrame(b.dataset.frame); } });
 
 function jogTo(target) {
   if (!isLive()) return toast(lockReason(), 'err');
@@ -5212,7 +5201,9 @@ for (const b of document.querySelectorAll('.preset')) b.addEventListener('click'
 function setUi(ui) {
   ui = ui === 'expert' ? 'expert' : 'simple';
   if (ui !== S.ui) releaseAll();
+  const wasView = viewActive();
   S.ui = ui;
+  if (viewActive() !== wasView) onFrameChange();
   document.body.classList.toggle('ui-simple', ui === 'simple');
   document.body.classList.toggle('ui-expert', ui === 'expert');
   for (const b of $('ui-seg').children) {
