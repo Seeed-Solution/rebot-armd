@@ -42,7 +42,8 @@
 - 单文件网页驾驶舱，适用于手机、平板和桌面（摇杆、笛卡尔控制、摄像头视频、识别叠加、手眼标定、点框抓取）；
 - 用于观测的 REST API 和用于控制的 WebSocket API，执行器指令只接受持有控制租约的连接；
 - 面向 agent 的高层动作（`move_to`、`move_relative`、`gripper`、`grasp`），由 [rebot-companion](https://github.com/Seeed-Solution/rebot-companion) 及其 MCP 服务器使用；
-- 把关节状态与指令录制为 Parquet 文件。
+- 把关节状态与指令录制为 Parquet 文件；
+- 用于拖动示教的重力补偿模式（已实现并在仿真中测试，未经实机验证）。
 
 > 本软件会驱动真实的机械臂。在硬件上运行前请先阅读 [安全](#安全)。
 
@@ -99,12 +100,12 @@
 
 `mock`（进程内仿真，默认值）用于测试和无机械臂时的界面开发。
 
-验证中驱动的协议编码由单元测试覆盖（`tests/test_protocol_vectors.rs`、`tests/test_driver_capabilities.rs`）。它们使用通用 6 关节 profile，没有运动学和工作空间，笛卡尔动作返回 `UNSUPPORTED`。达妙驱动另有带重力前馈的 MIT 模式，但只能在代码中启用（`DamiaoArmDriver::with_control_mode`），命令行和 profile 都不能选择。
+验证中驱动的协议编码由单元测试覆盖（`tests/test_protocol_vectors.rs`、`tests/test_driver_capabilities.rs`）。它们使用通用 6 关节 profile，没有运动学和工作空间，笛卡尔动作返回 `UNSUPPORTED`。达妙驱动另有带重力前馈的 MIT 模式，但只能在代码中启用（`DamiaoArmDriver::with_control_mode`），命令行和 profile 都不能选择。重力补偿模式在运行时把 J1–J6 切到 MIT 再切回（见[网页驾驶舱](#网页驾驶舱)），该切换未经实机验证。
 
 TODO / 路线图：
 
 - [ ] 在真实机械臂上验证 `rebot-rs`（RobStride）、`so-arm101`（飞特 STS）和 `fashionstar` / `star-arm102`（FashionStar），并提供带运动学和工作空间的 profile。
-- [ ] 支持选择达妙 MIT 模式（重力前馈）并在 B601-DM 上验证。
+- [ ] 在 B601-DM 上验证重力补偿模式（达妙 MIT 切换、重力前馈）（[核实清单](docs/control_safety_contract.md#hardware-verification-checklist--实机核实清单)）。
 - [ ] 主从示教（未实现；`--leader` / `--leader-port` 会被拒绝）。
 
 ---
@@ -209,6 +210,7 @@ export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 - **识别叠加**：在视频上绘制摄像头检测服务输出的检测框；识别开关与单次快照。
 - **手眼标定抽屉**：眼在手上（摄像头装在夹爪上）或眼在手外（固定摄像头），使用 ArUco 标记；采集位姿、求解、导出 rebot-companion 的 `HandEyeCalibration.load_result` 可读取的 JSON。
 - **点框抓取**：开启识别后点一个框并确认，armd 执行 `grasp` 动作（张开、俯视接近、闭环图像对中、J6 对齐 0° / 90°、下降、夹紧并判定、抬起）。任何摇杆、按键、停止或急停都会中止。抓取设置（桌面高度、夹爪位置像素、接近与抓取高度、相机俯角）由 armd 保存。目前只在仿真和截图测试中验证过；需要在真机上确认的项目见 [docs/plan_tap_to_grasp.md](docs/plan_tap_to_grasp.md)。
+- **重力补偿 / 拖动示教**：按住开关 0.6 秒，J1–J6 进入漂浮状态（MIT 模式，kp = 0，带阻尼，以 URDF 重力力矩为前馈，1 秒内渐入）；夹爪保持位置控制。开启期间摇杆、按键和预设不发送指令，夹爪按键发送张开 / 闭合动作，横幅显示渐入进度、录制开关和退出按钮。退出、停止、急停、租约丢失、故障、反馈超时、超速（1.5 rad/s）等退出原因都会在实测位姿锁定机械臂，并以提示条显示原因。目前只在仿真和截图测试中验证（`tests/test_gravity_comp.rs`、`scripts/gravity_comp_shots.mjs`），未经实机验证。
 - **急停**按钮、故障显示与清除、长按使能力矩、收纳。
 
 其他客户端持有租约时，驾驶舱切换为观察模式，并提供需确认的接管操作。
@@ -225,7 +227,7 @@ export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 | `/api/v1/observation/schema` | GET | 自由度、关节名、限位、工作空间、相机安装参数 |
 | `/api/v1/ws` | WS | 租约（`acquire_lease`、`heartbeat`）、`command` / `command_ack` / `command_reject`、遥测 |
 | `/api/v1/safety/e_stop` | POST | 急停，不需要租约 |
-| `/api/v1/torque`、`/api/v1/motion/*`、`/api/v1/action/*`、`/api/v1/safety/clear_fault` | POST | 返回 `409 LEASE_REQUIRED`；请把相同路径作为 WS `command` 发送 |
+| `/api/v1/torque`、`/api/v1/motion/*`、`/api/v1/action/*`、`/api/v1/mode/gravity_comp`、`/api/v1/safety/clear_fault` | POST | 返回 `409 LEASE_REQUIRED`；请把相同路径作为 WS `command` 发送 |
 | `/api/v1/grasp/setup` | GET | 抓取设置（通过 WS 指令修改） |
 | `/api/v1/dataset/record/start` / `save` / `discard` | POST | 示教片段录制 |
 | `/api/v1/detection/latest`、`/trigger`、`/inference`、`/ws` | GET / POST / WS | 检测服务代理 |
@@ -241,7 +243,7 @@ WebSocket 时序：
 
 参考文档：
 
-- [docs/agent_action_api.md](docs/agent_action_api.md)：`move_to`、`move_relative`（基座、工具、相机坐标系）、`gripper`、`grasp`、动作状态与错误码；
+- [docs/agent_action_api.md](docs/agent_action_api.md)：`move_to`、`move_relative`（基座、工具、相机坐标系）、`gripper`、`grasp`、重力补偿模式指令、动作状态与错误码；
 - [docs/control_safety_contract.md](docs/control_safety_contract.md)：租约、epoch、驱动能力、时序默认值、限速、工作空间；
 - [docs/detection_api.md](docs/detection_api.md)：识别路由与 agent 调用示例。
 
@@ -268,6 +270,8 @@ curl -X POST http://192.168.42.1:8765/api/v1/dataset/record/start \
      -H 'Content-Type: application/json' -d '{"output_path":"/userdata/datasets/episode_001.parquet"}'
 curl -X POST http://192.168.42.1:8765/api/v1/dataset/record/save      # 或 .../discard
 ```
+
+重力补偿模式下 J1–J6 的指令位置跟随实测位置，因此拖动示教片段中这些关节的 `action` 等于 `observation.state`。
 
 不传 `output_path` 时，文件写到工作目录下的 `./data/episodes/<episode_id>.parquet`。列名沿用 LeRobot 的命名，但 armd 每个片段写一个普通 Parquet 文件，不是 LeRobot 数据集（没有 `meta/` 文件、片段与帧索引，也没有相机画面）。本仓库不提供转换为 LeRobot 数据集的工具，也未测试用它训练。
 
@@ -346,6 +350,7 @@ armd 驱动的真实机械臂有足以伤人和损坏物品的力量。使用风
 - 工作空间盒：rebot-dm 上，servo 目标和规划运动采样点必须使 end_link 原点、夹爪包络 8 个角点和相机点高于地面（`floor_z_m`）、位于包围盒内且在 `max_reach_m` 之内；越界时返回 `422 WORKSPACE_VIOLATION`。包围盒是粗略限制，不检测与桌面物体的碰撞。
 - 限速：rebot-dm 上规划运动与动作的单关节速度上限为 0.45 rad/s；动作默认 0.05 m/s（最大 0.15 m/s）和 0.5 rad/s（最大 1.0 rad/s）。
 - 跟踪误差故障：跟随误差超过 0.5 rad 持续 500 ms 时锁存故障，信息中包含关节号；动作会更早以 `TRACKING_STALL` 结束。
+- 重力补偿（未经实机验证）：进入要求已使能、静止、持有租约且反馈新鲜。所有退出都先在实测位姿保持（力矩不断），再切回 POS_VEL；租约看门狗收纳在此之后才开始。例外：过温保护仍会断力矩；CAN 总线完全中断时，电机继续执行最后一条 MIT 指令（重力前馈加阻尼），直到总线恢复。详见 [docs/control_safety_contract.md](docs/control_safety_contract.md#gravity-compensation-hand-guiding--重力补偿拖动示教)。
 - 默认热点密码（`12345678`）和未鉴权的 HTTP/WebSocket API 使该网络上的任何人都能控制机械臂和开始录制。请修改密码，并只在可信网络上运行。
 
 以上数值是源码中的软件默认值（`src/model.rs`、`src/supervisor.rs`），不是经过认证的安全功能。
@@ -355,7 +360,7 @@ armd 驱动的真实机械臂有足以伤人和损坏物品的力量。使用风
 ## 开发
 
 ```bash
-cargo test                                 # 248 个测试（1 个 ignored），使用仿真机械臂，不需要硬件
+cargo test                                 # 272 个测试（1 个 ignored），使用仿真机械臂，不需要硬件
 cargo clippy --all-targets -- -D warnings
 node scripts/view_ik_selftest.mjs          # 驾驶舱视角坐标系 IK
 node scripts/calib_selftest.mjs            # 驾驶舱手眼标定（c 部分需要 ../rebot-companion 和 uv）

@@ -51,7 +51,9 @@ other hosts and arms are listed under [Hardware](#hardware) with their verificat
   accepted only from the connection that holds the control lease;
 - high-level actions for agents (`move_to`, `move_relative`, `gripper`, `grasp`), used by
   [rebot-companion](https://github.com/Seeed-Solution/rebot-companion) and its MCP server;
-- recording of joint state and commands to Parquet files.
+- recording of joint state and commands to Parquet files;
+- a gravity-compensation mode for hand-guided demonstrations (implemented and tested in
+  simulation, not verified on hardware).
 
 > This software moves a real arm. Read [Safety](#safety) before running it on hardware.
 
@@ -114,13 +116,16 @@ The protocol encoders of the drivers under verification are covered by unit test
 (`tests/test_protocol_vectors.rs`, `tests/test_driver_capabilities.rs`). They use the generic
 6-joint profile without kinematics or a workspace, so Cartesian actions return `UNSUPPORTED`.
 The Damiao driver also has an MIT mode with gravity feed-forward, but it can only be enabled
-from code (`DamiaoArmDriver::with_control_mode`), not from the CLI or a profile.
+from code (`DamiaoArmDriver::with_control_mode`), not from the CLI or a profile. The
+gravity-compensation mode switches J1–J6 to MIT at runtime and back (see
+[Web cockpit](#web-cockpit)); that switch is not verified on hardware.
 
 TODO / roadmap:
 
 - [ ] Verify `rebot-rs` (RobStride), `so-arm101` (Feetech STS) and `fashionstar` / `star-arm102`
       (FashionStar) on real arms, with profiles that include kinematics and a workspace.
-- [ ] Make the Damiao MIT mode (gravity feed-forward) selectable and verify it on the B601-DM.
+- [ ] Verify the gravity-compensation mode (Damiao MIT switch, gravity feed-forward) on the B601-DM
+      ([checklist](docs/control_safety_contract.md#hardware-verification-checklist--实机核实清单)).
 - [ ] Leader-follower teleoperation (not implemented; `--leader` / `--leader-port` are rejected).
 
 ---
@@ -274,6 +279,14 @@ Chinese and English (language switch in the header).
   (table height, gripper pixel, approach and grasp heights, camera tilt) is stored by armd.
   Tested only in simulation and screenshot tests so far; see
   [docs/plan_tap_to_grasp.md](docs/plan_tap_to_grasp.md) for what still needs checking on the arm.
+- **Gravity compensation / hand-guiding**: hold the switch for 0.6 s to make J1–J6 float (MIT
+  mode, kp = 0, damping, URDF gravity torque as feed-forward, ramped in over 1 s); the gripper
+  stays position-controlled. While it is on, sticks, keys and presets send nothing, the gripper
+  keys send open / close actions, and a banner shows the ramp, the recording toggle and an exit
+  button. Exit, stop, E-stop, lease loss, faults, stale feedback, overspeed (1.5 rad/s) and the
+  other exit causes lock the arm at the measured pose; the reason is shown as a toast. Tested
+  in simulation and screenshot tests only (`tests/test_gravity_comp.rs`,
+  `scripts/gravity_comp_shots.mjs`); not verified on hardware.
 - **E-stop** button, fault display and clear, torque enable by press-and-hold, park.
 
 When another client holds the lease, the cockpit switches to observer mode and offers a
@@ -292,7 +305,7 @@ WebSocket that holds the lease.
 | `/api/v1/observation/schema` | GET | DOF, joint names, limits, workspace, camera mount |
 | `/api/v1/ws` | WS | lease (`acquire_lease`, `heartbeat`), `command` / `command_ack` / `command_reject`, telemetry |
 | `/api/v1/safety/e_stop` | POST | E-stop, no lease needed |
-| `/api/v1/torque`, `/api/v1/motion/*`, `/api/v1/action/*`, `/api/v1/safety/clear_fault` | POST | return `409 LEASE_REQUIRED`; send the same paths as WS `command`s |
+| `/api/v1/torque`, `/api/v1/motion/*`, `/api/v1/action/*`, `/api/v1/mode/gravity_comp`, `/api/v1/safety/clear_fault` | POST | return `409 LEASE_REQUIRED`; send the same paths as WS `command`s |
 | `/api/v1/grasp/setup` | GET | grasp setup (changed with a WS command) |
 | `/api/v1/dataset/record/start` / `save` / `discard` | POST | episode recording |
 | `/api/v1/detection/latest`, `/trigger`, `/inference`, `/ws` | GET / POST / WS | detector proxy |
@@ -309,7 +322,8 @@ WebSocket sequence:
 Reference documents:
 
 - [docs/agent_action_api.md](docs/agent_action_api.md): `move_to`, `move_relative` (base,
-  tool and camera frames), `gripper`, `grasp`, action status and error codes;
+  tool and camera frames), `gripper`, `grasp`, the gravity-compensation mode command, action
+  status and error codes;
 - [docs/control_safety_contract.md](docs/control_safety_contract.md): lease, epochs, driver
   capabilities, timing defaults, speed caps, workspace;
 - [docs/detection_api.md](docs/detection_api.md): detection routes and an agent loop example.
@@ -342,6 +356,9 @@ curl -X POST http://192.168.42.1:8765/api/v1/dataset/record/start \
      -H 'Content-Type: application/json' -d '{"output_path":"/userdata/datasets/episode_001.parquet"}'
 curl -X POST http://192.168.42.1:8765/api/v1/dataset/record/save      # or .../discard
 ```
+
+In gravity-compensation mode the commanded position of J1–J6 follows the measured position,
+so a hand-guided episode has `action` equal to `observation.state` for those joints.
 
 Without `output_path` the file goes to `./data/episodes/<episode_id>.parquet` relative to the
 working directory. The column names follow LeRobot's naming, but armd writes one plain
@@ -446,6 +463,12 @@ own risk; the MIT License comes without warranty.
   actions default to 0.05 m/s (max 0.15 m/s) and 0.5 rad/s (max 1.0 rad/s).
 - Tracking-error fault: a following error above 0.5 rad for 500 ms latches a fault that names
   the joint; actions end earlier as `TRACKING_STALL`.
+- Gravity compensation (not verified on hardware): entry needs an armed, stationary arm, the
+  lease and fresh feedback. Every exit holds the measured pose with torque on, then switches
+  back to POS_VEL; the lease watchdog park starts only after that. Exceptions: a thermal trip
+  still disables torque, and with a complete CAN bus loss the motors keep their last MIT
+  command (gravity feed-forward and damping) until the bus returns. Details:
+  [docs/control_safety_contract.md](docs/control_safety_contract.md#gravity-compensation-hand-guiding--重力补偿拖动示教).
 - The default access point password (`12345678`) and the unauthenticated HTTP/WebSocket API
   let anyone on that network control the arm and start recordings. Change the password and
   run the arm on a network you trust.
@@ -458,7 +481,7 @@ not certified safety functions.
 ## Development
 
 ```bash
-cargo test                                 # 248 tests (1 ignored), mock arm, no hardware
+cargo test                                 # 272 tests (1 ignored), mock arm, no hardware
 cargo clippy --all-targets -- -D warnings
 node scripts/view_ik_selftest.mjs          # cockpit view-frame IK
 node scripts/calib_selftest.mjs            # cockpit hand-eye calibration (part c needs ../rebot-companion and uv)

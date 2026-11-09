@@ -183,6 +183,26 @@ The cockpit (`src/api/index.html`) uses this API: with Detect on, tap a box, con
 
 驾驶舱：开启「识别」后点框并确认「抓取」；HUD 上的「抓取设置」打开设置抽屉。任何 `gripper` / `grasp` 动作之后，驾驶舱从 `commanded_positions[6]` 同步夹爪目标，遥操作接管时夹爪不会被拉回原开度。
 
+## Gravity compensation mode / 重力补偿模式
+
+Not verified on hardware. Full contract: [control_safety_contract.md](control_safety_contract.md#gravity-compensation-hand-guiding--重力补偿拖动示教).
+
+```json
+{"type":"command","request_id":7,"generation":1,"epoch_id":42,"path":"/api/v1/mode/gravity_comp","body":{"enable":true,"scale":1.0,"damping_kd":0.5}}
+{"type":"command_ack","request_id":7,"status":"accepted","control_mode":"gravity_comp", ...}
+{"type":"command","request_id":8,"generation":1,"epoch_id":42,"path":"/api/v1/mode/gravity_comp","body":{"enable":false}}
+```
+
+- `enable` (bool, required). `scale` (optional, within the profile's `scale_range`, rebot-dm 0.5–1.2) multiplies the model torque. `damping_kd` (optional) is one number for J1–J6 or six numbers, each 0 ≤ kd ≤ `damping_kd_max` (2.0). Out-of-range values: `400 INVALID_COMMAND`.
+- `enable: true` while the mode is on is accepted without change; `enable: false` while it is off is accepted and does nothing.
+- The ack does not mean the arm floats yet: follow `observation.gravity_comp.phase` (`ramp_in` → `active`). After `enable: false`, `control_mode` returns to `position` once the switch back to POS_VEL is confirmed (about 100 ms).
+- Before sending, `observation.gravity_comp.blocker` gives the code the entry would be refused with (null when it would be accepted).
+- While the mode is on: servo frames, `motion/jog`, `motion/home`, presets, `motion/unload`, `torque`, `move_to`, `move_relative` and `grasp` return `409 MOTION_BUSY`; `motion/stop` and E-stop end the mode; `action/gripper` works; recording (REST) works.
+- `POST /api/v1/mode/gravity_comp` over REST returns `409 LEASE_REQUIRED` / `LEASE_ACTIVE` and does nothing.
+- Why the mode ended: `observation.gravity_comp.last_exit.code` (see the contract for the list).
+
+未经实机验证。完整契约见 [control_safety_contract.md](control_safety_contract.md#gravity-compensation-hand-guiding--重力补偿拖动示教)。`enable` 必填；`scale` 可选，须在 profile 的 `scale_range` 内（rebot-dm 为 0.5–1.2）；`damping_kd` 可选，一个数（J1–J6 共用）或六个数，每个 0 ≤ kd ≤ `damping_kd_max`（2.0），越界返回 `400 INVALID_COMMAND`。应答不代表已经漂浮，请看 `observation.gravity_comp.phase`（`ramp_in` → `active`）；`enable: false` 后切回 POS_VEL 确认（约 100 ms）时 `control_mode` 变回 `position`。发送前可读 `observation.gravity_comp.blocker`，得到会被拒绝的错误码（可进入时为 null）。模式开启时 servo 帧、`motion/jog`、`motion/home`、预设、`motion/unload`、`torque`、`move_to`、`move_relative`、`grasp` 返回 `409 MOTION_BUSY`；`motion/stop` 与急停结束本模式；`action/gripper` 与录制（REST）可用。REST 的 `POST /api/v1/mode/gravity_comp` 返回 `409 LEASE_REQUIRED` / `LEASE_ACTIVE`，不执行。模式结束原因见 `observation.gravity_comp.last_exit.code`。
+
 ## Errors / 错误码
 
 | code | status |
@@ -190,7 +210,9 @@ The cockpit (`src/api/index.html`) uses this API: with Detect on, tap a box, con
 | `IK_UNREACHABLE`, `IK_BRANCH_FLIP`, `WORKSPACE_VIOLATION` | 422 |
 | `MOTION_BUSY`, `PLAN_STALE` | 409 |
 | `INVALID_COMMAND` (bad or missing params, path too long) | 400 |
-| `UNSUPPORTED` | 422 |
+| `UNSUPPORTED`, `GRAVITY_MODEL_UNAVAILABLE` | 422 |
+| `NOT_ARMED` | 412 |
+| `GRAVITY_COMP_NOT_STATIONARY`, `GRAVITY_COMP_JOINT_LIMIT`, `GRAVITY_COMP_SWITCH_FAILED`, `FEEDBACK_STALE`, `LEASE_REQUIRED` (gravity compensation entry) | 409 |
 
 Codes that only appear in `action.code`: `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `ESTOP_ACTIVE`, `FAULT`, `WATCHDOG`, `LEASE_LOST`, `STOPPED`, `SUPERSEDED`, `UNLOAD_FAILED`; for `grasp` also `TARGET_LOST`, `CENTRING_FAILED`, `NOT_HOLDING`, `GRASP_TIMEOUT`, `DETECTION_UNAVAILABLE`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a later phase.
 
@@ -199,5 +221,6 @@ Codes that only appear in `action.code`: `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `E
 - POS_VEL lag gain K = 1.5, measured 2026-11-09 (basis of the 0.45 rad/s cap and the 0.38 / 0.45 rad band).
 - `squeeze_rad` 0.15 and `holding_torque_nm` 0.12 come from the MIT-mode project; grip torque under POS_VEL depends on the motor's internal gains.
 - `camera_mount` (`flip`, `tilt_deg`, `offset_m`) for camera-frame moves.
+- Gravity compensation: the Damiao CTRL_MODE register write while enabled, its acknowledgement, the PMAX / VMAX / TMAX values of each B601-DM motor, the URDF torque against the measured hold torque, the POS_VEL transient when the feed-forward ends at the switch back, and the damping / overspeed defaults (checklist in the contract).
 - Planning time on the SG2002: `cargo test --release --test test_actions bench_plan -- --ignored --nocapture`.
 - Grasp: `camera_tilt_deg` sign and value for the new mount, `camera_mount.offset_m`, `grip_pixel_norm`, `table_z_m`; detection rate and latency (`settle_delay_s`, `lost_*`); the jaw closing axis (assumed end_link y) for J6 alignment; `centre_tol_px` against detector jitter; `holding` thresholds under POS_VEL. Simulated-camera tests: `cargo test --test test_grasp -- --nocapture`.
