@@ -49,7 +49,7 @@ async fn setup(caps: DriverCapabilities, max_velocity: Option<f32>) -> (ArmSuper
     config.home_positions = vec![0.0];
     config.limits = vec![JointLimit::new("axis", -2.0, 2.0, 2.0, 5.0)];
     config.resting_pose = Some(RestingPosePolicy { position_tolerances: vec![0.08], max_total_deviation: 0.08,
-        max_velocity: 0.015, support_torque_limits: vec![(0, 1.0)], feedback_max_age_ms: 100 });
+        max_velocity: 0.015, joint_max_velocities: vec![], support_torque_limits: vec![(0, 1.0)], feedback_max_age_ms: 100 });
     let hardware = Arc::new(Mutex::new(Hardware { states: vec![JointState::default()], age: Some(Duration::ZERO),
         enabled: EnableState::Disabled, disable_fails: false, confirm_disable: true, write_fails: false,
         disable_calls: 0, written: vec![] }));

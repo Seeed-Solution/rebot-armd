@@ -11,7 +11,7 @@ const LEASE_MS: u64 = 50;
 
 fn policy(dof: usize) -> RestingPosePolicy {
     RestingPosePolicy { position_tolerances: vec![0.08; dof], max_total_deviation: 0.08 * dof as f32,
-        max_velocity: 0.015, support_torque_limits: vec![(0, 1.0)], feedback_max_age_ms: 100 }
+        max_velocity: 0.015, joint_max_velocities: vec![], support_torque_limits: vec![(0, 1.0)], feedback_max_age_ms: 100 }
 }
 
 fn sim_config(resting_pose: bool) -> ArmConfig {

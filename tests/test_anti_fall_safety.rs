@@ -180,18 +180,19 @@ async fn test_is_at_safe_resting_pose_criteria() {
     }
     assert!(!supervisor.is_at_safe_resting_pose().await);
 
-    // 3. Velocity check: all velocities <= 0.015 rad/s
+    // 3. Velocity check (rebot-dm policy, real units): J1-J3 <= 0.005 rad/s, which is the
+    // former 0.015 limit applied to readings decoded with VMAX 30 instead of the motors' 10.
     {
         let mut inner = supervisor.inner().write().await;
         inner.measured_positions = vec![0.0, 0.0, 0.0];
-        inner.measured_velocities = vec![0.012, -0.010, 0.005];
+        inner.measured_velocities = vec![0.004, -0.0033, 0.0017];
     }
     assert!(supervisor.is_at_safe_resting_pose().await);
 
-    // Any joint velocity > 0.015 -> must fail
+    // Any J1-J3 velocity > 0.005 -> must fail
     {
         let mut inner = supervisor.inner().write().await;
-        inner.measured_velocities = vec![0.018, 0.0, 0.0];
+        inner.measured_velocities = vec![0.006, 0.0, 0.0];
     }
     assert!(!supervisor.is_at_safe_resting_pose().await);
 
@@ -203,7 +204,7 @@ async fn test_is_at_safe_resting_pose_criteria() {
     ]);
     config.resting_pose = Some(armd::model::RestingPosePolicy {
         position_tolerances: vec![0.15, 0.08, 0.08], max_total_deviation: 0.22,
-        max_velocity: 0.015, support_torque_limits: vec![(1, 1.5), (2, 4.5)], feedback_max_age_ms: 100,
+        max_velocity: 0.015, joint_max_velocities: vec![], support_torque_limits: vec![(1, 1.5), (2, 4.5)], feedback_max_age_ms: 100,
     });
     let supervisor_hw = ArmSupervisor::new(config.clone());
     supervisor_hw.set_driver(Box::new(dummy)).await;
@@ -682,35 +683,38 @@ async fn test_gripper_stall_calibration_and_idle_immunity() {
     let supervisor = ArmSupervisor::new(rebot_cfg);
     supervisor.set_torque(true).await.unwrap();
 
-    // 1. Idle friction of -0.22 Nm (actual hardware observation) must NOT trigger stall
-    supervisor.set_torques(vec![0.1, -0.1, -3.8, -1.7, -0.2, 0.1, -0.22]).await;
+    // Torques in real units (J7 TMAX 10). The hardware values below were read with the old
+    // TMAX 18 mapping and are converted by 10 / 18: -0.22 -> -0.122, -0.85 -> -0.472, -0.25 -> -0.139.
+    // 1. Idle friction of -0.122 Nm (actual hardware observation) must NOT trigger stall
+    supervisor.set_torques(vec![0.1, -0.1, -3.8, -1.7, -0.2, 0.1, -0.122]).await;
     for _ in 0..10 {
         supervisor.tick(0.02).await;
     }
-    assert!(!supervisor.is_gripper_stalled().await, "Idle friction of -0.22 Nm must not trigger stall");
+    assert!(!supervisor.is_gripper_stalled().await, "Idle friction of -0.122 Nm must not trigger stall");
 
-    // 2. Clamping torque >= 0.80 Nm for 6 consecutive ticks triggers stall
-    supervisor.set_torques(vec![0.1, -0.1, -3.8, -1.7, -0.2, 0.1, -0.85]).await;
+    // 2. Clamping torque >= 0.444 Nm for 6 consecutive ticks triggers stall
+    supervisor.set_torques(vec![0.1, -0.1, -3.8, -1.7, -0.2, 0.1, -0.472]).await;
     for _ in 0..6 {
         supervisor.tick(0.02).await;
     }
-    assert!(supervisor.is_gripper_stalled().await, "Clamping torque >= 0.80 Nm must trigger stall");
+    assert!(supervisor.is_gripper_stalled().await, "Clamping torque >= 0.444 Nm must trigger stall");
 
-    // 3. Torque falling below 0.40 Nm for 6 consecutive ticks automatically clears stall
-    supervisor.set_torques(vec![0.1, -0.1, -3.8, -1.7, -0.2, 0.1, -0.25]).await;
+    // 3. Torque falling below 0.222 Nm for 6 consecutive ticks automatically clears stall
+    supervisor.set_torques(vec![0.1, -0.1, -3.8, -1.7, -0.2, 0.1, -0.139]).await;
     for _ in 0..6 {
         supervisor.tick(0.02).await;
     }
-    assert!(!supervisor.is_gripper_stalled().await, "Relaxed torque < 0.40 Nm must clear stall");
+    assert!(!supervisor.is_gripper_stalled().await, "Relaxed torque < 0.222 Nm must clear stall");
 }
 
 #[tokio::test]
 async fn test_gripper_free_travel_friction_is_not_a_stall() {
-    // Hardware 2026-11-06: free travel reached |tau| 0.80 Nm at -0.36 rad/s mid-stroke.
-    // High torque while the jaw is still moving must not freeze the gripper.
+    // Hardware 2026-11-06: free travel reached |tau| 0.80 Nm (old TMAX 18 reading; 0.444 Nm
+    // real) at -0.36 rad/s mid-stroke. High torque while the jaw is still moving must not
+    // freeze the gripper.
     let supervisor = ArmSupervisor::new(ArmConfig::rebot_dm());
     supervisor.set_torque(true).await.unwrap();
-    supervisor.set_torques(vec![0.1, -0.1, -3.8, -1.7, -0.2, 0.1, -0.85]).await;
+    supervisor.set_torques(vec![0.1, -0.1, -3.8, -1.7, -0.2, 0.1, -0.472]).await;
     for _ in 0..10 {
         supervisor.inner().write().await.measured_velocities[6] = -0.36;
         supervisor.tick(0.02).await;

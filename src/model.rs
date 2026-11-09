@@ -55,20 +55,34 @@ impl Default for JointState {
 pub struct RestingPosePolicy {
     pub position_tolerances: Vec<f32>,
     pub max_total_deviation: f32,
+    /// |velocity| limit (rad/s) for every joint without an entry in `joint_max_velocities`.
     pub max_velocity: f32,
+    /// Per-joint |velocity| limits (rad/s), joint 1 first; joints past the end use
+    /// `max_velocity`.
+    #[serde(default)]
+    pub joint_max_velocities: Vec<f32>,
     pub support_torque_limits: Vec<(usize, f32)>,
     pub feedback_max_age_ms: u64,
 }
 
 impl RestingPosePolicy {
+    /// The velocity and support-torque limits were tuned on readings decoded with the old
+    /// single range (VMAX 30, TMAX 18). In real units (J1-J3 VMAX 10, TMAX 28) the same
+    /// physical limits are 0.015 / 3 rad/s on J1-J3 and 1.5 / 4.5 N·m × 28 / 18 on J2 / J3.
     pub fn rebot_dm() -> Self {
         Self {
             position_tolerances: vec![0.15, 0.08, 0.08, 0.08, 0.08, 0.08],
             max_total_deviation: 0.22,
             max_velocity: 0.015,
-            support_torque_limits: vec![(1, 1.5), (2, 4.5)],
+            joint_max_velocities: vec![0.005, 0.005, 0.005, 0.015, 0.015, 0.015, 0.015],
+            support_torque_limits: vec![(1, 2.333), (2, 7.0)],
             feedback_max_age_ms: 100,
         }
+    }
+
+    /// |velocity| limit for joint `i` (0-based).
+    pub fn max_velocity_of(&self, i: usize) -> f32 {
+        self.joint_max_velocities.get(i).copied().unwrap_or(self.max_velocity)
     }
 }
 
@@ -166,8 +180,10 @@ pub struct GripperPolicy {
 
 impl GripperPolicy {
     /// Thresholds from the MIT-mode project; holding torque and squeeze need verification in POS_VEL.
+    /// holding_torque_nm 0.0667 is the former 0.12 read with TMAX 18, converted to the
+    /// J7 motor's real TMAX 10 (0.12 × 10 / 18).
     pub fn rebot_dm() -> Self {
-        Self { closed_rad: 0.0, open_rad: -5.7, holding_gap_rad: 0.30, holding_torque_nm: 0.12, squeeze_rad: 0.15, settle_ms: 300 }
+        Self { closed_rad: 0.0, open_rad: -5.7, holding_gap_rad: 0.30, holding_torque_nm: 0.0667, squeeze_rad: 0.15, settle_ms: 300 }
     }
 }
 
@@ -455,6 +471,8 @@ impl ArmConfig {
                 || policy.position_tolerances.iter().any(|v| !v.is_finite() || *v <= 0.0)
                 || !policy.max_total_deviation.is_finite() || policy.max_total_deviation <= 0.0
                 || !policy.max_velocity.is_finite() || policy.max_velocity <= 0.0
+                || policy.joint_max_velocities.len() > self.dof
+                || policy.joint_max_velocities.iter().any(|v| !v.is_finite() || *v <= 0.0)
                 || policy.feedback_max_age_ms == 0
                 || policy.support_torque_limits.iter().any(|(i, t)| *i >= self.dof || !t.is_finite() || *t < 0.0) {
                 return Err("Invalid resting-pose policy".into());

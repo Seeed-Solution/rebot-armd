@@ -219,7 +219,7 @@ Codes that only appear in `action.code`: `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `E
 ## Needs verification on the device / 需实机核实
 
 - POS_VEL lag gain K = 1.5, measured 2026-11-09 (basis of the 0.45 rad/s cap and the 0.38 / 0.45 rad band).
-- `squeeze_rad` 0.15 and `holding_torque_nm` 0.12 come from the MIT-mode project; grip torque under POS_VEL depends on the motor's internal gains.
+- `squeeze_rad` 0.15 and `holding_torque_nm` 0.0667 (0.12 as read with the old TMAX 18 mapping of J7, converted to its real TMAX 10) come from the MIT-mode project; grip torque under POS_VEL depends on the motor's internal gains.
 - `camera_mount` (`flip`, `tilt_deg`, `offset_m`) for camera-frame moves.
 - Gravity compensation: the Damiao CTRL_MODE register write while enabled, its acknowledgement, the PMAX / VMAX / TMAX values of each B601-DM motor, the URDF torque against the measured hold torque, the POS_VEL transient when the feed-forward ends at the switch back, and the damping / overspeed defaults (checklist in the contract).
 - Planning time on the SG2002: `cargo test --release --test test_actions bench_plan -- --ignored --nocapture`.

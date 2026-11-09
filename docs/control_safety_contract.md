@@ -68,6 +68,33 @@ Damiao motors map the 16-bit position and 12-bit velocity / torque fields of fee
   - A joint whose CTRL_MODE is not POS_VEL (left in MIT by an interrupted session) is marked unconfirmed; the enable handshake writes POS_VEL to it first.
   - Gravity compensation is refused with `DRIVER_RANGE_MISMATCH` / `DRIVER_RANGE_UNVERIFIED` unless the check passed. The MIT range readback before the first switch to MIT is skipped for joints the startup check verified.
 
+**Threshold migration (2026-11-09).** Every use of measured torque or velocity was checked. "Tuned" means the value was set against readings decoded with the old range; those keep the same physical behaviour (`tests/test_threshold_migration.rs` sweeps all 4096 raw values of each field and runs stall and resting pose end to end through the driver and supervisor; old and new decisions are equal). Factors: J1–J3 velocity old = 3 × real, J1–J3 torque old = 0.643 × real, J4–J7 torque old = 1.8 × real, J4–J7 velocity unchanged.
+
+| Location | Old | New | Reason |
+|---|---|---|---|
+| `src/supervisor.rs` `GRIPPER_STALL_LATCH_NM` (J7 stall, \|τ7\| ≥ for 6 ticks) | 0.80 N·m | 0.444 N·m | Tuned on hardware (2026-11-06); × 10 / 18 |
+| `src/supervisor.rs` `GRIPPER_STALL_RELEASE_NM` (\|τ7\| < for 6 ticks) | 0.40 N·m | 0.2223 N·m | Tuned; × 10 / 18 = 0.2222. Raw 2093 decodes to exactly 0.2222 and was read as 0.39999962 (< 0.40), so the bound sits just above it |
+| `src/supervisor.rs` stall condition \|v7\| < 0.10 rad/s | 0.10 | unchanged | J7 VMAX is 30, decoding unchanged |
+| `GripperPolicy::rebot_dm` `holding_torque_nm` (J7 grasp verdict) | 0.12 N·m | 0.0667 N·m | From the MIT-mode project, applied to J7 readings at TMAX 18; × 10 / 18 |
+| `RestingPosePolicy::rebot_dm` `support_torque_limits` J2 | 1.5 N·m | 2.333 N·m | Tuned on park readings; × 28 / 18 |
+| `RestingPosePolicy::rebot_dm` `support_torque_limits` J3 | 4.5 N·m | 7.0 N·m | Tuned; × 28 / 18 |
+| `RestingPosePolicy` velocity limit, J1–J3 (new field `joint_max_velocities`) | 0.015 rad/s | 0.005 rad/s | Tuned; ÷ 3. A single real-unit value cannot serve both motor types: 0.005 on J4–J7 is below their smallest non-zero reading (±0.0073 rad/s), so park could never release |
+| `RestingPosePolicy` velocity limit, J4–J7 | 0.015 rad/s | 0.015 rad/s | Decoding unchanged |
+| `src/motion.rs` `SETTLE_VEL` (action settle, J1–J6) | 0.05 rad/s | unchanged (real units) | Shared rule for every driver, specified in real units. J1–J3 settle becomes looser: real 0.0167 → 0.05 rad/s. Completion criterion only (sets `settled`), no safety effect |
+| `src/supervisor.rs` `is_fully_settled_hold` \|v\| ≤ 0.05 (handover settling, lease preemption) | 0.05 rad/s | unchanged | Settle-type check, also requires zero commanded velocity and fresh feedback; J1–J3 looser (0.0167 → 0.05 real) |
+| `GravityCompPolicy` `entry_max_velocity` | 0.05 rad/s | unchanged | Software default never run on hardware (the range check refused entry); defined in real units. J1–J3 entry is 3× looser than the old reading would have enforced |
+| `GravityCompPolicy` `max_speed_rad_s` (overspeed exit) | 1.5 rad/s | unchanged | Defined in real units and documented as 1.5 rad/s; never ran on hardware. The position-difference speed it is also compared with was always real units. The reported J1–J3 velocity no longer trips at a real 0.5 rad/s: looser than the mis-scaled reading, equal to the specification |
+| Gravity-comp entry crossfade (`entry_torque` = measured torque) | — | unchanged logic | Old J1–J3 feedback read 0.643× and the MIT encoding applied 28 / 18 to it, so the start torque was right by cancellation (J4–J6: 1.8 × 10 / 18 = 1). Model torque was mis-scaled the same way (J1–J3 × 1.56, J4–J6 × 0.56). Now both are real units; the reported J2 / J3 torque reads about 1.56× the old value and the crossfade starts from the real load. `torque_limits_nm` still clamps it (J2 12 N·m, J3 8.5 N·m) |
+| `GravityCompPolicy::validate` `torque_limits_nm` ≤ 18 | 18 N·m | 18 N·m, and ≤ each joint's TMAX | Commands, not readings; the TMAX check is new |
+| Supervisor gravity-torque clamp 12 / 6 N·m, `torque_limits_nm`, `hold_kp` / `hold_kd`, `damping_kd` | — | unchanged | Command values (model torque, gains), not compared with readings |
+| `JointLimit::max_velocity`, `planned_max_velocity`, following-error bound, `TRACKING_STALL`, `LAG_*` | — | unchanged | Commanded velocities or position errors; POS_VEL frames carry raw float position and speed limit |
+| Bus loss / stale feedback (`BUS_LOSS_TIMEOUT`, feedback ages) | — | unchanged | Time based, no velocity threshold |
+| Cockpit preset completion `\|v\| < 0.05` (all joints) | 0.05 rad/s | unchanged | UI settle check; J1–J3 looser as for `SETTLE_VEL` |
+| Cockpit calibration "arm moving" `\|v\| > 0.02` | 0.02 rad/s | unchanged | UI guard against capturing while moving; J1–J3 looser (0.0067 → 0.02 real) |
+| Cockpit gripper "stalled" `\|v7\| < 0.05` | 0.05 rad/s | unchanged | J7 decoding unchanged |
+| Cockpit joint table torque / velocity columns | — | unchanged | Display only; values are now real units |
+| Recorded episodes (`observation.state` torques / velocities) | — | — | Recordings made before this change carry the old scaling on J1–J7 torque and J1–J3 velocity |
+
 达妙电机把反馈帧与 MIT 帧中 16 位位置、12 位速度 / 力矩字段映射到 ±PMAX、±VMAX、±TMAX（21–23 号寄存器）。B601-DM 各电机读出的值（2026-11-09；请求为 `0x7FF` 上的 `[id, 0, 0x33, rid, 0, 0, 0, 0]`，应答为 `0x10 + id` 上的 `[id, 0, 0x33, rid, 值 小端]`）：J1–J3 CTRL_MODE 2、PMAX 12.5、VMAX 10、TMAX 28；J4–J7 CTRL_MODE 2、PMAX 12.5、VMAX 30、TMAX 10。rebot-dm profile 把它们写在 `damiao_ranges` 中，反馈解码与 MIT 编码按关节使用各自范围。此前所有电机都按 12.5 / 30 / 18 解码：J1–J3 速度读数为实际值的 3 倍，J1–J3 力矩为 0.643 倍，J4–J7 力矩为 1.8 倍。基于这些读数整定的阈值已换算（见下表）。
 
 - **启动量程检查**：`armd` 挂载 rebot-dm 驱动时，在任何使能之前读取每个电机的 10、21、22、23 号寄存器（读寄存器不改变使能状态，不发送使能帧）。每个电机最多等 20 ms：全部应答时约为 7 ×（4 帧 + 应答），七个电机都不应答时最多 140 ms。结果在每帧观测中以 `driver_range_check` 发布（`status` 为 `passed` | `mismatch` | `unverified`，另有 `message`、`duration_ms`，以及每个关节的 `joint`、`motor_id`、`status`、`ctrl_mode`、`reported` [PMAX, VMAX, TMAX] 或 null、`configured`）。
@@ -75,6 +102,33 @@ Damiao motors map the 16-bit position and 12-bit velocity / torque fields of fee
   - `unverified`：有电机未应答。记录 warning 日志，使用配置的范围。每次使能前重新读取，所有电机应答后变为 `passed`（或 `mismatch`）。
   - CTRL_MODE 不是 POS_VEL 的关节（被中断的会话遗留在 MIT）标记为未确认，使能握手会先给它写 POS_VEL。
   - 检查未通过时拒绝进入重力补偿（`DRIVER_RANGE_MISMATCH` / `DRIVER_RANGE_UNVERIFIED`）。启动检查已核对的关节，第一次切到 MIT 前不再重复读取范围。
+
+**阈值换算（2026-11-09）**：逐一检查了所有使用实测力矩或速度的地方。“已整定”指该值是对照旧范围解码的读数设定的，换算后物理行为不变（`tests/test_threshold_migration.rs` 对每个字段扫描全部 4096 个原始值，并让堵转与收纳位判定经驱动和 supervisor 端到端运行，新旧判定一致）。换算系数：J1–J3 速度旧读数 = 3 × 实际值，J1–J3 力矩旧读数 = 0.643 × 实际值，J4–J7 力矩旧读数 = 1.8 × 实际值，J4–J7 速度不变。
+
+| 位置 | 旧值 | 新值 | 原因 |
+|---|---|---|---|
+| `GRIPPER_STALL_LATCH_NM`（J7 堵转锁存） | 0.80 N·m | 0.444 N·m | 实机整定（2026-11-06）；× 10 / 18 |
+| `GRIPPER_STALL_RELEASE_NM`（堵转解除） | 0.40 N·m | 0.2223 N·m | 已整定；× 10 / 18 = 0.2222。原始值 2093 恰好解码为 0.2222，旧读数为 0.39999962（< 0.40），因此阈值取略高于它 |
+| 堵转条件 \|v7\| < 0.10 rad/s | 0.10 | 不变 | J7 VMAX 为 30，解码不变 |
+| `holding_torque_nm`（J7 夹持判定） | 0.12 N·m | 0.0667 N·m | 来自 MIT 项目，用于 TMAX 18 下的 J7 读数；× 10 / 18 |
+| 收纳位 `support_torque_limits` J2 | 1.5 N·m | 2.333 N·m | 已整定；× 28 / 18 |
+| 收纳位 `support_torque_limits` J3 | 4.5 N·m | 7.0 N·m | 已整定；× 28 / 18 |
+| 收纳位速度限值 J1–J3（新字段 `joint_max_velocities`） | 0.015 rad/s | 0.005 rad/s | 已整定；÷ 3。两种电机无法共用一个实际单位值：J4–J7 最小非零读数为 ±0.0073 rad/s，取 0.005 会使收纳永远无法断力矩 |
+| 收纳位速度限值 J4–J7 | 0.015 rad/s | 0.015 rad/s | 解码不变 |
+| `SETTLE_VEL`（动作到位判定，J1–J6） | 0.05 rad/s | 不变（实际单位） | 所有驱动共用、按实际单位定义。J1–J3 判定变宽：实际 0.0167 → 0.05 rad/s。只影响 `settled` 结果，不涉及安全 |
+| `is_fully_settled_hold` \|v\| ≤ 0.05（交接稳定、租约抢占） | 0.05 rad/s | 不变 | 稳定类判定，另要求指令速度为零且反馈新鲜；J1–J3 变宽（实际 0.0167 → 0.05） |
+| 重力补偿 `entry_max_velocity` | 0.05 rad/s | 不变 | 软件默认值，从未在实机运行（量程检查拒绝进入），按实际单位定义。J1–J3 进入条件比旧读数下宽 3 倍 |
+| 重力补偿 `max_speed_rad_s`（超速退出） | 1.5 rad/s | 不变 | 按实际单位定义并以 1.5 rad/s 公布，从未在实机运行；同时比较的位置差分速度一直是实际单位。J1–J3 上报速度不再在实际 0.5 rad/s 时触发：比错误缩放时宽，与规格一致 |
+| 重力补偿渐入（`entry_torque` = 实测力矩） | — | 逻辑不变 | 旧 J1–J3 反馈读数为 0.643 倍，MIT 编码又放大 28 / 18，起始力矩恰好抵消为正确值（J4–J6：1.8 × 10 / 18 = 1）；模型力矩同样被错误缩放（J1–J3 × 1.56，J4–J6 × 0.56）。现在两者都是实际单位，J2 / J3 力矩读数约为旧值的 1.56 倍，渐入从实际负载开始，仍受 `torque_limits_nm` 限幅（J2 12 N·m、J3 8.5 N·m） |
+| `torque_limits_nm` ≤ 18 校验 | 18 N·m | 18 N·m，且 ≤ 各关节 TMAX | 指令值；TMAX 校验为新增 |
+| supervisor 重力力矩限幅 12 / 6 N·m、`torque_limits_nm`、`hold_kp` / `hold_kd`、`damping_kd` | — | 不变 | 指令值（模型力矩、增益），不与读数比较 |
+| `JointLimit::max_velocity`、`planned_max_velocity`、跟随误差阈值、`TRACKING_STALL`、`LAG_*` | — | 不变 | 指令速度或位置误差；POS_VEL 帧直接携带浮点位置与限速 |
+| 总线丢失 / 反馈超时（`BUS_LOSS_TIMEOUT`、反馈时延） | — | 不变 | 基于时间，没有速度阈值 |
+| 驾驶舱预设完成 `\|v\| < 0.05`（所有关节） | 0.05 rad/s | 不变 | 界面稳定判定；J1–J3 变宽，同 `SETTLE_VEL` |
+| 驾驶舱标定“机械臂在动” `\|v\| > 0.02` | 0.02 rad/s | 不变 | 防止运动中采集；J1–J3 变宽（实际 0.0067 → 0.02） |
+| 驾驶舱夹爪“已堵转” `\|v7\| < 0.05` | 0.05 rad/s | 不变 | J7 解码不变 |
+| 驾驶舱关节表力矩 / 速度列 | — | 不变 | 仅显示，数值现为实际单位 |
+| 录制数据（`observation.state` 中的力矩 / 速度） | — | — | 此前录制的数据中 J1–J7 力矩与 J1–J3 速度仍是旧缩放 |
 
 ## Gravity compensation (hand-guiding) / 重力补偿（拖动示教）
 

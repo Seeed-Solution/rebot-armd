@@ -24,7 +24,9 @@ for mid in range(1, 8):
                 p_raw = (data[1] << 8) | data[2]
                 t_raw = (((data[4] & 0x0F) << 8) | data[5])
                 pos = uint_to_float(p_raw, -12.5, 12.5, 16)
-                tor = uint_to_float(t_raw, -18.0, 18.0, 12)
+                # TMAX read from the B601-DM motors (register 23): 28 on J1-J3, 10 on J4-J7
+                tmax = 28.0 if mid <= 3 else 10.0
+                tor = uint_to_float(t_raw, -tmax, tmax, 12)
                 rep = f"st={st}, pos={pos:.4f} rad ({pos*57.3:.1f} deg), tor={tor:.2f} Nm, temp={data[6]}C"
                 break
     except Exception:

@@ -49,6 +49,15 @@ pub enum PreemptError {
     Cooldown(u64),
 }
 
+/// J7 stall latch: |τ7| at or above this (N·m) with the jaw still, for 6 ticks.
+/// Tuned on hardware as 0.80 when τ7 was decoded with TMAX 18; the J7 motor's TMAX
+/// is 10, so the same physical torque is 0.80 × 10 / 18.
+pub const GRIPPER_STALL_LATCH_NM: f32 = 0.444;
+/// J7 stall release: |τ7| below this (N·m) for 6 ticks (formerly 0.40 at TMAX 18;
+/// 0.40 × 10 / 18 = 0.2222). Raw torque 2093 decodes to exactly that value and was read
+/// as 0.39999962 < 0.40 before, so the bound sits just above it.
+pub const GRIPPER_STALL_RELEASE_NM: f32 = 0.2223;
+
 /// Feedback gap that latches BusLoss while torqued. The Damiao motors run with
 /// CAN TIMEOUT=0 and keep holding their last POS_VEL target through a gap, so a
 /// short interruption is not a hazard by itself. 500 ms tolerates the ~260 ms
@@ -427,9 +436,9 @@ impl SupervisorInner {
             return Some(format!("total deviation {total:.4} rad (limit {})", policy.max_total_deviation));
         }
         if let Some((i, v)) = self.measured_velocities.iter().enumerate()
-            .find(|(_, v)| !v.is_finite() || v.abs() > policy.max_velocity)
+            .find(|(i, v)| !v.is_finite() || v.abs() > policy.max_velocity_of(*i))
         {
-            return Some(format!("joint {} moving at {v:.4} rad/s (limit {})", i + 1, policy.max_velocity));
+            return Some(format!("joint {} moving at {v:.4} rad/s (limit {})", i + 1, policy.max_velocity_of(i)));
         }
         if self.driver.is_some() {
             for &(i, max_tau) in &policy.support_torque_limits {
@@ -1790,7 +1799,7 @@ impl SupervisorInner {
                 // A stall is high torque with the jaw not moving. Torque alone also rises
                 // from friction during free travel over the 5.9 rad stroke.
                 let v_7 = self.measured_velocities.get(6).copied().unwrap_or(0.0);
-                if tau_7.abs() >= 0.80 && v_7.abs() < 0.10 {
+                if tau_7.abs() >= GRIPPER_STALL_LATCH_NM && v_7.abs() < 0.10 {
                     self.gripper_high_torque_ticks += 1;
                     if self.gripper_high_torque_ticks >= 6 {
                         self.gripper_stalled = true;
@@ -1810,8 +1819,8 @@ impl SupervisorInner {
                 }
             } else {
                 self.gripper_high_torque_ticks = 0;
-                // Exit condition B: |tau_7| < 0.40 for 6 consecutive ticks
-                if tau_7.abs() < 0.40 {
+                // Exit condition B: |tau_7| < GRIPPER_STALL_RELEASE_NM for 6 consecutive ticks
+                if tau_7.abs() < GRIPPER_STALL_RELEASE_NM {
                     self.gripper_low_torque_ticks += 1;
                     if self.gripper_low_torque_ticks >= 6 {
                         self.gripper_stalled = false;
