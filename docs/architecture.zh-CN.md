@@ -72,7 +72,7 @@ rebot-armd 分三层。核心可在任何受支持的控制器上运行；套件
 
 armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使驾驶舱和 agent 只访问一个源（`src/api/proxy.rs`，[detection_api.md](detection_api.md)）。
 
-- 版本：尚未版本化（v0 = 本文所列路由）。
+- 版本：感知服务在 `:8090` 的每个响应中返回 `"api_version"`；**1** 为套件 `rebot-vision` 的接口（模式、每种模式都支持单次触发、合并结果）。没有该字段的服务（yolo-detector、aruco-detector）视为版本 0：下表中除 `/api/mode` 外的路由。armd 将其作为 `capabilities.vision.api_version` 发布。
 - 上游：`ARMD_DETECTOR_URL`（默认 `http://127.0.0.1:8090`）。
 
 | armd 路由 | 上游 | 用途 |
@@ -80,15 +80,18 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 | `GET` / `POST /api/v1/detection/inference` | `/api/inference` | 持续推理开关、帧率 |
 | `GET /api/v1/detection/latest` | `/api/results/latest?after=&wait_ms=` | 最新结果，长轮询 |
 | `POST /api/v1/detection/trigger` | `/api/trigger?wait_ms=` | 对新帧推理一次，不改变 `enabled` |
+| `GET` / `POST /api/v1/vision/mode` | `/api/mode` | 模式 `off` / `yolo` / `aruco` / `both`，以及持续推理开关和统一帧率（版本 1） |
 | `GET /api/v1/detection/ws`、`/results` | `ws://127.0.0.1:8001/results` | 检测结果流（固定地址） |
 
-状态码和响应体原样透传；上游不可达返回 502。视频不经代理：驾驶舱直接播放相机的 H.264 WebSocket 流（`ws://<host>:8001/`）。目前 reCamera 上的感知服务是相机自带的 `yolo-detector`（或 `aruco-detector`），不属于套件；第二阶段由套件的 `rebot-vision` 替代（[dev_flow_spec_vision_runtime.md](dev_flow_spec_vision_runtime.md)），增加模式切换（`off | yolo | aruco | both`），并且每种模式都支持按需触发。
+状态码和响应体原样透传；上游不可达返回 502。视频不经代理：驾驶舱直接播放相机的 H.264 WebSocket 流（`ws://<host>:8001/`）。目前 reCamera 上的感知服务是相机自带的 `yolo-detector`（或 `aruco-detector`），不属于套件。套件自带的感知服务是 `rebot-vision`（`kits/recamera-b601dm/vision/`，设计见 [dev_flow_spec_vision_runtime.md](dev_flow_spec_vision_runtime.md)），随 `rebot-teleop` 1.2.0 发布：一个进程占用相机，按模式在同一帧上运行 YOLO（TPU）和 ArUco（CPU），所有模式共用一个推理帧率，每种模式都支持 `/api/trigger`，结果始终同时包含 `detections` 和 `markers`。
+
+抓取动作在执行期间切换到 `yolo`（原来开着 ArUco 时为 `both`）并开启推理，结束后恢复原模式和推理状态；没有 `/api/mode` 的服务（404）仍使用推理开关。驾驶舱的手眼标定抽屉打开期间切换到 `aruco`（原来开着 YOLO 时为 `both`）。
 
 ### 3. 能力发现
 
 `GET /api/v1/observation/schema` 带有 `capabilities`（`src/model.rs` 中的 `Capabilities`），驾驶舱与 MCP 客户端可据此调整，无需探测路由。旧版 armd 的 schema 没有 `capabilities`，解析结果为全 false、`version` 为 0。
 
-- 版本：`capabilities.version`，当前为 **1**（`CAPABILITIES_VERSION`）。
+- 版本：`capabilities.version`，当前为 **2**（`CAPABILITIES_VERSION`）。版本 2 在 `detection_proxy` 之后加入了 `vision.*` 字段。
 
 | 字段 | 为 true 的条件 |
 |---|---|
@@ -100,8 +103,15 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 | `gravity_comp` | profile、URDF 校验和驱动都支持该模式；与 `observation.gravity_comp.supported` 相同 |
 | `damiao_ranges` | profile 设置了分关节达妙范围（启动检查结果在 `observation.driver_range_check`） |
 | `vision.detection_proxy` | 恒为 true：检测路由存在；不检查感知服务是否可达 |
+| `vision.mode_endpoint` | （字符串）恒为 `/api/v1/vision/mode` |
+| `vision.modes` | （列表）感知服务报告的模式；服务不可达或没有 `/api/mode` 时为空 |
+| `vision.mode` | （字符串或 null）当前基础模式 |
+| `vision.api_version` | （数字或 null）感知接口版本 |
+| `vision.trigger`、`vision.yolo_available` | （布尔或 null）每种模式都支持触发；YOLO 模型已加载 |
 
-schema 的其他字段已描述机械臂：`dof`、`joint_names`、`limits`、`workspace`、`camera_mount`、`kinematics`。随观测变化的状态仍在观测中（`driver_capabilities`、`gravity_comp`、`driver_range_check`）。第二阶段在 `capabilities.vision` 中加入视觉模式（版本 2）。
+`vision.modes` 等字段来自感知服务的 `GET /api/mode`：schema 使用最近一次经 armd 代理的模式请求的响应，超过 2 秒则向服务查询（超时 500 ms）。
+
+schema 的其他字段已描述机械臂：`dof`、`joint_names`、`limits`、`workspace`、`camera_mount`、`kinematics`。随观测变化的状态仍在观测中（`driver_capabilities`、`gravity_comp`、`driver_range_check`）。
 
 ### 4. 打包
 
@@ -110,12 +120,15 @@ schema 的其他字段已描述机械臂：`dof`、`joint_names`、`limits`、`w
 - 版本：代码中未版本化；下面的布局为本文档的第 1 版。
 - armd 从环境变量读取 `PORT`、`RUST_LOG`、`ARMD_DETECTOR_URL`、`ARMD_GRASP_SETUP`。
 
-官方套件的安装包（`kits/recamera-b601dm/packaging/`，deb `rebot-teleop` 1.1.0）：
+官方套件的安装包（`kits/recamera-b601dm/packaging/`，deb `rebot-teleop` 1.2.0）：
 
 | 安装路径 | 仓库中的来源 |
 |---|---|
 | `/usr/bin/armd`，符号链接 `/usr/local/bin/armd` | 核心构建 |
-| `/etc/init.d/K92rebot-teleop`，符号链接 `S92rebot-teleop` | `packaging/rootfs/etc/init.d/K92rebot-teleop` |
+| `/usr/bin/rebot-vision` | `kits/recamera-b601dm/vision/`，由 `scripts/build_vision.sh` 构建 |
+| `/etc/init.d/K92rebot-teleop`（postinst 仅在没有 reCamera 控制台时添加 `S92rebot-teleop`） | `packaging/rootfs/etc/init.d/K92rebot-teleop` |
+| `/usr/share/rebot-teleop/rebot-vision-run`（重启循环，nice 10）、`vision.json.default` | `packaging/rootfs/usr/share/rebot-teleop/` |
+| `/usr/share/doc/rebot-teleop/`（`LICENSE`、`LICENSE-APACHE`、`THIRD_PARTY_NOTICES.md`） | 仓库根目录、`kits/recamera-b601dm/vision/LICENSE-APACHE` |
 | `/usr/share/rebot-teleop/index.html` | `src/api/index.html` |
 | `/usr/share/rebot-teleop/assets/reBot-DevArm_gripper.urdf` | `packaging/rootfs/usr/share/rebot-teleop/assets/` |
 | `/usr/share/rebot-teleop/profile/rebot-b601dm.json` | `kits/recamera-b601dm/profile/` |
@@ -134,7 +147,7 @@ kits/
   _template/                 第三方套件模板与说明
   recamera-b601dm/           官方参考套件
     profile/                 机械臂 profile JSON
-    vision/                  第二阶段：rebot-vision 进程（目前只有占位 README）
+    vision/                  rebot-vision 进程（C++，以 sscma-example-sg200x 为 SDK 构建）
     packaging/               rebot-teleop deb 源文件
     hardware/                相机支架 CAD，CERN-OHL-W-2.0（单独 LICENSE）
     calibration/             各支架相机俯角、内参占位值、抓取设置默认值

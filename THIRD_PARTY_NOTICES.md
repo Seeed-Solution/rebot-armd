@@ -69,6 +69,93 @@ DEALINGS IN THE SOFTWARE.
 - The reference files the scripts read (`D435_Gemini2_Mount.step`, `B3_CAN.step`, the
   reBot-DevArm MJCF and meshes) are not included; see the directory's `README.md`.
 
+## rebot-vision (reCamera runtime)
+
+`rebot-vision` is the kit's camera process (`kits/recamera-b601dm/vision/`, installed as
+`/usr/bin/rebot-vision` by the `rebot-teleop` deb). Its sources and the binary include code
+from the projects below.
+
+### sscma-example-sg200x application code (copied)
+
+- Upstream: https://github.com/Seeed-Studio/sscma-example-sg200x (fork
+  https://github.com/suharvest/sscma-example-sg200x, branch `phase3-hw`), commit
+  `9af8118e556c01872ed2cd583abd0c1191df9c6c`.
+- License: Apache-2.0, text in `kits/recamera-b601dm/vision/LICENSE-APACHE` (installed as
+  `/usr/share/doc/rebot-teleop/LICENSE-APACHE`). Copyright Seeed Technology Co., Ltd.
+- Copied files (path in this repository <- path upstream). "unchanged" = byte-identical at
+  the import commit; files marked "modified" carry a notice at the top (Apache-2.0 4(b)).
+
+| This repository (`kits/recamera-b601dm/vision/`) | Upstream (`solutions/`) | State |
+|---|---|---|
+| `main/marker_filter.h`, `main/marker_filter.cpp` | `aruco-detector/main/` | unchanged |
+| `main/camera_model.h`, `main/camera_model.cpp` | `aruco-detector/main/` | unchanged |
+| `main/capture_time.h` | `aruco-detector/main/` | unchanged |
+| `main/http_control.h`, `main/http_control.cpp` | `aruco-detector/main/` | modified |
+| `main/detector.h`, `main/detector.cpp` | `yolo-detector/main/` | unchanged |
+| `main/vision_control.h`, `main/vision_control.cpp` | `aruco-detector/main/inference_control.{h,cpp}` | modified (modes added) |
+| `main/aruco_stage.h`, `main/aruco_stage.cpp` | `aruco-detector/main/main.cpp` (frame handler, family table) | modified |
+| `main/main.cpp` | `aruco-detector/main/main.cpp`, `yolo-detector/main/main.cpp` | modified (merged) |
+| `tests/marker_filter_test.cpp`, `tests/camera_model_test.cpp`, `tests/capture_time_test.cpp` | `aruco-detector/tests/` | unchanged |
+| `tests/vision_control_test.cpp` | `aruco-detector/tests/inference_control_test.cpp` | modified |
+
+### Components compiled into the binary (not in this repository)
+
+The build uses an `sscma-example-sg200x` checkout as an SDK (`SSCMA_ROOT`, pinned in
+`kits/recamera-b601dm/vision/sscma.lock`). Statically linked from it:
+
+| Component | License | Notice |
+|---|---|---|
+| `components/app_framework`, `debug_stream`, `rtsp_server`, `ha_mqtt`, `onvif_service`, `sophgo` | Apache-2.0 (repository license) | Copyright Seeed Technology Co., Ltd.; text in `LICENSE-APACHE` |
+| `components/sscma-micro` | Apache-2.0 (`components/sscma-micro/sscma-micro/LICENSE`) | Copyright Seeed Technology Co., Ltd.; text in `LICENSE-APACHE` |
+| `sscma-micro/3rdparty/eigen` (headers) | MPL-2.0 | unmodified upstream Eigen, source at https://gitlab.com/libeigen/eigen; MPL text at https://mozilla.org/MPL/2.0/ |
+| `components/json` (nlohmann/json) | MIT, Copyright (c) 2013-2022 Niels Lohmann | MIT text as for JMuxer above, with that copyright line |
+| `components/apriltag` (with `aruco/` dictionaries) | BSD-2-Clause | text below |
+| `libwebsockets` (built by `components/libwebsockets/fetch_and_build.sh`, linked statically) | MIT | https://github.com/warmcat/libwebsockets/blob/main/LICENSE |
+
+Linked dynamically against the device's copies and not shipped in the deb: Sophgo MPI /
+cviruntime / TPU SDK libraries (`/mnt/system/lib`, vendor license), mosquitto (EPL-2.0 /
+EDL-1.0, pulled in by `ha_mqtt`; MQTT is not used at runtime), OpenSSL / c-ares from the
+reCamera OS.
+
+YOLO model files (`.cvimodel`) are not in this repository or the deb. `rebot-vision` loads the
+model already on the device (see `kits/recamera-b601dm/vision/README.md`); Ultralytics YOLO
+weights are AGPL-3.0 unless another license applies to the converted file.
+
+AprilTag (`components/apriltag`):
+
+```text
+Copyright (C) 2013-2016, The Regents of The University of Michigan.
+All rights reserved.
+
+This software was developed in the APRIL Robotics Lab under the
+direction of Edwin Olson, ebolson@umich.edu. This software may be
+available under alternative licensing terms; contact the address above.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The views and conclusions contained in the software and documentation are those
+of the authors and should not be interpreted as representing official policies,
+either expressed or implied, of the Regents of The University of Michigan.
+```
+
 ## Rust crates
 
 The Rust dependencies are not vendored. Cargo downloads them from crates.io as listed in

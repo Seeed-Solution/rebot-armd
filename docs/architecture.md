@@ -87,7 +87,10 @@ differs from `rebot_dm()`.
 armd does not run inference. It proxies a detector's HTTP API under its own port so the
 cockpit and agents use one origin (`src/api/proxy.rs`, [detection_api.md](detection_api.md)).
 
-- Version: not versioned yet (v0 = the routes below, as of this document).
+- Version: the provider reports `"api_version"` in every `:8090` body; **1** is the API of the
+  kit's `rebot-vision` (modes, trigger in every mode, combined result). Providers without the
+  field (yolo-detector, aruco-detector) are version 0: the routes below without `/api/mode`.
+  armd publishes the provider's version as `capabilities.vision.api_version`.
 - Upstream: `ARMD_DETECTOR_URL` (default `http://127.0.0.1:8090`).
 
 | armd route | Upstream | Purpose |
@@ -95,14 +98,22 @@ cockpit and agents use one origin (`src/api/proxy.rs`, [detection_api.md](detect
 | `GET` / `POST /api/v1/detection/inference` | `/api/inference` | continuous inference on / off, rates |
 | `GET /api/v1/detection/latest` | `/api/results/latest?after=&wait_ms=` | latest result, long poll |
 | `POST /api/v1/detection/trigger` | `/api/trigger?wait_ms=` | one inference on a fresh frame, `enabled` unchanged |
+| `GET` / `POST /api/v1/vision/mode` | `/api/mode` | mode `off` / `yolo` / `aruco` / `both`, continuous on / off and the shared rate in one request (version 1) |
 | `GET /api/v1/detection/ws`, `/results` | `ws://127.0.0.1:8001/results` | detection stream (fixed address) |
 
 Status and body pass through; an unreachable upstream gives 502. Video is not proxied: the
 cockpit plays the camera's H.264 WebSocket stream (`ws://<host>:8001/`) directly. On the
 reCamera the provider is today the camera's `yolo-detector` (or `aruco-detector`) service,
-not part of the kit; phase 2 replaces it with the kit's `rebot-vision`
-([dev_flow_spec_vision_runtime.md](dev_flow_spec_vision_runtime.md)), which adds mode
-switching (`off | yolo | aruco | both`) and on-demand trigger in every mode.
+not part of the kit. The kit's own provider is `rebot-vision`
+(`kits/recamera-b601dm/vision/`, design in [dev_flow_spec_vision_runtime.md](dev_flow_spec_vision_runtime.md)),
+shipped in `rebot-teleop` 1.2.0: one process owns the camera, runs YOLO (TPU) and ArUco (CPU) on
+the same frame by mode, at one inference rate for every mode, and runs `/api/trigger` in every
+mode. Results always carry both `detections` and `markers`.
+
+armd uses the mode API itself: the grasp action switches to `yolo` (`both` when ArUco was on)
+with inference on for its duration and restores the previous mode and inference state after
+every outcome; providers without `/api/mode` (404) get the old inference on / off toggle. The
+cockpit's hand-eye calibration drawer switches to `aruco` (`both` when YOLO was on) while open.
 
 ### 3. Capability discovery
 
@@ -110,7 +121,8 @@ switching (`off | yolo | aruco | both`) and on-demand trigger in every mode.
 the cockpit and MCP clients can adapt without probing routes. Schemas from older armd versions
 have no `capabilities` object; it parses as all false, `version` 0.
 
-- Version: `capabilities.version`, currently **1** (`CAPABILITIES_VERSION`).
+- Version: `capabilities.version`, currently **2** (`CAPABILITIES_VERSION`). Version 2 added
+  the `vision.*` fields after `detection_proxy`.
 
 | Field | True when |
 |---|---|
@@ -122,11 +134,19 @@ have no `capabilities` object; it parses as all false, `version` 0.
 | `gravity_comp` | profile, URDF check and driver support the mode; equals `observation.gravity_comp.supported` |
 | `damiao_ranges` | the profile sets per-joint Damiao ranges (the startup check result is `observation.driver_range_check`) |
 | `vision.detection_proxy` | always true: the detection routes exist; reachability of the provider is not checked |
+| `vision.mode_endpoint` | (string) always `/api/v1/vision/mode` |
+| `vision.modes` | (list) modes the provider reports (`off`, `yolo`, `aruco`, `both`); empty when it is unreachable or has no `/api/mode` |
+| `vision.mode` | (string or null) the provider's current base mode |
+| `vision.api_version` | (number or null) the provider's perception API version |
+| `vision.trigger`, `vision.yolo_available` | (bool or null) trigger in every mode; YOLO model loaded |
+
+The `vision.modes` / `mode` / `api_version` / `trigger` / `yolo_available` values come from the
+provider's `GET /api/mode`: the schema handler uses the body of the last mode request proxied
+through armd, or asks the provider (500 ms timeout) when that is older than 2 s.
 
 Other parts of the schema already describe the arm: `dof`, `joint_names`, `limits`,
 `workspace`, `camera_mount`, `kinematics`. Per-observation state stays in the observation
-(`driver_capabilities`, `gravity_comp`, `driver_range_check`). Phase 2 adds vision modes to
-`capabilities.vision` (version 2).
+(`driver_capabilities`, `gravity_comp`, `driver_range_check`).
 
 ### 4. Packaging
 
@@ -137,12 +157,15 @@ A kit ships: the armd binary (unchanged core), its profile, optional sidecar pro
 - Version: not versioned in code; the layout below is version 1 of this document.
 - armd reads `PORT`, `RUST_LOG`, `ARMD_DETECTOR_URL`, `ARMD_GRASP_SETUP` from the environment.
 
-The official kit's package (`kits/recamera-b601dm/packaging/`, deb `rebot-teleop` 1.1.0):
+The official kit's package (`kits/recamera-b601dm/packaging/`, deb `rebot-teleop` 1.2.0):
 
 | Installed path | Source in the repository |
 |---|---|
 | `/usr/bin/armd`, symlink `/usr/local/bin/armd` | core build |
-| `/etc/init.d/K92rebot-teleop`, symlink `S92rebot-teleop` | `packaging/rootfs/etc/init.d/K92rebot-teleop` |
+| `/usr/bin/rebot-vision` | `kits/recamera-b601dm/vision/`, built by `scripts/build_vision.sh` |
+| `/etc/init.d/K92rebot-teleop` (postinst adds `S92rebot-teleop` only without the reCamera console) | `packaging/rootfs/etc/init.d/K92rebot-teleop` |
+| `/usr/share/rebot-teleop/rebot-vision-run` (respawn loop, nice 10), `vision.json.default` | `packaging/rootfs/usr/share/rebot-teleop/` |
+| `/usr/share/doc/rebot-teleop/` (`LICENSE`, `LICENSE-APACHE`, `THIRD_PARTY_NOTICES.md`) | repository root, `kits/recamera-b601dm/vision/LICENSE-APACHE` |
 | `/usr/share/rebot-teleop/index.html` | `src/api/index.html` |
 | `/usr/share/rebot-teleop/assets/reBot-DevArm_gripper.urdf` | `packaging/rootfs/usr/share/rebot-teleop/assets/` |
 | `/usr/share/rebot-teleop/profile/rebot-b601dm.json` | `kits/recamera-b601dm/profile/` |
@@ -162,7 +185,7 @@ kits/
   _template/                 template and README for third-party kits
   recamera-b601dm/           official reference kit
     profile/                 arm profile JSON
-    vision/                  phase 2: rebot-vision process (placeholder README now)
+    vision/                  rebot-vision process (C++, built against sscma-example-sg200x)
     packaging/               rebot-teleop deb sources
     hardware/                camera mount CAD, CERN-OHL-W-2.0 (own LICENSE)
     calibration/             camera tilt per mount, placeholder intrinsics, grasp setup defaults

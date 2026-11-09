@@ -191,8 +191,8 @@ copy it to the camera and install it. `192.168.42.1` is the reCamera's address o
 when connected to the access point that this package starts, the camera is `192.168.16.1`.
 
 ```bash
-scp dist/rebot-teleop_1.1.0_riscv64.deb root@192.168.42.1:/tmp/
-ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.1.0_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
+scp dist/rebot-teleop_1.2.0_riscv64.deb root@192.168.42.1:/tmp/
+ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.2.0_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
 ```
 
 The package installs:
@@ -200,7 +200,8 @@ The package installs:
 | Path | Content |
 |---|---|
 | `/usr/bin/armd` (symlink `/usr/local/bin/armd`) | the daemon |
-| `/etc/init.d/K92rebot-teleop` (symlink `S92rebot-teleop`) | init script: Wi-Fi, `can0` setup, start / stop |
+| `/usr/bin/rebot-vision` | camera process: H.264 video `:8001`, YOLO / ArUco API `:8090` ([kits/recamera-b601dm/vision](kits/recamera-b601dm/vision/)) |
+| `/etc/init.d/K92rebot-teleop` (`postinst` adds `S92rebot-teleop` only on devices without the reCamera console) | init script: Wi-Fi, `can0` setup, start / stop of armd and rebot-vision |
 | `/usr/share/rebot-teleop/` | cockpit `index.html`, URDF, app manifest `rebot-teleop.json` for the reCamera app list, arm profile `profile/rebot-b601dm.json` |
 | `/userdata/local/apps/rebot-teleop.json` | copied by `postinst` |
 
@@ -213,6 +214,14 @@ network. These values are read from `/userdata/local/apps/rebot-teleop.config.js
 `network.ap_ip`, `network.ap_band`, `network.ap_channel`, `network.sta_ssid`,
 `network.sta_password`). **Change the default access point password** before using the arm
 outside a lab. Logs go to `/var/log/rebot-teleop.log`.
+
+After armd the init script starts `rebot-vision` (nice 10, restarted with backoff by
+`/usr/share/rebot-teleop/rebot-vision-run`, log `/var/log/rebot-vision.log`). Before that it
+stops a camera app that is running (for example `yolo-detector` or `aruco-detector`) with that
+app's own init script; other apps are not disabled or removed. Activating another camera app in
+the reCamera console stops this app. Vision settings: `/userdata/rebot-teleop/vision.json`. The
+YOLO model is not in the package; the model already on the device is used (see the vision
+README). Without a model, YOLO modes are unavailable and ArUco works.
 
 The access point uses 5 GHz by default (`network.ap_band: "5g"`, channel 44, 802.11n/ac,
 20 MHz). Set `network.ap_band` to `"2g4"` for 2.4 GHz (channel 6). `network.ap_channel`
@@ -258,13 +267,21 @@ rustup target add riscv64gc-unknown-linux-musl
 git clone --depth 1 https://github.com/sophgo/host-tools
 export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 
-./scripts/build_deb.sh 1.1.0          # version argument optional (default: debian/control)
+RECAMERA_DOCKER=tpuc_recamera \
+./scripts/build_deb.sh 1.2.0          # version argument optional (default: debian/control)
 # -> target/riscv64gc-unknown-linux-musl/release/armd
-# -> dist/rebot-teleop_1.1.0_riscv64.deb
+# -> dist/rebot-teleop_1.2.0_riscv64.deb
 
 ./scripts/build_deb.sh --flavor lite  # armd only, no reCamera kit files
 # -> dist/armd-lite_0.1.0_riscv64.tar.gz (armd, LICENSE, THIRD_PARTY_NOTICES.md)
 ```
+
+`--flavor recamera` needs `rebot-vision`, a C++ program built against the SG2002 SDK:
+`RECAMERA_DOCKER=<container>` builds it with `scripts/build_vision.sh` in a running
+`sophgo/tpuc_dev` container that has the host-tools, the reCamera OS SDK and
+`sscma-example-sg200x` (at the commit in `kits/recamera-b601dm/vision/sscma.lock`) under
+`/recamera`; `REBOT_VISION_BIN=<path>` uses a prebuilt binary. Details:
+[kits/recamera-b601dm/vision/README.md](kits/recamera-b601dm/vision/README.md).
 
 `--flavor recamera` (the default) builds the reCamera runtime: armd plus the files of the
 [reCamera B601-DM kit](kits/recamera-b601dm/) (init script, gallery manifest, URDF; sources in

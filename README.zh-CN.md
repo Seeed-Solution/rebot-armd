@@ -146,8 +146,8 @@ TODO / 路线图：
 构建安装包（见 [交叉编译](#交叉编译到-recamera)）或使用发布的 `.deb`，复制到摄像头并安装。`192.168.42.1` 是 reCamera 的 USB 网络地址；连接本包启动的 Wi-Fi 热点时，摄像头地址为 `192.168.16.1`。
 
 ```bash
-scp dist/rebot-teleop_1.1.0_riscv64.deb root@192.168.42.1:/tmp/
-ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.1.0_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
+scp dist/rebot-teleop_1.2.0_riscv64.deb root@192.168.42.1:/tmp/
+ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.2.0_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
 ```
 
 安装内容：
@@ -155,11 +155,14 @@ ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.1.0_riscv64.deb && /etc/init.
 | 路径 | 内容 |
 |---|---|
 | `/usr/bin/armd`（软链接 `/usr/local/bin/armd`） | 守护进程 |
-| `/etc/init.d/K92rebot-teleop`（软链接 `S92rebot-teleop`） | init 脚本：Wi-Fi、`can0` 配置、启动 / 停止 |
+| `/usr/bin/rebot-vision` | 相机进程：H.264 视频 `:8001`、YOLO / ArUco 接口 `:8090`（[kits/recamera-b601dm/vision](kits/recamera-b601dm/vision/)） |
+| `/etc/init.d/K92rebot-teleop`（仅在没有 reCamera 控制台的设备上由 `postinst` 添加 `S92rebot-teleop`） | init 脚本：Wi-Fi、`can0` 配置、armd 与 rebot-vision 的启动 / 停止 |
 | `/usr/share/rebot-teleop/` | 驾驶舱 `index.html`、URDF、reCamera 应用列表用的应用清单 `rebot-teleop.json`、机械臂 profile `profile/rebot-b601dm.json` |
 | `/userdata/local/apps/rebot-teleop.json` | 由 `postinst` 复制 |
 
 init 脚本启动 `armd --follower rebot-dm --follower-port can0 --port 8765`（该文件存在时再加 `--config /usr/share/rebot-teleop/profile/rebot-b601dm.json`），把 `can0` 设为 1 Mbit/s，并在 `wlan1` 上启动 Wi-Fi 热点（SSID `reCamera-Arm-Teleop`，默认密码 `12345678`，地址 `192.168.16.1`），也可以连接已有的 Wi-Fi 网络。这些值从 `/userdata/local/apps/rebot-teleop.config.json` 读取（`arm.follower_model`、`arm.serial_port`、`port`、`network.ap_ssid`、`network.ap_password`、`network.ap_ip`、`network.ap_band`、`network.ap_channel`、`network.sta_ssid`、`network.sta_password`）。在实验室以外使用前，**请修改默认热点密码**。日志在 `/var/log/rebot-teleop.log`。
+
+armd 之后 init 脚本启动 `rebot-vision`（nice 10，由 `/usr/share/rebot-teleop/rebot-vision-run` 退避重启，日志 `/var/log/rebot-vision.log`）。启动前用其他相机应用自己的 init 脚本停止正在运行的相机应用（例如 `yolo-detector`、`aruco-detector`），不禁用、不卸载其他应用。在 reCamera 控制台启用其他相机应用会停止本应用。视觉配置：`/userdata/rebot-teleop/vision.json`。安装包不含 YOLO 模型，使用设备上已有的模型（见 vision README）；没有模型时 YOLO 模式不可用，ArUco 可用。
 
 热点默认使用 5 GHz（`network.ap_band: "5g"`，信道 44，802.11n/ac，20 MHz 带宽）。把 `network.ap_band` 设为 `"2g4"` 改用 2.4 GHz（信道 6）。`network.ap_channel` 指定信道，`0` 或不设置时使用默认信道。启动后若 hostapd 未在 5 GHz 信道上运行（用 `iw dev wlan1 info` 检查），init 脚本改用 2.4 GHz 信道 6 重新启动，并把回退记录到 syslog。
 
@@ -192,13 +195,16 @@ rustup target add riscv64gc-unknown-linux-musl
 git clone --depth 1 https://github.com/sophgo/host-tools
 export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 
-./scripts/build_deb.sh 1.1.0          # 版本参数可省略（默认取 debian/control）
+RECAMERA_DOCKER=tpuc_recamera \
+./scripts/build_deb.sh 1.2.0          # 版本参数可省略（默认取 debian/control）
 # -> target/riscv64gc-unknown-linux-musl/release/armd
-# -> dist/rebot-teleop_1.1.0_riscv64.deb
+# -> dist/rebot-teleop_1.2.0_riscv64.deb
 
 ./scripts/build_deb.sh --flavor lite  # 只含 armd，不含 reCamera 套件文件
 # -> dist/armd-lite_0.1.0_riscv64.tar.gz（armd、LICENSE、THIRD_PARTY_NOTICES.md）
 ```
+
+`--flavor recamera` 需要 `rebot-vision`（基于 SG2002 SDK 构建的 C++ 程序）：`RECAMERA_DOCKER=<容器名>` 在正在运行、且 `/recamera` 下有 host-tools、reCamera OS SDK 和 `sscma-example-sg200x`（`kits/recamera-b601dm/vision/sscma.lock` 中的提交）的 `sophgo/tpuc_dev` 容器里用 `scripts/build_vision.sh` 构建；`REBOT_VISION_BIN=<路径>` 使用预编译的二进制。详见 [kits/recamera-b601dm/vision/README.md](kits/recamera-b601dm/vision/README.md)。
 
 `--flavor recamera`（默认）构建 reCamera 运行时：armd 加上 [reCamera B601-DM 套件](kits/recamera-b601dm/)的文件（init 脚本、应用列表 manifest、URDF；源文件在 `kits/recamera-b601dm/packaging/`）。`--flavor lite` 构建最小运行时：同一个 `armd` 二进制打成 tarball，不含 init 脚本和套件文件（版本默认取 `Cargo.toml`）。
 

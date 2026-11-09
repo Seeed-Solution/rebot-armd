@@ -1,6 +1,6 @@
 # Spec: vision runtime in rebot-armd (`rebot-vision`)
 
-Status: design spec, not implemented. Date: 2026-11-09; layout updated the same day for the core/kit
+Status: implemented in rebot-teleop 1.2.0 with the deviations listed in `kits/recamera-b601dm/vision/README.md` (no holds, no `/api/model`; grasp and calibration set and restore the mode). Device measurements (section 8.2) are open. Date: 2026-11-09; layout updated the same day for the core/kit
 split ([docs/architecture.md](architecture.md)): the vision code is part of the official reCamera kit and
 lives in `kits/recamera-b601dm/vision/`, not in a top-level `kits/recamera-b601dm/vision/`.
 Inputs read: this repo at `e799c2a`, `sscma-example-sg200x` at `9af8118` (local branch `phase3-hw`),
