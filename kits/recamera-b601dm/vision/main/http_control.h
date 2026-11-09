@@ -1,5 +1,7 @@
-#ifndef _ARUCO_HTTP_CONTROL_H_
-#define _ARUCO_HTTP_CONTROL_H_
+// Modified from sscma-example-sg200x solutions/aruco-detector/main/http_control.{h,cpp}
+// (commit 9af8118, Apache-2.0): namespace rv, routes served by VisionControl.
+#ifndef REBOT_VISION_HTTP_CONTROL_H_
+#define REBOT_VISION_HTTP_CONTROL_H_
 
 #include <atomic>
 #include <memory>
@@ -8,9 +10,9 @@
 #include <thread>
 #include <vector>
 
-#include "inference_control.h"
+#include "vision_control.h"
 
-namespace aruco {
+namespace rv {
 
 /** True if a Content-Type header value is application/json (parameters allowed, case-insensitive). */
 bool is_json_content_type(const std::string& value);
@@ -38,7 +40,7 @@ public:
     static constexpr int kMaxClients = 8;
     static constexpr int kRequestDeadlineMs = 3000;  // headers + body, total
 
-    explicit HttpControlServer(InferenceControl& ctl) : ctl_(ctl) {}
+    explicit HttpControlServer(VisionControl& ctl) : ctl_(ctl) {}
     ~HttpControlServer();
 
     bool start(int port);
@@ -55,7 +57,7 @@ private:
     void handle_client(int fd);
     void clean_finished_clients();
 
-    InferenceControl& ctl_;
+    VisionControl& ctl_;
     int server_fd_ = -1;
     std::atomic<bool> running_{false};
     std::unique_ptr<std::thread> thread_;
@@ -63,6 +65,6 @@ private:
     std::vector<std::shared_ptr<ClientContext>> clients_;
 };
 
-}  // namespace aruco
+}  // namespace rv
 
-#endif  // _ARUCO_HTTP_CONTROL_H_
+#endif  // REBOT_VISION_HTTP_CONTROL_H_

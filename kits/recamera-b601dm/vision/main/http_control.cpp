@@ -1,3 +1,5 @@
+// Modified from sscma-example-sg200x solutions/aruco-detector/main/http_control.{h,cpp}
+// (commit 9af8118, Apache-2.0): namespace rv, routes served by VisionControl.
 #include "http_control.h"
 
 #include <arpa/inet.h>
@@ -29,9 +31,9 @@
 #define MSG_NOSIGNAL 0
 #endif
 
-#define TAG "aruco-http"
+#define TAG "rebot-vision-http"
 
-namespace aruco {
+namespace rv {
 
 static constexpr size_t kMaxRequestBytes = 8192;
 
@@ -324,4 +326,4 @@ void HttpControlServer::handle_client(int fd) {
     send_reply(fd, r);
 }
 
-}  // namespace aruco
+}  // namespace rv
