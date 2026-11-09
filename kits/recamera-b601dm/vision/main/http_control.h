@@ -19,8 +19,9 @@ bool is_json_content_type(const std::string& value);
 
 /**
  * Pre-routing guard. Returns 0 to continue, 415 for a POST without
- * Content-Type: application/json, 405 for any method other than GET/POST
+ * Content-Type: application/json, 405 for any method other than GET/POST/DELETE
  * (including OPTIONS: preflights are never approved, no CORS headers are sent).
+ * A cross-origin page cannot send DELETE without a preflight either.
  */
 int precheck_request(const std::string& method, const std::string& content_type);
 

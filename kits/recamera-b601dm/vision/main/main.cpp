@@ -135,8 +135,9 @@ void print_usage(const char* prog) {
     printf("Usage: %s [options]   (options override %s)\n", prog, g_cfg.config_path.c_str());
     printf("  --config PATH            JSON config file (keys as the long options, '_' for '-')\n");
     printf("  --mode off|yolo|aruco|both  Base mode at start [default: yolo]\n");
-    printf("  --inference on|off       Continuous inference at start [default: off = standby]\n");
-    printf("  --fps N                  Inference rate for every mode, 1..15 [default: 5]\n");
+    printf("  --inference on|off       Default subscription (the mode API) at start [default: off = standby]\n");
+    printf("  --fps N                  Inference rate of the default subscription and cap of every\n");
+    printf("                           subscription, 1..15 [default: 5]\n");
     printf("  -m, --model PATH         YOLO .cvimodel [default: first of /userdata/rebot-teleop/models/yolo11n.cvimodel,\n");
     printf("                           /usr/share/supervisor/models/..., /userdata/local/models/...]\n");
     printf("  -c, --conf-threshold F   YOLO confidence threshold [default: 0.25]\n");

@@ -1,9 +1,12 @@
 // Modified from sscma-example-sg200x solutions/aruco-detector/main/inference_control.cpp
-// (commit 9af8118, Apache-2.0): modes, one shared rate, combined result envelope.
+// (commit 9af8118, Apache-2.0): modes, per-request pipelines, subscriptions, combined result
+// envelope.
 #include "vision_control.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 
@@ -98,6 +101,8 @@ VisionControl::VisionControl(const Options& opt, OnChange on_change)
     latest_.mode = mode_;
     reported_proc_ = processing_locked();
     reported_gate_ = gate_locked();
+    gate_active_ = continuous_locked().active();
+    gate_fps_ = continuous_locked().fps;
     if (on_change_) on_change_(reported_proc_, reported_gate_);
 }
 
@@ -107,7 +112,47 @@ int VisionControl::camera_gate_fps(bool processing, bool trigger_pending, int fp
     return fps <= 7 ? 2 * fps : kOpenGateFps;
 }
 
+Continuous VisionControl::continuous_locked() const noexcept {
+    Continuous c;
+    if (continuous_ && mode_ != Mode::Off) {
+        c.pipelines = pipelines_of(mode_);
+        c.fps = fps_;
+    }
+    for (const Subscription& s : subs_) {
+        c.pipelines = c.pipelines | s.pipelines;
+        c.fps = std::max(c.fps, s.fps);
+        ++c.subscriptions;
+    }
+    c.fps = c.active() ? std::min(c.fps, fps_) : 0;
+    return c;
+}
+
+int VisionControl::fps_locked() const noexcept {
+    const Continuous c = continuous_locked();
+    if (c.active()) return c.fps;
+    return triggers_.empty() ? kIdleFps : fps_;
+}
+
+int VisionControl::gate_locked() const noexcept {
+    const Continuous c = continuous_locked();
+    return camera_gate_fps(c.active() || !triggers_.empty(), !triggers_.empty(), c.active() ? c.fps : fps_);
+}
+
+bool VisionControl::expire_locked(uint64_t now_ms) {
+    const size_t n = subs_.size();
+    subs_.erase(std::remove_if(subs_.begin(), subs_.end(), [&](const Subscription& s) { return s.expires_ms <= now_ms; }),
+                subs_.end());
+    return subs_.size() != n;
+}
+
 void VisionControl::notify_locked() {
+    // Continuous work starts, stops or changes rate: the next frame is processed.
+    const Continuous c = continuous_locked();
+    if (c.active() != gate_active_ || c.fps != gate_fps_) {
+        gate_.reset();
+        gate_active_ = c.active();
+        gate_fps_ = c.fps;
+    }
     const bool proc = processing_locked();
     const int gate = gate_locked();
     if (proc == reported_proc_ && gate == reported_gate_) return;
@@ -136,6 +181,11 @@ bool VisionControl::continuous_enabled() const {
     return continuous_;
 }
 
+Continuous VisionControl::continuous() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return continuous_locked();
+}
+
 bool VisionControl::processing() const {
     std::lock_guard<std::mutex> lk(mu_);
     return processing_locked();
@@ -152,13 +202,23 @@ int VisionControl::current_fps() const {
 }
 
 Pipelines VisionControl::frame_plan(uint64_t frame_ms) {
-    std::lock_guard<std::mutex> lk(mu_);
-    input_meter_.add(frame_ms);
-    if (continuous_ && mode_ != Mode::Off && gate_.accept(frame_ms, fps_)) return pipelines_of(mode_);
-    for (uint64_t req : triggers_) {
-        if (req <= frame_ms) return pipelines_of(mode_ != Mode::Off ? mode_ : last_active_);
+    bool expired = false;
+    Pipelines p;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        input_meter_.add(frame_ms);
+        if (expire_locked(frame_ms)) {
+            expired = true;
+            notify_locked();
+        }
+        const Continuous c = continuous_locked();
+        if (c.active() && gate_.accept(frame_ms, c.fps)) p = c.pipelines;
+        for (const Trigger& t : triggers_) {
+            if (t.request_ms <= frame_ms) p = p | t.pipelines;
+        }
     }
-    return {};
+    if (expired) cv_.notify_all();
+    return p;
 }
 
 double VisionControl::input_fps(uint64_t now_ms) const {
@@ -176,8 +236,6 @@ VisionControl::Status VisionControl::apply(const Mode* mode, const bool* enabled
     if (mode && pipelines_of(*mode).yolo && !yolo_available_) return Status::YoloUnavailable;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        const bool old_cont = continuous_ && mode_ != Mode::Off;
-        const int old_fps = fps_;
         if (fps) fps_ = *fps;
         if (mode) {
             mode_ = *mode;
@@ -188,8 +246,6 @@ VisionControl::Status VisionControl::apply(const Mode* mode, const bool* enabled
             if (*enabled && mode_ == Mode::Off) mode_ = last_active_;
             continuous_ = *enabled;
         }
-        // Continuous processing (re)starts, or a new rate: the next frame is processed.
-        if (old_cont != (continuous_ && mode_ != Mode::Off) || old_fps != fps_) gate_.reset();
         notify_locked();
     }
     cv_.notify_all();
@@ -202,10 +258,95 @@ bool VisionControl::set_enabled(bool on) {
     return was != on;
 }
 
-void VisionControl::trigger_begin(uint64_t request_ms) {
+VisionControl::Status VisionControl::subscribe(const std::string& client, const std::string& id, Pipelines p,
+                                               int fps, int ttl_ms, uint64_t now_ms, Subscription& out) {
+    if (fps != 0 && (fps < kMinFps || fps > kMaxFps)) return Status::BadFps;
+    if (p.yolo && !yolo_available_) return Status::YoloUnavailable;
+    ttl_ms = std::max(kMinTtlMs, std::min(kMaxTtlMs, ttl_ms));
     {
         std::lock_guard<std::mutex> lk(mu_);
-        triggers_.push_back(request_ms);
+        expire_locked(now_ms);
+        auto it = subs_.end();
+        if (!id.empty()) {
+            it = std::find_if(subs_.begin(), subs_.end(), [&](const Subscription& s) { return s.id == id; });
+        }
+        if (it == subs_.end()) {
+            it = std::find_if(subs_.begin(), subs_.end(), [&](const Subscription& s) { return s.client == client; });
+        }
+        if (it == subs_.end()) {
+            if (static_cast<int>(subs_.size()) >= kMaxSubscriptions) {
+                notify_locked();
+                return Status::Full;
+            }
+            Subscription s;
+            s.id = "s" + std::to_string(next_sub_id_++);
+            subs_.push_back(s);
+            it = subs_.end() - 1;
+        }
+        it->client = client;
+        it->pipelines = p;
+        it->fps = fps == 0 ? fps_ : fps;
+        it->ttl_ms = ttl_ms;
+        it->expires_ms = now_ms + static_cast<uint64_t>(ttl_ms);
+        out = *it;
+        notify_locked();
+    }
+    cv_.notify_all();
+    return Status::Ok;
+}
+
+VisionControl::Status VisionControl::keepalive(const std::string& id, uint64_t now_ms, Subscription& out) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (expire_locked(now_ms)) notify_locked();
+    for (Subscription& s : subs_) {
+        if (s.id == id) {
+            s.expires_ms = now_ms + static_cast<uint64_t>(s.ttl_ms);
+            out = s;
+            return Status::Ok;
+        }
+    }
+    return Status::NotFound;
+}
+
+bool VisionControl::unsubscribe(const std::string& id) {
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        const size_t n = subs_.size();
+        subs_.erase(std::remove_if(subs_.begin(), subs_.end(), [&](const Subscription& s) { return s.id == id; }),
+                    subs_.end());
+        found = subs_.size() != n;
+        notify_locked();
+    }
+    cv_.notify_all();
+    return found;
+}
+
+std::vector<Subscription> VisionControl::subscriptions(uint64_t now_ms) {
+    expire(now_ms);
+    std::lock_guard<std::mutex> lk(mu_);
+    return subs_;
+}
+
+void VisionControl::expire(uint64_t now_ms) {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        changed = expire_locked(now_ms);
+        if (changed) notify_locked();
+    }
+    if (changed) cv_.notify_all();
+}
+
+Pipelines VisionControl::default_trigger_pipelines() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return pipelines_of(mode_ != Mode::Off ? mode_ : last_active_);
+}
+
+void VisionControl::trigger_begin(uint64_t request_ms, Pipelines p) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        triggers_.push_back({request_ms, p});
         notify_locked();
     }
     cv_.notify_all();
@@ -215,7 +356,7 @@ void VisionControl::trigger_end(uint64_t request_ms) {
     {
         std::lock_guard<std::mutex> lk(mu_);
         for (auto it = triggers_.begin(); it != triggers_.end(); ++it) {
-            if (*it == request_ms) {
+            if (it->request_ms == request_ms) {
                 triggers_.erase(it);
                 break;
             }
@@ -234,11 +375,16 @@ void VisionControl::publish(const VisionResult& r) {
     cv_.notify_all();
 }
 
-bool VisionControl::wait_fresh(uint32_t after, uint64_t request_ms, int wait_ms, VisionResult& out) {
+bool VisionControl::wait_fresh(uint32_t after, uint64_t request_ms, Pipelines need, int wait_ms, VisionResult& out) {
     if (wait_ms < 0) wait_ms = 0;
     if (wait_ms > kMaxWaitMs) wait_ms = kMaxWaitMs;
     std::unique_lock<std::mutex> lk(mu_);
-    auto fresh = [&] { return latest_.frame_id > after && latest_.frame_ms >= request_ms; };
+    // A frame planned before this trigger was registered can be newer than request_ms but
+    // lack its pipelines; the next one has them.
+    auto fresh = [&] {
+        return latest_.frame_id > after && latest_.frame_ms >= request_ms &&
+               Pipelines{latest_.ran_yolo, latest_.ran_aruco}.covers(need);
+    };
     cv_.wait_for(lk, std::chrono::milliseconds(wait_ms), [&] { return fresh() || stopping_; });
     out = latest_;
     return !fresh();
@@ -285,6 +431,27 @@ static std::string inference_body(const VisionControl& ctl) {
     return s.str();
 }
 
+static nlohmann::json pipeline_list(Pipelines p) {
+    nlohmann::json a = nlohmann::json::array();
+    if (p.yolo) a.push_back("yolo");
+    if (p.aruco) a.push_back("aruco");
+    return a;
+}
+
+static nlohmann::json continuous_json(const Continuous& c) {
+    return {{"active", c.active()}, {"pipelines", pipeline_list(c.pipelines)}, {"fps", c.fps},
+            {"subscriptions", c.subscriptions}};
+}
+
+static nlohmann::json subscription_json(const Subscription& s, uint64_t now_ms, int cap) {
+    const long long left = static_cast<long long>(s.expires_ms) - static_cast<long long>(now_ms);
+    return {{"id", s.id},       {"client", s.client},
+            {"pipelines", pipeline_list(s.pipelines)},
+            {"fps", std::min(s.fps, cap)},
+            {"requested_fps", s.fps},
+            {"ttl_ms", s.ttl_ms}, {"expires_in_ms", left < 0 ? 0 : left}};
+}
+
 static std::string mode_body(const VisionControl& ctl) {
     const uint64_t now = mono_ms();
     const Mode m = ctl.mode();
@@ -304,6 +471,10 @@ static std::string mode_body(const VisionControl& ctl) {
         {"camera_fps", ctl.camera_fps()},
         {"measured", {{"input_fps", ctl.input_fps(now)}, {"result_fps", ctl.result_fps(now)}}},
         {"trigger", true},
+        {"per_request_pipelines", true},
+        {"subscriptions", true},
+        {"max_fps", ctl.active_fps()},
+        {"continuous", continuous_json(ctl.continuous())},
         {"available", {{"yolo", ctl.yolo_available()}, {"aruco", true}}},
         {"model", {{"name", ctl.model_name()}, {"path", ctl.model_path()}}},
         {"family", ctl.family()},
@@ -389,21 +560,67 @@ static HttpReply latest_reply(VisionControl& ctl, const std::string& query, uint
     return {200, s.str()};
 }
 
-static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, uint64_t now_ms) {
+static HttpReply yolo_unavailable_reply() {
+    nlohmann::json j = {{"api_version", kApiVersion}, {"error", "yolo unavailable"},
+                        {"detail", "the YOLO model did not load; aruco and off still work"}};
+    return {409, j.dump()};
+}
+
+/** Body as a JSON object; an empty or blank body is {}. False when it is not an object. */
+static bool body_object(const std::string& body, nlohmann::json& out) {
+    if (body.find_first_not_of(" \t\r\n") == std::string::npos) {
+        out = nlohmann::json::object();
+        return true;
+    }
+    out = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
+    return !out.is_discarded() && out.is_object();
+}
+
+/** "pipelines": a non-empty list of "yolo" / "aruco" (duplicates allowed). */
+static bool parse_pipelines(const nlohmann::json& v, Pipelines& out) {
+    if (!v.is_array() || v.empty()) return false;
+    Pipelines p;
+    for (const auto& x : v) {
+        if (!x.is_string()) return false;
+        const std::string s = x.get<std::string>();
+        if (s == "yolo") p.yolo = true;
+        else if (s == "aruco") p.aruco = true;
+        else return false;
+    }
+    out = p;
+    return true;
+}
+
+static const char* kPipelinesError = "\"pipelines\" must be a non-empty list of \"yolo\", \"aruco\"";
+
+static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, const std::string& body,
+                               uint64_t now_ms) {
     int wait_ms = 2500;  // aruco-detector default for the single shot
     if (!wait_ms_param(query, wait_ms)) return {400, error_body("wait_ms must be a non-negative integer")};
+    nlohmann::json j;
+    if (!body_object(body, j)) return {400, error_body("body must be a JSON object")};
+    if (auto it = j.find("wait_ms"); it != j.end()) {
+        if (!it->is_number_unsigned()) return {400, error_body("wait_ms must be a non-negative integer")};
+        wait_ms = static_cast<int>(std::min<uint64_t>(it->get<uint64_t>(), VisionControl::kMaxWaitMs));
+    }
+    Pipelines want = ctl.default_trigger_pipelines();
+    if (auto it = j.find("pipelines"); it != j.end()) {
+        if (!parse_pipelines(*it, want)) return {400, error_body(kPipelinesError)};
+        if (want.yolo && !ctl.yolo_available()) return yolo_unavailable_reply();
+    }
 
     VisionResult current;
     ctl.latest(false, 0, 0, current);
     const uint32_t baseline = current.frame_id;
 
-    // Served by the first frame newer than this request; the camera gate opens meanwhile.
+    // Served by the first frame newer than this request, with the requested pipelines added
+    // to that frame; the camera gate opens meanwhile.
     const uint64_t request_ms = mono_ms();
     VisionResult r;
     bool timeout = false;
     {
-        auto scope = ctl.trigger_scope(request_ms);
-        timeout = ctl.wait_fresh(baseline, request_ms, wait_ms, r);
+        auto scope = ctl.trigger_scope(request_ms, want);
+        timeout = ctl.wait_fresh(baseline, request_ms, want, wait_ms, r);
     }
     std::ostringstream s;
     s << "{\"api_version\":" << kApiVersion;
@@ -411,7 +628,7 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, uin
         s << ",\"success\":false,\"timeout\":true,\"count\":0,\"detections\":[],\"markers\":[]}";
         return {200, s.str()};
     }
-    s << ",\"success\":true";
+    s << ",\"success\":true,\"requested\":" << pipeline_list(want).dump();
     put_result(s, r, ctl.family(), now_ms);
     s << "}";
     return {200, s.str()};
@@ -421,11 +638,9 @@ static HttpReply status_reply(VisionControl::Status st, const std::string& ok_bo
     switch (st) {
         case VisionControl::Status::BadFps:
             return {400, error_body("fps must be an integer in 1..15")};
-        case VisionControl::Status::YoloUnavailable: {
-            nlohmann::json j = {{"api_version", kApiVersion}, {"error", "yolo unavailable"},
-                                {"detail", "the YOLO model did not load; aruco and off still work"}};
-            return {409, j.dump()};
-        }
+        case VisionControl::Status::YoloUnavailable: return yolo_unavailable_reply();
+        case VisionControl::Status::Full: return {503, error_body("too many subscriptions")};
+        case VisionControl::Status::NotFound: return {404, error_body("no such subscription")};
         default: return {200, ok_body};
     }
 }
@@ -459,6 +674,58 @@ static HttpReply post_mode(VisionControl& ctl, const std::string& body) {
     return status_reply(st, st == VisionControl::Status::Ok ? mode_body(ctl) : "");
 }
 
+static std::string subscription_body(VisionControl& ctl, const Subscription& s, uint64_t mono) {
+    nlohmann::json j = subscription_json(s, mono, ctl.active_fps());
+    j["api_version"] = kApiVersion;
+    j["continuous"] = continuous_json(ctl.continuous());
+    return j.dump();
+}
+
+static HttpReply post_subscribe(VisionControl& ctl, const std::string& body, uint64_t mono) {
+    nlohmann::json j;
+    if (!body_object(body, j)) return {400, error_body("body must be a JSON object")};
+    const auto c = j.find("client");
+    if (c == j.end() || !c->is_string() || c->get<std::string>().empty() || c->get<std::string>().size() > 64)
+        return {400, error_body("\"client\" must be a string of 1..64 characters")};
+    Pipelines p;
+    const auto pl = j.find("pipelines");
+    if (pl == j.end() || !parse_pipelines(*pl, p)) return {400, error_body(kPipelinesError)};
+    int fps = 0;
+    if (auto it = j.find("fps"); it != j.end()) {
+        if (!it->is_number_integer()) return {400, error_body("fps must be an integer in 1..15")};
+        fps = it->get<int>();
+        if (fps == 0) return {400, error_body("fps must be an integer in 1..15")};
+    }
+    int ttl = VisionControl::kDefaultTtlMs;
+    if (auto it = j.find("ttl_ms"); it != j.end()) {
+        if (!it->is_number_unsigned()) return {400, error_body("ttl_ms must be a positive integer")};
+        ttl = static_cast<int>(std::min<uint64_t>(it->get<uint64_t>(), VisionControl::kMaxTtlMs));
+    }
+    std::string id;
+    if (auto it = j.find("id"); it != j.end()) {
+        if (!it->is_string()) return {400, error_body("\"id\" must be a string")};
+        id = it->get<std::string>();
+    }
+    Subscription s;
+    const VisionControl::Status st = ctl.subscribe(c->get<std::string>(), id, p, fps, ttl, mono, s);
+    return status_reply(st, st == VisionControl::Status::Ok ? subscription_body(ctl, s, mono) : "");
+}
+
+static std::string subscriptions_body(VisionControl& ctl, uint64_t mono) {
+    nlohmann::json list = nlohmann::json::array();
+    for (const Subscription& s : ctl.subscriptions(mono)) list.push_back(subscription_json(s, mono, ctl.active_fps()));
+    const Mode m = ctl.mode();
+    nlohmann::json j = {
+        {"api_version", kApiVersion},
+        {"subscriptions", list},
+        {"default", {{"mode", mode_name(m)}, {"enabled", ctl.continuous_enabled()}, {"fps", ctl.active_fps()}}},
+        {"continuous", continuous_json(ctl.continuous())},
+        {"max_fps", ctl.active_fps()},
+        {"max_subscriptions", VisionControl::kMaxSubscriptions},
+    };
+    return j.dump();
+}
+
 HttpReply handle_control_request(VisionControl& ctl, const std::string& method, const std::string& target,
                                  const std::string& body, uint64_t now_ms) {
     const size_t q = target.find('?');
@@ -481,7 +748,29 @@ HttpReply handle_control_request(VisionControl& ctl, const std::string& method, 
     } else if (path == "/api/results/latest" && method == "GET") {
         return latest_reply(ctl, query, now_ms);
     } else if (path == "/api/trigger" && method == "POST") {
-        return trigger_reply(ctl, query, now_ms);
+        return trigger_reply(ctl, query, body, now_ms);
+    } else if (path == "/api/subscriptions" && method == "GET") {
+        return {200, subscriptions_body(ctl, mono_ms())};
+    } else if (path == "/api/subscribe" && method == "POST") {
+        return post_subscribe(ctl, body, mono_ms());
+    } else if (path.rfind("/api/subscribe/", 0) == 0) {
+        std::string id = path.substr(std::strlen("/api/subscribe/"));
+        const std::string ka = "/keepalive";
+        const bool keep = id.size() > ka.size() && id.compare(id.size() - ka.size(), ka.size(), ka) == 0;
+        if (keep) id.resize(id.size() - ka.size());
+        if (id.empty() || id.find('/') != std::string::npos) return {404, error_body("not found")};
+        const uint64_t mono = mono_ms();
+        if (keep && method == "POST") {
+            Subscription s;
+            const VisionControl::Status st = ctl.keepalive(id, mono, s);
+            return status_reply(st, st == VisionControl::Status::Ok ? subscription_body(ctl, s, mono) : "");
+        }
+        if (!keep && method == "DELETE") {
+            if (!ctl.unsubscribe(id)) return {404, error_body("no such subscription")};
+            nlohmann::json j = {{"api_version", kApiVersion}, {"deleted", id},
+                                {"continuous", continuous_json(ctl.continuous())}};
+            return {200, j.dump()};
+        }
     }
     return {404, error_body("not found")};
 }

@@ -4,15 +4,25 @@ The reCamera kit's camera process (C++, SG2002). One process owns the camera and
 
 - H.264 video over WebSocket on `:8001` (`/`; each binary message is one access unit followed by
   an 8-byte little-endian Unix-ms timestamp), the overlay stream `/results` and `/snapshot.jpg`;
-- the perception provider API on `:8090` (`/api/inference`, `/api/results/latest`,
-  `/api/trigger`, `/api/mode`), which armd proxies under `/api/v1/detection/*` and
-  `/api/v1/vision/mode`. API and result shapes: [docs/detection_api.md](../../../docs/detection_api.md).
+- the perception provider API v2 on `:8090` (`/api/inference`, `/api/results/latest`,
+  `/api/trigger`, `/api/mode`, `/api/subscribe`, `/api/subscriptions`), which armd proxies under
+  `/api/v1/detection/*` and `/api/v1/vision/*`. API and result shapes:
+  [docs/detection_api.md](../../../docs/detection_api.md).
 
-Modes `off` / `yolo` / `aruco` / `both`, switched at runtime without restarting the process. YOLO
-runs on the TPU on the 640x640 inference frame; ArUco runs on the CPU on a zero-copy crop of the
-visible 640x360 band of the same frame. All modes share one inference rate (`fps`, 1..15). With
-continuous inference off the inference channel stands by at 1 fps and `POST /api/trigger` runs the
-current mode once.
+Vision runs on demand per caller. YOLO runs on the TPU on the 640x640 inference frame; ArUco runs
+on the CPU on a zero-copy crop of the visible 640x360 band of the same frame.
+
+- Standby: with no subscription nothing is inferred; the inference channel's camera gate is at
+  1 fps, the H.264 stream and the snapshot keep running.
+- `POST /api/trigger {"pipelines": ["yolo"] | ["aruco"] | ["yolo", "aruco"]}` runs those pipelines on
+  the first frame after the request. Without `pipelines` it runs the default subscription's mode
+  (the last active mode when that is `off`), as in API v1.
+- `POST /api/subscribe {"client", "pipelines", "fps"?, "ttl_ms"?}` starts continuous inference for one
+  caller until it is deleted or not kept alive for `ttl_ms` (default 3000). What runs is the union of
+  the active subscriptions' pipelines at the highest requested rate, capped at the configured `fps`
+  (`vision.json`, default 5, 1..15).
+- `/api/mode` (modes `off` / `yolo` / `aruco` / `both`) sets the default subscription, which never
+  expires; it joins the union like any other subscription.
 
 ## Frame rate and triggers
 
@@ -21,14 +31,17 @@ current mode once.
   `setGrpChn`); a runtime rate change only reaches the camera callback's software gate
   (`ma_camera_sg200x.cpp` `vpssCallback`). 1.2.0 started CH0 at `vision.json` `fps` (5), so
   `fps` 10 and 15 still gave about 5 results/s.
-- The camera gate bounds the CPU copies of CH0 frames: 1 fps in standby, twice `fps` up to 7 fps,
+- The camera gate bounds the CPU copies of CH0 frames: 1 fps in standby, twice the continuous rate
+  up to 7 fps,
   every frame above that, every frame while a trigger waits (`VisionControl::camera_gate_fps`).
   The gate passes a frame once 90 % of its period has passed since the last one, so it is not
-  used to set the rate: `RateGate` picks `fps` frames per second by due time, which holds the
-  rate under arrival jitter.
+  used to set the rate: `RateGate` picks the continuous rate's frames by due time, which holds the
+  rate under arrival jitter. It restarts when continuous work starts or its rate changes.
+- Expired subscriptions are dropped by the frame thread (on the next CH0 frame, at most about 1 s
+  late in standby) and by every subscription request.
 - Results per second = `min(fps, 15, 1000 / pipeline ms)`. `GET /api/mode` reports
   `measured.input_fps` (CH0 frames reaching rebot-vision) and `measured.result_fps`.
-- A trigger opens the gate at once (the gate rate is written to the camera directly, because the
+- A trigger opens the gate at once and its pipelines are added to that frame's continuous ones (the gate rate is written to the camera directly, because the
   frame thread is blocked in `retrieveFrame` until the old gate passes a frame) and is served by the
   first frame that arrives after the request: one CH0 frame (up to 67 ms) plus the pipelines.
 - With the forked `cv181x_vpss.ko` (online frame-rate control) the ISP runs at the fastest
@@ -153,12 +166,14 @@ answer 409 and ArUco works.
 
 ## Differences from the spec
 
-- No holds (`/api/mode/hold`): the grasp and the calibration drawer set the mode and restore the
-  previous one afterwards (user decision).
+- No holds (`/api/mode/hold`). From 1.3.0 callers no longer switch and restore the mode: the grasp
+  triggers `["yolo"]` per centring step, the cockpit overlay and the calibration drawer hold their
+  own subscriptions (user decision; with one global mode the caller that restored last won).
 - No `/api/model` runtime model switch; the model is chosen in `vision.json` and loaded at start.
 - The base mode is not written back to `vision.json`; after a restart the mode comes from
   `vision.json` (`mode`, default `yolo`) in standby.
 - No `vision` group in the console `config_schema` (the console restarts the whole app, armd
-  included, on a config change); mode and rate are set in the cockpit or over the API.
+  included, on a config change); the rate cap is set over the API (`POST /api/mode {"fps"}`) or in
+  `vision.json`.
 - Default rate 5 fps, from the device measurements under "Frame rate and triggers" (both @ 5:
   58 % whole-chip CPU; @ 10 or 15: 75 % for 7.2 results/s).

@@ -1,6 +1,7 @@
 // Modified from sscma-example-sg200x solutions/aruco-detector/main/inference_control.h
-// (commit 9af8118, Apache-2.0): vision modes (off / yolo / aruco / both), one shared
-// inference rate, and one result envelope with detections and markers.
+// (commit 9af8118, Apache-2.0): vision modes (off / yolo / aruco / both), per-request
+// pipelines, subscriptions for continuous inference, and one result envelope with detections
+// and markers.
 #ifndef REBOT_VISION_CONTROL_H_
 #define REBOT_VISION_CONTROL_H_
 
@@ -14,7 +15,7 @@
 namespace rv {
 
 /** Perception provider API version, reported as "api_version" in every :8090 body. */
-constexpr int kApiVersion = 1;
+constexpr int kApiVersion = 2;
 
 enum class Mode : uint8_t { Off, Yolo, Aruco, Both };
 
@@ -23,6 +24,30 @@ struct Pipelines {
     bool aruco = false;
     bool any() const noexcept { return yolo || aruco; }
     bool operator==(const Pipelines& o) const noexcept { return yolo == o.yolo && aruco == o.aruco; }
+    Pipelines operator|(const Pipelines& o) const noexcept { return {yolo || o.yolo, aruco || o.aruco}; }
+    /** Every pipeline of `o` is in this set. */
+    bool covers(const Pipelines& o) const noexcept { return (yolo || !o.yolo) && (aruco || !o.aruco); }
+};
+
+/**
+ * A caller's continuous inference: these pipelines at `fps` (clamped to the configured rate)
+ * until `expires_ms` (mono_ms()); refreshed by a keep-alive or by subscribing again.
+ */
+struct Subscription {
+    std::string id;
+    std::string client;
+    Pipelines pipelines;
+    int fps = 0;  ///< requested rate; runs at min(fps, configured rate)
+    int ttl_ms = 3000;
+    uint64_t expires_ms = 0;
+};
+
+/** What runs continuously: the union of the active subscriptions (and the default one). */
+struct Continuous {
+    Pipelines pipelines;
+    int fps = 0;  ///< max requested rate, clamped to the configured rate; 0 when nothing runs
+    int subscriptions = 0;  ///< active subscriptions, the default one not counted
+    bool active() const noexcept { return pipelines.any(); }
 };
 
 Pipelines pipelines_of(Mode m) noexcept;
@@ -91,6 +116,10 @@ public:
     static constexpr int kMaxFps = 15;
     /** Camera gate rate that passes every frame of a channel at up to kMaxFps (see camera_gate_fps). */
     static constexpr int kOpenGateFps = 30;
+    static constexpr int kMaxSubscriptions = 16;
+    static constexpr int kDefaultTtlMs = 3000;
+    static constexpr int kMinTtlMs = 500;
+    static constexpr int kMaxTtlMs = 60000;
 
     /**
      * Rate for the camera callback's frame gate (sscma-micro ma_camera_sg200x.cpp
@@ -117,11 +146,13 @@ public:
         std::string family = "aruco4x4_50";
     };
 
-    enum class Status { Ok, BadFps, YoloUnavailable };
+    enum class Status { Ok, BadFps, YoloUnavailable, Full, NotFound };
 
     class TriggerScope {
     public:
-        TriggerScope(VisionControl& c, uint64_t request_ms) : c_(&c), req_(request_ms) { c_->trigger_begin(req_); }
+        TriggerScope(VisionControl& c, uint64_t request_ms, Pipelines p) : c_(&c), req_(request_ms) {
+            c_->trigger_begin(req_, p);
+        }
         ~TriggerScope() { release(); }
         TriggerScope(const TriggerScope&) = delete;
         TriggerScope& operator=(const TriggerScope&) = delete;
@@ -141,10 +172,14 @@ public:
 
     Mode mode() const;
     Mode last_active_mode() const;
+    /** The default subscription (the mode API's `enabled`): never expires. */
     bool continuous_enabled() const;
+    /** Union of the active subscriptions and the default one. */
+    Continuous continuous() const;
     /** Pipelines run on frames (continuous, or a pending trigger). */
     bool processing() const;
     bool enabled() const { return processing(); }
+    /** Configured rate: the default subscription's rate and the cap of every subscription. */
     int active_fps() const;
     int current_fps() const;
     bool yolo_available() const noexcept { return yolo_available_; }
@@ -157,8 +192,9 @@ public:
 
     /**
      * Frame thread, once per frame: the pipelines to run on it (empty: skip). frame_ms is a
-     * mono_ms() the frame is known to be newer than. Runs continuous processing at the
-     * active rate (RateGate) and every trigger requested at or before frame_ms.
+     * mono_ms() the frame is known to be newer than. Drops subscriptions expired by frame_ms,
+     * runs the continuous pipelines at their rate (RateGate) and adds the pipelines of every
+     * trigger requested at or before frame_ms.
      */
     Pipelines frame_plan(uint64_t frame_ms);
 
@@ -174,27 +210,50 @@ public:
     Status set_mode(Mode m) { return apply(&m, nullptr, nullptr); }
     bool set_enabled(bool on);
 
-    void trigger_begin(uint64_t request_ms);
+    /**
+     * Add or refresh a subscription. The one with the same `id`, else the same `client`, is
+     * updated in place (same id); otherwise a new one is created. fps 0 = the configured rate.
+     */
+    Status subscribe(const std::string& client, const std::string& id, Pipelines p, int fps, int ttl_ms,
+                     uint64_t now_ms, Subscription& out);
+    Status keepalive(const std::string& id, uint64_t now_ms, Subscription& out);
+    bool unsubscribe(const std::string& id);
+    /** Active subscriptions (expired ones are dropped first). */
+    std::vector<Subscription> subscriptions(uint64_t now_ms);
+    /** Drop subscriptions expired at now_ms. */
+    void expire(uint64_t now_ms);
+
+    /** A trigger without pipelines: the default subscription's, else the last active mode's. */
+    Pipelines default_trigger_pipelines() const;
+    void trigger_begin(uint64_t request_ms, Pipelines p);
     void trigger_end(uint64_t request_ms);
-    TriggerScope trigger_scope(uint64_t request_ms) { return TriggerScope(*this, request_ms); }
+    TriggerScope trigger_scope(uint64_t request_ms, Pipelines p) { return TriggerScope(*this, request_ms, p); }
+    TriggerScope trigger_scope(uint64_t request_ms) { return TriggerScope(*this, request_ms, default_trigger_pipelines()); }
 
     void publish(const VisionResult& r);
     /** As aruco-detector: returns true when no result exists or the wait was not satisfied. */
     bool latest(bool has_after, uint32_t after, int wait_ms, VisionResult& out);
     /**
-     * Wait for a result newer than `after` from a frame newer than request_ms (a trigger's
-     * result). Returns true on timeout.
+     * Wait for a result newer than `after` from a frame newer than request_ms that ran at least
+     * `need` (a trigger's result). Returns true on timeout.
      */
-    bool wait_fresh(uint32_t after, uint64_t request_ms, int wait_ms, VisionResult& out);
+    bool wait_fresh(uint32_t after, uint64_t request_ms, Pipelines need, int wait_ms, VisionResult& out);
     void shutdown();
 
 private:
-    bool processing_locked() const noexcept {
-        return (continuous_ && mode_ != Mode::Off) || !triggers_.empty();
-    }
-    int fps_locked() const noexcept { return processing_locked() ? fps_ : kIdleFps; }
-    int gate_locked() const noexcept { return camera_gate_fps(processing_locked(), !triggers_.empty(), fps_); }
-    /** Report a processing / gate change to on_change_ (called with mu_ held). */
+    struct Trigger {
+        uint64_t request_ms;
+        Pipelines pipelines;
+    };
+    Continuous continuous_locked() const noexcept;
+    bool processing_locked() const noexcept { return continuous_locked().active() || !triggers_.empty(); }
+    int fps_locked() const noexcept;
+    int gate_locked() const noexcept;
+    bool expire_locked(uint64_t now_ms);
+    /**
+     * Report a processing / gate change to on_change_, and restart the rate gate when the
+     * continuous work starts or changes rate (called with mu_ held).
+     */
     void notify_locked();
 
     const bool yolo_available_;
@@ -208,9 +267,13 @@ private:
     Mode last_active_ = Mode::Yolo;
     bool continuous_ = false;
     int fps_ = 5;
-    std::vector<uint64_t> triggers_;  ///< request times of the pending triggers
+    std::vector<Trigger> triggers_;  ///< pending triggers
+    std::vector<Subscription> subs_;
+    uint64_t next_sub_id_ = 1;
     bool reported_proc_ = false;
     int reported_gate_ = 0;
+    bool gate_active_ = false;  ///< continuous work the rate gate was started for
+    int gate_fps_ = 0;
     RateGate gate_;
     RateMeter input_meter_;
     RateMeter result_meter_;
@@ -228,7 +291,9 @@ struct HttpReply {
  *   GET  /api/inference                 POST /api/inference {"enabled": bool}
  *   GET  /api/mode                      POST /api/mode {"mode"?, "enabled"?, "fps"?}
  *   GET  /api/results/latest[?after=<frame_id>&wait_ms=<0..5000>]
- *   POST /api/trigger[?wait_ms=<0..5000>]
+ *   POST /api/trigger[?wait_ms=<0..5000>] {"pipelines"?: ["yolo"|"aruco", ...], "wait_ms"?}
+ *   POST /api/subscribe {"client", "pipelines", "fps"?, "ttl_ms"?, "id"?}
+ *   POST /api/subscribe/<id>/keepalive  DELETE /api/subscribe/<id>  GET /api/subscriptions
  */
 HttpReply handle_control_request(VisionControl& ctl, const std::string& method, const std::string& target,
                                  const std::string& body, uint64_t now_ms = 0);

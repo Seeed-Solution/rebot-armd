@@ -1,5 +1,5 @@
 // Modified from sscma-example-sg200x solutions/aruco-detector/tests/inference_control_test.cpp
-// (commit 9af8118, Apache-2.0): modes, shared rate, trigger in every mode, combined envelope.
+// (commit 9af8118, Apache-2.0): modes, subscriptions, per-request pipelines, combined envelope.
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -323,7 +323,7 @@ static void test_trigger_gate_and_freshness() {
     old.frame_ms = 100;
     c.publish(old);
     VisionResult out;
-    CHECK(c.wait_fresh(0, 200, 30, out));  // timeout
+    CHECK(c.wait_fresh(0, 200, Pipelines{}, 30, out));  // timeout
     std::thread th([&] {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         VisionResult r;
@@ -331,7 +331,7 @@ static void test_trigger_gate_and_freshness() {
         r.frame_ms = 250;
         c.publish(r);
     });
-    CHECK(!c.wait_fresh(0, 200, 2000, out) && out.frame_id == 2);
+    CHECK(!c.wait_fresh(0, 200, Pipelines{}, 2000, out) && out.frame_id == 2);
     th.join();
 
     // Continuous at 1 fps: the rate gate would skip the next frame, a trigger runs it anyway.
@@ -436,6 +436,216 @@ static void test_result_json() {
     CHECK(extra["markers"].empty());
 }
 
+static std::string sub_body(const std::string& client, const std::string& pipes, int fps = 0, int ttl = 0) {
+    std::string b = "{\"client\":\"" + client + "\",\"pipelines\":" + pipes;
+    if (fps) b += ",\"fps\":" + std::to_string(fps);
+    if (ttl) b += ",\"ttl_ms\":" + std::to_string(ttl);
+    return b + "}";
+}
+
+static void test_standby() {
+    Calls calls;
+    VisionControl c(opts(Mode::Yolo, false, 5), calls.fn());
+    CHECK(!c.processing() && c.camera_fps() == VisionControl::kIdleFps && c.current_fps() == VisionControl::kIdleFps);
+    CHECK(!c.continuous().active() && c.continuous().fps == 0);
+    for (uint64_t t = 1000; t < 3000; t += 67) CHECK(!c.frame_plan(t).any());
+    json l = req(c, "GET", "/api/subscriptions");
+    CHECK(l["api_version"] == 2 && l["subscriptions"].empty() && l["continuous"]["active"] == false);
+    CHECK(l["default"]["mode"] == "yolo" && l["default"]["enabled"] == false && l["max_fps"] == 5);
+    json m = req(c, "GET", "/api/mode");
+    CHECK(m["per_request_pipelines"] == true && m["subscriptions"] == true && m["continuous"]["active"] == false);
+    CHECK(m["max_fps"] == 5 && m["processing"] == false && m["fps"] == 1);
+    CHECK(calls.v.size() == 1 && calls.v[0] == std::make_pair(false, 1));
+}
+
+static void test_subscription_union() {
+    Calls calls;
+    VisionControl c(opts(Mode::Yolo, false, 5), calls.fn());
+    int st = 0;
+    json a = req(c, "POST", "/api/subscribe", sub_body("overlay", R"(["yolo"])", 2), &st);
+    CHECK(st == 200 && a["api_version"] == 2 && a["id"].is_string() && a["pipelines"] == json({"yolo"}) && a["fps"] == 2);
+    CHECK(a["ttl_ms"] == VisionControl::kDefaultTtlMs && a["continuous"]["pipelines"] == json({"yolo"}));
+    CHECK(c.processing() && calls.v.back() == std::make_pair(true, 4));  // gate at twice the rate
+    json b = req(c, "POST", "/api/subscribe", sub_body("calib", R"(["aruco"])", 4), &st);
+    CHECK(st == 200 && b["id"] != a["id"]);
+    Continuous k = c.continuous();
+    CHECK(k.pipelines == (Pipelines{true, true}) && k.fps == 4 && k.subscriptions == 2);
+    CHECK(b["continuous"]["pipelines"] == json({"yolo", "aruco"}) && b["continuous"]["fps"] == 4);
+    CHECK(c.frame_plan(mono_ms()) == (Pipelines{true, true}));
+    // a faster request is clamped to the configured rate (the cap)
+    json f = req(c, "POST", "/api/subscribe", sub_body("fast", R"(["yolo"])", 12), &st);
+    CHECK(st == 200 && f["fps"] == 5 && f["requested_fps"] == 12 && c.continuous().fps == 5);
+    CHECK(calls.v.back() == std::make_pair(true, 10));
+    json l = req(c, "GET", "/api/subscriptions");
+    CHECK(l["subscriptions"].size() == 3 && l["continuous"]["subscriptions"] == 3);
+    // re-posting with the same client updates in place (same id)
+    json a2 = req(c, "POST", "/api/subscribe", sub_body("overlay", R"(["yolo","aruco"])", 3), &st);
+    CHECK(st == 200 && a2["id"] == a["id"] && a2["pipelines"] == json({"yolo", "aruco"}));
+    CHECK(req(c, "GET", "/api/subscriptions")["subscriptions"].size() == 3);
+    // delete: the union shrinks, the rate follows
+    json d = req(c, "DELETE", "/api/subscribe/" + f["id"].get<std::string>(), "", &st);
+    CHECK(st == 200 && d["deleted"] == f["id"] && d["continuous"]["fps"] == 4);
+    req(c, "DELETE", "/api/subscribe/" + f["id"].get<std::string>(), "", &st);
+    CHECK(st == 404);
+    req(c, "DELETE", "/api/subscribe/" + a["id"].get<std::string>(), "", &st);
+    req(c, "DELETE", "/api/subscribe/" + b["id"].get<std::string>(), "", &st);
+    CHECK(st == 200 && !c.processing() && calls.v.back() == std::make_pair(false, 1));
+    // the configured rate is the cap: lowering it slows every subscription
+    req(c, "POST", "/api/subscribe", sub_body("overlay", R"(["aruco"])", 5), &st);
+    req(c, "POST", "/api/mode", R"({"fps":2})", &st);
+    CHECK(st == 200 && c.continuous().fps == 2);
+
+    // errors
+    req(c, "POST", "/api/subscribe", R"({"pipelines":["yolo"]})", &st);
+    CHECK(st == 400);
+    req(c, "POST", "/api/subscribe", R"({"client":"x","pipelines":[]})", &st);
+    CHECK(st == 400);
+    req(c, "POST", "/api/subscribe", R"({"client":"x","pipelines":["video"]})", &st);
+    CHECK(st == 400);
+    req(c, "POST", "/api/subscribe", R"({"client":"x","pipelines":["yolo"],"fps":16})", &st);
+    CHECK(st == 400);
+    req(c, "POST", "/api/subscribe", "nope", &st);
+    CHECK(st == 400);
+    req(c, "POST", "/api/subscribe/zz/keepalive", "{}", &st);
+    CHECK(st == 404);
+    req(c, "GET", "/api/subscribe/zz", "", &st);
+    CHECK(st == 404);
+    for (int i = 0; i < VisionControl::kMaxSubscriptions - 1; ++i)
+        req(c, "POST", "/api/subscribe", sub_body("c" + std::to_string(i), R"(["aruco"])"), &st);
+    CHECK(st == 200);
+    req(c, "POST", "/api/subscribe", sub_body("one-too-many", R"(["aruco"])"), &st);
+    CHECK(st == 503);
+
+    VisionControl n(opts(Mode::Aruco, false, 5, /*yolo=*/false), nullptr);
+    json e = req(n, "POST", "/api/subscribe", sub_body("x", R"(["aruco","yolo"])"), &st);
+    CHECK(st == 409 && e["error"] == "yolo unavailable" && !n.processing());
+}
+
+static void test_subscription_expiry() {
+    Calls calls;
+    VisionControl c(opts(Mode::Yolo, false, 5), calls.fn());
+    Subscription s;
+    CHECK(c.subscribe("page", "", Pipelines{false, true}, 0, 3000, 1000, s) == VisionControl::Status::Ok);
+    CHECK(s.fps == 5 && s.expires_ms == 4000);
+    CHECK(c.frame_plan(1000) == (Pipelines{false, true}));
+    CHECK(c.keepalive(s.id, 3500, s) == VisionControl::Status::Ok && s.expires_ms == 6500);
+    CHECK(c.processing());
+    c.frame_plan(6400);
+    CHECK(c.processing() && c.subscriptions(6400).size() == 1);
+    // no keep-alive: the next frame after expiry drops it and the camera goes back to idle
+    CHECK(!c.frame_plan(6600).any());
+    CHECK(!c.processing() && c.camera_fps() == VisionControl::kIdleFps && calls.v.back() == std::make_pair(false, 1));
+    CHECK(c.keepalive(s.id, 6700, s) == VisionControl::Status::NotFound);
+    // re-posting after expiry creates a new subscription
+    Subscription s2;
+    CHECK(c.subscribe("page", s.id, Pipelines{false, true}, 0, 3000, 7000, s2) == VisionControl::Status::Ok);
+    CHECK(s2.id != s.id && c.processing());
+    c.expire(10001);
+    CHECK(!c.processing());
+    // ttl is clamped
+    CHECK(c.subscribe("short", "", Pipelines{true, false}, 0, 1, 20000, s) == VisionControl::Status::Ok);
+    CHECK(s.ttl_ms == VisionControl::kMinTtlMs && s.expires_ms == 20000 + VisionControl::kMinTtlMs);
+
+    // over HTTP, real clock: a 500 ms subscription without keep-alive expires; one kept alive stays
+    VisionControl h(opts(Mode::Yolo, false, 5), nullptr);
+    int st = 0;
+    json a = req(h, "POST", "/api/subscribe", sub_body("gone", R"(["yolo"])", 0, 500), &st);
+    json b = req(h, "POST", "/api/subscribe", sub_body("kept", R"(["aruco"])", 0, 500), &st);
+    for (int i = 0; i < 4; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        json k = req(h, "POST", "/api/subscribe/" + b["id"].get<std::string>() + "/keepalive", "{}", &st);
+        CHECK(st == 200 && k["expires_in_ms"].get<int>() > 400);
+    }
+    json l = req(h, "GET", "/api/subscriptions");
+    CHECK(l["subscriptions"].size() == 1 && l["subscriptions"][0]["id"] == b["id"]);
+    CHECK(l["continuous"]["pipelines"] == json({"aruco"}));
+    req(h, "POST", "/api/subscribe/" + a["id"].get<std::string>() + "/keepalive", "{}", &st);
+    CHECK(st == 404);
+}
+
+static void test_trigger_pipelines() {
+    // standby in base mode yolo: each requested set runs exactly, on a fresh frame
+    VisionControl c(opts(Mode::Yolo, false, 5), nullptr);
+    FakeCamera cam(c, 1000 / VisionControl::kMaxFps);
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    CHECK(cam.processed == 0);
+    struct Case { const char* body; bool yolo, aruco; };
+    for (const Case& k : {Case{R"({"pipelines":["aruco"]})", false, true}, Case{R"({"pipelines":["yolo"]})", true, false},
+                          Case{R"({"pipelines":["yolo","aruco"]})", true, true}, Case{"", true, false},
+                          Case{R"({"pipelines":["aruco"],"wait_ms":2000})", false, true}}) {
+        json r = req(c, "POST", "/api/trigger?wait_ms=2000", k.body);
+        CHECK(r["success"] == true && r["api_version"] == 2);
+        CHECK(r["pipelines"]["yolo"]["ran"] == k.yolo && r["pipelines"]["aruco"]["ran"] == k.aruco);
+        CHECK(r["detections"].empty() != k.yolo && r["markers"].empty() != k.aruco);
+        CHECK(r["requested"].size() == static_cast<size_t>(k.yolo + k.aruco));
+        CHECK(!c.processing() && c.camera_fps() == VisionControl::kIdleFps);
+    }
+    int st = 0;
+    req(c, "POST", "/api/trigger", R"({"pipelines":"yolo"})", &st);
+    CHECK(st == 400);
+    req(c, "POST", "/api/trigger", R"({"pipelines":["x"]})", &st);
+    CHECK(st == 400);
+    req(c, "POST", "/api/trigger", "[1]", &st);
+    CHECK(st == 400);
+
+    // a trigger while a subscription runs: served by the next frame with its pipelines added
+    Subscription s;
+    CHECK(c.subscribe("overlay", "", Pipelines{false, true}, 2, 3000, mono_ms(), s) == VisionControl::Status::Ok);
+    json first = req(c, "GET", "/api/results/latest?after=0&wait_ms=1000");
+    const auto t0 = clk::now();
+    json r = req(c, "POST", "/api/trigger?wait_ms=2000", R"({"pipelines":["yolo"]})");
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk::now() - t0).count();
+    CHECK(r["success"] == true && r["pipelines"]["yolo"]["ran"] == true && r["frame_id"] > first["frame_id"]);
+    CHECK(ms < 300);  // next frame, not the subscription's 2 fps slot
+    CHECK(c.processing() && c.continuous().pipelines == (Pipelines{false, true}));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    json later = req(c, "GET", "/api/results/latest");
+    CHECK(later["pipelines"]["aruco"]["ran"] == true);
+    c.unsubscribe(s.id);
+
+    // a result lacking the requested pipelines does not answer the trigger
+    VisionControl w(opts(Mode::Yolo, false, 5), nullptr);
+    VisionResult only_yolo;
+    only_yolo.frame_id = 1;
+    only_yolo.frame_ms = 500;
+    only_yolo.ran_yolo = true;
+    w.publish(only_yolo);
+    VisionResult out;
+    CHECK(w.wait_fresh(0, 400, Pipelines{false, true}, 30, out));
+    CHECK(!w.wait_fresh(0, 400, Pipelines{true, false}, 30, out));
+
+    // without a model: yolo triggers answer 409, aruco ones work
+    VisionControl n(opts(Mode::Aruco, false, 5, false), nullptr);
+    json e = req(n, "POST", "/api/trigger", R"({"pipelines":["yolo"]})", &st);
+    CHECK(st == 409 && e["error"] == "yolo unavailable");
+}
+
+static void test_mode_endpoint_compat() {
+    // POST /api/mode drives the default subscription; it never expires and joins the union
+    VisionControl c(opts(Mode::Yolo, false, 5), nullptr);
+    int st = 0;
+    json m = req(c, "POST", "/api/mode", R"({"mode":"yolo","enabled":true})", &st);
+    CHECK(st == 200 && m["enabled"] == true && m["continuous"]["pipelines"] == json({"yolo"}) && m["continuous"]["subscriptions"] == 0);
+    c.expire(mono_ms() + 3600 * 1000);
+    CHECK(c.continuous().pipelines == (Pipelines{true, false}));
+    Subscription s;
+    CHECK(c.subscribe("calib", "", Pipelines{false, true}, 0, 3000, mono_ms(), s) == VisionControl::Status::Ok);
+    json l = req(c, "GET", "/api/subscriptions");
+    CHECK(l["default"]["enabled"] == true && l["subscriptions"].size() == 1);
+    CHECK(l["continuous"]["pipelines"] == json({"yolo", "aruco"}) && l["continuous"]["fps"] == 5);
+    // mode off stops only the default subscription
+    req(c, "POST", "/api/mode", R"({"mode":"off"})", &st);
+    CHECK(c.continuous().pipelines == (Pipelines{false, true}) && c.processing());
+    m = req(c, "GET", "/api/mode");
+    CHECK(m["mode"] == "off" && m["enabled"] == false && m["processing"] == true);
+    // legacy /api/inference toggles the default subscription
+    json inf = req(c, "POST", "/api/inference", R"({"enabled":true})");
+    CHECK(inf["enabled"] == true && c.continuous().pipelines == (Pipelines{true, true}));
+    c.unsubscribe(s.id);
+    req(c, "POST", "/api/inference", R"({"enabled":false})");
+    CHECK(!c.processing());
+}
+
 static std::string http_roundtrip(int port, const std::string& raw) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in a;
@@ -473,6 +683,15 @@ static void test_http_server() {
     resp = http_roundtrip(port, "POST /api/mode HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\nContent-Length: " +
                                     std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
     CHECK(resp.find("415") != std::string::npos);
+    const std::string sb = R"({"client":"t","pipelines":["aruco"]})";
+    resp = http_roundtrip(port, "POST /api/subscribe HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: " +
+                                    std::to_string(sb.size()) + "\r\nConnection: close\r\n\r\n" + sb);
+    CHECK(resp.find("200 OK") != std::string::npos && c.processing());
+    const std::string id = json::parse(resp.substr(resp.find("\r\n\r\n") + 4))["id"];
+    resp = http_roundtrip(port, "DELETE /api/subscribe/" + id + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    CHECK(resp.find("200 OK") != std::string::npos && !c.processing());
+    resp = http_roundtrip(port, "PUT /api/mode HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    CHECK(resp.find("405") != std::string::npos);
     server.stop();
 }
 
@@ -487,6 +706,11 @@ int main() {
     test_trigger_latency();
     test_latest();
     test_result_json();
+    test_standby();
+    test_subscription_union();
+    test_subscription_expiry();
+    test_trigger_pipelines();
+    test_mode_endpoint_compat();
     test_http_server();
     if (g_fail) {
         std::printf("%d check(s) failed\n", g_fail);

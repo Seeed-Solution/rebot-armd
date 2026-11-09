@@ -44,6 +44,7 @@ static const char* status_text(int code) {
         case 404: return "Not Found";
         case 408: return "Request Timeout";
         case 405: return "Method Not Allowed";
+        case 409: return "Conflict";
         case 415: return "Unsupported Media Type";
         case 503: return "Service Unavailable";
         default: return "Error";
@@ -61,7 +62,7 @@ bool is_json_content_type(const std::string& value) {
 }
 
 int precheck_request(const std::string& method, const std::string& content_type) {
-    if (method == "GET") return 0;
+    if (method == "GET" || method == "DELETE") return 0;
     if (method == "POST") return is_json_content_type(content_type) ? 0 : 415;
     return 405;  // OPTIONS and everything else: no CORS preflight is approved
 }
