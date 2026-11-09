@@ -2,7 +2,14 @@
 name = "armd"
 version = "0.1.0"
 edition = "2021"
-description = "Minimal robotic arm daemon with LeRobot parquet recording and real-time safety control"
+description = "Arm control daemon (armd) for the reBot B601-DM arm on a Seeed reCamera: lease-based WebSocket control, safety supervisor, web cockpit and Parquet episode recording"
+license = "MIT"
+repository = "https://github.com/Seeed-Solution/rebot-armd"
+homepage = "https://github.com/Seeed-Solution/rebot-armd"
+readme = "README.md"
+keywords = ["robotics", "robot-arm", "lerobot", "recamera", "can"]
+categories = ["science::robotics"]
+publish = false
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
