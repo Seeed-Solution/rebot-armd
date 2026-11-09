@@ -10,7 +10,12 @@ pub const CMD_CLEAR_FAULTS: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 /// Serial bridge packet header
 pub const SERIAL_BRIDGE_HEADER: [u8; 2] = [0xAA, 0x55];
 
-/// Default physical parameter limits for Damiao DM4310 / DM6006 / DM8006
+/// MIT-frame and feedback mapping ranges of one Damiao motor. The motor maps the
+/// 16 / 12-bit fields onto [-PMAX, PMAX], [-VMAX, VMAX] and [-TMAX, TMAX] (registers
+/// 21 / 22 / 23), so these must equal that motor's registers. `Default` is the
+/// single range the driver used before per-joint ranges (12.5 / 30 / 18); it does
+/// not match every motor (on the B601-DM, J1-J3 report 12.5 / 10 / 28 and J4-J7
+/// 12.5 / 30 / 10).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DamiaoLimits {
     pub p_min: f32,
@@ -41,6 +46,17 @@ impl Default for DamiaoLimits {
         }
     }
 }
+
+impl DamiaoLimits {
+    /// Symmetric position / velocity / torque ranges with the default gain ranges.
+    pub fn symmetric(p_max: f32, v_max: f32, t_max: f32) -> Self {
+        Self { p_min: -p_max, p_max, v_min: -v_max, v_max, t_min: -t_max, t_max, ..Self::default() }
+    }
+}
+
+/// Motor ID in byte 0 of a feedback frame (low nibble), read before choosing the
+/// mapping range to decode it with.
+pub fn feedback_motor_id(frame: &CanFrame) -> u8 { frame.data[0] & 0x0F }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DamiaoError {
@@ -283,8 +299,9 @@ pub fn decode_serial_bridge_frame(buf: &[u8]) -> Result<(CanFrame, usize), Damia
 // Register access (0x7FF): control mode and the MIT mapping ranges
 // =========================================================================
 //
-// Layout as used by Damiao's DM_CAN reference library (not verified on the
-// B601-DM yet): request on CAN ID 0x7FF, `[id_l, id_h, op, rid, d0, d1, d2, d3]`
+// Layout as used by Damiao's DM_CAN reference library. Reads were confirmed on the
+// B601-DM on 2026-11-09 (registers 10 and 21-23 of all seven motors); writes have not
+// been checked on hardware yet. Request on CAN ID 0x7FF, `[id_l, id_h, op, rid, d0, d1, d2, d3]`
 // with op 0x33 = read and 0x55 = write (RAM only; 0xAA would store to flash).
 // The motor answers on its feedback ID with the same layout and the current
 // value. Integer registers (such as CTRL_MODE) are u32, the others f32, both

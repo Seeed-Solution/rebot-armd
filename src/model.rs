@@ -256,6 +256,30 @@ impl GravityCompPolicy {
     }
 }
 
+/// Damiao MIT / feedback mapping range of one motor: registers PMAX (21), VMAX (22)
+/// and TMAX (23). Feedback is decoded and MIT frames are encoded with these, so they
+/// must equal what the motor reports.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct DamiaoRange {
+    /// rad
+    pub p_max: f32,
+    /// rad/s
+    pub v_max: f32,
+    /// N·m
+    pub t_max: f32,
+}
+
+impl DamiaoRange {
+    /// B601-DM J1-J3, read from the motors 2026-11-09.
+    pub const REBOT_DM_J1_J3: Self = Self { p_max: 12.5, v_max: 10.0, t_max: 28.0 };
+    /// B601-DM J4-J7 (J7 = gripper), read from the motors 2026-11-09.
+    pub const REBOT_DM_J4_J7: Self = Self { p_max: 12.5, v_max: 30.0, t_max: 10.0 };
+
+    pub fn limits(&self) -> crate::protocol::damiao::DamiaoLimits {
+        crate::protocol::damiao::DamiaoLimits::symmetric(self.p_max, self.v_max, self.t_max)
+    }
+}
+
 /// Estimated Damiao POS_VEL lag gain: tracking error ~= v / POSVEL_LAG_GAIN rad at
 /// v rad/s. Estimate from the 2026-11 tracking-fault analysis; needs verification
 /// on hardware (record |commanded - measured| during presets to fit it).
@@ -303,6 +327,10 @@ pub struct ArmConfig {
     /// Gravity compensation (hand-guiding); None means unsupported.
     #[serde(default)]
     pub gravity_comp: Option<GravityCompPolicy>,
+    /// Damiao mapping range per joint (one per DOF). None keeps the single default
+    /// range ±12.5 rad, ±30 rad/s, ±18 N·m for every motor.
+    #[serde(default)]
+    pub damiao_ranges: Option<Vec<DamiaoRange>>,
 }
 
 impl Default for ArmConfig {
@@ -348,6 +376,7 @@ impl Default for ArmConfig {
             gripper_policy: None,
             grasp: None,
             gravity_comp: None,
+            damiao_ranges: None,
         }
     }
 }
@@ -403,11 +432,22 @@ impl ArmConfig {
                 return Err("Invalid gripper policy (needs dof 7, open/closed inside the J7 limits, 0 <= squeeze_rad <= 0.5)".into());
             }
         }
+        if let Some(ranges) = &self.damiao_ranges {
+            let ok = |x: f32| x.is_finite() && x > 0.0;
+            if ranges.len() != self.dof || !ranges.iter().all(|r| ok(r.p_max) && ok(r.v_max) && ok(r.t_max)) {
+                return Err(format!("damiao_ranges needs {} entries with positive finite p_max / v_max / t_max", self.dof));
+            }
+        }
         if let Some(gc) = &self.gravity_comp {
             if self.dof != 7 || self.gravity_model.is_none() {
                 return Err("gravity_comp requires dof == 7 and a gravity_model".into());
             }
             gc.validate()?;
+            if let Some(ranges) = &self.damiao_ranges {
+                if let Some(i) = (0..6).find(|&i| gc.torque_limits_nm[i] > ranges[i].t_max) {
+                    return Err(format!("gravity_comp torque_limits_nm[{i}] exceeds the joint's TMAX {}", ranges[i].t_max));
+                }
+            }
         }
         if let Some(g) = &self.grasp { g.validate().map_err(|e| format!("Invalid grasp setup: {e}"))?; }
         if let Some(policy) = &self.resting_pose {
@@ -480,6 +520,11 @@ impl ArmConfig {
             gripper_policy: Some(GripperPolicy::rebot_dm()),
             grasp: Some(crate::grasp::GraspSetup::default()),
             gravity_comp: Some(GravityCompPolicy::rebot_dm()),
+            damiao_ranges: Some(vec![
+                DamiaoRange::REBOT_DM_J1_J3, DamiaoRange::REBOT_DM_J1_J3, DamiaoRange::REBOT_DM_J1_J3,
+                DamiaoRange::REBOT_DM_J4_J7, DamiaoRange::REBOT_DM_J4_J7, DamiaoRange::REBOT_DM_J4_J7,
+                DamiaoRange::REBOT_DM_J4_J7,
+            ]),
         }
     }
 }

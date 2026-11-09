@@ -144,6 +144,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // Bind before mounting hardware; an unavailable API must not leave a hardware loop running.
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let damiao_limits: Option<Vec<_>> = config.damiao_ranges.as_ref().map(|r| r.iter().map(|r| r.limits()).collect());
     let supervisor = Arc::new(ArmSupervisor::new(config));
     armd::grasp::load_into(&supervisor, &armd::grasp::setup_path_from_env()).await;
     match follower {
@@ -153,12 +155,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let port = cli.follower_port.as_deref().unwrap_or("can0");
                 let can = armd::transport::SocketCanTransport::open(port)?;
                 if follower == "rebot-dm" {
-                    supervisor
-                        .set_driver(Box::new(armd::driver::DamiaoArmDriver::new(
-                            can,
-                            (1..=7).collect(),
-                        )))
-                        .await;
+                    let mut driver = armd::driver::DamiaoArmDriver::new(can, (1..=7).collect());
+                    if let Some(limits) = damiao_limits {
+                        driver = driver.with_joint_limits(limits)?;
+                    }
+                    supervisor.set_driver(Box::new(driver)).await;
                 } else {
                     supervisor
                         .set_driver(Box::new(armd::driver::RobStrideArmDriver::new(

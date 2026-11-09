@@ -560,7 +560,8 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     can: C,
     motor_ids: Vec<u16>,
     master_id: u32,
-    limits: DamiaoLimits,
+    /// MIT / feedback mapping range per joint (must equal each motor's PMAX / VMAX / TMAX).
+    limits: Vec<DamiaoLimits>,
     control_mode: DamiaoControlMode,
     default_vlim: f32,
     default_kp: f32,
@@ -579,7 +580,7 @@ pub struct DamiaoArmDriver<C: CanTransport> {
     last_refresh_instant: Option<Instant>,
     /// Confirmed control mode per joint; None = unconfirmed after a failed switch.
     joint_modes: Vec<Option<DamiaoControlMode>>,
-    /// PMAX / VMAX / TMAX read back from the motor and equal to `limits`.
+    /// PMAX / VMAX / TMAX read back from the motor and equal to `limits[i]`.
     mit_limits_verified: Vec<bool>,
     /// Register replies seen by `read_joint_states` since the last clear.
     register_replies: Vec<damiao::RegisterReply>,
@@ -595,7 +596,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             can,
             motor_ids,
             master_id: 0,
-            limits: DamiaoLimits::default(),
+            limits: vec![DamiaoLimits::default(); dof],
             control_mode: DamiaoControlMode::PosVel,
             default_vlim: 2.0,
             default_kp: 40.0,
@@ -629,12 +630,28 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self
     }
 
-    /// MIT / feedback mapping ranges. They must equal the motors' PMAX / VMAX / TMAX
-    /// registers; gravity compensation reads them back and refuses to start otherwise.
+    /// One MIT / feedback mapping range for every joint. It must equal the motors'
+    /// PMAX / VMAX / TMAX registers; gravity compensation reads them back and refuses
+    /// to start otherwise.
     pub fn with_limits(mut self, limits: DamiaoLimits) -> Self {
-        self.limits = limits;
+        self.limits.fill(limits);
         self.mit_limits_verified.fill(false);
         self
+    }
+
+    /// Per-joint mapping ranges, one per motor ID in order.
+    pub fn with_joint_limits(mut self, limits: Vec<DamiaoLimits>) -> Result<Self, ArmDriverError> {
+        if limits.len() != self.motor_ids.len() {
+            return Err(ArmDriverError::JointCountMismatch { expected: self.motor_ids.len(), actual: limits.len() });
+        }
+        self.limits = limits;
+        self.mit_limits_verified.fill(false);
+        Ok(self)
+    }
+
+    /// Mapping range used for each joint.
+    pub fn joint_limits(&self) -> &[DamiaoLimits] {
+        &self.limits
     }
 
     /// Confirmed control mode of each joint (None = unconfirmed).
@@ -664,7 +681,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
             target.kp.filter(|k| k.is_finite()).unwrap_or(self.default_kp),
             target.kd.filter(|k| k.is_finite()).unwrap_or(self.default_kd),
             torque,
-            &self.limits,
+            &self.limits[i],
         )
     }
 
@@ -694,7 +711,7 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         }
     }
 
-    /// Read PMAX / VMAX / TMAX of `joints` and require them to equal the driver's ranges:
+    /// Read PMAX / VMAX / TMAX of `joints` and require each to equal that joint's range:
     /// an MIT frame encoded with the wrong TMAX would scale every torque command.
     fn verify_mit_limits(&mut self, joints: &[usize]) -> Result<(), ArmDriverError> {
         const RIDS: [u8; 3] = [damiao::RID_PMAX, damiao::RID_VMAX, damiao::RID_TMAX];
@@ -707,8 +724,8 @@ impl<C: CanTransport> DamiaoArmDriver<C> {
         self.can.flush()?;
         let expected: Vec<(usize, bool, u8)> = joints.iter().flat_map(|&i| RIDS.map(|rid| (i, false, rid))).collect();
         let replies = self.await_register_replies(&expected);
-        let want = [self.limits.p_max, self.limits.v_max, self.limits.t_max];
         for (k, &i) in joints.iter().enumerate() {
+            let want = [self.limits[i].p_max, self.limits[i].v_max, self.limits[i].t_max];
             let got: Vec<Option<f32>> = (0..3).map(|r| replies[k * 3 + r].map(|reply| reply.as_f32())).collect();
             if got.iter().any(Option::is_none) {
                 return Err(ArmDriverError::HardwareFault(format!(
@@ -1201,7 +1218,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                         kp,
                         kd,
                         torque,
-                        &self.limits,
+                        &self.limits[i],
                     );
                     self.transmit_with_retry(&frame)?;
                     self.last_target_frames[i] = Some(frame);
@@ -1272,21 +1289,18 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             continue;
                         }
 
-                        if let Ok(feedback) = damiao::unpack_feedback_frame(&frame, &self.limits) {
-                            if let Some(idx) = self
-                                .motor_ids
-                                .iter()
-                                .position(|&id| id as u8 == feedback.motor_id)
-                            {
-                                self.cached_states[idx] = JointState {
-                                    position: feedback.position,
-                                    velocity: feedback.velocity,
-                                    torque: feedback.torque,
-                                    temperature: feedback.t_mos.max(feedback.t_rotor),
-                                };
-                                self.last_feedback_instant[idx] = Some(Instant::now());
-                                self.motor_status[idx] = feedback.state_or_error;
-                            }
+                        // Byte 0 names the motor; decode with that joint's own range.
+                        let fid = damiao::feedback_motor_id(&frame);
+                        let idx = self.motor_ids.iter().position(|&id| id as u8 == fid);
+                        if let Some((idx, Ok(feedback))) = idx.map(|idx| (idx, damiao::unpack_feedback_frame(&frame, &self.limits[idx]))) {
+                            self.cached_states[idx] = JointState {
+                                position: feedback.position,
+                                velocity: feedback.velocity,
+                                torque: feedback.torque,
+                                temperature: feedback.t_mos.max(feedback.t_rotor),
+                            };
+                            self.last_feedback_instant[idx] = Some(Instant::now());
+                            self.motor_status[idx] = feedback.state_or_error;
                         }
                     }
                     if frames_processed >= 64 || t0.elapsed() >= MAX_RX_DURATION {
@@ -1343,7 +1357,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                             self.default_kp,
                             self.default_kd,
                             0.0,
-                            &self.limits,
+                            &self.limits[i],
                         );
                         let _ = self.can.transmit(&frame);
                     }
