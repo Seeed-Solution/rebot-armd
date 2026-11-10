@@ -756,3 +756,46 @@ async fn test_websocket_lease_lost_reason_after_expiry_and_preemption() {
     }
     assert!(reasons.iter().all(|r| r == "preempted"), "{reasons:?}");
 }
+
+#[tokio::test]
+async fn test_observation_publishes_the_lease_holder_label() {
+    let (addr, supervisor) = spawn_test_server().await;
+    assert_eq!(supervisor.get_observation().await.lease_holder, None);
+
+    let (mut ws1, _) = connect_async(format!("ws://{}/api/v1/ws", addr)).await.unwrap();
+    let g1 = ws_reply(&mut ws1, json!({"type":"acquire_lease", "client_id":"rebot-mcp"}), &["lease_granted"]).await["generation"].as_u64().unwrap();
+    assert_eq!(supervisor.get_observation().await.lease_holder.as_deref(), Some("rebot-mcp"));
+
+    // A forced takeover publishes the new holder's label.
+    let (mut ws2, _) = connect_async(format!("ws://{}/api/v1/ws", addr)).await.unwrap();
+    let g2 = ws_reply(&mut ws2, json!({"type":"acquire_lease", "client_id":"web-abc", "force":true}), &["lease_granted"]).await["generation"].as_u64().unwrap();
+    assert!(g2 > g1);
+    assert_eq!(supervisor.get_observation().await.lease_holder.as_deref(), Some("web-abc"));
+
+    // Released: no holder.
+    let released = ws_reply(&mut ws2, json!({"type":"release_lease", "generation":g2}), &["lease_released"]).await;
+    assert_eq!(released["success"], true);
+    assert_eq!(supervisor.get_observation().await.lease_holder, None);
+
+    // An expired lease is not published either.
+    ws_reply(&mut ws1, json!({"type":"acquire_lease", "client_id":"rebot-mcp"}), &["lease_granted"]).await;
+    tokio::time::sleep(Duration::from_millis(1150)).await;
+    assert_eq!(supervisor.get_observation().await.lease_holder, None);
+
+    // REST observation carries the field (null when unheld).
+    let body = reqwest_get(addr, "/api/v1/observation").await;
+    assert!(body.get("lease_holder").is_some_and(Value::is_null), "{body}");
+}
+
+async fn reqwest_get(addr: SocketAddr, path: &str) -> Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    let body = out.split("\r\n\r\n").nth(1).unwrap();
+    serde_json::from_str(body).unwrap_or_else(|_| {
+        // chunked body: take the JSON between the first '{' and the last '}'
+        serde_json::from_str(&body[body.find('{').unwrap()..=body.rfind('}').unwrap()]).unwrap()
+    })
+}

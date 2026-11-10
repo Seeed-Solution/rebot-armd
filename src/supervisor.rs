@@ -120,6 +120,9 @@ pub struct WatchdogPark {
 pub struct ActiveLease {
     pub client_id: String,
     pub generation: u64,
+    /// The `client_id` label the holder sent with `acquire_lease` (e.g. "rebot-mcp"),
+    /// published in the observation as `lease_holder`; empty when none was given.
+    pub label: String,
     pub acquired_at: Instant,
     pub last_valid_motion_instant: Option<Instant>,
 }
@@ -439,6 +442,7 @@ impl SupervisorInner {
             control_mode: if self.gravity_comp.is_some() { crate::model::ControlMode::GravityComp } else { crate::model::ControlMode::Position },
             gravity_comp: self.gravity_comp_observation(),
             driver_range_check: self.driver.as_ref().and_then(|d| d.lock().ok().and_then(|drv| drv.range_check())),
+            lease_holder: self.lease_holder(),
         }
     }
 
@@ -1050,6 +1054,7 @@ impl SupervisorInner {
         self.active_lease = Some(ActiveLease {
             client_id: conn.to_string(),
             generation: gen,
+            label: label.to_string(),
             acquired_at: now,
             last_valid_motion_instant: None,
         });
@@ -1081,6 +1086,7 @@ impl SupervisorInner {
         self.active_lease = Some(ActiveLease {
             client_id: client_id.to_string(),
             generation: gen,
+            label: String::new(),
             acquired_at: now,
             last_valid_motion_instant: None,
         });
@@ -1192,6 +1198,18 @@ impl SupervisorInner {
             }
         }
         false
+    }
+
+    /// Records the label a lease holder sent with `acquire_lease` (shown to other clients).
+    pub fn set_lease_label(&mut self, client_id: &str, generation: u64, label: &str) {
+        if let Some(active) = self.active_lease.as_mut().filter(|a| a.client_id == client_id && a.generation == generation) {
+            active.label = label.to_string();
+        }
+    }
+
+    /// Label of the valid lease holder (empty string when it sent none); None when no lease is held.
+    pub fn lease_holder(&self) -> Option<String> {
+        self.active_lease.as_ref().filter(|a| a.acquired_at.elapsed() < self.lease_timeout).map(|a| a.label.clone())
     }
 
     /// Why `client_id` no longer holds `generation`: "preempted" when a forced acquire

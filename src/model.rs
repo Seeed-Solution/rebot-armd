@@ -623,6 +623,10 @@ pub struct ArmObservation {
     /// no such check or it has not run.
     #[serde(default)]
     pub driver_range_check: Option<DriverRangeCheck>,
+    /// `client_id` label of the client holding the control lease (empty when it sent
+    /// none); null when no lease is held.
+    #[serde(default)]
+    pub lease_holder: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

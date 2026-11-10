@@ -283,6 +283,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     } else {
                                         match inner.acquire_lease(&recv_connection) {
                                             Ok(generation) => {
+                                                inner.set_lease_label(&recv_connection, generation, label);
                                                 let previous = recv_generation.swap(generation, Ordering::SeqCst);
                                                 client_label = Some(label.to_owned());
                                                 if previous != generation { last_sequence = None; }

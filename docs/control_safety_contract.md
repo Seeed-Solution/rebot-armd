@@ -12,11 +12,13 @@ This document describes the software contract visible in the current source tree
 - Actuator authority belongs to the WebSocket connection that acquires the lease. Use `acquire_lease`, then periodic `heartbeat`, then strictly increasing `request_id` `command` messages carrying `generation` and the current `epoch_id`.
 - A successful command returns `command_ack`; lease loss, stale epoch, missing generation, or safety rejection returns `command_reject`. `estop` is accepted without a lease and advances the safety epoch.
 - REST actuator routes (`torque`, `heartbeat`, `motion/*`, and `clear_fault`) return a structured lease error and do not execute the action. This is intentional: a caller-supplied client ID cannot prove WebSocket connection ownership.
+- Every observation carries `lease_holder`: the `client_id` label the current holder sent with `acquire_lease` (empty string when it sent none), or `null` when no valid lease is held. It is informational; authority stays with the connection.
 
 - 观测通过 `GET /api/v1/observation` 及 schema 接口提供。
 - 执行器权限属于取得租约的 WebSocket 连接。流程为 `acquire_lease`、周期性 `heartbeat`、带 `generation` 和当前 `epoch_id` 且 `request_id` 严格递增的 `command`。
 - 成功返回 `command_ack`；租约丢失、epoch 过期、缺少 generation 或安全策略拒绝时返回 `command_reject`。`estop` 不需要租约，执行后会推进安全 epoch。
 - REST 执行器路由（`torque`、`heartbeat`、`motion/*`、`clear_fault`）返回结构化租约错误，不执行动作。
+- 每帧观测带 `lease_holder`：当前持有者在 `acquire_lease` 中发送的 `client_id` 标签（未发送时为空字符串），无有效租约时为 `null`。仅供显示，权限仍属于持有连接。
 
 ## Driver capability boundary / 驱动能力边界
 
