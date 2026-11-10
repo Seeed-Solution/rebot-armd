@@ -683,6 +683,9 @@ pub struct ArmObservation {
     /// reports no motor state (Damiao state codes 8-14).
     #[serde(default)]
     pub motor_errors: Vec<Option<MotorError>>,
+    /// Structured cause while the safety state is Fault or EStop; null otherwise.
+    #[serde(default)]
+    pub fault: Option<crate::safety::FaultInfo>,
 }
 
 /// A motor fault code reported in the motor's feedback (`observation.motor_errors`).

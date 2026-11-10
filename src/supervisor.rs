@@ -11,7 +11,7 @@ use crate::recording::{
     write_frames_to_parquet, EpisodeRecorder, EpisodeState, ParquetRecordingError, RecordFrame,
     RecordingError,
 };
-use crate::safety::{FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
+use crate::safety::{FaultCode, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
 use crate::trajectory::{MultiJointQuinticTrajectory, TrajectoryError, TrajectoryPlanner};
 use crate::motion::{
     ActionStatus, ActiveTrajectory, GripperMotion, GripperRequest, JointPath, MotionError, PathTrajectory,
@@ -564,6 +564,7 @@ impl SupervisorInner {
             lease_holder: self.lease_holder(),
             motion_limit: self.motion_limit.clone(),
             motor_errors: self.motor_errors.clone(),
+            fault: self.safety.fault(),
         }
     }
 
@@ -728,7 +729,7 @@ impl SupervisorInner {
                         self.last_disable_attempt = Some(Instant::now());
                     }
                     let err_msg = format!("Hardware torque enable failed: {}", e);
-                    self.safety.trigger_fault(FaultReason::Other(err_msg.clone()));
+                    self.safety.trigger_fault_coded(FaultCode::EnableFailed, FaultReason::Other(err_msg.clone()));
                     return Err(SafetyError::ClearFaultRejected(err_msg));
                 }
                 let states = match driver.read_joint_states() {
@@ -823,7 +824,7 @@ impl SupervisorInner {
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         if let Err(error) = self.request_disable() {
-            self.safety.trigger_fault(FaultReason::Other(error.to_string()));
+            self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(error.to_string()));
             return Err(error);
         }
         let state = self.safety.set_torque(false)?;
@@ -2026,7 +2027,7 @@ impl SupervisorInner {
         self.active_trajectory = None;
         self.commanded_velocities.fill(0.0);
         self.target_positions = self.commanded_positions.clone();
-        self.safety.trigger_fault(reason);
+        self.safety.trigger_fault_coded(FaultCode::ServoNoBrake, reason);
     }
 
     /// One control tick of the unload settle: the static resting-pose conditions must hold
@@ -2123,7 +2124,7 @@ impl SupervisorInner {
         if invalid_feedback && self.is_torqued && !self.safety.state().is_stopped() {
             self.stop_motion();
             self.commanded_velocities.fill(0.0);
-            self.safety.trigger_fault(FaultReason::Other("Invalid hardware telemetry".into()));
+            self.safety.trigger_fault_coded(FaultCode::InvalidTelemetry, FaultReason::Other("Invalid hardware telemetry".into()));
         }
 
         // A single late tick only shortens integration (dt is clamped below); the motors
@@ -2138,7 +2139,7 @@ impl SupervisorInner {
             }
             self.commanded_velocities.fill(0.0);
             self.commanded_accelerations.fill(0.0);
-            self.safety.trigger_fault(FaultReason::Other("Control loop deadline exceeded".into()));
+            self.safety.trigger_fault_coded(FaultCode::ControlDeadline, FaultReason::Other("Control loop deadline exceeded".into()));
         }
         let dt = if dt.is_finite() && dt > 0.0 { dt.min(0.080) } else { 0.020 };
         let before_velocities = self.commanded_velocities.clone();
@@ -2271,7 +2272,7 @@ impl SupervisorInner {
                         self.target_positions = hold_pos.clone();
                         self.commanded_positions = hold_pos;
                         self.commanded_velocities = vec![0.0; self.config.dof];
-                        self.safety.trigger_fault(FaultReason::Other(e.to_string()));
+                        self.safety.trigger_fault_coded(FaultCode::HardwareFault, FaultReason::Other(e.to_string()));
                     }
                 }
             }
@@ -2358,7 +2359,7 @@ impl SupervisorInner {
                     self.target_positions = self.measured_positions.clone();
                     self.commanded_velocities.fill(0.0);
                     self.commanded_accelerations.fill(0.0);
-                    self.safety.trigger_fault(FaultReason::Other(format!(
+                    self.safety.trigger_fault_coded(FaultCode::FollowingError, FaultReason::Other(format!(
                         "Persistent joint tracking error: joint {} cmd {cmd:.3} meas {meas:.3} rad", joint + 1)));
                 }
             } else { self.following_error_since = None; }
@@ -2686,7 +2687,7 @@ impl SupervisorInner {
                 self.target_positions = self.measured_positions.clone();
             }
             if !self.safety.state().is_stopped() {
-                self.safety.trigger_fault(FaultReason::Other(format!("Control output failed: {error}")));
+                self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(format!("Control output failed: {error}")));
             }
             tracing::error!("Control output failed: {error}");
         }
@@ -2707,7 +2708,7 @@ impl SupervisorInner {
             } else if settling_since.elapsed() > Duration::from_millis(1500) {
                 self.stop_motion();
                 self.commanded_velocities = vec![0.0; self.config.dof];
-                self.safety.trigger_fault(FaultReason::Other("Handover settling timeout".into()));
+                self.safety.trigger_fault_coded(FaultCode::HandoverUnsettled, FaultReason::Other("Handover settling timeout".into()));
                 self.handover_settling_since = None;
             }
         }

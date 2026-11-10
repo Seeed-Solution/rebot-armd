@@ -230,7 +230,7 @@ impl SupervisorInner {
                 let uncertain = drv.joint_modes_uncertain();
                 drop(drv);
                 if uncertain {
-                    self.safety.trigger_fault(FaultReason::Other(format!("GRAVITY_COMP_SWITCH_FAILED: {e}")));
+                    self.safety.trigger_fault_coded(crate::safety::FaultCode::GravityCompFailed, FaultReason::Other(format!("GRAVITY_COMP_SWITCH_FAILED: {e}")));
                 }
                 return Err(Self::reject("GRAVITY_COMP_SWITCH_FAILED", e.to_string()));
             }
@@ -467,7 +467,7 @@ impl SupervisorInner {
                 tracing::error!("Gravity compensation: switch back to POS_VEL not confirmed: {e}");
                 if let Some(run) = self.gravity_comp.as_mut() { run.phase = GravityCompPhase::ExitFailed { hold, retry_in_s: 0.5 }; }
                 if !self.safety.state().is_stopped() {
-                    self.safety.trigger_fault(FaultReason::Other(format!("GRAVITY_COMP_EXIT_FAILED: {e}")));
+                    self.safety.trigger_fault_coded(crate::safety::FaultCode::GravityCompFailed, FaultReason::Other(format!("GRAVITY_COMP_EXIT_FAILED: {e}")));
                 }
             }
         }

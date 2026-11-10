@@ -25,7 +25,7 @@ pub use recording::{
     lerobot_arrow_schema, read_frames_from_parquet, write_frames_to_parquet, EpisodeRecorder,
     EpisodeState, RecordFrame,
 };
-pub use safety::{FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
+pub use safety::{FaultCode, FaultInfo, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
 pub use supervisor::{ArmError, ArmSupervisor, PreemptError, SupervisorInner};
 pub use trajectory::{
     MultiJointQuinticTrajectory, QuinticPolynomial, TrajectoryError, TrajectoryPlanner,

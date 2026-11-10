@@ -114,6 +114,9 @@ async fn no_resting_pose_keeps_watchdog_fault_with_torque_held() {
     let supervisor = sim_torqued_away_from_home(false).await;
     let obs = expire_lease(&supervisor).await;
     assert!(matches!(obs.safety_state, SafetyState::Fault(FaultReason::WatchdogTimeout)));
+    let fault = obs.fault.as_ref().expect("fault field set in Fault");
+    assert_eq!(serde_json::to_value(fault).unwrap()["code"], "WATCHDOG_TIMEOUT");
+    assert!(fault.recoverable);
     assert!(obs.is_torqued);
     assert!(!supervisor.inner().read().await.pending_normal_unload);
 }
