@@ -935,6 +935,8 @@ pub struct Capabilities {
     pub residual_torques: bool,
     /// `GET /api/v1/diagnostics/tick`.
     pub tick_stats: bool,
+    /// `/api/v1/action/place`: 7-DOF, kinematics and gripper policy.
+    pub place: bool,
     pub vision: VisionCapabilities,
 }
 
@@ -963,6 +965,7 @@ impl Capabilities {
             speed_cap: true,
             residual_torques: config.gravity_model.is_some() && matches!(config.dof, 6 | 7),
             tick_stats: true,
+            place: seven && kin && config.gripper_policy.is_some(),
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }

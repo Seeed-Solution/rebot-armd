@@ -10,6 +10,7 @@ pub mod macro_action;
 pub mod model;
 pub mod motion;
 pub mod persist;
+pub mod place;
 pub mod poses;
 pub mod protocol;
 pub mod recording;

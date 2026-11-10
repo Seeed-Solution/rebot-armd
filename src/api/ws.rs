@@ -149,7 +149,41 @@ struct PendingPlan {
     tag: Option<String>,
 }
 
-enum ActionStart { Started(u64, f64), Plan(PendingPlan), Grasp(crate::grasp::PendingGrasp) }
+enum ActionStart { Started(u64, f64), Plan(PendingPlan), Macro(PendingMacro) }
+
+/// A macro action (crate::macro_action) checked under the lock, planned without it.
+enum PendingMacro { Grasp(crate::grasp::PendingGrasp), Place(crate::place::PendingPlace) }
+
+enum PlannedMacro { Grasp(crate::grasp::PlannedGrasp), Place(crate::place::PlannedPlace) }
+
+impl PendingMacro {
+    fn plan(self) -> Result<PlannedMacro, ArmError> {
+        match self {
+            Self::Grasp(g) => crate::grasp::plan(g).map(PlannedMacro::Grasp),
+            Self::Place(p) => crate::place::plan(p).map(PlannedMacro::Place),
+        }
+    }
+}
+
+impl PlannedMacro {
+    /// Begin the action and spawn its orchestrator. Returns (action id, expected duration).
+    fn start(self, inner: &mut SupervisorInner, supervisor: &Arc<ArmSupervisor>, deps: &crate::grasp::GraspDeps) -> Result<(u64, f64), ArmError> {
+        match self {
+            Self::Grasp(planned) => {
+                let id = inner.begin_macro("grasp", &planned.input, planned.request.tag.clone())?;
+                let duration = crate::grasp::expected_duration(&planned);
+                crate::grasp::spawn(supervisor.clone(), deps.source.clone(), id, planned);
+                Ok((id, duration))
+            }
+            Self::Place(planned) => {
+                let id = inner.begin_macro("place", &planned.input, planned.request.tag.clone())?;
+                let duration = crate::place::expected_duration(&planned);
+                crate::place::spawn(supervisor.clone(), id, planned);
+                Ok((id, duration))
+            }
+        }
+    }
+}
 
 // Under the write lock, after lease / epoch / request_id checks.
 fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: u64, request_id: &Value) -> Result<ActionStart, ApiError> {
@@ -162,7 +196,8 @@ fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: 
             let (id, duration) = inner.start_gripper(request, epoch)?;
             return Ok(ActionStart::Started(id, duration));
         }
-        "/api/v1/action/grasp" => return Ok(ActionStart::Grasp(crate::grasp::prepare(inner, body, epoch)?)),
+        "/api/v1/action/grasp" => return Ok(ActionStart::Macro(PendingMacro::Grasp(crate::grasp::prepare(inner, body, epoch)?))),
+        "/api/v1/action/place" => return Ok(ActionStart::Macro(PendingMacro::Place(crate::place::prepare(inner, body, epoch)?))),
         "/api/v1/action/move_to_pose" => {
             let (id, duration) = crate::poses::start_action(inner, body, epoch)?;
             return Ok(ActionStart::Started(id, duration));
@@ -256,7 +291,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let mut response: Option<Value>;
             let mut evicted_notify: Option<(String, u64)> = None;
             let mut pending_plan: Option<(PendingPlan, u64)> = None;
-            let mut pending_grasp: Option<(Value, crate::grasp::PendingGrasp, u64)> = None;
+            let mut pending_macro: Option<(Value, PendingMacro, u64)> = None;
             let mut pending_save: Option<crate::grasp::GraspSetup> = None;
             let mut pending_write: Option<crate::persist::PendingWrite> = None;
             if kind == "estop" || kind == "e_stop" {
@@ -384,7 +419,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                         response = match prepare_action(&mut inner, path, &value["body"], epoch, &value["request_id"]) {
                                             Ok(ActionStart::Started(id, duration)) => Some(command_ack(&inner, &value["request_id"], Some((id, duration)))),
                                             Ok(ActionStart::Plan(plan)) => { pending_plan = Some((plan, local_generation)); None }
-                                            Ok(ActionStart::Grasp(g)) => { pending_grasp = Some((value["request_id"].clone(), g, local_generation)); None }
+                                            Ok(ActionStart::Macro(m)) => { pending_macro = Some((value["request_id"].clone(), m, local_generation)); None }
                                             Err(error) => Some(command_reject(&inner, &value["request_id"], error)),
                                         };
                                     } else if path == "/api/v1/grasp/setup" {
@@ -498,10 +533,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     });
                 }
 
-                // Grasp: the coarse approach is planned without the lock (feasibility check),
-                // then the action begins and the orchestrator task takes over.
-                if let Some((request_id, pending, generation)) = pending_grasp.take() {
-                    let planned = tokio::task::spawn_blocking(move || crate::grasp::plan(pending)).await;
+                // Macro actions (grasp, place): the first motions are planned without the lock
+                // (feasibility check), then the action begins and the orchestrator task takes over.
+                if let Some((request_id, pending, generation)) = pending_macro.take() {
+                    let planned = tokio::task::spawn_blocking(move || pending.plan()).await;
                     let mut inner = recv_supervisor.inner().write().await;
                     response = Some(match planned {
                         Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
@@ -510,12 +545,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
                                 json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
                             } else {
-                                match inner.begin_macro("grasp", &planned.input, planned.request.tag.clone()) {
-                                    Ok(id) => {
-                                        let duration = crate::grasp::expected_duration(&planned);
-                                        crate::grasp::spawn(recv_supervisor.clone(), recv_deps.source.clone(), id, planned);
-                                        command_ack(&inner, &request_id, Some((id, duration)))
-                                    }
+                                match planned.start(&mut inner, &recv_supervisor, &recv_deps) {
+                                    Ok(started) => command_ack(&inner, &request_id, Some(started)),
                                     Err(error) => command_reject(&inner, &request_id, error.into()),
                                 }
                             }

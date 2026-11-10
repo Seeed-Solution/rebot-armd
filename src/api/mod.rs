@@ -74,6 +74,7 @@ pub fn create_router_full(
         .route("/api/v1/action/gripper", post(rest::action_requires_lease))
         .route("/api/v1/action/grasp", post(rest::action_requires_lease))
         .route("/api/v1/action/move_to_pose", post(rest::action_requires_lease))
+        .route("/api/v1/action/place", post(rest::action_requires_lease))
         .route("/api/v1/mode/gravity_comp", post(rest::action_requires_lease))
         .route("/api/v1/grasp/setup", get(rest::get_grasp_setup))
         .route("/api/v1/workspace/keepout", get(rest::get_keepout))

@@ -300,8 +300,18 @@ pub fn parse_speed(body: &Value) -> Result<Speed, MotionError> {
 
 /// Body of `/api/v1/action/move_to`.
 pub fn parse_move_to(body: &Value) -> Result<(GoalSpec, Speed, Option<String>), MotionError> {
-    let p = vec_n::<3>(body.get("position").unwrap_or(&Value::Null), "position")?;
-    let r = match body.get("orientation") {
+    let p = parse_position(body)?;
+    Ok((GoalSpec::Absolute { p, r: parse_orientation(body)? }, parse_speed(body)?, tag(body)?))
+}
+
+/// `position: [x, y, z]` (finite numbers).
+pub fn parse_position(body: &Value) -> Result<[f64; 3], MotionError> {
+    vec_n::<3>(body.get("position").unwrap_or(&Value::Null), "position")
+}
+
+/// `orientation: {"rpy": [r, p, y]} | {"quat": [w, x, y, z]} | null` (absent = None).
+pub fn parse_orientation(body: &Value) -> Result<Option<kinematics::Mat3>, MotionError> {
+    Ok(match body.get("orientation") {
         None | Some(Value::Null) => None,
         Some(o) => match (o.get("rpy"), o.get("quat")) {
             (Some(rpy), None) => { let v = vec_n::<3>(rpy, "orientation.rpy")?; Some(kinematics::rpy_to_r(v[0], v[1], v[2])) }
@@ -314,8 +324,7 @@ pub fn parse_move_to(body: &Value) -> Result<(GoalSpec, Speed, Option<String>), 
             }
             _ => return Err(MotionError::InvalidCommand("orientation must be {\"rpy\":[r,p,y]} or {\"quat\":[w,x,y,z]} or null".into())),
         },
-    };
-    Ok((GoalSpec::Absolute { p, r }, parse_speed(body)?, tag(body)?))
+    })
 }
 
 /// Body of `/api/v1/action/move_relative`.
@@ -670,7 +679,7 @@ impl ActiveTrajectory {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActionStatus {
     pub id: u64,
-    /// move_to | move_relative | gripper | grasp | joint_move | home | park | move_to_pose
+    /// move_to | move_relative | gripper | grasp | place | joint_move | home | park | move_to_pose
     pub kind: String,
     pub tag: Option<String>,
     /// running | done | failed | cancelled
