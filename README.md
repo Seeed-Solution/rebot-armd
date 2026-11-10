@@ -339,8 +339,14 @@ Chinese and English (language switch in the header).
   1.5 mrad, and a 30 s hand-guided recording gave 1509 frames.
 - **E-stop** button, fault display and clear, torque enable by press-and-hold, park.
 
-When another client holds the lease, the cockpit switches to observer mode and offers a
-takeover with confirmation.
+The cockpit does not take the lease when it opens. It acquires it on the first control input
+(jog, stick, key, Cartesian input, preset, enable, gripper, grasp, gravity compensation, park
+or home) and releases it after 30 s without input, only while torque is off and no action,
+gravity compensation, stream or motion is running: armd parks a torqued arm whose lease is
+released. An agent can therefore take the lease while a cockpit page is open. When another
+client holds the lease, the cockpit switches to observer mode, names the holder from the
+observation's `lease_holder` (another cockpit page, the AI agent `rebot-mcp`, or the client's
+label) and offers a takeover with confirmation. E-stop works without the lease.
 
 ## Vision (reCamera kit)
 

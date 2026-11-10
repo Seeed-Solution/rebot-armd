@@ -79,7 +79,7 @@ const feed = () => {
     const o = { positions: q, commanded_positions: q, velocities: [0, 0, 0, 0, 0, 0, 0], torques: [0, -2.1, -5.5, -1.3, 0, 0, 0], temperatures: Array(7).fill(32),
       safety_state: window.__state, enable_state: window.__state === 'Idle' ? 'Disabled' : 'Enabled', is_torqued: window.__state !== 'Idle', feedback_age_ms: Array(7).fill(5), epoch_id: 1,
       timestamp: performance.now() / 1000, action: null, control_mode: window.__mode, gravity_comp: window.__gc };
-    S.obs = o; S.obsAt = Date.now(); S.state = window.__state; S.epoch = 1; S.leaseGeneration = 1;
+    S.obs = o; S.obsAt = Date.now(); S.state = window.__state; S.epoch = 1; S.leaseGeneration = 1; S.lastIntentAt = Date.now(); // held, never idle
     gcOnObs(o);
     const vh = document.getElementById('vhint'); if (vh) vh.classList.add('hide');
   }, 30);

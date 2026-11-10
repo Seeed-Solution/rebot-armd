@@ -690,6 +690,9 @@ kbd { display: inline-block; min-width: 20px; padding: 1px 5px; margin-right: 2p
 /* ---------- lease preemption ---------- */
 .btn.btn-preempt { width: 100%; justify-content: center; margin-top: 8px; color: var(--sc-status-warning-fg); border-color: #ffd591; background: var(--sc-status-warning-bg); font-weight: 600; }
 .btn.btn-preempt:hover { color: var(--sc-status-warning-fg); border-color: #faad14; }
+.btn-preempt .preempt-lbl { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.2; }
+.btn-preempt .preempt-lbl small { font-size: 11px; font-weight: 500; opacity: .85; }
+.btn-preempt .preempt-lbl small:empty { display: none; }
 .btn-preempt[hidden], .preempt-modal[hidden], .preempt-cooldown[hidden] { display: none; }
 .preempt-modal { position: fixed; inset: 0; z-index: 1050; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(15, 23, 42, 0.38); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); animation: tin .15s ease; }
 .preempt-dialog { width: min(420px, 100%); padding: 20px 20px 16px; border-radius: 16px; background: #fff; border: 1px solid var(--sc-color-border-neutral); box-shadow: 0 20px 48px rgba(0, 0, 0, 0.18); }
@@ -1356,7 +1359,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
         </div>
         <button class="btn btn-preempt" id="btn-preempt" hidden>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h11l-3-3"/><path d="M17 17H6l3 3"/></svg>
-          <span data-i18n="preempt.btn">接管控制权</span>
+          <span class="preempt-lbl"><span data-i18n="preempt.btn">接管控制权</span><small id="preempt-who"></small></span>
         </button>
       </div>
 
@@ -1674,7 +1677,8 @@ const I18N = {
     'en.enable': '使能', 'en.holding': '保持中 · 按住恢复', 'en.hold': '按住 0.6 秒', 'en.reset_estop': '⚠️ 点击复位急停', 'en.clear_fault': '⚠️ 点击清除故障', 'en.on_unconfirmed': '控制已开启 · 未确认',
     'en.sub_reset': '复位后再长按使能', 'en.sub_off': '按住 0.6 秒失能',
     'estop': '急停', 'estop.aria': '紧急停止',
-    'lock.offline': '遥测断开，控制已锁定', 'lock.observer': '当前为观察模式，其他页面可能正在控制',
+    'lock.offline': '遥测断开，控制已锁定', 'lock.observer': '当前为观察模式，其他页面可能正在控制', 'lock.observer_who': '观察模式：{who}正在控制机械臂',
+    'preempt.who': '控制方：{who}', 'who.cockpit': '另一个驾驶舱页面', 'who.agent': 'AI 智能体（{id}）', 'who.other': '其他客户端', 'who.named': '客户端 {id}',
     'lock.estop': '⚠️ 急停已锁定：点击「复位急停」，再长按「使能」', 'lock.fault': '⚠️ 故障：点击「清除故障」后长按「使能」', 'lock.disabled': '未使能：按住「使能」0.6 秒后即可控制',
     'preempt.btn': '接管控制权', 'preempt.title': '接管控制权确认',
     'preempt.body': '当前有其他设备或窗口持有控制权。确认接管机械臂控制权？接管后原控制窗口将切换为观察模式，正在进行的运动将被平稳悬停保持。',
@@ -1714,7 +1718,7 @@ const I18N = {
     'err.reqfail': '请求失败：无法连接 armd', 'err.servo_reject': '控制指令被拒绝: ', 'err.preset_reject': '预设指令被拒绝: ', 'err.state_limit': '状态或限位不符', 'err.workspace': '目标超出安全工作空间（地面/边界），已拒绝', 'act.running': '外部控制：移动中', 'act.done': '外部控制：完成', 'act.failed': '外部控制：失败（{code}）', 'act.cancelled': '外部控制：已取消（{code}）', 'err.disconnected': '控制连接已断开或控制权已变化',
     'toast.lease_preempted': '⚠️ 控制权已被其他设备接管，当前页面已切换为观察模式',
     'toast.lease_expired': '⚠️ 连接中断，控制权已释放；机械臂若处于上电状态会自动收回停靠',
-    'toast.lease_released': '本页面已释放控制权', 'toast.goto': '正在前往{name}', 'toast.took': '已成功接管控制权', 'toast.take_failed': '接管未成功，控制权仍由其他设备持有',
+    'toast.lease_released': '本页面已释放控制权', 'toast.lease_idle': '空闲 {s} 秒，已释放控制权；下次操作时自动取回', 'toast.lease_busy': '{who}正在控制，本页面为观察模式', 'toast.goto': '正在前往{name}', 'toast.took': '已成功接管控制权', 'toast.take_failed': '接管未成功，控制权仍由其他设备持有',
     'toast.take_rejected': '接管请求被拒绝: ', 'toast.take_timeout': '接管响应超时，正在对账控制权...', 'toast.ws_not_ready': '控制连接未就绪，请稍后再试',
     'toast.homing': '回零中', 'toast.estop_unconfirmed': '无法确认急停，请使用现场安全装置并检查机械臂状态', 'toast.estop_confirmed': '设备已确认急停锁定，仍可能保持力矩', 'toast.estop_timeout': '急停状态未确认，请检查现场安全装置',
     'toast.reset_ok': '已成功复位，请长按使能开启控制', 'toast.parked': '已收纳到位并安全断电', 'toast.unload_unconfirmed': '尚未确认安全卸载，力矩可能仍保持，请检查状态',
@@ -1816,7 +1820,8 @@ const I18N = {
     'en.enable': 'Enable', 'en.holding': 'Holding · hold to resume', 'en.hold': 'Hold 0.6 s', 'en.reset_estop': '⚠️ Tap to reset E-Stop', 'en.clear_fault': '⚠️ Tap to clear fault', 'en.on_unconfirmed': 'On · unconfirmed',
     'en.sub_reset': 'Then hold to enable', 'en.sub_off': 'Hold 0.6 s to disable',
     'estop': 'E-Stop', 'estop.aria': 'Emergency stop',
-    'lock.offline': 'Telemetry lost, controls locked', 'lock.observer': 'Observer mode: another page may be in control',
+    'lock.offline': 'Telemetry lost, controls locked', 'lock.observer': 'Observer mode: another page may be in control', 'lock.observer_who': 'Observer mode: {who} is controlling the arm',
+    'preempt.who': 'Held by {who}', 'who.cockpit': 'another cockpit page', 'who.agent': 'an AI agent ({id})', 'who.other': 'another client', 'who.named': 'client {id}',
     'lock.estop': '⚠️ E-Stop latched: tap "Reset E-Stop", then hold "Enable"', 'lock.fault': '⚠️ Fault: tap "Clear fault", then hold "Enable"', 'lock.disabled': 'Disabled: hold "Enable" for 0.6 s to take control',
     'preempt.btn': 'Take over control', 'preempt.title': 'Confirm take over',
     'preempt.body': 'Another device or window holds control. Take over control of the arm? The previous window will switch to observer mode and any motion in progress will be held steady.',
@@ -1856,7 +1861,7 @@ const I18N = {
     'err.reqfail': 'Request failed: cannot reach armd', 'err.servo_reject': 'Control command rejected: ', 'err.preset_reject': 'Preset command rejected: ', 'err.state_limit': 'state or limits mismatch', 'err.workspace': 'Target outside the safe workspace (floor/boundary), rejected', 'act.running': 'External control: moving', 'act.done': 'External control: done', 'act.failed': 'External control: failed ({code})', 'act.cancelled': 'External control: cancelled ({code})', 'err.disconnected': 'Control connection lost or lease changed',
     'toast.lease_preempted': '⚠️ Control was taken over by another device, this page is now an observer',
     'toast.lease_expired': '⚠️ Connection dropped, so control was released. If the arm was torqued, it parked itself',
-    'toast.lease_released': 'This page released control', 'toast.goto': 'Moving to {name}', 'toast.took': 'Control taken over', 'toast.take_failed': 'Take over failed, another device still holds control',
+    'toast.lease_released': 'This page released control', 'toast.lease_idle': 'Idle for {s} s, control released; it is taken back on the next input', 'toast.lease_busy': '{who} is in control, this page is an observer', 'toast.goto': 'Moving to {name}', 'toast.took': 'Control taken over', 'toast.take_failed': 'Take over failed, another device still holds control',
     'toast.take_rejected': 'Take over rejected: ', 'toast.take_timeout': 'Take over timed out, reconciling lease...', 'toast.ws_not_ready': 'Control connection not ready, try again shortly',
     'toast.homing': 'Homing', 'toast.estop_unconfirmed': 'E-Stop not confirmed, use the on-site safety device and check the arm', 'toast.estop_confirmed': 'Device confirmed E-Stop latch; torque may still be held', 'toast.estop_timeout': 'E-Stop state not confirmed, check the on-site safety device',
     'toast.reset_ok': 'Reset done, hold Enable to take control', 'toast.parked': 'Parked and powered off safely', 'toast.unload_unconfirmed': 'Safe unload not confirmed, torque may still be held, check the state',
@@ -1908,7 +1913,10 @@ const QS = new URLSearchParams(location.search);
 const CFG = {
   servoPeriodMs: 50,          // 20 Hz servo streaming while a button / stick / key is held
   heartbeatMs: 150,           // WS heartbeat, lease timeout on armd is 2500 ms
-  leaseRetryMs: 500,          // retry acquire_lease after lease_rejected / lease_lost
+  // The lease is acquired on the first control input and released after this long without
+  // one, only while torque is off (a release while torqued starts armd's watchdog park).
+  // ?lease_idle_ms= shortens it for tests.
+  leaseIdleMs: Math.max(500, Number(QS.get('lease_idle_ms')) || 30000),
   leaseAckTimeoutMs: 3000,    // no lease_granted/rejected for the current seq within this window -> onAcquireTimeout
   staleMs: 2000,              // telemetry older than this locks the controls (tolerance for Wi-Fi AP jitter)
   deadzone: 0.08,
@@ -2105,7 +2113,7 @@ const S = {
   gripCmdAt: 0,
   servoTarget: null, servoLastAt: 0, servoInflight: false,
   leaseGeneration: null,      // WS motion lease generation granted by armd (null = not held)
-  leaseRetryTimer: null,      // single pending non-force acquire_lease retry timer
+  lastIntentAt: 0,            // Date.now() of the last control input (idle lease release)
   preemptCooldownUntil: 0,    // Date.now() until which the preempt confirm button stays disabled
   sequenceId: 0,              // per-connection monotonic servo frame id
   rec: { active: false, startedAt: 0 },
@@ -2171,11 +2179,17 @@ function rpcError(response) {
   }
   return Object.assign(new Error(message), { code: response.code, status: response.status });
 }
-function commandRPC(path, body) {
+function commandRPC(path, body, acquire = true) {
+  // First control input: acquire the lease, then send. A stop needs no lease of ours:
+  // without one this page has nothing running to stop.
+  if (acquire && S.leaseGeneration == null && path !== '/api/v1/motion/stop' && S.ws && S.ws.readyState === 1) {
+    return ensureLease().then(() => commandRPC(path, body, false));
+  }
   if (!S.ws || S.ws.readyState !== 1 || S.leaseGeneration == null || S.epoch == null) {
     return Promise.reject(Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' }));
   }
   const request_id = ++nextRequestId, ws = S.ws;
+  if (path !== '/api/v1/motion/stop') S.lastIntentAt = Date.now();
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pendingCommands.delete(request_id);
@@ -2261,7 +2275,7 @@ function connectWS() {
   clearActiveAcquire();
   resetLease();
   S.sequenceId = 0;
-  ws.onopen = () => startAcquire(ws, false);
+  // No acquire on open: the lease is taken on the first control input (ensureLease).
   ws.onmessage = (ev) => {
     let o; try { o = JSON.parse(ev.data); } catch (_) { return; }
     if (S.ws !== ws) return;
@@ -2375,7 +2389,6 @@ function onLeaseLost(ws, o) {
   if (o.generation != null ? o.generation === S.leaseGeneration : S.leaseGeneration != null) {
     resetLease();
     toast(t(leaseLossKey(o.reason)), 'warn');
-    scheduleLeaseRetry(ws, CFG.leaseRetryMs);
   }
 }
 // A stale socket's late close must never reset the lease or close the modal of the current socket.
@@ -2402,8 +2415,7 @@ function resetLease() {
   resetPoseMode();
   C.tailUntil = 0; C.lastInput = -Infinity;
   S.gripCmdAt = 0;
-  clearTimeout(S.leaseRetryTimer);
-  S.leaseRetryTimer = null;
+  settleLeaseWaiters(Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' }));
 }
 
 /* ---------- acquire_lease lifecycle: one request in flight, matched by (ws, seq) ---------- */
@@ -2413,14 +2425,64 @@ function clearActiveAcquire() {
   if (activeAcquire && activeAcquire.timer) clearTimeout(activeAcquire.timer);
   activeAcquire = null;
 }
+// Who holds the lease, from the observation: null when this page holds it or nobody does.
+// armd publishes the holder's acquire_lease client_id label (this page's own is CLIENT_ID).
+function leaseOther() {
+  if (S.leaseGeneration != null || !S.obs) return null;
+  const h = S.obs.lease_holder;
+  return h == null || h === CLIENT_ID ? null : h;
+}
+function leaseHolderText(h) {
+  if (h == null) return t('who.other');
+  if (/^web-/.test(h)) return t('who.cockpit');
+  if (/^rebot-(mcp|companion)/.test(h)) return t('who.agent', { id: h });
+  return h ? t('who.named', { id: h }) : t('who.other');
+}
+const leaseBusyError = (h) => Object.assign(new Error(t('toast.lease_busy', { who: leaseHolderText(h) })), { code: 'LEASE_ACTIVE' });
+// Lazy acquire: resolves once this page holds the lease. One acquire_lease in flight; every
+// caller waiting meanwhile gets its result. Rejects when another client holds the lease.
+let leaseWaiters = [];
+function ensureLease() {
+  S.lastIntentAt = Date.now();
+  if (S.leaseGeneration != null) return Promise.resolve();
+  const other = leaseOther();
+  if (other != null) return Promise.reject(leaseBusyError(other));
+  if (!S.ws || S.ws.readyState !== 1) return Promise.reject(Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' }));
+  return new Promise((resolve, reject) => {
+    leaseWaiters.push({ resolve, reject });
+    if (!activeAcquire) startAcquire(S.ws, false);
+  });
+}
+function settleLeaseWaiters(error) {
+  const waiters = leaseWaiters;
+  leaseWaiters = [];
+  for (const w of waiters) { if (error) w.reject(error); else w.resolve(); }
+}
+// Release an idle lease: no control input for CFG.leaseIdleMs, torque off (armd parks a torqued
+// arm when its lease is released), and nothing running: action, gravity compensation, preset,
+// stream, held input, pending command or a moving arm.
+function leaseIdleReleasable() {
+  const o = S.obs;
+  if (!o || !isLive() || S.leaseGeneration == null || !S.ws || S.ws.readyState !== 1) return false;
+  if (Date.now() - S.lastIntentAt < CFG.leaseIdleMs) return false;
+  if (o.is_torqued || o.disable_pending || o.enable_state === 'Enabled') return false;
+  if (o.action?.state === 'running' || o.control_mode === 'gravity_comp' || o.gravity_comp?.phase) return false;
+  if (S.presetRunning || S.streamActive || S.servoTarget || unloading || GR.sending || activeAcquire || pendingCommands.size) return false;
+  if (commandVector().some((x) => x !== 0) || Object.values(cartVelocity()).some((x) => x !== 0) || cartGripVel() !== 0) return false;
+  if (S.state === 'Moving' || !Array.isArray(o.velocities) || o.velocities.some((v) => !(Math.abs(v) < 0.05))) return false;
+  return true;
+}
+setInterval(() => {
+  if (!leaseIdleReleasable()) return;
+  const ws = S.ws;
+  try { ws.send(JSON.stringify({ type: 'release_lease', client_id: CLIENT_ID, generation: S.leaseGeneration })); } catch (_) { return; }
+  resetLease();
+  toast(t('toast.lease_idle', { s: Math.round(CFG.leaseIdleMs / 1000) }), 'info');
+}, 250);
 // The only sender of acquire_lease. force=true only from the preempt confirm button.
 function startAcquire(ws, force = false) {
   if (!ws || ws.readyState !== 1 || S.ws !== ws) return;
   if (activeAcquire && activeAcquire.timer) clearTimeout(activeAcquire.timer);
-  if (S.leaseRetryTimer) {
-    clearTimeout(S.leaseRetryTimer);
-    S.leaseRetryTimer = null;
-  }
   const seq = ++acquireSeq;
   const req = { ws, seq, force, timer: null };
   req.timer = setTimeout(() => onAcquireTimeout(req), CFG.leaseAckTimeoutMs);
@@ -2434,11 +2496,16 @@ function onAcquireResponse(ws, msg) {
   clearTimeout(activeAcquire.timer);
   activeAcquire = null;
   if (msg.type === 'lease_granted') {
-    if (typeof msg.generation !== 'number') { scheduleLeaseRetry(ws, CFG.leaseRetryMs); renderPreemptModal(); return; }
-    const wasHeld = S.leaseGeneration != null;
+    if (typeof msg.generation !== 'number') {
+      settleLeaseWaiters(Object.assign(new Error(t('err.rejected')), { code: 'LEASE_REJECTED' }));
+      renderPreemptModal(); return;
+    }
     S.leaseGeneration = msg.generation;
+    S.lastIntentAt = Date.now();
     closePreemptModal();
-    if (req.force || !wasHeld) toast(t('toast.took'), 'ok');
+    // a lazy acquire on input is silent; a takeover is confirmed
+    if (req.force) toast(t('toast.took'), 'ok');
+    settleLeaseWaiters(null);
     return;
   }
   // lease_rejected
@@ -2447,24 +2514,26 @@ function onAcquireResponse(ws, msg) {
     const remaining = Math.max(0, Number(msg.remaining_ms) || 0);
     S.preemptCooldownUntil = Date.now() + remaining;
     openPreemptModal();
-    scheduleLeaseRetry(ws, CFG.leaseRetryMs);
+    settleLeaseWaiters(leaseBusyError(S.obs?.lease_holder));
     return;
   }
   if (msg.error === 'controller_busy') {
     if (req.force) { closePreemptModal(); toast(t('toast.take_failed'), 'err'); }
-    scheduleLeaseRetry(ws, CFG.leaseRetryMs);
+    const busy = leaseBusyError(S.obs?.lease_holder);
+    if (!req.force) toastOnce(busy);
+    settleLeaseWaiters(busy);
     renderPreemptModal();
     return;
   }
   if (req.force) { closePreemptModal(); toast(t('toast.take_rejected') + (msg.message || msg.error || t('unknown_reason')), 'err'); }
-  scheduleLeaseRetry(ws, CFG.leaseRetryMs);
+  settleLeaseWaiters(Object.assign(new Error(t('err.rejected') + ': ' + (msg.message || msg.error || t('unknown_reason'))), { code: 'LEASE_REJECTED' }));
   renderPreemptModal();
 }
 function onAcquireTimeout(req) {
   if (activeAcquire !== req || S.ws !== req.ws) return;
   activeAcquire = null;
   if (!req.force) {
-    scheduleLeaseRetry(req.ws, CFG.leaseRetryMs);
+    settleLeaseWaiters(Object.assign(new Error(t('err.cmdtimeout')), { code: 'COMMAND_TIMEOUT' }));
     return;
   }
   // Forced acquire timed out: the server may or may not have granted it. Reconcile with a plain
@@ -2473,16 +2542,6 @@ function onAcquireTimeout(req) {
   toast(t('toast.take_timeout'), 'warn');
   startAcquire(req.ws, false);
 }
-function scheduleLeaseRetry(ws, delay) {
-  if (S.ws !== ws || activeAcquire != null) return;
-  clearTimeout(S.leaseRetryTimer);
-  S.leaseRetryTimer = setTimeout(() => {
-    S.leaseRetryTimer = null;
-    if (S.ws !== ws || ws.readyState !== 1 || activeAcquire != null) return;
-    startAcquire(ws, false);
-  }, delay);
-}
-
 /* ---------- preempt confirmation modal ---------- */
 let preemptTick = null;
 function openPreemptModal() {
@@ -2507,7 +2566,7 @@ function renderPreemptModal() {
   if (left > 0) setText(note, t('preempt.cool', { s: Math.ceil(left / 1000) }));
 }
 $('btn-preempt').addEventListener('click', () => {
-  if (S.leaseGeneration != null) return;
+  if (S.leaseGeneration != null || leaseOther() == null) return;
   openPreemptModal();
 });
 $('preempt-cancel').addEventListener('click', closePreemptModal);
@@ -3989,7 +4048,8 @@ async function loadSchema() {
 
 function lockReason() {
   if (!isLive()) return t('lock.offline');
-  if (S.leaseGeneration == null) return t('lock.observer');
+  const other = leaseOther();
+  if (other != null) return t('lock.observer_who', { who: leaseHolderText(other) });
   if (S.state === 'EStop') return t('lock.estop');
   if (S.state === 'Fault') return t('lock.fault');
   return t('lock.disabled');
@@ -4527,8 +4587,9 @@ function cartSend(t) {
 function sendServoFrame(positions) {
   if (gcOn()) return false; // the server would answer MOTION_BUSY
   if (!S.ws || S.ws.readyState !== 1) return false;
-  if (S.leaseGeneration == null) return false;
+  if (S.leaseGeneration == null) { ensureLease().catch(toastOnce); return false; } // first frame of an input: acquire
   S.streamActive = true;
+  S.lastIntentAt = Date.now();
   S.ws.send(JSON.stringify({
     type: 'servo',
     client_id: CLIENT_ID,
@@ -5202,9 +5263,10 @@ async function disableTorque({ fallback = true } = {}) {
 const gcOn = () => S.obs?.control_mode === 'gravity_comp';
 function gcBlockText() {
   if (!isLive()) return t('gc.b.offline');
-  if (S.leaseGeneration == null) return t('gc.b.observer');
+  if (leaseOther() != null) return t('gc.b.observer');
   const b = S.obs?.gravity_comp?.blocker;
-  if (!b) return null;
+  // not held but free: the switch acquires the lease first
+  if (!b || (b.code === 'LEASE_REQUIRED' && S.leaseGeneration == null)) return null;
   const k = 'gc.b.' + b.code;
   return t(k) !== k ? t(k) : (b.message || b.code);
 }
@@ -5395,7 +5457,9 @@ async function runPreset(name) {
   };
 
   try {
+    if (S.ws && S.ws.readyState === 1) await ensureLease();
     if (S.ws && S.ws.readyState === 1 && S.leaseGeneration != null) {
+      S.lastIntentAt = Date.now();
       S.ws.send(JSON.stringify({
         type: 'preset',
         name: name,
@@ -6384,7 +6448,7 @@ function frame(ts) {
   const live = isLive();
   const q = S.obs ? S.obs.positions : [0, 0, 0, 0, 0, 0];
   const v = commandVector();
-  const op = live && isOperational() && S.leaseGeneration != null;
+  const op = live && isOperational() && leaseOther() == null;
   const torqued = !!(S.obs && S.obs.is_torqued);
   const act = v.map((x) => op && x !== 0);
   if (S.mode === 'cart' && op && C.sending) { for (let i = 0; i < 4; i++) act[i] = true; act[GRIP] = Date.now() - S.gripCmdAt < 400; }
@@ -6423,8 +6487,10 @@ function frame(ts) {
   const holdingIdle = live && !stopped && !op && S.state === 'Idle' && torqued;
   setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop') : t('en.clear_fault')) : op ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
   setText($('enable-sub'), stopped ? t('en.sub_reset') : op ? t('en.sub_off') : t('en.hold'));
-  eb.disabled = !live || S.leaseGeneration == null;
-  $('btn-preempt').hidden = !live || !(S.ws && S.ws.readyState === 1) || S.leaseGeneration != null;
+  eb.disabled = !live || leaseOther() != null;
+  const holder = leaseOther();
+  $('btn-preempt').hidden = !live || !(S.ws && S.ws.readyState === 1) || holder == null;
+  setText($('preempt-who'), holder == null ? '' : t('preempt.who', { who: leaseHolderText(holder) }));
 
   // jog rows
   rows.forEach((r, i) => {
