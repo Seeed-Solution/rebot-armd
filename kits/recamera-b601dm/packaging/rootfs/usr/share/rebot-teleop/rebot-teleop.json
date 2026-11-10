@@ -4,8 +4,8 @@
   "name_zh": "reBot 具身视觉遥控与机械臂驱动",
   "scene": "Robotics & Embodied AI",
   "scene_zh": "机器人与具身智能",
-  "description": "reBot B601-DM arm control on the reCamera: arm on the B4 board CAN bus, Wi-Fi AP hotspot, browser cockpit with touch teleoperation, hand-eye calibration, tap-to-grasp and LeRobot dataset recording. Vision is included (H.264 video, YOLO object detection on the TPU, ArUco markers); no other camera app is needed.",
-  "description_zh": "reCamera 上的 reBot B601-DM 机械臂控制：机械臂接 B4 底板 CAN 总线，开机自启 Wi-Fi 热点，浏览器驾驶舱支持触屏遥控、手眼标定、点选抓取与 LeRobot 数据录制。已内置视觉（H.264 视频、TPU 运行 YOLO 物体识别、ArUco 标记识别），无需再安装其他相机应用。",
+  "description": "reBot B601-DM arm control on the reCamera: arm on the B4 board CAN bus, Wi-Fi AP hotspot, browser cockpit with touch teleoperation, hand-eye calibration, tap-to-grasp, gravity-compensation hand-guiding and recording to Parquet files. Vision is included (H.264 video, YOLO object detection on the TPU, ArUco markers); no other camera app is needed.",
+  "description_zh": "reCamera 上的 reBot B601-DM 机械臂控制：机械臂接 B4 底板 CAN 总线，开机自启 Wi-Fi 热点，浏览器驾驶舱支持触屏遥控、手眼标定、点选抓取、重力补偿拖动示教与 Parquet 录制。已内置视觉（H.264 视频、TPU 运行 YOLO 物体识别、ArUco 标记识别），无需再安装其他相机应用。",
   "type": "native",
   "init_script": "/etc/init.d/K92rebot-teleop",
   "stream_mode": "ws",
@@ -29,7 +29,7 @@
             "type": "select",
             "title": "Arm Model",
             "title_zh": "机械臂型号",
-            "options": ["rebot-dm", "so-arm101", "rebot-rs", "mock"],
+            "options": ["rebot-dm", "mock"],
             "default": "rebot-dm"
           },
           {
