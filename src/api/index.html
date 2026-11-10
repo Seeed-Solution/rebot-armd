@@ -1177,6 +1177,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           <span class="sc-status-badge is-danger" id="rec-chip" data-i18n="rec.chip0">录制 00:00</span>
           <span class="sc-status-badge" id="gc-chip" data-i18n="gc.chip">拖动示教</span>
           <span class="sc-status-badge" id="act-chip" role="status" aria-live="polite" hidden></span>
+          <span class="sc-status-badge is-info" id="ml-chip" role="status" aria-live="polite" hidden></span>
         </div>
         <div class="armview only-expert" id="armview">
           <span class="tag" data-i18n="armview.tag">姿态示意 · 侧视</span>
@@ -1714,7 +1715,9 @@ const I18N = {
     'jd.wyaw.part': '手腕', 'jd.wyaw.motion': '末端摆动', 'jd.wyaw.neg': '摆左', 'jd.wyaw.pos': '摆右',
     'jd.grip.part': '夹爪', 'jd.grip.motion': '开合抓取', 'jd.grip.neg': '张开', 'jd.grip.pos': '闭合夹紧', 'jd.grip.pos2': '夹紧',
     'ik.reach': '超出臂展范围，该方向已停止', 'ik.singular': '接近奇异位形（完全伸直或折叠），该方向已停止', 'ik.limit': '目标需要超出关节限位，该方向已停止',
-    'ik.jump': '该位姿需要翻转关节构型，已拒绝', 'ik.pose': '该姿态超出可达范围，已拒绝', 'ik.floor': '已到达安装平面高度下限', 'ik.lag': '电机响应滞后过大(>0.4rad)，已安全停机',
+    'ik.jump': '该位姿需要翻转关节构型，已拒绝', 'ik.pose': '该姿态超出可达范围，已拒绝', 'ik.floor': '已到达安装平面高度下限', 'ik.lag': '电机跟不上，已暂停该方向',
+    'ml.limit': '{j} 已到限位，该方向已停止', 'ml.slow_big': '大关节跟不上，已减速', 'ml.slow': '电机跟不上，已减速',
+    'ml.blocked': '{j} 受阻，已停在当前位置', 'ml.workspace': '已到工作范围边界，该方向已停止',
     'ik.blocked': 'IK 拦截', 'ik.stream': 'IK 流式 {hz}Hz', 'ik.ready': 'IK 就绪', 'ik.per_solve': ' µs/次',
     'cart.enable_first': '使能后可控制末端位姿', 'cart.following': '目标跟随实测位姿 · 分支 {branch} · {tx}', 'cart.tx_ws': 'WS 流', 'cart.tx_rest': 'REST 伺服',
     'wait_arm': '等待机械臂连接', 'wait_telemetry': '等待遥测', 'ready': '电机就绪 · 可以操控',
@@ -1857,7 +1860,9 @@ const I18N = {
     'jd.wyaw.part': 'Wrist', 'jd.wyaw.motion': 'End swing', 'jd.wyaw.neg': 'Swing L', 'jd.wyaw.pos': 'Swing R',
     'jd.grip.part': 'Gripper', 'jd.grip.motion': 'Open / close', 'jd.grip.neg': 'Open', 'jd.grip.pos': 'Close', 'jd.grip.pos2': 'Close',
     'ik.reach': 'Out of reach, motion in this direction stopped', 'ik.singular': 'Near singularity (fully extended or folded), motion in this direction stopped', 'ik.limit': 'Target exceeds joint limits, motion in this direction stopped',
-    'ik.jump': 'Pose needs a joint configuration flip, rejected', 'ik.pose': 'Pose out of reach, rejected', 'ik.floor': 'Reached the mounting-plane height limit', 'ik.lag': 'Motor lag too large (>0.4 rad), safely stopped',
+    'ik.jump': 'Pose needs a joint configuration flip, rejected', 'ik.pose': 'Pose out of reach, rejected', 'ik.floor': 'Reached the mounting-plane height limit', 'ik.lag': "Motors can't keep up; paused this direction",
+    'ml.limit': '{j} at its limit; this direction stopped', 'ml.slow_big': 'Slowed to what the motors can follow', 'ml.slow': 'Slowed to what the motors can follow',
+    'ml.blocked': '{j} blocked; holding position', 'ml.workspace': 'At the workspace boundary; this direction stopped',
     'ik.blocked': 'IK blocked', 'ik.stream': 'IK stream {hz} Hz', 'ik.ready': 'IK ready', 'ik.per_solve': ' µs/solve',
     'cart.enable_first': 'Enable to control end-effector pose', 'cart.following': 'Target follows measured pose · branch {branch} · {tx}', 'cart.tx_ws': 'WS stream', 'cart.tx_rest': 'REST servo',
     'wait_arm': 'Waiting for arm connection', 'wait_telemetry': 'Waiting for telemetry', 'ready': 'Motors ready · ready to control',
@@ -2347,6 +2352,7 @@ function connectWS() {
     S.obs = o; S.obsAt = Date.now(); S.wsCount++;
     gcOnObs(o);
     renderActionChip(o);
+    renderMotionLimit(o);
     graspOnObs(o);
     syncEpoch(o.epoch_id);
     const st = parseState(o.safety_state);
@@ -4512,6 +4518,27 @@ function renderActionChip(o) {
   el.classList.toggle('is-warn', a.state === 'running');
   el.classList.toggle('is-ok', a.state === 'done');
   el.classList.toggle('is-danger', a.state === 'failed' || a.state === 'cancelled');
+}
+// observation.motion_limit (armd's servo guard) as a short hint chip. speed / lead show only
+// after 1 s, and every hint stays 1 s after the limit clears, so short limits do not flicker.
+const ML = { key: '', j: '', until: 0, blocked: false };
+function renderMotionLimit(o) {
+  const el = $('ml-chip');
+  if (!el) return;
+  const ml = o.motion_limit, now = Date.now();
+  if (ml) {
+    const age = o.timestamp * 1000 - ml.since_ms;
+    const key = ml.reason === 'joint_limit' ? 'ml.limit' : ml.reason === 'blocked' ? 'ml.blocked'
+      : ml.reason === 'workspace' ? 'ml.workspace'
+      : age >= 1000 ? (ml.joint != null && ml.joint < 3 ? 'ml.slow_big' : 'ml.slow') : '';
+    if (key) { ML.key = key; ML.j = ml.joint == null ? '' : 'J' + (ml.joint + 1); ML.until = now + 1000; }
+    // armd ended the stream in a hold: drop the queued motion once so the goal does not pull on
+    if (ml.reason === 'blocked' && !ML.blocked) cartHoldStill();
+    ML.blocked = ml.reason === 'blocked';
+  } else ML.blocked = false;
+  const show = !!ML.key && now < ML.until;
+  el.hidden = !show;
+  if (show) setText(el, t(ML.key, { j: ML.j }));
 }
 function cartReject(err) {
   C.goal = { ...C.cmd };
