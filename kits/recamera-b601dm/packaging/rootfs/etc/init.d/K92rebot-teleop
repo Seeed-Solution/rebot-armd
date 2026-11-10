@@ -243,6 +243,7 @@ stop_own_ap() {
 # every 2 s for AP_GUARD_TICKS ticks, stop a console hostapd that appeared and restart ours
 # (band $1, channel $2) when it is no longer running or no longer on its channel.
 ap_guard() {
+    has_wifi || { rm -f "$AP_GUARD_PIDFILE"; return 0; }
     t=0
     off=0
     while [ "$t" -lt "${AP_GUARD_TICKS:-30}" ]; do
@@ -288,7 +289,18 @@ start_ap_guard() {
     start-stop-daemon -S -b -m -p "$AP_GUARD_PIDFILE" -a /bin/sh -- "$INIT_SCRIPT" ap-guard "$1" "$2" >/dev/null 2>&1 || true
 }
 
+# True when the device has a Wi-Fi interface. Some models (e.g. PoE) have none; then the STA
+# connection, the AP hotspot and its guard are skipped and armd runs on the wired network.
+has_wifi() {
+    [ -e /sys/class/net/wlan0 ] || [ -e /sys/class/net/wlan1 ]
+}
+
 start_wifi() {
+    if ! has_wifi; then
+        echo "[rebot-teleop] no Wi-Fi interface on this device; Wi-Fi client and AP hotspot skipped"
+        logger -t "$NAME" "no Wi-Fi interface (wlan0/wlan1); Wi-Fi client and AP hotspot skipped" 2>/dev/null || true
+        return 0
+    fi
     # 1. 启动 STA 外部 WiFi（如果配置了 sta_ssid）
     if [ -n "$STA_SSID" ]; then
         echo "[rebot-teleop] Connecting to external Wi-Fi: $STA_SSID..."

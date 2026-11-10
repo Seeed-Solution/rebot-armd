@@ -171,6 +171,8 @@ armd 之后 init 脚本启动 `rebot-vision`（nice 10，由 `/usr/share/rebot-t
 
 热点默认使用 5 GHz（`network.ap_band: "5g"`，信道 44，802.11n/ac，20 MHz 带宽）。把 `network.ap_band` 设为 `"2g4"` 改用 2.4 GHz（信道 6）。`network.ap_channel` 指定信道，`0` 或不设置时使用默认信道。启动后若 hostapd 未在 5 GHz 信道上运行（用 `iw dev wlan1 info` 检查），init 脚本改用 2.4 GHz 信道 6 重新启动，并把回退记录到 syslog。
 
+设备没有 Wi-Fi 网卡（没有 `wlan0`/`wlan1`，例如 PoE 版本）时，init 脚本跳过 Wi-Fi 联网、热点及热点守护，并记录到 syslog；通过有线网络访问 armd。
+
 安装或升级后，若本应用是控制台当前的活动应用（或设备没有控制台），`postinst` 会启动它。驾驶舱地址：`http://<摄像头地址>:8765/`。
 
 armd 通过 `http://127.0.0.1:8090` 访问视觉进程（可用 `ARMD_DETECTOR_URL` 修改）。`--flavor lite` 不含视觉进程，此时识别、标定和抓取不可用，驾驶舱其他功能正常。
