@@ -82,6 +82,7 @@ pub fn create_router_full(
         .route("/api/v1/dataset/record/discard", post(rest::dataset_record_discard))
         .route("/api/v1/diagnostics/boots", get(diagnostics::get_boots))
         .route("/api/v1/diagnostics/blackbox", get(diagnostics::get_blackbox))
+        .route("/api/v1/diagnostics/tick", get(diagnostics::get_tick))
         .route("/api/v1/ws", get(ws::ws_handler))
         // Single-Origin Reverse Proxy Routes
         .route("/api/v1/detection/ws", get(proxy::proxy_detection_ws))

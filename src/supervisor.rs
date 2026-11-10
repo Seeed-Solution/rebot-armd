@@ -2734,6 +2734,7 @@ pub struct ArmSupervisor {
     inner: Arc<RwLock<SupervisorInner>>,
     telemetry_tx: broadcast::Sender<ArmObservation>,
     pub e_stop_latched: Arc<AtomicBool>,
+    tick_stats: std::sync::Mutex<crate::diagnostics::tick::TickStats>,
 }
 
 impl ArmSupervisor {
@@ -2746,6 +2747,7 @@ impl ArmSupervisor {
             inner: Arc::new(RwLock::new(inner)),
             telemetry_tx: tx,
             e_stop_latched,
+            tick_stats: std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default()),
         }
     }
 
@@ -3022,12 +3024,22 @@ impl ArmSupervisor {
 
     /// Execute a control cycle step
     pub async fn tick(&self, dt: f64) -> ArmObservation {
-        let obs = {
+        let started = Instant::now();
+        let (obs, lock_held, control_hz) = {
             let mut inner = self.inner.write().await;
-            inner.tick(dt)
+            let locked = Instant::now();
+            let obs = inner.tick(dt);
+            (obs, locked.elapsed(), inner.config.control_frequency_hz)
         };
         // Broadcast observation to any active WebSocket listeners
         let _ = self.telemetry_tx.send(obs.clone());
+        let late = !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1));
+        self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).record(started.elapsed(), lock_held, late);
         obs
+    }
+
+    /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`).
+    pub fn tick_stats(&self) -> crate::diagnostics::tick::TickSnapshot {
+        self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).snapshot()
     }
 }
