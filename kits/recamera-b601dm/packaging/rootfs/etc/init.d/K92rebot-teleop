@@ -30,6 +30,15 @@ VISION_PIDFILE=/var/run/rebot-vision.pid
 VISION_CONF=/userdata/rebot-teleop/vision.json
 VISION_CONF_DEFAULT=/usr/share/$NAME/vision.json.default
 VISION_STOP_TICKS=40  # stop_vision waits up to 40 x 0.25 s for rebot-vision to exit
+# User program (rebot-app-run keeps /userdata/rebot-apps/<name>/main.py running), started
+# after armd when the config has app.enabled true and app.name set
+APP_RUNNER=/usr/share/$NAME/rebot-app-run
+APP_PIDFILE=/var/run/rebot-app.pid
+APP_NAMEFILE=/var/run/rebot-app.name
+APP_DIR_BASE=/userdata/rebot-apps
+APP_STOP_TICKS=60  # stop_app waits up to 60 x 0.25 s (the runner sends SIGKILL after 10 s)
+APP_ENABLED=""
+APP_NAME=""
 # Gallery apps that hold the camera. Only ones running from their own pidfile are stopped,
 # with their own init script; nothing is disabled or uninstalled.
 CAMERA_APPS="yolo-detector aruco-detector face-analysis face-recognition detection-blur ppocr-reader retail-vision qrcode-reader trigger-inspection-demo microduck-pose-qa fall-detection"
@@ -67,6 +76,7 @@ try:
         cfg = json.load(f)
     arm = cfg.get('arm', {})
     net = cfg.get('network', {})
+    app = cfg.get('app', {})
     if 'follower_model' in arm and arm['follower_model']: print(f\"FOLLOWER_MODEL='{arm['follower_model']}'\")
     if 'serial_port' in arm and arm['serial_port']: print(f\"FOLLOWER_PORT='{arm['serial_port']}'\")
     if 'port' in cfg and cfg['port']: print(f\"PORT='{cfg['port']}'\")
@@ -77,6 +87,9 @@ try:
     if str(net.get('ap_channel', '')).isdigit() and int(net['ap_channel']) > 0: print(f\"AP_CHANNEL='{int(net['ap_channel'])}'\")
     if 'sta_ssid' in net: print(f\"STA_SSID='{net['sta_ssid']}'\")
     if 'sta_password' in net: print(f\"STA_PASS='{net['sta_password']}'\")
+    import re
+    if app.get('enabled') in (True, 'true', 'True', 1, '1'): print(\"APP_ENABLED='1'\")
+    if isinstance(app.get('name'), str) and re.fullmatch(r'[A-Za-z0-9._-]+', app['name']) and app['name'] not in ('.', '..'): print(f\"APP_NAME='{app['name']}'\")
 except Exception:
     pass
 " 2>/dev/null)
@@ -391,6 +404,99 @@ register_active_app() {
     return 0
 }
 
+# PID of the app runner from its pidfile, if that process is the runner.
+app_pid() {
+    APID=$(cat "$APP_PIDFILE" 2>/dev/null)
+    case "$APID" in ''|*[!0-9]*) return 1 ;; esac
+    [ -d "/proc/$APID" ] || return 1
+    tr '\000' ' ' < "/proc/$APID/cmdline" 2>/dev/null | grep -q "$APP_RUNNER" || return 1
+    echo "$APID"
+}
+
+# app-start [name]: run /userdata/rebot-apps/<name> under rebot-app-run (name: argument, else
+# app.name of the config). Never fails the app start; returns 1 for a manual app-start that
+# could not start.
+start_app() {
+    ANAME=${1:-$APP_NAME}
+    if [ -z "$ANAME" ]; then
+        echo "[rebot-teleop] no app name (give one, or set app.name in the config)"
+        return 1
+    fi
+    case "$ANAME" in
+        *[!A-Za-z0-9._-]*|.|..) echo "[rebot-teleop] invalid app name: $ANAME"; return 1 ;;
+    esac
+    if [ ! -f "$APP_RUNNER" ]; then
+        echo "[rebot-teleop] $APP_RUNNER not installed"
+        return 1
+    fi
+    if [ ! -d "$APP_DIR_BASE/$ANAME" ]; then
+        echo "[rebot-teleop] $APP_DIR_BASE/$ANAME does not exist"
+        return 1
+    fi
+    if APID=$(app_pid); then
+        echo "[rebot-teleop] app $(cat "$APP_NAMEFILE" 2>/dev/null) is already running (PID: $APID); app-stop first"
+        return 1
+    fi
+    rm -f "$APP_PIDFILE"
+    echo "$ANAME" > "$APP_NAMEFILE"
+    start-stop-daemon -S -b -m -p "$APP_PIDFILE" -a /bin/sh -- "$APP_RUNNER" "$ANAME"
+    sleep 0.5
+    if APID=$(app_pid); then
+        echo "[rebot-teleop] app $ANAME started (PID: $APID, log $PERSIST_LOG_DIR/app-$ANAME.log)"
+    else
+        echo "[rebot-teleop] app $ANAME did not start; see $PERSIST_LOG_DIR/app-$ANAME.log"
+        return 1
+    fi
+    return 0
+}
+
+# Stop the app runner: SIGTERM; it forwards SIGTERM to the program and sends SIGKILL after
+# 10 s. A pidfile naming another process is left alone.
+stop_app() {
+    [ -f "$APP_PIDFILE" ] || return 0
+    APID=$(cat "$APP_PIDFILE" 2>/dev/null)
+    case "$APID" in ''|*[!0-9]*) rm -f "$APP_PIDFILE"; return 0 ;; esac
+    if [ ! -d "/proc/$APID" ]; then rm -f "$APP_PIDFILE"; return 0; fi
+    if ! tr '\000' ' ' < "/proc/$APID/cmdline" 2>/dev/null | grep -q "$APP_RUNNER"; then
+        echo "PID $APID is not $APP_RUNNER; leaving it"
+        return 0
+    fi
+    kill -TERM "$APID" 2>/dev/null || true
+    w=0
+    while [ "$w" -lt "$APP_STOP_TICKS" ] && proc_alive "$APID"; do sleep 0.25; w=$((w + 1)); done
+    if proc_alive "$APID"; then
+        echo "app runner still stopping (PID $APID)"
+    else
+        rm -f "$APP_PIDFILE"
+        echo "app stopped"
+    fi
+    return 0
+}
+
+app_status() {
+    ANAME=$(cat "$APP_NAMEFILE" 2>/dev/null)
+    if APID=$(app_pid); then
+        echo "app $ANAME runner is running (PID: $APID)"
+        cat "/tmp/rebot-app-$ANAME.state" 2>/dev/null
+        return 0
+    fi
+    echo "app runner is not running"
+    [ -n "$ANAME" ] && cat "/tmp/rebot-app-$ANAME.state" 2>/dev/null
+    return 1
+}
+
+# app-logs [n]: last n lines (default 50) of the log of the current (or last) app
+app_logs() {
+    ANAME=$(cat "$APP_NAMEFILE" 2>/dev/null)
+    [ -n "$ANAME" ] || ANAME=$APP_NAME
+    if [ -z "$ANAME" ] || [ ! -f "$PERSIST_LOG_DIR/app-$ANAME.log" ]; then
+        echo "no app log"
+        return 1
+    fi
+    case "${1:-50}" in ''|*[!0-9]*) echo "usage: app-logs [n]"; return 1 ;; esac
+    tail -n "${1:-50}" "$PERSIST_LOG_DIR/app-$ANAME.log"
+}
+
 port_busy() {
     command -v netstat >/dev/null 2>&1 || return 1
     netstat -ltn 2>/dev/null | grep -q "[:.]$1 "
@@ -448,6 +554,7 @@ start() {
             # armd already up (boot S92 then a console switch, or app_restore): make sure vision runs too
             echo "$NAME is already running (PID: $PID)"
             start_vision
+            if [ "$APP_ENABLED" = 1 ] && [ -n "$APP_NAME" ] && ! app_pid >/dev/null; then start_app || true; fi
             register_active_app || true
             return 0
         fi
@@ -515,6 +622,7 @@ start() {
     stop_video
 
     start_vision
+    if [ "$APP_ENABLED" = 1 ] && [ -n "$APP_NAME" ]; then start_app || true; fi
     register_active_app || true
     return 0
 }
@@ -585,6 +693,7 @@ stop_vision() {
 stop() {
     echo "Stopping $NAME..."
     stop_ap_guard
+    stop_app
     stop_vision
     if [ ! -f "$PIDFILE" ]; then
         if ! command -v pidof >/dev/null 2>&1 || pidof armd >/dev/null 2>&1; then
@@ -658,8 +767,12 @@ case "$1" in
     status) status; exit $? ;;
     register) register_active_app; exit $? ;;
     stop-vision) stop_vision; exit $? ;;
+    app-start) start_app "$2"; exit $? ;;
+    app-stop) stop_app; exit $? ;;
+    app-status) app_status; exit $? ;;
+    app-logs) app_logs "$2"; exit $? ;;
     ap-guard) ap_guard "$2" "$3"; exit 0 ;;
-    *) echo "Usage: $0 {start|stop|restart|status|register|stop-vision|ap-guard}"; exit 1 ;;
+    *) echo "Usage: $0 {start|stop|restart|status|register|stop-vision|ap-guard|app-start [name]|app-stop|app-status|app-logs [n]}"; exit 1 ;;
 esac
 
 exit 0

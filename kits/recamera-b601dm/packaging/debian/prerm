@@ -2,6 +2,7 @@
 set -e
 
 if [ -x /etc/init.d/K92rebot-teleop ]; then
+    /etc/init.d/K92rebot-teleop app-stop || true
     /etc/init.d/K92rebot-teleop stop || true
 fi
 

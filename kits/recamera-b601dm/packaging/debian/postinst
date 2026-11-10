@@ -8,6 +8,9 @@ cp -f /usr/share/rebot-teleop/rebot-teleop.md /userdata/local/apps/rebot-teleop.
 
 mkdir -p /userdata/datasets
 
+# user programs run by rebot-app-run (/userdata/rebot-apps/<name>/main.py); kept across upgrades
+mkdir -p /userdata/rebot-apps
+
 # rebot-vision: config and user models live on /userdata (models are not in the package)
 mkdir -p /userdata/rebot-teleop/models
 # armd (root) writes its rotating log and black box here; kept across upgrades and removal

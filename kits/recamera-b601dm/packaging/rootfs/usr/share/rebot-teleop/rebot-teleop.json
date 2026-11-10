@@ -105,6 +105,27 @@
             "default": ""
           }
         ]
+      },
+      {
+        "key": "app",
+        "title": "Your Program",
+        "title_zh": "自定义程序",
+        "items": [
+          {
+            "key": "enabled",
+            "type": "boolean",
+            "title": "Start the program at boot (restarts after a crash)",
+            "title_zh": "开机自动运行（崩溃后自动重启）",
+            "default": false
+          },
+          {
+            "key": "name",
+            "type": "text",
+            "title": "Program name (directory /userdata/rebot-apps/<name> with main.py)",
+            "title_zh": "程序名称（目录 /userdata/rebot-apps/<name>，内含 main.py）",
+            "default": ""
+          }
+        ]
       }
     ]
   }
