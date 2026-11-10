@@ -20,7 +20,8 @@ Build (from the repository root):
 
 ```bash
 export RECAMERA_TOOLCHAIN=<path>/host-tools/gcc/riscv64-linux-musl-x86_64
-export RECAMERA_DOCKER=tpuc_recamera   # tpuc_dev container for rebot-vision (or REBOT_VISION_BIN=<binary>)
+export REBOT_VISION_BIN=<binary>       # prebuilt rebot-vision from the GitHub release, or
+# export RECAMERA_DOCKER=<container>   # a tpuc_dev container to build it (vision/README.md, "Build")
 ./scripts/build_deb.sh                 # --flavor recamera (default): core + this kit
 # -> dist/rebot-teleop_1.3.4_riscv64.deb
 ```

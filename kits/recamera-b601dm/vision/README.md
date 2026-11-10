@@ -246,17 +246,66 @@ metadata, person tracking with dwell and zone / line counting, privacy blur, the
 `scripts/build_vision.sh` cross-compiles against an `sscma-example-sg200x` checkout used as an SDK
 (`SSCMA_ROOT`, at the commit in `sscma.lock`; CMake stops on another commit unless
 `REBOT_VISION_ALLOW_UNPINNED=1`), the reCamera OS SDK (`SG200X_SDK_PATH`) and the musl toolchain
-from sophgo host-tools. With a running `sophgo/tpuc_dev` container that mounts those under
-`/recamera`:
+from sophgo host-tools, inside a running `sophgo/tpuc_dev` container that mounts those under
+`/recamera`.
+
+If you only need the deb, skip this: download `rebot-vision-<version>-riscv64` and `SHA256SUMS`
+from the [GitHub releases](https://github.com/Seeed-Solution/rebot-armd/releases) and pass the
+binary with `REBOT_VISION_BIN=<binary> scripts/build_deb.sh --flavor recamera` (see the root
+README, "Cross-compile for reCamera").
+
+From source, all inputs public (run from a work directory next to the `rebot-armd` checkout):
 
 ```sh
-RECAMERA_DOCKER=tpuc_recamera scripts/build_vision.sh        # -> target/vision-riscv/rebot-vision
-RECAMERA_DOCKER=tpuc_recamera RECAMERA_TOOLCHAIN=... scripts/build_deb.sh --flavor recamera
+# 1. Inputs
+git clone --depth 1 https://github.com/sophgo/host-tools              # 9.3 GB checkout
+curl -LO https://github.com/Seeed-Studio/reCamera-OS/releases/download/0.2.4/sg2002_reCamera_0.2.4_emmc_sdk.tar.gz  # 349 MB
+echo "1c0b5fe3d43c24f3e56eb5ba89bc73e93a07d688282500969d5a2603efcd94f3  sg2002_reCamera_0.2.4_emmc_sdk.tar.gz" | sha256sum -c
+tar -xzf sg2002_reCamera_0.2.4_emmc_sdk.tar.gz         # -> sg2002_recamera_emmc/ (1.2 GB)
+git clone https://github.com/suharvest/sscma-example-sg200x
+git -C sscma-example-sg200x checkout \
+   $(sed -n 's/^commit=//p' rebot-armd/kits/recamera-b601dm/vision/sscma.lock)
+git -C sscma-example-sg200x submodule update --init
+
+# 2. Build container (sophgo/tpuc_dev is amd64 only, 7.8 GB; on an arm64 host it runs
+#    through an x86_64 qemu-user binfmt handler, e.g. Debian/Ubuntu qemu-user-static)
+docker run -d --name rebot_vision_build --platform linux/amd64 \
+  -v $PWD/host-tools:/recamera/host-tools \
+  -v $PWD/sg2002_recamera_emmc:/recamera/sg2002_recamera_emmc \
+  -v $PWD/sscma-example-sg200x:/recamera/sscma-example-sg200x \
+  sophgo/tpuc_dev:v3.1 sleep infinity
+
+# 3. libwebsockets, once per sscma-example-sg200x clone (-> components/libwebsockets/prebuilt)
+docker exec rebot_vision_build bash -c '
+  export SG200X_SDK_PATH=/recamera/sg2002_recamera_emmc
+  export PATH=/recamera/host-tools/gcc/riscv64-linux-musl-x86_64/bin:$PATH
+  /recamera/sscma-example-sg200x/components/libwebsockets/fetch_and_build.sh'
+
+# 4. rebot-vision, then the deb (from the rebot-armd checkout)
+cd rebot-armd
+RECAMERA_DOCKER=rebot_vision_build scripts/build_vision.sh   # -> target/vision-riscv/rebot-vision
+RECAMERA_DOCKER=rebot_vision_build RECAMERA_TOOLCHAIN=$PWD/../host-tools/gcc/riscv64-linux-musl-x86_64 \
+  scripts/build_deb.sh --flavor recamera                     # -> dist/rebot-teleop_<version>_riscv64.deb
+docker rm -f rebot_vision_build
 ```
 
+Notes:
+
+- The CMake configure step clones cJSON and Eigen from GitHub (SSCMA-Micro fetch scripts), so the
+  container needs network access on the first build.
+- The container runs as root, so `components/libwebsockets/prebuilt` and the files the fetch
+  scripts write in the `sscma-example-sg200x` checkout are owned by root on the host.
+- Tested with reCamera OS SDK 0.2.4 (`sg2002_reCamera_0.2.4_emmc_sdk.tar.gz`, the release marked
+  Latest) and `sophgo/tpuc_dev:v3.1` on an arm64 host: the binary was byte-identical to the v1.3.4
+  release asset `rebot-vision-1.3.4-riscv64`. The `reCamera_OS_SDK_x.x.x.tar.gz` name in the
+  sscma-example-sg200x README does not match the current release assets, which are named
+  `sg2002_reCamera_<version>_emmc_sdk.tar.gz`. The release's `sg2002_recamera_emmc_md5sum.txt` does
+  not list the SDK tarball; the SHA-256 above is the asset digest GitHub shows on the release page.
+
 `RECAMERA_ROOT`, `RECAMERA_GCC`, `SG200X_SDK_PATH`, `SSCMA_ROOT` override the paths inside the
-container (defaults under `/recamera`). `REBOT_VISION_BIN=<binary>` makes `build_deb.sh` use a
-prebuilt binary instead.
+container (defaults: `/recamera`, `/recamera/host-tools/gcc/riscv64-linux-musl-x86_64/bin`,
+`/recamera/sg2002_recamera_emmc`, `/recamera/sscma-example-sg200x`). `REBOT_VISION_BIN=<binary>`
+makes `build_deb.sh` use a prebuilt binary instead.
 
 Host tests (no SDK; nlohmann-json from `SSCMA_ROOT/components/json` or the system package):
 

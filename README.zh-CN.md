@@ -196,25 +196,34 @@ cargo run --release -- --follower mock
 
 ```bash
 rustup target add riscv64gc-unknown-linux-musl
-git clone --depth 1 https://github.com/sophgo/host-tools
+git clone --depth 1 https://github.com/sophgo/host-tools   # 检出后 9.3 GB
 export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 
-RECAMERA_DOCKER=tpuc_recamera \
-./scripts/build_deb.sh 1.3.4          # 版本参数可省略（默认取 debian/control）
-# -> target/riscv64gc-unknown-linux-musl/release/armd
-# -> dist/rebot-teleop_1.3.4_riscv64.deb
-
 ./scripts/build_deb.sh --flavor lite  # 只含 armd，不含 reCamera 套件文件
+# -> target/riscv64gc-unknown-linux-musl/release/armd
 # -> dist/armd-lite_0.1.0_riscv64.tar.gz（armd、LICENSE、THIRD_PARTY_NOTICES.md）
 ```
 
-`--flavor recamera` 需要 `rebot-vision`（基于 SG2002 SDK 构建的 C++ 程序）：`RECAMERA_DOCKER=<容器名>` 在正在运行、且 `/recamera` 下有 host-tools、reCamera OS SDK 和 `sscma-example-sg200x`（`kits/recamera-b601dm/vision/sscma.lock` 中的提交）的 `sophgo/tpuc_dev` 容器里用 `scripts/build_vision.sh` 构建；`REBOT_VISION_BIN=<路径>` 使用预编译的二进制。详见 [kits/recamera-b601dm/vision/README.md](kits/recamera-b601dm/vision/README.md)。
+`--flavor recamera`（deb 包）还需要 `rebot-vision`（基于 SG2002 SDK 构建的 C++ 程序）。最简单的方式是使用 [GitHub release](https://github.com/Seeed-Solution/rebot-armd/releases/tag/v1.3.4) 中的预编译二进制：
+
+```bash
+V=1.3.4
+curl -LO https://github.com/Seeed-Solution/rebot-armd/releases/download/v$V/rebot-vision-$V-riscv64
+curl -LO https://github.com/Seeed-Solution/rebot-armd/releases/download/v$V/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+
+REBOT_VISION_BIN=$PWD/rebot-vision-$V-riscv64 \
+./scripts/build_deb.sh 1.3.4          # 版本参数可省略（默认取 debian/control）
+# -> dist/rebot-teleop_1.3.4_riscv64.deb
+```
+
+如需从源码构建 `rebot-vision`，设置 `RECAMERA_DOCKER=<容器名>`（一个正在运行的 `sophgo/tpuc_dev:v3.1` 容器，`/recamera` 下有 host-tools、reCamera OS SDK 和 `sscma-example-sg200x`），`build_deb.sh` 会调用 `scripts/build_vision.sh`。逐步命令见 [kits/recamera-b601dm/vision/README.md](kits/recamera-b601dm/vision/README.md#build)。
 
 `--flavor recamera`（默认）构建 reCamera 运行时：armd 加上 [reCamera B601-DM 套件](kits/recamera-b601dm/)的文件（init 脚本、应用列表 manifest、URDF；源文件在 `kits/recamera-b601dm/packaging/`）。`--flavor lite` 构建最小运行时：同一个 `armd` 二进制打成 tarball，不含 init 脚本和套件文件（版本默认取 `Cargo.toml`）。
 
 `build_deb.sh` 需要 `cargo` 和 `dpkg-deb`。它根据 `RECAMERA_TOOLCHAIN` 生成 `RUSTFLAGS`（旧变量名 `REC_TOOLCHAIN` / `RISCV_SYSROOT` 仍可用）；如果自行设置了 `RUSTFLAGS`，则按原样使用。`.cargo/config.toml` 只保存目标级的链接器设置。
 
-编写本文档时实测的构建大小（release profile：`opt-level = "z"`、fat LTO、strip）：`armd` 4,327,440 字节（4.1 MiB），`.deb` 2,090,568 字节（2.0 MiB，gzip）。设备上的内存占用未测。
+v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO、strip）：`armd` 4,465,760 字节（4.3 MiB），`rebot-vision` 951,040 字节（929 KiB），`.deb` 2,702,126 字节（2.6 MiB，gzip）。设备上的内存占用未测。
 
 ---
 

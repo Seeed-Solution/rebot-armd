@@ -268,24 +268,34 @@ also works on an arm64 build host.
 
 ```bash
 rustup target add riscv64gc-unknown-linux-musl
-git clone --depth 1 https://github.com/sophgo/host-tools
+git clone --depth 1 https://github.com/sophgo/host-tools   # 9.3 GB checkout
 export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 
-RECAMERA_DOCKER=tpuc_recamera \
-./scripts/build_deb.sh 1.3.4          # version argument optional (default: debian/control)
-# -> target/riscv64gc-unknown-linux-musl/release/armd
-# -> dist/rebot-teleop_1.3.4_riscv64.deb
-
 ./scripts/build_deb.sh --flavor lite  # armd only, no reCamera kit files
+# -> target/riscv64gc-unknown-linux-musl/release/armd
 # -> dist/armd-lite_0.1.0_riscv64.tar.gz (armd, LICENSE, THIRD_PARTY_NOTICES.md)
 ```
 
-`--flavor recamera` needs `rebot-vision`, a C++ program built against the SG2002 SDK:
-`RECAMERA_DOCKER=<container>` builds it with `scripts/build_vision.sh` in a running
-`sophgo/tpuc_dev` container that has the host-tools, the reCamera OS SDK and
-`sscma-example-sg200x` (at the commit in `kits/recamera-b601dm/vision/sscma.lock`) under
-`/recamera`; `REBOT_VISION_BIN=<path>` uses a prebuilt binary. Details:
-[kits/recamera-b601dm/vision/README.md](kits/recamera-b601dm/vision/README.md).
+`--flavor recamera` (the deb) also needs `rebot-vision`, a C++ program built against the
+SG2002 SDK. The simplest way is the prebuilt binary from the
+[GitHub release](https://github.com/Seeed-Solution/rebot-armd/releases/tag/v1.3.4):
+
+```bash
+V=1.3.4
+curl -LO https://github.com/Seeed-Solution/rebot-armd/releases/download/v$V/rebot-vision-$V-riscv64
+curl -LO https://github.com/Seeed-Solution/rebot-armd/releases/download/v$V/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+
+REBOT_VISION_BIN=$PWD/rebot-vision-$V-riscv64 \
+./scripts/build_deb.sh 1.3.4          # version argument optional (default: debian/control)
+# -> dist/rebot-teleop_1.3.4_riscv64.deb
+```
+
+To build `rebot-vision` from source instead, set `RECAMERA_DOCKER=<container>` (a running
+`sophgo/tpuc_dev:v3.1` container with the host-tools, the reCamera OS SDK and
+`sscma-example-sg200x` under `/recamera`); `build_deb.sh` then runs
+`scripts/build_vision.sh`. Step-by-step commands:
+[kits/recamera-b601dm/vision/README.md](kits/recamera-b601dm/vision/README.md#build).
 
 `--flavor recamera` (the default) builds the reCamera runtime: armd plus the files of the
 [reCamera B601-DM kit](kits/recamera-b601dm/) (init script, gallery manifest, URDF; sources in
@@ -296,9 +306,9 @@ RECAMERA_DOCKER=tpuc_recamera \
 (the older names `REC_TOOLCHAIN` / `RISCV_SYSROOT` also work); if you set `RUSTFLAGS`
 yourself it is used as is. `.cargo/config.toml` only holds the target-wide linker settings.
 
-Sizes measured on the build for this README (release profile: `opt-level = "z"`, fat LTO,
-stripped): `armd` 4,327,440 bytes (4.1 MiB), `.deb` 2,090,568 bytes (2.0 MiB, gzip). Memory
-use on the device has not been measured for this README.
+Sizes of the v1.3.4 release assets (release profile: `opt-level = "z"`, fat LTO, stripped):
+`armd` 4,465,760 bytes (4.3 MiB), `rebot-vision` 951,040 bytes (929 KiB), `.deb` 2,702,126
+bytes (2.6 MiB, gzip). Memory use on the device has not been measured for this README.
 
 ---
 
