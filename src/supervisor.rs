@@ -336,14 +336,17 @@ impl SupervisorInner {
     /// Joint limits used for planning and servo stepping: `config.limits` with
     /// `max_velocity` capped at `config.planned_max_velocity` for every joint
     /// except the 7-DOF gripper (index 6).
+    /// `speed_cap.joint_velocity_scale` then scales the result (same joints).
     pub fn planning_limits(&self) -> Vec<crate::model::JointLimit> {
         let mut limits = self.config.limits.clone();
-        if let Some(cap) = self.config.planned_max_velocity {
-            let gripper_idx = (self.config.dof >= 7).then_some(6);
-            for (i, limit) in limits.iter_mut().enumerate() {
-                if Some(i) != gripper_idx {
+        let scale = self.config.speed_cap.and_then(|c| c.joint_velocity_scale).unwrap_or(1.0);
+        let gripper_idx = (self.config.dof >= 7).then_some(6);
+        for (i, limit) in limits.iter_mut().enumerate() {
+            if Some(i) != gripper_idx {
+                if let Some(cap) = self.config.planned_max_velocity {
                     limit.max_velocity = limit.max_velocity.min(cap);
                 }
+                limit.max_velocity *= scale;
             }
         }
         limits
@@ -1624,6 +1627,7 @@ impl SupervisorInner {
             q0: crate::kinematics::q6(&self.commanded_positions),
             j7: self.commanded_positions[6],
             limits: self.planning_limits(),
+            speed_cap: self.config.speed_cap,
             ws: self.workspace_policy().map(|(ws, _)| ws.clone()),
             cam: self.config.camera_mount.clone(),
             epoch: self.safety.epoch_id(),

@@ -82,6 +82,8 @@ pub struct PlanInput {
     pub j7: f32,
     /// `planning_limits()` (speed-capped) for all 7 joints.
     pub limits: Vec<JointLimit>,
+    /// Profile speed cap; Cartesian speeds are min(request, cap).
+    pub speed_cap: Option<crate::model::SpeedCap>,
     pub ws: Option<WorkspacePolicy>,
     pub cam: CameraMount,
     pub epoch: u64,
@@ -112,6 +114,13 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
         return Err(MotionError::InvalidCommand(format!(
             "speed must be 0 < linear <= {MAX_LINEAR_MPS} m/s and 0 < angular <= {MAX_ANGULAR_RPS} rad/s")));
     }
+    let speed = match input.speed_cap {
+        Some(cap) => Speed {
+            linear: cap.linear_mps.map_or(speed.linear, |c| speed.linear.min(f64::from(c))),
+            angular: cap.angular_rps.map_or(speed.angular, |c| speed.angular.min(f64::from(c))),
+        },
+        None => speed,
+    };
     let start = kinematics::fk(&input.q0);
     let dp = kinematics::sub(&goal.p, &start.p);
     let length = kinematics::norm(&dp);

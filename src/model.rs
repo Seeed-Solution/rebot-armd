@@ -330,6 +330,31 @@ fn default_servo_max_lead_rad() -> f32 {
     DEFAULT_SERVO_MAX_LEAD_RAD
 }
 
+/// Upper bound on planned motion speed (`speed_cap` in the profile). Each entry is
+/// applied as min() with the request and with `planned_max_velocity`; absent entries
+/// do not cap. Not changeable at runtime.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SpeedCap {
+    /// Cartesian actions: linear speed (m/s).
+    pub linear_mps: Option<f32>,
+    /// Cartesian actions: angular speed (rad/s).
+    pub angular_rps: Option<f32>,
+    /// Factor (0, 1] on the planned joint speed cap of every joint except the 7-DOF gripper.
+    pub joint_velocity_scale: Option<f32>,
+}
+
+impl SpeedCap {
+    fn validate(&self) -> Result<(), String> {
+        let positive = |v: Option<f32>| v.is_none_or(|x| x.is_finite() && x > 0.0);
+        if !positive(self.linear_mps) || !positive(self.angular_rps) || !positive(self.joint_velocity_scale)
+            || self.joint_velocity_scale.is_some_and(|x| x > 1.0) {
+            return Err("speed_cap: linear_mps and angular_rps positive finite, joint_velocity_scale in (0, 1]".into());
+        }
+        Ok(())
+    }
+}
+
 /// Robotic arm hardware/control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArmConfig {
@@ -389,6 +414,9 @@ pub struct ArmConfig {
     /// range ±12.5 rad, ±30 rad/s, ±18 N·m for every motor.
     #[serde(default)]
     pub damiao_ranges: Option<Vec<DamiaoRange>>,
+    /// Speed cap for every planned motion (actions, jog, home, park); None = no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_cap: Option<SpeedCap>,
 }
 
 impl Default for ArmConfig {
@@ -438,6 +466,7 @@ impl Default for ArmConfig {
             grasp: None,
             gravity_comp: None,
             damiao_ranges: None,
+            speed_cap: None,
         }
     }
 }
@@ -480,6 +509,7 @@ impl ArmConfig {
                     cap / POSVEL_LAG_GAIN, self.following_error.max_error_rad));
             }
         }
+        if let Some(cap) = &self.speed_cap { cap.validate()?; }
         if let Some(caps) = &self.servo_max_velocity {
             if caps.len() != self.dof || caps.iter().flatten().any(|v| !v.is_finite() || *v <= 0.0) {
                 return Err(format!("servo_max_velocity needs {} entries, each null or positive finite", self.dof));
@@ -624,6 +654,7 @@ impl ArmConfig {
                 DamiaoRange::REBOT_DM_J4_J7, DamiaoRange::REBOT_DM_J4_J7, DamiaoRange::REBOT_DM_J4_J7,
                 DamiaoRange::REBOT_DM_J4_J7,
             ]),
+            speed_cap: None,
         }
     }
 }
@@ -898,6 +929,9 @@ pub struct ObservationSchema {
     /// Servo lead cap (rad); null in older schemas.
     #[serde(default)]
     pub servo_max_lead_rad: Option<f32>,
+    /// Profile speed cap on planned motion; null when the profile sets none.
+    #[serde(default)]
+    pub speed_cap: Option<SpeedCap>,
 }
 
 impl ObservationSchema {
@@ -974,6 +1008,7 @@ impl ObservationSchema {
             capabilities: Capabilities::from_config(config),
             servo_max_velocity: config.servo_limits().iter().map(|l| l.max_velocity).collect(),
             servo_max_lead_rad: Some(config.servo_max_lead_rad),
+            speed_cap: config.speed_cap,
         }
     }
 }
