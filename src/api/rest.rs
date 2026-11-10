@@ -412,3 +412,8 @@ pub async fn get_grasp_setup(
 pub async fn get_keepout(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
     Json(supervisor.inner().read().await.keepout_state()).into_response()
 }
+
+/// `GET /api/v1/poses`: stored named poses (no lease).
+pub async fn get_poses(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
+    Json(supervisor.inner().read().await.poses.list.clone()).into_response()
+}

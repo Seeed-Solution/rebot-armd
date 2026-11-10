@@ -9,6 +9,7 @@ pub mod kinematics;
 pub mod model;
 pub mod motion;
 pub mod persist;
+pub mod poses;
 pub mod protocol;
 pub mod recording;
 pub mod safety;

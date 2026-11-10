@@ -217,7 +217,8 @@ pub struct SupervisorInner {
     pub gravity_comp: Option<crate::gravity_comp::GravityCompRun>,
     pub gravity_comp_last_exit: Option<crate::model::GravityCompExit>,
     /// Keep-out source and file (`src/keepout.rs`).
-    pub keepout: crate::keepout::Keepout,
+    pub keepout: crate::keepout::Keepout,    /// Named poses (`src/poses.rs`).
+    pub poses: crate::poses::PoseStore,
 }
 
 impl SupervisorInner {
@@ -319,6 +320,7 @@ impl SupervisorInner {
             gravity_comp: None,
             gravity_comp_last_exit: None,
             keepout: crate::keepout::Keepout::default(),
+            poses: crate::poses::PoseStore::default(),
         }
     }
 
@@ -1480,6 +1482,21 @@ impl SupervisorInner {
         epoch_id: Option<u64>,
         kind: &str,
     ) -> Result<(u64, u64, f64), ArmError> {
+        let limits = self.planning_limits();
+        self.start_quintic(target_positions, duration_secs, epoch_id, kind, None, &limits)
+    }
+
+    /// Joint-space quintic to `target_positions` planned with `limits`, recorded as an
+    /// action of `kind`. Returns (epoch, action id, planned duration).
+    pub(crate) fn start_quintic(
+        &mut self,
+        target_positions: Vec<f32>,
+        duration_secs: Option<f64>,
+        epoch_id: Option<u64>,
+        kind: &str,
+        tag: Option<String>,
+        limits: &[crate::model::JointLimit],
+    ) -> Result<(u64, u64, f64), ArmError> {
         self.gravity_comp_motion_busy()?;
         if self.handover_settling_since.is_some() {
             return Err(ArmError::Safety(SafetyError::HandoverSettling));
@@ -1519,7 +1536,7 @@ impl SupervisorInner {
             &target_positions,
             &vec![0.0; self.config.dof],
             duration_secs,
-            &self.planning_limits(),
+            limits,
         )?;
         let samples = Self::trajectory_samples(&traj);
         self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
@@ -1531,7 +1548,7 @@ impl SupervisorInner {
         self.target_positions = target_positions;
         self.safety.mark_motion_started()?;
         let duration = traj.duration;
-        let id = self.begin_action(kind, None);
+        let id = self.begin_action(kind, tag);
         self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)));
 
         Ok((self.safety.epoch_id(), id, duration))
@@ -1596,7 +1613,7 @@ impl SupervisorInner {
     }
 
     /// Preconditions shared by Cartesian and gripper actions.
-    fn action_preconditions(&self) -> Result<(), ArmError> {
+    pub(crate) fn action_preconditions(&self) -> Result<(), ArmError> {
         if self.handover_settling_since.is_some() { return Err(SafetyError::HandoverSettling.into()); }
         if self.e_stop_latched.load(Ordering::SeqCst) { return Err(SafetyError::EStopActive.into()); }
         match self.safety.state() {

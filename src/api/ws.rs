@@ -163,6 +163,10 @@ fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: 
             return Ok(ActionStart::Started(id, duration));
         }
         "/api/v1/action/grasp" => return Ok(ActionStart::Grasp(crate::grasp::prepare(inner, body, epoch)?)),
+        "/api/v1/action/move_to_pose" => {
+            let (id, duration) = crate::poses::start_action(inner, body, epoch)?;
+            return Ok(ActionStart::Started(id, duration));
+        }
         _ => return Err(invalid_command("Unknown action")),
     };
     let (spec, speed, tag) = parsed.map_err(ArmError::from)?;
@@ -390,6 +394,24 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                                 ack["setup"] = json!(setup);
                                                 pending_save = Some(setup);
                                                 ack
+                                            }
+                                            Err(error) => command_reject(&inner, &value["request_id"], error.into()),
+                                        });
+                                    } else if path == "/api/v1/poses/save" {
+                                        response = Some(match crate::poses::save(&mut inner, &value["body"]) {
+                                            Ok((pose, write)) => {
+                                                let mut ack = command_ack(&inner, &value["request_id"], None);
+                                                ack["pose"] = json!(pose);
+                                                pending_write = write;
+                                                ack
+                                            }
+                                            Err(error) => command_reject(&inner, &value["request_id"], error.into()),
+                                        });
+                                    } else if path == "/api/v1/poses/delete" {
+                                        response = Some(match crate::poses::delete(&mut inner, &value["body"]) {
+                                            Ok(write) => {
+                                                pending_write = write;
+                                                command_ack(&inner, &value["request_id"], None)
                                             }
                                             Err(error) => command_reject(&inner, &value["request_id"], error.into()),
                                         });

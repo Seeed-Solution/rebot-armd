@@ -193,6 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     start_blackbox(&supervisor, cli.blackbox_dir.as_deref(), &system, started);
     armd::grasp::load_into(&supervisor, &armd::grasp::setup_path_from_env()).await;
     armd::keepout::load_into(&supervisor, &armd::keepout::path_from_env()).await;
+    armd::poses::load_into(&supervisor, &armd::poses::path_from_env()).await;
     match follower {
         "rebot-rs" | "rebot-dm" => {
             #[cfg(target_os = "linux")]

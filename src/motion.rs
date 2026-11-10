@@ -252,7 +252,7 @@ pub fn resolve_goal(input: &PlanInput, spec: &GoalSpec) -> Pose {
     }
 }
 
-fn num(body: &Value, key: &str) -> Result<Option<f64>, MotionError> {
+pub fn num(body: &Value, key: &str) -> Result<Option<f64>, MotionError> {
     match body.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(v) => v.as_f64().filter(|x| x.is_finite()).map(Some)
@@ -270,7 +270,7 @@ fn vec_n<const N: usize>(v: &Value, key: &str) -> Result<[f64; N], MotionError> 
     Ok(out)
 }
 
-fn tag(body: &Value) -> Result<Option<String>, MotionError> {
+pub fn tag(body: &Value) -> Result<Option<String>, MotionError> {
     match body.get("tag") {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) if s.len() <= 64 => Ok(Some(s.clone())),
@@ -670,7 +670,7 @@ impl ActiveTrajectory {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActionStatus {
     pub id: u64,
-    /// move_to | move_relative | gripper | grasp | joint_move | home | park
+    /// move_to | move_relative | gripper | grasp | joint_move | home | park | move_to_pose
     pub kind: String,
     pub tag: Option<String>,
     /// running | done | failed | cancelled
