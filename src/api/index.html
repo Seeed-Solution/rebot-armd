@@ -1722,6 +1722,24 @@ const I18N = {
     'cart.enable_first': '使能后可控制末端位姿', 'cart.following': '目标跟随实测位姿 · 分支 {branch} · {tx}', 'cart.tx_ws': 'WS 流', 'cart.tx_rest': 'REST 伺服',
     'wait_arm': '等待机械臂连接', 'wait_telemetry': '等待遥测', 'ready': '电机就绪 · 可以操控',
     'fault.limit': '关节超限 {name}: {val}°', 'fault.thermal': '过温 J{j}: {temp}°C / {limit}°C',
+    // observation.fault.code -> short explanation + what to do (fc.<CODE> / fc.<CODE>.do)
+    'fm.coded': '⚠️ {title}。{todo}。点此清除故障后长按「使能」。', 'lock.fault_coded': '⚠️ {title}：{todo}，然后点「清除故障」并长按「使能」',
+    'fc.ESTOP': '急停已按下', 'fc.ESTOP.do': '确认周围安全后复位急停',
+    'fc.BUS_LOSS': '电机总线断开', 'fc.BUS_LOSS.do': '检查电机线缆和电源是否接好',
+    'fc.THERMAL_TRIP': '电机过热', 'fc.THERMAL_TRIP.do': '让机械臂停下冷却几分钟',
+    'fc.JOINT_LIMIT': '关节超出限位', 'fc.JOINT_LIMIT.do': '恢复后把该关节慢慢点动回限位范围内',
+    'fc.WATCHDOG_TIMEOUT': '控制连接中断，机械臂已停靠', 'fc.WATCHDOG_TIMEOUT.do': '检查网络连接',
+    'fc.FOLLOWING_ERROR': '关节跟不上指令（可能被挡住）', 'fc.FOLLOWING_ERROR.do': '检查工作区有没有障碍物或被卡住的关节',
+    'fc.CONTROL_DEADLINE': '控制循环超时', 'fc.CONTROL_DEADLINE.do': '一般可直接恢复；反复出现请重启 armd',
+    'fc.INVALID_TELEMETRY': '电机反馈数据异常', 'fc.INVALID_TELEMETRY.do': '检查电机线缆连接',
+    'fc.DRIVER_WRITE_FAILED': '指令无法发送到电机', 'fc.DRIVER_WRITE_FAILED.do': '检查电机线缆和电源',
+    'fc.HARDWARE_FAULT': '电机报告硬件故障', 'fc.HARDWARE_FAULT.do': '检查电机供电和指示灯；反复出现请联系技术支持',
+    'fc.ENABLE_FAILED': '电机使能失败', 'fc.ENABLE_FAILED.do': '检查电源和急停开关',
+    'fc.SERVO_NO_BRAKE': '关节来不及在限位前停住', 'fc.SERVO_NO_BRAKE.do': '恢复后降低速度再操作',
+    'fc.HANDOVER_UNSETTLED': '交接后机械臂没有停稳', 'fc.HANDOVER_UNSETTLED.do': '等机械臂完全静止',
+    'fc.GRAVITY_COMP_FAILED': '拖动示教模式切换失败', 'fc.GRAVITY_COMP_FAILED.do': '扶住机械臂',
+    'fc.COLLISION': '多次碰撞，机械臂已锁定', 'fc.COLLISION.do': '检查工作区，移开障碍物',
+    'fc.OTHER': '故障：{d}', 'fc.OTHER.do': '查看机械臂状态',
     'err.epoch': '控制状态已变化，请检查状态后重新操作', 'err.settling': '机械臂正在交接停稳中，请稍候片刻再操作', 'err.settling2': '机械臂正在交接停稳中，请稍候...', 'err.settling3': '机械臂正在交接停稳中，请稍候再试',
     'err.park_unsupported': '当前机械臂缺少自动收纳所需配置或反馈能力，未启动收纳；可使用回零功能，力矩仍需现场确认',
     'err.preset_unsupported': '当前机械臂不支持自动收纳，未启动运动；可使用回零功能，力矩仍需现场确认',
@@ -1867,6 +1885,23 @@ const I18N = {
     'cart.enable_first': 'Enable to control end-effector pose', 'cart.following': 'Target follows measured pose · branch {branch} · {tx}', 'cart.tx_ws': 'WS stream', 'cart.tx_rest': 'REST servo',
     'wait_arm': 'Waiting for arm connection', 'wait_telemetry': 'Waiting for telemetry', 'ready': 'Motors ready · ready to control',
     'fault.limit': 'Joint limit exceeded {name}: {val}°', 'fault.thermal': 'Over-temperature J{j}: {temp}°C / {limit}°C',
+    'fm.coded': '⚠️ {title}. {todo}. Tap here to clear the fault, then hold "Enable".', 'lock.fault_coded': '⚠️ {title}: {todo}, then tap "Clear fault" and hold "Enable"',
+    'fc.ESTOP': 'E-stop pressed', 'fc.ESTOP.do': 'Make sure the area is safe, then reset the E-stop',
+    'fc.BUS_LOSS': 'Motor bus lost', 'fc.BUS_LOSS.do': 'Check the motor cable and power',
+    'fc.THERMAL_TRIP': 'Motor overheated', 'fc.THERMAL_TRIP.do': 'Let the arm rest and cool for a few minutes',
+    'fc.JOINT_LIMIT': 'Joint out of its limit', 'fc.JOINT_LIMIT.do': 'Afterwards jog that joint slowly back into range',
+    'fc.WATCHDOG_TIMEOUT': 'Control connection lost; arm parked', 'fc.WATCHDOG_TIMEOUT.do': 'Check the network connection',
+    'fc.FOLLOWING_ERROR': 'A joint could not follow the command (maybe blocked)', 'fc.FOLLOWING_ERROR.do': 'Check the workspace for obstacles or a stuck joint',
+    'fc.CONTROL_DEADLINE': 'Control loop ran late', 'fc.CONTROL_DEADLINE.do': 'Usually safe to recover; restart armd if it repeats',
+    'fc.INVALID_TELEMETRY': 'Invalid motor feedback', 'fc.INVALID_TELEMETRY.do': 'Check the motor cable connections',
+    'fc.DRIVER_WRITE_FAILED': 'Commands could not reach the motors', 'fc.DRIVER_WRITE_FAILED.do': 'Check the motor cable and power',
+    'fc.HARDWARE_FAULT': 'A motor reported a hardware fault', 'fc.HARDWARE_FAULT.do': 'Check motor power and LEDs; contact support if it repeats',
+    'fc.ENABLE_FAILED': 'Motors failed to enable', 'fc.ENABLE_FAILED.do': 'Check the power supply and the E-stop switch',
+    'fc.SERVO_NO_BRAKE': 'A joint could not stop before its limit', 'fc.SERVO_NO_BRAKE.do': 'Afterwards use a lower speed',
+    'fc.HANDOVER_UNSETTLED': 'Arm did not settle after a handover', 'fc.HANDOVER_UNSETTLED.do': 'Wait until the arm is completely still',
+    'fc.GRAVITY_COMP_FAILED': 'Hand-guiding mode switch failed', 'fc.GRAVITY_COMP_FAILED.do': 'Support the arm with your hand',
+    'fc.COLLISION': 'Repeated collisions; arm locked', 'fc.COLLISION.do': 'Check the workspace and remove obstacles',
+    'fc.OTHER': 'Fault: {d}', 'fc.OTHER.do': 'Check the arm',
     'err.epoch': 'Control state changed, check the state and retry', 'err.settling': 'Arm is settling after handover, wait a moment and retry', 'err.settling2': 'Arm is settling after handover, please wait...', 'err.settling3': 'Arm is settling after handover, retry shortly',
     'err.park_unsupported': 'This arm lacks the configuration or feedback needed for auto-park; park not started. Use Home instead; confirm torque state on site',
     'err.preset_unsupported': 'This arm does not support auto-park; no motion started. Use Home instead; confirm torque state on site',
@@ -2113,7 +2148,7 @@ const S = {
   ],
   ws: null, wsCount: 0, hz: 0,
   rtt: null, lastReqAt: 0,
-  state: 'Offline', fault: '',
+  state: 'Offline', fault: '', faultCode: null,
   speedIdx: 1,
   clientId: CLIENT_ID,
   presetRunning: false,
@@ -2358,6 +2393,7 @@ function connectWS() {
     const st = parseState(o.safety_state);
     const wasStopped = isStopped();
     S.state = st.name; S.fault = st.detail;
+    S.faultCode = o.fault && typeof o.fault.code === 'string' ? o.fault.code : null;
     if (isStopped() && !wasStopped) {
       S.streamActive = false; S.servoTarget = null;
       releaseAll(); resetPoseMode();
@@ -4062,12 +4098,21 @@ async function loadSchema() {
   } catch (_) { setTimeout(loadSchema, 3000); }
 }
 
+// observation.fault.code -> { title, todo } in the current language; null for an unknown code
+function faultText() {
+  const c = S.faultCode;
+  if (!c || c === 'ESTOP' || I18N.zh['fc.' + c] === undefined) return null;
+  let title = t('fc.' + c, { d: S.fault || t('unknown') });
+  // joint limit / over-temperature details name the joint
+  if ((c === 'JOINT_LIMIT' || c === 'THERMAL_TRIP') && S.fault && !/^[A-Z][A-Za-z]+$/.test(S.fault)) title += (LANG === 'zh' ? '（' + S.fault + '）' : ' (' + S.fault + ')');
+  return { title, todo: t('fc.' + c + '.do') };
+}
 function lockReason() {
   if (!isLive()) return t('lock.offline');
   const other = leaseOther();
   if (other != null) return t('lock.observer_who', { who: leaseHolderText(other) });
   if (S.state === 'EStop') return t('lock.estop');
-  if (S.state === 'Fault') return t('lock.fault');
+  if (S.state === 'Fault') { const ft = faultText(); return ft ? t('lock.fault_coded', ft) : t('lock.fault'); }
   return t('lock.disabled');
 }
 function flashLock() {
@@ -6664,7 +6709,7 @@ function frame(ts) {
   const fm = $('fault-msg');
   const showFault = live && isStopped();
   fm.classList.toggle('show', showFault);
-  if (showFault) setText(fm, S.state === 'EStop' ? t('fm.estop') : t('fm.fault', { d: S.fault || t('unknown') }));
+  if (showFault) { const ft = S.state === 'Fault' && faultText(); setText(fm, S.state === 'EStop' ? t('fm.estop') : ft ? t('fm.coded', ft) : t('fm.fault', { d: S.fault || t('unknown') })); }
 
   if (S.rec.active) {
     const el = Date.now() - S.rec.startedAt;
