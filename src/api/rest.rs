@@ -163,6 +163,9 @@ impl From<ArmError> for ApiError {
                     code: Some("ESTOP_ACTIVE".to_string()),
                     safety_state: Some("EStop".to_string()),
                 },
+                crate::safety::SafetyError::CollisionHold(_) => {
+                    ApiError(StatusCode::CONFLICT, safety_err.to_string(), "COLLISION_HOLD".to_string())
+                }
                 crate::safety::SafetyError::MotionBusy => {
                     ApiError(StatusCode::CONFLICT, safety_err.to_string(), "MOTION_BUSY".to_string())
                 }

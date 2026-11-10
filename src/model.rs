@@ -452,6 +452,9 @@ pub struct ArmConfig {
     /// Speed cap for every planned motion (actions, jog, home, park); None = no cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed_cap: Option<SpeedCap>,
+    /// Collision guard (`src/collision.rs`); None = defaults, guard off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collision: Option<crate::collision::CollisionPolicy>,
 }
 
 impl Default for ArmConfig {
@@ -502,6 +505,7 @@ impl Default for ArmConfig {
             gravity_comp: None,
             damiao_ranges: None,
             speed_cap: None,
+            collision: None,
         }
     }
 }
@@ -545,6 +549,7 @@ impl ArmConfig {
             }
         }
         if let Some(cap) = &self.speed_cap { cap.validate()?; }
+        if let Some(c) = &self.collision { c.validate()?; }
         if let Some(caps) = &self.servo_max_velocity {
             if caps.len() != self.dof || caps.iter().flatten().any(|v| !v.is_finite() || *v <= 0.0) {
                 return Err(format!("servo_max_velocity needs {} entries, each null or positive finite", self.dof));
@@ -690,6 +695,7 @@ impl ArmConfig {
                 DamiaoRange::REBOT_DM_J4_J7,
             ]),
             speed_cap: None,
+            collision: None,
         }
     }
 }
@@ -751,10 +757,14 @@ pub struct ArmObservation {
     pub motor_errors: Vec<Option<MotorError>>,
     /// Structured cause while the safety state is Fault or EStop; null otherwise.
     #[serde(default)]
-    pub fault: Option<crate::safety::FaultInfo>,    /// Measured torque minus model gravity torque for J1..J6 (N·m); null without a
+    pub fault: Option<crate::safety::FaultInfo>,
+    /// Measured torque minus model gravity torque for J1..J6 (N·m); null without a
     /// gravity model or valid torque feedback. Observation only, no fault is raised from it.
     #[serde(default)]
     pub residual_torques: Option<[f32; 6]>,
+    /// Collision guard state; null while the guard is disabled or unavailable.
+    #[serde(default)]
+    pub collision: Option<crate::collision::CollisionObservation>,
 }
 
 /// A motor fault code reported in the motor's feedback (`observation.motor_errors`).
@@ -937,6 +947,9 @@ pub struct Capabilities {
     pub tick_stats: bool,
     /// `/api/v1/action/place`: 7-DOF, kinematics and gripper policy.
     pub place: bool,
+    /// Collision guard (`collision` profile section, `/api/v1/safety/collision`,
+    /// `observation.collision`): profile gravity model and a driver that reports torque.
+    pub collision_guard: bool,
     pub vision: VisionCapabilities,
 }
 
@@ -966,6 +979,8 @@ impl Capabilities {
             residual_torques: config.gravity_model.is_some() && matches!(config.dof, 6 | 7),
             tick_stats: true,
             place: seven && kin && config.gripper_policy.is_some(),
+            // The driver half is applied by ArmSupervisor::get_schema.
+            collision_guard: config.gravity_model.is_some() && matches!(config.dof, 6 | 7),
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }

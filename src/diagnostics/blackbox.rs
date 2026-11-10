@@ -83,6 +83,9 @@ struct Record<'a> {
     temperatures: R3<'a>,
     /// Measured minus model gravity torque, J1..J6; null when unavailable.
     residual_torques: Option<R3<'a>>,
+    /// Collision guard state (trip joint, residual, hold); omitted while the guard is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collision: Option<&'a crate::collision::CollisionObservation>,
     feedback_valid: bool,
     feedback_age_ms: &'a [Option<u64>],
     motor_errors: &'a [Option<crate::model::MotorError>],
@@ -109,6 +112,7 @@ pub fn record_line(boot: u64, t_ms: u64, dropped: u64, obs: &ArmObservation) -> 
         torques: R3(&obs.torques),
         temperatures: R3(&obs.temperatures),
         residual_torques: obs.residual_torques.as_ref().map(|r| R3(r)),
+        collision: obs.collision.as_ref(),
         feedback_valid: obs.feedback_valid,
         feedback_age_ms: &obs.feedback_age_ms,
         motor_errors: &obs.motor_errors,
