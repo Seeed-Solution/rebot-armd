@@ -928,6 +928,7 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
     background: rgba(255,255,255,0.35); border: 1px solid rgba(255,255,255,0.45); box-shadow: 0 4px 16px rgba(0,0,0,0.15);
   }
   body.ui-simple .brand { display: none; }
+  body.ui-simple.tb-compact-1 #state-badge, body.ui-simple.tb-compact-2 #link-badge { display: none !important; }
   body.ui-simple .ui-switch { margin: 0; padding: 2px; background: rgba(255,255,255,0.3); border-color: transparent; border-radius: 13px; }
   body.ui-simple .ui-switch button { min-width: 0; min-height: 24px; padding: 0 10px; border-radius: 11px; font-size: 12px; color: #1f2937; }
   body.ui-simple .ui-switch button.on { background: rgba(255,255,255,0.9); }
@@ -967,6 +968,12 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   body.ui-simple .gc-banner { position: fixed; z-index: 170; top: 50px; left: 50%; transform: translateX(-50%); width: min(92vw, 420px);
     backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%); background: rgba(255,247,230,0.92); box-shadow: 0 6px 18px rgba(0,0,0,0.25); }
   body.ui-simple.gc .gc-sw { display: none; }
+  /* the capsule is as wide as the Enable + E-stop row; the hand-guide switch takes that width and its short label */
+  body.ui-simple .safety { width: max-content; }
+  body.ui-simple .gc-sw { width: 0; min-width: 100%; }
+  body.ui-simple .gc-sw .sw-text { min-width: 0; }
+  body.ui-simple .gc-sw .gc-long { display: none; }
+  body.ui-simple .gc-sw .gc-short { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   body.ui-simple .btn-estop small { display: none; }
 
   /* presets: small pills on the right edge */
@@ -1104,6 +1111,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+.gc-sw .gc-short { display: none; }
 </style>
 </head>
 <body class="ui-simple offline locked">
@@ -1351,7 +1359,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
         </div>
         <button class="sw gc-sw" id="btn-gc" role="switch" aria-checked="false" hidden>
           <span class="sw-track"><i class="fill"></i><i class="thumb"></i></span>
-          <span class="sw-text"><b data-i18n="gc.title">重力补偿 / 拖动示教</b><small id="gc-sub" data-i18n="gc.hold">按住 0.6 秒进入</small></span>
+          <span class="sw-text"><b data-i18n="gc.title" class="gc-long">重力补偿 / 拖动示教</b><b data-i18n="gc.chip" class="gc-short">拖动示教</b><small id="gc-sub" data-i18n="gc.hold">按住 0.6 秒进入</small></span>
         </button>
         <div class="lock-note" id="lock-note">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
@@ -6745,6 +6753,53 @@ i18nHooks.push(
 );
 $('btn-lang').addEventListener('click', () => setLang(LANG === 'zh' ? 'en' : 'zh'));
 applyI18n();
+</script>
+<script>
+// Floating simple layout: keep the centred status island clear of the safety capsule (E-stop)
+// and the preset pills. Narrow landscape screens and long labels would otherwise slide it
+// over the E-stop button.
+(() => {
+  const body = document.body, tb = document.querySelector('.topbar');
+  const safety = document.querySelector('.safety'), presets = document.querySelector('.presets');
+  if (!tb || !safety) return;
+  const hit = (a, b) => !(a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top);
+  let busy = false;
+  function place() {
+    if (busy) return; busy = true;
+    try {
+      body.classList.remove('tb-compact-1', 'tb-compact-2');
+      tb.style.left = ''; tb.style.top = ''; tb.style.transform = '';
+      if (!body.classList.contains('ui-simple') || getComputedStyle(tb).position !== 'fixed') return;
+      const gap = 8;
+      for (let level = 0; level <= 2; level++) {
+        if (level) body.classList.add('tb-compact-' + level);
+        tb.style.left = ''; tb.style.transform = '';
+        const s = safety.getBoundingClientRect(), t = tb.getBoundingClientRect();
+        if (!hit(s, t)) return;
+        const right = presets && presets.getBoundingClientRect().width ? presets.getBoundingClientRect().left : innerWidth;
+        const space = right - s.right - 2 * gap;
+        if (t.width <= space) {
+          tb.style.left = Math.round(s.right + gap + (space - t.width) / 2) + 'px';
+          tb.style.transform = 'none';
+          return;
+        }
+      }
+      // no room beside the capsule: put the island under it, left-aligned
+      const s = safety.getBoundingClientRect();
+      tb.style.left = Math.round(s.left) + 'px';
+      tb.style.top = Math.round(s.bottom + gap) + 'px';
+      tb.style.transform = 'none';
+    } finally { busy = false; }
+  }
+  const ro = new ResizeObserver(() => requestAnimationFrame(place));
+  [safety, tb, presets].forEach(el => el && ro.observe(el));
+  const baseClass = () => body.className.replace(/\btb-compact-\d\b/g, '').trim();
+  let lastClass = baseClass();
+  new MutationObserver(() => { const c = baseClass(); if (c !== lastClass) { lastClass = c; requestAnimationFrame(place); } })
+    .observe(body, { attributes: true, attributeFilter: ['class'] });
+  addEventListener('resize', () => requestAnimationFrame(place));
+  requestAnimationFrame(place);
+})();
 </script>
 </body>
 </html>
