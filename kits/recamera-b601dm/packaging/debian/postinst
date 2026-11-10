@@ -28,6 +28,20 @@ fi
 # S94) and record rebot-teleop as the console's active app, as a console switch would (the
 # camera app that was active keeps running until the next boot or a start of rebot-teleop,
 # which stops it; nothing is disabled or uninstalled). Without the console, an S92 link.
+# Start after the install when this app should be running: the console's active app before
+# this install was rebot-teleop (an upgrade: the old package's prerm stopped it, and a
+# console switch to the app that is already active does nothing), or there is no console
+# (S92 boot link). Read before `register` below, which records rebot-teleop as active.
+START_APP=0
+if [ -x /usr/share/supervisor/scripts/main.sh ]; then
+    if [ -f /userdata/local/apps/state.json ] &&
+        grep -q '"active_app"[[:space:]]*:[[:space:]]*"rebot-teleop"' /userdata/local/apps/state.json; then
+        START_APP=1
+    fi
+else
+    START_APP=1
+fi
+
 if [ -x /usr/share/supervisor/scripts/main.sh ]; then
     for link in /etc/init.d/S??rebot-teleop; do
         if [ -L "$link" ]; then
@@ -45,5 +59,13 @@ chown -R root:root /etc/init.d/K92rebot-teleop /usr/bin/armd /usr/local/bin/armd
 # 刷新 overlayfs 缓存，确保 supervisor 立即感知到 /etc/init.d/K92rebot-teleop
 sync
 echo 2 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+# `start` takes a few seconds (CAN and Wi-Fi setup, armd and rebot-vision checks). It runs
+# in the background with its output in the app log, so it never holds opkg; when armd is
+# already running, start only makes sure rebot-vision runs (a hung vision loop is replaced).
+if [ "$START_APP" = 1 ] && [ -x /etc/init.d/K92rebot-teleop ]; then
+    echo "Starting rebot-teleop in the background (log /var/log/rebot-teleop.log)"
+    ( /etc/init.d/K92rebot-teleop start </dev/null >>/var/log/rebot-teleop.log 2>&1 & ) || true
+fi
 
 exit 0

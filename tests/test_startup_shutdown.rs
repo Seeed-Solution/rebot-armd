@@ -540,7 +540,7 @@ impl PackageRoot {
     fn new(console: bool) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let root = PackageRoot { dir: tempfile::tempdir().unwrap() };
-        for d in ["etc/init.d", "userdata/local/apps", "usr/share/rebot-teleop", "usr/share/supervisor/scripts"] {
+        for d in ["etc/init.d", "userdata/local/apps", "usr/share/rebot-teleop", "usr/share/supervisor/scripts", "var/log"] {
             std::fs::create_dir_all(root.p(d)).unwrap();
         }
         std::fs::write(root.p("usr/share/rebot-teleop/rebot-teleop.json"), "{}").unwrap();
@@ -576,6 +576,37 @@ impl PackageRoot {
             .replace("/usr/bin/", &format!("{r}/usr/bin/"))
             .replace("/usr/local/bin/", &format!("{r}/usr/local/bin/"))
             .replace("/proc/sys/", &format!("{r}/proc/sys/"))
+            .replace("/var/log/", &format!("{r}/var/log/"))
+    }
+
+    /// Replace K92rebot-teleop with a stub that logs its argument to `init-calls` and runs the
+    /// real script only for `register` (and `stop-vision`, a no-op here), so a postinst `start`
+    /// never touches the host's network, CAN or processes.
+    fn stub_init(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        let real = self.p("etc/init.d/real-K92rebot-teleop");
+        std::fs::write(&real, self.rebase(Self::INIT)).unwrap();
+        let stub = format!(
+            "#!/bin/sh\necho \"$1\" >> '{}'\ncase \"$1\" in register|stop-vision) exec sh '{}' \"$1\" ;; esac\nexit 0\n",
+            self.p("init-calls").display(),
+            real.display()
+        );
+        let init = self.p("etc/init.d/K92rebot-teleop");
+        std::fs::write(&init, stub).unwrap();
+        std::fs::set_permissions(&init, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Arguments the stub init script was called with; waits up to 3 s for `want` (the
+    /// postinst start runs in the background).
+    fn init_calls(&self, want: Option<&str>) -> String {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let calls = std::fs::read_to_string(self.p("init-calls")).unwrap_or_default();
+            if want.is_none_or(|w| calls.lines().any(|l| l == w)) || Instant::now() > deadline {
+                return calls;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn init_path(&self) -> String {
@@ -614,6 +645,7 @@ impl PackageRoot {
 #[test]
 fn postinst_with_console_removes_every_boot_link_and_registers_the_app() {
     let root = PackageRoot::new(true);
+    root.stub_init();
     let init = root.init_path();
     for link in ["S92rebot-teleop", "S94rebot-teleop"] {
         std::os::unix::fs::symlink(&init, root.p(&format!("etc/init.d/{link}"))).unwrap();
@@ -645,15 +677,58 @@ fn postinst_with_console_removes_every_boot_link_and_registers_the_app() {
     // written through the console's app_write_state with exactly one JSON argument
     assert_eq!(root.calls(), "app_write_state 2\n");
     assert!(String::from_utf8_lossy(&out.stdout).contains("recorded rebot-teleop as the console's active app"));
+    // another app was active: the install does not start rebot-teleop (it starts at the next
+    // boot, or when the console switches to it)
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(root.init_calls(None), "stop-vision\nregister\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn postinst_upgrade_starts_the_app_when_it_is_the_console_active_app() {
+    let root = PackageRoot::new(true);
+    root.stub_init();
+    std::fs::write(
+        root.p("userdata/local/apps/state.json"),
+        "{\n  \"active_app\": \"rebot-teleop\",\n  \"active_script\": \"/etc/init.d/K92rebot-teleop\",\n  \"models\": {},\n  \"updated_at\": 1762600000\n}",
+    )
+    .unwrap();
+    let started = Instant::now();
+    let out = root.postinst();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(started.elapsed() < Duration::from_secs(2), "postinst must not wait for start");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Starting rebot-teleop in the background"));
+    assert_eq!(root.init_calls(Some("start")), "stop-vision\nregister\nstart\n");
+    assert_eq!(root.state()["active_app"], "rebot-teleop");
+}
+
+#[cfg(unix)]
+#[test]
+fn postinst_does_not_start_the_app_without_an_active_app_record() {
+    for content in [None, Some("{\"active_app\": null, \"active_script\": null, \"models\": {}, \"updated_at\": 0}"), Some("garbage")] {
+        let root = PackageRoot::new(true);
+        root.stub_init();
+        if let Some(c) = content {
+            std::fs::write(root.p("userdata/local/apps/state.json"), c).unwrap();
+        }
+        let out = root.postinst();
+        assert!(out.status.success(), "{content:?}: {}", String::from_utf8_lossy(&out.stderr));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(root.init_calls(None), "stop-vision\nregister\n", "{content:?}");
+    }
 }
 
 #[cfg(unix)]
 #[test]
 fn postinst_without_console_creates_the_s92_link_and_leaves_state_alone() {
     let root = PackageRoot::new(false);
+    root.stub_init();
     std::fs::write(root.p("userdata/local/apps/state.json"), "{\"active_app\": \"yolo-detector\"}").unwrap();
     let out = root.postinst();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // no console: the S92 link is the app's boot start, so the install starts it as well
+    assert_eq!(root.init_calls(Some("start")), "stop-vision\nstart\n");
+    std::fs::write(root.p("etc/init.d/K92rebot-teleop"), root.rebase(PackageRoot::INIT)).unwrap();
     let link = root.p("etc/init.d/S92rebot-teleop");
     assert_eq!(std::fs::read_link(&link).unwrap().display().to_string(), root.init_path());
     assert_eq!(std::fs::read_to_string(root.p("userdata/local/apps/state.json")).unwrap(), "{\"active_app\": \"yolo-detector\"}");
