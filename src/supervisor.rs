@@ -2499,15 +2499,21 @@ impl SupervisorInner {
                                 infeasible = Some(i);
                                 break;
                             };
+                            // The lead cap shapes this tick only when the unclamped target would
+                            // step differently (otherwise the speed cap or the limits bind).
+                            let lead_shaping = lead_capped[i] && Self::bounded_servo_step_with_jerk(
+                                next_positions[i], clamped_tgt, next_velocities[i], servo_dt, limit,
+                                self.commanded_accelerations[i], self.config.max_jerk,
+                            ).is_none_or(|(_, v_raw, _)| (v_raw - v_next).abs() > 1.0e-4);
                             next_positions[i] = q_next;
                             next_velocities[i] = v_next;
                             // a lead-capped joint has not reached the client's target
                             reached_flags[i] = reached && !lead_capped[i];
                             let raw = &self.config.limits[i];
                             let excess = (clamped_tgt - actual_tgt).abs();
-                            if lead_capped[i] && lead_hit.is_none_or(|(_, e)| excess > e) {
+                            if lead_shaping && lead_hit.is_none_or(|(_, e)| excess > e) {
                                 lead_hit = Some((i, excess));
-                            } else if !lead_capped[i] && speed_hit.is_none()
+                            } else if !lead_shaping && speed_hit.is_none()
                                 && limit.max_velocity < raw.max_velocity
                                 && v_next.abs() >= limit.max_velocity - 1.0e-3 {
                                 speed_hit = Some(i);
