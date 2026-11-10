@@ -4,7 +4,8 @@
 //   a. VIK.fk equals CALM.fk (full URDF chain)
 //   b. FK -> IK round trip: 200 random joint sets (inside limits, away from singularities), perturbed start
 //   c. continuity: 0.2 m forward / strafe lines and a 90 deg look-around at 40 Hz, solved tick by tick
-//   d. semantics: forward = z_cam, strafe = x_cam, look-around / pitch keep the position, auto-level
+//   d. semantics: forward = z_cam, strafe = x_cam, look-around / pitch keep the position, auto-level after a
+//      rotation, none after a pure translation
 //   e. unreachable / invalid targets return ok:false without throwing
 //   f. timing: median per-solve time (target < 0.5 ms)
 import fs from 'node:fs';
@@ -140,6 +141,11 @@ for (const rollDeg of [20, -35, 90, 170, -150]) {
   lvWorst = Math.max(lvWorst, Math.abs(cl.x[2])); if (cl.y[2] > 0) lvDown = false;
 }
 check('d. auto-level from rolled poses (20..170 deg)', lvWorst < 1e-9 && lvDown, `max |x_cam.Z| ${lvWorst.toExponential(1)}, y_cam.Z <= 0: ${lvDown}`);
+// a pure translation keeps the orientation as it is (the cockpit's look stick moves the wrist joints and may
+// leave a roll; translation must not level it away)
+const Trl = VIK.fk([0, -1.167, -1.565, 1.435, 0.3, Math.PI / 2]), Ttr = VIK.integrate(Trl, { x: 1, y: -0.5, z: 0.3, p: 0, r: 0 }, 0.1, o);
+const rTr = VIK.diff(Trl, Ttr);
+check('d. translation keeps a rolled orientation (no auto-level)', rTr.a < 1e-12 && rTr.d > 0.005, `rot change ${rTr.a.toExponential(1)} rad, moved ${(rTr.d * 1000).toFixed(1)} mm, x_cam.Z ${VIK.camAxes(Trl, Rec).x[2].toFixed(4)}`);
 const Tdown = CALM.make(CALM.mul(CALM.axisR([0, 1, 0], 85 / D), CALM.rotOf(CALM.make([[1, 0, 0], [0, 0, -1], [0, 1, 0]], [0, 0, 0]))), [0.3, 0, 0.2]); // tool axis 85 deg down
 const vd = VIK.camAxes(Tdown, Rec).z[2];
 const Tdl = VIK.level(Tdown, Rec, LEVEL);

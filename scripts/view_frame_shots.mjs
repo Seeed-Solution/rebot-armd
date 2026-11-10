@@ -6,8 +6,9 @@
 // writes a PNG (default .cache/view-shots/). Simple mode (stored rebot.cart.frame = base) must use the view
 // frame with no frame toggle, pad-srot visible and btn-pose hidden. Expert mode, for view / base frame, must
 // show the toggle with the matching option on and no pad-srot. No horizontal page scroll anywhere.
-// Then drives W / A / ArrowRight / E in simple mode (view frame) and W / A in expert base frame and checks
-// the motion direction of the commanded pose.
+// Then drives W / A, the look stick (pad-srot) and E / ArrowRight / look step buttons, ArrowUp, W after a look,
+// and W + look stick together in simple mode (view frame), and W / A in expert base frame. Look input must move
+// only J4 (up / down) or J5 (left / right), others < 0.003 rad, with the matching optical-axis change.
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -102,7 +103,7 @@ for (const [ui, frame] of [['simple', 'view'], ['expert', 'base']]) {
   await page.waitForTimeout(600);
   const snap = () => page.evaluate(() => {
     const q = window.__sim, T = VIK.fk([...toModel(q), q[4], q[5]]), c = VIK.camAxes(T, CFG.view.Rec);
-    return { p: CALM.posOf(T), z: c.z, x: c.x, sent: window.__sent, status: C.status };
+    return { p: CALM.posOf(T), z: c.z, x: c.x, q: [...toModel(q), q[4], q[5]], sent: window.__sent, status: C.status };
   });
   const hold = async (code, ms = 400) => {
     await page.evaluate((c) => window.dispatchEvent(new KeyboardEvent('keydown', { code: c, key: c })), code);
@@ -126,11 +127,75 @@ for (const [ui, frame] of [['simple', 'view'], ['expert', 'base']]) {
     if (frame === 'view') check('view A = left along -x_cam', nrm(d) > 0.005 && -dot(d, s0.x) / nrm(d) > 0.99, `moved ${(nrm(d) * 1000).toFixed(1)} mm, cos(d, -x_cam) ${(-dot(d, s0.x) / nrm(d)).toFixed(4)}`);
     else check('base A = +Y', nrm(d) > 0.005 && d[1] / nrm(d) > 0.99, `moved ${(nrm(d) * 1000).toFixed(1)} mm, dir ${d.map((v) => (v / nrm(d)).toFixed(3))}`);
     if (frame === 'view') {
-      s0 = await snap(); await hold('ArrowRight'); s1 = await snap(); d = sub(s1.p, s0.p);
-      const h0 = Math.atan2(s0.z[1], s0.z[0]), h1 = Math.atan2(s1.z[1], s1.z[0]);
-      check('view ArrowRight = look right, TCP fixed, level', nrm(d) < 0.0015 && h1 < h0 - 0.05 && Math.abs(s1.x[2]) < 0.01, `TCP moved ${(nrm(d) * 1000).toFixed(2)} mm, heading ${(h0 * 57.3).toFixed(1)} -> ${(h1 * 57.3).toFixed(1)} deg, x_cam.Z ${s1.x[2].toFixed(4)}`);
-      s0 = await snap(); await hold('KeyE'); s1 = await snap(); d = sub(s1.p, s0.p);
-      check('view E = look up, TCP fixed', nrm(d) < 0.0015 && s1.z[2] > s0.z[2] + 0.02, `TCP moved ${(nrm(d) * 1000).toFixed(2)} mm, z_cam.Z ${s0.z[2].toFixed(3)} -> ${s1.z[2].toFixed(3)}`);
+      // look input = wrist only: J4 (up / down) or J5 (left / right); J1..J3 and J6 within 0.003 rad
+      const J = ['J1', 'J2', 'J3', 'J4', 'J5', 'J6'];
+      const dj = (a0, a1) => a1.q.slice(0, 6).map((v, i) => v - a0.q[i]);
+      const fmt = (d) => d.map((v, i) => `${J[i]} ${v >= 0 ? '+' : ''}${v.toFixed(4)}`).join(' ');
+      const only = (d, keep) => d.every((v, i) => keep.includes(i) ? Math.abs(v) > 0.05 : Math.abs(v) < 0.003);
+      const heading = (z) => Math.atan2(z[1], z[0]);
+      // drag the look stick (pad-srot) toward (ux, uy) of its radius for ms, then release
+      const stick = async (id, ux, uy, ms = 400, onHold = null, onLeave = null) => {
+        const r = await page.evaluate((i) => { const b = document.getElementById(i).getBoundingClientRect(); return { x: b.x + b.width / 2, y: b.y + b.height / 2, r: b.width / 2 }; }, id);
+        await page.mouse.move(r.x, r.y); await page.mouse.down();
+        await page.mouse.move(r.x + ux * r.r, r.y + uy * r.r, { steps: 4 });
+        if (onHold) await onHold();
+        await page.waitForTimeout(ms);
+        if (onLeave) await onLeave();
+        await page.mouse.up(); await page.waitForTimeout(700);
+      };
+      const look = async (name, act, keep, dirOk, dirTxt) => {
+        const a0 = await snap(); await act(); const a1 = await snap();
+        const d = dj(a0, a1), ok = only(d, keep) && dirOk(a0, a1);
+        check(name, ok, `${fmt(d)} | ${dirTxt(a0, a1)}`);
+        return a1;
+      };
+      const up = (a0, a1) => a1.z[2] > a0.z[2] + 0.02, upTxt = (a0, a1) => `z_cam.Z ${a0.z[2].toFixed(3)} -> ${a1.z[2].toFixed(3)}`;
+      const rt = (a0, a1) => dot(sub(a1.z, a0.z), a0.x) > 0.02 && heading(a1.z) < heading(a0.z),
+        rtTxt = (a0, a1) => `dz_cam . x_cam ${dot(sub(a1.z, a0.z), a0.x).toFixed(3)}, heading ${(heading(a0.z) * 57.3).toFixed(1)} -> ${(heading(a1.z) * 57.3).toFixed(1)} deg`;
+      await look('view right stick up = J4 only, look up', () => stick('pad-srot', 0, -0.9), [3], up, upTxt);
+      await look('view right stick right = J5 only, look right', () => stick('pad-srot', 0.9, 0), [4], rt, rtTxt);
+      await look('view key E = J4 only, look up', () => hold('KeyE'), [3], up, upTxt);
+      await look('view key ArrowRight = J5 only, look right', () => hold('ArrowRight'), [4], rt, rtTxt);
+      const dn = (a0, a1) => a1.z[2] < a0.z[2] - 0.02, dnTxt = upTxt;
+      await look('view step button look down = J4 only', async () => {
+        await page.evaluate(() => { setStep(2); cartStep('p', 1); cartStep('p', 1); }); await page.waitForTimeout(900);
+      }, [3], dn, dnTxt);
+      // lift (world Z) through the IK, orientation held
+      s0 = await snap(); await hold('ArrowUp'); s1 = await snap(); d = sub(s1.p, s0.p);
+      check('view ArrowUp = lift along world Z, orientation held', nrm(d) > 0.005 && d[2] / nrm(d) > 0.99 && dot(s1.z, s0.z) > 0.9999 && dot(s1.x, s0.x) > 0.9999,
+        `moved ${(nrm(d) * 1000).toFixed(1)} mm, dir.Z ${(d[2] / nrm(d)).toFixed(4)}, cos z_cam ${dot(s1.z, s0.z).toFixed(6)}, cos x_cam ${dot(s1.x, s0.x).toFixed(6)}`);
+      // after the J5 moves above the camera carries a roll (x_cam.Z != 0): W must not re-level it
+      s0 = await snap(); await hold('KeyW'); s1 = await snap(); d = sub(s1.p, s0.p);
+      check('view W after look: no auto-level roll, orientation held', nrm(d) > 0.005 && dot(d, s0.z) / nrm(d) > 0.99 && Math.abs(s1.x[2] - s0.x[2]) < 0.002 && dot(s1.z, s0.z) > 0.9999,
+        `x_cam.Z ${s0.x[2].toFixed(4)} -> ${s1.x[2].toFixed(4)}, cos(d, z_cam) ${(dot(d, s0.z) / nrm(d)).toFixed(4)}, joints ${fmt(dj(s0, s1))}`);
+      // both sticks: forward key held only while the look stick is held right. The wrist delta is applied first,
+      // then the translation with that orientation held (no auto-level), so J6 is not used to roll the camera
+      // back. A/B from the same rolled start pose (J5 = 0.3): W alone vs W + look right, same duration.
+      const START = [0, -1.167, -1.565, 1.435, 0.3, Math.PI / 2, 0.2];
+      const reset = async () => { await page.evaluate((q) => { window.__sim = q.slice(); cartSync(q); }, START); await page.waitForTimeout(300); };
+      const wDown = () => page.evaluate(() => window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', key: 'KeyW' })));
+      const wUp = () => page.evaluate(() => window.dispatchEvent(new KeyboardEvent('keyup', { code: 'KeyW', key: 'KeyW' })));
+      await reset(); s0 = await snap(); await wDown(); await page.waitForTimeout(400); await wUp(); await page.waitForTimeout(700); s1 = await snap();
+      const dA = dj(s0, s1);
+      // B: record every wrist step (viewWrist) during the combined move; it must change J4 / J5 only
+      await reset();
+      await page.evaluate(() => {
+        window.__ww = { n: 0, other: 0, j5: 0 };
+        const f = window.viewWrist;
+        window.viewWrist = (dq) => {
+          const q0 = C.q6.slice(), r = f(dq), q1 = C.q6;
+          window.__ww.n++; window.__ww.j5 += q1[4] - q0[4];
+          for (const i of [0, 1, 2, 5]) window.__ww.other = Math.max(window.__ww.other, Math.abs(q1[i] - q0[i]));
+          return r;
+        };
+      });
+      const b0 = await snap(); await stick('pad-srot', 0.9, 0, 400, wDown, wUp); const b1 = await snap();
+      const ww = await page.evaluate(() => window.__ww);
+      const dB = dj(b0, b1), dpB = sub(b1.p, b0.p);
+      check('view W alone (A/B reference)', nrm(sub(s1.p, s0.p)) > 0.005, `${fmt(dA)} | x_cam.Z ${s0.x[2].toFixed(4)} -> ${s1.x[2].toFixed(4)}`);
+      check('view both sticks: look stick moves J4 / J5 only, look right, roll not levelled',
+        ww.n > 5 && ww.other === 0 && ww.j5 > 0.05 && nrm(dpB) > 0.005 && rt(b0, b1) && Math.abs(b1.x[2]) >= Math.abs(b0.x[2]) - 0.002,
+        `${fmt(dB)} | wrist steps ${ww.n}: J5 sum ${ww.j5.toFixed(4)}, max |dJ1..3, dJ6| ${ww.other}; J6 B-A ${(dB[5] - dA[5]).toFixed(4)} (translation IK holding the new orientation); moved ${(nrm(dpB) * 1000).toFixed(1)} mm, x_cam.Z ${b0.x[2].toFixed(4)} -> ${b1.x[2].toFixed(4)}`);
     }
   }
   if (errs.length) { bad++; console.log('  FAIL page errors: ' + [...new Set(errs)].join(' | ').slice(0, 300)); }
