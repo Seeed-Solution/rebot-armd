@@ -1416,7 +1416,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
             </div>
           </div>
           <div class="ck-rot">
-            <div class="disc" id="pad-srot" data-i18n-aria="pad.rot" aria-label="视角摇杆（抬头低头 / 左转右转）">
+            <div class="disc" id="pad-srot" data-i18n-aria="pad.rot" aria-label="视角摇杆（只动手腕：J4 抬头低头 / J5 左转右转）">
               <span class="dir t" data-ax="p" data-s="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M6 11l6-6 6 6"/></svg><span class="lbl" data-i18n="vr.up">抬头</span></span>
               <span class="dir b" data-ax="p" data-s="1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M6 13l6 6 6-6"/></svg><span class="lbl" data-i18n="vr.dn">低头</span></span>
               <span class="dir l" data-ax="r" data-s="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg><span class="lbl" data-i18n="vr.l">左转</span></span>
@@ -1660,12 +1660,12 @@ const I18N = {
     'st.pan': '水平平移', 'step': '步长', 'step.title': '每次点按 {n} mm / {n}°',
     // camera-view cartesian frame (keys ending in @view win over @7 and the plain key while it is active)
     'frame': '坐标系', 'frame.view': '视角', 'frame.base': '底座', 'hub.xy': 'XY', 'hub.xy@view': '视角',
-    'vr.up': '抬头', 'vr.dn': '低头', 'vr.l': '左转', 'vr.r': '右转', 'pad.rot': '视角摇杆（抬头低头 / 左转右转）',
+    'vr.up': '抬头', 'vr.dn': '低头', 'vr.l': '左转', 'vr.r': '右转', 'pad.rot': '视角摇杆（只动手腕：J4 抬头低头 / J5 左转右转）',
     'pad.move@view': '移动摇杆（沿视线前进后退 / 画面左右平移）', 'st.pan@view': '视角移动', 'cap.fb': '前后', 'cap.lr': '左右',
     'd.lift@view': '抬头', 'd.press@view': '低头', 'cb.pup@view': '抬头', 'cb.pdn@view': '低头', 'cb.rr@view': '右转', 'cb.rl@view': '左转',
-    'vl.roll@view': '环视', 'vl.roll.sub@view': 'Yaw', 'c.roll@view': 'Roll 腕转',
+    'vl.roll@view': '环视', 'vl.roll.sub@view': 'J5', 'c.roll@view': 'Roll 腕转',
     'kb.cartsub@view': '空间位姿 / 简化模式（视角坐标）', 'kb.x@view': '前进 / 后退（沿视线）', 'kb.y@view': '左移 / 右移（画面水平）',
-    'kb.p@view': '抬头 / 低头', 'kb.r@view': '左转 / 右转（环视）',
+    'kb.p@view': '抬头 / 低头（J4 手腕）', 'kb.r@view': '左转 / 右转（J5 腕摆）',
     'grip': '夹爪', 'grip.opening': '夹爪开度', 'stick.grip6': '夹爪 J6',
     'dj.lean': '前倾', 'dj.back': '后仰', 'dj.ccw': '逆转', 'dj.cw': '顺转', 'dj.up': '上翘', 'dj.down': '下倾', 'dj.raise': '抬高', 'dj.lower': '下压', 'dj.rl': '旋左', 'dj.rr': '旋右',
     'stick.left': '左摇杆', 'stick.right': '右摇杆', 'stick.j2': 'J2 大臂', 'stick.j1': 'J1 底座', 'stick.j3': 'J3 小臂', 'stick.j5': 'J5 腕转', 'part.wrist': '手腕',
@@ -1803,12 +1803,12 @@ const I18N = {
     'pl.up': 'Up', 'pl.dn': 'Down', 'pl.rl': 'Roll L', 'pl.rr': 'Roll R',
     'st.pan': 'Horizontal', 'step': 'Step', 'step.title': '{n} mm / {n}° per tap',
     'frame': 'Frame', 'frame.view': 'View', 'frame.base': 'Base', 'hub.xy': 'XY', 'hub.xy@view': 'View',
-    'vr.up': 'Up', 'vr.dn': 'Down', 'vr.l': 'Left', 'vr.r': 'Right', 'pad.rot': 'Look stick (look up / down, turn left / right)',
+    'vr.up': 'Up', 'vr.dn': 'Down', 'vr.l': 'Left', 'vr.r': 'Right', 'pad.rot': 'Look stick (wrist only: J4 look up / down, J5 turn left / right)',
     'pad.move@view': 'Move stick (forward / back along the view, left / right in the image)', 'st.pan@view': 'View move', 'cap.fb': 'Fwd/Back', 'cap.lr': 'Left/Right',
     'd.lift@view': 'Up', 'd.press@view': 'Down', 'cb.pup@view': 'Look up', 'cb.pdn@view': 'Look down', 'cb.rr@view': 'Turn R', 'cb.rl@view': 'Turn L',
-    'vl.roll@view': 'Look', 'vl.roll.sub@view': 'Yaw', 'c.roll@view': 'Roll',
+    'vl.roll@view': 'Look', 'vl.roll.sub@view': 'J5', 'c.roll@view': 'Roll',
     'kb.cartsub@view': 'Cartesian / Simple mode (view frame)', 'kb.x@view': 'Forward / back (along the view)', 'kb.y@view': 'Left / right (image horizontal)',
-    'kb.p@view': 'Look up / down', 'kb.r@view': 'Turn left / right (look around)',
+    'kb.p@view': 'Look up / down (J4 wrist)', 'kb.r@view': 'Turn left / right (J5 wrist swing)',
     'grip': 'Gripper', 'grip.opening': 'Gripper opening', 'stick.grip6': 'Gripper J6',
     'dj.lean': 'Lean fwd', 'dj.back': 'Lean back', 'dj.ccw': 'CCW', 'dj.cw': 'CW', 'dj.up': 'Tilt up', 'dj.down': 'Tilt down', 'dj.raise': 'Raise', 'dj.lower': 'Lower', 'dj.rl': 'Rot. L', 'dj.rr': 'Rot. R',
     'stick.left': 'Left stick', 'stick.right': 'Right stick', 'stick.j2': 'J2 Shoulder', 'stick.j1': 'J1 Base', 'stick.j3': 'J3 Elbow', 'stick.j5': 'J5 Wrist roll', 'part.wrist': 'Wrist',
@@ -2141,6 +2141,7 @@ const C = {
   frame: store('rebot.cart.frame') === 'base' ? 'base' : 'view', // view (camera frame, 7-DOF only) | base
   T: null, Tg: null,          // view frame: solved / goal end_link pose (4x4, base frame)
   q6: null,                   // view frame: IK solution (model J1..J6) for T
+  wq: [0, 0],                 // view frame: queued wrist look steps (model rad, J4 / J5) from step buttons
   hold: { x: [0, 0], y: [0, 0], z: [0, 0], p: [0, 0], r: [0, 0] }, // continuous holds per axis [neg, pos]
   axes: { xy: [0, 0], z: 0, p: 0, sxy: [0, 0], sz: 0, sp: 0, sr: 0 }, // s*: simple cockpit (sxy = X/Y, sz = lift, sp/sr = pitch/J5 wrist in pose mode)
   stepIdx: 1,
@@ -3804,7 +3805,8 @@ const VIK = (() => {
   }
   // integrate operator input v = { x: forward, y: left (+), z: world up, p: look down (+), r: look right (+) }
   // over dt: translation in the camera frame (+ world Z), unit-ball normalised x vl; pitch about x_cam and
-  // look-around about world Z (both centred on the end_link origin) x wl; then auto-level.
+  // look-around about world Z (both centred on the end_link origin) x wl; then auto-level. A pure
+  // translation keeps the orientation as it is (no auto-level), so it never re-rolls the camera.
   function integrate(T, v, dt, o) {
     const c = camAxes(T, o.Rec);
     const d = [0, 1, 2].map((k) => -v.y * c.x[k] + v.x * c.z[k]);
@@ -3817,7 +3819,7 @@ const VIK = (() => {
     let R = flat(T);
     if (wp) R = m3(rotAxis(c.x, wp * o.wl * dt), R);
     if (wr) R = m3(rotAxis([0, 0, 1], wr * o.wl * dt), R);
-    return level(T4(R, p), o.Rec, o.levelCos);
+    return wp || wr ? level(T4(R, p), o.Rec, o.levelCos) : T4(R, p);
   }
   // position (m) and rotation (rad) difference B relative to A
   function diff(A, B) {
@@ -4486,11 +4488,13 @@ function cartSync(pos) {
   C.j5 = pos[4] ?? 0;
   C.branch = null;
   if (pos.length >= 6) { C.q6 = [...C.q, pos[4], pos[5]]; C.T = C.Tg = VIK.fk(C.q6); }
+  C.wq = [0, 0];
 }
 // drop queued motion: the goal snaps back to the last solved pose (both frames)
 function cartHoldStill() {
   if (C.goal && C.cmd) C.goal = { ...C.cmd };
   if (C.T) C.Tg = C.T;
+  C.wq = [0, 0];
 }
 // HUD line for actions started by an external client (agent / MCP); hidden 5 s after they end
 function renderActionChip(o) {
@@ -4566,7 +4570,9 @@ function cartStep(ax, s) {
   if (viewActive()) {
     if (!C.Tg) return;
     const n = CFG.cart.steps[C.stepIdx], v = { x: 0, y: 0, z: 0, p: 0, r: 0 };
-    v[ax] = s; // one tap: n mm along the camera axis / world Z, or n degrees of pitch / look-around
+    // look up / down and left / right: n degrees of J4 / J5, played out by cartTickView at the look rate
+    if (ax === 'p' || ax === 'r') { C.wq[ax === 'p' ? 0 : 1] += s * n / DEG; cartKick(); return; }
+    v[ax] = s; // one tap: n mm along the camera axis / world Z
     C.Tg = VIK.integrate(C.Tg, v, 1, { vl: n / 1000, wl: n / DEG, Rec: CFG.view.Rec, levelCos: CFG.view.levelCos });
     cartKick();
     return;
@@ -4732,8 +4738,34 @@ function modelLimits6() {
   return { lo, hi };
 }
 const toMotor6 = (q) => [...toMotor(q.slice(0, 4)), q[4], q[5]];
-// Camera-view frame: left stick = forward (optical axis) / strafe (image x), lift = world Z, right stick =
-// pitch about x_cam / look-around about world Z (centred on end_link), auto-level. Same guards as cartTick.
+// Camera-view frame: left stick = forward (optical axis) / strafe (image x), lift = world Z, both through
+// the 6-joint IK with the orientation held; right stick = wrist only: up / down drives J4, left / right
+// drives J5 as joint velocities (J1..J3 and J6 stay put). Same guards as cartTick.
+// Signs from VIK.fk at the inspect pose (J4 = 1.435, J5 = 0, J6 = pi/2) and at J4 = 0: J4 + moves the
+// optical axis toward +y_cam (image down), J5 + moves it toward +x_cam (image right). With v.p = look
+// down (+) and v.r = look right (+): dJ4 = +v.p, dJ5 = +v.r.
+const VIEW_WRIST_SIGN = [1, 1];
+// Move model J4 / J5 by dq (rad), clamped to the joint limits (a joint already past its margin may stay but
+// not go further), and re-derive T from FK. A pending translation goal keeps its offset from T and takes
+// the new orientation. Returns true if a joint moved.
+function viewWrist(dq) {
+  const { lo, hi } = modelLimits6();
+  const q = C.q6.slice();
+  for (const [k, i] of [[0, 3], [1, 4]]) q[i] = clamp(q[i] + dq[k], Math.min(lo[i], C.q6[i]), Math.max(hi[i], C.q6[i]));
+  const moved = q[3] !== C.q6[3] || q[4] !== C.q6[4];
+  if (!moved) {
+    if (C.status !== 'limit') { buzz(30); toastOnce({ message: ikText(IK_MSG.limit), code: 'IK' }); }
+    C.status = 'limit'; C.msg = IK_MSG.limit;
+    return false;
+  }
+  const T = VIK.fk(q), p0 = CALM.posOf(C.T), p1 = CALM.posOf(T);
+  if (p1[2] < CFG.cart.zMin && p1[2] < p0[2]) { cartReject('floor'); return false; }
+  const pg = CALM.posOf(C.Tg);
+  C.Tg = C.Tg === C.T ? T : CALM.make(CALM.rotOf(T), p1.map((x, k) => x + pg[k] - p0[k]));
+  C.T = T; C.q6 = q;
+  if (C.status !== 'ok') { C.status = 'ok'; C.msg = ''; }
+  return true;
+}
 function cartTickView() {
   const pos = S.obs.positions;
   const now = performance.now();
@@ -4752,7 +4784,7 @@ function cartTickView() {
   const input = motion || gripMoving;
   if (input) cartKick();
   const settling = now - C.lastInput < CFG.cart.settleMs;
-  const pending = C.Tg !== C.T;
+  const pending = C.Tg !== C.T || C.wq[0] !== 0 || C.wq[1] !== 0;
   if (!C.Tg || (!input && !pending && !settling && now > C.tailUntil)) {
     cartSync(pos); // idle: track the real arm so the next command starts from where it is
     if (C.status !== 'ok' && C.status !== 'idle' && now - C.lastInput > 1500) { C.status = 'idle'; C.msg = ''; }
@@ -4760,10 +4792,7 @@ function cartTickView() {
   }
 
   const scale = speedScale();
-  const vl = CFG.cart.vmax * scale, wl = CFG.view.wmax * scale;
-  if (motion) C.Tg = VIK.integrate(C.Tg, v, dt, { vl, wl, Rec: CFG.view.Rec, levelCos: CFG.view.levelCos });
-  // anti-windup: goal at most 0.25 m / 30 deg away from the solved pose
-  C.Tg = VIK.clampGoal(C.T, C.Tg, 0.25, CFG.view.maxRot);
+  const vl = CFG.cart.vmax * scale, wl = CFG.view.wmax * scale; // wl: rad/s of J4 / J5 for the look stick
 
   // lag guard over J1..J6: do not let the command run ahead of a slow / blocked arm
   const mq = toMotor6(C.q6);
@@ -4771,16 +4800,31 @@ function cartTickView() {
   // tighter than base mode: a camera-frame move often needs one slow joint (J1) to cover most of the path
   const a = 0.08, b = 0.20;
   const factor = clamp(1.0 - (lag - a) / (b - a), 0.0, 1.0);
+  let stalled = false;
   if (lag > 0.40) {
     if (!C.stallSince) C.stallSince = now;
-    else if (now - C.stallSince > 500) {
-      C.Tg = C.T;
-      C.status = 'stall';
-      C.msg = 'ik.lag';
-    }
+    else if (now - C.stallSince > 500) stalled = true;
   } else {
     C.stallSince = 0;
   }
+
+  // 1. look stick / look steps: wrist joints only, applied first; the result is the orientation held below
+  let wp = v.p, wr = v.r;
+  const wn = Math.hypot(wp, wr);
+  if (wn > 1) { wp /= wn; wr /= wn; }
+  const wmax = wl * dt * factor;
+  const dq = [VIEW_WRIST_SIGN[0] * wp * wmax, VIEW_WRIST_SIGN[1] * wr * wmax];
+  for (let k = 0; k < 2; k++) {
+    const qs = clamp(C.wq[k], -wmax, wmax); // queued steps play out at the look rate
+    C.wq[k] -= qs; dq[k] += qs;
+  }
+  if (stalled) C.wq = [0, 0];
+  else if (dq[0] || dq[1]) { if (!viewWrist(dq)) C.wq = [0, 0]; }
+  // 2. translation (left stick, lift) with the orientation held
+  if (v.x || v.y || v.z) C.Tg = VIK.integrate(C.Tg, { x: v.x, y: v.y, z: v.z, p: 0, r: 0 }, dt, { vl, wl, Rec: CFG.view.Rec, levelCos: CFG.view.levelCos });
+  if (stalled) { C.Tg = C.T; C.status = 'stall'; C.msg = 'ik.lag'; }
+  // anti-windup: goal at most 0.25 m / 30 deg away from the solved pose
+  C.Tg = VIK.clampGoal(C.T, C.Tg, 0.25, CFG.view.maxRot);
   // rate-limited follower: position <= vl dt, orientation <= wl dt (geodesic)
   const cand = VIK.approach(C.T, C.Tg, vl * dt * factor, wl * dt * factor);
   const step = VIK.diff(C.T, cand);
@@ -4837,8 +4881,9 @@ const ARROW = {
   down: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 9l7 7 7-7"/></svg>',
   left: CHEV_L, right: CHEV_R,
 };
-// step-button axis tags in the view frame: camera axes (Zc forward, Xc right), world Z, yaw (CCW +)
-const VIEW_SUB = { 'X+': 'Zc+', 'X−': 'Zc−', 'Y+': 'Xc−', 'Y−': 'Xc+', 'R+': 'Yaw−', 'R−': 'Yaw+' };
+// step-button axis tags in the view frame: camera axes (Zc forward, Xc right), world Z, wrist joints
+// (look up = J4−, turn right = J5+; see VIEW_WRIST_SIGN)
+const VIEW_SUB = { 'X+': 'Zc+', 'X−': 'Zc−', 'Y+': 'Xc−', 'Y−': 'Xc+', 'P−': 'J4−', 'P+': 'J4+', 'R+': 'J5+', 'R−': 'J5−' };
 function cartButton(parent, ax, s, label, sub, arrow) {
   const b = document.createElement('button');
   b.className = 'jbtn cbtn';
@@ -4953,7 +4998,7 @@ new Pad($('pad-sgrip'), {
   }
 });
 
-// view frame look stick: up = look up, right = turn right (C.axes.sp / sr, same signs as the pose stick)
+// view frame look stick: up = look up (J4), right = turn right (J5); C.axes.sp / sr, same signs as the pose stick
 let rotPadRequiresNeutral = false;
 const padSrot = new Pad($('pad-srot'), { onChange: (v) => {
   if (rotPadRequiresNeutral) {
