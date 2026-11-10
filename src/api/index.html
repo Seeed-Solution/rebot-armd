@@ -106,6 +106,7 @@ body.ui-simple .only-expert, body.ui-expert .only-simple { display: none !import
 .seg button:hover { color: var(--sc-color-text); }
 .seg button.on { background: #fff; color: var(--sc-color-primary-dark); box-shadow: 0 1px 3px rgba(0,0,0,0.08); font-weight: 600; }
 .seg-sm button { min-height: 28px; padding: 0 10px; font-size: 12px; }
+body.locked .pose-go { opacity: .45; filter: saturate(0); cursor: not-allowed; }
 
 /* ---------- buttons ---------- */
 .btn {
@@ -1706,7 +1707,7 @@ const I18N = {
     'lang.btn': 'EN', 'lang.aria': '切换语言',
     'speed': '速度', 'speed.adjust': '速度调节', 'speed.mult': '速度倍率',
     'fs.enter': '进入全屏', 'fs.title': '全屏', 'fs.exit': '退出全屏 / 展开布局', 'fs.hud': '全屏 HUD 沉浸模式',
-    'st.EStop': '急停', 'st.Offline': '离线', 'st.Armed': '已使能', 'st.Moving': '运动中', 'st.Idle': '未使能', 'st.Booting': '启动中', 'st.Fault': '故障', 'st.unconfirmed': '使能状态未确认',
+    'st.EStop': '急停', 'st.Offline': '离线', 'st.Armed': '已使能', 'st.Moving': '运动中', 'st.Idle': '未使能', 'st.Booting': '启动中', 'st.Fault': '故障', 'st.unconfirmed': '使能状态未确认', 'st.col_hold': '碰撞保护中',
     'no_telemetry': '无遥测', 'unknown': '未知', 'unknown_reason': '未知原因',
     'v.connecting': '正在连接摄像头…', 'v.retry': '立即重试', 'v.chip.connecting': '连接中', 'v.live': '实时',
     'v.noservice': '未连接到视频服务', 'v.dropped': '视频流中断，正在重连…', 'v.cant_open': '视频源无法打开',
@@ -1796,7 +1797,7 @@ const I18N = {
     'estop': '急停', 'estop.aria': '紧急停止',
     'lock.offline': '遥测断开，控制已锁定', 'lock.observer': '当前为观察模式，其他页面可能正在控制', 'lock.observer_who': '观察模式：{who}正在控制机械臂',
     'preempt.who': '控制方：{who}', 'who.cockpit': '另一个驾驶舱页面', 'who.agent': 'AI 智能体（{id}）', 'who.other': '其他客户端', 'who.named': '客户端 {id}',
-    'lock.estop': '⚠️ 急停已锁定：点击「复位急停」，再长按「使能」', 'lock.fault': '⚠️ 故障：点击「清除故障」后长按「使能」', 'lock.disabled': '未使能：按住「使能」0.6 秒后即可控制',
+    'lock.estop': '⚠️ 急停已锁定：点击「复位急停」，再长按「使能」', 'lock.fault': '⚠️ 故障：点击「清除故障」后长按「使能」', 'lock.disabled': '未使能：按住「使能」0.6 秒后即可控制', 'lock.col_hold': '碰撞保护中：自动恢复前运动控制已锁定（急停可用）',
     'preempt.btn': '接管控制权', 'preempt.title': '接管控制权确认',
     'preempt.body': '当前有其他设备或窗口持有控制权。确认接管机械臂控制权？接管后原控制窗口将切换为观察模式，正在进行的运动将被平稳悬停保持。',
     'preempt.confirm': '确认接管', 'preempt.taking': '接管中…', 'preempt.cool': '刚刚发生过控制权交接，请 {s} 秒后再试', 'cancel': '取消',
@@ -1885,7 +1886,7 @@ const I18N = {
     'lang.btn': '中文', 'lang.aria': 'Switch language',
     'speed': 'Speed', 'speed.adjust': 'Adjust speed', 'speed.mult': 'Speed multiplier',
     'fs.enter': 'Enter fullscreen', 'fs.title': 'Fullscreen', 'fs.exit': 'Exit fullscreen / restore layout', 'fs.hud': 'Fullscreen HUD mode',
-    'st.EStop': 'E-Stop', 'st.Offline': 'Offline', 'st.Armed': 'Enabled', 'st.Moving': 'Moving', 'st.Idle': 'Disabled', 'st.Booting': 'Booting', 'st.Fault': 'Fault', 'st.unconfirmed': 'Enable unconfirmed',
+    'st.EStop': 'E-Stop', 'st.Offline': 'Offline', 'st.Armed': 'Enabled', 'st.Moving': 'Moving', 'st.Idle': 'Disabled', 'st.Booting': 'Booting', 'st.Fault': 'Fault', 'st.unconfirmed': 'Enable unconfirmed', 'st.col_hold': 'Collision hold',
     'no_telemetry': 'No telemetry', 'unknown': 'unknown', 'unknown_reason': 'unknown reason',
     'v.connecting': 'Connecting to camera…', 'v.retry': 'Retry now', 'v.chip.connecting': 'Connecting', 'v.live': 'Live',
     'v.noservice': 'Video service not reachable', 'v.dropped': 'Video stream lost, reconnecting…', 'v.cant_open': 'Cannot open video source',
@@ -1973,7 +1974,7 @@ const I18N = {
     'estop': 'E-Stop', 'estop.aria': 'Emergency stop',
     'lock.offline': 'Telemetry lost, controls locked', 'lock.observer': 'Observer mode: another page may be in control', 'lock.observer_who': 'Observer mode: {who} is controlling the arm',
     'preempt.who': 'Held by {who}', 'who.cockpit': 'another cockpit page', 'who.agent': 'an AI agent ({id})', 'who.other': 'another client', 'who.named': 'client {id}',
-    'lock.estop': '⚠️ E-Stop latched: tap "Reset E-Stop", then hold "Enable"', 'lock.fault': '⚠️ Fault: tap "Clear fault", then hold "Enable"', 'lock.disabled': 'Disabled: hold "Enable" for 0.6 s to take control',
+    'lock.estop': '⚠️ E-Stop latched: tap "Reset E-Stop", then hold "Enable"', 'lock.fault': '⚠️ Fault: tap "Clear fault", then hold "Enable"', 'lock.disabled': 'Disabled: hold "Enable" for 0.6 s to take control', 'lock.col_hold': 'Collision hold: motion controls locked until it resumes (E-stop available)',
     'preempt.btn': 'Take over control', 'preempt.title': 'Confirm take over',
     'preempt.body': 'Another device or window holds control. Take over control of the arm? The previous window will switch to observer mode and any motion in progress will be held steady.',
     'preempt.confirm': 'Take over', 'preempt.taking': 'Taking over…', 'preempt.cool': 'Control was just handed over. Try again in {s} s', 'cancel': 'Cancel',
@@ -2442,6 +2443,9 @@ function parseState(s) {
 }
 const isLive = () => S.obs && Date.now() - S.obsAt < CFG.staleMs;
 const isOperational = () => S.state === 'Armed' || S.state === 'Moving';
+// collision guard protective stop (observation.collision.active): enabled, but motion commands are held
+const colHold = () => !!(S.obs && S.obs.collision && S.obs.collision.active);
+const canMove = () => isOperational() && !colHold();
 const isStopped = () => S.state === 'EStop' || S.state === 'Fault';
 const gripFrac = (rad) => clamp((rad - CFG.gripClosed) / (CFG.gripOpen - CFG.gripClosed), 0, 1);
 const gripRad = () => CFG.gripClosed + (S.grip ?? 0) * (CFG.gripOpen - CFG.gripClosed);
@@ -4254,6 +4258,7 @@ function lockReason() {
   if (other != null) return t('lock.observer_who', { who: leaseHolderText(other) });
   if (S.state === 'EStop') return t('lock.estop');
   if (S.state === 'Fault') { const ft = faultText(); return ft ? t('lock.fault_coded', ft) : t('lock.fault'); }
+  if (isOperational() && colHold()) return t('lock.col_hold');
   return t('lock.disabled');
 }
 function flashLock() {
@@ -4504,7 +4509,7 @@ window.addEventListener('keydown', (e) => {
     S.keys.add(e.code); return;
   }
   if (e.code === 'KeyG') {
-    if (!S.obs || !isOperational()) { flashLock(); return; }
+    if (!S.obs || !canMove()) { flashLock(); return; }
     S.grip = (S.grip ?? 0) > 0.5 ? 0 : 1;
     S.gripCmdAt = Date.now();
     commandGrip();
@@ -4611,7 +4616,7 @@ setInterval(() => {
   const now = performance.now();
   if (S.presetRunning) return;
   if (gcOn()) { S.servoTarget = null; gcInput(v); return; } // hand-guiding: no servo frames
-  if (!moving || !isLive() || !isOperational() || S.epoch == null) { S.servoTarget = null; return; }
+  if (!moving || !isLive() || !canMove() || S.epoch == null) { S.servoTarget = null; return; }
   const pos = S.obs.positions;
   if (!S.servoTarget || now - S.servoLastAt > 300) {
     S.servoTarget = pos.slice(0, S.dof);
@@ -4841,7 +4846,7 @@ function cartTick() {
   const now = performance.now();
   const dt = Math.min(0.1, (now - (C.lastTick || now)) / 1000);
   C.lastTick = now;
-  if (!isLive() || !isOperational() || S.epoch == null) {
+  if (!isLive() || !canMove() || S.epoch == null) {
     cartSync(pos); C.tailUntil = 0; C.status = 'idle'; C.msg = '';
     return;
   }
@@ -4984,7 +4989,7 @@ function cartTickView() {
   const now = performance.now();
   const dt = Math.min(0.1, (now - (C.lastTick || now)) / 1000);
   C.lastTick = now;
-  if (!isLive() || !isOperational() || S.epoch == null || !C.q6) {
+  if (!isLive() || !canMove() || S.epoch == null || !C.q6) {
     cartSync(pos); C.tailUntil = 0; C.status = 'idle'; C.msg = '';
     return;
   }
@@ -5262,7 +5267,7 @@ function jogTo(target) {
 }
 function commandGrip() {
   if (gcOn()) { gcGrip(S.grip > 0.5 ? -1 : 1); return; }
-  if (!S.obs || !isOperational()) { flashLock(); return; }
+  if (!S.obs || !canMove()) { flashLock(); return; }
   if (S.mode === 'cart') { S.gripCmdAt = Date.now(); cartKick(); return; } // the cartesian stream carries J6
   if (S.servoTarget) return; // while streaming, servo carries J6
   S.gripCmdAt = Date.now();
@@ -5272,7 +5277,7 @@ function commandGrip() {
 }
 function home() {
   if (gcOn()) { gcSticksOff(); return; }
-  if (!isOperational()) { toast(lockReason(), 'err'); flashLock(); return; }
+  if (!canMove()) { toast(lockReason(), 'err'); flashLock(); return; }
   api('/api/v1/motion/home', { epoch_id: S.epoch }).then(() => toast(t('toast.homing'), 'ok')).catch(() => {});
 }
 function eStop() {
@@ -5707,7 +5712,7 @@ function presetTarget(name) {
   return clampTarget(t);
 }
 async function runPreset(name) {
-  if (!isOperational() || !isLive()) { toast(lockReason(), 'err'); flashLock(); return; }
+  if (!canMove() || !isLive()) { toast(lockReason(), 'err'); flashLock(); return; }
   releaseAll();
   S.presetRunning = true;
   S.preset = { name, until: Date.now() + 15000, startedAt: Date.now() };
@@ -6868,7 +6873,7 @@ async function poseDelete(name) {
   } catch (e) { const m = poseErr(e); toast(m, 'err', e.code || ''); posesRender(m); }
 }
 async function poseGo(name) {
-  if (!isLive() || !isOperational()) { toast(isLive() && !isStopped() && leaseOther() == null ? t('pose.enable_first') : lockReason(), 'err'); flashLock(); return; }
+  if (!isLive() || !canMove()) { toast(isLive() && !isStopped() && !colHold() && leaseOther() == null ? t('pose.enable_first') : lockReason(), 'err'); flashLock(); return; }
   try {
     await commandRPC('/api/v1/action/move_to_pose', { name, speed_scale: clamp(speedScale(), 0.1, 1), tag: 'cockpit' });
     setText($('pose-status'), t('pose.moving', { name }));
@@ -6948,7 +6953,8 @@ function frame(ts) {
   const live = isLive();
   const q = S.obs ? S.obs.positions : [0, 0, 0, 0, 0, 0];
   const v = commandVector();
-  const op = live && isOperational() && leaseOther() == null;
+  const en = live && isOperational() && leaseOther() == null;
+  const op = en && !colHold();
   const torqued = !!(S.obs && S.obs.is_torqued);
   const act = v.map((x) => op && x !== 0);
   if (S.mode === 'cart' && op && C.sending) { for (let i = 0; i < 4; i++) act[i] = true; act[GRIP] = Date.now() - S.gripCmdAt < 400; }
@@ -6975,19 +6981,20 @@ function frame(ts) {
   const st = live ? S.state : 'Offline';
   const badge = $('state-badge');
   const enableUnknown = S.obs?.enable_state === 'Unknown';
-  setText(badge, enableUnknown && torqued && (st === 'Armed' || st === 'Moving') ? t('st.unconfirmed') : STATE_TEXT[st] ? t(STATE_TEXT[st]) : String(st).toUpperCase());
-  setCls(badge, 'sc-status-badge ' + (STATE_BADGE[st] ?? ''));
+  const hold = live && isOperational() && colHold();
+  setText(badge, hold ? t('st.col_hold') : enableUnknown && torqued && (st === 'Armed' || st === 'Moving') ? t('st.unconfirmed') : STATE_TEXT[st] ? t(STATE_TEXT[st]) : String(st).toUpperCase());
+  setCls(badge, 'sc-status-badge ' + (hold ? 'is-warn' : STATE_BADGE[st] ?? ''));
 
   // enable button morphs: hold-to-enable / tap-to-disable / tap-to-clear
   const eb = $('btn-enable');
   const stopped = isStopped();
-  eb.classList.toggle('on', op);
+  eb.classList.toggle('on', en);
   eb.classList.toggle('clear', stopped);
-  eb.setAttribute('aria-checked', String(op));
+  eb.setAttribute('aria-checked', String(en));
   // After a fault is cleared the motors may still hold the arm (safety Idle, torque on): say so.
-  const holdingIdle = live && !stopped && !op && S.state === 'Idle' && torqued;
-  setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop') : t('en.clear_fault')) : op ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
-  setText($('enable-sub'), stopped ? t('en.sub_reset') : op ? t('en.sub_off') : t('en.hold'));
+  const holdingIdle = live && !stopped && !en && S.state === 'Idle' && torqued;
+  setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop') : t('en.clear_fault')) : en ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
+  setText($('enable-sub'), stopped ? t('en.sub_reset') : en ? t('en.sub_off') : t('en.hold'));
   eb.disabled = !live || leaseOther() != null;
   const holder = leaseOther();
   $('btn-preempt').hidden = !live || !(S.ws && S.ws.readyState === 1) || holder == null;
@@ -7120,7 +7127,7 @@ function renderSimple(live, op) {
   if ($('s-grip-jog-bar')) $('s-grip-jog-bar').style.width = ((f ?? 0) * 100).toFixed(1) + '%';
 
   const rd = $('s-ready');
-  setCls(rd, 'ready' + (op ? ' ok' : live && isStopped() ? ' bad' : ''));
+  setCls(rd, 'ready' + (op ? ' ok' : live && (isStopped() || colHold()) ? ' bad' : ''));
   setText($('s-ready-txt'), !live ? t('wait_arm') : op ? t('ready') : lockReason());
   if (S.preset && Date.now() > S.preset.until) { S.preset = null; S.presetRunning = false; }
   for (const b of document.querySelectorAll('.preset')) b.classList.toggle('busy', !!S.preset && S.preset.name === b.dataset.preset);

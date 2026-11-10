@@ -127,12 +127,14 @@ const EXPECT = {
     waiting: '碰撞保护：关节 J2 受阻（7.4 N·m），已停止；受力消除后自动恢复',
     esc: '⚠️ 多次碰撞，机械臂已锁定', bus: '电机总线断开', busDo: '检查电机线缆和电源是否接好',
     clear: '⚠️ 点击清除故障', settings: '设置', poses: '点位', bad: '名称不符合规则',
+    hold: '碰撞保护中', holdLock: '碰撞保护中：自动恢复前运动控制已锁定（急停可用）', armed: '已使能',
   },
   en: {
     active: 'Collision guard: joint J2 blocked (7.4 N·m), stopped; resuming in 1.6 s',
     waiting: 'Collision guard: joint J2 blocked (7.4 N·m), stopped; resumes once the force is gone',
     esc: '⚠️ Repeated collisions; arm locked', bus: 'Motor bus lost', busDo: 'Check the motor cable and power',
     clear: '⚠️ Tap to clear fault', settings: 'Settings', poses: 'Poses', bad: 'Invalid name',
+    hold: 'Collision hold', holdLock: 'Collision hold: motion controls locked until it resumes (E-stop available)', armed: 'Enabled',
   },
 };
 
@@ -171,6 +173,16 @@ try {
     ok(!(await vis(page, 'col-clear')), `${tag} active: no clear button`);
     const b2 = await page.evaluate(() => document.querySelector('#rt-bars .rt-bar:nth-child(3)').className);
     ok(b2 === 'rt-bar trip', `${tag} J2 bar tripped (${b2})`);
+    // A1: status pill and motion controls during the hold; E-stop stays usable
+    const hold = await page.evaluate(() => ({ badge: document.getElementById('state-badge').textContent, cls: document.getElementById('state-badge').className,
+      locked: document.body.classList.contains('locked'), en: document.getElementById('btn-enable').classList.contains('on'),
+      estop: !document.getElementById('btn-estop').disabled, jogOp: getComputedStyle(document.querySelector('.jbtn') || document.body).opacity }));
+    ok(hold.badge === E.hold && hold.cls.includes('is-warn'), `${tag} A1 status pill "${hold.badge}" (${hold.cls})`);
+    ok(hold.locked && hold.en && hold.estop, `${tag} A1 controls locked, enable stays on, E-stop usable ${JSON.stringify(hold)}`);
+    ok(Number(hold.jogOp) < 1, `${tag} A1 jog buttons dimmed (opacity ${hold.jogOp})`);
+    const nJ = P.cmds.length;
+    await page.keyboard.down('KeyQ'); await page.waitForTimeout(250); await page.keyboard.up('KeyQ'); await page.waitForTimeout(100);
+    ok(!P.cmds.slice(nJ).some((c) => /motion|action/.test(c.path)), `${tag} A1 jog key sends nothing during the hold ${JSON.stringify(P.cmds.slice(nJ))}`);
     await page.evaluate(() => window.scrollTo(0, 0));
     await shot(page, `devplat_collision_${tag}`);
     // not dismissable (Escape is the cockpit's E-stop key, so only a click is tried)
@@ -206,12 +218,24 @@ try {
     P.scene = 'active'; await page.waitForTimeout(250);
     tt = await text(page, 'col-title');
     ok(tt === E.active && await inView(page, 'col-banner'), `${tag} active banner "${tt}" in view`);
+    ok((await text(page, 's-ready-txt')) === E.holdLock, `${tag} A1 simple status "${await text(page, 's-ready-txt')}"`);
     await shot(page, `devplat_collision_${tag}`);
+    {
+      await page.click('#btn-pset'); await page.waitForTimeout(400);
+      const goOp = await page.evaluate(() => getComputedStyle(document.querySelector('#pose-list .pose-go')).opacity);
+      ok(Number(goOp) < 1, `${tag} A1 pose go dimmed during the hold (opacity ${goOp})`);
+      const n2 = P.cmds.length;
+      await page.click('#pose-list li[data-name="bin_a"] .pose-go'); await page.waitForTimeout(300);
+      ok(P.cmds.length === n2, `${tag} A1 pose go sends nothing during the hold ${JSON.stringify(P.cmds.slice(n2))}`);
+      await shot(page, `devplat_hold_poses_${tag}`);
+      await page.click('#pset-close'); await page.waitForTimeout(200);
+    }
     P.scene = 'bus'; await page.waitForTimeout(250);
     const rd = await text(page, 's-ready-txt');
     ok(rd.includes(E.bus) && rd.includes(E.busDo), `${tag} simple status line "${rd}"`);
     P.scene = 'normal'; await page.waitForTimeout(250);
     ok(!(await vis(page, 'col-banner')), `${tag} banner hides after auto-resume`);
+    ok((await text(page, 'state-badge')) === E.armed && !(await page.evaluate(() => document.body.classList.contains('locked'))), `${tag} A1 enabled and unlocked after auto-resume`);
 
     // settings drawer
     ok((await page.getAttribute('#btn-sset', 'aria-label')) === E.settings, `${tag} settings aria-label`);
