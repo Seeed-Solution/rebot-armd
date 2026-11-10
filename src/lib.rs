@@ -1,4 +1,5 @@
 pub mod api;
+pub mod chain;
 pub mod collision;
 pub mod diagnostics;
 pub mod driver;
@@ -19,6 +20,7 @@ pub mod safety;
 pub mod safety_describe;
 pub mod supervisor;
 pub mod trajectory;
+pub mod urdf;
 pub mod transport;
 
 pub use api::create_router;

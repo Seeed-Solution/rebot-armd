@@ -295,6 +295,11 @@ pub fn compute_gravity_torques(q: &[f32; 6]) -> Result<[f32; 6], GravityError> {
         q[4] as f64,
         q[5] as f64,
     ];
+    Ok(gravity_torques_f64(&q64).map(|t| t as f32))
+}
+
+/// [`compute_gravity_torques`] in f64, without the finiteness check.
+pub fn gravity_torques_f64(q64: &[f64; 6]) -> [f64; 6] {
 
     // Forward kinematics
     let mut o_r = [[[0.0; 3]; 3]; NUM_JOINTS];
@@ -336,7 +341,7 @@ pub fn compute_gravity_torques(q: &[f32; 6]) -> Result<[f32; 6], GravityError> {
 
     // Compute gravity torques for joints 1..6
     let g_acc = 9.81;
-    let mut tau = [0.0f32; 6];
+    let mut tau = [0.0f64; 6];
 
     for k in 1..=6 {
         let axis_world = mat3_vec3_mul(&o_r[k], &AXES[k]);
@@ -368,8 +373,8 @@ pub fn compute_gravity_torques(q: &[f32; 6]) -> Result<[f32; 6], GravityError> {
             joint_tau_f64 += vec3_dot(&axis_world, &t_balance);
         }
 
-        tau[k - 1] = joint_tau_f64 as f32;
+        tau[k - 1] = joint_tau_f64;
     }
 
-    Ok(tau)
+    tau
 }

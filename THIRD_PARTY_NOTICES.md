@@ -176,6 +176,13 @@ and/or Apache-2.0). The license of every crate in the dependency tree can be lis
 contains code from these crates and from the Rust standard library (MIT OR Apache-2.0)
 and, for the reCamera build, musl libc (MIT).
 
+Crates added for a specific feature:
+
+- `roxmltree` 0.21 (MIT OR Apache-2.0, Copyright (c) 2018 Yevhenii Reizner): read-only
+  XML tree used by `src/urdf.rs` to read the URDF named by a profile's `urdf` field. It has
+  no dependencies of its own; a hand-written XML reader would be more code to review than
+  the crate, and the URDF is only read once at startup.
+
 ## Not included
 
 `third_party/` is listed in `.gitignore` and is not part of the repository. Older versions
