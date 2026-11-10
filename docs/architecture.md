@@ -60,6 +60,7 @@ The `ArmConfig` JSON loaded with `armd --config <file>` (`src/model.rs`). Withou
 | `following_error` | `max_error_rad`, `persistence_ms` | no (0.5 rad, 500 ms) |
 | `max_jerk`, `planned_max_velocity` | trajectory jerk preference, planned-motion speed cap | no |
 | `speed_cap` | `linear_mps`, `angular_rps`, `joint_velocity_scale` (0, 1]: upper bound for every planned motion, min() with the request and `planned_max_velocity`; each entry optional | no |
+| `collision` | collision guard: `enabled` (default false), `thresholds_nm` (J1..J6, placeholders until measured on a real arm), `persist_ticks`, `clear_ratio`, `resume_after_s`, `max_auto_resumes`, `escalate_window_s`; each entry optional | no |
 | `kinematics` | kinematic model (`RebotDevArm`); null disables Cartesian actions and the workspace check | no |
 | `workspace` | Cartesian safety box (`floor_z_m`, `box_min_m`, `box_max_m`, `max_reach_m`, `check_points_end_m`, `keepout_boxes` `[{name, min_m, max_m}]`, at most 16) | no |
 | `gravity_model` | gravity model (`RebotDevArm`) | no |
@@ -80,8 +81,10 @@ Not in the profile today:
 - The grasp setup can also come from `ARMD_GRASP_SETUP` (runtime changes, persisted).
 - Runtime keep-out boxes (`ARMD_KEEPOUT`, default `/userdata/rebot-teleop/keepout.json`)
   replace `workspace.keepout_boxes` when present; named poses are stored in `ARMD_POSES`
-  (default `/userdata/rebot-teleop/poses.json`). Both files are written atomically; an invalid
-  file is logged at start and left unchanged.
+  (default `/userdata/rebot-teleop/poses.json`); the runtime collision guard setting in
+  `ARMD_COLLISION` (default `/userdata/rebot-teleop/collision.json`) replaces `collision.enabled`
+  when present. The files are written atomically; an invalid file is logged at start and left
+  unchanged.
 
 The official kit ships the B601-DM profile as data,
 `kits/recamera-b601dm/profile/rebot-b601dm.json`; `tests/test_arm_profile.rs` fails when it
@@ -143,7 +146,8 @@ have no `capabilities` object; it parses as all false, `version` 0.
   `servo_max_velocity` and `servo_max_lead_rad`, and `observation.motion_limit`); version 5 added
   `diagnostics`; version 6 added `obs_rate`, `fault_codes`, `poses`, `keepout`, `speed_cap`,
   `residual_torques` and `tick_stats` (with the schema field `speed_cap` and the observation
-  fields `fault` and `residual_torques`), and `place`. Clients check each field and fall back
+  fields `fault` and `residual_torques`), `place`, and `collision_guard` (with the observation
+  field `collision`). Clients check each field and fall back
   when it is false or missing.
 
 | Field | True when |
@@ -165,6 +169,7 @@ have no `capabilities` object; it parses as all false, `version` 0.
 | `residual_torques` | the profile has a gravity model on a 6/7-DOF arm; `observation.residual_torques` is still null without torque feedback (version 6) |
 | `tick_stats` | always true: `GET /api/v1/diagnostics/tick` exists (version 6) |
 | `place` | 7-DOF, `kinematics` and `gripper_policy` set (`/api/v1/action/place`; version 6) |
+| `collision_guard` | the profile has a gravity model on a 6/7-DOF arm and the driver reports torque: the `collision` profile section, `/api/v1/safety/collision` and `observation.collision` apply (the guard itself is off unless enabled; version 6) |
 | `vision.detection_proxy` | always true: the detection routes exist; reachability of the provider is not checked |
 | `vision.mode_endpoint` | (string) always `/api/v1/vision/mode` |
 | `vision.modes` | (list) modes the provider reports (`off`, `yolo`, `aruco`, `both`); empty when it is unreachable or has no `/api/mode` |
@@ -183,7 +188,7 @@ Other parts of the schema already describe the arm: `dof`, `joint_names`, `limit
 `workspace`, `camera_mount`, `kinematics`, `servo_max_velocity` (effective servo speed cap per
 joint), `servo_max_lead_rad`, `speed_cap`. Per-observation state stays in the observation
 (`driver_capabilities`, `gravity_comp`, `driver_range_check`, `motion_limit`, `fault`,
-`residual_torques`).
+`residual_torques`, `collision`).
 
 ### 4. Packaging
 
@@ -192,7 +197,7 @@ A kit ships: the armd binary (unchanged core), its profile, optional sidecar pro
 `armd --follower <model> [--follower-port <port>] --config <profile>`.
 
 - Version: not versioned in code; the layout below is version 1 of this document.
-- armd reads `PORT`, `RUST_LOG`, `ARMD_DETECTOR_URL`, `ARMD_GRASP_SETUP`, `ARMD_KEEPOUT`, `ARMD_POSES`, `ARMD_LOG_DIR`, `ARMD_BLACKBOX_DIR` from the environment.
+- armd reads `PORT`, `RUST_LOG`, `ARMD_DETECTOR_URL`, `ARMD_GRASP_SETUP`, `ARMD_KEEPOUT`, `ARMD_POSES`, `ARMD_COLLISION`, `ARMD_LOG_DIR`, `ARMD_BLACKBOX_DIR` from the environment.
 
 The official kit's package (`kits/recamera-b601dm/packaging/`, deb `rebot-teleop` 1.3.4):
 

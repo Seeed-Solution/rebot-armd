@@ -92,6 +92,7 @@ fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch:
         }
         "/api/v1/motion/unload" => {
             inner.gravity_comp_motion_busy().map_err(ArmError::from)?;
+            inner.collision_hold_check().map_err(ArmError::from)?;
             if inner.handover_settling_since.is_some() {
                 return Err(ArmError::Safety(SafetyError::HandoverSettling).into());
             }
@@ -447,6 +448,16 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             Ok(write) => {
                                                 pending_write = write;
                                                 command_ack(&inner, &value["request_id"], None)
+                                            }
+                                            Err(error) => command_reject(&inner, &value["request_id"], error.into()),
+                                        });
+                                    } else if path == "/api/v1/safety/collision" {
+                                        response = Some(match crate::collision::update(&mut inner, &value["body"]) {
+                                            Ok((config, write)) => {
+                                                let mut ack = command_ack(&inner, &value["request_id"], None);
+                                                ack["collision"] = json!(config);
+                                                pending_write = write;
+                                                ack
                                             }
                                             Err(error) => command_reject(&inner, &value["request_id"], error.into()),
                                         });

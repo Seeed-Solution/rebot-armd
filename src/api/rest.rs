@@ -163,6 +163,9 @@ impl From<ArmError> for ApiError {
                     code: Some("ESTOP_ACTIVE".to_string()),
                     safety_state: Some("EStop".to_string()),
                 },
+                crate::safety::SafetyError::CollisionHold(_) => {
+                    ApiError(StatusCode::CONFLICT, safety_err.to_string(), "COLLISION_HOLD".to_string())
+                }
                 crate::safety::SafetyError::MotionBusy => {
                     ApiError(StatusCode::CONFLICT, safety_err.to_string(), "MOTION_BUSY".to_string())
                 }
@@ -416,4 +419,9 @@ pub async fn get_keepout(State(supervisor): State<Arc<ArmSupervisor>>) -> Respon
 /// `GET /api/v1/poses`: stored named poses (no lease).
 pub async fn get_poses(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
     Json(supervisor.inner().read().await.poses.list.clone()).into_response()
+}
+
+/// `GET /api/v1/safety/collision`: effective collision guard config (scaled thresholds).
+pub async fn get_collision(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
+    Json(supervisor.inner().read().await.collision_config()).into_response()
 }

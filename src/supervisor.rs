@@ -218,16 +218,20 @@ pub struct SupervisorInner {
     pub gravity_comp: Option<crate::gravity_comp::GravityCompRun>,
     pub gravity_comp_last_exit: Option<crate::model::GravityCompExit>,
     /// Keep-out source and file (`src/keepout.rs`).
-    pub keepout: crate::keepout::Keepout,    /// Named poses (`src/poses.rs`).
+    pub keepout: crate::keepout::Keepout,
+    /// Named poses (`src/poses.rs`).
     pub poses: crate::poses::PoseStore,
     /// Measured minus model gravity torque, J1..J6 (`observation.residual_torques`).
     pub residual_torques: Option<[f32; 6]>,
+    /// Collision guard state (`src/collision.rs`).
+    pub collision: crate::collision::CollisionGuard,
 }
 
 impl SupervisorInner {
     pub fn new(mut config: ArmConfig) -> Self {
         config.validate().expect("Invalid ArmConfig: invariant violation");
         let dof = config.dof;
+        let collision_policy = config.collision.unwrap_or_default();
         let positions = config.home_positions.clone();
         let target_positions = positions.clone();
         let lease_timeout = Duration::from_millis(config.lease_timeout_ms);
@@ -325,6 +329,7 @@ impl SupervisorInner {
             keepout: crate::keepout::Keepout::default(),
             poses: crate::poses::PoseStore::default(),
             residual_torques: None,
+            collision: crate::collision::CollisionGuard::from_policy(&collision_policy),
         }
     }
 
@@ -578,6 +583,7 @@ impl SupervisorInner {
             motor_errors: self.motor_errors.clone(),
             fault: self.safety.fault(),
             residual_torques: self.residual_torques,
+            collision: self.collision_observation(),
         }
     }
 
@@ -1289,6 +1295,7 @@ impl SupervisorInner {
         let Some(policy) = &self.config.resting_pose else { return Some("no resting pose configured".into()); };
         if !self.supports_automatic_unload() { return Some("driver lacks velocity/torque/enable feedback".into()); }
         if self.e_stop_latched.load(Ordering::SeqCst) { return Some("E-stop latched".into()); }
+        if self.collision.hold.is_some() { return Some("collision hold".into()); }
         if !self.safety.state().is_operational() { return Some(format!("safety state {:?}", self.safety.state())); }
         if self.pending_rearm || self.disable_pending || self.output_suspended || self.handover_settling_since.is_some() {
             return Some("re-arm, disable, output suspension or handover pending".into());
@@ -1403,6 +1410,7 @@ impl SupervisorInner {
 
     pub fn servo(&mut self, targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
         self.gravity_comp_servo_busy()?;
+        self.collision_hold_check()?;
         if self.handover_settling_since.is_some() {
             return Err(SafetyError::HandoverSettling);
         }
@@ -1503,6 +1511,7 @@ impl SupervisorInner {
         limits: &[crate::model::JointLimit],
     ) -> Result<(u64, u64, f64), ArmError> {
         self.gravity_comp_motion_busy()?;
+        self.collision_hold_check()?;
         if self.handover_settling_since.is_some() {
             return Err(ArmError::Safety(SafetyError::HandoverSettling));
         }
@@ -1589,7 +1598,7 @@ impl SupervisorInner {
         id
     }
 
-    fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
+    pub(crate) fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
                      settled: Option<bool>, holding: Option<bool>, gap: Option<f32>) {
         let now = self.now_s();
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
@@ -1630,6 +1639,7 @@ impl SupervisorInner {
         if self.pending_rearm || self.pending_normal_unload {
             return Err(SafetyError::NotArmed(self.safety.state().clone()).into());
         }
+        self.collision_hold_check()?;
         if let Some(reason) = self.busy_reason() { return Err(MotionError::MotionBusy(reason).into()); }
         Ok(())
     }
@@ -2258,6 +2268,7 @@ impl SupervisorInner {
             None => self.gravity_torques.clear(),
         }
         let torque_feedback = self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+        self.collision.torque_feedback = torque_feedback;
         self.residual_torques = model_gravity.filter(|_| torque_feedback && self.feedback_numeric_valid && self.torques.len() >= 6)
             .map(|tau| std::array::from_fn(|i| self.torques[i] - tau[i]))
             .filter(|r: &[f32; 6]| r.iter().all(|v| v.is_finite()));
@@ -2407,6 +2418,9 @@ impl SupervisorInner {
 
         // Use one integration interval and never integrate a reference twice in a tick.
         let servo_dt = dt.clamp(0.001, 0.1);
+
+        // Collision guard: a trip stops the reference before it is stepped this tick.
+        self.collision_tick(servo_dt);
         let mut reference_stepped = false;
 
         // 3. Step trajectory if active, or step servo target
@@ -2810,6 +2824,7 @@ impl ArmSupervisor {
         let inner = self.inner.read().await;
         let mut schema = ObservationSchema::from_config(&inner.config);
         schema.capabilities.gravity_comp = inner.gravity_comp_support().is_ok();
+        schema.capabilities.collision_guard &= inner.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
         schema
     }
 

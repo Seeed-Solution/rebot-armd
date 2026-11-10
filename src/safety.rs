@@ -53,6 +53,8 @@ pub enum FaultCode {
     ServoNoBrake,
     HandoverUnsettled,
     GravityCompFailed,
+    /// Collision guard: more trips than `collision.max_auto_resumes` within the window.
+    Collision,
     Other,
 }
 
@@ -163,6 +165,9 @@ pub enum SafetyError {
 
     #[error("Motion busy: an action trajectory is running")]
     MotionBusy,
+
+    #[error("{0}")]
+    CollisionHold(String),
 
     #[error("Target outside the safe workspace: check point {point} {limit} {value:.3} m beyond bound {bound:.3} m")]
     WorkspaceViolation { point: usize, limit: String, value: f32, bound: f32 },
