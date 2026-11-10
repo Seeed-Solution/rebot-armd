@@ -89,14 +89,14 @@ init 脚本把 `can0` 设为 1 Mbit/s，与机械臂一致。
 | Gripper range (closed +0.03 rad, mechanical full open -5.87 rad) | measured 2026-11-06 | `src/model.rs` |
 | POS_VEL lag gain 1.5 (basis of the 0.45 rad/s planned-speed cap) | measured 2026-11-09; listed under "needs verification" | docs/agent_action_api.md |
 | Camera image upright with the v5 mount | observed on the arm | `hardware/v7_tilt/README.txt` |
-| Gravity compensation (hand-guiding) | simulation and screenshot tests only | README, docs/control_safety_contract.md checklist |
+| Gravity compensation (hand-guiding) | verified on hardware: exit paths held within 1.5 mrad, 30 s recording gave 1509 frames | README, docs/control_safety_contract.md checklist |
 | Tap-to-grasp | simulation and screenshot tests only | README, docs/plan_tap_to_grasp.md |
 | `camera_mount` (`tilt_deg`, `offset_m`) for camera-frame moves | needs verification | docs/agent_action_api.md |
 | Planning time on the SG2002 | needs verification | docs/agent_action_api.md |
 | v7_tilt mounts | not printed or fitted | `hardware/v7_tilt/README.txt` |
 
-Object detection comes from the camera's `yolo-detector` service, which is not part of this
-kit's package (README "Install on reCamera").
+Object detection and ArUco come from `rebot-vision`, which is part of this kit's package
+(README "Install on reCamera"); no separate camera app is needed.
 
 ### 已验证能力
 
@@ -108,10 +108,10 @@ kit's package (README "Install on reCamera").
 | 夹爪范围（闭合 +0.03 rad，机械全开 -5.87 rad） | 2026-11-06 实测 | `src/model.rs` |
 | POS_VEL 滞后增益 1.5（0.45 rad/s 规划限速的依据） | 2026-11-09 实测，列在「需实机核实」 | docs/agent_action_api.md |
 | v5 支架下画面方向为正 | 实机观察 | `hardware/v7_tilt/README.txt` |
-| 重力补偿（拖动示教） | 仅仿真与截图测试 | README、docs/control_safety_contract.md 清单 |
+| 重力补偿（拖动示教） | 实机验证：各退出路径位置偏差不超过 1.5 mrad，30 s 录制 1509 帧 | README、docs/control_safety_contract.md 清单 |
 | 点框抓取 | 仅仿真与截图测试 | README、docs/plan_tap_to_grasp.md |
 | 相机坐标系运动用的 `camera_mount`（`tilt_deg`、`offset_m`） | 需实机核实 | docs/agent_action_api.md |
 | SG2002 上的规划耗时 | 需实机核实 | docs/agent_action_api.md |
 | v7_tilt 支架 | 未打印、未试装 | `hardware/v7_tilt/README.txt` |
 
-目标检测来自相机自带的 `yolo-detector` 服务，不在本套件的安装包内（README「在 reCamera 上安装」）。
+目标检测和 ArUco 由 `rebot-vision` 提供，包含在本套件的安装包内（README「在 reCamera 上安装」），无需另装相机应用。

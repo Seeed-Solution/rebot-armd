@@ -141,7 +141,7 @@ TODO / 路线图：
 
 ### 核心、套件与 agent
 
-仓库分三层：**核心**（`armd`，即本 crate）；**套件**，把核心适配到一种 控制器 + 机械臂 + 相机 + 支架 组合（`kits/recamera-b601dm/` 是官方参考套件，`kits/_template/` 是第三方套件的起点）；**agent 层**（rebot-companion、驾驶舱），只使用 armd 的 API。核心与套件通过四个带版本的契约交互：机械臂 profile JSON（`--config`，`profile_version` 1）、感知服务 API（检测代理）、能力发现（观测 schema 中的 `capabilities`，版本 1）和打包。`./scripts/build_deb.sh --flavor lite` 只构建核心，默认的 `--flavor recamera` 构建核心加 reCamera 套件。详见 [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md)。
+仓库分三层：**核心**（`armd`，即本 crate）；**套件**，把核心适配到一种 控制器 + 机械臂 + 相机 + 支架 组合（`kits/recamera-b601dm/` 是官方参考套件，`kits/_template/` 是第三方套件的起点）；**agent 层**（rebot-companion、驾驶舱），只使用 armd 的 API。核心与套件通过四个带版本的契约交互：机械臂 profile JSON（`--config`，`profile_version` 1）、感知服务 API（检测代理）、能力发现（观测 schema 中的 `capabilities`，版本 3）和打包。`./scripts/build_deb.sh --flavor lite` 只构建核心，默认的 `--flavor recamera` 构建核心加 reCamera 套件。详见 [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md)。
 
 ---
 
@@ -170,7 +170,7 @@ armd 之后 init 脚本启动 `rebot-vision`（nice 10，由 `/usr/share/rebot-t
 
 热点默认使用 5 GHz（`network.ap_band: "5g"`，信道 44，802.11n/ac，20 MHz 带宽）。把 `network.ap_band` 设为 `"2g4"` 改用 2.4 GHz（信道 6）。`network.ap_channel` 指定信道，`0` 或不设置时使用默认信道。启动后若 hostapd 未在 5 GHz 信道上运行（用 `iw dev wlan1 info` 检查），init 脚本改用 2.4 GHz 信道 6 重新启动，并把回退记录到 syslog。
 
-驾驶舱地址：`http://<摄像头地址>:8765/`。
+安装或升级后，若本应用是控制台当前的活动应用（或设备没有控制台），`postinst` 会启动它。驾驶舱地址：`http://<摄像头地址>:8765/`。
 
 armd 通过 `http://127.0.0.1:8090` 访问视觉进程（可用 `ARMD_DETECTOR_URL` 修改）。`--flavor lite` 不含视觉进程，此时识别、标定和抓取不可用，驾驶舱其他功能正常。
 

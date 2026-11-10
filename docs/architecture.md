@@ -109,10 +109,10 @@ cockpit and agents use one origin (`src/api/proxy.rs`, [detection_api.md](detect
 
 Status and body pass through; an unreachable upstream gives 502. Video is not proxied: the
 cockpit plays the camera's H.264 WebSocket stream (`ws://<host>:8001/`) directly. On the
-reCamera the provider is today the camera's `yolo-detector` (or `aruco-detector`) service,
-not part of the kit. The kit's own provider is `rebot-vision`
-(`kits/recamera-b601dm/vision/`, design in [dev_flow_spec_vision_runtime.md](dev_flow_spec_vision_runtime.md)),
-shipped in `rebot-teleop` 1.2.0: one process owns the camera and runs YOLO (TPU) and ArUco (CPU)
+reCamera the provider is the kit's `rebot-vision` (the camera's `yolo-detector` or
+`aruco-detector` services also work as version 0 providers). `rebot-vision`
+(`kits/recamera-b601dm/vision/`, design in [dev_flow_spec_vision_runtime.md](dev_flow_spec_vision_runtime.md))
+is part of the package since `rebot-teleop` 1.2.0: one process owns the camera and runs YOLO (TPU) and ArUco (CPU)
 on the same frame. From 1.3.0 (version 2) it infers nothing without a caller: a trigger runs the
 pipelines it names, and continuous inference runs the union of the active subscriptions'
 pipelines at their highest rate, capped at the configured rate. Results always carry both
@@ -172,7 +172,7 @@ A kit ships: the armd binary (unchanged core), its profile, optional sidecar pro
 - Version: not versioned in code; the layout below is version 1 of this document.
 - armd reads `PORT`, `RUST_LOG`, `ARMD_DETECTOR_URL`, `ARMD_GRASP_SETUP` from the environment.
 
-The official kit's package (`kits/recamera-b601dm/packaging/`, deb `rebot-teleop` 1.2.0):
+The official kit's package (`kits/recamera-b601dm/packaging/`, deb `rebot-teleop` 1.3.4):
 
 | Installed path | Source in the repository |
 |---|---|

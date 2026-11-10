@@ -1,6 +1,6 @@
 # 计划：驾驶舱点框抓取（Tap-to-Grasp）
 
-状态：第一版已实施，未经真机验证（2026-11-09）。实现与本计划的差异见 §7；接口见 `docs/agent_action_api.md`「Grasp / 点框抓取」。
+状态：第一版已实施，未经真机验证（2026-11-09）。设计记录：当前检测由套件内的 `rebot-vision` 提供，抓取每次对准用 `["yolo"]` 单次触发（见 `docs/detection_api.md`），下文的 `yolo-detector` 指当时的检测程序。实现与本计划的差异见 §7；接口见 `docs/agent_action_api.md`「Grasp / 点框抓取」。
 
 原前置：视角模式遥操作先落地；本功能不依赖它的 6 轴 IK，可独立开发。
 

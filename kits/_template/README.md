@@ -8,7 +8,7 @@ core) stays unchanged; a kit provides data and packaging that use the four contr
 |---|---|---|
 | Arm profile | [`profile/`](profile/): an `ArmConfig` JSON for `armd --config` | `profile_version` 1 |
 | Perception provider API | optional: a process serving the detector API that armd proxies ([`vision/`](vision/README.md)) | unversioned, as in docs/detection_api.md |
-| Capability discovery | nothing: armd derives `capabilities` in `GET /api/v1/observation/schema` from the profile and driver | `capabilities.version` 1 |
+| Capability discovery | nothing: armd derives `capabilities` in `GET /api/v1/observation/schema` from the profile and driver | `capabilities.version` 3 |
 | Packaging | [`packaging/`](packaging/README.md): armd binary + profile + optional sidecars + launch script | layout below |
 
 Third-party kits live in their own repositories. They do not fork armd: they take the armd

@@ -182,7 +182,7 @@ one controller + arm + camera + mount (`kits/recamera-b601dm/` is the official r
 (rebot-companion, the cockpit) that uses only armd's API. Core and kits interact through four
 versioned contracts: the arm profile JSON (`--config`, `profile_version` 1), the perception
 provider API (the detection proxy), capability discovery (`capabilities` in the observation
-schema, version 1) and packaging. `./scripts/build_deb.sh --flavor lite` builds the core
+schema, version 3) and packaging. `./scripts/build_deb.sh --flavor lite` builds the core
 alone, the default `--flavor recamera` the core with the reCamera kit. Details:
 [docs/architecture.md](docs/architecture.md).
 
@@ -233,7 +233,8 @@ overrides the channel; `0` or unset keeps the default. If hostapd is not running
 channel after start (checked with `iw dev wlan1 info`), the init script restarts it on
 2.4 GHz channel 6 and writes the fallback to syslog.
 
-Open the cockpit at `http://<camera-address>:8765/`.
+After an install or upgrade, `postinst` starts the app when it is the console's active app
+(or on devices without the console). Open the cockpit at `http://<camera-address>:8765/`.
 
 armd reaches the vision process at `http://127.0.0.1:8090` (`ARMD_DETECTOR_URL` to change it).
 With `--flavor lite` there is no vision process; detection, calibration and grasp are then

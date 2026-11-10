@@ -86,7 +86,7 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 | `GET /api/v1/vision/subscriptions` | `/api/subscriptions` | 有效订阅及实际运行内容（版本 2） |
 | `GET /api/v1/detection/ws`、`/results` | `ws://127.0.0.1:8001/results` | 检测结果流（固定地址） |
 
-状态码和响应体原样透传；上游不可达返回 502。视频不经代理：驾驶舱直接播放相机的 H.264 WebSocket 流（`ws://<host>:8001/`）。目前 reCamera 上的感知服务是相机自带的 `yolo-detector`（或 `aruco-detector`），不属于套件。套件自带的感知服务是 `rebot-vision`（`kits/recamera-b601dm/vision/`，设计见 [dev_flow_spec_vision_runtime.md](dev_flow_spec_vision_runtime.md)），随 `rebot-teleop` 1.2.0 发布：一个进程占用相机，在同一帧上运行 YOLO（TPU）和 ArUco（CPU）。1.3.0（版本 2）起没有调用方时不做推理：单次触发运行其指定的流水线；持续推理运行所有有效订阅流水线的并集，帧率取请求的最大值并受配置帧率限制。结果始终同时包含 `detections` 和 `markers`。
+状态码和响应体原样透传；上游不可达返回 502。视频不经代理：驾驶舱直接播放相机的 H.264 WebSocket 流（`ws://<host>:8001/`）。reCamera 上的感知服务是套件的 `rebot-vision`（相机自带的 `yolo-detector` 或 `aruco-detector` 也可作为版本 0 的服务）。`rebot-vision`（`kits/recamera-b601dm/vision/`，设计见 [dev_flow_spec_vision_runtime.md](dev_flow_spec_vision_runtime.md)）自 `rebot-teleop` 1.2.0 起包含在安装包内：一个进程占用相机，在同一帧上运行 YOLO（TPU）和 ArUco（CPU）。1.3.0（版本 2）起没有调用方时不做推理：单次触发运行其指定的流水线；持续推理运行所有有效订阅流水线的并集，帧率取请求的最大值并受配置帧率限制。结果始终同时包含 `detections` 和 `markers`。
 
 调用方不再修改全局模式（只有一个全局模式时，最后恢复的调用方生效）。抓取动作每次对准触发一次 `{"pipelines": ["yolo"]}`；驾驶舱叠加层开启且页面可见时持有自己的订阅；手眼标定抽屉打开期间持有一个 ArUco 订阅，每次采样用一次 `["aruco"]` 单次触发。上游为版本 1 时，抓取仍切换到 `yolo`（原来开着 ArUco 时为 `both`）并在结束后恢复，驾驶舱仍使用模式；没有 `/api/mode` 的服务（404）仍使用推理开关。
 
@@ -125,7 +125,7 @@ schema 的其他字段已描述机械臂：`dof`、`joint_names`、`limits`、`w
 - 版本：代码中未版本化；下面的布局为本文档的第 1 版。
 - armd 从环境变量读取 `PORT`、`RUST_LOG`、`ARMD_DETECTOR_URL`、`ARMD_GRASP_SETUP`。
 
-官方套件的安装包（`kits/recamera-b601dm/packaging/`，deb `rebot-teleop` 1.2.0）：
+官方套件的安装包（`kits/recamera-b601dm/packaging/`，deb `rebot-teleop` 1.3.4）：
 
 | 安装路径 | 仓库中的来源 |
 |---|---|
