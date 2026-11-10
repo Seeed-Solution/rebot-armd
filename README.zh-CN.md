@@ -17,7 +17,9 @@
 
 [English](./README.md) | 中文
 
-<!-- TODO: Add demo GIF showing Web cockpit teleoperation here -->
+<img src="docs/images/rebot-recamera-teleop.jpg" alt="平板上的网页驾驶舱遥控 reBot B601-DM 机械臂" width="760">
+
+<sub>平板上的网页驾驶舱遥控 reBot B601-DM；腕部的 reCamera 运行 armd 和视觉进程。</sub>
 
 </div>
 

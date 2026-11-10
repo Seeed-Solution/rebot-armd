@@ -17,7 +17,9 @@
 
 English | [中文](./README.zh-CN.md)
 
-<!-- TODO: Add demo GIF showing Web cockpit teleoperation here -->
+<img src="docs/images/rebot-recamera-teleop.jpg" alt="reBot B601-DM arm driven from a tablet cockpit served by a reCamera" width="760">
+
+<sub>reBot B601-DM driven from the web cockpit on a tablet; the reCamera on the wrist runs armd and the vision process.</sub>
 
 </div>
 
