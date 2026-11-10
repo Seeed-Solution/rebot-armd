@@ -331,8 +331,10 @@ Chinese and English (language switch in the header).
   dataset recording and keyboard shortcuts.
 - **Joint jog**: two virtual joysticks (J1/J2, J3/J5, gripper) and the keyboard.
 - **Cartesian control** in two frames:
-  - *view frame*: directions follow the camera image (the camera is mounted after J6), solved
-    with a 6-joint IK in the browser;
+  - *view frame*: directions follow the camera image (the camera is mounted after J6). The
+    move stick (forward along the view / sideways in the image) and the lift are solved with a
+    6-joint IK in the browser that holds the camera orientation; the look stick moves the wrist
+    only (up / down = J4, left / right = J5), so J1–J3 and J6 stay where they are;
   - *base frame*: directions follow the arm's base axes.
   The target follows the measured pose and is streamed over the WebSocket lease.
 - **Detection overlay**: YOLO boxes and ArUco markers drawn on the video. Choose YOLO, ArUco
