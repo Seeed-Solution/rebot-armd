@@ -342,7 +342,13 @@ async fn ws_heartbeats_renew_lease_across_jog_unload_torque_cycles() {
             let epoch = supervisor.inner().read().await.safety.epoch_id();
             let hb = serde_json::json!({"type":"heartbeat", "client_id":"sdk", "generation":generation, "epoch_id":epoch});
             ws.send(tokio_tungstenite::tungstenite::Message::Text(hb.to_string().into())).await.unwrap();
-            for _ in 0..3 { supervisor.tick(0.05).await; tokio::time::sleep(Duration::from_millis(16)).await; }
+            for _ in 0..3 {
+                supervisor.tick(0.05).await;
+                // Keep reading telemetry like a real client; an unread socket backs up
+                // and delays the next command reply past the 300 ms lease.
+                let until = tokio::time::Instant::now() + Duration::from_millis(16);
+                while let Ok(Some(_)) = tokio::time::timeout_at(until, futures_util::StreamExt::next(ws)).await {}
+            }
             let inner = supervisor.inner().read().await;
             assert!(inner.watchdog_park.is_none() && !inner.safety.state().is_stopped(),
                 "lease watchdog fired: {:?}", inner.safety.state());
