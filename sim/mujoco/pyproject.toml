@@ -24,3 +24,9 @@ dev = [
     "pytest>=9.2.0",
     "websockets>=17.4",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# websockets 17 warns when a sync connection outlives a `with` block; the e2e client
+# keeps one open across the test on purpose.
+filterwarnings = ["ignore:connect\\(\\) must be used as a context manager:DeprecationWarning"]
