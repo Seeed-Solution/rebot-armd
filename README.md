@@ -366,10 +366,11 @@ Measured on the reCamera with the arm's torque off (rebot-teleop 1.3.1, two runs
 |---|---|---|---|
 | Standby (no caller) | — | — | 20–26 % (vision process 6 %) |
 | YOLO | TPU | 47 ms | 34 % |
-| ArUco (640 × 360) | CPU | 37 ms | 53 % |
+| ArUco (640 × 360) | CPU | 37–57 ms (scene-dependent) | 53 % |
 | YOLO + ArUco | TPU + CPU | — | 55 % |
 
-A single trigger from standby returns in 0.12–0.17 s for ArUco or both; YOLO triggers took 0.1–0.6 s. Settings, the model search path
+A single trigger from standby returns in about 0.12–0.25 s (p50 0.13–0.15 s), measured from a
+warm client; the first request of a newly started client adds about 0.4 s of connection set-up. Settings, the model search path
 and the per-stage ArUco timing are in the
 [vision README](kits/recamera-b601dm/vision/README.md).
 

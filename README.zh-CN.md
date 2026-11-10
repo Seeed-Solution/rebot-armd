@@ -251,10 +251,10 @@ RECAMERA_DOCKER=tpuc_recamera \
 |---|---|---|---|
 | 待机（无调用方） | — | — | 20–26 %（视觉进程 6 %） |
 | YOLO | TPU | 47 ms | 34 % |
-| ArUco（640 × 360） | CPU | 37 ms | 53 % |
+| ArUco（640 × 360） | CPU | 37–57 ms（随场景变化） | 53 % |
 | YOLO + ArUco | TPU + CPU | — | 55 % |
 
-从待机发起单次触发：ArUco 或两者 0.12–0.17 秒返回；YOLO 触发 0.1–0.6 秒。配置项、模型查找路径和 ArUco 分阶段耗时见 [vision README](kits/recamera-b601dm/vision/README.md)。
+从待机发起单次触发约 0.12–0.25 秒返回（中位数 0.13–0.15 秒，客户端已预热）；新启动客户端的第一个请求另有约 0.4 秒连接建立开销。配置项、模型查找路径和 ArUco 分阶段耗时见 [vision README](kits/recamera-b601dm/vision/README.md)。
 
 ---
 
