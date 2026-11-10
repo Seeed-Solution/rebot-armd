@@ -525,6 +525,154 @@ fn vision_runner_forwards_sigterm_and_exits() {
     assert_eq!(std::fs::read_to_string(&marks).unwrap(), "start\nterm\n", "child got SIGTERM once and was not restarted");
 }
 
+/// The hotspot functions of K92rebot-teleop in a temp dir with a fake /proc and /var/run:
+/// `hostapd` creates a fake process, `kill` removes one and logs the signal, `iw` reports the
+/// channel of our running hostapd. `extra` runs before the scenario (pre-existing processes).
+#[cfg(unix)]
+struct ApEnv {
+    temp: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl ApEnv {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        for d in ["proc", "run", "etc"] {
+            std::fs::create_dir_all(temp.path().join(d)).unwrap();
+        }
+        ApEnv { temp }
+    }
+
+    fn p(&self, rel: &str) -> std::path::PathBuf {
+        self.temp.path().join(rel)
+    }
+
+    /// A fake process `pid` with NUL-separated `cmdline`.
+    fn process(&self, pid: u32, cmdline: &str) {
+        let dir = self.p(&format!("proc/{pid}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cmdline"), cmdline.replace(' ', "\0") + "\0").unwrap();
+    }
+
+    fn run(&self, body: &str) -> String {
+        let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
+        let t = self.temp.path().display().to_string();
+        let functions = init_section(source, "# Write the hostapd config", "\n# PID of the vision respawn loop")
+            .replace("/proc/", &format!("{t}/proc/"))
+            .replace("/var/run/", &format!("{t}/run/"))
+            .replace("/etc/", &format!("{t}/etc/"))
+            .replace("/usr/sbin/dnsmasq", "dnsmasq_stub")
+            .replace("start-stop-daemon", "ssd_stub");
+        let script = format!(
+            r#"NAME=rebot-teleop
+T='{t}'
+AP_SSID=reCamera-Arm-Teleop; AP_PASS=12345678; AP_IP=192.168.16.1; AP_BAND=5g; AP_CHANNEL=; STA_SSID=
+AP_CONF="$T/run/hostapd_arm.conf"; AP_PIDFILE="$T/run/hostapd_arm.pid"; AP_GUARD_PIDFILE="$T/run/apguard.pid"
+INIT_SCRIPT=/etc/init.d/K92rebot-teleop
+echo 1000 > "$T/nextpid"
+pidof() {{
+    found=1
+    for d in "$T"/proc/[0-9]*; do
+        [ -f "$d/cmdline" ] || continue
+        case "$(tr '\000' ' ' < "$d/cmdline")" in "$1 "*) printf '%s ' "${{d##*/}}"; found=0 ;; esac
+    done
+    [ $found -eq 0 ] && echo
+    return $found
+}}
+hostapd() {{
+    echo "hostapd $*" >> "$T/calls"
+    n=$(cat "$T/nextpid"); echo $((n + 1)) > "$T/nextpid"
+    mkdir -p "$T/proc/$n"
+    printf 'hostapd\000%s\000' "$@" | tr ' ' '\000' > "$T/proc/$n/cmdline"
+    [ "$2" = -P ] && echo "$n" > "$3"
+    return 0
+}}
+iw() {{
+    p=$(cat "$AP_PIDFILE" 2>/dev/null)
+    [ -n "$p" ] && [ -d "$T/proc/$p" ] && [ ! -f "$T/console_on_air" ] || return 0
+    echo "Interface wlan1"
+    echo "	channel $(sed -n 's/^channel=//p' "$AP_CONF") (5220 MHz), width: 20 MHz"
+}}
+kill() {{ echo "$1 $2" >> "$T/signals"; rm -rf "$T/proc/$2"; [ "$2" = "$(cat "$T/console_on_air_pid" 2>/dev/null)" ] && rm -f "$T/console_on_air"; return 0; }}
+sleep() {{ if [ -f "$T/late" ]; then rm -f "$T/late"; sh -c "$(cat "$T/late_cmd")"; fi; }}
+logger() {{ shift 2; echo "$*" >> "$T/log"; }}
+ifconfig() {{ echo "ifconfig $*" >> "$T/calls"; echo wlan1; }}
+ssd_stub() {{ echo "ssd $*" >> "$T/calls"; return 0; }}
+killall() {{ :; }}
+dnsmasq_stub() {{ :; }}
+{functions}
+{body}
+echo "hostapd now: $(pidof hostapd)"
+"#
+        );
+        let out = device_shell().args(["-c", &script]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    fn read(&self, rel: &str) -> String {
+        std::fs::read_to_string(self.p(rel)).unwrap_or_default()
+    }
+
+    fn own_pid(&self) -> String {
+        self.read("run/hostapd_arm.pid").trim().to_string()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn init_takes_wlan1_over_from_the_console_hotspot_at_start() {
+    let env = ApEnv::new();
+    env.process(500, "hostapd -B /etc/hostapd_2g4.conf");
+    let out = env.run("start_wifi");
+    assert_eq!(env.read("signals"), "-TERM 500\n", "{out}");
+    let own = env.own_pid();
+    assert!(env.p(&format!("proc/{own}")).is_dir(), "{out}");
+    assert!(out.contains(&format!("hostapd now: {own} \n")), "exactly one hostapd, ours: {out}");
+    assert!(env.read("run/hostapd_arm.conf").contains("ssid=reCamera-Arm-Teleop\nhw_mode=a\nchannel=44\n"));
+    assert!(env.read("log").contains("AP takeover at start: stopped the console's hostapd (PID 500"), "{}", env.read("log"));
+    assert!(env.read("calls").contains("ap-guard 5g 44"), "{}", env.read("calls"));
+}
+
+#[cfg(unix)]
+#[test]
+fn init_ap_guard_stops_a_console_hotspot_that_starts_late_and_restarts_ours() {
+    // The console starts its hotspot during the guard's first tick; wlan1 then serves the
+    // console's network, so ours is no longer on its channel (or has exited).
+    for ours_exits in [false, true] {
+        let env = ApEnv::new();
+        let t = env.p("").display().to_string();
+        let kill_ours = if ours_exits { format!("rm -rf {t}/proc/$(cat {t}/run/hostapd_arm.pid);") } else { String::new() };
+        std::fs::write(env.p("late_cmd"), format!("mkdir -p {t}/proc/600; printf 'hostapd\\000-B\\000/etc/hostapd_5g.conf\\000' > {t}/proc/600/cmdline; touch {t}/console_on_air; echo 600 > {t}/console_on_air_pid; {kill_ours}")).unwrap();
+        let out = env.run(&format!("start_wifi; first=$(cat \"$AP_PIDFILE\"); touch \"$T/late\"; AP_GUARD_TICKS=4 ap_guard 5g 44; echo first=$first"));
+        assert!(env.read("signals").starts_with("-TERM 600\n"), "{ours_exits}: {}", env.read("signals"));
+        assert!(env.read("log").contains("AP takeover after boot (guard): stopped the console's hostapd (PID 600"), "{}", env.read("log"));
+        let own = env.own_pid();
+        assert!(out.contains(&format!("hostapd now: {own} \n")), "{ours_exits}: one hostapd, ours: {out}");
+        if ours_exits {
+            assert!(env.read("log").contains("AP guard: our hostapd was not running on channel 44; restarting it"), "{}", env.read("log"));
+            assert!(!out.contains(&format!("first={own}\n")), "ours restarted: {out}");
+        }
+        assert!(!env.p("proc/600").exists());
+        assert!(!env.p("run/apguard.pid").exists(), "the guard removes its pidfile when it ends");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn init_leaves_an_unrelated_hostapd_alone() {
+    let env = ApEnv::new();
+    env.process(700, "hostapd -B /etc/other_ap.conf");
+    // guard pidfiles: one naming the guard, one naming another process
+    env.process(800, "/bin/sh /etc/init.d/K92rebot-teleop ap-guard 5g 44");
+    env.process(801, "/usr/bin/other");
+    let out = env.run("start_wifi; AP_GUARD_TICKS=3 ap_guard 5g 44; echo 801 > \"$AP_GUARD_PIDFILE\"; stop_ap_guard; echo 800 > \"$AP_GUARD_PIDFILE\"; stop_ap_guard");
+    assert_eq!(env.read("signals"), "-TERM 800\n", "only the guard is signalled: {out}");
+    assert!(!env.read("calls").contains("hostapd "), "no hostapd started next to another: {}", env.read("calls"));
+    assert!(out.contains("hostapd now: 700 \n"), "{out}");
+    assert!(env.read("log").contains("AP not started: hostapd 700 is not ours or the console's"), "{}", env.read("log"));
+}
+
 /// A reCamera root in a temp dir: postinst and K92rebot-teleop with their absolute paths moved
 /// under it, a supervisor main.sh stub, and a log of the stub's calls.
 #[cfg(unix)]

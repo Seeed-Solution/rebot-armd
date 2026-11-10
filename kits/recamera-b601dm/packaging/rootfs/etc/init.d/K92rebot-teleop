@@ -35,6 +35,12 @@ SUPERVISOR_MAIN=/usr/share/supervisor/scripts/main.sh
 APPS_STATE=/userdata/local/apps/state.json
 INIT_SCRIPT=/etc/init.d/K92$NAME
 
+# Our hotspot hostapd, and the guard that keeps it against the console's boot hotspot
+AP_CONF=/var/run/hostapd_arm.conf
+AP_PIDFILE=/var/run/hostapd_arm.pid
+AP_GUARD_PIDFILE=/var/run/rebot-teleop-apguard.pid
+AP_GUARD_TICKS=30  # x 2 s
+
 # 默认配置参数
 FOLLOWER_MODEL="rebot-dm"
 FOLLOWER_PORT="can0"
@@ -73,7 +79,7 @@ except Exception:
 fi
 
 # Write the hostapd config for band $1 (5g | 2g4) on channel $2 and start hostapd.
-# Succeeds when hostapd is running and `iw dev wlan1 info` reports that channel.
+# Succeeds when our hostapd (AP_PIDFILE) is running and `iw dev wlan1 info` reports that channel.
 start_ap() {
     if [ "$1" = "5g" ]; then
         AP_HW="hw_mode=a
@@ -88,7 +94,7 @@ ieee80211n=1"
         AP_BAND_LABEL="2.4 GHz"
     fi
     echo "[rebot-teleop] Starting Wi-Fi AP Hotspot (SSID: $AP_SSID on wlan1, $AP_BAND_LABEL channel $2)..."
-    cat <<EOF > "$AP_CONF"
+    cat <<EOT > "$AP_CONF"
 interface=wlan1
 driver=nl80211
 ssid=$AP_SSID
@@ -101,18 +107,168 @@ wpa_passphrase=$AP_PASS
 wpa_key_mgmt=WPA-PSK
 wpa_pairwise=CCMP
 rsn_pairwise=CCMP
-EOF
+EOT
 
     # hostapd 参数 -B 必须置于配置文件路径之前
+    rm -f "$AP_PIDFILE"
     hostapd -B -P "$AP_PIDFILE" "$AP_CONF" >/dev/null 2>&1 || true
     w=0
     while [ $w -lt 6 ]; do
         sleep 0.5
-        pidof hostapd >/dev/null 2>&1 || return 1
+        own_ap_pid >/dev/null || return 1
         iw dev wlan1 info 2>/dev/null | grep -q "channel $2 " && return 0
         w=$((w + 1))
     done
     return 1
+}
+
+# Command line of process $1, NULs as spaces.
+proc_cmdline() {
+    tr '\000' ' ' < "/proc/$1/cmdline" 2>/dev/null
+}
+
+# PID of our hostapd: the one in AP_PIDFILE, running with AP_CONF.
+own_ap_pid() {
+    OPID=$(cat "$AP_PIDFILE" 2>/dev/null)
+    case "$OPID" in ''|*[!0-9]*) return 1 ;; esac
+    [ -d "/proc/$OPID" ] || return 1
+    case "$(proc_cmdline "$OPID")" in *hostapd*"$AP_CONF"*) echo "$OPID" ;; *) return 1 ;; esac
+}
+
+# PIDs of hostapd processes the reCamera console started (/etc/hostapd_2g4.conf or
+# /etc/hostapd_5g.conf, its system hotspot reCamera_XXXXXX).
+console_ap_pids() {
+    for HPID in $(pidof hostapd 2>/dev/null); do
+        case "$(proc_cmdline "$HPID")" in
+            *hostapd_2g4.conf*|*hostapd_5g.conf*) echo "$HPID" ;;
+        esac
+    done
+}
+
+# PIDs of hostapd processes that are neither ours nor the console's. Never signalled.
+other_ap_pids() {
+    OWN=$(own_ap_pid)
+    for HPID in $(pidof hostapd 2>/dev/null); do
+        [ "$HPID" = "$OWN" ] && continue
+        case "$(proc_cmdline "$HPID")" in
+            *hostapd_2g4.conf*|*hostapd_5g.conf*) ;;
+            *) echo "$HPID" ;;
+        esac
+    done
+}
+
+# Stop the console's hostapd only (SIGTERM, up to 2 s, then SIGKILL), so our AP can use
+# wlan1. Returns 0 when one was stopped. $1 says when, for the log.
+stop_console_ap() {
+    CPIDS=$(console_ap_pids)
+    [ -n "$CPIDS" ] || return 1
+    for CPID in $CPIDS; do
+        CCMD=$(proc_cmdline "$CPID")
+        kill -TERM "$CPID" 2>/dev/null || true
+        k=0
+        while [ "$k" -lt 8 ] && [ -d "/proc/$CPID" ]; do sleep 0.25; k=$((k + 1)); done
+        if [ -d "/proc/$CPID" ]; then
+            kill -KILL "$CPID" 2>/dev/null || true
+            k=0
+            while [ "$k" -lt 4 ] && [ -d "/proc/$CPID" ]; do sleep 0.25; k=$((k + 1)); done
+        fi
+        echo "[rebot-teleop] stopped the console's hotspot (hostapd PID $CPID) $1"
+        logger -t "$NAME" "AP takeover $1: stopped the console's hostapd (PID $CPID: $CCMD)" 2>/dev/null || true
+    done
+    return 0
+}
+
+# Restart dnsmasq so wlan1 gets DHCP (graceful stop with retries, against the cold-boot race).
+restart_dnsmasq() {
+    start-stop-daemon -K -p /var/run/dnsmasq.pid -s TERM 2>/dev/null || killall -TERM dnsmasq 2>/dev/null || true
+    w=0
+    while [ $w -lt 4 ] && pidof dnsmasq >/dev/null 2>&1; do sleep 0.25; w=$((w + 1)); done
+    if pidof dnsmasq >/dev/null 2>&1; then killall -9 dnsmasq 2>/dev/null || true; sleep 0.2; fi
+    if [ -f /etc/dnsmasq/usb_wlan1.conf ]; then
+        /usr/sbin/dnsmasq -C /etc/dnsmasq/usb_wlan1.conf >/dev/null 2>&1 || true
+    elif [ -f /etc/init.d/S80dnsmasq ]; then
+        /etc/init.d/S80dnsmasq start >/dev/null 2>&1 || true
+    fi
+}
+
+# Start our AP on the configured band; 5 GHz falls back to 2.4 GHz channel 6. Sets
+# AP_RUN_BAND / AP_RUN_CHANNEL to what was started.
+start_own_ap() {
+    AP_RUN_BAND="$AP_BAND"
+    if [ "$AP_BAND" = "2g4" ]; then
+        AP_RUN_CHANNEL="${AP_CHANNEL:-6}"
+        start_ap 2g4 "$AP_RUN_CHANNEL" || true
+    else
+        AP_RUN_CHANNEL="${AP_CHANNEL:-44}"
+        if ! start_ap 5g "$AP_RUN_CHANNEL"; then
+            echo "[rebot-teleop] 5 GHz AP did not come up on channel $AP_RUN_CHANNEL; falling back to 2.4 GHz channel 6"
+            logger -t "$NAME" "5 GHz AP failed on channel $AP_RUN_CHANNEL; fell back to 2.4 GHz channel 6" 2>/dev/null || true
+            stop_own_ap
+            AP_RUN_BAND=2g4
+            AP_RUN_CHANNEL=6
+            start_ap 2g4 6 || true
+        fi
+    fi
+    ifconfig wlan1 "$AP_IP" netmask 255.255.255.0 up 2>/dev/null || true
+}
+
+# Stop only our hostapd (its pidfile and config), SIGTERM.
+stop_own_ap() {
+    if OPID=$(own_ap_pid); then
+        kill -TERM "$OPID" 2>/dev/null || true
+        k=0
+        while [ "$k" -lt 4 ] && [ -d "/proc/$OPID" ]; do sleep 0.25; k=$((k + 1)); done
+    fi
+    rm -f "$AP_PIDFILE"
+}
+
+# Background guard for the boot race (the console can start its hotspot just after ours):
+# every 2 s for AP_GUARD_TICKS ticks, stop a console hostapd that appeared and restart ours
+# (band $1, channel $2) when it is no longer running or no longer on its channel.
+ap_guard() {
+    t=0
+    off=0
+    while [ "$t" -lt "${AP_GUARD_TICKS:-30}" ]; do
+        sleep 2
+        t=$((t + 1))
+        changed=0
+        stop_console_ap "after boot (guard)" && changed=1
+        if ! own_ap_pid >/dev/null; then
+            off=2
+        elif iw dev wlan1 info 2>/dev/null | grep -q "channel $2 "; then
+            off=0
+        else
+            off=$((off + 1))
+        fi
+        # a hostapd that is not ours or the console's owns wlan1: leave it
+        if [ "$off" -ge 2 ] && [ -z "$(other_ap_pids)" ]; then
+            echo "[rebot-teleop] our hotspot is down; restarting it"
+            logger -t "$NAME" "AP guard: our hostapd was not running on channel $2; restarting it" 2>/dev/null || true
+            stop_own_ap
+            start_ap "$1" "$2" || true
+            ifconfig wlan1 "$AP_IP" netmask 255.255.255.0 up 2>/dev/null || true
+            changed=1
+            off=0
+        fi
+        [ "$changed" -eq 1 ] && restart_dnsmasq
+    done
+    rm -f "$AP_GUARD_PIDFILE"
+}
+
+# Stop the AP guard from its pidfile if that process is the guard.
+stop_ap_guard() {
+    GPID=$(cat "$AP_GUARD_PIDFILE" 2>/dev/null)
+    case "$GPID" in ''|*[!0-9]*) rm -f "$AP_GUARD_PIDFILE"; return 0 ;; esac
+    case "$(proc_cmdline "$GPID")" in
+        *ap-guard*) kill -TERM "$GPID" 2>/dev/null || true ;;
+    esac
+    rm -f "$AP_GUARD_PIDFILE"
+    return 0
+}
+
+start_ap_guard() {
+    stop_ap_guard
+    start-stop-daemon -S -b -m -p "$AP_GUARD_PIDFILE" -a /bin/sh -- "$INIT_SCRIPT" ap-guard "$1" "$2" >/dev/null 2>&1 || true
 }
 
 start_wifi() {
@@ -141,33 +297,19 @@ start_wifi() {
         iw dev wlan0 interface add wlan1 type __ap 2>/dev/null || true
     fi
 
-    # 3. 启动 AP 热点（绑定在 wlan1 上）；5 GHz 起不来时回退到 2.4 GHz 信道 6
-    if ! pidof hostapd >/dev/null 2>&1; then
-        AP_CONF="/var/run/hostapd_arm.conf"
-        AP_PIDFILE="/var/run/hostapd_arm.pid"
-        if [ "$AP_BAND" = "2g4" ]; then
-            start_ap 2g4 "${AP_CHANNEL:-6}" || true
-        elif ! start_ap 5g "${AP_CHANNEL:-44}"; then
-            echo "[rebot-teleop] 5 GHz AP did not come up on channel ${AP_CHANNEL:-44}; falling back to 2.4 GHz channel 6"
-            logger -t "$NAME" "5 GHz AP failed on channel ${AP_CHANNEL:-44}; fell back to 2.4 GHz channel 6" 2>/dev/null || true
-            # Stop only the hostapd started above (its pidfile), then retry on 2.4 GHz.
-            AP_PID=$(cat "$AP_PIDFILE" 2>/dev/null)
-            case "$AP_PID" in ''|*[!0-9]*) ;; *) kill -TERM "$AP_PID" 2>/dev/null || true; sleep 1 ;; esac
-            rm -f "$AP_PIDFILE"
-            start_ap 2g4 6 || true
-        fi
-        ifconfig wlan1 "$AP_IP" netmask 255.255.255.0 up 2>/dev/null || true
-
-        # 重启 dnsmasq 以使 wlan1 的 DHCP 分配生效（优雅停机并重试，防止 cold-boot 竞争）
-        start-stop-daemon -K -p /var/run/dnsmasq.pid -s TERM 2>/dev/null || killall -TERM dnsmasq 2>/dev/null || true
-        w=0
-        while [ $w -lt 4 ] && pidof dnsmasq >/dev/null 2>&1; do sleep 0.25; w=$((w + 1)); done
-        if pidof dnsmasq >/dev/null 2>&1; then killall -9 dnsmasq 2>/dev/null || true; sleep 0.2; fi
-        if [ -f /etc/dnsmasq/usb_wlan1.conf ]; then
-            /usr/sbin/dnsmasq -C /etc/dnsmasq/usb_wlan1.conf >/dev/null 2>&1 || true
-        elif [ -f /etc/init.d/S80dnsmasq ]; then
-            /etc/init.d/S80dnsmasq start >/dev/null 2>&1 || true
-        fi
+    # 3. 启动 AP 热点（绑定在 wlan1 上）；5 GHz 起不来时回退到 2.4 GHz 信道 6。
+    # The console starts its own hotspot (hostapd_2g4/5g.conf) at boot when no hostapd runs;
+    # that one is stopped for ours. A hostapd that is neither is left alone.
+    stop_console_ap "at start" || true
+    if own_ap_pid >/dev/null; then
+        echo "[rebot-teleop] Wi-Fi AP hotspot already running (PID: $(own_ap_pid))"
+    elif [ -n "$(other_ap_pids)" ]; then
+        echo "[rebot-teleop] another hostapd runs on this device (PID: $(other_ap_pids | tr '\n' ' ')); AP not started"
+        logger -t "$NAME" "AP not started: hostapd $(other_ap_pids | tr '\n' ' ')is not ours or the console's" 2>/dev/null || true
+    else
+        start_own_ap
+        restart_dnsmasq
+        start_ap_guard "$AP_RUN_BAND" "$AP_RUN_CHANNEL"
     fi
 }
 
@@ -434,6 +576,7 @@ stop_vision() {
 
 stop() {
     echo "Stopping $NAME..."
+    stop_ap_guard
     stop_vision
     if [ ! -f "$PIDFILE" ]; then
         if ! command -v pidof >/dev/null 2>&1 || pidof armd >/dev/null 2>&1; then
@@ -507,7 +650,8 @@ case "$1" in
     status) status; exit $? ;;
     register) register_active_app; exit $? ;;
     stop-vision) stop_vision; exit $? ;;
-    *) echo "Usage: $0 {start|stop|restart|status|register|stop-vision}"; exit 1 ;;
+    ap-guard) ap_guard "$2" "$3"; exit 0 ;;
+    *) echo "Usage: $0 {start|stop|restart|status|register|stop-vision|ap-guard}"; exit 1 ;;
 esac
 
 exit 0
