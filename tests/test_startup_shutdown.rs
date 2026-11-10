@@ -782,3 +782,31 @@ fn register_falls_back_to_an_atomic_write_when_the_console_write_fails() {
     assert_eq!(s["active_script"], root.init_path().as_str());
     assert!(!root.p("userdata/local/apps/.state.json.tmp").exists());
 }
+
+/// The gallery manifest's "version" is what the console reports as the installed version, so it
+/// must equal the package version: in the repo, and in the package (build_deb.sh writes it).
+#[test]
+fn manifest_version_matches_the_debian_package_version() {
+    let control = include_str!("../kits/recamera-b601dm/packaging/debian/control");
+    let version = control.lines().find_map(|l| l.strip_prefix("Version:")).map(str::trim).expect("Version in control");
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/rebot-teleop.json")).unwrap();
+    assert_eq!(manifest["version"], version, "rebot-teleop.json version must equal debian/control Version");
+
+    // build_deb.sh rewrites the staged manifest's "version" line with the package version and
+    // fails when the result does not carry it; run that sed on the manifest with another version.
+    let script = include_str!("../scripts/build_deb.sh");
+    let sed = script.lines().find(|l| l.starts_with("sed -i -E 's/^(  \"version\": )")).expect("version sed in build_deb.sh");
+    assert!(script.contains("grep -q \"^  \\\"version\\\": \\\"${VERSION}\\\",\" \"${MANIFEST}\""), "build_deb.sh checks the result");
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("rebot-teleop.json");
+    std::fs::write(&file, include_str!("../kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/rebot-teleop.json")).unwrap();
+    let out = Command::new("sh")
+        .args(["-c", &format!("VERSION=9.8.7-test; MANIFEST='{}'; {sed}", file.display())])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let staged: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(staged["version"], "9.8.7-test");
+    assert_eq!(staged["id"], "rebot-teleop");
+}

@@ -183,6 +183,14 @@ cp -f "${REPO_ROOT}/kits/recamera-b601dm/profile/rebot-b601dm.json" "${STAGING_D
 if [ -f "${REPO_ROOT}/src/api/index.html" ]; then
     cp -f "${REPO_ROOT}/src/api/index.html" "${STAGING_DIR}/usr/share/rebot-teleop/index.html"
 fi
+# Gallery manifest: its "version" is the package version (the console reports it as the
+# installed version), written here so the two cannot differ.
+MANIFEST="${STAGING_DIR}/usr/share/rebot-teleop/rebot-teleop.json"
+sed -i -E 's/^(  "version": )"[^"]*"/\1"'"${VERSION}"'"/' "${MANIFEST}"
+if ! grep -q "^  \"version\": \"${VERSION}\"," "${MANIFEST}"; then
+    echo "Error: could not set \"version\": \"${VERSION}\" in ${MANIFEST}" >&2
+    exit 1
+fi
 find "${STAGING_DIR}/usr/share/rebot-teleop" -type f -exec chmod 0644 {} +
 chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-vision-run"
 
