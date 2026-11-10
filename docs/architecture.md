@@ -143,8 +143,8 @@ have no `capabilities` object; it parses as all false, `version` 0.
   `servo_max_velocity` and `servo_max_lead_rad`, and `observation.motion_limit`); version 5 added
   `diagnostics`; version 6 added `obs_rate`, `fault_codes`, `poses`, `keepout`, `speed_cap`,
   `residual_torques` and `tick_stats` (with the schema field `speed_cap` and the observation
-  fields `fault` and `residual_torques`). Clients check each field and fall back when it is
-  false or missing.
+  fields `fault` and `residual_torques`), and `place`. Clients check each field and fall back
+  when it is false or missing.
 
 | Field | True when |
 |---|---|
@@ -164,6 +164,7 @@ have no `capabilities` object; it parses as all false, `version` 0.
 | `speed_cap` | always true: the profile `speed_cap` is applied and published as `schema.speed_cap` (null when not set) (version 6) |
 | `residual_torques` | the profile has a gravity model on a 6/7-DOF arm; `observation.residual_torques` is still null without torque feedback (version 6) |
 | `tick_stats` | always true: `GET /api/v1/diagnostics/tick` exists (version 6) |
+| `place` | 7-DOF, `kinematics` and `gripper_policy` set (`/api/v1/action/place`; version 6) |
 | `vision.detection_proxy` | always true: the detection routes exist; reachability of the provider is not checked |
 | `vision.mode_endpoint` | (string) always `/api/v1/vision/mode` |
 | `vision.modes` | (list) modes the provider reports (`off`, `yolo`, `aruco`, `both`); empty when it is unreachable or has no `/api/mode` |

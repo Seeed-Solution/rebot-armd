@@ -31,6 +31,7 @@ The existing `/api/v1/motion/jog`, `/motion/home`, `/motion/unload` commands and
 | `/api/v1/action/grasp` | `{"label":str, "box_norm":[x0,y0,x1,y1], "frame_id":int?, "ts_ms":number?, "overrides":{setup fields}?, "tag"?}` — see [Grasp](#grasp--点框抓取) |
 | `/api/v1/grasp/setup` | grasp setup patch, see [Grasp setup](#grasp-setup--抓取设置) (not an action: acknowledged without `action_id`) |
 | `/api/v1/action/move_to_pose` | `{"name":str, "include_gripper":bool? (default false), "speed_scale":0.1..1.0? (default 1.0), "tag"?}` — see [Named poses](#named-poses--命名姿态) |
+| `/api/v1/action/place` | `{"pose":str? \| "position":[x,y,z]?, "orientation"?, "approach_height_m":0.02..0.30? (default 0.08), "release":bool? (default true), "retreat":bool? (default true), "speed_scale":0.1..1.0? (default 1.0), "tag"?}` — see [Place](#place--放置) |
 | `/api/v1/poses/save`, `/api/v1/poses/delete` | `{"name":str, "positions":[dof]?}` / `{"name":str}` (not actions: acknowledged without `action_id`) |
 | `/api/v1/workspace/keepout` | `{"boxes":[{"name":str, "min_m":[x,y,z], "max_m":[x,y,z]}]}` — see [Keep-out boxes](#keep-out-boxes--禁入盒) (not an action) |
 
@@ -83,7 +84,7 @@ Every observation carries `action` (latest record) and, for 2 s after a newer ac
            "holding":null, "gripper_gap_rad":null, "settled":null}
 ```
 
-`kind`: `move_to`, `move_relative`, `gripper`, `grasp`, `joint_move`, `home`, `park`, `move_to_pose`. A `grasp` record also carries `phase`, `iteration` and `error_px` (null for other kinds). `state`: `running`, `done`, `failed`, `cancelled`. `started_at` / `finished_at` use the observation `timestamp` clock. Clients block by waiting until `action.id == action_id` and `state != "running"`, or until `previous_action.id == action_id`.
+`kind`: `move_to`, `move_relative`, `gripper`, `grasp`, `place`, `joint_move`, `home`, `park`, `move_to_pose`. A `grasp` record also carries `phase`, `iteration` and `error_px`; a `place` record carries `phase` (all three are null for other kinds). `state`: `running`, `done`, `failed`, `cancelled`. `started_at` / `finished_at` use the observation `timestamp` clock. Clients block by waiting until `action.id == action_id` and `state != "running"`, or until `previous_action.id == action_id`.
 
 A running action ends when its reference goes away:
 
@@ -219,6 +220,54 @@ The cockpit (`src/api/index.html`) uses this API: with Detect on, tap a box, con
 
 驾驶舱：开启「识别」后点框并确认「抓取」；HUD 上的「抓取设置」打开设置抽屉。任何 `gripper` / `grasp` 动作之后，驾驶舱从 `commanded_positions[6]` 同步夹爪目标，遥操作接管时夹爪不会被拉回原开度。
 
+## Place / 放置
+
+`/api/v1/action/place` puts a held object down at a named pose or at a base-frame position. Needs a 7-DOF profile with `kinematics` and `gripper_policy` (`capabilities.place`); otherwise `UNSUPPORTED`. No camera or grasp setup is involved.
+
+`/api/v1/action/place` 把夹持的物体放到命名姿态或基座坐标系下的指定位置。需要 7 轴且设置了 `kinematics` 和 `gripper_policy`（`capabilities.place`），否则返回 `UNSUPPORTED`。不使用相机和抓取设置。
+
+| field | default | meaning |
+|---|---|---|
+| `pose` | — | named pose; its stored TCP (`tcp.position`, `tcp.rpy`) is the place point and orientation. A pose saved without a TCP uses FK of its positions |
+| `position` | — | place point `[x,y,z]` (end_link origin, base frame, m). Exactly one of `pose` / `position` |
+| `orientation` | null | `{"rpy":[r,p,y]}` or `{"quat":[w,x,y,z]}`; null = the pose's orientation (`pose`) or the current one (`position`) |
+| `approach_height_m` | 0.08 | 0.02..0.30; height above the place point for the approach and the retreat |
+| `release` | true | open the gripper at the place point |
+| `retreat` | true | move straight up by `approach_height_m` after the release |
+| `speed_scale` | 1.0 | 0.1..1.0; every phase runs at 0.05 m/s × scale linear and 0.5 rad/s × scale angular (the `move_to` defaults), then the profile `speed_cap` |
+| `tag` | null | string ≤ 64 bytes |
+
+Phases (`action.phase`, `action.progress`):
+
+| phase | progress | what happens |
+|---|---|---|
+| `lift` | 0.05 | straight up, orientation kept, to max(current z, target z + `approach_height_m`); no motion when the TCP is already within 1 mm of that height |
+| `approach` | 0.2 | straight line to target + `approach_height_m` in z, rotating to the place orientation |
+| `descend` | 0.55 | straight down to the place point |
+| `open` | 0.75 | gripper `open` (only with `release`) |
+| `retreat` | 0.85 | straight up by `approach_height_m` (only with `retreat`) |
+| `done` | 1.0 | `state:"done"`; `holding:false` after a release, null otherwise |
+
+Before the ack, outside the lock, lift, approach, descend and retreat are planned in sequence from the commanded state (each from the end of the previous one, retreat with the jaws open when `release`). A failure is a `command_reject` with the planner code (`IK_UNREACHABLE`, `IK_BRANCH_FLIP`, `WORKSPACE_VIOLATION` incl. keep-out boxes with `keepout '<name>'` in the message, 422); an unknown `pose` is `POSE_NOT_FOUND` (404); bad fields are `INVALID_COMMAND`. Each phase is planned again from the commanded state when it runs.
+
+Execution uses the same orchestration as `grasp` (`src/macro_action.rs`): every motion is a sub-motion of the one `place` record, installed under the lock only while the action is still running, and the cancellation table of [Grasp](#phases--阶段) applies unchanged (`/motion/stop` → `cancelled` / `STOPPED`, new motion → `SUPERSEDED`, lease → `LEASE_LOST`, E-stop / Fault / watchdog → `failed`). Servo frames are rejected with `MOTION_BUSY` for the whole action. A sub-motion longer than its planned duration × 2 + 5 s (gripper: expected duration + 10 s), capped at 60 s, or the whole action longer than 2 × `expected_duration_s` + 20 s, stops the motion and ends as `PLACE_TIMEOUT`. Sub-motion failures (`TRACKING_STALL`, `GRIPPER_TIMEOUT`, planner codes) end the action with that code.
+
+应答前在锁外按顺序规划抬升、接近、下降和撤离（每段从上一段终点开始；`release` 时撤离段按夹爪张开规划）。规划失败直接 `command_reject`（`IK_UNREACHABLE` / `IK_BRANCH_FLIP` / `WORKSPACE_VIOLATION`，含禁入盒，消息中带 `keepout '<name>'`，422）；`pose` 不存在返回 `POSE_NOT_FOUND`（404）；参数错误返回 `INVALID_COMMAND`。执行时每个阶段从当前指令位置重新规划。
+
+阶段：`lift` 沿竖直方向抬升到 max(当前 z, 目标 z + `approach_height_m`)，已在该高度 1 mm 内则不运动；`approach` 直线移动到目标上方 `approach_height_m` 处并转到放置姿态（指定姿态、命名姿态的姿态或当前姿态）；`descend` 竖直下降到放置点；`open` 张开夹爪（仅 `release`）；`retreat` 竖直上升 `approach_height_m`（仅 `retreat`）；`done`。速度为 `move_to` 默认值（0.05 m/s、0.5 rad/s）乘以 `speed_scale`，再受 profile `speed_cap` 限制。执行与 `grasp` 共用编排模块（`src/macro_action.rs`），取消规则相同：`/motion/stop` 为 `cancelled` / `STOPPED`，新运动为 `SUPERSEDED`，租约丢失为 `LEASE_LOST`，急停 / 故障 / 看门狗为 `failed`。单个子运动超过规划时长 × 2 + 5 s（夹爪为预计时长 + 10 s，上限 60 s），或整个动作超过 2 × `expected_duration_s` + 20 s，停止运动并以 `PLACE_TIMEOUT` 结束。`release:false` 时夹爪保持原指令位置，`holding` 为 null。
+
+Example / 示例:
+
+```json
+{"type":"command", "request_id":52, "generation":7, "epoch_id":3, "path":"/api/v1/action/place",
+ "body":{"pose":"bin_a", "approach_height_m":0.06, "tag":"drop"}}
+```
+
+```json
+"action": {"id":10, "kind":"place", "tag":"drop", "state":"running", "phase":"descend", "progress":0.55,
+           "code":null, "holding":null, "iteration":null, "error_px":null, ...}
+```
+
 ## Gravity compensation mode / 重力补偿模式
 
 Verified on the reBot B601-DM (see the README). Full contract: [control_safety_contract.md](control_safety_contract.md#gravity-compensation-hand-guiding--重力补偿拖动示教).
@@ -290,7 +339,7 @@ SG2002 上电原因 `reset_reason`）；`blackbox?seconds=N` 返回本次启动�
 | `POSE_NOT_FOUND` | 404 |
 | `GRAVITY_COMP_NOT_STATIONARY`, `GRAVITY_COMP_JOINT_LIMIT`, `GRAVITY_COMP_SWITCH_FAILED`, `FEEDBACK_STALE`, `LEASE_REQUIRED` (gravity compensation entry) | 409 |
 
-Codes that only appear in `action.code`: `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `ESTOP_ACTIVE`, `FAULT`, `WATCHDOG`, `LEASE_LOST`, `STOPPED`, `SUPERSEDED`, `UNLOAD_FAILED`; for `grasp` also `TARGET_LOST`, `CENTRING_FAILED`, `NOT_HOLDING`, `GRASP_TIMEOUT`, `DETECTION_UNAVAILABLE`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a later phase.
+Codes that only appear in `action.code`: `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `ESTOP_ACTIVE`, `FAULT`, `WATCHDOG`, `LEASE_LOST`, `STOPPED`, `SUPERSEDED`, `UNLOAD_FAILED`; for `grasp` also `TARGET_LOST`, `CENTRING_FAILED`, `NOT_HOLDING`, `GRASP_TIMEOUT`, `DETECTION_UNAVAILABLE`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a later phase; for `place` also `PLACE_TIMEOUT`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a re-planned phase.
 
 ## Needs verification on the device / 需实机核实
 
