@@ -363,7 +363,19 @@ Chinese and English (language switch in the header).
   Overspeed limits are 1.5 rad/s for J1–J3 and 3.0 rad/s for J4–J6. On the B601-DM, all five
   exit paths tested (exit, stop, takeover, E-stop, client disconnect) held the arm within
   1.5 mrad, and a 30 s hand-guided recording gave 1509 frames.
-- **E-stop** button, fault display and clear, torque enable by press-and-hold, park.
+- **E-stop** button, fault display and clear, torque enable by press-and-hold, park. With
+  `capabilities.fault_codes`, the fault display explains `observation.fault.code` in one line
+  and says what to check before clearing (for example `BUS_LOSS`: check the motor cable and power).
+- **Collision guard** (only when `capabilities.collision_guard` is true): while
+  `observation.collision.active`, a red banner names the joint, its residual torque and the
+  auto-resume countdown; it cannot be closed. After escalation to the `COLLISION` fault it shows
+  the clear-fault button. The settings drawer (gear in the header) switches the guard on or off
+  and sets the sensitivity (low / medium / high); the thresholds are not calibrated on the arm
+  yet. Expert mode shows J1–J6 residual torque bars against the thresholds (green below 50 %,
+  yellow up to 100 %, red when tripped).
+- **Poses drawer** (only when `capabilities.poses` is true): record the current position under
+  a name (`^[A-Za-z0-9_-]{1,64}$`), move to a stored pose (`move_to_pose` action at the cockpit
+  speed) or delete it.
 
 The cockpit does not take the lease when it opens. It acquires it on the first control input
 (jog, stick, key, Cartesian input, preset, enable, gripper, grasp, gravity compensation, park
@@ -601,6 +613,7 @@ cargo clippy --all-targets -- -D warnings
 node scripts/view_ik_selftest.mjs          # cockpit view-frame IK
 node scripts/calib_selftest.mjs            # cockpit hand-eye calibration (part c needs ../rebot-companion and uv)
 node tests/test_rpc_error_contract.js      # cockpit RPC error handling
+node scripts/devplat_shots.mjs             # cockpit fault texts, collision guard, poses (Playwright >= 1.48, no armd)
 ```
 
 CI (`.github/workflows/ci.yml`) runs these, plus `sh -n` on the kit init scripts. `cargo fmt --check` is not enforced: the code is

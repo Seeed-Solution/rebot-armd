@@ -248,7 +248,9 @@ v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 - **手眼标定抽屉**：眼在手上（摄像头装在夹爪上）或眼在手外（固定摄像头），使用 ArUco 标记；采集位姿、求解、导出 rebot-companion 的 `HandEyeCalibration.load_result` 可读取的 JSON。
 - **点框抓取**：开启识别后点一个框并确认，armd 执行 `grasp` 动作（张开、俯视接近、闭环图像对中、J6 对齐 0° / 90°、下降、夹紧并判定、抬起）。任何摇杆、按键、停止或急停都会中止。抓取设置（桌面高度、夹爪位置像素、接近与抓取高度、相机俯角）由 armd 保存。目前只在仿真和截图测试中验证过；需要在真机上确认的项目见 [docs/plan_tap_to_grasp.md](docs/plan_tap_to_grasp.md)。
 - **重力补偿 / 拖动示教**：按住开关 0.6 秒，J1–J6 进入漂浮状态（MIT 模式，kp = 0，带阻尼，以 URDF 重力力矩为前馈，1 秒内渐入）；夹爪保持位置控制。开启期间摇杆、按键和预设不发送指令，夹爪按键发送张开 / 闭合动作，横幅显示渐入进度、录制开关和退出按钮。退出、停止、急停、租约丢失、故障、反馈超时、超速等退出原因都会在实测位姿锁定机械臂，并以提示条显示原因。超速阈值：J1–J3 为 1.5 rad/s，J4–J6 为 3.0 rad/s。在 B601-DM 上测试的五种退出方式（退出、停止、接管、急停、客户端断开）均把机械臂保持在 1.5 mrad 以内；一段 30 秒拖动示教录制得到 1509 帧。
-- **急停**按钮、故障显示与清除、长按使能力矩、收纳。
+- **急停**按钮、故障显示与清除、长按使能力矩、收纳。armd 提供 `capabilities.fault_codes` 时，故障显示用一句话说明 `observation.fault.code`，并给出清除前要检查的内容（例如 `BUS_LOSS`：检查电机线缆和电源）。
+- **碰撞保护**（仅在 `capabilities.collision_guard` 为 true 时显示）：`observation.collision.active` 期间，顶部红色横幅显示受阻关节、残余力矩和自动恢复倒计时，不能关闭；升级为 `COLLISION` 故障后显示清除故障按钮。设置抽屉（顶栏齿轮）可开关碰撞保护并选择灵敏度（低 / 中 / 高）；阈值尚未在机械臂上标定。专家模式显示 J1–J6 残余力矩条（低于阈值 50 % 为绿色，50–100 % 为黄色，触发时为红色）。
+- **点位抽屉**（仅在 `capabilities.poses` 为 true 时显示）：用名称（`^[A-Za-z0-9_-]{1,64}$`）记录当前位置，按驾驶舱速度前往已存点位（`move_to_pose` 动作），或删除点位。
 
 驾驶舱打开时不取得租约，在第一次控制输入（点动、摇杆、按键、笛卡尔输入、预设、使能、夹爪、抓取、重力补偿、收纳或回零）时取得；30 秒无输入后释放，且仅在力矩关闭、没有动作、重力补偿、串流或运动时释放（力矩开启时释放租约，armd 会让机械臂回到停靠位）。因此驾驶舱页面打开时，智能体也能取得租约。其他客户端持有租约时，驾驶舱切换为观察模式，按观测中的 `lease_holder` 显示持有者（另一个驾驶舱页面、AI 智能体 `rebot-mcp` 或该客户端的标签），并提供需确认的接管操作。急停不需要租约。
 
@@ -415,6 +417,7 @@ cargo clippy --all-targets -- -D warnings
 node scripts/view_ik_selftest.mjs          # 驾驶舱视角坐标系 IK
 node scripts/calib_selftest.mjs            # 驾驶舱手眼标定（c 部分需要 ../rebot-companion 和 uv）
 node tests/test_rpc_error_contract.js      # 驾驶舱 RPC 错误处理
+node scripts/devplat_shots.mjs             # 驾驶舱故障说明、碰撞保护、点位（Playwright >= 1.48，不需要 armd）
 ```
 
 CI（`.github/workflows/ci.yml`）运行以上检查，并对套件 init 脚本执行 `sh -n`。未强制 `cargo fmt --check`：代码尚未按 rustfmt 格式化。RISC-V 交叉编译不在 CI 中，因为它需要 SG2002 工具链的库文件。`test_damiao_smoothness::stale_posvel_gripper_recovery_uses_posvel_frame` 对时序敏感，机器负载高时可能失败，重跑即可。
