@@ -388,6 +388,19 @@ body.offline .banner { display: block; }
   box-shadow: var(--sc-shadow);
 }
 .armview canvas { width: 100%; height: 100%; display: block; }
+.hud .v3-btn { pointer-events: auto; }
+.v3-btn::before { display: none; }
+.v3-btn[aria-pressed="true"] { background: var(--sc-color-primary-dark); color: #fff; }
+.view3d { position: absolute; inset: 0; z-index: 6; background: #eef2ea; border-radius: inherit; overflow: hidden; }
+.view3d canvas { width: 100%; height: 100%; display: block; touch-action: none; }
+.v3-legend { position: absolute; left: 10px; bottom: 8px; display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: #374151; pointer-events: none; }
+.v3-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px; vertical-align: -1px; }
+.v3-legend .k-meas i { background: #2b2f2c; }
+.v3-legend .k-cmd i { background: rgba(59, 130, 246, 0.45); }
+.v3-legend .k-ws i { border: 1.5px solid #5B7D15; }
+.v3-legend .k-ko i { background: rgba(220, 38, 38, 0.35); border: 1px solid #dc2626; }
+.v3-status { position: absolute; left: 10px; top: 8px; right: 52px; font-size: 12px; color: #374151; pointer-events: none; }
+.v3-x { position: absolute; top: 6px; right: 6px; width: 40px; height: 40px; min-height: 40px; padding: 0; font-size: 20px; border-radius: 12px; background: rgba(255,255,255,0.85); }
 .armview .tag { position: absolute; left: 8px; top: 6px; font-size: 11px; color: var(--sc-color-text-tertiary); }
 body.offline .armview { bottom: 56px; }
 
@@ -1241,6 +1254,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           </div>
         </div>
         <div class="hud">
+          <button class="btn det-btn v3-btn" id="btn-3d" type="button" aria-pressed="false" aria-controls="view3d" data-i18n-aria="v3.aria" aria-label="3D 视图">3D</button>
           <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button><span class="seg seg-sm vmode" id="vmode" role="radiogroup" data-i18n-aria="vm.label" aria-label="视觉模式" hidden><button type="button" role="radio" data-vm="off" data-i18n="vm.off">关</button><button type="button" role="radio" data-vm="yolo" data-i18n="vm.yolo">YOLO</button><button type="button" role="radio" data-vm="aruco" data-i18n="vm.aruco">ArUco</button><button type="button" role="radio" data-vm="both" data-i18n="vm.both">两者</button></span><button class="btn det-btn det-trig" id="btn-trigger" type="button" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span><button class="btn det-btn det-gset" id="btn-gset" type="button" data-i18n="gset.open" hidden>抓取设置</button></span>
           <span class="sc-status-badge" id="cam-chip" data-i18n="v.chip.connecting">连接中</span>
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
@@ -1253,6 +1267,12 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
         <div class="armview only-expert" id="armview">
           <span class="tag" data-i18n="armview.tag">姿态示意 · 侧视</span>
           <canvas id="arm-canvas"></canvas>
+        </div>
+        <div class="view3d" id="view3d" role="region" data-i18n-aria="v3.aria" aria-label="3D 视图" hidden>
+          <canvas id="v3-canvas"></canvas>
+          <span class="v3-status" id="v3-status" role="status"></span>
+          <div class="v3-legend"><span class="k-meas"><i></i><b data-i18n="v3.leg.meas">实测</b></span><span class="k-cmd"><i></i><b data-i18n="v3.leg.cmd">指令</b></span><span class="k-ws"><i></i><b data-i18n="v3.leg.ws">工作空间</b></span><span class="k-ko"><i></i><b data-i18n="v3.leg.ko">禁入区</b></span></div>
+          <button class="btn v3-x" id="v3-close" type="button" data-i18n-aria="v3.close" aria-label="关闭 3D 视图">×</button>
         </div>
         <div class="grasp-bar" id="grasp-bar" role="group" data-i18n-aria="grasp.aria" aria-label="点框抓取" hidden>
           <div class="grasp-info" id="grasp-info"><b id="grasp-label">--</b><span class="mono" id="grasp-score">--</span></div>
@@ -1760,6 +1780,8 @@ const I18N = {
     'calib.ok.solve.eih': '标定完成，位置 RMSE {rmse} mm，姿态 RMSE {rot}°', 'calib.rmse.warn.eih': '残差偏大：检查标记是否固定不动、采集时机械臂是否静止，删除标黄的位姿后重新求解',
     'calib.r.frame': '结果', 'calib.r.rmse_pos': '位置残差 RMSE', 'calib.r.rmse_rot': '姿态残差 RMSE',
     'rec.chip0': '录制 00:00', 'rec.chip': '录制 ',
+    'v3.aria': '3D 视图', 'v3.close': '关闭 3D 视图', 'v3.loading': '正在加载 3D 视图…', 'v3.err': '3D 视图加载失败：{m}', 'v3.stick': '未安装机械臂网格，显示关节骨架', 'v3.offline': '无遥测，显示最后姿态', 'v3.hint': '拖动旋转 · 双指缩放',
+    'v3.leg.meas': '实测', 'v3.leg.cmd': '指令', 'v3.leg.ws': '工作空间', 'v3.leg.ko': '禁入区',
     'armview.tag': '姿态示意 · 侧视', 'banner.lock': '遥测断开 · 控制已锁定',
     'ctl.mode': '控制方式', 'mode.joint': '关节点动', 'mode.cart': '空间位姿', 'home': '回零',
     'input.mode': '输入方式', 'input.btn': '按键', 'input.stick': '摇杆',
@@ -1939,6 +1961,8 @@ const I18N = {
     'calib.ok.solve.eih': 'Calibration solved, position RMSE {rmse} mm, rotation RMSE {rot}°', 'calib.rmse.warn.eih': 'High residual: check the marker is fixed and the arm was still; delete the highlighted poses and solve again',
     'calib.r.frame': 'Result', 'calib.r.rmse_pos': 'Position RMSE', 'calib.r.rmse_rot': 'Rotation RMSE',
     'rec.chip0': 'REC 00:00', 'rec.chip': 'REC ',
+    'v3.aria': '3D view', 'v3.close': 'Close 3D view', 'v3.loading': 'Loading 3D view…', 'v3.err': '3D view failed to load: {m}', 'v3.stick': 'Arm meshes not installed; showing the joint skeleton', 'v3.offline': 'No telemetry; showing the last pose', 'v3.hint': 'Drag to rotate · pinch to zoom',
+    'v3.leg.meas': 'Measured', 'v3.leg.cmd': 'Commanded', 'v3.leg.ws': 'Workspace', 'v3.leg.ko': 'Keep-out',
     'armview.tag': 'Pose preview · side view', 'banner.lock': 'Telemetry lost · controls locked',
     'ctl.mode': 'Control mode', 'mode.joint': 'Joint jog', 'mode.cart': 'Cartesian', 'home': 'Home',
     'input.mode': 'Input type', 'input.btn': 'Buttons', 'input.stick': 'Sticks',
@@ -4223,7 +4247,7 @@ function initCalib() {
 async function loadSchema() {
   try {
     const sc = await api('/api/v1/observation/schema', undefined, { quiet: true, method: 'GET' });
-    if (sc) { S.caps = sc.capabilities || {}; colOnCaps(); posesOnCaps(); }
+    if (sc) { S.caps = sc.capabilities || {}; S.wsPolicy = sc.workspace || null; colOnCaps(); posesOnCaps(); V3.sceneAt = 0; }
     if (sc && Array.isArray(sc.limits) && sc.limits.length) {
       const oldDof = S.dof;
       S.limits = sc.limits;
@@ -6905,6 +6929,192 @@ $('pose-list').addEventListener('click', (e) => {
   else if (b.classList.contains('pose-del')) poseDelete(li.dataset.name);
 });
 i18nHooks.push(() => { if (!$('pset').hidden) { posesRender(); poseNameCheck(); } });
+
+/* =================================================================
+   3D arm view, loaded on first open: three.js + urdf-loader (/assets/three-urdf.min.js, embedded),
+   URDF and decimated meshes from the kit asset directory (/assets/model/). Without meshes it draws a
+   stick figure through the URDF joint frames (VIK). Angles: motor angle = URDF angle for J1..J6; J7 maps
+   to the finger travel via the profile gripper_policy (CFG.gripClosed / gripOpen). Renders at most
+   ~30 fps and only when the pose, the scene or the camera changed.
+   ================================================================= */
+const V3 = { open: false, init: null, T: null, r: null, scene: null, cam: null, ctl: null, root: null, solid: null, ghost: null,
+  extras: null, mode: '', dirty: true, last: 0, raf: 0, key: '', sceneAt: 0, renders: 0, ghostMat: null };
+const V3_FINGER_M = 0.0425; // URDF left/right_finger_joint upper limit (m)
+const V3_LINK_OF = { gripper_body: 'end_link', finger_L: 'left_finger', finger_R: 'right_finger' };
+const v3Geo = new Map();
+function v3Toggle(open) {
+  V3.open = open;
+  $('view3d').hidden = !open;
+  $('btn-3d').setAttribute('aria-pressed', String(open));
+  if (open) v3Start();
+  else { cancelAnimationFrame(V3.raf); V3.raf = 0; $('btn-3d').focus({ preventScroll: true }); }
+}
+async function v3Start() {
+  try { await (V3.init ||= v3Init()); } catch (e) { V3.init = null; setText($('v3-status'), t('v3.err', { m: e.message || String(e) })); return; }
+  if (!V3.open) return;
+  if (Date.now() - V3.sceneAt > 5000) v3Extras();
+  v3Resize();
+  if (!V3.raf) V3.raf = requestAnimationFrame(v3Tick);
+}
+async function v3Init() {
+  setText($('v3-status'), t('v3.loading'));
+  const T = V3.T = await import('/assets/three-urdf.min.js');
+  const cv = $('v3-canvas');
+  V3.r = new T.WebGLRenderer({ canvas: cv, antialias: true });
+  V3.r.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  const scene = V3.scene = new T.Scene();
+  scene.background = new T.Color(0xeef2ea);
+  scene.add(new T.HemisphereLight(0xffffff, 0x80857c, 2.4));
+  const sun = new T.DirectionalLight(0xffffff, 1.8); sun.position.set(1.2, 2.0, 1.0); scene.add(sun);
+  V3.cam = new T.PerspectiveCamera(42, 1, 0.01, 20);
+  V3.ctl = new T.OrbitControls(V3.cam, cv);
+  V3.ctl.target.set(0.05, 0.22, 0); V3.ctl.minDistance = 0.25; V3.ctl.maxDistance = 4; V3.ctl.update();
+  V3.ctl.addEventListener('change', () => { V3.dirty = true; });
+  // URDF base_link (z up) -> three.js (y up)
+  V3.root = new T.Group(); V3.root.rotation.x = -Math.PI / 2; scene.add(V3.root);
+  V3.ghostMat = new T.MeshBasicMaterial({ color: 0x3b82f6, transparent: true, opacity: 0.28, depthWrite: false });
+  let urdf = null, man = null;
+  try {
+    const [u, m] = await Promise.all([fetch('/assets/model/reBot-DevArm_gripper.urdf'), fetch('/assets/model/meshes/manifest.json')]);
+    if (u.ok && m.ok) { urdf = await u.text(); man = await m.json(); }
+  } catch (_) { /* stick figure */ }
+  if (urdf && man && man.links) {
+    try { V3.solid = await v3Robot(T, urdf, man, false); V3.ghost = await v3Robot(T, urdf, man, true); V3.mode = 'mesh'; }
+    catch (e) { console.warn('3D meshes', e); V3.solid = V3.ghost = null; }
+  }
+  if (!V3.solid) { V3.solid = v3Stick(T, false); V3.ghost = v3Stick(T, true); V3.mode = 'stick'; }
+  V3.ghost.obj.renderOrder = 2;
+  V3.root.add(V3.solid.obj, V3.ghost.obj);
+  new ResizeObserver(() => { if (V3.open) v3Resize(); }).observe($('view3d'));
+  V3.key = '';
+}
+function v3Robot(T, urdf, man, ghost) {
+  const pend = [];
+  const loader = new T.URDFLoader();
+  loader.packages = (pkg) => '/assets/model/' + pkg;
+  loader.loadMeshCb = (path, _mgr, _mat, done) => {
+    const base = path.split('/').pop().replace(/\.stl$/i, '');
+    const parts = man.links[V3_LINK_OF[base] || base] || [];
+    const g = new T.Group();
+    pend.push(Promise.all(parts.map(async (pt) => {
+      if (!v3Geo.has(pt.file)) v3Geo.set(pt.file, new T.STLLoader().loadAsync('/assets/model/meshes/' + pt.file));
+      const geo = await v3Geo.get(pt.file);
+      if (!geo.attributes.normal) geo.computeVertexNormals();
+      const mat = ghost ? V3.ghostMat
+        : new T.MeshStandardMaterial({ color: new T.Color().setRGB(pt.rgb[0], pt.rgb[1], pt.rgb[2], T.SRGBColorSpace), metalness: 0.25, roughness: 0.6 });
+      g.add(new T.Mesh(geo, mat));
+    })));
+    done(g);
+  };
+  const robot = loader.parse(urdf);
+  return Promise.all(pend).then(() => ({
+    obj: robot,
+    set(q) {
+      for (let i = 0; i < 6; i++) robot.setJointValue('joint' + (i + 1), Number(q[i]) || 0);
+      if (q.length > 6) { const d = gripFrac(q[6]) * V3_FINGER_M; robot.setJointValue('left_finger_joint', d); robot.setJointValue('right_finger_joint', d); }
+    },
+    end() { const v = robot.links.end_link.getWorldPosition(new T.Vector3()); V3.root.worldToLocal(v); return [v.x, v.y, v.z]; },
+  }));
+}
+// stick figure through the URDF joint frames: base, J1..J6 origins, end_link
+function v3Stick(T, ghost) {
+  const obj = new T.Group();
+  const bone = ghost ? V3.ghostMat : new T.MeshStandardMaterial({ color: 0x3a3f3b, roughness: 0.6 });
+  const joint = ghost ? V3.ghostMat : new T.MeshStandardMaterial({ color: 0x84b521, roughness: 0.5 });
+  const cyl = new T.CylinderGeometry(0.014, 0.014, 1, 14), sph = new T.SphereGeometry(0.022, 18, 12);
+  const mk = (geo, mat) => { const m = new T.Mesh(geo, mat); obj.add(m); return m; };
+  const bones = Array.from({ length: 7 }, () => mk(cyl, bone)), balls = Array.from({ length: 8 }, () => mk(sph, joint));
+  const up = new T.Vector3(0, 1, 0), a = new T.Vector3(), b = new T.Vector3(), d = new T.Vector3();
+  return {
+    obj,
+    set(q) {
+      const f = VIK.frames(q.slice(0, 6).map((v) => Number(v) || 0));
+      const pts = [[0, 0, 0], ...f.o, f.p];
+      pts.forEach((p, i) => balls[i].position.set(p[0], p[1], p[2]));
+      for (let i = 0; i < 7; i++) {
+        a.set(...pts[i]); b.set(...pts[i + 1]); d.subVectors(b, a);
+        const L = d.length(), m = bones[i];
+        m.visible = L > 1e-4;
+        if (!m.visible) continue;
+        m.position.copy(a).addScaledVector(d, 0.5); m.scale.set(1, L, 1); m.quaternion.setFromUnitVectors(up, d.normalize());
+      }
+    },
+    end() { const p = balls[7].position; return [p.x, p.y, p.z]; },
+  };
+}
+// floor grid, workspace box, keep-out boxes, named pose markers (URDF base frame)
+async function v3Extras() {
+  const T = V3.T;
+  V3.sceneAt = Date.now();
+  let boxes = null, poses = [];
+  try { const r = await fetch('/api/v1/workspace/keepout'); if (r.ok) { const j = await r.json(); boxes = Array.isArray(j) ? j : j.boxes; } } catch (_) {}
+  if (!Array.isArray(boxes)) boxes = (S.wsPolicy && S.wsPolicy.keepout_boxes) || [];
+  if (S.caps && S.caps.poses) { try { const r = await fetch('/api/v1/poses'); if (r.ok) { const j = await r.json(); poses = Array.isArray(j) ? j : j.poses || []; } } catch (_) {} }
+  if (V3.extras) { V3.root.remove(V3.extras); V3.extras.traverse((o) => { if (o.geometry) o.geometry.dispose(); }); }
+  const g = V3.extras = new T.Group();
+  const ws = S.wsPolicy;
+  const floor = ws && Number.isFinite(ws.floor_z_m) ? ws.floor_z_m : 0;
+  const grid = new T.GridHelper(1.2, 24, 0x9aa395, 0xc9cfc4);
+  grid.rotation.x = Math.PI / 2; grid.position.z = floor; g.add(grid);
+  const box = (lo, hi, color, fill, name) => {
+    const s = [0, 1, 2].map((k) => Math.max(1e-3, hi[k] - lo[k]));
+    const geo = new T.BoxGeometry(s[0], s[1], s[2]);
+    const c = [0, 1, 2].map((k) => (hi[k] + lo[k]) / 2);
+    const edges = new T.LineSegments(new T.EdgesGeometry(geo), new T.LineBasicMaterial({ color }));
+    edges.position.set(c[0], c[1], c[2]); edges.name = name; g.add(edges);
+    if (fill) { const m = new T.Mesh(geo, new T.MeshBasicMaterial({ color, transparent: true, opacity: 0.18, depthWrite: false })); m.position.copy(edges.position); m.name = name; g.add(m); }
+  };
+  if (ws && Array.isArray(ws.box_min_m) && Array.isArray(ws.box_max_m)) {
+    const lo = ws.box_min_m.slice(), hi = ws.box_max_m.slice();
+    lo[2] = Math.max(lo[2], floor);
+    if (hi[2] > lo[2]) box(lo, hi, 0x5b7d15, false, 'workspace');
+  }
+  for (const b of boxes) if (Array.isArray(b.min_m) && Array.isArray(b.max_m)) box(b.min_m, b.max_m, 0xdc2626, true, 'keepout:' + b.name);
+  const dot = new T.SphereGeometry(0.012, 12, 8), dm = new T.MeshBasicMaterial({ color: 0xf59e0b });
+  for (const p of poses) {
+    const v = p && p.tcp && p.tcp.position;
+    if (Array.isArray(v)) { const m = new T.Mesh(dot, dm); m.position.set(v[0], v[1], v[2]); m.name = 'pose:' + p.name; g.add(m); }
+  }
+  V3.root.add(g);
+  V3.dirty = true;
+}
+function v3Resize() {
+  const el = $('view3d'), w = el.clientWidth, h = el.clientHeight;
+  if (!V3.r || !w || !h) return;
+  V3.r.setSize(w, h, false);
+  V3.cam.aspect = w / h; V3.cam.updateProjectionMatrix();
+  if (!V3.fitted) { // first layout: fit a 0.45 m sphere around the arm into the narrower field of view
+    V3.fitted = true;
+    const half = Math.atan(Math.tan((V3.cam.fov * Math.PI) / 360) * Math.min(1, V3.cam.aspect));
+    const d = 0.45 / Math.sin(half);
+    V3.cam.position.set(0.62, 0.42, 0.66).normalize().multiplyScalar(d).add(V3.ctl.target);
+    V3.ctl.update();
+  }
+  V3.dirty = true;
+}
+function v3Tick(ts) {
+  V3.raf = V3.open ? requestAnimationFrame(v3Tick) : 0;
+  if (!V3.open || !V3.solid || ts - V3.last < 33) return;
+  const o = S.obs, live = isLive();
+  if (o && Array.isArray(o.positions)) {
+    const meas = o.positions, cmd = Array.isArray(o.commanded_positions) ? o.commanded_positions : meas;
+    const key = meas.map((v) => Math.round(v * 2000)).join() + '|' + cmd.map((v) => Math.round(v * 2000)).join();
+    if (key !== V3.key) {
+      V3.key = key;
+      V3.solid.set(meas); V3.ghost.set(cmd);
+      V3.ghost.obj.visible = cmd.some((v, i) => Math.abs(v - (meas[i] ?? v)) > (i === GRIP ? 0.05 : 0.005));
+      V3.dirty = true;
+    }
+  }
+  const st = V3.mode === 'stick' ? t('v3.stick') : !live ? t('v3.offline') : '';
+  if ($('v3-status').textContent !== st) setText($('v3-status'), st);
+  if (!V3.dirty) return;
+  V3.dirty = false; V3.last = ts; V3.renders++;
+  V3.r.render(V3.scene, V3.cam);
+}
+$('btn-3d').addEventListener('click', () => v3Toggle(!V3.open));
+$('v3-close').addEventListener('click', () => v3Toggle(false));
+i18nHooks.push(() => { V3.key = ''; });
 
 function renderCollision(live, ts) {
   const c = live && S.obs ? S.obs.collision : null;
