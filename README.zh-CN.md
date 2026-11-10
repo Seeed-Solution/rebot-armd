@@ -43,7 +43,8 @@
 
 - 单文件网页驾驶舱，适用于手机、平板和桌面（摇杆、笛卡尔控制、摄像头视频、识别叠加、手眼标定、点框抓取）；
 - 用于观测的 REST API 和用于控制的 WebSocket API，执行器指令只接受持有控制租约的连接；
-- 面向 agent 的高层动作（`move_to`、`move_relative`、`gripper`、`grasp`），由 [rebot-companion](https://github.com/Seeed-Solution/rebot-companion) 及其 MCP 服务器使用；
+- 面向 agent 的高层动作（`move_to`、`move_relative`、`gripper`、`grasp`、基于命名姿态的 `move_to_pose`），由 [rebot-companion](https://github.com/Seeed-Solution/rebot-companion) 及其 MCP 服务器使用；
+- 客户端无法放宽的服务端限制：含禁入盒的笛卡尔工作空间与 profile 速度上限；故障带机器可读的故障码；
 - 把关节状态与指令录制为 Parquet 文件；
 - 目标检测（YOLO，跑在 TPU）与带 3D 位姿的 ArUco 标记（跑在 CPU），只在调用方请求时运行（[视觉](#视觉recamera-套件)）；
 - 用于拖动示教的重力补偿模式，已在 B601-DM 上实机验证。
@@ -281,13 +282,15 @@ v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 
 | 路径 | 方法 | 用途 |
 |---|---|---|
-| `/api/v1/observation` | GET | 位置、速度、力矩、温度、安全状态、`commanded_positions`、最近的 `action`、驱动能力、`driver_range_check`（启动时从电机读出的达妙映射范围）、`motion_limit`（正在作用的 servo 限速 / 领先量上限、关节限位、工作空间或受阻保持；[契约](docs/control_safety_contract.md#servo-streaming-guard--流式控制保护)）、`motor_errors`（各关节电机错误码） |
-| `/api/v1/observation/schema` | GET | 自由度、关节名、限位、工作空间、相机安装参数、`capabilities`（[字段](docs/architecture.zh-CN.md#3-能力发现)） |
-| `/api/v1/ws` | WS | 租约（`acquire_lease`、`heartbeat`）、`command` / `command_ack` / `command_reject`、遥测 |
+| `/api/v1/observation` | GET | 位置、速度、力矩、温度、安全状态、`commanded_positions`、最近的 `action`、驱动能力、`driver_range_check`（启动时从电机读出的达妙映射范围）、`motion_limit`（正在作用的 servo 限速 / 领先量上限、关节限位、工作空间或受阻保持；[契约](docs/control_safety_contract.md#servo-streaming-guard--流式控制保护)）、`motor_errors`（各关节电机错误码）、`fault`（Fault / EStop 时为 `{code, message, recoverable}`）、`residual_torques`（实测力矩减模型重力力矩，J1..J6） |
+| `/api/v1/observation/schema` | GET | 自由度、关节名、限位、工作空间、相机安装参数、`speed_cap`、`capabilities`（[字段](docs/architecture.zh-CN.md#3-能力发现)） |
+| `/api/v1/ws` | WS | 租约（`acquire_lease`、`heartbeat`）、`command` / `command_ack` / `command_reject`、遥测；`?obs_hz=N` 把该连接的遥测限制为每秒 N 条 |
 | `/api/v1/safety/e_stop` | POST | 急停，不需要租约 |
 | `/api/v1/torque`、`/api/v1/motion/*`、`/api/v1/action/*`、`/api/v1/mode/gravity_comp`、`/api/v1/safety/clear_fault` | POST | 返回 `409 LEASE_REQUIRED`；请把相同路径作为 WS `command` 发送 |
 | `/api/v1/grasp/setup` | GET | 抓取设置（通过 WS 指令修改） |
-| `/api/v1/diagnostics/boots`、`/api/v1/diagnostics/blackbox?seconds=N[&prev=1]` | GET | 启动记录与黑匣子记录（复位前的状态），无需租约（[格式](docs/agent_action_api.md#diagnostics--诊断)） |
+| `/api/v1/poses` | GET | 命名姿态（通过 WS 指令保存、删除，供 `move_to_pose` 动作使用；[格式](docs/agent_action_api.md#named-poses--命名姿态)） |
+| `/api/v1/workspace/keepout` | GET | 禁入盒及其来源（`profile` 或 `runtime`；通过 WS 指令替换） |
+| `/api/v1/diagnostics/boots`、`/api/v1/diagnostics/blackbox?seconds=N[&prev=1]`、`/api/v1/diagnostics/tick` | GET | 启动记录、黑匣子记录（复位前的状态）与控制周期耗时，无需租约（[格式](docs/agent_action_api.md#diagnostics--诊断)） |
 | `/api/v1/dataset/record/start` / `save` / `discard` | POST | 示教片段录制 |
 | `/api/v1/detection/latest`、`/trigger`、`/inference`、`/ws` | GET / POST / WS | 检测服务代理 |
 
@@ -302,7 +305,7 @@ WebSocket 时序：
 
 参考文档：
 
-- [docs/agent_action_api.md](docs/agent_action_api.md)：`move_to`、`move_relative`（基座、工具、相机坐标系）、`gripper`、`grasp`、重力补偿模式指令、动作状态与错误码；
+- [docs/agent_action_api.md](docs/agent_action_api.md)：`move_to`、`move_relative`（基座、工具、相机坐标系）、`gripper`、`grasp`、`move_to_pose` 与命名姿态、禁入盒、重力补偿模式指令、动作状态、故障码与错误码；
 - [docs/control_safety_contract.md](docs/control_safety_contract.md)：租约、epoch、驱动能力、时序默认值、限速、工作空间；
 - [docs/detection_api.md](docs/detection_api.md)：识别路由与 agent 调用示例。
 
@@ -353,7 +356,7 @@ armd [OPTIONS]
 
 日志同时输出到 stdout。日志或黑匣子目录无法创建或写入时，armd 记一条警告并在没有该功能的情况下运行。黑匣子：每个采样一行 JSON（上力矩或关节运动时 5 Hz，否则每 5 s 一行；上力矩时每行 `fdatasync`），512 KiB x 3 个文件；每次启动在 `boots.log` 追加一行，含上一次启动的最后一条记录。详见 [docs/agent_action_api.md](docs/agent_action_api.md#diagnostics--诊断)。
 
-环境变量：`RUST_LOG`（日志过滤，默认 `armd=info,tower_http=info`）、`PORT`、`ARMD_DETECTOR_URL`（默认 `http://127.0.0.1:8090`）、`ARMD_GRASP_SETUP`（抓取设置文件，默认 `/userdata/rebot-teleop/grasp_setup.json`）、`ARMD_LOG_DIR`、`ARMD_BLACKBOX_DIR`。
+环境变量：`RUST_LOG`（日志过滤，默认 `armd=info,tower_http=info`）、`PORT`、`ARMD_DETECTOR_URL`（默认 `http://127.0.0.1:8090`）、`ARMD_GRASP_SETUP`（抓取设置文件，默认 `/userdata/rebot-teleop/grasp_setup.json`）、`ARMD_KEEPOUT`（运行时禁入盒，默认 `/userdata/rebot-teleop/keepout.json`）、`ARMD_POSES`（命名姿态，默认 `/userdata/rebot-teleop/poses.json`）、`ARMD_LOG_DIR`、`ARMD_BLACKBOX_DIR`。
 
 不带 `--config` 时，`rebot-dm` 使用内置 B601-DM profile（`src/model.rs` 中的 `ArmConfig::rebot_dm()`），其他 follower 使用通用 6 关节 profile。`--config` 文件是完整的 `ArmConfig` JSON。同一份 B601-DM profile 以数据形式放在 [`kits/recamera-b601dm/profile/rebot-b601dm.json`](kits/recamera-b601dm/profile/rebot-b601dm.json)（有测试保证它与 `rebot_dm()` 一致）；deb 把它安装到 `/usr/share/rebot-teleop/profile/rebot-b601dm.json`，follower 为 `rebot-dm` 时 init 脚本用 `--config` 传入。以下为 rebot-dm 取值的节选：
 

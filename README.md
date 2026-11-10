@@ -51,8 +51,11 @@ other hosts and arms are listed under [Hardware](#hardware) with their verificat
   camera video, detection overlay, hand-eye calibration, tap-to-grasp);
 - a REST API for observation and a WebSocket API for control, where actuator commands are
   accepted only from the connection that holds the control lease;
-- high-level actions for agents (`move_to`, `move_relative`, `gripper`, `grasp`), used by
+- high-level actions for agents (`move_to`, `move_relative`, `gripper`, `grasp`,
+  `move_to_pose` with named poses), used by
   [rebot-companion](https://github.com/Seeed-Solution/rebot-companion) and its MCP server;
+- server-side limits clients cannot raise: a Cartesian workspace with keep-out boxes and a
+  profile speed cap; faults are reported with a machine-readable code;
 - recording of joint state and commands to Parquet files;
 - object detection (YOLO, on the TPU) and ArUco markers with 3D pose (on the CPU), run only
   when a caller asks for them ([Vision](#vision-recamera-kit));
@@ -412,13 +415,15 @@ WebSocket that holds the lease.
 
 | Path | Method | Purpose |
 |---|---|---|
-| `/api/v1/observation` | GET | positions, velocities, torques, temperatures, safety state, `commanded_positions`, latest `action`, driver capabilities, `driver_range_check` (Damiao mapping ranges read from the motors at startup), `motion_limit` (servo speed / lead cap, joint limit, workspace or blocked hold shaping the motion; [contract](docs/control_safety_contract.md#servo-streaming-guard--流式控制保护)), `motor_errors` (per-joint motor fault code) |
-| `/api/v1/observation/schema` | GET | DOF, joint names, limits, workspace, camera mount, `capabilities` ([fields](docs/architecture.md#3-capability-discovery)) |
-| `/api/v1/ws` | WS | lease (`acquire_lease`, `heartbeat`), `command` / `command_ack` / `command_reject`, telemetry |
+| `/api/v1/observation` | GET | positions, velocities, torques, temperatures, safety state, `commanded_positions`, latest `action`, driver capabilities, `driver_range_check` (Damiao mapping ranges read from the motors at startup), `motion_limit` (servo speed / lead cap, joint limit, workspace or blocked hold shaping the motion; [contract](docs/control_safety_contract.md#servo-streaming-guard--流式控制保护)), `motor_errors` (per-joint motor fault code), `fault` (`{code, message, recoverable}` in Fault / EStop), `residual_torques` (measured minus model gravity torque, J1..J6) |
+| `/api/v1/observation/schema` | GET | DOF, joint names, limits, workspace, camera mount, `speed_cap`, `capabilities` ([fields](docs/architecture.md#3-capability-discovery)) |
+| `/api/v1/ws` | WS | lease (`acquire_lease`, `heartbeat`), `command` / `command_ack` / `command_reject`, telemetry; `?obs_hz=N` limits telemetry on that connection to N per second |
 | `/api/v1/safety/e_stop` | POST | E-stop, no lease needed |
 | `/api/v1/torque`, `/api/v1/motion/*`, `/api/v1/action/*`, `/api/v1/mode/gravity_comp`, `/api/v1/safety/clear_fault` | POST | return `409 LEASE_REQUIRED`; send the same paths as WS `command`s |
 | `/api/v1/grasp/setup` | GET | grasp setup (changed with a WS command) |
-| `/api/v1/diagnostics/boots`, `/api/v1/diagnostics/blackbox?seconds=N[&prev=1]` | GET | boot records and black-box records (state before a reset), no lease needed ([format](docs/agent_action_api.md#diagnostics--诊断)) |
+| `/api/v1/poses` | GET | named poses (saved and deleted with WS commands, used by the `move_to_pose` action; [format](docs/agent_action_api.md#named-poses--命名姿态)) |
+| `/api/v1/workspace/keepout` | GET | keep-out boxes and their source (`profile` or `runtime`; replaced with a WS command) |
+| `/api/v1/diagnostics/boots`, `/api/v1/diagnostics/blackbox?seconds=N[&prev=1]`, `/api/v1/diagnostics/tick` | GET | boot records, black-box records (state before a reset) and control tick timing, no lease needed ([format](docs/agent_action_api.md#diagnostics--诊断)) |
 | `/api/v1/dataset/record/start` / `save` / `discard` | POST | episode recording |
 | `/api/v1/detection/latest`, `/trigger`, `/inference`, `/ws` | GET / POST / WS | detector proxy |
 
@@ -434,8 +439,8 @@ WebSocket sequence:
 Reference documents:
 
 - [docs/agent_action_api.md](docs/agent_action_api.md): `move_to`, `move_relative` (base,
-  tool and camera frames), `gripper`, `grasp`, the gravity-compensation mode command, action
-  status and error codes;
+  tool and camera frames), `gripper`, `grasp`, `move_to_pose` and named poses, keep-out boxes,
+  the gravity-compensation mode command, action status, fault codes and error codes;
 - [docs/control_safety_contract.md](docs/control_safety_contract.md): lease, epochs, driver
   capabilities, timing defaults, speed caps, workspace;
 - [docs/detection_api.md](docs/detection_api.md): detection routes and an agent loop example.
@@ -503,7 +508,9 @@ files; each start appends a line with the previous start's last record to `boots
 
 Environment: `RUST_LOG` (log filter, default `armd=info,tower_http=info`), `PORT`,
 `ARMD_DETECTOR_URL` (default `http://127.0.0.1:8090`), `ARMD_GRASP_SETUP` (grasp setup file,
-default `/userdata/rebot-teleop/grasp_setup.json`), `ARMD_LOG_DIR`, `ARMD_BLACKBOX_DIR`.
+default `/userdata/rebot-teleop/grasp_setup.json`), `ARMD_KEEPOUT` (runtime keep-out boxes,
+default `/userdata/rebot-teleop/keepout.json`), `ARMD_POSES` (named poses, default
+`/userdata/rebot-teleop/poses.json`), `ARMD_LOG_DIR`, `ARMD_BLACKBOX_DIR`.
 
 Without `--config`, `rebot-dm` uses the built-in B601-DM profile (`ArmConfig::rebot_dm()` in
 `src/model.rs`) and the other followers a generic 6-joint profile. A `--config` file is a
