@@ -146,8 +146,8 @@ have no `capabilities` object; it parses as all false, `version` 0.
   `servo_max_velocity` and `servo_max_lead_rad`, and `observation.motion_limit`); version 5 added
   `diagnostics`; version 6 added `obs_rate`, `fault_codes`, `poses`, `keepout`, `speed_cap`,
   `residual_torques` and `tick_stats` (with the schema field `speed_cap` and the observation
-  fields `fault` and `residual_torques`), `place`, and `collision_guard` (with the observation
-  field `collision`). Clients check each field and fall back
+  fields `fault` and `residual_torques`), `place`, `collision_guard` (with the observation
+  field `collision`), and `safety_describe`. Clients check each field and fall back
   when it is false or missing.
 
 | Field | True when |
@@ -170,6 +170,7 @@ have no `capabilities` object; it parses as all false, `version` 0.
 | `tick_stats` | always true: `GET /api/v1/diagnostics/tick` exists (version 6) |
 | `place` | 7-DOF, `kinematics` and `gripper_policy` set (`/api/v1/action/place`; version 6) |
 | `collision_guard` | the profile has a gravity model on a 6/7-DOF arm and the driver reports torque: the `collision` profile section, `/api/v1/safety/collision` and `observation.collision` apply (the guard itself is off unless enabled; version 6) |
+| `safety_describe` | always true: `GET /api/v1/safety/describe` lists limits, stops and faults generated from the running config (version 6) |
 | `vision.detection_proxy` | always true: the detection routes exist; reachability of the provider is not checked |
 | `vision.mode_endpoint` | (string) always `/api/v1/vision/mode` |
 | `vision.modes` | (list) modes the provider reports (`off`, `yolo`, `aruco`, `both`); empty when it is unreachable or has no `/api/mode` |

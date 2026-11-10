@@ -97,7 +97,7 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 
 `GET /api/v1/observation/schema` 带有 `capabilities`（`src/model.rs` 中的 `Capabilities`），驾驶舱与 MCP 客户端可据此调整，无需探测路由。旧版 armd 的 schema 没有 `capabilities`，解析结果为全 false、`version` 为 0。
 
-- 版本：`capabilities.version`，当前为 **6**（`CAPABILITIES_VERSION`）。版本 2 在 `detection_proxy` 之后加入了 `vision.*` 字段；版本 3 加入了 `vision.per_request_pipelines` 和 `vision.subscriptions`；版本 4 加入了 `servo_guard`（以及 schema 字段 `servo_max_velocity`、`servo_max_lead_rad` 和 `observation.motion_limit`）；版本 5 加入了 `diagnostics`；版本 6 加入了 `obs_rate`、`fault_codes`、`poses`、`keepout`、`speed_cap`、`residual_torques`、`tick_stats`（以及 schema 字段 `speed_cap` 和观测字段 `fault`、`residual_torques`）、`place` 以及 `collision_guard`（以及观测字段 `collision`）。客户端逐项检查，字段为 false 或缺失时降级处理。
+- 版本：`capabilities.version`，当前为 **6**（`CAPABILITIES_VERSION`）。版本 2 在 `detection_proxy` 之后加入了 `vision.*` 字段；版本 3 加入了 `vision.per_request_pipelines` 和 `vision.subscriptions`；版本 4 加入了 `servo_guard`（以及 schema 字段 `servo_max_velocity`、`servo_max_lead_rad` 和 `observation.motion_limit`）；版本 5 加入了 `diagnostics`；版本 6 加入了 `obs_rate`、`fault_codes`、`poses`、`keepout`、`speed_cap`、`residual_torques`、`tick_stats`（以及 schema 字段 `speed_cap` 和观测字段 `fault`、`residual_torques`）、`place`、`collision_guard`（以及观测字段 `collision`）以及 `safety_describe`。客户端逐项检查，字段为 false 或缺失时降级处理。
 
 | 字段 | 为 true 的条件 |
 |---|---|
@@ -119,6 +119,7 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 | `tick_stats` | 恒为 true：`GET /api/v1/diagnostics/tick` 存在（版本 6） |
 | `place` | 7 轴，且设置了 `kinematics`、`gripper_policy`（`/api/v1/action/place`；版本 6） |
 | `collision_guard` | profile 有重力模型、6/7 轴且驱动报告力矩：`collision` profile 段、`/api/v1/safety/collision` 与 `observation.collision` 生效（保护本身默认关闭；版本 6） |
+| `safety_describe` | 恒为 true：`GET /api/v1/safety/describe` 列出由运行中配置生成的限值、停止方式与故障（版本 6） |
 | `vision.detection_proxy` | 恒为 true：检测路由存在；不检查感知服务是否可达 |
 | `vision.mode_endpoint` | （字符串）恒为 `/api/v1/vision/mode` |
 | `vision.modes` | （列表）感知服务报告的模式；服务不可达或没有 `/api/mode` 时为空 |
