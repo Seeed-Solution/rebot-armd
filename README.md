@@ -613,7 +613,6 @@ cargo clippy --all-targets -- -D warnings
 node scripts/view_ik_selftest.mjs          # cockpit view-frame IK
 node scripts/calib_selftest.mjs            # cockpit hand-eye calibration (part c needs ../rebot-companion and uv)
 node tests/test_rpc_error_contract.js      # cockpit RPC error handling
-node scripts/devplat_shots.mjs             # cockpit fault texts, collision guard, poses (Playwright >= 1.48, no armd)
 ```
 
 CI (`.github/workflows/ci.yml`) runs these, plus `sh -n` on the kit init scripts. `cargo fmt --check` is not enforced: the code is
@@ -624,7 +623,8 @@ is timing-sensitive and can fail on a loaded machine; rerun it.
 Playwright scripts (`scripts/*_shots.mjs`, `scripts/ux_walkthrough.mjs`,
 `tests/test_*_playwright.js`, `tests/test_single_origin_e2e.js`) take cockpit screenshots;
 they need Playwright (`PLAYWRIGHT=<module path>` to override) and a Chromium (`CHROME=<path>`),
-and some need a running armd. The `scripts/*_shots.mjs` write to `.cache/` (or `OUT`), the
+and some need a running armd. `scripts/devplat_shots.mjs` (fault texts, collision guard, poses) needs no armd and
+Playwright 1.48 or later. The `scripts/*_shots.mjs` write to `.cache/` (or `OUT`), the
 `tests/*.js` scripts to `tests/artifacts/`; both are ignored by git. The Python scripts in
 `scripts/` are bench diagnostics: some send raw CAN frames to the motors, others drive a running
 armd over its API. Run them only with the arm supported and the workspace clear.
