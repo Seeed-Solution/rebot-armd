@@ -164,7 +164,7 @@ impl SupervisorInner {
             return Some(reason("NOT_ARMED", "Enable the arm first"));
         }
         if self.pending_normal_unload || self.active_trajectory.is_some() || self.servo_target.is_some()
-            || self.grasp_run.is_some() || self.safety.state() != &SafetyState::Armed
+            || self.macro_run.is_some() || self.safety.state() != &SafetyState::Armed
             || self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) {
             return Some(reason("MOTION_BUSY", "Wait until the arm has stopped"));
         }

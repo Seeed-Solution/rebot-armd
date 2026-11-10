@@ -13,6 +13,7 @@ use crate::recording::{
 };
 use crate::safety::{FaultCode, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
 use crate::trajectory::{MultiJointQuinticTrajectory, TrajectoryError, TrajectoryPlanner};
+use crate::macro_action::{MacroRun, SubDone, SubState};
 use crate::motion::{
     ActionStatus, ActiveTrajectory, GripperMotion, GripperRequest, JointPath, MotionError, PathTrajectory,
     PlanInput, Reference, Settle, StepCtx, StepOut, StepStatus,
@@ -177,8 +178,8 @@ pub struct SupervisorInner {
     pub action_lease_generation: Option<u64>,
     /// Settle phase of a finished joint_move / home quintic: (action id, settle state).
     pub quintic_settle: Option<(u64, Settle)>,
-    /// Running tap-to-grasp orchestration (its sub-motions carry the grasp action id).
-    pub grasp_run: Option<crate::grasp::GraspRun>,
+    /// Running macro action (grasp, place); its sub-motions carry the action id.
+    pub macro_run: Option<crate::macro_action::MacroRun>,
     /// Test hook run once by the WS action handler between planning and install.
     #[doc(hidden)]
     pub before_install_hook: Option<Box<dyn FnOnce(&mut SupervisorInner) + Send + Sync>>,
@@ -288,7 +289,7 @@ impl SupervisorInner {
             previous_action: None,
             next_action_id: 0,
             action_lease_generation: None,
-            grasp_run: None,
+            macro_run: None,
             quintic_settle: None,
             before_install_hook: None,
             last_heartbeat: now,
@@ -408,7 +409,7 @@ impl SupervisorInner {
     /// [`MOTION_LIMIT_CLEAR_S`].
     fn expire_motion_limit(&mut self) {
         if self.servo_blocked_hold {
-            let resumed = self.servo_target.is_some() || self.active_trajectory.is_some() || self.grasp_run.is_some()
+            let resumed = self.servo_target.is_some() || self.active_trajectory.is_some() || self.macro_run.is_some()
                 || self.gravity_comp.is_some() || !self.is_torqued || self.safety.state().is_stopped();
             if resumed {
                 self.clear_blocked_hold();
@@ -1420,7 +1421,7 @@ impl SupervisorInner {
         if self.pending_rearm || self.pending_normal_unload {
             return Err(SafetyError::NotArmed(self.safety.state().clone()));
         }
-        if self.active_trajectory.is_some() || self.grasp_run.is_some() {
+        if self.active_trajectory.is_some() || self.macro_run.is_some() {
             return Err(SafetyError::MotionBusy);
         }
 
@@ -1565,8 +1566,8 @@ impl SupervisorInner {
     /// Start a new action record; a running one is cancelled as SUPERSEDED.
     pub fn begin_action(&mut self, kind: &str, tag: Option<String>) -> u64 {
         let now = self.now_s();
-        // any new action ends a running grasp (its orchestrator sees the record cancelled)
-        self.grasp_run = None;
+        // any new action ends a running macro (its orchestrator sees the record cancelled)
+        self.macro_run = None;
         if let Some(mut old) = self.last_action.take() {
             if old.is_running() {
                 old.state = "cancelled".into();
@@ -1603,7 +1604,7 @@ impl SupervisorInner {
             tracing::info!("Action {} ({}) {}{}", id, a.kind, state, code.map(|c| format!(" {c}")).unwrap_or_default());
         }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
-        if self.grasp_run.as_ref().is_some_and(|g| g.id == id) { self.grasp_run = None; }
+        if self.macro_run.as_ref().is_some_and(|m| m.id == id) { self.macro_run = None; }
     }
 
     /// Start a park (NormalUnload) and record it as a `park` action. Returns its id when
@@ -1713,26 +1714,30 @@ impl SupervisorInner {
         self.config.grasp = Some(setup);
     }
 
-    /// Begin a `grasp` action after its approach was planned from `input`. Returns its id.
-    pub fn begin_grasp(&mut self, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
+    // ---- macro actions (crate::macro_action) ----
+
+    /// Begin a macro action (`grasp`, `place`) after its first motion was planned from
+    /// `input`. Its orchestrator drives it from now on. Returns its id.
+    pub fn begin_macro(&mut self, kind: &str, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
         self.check_plan_fresh(input)?;
-        let id = self.begin_action("grasp", tag);
-        self.grasp_run = Some(crate::grasp::GraspRun { id, epoch: input.epoch, sub: crate::grasp::SubState::Idle, stop_requested: false });
-        self.set_grasp_phase(id, "start", 0.0, None, None);
+        let id = self.begin_action(kind, tag);
+        self.macro_run = Some(MacroRun { id, epoch: input.epoch, sub: SubState::Idle, stop_requested: false });
+        self.set_action_phase(id, "start", 0.0, None, None);
         Ok(id)
     }
 
-    /// The grasp `id` is still the running action.
-    pub fn grasp_alive(&self, id: u64) -> bool {
-        self.grasp_run.as_ref().is_some_and(|g| g.id == id)
+    /// The macro action `id` is still the running action.
+    pub fn macro_alive(&self, id: u64) -> bool {
+        self.macro_run.as_ref().is_some_and(|m| m.id == id)
             && self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running())
     }
 
-    pub fn grasp_sub(&self, id: u64) -> Option<crate::grasp::SubState> {
-        self.grasp_run.as_ref().filter(|g| g.id == id).map(|g| g.sub.clone())
+    pub fn macro_sub(&self, id: u64) -> Option<SubState> {
+        self.macro_run.as_ref().filter(|m| m.id == id).map(|m| m.sub.clone())
     }
 
-    pub fn set_grasp_phase(&mut self, id: u64, phase: &str, progress: f32, iteration: Option<u32>, error_px: Option<f32>) {
+    /// Set `phase` / `progress` (and centring stats) of the running action `id`.
+    pub fn set_action_phase(&mut self, id: u64, phase: &str, progress: f32, iteration: Option<u32>, error_px: Option<f32>) {
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
             a.phase = Some(phase.into());
             a.progress = progress;
@@ -1742,29 +1747,29 @@ impl SupervisorInner {
         }
     }
 
-    fn grasp_sub_ready(&self, id: u64) -> Result<u64, ArmError> {
-        let run = self.grasp_run.as_ref().filter(|g| g.id == id && self.grasp_alive(id))
-            .ok_or_else(|| ArmError::Internal("grasp is no longer running".into()))?;
-        if run.sub == crate::grasp::SubState::Running {
-            return Err(MotionError::MotionBusy("a grasp motion is running".into()).into());
+    fn macro_sub_ready(&self, id: u64) -> Result<u64, ArmError> {
+        let run = self.macro_run.as_ref().filter(|m| m.id == id && self.macro_alive(id))
+            .ok_or_else(|| ArmError::Internal("the action is no longer running".into()))?;
+        if run.sub == SubState::Running {
+            return Err(MotionError::MotionBusy("a sub-motion of the action is running".into()).into());
         }
         Ok(run.epoch)
     }
 
-    /// Install a planned sub-motion of grasp `id`. Returns its planned duration.
-    pub fn install_grasp_path(&mut self, id: u64, input: &PlanInput, path: JointPath) -> Result<f64, ArmError> {
-        let epoch = self.grasp_sub_ready(id)?;
-        if input.epoch != epoch { return Err(MotionError::PlanStale("epoch changed during the grasp".into()).into()); }
+    /// Install a planned sub-motion of macro action `id`. Returns its planned duration.
+    pub fn install_macro_path(&mut self, id: u64, input: &PlanInput, path: JointPath) -> Result<f64, ArmError> {
+        let epoch = self.macro_sub_ready(id)?;
+        if input.epoch != epoch { return Err(MotionError::PlanStale("epoch changed during the action".into()).into()); }
         self.check_plan_fresh(input)?;
         let duration = self.start_path_motion(input, &path)?;
         self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Path(PathTrajectory::new(path)) });
-        if let Some(g) = self.grasp_run.as_mut() { g.sub = crate::grasp::SubState::Running; }
+        if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
         Ok(duration + 0.5)
     }
 
-    /// Start a gripper sub-motion of grasp `id`. Returns its expected duration.
-    pub fn start_grasp_gripper(&mut self, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
-        let epoch = self.grasp_sub_ready(id)?;
+    /// Start a gripper sub-motion of macro action `id`. Returns its expected duration.
+    pub fn start_macro_gripper(&mut self, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
+        let epoch = self.macro_sub_ready(id)?;
         let Some(policy) = self.config.gripper_policy.clone().filter(|_| self.config.dof >= 7) else {
             return Err(MotionError::Unsupported("Gripper actions need a 7-DOF profile with a gripper policy".into()).into());
         };
@@ -1780,21 +1785,21 @@ impl SupervisorInner {
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
         self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Gripper(motion) });
-        if let Some(g) = self.grasp_run.as_mut() { g.sub = crate::grasp::SubState::Running; }
+        if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
         Ok(duration)
     }
 
-    /// End grasp `id` from its orchestrator (no-op when it already ended).
-    pub fn finish_grasp(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>, holding: Option<bool>, gap: Option<f32>) {
-        if !self.grasp_alive(id) { return; }
+    /// End macro action `id` from its orchestrator (no-op when it already ended).
+    pub fn finish_macro(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>, holding: Option<bool>, gap: Option<f32>) {
+        if !self.macro_alive(id) { return; }
         if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { self.stop_motion(); }
-        if state == "done" { self.set_grasp_phase(id, "done", 1.0, None, None); }
+        if state == "done" { self.set_action_phase(id, "done", 1.0, None, None); }
         self.finish_action(id, state, code, message, None, holding, gap);
     }
 
-    /// `/motion/stop`: also ends a grasp waiting between motions.
-    pub fn request_grasp_stop(&mut self) {
-        if let Some(g) = self.grasp_run.as_mut() { g.stop_requested = true; }
+    /// `/motion/stop`: also ends a macro action waiting between sub-motions.
+    pub fn request_macro_stop(&mut self) {
+        if let Some(m) = self.macro_run.as_mut() { m.stop_requested = true; }
     }
 
     /// Start a gripper action. Returns (action id, expected duration).
@@ -1825,6 +1830,7 @@ impl SupervisorInner {
     fn reconcile_action(&mut self, dt: f64) {
         let Some(action) = self.last_action.as_ref().filter(|a| a.is_running()) else { return; };
         let (id, kind) = (action.id, action.kind.clone());
+        let is_macro = self.macro_run.as_ref().is_some_and(|m| m.id == id);
         let carried = self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id));
         let lease_now = self.active_lease.as_ref().map(|l| l.generation);
         let cause: Option<(&str, &str, String)> = match self.safety.state() {
@@ -1836,20 +1842,21 @@ impl SupervisorInner {
             _ => None,
         };
         if let Some((state, code, message)) = cause {
-            // a grasp sub-motion must not outlive its grasp
-            if kind == "grasp" && carried { self.stop_motion(); }
+            // a macro sub-motion must not outlive its action
+            if is_macro && carried { self.stop_motion(); }
             self.finish_action(id, state, Some(code), Some(message), None, None, None);
             return;
         }
-        if kind == "grasp" {
+        if let Some(run) = self.macro_run.as_ref().filter(|m| m.id == id) {
+            // between sub-motions the orchestrator owns the action; it ends here only when
+            // something else took the arm or a stop arrived
             if carried { return; }
             let superseded = self.active_trajectory.is_some() || self.servo_target.is_some();
-            let ended: Option<(&str, &str, String)> = match self.grasp_run.as_ref().filter(|g| g.id == id) {
-                None => Some(("failed", "INTERNAL", "Grasp orchestrator ended".into())),
-                Some(_) if superseded => Some(("cancelled", "SUPERSEDED", "Replaced by new motion".into())),
-                Some(g) if g.sub == crate::grasp::SubState::Running || g.stop_requested => Some(("cancelled", "STOPPED", "Motion stopped".into())),
-                Some(_) => None,
-            };
+            let ended: Option<(&str, &str, String)> = if superseded {
+                Some(("cancelled", "SUPERSEDED", "Replaced by new motion".into()))
+            } else if run.sub == SubState::Running || run.stop_requested {
+                Some(("cancelled", "STOPPED", "Motion stopped".into()))
+            } else { None };
             if let Some((state, code, message)) = ended { self.finish_action(id, state, Some(code), Some(message), None, None, None); }
             return;
         }
@@ -1896,9 +1903,9 @@ impl SupervisorInner {
             self.gripper_high_torque_ticks = 0;
             self.gripper_low_torque_ticks = 0;
         }
-        let grasp_sub = self.grasp_run.as_ref().is_some_and(|g| Some(g.id) == action_id);
+        let macro_sub = self.macro_run.as_ref().is_some_and(|m| Some(m.id) == action_id);
         if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
-            if a.id == id && a.is_running() && !grasp_sub { a.progress = out.progress; }
+            if a.id == id && a.is_running() && !macro_sub { a.progress = out.progress; }
         }
         match out.status {
             StepStatus::Running => {}
@@ -1907,9 +1914,9 @@ impl SupervisorInner {
                 self.commanded_velocities.fill(0.0);
                 self.target_positions = self.commanded_positions.clone();
                 self.safety.mark_motion_finished();
-                if grasp_sub {
-                    if let Some(g) = self.grasp_run.as_mut() {
-                        g.sub = crate::grasp::SubState::Done(crate::grasp::SubDone { settled, holding, gripper_gap_rad, at: Instant::now() });
+                if macro_sub {
+                    if let Some(m) = self.macro_run.as_mut() {
+                        m.sub = SubState::Done(SubDone { settled, holding, gripper_gap_rad, at: Instant::now() });
                     }
                 } else if let Some(id) = action_id { self.finish_action(id, "done", None, None, settled, holding, gripper_gap_rad); }
             }
@@ -1926,8 +1933,8 @@ impl SupervisorInner {
                 self.commanded_velocities.fill(0.0);
                 self.target_positions = self.commanded_positions.clone();
                 self.safety.mark_motion_finished();
-                if grasp_sub {
-                    if let Some(g) = self.grasp_run.as_mut() { g.sub = crate::grasp::SubState::Failed { code: code.into(), message }; }
+                if macro_sub {
+                    if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Failed { code: code.into(), message }; }
                 } else if let Some(id) = action_id { self.finish_action(id, "failed", Some(code), Some(message), None, None, None); }
             }
         }

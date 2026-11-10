@@ -391,7 +391,7 @@ async fn assert_idle_after(sup: &ArmSupervisor, id: u64) {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let q0 = {
         let inner = sup.inner().read().await;
-        assert!(inner.grasp_run.is_none(), "grasp run cleared");
+        assert!(inner.macro_run.is_none(), "grasp run cleared");
         assert!(!inner.active_trajectory.as_ref().is_some_and(|t| t.action_id == Some(id)), "no grasp motion left");
         inner.commanded_positions.clone()
     };
@@ -422,13 +422,13 @@ async fn grasp_stop_during_motion_and_between_motions() {
     let a = cancel_case("approach", Some(true), async |rig: &Rig| {
         let mut inner = rig.sup.inner().write().await;
         inner.stop_motion();
-        inner.request_grasp_stop();
+        inner.request_macro_stop();
     }).await;
     assert_eq!((a.state.as_str(), a.code.as_deref()), ("cancelled", Some("STOPPED")), "{a:?}");
     let a = cancel_case("centring", Some(false), async |rig: &Rig| {
         let mut inner = rig.sup.inner().write().await;
         inner.stop_motion();
-        inner.request_grasp_stop();
+        inner.request_macro_stop();
     }).await;
     assert_eq!((a.state.as_str(), a.code.as_deref()), ("cancelled", Some("STOPPED")), "{a:?}");
 }

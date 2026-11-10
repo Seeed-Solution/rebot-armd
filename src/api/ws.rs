@@ -108,7 +108,7 @@ fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch:
         "/api/v1/motion/stop" => {
             inner.exit_gravity_comp("STOPPED", "Stop command");
             inner.stop_motion();
-            inner.request_grasp_stop();
+            inner.request_macro_stop();
         }
         "/api/v1/mode/gravity_comp" => {
             let enable = body.get("enable").and_then(Value::as_bool)
@@ -510,7 +510,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
                                 json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
                             } else {
-                                match inner.begin_grasp(&planned.input, planned.request.tag.clone()) {
+                                match inner.begin_macro("grasp", &planned.input, planned.request.tag.clone()) {
                                     Ok(id) => {
                                         let duration = crate::grasp::expected_duration(&planned);
                                         crate::grasp::spawn(recv_supervisor.clone(), recv_deps.source.clone(), id, planned);

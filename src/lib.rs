@@ -6,6 +6,7 @@ pub mod gravity;
 pub mod gravity_comp;
 pub mod keepout;
 pub mod kinematics;
+pub mod macro_action;
 pub mod model;
 pub mod motion;
 pub mod persist;
