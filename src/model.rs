@@ -783,7 +783,7 @@ pub struct SchemaField {
 }
 
 /// Version of the capability summary in the observation schema (`capabilities`).
-pub const CAPABILITIES_VERSION: u32 = 4;
+pub const CAPABILITIES_VERSION: u32 = 5;
 
 /// Vision features armd offers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -842,6 +842,10 @@ pub struct Capabilities {
     /// armd bounds servo streams itself (speed and lead caps, blocked hold) and publishes
     /// `observation.motion_limit`. Present from capabilities version 4.
     pub servo_guard: bool,
+    /// Read-only `/api/v1/diagnostics/boots` and `/api/v1/diagnostics/blackbox` exist
+    /// (their `enabled` says whether this armd writes the files). Present from
+    /// capabilities version 5.
+    pub diagnostics: bool,
     pub vision: VisionCapabilities,
 }
 
@@ -862,6 +866,7 @@ impl Capabilities {
             gravity_comp: seven && config.gravity_model.is_some() && config.gravity_comp.is_some(),
             damiao_ranges: config.damiao_ranges.is_some(),
             servo_guard: true,
+            diagnostics: true,
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }

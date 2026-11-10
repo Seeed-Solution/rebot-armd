@@ -1,3 +1,4 @@
+pub mod diagnostics;
 pub mod proxy;
 pub mod rest;
 pub mod ws;
@@ -46,6 +47,16 @@ pub fn create_router_with_detector(supervisor: Arc<ArmSupervisor>, detector: pro
 
 /// [`create_router_with_detector`] with explicit grasp dependencies (detection source, setup file).
 pub fn create_router_with(supervisor: Arc<ArmSupervisor>, detector: proxy::DetectorUpstream, grasp: crate::grasp::GraspDeps) -> Router {
+    create_router_full(supervisor, detector, grasp, crate::diagnostics::DiagnosticsState::global())
+}
+
+/// [`create_router_with`] with explicit diagnostics files (`/api/v1/diagnostics/*`).
+pub fn create_router_full(
+    supervisor: Arc<ArmSupervisor>,
+    detector: proxy::DetectorUpstream,
+    grasp: crate::grasp::GraspDeps,
+    diagnostics: crate::diagnostics::DiagnosticsState,
+) -> Router {
     Router::new()
         .route("/", get(serve_index))
         .route("/assets/jmuxer.min.js", get(serve_jmuxer))
@@ -69,6 +80,8 @@ pub fn create_router_with(supervisor: Arc<ArmSupervisor>, detector: proxy::Detec
         .route("/api/v1/dataset/record/start", post(rest::dataset_record_start))
         .route("/api/v1/dataset/record/save", post(rest::dataset_record_save))
         .route("/api/v1/dataset/record/discard", post(rest::dataset_record_discard))
+        .route("/api/v1/diagnostics/boots", get(diagnostics::get_boots))
+        .route("/api/v1/diagnostics/blackbox", get(diagnostics::get_blackbox))
         .route("/api/v1/ws", get(ws::ws_handler))
         // Single-Origin Reverse Proxy Routes
         .route("/api/v1/detection/ws", get(proxy::proxy_detection_ws))
@@ -87,6 +100,7 @@ pub fn create_router_with(supervisor: Arc<ArmSupervisor>, detector: proxy::Detec
         .layer(axum::Extension(detector))
         .layer(axum::Extension(proxy::VisionCache::default()))
         .layer(axum::Extension(grasp))
+        .layer(axum::Extension(diagnostics))
         .layer(middleware::from_fn(same_origin))
         .layer(TraceLayer::new_for_http())
         .with_state(supervisor)
