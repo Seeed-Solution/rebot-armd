@@ -51,6 +51,7 @@ rebot-armd 分三层。核心可在任何受支持的控制器上运行；套件
 | `following_error` | `max_error_rad`、`persistence_ms` | 否（0.5 rad，500 ms） |
 | `max_jerk`、`planned_max_velocity` | 轨迹加加速度偏好、规划运动限速 | 否 |
 | `speed_cap` | `linear_mps`、`angular_rps`、`joint_velocity_scale`（0, 1]：所有规划运动的速度上限，与请求值和 `planned_max_velocity` 取 min；各项可选 | 否 |
+| `collision` | 碰撞保护：`enabled`（默认 false）、`thresholds_nm`（J1..J6，真机实测前为占位值）、`persist_ticks`、`clear_ratio`、`resume_after_s`、`max_auto_resumes`、`escalate_window_s`；各项可选 | 否 |
 | `kinematics` | 运动学模型（`RebotDevArm`）；为 null 时关闭笛卡尔动作和工作空间检查 | 否 |
 | `workspace` | 笛卡尔安全盒（`floor_z_m`、`box_min_m`、`box_max_m`、`max_reach_m`、`check_points_end_m`、`keepout_boxes` `[{name, min_m, max_m}]`，最多 16 个） | 否 |
 | `gravity_model` | 重力模型（`RebotDevArm`） | 否 |
@@ -66,7 +67,7 @@ rebot-armd 分三层。核心可在任何受支持的控制器上运行；套件
 
 - URDF：`gravity_model` 选择编译进 armd 的模型。启动时 armd 在固定路径（`assets/`、`/usr/share/rebot-teleop/assets/`、`/usr/share/rebot-teleop/`）校验 `reBot-DevArm_gripper.urdf` 的 sha256；reCamera 套件的 deb 负责安装该文件。路径不是 profile 字段。
 - 抓取设置也可来自 `ARMD_GRASP_SETUP`（运行时修改并持久化）。
-- 运行时禁入盒（`ARMD_KEEPOUT`，默认 `/userdata/rebot-teleop/keepout.json`）存在时替换 `workspace.keepout_boxes`；命名姿态保存在 `ARMD_POSES`（默认 `/userdata/rebot-teleop/poses.json`）。两个文件都以原子方式写入；启动时文件无效则记录日志并保持原样。
+- 运行时禁入盒（`ARMD_KEEPOUT`，默认 `/userdata/rebot-teleop/keepout.json`）存在时替换 `workspace.keepout_boxes`；命名姿态保存在 `ARMD_POSES`（默认 `/userdata/rebot-teleop/poses.json`）；运行时碰撞保护设置保存在 `ARMD_COLLISION`（默认 `/userdata/rebot-teleop/collision.json`），存在时替换 `collision.enabled`。这些文件都以原子方式写入；启动时文件无效则记录日志并保持原样。
 
 官方套件把 B601-DM profile 以数据形式提供：`kits/recamera-b601dm/profile/rebot-b601dm.json`；与 `rebot_dm()` 不一致时 `tests/test_arm_profile.rs` 失败。
 
@@ -96,7 +97,7 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 
 `GET /api/v1/observation/schema` 带有 `capabilities`（`src/model.rs` 中的 `Capabilities`），驾驶舱与 MCP 客户端可据此调整，无需探测路由。旧版 armd 的 schema 没有 `capabilities`，解析结果为全 false、`version` 为 0。
 
-- 版本：`capabilities.version`，当前为 **6**（`CAPABILITIES_VERSION`）。版本 2 在 `detection_proxy` 之后加入了 `vision.*` 字段；版本 3 加入了 `vision.per_request_pipelines` 和 `vision.subscriptions`；版本 4 加入了 `servo_guard`（以及 schema 字段 `servo_max_velocity`、`servo_max_lead_rad` 和 `observation.motion_limit`）；版本 5 加入了 `diagnostics`；版本 6 加入了 `obs_rate`、`fault_codes`、`poses`、`keepout`、`speed_cap`、`residual_torques`、`tick_stats`（以及 schema 字段 `speed_cap` 和观测字段 `fault`、`residual_torques`）以及 `place`。客户端逐项检查，字段为 false 或缺失时降级处理。
+- 版本：`capabilities.version`，当前为 **6**（`CAPABILITIES_VERSION`）。版本 2 在 `detection_proxy` 之后加入了 `vision.*` 字段；版本 3 加入了 `vision.per_request_pipelines` 和 `vision.subscriptions`；版本 4 加入了 `servo_guard`（以及 schema 字段 `servo_max_velocity`、`servo_max_lead_rad` 和 `observation.motion_limit`）；版本 5 加入了 `diagnostics`；版本 6 加入了 `obs_rate`、`fault_codes`、`poses`、`keepout`、`speed_cap`、`residual_torques`、`tick_stats`（以及 schema 字段 `speed_cap` 和观测字段 `fault`、`residual_torques`）、`place` 以及 `collision_guard`（以及观测字段 `collision`）。客户端逐项检查，字段为 false 或缺失时降级处理。
 
 | 字段 | 为 true 的条件 |
 |---|---|
@@ -117,6 +118,7 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 | `residual_torques` | profile 有重力模型且为 6/7 轴；没有力矩反馈时 `observation.residual_torques` 仍为 null（版本 6） |
 | `tick_stats` | 恒为 true：`GET /api/v1/diagnostics/tick` 存在（版本 6） |
 | `place` | 7 轴，且设置了 `kinematics`、`gripper_policy`（`/api/v1/action/place`；版本 6） |
+| `collision_guard` | profile 有重力模型、6/7 轴且驱动报告力矩：`collision` profile 段、`/api/v1/safety/collision` 与 `observation.collision` 生效（保护本身默认关闭；版本 6） |
 | `vision.detection_proxy` | 恒为 true：检测路由存在；不检查感知服务是否可达 |
 | `vision.mode_endpoint` | （字符串）恒为 `/api/v1/vision/mode` |
 | `vision.modes` | （列表）感知服务报告的模式；服务不可达或没有 `/api/mode` 时为空 |
@@ -128,14 +130,14 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 
 `vision.modes` 等字段来自感知服务的 `GET /api/mode`：schema 使用最近一次经 armd 代理的模式请求的响应，超过 2 秒则向服务查询（超时 500 ms）。
 
-schema 的其他字段已描述机械臂：`dof`、`joint_names`、`limits`、`workspace`、`camera_mount`、`kinematics`、`servo_max_velocity`（各关节实际的 servo 限速）、`servo_max_lead_rad`、`speed_cap`。随观测变化的状态仍在观测中（`driver_capabilities`、`gravity_comp`、`driver_range_check`、`motion_limit`、`fault`、`residual_torques`）。
+schema 的其他字段已描述机械臂：`dof`、`joint_names`、`limits`、`workspace`、`camera_mount`、`kinematics`、`servo_max_velocity`（各关节实际的 servo 限速）、`servo_max_lead_rad`、`speed_cap`。随观测变化的状态仍在观测中（`driver_capabilities`、`gravity_comp`、`driver_range_check`、`motion_limit`、`fault`、`residual_torques`、`collision`）。
 
 ### 4. 打包
 
 套件提供：armd 二进制（核心不改）、profile、可选的旁路进程（感知服务）、启动脚本；启动脚本启动这些进程并运行 `armd --follower <model> [--follower-port <port>] --config <profile>`。
 
 - 版本：代码中未版本化；下面的布局为本文档的第 1 版。
-- armd 从环境变量读取 `PORT`、`RUST_LOG`、`ARMD_DETECTOR_URL`、`ARMD_GRASP_SETUP`、`ARMD_KEEPOUT`、`ARMD_POSES`、`ARMD_LOG_DIR`、`ARMD_BLACKBOX_DIR`。
+- armd 从环境变量读取 `PORT`、`RUST_LOG`、`ARMD_DETECTOR_URL`、`ARMD_GRASP_SETUP`、`ARMD_KEEPOUT`、`ARMD_POSES`、`ARMD_COLLISION`、`ARMD_LOG_DIR`、`ARMD_BLACKBOX_DIR`。
 
 官方套件的安装包（`kits/recamera-b601dm/packaging/`，deb `rebot-teleop` 1.3.4）：
 

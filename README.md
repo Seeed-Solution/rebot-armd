@@ -510,7 +510,8 @@ Environment: `RUST_LOG` (log filter, default `armd=info,tower_http=info`), `PORT
 `ARMD_DETECTOR_URL` (default `http://127.0.0.1:8090`), `ARMD_GRASP_SETUP` (grasp setup file,
 default `/userdata/rebot-teleop/grasp_setup.json`), `ARMD_KEEPOUT` (runtime keep-out boxes,
 default `/userdata/rebot-teleop/keepout.json`), `ARMD_POSES` (named poses, default
-`/userdata/rebot-teleop/poses.json`), `ARMD_LOG_DIR`, `ARMD_BLACKBOX_DIR`.
+`/userdata/rebot-teleop/poses.json`), `ARMD_COLLISION` (collision guard setting, default
+`/userdata/rebot-teleop/collision.json`), `ARMD_LOG_DIR`, `ARMD_BLACKBOX_DIR`.
 
 Without `--config`, `rebot-dm` uses the built-in B601-DM profile (`ArmConfig::rebot_dm()` in
 `src/model.rs`) and the other followers a generic 6-joint profile. A `--config` file is a
