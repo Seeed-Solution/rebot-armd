@@ -7,7 +7,8 @@ datagram. Wire protocol: see src/sim_driver.rs and docs/simulation.md.
 Motor model per joint, mirroring the Damiao modes armd uses:
 - POS_VEL: v_des = clip(KPOS * (q_target - q), +-vlim); torque = KV * (v_des - dq)
   plus the model's bias torque (gravity, Coriolis) on J1..J6, which stands in for the
-  motor's integrator. Torque limited to the motor's rating.
+  motor's integrator. v_des is also capped at the motor's no-load speed; torque is
+  limited to the motor's peak torque.
 - MIT: torque = kp * (q_target - q) + kd * (dq_target - dq) + tau_ff.
 - Disabled: no torque (the arm falls under gravity, as on hardware).
 Reported torque is the total motor torque; temperatures are a constant 35 C.
@@ -30,10 +31,14 @@ from .model import DOF, Indexer, load_model
 PROTOCOL_VERSION = 1
 STATE_EVERY = 2  # physics steps per state datagram (250 Hz at 500 Hz physics)
 TEMPERATURE_C = 35.0
-# POS_VEL loop gains (guessed; not identified on the motors). KPOS in 1/s, KV in N·m·s/rad.
+# POS_VEL loop gains (assumed; not identified on the motors). KPOS in 1/s, KV in N·m·s/rad.
 KPOS = np.array([25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0])
 KV = np.array([8.0, 8.0, 8.0, 1.5, 1.5, 1.5, 0.5])
-TORQUE_LIMIT = np.array([27.0, 27.0, 27.0, 7.0, 7.0, 7.0, 1.5])
+# Damiao datasheet values (Seeed wiki damiao_series, Damiao user manuals): J1..J3
+# DM-J4340P-2EC, J4..J7 DM-J4310-2EC V1.1. Peak torque in N·m, no-load speed at 24 V in
+# rad/s (52 rpm and 200 rpm), both output side.
+TORQUE_LIMIT = np.array([27.0, 27.0, 27.0, 7.0, 7.0, 7.0, 7.0])
+NO_LOAD_SPEED = np.array([52.0] * 3 + [200.0] * 4) * 2 * np.pi / 60
 
 
 class Motors:
@@ -94,7 +99,8 @@ class Motors:
         bias = d.qfrc_bias[self.dofs[:6]]
         for i in range(DOF):
             if self.mode[i] == "pos_vel":
-                ctrl[i] = np.clip(KPOS[i] * (self.q_t[i] - q[i]), -self.vlim[i], self.vlim[i])
+                vmax = min(self.vlim[i], NO_LOAD_SPEED[i])
+                ctrl[i] = np.clip(KPOS[i] * (self.q_t[i] - q[i]), -vmax, vmax)
                 kv[i] = KV[i]
                 if i < 6:
                     extra[i] = bias[i]
