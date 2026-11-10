@@ -119,8 +119,11 @@ on the CPU on a zero-copy crop of the visible 640x360 band of the same frame.
     on the device (same with the client on another host), and the trigger skipping the patched
     path (`ArucoStage::run` takes the same detector path; `full_scan` only turns ROI tracking
     off, which is off by default). The cause is not found: something specific to the trigger
-    frame costs about 5 ms in the gradient-cluster pass. Not yet run: a trigger while a
-    subscription @ 1 runs, which separates the trigger frame from the standby state.
+    frame costs about 5 ms in the gradient-cluster pass. It is not the standby state: with an
+    aruco subscription @ 1 running and 30 triggers in between (same scene, median 6 quads), the
+    trigger frames gave clusters p50 19.3 ms (p90 21.9) against 14.0 ms (p90 18.4) for the 56
+    subscription frames. The per-frame total was the same in that run (p50 51.7 ms trigger,
+    53.3 ms subscription), so the cost is small; the cause is still open.
   - A shell loop polling the API with `curl` every 100 ms on the device raises ArUco wall time
     to about 170 ms (one core); measure with process CPU ticks or a low-overhead script, and
     warm a node client up before timing its first request.
