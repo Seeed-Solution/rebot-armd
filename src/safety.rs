@@ -35,27 +35,42 @@ pub enum FaultReason {
     Other(String),
 }
 
-/// Machine-readable cause of the current Fault / EStop (`observation.fault.code`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum FaultCode {
-    Estop,
-    BusLoss,
-    ThermalTrip,
-    JointLimit,
-    WatchdogTimeout,
-    FollowingError,
-    ControlDeadline,
-    InvalidTelemetry,
-    DriverWriteFailed,
-    HardwareFault,
-    EnableFailed,
-    ServoNoBrake,
-    HandoverUnsettled,
-    GravityCompFailed,
-    /// Collision guard: more trips than `collision.max_auto_resumes` within the window.
-    Collision,
-    Other,
+/// Declares [`FaultCode`] and [`FaultCode::ALL`] from one list, so `ALL` names every variant.
+macro_rules! fault_codes {
+    ($(#[$doc:meta])* pub enum FaultCode { $($(#[$vdoc:meta])* $variant:ident,)* }) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+        pub enum FaultCode { $($(#[$vdoc])* $variant,)* }
+
+        impl FaultCode {
+            /// Every variant, in declaration order.
+            pub const ALL: &'static [FaultCode] = &[$(FaultCode::$variant,)*];
+        }
+    };
+}
+
+fault_codes! {
+    /// Machine-readable cause of the current Fault / EStop (`observation.fault.code`).
+    pub enum FaultCode {
+        Estop,
+        BusLoss,
+        ThermalTrip,
+        JointLimit,
+        WatchdogTimeout,
+        FollowingError,
+        ControlDeadline,
+        InvalidTelemetry,
+        DriverWriteFailed,
+        HardwareFault,
+        EnableFailed,
+        ServoNoBrake,
+        HandoverUnsettled,
+        GravityCompFailed,
+        /// Collision guard: more trips than `collision.max_auto_resumes` within the window.
+        Collision,
+        Other,
+    }
 }
 
 impl FaultCode {
