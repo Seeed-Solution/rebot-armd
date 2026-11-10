@@ -12,6 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
+rebot-sim = "rebot_sim.server:main"
 rebot-sim-fk = "rebot_sim.fk:main"
 
 [build-system]

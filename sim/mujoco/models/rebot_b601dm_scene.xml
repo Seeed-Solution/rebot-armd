@@ -12,7 +12,8 @@
     at y = 0 when closed.
   - Modified 2026-11-11 for rebot-sim: meshes replaced by box primitives, finger
     inertials moved to the jaw blades, joint ranges set to the armd B601-DM profile
-    limits plus 0.1 rad, velocity-servo actuators, table and cube added.
+    limits plus 0.1 rad except the J2 / J3 upper stops at 0 (URDF upper limits: the
+    folded resting pose q = 0 leans on them), velocity-servo actuators, table and cube.
   - This file is a modified Covered Source under CERN-OHL-W-2.0
     (https://ohwr.org/cern_ohl_w_v2.txt) and is not covered by the MIT License of
     this repository. No upstream meshes are included; set REBOT_DEVARM_DIR to a
@@ -73,11 +74,11 @@
         <joint name="joint1" axis="0 0 1" range="-3.24159 3.24159" armature="0.05"/>
         <inertial pos="0.000113614552951627 -0.000616319527051323 0.0236476372671394" mass="0.1613" fullinertia="0.00025207 0.00015464 0.00023416 0 -2.832e-05 0"/>
         <body name="link2" pos="0.020084 0.031625 0.05555" euler="-1.5708 0 0">
-          <joint name="joint2" axis="0 0 -1" range="-2.1944 2.1944" armature="0.05"/>
+          <joint name="joint2" axis="0 0 -1" range="-2.1944 0" armature="0.05"/>
           <inertial pos="-0.13225622308888 -0.0030617036386309 -0.0308306967030205" mass="1.3266" fullinertia="0.00073374 0.01255987 0.01281387 -4.3e-07 8.51e-06 1.28e-06"/>
           <geom name="link2" type="box" pos="-0.132 0 -0.0316" size="0.1605 0.0285 0.0337"/>
           <body name="link3" pos="-0.264 0 0">
-            <joint name="joint3" axis="0 0 1" range="-2.71799 2.71799" armature="0.05"/>
+            <joint name="joint3" axis="0 0 1" range="-2.71799 0" armature="0.05"/>
             <inertial pos="0.121040035791843 -0.0536211076627949 -0.0310137854608077" mass="0.8353" fullinertia="0.00046807 0.00632695 0.00648221 -3.456e-05 -4.26e-05 6e-08"/>
             <geom name="link3" type="box" pos="0.1222 -0.03 -0.0311" size="0.1489 0.0525 0.0401"/>
             <body name="link4" pos="0.2426 -0.054 -0.001625">
