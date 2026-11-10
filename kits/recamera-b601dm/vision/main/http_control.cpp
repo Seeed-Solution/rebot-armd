@@ -193,6 +193,7 @@ void HttpControlServer::accept_loop() {
         socklen_t clen = sizeof(caddr);
         const int cfd = ::accept(sfd, reinterpret_cast<sockaddr*>(&caddr), &clen);
         if (cfd < 0) continue;
+        const uint64_t accept_ms = mono_ms();
 
         std::shared_ptr<ClientContext> ctx = std::make_shared<ClientContext>();
         ctx->fd = cfd;
@@ -207,8 +208,8 @@ void HttpControlServer::accept_loop() {
                 ::close(cfd);
                 continue;
             }
-            ctx->thread = std::thread([this, ctx]() {
-                handle_client(ctx->fd);
+            ctx->thread = std::thread([this, ctx, accept_ms]() {
+                handle_client(ctx->fd, accept_ms);
                 {
                     std::lock_guard<std::mutex> lk(clients_mu_);
                     if (ctx->fd >= 0) {
@@ -287,7 +288,9 @@ ReadStatus read_http_request(int fd, int deadline_ms, std::string& buf, size_t& 
     return ReadStatus::Ok;
 }
 
-void HttpControlServer::handle_client(int fd) {
+void HttpControlServer::handle_client(int fd, uint64_t accept_ms) {
+    RequestTimes times;
+    times.accept_ms = accept_ms;
     std::string buf;
     size_t header_end = std::string::npos;
     size_t content_length = 0;
@@ -323,7 +326,8 @@ void HttpControlServer::handle_client(int fd) {
     }
 
     const std::string body = buf.substr(header_end + 4, has_content_length ? content_length : std::string::npos);
-    const HttpReply r = handle_control_request(ctl_, method, target, body, 0);
+    times.read_ms = mono_ms();
+    const HttpReply r = handle_control_request(ctl_, method, target, body, 0, &times);
     send_reply(fd, r);
 }
 

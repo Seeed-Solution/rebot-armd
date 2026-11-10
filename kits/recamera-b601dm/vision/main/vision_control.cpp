@@ -207,6 +207,7 @@ Pipelines VisionControl::frame_plan(uint64_t frame_ms, Pipelines* triggered) {
     {
         std::lock_guard<std::mutex> lk(mu_);
         input_meter_.add(frame_ms);
+        ++offered_;
         if (expire_locked(frame_ms)) {
             expired = true;
             notify_locked();
@@ -222,6 +223,11 @@ Pipelines VisionControl::frame_plan(uint64_t frame_ms, Pipelines* triggered) {
     }
     if (expired) cv_.notify_all();
     return p;
+}
+
+uint32_t VisionControl::offered() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return offered_;
 }
 
 double VisionControl::input_fps(uint64_t now_ms) const {
@@ -373,6 +379,7 @@ void VisionControl::publish(const VisionResult& r) {
     {
         std::lock_guard<std::mutex> lk(mu_);
         latest_ = r;
+        latest_.done_ms = mono_ms();
         result_meter_.add(r.frame_ms);
     }
     cv_.notify_all();
@@ -599,7 +606,7 @@ static bool parse_pipelines(const nlohmann::json& v, Pipelines& out) {
 static const char* kPipelinesError = "\"pipelines\" must be a non-empty list of \"yolo\", \"aruco\"";
 
 static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, const std::string& body,
-                               uint64_t now_ms) {
+                               uint64_t now_ms, const RequestTimes* times) {
     int wait_ms = 2500;  // aruco-detector default for the single shot
     if (!wait_ms_param(query, wait_ms)) return {400, error_body("wait_ms must be a non-negative integer")};
     nlohmann::json j;
@@ -621,11 +628,16 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, con
     // Served by the first frame newer than this request, with the requested pipelines added
     // to that frame; the camera gate opens meanwhile.
     const uint64_t request_ms = mono_ms();
+    const uint32_t offered0 = ctl.offered();
     VisionResult r;
     bool timeout = false;
+    uint64_t gate_ms = 0;
+    uint64_t wake_ms = 0;
     {
         auto scope = ctl.trigger_scope(request_ms, want);
+        gate_ms = mono_ms();
         timeout = ctl.wait_fresh(baseline, request_ms, want, wait_ms, r);
+        wake_ms = mono_ms();
     }
     std::ostringstream s;
     s << "{\"api_version\":" << kApiVersion;
@@ -635,6 +647,15 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, con
     }
     s << ",\"success\":true,\"requested\":" << pipeline_list(want).dump();
     put_result(s, r, ctl.family(), now_ms);
+    // Where the time went (mono_ms(); "skipped": frames offered after the request that did not
+    // serve it, e.g. grabbed before it).
+    const uint64_t end_ms = mono_ms();
+    s << ",\"timing\":{\"accept_ms\":" << (times ? times->accept_ms : 0)
+      << ",\"read_ms\":" << (times ? times->read_ms : 0) << ",\"request_ms\":" << request_ms
+      << ",\"gate_ms\":" << gate_ms << ",\"wait_ms\":" << r.wait_ms << ",\"grab_ms\":" << r.grab_ms
+      << ",\"frame_ms\":" << r.frame_ms << ",\"done_ms\":" << r.done_ms << ",\"wake_ms\":" << wake_ms
+      << ",\"reply_ms\":" << end_ms << ",\"skipped\":" << (r.offered > offered0 ? r.offered - offered0 - 1 : 0)
+      << "}";
     s << "}";
     return {200, s.str()};
 }
@@ -732,7 +753,7 @@ static std::string subscriptions_body(VisionControl& ctl, uint64_t mono) {
 }
 
 HttpReply handle_control_request(VisionControl& ctl, const std::string& method, const std::string& target,
-                                 const std::string& body, uint64_t now_ms) {
+                                 const std::string& body, uint64_t now_ms, const RequestTimes* times) {
     const size_t q = target.find('?');
     const std::string path = target.substr(0, q);
     const std::string query = q == std::string::npos ? "" : target.substr(q + 1);
@@ -753,7 +774,7 @@ HttpReply handle_control_request(VisionControl& ctl, const std::string& method, 
     } else if (path == "/api/results/latest" && method == "GET") {
         return latest_reply(ctl, query, now_ms);
     } else if (path == "/api/trigger" && method == "POST") {
-        return trigger_reply(ctl, query, body, now_ms);
+        return trigger_reply(ctl, query, body, now_ms, times);
     } else if (path == "/api/subscriptions" && method == "GET") {
         return {200, subscriptions_body(ctl, mono_ms())};
     } else if (path == "/api/subscribe" && method == "POST") {

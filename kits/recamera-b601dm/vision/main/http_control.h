@@ -55,7 +55,7 @@ private:
     };
 
     void accept_loop();
-    void handle_client(int fd);
+    void handle_client(int fd, uint64_t accept_ms);
     void clean_finished_clients();
 
     VisionControl& ctl_;

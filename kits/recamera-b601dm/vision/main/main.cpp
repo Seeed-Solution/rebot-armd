@@ -477,6 +477,9 @@ int main(int argc, char** argv) {
         rv::VisionResult vr;
         vr.frame_id = ++frame_id;
         vr.frame_ms = frame_ms;
+        vr.wait_ms = before_grab_ms;
+        vr.grab_ms = grab_ms;
+        vr.offered = ctl.offered();
         vr.ts_ms = capture_unix_ms(frame.ts_ms);
         vr.mode = ctl.mode();
         vr.width = crop.w;

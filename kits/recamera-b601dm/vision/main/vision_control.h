@@ -107,6 +107,11 @@ struct VisionResult {
     bool undistorted = false;
     std::string markers_json = "[]";  ///< pixels in width x height
     std::string aruco_stages_json;    ///< pipelines.aruco.stages object (ms per stage); empty: omitted
+    // Frame thread timeline (mono_ms()), reported in a trigger's "timing" object.
+    uint64_t wait_ms = 0;     ///< the frame thread started waiting for this frame
+    uint64_t grab_ms = 0;     ///< retrieveFrame() returned it
+    uint64_t done_ms = 0;     ///< publish() (pipelines done)
+    uint32_t offered = 0;     ///< frame_plan() calls up to and including this frame
 };
 
 class VisionControl {
@@ -199,6 +204,8 @@ public:
      * triggers alone.
      */
     Pipelines frame_plan(uint64_t frame_ms, Pipelines* triggered = nullptr);
+    /** frame_plan() calls so far (frames offered to the pipelines). */
+    uint32_t offered() const;
 
     /** Frames offered to frame_plan() and results published, per second (last 2 s). */
     double input_fps(uint64_t now_ms) const;
@@ -279,8 +286,15 @@ private:
     RateGate gate_;
     RateMeter input_meter_;
     RateMeter result_meter_;
+    uint32_t offered_ = 0;
     VisionResult latest_;
     bool stopping_ = false;
+};
+
+/** When the HTTP server accepted the connection and finished reading the request (mono_ms()). */
+struct RequestTimes {
+    uint64_t accept_ms = 0;
+    uint64_t read_ms = 0;
 };
 
 struct HttpReply {
@@ -298,7 +312,7 @@ struct HttpReply {
  *   POST /api/subscribe/<id>/keepalive  DELETE /api/subscribe/<id>  GET /api/subscriptions
  */
 HttpReply handle_control_request(VisionControl& ctl, const std::string& method, const std::string& target,
-                                 const std::string& body, uint64_t now_ms = 0);
+                                 const std::string& body, uint64_t now_ms = 0, const RequestTimes* times = nullptr);
 
 }  // namespace rv
 

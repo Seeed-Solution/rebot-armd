@@ -193,6 +193,12 @@ static void test_trigger_each_mode() {
         CHECK(r["count"] == (want.aruco ? 1 : 0));
         CHECK(r["width"] == 640 && r["height"] == 360);
         CHECK(r["mode"] == mode_name(m));
+        // timeline: request, gate, serving frame, publish, wake-up, reply (mono_ms)
+        const json& tm = r["timing"];
+        CHECK(tm.is_object() && tm["accept_ms"] == 0 && tm["read_ms"] == 0);  // no HTTP server here
+        CHECK(tm["request_ms"] <= tm["gate_ms"] && tm["gate_ms"] <= tm["wake_ms"] && tm["wake_ms"] <= tm["reply_ms"]);
+        CHECK(tm["request_ms"] <= tm["frame_ms"] && tm["frame_ms"] <= tm["done_ms"] && tm["done_ms"] <= tm["wake_ms"]);
+        CHECK(tm["skipped"].get<int>() >= 0);
         // back to standby, continuous state untouched
         CHECK(!c.processing() && !c.continuous_enabled() && c.mode() == m);
         CHECK(c.current_fps() == 1);
