@@ -1,3 +1,4 @@
+pub mod assets;
 pub mod diagnostics;
 pub mod proxy;
 pub mod rest;
@@ -60,6 +61,8 @@ pub fn create_router_full(
     Router::new()
         .route("/", get(serve_index))
         .route("/assets/jmuxer.min.js", get(serve_jmuxer))
+        .route("/assets/three-urdf.min.js", get(assets::serve_three))
+        .route("/assets/model/{*path}", get(assets::serve_model))
         .route("/api/v1/observation", get(rest::get_observation))
         .route("/api/v1/observation/schema", get(rest::get_observation_schema))
         .route("/api/v1/torque", post(rest::set_torque))
