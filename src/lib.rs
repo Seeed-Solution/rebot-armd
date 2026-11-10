@@ -1,4 +1,5 @@
 pub mod api;
+pub mod diagnostics;
 pub mod driver;
 pub mod grasp;
 pub mod gravity;
