@@ -1,0 +1,25 @@
+[project]
+name = "rebot-sim"
+version = "0.1.0"
+description = "MuJoCo physics simulator for armd --follower sim (reBot B601-DM)"
+authors = [
+    { name = "Harvest Su", email = "suharvest@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "mujoco>=4.0.0",
+    "numpy>=2.5.4",
+]
+
+[project.scripts]
+rebot-sim-fk = "rebot_sim.fk:main"
+
+[build-system]
+requires = ["uv_build>=0.11.28,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "websockets>=17.4",
+]
