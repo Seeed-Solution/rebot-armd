@@ -132,10 +132,11 @@ without `/api/mode` (404) get the old inference on / off toggle.
 the cockpit and MCP clients can adapt without probing routes. Schemas from older armd versions
 have no `capabilities` object; it parses as all false, `version` 0.
 
-- Version: `capabilities.version`, currently **4** (`CAPABILITIES_VERSION`). Version 2 added
+- Version: `capabilities.version`, currently **5** (`CAPABILITIES_VERSION`). Version 2 added
   the `vision.*` fields after `detection_proxy`; version 3 added `vision.per_request_pipelines`
   and `vision.subscriptions`; version 4 added `servo_guard` (with the schema fields
-  `servo_max_velocity` and `servo_max_lead_rad`, and `observation.motion_limit`).
+  `servo_max_velocity` and `servo_max_lead_rad`, and `observation.motion_limit`); version 5 added
+  `diagnostics`.
 
 | Field | True when |
 |---|---|
@@ -147,6 +148,7 @@ have no `capabilities` object; it parses as all false, `version` 0.
 | `gravity_comp` | profile, URDF check and driver support the mode; equals `observation.gravity_comp.supported` |
 | `damiao_ranges` | the profile sets per-joint Damiao ranges (the startup check result is `observation.driver_range_check`) |
 | `servo_guard` | always true: armd caps servo streams (speed, lead), ends a blocked stream in a hold and publishes `observation.motion_limit` (version 4) |
+| `diagnostics` | always true: `GET /api/v1/diagnostics/boots` and `/blackbox` exist; their `enabled` says whether this armd writes the files (version 5) |
 | `vision.detection_proxy` | always true: the detection routes exist; reachability of the provider is not checked |
 | `vision.mode_endpoint` | (string) always `/api/v1/vision/mode` |
 | `vision.modes` | (list) modes the provider reports (`off`, `yolo`, `aruco`, `both`); empty when it is unreachable or has no `/api/mode` |
@@ -173,7 +175,7 @@ A kit ships: the armd binary (unchanged core), its profile, optional sidecar pro
 `armd --follower <model> [--follower-port <port>] --config <profile>`.
 
 - Version: not versioned in code; the layout below is version 1 of this document.
-- armd reads `PORT`, `RUST_LOG`, `ARMD_DETECTOR_URL`, `ARMD_GRASP_SETUP` from the environment.
+- armd reads `PORT`, `RUST_LOG`, `ARMD_DETECTOR_URL`, `ARMD_GRASP_SETUP`, `ARMD_LOG_DIR`, `ARMD_BLACKBOX_DIR` from the environment.
 
 The official kit's package (`kits/recamera-b601dm/packaging/`, deb `rebot-teleop` 1.3.4):
 

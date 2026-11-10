@@ -287,6 +287,7 @@ v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 | `/api/v1/safety/e_stop` | POST | 急停，不需要租约 |
 | `/api/v1/torque`、`/api/v1/motion/*`、`/api/v1/action/*`、`/api/v1/mode/gravity_comp`、`/api/v1/safety/clear_fault` | POST | 返回 `409 LEASE_REQUIRED`；请把相同路径作为 WS `command` 发送 |
 | `/api/v1/grasp/setup` | GET | 抓取设置（通过 WS 指令修改） |
+| `/api/v1/diagnostics/boots`、`/api/v1/diagnostics/blackbox?seconds=N[&prev=1]` | GET | 启动记录与黑匣子记录（复位前的状态），无需租约（[格式](docs/agent_action_api.md#diagnostics--诊断)） |
 | `/api/v1/dataset/record/start` / `save` / `discard` | POST | 示教片段录制 |
 | `/api/v1/detection/latest`、`/trigger`、`/inference`、`/ws` | GET / POST / WS | 检测服务代理 |
 
@@ -343,10 +344,16 @@ armd [OPTIONS]
     --follower-port <PORT>   CAN 接口（默认 can0）或串口设备（默认 /dev/ttyUSB0）
     --config <JSON>          ArmConfig profile（关节数必须与 follower 一致）
     --port <PORT>            HTTP / WebSocket 端口（默认 8765，或 $PORT）
+    --log-dir <DIR>          滚动日志 armd.log，1 MiB x 3 个文件（/userdata 存在时默认
+                             /userdata/rebot-teleop/logs，否则关闭；`off` 关闭；或 $ARMD_LOG_DIR）
+    --blackbox-dir <DIR>     黑匣子 bb.jsonl 与 boots.log（/userdata 存在时默认
+                             /userdata/rebot-teleop/blackbox，否则关闭；`off` 关闭；或 $ARMD_BLACKBOX_DIR）
     -h, --help
 ```
 
-环境变量：`RUST_LOG`（日志过滤，默认 `armd=info,tower_http=info`）、`PORT`、`ARMD_DETECTOR_URL`（默认 `http://127.0.0.1:8090`）、`ARMD_GRASP_SETUP`（抓取设置文件，默认 `/userdata/rebot-teleop/grasp_setup.json`）。
+日志同时输出到 stdout。日志或黑匣子目录无法创建或写入时，armd 记一条警告并在没有该功能的情况下运行。黑匣子：每个采样一行 JSON（上力矩或关节运动时 5 Hz，否则每 5 s 一行；上力矩时每行 `fdatasync`），512 KiB x 3 个文件；每次启动在 `boots.log` 追加一行，含上一次启动的最后一条记录。详见 [docs/agent_action_api.md](docs/agent_action_api.md#diagnostics--诊断)。
+
+环境变量：`RUST_LOG`（日志过滤，默认 `armd=info,tower_http=info`）、`PORT`、`ARMD_DETECTOR_URL`（默认 `http://127.0.0.1:8090`）、`ARMD_GRASP_SETUP`（抓取设置文件，默认 `/userdata/rebot-teleop/grasp_setup.json`）、`ARMD_LOG_DIR`、`ARMD_BLACKBOX_DIR`。
 
 不带 `--config` 时，`rebot-dm` 使用内置 B601-DM profile（`src/model.rs` 中的 `ArmConfig::rebot_dm()`），其他 follower 使用通用 6 关节 profile。`--config` 文件是完整的 `ArmConfig` JSON。同一份 B601-DM profile 以数据形式放在 [`kits/recamera-b601dm/profile/rebot-b601dm.json`](kits/recamera-b601dm/profile/rebot-b601dm.json)（有测试保证它与 `rebot_dm()` 一致）；deb 把它安装到 `/usr/share/rebot-teleop/profile/rebot-b601dm.json`，follower 为 `rebot-dm` 时 init 脚本用 `--config` 传入。以下为 rebot-dm 取值的节选：
 

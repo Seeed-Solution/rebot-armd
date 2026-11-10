@@ -418,6 +418,7 @@ WebSocket that holds the lease.
 | `/api/v1/safety/e_stop` | POST | E-stop, no lease needed |
 | `/api/v1/torque`, `/api/v1/motion/*`, `/api/v1/action/*`, `/api/v1/mode/gravity_comp`, `/api/v1/safety/clear_fault` | POST | return `409 LEASE_REQUIRED`; send the same paths as WS `command`s |
 | `/api/v1/grasp/setup` | GET | grasp setup (changed with a WS command) |
+| `/api/v1/diagnostics/boots`, `/api/v1/diagnostics/blackbox?seconds=N[&prev=1]` | GET | boot records and black-box records (state before a reset), no lease needed ([format](docs/agent_action_api.md#diagnostics--诊断)) |
 | `/api/v1/dataset/record/start` / `save` / `discard` | POST | episode recording |
 | `/api/v1/detection/latest`, `/trigger`, `/inference`, `/ws` | GET / POST / WS | detector proxy |
 
@@ -487,12 +488,22 @@ armd [OPTIONS]
     --follower-port <PORT>   CAN interface (default can0) or serial device (default /dev/ttyUSB0)
     --config <JSON>          ArmConfig profile (must match the follower's joint count)
     --port <PORT>            HTTP / WebSocket port (default 8765, or $PORT)
+    --log-dir <DIR>          rotating log armd.log, 1 MiB x 3 files (default /userdata/rebot-teleop/logs
+                             when /userdata exists, else off; `off` disables; or $ARMD_LOG_DIR)
+    --blackbox-dir <DIR>     black box bb.jsonl and boots.log (default /userdata/rebot-teleop/blackbox
+                             when /userdata exists, else off; `off` disables; or $ARMD_BLACKBOX_DIR)
     -h, --help
 ```
 
+The log always goes to stdout as well. When the log or black-box directory cannot be created or
+written, armd logs one warning and runs without it. Black box: one JSON line per sample (5 Hz
+while torqued or moving, every 5 s otherwise; `fdatasync` per line while torqued), 512 KiB x 3
+files; each start appends a line with the previous start's last record to `boots.log`. Details:
+[docs/agent_action_api.md](docs/agent_action_api.md#diagnostics--诊断).
+
 Environment: `RUST_LOG` (log filter, default `armd=info,tower_http=info`), `PORT`,
 `ARMD_DETECTOR_URL` (default `http://127.0.0.1:8090`), `ARMD_GRASP_SETUP` (grasp setup file,
-default `/userdata/rebot-teleop/grasp_setup.json`).
+default `/userdata/rebot-teleop/grasp_setup.json`), `ARMD_LOG_DIR`, `ARMD_BLACKBOX_DIR`.
 
 Without `--config`, `rebot-dm` uses the built-in B601-DM profile (`ArmConfig::rebot_dm()` in
 `src/model.rs`) and the other followers a generic 6-joint profile. A `--config` file is a

@@ -203,6 +203,42 @@ Verified on the reBot B601-DM (see the README). Full contract: [control_safety_c
 
 已在 reBot B601-DM 上实机验证（见 README）。完整契约见 [control_safety_contract.md](control_safety_contract.md#gravity-compensation-hand-guiding--重力补偿拖动示教)。`enable` 必填；`scale` 可选，须在 profile 的 `scale_range` 内（rebot-dm 为 0.5–1.2）；`damping_kd` 可选，一个数（J1–J6 共用）或六个数，每个 0 ≤ kd ≤ `damping_kd_max`（2.0），越界返回 `400 INVALID_COMMAND`。应答不代表已经漂浮，请看 `observation.gravity_comp.phase`（`ramp_in` → `active`）；`enable: false` 后切回 POS_VEL 确认（约 100 ms）时 `control_mode` 变回 `position`。发送前可读 `observation.gravity_comp.blocker`，得到会被拒绝的错误码（可进入时为 null）。模式开启时 servo 帧、`motion/jog`、`motion/home`、预设、`motion/unload`、`torque`、`move_to`、`move_relative`、`grasp` 返回 `409 MOTION_BUSY`；`motion/stop` 与急停结束本模式；`action/gripper` 与录制（REST）可用。REST 的 `POST /api/v1/mode/gravity_comp` 返回 `409 LEASE_REQUIRED` / `LEASE_ACTIVE`，不执行。模式结束原因见 `observation.gravity_comp.last_exit.code`。
 
+## Diagnostics / 诊断
+
+Read-only, no lease, `GET` only. They read the files armd writes under `--blackbox-dir`
+(default `/userdata/rebot-teleop/blackbox`), which survive a reboot or power cut. Responses are
+JSON, at most 2 MB (older lines are cut first, `truncated: true`). Without a black-box
+directory both return `enabled: false` and empty lists.
+
+| Path | Returns |
+|---|---|
+| `/api/v1/diagnostics/boots` | `{"enabled", "boot", "truncated", "boots": [...]}`: one entry per armd start, oldest first |
+| `/api/v1/diagnostics/blackbox?seconds=N` | `{"enabled", "boot", "current_boot", "seconds", "truncated", "records": [...]}`: this start's records of the last N seconds (default 60, max 3600), oldest first |
+| `/api/v1/diagnostics/blackbox?seconds=N&prev=1` | the same for the previous start: the seconds before the last reset or restart |
+
+Boot entry (`boots.log`): `boot` (start counter, persisted in `boot_count`), `uptime_s` (kernel
+uptime at armd start), `kernel_boot_id`, `same_kernel_boot` (false: the kernel booted since the
+previous armd start; true: armd restarted without a reboot; null: unknown), `reset_reason` (SG2002
+`cvi-base` power-on reason: `cold_boot`, `watchdog`, `suspend`, `warm_reset`; null when not
+available; the driver reports unknown causes as `cold_boot`), `armd_version`, `prev_last` (the
+last black-box record of the previous start, or null).
+
+Black-box record (`bb.jsonl`): `boot`, `t_ms` (monotonic ms since armd start), `safety_state`,
+`is_torqued`, `enable_state`, `lease_holder`, `control_mode`, `positions`,
+`commanded_positions`, `velocities`, `torques`, `temperatures` (3 decimals), `feedback_valid`,
+`feedback_age_ms`, `motor_errors`, `motion_limit`, `action` (latest action as `kind:state`),
+`dropped` (samples dropped so far because the writer was busy). Rate: 5 Hz while torqued or a
+joint moves faster than 0.05 rad/s, otherwise one line every 5 s. Each line is `fdatasync`ed
+while torqued. Files: `bb.jsonl` rotated at 512 KiB, two old files kept (`.1`, `.2`); about 10 min
+at 5 Hz (about 490 B per line), about 4 h idle. armd has no CAN error counters, so the record carries none.
+
+只读，无需租约，仅 `GET`。读取 armd 写在 `--blackbox-dir`（默认
+`/userdata/rebot-teleop/blackbox`）下的文件，重启或断电后仍在。响应为 JSON，最大 2 MB（超出时先丢
+最旧的行，`truncated: true`）。没有黑匣子目录时两者都返回 `enabled: false` 和空列表。`boots` 每次
+armd 启动一条（含上一次启动的最后一条记录 `prev_last`、内核 `uptime_s`、`same_kernel_boot`、
+SG2002 上电原因 `reset_reason`）；`blackbox?seconds=N` 返回本次启动最近 N 秒（默认 60，最大
+3600）的记录，`&prev=1` 返回上一次启动的记录，即复位或重启前的那几秒。记录字段与采样率见上文英文部分。
+
 ## Errors / 错误码
 
 | code | status |

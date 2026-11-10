@@ -94,7 +94,7 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 
 `GET /api/v1/observation/schema` 带有 `capabilities`（`src/model.rs` 中的 `Capabilities`），驾驶舱与 MCP 客户端可据此调整，无需探测路由。旧版 armd 的 schema 没有 `capabilities`，解析结果为全 false、`version` 为 0。
 
-- 版本：`capabilities.version`，当前为 **4**（`CAPABILITIES_VERSION`）。版本 2 在 `detection_proxy` 之后加入了 `vision.*` 字段；版本 3 加入了 `vision.per_request_pipelines` 和 `vision.subscriptions`；版本 4 加入了 `servo_guard`（以及 schema 字段 `servo_max_velocity`、`servo_max_lead_rad` 和 `observation.motion_limit`）。
+- 版本：`capabilities.version`，当前为 **5**（`CAPABILITIES_VERSION`）。版本 2 在 `detection_proxy` 之后加入了 `vision.*` 字段；版本 3 加入了 `vision.per_request_pipelines` 和 `vision.subscriptions`；版本 4 加入了 `servo_guard`（以及 schema 字段 `servo_max_velocity`、`servo_max_lead_rad` 和 `observation.motion_limit`）；版本 5 加入了 `diagnostics`。
 
 | 字段 | 为 true 的条件 |
 |---|---|
@@ -106,6 +106,7 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 | `gravity_comp` | profile、URDF 校验和驱动都支持该模式；与 `observation.gravity_comp.supported` 相同 |
 | `damiao_ranges` | profile 设置了分关节达妙范围（启动检查结果在 `observation.driver_range_check`） |
 | `servo_guard` | 恒为 true：armd 对 servo 流限速、限制领先量，受阻时结束流式并保持，观测中发布 `motion_limit`（版本 4） |
+| `diagnostics` | 恒为 true：`GET /api/v1/diagnostics/boots` 和 `/blackbox` 存在；其中 `enabled` 表示本 armd 是否写这些文件（版本 5） |
 | `vision.detection_proxy` | 恒为 true：检测路由存在；不检查感知服务是否可达 |
 | `vision.mode_endpoint` | （字符串）恒为 `/api/v1/vision/mode` |
 | `vision.modes` | （列表）感知服务报告的模式；服务不可达或没有 `/api/mode` 时为空 |
@@ -124,7 +125,7 @@ schema 的其他字段已描述机械臂：`dof`、`joint_names`、`limits`、`w
 套件提供：armd 二进制（核心不改）、profile、可选的旁路进程（感知服务）、启动脚本；启动脚本启动这些进程并运行 `armd --follower <model> [--follower-port <port>] --config <profile>`。
 
 - 版本：代码中未版本化；下面的布局为本文档的第 1 版。
-- armd 从环境变量读取 `PORT`、`RUST_LOG`、`ARMD_DETECTOR_URL`、`ARMD_GRASP_SETUP`。
+- armd 从环境变量读取 `PORT`、`RUST_LOG`、`ARMD_DETECTOR_URL`、`ARMD_GRASP_SETUP`、`ARMD_LOG_DIR`、`ARMD_BLACKBOX_DIR`。
 
 官方套件的安装包（`kits/recamera-b601dm/packaging/`，deb `rebot-teleop` 1.3.4）：
 
