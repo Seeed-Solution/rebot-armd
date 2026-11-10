@@ -231,6 +231,12 @@ v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 
 `src/api/index.html` 是不依赖外部资源的单个 HTML 文件，嵌入二进制并在 `/` 提供。JMuxer（`/assets/jmuxer.min.js`）播放摄像头视频。界面支持中文和英文（页头切换）。
 
+<p align="center">
+  <img src="docs/images/cockpit-phone-landscape.jpg" alt="手机横屏驾驶舱：实时视频叠加摇杆、使能、急停和状态" width="49%">
+  <img src="docs/images/cockpit-desktop-expert.jpg" alt="桌面专家模式驾驶舱：实时视频、关节点动、通信状态和关节表" width="49%">
+</p>
+<sub>截图来自真机 reCamera 的实时视频，力矩关闭。左：手机横屏简化模式；右：桌面专家模式（英文界面）。</sub>
+
 - **简洁 / 专家模式**：简洁模式显示视频和叠加在视频上的摇杆，在 7 自由度机械臂上固定使用视角坐标系；专家模式另有视角 / 基座坐标系切换、关节 / 笛卡尔模式切换、侧视姿态预览、链路状态、关节状态表、数据集录制和键盘快捷键。
 - **关节点动**：两个虚拟摇杆（J1/J2、J3/J5、夹爪）以及键盘。
 - **笛卡尔控制**，两种坐标系：

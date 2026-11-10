@@ -319,6 +319,12 @@ bytes (2.6 MiB, gzip). Memory use on the device has not been measured for this R
 and served at `/`. JMuxer (`/assets/jmuxer.min.js`) plays the camera video. The UI is in
 Chinese and English (language switch in the header).
 
+<p align="center">
+  <img src="docs/images/cockpit-phone-landscape.jpg" alt="Cockpit on a phone in landscape: live camera video with joysticks, Enable, E-stop and status chips" width="49%">
+  <img src="docs/images/cockpit-desktop-expert.jpg" alt="Cockpit in expert mode on a desktop: live video, joint jog, link status and joint table" width="49%">
+</p>
+<sub>Screenshots from the real reCamera with live video, torque off. Left: simple mode on a phone in landscape (Chinese UI). Right: expert mode on a desktop.</sub>
+
 - **Simple / expert mode**: simple shows the video with the joysticks on top and, on the
   7-DOF arm, always drives in the view frame; expert adds the view / base frame switch, the
   joint / Cartesian mode switch, a side-view pose preview, link status, the joint state table,
