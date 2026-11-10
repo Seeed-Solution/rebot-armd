@@ -347,6 +347,21 @@ body.ui-expert .main {
 .tgl input:focus-visible + i { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
 .tgl input:disabled + i { opacity: .5; }
 .col-note { color: var(--sc-status-warning-fg) !important; }
+.pose-list { max-height: none; flex: 1 1 auto; min-height: 0; align-content: start; }
+.pose-list li { align-items: center; }
+.pose-list li .pn { display: grid; gap: 2px; min-width: 0; }
+.pose-list li .pn b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pose-list li .pn small { font-size: 11px; color: var(--sc-color-text-tertiary); }
+.pose-list li .pa { display: flex; gap: 6px; flex: none; }
+.pose-list li .btn { min-height: 36px; padding: 0 12px; font-size: 13px; touch-action: manipulation; }
+.pose-list li .btn.pose-del { color: var(--sc-status-danger-fg); }
+.pose-list li .btn.pose-del.armed { background: var(--sc-status-danger-bg); border-color: #ffccc7; }
+.pose-empty { justify-content: center !important; color: var(--sc-color-text-tertiary); }
+.pose-new { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; }
+.pose-new .field input { width: 100%; min-width: 0; }
+.pose-new .btn { min-height: 44px; }
+.pose-new small { grid-column: 1 / -1; }
+.pose-new small.bad { color: var(--sc-status-danger-fg); }
 .rt-bars { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; padding: 0 16px 12px; }
 .rt-bars[hidden] { display: none; }
 .rt-cap { grid-column: 1 / -1; font-size: 11px; color: var(--sc-color-text-tertiary); }
@@ -1195,6 +1210,9 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
       <svg class="ic-enter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
       <svg class="ic-exit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h3a2 2 0 0 0 2-2V3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M21 16h-3a2 2 0 0 0-2 2v3"/></svg>
     </button>
+    <button class="hd-btn" id="btn-pset" type="button" aria-label="点位" title="点位" data-i18n-aria="pose.title" data-i18n-title="pose.title" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 19 9.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/></svg>
+    </button>
     <button class="hd-btn" id="btn-sset" type="button" aria-label="设置" title="设置" data-i18n-aria="sset.title" data-i18n-title="sset.title" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2l2.4 2.6 3.5-.4.4 3.5L21 10l-1.7 3 1 3.4-3.3 1.3-1.3 3.3-3.4-1-3 1.7-2.3-2.7-3.5.4-.4-3.5L1 14.5l1.7-3-1-3.4L5 6.8 6.3 3.5l3.4 1z" transform="scale(.9) translate(1.3 1.3)"/><circle cx="12" cy="12" r="3.2"/></svg>
     </button>
@@ -1635,6 +1653,22 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     </div>
   </aside>
 </div>
+<div class="calib-mask" id="pset" hidden>
+  <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="pset-h">
+    <div class="calib-head">
+      <h3 id="pset-h" data-i18n="pose.title">点位</h3>
+      <button class="btn calib-x" id="pset-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+    </div>
+    <p class="calib-hint" data-i18n="pose.hint">把机械臂移到想要的位置，起个名字记录下来；之后点「前往」机械臂会自己回到这个位置（需要先使能）。</p>
+    <div class="gset-row pose-new">
+      <label class="field"><span data-i18n="pose.name">名称</span><input id="pose-name" maxlength="64" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="bin_a"></label>
+      <button class="btn btn-primary" id="pose-save" type="button" data-i18n="pose.save">记录当前位置</button>
+      <small id="pose-rule" data-i18n="pose.rule">只能用英文字母、数字、下划线 _ 或短横线 -，最多 64 个字符；同名会覆盖。</small>
+    </div>
+    <ol class="calib-list pose-list" id="pose-list"></ol>
+    <div class="calib-live mono" id="pose-status">--</div>
+  </aside>
+</div>
 <div class="col-banner" id="col-banner" role="alert" aria-live="assertive" hidden>
   <b id="col-title"></b><span id="col-sub"></span>
   <button class="btn" id="col-clear" type="button" data-i18n="en.clear_fault" hidden>⚠️ 点击清除故障</button>
@@ -1822,6 +1856,12 @@ const I18N = {
     'col.set.note': '注意：这台机械臂的碰撞阈值还没有标定，灵敏度只作试用参考；碰撞保护不能代替急停。',
     'col.st.on': '已开启 · 灵敏度{s}', 'col.st.off': '已关闭', 'col.st.saved': '已保存', 'col.st.loading': '读取中…', 'col.st.err': '读取失败：{e}',
     'rt.cap': '残余力矩（实测 − 重力模型）/ 碰撞阈值',
+    'pose.title': '点位', 'pose.hint': '把机械臂移到想要的位置，起个名字记录下来；之后点「前往」机械臂会自己回到这个位置（需要先使能）。',
+    'pose.name': '名称', 'pose.save': '记录当前位置', 'pose.rule': '只能用英文字母、数字、下划线 _ 或短横线 -，最多 64 个字符；同名会覆盖。',
+    'pose.bad': '名称不符合规则：只能用英文字母、数字、_ 或 -，1 到 64 个字符', 'pose.go': '前往', 'pose.del': '删除', 'pose.del.confirm': '确认删除',
+    'pose.empty': '还没有记录的点位', 'pose.count': '共 {n} 个点位', 'pose.loading': '读取中…', 'pose.err': '读取失败：{e}',
+    'pose.saved': '已记录点位 {name}', 'pose.deleted': '已删除点位 {name}', 'pose.moving': '正在前往点位 {name}', 'pose.enable_first': '请先使能机械臂，再前往点位',
+    'pose.code.POSE_NOT_FOUND': '点位不存在（可能已被删除）', 'pose.code.WORKSPACE_VIOLATION': '目标位置超出工作范围', 'pose.code.INVALID_COMMAND': '参数无效：{m}',
     'err.epoch': '控制状态已变化，请检查状态后重新操作', 'err.settling': '机械臂正在交接停稳中，请稍候片刻再操作', 'err.settling2': '机械臂正在交接停稳中，请稍候...', 'err.settling3': '机械臂正在交接停稳中，请稍候再试',
     'err.park_unsupported': '当前机械臂缺少自动收纳所需配置或反馈能力，未启动收纳；可使用回零功能，力矩仍需现场确认',
     'err.preset_unsupported': '当前机械臂不支持自动收纳，未启动运动；可使用回零功能，力矩仍需现场确认',
@@ -1992,6 +2032,12 @@ const I18N = {
     'col.set.note': 'Note: collision thresholds are not calibrated on this arm yet; treat the sensitivity as a trial setting. The guard does not replace the E-stop.',
     'col.st.on': 'On · sensitivity {s}', 'col.st.off': 'Off', 'col.st.saved': 'Saved', 'col.st.loading': 'Loading…', 'col.st.err': 'Read failed: {e}',
     'rt.cap': 'Residual torque (measured − gravity model) / collision threshold',
+    'pose.title': 'Poses', 'pose.hint': 'Move the arm where you want it and record the position under a name. "Go" later brings the arm back there by itself (enable the arm first).',
+    'pose.name': 'Name', 'pose.save': 'Record current position', 'pose.rule': 'Letters, digits, _ or - only, up to 64 characters; an existing name is overwritten.',
+    'pose.bad': 'Invalid name: use letters, digits, _ or -, 1 to 64 characters', 'pose.go': 'Go', 'pose.del': 'Delete', 'pose.del.confirm': 'Confirm',
+    'pose.empty': 'No poses recorded yet', 'pose.count': '{n} poses', 'pose.loading': 'Loading…', 'pose.err': 'Read failed: {e}',
+    'pose.saved': 'Recorded pose {name}', 'pose.deleted': 'Deleted pose {name}', 'pose.moving': 'Moving to pose {name}', 'pose.enable_first': 'Enable the arm first, then go to a pose',
+    'pose.code.POSE_NOT_FOUND': 'Pose not found (maybe deleted)', 'pose.code.WORKSPACE_VIOLATION': 'Target is outside the workspace', 'pose.code.INVALID_COMMAND': 'Invalid parameters: {m}',
     'err.epoch': 'Control state changed, check the state and retry', 'err.settling': 'Arm is settling after handover, wait a moment and retry', 'err.settling2': 'Arm is settling after handover, please wait...', 'err.settling3': 'Arm is settling after handover, retry shortly',
     'err.park_unsupported': 'This arm lacks the configuration or feedback needed for auto-park; park not started. Use Home instead; confirm torque state on site',
     'err.preset_unsupported': 'This arm does not support auto-park; no motion started. Use Home instead; confirm torque state on site',
@@ -4170,7 +4216,7 @@ function initCalib() {
 async function loadSchema() {
   try {
     const sc = await api('/api/v1/observation/schema', undefined, { quiet: true, method: 'GET' });
-    if (sc) { S.caps = sc.capabilities || {}; colOnCaps(); }
+    if (sc) { S.caps = sc.capabilities || {}; colOnCaps(); posesOnCaps(); }
     if (sc && Array.isArray(sc.limits) && sc.limits.length) {
       const oldDof = S.dof;
       S.limits = sc.limits;
@@ -6740,6 +6786,114 @@ $('col-sens').addEventListener('click', (e) => {
 });
 $('col-clear').addEventListener('click', () => clearFault());
 i18nHooks.push(() => { if (!$('sset').hidden) colRenderSet(); COL.barAt = 0; });
+
+/* =================================================================
+   Named poses (capability poses): GET /api/v1/poses, WS /api/v1/poses/save|delete,
+   action /api/v1/action/move_to_pose.
+   ================================================================= */
+const POSE_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const PS = { list: [], loaded: false, delArmed: null, delTimer: 0 };
+function posesOnCaps() { $('btn-pset').hidden = !(S.caps && S.caps.poses); }
+function poseErr(e) {
+  const k = 'pose.code.' + (e.code || '');
+  return I18N.zh[k] !== undefined ? t(k, { m: e.message }) : e.message;
+}
+async function posesLoad(quiet) {
+  if (!quiet) setText($('pose-status'), t('pose.loading'));
+  try {
+    const res = await fetch('/api/v1/poses', { cache: 'no-store' });
+    const d = await res.json();
+    if (!res.ok) throw new Error(d && (d.message || d.error) || 'HTTP ' + res.status);
+    PS.list = Array.isArray(d.poses) ? d.poses : [];
+    PS.loaded = true;
+    posesRender(PS.list.length ? t('pose.count', { n: PS.list.length }) : '--');
+  } catch (e) { posesRender(t('pose.err', { e: e.message })); }
+}
+function posesRender(status) {
+  const ol = $('pose-list');
+  ol.textContent = '';
+  if (!PS.list.length) {
+    const li = document.createElement('li'); li.className = 'pose-empty'; li.textContent = PS.loaded ? t('pose.empty') : '--'; ol.appendChild(li);
+  }
+  for (const p of PS.list) {
+    const li = document.createElement('li');
+    li.dataset.name = p.name;
+    const tcp = p.tcp && Array.isArray(p.tcp.position) ? p.tcp.position.map((v) => Math.round(v * 1000)).join(', ') + ' mm' : '';
+    const when = Number.isFinite(p.saved_at_ms) && p.saved_at_ms > 0 ? new Date(p.saved_at_ms).toLocaleString(LANG === 'zh' ? 'zh-CN' : 'en-GB', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+    li.innerHTML = '<span class="pn"><b></b><small></small></span><span class="pa"><button class="btn pose-go" type="button"></button><button class="btn pose-del" type="button"></button></span>';
+    li.querySelector('b').textContent = p.name;
+    li.querySelector('small').textContent = [tcp, when].filter(Boolean).join(' · ');
+    li.querySelector('.pose-go').textContent = t('pose.go');
+    const del = li.querySelector('.pose-del');
+    const armed = PS.delArmed === p.name;
+    del.textContent = armed ? t('pose.del.confirm') : t('pose.del');
+    del.classList.toggle('armed', armed);
+    ol.appendChild(li);
+  }
+  if (status !== undefined) setText($('pose-status'), status);
+}
+function poseNameCheck() {
+  const v = $('pose-name').value.trim();
+  const ok = POSE_NAME_RE.test(v);
+  const rule = $('pose-rule');
+  rule.classList.toggle('bad', v !== '' && !ok);
+  setText(rule, v !== '' && !ok ? t('pose.bad') : t('pose.rule'));
+  return ok ? v : null;
+}
+async function poseSave() {
+  const name = poseNameCheck();
+  if (!name) { $('pose-name').focus(); setText($('pose-rule'), t('pose.bad')); $('pose-rule').classList.add('bad'); return; }
+  $('pose-save').disabled = true;
+  try {
+    await commandRPC('/api/v1/poses/save', { name });
+    toast(t('pose.saved', { name }), 'ok');
+    $('pose-name').value = '';
+    await posesLoad(true);
+    posesRender(t('pose.saved', { name }));
+  } catch (e) { const m = poseErr(e); toast(m, 'err', e.code || ''); posesRender(m); }
+  finally { $('pose-save').disabled = false; }
+}
+async function poseDelete(name) {
+  if (PS.delArmed !== name) {
+    PS.delArmed = name; clearTimeout(PS.delTimer);
+    PS.delTimer = setTimeout(() => { PS.delArmed = null; posesRender(); }, 3000);
+    posesRender(); return;
+  }
+  PS.delArmed = null; clearTimeout(PS.delTimer);
+  try {
+    await commandRPC('/api/v1/poses/delete', { name });
+    toast(t('pose.deleted', { name }), 'ok');
+    await posesLoad(true);
+    posesRender(t('pose.deleted', { name }));
+  } catch (e) { const m = poseErr(e); toast(m, 'err', e.code || ''); posesRender(m); }
+}
+async function poseGo(name) {
+  if (!isLive() || !isOperational()) { toast(isLive() && !isStopped() && leaseOther() == null ? t('pose.enable_first') : lockReason(), 'err'); flashLock(); return; }
+  try {
+    await commandRPC('/api/v1/action/move_to_pose', { name, speed_scale: clamp(speedScale(), 0.1, 1), tag: 'cockpit' });
+    setText($('pose-status'), t('pose.moving', { name }));
+    toast(t('pose.moving', { name }), 'ok');
+  } catch (e) { const m = poseErr(e); toast(m, 'err', e.code || ''); setText($('pose-status'), m); }
+}
+function psetOpen(open) {
+  $('pset').hidden = !open;
+  if (open) { PS.delArmed = null; posesRender(); posesLoad(false); $('pset-close').focus({ preventScroll: true }); }
+  else $('btn-pset').focus({ preventScroll: true });
+}
+$('btn-pset').addEventListener('click', () => psetOpen(true));
+$('pset-close').addEventListener('click', () => psetOpen(false));
+$('pset').addEventListener('click', (e) => { if (e.target === e.currentTarget) psetOpen(false); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('pset').hidden) psetOpen(false); });
+$('pose-name').addEventListener('input', poseNameCheck);
+$('pose-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); poseSave(); } });
+$('pose-save').addEventListener('click', poseSave);
+$('pose-list').addEventListener('click', (e) => {
+  const b = e.target.closest('button'), li = e.target.closest('li');
+  if (!b || !li || !li.dataset.name) return;
+  if (b.classList.contains('pose-go')) poseGo(li.dataset.name);
+  else if (b.classList.contains('pose-del')) poseDelete(li.dataset.name);
+});
+i18nHooks.push(() => { if (!$('pset').hidden) { posesRender(); poseNameCheck(); } });
 
 function renderCollision(live, ts) {
   const c = live && S.obs ? S.obs.collision : null;
