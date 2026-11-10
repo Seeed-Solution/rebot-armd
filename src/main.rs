@@ -13,6 +13,8 @@ struct CliArgs {
     follower_port: Option<String>,
     port: Option<u16>,
     config: Option<String>,
+    log_dir: Option<String>,
+    blackbox_dir: Option<String>,
 }
 
 fn parse_cli_args() -> Result<CliArgs, String> {
@@ -25,6 +27,8 @@ fn parse_cli_args() -> Result<CliArgs, String> {
                 --follower-port <PORT>   CAN interface or serial device\n\
                 --config <JSON>          ArmConfig profile (must match follower joint count)\n\
                 --port <PORT>            HTTP / WebSocket port (default 8765)\n\
+                --log-dir <DIR>          rotating log armd.log (default /userdata/rebot-teleop/logs when /userdata exists; off disables)\n\
+                --blackbox-dir <DIR>     black box and boot record (default /userdata/rebot-teleop/blackbox when /userdata exists; off disables)\n\
                 --help                   Print help\n\n\
                 Leader-following is not implemented. Hardware failures never fall back to mock.");
             std::process::exit(0);
@@ -36,7 +40,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
         }
         if !matches!(
             arg.as_str(),
-            "--follower" | "--follower-port" | "--port" | "--config"
+            "--follower" | "--follower-port" | "--port" | "--config" | "--log-dir" | "--blackbox-dir"
         ) {
             return Err(format!("Unknown argument: {arg}"));
         }
@@ -48,6 +52,8 @@ fn parse_cli_args() -> Result<CliArgs, String> {
             "--follower" => cli.follower = Some(value),
             "--follower-port" => cli.follower_port = Some(value),
             "--config" => cli.config = Some(value),
+            "--log-dir" => cli.log_dir = Some(value),
+            "--blackbox-dir" => cli.blackbox_dir = Some(value),
             "--port" => {
                 cli.port = Some(
                     value
@@ -91,17 +97,54 @@ fn set_realtime_priority() {
     }
 }
 
+/// Boot record, then the black box; any failure leaves armd running without them.
+fn start_blackbox(supervisor: &ArmSupervisor, cli_dir: Option<&str>, system: &armd::diagnostics::boot::SystemInfo, started: std::time::Instant) {
+    use armd::diagnostics::{self, DiagnosticsState};
+    let Some(dir) = diagnostics::resolve_dir(cli_dir, "ARMD_BLACKBOX_DIR", diagnostics::DEFAULT_BLACKBOX_DIR) else {
+        return;
+    };
+    let result = diagnostics::prepare_dir(&dir)
+        .and_then(|()| diagnostics::boot::record_boot(&dir, system))
+        .and_then(|rec| diagnostics::blackbox::open(&dir, rec.boot, started).map(|bb| (rec, bb)));
+    match result {
+        Ok((rec, bb)) => {
+            info!("Previous start: {}", diagnostics::boot::summary(&rec));
+            info!("Black box recording to {} (boot {})", dir.display(), rec.boot);
+            diagnostics::blackbox::spawn_recorder(supervisor, bb);
+            DiagnosticsState::set_global(DiagnosticsState { blackbox_dir: Some(dir), boot: rec.boot });
+        }
+        Err(e) => warn!("Black box directory {} unavailable ({e}); black box off", dir.display()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let started = std::time::Instant::now();
+    let system = armd::diagnostics::boot::SystemInfo::read();
+    let cli = parse_cli_args()?;
+
+    // stdout as before (the init script redirects it); a copy in a rotating file on
+    // /userdata that survives a reboot.
+    let log_dir = armd::diagnostics::resolve_dir(cli.log_dir.as_deref(), "ARMD_LOG_DIR", armd::diagnostics::DEFAULT_LOG_DIR);
+    let mut log_warning = None;
+    let log_file = log_dir.as_deref().and_then(|dir| match armd::diagnostics::open_log(dir) {
+        Ok(file) => Some(file),
+        Err(e) => {
+            log_warning = Some(format!("Log directory {} unavailable ({e}); logging to stdout only", dir.display()));
+            None
+        }
+    });
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "armd=info,tower_http=info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
+        .with(log_file.map(|file| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(file))))
         .init();
-
-    let cli = parse_cli_args()?;
+    if let Some(warning) = log_warning {
+        warn!("{warning}");
+    }
     let follower = cli.follower.as_deref().unwrap_or("mock");
     let expected_dof = match follower {
         "rebot-dm" => Some(7),
@@ -147,6 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let damiao_limits: Option<Vec<_>> = config.damiao_ranges.as_ref().map(|r| r.iter().map(|r| r.limits()).collect());
     let supervisor = Arc::new(ArmSupervisor::new(config));
+    start_blackbox(&supervisor, cli.blackbox_dir.as_deref(), &system, started);
     armd::grasp::load_into(&supervisor, &armd::grasp::setup_path_from_env()).await;
     match follower {
         "rebot-rs" | "rebot-dm" => {
