@@ -94,7 +94,7 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 
 `GET /api/v1/observation/schema` 带有 `capabilities`（`src/model.rs` 中的 `Capabilities`），驾驶舱与 MCP 客户端可据此调整，无需探测路由。旧版 armd 的 schema 没有 `capabilities`，解析结果为全 false、`version` 为 0。
 
-- 版本：`capabilities.version`，当前为 **3**（`CAPABILITIES_VERSION`）。版本 2 在 `detection_proxy` 之后加入了 `vision.*` 字段；版本 3 加入了 `vision.per_request_pipelines` 和 `vision.subscriptions`。
+- 版本：`capabilities.version`，当前为 **4**（`CAPABILITIES_VERSION`）。版本 2 在 `detection_proxy` 之后加入了 `vision.*` 字段；版本 3 加入了 `vision.per_request_pipelines` 和 `vision.subscriptions`；版本 4 加入了 `servo_guard`（以及 schema 字段 `servo_max_velocity`、`servo_max_lead_rad` 和 `observation.motion_limit`）。
 
 | 字段 | 为 true 的条件 |
 |---|---|
@@ -105,6 +105,7 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 | `grasp` | 7 轴，且设置了 `kinematics`、`gripper_policy`、`grasp`（`/api/v1/action/grasp`） |
 | `gravity_comp` | profile、URDF 校验和驱动都支持该模式；与 `observation.gravity_comp.supported` 相同 |
 | `damiao_ranges` | profile 设置了分关节达妙范围（启动检查结果在 `observation.driver_range_check`） |
+| `servo_guard` | 恒为 true：armd 对 servo 流限速、限制领先量，受阻时结束流式并保持，观测中发布 `motion_limit`（版本 4） |
 | `vision.detection_proxy` | 恒为 true：检测路由存在；不检查感知服务是否可达 |
 | `vision.mode_endpoint` | （字符串）恒为 `/api/v1/vision/mode` |
 | `vision.modes` | （列表）感知服务报告的模式；服务不可达或没有 `/api/mode` 时为空 |
@@ -116,7 +117,7 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 
 `vision.modes` 等字段来自感知服务的 `GET /api/mode`：schema 使用最近一次经 armd 代理的模式请求的响应，超过 2 秒则向服务查询（超时 500 ms）。
 
-schema 的其他字段已描述机械臂：`dof`、`joint_names`、`limits`、`workspace`、`camera_mount`、`kinematics`。随观测变化的状态仍在观测中（`driver_capabilities`、`gravity_comp`、`driver_range_check`）。
+schema 的其他字段已描述机械臂：`dof`、`joint_names`、`limits`、`workspace`、`camera_mount`、`kinematics`、`servo_max_velocity`（各关节实际的 servo 限速）、`servo_max_lead_rad`。随观测变化的状态仍在观测中（`driver_capabilities`、`gravity_comp`、`driver_range_check`、`motion_limit`）。
 
 ### 4. 打包
 

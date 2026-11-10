@@ -554,6 +554,21 @@ impl ArmConfig {
         Ok(())
     }
 
+    /// Joint limits for servo stepping: `max_velocity` capped at `servo_max_velocity`
+    /// per joint, except the 7-DOF gripper (index 6).
+    pub fn servo_limits(&self) -> Vec<JointLimit> {
+        let mut limits = self.limits.clone();
+        if let Some(caps) = &self.servo_max_velocity {
+            let gripper_idx = (self.dof >= 7).then_some(6);
+            for (i, (limit, cap)) in limits.iter_mut().zip(caps).enumerate() {
+                if let (Some(cap), false) = (cap, Some(i) == gripper_idx) {
+                    limit.max_velocity = limit.max_velocity.min(*cap);
+                }
+            }
+        }
+        limits
+    }
+
     /// Factory for reBot Arm B601-DM with 6 arm joints + 1 gripper joint (7 DOF total)
     #[allow(clippy::approx_constant)] // joint limits use the rounded values from the motor profile
     pub fn rebot_dm() -> Self {
@@ -660,6 +675,49 @@ pub struct ArmObservation {
     /// none); null when no lease is held.
     #[serde(default)]
     pub lease_holder: Option<String>,
+    /// Limit that is shaping servo motion right now (speed / lead cap, joint limit,
+    /// workspace, blocked hold); null when none applies. See docs/control_safety_contract.md.
+    #[serde(default)]
+    pub motion_limit: Option<MotionLimit>,
+}
+
+/// Why armd is shaping or refusing the requested motion (`observation.motion_limit`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionLimitReason {
+    /// The servo speed cap (`servo_max_velocity`) bounds the commanded velocity.
+    Speed,
+    /// The servo lead cap (`servo_max_lead_rad`) holds the command back.
+    Lead,
+    /// A servo target at or beyond a joint limit.
+    JointLimit,
+    /// A servo frame rejected by the Cartesian workspace check.
+    Workspace,
+    /// The stream ended in a hold: a joint could not follow (no Fault).
+    Blocked,
+}
+
+impl MotionLimitReason {
+    /// Higher wins when several limits apply at once.
+    pub fn priority(self) -> u8 {
+        match self {
+            Self::Speed => 0,
+            Self::Lead => 1,
+            Self::Workspace => 2,
+            Self::JointLimit => 3,
+            Self::Blocked => 4,
+        }
+    }
+}
+
+/// `observation.motion_limit`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MotionLimit {
+    pub reason: MotionLimitReason,
+    /// 0-based joint index; null when the limit is not tied to one joint (workspace).
+    pub joint: Option<usize>,
+    /// Observation clock (`timestamp`, in ms) when this limit started.
+    pub since_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -714,7 +772,7 @@ pub struct SchemaField {
 }
 
 /// Version of the capability summary in the observation schema (`capabilities`).
-pub const CAPABILITIES_VERSION: u32 = 3;
+pub const CAPABILITIES_VERSION: u32 = 4;
 
 /// Vision features armd offers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -770,6 +828,9 @@ pub struct Capabilities {
     /// The profile sets per-joint Damiao mapping ranges (`damiao_ranges`); the startup
     /// range check result is `observation.driver_range_check`.
     pub damiao_ranges: bool,
+    /// armd bounds servo streams itself (speed and lead caps, blocked hold) and publishes
+    /// `observation.motion_limit`. Present from capabilities version 4.
+    pub servo_guard: bool,
     pub vision: VisionCapabilities,
 }
 
@@ -789,6 +850,7 @@ impl Capabilities {
             grasp: seven && kin && config.gripper_policy.is_some() && config.grasp.is_some(),
             gravity_comp: seven && config.gravity_model.is_some() && config.gravity_comp.is_some(),
             damiao_ranges: config.damiao_ranges.is_some(),
+            servo_guard: true,
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }
@@ -810,6 +872,13 @@ pub struct ObservationSchema {
     pub kinematics: Option<KinematicsModel>,
     #[serde(default)]
     pub capabilities: Capabilities,
+    /// Effective servo-streaming speed cap per joint (rad/s): min(`servo_max_velocity`,
+    /// joint limit); the joint limit where no cap applies. Empty in older schemas.
+    #[serde(default)]
+    pub servo_max_velocity: Vec<f32>,
+    /// Servo lead cap (rad); null in older schemas.
+    #[serde(default)]
+    pub servo_max_lead_rad: Option<f32>,
 }
 
 impl ObservationSchema {
@@ -884,6 +953,8 @@ impl ObservationSchema {
             camera_mount: config.camera_mount.clone(),
             kinematics: config.kinematics,
             capabilities: Capabilities::from_config(config),
+            servo_max_velocity: config.servo_limits().iter().map(|l| l.max_velocity).collect(),
+            servo_max_lead_rad: Some(config.servo_max_lead_rad),
         }
     }
 }

@@ -132,9 +132,10 @@ without `/api/mode` (404) get the old inference on / off toggle.
 the cockpit and MCP clients can adapt without probing routes. Schemas from older armd versions
 have no `capabilities` object; it parses as all false, `version` 0.
 
-- Version: `capabilities.version`, currently **3** (`CAPABILITIES_VERSION`). Version 2 added
+- Version: `capabilities.version`, currently **4** (`CAPABILITIES_VERSION`). Version 2 added
   the `vision.*` fields after `detection_proxy`; version 3 added `vision.per_request_pipelines`
-  and `vision.subscriptions`.
+  and `vision.subscriptions`; version 4 added `servo_guard` (with the schema fields
+  `servo_max_velocity` and `servo_max_lead_rad`, and `observation.motion_limit`).
 
 | Field | True when |
 |---|---|
@@ -145,6 +146,7 @@ have no `capabilities` object; it parses as all false, `version` 0.
 | `grasp` | 7-DOF, `kinematics`, `gripper_policy` and `grasp` set (`/api/v1/action/grasp`) |
 | `gravity_comp` | profile, URDF check and driver support the mode; equals `observation.gravity_comp.supported` |
 | `damiao_ranges` | the profile sets per-joint Damiao ranges (the startup check result is `observation.driver_range_check`) |
+| `servo_guard` | always true: armd caps servo streams (speed, lead), ends a blocked stream in a hold and publishes `observation.motion_limit` (version 4) |
 | `vision.detection_proxy` | always true: the detection routes exist; reachability of the provider is not checked |
 | `vision.mode_endpoint` | (string) always `/api/v1/vision/mode` |
 | `vision.modes` | (list) modes the provider reports (`off`, `yolo`, `aruco`, `both`); empty when it is unreachable or has no `/api/mode` |
@@ -160,8 +162,9 @@ provider's `GET /api/mode`: the schema handler uses the body of the last mode re
 through armd, or asks the provider (500 ms timeout) when that is older than 2 s.
 
 Other parts of the schema already describe the arm: `dof`, `joint_names`, `limits`,
-`workspace`, `camera_mount`, `kinematics`. Per-observation state stays in the observation
-(`driver_capabilities`, `gravity_comp`, `driver_range_check`).
+`workspace`, `camera_mount`, `kinematics`, `servo_max_velocity` (effective servo speed cap per
+joint), `servo_max_lead_rad`. Per-observation state stays in the observation
+(`driver_capabilities`, `gravity_comp`, `driver_range_check`, `motion_limit`).
 
 ### 4. Packaging
 

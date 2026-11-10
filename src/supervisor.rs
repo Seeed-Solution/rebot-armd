@@ -6,7 +6,7 @@ use tokio::sync::{broadcast, RwLock};
 use thiserror::Error;
 
 use crate::driver::{ArmDriver, JointTarget, EnableState, DriverCapabilities};
-use crate::model::{ArmConfig, ArmObservation, ObservationSchema, RestingPosePolicy};
+use crate::model::{ArmConfig, ArmObservation, MotionLimit, MotionLimitReason, ObservationSchema, RestingPosePolicy};
 use crate::recording::{
     write_frames_to_parquet, EpisodeRecorder, EpisodeState, ParquetRecordingError, RecordFrame,
     RecordingError,
@@ -110,6 +110,9 @@ pub struct UnloadSettle {
 /// (rad) over `following_error.persistence_ms` is blocked.
 pub const SERVO_BLOCKED_PROGRESS_RAD: f32 = 0.01;
 
+/// `observation.motion_limit` is cleared this long (s) after the limit last applied.
+pub const MOTION_LIMIT_CLEAR_S: f64 = 0.3;
+
 /// Park started by the lease watchdog: elapsed control-loop time against its budget.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WatchdogPark {
@@ -154,6 +157,12 @@ pub struct SupervisorInner {
     /// Per joint, while the servo lead cap holds it: when the current run started and
     /// the measured position then (blocked detection, [`SERVO_BLOCKED_PROGRESS_RAD`]).
     pub servo_lead_stall: Vec<Option<(Instant, f32)>>,
+    /// Published as `observation.motion_limit`.
+    pub motion_limit: Option<MotionLimit>,
+    /// Observation-clock time (s) `motion_limit` last applied.
+    pub motion_limit_seen_s: f64,
+    /// Holding after a blocked servo stream (keeps `motion_limit` = blocked).
+    pub servo_blocked_hold: bool,
     pub is_torqued: bool,
     pub pending_rearm: bool,
     pub active_trajectory: Option<ActiveTrajectory>,
@@ -261,6 +270,9 @@ impl SupervisorInner {
             servo_target: None,
             servo_settled_ticks: vec![0; dof],
             servo_lead_stall: vec![None; dof],
+            motion_limit: None,
+            motion_limit_seen_s: 0.0,
+            servo_blocked_hold: false,
             is_torqued: false,
             pending_rearm: false,
             active_trajectory: None,
@@ -337,16 +349,49 @@ impl SupervisorInner {
     /// Joint limits used for servo stepping: `config.limits` with `max_velocity` capped
     /// at `config.servo_max_velocity` per joint, except the 7-DOF gripper (index 6).
     pub fn servo_limits(&self) -> Vec<crate::model::JointLimit> {
-        let mut limits = self.config.limits.clone();
-        if let Some(caps) = &self.config.servo_max_velocity {
-            let gripper_idx = (self.config.dof >= 7).then_some(6);
-            for (i, (limit, cap)) in limits.iter_mut().zip(caps).enumerate() {
-                if let (Some(cap), false) = (cap, Some(i) == gripper_idx) {
-                    limit.max_velocity = limit.max_velocity.min(*cap);
-                }
+        self.config.servo_limits()
+    }
+
+    /// Report that `reason` shapes the motion now. The same reason keeps its start time;
+    /// a fresh limit of higher priority is not replaced by a lower one.
+    pub fn note_motion_limit(&mut self, reason: MotionLimitReason, joint: Option<usize>) {
+        let now = self.now_s();
+        if let Some(cur) = self.motion_limit.as_mut() {
+            if cur.reason == reason {
+                cur.joint = joint;
+                self.motion_limit_seen_s = now;
+                return;
+            }
+            if now - self.motion_limit_seen_s < MOTION_LIMIT_CLEAR_S && cur.reason.priority() > reason.priority() {
+                return;
             }
         }
-        limits
+        self.motion_limit = Some(MotionLimit { reason, joint, since_ms: (now * 1000.0) as u64 });
+        self.motion_limit_seen_s = now;
+    }
+
+    /// End of tick: keep `blocked` while the hold lasts, clear a limit not seen for
+    /// [`MOTION_LIMIT_CLEAR_S`].
+    fn expire_motion_limit(&mut self) {
+        if self.servo_blocked_hold {
+            let resumed = self.servo_target.is_some() || self.active_trajectory.is_some() || self.grasp_run.is_some()
+                || self.gravity_comp.is_some() || !self.is_torqued || self.safety.state().is_stopped();
+            if resumed {
+                self.clear_blocked_hold();
+            } else {
+                self.motion_limit_seen_s = self.now_s();
+            }
+        }
+        if self.motion_limit.is_some() && self.now_s() - self.motion_limit_seen_s > MOTION_LIMIT_CLEAR_S {
+            self.motion_limit = None;
+        }
+    }
+
+    fn clear_blocked_hold(&mut self) {
+        self.servo_blocked_hold = false;
+        if self.motion_limit.as_ref().is_some_and(|l| l.reason == MotionLimitReason::Blocked) {
+            self.motion_limit = None;
+        }
     }
 
     /// Servo streaming found joint `joint` blocked: end the stream and hold the measured
@@ -373,6 +418,8 @@ impl SupervisorInner {
         self.following_error_since = None;
         self.servo_lead_stall.fill(None);
         self.safety.mark_motion_finished();
+        self.note_motion_limit(MotionLimitReason::Blocked, Some(joint));
+        self.servo_blocked_hold = true;
     }
 
     /// Workspace policy and camera mount when the Cartesian check applies
@@ -492,6 +539,7 @@ impl SupervisorInner {
             gravity_comp: self.gravity_comp_observation(),
             driver_range_check: self.driver.as_ref().and_then(|d| d.lock().ok().and_then(|drv| drv.range_check())),
             lease_holder: self.lease_holder(),
+            motion_limit: self.motion_limit.clone(),
         }
     }
 
@@ -1340,14 +1388,20 @@ impl SupervisorInner {
         }
 
         // 1. Validate motion command against epoch, safety state, and soft limits
-        self.safety.validate_motion_command(
-            Some(epoch_id),
-            &targets,
-            &self.config.limits,
-        )?;
+        if let Err(e) = self.safety.validate_motion_command(Some(epoch_id), &targets, &self.config.limits) {
+            if let SafetyError::SoftLimitExceeded { joint, .. } = &e {
+                let idx = self.config.limits.iter().position(|l| &l.name == joint);
+                self.note_motion_limit(MotionLimitReason::JointLimit, idx);
+            }
+            return Err(e);
+        }
 
         // 1b. Cartesian workspace: the target may not leave the box further than now.
-        self.check_workspace_path(&self.commanded_positions, [targets.as_slice()])?;
+        if let Err(e) = self.check_workspace_path(&self.commanded_positions, [targets.as_slice()]) {
+            self.note_motion_limit(MotionLimitReason::Workspace, None);
+            return Err(e);
+        }
+        if self.servo_blocked_hold { self.clear_blocked_hold(); }
 
         // Only renew lease and motion frame timestamp AFTER command validation succeeds
         self.last_heartbeat = Instant::now();
@@ -2384,6 +2438,7 @@ impl SupervisorInner {
                     let lead_gate = self.driver.is_some() && self.is_torqued
                         && self.hardware_feedback_fresh(Duration::from_millis(100));
                     let mut lead_capped = vec![false; self.config.dof];
+                    let (mut lead_hit, mut speed_hit, mut limit_hit) = (None::<(usize, f32)>, None, None);
                     for (i, &tgt) in target.iter().enumerate() {
                         if i < self.config.dof {
                             let limit = &step_limits[i];
@@ -2421,8 +2476,25 @@ impl SupervisorInner {
                             next_velocities[i] = v_next;
                             // a lead-capped joint has not reached the client's target
                             reached_flags[i] = reached && !lead_capped[i];
+                            let raw = &self.config.limits[i];
+                            let excess = (clamped_tgt - actual_tgt).abs();
+                            if lead_capped[i] && lead_hit.is_none_or(|(_, e)| excess > e) {
+                                lead_hit = Some((i, excess));
+                            } else if !lead_capped[i] && speed_hit.is_none()
+                                && limit.max_velocity < raw.max_velocity
+                                && v_next.abs() >= limit.max_velocity - 1.0e-3 {
+                                speed_hit = Some(i);
+                            }
+                            if Some(i) != gripper_idx && limit_hit.is_none()
+                                && ((clamped_tgt >= raw.max_position - 1.0e-3 && q_next >= raw.max_position - 5.0e-3)
+                                    || (clamped_tgt <= raw.min_position + 1.0e-3 && q_next <= raw.min_position + 5.0e-3)) {
+                                limit_hit = Some(i);
+                            }
                         }
                     }
+                    if let Some(i) = limit_hit { self.note_motion_limit(MotionLimitReason::JointLimit, Some(i)); }
+                    if let Some((i, _)) = lead_hit { self.note_motion_limit(MotionLimitReason::Lead, Some(i)); }
+                    else if let Some(i) = speed_hit { self.note_motion_limit(MotionLimitReason::Speed, Some(i)); }
                     // Lead-capped without measured progress for the persistence time: blocked.
                     let persistence = Duration::from_millis(self.config.following_error.persistence_ms);
                     let mut blocked = None;
@@ -2608,6 +2680,7 @@ impl SupervisorInner {
         }
 
         self.reconcile_action(servo_dt);
+        self.expire_motion_limit();
         let obs = self.current_observation();
 
         // 5. Record frame if episode recording is active

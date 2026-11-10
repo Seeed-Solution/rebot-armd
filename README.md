@@ -170,7 +170,9 @@ TODO / roadmap:
   joint position, velocity and acceleration limits; temperature trip at `max_temperature`
   (70 °C in the built-in profiles); feedback freshness (250 ms); following-error fault
   (`max_error_rad` 0.5 for 500 ms) and `TRACKING_STALL` for actions; planned-motion speed cap
-  (`planned_max_velocity`, 0.45 rad/s on rebot-dm); Cartesian workspace check (floor, box,
+  (`planned_max_velocity`, 0.45 rad/s on rebot-dm); servo-stream speed and lead caps
+  (`servo_max_velocity`, `servo_max_lead_rad` 0.2) with a hold instead of a Fault when a
+  joint cannot follow, reported as `motion_limit`; Cartesian workspace check (floor, box,
   reach); lease watchdog that parks the arm; refusal to cut torque away from the resting pose
   (`ARM_NOT_AT_RESTING_POSE`), so the arm is not dropped.
 
@@ -182,7 +184,7 @@ one controller + arm + camera + mount (`kits/recamera-b601dm/` is the official r
 (rebot-companion, the cockpit) that uses only armd's API. Core and kits interact through four
 versioned contracts: the arm profile JSON (`--config`, `profile_version` 1), the perception
 provider API (the detection proxy), capability discovery (`capabilities` in the observation
-schema, version 3) and packaging. `./scripts/build_deb.sh --flavor lite` builds the core
+schema, version 4) and packaging. `./scripts/build_deb.sh --flavor lite` builds the core
 alone, the default `--flavor recamera` the core with the reCamera kit. Details:
 [docs/architecture.md](docs/architecture.md).
 
@@ -410,7 +412,7 @@ WebSocket that holds the lease.
 
 | Path | Method | Purpose |
 |---|---|---|
-| `/api/v1/observation` | GET | positions, velocities, torques, temperatures, safety state, `commanded_positions`, latest `action`, driver capabilities, `driver_range_check` (Damiao mapping ranges read from the motors at startup) |
+| `/api/v1/observation` | GET | positions, velocities, torques, temperatures, safety state, `commanded_positions`, latest `action`, driver capabilities, `driver_range_check` (Damiao mapping ranges read from the motors at startup), `motion_limit` (servo speed / lead cap, joint limit, workspace or blocked hold shaping the motion; [contract](docs/control_safety_contract.md#servo-streaming-guard--流式控制保护)) |
 | `/api/v1/observation/schema` | GET | DOF, joint names, limits, workspace, camera mount, `capabilities` ([fields](docs/architecture.md#3-capability-discovery)) |
 | `/api/v1/ws` | WS | lease (`acquire_lease`, `heartbeat`), `command` / `command_ack` / `command_reject`, telemetry |
 | `/api/v1/safety/e_stop` | POST | E-stop, no lease needed |
@@ -513,6 +515,8 @@ complete `ArmConfig` JSON. The same B601-DM profile is shipped as data in
   ],
   "home_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0],
   "planned_max_velocity": 0.45,
+  "servo_max_velocity": [0.45, 0.45, 0.45, 1.5, 1.5, 1.5, null],
+  "servo_max_lead_rad": 0.2,
   "workspace": {"floor_z_m": 0.0, "box_min_m": [-0.6, -0.6, -1.0], "box_max_m": [0.6, 0.6, 0.8], "max_reach_m": 0.52}
 }
 ```

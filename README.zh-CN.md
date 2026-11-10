@@ -137,11 +137,11 @@ TODO / 路线图：
 
 - **控制循环**：固定周期 tick（`control_frequency_hz`，内置 profile 为 50 Hz，允许范围 1..1000）。tick 晚于 80 ms 时锁存安全保持，不继续执行旧轨迹。视频不经过 armd：驾驶舱用 JMuxer 直接播放摄像头的 H.264 WebSocket 流（`ws://<host>:8001/`）。
 - **租约**：执行器权限属于发送了 `acquire_lease` 并持续发送 `heartbeat` 的 WebSocket 连接（租约超时 2500 ms）。每条 `command` 都带租约 `generation`、当前安全 `epoch_id` 和严格递增的 `request_id`。REST 执行器路由（`torque`、`motion/*`、`action/*`、`clear_fault`）返回 `409 LEASE_REQUIRED`，不执行动作。急停例外：REST 与 WebSocket 都不需要租约。其他客户端可用 `force` 接管，接管后在机械臂稳定前拒绝运动（`HANDOVER_SETTLING`）。
-- **安全层**（详见 [docs/control_safety_contract.md](docs/control_safety_contract.md)）：关节位置、速度、加速度限位；`max_temperature` 温度保护（内置 profile 为 70 °C）；反馈新鲜度（250 ms）；跟随误差故障（`max_error_rad` 0.5，持续 500 ms）及动作的 `TRACKING_STALL`；规划运动限速（`planned_max_velocity`，rebot-dm 为 0.45 rad/s）；笛卡尔工作空间检查（地面、包围盒、伸展范围）；租约看门狗自动收纳；不在收纳位时拒绝断力矩（`ARM_NOT_AT_RESTING_POSE`），避免机械臂下坠。
+- **安全层**（详见 [docs/control_safety_contract.md](docs/control_safety_contract.md)）：关节位置、速度、加速度限位；`max_temperature` 温度保护（内置 profile 为 70 °C）；反馈新鲜度（250 ms）；跟随误差故障（`max_error_rad` 0.5，持续 500 ms）及动作的 `TRACKING_STALL`；规划运动限速（`planned_max_velocity`，rebot-dm 为 0.45 rad/s）；servo 流式限速与领先量上限（`servo_max_velocity`、`servo_max_lead_rad` 0.2），关节跟不上时保持位置而不报 Fault，并在观测 `motion_limit` 中报告；笛卡尔工作空间检查（地面、包围盒、伸展范围）；租约看门狗自动收纳；不在收纳位时拒绝断力矩（`ARM_NOT_AT_RESTING_POSE`），避免机械臂下坠。
 
 ### 核心、套件与 agent
 
-仓库分三层：**核心**（`armd`，即本 crate）；**套件**，把核心适配到一种 控制器 + 机械臂 + 相机 + 支架 组合（`kits/recamera-b601dm/` 是官方参考套件，`kits/_template/` 是第三方套件的起点）；**agent 层**（rebot-companion、驾驶舱），只使用 armd 的 API。核心与套件通过四个带版本的契约交互：机械臂 profile JSON（`--config`，`profile_version` 1）、感知服务 API（检测代理）、能力发现（观测 schema 中的 `capabilities`，版本 3）和打包。`./scripts/build_deb.sh --flavor lite` 只构建核心，默认的 `--flavor recamera` 构建核心加 reCamera 套件。详见 [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md)。
+仓库分三层：**核心**（`armd`，即本 crate）；**套件**，把核心适配到一种 控制器 + 机械臂 + 相机 + 支架 组合（`kits/recamera-b601dm/` 是官方参考套件，`kits/_template/` 是第三方套件的起点）；**agent 层**（rebot-companion、驾驶舱），只使用 armd 的 API。核心与套件通过四个带版本的契约交互：机械臂 profile JSON（`--config`，`profile_version` 1）、感知服务 API（检测代理）、能力发现（观测 schema 中的 `capabilities`，版本 4）和打包。`./scripts/build_deb.sh --flavor lite` 只构建核心，默认的 `--flavor recamera` 构建核心加 reCamera 套件。详见 [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md)。
 
 ---
 
@@ -281,7 +281,7 @@ v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 
 | 路径 | 方法 | 用途 |
 |---|---|---|
-| `/api/v1/observation` | GET | 位置、速度、力矩、温度、安全状态、`commanded_positions`、最近的 `action`、驱动能力、`driver_range_check`（启动时从电机读出的达妙映射范围） |
+| `/api/v1/observation` | GET | 位置、速度、力矩、温度、安全状态、`commanded_positions`、最近的 `action`、驱动能力、`driver_range_check`（启动时从电机读出的达妙映射范围）、`motion_limit`（正在作用的 servo 限速 / 领先量上限、关节限位、工作空间或受阻保持；[契约](docs/control_safety_contract.md#servo-streaming-guard--流式控制保护)） |
 | `/api/v1/observation/schema` | GET | 自由度、关节名、限位、工作空间、相机安装参数、`capabilities`（[字段](docs/architecture.zh-CN.md#3-能力发现)） |
 | `/api/v1/ws` | WS | 租约（`acquire_lease`、`heartbeat`）、`command` / `command_ack` / `command_reject`、遥测 |
 | `/api/v1/safety/e_stop` | POST | 急停，不需要租约 |
@@ -363,6 +363,8 @@ armd [OPTIONS]
   ],
   "home_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0],
   "planned_max_velocity": 0.45,
+  "servo_max_velocity": [0.45, 0.45, 0.45, 1.5, 1.5, 1.5, null],
+  "servo_max_lead_rad": 0.2,
   "workspace": {"floor_z_m": 0.0, "box_min_m": [-0.6, -0.6, -1.0], "box_max_m": [0.6, 0.6, 0.8], "max_reach_m": 0.52}
 }
 ```
