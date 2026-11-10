@@ -321,8 +321,10 @@ bytes (2.6 MiB, gzip). Memory use on the device has not been measured for this R
 ## Web cockpit
 
 `src/api/index.html` is a single HTML file without external resources, embedded in the binary
-and served at `/`. JMuxer (`/assets/jmuxer.min.js`) plays the camera video. The UI is in
-Chinese and English (language switch in the header).
+and served at `/`. JMuxer (`/assets/jmuxer.min.js`) plays the camera video. The 3D view's
+three.js + urdf-loader bundle (`/assets/three-urdf.min.js`, 149 KB gzip) is also embedded and is
+fetched only when the 3D view is opened. The UI is in Chinese and English (language switch in
+the header).
 
 <p align="center">
   <img src="docs/images/cockpit-phone-landscape.jpg" alt="Cockpit on a phone in landscape: live camera video with joysticks, Enable, E-stop and status chips" width="49%">
@@ -368,11 +370,25 @@ Chinese and English (language switch in the header).
   and says what to check before clearing (for example `BUS_LOSS`: check the motor cable and power).
 - **Collision guard** (only when `capabilities.collision_guard` is true): while
   `observation.collision.active`, a red banner names the joint, its residual torque and the
-  auto-resume countdown; it cannot be closed. After escalation to the `COLLISION` fault it shows
+  auto-resume countdown; it cannot be closed. During the hold the status reads "Collision hold"
+  and jog, sticks, presets, home, gripper and pose "Go" are locked; E-stop and the enable switch
+  stay usable. The sensitivity buttons are disabled while the guard is off. After escalation to the `COLLISION` fault it shows
   the clear-fault button. The settings drawer (gear in the header) switches the guard on or off
   and sets the sensitivity (low / medium / high); the thresholds are not calibrated on the arm
   yet. Expert mode shows J1–J6 residual torque bars against the thresholds (green below 50 %,
   yellow up to 100 %, red when tripped).
+- **3D view** ("3D" button on the video): the arm drawn from `reBot-DevArm_gripper.urdf` with the
+  measured joint angles (solid) and `commanded_positions` (translucent blue, shown when they
+  differ), a floor grid, the workspace box, keep-out boxes (`GET /api/v1/workspace/keepout`) and
+  stored poses as orange dots. Drag to rotate, pinch or scroll to zoom. J1–J6 use the motor angle
+  as the URDF angle; J7 is mapped to the finger travel (0–42.5 mm) between `gripper_policy`
+  `closed_rad` and `open_rad`. armd serves the URDF and meshes read-only from the asset directory
+  (`assets/`, else `/usr/share/rebot-teleop/assets/`, or `ARMD_ASSET_DIR`) at `/assets/model/`;
+  the kit `.deb` installs 34 decimated B601-DM meshes (2.8 MB). Without the meshes (lite
+  tarball) the view draws a stick figure through the URDF joint frames. It renders at most
+  30 frames/s and only when the pose, the boxes or the camera changed. The rendered `end_link`
+  matches armd's `kinematics::fk` within 0.001 mm at the points in `tests/fixtures/fk_points.json`
+  (`scripts/view3d_shots.mjs`).
 - **Poses drawer** (only when `capabilities.poses` is true): record the current position under
   a name (`^[A-Za-z0-9_-]{1,64}$`), move to a stored pose (`move_to_pose` action at the cockpit
   speed) or delete it.
