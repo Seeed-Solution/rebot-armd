@@ -106,6 +106,10 @@ pub struct UnloadSettle {
     pub last_report_s: Option<f64>,
 }
 
+/// Servo streaming: a lead-capped joint whose measured position moves less than this
+/// (rad) over `following_error.persistence_ms` is blocked.
+pub const SERVO_BLOCKED_PROGRESS_RAD: f32 = 0.01;
+
 /// Park started by the lease watchdog: elapsed control-loop time against its budget.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WatchdogPark {
@@ -147,6 +151,9 @@ pub struct SupervisorInner {
     pub target_positions: Vec<f32>,
     pub servo_target: Option<Vec<f32>>,
     pub servo_settled_ticks: Vec<u32>,
+    /// Per joint, while the servo lead cap holds it: when the current run started and
+    /// the measured position then (blocked detection, [`SERVO_BLOCKED_PROGRESS_RAD`]).
+    pub servo_lead_stall: Vec<Option<(Instant, f32)>>,
     pub is_torqued: bool,
     pub pending_rearm: bool,
     pub active_trajectory: Option<ActiveTrajectory>,
@@ -253,6 +260,7 @@ impl SupervisorInner {
             target_positions,
             servo_target: None,
             servo_settled_ticks: vec![0; dof],
+            servo_lead_stall: vec![None; dof],
             is_torqued: false,
             pending_rearm: false,
             active_trajectory: None,
@@ -324,6 +332,47 @@ impl SupervisorInner {
             }
         }
         limits
+    }
+
+    /// Joint limits used for servo stepping: `config.limits` with `max_velocity` capped
+    /// at `config.servo_max_velocity` per joint, except the 7-DOF gripper (index 6).
+    pub fn servo_limits(&self) -> Vec<crate::model::JointLimit> {
+        let mut limits = self.config.limits.clone();
+        if let Some(caps) = &self.config.servo_max_velocity {
+            let gripper_idx = (self.config.dof >= 7).then_some(6);
+            for (i, (limit, cap)) in limits.iter_mut().zip(caps).enumerate() {
+                if let (Some(cap), false) = (cap, Some(i) == gripper_idx) {
+                    limit.max_velocity = limit.max_velocity.min(*cap);
+                }
+            }
+        }
+        limits
+    }
+
+    /// Servo streaming found joint `joint` blocked: end the stream and hold the measured
+    /// pose with torque on, without a Fault. The gripper keeps its command so that a held
+    /// object is not released. A tracking error that persists in this hold latches the
+    /// usual tracking Fault (the stream is no longer active).
+    fn enter_servo_blocked_hold(&mut self, joint: usize, why: &str) {
+        tracing::warn!(
+            "Joint {} blocked during servo streaming ({why}; cmd {:.3} meas {:.3} rad): stream stopped, holding position",
+            joint + 1, self.commanded_positions[joint], self.measured_positions[joint]);
+        let gripper_idx = (self.config.dof >= 7).then_some(6);
+        let grip_cmd = gripper_idx.map(|g| self.commanded_positions[g]);
+        self.stop_motion();
+        if self.measured_positions.iter().all(|q| q.is_finite()) {
+            for (i, (c, m)) in self.commanded_positions.iter_mut().zip(&self.measured_positions).enumerate() {
+                let l = &self.config.limits[i];
+                *c = m.clamp(l.min_position, l.max_position);
+            }
+        }
+        if let (Some(g), Some(c)) = (gripper_idx, grip_cmd) { self.commanded_positions[g] = c; }
+        self.target_positions = self.commanded_positions.clone();
+        self.commanded_velocities.fill(0.0);
+        self.commanded_accelerations.fill(0.0);
+        self.following_error_since = None;
+        self.servo_lead_stall.fill(None);
+        self.safety.mark_motion_finished();
     }
 
     /// Workspace policy and camera mount when the Cartesian check applies
@@ -2218,7 +2267,11 @@ impl SupervisorInner {
                 .map(|(i, (q, measured))| (i, *q, *measured));
             if let Some((joint, cmd, meas)) = outside {
                 let since = self.following_error_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= Duration::from_millis(self.config.following_error.persistence_ms) {
+                if since.elapsed() >= Duration::from_millis(self.config.following_error.persistence_ms)
+                    && self.servo_target.is_some() && self.measured_positions.iter().all(|q| q.is_finite()) {
+                    // Streaming toward a target the joint cannot follow: a recoverable hold.
+                    self.enter_servo_blocked_hold(joint, "tracking error above the bound");
+                } else if since.elapsed() >= Duration::from_millis(self.config.following_error.persistence_ms) {
                     self.stop_motion();
                     self.commanded_positions = self.measured_positions.clone();
                     self.target_positions = self.measured_positions.clone();
@@ -2322,18 +2375,35 @@ impl SupervisorInner {
                     let mut next_positions = self.commanded_positions.clone();
                     let mut next_velocities = self.commanded_velocities.clone();
                     let mut infeasible = None;
-                    // teleop streaming keeps the raw joint limits: clients bound their own lead (the cockpit keeps
-                    // it under 0.2 rad), so the tracking error cannot approach the fault threshold here
-                    let step_limits = self.config.limits.clone();
+                    // Speed cap: joint limits capped by servo_max_velocity. Lead cap: in the direction
+                    // of travel the stepper target stays within servo_max_lead_rad of the measured
+                    // position (torque on, fresh feedback), so the tracking error stays below the bound
+                    // whatever the client sends.
+                    let step_limits = self.servo_limits();
+                    let lead = self.config.servo_max_lead_rad;
+                    let lead_gate = self.driver.is_some() && self.is_torqued
+                        && self.hardware_feedback_fresh(Duration::from_millis(100));
+                    let mut lead_capped = vec![false; self.config.dof];
                     for (i, &tgt) in target.iter().enumerate() {
                         if i < self.config.dof {
                             let limit = &step_limits[i];
                             let clamped_tgt = tgt.clamp(limit.min_position, limit.max_position);
-                            let actual_tgt = if i == 6 && self.gripper_stalled {
+                            let mut actual_tgt = if i == 6 && self.gripper_stalled {
                                 self.commanded_positions[6]
                             } else {
                                 clamped_tgt
                             };
+                            let meas = self.measured_positions[i];
+                            if lead_gate && Some(i) != gripper_idx && meas.is_finite() {
+                                let q = next_positions[i];
+                                if actual_tgt > q && actual_tgt > meas + lead {
+                                    actual_tgt = meas + lead;
+                                    lead_capped[i] = true;
+                                } else if actual_tgt < q && actual_tgt < meas - lead {
+                                    actual_tgt = meas - lead;
+                                    lead_capped[i] = true;
+                                }
+                            }
                             let step = Self::bounded_servo_step_with_jerk(
                                 next_positions[i],
                                 actual_tgt,
@@ -2349,11 +2419,28 @@ impl SupervisorInner {
                             };
                             next_positions[i] = q_next;
                             next_velocities[i] = v_next;
-                            reached_flags[i] = reached;
+                            // a lead-capped joint has not reached the client's target
+                            reached_flags[i] = reached && !lead_capped[i];
                         }
+                    }
+                    // Lead-capped without measured progress for the persistence time: blocked.
+                    let persistence = Duration::from_millis(self.config.following_error.persistence_ms);
+                    let mut blocked = None;
+                    for (i, &capped) in lead_capped.iter().enumerate() {
+                        let meas = self.measured_positions[i];
+                        self.servo_lead_stall[i] = match (capped, self.servo_lead_stall[i]) {
+                            (false, _) => None,
+                            (true, Some((t0, m0))) if (meas - m0).abs() <= SERVO_BLOCKED_PROGRESS_RAD => {
+                                if t0.elapsed() >= persistence && blocked.is_none() { blocked = Some(i); }
+                                Some((t0, m0))
+                            }
+                            (true, _) => Some((Instant::now(), meas)),
+                        };
                     }
                     if let Some(i) = infeasible {
                         self.latch_servo_fault(i);
+                    } else if let Some(i) = blocked {
+                        self.enter_servo_blocked_hold(i, "no progress at the lead cap");
                     } else {
                         self.commanded_positions = next_positions;
                         self.commanded_velocities = next_velocities;

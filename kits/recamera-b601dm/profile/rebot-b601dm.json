@@ -112,6 +112,16 @@
   "max_jerk": 50.0,
   "gravity_model": "RebotDevArm",
   "planned_max_velocity": 0.45,
+  "servo_max_velocity": [
+    0.45,
+    0.45,
+    0.45,
+    1.5,
+    1.5,
+    1.5,
+    null
+  ],
+  "servo_max_lead_rad": 0.2,
   "kinematics": "RebotDevArm",
   "workspace": {
     "floor_z_m": 0.0,

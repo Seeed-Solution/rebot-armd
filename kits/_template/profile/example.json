@@ -72,6 +72,8 @@
   "max_jerk": null,
   "gravity_model": null,
   "planned_max_velocity": null,
+  "servo_max_velocity": null,
+  "servo_max_lead_rad": 0.2,
   "kinematics": null,
   "workspace": null,
   "camera_mount": {

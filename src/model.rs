@@ -323,6 +323,13 @@ fn default_profile_version() -> u32 {
     1
 }
 
+/// Default for [`ArmConfig::servo_max_lead_rad`].
+pub const DEFAULT_SERVO_MAX_LEAD_RAD: f32 = 0.2;
+
+fn default_servo_max_lead_rad() -> f32 {
+    DEFAULT_SERVO_MAX_LEAD_RAD
+}
+
 /// Robotic arm hardware/control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArmConfig {
@@ -346,11 +353,21 @@ pub struct ArmConfig {
     pub max_jerk: Option<f32>,
     #[serde(default)]
     pub gravity_model: Option<GravityModel>,
-    /// Joint speed cap (rad/s) for planned motion (jog, home, presets, park) and
-    /// servo stepping. Applies to every joint except the 7-DOF gripper (index 6).
+    /// Joint speed cap (rad/s) for planned motion (jog, home, presets, park).
+    /// Applies to every joint except the 7-DOF gripper (index 6).
     /// Keeps POS_VEL lag below the following-error bound. None = no extra cap.
     #[serde(default)]
     pub planned_max_velocity: Option<f32>,
+    /// Per-joint speed cap (rad/s) for servo streaming, one entry per joint (`null` =
+    /// no cap); the servo step uses min(entry, joint limit). The 7-DOF gripper is
+    /// always exempt. None keeps the joint limits.
+    #[serde(default)]
+    pub servo_max_velocity: Option<Vec<Option<f32>>>,
+    /// Servo streaming: the commanded position of every joint except the 7-DOF gripper
+    /// stays within this distance of the measured position in the direction of travel
+    /// (torque on, fresh feedback). Must be below `following_error.max_error_rad`.
+    #[serde(default = "default_servo_max_lead_rad")]
+    pub servo_max_lead_rad: f32,
     /// Kinematic model; None disables the workspace check and Cartesian actions.
     #[serde(default)]
     pub kinematics: Option<KinematicsModel>,
@@ -412,6 +429,8 @@ impl Default for ArmConfig {
             max_jerk: None,
             gravity_model: None,
             planned_max_velocity: None,
+            servo_max_velocity: None,
+            servo_max_lead_rad: DEFAULT_SERVO_MAX_LEAD_RAD,
             kinematics: None,
             workspace: None,
             camera_mount: CameraMount::default(),
@@ -460,6 +479,17 @@ impl ArmConfig {
                     "planned_max_velocity {cap} rad/s implies an expected lag {:.3} rad at or above the following-error bound {} rad",
                     cap / POSVEL_LAG_GAIN, self.following_error.max_error_rad));
             }
+        }
+        if let Some(caps) = &self.servo_max_velocity {
+            if caps.len() != self.dof || caps.iter().flatten().any(|v| !v.is_finite() || *v <= 0.0) {
+                return Err(format!("servo_max_velocity needs {} entries, each null or positive finite", self.dof));
+            }
+        }
+        if !self.servo_max_lead_rad.is_finite() || self.servo_max_lead_rad <= 0.0
+            || self.servo_max_lead_rad >= self.following_error.max_error_rad {
+            return Err(format!(
+                "servo_max_lead_rad {} must be positive and below the following-error bound {} rad",
+                self.servo_max_lead_rad, self.following_error.max_error_rad));
         }
         if self.kinematics.is_some() && self.dof != 7 {
             return Err("kinematics requires dof == 7 (6 arm joints + gripper)".into());
@@ -565,6 +595,9 @@ impl ArmConfig {
             max_jerk: Some(50.0),
             gravity_model: Some(GravityModel::RebotDevArm),
             planned_max_velocity: Some(0.45),
+            // J1-J3 measured trackable at 0.45 rad/s; wrist joints follow faster.
+            servo_max_velocity: Some(vec![Some(0.45), Some(0.45), Some(0.45), Some(1.5), Some(1.5), Some(1.5), None]),
+            servo_max_lead_rad: DEFAULT_SERVO_MAX_LEAD_RAD,
             kinematics: Some(KinematicsModel::RebotDevArm),
             workspace: Some(WorkspacePolicy::rebot_dm()),
             camera_mount: CameraMount::default(),
