@@ -312,6 +312,50 @@ body.ui-expert .main {
 .gset-row .btn { min-height: 44px; touch-action: manipulation; }
 .gset-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .gset-grid .field input { width: 100%; min-width: 0; }
+/* header icon buttons (settings, poses); same look as the full-screen button */
+.hd-btn { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; padding: 0; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral); background: #fff; color: var(--sc-color-text-secondary); cursor: pointer; touch-action: manipulation; }
+.hd-btn[hidden] { display: none; }
+.hd-btn svg { width: 18px; height: 18px; }
+.hd-btn:hover { color: var(--sc-color-text-primary); border-color: var(--sc-color-primary); }
+.hd-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+/* narrow phones: short UI-mode labels make room for the header icon buttons */
+@media (max-width: 479px) {
+  .topbar:has(.hd-btn:not([hidden])) .ui-switch .full { display: none; }
+  .topbar:has(.hd-btn:not([hidden])) .ui-switch .short { display: inline; }
+  .topbar:has(.hd-btn:not([hidden])) .ui-switch button { padding: 0 10px; }
+  .hd-btn { width: 32px; }
+}
+@media (max-width: 389px) {
+  .topbar:has(.hd-btn:not([hidden])) { gap: 4px; }
+  .hd-btn { width: 28px; }
+  .topbar:has(.hd-btn:not([hidden])) .ui-switch button { padding: 0 8px; }
+}
+/* collision guard: protective-stop banner, settings, residual torque bars */
+.col-banner { position: fixed; z-index: 400; top: calc(var(--head-h) + 8px); left: 50%; transform: translateX(-50%); width: min(94vw, 560px);
+  display: grid; gap: 4px; padding: 10px 14px; border-radius: var(--sc-radius-lg); background: #c73c3e; color: #fff; box-shadow: 0 10px 28px rgba(199, 60, 62, 0.35); font-size: 14px; line-height: 1.45; }
+.col-banner[hidden] { display: none; }
+.col-banner b { font-weight: 700; }
+.col-banner span { font-size: 12px; opacity: .95; }
+.col-banner .btn { justify-self: start; margin-top: 4px; min-height: 36px; background: #fff; color: #c73c3e; border-color: #fff; font-weight: 700; }
+.col-banner .btn[hidden] { display: none; }
+.tgl { position: relative; display: inline-block; width: 44px; height: 26px; flex: none; }
+.tgl input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+.tgl i { position: absolute; inset: 0; border-radius: 13px; background: #cbd5e1; transition: background .15s; pointer-events: none; }
+.tgl i::after { content: ''; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.2); transition: transform .15s; }
+.tgl input:checked + i { background: var(--sc-color-primary); }
+.tgl input:checked + i::after { transform: translateX(18px); }
+.tgl input:focus-visible + i { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+.tgl input:disabled + i { opacity: .5; }
+.col-note { color: var(--sc-status-warning-fg) !important; }
+.rt-bars { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; padding: 0 16px 12px; }
+.rt-bars[hidden] { display: none; }
+.rt-cap { grid-column: 1 / -1; font-size: 11px; color: var(--sc-color-text-tertiary); }
+.rt-bar { display: grid; gap: 3px; font-size: 11px; text-align: center; color: var(--sc-color-text-secondary); font-variant-numeric: tabular-nums; }
+.rt-bar i { display: block; height: 6px; border-radius: 3px; background: var(--sc-color-bg-sunken); overflow: hidden; }
+.rt-bar i b { display: block; height: 100%; width: 0; background: #52c41a; }
+.rt-bar.warn i b { background: #faad14; }
+.rt-bar.trip i b { background: #c73c3e; }
+.rt-bar.trip { color: #c73c3e; font-weight: 700; }
 body.recording #rec-chip { display: inline-flex; }
 .banner {
   position: absolute; left: 12px; right: 12px; bottom: 12px; display: none; text-align: center;
@@ -893,6 +937,8 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   .fs-btn { width: 28px; height: 28px; flex-shrink: 0; display: inline-flex !important; }
   .fs-btn svg { width: 16px; height: 16px; }
   .lang-btn { height: 28px; min-width: 28px; padding: 0 8px; flex-shrink: 0; }
+  .hd-btn { width: 28px; height: 28px; }
+  .hd-btn svg { width: 16px; height: 16px; }
   /* touch controls: no scroll/zoom gestures, no text selection, no double-tap zoom */
   .disc, .pose-btn, .grip-key, .preset, .sw, .btn-estop, .fs-btn, .pad, .cluster, .knob {
     touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
@@ -1148,6 +1194,9 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <button class="fs-btn" id="btn-fs" type="button" aria-pressed="false" aria-label="进入全屏" title="全屏" data-i18n-aria="fs.enter" data-i18n-title="fs.title" hidden>
       <svg class="ic-enter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
       <svg class="ic-exit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h3a2 2 0 0 0 2-2V3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M21 16h-3a2 2 0 0 0-2 2v3"/></svg>
+    </button>
+    <button class="hd-btn" id="btn-sset" type="button" aria-label="设置" title="设置" data-i18n-aria="sset.title" data-i18n-title="sset.title" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2l2.4 2.6 3.5-.4.4 3.5L21 10l-1.7 3 1 3.4-3.3 1.3-1.3 3.3-3.4-1-3 1.7-2.3-2.7-3.5.4-.4-3.5L1 14.5l1.7-3-1-3.4L5 6.8 6.3 3.5l3.4 1z" transform="scale(.9) translate(1.3 1.3)"/><circle cx="12" cy="12" r="3.2"/></svg>
     </button>
     <button class="lang-btn" id="btn-lang" type="button" aria-label="Switch language">EN</button>
   </header>
@@ -1471,6 +1520,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           <thead><tr><th data-i18n="jt.joint">关节</th><th data-i18n="jt.deg">角度°</th><th>rad</th><th>°/s</th><th data-i18n="jt.torque">力矩</th><th>°C</th></tr></thead>
           <tbody id="jtable-body"></tbody>
         </table>
+        <div class="rt-bars" id="rt-bars" hidden></div>
       </div>
 
       <!-- expert: dataset -->
@@ -1582,6 +1632,30 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <div class="calib-actions">
       <button class="btn btn-primary" id="gset-save" type="button" data-i18n="gset.save">保存高度</button>
       <button class="btn" id="gset-reload" type="button" data-i18n="gset.reload">重新读取</button>
+    </div>
+  </aside>
+</div>
+<div class="col-banner" id="col-banner" role="alert" aria-live="assertive" hidden>
+  <b id="col-title"></b><span id="col-sub"></span>
+  <button class="btn" id="col-clear" type="button" data-i18n="en.clear_fault" hidden>⚠️ 点击清除故障</button>
+</div>
+<div class="calib-mask" id="sset" hidden>
+  <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="sset-h">
+    <div class="calib-head">
+      <h3 id="sset-h" data-i18n="sset.title">设置</h3>
+      <button class="btn calib-x" id="sset-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+    </div>
+    <div class="gset-row" id="col-set">
+      <div class="gset-k"><span data-i18n="col.set.title">碰撞保护</span><label class="tgl"><input type="checkbox" id="col-en" role="switch" data-i18n-aria="col.set.title" aria-label="碰撞保护"><i></i></label></div>
+      <small data-i18n="col.set.desc">机械臂运动中受阻时自动停在原地，受力消除后自动恢复；短时间内多次碰撞会锁定为故障。</small>
+      <div class="gset-k"><span data-i18n="col.sens">灵敏度</span>
+        <div class="seg seg-sm" id="col-sens" role="radiogroup" data-i18n-aria="col.sens" aria-label="灵敏度">
+          <button type="button" role="radio" data-v="low" data-i18n="col.sens.low">低</button><button type="button" role="radio" data-v="medium" data-i18n="col.sens.medium">中</button><button type="button" role="radio" data-v="high" data-i18n="col.sens.high">高</button>
+        </div>
+      </div>
+      <small data-i18n="col.sens.hint">高：轻微受阻就停；低：只在明显受阻时停。</small>
+      <small class="col-note" data-i18n="col.set.note">注意：这台机械臂的碰撞阈值还没有标定，灵敏度只作试用参考；碰撞保护不能代替急停。</small>
+      <div class="calib-live mono" id="col-status">--</div>
     </div>
   </aside>
 </div>
@@ -1740,6 +1814,14 @@ const I18N = {
     'fc.GRAVITY_COMP_FAILED': '拖动示教模式切换失败', 'fc.GRAVITY_COMP_FAILED.do': '扶住机械臂',
     'fc.COLLISION': '多次碰撞，机械臂已锁定', 'fc.COLLISION.do': '检查工作区，移开障碍物',
     'fc.OTHER': '故障：{d}', 'fc.OTHER.do': '查看机械臂状态',
+    'col.active': '碰撞保护：关节 J{j} 受阻（{r} N·m），已停止；{s} 秒后自动恢复', 'col.active_wait': '碰撞保护：关节 J{j} 受阻（{r} N·m），已停止；受力消除后自动恢复',
+    'col.sub': '请移开障碍物，机械臂保持在当前位置，期间不能运动。', 'col.esc.sub': '{todo}，然后点下面的按钮清除故障，再长按「使能」。',
+    'err.collision_hold': '碰撞保护中，机械臂暂停运动，受力消除后自动恢复',
+    'sset.title': '设置', 'col.set.title': '碰撞保护', 'col.set.desc': '机械臂运动中受阻时自动停在原地，受力消除后自动恢复；短时间内多次碰撞会锁定为故障。',
+    'col.sens': '灵敏度', 'col.sens.low': '低', 'col.sens.medium': '中', 'col.sens.high': '高', 'col.sens.hint': '高：轻微受阻就停；低：只在明显受阻时停。',
+    'col.set.note': '注意：这台机械臂的碰撞阈值还没有标定，灵敏度只作试用参考；碰撞保护不能代替急停。',
+    'col.st.on': '已开启 · 灵敏度{s}', 'col.st.off': '已关闭', 'col.st.saved': '已保存', 'col.st.loading': '读取中…', 'col.st.err': '读取失败：{e}',
+    'rt.cap': '残余力矩（实测 − 重力模型）/ 碰撞阈值',
     'err.epoch': '控制状态已变化，请检查状态后重新操作', 'err.settling': '机械臂正在交接停稳中，请稍候片刻再操作', 'err.settling2': '机械臂正在交接停稳中，请稍候...', 'err.settling3': '机械臂正在交接停稳中，请稍候再试',
     'err.park_unsupported': '当前机械臂缺少自动收纳所需配置或反馈能力，未启动收纳；可使用回零功能，力矩仍需现场确认',
     'err.preset_unsupported': '当前机械臂不支持自动收纳，未启动运动；可使用回零功能，力矩仍需现场确认',
@@ -1902,6 +1984,14 @@ const I18N = {
     'fc.GRAVITY_COMP_FAILED': 'Hand-guiding mode switch failed', 'fc.GRAVITY_COMP_FAILED.do': 'Support the arm with your hand',
     'fc.COLLISION': 'Repeated collisions; arm locked', 'fc.COLLISION.do': 'Check the workspace and remove obstacles',
     'fc.OTHER': 'Fault: {d}', 'fc.OTHER.do': 'Check the arm',
+    'col.active': 'Collision guard: joint J{j} blocked ({r} N·m), stopped; resuming in {s} s', 'col.active_wait': 'Collision guard: joint J{j} blocked ({r} N·m), stopped; resumes once the force is gone',
+    'col.sub': 'Remove the obstacle. The arm holds its position and cannot move meanwhile.', 'col.esc.sub': '{todo}, then tap the button below to clear the fault and hold "Enable".',
+    'err.collision_hold': 'Collision guard is holding the arm; motion resumes once the force is gone',
+    'sset.title': 'Settings', 'col.set.title': 'Collision guard', 'col.set.desc': 'Stops the arm where it is when a moving joint is blocked and resumes once the force is gone. Repeated collisions in a short time latch a fault.',
+    'col.sens': 'Sensitivity', 'col.sens.low': 'Low', 'col.sens.medium': 'Medium', 'col.sens.high': 'High', 'col.sens.hint': 'High: stops at light resistance. Low: stops only when clearly blocked.',
+    'col.set.note': 'Note: collision thresholds are not calibrated on this arm yet; treat the sensitivity as a trial setting. The guard does not replace the E-stop.',
+    'col.st.on': 'On · sensitivity {s}', 'col.st.off': 'Off', 'col.st.saved': 'Saved', 'col.st.loading': 'Loading…', 'col.st.err': 'Read failed: {e}',
+    'rt.cap': 'Residual torque (measured − gravity model) / collision threshold',
     'err.epoch': 'Control state changed, check the state and retry', 'err.settling': 'Arm is settling after handover, wait a moment and retry', 'err.settling2': 'Arm is settling after handover, please wait...', 'err.settling3': 'Arm is settling after handover, retry shortly',
     'err.park_unsupported': 'This arm lacks the configuration or feedback needed for auto-park; park not started. Use Home instead; confirm torque state on site',
     'err.preset_unsupported': 'This arm does not support auto-park; no motion started. Use Home instead; confirm torque state on site',
@@ -2223,6 +2313,8 @@ function rpcError(response) {
     message = t('err.settling');
   } else if (response.code === 'UNSUPPORTED') {
     message = t('err.park_unsupported');
+  } else if (response.code === 'COLLISION_HOLD') {
+    message = t('err.collision_hold');
   } else {
     message = response.message || response.error || t('err.rejected');
   }
@@ -2363,6 +2455,7 @@ function connectWS() {
       }
       const msg = o.code === 'HANDOVER_SETTLING'
         ? t('err.settling2')
+        : o.code === 'COLLISION_HOLD' ? t('err.collision_hold')
         : t('err.servo_reject') + (o.message || o.error || t('err.state_limit'));
       toastOnce({ message: msg, code: o.code || 'SERVO_REJECT' });
       return;
@@ -2378,6 +2471,7 @@ function connectWS() {
       S.preset = null;
       const msg = o.code === 'HANDOVER_SETTLING'
         ? t('err.settling3')
+        : o.code === 'COLLISION_HOLD' ? t('err.collision_hold')
         : o.code === 'WORKSPACE_VIOLATION' ? t('err.workspace')
         : (o.code === 'UNSUPPORTED' ? t('err.preset_unsupported') : t('err.preset_reject') + (o.message || o.error || o.reason || t('err.state_limit')));
       toast(msg, 'err');
@@ -4076,6 +4170,7 @@ function initCalib() {
 async function loadSchema() {
   try {
     const sc = await api('/api/v1/observation/schema', undefined, { quiet: true, method: 'GET' });
+    if (sc) { S.caps = sc.capabilities || {}; colOnCaps(); }
     if (sc && Array.isArray(sc.limits) && sc.limits.length) {
       const oldDof = S.dof;
       S.limits = sc.limits;
@@ -6564,6 +6659,132 @@ $('gset-save').addEventListener('click', () => {
 i18nHooks.push(() => { renderGrasp(); if (!$('gset').hidden) gsetRender(); });
 graspLoadSetup(true);
 
+/* =================================================================
+   Collision guard (capability collision_guard, observation.collision, WS /api/v1/safety/collision):
+   protective-stop banner, settings drawer section, residual torque bars (J1..J6).
+   Everything stays hidden on an armd without the guard.
+   ================================================================= */
+const COL = { cfg: null, thr: null, barAt: 0, busy: false };
+const colAvail = () => !!(S.caps && S.caps.collision_guard) || !!(S.obs && S.obs.collision);
+function colThresholds(c) {
+  if (!c) return null;
+  const e = c.effective || c;
+  for (const k of ['effective_thresholds_nm', 'scaled_thresholds_nm', 'thresholds_nm']) {
+    const v = e[k] ?? c[k];
+    if (Array.isArray(v) && v.length >= 6 && v.slice(0, 6).every((x) => Number.isFinite(x) && x > 0)) return v.slice(0, 6);
+  }
+  return null;
+}
+function colOnCaps() {
+  $('btn-sset').hidden = !colAvail();
+  if (colAvail() && !COL.cfg) colLoad(true);
+}
+async function colLoad(quiet) {
+  if (!quiet) colRenderSet(t('col.st.loading'));
+  try {
+    const res = await fetch('/api/v1/safety/collision', { cache: 'no-store' });
+    const d = await res.json();
+    if (!res.ok) throw new Error(d && (d.message || d.error) || 'HTTP ' + res.status);
+    COL.cfg = d; COL.thr = colThresholds(d);
+    colRenderSet(quiet ? undefined : '');
+  } catch (e) { if (!quiet) colRenderSet(t('col.st.err', { e: e.message })); }
+}
+function colRenderSet(status) {
+  const c = COL.cfg, o = S.obs && S.obs.collision;
+  const enabled = c ? !!c.enabled : !!o;
+  const sens = (c && c.sensitivity) || (o && o.sensitivity) || 'medium';
+  const en = $('col-en');
+  if (!COL.busy) en.checked = enabled;
+  en.disabled = COL.busy || !c;
+  for (const b of $('col-sens').querySelectorAll('button')) {
+    const on = b.dataset.v === sens;
+    b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on));
+    b.disabled = COL.busy || !c;
+  }
+  const st = $('col-status');
+  const txt = status || (c ? (enabled ? t('col.st.on', { s: t('col.sens.' + sens) }) : t('col.st.off')) : '--');
+  setText(st, txt);
+  st.classList.toggle('ok', !!c && enabled);
+}
+async function colWrite(patch) {
+  COL.busy = true; colRenderSet();
+  try {
+    const ack = await commandRPC('/api/v1/safety/collision', patch);
+    syncEpoch(ack.epoch_id);
+    const cfg = ack.collision || ack.config || (('enabled' in ack) ? ack : null);
+    if (cfg) { COL.cfg = { ...(COL.cfg || {}), ...cfg }; COL.thr = colThresholds(COL.cfg) || COL.thr; }
+    else if (COL.cfg) Object.assign(COL.cfg, patch);
+    COL.busy = false;
+    toast(t('col.st.saved'), 'ok');
+    colRenderSet();
+    colLoad(true);
+  } catch (e) {
+    COL.busy = false;
+    toast(e.message, 'err', e.code || '');
+    colRenderSet(e.message);
+  }
+}
+function ssetOpen(open) {
+  $('sset').hidden = !open;
+  if (open) { colRenderSet(); colLoad(false); $('sset-close').focus({ preventScroll: true }); }
+  else $('btn-sset').focus({ preventScroll: true });
+}
+$('btn-sset').addEventListener('click', () => ssetOpen(true));
+$('sset-close').addEventListener('click', () => ssetOpen(false));
+$('sset').addEventListener('click', (e) => { if (e.target === e.currentTarget) ssetOpen(false); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('sset').hidden) ssetOpen(false); });
+$('col-en').addEventListener('change', (e) => colWrite({ enabled: e.target.checked }));
+$('col-sens').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (b && !b.disabled && !b.classList.contains('on')) colWrite({ sensitivity: b.dataset.v });
+});
+$('col-clear').addEventListener('click', () => clearFault());
+i18nHooks.push(() => { if (!$('sset').hidden) colRenderSet(); COL.barAt = 0; });
+
+function renderCollision(live, ts) {
+  const c = live && S.obs ? S.obs.collision : null;
+  if (c && $('btn-sset').hidden) $('btn-sset').hidden = false; // guard reported before the schema said so
+  const escalated = live && S.state === 'Fault' && S.faultCode === 'COLLISION';
+  const active = !!(c && c.active);
+  const banner = $('col-banner');
+  banner.hidden = !(active || escalated);
+  if (escalated) {
+    setText($('col-title'), '⚠️ ' + t('fc.COLLISION'));
+    setText($('col-sub'), t('col.esc.sub', { todo: t('fc.COLLISION.do') }));
+  } else if (active) {
+    const r = Number.isFinite(c.residual_nm) ? Math.abs(c.residual_nm).toFixed(1) : '--';
+    const vars = { j: c.joint ?? '?', r, s: Number.isFinite(c.resume_in_s) ? Math.max(0, c.resume_in_s).toFixed(1) : '' };
+    setText($('col-title'), t(Number.isFinite(c.resume_in_s) ? 'col.active' : 'col.active_wait', vars));
+    setText($('col-sub'), t('col.sub'));
+  }
+  $('col-clear').hidden = !escalated;
+  // residual torque bars at ~10 Hz (the observation arrives at up to 50 Hz)
+  if (ts - COL.barAt < 100) return;
+  COL.barAt = ts;
+  const rt = live && S.obs ? S.obs.residual_torques : null;
+  const thr = COL.thr || null;
+  const box = $('rt-bars');
+  const show = Array.isArray(rt) && rt.length >= 6 && !!thr && colAvail();
+  box.hidden = !show;
+  if (!show) return;
+  if (box.childElementCount !== 7 || box.dataset.lang !== LANG) {
+    box.dataset.lang = LANG;
+    box.innerHTML = '<span class="rt-cap"></span>' + Array.from({ length: 6 }, (_, i) => `<span class="rt-bar"><i><b></b></i>J${i + 1}</span>`).join('');
+    box.firstChild.textContent = t('rt.cap');
+  }
+  for (let i = 0; i < 6; i++) {
+    const el = box.children[i + 1], v = rt[i], th = (c && c.active && c.joint === i + 1 && Number.isFinite(c.threshold_nm)) ? c.threshold_nm : thr[i];
+    const frac = Number.isFinite(v) ? Math.abs(v) / th : 0;
+    const cls = 'rt-bar' + (c && c.active && c.joint === i + 1 ? ' trip' : frac >= 0.5 ? ' warn' : '');
+    if (el.className !== cls) el.className = cls;
+    const w = Math.min(100, frac * 100).toFixed(0) + '%';
+    const bar = el.firstChild.firstChild;
+    if (bar.style.width !== w) bar.style.width = w;
+    const tip = Number.isFinite(v) ? `J${i + 1} ${v.toFixed(2)} / ${th.toFixed(1)} N·m` : `J${i + 1} --`;
+    if (el.title !== tip) el.title = tip;
+  }
+}
+
 function setText(el, txt) { if (el.textContent !== txt) el.textContent = txt; }
 function setCls(el, cls) { if (el.className !== cls) el.className = cls; }
 const fmtDeg = (rad) => { const d = rad * DEG; return (d >= 0 ? '+' : '−') + Math.abs(d).toFixed(1); };
@@ -6592,6 +6813,7 @@ function frame(ts) {
   if (!op && (S.keys.size || cartHeld || S.hold.some((h) => h[0] || h[1]) || pads.some((p) => p.active()))) releaseAll();
   setText($('lock-txt'), lockReason());
   renderGc();
+  renderCollision(live, ts);
 
   const lb = $('link-badge');
   setText(lb, live ? `${S.hz} Hz · ${S.rtt == null ? '--' : Math.round(S.rtt)} ms` : t('no_telemetry'));
