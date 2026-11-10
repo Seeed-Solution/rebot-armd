@@ -644,7 +644,7 @@ fn init_ap_guard_stops_a_console_hotspot_that_starts_late_and_restarts_ours() {
         let t = env.p("").display().to_string();
         let kill_ours = if ours_exits { format!("rm -rf {t}/proc/$(cat {t}/run/hostapd_arm.pid);") } else { String::new() };
         std::fs::write(env.p("late_cmd"), format!("mkdir -p {t}/proc/600; printf 'hostapd\\000-B\\000/etc/hostapd_5g.conf\\000' > {t}/proc/600/cmdline; touch {t}/console_on_air; echo 600 > {t}/console_on_air_pid; {kill_ours}")).unwrap();
-        let out = env.run(&format!("start_wifi; first=$(cat \"$AP_PIDFILE\"); touch \"$T/late\"; AP_GUARD_TICKS=4 ap_guard 5g 44; echo first=$first"));
+        let out = env.run("start_wifi; first=$(cat \"$AP_PIDFILE\"); touch \"$T/late\"; AP_GUARD_TICKS=4 ap_guard 5g 44; echo first=$first");
         assert!(env.read("signals").starts_with("-TERM 600\n"), "{ours_exits}: {}", env.read("signals"));
         assert!(env.read("log").contains("AP takeover after boot (guard): stopped the console's hostapd (PID 600"), "{}", env.read("log"));
         let own = env.own_pid();
