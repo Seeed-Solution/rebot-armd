@@ -106,6 +106,9 @@ body.ui-simple .only-expert, body.ui-expert .only-simple { display: none !import
 .seg button:hover { color: var(--sc-color-text); }
 .seg button.on { background: #fff; color: var(--sc-color-primary-dark); box-shadow: 0 1px 3px rgba(0,0,0,0.08); font-weight: 600; }
 .seg-sm button { min-height: 28px; padding: 0 10px; font-size: 12px; }
+.seg.off button, .seg button:disabled { cursor: not-allowed; }
+.seg.off { opacity: .45; filter: saturate(0); }
+.seg.off button.on { background: transparent; box-shadow: none; }
 body.locked .pose-go { opacity: .45; filter: saturate(0); cursor: not-allowed; }
 
 /* ---------- buttons ---------- */
@@ -6747,10 +6750,13 @@ function colRenderSet(status) {
   const en = $('col-en');
   if (!COL.busy) en.checked = enabled;
   en.disabled = COL.busy || !c;
+  const sensOff = !(COL.busy ? en.checked : enabled);
+  $('col-sens').classList.toggle('off', sensOff);
+  $('col-sens').setAttribute('aria-disabled', String(sensOff));
   for (const b of $('col-sens').querySelectorAll('button')) {
     const on = b.dataset.v === sens;
     b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on));
-    b.disabled = COL.busy || !c;
+    b.disabled = COL.busy || !c || sensOff;
   }
   const st = $('col-status');
   const txt = status || (c ? (enabled ? t('col.st.on', { s: t('col.sens.' + sens) }) : t('col.st.off')) : '--');

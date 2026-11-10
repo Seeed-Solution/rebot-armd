@@ -253,6 +253,15 @@ try {
     await page.click('#col-en', { force: true }); await page.waitForTimeout(400);
     ok(JSON.stringify(P.cmds.slice(n1)) === JSON.stringify([{ path: '/api/v1/safety/collision', body: { enabled: false } }]), `${tag} toggle command ${JSON.stringify(P.cmds.slice(n1))}`);
     ok(!(await page.isChecked('#col-en')), `${tag} toggle off`);
+    const sens = await page.evaluate(() => ({ dis: [...document.querySelectorAll('#col-sens button')].map((b) => b.disabled), off: document.getElementById('col-sens').classList.contains('off'),
+      op: getComputedStyle(document.getElementById('col-sens')).opacity }));
+    ok(sens.dis.every(Boolean) && sens.off && Number(sens.op) < 1, `${tag} A2 sensitivity disabled and greyed while off ${JSON.stringify(sens)}`);
+    n1 = P.cmds.length;
+    await page.click('#col-sens button[data-v="low"]', { force: true }); await page.waitForTimeout(250);
+    ok(P.cmds.length === n1, `${tag} A2 sensitivity click while off sends nothing`);
+    await shot(page, `devplat_settings_off_${tag}`);
+    await page.click('#col-en', { force: true }); await page.waitForTimeout(400);
+    ok(await page.evaluate(() => [...document.querySelectorAll('#col-sens button')].every((b) => !b.disabled)), `${tag} A2 sensitivity re-enabled when the guard is back on`);
     await page.click('#sset-close'); await page.waitForTimeout(200);
 
     // poses drawer
