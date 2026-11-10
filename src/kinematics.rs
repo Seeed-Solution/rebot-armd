@@ -422,9 +422,22 @@ pub struct ViolationDetail {
     pub point: usize,
     /// `floor`, `box_x_min`, `box_x_max`, ..., `box_z_max` or `reach`.
     pub limit: &'static str,
-    /// Coordinate (m) of the point along the violated limit (reach: distance to the shoulder axis).
+    /// Coordinate (m) of the point along the violated limit (reach: distance to the shoulder axis;
+    /// keepout: depth inside the box, bound 0).
     pub value: f64,
     pub bound: f64,
+    /// Index into `keepout_boxes` when `limit` is `keepout`.
+    pub keepout: Option<usize>,
+}
+
+impl ViolationDetail {
+    /// `limit`, with the box name for a keep-out box (`keepout 'name'`).
+    pub fn label(&self, ws: &crate::model::WorkspacePolicy) -> String {
+        match self.keepout {
+            Some(i) => format!("keepout '{}'", ws.keepout_boxes.get(i).map_or("?", |b| b.name.as_str())),
+            None => self.limit.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -442,18 +455,18 @@ const BOX_LIMITS: [[&str; 2]; 3] = [["box_x_min", "box_x_max"], ["box_y_min", "b
 /// Workspace excess for joint positions `q` (at least J1..J6, model = motor angles).
 pub fn workspace_violation(q: &[f32], ws: &crate::model::WorkspacePolicy, cam: &crate::model::CameraMount) -> Violation {
     if q.len() < 6 || q[..6].iter().any(|v| !v.is_finite()) {
-        return Violation { total: f64::INFINITY, worst: Some(ViolationDetail { point: 0, limit: "invalid", value: f64::NAN, bound: 0.0 }) };
+        return Violation { total: f64::INFINITY, worst: Some(ViolationDetail { point: 0, limit: "invalid", value: f64::NAN, bound: 0.0, keepout: None }) };
     }
     workspace_violation_pose(&fk(&q6(q)), ws, cam)
 }
 
 pub fn workspace_violation_pose(pose: &Pose, ws: &crate::model::WorkspacePolicy, cam: &crate::model::CameraMount) -> Violation {
     let mut v = Violation::default();
-    let mut note = |excess: f64, point: usize, limit: &'static str, value: f64, bound: f64| {
+    let mut note = |excess: f64, point: usize, limit: &'static str, value: f64, bound: f64, keepout: Option<usize>| {
         if excess > 0.0 {
             v.total += excess;
             if v.worst.is_none_or(|w| excess > (w.value - w.bound).abs()) {
-                v.worst = Some(ViolationDetail { point, limit, value, bound });
+                v.worst = Some(ViolationDetail { point, limit, value, bound, keepout });
             }
         }
     };
@@ -466,16 +479,22 @@ pub fn workspace_violation_pose(pose: &Pose, ws: &crate::model::WorkspacePolicy,
         .chain(cam.offset_m.map(|o| (n + 1, o)));
     for (idx, local) in points {
         let p = pose.transform_point(&local.map(f64::from));
-        note(floor - p[2], idx, "floor", p[2], floor);
+        note(floor - p[2], idx, "floor", p[2], floor, None);
         for k in 0..3 {
-            note(lo[k] - p[k], idx, BOX_LIMITS[k][0], p[k], lo[k]);
-            note(p[k] - hi[k], idx, BOX_LIMITS[k][1], p[k], hi[k]);
+            note(lo[k] - p[k], idx, BOX_LIMITS[k][0], p[k], lo[k], None);
+            note(p[k] - hi[k], idx, BOX_LIMITS[k][1], p[k], hi[k], None);
         }
         if idx == 0 {
             if let Some(reach) = ws.max_reach_m {
                 let d = shoulder_reach(&p);
-                note(d - f64::from(reach), 0, "reach", d, f64::from(reach));
+                note(d - f64::from(reach), 0, "reach", d, f64::from(reach), None);
             }
+        }
+        // Keep-out box: excess = depth inside (distance to the nearest face).
+        for (b, kb) in ws.keepout_boxes.iter().enumerate() {
+            let depth = (0..3).map(|k| (p[k] - f64::from(kb.min_m[k])).min(f64::from(kb.max_m[k]) - p[k]))
+                .fold(f64::INFINITY, f64::min);
+            note(depth, idx, "keepout", depth, 0.0, Some(b));
         }
     }
     v

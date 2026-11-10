@@ -114,6 +114,40 @@ pub struct WorkspacePolicy {
     pub max_reach_m: Option<f32>,
     /// Points in end_link coordinates (m) that must stay inside the box and above the floor.
     pub check_points_end_m: Vec<[f32; 3]>,
+    /// Boxes (base frame) no check point may enter. A runtime list
+    /// (`/api/v1/workspace/keepout`) replaces this one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keepout_boxes: Vec<KeepoutBox>,
+}
+
+/// Most keep-out boxes a profile or the runtime list may hold.
+pub const MAX_KEEPOUT_BOXES: usize = 16;
+
+/// Axis-aligned keep-out box in the base frame (m).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KeepoutBox {
+    pub name: String,
+    pub min_m: [f32; 3],
+    pub max_m: [f32; 3],
+}
+
+impl KeepoutBox {
+    /// Validate a box list: at most [`MAX_KEEPOUT_BOXES`], names 1..=64 bytes, finite, min < max per axis.
+    pub fn validate_list(boxes: &[KeepoutBox]) -> Result<(), String> {
+        if boxes.len() > MAX_KEEPOUT_BOXES {
+            return Err(format!("at most {MAX_KEEPOUT_BOXES} keep-out boxes"));
+        }
+        for b in boxes {
+            if b.name.is_empty() || b.name.len() > 64 {
+                return Err("keep-out box name must be 1..64 bytes".into());
+            }
+            if !b.min_m.iter().chain(&b.max_m).all(|v| v.is_finite())
+                || b.min_m.iter().zip(&b.max_m).any(|(lo, hi)| lo >= hi) {
+                return Err(format!("keep-out box '{}': finite values and min_m < max_m on every axis", b.name));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl WorkspacePolicy {
@@ -131,6 +165,7 @@ impl WorkspacePolicy {
             box_max_m: [0.60, 0.60, 0.80],
             max_reach_m: Some(0.52),
             check_points_end_m: corners,
+            keepout_boxes: Vec::new(),
         }
     }
 
@@ -143,7 +178,7 @@ impl WorkspacePolicy {
             || !self.check_points_end_m.iter().all(finite3) {
             return Err("Invalid workspace policy: finite values, box_min < box_max, 1..16 check points".into());
         }
-        Ok(())
+        KeepoutBox::validate_list(&self.keepout_boxes)
     }
 }
 

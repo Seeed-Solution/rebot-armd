@@ -407,3 +407,8 @@ pub async fn get_grasp_setup(
         None => Json(serde_json::json!({"supported": false, "setup": null, "path": path})).into_response(),
     }
 }
+
+/// `GET /api/v1/workspace/keepout`: effective keep-out boxes and their source.
+pub async fn get_keepout(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
+    Json(supervisor.inner().read().await.keepout_state()).into_response()
+}

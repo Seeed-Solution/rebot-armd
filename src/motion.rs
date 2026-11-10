@@ -163,7 +163,7 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
             let v = kinematics::workspace_violation(&q32, ws, &input.cam);
             if kinematics::workspace_rejects(&v, v0) {
                 let w = v.worst.expect("violation has a worst point");
-                return Err(MotionError::WorkspaceViolation { s, point: w.point, limit: w.limit.to_string(), value: w.value, bound: w.bound });
+                return Err(MotionError::WorkspaceViolation { s, point: w.point, limit: w.label(ws), value: w.value, bound: w.bound });
             }
         }
         q_samples.push(q32);

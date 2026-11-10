@@ -254,6 +254,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let mut pending_plan: Option<(PendingPlan, u64)> = None;
             let mut pending_grasp: Option<(Value, crate::grasp::PendingGrasp, u64)> = None;
             let mut pending_save: Option<crate::grasp::GraspSetup> = None;
+            let mut pending_write: Option<crate::persist::PendingWrite> = None;
             if kind == "estop" || kind == "e_stop" {
                 let (state, epoch) = recv_supervisor.trigger_e_stop().await;
                 response = Some(json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":state}));
@@ -392,6 +393,17 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             }
                                             Err(error) => command_reject(&inner, &value["request_id"], error.into()),
                                         });
+                                    } else if path == "/api/v1/workspace/keepout" {
+                                        response = Some(match crate::keepout::update(&mut inner, &value["body"]) {
+                                            Ok((state, write)) => {
+                                                let mut ack = command_ack(&inner, &value["request_id"], None);
+                                                ack["boxes"] = json!(state.boxes);
+                                                ack["source"] = json!(state.source);
+                                                pending_write = write;
+                                                ack
+                                            }
+                                            Err(error) => command_reject(&inner, &value["request_id"], error.into()),
+                                        });
                                     } else {
                                         let result = execute_command(&mut inner, path, &value["body"], epoch);
                                         response = Some(match result {
@@ -498,6 +510,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     }
                 }
 
+                if let (Some(write), Some(reply)) = (pending_write.take(), response.as_mut()) {
+                    match write.run().await {
+                        Ok(()) => reply["persisted"] = json!(true),
+                        Err(e) => { tracing::warn!("State file not saved: {e}"); reply["persisted"] = json!(false); reply["persist_error"] = json!(e); }
+                    }
+                }
                 if let Some((evicted_conn, evicted_gen)) = evicted_notify {
                     let sender_opt = {
                         let reg = CONNECTION_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());

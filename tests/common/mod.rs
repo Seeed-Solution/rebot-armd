@@ -74,3 +74,29 @@ pub async fn servo_reject_within(ws: &mut TestSocket, ms: u64) -> Option<serde_j
 pub async fn drain(ws: &mut TestSocket, ms: u64) {
     while let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_millis(ms), ws.next()).await {}
 }
+
+/// Server with a 50 Hz ticker, a lease holder and torque on, commanded/measured at `q`.
+/// Returns (socket, generation, epoch, supervisor, addr).
+pub async fn torqued_rig(supervisor: Arc<ArmSupervisor>, q: &[f32]) -> (TestSocket, u64, u64, Arc<ArmSupervisor>, SocketAddr) {
+    let router = create_router(supervisor.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+    let ticker = supervisor.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
+        loop { interval.tick().await; ticker.tick(0.02).await; }
+    });
+    let (mut ws, generation) = controller(addr).await;
+    let epoch = supervisor.get_observation().await.epoch_id;
+    let ack = rpc(&mut ws, generation, epoch, "/api/v1/torque", serde_json::json!({"enable": true})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.commanded_positions = q.to_vec();
+        inner.measured_positions = q.to_vec();
+        inner.target_positions = q.to_vec();
+    }
+    let epoch = supervisor.get_observation().await.epoch_id;
+    (ws, generation, epoch, supervisor, addr)
+}

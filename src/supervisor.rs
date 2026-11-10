@@ -216,6 +216,8 @@ pub struct SupervisorInner {
     /// Running gravity-compensation session (`src/gravity_comp.rs`).
     pub gravity_comp: Option<crate::gravity_comp::GravityCompRun>,
     pub gravity_comp_last_exit: Option<crate::model::GravityCompExit>,
+    /// Keep-out source and file (`src/keepout.rs`).
+    pub keepout: crate::keepout::Keepout,
 }
 
 impl SupervisorInner {
@@ -316,6 +318,7 @@ impl SupervisorInner {
             handover_settling_since: None,
             gravity_comp: None,
             gravity_comp_last_exit: None,
+            keepout: crate::keepout::Keepout::default(),
         }
     }
 
@@ -468,9 +471,9 @@ impl SupervisorInner {
         for q in samples {
             let v = crate::kinematics::workspace_violation(q, ws, cam);
             if crate::kinematics::workspace_rejects(&v, &v0) {
-                let w = v.worst.unwrap_or(crate::kinematics::ViolationDetail { point: 0, limit: "invalid", value: f64::NAN, bound: 0.0 });
+                let w = v.worst.unwrap_or(crate::kinematics::ViolationDetail { point: 0, limit: "invalid", value: f64::NAN, bound: 0.0, keepout: None });
                 return Err(SafetyError::WorkspaceViolation {
-                    point: w.point, limit: w.limit.to_string(), value: w.value as f32, bound: w.bound as f32,
+                    point: w.point, limit: w.label(ws), value: w.value as f32, bound: w.bound as f32,
                 });
             }
         }
