@@ -78,6 +78,7 @@ pub fn create_router_full(
         .route("/api/v1/mode/gravity_comp", post(rest::action_requires_lease))
         .route("/api/v1/grasp/setup", get(rest::get_grasp_setup))
         .route("/api/v1/workspace/keepout", get(rest::get_keepout))
+        .route("/api/v1/safety/collision", get(rest::get_collision))
         .route("/api/v1/poses", get(rest::get_poses))
         .route("/api/v1/safety/e_stop", post(rest::safety_e_stop))
         .route("/api/v1/safety/clear_fault", post(rest::safety_clear_fault))

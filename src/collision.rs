@@ -3,17 +3,26 @@
 //!
 //! This is contact detection on a gravity-model residual, not a certified safety function.
 //! The default thresholds are placeholders until they are measured on a real arm; the guard
-//! is off unless the profile enables it.
+//! is off unless the profile or the runtime setting enables it.
 //!
 //! Per tick the guard costs O(6) and allocates nothing; strings are built only on a trip.
 
+use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
+use crate::motion::MotionError;
+use crate::persist::{self, Loaded, PendingWrite};
 use crate::safety::{FaultCode, FaultReason, SafetyError};
-use crate::supervisor::SupervisorInner;
+use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
 
+pub const DEFAULT_COLLISION_PATH: &str = "/userdata/rebot-teleop/collision.json";
 /// Trip times kept for the escalation count; bounds `max_auto_resumes`.
 pub const MAX_TRIP_HISTORY: usize = 16;
+
+/// `ARMD_COLLISION` or [`DEFAULT_COLLISION_PATH`].
+pub fn path_from_env() -> PathBuf {
+    persist::path_from_env("ARMD_COLLISION", DEFAULT_COLLISION_PATH)
+}
 
 /// Profile section `collision`. Every field is optional; the values below are placeholders
 /// until measured on a real arm.
@@ -122,6 +131,10 @@ pub struct CollisionHold {
 pub struct CollisionGuard {
     pub enabled: bool,
     pub sensitivity: Sensitivity,
+    /// True once a runtime setting replaced the profile's.
+    pub runtime: bool,
+    /// File the runtime setting is written to; None = not persisted.
+    pub path: Option<PathBuf>,
     /// The driver reports torque (refreshed every tick).
     pub torque_feedback: bool,
     pub hold: Option<CollisionHold>,
@@ -150,6 +163,33 @@ impl CollisionGuard {
         let n = self.trip_count.min(MAX_TRIP_HISTORY);
         self.trips[..n].iter().filter(|t| now - **t <= window).count() as u32
     }
+}
+
+/// `GET /api/v1/safety/collision` body and WS ack.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct CollisionConfig {
+    /// Profile gravity model and driver torque feedback (capability `collision_guard`).
+    pub available: bool,
+    pub enabled: bool,
+    pub sensitivity: Sensitivity,
+    /// Effective thresholds: profile thresholds x sensitivity factor.
+    pub thresholds_nm: [f32; 6],
+    pub profile_thresholds_nm: [f32; 6],
+    pub persist_ticks: u32,
+    pub clear_ratio: f32,
+    pub resume_after_s: f64,
+    pub max_auto_resumes: u32,
+    pub escalate_window_s: f64,
+    /// `profile` or `runtime`.
+    pub source: &'static str,
+    pub active: bool,
+}
+
+/// File body.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct CollisionSetting {
+    pub enabled: bool,
+    pub sensitivity: Sensitivity,
 }
 
 impl SupervisorInner {
@@ -193,6 +233,24 @@ impl SupervisorInner {
             enabled: true,
             sensitivity: self.collision.sensitivity,
         })
+    }
+
+    pub fn collision_config(&self) -> CollisionConfig {
+        let p = self.collision_policy();
+        CollisionConfig {
+            available: self.collision_available(),
+            enabled: self.collision.enabled,
+            sensitivity: self.collision.sensitivity,
+            thresholds_nm: self.collision_thresholds(),
+            profile_thresholds_nm: p.thresholds_nm,
+            persist_ticks: p.persist_ticks,
+            clear_ratio: p.clear_ratio,
+            resume_after_s: p.resume_after_s,
+            max_auto_resumes: p.max_auto_resumes,
+            escalate_window_s: p.escalate_window_s,
+            source: if self.collision.runtime { "runtime" } else { "profile" },
+            active: self.collision.hold.is_some(),
+        }
     }
 
     /// One control tick of the guard, after the residuals of this tick are known and
@@ -283,5 +341,58 @@ impl SupervisorInner {
             return;
         }
         self.collision.hold = Some(CollisionHold { joint: j, residual_nm: residual, threshold_nm: threshold, since_s: now, quiet_s: 0.0 });
+    }
+
+    /// Apply a runtime setting (WS command / file). Enabling needs the guard to be available
+    /// when `check` is set (the startup load runs before the driver is attached).
+    fn set_collision(&mut self, enabled: Option<bool>, sensitivity: Option<Sensitivity>, check: bool) -> Result<(), ArmError> {
+        if check && enabled == Some(true) && !self.collision_available() {
+            return Err(MotionError::Unsupported(
+                "The collision guard needs a profile gravity model and a driver that reports torque".into()).into());
+        }
+        if let Some(e) = enabled { self.collision.enabled = e; }
+        if !self.collision.enabled {
+            // Switching the guard off ends a hold at once (the lease holder decided).
+            self.collision.hold = None;
+            self.collision.over = [0; 6];
+        }
+        if let Some(s) = sensitivity { self.collision.sensitivity = s; }
+        self.collision.runtime = true;
+        Ok(())
+    }
+}
+
+/// WS command `/api/v1/safety/collision` `{"enabled": bool?, "sensitivity": "low"|"medium"|"high"?}`.
+/// Returns the new effective config and the file write to run after the lock is released.
+pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(CollisionConfig, Option<PendingWrite>), ArmError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body { enabled: Option<bool>, sensitivity: Option<Sensitivity> }
+    let b: Body = serde_json::from_value(body.clone()).map_err(|e| MotionError::InvalidCommand(format!(
+        "collision body must be {{\"enabled\": bool?, \"sensitivity\": \"low\"|\"medium\"|\"high\"?}}: {e}")))?;
+    if b.enabled.is_none() && b.sensitivity.is_none() {
+        return Err(MotionError::InvalidCommand("collision body needs enabled and/or sensitivity".into()).into());
+    }
+    inner.set_collision(b.enabled, b.sensitivity, true)?;
+    let setting = CollisionSetting { enabled: inner.collision.enabled, sensitivity: inner.collision.sensitivity };
+    let write = inner.collision.path.clone().map(|path| PendingWrite {
+        path,
+        text: serde_json::to_string_pretty(&setting).unwrap_or_default(),
+    });
+    Ok((inner.collision_config(), write))
+}
+
+/// Load the persisted runtime setting at startup (logs the outcome). An invalid file is
+/// left untouched and the profile setting stays in force.
+pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
+    let mut inner = supervisor.inner().write().await;
+    inner.collision.path = Some(path.to_path_buf());
+    match persist::load::<CollisionSetting>(path, |_| Ok(())) {
+        Loaded::Loaded(s) => {
+            tracing::info!("Collision guard setting loaded from {} (enabled {}, sensitivity {:?})", path.display(), s.enabled, s.sensitivity);
+            let _ = inner.set_collision(Some(s.enabled), Some(s.sensitivity), false);
+        }
+        Loaded::Missing => {}
+        Loaded::Invalid(e) => tracing::warn!("Ignoring collision guard file: {e}; using the profile setting"),
     }
 }

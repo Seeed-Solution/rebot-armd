@@ -451,6 +451,16 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             }
                                             Err(error) => command_reject(&inner, &value["request_id"], error.into()),
                                         });
+                                    } else if path == "/api/v1/safety/collision" {
+                                        response = Some(match crate::collision::update(&mut inner, &value["body"]) {
+                                            Ok((config, write)) => {
+                                                let mut ack = command_ack(&inner, &value["request_id"], None);
+                                                ack["collision"] = json!(config);
+                                                pending_write = write;
+                                                ack
+                                            }
+                                            Err(error) => command_reject(&inner, &value["request_id"], error.into()),
+                                        });
                                     } else if path == "/api/v1/workspace/keepout" {
                                         response = Some(match crate::keepout::update(&mut inner, &value["body"]) {
                                             Ok((state, write)) => {

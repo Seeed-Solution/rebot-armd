@@ -420,3 +420,8 @@ pub async fn get_keepout(State(supervisor): State<Arc<ArmSupervisor>>) -> Respon
 pub async fn get_poses(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
     Json(supervisor.inner().read().await.poses.list.clone()).into_response()
 }
+
+/// `GET /api/v1/safety/collision`: effective collision guard config (scaled thresholds).
+pub async fn get_collision(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
+    Json(supervisor.inner().read().await.collision_config()).into_response()
+}
