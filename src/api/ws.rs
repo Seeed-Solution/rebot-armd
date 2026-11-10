@@ -22,9 +22,32 @@ pub fn connection_registry() -> ConnectionRegistry {
 
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 
+/// `?obs_hz=N`: send at most N observations per second on this connection (clamped to
+/// 1..control_frequency_hz). Absent: every tick. Control replies are never decimated.
 pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSupervisor>>,
-                        axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, supervisor, deps))
+                        axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+                        axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>) -> axum::response::Response {
+    let control_hz = supervisor.inner().read().await.config.control_frequency_hz.max(1);
+    let obs_rate = match query.get("obs_hz") {
+        None => None,
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(n) => Some(ObsRate { hz: n.clamp(1, u64::from(control_hz)) as f64, control_hz: f64::from(control_hz) }),
+            Err(_) => return (StatusCode::BAD_REQUEST, "obs_hz must be a non-negative integer").into_response(),
+        },
+    };
+    ws.on_upgrade(move |socket| handle_socket(socket, supervisor, deps, obs_rate)).into_response()
+}
+
+/// Per-connection observation rate limit.
+#[derive(Debug, Clone, Copy)]
+struct ObsRate { hz: f64, control_hz: f64 }
+
+impl ObsRate {
+    /// Whether an observation stamped `timestamp` is sent, given the last one sent.
+    /// Half a control period of tolerance keeps tick jitter from skipping a slot.
+    fn due(&self, last_sent: Option<f64>, timestamp: f64) -> bool {
+        last_sent.is_none_or(|t| timestamp - t >= 1.0 / self.hz - 0.5 / self.control_hz)
+    }
 }
 
 fn invalid_command(message: &str) -> ApiError {
@@ -164,7 +187,7 @@ fn command_reject(inner: &SupervisorInner, request_id: &Value, error: ApiError) 
     reply
 }
 
-async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: crate::grasp::GraspDeps) {
+async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: crate::grasp::GraspDeps, obs_rate: Option<ObsRate>) {
     let (mut sender, mut receiver) = socket.split();
     let mut telemetry = supervisor.subscribe_telemetry();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(64);
@@ -187,6 +210,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let _conn_guard = ConnectionGuard(connection.clone());
 
     let mut send_task = tokio::spawn(async move {
+        let mut last_sent: Option<f64> = None;
         loop {
             tokio::select! {
                 biased;
@@ -196,6 +220,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 },
                 observation = telemetry.recv() => match observation {
                     Ok(obs) => {
+                        if let Some(rate) = obs_rate {
+                            if !rate.due(last_sent, obs.timestamp) { continue; }
+                            last_sent = Some(obs.timestamp);
+                        }
                         if let Ok(text) = serde_json::to_string(&obs) {
                             if sender.send(Message::Text(text.into())).await.is_err() { break; }
                         }
