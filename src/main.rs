@@ -190,6 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let damiao_limits: Option<Vec<_>> = config.damiao_ranges.as_ref().map(|r| r.iter().map(|r| r.limits()).collect());
     let supervisor = Arc::new(ArmSupervisor::new(config));
+    supervisor.set_follower(follower).await;
     start_blackbox(&supervisor, cli.blackbox_dir.as_deref(), &system, started);
     armd::grasp::load_into(&supervisor, &armd::grasp::setup_path_from_env()).await;
     armd::keepout::load_into(&supervisor, &armd::keepout::path_from_env()).await;

@@ -425,3 +425,8 @@ pub async fn get_poses(State(supervisor): State<Arc<ArmSupervisor>>) -> Response
 pub async fn get_collision(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
     Json(supervisor.inner().read().await.collision_config()).into_response()
 }
+
+/// `GET /api/v1/safety/describe`: limits, stops and faults of this armd (no lease).
+pub async fn get_safety_describe(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
+    Json(supervisor.inner().read().await.safety_describe()).into_response()
+}

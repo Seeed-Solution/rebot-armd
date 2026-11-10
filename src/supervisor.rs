@@ -235,6 +235,8 @@ pub struct SupervisorInner {
     pub residual_torques: Option<[f32; 6]>,
     /// Collision guard state (`src/collision.rs`).
     pub collision: crate::collision::CollisionGuard,
+    /// `--follower` model name armd was started with (`safety/describe` `device.follower`).
+    pub follower: Option<String>,
 }
 
 impl SupervisorInner {
@@ -340,7 +342,16 @@ impl SupervisorInner {
             poses: crate::poses::PoseStore::default(),
             residual_torques: None,
             collision: crate::collision::CollisionGuard::from_policy(&collision_policy),
+            follower: None,
         }
+    }
+
+    /// Observation schema: profile capabilities plus the parts that depend on the driver.
+    pub fn schema(&self) -> ObservationSchema {
+        let mut schema = ObservationSchema::from_config(&self.config);
+        schema.capabilities.gravity_comp = self.gravity_comp_support().is_ok();
+        schema.capabilities.collision_guard &= self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+        schema
     }
 
     pub fn with_driver(mut self, driver: Box<dyn ArmDriver>) -> Self {
@@ -2830,11 +2841,12 @@ impl ArmSupervisor {
     }
 
     pub async fn get_schema(&self) -> ObservationSchema {
-        let inner = self.inner.read().await;
-        let mut schema = ObservationSchema::from_config(&inner.config);
-        schema.capabilities.gravity_comp = inner.gravity_comp_support().is_ok();
-        schema.capabilities.collision_guard &= inner.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
-        schema
+        self.inner.read().await.schema()
+    }
+
+    /// Records the `--follower` model name for `GET /api/v1/safety/describe`.
+    pub async fn set_follower(&self, name: &str) {
+        self.inner.write().await.follower = Some(name.to_string());
     }
 
     pub async fn get_config(&self) -> ArmConfig {

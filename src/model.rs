@@ -950,6 +950,8 @@ pub struct Capabilities {
     /// Collision guard (`collision` profile section, `/api/v1/safety/collision`,
     /// `observation.collision`): profile gravity model and a driver that reports torque.
     pub collision_guard: bool,
+    /// `GET /api/v1/safety/describe`: limits, stops and faults generated from the running config.
+    pub safety_describe: bool,
     pub vision: VisionCapabilities,
 }
 
@@ -981,6 +983,7 @@ impl Capabilities {
             place: seven && kin && config.gripper_policy.is_some(),
             // The driver half is applied by ArmSupervisor::get_schema.
             collision_guard: config.gravity_model.is_some() && matches!(config.dof, 6 | 7),
+            safety_describe: true,
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }
