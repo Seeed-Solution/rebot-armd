@@ -219,6 +219,8 @@ pub struct SupervisorInner {
     /// Keep-out source and file (`src/keepout.rs`).
     pub keepout: crate::keepout::Keepout,    /// Named poses (`src/poses.rs`).
     pub poses: crate::poses::PoseStore,
+    /// Measured minus model gravity torque, J1..J6 (`observation.residual_torques`).
+    pub residual_torques: Option<[f32; 6]>,
 }
 
 impl SupervisorInner {
@@ -321,6 +323,7 @@ impl SupervisorInner {
             gravity_comp_last_exit: None,
             keepout: crate::keepout::Keepout::default(),
             poses: crate::poses::PoseStore::default(),
+            residual_torques: None,
         }
     }
 
@@ -573,6 +576,7 @@ impl SupervisorInner {
             motion_limit: self.motion_limit.clone(),
             motor_errors: self.motor_errors.clone(),
             fault: self.safety.fault(),
+            residual_torques: self.residual_torques,
         }
     }
 
@@ -2224,27 +2228,32 @@ impl SupervisorInner {
         // 0.2 Compute gravity torques if gravity compensation is enabled, driver feedback is valid, and measured positions available
         let driver_feedback_ok = self.hardware_feedback_fresh(Duration::from_millis(250));
 
-        if self.gravity_output_enabled() && driver_feedback_ok && self.measured_positions.len() >= 6 {
+        // The model torques are computed whenever the profile has a gravity model (for the
+        // residuals); they drive the output only when gravity output is enabled.
+        let model_gravity = if self.config.gravity_model.is_some() && matches!(self.config.dof, 6 | 7)
+            && driver_feedback_ok && self.measured_positions.len() >= 6 {
             let mut q = [0.0f32; 6];
             q.copy_from_slice(&self.measured_positions[0..6]);
             match crate::gravity::compute_gravity_torques(&q) {
-                Ok(tau) => {
-                    let all_finite = tau.iter().all(|t| t.is_finite());
-                    if all_finite {
-                        self.gravity_torques = tau.to_vec();
-                    } else {
-                        tracing::warn!("Gravity torque contains non-finite values, zeroing out");
-                        self.gravity_torques.clear();
-                    }
+                Ok(tau) if tau.iter().all(|t| t.is_finite()) => Some(tau),
+                Ok(_) => {
+                    tracing::warn!("Gravity torque contains non-finite values, zeroing out");
+                    None
                 }
                 Err(e) => {
                     tracing::warn!("Gravity torque computation error: {:?}", e);
-                    self.gravity_torques.clear();
+                    None
                 }
             }
-        } else {
-            self.gravity_torques.clear();
+        } else { None };
+        match model_gravity.filter(|_| self.gravity_output_enabled()) {
+            Some(tau) => { self.gravity_torques.clear(); self.gravity_torques.extend_from_slice(&tau); }
+            None => self.gravity_torques.clear(),
         }
+        let torque_feedback = self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+        self.residual_torques = model_gravity.filter(|_| torque_feedback && self.feedback_numeric_valid && self.torques.len() >= 6)
+            .map(|tau| std::array::from_fn(|i| self.torques[i] - tau[i]))
+            .filter(|r: &[f32; 6]| r.iter().all(|v| v.is_finite()));
 
         // Apply Slew-Rate Limiter (15.0 N·m/s) and safety limits to gravity torques
         if self.gravity_torques_ramped.len() != self.config.dof {

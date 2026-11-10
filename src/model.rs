@@ -751,7 +751,10 @@ pub struct ArmObservation {
     pub motor_errors: Vec<Option<MotorError>>,
     /// Structured cause while the safety state is Fault or EStop; null otherwise.
     #[serde(default)]
-    pub fault: Option<crate::safety::FaultInfo>,
+    pub fault: Option<crate::safety::FaultInfo>,    /// Measured torque minus model gravity torque for J1..J6 (N·m); null without a
+    /// gravity model or valid torque feedback. Observation only, no fault is raised from it.
+    #[serde(default)]
+    pub residual_torques: Option<[f32; 6]>,
 }
 
 /// A motor fault code reported in the motor's feedback (`observation.motor_errors`).
