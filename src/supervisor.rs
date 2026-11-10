@@ -65,6 +65,16 @@ pub const GRIPPER_STALL_RELEASE_NM: f32 = 0.2223;
 /// CAN gaps observed on the reBot rig (2026-11-06, coinciding with 24 V sags);
 /// a real power loss drops the arm regardless of this bound.
 pub const BUS_LOSS_TIMEOUT: Duration = Duration::from_millis(500);
+/// A control tick arriving later than this after the previous one (or a non-finite /
+/// non-positive step) latches Fault `CONTROL_DEADLINE` while torqued and operational.
+/// Same bound as the hardware feedback freshness limit of the drivers.
+pub const CONTROL_DEADLINE: Duration = Duration::from_millis(250);
+/// After a takeover (`acquire_lease` with `force`) another connection must wait this long
+/// before it can take the lease over again.
+pub const PREEMPT_COOLDOWN: Duration = Duration::from_secs(3);
+/// A ThermalTrip can be cleared only once every joint reports a temperature at or below
+/// `max_temperature` minus this margin (°C).
+pub const THERMAL_CLEAR_MARGIN_C: f32 = 5.0;
 /// Lower bound for the automatic park started by an expired lease (trajectory + settle).
 /// The actual budget is `max(WATCHDOG_PARK_TIMEOUT, deceleration + planned duration +
 /// UNLOAD_SETTLE_HOLD + WATCHDOG_PARK_MARGIN)`, counted in control-loop time.
@@ -1050,7 +1060,7 @@ impl SupervisorInner {
             }
             drv.check_hardware_status().map_err(|e| SafetyError::ClearFaultRejected(e.to_string()))?;
             if thermal && (!drv.capabilities().temperature_feedback || states.iter().any(|state|
-                !state.temperature.is_finite() || state.temperature > self.config.max_temperature - 5.0)) {
+                !state.temperature.is_finite() || state.temperature > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C)) {
                 return Err(SafetyError::ClearFaultRejected("Temperature must be confirmed below the reset threshold".into()));
             }
             let state = drv.enable_state();
@@ -1066,7 +1076,7 @@ impl SupervisorInner {
             }
             state
         } else {
-            if thermal && self.temperatures.iter().any(|t| !t.is_finite() || *t > self.config.max_temperature - 5.0) {
+            if thermal && self.temperatures.iter().any(|t| !t.is_finite() || *t > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C) {
                 return Err(SafetyError::ClearFaultRejected("Temperature is above the reset threshold".into()));
             }
             if self.is_torqued { EnableState::Enabled } else { EnableState::Disabled }
@@ -1150,11 +1160,10 @@ impl SupervisorInner {
             }
 
             if active.client_id != conn {
-                let cooldown = Duration::from_secs(3);
                 if let Some(last) = self.last_preemption {
                     let elapsed = last.elapsed();
-                    if elapsed < cooldown {
-                        let remaining_ms = (cooldown.saturating_sub(elapsed).as_millis() as u64).max(1);
+                    if elapsed < PREEMPT_COOLDOWN {
+                        let remaining_ms = (PREEMPT_COOLDOWN.saturating_sub(elapsed).as_millis() as u64).max(1);
                         return Err(PreemptError::Cooldown(remaining_ms));
                     }
                 }
@@ -2174,8 +2183,8 @@ impl SupervisorInner {
 
         // A single late tick only shortens integration (dt is clamped below); the motors
         // keep holding their last POS_VEL target meanwhile. Fault on a real stall, using
-        // the same 250 ms bound as the hardware feedback deadline.
-        if (!dt.is_finite() || dt <= 0.0 || dt > 0.250)
+        // CONTROL_DEADLINE (the same 250 ms bound as the hardware feedback deadline).
+        if (!dt.is_finite() || dt <= 0.0 || dt > CONTROL_DEADLINE.as_secs_f64())
             && self.is_torqued && self.safety.state().is_operational() {
             self.stop_motion();
             if self.measured_positions.iter().all(|p| p.is_finite()) {
