@@ -16,6 +16,10 @@ NAME=rebot-teleop
 DAEMON=/usr/local/bin/armd
 PIDFILE=/var/run/$NAME.pid
 LOGFILE=/var/log/$NAME.log
+# armd also writes a rotating log (armd.log) and its black box (bb.jsonl, boots.log) on
+# /userdata, which survive a reboot (armd --log-dir / --blackbox-dir defaults)
+PERSIST_LOG_DIR=/userdata/rebot-teleop/logs
+BLACKBOX_DIR=/userdata/rebot-teleop/blackbox
 # B601-DM arm profile (kit data, equal to armd's built-in rebot-dm profile)
 PROFILE=/usr/share/$NAME/profile/rebot-b601dm.json
 
@@ -479,6 +483,10 @@ start() {
     if [ "$FOLLOWER_MODEL" = "rebot-dm" ] && [ -f "$PROFILE" ]; then
         DAEMON_OPTS="$DAEMON_OPTS --config $PROFILE"
     fi
+
+    # armd runs as root; it falls back to stdout only when these cannot be written
+    mkdir -p "$PERSIST_LOG_DIR" "$BLACKBOX_DIR" 2>/dev/null || true
+    DAEMON_OPTS="$DAEMON_OPTS --log-dir $PERSIST_LOG_DIR --blackbox-dir $BLACKBOX_DIR"
 
     start-stop-daemon -S -b -m -p $PIDFILE -a /bin/sh -- -c "exec $DAEMON $DAEMON_OPTS >> $LOGFILE 2>&1"
     if [ $? -ne 0 ]; then

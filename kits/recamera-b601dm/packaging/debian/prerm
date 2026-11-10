@@ -8,6 +8,8 @@ fi
 rm -f /userdata/local/apps/rebot-teleop.json
 rm -f /userdata/local/apps/rebot-teleop.zh.md
 rm -f /userdata/local/apps/rebot-teleop.md
+# /userdata/rebot-teleop (vision.json, models, logs, blackbox) is kept: the logs and the
+# black box are what explains a reset, also across an upgrade or reinstall.
 
 sync
 echo 2 > /proc/sys/vm/drop_caches 2>/dev/null || true

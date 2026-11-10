@@ -10,6 +10,10 @@ mkdir -p /userdata/datasets
 
 # rebot-vision: config and user models live on /userdata (models are not in the package)
 mkdir -p /userdata/rebot-teleop/models
+# armd (root) writes its rotating log and black box here; kept across upgrades and removal
+mkdir -p /userdata/rebot-teleop/logs /userdata/rebot-teleop/blackbox
+chown root:root /userdata/rebot-teleop/logs /userdata/rebot-teleop/blackbox 2>/dev/null || true
+chmod 0755 /userdata/rebot-teleop/logs /userdata/rebot-teleop/blackbox 2>/dev/null || true
 if [ ! -f /userdata/rebot-teleop/vision.json ]; then
     cp -f /usr/share/rebot-teleop/vision.json.default /userdata/rebot-teleop/vision.json 2>/dev/null || true
 fi
