@@ -115,3 +115,56 @@ Object detection and ArUco come from `rebot-vision`, which is part of this kit's
 | v7_tilt 支架 | 未打印、未试装 | `hardware/v7_tilt/README.txt` |
 
 目标检测和 ArUco 由 `rebot-vision` 提供，包含在本套件的安装包内（README「在 reCamera 上安装」），无需另装相机应用。
+
+## Run your own program
+
+The reCamera gallery runs one app at a time and the camera is exclusive, so a user program runs
+inside the rebot-teleop package, not as a separate gallery app. `rebot-app-run` runs it, restarts
+it after a crash and keeps its log. The runner is covered by host tests
+(`scripts/test_app_runner.sh`); it has not been run on a device yet.
+
+1. Write the program with the stdlib-only `rebot` SDK (rebot-companion). The deb carries the
+   `rebot/` package in `/usr/share/rebot-teleop/python` when it was built with
+   `REBOT_SDK_DIR=<rebot-companion checkout>`. Example: `/usr/share/rebot-teleop/examples/hello/main.py`.
+2. Copy the program to `/userdata/rebot-apps/<name>/` (entry `main.py`).
+3. Start it: `/etc/init.d/K92rebot-teleop app-start <name>`. Other commands: `app-stop`,
+   `app-status`, `app-logs [n]` (default 50 lines).
+4. Start at boot: in the rebot-teleop settings, group "Your Program", set `app.enabled` to true and
+   `app.name` to `<name>` (`/userdata/local/apps/rebot-teleop.config.json`). `start` launches the
+   program after armd; `stop` stops it first.
+
+| Item | Value |
+|---|---|
+| Command | `nice -n 5 python3 -u <entry>`, working directory = the app directory |
+| Environment | `REBOT_HOST=127.0.0.1`, `PYTHONPATH=/usr/share/rebot-teleop/python:<app dir>` |
+| `app.json` (optional) | `{"entry": "main.py", "restart": "on-failure" \| "always" \| "never"}`; default `main.py`, `on-failure` |
+| Restart | exit code 0 ends the runner with `on-failure`; other exits restart after 1, 2, 4 ... 30 s (back to 1 s after a run longer than 60 s); 10 starts within 5 minutes end it with state `given_up` |
+| Stop | SIGTERM to the program, SIGKILL after 10 s |
+| Log | `/userdata/rebot-teleop/logs/app-<name>.log`; above 512 KiB (checked before each start and every 30 s) it is copied to `.1`, `.1` to `.2`, and truncated; bytes written during the copy can be lost |
+| State | `/tmp/rebot-app-<name>.state`: `state` (running, backoff, stopped, given_up), `pid`, `runner`, `starts`, `last_exit` |
+
+### 运行自己的程序
+
+reCamera 应用画廊一次只运行一个应用，摄像头为独占资源，因此用户程序由 rebot-teleop 软件包托管，
+不作为独立的画廊应用。`rebot-app-run` 负责运行、崩溃后重启并保留日志。运行器已有主机端测试
+（`scripts/test_app_runner.sh`），尚未在设备上运行。
+
+1. 用仅依赖标准库的 `rebot` SDK（rebot-companion）编写程序。构建 deb 时设置
+   `REBOT_SDK_DIR=<rebot-companion 检出目录>`，`rebot/` 包会装入 `/usr/share/rebot-teleop/python`。
+   示例：`/usr/share/rebot-teleop/examples/hello/main.py`。
+2. 将程序复制到 `/userdata/rebot-apps/<name>/`（入口 `main.py`）。
+3. 启动：`/etc/init.d/K92rebot-teleop app-start <name>`。其他命令：`app-stop`、`app-status`、
+   `app-logs [n]`（默认 50 行）。
+4. 开机自启：在 rebot-teleop 设置的“自定义程序”组中，将 `app.enabled` 设为 true、`app.name`
+   设为 `<name>`（`/userdata/local/apps/rebot-teleop.config.json`）。`start` 在 armd 之后启动该程序，
+   `stop` 先停止该程序。
+
+| 项目 | 取值 |
+|---|---|
+| 命令 | `nice -n 5 python3 -u <entry>`，工作目录为程序目录 |
+| 环境变量 | `REBOT_HOST=127.0.0.1`，`PYTHONPATH=/usr/share/rebot-teleop/python:<程序目录>` |
+| `app.json`（可选） | `{"entry": "main.py", "restart": "on-failure" \| "always" \| "never"}`；默认 `main.py`、`on-failure` |
+| 重启 | `on-failure` 下退出码 0 即结束；其他退出按 1、2、4 ... 30 秒退避重启（运行超过 60 秒后回到 1 秒）；5 分钟内启动 10 次则以 `given_up` 状态结束 |
+| 停止 | 向程序发 SIGTERM，10 秒后 SIGKILL |
+| 日志 | `/userdata/rebot-teleop/logs/app-<name>.log`；超过 512 KiB（每次启动前及每 30 秒检查）时复制为 `.1`（原 `.1` 变 `.2`）并原地清空，复制期间写入的字节可能丢失 |
+| 状态 | `/tmp/rebot-app-<name>.state`：`state`（running、backoff、stopped、given_up）、`pid`、`runner`、`starts`、`last_exit` |
