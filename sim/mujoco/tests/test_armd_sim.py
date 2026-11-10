@@ -164,7 +164,10 @@ def rig(tmp_path):
 def test_armd_on_simulator(rig):
     client, sim, logs = rig
     fk = Fk()
-    obs = client.observation()
+    # armd answers HTTP before the simulator (python + mujoco import) sends its first state
+    deadline = time.time() + 10
+    while not (obs := client.observation())["feedback_valid"] and time.time() < deadline:
+        time.sleep(0.1)
     print(f"\nboot: feedback_valid={obs['feedback_valid']} enable_state={obs['enable_state']} positions={np.round(obs['positions'], 3).tolist()}")
     assert obs["feedback_valid"], "simulator feedback not reaching armd"
 
@@ -181,8 +184,9 @@ def test_armd_on_simulator(rig):
     assert rec["state"] == "done", json.dumps(rec)
 
     # 2. open the jaws, then move_to above the cube with the tool pointing down
+    t0 = time.time()
     rec = client.wait_action(client.command("/api/v1/action/gripper", {"command": "open", "speed": 2.0, "timeout_s": 10})["action_id"])
-    print(f"gripper open: {rec['state']} gap={rec['gripper_gap_rad']}")
+    print(f"gripper open: {rec['state']} gap={rec['gripper_gap_rad']} in {time.time() - t0:.2f} s")
     assert rec["state"] == "done", json.dumps(rec)
     above = [CUBE_XY[0], CUBE_XY[1], 0.12]
     ack = client.command("/api/v1/action/move_to", {"position": above, "orientation": TOOL_DOWN, "speed": {"linear": 0.1}})
@@ -205,9 +209,11 @@ def test_armd_on_simulator(rig):
     rec = client.wait_action(client.command("/api/v1/action/move_to", {"position": grasp, "orientation": TOOL_DOWN})["action_id"])
     print(f"descend: {rec['state']} tcp={np.round(fk.tcp(client.observation()['positions']), 4).tolist()}")
     assert rec["state"] == "done", json.dumps(rec)
+    t0 = time.time()
     rec = client.wait_action(client.command("/api/v1/action/gripper", {"command": "close", "grasp": True})["action_id"])
+    t_close = time.time() - t0
     obs = client.observation()
-    print(f"gripper close: {rec['state']} holding={rec['holding']} gap={rec['gripper_gap_rad']} q7={obs['positions'][6]:.3f} tau7={obs['torques'][6]:.3f}")
+    print(f"gripper close in {t_close:.2f} s: {rec['state']} holding={rec['holding']} gap={rec['gripper_gap_rad']} q7={obs['positions'][6]:.3f} tau7={obs['torques'][6]:.3f}")
     assert rec["state"] == "done" and rec["holding"] is True, json.dumps(rec)
 
     # 5. lift: the cube comes along (jaw gap stays)
