@@ -90,6 +90,22 @@ pub struct DriverCapabilities {
 }
 
 /// Universal robotic arm hardware driver trait
+/// Name of a Damiao feedback state code that reports a fault (8 and above); None for
+/// the normal states (0 disabled, 1 enabled).
+pub fn damiao_fault_name(code: u8) -> Option<&'static str> {
+    Some(match code {
+        0..=7 => return None,
+        8 => "Overvoltage",
+        9 => "Undervoltage",
+        0xA => "Overcurrent",
+        0xB => "MOS Overtemperature",
+        0xC => "Rotor Overtemperature",
+        0xD => "CAN Communication Loss",
+        0xE => "Overload",
+        _ => "Motor Hardware Fault",
+    })
+}
+
 pub trait ArmDriver: Send {
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
 
@@ -1098,17 +1114,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
     fn check_hardware_status(&self) -> Result<(), ArmDriverError> {
         for (i, &st) in self.motor_status.iter().enumerate() {
             let motor_id = self.motor_ids.get(i).copied().unwrap_or(0);
-            if st >= 8 {
-                let reason = match st {
-                    8 => "Overvoltage",
-                    9 => "Undervoltage",
-                    0xA => "Overcurrent",
-                    0xB => "MOS Overtemperature",
-                    0xC => "Rotor Overtemperature",
-                    0xD => "CAN Communication Loss",
-                    0xE => "Overload",
-                    _ => "Motor Hardware Fault",
-                };
+            if let Some(reason) = damiao_fault_name(st) {
                 return Err(ArmDriverError::HardwareFault(format!(
                     "Joint {} (CAN ID 0x{:X}) reported fault: {}",
                     i, motor_id, reason

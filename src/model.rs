@@ -679,6 +679,17 @@ pub struct ArmObservation {
     /// workspace, blocked hold); null when none applies. See docs/control_safety_contract.md.
     #[serde(default)]
     pub motion_limit: Option<MotionLimit>,
+    /// Per joint: the motor's reported fault code, or null. Empty when the driver
+    /// reports no motor state (Damiao state codes 8-14).
+    #[serde(default)]
+    pub motor_errors: Vec<Option<MotorError>>,
+}
+
+/// A motor fault code reported in the motor's feedback (`observation.motor_errors`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MotorError {
+    pub code: u8,
+    pub name: String,
 }
 
 /// Why armd is shaping or refusing the requested motion (`observation.motion_limit`).

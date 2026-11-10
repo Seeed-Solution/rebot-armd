@@ -157,6 +157,8 @@ pub struct SupervisorInner {
     /// Per joint, while the servo lead cap holds it: when the current run started and
     /// the measured position then (blocked detection, [`SERVO_BLOCKED_PROGRESS_RAD`]).
     pub servo_lead_stall: Vec<Option<(Instant, f32)>>,
+    /// Published as `observation.motor_errors`; a change is logged once per joint.
+    pub motor_errors: Vec<Option<crate::model::MotorError>>,
     /// Published as `observation.motion_limit`.
     pub motion_limit: Option<MotionLimit>,
     /// Observation-clock time (s) `motion_limit` last applied.
@@ -270,6 +272,7 @@ impl SupervisorInner {
             servo_target: None,
             servo_settled_ticks: vec![0; dof],
             servo_lead_stall: vec![None; dof],
+            motor_errors: Vec::new(),
             motion_limit: None,
             motion_limit_seen_s: 0.0,
             servo_blocked_hold: false,
@@ -350,6 +353,26 @@ impl SupervisorInner {
     /// at `config.servo_max_velocity` per joint, except the 7-DOF gripper (index 6).
     pub fn servo_limits(&self) -> Vec<crate::model::JointLimit> {
         self.config.servo_limits()
+    }
+
+    fn decode_motor_errors(status: Vec<u8>) -> Vec<Option<crate::model::MotorError>> {
+        status.into_iter().map(|code| crate::driver::damiao_fault_name(code)
+            .map(|name| crate::model::MotorError { code, name: name.to_string() })).collect()
+    }
+
+    /// Store the motor error codes, logging each per-joint change once.
+    fn update_motor_errors(&mut self, errors: Vec<Option<crate::model::MotorError>>) {
+        if errors == self.motor_errors { return; }
+        for (i, e) in errors.iter().enumerate() {
+            let prev = self.motor_errors.get(i).cloned().flatten();
+            match (prev, e) {
+                (p, Some(e)) if p.as_ref() != Some(e) =>
+                    tracing::warn!("Joint {} motor reports error code 0x{:X} ({})", i + 1, e.code, e.name),
+                (Some(p), None) => tracing::info!("Joint {} motor error 0x{:X} ({}) cleared", i + 1, p.code, p.name),
+                _ => {}
+            }
+        }
+        self.motor_errors = errors;
     }
 
     /// Report that `reason` shapes the motion now. The same reason keeps its start time;
@@ -540,6 +563,7 @@ impl SupervisorInner {
             driver_range_check: self.driver.as_ref().and_then(|d| d.lock().ok().and_then(|drv| drv.range_check())),
             lease_holder: self.lease_holder(),
             motion_limit: self.motion_limit.clone(),
+            motor_errors: self.motor_errors.clone(),
         }
     }
 
@@ -2071,6 +2095,7 @@ impl SupervisorInner {
 
         // Polling a cached sample never refreshes its hardware receive timestamp.
         let mut invalid_feedback = false;
+        let mut motor_status = None;
         if let Some(ref d) = self.driver {
             self.feedback_numeric_valid = false;
             if let Ok(mut driver) = d.lock() {
@@ -2091,8 +2116,10 @@ impl SupervisorInner {
                         }
                     }
                 }
+                motor_status = driver.motor_status();
             }
         }
+        self.update_motor_errors(motor_status.map(Self::decode_motor_errors).unwrap_or_default());
         if invalid_feedback && self.is_torqued && !self.safety.state().is_stopped() {
             self.stop_motion();
             self.commanded_velocities.fill(0.0);

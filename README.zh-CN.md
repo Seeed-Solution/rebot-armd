@@ -281,7 +281,7 @@ v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 
 | 路径 | 方法 | 用途 |
 |---|---|---|
-| `/api/v1/observation` | GET | 位置、速度、力矩、温度、安全状态、`commanded_positions`、最近的 `action`、驱动能力、`driver_range_check`（启动时从电机读出的达妙映射范围）、`motion_limit`（正在作用的 servo 限速 / 领先量上限、关节限位、工作空间或受阻保持；[契约](docs/control_safety_contract.md#servo-streaming-guard--流式控制保护)） |
+| `/api/v1/observation` | GET | 位置、速度、力矩、温度、安全状态、`commanded_positions`、最近的 `action`、驱动能力、`driver_range_check`（启动时从电机读出的达妙映射范围）、`motion_limit`（正在作用的 servo 限速 / 领先量上限、关节限位、工作空间或受阻保持；[契约](docs/control_safety_contract.md#servo-streaming-guard--流式控制保护)）、`motor_errors`（各关节电机错误码） |
 | `/api/v1/observation/schema` | GET | 自由度、关节名、限位、工作空间、相机安装参数、`capabilities`（[字段](docs/architecture.zh-CN.md#3-能力发现)） |
 | `/api/v1/ws` | WS | 租约（`acquire_lease`、`heartbeat`）、`command` / `command_ack` / `command_reject`、遥测 |
 | `/api/v1/safety/e_stop` | POST | 急停，不需要租约 |
