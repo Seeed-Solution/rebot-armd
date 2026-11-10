@@ -88,7 +88,7 @@ try:
     if 'sta_ssid' in net: print(f\"STA_SSID='{net['sta_ssid']}'\")
     if 'sta_password' in net: print(f\"STA_PASS='{net['sta_password']}'\")
     import re
-    if app.get('enabled') in (True, 'true', 'True', 1, '1'): print(\"APP_ENABLED='1'\")
+    if app.get('enabled') in (True, 'true', 'True', 1, '1', 'on'): print(\"APP_ENABLED='1'\")
     if isinstance(app.get('name'), str) and re.fullmatch(r'[A-Za-z0-9._-]+', app['name']) and app['name'] not in ('.', '..'): print(f\"APP_NAME='{app['name']}'\")
 except Exception:
     pass

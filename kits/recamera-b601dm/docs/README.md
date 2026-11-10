@@ -129,7 +129,7 @@ it after a crash and keeps its log. The runner is covered by host tests
 2. Copy the program to `/userdata/rebot-apps/<name>/` (entry `main.py`).
 3. Start it: `/etc/init.d/K92rebot-teleop app-start <name>`. Other commands: `app-stop`,
    `app-status`, `app-logs [n]` (default 50 lines).
-4. Start at boot: in the rebot-teleop settings, group "Your Program", set `app.enabled` to true and
+4. Start at boot: in the rebot-teleop settings, group "Your Program", set `app.enabled` to `on` and
    `app.name` to `<name>` (`/userdata/local/apps/rebot-teleop.config.json`). `start` launches the
    program after armd; `stop` stops it first.
 
@@ -155,7 +155,7 @@ reCamera 应用画廊一次只运行一个应用，摄像头为独占资源，�
 2. 将程序复制到 `/userdata/rebot-apps/<name>/`（入口 `main.py`）。
 3. 启动：`/etc/init.d/K92rebot-teleop app-start <name>`。其他命令：`app-stop`、`app-status`、
    `app-logs [n]`（默认 50 行）。
-4. 开机自启：在 rebot-teleop 设置的“自定义程序”组中，将 `app.enabled` 设为 true、`app.name`
+4. 开机自启：在 rebot-teleop 设置的“自定义程序”组中，将 `app.enabled` 设为 `on`、`app.name`
    设为 `<name>`（`/userdata/local/apps/rebot-teleop.config.json`）。`start` 在 armd 之后启动该程序，
    `stop` 先停止该程序。
 
