@@ -78,7 +78,7 @@ from the projects below.
 ### sscma-example-sg200x application code (copied)
 
 - Upstream: https://github.com/Seeed-Studio/sscma-example-sg200x (fork
-  https://github.com/suharvest/sscma-example-sg200x, branch `phase3-hw`), commit
+  https://github.com/suharvest/sscma-example-sg200x, branch `main`), commit
   `9af8118e556c01872ed2cd583abd0c1191df9c6c`.
 - License: Apache-2.0, text in `kits/recamera-b601dm/vision/LICENSE-APACHE` (installed as
   `/usr/share/doc/rebot-teleop/LICENSE-APACHE`). Copyright Seeed Technology Co., Ltd.

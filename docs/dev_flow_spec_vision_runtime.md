@@ -89,10 +89,10 @@ from the console schema), ONVIF meta, privacy blur (`yolo-detector/main/main.cpp
 Estimated copied/new C++: 1.5-2.0 k lines (needs verification after the merge).
 
 Pin rules:
-- `sscma.lock` must name a commit that exists on a public remote. The local checkout is on `phase3-hw`,
-  17 commits ahead of `origin/main` (`git rev-list --count origin/main..phase3-hw`), and `origin` is the
-  fork `github.com/suharvest/sscma-example-sg200x`. Which of those commits `rebot-vision` needs, and whether
-  they get pushed or merged upstream (`Seeed-Studio/sscma-example-sg200x`), is an open item.
+- `sscma.lock` must name a commit that exists on a public remote. Since 2026-11-10 the pinned commit
+  `9af8118` is the head of `main` on the fork `github.com/suharvest/sscma-example-sg200x` (fast-forwarded
+  from `phase3-hw`). The fork is about 305 commits ahead of `Seeed-Studio/sscma-example-sg200x`; the parts
+  rebot-vision depends on (video/VPSS VB blocks, camera copy, websocket transport) are not upstream yet.
 - `kits/recamera-b601dm/vision/CMakeLists.txt` fails configure when `git -C $SSCMA_ROOT rev-parse HEAD` differs from the lock,
   unless `-DREBOT_VISION_ALLOW_UNPINNED=ON`.
 - `components/libwebsockets/fetch_and_build.sh` must be run once per SSCMA checkout
@@ -685,8 +685,8 @@ sensecraft-solutions: `feat(rebot_agent_arm): drop camera app step for rebot-tel
 
 ## 9. Open questions
 
-1. Which `phase3-hw` commits of sscma-example-sg200x does `rebot-vision` need, and where will the pinned
-   commit be published (fork or upstream)?
+1. Resolved 2026-11-10: the pinned commit is published on the fork's `main`. Open: which of the fork's
+   changes to upstream to `Seeed-Studio/sscma-example-sg200x`.
 2. CPU budget numbers (70 % total, armd jitter) and the default fps follow from 8.2 item 6.
 3. Is the CH0 640x640 frame letterboxed (2.2)? If not, the ArUco crop and the coordinate change in 2.3 change.
 4. Can the sscma-micro engine reload a model in-process (2.5), or does model switching restart `rebot-vision`?

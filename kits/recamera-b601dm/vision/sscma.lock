@@ -1,9 +1,8 @@
 # sscma-example-sg200x checkout that rebot-vision builds against (SSCMA_ROOT).
 # CMakeLists.txt compares `git -C $SSCMA_ROOT rev-parse HEAD` with `commit` and stops
 # unless -DREBOT_VISION_ALLOW_UNPINNED=ON.
-# Open item: this commit is on the local branch phase3-hw of the fork and not yet on a
-# public remote (docs/dev_flow_spec_vision_runtime.md section 1.2).
+# The commit is public on the fork's main branch (also on branch phase3-hw).
 repo=https://github.com/suharvest/sscma-example-sg200x
-branch=phase3-hw
+branch=main
 commit=9af8118e556c01872ed2cd583abd0c1191df9c6c
 # components/libwebsockets/fetch_and_build.sh must have produced components/libwebsockets/prebuilt
