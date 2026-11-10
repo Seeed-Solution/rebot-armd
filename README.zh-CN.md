@@ -150,8 +150,8 @@ TODO / 路线图：
 构建安装包（见 [交叉编译](#交叉编译到-recamera)）或使用发布的 `.deb`，复制到摄像头并安装。`192.168.42.1` 是 reCamera 的 USB 网络地址；连接本包启动的 Wi-Fi 热点时，摄像头地址为 `192.168.16.1`。
 
 ```bash
-scp dist/rebot-teleop_1.3.6_riscv64.deb root@192.168.42.1:/tmp/
-ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.3.6_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
+scp dist/rebot-teleop_1.3.7_riscv64.deb root@192.168.42.1:/tmp/
+ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.3.7_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
 ```
 
 安装内容：
@@ -213,8 +213,8 @@ curl -LO https://github.com/Seeed-Solution/rebot-armd/releases/download/v$V/SHA2
 sha256sum --ignore-missing -c SHA256SUMS
 
 REBOT_VISION_BIN=$PWD/rebot-vision-$V-riscv64 \
-./scripts/build_deb.sh 1.3.6          # 版本参数可省略（默认取 debian/control）
-# -> dist/rebot-teleop_1.3.6_riscv64.deb
+./scripts/build_deb.sh 1.3.7          # 版本参数可省略（默认取 debian/control）
+# -> dist/rebot-teleop_1.3.7_riscv64.deb
 ```
 
 如需从源码构建 `rebot-vision`，设置 `RECAMERA_DOCKER=<容器名>`（一个正在运行的 `sophgo/tpuc_dev:v3.1` 容器，`/recamera` 下有 host-tools、reCamera OS SDK 和 `sscma-example-sg200x`），`build_deb.sh` 会调用 `scripts/build_vision.sh`。逐步命令见 [kits/recamera-b601dm/vision/README.md](kits/recamera-b601dm/vision/README.md#build)。

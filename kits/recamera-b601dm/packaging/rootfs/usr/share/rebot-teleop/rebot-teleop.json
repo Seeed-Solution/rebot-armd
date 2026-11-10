@@ -1,6 +1,6 @@
 {
   "id": "rebot-teleop",
-  "version": "1.3.6",
+  "version": "1.3.7",
   "name": "reBot Teleoperation & Vision",
   "name_zh": "reBot 具身视觉遥控与机械臂驱动",
   "scene": "Robotics & Embodied AI",

@@ -197,8 +197,8 @@ copy it to the camera and install it. `192.168.42.1` is the reCamera's address o
 when connected to the access point that this package starts, the camera is `192.168.16.1`.
 
 ```bash
-scp dist/rebot-teleop_1.3.6_riscv64.deb root@192.168.42.1:/tmp/
-ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.3.6_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
+scp dist/rebot-teleop_1.3.7_riscv64.deb root@192.168.42.1:/tmp/
+ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.3.7_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
 ```
 
 The package installs:
@@ -290,8 +290,8 @@ curl -LO https://github.com/Seeed-Solution/rebot-armd/releases/download/v$V/SHA2
 sha256sum --ignore-missing -c SHA256SUMS
 
 REBOT_VISION_BIN=$PWD/rebot-vision-$V-riscv64 \
-./scripts/build_deb.sh 1.3.6          # version argument optional (default: debian/control)
-# -> dist/rebot-teleop_1.3.6_riscv64.deb
+./scripts/build_deb.sh 1.3.7          # version argument optional (default: debian/control)
+# -> dist/rebot-teleop_1.3.7_riscv64.deb
 ```
 
 To build `rebot-vision` from source instead, set `RECAMERA_DOCKER=<container>` (a running
