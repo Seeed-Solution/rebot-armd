@@ -79,13 +79,58 @@ on the CPU on a zero-copy crop of the visible 640x360 band of the same frame.
   | `["aruco"]` | 108-170 | aruco 45-71 |
   | `["yolo","aruco"]` | 124-221 | yolo 45-48, aruco 43-59 |
 
-  Open issues seen in these runs, not yet investigated:
-  - 4 of 10 YOLO triggers took 286-607 ms while YOLO itself took 47 ms; with 1.3.0 all YOLO
-    triggers returned in 96-137 ms. The extra time is outside the pipeline (frame wait or
-    request handling).
-  - ArUco in a trigger frame takes 56-67 ms against 37 ms per frame in a subscription.
+  Open issues seen in these runs, investigated afterwards (1.3.1 and 1.3.0 binaries swapped on
+  the device and interleaved, 4 rounds x 10 triggers per set each; then a build with the trigger
+  `timing` object, 5 rounds of 15 per set; arm torque off; all on-device node scripts, 1.2-1.6 s between
+  triggers):
+  - YOLO trigger tail (286-607 ms): not a 1.3.1 regression and mostly not rebot-vision time.
+    The first trigger a node process sends takes 523-611 ms with both binaries (8 of 8 runs),
+    the rest are alike:
+
+    | binary | first trigger of the script | other YOLO triggers, ms p50 / p95 / max | > 250 ms | ArUco triggers, ms p50 / p95 / max |
+    |---|---|---|---|---|
+    | 1.3.0 | 542, 530, 548, 531 | 149 / 240 / 500 (n 36) | 2 | 148 / 260 / 790 (n 40) |
+    | 1.3.1 | 611, 556, 523, 545 | 135 / 211 / 408 (n 36) | 1 | 128 / 194 / 441 (n 40) |
+
+    The `timing` timestamps put the first trigger's extra 400 ms in the client: 204-206 ms from
+    the client's request to the server's `accept`, 101-126 ms from `accept` to the end of the
+    request, 123-139 ms from the reply to the client having it; gate to frame 36-65 ms and
+    YOLO 48 ms as in every other trigger. With three `GET /api/mode` requests first, the
+    first trigger took 181 and 123 ms. The 1.3.0 figures of 96-137 ms came from a client
+    that was already warm. The triggers above 250 ms that remain (8 of 147 with `timing`)
+    are a pipeline preempted on the single core (frame to publish 141-597 ms; YOLO is 47 ms
+    otherwise) or a client delay (client to `accept` 56-119 ms); none waited past a frame
+    (`skipped` 0 in all 150). Gate to frame: p50 43-56 ms, max 107 ms (one CH0 frame is
+    67 ms).
+  - ArUco slower in a trigger: only the `clusters` stage grows. Same scene (7-8 candidate quads;
+    the 37 ms above was a scene with 4), 50 frames per case, ms p50:
+
+    | case | ArUco ms p50 / p95 | gray | threshold | unionfind | clusters | quad fit | refine |
+    |---|---|---|---|---|---|---|---|
+    | subscription @ 1 (frames 1 s apart, gate 2 fps) | 56.4 / 191.6 | 4.8 | 2.9 | 5.9 | 14.8 | 21.0 | 3.6 |
+    | subscription @ 2 | 53.3 / 59.8 | 4.9 | 2.8 | 6.0 | 14.3 | 20.2 | 3.6 |
+    | subscription @ 5 | 55.9 / 73.2 | 4.8 | 2.8 | 6.2 | 14.4 | 20.9 | 4.0 |
+    | subscription @ 10 (gate 30 fps, as during a trigger) | 55.5 / 59.7 | 4.9 | 2.8 | 6.2 | 14.5 | 20.9 | 3.6 |
+    | trigger from standby | 61.2 / 204.1 | 4.9 | 2.8 | 5.9 | 19.4 | 21.2 | 4.0 |
+    | trigger from standby, client on another host (30) | 63.4 / 67.0 | 4.9 | 2.9 | 5.9 | 20.2 | 22.8 | 4.0 |
+
+    Ruled out: an idle gap before the frame (subscription @ 1 has a 1 s gap and no growth), the
+    open camera gate's copies (subscription @ 10 runs with the same gate), the measuring client
+    on the device (same with the client on another host), and the trigger skipping the patched
+    path (`ArucoStage::run` takes the same detector path; `full_scan` only turns ROI tracking
+    off, which is off by default). The cause is not found: something specific to the trigger
+    frame costs about 5 ms in the gradient-cluster pass. Not yet run: a trigger while a
+    subscription @ 1 runs, which separates the trigger frame from the standby state.
   - A shell loop polling the API with `curl` every 100 ms on the device raises ArUco wall time
-    to about 170 ms (one core); measure with process CPU ticks or a low-overhead script.
+    to about 170 ms (one core); measure with process CPU ticks or a low-overhead script, and
+    warm a node client up before timing its first request.
+
+  `POST /api/trigger` returns a `timing` object (`mono_ms`, CLOCK_MONOTONIC, the clock of
+  node's `process.hrtime`): `accept_ms` (connection accepted), `read_ms` (request read),
+  `request_ms` (trigger registered), `gate_ms` (camera gate opened), `wait_ms` (frame thread
+  started waiting for the serving frame), `grab_ms` (frame retrieved), `frame_ms`, `done_ms`
+  (pipelines done, result published), `wake_ms` (request thread woke), `reply_ms` (reply
+  built) and `skipped` (frames planned after the request that did not serve it).
 
 ## ArUco cost
 
