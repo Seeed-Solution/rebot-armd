@@ -855,7 +855,7 @@ pub struct SchemaField {
 }
 
 /// Version of the capability summary in the observation schema (`capabilities`).
-pub const CAPABILITIES_VERSION: u32 = 5;
+pub const CAPABILITIES_VERSION: u32 = 6;
 
 /// Vision features armd offers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -918,6 +918,23 @@ pub struct Capabilities {
     /// (their `enabled` says whether this armd writes the files). Present from
     /// capabilities version 5.
     pub diagnostics: bool,
+    /// `/api/v1/ws?obs_hz=N` limits the observation rate per connection. Present from
+    /// capabilities version 6, like the fields below.
+    pub obs_rate: bool,
+    /// `observation.fault` carries `{code, message, recoverable}` in Fault / EStop.
+    pub fault_codes: bool,
+    /// Named poses: `GET /api/v1/poses`, WS `/api/v1/poses/save|delete`, action `move_to_pose`.
+    pub poses: bool,
+    /// Keep-out boxes (`workspace.keepout_boxes`, `/api/v1/workspace/keepout`); needs the
+    /// workspace check.
+    pub keepout: bool,
+    /// The profile `speed_cap` section is honoured and published as `schema.speed_cap`.
+    pub speed_cap: bool,
+    /// `observation.residual_torques` can be non-null (profile gravity model); it stays null
+    /// without torque feedback.
+    pub residual_torques: bool,
+    /// `GET /api/v1/diagnostics/tick`.
+    pub tick_stats: bool,
     pub vision: VisionCapabilities,
 }
 
@@ -939,6 +956,13 @@ impl Capabilities {
             damiao_ranges: config.damiao_ranges.is_some(),
             servo_guard: true,
             diagnostics: true,
+            obs_rate: true,
+            fault_codes: true,
+            poses: true,
+            keepout: kin && config.workspace.is_some(),
+            speed_cap: true,
+            residual_torques: config.gravity_model.is_some() && matches!(config.dof, 6 | 7),
+            tick_stats: true,
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }
