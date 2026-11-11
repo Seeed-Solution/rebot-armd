@@ -228,6 +228,7 @@ impl SupervisorInner {
                 "workspace": workspace,
                 "keepout_boxes": keepout.boxes,
                 "keepout_source": keepout.source,
+                "keepout_rule": "boxes in force = profile boxes + runtime boxes (each tagged with its source); the runtime list cannot remove a profile box",
                 "speed_cap": cap,
                 "action_speed_max": {
                     "linear_mps": cap.and_then(|s| s.linear_mps).map_or(MAX_LINEAR_MPS, |v| MAX_LINEAR_MPS.min(f64::from(v))),

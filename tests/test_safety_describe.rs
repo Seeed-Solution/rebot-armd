@@ -168,7 +168,7 @@ async fn runtime_keepout_is_reflected() {
     supervisor.inner().write().await.set_keepout_boxes(vec![b]).unwrap();
     let after = describe(&supervisor).await;
     assert_eq!(after["limits"]["keepout_source"], "runtime");
-    assert_eq!(after["limits"]["keepout_boxes"], json!([{"name": "tray", "min_m": [0.2f32, -0.1f32, 0.0f32], "max_m": [0.3f32, 0.1f32, 0.1f32]}]));
+    assert_eq!(after["limits"]["keepout_boxes"], json!([{"name": "tray", "min_m": [0.2f32, -0.1f32, 0.0f32], "max_m": [0.3f32, 0.1f32, 0.1f32], "source": "runtime"}]));
 }
 
 #[tokio::test]

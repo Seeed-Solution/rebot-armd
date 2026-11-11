@@ -296,7 +296,7 @@ v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 | `/api/v1/torque`、`/api/v1/motion/*`、`/api/v1/action/*`、`/api/v1/mode/gravity_comp`、`/api/v1/safety/clear_fault` | POST | 返回 `409 LEASE_REQUIRED`；请把相同路径作为 WS `command` 发送 |
 | `/api/v1/grasp/setup` | GET | 抓取设置（通过 WS 指令修改） |
 | `/api/v1/poses` | GET | 命名姿态（通过 WS 指令保存、删除，供 `move_to_pose` 动作使用；[格式](docs/agent_action_api.md#named-poses--命名姿态)） |
-| `/api/v1/workspace/keepout` | GET | 禁入盒及其来源（`profile` 或 `runtime`；通过 WS 指令替换） |
+| `/api/v1/workspace/keepout` | GET | 生效的禁入盒，每个标注 `profile` 或 `runtime`（运行时列表通过 WS 指令设置，只能增加禁入盒） |
 | `/api/v1/diagnostics/boots`、`/api/v1/diagnostics/blackbox?seconds=N[&prev=1]`、`/api/v1/diagnostics/tick` | GET | 启动记录、黑匣子记录（复位前的状态）与控制周期耗时，无需租约（[格式](docs/agent_action_api.md#diagnostics--诊断)） |
 | `/api/v1/dataset/record/start` / `save` / `discard` | POST | 示教片段录制 |
 | `/api/v1/detection/latest`、`/trigger`、`/inference`、`/ws` | GET / POST / WS | 检测服务代理 |

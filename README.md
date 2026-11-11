@@ -462,7 +462,7 @@ WebSocket that holds the lease.
 | `/api/v1/torque`, `/api/v1/motion/*`, `/api/v1/action/*`, `/api/v1/mode/gravity_comp`, `/api/v1/safety/clear_fault` | POST | return `409 LEASE_REQUIRED`; send the same paths as WS `command`s |
 | `/api/v1/grasp/setup` | GET | grasp setup (changed with a WS command) |
 | `/api/v1/poses` | GET | named poses (saved and deleted with WS commands, used by the `move_to_pose` action; [format](docs/agent_action_api.md#named-poses--命名姿态)) |
-| `/api/v1/workspace/keepout` | GET | keep-out boxes and their source (`profile` or `runtime`; replaced with a WS command) |
+| `/api/v1/workspace/keepout` | GET | keep-out boxes in force, each tagged `profile` or `runtime` (the runtime list, set with a WS command, only adds boxes) |
 | `/api/v1/diagnostics/boots`, `/api/v1/diagnostics/blackbox?seconds=N[&prev=1]`, `/api/v1/diagnostics/tick` | GET | boot records, black-box records (state before a reset) and control tick timing, no lease needed ([format](docs/agent_action_api.md#diagnostics--诊断)) |
 | `/api/v1/dataset/record/start` / `save` / `discard` | POST | episode recording |
 | `/api/v1/detection/latest`, `/trigger`, `/inference`, `/ws` | GET / POST / WS | detector proxy |

@@ -106,7 +106,7 @@ the camera mount (`cam_mount`) uses the second-to-last joint as the wrist axis. 
 hardware), template [`kits/_template/profile/example_urdf.json`](../kits/_template/profile/example_urdf.json).
 - The grasp setup can also come from `ARMD_GRASP_SETUP` (runtime changes, persisted).
 - Runtime keep-out boxes (`ARMD_KEEPOUT`, default `/userdata/rebot-teleop/keepout.json`)
-  replace `workspace.keepout_boxes` when present; named poses are stored in `ARMD_POSES`
+  are added to `workspace.keepout_boxes` (they cannot remove a profile box); named poses are stored in `ARMD_POSES`
   (default `/userdata/rebot-teleop/poses.json`); the runtime collision guard setting in
   `ARMD_COLLISION` (default `/userdata/rebot-teleop/collision.json`) replaces `collision.enabled`
   when present. The files are written atomically; an invalid file is logged at start and left

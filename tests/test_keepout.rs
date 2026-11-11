@@ -84,7 +84,7 @@ fn keepout_lists_are_validated() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn runtime_keepout_replaces_the_profile_list_and_is_persisted() {
+async fn runtime_keepout_adds_to_the_profile_list_and_is_persisted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("keepout.json");
     let supervisor = Arc::new(ArmSupervisor::new(with_boxes(vec![cube("profile_box", [0.3, 0.3, 0.3])])));
@@ -94,6 +94,7 @@ async fn runtime_keepout_replaces_the_profile_list_and_is_persisted() {
     let state = get().await;
     assert_eq!(state["source"], "profile");
     assert_eq!(state["boxes"][0]["name"], "profile_box");
+    assert_eq!(state["boxes"][0]["source"], "profile");
 
     let p0 = tcp(&INSPECT);
     let mid = [p0[0] + 0.04, p0[1], p0[2]];
@@ -104,9 +105,11 @@ async fn runtime_keepout_replaces_the_profile_list_and_is_persisted() {
     assert_eq!(ack["persisted"], true);
     let state = get().await;
     assert_eq!(state["source"], "runtime");
-    assert_eq!(state["boxes"].as_array().unwrap().len(), 1);
-    assert_eq!(state["boxes"][0]["name"], "tray");
+    assert_eq!(state["boxes"].as_array().unwrap().len(), 2, "{state}");
+    assert_eq!((&state["boxes"][0]["name"], &state["boxes"][0]["source"]), (&json!("profile_box"), &json!("profile")));
+    assert_eq!((&state["boxes"][1]["name"], &state["boxes"][1]["source"]), (&json!("tray"), &json!("runtime")));
     let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved["boxes"].as_array().unwrap().len(), 1, "only the runtime list is persisted: {saved}");
     assert_eq!(saved["boxes"][0]["name"], "tray");
 
     let reply = common::rpc(&mut ws, generation, epoch, "/api/v1/action/move_to",
@@ -118,7 +121,15 @@ async fn runtime_keepout_replaces_the_profile_list_and_is_persisted() {
     // Invalid list: refused, previous list kept.
     let reply = common::rpc(&mut ws, generation, epoch, "/api/v1/workspace/keepout", json!({"boxes": vec![b.clone(); 17]})).await;
     assert_eq!(reply["code"], "INVALID_COMMAND", "{reply}");
-    assert_eq!(get().await["boxes"][0]["name"], "tray");
+    assert_eq!(get().await["boxes"][1]["name"], "tray");
+    // An empty runtime list removes no profile box.
+    let ack = common::rpc(&mut ws, generation, epoch, "/api/v1/workspace/keepout", json!({"boxes": []})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let state = get().await;
+    assert_eq!(state["boxes"].as_array().unwrap().len(), 1, "{state}");
+    assert_eq!(state["boxes"][0]["name"], "profile_box");
+    let ack = common::rpc(&mut ws, generation, epoch, "/api/v1/workspace/keepout", json!({"boxes": [b]})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
 
     // A new start loads the runtime list.
     let again = ArmSupervisor::new(ArmConfig::rebot_dm());
@@ -200,4 +211,26 @@ fn servo_stream_cannot_sweep_through_a_keepout_box() {
     assert!((inner.commanded_positions[0] - INSPECT[0]).abs() > 0.03, "moved towards the box first");
     let limit = inner.motion_limit.as_ref().expect("motion_limit");
     assert_eq!(limit.reason, armd::model::MotionLimitReason::Workspace);
+}
+
+/// The runtime list adds to the profile list: a profile box stays enforced whatever the
+/// runtime list is, and the combined list is capped.
+#[test]
+fn runtime_keepout_is_additive_with_the_profile() {
+    let p0 = tcp(&INSPECT);
+    let mid = [p0[0] + 0.04, p0[1], p0[2]];
+    let mut inner = sim_at(with_boxes(vec![cube("fixture", mid)]), &INSPECT);
+    inner.set_keepout_boxes(vec![cube("aside", [mid[0], mid[1] + 0.3, mid[2]])]).unwrap();
+    let names: Vec<_> = inner.config.workspace.as_ref().unwrap().keepout_boxes.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(names, ["fixture", "aside"]);
+    inner.set_keepout_boxes(vec![]).unwrap();
+    let input = inner.plan_input().unwrap();
+    let g = resolve_goal(&input, &GoalSpec::Absolute { p: [p0[0] + 0.08, p0[1], p0[2]], r: None });
+    match plan_cartesian(&input, g, Speed::default()) {
+        Err(MotionError::WorkspaceViolation { limit, .. }) => assert_eq!(limit, "keepout 'fixture'"),
+        other => panic!("profile box must stay in force, got {other:?}"),
+    }
+    let sixteen: Vec<_> = (0..16).map(|i| cube(&format!("r{i}"), [0.3, 0.3, 0.05 * f64::from(i)])).collect();
+    assert!(matches!(inner.set_keepout_boxes(sixteen), Err(ArmError::Motion(MotionError::InvalidCommand(_)))), "17 in force");
+    assert_eq!(inner.keepout_state().boxes.len(), 1);
 }

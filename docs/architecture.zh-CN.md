@@ -81,7 +81,7 @@ rebot-armd 分三层。核心可在任何受支持的控制器上运行；套件
 
 tip 坐标系是工作空间检查点和笛卡尔目标所在的坐标系；使用链时相机安装（`cam_mount`）以倒数第二个关节为腕部轴。Profile：[`profiles/rebot_b601_rs.json`](../profiles/rebot_b601_rs.json)（B601-RS，未在实机验证），模板 [`kits/_template/profile/example_urdf.json`](../kits/_template/profile/example_urdf.json)。
 - 抓取设置也可来自 `ARMD_GRASP_SETUP`（运行时修改并持久化）。
-- 运行时禁入盒（`ARMD_KEEPOUT`，默认 `/userdata/rebot-teleop/keepout.json`）存在时替换 `workspace.keepout_boxes`；命名姿态保存在 `ARMD_POSES`（默认 `/userdata/rebot-teleop/poses.json`）；运行时碰撞保护设置保存在 `ARMD_COLLISION`（默认 `/userdata/rebot-teleop/collision.json`），存在时替换 `collision.enabled`。这些文件都以原子方式写入；启动时文件无效则记录日志并保持原样。
+- 运行时禁入盒（`ARMD_KEEPOUT`，默认 `/userdata/rebot-teleop/keepout.json`）存在时追加到 `workspace.keepout_boxes`（不能删除 profile 中的禁入盒）；命名姿态保存在 `ARMD_POSES`（默认 `/userdata/rebot-teleop/poses.json`）；运行时碰撞保护设置保存在 `ARMD_COLLISION`（默认 `/userdata/rebot-teleop/collision.json`），存在时替换 `collision.enabled`。这些文件都以原子方式写入；启动时文件无效则记录日志并保持原样。
 
 官方套件把 B601-DM profile 以数据形式提供：`kits/recamera-b601dm/profile/rebot-b601dm.json`；与 `rebot_dm()` 不一致时 `tests/test_arm_profile.rs` 失败。
 
