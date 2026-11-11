@@ -470,3 +470,22 @@ fn supported_joints_at_the_resting_pose_do_not_trip() {
     ticks(&mut inner, 5);
     assert_eq!(inner.collision.hold.map(|h| h.joint), Some(2), "J3 away from home trips");
 }
+
+/// The support exemption needs a tolerance for every arm joint: a profile with a short
+/// tolerance vector is refused, and an unvalidated one never exempts (J6 far off home).
+#[test]
+fn short_resting_tolerances_are_refused_and_never_exempt() {
+    let mut config = profile(Some(policy()));
+    config.resting_pose.as_mut().unwrap().position_tolerances = vec![0.15, 0.08, 0.08];
+    let err = config.clone().validate().unwrap_err();
+    assert!(err.contains("position_tolerances needs a value for each of the 6 arm joints"), "{err}");
+    let (mut inner, arm) = rig(Some(policy()));
+    inner.config.resting_pose.as_mut().unwrap().position_tolerances = vec![0.15, 0.08, 0.08];
+    let mut q: Vec<f32> = inner.config.home_positions.clone();
+    q[5] += 1.0; // J6 far from home, J1..J5 at home
+    arm.0.lock().unwrap().q.copy_from_slice(&q);
+    inner.commanded_positions = q.clone();
+    inner.target_positions = q.clone();
+    ticks(&mut inner, 3);
+    assert_eq!(inner.collision_supported_joints(), [false; 6]);
+}

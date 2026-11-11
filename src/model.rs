@@ -555,6 +555,15 @@ impl ArmConfig {
     /// Number of arm joints of the kinematic / gravity model (6 for the built-in model).
     pub fn arm_dof(&self) -> usize { self.arm_model.arm_dof() }
 
+    /// Joints the resting-pose position check must cover: every joint before a trailing
+    /// gripper (all joints when the gripper is not the last one or there is none).
+    pub fn resting_arm_joints(&self) -> usize {
+        match self.gripper_index() {
+            Some(g) if g + 1 == self.dof => g,
+            _ => self.dof,
+        }
+    }
+
     /// Index of the gripper joint, if the profile has one.
     pub fn gripper_index(&self) -> Option<usize> {
         self.gripper_joint.or_else(|| (self.dof > self.arm_dof()).then_some(self.arm_dof()))
@@ -719,6 +728,10 @@ impl ArmConfig {
         }
         if let Some(g) = &self.grasp { g.validate().map_err(|e| format!("Invalid grasp setup: {e}"))?; }
         if let Some(policy) = &self.resting_pose {
+            if policy.position_tolerances.len() < self.resting_arm_joints() {
+                return Err(format!("resting_pose.position_tolerances needs a value for each of the {} arm joints",
+                                   self.resting_arm_joints()));
+            }
             if policy.position_tolerances.is_empty() || policy.position_tolerances.len() > self.dof
                 || policy.position_tolerances.iter().any(|v| !v.is_finite() || *v <= 0.0)
                 || !policy.max_total_deviation.is_finite() || policy.max_total_deviation <= 0.0

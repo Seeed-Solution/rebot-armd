@@ -263,14 +263,18 @@ impl SupervisorInner {
     /// One control tick of the guard, after the residuals of this tick are known and
     /// before the motion reference is stepped. `dt` is the control-loop step (s).
     /// J1..J6 resting on their support: listed in `resting_pose.support_torque_limits` and
-    /// every joint within `resting_pose.position_tolerances` of home (measured positions).
+    /// every arm joint (`ArmConfig::resting_arm_joints`) within `resting_pose.position_tolerances`
+    /// of home (measured positions).
     pub fn collision_supported_joints(&self) -> [bool; 6] {
         let mut out = [false; 6];
         let Some(policy) = self.config.resting_pose.as_ref() else { return out; };
         let home = &self.config.home_positions;
-        let at_rest = !policy.position_tolerances.is_empty() && policy.position_tolerances.iter().enumerate().all(|(i, tol)| {
-            match (self.measured_positions.get(i), home.get(i)) {
-                (Some(q), Some(h)) => (q - h).abs() <= *tol,
+        // Every arm joint needs a tolerance and a reading within it (a short tolerance vector
+        // would leave the joints past its end unchecked).
+        let n = self.config.resting_arm_joints();
+        let at_rest = n > 0 && (0..n).all(|i| {
+            match (self.measured_positions.get(i), home.get(i), policy.position_tolerances.get(i)) {
+                (Some(q), Some(h), Some(tol)) => (q - h).abs() <= *tol,
                 _ => false,
             }
         });
