@@ -20,7 +20,8 @@
 # - Processes that left the group (setsid, daemonizing libraries): when the runner is root,
 #   after the program has exited (on its own or on stop) every process of $REBOT_APP_USER
 #   whose start time (/proc/<pid>/stat field 22) is at or after the program's is sent
-#   SIGKILL. This assumes that user runs nothing but the app: its other processes started
+#   SIGKILL; the /proc sweep repeats until it finds none (REBOT_APP_LEFTOVER_SWEEPS, default
+#   20), each pid re-checked (uid, start time) right before its kill. This assumes that user runs nothing but the app: its other processes started
 #   while the app ran (a login shell of the same user, for example) are killed too, so the app
 #   has a user of its own (not the SSH login user recamera). A runner that is not root runs the program as its own user and
 #   does not do this (it would hit the runner's own processes).
@@ -33,7 +34,7 @@
 #   backoff | stopped | given_up), pid (program), runner (this process), starts, last_exit.
 # - Tuning, for tests: REBOT_APP_USER, REBOT_APP_BACKOFF_MAX, REBOT_APP_STABLE_SECS, REBOT_APP_GIVEUP_STARTS,
 #   REBOT_APP_GIVEUP_WINDOW, REBOT_APP_KILL_GRACE, REBOT_APP_LOG_MAX, REBOT_APP_LOG_CHECK,
-#   REBOT_APP_PYTHONPATH, REBOT_APP_PYTHON.
+#   REBOT_APP_PYTHONPATH, REBOT_APP_PYTHON, REBOT_APP_LEFTOVER_SWEEPS.
 # - Everything is in functions and the last line calls main (see rebot-vision-run).
 
 APPS_DIR=${REBOT_APPS_DIR:-/userdata/rebot-apps}
@@ -49,6 +50,7 @@ LOG_CHECK=${REBOT_APP_LOG_CHECK:-30}
 SDK_PATH=${REBOT_APP_PYTHONPATH:-/usr/share/rebot-teleop/python}
 PYTHON=${REBOT_APP_PYTHON:-python3}
 RUN_USER=${REBOT_APP_USER:-rebot-app}
+LEFTOVER_SWEEPS=${REBOT_APP_LEFTOVER_SWEEPS:-20}
 
 # python3 -I -S -c "$LAUNCH" <user> <pythonpath> <command...>: new session (own process group),
 # drop to <user> (supplementary groups from /etc/group), set PYTHONPATH, exec the command.
@@ -137,23 +139,49 @@ starttime() {
     echo "$1"
 }
 
+# is_leftover <pid>: <pid> belongs to RUN_USER and started at or after the program
+# (child_start). The start time is read before and after the uid, and both must agree: a pid
+# that exited and was reused by another process between the reads does not pass, nor does a
+# zombie.
+is_leftover() {
+    lp=$1
+    s1=$(starttime "$lp") || return 1
+    [ "$s1" -ge "$child_start" ] || return 1
+    u=""
+    while IFS= read -r line; do
+        case "$line" in Uid:*) set -f; set -- ${line#Uid:}; set +f; u=$1; break ;; esac
+    done < "/proc/$lp/status" 2>/dev/null
+    [ "$u" = "$uid" ] || return 1
+    s2=$(starttime "$lp") || return 1
+    [ "$s1" = "$s2" ] || return 1
+    # a zombie (already dead, waiting to be reaped) is not a leftover
+    st=$(cat "/proc/$lp/stat" 2>/dev/null) || return 1
+    case "${st##*) }" in Z*|X*) return 1 ;; esac
+}
+
 # kill_user_leftovers: SIGKILL every process of RUN_USER started at or after the program
-# (child_start); only when the runner is root (see the header).
+# (child_start); only when the runner is root (see the header). Each pid is re-checked by
+# is_leftover right before its kill, and the /proc sweep repeats until a sweep finds none
+# (at most LEFTOVER_SWEEPS times), so processes forked during a sweep are caught by the next
+# one. Remaining race: a pid that exits and is reused by a process of another user between
+# its last check and the kill() (a few instructions; BusyBox has no pidfd kill).
 kill_user_leftovers() {
     [ "$(id -u)" -eq 0 ] && [ -n "$child_start" ] || return 0
-    for d in /proc/[0-9]*; do
-        p=${d#/proc/}
-        [ "$p" = "$$" ] && continue
-        u=""
-        while IFS= read -r line; do
-            case "$line" in Uid:*) set -f; set -- ${line#Uid:}; set +f; u=$1; break ;; esac
-        done < "$d/status" 2>/dev/null
-        [ "$u" = "$uid" ] || continue
-        st=$(starttime "$p") || continue
-        if [ "$st" -ge "$child_start" ]; then
+    sweeps=0
+    while [ "$sweeps" -lt "$LEFTOVER_SWEEPS" ]; do
+        sweeps=$((sweeps + 1))
+        found=0
+        for d in /proc/[0-9]*; do
+            p=${d#/proc/}
+            [ "$p" = "$$" ] && continue
+            is_leftover "$p" || continue
+            found=1
             kill -KILL "$p" 2>/dev/null && log "killed pid $p of $RUN_USER started after the program (outside its group)"
-        fi
+        done
+        [ "$found" -eq 0 ] && return 0
     done
+    log "processes of $RUN_USER started after the program still found after $LEFTOVER_SWEEPS sweeps"
+    return 1
 }
 
 # Wait until the program ($child) has exited; its status in rc (see rebot-vision-run).

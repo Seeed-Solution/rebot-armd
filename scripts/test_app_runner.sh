@@ -243,6 +243,25 @@ sys.exit(5)"
             check "setsid ($mode): the escaped child is gone" wait_for 3 sh -c "[ -n '$EPID' ] && ! kill -0 '$EPID'"
         done
         check "setsid: a process of the app user started before the app survives" kill -0 "$OLDPID"
+        # 12c. an escaped process that keeps forking: children forked while a sweep runs are
+        # caught by the next sweep, none is left
+        new_app forker "import os, sys, time
+if os.fork() == 0:
+    os.setsid()
+    open('$T/forker.pid', 'w').write(str(os.getpid()))
+    for _ in range(3000):  # bounded, also when the runner leaves it running
+        if os.fork() == 0:
+            os.execvp('sleep', ['sleep', '6071'])
+        time.sleep(0.003)
+time.sleep(0.8)
+sys.exit(5)"
+        printf '%s\n' '{"restart": "never"}' > "$T/apps/forker/app.json"
+        run_fg forker
+        sleep 0.5
+        check "forking escape: no process of it is left" sh -c "! pgrep -u '$APP_USER' -f 'sleep 6071'"
+        FPID=$(cat "$T/forker.pid" 2>/dev/null)
+        [ -n "$FPID" ] && kill -KILL "$FPID" 2>/dev/null
+        pkill -KILL -u "$APP_USER" -f 'sleep 6071' 2>/dev/null
         kill "$OLDPID" 2>/dev/null; wait "$OLDPID" 2>/dev/null
     else
         echo "  skip setsid escape (needs root)"
