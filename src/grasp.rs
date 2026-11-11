@@ -1145,4 +1145,106 @@ mod tests {
         let up = Pose::new(kinematics::axis_r(&[0.0, 1.0, 0.0], std::f64::consts::PI), pose.p);
         assert!(cam.plane_point(&up, [320.0, 180.0], 0.0).is_none());
     }
+
+    /// v8 holder: rot 90, tilt -38, lens centre behind and above the jaw tips.
+    fn v8() -> (GraspSetup, CameraMount, CamModel) {
+        let setup = GraspSetup { camera_tilt_deg: -38.0, ..Default::default() };
+        let mount = CameraMount { rot_deg: 90.0, tilt_deg: -38.0, offset_m: Some([-0.0731, 0.0005, 0.066]), ..Default::default() };
+        let cam = CamModel::assumed(&crate::chain::ArmModel::RebotDevArm, &setup, &mount);
+        (setup, mount, cam)
+    }
+
+    fn inspect_r() -> Mat3 { kinematics::fk(&[0.0, -1.167, -1.565, 1.435, 0.0, std::f64::consts::FRAC_PI_2]).r }
+
+    fn close(a: &Vec3, b: &Vec3, tol: f64) -> bool { kinematics::norm(&kinematics::sub(a, b)) < tol }
+
+    #[test]
+    fn camera_down_mode_follows_the_setting_tilt_and_lens_centre() {
+        let (setup, mount, _) = v8();
+        assert_eq!(camera_down_mode(&setup, &mount), Ok(true), "auto, tilted, lens centre known");
+        let no_offset = CameraMount { offset_m: None, ..mount.clone() };
+        assert_eq!(camera_down_mode(&setup, &no_offset), Ok(false), "auto without a lens centre");
+        for tilt in [0.0, 4.9, -5.0] {
+            assert_eq!(camera_down_mode(&GraspSetup { camera_tilt_deg: tilt, ..setup.clone() }, &mount), Ok(false), "auto at tilt {tilt}");
+        }
+        assert_eq!(camera_down_mode(&GraspSetup { camera_tilt_deg: -5.1, ..setup.clone() }, &mount), Ok(true));
+        let off = GraspSetup { acquire_camera_down: AcquireCameraDown::Off, ..setup.clone() };
+        assert_eq!(camera_down_mode(&off, &mount), Ok(false));
+        let on = GraspSetup { acquire_camera_down: AcquireCameraDown::On, camera_tilt_deg: 0.0, ..setup.clone() };
+        assert_eq!(camera_down_mode(&on, &mount), Ok(true));
+        assert!(camera_down_mode(&on, &no_offset).is_err(), "on needs the lens centre");
+        // setup field: lowercase strings, default auto, other values rejected
+        let d = GraspSetup::default();
+        assert_eq!(serde_json::to_value(&d).unwrap()["acquire_camera_down"], "auto");
+        assert_eq!(d.patched(&serde_json::json!({"acquire_camera_down": "on"})).unwrap().acquire_camera_down, AcquireCameraDown::On);
+        for bad in [serde_json::json!("yes"), serde_json::json!(true), serde_json::json!(1)] {
+            assert!(d.patched(&serde_json::json!({"acquire_camera_down": bad})).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn camera_down_pose_puts_the_optical_axis_down_over_the_target() {
+        let (setup, _, cam) = v8();
+        let target = [0.28, -0.04, setup.table_z_m + setup.grasp_height_m];
+        let r_now = inspect_r();
+        let pose = camera_down_pose(&r_now, &target, &setup, &cam);
+        let rc = cam.rotation(&pose);
+        assert!(kinematics::column(&rc, 2)[2] < -1.0 + 1e-12, "optical axis down: {:?}", kinematics::column(&rc, 2));
+        let o = cam.origin(&pose);
+        assert!((o[0] - target[0]).abs() < 1e-12 && (o[1] - target[1]).abs() < 1e-12, "camera centre over the target: {o:?}");
+        assert!((pose.p[2] - (setup.table_z_m + setup.approach_height_m)).abs() < 1e-12, "TCP at approach height");
+        // the tool is pitched by the mount tilt about x_cam; heading (x_cam) kept
+        let tool_from_down = kinematics::column(&pose.r, 0)[2].clamp(-1.0, 1.0).acos();
+        assert!((std::f64::consts::PI - tool_from_down - 38f64.to_radians()).abs() < 1e-9, "tool pitched by 38 deg");
+        let v = look_down(&r_now);
+        let x_cam_v = kinematics::mat_vec(&v, &kinematics::column(&cam.rec, 0));
+        assert!(close(&kinematics::column(&rc, 0), &x_cam_v, 1e-9), "pitch about x_cam");
+        assert!(kinematics::angle_between(&look_down(&pose.r), &v) < 1e-9, "look_down undoes it");
+        // the image centre ray meets the plane straight below the camera
+        let hit = cam.plane_point(&pose, [cam.cx, cam.cy], target[2]).unwrap();
+        assert!(close(&hit, &target, 1e-9), "{hit:?}");
+        // tilt 0: the optical axis already is the tool axis, the orientation is look_down's
+        let flat = CamModel::assumed(&crate::chain::ArmModel::RebotDevArm, &GraspSetup::default(), &CameraMount::default());
+        assert_eq!(camera_down(&v, &flat.rec), v);
+    }
+
+    #[test]
+    fn tilted_ray_meets_the_table_ahead_by_the_tilt() {
+        // tool vertical, camera tilted 38 deg: the image centre ray meets the plane h·tan(38)
+        // from the point below the lens centre
+        let (setup, _, cam) = v8();
+        let pose = Pose::new(look_down(&inspect_r()), [0.25, 0.0, 0.15]);
+        let o = cam.origin(&pose);
+        let plane = setup.table_z_m + setup.grasp_height_m;
+        let hit = cam.plane_point(&pose, [cam.cx, cam.cy], plane).unwrap();
+        let ahead = (hit[0] - o[0]).hypot(hit[1] - o[1]);
+        assert!((ahead - (o[2] - plane) * 38f64.to_radians().tan()).abs() < 1e-9, "ahead {ahead}");
+        let px = cam.project(&pose, &hit).unwrap();
+        assert!((px[0] - cam.cx).abs() < 1e-6 && (px[1] - cam.cy).abs() < 1e-6);
+        // the table point under the jaw tips is outside the image at approach height (v < 0)
+        let under = cam.project(&pose, &[pose.p[0], pose.p[1], setup.table_z_m]).map(|p| cam.to_norm(p));
+        assert!(under.is_none_or(|n| !(0.0..=1.0).contains(&n[1])), "{under:?}");
+    }
+
+    #[test]
+    fn transition_goes_tool_vertical_above_the_centred_target() {
+        let (setup, _, cam) = v8();
+        let r_now = inspect_r();
+        let target = [0.30, 0.03, setup.table_z_m + setup.grasp_height_m];
+        let pose = camera_down_pose(&r_now, &target, &setup, &cam);
+        let (t, goal) = transition_pose(&pose, [cam.cx, cam.cy], &setup, &cam).unwrap();
+        assert!(close(&t, &target, 1e-9), "{t:?}");
+        assert!(close(&goal.p, &[target[0], target[1], setup.table_z_m + setup.approach_height_m], 1e-9), "{:?}", goal.p);
+        assert!(kinematics::column(&goal.r, 0)[2] < -1.0 + 1e-12, "tool axis down");
+        assert!(kinematics::angle_between(&goal.r, &look_down(&r_now)) < 1e-9, "heading of the approach kept");
+        // a box centre off the image centre maps to its own table point
+        let off_px = [cam.cx + 30.0, cam.cy - 20.0];
+        let (t2, _) = transition_pose(&pose, off_px, &setup, &cam).unwrap();
+        let px = cam.project(&pose, &t2).unwrap();
+        assert!((px[0] - off_px[0]).abs() < 1e-6 && (px[1] - off_px[1]).abs() < 1e-6);
+        // expected duration of the move: rotation of 38 deg at 0.5 rad/s dominates here
+        let est = transition_estimate(&pose, &target, &setup);
+        let rot = 1.1 * 1.875 * 38f64.to_radians() / motion::DEFAULT_ANGULAR_RPS;
+        assert!(est >= rot - 1e-9 && est < rot + 3.0, "{est} vs {rot}");
+    }
 }
