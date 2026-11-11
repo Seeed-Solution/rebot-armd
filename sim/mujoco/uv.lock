@@ -639,7 +639,7 @@ dev = [
 requires-dist = [
     { name = "av", specifier = ">=19.0.2" },
     { name = "matplotlib", specifier = ">=3.11.2" },
-    { name = "mujoco", specifier = ">=4.0.0" },
+    { name = "mujoco", specifier = ">=4.0.0,<4.1" },
     { name = "numpy", specifier = ">=2.5.4" },
     { name = "websockets", specifier = ">=17.4" },
 ]
