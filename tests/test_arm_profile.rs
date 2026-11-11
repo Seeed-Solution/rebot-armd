@@ -159,3 +159,18 @@ fn template_profile_is_a_valid_profile() {
     assert_eq!(config.profile_version, ARM_PROFILE_VERSION);
     assert_eq!(config.dof, 6);
 }
+
+/// kits/_template/profile/example_urdf.json parses; with its `my-arm.urdf` replaced by the
+/// B601-RS URDF and chain tip it loads and validates.
+#[test]
+fn template_urdf_profile_is_a_valid_profile() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/kits/_template/profile/example_urdf.json");
+    let err = ArmConfig::from_profile_file(path).unwrap_err();
+    assert!(err.contains("my-arm.urdf"), "{err}");
+    let mut config: ArmConfig = serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap();
+    config.urdf = Some(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ReBot_Arm_RS.urdf").into());
+    config.chain.as_mut().unwrap().tip_link = "gripper_end".into();
+    config.load_arm_model(None).unwrap();
+    config.validate().unwrap();
+    assert_eq!((config.dof, config.arm_dof(), config.gripper_index()), (6, 6, None));
+}
