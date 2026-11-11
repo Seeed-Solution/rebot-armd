@@ -302,24 +302,25 @@ class PerceptionServer:
         if path == "/api/mode" and method == "POST":
             if not body or not set(body) <= {"mode", "enabled", "fps"}:
                 raise ValueError("body needs mode, enabled or fps")
-            with p.cond:
+            if "mode" in body and body["mode"] not in MODES:
+                raise ValueError("bad mode")
+            if "enabled" in body and not isinstance(body["enabled"], bool):
+                raise ValueError("enabled must be a bool")
+            if "fps" in body and (isinstance(body["fps"], bool) or not isinstance(body["fps"], int)
+                                  or not 1 <= body["fps"] <= 15):
+                raise ValueError("fps must be 1..15")
+            with p.cond:  # the whole body is valid: apply it
                 if "mode" in body:
-                    if body["mode"] not in MODES:
-                        raise ValueError("bad mode")
                     p.mode = body["mode"]
                     if p.mode == "off":
                         p.enabled = False
                     else:
                         p.last_active = p.mode
                 if "enabled" in body:
-                    if not isinstance(body["enabled"], bool):
-                        raise ValueError("enabled must be a bool")
                     p.enabled = body["enabled"]
                     if p.enabled and p.mode == "off":
                         p.mode = p.last_active
                 if "fps" in body:
-                    if not isinstance(body["fps"], int) or not 1 <= body["fps"] <= 15:
-                        raise ValueError("fps must be 1..15")
                     p.max_fps = body["fps"]
                 return 200, p.mode_body()
         if path == "/api/inference":

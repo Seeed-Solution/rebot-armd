@@ -130,3 +130,14 @@ def test_subscription_fps_follows_the_current_cap(api):
     assert http(base + "/api/mode", {"fps": 3})[0] == 200
     code, subs = http(base + "/api/subscriptions")
     assert subs["subscriptions"][0]["fps"] == 3 and subs["continuous"]["fps"] == 3
+
+
+@pytest.mark.parametrize("body", [{"mode": "aruco", "fps": 99}, {"mode": "both", "enabled": "yes"},
+                                  {"enabled": True, "fps": 0}, {"mode": "sift", "enabled": True}])
+def test_mode_body_is_validated_before_anything_changes(api, body):
+    _, _, base = api
+    before = http(base + "/api/mode")[1]
+    assert http(base + "/api/mode", body)[0] == 400
+    after = http(base + "/api/mode")[1]
+    assert {k: after[k] for k in ("mode", "enabled", "fps", "last_active_mode", "max_fps")} == \
+        {k: before[k] for k in ("mode", "enabled", "fps", "last_active_mode", "max_fps")}
