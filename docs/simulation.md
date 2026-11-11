@@ -174,5 +174,5 @@ Host spark-6124 (aarch64, Cortex-X925, 20 cores), MuJoCo 4.0.0, Python 3.13:
 - J7 torque scale: holding and stall thresholds (`gripper_policy.holding_torque_nm`, the 0.444 N·m stall latch) are met through the assumed velocity-loop gain (KV 0.5 × vlim 2.0 = 1.0 N·m squeeze, below the 7 N·m peak), not by a measured gripper model.
 - No camera image yet: vision, `grasp` (point-and-grasp) and detection need the real camera or a separate image source.
 - No motor faults (over-temperature, under-voltage); temperature is constant. Damiao register access (mapping-range check, CTRL_MODE writes) is not simulated: `driver_range_check` is null and MIT switching is confirmed locally.
-- With the default `speed` 1.0 rad/s the jaw reached −5.699 rad from closed after about 5.9 s, too late for the 200 ms settle within the 6 s default `timeout_s`: the gripper action ended `GRIPPER_TIMEOUT`. The test opens at 2.0 rad/s. Not verified on the real gripper.
+- With the default `speed` 1.0 rad/s the jaw reaches −5.699 rad from closed after about 5.9 s; the open action is done after 6.2 s (2026-11-11), within the default `timeout_s` of 8.5 s for that stroke (formerly a fixed 6 s, which ended in `GRIPPER_TIMEOUT`). The test opens at 2.0 rad/s. Not verified on the real gripper.
 - The simulator runs on the host only; it is not packaged for the reCamera.

@@ -63,7 +63,7 @@ fn rig(j7: f32, block: Option<f32>, frozen_j7: bool) -> (SupervisorInner, Arc<Mu
 }
 
 fn request(command: GripperCommand, fraction: Option<f64>, grasp: bool, timeout_s: f64) -> GripperRequest {
-    GripperRequest { command, fraction, grasp, speed: 1.0, timeout_s, tag: Some("t".into()) }
+    GripperRequest { command, fraction, grasp, speed: 1.0, timeout_s: Some(timeout_s), tag: Some("t".into()) }
 }
 
 fn run(inner: &mut SupervisorInner, id: u64, max_s: f64) -> armd::motion::ActionStatus {
@@ -236,4 +236,22 @@ fn close_into_an_obstacle_latches_and_holds_at_measured() {
             "torque sign {tau_sign}: J7 command {} held at measured {}", inner.commanded_positions[6], inner.measured_positions[6]);
         assert!((inner.measured_positions[6] + 2.0).abs() < 1e-3);
     }
+}
+
+#[test]
+fn default_timeout_covers_a_full_stroke() {
+    let req = armd::motion::parse_gripper(&serde_json::json!({"command": "open"})).unwrap();
+    assert_eq!((req.speed, req.timeout_s), (1.0, None));
+    let (mut inner, _rig) = rig(0.0, None, false);
+    let epoch = inner.safety.epoch_id();
+    let (id, expected) = inner.start_gripper(req, epoch).unwrap();
+    assert!(expected > 6.0, "{expected}");
+    let a = run(&mut inner, id, 12.0);
+    assert_eq!(a.state, "done", "{a:?}");
+    assert!((inner.measured_positions[6] - GripperPolicy::rebot_dm().open_rad).abs() < 0.05);
+    // an explicit timeout_s still applies as given
+    let req = armd::motion::parse_gripper(&serde_json::json!({"command": "close", "grasp": false, "timeout_s": 3.0})).unwrap();
+    let (id, _) = inner.start_gripper(req, epoch).unwrap();
+    let a = run(&mut inner, id, 5.0);
+    assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("GRIPPER_TIMEOUT")), "{a:?}");
 }

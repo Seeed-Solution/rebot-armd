@@ -373,9 +373,15 @@ pub struct GripperRequest {
     pub grasp: bool,
     /// J7 speed (rad/s), <= 2.0.
     pub speed: f64,
-    pub timeout_s: f64,
+    /// Deadline (s). None: `max(GRIPPER_DEFAULT_TIMEOUT_S, expected duration + GRIPPER_TIMEOUT_MARGIN_S)`.
+    pub timeout_s: Option<f64>,
     pub tag: Option<String>,
 }
+
+/// Shortest default gripper deadline (s).
+pub const GRIPPER_DEFAULT_TIMEOUT_S: f64 = 6.0;
+/// Added to the expected duration for the default gripper deadline (s).
+pub const GRIPPER_TIMEOUT_MARGIN_S: f64 = 2.0;
 
 /// Body of `/api/v1/action/gripper`.
 pub fn parse_gripper(body: &Value) -> Result<GripperRequest, MotionError> {
@@ -407,8 +413,8 @@ pub fn parse_gripper(body: &Value) -> Result<GripperRequest, MotionError> {
     if !(speed > 0.0 && speed <= 2.0) {
         return Err(MotionError::InvalidCommand("speed must be in (0, 2.0] rad/s".into()));
     }
-    let timeout_s = num(body, "timeout_s")?.unwrap_or(6.0);
-    if !(timeout_s > 0.0 && timeout_s <= 30.0) {
+    let timeout_s = num(body, "timeout_s")?;
+    if timeout_s.is_some_and(|t| !(t > 0.0 && t <= 30.0)) {
         return Err(MotionError::InvalidCommand("timeout_s must be in (0, 30] s".into()));
     }
     Ok(GripperRequest { command, fraction, grasp, speed, timeout_s, tag: tag(body)? })
@@ -552,6 +558,8 @@ pub struct GripperMotion {
     pub target: f32,
     pub start: f32,
     pub elapsed: f64,
+    /// Deadline (s): the request's timeout_s, else the default rule.
+    pub timeout_s: f64,
     still_for: f64,
     moved: bool,
     phase: GripPhase,
@@ -565,7 +573,10 @@ impl GripperMotion {
             GripperCommand::Move => policy.closed_rad + request.fraction.unwrap_or(0.0) as f32 * (policy.open_rad - policy.closed_rad),
         }.clamp(limit.min_position, limit.max_position);
         let limit = JointLimit { max_velocity: request.speed as f32, ..limit };
-        Self { request, policy, limit, target, start, elapsed: 0.0, still_for: 0.0, moved: false, phase: GripPhase::Moving }
+        let mut m = Self { request, policy, limit, target, start, elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, moved: false, phase: GripPhase::Moving };
+        m.timeout_s = m.request.timeout_s
+            .unwrap_or_else(|| GRIPPER_DEFAULT_TIMEOUT_S.max(m.expected_duration() + GRIPPER_TIMEOUT_MARGIN_S));
+        m
     }
 
     /// Expected duration (s) for the travel at the requested speed, plus settle.
@@ -608,11 +619,11 @@ impl GripperMotion {
             return StepOut { positions, velocities, status, progress: 1.0, clear_gripper_stall: clear };
         }
 
-        if self.elapsed > self.request.timeout_s {
+        if self.elapsed > self.timeout_s {
             positions[6] = m7;
             return StepOut { positions, velocities, progress: progress_of(m7), clear_gripper_stall: clear,
                 status: StepStatus::Failed { code: "GRIPPER_TIMEOUT", message: format!(
-                    "Gripper did not finish within {:.1} s (at {m7:.3} rad, target {:.3} rad)", self.request.timeout_s, self.target) } };
+                    "Gripper did not finish within {:.1} s (at {m7:.3} rad, target {:.3} rad)", self.timeout_s, self.target) } };
         }
 
         // Step J7 toward the target unless the stall latch holds it.
