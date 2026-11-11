@@ -103,8 +103,9 @@ class Scene:
 
     def reset(self, data: mujoco.MjData, seed: int | None) -> None:
         """Place the objects for `seed` at rest (zero velocity); the arm is not touched."""
+        poses = sample_poses(self.objects, seed)  # raises on a bad seed before anything changes
         self.seed = seed
-        for obj, qa, va, (x, y, yaw) in zip(self.objects, self.qpos, self.qvel, sample_poses(self.objects, seed)):
+        for obj, qa, va, (x, y, yaw) in zip(self.objects, self.qpos, self.qvel, poses):
             data.qpos[qa:qa + 7] = [x, y, obj.rest_z, math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)]
             data.qvel[va:va + 6] = 0.0
         mujoco.mj_forward(self.model, data)

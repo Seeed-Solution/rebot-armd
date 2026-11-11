@@ -352,9 +352,10 @@ class PerceptionServer:
                              "continuous": cont, "subscriptions": [p.sub_body(s) for s in p.subs.values()]}
         if path == "/sim/reset" and method == "POST":
             seed = body.get("seed")
-            if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
-                raise ValueError("seed must be an integer or null")
-            return 200, self.sim.request_reset(seed)
+            if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int) or seed < 0):
+                raise ValueError("seed must be a non-negative integer or null")
+            out = self.sim.request_reset(seed)
+            return (500 if "error" in out else 200), out
         if path == "/sim/state" and method == "GET":
             return 200, self.sim.sim_state()
         if path == "/sim/camera" and method == "GET":

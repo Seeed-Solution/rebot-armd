@@ -281,8 +281,7 @@ class Simulator:
         with self.lock:
             if self._resets:
                 for seed, done, out in self._resets:
-                    self.scene.reset(self.data, seed)
-                    out.update(self._state_locked())
+                    out.update(self._reset_locked(seed))
                     done.set()
                 self._resets.clear()
             self.motors.apply()
@@ -303,9 +302,16 @@ class Simulator:
             with self.lock:
                 if (seed, done, out) in self._resets:
                     self._resets.remove((seed, done, out))
-                    self.scene.reset(self.data, seed)
-                    out.update(self._state_locked())
+                    out.update(self._reset_locked(seed))
         return out
+
+    def _reset_locked(self, seed) -> dict:
+        """Reset the scene; a seed the scene rejects gives {"error": ...} and changes nothing."""
+        try:
+            self.scene.reset(self.data, seed)
+        except (ValueError, TypeError, OverflowError) as exc:
+            return {"error": f"reset with seed {seed!r} failed: {exc}"}
+        return self._state_locked()
 
     def _state_locked(self) -> dict:
         d = self.data
@@ -350,8 +356,7 @@ class Simulator:
                 self.cam_conn = None
                 return
             if msg[0] == "reset":
-                self.scene.reset(self.data, msg[1])
-                self.cam_conn.send(self._state_locked())
+                self.cam_conn.send(self._reset_locked(msg[1]))
             else:
                 self.cam_conn.send(self._state_locked())
 
@@ -453,6 +458,8 @@ def main(argv: list[str] | None = None) -> None:
         parse_objects(args.objects)
     except ValueError as exc:
         parser.error(f"--objects: {exc}")
+    if args.seed is not None and args.seed < 0:
+        parser.error("--seed must be non-negative")
     mount = CameraMount.from_profile(args.profile) if args.profile else CameraMount.from_profile()
     if args.camera_rot_deg is not None or args.camera_tilt_deg is not None or args.camera_offset:
         off = mount.offset_m
