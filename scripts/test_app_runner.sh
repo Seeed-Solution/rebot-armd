@@ -224,7 +224,9 @@ u = pwd.getpwnam(sys.argv[1]); os.setsid(); os.setgid(u.pw_gid); os.setuid(u.pw_
 os.execvp("sleep", ["sleep", "60"])' "$APP_USER" &
         OLDPID=$!
         sleep 0.2
-        for mode in stop exit; do
+        for run in stop exit stop-fallback exit-fallback; do
+            mode=${run%-fallback}
+            pidfd=1; [ "$run" = "$mode" ] || pidfd=0
             new_app "escape$mode" "import subprocess, sys, time
 p = subprocess.Popen(['sleep', '60'], start_new_session=True)
 open('$T/escape.child', 'w').write(str(p.pid))
@@ -233,14 +235,20 @@ time.sleep(60 if '$mode' == 'stop' else 0.5)
 sys.exit(5)"
             printf '%s\n' '{"restart": "never"}' > "$T/apps/escape$mode/app.json"
             rm -f "$T/escape.child"
-            run_bg "escape$mode"
-            check "setsid ($mode): child started" wait_for 10 test -s "$T/escape.child"
+            rm -f "$T/logs/app-escape$mode.log"
+            run_bg "escape$mode" REBOT_APP_PIDFD=$pidfd
+            check "setsid ($run): child started" wait_for 10 test -s "$T/escape.child"
             EPID=$(cat "$T/escape.child" 2>/dev/null)
-            check "setsid ($mode): child is in another session" sh -c "[ \"\$(ps -o sid= -p $EPID | tr -d ' ')\" = $EPID ]"
+            check "setsid ($run): child is in another session" sh -c "[ \"\$(ps -o sid= -p $EPID | tr -d ' ')\" = $EPID ]"
             [ "$mode" = stop ] && kill -TERM "$RPID"
-            check "setsid ($mode): runner exits" wait_for 8 sh -c "! kill -0 $RPID"
+            check "setsid ($run): runner exits" wait_for 8 sh -c "! kill -0 $RPID"
             wait "$RPID" 2>/dev/null
-            check "setsid ($mode): the escaped child is gone" wait_for 3 sh -c "[ -n '$EPID' ] && ! kill -0 '$EPID'"
+            check "setsid ($run): the escaped child is gone" wait_for 3 sh -c "[ -n '$EPID' ] && ! kill -0 '$EPID'"
+            if [ "$pidfd" -eq 1 ]; then
+                check "setsid ($run): killed through a pidfd, no fallback" sh -c "grep -q 'killed pid $EPID .*; pidfd)' '$T/logs/app-escape$mode.log' && ! grep -q 'falling back' '$T/logs/app-escape$mode.log'"
+            else
+                check "setsid ($run): fallback logged, killed with kill <pid>" sh -c "grep -q 'pidfd sweep unavailable (exit 3); falling back' '$T/logs/app-escape$mode.log' && grep -q 'killed pid $EPID .*(outside its group)\$' '$T/logs/app-escape$mode.log'"
+            fi
         done
         check "setsid: a process of the app user started before the app survives" kill -0 "$OLDPID"
         # 12c. an escaped process that keeps forking: children forked while a sweep runs are
@@ -296,6 +304,70 @@ check "config: app name" [ "$APP_NAME" = demo ]
 check "config: nothing was executed" sh -c "[ ! -e '$CT/pwned1' ] && [ ! -e '$CT/pwned2' ]"
 rm -rf "$CT"
 
+# leftover sweep helper ($SWEEP, pidfds) on explicit candidate pids of the current user
+echo "== rebot-app-run pidfd sweep"
+eval "$(sed -n "/^SWEEP='/,/^sys.exit(4 if failed else 0)'\$/p" "$RUNNER")"
+check "sweep: helper extracted" [ -n "$SWEEP" ]
+starttime_of() { python3 -c 'import sys; print(open("/proc/%s/stat" % sys.argv[1]).read().rsplit(")", 1)[1].split()[19])' "$1"; }
+sweep() { python3 -I -S -c "$SWEEP" "$@"; }
+if python3 -c 'import os, signal; os.close(os.pidfd_open(os.getpid())); signal.pidfd_send_signal' 2>/dev/null; then
+    ME=$(id -u)
+    sleep 60 & V1=$!
+    sleep 60 & V2=$!
+    S1=$(starttime_of "$V1")
+    out=$(sweep "$ME" "$S1" SIGKILL 1 "$$" "$V1"); r=$?
+    check "sweep: matching pid is killed and printed" sh -c "[ $r -eq 0 ] && [ '$out' = '$V1' ]"
+    wait "$V1" 2>/dev/null; rc=$?
+    check "sweep: it died of SIGKILL" [ "$rc" -eq 137 ]
+    check "sweep: the other candidate (not listed) is alive" alive "$V2"
+    S2=$(starttime_of "$V2")
+    out=$(sweep "$ME" $((S2 + 1)) SIGKILL 1 "$$" "$V2")
+    check "sweep: pid started before <start> (reused-pid stand-in) is skipped" sh -c "[ -z '$out' ] && kill -0 $V2"
+    out=$(sweep 4242 "$S2" SIGKILL 1 "$$" "$V2")
+    check "sweep: pid of another uid is skipped" sh -c "[ -z '$out' ] && kill -0 $V2"
+    out=$(sweep "$ME" "$S2" SIGKILL 1 "$V2" "$V2")
+    check "sweep: the excluded pid is skipped" sh -c "[ -z '$out' ] && kill -0 $V2"
+    out=$(sweep "$ME" 0 SIGKILL 1 "$$" 999999999 "$V2")
+    check "sweep: a pid that does not exist is skipped" sh -c "[ '$out' = '$V2' ]"
+    wait "$V2" 2>/dev/null
+    # a zombie: a child its parent does not wait for
+    ZT=$(mktemp)
+    python3 -c 'import os, sys, time
+p = os.fork()
+if p == 0:
+    os._exit(0)
+open(sys.argv[1], "w").write(str(p)); time.sleep(3)' "$ZT" & ZH=$!
+    wait_for 3 test -s "$ZT"; Z=$(cat "$ZT")
+    sleep 0.2
+    check "sweep: zombie stand-in is in state Z" sh -c "[ \"\$(cut -d' ' -f3 /proc/$Z/stat)\" = Z ]"
+    out=$(sweep "$ME" 0 SIGKILL 1 "$$" "$Z")
+    check "sweep: a zombie is skipped" [ -z "$out" ]
+    kill "$ZH" 2>/dev/null; wait "$ZH" 2>/dev/null; rm -f "$ZT"
+else
+    echo "  skip pidfd sweep on candidates (no pidfd on this host)"
+fi
+sleep 60 & V3=$!
+sweep "$(id -u)" 0 SIGKILL 0 "$$" "$V3"; r=$?
+check "sweep: forced off (REBOT_APP_PIDFD=0) exits 3, signals nothing" sh -c "[ $r -eq 3 ] && kill -0 $V3"
+out=$(python3 -I -S -c 'import os, sys; del os.pidfd_open; sys.argv = sys.argv[1:]; exec(sys.argv[0])' "$SWEEP" "$(id -u)" 0 SIGKILL 1 "$$" "$V3"); r=$?
+check "sweep: without os.pidfd_open exits 3, signals nothing" sh -c "[ $r -eq 3 ] && [ -z '$out' ] && kill -0 $V3"
+# pidfd_open failing with another errno (ENFILE here; injected): reported, exit 4; ESRCH
+# (the pid has exited) is skipped
+INJECT='import errno, os, signal, sys
+code = getattr(errno, sys.argv[1])
+def pidfd_open(pid, flags=0):
+    raise OSError(code, os.strerror(code))
+os.pidfd_open = pidfd_open
+if not hasattr(signal, "pidfd_send_signal"):
+    signal.pidfd_send_signal = lambda fd, sig: None
+sys.argv = sys.argv[2:]
+exec(sys.argv[0])'
+out=$(python3 -I -S -c "$INJECT" ENFILE "$SWEEP" "$(id -u)" 0 SIGKILL 1 "$$" "$V3"); r=$?
+check "sweep: pidfd_open ENFILE exits 4 and names the pid and errno" sh -c "[ $r -eq 4 ] && [ '$out' = '!$V3:ENFILE' ] && kill -0 $V3"
+out=$(python3 -I -S -c "$INJECT" ESRCH "$SWEEP" "$(id -u)" 0 SIGKILL 1 "$$" "$V3"); r=$?
+check "sweep: pidfd_open ESRCH is skipped (exit 0, nothing printed)" sh -c "[ $r -eq 0 ] && [ -z '$out' ]"
+kill "$V3"; wait "$V3" 2>/dev/null
+
 # build_deb.sh: the recamera flavor without REBOT_SDK_DIR stops before building
 echo "== build_deb.sh REBOT_SDK_DIR"
 out=$(env -u REBOT_SDK_DIR bash "$HERE/build_deb.sh" 2>&1); rc=$?
@@ -344,6 +416,43 @@ base_files
 printf 'rebot-app:x:996:\n' >> "$UT/group"
 run_tool; r=$?
 check "app-user: missing passwd entry gets the group gid" sh -c "[ $r -eq 0 ] && grep -q '^rebot-app:x:[0-9]*:996:' '$UT/passwd' && [ \$(grep -c '^rebot-app:' '$UT/group') -eq 1 ]"
+# group gid: a group of the same name with another gid, or a gid owned by another group, is
+# refused (exit 4) and nothing is written
+for case in groupgid othergroup; do
+    base_files
+    printf 'rebot-app:x:997:997:rebot user programs:/userdata/rebot-apps:/bin/false\n' >> "$UT/passwd"
+    case $case in
+        groupgid) printf 'rebot-app:x:995:\n' >> "$UT/group" ;;
+        othergroup) printf 'video:x:997:\n' >> "$UT/group" ;;
+    esac
+    cp "$UT/passwd" "$UT/passwd.1"; cp "$UT/group" "$UT/group.1"; cp "$UT/shadow" "$UT/shadow.1"
+    out=$(run_tool 2>&1); r=$?
+    check "app-user: gid mismatch ($case) refused (exit 4), nothing written" sh -c "[ $r -eq 4 ] && cmp -s '$UT/passwd' '$UT/passwd.1' && cmp -s '$UT/group' '$UT/group.1' && cmp -s '$UT/shadow' '$UT/shadow.1'"
+    check "app-user: gid mismatch ($case) names the gids" sh -c 'printf "%s" "$1" | grep -q "has gid 997"' _ "$out"
+done
+# native method (stub addgroup/adduser in PATH): a missing group is created with the passwd gid
+mkdir -p "$UT/bin"
+printf '#!/bin/sh\necho "addgroup $*" >> "%s/calls"\ngid=994\nwhile [ $# -gt 1 ]; do case $1 in -g) gid=$2; shift ;; esac; shift; done\necho "$1:x:$gid:" >> "%s/group"\n' "$UT" "$UT" > "$UT/bin/addgroup"
+printf '#!/bin/sh\necho "adduser $*" >> "%s/calls"\nexit 1\n' "$UT" > "$UT/bin/adduser"
+chmod +x "$UT/bin/addgroup" "$UT/bin/adduser"
+base_files; rm -f "$UT/calls"
+printf 'rebot-app:x:997:997:rebot user programs:/userdata/rebot-apps:/bin/false\n' >> "$UT/passwd"
+run_tool REBOT_APP_METHOD=native PATH="$UT/bin:$PATH"; r=$?
+check "app-user (native): addgroup called with -g <passwd gid> -S" grep -qx 'addgroup -g 997 -S rebot-app' "$UT/calls"
+check "app-user (native): group has the passwd gid, account complete" sh -c "[ $r -eq 0 ] && grep -qx 'rebot-app:x:997:' '$UT/group' && [ \$(grep -c '^rebot-app:' '$UT/group') -eq 1 ] && grep -q '^rebot-app:!:' '$UT/shadow'"
+# ... and an addgroup that ignores -g (other gid) is caught right after addgroup: the group
+# it created stays, nothing else is written (no adduser call, no shadow entry)
+sed -i 's/gid=\$2; shift/shift/' "$UT/bin/addgroup"
+base_files; rm -f "$UT/calls"
+printf 'rebot-app:x:997:997:rebot user programs:/userdata/rebot-apps:/bin/false\n' >> "$UT/passwd"
+cp "$UT/passwd" "$UT/passwd.1"; cp "$UT/shadow" "$UT/shadow.1"
+run_tool REBOT_APP_METHOD=native PATH="$UT/bin:$PATH" 2>/dev/null; r=$?
+check "app-user (native): group created with another gid is refused (exit 4)" [ "$r" -eq 4 ]
+check "app-user (native): after the refusal only the tool's group was added" sh -c "grep -qx 'rebot-app:x:994:' '$UT/group' && [ \$(grep -c '^rebot-app:' '$UT/group') -eq 1 ] && cmp -s '$UT/passwd' '$UT/passwd.1' && cmp -s '$UT/shadow' '$UT/shadow.1' && ! grep -q '^adduser' '$UT/calls'"
+# a fresh account via the native method: addgroup without -g, adduser -G
+base_files; rm -f "$UT/calls"
+run_tool REBOT_APP_METHOD=native PATH="$UT/bin:$PATH"; r=$?
+check "app-user (native): fresh account, addgroup -S without -g" sh -c "[ $r -eq 0 ] && grep -qx 'addgroup -S rebot-app' '$UT/calls' && grep -q '^adduser -S -D -H .* -G rebot-app rebot-app' '$UT/calls' && grep -q '^rebot-app:x:[0-9]*:994:' '$UT/passwd'"
 # an existing privileged account is refused and left as it is
 for case in uid0 gid0 wheelgid wheelmember; do
     base_files

@@ -21,7 +21,11 @@
 #   after the program has exited (on its own or on stop) every process of $REBOT_APP_USER
 #   whose start time (/proc/<pid>/stat field 22) is at or after the program's is sent
 #   SIGKILL; the /proc sweep repeats until it finds none (REBOT_APP_LEFTOVER_SWEEPS, default
-#   20), each pid re-checked (uid, start time) right before its kill. This assumes that user runs nothing but the app: its other processes started
+#   20). Each pid is opened as a pidfd (python3 os.pidfd_open, Linux >= 5.3), checked (uid,
+#   start time, not a zombie, still alive after the reads) and signalled through the pidfd,
+#   so a pid reused by another process is never signalled. Without pidfds (no
+#   os.pidfd_open / signal.pidfd_send_signal, ENOSYS, or REBOT_APP_PIDFD=0) the runner logs
+#   the fallback once and uses kill <pid> after re-checking uid and start time. This assumes that user runs nothing but the app: its other processes started
 #   while the app ran (a login shell of the same user, for example) are killed too, so the app
 #   has a user of its own (not the SSH login user recamera). A runner that is not root runs the program as its own user and
 #   does not do this (it would hit the runner's own processes).
@@ -34,7 +38,7 @@
 #   backoff | stopped | given_up), pid (program), runner (this process), starts, last_exit.
 # - Tuning, for tests: REBOT_APP_USER, REBOT_APP_BACKOFF_MAX, REBOT_APP_STABLE_SECS, REBOT_APP_GIVEUP_STARTS,
 #   REBOT_APP_GIVEUP_WINDOW, REBOT_APP_KILL_GRACE, REBOT_APP_LOG_MAX, REBOT_APP_LOG_CHECK,
-#   REBOT_APP_PYTHONPATH, REBOT_APP_PYTHON, REBOT_APP_LEFTOVER_SWEEPS.
+#   REBOT_APP_PYTHONPATH, REBOT_APP_PYTHON, REBOT_APP_LEFTOVER_SWEEPS, REBOT_APP_PIDFD.
 # - Everything is in functions and the last line calls main (see rebot-vision-run).
 
 APPS_DIR=${REBOT_APPS_DIR:-/userdata/rebot-apps}
@@ -51,6 +55,8 @@ SDK_PATH=${REBOT_APP_PYTHONPATH:-/usr/share/rebot-teleop/python}
 PYTHON=${REBOT_APP_PYTHON:-python3}
 RUN_USER=${REBOT_APP_USER:-rebot-app}
 LEFTOVER_SWEEPS=${REBOT_APP_LEFTOVER_SWEEPS:-20}
+USE_PIDFD=${REBOT_APP_PIDFD:-1}
+pidfd_ok=1  # 0 after the first sweep that found no pidfds (logged once)
 
 # python3 -I -S -c "$LAUNCH" <user> <pythonpath> <command...>: new session (own process group),
 # drop to <user> (supplementary groups from /etc/group), set PYTHONPATH, exec the command.
@@ -68,6 +74,62 @@ if os.getuid() == 0 or os.geteuid() == 0:
     sys.exit("rebot-app-run: refusing to run the program as root")
 os.environ.update(HOME=u.pw_dir, USER=u.pw_name, LOGNAME=u.pw_name, PYTHONPATH=pythonpath)
 os.execvp(sys.argv[3], sys.argv[3:])'
+
+# python3 -I -S -c "$SWEEP" <uid> <start> <signal> <use-pidfd> <exclude> [pid...]: one sweep
+# with pidfds over the given pids (default: every pid in /proc) other than <exclude> and
+# itself. A pid is signalled when it has uid <uid>, a start time (/proc/<pid>/stat field 22)
+# >= <start> and is not a zombie. The pid is opened as a pidfd first and read after; the
+# pidfd still being alive after the reads (pidfd_send_signal 0) shows they describe the
+# process the pidfd refers to, and the signal goes through that pidfd, so a pid that was
+# reused before pidfd_open fails the check and one reused later is not reached. Prints each
+# pid it signalled; a pid that has exited (ESRCH from pidfd_open) is skipped. exit 3 without
+# pidfds (<use-pidfd> 0, no os.pidfd_open / signal.pidfd_send_signal, ENOSYS / EPERM from
+# pidfd_open). Any other pidfd_open error (for example ENFILE, EMFILE) prints !<pid>:<errno
+# name>, the sweep goes on with the other pids and exits 4: that pid may still be running.
+SWEEP='import errno, os, signal, sys
+uid, start, sig, use, exclude = sys.argv[1], int(sys.argv[2]), getattr(signal, sys.argv[3]), sys.argv[4], sys.argv[5]
+if use != "1" or not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+    sys.exit(3)
+def info(pid):
+    with open("/proc/%s/stat" % pid) as f:
+        rest = f.read().rsplit(")", 1)[1].split()
+    u = None
+    with open("/proc/%s/status" % pid) as f:
+        for line in f:
+            if line.startswith("Uid:"):
+                u = line.split()[1]
+                break
+    return rest[0], int(rest[19]), u
+pids = sys.argv[6:] or [p for p in os.listdir("/proc") if p.isdigit()]
+failed = False
+for pid in pids:
+    if pid in (exclude, str(os.getpid())):
+        continue
+    try:
+        fd = os.pidfd_open(int(pid))
+    except OSError as e:
+        if e.errno in (errno.ENOSYS, errno.EPERM):
+            sys.exit(3)
+        if e.errno != errno.ESRCH:
+            print("!%s:%s" % (pid, errno.errorcode.get(e.errno, e.errno)))
+            failed = True
+        continue
+    try:
+        try:
+            state, st, u = info(pid)
+        except (OSError, ValueError, IndexError):
+            continue
+        if u != uid or st < start or state in ("Z", "X"):
+            continue
+        try:
+            signal.pidfd_send_signal(fd, 0)
+            signal.pidfd_send_signal(fd, sig)
+        except ProcessLookupError:
+            continue
+        print(pid)
+    finally:
+        os.close(fd)
+sys.exit(4 if failed else 0)'
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [rebot-app-run] $*" >> "$LOG" 2>/dev/null; }
 
@@ -160,17 +222,40 @@ is_leftover() {
 }
 
 # kill_user_leftovers: SIGKILL every process of RUN_USER started at or after the program
-# (child_start); only when the runner is root (see the header). Each pid is re-checked by
-# is_leftover right before its kill, and the /proc sweep repeats until a sweep finds none
-# (at most LEFTOVER_SWEEPS times), so processes forked during a sweep are caught by the next
-# one. Remaining race: a pid that exits and is reused by a process of another user between
-# its last check and the kill() (a few instructions; BusyBox has no pidfd kill).
+# (child_start); only when the runner is root (see the header). The /proc sweep repeats until
+# a sweep finds none (at most LEFTOVER_SWEEPS times), so processes forked during a sweep are
+# caught by the next one. With pidfds ($SWEEP) a reused pid is never signalled; a pid that
+# pidfd_open fails on with an error other than ESRCH / ENOSYS / EPERM is logged and the
+# sweep fails (return 1), since that process may still be running. Fallback
+# (no pidfds): each pid is re-checked by is_leftover right before kill <pid>; remaining race:
+# a pid that exits and is reused by a process of another user between its last check and the
+# kill() (a few instructions).
 kill_user_leftovers() {
     [ "$(id -u)" -eq 0 ] && [ -n "$child_start" ] || return 0
     sweeps=0
     while [ "$sweeps" -lt "$LEFTOVER_SWEEPS" ]; do
         sweeps=$((sweeps + 1))
         found=0
+        if [ "$pidfd_ok" = 1 ]; then
+            out=$(python3 -I -S -c "$SWEEP" "$uid" "$child_start" SIGKILL "$USE_PIDFD" "$$" 2>/dev/null)
+            src=$?
+            if [ "$src" -eq 0 ] || [ "$src" -eq 4 ]; then
+                for p in $out; do
+                    case "$p" in
+                        '!'*) p=${p#!}; log "pidfd_open failed for pid ${p%%:*} (${p#*:}); it may still be running" ;;
+                        *) found=1; log "killed pid $p of $RUN_USER started after the program (outside its group; pidfd)" ;;
+                    esac
+                done
+                if [ "$src" -eq 4 ]; then
+                    log "leftover sweep failed: processes of $RUN_USER may still be running"
+                    return 1
+                fi
+                [ "$found" -eq 0 ] && return 0
+                continue
+            fi
+            pidfd_ok=0
+            log "pidfd sweep unavailable (exit $src); falling back to kill <pid> after a uid / start time re-check"
+        fi
         for d in /proc/[0-9]*; do
             p=${d#/proc/}
             [ "$p" = "$$" ] && continue
