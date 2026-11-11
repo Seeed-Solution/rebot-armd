@@ -63,20 +63,20 @@ def http(url: str, body: dict | None = None, method: str | None = None) -> tuple
 
 @pytest.fixture(scope="module")
 def live():
-    from rebot_sim.perception import CameraRig, PerceptionServer, serve_video
+    import threading
 
     sim = Simulator(free_port(socket.SOCK_DGRAM), objects="cube,cup", seed=None, camera_mount=CameraMount())
-    sim.rig = CameraRig(sim, 15, (640, 360), scene_stream=False)
-    sim.rig.ready.wait(30)
-    if sim.rig.error:
-        pytest.skip(sim.rig.error)
     vport, pport = free_port(), free_port()
-    ws = serve_video("127.0.0.1", vport, sim.rig.streams)
-    ps = PerceptionServer(sim.rig.perception, sim, "127.0.0.1", pport)
+    ready = sim.start_camera(15, (640, 360), "127.0.0.1", vport, pport, objects="cube,cup")
+    if "error" in ready:
+        pytest.skip(ready["error"])
+    runner = threading.Thread(target=sim.run, daemon=True)  # physics: serves the shared state and /sim
+    runner.start()
     yield sim, f"ws://127.0.0.1:{vport}/", f"http://127.0.0.1:{pport}"
     sim.stopping = True
-    ws.shutdown()
-    ps.httpd.shutdown()
+    runner.join(2)
+    sim.cam_proc.terminate()
+    sim.cam_proc.join(5)
     sim.sock.close()
 
 

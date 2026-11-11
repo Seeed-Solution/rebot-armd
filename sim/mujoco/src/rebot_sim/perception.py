@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
 import queue
 import threading
 import time
@@ -422,88 +423,146 @@ class PerceptionServer:
             return 200, {"api_version": API_VERSION, **p.sub_body(s), "continuous": p.continuous()}
 
 
-# --------------------------------------------------------------------------- render loop
+# --------------------------------------------------------------------------- render process
+#
+# The camera runs in a child process (spawned, so it gets its own GL context and GIL): on a
+# loaded host a render thread in the simulator process cut the 500 Hz physics loop to about
+# 220 Hz, while a separate rendering process left it at 500 Hz. The simulator publishes
+# its state in shared memory (seqlock) and answers /sim requests over a pipe.
+
+HDR = 4  # shared float64 slots: seq, sim time, camera frames, camera ms/frame
+
+
+class SharedState:
+    """Simulator state in shared memory: [seq, time, frames, frame_ms, qpos..., qvel...]."""
+
+    def __init__(self, nq: int, nv: int, name: str | None = None):
+        from multiprocessing import shared_memory
+
+        size = (HDR + nq + nv) * 8
+        self.shm = shared_memory.SharedMemory(name=name, create=name is None, size=size)
+        self.arr = np.ndarray((HDR + nq + nv,), dtype=np.float64, buffer=self.shm.buf)
+        self.nq, self.nv = nq, nv
+        if name is None:
+            self.arr[:] = 0.0
+
+    def write(self, data) -> None:
+        a = self.arr
+        a[0] += 1  # odd: writing
+        a[1] = data.time
+        a[HDR:HDR + self.nq] = data.qpos
+        a[HDR + self.nq:] = data.qvel
+        a[0] += 1
+
+    def read(self, data) -> bool:
+        a = self.arr
+        for _ in range(1000):
+            s1 = a[0]
+            if s1 % 2:
+                continue
+            qpos, qvel, t = a[HDR:HDR + self.nq].copy(), a[HDR + self.nq:].copy(), a[1]
+            if a[0] == s1:
+                data.qpos[:], data.qvel[:], data.time = qpos, qvel, t
+                return s1 > 0
+        return False
+
+
+class SimLink:
+    """Child side of the simulator pipe: /sim/reset and /sim/state go to the physics loop."""
+
+    def __init__(self, conn):
+        self.conn, self.lock = conn, threading.Lock()
+
+    def call(self, msg: tuple, timeout: float = 3.0) -> dict:
+        with self.lock:
+            self.conn.send(msg)
+            if not self.conn.poll(timeout):
+                raise TimeoutError("simulator did not answer")
+            return self.conn.recv()
 
 
 class CameraRig:
-    """Render thread: copies the simulator state, renders the wrist (and optionally scene)
-    camera, computes ground-truth detections, encodes and publishes."""
+    """Renders the wrist (and optionally scene) camera from the shared state, computes
+    ground-truth detections, encodes and publishes. Runs in the camera process."""
 
-    def __init__(self, sim, fps: int, size: tuple[int, int], scene_stream: bool):
+    def __init__(self, cfg: dict, state: SharedState, link: SimLink):
         import mujoco
 
         from . import camera as cam
+        from .model import load_model
+        from .scene import Scene, parse_objects
 
-        self.sim, self.fps, self.size = sim, fps, size
-        self.model = sim.model
+        self.cfg, self.state, self.link = cfg, state, link
+        self.fps, self.size = cfg["fps"], tuple(cfg["size"])
+        self.mount = cam.CameraMount(*cfg["mount"])
+        objects = parse_objects(cfg["objects"])
+        self.model = load_model(objects=objects, camera=self.mount)
         self.data = mujoco.MjData(self.model)
-        self.wrist_id = self.model.camera("wrist").id
+        self.scene = Scene(self.model, objects)
         self.streams = {"/": VideoStream()}
-        if scene_stream:
+        if cfg["scene_stream"]:
             self.streams["/scene"] = VideoStream()
-        self.perception = Perception(max_fps=min(15, fps))
+        self.perception = Perception(max_fps=min(15, self.fps))
         self.frame_id = 0
         self.render_ms: list[float] = []
-        self.backend = None
-        self.error: str | None = None
-        self.ready = threading.Event()
+        self.backend = os.environ.get("MUJOCO_GL", "default")
         self._cam = cam
-        self._thread = threading.Thread(target=self._run, name="camera", daemon=True)
-        self._thread.start()
 
-    def _run(self) -> None:
-        import os
+    # PerceptionServer's simulator interface
+    def request_reset(self, seed):
+        return self.link.call(("reset", seed))
 
+    def sim_state(self):
+        return self.link.call(("state",))
+
+    def camera_info(self) -> dict:
+        cam, m = self._cam, self.mount
+        r = cam.mount_rotation(self.model, m)
+        return {
+            "camera_mount": {"flip": m.flip, "rot_deg": m.rot_deg, "tilt_deg": m.tilt_deg,
+                             "offset_m": [round(float(v), 5) for v in m.offset]},
+            "hfov_deg": round(cam.HFOV_DEG, 3), "vfov_deg": round(cam.VFOV_DEG, 3),
+            "stream_size": list(self.size), "fps": self.fps, "detection_size": list(cam.DETECTION_SIZE),
+            "fx_px": round(cam.focal_px(cam.DETECTION_SIZE[1]), 2),
+            "grip_pixel_norm_at": {f"{h:.2f}": cam.grip_pixel_norm(r, m.offset, h) for h in (0.10, 0.12, 0.15, 0.18, 0.20)},
+            "render_backend": self.backend, "render": self.stats(),
+        }
+
+    def run(self, parent_pid: int) -> None:
         import mujoco
 
-        try:
-            w, h = self.size
-            self.model.vis.global_.offwidth = max(self.model.vis.global_.offwidth, w)
-            self.model.vis.global_.offheight = max(self.model.vis.global_.offheight, h)
-            renderer = mujoco.Renderer(self.model, h, w)
-            seg_renderer = mujoco.Renderer(self.model, self._cam.DETECTION_SIZE[1], self._cam.DETECTION_SIZE[0])
-            seg_renderer.enable_segmentation_rendering()
-            self.backend = os.environ.get("MUJOCO_GL", "default")
-            opt = mujoco.MjvOption()
-            opt.sitegroup[:] = 0
-            if self.sim.has_meshes:
-                opt.geomgroup[3] = 0  # box primitives hidden behind the upstream meshes
-            encoders = {path: self._cam.H264Encoder(w, h, self.fps) for path in self.streams}
-        except Exception as exc:  # no GL backend, no libx264
-            self.error = f"camera init failed: {exc}"
-            self.ready.set()
-            return
-        self.ready.set()
+        w, h = self.size
+        self.model.vis.global_.offwidth = max(self.model.vis.global_.offwidth, w)
+        self.model.vis.global_.offheight = max(self.model.vis.global_.offheight, h)
+        renderer = mujoco.Renderer(self.model, h, w)
+        seg_renderer = mujoco.Renderer(self.model, self._cam.DETECTION_SIZE[1], self._cam.DETECTION_SIZE[0])
+        seg_renderer.enable_segmentation_rendering()
+        opt = mujoco.MjvOption()
+        opt.sitegroup[:] = 0
+        if self.cfg["has_meshes"]:
+            opt.geomgroup[3] = 0  # box primitives hidden behind the upstream meshes
+        encoders = {path: self._cam.H264Encoder(w, h, self.fps) for path in self.streams}
         period = 1.0 / self.fps
         next_t = time.perf_counter()
-        while not self.sim.stopping:
+        while os.getppid() == parent_pid:
             t0 = time.perf_counter()
-            with self.sim.lock:
-                self.data.qpos[:] = self.sim.data.qpos
-                self.data.qvel[:] = self.sim.data.qvel
-                self.data.time = self.sim.data.time
-                captured = time.monotonic()
-            mujoco.mj_forward(self.model, self.data)
+            self.state.read(self.data)
+            captured = time.monotonic()
             ts_ms = _now_ms()
-            renderer.update_scene(self.data, camera="wrist", scene_option=opt)
-            rgb = renderer.render()
+            mujoco.mj_forward(self.model, self.data)
             seg_renderer.update_scene(self.data, camera="wrist", scene_option=opt)
-            dets = self._cam.detections(self._cam.segmentation_ids(seg_renderer.render()), self.sim.scene)
+            dets = self._cam.detections(self._cam.segmentation_ids(seg_renderer.render()), self.scene)
             self.frame_id += 1
             self.perception.on_frame(self.frame_id, ts_ms, captured, dets)
             for path, stream in self.streams.items():
                 if not stream.active:
                     continue
-                if path != "/":
-                    renderer.update_scene(self.data, camera="scene", scene_option=opt)
-                    img = renderer.render()
-                else:
-                    img = rgb
-                idr = stream.take_idr_request()
-                au = encoders[path].encode(img, keyframe=idr)
+                renderer.update_scene(self.data, camera="wrist" if path == "/" else "scene", scene_option=opt)
+                au = encoders[path].encode(renderer.render(), keyframe=stream.take_idr_request())
                 if au:
                     stream.publish(au, ts_ms, 5 in _nal_types(au))
             self.render_ms = (self.render_ms + [(time.perf_counter() - t0) * 1000])[-100:]
+            self.state.arr[2], self.state.arr[3] = self.frame_id, float(np.mean(self.render_ms))
             next_t += period
             now = time.perf_counter()
             if next_t > now:
@@ -515,6 +574,23 @@ class CameraRig:
         ms = np.array(self.render_ms) if self.render_ms else np.zeros(1)
         return {"frames": self.frame_id, "frame_ms_mean": round(float(ms.mean()), 2),
                 "frame_ms_max": round(float(ms.max()), 2)}
+
+
+def camera_main(cfg: dict, shm_name: str, nq: int, nv: int, conn, ready_conn, parent_pid: int) -> None:
+    """Camera process entry: build the rig, start the servers, report readiness, render."""
+    state = SharedState(nq, nv, shm_name)
+    try:
+        rig = CameraRig(cfg, state, SimLink(conn))
+        import mujoco
+
+        mujoco.Renderer(rig.model, 8, 8).close()  # fails here when no GL backend works
+        serve_video(cfg["host"], cfg["video_port"], rig.streams)
+        PerceptionServer(rig.perception, rig, cfg["host"], cfg["perception_port"])
+    except Exception as exc:  # no GL backend, no libx264, port in use
+        ready_conn.send({"error": f"camera init failed: {exc!r}"})
+        return
+    ready_conn.send({"backend": rig.backend})
+    rig.run(parent_pid)
 
 
 def _nal_types(au: bytes) -> list[int]:

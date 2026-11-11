@@ -31,7 +31,7 @@ import time
 import mujoco
 import numpy as np
 
-from .camera import CameraMount, grip_pixel_norm, mount_rotation
+from .camera import CameraMount
 from .model import DOF, Indexer, load_model
 from .scene import Scene, parse_objects
 
@@ -194,7 +194,9 @@ class Simulator:
         self.lock = threading.Lock()
         self.stopping = False
         self._resets: list[tuple[int | None, threading.Event, dict]] = []
-        self.rig = None
+        self.shared = None  # SharedState for the camera process
+        self.cam_conn = None
+        self.cam_proc = None
         self.torque_report = torque_report
         # --torque-report mean: torques of the last physics steps and the command period in steps
         self.tau_hist: collections.deque = collections.deque(maxlen=256)
@@ -285,6 +287,8 @@ class Simulator:
                 self._resets.clear()
             self.motors.apply()
             mujoco.mj_step(self.model, self.data)
+        if self.shared is not None:
+            self.shared.write(self.data)
         if self.torque_report == "mean":
             self.tau_hist.append(self.motors.reported_torque())
             self.steps_since_cmd += 1
@@ -314,33 +318,54 @@ class Simulator:
         with self.lock:
             return self._state_locked()
 
-    def camera_info(self) -> dict:
-        from .camera import DETECTION_SIZE, HFOV_DEG, VFOV_DEG, focal_px
+    def start_camera(self, fps: int, size: tuple[int, int], host: str, video_port: int, perception_port: int,
+                     scene_stream: bool = False, objects: str = "cube", timeout: float = 60.0) -> dict:
+        """Spawn the camera process (perception.camera_main); returns its ready message."""
+        import multiprocessing as mp
+
+        from .perception import SharedState, camera_main
+
+        self.shared = SharedState(self.model.nq, self.model.nv)
+        self.shared.write(self.data)
+        ctx = mp.get_context("spawn")
+        self.cam_conn, child = ctx.Pipe()
+        ready_r, ready_w = ctx.Pipe(duplex=False)
         m = self.mount
-        if m is None:
-            return {"error": "camera off (start rebot-sim with --camera)"}
-        r = mount_rotation(self.model, m)
-        rig = self.rig
-        return {
-            "camera_mount": {"flip": m.flip, "rot_deg": m.rot_deg, "tilt_deg": m.tilt_deg,
-                             "offset_m": [round(float(v), 5) for v in m.offset]},
-            "hfov_deg": round(HFOV_DEG, 3), "vfov_deg": round(VFOV_DEG, 3),
-            "stream_size": list(rig.size) if rig else None, "fps": rig.fps if rig else None,
-            "detection_size": list(DETECTION_SIZE), "fx_px": round(focal_px(DETECTION_SIZE[1]), 2),
-            "grip_pixel_norm_at": {f"{h:.2f}": grip_pixel_norm(r, m.offset, h) for h in (0.10, 0.12, 0.15, 0.18, 0.20)},
-            "render_backend": rig.backend if rig else None, "render": rig.stats() if rig else None,
-            "error": rig.error if rig else None,
-        }
+        cfg = {"fps": fps, "size": list(size), "host": host, "video_port": video_port,
+               "perception_port": perception_port, "scene_stream": scene_stream, "objects": objects,
+               "mount": [m.flip, m.rot_deg, m.tilt_deg, m.offset_m], "has_meshes": self.has_meshes}
+        self.cam_proc = ctx.Process(target=camera_main, name="rebot-sim-camera", daemon=True,
+                                    args=(cfg, self.shared.shm.name, self.model.nq, self.model.nv, child, ready_w, os.getpid()))
+        self.cam_proc.start()
+        if not ready_r.poll(timeout):
+            return {"error": "camera process did not start"}
+        return ready_r.recv()
+
+    def service_camera(self) -> None:
+        """Answer the camera process's /sim requests (physics thread)."""
+        while self.cam_conn is not None and self.cam_conn.poll():
+            try:
+                msg = self.cam_conn.recv()
+            except EOFError:
+                self.cam_conn = None
+                return
+            if msg[0] == "reset":
+                self.scene.reset(self.data, msg[1])
+                self.cam_conn.send(self._state_locked())
+            else:
+                self.cam_conn.send(self._state_locked())
 
     def run(self, duration: float | None = None, stats_every: float = 0.0) -> None:
         dt = self.model.opt.timestep
         start = time.perf_counter()
         next_t = start
         steps, last_stats, last_steps = 0, start, 0
-        while duration is None or time.perf_counter() - start < duration:
+        while (duration is None or time.perf_counter() - start < duration) and not self.stopping:
             self.poll_socket()
             self.step()
             steps += 1
+            if steps % 10 == 0 and self.cam_conn is not None:
+                self.service_camera()
             if steps % STATE_EVERY == 0 and self.peer is not None:
                 try:
                     self.sock.sendto(self.state_datagram(), self.peer)
@@ -361,9 +386,8 @@ class Simulator:
                 obj = self.objects[0].name
                 cube = self.data.body(obj).xpos
                 cam = ""
-                if self.rig is not None:
-                    st = self.rig.stats()
-                    cam = f" camera={st['frames']} frames {st['frame_ms_mean']:.1f} ms/frame"
+                if self.shared is not None:
+                    cam = f" camera={self.shared.arr[2]:.0f} frames {self.shared.arr[3]:.1f} ms/frame"
                 print(f"t={self.data.time:8.2f}s rate={rate:6.1f} Hz enabled={self.motors.enabled} "
                       f"q={np.round(self.motors.idx.motor_positions(self.data), 3).tolist()} "
                       f"{obj}=({cube[0]:.3f},{cube[1]:.3f},{cube[2]:.3f}) rejected={self.rejected}{cam}", flush=True)
@@ -449,16 +473,13 @@ def main(argv: list[str] | None = None) -> None:
                     camera_mount=mount if args.camera else None)
     print(f"rebot-sim listening on udp://{args.host}:{args.port} (session {sim.session})", flush=True)
     if args.camera:
-        from .perception import CameraRig, PerceptionServer, serve_video
         w, h = (int(v) for v in args.camera_size.split("x"))
-        sim.rig = CameraRig(sim, args.fps, (w, h), args.scene_stream)
-        sim.rig.ready.wait(30)
-        if sim.rig.error:
-            print(f"rebot-sim: {sim.rig.error}", file=sys.stderr, flush=True)
+        ready = sim.start_camera(args.fps, (w, h), args.http_host, args.video_port, args.perception_port,
+                                 args.scene_stream, args.objects)
+        if "error" in ready:
+            print(f"rebot-sim: {ready['error']}", file=sys.stderr, flush=True)
             sys.exit(1)
-        serve_video(args.http_host, args.video_port, sim.rig.streams)
-        PerceptionServer(sim.rig.perception, sim, args.http_host, args.perception_port)
-        print(f"camera: {w}x{h} @ {args.fps} fps ({sim.rig.backend}), mount rot {mount.rot_deg:g} tilt {mount.tilt_deg:g} "
+        print(f"camera: {w}x{h} @ {args.fps} fps ({ready['backend']}, own process), mount rot {mount.rot_deg:g} tilt {mount.tilt_deg:g} "
               f"offset {mount.offset.round(4).tolist()}; video ws://{args.http_host}:{args.video_port}/, "
               f"perception http://{args.http_host}:{args.perception_port}", flush=True)
     try:
