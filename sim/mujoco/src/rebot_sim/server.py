@@ -115,7 +115,7 @@ class Motors:
     def apply(self) -> None:
         """Set actuator gains / controls and applied forces for the next step."""
         m, d = self.model, self.data
-        q, dq = self.idx.motor_positions(d), self.idx.motor_velocities(d)
+        q = self.idx.motor_positions(d)
         d.qfrc_applied[self.dofs] = 0.0
         if not self.enabled:
             m.actuator_gainprm[:, 0] = 0.0
