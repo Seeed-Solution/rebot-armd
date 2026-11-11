@@ -252,6 +252,13 @@ pub fn update_setup(inner: &mut SupervisorInner, body: &Value) -> Result<GraspSe
         Some(_) => return Err(MotionError::InvalidCommand("table_z_from_tcp must be boolean".into()).into()),
     }
     let setup = base.patched(&Value::Object(patch)).map_err(MotionError::InvalidCommand)?;
+    // the camera tilt is workspace geometry (camera check point): it cannot change under an
+    // accepted motion; other setup fields can
+    if setup.camera_tilt_deg as f32 != inner.config.camera_mount.tilt_deg {
+        if let Some(reason) = inner.workspace_change_blocker() {
+            return Err(MotionError::MotionBusy(format!("camera_tilt_deg cannot change while {reason}")).into());
+        }
+    }
     inner.set_grasp_setup(setup.clone());
     Ok(setup)
 }

@@ -712,3 +712,22 @@ async fn grasp_triggers_fail_target_lost_and_without_model() {
     assert!(rig2.sim.mode_calls.lock().unwrap().is_empty());
     assert_idle_after(&rig2.sup, id).await;
 }
+
+/// Camera tilt is workspace geometry: it cannot change while a macro runs (so a grasp's own
+/// plans are not made stale by a setup update), other setup fields can; idle, it can.
+#[test]
+fn camera_tilt_change_is_busy_while_a_macro_runs() {
+    let mut inner = common::sim_at(ArmConfig::rebot_dm(), &common::INSPECT);
+    inner.set_grasp_setup(GraspSetup::default());
+    let input = inner.plan_input().unwrap();
+    inner.begin_macro("grasp", &input, None).unwrap();
+    let err = grasp::update_setup(&mut inner, &json!({"camera_tilt_deg": 25.0})).unwrap_err();
+    assert_eq!(armd::api::rest::ApiError::from(err).code.as_deref(), Some("MOTION_BUSY"));
+    assert_eq!(inner.config.camera_mount.tilt_deg, 0.0);
+    grasp::update_setup(&mut inner, &json!({"table_z_m": 0.01})).expect("non-geometry field");
+    assert_eq!(inner.workspace_revision, input.workspace_revision, "the running grasp's plans stay fresh");
+    let mut inner = common::sim_at(ArmConfig::rebot_dm(), &common::INSPECT);
+    inner.set_grasp_setup(GraspSetup::default());
+    grasp::update_setup(&mut inner, &json!({"camera_tilt_deg": 25.0})).expect("idle");
+    assert_eq!(inner.config.camera_mount.tilt_deg, 25.0);
+}
