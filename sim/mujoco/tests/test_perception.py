@@ -40,16 +40,16 @@ def sim():
 def test_bad_reset_seed_is_answered_and_physics_keeps_running(sim):
     parent, child = mp.Pipe()
     sim.cam_conn = parent
-    child.send(("reset", -1))
+    child.send((1, "reset", -1))
     sim.service_camera()  # must not raise into the physics loop
-    reply = child.recv()
-    assert "error" in reply and "seed" in reply["error"] and sim.scene.seed is None
+    rid, reply = child.recv()
+    assert rid == 1 and "error" in reply and "seed" in reply["error"] and sim.scene.seed is None
     t = sim.data.time
     sim.step()
     assert sim.data.time > t and sim.cam_conn is parent
-    child.send(("reset", 4))
+    child.send((2, "reset", 4))
     sim.service_camera()
-    assert child.recv()["seed"] == 4
+    assert child.recv() == (2, sim.sim_state())
 
 
 class FakeSim:
@@ -87,3 +87,33 @@ def test_reset_seed_must_be_a_non_negative_integer(api, seed):
     assert fake.resets == []
     assert http(base + "/sim/reset", {"seed": 0}) == (200, {"seed": 0})
     assert http(base + "/sim/reset", {}) == (200, {"seed": None})
+
+
+def test_late_simulator_reply_does_not_answer_the_next_request(sim):
+    import threading
+
+    from rebot_sim.perception import SimLink
+
+    parent, child = mp.Pipe()
+    sim.cam_conn, link = parent, SimLink(child)
+    with pytest.raises(TimeoutError):
+        link.call(("state",), timeout=0.1)  # nobody serves the pipe
+    sim.service_camera()  # the physics loop answers the timed-out request late
+    out = {}
+    t = threading.Thread(target=lambda: out.update(link.call(("reset", 3), timeout=2.0)))
+    t.start()
+    while t.is_alive():
+        sim.service_camera()
+        t.join(0.01)
+    assert out["seed"] == 3
+
+
+def test_simulator_timeout_is_a_server_error(api):
+    _, fake, base = api
+
+    def stuck():
+        raise TimeoutError("simulator did not answer")
+
+    fake.sim_state = stuck
+    code, body = http(base + "/sim/state")
+    assert code == 504 and "simulator" in body["error"]

@@ -258,6 +258,10 @@ class _Handler(BaseHTTPRequestHandler):
             code, out = self.app.dispatch(method, url.path.rstrip("/") or "/", qs, body)
         except ValueError as exc:
             code, out = 400, {"error": str(exc)}
+        except TimeoutError as exc:  # the simulator's physics loop did not answer
+            code, out = 504, {"error": str(exc)}
+        except (OSError, EOFError) as exc:  # simulator pipe closed
+            code, out = 503, {"error": f"simulator unavailable: {exc!r}"}
         self._send(code, out)
 
 
@@ -469,17 +473,28 @@ class SharedState:
 
 
 class SimLink:
-    """Child side of the simulator pipe: /sim/reset and /sim/state go to the physics loop."""
+    """Child side of the simulator pipe: /sim/reset and /sim/state go to the physics loop.
+    Requests are `(id, op, *args)`, replies `(id, body)`; a reply to an earlier request that
+    timed out is dropped, so it never answers a later one."""
 
     def __init__(self, conn):
         self.conn, self.lock = conn, threading.Lock()
+        self._ids = itertools.count(1)
 
     def call(self, msg: tuple, timeout: float = 3.0) -> dict:
         with self.lock:
-            self.conn.send(msg)
-            if not self.conn.poll(timeout):
-                raise TimeoutError("simulator did not answer")
-            return self.conn.recv()
+            while self.conn.poll():  # late replies to timed-out requests
+                self.conn.recv()
+            rid = next(self._ids)
+            self.conn.send((rid, *msg))
+            deadline = time.monotonic() + timeout
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0 or not self.conn.poll(left):
+                    raise TimeoutError("simulator did not answer")
+                got, body = self.conn.recv()
+                if got == rid:
+                    return body
 
 
 class CameraRig:

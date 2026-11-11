@@ -355,10 +355,11 @@ class Simulator:
             except EOFError:
                 self.cam_conn = None
                 return
-            if msg[0] == "reset":
-                self.cam_conn.send(self._reset_locked(msg[1]))
+            rid, op = msg[0], msg[1]
+            if op == "reset":
+                self.cam_conn.send((rid, self._reset_locked(msg[2])))
             else:
-                self.cam_conn.send(self._state_locked())
+                self.cam_conn.send((rid, self._state_locked()))
 
     def run(self, duration: float | None = None, stats_every: float = 0.0) -> None:
         dt = self.model.opt.timestep
