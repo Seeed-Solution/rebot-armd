@@ -30,6 +30,10 @@ The existing `/api/v1/motion/jog`, `/motion/home`, `/motion/unload` commands and
 | `/api/v1/action/gripper` | `{"command":"open"\|"close"\|"move", "fraction":0..1? (move only; 0 closed, 1 open), "grasp":bool? (close only, default true), "speed":rad/s? (≤2.0, default 1.0), "timeout_s":? (default 6, ≤30), "tag"?}` |
 | `/api/v1/action/grasp` | `{"label":str, "box_norm":[x0,y0,x1,y1], "frame_id":int?, "ts_ms":number?, "overrides":{setup fields}?, "tag"?}` — see [Grasp](#grasp--点框抓取) |
 | `/api/v1/grasp/setup` | grasp setup patch, see [Grasp setup](#grasp-setup--抓取设置) (not an action: acknowledged without `action_id`) |
+| `/api/v1/action/move_to_pose` | `{"name":str, "include_gripper":bool? (default false), "speed_scale":0.1..1.0? (default 1.0), "tag"?}` — see [Named poses](#named-poses--命名姿态) |
+| `/api/v1/action/place` | `{"pose":str? \| "position":[x,y,z]?, "orientation"?, "approach_height_m":0.02..0.30? (default 0.08), "release":bool? (default true), "retreat":bool? (default true), "speed_scale":0.1..1.0? (default 1.0), "tag"?}` — see [Place](#place--放置) |
+| `/api/v1/poses/save`, `/api/v1/poses/delete` | `{"name":str, "positions":[dof]?}` / `{"name":str}` (not actions: acknowledged without `action_id`) |
+| `/api/v1/workspace/keepout` | `{"boxes":[{"name":str, "min_m":[x,y,z], "max_m":[x,y,z]}]}` — see [Keep-out boxes](#keep-out-boxes--禁入盒) (not an action) |
 
 - Poses are the end_link pose in base_link, metres and radians (URDF `assets/reBot-DevArm_gripper.urdf`; end_link x is the tool axis). `rpy` is URDF fixed-axis R = Rz(yaw)·Ry(pitch)·Rx(roll). `orientation: null` keeps the current orientation.
 - Motor angle = URDF model angle for J1..J6 (the cockpit's `?iksign` / `?ikoff` overrides are not applied).
@@ -52,7 +56,11 @@ The camera rotation is R_base_cam = R_base_end · R_end_cam, R_end_cam from `con
 
 Defaults linear 0.05 m/s (max 0.15), angular 0.5 rad/s (max 1.0). Joint speed is capped by `planned_max_velocity` (0.45 rad/s on rebot-dm), joint acceleration by min(limit, 3.0 rad/s²).
 
+A profile `speed_cap` (`linear_mps`, `angular_rps`, `joint_velocity_scale`) lowers these further: the request speed is accepted within the limits above, then min(request, cap) is planned, and the joint speed cap is multiplied by `joint_velocity_scale` (gripper excluded). It applies to every planned motion (actions, jog, home, park, `move_to_pose`), cannot be changed at runtime and is published as `schema.speed_cap`.
+
 默认线速度 0.05 m/s（上限 0.15），角速度 0.5 rad/s（上限 1.0）。关节速度受 `planned_max_velocity`（rebot-dm 0.45 rad/s）限制，加速度上限 min(限位, 3.0 rad/s²)。
+
+profile 的 `speed_cap`（`linear_mps`、`angular_rps`、`joint_velocity_scale`）进一步降低速度：请求值在上述范围内被接受，规划时取 min(请求值, 上限)，关节限速乘以 `joint_velocity_scale`（夹爪除外）。对所有规划运动生效（动作、jog、home、park、`move_to_pose`），运行时不可修改，发布在 `schema.speed_cap`。
 
 ## Planning and execution / 规划与执行
 
@@ -76,7 +84,7 @@ Every observation carries `action` (latest record) and, for 2 s after a newer ac
            "holding":null, "gripper_gap_rad":null, "settled":null}
 ```
 
-`kind`: `move_to`, `move_relative`, `gripper`, `grasp`, `joint_move`, `home`, `park`. A `grasp` record also carries `phase`, `iteration` and `error_px` (null for other kinds). `state`: `running`, `done`, `failed`, `cancelled`. `started_at` / `finished_at` use the observation `timestamp` clock. Clients block by waiting until `action.id == action_id` and `state != "running"`, or until `previous_action.id == action_id`.
+`kind`: `move_to`, `move_relative`, `gripper`, `grasp`, `place`, `joint_move`, `home`, `park`, `move_to_pose`. A `grasp` record also carries `phase`, `iteration` and `error_px`; a `place` record carries `phase` (all three are null for other kinds). `state`: `running`, `done`, `failed`, `cancelled`. `started_at` / `finished_at` use the observation `timestamp` clock. Clients block by waiting until `action.id == action_id` and `state != "running"`, or until `previous_action.id == action_id`.
 
 A running action ends when its reference goes away:
 
@@ -91,6 +99,57 @@ A running action ends when its reference goes away:
 | park ended with torque on | `failed` / `UNLOAD_FAILED` |
 
 Servo frames while an action runs are rejected with `MOTION_BUSY`. Jog, preset, home and park are accepted and supersede it.
+
+## Named poses / 命名姿态
+
+`GET /api/v1/poses` (no lease) returns `{"poses":[{"name", "positions":[dof], "tcp":{"position":[x,y,z], "rpy":[r,p,y]} | null, "saved_at_ms"}]}`. `tcp` is the end_link pose at save time (null without `kinematics`); `saved_at_ms` is Unix time.
+
+- `/api/v1/poses/save` (lease): `name` matches `^[A-Za-z0-9_-]{1,64}$`; `positions` defaults to the measured positions and must be within the joint limits. Saving an existing name replaces it. At most 64 poses. The ack carries `pose`.
+- `/api/v1/poses/delete` (lease): an unknown name is `404 POSE_NOT_FOUND`.
+- Both acks carry `persisted` (true / false with `persist_error`). The store is written atomically to `ARMD_POSES` (default `/userdata/rebot-teleop/poses.json`) after the supervisor lock is released. At start a valid file is loaded; an unreadable or invalid file is logged and the store starts empty; a malformed or invalid file is renamed to `poses.json.bad-<unix seconds>` so the next save cannot overwrite it.
+- `/api/v1/action/move_to_pose`: joint-space quintic of J1..J6 (and J7 with `include_gripper`) to the stored positions, planned with the joint speed cap × `speed_scale`. Action kind `move_to_pose`; same preconditions as the other actions (`MOTION_BUSY` while a trajectory or servo stream runs) and the same cancellation causes. The path's verification samples (21, more with keep-out boxes: see [Keep-out boxes](#keep-out-boxes--禁入盒)) pass the joint limits and, with `kinematics` and `workspace`, the workspace rule including keep-out boxes. Errors: `POSE_NOT_FOUND` (404), `WORKSPACE_VIOLATION` (422), `INVALID_COMMAND` (400).
+
+`GET /api/v1/poses`（无需租约）返回已保存的姿态。`/api/v1/poses/save`、`/api/v1/poses/delete` 需要租约：名称须匹配 `^[A-Za-z0-9_-]{1,64}$`，`positions` 默认取实测位置并须在关节限位内，同名覆盖，最多 64 个；删除不存在的名称返回 `404 POSE_NOT_FOUND`。文件在释放锁后原子写入 `ARMD_POSES`（默认 `/userdata/rebot-teleop/poses.json`）；启动时文件无效则记录日志、以空列表启动；格式错误或无效的文件重命名为 `poses.json.bad-<unix 秒>`，之后的保存不会覆盖它。`move_to_pose` 以关节空间五次多项式移动 J1..J6（`include_gripper` 时含 J7），速度为关节限速 × `speed_scale`，动作类型 `move_to_pose`，前置条件与取消规则同其他动作，路径的校验采样点（21 个，有禁入盒时更多，见“禁入盒”）须满足关节限位和工作空间规则（含禁入盒）。
+
+## Keep-out boxes / 禁入盒
+
+Axis-aligned boxes in the base frame that no workspace check point may enter. They are checked wherever the workspace rule applies (servo targets, every sample of Cartesian paths, the samples of jog / home / preset / `move_to_pose` quintics: 21, plus with keep-out boxes the samples of the sweep check described in the safety contract, at most 4000 added FK evaluations, else `WORKSPACE_VIOLATION`; servo and braking steps are checked the same way, at most 64 added evaluations per tick, else the stream stops in the recoverable hold; park is checked too: it is exempt from the floor, box and reach limits only, so a park through a box is `WORKSPACE_VIOLATION` and a watchdog park through a box holds position and latches `WATCHDOG_TIMEOUT`) on the same check points (end_link origin, `check_points_end_m`, camera offset). Entering a box is `WORKSPACE_VIOLATION` with `keepout '<name>'` in the message; as with the other limits, a move that starts inside a box and does not go deeper is allowed.
+
+- Profile: `workspace.keepout_boxes` (default empty, at most 16).
+- `GET /api/v1/workspace/keepout` returns `{"boxes":[{name, min_m, max_m, "source":"profile"|"runtime"}, ...], "source":"profile"|"runtime"}`: the boxes in force, profile boxes first; the top-level `source` is `runtime` once a runtime list was set.
+- WS command `/api/v1/workspace/keepout` `{"boxes":[...]}` (lease) replaces the runtime list: names 1..64 bytes, finite, `min_m < max_m` on every axis, at most 16 boxes in force (profile + runtime), else `400 INVALID_COMMAND`. Profiles without `kinematics` and `workspace` return `UNSUPPORTED`. The boxes in force are the profile boxes plus the runtime list: a runtime list only adds boxes and cannot remove a profile box; `{"boxes": []}` clears the runtime list. While a trajectory, macro action, servo stream or park runs, or the arm still moves, the command is `409 MOTION_BUSY`; an action planned before a change is `409 PLAN_STALE` at install. It is written to `ARMD_KEEPOUT` (default `/userdata/rebot-teleop/keepout.json`, ack field `persisted`) and loaded at the next start. Acks of state-file commands (keep-out, poses, collision setting, grasp setup) are sent when the write finished, so they can arrive after replies to later messages; their `epoch_id`, `safety_state` and `is_torqued` are read when the ack is sent.
+
+禁入盒为基座坐标系下的轴对齐盒，工作空间检查点不得进入。在所有应用工作空间规则的位置检查（有禁入盒时，关节空间轨迹与 servo / 制动步按安全契约中的扫掠检查验证，每条轨迹最多追加 4000 次 FK，超出返回 `WORKSPACE_VIOLATION`；每个 servo 周期最多追加 64 次，超出则 servo 流停在可恢复的保持状态），进入时返回 `WORKSPACE_VIOLATION`，消息中带 `keepout '<name>'`；起点已在盒内且不再深入的运动允许。profile 字段 `workspace.keepout_boxes`；`GET /api/v1/workspace/keepout` 返回列表与来源；WS 指令 `/api/v1/workspace/keepout` 需要租约，替换运行时列表（profile 与运行时合计最多 16 个），写入 `ARMD_KEEPOUT`（默认 `/userdata/rebot-teleop/keepout.json`），下次启动时加载。状态文件类指令（禁入盒、姿态、碰撞设置、抓取设置）的应答在写入完成后发送，可能晚于后续消息的应答；其中的 `epoch_id`、`safety_state`、`is_torqued` 取发送时的值。生效的禁入盒为 profile 列表加运行时列表：运行时列表只能增加禁入盒，不能删除 profile 中的禁入盒；轨迹、宏动作、servo 流或收纳进行中（或机械臂仍在运动）时该指令返回 `409 MOTION_BUSY`，变更前规划的动作在安装时返回 `409 PLAN_STALE`；`GET` 返回的每个盒带 `source`（`profile` 或 `runtime`）。
+
+## Observation rate, faults and residual torques / 观测频率、故障与残差力矩
+
+- `/api/v1/ws?obs_hz=N` (integer >= 0, clamped to 1..`control_frequency_hz`, so 0 and 1 mean 1 Hz; anything else: `400` before the upgrade) sends at most N observations per second on that connection, always the newest. Lease, ack, reject, `lease_lost` and `epoch_sync` messages are not decimated. `action` keeps the latest record and `previous_action` stays 2 s, so N ≥ 1 does not lose a terminal action state.
+- `fault`: null, or `{"code", "message", "recoverable"}` while `safety_state` is Fault or EStop (`safety_state` keeps its shape). Codes: `ESTOP`, `BUS_LOSS`, `THERMAL_TRIP`, `JOINT_LIMIT`, `WATCHDOG_TIMEOUT`, `FOLLOWING_ERROR`, `CONTROL_DEADLINE`, `INVALID_TELEMETRY`, `DRIVER_WRITE_FAILED`, `HARDWARE_FAULT`, `ENABLE_FAILED`, `SERVO_NO_BRAKE`, `HANDOVER_UNSETTLED`, `GRAVITY_COMP_FAILED`, `COLLISION`, `OTHER`. `recoverable` is true only for `WATCHDOG_TIMEOUT`, `CONTROL_DEADLINE`, `HANDOVER_UNSETTLED`; it is a hint for client policies, armd never clears a fault by itself.
+- `residual_torques`: measured torque minus model gravity torque for J1..J6 (N·m), null without a gravity model or valid torque feedback (also null with the mock follower). The residual raises no fault itself; the collision guard below uses it.
+
+`?obs_hz=N` 限制该连接每秒最多 N 条观测（取 1..`control_frequency_hz`），租约、应答、拒绝、`lease_lost`、`epoch_sync` 不降频。`fault` 在 Fault / EStop 时为 `{code, message, recoverable}`，否则为 null；`recoverable` 仅对 `WATCHDOG_TIMEOUT`、`CONTROL_DEADLINE`、`HANDOVER_UNSETTLED` 为 true，只是给客户端的提示，armd 不会自行清除故障。`residual_torques` 为 J1..J6 实测力矩减模型重力力矩，无重力模型或无有效力矩反馈时为 null，本身不触发故障，碰撞保护（见下）使用它。
+
+## Collision guard / 碰撞保护
+
+Contact detection with a protective stop, built on `residual_torques` (capability `collision_guard`: profile gravity model and a driver that reports torque). It is contact detection, not a certified safety function, and the default thresholds are placeholders until measured on a real arm, so it is **off by default**; thresholds must come from rebot-sysid. Joints resting on their support (`resting_pose.support_torque_limits`) are not watched at the resting pose. Full rules: `docs/control_safety_contract.md` "Collision guard".
+
+- Profile section `collision`: `{"enabled": false, "thresholds_nm": [6.0,6.0,6.0,2.5,2.5,2.5], "persist_ticks": 4, "clear_ratio": 0.5, "resume_after_s": 2.0, "max_auto_resumes": 3, "escalate_window_s": 60}` (all optional).
+- `GET /api/v1/safety/collision` (no lease): `{"available", "enabled", "sensitivity", "thresholds_nm" (scaled), "profile_thresholds_nm", "persist_ticks", "clear_ratio", "resume_after_s", "max_auto_resumes", "escalate_window_s", "source": "profile"|"runtime", "active"}`.
+- WS command `/api/v1/safety/collision` `{"enabled": bool?, "sensitivity": "low"|"medium"|"high"?}` (lease; at least one field; unknown fields or values are `400 INVALID_COMMAND`; enabling while unavailable is `422 UNSUPPORTED`). Sensitivity scales the thresholds ×1.5 / ×1.0 / ×0.7. The ack carries `collision` (the config above) and `persisted`; the setting is written to `ARMD_COLLISION` (default `/userdata/rebot-teleop/collision.json`) and loaded at the next start. Switching the guard off ends a hold at once.
+- Trip: |residual| above the threshold for `persist_ticks` ticks on any of J1..J6, with torque on, Armed / Moving and gravity compensation off. The running action ends `failed` with code `COLLISION` (message names the joint and residual); the arm holds its measured pose with torque on. `safety_state` does not change.
+- While `collision.active`, motion (jog, home, presets, park, servo, every action, gravity-compensation entry) is rejected with `409 COLLISION_HOLD`; e_stop, stop, clear_fault and torque off work.
+- The hold ends by itself after every residual stays below `clear_ratio` × threshold for `resume_after_s`. The (`max_auto_resumes`+1)-th trip within `escalate_window_s` latches Fault code `COLLISION` (`recoverable: false`), which needs `clear_fault`.
+- Observation `collision`: null while disabled or unavailable, else `{"active": bool, "joint": int|null (1-based), "residual_nm": float|null, "threshold_nm": float|null, "since_s": float|null, "resume_in_s": float|null, "trips_in_window": int, "enabled": true, "sensitivity": "medium"}`.
+
+Client pattern: on an action failing with `COLLISION`, wait until `collision.active` is false (raise if `fault.code` is `COLLISION`), then retry the step once; on escalation stop.
+
+基于 `residual_torques` 的接触检测与保护性停止（能力 `collision_guard`：profile 有重力模型且驱动报告力矩）。它是接触检测，不是经过认证的安全功能；默认阈值在真机实测前为占位值，因此**默认关闭**；阈值须来自 rebot-sysid。在收纳位姿靠在支撑上的关节（`resting_pose.support_torque_limits`）不参与检测。完整规则见 `docs/control_safety_contract.md`“碰撞保护”。profile 段 `collision` 字段同上；`GET /api/v1/safety/collision`（无需租约）返回含缩放后阈值的生效配置；WS 指令 `/api/v1/safety/collision`（需租约）设置 `enabled` 与 `sensitivity`（low / medium / high，阈值乘以 1.5 / 1.0 / 0.7），写入 `ARMD_COLLISION`（默认 `/userdata/rebot-teleop/collision.json`），下次启动加载；关闭保护会立即结束保持。触发后正在执行的动作以 `COLLISION` 失败，机械臂在实测位置保持力矩，`safety_state` 不变；保持期间运动类指令返回 `409 COLLISION_HOLD`，急停、停止、`clear_fault`、断力矩仍可用。残差低于 `clear_ratio` × 阈值持续 `resume_after_s` 后自动恢复；`escalate_window_s` 内第 `max_auto_resumes`+1 次触发锁存 Fault `COLLISION`，须 `clear_fault`。观测字段 `collision` 结构见上。
+
+## Safety self-description / 安全自描述
+
+`GET /api/v1/safety/describe` (no lease; capability `safety_describe`) lists this armd's timing, joint and Cartesian limits, keep-out boxes, speed cap, stops (`e_stop`, `watchdog` with the outcome for this config, `bus_loss`, `control_deadline`, `following_error`, `thermal`, and `collision_protective_stop` with `collision_guard`), every fault code with its recovery steps, and hardware notes. Values come from the running config and the code's constants. A client or AI assistant reads it before planning motion and keeps within those limits. Field list: `docs/control_safety_contract.md` "Safety self-description".
+
+`GET /api/v1/safety/describe`（无需租约；能力 `safety_describe`）列出本 armd 的时序、关节与笛卡尔限值、禁入盒、速度上限、停止方式（`e_stop`、按本配置给出结果的 `watchdog`、`bus_loss`、`control_deadline`、`following_error`、`thermal`，有 `collision_guard` 时另有 `collision_protective_stop`）、每个故障码及其恢复步骤和硬件说明。数值取自运行中的配置与代码常量。客户端或 AI 助手在规划运动前读取，并在这些限值内运行。字段列表见 `docs/control_safety_contract.md`“安全自描述”。
 
 ## Grasp / 点框抓取
 
@@ -160,9 +219,9 @@ Example / 示例:
 
 Persistence: `ARMD_GRASP_SETUP` (default `/userdata/rebot-teleop/grasp_setup.json`), written atomically (temp file + rename, directory created). At startup a missing file keeps the defaults; an unreadable, malformed or invalid file is logged and ignored (defaults kept, file untouched); a partial file overrides only its fields.
 
-`camera_tilt_deg` is `camera_mount.tilt_deg`: setting it changes the mount used by camera-frame moves and published in the schema. For the default mount (`flip:false`) a negative tilt turns the optical axis toward the jaws (image down).
+`camera_tilt_deg` is `camera_mount.tilt_deg`: setting it changes the mount used by camera-frame moves and published in the schema. A change of `camera_tilt_deg` while a trajectory, macro action, servo stream or park runs is `409 MOTION_BUSY` (the camera point is part of the workspace check); other fields can change at any time. For the default mount (`flip:false`) a negative tilt turns the optical axis toward the jaws (image down).
 
-设置默认值来自 `ArmConfig.grasp`；运行时用 `GET /api/v1/grasp/setup` 读取，用 WS 指令 `/api/v1/grasp/setup` 修改（`table_z_from_tcp: true` 以当前夹爪尖高度作为桌面高度），保存到 `ARMD_GRASP_SETUP`（默认 `/userdata/rebot-teleop/grasp_setup.json`）。文件缺失用默认值；文件损坏或数值无效时记日志并忽略。`camera_tilt_deg` 即 `camera_mount.tilt_deg`；默认安装（`flip:false`）下负值表示光轴朝夹爪方向（画面下方）倾斜。
+设置默认值来自 `ArmConfig.grasp`；运行时用 `GET /api/v1/grasp/setup` 读取，用 WS 指令 `/api/v1/grasp/setup` 修改（`table_z_from_tcp: true` 以当前夹爪尖高度作为桌面高度），保存到 `ARMD_GRASP_SETUP`（默认 `/userdata/rebot-teleop/grasp_setup.json`）。文件缺失用默认值；文件损坏或数值无效时记日志并忽略。`camera_tilt_deg` 即 `camera_mount.tilt_deg`；轨迹、宏动作、servo 流或收纳进行中修改 `camera_tilt_deg` 返回 `409 MOTION_BUSY`（相机点属于工作空间检查），其他字段随时可改；默认安装（`flip:false`）下负值表示光轴朝夹爪方向（画面下方）倾斜。
 
 | field | default | meaning |
 |---|---|---|
@@ -182,6 +241,54 @@ Persistence: `ARMD_GRASP_SETUP` (default `/userdata/rebot-teleop/grasp_setup.jso
 The cockpit (`src/api/index.html`) uses this API: with Detect on, tap a box, confirm "Grasp"; the "Grasp setup" HUD button opens the setup drawer. After any `gripper` or `grasp` action the cockpit takes its gripper target from `commanded_positions[6]`, so taking over by teleop does not move the jaw.
 
 驾驶舱：开启「识别」后点框并确认「抓取」；HUD 上的「抓取设置」打开设置抽屉。任何 `gripper` / `grasp` 动作之后，驾驶舱从 `commanded_positions[6]` 同步夹爪目标，遥操作接管时夹爪不会被拉回原开度。
+
+## Place / 放置
+
+`/api/v1/action/place` puts a held object down at a named pose or at a base-frame position. Needs a 7-DOF profile with `kinematics` and `gripper_policy` (`capabilities.place`); otherwise `UNSUPPORTED`. No camera or grasp setup is involved.
+
+`/api/v1/action/place` 把夹持的物体放到命名姿态或基座坐标系下的指定位置。需要 7 轴且设置了 `kinematics` 和 `gripper_policy`（`capabilities.place`），否则返回 `UNSUPPORTED`。不使用相机和抓取设置。
+
+| field | default | meaning |
+|---|---|---|
+| `pose` | — | named pose; its stored TCP (`tcp.position`, `tcp.rpy`) is the place point and orientation. A pose saved without a TCP uses FK of its positions |
+| `position` | — | place point `[x,y,z]` (end_link origin, base frame, m). Exactly one of `pose` / `position` |
+| `orientation` | null | `{"rpy":[r,p,y]}` or `{"quat":[w,x,y,z]}`; null = the pose's orientation (`pose`) or the current one (`position`) |
+| `approach_height_m` | 0.08 | 0.02..0.30; height above the place point for the approach and the retreat |
+| `release` | true | open the gripper at the place point |
+| `retreat` | true | move straight up by `approach_height_m` after the release |
+| `speed_scale` | 1.0 | 0.1..1.0; every phase runs at 0.05 m/s × scale linear and 0.5 rad/s × scale angular (the `move_to` defaults), then the profile `speed_cap` |
+| `tag` | null | string ≤ 64 bytes |
+
+Phases (`action.phase`, `action.progress`):
+
+| phase | progress | what happens |
+|---|---|---|
+| `lift` | 0.05 | straight up, orientation kept, to max(current z, target z + `approach_height_m`); no motion when the TCP is already within 1 mm of that height |
+| `approach` | 0.2 | straight line to target + `approach_height_m` in z, rotating to the place orientation |
+| `descend` | 0.55 | straight down to the place point |
+| `open` | 0.75 | gripper `open` (only with `release`) |
+| `retreat` | 0.85 | straight up by `approach_height_m` (only with `retreat`) |
+| `done` | 1.0 | `state:"done"`; `holding:false` after a release, null otherwise |
+
+Before the ack, outside the lock, lift, approach, descend and retreat are planned in sequence from the commanded state (each from the end of the previous one, retreat with the jaws open when `release`). A failure is a `command_reject` with the planner code (`IK_UNREACHABLE`, `IK_BRANCH_FLIP`, `WORKSPACE_VIOLATION` incl. keep-out boxes with `keepout '<name>'` in the message, 422); an unknown `pose` is `POSE_NOT_FOUND` (404); bad fields are `INVALID_COMMAND`. Each phase is planned again from the commanded state when it runs.
+
+Execution uses the same orchestration as `grasp` (`src/macro_action.rs`): every motion is a sub-motion of the one `place` record, installed under the lock only while the action is still running, and the cancellation table of [Grasp](#phases--阶段) applies unchanged (`/motion/stop` → `cancelled` / `STOPPED`, new motion → `SUPERSEDED`, lease → `LEASE_LOST`, E-stop / Fault / watchdog → `failed`). Servo frames are rejected with `MOTION_BUSY` for the whole action. A sub-motion longer than its planned duration × 2 + 5 s (gripper: expected duration + 10 s), capped at 60 s, or the whole action longer than 2 × `expected_duration_s` + 20 s, stops the motion and ends as `PLACE_TIMEOUT`. Sub-motion failures (`TRACKING_STALL`, `GRIPPER_TIMEOUT`, planner codes) end the action with that code.
+
+应答前在锁外按顺序规划抬升、接近、下降和撤离（每段从上一段终点开始；`release` 时撤离段按夹爪张开规划）。规划失败直接 `command_reject`（`IK_UNREACHABLE` / `IK_BRANCH_FLIP` / `WORKSPACE_VIOLATION`，含禁入盒，消息中带 `keepout '<name>'`，422）；`pose` 不存在返回 `POSE_NOT_FOUND`（404）；参数错误返回 `INVALID_COMMAND`。执行时每个阶段从当前指令位置重新规划。
+
+阶段：`lift` 沿竖直方向抬升到 max(当前 z, 目标 z + `approach_height_m`)，已在该高度 1 mm 内则不运动；`approach` 直线移动到目标上方 `approach_height_m` 处并转到放置姿态（指定姿态、命名姿态的姿态或当前姿态）；`descend` 竖直下降到放置点；`open` 张开夹爪（仅 `release`）；`retreat` 竖直上升 `approach_height_m`（仅 `retreat`）；`done`。速度为 `move_to` 默认值（0.05 m/s、0.5 rad/s）乘以 `speed_scale`，再受 profile `speed_cap` 限制。执行与 `grasp` 共用编排模块（`src/macro_action.rs`），取消规则相同：`/motion/stop` 为 `cancelled` / `STOPPED`，新运动为 `SUPERSEDED`，租约丢失为 `LEASE_LOST`，急停 / 故障 / 看门狗为 `failed`。单个子运动超过规划时长 × 2 + 5 s（夹爪为预计时长 + 10 s，上限 60 s），或整个动作超过 2 × `expected_duration_s` + 20 s，停止运动并以 `PLACE_TIMEOUT` 结束。`release:false` 时夹爪保持原指令位置，`holding` 为 null。
+
+Example / 示例:
+
+```json
+{"type":"command", "request_id":52, "generation":7, "epoch_id":3, "path":"/api/v1/action/place",
+ "body":{"pose":"bin_a", "approach_height_m":0.06, "tag":"drop"}}
+```
+
+```json
+"action": {"id":10, "kind":"place", "tag":"drop", "state":"running", "phase":"descend", "progress":0.55,
+           "code":null, "holding":null, "iteration":null, "error_px":null, ...}
+```
 
 ## Gravity compensation mode / 重力补偿模式
 
@@ -215,6 +322,7 @@ directory both return `enabled: false` and empty lists.
 | `/api/v1/diagnostics/boots` | `{"enabled", "boot", "truncated", "boots": [...]}`: one entry per armd start, oldest first |
 | `/api/v1/diagnostics/blackbox?seconds=N` | `{"enabled", "boot", "current_boot", "seconds", "truncated", "records": [...]}`: this start's records of the last N seconds (default 60, max 3600), oldest first |
 | `/api/v1/diagnostics/blackbox?seconds=N&prev=1` | the same for the previous start: the seconds before the last reset or restart |
+| `/api/v1/diagnostics/tick` | `{"window", "tick_us": {"p50","p99","max"}, "lock_us": {...}, "late_count", "since_boot_ticks"}` over the last 1000 control ticks (in memory, works without a black-box directory) |
 
 Boot entry (`boots.log`): `boot` (start counter, persisted in `boot_count`), `uptime_s` (kernel
 uptime at armd start), `kernel_boot_id`, `same_kernel_boot` (false: the kernel booted since the
@@ -226,31 +334,34 @@ last black-box record of the previous start, or null).
 Black-box record (`bb.jsonl`): `boot`, `t_ms` (monotonic ms since armd start), `safety_state`,
 `is_torqued`, `enable_state`, `lease_holder`, `control_mode`, `positions`,
 `commanded_positions`, `velocities`, `torques`, `temperatures` (3 decimals), `feedback_valid`,
-`feedback_age_ms`, `motor_errors`, `motion_limit`, `action` (latest action as `kind:state`),
+`feedback_age_ms`, `motor_errors`, `motion_limit`, `residual_torques` (3 decimals or null), `collision` (the observation field; omitted while null), `action` (latest action as `kind:state`),
 `dropped` (samples dropped so far because the writer was busy). Rate: 5 Hz while torqued or a
 joint moves faster than 0.05 rad/s, otherwise one line every 5 s. Each line is `fdatasync`ed
 while torqued. Files: `bb.jsonl` rotated at 512 KiB, two old files kept (`.1`, `.2`); about 10 min
 at 5 Hz (about 490 B per line), about 4 h idle. armd has no CAN error counters, so the record carries none.
+
+Tick timing: `tick_us` is the whole `ArmSupervisor::tick` call (waiting for the supervisor lock, the tick body and the telemetry broadcast), `lock_us` the time the tick holds the supervisor write lock, both in µs (nearest-rank percentiles). `late_count` counts ticks since start whose `dt` exceeded two control periods.
 
 只读，无需租约，仅 `GET`。读取 armd 写在 `--blackbox-dir`（默认
 `/userdata/rebot-teleop/blackbox`）下的文件，重启或断电后仍在。响应为 JSON，最大 2 MB（超出时先丢
 最旧的行，`truncated: true`）。没有黑匣子目录时两者都返回 `enabled: false` 和空列表。`boots` 每次
 armd 启动一条（含上一次启动的最后一条记录 `prev_last`、内核 `uptime_s`、`same_kernel_boot`、
 SG2002 上电原因 `reset_reason`）；`blackbox?seconds=N` 返回本次启动最近 N 秒（默认 60，最大
-3600）的记录，`&prev=1` 返回上一次启动的记录，即复位或重启前的那几秒。记录字段与采样率见上文英文部分。
+3600）的记录，`&prev=1` 返回上一次启动的记录，即复位或重启前的那几秒。记录字段与采样率见上文英文部分。`/api/v1/diagnostics/tick` 返回最近 1000 个控制周期的耗时（`tick_us` 为整个周期调用，`lock_us` 为持有监督器写锁的时间，单位 µs）以及启动以来 `dt` 超过两个控制周期的次数 `late_count`。
 
 ## Errors / 错误码
 
 | code | status |
 |---|---|
 | `IK_UNREACHABLE`, `IK_BRANCH_FLIP`, `WORKSPACE_VIOLATION` | 422 |
-| `MOTION_BUSY`, `PLAN_STALE` | 409 |
+| `MOTION_BUSY`, `PLAN_STALE`, `COLLISION_HOLD` | 409 |
 | `INVALID_COMMAND` (bad or missing params, path too long) | 400 |
 | `UNSUPPORTED`, `GRAVITY_MODEL_UNAVAILABLE` | 422 |
 | `NOT_ARMED` | 412 |
+| `POSE_NOT_FOUND` | 404 |
 | `GRAVITY_COMP_NOT_STATIONARY`, `GRAVITY_COMP_JOINT_LIMIT`, `GRAVITY_COMP_SWITCH_FAILED`, `FEEDBACK_STALE`, `LEASE_REQUIRED` (gravity compensation entry) | 409 |
 
-Codes that only appear in `action.code`: `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `ESTOP_ACTIVE`, `FAULT`, `WATCHDOG`, `LEASE_LOST`, `STOPPED`, `SUPERSEDED`, `UNLOAD_FAILED`; for `grasp` also `TARGET_LOST`, `CENTRING_FAILED`, `NOT_HOLDING`, `GRASP_TIMEOUT`, `DETECTION_UNAVAILABLE`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a later phase.
+Codes that only appear in `action.code`: `COLLISION`, `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `ESTOP_ACTIVE`, `FAULT`, `WATCHDOG`, `LEASE_LOST`, `STOPPED`, `SUPERSEDED`, `UNLOAD_FAILED`; for `grasp` also `TARGET_LOST`, `CENTRING_FAILED`, `NOT_HOLDING`, `GRASP_TIMEOUT`, `DETECTION_UNAVAILABLE`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a later phase; for `place` also `PLACE_TIMEOUT`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a re-planned phase.
 
 ## Needs verification on the device / 需实机核实
 

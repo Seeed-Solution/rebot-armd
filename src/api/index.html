@@ -106,6 +106,10 @@ body.ui-simple .only-expert, body.ui-expert .only-simple { display: none !import
 .seg button:hover { color: var(--sc-color-text); }
 .seg button.on { background: #fff; color: var(--sc-color-primary-dark); box-shadow: 0 1px 3px rgba(0,0,0,0.08); font-weight: 600; }
 .seg-sm button { min-height: 28px; padding: 0 10px; font-size: 12px; }
+.seg.off button, .seg button:disabled { cursor: not-allowed; }
+.seg.off { opacity: .45; filter: saturate(0); }
+.seg.off button.on { background: transparent; box-shadow: none; }
+body.locked .pose-go { opacity: .45; filter: saturate(0); cursor: not-allowed; }
 
 /* ---------- buttons ---------- */
 .btn {
@@ -312,6 +316,65 @@ body.ui-expert .main {
 .gset-row .btn { min-height: 44px; touch-action: manipulation; }
 .gset-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .gset-grid .field input { width: 100%; min-width: 0; }
+/* header icon buttons (settings, poses); same look as the full-screen button */
+.hd-btn { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; padding: 0; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral); background: #fff; color: var(--sc-color-text-secondary); cursor: pointer; touch-action: manipulation; }
+.hd-btn[hidden] { display: none; }
+.hd-btn svg { width: 18px; height: 18px; }
+.hd-btn:hover { color: var(--sc-color-text-primary); border-color: var(--sc-color-primary); }
+.hd-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+/* narrow phones: short UI-mode labels make room for the header icon buttons */
+@media (max-width: 479px) {
+  .topbar:has(.hd-btn:not([hidden])) .ui-switch .full { display: none; }
+  .topbar:has(.hd-btn:not([hidden])) .ui-switch .short { display: inline; }
+  .topbar:has(.hd-btn:not([hidden])) .ui-switch button { padding: 0 10px; }
+  .hd-btn { width: 32px; }
+}
+@media (max-width: 389px) {
+  .topbar:has(.hd-btn:not([hidden])) { gap: 4px; }
+  .hd-btn { width: 28px; }
+  .topbar:has(.hd-btn:not([hidden])) .ui-switch button { padding: 0 8px; }
+}
+/* collision guard: protective-stop banner, settings, residual torque bars */
+.col-banner { position: fixed; z-index: 400; top: calc(var(--head-h) + 8px); left: 50%; transform: translateX(-50%); width: min(94vw, 560px);
+  display: grid; gap: 4px; padding: 10px 14px; border-radius: var(--sc-radius-lg); background: #c73c3e; color: #fff; box-shadow: 0 10px 28px rgba(199, 60, 62, 0.35); font-size: 14px; line-height: 1.45; }
+.col-banner[hidden] { display: none; }
+.col-banner b { font-weight: 700; }
+.col-banner span { font-size: 12px; opacity: .95; }
+.col-banner .btn { justify-self: start; margin-top: 4px; min-height: 36px; background: #fff; color: #c73c3e; border-color: #fff; font-weight: 700; }
+.col-banner .btn[hidden] { display: none; }
+.tgl { position: relative; display: inline-block; width: 44px; height: 26px; flex: none; }
+.tgl input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+.tgl i { position: absolute; inset: 0; border-radius: 13px; background: #cbd5e1; transition: background .15s; pointer-events: none; }
+.tgl i::after { content: ''; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.2); transition: transform .15s; }
+.tgl input:checked + i { background: var(--sc-color-primary); }
+.tgl input:checked + i::after { transform: translateX(18px); }
+.tgl input:focus-visible + i { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+.tgl input:disabled + i { opacity: .5; }
+.col-note { color: var(--sc-status-warning-fg) !important; }
+.pose-list { max-height: none; flex: 1 1 auto; min-height: 0; align-content: start; }
+.pose-list li { align-items: center; }
+.pose-list li .pn { display: grid; gap: 2px; min-width: 0; }
+.pose-list li .pn b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pose-list li .pn small { font-size: 11px; color: var(--sc-color-text-tertiary); }
+.pose-list li .pa { display: flex; gap: 6px; flex: none; }
+.pose-list li .btn { min-height: 36px; padding: 0 12px; font-size: 13px; touch-action: manipulation; }
+.pose-list li .btn.pose-del { color: var(--sc-status-danger-fg); }
+.pose-list li .btn.pose-del.armed { background: var(--sc-status-danger-bg); border-color: #ffccc7; }
+.pose-empty { justify-content: center !important; color: var(--sc-color-text-tertiary); }
+.pose-new { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; }
+.pose-new .field input { width: 100%; min-width: 0; }
+.pose-new .btn { min-height: 44px; }
+.pose-new small { grid-column: 1 / -1; }
+.pose-new small.bad { color: var(--sc-status-danger-fg); }
+.rt-bars { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; padding: 0 16px 12px; }
+.rt-bars[hidden] { display: none; }
+.rt-cap { grid-column: 1 / -1; font-size: 11px; color: var(--sc-color-text-tertiary); }
+.rt-bar { display: grid; gap: 3px; font-size: 11px; text-align: center; color: var(--sc-color-text-secondary); font-variant-numeric: tabular-nums; }
+.rt-bar i { display: block; height: 6px; border-radius: 3px; background: var(--sc-color-bg-sunken); overflow: hidden; }
+.rt-bar i b { display: block; height: 100%; width: 0; background: #52c41a; }
+.rt-bar.warn i b { background: #faad14; }
+.rt-bar.trip i b { background: #c73c3e; }
+.rt-bar.trip { color: #c73c3e; font-weight: 700; }
 body.recording #rec-chip { display: inline-flex; }
 .banner {
   position: absolute; left: 12px; right: 12px; bottom: 12px; display: none; text-align: center;
@@ -325,6 +388,19 @@ body.offline .banner { display: block; }
   box-shadow: var(--sc-shadow);
 }
 .armview canvas { width: 100%; height: 100%; display: block; }
+.hud .v3-btn { pointer-events: auto; }
+.v3-btn::before { display: none; }
+.v3-btn[aria-pressed="true"] { background: var(--sc-color-primary-dark); color: #fff; }
+.view3d { position: absolute; inset: 0; z-index: 6; background: #eef2ea; border-radius: inherit; overflow: hidden; }
+.view3d canvas { width: 100%; height: 100%; display: block; touch-action: none; }
+.v3-legend { position: absolute; left: 10px; bottom: 8px; display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: #374151; pointer-events: none; }
+.v3-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px; vertical-align: -1px; }
+.v3-legend .k-meas i { background: #2b2f2c; }
+.v3-legend .k-cmd i { background: rgba(59, 130, 246, 0.45); }
+.v3-legend .k-ws i { border: 1.5px solid #5B7D15; }
+.v3-legend .k-ko i { background: rgba(220, 38, 38, 0.35); border: 1px solid #dc2626; }
+.v3-status { position: absolute; left: 10px; top: 8px; right: 52px; font-size: 12px; color: #374151; pointer-events: none; }
+.v3-x { position: absolute; top: 6px; right: 6px; width: 40px; height: 40px; min-height: 40px; padding: 0; font-size: 20px; border-radius: 12px; background: rgba(255,255,255,0.85); }
 .armview .tag { position: absolute; left: 8px; top: 6px; font-size: 11px; color: var(--sc-color-text-tertiary); }
 body.offline .armview { bottom: 56px; }
 
@@ -893,6 +969,8 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   .fs-btn { width: 28px; height: 28px; flex-shrink: 0; display: inline-flex !important; }
   .fs-btn svg { width: 16px; height: 16px; }
   .lang-btn { height: 28px; min-width: 28px; padding: 0 8px; flex-shrink: 0; }
+  .hd-btn { width: 28px; height: 28px; }
+  .hd-btn svg { width: 16px; height: 16px; }
   /* touch controls: no scroll/zoom gestures, no text selection, no double-tap zoom */
   .disc, .pose-btn, .grip-key, .preset, .sw, .btn-estop, .fs-btn, .pad, .cluster, .knob {
     touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
@@ -1149,6 +1227,12 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
       <svg class="ic-enter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
       <svg class="ic-exit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h3a2 2 0 0 0 2-2V3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M21 16h-3a2 2 0 0 0-2 2v3"/></svg>
     </button>
+    <button class="hd-btn" id="btn-pset" type="button" aria-label="点位" title="点位" data-i18n-aria="pose.title" data-i18n-title="pose.title" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 19 9.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/></svg>
+    </button>
+    <button class="hd-btn" id="btn-sset" type="button" aria-label="设置" title="设置" data-i18n-aria="sset.title" data-i18n-title="sset.title" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2l2.4 2.6 3.5-.4.4 3.5L21 10l-1.7 3 1 3.4-3.3 1.3-1.3 3.3-3.4-1-3 1.7-2.3-2.7-3.5.4-.4-3.5L1 14.5l1.7-3-1-3.4L5 6.8 6.3 3.5l3.4 1z" transform="scale(.9) translate(1.3 1.3)"/><circle cx="12" cy="12" r="3.2"/></svg>
+    </button>
     <button class="lang-btn" id="btn-lang" type="button" aria-label="Switch language">EN</button>
   </header>
 
@@ -1170,6 +1254,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           </div>
         </div>
         <div class="hud">
+          <button class="btn det-btn v3-btn" id="btn-3d" type="button" aria-pressed="false" aria-controls="view3d" data-i18n-aria="v3.aria" aria-label="3D 视图">3D</button>
           <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button><span class="seg seg-sm vmode" id="vmode" role="radiogroup" data-i18n-aria="vm.label" aria-label="视觉模式" hidden><button type="button" role="radio" data-vm="off" data-i18n="vm.off">关</button><button type="button" role="radio" data-vm="yolo" data-i18n="vm.yolo">YOLO</button><button type="button" role="radio" data-vm="aruco" data-i18n="vm.aruco">ArUco</button><button type="button" role="radio" data-vm="both" data-i18n="vm.both">两者</button></span><button class="btn det-btn det-trig" id="btn-trigger" type="button" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span><button class="btn det-btn det-gset" id="btn-gset" type="button" data-i18n="gset.open" hidden>抓取设置</button></span>
           <span class="sc-status-badge" id="cam-chip" data-i18n="v.chip.connecting">连接中</span>
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
@@ -1182,6 +1267,12 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
         <div class="armview only-expert" id="armview">
           <span class="tag" data-i18n="armview.tag">姿态示意 · 侧视</span>
           <canvas id="arm-canvas"></canvas>
+        </div>
+        <div class="view3d" id="view3d" role="region" data-i18n-aria="v3.aria" aria-label="3D 视图" hidden>
+          <canvas id="v3-canvas"></canvas>
+          <span class="v3-status" id="v3-status" role="status"></span>
+          <div class="v3-legend"><span class="k-meas"><i></i><b data-i18n="v3.leg.meas">实测</b></span><span class="k-cmd"><i></i><b data-i18n="v3.leg.cmd">指令</b></span><span class="k-ws"><i></i><b data-i18n="v3.leg.ws">工作空间</b></span><span class="k-ko"><i></i><b data-i18n="v3.leg.ko">禁入区</b></span></div>
+          <button class="btn v3-x" id="v3-close" type="button" data-i18n-aria="v3.close" aria-label="关闭 3D 视图">×</button>
         </div>
         <div class="grasp-bar" id="grasp-bar" role="group" data-i18n-aria="grasp.aria" aria-label="点框抓取" hidden>
           <div class="grasp-info" id="grasp-info"><b id="grasp-label">--</b><span class="mono" id="grasp-score">--</span></div>
@@ -1471,6 +1562,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           <thead><tr><th data-i18n="jt.joint">关节</th><th data-i18n="jt.deg">角度°</th><th>rad</th><th>°/s</th><th data-i18n="jt.torque">力矩</th><th>°C</th></tr></thead>
           <tbody id="jtable-body"></tbody>
         </table>
+        <div class="rt-bars" id="rt-bars" hidden></div>
       </div>
 
       <!-- expert: dataset -->
@@ -1585,6 +1677,46 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     </div>
   </aside>
 </div>
+<div class="calib-mask" id="pset" hidden>
+  <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="pset-h">
+    <div class="calib-head">
+      <h3 id="pset-h" data-i18n="pose.title">点位</h3>
+      <button class="btn calib-x" id="pset-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+    </div>
+    <p class="calib-hint" data-i18n="pose.hint">把机械臂移到想要的位置，起个名字记录下来；之后点「前往」机械臂会自己回到这个位置（需要先使能）。</p>
+    <div class="gset-row pose-new">
+      <label class="field"><span data-i18n="pose.name">名称</span><input id="pose-name" maxlength="64" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="bin_a"></label>
+      <button class="btn btn-primary" id="pose-save" type="button" data-i18n="pose.save">记录当前位置</button>
+      <small id="pose-rule" data-i18n="pose.rule">只能用英文字母、数字、下划线 _ 或短横线 -，最多 64 个字符；同名会覆盖。</small>
+    </div>
+    <ol class="calib-list pose-list" id="pose-list"></ol>
+    <div class="calib-live mono" id="pose-status">--</div>
+  </aside>
+</div>
+<div class="col-banner" id="col-banner" role="alert" aria-live="assertive" hidden>
+  <b id="col-title"></b><span id="col-sub"></span>
+  <button class="btn" id="col-clear" type="button" data-i18n="en.clear_fault" hidden>⚠️ 点击清除故障</button>
+</div>
+<div class="calib-mask" id="sset" hidden>
+  <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="sset-h">
+    <div class="calib-head">
+      <h3 id="sset-h" data-i18n="sset.title">设置</h3>
+      <button class="btn calib-x" id="sset-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+    </div>
+    <div class="gset-row" id="col-set">
+      <div class="gset-k"><span data-i18n="col.set.title">碰撞保护</span><label class="tgl"><input type="checkbox" id="col-en" role="switch" data-i18n-aria="col.set.title" aria-label="碰撞保护"><i></i></label></div>
+      <small data-i18n="col.set.desc">机械臂运动中受阻时自动停在原地，受力消除后自动恢复；短时间内多次碰撞会锁定为故障。</small>
+      <div class="gset-k"><span data-i18n="col.sens">灵敏度</span>
+        <div class="seg seg-sm" id="col-sens" role="radiogroup" data-i18n-aria="col.sens" aria-label="灵敏度">
+          <button type="button" role="radio" data-v="low" data-i18n="col.sens.low">低</button><button type="button" role="radio" data-v="medium" data-i18n="col.sens.medium">中</button><button type="button" role="radio" data-v="high" data-i18n="col.sens.high">高</button>
+        </div>
+      </div>
+      <small data-i18n="col.sens.hint">高：轻微受阻就停；低：只在明显受阻时停。</small>
+      <small class="col-note" data-i18n="col.set.note">注意：这台机械臂的碰撞阈值还没有标定，灵敏度只作试用参考；碰撞保护不能代替急停。</small>
+      <div class="calib-live mono" id="col-status">--</div>
+    </div>
+  </aside>
+</div>
 <script>
 'use strict';
 /* =================================================================
@@ -1598,7 +1730,7 @@ const I18N = {
     'lang.btn': 'EN', 'lang.aria': '切换语言',
     'speed': '速度', 'speed.adjust': '速度调节', 'speed.mult': '速度倍率',
     'fs.enter': '进入全屏', 'fs.title': '全屏', 'fs.exit': '退出全屏 / 展开布局', 'fs.hud': '全屏 HUD 沉浸模式',
-    'st.EStop': '急停', 'st.Offline': '离线', 'st.Armed': '已使能', 'st.Moving': '运动中', 'st.Idle': '未使能', 'st.Booting': '启动中', 'st.Fault': '故障', 'st.unconfirmed': '使能状态未确认',
+    'st.EStop': '急停', 'st.Offline': '离线', 'st.Armed': '已使能', 'st.Moving': '运动中', 'st.Idle': '未使能', 'st.Booting': '启动中', 'st.Fault': '故障', 'st.unconfirmed': '使能状态未确认', 'st.col_hold': '碰撞保护中',
     'no_telemetry': '无遥测', 'unknown': '未知', 'unknown_reason': '未知原因',
     'v.connecting': '正在连接摄像头…', 'v.retry': '立即重试', 'v.chip.connecting': '连接中', 'v.live': '实时',
     'v.noservice': '未连接到视频服务', 'v.dropped': '视频流中断，正在重连…', 'v.cant_open': '视频源无法打开',
@@ -1648,6 +1780,8 @@ const I18N = {
     'calib.ok.solve.eih': '标定完成，位置 RMSE {rmse} mm，姿态 RMSE {rot}°', 'calib.rmse.warn.eih': '残差偏大：检查标记是否固定不动、采集时机械臂是否静止，删除标黄的位姿后重新求解',
     'calib.r.frame': '结果', 'calib.r.rmse_pos': '位置残差 RMSE', 'calib.r.rmse_rot': '姿态残差 RMSE',
     'rec.chip0': '录制 00:00', 'rec.chip': '录制 ',
+    'v3.aria': '3D 视图', 'v3.close': '关闭 3D 视图', 'v3.loading': '正在加载 3D 视图…', 'v3.err': '3D 视图加载失败：{m}', 'v3.stick': '未安装机械臂网格，显示关节骨架', 'v3.offline': '无遥测，显示最后姿态', 'v3.hint': '拖动旋转 · 双指缩放',
+    'v3.leg.meas': '实测', 'v3.leg.cmd': '指令', 'v3.leg.ws': '工作空间', 'v3.leg.ko': '禁入区',
     'armview.tag': '姿态示意 · 侧视', 'banner.lock': '遥测断开 · 控制已锁定',
     'ctl.mode': '控制方式', 'mode.joint': '关节点动', 'mode.cart': '空间位姿', 'home': '回零',
     'input.mode': '输入方式', 'input.btn': '按键', 'input.stick': '摇杆',
@@ -1688,7 +1822,7 @@ const I18N = {
     'estop': '急停', 'estop.aria': '紧急停止',
     'lock.offline': '遥测断开，控制已锁定', 'lock.observer': '当前为观察模式，其他页面可能正在控制', 'lock.observer_who': '观察模式：{who}正在控制机械臂',
     'preempt.who': '控制方：{who}', 'who.cockpit': '另一个驾驶舱页面', 'who.agent': 'AI 智能体（{id}）', 'who.other': '其他客户端', 'who.named': '客户端 {id}',
-    'lock.estop': '⚠️ 急停已锁定：点击「复位急停」，再长按「使能」', 'lock.fault': '⚠️ 故障：点击「清除故障」后长按「使能」', 'lock.disabled': '未使能：按住「使能」0.6 秒后即可控制',
+    'lock.estop': '⚠️ 急停已锁定：点击「复位急停」，再长按「使能」', 'lock.fault': '⚠️ 故障：点击「清除故障」后长按「使能」', 'lock.disabled': '未使能：按住「使能」0.6 秒后即可控制', 'lock.col_hold': '碰撞保护中：自动恢复前运动控制已锁定（急停可用）',
     'preempt.btn': '接管控制权', 'preempt.title': '接管控制权确认',
     'preempt.body': '当前有其他设备或窗口持有控制权。确认接管机械臂控制权？接管后原控制窗口将切换为观察模式，正在进行的运动将被平稳悬停保持。',
     'preempt.confirm': '确认接管', 'preempt.taking': '接管中…', 'preempt.cool': '刚刚发生过控制权交接，请 {s} 秒后再试', 'cancel': '取消',
@@ -1722,6 +1856,38 @@ const I18N = {
     'cart.enable_first': '使能后可控制末端位姿', 'cart.following': '目标跟随实测位姿 · 分支 {branch} · {tx}', 'cart.tx_ws': 'WS 流', 'cart.tx_rest': 'REST 伺服',
     'wait_arm': '等待机械臂连接', 'wait_telemetry': '等待遥测', 'ready': '电机就绪 · 可以操控',
     'fault.limit': '关节超限 {name}: {val}°', 'fault.thermal': '过温 J{j}: {temp}°C / {limit}°C',
+    // observation.fault.code -> short explanation + what to do (fc.<CODE> / fc.<CODE>.do)
+    'fm.coded': '⚠️ {title}。{todo}。点此清除故障后长按「使能」。', 'lock.fault_coded': '⚠️ {title}：{todo}，然后点「清除故障」并长按「使能」',
+    'fc.ESTOP': '急停已按下', 'fc.ESTOP.do': '确认周围安全后复位急停',
+    'fc.BUS_LOSS': '电机总线断开', 'fc.BUS_LOSS.do': '检查电机线缆和电源是否接好',
+    'fc.THERMAL_TRIP': '电机过热', 'fc.THERMAL_TRIP.do': '让机械臂停下冷却几分钟',
+    'fc.JOINT_LIMIT': '关节超出限位', 'fc.JOINT_LIMIT.do': '恢复后把该关节慢慢点动回限位范围内',
+    'fc.WATCHDOG_TIMEOUT': '控制连接中断，机械臂已停靠', 'fc.WATCHDOG_TIMEOUT.do': '检查网络连接',
+    'fc.FOLLOWING_ERROR': '关节跟不上指令（可能被挡住）', 'fc.FOLLOWING_ERROR.do': '检查工作区有没有障碍物或被卡住的关节',
+    'fc.CONTROL_DEADLINE': '控制循环超时', 'fc.CONTROL_DEADLINE.do': '一般可直接恢复；反复出现请重启 armd',
+    'fc.INVALID_TELEMETRY': '电机反馈数据异常', 'fc.INVALID_TELEMETRY.do': '检查电机线缆连接',
+    'fc.DRIVER_WRITE_FAILED': '指令无法发送到电机', 'fc.DRIVER_WRITE_FAILED.do': '检查电机线缆和电源',
+    'fc.HARDWARE_FAULT': '电机报告硬件故障', 'fc.HARDWARE_FAULT.do': '检查电机供电和指示灯；反复出现请联系技术支持',
+    'fc.ENABLE_FAILED': '电机使能失败', 'fc.ENABLE_FAILED.do': '检查电源和急停开关',
+    'fc.SERVO_NO_BRAKE': '关节来不及在限位前停住', 'fc.SERVO_NO_BRAKE.do': '恢复后降低速度再操作',
+    'fc.HANDOVER_UNSETTLED': '交接后机械臂没有停稳', 'fc.HANDOVER_UNSETTLED.do': '等机械臂完全静止',
+    'fc.GRAVITY_COMP_FAILED': '拖动示教模式切换失败', 'fc.GRAVITY_COMP_FAILED.do': '扶住机械臂',
+    'fc.COLLISION': '多次碰撞，机械臂已锁定', 'fc.COLLISION.do': '检查工作区，移开障碍物',
+    'fc.OTHER': '故障：{d}', 'fc.OTHER.do': '查看机械臂状态',
+    'col.active': '碰撞保护：关节 J{j} 受阻（{r} N·m），已停止；{s} 秒后自动恢复', 'col.active_wait': '碰撞保护：关节 J{j} 受阻（{r} N·m），已停止；受力消除后自动恢复',
+    'col.sub': '请移开障碍物，机械臂保持在当前位置，期间不能运动。', 'col.esc.sub': '{todo}，然后点下面的按钮清除故障，再长按「使能」。',
+    'err.collision_hold': '碰撞保护中，机械臂暂停运动，受力消除后自动恢复',
+    'sset.title': '设置', 'col.set.title': '碰撞保护', 'col.set.desc': '机械臂运动中受阻时自动停在原地，受力消除后自动恢复；短时间内多次碰撞会锁定为故障。',
+    'col.sens': '灵敏度', 'col.sens.low': '低', 'col.sens.medium': '中', 'col.sens.high': '高', 'col.sens.hint': '高：轻微受阻就停；低：只在明显受阻时停。',
+    'col.set.note': '注意：这台机械臂的碰撞阈值还没有标定，灵敏度只作试用参考；碰撞保护不能代替急停。',
+    'col.st.on': '已开启 · 灵敏度{s}', 'col.st.off': '已关闭', 'col.st.saved': '已保存', 'col.st.loading': '读取中…', 'col.st.err': '读取失败：{e}',
+    'rt.cap': '残余力矩（实测 − 重力模型）/ 碰撞阈值',
+    'pose.title': '点位', 'pose.hint': '把机械臂移到想要的位置，起个名字记录下来；之后点「前往」机械臂会自己回到这个位置（需要先使能）。',
+    'pose.name': '名称', 'pose.save': '记录当前位置', 'pose.rule': '只能用英文字母、数字、下划线 _ 或短横线 -，最多 64 个字符；同名会覆盖。',
+    'pose.bad': '名称不符合规则：只能用英文字母、数字、_ 或 -，1 到 64 个字符', 'pose.go': '前往', 'pose.del': '删除', 'pose.del.confirm': '确认删除',
+    'pose.empty': '还没有记录的点位', 'pose.count': '共 {n} 个点位', 'pose.loading': '读取中…', 'pose.err': '读取失败：{e}',
+    'pose.saved': '已记录点位 {name}', 'pose.deleted': '已删除点位 {name}', 'pose.moving': '正在前往点位 {name}', 'pose.enable_first': '请先使能机械臂，再前往点位',
+    'pose.code.POSE_NOT_FOUND': '点位不存在（可能已被删除）', 'pose.code.WORKSPACE_VIOLATION': '目标位置超出工作范围', 'pose.code.INVALID_COMMAND': '参数无效：{m}',
     'err.epoch': '控制状态已变化，请检查状态后重新操作', 'err.settling': '机械臂正在交接停稳中，请稍候片刻再操作', 'err.settling2': '机械臂正在交接停稳中，请稍候...', 'err.settling3': '机械臂正在交接停稳中，请稍候再试',
     'err.park_unsupported': '当前机械臂缺少自动收纳所需配置或反馈能力，未启动收纳；可使用回零功能，力矩仍需现场确认',
     'err.preset_unsupported': '当前机械臂不支持自动收纳，未启动运动；可使用回零功能，力矩仍需现场确认',
@@ -1745,7 +1911,7 @@ const I18N = {
     'lang.btn': '中文', 'lang.aria': 'Switch language',
     'speed': 'Speed', 'speed.adjust': 'Adjust speed', 'speed.mult': 'Speed multiplier',
     'fs.enter': 'Enter fullscreen', 'fs.title': 'Fullscreen', 'fs.exit': 'Exit fullscreen / restore layout', 'fs.hud': 'Fullscreen HUD mode',
-    'st.EStop': 'E-Stop', 'st.Offline': 'Offline', 'st.Armed': 'Enabled', 'st.Moving': 'Moving', 'st.Idle': 'Disabled', 'st.Booting': 'Booting', 'st.Fault': 'Fault', 'st.unconfirmed': 'Enable unconfirmed',
+    'st.EStop': 'E-Stop', 'st.Offline': 'Offline', 'st.Armed': 'Enabled', 'st.Moving': 'Moving', 'st.Idle': 'Disabled', 'st.Booting': 'Booting', 'st.Fault': 'Fault', 'st.unconfirmed': 'Enable unconfirmed', 'st.col_hold': 'Collision hold',
     'no_telemetry': 'No telemetry', 'unknown': 'unknown', 'unknown_reason': 'unknown reason',
     'v.connecting': 'Connecting to camera…', 'v.retry': 'Retry now', 'v.chip.connecting': 'Connecting', 'v.live': 'Live',
     'v.noservice': 'Video service not reachable', 'v.dropped': 'Video stream lost, reconnecting…', 'v.cant_open': 'Cannot open video source',
@@ -1795,6 +1961,8 @@ const I18N = {
     'calib.ok.solve.eih': 'Calibration solved, position RMSE {rmse} mm, rotation RMSE {rot}°', 'calib.rmse.warn.eih': 'High residual: check the marker is fixed and the arm was still; delete the highlighted poses and solve again',
     'calib.r.frame': 'Result', 'calib.r.rmse_pos': 'Position RMSE', 'calib.r.rmse_rot': 'Rotation RMSE',
     'rec.chip0': 'REC 00:00', 'rec.chip': 'REC ',
+    'v3.aria': '3D view', 'v3.close': 'Close 3D view', 'v3.loading': 'Loading 3D view…', 'v3.err': '3D view failed to load: {m}', 'v3.stick': 'Arm meshes not installed; showing the joint skeleton', 'v3.offline': 'No telemetry; showing the last pose', 'v3.hint': 'Drag to rotate · pinch to zoom',
+    'v3.leg.meas': 'Measured', 'v3.leg.cmd': 'Commanded', 'v3.leg.ws': 'Workspace', 'v3.leg.ko': 'Keep-out',
     'armview.tag': 'Pose preview · side view', 'banner.lock': 'Telemetry lost · controls locked',
     'ctl.mode': 'Control mode', 'mode.joint': 'Joint jog', 'mode.cart': 'Cartesian', 'home': 'Home',
     'input.mode': 'Input type', 'input.btn': 'Buttons', 'input.stick': 'Sticks',
@@ -1833,7 +2001,7 @@ const I18N = {
     'estop': 'E-Stop', 'estop.aria': 'Emergency stop',
     'lock.offline': 'Telemetry lost, controls locked', 'lock.observer': 'Observer mode: another page may be in control', 'lock.observer_who': 'Observer mode: {who} is controlling the arm',
     'preempt.who': 'Held by {who}', 'who.cockpit': 'another cockpit page', 'who.agent': 'an AI agent ({id})', 'who.other': 'another client', 'who.named': 'client {id}',
-    'lock.estop': '⚠️ E-Stop latched: tap "Reset E-Stop", then hold "Enable"', 'lock.fault': '⚠️ Fault: tap "Clear fault", then hold "Enable"', 'lock.disabled': 'Disabled: hold "Enable" for 0.6 s to take control',
+    'lock.estop': '⚠️ E-Stop latched: tap "Reset E-Stop", then hold "Enable"', 'lock.fault': '⚠️ Fault: tap "Clear fault", then hold "Enable"', 'lock.disabled': 'Disabled: hold "Enable" for 0.6 s to take control', 'lock.col_hold': 'Collision hold: motion controls locked until it resumes (E-stop available)',
     'preempt.btn': 'Take over control', 'preempt.title': 'Confirm take over',
     'preempt.body': 'Another device or window holds control. Take over control of the arm? The previous window will switch to observer mode and any motion in progress will be held steady.',
     'preempt.confirm': 'Take over', 'preempt.taking': 'Taking over…', 'preempt.cool': 'Control was just handed over. Try again in {s} s', 'cancel': 'Cancel',
@@ -1867,6 +2035,37 @@ const I18N = {
     'cart.enable_first': 'Enable to control end-effector pose', 'cart.following': 'Target follows measured pose · branch {branch} · {tx}', 'cart.tx_ws': 'WS stream', 'cart.tx_rest': 'REST servo',
     'wait_arm': 'Waiting for arm connection', 'wait_telemetry': 'Waiting for telemetry', 'ready': 'Motors ready · ready to control',
     'fault.limit': 'Joint limit exceeded {name}: {val}°', 'fault.thermal': 'Over-temperature J{j}: {temp}°C / {limit}°C',
+    'fm.coded': '⚠️ {title}. {todo}. Tap here to clear the fault, then hold "Enable".', 'lock.fault_coded': '⚠️ {title}: {todo}, then tap "Clear fault" and hold "Enable"',
+    'fc.ESTOP': 'E-stop pressed', 'fc.ESTOP.do': 'Make sure the area is safe, then reset the E-stop',
+    'fc.BUS_LOSS': 'Motor bus lost', 'fc.BUS_LOSS.do': 'Check the motor cable and power',
+    'fc.THERMAL_TRIP': 'Motor overheated', 'fc.THERMAL_TRIP.do': 'Let the arm rest and cool for a few minutes',
+    'fc.JOINT_LIMIT': 'Joint out of its limit', 'fc.JOINT_LIMIT.do': 'Afterwards jog that joint slowly back into range',
+    'fc.WATCHDOG_TIMEOUT': 'Control connection lost; arm parked', 'fc.WATCHDOG_TIMEOUT.do': 'Check the network connection',
+    'fc.FOLLOWING_ERROR': 'A joint could not follow the command (maybe blocked)', 'fc.FOLLOWING_ERROR.do': 'Check the workspace for obstacles or a stuck joint',
+    'fc.CONTROL_DEADLINE': 'Control loop ran late', 'fc.CONTROL_DEADLINE.do': 'Usually safe to recover; restart armd if it repeats',
+    'fc.INVALID_TELEMETRY': 'Invalid motor feedback', 'fc.INVALID_TELEMETRY.do': 'Check the motor cable connections',
+    'fc.DRIVER_WRITE_FAILED': 'Commands could not reach the motors', 'fc.DRIVER_WRITE_FAILED.do': 'Check the motor cable and power',
+    'fc.HARDWARE_FAULT': 'A motor reported a hardware fault', 'fc.HARDWARE_FAULT.do': 'Check motor power and LEDs; contact support if it repeats',
+    'fc.ENABLE_FAILED': 'Motors failed to enable', 'fc.ENABLE_FAILED.do': 'Check the power supply and the E-stop switch',
+    'fc.SERVO_NO_BRAKE': 'A joint could not stop before its limit', 'fc.SERVO_NO_BRAKE.do': 'Afterwards use a lower speed',
+    'fc.HANDOVER_UNSETTLED': 'Arm did not settle after a handover', 'fc.HANDOVER_UNSETTLED.do': 'Wait until the arm is completely still',
+    'fc.GRAVITY_COMP_FAILED': 'Hand-guiding mode switch failed', 'fc.GRAVITY_COMP_FAILED.do': 'Support the arm with your hand',
+    'fc.COLLISION': 'Repeated collisions; arm locked', 'fc.COLLISION.do': 'Check the workspace and remove obstacles',
+    'fc.OTHER': 'Fault: {d}', 'fc.OTHER.do': 'Check the arm',
+    'col.active': 'Collision guard: joint J{j} blocked ({r} N·m), stopped; resuming in {s} s', 'col.active_wait': 'Collision guard: joint J{j} blocked ({r} N·m), stopped; resumes once the force is gone',
+    'col.sub': 'Remove the obstacle. The arm holds its position and cannot move meanwhile.', 'col.esc.sub': '{todo}, then tap the button below to clear the fault and hold "Enable".',
+    'err.collision_hold': 'Collision guard is holding the arm; motion resumes once the force is gone',
+    'sset.title': 'Settings', 'col.set.title': 'Collision guard', 'col.set.desc': 'Stops the arm where it is when a moving joint is blocked and resumes once the force is gone. Repeated collisions in a short time latch a fault.',
+    'col.sens': 'Sensitivity', 'col.sens.low': 'Low', 'col.sens.medium': 'Medium', 'col.sens.high': 'High', 'col.sens.hint': 'High: stops at light resistance. Low: stops only when clearly blocked.',
+    'col.set.note': 'Note: collision thresholds are not calibrated on this arm yet; treat the sensitivity as a trial setting. The guard does not replace the E-stop.',
+    'col.st.on': 'On · sensitivity {s}', 'col.st.off': 'Off', 'col.st.saved': 'Saved', 'col.st.loading': 'Loading…', 'col.st.err': 'Read failed: {e}',
+    'rt.cap': 'Residual torque (measured − gravity model) / collision threshold',
+    'pose.title': 'Poses', 'pose.hint': 'Move the arm where you want it and record the position under a name. "Go" later brings the arm back there by itself (enable the arm first).',
+    'pose.name': 'Name', 'pose.save': 'Record current position', 'pose.rule': 'Letters, digits, _ or - only, up to 64 characters; an existing name is overwritten.',
+    'pose.bad': 'Invalid name: use letters, digits, _ or -, 1 to 64 characters', 'pose.go': 'Go', 'pose.del': 'Delete', 'pose.del.confirm': 'Confirm',
+    'pose.empty': 'No poses recorded yet', 'pose.count': '{n} poses', 'pose.loading': 'Loading…', 'pose.err': 'Read failed: {e}',
+    'pose.saved': 'Recorded pose {name}', 'pose.deleted': 'Deleted pose {name}', 'pose.moving': 'Moving to pose {name}', 'pose.enable_first': 'Enable the arm first, then go to a pose',
+    'pose.code.POSE_NOT_FOUND': 'Pose not found (maybe deleted)', 'pose.code.WORKSPACE_VIOLATION': 'Target is outside the workspace', 'pose.code.INVALID_COMMAND': 'Invalid parameters: {m}',
     'err.epoch': 'Control state changed, check the state and retry', 'err.settling': 'Arm is settling after handover, wait a moment and retry', 'err.settling2': 'Arm is settling after handover, please wait...', 'err.settling3': 'Arm is settling after handover, retry shortly',
     'err.park_unsupported': 'This arm lacks the configuration or feedback needed for auto-park; park not started. Use Home instead; confirm torque state on site',
     'err.preset_unsupported': 'This arm does not support auto-park; no motion started. Use Home instead; confirm torque state on site',
@@ -2113,7 +2312,7 @@ const S = {
   ],
   ws: null, wsCount: 0, hz: 0,
   rtt: null, lastReqAt: 0,
-  state: 'Offline', fault: '',
+  state: 'Offline', fault: '', faultCode: null,
   speedIdx: 1,
   clientId: CLIENT_ID,
   presetRunning: false,
@@ -2188,6 +2387,8 @@ function rpcError(response) {
     message = t('err.settling');
   } else if (response.code === 'UNSUPPORTED') {
     message = t('err.park_unsupported');
+  } else if (response.code === 'COLLISION_HOLD') {
+    message = t('err.collision_hold');
   } else {
     message = response.message || response.error || t('err.rejected');
   }
@@ -2269,6 +2470,9 @@ function parseState(s) {
 }
 const isLive = () => S.obs && Date.now() - S.obsAt < CFG.staleMs;
 const isOperational = () => S.state === 'Armed' || S.state === 'Moving';
+// collision guard protective stop (observation.collision.active): enabled, but motion commands are held
+const colHold = () => !!(S.obs && S.obs.collision && S.obs.collision.active);
+const canMove = () => isOperational() && !colHold();
 const isStopped = () => S.state === 'EStop' || S.state === 'Fault';
 const gripFrac = (rad) => clamp((rad - CFG.gripClosed) / (CFG.gripOpen - CFG.gripClosed), 0, 1);
 const gripRad = () => CFG.gripClosed + (S.grip ?? 0) * (CFG.gripOpen - CFG.gripClosed);
@@ -2328,6 +2532,7 @@ function connectWS() {
       }
       const msg = o.code === 'HANDOVER_SETTLING'
         ? t('err.settling2')
+        : o.code === 'COLLISION_HOLD' ? t('err.collision_hold')
         : t('err.servo_reject') + (o.message || o.error || t('err.state_limit'));
       toastOnce({ message: msg, code: o.code || 'SERVO_REJECT' });
       return;
@@ -2343,6 +2548,7 @@ function connectWS() {
       S.preset = null;
       const msg = o.code === 'HANDOVER_SETTLING'
         ? t('err.settling3')
+        : o.code === 'COLLISION_HOLD' ? t('err.collision_hold')
         : o.code === 'WORKSPACE_VIOLATION' ? t('err.workspace')
         : (o.code === 'UNSUPPORTED' ? t('err.preset_unsupported') : t('err.preset_reject') + (o.message || o.error || o.reason || t('err.state_limit')));
       toast(msg, 'err');
@@ -2358,6 +2564,7 @@ function connectWS() {
     const st = parseState(o.safety_state);
     const wasStopped = isStopped();
     S.state = st.name; S.fault = st.detail;
+    S.faultCode = o.fault && typeof o.fault.code === 'string' ? o.fault.code : null;
     if (isStopped() && !wasStopped) {
       S.streamActive = false; S.servoTarget = null;
       releaseAll(); resetPoseMode();
@@ -4040,6 +4247,7 @@ function initCalib() {
 async function loadSchema() {
   try {
     const sc = await api('/api/v1/observation/schema', undefined, { quiet: true, method: 'GET' });
+    if (sc) { S.caps = sc.capabilities || {}; S.wsPolicy = sc.workspace || null; colOnCaps(); posesOnCaps(); V3.sceneAt = 0; }
     if (sc && Array.isArray(sc.limits) && sc.limits.length) {
       const oldDof = S.dof;
       S.limits = sc.limits;
@@ -4062,12 +4270,22 @@ async function loadSchema() {
   } catch (_) { setTimeout(loadSchema, 3000); }
 }
 
+// observation.fault.code -> { title, todo } in the current language; null for an unknown code
+function faultText() {
+  const c = S.faultCode;
+  if (!c || c === 'ESTOP' || I18N.zh['fc.' + c] === undefined) return null;
+  let title = t('fc.' + c, { d: S.fault || t('unknown') });
+  // joint limit / over-temperature details name the joint
+  if ((c === 'JOINT_LIMIT' || c === 'THERMAL_TRIP') && S.fault && !/^[A-Z][A-Za-z]+$/.test(S.fault)) title += (LANG === 'zh' ? '（' + S.fault + '）' : ' (' + S.fault + ')');
+  return { title, todo: t('fc.' + c + '.do') };
+}
 function lockReason() {
   if (!isLive()) return t('lock.offline');
   const other = leaseOther();
   if (other != null) return t('lock.observer_who', { who: leaseHolderText(other) });
   if (S.state === 'EStop') return t('lock.estop');
-  if (S.state === 'Fault') return t('lock.fault');
+  if (S.state === 'Fault') { const ft = faultText(); return ft ? t('lock.fault_coded', ft) : t('lock.fault'); }
+  if (isOperational() && colHold()) return t('lock.col_hold');
   return t('lock.disabled');
 }
 function flashLock() {
@@ -4318,7 +4536,7 @@ window.addEventListener('keydown', (e) => {
     S.keys.add(e.code); return;
   }
   if (e.code === 'KeyG') {
-    if (!S.obs || !isOperational()) { flashLock(); return; }
+    if (!S.obs || !canMove()) { flashLock(); return; }
     S.grip = (S.grip ?? 0) > 0.5 ? 0 : 1;
     S.gripCmdAt = Date.now();
     commandGrip();
@@ -4425,7 +4643,7 @@ setInterval(() => {
   const now = performance.now();
   if (S.presetRunning) return;
   if (gcOn()) { S.servoTarget = null; gcInput(v); return; } // hand-guiding: no servo frames
-  if (!moving || !isLive() || !isOperational() || S.epoch == null) { S.servoTarget = null; return; }
+  if (!moving || !isLive() || !canMove() || S.epoch == null) { S.servoTarget = null; return; }
   const pos = S.obs.positions;
   if (!S.servoTarget || now - S.servoLastAt > 300) {
     S.servoTarget = pos.slice(0, S.dof);
@@ -4655,7 +4873,7 @@ function cartTick() {
   const now = performance.now();
   const dt = Math.min(0.1, (now - (C.lastTick || now)) / 1000);
   C.lastTick = now;
-  if (!isLive() || !isOperational() || S.epoch == null) {
+  if (!isLive() || !canMove() || S.epoch == null) {
     cartSync(pos); C.tailUntil = 0; C.status = 'idle'; C.msg = '';
     return;
   }
@@ -4798,7 +5016,7 @@ function cartTickView() {
   const now = performance.now();
   const dt = Math.min(0.1, (now - (C.lastTick || now)) / 1000);
   C.lastTick = now;
-  if (!isLive() || !isOperational() || S.epoch == null || !C.q6) {
+  if (!isLive() || !canMove() || S.epoch == null || !C.q6) {
     cartSync(pos); C.tailUntil = 0; C.status = 'idle'; C.msg = '';
     return;
   }
@@ -5076,7 +5294,7 @@ function jogTo(target) {
 }
 function commandGrip() {
   if (gcOn()) { gcGrip(S.grip > 0.5 ? -1 : 1); return; }
-  if (!S.obs || !isOperational()) { flashLock(); return; }
+  if (!S.obs || !canMove()) { flashLock(); return; }
   if (S.mode === 'cart') { S.gripCmdAt = Date.now(); cartKick(); return; } // the cartesian stream carries J6
   if (S.servoTarget) return; // while streaming, servo carries J6
   S.gripCmdAt = Date.now();
@@ -5086,7 +5304,7 @@ function commandGrip() {
 }
 function home() {
   if (gcOn()) { gcSticksOff(); return; }
-  if (!isOperational()) { toast(lockReason(), 'err'); flashLock(); return; }
+  if (!canMove()) { toast(lockReason(), 'err'); flashLock(); return; }
   api('/api/v1/motion/home', { epoch_id: S.epoch }).then(() => toast(t('toast.homing'), 'ok')).catch(() => {});
 }
 function eStop() {
@@ -5521,7 +5739,7 @@ function presetTarget(name) {
   return clampTarget(t);
 }
 async function runPreset(name) {
-  if (!isOperational() || !isLive()) { toast(lockReason(), 'err'); flashLock(); return; }
+  if (!canMove() || !isLive()) { toast(lockReason(), 'err'); flashLock(); return; }
   releaseAll();
   S.presetRunning = true;
   S.preset = { name, until: Date.now() + 15000, startedAt: Date.now() };
@@ -6519,6 +6737,429 @@ $('gset-save').addEventListener('click', () => {
 i18nHooks.push(() => { renderGrasp(); if (!$('gset').hidden) gsetRender(); });
 graspLoadSetup(true);
 
+/* =================================================================
+   Collision guard (capability collision_guard, observation.collision, WS /api/v1/safety/collision):
+   protective-stop banner, settings drawer section, residual torque bars (J1..J6).
+   Everything stays hidden on an armd without the guard.
+   ================================================================= */
+const COL = { cfg: null, thr: null, barAt: 0, busy: false };
+const colAvail = () => !!(S.caps && S.caps.collision_guard) || !!(S.obs && S.obs.collision);
+function colThresholds(c) {
+  if (!c) return null;
+  const e = c.effective || c;
+  for (const k of ['effective_thresholds_nm', 'scaled_thresholds_nm', 'thresholds_nm']) {
+    const v = e[k] ?? c[k];
+    if (Array.isArray(v) && v.length >= 6 && v.slice(0, 6).every((x) => Number.isFinite(x) && x > 0)) return v.slice(0, 6);
+  }
+  return null;
+}
+function colOnCaps() {
+  $('btn-sset').hidden = !colAvail();
+  if (colAvail() && !COL.cfg) colLoad(true);
+}
+async function colLoad(quiet) {
+  if (!quiet) colRenderSet(t('col.st.loading'));
+  try {
+    const res = await fetch('/api/v1/safety/collision', { cache: 'no-store' });
+    const d = await res.json();
+    if (!res.ok) throw new Error(d && (d.message || d.error) || 'HTTP ' + res.status);
+    COL.cfg = d; COL.thr = colThresholds(d);
+    colRenderSet(quiet ? undefined : '');
+  } catch (e) { if (!quiet) colRenderSet(t('col.st.err', { e: e.message })); }
+}
+function colRenderSet(status) {
+  const c = COL.cfg, o = S.obs && S.obs.collision;
+  const enabled = c ? !!c.enabled : !!o;
+  const sens = (c && c.sensitivity) || (o && o.sensitivity) || 'medium';
+  const en = $('col-en');
+  if (!COL.busy) en.checked = enabled;
+  en.disabled = COL.busy || !c;
+  const sensOff = !(COL.busy ? en.checked : enabled);
+  $('col-sens').classList.toggle('off', sensOff);
+  $('col-sens').setAttribute('aria-disabled', String(sensOff));
+  for (const b of $('col-sens').querySelectorAll('button')) {
+    const on = b.dataset.v === sens;
+    b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on));
+    b.disabled = COL.busy || !c || sensOff;
+  }
+  const st = $('col-status');
+  const txt = status || (c ? (enabled ? t('col.st.on', { s: t('col.sens.' + sens) }) : t('col.st.off')) : '--');
+  setText(st, txt);
+  st.classList.toggle('ok', !!c && enabled);
+}
+async function colWrite(patch) {
+  COL.busy = true; colRenderSet();
+  try {
+    const ack = await commandRPC('/api/v1/safety/collision', patch);
+    syncEpoch(ack.epoch_id);
+    const cfg = ack.collision || ack.config || (('enabled' in ack) ? ack : null);
+    if (cfg) { COL.cfg = { ...(COL.cfg || {}), ...cfg }; COL.thr = colThresholds(COL.cfg) || COL.thr; }
+    else if (COL.cfg) Object.assign(COL.cfg, patch);
+    COL.busy = false;
+    toast(t('col.st.saved'), 'ok');
+    colRenderSet();
+    colLoad(true);
+  } catch (e) {
+    COL.busy = false;
+    toast(e.message, 'err', e.code || '');
+    colRenderSet(e.message);
+  }
+}
+function ssetOpen(open) {
+  $('sset').hidden = !open;
+  if (open) { colRenderSet(); colLoad(false); $('sset-close').focus({ preventScroll: true }); }
+  else $('btn-sset').focus({ preventScroll: true });
+}
+$('btn-sset').addEventListener('click', () => ssetOpen(true));
+$('sset-close').addEventListener('click', () => ssetOpen(false));
+$('sset').addEventListener('click', (e) => { if (e.target === e.currentTarget) ssetOpen(false); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('sset').hidden) ssetOpen(false); });
+$('col-en').addEventListener('change', (e) => colWrite({ enabled: e.target.checked }));
+$('col-sens').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (b && !b.disabled && !b.classList.contains('on')) colWrite({ sensitivity: b.dataset.v });
+});
+$('col-clear').addEventListener('click', () => clearFault());
+i18nHooks.push(() => { if (!$('sset').hidden) colRenderSet(); COL.barAt = 0; });
+
+/* =================================================================
+   Named poses (capability poses): GET /api/v1/poses, WS /api/v1/poses/save|delete,
+   action /api/v1/action/move_to_pose.
+   ================================================================= */
+const POSE_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const PS = { list: [], loaded: false, delArmed: null, delTimer: 0 };
+function posesOnCaps() { $('btn-pset').hidden = !(S.caps && S.caps.poses); }
+function poseErr(e) {
+  const k = 'pose.code.' + (e.code || '');
+  return I18N.zh[k] !== undefined ? t(k, { m: e.message }) : e.message;
+}
+async function posesLoad(quiet) {
+  if (!quiet) setText($('pose-status'), t('pose.loading'));
+  try {
+    const res = await fetch('/api/v1/poses', { cache: 'no-store' });
+    const d = await res.json();
+    if (!res.ok) throw new Error(d && (d.message || d.error) || 'HTTP ' + res.status);
+    PS.list = Array.isArray(d.poses) ? d.poses : [];
+    PS.loaded = true;
+    posesRender(PS.list.length ? t('pose.count', { n: PS.list.length }) : '--');
+  } catch (e) { posesRender(t('pose.err', { e: e.message })); }
+}
+function posesRender(status) {
+  const ol = $('pose-list');
+  ol.textContent = '';
+  if (!PS.list.length) {
+    const li = document.createElement('li'); li.className = 'pose-empty'; li.textContent = PS.loaded ? t('pose.empty') : '--'; ol.appendChild(li);
+  }
+  for (const p of PS.list) {
+    const li = document.createElement('li');
+    li.dataset.name = p.name;
+    const tcp = p.tcp && Array.isArray(p.tcp.position) ? p.tcp.position.map((v) => Math.round(v * 1000)).join(', ') + ' mm' : '';
+    const when = Number.isFinite(p.saved_at_ms) && p.saved_at_ms > 0 ? new Date(p.saved_at_ms).toLocaleString(LANG === 'zh' ? 'zh-CN' : 'en-GB', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+    li.innerHTML = '<span class="pn"><b></b><small></small></span><span class="pa"><button class="btn pose-go" type="button"></button><button class="btn pose-del" type="button"></button></span>';
+    li.querySelector('b').textContent = p.name;
+    li.querySelector('small').textContent = [tcp, when].filter(Boolean).join(' · ');
+    li.querySelector('.pose-go').textContent = t('pose.go');
+    const del = li.querySelector('.pose-del');
+    const armed = PS.delArmed === p.name;
+    del.textContent = armed ? t('pose.del.confirm') : t('pose.del');
+    del.classList.toggle('armed', armed);
+    ol.appendChild(li);
+  }
+  if (status !== undefined) setText($('pose-status'), status);
+}
+function poseNameCheck() {
+  const v = $('pose-name').value.trim();
+  const ok = POSE_NAME_RE.test(v);
+  const rule = $('pose-rule');
+  rule.classList.toggle('bad', v !== '' && !ok);
+  setText(rule, v !== '' && !ok ? t('pose.bad') : t('pose.rule'));
+  return ok ? v : null;
+}
+async function poseSave() {
+  const name = poseNameCheck();
+  if (!name) { $('pose-name').focus(); setText($('pose-rule'), t('pose.bad')); $('pose-rule').classList.add('bad'); return; }
+  $('pose-save').disabled = true;
+  try {
+    await commandRPC('/api/v1/poses/save', { name });
+    toast(t('pose.saved', { name }), 'ok');
+    $('pose-name').value = '';
+    await posesLoad(true);
+    posesRender(t('pose.saved', { name }));
+  } catch (e) { const m = poseErr(e); toast(m, 'err', e.code || ''); posesRender(m); }
+  finally { $('pose-save').disabled = false; }
+}
+async function poseDelete(name) {
+  if (PS.delArmed !== name) {
+    PS.delArmed = name; clearTimeout(PS.delTimer);
+    PS.delTimer = setTimeout(() => { PS.delArmed = null; posesRender(); }, 3000);
+    posesRender(); return;
+  }
+  PS.delArmed = null; clearTimeout(PS.delTimer);
+  try {
+    await commandRPC('/api/v1/poses/delete', { name });
+    toast(t('pose.deleted', { name }), 'ok');
+    await posesLoad(true);
+    posesRender(t('pose.deleted', { name }));
+  } catch (e) { const m = poseErr(e); toast(m, 'err', e.code || ''); posesRender(m); }
+}
+async function poseGo(name) {
+  if (!isLive() || !canMove()) { toast(isLive() && !isStopped() && !colHold() && leaseOther() == null ? t('pose.enable_first') : lockReason(), 'err'); flashLock(); return; }
+  try {
+    await commandRPC('/api/v1/action/move_to_pose', { name, speed_scale: clamp(speedScale(), 0.1, 1), tag: 'cockpit' });
+    setText($('pose-status'), t('pose.moving', { name }));
+    toast(t('pose.moving', { name }), 'ok');
+  } catch (e) { const m = poseErr(e); toast(m, 'err', e.code || ''); setText($('pose-status'), m); }
+}
+function psetOpen(open) {
+  $('pset').hidden = !open;
+  if (open) { PS.delArmed = null; posesRender(); posesLoad(false); $('pset-close').focus({ preventScroll: true }); }
+  else $('btn-pset').focus({ preventScroll: true });
+}
+$('btn-pset').addEventListener('click', () => psetOpen(true));
+$('pset-close').addEventListener('click', () => psetOpen(false));
+$('pset').addEventListener('click', (e) => { if (e.target === e.currentTarget) psetOpen(false); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('pset').hidden) psetOpen(false); });
+$('pose-name').addEventListener('input', poseNameCheck);
+$('pose-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); poseSave(); } });
+$('pose-save').addEventListener('click', poseSave);
+$('pose-list').addEventListener('click', (e) => {
+  const b = e.target.closest('button'), li = e.target.closest('li');
+  if (!b || !li || !li.dataset.name) return;
+  if (b.classList.contains('pose-go')) poseGo(li.dataset.name);
+  else if (b.classList.contains('pose-del')) poseDelete(li.dataset.name);
+});
+i18nHooks.push(() => { if (!$('pset').hidden) { posesRender(); poseNameCheck(); } });
+
+/* =================================================================
+   3D arm view, loaded on first open: three.js + urdf-loader (/assets/three-urdf.min.js, embedded),
+   URDF and decimated meshes from the kit asset directory (/assets/model/). Without meshes it draws a
+   stick figure through the URDF joint frames (VIK). Angles: motor angle = URDF angle for J1..J6; J7 maps
+   to the finger travel via the profile gripper_policy (CFG.gripClosed / gripOpen). Renders at most
+   ~30 fps and only when the pose, the scene or the camera changed.
+   ================================================================= */
+const V3 = { open: false, init: null, T: null, r: null, scene: null, cam: null, ctl: null, root: null, solid: null, ghost: null,
+  extras: null, mode: '', dirty: true, last: 0, raf: 0, key: '', sceneAt: 0, renders: 0, ghostMat: null };
+const V3_FINGER_M = 0.0425; // URDF left/right_finger_joint upper limit (m)
+const V3_LINK_OF = { gripper_body: 'end_link', finger_L: 'left_finger', finger_R: 'right_finger' };
+const v3Geo = new Map();
+function v3Toggle(open) {
+  V3.open = open;
+  $('view3d').hidden = !open;
+  $('btn-3d').setAttribute('aria-pressed', String(open));
+  if (open) v3Start();
+  else { cancelAnimationFrame(V3.raf); V3.raf = 0; $('btn-3d').focus({ preventScroll: true }); }
+}
+async function v3Start() {
+  try { await (V3.init ||= v3Init()); } catch (e) { V3.init = null; setText($('v3-status'), t('v3.err', { m: e.message || String(e) })); return; }
+  if (!V3.open) return;
+  if (Date.now() - V3.sceneAt > 5000) v3Extras();
+  v3Resize();
+  if (!V3.raf) V3.raf = requestAnimationFrame(v3Tick);
+}
+async function v3Init() {
+  setText($('v3-status'), t('v3.loading'));
+  const T = V3.T = await import('/assets/three-urdf.min.js');
+  const cv = $('v3-canvas');
+  V3.r = new T.WebGLRenderer({ canvas: cv, antialias: true });
+  V3.r.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  const scene = V3.scene = new T.Scene();
+  scene.background = new T.Color(0xeef2ea);
+  scene.add(new T.HemisphereLight(0xffffff, 0x80857c, 2.4));
+  const sun = new T.DirectionalLight(0xffffff, 1.8); sun.position.set(1.2, 2.0, 1.0); scene.add(sun);
+  V3.cam = new T.PerspectiveCamera(42, 1, 0.01, 20);
+  V3.ctl = new T.OrbitControls(V3.cam, cv);
+  V3.ctl.target.set(0.05, 0.22, 0); V3.ctl.minDistance = 0.25; V3.ctl.maxDistance = 4; V3.ctl.update();
+  V3.ctl.addEventListener('change', () => { V3.dirty = true; });
+  // URDF base_link (z up) -> three.js (y up)
+  V3.root = new T.Group(); V3.root.rotation.x = -Math.PI / 2; scene.add(V3.root);
+  V3.ghostMat = new T.MeshBasicMaterial({ color: 0x3b82f6, transparent: true, opacity: 0.28, depthWrite: false });
+  let urdf = null, man = null;
+  try {
+    const [u, m] = await Promise.all([fetch('/assets/model/reBot-DevArm_gripper.urdf'), fetch('/assets/model/meshes/manifest.json')]);
+    if (u.ok && m.ok) { urdf = await u.text(); man = await m.json(); }
+  } catch (_) { /* stick figure */ }
+  if (urdf && man && man.links) {
+    try { V3.solid = await v3Robot(T, urdf, man, false); V3.ghost = await v3Robot(T, urdf, man, true); V3.mode = 'mesh'; }
+    catch (e) { console.warn('3D meshes', e); V3.solid = V3.ghost = null; }
+  }
+  if (!V3.solid) { V3.solid = v3Stick(T, false); V3.ghost = v3Stick(T, true); V3.mode = 'stick'; }
+  V3.ghost.obj.renderOrder = 2;
+  V3.root.add(V3.solid.obj, V3.ghost.obj);
+  new ResizeObserver(() => { if (V3.open) v3Resize(); }).observe($('view3d'));
+  V3.key = '';
+}
+function v3Robot(T, urdf, man, ghost) {
+  const pend = [];
+  const loader = new T.URDFLoader();
+  loader.packages = (pkg) => '/assets/model/' + pkg;
+  loader.loadMeshCb = (path, _mgr, _mat, done) => {
+    const base = path.split('/').pop().replace(/\.stl$/i, '');
+    const parts = man.links[V3_LINK_OF[base] || base] || [];
+    const g = new T.Group();
+    pend.push(Promise.all(parts.map(async (pt) => {
+      if (!v3Geo.has(pt.file)) v3Geo.set(pt.file, new T.STLLoader().loadAsync('/assets/model/meshes/' + pt.file));
+      const geo = await v3Geo.get(pt.file);
+      if (!geo.attributes.normal) geo.computeVertexNormals();
+      const mat = ghost ? V3.ghostMat
+        : new T.MeshStandardMaterial({ color: new T.Color().setRGB(pt.rgb[0], pt.rgb[1], pt.rgb[2], T.SRGBColorSpace), metalness: 0.25, roughness: 0.6 });
+      g.add(new T.Mesh(geo, mat));
+    })));
+    done(g);
+  };
+  const robot = loader.parse(urdf);
+  return Promise.all(pend).then(() => ({
+    obj: robot,
+    set(q) {
+      for (let i = 0; i < 6; i++) robot.setJointValue('joint' + (i + 1), Number(q[i]) || 0);
+      if (q.length > 6) { const d = gripFrac(q[6]) * V3_FINGER_M; robot.setJointValue('left_finger_joint', d); robot.setJointValue('right_finger_joint', d); }
+    },
+    end() { const v = robot.links.end_link.getWorldPosition(new T.Vector3()); V3.root.worldToLocal(v); return [v.x, v.y, v.z]; },
+  }));
+}
+// stick figure through the URDF joint frames: base, J1..J6 origins, end_link
+function v3Stick(T, ghost) {
+  const obj = new T.Group();
+  const bone = ghost ? V3.ghostMat : new T.MeshStandardMaterial({ color: 0x3a3f3b, roughness: 0.6 });
+  const joint = ghost ? V3.ghostMat : new T.MeshStandardMaterial({ color: 0x84b521, roughness: 0.5 });
+  const cyl = new T.CylinderGeometry(0.014, 0.014, 1, 14), sph = new T.SphereGeometry(0.022, 18, 12);
+  const mk = (geo, mat) => { const m = new T.Mesh(geo, mat); obj.add(m); return m; };
+  const bones = Array.from({ length: 7 }, () => mk(cyl, bone)), balls = Array.from({ length: 8 }, () => mk(sph, joint));
+  const up = new T.Vector3(0, 1, 0), a = new T.Vector3(), b = new T.Vector3(), d = new T.Vector3();
+  return {
+    obj,
+    set(q) {
+      const f = VIK.frames(q.slice(0, 6).map((v) => Number(v) || 0));
+      const pts = [[0, 0, 0], ...f.o, f.p];
+      pts.forEach((p, i) => balls[i].position.set(p[0], p[1], p[2]));
+      for (let i = 0; i < 7; i++) {
+        a.set(...pts[i]); b.set(...pts[i + 1]); d.subVectors(b, a);
+        const L = d.length(), m = bones[i];
+        m.visible = L > 1e-4;
+        if (!m.visible) continue;
+        m.position.copy(a).addScaledVector(d, 0.5); m.scale.set(1, L, 1); m.quaternion.setFromUnitVectors(up, d.normalize());
+      }
+    },
+    end() { const p = balls[7].position; return [p.x, p.y, p.z]; },
+  };
+}
+// floor grid, workspace box, keep-out boxes, named pose markers (URDF base frame)
+async function v3Extras() {
+  const T = V3.T;
+  V3.sceneAt = Date.now();
+  let boxes = null, poses = [];
+  try { const r = await fetch('/api/v1/workspace/keepout'); if (r.ok) { const j = await r.json(); boxes = Array.isArray(j) ? j : j.boxes; } } catch (_) {}
+  if (!Array.isArray(boxes)) boxes = (S.wsPolicy && S.wsPolicy.keepout_boxes) || [];
+  if (S.caps && S.caps.poses) { try { const r = await fetch('/api/v1/poses'); if (r.ok) { const j = await r.json(); poses = Array.isArray(j) ? j : j.poses || []; } } catch (_) {} }
+  if (V3.extras) { V3.root.remove(V3.extras); V3.extras.traverse((o) => { if (o.geometry) o.geometry.dispose(); }); }
+  const g = V3.extras = new T.Group();
+  const ws = S.wsPolicy;
+  const floor = ws && Number.isFinite(ws.floor_z_m) ? ws.floor_z_m : 0;
+  const grid = new T.GridHelper(1.2, 24, 0x9aa395, 0xc9cfc4);
+  grid.rotation.x = Math.PI / 2; grid.position.z = floor; g.add(grid);
+  const box = (lo, hi, color, fill, name) => {
+    const s = [0, 1, 2].map((k) => Math.max(1e-3, hi[k] - lo[k]));
+    const geo = new T.BoxGeometry(s[0], s[1], s[2]);
+    const c = [0, 1, 2].map((k) => (hi[k] + lo[k]) / 2);
+    const edges = new T.LineSegments(new T.EdgesGeometry(geo), new T.LineBasicMaterial({ color }));
+    edges.position.set(c[0], c[1], c[2]); edges.name = name; g.add(edges);
+    if (fill) { const m = new T.Mesh(geo, new T.MeshBasicMaterial({ color, transparent: true, opacity: 0.18, depthWrite: false })); m.position.copy(edges.position); m.name = name; g.add(m); }
+  };
+  if (ws && Array.isArray(ws.box_min_m) && Array.isArray(ws.box_max_m)) {
+    const lo = ws.box_min_m.slice(), hi = ws.box_max_m.slice();
+    lo[2] = Math.max(lo[2], floor);
+    if (hi[2] > lo[2]) box(lo, hi, 0x5b7d15, false, 'workspace');
+  }
+  for (const b of boxes) if (Array.isArray(b.min_m) && Array.isArray(b.max_m)) box(b.min_m, b.max_m, 0xdc2626, true, 'keepout:' + b.name);
+  const dot = new T.SphereGeometry(0.012, 12, 8), dm = new T.MeshBasicMaterial({ color: 0xf59e0b });
+  for (const p of poses) {
+    const v = p && p.tcp && p.tcp.position;
+    if (Array.isArray(v)) { const m = new T.Mesh(dot, dm); m.position.set(v[0], v[1], v[2]); m.name = 'pose:' + p.name; g.add(m); }
+  }
+  V3.root.add(g);
+  V3.dirty = true;
+}
+function v3Resize() {
+  const el = $('view3d'), w = el.clientWidth, h = el.clientHeight;
+  if (!V3.r || !w || !h) return;
+  V3.r.setSize(w, h, false);
+  V3.cam.aspect = w / h; V3.cam.updateProjectionMatrix();
+  if (!V3.fitted) { // first layout: fit a 0.45 m sphere around the arm into the narrower field of view
+    V3.fitted = true;
+    const half = Math.atan(Math.tan((V3.cam.fov * Math.PI) / 360) * Math.min(1, V3.cam.aspect));
+    const d = 0.45 / Math.sin(half);
+    V3.cam.position.set(0.62, 0.42, 0.66).normalize().multiplyScalar(d).add(V3.ctl.target);
+    V3.ctl.update();
+  }
+  V3.dirty = true;
+}
+function v3Tick(ts) {
+  V3.raf = V3.open ? requestAnimationFrame(v3Tick) : 0;
+  if (!V3.open || !V3.solid || ts - V3.last < 33) return;
+  const o = S.obs, live = isLive();
+  if (o && Array.isArray(o.positions)) {
+    const meas = o.positions, cmd = Array.isArray(o.commanded_positions) ? o.commanded_positions : meas;
+    const key = meas.map((v) => Math.round(v * 2000)).join() + '|' + cmd.map((v) => Math.round(v * 2000)).join();
+    if (key !== V3.key) {
+      V3.key = key;
+      V3.solid.set(meas); V3.ghost.set(cmd);
+      V3.ghost.obj.visible = cmd.some((v, i) => Math.abs(v - (meas[i] ?? v)) > (i === GRIP ? 0.05 : 0.005));
+      V3.dirty = true;
+    }
+  }
+  const st = V3.mode === 'stick' ? t('v3.stick') : !live ? t('v3.offline') : '';
+  if ($('v3-status').textContent !== st) setText($('v3-status'), st);
+  if (!V3.dirty) return;
+  V3.dirty = false; V3.last = ts; V3.renders++;
+  V3.r.render(V3.scene, V3.cam);
+}
+$('btn-3d').addEventListener('click', () => v3Toggle(!V3.open));
+$('v3-close').addEventListener('click', () => v3Toggle(false));
+i18nHooks.push(() => { V3.key = ''; });
+
+function renderCollision(live, ts) {
+  const c = live && S.obs ? S.obs.collision : null;
+  if (c && $('btn-sset').hidden) $('btn-sset').hidden = false; // guard reported before the schema said so
+  const escalated = live && S.state === 'Fault' && S.faultCode === 'COLLISION';
+  const active = !!(c && c.active);
+  const banner = $('col-banner');
+  banner.hidden = !(active || escalated);
+  if (escalated) {
+    setText($('col-title'), '⚠️ ' + t('fc.COLLISION'));
+    setText($('col-sub'), t('col.esc.sub', { todo: t('fc.COLLISION.do') }));
+  } else if (active) {
+    const r = Number.isFinite(c.residual_nm) ? Math.abs(c.residual_nm).toFixed(1) : '--';
+    const vars = { j: c.joint ?? '?', r, s: Number.isFinite(c.resume_in_s) ? Math.max(0, c.resume_in_s).toFixed(1) : '' };
+    setText($('col-title'), t(Number.isFinite(c.resume_in_s) ? 'col.active' : 'col.active_wait', vars));
+    setText($('col-sub'), t('col.sub'));
+  }
+  $('col-clear').hidden = !escalated;
+  // residual torque bars at ~10 Hz (the observation arrives at up to 50 Hz)
+  if (ts - COL.barAt < 100) return;
+  COL.barAt = ts;
+  const rt = live && S.obs ? S.obs.residual_torques : null;
+  const thr = COL.thr || null;
+  const box = $('rt-bars');
+  const show = Array.isArray(rt) && rt.length >= 6 && !!thr && colAvail();
+  box.hidden = !show;
+  if (!show) return;
+  if (box.childElementCount !== 7 || box.dataset.lang !== LANG) {
+    box.dataset.lang = LANG;
+    box.innerHTML = '<span class="rt-cap"></span>' + Array.from({ length: 6 }, (_, i) => `<span class="rt-bar"><i><b></b></i>J${i + 1}</span>`).join('');
+    box.firstChild.textContent = t('rt.cap');
+  }
+  for (let i = 0; i < 6; i++) {
+    const el = box.children[i + 1], v = rt[i], th = (c && c.active && c.joint === i + 1 && Number.isFinite(c.threshold_nm)) ? c.threshold_nm : thr[i];
+    const frac = Number.isFinite(v) ? Math.abs(v) / th : 0;
+    const cls = 'rt-bar' + (c && c.active && c.joint === i + 1 ? ' trip' : frac >= 0.5 ? ' warn' : '');
+    if (el.className !== cls) el.className = cls;
+    const w = Math.min(100, frac * 100).toFixed(0) + '%';
+    const bar = el.firstChild.firstChild;
+    if (bar.style.width !== w) bar.style.width = w;
+    const tip = Number.isFinite(v) ? `J${i + 1} ${v.toFixed(2)} / ${th.toFixed(1)} N·m` : `J${i + 1} --`;
+    if (el.title !== tip) el.title = tip;
+  }
+}
+
 function setText(el, txt) { if (el.textContent !== txt) el.textContent = txt; }
 function setCls(el, cls) { if (el.className !== cls) el.className = cls; }
 const fmtDeg = (rad) => { const d = rad * DEG; return (d >= 0 ? '+' : '−') + Math.abs(d).toFixed(1); };
@@ -6528,7 +7169,8 @@ function frame(ts) {
   const live = isLive();
   const q = S.obs ? S.obs.positions : [0, 0, 0, 0, 0, 0];
   const v = commandVector();
-  const op = live && isOperational() && leaseOther() == null;
+  const en = live && isOperational() && leaseOther() == null;
+  const op = en && !colHold();
   const torqued = !!(S.obs && S.obs.is_torqued);
   const act = v.map((x) => op && x !== 0);
   if (S.mode === 'cart' && op && C.sending) { for (let i = 0; i < 4; i++) act[i] = true; act[GRIP] = Date.now() - S.gripCmdAt < 400; }
@@ -6547,6 +7189,7 @@ function frame(ts) {
   if (!op && (S.keys.size || cartHeld || S.hold.some((h) => h[0] || h[1]) || pads.some((p) => p.active()))) releaseAll();
   setText($('lock-txt'), lockReason());
   renderGc();
+  renderCollision(live, ts);
 
   const lb = $('link-badge');
   setText(lb, live ? `${S.hz} Hz · ${S.rtt == null ? '--' : Math.round(S.rtt)} ms` : t('no_telemetry'));
@@ -6554,19 +7197,20 @@ function frame(ts) {
   const st = live ? S.state : 'Offline';
   const badge = $('state-badge');
   const enableUnknown = S.obs?.enable_state === 'Unknown';
-  setText(badge, enableUnknown && torqued && (st === 'Armed' || st === 'Moving') ? t('st.unconfirmed') : STATE_TEXT[st] ? t(STATE_TEXT[st]) : String(st).toUpperCase());
-  setCls(badge, 'sc-status-badge ' + (STATE_BADGE[st] ?? ''));
+  const hold = live && isOperational() && colHold();
+  setText(badge, hold ? t('st.col_hold') : enableUnknown && torqued && (st === 'Armed' || st === 'Moving') ? t('st.unconfirmed') : STATE_TEXT[st] ? t(STATE_TEXT[st]) : String(st).toUpperCase());
+  setCls(badge, 'sc-status-badge ' + (hold ? 'is-warn' : STATE_BADGE[st] ?? ''));
 
   // enable button morphs: hold-to-enable / tap-to-disable / tap-to-clear
   const eb = $('btn-enable');
   const stopped = isStopped();
-  eb.classList.toggle('on', op);
+  eb.classList.toggle('on', en);
   eb.classList.toggle('clear', stopped);
-  eb.setAttribute('aria-checked', String(op));
+  eb.setAttribute('aria-checked', String(en));
   // After a fault is cleared the motors may still hold the arm (safety Idle, torque on): say so.
-  const holdingIdle = live && !stopped && !op && S.state === 'Idle' && torqued;
-  setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop') : t('en.clear_fault')) : op ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
-  setText($('enable-sub'), stopped ? t('en.sub_reset') : op ? t('en.sub_off') : t('en.hold'));
+  const holdingIdle = live && !stopped && !en && S.state === 'Idle' && torqued;
+  setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop') : t('en.clear_fault')) : en ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
+  setText($('enable-sub'), stopped ? t('en.sub_reset') : en ? t('en.sub_off') : t('en.hold'));
   eb.disabled = !live || leaseOther() != null;
   const holder = leaseOther();
   $('btn-preempt').hidden = !live || !(S.ws && S.ws.readyState === 1) || holder == null;
@@ -6664,7 +7308,7 @@ function frame(ts) {
   const fm = $('fault-msg');
   const showFault = live && isStopped();
   fm.classList.toggle('show', showFault);
-  if (showFault) setText(fm, S.state === 'EStop' ? t('fm.estop') : t('fm.fault', { d: S.fault || t('unknown') }));
+  if (showFault) { const ft = S.state === 'Fault' && faultText(); setText(fm, S.state === 'EStop' ? t('fm.estop') : ft ? t('fm.coded', ft) : t('fm.fault', { d: S.fault || t('unknown') })); }
 
   if (S.rec.active) {
     const el = Date.now() - S.rec.startedAt;
@@ -6699,7 +7343,7 @@ function renderSimple(live, op) {
   if ($('s-grip-jog-bar')) $('s-grip-jog-bar').style.width = ((f ?? 0) * 100).toFixed(1) + '%';
 
   const rd = $('s-ready');
-  setCls(rd, 'ready' + (op ? ' ok' : live && isStopped() ? ' bad' : ''));
+  setCls(rd, 'ready' + (op ? ' ok' : live && (isStopped() || colHold()) ? ' bad' : ''));
   setText($('s-ready-txt'), !live ? t('wait_arm') : op ? t('ready') : lockReason());
   if (S.preset && Date.now() > S.preset.until) { S.preset = null; S.presetRunning = false; }
   for (const b of document.querySelectorAll('.preset')) b.classList.toggle('busy', !!S.preset && S.preset.name === b.dataset.preset);

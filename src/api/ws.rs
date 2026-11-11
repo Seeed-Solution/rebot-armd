@@ -22,9 +22,41 @@ pub fn connection_registry() -> ConnectionRegistry {
 
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 
+/// Test hook: pause (ms) between stamping a delayed command ack with the current epoch and
+/// enqueueing it. 0 (no pause) outside tests.
+pub static TEST_ACK_STAMP_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+async fn test_ack_stamp_delay() {
+    let ms = TEST_ACK_STAMP_DELAY_MS.load(Ordering::Relaxed);
+    if ms > 0 { tokio::time::sleep(std::time::Duration::from_millis(ms)).await; }
+}
+
+/// `?obs_hz=N`: send at most N observations per second on this connection (clamped to
+/// 1..control_frequency_hz). Absent: every tick. Control replies are never decimated.
 pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSupervisor>>,
-                        axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, supervisor, deps))
+                        axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+                        axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>) -> axum::response::Response {
+    let control_hz = supervisor.inner().read().await.config.control_frequency_hz.max(1);
+    let obs_rate = match query.get("obs_hz") {
+        None => None,
+        Some(v) => match v.trim().parse::<u64>() {
+            Ok(n) => Some(ObsRate { hz: n.clamp(1, u64::from(control_hz)) as f64, control_hz: f64::from(control_hz) }),
+            Err(_) => return (StatusCode::BAD_REQUEST, "obs_hz must be an integer >= 0 (0 and 1 mean 1 Hz; values above control_frequency_hz are clamped)").into_response(),
+        },
+    };
+    ws.on_upgrade(move |socket| handle_socket(socket, supervisor, deps, obs_rate)).into_response()
+}
+
+/// Per-connection observation rate limit.
+#[derive(Debug, Clone, Copy)]
+struct ObsRate { hz: f64, control_hz: f64 }
+
+impl ObsRate {
+    /// Whether an observation stamped `timestamp` is sent, given the last one sent.
+    /// Half a control period of tolerance keeps tick jitter from skipping a slot.
+    fn due(&self, last_sent: Option<f64>, timestamp: f64) -> bool {
+        last_sent.is_none_or(|t| timestamp - t >= 1.0 / self.hz - 0.5 / self.control_hz)
+    }
 }
 
 fn invalid_command(message: &str) -> ApiError {
@@ -69,6 +101,7 @@ fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch:
         }
         "/api/v1/motion/unload" => {
             inner.gravity_comp_motion_busy().map_err(ArmError::from)?;
+            inner.collision_hold_check().map_err(ArmError::from)?;
             if inner.handover_settling_since.is_some() {
                 return Err(ArmError::Safety(SafetyError::HandoverSettling).into());
             }
@@ -78,14 +111,14 @@ fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch:
             if !inner.safety.state().is_operational() {
                 return Err(ArmError::Safety(SafetyError::NotArmed(inner.safety.state().clone())).into());
             }
-            let id = inner.unload_action();
+            let id = inner.unload_action()?;
             let duration = inner.active_trajectory.as_ref().map_or(0.0, |t| t.duration()) + 0.8;
             return Ok(id.map(|id| (id, duration)));
         }
         "/api/v1/motion/stop" => {
             inner.exit_gravity_comp("STOPPED", "Stop command");
             inner.stop_motion();
-            inner.request_grasp_stop();
+            inner.request_macro_stop();
         }
         "/api/v1/mode/gravity_comp" => {
             let enable = body.get("enable").and_then(Value::as_bool)
@@ -126,7 +159,41 @@ struct PendingPlan {
     tag: Option<String>,
 }
 
-enum ActionStart { Started(u64, f64), Plan(PendingPlan), Grasp(crate::grasp::PendingGrasp) }
+enum ActionStart { Started(u64, f64), Plan(PendingPlan), Macro(PendingMacro) }
+
+/// A macro action (crate::macro_action) checked under the lock, planned without it.
+enum PendingMacro { Grasp(crate::grasp::PendingGrasp), Place(crate::place::PendingPlace) }
+
+enum PlannedMacro { Grasp(crate::grasp::PlannedGrasp), Place(crate::place::PlannedPlace) }
+
+impl PendingMacro {
+    fn plan(self) -> Result<PlannedMacro, ArmError> {
+        match self {
+            Self::Grasp(g) => crate::grasp::plan(g).map(PlannedMacro::Grasp),
+            Self::Place(p) => crate::place::plan(p).map(PlannedMacro::Place),
+        }
+    }
+}
+
+impl PlannedMacro {
+    /// Begin the action and spawn its orchestrator. Returns (action id, expected duration).
+    fn start(self, inner: &mut SupervisorInner, supervisor: &Arc<ArmSupervisor>, deps: &crate::grasp::GraspDeps) -> Result<(u64, f64), ArmError> {
+        match self {
+            Self::Grasp(planned) => {
+                let id = inner.begin_macro("grasp", &planned.input, planned.request.tag.clone())?;
+                let duration = crate::grasp::expected_duration(&planned);
+                crate::grasp::spawn(supervisor.clone(), deps.source.clone(), id, planned);
+                Ok((id, duration))
+            }
+            Self::Place(planned) => {
+                let id = inner.begin_macro("place", &planned.input, planned.request.tag.clone())?;
+                let duration = crate::place::expected_duration(&planned);
+                crate::place::spawn(supervisor.clone(), id, planned);
+                Ok((id, duration))
+            }
+        }
+    }
+}
 
 // Under the write lock, after lease / epoch / request_id checks.
 fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: u64, request_id: &Value) -> Result<ActionStart, ApiError> {
@@ -139,7 +206,12 @@ fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: 
             let (id, duration) = inner.start_gripper(request, epoch)?;
             return Ok(ActionStart::Started(id, duration));
         }
-        "/api/v1/action/grasp" => return Ok(ActionStart::Grasp(crate::grasp::prepare(inner, body, epoch)?)),
+        "/api/v1/action/grasp" => return Ok(ActionStart::Macro(PendingMacro::Grasp(crate::grasp::prepare(inner, body, epoch)?))),
+        "/api/v1/action/place" => return Ok(ActionStart::Macro(PendingMacro::Place(crate::place::prepare(inner, body, epoch)?))),
+        "/api/v1/action/move_to_pose" => {
+            let (id, duration) = crate::poses::start_action(inner, body, epoch)?;
+            return Ok(ActionStart::Started(id, duration));
+        }
         _ => return Err(invalid_command("Unknown action")),
     };
     let (spec, speed, tag) = parsed.map_err(ArmError::from)?;
@@ -158,13 +230,33 @@ fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) ->
     ack
 }
 
+/// Ack fields and the state-file write of a state-changing command.
+type StateReply = (Vec<(&'static str, Value)>, Option<crate::persist::PendingWrite>);
+
+/// Commands that change persisted state (grasp setup, poses, collision setting, keep-out
+/// boxes). None for any other path.
+fn state_command(inner: &mut SupervisorInner, path: &str, body: &Value, setup_path: Option<&std::path::PathBuf>) -> Option<Result<StateReply, ArmError>> {
+    Some(match path {
+        "/api/v1/grasp/setup" => crate::grasp::update_setup(inner, body).map(|setup| {
+            let write = setup_path.cloned().map(|p| crate::persist::PendingWrite::new(p, serde_json::to_string_pretty(&setup).unwrap_or_default()));
+            (vec![("setup", json!(setup))], write)
+        }),
+        "/api/v1/poses/save" => crate::poses::save(inner, body).map(|(pose, write)| (vec![("pose", json!(pose))], write)),
+        "/api/v1/poses/delete" => crate::poses::delete(inner, body).map(|write| (vec![], write)),
+        "/api/v1/safety/collision" => crate::collision::update(inner, body).map(|(config, write)| (vec![("collision", json!(config))], write)),
+        "/api/v1/workspace/keepout" => crate::keepout::update(inner, body)
+            .map(|(state, write)| (vec![("boxes", json!(state.boxes)), ("source", json!(state.source))], write)),
+        _ => return None,
+    })
+}
+
 fn command_reject(inner: &SupervisorInner, request_id: &Value, error: ApiError) -> Value {
     let mut reply = rejection(error, "command_reject", inner.safety.epoch_id());
     reply["request_id"] = request_id.clone();
     reply
 }
 
-async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: crate::grasp::GraspDeps) {
+async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: crate::grasp::GraspDeps, obs_rate: Option<ObsRate>) {
     let (mut sender, mut receiver) = socket.split();
     let mut telemetry = supervisor.subscribe_telemetry();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(64);
@@ -187,6 +279,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let _conn_guard = ConnectionGuard(connection.clone());
 
     let mut send_task = tokio::spawn(async move {
+        let mut last_sent: Option<f64> = None;
         loop {
             tokio::select! {
                 biased;
@@ -196,6 +289,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 },
                 observation = telemetry.recv() => match observation {
                     Ok(obs) => {
+                        if let Some(rate) = obs_rate {
+                            if !rate.due(last_sent, obs.timestamp) { continue; }
+                            last_sent = Some(obs.timestamp);
+                        }
                         if let Ok(text) = serde_json::to_string(&obs) {
                             if sender.send(Message::Text(text.into())).await.is_err() { break; }
                         }
@@ -214,7 +311,29 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         let mut client_label: Option<String> = None;
         let mut last_sequence: Option<u64> = None;
         let mut last_request: Option<u64> = None;
-        while let Some(Ok(message)) = receiver.next().await {
+        // Delayed acks (sent after a state-file write) come back here and are stamped with
+        // the current epoch and enqueued by this loop, in order with its other replies
+        // (epoch_sync, rejects): the epochs a client receives never go back.
+        let (ack_tx, mut ack_rx) = mpsc::channel::<Value>(64);
+        loop {
+            let message = tokio::select! {
+                biased;
+                Some(mut reply) = ack_rx.recv() => {
+                    {
+                        let inner = recv_supervisor.inner().read().await;
+                        reply["epoch_id"] = json!(inner.safety.epoch_id());
+                        reply["safety_state"] = json!(inner.safety.state());
+                        reply["is_torqued"] = json!(inner.is_torqued);
+                    }
+                    test_ack_stamp_delay().await;
+                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                    continue;
+                }
+                message = receiver.next() => match message {
+                    Some(Ok(message)) => message,
+                    _ => break,
+                },
+            };
             let Message::Text(text) = message else {
                 if matches!(message, Message::Close(_)) { break; }
                 continue;
@@ -224,8 +343,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let mut response: Option<Value>;
             let mut evicted_notify: Option<(String, u64)> = None;
             let mut pending_plan: Option<(PendingPlan, u64)> = None;
-            let mut pending_grasp: Option<(Value, crate::grasp::PendingGrasp, u64)> = None;
-            let mut pending_save: Option<crate::grasp::GraspSetup> = None;
+            let mut pending_macro: Option<(Value, PendingMacro, u64)> = None;
+            let mut pending_write: Option<crate::persist::PendingWrite> = None;
             if kind == "estop" || kind == "e_stop" {
                 let (state, epoch) = recv_supervisor.trigger_e_stop().await;
                 response = Some(json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":state}));
@@ -351,15 +470,15 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                         response = match prepare_action(&mut inner, path, &value["body"], epoch, &value["request_id"]) {
                                             Ok(ActionStart::Started(id, duration)) => Some(command_ack(&inner, &value["request_id"], Some((id, duration)))),
                                             Ok(ActionStart::Plan(plan)) => { pending_plan = Some((plan, local_generation)); None }
-                                            Ok(ActionStart::Grasp(g)) => { pending_grasp = Some((value["request_id"].clone(), g, local_generation)); None }
+                                            Ok(ActionStart::Macro(m)) => { pending_macro = Some((value["request_id"].clone(), m, local_generation)); None }
                                             Err(error) => Some(command_reject(&inner, &value["request_id"], error)),
                                         };
-                                    } else if path == "/api/v1/grasp/setup" {
-                                        response = Some(match crate::grasp::update_setup(&mut inner, &value["body"]) {
-                                            Ok(setup) => {
+                                    } else if let Some(result) = state_command(&mut inner, path, &value["body"], recv_deps.setup_path.as_ref()) {
+                                        response = Some(match result {
+                                            Ok((fields, write)) => {
                                                 let mut ack = command_ack(&inner, &value["request_id"], None);
-                                                ack["setup"] = json!(setup);
-                                                pending_save = Some(setup);
+                                                for (key, field) in fields { ack[key] = field; }
+                                                pending_write = write;
                                                 ack
                                             }
                                             Err(error) => command_reject(&inner, &value["request_id"], error.into()),
@@ -436,10 +555,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     });
                 }
 
-                // Grasp: the coarse approach is planned without the lock (feasibility check),
-                // then the action begins and the orchestrator task takes over.
-                if let Some((request_id, pending, generation)) = pending_grasp.take() {
-                    let planned = tokio::task::spawn_blocking(move || crate::grasp::plan(pending)).await;
+                // Macro actions (grasp, place): the first motions are planned without the lock
+                // (feasibility check), then the action begins and the orchestrator task takes over.
+                if let Some((request_id, pending, generation)) = pending_macro.take() {
+                    let planned = tokio::task::spawn_blocking(move || pending.plan()).await;
                     let mut inner = recv_supervisor.inner().write().await;
                     response = Some(match planned {
                         Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
@@ -448,28 +567,31 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
                                 json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
                             } else {
-                                match inner.begin_grasp(&planned.input, planned.request.tag.clone()) {
-                                    Ok(id) => {
-                                        let duration = crate::grasp::expected_duration(&planned);
-                                        crate::grasp::spawn(recv_supervisor.clone(), recv_deps.source.clone(), id, planned);
-                                        command_ack(&inner, &request_id, Some((id, duration)))
-                                    }
+                                match planned.start(&mut inner, &recv_supervisor, &recv_deps) {
+                                    Ok(started) => command_ack(&inner, &request_id, Some(started)),
                                     Err(error) => command_reject(&inner, &request_id, error.into()),
                                 }
                             }
                         }
                     });
                 }
-                if let Some(setup) = pending_save.take() {
-                    if let (Some(path), Some(reply)) = (recv_deps.setup_path.clone(), response.as_mut()) {
-                        match tokio::task::spawn_blocking(move || crate::grasp::save_setup(&path, &setup)).await {
-                            Ok(Ok(())) => reply["persisted"] = json!(true),
-                            Ok(Err(e)) => { tracing::warn!("Grasp setup not saved: {e}"); reply["persisted"] = json!(false); reply["persist_error"] = json!(e.to_string()); }
-                            Err(e) => { reply["persisted"] = json!(false); reply["persist_error"] = json!(e.to_string()); }
+                // State files are written by the single persist writer; this loop does not wait
+                // for the disk: the ack (with `persisted`) is sent when the write finished.
+                if let Some(write) = pending_write.take() {
+                    let reply = response.take();
+                    let tx = ack_tx.clone();
+                    tokio::spawn(async move {
+                        let result = write.run().await;
+                        let Some(mut reply) = reply else { return; };
+                        match result {
+                            Ok(()) => reply["persisted"] = json!(true),
+                            Err(e) => { tracing::warn!("State file not saved: {e}"); reply["persisted"] = json!(false); reply["persist_error"] = json!(e); }
                         }
-                    }
+                        // the ack can follow later replies: the receive loop stamps it with the
+                        // state at send time, so a client never rolls its epoch back
+                        let _ = tx.send(reply).await;
+                    });
                 }
-
                 if let Some((evicted_conn, evicted_gen)) = evicted_notify {
                     let sender_opt = {
                         let reg = CONNECTION_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());

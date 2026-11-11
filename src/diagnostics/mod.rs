@@ -4,6 +4,7 @@
 pub mod blackbox;
 pub mod boot;
 pub mod rotating;
+pub mod tick;
 
 use std::path::{Path, PathBuf};
 

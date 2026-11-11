@@ -90,10 +90,17 @@ init 脚本把 `can0` 设为 1 Mbit/s，与机械臂一致。
 | POS_VEL lag gain 1.5 (basis of the 0.45 rad/s planned-speed cap) | measured 2026-11-09; listed under "needs verification" | docs/agent_action_api.md |
 | Camera image upright with the v5 mount | observed on the arm | `hardware/v7_tilt/README.txt` |
 | Gravity compensation (hand-guiding) | verified on hardware: exit paths held within 1.5 mrad, 30 s recording gave 1509 frames | README, docs/control_safety_contract.md checklist |
+| Collision thresholds in the profile (`collision.thresholds_nm` 2.0, 1.19, 2.82, 1.43, 0.87, 0.28 N·m, `enabled: false`) | `rebot-sysid` on the arm 2026-11-11, one session, ±0.08 rad at two poses; needs validation at more poses before enabling | `profile/rebot-b601dm.json`, docs/simulation.md |
 | Tap-to-grasp | simulation and screenshot tests only | README, docs/plan_tap_to_grasp.md |
 | `camera_mount` (`tilt_deg`, `offset_m`) for camera-frame moves | needs verification | docs/agent_action_api.md |
 | Planning time on the SG2002 | needs verification | docs/agent_action_api.md |
 | v7_tilt mounts | not printed or fitted | `hardware/v7_tilt/README.txt` |
+
+The collision guard stays off in the profile (`collision.enabled: false`). The thresholds come
+from one `rebot-sysid` session on one arm at two poses (B601-DM, 2026-11-11, sweeps ±0.08 rad);
+residuals vary with pose, load and motor temperature, so run `rebot-sysid` at more poses (and
+with warm motors) and compare before enabling the guard in the profile or at runtime
+(`/api/v1/safety/collision`).
 
 Object detection and ArUco come from `rebot-vision`, which is part of this kit's package
 (README "Install on reCamera"); no separate camera app is needed.
@@ -109,9 +116,72 @@ Object detection and ArUco come from `rebot-vision`, which is part of this kit's
 | POS_VEL 滞后增益 1.5（0.45 rad/s 规划限速的依据） | 2026-11-09 实测，列在「需实机核实」 | docs/agent_action_api.md |
 | v5 支架下画面方向为正 | 实机观察 | `hardware/v7_tilt/README.txt` |
 | 重力补偿（拖动示教） | 实机验证：各退出路径位置偏差不超过 1.5 mrad，30 s 录制 1509 帧 | README、docs/control_safety_contract.md 清单 |
+| profile 中的碰撞阈值（`collision.thresholds_nm` 2.0、1.19、2.82、1.43、0.87、0.28 N·m，`enabled: false`） | 2026-11-11 在实机上用 `rebot-sysid` 测得：一次测试、两个姿态、±0.08 rad；启用前须在更多姿态下验证 | `profile/rebot-b601dm.json`、docs/simulation.md |
 | 点框抓取 | 仅仿真与截图测试 | README、docs/plan_tap_to_grasp.md |
 | 相机坐标系运动用的 `camera_mount`（`tilt_deg`、`offset_m`） | 需实机核实 | docs/agent_action_api.md |
 | SG2002 上的规划耗时 | 需实机核实 | docs/agent_action_api.md |
 | v7_tilt 支架 | 未打印、未试装 | `hardware/v7_tilt/README.txt` |
 
+profile 中碰撞检测保持关闭（`collision.enabled: false`）。阈值来自一台机械臂上的一次 `rebot-sysid`
+测试、两个姿态（B601-DM，2026-11-11，扫动 ±0.08 rad）；残差随姿态、负载和电机温度变化，因此在 profile
+或运行时（`/api/v1/safety/collision`）启用前，应在更多姿态下（并在电机升温后）运行 `rebot-sysid` 并对比结果。
+
 目标检测和 ArUco 由 `rebot-vision` 提供，包含在本套件的安装包内（README「在 reCamera 上安装」），无需另装相机应用。
+
+## Run your own program
+
+The reCamera gallery runs one app at a time and the camera is exclusive, so a user program runs
+inside the rebot-teleop package, not as a separate gallery app. `rebot-app-run` runs it, restarts
+it after a crash and keeps its log. The runner is covered by host tests
+(`scripts/test_app_runner.sh`); it has not been run on a device yet.
+
+1. Write the program with the stdlib-only `rebot` SDK (rebot-companion). The deb carries the
+   `rebot/` package in `/usr/share/rebot-teleop/python` (the recamera build requires
+   `REBOT_SDK_DIR=<rebot-companion checkout>`). Example: `/usr/share/rebot-teleop/examples/hello/main.py`.
+2. Copy the program to `/userdata/rebot-apps/<name>/` (entry `main.py`).
+3. Start it: `/etc/init.d/K92rebot-teleop app-start <name>`. Other commands: `app-stop`,
+   `app-status`, `app-logs [n]` (default 50 lines).
+4. Start at boot: in the rebot-teleop settings, group "Your Program", set `app.enabled` to `on` and
+   `app.name` to `<name>` (`/userdata/local/apps/rebot-teleop.config.json`). `start` launches the
+   program after armd; `stop` stops it first.
+
+| Item | Value |
+|---|---|
+| Command | `nice -n 5 python3 -u <entry>`, working directory = the app directory |
+| User | `rebot-app` (system user created by the package's postinst, no login shell, no password; `REBOT_APP_USER` overrides it), never root; a missing user refuses the start. `/userdata/rebot-apps` is owned by `rebot-app:rebot-app` (0755), so the program can write in its own directory. It can read `/userdata/rebot-teleop` but not write the armd state files there (root-owned). The package removal keeps the user. Access to GPIO or serial devices needs a manual group step, for example `addgroup rebot-app dialout` (check the group that owns the device node with `ls -l`) |
+| Environment | `REBOT_HOST=127.0.0.1`, `PYTHONPATH=/usr/share/rebot-teleop/python:<app dir>` |
+| `app.json` (optional) | `{"entry": "main.py", "restart": "on-failure" \| "always" \| "never"}`; default `main.py`, `on-failure` |
+| Restart | exit code 0 ends the runner with `on-failure`; other exits restart after 1, 2, 4 ... 30 s (back to 1 s after a run longer than 60 s); 10 starts within 5 minutes end it with state `given_up` |
+| Stop | the program runs in its own session; SIGTERM to its process group, SIGKILL to the group after 10 s; processes left in the group when the program exits are killed; then every process of the app user started at or after the program (also ones that left the group with `setsid`) is killed. This assumes the app user runs nothing else; `rebot-app` has no login, so the SSH user `recamera` is not affected |
+| Log | `/userdata/rebot-teleop/logs/app-<name>.log`; above 512 KiB (checked before each start and every 30 s) it is copied to `.1`, `.1` to `.2`, and truncated; bytes written during the copy can be lost |
+| State | `/tmp/rebot-app-<name>.state`: `state` (running, backoff, stopped, given_up), `pid`, `runner`, `starts`, `last_exit` |
+
+### 运行自己的程序
+
+reCamera 应用画廊一次只运行一个应用，摄像头为独占资源，因此用户程序由 rebot-teleop 软件包托管，
+不作为独立的画廊应用。`rebot-app-run` 负责运行、崩溃后重启并保留日志。运行器已有主机端测试
+（`scripts/test_app_runner.sh`），尚未在设备上运行。
+
+1. 用仅依赖标准库的 `rebot` SDK（rebot-companion）编写程序。构建 recamera deb 时必须设置
+   `REBOT_SDK_DIR=<rebot-companion 检出目录>`（未设置时构建停止），`rebot/` 包会装入 `/usr/share/rebot-teleop/python`。
+   示例：`/usr/share/rebot-teleop/examples/hello/main.py`。
+2. 将程序复制到 `/userdata/rebot-apps/<name>/`（入口 `main.py`）。
+3. 启动：`/etc/init.d/K92rebot-teleop app-start <name>`。其他命令：`app-stop`、`app-status`、
+   `app-logs [n]`（默认 50 行）。
+4. 开机自启：在 rebot-teleop 设置的“自定义程序”组中，将 `app.enabled` 设为 `on`、`app.name`
+   设为 `<name>`（`/userdata/local/apps/rebot-teleop.config.json`）。`start` 在 armd 之后启动该程序，
+   `stop` 先停止该程序。
+
+程序以非特权系统用户 `rebot-app` 运行（软件包 postinst 创建，无登录 shell、无密码；可用 `REBOT_APP_USER` 指定，不允许 root）；该用户不存在时不启动并记录日志。卸载软件包时保留该用户。
+`/userdata/rebot-apps` 属于 `rebot-app:rebot-app`（0755），程序可在自己的目录中写文件；可读取 `/userdata/rebot-teleop`，但不能写入其中由 root 拥有的 armd 状态文件。访问 GPIO 或串口设备需要手动加入对应的组，例如 `addgroup rebot-app dialout`（用 `ls -l` 查看设备节点所属的组）。程序在独立会话中运行，
+停止时 SIGTERM 发送到整个进程组，10 秒后对进程组发送 SIGKILL；程序退出后遗留在进程组中的进程会被结束，随后该用户在程序启动之后启动的所有进程（包括用 `setsid` 离开进程组的进程）也会被结束。此规则假定该用户只运行这个程序；`rebot-app` 不可登录，SSH 用户 `recamera` 不受影响。
+
+| 项目 | 取值 |
+|---|---|
+| 命令 | `nice -n 5 python3 -u <entry>`，工作目录为程序目录 |
+| 环境变量 | `REBOT_HOST=127.0.0.1`，`PYTHONPATH=/usr/share/rebot-teleop/python:<程序目录>` |
+| `app.json`（可选） | `{"entry": "main.py", "restart": "on-failure" \| "always" \| "never"}`；默认 `main.py`、`on-failure` |
+| 重启 | `on-failure` 下退出码 0 即结束；其他退出按 1、2、4 ... 30 秒退避重启（运行超过 60 秒后回到 1 秒）；5 分钟内启动 10 次则以 `given_up` 状态结束 |
+| 停止 | 向程序发 SIGTERM，10 秒后 SIGKILL |
+| 日志 | `/userdata/rebot-teleop/logs/app-<name>.log`；超过 512 KiB（每次启动前及每 30 秒检查）时复制为 `.1`（原 `.1` 变 `.2`）并原地清空，复制期间写入的字节可能丢失 |
+| 状态 | `/tmp/rebot-app-<name>.state`：`state`（running、backoff、stopped、given_up）、`pid`、`runner`、`starts`、`last_exit` |

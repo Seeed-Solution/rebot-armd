@@ -26,5 +26,10 @@ export REBOT_VISION_BIN=<binary>       # prebuilt rebot-vision from the GitHub r
 # -> dist/rebot-teleop_1.3.8_riscv64.deb
 ```
 
+User programs written with the `rebot` Python SDK run under `rebot-app-run` (start at boot,
+restart after a crash, log in `/userdata/rebot-teleop/logs`): see
+[docs/README.md](docs/README.md#run-your-own-program). `REBOT_SDK_DIR=<rebot-companion checkout>`
+is required when building the recamera deb (the build stops without it); it puts the SDK in the deb.
+
 The deb installs the profile at `/usr/share/rebot-teleop/profile/rebot-b601dm.json`; the init
 script passes it with `--config` when the follower is `rebot-dm` and the file exists.

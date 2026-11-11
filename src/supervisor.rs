@@ -11,8 +11,9 @@ use crate::recording::{
     write_frames_to_parquet, EpisodeRecorder, EpisodeState, ParquetRecordingError, RecordFrame,
     RecordingError,
 };
-use crate::safety::{FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
+use crate::safety::{FaultCode, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
 use crate::trajectory::{MultiJointQuinticTrajectory, TrajectoryError, TrajectoryPlanner};
+use crate::macro_action::{MacroRun, SubDone, SubState};
 use crate::motion::{
     ActionStatus, ActiveTrajectory, GripperMotion, GripperRequest, JointPath, MotionError, PathTrajectory,
     PlanInput, Reference, Settle, StepCtx, StepOut, StepStatus,
@@ -64,6 +65,16 @@ pub const GRIPPER_STALL_RELEASE_NM: f32 = 0.2223;
 /// CAN gaps observed on the reBot rig (2026-11-06, coinciding with 24 V sags);
 /// a real power loss drops the arm regardless of this bound.
 pub const BUS_LOSS_TIMEOUT: Duration = Duration::from_millis(500);
+/// A control tick arriving later than this after the previous one (or a non-finite /
+/// non-positive step) latches Fault `CONTROL_DEADLINE` while torqued and operational.
+/// Same bound as the hardware feedback freshness limit of the drivers.
+pub const CONTROL_DEADLINE: Duration = Duration::from_millis(250);
+/// After a takeover (`acquire_lease` with `force`) another connection must wait this long
+/// before it can take the lease over again.
+pub const PREEMPT_COOLDOWN: Duration = Duration::from_secs(3);
+/// A ThermalTrip can be cleared only once every joint reports a temperature at or below
+/// `max_temperature` minus this margin (°C).
+pub const THERMAL_CLEAR_MARGIN_C: f32 = 5.0;
 /// Lower bound for the automatic park started by an expired lease (trajectory + settle).
 /// The actual budget is `max(WATCHDOG_PARK_TIMEOUT, deceleration + planned duration +
 /// UNLOAD_SETTLE_HOLD + WATCHDOG_PARK_MARGIN)`, counted in control-loop time.
@@ -109,6 +120,14 @@ pub struct UnloadSettle {
 /// Servo streaming: a lead-capped joint whose measured position moves less than this
 /// (rad) over `following_error.persistence_ms` is blocked.
 pub const SERVO_BLOCKED_PROGRESS_RAD: f32 = 0.01;
+
+/// Most FK evaluations the keep-out sweep check may add for one servo or braking step;
+/// a step that needs more is held like a step into a box.
+pub const MAX_KEEPOUT_EVALS_PER_TICK: usize = 64;
+
+/// Most FK evaluations the keep-out sweep check may add for one joint-space trajectory;
+/// a path that needs more is WORKSPACE_VIOLATION.
+pub const MAX_KEEPOUT_EVALS_PER_PLAN: usize = 4000;
 
 /// `observation.motion_limit` is cleared this long (s) after the limit last applied.
 pub const MOTION_LIMIT_CLEAR_S: f64 = 0.3;
@@ -177,8 +196,8 @@ pub struct SupervisorInner {
     pub action_lease_generation: Option<u64>,
     /// Settle phase of a finished joint_move / home quintic: (action id, settle state).
     pub quintic_settle: Option<(u64, Settle)>,
-    /// Running tap-to-grasp orchestration (its sub-motions carry the grasp action id).
-    pub grasp_run: Option<crate::grasp::GraspRun>,
+    /// Running macro action (grasp, place); its sub-motions carry the action id.
+    pub macro_run: Option<crate::macro_action::MacroRun>,
     /// Test hook run once by the WS action handler between planning and install.
     #[doc(hidden)]
     pub before_install_hook: Option<Box<dyn FnOnce(&mut SupervisorInner) + Send + Sync>>,
@@ -197,6 +216,11 @@ pub struct SupervisorInner {
     pub unload_settle: Option<UnloadSettle>,
     /// Set while a park started by the lease watchdog is running.
     pub watchdog_park: Option<WatchdogPark>,
+    /// Set when the last park was refused because its path enters a keep-out box.
+    pub park_rejection: Option<SafetyError>,
+    /// Bumped on every change of the workspace rule inputs (keep-out boxes, camera mount);
+    /// a plan made outside the lock must match it at install (else PLAN_STALE).
+    pub workspace_revision: u64,
     /// Duration of the most recently planned NormalUnload trajectory (s).
     pub unload_planned_duration: Option<f64>,
     pub recorder: EpisodeRecorder,
@@ -216,12 +240,23 @@ pub struct SupervisorInner {
     /// Running gravity-compensation session (`src/gravity_comp.rs`).
     pub gravity_comp: Option<crate::gravity_comp::GravityCompRun>,
     pub gravity_comp_last_exit: Option<crate::model::GravityCompExit>,
+    /// Keep-out source and file (`src/keepout.rs`).
+    pub keepout: crate::keepout::Keepout,
+    /// Named poses (`src/poses.rs`).
+    pub poses: crate::poses::PoseStore,
+    /// Measured minus model gravity torque, J1..J6 (`observation.residual_torques`).
+    pub residual_torques: Option<[f32; 6]>,
+    /// Collision guard state (`src/collision.rs`).
+    pub collision: crate::collision::CollisionGuard,
+    /// `--follower` model name armd was started with (`safety/describe` `device.follower`).
+    pub follower: Option<String>,
 }
 
 impl SupervisorInner {
     pub fn new(mut config: ArmConfig) -> Self {
         config.validate().expect("Invalid ArmConfig: invariant violation");
         let dof = config.dof;
+        let collision_policy = config.collision.unwrap_or_default();
         let positions = config.home_positions.clone();
         let target_positions = positions.clone();
         let lease_timeout = Duration::from_millis(config.lease_timeout_ms);
@@ -234,7 +269,13 @@ impl SupervisorInner {
             "/usr/share/rebot-teleop/reBot-DevArm_gripper.urdf",
         ];
         let mut gravity_compensated = false;
-        for path in &candidate_urdf_paths {
+        if let Some(chain) = config.arm_model.chain() {
+            // Profile URDF: read and (with urdf_sha256) verified by ArmConfig::load_arm_model.
+            tracing::info!("Arm model from URDF '{}' ({} -> {}, {} joints, {:.3} kg moving)",
+                chain.robot, chain.base_link, chain.tip_link, chain.dof(), chain.moving_mass());
+            gravity_compensated = chain.moving_mass() > 0.0;
+        }
+        for path in candidate_urdf_paths.iter().filter(|_| config.arm_model.chain().is_none()) {
             if std::path::Path::new(path).exists() {
                 match crate::gravity::verify_urdf_sha256(path) {
                     Ok(()) => {
@@ -283,7 +324,7 @@ impl SupervisorInner {
             previous_action: None,
             next_action_id: 0,
             action_lease_generation: None,
-            grasp_run: None,
+            macro_run: None,
             quintic_settle: None,
             before_install_hook: None,
             last_heartbeat: now,
@@ -300,6 +341,8 @@ impl SupervisorInner {
             pending_normal_unload: false,
             unload_settle: None,
             watchdog_park: None,
+            park_rejection: None,
+            workspace_revision: 0,
             unload_planned_duration: None,
             recorder: EpisodeRecorder::new(),
             start_time: now,
@@ -316,7 +359,20 @@ impl SupervisorInner {
             handover_settling_since: None,
             gravity_comp: None,
             gravity_comp_last_exit: None,
+            keepout: crate::keepout::Keepout::default(),
+            poses: crate::poses::PoseStore::default(),
+            residual_torques: None,
+            collision: crate::collision::CollisionGuard::from_policy(&collision_policy),
+            follower: None,
         }
+    }
+
+    /// Observation schema: profile capabilities plus the parts that depend on the driver.
+    pub fn schema(&self) -> ObservationSchema {
+        let mut schema = ObservationSchema::from_config(&self.config);
+        schema.capabilities.gravity_comp = self.gravity_comp_support().is_ok();
+        schema.capabilities.collision_guard &= self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+        schema
     }
 
     pub fn with_driver(mut self, driver: Box<dyn ArmDriver>) -> Self {
@@ -336,14 +392,17 @@ impl SupervisorInner {
     /// Joint limits used for planning and servo stepping: `config.limits` with
     /// `max_velocity` capped at `config.planned_max_velocity` for every joint
     /// except the 7-DOF gripper (index 6).
+    /// `speed_cap.joint_velocity_scale` then scales the result (same joints).
     pub fn planning_limits(&self) -> Vec<crate::model::JointLimit> {
         let mut limits = self.config.limits.clone();
-        if let Some(cap) = self.config.planned_max_velocity {
-            let gripper_idx = (self.config.dof >= 7).then_some(6);
-            for (i, limit) in limits.iter_mut().enumerate() {
-                if Some(i) != gripper_idx {
+        let scale = self.config.speed_cap.and_then(|c| c.joint_velocity_scale).unwrap_or(1.0);
+        let gripper_idx = self.config.gripper_index();
+        for (i, limit) in limits.iter_mut().enumerate() {
+            if Some(i) != gripper_idx {
+                if let Some(cap) = self.config.planned_max_velocity {
                     limit.max_velocity = limit.max_velocity.min(cap);
                 }
+                limit.max_velocity *= scale;
             }
         }
         limits
@@ -397,7 +456,7 @@ impl SupervisorInner {
     /// [`MOTION_LIMIT_CLEAR_S`].
     fn expire_motion_limit(&mut self) {
         if self.servo_blocked_hold {
-            let resumed = self.servo_target.is_some() || self.active_trajectory.is_some() || self.grasp_run.is_some()
+            let resumed = self.servo_target.is_some() || self.active_trajectory.is_some() || self.macro_run.is_some()
                 || self.gravity_comp.is_some() || !self.is_torqued || self.safety.state().is_stopped();
             if resumed {
                 self.clear_blocked_hold();
@@ -425,7 +484,132 @@ impl SupervisorInner {
         tracing::warn!(
             "Joint {} blocked during servo streaming ({why}; cmd {:.3} meas {:.3} rad): stream stopped, holding position",
             joint + 1, self.commanded_positions[joint], self.measured_positions[joint]);
-        let gripper_idx = (self.config.dof >= 7).then_some(6);
+        self.servo_hold(MotionLimitReason::Blocked, Some(joint));
+    }
+
+    /// The servo / braking step to `next` sweeps into a keep-out box: same recoverable hold.
+    fn enter_servo_keepout_hold(&mut self, e: &SafetyError) {
+        tracing::warn!("Servo step would enter a keep-out box ({e}): stream stopped, holding position");
+        self.servo_hold(MotionLimitReason::Workspace, None);
+    }
+
+    /// Joint-space step from the commanded position to `next` (linear in joint space)
+    /// against the keep-out boxes: the conservative sweep check
+    /// ([`keepout_sweep`](Self::keepout_sweep)) with at most [`MAX_KEEPOUT_EVALS_PER_TICK`]
+    /// added FK evaluations, then the start / midpoint / end rule for boxes the step starts
+    /// in. No FK call without boxes.
+    pub fn servo_step_keepout(&self, next: &[f32]) -> Result<(), SafetyError> {
+        let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
+        if ws.keepout_boxes.is_empty() { return Ok(()); }
+        let a = &self.commanded_positions;
+        let lerp = |t: f64| -> Vec<f32> { a.iter().zip(next).map(|(x, y)| x + (t as f32) * (y - x)).collect() };
+        let travel = |t0: f64, t1: f64| -> Vec<f64> { a.iter().zip(next).map(|(x, y)| f64::from((y - x).abs()) * (t1 - t0)).collect() };
+        self.keepout_sweep(ws, cam, &lerp, &travel, &[0.0, 1.0], MAX_KEEPOUT_EVALS_PER_TICK)?;
+        let mid = lerp(0.5);
+        self.check_keepout_path(a, [mid.as_slice(), next])
+    }
+
+    /// Conservative keep-out check of the joint path `at(t)` over `knots` (ascending).
+    ///
+    /// Every check point (end_link origin, `check_points_end_m`, camera offset) moves along
+    /// an interval `[t0, t1]` at most `L = sum_j travel_j * reach_j`, with `travel` an upper
+    /// bound on each joint's travel and `reach_j` the largest distance from joint `j`'s axis to
+    /// a check point ([`ArmModel::joint_reach`](crate::chain::ArmModel::joint_reach)). A
+    /// point at Euclidean distances `d0`, `d1` from a box at the interval ends cannot enter
+    /// it when `d0 + d1 > L`. An interval where that fails for some point and box is split at
+    /// its midpoint; one with `L` at most [`WORKSPACE_EPS`](crate::kinematics::WORKSPACE_EPS)
+    /// is accepted (the depth rule's tolerance). A sample with a point deeper than the
+    /// tolerance in a box is WORKSPACE_VIOLATION; so is needing more than `budget` added
+    /// evaluations. Boxes a point is already inside at `at(knots[0])` are left to the
+    /// sample rule (a move out of a box is allowed). Returns the evaluated samples in order.
+    pub fn keepout_sweep(
+        &self,
+        ws: &crate::model::WorkspacePolicy,
+        cam: &crate::model::CameraMount,
+        at: &dyn Fn(f64) -> Vec<f32>,
+        travel: &dyn Fn(f64, f64) -> Vec<f64>,
+        knots: &[f64],
+        budget: usize,
+    ) -> Result<Vec<Vec<f32>>, SafetyError> {
+        use crate::kinematics::WORKSPACE_EPS;
+        let model = &self.config.arm_model;
+        let n = model.arm_dof();
+        let local: Vec<[f64; 3]> = std::iter::once([0.0f32; 3]).chain(ws.check_points_end_m.iter().copied())
+            .chain(cam.offset_m).map(|p| p.map(f64::from)).collect();
+        let reach = model.joint_reach(local.iter().map(crate::kinematics::norm).fold(0.0, f64::max));
+        let boxes: Vec<([f64; 3], [f64; 3])> = ws.keepout_boxes.iter().map(|b| (b.min_m.map(f64::from), b.max_m.map(f64::from))).collect();
+        let invalid = || SafetyError::WorkspaceViolation { point: 0, limit: "invalid".into(), value: f32::NAN, bound: 0.0 };
+        // (outside distance, depth inside) of every point to every box at q
+        let measure = |q: &[f32]| -> Option<Vec<(f64, f64)>> {
+            let pose = model.fk_f32(q)?;
+            Some(local.iter().flat_map(|l| {
+                let p = pose.transform_point(l);
+                boxes.iter().map(move |(lo, hi)| {
+                    let out = (0..3).map(|k| (lo[k] - p[k]).max(p[k] - hi[k]).max(0.0).powi(2)).sum::<f64>().sqrt();
+                    let depth = (0..3).map(|k| (p[k] - lo[k]).min(hi[k] - p[k])).fold(f64::INFINITY, f64::min);
+                    (out, depth)
+                })
+            }).collect())
+        };
+        let nb = boxes.len();
+        let first = at(knots[0]);
+        let m0 = measure(&first).ok_or_else(invalid)?;
+        let active: Vec<bool> = m0.iter().map(|&(_, depth)| depth <= 0.0).collect();
+        let check = |m: &[(f64, f64)]| -> Result<(), SafetyError> {
+            match m.iter().enumerate().filter(|(i, (_, depth))| active[*i] && *depth > WORKSPACE_EPS)
+                .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1)) {
+                Some((i, &(_, depth))) => Err(SafetyError::WorkspaceViolation {
+                    point: i / nb,
+                    limit: format!("keepout '{}'", ws.keepout_boxes[i % nb].name),
+                    value: depth as f32, bound: 0.0,
+                }),
+                None => Ok(()),
+            }
+        };
+        let mut samples: Vec<(f64, Vec<f32>)> = vec![(knots[0], first)];
+        let mut ends: Vec<(f64, Vec<(f64, f64)>)> = vec![(knots[0], m0)];
+        for &t in &knots[1..] {
+            let q = at(t);
+            let m = measure(&q).ok_or_else(invalid)?;
+            check(&m)?;
+            samples.push((t, q));
+            ends.push((t, m));
+        }
+        let mut evals = 0usize;
+        let mut stack: Vec<((f64, Vec<(f64, f64)>), (f64, Vec<(f64, f64)>))> = Vec::new();
+        let mut ends = ends.into_iter();
+        let mut prev = ends.next().ok_or_else(invalid)?;
+        for e in ends { stack.push((prev, e.clone())); prev = e; }
+        while let Some(((t0, m0), (t1, m1))) = stack.pop() {
+            let tr = travel(t0, t1);
+            let bound: f64 = tr.iter().take(n).zip(&reach).map(|(d, r)| d * r).sum();
+            if !bound.is_finite() { return Err(invalid()); }
+            if bound <= WORKSPACE_EPS
+                || m0.iter().zip(&m1).zip(&active).all(|((a, b), &on)| !on || a.0 + b.0 > bound) {
+                continue;
+            }
+            if evals >= budget {
+                return Err(SafetyError::WorkspaceViolation {
+                    point: 0,
+                    limit: format!("keepout check: the path needs more than {budget} FK evaluations to clear the keep-out boxes; bound"),
+                    value: bound as f32, bound: WORKSPACE_EPS as f32,
+                });
+            }
+            evals += 1;
+            let tm = 0.5 * (t0 + t1);
+            let q = at(tm);
+            let m = measure(&q).ok_or_else(invalid)?;
+            check(&m)?;
+            samples.push((tm, q));
+            stack.push(((tm, m.clone()), (t1, m1)));
+            stack.push(((t0, m0), (tm, m)));
+        }
+        samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Ok(samples.into_iter().map(|(_, q)| q).collect())
+    }
+
+    fn servo_hold(&mut self, reason: MotionLimitReason, joint: Option<usize>) {
+        let gripper_idx = self.config.gripper_index();
         let grip_cmd = gripper_idx.map(|g| self.commanded_positions[g]);
         self.stop_motion();
         if self.measured_positions.iter().all(|q| q.is_finite()) {
@@ -441,7 +625,7 @@ impl SupervisorInner {
         self.following_error_since = None;
         self.servo_lead_stall.fill(None);
         self.safety.mark_motion_finished();
-        self.note_motion_limit(MotionLimitReason::Blocked, Some(joint));
+        self.note_motion_limit(reason, joint);
         self.servo_blocked_hold = true;
     }
 
@@ -449,7 +633,7 @@ impl SupervisorInner {
     /// (workspace and kinematics configured, 7-DOF arm).
     pub fn workspace_policy(&self) -> Option<(&crate::model::WorkspacePolicy, &crate::model::CameraMount)> {
         match (&self.config.workspace, self.config.kinematics) {
-            (Some(ws), Some(_)) if self.config.dof == 7 => Some((ws, &self.config.camera_mount)),
+            (Some(ws), Some(_)) if self.config.dof >= self.config.arm_dof() => Some((ws, &self.config.camera_mount)),
             _ => None,
         }
     }
@@ -461,13 +645,44 @@ impl SupervisorInner {
         samples: impl IntoIterator<Item = &'a [f32]>,
     ) -> Result<(), SafetyError> {
         let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
-        let v0 = crate::kinematics::workspace_violation(start, ws, cam);
+        self.check_path_against(ws, cam, start, samples)
+    }
+
+    /// [`check_workspace_path`](Self::check_workspace_path) against the keep-out boxes only
+    /// (no floor / box / reach): the part of the rule park may not bypass.
+    pub fn check_keepout_path<'a>(
+        &self,
+        start: &[f32],
+        samples: impl IntoIterator<Item = &'a [f32]>,
+    ) -> Result<(), SafetyError> {
+        let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
+        if ws.keepout_boxes.is_empty() { return Ok(()); }
+        let only = crate::model::WorkspacePolicy {
+            floor_z_m: f32::NEG_INFINITY,
+            box_min_m: [f32::NEG_INFINITY; 3],
+            box_max_m: [f32::INFINITY; 3],
+            max_reach_m: None,
+            check_points_end_m: ws.check_points_end_m.clone(),
+            keepout_boxes: ws.keepout_boxes.clone(),
+        };
+        self.check_path_against(&only, cam, start, samples)
+    }
+
+    fn check_path_against<'a>(
+        &self,
+        ws: &crate::model::WorkspacePolicy,
+        cam: &crate::model::CameraMount,
+        start: &[f32],
+        samples: impl IntoIterator<Item = &'a [f32]>,
+    ) -> Result<(), SafetyError> {
+        let model = &self.config.arm_model;
+        let v0 = model.workspace_violation(start, ws, cam);
         for q in samples {
-            let v = crate::kinematics::workspace_violation(q, ws, cam);
+            let v = model.workspace_violation(q, ws, cam);
             if crate::kinematics::workspace_rejects(&v, &v0) {
-                let w = v.worst.unwrap_or(crate::kinematics::ViolationDetail { point: 0, limit: "invalid", value: f64::NAN, bound: 0.0 });
+                let w = v.worst.unwrap_or(crate::kinematics::ViolationDetail { point: 0, limit: "invalid", value: f64::NAN, bound: 0.0, keepout: None });
                 return Err(SafetyError::WorkspaceViolation {
-                    point: w.point, limit: w.limit.to_string(), value: w.value as f32, bound: w.bound as f32,
+                    point: w.point, limit: w.label(ws), value: w.value as f32, bound: w.bound as f32,
                 });
             }
         }
@@ -476,11 +691,33 @@ impl SupervisorInner {
 
     /// The planner's 21 verification points of a trajectory.
     pub fn trajectory_samples(traj: &MultiJointQuinticTrajectory) -> Vec<Vec<f32>> {
-        (0..=20).map(|k| traj.sample(traj.duration * f64::from(k) / 20.0).positions).collect()
+        Self::uniform_samples(traj, 20)
+    }
+
+    fn uniform_samples(traj: &MultiJointQuinticTrajectory, n: usize) -> Vec<Vec<f32>> {
+        (0..=n).map(|k| traj.sample(traj.duration * k as f64 / n as f64).positions).collect()
+    }
+
+    /// Workspace verification points of a joint-space trajectory: the 21 planner samples,
+    /// plus, with keep-out boxes, the samples of the conservative sweep check
+    /// ([`keepout_sweep`](Self::keepout_sweep), at most [`MAX_KEEPOUT_EVALS_PER_PLAN`] added
+    /// FK evaluations; a path that needs more, or that enters a box, is WORKSPACE_VIOLATION).
+    pub fn workspace_samples(&self, traj: &MultiJointQuinticTrajectory) -> Result<Vec<Vec<f32>>, SafetyError> {
+        self.workspace_samples_with_budget(traj, MAX_KEEPOUT_EVALS_PER_PLAN)
+    }
+
+    /// [`workspace_samples`](Self::workspace_samples) with `budget` added FK evaluations.
+    pub fn workspace_samples_with_budget(&self, traj: &MultiJointQuinticTrajectory, budget: usize) -> Result<Vec<Vec<f32>>, SafetyError> {
+        let Some((ws, cam)) = self.workspace_policy().filter(|(ws, _)| !ws.keepout_boxes.is_empty())
+            else { return Ok(Self::trajectory_samples(traj)); };
+        let knots: Vec<f64> = (0..=20).map(|k| traj.duration * k as f64 / 20.0).collect();
+        let at = |t: f64| traj.sample(t).positions;
+        let travel = |t0: f64, t1: f64| traj.travel_bound(t0, t1);
+        self.keepout_sweep(ws, cam, &at, &travel, &knots, budget)
     }
 
     fn gravity_output_enabled(&self) -> bool {
-        self.gravity_compensated && self.config.gravity_model.is_some() && matches!(self.config.dof, 6 | 7) && self.driver.as_ref().is_none_or(|d|
+        self.gravity_compensated && self.config.gravity_model.is_some() && self.config.dof >= self.config.arm_dof() && self.driver.as_ref().is_none_or(|d|
             d.lock().is_ok_and(|drv| drv.capabilities().torque_feedforward))
     }
 
@@ -564,6 +801,9 @@ impl SupervisorInner {
             lease_holder: self.lease_holder(),
             motion_limit: self.motion_limit.clone(),
             motor_errors: self.motor_errors.clone(),
+            fault: self.safety.fault(),
+            residual_torques: self.residual_torques,
+            collision: self.collision_observation(),
         }
     }
 
@@ -728,7 +968,7 @@ impl SupervisorInner {
                         self.last_disable_attempt = Some(Instant::now());
                     }
                     let err_msg = format!("Hardware torque enable failed: {}", e);
-                    self.safety.trigger_fault(FaultReason::Other(err_msg.clone()));
+                    self.safety.trigger_fault_coded(FaultCode::EnableFailed, FaultReason::Other(err_msg.clone()));
                     return Err(SafetyError::ClearFaultRejected(err_msg));
                 }
                 let states = match driver.read_joint_states() {
@@ -823,7 +1063,7 @@ impl SupervisorInner {
         self.stop_motion();
         self.commanded_velocities.fill(0.0);
         if let Err(error) = self.request_disable() {
-            self.safety.trigger_fault(FaultReason::Other(error.to_string()));
+            self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(error.to_string()));
             return Err(error);
         }
         let state = self.safety.set_torque(false)?;
@@ -901,8 +1141,27 @@ impl SupervisorInner {
                         Some(1.5),
                         &self.planning_limits(),
                     ) {
-                        // Park is exempt from the workspace check: it must always remain possible.
-                        let samples = Self::trajectory_samples(&traj);
+                        // Park is exempt from the floor / box / reach limits (it must remain
+                        // possible from a violating pose) but not from the keep-out boxes.
+                        let samples = match self.workspace_samples(&traj) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!("Park path cannot be verified against the keep-out boxes ({e}); not parking");
+                                self.park_rejection = Some(e);
+                                self.pending_normal_unload = false;
+                                self.unload_settle = None;
+                                self.active_trajectory = None;
+                                return;
+                            }
+                        };
+                        if let Err(e) = self.check_keepout_path(&clamped_start, samples.iter().map(Vec::as_slice)) {
+                            tracing::warn!("Park path enters a keep-out box ({e}); not parking");
+                            self.park_rejection = Some(e);
+                            self.pending_normal_unload = false;
+                            self.unload_settle = None;
+                            self.active_trajectory = None;
+                            return;
+                        }
                         if let Err(e) = self.check_workspace_path(&clamped_start, samples.iter().map(Vec::as_slice)) {
                             tracing::warn!("Park path leaves the workspace ({e}); parking anyway");
                         }
@@ -1030,7 +1289,7 @@ impl SupervisorInner {
             }
             drv.check_hardware_status().map_err(|e| SafetyError::ClearFaultRejected(e.to_string()))?;
             if thermal && (!drv.capabilities().temperature_feedback || states.iter().any(|state|
-                !state.temperature.is_finite() || state.temperature > self.config.max_temperature - 5.0)) {
+                !state.temperature.is_finite() || state.temperature > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C)) {
                 return Err(SafetyError::ClearFaultRejected("Temperature must be confirmed below the reset threshold".into()));
             }
             let state = drv.enable_state();
@@ -1046,7 +1305,7 @@ impl SupervisorInner {
             }
             state
         } else {
-            if thermal && self.temperatures.iter().any(|t| !t.is_finite() || *t > self.config.max_temperature - 5.0) {
+            if thermal && self.temperatures.iter().any(|t| !t.is_finite() || *t > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C) {
                 return Err(SafetyError::ClearFaultRejected("Temperature is above the reset threshold".into()));
             }
             if self.is_torqued { EnableState::Enabled } else { EnableState::Disabled }
@@ -1130,11 +1389,10 @@ impl SupervisorInner {
             }
 
             if active.client_id != conn {
-                let cooldown = Duration::from_secs(3);
                 if let Some(last) = self.last_preemption {
                     let elapsed = last.elapsed();
-                    if elapsed < cooldown {
-                        let remaining_ms = (cooldown.saturating_sub(elapsed).as_millis() as u64).max(1);
+                    if elapsed < PREEMPT_COOLDOWN {
+                        let remaining_ms = (PREEMPT_COOLDOWN.saturating_sub(elapsed).as_millis() as u64).max(1);
                         return Err(PreemptError::Cooldown(remaining_ms));
                     }
                 }
@@ -1275,6 +1533,7 @@ impl SupervisorInner {
         let Some(policy) = &self.config.resting_pose else { return Some("no resting pose configured".into()); };
         if !self.supports_automatic_unload() { return Some("driver lacks velocity/torque/enable feedback".into()); }
         if self.e_stop_latched.load(Ordering::SeqCst) { return Some("E-stop latched".into()); }
+        if self.collision.hold.is_some() { return Some("collision hold".into()); }
         if !self.safety.state().is_operational() { return Some(format!("safety state {:?}", self.safety.state())); }
         if self.pending_rearm || self.disable_pending || self.output_suspended || self.handover_settling_since.is_some() {
             return Some("re-arm, disable, output suspension or handover pending".into());
@@ -1389,6 +1648,7 @@ impl SupervisorInner {
 
     pub fn servo(&mut self, targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
         self.gravity_comp_servo_busy()?;
+        self.collision_hold_check()?;
         if self.handover_settling_since.is_some() {
             return Err(SafetyError::HandoverSettling);
         }
@@ -1407,7 +1667,7 @@ impl SupervisorInner {
         if self.pending_rearm || self.pending_normal_unload {
             return Err(SafetyError::NotArmed(self.safety.state().clone()));
         }
-        if self.active_trajectory.is_some() || self.grasp_run.is_some() {
+        if self.active_trajectory.is_some() || self.macro_run.is_some() {
             return Err(SafetyError::MotionBusy);
         }
 
@@ -1473,7 +1733,23 @@ impl SupervisorInner {
         epoch_id: Option<u64>,
         kind: &str,
     ) -> Result<(u64, u64, f64), ArmError> {
+        let limits = self.planning_limits();
+        self.start_quintic(target_positions, duration_secs, epoch_id, kind, None, &limits)
+    }
+
+    /// Joint-space quintic to `target_positions` planned with `limits`, recorded as an
+    /// action of `kind`. Returns (epoch, action id, planned duration).
+    pub(crate) fn start_quintic(
+        &mut self,
+        target_positions: Vec<f32>,
+        duration_secs: Option<f64>,
+        epoch_id: Option<u64>,
+        kind: &str,
+        tag: Option<String>,
+        limits: &[crate::model::JointLimit],
+    ) -> Result<(u64, u64, f64), ArmError> {
         self.gravity_comp_motion_busy()?;
+        self.collision_hold_check()?;
         if self.handover_settling_since.is_some() {
             return Err(ArmError::Safety(SafetyError::HandoverSettling));
         }
@@ -1512,9 +1788,9 @@ impl SupervisorInner {
             &target_positions,
             &vec![0.0; self.config.dof],
             duration_secs,
-            &self.planning_limits(),
+            limits,
         )?;
-        let samples = Self::trajectory_samples(&traj);
+        let samples = self.workspace_samples(&traj)?;
         self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
 
         // 3. Only renew lease AFTER command validation and planning succeed
@@ -1524,7 +1800,7 @@ impl SupervisorInner {
         self.target_positions = target_positions;
         self.safety.mark_motion_started()?;
         let duration = traj.duration;
-        let id = self.begin_action(kind, None);
+        let id = self.begin_action(kind, tag);
         self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)));
 
         Ok((self.safety.epoch_id(), id, duration))
@@ -1537,8 +1813,8 @@ impl SupervisorInner {
     /// Start a new action record; a running one is cancelled as SUPERSEDED.
     pub fn begin_action(&mut self, kind: &str, tag: Option<String>) -> u64 {
         let now = self.now_s();
-        // any new action ends a running grasp (its orchestrator sees the record cancelled)
-        self.grasp_run = None;
+        // any new action ends a running macro (its orchestrator sees the record cancelled)
+        self.macro_run = None;
         if let Some(mut old) = self.last_action.take() {
             if old.is_running() {
                 old.state = "cancelled".into();
@@ -1560,7 +1836,7 @@ impl SupervisorInner {
         id
     }
 
-    fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
+    pub(crate) fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
                      settled: Option<bool>, holding: Option<bool>, gap: Option<f32>) {
         let now = self.now_s();
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
@@ -1575,21 +1851,24 @@ impl SupervisorInner {
             tracing::info!("Action {} ({}) {}{}", id, a.kind, state, code.map(|c| format!(" {c}")).unwrap_or_default());
         }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
-        if self.grasp_run.as_ref().is_some_and(|g| g.id == id) { self.grasp_run = None; }
+        if self.macro_run.as_ref().is_some_and(|m| m.id == id) { self.macro_run = None; }
     }
 
     /// Start a park (NormalUnload) and record it as a `park` action. Returns its id when
     /// the park started.
-    pub fn unload_action(&mut self) -> Option<u64> {
+    /// A park whose path enters a keep-out box is `WORKSPACE_VIOLATION`.
+    pub fn unload_action(&mut self) -> Result<Option<u64>, ArmError> {
+        self.park_rejection = None;
         self.execute_stop(StopPolicy::NormalUnload);
-        if !self.pending_normal_unload { return None; }
+        if let Some(e) = self.park_rejection.take() { return Err(e.into()); }
+        if !self.pending_normal_unload { return Ok(None); }
         let id = self.begin_action("park", None);
         if let Some(active) = self.active_trajectory.as_mut() { active.action_id = Some(id); }
-        Some(id)
+        Ok(Some(id))
     }
 
     /// Preconditions shared by Cartesian and gripper actions.
-    fn action_preconditions(&self) -> Result<(), ArmError> {
+    pub(crate) fn action_preconditions(&self) -> Result<(), ArmError> {
         if self.handover_settling_since.is_some() { return Err(SafetyError::HandoverSettling.into()); }
         if self.e_stop_latched.load(Ordering::SeqCst) { return Err(SafetyError::EStopActive.into()); }
         match self.safety.state() {
@@ -1601,8 +1880,17 @@ impl SupervisorInner {
         if self.pending_rearm || self.pending_normal_unload {
             return Err(SafetyError::NotArmed(self.safety.state().clone()).into());
         }
+        self.collision_hold_check()?;
         if let Some(reason) = self.busy_reason() { return Err(MotionError::MotionBusy(reason).into()); }
         Ok(())
+    }
+
+    /// Why the workspace rule may not change now: a motion, macro, stream or park is
+    /// running (each was checked against the current rule).
+    pub fn workspace_change_blocker(&self) -> Option<String> {
+        if self.macro_run.is_some() { return Some("a macro action is running".into()); }
+        if self.pending_normal_unload { return Some("a park is running".into()); }
+        self.busy_reason()
     }
 
     fn busy_reason(&self) -> Option<String> {
@@ -1614,8 +1902,8 @@ impl SupervisorInner {
 
     /// Snapshot for planning a Cartesian action outside the lock.
     pub fn plan_input(&self) -> Result<PlanInput, ArmError> {
-        if self.config.kinematics.is_none() || self.config.dof != 7 {
-            return Err(MotionError::Unsupported("Cartesian actions need a 7-DOF profile with a kinematics model".into()).into());
+        if self.config.kinematics.is_none() || !self.config.six_plus_gripper() {
+            return Err(MotionError::Unsupported("Cartesian actions need a kinematics model with 6 arm joints and the gripper at joint 7".into()).into());
         }
         self.action_preconditions()?;
         self.gravity_comp_motion_busy()?;
@@ -1623,9 +1911,12 @@ impl SupervisorInner {
             q0: crate::kinematics::q6(&self.commanded_positions),
             j7: self.commanded_positions[6],
             limits: self.planning_limits(),
+            speed_cap: self.config.speed_cap,
             ws: self.workspace_policy().map(|(ws, _)| ws.clone()),
             cam: self.config.camera_mount.clone(),
+            arm: self.config.arm_model.clone(),
             epoch: self.safety.epoch_id(),
+            workspace_revision: self.workspace_revision,
         })
     }
 
@@ -1643,6 +1934,9 @@ impl SupervisorInner {
     fn check_plan_fresh(&self, input: &PlanInput) -> Result<(), ArmError> {
         if self.safety.epoch_id() != input.epoch {
             return Err(MotionError::PlanStale("epoch changed while planning".into()).into());
+        }
+        if self.workspace_revision != input.workspace_revision {
+            return Err(MotionError::PlanStale("workspace or keep-out boxes changed while planning".into()).into());
         }
         match self.action_preconditions() {
             Err(ArmError::Motion(MotionError::MotionBusy(reason))) => {
@@ -1672,7 +1966,7 @@ impl SupervisorInner {
     /// Runtime grasp setup (`config.grasp`, with the camera tilt taken from `camera_mount`).
     /// None when the profile cannot grasp (no kinematics, gripper policy or grasp section).
     pub fn grasp_setup(&self) -> Option<crate::grasp::GraspSetup> {
-        if self.config.dof != 7 || self.config.kinematics.is_none() || self.config.gripper_policy.is_none() { return None; }
+        if !self.config.six_plus_gripper() || self.config.kinematics.is_none() || self.config.gripper_policy.is_none() { return None; }
         let mut s = self.config.grasp.clone()?;
         s.camera_tilt_deg = f64::from(self.config.camera_mount.tilt_deg);
         Some(s)
@@ -1680,30 +1974,35 @@ impl SupervisorInner {
 
     /// Replace the runtime setup; `camera_tilt_deg` also sets `camera_mount.tilt_deg`.
     pub fn set_grasp_setup(&mut self, setup: crate::grasp::GraspSetup) {
+        if self.config.camera_mount.tilt_deg != setup.camera_tilt_deg as f32 { self.workspace_revision += 1; }
         self.config.camera_mount.tilt_deg = setup.camera_tilt_deg as f32;
         self.config.grasp = Some(setup);
     }
 
-    /// Begin a `grasp` action after its approach was planned from `input`. Returns its id.
-    pub fn begin_grasp(&mut self, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
+    // ---- macro actions (crate::macro_action) ----
+
+    /// Begin a macro action (`grasp`, `place`) after its first motion was planned from
+    /// `input`. Its orchestrator drives it from now on. Returns its id.
+    pub fn begin_macro(&mut self, kind: &str, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
         self.check_plan_fresh(input)?;
-        let id = self.begin_action("grasp", tag);
-        self.grasp_run = Some(crate::grasp::GraspRun { id, epoch: input.epoch, sub: crate::grasp::SubState::Idle, stop_requested: false });
-        self.set_grasp_phase(id, "start", 0.0, None, None);
+        let id = self.begin_action(kind, tag);
+        self.macro_run = Some(MacroRun { id, epoch: input.epoch, sub: SubState::Idle, stop_requested: false });
+        self.set_action_phase(id, "start", 0.0, None, None);
         Ok(id)
     }
 
-    /// The grasp `id` is still the running action.
-    pub fn grasp_alive(&self, id: u64) -> bool {
-        self.grasp_run.as_ref().is_some_and(|g| g.id == id)
+    /// The macro action `id` is still the running action.
+    pub fn macro_alive(&self, id: u64) -> bool {
+        self.macro_run.as_ref().is_some_and(|m| m.id == id && !m.stop_requested)
             && self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running())
     }
 
-    pub fn grasp_sub(&self, id: u64) -> Option<crate::grasp::SubState> {
-        self.grasp_run.as_ref().filter(|g| g.id == id).map(|g| g.sub.clone())
+    pub fn macro_sub(&self, id: u64) -> Option<SubState> {
+        self.macro_run.as_ref().filter(|m| m.id == id).map(|m| m.sub.clone())
     }
 
-    pub fn set_grasp_phase(&mut self, id: u64, phase: &str, progress: f32, iteration: Option<u32>, error_px: Option<f32>) {
+    /// Set `phase` / `progress` (and centring stats) of the running action `id`.
+    pub fn set_action_phase(&mut self, id: u64, phase: &str, progress: f32, iteration: Option<u32>, error_px: Option<f32>) {
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
             a.phase = Some(phase.into());
             a.progress = progress;
@@ -1713,29 +2012,29 @@ impl SupervisorInner {
         }
     }
 
-    fn grasp_sub_ready(&self, id: u64) -> Result<u64, ArmError> {
-        let run = self.grasp_run.as_ref().filter(|g| g.id == id && self.grasp_alive(id))
-            .ok_or_else(|| ArmError::Internal("grasp is no longer running".into()))?;
-        if run.sub == crate::grasp::SubState::Running {
-            return Err(MotionError::MotionBusy("a grasp motion is running".into()).into());
+    fn macro_sub_ready(&self, id: u64) -> Result<u64, ArmError> {
+        let run = self.macro_run.as_ref().filter(|m| m.id == id && self.macro_alive(id))
+            .ok_or_else(|| ArmError::Internal("the action is no longer running".into()))?;
+        if run.sub == SubState::Running {
+            return Err(MotionError::MotionBusy("a sub-motion of the action is running".into()).into());
         }
         Ok(run.epoch)
     }
 
-    /// Install a planned sub-motion of grasp `id`. Returns its planned duration.
-    pub fn install_grasp_path(&mut self, id: u64, input: &PlanInput, path: JointPath) -> Result<f64, ArmError> {
-        let epoch = self.grasp_sub_ready(id)?;
-        if input.epoch != epoch { return Err(MotionError::PlanStale("epoch changed during the grasp".into()).into()); }
+    /// Install a planned sub-motion of macro action `id`. Returns its planned duration.
+    pub fn install_macro_path(&mut self, id: u64, input: &PlanInput, path: JointPath) -> Result<f64, ArmError> {
+        let epoch = self.macro_sub_ready(id)?;
+        if input.epoch != epoch { return Err(MotionError::PlanStale("epoch changed during the action".into()).into()); }
         self.check_plan_fresh(input)?;
         let duration = self.start_path_motion(input, &path)?;
         self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Path(PathTrajectory::new(path)) });
-        if let Some(g) = self.grasp_run.as_mut() { g.sub = crate::grasp::SubState::Running; }
+        if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
         Ok(duration + 0.5)
     }
 
-    /// Start a gripper sub-motion of grasp `id`. Returns its expected duration.
-    pub fn start_grasp_gripper(&mut self, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
-        let epoch = self.grasp_sub_ready(id)?;
+    /// Start a gripper sub-motion of macro action `id`. Returns its expected duration.
+    pub fn start_macro_gripper(&mut self, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
+        let epoch = self.macro_sub_ready(id)?;
         let Some(policy) = self.config.gripper_policy.clone().filter(|_| self.config.dof >= 7) else {
             return Err(MotionError::Unsupported("Gripper actions need a 7-DOF profile with a gripper policy".into()).into());
         };
@@ -1751,21 +2050,27 @@ impl SupervisorInner {
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
         self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Gripper(motion) });
-        if let Some(g) = self.grasp_run.as_mut() { g.sub = crate::grasp::SubState::Running; }
+        if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
         Ok(duration)
     }
 
-    /// End grasp `id` from its orchestrator (no-op when it already ended).
-    pub fn finish_grasp(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>, holding: Option<bool>, gap: Option<f32>) {
-        if !self.grasp_alive(id) { return; }
+    /// End macro action `id` from its orchestrator (no-op when it already ended).
+    pub fn finish_macro(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>, holding: Option<bool>, gap: Option<f32>) {
+        if !self.macro_alive(id) { return; }
         if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { self.stop_motion(); }
-        if state == "done" { self.set_grasp_phase(id, "done", 1.0, None, None); }
+        if state == "done" { self.set_action_phase(id, "done", 1.0, None, None); }
         self.finish_action(id, state, code, message, None, holding, gap);
     }
 
-    /// `/motion/stop`: also ends a grasp waiting between motions.
-    pub fn request_grasp_stop(&mut self) {
-        if let Some(g) = self.grasp_run.as_mut() { g.stop_requested = true; }
+    /// `/motion/stop`: ends the running macro action now, under the caller's lock, so its
+    /// orchestrator cannot install another sub-motion before the next tick.
+    pub fn request_macro_stop(&mut self) {
+        let Some(m) = self.macro_run.as_mut() else { return; };
+        m.stop_requested = true;
+        let id = m.id;
+        if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { self.stop_motion(); }
+        self.finish_action(id, "cancelled", Some("STOPPED"), Some("Motion stopped".into()), None, None, None);
+        self.macro_run = None;
     }
 
     /// Start a gripper action. Returns (action id, expected duration).
@@ -1796,6 +2101,7 @@ impl SupervisorInner {
     fn reconcile_action(&mut self, dt: f64) {
         let Some(action) = self.last_action.as_ref().filter(|a| a.is_running()) else { return; };
         let (id, kind) = (action.id, action.kind.clone());
+        let is_macro = self.macro_run.as_ref().is_some_and(|m| m.id == id);
         let carried = self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id));
         let lease_now = self.active_lease.as_ref().map(|l| l.generation);
         let cause: Option<(&str, &str, String)> = match self.safety.state() {
@@ -1807,20 +2113,21 @@ impl SupervisorInner {
             _ => None,
         };
         if let Some((state, code, message)) = cause {
-            // a grasp sub-motion must not outlive its grasp
-            if kind == "grasp" && carried { self.stop_motion(); }
+            // a macro sub-motion must not outlive its action
+            if is_macro && carried { self.stop_motion(); }
             self.finish_action(id, state, Some(code), Some(message), None, None, None);
             return;
         }
-        if kind == "grasp" {
+        if let Some(run) = self.macro_run.as_ref().filter(|m| m.id == id) {
+            // between sub-motions the orchestrator owns the action; it ends here only when
+            // something else took the arm or a stop arrived
             if carried { return; }
             let superseded = self.active_trajectory.is_some() || self.servo_target.is_some();
-            let ended: Option<(&str, &str, String)> = match self.grasp_run.as_ref().filter(|g| g.id == id) {
-                None => Some(("failed", "INTERNAL", "Grasp orchestrator ended".into())),
-                Some(_) if superseded => Some(("cancelled", "SUPERSEDED", "Replaced by new motion".into())),
-                Some(g) if g.sub == crate::grasp::SubState::Running || g.stop_requested => Some(("cancelled", "STOPPED", "Motion stopped".into())),
-                Some(_) => None,
-            };
+            let ended: Option<(&str, &str, String)> = if superseded {
+                Some(("cancelled", "SUPERSEDED", "Replaced by new motion".into()))
+            } else if run.sub == SubState::Running || run.stop_requested {
+                Some(("cancelled", "STOPPED", "Motion stopped".into()))
+            } else { None };
             if let Some((state, code, message)) = ended { self.finish_action(id, state, Some(code), Some(message), None, None, None); }
             return;
         }
@@ -1867,9 +2174,9 @@ impl SupervisorInner {
             self.gripper_high_torque_ticks = 0;
             self.gripper_low_torque_ticks = 0;
         }
-        let grasp_sub = self.grasp_run.as_ref().is_some_and(|g| Some(g.id) == action_id);
+        let macro_sub = self.macro_run.as_ref().is_some_and(|m| Some(m.id) == action_id);
         if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
-            if a.id == id && a.is_running() && !grasp_sub { a.progress = out.progress; }
+            if a.id == id && a.is_running() && !macro_sub { a.progress = out.progress; }
         }
         match out.status {
             StepStatus::Running => {}
@@ -1878,9 +2185,9 @@ impl SupervisorInner {
                 self.commanded_velocities.fill(0.0);
                 self.target_positions = self.commanded_positions.clone();
                 self.safety.mark_motion_finished();
-                if grasp_sub {
-                    if let Some(g) = self.grasp_run.as_mut() {
-                        g.sub = crate::grasp::SubState::Done(crate::grasp::SubDone { settled, holding, gripper_gap_rad, at: Instant::now() });
+                if macro_sub {
+                    if let Some(m) = self.macro_run.as_mut() {
+                        m.sub = SubState::Done(SubDone { settled, holding, gripper_gap_rad, at: Instant::now() });
                     }
                 } else if let Some(id) = action_id { self.finish_action(id, "done", None, None, settled, holding, gripper_gap_rad); }
             }
@@ -1897,8 +2204,8 @@ impl SupervisorInner {
                 self.commanded_velocities.fill(0.0);
                 self.target_positions = self.commanded_positions.clone();
                 self.safety.mark_motion_finished();
-                if grasp_sub {
-                    if let Some(g) = self.grasp_run.as_mut() { g.sub = crate::grasp::SubState::Failed { code: code.into(), message }; }
+                if macro_sub {
+                    if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Failed { code: code.into(), message }; }
                 } else if let Some(id) = action_id { self.finish_action(id, "failed", Some(code), Some(message), None, None, None); }
             }
         }
@@ -2026,7 +2333,7 @@ impl SupervisorInner {
         self.active_trajectory = None;
         self.commanded_velocities.fill(0.0);
         self.target_positions = self.commanded_positions.clone();
-        self.safety.trigger_fault(reason);
+        self.safety.trigger_fault_coded(FaultCode::ServoNoBrake, reason);
     }
 
     /// One control tick of the unload settle: the static resting-pose conditions must hold
@@ -2123,13 +2430,13 @@ impl SupervisorInner {
         if invalid_feedback && self.is_torqued && !self.safety.state().is_stopped() {
             self.stop_motion();
             self.commanded_velocities.fill(0.0);
-            self.safety.trigger_fault(FaultReason::Other("Invalid hardware telemetry".into()));
+            self.safety.trigger_fault_coded(FaultCode::InvalidTelemetry, FaultReason::Other("Invalid hardware telemetry".into()));
         }
 
         // A single late tick only shortens integration (dt is clamped below); the motors
         // keep holding their last POS_VEL target meanwhile. Fault on a real stall, using
-        // the same 250 ms bound as the hardware feedback deadline.
-        if (!dt.is_finite() || dt <= 0.0 || dt > 0.250)
+        // CONTROL_DEADLINE (the same 250 ms bound as the hardware feedback deadline).
+        if (!dt.is_finite() || dt <= 0.0 || dt > CONTROL_DEADLINE.as_secs_f64())
             && self.is_torqued && self.safety.state().is_operational() {
             self.stop_motion();
             if self.measured_positions.iter().all(|p| p.is_finite()) {
@@ -2138,7 +2445,7 @@ impl SupervisorInner {
             }
             self.commanded_velocities.fill(0.0);
             self.commanded_accelerations.fill(0.0);
-            self.safety.trigger_fault(FaultReason::Other("Control loop deadline exceeded".into()));
+            self.safety.trigger_fault_coded(FaultCode::ControlDeadline, FaultReason::Other("Control loop deadline exceeded".into()));
         }
         let dt = if dt.is_finite() && dt > 0.0 { dt.min(0.080) } else { 0.020 };
         let before_velocities = self.commanded_velocities.clone();
@@ -2199,27 +2506,33 @@ impl SupervisorInner {
         // 0.2 Compute gravity torques if gravity compensation is enabled, driver feedback is valid, and measured positions available
         let driver_feedback_ok = self.hardware_feedback_fresh(Duration::from_millis(250));
 
-        if self.gravity_output_enabled() && driver_feedback_ok && self.measured_positions.len() >= 6 {
-            let mut q = [0.0f32; 6];
-            q.copy_from_slice(&self.measured_positions[0..6]);
-            match crate::gravity::compute_gravity_torques(&q) {
-                Ok(tau) => {
-                    let all_finite = tau.iter().all(|t| t.is_finite());
-                    if all_finite {
-                        self.gravity_torques = tau.to_vec();
-                    } else {
-                        tracing::warn!("Gravity torque contains non-finite values, zeroing out");
-                        self.gravity_torques.clear();
-                    }
+        // The model torques are computed whenever the profile has a gravity model (for the
+        // residuals); they drive the output only when gravity output is enabled.
+        let arm_dof = self.config.arm_dof();
+        let model_gravity = if self.config.gravity_model.is_some() && self.config.dof >= arm_dof
+            && driver_feedback_ok && self.measured_positions.len() >= arm_dof {
+            match self.config.arm_model.gravity_torques(&self.measured_positions[..arm_dof]) {
+                Ok(tau) if tau.iter().all(|t| t.is_finite()) => Some(tau),
+                Ok(_) => {
+                    tracing::warn!("Gravity torque contains non-finite values, zeroing out");
+                    None
                 }
                 Err(e) => {
                     tracing::warn!("Gravity torque computation error: {:?}", e);
-                    self.gravity_torques.clear();
+                    None
                 }
             }
-        } else {
-            self.gravity_torques.clear();
+        } else { None };
+        match model_gravity.filter(|_| self.gravity_output_enabled()) {
+            Some(tau) => { self.gravity_torques.clear(); self.gravity_torques.extend_from_slice(&tau[..arm_dof]); }
+            None => self.gravity_torques.clear(),
         }
+        let torque_feedback = self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+        self.collision.torque_feedback = torque_feedback;
+        // Residuals and the collision guard are per joint of a 6-joint arm.
+        self.residual_torques = model_gravity.filter(|_| arm_dof == 6 && torque_feedback && self.feedback_numeric_valid && self.torques.len() >= 6)
+            .map(|tau| std::array::from_fn(|i| self.torques[i] - tau[i]))
+            .filter(|r: &[f32; 6]| r.iter().all(|v| v.is_finite()));
 
         // Apply Slew-Rate Limiter (15.0 N·m/s) and safety limits to gravity torques
         if self.gravity_torques_ramped.len() != self.config.dof {
@@ -2271,7 +2584,7 @@ impl SupervisorInner {
                         self.target_positions = hold_pos.clone();
                         self.commanded_positions = hold_pos;
                         self.commanded_velocities = vec![0.0; self.config.dof];
-                        self.safety.trigger_fault(FaultReason::Other(e.to_string()));
+                        self.safety.trigger_fault_coded(FaultCode::HardwareFault, FaultReason::Other(e.to_string()));
                     }
                 }
             }
@@ -2341,7 +2654,7 @@ impl SupervisorInner {
             // The 7-DOF gripper is excluded: Damiao POS_VEL trails its command by about
             // v / 2.2 rad (0.9 rad at 2 rad/s), and gripping an object leaves a lasting
             // error by design. Its own stall detection covers it.
-            let gripper_idx = (self.config.dof >= 7).then_some(6);
+            let gripper_idx = self.config.gripper_index();
             let outside = self.commanded_positions.iter().zip(&self.measured_positions).enumerate()
                 .find(|(i, (q, measured))| Some(*i) != gripper_idx
                     && (!measured.is_finite() || (*q - *measured).abs() > threshold))
@@ -2358,7 +2671,7 @@ impl SupervisorInner {
                     self.target_positions = self.measured_positions.clone();
                     self.commanded_velocities.fill(0.0);
                     self.commanded_accelerations.fill(0.0);
-                    self.safety.trigger_fault(FaultReason::Other(format!(
+                    self.safety.trigger_fault_coded(FaultCode::FollowingError, FaultReason::Other(format!(
                         "Persistent joint tracking error: joint {} cmd {cmd:.3} meas {meas:.3} rad", joint + 1)));
                 }
             } else { self.following_error_since = None; }
@@ -2366,6 +2679,9 @@ impl SupervisorInner {
 
         // Use one integration interval and never integrate a reference twice in a tick.
         let servo_dt = dt.clamp(0.001, 0.1);
+
+        // Collision guard: a trip stops the reference before it is stepped this tick.
+        self.collision_tick(servo_dt);
         let mut reference_stepped = false;
 
         // 3. Step trajectory if active, or step servo target
@@ -2432,7 +2748,7 @@ impl SupervisorInner {
                 // The 7-DOF gripper is exempt: its far targets are expected (POS_VEL needs a
                 // lead to reach speed) and the per-joint servo step below still bounds its
                 // velocity and acceleration.
-                let gripper_idx = (self.config.dof >= 7).then_some(6);
+                let gripper_idx = self.config.gripper_index();
                 let has_dirty_jump = target.iter().enumerate().any(|(i, &tgt)| {
                     if Some(i) == gripper_idx {
                         false
@@ -2546,6 +2862,8 @@ impl SupervisorInner {
                         self.latch_servo_fault(i);
                     } else if let Some(i) = blocked {
                         self.enter_servo_blocked_hold(i, "no progress at the lead cap");
+                    } else if let Err(e) = self.servo_step_keepout(&next_positions) {
+                        self.enter_servo_keepout_hold(&e);
                     } else {
                         self.commanded_positions = next_positions;
                         self.commanded_velocities = next_velocities;
@@ -2600,8 +2918,11 @@ impl SupervisorInner {
                 next_positions[i] = q_next;
                 next_velocities[i] = v_next;
             }
+            let braking = self.commanded_velocities.iter().any(|&v| v != 0.0);
             if let Some(i) = infeasible {
                 self.latch_servo_fault(i);
+            } else if let Some(e) = braking.then(|| self.servo_step_keepout(&next_positions).err()).flatten() {
+                self.enter_servo_keepout_hold(&e);
             } else {
                 self.commanded_positions = next_positions;
                 self.commanded_velocities = next_velocities;
@@ -2686,7 +3007,7 @@ impl SupervisorInner {
                 self.target_positions = self.measured_positions.clone();
             }
             if !self.safety.state().is_stopped() {
-                self.safety.trigger_fault(FaultReason::Other(format!("Control output failed: {error}")));
+                self.safety.trigger_fault_coded(FaultCode::DriverWriteFailed, FaultReason::Other(format!("Control output failed: {error}")));
             }
             tracing::error!("Control output failed: {error}");
         }
@@ -2707,7 +3028,7 @@ impl SupervisorInner {
             } else if settling_since.elapsed() > Duration::from_millis(1500) {
                 self.stop_motion();
                 self.commanded_velocities = vec![0.0; self.config.dof];
-                self.safety.trigger_fault(FaultReason::Other("Handover settling timeout".into()));
+                self.safety.trigger_fault_coded(FaultCode::HandoverUnsettled, FaultReason::Other("Handover settling timeout".into()));
                 self.handover_settling_since = None;
             }
         }
@@ -2734,6 +3055,7 @@ pub struct ArmSupervisor {
     inner: Arc<RwLock<SupervisorInner>>,
     telemetry_tx: broadcast::Sender<ArmObservation>,
     pub e_stop_latched: Arc<AtomicBool>,
+    tick_stats: std::sync::Mutex<crate::diagnostics::tick::TickStats>,
 }
 
 impl ArmSupervisor {
@@ -2746,6 +3068,7 @@ impl ArmSupervisor {
             inner: Arc::new(RwLock::new(inner)),
             telemetry_tx: tx,
             e_stop_latched,
+            tick_stats: std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default()),
         }
     }
 
@@ -2764,10 +3087,12 @@ impl ArmSupervisor {
     }
 
     pub async fn get_schema(&self) -> ObservationSchema {
-        let inner = self.inner.read().await;
-        let mut schema = ObservationSchema::from_config(&inner.config);
-        schema.capabilities.gravity_comp = inner.gravity_comp_support().is_ok();
-        schema
+        self.inner.read().await.schema()
+    }
+
+    /// Records the `--follower` model name for `GET /api/v1/safety/describe`.
+    pub async fn set_follower(&self, name: &str) {
+        self.inner.write().await.follower = Some(name.to_string());
     }
 
     pub async fn get_config(&self) -> ArmConfig {
@@ -3022,12 +3347,22 @@ impl ArmSupervisor {
 
     /// Execute a control cycle step
     pub async fn tick(&self, dt: f64) -> ArmObservation {
-        let obs = {
+        let started = Instant::now();
+        let (obs, lock_held, control_hz) = {
             let mut inner = self.inner.write().await;
-            inner.tick(dt)
+            let locked = Instant::now();
+            let obs = inner.tick(dt);
+            (obs, locked.elapsed(), inner.config.control_frequency_hz)
         };
         // Broadcast observation to any active WebSocket listeners
         let _ = self.telemetry_tx.send(obs.clone());
+        let late = !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1));
+        self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).record(started.elapsed(), lock_held, late);
         obs
+    }
+
+    /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`).
+    pub fn tick_stats(&self) -> crate::diagnostics::tick::TickSnapshot {
+        self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).snapshot()
     }
 }

@@ -41,3 +41,8 @@ pub async fn get_blackbox(Extension(state): Extension<DiagnosticsState>, Query(q
     let prev = q.prev.unwrap_or(0) != 0;
     blocking(move || blackbox_body(&state, seconds, prev)).await
 }
+
+/// `GET /api/v1/diagnostics/tick`: control tick timing over the last 1000 ticks.
+pub async fn get_tick(axum::extract::State(supervisor): axum::extract::State<std::sync::Arc<crate::supervisor::ArmSupervisor>>) -> Response {
+    axum::Json(supervisor.tick_stats()).into_response()
+}

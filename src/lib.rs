@@ -1,17 +1,27 @@
 pub mod api;
+pub mod chain;
+pub mod collision;
 pub mod diagnostics;
 pub mod driver;
 pub mod grasp;
 pub mod gravity;
 pub mod gravity_comp;
+pub mod keepout;
 pub mod kinematics;
+pub mod macro_action;
 pub mod model;
 pub mod motion;
+pub mod persist;
+pub mod place;
+pub mod poses;
 pub mod protocol;
 pub mod recording;
 pub mod safety;
+pub mod safety_describe;
+pub mod sim_driver;
 pub mod supervisor;
 pub mod trajectory;
+pub mod urdf;
 pub mod transport;
 
 pub use api::create_router;
@@ -25,7 +35,7 @@ pub use recording::{
     lerobot_arrow_schema, read_frames_from_parquet, write_frames_to_parquet, EpisodeRecorder,
     EpisodeState, RecordFrame,
 };
-pub use safety::{FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
+pub use safety::{FaultCode, FaultInfo, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
 pub use supervisor::{ArmError, ArmSupervisor, PreemptError, SupervisorInner};
 pub use trajectory::{
     MultiJointQuinticTrajectory, QuinticPolynomial, TrajectoryError, TrajectoryPlanner,

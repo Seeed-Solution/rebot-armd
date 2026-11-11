@@ -11,6 +11,9 @@ async fn rebot_dm_schema_declares_its_features() {
     assert_eq!(caps.version, CAPABILITIES_VERSION);
     assert_eq!(caps.profile_version, ARM_PROFILE_VERSION);
     assert!(caps.cartesian && caps.workspace_check && caps.gripper && caps.grasp && caps.damiao_ranges);
+    assert_eq!(caps.version, 6);
+    assert!(caps.obs_rate && caps.fault_codes && caps.poses && caps.keepout && caps.speed_cap
+        && caps.residual_torques && caps.tick_stats && caps.place && caps.safety_describe);
     assert!(caps.vision.detection_proxy);
     assert_eq!(caps.vision.mode_endpoint, "/api/v1/vision/mode");
     assert!(caps.vision.modes.is_empty() && caps.vision.mode.is_none(), "provider fields come from the API layer");
@@ -23,6 +26,8 @@ async fn generic_profile_declares_no_arm_features() {
     let supervisor = ArmSupervisor::new(ArmConfig::default());
     let caps = supervisor.get_schema().await.capabilities;
     assert!(!caps.cartesian && !caps.workspace_check && !caps.gripper && !caps.grasp && !caps.gravity_comp && !caps.damiao_ranges);
+    assert!(!caps.keepout && !caps.residual_torques, "need the workspace check / a gravity model");
+    assert!(caps.obs_rate && caps.fault_codes && caps.poses && caps.speed_cap && caps.tick_stats && caps.safety_describe);
     assert_eq!(caps.gravity_comp, supervisor.get_observation().await.gravity_comp.supported);
 }
 

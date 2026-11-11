@@ -1,0 +1,138 @@
+#!/bin/sh
+# rebot-app-user: creates the system user (and group) that rebot-app-run runs user programs as.
+# Called by the package's postinst; idempotent (a complete, unprivileged account is left as
+# it is).
+# - User/group: $REBOT_APP_USER (default rebot-app), system uid/gid (highest free id in
+#   100..999), no password (locked), no login shell (/sbin/nologin, else /bin/false), home
+#   $REBOT_APPS_DIR (default /userdata/rebot-apps, not created here).
+# - Method: BusyBox addgroup/adduser -S when the real /etc/passwd and /etc/group are used and
+#   adduser exists; otherwise (or when adduser fails) a line is appended to the passwd, group
+#   and shadow files. /etc is an overlay on the device, so the files persist.
+# - Lock: runs are serialised with flock on $REBOT_APP_LOCK (default
+#   /run/rebot-app-user.lock, /var/run without /run) when flock exists, else with the directory $REBOT_APP_LOCK.d
+#   (mkdir is atomic; /run is cleared at boot, so a lock left by a killed run goes away with a
+#   reboot or is removed by hand). Waits at most $REBOT_APP_LOCK_WAIT s (default 30), exit 1.
+# - Repair: a partial account from an interrupted run is completed: a missing group gets the
+#   gid of the passwd entry, a missing passwd entry the gid of the group, a missing shadow
+#   entry (when the shadow file exists) a locked one.
+# - Refused (exit 3, nothing written): an existing account with uid 0, primary gid 0 or the
+#   gid of root / wheel / sudo / adm, or listed as a member of one of those groups.
+# - Files, for tests: REBOT_APP_PASSWD, REBOT_APP_GROUP, REBOT_APP_SHADOW (setting any of them
+#   selects the append method; the shadow file is only written when it exists).
+# - Not touched: the user is never removed (prerm/postrm keep it, so files it owns keep a
+#   stable owner), and group memberships for GPIO / serial devices are a manual step.
+
+APP_USER=${REBOT_APP_USER:-rebot-app}
+APPS_DIR=${REBOT_APPS_DIR:-/userdata/rebot-apps}
+PASSWD=${REBOT_APP_PASSWD:-/etc/passwd}
+GROUP=${REBOT_APP_GROUP:-/etc/group}
+SHADOW=${REBOT_APP_SHADOW:-/etc/shadow}
+RUN_DIR=/run; [ -d "$RUN_DIR" ] || RUN_DIR=/var/run
+LOCK=${REBOT_APP_LOCK:-$RUN_DIR/rebot-app-user.lock}
+LOCK_WAIT=${REBOT_APP_LOCK_WAIT:-30}
+PRIV_GROUPS="root wheel sudo adm"
+
+case "$APP_USER" in
+    ''|root|*[!a-z0-9_-]*) echo "rebot-app-user: invalid user name '$APP_USER'" >&2; exit 2 ;;
+esac
+
+has_entry() { [ -f "$2" ] && grep -q "^$1:" "$2"; }
+
+# free_id: highest id in 100..999 used neither as uid in $PASSWD nor as gid in $GROUP
+free_id() {
+    used=$(cut -d: -f3 "$PASSWD" "$GROUP" 2>/dev/null)
+    id=999
+    while [ "$id" -ge 100 ]; do
+        printf '%s\n' "$used" | grep -qx "$id" || { echo "$id"; return 0; }
+        id=$((id - 1))
+    done
+    return 1
+}
+
+SHELL_PATH=/bin/false
+[ -x /sbin/nologin ] && SHELL_PATH=/sbin/nologin
+
+# field <name> <file> <n>: field n of the entry <name> in <file>
+field() { [ -f "$2" ] && awk -F: -v n="$1" -v f="$3" '$1 == n { print $f; exit }' "$2"; }
+
+# lock: serialise concurrent runs (see the header)
+lock() {
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$LOCK" || { echo "rebot-app-user: cannot open lock $LOCK" >&2; exit 1; }
+        flock -w "$LOCK_WAIT" 9 || { echo "rebot-app-user: lock $LOCK busy" >&2; exit 1; }
+        return 0
+    fi
+    n=$((LOCK_WAIT * 10))
+    until mkdir "$LOCK.d" 2>/dev/null; do
+        n=$((n - 1))
+        [ "$n" -gt 0 ] || { echo "rebot-app-user: lock $LOCK.d busy (remove it if no run is active)" >&2; exit 1; }
+        sleep 0.1
+    done
+    trap 'rmdir "$LOCK.d" 2>/dev/null' EXIT
+    trap 'exit 1' INT TERM HUP
+}
+
+# check_unprivileged: refuse (exit 3) an existing account that has root / admin rights
+check_unprivileged() {
+    uid=$(field "$APP_USER" "$PASSWD" 3)
+    pgid=$(field "$APP_USER" "$PASSWD" 4)
+    if [ -n "$uid" ] && [ "$uid" = 0 ]; then
+        echo "rebot-app-user: existing user $APP_USER has uid 0; refusing" >&2; exit 3
+    fi
+    for g in $PRIV_GROUPS; do
+        ggid=$(field "$g" "$GROUP" 3)
+        if [ -n "$pgid" ] && { [ "$pgid" = 0 ] || [ "$pgid" = "$ggid" ]; }; then
+            echo "rebot-app-user: existing user $APP_USER has primary group $pgid (privileged); refusing" >&2; exit 3
+        fi
+        if field "$g" "$GROUP" 4 | tr ',' '\n' | grep -qx "$APP_USER"; then
+            echo "rebot-app-user: existing user $APP_USER is a member of $g; refusing" >&2; exit 3
+        fi
+    done
+    gid=$(field "$APP_USER" "$GROUP" 3)
+    if [ -n "$gid" ] && [ "$gid" = 0 ]; then
+        echo "rebot-app-user: existing group $APP_USER has gid 0; refusing" >&2; exit 3
+    fi
+}
+
+complete() {
+    has_entry "$APP_USER" "$PASSWD" && has_entry "$APP_USER" "$GROUP" \
+        && { [ ! -f "$SHADOW" ] || has_entry "$APP_USER" "$SHADOW"; }
+}
+
+lock
+check_unprivileged
+complete && exit 0
+
+custom=0
+[ -n "$REBOT_APP_PASSWD$REBOT_APP_GROUP$REBOT_APP_SHADOW" ] && custom=1
+
+if [ "$custom" -eq 0 ] && command -v adduser >/dev/null 2>&1 && command -v addgroup >/dev/null 2>&1; then
+    has_entry "$APP_USER" "$GROUP" || addgroup -S "$APP_USER" 2>/dev/null
+    has_entry "$APP_USER" "$PASSWD" || adduser -S -D -H -h "$APPS_DIR" -s "$SHELL_PATH" -G "$APP_USER" "$APP_USER" 2>/dev/null
+fi
+
+# append method, also to repair what an interrupted run or adduser left out
+uid=$(field "$APP_USER" "$PASSWD" 3)
+gid=$(field "$APP_USER" "$GROUP" 3)
+if [ -z "$gid" ]; then
+    if [ -n "$uid" ]; then
+        gid=$(field "$APP_USER" "$PASSWD" 4)  # the passwd entry names its gid
+    else
+        gid=$(free_id) || { echo "rebot-app-user: no free system id" >&2; exit 1; }
+    fi
+    printf '%s:x:%s:\n' "$APP_USER" "$gid" >> "$GROUP" || exit 1
+fi
+if [ -z "$uid" ]; then
+    if cut -d: -f3 "$PASSWD" 2>/dev/null | grep -qx "$gid"; then
+        uid=$(free_id) || { echo "rebot-app-user: no free system id" >&2; exit 1; }
+    else
+        uid=$gid
+    fi
+    printf '%s:x:%s:%s:rebot user programs:%s:%s\n' "$APP_USER" "$uid" "$gid" "$APPS_DIR" "$SHELL_PATH" >> "$PASSWD" || exit 1
+fi
+if [ -f "$SHADOW" ] && ! has_entry "$APP_USER" "$SHADOW"; then
+    printf '%s:!:0:0:99999:7:::\n' "$APP_USER" >> "$SHADOW" || exit 1
+fi
+check_unprivileged
+complete || { echo "rebot-app-user: account $APP_USER still incomplete" >&2; exit 1; }
+exit 0

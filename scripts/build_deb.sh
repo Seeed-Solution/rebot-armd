@@ -14,6 +14,8 @@ set -euo pipefail
 #                      rebot-vision: REBOT_VISION_BIN=<prebuilt binary>, or
 #                      RECAMERA_DOCKER=<tpuc_dev container> to build it with
 #                      scripts/build_vision.sh (see that script for the paths)
+#                      REBOT_SDK_DIR=<rebot-companion checkout>: its rebot/ Python
+#                      package goes to /usr/share/rebot-teleop/python (required)
 #   --flavor lite      core only: the armd binary with LICENSE and
 #                      THIRD_PARTY_NOTICES.md, no init script, no kit files
 #                      -> dist/armd-lite_<VERSION>_riscv64.tar.gz
@@ -31,7 +33,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --flavor) FLAVOR="${2:-}"; shift 2 ;;
         --flavor=*) FLAVOR="${1#--flavor=}"; shift ;;
-        -h|--help) sed -n '4,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help) sed -n '4,23p' "${BASH_SOURCE[0]}"; exit 0 ;;
         -*) echo "Error: unknown option $1" >&2; exit 1 ;;
         *) CUSTOM_VERSION="$1"; shift ;;
     esac
@@ -40,6 +42,12 @@ case "$FLAVOR" in
     recamera|lite) ;;
     *) echo "Error: --flavor must be recamera or lite (got '${FLAVOR}')" >&2; exit 1 ;;
 esac
+# The recamera deb runs user programs that import the rebot SDK; lite has no SDK.
+if [ "$FLAVOR" = "recamera" ] && { [ -z "${REBOT_SDK_DIR:-}" ] || [ ! -d "${REBOT_SDK_DIR}/rebot" ]; }; then
+    echo "Error: the recamera flavor needs the rebot Python SDK: set REBOT_SDK_DIR=<rebot-companion checkout>" >&2
+    echo "       (a directory with rebot/; got '${REBOT_SDK_DIR:-}')." >&2
+    exit 1
+fi
 
 # SG2002 RISC-V musl toolchain (sophgo host-tools: gcc/riscv64-linux-musl-x86_64).
 # Only its T-Head (lib64v0p7_xthead/lp64d) libraries are used; rust-lld links.
@@ -175,6 +183,19 @@ chmod 0755 "${STAGING_DIR}/etc/init.d/K92rebot-teleop"
 
 cp -r "${PACKAGING_DIR}/rootfs/usr/share/rebot-teleop/"* "${STAGING_DIR}/usr/share/rebot-teleop/"
 
+# rebot Python SDK (stdlib only) for user programs run by rebot-app-run: the rebot/ package
+# of a rebot-companion checkout (REBOT_SDK_DIR), without __pycache__
+{
+    SDK_DEST="${STAGING_DIR}/usr/share/rebot-teleop/python"
+    mkdir -p "${SDK_DEST}"
+    (cd "${REBOT_SDK_DIR}" && find rebot -name __pycache__ -prune -o -type f ! -name '*.pyc' -print) |
+        while IFS= read -r f; do
+            mkdir -p "${SDK_DEST}/$(dirname "$f")"
+            cp -f "${REBOT_SDK_DIR}/$f" "${SDK_DEST}/$f"
+        done
+    echo "      rebot Python SDK copied from ${REBOT_SDK_DIR}/rebot"
+}
+
 # Arm profile of the kit (loaded by the init script with --config)
 mkdir -p "${STAGING_DIR}/usr/share/rebot-teleop/profile"
 cp -f "${REPO_ROOT}/kits/recamera-b601dm/profile/rebot-b601dm.json" "${STAGING_DIR}/usr/share/rebot-teleop/profile/rebot-b601dm.json"
@@ -193,6 +214,8 @@ if ! grep -q "^  \"version\": \"${VERSION}\"," "${MANIFEST}"; then
 fi
 find "${STAGING_DIR}/usr/share/rebot-teleop" -type f -exec chmod 0644 {} +
 chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-vision-run"
+chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-app-run"
+chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-app-user"
 
 # rebot-vision and the licence notices for the code it contains
 cp -f "${VISION_BIN}" "${STAGING_DIR}/usr/bin/rebot-vision"

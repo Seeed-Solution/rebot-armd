@@ -153,3 +153,23 @@ fn blackbox_cpu_cost() {
     println!("per line write+fdatasync: cpu {per_sync_write:?}, wall {per_sync_wall:?}; write only: {per_write:?}");
     println!("CPU per second: torqued {torqued:?} ({:.4} %), idle {idle:?} ({:.4} %)", torqued.as_secs_f64() * 100.0, idle.as_secs_f64() * 100.0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tick_route_reports_timing_and_late_ticks() {
+    let supervisor = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    for _ in 0..20 { supervisor.tick(0.02).await; }
+    // 50 Hz: a tick later than 2 periods (40 ms) counts as late.
+    supervisor.tick(0.05).await;
+    supervisor.tick(0.039).await;
+    let addr = serve(supervisor, DiagnosticsState::default()).await;
+    let body: serde_json::Value = reqwest::get(format!("http://{addr}/api/v1/diagnostics/tick")).await.unwrap().json().await.unwrap();
+    assert_eq!(body["window"], 22);
+    assert_eq!(body["since_boot_ticks"], 22);
+    assert_eq!(body["late_count"], 1);
+    for key in ["tick_us", "lock_us"] {
+        let p = &body[key];
+        let (p50, p99, max) = (p["p50"].as_u64().unwrap(), p["p99"].as_u64().unwrap(), p["max"].as_u64().unwrap());
+        assert!(p50 <= p99 && p99 <= max, "{key}: {p}");
+    }
+    assert!(body["lock_us"]["max"].as_u64().unwrap() <= body["tick_us"]["max"].as_u64().unwrap());
+}

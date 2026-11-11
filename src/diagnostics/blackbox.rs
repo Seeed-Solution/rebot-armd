@@ -81,6 +81,11 @@ struct Record<'a> {
     velocities: R3<'a>,
     torques: R3<'a>,
     temperatures: R3<'a>,
+    /// Measured minus model gravity torque, J1..J6; null when unavailable.
+    residual_torques: Option<R3<'a>>,
+    /// Collision guard state (trip joint, residual, hold); omitted while the guard is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collision: Option<&'a crate::collision::CollisionObservation>,
     feedback_valid: bool,
     feedback_age_ms: &'a [Option<u64>],
     motor_errors: &'a [Option<crate::model::MotorError>],
@@ -106,6 +111,8 @@ pub fn record_line(boot: u64, t_ms: u64, dropped: u64, obs: &ArmObservation) -> 
         velocities: R3(&obs.velocities),
         torques: R3(&obs.torques),
         temperatures: R3(&obs.temperatures),
+        residual_torques: obs.residual_torques.as_ref().map(|r| R3(r)),
+        collision: obs.collision.as_ref(),
         feedback_valid: obs.feedback_valid,
         feedback_age_ms: &obs.feedback_age_ms,
         motor_errors: &obs.motor_errors,
@@ -283,10 +290,14 @@ mod tests {
         assert_eq!(v["velocities"][0], 0.123);
         assert_eq!(v["positions"].as_array().unwrap().len(), 7);
         assert_eq!(v["dropped"], 2);
-        for key in ["safety_state", "torques", "temperatures", "feedback_age_ms", "motor_errors", "motion_limit", "action"] {
+        for key in ["safety_state", "torques", "temperatures", "residual_torques", "feedback_age_ms", "motor_errors", "motion_limit", "action"] {
             assert!(v.get(key).is_some(), "{key}");
         }
         assert!(line.len() < 1024, "{} bytes", line.len());
+        o.residual_torques = Some([0.5, -1.25, 0.0, 0.0, 0.0, 0.1234]);
+        let v: serde_json::Value = serde_json::from_str(&record_line(7, 1234, 2, &o)).unwrap();
+        assert_eq!(v["residual_torques"][1], -1.25);
+        assert_eq!(v["residual_torques"][5], 0.123);
     }
 
     struct Collect(Arc<Mutex<Vec<(String, bool)>>>);

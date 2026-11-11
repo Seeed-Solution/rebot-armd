@@ -43,7 +43,8 @@
 
 - 单文件网页驾驶舱，适用于手机、平板和桌面（摇杆、笛卡尔控制、摄像头视频、识别叠加、手眼标定、点框抓取）；
 - 用于观测的 REST API 和用于控制的 WebSocket API，执行器指令只接受持有控制租约的连接；
-- 面向 agent 的高层动作（`move_to`、`move_relative`、`gripper`、`grasp`），由 [rebot-companion](https://github.com/Seeed-Solution/rebot-companion) 及其 MCP 服务器使用；
+- 面向 agent 的高层动作（`move_to`、`move_relative`、`gripper`、`grasp`、基于命名姿态的 `move_to_pose`），由 [rebot-companion](https://github.com/Seeed-Solution/rebot-companion) 及其 MCP 服务器使用；
+- 客户端无法放宽的服务端限制：含禁入盒的笛卡尔工作空间与 profile 速度上限；故障带机器可读的故障码；
 - 把关节状态与指令录制为 Parquet 文件；
 - 目标检测（YOLO，跑在 TPU）与带 3D 位姿的 ArUco 标记（跑在 CPU），只在调用方请求时运行（[视觉](#视觉recamera-套件)）；
 - 用于拖动示教的重力补偿模式，已在 B601-DM 上实机验证。
@@ -105,6 +106,8 @@
 `mock`（进程内仿真，默认值）用于测试和无机械臂时的界面开发。
 
 验证中驱动的协议编码由单元测试覆盖（`tests/test_protocol_vectors.rs`、`tests/test_driver_capabilities.rs`）。它们使用通用 6 关节 profile，没有运动学和工作空间，笛卡尔动作返回 `UNSUPPORTED`。达妙驱动另有带重力前馈的 MIT 模式，但只能在代码中启用（`DamiaoArmDriver::with_control_mode`），命令行和 profile 都不能选择。重力补偿模式在运行时把 J1–J6 切到 MIT 再切回（见[网页驾驶舱](#网页驾驶舱)），该切换已在 B601-DM 上实机验证。
+
+其他机械臂可以从 profile 指定的 URDF 获取运动学和重力模型（`"kinematics": "Urdf"`，字段 `urdf`、`chain`；见 [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md)）。`profiles/rebot_b601_rs.json` 为 B601-RS 提供这样的 profile（`--follower rebot-rs --config profiles/rebot_b601_rs.json`）：FK 和重力在测试中与 RS 的 MuJoCo 模型和 URDF 对比；关节方向、零位偏置、限位和质量未在真实机械臂上验证。它有 6 个手臂关节、没有夹爪关节，因此有工作空间检查和重力模型，没有笛卡尔动作。
 
 TODO / 路线图：
 
@@ -170,6 +173,8 @@ armd 之后 init 脚本启动 `rebot-vision`（nice 10，由 `/usr/share/rebot-t
 
 热点默认使用 5 GHz（`network.ap_band: "5g"`，信道 44，802.11n/ac，20 MHz 带宽）。把 `network.ap_band` 设为 `"2g4"` 改用 2.4 GHz（信道 6）。`network.ap_channel` 指定信道，`0` 或不设置时使用默认信道。启动后若 hostapd 未在 5 GHz 信道上运行（用 `iw dev wlan1 info` 检查），init 脚本改用 2.4 GHz 信道 6 重新启动，并把回退记录到 syslog。
 
+设备没有 Wi-Fi 网卡（没有 `wlan0`/`wlan1`，例如 PoE 版本）时，init 脚本跳过 Wi-Fi 联网、热点及热点守护，并记录到 syslog；通过有线网络访问 armd。
+
 安装或升级后，若本应用是控制台当前的活动应用（或设备没有控制台），`postinst` 会启动它。驾驶舱地址：`http://<摄像头地址>:8765/`。
 
 armd 通过 `http://127.0.0.1:8090` 访问视觉进程（可用 `ARMD_DETECTOR_URL` 修改）。`--flavor lite` 不含视觉进程，此时识别、标定和抓取不可用，驾驶舱其他功能正常。
@@ -229,7 +234,7 @@ v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 
 ## 网页驾驶舱
 
-`src/api/index.html` 是不依赖外部资源的单个 HTML 文件，嵌入二进制并在 `/` 提供。JMuxer（`/assets/jmuxer.min.js`）播放摄像头视频。界面支持中文和英文（页头切换）。
+`src/api/index.html` 是不依赖外部资源的单个 HTML 文件，嵌入二进制并在 `/` 提供。JMuxer（`/assets/jmuxer.min.js`）播放摄像头视频。3D 视图用的 three.js + urdf-loader 包（`/assets/three-urdf.min.js`，gzip 后 149 KB）也嵌入二进制，只在打开 3D 视图时下载。界面支持中文和英文（页头切换）。
 
 <p align="center">
   <img src="docs/images/cockpit-phone-landscape.jpg" alt="手机横屏驾驶舱：实时视频叠加摇杆、使能、急停和状态" width="49%">
@@ -247,7 +252,10 @@ v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 - **手眼标定抽屉**：眼在手上（摄像头装在夹爪上）或眼在手外（固定摄像头），使用 ArUco 标记；采集位姿、求解、导出 rebot-companion 的 `HandEyeCalibration.load_result` 可读取的 JSON。
 - **点框抓取**：开启识别后点一个框并确认，armd 执行 `grasp` 动作（张开、俯视接近、闭环图像对中、J6 对齐 0° / 90°、下降、夹紧并判定、抬起）。任何摇杆、按键、停止或急停都会中止。抓取设置（桌面高度、夹爪位置像素、接近与抓取高度、相机俯角）由 armd 保存。目前只在仿真和截图测试中验证过；需要在真机上确认的项目见 [docs/plan_tap_to_grasp.md](docs/plan_tap_to_grasp.md)。
 - **重力补偿 / 拖动示教**：按住开关 0.6 秒，J1–J6 进入漂浮状态（MIT 模式，kp = 0，带阻尼，以 URDF 重力力矩为前馈，1 秒内渐入）；夹爪保持位置控制。开启期间摇杆、按键和预设不发送指令，夹爪按键发送张开 / 闭合动作，横幅显示渐入进度、录制开关和退出按钮。退出、停止、急停、租约丢失、故障、反馈超时、超速等退出原因都会在实测位姿锁定机械臂，并以提示条显示原因。超速阈值：J1–J3 为 1.5 rad/s，J4–J6 为 3.0 rad/s。在 B601-DM 上测试的五种退出方式（退出、停止、接管、急停、客户端断开）均把机械臂保持在 1.5 mrad 以内；一段 30 秒拖动示教录制得到 1509 帧。
-- **急停**按钮、故障显示与清除、长按使能力矩、收纳。
+- **急停**按钮、故障显示与清除、长按使能力矩、收纳。armd 提供 `capabilities.fault_codes` 时，故障显示用一句话说明 `observation.fault.code`，并给出清除前要检查的内容（例如 `BUS_LOSS`：检查电机线缆和电源）。
+- **碰撞保护**（仅在 `capabilities.collision_guard` 为 true 时显示）：`observation.collision.active` 期间，顶部红色横幅显示受阻关节、残余力矩和自动恢复倒计时，不能关闭；保护期间状态显示「碰撞保护中」，点动、摇杆、预设、回零、夹爪和点位「前往」被锁定，急停和使能开关仍可用；碰撞保护关闭时灵敏度按钮不可点；升级为 `COLLISION` 故障后显示清除故障按钮。设置抽屉（顶栏齿轮）可开关碰撞保护并选择灵敏度（低 / 中 / 高）；阈值尚未在机械臂上标定。专家模式显示 J1–J6 残余力矩条（低于阈值 50 % 为绿色，50–100 % 为黄色，触发时为红色）。
+- **3D 视图**（视频上的「3D」按钮）：按 `reBot-DevArm_gripper.urdf` 绘制机械臂，实测关节角为实体，`commanded_positions` 为半透明蓝色（与实测不同时显示），另有地面网格、工作空间框、禁入盒（`GET /api/v1/workspace/keepout`）和已存点位（橙色圆点）。拖动旋转，双指或滚轮缩放。J1–J6 电机角即 URDF 角；J7 按 `gripper_policy` 的 `closed_rad` 到 `open_rad` 映射为手指行程（0–42.5 mm）。armd 从资源目录（`assets/`，否则 `/usr/share/rebot-teleop/assets/`，或 `ARMD_ASSET_DIR`）只读提供 URDF 和网格，路径 `/assets/model/`；套件 `.deb` 安装 34 个简化后的 B601-DM 网格（2.8 MB）。没有网格时（lite 包）显示经过 URDF 关节坐标系的骨架。最多每秒渲染 30 帧，只在姿态、方框或视角变化时渲染。在 `tests/fixtures/fk_points.json` 的各点上，渲染的 `end_link` 与 armd `kinematics::fk` 相差不超过 0.001 mm（`scripts/view3d_shots.mjs`）。
+- **点位抽屉**（仅在 `capabilities.poses` 为 true 时显示）：用名称（`^[A-Za-z0-9_-]{1,64}$`）记录当前位置，按驾驶舱速度前往已存点位（`move_to_pose` 动作），或删除点位。
 
 驾驶舱打开时不取得租约，在第一次控制输入（点动、摇杆、按键、笛卡尔输入、预设、使能、夹爪、抓取、重力补偿、收纳或回零）时取得；30 秒无输入后释放，且仅在力矩关闭、没有动作、重力补偿、串流或运动时释放（力矩开启时释放租约，armd 会让机械臂回到停靠位）。因此驾驶舱页面打开时，智能体也能取得租约。其他客户端持有租约时，驾驶舱切换为观察模式，按观测中的 `lease_holder` 显示持有者（另一个驾驶舱页面、AI 智能体 `rebot-mcp` 或该客户端的标签），并提供需确认的接管操作。急停不需要租约。
 
@@ -281,13 +289,15 @@ v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 
 | 路径 | 方法 | 用途 |
 |---|---|---|
-| `/api/v1/observation` | GET | 位置、速度、力矩、温度、安全状态、`commanded_positions`、最近的 `action`、驱动能力、`driver_range_check`（启动时从电机读出的达妙映射范围）、`motion_limit`（正在作用的 servo 限速 / 领先量上限、关节限位、工作空间或受阻保持；[契约](docs/control_safety_contract.md#servo-streaming-guard--流式控制保护)）、`motor_errors`（各关节电机错误码） |
-| `/api/v1/observation/schema` | GET | 自由度、关节名、限位、工作空间、相机安装参数、`capabilities`（[字段](docs/architecture.zh-CN.md#3-能力发现)） |
-| `/api/v1/ws` | WS | 租约（`acquire_lease`、`heartbeat`）、`command` / `command_ack` / `command_reject`、遥测 |
+| `/api/v1/observation` | GET | 位置、速度、力矩、温度、安全状态、`commanded_positions`、最近的 `action`、驱动能力、`driver_range_check`（启动时从电机读出的达妙映射范围）、`motion_limit`（正在作用的 servo 限速 / 领先量上限、关节限位、工作空间或受阻保持；[契约](docs/control_safety_contract.md#servo-streaming-guard--流式控制保护)）、`motor_errors`（各关节电机错误码）、`fault`（Fault / EStop 时为 `{code, message, recoverable}`）、`residual_torques`（实测力矩减模型重力力矩，J1..J6） |
+| `/api/v1/observation/schema` | GET | 自由度、关节名、限位、工作空间、相机安装参数、`speed_cap`、`capabilities`（[字段](docs/architecture.zh-CN.md#3-能力发现)） |
+| `/api/v1/ws` | WS | 租约（`acquire_lease`、`heartbeat`）、`command` / `command_ack` / `command_reject`、遥测；`?obs_hz=N` 把该连接的遥测限制为每秒 N 条 |
 | `/api/v1/safety/e_stop` | POST | 急停，不需要租约 |
 | `/api/v1/torque`、`/api/v1/motion/*`、`/api/v1/action/*`、`/api/v1/mode/gravity_comp`、`/api/v1/safety/clear_fault` | POST | 返回 `409 LEASE_REQUIRED`；请把相同路径作为 WS `command` 发送 |
 | `/api/v1/grasp/setup` | GET | 抓取设置（通过 WS 指令修改） |
-| `/api/v1/diagnostics/boots`、`/api/v1/diagnostics/blackbox?seconds=N[&prev=1]` | GET | 启动记录与黑匣子记录（复位前的状态），无需租约（[格式](docs/agent_action_api.md#diagnostics--诊断)） |
+| `/api/v1/poses` | GET | 命名姿态（通过 WS 指令保存、删除，供 `move_to_pose` 动作使用；[格式](docs/agent_action_api.md#named-poses--命名姿态)） |
+| `/api/v1/workspace/keepout` | GET | 生效的禁入盒，每个标注 `profile` 或 `runtime`（运行时列表通过 WS 指令设置，只能增加禁入盒） |
+| `/api/v1/diagnostics/boots`、`/api/v1/diagnostics/blackbox?seconds=N[&prev=1]`、`/api/v1/diagnostics/tick` | GET | 启动记录、黑匣子记录（复位前的状态）与控制周期耗时，无需租约（[格式](docs/agent_action_api.md#diagnostics--诊断)） |
 | `/api/v1/dataset/record/start` / `save` / `discard` | POST | 示教片段录制 |
 | `/api/v1/detection/latest`、`/trigger`、`/inference`、`/ws` | GET / POST / WS | 检测服务代理 |
 
@@ -302,7 +312,7 @@ WebSocket 时序：
 
 参考文档：
 
-- [docs/agent_action_api.md](docs/agent_action_api.md)：`move_to`、`move_relative`（基座、工具、相机坐标系）、`gripper`、`grasp`、重力补偿模式指令、动作状态与错误码；
+- [docs/agent_action_api.md](docs/agent_action_api.md)：`move_to`、`move_relative`（基座、工具、相机坐标系）、`gripper`、`grasp`、`move_to_pose` 与命名姿态、禁入盒、重力补偿模式指令、动作状态、故障码与错误码；
 - [docs/control_safety_contract.md](docs/control_safety_contract.md)：租约、epoch、驱动能力、时序默认值、限速、工作空间；
 - [docs/detection_api.md](docs/detection_api.md)：识别路由与 agent 调用示例。
 
@@ -353,7 +363,7 @@ armd [OPTIONS]
 
 日志同时输出到 stdout。日志或黑匣子目录无法创建或写入时，armd 记一条警告并在没有该功能的情况下运行。黑匣子：每个采样一行 JSON（上力矩或关节运动时 5 Hz，否则每 5 s 一行；上力矩时每行 `fdatasync`），512 KiB x 3 个文件；每次启动在 `boots.log` 追加一行，含上一次启动的最后一条记录。详见 [docs/agent_action_api.md](docs/agent_action_api.md#diagnostics--诊断)。
 
-环境变量：`RUST_LOG`（日志过滤，默认 `armd=info,tower_http=info`）、`PORT`、`ARMD_DETECTOR_URL`（默认 `http://127.0.0.1:8090`）、`ARMD_GRASP_SETUP`（抓取设置文件，默认 `/userdata/rebot-teleop/grasp_setup.json`）、`ARMD_LOG_DIR`、`ARMD_BLACKBOX_DIR`。
+环境变量：`RUST_LOG`（日志过滤，默认 `armd=info,tower_http=info`）、`PORT`、`ARMD_DETECTOR_URL`（默认 `http://127.0.0.1:8090`）、`ARMD_GRASP_SETUP`（抓取设置文件，默认 `/userdata/rebot-teleop/grasp_setup.json`）、`ARMD_KEEPOUT`（运行时禁入盒，默认 `/userdata/rebot-teleop/keepout.json`）、`ARMD_POSES`（命名姿态，默认 `/userdata/rebot-teleop/poses.json`）、`ARMD_COLLISION`（碰撞保护设置，默认 `/userdata/rebot-teleop/collision.json`）、`ARMD_LOG_DIR`、`ARMD_BLACKBOX_DIR`。
 
 不带 `--config` 时，`rebot-dm` 使用内置 B601-DM profile（`src/model.rs` 中的 `ArmConfig::rebot_dm()`），其他 follower 使用通用 6 关节 profile。`--config` 文件是完整的 `ArmConfig` JSON。同一份 B601-DM profile 以数据形式放在 [`kits/recamera-b601dm/profile/rebot-b601dm.json`](kits/recamera-b601dm/profile/rebot-b601dm.json)（有测试保证它与 `rebot_dm()` 一致）；deb 把它安装到 `/usr/share/rebot-teleop/profile/rebot-b601dm.json`，follower 为 `rebot-dm` 时 init 脚本用 `--config` 传入。以下为 rebot-dm 取值的节选：
 
@@ -416,7 +426,7 @@ node tests/test_rpc_error_contract.js      # 驾驶舱 RPC 错误处理
 
 CI（`.github/workflows/ci.yml`）运行以上检查，并对套件 init 脚本执行 `sh -n`。未强制 `cargo fmt --check`：代码尚未按 rustfmt 格式化。RISC-V 交叉编译不在 CI 中，因为它需要 SG2002 工具链的库文件。`test_damiao_smoothness::stale_posvel_gripper_recovery_uses_posvel_frame` 对时序敏感，机器负载高时可能失败，重跑即可。
 
-Playwright 脚本（`scripts/*_shots.mjs`、`scripts/ux_walkthrough.mjs`、`tests/test_*_playwright.js`、`tests/test_single_origin_e2e.js`）用于驾驶舱截图；需要 Playwright（可用 `PLAYWRIGHT=<模块路径>` 指定）和 Chromium（`CHROME=<路径>`），部分脚本需要运行中的 armd。`scripts/*_shots.mjs` 写到 `.cache/`（或 `OUT`），`tests/*.js` 写到 `tests/artifacts/`，两者都已被 git 忽略。`scripts/` 中的 Python 脚本用于台架诊断：有的直接向电机发送 CAN 帧，有的通过 API 驱动运行中的 armd。只在机械臂有支撑、工作区已清空时运行。
+Playwright 脚本（`scripts/*_shots.mjs`、`scripts/ux_walkthrough.mjs`、`tests/test_*_playwright.js`、`tests/test_single_origin_e2e.js`）用于驾驶舱截图；需要 Playwright（可用 `PLAYWRIGHT=<模块路径>` 指定）和 Chromium（`CHROME=<路径>`），部分脚本需要运行中的 armd。`scripts/devplat_shots.mjs`（故障说明、碰撞保护、点位）不需要 armd，需要 Playwright 1.48 或更高版本。`scripts/*_shots.mjs` 写到 `.cache/`（或 `OUT`），`tests/*.js` 写到 `tests/artifacts/`，两者都已被 git 忽略。`scripts/` 中的 Python 脚本用于台架诊断：有的直接向电机发送 CAN 帧，有的通过 API 驱动运行中的 armd。只在机械臂有支撑、工作区已清空时运行。
 
 另见 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [SECURITY.md](SECURITY.md)。
 

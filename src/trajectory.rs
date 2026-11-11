@@ -124,6 +124,27 @@ impl QuinticPolynomial {
                 + t * (3.0 * self.a3 + t * (4.0 * self.a4 + 5.0 * self.a5 * t)))
     }
 
+    /// Upper bound on |velocity| over `[t0, t1]` (within the duration): the exact Taylor
+    /// expansion of the quartic velocity at the midpoint, every term taken by magnitude.
+    pub fn speed_bound(&self, t0: f64, t1: f64) -> f64 {
+        let (t, h) = (0.5 * (t0 + t1), 0.5 * (t1 - t0).abs());
+        let d = [
+            self.a1 + t * (2.0 * self.a2 + t * (3.0 * self.a3 + t * (4.0 * self.a4 + 5.0 * self.a5 * t))),
+            2.0 * self.a2 + t * (6.0 * self.a3 + t * (12.0 * self.a4 + 20.0 * self.a5 * t)),
+            6.0 * self.a3 + t * (24.0 * self.a4 + 60.0 * self.a5 * t),
+            24.0 * self.a4 + 120.0 * self.a5 * t,
+            120.0 * self.a5,
+        ];
+        let mut bound = 0.0;
+        let mut hk = 1.0;
+        let mut fact = 1.0;
+        for (k, dk) in d.iter().enumerate() {
+            if k > 0 { hk *= h; fact *= k as f64; }
+            bound += dk.abs() * hk / fact;
+        }
+        bound
+    }
+
     /// Sample acceleration at time t
     pub fn acceleration(&self, t: f64) -> f64 {
         if t <= 0.0 {
@@ -226,6 +247,12 @@ impl MultiJointQuinticTrajectory {
             velocities,
             accelerations,
         }
+    }
+
+    /// Upper bound on how far each joint travels during `[t0, t1]` (rad).
+    pub fn travel_bound(&self, t0: f64, t1: f64) -> Vec<f64> {
+        let (a, b) = (t0.clamp(0.0, self.duration), t1.clamp(0.0, self.duration));
+        self.polynomials.iter().map(|p| p.speed_bound(a, b) * (b - a).abs()).collect()
     }
 
     pub fn is_finished(&self) -> bool {

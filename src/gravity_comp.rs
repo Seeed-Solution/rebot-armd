@@ -94,7 +94,7 @@ impl SupervisorInner {
     pub fn gravity_comp_active(&self) -> bool { self.gravity_comp.is_some() }
 
     fn gravity_comp_policy(&self) -> Option<&GravityCompPolicy> {
-        self.config.gravity_comp.as_ref().filter(|_| self.config.dof == 7 && self.config.gravity_model.is_some())
+        self.config.gravity_comp.as_ref().filter(|_| self.config.six_plus_gripper() && self.config.gravity_model.is_some())
     }
 
     /// The profile and driver support the mode (independent of the current state).
@@ -120,8 +120,7 @@ impl SupervisorInner {
 
     /// Model torque at the measured pose, scaled and clamped per joint.
     fn gravity_comp_model_torque(&self, policy: &GravityCompPolicy, scale: f32) -> Option<[f32; ARM]> {
-        let q = arm6(self.measured_positions.get(..ARM)?);
-        let tau = crate::gravity::compute_gravity_torques(&q).ok()?;
+        let tau = self.config.arm_model.gravity_torques(self.measured_positions.get(..ARM)?).ok()?;
         if !tau.iter().all(|t| t.is_finite()) { return None; }
         let mut out = [0.0; ARM];
         for i in 0..ARM {
@@ -164,7 +163,7 @@ impl SupervisorInner {
             return Some(reason("NOT_ARMED", "Enable the arm first"));
         }
         if self.pending_normal_unload || self.active_trajectory.is_some() || self.servo_target.is_some()
-            || self.grasp_run.is_some() || self.safety.state() != &SafetyState::Armed
+            || self.macro_run.is_some() || self.safety.state() != &SafetyState::Armed
             || self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) {
             return Some(reason("MOTION_BUSY", "Wait until the arm has stopped"));
         }
@@ -196,6 +195,7 @@ impl SupervisorInner {
     /// Enter gravity compensation. Idempotent while the mode is on.
     pub fn enter_gravity_comp(&mut self, request: GravityCompRequest) -> Result<(), ArmError> {
         if self.gravity_comp.is_some() { return Ok(()); }
+        self.collision_hold_check()?;
         if let Some(r) = self.gravity_comp_blocker() { return Err(Self::reject(&r.code, r.message)); }
         let policy = self.gravity_comp_policy().cloned().ok_or_else(|| Self::reject("UNSUPPORTED", "no policy".into()))?;
         let [lo, hi] = policy.scale_range;
@@ -230,7 +230,7 @@ impl SupervisorInner {
                 let uncertain = drv.joint_modes_uncertain();
                 drop(drv);
                 if uncertain {
-                    self.safety.trigger_fault(FaultReason::Other(format!("GRAVITY_COMP_SWITCH_FAILED: {e}")));
+                    self.safety.trigger_fault_coded(crate::safety::FaultCode::GravityCompFailed, FaultReason::Other(format!("GRAVITY_COMP_SWITCH_FAILED: {e}")));
                 }
                 return Err(Self::reject("GRAVITY_COMP_SWITCH_FAILED", e.to_string()));
             }
@@ -467,7 +467,7 @@ impl SupervisorInner {
                 tracing::error!("Gravity compensation: switch back to POS_VEL not confirmed: {e}");
                 if let Some(run) = self.gravity_comp.as_mut() { run.phase = GravityCompPhase::ExitFailed { hold, retry_in_s: 0.5 }; }
                 if !self.safety.state().is_stopped() {
-                    self.safety.trigger_fault(FaultReason::Other(format!("GRAVITY_COMP_EXIT_FAILED: {e}")));
+                    self.safety.trigger_fault_coded(crate::safety::FaultCode::GravityCompFailed, FaultReason::Other(format!("GRAVITY_COMP_EXIT_FAILED: {e}")));
                 }
             }
         }

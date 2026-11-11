@@ -55,16 +55,19 @@ fn newer_profile_version_is_refused() {
 
 const INIT_SCRIPT: &str = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
 
-/// The init script passes the installed profile only to the rebot-dm follower, and only
-/// when the file exists; build_deb.sh installs the kit profile at that path.
+/// The init script passes the installed profile to the rebot-dm and mock followers, only when
+/// the file exists, and --follower-port to every follower except mock; build_deb.sh installs
+/// the kit profile at that path.
 #[cfg(unix)]
 #[test]
-fn init_script_passes_kit_profile_to_rebot_dm_only() {
+fn init_script_passes_kit_profile_to_rebot_dm_and_mock_only() {
     assert!(INIT_SCRIPT.contains("PROFILE=/usr/share/$NAME/profile/rebot-b601dm.json"));
     assert!(include_str!("../scripts/build_deb.sh")
         .contains("/usr/share/rebot-teleop/profile/rebot-b601dm.json\""));
     let start = INIT_SCRIPT.find("    DAEMON_OPTS=\"--follower").unwrap();
-    let end = start + INIT_SCRIPT[start..].find("\n    fi\n").unwrap() + "\n    fi\n".len();
+    // The snippet ends with the `fi` that closes the `--config` block.
+    let config_at = start + INIT_SCRIPT[start..].find("--config $PROFILE").unwrap();
+    let end = config_at + INIT_SCRIPT[config_at..].find("\n    fi\n").unwrap() + "\n    fi\n".len();
     let snippet = &INIT_SCRIPT[start..end];
     let run = |model: &str, profile: &str| {
         let script = format!(
@@ -80,6 +83,8 @@ fn init_script_passes_kit_profile_to_rebot_dm_only() {
     );
     assert_eq!(run("rebot-dm", "/nonexistent/profile.json"), "--follower rebot-dm --follower-port can0 --port 8765");
     assert_eq!(run("so-arm101", PROFILE_PATH), "--follower so-arm101 --follower-port can0 --port 8765");
+    assert_eq!(run("mock", PROFILE_PATH), format!("--follower mock --port 8765 --config {PROFILE_PATH}"));
+    assert_eq!(run("mock", "/nonexistent/profile.json"), "--follower mock --port 8765");
 }
 
 /// armd started with `--config <kit profile>` serves the B601-DM schema (mock follower).
@@ -158,4 +163,44 @@ fn template_profile_is_a_valid_profile() {
     config.validate().unwrap();
     assert_eq!(config.profile_version, ARM_PROFILE_VERSION);
     assert_eq!(config.dof, 6);
+}
+
+/// kits/_template/profile/example_urdf.json parses; with its `my-arm.urdf` replaced by the
+/// B601-RS URDF and chain tip it loads and validates.
+#[test]
+fn template_urdf_profile_is_a_valid_profile() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/kits/_template/profile/example_urdf.json");
+    let err = ArmConfig::from_profile_file(path).unwrap_err();
+    assert!(err.contains("my-arm.urdf"), "{err}");
+    let mut config: ArmConfig = serde_json::from_reader(std::fs::File::open(path).unwrap()).unwrap();
+    config.urdf = Some(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ReBot_Arm_RS.urdf").into());
+    config.chain.as_mut().unwrap().tip_link = "gripper_end".into();
+    config.load_arm_model(None).unwrap();
+    config.validate().unwrap();
+    assert_eq!((config.dof, config.arm_dof(), config.gripper_index()), (6, 6, None));
+}
+
+/// The kit profile carries the collision thresholds from the real-arm rebot-sysid session
+/// (B601-DM, 2026-11-11, ±0.08 rad, two poses), with the guard off until they are validated
+/// at more poses; the other collision settings are the defaults.
+#[test]
+fn kit_profile_collision_section_from_sysid() {
+    let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(PROFILE_PATH).unwrap()).unwrap();
+    let c = &file["collision"];
+    assert_eq!(c["enabled"], serde_json::json!(false));
+    assert_eq!(c["thresholds_nm"], serde_json::json!([2.0, 1.19, 2.82, 1.43, 0.87, 0.28]));
+    let policy = ArmConfig::rebot_dm().collision.expect("rebot_dm collision section");
+    let defaults = armd::collision::CollisionPolicy::default();
+    assert_eq!(armd::collision::CollisionPolicy { thresholds_nm: defaults.thresholds_nm, ..policy }, defaults);
+    assert!(!policy.enabled);
+}
+
+#[test]
+fn schema_from_kit_profile_publishes_home_and_resting_pose() {
+    let config = ArmConfig::from_profile_file(PROFILE_PATH).unwrap();
+    let schema: serde_json::Value = serde_json::from_str(&serde_json::to_string(&armd::ObservationSchema::from_config(&config)).unwrap()).unwrap();
+    let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(PROFILE_PATH).unwrap()).unwrap();
+    assert_eq!(schema["home_positions"], file["home_positions"]);
+    assert_eq!(schema["resting_pose"], file["resting_pose"]);
+    assert!(!schema["resting_pose"].is_null());
 }

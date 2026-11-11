@@ -1,3 +1,4 @@
+pub mod assets;
 pub mod diagnostics;
 pub mod proxy;
 pub mod rest;
@@ -60,6 +61,8 @@ pub fn create_router_full(
     Router::new()
         .route("/", get(serve_index))
         .route("/assets/jmuxer.min.js", get(serve_jmuxer))
+        .route("/assets/three-urdf.min.js", get(assets::serve_three))
+        .route("/assets/model/{*path}", get(assets::serve_model))
         .route("/api/v1/observation", get(rest::get_observation))
         .route("/api/v1/observation/schema", get(rest::get_observation_schema))
         .route("/api/v1/torque", post(rest::set_torque))
@@ -73,8 +76,14 @@ pub fn create_router_full(
         .route("/api/v1/action/move_relative", post(rest::action_requires_lease))
         .route("/api/v1/action/gripper", post(rest::action_requires_lease))
         .route("/api/v1/action/grasp", post(rest::action_requires_lease))
+        .route("/api/v1/action/move_to_pose", post(rest::action_requires_lease))
+        .route("/api/v1/action/place", post(rest::action_requires_lease))
         .route("/api/v1/mode/gravity_comp", post(rest::action_requires_lease))
         .route("/api/v1/grasp/setup", get(rest::get_grasp_setup))
+        .route("/api/v1/workspace/keepout", get(rest::get_keepout))
+        .route("/api/v1/safety/collision", get(rest::get_collision))
+        .route("/api/v1/safety/describe", get(rest::get_safety_describe))
+        .route("/api/v1/poses", get(rest::get_poses))
         .route("/api/v1/safety/e_stop", post(rest::safety_e_stop))
         .route("/api/v1/safety/clear_fault", post(rest::safety_clear_fault))
         .route("/api/v1/dataset/record/start", post(rest::dataset_record_start))
@@ -82,6 +91,7 @@ pub fn create_router_full(
         .route("/api/v1/dataset/record/discard", post(rest::dataset_record_discard))
         .route("/api/v1/diagnostics/boots", get(diagnostics::get_boots))
         .route("/api/v1/diagnostics/blackbox", get(diagnostics::get_blackbox))
+        .route("/api/v1/diagnostics/tick", get(diagnostics::get_tick))
         .route("/api/v1/ws", get(ws::ws_handler))
         // Single-Origin Reverse Proxy Routes
         .route("/api/v1/detection/ws", get(proxy::proxy_detection_ws))

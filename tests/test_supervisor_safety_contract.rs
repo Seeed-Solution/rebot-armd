@@ -142,6 +142,10 @@ async fn sustained_following_error_latches_hold_but_transient_error_does_not() {
     supervisor.inner().write().await.following_error_since = Some(Instant::now() - Duration::from_millis(501));
     let obs = supervisor.tick(0.02).await;
     assert!(obs.safety_state.is_stopped());
+    let fault = obs.fault.as_ref().expect("fault field set in Fault");
+    assert_eq!(fault.code, armd::FaultCode::FollowingError);
+    assert!(!fault.recoverable);
+    assert!(fault.message.starts_with("Persistent joint tracking error"), "{}", fault.message);
     assert_eq!(h.lock().unwrap().written.last().unwrap()[0].position, 0.0);
 }
 

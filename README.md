@@ -51,8 +51,11 @@ other hosts and arms are listed under [Hardware](#hardware) with their verificat
   camera video, detection overlay, hand-eye calibration, tap-to-grasp);
 - a REST API for observation and a WebSocket API for control, where actuator commands are
   accepted only from the connection that holds the control lease;
-- high-level actions for agents (`move_to`, `move_relative`, `gripper`, `grasp`), used by
+- high-level actions for agents (`move_to`, `move_relative`, `gripper`, `grasp`,
+  `move_to_pose` with named poses), used by
   [rebot-companion](https://github.com/Seeed-Solution/rebot-companion) and its MCP server;
+- server-side limits clients cannot raise: a Cartesian workspace with keep-out boxes and a
+  profile speed cap; faults are reported with a machine-readable code;
 - recording of joint state and commands to Parquet files;
 - object detection (YOLO, on the TPU) and ArUco markers with 3D pose (on the CPU), run only
   when a caller asks for them ([Vision](#vision-recamera-kit));
@@ -123,6 +126,14 @@ The Damiao driver also has an MIT mode with gravity feed-forward, but it can onl
 from code (`DamiaoArmDriver::with_control_mode`), not from the CLI or a profile. The
 gravity-compensation mode switches J1–J6 to MIT at runtime and back (see
 [Web cockpit](#web-cockpit)); that switch is verified on the B601-DM.
+
+Other arms can take their kinematic and gravity model from a URDF named in the profile
+(`"kinematics": "Urdf"`, fields `urdf`, `chain`; see
+[docs/architecture.md](docs/architecture.md#1-arm-profile)). `profiles/rebot_b601_rs.json` does
+this for the B601-RS (`--follower rebot-rs --config profiles/rebot_b601_rs.json`): FK and
+gravity are checked against the RS MuJoCo model and URDF in tests; joint signs, offsets,
+limits and masses are not verified on a real arm. With 6 arm joints and no gripper joint it
+gets the workspace check and the gravity model, not the Cartesian actions.
 
 TODO / roadmap:
 
@@ -235,6 +246,10 @@ overrides the channel; `0` or unset keeps the default. If hostapd is not running
 channel after start (checked with `iw dev wlan1 info`), the init script restarts it on
 2.4 GHz channel 6 and writes the fallback to syslog.
 
+On a device without a Wi-Fi interface (no `wlan0`/`wlan1`, for example the PoE model) the
+init script skips the Wi-Fi client, the hotspot and its guard, logs that to syslog, and armd is
+reached over the wired network.
+
 After an install or upgrade, `postinst` starts the app when it is the console's active app
 (or on devices without the console). Open the cockpit at `http://<camera-address>:8765/`.
 
@@ -318,8 +333,10 @@ bytes (2.6 MiB, gzip). Memory use on the device has not been measured for this R
 ## Web cockpit
 
 `src/api/index.html` is a single HTML file without external resources, embedded in the binary
-and served at `/`. JMuxer (`/assets/jmuxer.min.js`) plays the camera video. The UI is in
-Chinese and English (language switch in the header).
+and served at `/`. JMuxer (`/assets/jmuxer.min.js`) plays the camera video. The 3D view's
+three.js + urdf-loader bundle (`/assets/three-urdf.min.js`, 149 KB gzip) is also embedded and is
+fetched only when the 3D view is opened. The UI is in Chinese and English (language switch in
+the header).
 
 <p align="center">
   <img src="docs/images/cockpit-phone-landscape.jpg" alt="Cockpit on a phone in landscape: live camera video with joysticks, Enable, E-stop and status chips" width="49%">
@@ -360,7 +377,33 @@ Chinese and English (language switch in the header).
   Overspeed limits are 1.5 rad/s for J1–J3 and 3.0 rad/s for J4–J6. On the B601-DM, all five
   exit paths tested (exit, stop, takeover, E-stop, client disconnect) held the arm within
   1.5 mrad, and a 30 s hand-guided recording gave 1509 frames.
-- **E-stop** button, fault display and clear, torque enable by press-and-hold, park.
+- **E-stop** button, fault display and clear, torque enable by press-and-hold, park. With
+  `capabilities.fault_codes`, the fault display explains `observation.fault.code` in one line
+  and says what to check before clearing (for example `BUS_LOSS`: check the motor cable and power).
+- **Collision guard** (only when `capabilities.collision_guard` is true): while
+  `observation.collision.active`, a red banner names the joint, its residual torque and the
+  auto-resume countdown; it cannot be closed. During the hold the status reads "Collision hold"
+  and jog, sticks, presets, home, gripper and pose "Go" are locked; E-stop and the enable switch
+  stay usable. The sensitivity buttons are disabled while the guard is off. After escalation to the `COLLISION` fault it shows
+  the clear-fault button. The settings drawer (gear in the header) switches the guard on or off
+  and sets the sensitivity (low / medium / high); the thresholds are not calibrated on the arm
+  yet. Expert mode shows J1–J6 residual torque bars against the thresholds (green below 50 %,
+  yellow up to 100 %, red when tripped).
+- **3D view** ("3D" button on the video): the arm drawn from `reBot-DevArm_gripper.urdf` with the
+  measured joint angles (solid) and `commanded_positions` (translucent blue, shown when they
+  differ), a floor grid, the workspace box, keep-out boxes (`GET /api/v1/workspace/keepout`) and
+  stored poses as orange dots. Drag to rotate, pinch or scroll to zoom. J1–J6 use the motor angle
+  as the URDF angle; J7 is mapped to the finger travel (0–42.5 mm) between `gripper_policy`
+  `closed_rad` and `open_rad`. armd serves the URDF and meshes read-only from the asset directory
+  (`assets/`, else `/usr/share/rebot-teleop/assets/`, or `ARMD_ASSET_DIR`) at `/assets/model/`;
+  the kit `.deb` installs 34 decimated B601-DM meshes (2.8 MB). Without the meshes (lite
+  tarball) the view draws a stick figure through the URDF joint frames. It renders at most
+  30 frames/s and only when the pose, the boxes or the camera changed. The rendered `end_link`
+  matches armd's `kinematics::fk` within 0.001 mm at the points in `tests/fixtures/fk_points.json`
+  (`scripts/view3d_shots.mjs`).
+- **Poses drawer** (only when `capabilities.poses` is true): record the current position under
+  a name (`^[A-Za-z0-9_-]{1,64}$`), move to a stored pose (`move_to_pose` action at the cockpit
+  speed) or delete it.
 
 The cockpit does not take the lease when it opens. It acquires it on the first control input
 (jog, stick, key, Cartesian input, preset, enable, gripper, grasp, gravity compensation, park
@@ -412,13 +455,15 @@ WebSocket that holds the lease.
 
 | Path | Method | Purpose |
 |---|---|---|
-| `/api/v1/observation` | GET | positions, velocities, torques, temperatures, safety state, `commanded_positions`, latest `action`, driver capabilities, `driver_range_check` (Damiao mapping ranges read from the motors at startup), `motion_limit` (servo speed / lead cap, joint limit, workspace or blocked hold shaping the motion; [contract](docs/control_safety_contract.md#servo-streaming-guard--流式控制保护)), `motor_errors` (per-joint motor fault code) |
-| `/api/v1/observation/schema` | GET | DOF, joint names, limits, workspace, camera mount, `capabilities` ([fields](docs/architecture.md#3-capability-discovery)) |
-| `/api/v1/ws` | WS | lease (`acquire_lease`, `heartbeat`), `command` / `command_ack` / `command_reject`, telemetry |
+| `/api/v1/observation` | GET | positions, velocities, torques, temperatures, safety state, `commanded_positions`, latest `action`, driver capabilities, `driver_range_check` (Damiao mapping ranges read from the motors at startup), `motion_limit` (servo speed / lead cap, joint limit, workspace or blocked hold shaping the motion; [contract](docs/control_safety_contract.md#servo-streaming-guard--流式控制保护)), `motor_errors` (per-joint motor fault code), `fault` (`{code, message, recoverable}` in Fault / EStop), `residual_torques` (measured minus model gravity torque, J1..J6) |
+| `/api/v1/observation/schema` | GET | DOF, joint names, limits, workspace, camera mount, `speed_cap`, `capabilities` ([fields](docs/architecture.md#3-capability-discovery)) |
+| `/api/v1/ws` | WS | lease (`acquire_lease`, `heartbeat`), `command` / `command_ack` / `command_reject`, telemetry; `?obs_hz=N` limits telemetry on that connection to N per second |
 | `/api/v1/safety/e_stop` | POST | E-stop, no lease needed |
 | `/api/v1/torque`, `/api/v1/motion/*`, `/api/v1/action/*`, `/api/v1/mode/gravity_comp`, `/api/v1/safety/clear_fault` | POST | return `409 LEASE_REQUIRED`; send the same paths as WS `command`s |
 | `/api/v1/grasp/setup` | GET | grasp setup (changed with a WS command) |
-| `/api/v1/diagnostics/boots`, `/api/v1/diagnostics/blackbox?seconds=N[&prev=1]` | GET | boot records and black-box records (state before a reset), no lease needed ([format](docs/agent_action_api.md#diagnostics--诊断)) |
+| `/api/v1/poses` | GET | named poses (saved and deleted with WS commands, used by the `move_to_pose` action; [format](docs/agent_action_api.md#named-poses--命名姿态)) |
+| `/api/v1/workspace/keepout` | GET | keep-out boxes in force, each tagged `profile` or `runtime` (the runtime list, set with a WS command, only adds boxes) |
+| `/api/v1/diagnostics/boots`, `/api/v1/diagnostics/blackbox?seconds=N[&prev=1]`, `/api/v1/diagnostics/tick` | GET | boot records, black-box records (state before a reset) and control tick timing, no lease needed ([format](docs/agent_action_api.md#diagnostics--诊断)) |
 | `/api/v1/dataset/record/start` / `save` / `discard` | POST | episode recording |
 | `/api/v1/detection/latest`, `/trigger`, `/inference`, `/ws` | GET / POST / WS | detector proxy |
 
@@ -434,8 +479,8 @@ WebSocket sequence:
 Reference documents:
 
 - [docs/agent_action_api.md](docs/agent_action_api.md): `move_to`, `move_relative` (base,
-  tool and camera frames), `gripper`, `grasp`, the gravity-compensation mode command, action
-  status and error codes;
+  tool and camera frames), `gripper`, `grasp`, `move_to_pose` and named poses, keep-out boxes,
+  the gravity-compensation mode command, action status, fault codes and error codes;
 - [docs/control_safety_contract.md](docs/control_safety_contract.md): lease, epochs, driver
   capabilities, timing defaults, speed caps, workspace;
 - [docs/detection_api.md](docs/detection_api.md): detection routes and an agent loop example.
@@ -503,7 +548,10 @@ files; each start appends a line with the previous start's last record to `boots
 
 Environment: `RUST_LOG` (log filter, default `armd=info,tower_http=info`), `PORT`,
 `ARMD_DETECTOR_URL` (default `http://127.0.0.1:8090`), `ARMD_GRASP_SETUP` (grasp setup file,
-default `/userdata/rebot-teleop/grasp_setup.json`), `ARMD_LOG_DIR`, `ARMD_BLACKBOX_DIR`.
+default `/userdata/rebot-teleop/grasp_setup.json`), `ARMD_KEEPOUT` (runtime keep-out boxes,
+default `/userdata/rebot-teleop/keepout.json`), `ARMD_POSES` (named poses, default
+`/userdata/rebot-teleop/poses.json`), `ARMD_COLLISION` (collision guard setting, default
+`/userdata/rebot-teleop/collision.json`), `ARMD_LOG_DIR`, `ARMD_BLACKBOX_DIR`.
 
 Without `--config`, `rebot-dm` uses the built-in B601-DM profile (`ArmConfig::rebot_dm()` in
 `src/model.rs`) and the other followers a generic 6-joint profile. A `--config` file is a
@@ -604,7 +652,8 @@ is timing-sensitive and can fail on a loaded machine; rerun it.
 Playwright scripts (`scripts/*_shots.mjs`, `scripts/ux_walkthrough.mjs`,
 `tests/test_*_playwright.js`, `tests/test_single_origin_e2e.js`) take cockpit screenshots;
 they need Playwright (`PLAYWRIGHT=<module path>` to override) and a Chromium (`CHROME=<path>`),
-and some need a running armd. The `scripts/*_shots.mjs` write to `.cache/` (or `OUT`), the
+and some need a running armd. `scripts/devplat_shots.mjs` (fault texts, collision guard, poses) needs no armd and
+Playwright 1.48 or later. The `scripts/*_shots.mjs` write to `.cache/` (or `OUT`), the
 `tests/*.js` scripts to `tests/artifacts/`; both are ignored by git. The Python scripts in
 `scripts/` are bench diagnostics: some send raw CAN frames to the motors, others drive a running
 armd over its API. Run them only with the arm supported and the workspace clear.

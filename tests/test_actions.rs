@@ -225,7 +225,7 @@ fn joint_move_home_and_park_create_action_records() {
     assert_eq!((a.kind.as_str(), a.state.as_str()), ("home", "done"));
     inner.commanded_positions = INSPECT.to_vec();
     inner.measured_positions = INSPECT.to_vec();
-    let id = inner.unload_action().expect("park starts");
+    let id = inner.unload_action().unwrap().expect("park starts");
     let a = run(&mut inner, id, 15.0, |_| {});
     assert_eq!((a.kind.as_str(), a.state.as_str()), ("park", "done"), "{a:?}");
     assert!(!inner.is_torqued);

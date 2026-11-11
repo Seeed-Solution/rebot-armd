@@ -95,12 +95,15 @@ impl Default for FollowingErrorPolicy {
     fn default() -> Self { Self { max_error_rad: 0.5, persistence_ms: 500 } }
 }
 
+/// Gravity model: the built-in B601-DM model or the inertials of the profile URDF
+/// (`urdf` + `chain`, src/chain.rs).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum GravityModel { RebotDevArm }
+pub enum GravityModel { RebotDevArm, Urdf }
 
-/// Kinematic model used for the Cartesian workspace check and Cartesian actions.
+/// Kinematic model used for the Cartesian workspace check and Cartesian actions: the
+/// built-in B601-DM model or the profile URDF chain (`urdf` + `chain`, src/chain.rs).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum KinematicsModel { RebotDevArm }
+pub enum KinematicsModel { RebotDevArm, Urdf }
 
 /// Server-side Cartesian safety box, checked on the end_link pose (src/kinematics.rs).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -114,6 +117,40 @@ pub struct WorkspacePolicy {
     pub max_reach_m: Option<f32>,
     /// Points in end_link coordinates (m) that must stay inside the box and above the floor.
     pub check_points_end_m: Vec<[f32; 3]>,
+    /// Boxes (base frame) no check point may enter. A runtime list
+    /// (`/api/v1/workspace/keepout`) replaces this one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keepout_boxes: Vec<KeepoutBox>,
+}
+
+/// Most keep-out boxes a profile or the runtime list may hold.
+pub const MAX_KEEPOUT_BOXES: usize = 16;
+
+/// Axis-aligned keep-out box in the base frame (m).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KeepoutBox {
+    pub name: String,
+    pub min_m: [f32; 3],
+    pub max_m: [f32; 3],
+}
+
+impl KeepoutBox {
+    /// Validate a box list: at most [`MAX_KEEPOUT_BOXES`], names 1..=64 bytes, finite, min < max per axis.
+    pub fn validate_list(boxes: &[KeepoutBox]) -> Result<(), String> {
+        if boxes.len() > MAX_KEEPOUT_BOXES {
+            return Err(format!("at most {MAX_KEEPOUT_BOXES} keep-out boxes"));
+        }
+        for b in boxes {
+            if b.name.is_empty() || b.name.len() > 64 {
+                return Err("keep-out box name must be 1..64 bytes".into());
+            }
+            if !b.min_m.iter().chain(&b.max_m).all(|v| v.is_finite())
+                || b.min_m.iter().zip(&b.max_m).any(|(lo, hi)| lo >= hi) {
+                return Err(format!("keep-out box '{}': finite values and min_m < max_m on every axis", b.name));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl WorkspacePolicy {
@@ -131,6 +168,7 @@ impl WorkspacePolicy {
             box_max_m: [0.60, 0.60, 0.80],
             max_reach_m: Some(0.52),
             check_points_end_m: corners,
+            keepout_boxes: Vec::new(),
         }
     }
 
@@ -143,7 +181,7 @@ impl WorkspacePolicy {
             || !self.check_points_end_m.iter().all(finite3) {
             return Err("Invalid workspace policy: finite values, box_min < box_max, 1..16 check points".into());
         }
-        Ok(())
+        KeepoutBox::validate_list(&self.keepout_boxes)
     }
 }
 
@@ -330,6 +368,31 @@ fn default_servo_max_lead_rad() -> f32 {
     DEFAULT_SERVO_MAX_LEAD_RAD
 }
 
+/// Upper bound on planned motion speed (`speed_cap` in the profile). Each entry is
+/// applied as min() with the request and with `planned_max_velocity`; absent entries
+/// do not cap. Not changeable at runtime.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SpeedCap {
+    /// Cartesian actions: linear speed (m/s).
+    pub linear_mps: Option<f32>,
+    /// Cartesian actions: angular speed (rad/s).
+    pub angular_rps: Option<f32>,
+    /// Factor (0, 1] on the planned joint speed cap of every joint except the 7-DOF gripper.
+    pub joint_velocity_scale: Option<f32>,
+}
+
+impl SpeedCap {
+    fn validate(&self) -> Result<(), String> {
+        let positive = |v: Option<f32>| v.is_none_or(|x| x.is_finite() && x > 0.0);
+        if !positive(self.linear_mps) || !positive(self.angular_rps) || !positive(self.joint_velocity_scale)
+            || self.joint_velocity_scale.is_some_and(|x| x > 1.0) {
+            return Err("speed_cap: linear_mps and angular_rps positive finite, joint_velocity_scale in (0, 1]".into());
+        }
+        Ok(())
+    }
+}
+
 /// Robotic arm hardware/control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArmConfig {
@@ -389,6 +452,44 @@ pub struct ArmConfig {
     /// range ±12.5 rad, ±30 rad/s, ±18 N·m for every motor.
     #[serde(default)]
     pub damiao_ranges: Option<Vec<DamiaoRange>>,
+    /// Speed cap for every planned motion (actions, jog, home, park); None = no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_cap: Option<SpeedCap>,
+    /// Collision guard (`src/collision.rs`); None = defaults, guard off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collision: Option<crate::collision::CollisionPolicy>,
+    /// Facts about the installed hardware published by `/api/v1/safety/describe`;
+    /// None = no wired emergency stop and the default notes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<HardwareInfo>,
+    /// URDF file for `kinematics` / `gravity_model` = `Urdf`, relative to the profile file's
+    /// directory (or absolute). Read once at startup by [`ArmConfig::load_arm_model`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urdf: Option<String>,
+    /// Expected sha256 (hex) of the `urdf` file; startup fails on a mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urdf_sha256: Option<String>,
+    /// Arm chain inside `urdf` and its joint mapping (src/chain.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<crate::chain::ChainSpec>,
+    /// Gripper joint index. Absent: the joint after the arm joints when `dof` has one more
+    /// joint than the arm model (index 6 for the B601-DM), otherwise none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gripper_joint: Option<usize>,
+    /// Arm model built from the fields above (not part of the profile JSON).
+    #[serde(skip)]
+    pub arm_model: crate::chain::ArmModel,
+}
+
+/// Profile field `hardware`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HardwareInfo {
+    /// A wired emergency stop that removes motor power is installed.
+    #[serde(default)]
+    pub physical_estop: bool,
+    /// Replaces the default notes when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<Vec<String>>,
 }
 
 impl Default for ArmConfig {
@@ -438,11 +539,92 @@ impl Default for ArmConfig {
             grasp: None,
             gravity_comp: None,
             damiao_ranges: None,
+            speed_cap: None,
+            collision: None,
+            hardware: None,
+            urdf: None,
+            urdf_sha256: None,
+            chain: None,
+            gripper_joint: None,
+            arm_model: crate::chain::ArmModel::RebotDevArm,
         }
     }
 }
 
 impl ArmConfig {
+    /// Number of arm joints of the kinematic / gravity model (6 for the built-in model).
+    pub fn arm_dof(&self) -> usize { self.arm_model.arm_dof() }
+
+    /// Joints the resting-pose position check must cover: every joint before a trailing
+    /// gripper (all joints when the gripper is not the last one or there is none).
+    pub fn resting_arm_joints(&self) -> usize {
+        match self.gripper_index() {
+            Some(g) if g + 1 == self.dof => g,
+            _ => self.dof,
+        }
+    }
+
+    /// Index of the gripper joint, if the profile has one.
+    pub fn gripper_index(&self) -> Option<usize> {
+        self.gripper_joint.or_else(|| (self.dof > self.arm_dof()).then_some(self.arm_dof()))
+    }
+
+    /// The joint layout the Cartesian action planner, gravity compensation and the gripper
+    /// actions use: 6 arm joints followed by the gripper at index 6.
+    pub fn six_plus_gripper(&self) -> bool {
+        self.dof == 7 && self.arm_dof() == 6 && self.gripper_index() == Some(6)
+    }
+
+    /// Profile uses the URDF chain for kinematics or gravity.
+    pub fn uses_urdf(&self) -> bool {
+        self.kinematics == Some(KinematicsModel::Urdf) || self.gravity_model == Some(GravityModel::Urdf)
+    }
+
+    /// Read a profile JSON file and build its arm model (`urdf` relative to the file).
+    /// The result still needs [`Self::validate`].
+    pub fn from_profile_file(path: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        let file = std::fs::File::open(path).map_err(|e| format!("profile {}: {e}", path.display()))?;
+        let mut config: Self = serde_json::from_reader(std::io::BufReader::new(file))
+            .map_err(|e| format!("profile {}: {e}", path.display()))?;
+        config.load_arm_model(path.parent())?;
+        Ok(config)
+    }
+
+    /// Build [`Self::arm_model`] from `urdf` + `chain` when the profile uses `Urdf`;
+    /// `profile_dir` resolves a relative `urdf` path. Call before [`Self::validate`].
+    pub fn load_arm_model(&mut self, profile_dir: Option<&std::path::Path>) -> Result<(), String> {
+        if !self.uses_urdf() {
+            if self.urdf.is_some() || self.chain.is_some() {
+                return Err("urdf / chain are set but neither kinematics nor gravity_model is \"Urdf\"".into());
+            }
+            self.arm_model = crate::chain::ArmModel::RebotDevArm;
+            return Ok(());
+        }
+        let (Some(rel), Some(spec)) = (&self.urdf, &self.chain) else {
+            return Err("kinematics / gravity_model \"Urdf\" needs the urdf and chain fields".into());
+        };
+        let path = match profile_dir {
+            Some(dir) if std::path::Path::new(rel).is_relative() => dir.join(rel),
+            _ => std::path::PathBuf::from(rel),
+        };
+        let bytes = std::fs::read(&path).map_err(|e| format!("urdf {}: {e}", path.display()))?;
+        if let Some(expected) = &self.urdf_sha256 {
+            let actual = crate::gravity::compute_sha256(&bytes);
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(format!("urdf {}: sha256 {actual} does not match urdf_sha256 {expected}", path.display()));
+            }
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|e| format!("urdf {}: {e}", path.display()))?;
+        let chain = crate::chain::KinematicChain::from_urdf_str(text, spec)
+            .map_err(|e| format!("urdf {}: {e}", path.display()))?;
+        if self.gravity_model == Some(GravityModel::Urdf) && chain.moving_mass() <= 0.0 {
+            return Err(format!("urdf {}: gravity_model \"Urdf\" but the chain links have no mass", path.display()));
+        }
+        self.arm_model = crate::chain::ArmModel::Chain(std::sync::Arc::new(chain));
+        Ok(())
+    }
+
     /// Validate configuration invariants and auto-normalize joint names
     pub fn validate(&mut self) -> Result<(), String> {
         if self.profile_version == 0 || self.profile_version > ARM_PROFILE_VERSION {
@@ -480,6 +662,8 @@ impl ArmConfig {
                     cap / POSVEL_LAG_GAIN, self.following_error.max_error_rad));
             }
         }
+        if let Some(cap) = &self.speed_cap { cap.validate()?; }
+        if let Some(c) = &self.collision { c.validate()?; }
         if let Some(caps) = &self.servo_max_velocity {
             if caps.len() != self.dof || caps.iter().flatten().any(|v| !v.is_finite() || *v <= 0.0) {
                 return Err(format!("servo_max_velocity needs {} entries, each null or positive finite", self.dof));
@@ -491,8 +675,23 @@ impl ArmConfig {
                 "servo_max_lead_rad {} must be positive and below the following-error bound {} rad",
                 self.servo_max_lead_rad, self.following_error.max_error_rad));
         }
-        if self.kinematics.is_some() && self.dof != 7 {
+        let builtin = self.kinematics == Some(KinematicsModel::RebotDevArm) || self.gravity_model == Some(GravityModel::RebotDevArm);
+        if builtin && self.uses_urdf() {
+            return Err("kinematics and gravity_model must both be RebotDevArm or both Urdf".into());
+        }
+        if self.uses_urdf() != self.arm_model.chain().is_some() {
+            return Err("kinematics / gravity_model \"Urdf\" needs a loaded URDF chain (ArmConfig::load_arm_model)".into());
+        }
+        if self.kinematics == Some(KinematicsModel::RebotDevArm) && self.dof != 7 {
             return Err("kinematics requires dof == 7 (6 arm joints + gripper)".into());
+        }
+        if let Some(g) = self.gripper_joint {
+            if g >= self.dof || g < self.arm_dof() {
+                return Err(format!("gripper_joint {g} must be an index in {}..{} (after the arm joints)", self.arm_dof(), self.dof));
+            }
+        }
+        if self.uses_urdf() && (self.dof < self.arm_dof() || self.dof > self.arm_dof() + 1) {
+            return Err(format!("the URDF chain has {} joints; dof must be {} or {} (with a gripper)", self.arm_dof(), self.arm_dof(), self.arm_dof() + 1));
         }
         if let Some(ws) = &self.workspace { ws.validate()?; }
         let cam = &self.camera_mount;
@@ -517,7 +716,7 @@ impl ArmConfig {
             }
         }
         if let Some(gc) = &self.gravity_comp {
-            if self.dof != 7 || self.gravity_model.is_none() {
+            if !self.six_plus_gripper() || self.gravity_model.is_none() {
                 return Err("gravity_comp requires dof == 7 and a gravity_model".into());
             }
             gc.validate()?;
@@ -529,6 +728,10 @@ impl ArmConfig {
         }
         if let Some(g) = &self.grasp { g.validate().map_err(|e| format!("Invalid grasp setup: {e}"))?; }
         if let Some(policy) = &self.resting_pose {
+            if policy.position_tolerances.len() < self.resting_arm_joints() {
+                return Err(format!("resting_pose.position_tolerances needs a value for each of the {} arm joints",
+                                   self.resting_arm_joints()));
+            }
             if policy.position_tolerances.is_empty() || policy.position_tolerances.len() > self.dof
                 || policy.position_tolerances.iter().any(|v| !v.is_finite() || *v <= 0.0)
                 || !policy.max_total_deviation.is_finite() || policy.max_total_deviation <= 0.0
@@ -559,7 +762,7 @@ impl ArmConfig {
     pub fn servo_limits(&self) -> Vec<JointLimit> {
         let mut limits = self.limits.clone();
         if let Some(caps) = &self.servo_max_velocity {
-            let gripper_idx = (self.dof >= 7).then_some(6);
+            let gripper_idx = self.gripper_index();
             for (i, (limit, cap)) in limits.iter_mut().zip(caps).enumerate() {
                 if let (Some(cap), false) = (cap, Some(i) == gripper_idx) {
                     limit.max_velocity = limit.max_velocity.min(*cap);
@@ -624,6 +827,20 @@ impl ArmConfig {
                 DamiaoRange::REBOT_DM_J4_J7, DamiaoRange::REBOT_DM_J4_J7, DamiaoRange::REBOT_DM_J4_J7,
                 DamiaoRange::REBOT_DM_J4_J7,
             ]),
+            speed_cap: None,
+            // rebot-sysid on the real arm (B601-DM, 2026-11-11, ±0.08 rad, one session at two
+            // poses): off until validated at more poses (kits/recamera-b601dm/README.md)
+            collision: Some(crate::collision::CollisionPolicy {
+                enabled: false,
+                thresholds_nm: [2.0, 1.19, 2.82, 1.43, 0.87, 0.28],
+                ..Default::default()
+            }),
+            hardware: None,
+            urdf: None,
+            urdf_sha256: None,
+            chain: None,
+            gripper_joint: None,
+            arm_model: crate::chain::ArmModel::RebotDevArm,
         }
     }
 }
@@ -683,6 +900,16 @@ pub struct ArmObservation {
     /// reports no motor state (Damiao state codes 8-14).
     #[serde(default)]
     pub motor_errors: Vec<Option<MotorError>>,
+    /// Structured cause while the safety state is Fault or EStop; null otherwise.
+    #[serde(default)]
+    pub fault: Option<crate::safety::FaultInfo>,
+    /// Measured torque minus model gravity torque for J1..J6 (N·m); null without a
+    /// gravity model or valid torque feedback. Observation only, no fault is raised from it.
+    #[serde(default)]
+    pub residual_torques: Option<[f32; 6]>,
+    /// Collision guard state; null while the guard is disabled or unavailable.
+    #[serde(default)]
+    pub collision: Option<crate::collision::CollisionObservation>,
 }
 
 /// A motor fault code reported in the motor's feedback (`observation.motor_errors`).
@@ -783,7 +1010,7 @@ pub struct SchemaField {
 }
 
 /// Version of the capability summary in the observation schema (`capabilities`).
-pub const CAPABILITIES_VERSION: u32 = 5;
+pub const CAPABILITIES_VERSION: u32 = 6;
 
 /// Vision features armd offers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -846,6 +1073,30 @@ pub struct Capabilities {
     /// (their `enabled` says whether this armd writes the files). Present from
     /// capabilities version 5.
     pub diagnostics: bool,
+    /// `/api/v1/ws?obs_hz=N` limits the observation rate per connection. Present from
+    /// capabilities version 6, like the fields below.
+    pub obs_rate: bool,
+    /// `observation.fault` carries `{code, message, recoverable}` in Fault / EStop.
+    pub fault_codes: bool,
+    /// Named poses: `GET /api/v1/poses`, WS `/api/v1/poses/save|delete`, action `move_to_pose`.
+    pub poses: bool,
+    /// Keep-out boxes (`workspace.keepout_boxes`, `/api/v1/workspace/keepout`); needs the
+    /// workspace check.
+    pub keepout: bool,
+    /// The profile `speed_cap` section is honoured and published as `schema.speed_cap`.
+    pub speed_cap: bool,
+    /// `observation.residual_torques` can be non-null (profile gravity model); it stays null
+    /// without torque feedback.
+    pub residual_torques: bool,
+    /// `GET /api/v1/diagnostics/tick`.
+    pub tick_stats: bool,
+    /// `/api/v1/action/place`: 7-DOF, kinematics and gripper policy.
+    pub place: bool,
+    /// Collision guard (`collision` profile section, `/api/v1/safety/collision`,
+    /// `observation.collision`): profile gravity model and a driver that reports torque.
+    pub collision_guard: bool,
+    /// `GET /api/v1/safety/describe`: limits, stops and faults generated from the running config.
+    pub safety_describe: bool,
     pub vision: VisionCapabilities,
 }
 
@@ -853,8 +1104,9 @@ impl Capabilities {
     /// Capabilities that follow from the profile alone. `gravity_comp` also depends on
     /// the driver and the URDF check; this sets it from the profile only.
     pub fn from_config(config: &ArmConfig) -> Self {
-        let seven = config.dof == 7;
+        let seven = config.six_plus_gripper();
         let kin = config.kinematics.is_some();
+        let six_arm = config.arm_dof() == 6 && matches!(config.dof, 6 | 7);
         let gripper = config.dof >= 7 && config.gripper_policy.is_some();
         Self {
             version: CAPABILITIES_VERSION,
@@ -867,6 +1119,17 @@ impl Capabilities {
             damiao_ranges: config.damiao_ranges.is_some(),
             servo_guard: true,
             diagnostics: true,
+            obs_rate: true,
+            fault_codes: true,
+            poses: true,
+            keepout: kin && config.workspace.is_some(),
+            speed_cap: true,
+            residual_torques: config.gravity_model.is_some() && six_arm,
+            tick_stats: true,
+            place: seven && kin && config.gripper_policy.is_some(),
+            // The driver half is applied by ArmSupervisor::get_schema.
+            collision_guard: config.gravity_model.is_some() && six_arm,
+            safety_describe: true,
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }
@@ -895,6 +1158,16 @@ pub struct ObservationSchema {
     /// Servo lead cap (rad); null in older schemas.
     #[serde(default)]
     pub servo_max_lead_rad: Option<f32>,
+    /// Profile speed cap on planned motion; null when the profile sets none.
+    #[serde(default)]
+    pub speed_cap: Option<SpeedCap>,
+    /// Profile home pose (rad, one value per joint); null in older schemas.
+    #[serde(default)]
+    pub home_positions: Option<Vec<f32>>,
+    /// Profile resting-pose policy (tolerances, stillness and support-torque limits); null
+    /// when the profile has none and in older schemas.
+    #[serde(default)]
+    pub resting_pose: Option<RestingPosePolicy>,
 }
 
 impl ObservationSchema {
@@ -971,6 +1244,9 @@ impl ObservationSchema {
             capabilities: Capabilities::from_config(config),
             servo_max_velocity: config.servo_limits().iter().map(|l| l.max_velocity).collect(),
             servo_max_lead_rad: Some(config.servo_max_lead_rad),
+            speed_cap: config.speed_cap,
+            home_positions: Some(config.home_positions.clone()),
+            resting_pose: config.resting_pose.clone(),
         }
     }
 }

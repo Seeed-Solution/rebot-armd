@@ -82,9 +82,15 @@ pub struct PlanInput {
     pub j7: f32,
     /// `planning_limits()` (speed-capped) for all 7 joints.
     pub limits: Vec<JointLimit>,
+    /// Profile speed cap; Cartesian speeds are min(request, cap).
+    pub speed_cap: Option<crate::model::SpeedCap>,
     pub ws: Option<WorkspacePolicy>,
     pub cam: CameraMount,
+    /// Kinematic model of the profile (built-in or URDF chain).
+    pub arm: crate::chain::ArmModel,
     pub epoch: u64,
+    /// `SupervisorInner::workspace_revision` the plan was checked against.
+    pub workspace_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -112,7 +118,14 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
         return Err(MotionError::InvalidCommand(format!(
             "speed must be 0 < linear <= {MAX_LINEAR_MPS} m/s and 0 < angular <= {MAX_ANGULAR_RPS} rad/s")));
     }
-    let start = kinematics::fk(&input.q0);
+    let speed = match input.speed_cap {
+        Some(cap) => Speed {
+            linear: cap.linear_mps.map_or(speed.linear, |c| speed.linear.min(f64::from(c))),
+            angular: cap.angular_rps.map_or(speed.angular, |c| speed.angular.min(f64::from(c))),
+        },
+        None => speed,
+    };
+    let start = input.arm.fk(&input.q0);
     let dp = kinematics::sub(&goal.p, &start.p);
     let length = kinematics::norm(&dp);
     let w_rel = kinematics::log_v(&kinematics::mul_t(&goal.r, &start.r));
@@ -127,7 +140,7 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
     let lo: [f64; 6] = std::array::from_fn(|i| f64::from(input.limits[i].min_position) + IK_LIMIT_MARGIN);
     let hi: [f64; 6] = std::array::from_fn(|i| f64::from(input.limits[i].max_position) - IK_LIMIT_MARGIN);
     let start_q32: [f32; 7] = std::array::from_fn(|i| if i < 6 { input.q0[i] as f32 } else { input.j7 });
-    let v_start = input.ws.as_ref().map(|ws| kinematics::workspace_violation(&start_q32, ws, &input.cam));
+    let v_start = input.ws.as_ref().map(|ws| input.arm.workspace_violation(&start_q32, ws, &input.cam));
 
     let mut q_samples = Vec::with_capacity(n + 1);
     let mut s_samples = Vec::with_capacity(n + 1);
@@ -140,7 +153,7 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
         let r = if k == n { goal.r } else {
             kinematics::mat_mul(&kinematics::exp_r(&[w_rel[0] * s, w_rel[1] * s, w_rel[2] * s]), &start.r)
         };
-        let sol = kinematics::solve_dls(&Pose::new(r, p), &prev, &lo, &hi, kinematics::PAR.w);
+        let sol = input.arm.solve_dls(&Pose::new(r, p), &prev, &lo, &hi, kinematics::PAR.w);
         if !sol.ok {
             return Err(MotionError::IkUnreachable { s, ep: sol.ep, er: sol.er });
         }
@@ -151,10 +164,10 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
         }
         let q32: [f32; 7] = std::array::from_fn(|i| if i < 6 { sol.q[i] as f32 } else { input.j7 });
         if let (Some(ws), Some(v0)) = (input.ws.as_ref(), v_start.as_ref()) {
-            let v = kinematics::workspace_violation(&q32, ws, &input.cam);
+            let v = input.arm.workspace_violation(&q32, ws, &input.cam);
             if kinematics::workspace_rejects(&v, v0) {
                 let w = v.worst.expect("violation has a worst point");
-                return Err(MotionError::WorkspaceViolation { s, point: w.point, limit: w.limit.to_string(), value: w.value, bound: w.bound });
+                return Err(MotionError::WorkspaceViolation { s, point: w.point, limit: w.label(ws), value: w.value, bound: w.bound });
             }
         }
         q_samples.push(q32);
@@ -194,7 +207,7 @@ pub enum GoalSpec {
 
 /// Resolve a goal request against the start pose `fk(q0)`.
 pub fn resolve_goal(input: &PlanInput, spec: &GoalSpec) -> Pose {
-    let start = kinematics::fk(&input.q0);
+    let start = input.arm.fk(&input.q0);
     match spec {
         GoalSpec::Absolute { p, r } => Pose::new(r.unwrap_or(start.r), *p),
         GoalSpec::Relative { frame, d, dyaw, dpitch, droll, level } => {
@@ -223,7 +236,7 @@ pub fn resolve_goal(input: &PlanInput, spec: &GoalSpec) -> Pose {
                     Pose::new(kinematics::mat_mul(&start.r, &local), p)
                 }
                 RelFrame::Camera => {
-                    let rec = kinematics::cam_mount(input.cam.flip, f64::from(input.cam.rot_deg), f64::from(input.cam.tilt_deg));
+                    let rec = input.arm.cam_mount(input.cam.flip, f64::from(input.cam.rot_deg), f64::from(input.cam.tilt_deg));
                     let rc = kinematics::cam_rotation(&start, &rec);
                     let p = kinematics::add(&start.p, &kinematics::mat_vec(&rc, d));
                     let mut r = start.r;
@@ -243,11 +256,19 @@ pub fn resolve_goal(input: &PlanInput, spec: &GoalSpec) -> Pose {
     }
 }
 
-fn num(body: &Value, key: &str) -> Result<Option<f64>, MotionError> {
+pub fn num(body: &Value, key: &str) -> Result<Option<f64>, MotionError> {
     match body.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(v) => v.as_f64().filter(|x| x.is_finite()).map(Some)
             .ok_or_else(|| MotionError::InvalidCommand(format!("{key} must be a finite number"))),
+    }
+}
+
+/// Optional boolean `key`; `default` when absent or null.
+pub fn flag(body: &Value, key: &str, default: bool) -> Result<bool, MotionError> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v.as_bool().ok_or_else(|| MotionError::InvalidCommand(format!("{key} must be a boolean"))),
     }
 }
 
@@ -261,7 +282,7 @@ fn vec_n<const N: usize>(v: &Value, key: &str) -> Result<[f64; N], MotionError> 
     Ok(out)
 }
 
-fn tag(body: &Value) -> Result<Option<String>, MotionError> {
+pub fn tag(body: &Value) -> Result<Option<String>, MotionError> {
     match body.get("tag") {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) if s.len() <= 64 => Ok(Some(s.clone())),
@@ -291,8 +312,18 @@ pub fn parse_speed(body: &Value) -> Result<Speed, MotionError> {
 
 /// Body of `/api/v1/action/move_to`.
 pub fn parse_move_to(body: &Value) -> Result<(GoalSpec, Speed, Option<String>), MotionError> {
-    let p = vec_n::<3>(body.get("position").unwrap_or(&Value::Null), "position")?;
-    let r = match body.get("orientation") {
+    let p = parse_position(body)?;
+    Ok((GoalSpec::Absolute { p, r: parse_orientation(body)? }, parse_speed(body)?, tag(body)?))
+}
+
+/// `position: [x, y, z]` (finite numbers).
+pub fn parse_position(body: &Value) -> Result<[f64; 3], MotionError> {
+    vec_n::<3>(body.get("position").unwrap_or(&Value::Null), "position")
+}
+
+/// `orientation: {"rpy": [r, p, y]} | {"quat": [w, x, y, z]} | null` (absent = None).
+pub fn parse_orientation(body: &Value) -> Result<Option<kinematics::Mat3>, MotionError> {
+    Ok(match body.get("orientation") {
         None | Some(Value::Null) => None,
         Some(o) => match (o.get("rpy"), o.get("quat")) {
             (Some(rpy), None) => { let v = vec_n::<3>(rpy, "orientation.rpy")?; Some(kinematics::rpy_to_r(v[0], v[1], v[2])) }
@@ -305,8 +336,7 @@ pub fn parse_move_to(body: &Value) -> Result<(GoalSpec, Speed, Option<String>), 
             }
             _ => return Err(MotionError::InvalidCommand("orientation must be {\"rpy\":[r,p,y]} or {\"quat\":[w,x,y,z]} or null".into())),
         },
-    };
-    Ok((GoalSpec::Absolute { p, r }, parse_speed(body)?, tag(body)?))
+    })
 }
 
 /// Body of `/api/v1/action/move_relative`.
@@ -661,7 +691,7 @@ impl ActiveTrajectory {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActionStatus {
     pub id: u64,
-    /// move_to | move_relative | gripper | grasp | joint_move | home | park
+    /// move_to | move_relative | gripper | grasp | place | joint_move | home | park | move_to_pose
     pub kind: String,
     pub tag: Option<String>,
     /// running | done | failed | cancelled

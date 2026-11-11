@@ -25,7 +25,8 @@ use crate::api::proxy::DetectorUpstream;
 use crate::api::rest::ApiError;
 use crate::kinematics::{self, Mat3, Pose, Vec3};
 use crate::model::CameraMount;
-use crate::motion::{self, GoalSpec, GripperCommand, GripperRequest, MotionError, PlanInput, RelFrame, Speed};
+use crate::macro_action::{fail, MacroCtx, Stop, SubDone};
+use crate::motion::{self, GoalSpec, GripperCommand, MotionError, PlanInput, RelFrame, Speed};
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -204,15 +205,6 @@ pub fn load_setup(path: &Path, base: &GraspSetup) -> (GraspSetup, LoadOutcome) {
     }
 }
 
-/// Write the setup atomically (temp file + rename), creating the directory.
-pub fn save_setup(path: &Path, setup: &GraspSetup) -> std::io::Result<()> {
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) { std::fs::create_dir_all(dir)?; }
-    let text = serde_json::to_string_pretty(setup).map_err(std::io::Error::other)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)
-}
-
 /// Load the persisted setup into the supervisor at startup (logs the outcome).
 pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
     let mut inner = supervisor.inner().write().await;
@@ -251,12 +243,22 @@ pub fn update_setup(inner: &mut SupervisorInner, body: &Value) -> Result<GraspSe
     match patch.remove("table_z_from_tcp") {
         None | Some(Value::Null) | Some(Value::Bool(false)) => {}
         Some(Value::Bool(true)) => {
-            let z = kinematics::fk(&kinematics::q6(&inner.commanded_positions)).p[2];
+            let Some(pose) = inner.config.arm_model.fk_f32(&inner.commanded_positions) else {
+                return Err(MotionError::InvalidCommand("commanded positions are not a valid joint vector".into()).into());
+            };
+            let z = pose.p[2];
             patch.insert("table_z_m".into(), serde_json::json!((z * 1e4).round() / 1e4));
         }
         Some(_) => return Err(MotionError::InvalidCommand("table_z_from_tcp must be boolean".into()).into()),
     }
     let setup = base.patched(&Value::Object(patch)).map_err(MotionError::InvalidCommand)?;
+    // the camera tilt is workspace geometry (camera check point): it cannot change under an
+    // accepted motion; other setup fields can
+    if setup.camera_tilt_deg as f32 != inner.config.camera_mount.tilt_deg {
+        if let Some(reason) = inner.workspace_change_blocker() {
+            return Err(MotionError::MotionBusy(format!("camera_tilt_deg cannot change while {reason}")).into());
+        }
+    }
     inner.set_grasp_setup(setup.clone());
     Ok(setup)
 }
@@ -550,9 +552,9 @@ pub struct CamModel {
 impl CamModel {
     /// The controller's model: mount flip / rot from the config, tilt and rough intrinsics from
     /// the setup, optical centre at `camera_mount.offset_m` (end_link origin when unset).
-    pub fn assumed(setup: &GraspSetup, mount: &CameraMount) -> Self {
+    pub fn assumed(arm: &crate::chain::ArmModel, setup: &GraspSetup, mount: &CameraMount) -> Self {
         Self {
-            rec: kinematics::cam_mount(mount.flip, f64::from(mount.rot_deg), setup.camera_tilt_deg),
+            rec: arm.cam_mount(mount.flip, f64::from(mount.rot_deg), setup.camera_tilt_deg),
             offset: mount.offset_m.map(|o| o.map(f64::from)).unwrap_or([0.0; 3]),
             fx: setup.fx_px, fy: setup.fy_px,
             cx: setup.image_size_px[0] / 2.0, cy: setup.image_size_px[1] / 2.0,
@@ -684,8 +686,8 @@ fn approach_pose(r_now: &Mat3, target: &Vec3, setup: &GraspSetup) -> Pose {
 pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     let PendingGrasp { input, request, open_rad } = pending;
     let setup = &request.setup;
-    let pose = kinematics::fk(&input.q0);
-    let cam = CamModel::assumed(setup, &input.cam);
+    let pose = input.arm.fk(&input.q0);
+    let cam = CamModel::assumed(&input.arm, setup, &input.cam);
     let centre = cam.to_px(box_centre(&request.box_norm));
     let target = cam.plane_point(&pose, centre, grasp_plane(setup)).ok_or_else(|| ArmError::from(MotionError::InvalidCommand(
         "the box centre ray does not meet the table plane in front of the camera".into())))?;
@@ -712,139 +714,40 @@ pub async fn start(supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSou
     };
     let planned = tokio::task::spawn_blocking(move || plan(pending)).await
         .map_err(|e| ArmError::Internal(format!("planner task failed: {e}")))??;
-    let id = supervisor.inner().write().await.begin_grasp(&planned.input, planned.request.tag.clone())?;
+    let id = supervisor.inner().write().await.begin_macro("grasp", &planned.input, planned.request.tag.clone())?;
     let duration = expected_duration(&planned);
     spawn(supervisor.clone(), source, id, planned);
     Ok((id, duration))
 }
 
-/// Spawn the orchestrator for an action begun with `SupervisorInner::begin_grasp`.
+/// Spawn the orchestrator for an action begun with `SupervisorInner::begin_macro("grasp", ..)`.
 pub fn spawn(supervisor: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64, planned: PlannedGrasp) {
     tokio::spawn(run(supervisor, source, id, planned));
 }
 
 // ---- orchestrator ----
 
-/// How a phase ended early.
-#[derive(Debug, Clone, PartialEq)]
-enum Stop {
-    /// The action already ended (stop, E-stop, lease, supersede): exit without touching it.
-    Cancelled,
-    Fail(String, String),
-}
+const POLL: Duration = crate::macro_action::POLL;
 
-fn fail(code: &str, message: impl Into<String>) -> Stop { Stop::Fail(code.into(), message.into()) }
-
-fn arm_fail(e: ArmError) -> Stop {
-    let api = ApiError::from(e);
-    Stop::Fail(api.code.unwrap_or_else(|| api.error.clone()), api.message)
-}
-
-/// Result of a finished sub-motion.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SubDone {
-    pub settled: Option<bool>,
-    pub holding: Option<bool>,
-    pub gripper_gap_rad: Option<f32>,
-    pub at: Instant,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum SubState {
-    Idle,
-    Running,
-    Done(SubDone),
-    Failed { code: String, message: String },
-}
-
-/// Supervisor-side record of a running grasp.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GraspRun {
-    pub id: u64,
-    pub epoch: u64,
-    pub sub: SubState,
-    /// `/motion/stop` arrived while no sub-motion was running.
-    pub stop_requested: bool,
-}
-
-const POLL: Duration = Duration::from_millis(20);
-
+/// Grasp phases on top of the shared macro-action primitives ([`MacroCtx`], via `Deref`).
 struct Orchestrator {
-    sup: Arc<ArmSupervisor>,
+    ctx: MacroCtx,
     source: Arc<dyn DetectionSource>,
-    id: u64,
     setup: GraspSetup,
     cam: CamModel,
-    deadline: Instant,
     /// Each centring step triggers its own frame (perception API 2) instead of reading the
     /// continuous results.
     triggered: bool,
 }
 
+impl std::ops::Deref for Orchestrator {
+    type Target = MacroCtx;
+    fn deref(&self) -> &MacroCtx { &self.ctx }
+}
+
 impl Orchestrator {
-    async fn alive(&self) -> bool { self.sup.inner().read().await.grasp_alive(self.id) }
-
-    async fn check(&self) -> Result<(), Stop> {
-        if !self.alive().await { return Err(Stop::Cancelled); }
-        if Instant::now() > self.deadline { return Err(fail("GRASP_TIMEOUT", format!("Grasp did not finish within {:.0} s", self.setup.timeout_s))); }
-        Ok(())
-    }
-
-    async fn phase(&self, phase: &str, progress: f32) -> Result<(), Stop> {
-        self.check().await?;
-        self.sup.inner().write().await.set_grasp_phase(self.id, phase, progress, None, None);
-        Ok(())
-    }
-
-    async fn pose(&self) -> Pose { kinematics::fk(&kinematics::q6(&self.sup.inner().read().await.commanded_positions)) }
-
-    /// Wait for the installed sub-motion; stop it on a timeout.
-    async fn wait_sub(&self, phase: &str, limit_s: f64) -> Result<SubDone, Stop> {
-        let until = Instant::now() + Duration::from_secs_f64(limit_s.min(self.setup.phase_timeout_s));
-        loop {
-            tokio::time::sleep(POLL).await;
-            let mut inner = self.sup.inner().write().await;
-            if !inner.grasp_alive(self.id) { return Err(Stop::Cancelled); }
-            match inner.grasp_sub(self.id) {
-                Some(SubState::Done(d)) => return Ok(d),
-                Some(SubState::Failed { code, message }) => return Err(Stop::Fail(code, message)),
-                _ => {}
-            }
-            let now = Instant::now();
-            if now > until || now > self.deadline {
-                inner.stop_motion();
-                return Err(fail("GRASP_TIMEOUT", format!("Phase {phase} did not finish in time")));
-            }
-        }
-    }
-
     async fn move_arm(&self, phase: &str, spec: GoalSpec, linear: f64) -> Result<SubDone, Stop> {
-        let input = {
-            let inner = self.sup.inner().read().await;
-            if !inner.grasp_alive(self.id) { return Err(Stop::Cancelled); }
-            inner.plan_input().map_err(arm_fail)?
-        };
-        let goal = motion::resolve_goal(&input, &spec);
-        let speed = Speed { linear, angular: motion::DEFAULT_ANGULAR_RPS };
-        let (input, planned) = tokio::task::spawn_blocking(move || { let p = motion::plan_cartesian(&input, goal, speed); (input, p) }).await
-            .map_err(|e| fail("INTERNAL", format!("planner task failed: {e}")))?;
-        let path = planned.map_err(|e| arm_fail(e.into()))?;
-        let limit = {
-            let mut inner = self.sup.inner().write().await;
-            if !inner.grasp_alive(self.id) { return Err(Stop::Cancelled); }
-            inner.install_grasp_path(self.id, &input, path).map_err(arm_fail)?
-        };
-        self.wait_sub(phase, limit * 2.0 + 5.0).await
-    }
-
-    async fn gripper(&self, phase: &str, command: GripperCommand) -> Result<SubDone, Stop> {
-        let request = GripperRequest { command, fraction: None, grasp: command == GripperCommand::Close, speed: 1.0, timeout_s: 8.0, tag: None };
-        let limit = {
-            let mut inner = self.sup.inner().write().await;
-            if !inner.grasp_alive(self.id) { return Err(Stop::Cancelled); }
-            inner.start_grasp_gripper(self.id, request).map_err(arm_fail)?
-        };
-        self.wait_sub(phase, limit + 10.0).await
+        self.ctx.move_arm(phase, spec, Speed { linear, angular: motion::DEFAULT_ANGULAR_RPS }).await
     }
 
     /// Next fresh frame (captured after `since` + settle delay) containing the target.
@@ -931,7 +834,7 @@ impl Orchestrator {
                 ys.push(c[1]);
                 let err = (c[0] - grip_px[0]).hypot(c[1] - grip_px[1]);
                 if err <= s.centre_tol_px { consecutive += 1; } else { consecutive = 0; }
-                self.sup.inner().write().await.set_grasp_phase(self.id, "centring", 0.3, Some(iteration), Some(err as f32));
+                self.sup.inner().write().await.set_action_phase(self.id, "centring", 0.3, Some(iteration), Some(err as f32));
                 if consecutive >= s.stable_frames { break None; }
                 let m = s.median_frames as usize;
                 if xs.len() >= m {
@@ -987,11 +890,6 @@ impl Orchestrator {
         Ok((true, closed.gripper_gap_rad))
     }
 
-    async fn gripper_phase(&self, phase: &str, progress: f32, command: GripperCommand) -> Result<SubDone, Stop> {
-        self.phase(phase, progress).await?;
-        self.gripper(phase, command).await
-    }
-
     /// ±pi/2 about the tool axis when the jaws would close across the long side.
     async fn align_turn(&self, det: &Detection) -> Option<f64> {
         let b = det.box_norm;
@@ -1013,11 +911,15 @@ impl Orchestrator {
 
 async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64, planned: PlannedGrasp) {
     let setup = planned.request.setup.clone();
-    let cam = CamModel::assumed(&setup, &planned.input.cam);
+    let cam = CamModel::assumed(&planned.input.arm, &setup, &planned.input.cam);
     let deadline = Instant::now() + Duration::from_secs_f64(setup.timeout_s);
     let per_request = source.per_request_pipelines().await;
     let triggered = per_request == Ok(true);
-    let orch = Orchestrator { sup: sup.clone(), source: source.clone(), id, deadline, setup, cam, triggered };
+    let ctx = MacroCtx {
+        sup: sup.clone(), id, deadline, phase_timeout_s: setup.phase_timeout_s, timeout_code: "GRASP_TIMEOUT",
+        timeout_message: format!("Grasp did not finish within {:.0} s", setup.timeout_s),
+    };
+    let orch = Orchestrator { ctx, source: source.clone(), setup, cam, triggered };
     let result = if let Err(e) = per_request {
         Err(fail("DETECTION_UNAVAILABLE", format!("Cannot reach the vision provider: {e}")))
     } else if triggered {
@@ -1063,13 +965,13 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
     } };
     let mut inner = sup.inner().write().await;
     match result {
-        Ok((holding, gap)) => inner.finish_grasp(id, "done", None, None, Some(holding), gap),
+        Ok((holding, gap)) => inner.finish_macro(id, "done", None, None, Some(holding), gap),
         Err(Stop::Fail(code, message)) => {
             tracing::info!("Grasp {id} failed: {code} {message}");
             let holding = if code == "NOT_HOLDING" { Some(false) } else { None };
-            inner.finish_grasp(id, "failed", Some(&code), Some(message), holding, None);
+            inner.finish_macro(id, "failed", Some(&code), Some(message), holding, None);
         }
-        Err(Stop::Cancelled) => inner.finish_grasp(id, "cancelled", None, None, None, None),
+        Err(Stop::Cancelled) => inner.finish_macro(id, "cancelled", None, None, None, None),
     }
 }
 
@@ -1110,7 +1012,7 @@ mod tests {
     #[allow(clippy::approx_constant)]
     fn ray_and_projection_round_trip() {
         let setup = GraspSetup { camera_tilt_deg: 20.0, ..Default::default() };
-        let cam = CamModel::assumed(&setup, &CameraMount::default());
+        let cam = CamModel::assumed(&crate::chain::ArmModel::RebotDevArm, &setup, &CameraMount::default());
         let pose = Pose::new(look_down(&kinematics::fk(&[0.0, -1.167, -1.565, 1.435, 0.0, 1.5708]).r), [0.3, 0.05, 0.2]);
         assert!(kinematics::column(&pose.r, 0)[2] < -0.999999);
         let p = cam.plane_point(&pose, [300.0, 200.0], 0.01).unwrap();

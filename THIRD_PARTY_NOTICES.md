@@ -54,8 +54,89 @@ DEALINGS IN THE SOFTWARE.
   header comment describes the additions. These files
   are not covered by the MIT License of this repository.
 - The URDF refers to mesh files (`package://reBot-DevArm_description_fixend/meshes/*.STL`)
-  that are not included here; armd does not load meshes. They are available from the
-  upstream repository under the same license.
+  that are not included here. armd does not load meshes; the cockpit 3D view serves this URDF
+  from `/assets/model/` and replaces those meshes with the decimated DM meshes listed below.
+
+## three.js and urdf-loader (cockpit 3D view)
+
+- File: `src/api/vendor/three-urdf.min.js.gz` (embedded in the `armd` binary and served at
+  `/assets/three-urdf.min.js` with `Content-Encoding: gzip`; the cockpit loads it only when the
+  3D view is opened). One minified ES module built by `scripts/vendor_three.mjs` with esbuild
+  0.25.10 from npm `three@0.186.1` (the classes the view uses, `OrbitControls`, `STLLoader`) and
+  `urdf-loader@0.13.1` (`src/URDFLoader.js`, `src/URDFClasses.js`). Modifications: bundled and
+  minified; urdf-loader's import of three.js `ColladaLoader` is replaced by a stub that throws.
+  sha256 of the `.gz` file: `c5ab604e2dfeb6daa9fe436e54d069515b53b45581c00ad021d7b2594fffb133`.
+- three.js: https://github.com/mrdoob/three.js, License: MIT.
+
+```text
+The MIT License
+
+Copyright © 2010-2026 three.js authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
+- urdf-loader: https://github.com/gkjohnson/urdf-loaders (`javascript/`), License: Apache-2.0
+  (full text: `kits/recamera-b601dm/vision/LICENSE-APACHE`, the same Apache License 2.0).
+
+```text
+Copyright © 2020 California Institute of Technology. ALL RIGHTS
+RESERVED. United States Government Sponsorship Acknowledged.
+Neither the name of Caltech nor its operating division, the
+Jet Propulsion Laboratory, nor the names of its contributors may be
+used to endorse or promote products derived from this software
+without specific prior written permission.
+```
+
+## reBot B601-DM visual meshes (cockpit 3D view)
+
+- Files: `kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/assets/meshes/` (34 STL
+  files, `manifest.json`, `NOTICE.md`, `LICENSE-CERN-OHL-W-2.0.txt`; 2.8 MB), installed by the
+  `.deb` to `/usr/share/rebot-teleop/assets/meshes/` and served by armd at
+  `/assets/model/meshes/`. Not embedded in the binary and not part of the lite tarball.
+- Upstream: https://github.com/Seeed-Projects/reBot-DevArm, `Rebot_Arm_description/DM/meshes/visual`
+  and `meshes/shared`, commit `b2287b6`. Copyright 2026 Seeed Studio Co., Ltd.
+- License: CERN-OHL-W-2.0; the full text is installed next to the meshes.
+- Modifications (2026-11-11): simplified to about 12 % of the triangles (at least 300 per part) by
+  `scripts/decimate_meshes.py`, `colored_` prefix removed, `manifest.json` added (part to link
+  mapping and colours from the upstream URDF materials). See `NOTICE.md` in that directory.
+
+## reBot B601-RS robot description (URDF)
+
+- File: `assets/ReBot_Arm_RS.urdf`, read at startup by armd when a profile names it
+  (`profiles/rebot_b601_rs.json`).
+- Upstream: https://github.com/Seeed-Projects/reBot-DevArm,
+  `Rebot_Arm_description/RS/urdf/ReBot_Arm_RS.urdf` at commit `a3155aa`, unmodified
+  (sha256 `3838ca8f9d586be22a89b33c7cbdd4abd43d4a92a2de377b294eef4c5bd7654d`).
+- License: CERN-OHL-W-2.0, as the B601-DM URDF above. Not covered by the MIT License of this
+  repository. The meshes it refers to are not included.
+
+## reBot B601-DM MuJoCo scene (simulator)
+
+- File: `sim/mujoco/models/rebot_b601dm_scene.xml`.
+- Derived from: the arm chain and inertials of `assets/reBot-DevArm_gripper.urdf` (above) and
+  the gripper collision extents of `Rebot_Arm_description/DM/mjcf/rebotarm_b601_colored.xml` of
+  https://github.com/Seeed-Projects/reBot-DevArm.
+- License: CERN-OHL-W-2.0 (https://ohwr.org/cern_ohl_w_v2.txt). Not covered by the MIT License
+  of this repository. The file header records the modifications (box primitives instead of
+  meshes, actuators, table and cube; 2026-11-11). No upstream meshes are included; the
+  simulator loads them from a reBot-DevArm checkout named by `REBOT_DEVARM_DIR`, when set.
 
 ## reCamera mount CAD (kit hardware)
 
@@ -175,6 +256,13 @@ and/or Apache-2.0). The license of every crate in the dependency tree can be lis
 [`cargo-deny`](https://crates.io/crates/cargo-deny). A statically linked `armd` binary
 contains code from these crates and from the Rust standard library (MIT OR Apache-2.0)
 and, for the reCamera build, musl libc (MIT).
+
+Crates added for a specific feature:
+
+- `roxmltree` 0.21 (MIT OR Apache-2.0, Copyright (c) 2018 Yevhenii Reizner): read-only
+  XML tree used by `src/urdf.rs` to read the URDF named by a profile's `urdf` field. It has
+  no dependencies of its own; a hand-written XML reader would be more code to review than
+  the crate, and the URDF is only read once at startup.
 
 ## Not included
 

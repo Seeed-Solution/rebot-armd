@@ -29,6 +29,8 @@ tempfile = "3"
 serialport = { version = "4", default-features = false }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 libc = "0.2"
+# URDF parsing for profile kinematic chains (src/urdf.rs); no dependencies of its own.
+roxmltree = "0.21"
 
 # Style lints that the code base does not follow; everything else is denied in CI
 # (`cargo clippy --all-targets -- -D warnings`).

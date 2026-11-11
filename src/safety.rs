@@ -35,6 +35,84 @@ pub enum FaultReason {
     Other(String),
 }
 
+/// Declares [`FaultCode`] and [`FaultCode::ALL`] from one list, so `ALL` names every variant.
+macro_rules! fault_codes {
+    ($(#[$doc:meta])* pub enum FaultCode { $($(#[$vdoc:meta])* $variant:ident,)* }) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+        pub enum FaultCode { $($(#[$vdoc])* $variant,)* }
+
+        impl FaultCode {
+            /// Every variant, in declaration order.
+            pub const ALL: &'static [FaultCode] = &[$(FaultCode::$variant,)*];
+        }
+    };
+}
+
+fault_codes! {
+    /// Machine-readable cause of the current Fault / EStop (`observation.fault.code`).
+    pub enum FaultCode {
+        Estop,
+        BusLoss,
+        ThermalTrip,
+        JointLimit,
+        WatchdogTimeout,
+        FollowingError,
+        ControlDeadline,
+        InvalidTelemetry,
+        DriverWriteFailed,
+        HardwareFault,
+        EnableFailed,
+        ServoNoBrake,
+        HandoverUnsettled,
+        GravityCompFailed,
+        /// Collision guard: more trips than `collision.max_auto_resumes` within the window.
+        Collision,
+        Other,
+    }
+}
+
+impl FaultCode {
+    /// Hint for client recovery policies; armd never clears a fault by itself.
+    pub fn recoverable(self) -> bool {
+        matches!(self, FaultCode::WatchdogTimeout | FaultCode::ControlDeadline | FaultCode::HandoverUnsettled)
+    }
+
+    /// Code implied by a reason when the trigger site gave none.
+    pub fn from_reason(reason: &FaultReason) -> Self {
+        match reason {
+            FaultReason::JointLimitExceeded { .. } => FaultCode::JointLimit,
+            FaultReason::ThermalTrip { .. } => FaultCode::ThermalTrip,
+            FaultReason::BusLoss => FaultCode::BusLoss,
+            FaultReason::WatchdogTimeout => FaultCode::WatchdogTimeout,
+            FaultReason::Other(_) => FaultCode::Other,
+        }
+    }
+}
+
+/// `observation.fault`: present whenever the safety state is Fault or EStop.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaultInfo {
+    pub code: FaultCode,
+    pub message: String,
+    pub recoverable: bool,
+}
+
+impl FaultReason {
+    pub fn message(&self) -> String {
+        match self {
+            FaultReason::JointLimitExceeded { joint_name, value, min, max, .. } =>
+                format!("Joint '{joint_name}' at {value:.4} outside [{min:.4}, {max:.4}]"),
+            FaultReason::ThermalTrip { joint_idx, temperature, limit } =>
+                format!("Joint {} temperature {temperature:.1} C above limit {limit:.1} C", joint_idx + 1),
+            FaultReason::BusLoss => "No fresh feedback from every joint (bus loss)".into(),
+            FaultReason::WatchdogTimeout => "Control lease expired while torqued".into(),
+            FaultReason::Other(m) => m.clone(),
+        }
+    }
+}
+
 /// Safety state machine states
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SafetyState {
@@ -103,6 +181,9 @@ pub enum SafetyError {
     #[error("Motion busy: an action trajectory is running")]
     MotionBusy,
 
+    #[error("{0}")]
+    CollisionHold(String),
+
     #[error("Target outside the safe workspace: check point {point} {limit} {value:.3} m beyond bound {bound:.3} m")]
     WorkspaceViolation { point: usize, limit: String, value: f32, bound: f32 },
 }
@@ -112,6 +193,8 @@ pub enum SafetyError {
 pub struct SafetyManager {
     state: SafetyState,
     epoch_id: u64,
+    /// Code recorded by the trigger site of the current Fault.
+    fault_code: Option<FaultCode>,
 }
 
 impl Default for SafetyManager {
@@ -119,6 +202,7 @@ impl Default for SafetyManager {
         Self {
             state: SafetyState::Idle,
             epoch_id: 1,
+            fault_code: None,
         }
     }
 }
@@ -146,9 +230,26 @@ impl SafetyManager {
         self.epoch_id
     }
 
-    /// Advance epoch and latch Fault immediately
+    /// Structured cause of the current Fault / EStop; None in any other state.
+    pub fn fault(&self) -> Option<FaultInfo> {
+        let (code, message) = match &self.state {
+            SafetyState::EStop => (FaultCode::Estop, "E-stop latched".to_string()),
+            SafetyState::Fault(reason) => (self.fault_code.unwrap_or_else(|| FaultCode::from_reason(reason)), reason.message()),
+            _ => return None,
+        };
+        Some(FaultInfo { code, message, recoverable: code.recoverable() })
+    }
+
+    /// Advance epoch and latch Fault immediately; the code follows from the reason.
     pub fn trigger_fault(&mut self, reason: FaultReason) -> u64 {
-        tracing::warn!("Safety: {:?} -> Fault({:?})", self.state, reason);
+        let code = FaultCode::from_reason(&reason);
+        self.trigger_fault_coded(code, reason)
+    }
+
+    /// [`Self::trigger_fault`] with the code recorded by the trigger site.
+    pub fn trigger_fault_coded(&mut self, code: FaultCode, reason: FaultReason) -> u64 {
+        tracing::warn!("Safety: {:?} -> Fault({:?}) [{code:?}]", self.state, reason);
+        self.fault_code = Some(code);
         self.state = SafetyState::Fault(reason);
         self.epoch_id = self.epoch_id.wrapping_add(1);
         self.epoch_id
@@ -161,6 +262,7 @@ impl SafetyManager {
             SafetyState::EStop | SafetyState::Fault(_) => {
                 tracing::info!("Safety: {:?} cleared -> Idle", self.state);
                 self.state = SafetyState::Idle;
+                self.fault_code = None;
                 self.epoch_id = self.epoch_id.wrapping_add(1);
                 Ok(self.state.clone())
             }
