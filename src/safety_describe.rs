@@ -196,6 +196,19 @@ impl SupervisorInner {
             "check_points_end_m": ws.check_points_end_m,
         }));
         let keepout = self.keepout_state();
+        let hw = c.hardware.clone().unwrap_or_default();
+        let notes = hw.notes.clone().unwrap_or_else(|| {
+            let mut n = Vec::new();
+            if !hw.physical_estop { n.push("software stops only; no wired emergency stop".to_string()); }
+            n.push("motor behaviour when CAN is physically lost depends on the motor's own timeout (unverified)".into());
+            n.push("thermal trip and a completed watchdog park turn torque off; every other stop holds position with torque on".into());
+            n
+        });
+        let hardware = json!({
+            "physical_estop": hw.physical_estop,
+            "torque_off_on_fault": false,
+            "notes": notes,
+        });
 
         json!({
             "describe_version": DESCRIBE_VERSION,
@@ -237,15 +250,7 @@ impl SupervisorInner {
             },
             "stops": stops,
             "faults": faults(),
-            "hardware": {
-                "physical_estop": false,
-                "torque_off_on_fault": false,
-                "notes": [
-                    "software stops only; no wired emergency stop",
-                    "motor behaviour when CAN is physically lost depends on the motor's own timeout (unverified)",
-                    "thermal trip and a completed watchdog park turn torque off; every other stop holds position with torque on",
-                ],
-            },
+            "hardware": hardware,
             "not_a_safety_function": true,
         })
     }

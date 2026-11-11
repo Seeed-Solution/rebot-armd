@@ -206,3 +206,18 @@ async fn collision_stop_only_with_the_capability_and_follows_the_runtime_setting
     assert_eq!(c["source"], "runtime");
     assert_eq!(c["thresholds_nm"], json!(guarded.inner().read().await.collision_thresholds()));
 }
+
+#[tokio::test]
+async fn hardware_section_follows_the_profile() {
+    let mut config = ArmConfig::rebot_dm();
+    let json: serde_json::Value = serde_json::from_str(r#"{"physical_estop": true}"#).unwrap();
+    config.hardware = Some(serde_json::from_value(json).unwrap());
+    let d = describe(&ArmSupervisor::new(config.clone())).await;
+    assert_eq!(d["hardware"]["physical_estop"], true);
+    let notes = d["hardware"]["notes"].as_array().unwrap();
+    assert!(notes.iter().all(|n| n != "software stops only; no wired emergency stop"), "{notes:?}");
+    assert_eq!(notes.len(), 2);
+    config.hardware = Some(armd::model::HardwareInfo { physical_estop: true, notes: Some(vec!["mushroom button on the base cuts motor power".into()]) });
+    let d = describe(&ArmSupervisor::new(config)).await;
+    assert_eq!(d["hardware"]["notes"], json!(["mushroom button on the base cuts motor power"]));
+}

@@ -458,6 +458,10 @@ pub struct ArmConfig {
     /// Collision guard (`src/collision.rs`); None = defaults, guard off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collision: Option<crate::collision::CollisionPolicy>,
+    /// Facts about the installed hardware published by `/api/v1/safety/describe`;
+    /// None = no wired emergency stop and the default notes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<HardwareInfo>,
     /// URDF file for `kinematics` / `gravity_model` = `Urdf`, relative to the profile file's
     /// directory (or absolute). Read once at startup by [`ArmConfig::load_arm_model`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -475,6 +479,17 @@ pub struct ArmConfig {
     /// Arm model built from the fields above (not part of the profile JSON).
     #[serde(skip)]
     pub arm_model: crate::chain::ArmModel,
+}
+
+/// Profile field `hardware`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct HardwareInfo {
+    /// A wired emergency stop that removes motor power is installed.
+    #[serde(default)]
+    pub physical_estop: bool,
+    /// Replaces the default notes when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<Vec<String>>,
 }
 
 impl Default for ArmConfig {
@@ -526,6 +541,7 @@ impl Default for ArmConfig {
             damiao_ranges: None,
             speed_cap: None,
             collision: None,
+            hardware: None,
             urdf: None,
             urdf_sha256: None,
             chain: None,
@@ -800,6 +816,7 @@ impl ArmConfig {
             ]),
             speed_cap: None,
             collision: None,
+            hardware: None,
             urdf: None,
             urdf_sha256: None,
             chain: None,

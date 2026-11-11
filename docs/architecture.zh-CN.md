@@ -54,6 +54,7 @@ rebot-armd 分三层。核心可在任何受支持的控制器上运行；套件
 | `collision` | 碰撞保护：`enabled`（默认 false）、`thresholds_nm`（J1..J6，真机实测前为占位值）、`persist_ticks`、`clear_ratio`、`resume_after_s`、`max_auto_resumes`、`escalate_window_s`；各项可选 | 否 |
 | `kinematics` | 运动学模型：`RebotDevArm`（内置 B601-DM，要求 `dof` 为 7）或 `Urdf`（`urdf` 中的 `chain`）；为 null 时关闭笛卡尔动作和工作空间检查 | 否 |
 | `workspace` | 笛卡尔安全盒（`floor_z_m`、`box_min_m`、`box_max_m`、`max_reach_m`、`check_points_end_m`、`keepout_boxes` `[{name, min_m, max_m}]`，最多 16 个） | 否 |
+| `hardware` | `{physical_estop: bool, notes: [str]}`，由 `/api/v1/safety/describe` 公开（默认：无硬线急停，内置说明） | 否 |
 | `gravity_model` | 重力模型：`RebotDevArm` 或 `Urdf`（`urdf` 中的惯性参数）；两个模型字段必须来自同一来源 | 否 |
 | `urdf` | `Urdf` 使用的 URDF 文件，相对 profile 文件所在目录；启动时读取一次 | 使用 `Urdf` 时必填 |
 | `urdf_sha256` | `urdf` 的期望 sha256；不一致时启动失败 | 否 |

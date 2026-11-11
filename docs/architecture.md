@@ -66,6 +66,7 @@ The `ArmConfig` JSON loaded with `armd --config <file>` (`src/model.rs`). Withou
 | `collision` | collision guard: `enabled` (default false), `thresholds_nm` (J1..J6, placeholders until measured on a real arm), `persist_ticks`, `clear_ratio`, `resume_after_s`, `max_auto_resumes`, `escalate_window_s`; each entry optional | no |
 | `kinematics` | kinematic model: `RebotDevArm` (built-in B601-DM, needs `dof` 7) or `Urdf` (the `chain` of `urdf`); null disables Cartesian actions and the workspace check | no |
 | `workspace` | Cartesian safety box (`floor_z_m`, `box_min_m`, `box_max_m`, `max_reach_m`, `check_points_end_m`, `keepout_boxes` `[{name, min_m, max_m}]`, at most 16) | no |
+| `hardware` | `{physical_estop: bool, notes: [str]}` published by `/api/v1/safety/describe` (default: no wired e-stop, built-in notes) | no |
 | `gravity_model` | gravity model: `RebotDevArm` or `Urdf` (inertials of `urdf`); both model fields must name the same source | no |
 | `urdf` | URDF file for `Urdf`, relative to the profile file; read once at startup | with `Urdf` |
 | `urdf_sha256` | expected sha256 of `urdf`; startup fails on a mismatch | no |
