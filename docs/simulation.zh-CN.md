@@ -142,7 +142,7 @@ rebot-vision 感知接口版本 2（[detection_api.md](detection_api.md)）：`G
 
 `tests/test_camera_grasp.py` 启动 `rebot-sim --camera` 和 `armd --follower sim`（`ARMD_DETECTOR_URL` 指向仿真器），回 home，工具朝下移到方块上方 0.20 m，经 armd 触发一次检测（`/api/v1/detection/trigger`），再以方块的框发送 `/api/v1/action/grasp`。armd 使用套件 profile 的副本，其中 `camera_mount.offset_m` 设为仿真器的镜头中心；请求用 `overrides` 覆盖 `grip_pixel_norm`（`/sim/camera` 中 0.15 m 接近高度的值）和 `fx_px` / `fy_px`（824）。之后抓取宏（`src/grasp.rs`）与真机流程相同：接近、在新触发的帧上对中、J6 对齐、下降、闭合、抬起。通过条件：动作 `done` 且 `holding: true`，`/sim/state` 中方块 `grasped`，抬起超过 5 cm，与 TCP 水平距离小于 3 cm。
 
-结果（spark-6124，2026-11-11，`pytest -s tests/test_camera_grasp.py`，135 s 内 2 项通过）：
+结果（spark-6124，2026-11-11，`pytest -s tests/test_camera_grasp.py`，v5 用例；135 s 内 2 项通过；加入相机朝下采集后重跑数值相同，seed 3 用例 37.2 s）：
 
 | 场景 | 观察位姿处的检测（640x360 归一化） | 对中修正次数 | 最终误差 | 抓取耗时 | 抬起后的方块 |
 |---|---|---|---|---|---|
@@ -151,7 +151,16 @@ rebot-vision 感知接口版本 2（[detection_api.md](detection_api.md)）：`G
 
 默认场景中 armd 的相机模型与仿真器完全一致（安装、镜头中心、fx 相同），接近后即已对中。armd 本身不计算抓取像素和镜头中心；真机上它们来自抓取设置和 profile。
 
-v8 支架（倾斜 −38°）：工具竖直朝下时，夹爪尖正下方桌面点在画面中的归一化 v 值为：距指尖 0 m 时 0.66，0.05 m 时 0.10，约 0.06 m 以外超出画面上沿（v < 0）（0.15 m 处 `grip_pixel_norm` 的 v = −0.40）。抓取宏的对中要求该点在接近高度处位于画面内（`grip_pixel_norm` ∈ [0, 1]，`approach_height_m` ≥ `grasp_height_m` + 0.02），因此 v8 安装不适用于当前的俯视抓取宏。此结论由安装几何计算得出，未在真机上验证。
+v8 支架（倾斜 −38°）：工具竖直朝下时，夹爪尖正下方桌面点在画面中的归一化 v 值为：距指尖 0 m 时 0.66，0.05 m 时 0.10，约 0.06 m 以外超出画面上沿（v < 0）（0.15 m 处 `grip_pixel_norm` 的 v = −0.40），因此在接近高度无法以俯视方式对中到 `grip_pixel_norm`。armd 对该安装使用相机朝下采集（`acquire_camera_down: auto`，见 [agent_action_api.md](agent_action_api.md#camera-down-acquisition--相机朝下采集)）：光轴竖直完成接近和对中，再转换到目标上方工具竖直的位姿。
+
+v8 用例（`v8_default`、`v8_seed3_cube_cup`）以 `--camera-rot-deg 90 --camera-tilt-deg -38` 启动 `rebot-sim`，armd 使用相同的 `camera_mount`（`rot_deg` 90、`tilt_deg` −38、仿真器的镜头中心）。观察位姿为工具从竖直向相机朝下俯仰一半（19°），画面中心射线距方块 2 cm；请求覆盖 `fx_px` / `fy_px` 和 `approach_height_m` 0.15，不覆盖 `grip_pixel_norm`。结果（同一次运行，270 s 内 4 项通过）：
+
+| 场景 | 观察位姿处的检测（640x360 归一化） | 对中修正次数 | 最终误差（相对画面中心） | 抓取耗时（预计） | 抬起后的方块 |
+|---|---|---|---|---|---|
+| v8，默认方块 (0.30, 0) | x 0.457, y 0.461, w 0.173, h 0.017（大部分被夹爪遮挡） | 2 | 10.0 px | 37.4 s（38.2 s） | `grasped`，抬起 0.105 m，两侧夹指接触，x、y 距起始位置 0.1 mm |
+| v8，`--objects cube,cup --seed 3`，方块 (0.232, −0.074) | x 0.453, y 0.432, w 0.091, h 0.075 | 3 | 5.5 px | 35.8 s（37.4 s） | `grasped`，抬起 0.105 m，杯子未被碰到 |
+
+两个用例都没有 `final_offset_px`：0.15 m 接近高度下，转换后夹爪下方的目标不在画面内，不取复查帧。仅在仿真中验证，未在真机上运行。
 
 ## 摩擦辨识（`rebot-sysid`）
 
