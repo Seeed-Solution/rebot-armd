@@ -73,7 +73,8 @@ pub fn parse_place(inner: &SupervisorInner, body: &Value) -> Result<PlaceRequest
         // the stored TCP; poses saved without kinematics carry none, so use FK of the positions
         let tcp = match &stored.tcp {
             Some(t) => Pose::new(kinematics::rpy_to_r(t.rpy[0], t.rpy[1], t.rpy[2]), t.position),
-            None if stored.positions.len() >= 6 => kinematics::fk(&kinematics::q6(&stored.positions)),
+            None if stored.positions.len() >= 6 => inner.config.arm_model.fk_f32(&stored.positions)
+                .ok_or_else(|| invalid(format!("pose '{name}' positions are not a valid joint vector")))?,
             None => return Err(invalid(format!("pose '{name}' has no TCP"))),
         };
         (Some(name.to_string()), tcp.p, Some(requested.unwrap_or(tcp.r)))
@@ -115,7 +116,7 @@ pub struct PlannedPlace {
 /// Under the lock: parse and check preconditions.
 pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<PendingPlace, ArmError> {
     if !body.is_object() { return Err(invalid("Command body must be an object")); }
-    if inner.config.dof != 7 || inner.config.kinematics.is_none() {
+    if !inner.config.six_plus_gripper() || inner.config.kinematics.is_none() {
         return Err(MotionError::Unsupported("Place needs a 7-DOF profile with kinematics and a gripper policy".into()).into());
     }
     let Some(policy) = inner.config.gripper_policy.as_ref() else {
@@ -139,7 +140,7 @@ fn above(req: &PlaceRequest) -> Vec3 { [req.target[0], req.target[1], req.target
 pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
     let PendingPlace { input, request, open_rad } = pending;
     let speed = request.speed();
-    let start = kinematics::fk(&input.q0);
+    let start = input.arm.fk(&input.q0);
     let r_place = request.orientation.unwrap_or(start.r);
     let mut cur = input.clone();
     let step = |cur: &mut PlanInput, goal: Pose| -> Result<f64, ArmError> {

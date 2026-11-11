@@ -256,7 +256,13 @@ impl SupervisorInner {
             "/usr/share/rebot-teleop/reBot-DevArm_gripper.urdf",
         ];
         let mut gravity_compensated = false;
-        for path in &candidate_urdf_paths {
+        if let Some(chain) = config.arm_model.chain() {
+            // Profile URDF: read and (with urdf_sha256) verified by ArmConfig::load_arm_model.
+            tracing::info!("Arm model from URDF '{}' ({} -> {}, {} joints, {:.3} kg moving)",
+                chain.robot, chain.base_link, chain.tip_link, chain.dof(), chain.moving_mass());
+            gravity_compensated = chain.moving_mass() > 0.0;
+        }
+        for path in candidate_urdf_paths.iter().filter(|_| config.arm_model.chain().is_none()) {
             if std::path::Path::new(path).exists() {
                 match crate::gravity::verify_urdf_sha256(path) {
                     Ok(()) => {
@@ -375,7 +381,7 @@ impl SupervisorInner {
     pub fn planning_limits(&self) -> Vec<crate::model::JointLimit> {
         let mut limits = self.config.limits.clone();
         let scale = self.config.speed_cap.and_then(|c| c.joint_velocity_scale).unwrap_or(1.0);
-        let gripper_idx = (self.config.dof >= 7).then_some(6);
+        let gripper_idx = self.config.gripper_index();
         for (i, limit) in limits.iter_mut().enumerate() {
             if Some(i) != gripper_idx {
                 if let Some(cap) = self.config.planned_max_velocity {
@@ -463,7 +469,7 @@ impl SupervisorInner {
         tracing::warn!(
             "Joint {} blocked during servo streaming ({why}; cmd {:.3} meas {:.3} rad): stream stopped, holding position",
             joint + 1, self.commanded_positions[joint], self.measured_positions[joint]);
-        let gripper_idx = (self.config.dof >= 7).then_some(6);
+        let gripper_idx = self.config.gripper_index();
         let grip_cmd = gripper_idx.map(|g| self.commanded_positions[g]);
         self.stop_motion();
         if self.measured_positions.iter().all(|q| q.is_finite()) {
@@ -487,7 +493,7 @@ impl SupervisorInner {
     /// (workspace and kinematics configured, 7-DOF arm).
     pub fn workspace_policy(&self) -> Option<(&crate::model::WorkspacePolicy, &crate::model::CameraMount)> {
         match (&self.config.workspace, self.config.kinematics) {
-            (Some(ws), Some(_)) if self.config.dof == 7 => Some((ws, &self.config.camera_mount)),
+            (Some(ws), Some(_)) if self.config.dof >= self.config.arm_dof() => Some((ws, &self.config.camera_mount)),
             _ => None,
         }
     }
@@ -499,9 +505,10 @@ impl SupervisorInner {
         samples: impl IntoIterator<Item = &'a [f32]>,
     ) -> Result<(), SafetyError> {
         let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
-        let v0 = crate::kinematics::workspace_violation(start, ws, cam);
+        let model = &self.config.arm_model;
+        let v0 = model.workspace_violation(start, ws, cam);
         for q in samples {
-            let v = crate::kinematics::workspace_violation(q, ws, cam);
+            let v = model.workspace_violation(q, ws, cam);
             if crate::kinematics::workspace_rejects(&v, &v0) {
                 let w = v.worst.unwrap_or(crate::kinematics::ViolationDetail { point: 0, limit: "invalid", value: f64::NAN, bound: 0.0, keepout: None });
                 return Err(SafetyError::WorkspaceViolation {
@@ -518,7 +525,7 @@ impl SupervisorInner {
     }
 
     fn gravity_output_enabled(&self) -> bool {
-        self.gravity_compensated && self.config.gravity_model.is_some() && matches!(self.config.dof, 6 | 7) && self.driver.as_ref().is_none_or(|d|
+        self.gravity_compensated && self.config.gravity_model.is_some() && self.config.dof >= self.config.arm_dof() && self.driver.as_ref().is_none_or(|d|
             d.lock().is_ok_and(|drv| drv.capabilities().torque_feedforward))
     }
 
@@ -1673,8 +1680,8 @@ impl SupervisorInner {
 
     /// Snapshot for planning a Cartesian action outside the lock.
     pub fn plan_input(&self) -> Result<PlanInput, ArmError> {
-        if self.config.kinematics.is_none() || self.config.dof != 7 {
-            return Err(MotionError::Unsupported("Cartesian actions need a 7-DOF profile with a kinematics model".into()).into());
+        if self.config.kinematics.is_none() || !self.config.six_plus_gripper() {
+            return Err(MotionError::Unsupported("Cartesian actions need a kinematics model with 6 arm joints and the gripper at joint 7".into()).into());
         }
         self.action_preconditions()?;
         self.gravity_comp_motion_busy()?;
@@ -1685,6 +1692,7 @@ impl SupervisorInner {
             speed_cap: self.config.speed_cap,
             ws: self.workspace_policy().map(|(ws, _)| ws.clone()),
             cam: self.config.camera_mount.clone(),
+            arm: self.config.arm_model.clone(),
             epoch: self.safety.epoch_id(),
         })
     }
@@ -1732,7 +1740,7 @@ impl SupervisorInner {
     /// Runtime grasp setup (`config.grasp`, with the camera tilt taken from `camera_mount`).
     /// None when the profile cannot grasp (no kinematics, gripper policy or grasp section).
     pub fn grasp_setup(&self) -> Option<crate::grasp::GraspSetup> {
-        if self.config.dof != 7 || self.config.kinematics.is_none() || self.config.gripper_policy.is_none() { return None; }
+        if !self.config.six_plus_gripper() || self.config.kinematics.is_none() || self.config.gripper_policy.is_none() { return None; }
         let mut s = self.config.grasp.clone()?;
         s.camera_tilt_deg = f64::from(self.config.camera_mount.tilt_deg);
         Some(s)
@@ -2267,11 +2275,10 @@ impl SupervisorInner {
 
         // The model torques are computed whenever the profile has a gravity model (for the
         // residuals); they drive the output only when gravity output is enabled.
-        let model_gravity = if self.config.gravity_model.is_some() && matches!(self.config.dof, 6 | 7)
-            && driver_feedback_ok && self.measured_positions.len() >= 6 {
-            let mut q = [0.0f32; 6];
-            q.copy_from_slice(&self.measured_positions[0..6]);
-            match crate::gravity::compute_gravity_torques(&q) {
+        let arm_dof = self.config.arm_dof();
+        let model_gravity = if self.config.gravity_model.is_some() && self.config.dof >= arm_dof
+            && driver_feedback_ok && self.measured_positions.len() >= arm_dof {
+            match self.config.arm_model.gravity_torques(&self.measured_positions[..arm_dof]) {
                 Ok(tau) if tau.iter().all(|t| t.is_finite()) => Some(tau),
                 Ok(_) => {
                     tracing::warn!("Gravity torque contains non-finite values, zeroing out");
@@ -2284,12 +2291,13 @@ impl SupervisorInner {
             }
         } else { None };
         match model_gravity.filter(|_| self.gravity_output_enabled()) {
-            Some(tau) => { self.gravity_torques.clear(); self.gravity_torques.extend_from_slice(&tau); }
+            Some(tau) => { self.gravity_torques.clear(); self.gravity_torques.extend_from_slice(&tau[..arm_dof]); }
             None => self.gravity_torques.clear(),
         }
         let torque_feedback = self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
         self.collision.torque_feedback = torque_feedback;
-        self.residual_torques = model_gravity.filter(|_| torque_feedback && self.feedback_numeric_valid && self.torques.len() >= 6)
+        // Residuals and the collision guard are per joint of a 6-joint arm.
+        self.residual_torques = model_gravity.filter(|_| arm_dof == 6 && torque_feedback && self.feedback_numeric_valid && self.torques.len() >= 6)
             .map(|tau| std::array::from_fn(|i| self.torques[i] - tau[i]))
             .filter(|r: &[f32; 6]| r.iter().all(|v| v.is_finite()));
 
@@ -2413,7 +2421,7 @@ impl SupervisorInner {
             // The 7-DOF gripper is excluded: Damiao POS_VEL trails its command by about
             // v / 2.2 rad (0.9 rad at 2 rad/s), and gripping an object leaves a lasting
             // error by design. Its own stall detection covers it.
-            let gripper_idx = (self.config.dof >= 7).then_some(6);
+            let gripper_idx = self.config.gripper_index();
             let outside = self.commanded_positions.iter().zip(&self.measured_positions).enumerate()
                 .find(|(i, (q, measured))| Some(*i) != gripper_idx
                     && (!measured.is_finite() || (*q - *measured).abs() > threshold))
@@ -2507,7 +2515,7 @@ impl SupervisorInner {
                 // The 7-DOF gripper is exempt: its far targets are expected (POS_VEL needs a
                 // lead to reach speed) and the per-joint servo step below still bounds its
                 // velocity and acceleration.
-                let gripper_idx = (self.config.dof >= 7).then_some(6);
+                let gripper_idx = self.config.gripper_index();
                 let has_dirty_jump = target.iter().enumerate().any(|(i, &tgt)| {
                     if Some(i) == gripper_idx {
                         false

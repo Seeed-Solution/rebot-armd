@@ -95,12 +95,15 @@ impl Default for FollowingErrorPolicy {
     fn default() -> Self { Self { max_error_rad: 0.5, persistence_ms: 500 } }
 }
 
+/// Gravity model: the built-in B601-DM model or the inertials of the profile URDF
+/// (`urdf` + `chain`, src/chain.rs).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum GravityModel { RebotDevArm }
+pub enum GravityModel { RebotDevArm, Urdf }
 
-/// Kinematic model used for the Cartesian workspace check and Cartesian actions.
+/// Kinematic model used for the Cartesian workspace check and Cartesian actions: the
+/// built-in B601-DM model or the profile URDF chain (`urdf` + `chain`, src/chain.rs).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum KinematicsModel { RebotDevArm }
+pub enum KinematicsModel { RebotDevArm, Urdf }
 
 /// Server-side Cartesian safety box, checked on the end_link pose (src/kinematics.rs).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -455,6 +458,23 @@ pub struct ArmConfig {
     /// Collision guard (`src/collision.rs`); None = defaults, guard off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collision: Option<crate::collision::CollisionPolicy>,
+    /// URDF file for `kinematics` / `gravity_model` = `Urdf`, relative to the profile file's
+    /// directory (or absolute). Read once at startup by [`ArmConfig::load_arm_model`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urdf: Option<String>,
+    /// Expected sha256 (hex) of the `urdf` file; startup fails on a mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urdf_sha256: Option<String>,
+    /// Arm chain inside `urdf` and its joint mapping (src/chain.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<crate::chain::ChainSpec>,
+    /// Gripper joint index. Absent: the joint after the arm joints when `dof` has one more
+    /// joint than the arm model (index 6 for the B601-DM), otherwise none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gripper_joint: Option<usize>,
+    /// Arm model built from the fields above (not part of the profile JSON).
+    #[serde(skip)]
+    pub arm_model: crate::chain::ArmModel,
 }
 
 impl Default for ArmConfig {
@@ -506,11 +526,80 @@ impl Default for ArmConfig {
             damiao_ranges: None,
             speed_cap: None,
             collision: None,
+            urdf: None,
+            urdf_sha256: None,
+            chain: None,
+            gripper_joint: None,
+            arm_model: crate::chain::ArmModel::RebotDevArm,
         }
     }
 }
 
 impl ArmConfig {
+    /// Number of arm joints of the kinematic / gravity model (6 for the built-in model).
+    pub fn arm_dof(&self) -> usize { self.arm_model.arm_dof() }
+
+    /// Index of the gripper joint, if the profile has one.
+    pub fn gripper_index(&self) -> Option<usize> {
+        self.gripper_joint.or_else(|| (self.dof > self.arm_dof()).then_some(self.arm_dof()))
+    }
+
+    /// The joint layout the Cartesian action planner, gravity compensation and the gripper
+    /// actions use: 6 arm joints followed by the gripper at index 6.
+    pub fn six_plus_gripper(&self) -> bool {
+        self.dof == 7 && self.arm_dof() == 6 && self.gripper_index() == Some(6)
+    }
+
+    /// Profile uses the URDF chain for kinematics or gravity.
+    pub fn uses_urdf(&self) -> bool {
+        self.kinematics == Some(KinematicsModel::Urdf) || self.gravity_model == Some(GravityModel::Urdf)
+    }
+
+    /// Read a profile JSON file and build its arm model (`urdf` relative to the file).
+    /// The result still needs [`Self::validate`].
+    pub fn from_profile_file(path: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        let file = std::fs::File::open(path).map_err(|e| format!("profile {}: {e}", path.display()))?;
+        let mut config: Self = serde_json::from_reader(std::io::BufReader::new(file))
+            .map_err(|e| format!("profile {}: {e}", path.display()))?;
+        config.load_arm_model(path.parent())?;
+        Ok(config)
+    }
+
+    /// Build [`Self::arm_model`] from `urdf` + `chain` when the profile uses `Urdf`;
+    /// `profile_dir` resolves a relative `urdf` path. Call before [`Self::validate`].
+    pub fn load_arm_model(&mut self, profile_dir: Option<&std::path::Path>) -> Result<(), String> {
+        if !self.uses_urdf() {
+            if self.urdf.is_some() || self.chain.is_some() {
+                return Err("urdf / chain are set but neither kinematics nor gravity_model is \"Urdf\"".into());
+            }
+            self.arm_model = crate::chain::ArmModel::RebotDevArm;
+            return Ok(());
+        }
+        let (Some(rel), Some(spec)) = (&self.urdf, &self.chain) else {
+            return Err("kinematics / gravity_model \"Urdf\" needs the urdf and chain fields".into());
+        };
+        let path = match profile_dir {
+            Some(dir) if std::path::Path::new(rel).is_relative() => dir.join(rel),
+            _ => std::path::PathBuf::from(rel),
+        };
+        let bytes = std::fs::read(&path).map_err(|e| format!("urdf {}: {e}", path.display()))?;
+        if let Some(expected) = &self.urdf_sha256 {
+            let actual = crate::gravity::compute_sha256(&bytes);
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(format!("urdf {}: sha256 {actual} does not match urdf_sha256 {expected}", path.display()));
+            }
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|e| format!("urdf {}: {e}", path.display()))?;
+        let chain = crate::chain::KinematicChain::from_urdf_str(text, spec)
+            .map_err(|e| format!("urdf {}: {e}", path.display()))?;
+        if self.gravity_model == Some(GravityModel::Urdf) && chain.moving_mass() <= 0.0 {
+            return Err(format!("urdf {}: gravity_model \"Urdf\" but the chain links have no mass", path.display()));
+        }
+        self.arm_model = crate::chain::ArmModel::Chain(std::sync::Arc::new(chain));
+        Ok(())
+    }
+
     /// Validate configuration invariants and auto-normalize joint names
     pub fn validate(&mut self) -> Result<(), String> {
         if self.profile_version == 0 || self.profile_version > ARM_PROFILE_VERSION {
@@ -561,8 +650,23 @@ impl ArmConfig {
                 "servo_max_lead_rad {} must be positive and below the following-error bound {} rad",
                 self.servo_max_lead_rad, self.following_error.max_error_rad));
         }
-        if self.kinematics.is_some() && self.dof != 7 {
+        let builtin = self.kinematics == Some(KinematicsModel::RebotDevArm) || self.gravity_model == Some(GravityModel::RebotDevArm);
+        if builtin && self.uses_urdf() {
+            return Err("kinematics and gravity_model must both be RebotDevArm or both Urdf".into());
+        }
+        if self.uses_urdf() != self.arm_model.chain().is_some() {
+            return Err("kinematics / gravity_model \"Urdf\" needs a loaded URDF chain (ArmConfig::load_arm_model)".into());
+        }
+        if self.kinematics == Some(KinematicsModel::RebotDevArm) && self.dof != 7 {
             return Err("kinematics requires dof == 7 (6 arm joints + gripper)".into());
+        }
+        if let Some(g) = self.gripper_joint {
+            if g >= self.dof || g < self.arm_dof() {
+                return Err(format!("gripper_joint {g} must be an index in {}..{} (after the arm joints)", self.arm_dof(), self.dof));
+            }
+        }
+        if self.uses_urdf() && (self.dof < self.arm_dof() || self.dof > self.arm_dof() + 1) {
+            return Err(format!("the URDF chain has {} joints; dof must be {} or {} (with a gripper)", self.arm_dof(), self.arm_dof(), self.arm_dof() + 1));
         }
         if let Some(ws) = &self.workspace { ws.validate()?; }
         let cam = &self.camera_mount;
@@ -587,7 +691,7 @@ impl ArmConfig {
             }
         }
         if let Some(gc) = &self.gravity_comp {
-            if self.dof != 7 || self.gravity_model.is_none() {
+            if !self.six_plus_gripper() || self.gravity_model.is_none() {
                 return Err("gravity_comp requires dof == 7 and a gravity_model".into());
             }
             gc.validate()?;
@@ -629,7 +733,7 @@ impl ArmConfig {
     pub fn servo_limits(&self) -> Vec<JointLimit> {
         let mut limits = self.limits.clone();
         if let Some(caps) = &self.servo_max_velocity {
-            let gripper_idx = (self.dof >= 7).then_some(6);
+            let gripper_idx = self.gripper_index();
             for (i, (limit, cap)) in limits.iter_mut().zip(caps).enumerate() {
                 if let (Some(cap), false) = (cap, Some(i) == gripper_idx) {
                     limit.max_velocity = limit.max_velocity.min(*cap);
@@ -696,6 +800,11 @@ impl ArmConfig {
             ]),
             speed_cap: None,
             collision: None,
+            urdf: None,
+            urdf_sha256: None,
+            chain: None,
+            gripper_joint: None,
+            arm_model: crate::chain::ArmModel::RebotDevArm,
         }
     }
 }
@@ -959,8 +1068,9 @@ impl Capabilities {
     /// Capabilities that follow from the profile alone. `gravity_comp` also depends on
     /// the driver and the URDF check; this sets it from the profile only.
     pub fn from_config(config: &ArmConfig) -> Self {
-        let seven = config.dof == 7;
+        let seven = config.six_plus_gripper();
         let kin = config.kinematics.is_some();
+        let six_arm = config.arm_dof() == 6 && matches!(config.dof, 6 | 7);
         let gripper = config.dof >= 7 && config.gripper_policy.is_some();
         Self {
             version: CAPABILITIES_VERSION,
@@ -978,11 +1088,11 @@ impl Capabilities {
             poses: true,
             keepout: kin && config.workspace.is_some(),
             speed_cap: true,
-            residual_torques: config.gravity_model.is_some() && matches!(config.dof, 6 | 7),
+            residual_torques: config.gravity_model.is_some() && six_arm,
             tick_stats: true,
             place: seven && kin && config.gripper_policy.is_some(),
             // The driver half is applied by ArmSupervisor::get_schema.
-            collision_guard: config.gravity_model.is_some() && matches!(config.dof, 6 | 7),
+            collision_guard: config.gravity_model.is_some() && six_arm,
             safety_describe: true,
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }

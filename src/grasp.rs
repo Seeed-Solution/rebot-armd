@@ -252,7 +252,10 @@ pub fn update_setup(inner: &mut SupervisorInner, body: &Value) -> Result<GraspSe
     match patch.remove("table_z_from_tcp") {
         None | Some(Value::Null) | Some(Value::Bool(false)) => {}
         Some(Value::Bool(true)) => {
-            let z = kinematics::fk(&kinematics::q6(&inner.commanded_positions)).p[2];
+            let Some(pose) = inner.config.arm_model.fk_f32(&inner.commanded_positions) else {
+                return Err(MotionError::InvalidCommand("commanded positions are not a valid joint vector".into()).into());
+            };
+            let z = pose.p[2];
             patch.insert("table_z_m".into(), serde_json::json!((z * 1e4).round() / 1e4));
         }
         Some(_) => return Err(MotionError::InvalidCommand("table_z_from_tcp must be boolean".into()).into()),
@@ -551,9 +554,9 @@ pub struct CamModel {
 impl CamModel {
     /// The controller's model: mount flip / rot from the config, tilt and rough intrinsics from
     /// the setup, optical centre at `camera_mount.offset_m` (end_link origin when unset).
-    pub fn assumed(setup: &GraspSetup, mount: &CameraMount) -> Self {
+    pub fn assumed(arm: &crate::chain::ArmModel, setup: &GraspSetup, mount: &CameraMount) -> Self {
         Self {
-            rec: kinematics::cam_mount(mount.flip, f64::from(mount.rot_deg), setup.camera_tilt_deg),
+            rec: arm.cam_mount(mount.flip, f64::from(mount.rot_deg), setup.camera_tilt_deg),
             offset: mount.offset_m.map(|o| o.map(f64::from)).unwrap_or([0.0; 3]),
             fx: setup.fx_px, fy: setup.fy_px,
             cx: setup.image_size_px[0] / 2.0, cy: setup.image_size_px[1] / 2.0,
@@ -685,8 +688,8 @@ fn approach_pose(r_now: &Mat3, target: &Vec3, setup: &GraspSetup) -> Pose {
 pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     let PendingGrasp { input, request, open_rad } = pending;
     let setup = &request.setup;
-    let pose = kinematics::fk(&input.q0);
-    let cam = CamModel::assumed(setup, &input.cam);
+    let pose = input.arm.fk(&input.q0);
+    let cam = CamModel::assumed(&input.arm, setup, &input.cam);
     let centre = cam.to_px(box_centre(&request.box_norm));
     let target = cam.plane_point(&pose, centre, grasp_plane(setup)).ok_or_else(|| ArmError::from(MotionError::InvalidCommand(
         "the box centre ray does not meet the table plane in front of the camera".into())))?;
@@ -910,7 +913,7 @@ impl Orchestrator {
 
 async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64, planned: PlannedGrasp) {
     let setup = planned.request.setup.clone();
-    let cam = CamModel::assumed(&setup, &planned.input.cam);
+    let cam = CamModel::assumed(&planned.input.arm, &setup, &planned.input.cam);
     let deadline = Instant::now() + Duration::from_secs_f64(setup.timeout_s);
     let per_request = source.per_request_pipelines().await;
     let triggered = per_request == Ok(true);
@@ -1011,7 +1014,7 @@ mod tests {
     #[allow(clippy::approx_constant)]
     fn ray_and_projection_round_trip() {
         let setup = GraspSetup { camera_tilt_deg: 20.0, ..Default::default() };
-        let cam = CamModel::assumed(&setup, &CameraMount::default());
+        let cam = CamModel::assumed(&crate::chain::ArmModel::RebotDevArm, &setup, &CameraMount::default());
         let pose = Pose::new(look_down(&kinematics::fk(&[0.0, -1.167, -1.565, 1.435, 0.0, 1.5708]).r), [0.3, 0.05, 0.2]);
         assert!(kinematics::column(&pose.r, 0)[2] < -0.999999);
         let p = cam.plane_point(&pose, [300.0, 200.0], 0.01).unwrap();

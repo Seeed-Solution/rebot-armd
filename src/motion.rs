@@ -86,6 +86,8 @@ pub struct PlanInput {
     pub speed_cap: Option<crate::model::SpeedCap>,
     pub ws: Option<WorkspacePolicy>,
     pub cam: CameraMount,
+    /// Kinematic model of the profile (built-in or URDF chain).
+    pub arm: crate::chain::ArmModel,
     pub epoch: u64,
 }
 
@@ -121,7 +123,7 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
         },
         None => speed,
     };
-    let start = kinematics::fk(&input.q0);
+    let start = input.arm.fk(&input.q0);
     let dp = kinematics::sub(&goal.p, &start.p);
     let length = kinematics::norm(&dp);
     let w_rel = kinematics::log_v(&kinematics::mul_t(&goal.r, &start.r));
@@ -136,7 +138,7 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
     let lo: [f64; 6] = std::array::from_fn(|i| f64::from(input.limits[i].min_position) + IK_LIMIT_MARGIN);
     let hi: [f64; 6] = std::array::from_fn(|i| f64::from(input.limits[i].max_position) - IK_LIMIT_MARGIN);
     let start_q32: [f32; 7] = std::array::from_fn(|i| if i < 6 { input.q0[i] as f32 } else { input.j7 });
-    let v_start = input.ws.as_ref().map(|ws| kinematics::workspace_violation(&start_q32, ws, &input.cam));
+    let v_start = input.ws.as_ref().map(|ws| input.arm.workspace_violation(&start_q32, ws, &input.cam));
 
     let mut q_samples = Vec::with_capacity(n + 1);
     let mut s_samples = Vec::with_capacity(n + 1);
@@ -149,7 +151,7 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
         let r = if k == n { goal.r } else {
             kinematics::mat_mul(&kinematics::exp_r(&[w_rel[0] * s, w_rel[1] * s, w_rel[2] * s]), &start.r)
         };
-        let sol = kinematics::solve_dls(&Pose::new(r, p), &prev, &lo, &hi, kinematics::PAR.w);
+        let sol = input.arm.solve_dls(&Pose::new(r, p), &prev, &lo, &hi, kinematics::PAR.w);
         if !sol.ok {
             return Err(MotionError::IkUnreachable { s, ep: sol.ep, er: sol.er });
         }
@@ -160,7 +162,7 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
         }
         let q32: [f32; 7] = std::array::from_fn(|i| if i < 6 { sol.q[i] as f32 } else { input.j7 });
         if let (Some(ws), Some(v0)) = (input.ws.as_ref(), v_start.as_ref()) {
-            let v = kinematics::workspace_violation(&q32, ws, &input.cam);
+            let v = input.arm.workspace_violation(&q32, ws, &input.cam);
             if kinematics::workspace_rejects(&v, v0) {
                 let w = v.worst.expect("violation has a worst point");
                 return Err(MotionError::WorkspaceViolation { s, point: w.point, limit: w.label(ws), value: w.value, bound: w.bound });
@@ -203,7 +205,7 @@ pub enum GoalSpec {
 
 /// Resolve a goal request against the start pose `fk(q0)`.
 pub fn resolve_goal(input: &PlanInput, spec: &GoalSpec) -> Pose {
-    let start = kinematics::fk(&input.q0);
+    let start = input.arm.fk(&input.q0);
     match spec {
         GoalSpec::Absolute { p, r } => Pose::new(r.unwrap_or(start.r), *p),
         GoalSpec::Relative { frame, d, dyaw, dpitch, droll, level } => {
@@ -232,7 +234,7 @@ pub fn resolve_goal(input: &PlanInput, spec: &GoalSpec) -> Pose {
                     Pose::new(kinematics::mat_mul(&start.r, &local), p)
                 }
                 RelFrame::Camera => {
-                    let rec = kinematics::cam_mount(input.cam.flip, f64::from(input.cam.rot_deg), f64::from(input.cam.tilt_deg));
+                    let rec = input.arm.cam_mount(input.cam.flip, f64::from(input.cam.rot_deg), f64::from(input.cam.tilt_deg));
                     let rc = kinematics::cam_rotation(&start, &rec);
                     let p = kinematics::add(&start.p, &kinematics::mat_vec(&rc, d));
                     let mut r = start.r;

@@ -93,10 +93,9 @@ fn check_positions(q: &[f32], config: &crate::model::ArmConfig) -> Result<(), St
 
 impl SupervisorInner {
     fn pose_tcp(&self, q: &[f32]) -> Option<PoseTcp> {
-        (self.config.kinematics.is_some() && q.len() >= 6).then(|| {
-            let pose = crate::kinematics::fk(&crate::kinematics::q6(q));
-            PoseTcp { position: pose.p, rpy: crate::kinematics::r_to_rpy(&pose.r) }
-        })
+        self.config.kinematics?;
+        let pose = self.config.arm_model.fk_f32(q)?;
+        Some(PoseTcp { position: pose.p, rpy: crate::kinematics::r_to_rpy(&pose.r) })
     }
 
     fn poses_write(&self) -> Option<PendingWrite> {
@@ -112,9 +111,8 @@ impl SupervisorInner {
         let pose = self.poses.list.poses.iter().find(|p| p.name == name).ok_or_else(|| not_found(name))?;
         check_positions(&pose.positions, &self.config).map_err(invalid)?;
         let mut target = self.commanded_positions.clone();
-        let arm = self.config.dof.min(6);
-        target[..arm].copy_from_slice(&pose.positions[..arm]);
-        let gripper_idx = (self.config.dof >= 7).then_some(6);
+        let gripper_idx = self.config.gripper_index();
+        for i in (0..self.config.dof).filter(|i| Some(*i) != gripper_idx) { target[i] = pose.positions[i]; }
         if let (true, Some(g)) = (include_gripper, gripper_idx) { target[g] = pose.positions[g]; }
         self.action_preconditions()?;
         let mut limits = self.planning_limits();

@@ -94,7 +94,7 @@ impl SupervisorInner {
     pub fn gravity_comp_active(&self) -> bool { self.gravity_comp.is_some() }
 
     fn gravity_comp_policy(&self) -> Option<&GravityCompPolicy> {
-        self.config.gravity_comp.as_ref().filter(|_| self.config.dof == 7 && self.config.gravity_model.is_some())
+        self.config.gravity_comp.as_ref().filter(|_| self.config.six_plus_gripper() && self.config.gravity_model.is_some())
     }
 
     /// The profile and driver support the mode (independent of the current state).
@@ -120,8 +120,7 @@ impl SupervisorInner {
 
     /// Model torque at the measured pose, scaled and clamped per joint.
     fn gravity_comp_model_torque(&self, policy: &GravityCompPolicy, scale: f32) -> Option<[f32; ARM]> {
-        let q = arm6(self.measured_positions.get(..ARM)?);
-        let tau = crate::gravity::compute_gravity_torques(&q).ok()?;
+        let tau = self.config.arm_model.gravity_torques(self.measured_positions.get(..ARM)?).ok()?;
         if !tau.iter().all(|t| t.is_finite()) { return None; }
         let mut out = [0.0; ARM];
         for i in 0..ARM {

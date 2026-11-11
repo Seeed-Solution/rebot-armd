@@ -199,7 +199,7 @@ impl SupervisorInner {
 
     /// Gravity model on a 6/7-DOF profile and a driver that reports torque.
     pub fn collision_available(&self) -> bool {
-        self.config.gravity_model.is_some() && matches!(self.config.dof, 6 | 7) && self.collision.torque_feedback
+        self.config.gravity_model.is_some() && self.config.arm_dof() == 6 && matches!(self.config.dof, 6 | 7) && self.collision.torque_feedback
     }
 
     pub fn collision_thresholds(&self) -> [f32; 6] {
@@ -318,7 +318,7 @@ impl SupervisorInner {
         }
         self.macro_run = None;
         // Hold commanded = measured; the gripper keeps its command so a held object stays held.
-        let gripper_idx = (self.config.dof >= 7).then_some(6);
+        let gripper_idx = self.config.gripper_index();
         let grip_cmd = gripper_idx.map(|g| self.commanded_positions[g]);
         self.stop_motion();
         if self.measured_positions.iter().all(|q| q.is_finite()) {

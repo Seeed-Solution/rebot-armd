@@ -97,7 +97,10 @@ impl MacroCtx {
     }
 
     /// FK of the commanded J1..J6.
-    pub async fn pose(&self) -> Pose { kinematics::fk(&kinematics::q6(&self.sup.inner().read().await.commanded_positions)) }
+    pub async fn pose(&self) -> Pose {
+        let inner = self.sup.inner().read().await;
+        inner.config.arm_model.fk_f32(&inner.commanded_positions).unwrap_or_else(|| kinematics::fk(&kinematics::q6(&inner.commanded_positions)))
+    }
 
     /// Wait for the installed sub-motion; stop it on a timeout.
     pub async fn wait_sub(&self, phase: &str, limit_s: f64) -> Result<SubDone, Stop> {
