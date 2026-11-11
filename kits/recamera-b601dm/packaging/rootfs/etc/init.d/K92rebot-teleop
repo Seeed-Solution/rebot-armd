@@ -66,33 +66,40 @@ AP_CHANNEL=""    # empty: 44 on 5g, 6 on 2g4
 STA_SSID=""
 STA_PASS=""
 
-# 读取 supervisor 或系统覆盖配置
 CONFIG_JSON="/userdata/local/apps/$NAME.config.json"
-if [ -f "$CONFIG_JSON" ] && which python3 >/dev/null 2>&1; then
-    eval $(python3 -c "
-import json
+
+# config_shell_vars <config.json>: shell assignments for the settings in the file, each value
+# quoted with shlex.quote (the output is eval'ed; a value cannot run commands). python3 >= 3.3.
+config_shell_vars() {
+    python3 -c "
+import json, re, shlex, sys
+def put(k, v): print(k + '=' + shlex.quote(str(v)))
 try:
-    with open('$CONFIG_JSON') as f:
+    with open(sys.argv[1]) as f:
         cfg = json.load(f)
     arm = cfg.get('arm', {})
     net = cfg.get('network', {})
     app = cfg.get('app', {})
-    if 'follower_model' in arm and arm['follower_model']: print(f\"FOLLOWER_MODEL='{arm['follower_model']}'\")
-    if 'serial_port' in arm and arm['serial_port']: print(f\"FOLLOWER_PORT='{arm['serial_port']}'\")
-    if 'port' in cfg and cfg['port']: print(f\"PORT='{cfg['port']}'\")
-    if 'ap_ssid' in net and net['ap_ssid']: print(f\"AP_SSID='{net['ap_ssid']}'\")
-    if 'ap_password' in net and net['ap_password']: print(f\"AP_PASS='{net['ap_password']}'\")
-    if 'ap_ip' in net and net['ap_ip']: print(f\"AP_IP='{net['ap_ip']}'\")
-    if net.get('ap_band') in ('5g', '2g4'): print(f\"AP_BAND='{net['ap_band']}'\")
-    if str(net.get('ap_channel', '')).isdigit() and int(net['ap_channel']) > 0: print(f\"AP_CHANNEL='{int(net['ap_channel'])}'\")
-    if 'sta_ssid' in net: print(f\"STA_SSID='{net['sta_ssid']}'\")
-    if 'sta_password' in net: print(f\"STA_PASS='{net['sta_password']}'\")
-    import re
-    if app.get('enabled') in (True, 'true', 'True', 1, '1', 'on'): print(\"APP_ENABLED='1'\")
-    if isinstance(app.get('name'), str) and re.fullmatch(r'[A-Za-z0-9._-]+', app['name']) and app['name'] not in ('.', '..'): print(f\"APP_NAME='{app['name']}'\")
+    if 'follower_model' in arm and arm['follower_model']: put('FOLLOWER_MODEL', arm['follower_model'])
+    if 'serial_port' in arm and arm['serial_port']: put('FOLLOWER_PORT', arm['serial_port'])
+    if 'port' in cfg and cfg['port']: put('PORT', cfg['port'])
+    if 'ap_ssid' in net and net['ap_ssid']: put('AP_SSID', net['ap_ssid'])
+    if 'ap_password' in net and net['ap_password']: put('AP_PASS', net['ap_password'])
+    if 'ap_ip' in net and net['ap_ip']: put('AP_IP', net['ap_ip'])
+    if net.get('ap_band') in ('5g', '2g4'): put('AP_BAND', net['ap_band'])
+    if str(net.get('ap_channel', '')).isdigit() and int(net['ap_channel']) > 0: put('AP_CHANNEL', int(net['ap_channel']))
+    if 'sta_ssid' in net: put('STA_SSID', net['sta_ssid'])
+    if 'sta_password' in net: put('STA_PASS', net['sta_password'])
+    if app.get('enabled') in (True, 'true', 'True', 1, '1', 'on'): put('APP_ENABLED', '1')
+    if isinstance(app.get('name'), str) and re.fullmatch(r'[A-Za-z0-9._-]+', app['name']) and app['name'] not in ('.', '..'): put('APP_NAME', app['name'])
 except Exception:
     pass
-" 2>/dev/null)
+" "$1"
+}
+
+# 读取 supervisor 或系统覆盖配置
+if [ -f "$CONFIG_JSON" ] && which python3 >/dev/null 2>&1; then
+    eval "$(config_shell_vars "$CONFIG_JSON" 2>/dev/null)"
 fi
 
 # Write the hostapd config for band $1 (5g | 2g4) on channel $2 and start hostapd.

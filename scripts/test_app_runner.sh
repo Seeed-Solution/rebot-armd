@@ -213,6 +213,24 @@ for f in "$RUNNER" "$K92" "$KIT/../debian/postinst" "$KIT/../debian/prerm"; do
     fi
 done
 
+# K92 config parser: values are shell-quoted before eval (a value with ' or $(...) runs nothing)
+echo "== K92 config_shell_vars"
+CT=$(mktemp -d)
+python3 -c '
+import json, sys
+json.dump({"network": {"sta_ssid": "it'"'"'s $(touch " + sys.argv[1] + "/pwned1)", "sta_password": "`touch " + sys.argv[1] + "/pwned2`; x\"y",
+           "ap_ssid": "a b\nc"}, "app": {"enabled": True, "name": "demo"}}, open(sys.argv[1] + "/cfg.json", "w"))' "$CT"
+eval "$(sed -n '/^config_shell_vars() {/,/^}/p' "$K92")"
+STA_SSID=""; STA_PASS=""; AP_SSID=""; APP_NAME=""
+eval "$(config_shell_vars "$CT/cfg.json")"
+check "config: value with ' and \$(...) kept literally" [ "$STA_SSID" = "it's \$(touch $CT/pwned1)" ]
+check "config: value with backticks kept literally" [ "$STA_PASS" = "\`touch $CT/pwned2\`; x\"y" ]
+check "config: value with a space and a newline kept" [ "$AP_SSID" = "a b
+c" ]
+check "config: app name" [ "$APP_NAME" = demo ]
+check "config: nothing was executed" sh -c "[ ! -e '$CT/pwned1' ] && [ ! -e '$CT/pwned2' ]"
+rm -rf "$CT"
+
 run_suite /bin/sh
 if command -v busybox >/dev/null 2>&1 && busybox sh -c : 2>/dev/null; then
     run_suite "busybox sh"
