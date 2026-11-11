@@ -219,3 +219,25 @@ async fn capability_follows_kinematics_and_gripper_policy() {
     c.kinematics = None;
     assert!(!armd::model::Capabilities::from_config(&c).place);
 }
+
+/// `/motion/stop` between two phases ends the macro under the stop's lock: the orchestrator's
+/// next sub-motion (here the `open` of a place) is refused before any tick runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_between_phases_refuses_the_next_sub_motion() {
+    use armd::motion::{GripperCommand, GripperRequest};
+    let r = rig(vec![]).await;
+    let mut inner = r.sup.inner().write().await;
+    let input = inner.plan_input().unwrap();
+    let id = inner.begin_macro("place", &input, None).unwrap();
+    // the stop handler of `/api/v1/motion/stop`
+    inner.stop_motion();
+    inner.request_macro_stop();
+    let j7 = inner.commanded_positions[6];
+    let open = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: 8.0, tag: None };
+    assert!(inner.start_macro_gripper(id, open).is_err(), "gripper sub-motion installed after stop");
+    assert!(inner.active_trajectory.is_none() && inner.macro_run.is_none());
+    assert_eq!(inner.commanded_positions[6], j7);
+    assert!(inner.target_positions[6] == j7, "gripper target changed");
+    let a = inner.last_action.clone().unwrap();
+    assert_eq!((a.id, a.state.as_str(), a.code.as_deref()), (id, "cancelled", Some("STOPPED")), "{a:?}");
+}

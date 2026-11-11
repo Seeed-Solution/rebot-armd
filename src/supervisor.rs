@@ -1766,7 +1766,7 @@ impl SupervisorInner {
 
     /// The macro action `id` is still the running action.
     pub fn macro_alive(&self, id: u64) -> bool {
-        self.macro_run.as_ref().is_some_and(|m| m.id == id)
+        self.macro_run.as_ref().is_some_and(|m| m.id == id && !m.stop_requested)
             && self.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running())
     }
 
@@ -1835,9 +1835,15 @@ impl SupervisorInner {
         self.finish_action(id, state, code, message, None, holding, gap);
     }
 
-    /// `/motion/stop`: also ends a macro action waiting between sub-motions.
+    /// `/motion/stop`: ends the running macro action now, under the caller's lock, so its
+    /// orchestrator cannot install another sub-motion before the next tick.
     pub fn request_macro_stop(&mut self) {
-        if let Some(m) = self.macro_run.as_mut() { m.stop_requested = true; }
+        let Some(m) = self.macro_run.as_mut() else { return; };
+        m.stop_requested = true;
+        let id = m.id;
+        if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { self.stop_motion(); }
+        self.finish_action(id, "cancelled", Some("STOPPED"), Some("Motion stopped".into()), None, None, None);
+        self.macro_run = None;
     }
 
     /// Start a gripper action. Returns (action id, expected duration).
