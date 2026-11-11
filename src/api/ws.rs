@@ -221,6 +221,26 @@ fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) ->
     ack
 }
 
+/// Ack fields and the state-file write of a state-changing command.
+type StateReply = (Vec<(&'static str, Value)>, Option<crate::persist::PendingWrite>);
+
+/// Commands that change persisted state (grasp setup, poses, collision setting, keep-out
+/// boxes). None for any other path.
+fn state_command(inner: &mut SupervisorInner, path: &str, body: &Value, setup_path: Option<&std::path::PathBuf>) -> Option<Result<StateReply, ArmError>> {
+    Some(match path {
+        "/api/v1/grasp/setup" => crate::grasp::update_setup(inner, body).map(|setup| {
+            let write = setup_path.cloned().map(|p| crate::persist::PendingWrite::new(p, serde_json::to_string_pretty(&setup).unwrap_or_default()));
+            (vec![("setup", json!(setup))], write)
+        }),
+        "/api/v1/poses/save" => crate::poses::save(inner, body).map(|(pose, write)| (vec![("pose", json!(pose))], write)),
+        "/api/v1/poses/delete" => crate::poses::delete(inner, body).map(|write| (vec![], write)),
+        "/api/v1/safety/collision" => crate::collision::update(inner, body).map(|(config, write)| (vec![("collision", json!(config))], write)),
+        "/api/v1/workspace/keepout" => crate::keepout::update(inner, body)
+            .map(|(state, write)| (vec![("boxes", json!(state.boxes)), ("source", json!(state.source))], write)),
+        _ => return None,
+    })
+}
+
 fn command_reject(inner: &SupervisorInner, request_id: &Value, error: ApiError) -> Value {
     let mut reply = rejection(error, "command_reject", inner.safety.epoch_id());
     reply["request_id"] = request_id.clone();
@@ -422,51 +442,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             Ok(ActionStart::Macro(m)) => { pending_macro = Some((value["request_id"].clone(), m, local_generation)); None }
                                             Err(error) => Some(command_reject(&inner, &value["request_id"], error)),
                                         };
-                                    } else if path == "/api/v1/grasp/setup" {
-                                        response = Some(match crate::grasp::update_setup(&mut inner, &value["body"]) {
-                                            Ok(setup) => {
+                                    } else if let Some(result) = state_command(&mut inner, path, &value["body"], recv_deps.setup_path.as_ref()) {
+                                        response = Some(match result {
+                                            Ok((fields, write)) => {
                                                 let mut ack = command_ack(&inner, &value["request_id"], None);
-                                                ack["setup"] = json!(setup);
-                                                pending_write = recv_deps.setup_path.clone().map(|p| crate::persist::PendingWrite::new(
-                                                    p, serde_json::to_string_pretty(&setup).unwrap_or_default()));
-                                                ack
-                                            }
-                                            Err(error) => command_reject(&inner, &value["request_id"], error.into()),
-                                        });
-                                    } else if path == "/api/v1/poses/save" {
-                                        response = Some(match crate::poses::save(&mut inner, &value["body"]) {
-                                            Ok((pose, write)) => {
-                                                let mut ack = command_ack(&inner, &value["request_id"], None);
-                                                ack["pose"] = json!(pose);
-                                                pending_write = write;
-                                                ack
-                                            }
-                                            Err(error) => command_reject(&inner, &value["request_id"], error.into()),
-                                        });
-                                    } else if path == "/api/v1/poses/delete" {
-                                        response = Some(match crate::poses::delete(&mut inner, &value["body"]) {
-                                            Ok(write) => {
-                                                pending_write = write;
-                                                command_ack(&inner, &value["request_id"], None)
-                                            }
-                                            Err(error) => command_reject(&inner, &value["request_id"], error.into()),
-                                        });
-                                    } else if path == "/api/v1/safety/collision" {
-                                        response = Some(match crate::collision::update(&mut inner, &value["body"]) {
-                                            Ok((config, write)) => {
-                                                let mut ack = command_ack(&inner, &value["request_id"], None);
-                                                ack["collision"] = json!(config);
-                                                pending_write = write;
-                                                ack
-                                            }
-                                            Err(error) => command_reject(&inner, &value["request_id"], error.into()),
-                                        });
-                                    } else if path == "/api/v1/workspace/keepout" {
-                                        response = Some(match crate::keepout::update(&mut inner, &value["body"]) {
-                                            Ok((state, write)) => {
-                                                let mut ack = command_ack(&inner, &value["request_id"], None);
-                                                ack["boxes"] = json!(state.boxes);
-                                                ack["source"] = json!(state.source);
+                                                for (key, field) in fields { ack[key] = field; }
                                                 pending_write = write;
                                                 ack
                                             }
