@@ -549,12 +549,21 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 if let Some(write) = pending_write.take() {
                     let reply = response.take();
                     let tx = out_tx.clone();
+                    let sup = recv_supervisor.clone();
                     tokio::spawn(async move {
                         let result = write.run().await;
                         let Some(mut reply) = reply else { return; };
                         match result {
                             Ok(()) => reply["persisted"] = json!(true),
                             Err(e) => { tracing::warn!("State file not saved: {e}"); reply["persisted"] = json!(false); reply["persist_error"] = json!(e); }
+                        }
+                        // the ack can follow later replies: it carries the state at send time,
+                        // so a client never rolls its epoch back to the one of the command
+                        {
+                            let inner = sup.inner().read().await;
+                            reply["epoch_id"] = json!(inner.safety.epoch_id());
+                            reply["safety_state"] = json!(inner.safety.state());
+                            reply["is_torqued"] = json!(inner.is_torqued);
                         }
                         let _ = tx.send(Message::Text(reply.to_string().into())).await;
                     });

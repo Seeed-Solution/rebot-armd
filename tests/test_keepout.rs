@@ -280,3 +280,38 @@ fn joint_move_keepout_sampling_is_dense_enough_for_small_boxes() {
     assert_eq!(api.code.as_deref(), Some("WORKSPACE_VIOLATION"));
     assert!(api.message.contains("needs more than 400 samples"), "{}", api.message);
 }
+
+/// The keep-out ack is sent after the file write and can follow later replies (here the
+/// E-stop's epoch_sync): it carries the epoch current when it is sent, never an older one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_persist_ack_carries_the_epoch_at_send_time() {
+    use futures_util::StreamExt;
+    let dir = tempfile::tempdir().unwrap();
+    let supervisor = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    armd::keepout::load_into(&supervisor, &dir.path().join("keepout.json")).await;
+    let (mut ws, generation, epoch, sup, _) = common::torqued_rig(supervisor, &INSPECT).await;
+    armd::persist::TEST_WRITE_DELAY_MS.store(300, std::sync::atomic::Ordering::Relaxed);
+    common::send(&mut ws, json!({"type":"command", "request_id": 777, "generation": generation, "epoch_id": epoch,
+        "path": "/api/v1/workspace/keepout", "body": {"boxes": [cube("t", [0.3, 0.3, 0.3])]}})).await;
+    common::send(&mut ws, json!({"type":"estop"})).await;
+    let (mut ack, mut sync) = (None, None);
+    while ack.is_none() || sync.is_none() {
+        let text = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap().into_text().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        match v["type"].as_str() {
+            Some("command_ack") | Some("command_reject") if v["request_id"] == 777 => ack = Some((v, sync.is_some())),
+            Some("epoch_sync") => sync = Some(v),
+            _ => {}
+        }
+    }
+    armd::persist::TEST_WRITE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let (ack, after_sync) = ack.unwrap();
+    let sync = sync.unwrap();
+    assert_eq!(ack["persisted"], true, "{ack}");
+    let now = sup.get_observation().await.epoch_id;
+    assert_eq!(sync["epoch_id"].as_u64(), Some(now));
+    if after_sync {
+        assert_eq!(ack["epoch_id"].as_u64(), Some(now), "ack after epoch_sync must not roll the epoch back: {ack}");
+    }
+    assert!(after_sync, "the ack is sent after the write, after the immediate E-stop reply");
+}

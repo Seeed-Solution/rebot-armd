@@ -86,6 +86,10 @@ pub fn load<T: serde::de::DeserializeOwned>(path: &Path, validate: impl FnOnce(&
 
 static REVISION: AtomicU64 = AtomicU64::new(0);
 
+/// Extra delay (ms) before each write on the writer thread; 0 in normal use. Tests set it to
+/// make "the ack follows later replies" deterministic.
+pub static TEST_WRITE_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
 /// A write prepared under the supervisor lock and carried out after it is released.
 #[derive(Debug, Clone)]
 pub struct PendingWrite {
@@ -107,6 +111,8 @@ fn writer() -> &'static std::sync::Mutex<mpsc::Sender<Job>> {
         std::thread::Builder::new().name("armd-persist".into()).spawn(move || {
             let mut written: HashMap<PathBuf, u64> = HashMap::new();
             for Job { write, done } in rx {
+                let delay = TEST_WRITE_DELAY_MS.load(Ordering::Relaxed);
+                if delay > 0 { std::thread::sleep(std::time::Duration::from_millis(delay)); }
                 let last = written.get(&write.path).copied();
                 let result = if last.is_some_and(|r| r > write.revision) {
                     Ok(()) // a newer state of this file is already on disk
