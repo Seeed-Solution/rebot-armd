@@ -311,7 +311,7 @@ UT=$(mktemp -d)
 printf 'root:x:0:0:root:/root:/bin/sh\nrecamera:x:1000:1000::/home/recamera:/bin/sh\n' > "$UT/passwd"
 printf 'root:x:0:\nrecamera:x:1000:\n' > "$UT/group"
 printf 'root:*:0:0:99999:7:::\n' > "$UT/shadow"
-run_tool() { env REBOT_APP_PASSWD="$UT/passwd" REBOT_APP_GROUP="$UT/group" REBOT_APP_SHADOW="$UT/shadow" "$@" sh "$USERTOOL"; }
+run_tool() { env REBOT_APP_PASSWD="$UT/passwd" REBOT_APP_GROUP="$UT/group" REBOT_APP_SHADOW="$UT/shadow" REBOT_APP_LOCK="$UT/lock" "$@" sh "$USERTOOL"; }
 run_tool; r1=$?
 cp "$UT/passwd" "$UT/passwd.1"; cp "$UT/group" "$UT/group.1"; cp "$UT/shadow" "$UT/shadow.1"
 run_tool; r2=$?
@@ -325,6 +325,59 @@ check "app-user: second run changes nothing" sh -c "cmp -s '$UT/passwd' '$UT/pas
 check "app-user: exactly one entry" sh -c "[ \$(grep -c '^rebot-app:' '$UT/passwd') -eq 1 ] && [ \$(grep -c '^rebot-app:' '$UT/group') -eq 1 ]"
 env REBOT_APP_USER=root REBOT_APP_PASSWD="$UT/passwd" REBOT_APP_GROUP="$UT/group" sh "$USERTOOL" 2>/dev/null
 check "app-user: refuses root" [ "$?" -eq 2 ]
+# partial accounts from an interrupted run are completed
+base_files() {
+    printf 'root:x:0:0:root:/root:/bin/sh\nrecamera:x:1000:1000::/home/recamera:/bin/sh\n' > "$UT/passwd"
+    printf 'root:x:0:\nwheel:x:10:\nrecamera:x:1000:\n' > "$UT/group"
+    printf 'root:*:0:0:99999:7:::\n' > "$UT/shadow"
+}
+base_files
+printf 'rebot-app:x:998:998:rebot user programs:/userdata/rebot-apps:/bin/false\n' >> "$UT/passwd"
+printf 'rebot-app:x:998:\n' >> "$UT/group"
+run_tool; r=$?
+check "app-user: missing shadow entry is added" sh -c "[ $r -eq 0 ] && [ \$(grep -c '^rebot-app:!:' '$UT/shadow') -eq 1 ] && [ \$(grep -c '^rebot-app:' '$UT/passwd') -eq 1 ]"
+base_files
+printf 'rebot-app:x:997:997:rebot user programs:/userdata/rebot-apps:/bin/false\n' >> "$UT/passwd"
+run_tool; r=$?
+check "app-user: missing group gets the passwd gid" sh -c "[ $r -eq 0 ] && grep -qx 'rebot-app:x:997:' '$UT/group' && grep -q '^rebot-app:!:' '$UT/shadow'"
+base_files
+printf 'rebot-app:x:996:\n' >> "$UT/group"
+run_tool; r=$?
+check "app-user: missing passwd entry gets the group gid" sh -c "[ $r -eq 0 ] && grep -q '^rebot-app:x:[0-9]*:996:' '$UT/passwd' && [ \$(grep -c '^rebot-app:' '$UT/group') -eq 1 ]"
+# an existing privileged account is refused and left as it is
+for case in uid0 gid0 wheelgid wheelmember; do
+    base_files
+    case $case in
+        uid0) printf 'rebot-app:x:0:998::/:/bin/false\n' >> "$UT/passwd"; printf 'rebot-app:x:998:\n' >> "$UT/group" ;;
+        gid0) printf 'rebot-app:x:998:0::/:/bin/false\n' >> "$UT/passwd"; printf 'rebot-app:x:998:\n' >> "$UT/group" ;;
+        wheelgid) printf 'rebot-app:x:998:10::/:/bin/false\n' >> "$UT/passwd"; printf 'rebot-app:x:998:\n' >> "$UT/group" ;;
+        wheelmember) printf 'rebot-app:x:998:998::/:/bin/false\n' >> "$UT/passwd"
+            printf 'root:x:0:\nwheel:x:10:recamera,rebot-app\nrecamera:x:1000:\nrebot-app:x:998:\n' > "$UT/group" ;;
+    esac
+    cp "$UT/passwd" "$UT/passwd.1"; cp "$UT/group" "$UT/group.1"; cp "$UT/shadow" "$UT/shadow.1"
+    run_tool 2>/dev/null; r=$?
+    check "app-user: privileged account ($case) refused, nothing written" sh -c "[ $r -eq 3 ] && cmp -s '$UT/passwd' '$UT/passwd.1' && cmp -s '$UT/group' '$UT/group.1' && cmp -s '$UT/shadow' '$UT/shadow.1'"
+done
+# concurrent runs are serialised: one entry each
+base_files
+pids=""
+for i in 1 2 3 4 5 6 7 8; do run_tool & pids="$pids $!"; done
+ok=1
+for p in $pids; do wait "$p" || ok=0; done
+check "app-user: 8 concurrent runs succeed" [ "$ok" -eq 1 ]
+check "app-user: concurrent runs leave one entry each" sh -c "[ \$(grep -c '^rebot-app:' '$UT/passwd') -eq 1 ] && [ \$(grep -c '^rebot-app:' '$UT/group') -eq 1 ] && [ \$(grep -c '^rebot-app:' '$UT/shadow') -eq 1 ]"
+# a held lock: the run waits, then gives up without writing
+base_files
+if command -v flock >/dev/null 2>&1; then
+    flock "$UT/lock" sleep 3 & holder=$!
+    sleep 0.3
+else
+    mkdir "$UT/lock.d"; holder=""
+fi
+run_tool REBOT_APP_LOCK_WAIT=1 2>/dev/null; r=$?
+check "app-user: held lock gives up (exit 1) and writes nothing" sh -c "[ $r -eq 1 ] && ! grep -q '^rebot-app:' '$UT/passwd'"
+[ -n "$holder" ] && { kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null; }
+rmdir "$UT/lock.d" 2>/dev/null
 check "runner: default user is rebot-app" grep -q 'RUN_USER=\${REBOT_APP_USER:-rebot-app}' "$RUNNER"
 rm -rf "$UT"
 
