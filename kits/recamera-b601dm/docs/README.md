@@ -148,11 +148,11 @@ it after a crash and keeps its log. The runner is covered by host tests
 | Item | Value |
 |---|---|
 | Command | `nice -n 5 python3 -u <entry>`, working directory = the app directory |
-| User | `rebot-app` (system user created by the package's postinst, no login shell, no password; `REBOT_APP_USER` overrides it), never root; a missing user refuses the start. `/userdata/rebot-apps` is owned by `rebot-app:rebot-app` (0755), so the program can write in its own directory. It can read `/userdata/rebot-teleop` but not write the armd state files there (root-owned). The package removal keeps the user. Access to GPIO or serial devices needs a manual group step, for example `addgroup rebot-app dialout` (check the group that owns the device node with `ls -l`) |
+| User | `rebot-app` (system user created by the package's postinst, no login shell, no password; `REBOT_APP_USER` overrides it), never root; a missing user refuses the start. `/userdata/rebot-apps` is owned by `rebot-app:rebot-app` (0755), so the program can write in its own directory. It can read `/userdata/rebot-teleop` but not write the armd state files there (root-owned). The package removal keeps the user. Access to GPIO or serial devices needs a manual group step, for example `addgroup rebot-app dialout` (check the group that owns the device node with `ls -l`). `rebot-app-user` (postinst) refuses with exit 3 an existing account with root or admin rights and with exit 4 one whose passwd gid differs from the gid of the group `rebot-app` (or belongs to another group); both are left as they are |
 | Environment | `REBOT_HOST=127.0.0.1`, `PYTHONPATH=/usr/share/rebot-teleop/python:<app dir>` |
 | `app.json` (optional) | `{"entry": "main.py", "restart": "on-failure" \| "always" \| "never"}`; default `main.py`, `on-failure` |
 | Restart | exit code 0 ends the runner with `on-failure`; other exits restart after 1, 2, 4 ... 30 s (back to 1 s after a run longer than 60 s); 10 starts within 5 minutes end it with state `given_up` |
-| Stop | the program runs in its own session; SIGTERM to its process group, SIGKILL to the group after 10 s; processes left in the group when the program exits are killed; then every process of the app user started at or after the program (also ones that left the group with `setsid`) is killed. This assumes the app user runs nothing else; `rebot-app` has no login, so the SSH user `recamera` is not affected |
+| Stop | the program runs in its own session; SIGTERM to its process group, SIGKILL to the group after 10 s; processes left in the group when the program exits are killed; then every process of the app user started at or after the program (also ones that left the group with `setsid`) is killed. Each such process is opened as a pidfd (`os.pidfd_open`, Linux >= 5.3), checked (uid, start time, not a zombie) and sent SIGKILL through the pidfd (`signal.pidfd_send_signal`), so a pid that was reused by another process is not signalled. riscv64 uses the generic syscall table, where `pidfd_send_signal` (424) and `pidfd_open` (434) exist since Linux 5.1 / 5.3, so the reCamera kernel 5.10 has both (read from the table, not yet measured on the device). When the device's python3 has no pidfd functions (they exist only when Python was built with Linux >= 5.3 headers; check with `python3 -c "import os, signal; os.pidfd_open, signal.pidfd_send_signal"`) or the kernel returns ENOSYS, the log gets one line `pidfd sweep unavailable ...` and the runner uses `kill <pid>` after re-checking uid and start time; the remaining race there is a pid that exits and is reused by another user's process between that check and the `kill()`. This assumes the app user runs nothing else; `rebot-app` has no login, so the SSH user `recamera` is not affected |
 | Log | `/userdata/rebot-teleop/logs/app-<name>.log`; above 512 KiB (checked before each start and every 30 s) it is copied to `.1`, `.1` to `.2`, and truncated; bytes written during the copy can be lost |
 | State | `/tmp/rebot-app-<name>.state`: `state` (running, backoff, stopped, given_up), `pid`, `runner`, `starts`, `last_exit` |
 
@@ -175,6 +175,8 @@ reCamera 应用画廊一次只运行一个应用，摄像头为独占资源，�
 程序以非特权系统用户 `rebot-app` 运行（软件包 postinst 创建，无登录 shell、无密码；可用 `REBOT_APP_USER` 指定，不允许 root）；该用户不存在时不启动并记录日志。卸载软件包时保留该用户。
 `/userdata/rebot-apps` 属于 `rebot-app:rebot-app`（0755），程序可在自己的目录中写文件；可读取 `/userdata/rebot-teleop`，但不能写入其中由 root 拥有的 armd 状态文件。访问 GPIO 或串口设备需要手动加入对应的组，例如 `addgroup rebot-app dialout`（用 `ls -l` 查看设备节点所属的组）。程序在独立会话中运行，
 停止时 SIGTERM 发送到整个进程组，10 秒后对进程组发送 SIGKILL；程序退出后遗留在进程组中的进程会被结束，随后该用户在程序启动之后启动的所有进程（包括用 `setsid` 离开进程组的进程）也会被结束。此规则假定该用户只运行这个程序；`rebot-app` 不可登录，SSH 用户 `recamera` 不受影响。
+每个此类进程先以 pidfd 打开（`os.pidfd_open`，Linux >= 5.3），检查 uid、启动时间、非僵尸进程后，通过该 pidfd 发送 SIGKILL（`signal.pidfd_send_signal`），因此已被其他进程复用的 pid 不会收到信号。riscv64 使用通用系统调用表，其中 `pidfd_send_signal`（424）和 `pidfd_open`（434）分别自 Linux 5.1 / 5.3 起存在，reCamera 的 5.10 内核两者都有（依据系统调用表，尚未在设备上实测）。设备上的 python3 没有 pidfd 函数（只有用 Linux >= 5.3 头文件构建的 Python 才有；用 `python3 -c "import os, signal; os.pidfd_open, signal.pidfd_send_signal"` 检查）或内核返回 ENOSYS 时，日志记录一行 `pidfd sweep unavailable ...`，运行器改为重新检查 uid 和启动时间后执行 `kill <pid>`；这种情况下剩余的竞争窗口是：该 pid 在检查与 `kill()` 之间退出并被其他用户的进程复用。
+`rebot-app-user`（postinst 调用）对已有的 root 或管理员权限账户以退出码 3 拒绝，对 passwd 中的 gid 与 `rebot-app` 组的 gid 不一致（或属于其他组）的账户以退出码 4 拒绝，两种情况都不修改文件。
 
 | 项目 | 取值 |
 |---|---|
@@ -182,6 +184,6 @@ reCamera 应用画廊一次只运行一个应用，摄像头为独占资源，�
 | 环境变量 | `REBOT_HOST=127.0.0.1`，`PYTHONPATH=/usr/share/rebot-teleop/python:<程序目录>` |
 | `app.json`（可选） | `{"entry": "main.py", "restart": "on-failure" \| "always" \| "never"}`；默认 `main.py`、`on-failure` |
 | 重启 | `on-failure` 下退出码 0 即结束；其他退出按 1、2、4 ... 30 秒退避重启（运行超过 60 秒后回到 1 秒）；5 分钟内启动 10 次则以 `given_up` 状态结束 |
-| 停止 | 向程序发 SIGTERM，10 秒后 SIGKILL |
+| 停止 | 向进程组发 SIGTERM，10 秒后 SIGKILL；随后通过 pidfd（不可用时回退到 `kill <pid>`）结束该用户在程序启动之后启动的进程 |
 | 日志 | `/userdata/rebot-teleop/logs/app-<name>.log`；超过 512 KiB（每次启动前及每 30 秒检查）时复制为 `.1`（原 `.1` 变 `.2`）并原地清空，复制期间写入的字节可能丢失 |
 | 状态 | `/tmp/rebot-app-<name>.state`：`state`（running、backoff、stopped、given_up）、`pid`、`runner`、`starts`、`last_exit` |
