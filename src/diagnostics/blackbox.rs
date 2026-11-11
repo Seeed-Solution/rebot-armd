@@ -21,9 +21,10 @@ use crate::model::ArmObservation;
 
 pub const BB_FILE: &str = "bb.jsonl";
 /// Rotation size of `bb.jsonl`.
-pub const BB_MAX_BYTES: u64 = 512 * 1024;
-/// Old files kept: `bb.jsonl.1`, `bb.jsonl.2`.
-pub const BB_KEEP: usize = 2;
+pub const BB_MAX_BYTES: u64 = 2 * 1024 * 1024;
+/// Old files kept: `bb.jsonl.1` … `bb.jsonl.6`. 7 x 2 MiB holds about 75 min at 5 Hz
+/// (about 656 B per line, measured 2026-11-11) and about 30 h idle.
+pub const BB_KEEP: usize = 6;
 /// Sample period while torqued or moving (5 Hz).
 pub const ACTIVE_PERIOD: Duration = Duration::from_millis(200);
 /// Sample period while idle (0.2 Hz).
@@ -359,12 +360,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut f = RotatingFile::open(dir.path().join(BB_FILE), 2_000, BB_KEEP).unwrap();
         let line = record_line(1, 0, 0, &obs(true, 0.0));
-        for _ in 0..(10_000 / line.len()) {
+        for _ in 0..((BB_KEEP + 3) * 2_000 / line.len()) {
             f.write_line(line.as_bytes(), true).unwrap();
         }
         let p = dir.path().join(BB_FILE);
-        assert!(RotatingFile::numbered(&p, 2).exists() && !RotatingFile::numbered(&p, 3).exists());
-        for n in 0..=2 {
+        assert!(RotatingFile::numbered(&p, BB_KEEP).exists() && !RotatingFile::numbered(&p, BB_KEEP + 1).exists());
+        for n in 0..=BB_KEEP {
             assert!(std::fs::metadata(RotatingFile::numbered(&p, n)).unwrap().len() <= 2_000);
         }
     }

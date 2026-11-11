@@ -390,8 +390,9 @@ Black-box record (`bb.jsonl`): `boot`, `t_ms` (monotonic ms since armd start), `
 `feedback_age_ms`, `motor_errors`, `motion_limit`, `residual_torques` (3 decimals or null), `collision` (the observation field; omitted while null), `action` (latest action as `kind:state`),
 `dropped` (samples dropped so far because the writer was busy). Rate: 5 Hz while torqued or a
 joint moves faster than 0.05 rad/s, otherwise one line every 5 s. Each line is `fdatasync`ed
-while torqued. Files: `bb.jsonl` rotated at 512 KiB, two old files kept (`.1`, `.2`); about 10 min
-at 5 Hz (about 490 B per line), about 4 h idle. armd has no CAN error counters, so the record carries none.
+while torqued. Files: `bb.jsonl` rotated at 2 MiB, six old files kept (`.1` … `.6`); about 75 min
+at 5 Hz (about 656 B per line, measured on the arm), about 30 h idle. The 2 MB response cap
+holds about 10 min of 5 Hz records; request a shorter window to get it untruncated. armd has no CAN error counters, so the record carries none.
 
 Tick timing: `tick_us` is the whole `ArmSupervisor::tick` call (waiting for the supervisor lock, the tick body and the telemetry broadcast), `lock_us` the time the tick holds the supervisor write lock, both in µs (nearest-rank percentiles). `late_count` counts ticks since start whose `dt` exceeded two control periods.
 

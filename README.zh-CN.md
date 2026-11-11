@@ -376,7 +376,7 @@ armd [OPTIONS]
     -h, --help
 ```
 
-日志同时输出到 stdout。日志或黑匣子目录无法创建或写入时，armd 记一条警告并在没有该功能的情况下运行。黑匣子：每个采样一行 JSON（上力矩或关节运动时 5 Hz，否则每 5 s 一行；上力矩时每行 `fdatasync`），512 KiB x 3 个文件；每次启动在 `boots.log` 追加一行，含上一次启动的最后一条记录。详见 [docs/agent_action_api.md](docs/agent_action_api.md#diagnostics--诊断)。
+日志同时输出到 stdout。日志或黑匣子目录无法创建或写入时，armd 记一条警告并在没有该功能的情况下运行。黑匣子：每个采样一行 JSON（上力矩或关节运动时 5 Hz，否则每 5 s 一行；上力矩时每行 `fdatasync`），2 MiB x 7 个文件（上力矩时约 75 分钟）；每次启动在 `boots.log` 追加一行，含上一次启动的最后一条记录。详见 [docs/agent_action_api.md](docs/agent_action_api.md#diagnostics--诊断)。
 
 环境变量：`RUST_LOG`（日志过滤，默认 `armd=info,tower_http=info`）、`PORT`、`ARMD_DETECTOR_URL`（默认 `http://127.0.0.1:8090`）、`ARMD_GRASP_SETUP`（抓取设置文件，默认 `/userdata/rebot-teleop/grasp_setup.json`）、`ARMD_KEEPOUT`（运行时禁入盒，默认 `/userdata/rebot-teleop/keepout.json`）、`ARMD_POSES`（命名姿态，默认 `/userdata/rebot-teleop/poses.json`）、`ARMD_COLLISION`（碰撞保护设置，默认 `/userdata/rebot-teleop/collision.json`）、`ARMD_LOG_DIR`、`ARMD_BLACKBOX_DIR`。
 

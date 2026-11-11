@@ -573,8 +573,8 @@ armd [OPTIONS]
 
 The log always goes to stdout as well. When the log or black-box directory cannot be created or
 written, armd logs one warning and runs without it. Black box: one JSON line per sample (5 Hz
-while torqued or moving, every 5 s otherwise; `fdatasync` per line while torqued), 512 KiB x 3
-files; each start appends a line with the previous start's last record to `boots.log`. Details:
+while torqued or moving, every 5 s otherwise; `fdatasync` per line while torqued), 2 MiB x 7
+files (about 75 min while torqued); each start appends a line with the previous start's last record to `boots.log`. Details:
 [docs/agent_action_api.md](docs/agent_action_api.md#diagnostics--诊断).
 
 Environment: `RUST_LOG` (log filter, default `armd=info,tower_http=info`), `PORT`,
