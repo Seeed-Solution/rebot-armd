@@ -208,7 +208,7 @@ async fn rig_mounted(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start:
 
 /// [`rig_mounted`] with a driver (and the collision guard on) when `arm` is given.
 async fn rig_driven(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start: ([f32; 7], Pose), offset_xy: [f64; 2], lease: bool,
-                    arm: Option<TestArm>) -> Rig {
+                    arm: Option<common::TestArm>) -> Rig {
     let mut config = ArmConfig::rebot_dm();
     if arm.is_some() { config.collision = Some(armd::collision::CollisionPolicy { enabled: true, ..Default::default() }); }
     // the controller knows the optical centre only when the truth says so (`Truth::same`)
@@ -785,6 +785,13 @@ fn camera_tilt_change_is_busy_while_a_macro_runs() {
 
 const V8_OFFSET: Vec3 = [-0.0731, 0.0005, 0.066];
 
+/// v8 setup, truth = controller, and a start with the tool pitched half way to camera-down.
+fn v8_setup() -> (GraspSetup, Truth, ([f32; 7], Pose)) {
+    let setup = GraspSetup { camera_tilt_deg: -38.0, ..GraspSetup::default() };
+    let truth = Truth { rot_deg: 90.0, offset: V8_OFFSET, ..Truth::same() };
+    (setup, truth, pitched_start(&kinematics::cam_mount(false, 90.0, -38.0), 0.5, 0.22))
+}
+
 /// Camera-down grasps with the v8 mount: approach and centre with the optical axis down, then
 /// the transition to the tool-vertical pose above the target, align, descend, close, lift.
 #[tokio::test]
@@ -798,8 +805,7 @@ async fn camera_down_grasp_with_the_v8_mount() {
     ];
     for (name, truth, offset, max_err) in cases {
         // the operator has the tool pitched half way, so the table below is in view
-        let start = pitched_start(&kinematics::cam_mount(false, 90.0, -38.0), 0.5, 0.22);
-        let rig = rig_mounted(setup.clone(), truth, 90.0, start, offset, false).await;
+        let rig = rig_mounted(setup.clone(), truth, 90.0, v8_setup().2, offset, false).await;
         let body = tap(&rig).await;
         let (id, duration) = grasp::start(&rig.sup, rig.sim.clone(), &body).await.expect("grasp accepted");
         let mut phases: Vec<String> = Vec::new();
@@ -839,14 +845,7 @@ async fn camera_down_grasp_with_the_v8_mount() {
 /// re-check records its offset from the (calibrated) grip pixel; motion is unchanged.
 #[tokio::test]
 async fn camera_down_recheck_records_the_final_offset() {
-    let setup = GraspSetup { camera_tilt_deg: -38.0, approach_height_m: 0.06, ..GraspSetup::default() };
-    let truth = Truth { rot_deg: 90.0, offset: V8_OFFSET, ..Truth::same() };
-    let start = pitched_start(&kinematics::cam_mount(false, 90.0, -38.0), 0.5, 0.22);
-    let start_r = start.1.r;
-    let rig = rig_mounted(setup.clone(), truth, 90.0, start, [0.01, 0.0], false).await;
-    let mut s = setup.clone();
-    s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
-    rig.sup.inner().write().await.set_grasp_setup(s.clone());
+    let (rig, s) = v8_recheck_rig().await;
     let o = run_grasp(&rig).await;
     println!("v8 re-check at 0.06 m: {} {:?}, grip pixel {:?}, final offset {:?} px, final xy error {:.2} mm",
         o.status.state, o.status.code, s.grip_pixel_norm, o.status.final_offset_px, xy_err(&o.final_pose.p, &rig.object) * 1000.0);
@@ -915,12 +914,11 @@ async fn camera_down_keeps_the_pitched_envelope_above_a_raised_table() {
 
 /// v8 rig at a 0.06 m approach (the target under the jaws is in view after the transition),
 /// grip pixel calibrated.
-async fn v8_recheck_rig(lease: bool) -> (Rig, GraspSetup) {
-    let setup = GraspSetup { camera_tilt_deg: -38.0, approach_height_m: 0.06, ..GraspSetup::default() };
-    let truth = Truth { rot_deg: 90.0, offset: V8_OFFSET, ..Truth::same() };
-    let start = pitched_start(&kinematics::cam_mount(false, 90.0, -38.0), 0.5, 0.22);
+async fn v8_recheck_rig() -> (Rig, GraspSetup) {
+    let (setup, truth, start) = v8_setup();
+    let setup = GraspSetup { approach_height_m: 0.06, ..setup };
     let start_r = start.1.r;
-    let rig = rig_mounted(setup.clone(), truth, 90.0, start, [0.01, 0.0], lease).await;
+    let rig = rig_mounted(setup.clone(), truth, 90.0, start, [0.01, 0.0], false).await;
     let mut s = setup.clone();
     s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
     rig.sup.inner().write().await.set_grasp_setup(s.clone());
@@ -932,7 +930,7 @@ async fn v8_recheck_rig(lease: bool) -> (Rig, GraspSetup) {
 #[tokio::test]
 async fn camera_down_recheck_failures_end_the_grasp_before_descent() {
     for (case, expect) in [("lost", "TARGET_LOST"), ("displaced", "TARGET_DISPLACED"), ("detector", "DETECTION_UNAVAILABLE")] {
-        let (rig, s) = v8_recheck_rig(false).await;
+        let (rig, s) = v8_recheck_rig().await;
         let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
         wait_phase(&rig.sup, id, "transition", Some(true)).await;
         match case {
@@ -960,7 +958,7 @@ async fn camera_down_recheck_failures_end_the_grasp_before_descent() {
 #[tokio::test]
 async fn stale_frames_end_the_observation_as_target_lost() {
     let rig1 = rig(GraspSetup::default(), Truth::same(), 0.0, [0.01, 0.01], false).await;
-    let (rig2, _) = v8_recheck_rig(false).await;
+    let (rig2, _) = v8_recheck_rig().await;
     for (case, rig, phase) in [("centring", &rig1, "centring"), ("re-check", &rig2, "transition")] {
         let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(rig).await).await.unwrap();
         wait_phase(&rig.sup, id, phase, Some(case == "re-check")).await;
@@ -975,49 +973,6 @@ async fn stale_frames_end_the_observation_as_target_lost() {
 }
 
 // ---- ending a camera-down grasp during the transition ----
-
-/// Test driver for the collision case: an ideal position servo reporting the model gravity
-/// torque plus a residual the test sets (as tests/test_collision_guard.rs).
-#[derive(Default)]
-struct ArmState { q: [f32; 7], torqued: bool, extra: [f32; 6] }
-
-#[derive(Clone, Default)]
-struct TestArm(Arc<Mutex<ArmState>>);
-
-impl armd::driver::ArmDriver for TestArm {
-    fn capabilities(&self) -> armd::driver::DriverCapabilities {
-        armd::driver::DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true }
-    }
-    fn enable_state(&self) -> armd::driver::EnableState {
-        if self.0.lock().unwrap().torqued { armd::driver::EnableState::Enabled } else { armd::driver::EnableState::Disabled }
-    }
-    fn is_feedback_valid(&self) -> bool { true }
-    fn is_enabled(&self) -> bool { self.0.lock().unwrap().torqued }
-    fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
-    fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, armd::driver::ArmDriverError> {
-        let s = self.0.lock().unwrap();
-        let q6: [f32; 6] = std::array::from_fn(|i| s.q[i]);
-        let g = armd::compute_gravity_torques(&q6).unwrap();
-        Ok((0..7).map(|i| armd::model::JointState {
-            position: s.q[i], velocity: 0.0, temperature: 30.0, torque: if i < 6 { g[i] + s.extra[i] } else { 0.0 },
-        }).collect())
-    }
-    fn write_joint_targets(&mut self, targets: &[armd::driver::JointTarget]) -> Result<(), armd::driver::ArmDriverError> {
-        let mut s = self.0.lock().unwrap();
-        for (i, t) in targets.iter().enumerate().take(7) { s.q[i] = t.position; }
-        Ok(())
-    }
-    fn set_torque(&mut self, enabled: bool) -> Result<(), armd::driver::ArmDriverError> {
-        self.0.lock().unwrap().torqued = enabled;
-        Ok(())
-    }
-}
-
-fn v8_setup() -> (GraspSetup, Truth, ([f32; 7], Pose)) {
-    let setup = GraspSetup { camera_tilt_deg: -38.0, ..GraspSetup::default() };
-    let truth = Truth { rot_deg: 90.0, offset: V8_OFFSET, ..Truth::same() };
-    (setup, truth, pitched_start(&kinematics::cam_mount(false, 90.0, -38.0), 0.5, 0.22))
-}
 
 #[tokio::test]
 async fn camera_down_stop_during_the_transition() {
@@ -1066,11 +1021,11 @@ async fn camera_down_lease_loss_during_the_transition() {
 #[tokio::test]
 async fn camera_down_collision_during_the_transition_holds() {
     let (setup, truth, start) = v8_setup();
-    let arm = TestArm::default();
+    let arm = common::TestArm::new();
     let rig = rig_driven(setup, truth, 90.0, start, [0.0, 0.0], false, Some(arm.clone())).await;
     let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
     wait_phase(&rig.sup, id, "transition", Some(true)).await;
-    arm.0.lock().unwrap().extra[1] = -20.0;
+    arm.set_residual(1, -20.0);
     let a = wait_done(&rig.sup, id, 10.0, |_| {}).await;
     assert_eq!((a.state.as_str(), a.code.as_deref(), a.phase.as_deref()), ("failed", Some("COLLISION"), Some("transition")), "{a:?}");
     assert!(rig.sup.inner().read().await.collision.hold.is_some(), "collision hold");
@@ -1118,7 +1073,7 @@ async fn camera_down_rejects_a_camera_body_that_would_reach_the_table() {
 async fn delayed_detector_recovers_from_stale_frames() {
     for triggered in [false, true] {
         for phase in ["centring", "transition"] {
-            let (rig, s) = v8_recheck_rig(false).await;
+            let (rig, s) = v8_recheck_rig().await;
             rig.sim.delayed.store(true, Ordering::SeqCst);
             rig.sim.per_request.store(triggered, Ordering::SeqCst);
             let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();

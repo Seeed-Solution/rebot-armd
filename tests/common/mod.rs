@@ -2,13 +2,15 @@
 #![allow(dead_code)]
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
+use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointMode, JointTarget};
+use armd::model::JointState;
 use armd::{create_router, ArmConfig, ArmSupervisor, SupervisorInner};
 
 /// Inspection pose used across the motion tests (J7 closed).
@@ -113,4 +115,57 @@ pub async fn torqued_rig(supervisor: Arc<ArmSupervisor>, q: &[f32]) -> (TestSock
     }
     let epoch = supervisor.get_observation().await.epoch_id;
     (ws, generation, epoch, supervisor, addr)
+}
+
+#[derive(Default)]
+pub struct ArmState { pub q: [f32; 7], pub torqued: bool, pub extra: [f32; 6], pub mit: bool }
+
+/// Test driver for the collision guard: an ideal position servo (holding still in MIT mode)
+/// reporting the model gravity torque plus a residual the test sets per joint.
+#[derive(Clone)]
+pub struct TestArm(pub Arc<Mutex<ArmState>>);
+
+impl TestArm {
+    pub fn new() -> Self { Self(Arc::new(Mutex::new(ArmState { q: INSPECT, ..Default::default() }))) }
+    pub fn set_residual(&self, joint: usize, nm: f32) { self.0.lock().unwrap().extra[joint] = nm; }
+    pub fn clear(&self) { self.0.lock().unwrap().extra = [0.0; 6]; }
+}
+
+impl ArmDriver for TestArm {
+    fn capabilities(&self) -> DriverCapabilities {
+        DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true }
+    }
+    fn enable_state(&self) -> EnableState {
+        if self.0.lock().unwrap().torqued { EnableState::Enabled } else { EnableState::Disabled }
+    }
+    fn is_feedback_valid(&self) -> bool { true }
+    fn is_enabled(&self) -> bool { self.0.lock().unwrap().torqued }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
+    fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        let s = self.0.lock().unwrap();
+        let mut q6 = [0.0; 6];
+        q6.copy_from_slice(&s.q[..6]);
+        let g = armd::compute_gravity_torques(&q6).unwrap();
+        Ok((0..7).map(|i| JointState {
+            position: s.q[i], velocity: 0.0, temperature: 30.0,
+            torque: if i < 6 { g[i] + s.extra[i] } else { 0.0 },
+        }).collect())
+    }
+    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        let mut s = self.0.lock().unwrap();
+        // Ideal position servo; in MIT mode (gravity compensation) the arm stays put.
+        if !s.mit { for (i, t) in targets.iter().enumerate().take(7) { s.q[i] = t.position; } }
+        Ok(())
+    }
+    fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
+        let mut s = self.0.lock().unwrap();
+        s.torqued = enabled;
+        s.mit = false;
+        Ok(())
+    }
+    fn supports_mit_mode_switch(&self) -> bool { true }
+    fn set_joint_modes(&mut self, modes: &[JointMode], _hold: &[JointTarget]) -> Result<(), ArmDriverError> {
+        self.0.lock().unwrap().mit = modes.iter().take(6).any(|m| *m == JointMode::Mit);
+        Ok(())
+    }
 }
