@@ -375,10 +375,7 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
     }
     inner.set_collision(b.enabled, b.sensitivity, true)?;
     let setting = CollisionSetting { enabled: inner.collision.enabled, sensitivity: inner.collision.sensitivity };
-    let write = inner.collision.path.clone().map(|path| PendingWrite {
-        path,
-        text: serde_json::to_string_pretty(&setting).unwrap_or_default(),
-    });
+    let write = inner.collision.path.clone().map(|path| PendingWrite::new(path, serde_json::to_string_pretty(&setting).unwrap_or_default()));
     Ok((inner.collision_config(), write))
 }
 

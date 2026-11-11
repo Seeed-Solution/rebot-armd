@@ -98,10 +98,8 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
         .map_err(|e| MotionError::InvalidCommand(format!("keep-out body must be {{\"boxes\": [{{name, min_m, max_m}}]}}: {e}")))?;
     inner.set_keepout_boxes(list.boxes)?;
     let state = inner.keepout_state();
-    let write = inner.keepout.path.clone().map(|path| PendingWrite {
-        path,
-        text: serde_json::to_string_pretty(&KeepoutList { boxes: inner.keepout.runtime_boxes.clone() }).unwrap_or_default(),
-    });
+    let write = inner.keepout.path.clone().map(|path| PendingWrite::new(path,
+        serde_json::to_string_pretty(&KeepoutList { boxes: inner.keepout.runtime_boxes.clone() }).unwrap_or_default()));
     Ok((state, write))
 }
 

@@ -109,8 +109,9 @@ hardware), template [`kits/_template/profile/example_urdf.json`](../kits/_templa
   are added to `workspace.keepout_boxes` (they cannot remove a profile box); named poses are stored in `ARMD_POSES`
   (default `/userdata/rebot-teleop/poses.json`); the runtime collision guard setting in
   `ARMD_COLLISION` (default `/userdata/rebot-teleop/collision.json`) replaces `collision.enabled`
-  when present. The files are written atomically; an invalid file is logged at start and left
-  unchanged.
+  when present. The files are written by one writer thread in order (unique temp file, fsync,
+  rename, directory fsync; an older state never overwrites a newer one); an invalid file is
+  logged at start and renamed to `<name>.bad-<unix seconds>`.
 
 The official kit ships the B601-DM profile as data,
 `kits/recamera-b601dm/profile/rebot-b601dm.json`; `tests/test_arm_profile.rs` fails when it

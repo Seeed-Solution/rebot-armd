@@ -139,7 +139,7 @@ async fn runtime_keepout_adds_to_the_profile_list_and_is_persisted() {
 }
 
 #[tokio::test]
-async fn corrupt_keepout_file_is_ignored_and_left_untouched() {
+async fn corrupt_keepout_file_is_ignored_and_moved_aside() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("keepout.json");
     std::fs::write(&path, "{\"boxes\": [ broken").unwrap();
@@ -147,7 +147,11 @@ async fn corrupt_keepout_file_is_ignored_and_left_untouched() {
     armd::keepout::load_into(&supervisor, &path).await;
     let state = supervisor.inner().read().await.keepout_state();
     assert_eq!((state.source, state.boxes.len()), ("profile", 1));
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"boxes\": [ broken");
+    assert!(!path.exists());
+    let bad: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(bad.len(), 1, "{bad:?}");
+    assert!(bad[0].file_name().unwrap().to_string_lossy().starts_with("keepout.json.bad-"), "{bad:?}");
+    assert_eq!(std::fs::read_to_string(&bad[0]).unwrap(), "{\"boxes\": [ broken");
 }
 
 /// A keep-out box on the park path from INSPECT (at the midpoint of the joint-space move home).

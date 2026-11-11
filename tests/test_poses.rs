@@ -44,9 +44,13 @@ async fn poses_file_round_trips_and_corrupt_file_is_not_overwritten_on_start() {
         let supervisor = ArmSupervisor::new(ArmConfig::rebot_dm());
         armd::poses::load_into(&supervisor, &path).await;
         assert!(supervisor.inner().read().await.poses.list.poses.is_empty(), "{corrupt}");
-        // Starting (and ticking) does not rewrite the file.
+        // The invalid file is moved aside before anything can overwrite it.
         supervisor.tick(0.02).await;
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
+        assert!(!path.exists(), "{corrupt}");
+        let bad: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("poses.json.bad-")).collect();
+        assert!(bad.iter().any(|p| std::fs::read_to_string(p).unwrap() == corrupt), "{bad:?}");
+        for p in bad { std::fs::remove_file(p).unwrap(); }
         // The next successful save replaces it.
         let write = {
             let mut inner = supervisor.inner().write().await;

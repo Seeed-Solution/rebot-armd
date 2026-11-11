@@ -99,10 +99,7 @@ impl SupervisorInner {
     }
 
     fn poses_write(&self) -> Option<PendingWrite> {
-        self.poses.path.clone().map(|path| PendingWrite {
-            path,
-            text: serde_json::to_string_pretty(&self.poses.list).unwrap_or_default(),
-        })
+        self.poses.path.clone().map(|path| PendingWrite::new(path, serde_json::to_string_pretty(&self.poses.list).unwrap_or_default()))
     }
 
     /// Joint-space quintic of J1..J6 (and J7 with `include_gripper`) to a stored pose,

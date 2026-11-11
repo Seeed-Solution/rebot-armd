@@ -293,7 +293,6 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let mut evicted_notify: Option<(String, u64)> = None;
             let mut pending_plan: Option<(PendingPlan, u64)> = None;
             let mut pending_macro: Option<(Value, PendingMacro, u64)> = None;
-            let mut pending_save: Option<crate::grasp::GraspSetup> = None;
             let mut pending_write: Option<crate::persist::PendingWrite> = None;
             if kind == "estop" || kind == "e_stop" {
                 let (state, epoch) = recv_supervisor.trigger_e_stop().await;
@@ -428,7 +427,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             Ok(setup) => {
                                                 let mut ack = command_ack(&inner, &value["request_id"], None);
                                                 ack["setup"] = json!(setup);
-                                                pending_save = Some(setup);
+                                                pending_write = recv_deps.setup_path.clone().map(|p| crate::persist::PendingWrite::new(
+                                                    p, serde_json::to_string_pretty(&setup).unwrap_or_default()));
                                                 ack
                                             }
                                             Err(error) => command_reject(&inner, &value["request_id"], error.into()),
@@ -564,21 +564,20 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         }
                     });
                 }
-                if let Some(setup) = pending_save.take() {
-                    if let (Some(path), Some(reply)) = (recv_deps.setup_path.clone(), response.as_mut()) {
-                        match tokio::task::spawn_blocking(move || crate::grasp::save_setup(&path, &setup)).await {
-                            Ok(Ok(())) => reply["persisted"] = json!(true),
-                            Ok(Err(e)) => { tracing::warn!("Grasp setup not saved: {e}"); reply["persisted"] = json!(false); reply["persist_error"] = json!(e.to_string()); }
-                            Err(e) => { reply["persisted"] = json!(false); reply["persist_error"] = json!(e.to_string()); }
+                // State files are written by the single persist writer; this loop does not wait
+                // for the disk: the ack (with `persisted`) is sent when the write finished.
+                if let Some(write) = pending_write.take() {
+                    let reply = response.take();
+                    let tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let result = write.run().await;
+                        let Some(mut reply) = reply else { return; };
+                        match result {
+                            Ok(()) => reply["persisted"] = json!(true),
+                            Err(e) => { tracing::warn!("State file not saved: {e}"); reply["persisted"] = json!(false); reply["persist_error"] = json!(e); }
                         }
-                    }
-                }
-
-                if let (Some(write), Some(reply)) = (pending_write.take(), response.as_mut()) {
-                    match write.run().await {
-                        Ok(()) => reply["persisted"] = json!(true),
-                        Err(e) => { tracing::warn!("State file not saved: {e}"); reply["persisted"] = json!(false); reply["persist_error"] = json!(e); }
-                    }
+                        let _ = tx.send(Message::Text(reply.to_string().into())).await;
+                    });
                 }
                 if let Some((evicted_conn, evicted_gen)) = evicted_notify {
                     let sender_opt = {
