@@ -14,6 +14,7 @@ import itertools
 import json
 import os
 import queue
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -565,6 +566,9 @@ class CameraRig:
         self.frame_id = 0
         self.physics_step: int | None = None  # physics step of the newest frame
         self.skipped = 0  # camera ticks without a new physics state (nothing published)
+        self.seg_failures = 0  # segmentation renders that failed (frame published without a result)
+        self.seg_consecutive = 0
+        self.seg_last_error: str | None = None
         self.render_ms: list[float] = []
         self.backend = os.environ.get("MUJOCO_GL", "default")
         self._cam = cam
@@ -584,6 +588,7 @@ class CameraRig:
                          "physics_time": frame["physics_time"] if frame else None,
                          "physics_step": frame["physics_step"] if frame else None,
                          "lag_s": None if lag is None else round(lag, 6), "skipped": self.skipped,
+                         "seg_failures": self.seg_failures, "seg_last_error": self.seg_last_error,
                          "stale": frame is None or lag > 2.0 / self.fps}
         return out
 
@@ -608,18 +613,49 @@ class CameraRig:
         self.model.vis.global_.offwidth = max(self.model.vis.global_.offwidth, w)
         self.model.vis.global_.offheight = max(self.model.vis.global_.offheight, h)
         self.renderer = mujoco.Renderer(self.model, h, w)
+        # plain renderer: render_segmentation sets the ID-colour flags and decodes with bounds checks
         self.seg_renderer = mujoco.Renderer(self.model, self._cam.DETECTION_SIZE[1], self._cam.DETECTION_SIZE[0])
-        self.seg_renderer.enable_segmentation_rendering()
         self.opt = mujoco.MjvOption()
         self.opt.sitegroup[:] = 0
         if self.cfg["has_meshes"]:
             self.opt.geomgroup[3] = 0  # box primitives hidden behind the upstream meshes
         self.encoders = {path: self._cam.H264Encoder(w, h, self.fps) for path in self.streams}
+        # one RGB and one segmentation render succeed before readiness is reported
+        self.state.read(self.data)
+        mujoco.mj_forward(self.model, self.data)
+        self.renderer.update_scene(self.data, camera="wrist", scene_option=self.opt)
+        self.renderer.render()
+        while self.detect() is None:  # raises after SEG_MAX_CONSECUTIVE failures
+            pass
+
+    SEG_MAX_CONSECUTIVE = 10
+
+    def detect(self) -> list[dict] | None:
+        """Ground-truth detections of the wrist view of self.data, or None when the segmentation
+        render failed (logged and counted; the frame then gets no result). Raises RuntimeError
+        after SEG_MAX_CONSECUTIVE failures in a row."""
+        r = self.seg_renderer
+        r.update_scene(self.data, camera="wrist", scene_option=self.opt)
+        try:
+            ids = self._cam.render_segmentation(r)
+        except Exception as exc:  # SegmentationError (bad readback) or a GL error
+            self.seg_failures += 1
+            self.seg_consecutive += 1
+            self.seg_last_error = repr(exc)
+            print(f"rebot-sim camera: segmentation failed on frame {self.frame_id + 1} "
+                  f"({self.seg_consecutive} in a row, {self.seg_failures} total): {exc!r}; "
+                  f"diag {getattr(exc, 'diag', {})} nbody {self.model.nbody} ngeom {self.model.ngeom} "
+                  f"scene.ngeom {r.scene.ngeom}", file=sys.stderr, flush=True)
+            if self.seg_consecutive >= self.SEG_MAX_CONSECUTIVE:
+                raise RuntimeError(f"segmentation failed on {self.seg_consecutive} consecutive frames: {exc!r}") from exc
+            return None
+        self.seg_consecutive = 0
+        return self._cam.detections(ids, self.scene)
 
     def run(self, parent_pid: int) -> None:
         import mujoco
 
-        renderer, seg_renderer, opt, encoders = self.renderer, self.seg_renderer, self.opt, self.encoders
+        renderer, opt, encoders = self.renderer, self.opt, self.encoders
         period = 1.0 / self.fps
         next_t = time.perf_counter()
         while os.getppid() == parent_pid:
@@ -632,10 +668,10 @@ class CameraRig:
                 captured = time.monotonic()
                 ts_ms = _now_ms()
                 mujoco.mj_forward(self.model, self.data)
-                seg_renderer.update_scene(self.data, camera="wrist", scene_option=opt)
-                dets = self._cam.detections(self._cam.segmentation_ids(seg_renderer.render()), self.scene)
+                dets = self.detect()
                 self.frame_id += 1
-                self.perception.on_frame(self.frame_id, ts_ms, captured, dets, self.data.time, step)
+                if dets is not None:  # a failed segmentation: the video frame goes out, no result
+                    self.perception.on_frame(self.frame_id, ts_ms, captured, dets, self.data.time, step)
                 for path, stream in self.streams.items():
                     if not stream.active:
                         continue

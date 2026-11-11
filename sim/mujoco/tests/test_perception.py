@@ -337,3 +337,66 @@ def test_shared_state_is_consistent_across_processes():
         assert done.is_set() and data.time == 200_000
     finally:
         st.close()
+
+
+def _rig():
+    from rebot_sim.camera import CameraMount
+    from rebot_sim.model import load_model
+    from rebot_sim.perception import CameraRig, SharedState, SimLink
+
+    m = CameraMount()
+    model = load_model(devarm_dir="", camera=m)
+    st = SharedState(model.nq, model.nv)
+    cfg = {"fps": 15, "size": [640, 360], "mount": [m.flip, m.rot_deg, m.tilt_deg, m.offset_m],
+           "objects": "cube", "scene_stream": False, "has_meshes": False}
+    return CameraRig(cfg, st, SimLink(None)), st
+
+
+def test_segmentation_decode_rejects_out_of_range_ids_and_matches_mujoco():
+    import mujoco
+    import numpy as np
+
+    from rebot_sim import camera as cam
+
+    rig, st = _rig()
+    try:
+        rig.setup()  # also renders once
+        m, d = rig.model, rig.data
+        for j, q in zip(range(1, 7), [0.46, -0.63, -1.05, 1.48, 0.43, -0.66]):  # cube in view
+            d.qpos[m.jnt_qposadr[m.joint(f"joint{j}").id]] = q
+        mujoco.mj_forward(m, d)
+        r = rig.seg_renderer
+        r.update_scene(rig.data, camera="wrist", scene_option=rig.opt)
+        ours = cam.render_segmentation(r)
+        ref = mujoco.Renderer(rig.model, 360, 640)
+        ref.enable_segmentation_rendering()
+        ref.update_scene(rig.data, camera="wrist", scene_option=rig.opt)
+        assert (ours == cam.segmentation_ids(ref.render())).all() and (ours >= 0).any()
+        garbage = np.zeros((360, 640, 3), np.uint8)
+        garbage[5, 7] = (0xB0, 0x0A, 0xFE)  # an id far above ngeom, as seen from mujoco 4.0.0
+        with pytest.raises(cam.SegmentationError) as e:
+            cam.decode_segmentation(garbage, r.scene)
+        assert e.value.diag["max_value"] == 0xFE0AB0 and e.value.diag["bad_pixels"] == 1
+    finally:
+        st.close()
+
+
+def test_a_bad_segmentation_frame_is_skipped_and_ten_in_a_row_fail_the_camera():
+    import numpy as np
+
+    rig, st = _rig()
+    try:
+        rig.setup()
+        r = rig.seg_renderer
+        good = r.render
+        r.render = lambda: np.full((360, 640, 3), 255, np.uint8)  # every pixel out of range
+        assert rig.detect() is None and rig.seg_failures == 1
+        r.render = good
+        assert rig.detect() is not None and rig.seg_failures == 1 and rig.seg_consecutive == 0
+        r.render = lambda: np.full((360, 640, 3), 255, np.uint8)
+        for _ in range(9):
+            assert rig.detect() is None
+        with pytest.raises(RuntimeError, match="10 consecutive"):
+            rig.detect()
+    finally:
+        st.close()
