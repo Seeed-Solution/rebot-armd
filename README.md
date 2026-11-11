@@ -333,8 +333,10 @@ bytes (2.6 MiB, gzip). Memory use on the device has not been measured for this R
 ## Web cockpit
 
 `src/api/index.html` is a single HTML file without external resources, embedded in the binary
-and served at `/`. JMuxer (`/assets/jmuxer.min.js`) plays the camera video. The UI is in
-Chinese and English (language switch in the header).
+and served at `/`. JMuxer (`/assets/jmuxer.min.js`) plays the camera video. The 3D view's
+three.js + urdf-loader bundle (`/assets/three-urdf.min.js`, 149 KB gzip) is also embedded and is
+fetched only when the 3D view is opened. The UI is in Chinese and English (language switch in
+the header).
 
 <p align="center">
   <img src="docs/images/cockpit-phone-landscape.jpg" alt="Cockpit on a phone in landscape: live camera video with joysticks, Enable, E-stop and status chips" width="49%">
@@ -375,7 +377,33 @@ Chinese and English (language switch in the header).
   Overspeed limits are 1.5 rad/s for J1–J3 and 3.0 rad/s for J4–J6. On the B601-DM, all five
   exit paths tested (exit, stop, takeover, E-stop, client disconnect) held the arm within
   1.5 mrad, and a 30 s hand-guided recording gave 1509 frames.
-- **E-stop** button, fault display and clear, torque enable by press-and-hold, park.
+- **E-stop** button, fault display and clear, torque enable by press-and-hold, park. With
+  `capabilities.fault_codes`, the fault display explains `observation.fault.code` in one line
+  and says what to check before clearing (for example `BUS_LOSS`: check the motor cable and power).
+- **Collision guard** (only when `capabilities.collision_guard` is true): while
+  `observation.collision.active`, a red banner names the joint, its residual torque and the
+  auto-resume countdown; it cannot be closed. During the hold the status reads "Collision hold"
+  and jog, sticks, presets, home, gripper and pose "Go" are locked; E-stop and the enable switch
+  stay usable. The sensitivity buttons are disabled while the guard is off. After escalation to the `COLLISION` fault it shows
+  the clear-fault button. The settings drawer (gear in the header) switches the guard on or off
+  and sets the sensitivity (low / medium / high); the thresholds are not calibrated on the arm
+  yet. Expert mode shows J1–J6 residual torque bars against the thresholds (green below 50 %,
+  yellow up to 100 %, red when tripped).
+- **3D view** ("3D" button on the video): the arm drawn from `reBot-DevArm_gripper.urdf` with the
+  measured joint angles (solid) and `commanded_positions` (translucent blue, shown when they
+  differ), a floor grid, the workspace box, keep-out boxes (`GET /api/v1/workspace/keepout`) and
+  stored poses as orange dots. Drag to rotate, pinch or scroll to zoom. J1–J6 use the motor angle
+  as the URDF angle; J7 is mapped to the finger travel (0–42.5 mm) between `gripper_policy`
+  `closed_rad` and `open_rad`. armd serves the URDF and meshes read-only from the asset directory
+  (`assets/`, else `/usr/share/rebot-teleop/assets/`, or `ARMD_ASSET_DIR`) at `/assets/model/`;
+  the kit `.deb` installs 34 decimated B601-DM meshes (2.8 MB). Without the meshes (lite
+  tarball) the view draws a stick figure through the URDF joint frames. It renders at most
+  30 frames/s and only when the pose, the boxes or the camera changed. The rendered `end_link`
+  matches armd's `kinematics::fk` within 0.001 mm at the points in `tests/fixtures/fk_points.json`
+  (`scripts/view3d_shots.mjs`).
+- **Poses drawer** (only when `capabilities.poses` is true): record the current position under
+  a name (`^[A-Za-z0-9_-]{1,64}$`), move to a stored pose (`move_to_pose` action at the cockpit
+  speed) or delete it.
 
 The cockpit does not take the lease when it opens. It acquires it on the first control input
 (jog, stick, key, Cartesian input, preset, enable, gripper, grasp, gravity compensation, park
@@ -624,7 +652,8 @@ is timing-sensitive and can fail on a loaded machine; rerun it.
 Playwright scripts (`scripts/*_shots.mjs`, `scripts/ux_walkthrough.mjs`,
 `tests/test_*_playwright.js`, `tests/test_single_origin_e2e.js`) take cockpit screenshots;
 they need Playwright (`PLAYWRIGHT=<module path>` to override) and a Chromium (`CHROME=<path>`),
-and some need a running armd. The `scripts/*_shots.mjs` write to `.cache/` (or `OUT`), the
+and some need a running armd. `scripts/devplat_shots.mjs` (fault texts, collision guard, poses) needs no armd and
+Playwright 1.48 or later. The `scripts/*_shots.mjs` write to `.cache/` (or `OUT`), the
 `tests/*.js` scripts to `tests/artifacts/`; both are ignored by git. The Python scripts in
 `scripts/` are bench diagnostics: some send raw CAN frames to the motors, others drive a running
 armd over its API. Run them only with the arm supported and the workspace clear.

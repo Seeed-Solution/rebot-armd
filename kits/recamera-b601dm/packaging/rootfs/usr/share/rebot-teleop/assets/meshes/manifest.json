@@ -1,0 +1,332 @@
+{
+ "source": "Seeed-Projects/reBot-DevArm Rebot_Arm_description/DM (CERN-OHL-W-2.0)",
+ "note": "visual meshes simplified to 12% of their faces (min 300) by scripts/decimate_meshes.py",
+ "links": {
+  "base_link": [
+   {
+    "file": "base_link_silver_trim.stl",
+    "rgb": [
+     0.8784,
+     0.8902,
+     0.8745
+    ],
+    "faces": 927
+   },
+   {
+    "file": "base_link_hardware_black.stl",
+    "rgb": [
+     0.0196,
+     0.0275,
+     0.0235
+    ],
+    "faces": 4076
+   },
+   {
+    "file": "base_link_matte_black.stl",
+    "rgb": [
+     0.0667,
+     0.0745,
+     0.0706
+    ],
+    "faces": 4782
+   }
+  ],
+  "link1": [
+   {
+    "file": "link1_matte_black.stl",
+    "rgb": [
+     0.0667,
+     0.0745,
+     0.0706
+    ],
+    "faces": 468
+   },
+   {
+    "file": "link1_hardware_black.stl",
+    "rgb": [
+     0.0196,
+     0.0275,
+     0.0235
+    ],
+    "faces": 300
+   },
+   {
+    "file": "link1_anodized_grey.stl",
+    "rgb": [
+     0.8314,
+     0.8471,
+     0.8314
+    ],
+    "faces": 300
+   }
+  ],
+  "link2": [
+   {
+    "file": "link2_seeed_yellow.stl",
+    "rgb": [
+     0.73,
+     0.84,
+     0.12
+    ],
+    "faces": 300
+   },
+   {
+    "file": "link2_matte_black.stl",
+    "rgb": [
+     0.0667,
+     0.0745,
+     0.0706
+    ],
+    "faces": 9083
+   },
+   {
+    "file": "link2_hardware_black.stl",
+    "rgb": [
+     0.0196,
+     0.0275,
+     0.0235
+    ],
+    "faces": 1756
+   },
+   {
+    "file": "link2_anodized_grey.stl",
+    "rgb": [
+     0.8314,
+     0.8471,
+     0.8314
+    ],
+    "faces": 1144
+   }
+  ],
+  "link3": [
+   {
+    "file": "link3_seeed_yellow.stl",
+    "rgb": [
+     0.73,
+     0.84,
+     0.12
+    ],
+    "faces": 617
+   },
+   {
+    "file": "link3_matte_black.stl",
+    "rgb": [
+     0.0667,
+     0.0745,
+     0.0706
+    ],
+    "faces": 4793
+   },
+   {
+    "file": "link3_hardware_black.stl",
+    "rgb": [
+     0.0196,
+     0.0275,
+     0.0235
+    ],
+    "faces": 2376
+   },
+   {
+    "file": "link3_anodized_grey.stl",
+    "rgb": [
+     0.8314,
+     0.8471,
+     0.8314
+    ],
+    "faces": 1470
+   }
+  ],
+  "link4": [
+   {
+    "file": "link4_seeed_yellow.stl",
+    "rgb": [
+     0.0667,
+     0.0745,
+     0.0706
+    ],
+    "faces": 300
+   },
+   {
+    "file": "link4_matte_black.stl",
+    "rgb": [
+     0.0667,
+     0.0745,
+     0.0706
+    ],
+    "faces": 4538
+   },
+   {
+    "file": "link4_hardware_black.stl",
+    "rgb": [
+     0.0196,
+     0.0275,
+     0.0235
+    ],
+    "faces": 1452
+   },
+   {
+    "file": "link4_anodized_grey.stl",
+    "rgb": [
+     0.8314,
+     0.8471,
+     0.8314
+    ],
+    "faces": 704
+   }
+  ],
+  "link5": [
+   {
+    "file": "link5_matte_black.stl",
+    "rgb": [
+     0.0667,
+     0.0745,
+     0.0706
+    ],
+    "faces": 4144
+   },
+   {
+    "file": "link5_hardware_black.stl",
+    "rgb": [
+     0.0196,
+     0.0275,
+     0.0235
+    ],
+    "faces": 880
+   },
+   {
+    "file": "link5_anodized_grey.stl",
+    "rgb": [
+     0.8314,
+     0.8471,
+     0.8314
+    ],
+    "faces": 430
+   }
+  ],
+  "link6": [
+   {
+    "file": "link6_matte_black.stl",
+    "rgb": [
+     0.0667,
+     0.0745,
+     0.0706
+    ],
+    "faces": 4434
+   },
+   {
+    "file": "link6_hardware_black.stl",
+    "rgb": [
+     0.0196,
+     0.0275,
+     0.0235
+    ],
+    "faces": 350
+   }
+  ],
+  "end_link": [
+   {
+    "file": "gripper_base_seeed_yellow.stl",
+    "rgb": [
+     0.725,
+     0.835,
+     0.118
+    ],
+    "faces": 806
+   },
+   {
+    "file": "gripper_base_hardware_black.stl",
+    "rgb": [
+     0.0196,
+     0.0275,
+     0.0235
+    ],
+    "faces": 298
+   },
+   {
+    "file": "gripper_base_metal.stl",
+    "rgb": [
+     0.8314,
+     0.8471,
+     0.8314
+    ],
+    "faces": 314
+   }
+  ],
+  "left_finger": [
+   {
+    "file": "left_finger_finger_black.stl",
+    "rgb": [
+     0.0667,
+     0.0745,
+     0.0706
+    ],
+    "faces": 300
+   },
+   {
+    "file": "left_finger_carriage_grey.stl",
+    "rgb": [
+     0.239,
+     0.278,
+     0.271
+    ],
+    "faces": 300
+   },
+   {
+    "file": "left_finger_travel_stop_yellow.stl",
+    "rgb": [
+     0.725,
+     0.835,
+     0.118
+    ],
+    "faces": 300
+   },
+   {
+    "file": "left_finger_rack_metal.stl",
+    "rgb": [
+     0.8314,
+     0.8471,
+     0.8314
+    ],
+    "faces": 1784
+   }
+  ],
+  "right_finger": [
+   {
+    "file": "right_finger_finger_black.stl",
+    "rgb": [
+     0.0667,
+     0.0745,
+     0.0706
+    ],
+    "faces": 300
+   },
+   {
+    "file": "right_finger_carriage_grey.stl",
+    "rgb": [
+     0.239,
+     0.278,
+     0.271
+    ],
+    "faces": 300
+   },
+   {
+    "file": "right_finger_travel_stop_yellow.stl",
+    "rgb": [
+     0.725,
+     0.835,
+     0.118
+    ],
+    "faces": 300
+   },
+   {
+    "file": "right_finger_rack_metal.stl",
+    "rgb": [
+     0.8314,
+     0.8471,
+     0.8314
+    ],
+    "faces": 1784
+   }
+  ]
+ }
+}
