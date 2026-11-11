@@ -121,6 +121,9 @@ pub struct UnloadSettle {
 /// (rad) over `following_error.persistence_ms` is blocked.
 pub const SERVO_BLOCKED_PROGRESS_RAD: f32 = 0.01;
 
+/// Most verification samples of one joint-space trajectory with keep-out boxes.
+pub const MAX_KEEPOUT_SAMPLES: usize = 400;
+
 /// `observation.motion_limit` is cleared this long (s) after the limit last applied.
 pub const MOTION_LIMIT_CLEAR_S: f64 = 0.3;
 
@@ -576,7 +579,53 @@ impl SupervisorInner {
 
     /// The planner's 21 verification points of a trajectory.
     pub fn trajectory_samples(traj: &MultiJointQuinticTrajectory) -> Vec<Vec<f32>> {
-        (0..=20).map(|k| traj.sample(traj.duration * f64::from(k) / 20.0).positions).collect()
+        Self::uniform_samples(traj, 20)
+    }
+
+    fn uniform_samples(traj: &MultiJointQuinticTrajectory, n: usize) -> Vec<Vec<f32>> {
+        (0..=n).map(|k| traj.sample(traj.duration * k as f64 / n as f64).positions).collect()
+    }
+
+    /// Workspace verification points of a joint-space trajectory: the 21 planner samples, or,
+    /// with keep-out boxes, enough samples that no check point moves more than half the
+    /// smallest box dimension between two of them (at most [`MAX_KEEPOUT_SAMPLES`]; a path
+    /// that needs more is WORKSPACE_VIOLATION).
+    pub fn workspace_samples(&self, traj: &MultiJointQuinticTrajectory) -> Result<Vec<Vec<f32>>, SafetyError> {
+        let samples = Self::trajectory_samples(traj);
+        let Some((ws, cam)) = self.workspace_policy() else { return Ok(samples); };
+        let Some(spacing) = ws.keepout_boxes.iter()
+            .flat_map(|b| (0..3).map(move |k| f64::from(b.max_m[k] - b.min_m[k])))
+            .reduce(f64::min).map(|d| 0.5 * d) else { return Ok(samples); };
+        let points: Vec<[f64; 3]> = std::iter::once([0.0; 3])
+            .chain(ws.check_points_end_m.iter().map(|p| p.map(f64::from)))
+            .chain(cam.offset_m.map(|o| o.map(f64::from)))
+            .collect();
+        let model = &self.config.arm_model;
+        let step = |samples: &[Vec<f32>]| -> f64 {
+            let at: Vec<Option<Vec<[f64; 3]>>> = samples.iter()
+                .map(|q| model.fk_f32(q).map(|pose| points.iter().map(|p| pose.transform_point(p)).collect()))
+                .collect();
+            at.windows(2).map(|w| match (&w[0], &w[1]) {
+                (Some(a), Some(b)) => a.iter().zip(b).map(|(x, y)| crate::kinematics::norm(&crate::kinematics::sub(x, y))).fold(0.0, f64::max),
+                _ => f64::INFINITY,
+            }).fold(0.0, f64::max)
+        };
+        let mut n = 20usize;
+        let mut samples = samples;
+        loop {
+            let max_step = step(&samples);
+            if max_step <= spacing { return Ok(samples); }
+            let next = if max_step.is_finite() { (n as f64 * max_step / spacing * 1.2).ceil() as usize } else { usize::MAX };
+            if n >= MAX_KEEPOUT_SAMPLES || next > MAX_KEEPOUT_SAMPLES * 4 {
+                return Err(SafetyError::WorkspaceViolation {
+                    point: 0,
+                    limit: format!("keepout sampling: the path needs more than {MAX_KEEPOUT_SAMPLES} samples for {spacing:.4} m spacing (half the smallest keep-out box); step"),
+                    value: max_step as f32, bound: spacing as f32,
+                });
+            }
+            n = next.clamp(n + 1, MAX_KEEPOUT_SAMPLES);
+            samples = Self::uniform_samples(traj, n);
+        }
     }
 
     fn gravity_output_enabled(&self) -> bool {
@@ -1006,7 +1055,17 @@ impl SupervisorInner {
                     ) {
                         // Park is exempt from the floor / box / reach limits (it must remain
                         // possible from a violating pose) but not from the keep-out boxes.
-                        let samples = Self::trajectory_samples(&traj);
+                        let samples = match self.workspace_samples(&traj) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!("Park path cannot be verified against the keep-out boxes ({e}); not parking");
+                                self.park_rejection = Some(e);
+                                self.pending_normal_unload = false;
+                                self.unload_settle = None;
+                                self.active_trajectory = None;
+                                return;
+                            }
+                        };
                         if let Err(e) = self.check_keepout_path(&clamped_start, samples.iter().map(Vec::as_slice)) {
                             tracing::warn!("Park path enters a keep-out box ({e}); not parking");
                             self.park_rejection = Some(e);
@@ -1643,7 +1702,7 @@ impl SupervisorInner {
             duration_secs,
             limits,
         )?;
-        let samples = Self::trajectory_samples(&traj);
+        let samples = self.workspace_samples(&traj)?;
         self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
 
         // 3. Only renew lease AFTER command validation and planning succeed

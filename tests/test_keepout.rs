@@ -262,3 +262,32 @@ fn keepout_change_is_busy_during_motion_and_makes_plans_stale() {
     assert_eq!(armd::api::rest::ApiError::from(err).code.as_deref(), Some("PLAN_STALE"));
     assert!(inner.active_trajectory.is_none());
 }
+
+/// A small box between two of the 21 planner samples of a long joint move is still found.
+#[test]
+fn joint_move_keepout_sampling_is_dense_enough_for_small_boxes() {
+    let mut target = INSPECT;
+    target[0] += 1.2;
+    let mut probe = sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    probe.jog(target.to_vec(), None, None).unwrap();
+    let traj = probe.active_trajectory.as_ref().unwrap().as_quintic().unwrap().clone();
+    let between = traj.sample(traj.duration * 10.5 / 20.0).positions;
+    let c = tcp(&between);
+    let small = KeepoutBox { name: "pin".into(), min_m: c.map(|v| (v - 0.006) as f32), max_m: c.map(|v| (v + 0.006) as f32) };
+    // the 21 samples miss it
+    let samples = SupervisorInner::trajectory_samples(&traj);
+    let ws = { let mut w = probe.config.workspace.clone().unwrap(); w.keepout_boxes = vec![small.clone()]; w };
+    assert!(samples.iter().all(|q| probe.config.arm_model.workspace_violation(q, &ws, &probe.config.camera_mount).total == 0.0), "box must sit between samples");
+    let mut inner = sim_at(with_boxes(vec![small]), &INSPECT);
+    let err = inner.jog(target.to_vec(), None, None).unwrap_err();
+    assert!(err.to_string().contains("keepout 'pin'"), "{err}");
+    assert!(inner.active_trajectory.is_none());
+
+    // a path that would need more than MAX_KEEPOUT_SAMPLES is refused with a clear message
+    let tiny = KeepoutBox { name: "speck".into(), min_m: [0.9, 0.9, 0.9], max_m: [0.9001, 0.9001, 0.9001] };
+    let mut inner = sim_at(with_boxes(vec![tiny]), &INSPECT);
+    let err = inner.jog(target.to_vec(), None, None).unwrap_err();
+    let api = armd::api::rest::ApiError::from(err);
+    assert_eq!(api.code.as_deref(), Some("WORKSPACE_VIOLATION"));
+    assert!(api.message.contains("needs more than 400 samples"), "{}", api.message);
+}
