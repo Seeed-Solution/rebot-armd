@@ -154,7 +154,12 @@ pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
     let approach = step(&mut cur, Pose::new(r_place, above(&request)))?;
     let descend = step(&mut cur, Pose::new(r_place, request.target))?;
     if request.release { cur.j7 = open_rad; }
-    let retreat = if request.retreat { step(&mut cur, Pose::new(r_place, above(&request)))? } else { 0.0 };
+    // as the runtime phase: straight up by approach_m from where descend ended, same orientation
+    let retreat = if request.retreat {
+        let p = cur.arm.fk(&cur.q0).p;
+        let goal = motion::resolve_goal(&cur, &GoalSpec::Absolute { p: [p[0], p[1], p[2] + request.approach_m], r: None });
+        step(&mut cur, goal)?
+    } else { 0.0 };
     Ok(PlannedPlace { input, request, r_place, durations: [lift, approach, descend, retreat] })
 }
 
