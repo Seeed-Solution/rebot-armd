@@ -42,6 +42,14 @@ TORQUE_LIMIT = np.array([27.0, 27.0, 27.0, 7.0, 7.0, 7.0, 7.0])
 NO_LOAD_SPEED = np.array([52.0] * 3 + [200.0] * 4) * 2 * np.pi / 60
 
 
+def _finite(v) -> float | None:
+    """`v` as a finite float (bool and non-numbers are None)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    f = float(v)
+    return f if np.isfinite(f) else None
+
+
 class Motors:
     """Damiao-like motor state and control law for the 7 actuators."""
 
@@ -68,19 +76,40 @@ class Motors:
             self.mode = ["pos_vel"] * DOF
         self.enabled = enabled
 
-    def set_targets(self, targets: list[dict]) -> bool:
-        if len(targets) != DOF:
-            return False
-        for i, t in enumerate(targets):
+    @staticmethod
+    def parse_targets(targets) -> list[tuple] | None:
+        """Validated targets (one tuple per joint), or None when any field is malformed."""
+        if not isinstance(targets, list) or len(targets) != DOF:
+            return None
+        out = []
+        for t in targets:
+            if not isinstance(t, dict):
+                return None
             mode = t.get("mode")
             if mode == "pos_vel":
-                self.mode[i], self.q_t[i], self.vlim[i] = mode, float(t["q"]), abs(float(t.get("vlim", 2.0)))
+                q, vlim = _finite(t.get("q")), _finite(t.get("vlim", 2.0))
+                if q is None or vlim is None:
+                    return None
+                out.append((mode, q, abs(vlim)))
             elif mode == "mit":
-                self.mode[i] = mode
-                self.q_t[i], self.dq_t[i] = float(t["q"]), float(t.get("dq", 0.0))
-                self.kp[i], self.kd[i], self.tau_ff[i] = float(t.get("kp", 0.0)), float(t.get("kd", 0.0)), float(t.get("tau", 0.0))
+                vals = [_finite(t.get("q"))] + [_finite(t.get(k, 0.0)) for k in ("dq", "kp", "kd", "tau")]
+                if any(v is None for v in vals):
+                    return None
+                out.append((mode, *vals))
             else:
-                return False
+                return None
+        return out
+
+    def set_targets(self, targets) -> bool:
+        """Apply all targets, or none of them when one is malformed."""
+        parsed = self.parse_targets(targets)
+        if parsed is None:
+            return False
+        for i, t in enumerate(parsed):
+            if t[0] == "pos_vel":
+                self.mode[i], self.q_t[i], self.vlim[i] = t
+            else:
+                self.mode[i], self.q_t[i], self.dq_t[i], self.kp[i], self.kd[i], self.tau_ff[i] = t
         return True
 
     def apply(self) -> None:
@@ -160,22 +189,28 @@ class Simulator:
             self.viewer = mj_viewer.launch_passive(self.model, self.data)
 
     def handle(self, payload: bytes, addr) -> None:
+        """Apply one datagram. Malformed packets change nothing and are counted in `rejected`."""
         try:
             msg = json.loads(payload)
-            if msg.get("v") != PROTOCOL_VERSION or msg.get("type") not in ("cmd", "poll"):
-                raise ValueError("unknown message")
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, UnicodeDecodeError, RecursionError):
+            msg = None
+        if not isinstance(msg, dict) or msg.get("v") != PROTOCOL_VERSION or msg.get("type") not in ("cmd", "poll"):
+            self.rejected += 1
+            return
+        if msg["type"] == "poll":
+            self.peer = addr
+            return
+        enable, seq, targets = msg.get("enable", False), msg.get("seq", 0), msg.get("targets")
+        parsed = None if targets is None else Motors.parse_targets(targets)
+        if (not isinstance(enable, bool) or isinstance(seq, bool) or not isinstance(seq, int) or seq < 0
+                or (targets is not None and parsed is None)):
             self.rejected += 1
             return
         self.peer = addr
-        if msg["type"] == "poll":
-            return
-        targets = msg.get("targets")
-        self.motors.set_enabled(bool(msg.get("enable", False)))
-        if targets is not None and not self.motors.set_targets(targets):
-            self.rejected += 1
-            return
-        self.ack = int(msg.get("seq", 0))
+        self.motors.set_enabled(enable)
+        if targets is not None:
+            self.motors.set_targets(targets)
+        self.ack = seq
         if self.steps_since_cmd:
             self.cmd_period = min(self.steps_since_cmd, self.tau_hist.maxlen)
         self.steps_since_cmd = 0
