@@ -17,6 +17,11 @@
 //! as the v8 holder): approach with the optical axis vertical and the camera centre above
 //! the estimate, centre the box on the image centre, then one Cartesian move to the
 //! tool-vertical pose above the table point of the centred ray (`transition`).
+//!
+//! Table clearance ([`TABLE_CLEARANCE_M`], [`envelope`]): every sub-motion, in both modes,
+//! keeps the TCP, the gripper check points and the camera (lens, body box) above
+//! `table_z_m + 0.005` along its path. The approach (and the camera-down transition) is
+//! checked before the ack; every sub-motion again before it is installed.
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -163,7 +168,8 @@ impl GraspSetup {
         if !all.iter().all(|v| fin(*v)) { return Err("grasp setup values must be finite".into()); }
         let check = |ok: bool, msg: &str| if ok { Ok(()) } else { Err(msg.to_string()) };
         check((-0.5..=0.5).contains(&self.table_z_m), "table_z_m must be in [-0.5, 0.5] m")?;
-        check(self.grasp_height_m >= 0.005 && self.grasp_height_m <= 0.2, "grasp_height_m must be in [0.005, 0.2] m")?;
+        // >= TABLE_CLEARANCE_M: the jaw tips (TCP) at the grasp height are within the clearance rule
+        check(self.grasp_height_m >= TABLE_CLEARANCE_M && self.grasp_height_m <= 0.2, "grasp_height_m must be in [0.005, 0.2] m")?;
         check(self.approach_height_m >= self.grasp_height_m + 0.02 && self.approach_height_m <= 0.4,
             "approach_height_m must be at least grasp_height_m + 0.02 and at most 0.4 m")?;
         check(self.lift_height_m >= self.grasp_height_m + 0.02 && self.lift_height_m <= 0.4,
@@ -652,16 +658,21 @@ pub fn camera_down_mode(setup: &GraspSetup, mount: &CameraMount) -> Result<bool,
     }
 }
 
-/// Clearance between every envelope point and the table during camera-down acquisition (m).
+/// Clearance between every envelope point and the table on every grasp sub-motion (m). One
+/// bound for every point, the TCP (jaw tips) included: `grasp_height_m` is validated to be at
+/// least this, so the tool-vertical jaw tips at the grasp height always satisfy it, and a point
+/// below the jaw-tip plane needs `grasp_height_m` to leave this much under it.
 pub const TABLE_CLEARANCE_M: f64 = 0.005;
 
-/// End_link points kept above the table during camera-down acquisition: the TCP, the
-/// workspace check points, the lens centre and, with a lens centre, the 8 corners of the
-/// camera body box (`camera_mount.body_size_m`: front face centred on the lens, `rec` axes).
+/// End_link points kept above the table on every grasp sub-motion: the TCP, the workspace
+/// check points and, when `camera_mount.offset_m` or `body_size_m` is set, the lens centre
+/// (`offset_m`, else the end_link origin as [`CamModel::assumed`] takes it) and the 8 corners
+/// of the camera body box (`body_size_m` or the default: front face centred on the lens, `rec` axes).
 pub fn envelope(ws: Option<&WorkspacePolicy>, mount: &CameraMount, rec: &Mat3) -> Vec<Vec3> {
     let mut pts = vec![[0.0; 3]];
     pts.extend(ws.iter().flat_map(|w| w.check_points_end_m.iter().map(|p| p.map(f64::from))));
-    if let Some(o) = mount.offset_m.map(|o| o.map(f64::from)) {
+    let lens = mount.offset_m.or(mount.body_size_m.map(|_| [0.0; 3]));
+    if let Some(o) = lens.map(|o| o.map(f64::from)) {
         pts.push(o);
         let [w, h, d] = mount.body_size().map(f64::from);
         for sx in [-0.5, 0.5] { for sy in [-0.5, 0.5] { for z in [0.0, -d] {
@@ -685,16 +696,19 @@ fn path_samples(from: &Pose, to: &Pose) -> Vec<(f64, Pose)> {
 }
 
 /// First sample of the path `from` → `to` where an envelope point is below
-/// `table_z + TABLE_CLEARANCE_M`, as a workspace violation (s, point index, z, bound). A path
-/// that starts below the bound may move as long as it does not go lower.
+/// `table_z + TABLE_CLEARANCE_M`, as a workspace violation (s, point index, z, bound). Each
+/// point is checked against its own floor: a point that starts below the bound may move as
+/// long as it does not go lower than its start height; a point that starts above it must stay
+/// above the bound.
 pub fn table_violation(from: &Pose, to: &Pose, pts: &[Vec3], table_z: f64) -> Option<MotionError> {
     let bound = table_z + TABLE_CLEARANCE_M;
-    let low = |pose: &Pose| pts.iter().enumerate().map(|(i, p)| (i, pose.transform_point(p)[2]))
-        .min_by(|a, b| a.1.total_cmp(&b.1)).expect("the envelope has the TCP");
-    let start = low(from).1.min(bound);
+    let floor: Vec<f64> = pts.iter().map(|p| from.transform_point(p)[2].min(bound)).collect();
     path_samples(from, to).into_iter().find_map(|(s, pose)| {
-        let (point, z) = low(&pose);
-        (z < start - 1e-6).then(|| MotionError::WorkspaceViolation { s, point, limit: "table_z_m + 0.005".into(), value: z, bound })
+        pts.iter().zip(&floor).enumerate()
+            .map(|(i, (p, f))| (i, pose.transform_point(p)[2], *f))
+            .filter(|&(_, z, f)| z < f - 1e-6)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(point, z, _)| MotionError::WorkspaceViolation { s, point, limit: "table_z_m + 0.005".into(), value: z, bound })
     })
 }
 
@@ -829,18 +843,17 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     let target = cam.plane_point(&pose, centre, grasp_plane(setup)).ok_or_else(|| ArmError::from(MotionError::InvalidCommand(
         "the box centre ray does not meet the table plane in front of the camera".into())))?;
     let camera_down = camera_down_mode(setup, &input.cam).map_err(MotionError::InvalidCommand)?;
+    let pts = envelope(input.ws.as_ref(), &input.cam, &cam.rec);
+    // the envelope stays above the table on the approach and (camera-down) the transition
     let goal = if camera_down {
-        let pts = envelope(input.ws.as_ref(), &input.cam, &cam.rec);
         let goal = camera_down_pose(&pose.r, &target, setup, &cam, &pts);
-        // the pitched envelope stays above the table on the approach and the transition
         let tool = approach_pose(&goal.r, &target, setup);
-        if let Some(e) = table_violation(&pose, &goal, &pts, setup.table_z_m).or_else(|| table_violation(&goal, &tool, &pts, setup.table_z_m)) {
-            return Err(e.into());
-        }
+        if let Some(e) = table_violation(&goal, &tool, &pts, setup.table_z_m) { return Err(e.into()); }
         goal
     } else {
         approach_pose(&pose.r, &target, setup)
     };
+    if let Some(e) = table_violation(&pose, &goal, &pts, setup.table_z_m) { return Err(e.into()); }
     let mut open_input = input.clone();
     open_input.j7 = open_rad;
     let path = motion::plan_cartesian(&open_input, goal, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
@@ -898,7 +911,7 @@ struct Orchestrator {
     source: Arc<dyn DetectionSource>,
     setup: GraspSetup,
     cam: CamModel,
-    /// Points kept above the table during camera-down acquisition ([`envelope`]).
+    /// Points kept above the table on every sub-motion ([`envelope`]).
     envelope: Vec<Vec3>,
     /// Each centring step triggers its own frame (perception API 2) instead of reading the
     /// continuous results.
@@ -911,7 +924,18 @@ impl std::ops::Deref for Orchestrator {
 }
 
 impl Orchestrator {
+    /// Every grasp sub-motion: WORKSPACE_VIOLATION before anything is installed when its
+    /// straight path from the commanded pose takes the envelope below the table clearance.
     async fn move_arm(&self, phase: &str, spec: GoalSpec, linear: f64) -> Result<SubDone, Stop> {
+        let input = {
+            let inner = self.sup.inner().read().await;
+            if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
+            inner.plan_input().map_err(crate::macro_action::arm_fail)?
+        };
+        let goal = motion::resolve_goal(&input, &spec);
+        if let Some(e) = table_violation(&input.arm.fk(&input.q0), &goal, &self.envelope, self.setup.table_z_m) {
+            return Err(crate::macro_action::arm_fail(e.into()));
+        }
         self.ctx.move_arm(phase, spec, Speed { linear, angular: motion::DEFAULT_ANGULAR_RPS }).await
     }
 
@@ -988,7 +1012,6 @@ impl Orchestrator {
                 tracing::info!("Grasp {}: camera-down acquisition at {height:.3} m (approach_height_m {:.3}) for table clearance", self.id, s.approach_height_m);
                 self.sup.inner().write().await.set_action_acquire_height(self.id, height as f32);
             }
-            self.table_clear(&pose0, &goal)?;
         }
         let done = self.move_arm("approach", GoalSpec::Absolute { p: goal.p, r: Some(goal.r) }, s.approach_speed_mps).await?;
 
@@ -1043,7 +1066,6 @@ impl Orchestrator {
             if len > s.max_step_m { step = [step[0] * s.max_step_m / len, step[1] * s.max_step_m / len, 0.0]; }
             // predict where the target lands after the step (same rough model)
             let moved = Pose::new(pose.r, kinematics::add(&pose.p, &step));
-            if camera_down { self.table_clear(&pose, &moved)?; }
             if let Some(p) = self.cam.project(&moved, &pt) { tracker.predict_at(self.cam.to_norm(p)); }
             let done = self.move_arm("centring", GoalSpec::Relative { frame: RelFrame::Base, d: step, dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false }, s.approach_speed_mps).await?;
             since = done.at;
@@ -1056,7 +1078,6 @@ impl Orchestrator {
             let Some((t, goal)) = transition_pose(&pose, self.cam.to_px(box_centre(&last.box_norm)), s, &self.cam) else {
                 return Err(fail("CENTRING_FAILED", "The target ray does not meet the table plane"));
             };
-            self.table_clear(&pose, &goal)?;
             let done = self.move_arm("transition", GoalSpec::Absolute { p: goal.p, r: Some(goal.r) }, s.approach_speed_mps).await?;
             // verify the target where the model expects it before descending
             self.recheck(&planned.request.label, &last, &t, grip_px, done.at, &mut after).await?;
@@ -1088,11 +1109,6 @@ impl Orchestrator {
         let p = self.pose().await.p;
         self.move_arm("lift", lift_to(p), s.descend_speed_mps).await?;
         Ok((true, closed.gripper_gap_rad))
-    }
-
-    /// Camera-down: the straight path `from` → `to` keeps the envelope above the table.
-    fn table_clear(&self, from: &Pose, to: &Pose) -> Result<(), Stop> {
-        table_violation(from, to, &self.envelope, self.setup.table_z_m).map_or(Ok(()), |e| Err(crate::macro_action::arm_fail(e.into())))
     }
 
     /// After the camera-down transition, when the model projects the target `t` into the
@@ -1355,6 +1371,44 @@ mod tests {
         // a path from below the bound may move sideways but not lower
         let side = Pose::new(low.r, [low.p[0] + 0.01, low.p[1], low.p[2]]);
         assert!(table_violation(&low, &side, &pts, setup.table_z_m).is_none());
+    }
+
+    #[test]
+    fn below_clearance_exception_is_per_point() {
+        // two points 0.1 m either side of the TCP along x, TCP 4 mm above the table. A roll
+        // about y from -5.73 to +5.16 deg swaps which point is lowest: -x starts lowest at
+        // -6 mm (below the table), +x starts at 14 mm and ends at -5 mm, through the table but
+        // above the lowest start height. Only -x may sit below the bound, +x must stay above it.
+        let table_z = 0.0;
+        let pts = [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]];
+        let roll = |deg: f64| kinematics::exp_r(&[0.0, deg.to_radians(), 0.0]);
+        let a = (0.01f64 / 0.1).asin().to_degrees();
+        let from = Pose::new(roll(-a), [0.0, 0.0, 0.004]);
+        let to = Pose::new(roll(0.9 * a), [0.0, 0.0, 0.004]);
+        let z = |pose: &Pose, i: usize| pose.transform_point(&pts[i])[2];
+        let bound = table_z + TABLE_CLEARANCE_M;
+        assert!(z(&from, 2) < table_z && z(&from, 1) > bound, "-x starts lowest, below the table; +x above the bound");
+        assert!(z(&to, 1) < table_z && z(&to, 1) > z(&from, 2) + 1e-4, "+x ends in the table, above the lowest start");
+        assert!(path_samples(&from, &to).iter().all(|(_, p)| (0..3).all(|i| z(p, i) >= z(&from, 2) - 1e-6)),
+            "no sample goes below the lowest start height, so a single-minimum check accepts the path");
+        match table_violation(&from, &to, &pts, table_z) {
+            Some(MotionError::WorkspaceViolation { point, value, .. }) => assert!(point == 1 && value < bound, "{point} {value}"),
+            other => panic!("expected a violation of point 1, got {other:?}"),
+        }
+        // the lowest point may stay where it started
+        assert!(table_violation(&from, &from, &pts, table_z).is_none());
+    }
+
+    #[test]
+    fn envelope_has_the_camera_when_a_lens_or_body_is_set() {
+        let ws = crate::model::ArmConfig::rebot_dm().workspace;
+        let rec = kinematics::cam_mount(false, 0.0, -38.0);
+        let n = |mount: CameraMount| envelope(ws.as_ref(), &mount, &rec).len();
+        assert_eq!(n(CameraMount::default()), 9, "TCP and 8 check points");
+        assert_eq!(n(CameraMount { offset_m: Some([-0.06, 0.0, 0.04]), ..Default::default() }), 18);
+        // a body size without a lens centre: the lens at the end_link origin, as CamModel assumes
+        let pts = envelope(ws.as_ref(), &CameraMount { body_size_m: Some([0.05, 0.05, 0.04]), ..Default::default() }, &rec);
+        assert_eq!((pts.len(), pts[9]), (18, [0.0; 3]));
     }
 
     #[test]

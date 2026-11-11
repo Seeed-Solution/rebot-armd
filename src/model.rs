@@ -199,7 +199,7 @@ pub struct CameraMount {
     pub offset_m: Option<[f32; 3]>,
     /// Camera body (housing and holder) as a box [width along x_cam, height along y_cam,
     /// depth behind the lens along −z_cam] (m), lens at the centre of its front face. Kept
-    /// above the table during camera-down grasp acquisition; None = [`CAMERA_BODY_DEFAULT_M`].
+    /// above the table on every grasp sub-motion; None = [`CAMERA_BODY_DEFAULT_M`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_size_m: Option<[f32; 3]>,
 }
