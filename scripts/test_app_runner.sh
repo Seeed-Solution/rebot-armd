@@ -306,7 +306,7 @@ rm -rf "$CT"
 
 # leftover sweep helper ($SWEEP, pidfds) on explicit candidate pids of the current user
 echo "== rebot-app-run pidfd sweep"
-eval "$(sed -n "/^SWEEP='/,/^        os.close(fd)'\$/p" "$RUNNER")"
+eval "$(sed -n "/^SWEEP='/,/^sys.exit(4 if failed else 0)'\$/p" "$RUNNER")"
 check "sweep: helper extracted" [ -n "$SWEEP" ]
 starttime_of() { python3 -c 'import sys; print(open("/proc/%s/stat" % sys.argv[1]).read().rsplit(")", 1)[1].split()[19])' "$1"; }
 sweep() { python3 -I -S -c "$SWEEP" "$@"; }
@@ -351,6 +351,21 @@ sweep "$(id -u)" 0 SIGKILL 0 "$$" "$V3"; r=$?
 check "sweep: forced off (REBOT_APP_PIDFD=0) exits 3, signals nothing" sh -c "[ $r -eq 3 ] && kill -0 $V3"
 out=$(python3 -I -S -c 'import os, sys; del os.pidfd_open; sys.argv = sys.argv[1:]; exec(sys.argv[0])' "$SWEEP" "$(id -u)" 0 SIGKILL 1 "$$" "$V3"); r=$?
 check "sweep: without os.pidfd_open exits 3, signals nothing" sh -c "[ $r -eq 3 ] && [ -z '$out' ] && kill -0 $V3"
+# pidfd_open failing with another errno (ENFILE here; injected): reported, exit 4; ESRCH
+# (the pid has exited) is skipped
+INJECT='import errno, os, signal, sys
+code = getattr(errno, sys.argv[1])
+def pidfd_open(pid, flags=0):
+    raise OSError(code, os.strerror(code))
+os.pidfd_open = pidfd_open
+if not hasattr(signal, "pidfd_send_signal"):
+    signal.pidfd_send_signal = lambda fd, sig: None
+sys.argv = sys.argv[2:]
+exec(sys.argv[0])'
+out=$(python3 -I -S -c "$INJECT" ENFILE "$SWEEP" "$(id -u)" 0 SIGKILL 1 "$$" "$V3"); r=$?
+check "sweep: pidfd_open ENFILE exits 4 and names the pid and errno" sh -c "[ $r -eq 4 ] && [ '$out' = '!$V3:ENFILE' ] && kill -0 $V3"
+out=$(python3 -I -S -c "$INJECT" ESRCH "$SWEEP" "$(id -u)" 0 SIGKILL 1 "$$" "$V3"); r=$?
+check "sweep: pidfd_open ESRCH is skipped (exit 0, nothing printed)" sh -c "[ $r -eq 0 ] && [ -z '$out' ]"
 kill "$V3"; wait "$V3" 2>/dev/null
 
 # build_deb.sh: the recamera flavor without REBOT_SDK_DIR stops before building

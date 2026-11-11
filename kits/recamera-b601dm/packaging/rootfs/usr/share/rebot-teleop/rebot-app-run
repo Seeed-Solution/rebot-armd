@@ -82,8 +82,10 @@ os.execvp(sys.argv[3], sys.argv[3:])'
 # pidfd still being alive after the reads (pidfd_send_signal 0) shows they describe the
 # process the pidfd refers to, and the signal goes through that pidfd, so a pid that was
 # reused before pidfd_open fails the check and one reused later is not reached. Prints each
-# pid it signalled; exit 3 without pidfds (<use-pidfd> 0, no os.pidfd_open /
-# signal.pidfd_send_signal, ENOSYS / EPERM from pidfd_open).
+# pid it signalled; a pid that has exited (ESRCH from pidfd_open) is skipped. exit 3 without
+# pidfds (<use-pidfd> 0, no os.pidfd_open / signal.pidfd_send_signal, ENOSYS / EPERM from
+# pidfd_open). Any other pidfd_open error (for example ENFILE, EMFILE) prints !<pid>:<errno
+# name>, the sweep goes on with the other pids and exits 4: that pid may still be running.
 SWEEP='import errno, os, signal, sys
 uid, start, sig, use, exclude = sys.argv[1], int(sys.argv[2]), getattr(signal, sys.argv[3]), sys.argv[4], sys.argv[5]
 if use != "1" or not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
@@ -99,6 +101,7 @@ def info(pid):
                 break
     return rest[0], int(rest[19]), u
 pids = sys.argv[6:] or [p for p in os.listdir("/proc") if p.isdigit()]
+failed = False
 for pid in pids:
     if pid in (exclude, str(os.getpid())):
         continue
@@ -107,6 +110,9 @@ for pid in pids:
     except OSError as e:
         if e.errno in (errno.ENOSYS, errno.EPERM):
             sys.exit(3)
+        if e.errno != errno.ESRCH:
+            print("!%s:%s" % (pid, errno.errorcode.get(e.errno, e.errno)))
+            failed = True
         continue
     try:
         try:
@@ -122,7 +128,8 @@ for pid in pids:
             continue
         print(pid)
     finally:
-        os.close(fd)'
+        os.close(fd)
+sys.exit(4 if failed else 0)'
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [rebot-app-run] $*" >> "$LOG" 2>/dev/null; }
 
@@ -217,7 +224,9 @@ is_leftover() {
 # kill_user_leftovers: SIGKILL every process of RUN_USER started at or after the program
 # (child_start); only when the runner is root (see the header). The /proc sweep repeats until
 # a sweep finds none (at most LEFTOVER_SWEEPS times), so processes forked during a sweep are
-# caught by the next one. With pidfds ($SWEEP) a reused pid is never signalled. Fallback
+# caught by the next one. With pidfds ($SWEEP) a reused pid is never signalled; a pid that
+# pidfd_open fails on with an error other than ESRCH / ENOSYS / EPERM is logged and the
+# sweep fails (return 1), since that process may still be running. Fallback
 # (no pidfds): each pid is re-checked by is_leftover right before kill <pid>; remaining race:
 # a pid that exits and is reused by a process of another user between its last check and the
 # kill() (a few instructions).
@@ -230,11 +239,17 @@ kill_user_leftovers() {
         if [ "$pidfd_ok" = 1 ]; then
             out=$(python3 -I -S -c "$SWEEP" "$uid" "$child_start" SIGKILL "$USE_PIDFD" "$$" 2>/dev/null)
             src=$?
-            if [ "$src" -eq 0 ]; then
+            if [ "$src" -eq 0 ] || [ "$src" -eq 4 ]; then
                 for p in $out; do
-                    found=1
-                    log "killed pid $p of $RUN_USER started after the program (outside its group; pidfd)"
+                    case "$p" in
+                        '!'*) p=${p#!}; log "pidfd_open failed for pid ${p%%:*} (${p#*:}); it may still be running" ;;
+                        *) found=1; log "killed pid $p of $RUN_USER started after the program (outside its group; pidfd)" ;;
+                    esac
                 done
+                if [ "$src" -eq 4 ]; then
+                    log "leftover sweep failed: processes of $RUN_USER may still be running"
+                    return 1
+                fi
                 [ "$found" -eq 0 ] && return 0
                 continue
             fi
