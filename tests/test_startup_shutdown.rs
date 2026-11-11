@@ -537,7 +537,7 @@ struct ApEnv {
 impl ApEnv {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
-        for d in ["proc", "run", "etc"] {
+        for d in ["proc", "run", "etc", "sys/class/net/wlan0"] {
             std::fs::create_dir_all(temp.path().join(d)).unwrap();
         }
         ApEnv { temp }
@@ -559,6 +559,7 @@ impl ApEnv {
         let t = self.temp.path().display().to_string();
         let functions = init_section(source, "# Write the hostapd config", "\n# PID of the vision respawn loop")
             .replace("/proc/", &format!("{t}/proc/"))
+            .replace("/sys/class/net/", &format!("{t}/sys/class/net/"))
             .replace("/var/run/", &format!("{t}/run/"))
             .replace("/etc/", &format!("{t}/etc/"))
             .replace("/usr/sbin/dnsmasq", "dnsmasq_stub")
@@ -617,6 +618,19 @@ echo "hostapd now: $(pidof hostapd)"
     fn own_pid(&self) -> String {
         self.read("run/hostapd_arm.pid").trim().to_string()
     }
+}
+
+/// Without a Wi-Fi interface (e.g. the PoE model) the script starts no hotspot and no guard.
+#[cfg(unix)]
+#[test]
+fn init_skips_wifi_without_a_wifi_interface() {
+    let env = ApEnv::new();
+    std::fs::remove_dir_all(env.p("sys/class/net/wlan0")).unwrap();
+    let out = env.run("start_wifi; AP_GUARD_TICKS=2 ap_guard 5g 44; echo done");
+    assert!(out.contains("no Wi-Fi interface"), "{out}");
+    assert!(out.contains("done"), "{out}");
+    assert!(!env.p("run/hostapd_arm.conf").exists(), "{out}");
+    assert!(!env.read("calls").contains("ap-guard"), "{}", env.read("calls"));
 }
 
 #[cfg(unix)]

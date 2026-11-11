@@ -597,11 +597,12 @@ start() {
         fi
     fi
 
-    DAEMON_OPTS="--follower $FOLLOWER_MODEL --port $PORT"
+    DAEMON_OPTS="--follower $FOLLOWER_MODEL"
     # armd rejects --follower-port for the mock follower (no hardware).
     if [ "$FOLLOWER_MODEL" != "mock" ]; then
         DAEMON_OPTS="$DAEMON_OPTS --follower-port $FOLLOWER_PORT"
     fi
+    DAEMON_OPTS="$DAEMON_OPTS --port $PORT"
     # The profile is for the 7-joint B601-DM; the mock follower uses it too so that it simulates
     # that arm (7 joints, Cartesian actions). Other followers keep their built-in profile.
     if { [ "$FOLLOWER_MODEL" = "rebot-dm" ] || [ "$FOLLOWER_MODEL" = "mock" ]; } && [ -f "$PROFILE" ]; then
