@@ -18,6 +18,7 @@ pub mod protocol;
 pub mod recording;
 pub mod safety;
 pub mod safety_describe;
+pub mod sim_driver;
 pub mod supervisor;
 pub mod trajectory;
 pub mod urdf;

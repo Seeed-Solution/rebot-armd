@@ -23,8 +23,8 @@ fn parse_cli_args() -> Result<CliArgs, String> {
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
             println!("armd - Robotic arm daemon\n\nUSAGE: armd [OPTIONS]\n\n\
-                --follower <MODEL>       rebot-rs, rebot-dm, so-arm101, fashionstar, star-arm102, mock (default)\n\
-                --follower-port <PORT>   CAN interface or serial device\n\
+                --follower <MODEL>       rebot-rs, rebot-dm, so-arm101, fashionstar, star-arm102, sim, mock (default)\n\
+                --follower-port <PORT>   CAN interface, serial device, or udp://HOST:PORT for sim (default udp://127.0.0.1:47600)\n\
                 --config <JSON>          ArmConfig profile (must match follower joint count)\n\
                 --port <PORT>            HTTP / WebSocket port (default 8765)\n\
                 --log-dir <DIR>          rotating log armd.log (default /userdata/rebot-teleop/logs when /userdata exists; off disables)\n\
@@ -147,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let follower = cli.follower.as_deref().unwrap_or("mock");
     let expected_dof = match follower {
-        "rebot-dm" => Some(7),
+        "rebot-dm" | "sim" => Some(7),
         "rebot-rs" | "so-arm101" | "fashionstar" | "star-arm102" => Some(6),
         "mock" => None,
         other => return Err(format!("Unknown follower model: {other}").into()),
@@ -161,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::warn!("Profile {path} has no kinematics/workspace: the Cartesian workspace check and Cartesian actions are off");
         }
         config
-    } else if follower == "rebot-dm" {
+    } else if follower == "rebot-dm" || follower == "sim" {
         ArmConfig::rebot_dm()
     } else {
         ArmConfig::default()
@@ -247,6 +247,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await;
             }
             info!("Mounted {} on {}", follower, port);
+        }
+        "sim" => {
+            let addr = cli.follower_port.as_deref().unwrap_or(armd::sim_driver::DEFAULT_SIM_ADDR);
+            let driver = armd::sim_driver::SimArmDriver::connect(addr, 7)?;
+            supervisor.set_driver(Box::new(driver)).await;
+            info!("Mounted sim follower (physics simulator at {addr}, B601-DM semantics)");
         }
         "mock" => info!("Follower configured as mock simulation"),
         _ => unreachable!(),

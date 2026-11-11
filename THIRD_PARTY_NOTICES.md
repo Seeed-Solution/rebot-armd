@@ -127,6 +127,17 @@ without specific prior written permission.
 - License: CERN-OHL-W-2.0, as the B601-DM URDF above. Not covered by the MIT License of this
   repository. The meshes it refers to are not included.
 
+## reBot B601-DM MuJoCo scene (simulator)
+
+- File: `sim/mujoco/models/rebot_b601dm_scene.xml`.
+- Derived from: the arm chain and inertials of `assets/reBot-DevArm_gripper.urdf` (above) and
+  the gripper collision extents of `Rebot_Arm_description/DM/mjcf/rebotarm_b601_colored.xml` of
+  https://github.com/Seeed-Projects/reBot-DevArm.
+- License: CERN-OHL-W-2.0 (https://ohwr.org/cern_ohl_w_v2.txt). Not covered by the MIT License
+  of this repository. The file header records the modifications (box primitives instead of
+  meshes, actuators, table and cube; 2026-11-11). No upstream meshes are included; the
+  simulator loads them from a reBot-DevArm checkout named by `REBOT_DEVARM_DIR`, when set.
+
 ## reCamera mount CAD (kit hardware)
 
 - Files: `kits/recamera-b601dm/hardware/` (v5 and v7_tilt STEP/STL, previews, generator,
