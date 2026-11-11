@@ -384,7 +384,7 @@ def _segmentation_startup(frames: int) -> dict:
 @pytest.mark.slow
 def test_segmentation_over_many_camera_startups_matches_mujoco():
     """20 start-ups in fresh processes, 10 frames each: no failed segmentation, every frame equal
-    to mujoco's segmentation (the canary row is outside the read-back image)."""
+    to mujoco's segmentation (the canary row is cropped from the readback)."""
     ctx = mp.get_context("spawn")
     with ctx.Pool(1, maxtasksperchild=1) as pool:
         runs = [pool.apply(_segmentation_startup, (10,)) for _ in range(20)]
@@ -393,11 +393,11 @@ def test_segmentation_over_many_camera_startups_matches_mujoco():
     assert all(r["visible"] == 10 for r in runs)
 
 
-def _drop_gpu_commands(monkeypatch, on: bool) -> None:
-    """Stand-in for the GPU driver out of memory: the frame's draw calls do nothing, so the
-    readback is the previous frame's buffer (all valid ids, with the previous canary)."""
-    for name, f in _GL_DRAW.items():
-        monkeypatch.setattr(mujoco, name, (lambda *a: None) if on else f)
+def _drop_gpu_commands(monkeypatch, on: bool, names=("mjr_render", "mjr_rectangle")) -> None:
+    """Stand-in for the GPU driver out of memory: the named draw calls do nothing, so the
+    readback keeps what the previous frame left there (all valid ids, the previous canary)."""
+    for name in names:
+        monkeypatch.setattr(mujoco, name, (lambda *a: None) if on else _GL_DRAW[name])
 
 
 _GL_DRAW = {name: getattr(mujoco, name) for name in ("mjr_render", "mjr_rectangle")}
@@ -419,6 +419,53 @@ def test_a_dropped_segmentation_render_is_detected_by_its_canary(monkeypatch):
         assert (cam.render_segmentation(r) == before).all()
     finally:
         st.close()
+
+
+def test_a_dropped_scene_with_the_canary_drawn_is_not_detected(monkeypatch):
+    """Known gap: when only the scene draw is lost and the stale buffer holds valid ids, the
+    canary (drawn) and the bounds check (valid ids) both pass and the stale frame is returned."""
+    rig, st = _rig()
+    try:
+        rig.setup()
+        r = rig.seg_renderer
+        set_arm(rig.model, rig.data, [0.46, -0.63, -1.05, 1.48, 0.43, -0.66])  # cube in view
+        r.update_scene(rig.data, camera="wrist", scene_option=rig.opt)
+        before = cam.render_segmentation(r)
+        set_arm(rig.model, rig.data, [0.0, -0.63, -1.05, 1.48, 0.43, -0.66])  # a different view
+        r.update_scene(rig.data, camera="wrist", scene_option=rig.opt)
+        _drop_gpu_commands(monkeypatch, True, ("mjr_render",))
+        stale = cam.render_segmentation(r)  # no SegmentationError
+        _drop_gpu_commands(monkeypatch, False)
+        truth = cam.render_segmentation(r)
+        assert (stale == before).all() and not (stale == truth).all()
+    finally:
+        st.close()
+
+
+def test_a_dropped_canary_with_the_scene_drawn_fails_the_segmentation(monkeypatch):
+    rig, st = _rig()
+    try:
+        rig.setup()
+        set_arm(rig.model, rig.data, [0.46, -0.63, -1.05, 1.48, 0.43, -0.66])
+        r = rig.seg_renderer
+        r.update_scene(rig.data, camera="wrist", scene_option=rig.opt)
+        cam.render_segmentation(r)
+        _drop_gpu_commands(monkeypatch, True, ("mjr_rectangle",))
+        with pytest.raises(cam.SegmentationError, match="not executed") as e:
+            cam.render_segmentation(r)
+        assert e.value.diag["canary_read"] != e.value.diag["canary_expected"]
+    finally:
+        st.close()
+
+
+def test_missing_renderer_internals_fail_loudly():
+    class Bare:
+        height, width, scene = 360, 640, None
+
+    with pytest.raises(RuntimeError, match=r"lacks \['_mjr_context', '_rect', '_gl_context'\]"):
+        cam.check_renderer_internals(Bare())
+    with pytest.raises(RuntimeError, match="lacks"):
+        cam.render_segmentation(Bare())
 
 
 def test_a_bad_segmentation_frame_is_skipped_and_ten_in_a_row_fail_the_camera(monkeypatch):
