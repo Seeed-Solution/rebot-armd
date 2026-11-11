@@ -87,6 +87,21 @@ struct Shared {
     rejected: u64,
 }
 
+/// Datagrams not sent because the socket buffer was full (non-blocking send).
+static SEND_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// Send without blocking the control tick (the socket itself stays blocking for the
+/// receiver thread, which shares it): a full buffer drops the datagram and counts it, like a
+/// lost CAN frame. Other errors are ignored for the same reason.
+fn send_nonblocking(socket: &UdpSocket, bytes: &[u8]) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: valid fd and buffer for the duration of the call.
+    let n = unsafe { libc::send(socket.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), libc::MSG_DONTWAIT) };
+    if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+        SEND_DROPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub struct SimArmDriver {
     socket: UdpSocket,
     dof: usize,
@@ -132,13 +147,16 @@ impl SimArmDriver {
     /// Datagrams dropped as malformed, out of order or for the wrong joint count.
     pub fn rejected_datagrams(&self) -> u64 { self.shared.lock().map_or(0, |s| s.rejected) }
 
+    /// Commands dropped because the send buffer was full (all sim drivers of the process).
+    pub fn dropped_sends() -> u64 { SEND_DROPS.load(Ordering::Relaxed) }
+
     fn send(&mut self, targets: Option<Vec<SimTarget>>) -> u64 {
         self.seq += 1;
         let cmd = SimCommand { v: PROTOCOL_VERSION, kind: "cmd".into(), seq: self.seq, enable: self.enable_requested, targets };
         if let Ok(bytes) = serde_json::to_vec(&cmd) {
             // A lost datagram is equivalent to a lost CAN frame: the missing feedback,
             // not the write error, is what the supervisor acts on (BUS_LOSS).
-            let _ = self.socket.send(&bytes);
+            send_nonblocking(&self.socket, &bytes);
             self.last_send_ms.store(self.epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
         self.seq
@@ -180,7 +198,7 @@ fn receiver_loop(socket: UdpSocket, dof: usize, shared: Arc<Mutex<Shared>>, stop
     while !stop.load(Ordering::SeqCst) {
         let now_ms = epoch.elapsed().as_millis() as u64;
         if now_ms.saturating_sub(last_send_ms.load(Ordering::Relaxed)) >= KEEPALIVE.as_millis() as u64 {
-            let _ = socket.send(&keepalive);
+            send_nonblocking(&socket, &keepalive);
             last_send_ms.store(now_ms, Ordering::Relaxed);
         }
         let n = match socket.recv(&mut buf) {
@@ -188,8 +206,10 @@ fn receiver_loop(socket: UdpSocket, dof: usize, shared: Arc<Mutex<Shared>>, stop
             // Timeout, or ECONNREFUSED while no simulator listens: keep polling.
             Err(_) => continue,
         };
+        // parse outside the lock; the lock only guards the swap
+        let parsed = parse_state(&buf[..n], dof);
         let Ok(mut s) = shared.lock() else { return };
-        match parse_state(&buf[..n], dof) {
+        match parsed {
             // Same session: drop duplicates and reordered datagrams. A new session
             // (simulator restart) starts a new sequence.
             Some(state) if s.latest.as_ref().is_none_or(|l| l.session != state.session || state.seq > l.seq) => {
