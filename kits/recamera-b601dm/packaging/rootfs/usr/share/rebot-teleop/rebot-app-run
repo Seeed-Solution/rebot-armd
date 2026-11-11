@@ -5,10 +5,17 @@
 # app.json {"entry": "main.py", "restart": "on-failure" | "always" | "never"} (default
 # on-failure). The program runs as `nice -n 5 python3 -u <entry>` in the app directory with
 # REBOT_HOST=127.0.0.1 and PYTHONPATH=/usr/share/rebot-teleop/python:<app dir>.
+# - User: the program runs as $REBOT_APP_USER (default recamera, unprivileged; HOME, USER and
+#   LOGNAME set to it), never as root. A missing user, a root user, or a runner that is not
+#   root and asked for another user refuses the start (logged, state stopped, exit 1).
+# - Process group: the program starts in its own session; stop and restart signal the whole
+#   group, so processes it started do not survive it.
 # - Restart: exit code 0 ends the runner with on-failure; any other exit restarts with backoff
 #   1, 2, 4 ... 30 s (back to 1 s after a run longer than 60 s); 10 starts within 5 minutes
 #   end the runner with state given_up. "always" restarts after exit code 0 too, "never" never.
-# - SIGTERM: forwarded to the program; SIGKILL when it is still running after 10 s.
+# - SIGTERM: forwarded to the program's process group; SIGKILL to the group when the program
+#   is still running after 10 s. When the program has exited, what is left of its group is
+#   sent SIGKILL.
 # - Log: stdout and stderr of the program and the runner's own lines are appended to
 #   $REBOT_APP_LOG_DIR/app-<name>.log (default /userdata/rebot-teleop/logs). The size is
 #   checked before every start and every 30 s while the program runs; above 512 KiB the log is
@@ -16,7 +23,7 @@
 #   Bytes written between the copy and the truncate are lost.
 # - State file $REBOT_APP_STATE_DIR/rebot-app-<name>.state (default /tmp): state (running |
 #   backoff | stopped | given_up), pid (program), runner (this process), starts, last_exit.
-# - Tuning, for tests: REBOT_APP_BACKOFF_MAX, REBOT_APP_STABLE_SECS, REBOT_APP_GIVEUP_STARTS,
+# - Tuning, for tests: REBOT_APP_USER, REBOT_APP_BACKOFF_MAX, REBOT_APP_STABLE_SECS, REBOT_APP_GIVEUP_STARTS,
 #   REBOT_APP_GIVEUP_WINDOW, REBOT_APP_KILL_GRACE, REBOT_APP_LOG_MAX, REBOT_APP_LOG_CHECK,
 #   REBOT_APP_PYTHONPATH, REBOT_APP_PYTHON.
 # - Everything is in functions and the last line calls main (see rebot-vision-run).
@@ -33,6 +40,21 @@ LOG_MAX=${REBOT_APP_LOG_MAX:-524288}
 LOG_CHECK=${REBOT_APP_LOG_CHECK:-30}
 SDK_PATH=${REBOT_APP_PYTHONPATH:-/usr/share/rebot-teleop/python}
 PYTHON=${REBOT_APP_PYTHON:-python3}
+RUN_USER=${REBOT_APP_USER:-recamera}
+
+# python3 -c "$LAUNCH" <user> <command...>: new session (own process group), drop to <user>
+# (supplementary groups from /etc/group), then exec the command.
+LAUNCH='import os, pwd, sys
+u = pwd.getpwnam(sys.argv[1])
+os.setsid()
+if os.getuid() != u.pw_uid:
+    os.initgroups(u.pw_name, u.pw_gid)
+    os.setgid(u.pw_gid)
+    os.setuid(u.pw_uid)
+if os.getuid() == 0 or os.geteuid() == 0:
+    sys.exit("rebot-app-run: refusing to run the program as root")
+os.environ.update(HOME=u.pw_dir, USER=u.pw_name, LOGNAME=u.pw_name)
+os.execvp(sys.argv[2], sys.argv[2:])'
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [rebot-app-run] $*" >> "$LOG" 2>/dev/null; }
 
@@ -68,12 +90,25 @@ on_term() {
     stopping=1
     [ -n "$sleeper" ] && kill -TERM "$sleeper" 2>/dev/null
     if [ -n "$child" ]; then
-        kill -TERM "$child" 2>/dev/null
+        # the group (pgid = program pid) exists once the launcher ran setsid
+        kill -TERM "-$child" 2>/dev/null || kill -TERM "$child" 2>/dev/null
         if [ -z "$killer" ]; then
-            ( sleep "$KILL_GRACE"; kill -KILL "$child" 2>/dev/null ) &
+            ( sleep "$KILL_GRACE"; kill -KILL "-$child" 2>/dev/null || kill -KILL "$child" 2>/dev/null ) &
             killer=$!
         fi
     fi
+}
+
+# check_user: the program user exists, is not root, and this runner can switch to it.
+check_user() {
+    uid=$(id -u "$RUN_USER" 2>/dev/null) || { log "user $RUN_USER does not exist; not starting (set REBOT_APP_USER)"; return 1; }
+    [ "$uid" -ne 0 ] || { log "user $RUN_USER is root; not starting"; return 1; }
+    me=$(id -u)
+    if [ "$me" -ne 0 ] && [ "$me" -ne "$uid" ]; then
+        log "runner is not root and cannot run the program as $RUN_USER; not starting"
+        return 1
+    fi
+    command -v python3 >/dev/null 2>&1 || { log "python3 not found; not starting"; return 1; }
 }
 
 # Wait until the program ($child) has exited; its status in rc (see rebot-vision-run).
@@ -145,6 +180,11 @@ main() {
         return 1
     fi
 
+    if ! check_user; then
+        write_state stopped
+        return 1
+    fi
+
     NICE="nice -n 5"
     command -v nice >/dev/null 2>&1 || NICE=""
     export REBOT_HOST=127.0.0.1
@@ -153,7 +193,7 @@ main() {
 
     rotate_loop &
     rotator=$!
-    log "starting $NAME (entry $entry, restart $restart)"
+    log "starting $NAME (entry $entry, restart $restart, user $RUN_USER)"
 
     starts=""
     delay=1
@@ -175,7 +215,7 @@ main() {
         starts="$starts $now"
         rotate_log
         cd "$APP_DIR" || { log "cannot enter $APP_DIR"; write_state stopped; result=1; break; }
-        $NICE "$PYTHON" -u "$entry" >> "$LOG" 2>&1 < /dev/null &
+        $NICE python3 -c "$LAUNCH" "$RUN_USER" "$PYTHON" -u "$entry" >> "$LOG" 2>&1 < /dev/null &
         child=$!
         total=$((total + 1))
         # a SIGTERM between the fork and the line above found no child to forward to
@@ -183,6 +223,8 @@ main() {
         write_state running
         wait_child
         last_exit=$rc
+        # processes the program left in its group
+        kill -KILL "-$child" 2>/dev/null
         [ -n "$killer" ] && { kill -TERM "$killer" 2>/dev/null; killer=""; }
         child=""
         if [ "$stopping" -eq 1 ]; then break; fi

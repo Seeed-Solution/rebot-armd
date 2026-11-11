@@ -136,10 +136,11 @@ it after a crash and keeps its log. The runner is covered by host tests
 | Item | Value |
 |---|---|
 | Command | `nice -n 5 python3 -u <entry>`, working directory = the app directory |
+| User | `recamera` (unprivileged; `REBOT_APP_USER` overrides it), never root; a missing user refuses the start. The program can read the app directory and `/userdata/rebot-teleop` but not write the armd state files there (root-owned); a program that writes files needs a directory writable by `recamera` |
 | Environment | `REBOT_HOST=127.0.0.1`, `PYTHONPATH=/usr/share/rebot-teleop/python:<app dir>` |
 | `app.json` (optional) | `{"entry": "main.py", "restart": "on-failure" \| "always" \| "never"}`; default `main.py`, `on-failure` |
 | Restart | exit code 0 ends the runner with `on-failure`; other exits restart after 1, 2, 4 ... 30 s (back to 1 s after a run longer than 60 s); 10 starts within 5 minutes end it with state `given_up` |
-| Stop | SIGTERM to the program, SIGKILL after 10 s |
+| Stop | the program runs in its own session; SIGTERM to its process group, SIGKILL to the group after 10 s; processes left in the group when the program exits are killed |
 | Log | `/userdata/rebot-teleop/logs/app-<name>.log`; above 512 KiB (checked before each start and every 30 s) it is copied to `.1`, `.1` to `.2`, and truncated; bytes written during the copy can be lost |
 | State | `/tmp/rebot-app-<name>.state`: `state` (running, backoff, stopped, given_up), `pid`, `runner`, `starts`, `last_exit` |
 
@@ -158,6 +159,10 @@ reCamera 应用画廊一次只运行一个应用，摄像头为独占资源，�
 4. 开机自启：在 rebot-teleop 设置的“自定义程序”组中，将 `app.enabled` 设为 `on`、`app.name`
    设为 `<name>`（`/userdata/local/apps/rebot-teleop.config.json`）。`start` 在 armd 之后启动该程序，
    `stop` 先停止该程序。
+
+程序以非特权用户 `recamera` 运行（可用 `REBOT_APP_USER` 指定，不允许 root）；该用户不存在时不启动并记录日志。
+程序可读取应用目录与 `/userdata/rebot-teleop`，但不能写入其中由 root 拥有的 armd 状态文件。程序在独立会话中运行，
+停止时 SIGTERM 发送到整个进程组，10 秒后对进程组发送 SIGKILL；程序退出后遗留在进程组中的进程会被结束。
 
 | 项目 | 取值 |
 |---|---|

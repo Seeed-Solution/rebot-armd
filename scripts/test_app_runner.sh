@@ -2,6 +2,7 @@
 # Host-side test of kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/rebot-app-run.
 # Runs every case under /bin/sh and, when installed, under `busybox sh` (the reCamera shell).
 # Needs python3 and timeout. Timings are shortened with the runner's REBOT_APP_* variables.
+# Not root: the program runs as the current user (REBOT_APP_USER); as root it runs as nobody.
 # Usage: scripts/test_app_runner.sh
 HERE=$(cd "$(dirname "$0")" && pwd)
 KIT=$HERE/../kits/recamera-b601dm/packaging/rootfs
@@ -9,6 +10,7 @@ RUNNER=$KIT/usr/share/rebot-teleop/rebot-app-run
 K92=$KIT/etc/init.d/K92rebot-teleop
 FAILS=0
 PASSES=0
+if [ "$(id -u)" -eq 0 ]; then APP_USER=nobody; else APP_USER=$(id -un); fi
 
 pass() { PASSES=$((PASSES + 1)); echo "  ok   $*"; }
 fail() { FAILS=$((FAILS + 1)); echo "  FAIL $*"; }
@@ -28,14 +30,14 @@ new_app() {
 run_fg() {
     n=$1; shift
     env REBOT_APPS_DIR="$T/apps" REBOT_APP_LOG_DIR="$T/logs" REBOT_APP_STATE_DIR="$T/state" \
-        REBOT_APP_PYTHONPATH=/usr/share/rebot-teleop/python "$@" timeout 30 $SH "$RUNNER" "$n"
+        REBOT_APP_PYTHONPATH=/usr/share/rebot-teleop/python REBOT_APP_USER="$APP_USER" "$@" timeout 30 $SH "$RUNNER" "$n"
     RC=$?
 }
 # run_bg <name> [env assignments...]: runner in the background, its pid in RPID
 run_bg() {
     n=$1; shift
     env REBOT_APPS_DIR="$T/apps" REBOT_APP_LOG_DIR="$T/logs" REBOT_APP_STATE_DIR="$T/state" \
-        REBOT_APP_PYTHONPATH=/usr/share/rebot-teleop/python "$@" $SH "$RUNNER" "$n" &
+        REBOT_APP_PYTHONPATH=/usr/share/rebot-teleop/python REBOT_APP_USER="$APP_USER" "$@" $SH "$RUNNER" "$n" &
     RPID=$!
 }
 # wait_for <seconds> <command...>: poll every 0.1 s
@@ -151,6 +153,44 @@ run_suite() {
     check "missing app directory: runner exits 1" [ "$RC" -eq 1 ]
     run_fg '../x'
     check "invalid name: runner exits 2" [ "$RC" -eq 2 ]
+
+    # 11. program user: REBOT_APP_USER; unknown user or root refuses the start
+    new_app who 'import os; print("UID=%d HOME=%s" % (os.getuid(), os.environ["HOME"]))'
+    run_fg who
+    check "user: runs as REBOT_APP_USER" log_has who "UID=$(id -u "$APP_USER") "
+    new_app nouser 'print("must not run")'
+    run_fg nouser REBOT_APP_USER=no_such_user_rebot
+    check "unknown user: runner exits 1" [ "$RC" -eq 1 ]
+    check "unknown user: logged" log_has nouser "user no_such_user_rebot does not exist"
+    check "unknown user: program not run" sh -c "! grep -q 'must not run' '$T/logs/app-nouser.log'"
+    check "unknown user: state stopped" state_is nouser stopped
+    new_app asroot 'print("must not run")'
+    run_fg asroot REBOT_APP_USER=root
+    check "root user: refused" sh -c "[ $RC -eq 1 ] && grep -q 'is root; not starting' '$T/logs/app-asroot.log' && ! grep -q 'must not run' '$T/logs/app-asroot.log'"
+
+    # 12. process group: stop also ends the processes the program started
+    new_app group "import subprocess, time
+p = subprocess.Popen(['sleep', '60'])
+open('$T/group.child', 'w').write(str(p.pid))
+print('spawned', flush=True)
+time.sleep(60)"
+    run_bg group
+    check "group: program and its child running" wait_for 10 test -s "$T/group.child"
+    GPID=$(cat "$T/group.child" 2>/dev/null)
+    check "group: program is a session leader" sh -c "[ \"\$(ps -o sid= -p $(state_get group pid) | tr -d ' ')\" = $(state_get group pid) ]"
+    kill -TERM "$RPID"
+    check "group: runner exits" wait_for 5 sh -c "! kill -0 $RPID"
+    wait "$RPID" 2>/dev/null
+    check "group: the program's child is gone after stop" wait_for 3 sh -c "! kill -0 $GPID"
+    # ... and after the program exits on its own
+    new_app orphan "import subprocess, sys
+p = subprocess.Popen(['sleep', '60'])
+open('$T/orphan.child', 'w').write(str(p.pid))
+sys.exit(4)"
+    printf '%s\n' '{"restart": "never"}' > "$T/apps/orphan/app.json"
+    run_fg orphan
+    OPID=$(cat "$T/orphan.child" 2>/dev/null)
+    check "group: a child left by an exited program is killed" wait_for 3 sh -c "[ -n '$OPID' ] && ! kill -0 '$OPID'"
 
     rm -rf "$T"
 }
