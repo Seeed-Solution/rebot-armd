@@ -716,6 +716,10 @@ pub struct ActionStatus {
     /// frame after the transition; diagnostic, absent when not measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_offset_px: Option<[f32; 2]>,
+    /// Grasp camera-down acquisition: TCP height above the table (m) used instead of
+    /// `approach_height_m`, raised for table clearance; absent when not raised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquire_height_m: Option<f32>,
 }
 
 impl ActionStatus {

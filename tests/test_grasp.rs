@@ -839,3 +839,44 @@ async fn camera_down_on_without_lens_centre_is_rejected() {
     body["overrides"] = json!({"acquire_camera_down": "sideways"});
     assert_eq!(grasp::start(&rig.sup, rig.sim.clone(), &body).await.unwrap_err().code.as_deref(), Some("INVALID_COMMAND"));
 }
+
+/// Lowest base-frame z of the TCP, the workspace check points and the lens centre at `q`.
+fn envelope_min_z(config: &ArmConfig, q: &[f32]) -> f64 {
+    let pose = kinematics::fk(&kinematics::q6(q));
+    let mut pts: Vec<Vec3> = vec![[0.0; 3]];
+    pts.extend(config.workspace.iter().flat_map(|w| w.check_points_end_m.iter().map(|p| p.map(f64::from))));
+    pts.extend(config.camera_mount.offset_m.map(|o| o.map(f64::from)));
+    pts.iter().map(|p| pose.transform_point(p)[2]).fold(f64::INFINITY, f64::min)
+}
+
+/// Raised table and a low approach: the pitched gripper envelope would reach below the table
+/// at the requested approach height. The camera-down acquisition raises the TCP so every check
+/// point stays above table_z_m + clearance (reported as `acquire_height_m`) through the
+/// approach, centring and transition.
+#[tokio::test]
+async fn camera_down_keeps_the_pitched_envelope_above_a_raised_table() {
+    let setup = GraspSetup { camera_tilt_deg: -38.0, table_z_m: 0.10, grasp_height_m: 0.015, approach_height_m: 0.035, ..GraspSetup::default() };
+    // rot 0: the tilt pitches the tool about the axis along which the check points are
+    // 92.5 mm off the tool axis (v8's rot 90 pitches about the 34.7 mm one)
+    let truth = Truth { rot_deg: 0.0, offset: V8_OFFSET, ..Truth::same() };
+    let start = pitched_start(&kinematics::cam_mount(false, 0.0, -38.0), 0.5, 0.30);
+    let rig = rig_mounted(setup.clone(), truth, 0.0, start, [0.0, 0.0], false).await;
+    let config = rig.sup.inner().read().await.config.clone();
+    let body = tap(&rig).await;
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &body).await.expect("grasp accepted");
+    let sup = rig.sup.clone();
+    let mut lowest = f64::INFINITY;
+    let mut at = String::new();
+    let a = wait_done(&rig.sup, id, 60.0, |a| {
+        if let Ok(inner) = sup.inner().try_read() {
+            let z = envelope_min_z(&config, &inner.commanded_positions);
+            if z < lowest { lowest = z; at = a.phase.clone().unwrap_or_default(); }
+        }
+    }).await;
+    println!("raised table: {} {:?} acquire_height_m {:?}, lowest envelope point {:.4} m (table {:.3}) in phase {at}",
+        a.state, a.code, a.acquire_height_m, lowest, setup.table_z_m);
+    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+    let h = a.acquire_height_m.expect("acquisition height raised and reported");
+    assert!(f64::from(h) > setup.approach_height_m + 0.01, "{h}");
+    assert!(lowest >= setup.table_z_m + 0.004, "envelope {lowest:.4} m reached the table {:.3} m in {at}", setup.table_z_m);
+}
