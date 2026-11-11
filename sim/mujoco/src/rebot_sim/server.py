@@ -332,9 +332,9 @@ class Simulator:
 
         from .perception import SharedState, camera_main
 
-        self.shared = SharedState(self.model.nq, self.model.nv)
-        self.shared.write(self.data)
         ctx = mp.get_context("spawn")
+        self.shared = SharedState(self.model.nq, self.model.nv, lock=ctx.Lock())
+        self.shared.write(self.data)
         self.cam_conn, child = ctx.Pipe()
         ready_r, ready_w = ctx.Pipe(duplex=False)
         m = self.mount
@@ -342,7 +342,8 @@ class Simulator:
                "perception_port": perception_port, "scene_stream": scene_stream, "objects": objects,
                "mount": [m.flip, m.rot_deg, m.tilt_deg, m.offset_m], "has_meshes": self.has_meshes}
         self.cam_proc = ctx.Process(target=camera_main, name="rebot-sim-camera", daemon=True,
-                                    args=(cfg, self.shared.shm.name, self.model.nq, self.model.nv, child, ready_w, os.getpid()))
+                                    args=(cfg, self.shared.shm.name, self.shared.lock, self.model.nq, self.model.nv, child, ready_w,
+                                          os.getpid()))
         self.cam_proc.start()
         child.close()
         ready_w.close()

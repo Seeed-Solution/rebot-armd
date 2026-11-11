@@ -456,16 +456,18 @@ class PerceptionServer:
 # The camera runs in a child process (spawned, so it gets its own GL context and GIL): on a
 # loaded host a render thread in the simulator process cut the 500 Hz physics loop to about
 # 220 Hz, while a separate rendering process left it at 500 Hz. The simulator publishes
-# its state in shared memory (seqlock) and answers /sim requests over a pipe.
+# its state in shared memory under a multiprocessing lock and answers /sim requests over a pipe.
 
-HDR = 5  # shared float64 slots: seq, sim time, camera frames, camera ms/frame, physics step
+HDR = 5  # shared float64 slots: writes, sim time, camera frames, camera ms/frame, physics step
 
 
 class SharedState:
-    """Simulator state in shared memory: [seq, time, frames, frame_ms, step, qpos..., qvel...].
-    `step` counts the physics states written, so a reader can tell whether physics advanced."""
+    """Simulator state in shared memory: [writes, time, frames, frame_ms, step, qpos..., qvel...].
+    `step` counts the physics states written, so a reader can tell whether physics advanced.
+    Writes and reads hold `lock` (a multiprocessing lock: it orders the memory accesses across
+    processes, which a seqlock on plain numpy stores does not)."""
 
-    def __init__(self, nq: int, nv: int, name: str | None = None):
+    def __init__(self, nq: int, nv: int, name: str | None = None, lock=None):
         from multiprocessing import shared_memory
 
         size = (HDR + nq + nv) * 8
@@ -473,6 +475,11 @@ class SharedState:
         self.shm = shared_memory.SharedMemory(name=name, create=self.owner, size=size, track=self.owner)
         self.arr = np.ndarray((HDR + nq + nv,), dtype=np.float64, buffer=self.shm.buf)
         self.nq, self.nv = nq, nv
+        if lock is None:
+            import multiprocessing as mp
+
+            lock = mp.get_context("spawn").Lock()
+        self.lock = lock
         if self.owner:
             self.arr[:] = 0.0
 
@@ -490,28 +497,22 @@ class SharedState:
 
     def write(self, data) -> None:
         a = self.arr
-        a[0] += 1  # odd: writing
-        a[1] = data.time
-        a[4] += 1
-        a[HDR:HDR + self.nq] = data.qpos
-        a[HDR + self.nq:] = data.qvel
-        a[0] += 1
+        with self.lock:
+            a[0] += 1
+            a[1] = data.time
+            a[4] += 1
+            a[HDR:HDR + self.nq] = data.qpos
+            a[HDR + self.nq:] = data.qvel
 
     def read(self, data) -> int | None:
-        """Copy a consistent state into `data`; returns its physics step, or None (and leaves
-        `data` alone) when nothing was written yet or no consistent copy was had."""
+        """Copy the state into `data`; returns its physics step, or None (and leaves `data`
+        alone) when nothing was written yet."""
         a = self.arr
-        for _ in range(1000):
-            s1 = a[0]
-            if s1 % 2:
-                continue
-            qpos, qvel, t, step = a[HDR:HDR + self.nq].copy(), a[HDR + self.nq:].copy(), a[1], a[4]
-            if a[0] == s1:
-                if s1 == 0:
-                    return None
-                data.qpos[:], data.qvel[:], data.time = qpos, qvel, t
-                return int(step)
-        return None
+        with self.lock:
+            if a[0] == 0:
+                return None
+            data.qpos[:], data.qvel[:], data.time = a[HDR:HDR + self.nq], a[HDR + self.nq:], a[1]
+            return int(a[4])
 
 
 class SimLink:
@@ -657,10 +658,10 @@ class CameraRig:
                 "frame_ms_max": round(float(ms.max()), 2)}
 
 
-def camera_main(cfg: dict, shm_name: str, nq: int, nv: int, conn, ready_conn, parent_pid: int) -> None:
+def camera_main(cfg: dict, shm_name: str, lock, nq: int, nv: int, conn, ready_conn, parent_pid: int) -> None:
     """Camera process entry: build the rig with its renderers and encoders, start the servers,
     then report readiness and render."""
-    state = SharedState(nq, nv, shm_name)
+    state = SharedState(nq, nv, shm_name, lock)
     try:
         rig = CameraRig(cfg, state, SimLink(conn))
         rig.setup()  # renderers and encoders before readiness is reported

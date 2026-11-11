@@ -289,3 +289,51 @@ def test_camera_dying_mid_request_does_not_break_the_physics_loop(sim):
     t = sim.data.time
     sim.step()
     assert sim.data.time > t
+
+
+def _write_states(name: str, nq: int, nv: int, lock, n: int) -> None:
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from rebot_sim.perception import SharedState
+
+    st = SharedState(nq, nv, name, lock)
+    for k in range(1, n + 1):
+        st.write(SimpleNamespace(time=float(k), qpos=np.full(nq, float(k)), qvel=np.full(nv, float(k))))
+    st.close()
+
+
+def test_shared_state_is_consistent_across_processes():
+    """Writer and reader serialise on a multiprocessing lock: a read never mixes two states,
+    and a read waits while a write holds the lock."""
+    import threading
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from rebot_sim.perception import SharedState
+
+    ctx = mp.get_context("spawn")
+    nq, nv = 30, 28
+    st = SharedState(nq, nv, lock=ctx.Lock())
+    data = SimpleNamespace(time=0.0, qpos=np.zeros(nq), qvel=np.zeros(nv))
+    try:
+        writer = ctx.Process(target=_write_states, args=(st.shm.name, nq, nv, st.lock, 200_000))
+        writer.start()
+        reads = 0
+        while writer.is_alive() or reads == 0:
+            if st.read(data) is not None:
+                reads += 1
+                assert (data.qpos == data.time).all() and (data.qvel == data.time).all()
+        writer.join()
+        assert writer.exitcode == 0 and reads > 0
+        done = threading.Event()
+        with st.lock:
+            t = threading.Thread(target=lambda: (st.read(data), done.set()))
+            t.start()
+            assert not done.wait(0.2), "read did not wait for the lock"
+        t.join(2)
+        assert done.is_set() and data.time == 200_000
+    finally:
+        st.close()
