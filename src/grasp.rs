@@ -660,11 +660,18 @@ pub fn camera_down_mode(setup: &GraspSetup, mount: &CameraMount) -> Result<bool,
 pub const TABLE_CLEARANCE_M: f64 = 0.005;
 
 /// End_link points kept above the table during camera-down acquisition: the TCP, the
-/// workspace check points and the lens centre.
-pub fn envelope(ws: Option<&WorkspacePolicy>, mount: &CameraMount) -> Vec<Vec3> {
+/// workspace check points, the lens centre and, with a lens centre, the 8 corners of the
+/// camera body box (`camera_mount.body_size_m`: front face centred on the lens, `rec` axes).
+pub fn envelope(ws: Option<&WorkspacePolicy>, mount: &CameraMount, rec: &Mat3) -> Vec<Vec3> {
     let mut pts = vec![[0.0; 3]];
     pts.extend(ws.iter().flat_map(|w| w.check_points_end_m.iter().map(|p| p.map(f64::from))));
-    pts.extend(mount.offset_m.map(|o| o.map(f64::from)));
+    if let Some(o) = mount.offset_m.map(|o| o.map(f64::from)) {
+        pts.push(o);
+        let [w, h, d] = mount.body_size().map(f64::from);
+        for sx in [-0.5, 0.5] { for sy in [-0.5, 0.5] { for z in [0.0, -d] {
+            pts.push(kinematics::add(&o, &kinematics::mat_vec(rec, &[sx * w, sy * h, z])));
+        }}}
+    }
     pts
 }
 
@@ -829,7 +836,7 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     let target = cam.plane_point(&pose, centre, grasp_plane(setup)).ok_or_else(|| ArmError::from(MotionError::InvalidCommand(
         "the box centre ray does not meet the table plane in front of the camera".into())))?;
     let camera_down = camera_down_mode(setup, &input.cam).map_err(MotionError::InvalidCommand)?;
-    let pts = envelope(input.ws.as_ref(), &input.cam);
+    let pts = envelope(input.ws.as_ref(), &input.cam, &cam.rec);
     let goal = if camera_down { camera_down_pose(&pose.r, &target, setup, &cam, &pts) } else { approach_pose(&pose.r, &target, setup) };
     if camera_down {
         // the pitched envelope stays above the table on the approach and the transition
@@ -1142,7 +1149,7 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
         sup: sup.clone(), id, deadline, phase_timeout_s: setup.phase_timeout_s, timeout_code: "GRASP_TIMEOUT",
         timeout_message: format!("Grasp did not finish within {:.0} s", setup.timeout_s),
     };
-    let envelope = envelope(planned.input.ws.as_ref(), &planned.input.cam);
+    let envelope = envelope(planned.input.ws.as_ref(), &planned.input.cam, &cam.rec);
     let orch = Orchestrator { ctx, source: source.clone(), setup, cam, envelope, triggered };
     let result = if let Err(e) = per_request {
         Err(fail("DETECTION_UNAVAILABLE", format!("Cannot reach the vision provider: {e}")))
@@ -1335,8 +1342,8 @@ mod tests {
         let setup = GraspSetup { camera_tilt_deg: -38.0, table_z_m: 0.10, approach_height_m: 0.035, ..Default::default() };
         let mount = CameraMount { tilt_deg: -38.0, offset_m: Some([-0.0731, 0.0005, 0.066]), ..Default::default() };
         let cam = CamModel::assumed(&crate::chain::ArmModel::RebotDevArm, &setup, &mount);
-        let pts = envelope(crate::model::ArmConfig::rebot_dm().workspace.as_ref(), &mount);
-        assert_eq!(pts.len(), 10, "TCP, 8 check points, lens centre");
+        let pts = envelope(crate::model::ArmConfig::rebot_dm().workspace.as_ref(), &mount, &cam.rec);
+        assert_eq!(pts.len(), 18, "TCP, 8 check points, lens centre, 8 body corners");
         let target = [0.28, 0.0, setup.table_z_m + setup.grasp_height_m];
         let low = camera_down_pose(&inspect_r(), &target, &setup, &cam, &[]);
         assert!((low.p[2] - 0.135).abs() < 1e-12, "TCP only: approach height");

@@ -197,6 +197,22 @@ pub struct CameraMount {
     /// Camera position in end_link (m). When set it is added to the workspace check points.
     /// No default: the real position needs measuring.
     pub offset_m: Option<[f32; 3]>,
+    /// Camera body (housing and holder) as a box [width along x_cam, height along y_cam,
+    /// depth behind the lens along −z_cam] (m), lens at the centre of its front face. Kept
+    /// above the table during camera-down grasp acquisition; None = [`CAMERA_BODY_DEFAULT_M`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_size_m: Option<[f32; 3]>,
+}
+
+/// reCamera housing 40 x 40 x 36.5 mm in the v8 holder (reBot-DevArm
+/// hardware/camera-mounts/recamera-mounts/v8/generate_recamera_mount.py: 0.3 mm clearance,
+/// 3 mm walls, 7 mm ears each side, 3 mm support below and top bar above, 3.5 mm rear lip):
+/// 54.6 x 46.6 x 40 mm, rounded up.
+pub const CAMERA_BODY_DEFAULT_M: [f32; 3] = [0.055, 0.047, 0.040];
+
+impl CameraMount {
+    /// The body box size in use.
+    pub fn body_size(&self) -> [f32; 3] { self.body_size_m.unwrap_or(CAMERA_BODY_DEFAULT_M) }
 }
 
 /// Gripper action parameters (`/api/v1/action/gripper`).
@@ -632,6 +648,9 @@ impl ArmConfig {
                 "profile_version {} is not supported (this armd reads 1..={ARM_PROFILE_VERSION})",
                 self.profile_version
             ));
+        }
+        if self.camera_mount.body_size_m.is_some_and(|b| !b.iter().all(|v| v.is_finite() && *v > 0.0 && *v <= 0.2)) {
+            return Err("camera_mount.body_size_m must be three sizes in (0, 0.2] m".into());
         }
         if self.dof == 0 {
             return Err("DOF cannot be zero".into());

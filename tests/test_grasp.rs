@@ -1074,3 +1074,35 @@ async fn camera_down_collision_during_the_transition_holds() {
     assert_idle_after(&rig.sup, id).await;
     assert!(rig.sup.inner().read().await.macro_run.is_none());
 }
+
+/// A raised table where only the camera body reaches it: lens beside the jaw tips (test mount,
+/// rot 0, tilt -38, lens 30 mm off the tool axis at the tip plane) with a 90 x 90 x 40 mm body.
+/// The TCP, the gripper check points and the lens clear the table on the camera-down
+/// acquisition; a body corner does not at the end of the transition, so the grasp is rejected
+/// up front (WORKSPACE_VIOLATION). With a 1 mm body the same grasp is accepted.
+#[tokio::test]
+async fn camera_down_rejects_a_camera_body_that_would_reach_the_table() {
+    let setup = GraspSetup { camera_tilt_deg: -38.0, table_z_m: 0.10, grasp_height_m: 0.005, approach_height_m: 0.025, ..GraspSetup::default() };
+    for (body, accepted) in [([0.001f32, 0.001, 0.001], true), ([0.09, 0.09, 0.04], false)] {
+        let truth = Truth { rot_deg: 0.0, offset: [0.0, 0.0, 0.03], ..Truth::same() };
+        let start = pitched_start(&kinematics::cam_mount(false, 0.0, -38.0), 0.5, 0.30);
+        let rig = rig_mounted(setup.clone(), truth, 0.0, start, [0.0, 0.0], false).await;
+        rig.sup.inner().write().await.config.camera_mount.body_size_m = Some(body);
+        let r = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await;
+        println!("camera body {body:?}: {:?}", r.as_ref().map(|_| ()).map_err(|e| (e.code.clone(), e.message.clone())));
+        if accepted {
+            let (id, _) = r.expect("accepted with a 1 mm body");
+            rig.sup.inner().write().await.request_macro_stop();
+            wait_done(&rig.sup, id, 5.0, |_| {}).await;
+        } else {
+            let e = r.expect_err("rejected");
+            assert_eq!(e.code.as_deref(), Some("WORKSPACE_VIOLATION"), "{e:?}");
+            assert!(e.message.contains("table_z_m"), "{e:?}");
+        }
+    }
+    // profile field: optional, validated
+    let mut c = ArmConfig::rebot_dm();
+    assert!(c.camera_mount.body_size_m.is_none() && c.validate().is_ok());
+    c.camera_mount.body_size_m = Some([0.05, 0.3, 0.04]);
+    assert!(c.validate().is_err());
+}
