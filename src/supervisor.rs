@@ -210,6 +210,9 @@ pub struct SupervisorInner {
     pub watchdog_park: Option<WatchdogPark>,
     /// Set when the last park was refused because its path enters a keep-out box.
     pub park_rejection: Option<SafetyError>,
+    /// Bumped on every change of the workspace rule inputs (keep-out boxes, camera mount);
+    /// a plan made outside the lock must match it at install (else PLAN_STALE).
+    pub workspace_revision: u64,
     /// Duration of the most recently planned NormalUnload trajectory (s).
     pub unload_planned_duration: Option<f64>,
     pub recorder: EpisodeRecorder,
@@ -331,6 +334,7 @@ impl SupervisorInner {
             unload_settle: None,
             watchdog_park: None,
             park_rejection: None,
+            workspace_revision: 0,
             unload_planned_duration: None,
             recorder: EpisodeRecorder::new(),
             start_time: now,
@@ -1734,6 +1738,14 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// Why the workspace rule may not change now: a motion, macro, stream or park is
+    /// running (each was checked against the current rule).
+    pub fn workspace_change_blocker(&self) -> Option<String> {
+        if self.macro_run.is_some() { return Some("a macro action is running".into()); }
+        if self.pending_normal_unload { return Some("a park is running".into()); }
+        self.busy_reason()
+    }
+
     fn busy_reason(&self) -> Option<String> {
         if self.active_trajectory.is_some() { return Some("a trajectory is running".into()); }
         if self.servo_target.is_some() { return Some("servo streaming is active".into()); }
@@ -1757,6 +1769,7 @@ impl SupervisorInner {
             cam: self.config.camera_mount.clone(),
             arm: self.config.arm_model.clone(),
             epoch: self.safety.epoch_id(),
+            workspace_revision: self.workspace_revision,
         })
     }
 
@@ -1774,6 +1787,9 @@ impl SupervisorInner {
     fn check_plan_fresh(&self, input: &PlanInput) -> Result<(), ArmError> {
         if self.safety.epoch_id() != input.epoch {
             return Err(MotionError::PlanStale("epoch changed while planning".into()).into());
+        }
+        if self.workspace_revision != input.workspace_revision {
+            return Err(MotionError::PlanStale("workspace or keep-out boxes changed while planning".into()).into());
         }
         match self.action_preconditions() {
             Err(ArmError::Motion(MotionError::MotionBusy(reason))) => {
@@ -1811,6 +1827,7 @@ impl SupervisorInner {
 
     /// Replace the runtime setup; `camera_tilt_deg` also sets `camera_mount.tilt_deg`.
     pub fn set_grasp_setup(&mut self, setup: crate::grasp::GraspSetup) {
+        if self.config.camera_mount.tilt_deg != setup.camera_tilt_deg as f32 { self.workspace_revision += 1; }
         self.config.camera_mount.tilt_deg = setup.camera_tilt_deg as f32;
         self.config.grasp = Some(setup);
     }

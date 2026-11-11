@@ -89,6 +89,8 @@ pub struct PlanInput {
     /// Kinematic model of the profile (built-in or URDF chain).
     pub arm: crate::chain::ArmModel,
     pub epoch: u64,
+    /// `SupervisorInner::workspace_revision` the plan was checked against.
+    pub workspace_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

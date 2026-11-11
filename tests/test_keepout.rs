@@ -234,3 +234,27 @@ fn runtime_keepout_is_additive_with_the_profile() {
     assert!(matches!(inner.set_keepout_boxes(sixteen), Err(ArmError::Motion(MotionError::InvalidCommand(_)))), "17 in force");
     assert_eq!(inner.keepout_state().boxes.len(), 1);
 }
+
+/// Accepted motion was checked against the boxes in force: they cannot change under it, and a
+/// plan made before a change is stale at install.
+#[test]
+fn keepout_change_is_busy_during_motion_and_makes_plans_stale() {
+    let p0 = tcp(&INSPECT);
+    let mut inner = sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    let mut q = INSPECT.to_vec();
+    q[0] += 0.2;
+    inner.jog(q, None, None).unwrap();
+    let err = inner.set_keepout_boxes(vec![cube("late", [0.3, 0.3, 0.3])]).unwrap_err();
+    assert_eq!(armd::api::rest::ApiError::from(err).code.as_deref(), Some("MOTION_BUSY"));
+    assert!(inner.keepout_state().boxes.is_empty());
+
+    let mut inner = sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    let input = inner.plan_input().unwrap();
+    let g = resolve_goal(&input, &GoalSpec::Absolute { p: [p0[0] + 0.08, p0[1], p0[2]], r: None });
+    let path = plan_cartesian(&input, g, Speed::default()).unwrap();
+    // the box lands on the planned path after planning
+    inner.set_keepout_boxes(vec![cube("late", [p0[0] + 0.04, p0[1], p0[2]])]).unwrap();
+    let err = inner.install_path(&input, path, "move_to", None).unwrap_err();
+    assert_eq!(armd::api::rest::ApiError::from(err).code.as_deref(), Some("PLAN_STALE"));
+    assert!(inner.active_trajectory.is_none());
+}

@@ -74,6 +74,9 @@ impl SupervisorInner {
         if self.workspace_policy().is_none() {
             return Err(MotionError::Unsupported("Keep-out boxes need a profile with kinematics and a workspace".into()).into());
         }
+        if let Some(reason) = self.workspace_change_blocker() {
+            return Err(MotionError::MotionBusy(format!("keep-out boxes cannot change while {reason}")).into());
+        }
         KeepoutBox::validate_list(&boxes).map_err(MotionError::InvalidCommand)?;
         let profile = self.profile_keepout();
         let effective: Vec<KeepoutBox> = profile.iter().chain(&boxes).cloned().collect();
@@ -83,6 +86,7 @@ impl SupervisorInner {
         self.keepout.profile = Some(profile);
         self.keepout.runtime_boxes = boxes;
         self.keepout.runtime = true;
+        self.workspace_revision += 1;
         Ok(())
     }
 }
