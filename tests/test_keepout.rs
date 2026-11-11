@@ -176,3 +176,28 @@ fn watchdog_park_through_a_keepout_box_holds_and_latches_watchdog_timeout() {
     let moved = INSPECT.iter().zip(&inner.commanded_positions).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
     assert!(moved < 1e-3, "held in place ({moved} rad)");
 }
+
+/// A servo target outside every box whose stepped path crosses one: each tick's step is
+/// checked, the stream stops in the recoverable hold before the box.
+#[test]
+fn servo_stream_cannot_sweep_through_a_keepout_box() {
+    let (mut target, mut mid) = (INSPECT, INSPECT);
+    // one frame (servo targets are at most 0.35 rad from the commanded pose)
+    target[0] += 0.3;
+    mid[0] += 0.15;
+    let c = tcp(&mid);
+    let b = KeepoutBox { name: "between".into(), min_m: c.map(|v| (v - 0.02) as f32), max_m: c.map(|v| (v + 0.02) as f32) };
+    let mut inner = sim_at(with_boxes(vec![b]), &INSPECT);
+    let epoch = inner.safety.epoch_id();
+    inner.servo(target.to_vec(), epoch).expect("the target itself is outside the box");
+    let ws = inner.config.workspace.clone().unwrap();
+    for _ in 0..300 {
+        inner.tick(0.02);
+        let v = inner.config.arm_model.workspace_violation(&inner.commanded_positions, &ws, &inner.config.camera_mount);
+        assert!(v.total <= 1e-9, "commanded pose entered the box: {:?}", inner.commanded_positions);
+    }
+    assert!(inner.servo_blocked_hold && inner.servo_target.is_none(), "stream must end in the hold: q={:?} target={:?} limit={:?} state={:?}", inner.commanded_positions, inner.servo_target, inner.motion_limit, inner.safety.state());
+    assert!((inner.commanded_positions[0] - INSPECT[0]).abs() > 0.03, "moved towards the box first");
+    let limit = inner.motion_limit.as_ref().expect("motion_limit");
+    assert_eq!(limit.reason, armd::model::MotionLimitReason::Workspace);
+}

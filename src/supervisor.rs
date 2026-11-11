@@ -472,6 +472,24 @@ impl SupervisorInner {
         tracing::warn!(
             "Joint {} blocked during servo streaming ({why}; cmd {:.3} meas {:.3} rad): stream stopped, holding position",
             joint + 1, self.commanded_positions[joint], self.measured_positions[joint]);
+        self.servo_hold(MotionLimitReason::Blocked, Some(joint));
+    }
+
+    /// The servo / braking step to `next` sweeps into a keep-out box: same recoverable hold.
+    fn enter_servo_keepout_hold(&mut self, e: &SafetyError) {
+        tracing::warn!("Servo step would enter a keep-out box ({e}): stream stopped, holding position");
+        self.servo_hold(MotionLimitReason::Workspace, None);
+    }
+
+    /// Joint-space step from the commanded position to `next` (both ends and the midpoint)
+    /// against the keep-out boxes. Three FK calls; none without boxes.
+    fn servo_step_keepout(&self, next: &[f32]) -> Result<(), SafetyError> {
+        if self.workspace_policy().is_none_or(|(ws, _)| ws.keepout_boxes.is_empty()) { return Ok(()); }
+        let mid: Vec<f32> = self.commanded_positions.iter().zip(next).map(|(a, b)| 0.5 * (a + b)).collect();
+        self.check_keepout_path(&self.commanded_positions, [mid.as_slice(), next])
+    }
+
+    fn servo_hold(&mut self, reason: MotionLimitReason, joint: Option<usize>) {
         let gripper_idx = self.config.gripper_index();
         let grip_cmd = gripper_idx.map(|g| self.commanded_positions[g]);
         self.stop_motion();
@@ -488,7 +506,7 @@ impl SupervisorInner {
         self.following_error_since = None;
         self.servo_lead_stall.fill(None);
         self.safety.mark_motion_finished();
-        self.note_motion_limit(MotionLimitReason::Blocked, Some(joint));
+        self.note_motion_limit(reason, joint);
         self.servo_blocked_hold = true;
     }
 
@@ -2680,6 +2698,8 @@ impl SupervisorInner {
                         self.latch_servo_fault(i);
                     } else if let Some(i) = blocked {
                         self.enter_servo_blocked_hold(i, "no progress at the lead cap");
+                    } else if let Err(e) = self.servo_step_keepout(&next_positions) {
+                        self.enter_servo_keepout_hold(&e);
                     } else {
                         self.commanded_positions = next_positions;
                         self.commanded_velocities = next_velocities;
@@ -2734,8 +2754,11 @@ impl SupervisorInner {
                 next_positions[i] = q_next;
                 next_velocities[i] = v_next;
             }
+            let braking = self.commanded_velocities.iter().any(|&v| v != 0.0);
             if let Some(i) = infeasible {
                 self.latch_servo_fault(i);
+            } else if let Some(e) = braking.then(|| self.servo_step_keepout(&next_positions).err()).flatten() {
+                self.enter_servo_keepout_hold(&e);
             } else {
                 self.commanded_positions = next_positions;
                 self.commanded_velocities = next_velocities;
