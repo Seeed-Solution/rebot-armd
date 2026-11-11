@@ -25,12 +25,15 @@ import os
 import random
 import socket
 import sys
+import threading
 import time
 
 import mujoco
 import numpy as np
 
+from .camera import CameraMount, grip_pixel_norm, mount_rotation
 from .model import DOF, Indexer, load_model
+from .scene import Scene, parse_objects
 
 PROTOCOL_VERSION = 1
 STATE_EVERY = 2  # physics steps per state datagram (250 Hz at 500 Hz physics)
@@ -181,8 +184,17 @@ def set_joint_friction(model: mujoco.MjModel, damping=None, frictionloss=None) -
 
 class Simulator:
     def __init__(self, port: int, host: str = "127.0.0.1", viewer: bool = False, damping=None, frictionloss=None,
-                 torque_report: str = "instant"):
-        self.model = load_model()
+                 torque_report: str = "instant", objects: str = "cube", seed: int | None = None,
+                 camera_mount: CameraMount | None = None):
+        self.objects = parse_objects(objects)
+        self.mount = camera_mount
+        self.has_meshes = bool(os.environ.get("REBOT_DEVARM_DIR"))
+        self.model = load_model(objects=self.objects, camera=camera_mount)
+        # physics runs under this lock; the camera thread and the HTTP routes read under it
+        self.lock = threading.Lock()
+        self.stopping = False
+        self._resets: list[tuple[int | None, threading.Event, dict]] = []
+        self.rig = None
         self.torque_report = torque_report
         # --torque-report mean: torques of the last physics steps and the command period in steps
         self.tau_hist: collections.deque = collections.deque(maxlen=256)
@@ -190,7 +202,8 @@ class Simulator:
         set_joint_friction(self.model, damping, frictionloss)
         self.data = mujoco.MjData(self.model)
         self.motors = Motors(self.model, self.data)
-        mujoco.mj_forward(self.model, self.data)
+        self.scene = Scene(self.model, self.objects)
+        self.scene.reset(self.data, seed)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((host, port))
         self.sock.setblocking(False)
@@ -263,11 +276,61 @@ class Simulator:
         return self.motors.reported_torque()
 
     def step(self) -> None:
-        self.motors.apply()
-        mujoco.mj_step(self.model, self.data)
+        with self.lock:
+            if self._resets:
+                for seed, done, out in self._resets:
+                    self.scene.reset(self.data, seed)
+                    out.update(self._state_locked())
+                    done.set()
+                self._resets.clear()
+            self.motors.apply()
+            mujoco.mj_step(self.model, self.data)
         if self.torque_report == "mean":
             self.tau_hist.append(self.motors.reported_torque())
             self.steps_since_cmd += 1
+
+    # ---- scene control (HTTP threads)
+    def request_reset(self, seed: int | None, timeout: float = 2.0) -> dict:
+        """Place the objects for `seed` at the next physics step; returns the state after it."""
+        done, out = threading.Event(), {}
+        with self.lock:
+            self._resets.append((seed, done, out))
+        if not done.wait(timeout):  # physics loop not running (tests): apply here
+            with self.lock:
+                if (seed, done, out) in self._resets:
+                    self._resets.remove((seed, done, out))
+                    self.scene.reset(self.data, seed)
+                    out.update(self._state_locked())
+        return out
+
+    def _state_locked(self) -> dict:
+        d = self.data
+        return {"t": round(d.time, 4), "seed": self.scene.seed, "enabled": self.motors.enabled,
+                "q": self.motors.idx.motor_positions(d).round(5).tolist(),
+                "tcp": [round(float(v), 5) for v in d.body("end_link").xpos],
+                "objects": self.scene.state(d)}
+
+    def sim_state(self) -> dict:
+        with self.lock:
+            return self._state_locked()
+
+    def camera_info(self) -> dict:
+        from .camera import DETECTION_SIZE, HFOV_DEG, VFOV_DEG, focal_px
+        m = self.mount
+        if m is None:
+            return {"error": "camera off (start rebot-sim with --camera)"}
+        r = mount_rotation(self.model, m)
+        rig = self.rig
+        return {
+            "camera_mount": {"flip": m.flip, "rot_deg": m.rot_deg, "tilt_deg": m.tilt_deg,
+                             "offset_m": [round(float(v), 5) for v in m.offset]},
+            "hfov_deg": round(HFOV_DEG, 3), "vfov_deg": round(VFOV_DEG, 3),
+            "stream_size": list(rig.size) if rig else None, "fps": rig.fps if rig else None,
+            "detection_size": list(DETECTION_SIZE), "fx_px": round(focal_px(DETECTION_SIZE[1]), 2),
+            "grip_pixel_norm_at": {f"{h:.2f}": grip_pixel_norm(r, m.offset, h) for h in (0.10, 0.12, 0.15, 0.18, 0.20)},
+            "render_backend": rig.backend if rig else None, "render": rig.stats() if rig else None,
+            "error": rig.error if rig else None,
+        }
 
     def run(self, duration: float | None = None, stats_every: float = 0.0) -> None:
         dt = self.model.opt.timestep
@@ -295,10 +358,15 @@ class Simulator:
                 next_t = now  # fell behind by > 50 ms: drop the backlog instead of racing
             if stats_every and now - last_stats >= stats_every:
                 rate = (steps - last_steps) / (now - last_stats)
-                cube = self.data.body("cube").xpos
+                obj = self.objects[0].name
+                cube = self.data.body(obj).xpos
+                cam = ""
+                if self.rig is not None:
+                    st = self.rig.stats()
+                    cam = f" camera={st['frames']} frames {st['frame_ms_mean']:.1f} ms/frame"
                 print(f"t={self.data.time:8.2f}s rate={rate:6.1f} Hz enabled={self.motors.enabled} "
                       f"q={np.round(self.motors.idx.motor_positions(self.data), 3).tolist()} "
-                      f"cube=({cube[0]:.3f},{cube[1]:.3f},{cube[2]:.3f}) rejected={self.rejected}", flush=True)
+                      f"{obj}=({cube[0]:.3f},{cube[1]:.3f},{cube[2]:.3f}) rejected={self.rejected}{cam}", flush=True)
                 last_stats, last_steps = now, steps
 
 
@@ -338,7 +406,38 @@ def main(argv: list[str] | None = None) -> None:
                         help="J1..J6 joint friction loss in N·m (default: scene values)")
     parser.add_argument("--torque-report", choices=("instant", "mean"), default="instant",
                         help="torque in state datagrams: instantaneous (default) or mean over the last command period")
+    parser.add_argument("--objects", default="cube", help="scene objects, 1..3 of cube, cup, block (default cube)")
+    parser.add_argument("--seed", type=int, default=None, help="object placement seed (default: fixed layout)")
+    parser.add_argument("--camera", action="store_true",
+                        help="render the wrist camera: H.264 stream, perception API, /sim routes")
+    parser.add_argument("--video-port", type=int, default=8001, help="camera WebSocket port (default 8001)")
+    parser.add_argument("--perception-port", type=int, default=8090, help="perception / sim HTTP port (default 8090)")
+    parser.add_argument("--http-host", default="127.0.0.1", help="bind address of the camera and HTTP servers")
+    parser.add_argument("--fps", type=int, default=15, help="camera frames per second (default 15)")
+    parser.add_argument("--camera-size", default="1280x720", choices=("1280x720", "640x360"), help="stream size")
+    parser.add_argument("--scene-stream", action="store_true", help="also stream the overview camera at /scene")
+    parser.add_argument("--profile", default=None, help="profile JSON whose camera_mount is used (default: the kit profile)")
+    parser.add_argument("--camera-rot-deg", type=float, default=None, help="override camera_mount.rot_deg")
+    parser.add_argument("--camera-tilt-deg", type=float, default=None,
+                        help="override camera_mount.tilt_deg (armd sign: negative turns the axis toward the jaws)")
+    parser.add_argument("--camera-offset", default=None, metavar="X,Y,Z",
+                        help="lens centre in end_link (m); default camera_mount.offset_m, else the v8 holder value")
     args = parser.parse_args(argv)
+    if not 1 <= args.fps <= 30:
+        parser.error("--fps must be 1..30")
+    try:
+        parse_objects(args.objects)
+    except ValueError as exc:
+        parser.error(f"--objects: {exc}")
+    mount = CameraMount.from_profile(args.profile) if args.profile else CameraMount.from_profile()
+    if args.camera_rot_deg is not None or args.camera_tilt_deg is not None or args.camera_offset:
+        off = mount.offset_m
+        if args.camera_offset:
+            off = tuple(float(v) for v in args.camera_offset.split(","))
+            if len(off) != 3:
+                parser.error("--camera-offset needs 3 values")
+        mount = CameraMount(mount.flip, mount.rot_deg if args.camera_rot_deg is None else args.camera_rot_deg,
+                            mount.tilt_deg if args.camera_tilt_deg is None else args.camera_tilt_deg, off)
     if args.benchmark:
         print(f"{benchmark(args.benchmark):.0f} physics steps/s (timestep 2 ms, unpaced)")
         return
@@ -346,12 +445,28 @@ def main(argv: list[str] | None = None) -> None:
     if viewer and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") or sys.platform == "darwin"):
         parser.error("--viewer needs a display (DISPLAY / WAYLAND_DISPLAY not set)")
     sim = Simulator(args.port, args.host, viewer=viewer, damping=args.damping, frictionloss=args.frictionloss,
-                    torque_report=args.torque_report)
+                    torque_report=args.torque_report, objects=args.objects, seed=args.seed,
+                    camera_mount=mount if args.camera else None)
     print(f"rebot-sim listening on udp://{args.host}:{args.port} (session {sim.session})", flush=True)
+    if args.camera:
+        from .perception import CameraRig, PerceptionServer, serve_video
+        w, h = (int(v) for v in args.camera_size.split("x"))
+        sim.rig = CameraRig(sim, args.fps, (w, h), args.scene_stream)
+        sim.rig.ready.wait(30)
+        if sim.rig.error:
+            print(f"rebot-sim: {sim.rig.error}", file=sys.stderr, flush=True)
+            sys.exit(1)
+        serve_video(args.http_host, args.video_port, sim.rig.streams)
+        PerceptionServer(sim.rig.perception, sim, args.http_host, args.perception_port)
+        print(f"camera: {w}x{h} @ {args.fps} fps ({sim.rig.backend}), mount rot {mount.rot_deg:g} tilt {mount.tilt_deg:g} "
+              f"offset {mount.offset.round(4).tolist()}; video ws://{args.http_host}:{args.video_port}/, "
+              f"perception http://{args.http_host}:{args.perception_port}", flush=True)
     try:
         sim.run(args.duration, args.stats)
     except KeyboardInterrupt:
         pass
+    finally:
+        sim.stopping = True
 
 
 if __name__ == "__main__":
