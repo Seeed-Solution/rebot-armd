@@ -696,16 +696,19 @@ fn path_samples(from: &Pose, to: &Pose) -> Vec<(f64, Pose)> {
 }
 
 /// First sample of the path `from` → `to` where an envelope point is below
-/// `table_z + TABLE_CLEARANCE_M`, as a workspace violation (s, point index, z, bound). A path
-/// that starts below the bound may move as long as it does not go lower.
+/// `table_z + TABLE_CLEARANCE_M`, as a workspace violation (s, point index, z, bound). Each
+/// point is checked against its own floor: a point that starts below the bound may move as
+/// long as it does not go lower than its start height; a point that starts above it must stay
+/// above the bound.
 pub fn table_violation(from: &Pose, to: &Pose, pts: &[Vec3], table_z: f64) -> Option<MotionError> {
     let bound = table_z + TABLE_CLEARANCE_M;
-    let low = |pose: &Pose| pts.iter().enumerate().map(|(i, p)| (i, pose.transform_point(p)[2]))
-        .min_by(|a, b| a.1.total_cmp(&b.1)).expect("the envelope has the TCP");
-    let start = low(from).1.min(bound);
+    let floor: Vec<f64> = pts.iter().map(|p| from.transform_point(p)[2].min(bound)).collect();
     path_samples(from, to).into_iter().find_map(|(s, pose)| {
-        let (point, z) = low(&pose);
-        (z < start - 1e-6).then(|| MotionError::WorkspaceViolation { s, point, limit: "table_z_m + 0.005".into(), value: z, bound })
+        pts.iter().zip(&floor).enumerate()
+            .map(|(i, (p, f))| (i, pose.transform_point(p)[2], *f))
+            .filter(|&(_, z, f)| z < f - 1e-6)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(point, z, _)| MotionError::WorkspaceViolation { s, point, limit: "table_z_m + 0.005".into(), value: z, bound })
     })
 }
 
@@ -1368,6 +1371,32 @@ mod tests {
         // a path from below the bound may move sideways but not lower
         let side = Pose::new(low.r, [low.p[0] + 0.01, low.p[1], low.p[2]]);
         assert!(table_violation(&low, &side, &pts, setup.table_z_m).is_none());
+    }
+
+    #[test]
+    fn below_clearance_exception_is_per_point() {
+        // two points 0.1 m either side of the TCP along x, TCP 4 mm above the table. A roll
+        // about y from -5.73 to +5.16 deg swaps which point is lowest: -x starts lowest at
+        // -6 mm (below the table), +x starts at 14 mm and ends at -5 mm, through the table but
+        // above the lowest start height. Only -x may sit below the bound, +x must stay above it.
+        let table_z = 0.0;
+        let pts = [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]];
+        let roll = |deg: f64| kinematics::exp_r(&[0.0, deg.to_radians(), 0.0]);
+        let a = (0.01f64 / 0.1).asin().to_degrees();
+        let from = Pose::new(roll(-a), [0.0, 0.0, 0.004]);
+        let to = Pose::new(roll(0.9 * a), [0.0, 0.0, 0.004]);
+        let z = |pose: &Pose, i: usize| pose.transform_point(&pts[i])[2];
+        let bound = table_z + TABLE_CLEARANCE_M;
+        assert!(z(&from, 2) < table_z && z(&from, 1) > bound, "-x starts lowest, below the table; +x above the bound");
+        assert!(z(&to, 1) < table_z && z(&to, 1) > z(&from, 2) + 1e-4, "+x ends in the table, above the lowest start");
+        assert!(path_samples(&from, &to).iter().all(|(_, p)| (0..3).all(|i| z(p, i) >= z(&from, 2) - 1e-6)),
+            "no sample goes below the lowest start height, so a single-minimum check accepts the path");
+        match table_violation(&from, &to, &pts, table_z) {
+            Some(MotionError::WorkspaceViolation { point, value, .. }) => assert!(point == 1 && value < bound, "{point} {value}"),
+            other => panic!("expected a violation of point 1, got {other:?}"),
+        }
+        // the lowest point may stay where it started
+        assert!(table_violation(&from, &from, &pts, table_z).is_none());
     }
 
     #[test]
