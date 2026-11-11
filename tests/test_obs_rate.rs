@@ -52,5 +52,14 @@ async fn obs_hz_is_clamped_and_validated() {
     for q in ["0", "1000"] {
         assert!(connect_async(format!("ws://{addr}/api/v1/ws?obs_hz={q}")).await.is_ok(), "obs_hz={q}");
     }
-    assert!(connect_async(format!("ws://{addr}/api/v1/ws?obs_hz=fast")).await.is_err());
+    for q in ["fast", "-1", "2.5"] {
+        match connect_async(format!("ws://{addr}/api/v1/ws?obs_hz={q}")).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) => {
+                assert_eq!(r.status(), 400);
+                let body = String::from_utf8(r.body().clone().unwrap_or_default()).unwrap();
+                assert!(body.contains("integer >= 0 (0 and 1 mean 1 Hz"), "{body}");
+            }
+            other => panic!("obs_hz={q}: {other:?}"),
+        }
+    }
 }

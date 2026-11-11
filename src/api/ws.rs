@@ -32,7 +32,7 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSu
         None => None,
         Some(v) => match v.trim().parse::<u64>() {
             Ok(n) => Some(ObsRate { hz: n.clamp(1, u64::from(control_hz)) as f64, control_hz: f64::from(control_hz) }),
-            Err(_) => return (StatusCode::BAD_REQUEST, "obs_hz must be a non-negative integer").into_response(),
+            Err(_) => return (StatusCode::BAD_REQUEST, "obs_hz must be an integer >= 0 (0 and 1 mean 1 Hz; values above control_frequency_hz are clamped)").into_response(),
         },
     };
     ws.on_upgrade(move |socket| handle_socket(socket, supervisor, deps, obs_rate)).into_response()
