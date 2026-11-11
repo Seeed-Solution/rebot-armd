@@ -122,7 +122,7 @@ uv run rebot-sysid --url http://<recamera-ip>:8765 --i-am-at-the-arm \
 
 - 整个过程（默认参数下每个关节约 30 s 运动）必须有人守在机械臂旁，急停在手边。Ctrl-C 停止运动，armd 保持当前姿态。
 - `--pose` 要让每个关节距离限位至少 `--amplitude`，工具远离桌面和扫动范围内的物体；J1 会让整条臂摆动 ±amplitude。先用 `--joints 6` 和默认参数跑一次，看过曲线再扩大范围。
-- 先关闭 cockpit 等其他客户端：工具需要租约。结束时回到起始姿态并释放租约；之后 armd 保持姿态，并像其他已上使能但无租约持有者的情况一样锁存 `WatchdogTimeout` 故障（在 cockpit 中清除）。带 `--unload` 时改为停靠并下使能；此时 `--return-home`（带 `--unload` 时默认开启，`--no-return-home` 关闭）先慢速 jog 到 profile 的 home 姿态，使停靠只是小幅移动。home 姿态取自 `GET /api/v1/observation/schema` 的 `home_positions`；armd 目前不公开该字段，因此回 home 的 jog 目标为起始姿态（不移动），停靠从该处以 armd 的停靠速度执行。回 home 的 jog 不移动夹爪。
+- 先关闭 cockpit 等其他客户端：工具需要租约。结束时回到起始姿态并释放租约；之后 armd 保持姿态，并像其他已上使能但无租约持有者的情况一样锁存 `WatchdogTimeout` 故障（在 cockpit 中清除）。带 `--unload` 时改为停靠并下使能：工具先以 `--approach-speed` 慢速 jog 到 profile 的 home 姿态，只有此后机械臂处于 home 的 `resting_pose.position_tolerances` 范围内才调用 unload，使 armd 以其自身速度执行的停靠只是小幅移动。home 姿态和容差取自 `GET /api/v1/observation/schema` 的 `home_positions` 与 `resting_pose`；armd 未公开时，`--unload` 在任何运动之前即被拒绝。机械臂最终不在容差内时（包括出错后的恢复流程），工具不执行 unload：机械臂保持使能并保持姿态，工具打印处理说明并以非零状态退出。回 home 的 jog 不移动夹爪。
 - 速度：真机上 J1..J3 不超过 0.08 rad/s（例如 `--joints 1,2,3 --speeds 0.04,0.08`，再用默认参数跑 `--joints 4,5,6`）。
 - 电机温度升高后摩擦会变小：`samples.json` 中有电机温度；若阈值用于长时间运行，应在机械臂运行一段时间后重复辨识。
 - 可用报告中的数值更新仿真器：`rebot-sim --damping <J1..J6 粘滞项> --frictionloss <J1..J6 库仑项>`。

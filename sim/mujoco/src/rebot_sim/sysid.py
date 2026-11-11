@@ -16,7 +16,8 @@ writes a JSON report and one plot per joint, and prints suggested collision thre
 = max |r - Coulomb-only fit| over all recorded samples x a safety factor (a negative
 viscous term is reported as unreliable). After an abort or error the joints already
 finished are still fitted and written (report field `aborted`), and a torqued, Armed arm
-is jogged slowly back to the start pose (and home and unloaded with --unload).
+is jogged slowly back to the start pose (with --unload on to the schema home pose, and
+unloaded only when it is then within the schema resting tolerances).
 
 Nothing is installed on the arm side: armd only sees servo frames and commands.
 See docs/simulation.md ("Friction identification") for the procedure on the real arm.
@@ -435,6 +436,11 @@ def floats(text: str, n: int | None = None, name: str = "") -> list[float]:
     return vals
 
 
+def finite_in(x: float, hi: float = math.inf) -> bool:
+    """x finite and in (0, hi] (NaN, inf and negative values fail)."""
+    return math.isfinite(x) and 0 < x <= hi
+
+
 def parse_args(argv):
     p = argparse.ArgumentParser(prog="rebot-sysid", description="Joint friction identification through armd (B601-DM).")
     p.add_argument("--url", default="http://127.0.0.1:8765", help="armd base URL (default http://127.0.0.1:8765)")
@@ -457,31 +463,30 @@ def parse_args(argv):
     p.add_argument("--threshold-floor", type=float, default=0.1, help="minimum suggested threshold in N·m (default 0.1)")
     p.add_argument("--out", default="sysid-out", help="output directory for report.json, samples.json, plots")
     p.add_argument("--unload", action="store_true",
-                   help="park and torque off at the end, also after an error or abort (default: return to the start pose and hold)")
+                   help="at the end, also after an error or abort, jog slowly to the profile home pose and park / torque off "
+                        "there (default: return to the start pose and hold). Needs home_positions and "
+                        "resting_pose in armd's observation schema (refused before moving otherwise); when the "
+                        "arm does not end within the resting tolerances of home it holds and the run fails")
     p.add_argument("--approach-speed", type=float, default=DEFAULT_APPROACH_SPEED,
                    help=f"speed of the jogs to the start pose, back to it and home: duration = largest J1..J6 change / this, "
                         f"at least {MIN_APPROACH_S:g} s (rad/s, default {DEFAULT_APPROACH_SPEED})")
-    p.add_argument("--return-home", action=argparse.BooleanOptionalAction, default=None,
-                   help="before --unload, jog slowly to the profile home pose so that the park is a small move "
-                        "(default: on with --unload). The home pose is read from the observation schema "
-                        "(home_positions); when armd does not publish it, the start pose is used")
     a = p.parse_args(argv)
-    if a.return_home is None:
-        a.return_home = a.unload
-    if not 0 < a.approach_speed <= MAX_SPEED:
+    if not finite_in(a.approach_speed, MAX_SPEED):
         p.error(f"--approach-speed must be in (0, {MAX_SPEED}] rad/s")
     a.joints = sorted({int(x) - 1 for x in a.joints.split(",") if x.strip()})
     a.speeds = floats(a.speeds)
     if not a.joints or not all(0 <= j < ARM_JOINTS for j in a.joints):
         p.error("--joints takes values 1..6")
-    if not 0 < a.amplitude <= MAX_AMPLITUDE:
+    if not finite_in(a.amplitude, MAX_AMPLITUDE):
         p.error(f"--amplitude must be in (0, {MAX_AMPLITUDE}] rad")
-    if len(a.speeds) < 2 or not all(0 < v <= MAX_SPEED for v in a.speeds):
+    if len(a.speeds) < 2 or not all(finite_in(v, MAX_SPEED) for v in a.speeds):
         p.error(f"--speeds needs at least two speeds in (0, {MAX_SPEED}] rad/s (Coulomb and viscous need two)")
-    if not 0 < a.accel <= MAX_ACCEL:
+    if not finite_in(a.accel, MAX_ACCEL):
         p.error(f"--accel must be in (0, {MAX_ACCEL}] rad/s²")
     if a.cycles < 1:
         p.error("--cycles must be >= 1")
+    if not all(finite_in(x) for x in a.abort_nm):
+        p.error("--abort-nm values must be finite and > 0 N·m")
     return a
 
 
@@ -515,10 +520,43 @@ def armed(link) -> bool:
     return bool(obs.get("is_torqued")) and not isinstance(state, dict) and state in ("Armed", "Moving")
 
 
-def finish(link, a, ret: list[float], home: list[float] | None, dof: int, log=print) -> None:
+def unload_home(schema: dict, dof: int, current: list[float]) -> tuple[list[float] | None, list[float] | None, str | None]:
+    """Home pose and J1..J6 resting tolerances for --unload, both from the observation schema.
+
+    Returns (home, tolerances, None) or (None, None, reason). armd parks at the profile home
+    at its own speed, so an unload is only safe after a slow jog to a home that armd itself
+    published; a guessed home (e.g. the sweep start) could turn the park into a large fast move.
+    """
+    home = schema.get("home_positions")
+    rest = schema.get("resting_pose")
+    if not isinstance(home, list):
+        return None, None, "armd publishes no home_positions in its observation schema"
+    if len(home) != dof:
+        raise SysidError(f"schema home_positions has {len(home)} values, dof {dof}")
+    tol = rest.get("position_tolerances") if isinstance(rest, dict) else None
+    if not isinstance(tol, list) or len(tol) < ARM_JOINTS:
+        return None, None, "armd publishes no resting_pose.position_tolerances for J1..J6 in its observation schema"
+    home = [float(x) for x in home]
+    home[ARM_JOINTS:] = current[ARM_JOINTS:]  # the gripper is not moved
+    return home, [float(x) for x in tol[:ARM_JOINTS]], None
+
+
+def within(q, target, tol) -> bool:
+    """Every J1..J6 position within its tolerance of target."""
+    return all(abs(float(q[i]) - target[i]) <= tol[i] for i in range(ARM_JOINTS))
+
+
+UNLOAD_REFUSED = ("not unloading: {why}. The arm stays torqued and holds its pose. "
+                  "Jog it slowly to the home pose from the cockpit, then park / torque off there "
+                  "(or support the arm by hand before switching torque off).")
+
+
+def finish(link, a, ret: list[float], home: list[float] | None, dof: int, log=print,
+           tolerances: list[float] | None = None) -> None:
     """End of a run, also after an error or abort: when the arm is torqued and armd Armed /
-    Moving, jog slowly back to `ret`; with --return-home (and --unload) on to `home`; with
-    --unload, unload. Otherwise nothing is moved."""
+    Moving, jog slowly back to `ret`; with --unload jog slowly on to `home` (from the schema)
+    and unload only when the arm is then within the resting tolerances of it. Otherwise
+    nothing is moved; a refused unload raises SysidError (the arm holds its pose)."""
     if not armed(link):
         obs = link.obs or {}
         log(f"not moving the arm: torque {'on' if obs.get('is_torqued') else 'off'}, safety state {obs.get('safety_state')}")
@@ -527,12 +565,20 @@ def finish(link, a, ret: list[float], home: list[float] | None, dof: int, log=pr
     while link.obs.get("safety_state") != "Armed" and time.time() < deadline:
         time.sleep(0.05)
     slow_jog(link, ret, dof, a.approach_speed, log)
-    if a.unload:
-        if a.return_home and home is not None:
-            slow_jog(link, home, dof, a.approach_speed, log)
-        ack = link.command("/api/v1/motion/unload", {})
-        if ack.get("action_id"):
-            link.wait_action(ack["action_id"], 60)
+    if not a.unload:
+        return
+    if home is None or tolerances is None:
+        raise SysidError(UNLOAD_REFUSED.format(why="no authoritative home pose / resting tolerances from armd"))
+    slow_jog(link, home, dof, a.approach_speed, log)
+    time.sleep(0.5)
+    q = link.obs["positions"]
+    if not armed(link) or not within(q, home, tolerances):
+        raise SysidError(UNLOAD_REFUSED.format(
+            why=f"after the home jog the arm is at {np.round(q[:ARM_JOINTS], 3).tolist()}, not within the resting "
+                f"tolerances {tolerances} of home {np.round(home[:ARM_JOINTS], 3).tolist()}"))
+    ack = link.command("/api/v1/motion/unload", {})
+    if ack.get("action_id"):
+        link.wait_action(ack["action_id"], 60)
 
 
 def write_results(a, out_dir: Path, link, segments: list[Segment], cfg: SweepConfig, start: list[float],
@@ -601,6 +647,7 @@ def main(argv: list[str] | None = None) -> dict:
     start: list[float] | None = None
     ret: list[float] | None = None
     home = None
+    tolerances = None
     dof: int | None = None
     swept = False
     try:
@@ -609,11 +656,11 @@ def main(argv: list[str] | None = None) -> dict:
         if len(obs["positions"]) != dof:
             raise SysidError(f"observation has {len(obs['positions'])} joints, schema dof {dof}")
         current = list(obs["positions"])
-        if isinstance(schema.get("home_positions"), list):
-            home = list(schema["home_positions"])
-            if len(home) != dof:
-                raise SysidError(f"schema home_positions has {len(home)} values, dof {dof}")
-            home[ARM_JOINTS:] = current[ARM_JOINTS:]  # the gripper is not moved
+        if a.unload:
+            home, tolerances, why = unload_home(schema, dof, current)
+            if why is not None:  # refused before anything moves
+                raise SysidError(f"--unload needs the home pose and resting tolerances from armd: {why}. "
+                                 "Update armd, or run without --unload and park from the cockpit")
         if not obs.get("is_torqued"):
             if not a.enable:
                 raise SysidError("torque is off: enable it in the cockpit or pass --enable")
@@ -622,8 +669,6 @@ def main(argv: list[str] | None = None) -> dict:
         start = list(current)
         if a.pose is not None:
             start[:ARM_JOINTS] = a.pose
-        if home is None:
-            home = list(start)
         per_joint = sum(4 * a.amplitude * a.cycles / v + 2 * a.amplitude / v + 0.5 for v in a.speeds)
         print(f"start pose (rad): {np.round(start[:ARM_JOINTS], 3).tolist()}")
         for j in a.joints:
@@ -650,14 +695,15 @@ def main(argv: list[str] | None = None) -> dict:
             print(f"rebot-sysid: writing the partial results failed: {we}", file=sys.stderr)
         try:
             if ret is not None and dof is not None:
-                finish(link, a, ret, home, dof, log=lambda m: print(f"recovery: {m}", file=sys.stderr))
+                finish(link, a, ret, home, dof, log=lambda m: print(f"recovery: {m}", file=sys.stderr),
+                       tolerances=tolerances)
         except BaseException as fe:
             print(f"rebot-sysid: recovery failed: {fe}", file=sys.stderr)
         link.close()
         raise
     try:
         report = write_results(a, out_dir, link, segments, cfg, start, None)
-        finish(link, a, ret, home, dof)
+        finish(link, a, ret, home, dof, tolerances=tolerances)
         return report
     except BaseException:
         link.stop()

@@ -14,6 +14,8 @@ from rebot_sim import sysid
 
 POSE = [0.0, -1.0, -1.2, 0.6, 0.0, 0.0, 0.0]
 HOME = [0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0, -0.5]
+REST = {"position_tolerances": [0.15, 0.08, 0.08, 0.08, 0.08, 0.08]}
+SCHEMA = {"dof": 7, "home_positions": HOME, "resting_pose": REST}
 ARGS = ["--i-am-at-the-arm", "--yes", "--amplitude", "0.1", "--speeds", "0.05,0.1", "--cycles", "1"]
 
 
@@ -87,7 +89,7 @@ def test_abort_keeps_finished_joints_and_returns_slowly_home_and_unloads(rig, tm
         if abs(link.obs["positions"][1] - POSE[1]) > 0.05:
             link.obs["residual_torques"] = list(link.obs["residual_torques"])
             link.obs["residual_torques"][3] += 3.0
-    link = rig(FakeLink(on_servo=spike), {"dof": 7, "home_positions": HOME})
+    link = rig(FakeLink(on_servo=spike), SCHEMA)
     with pytest.raises(sysid.SysidError, match="J4 residual changed"):
         sysid.main(ARGS + ["--joints", "1,2", "--unload", "--out", str(tmp_path)])
     report = json.loads((tmp_path / "report.json").read_text())
@@ -112,7 +114,7 @@ def test_fault_exit_does_not_move_the_arm(rig, tmp_path):
     def fault(link):
         if link.servos == 40:
             link.obs["safety_state"] = {"Fault": {"code": "TRACKING_ERROR"}}
-    link = rig(FakeLink(on_servo=fault), {"dof": 7, "home_positions": HOME})
+    link = rig(FakeLink(on_servo=fault), SCHEMA)
     with pytest.raises(sysid.SysidError, match="safety state"):
         sysid.main(ARGS + ["--joints", "1", "--unload", "--out", str(tmp_path)])
     report = json.loads((tmp_path / "report.json").read_text())
@@ -121,7 +123,7 @@ def test_fault_exit_does_not_move_the_arm(rig, tmp_path):
 
 
 def test_success_returns_home_before_unload_and_flags_negative_viscous(rig, tmp_path):
-    link = rig(FakeLink(fc=0.4, fv=-0.2), {"dof": 7, "home_positions": HOME})
+    link = rig(FakeLink(fc=0.4, fv=-0.2), SCHEMA)
     report = sysid.main(ARGS + ["--joints", "5", "--unload", "--out", str(tmp_path)])
     j = report["joints"][0]
     assert report["aborted"] is None
@@ -133,16 +135,56 @@ def test_success_returns_home_before_unload_and_flags_negative_viscous(rig, tmp_
     assert tail[1][1] == pytest.approx(HOME[:6] + POSE[6:])
 
 
-def test_no_return_home_and_no_home_in_schema(rig, tmp_path):
+@pytest.mark.parametrize("schema", [{"dof": 7}, {"dof": 7, "home_positions": HOME},
+                                    {"dof": 7, "home_positions": HOME, "resting_pose": {"position_tolerances": [0.1] * 3}}])
+def test_unload_without_authoritative_home_is_refused_before_moving(rig, tmp_path, schema):
+    # no home / resting tolerances from armd: no fallback to the sweep start, nothing moves
+    link = rig(FakeLink(), schema)
+    with pytest.raises(sysid.SysidError, match="--unload needs the home pose"):
+        sysid.main(ARGS + ["--joints", "6", "--unload", "--out", str(tmp_path)])
+    assert [c for c in link.calls if c[0] in ("servo", "jog", "/api/v1/motion/unload")] == []
+
+
+def test_recovery_without_authoritative_home_does_not_unload(rig, tmp_path):
+    # the recovery path itself never unloads without a schema home
+    link = FakeLink()
+    a = sysid.parse_args(ARGS + ["--unload"])
+    with pytest.raises(sysid.SysidError, match="not unloading"):
+        sysid.finish(link, a, POSE, None, 7, log=lambda m: None)
+    assert [c[0] for c in link.calls] == ["jog"]
+
+
+def test_unload_refused_when_home_jog_ends_outside_tolerance(rig, tmp_path):
+    class Short(FakeLink):
+        def jog(self, positions, duration=None):  # the home jog stops 0.2 rad short on J2
+            super().jog(positions, duration)
+            if positions[1] == HOME[1]:
+                q = list(self.obs["positions"]); q[1] -= 0.2
+                self.obs = {**self.obs, "positions": q}
+    link = rig(Short(), SCHEMA)
+    with pytest.raises(sysid.SysidError, match="not unloading.*not within the resting tolerances"):
+        sysid.main(ARGS + ["--joints", "6", "--unload", "--out", str(tmp_path)])
+    assert [c[0] for c in after(link.calls, "jog")] == ["jog", "jog"]
+    assert link.obs["is_torqued"] is True
+
+
+def test_no_unload_returns_to_start_and_holds(rig, tmp_path):
     link = rig(FakeLink(), {"dof": 7})
-    sysid.main(ARGS + ["--joints", "6", "--unload", "--no-return-home", "--out", str(tmp_path)])
-    assert [c[0] for c in after(link.calls, "jog")] == ["jog", "/api/v1/motion/unload"]
-    # without home_positions in the schema the home jog goes to the start pose
-    link = rig(FakeLink(), {"dof": 7})
-    sysid.main(ARGS + ["--joints", "6", "--unload", "--out", str(tmp_path)])
+    sysid.main(ARGS + ["--joints", "6", "--out", str(tmp_path)])
     tail = after(link.calls, "jog")
-    assert [c[0] for c in tail] == ["jog", "jog", "/api/v1/motion/unload"]
-    assert tail[1][1] == pytest.approx(POSE) and tail[1][2] == pytest.approx(3.0)
+    assert [c[0] for c in tail] == ["jog"] and tail[0][1] == pytest.approx(POSE)
+
+
+@pytest.mark.parametrize("flag,value", [
+    ("--abort-nm", "4,4,nan,2.5,2.5,2.5"), ("--abort-nm", "4,4,4,2.5,inf,2.5"), ("--abort-nm", "4,4,4,-1,2.5,2.5"),
+    ("--amplitude", "nan"), ("--amplitude", "-0.1"), ("--amplitude", "inf"),
+    ("--speeds", "0.05,nan"), ("--speeds", "0.05,-0.1"), ("--speeds", "inf,0.1"),
+    ("--accel", "nan"), ("--accel", "-1"), ("--accel", "inf"),
+    ("--approach-speed", "nan"), ("--approach-speed", "-0.1"), ("--approach-speed", "inf"),
+])
+def test_non_finite_or_negative_arguments_are_rejected(flag, value):
+    with pytest.raises(SystemExit):
+        sysid.parse_args(["--i-am-at-the-arm", f"{flag}={value}"])
 
 
 def test_approach_jog_duration_from_approach_speed(rig, tmp_path):
@@ -173,5 +215,4 @@ def test_joint_vector_length_is_checked_before_sending(rig, tmp_path):
 def test_defaults():
     a = sysid.parse_args(["--i-am-at-the-arm"])
     assert a.abort_nm == [4.0, 4.0, 4.0, 2.5, 2.5, 2.5]
-    assert a.approach_speed == 0.1 and a.return_home is False
-    assert sysid.parse_args(["--unload"]).return_home is True
+    assert a.approach_speed == 0.1 and a.unload is False
