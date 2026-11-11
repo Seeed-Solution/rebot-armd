@@ -444,3 +444,29 @@ async fn trip_during_place_ends_it_and_no_phase_follows() {
     let moved = q0.iter().zip(&inner.commanded_positions).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
     assert!(moved < 1e-3, "orchestrator issued no motion after the trip ({moved} rad)");
 }
+
+/// Real B601-DM at the folded home pose: J3 rests on its support with ~7.5 N·m residual
+/// (J2 ~1.2). Supported joints (`resting_pose.support_torque_limits`) are not watched while the
+/// arm is within the resting-pose tolerances; other joints, and the same joint off home, are.
+#[test]
+fn supported_joints_at_the_resting_pose_do_not_trip() {
+    let (mut inner, arm) = rig(Some(policy()));
+    let home: Vec<f32> = inner.config.home_positions.clone();
+    arm.0.lock().unwrap().q.copy_from_slice(&home);
+    inner.commanded_positions = home.clone();
+    inner.target_positions = home.clone();
+    ticks(&mut inner, 3);
+    assert_eq!(inner.collision_supported_joints(), [false, true, true, false, false, false]);
+    arm.set_residual(2, 7.5);
+    arm.set_residual(1, 1.2);
+    ticks(&mut inner, 20);
+    assert!(inner.collision.hold.is_none(), "J3 on its support must not trip at home");
+    arm.set_residual(0, 7.0);
+    ticks(&mut inner, 5);
+    assert_eq!(inner.collision.hold.map(|h| h.joint), Some(0), "J1 is not supported: trips");
+    // off home the support exemption ends
+    let (mut inner, arm) = rig(Some(policy()));
+    arm.set_residual(2, 7.5);
+    ticks(&mut inner, 5);
+    assert_eq!(inner.collision.hold.map(|h| h.joint), Some(2), "J3 away from home trips");
+}

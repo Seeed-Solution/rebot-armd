@@ -3,7 +3,14 @@
 //!
 //! This is contact detection on a gravity-model residual, not a certified safety function.
 //! The default thresholds are placeholders until they are measured on a real arm; the guard
-//! is off unless the profile or the runtime setting enables it.
+//! is off unless the profile or the runtime setting enables it. Thresholds must come from a
+//! rebot-sysid measurement of the arm: on the B601-DM at the folded home pose the residuals
+//! measured J1 ±1.1, J2 ~1.2, J3 ~7.0-7.5, J4 ~2.2 (4.4 during a J4 move), J5 ~0.9 N·m, above
+//! several placeholder thresholds.
+//!
+//! Joints listed in `resting_pose.support_torque_limits` are not watched while every joint is
+//! within `resting_pose.position_tolerances` of home: they rest on their mechanical support and
+//! the support force shows up as residual.
 //!
 //! Per tick the guard costs O(6) and allocates nothing; strings are built only on a trip.
 
@@ -255,6 +262,24 @@ impl SupervisorInner {
 
     /// One control tick of the guard, after the residuals of this tick are known and
     /// before the motion reference is stepped. `dt` is the control-loop step (s).
+    /// J1..J6 resting on their support: listed in `resting_pose.support_torque_limits` and
+    /// every joint within `resting_pose.position_tolerances` of home (measured positions).
+    pub fn collision_supported_joints(&self) -> [bool; 6] {
+        let mut out = [false; 6];
+        let Some(policy) = self.config.resting_pose.as_ref() else { return out; };
+        let home = &self.config.home_positions;
+        let at_rest = !policy.position_tolerances.is_empty() && policy.position_tolerances.iter().enumerate().all(|(i, tol)| {
+            match (self.measured_positions.get(i), home.get(i)) {
+                (Some(q), Some(h)) => (q - h).abs() <= *tol,
+                _ => false,
+            }
+        });
+        if at_rest {
+            for &(i, _) in &policy.support_torque_limits { if i < 6 { out[i] = true; } }
+        }
+        out
+    }
+
     pub(crate) fn collision_tick(&mut self, dt: f64) {
         let p = self.collision_policy();
         let operational = self.is_torqued && self.safety.state().is_operational() && self.gravity_comp.is_none()
@@ -269,7 +294,8 @@ impl SupervisorInner {
                 return;
             }
             let thr = self.collision_thresholds();
-            let quiet = self.residual_torques.is_some_and(|r| (0..6).all(|j| r[j].abs() < p.clear_ratio * thr[j]));
+            let supported = self.collision_supported_joints();
+            let quiet = self.residual_torques.is_some_and(|r| (0..6).all(|j| supported[j] || r[j].abs() < p.clear_ratio * thr[j]));
             hold.quiet_s = if quiet { hold.quiet_s + dt } else { 0.0 };
             if hold.quiet_s >= p.resume_after_s {
                 tracing::info!("Collision hold on joint {} ended: residuals below {:.0}% of the thresholds for {:.1} s",
@@ -287,9 +313,10 @@ impl SupervisorInner {
             return;
         };
         let thr = self.collision_thresholds();
+        let supported = self.collision_supported_joints();
         let mut worst: Option<(usize, f32)> = None;
         for j in 0..6 {
-            if r[j].abs() > thr[j] {
+            if !supported[j] && r[j].abs() > thr[j] {
                 self.collision.over[j] = self.collision.over[j].saturating_add(1);
                 let ratio = r[j].abs() / thr[j];
                 if self.collision.over[j] >= p.persist_ticks && worst.is_none_or(|(_, w)| ratio > w) {
