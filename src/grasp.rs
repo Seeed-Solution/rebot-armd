@@ -98,6 +98,9 @@ pub struct GraspSetup {
     /// re-orient to the tool-vertical pose above the target. `auto` = on when
     /// |`camera_tilt_deg`| > [`CAMERA_DOWN_AUTO_TILT_DEG`] and `camera_mount.offset_m` is set.
     pub acquire_camera_down: AcquireCameraDown,
+    /// Camera-down re-check after the transition: TARGET_DISPLACED when the target's box
+    /// centre is more than this many pixels from where the model projects it.
+    pub recheck_tol_px: f64,
 }
 
 /// `acquire_camera_down` setting.
@@ -144,6 +147,7 @@ impl Default for GraspSetup {
             phase_timeout_s: 25.0,
             timeout_s: 120.0,
             acquire_camera_down: AcquireCameraDown::Auto,
+            recheck_tol_px: 40.0,
         }
     }
 }
@@ -155,7 +159,7 @@ impl GraspSetup {
             self.grip_pixel_norm[0], self.grip_pixel_norm[1], self.camera_tilt_deg, self.image_size_px[0],
             self.image_size_px[1], self.fx_px, self.fy_px, self.centre_tol_px, self.servo_gain, self.max_step_m,
             self.match_dist_px, self.match_iou, self.acquire_dist_px, self.lost_timeout_s, self.settle_delay_s,
-            self.align_min_aspect, self.approach_speed_mps, self.descend_speed_mps, self.phase_timeout_s, self.timeout_s];
+            self.align_min_aspect, self.approach_speed_mps, self.descend_speed_mps, self.phase_timeout_s, self.timeout_s, self.recheck_tol_px];
         if !all.iter().all(|v| fin(*v)) { return Err("grasp setup values must be finite".into()); }
         let check = |ok: bool, msg: &str| if ok { Ok(()) } else { Err(msg.to_string()) };
         check((-0.5..=0.5).contains(&self.table_z_m), "table_z_m must be in [-0.5, 0.5] m")?;
@@ -178,6 +182,7 @@ impl GraspSetup {
         check(self.lost_timeout_s > 0.0 && self.lost_timeout_s <= 10.0 && (1..=100).contains(&self.lost_frames),
             "lost_timeout_s must be in (0, 10] s and lost_frames 1..100")?;
         check((0.0..=2.0).contains(&self.settle_delay_s), "settle_delay_s must be in [0, 2] s")?;
+        check(self.recheck_tol_px > 0.0 && self.recheck_tol_px <= 500.0, "recheck_tol_px must be in (0, 500]")?;
         check(self.align_min_aspect >= 1.0 && self.align_min_aspect <= 10.0, "align_min_aspect must be in [1, 10]")?;
         let speed_ok = |v: f64| v > 0.0 && v <= motion::MAX_LINEAR_MPS;
         check(speed_ok(self.approach_speed_mps) && speed_ok(self.descend_speed_mps), "speeds must be in (0, 0.15] m/s")?;
@@ -1040,10 +1045,8 @@ impl Orchestrator {
             };
             self.table_clear(&pose, &goal)?;
             let done = self.move_arm("transition", GoalSpec::Absolute { p: goal.p, r: Some(goal.r) }, s.approach_speed_mps).await?;
-            // diagnostic only: where the target appears relative to the grip pixel now
-            if let Some(offset) = self.recheck(&planned.request.label, &last, &t, grip_px, done.at, &mut after).await? {
-                self.sup.inner().write().await.set_action_final_offset(self.id, offset);
-            }
+            // verify the target where the model expects it before descending
+            self.recheck(&planned.request.label, &last, &t, grip_px, done.at, &mut after).await?;
         }
 
         // J6 alignment: close the jaws across the box's short side
@@ -1082,23 +1085,24 @@ impl Orchestrator {
         }
     }
 
-    /// After the camera-down transition: the target's box centre minus `grip_px` in one fresh
-    /// frame, when the model projects the target into the image. Not seeing it is not a
-    /// failure (None); stops and timeouts still end the grasp.
-    async fn recheck(&self, label: &str, last: &Detection, t: &Vec3, grip_px: [f64; 2], since: Instant, after: &mut Option<u64>) -> Result<Option<[f32; 2]>, Stop> {
+    /// After the camera-down transition, when the model projects the target `t` into the
+    /// image: one fresh frame must show it (else TARGET_LOST / DETECTION_UNAVAILABLE), within
+    /// `recheck_tol_px` of the projection (else TARGET_DISPLACED). Records the box centre minus
+    /// `grip_px` as `final_offset_px`. Nothing is checked when the target is not expected in view.
+    async fn recheck(&self, label: &str, last: &Detection, t: &Vec3, grip_px: [f64; 2], since: Instant, after: &mut Option<u64>) -> Result<(), Stop> {
         let pose = self.pose().await;
-        let Some(p) = self.cam.project(&pose, t) else { return Ok(None) };
-        if !(p[0] >= 0.0 && p[0] <= self.cam.size[0] && p[1] >= 0.0 && p[1] <= self.cam.size[1]) { return Ok(None); }
+        let Some(p) = self.cam.project(&pose, t) else { return Ok(()) };
+        if !(p[0] >= 0.0 && p[0] <= self.cam.size[0] && p[1] >= 0.0 && p[1] <= self.cam.size[1]) { return Ok(()); }
         let mut tracker = Tracker { label: label.to_string(), predicted: last.box_norm, gate_px: self.setup.acquire_dist_px };
         tracker.predict_at(self.cam.to_norm(p));
-        match self.fresh_match(&tracker, since, after).await {
-            Ok(d) => {
-                let c = self.cam.to_px(box_centre(&d.box_norm));
-                Ok(Some([(c[0] - grip_px[0]) as f32, (c[1] - grip_px[1]) as f32]))
-            }
-            Err(Stop::Fail(code, _)) if code == "TARGET_LOST" || code == "DETECTION_UNAVAILABLE" => Ok(None),
-            Err(e) => Err(e),
+        let d = self.fresh_match(&tracker, since, after).await?;
+        let c = self.cam.to_px(box_centre(&d.box_norm));
+        self.sup.inner().write().await.set_action_final_offset(self.id, [(c[0] - grip_px[0]) as f32, (c[1] - grip_px[1]) as f32]);
+        let moved = (c[0] - p[0]).hypot(c[1] - p[1]);
+        if moved > self.setup.recheck_tol_px {
+            return Err(fail("TARGET_DISPLACED", format!("Target {moved:.0} px from where it was expected after the transition (recheck_tol_px {:.0})", self.setup.recheck_tol_px)));
         }
+        Ok(())
     }
 
     /// ±pi/2 about the tool axis when the jaws would close across the long side.
@@ -1266,6 +1270,8 @@ mod tests {
         let d = GraspSetup::default();
         assert_eq!(serde_json::to_value(&d).unwrap()["acquire_camera_down"], "auto");
         assert_eq!(d.patched(&serde_json::json!({"acquire_camera_down": "on"})).unwrap().acquire_camera_down, AcquireCameraDown::On);
+        assert!(d.patched(&serde_json::json!({"recheck_tol_px": 0.0})).is_err() && d.patched(&serde_json::json!({"recheck_tol_px": 501.0})).is_err());
+        assert_eq!(d.patched(&serde_json::json!({"recheck_tol_px": 25.0})).unwrap().recheck_tol_px, 25.0);
         for bad in [serde_json::json!("yes"), serde_json::json!(true), serde_json::json!(1)] {
             assert!(d.patched(&serde_json::json!({"acquire_camera_down": bad})).is_err(), "{bad}");
         }

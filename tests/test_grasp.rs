@@ -40,6 +40,10 @@ struct SimCamera {
     per_request: AtomicBool,
     trigger_calls: Mutex<Vec<Vec<String>>>,
     next_frame_calls: AtomicU64,
+    /// The object moved by this much (m, base x, y) since the rig was built.
+    shift: Mutex<[f64; 2]>,
+    /// Every frame request fails (detector error).
+    failing: AtomicBool,
 }
 
 impl SimCamera {
@@ -68,6 +72,8 @@ impl SimCamera {
 
     fn project_box(&self, pose: &Pose) -> Option<[f64; 4]> {
         let o = &self.object;
+        let sh = *self.shift.lock().unwrap();
+        let o = Object { centre: [o.centre[0] + sh[0], o.centre[1] + sh[1], o.centre[2]], half: o.half, height: o.height };
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for sx in [-1.0, 1.0] { for sy in [-1.0, 1.0] { for z in [o.centre[2], o.centre[2] + o.height] {
             let p = self.cam.project(pose, &[o.centre[0] + sx * o.half[0], o.centre[1] + sy * o.half[1], z])?;
@@ -108,6 +114,7 @@ impl DetectionSource for SimCamera {
     fn next_frame(&self, _after: Option<u64>, wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
         Box::pin(async move {
             self.next_frame_calls.fetch_add(1, Ordering::SeqCst);
+            if self.failing.load(Ordering::SeqCst) { return Err("detector returned 503".into()); }
             if !self.yolo_running() {
                 tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                 return Ok(None);
@@ -121,6 +128,7 @@ impl DetectionSource for SimCamera {
     fn trigger(&self, pipelines: &'static [&'static str], _wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
         Box::pin(async move {
             self.trigger_calls.lock().unwrap().push(pipelines.iter().map(|p| p.to_string()).collect());
+            if self.failing.load(Ordering::SeqCst) { return Err("detector returned 503".into()); }
             if self.no_yolo.load(Ordering::SeqCst) && pipelines.contains(&"yolo") {
                 return Err("detector returned 409 Conflict yolo unavailable".into());
             }
@@ -210,6 +218,7 @@ async fn rig_mounted(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start:
         visible: AtomicBool::new(true), enabled: AtomicBool::new(false), frame: AtomicU64::new(0), inference_calls: Mutex::new(Vec::new()),
         vision: Mutex::new(None), mode_calls: Mutex::new(Vec::new()), no_yolo: AtomicBool::new(false),
         per_request: AtomicBool::new(false), trigger_calls: Mutex::new(Vec::new()), next_frame_calls: AtomicU64::new(0),
+        shift: Mutex::new([0.0; 2]), failing: AtomicBool::new(false),
     });
     let hold = Arc::new(AtomicBool::new(true));
     let (ticker, hold_t) = (sup.clone(), hold.clone());
@@ -879,4 +888,45 @@ async fn camera_down_keeps_the_pitched_envelope_above_a_raised_table() {
     let h = a.acquire_height_m.expect("acquisition height raised and reported");
     assert!(f64::from(h) > setup.approach_height_m + 0.01, "{h}");
     assert!(lowest >= setup.table_z_m + 0.004, "envelope {lowest:.4} m reached the table {:.3} m in {at}", setup.table_z_m);
+}
+
+/// v8 rig at a 0.06 m approach (the target under the jaws is in view after the transition),
+/// grip pixel calibrated.
+async fn v8_recheck_rig(lease: bool) -> (Rig, GraspSetup) {
+    let setup = GraspSetup { camera_tilt_deg: -38.0, approach_height_m: 0.06, ..GraspSetup::default() };
+    let truth = Truth { rot_deg: 90.0, offset: V8_OFFSET, ..Truth::same() };
+    let start = pitched_start(&kinematics::cam_mount(false, 90.0, -38.0), 0.5, 0.22);
+    let start_r = start.1.r;
+    let rig = rig_mounted(setup.clone(), truth, 90.0, start, [0.01, 0.0], lease).await;
+    let mut s = setup.clone();
+    s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+    rig.sup.inner().write().await.set_grasp_setup(s.clone());
+    (rig, s)
+}
+
+/// After the transition the model expects the target in view: losing it, finding it moved, or
+/// a detector error ends the grasp with that code before the descent.
+#[tokio::test]
+async fn camera_down_recheck_failures_end_the_grasp_before_descent() {
+    for (case, expect) in [("lost", "TARGET_LOST"), ("displaced", "TARGET_DISPLACED"), ("detector", "DETECTION_UNAVAILABLE")] {
+        let (rig, s) = v8_recheck_rig(false).await;
+        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+        wait_phase(&rig.sup, id, "transition", Some(true)).await;
+        match case {
+            "lost" => rig.sim.visible.store(false, Ordering::SeqCst),
+            "displaced" => *rig.sim.shift.lock().unwrap() = [0.02, 0.0],
+            _ => rig.sim.failing.store(true, Ordering::SeqCst),
+        }
+        let mut phases = Vec::new();
+        let a = wait_done(&rig.sup, id, 20.0, |a| {
+            let p = a.phase.clone().unwrap_or_default();
+            if phases.last() != Some(&p) { phases.push(p); }
+        }).await;
+        let z = start_pose(&rig).await.p[2];
+        println!("re-check {case}: {} {:?} {:?}, final offset {:?}, phases {phases:?}, TCP z {z:.3}", a.state, a.code, a.message, a.final_offset_px);
+        assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some(expect)), "{case}: {a:?}");
+        assert!(!phases.iter().any(|p| p == "descend" || p == "close"), "{case}: {phases:?}");
+        assert!((z - (s.table_z_m + s.approach_height_m)).abs() < 2e-3, "{case}: still at approach height, z {z}");
+        assert_idle_after(&rig.sup, id).await;
+    }
 }
