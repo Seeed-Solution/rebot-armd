@@ -13,7 +13,10 @@ where r is armd's residual torque (measured torque minus its gravity model, J1..
 without a gravity model, the raw torque. The kq term absorbs gravity-model error that
 varies with position over the small sweep. Per direction it also fits r = a + b * v. It
 writes a JSON report and one plot per joint, and prints suggested collision thresholds
-= max |r - friction fit| over all recorded samples x a safety factor.
+= max |r - Coulomb-only fit| over all recorded samples x a safety factor (a negative
+viscous term is reported as unreliable). After an abort or error the joints already
+finished are still fitted and written (report field `aborted`), and a torqued, Armed arm
+is jogged slowly back to the start pose (and home and unloaded with --unload).
 
 Nothing is installed on the arm side: armd only sees servo frames and commands.
 See docs/simulation.md ("Friction identification") for the procedure on the real arm.
@@ -40,9 +43,14 @@ OBS_HZ = 50
 MAX_AMPLITUDE = 0.35
 MAX_SPEED = 0.6
 MAX_ACCEL = 3.0
-# Default abort level on |residual| (N·m) per joint: about 1/3 of the DM4340P / DM4310
-# rated torque (9 / 3 N·m).
-DEFAULT_ABORT_NM = [3.0, 3.0, 3.0, 1.0, 1.0, 1.0]
+# Default abort level on |residual change| (N·m) per joint: below half the DM4340P / DM4310
+# rated torque (9 / 3 N·m). 1.0 on J4..J6 tripped on normal J4 friction swings on the real
+# arm (B601-DM, 2026-11-11).
+DEFAULT_ABORT_NM = [4.0, 4.0, 4.0, 2.5, 2.5, 2.5]
+# Speed of the approach / return / home jogs (rad/s, largest J1..J6 change) and their
+# shortest duration (s).
+DEFAULT_APPROACH_SPEED = 0.1
+MIN_APPROACH_S = 3.0
 
 
 class SysidError(RuntimeError):
@@ -233,11 +241,29 @@ class SweepConfig:
     settle_s: float = 0.5
 
 
-def run_sweeps(link: ArmdLink, start: list[float], cfg: SweepConfig, log=print) -> list[Segment]:
-    """Sweep every joint in cfg.joints around start; returns the time windows per speed."""
+def run_sweeps(link: ArmdLink, start: list[float], cfg: SweepConfig, log=print,
+               segments: list[Segment] | None = None) -> list[Segment]:
+    """Sweep every joint in cfg.joints around start; returns the time windows per speed.
+
+    Each finished speed is appended to `segments` (when given) as it ends, so a caller that
+    sees an exception still has the windows recorded so far.
+    """
     dt = 1.0 / SERVO_HZ
-    segments: list[Segment] = []
+    segments = [] if segments is None else segments
     link.recording = True
+    try:
+        _sweep(link, start, cfg, log, segments, dt)
+    finally:
+        link.recording = False
+    return segments
+
+
+def finished_joints(segments: list[Segment], cfg: SweepConfig) -> list[int]:
+    """Joints whose sweeps at every speed ended."""
+    return [j for j in cfg.joints if sorted(s.speed for s in segments if s.joint == j) == sorted(cfg.speeds)]
+
+
+def _sweep(link, start, cfg, log, segments, dt):
     baseline = np.array(link.obs.get("residual_torques") or link.obs["torques"][:ARM_JOINTS], dtype=float)
     period = dt
     for j in cfg.joints:
@@ -272,8 +298,6 @@ def run_sweeps(link: ArmdLink, start: list[float], cfg: SweepConfig, log=print) 
                 else:
                     next_t = time.monotonic()
             segments.append(Segment(j, v, t0, link.obs["timestamp"]))
-    link.recording = False
-    return segments
 
 
 # --------------------------------------------------------------------------- fit
@@ -334,9 +358,17 @@ def fit_joint(j: int, data: dict, segments: list[Segment], amplitude: float, cen
     B = np.column_stack([pos, pos * v, neg, neg * v, x]).astype(float)
     d, *_ = np.linalg.lstsq(B, y, rcond=None)
     speeds = sorted({s.speed for s in segments if s.joint == j})
+    # Coulomb-only fit r = Fc * sign(v) + offset + kq * x: the collision thresholds are based
+    # on it (a negative viscous term, seen on the real arm, is not physical)
+    C = np.column_stack([sgn, np.ones(n), x])
+    cc, *_ = np.linalg.lstsq(C, y, rcond=None)
+    c_rmse = float(np.sqrt(np.mean((C @ cc - y) ** 2)))
     return {
         "joint": j + 1, "samples": n, "speeds_rad_s": speeds,
         "coulomb_nm": fc, "viscous_nm_s_rad": fv, "offset_nm": off, "position_slope_nm_rad": kq, "rmse_nm": rmse,
+        "viscous_reliable": fv >= 0.0,
+        **({} if fv >= 0.0 else {"viscous_note": "Fv < 0: viscous fit unreliable (not physical); thresholds use the Coulomb-only fit"}),
+        "coulomb_only": {"coulomb_nm": float(cc[0]), "offset_nm": float(cc[1]), "position_slope_nm_rad": float(cc[2]), "rmse_nm": c_rmse},
         "positive": {"intercept_nm": float(d[0]), "slope_nm_s_rad": float(d[1]), "coulomb_nm": float(d[0]) - off},
         "negative": {"intercept_nm": float(d[2]), "slope_nm_s_rad": float(d[3]), "coulomb_nm": off - float(d[2])},
         "_mask": mask,
@@ -348,13 +380,20 @@ def friction_model(fit: dict, v: np.ndarray, x: np.ndarray, v_eps: float = 0.01)
     return fit["coulomb_nm"] * np.tanh(v / v_eps) + fit["viscous_nm_s_rad"] * v + fit["offset_nm"] + fit["position_slope_nm_rad"] * x
 
 
+def coulomb_model(fit: dict, v: np.ndarray, x: np.ndarray, v_eps: float = 0.01) -> np.ndarray:
+    """Coulomb-only r(v, q) (no viscous term); sign(v) smoothed as in friction_model."""
+    c = fit["coulomb_only"]
+    return c["coulomb_nm"] * np.tanh(v / v_eps) + c["offset_nm"] + c["position_slope_nm_rad"] * x
+
+
 def thresholds(fits: dict[int, dict], data: dict, centers: list[float], factor: float, floor_nm: float) -> dict[int, dict]:
-    """max |r - fit| over every recorded sample (all sweeps, moving and standing) x factor."""
+    """max |r - Coulomb-only fit| over every recorded sample (all sweeps, moving and standing)
+    x factor: Coulomb friction plus the residual spread, no viscous term."""
     out = {}
     for j, fit in fits.items():
-        dev = np.abs(data["r"][:, j] - friction_model(fit, data["v"][:, j], data["q"][:, j] - centers[j]))
+        dev = np.abs(data["r"][:, j] - coulomb_model(fit, data["v"][:, j], data["q"][:, j] - centers[j]))
         mx = float(dev.max())
-        out[j] = {"max_abs_deviation_nm": mx, "p99_abs_deviation_nm": float(np.percentile(dev, 99)),
+        out[j] = {"basis": "coulomb_only", "max_abs_deviation_nm": mx, "p99_abs_deviation_nm": float(np.percentile(dev, 99)),
                   "factor": factor, "suggested_threshold_nm": max(mx * factor, floor_nm)}
     return out
 
@@ -407,16 +446,30 @@ def parse_args(argv):
                    help="start pose J1..J6 in rad (comma-separated); jogs there first. Default: the current pose")
     p.add_argument("--joints", default="1,2,3,4,5,6", help="joints to identify (default 1,2,3,4,5,6)")
     p.add_argument("--amplitude", type=float, default=0.15, help=f"sweep half-range in rad (default 0.15, max {MAX_AMPLITUDE})")
-    p.add_argument("--speeds", default="0.1,0.2,0.3", help=f"sweep speeds in rad/s (default 0.1,0.2,0.3, max {MAX_SPEED})")
+    p.add_argument("--speeds", default="0.1,0.2,0.3",
+                   help=f"sweep speeds in rad/s (default 0.1,0.2,0.3, max {MAX_SPEED}); on the real arm use at most "
+                        "0.08 rad/s for J1..J3 (run them separately, e.g. --joints 1,2,3 --speeds 0.04,0.08)")
     p.add_argument("--cycles", type=int, default=2, help="back-and-forth cycles per speed (default 2)")
     p.add_argument("--accel", type=float, default=1.0, help=f"turnaround acceleration rad/s² (default 1.0, max {MAX_ACCEL})")
     p.add_argument("--abort-nm", type=lambda s: floats(s, ARM_JOINTS, "--abort-nm"), default=DEFAULT_ABORT_NM,
-                   help="stop if a J1..J6 residual moves this far from its value at the start (N·m, default 3,3,3,1,1,1)")
+                   help="stop if a J1..J6 residual moves this far from its value at the start (N·m, default 4,4,4,2.5,2.5,2.5)")
     p.add_argument("--safety-factor", type=float, default=1.5, help="collision threshold = max deviation x this (default 1.5)")
     p.add_argument("--threshold-floor", type=float, default=0.1, help="minimum suggested threshold in N·m (default 0.1)")
     p.add_argument("--out", default="sysid-out", help="output directory for report.json, samples.json, plots")
-    p.add_argument("--unload", action="store_true", help="park and torque off at the end (default: return to the start pose and hold)")
+    p.add_argument("--unload", action="store_true",
+                   help="park and torque off at the end, also after an error or abort (default: return to the start pose and hold)")
+    p.add_argument("--approach-speed", type=float, default=DEFAULT_APPROACH_SPEED,
+                   help=f"speed of the jogs to the start pose, back to it and home: duration = largest J1..J6 change / this, "
+                        f"at least {MIN_APPROACH_S:g} s (rad/s, default {DEFAULT_APPROACH_SPEED})")
+    p.add_argument("--return-home", action=argparse.BooleanOptionalAction, default=None,
+                   help="before --unload, jog slowly to the profile home pose so that the park is a small move "
+                        "(default: on with --unload). The home pose is read from the observation schema "
+                        "(home_positions); when armd does not publish it, the start pose is used")
     a = p.parse_args(argv)
+    if a.return_home is None:
+        a.return_home = a.unload
+    if not 0 < a.approach_speed <= MAX_SPEED:
+        p.error(f"--approach-speed must be in (0, {MAX_SPEED}] rad/s")
     a.joints = sorted({int(x) - 1 for x in a.joints.split(",") if x.strip()})
     a.speeds = floats(a.speeds)
     if not a.joints or not all(0 <= j < ARM_JOINTS for j in a.joints):
@@ -432,26 +485,145 @@ def parse_args(argv):
     return a
 
 
+def fetch_schema(url: str, timeout: float = 5.0) -> dict | None:
+    """GET /api/v1/observation/schema; None when it cannot be read."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/api/v1/observation/schema", timeout=timeout) as r:
+            return json.loads(r.read())
+    except (OSError, ValueError):
+        return None
+
+
+def slow_jog(link, target, dof: int, speed: float, log=print) -> None:
+    """Jog to `target` (dof values) with duration = largest J1..J6 change / speed, at least
+    MIN_APPROACH_S. The vector length is checked before anything is sent."""
+    target = [float(x) for x in target]
+    if len(target) != dof:
+        raise SysidError(f"joint vector has {len(target)} values, armd expects {dof} (schema dof)")
+    current = link.obs["positions"]
+    delta = max((abs(t - c) for t, c in zip(target[:ARM_JOINTS], current[:ARM_JOINTS])), default=0.0)
+    duration = max(MIN_APPROACH_S, delta / speed)
+    log(f"jog to {np.round(target[:ARM_JOINTS], 3).tolist()} in {duration:.1f} s")
+    link.jog(target, duration)
+
+
+def armed(link) -> bool:
+    """Torque on and armd Armed or Moving (no fault, E-stop or other stop)."""
+    obs = link.obs or {}
+    state = obs.get("safety_state")
+    return bool(obs.get("is_torqued")) and not isinstance(state, dict) and state in ("Armed", "Moving")
+
+
+def finish(link, a, ret: list[float], home: list[float] | None, dof: int, log=print) -> None:
+    """End of a run, also after an error or abort: when the arm is torqued and armd Armed /
+    Moving, jog slowly back to `ret`; with --return-home (and --unload) on to `home`; with
+    --unload, unload. Otherwise nothing is moved."""
+    if not armed(link):
+        obs = link.obs or {}
+        log(f"not moving the arm: torque {'on' if obs.get('is_torqued') else 'off'}, safety state {obs.get('safety_state')}")
+        return
+    deadline = time.time() + 2.0  # a stopped servo stream brakes first (Moving)
+    while link.obs.get("safety_state") != "Armed" and time.time() < deadline:
+        time.sleep(0.05)
+    slow_jog(link, ret, dof, a.approach_speed, log)
+    if a.unload:
+        if a.return_home and home is not None:
+            slow_jog(link, home, dof, a.approach_speed, log)
+        ack = link.command("/api/v1/motion/unload", {})
+        if ack.get("action_id"):
+            link.wait_action(ack["action_id"], 60)
+
+
+def write_results(a, out_dir: Path, link, segments: list[Segment], cfg: SweepConfig, start: list[float],
+                  aborted: str | None) -> dict:
+    """Fit the joints whose sweeps finished, write report.json and samples.json."""
+    done = finished_joints(segments, cfg)
+    fits, th, plots, data, errors = {}, {}, [], None, {}
+    if done and link.samples:
+        data = samples_array(link.samples)
+        if data["residual_source"] != "residual_torques":
+            print("warning: armd reports no residual_torques (no gravity model); fitting raw torques", file=sys.stderr)
+        for j in done:
+            try:
+                fits[j] = fit_joint(j, data, segments, a.amplitude, start[j], a.accel)
+            except SysidError as e:
+                errors[j] = str(e)
+        th = thresholds(fits, data, start, a.safety_factor, a.threshold_floor)
+        plots = plot(fits, data, start, out_dir)
+    report = {
+        "tool": "rebot-sysid", "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "armd_url": a.url,
+        "aborted": aborted,
+        "joints_requested": [j + 1 for j in cfg.joints], "joints_finished": [j + 1 for j in done],
+        "start_pose_rad": start[:ARM_JOINTS], "amplitude_rad": a.amplitude, "speeds_rad_s": a.speeds,
+        "cycles": a.cycles, "accel_rad_s2": a.accel, "abort_nm": a.abort_nm,
+        "residual_source": data["residual_source"] if data else None,
+        "samples": len(link.samples),
+        "model": "r = coulomb_nm * sign(v) + viscous_nm_s_rad * v + offset_nm + position_slope_nm_rad * (q - q_start)",
+        "threshold_basis": "max |r - coulomb_only fit| x factor (Coulomb + residual spread, no viscous term)",
+        "joints": [{**{k: v for k, v in fits[j].items() if not k.startswith("_")}, "collision": th[j]} for j in done if j in fits],
+        "fit_errors": {f"J{j + 1}": e for j, e in errors.items()},
+        "plots": plots,
+    }
+    (out_dir / "report.json").write_text(json.dumps(report, indent=2))
+    (out_dir / "samples.json").write_text(json.dumps({"aborted": aborted, "segments": [s.__dict__ for s in segments],
+                                                      "samples": link.samples}))
+    if fits:
+        print(f"\n{'joint':>5} {'Fc N·m':>8} {'Fv N·m·s/rad':>13} {'offset':>8} {'Fc+':>7} {'Fc-':>7} {'rmse':>6} {'n':>5} {'threshold':>10}")
+        for j, f in fits.items():
+            print(f"J{j + 1:>4} {f['coulomb_nm']:8.4f} {f['viscous_nm_s_rad']:13.4f}{'' if f['viscous_reliable'] else '?'} "
+                  f"{f['offset_nm']:8.4f} {f['positive']['coulomb_nm']:7.4f} {f['negative']['coulomb_nm']:7.4f} "
+                  f"{f['rmse_nm']:6.4f} {f['samples']:5d} {th[j]['suggested_threshold_nm']:10.3f}")
+        if not all(f["viscous_reliable"] for f in fits.values()):
+            print("?: Fv < 0, viscous fit unreliable")
+        print(f"\nsuggested collision thresholds (N·m, max |residual - Coulomb-only fit| x {a.safety_factor}): "
+              f"{[round(th[j]['suggested_threshold_nm'], 3) for j in fits]}")
+    if aborted:
+        print(f"aborted: {aborted}; joints finished and fitted: {[j + 1 for j in fits]}")
+    print(f"report: {out_dir / 'report.json'}")
+    return report
+
+
 def main(argv: list[str] | None = None) -> dict:
+    """Run the identification. After an error or abort the joints already finished are
+    fitted and written (report `aborted`), the arm is brought back (see finish) and the
+    error is raised again."""
     a = parse_args(argv)
     if not a.at_arm:
         sys.exit("rebot-sysid moves the arm. Run it only with a person at the arm and the e-stop in reach, "
                  "and pass --i-am-at-the-arm.")
     out_dir = Path(a.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    schema = fetch_schema(a.url) or {}
     link = ArmdLink(a.url)
+    cfg = SweepConfig(a.joints, a.amplitude, a.speeds, a.cycles, a.accel, a.abort_nm)
+    segments: list[Segment] = []
+    start: list[float] | None = None
+    ret: list[float] | None = None
+    home = None
+    dof: int | None = None
+    swept = False
     try:
         obs = link.obs
+        dof = int(schema.get("dof") or len(obs["positions"]))
+        if len(obs["positions"]) != dof:
+            raise SysidError(f"observation has {len(obs['positions'])} joints, schema dof {dof}")
+        current = list(obs["positions"])
+        if isinstance(schema.get("home_positions"), list):
+            home = list(schema["home_positions"])
+            if len(home) != dof:
+                raise SysidError(f"schema home_positions has {len(home)} values, dof {dof}")
+            home[ARM_JOINTS:] = current[ARM_JOINTS:]  # the gripper is not moved
         if not obs.get("is_torqued"):
             if not a.enable:
                 raise SysidError("torque is off: enable it in the cockpit or pass --enable")
             link.command("/api/v1/torque", {"enable": True})
             time.sleep(0.3)
-        current = list(link.obs["positions"])
         start = list(current)
         if a.pose is not None:
             start[:ARM_JOINTS] = a.pose
-        cfg = SweepConfig(a.joints, a.amplitude, a.speeds, a.cycles, a.accel, a.abort_nm)
+        if home is None:
+            home = list(start)
         per_joint = sum(4 * a.amplitude * a.cycles / v + 2 * a.amplitude / v + 0.5 for v in a.speeds)
         print(f"start pose (rad): {np.round(start[:ARM_JOINTS], 3).tolist()}")
         for j in a.joints:
@@ -461,41 +633,31 @@ def main(argv: list[str] | None = None) -> dict:
         if not a.yes and input("move the arm? type 'yes': ").strip() != "yes":
             raise SysidError("cancelled")
         if a.pose is not None:
-            link.jog(start)
+            ret = list(current)  # an error during the approach returns to where the arm was
+            slow_jog(link, start, dof, a.approach_speed)
             time.sleep(0.5)
         start = list(link.obs["positions"])  # sweep around where the arm actually is
-        segments = run_sweeps(link, start, cfg)
-        link.jog(start)
-        data = samples_array(link.samples)
-        if data["residual_source"] != "residual_torques":
-            print("warning: armd reports no residual_torques (no gravity model); fitting raw torques", file=sys.stderr)
-        fits = {j: fit_joint(j, data, segments, a.amplitude, start[j], a.accel) for j in a.joints}
-        th = thresholds(fits, data, start, a.safety_factor, a.threshold_floor)
-        plots = plot(fits, data, start, out_dir)
-        report = {
-            "tool": "rebot-sysid", "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "armd_url": a.url,
-            "start_pose_rad": start[:ARM_JOINTS], "amplitude_rad": a.amplitude, "speeds_rad_s": a.speeds,
-            "cycles": a.cycles, "accel_rad_s2": a.accel, "residual_source": data["residual_source"],
-            "samples": len(link.samples),
-            "model": "r = coulomb_nm * sign(v) + viscous_nm_s_rad * v + offset_nm + position_slope_nm_rad * (q - q_start)",
-            "joints": [{**{k: v for k, v in fits[j].items() if not k.startswith("_")}, "collision": th[j]} for j in a.joints],
-            "plots": plots,
-        }
-        (out_dir / "report.json").write_text(json.dumps(report, indent=2))
-        (out_dir / "samples.json").write_text(json.dumps({"segments": [s.__dict__ for s in segments], "samples": link.samples}))
-        print(f"\n{'joint':>5} {'Fc N·m':>8} {'Fv N·m·s/rad':>13} {'offset':>8} {'Fc+':>7} {'Fc-':>7} {'rmse':>6} {'n':>5} {'threshold':>10}")
-        for j in a.joints:
-            f = fits[j]
-            print(f"J{j + 1:>4} {f['coulomb_nm']:8.4f} {f['viscous_nm_s_rad']:13.4f} {f['offset_nm']:8.4f} "
-                  f"{f['positive']['coulomb_nm']:7.4f} {f['negative']['coulomb_nm']:7.4f} {f['rmse_nm']:6.4f} "
-                  f"{f['samples']:5d} {th[j]['suggested_threshold_nm']:10.3f}")
-        print(f"\nsuggested collision thresholds (N·m, max |residual - fit| x {a.safety_factor}): "
-              f"{[round(th[j]['suggested_threshold_nm'], 3) for j in a.joints]}")
-        print(f"report: {out_dir / 'report.json'}")
-        if a.unload:
-            ack = link.command("/api/v1/motion/unload", {})
-            if ack.get("action_id"):
-                link.wait_action(ack["action_id"], 60)
+        ret = list(start)
+        swept = True
+        run_sweeps(link, start, cfg, segments=segments)
+    except BaseException as e:
+        link.stop()
+        aborted = f"{type(e).__name__}: {e}" if not isinstance(e, SysidError) else str(e)
+        try:
+            if swept:
+                write_results(a, out_dir, link, segments, cfg, start, aborted)
+        except Exception as we:  # never mask the original error
+            print(f"rebot-sysid: writing the partial results failed: {we}", file=sys.stderr)
+        try:
+            if ret is not None and dof is not None:
+                finish(link, a, ret, home, dof, log=lambda m: print(f"recovery: {m}", file=sys.stderr))
+        except BaseException as fe:
+            print(f"rebot-sysid: recovery failed: {fe}", file=sys.stderr)
+        link.close()
+        raise
+    try:
+        report = write_results(a, out_dir, link, segments, cfg, start, None)
+        finish(link, a, ret, home, dof)
         return report
     except BaseException:
         link.stop()

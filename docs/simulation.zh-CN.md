@@ -103,12 +103,12 @@ armd 侧（`src/sim_driver.rs`）：后台线程把状态收进缓存，控制�
 流程：
 
 1. 获取控制租约；不带 `--i-am-at-the-arm` 时拒绝启动；运动前要求输入 `yes`（`--yes` 跳过）。未上使能时拒绝运行，除非带 `--enable`。
-2. 可选：先 jog 到 `--pose`（J1..J6，rad）；否则以当前姿态为中心。
+2. 可选：先 jog 到 `--pose`（J1..J6，rad）；否则以当前姿态为中心。该 jog、回起始姿态和回 home 的 jog 时长 = J1..J6 最大变化量 / `--approach-speed`（默认 0.1 rad/s），至少 3 s。每个关节向量在发送前按 schema 的 `dof` 检查长度。
 3. 对 `--joints` 中的每个关节（其余关节保持不动）：以 50 Hz servo 流做梯形往复扫动，幅度 ±`--amplitude`（默认 0.15 rad，上限 0.35），速度依次取 `--speeds`（默认 0.1、0.2、0.3 rad/s，上限 0.6；至少两档，区分库仑与粘滞项需要），每档 `--cycles`（默认 2）个来回，换向加速度 `--accel`（默认 1.0 rad/s²）。armd 对每一帧检查关节限位和工作空间。
-4. 从观测（`obs_hz=50`）记录 q、dq、力矩和 `residual_torques`（力矩 − armd 重力模型）。以下情况发送 `motion/stop` 并中止：某关节残差相对开始时变化超过 `--abort-nm`（默认 3、3、3、1、1、1 N·m）、任何故障 / 急停 / 租约丢失、Ctrl-C、servo 被拒。
+4. 从观测（`obs_hz=50`）记录 q、dq、力矩和 `residual_torques`（力矩 − armd 重力模型）。以下情况发送 `motion/stop` 并中止：某关节残差相对开始时变化超过 `--abort-nm`（默认 4、4、4、2.5、2.5、2.5 N·m；真机上 J4..J6 取 1.0 时被 J4 的正常摩擦波动触发）、任何故障 / 急停 / 租约丢失、Ctrl-C、servo 被拒。中止或出错后，已完成扫动的关节照常拟合并写出结果（`report.json` / `samples.json` 的 `aborted` 字段为原因，`joints_finished` 为已完成的关节）；之后若机械臂已上使能且 armd 处于 Armed 或 Moving，以慢速 jog 回到起始姿态（错误发生在前往起始姿态的 jog 中时，回到该 jog 之前的姿态），带 `--unload` 时与正常结束一样回 home 并下使能。其他状态下不移动机械臂。随后工具以该错误退出。
 5. 回到起始姿态，在匀速样本（速度与扫动速度相差 10 % 以内，位置避开换向加减速段：|q − q_start| ≤ amplitude − v²/(2·accel) − 0.15 s · v − 0.01 rad，使加速度力矩不进入拟合）上拟合。速度由 ±2 个样本（80 ms）的位置差分得到，不用上报的速度（见采样相位一节）：
-   `r = Fc · sign(v) + Fv · v + offset + kq · (q − q_start)`；`kq` 吸收重力模型在扫动范围内随位置变化的误差。另按方向分别拟合 `r = a + b · v`（非对称摩擦）。
-6. 每个关节的碰撞阈值建议 = 所有记录样本（全部扫动，含换向段以及该关节静止、其他关节运动的时段）上 |r − 拟合值(v, q)| 的最大值 × `--safety-factor`（默认 1.5），且不低于 `--threshold-floor`（0.1 N·m）。
+   `r = Fc · sign(v) + Fv · v + offset + kq · (q − q_start)`；`kq` 吸收重力模型在扫动范围内随位置变化的误差。另按方向分别拟合 `r = a + b · v`（非对称摩擦），并做仅库仑项的拟合 `r = Fc · sign(v) + offset + kq · (q − q_start)`（`coulomb_only`）。Fv < 0 的拟合（真机上出现过）标记为 `viscous_reliable: false` 并附 `viscous_note`。
+6. 每个关节的碰撞阈值建议 = 所有记录样本（全部扫动，含换向段以及该关节静止、其他关节运动的时段）上 |r − 仅库仑项拟合值(v, q)| 的最大值（库仑摩擦加残差离散度，不含粘滞项；`collision.basis: coulomb_only`） × `--safety-factor`（默认 1.5），且不低于 `--threshold-floor`（0.1 N·m）。
 
 输出目录 `--out`（默认 `sysid-out/`）：`report.json`（每个关节的 `coulomb_nm`、`viscous_nm_s_rad`、`offset_nm`、`position_slope_nm_rad`、`rmse_nm`、`positive` / `negative` 分方向拟合、`collision.max_abs_deviation_nm`、`collision.p99_abs_deviation_nm`、`collision.suggested_threshold_nm`）、`samples.json`（原始观测和各扫动时间窗）、`friction_J<n>.png`（残差-速度散点及拟合线）。没有重力模型时 armd 不提供 `residual_torques`，工具改为拟合原始力矩并给出警告。
 
@@ -122,7 +122,8 @@ uv run rebot-sysid --url http://<recamera-ip>:8765 --i-am-at-the-arm \
 
 - 整个过程（默认参数下每个关节约 30 s 运动）必须有人守在机械臂旁，急停在手边。Ctrl-C 停止运动，armd 保持当前姿态。
 - `--pose` 要让每个关节距离限位至少 `--amplitude`，工具远离桌面和扫动范围内的物体；J1 会让整条臂摆动 ±amplitude。先用 `--joints 6` 和默认参数跑一次，看过曲线再扩大范围。
-- 先关闭 cockpit 等其他客户端：工具需要租约。结束时回到起始姿态并释放租约；之后 armd 保持姿态，并像其他已上使能但无租约持有者的情况一样锁存 `WatchdogTimeout` 故障（在 cockpit 中清除）。带 `--unload` 时改为停靠并下使能。
+- 先关闭 cockpit 等其他客户端：工具需要租约。结束时回到起始姿态并释放租约；之后 armd 保持姿态，并像其他已上使能但无租约持有者的情况一样锁存 `WatchdogTimeout` 故障（在 cockpit 中清除）。带 `--unload` 时改为停靠并下使能；此时 `--return-home`（带 `--unload` 时默认开启，`--no-return-home` 关闭）先慢速 jog 到 profile 的 home 姿态，使停靠只是小幅移动。home 姿态取自 `GET /api/v1/observation/schema` 的 `home_positions`；armd 目前不公开该字段，因此回 home 的 jog 目标为起始姿态（不移动），停靠从该处以 armd 的停靠速度执行。回 home 的 jog 不移动夹爪。
+- 速度：真机上 J1..J3 不超过 0.08 rad/s（例如 `--joints 1,2,3 --speeds 0.04,0.08`，再用默认参数跑 `--joints 4,5,6`）。
 - 电机温度升高后摩擦会变小：`samples.json` 中有电机温度；若阈值用于长时间运行，应在机械臂运行一段时间后重复辨识。
 - 可用报告中的数值更新仿真器：`rebot-sim --damping <J1..J6 粘滞项> --frictionloss <J1..J6 库仑项>`。
 
@@ -138,16 +139,16 @@ armd 以 50 Hz 运行：每个周期先读电机反馈，再发送下一个位�
 
 `tests/test_sysid.py`（标记 `slow`）以 `rebot-sim --torque-report mean` 启动仿真器，阻尼设为 1.5、1.2、1.5、0.3、0.25、0.3 N·m·s/rad，摩擦设为 0.3、0.4、0.3、0.1、0.12、0.1 N·m，用默认参数对 `armd --follower sim` 运行 `rebot-sysid --pose 0,-1.6,-1.2,0.9,0,0`，要求每个拟合的 Fc、Fv 与设定值相差不超过 15 %。
 
-结果（spark-6124，2026-11-11，3 档速度 × 2 个来回，±0.15 rad，测试用时 210 s）：
+结果（spark-6124，2026-11-11，3 档速度 × 2 个来回，±0.15 rad，测试用时 230 s；阈值按仅库仑项的拟合计算）：
 
 | 关节 | Fc 拟合 / 设定（N·m） | 误差 | Fv 拟合 / 设定（N·m·s/rad） | 误差 | 建议阈值（N·m） |
 |---|---|---|---|---|---|
-| J1 | 0.293 / 0.3 | −2.4 % | 1.583 / 1.5 | +5.5 % | 1.617 |
-| J2 | 0.400 / 0.4 | 0.0 % | 1.270 / 1.2 | +5.8 % | 0.709 |
-| J3 | 0.300 / 0.3 | 0.0 % | 1.471 / 1.5 | −1.9 % | 0.527 |
-| J4 | 0.100 / 0.1 | +0.1 % | 0.277 / 0.3 | −7.6 % | 0.100 |
-| J5 | 0.120 / 0.12 | 0.0 % | 0.241 / 0.25 | −3.4 % | 0.187 |
-| J6 | 0.100 / 0.1 | +0.3 % | 0.296 / 0.3 | −1.5 % | 0.111 |
+| J1 | 0.303 / 0.3 | +1.0 % | 1.479 / 1.5 | −1.4 % | 0.742 |
+| J2 | 0.401 / 0.4 | +0.2 % | 1.269 / 1.2 | +5.7 % | 0.911 |
+| J3 | 0.302 / 0.3 | +0.5 % | 1.458 / 1.5 | −2.8 % | 0.765 |
+| J4 | 0.100 / 0.1 | +0.3 % | 0.276 / 0.3 | −8.0 % | 0.112 |
+| J5 | 0.120 / 0.12 | +0.2 % | 0.240 / 0.25 | −4.2 % | 0.119 |
+| J6 | 0.100 / 0.1 | 0.0 % | 0.300 / 0.3 | −0.2 % | 0.167 |
 
 阈值包含换向时的加速度力矩（J1 以 1 rad/s² 带动伸展的整条臂），这属于正常运动的一部分；降低 `--accel` 可降低阈值。
 

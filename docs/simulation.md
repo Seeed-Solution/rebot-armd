@@ -103,12 +103,12 @@ armd side (`src/sim_driver.rs`): a background thread receives state into a cache
 Procedure:
 
 1. Takes the control lease, refuses to start unless `--i-am-at-the-arm` is given, and asks for `yes` before moving (`--yes` skips the prompt). Refuses when torque is off unless `--enable` is given.
-2. Optionally jogs to `--pose` (J1..J6, rad); otherwise sweeps around the current pose.
+2. Optionally jogs to `--pose` (J1..J6, rad); otherwise sweeps around the current pose. This jog, the return to the start pose and the home jog take duration = largest J1..J6 change / `--approach-speed` (default 0.1 rad/s), at least 3 s. Every joint vector is checked against the schema `dof` before it is sent.
 3. For each joint in `--joints`, with the other joints held: servo stream at 50 Hz, trapezoidal back-and-forth sweep ±`--amplitude` (default 0.15 rad, max 0.35) at each of `--speeds` (default 0.1, 0.2, 0.3 rad/s, max 0.6; at least two speeds, needed to separate Coulomb from viscous), `--cycles` (default 2) per speed, turnarounds at `--accel` (default 1.0 rad/s²). armd checks joint limits and the workspace on every frame.
-4. Records q, dq, torque and `residual_torques` (torque − armd gravity model) from the observations (`obs_hz=50`). Aborts with `motion/stop` when a residual moves more than `--abort-nm` (default 3, 3, 3, 1, 1, 1 N·m) from its value at the start, on any fault / E-stop / lease loss, on Ctrl-C, and on any servo rejection.
+4. Records q, dq, torque and `residual_torques` (torque − armd gravity model) from the observations (`obs_hz=50`). Aborts with `motion/stop` when a residual moves more than `--abort-nm` (default 3, 3, 3, 1, 1, 1 N·m) from its value at the start (default 4, 4, 4, 2.5, 2.5, 2.5 N·m; 1.0 on J4..J6 tripped on normal J4 friction swings on the real arm), on any fault / E-stop / lease loss, on Ctrl-C, and on any servo rejection. After an abort or error the joints whose sweeps had finished are fitted and written (`report.json` / `samples.json` field `aborted` holds the reason, `joints_finished` the joints); then, when the arm is torqued and armd is Armed or Moving, it jogs slowly back to the start pose (to the pose before the approach when the error came during the approach jog) and, with `--unload`, goes home and unloads as at the end of a run. In any other state the arm is not moved. The tool then exits with the error.
 5. Returns to the start pose and fits, on the constant-velocity samples (velocity within 10 % of the sweep speed, position clear of the turnaround ramps: |q − q_start| ≤ amplitude − v²/(2·accel) − 0.15 s · v − 0.01 rad, so no acceleration torque enters). The velocity is taken from position differences over ±2 samples (80 ms), not from the reported velocity (see the sampling-phase section):
-   `r = Fc · sign(v) + Fv · v + offset + kq · (q − q_start)`; `kq` absorbs gravity-model error that varies over the sweep. Per direction it also fits `r = a + b · v` (asymmetric friction).
-6. Suggested collision threshold per joint = max |r − fit(v, q)| over every recorded sample (all sweeps, including turnarounds and the time the joint stands still while others move) × `--safety-factor` (default 1.5), at least `--threshold-floor` (0.1 N·m).
+   `r = Fc · sign(v) + Fv · v + offset + kq · (q − q_start)`; `kq` absorbs gravity-model error that varies over the sweep. Per direction it also fits `r = a + b · v` (asymmetric friction), and a Coulomb-only fit `r = Fc · sign(v) + offset + kq · (q − q_start)` (`coulomb_only`). A fit with Fv < 0 (seen on the real arm) is marked `viscous_reliable: false` with a `viscous_note`.
+6. Suggested collision threshold per joint = max |r − Coulomb-only fit(v, q)| over every recorded sample (Coulomb friction plus the residual spread, no viscous term; `collision.basis: coulomb_only`) (all sweeps, including turnarounds and the time the joint stands still while others move) × `--safety-factor` (default 1.5), at least `--threshold-floor` (0.1 N·m).
 
 Output in `--out` (default `sysid-out/`): `report.json` (per joint `coulomb_nm`, `viscous_nm_s_rad`, `offset_nm`, `position_slope_nm_rad`, `rmse_nm`, `positive` / `negative` direction fits, `collision.max_abs_deviation_nm`, `collision.p99_abs_deviation_nm`, `collision.suggested_threshold_nm`), `samples.json` (raw observations and sweep windows), `friction_J<n>.png` (residual vs velocity with the fit). Without a gravity model armd reports no `residual_torques`; the tool then fits raw torques and warns.
 
@@ -122,7 +122,8 @@ uv run rebot-sysid --url http://<recamera-ip>:8765 --i-am-at-the-arm \
 
 - A person stays at the arm with the e-stop in reach for the whole run (about 30 s of motion per joint with the defaults). Ctrl-C stops the motion; armd keeps holding the pose.
 - Choose `--pose` with every joint at least `--amplitude` away from its limit and the tool clear of the table and of anything the sweep can reach; J1 swings the whole arm by ±amplitude. Start with `--joints 6` and the defaults, look at the plot, then widen.
-- Close the cockpit or any other client first: the tool needs the lease. At the end it returns to the start pose and releases the lease; armd then holds and latches the usual `WatchdogTimeout` fault for a torqued arm without a lease owner (clear it in the cockpit). `--unload` parks and turns torque off instead.
+- Close the cockpit or any other client first: the tool needs the lease. At the end it returns to the start pose and releases the lease; armd then holds and latches the usual `WatchdogTimeout` fault for a torqued arm without a lease owner (clear it in the cockpit). `--unload` parks and turns torque off instead; with it `--return-home` (default on with `--unload`, `--no-return-home` turns it off) first jogs slowly to the profile home pose so that the park is a small move. The home pose is read from `home_positions` in `GET /api/v1/observation/schema`; armd does not publish that field today, so the home jog goes to the start pose (no move) and the park runs from there at armd's park speed. The gripper is not moved by the home jog.
+- Speeds: use at most 0.08 rad/s for J1..J3 on the real arm (for example `--joints 1,2,3 --speeds 0.04,0.08`, then `--joints 4,5,6` with the defaults).
 - Warm motors have lower friction than cold ones: note the motor temperatures (in `samples.json`) and repeat after the arm has run for a while if the thresholds are meant for continuous operation.
 - The simulator values can be updated from the report: `rebot-sim --damping <viscous J1..J6> --frictionloss <coulomb J1..J6>`.
 
@@ -138,16 +139,16 @@ On the real arm the Damiao reply to each command carries the torque at that mome
 
 `tests/test_sysid.py` (marker `slow`) starts `rebot-sim --torque-report mean` with damping 1.5, 1.2, 1.5, 0.3, 0.25, 0.3 N·m·s/rad and friction loss 0.3, 0.4, 0.3, 0.1, 0.12, 0.1 N·m, runs `rebot-sysid --pose 0,-1.6,-1.2,0.9,0,0` with the defaults against `armd --follower sim`, and requires every fitted Fc and Fv within 15 % of the set value.
 
-Result (spark-6124, 2026-11-11, 3 speeds × 2 cycles, ±0.15 rad, 210 s test):
+Result (spark-6124, 2026-11-11, 3 speeds × 2 cycles, ±0.15 rad, 230 s test; thresholds on the Coulomb-only basis):
 
 | joint | Fc fitted / set (N·m) | error | Fv fitted / set (N·m·s/rad) | error | suggested threshold (N·m) |
 |---|---|---|---|---|---|
-| J1 | 0.293 / 0.3 | −2.4 % | 1.583 / 1.5 | +5.5 % | 1.617 |
-| J2 | 0.400 / 0.4 | 0.0 % | 1.270 / 1.2 | +5.8 % | 0.709 |
-| J3 | 0.300 / 0.3 | 0.0 % | 1.471 / 1.5 | −1.9 % | 0.527 |
-| J4 | 0.100 / 0.1 | +0.1 % | 0.277 / 0.3 | −7.6 % | 0.100 |
-| J5 | 0.120 / 0.12 | 0.0 % | 0.241 / 0.25 | −3.4 % | 0.187 |
-| J6 | 0.100 / 0.1 | +0.3 % | 0.296 / 0.3 | −1.5 % | 0.111 |
+| J1 | 0.303 / 0.3 | +1.0 % | 1.479 / 1.5 | −1.4 % | 0.742 |
+| J2 | 0.401 / 0.4 | +0.2 % | 1.269 / 1.2 | +5.7 % | 0.911 |
+| J3 | 0.302 / 0.3 | +0.5 % | 1.458 / 1.5 | −2.8 % | 0.765 |
+| J4 | 0.100 / 0.1 | +0.3 % | 0.276 / 0.3 | −8.0 % | 0.112 |
+| J5 | 0.120 / 0.12 | +0.2 % | 0.240 / 0.25 | −4.2 % | 0.119 |
+| J6 | 0.100 / 0.1 | 0.0 % | 0.300 / 0.3 | −0.2 % | 0.167 |
 
 The thresholds include the turnaround acceleration torque (J1 swings the extended arm at 1 rad/s²), since that is part of normal motion; a lower `--accel` lowers them.
 
