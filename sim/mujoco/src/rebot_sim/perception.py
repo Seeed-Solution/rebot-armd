@@ -496,24 +496,35 @@ class SharedState:
             except FileNotFoundError:
                 pass
 
+    LOCK_TIMEOUT_S = 0.2  # a process that died holding the lock never releases it
+
     def write(self, data) -> None:
+        """Publish `data`; raises TimeoutError when the lock is not had within LOCK_TIMEOUT_S."""
         a = self.arr
-        with self.lock:
+        if not self.lock.acquire(timeout=self.LOCK_TIMEOUT_S):
+            raise TimeoutError("shared-state lock timeout")
+        try:
             a[0] += 1
             a[1] = data.time
             a[4] += 1
             a[HDR:HDR + self.nq] = data.qpos
             a[HDR + self.nq:] = data.qvel
+        finally:
+            self.lock.release()
 
     def read(self, data) -> int | None:
         """Copy the state into `data`; returns its physics step, or None (and leaves `data`
-        alone) when nothing was written yet."""
+        alone) when nothing was written yet or the lock was not had within LOCK_TIMEOUT_S."""
         a = self.arr
-        with self.lock:
+        if not self.lock.acquire(timeout=self.LOCK_TIMEOUT_S):
+            return None
+        try:
             if a[0] == 0:
                 return None
             data.qpos[:], data.qvel[:], data.time = a[HDR:HDR + self.nq], a[HDR + self.nq:], a[1]
             return int(a[4])
+        finally:
+            self.lock.release()
 
 
 class SimLink:

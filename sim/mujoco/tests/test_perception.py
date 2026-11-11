@@ -328,13 +328,15 @@ def test_shared_state_is_consistent_across_processes():
                 assert (data.qpos == data.time).all() and (data.qvel == data.time).all()
         writer.join()
         assert writer.exitcode == 0 and reads > 0
-        done = threading.Event()
-        with st.lock:
-            t = threading.Thread(target=lambda: (st.read(data), done.set()))
+        got = []
+        with st.lock:  # a read waits for the lock, at most LOCK_TIMEOUT_S, then gives up
+            t = threading.Thread(target=lambda: got.append(st.read(data)))
             t.start()
-            assert not done.wait(0.2), "read did not wait for the lock"
-        t.join(2)
-        assert done.is_set() and data.time == 200_000
+            t.join(0.1)
+            assert t.is_alive(), "read did not wait for the lock"
+            t.join(2)
+            assert got == [None]
+        assert st.read(data) == 200_000 and data.time == 200_000
     finally:
         st.close()
 
@@ -400,3 +402,31 @@ def test_a_bad_segmentation_frame_is_skipped_and_ten_in_a_row_fail_the_camera():
             rig.detect()
     finally:
         st.close()
+
+
+def _hold_lock(lock, held) -> None:
+    import time
+
+    lock.acquire()
+    held.set()
+    time.sleep(60)
+
+
+def test_physics_stops_when_the_camera_dies_holding_the_shared_state_lock(sim):
+    import os
+    import signal
+    import time
+
+    from rebot_sim.perception import SharedState
+
+    ctx = mp.get_context("spawn")
+    sim.shared = SharedState(sim.model.nq, sim.model.nv, lock=ctx.Lock())
+    held = ctx.Event()
+    holder = ctx.Process(target=_hold_lock, args=(sim.shared.lock, held))
+    holder.start()
+    assert held.wait(30)
+    os.kill(holder.pid, signal.SIGKILL)  # dies with the lock held
+    holder.join(5)
+    t0 = time.perf_counter()
+    sim.run(duration=5)
+    assert time.perf_counter() - t0 < 1.0 and sim.camera_error == "shared-state lock timeout"

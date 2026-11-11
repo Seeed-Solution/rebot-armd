@@ -287,8 +287,11 @@ class Simulator:
                 self._resets.clear()
             self.motors.apply()
             mujoco.mj_step(self.model, self.data)
-        if self.shared is not None:
-            self.shared.write(self.data)
+        if self.shared is not None and self.camera_error is None:
+            try:
+                self.shared.write(self.data)
+            except TimeoutError:  # the camera process died holding the lock
+                self.camera_error = "shared-state lock timeout"
         if self.torque_report == "mean":
             self.tau_hist.append(self.motors.reported_torque())
             self.steps_since_cmd += 1
@@ -417,11 +420,11 @@ class Simulator:
             self.poll_socket()
             self.step()
             steps += 1
+            if self.camera_error:
+                print(f"rebot-sim: {self.camera_error}", file=sys.stderr, flush=True)
+                return
             if steps % 10 == 0 and self.cam_conn is not None:
-                self.service_camera()
-                if self.camera_error:
-                    print(f"rebot-sim: {self.camera_error}", file=sys.stderr, flush=True)
-                    return
+                self.service_camera()  # a closed pipe sets camera_error: the loop ends after the next step
             if steps % 100 == 0 and self.cam_proc is not None and not self.cam_proc.is_alive():
                 self.camera_error = f"camera process exited (code {self.cam_proc.exitcode})"
                 print(f"rebot-sim: {self.camera_error}", file=sys.stderr, flush=True)
