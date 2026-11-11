@@ -9,8 +9,7 @@ use armd::kinematics;
 use armd::model::{ArmConfig, KeepoutBox};
 use armd::motion::{plan_cartesian, resolve_goal, GoalSpec, MotionError, Speed};
 use armd::{ArmError, ArmSupervisor, SupervisorInner};
-
-const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
+use common::{sim_at, INSPECT};
 
 fn tcp(q: &[f32]) -> [f64; 3] { kinematics::fk(&kinematics::q6(q)).p }
 
@@ -23,16 +22,6 @@ fn with_boxes(boxes: Vec<KeepoutBox>) -> ArmConfig {
     let mut config = ArmConfig::rebot_dm();
     config.workspace.as_mut().unwrap().keepout_boxes = boxes;
     config
-}
-
-fn sim_at(config: ArmConfig, q: &[f32; 7]) -> SupervisorInner {
-    let mut inner = SupervisorInner::new(config);
-    inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
-    inner.commanded_positions = q.to_vec();
-    inner.measured_positions = q.to_vec();
-    inner.target_positions = q.to_vec();
-    inner
 }
 
 #[test]

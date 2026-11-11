@@ -9,7 +9,21 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use armd::{create_router, ArmConfig, ArmSupervisor};
+use armd::{create_router, ArmConfig, ArmSupervisor, SupervisorInner};
+
+/// Inspection pose used across the motion tests (J7 closed).
+pub const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
+
+/// Torqued, lease-free supervisor holding `q` (commanded = measured = target).
+pub fn sim_at(config: ArmConfig, q: &[f32; 7]) -> SupervisorInner {
+    let mut inner = SupervisorInner::new(config);
+    inner.lease_enabled = false;
+    inner.set_torque(true).unwrap();
+    inner.commanded_positions = q.to_vec();
+    inner.measured_positions = q.to_vec();
+    inner.target_positions = q.to_vec();
+    inner
+}
 
 pub type TestSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 

@@ -9,8 +9,8 @@ use serde_json::json;
 use armd::model::{ArmConfig, KeepoutBox};
 use armd::poses::{NamedPose, PoseList};
 use armd::{kinematics, ArmSupervisor};
+use common::INSPECT;
 
-const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
 const READY: [f32; 7] = [0.3, -0.9, -1.3, 1.2, 0.1, 1.2, -1.0];
 
 async fn wait_action(ws: &mut common::TestSocket, supervisor: &ArmSupervisor, generation: u64, epoch: u64, id: u64) -> armd::motion::ActionStatus {

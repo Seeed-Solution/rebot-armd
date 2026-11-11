@@ -17,9 +17,9 @@ use armd::model::{ArmConfig, JointState};
 use armd::motion::{plan_cartesian, resolve_goal, GoalSpec, Speed};
 use armd::{ArmError, ArmSupervisor, FaultCode, SafetyState, SupervisorInner};
 use serde_json::json;
+use common::INSPECT;
 
 const DT: f64 = 0.02;
-const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
 
 #[derive(Default)]
 struct ArmState { q: [f32; 7], torqued: bool, extra: [f32; 6], mit: bool }

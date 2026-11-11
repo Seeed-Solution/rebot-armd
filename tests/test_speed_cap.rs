@@ -1,21 +1,12 @@
 //! Profile `speed_cap`: min() with request speeds and planned_max_velocity for planned motion.
 
+mod common;
+
 use armd::kinematics;
 use armd::model::{ArmConfig, ObservationSchema, SpeedCap};
 use armd::motion::{plan_cartesian, resolve_goal, GoalSpec, Speed};
 use armd::SupervisorInner;
-
-const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
-
-fn sim_at(config: ArmConfig, q: &[f32; 7]) -> SupervisorInner {
-    let mut inner = SupervisorInner::new(config);
-    inner.lease_enabled = false;
-    inner.set_torque(true).unwrap();
-    inner.commanded_positions = q.to_vec();
-    inner.measured_positions = q.to_vec();
-    inner.target_positions = q.to_vec();
-    inner
-}
+use common::{sim_at, INSPECT};
 
 fn capped(cap: SpeedCap) -> ArmConfig {
     ArmConfig { speed_cap: Some(cap), ..ArmConfig::rebot_dm() }
