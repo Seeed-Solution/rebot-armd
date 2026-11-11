@@ -16,6 +16,13 @@
 # - SIGTERM: forwarded to the program's process group; SIGKILL to the group when the program
 #   is still running after 10 s. When the program has exited, what is left of its group is
 #   sent SIGKILL.
+# - Processes that left the group (setsid, daemonizing libraries): when the runner is root,
+#   after the program has exited (on its own or on stop) every process of $REBOT_APP_USER
+#   whose start time (/proc/<pid>/stat field 22) is at or after the program's is sent
+#   SIGKILL. This assumes that user runs nothing but the app: its other processes started
+#   while the app ran (a login shell of the same user, for example) are killed too, so give
+#   the app a user of its own. A runner that is not root runs the program as its own user and
+#   does not do this (it would hit the runner's own processes).
 # - Log: stdout and stderr of the program and the runner's own lines are appended to
 #   $REBOT_APP_LOG_DIR/app-<name>.log (default /userdata/rebot-teleop/logs). The size is
 #   checked before every start and every 30 s while the program runs; above 512 KiB the log is
@@ -114,6 +121,40 @@ check_user() {
     command -v python3 >/dev/null 2>&1 || { log "python3 not found; not starting"; return 1; }
 }
 
+# starttime <pid>: start time of <pid> in clock ticks since boot (field 22 of
+# /proc/<pid>/stat; the fields after the command name, which can hold spaces and ")", start
+# at field 3)
+starttime() {
+    st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    st=${st##*) }
+    set -f
+    # shellcheck disable=SC2086
+    set -- $st
+    set +f
+    [ "$#" -ge 20 ] || return 1
+    shift 19
+    echo "$1"
+}
+
+# kill_user_leftovers: SIGKILL every process of RUN_USER started at or after the program
+# (child_start); only when the runner is root (see the header).
+kill_user_leftovers() {
+    [ "$(id -u)" -eq 0 ] && [ -n "$child_start" ] || return 0
+    for d in /proc/[0-9]*; do
+        p=${d#/proc/}
+        [ "$p" = "$$" ] && continue
+        u=""
+        while IFS= read -r line; do
+            case "$line" in Uid:*) set -f; set -- ${line#Uid:}; set +f; u=$1; break ;; esac
+        done < "$d/status" 2>/dev/null
+        [ "$u" = "$uid" ] || continue
+        st=$(starttime "$p") || continue
+        if [ "$st" -ge "$child_start" ]; then
+            kill -KILL "$p" 2>/dev/null && log "killed pid $p of $RUN_USER started after the program (outside its group)"
+        fi
+    done
+}
+
 # Wait until the program ($child) has exited; its status in rc (see rebot-vision-run).
 wait_child() {
     rc=0
@@ -164,6 +205,7 @@ main() {
     LOG=$LOG_DIR/app-$NAME.log
     STATE=$STATE_DIR/rebot-app-$NAME.state
     child=""
+    child_start=""
     killer=""
     sleeper=""
     total=0
@@ -224,6 +266,7 @@ main() {
         cd "$APP_DIR" || { log "cannot enter $APP_DIR"; write_state stopped; result=1; break; }
         $NICE python3 -I -S -c "$LAUNCH" "$RUN_USER" "$APP_PYTHONPATH" "$PYTHON" -u "$entry" >> "$LOG" 2>&1 < /dev/null &
         child=$!
+        child_start=$(starttime "$child")
         total=$((total + 1))
         # a SIGTERM between the fork and the line above found no child to forward to
         [ "$stopping" -eq 1 ] && on_term
@@ -232,6 +275,9 @@ main() {
         last_exit=$rc
         # processes the program left in its group
         kill -KILL "-$child" 2>/dev/null
+        # ... and processes it started that left the group
+        kill_user_leftovers
+        child_start=""
         [ -n "$killer" ] && { kill -TERM "$killer" 2>/dev/null; killer=""; }
         child=""
         if [ "$stopping" -eq 1 ]; then break; fi

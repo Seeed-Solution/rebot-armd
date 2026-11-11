@@ -59,6 +59,8 @@ run_suite() {
     SH=$1
     echo "== $SH"
     T=$(mktemp -d) || exit 1
+    # as root the program runs as nobody: it reads the apps and writes its marker files here
+    [ "$(id -u)" -eq 0 ] && chmod 1777 "$T"
 
     # 1. exit code 0 with the default restart policy (on-failure): runs once, then stops
     new_app clean 'print("hello from clean")'
@@ -212,6 +214,39 @@ sys.exit(4)"
     run_fg orphan
     OPID=$(cat "$T/orphan.child" 2>/dev/null)
     check "group: a child left by an exited program is killed" wait_for 3 sh -c "[ -n '$OPID' ] && ! kill -0 '$OPID'"
+
+    # 12b. root only: a child that calls setsid leaves the group; processes of the app user
+    # started after the program are killed on stop and after the program exits, an older
+    # process of that user is not
+    if [ "$(id -u)" -eq 0 ]; then
+        python3 -c 'import os, pwd, sys, time
+u = pwd.getpwnam(sys.argv[1]); os.setsid(); os.setgid(u.pw_gid); os.setuid(u.pw_uid)
+os.execvp("sleep", ["sleep", "60"])' "$APP_USER" &
+        OLDPID=$!
+        sleep 0.2
+        for mode in stop exit; do
+            new_app "escape$mode" "import subprocess, sys, time
+p = subprocess.Popen(['sleep', '60'], start_new_session=True)
+open('$T/escape.child', 'w').write(str(p.pid))
+print('escaped', flush=True)
+time.sleep(60 if '$mode' == 'stop' else 0.5)
+sys.exit(5)"
+            printf '%s\n' '{"restart": "never"}' > "$T/apps/escape$mode/app.json"
+            rm -f "$T/escape.child"
+            run_bg "escape$mode"
+            check "setsid ($mode): child started" wait_for 10 test -s "$T/escape.child"
+            EPID=$(cat "$T/escape.child" 2>/dev/null)
+            check "setsid ($mode): child is in another session" sh -c "[ \"\$(ps -o sid= -p $EPID | tr -d ' ')\" = $EPID ]"
+            [ "$mode" = stop ] && kill -TERM "$RPID"
+            check "setsid ($mode): runner exits" wait_for 8 sh -c "! kill -0 $RPID"
+            wait "$RPID" 2>/dev/null
+            check "setsid ($mode): the escaped child is gone" wait_for 3 sh -c "[ -n '$EPID' ] && ! kill -0 '$EPID'"
+        done
+        check "setsid: a process of the app user started before the app survives" kill -0 "$OLDPID"
+        kill "$OLDPID" 2>/dev/null; wait "$OLDPID" 2>/dev/null
+    else
+        echo "  skip setsid escape (needs root)"
+    fi
 
     rm -rf "$T"
 }

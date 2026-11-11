@@ -140,7 +140,7 @@ it after a crash and keeps its log. The runner is covered by host tests
 | Environment | `REBOT_HOST=127.0.0.1`, `PYTHONPATH=/usr/share/rebot-teleop/python:<app dir>` |
 | `app.json` (optional) | `{"entry": "main.py", "restart": "on-failure" \| "always" \| "never"}`; default `main.py`, `on-failure` |
 | Restart | exit code 0 ends the runner with `on-failure`; other exits restart after 1, 2, 4 ... 30 s (back to 1 s after a run longer than 60 s); 10 starts within 5 minutes end it with state `given_up` |
-| Stop | the program runs in its own session; SIGTERM to its process group, SIGKILL to the group after 10 s; processes left in the group when the program exits are killed |
+| Stop | the program runs in its own session; SIGTERM to its process group, SIGKILL to the group after 10 s; processes left in the group when the program exits are killed; then every process of the app user started at or after the program (also ones that left the group with `setsid`) is killed. This assumes the app user runs nothing else: a login shell of that user started while the app runs is killed too, so set `REBOT_APP_USER` to a user of its own when you log in as `recamera` |
 | Log | `/userdata/rebot-teleop/logs/app-<name>.log`; above 512 KiB (checked before each start and every 30 s) it is copied to `.1`, `.1` to `.2`, and truncated; bytes written during the copy can be lost |
 | State | `/tmp/rebot-app-<name>.state`: `state` (running, backoff, stopped, given_up), `pid`, `runner`, `starts`, `last_exit` |
 
@@ -162,7 +162,7 @@ reCamera 应用画廊一次只运行一个应用，摄像头为独占资源，�
 
 程序以非特权用户 `recamera` 运行（可用 `REBOT_APP_USER` 指定，不允许 root）；该用户不存在时不启动并记录日志。
 程序可读取应用目录与 `/userdata/rebot-teleop`，但不能写入其中由 root 拥有的 armd 状态文件。程序在独立会话中运行，
-停止时 SIGTERM 发送到整个进程组，10 秒后对进程组发送 SIGKILL；程序退出后遗留在进程组中的进程会被结束。
+停止时 SIGTERM 发送到整个进程组，10 秒后对进程组发送 SIGKILL；程序退出后遗留在进程组中的进程会被结束，随后该用户在程序启动之后启动的所有进程（包括用 `setsid` 离开进程组的进程）也会被结束。此规则假定该用户只运行这个程序：程序运行期间以该用户登录的 shell 也会被结束，因此以 `recamera` 登录设备时，应通过 `REBOT_APP_USER` 为程序指定单独的用户。
 
 | 项目 | 取值 |
 |---|---|
