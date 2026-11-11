@@ -919,9 +919,11 @@ impl Orchestrator {
         self.ctx.move_arm(phase, spec, Speed { linear, angular: motion::DEFAULT_ANGULAR_RPS }).await
     }
 
-    /// Next fresh frame (captured after `since` + settle delay) containing the target. The
-    /// observation ends as TARGET_LOST `lost_timeout_s` after max(now, settle time), whether or
-    /// not frames arrive (stale frames do not extend it).
+    /// Next fresh frame (captured after `since` + settle delay) containing the target.
+    /// TARGET_LOST when: frames keep arriving but all predate the settle time, `lost_timeout_s`
+    /// after max(now, settle time) (stale frames do not extend it); no frame arrives for
+    /// max(3 s, `lost_timeout_s`); fresh frames miss the target `lost_frames` times or for
+    /// `lost_timeout_s` from the call.
     async fn fresh_match(&self, tracker: &Tracker, since: Instant, after: &mut Option<u64>) -> Result<Detection, Stop> {
         let not_before = since + Duration::from_secs_f64(self.setup.settle_delay_s);
         let started = Instant::now();
