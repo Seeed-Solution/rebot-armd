@@ -190,3 +190,25 @@ def test_perception_api_v2(live):
     code, cam = http(base + "/sim/camera")
     assert cam["camera_mount"]["offset_m"] == list(DEFAULT_OFFSET_M) and cam["fx_px"] == pytest.approx(823.8, abs=0.1)
     assert cam["render_backend"] in ("egl", "osmesa", "glfw", "default")
+
+
+def test_view_past_the_table_shows_a_neutral_background():
+    """At this pose the top of the wrist image looks past the table and the floor: that is
+    the scene background (no geom, depth at zfar), which must not render black."""
+    objects = parse_objects("cube")
+    model = load_model(devarm_dir="", objects=objects, camera=CameraMount.from_profile())
+    data = mujoco.MjData(model)
+    Scene(model, objects).reset(data, seed=None)
+    for j, q in zip(range(1, 7), [0.089, -1.034, -1.185, 0.933, -0.386, 1.37]):
+        data.qpos[model.jnt_qposadr[model.joint(f"joint{j}").id]] = q
+    mujoco.mj_forward(model, data)
+    model.vis.global_.offwidth, model.vis.global_.offheight = 1280, 720
+    renderer = mujoco.Renderer(model, 720, 1280)
+    renderer.update_scene(data, camera="wrist")
+    rgb = renderer.render()
+    renderer.enable_segmentation_rendering()
+    renderer.update_scene(data, camera="wrist")
+    background = segmentation_ids(renderer.render()) == -1
+    assert background[:10].all(), "pose no longer looks past the scene"
+    top = rgb[:10].reshape(-1, 3).astype(float)
+    assert top.min() > 60 and np.ptp(top.mean(axis=0)) < 20, top.mean(axis=0)  # light, near grey
