@@ -159,6 +159,18 @@ def decode_segmentation(rgb: np.ndarray, scene: mujoco.MjvScene) -> np.ndarray:
 
 _canary_frames = itertools.count(1)
 
+# Private mujoco.Renderer attributes render_segmentation uses (checked against mujoco 4.0.0).
+_RENDERER_INTERNALS = ("_mjr_context", "_rect", "_gl_context", "height", "width", "scene")
+
+
+def check_renderer_internals(renderer: mujoco.Renderer) -> None:
+    """Raise RuntimeError naming the missing attributes when this mujoco's Renderer lacks the
+    internals render_segmentation relies on (they are not public API)."""
+    missing = [a for a in _RENDERER_INTERNALS if not hasattr(renderer, a)]
+    if missing:
+        raise RuntimeError(f"mujoco {mujoco.__version__}: Renderer lacks {missing}, used by render_segmentation "
+                           "(written against mujoco 4.0.0); update rebot_sim.camera for this version")
+
 
 def render_segmentation(renderer: mujoco.Renderer) -> np.ndarray:
     """Segmentation (geom id per pixel) of the renderer's current scene: an ID-colour render
@@ -168,14 +180,17 @@ def render_segmentation(renderer: mujoco.Renderer) -> np.ndarray:
     the GB10 when other processes hold most of the unified memory), it drops rendering commands
     without a GL or EGL error, and the readback holds stale or uninitialised memory. To detect
     that, a canary pixel with a colour that changes every frame and is no segmentation id is
-    drawn after the scene, in the offscreen buffer row just above the read-back image, and read
-    back separately: a missing canary raises SegmentationError. Needs an offscreen buffer
-    taller than the renderer (model.vis.global_.offheight > height)."""
-    con, rect = renderer._mjr_context, renderer._rect  # mujoco 4.0.0 Renderer internals
+    drawn after the scene, in the offscreen buffer row just above the image. One readback covers
+    the image and that row; a missing canary raises SegmentationError, then the row is cropped
+    away. Needs an offscreen buffer taller than the renderer
+    (model.vis.global_.offheight > height)."""
+    check_renderer_internals(renderer)
+    con, rect = renderer._mjr_context, renderer._rect
     if con.offHeight <= renderer.height:
         raise ValueError(f"offscreen buffer height {con.offHeight} leaves no canary row above {renderer.height}")
     canary = (0xFE, next(_canary_frames) % 256, 0xFE)  # value 0xFExxFE: above any geom count
     canary_rect = mujoco.MjrRect(0, renderer.height, 1, 1)
+    read_rect = mujoco.MjrRect(0, 0, renderer.width, renderer.height + 1)  # image + canary row
     flags = renderer.scene.flags
     flags[mujoco.mjtRndFlag.mjRND_SEGMENT] = flags[mujoco.mjtRndFlag.mjRND_IDCOLOR] = True
     try:
@@ -183,15 +198,15 @@ def render_segmentation(renderer: mujoco.Renderer) -> np.ndarray:
             renderer._gl_context.make_current()
         mujoco.mjr_render(rect, renderer.scene, con)
         mujoco.mjr_rectangle(canary_rect, *(c / 255 for c in canary), 1.0)
-        rgb = np.empty((renderer.height, renderer.width, 3), np.uint8)
-        mujoco.mjr_readPixels(rgb, None, rect, con)
-        seen = np.empty((1, 1, 3), np.uint8)
-        mujoco.mjr_readPixels(seen, None, canary_rect, con)
+        buf = np.empty((renderer.height + 1, renderer.width, 3), np.uint8)
+        mujoco.mjr_readPixels(buf, None, read_rect, con)
     finally:
         flags[mujoco.mjtRndFlag.mjRND_SEGMENT] = flags[mujoco.mjtRndFlag.mjRND_IDCOLOR] = False
-    if tuple(int(c) for c in seen[0, 0]) != canary:
-        diag = {"canary_expected": list(canary), "canary_read": seen[0, 0].tolist()}
+    seen = buf[renderer.height, 0]  # glReadPixels rows run bottom-up: the last row is y = height
+    if tuple(int(c) for c in seen) != canary:
+        diag = {"canary_expected": list(canary), "canary_read": seen.tolist()}
         raise SegmentationError(f"segmentation render not executed (GPU out of memory?): {diag}", diag)
+    rgb = buf[:renderer.height]
     if renderer._gl_context:  # EGL / OSMesa / GLFW read back bottom-up
         rgb = np.flipud(rgb)
     return decode_segmentation(rgb, renderer.scene)
