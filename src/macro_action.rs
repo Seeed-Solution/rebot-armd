@@ -107,16 +107,22 @@ impl MacroCtx {
         let until = Instant::now() + Duration::from_secs_f64(limit_s.min(self.phase_timeout_s));
         loop {
             tokio::time::sleep(POLL).await;
-            let mut inner = self.sup.inner().write().await;
-            if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
-            match inner.macro_sub(self.id) {
-                Some(SubState::Done(d)) => return Ok(d),
-                Some(SubState::Failed { code, message }) => return Err(Stop::Fail(code, message)),
-                _ => {}
+            {
+                // poll with the read lock; the write lock only to stop on a timeout
+                let inner = self.sup.inner().read().await;
+                if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
+                match inner.macro_sub(self.id) {
+                    Some(SubState::Done(d)) => return Ok(d),
+                    Some(SubState::Failed { code, message }) => return Err(Stop::Fail(code, message)),
+                    _ => {}
+                }
             }
             let now = Instant::now();
             if now > until || now > self.deadline {
-                inner.stop_motion();
+                let mut inner = self.sup.inner().write().await;
+                if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
+                if let Some(SubState::Done(d)) = inner.macro_sub(self.id) { return Ok(d); }
+                if inner.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(self.id)) { inner.stop_motion(); }
                 return Err(fail(self.timeout_code, format!("Phase {phase} did not finish in time")));
             }
         }
