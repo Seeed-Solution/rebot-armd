@@ -15,7 +15,7 @@ use axum::{
 /// `ARMD_ASSET_DIR` replaces the list.
 pub const ASSET_DIRS: [&str; 2] = ["assets", "/usr/share/rebot-teleop/assets"];
 const URDF_NAME: &str = "reBot-DevArm_gripper.urdf";
-const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// The first directory that holds the URDF, or `ARMD_ASSET_DIR` when set.
 pub fn asset_dir() -> Option<PathBuf> {
@@ -82,7 +82,21 @@ async fn serve_from(dir: &Path, rel: &str) -> Response {
 // scripts/vendor_three.mjs; fetched only when the 3D view is opened.
 static THREE_URDF_GZ: &[u8] = include_bytes!("vendor/three-urdf.min.js.gz");
 
-pub async fn serve_three() -> impl IntoResponse {
+/// Served gzip-encoded only (browsers always accept gzip); a client that does not accept
+/// it gets 406.
+pub async fn serve_three(headers: axum::http::HeaderMap) -> Response {
+    let gzip_ok = headers.get_all(header::ACCEPT_ENCODING).iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|e| {
+            let mut parts = e.split(';');
+            let name = parts.next().unwrap_or("").trim();
+            let q = parts.find_map(|p| p.trim().strip_prefix("q=").and_then(|v| v.trim().parse::<f32>().ok())).unwrap_or(1.0);
+            (name.eq_ignore_ascii_case("gzip") || name == "*") && q > 0.0
+        });
+    if !gzip_ok {
+        return (StatusCode::NOT_ACCEPTABLE, "three-urdf.min.js is only available gzip-encoded; send Accept-Encoding: gzip").into_response();
+    }
     (
         [
             (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
@@ -91,6 +105,7 @@ pub async fn serve_three() -> impl IntoResponse {
         ],
         THREE_URDF_GZ,
     )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -104,6 +119,7 @@ mod tests {
         std::fs::write(t.path().join("assets/meshes/link1.stl"), "solid").unwrap();
         std::fs::write(t.path().join("assets/meshes/manifest.json"), "{}").unwrap();
         std::fs::write(t.path().join("assets/meshes/run.sh"), "x").unwrap();
+        std::fs::write(t.path().join("assets/meshes/huge.stl"), vec![b's'; (MAX_FILE_BYTES + 1) as usize]).unwrap();
         std::fs::write(t.path().join("secret.json"), "{}").unwrap();
         t
     }
@@ -145,14 +161,25 @@ mod tests {
         let app = axum::Router::new()
             .route("/assets/model/{*path}", axum::routing::get(move |UrlPath(rel): UrlPath<String>| async move { serve_from(&d, &rel).await }))
             .route("/assets/three-urdf.min.js", axum::routing::get(serve_three));
-        let get = |u: &str| axum::http::Request::get(u).body(Body::empty()).unwrap();
+        let get = |u: &str| axum::http::Request::get(u).header(header::ACCEPT_ENCODING, "gzip, deflate, br").body(Body::empty()).unwrap();
         let r = app.clone().oneshot(get("/assets/model/meshes/link1.stl")).await.unwrap();
         assert_eq!(r.status(), StatusCode::OK);
         assert_eq!(r.headers()[header::CONTENT_TYPE], "model/stl");
-        for bad in ["/assets/model/../secret.json", "/assets/model/meshes/%2e%2e/%2e%2e/secret.json", "/assets/model/meshes/run.sh"] {
+        for bad in ["/assets/model/meshes/huge.stl", "/assets/model/../secret.json", "/assets/model/meshes/%2e%2e/%2e%2e/secret.json", "/assets/model/meshes/run.sh"] {
             let r = app.clone().oneshot(get(bad)).await.unwrap();
             assert_eq!(r.status(), StatusCode::NOT_FOUND, "{bad}");
         }
+        let plain = |enc: Option<&str>| {
+            let mut r = axum::http::Request::get("/assets/three-urdf.min.js");
+            if let Some(e) = enc { r = r.header(header::ACCEPT_ENCODING, e); }
+            r.body(Body::empty()).unwrap()
+        };
+        for enc in [None, Some("identity"), Some("br, gzip;q=0")] {
+            let r = app.clone().oneshot(plain(enc)).await.unwrap();
+            assert_eq!(r.status(), StatusCode::NOT_ACCEPTABLE, "{enc:?}");
+        }
+        let r = app.clone().oneshot(plain(Some("deflate, gzip;q=0.5"))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
         let r = app.oneshot(get("/assets/three-urdf.min.js")).await.unwrap();
         assert_eq!(r.headers()[header::CONTENT_ENCODING], "gzip");
         let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
