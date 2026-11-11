@@ -119,6 +119,28 @@ Under verification (drivers exist in the code; not run on a real arm, not suppor
 
 `mock` (in-process simulation, the default) is used by the tests and for UI work without an arm.
 
+`sim` connects armd to `rebot-sim`, a MuJoCo physics simulation of the B601-DM (`sim/mujoco`,
+UDP, default `udp://127.0.0.1:47600`). armd's checks (joint limits, workspace, lease watchdog,
+gripper holding, residual torques, bus-loss detection) run on the simulated positions, velocities
+and torques. With `--camera` the simulator also renders the wrist camera and serves it like the
+reCamera kit: H.264 stream at `ws://127.0.0.1:8001/`, a ground-truth perception provider
+(rebot-vision perception API v2) at `http://127.0.0.1:8090`, and `/sim/reset` / `/sim/state` /
+`/sim/camera` for seeded scenes (objects `cube`, `cup`, `block`) and evaluation. Run:
+
+```bash
+# terminal 1: simulator with the wrist camera
+cd sim/mujoco
+uv run rebot-sim --camera --objects cube,cup --seed 3 --stats 2
+
+# terminal 2: armd with the B601-DM profile, detection from the simulator
+ARMD_DETECTOR_URL=http://127.0.0.1:8090 cargo run --bin armd -- --follower sim \
+  --config kits/recamera-b601dm/profile/rebot-b601dm.json --log-dir off --blackbox-dir off
+```
+
+Without `--camera` the simulator runs physics only (`uv run rebot-sim --port 47600 --headless`).
+Requirements, options, the wire protocol and the measured simulation results are in
+[docs/simulation.md](docs/simulation.md).
+
 The protocol encoders of the drivers under verification are covered by unit tests
 (`tests/test_protocol_vectors.rs`, `tests/test_driver_capabilities.rs`). They use the generic
 6-joint profile without kinematics or a workspace, so Cartesian actions return `UNSUPPORTED`.
@@ -366,7 +388,15 @@ the header).
   (open, approach looking down, closed-loop image centring, align J6 to 0° / 90°, descend,
   close and check the hold, lift). Any joystick, key, stop or E-stop ends it. The grasp setup
   (table height, gripper pixel, approach and grasp heights, camera tilt) is stored by armd.
-  Tested only in simulation and screenshot tests so far; see
+  For a camera pitched toward the jaws (v8 holder, `camera_mount` `rot_deg` 90, `tilt_deg` −38)
+  the jaws' table point is outside the image when the tool points down; the setup field
+  `acquire_camera_down` (`auto` (default), `on`, `off`) then selects camera-down acquisition:
+  approach and centring with the optical axis vertical, then one move to the tool-vertical pose
+  above the target and the same descent (`auto`: when |camera tilt| > 5° and
+  `camera_mount.offset_m` is set; see
+  [docs/agent_action_api.md](docs/agent_action_api.md#camera-down-acquisition--相机朝下采集)).
+  Tested only in simulation and screenshot tests so far (camera-down: in `rebot-sim` only, not
+  tried on the arm); see
   [docs/plan_tap_to_grasp.md](docs/plan_tap_to_grasp.md) for what still needs checking on the arm.
 - **Gravity compensation / hand-guiding**: hold the switch for 0.6 s to make J1–J6 float (MIT
   mode, kp = 0, damping, URDF gravity torque as feed-forward, ramped in over 1 s); the gripper
@@ -529,8 +559,9 @@ has not been tested.
 
 ```text
 armd [OPTIONS]
-    --follower <MODEL>       rebot-dm, rebot-rs, so-arm101, fashionstar, star-arm102, mock (default)
-    --follower-port <PORT>   CAN interface (default can0) or serial device (default /dev/ttyUSB0)
+    --follower <MODEL>       rebot-dm, rebot-rs, so-arm101, fashionstar, star-arm102, sim, mock (default)
+    --follower-port <PORT>   CAN interface (default can0), serial device (default /dev/ttyUSB0),
+                             or udp://HOST:PORT for sim (default udp://127.0.0.1:47600)
     --config <JSON>          ArmConfig profile (must match the follower's joint count)
     --port <PORT>            HTTP / WebSocket port (default 8765, or $PORT)
     --log-dir <DIR>          rotating log armd.log, 1 MiB x 3 files (default /userdata/rebot-teleop/logs
