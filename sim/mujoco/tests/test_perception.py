@@ -4,19 +4,32 @@ from __future__ import annotations
 
 import json
 import multiprocessing as mp
+import os
+import signal
 import socket
+import threading
+import time
 import urllib.error
 import urllib.request
+from multiprocessing import shared_memory
+from types import SimpleNamespace
 
+import mujoco
+import numpy as np
 import pytest
+from test_armd_sim import free_port
 
+from rebot_sim import camera as cam
+from rebot_sim.camera import CameraMount
+from rebot_sim.model import load_model
+from rebot_sim.perception import (
+    CameraRig,
+    Perception,
+    PerceptionServer,
+    SharedState,
+    SimLink,
+)
 from rebot_sim.server import Simulator
-
-
-def free_port(kind=socket.SOCK_STREAM) -> int:
-    with socket.socket(socket.AF_INET, kind) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def http(url: str, body: dict | None = None, method: str | None = None) -> tuple[int, dict]:
@@ -28,6 +41,25 @@ def http(url: str, body: dict | None = None, method: str | None = None) -> tuple
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read())
+
+
+def set_arm(model: mujoco.MjModel, data: mujoco.MjData, q) -> None:
+    """Put J1..J6 at `q` (rad) and update the kinematics."""
+    for j, v in zip(range(1, 7), q):
+        data.qpos[model.jnt_qposadr[model.joint(f"joint{j}").id]] = v
+    mujoco.mj_forward(model, data)
+
+
+def camera_sim() -> tuple[Simulator, int]:
+    """A one-cube simulator with its camera process started (skips without GL / libx264);
+    returns it and the perception port."""
+    s = Simulator(free_port(socket.SOCK_DGRAM), objects="cube", camera_mount=CameraMount())
+    pport = free_port()
+    ready = s.start_camera(15, (640, 360), "127.0.0.1", free_port(), pport, objects="cube")
+    if "error" in ready:
+        s.close()
+        pytest.skip(ready["error"])
+    return s, pport
 
 
 @pytest.fixture
@@ -71,8 +103,6 @@ class FakeSim:
 
 @pytest.fixture
 def api():
-    from rebot_sim.perception import Perception, PerceptionServer
-
     fake = FakeSim()
     srv = PerceptionServer(Perception(max_fps=15), fake, "127.0.0.1", 0)
     yield srv, fake, f"http://127.0.0.1:{srv.httpd.server_address[1]}"
@@ -90,10 +120,6 @@ def test_reset_seed_must_be_a_non_negative_integer(api, seed):
 
 
 def test_late_simulator_reply_does_not_answer_the_next_request(sim):
-    import threading
-
-    from rebot_sim.perception import SimLink
-
     parent, child = mp.Pipe()
     sim.cam_conn, link = parent, SimLink(child)
     with pytest.raises(TimeoutError):
@@ -147,9 +173,6 @@ def test_trigger_adds_its_pipelines_to_the_next_frame_and_shares_the_result(api)
     """API v2 union (kits/recamera-b601dm/vision VisionControl::frame_plan): a trigger's
     pipelines join the next frame's continuous plan; that one result answers the trigger and
     becomes `latest`."""
-    import threading
-    import time
-
     srv, _, base = api
     assert http(base + "/api/subscribe", {"client": "t", "pipelines": ["yolo"], "fps": 15})[0] == 200
     dets = [{"class_name": "cube"}]
@@ -169,17 +192,7 @@ def test_trigger_adds_its_pipelines_to_the_next_frame_and_shares_the_result(api)
 def test_camera_publishes_no_frame_without_new_physics():
     """The camera process renders only physics states it has not rendered yet; results and
     /sim/state carry the physics time of the frame."""
-    import threading
-    import time
-
-    from rebot_sim.camera import CameraMount
-
-    sim = Simulator(free_port(socket.SOCK_DGRAM), objects="cube", camera_mount=CameraMount())
-    pport = free_port()
-    ready = sim.start_camera(15, (640, 360), "127.0.0.1", free_port(), pport, objects="cube")
-    if "error" in ready:
-        sim.close()
-        pytest.skip(ready["error"])
+    sim, pport = camera_sim()
     base, stop, mu = f"http://127.0.0.1:{pport}", threading.Event(), threading.Lock()
 
     def pipe_only():  # answers /sim requests; the physics does not step
@@ -213,8 +226,6 @@ def test_camera_publishes_no_frame_without_new_physics():
 
 
 def test_camera_reports_ready_only_after_its_encoders_exist():
-    from rebot_sim.camera import CameraMount
-
     s = Simulator(free_port(socket.SOCK_DGRAM), objects="cube", camera_mount=CameraMount())
     try:  # libx264 rejects an odd frame size when the encoder opens
         ready = s.start_camera(15, (641, 361), "127.0.0.1", free_port(), free_port(), objects="cube", timeout=30)
@@ -224,15 +235,8 @@ def test_camera_reports_ready_only_after_its_encoders_exist():
 
 
 def test_physics_loop_reports_a_dead_camera_process():
-    import time
-
-    from rebot_sim.camera import CameraMount
-
-    s = Simulator(free_port(socket.SOCK_DGRAM), objects="cube", camera_mount=CameraMount())
+    s, _ = camera_sim()
     try:
-        ready = s.start_camera(15, (640, 360), "127.0.0.1", free_port(), free_port(), objects="cube")
-        if "error" in ready:
-            pytest.skip(ready["error"])
         s.cam_proc.kill()
         t0 = time.perf_counter()
         s.run(duration=10)
@@ -242,8 +246,6 @@ def test_physics_loop_reports_a_dead_camera_process():
 
 
 def _shm_exists(name: str) -> bool:
-    from multiprocessing import shared_memory
-
     try:
         shared_memory.SharedMemory(name=name, track=False).close()
     except FileNotFoundError:
@@ -252,14 +254,7 @@ def _shm_exists(name: str) -> bool:
 
 
 def test_close_stops_the_camera_and_frees_everything():
-    from rebot_sim.camera import CameraMount
-
-    s = Simulator(free_port(socket.SOCK_DGRAM), objects="cube", camera_mount=CameraMount())
-    pport = free_port()
-    ready = s.start_camera(15, (640, 360), "127.0.0.1", free_port(), pport, objects="cube")
-    if "error" in ready:
-        s.close()
-        pytest.skip(ready["error"])
+    s, pport = camera_sim()
     proc, name = s.cam_proc, s.shared.shm.name
     s.close()
     assert not proc.is_alive() and not _shm_exists(name) and s.sock.fileno() == -1
@@ -269,8 +264,6 @@ def test_close_stops_the_camera_and_frees_everything():
 
 
 def test_failed_camera_start_frees_the_child_and_shared_memory():
-    from rebot_sim.camera import CameraMount
-
     s = Simulator(free_port(socket.SOCK_DGRAM), objects="cube", camera_mount=CameraMount())
     try:
         assert "error" in s.start_camera(15, (641, 361), "127.0.0.1", free_port(), free_port(), objects="cube")
@@ -292,12 +285,6 @@ def test_camera_dying_mid_request_does_not_break_the_physics_loop(sim):
 
 
 def _write_states(name: str, nq: int, nv: int, lock, n: int) -> None:
-    from types import SimpleNamespace
-
-    import numpy as np
-
-    from rebot_sim.perception import SharedState
-
     st = SharedState(nq, nv, name, lock)
     for k in range(1, n + 1):
         st.write(SimpleNamespace(time=float(k), qpos=np.full(nq, float(k)), qvel=np.full(nv, float(k))))
@@ -307,13 +294,6 @@ def _write_states(name: str, nq: int, nv: int, lock, n: int) -> None:
 def test_shared_state_is_consistent_across_processes():
     """Writer and reader serialise on a multiprocessing lock: a read never mixes two states,
     and a read waits while a write holds the lock."""
-    import threading
-    from types import SimpleNamespace
-
-    import numpy as np
-
-    from rebot_sim.perception import SharedState
-
     ctx = mp.get_context("spawn")
     nq, nv = 30, 28
     st = SharedState(nq, nv, lock=ctx.Lock())
@@ -342,10 +322,6 @@ def test_shared_state_is_consistent_across_processes():
 
 
 def _rig():
-    from rebot_sim.camera import CameraMount
-    from rebot_sim.model import load_model
-    from rebot_sim.perception import CameraRig, SharedState, SimLink
-
     m = CameraMount()
     model = load_model(devarm_dir="", camera=m)
     st = SharedState(model.nq, model.nv)
@@ -355,18 +331,10 @@ def _rig():
 
 
 def test_segmentation_decode_rejects_out_of_range_ids_and_matches_mujoco():
-    import mujoco
-    import numpy as np
-
-    from rebot_sim import camera as cam
-
     rig, st = _rig()
     try:
         rig.setup()  # also renders once
-        m, d = rig.model, rig.data
-        for j, q in zip(range(1, 7), [0.46, -0.63, -1.05, 1.48, 0.43, -0.66]):  # cube in view
-            d.qpos[m.jnt_qposadr[m.joint(f"joint{j}").id]] = q
-        mujoco.mj_forward(m, d)
+        set_arm(rig.model, rig.data, [0.46, -0.63, -1.05, 1.48, 0.43, -0.66])  # cube in view
         r = rig.seg_renderer
         r.update_scene(rig.data, camera="wrist", scene_option=rig.opt)
         ours = cam.render_segmentation(r)
@@ -384,8 +352,6 @@ def test_segmentation_decode_rejects_out_of_range_ids_and_matches_mujoco():
 
 
 def test_a_bad_segmentation_frame_is_skipped_and_ten_in_a_row_fail_the_camera():
-    import numpy as np
-
     rig, st = _rig()
     try:
         rig.setup()
@@ -405,20 +371,12 @@ def test_a_bad_segmentation_frame_is_skipped_and_ten_in_a_row_fail_the_camera():
 
 
 def _hold_lock(lock, held) -> None:
-    import time
-
     lock.acquire()
     held.set()
     time.sleep(60)
 
 
 def test_physics_stops_when_the_camera_dies_holding_the_shared_state_lock(sim):
-    import os
-    import signal
-    import time
-
-    from rebot_sim.perception import SharedState
-
     ctx = mp.get_context("spawn")
     sim.shared = SharedState(sim.model.nq, sim.model.nv, lock=ctx.Lock())
     held = ctx.Event()
