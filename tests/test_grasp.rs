@@ -197,7 +197,14 @@ async fn rig(setup: GraspSetup, truth: Truth, start_tilt_deg: f64, offset_xy: [f
 
 /// [`rig`] with the controller's `camera_mount.rot_deg` and a given start (q, pose).
 async fn rig_mounted(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start: ([f32; 7], Pose), offset_xy: [f64; 2], lease: bool) -> Rig {
+    rig_driven(setup, truth, mount_rot_deg, start, offset_xy, lease, None).await
+}
+
+/// [`rig_mounted`] with a driver (and the collision guard on) when `arm` is given.
+async fn rig_driven(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start: ([f32; 7], Pose), offset_xy: [f64; 2], lease: bool,
+                    arm: Option<TestArm>) -> Rig {
     let mut config = ArmConfig::rebot_dm();
+    if arm.is_some() { config.collision = Some(armd::collision::CollisionPolicy { enabled: true, ..Default::default() }); }
     // the controller knows the optical centre only when the truth says so (`Truth::same`)
     let offset_m = truth.known_offset.then(|| truth.offset.map(|v| v as f32));
     config.camera_mount = CameraMount { rot_deg: mount_rot_deg, tilt_deg: setup.camera_tilt_deg as f32, offset_m, ..CameraMount::default() };
@@ -206,6 +213,10 @@ async fn rig_mounted(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start:
     {
         let mut inner = sup.inner().write().await;
         inner.lease_enabled = lease;
+        if let Some(arm) = &arm {
+            arm.0.lock().unwrap().q = q;
+            inner.driver = Some(std::sync::Mutex::new(Box::new(arm.clone())));
+        }
         inner.set_torque(true).unwrap();
         inner.commanded_positions = q.to_vec();
         inner.measured_positions = q.to_vec();
@@ -495,7 +506,10 @@ async fn grasp_rejects_servo_frames_while_running() {
 struct WsRig { rig: Rig, ws: common::TestSocket, generation: u64, epoch: u64, addr: std::net::SocketAddr }
 
 async fn ws_rig(setup_path: Option<std::path::PathBuf>) -> WsRig {
-    let rig = rig(GraspSetup::default(), Truth::same(), 0.0, [0.0, 0.0], true).await;
+    ws_rig_on(rig(GraspSetup::default(), Truth::same(), 0.0, [0.0, 0.0], true).await, setup_path).await
+}
+
+async fn ws_rig_on(rig: Rig, setup_path: Option<std::path::PathBuf>) -> WsRig {
     let deps = GraspDeps { source: rig.sim.clone(), setup_path };
     let router = armd::api::create_router_with(rig.sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -952,4 +966,111 @@ async fn stale_frames_end_the_observation_as_target_lost() {
         assert!(t.elapsed() < Duration::from_secs(4), "{case}: {:?}", t.elapsed());
         assert_idle_after(&rig.sup, id).await;
     }
+}
+
+// ---- ending a camera-down grasp during the transition ----
+
+/// Test driver for the collision case: an ideal position servo reporting the model gravity
+/// torque plus a residual the test sets (as tests/test_collision_guard.rs).
+#[derive(Default)]
+struct ArmState { q: [f32; 7], torqued: bool, extra: [f32; 6] }
+
+#[derive(Clone, Default)]
+struct TestArm(Arc<Mutex<ArmState>>);
+
+impl armd::driver::ArmDriver for TestArm {
+    fn capabilities(&self) -> armd::driver::DriverCapabilities {
+        armd::driver::DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true }
+    }
+    fn enable_state(&self) -> armd::driver::EnableState {
+        if self.0.lock().unwrap().torqued { armd::driver::EnableState::Enabled } else { armd::driver::EnableState::Disabled }
+    }
+    fn is_feedback_valid(&self) -> bool { true }
+    fn is_enabled(&self) -> bool { self.0.lock().unwrap().torqued }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
+    fn read_joint_states(&mut self) -> Result<Vec<armd::model::JointState>, armd::driver::ArmDriverError> {
+        let s = self.0.lock().unwrap();
+        let q6: [f32; 6] = std::array::from_fn(|i| s.q[i]);
+        let g = armd::compute_gravity_torques(&q6).unwrap();
+        Ok((0..7).map(|i| armd::model::JointState {
+            position: s.q[i], velocity: 0.0, temperature: 30.0, torque: if i < 6 { g[i] + s.extra[i] } else { 0.0 },
+        }).collect())
+    }
+    fn write_joint_targets(&mut self, targets: &[armd::driver::JointTarget]) -> Result<(), armd::driver::ArmDriverError> {
+        let mut s = self.0.lock().unwrap();
+        for (i, t) in targets.iter().enumerate().take(7) { s.q[i] = t.position; }
+        Ok(())
+    }
+    fn set_torque(&mut self, enabled: bool) -> Result<(), armd::driver::ArmDriverError> {
+        self.0.lock().unwrap().torqued = enabled;
+        Ok(())
+    }
+}
+
+fn v8_setup() -> (GraspSetup, Truth, ([f32; 7], Pose)) {
+    let setup = GraspSetup { camera_tilt_deg: -38.0, ..GraspSetup::default() };
+    let truth = Truth { rot_deg: 90.0, offset: V8_OFFSET, ..Truth::same() };
+    (setup, truth, pitched_start(&kinematics::cam_mount(false, 90.0, -38.0), 0.5, 0.22))
+}
+
+#[tokio::test]
+async fn camera_down_stop_during_the_transition() {
+    let (setup, truth, start) = v8_setup();
+    let rig = rig_mounted(setup, truth, 90.0, start, [0.0, 0.0], false).await;
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+    wait_phase(&rig.sup, id, "transition", Some(true)).await;
+    let t = Instant::now();
+    {
+        let mut inner = rig.sup.inner().write().await;
+        inner.stop_motion();
+        inner.request_macro_stop();
+    }
+    let a = wait_done(&rig.sup, id, 2.0, |_| {}).await;
+    assert_eq!((a.state.as_str(), a.code.as_deref(), a.phase.as_deref()), ("cancelled", Some("STOPPED"), Some("transition")), "{a:?}");
+    assert!(t.elapsed() < Duration::from_millis(500), "{:?}", t.elapsed());
+    assert_idle_after(&rig.sup, id).await;
+}
+
+#[tokio::test]
+async fn camera_down_lease_loss_during_the_transition() {
+    let (setup, truth, start) = v8_setup();
+    let rig = rig_mounted(setup, truth, 90.0, start, [0.0, 0.0], true).await;
+    let mut w = ws_rig_on(rig, None).await;
+    let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", tap(&w.rig).await).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("ack {ack}"));
+    // keep the lease alive until the transition move runs
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(Instant::now() < deadline, "transition not reached: {:?}", w.rig.sup.get_observation().await.action);
+        common::send(&mut w.ws, json!({"type":"heartbeat", "generation":w.generation, "epoch_id":w.epoch})).await;
+        common::drain(&mut w.ws, 2).await;
+        let inner = w.rig.sup.inner().read().await;
+        let a = inner.last_action.as_ref().unwrap();
+        assert!(a.is_running(), "{a:?}");
+        if a.phase.as_deref() == Some("transition") && inner.active_trajectory.as_ref().is_some_and(|t| t.action_id == Some(id)) { break; }
+        drop(inner);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let t = Instant::now();
+    let reply = common::ws_reply(&mut w.ws, json!({"type":"release_lease", "generation":w.generation}), &["lease_released"]).await;
+    assert_eq!(reply["success"], true);
+    let a = wait_done(&w.rig.sup, id, 2.0, |_| {}).await;
+    assert_eq!((a.state.as_str(), a.code.as_deref(), a.phase.as_deref()), ("cancelled", Some("LEASE_LOST"), Some("transition")), "{a:?}");
+    assert!(t.elapsed() < Duration::from_millis(500));
+    assert_idle_after(&w.rig.sup, id).await;
+}
+
+#[tokio::test]
+async fn camera_down_collision_during_the_transition_holds() {
+    let (setup, truth, start) = v8_setup();
+    let arm = TestArm::default();
+    let rig = rig_driven(setup, truth, 90.0, start, [0.0, 0.0], false, Some(arm.clone())).await;
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+    wait_phase(&rig.sup, id, "transition", Some(true)).await;
+    arm.0.lock().unwrap().extra[1] = -20.0;
+    let a = wait_done(&rig.sup, id, 2.0, |_| {}).await;
+    assert_eq!((a.state.as_str(), a.code.as_deref(), a.phase.as_deref()), ("failed", Some("COLLISION"), Some("transition")), "{a:?}");
+    assert!(rig.sup.inner().read().await.collision.hold.is_some(), "collision hold");
+    assert_idle_after(&rig.sup, id).await;
+    assert!(rig.sup.inner().read().await.macro_run.is_none());
 }
