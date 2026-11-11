@@ -1371,6 +1371,18 @@ mod tests {
     }
 
     #[test]
+    fn envelope_has_the_camera_when_a_lens_or_body_is_set() {
+        let ws = crate::model::ArmConfig::rebot_dm().workspace;
+        let rec = kinematics::cam_mount(false, 0.0, -38.0);
+        let n = |mount: CameraMount| envelope(ws.as_ref(), &mount, &rec).len();
+        assert_eq!(n(CameraMount::default()), 9, "TCP and 8 check points");
+        assert_eq!(n(CameraMount { offset_m: Some([-0.06, 0.0, 0.04]), ..Default::default() }), 18);
+        // a body size without a lens centre: the lens at the end_link origin, as CamModel assumes
+        let pts = envelope(ws.as_ref(), &CameraMount { body_size_m: Some([0.05, 0.05, 0.04]), ..Default::default() }, &rec);
+        assert_eq!((pts.len(), pts[9]), (18, [0.0; 3]));
+    }
+
+    #[test]
     fn transition_goes_tool_vertical_above_the_centred_target() {
         let (setup, _, cam) = v8();
         let r_now = inspect_r();

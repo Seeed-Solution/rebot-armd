@@ -1065,6 +1065,45 @@ async fn camera_down_rejects_a_camera_body_that_would_reach_the_table() {
     assert!(c.validate().is_err());
 }
 
+/// Look-down (v5) grasp where only the descent would take the camera to the table: tilt 0, the
+/// lens `ahead_m` beyond the jaw-tip plane (along the tool axis), so with the tool vertical it is
+/// that far below the TCP. At the default grasp height (15 mm) a lens 9 mm ahead stays 6 mm
+/// above the table and the grasp completes; 14.5 mm ahead it would be 0.5 mm above, so the
+/// grasp fails WORKSPACE_VIOLATION in the descend phase before that motion is installed (the
+/// approach and centring are clear, so it is acked).
+#[tokio::test]
+async fn look_down_descent_that_would_bring_the_camera_to_the_table_fails() {
+    let setup = GraspSetup::default();
+    for (ahead_m, ok) in [(0.009, true), (0.0145, false)] {
+        let truth = Truth { offset: [ahead_m, 0.0, 0.03], ..Truth::same() };
+        let rig = rig(setup.clone(), truth, 0.0, [0.0, 0.0], false).await;
+        let start_r = start_pose(&rig).await.r;
+        let mut s = setup.clone();
+        s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+        rig.sup.inner().write().await.set_grasp_setup(s.clone());
+        let config = rig.sup.inner().read().await.config.clone();
+        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("acked: approach and centring are clear");
+        let sup = rig.sup.clone();
+        let mut lowest = f64::INFINITY;
+        let a = wait_done(&rig.sup, id, 60.0, |_| {
+            if let Ok(inner) = sup.inner().try_read() { lowest = lowest.min(envelope_min_z(&config, &inner.commanded_positions)); }
+        }).await;
+        let tcp_z = start_pose(&rig).await.p[2];
+        println!("lens {:.1} mm ahead: {} {:?} in {:?}: {:?}, lowest TCP / check point / lens {lowest:.4} m, final TCP z {tcp_z:.4} m",
+            ahead_m * 1000.0, a.state, a.code, a.phase, a.message);
+        if ok {
+            assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+            assert!(lowest >= s.table_z_m + grasp::TABLE_CLEARANCE_M - 1e-6, "{lowest}");
+        } else {
+            assert_eq!((a.state.as_str(), a.code.as_deref(), a.phase.as_deref()), ("failed", Some("WORKSPACE_VIOLATION"), Some("descend")), "{a:?}");
+            assert!(a.message.as_deref().is_some_and(|m| m.contains("table_z_m")), "{a:?}");
+            assert!((tcp_z - (s.table_z_m + s.approach_height_m)).abs() < 2e-3, "not descended: TCP z {tcp_z}");
+            assert!(lowest >= s.table_z_m + grasp::TABLE_CLEARANCE_M, "{lowest}");
+            assert_idle_after(&rig.sup, id).await;
+        }
+    }
+}
+
 /// Detector latency 120..250 ms per result, continuous (`/api/results/latest`) and triggered
 /// (perception API 2): a stretch of stale frames (captured 30 s earlier) right after the
 /// centring starts or the transition move ends is followed by fresh ones, and the grasp
