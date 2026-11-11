@@ -912,10 +912,13 @@ impl Orchestrator {
         self.ctx.move_arm(phase, spec, Speed { linear, angular: motion::DEFAULT_ANGULAR_RPS }).await
     }
 
-    /// Next fresh frame (captured after `since` + settle delay) containing the target.
+    /// Next fresh frame (captured after `since` + settle delay) containing the target. The
+    /// observation ends as TARGET_LOST `lost_timeout_s` after max(now, settle time), whether or
+    /// not frames arrive (stale frames do not extend it).
     async fn fresh_match(&self, tracker: &Tracker, since: Instant, after: &mut Option<u64>) -> Result<Detection, Stop> {
         let not_before = since + Duration::from_secs_f64(self.setup.settle_delay_s);
         let started = Instant::now();
+        let observe_until = started.max(not_before) + Duration::from_secs_f64(self.setup.lost_timeout_s);
         let mut last_frame = Instant::now();
         let mut unmatched = 0u32;
         loop {
@@ -948,7 +951,12 @@ impl Orchestrator {
             };
             *after = Some(frame.frame_id);
             last_frame = Instant::now();
-            if frame.captured_at < not_before { continue; }
+            if frame.captured_at < not_before {
+                if last_frame > observe_until {
+                    return Err(fail("TARGET_LOST", format!("No frame captured after the motion settled within {:.1} s", self.setup.lost_timeout_s)));
+                }
+                continue;
+            }
             if let Some(d) = tracker.find(&frame, &self.setup) { return Ok(d); }
             unmatched += 1;
             if unmatched >= self.setup.lost_frames || started.elapsed().as_secs_f64() > self.setup.lost_timeout_s {

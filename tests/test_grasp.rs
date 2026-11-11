@@ -44,6 +44,8 @@ struct SimCamera {
     shift: Mutex<[f64; 2]>,
     /// Every frame request fails (detector error).
     failing: AtomicBool,
+    /// Frames keep arriving but were captured 30 s ago (a stalled camera behind a live API).
+    stale: AtomicBool,
 }
 
 impl SimCamera {
@@ -67,7 +69,8 @@ impl SimCamera {
             if let Some(b) = self.project_box(&pose) { detections.push(Detection { label: self.label.clone(), score: 0.9, box_norm: b }); }
         }
         let frame_id = self.frame.fetch_add(1, Ordering::SeqCst) + 1;
-        DetectionFrame { frame_id, captured_at: Instant::now(), detections }
+        let captured_at = if self.stale.load(Ordering::SeqCst) { Instant::now() - Duration::from_secs(30) } else { Instant::now() };
+        DetectionFrame { frame_id, captured_at, detections }
     }
 
     fn project_box(&self, pose: &Pose) -> Option<[f64; 4]> {
@@ -218,7 +221,7 @@ async fn rig_mounted(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start:
         visible: AtomicBool::new(true), enabled: AtomicBool::new(false), frame: AtomicU64::new(0), inference_calls: Mutex::new(Vec::new()),
         vision: Mutex::new(None), mode_calls: Mutex::new(Vec::new()), no_yolo: AtomicBool::new(false),
         per_request: AtomicBool::new(false), trigger_calls: Mutex::new(Vec::new()), next_frame_calls: AtomicU64::new(0),
-        shift: Mutex::new([0.0; 2]), failing: AtomicBool::new(false),
+        shift: Mutex::new([0.0; 2]), failing: AtomicBool::new(false), stale: AtomicBool::new(false),
     });
     let hold = Arc::new(AtomicBool::new(true));
     let (ticker, hold_t) = (sup.clone(), hold.clone());
@@ -927,6 +930,26 @@ async fn camera_down_recheck_failures_end_the_grasp_before_descent() {
         assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some(expect)), "{case}: {a:?}");
         assert!(!phases.iter().any(|p| p == "descend" || p == "close"), "{case}: {phases:?}");
         assert!((z - (s.table_z_m + s.approach_height_m)).abs() < 2e-3, "{case}: still at approach height, z {z}");
+        assert_idle_after(&rig.sup, id).await;
+    }
+}
+
+/// Frames that keep arriving but predate the settled motion count against the observation
+/// deadline: TARGET_LOST after about `lost_timeout_s`, in the centring loop and in the
+/// camera-down re-check, instead of waiting for GRASP_TIMEOUT.
+#[tokio::test]
+async fn stale_frames_end_the_observation_as_target_lost() {
+    let rig1 = rig(GraspSetup::default(), Truth::same(), 0.0, [0.01, 0.01], false).await;
+    let (rig2, _) = v8_recheck_rig(false).await;
+    for (case, rig, phase) in [("centring", &rig1, "centring"), ("re-check", &rig2, "transition")] {
+        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(rig).await).await.unwrap();
+        wait_phase(&rig.sup, id, phase, Some(case == "re-check")).await;
+        rig.sim.stale.store(true, Ordering::SeqCst);
+        let t = Instant::now();
+        let a = wait_done(&rig.sup, id, 15.0, |_| {}).await;
+        println!("stale frames in {case}: {} {:?} {:?} after {:.2} s", a.state, a.code, a.message, t.elapsed().as_secs_f64());
+        assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("TARGET_LOST")), "{case}: {a:?}");
+        assert!(t.elapsed() < Duration::from_secs(4), "{case}: {:?}", t.elapsed());
         assert_idle_after(&rig.sup, id).await;
     }
 }
