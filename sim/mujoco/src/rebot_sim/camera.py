@@ -128,7 +128,7 @@ def grip_pixel_norm(r_end_cam: np.ndarray, offset: np.ndarray, height_m: float) 
 
 def segmentation_ids(seg: np.ndarray) -> np.ndarray:
     """Geom id per pixel (-1 elsewhere) from a MuJoCo segmentation render (H x W x 2)."""
-    return np.where(seg[:, :, 1] == mujoco.mjtObj.mjOBJ_GEOM, seg[:, :, 0], -1)
+    return np.where(seg[:, :, 1] == int(mujoco.mjtObj.mjOBJ_GEOM), seg[:, :, 0], -1)  # int: an enum compares per element in Python
 
 
 def detections(geom_ids: np.ndarray, scene, min_pixels: int = 20) -> list[dict]:
