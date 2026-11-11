@@ -148,11 +148,11 @@ it after a crash and keeps its log. The runner is covered by host tests
 | Item | Value |
 |---|---|
 | Command | `nice -n 5 python3 -u <entry>`, working directory = the app directory |
-| User | `recamera` (unprivileged; `REBOT_APP_USER` overrides it), never root; a missing user refuses the start. The program can read the app directory and `/userdata/rebot-teleop` but not write the armd state files there (root-owned); a program that writes files needs a directory writable by `recamera` |
+| User | `rebot-app` (system user created by the package's postinst, no login shell, no password; `REBOT_APP_USER` overrides it), never root; a missing user refuses the start. `/userdata/rebot-apps` is owned by `rebot-app:rebot-app` (0755), so the program can write in its own directory. It can read `/userdata/rebot-teleop` but not write the armd state files there (root-owned). The package removal keeps the user. Access to GPIO or serial devices needs a manual group step, for example `addgroup rebot-app dialout` (check the group that owns the device node with `ls -l`) |
 | Environment | `REBOT_HOST=127.0.0.1`, `PYTHONPATH=/usr/share/rebot-teleop/python:<app dir>` |
 | `app.json` (optional) | `{"entry": "main.py", "restart": "on-failure" \| "always" \| "never"}`; default `main.py`, `on-failure` |
 | Restart | exit code 0 ends the runner with `on-failure`; other exits restart after 1, 2, 4 ... 30 s (back to 1 s after a run longer than 60 s); 10 starts within 5 minutes end it with state `given_up` |
-| Stop | the program runs in its own session; SIGTERM to its process group, SIGKILL to the group after 10 s; processes left in the group when the program exits are killed; then every process of the app user started at or after the program (also ones that left the group with `setsid`) is killed. This assumes the app user runs nothing else: a login shell of that user started while the app runs is killed too, so set `REBOT_APP_USER` to a user of its own when you log in as `recamera` |
+| Stop | the program runs in its own session; SIGTERM to its process group, SIGKILL to the group after 10 s; processes left in the group when the program exits are killed; then every process of the app user started at or after the program (also ones that left the group with `setsid`) is killed. This assumes the app user runs nothing else; `rebot-app` has no login, so the SSH user `recamera` is not affected |
 | Log | `/userdata/rebot-teleop/logs/app-<name>.log`; above 512 KiB (checked before each start and every 30 s) it is copied to `.1`, `.1` to `.2`, and truncated; bytes written during the copy can be lost |
 | State | `/tmp/rebot-app-<name>.state`: `state` (running, backoff, stopped, given_up), `pid`, `runner`, `starts`, `last_exit` |
 
@@ -172,9 +172,9 @@ reCamera 应用画廊一次只运行一个应用，摄像头为独占资源，�
    设为 `<name>`（`/userdata/local/apps/rebot-teleop.config.json`）。`start` 在 armd 之后启动该程序，
    `stop` 先停止该程序。
 
-程序以非特权用户 `recamera` 运行（可用 `REBOT_APP_USER` 指定，不允许 root）；该用户不存在时不启动并记录日志。
-程序可读取应用目录与 `/userdata/rebot-teleop`，但不能写入其中由 root 拥有的 armd 状态文件。程序在独立会话中运行，
-停止时 SIGTERM 发送到整个进程组，10 秒后对进程组发送 SIGKILL；程序退出后遗留在进程组中的进程会被结束，随后该用户在程序启动之后启动的所有进程（包括用 `setsid` 离开进程组的进程）也会被结束。此规则假定该用户只运行这个程序：程序运行期间以该用户登录的 shell 也会被结束，因此以 `recamera` 登录设备时，应通过 `REBOT_APP_USER` 为程序指定单独的用户。
+程序以非特权系统用户 `rebot-app` 运行（软件包 postinst 创建，无登录 shell、无密码；可用 `REBOT_APP_USER` 指定，不允许 root）；该用户不存在时不启动并记录日志。卸载软件包时保留该用户。
+`/userdata/rebot-apps` 属于 `rebot-app:rebot-app`（0755），程序可在自己的目录中写文件；可读取 `/userdata/rebot-teleop`，但不能写入其中由 root 拥有的 armd 状态文件。访问 GPIO 或串口设备需要手动加入对应的组，例如 `addgroup rebot-app dialout`（用 `ls -l` 查看设备节点所属的组）。程序在独立会话中运行，
+停止时 SIGTERM 发送到整个进程组，10 秒后对进程组发送 SIGKILL；程序退出后遗留在进程组中的进程会被结束，随后该用户在程序启动之后启动的所有进程（包括用 `setsid` 离开进程组的进程）也会被结束。此规则假定该用户只运行这个程序；`rebot-app` 不可登录，SSH 用户 `recamera` 不受影响。
 
 | 项目 | 取值 |
 |---|---|

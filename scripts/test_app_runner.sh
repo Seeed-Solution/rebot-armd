@@ -285,6 +285,30 @@ check "build_deb: the error names REBOT_SDK_DIR" sh -c 'printf "%s" "$1" | grep 
 out=$(REBOT_SDK_DIR=/nonexistent bash "$HERE/build_deb.sh" 2>&1)
 check "build_deb: REBOT_SDK_DIR without rebot/ fails" sh -c 'printf "%s" "$1" | grep -q "needs the rebot Python SDK"' _ "$out"
 
+# rebot-app-user: creates the program user in temp passwd/group/shadow files, idempotently
+echo "== rebot-app-user"
+USERTOOL=$KIT/usr/share/rebot-teleop/rebot-app-user
+UT=$(mktemp -d)
+printf 'root:x:0:0:root:/root:/bin/sh\nrecamera:x:1000:1000::/home/recamera:/bin/sh\n' > "$UT/passwd"
+printf 'root:x:0:\nrecamera:x:1000:\n' > "$UT/group"
+printf 'root:*:0:0:99999:7:::\n' > "$UT/shadow"
+run_tool() { env REBOT_APP_PASSWD="$UT/passwd" REBOT_APP_GROUP="$UT/group" REBOT_APP_SHADOW="$UT/shadow" "$@" sh "$USERTOOL"; }
+run_tool; r1=$?
+cp "$UT/passwd" "$UT/passwd.1"; cp "$UT/group" "$UT/group.1"; cp "$UT/shadow" "$UT/shadow.1"
+run_tool; r2=$?
+check "app-user: first run succeeds" [ "$r1" -eq 0 ]
+check "app-user: passwd entry, no login shell" sh -c "grep -Eq '^rebot-app:x:[0-9]+:[0-9]+:.*:(/bin/false|/sbin/nologin)\$' '$UT/passwd'"
+check "app-user: group entry with the same id" sh -c "[ \"\$(sed -n 's/^rebot-app:x:\([0-9]*\):.*/\1/p' '$UT/group')\" = \"\$(sed -n 's/^rebot-app:x:[0-9]*:\([0-9]*\):.*/\1/p' '$UT/passwd')\" ]"
+check "app-user: id is a system id not used by recamera" sh -c "! grep -q '^rebot-app:x:1000:' '$UT/passwd'"
+check "app-user: locked password in shadow" grep -q '^rebot-app:!:' "$UT/shadow"
+check "app-user: second run succeeds" [ "$r2" -eq 0 ]
+check "app-user: second run changes nothing" sh -c "cmp -s '$UT/passwd' '$UT/passwd.1' && cmp -s '$UT/group' '$UT/group.1' && cmp -s '$UT/shadow' '$UT/shadow.1'"
+check "app-user: exactly one entry" sh -c "[ \$(grep -c '^rebot-app:' '$UT/passwd') -eq 1 ] && [ \$(grep -c '^rebot-app:' '$UT/group') -eq 1 ]"
+env REBOT_APP_USER=root REBOT_APP_PASSWD="$UT/passwd" REBOT_APP_GROUP="$UT/group" sh "$USERTOOL" 2>/dev/null
+check "app-user: refuses root" [ "$?" -eq 2 ]
+check "runner: default user is rebot-app" grep -q 'RUN_USER=\${REBOT_APP_USER:-rebot-app}' "$RUNNER"
+rm -rf "$UT"
+
 run_suite /bin/sh
 if command -v busybox >/dev/null 2>&1 && busybox sh -c : 2>/dev/null; then
     run_suite "busybox sh"

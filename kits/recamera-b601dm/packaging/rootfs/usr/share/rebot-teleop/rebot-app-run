@@ -5,7 +5,8 @@
 # app.json {"entry": "main.py", "restart": "on-failure" | "always" | "never"} (default
 # on-failure). The program runs as `nice -n 5 python3 -u <entry>` in the app directory with
 # REBOT_HOST=127.0.0.1 and PYTHONPATH=/usr/share/rebot-teleop/python:<app dir>.
-# - User: the program runs as $REBOT_APP_USER (default recamera, unprivileged; HOME, USER and
+# - User: the program runs as $REBOT_APP_USER (default rebot-app, a system user created by the
+#   package's postinst with rebot-app-user; unprivileged; HOME, USER and
 #   LOGNAME set to it), never as root. A missing user, a root user, or a runner that is not
 #   root and asked for another user refuses the start (logged, state stopped, exit 1).
 # - Process group: the program starts in its own session; stop and restart signal the whole
@@ -20,8 +21,8 @@
 #   after the program has exited (on its own or on stop) every process of $REBOT_APP_USER
 #   whose start time (/proc/<pid>/stat field 22) is at or after the program's is sent
 #   SIGKILL. This assumes that user runs nothing but the app: its other processes started
-#   while the app ran (a login shell of the same user, for example) are killed too, so give
-#   the app a user of its own. A runner that is not root runs the program as its own user and
+#   while the app ran (a login shell of the same user, for example) are killed too, so the app
+#   has a user of its own (not the SSH login user recamera). A runner that is not root runs the program as its own user and
 #   does not do this (it would hit the runner's own processes).
 # - Log: stdout and stderr of the program and the runner's own lines are appended to
 #   $REBOT_APP_LOG_DIR/app-<name>.log (default /userdata/rebot-teleop/logs). The size is
@@ -47,7 +48,7 @@ LOG_MAX=${REBOT_APP_LOG_MAX:-524288}
 LOG_CHECK=${REBOT_APP_LOG_CHECK:-30}
 SDK_PATH=${REBOT_APP_PYTHONPATH:-/usr/share/rebot-teleop/python}
 PYTHON=${REBOT_APP_PYTHON:-python3}
-RUN_USER=${REBOT_APP_USER:-recamera}
+RUN_USER=${REBOT_APP_USER:-rebot-app}
 
 # python3 -I -S -c "$LAUNCH" <user> <pythonpath> <command...>: new session (own process group),
 # drop to <user> (supplementary groups from /etc/group), set PYTHONPATH, exec the command.

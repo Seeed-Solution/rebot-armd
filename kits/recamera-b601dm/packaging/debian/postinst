@@ -10,6 +10,17 @@ mkdir -p /userdata/datasets
 
 # user programs run by rebot-app-run (/userdata/rebot-apps/<name>/main.py); kept across upgrades
 mkdir -p /userdata/rebot-apps
+# ... as the system user rebot-app (no login, no password); created once, never removed.
+# The apps directory belongs to it (0755): programs can write their own files there and in
+# <name>/; the SDK, /userdata/rebot-teleop and armd's root-owned state stay read-only for it.
+# rebot-app-run refuses to start when the user is missing.
+if [ -x /usr/share/rebot-teleop/rebot-app-user ]; then
+    /usr/share/rebot-teleop/rebot-app-user || echo "warning: could not create user rebot-app; user programs will not start"
+fi
+if id rebot-app >/dev/null 2>&1; then
+    chown -R rebot-app:rebot-app /userdata/rebot-apps 2>/dev/null || true
+    chmod 0755 /userdata/rebot-apps 2>/dev/null || true
+fi
 
 # rebot-vision: config and user models live on /userdata (models are not in the package)
 mkdir -p /userdata/rebot-teleop/models

@@ -215,6 +215,7 @@ fi
 find "${STAGING_DIR}/usr/share/rebot-teleop" -type f -exec chmod 0644 {} +
 chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-vision-run"
 chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-app-run"
+chmod 0755 "${STAGING_DIR}/usr/share/rebot-teleop/rebot-app-user"
 
 # rebot-vision and the licence notices for the code it contains
 cp -f "${VISION_BIN}" "${STAGING_DIR}/usr/bin/rebot-vision"

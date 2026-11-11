@@ -1,0 +1,65 @@
+#!/bin/sh
+# rebot-app-user: creates the system user (and group) that rebot-app-run runs user programs as.
+# Called by the package's postinst; idempotent (an existing user or group is left as it is).
+# - User/group: $REBOT_APP_USER (default rebot-app), system uid/gid (highest free id in
+#   100..999), no password (locked), no login shell (/sbin/nologin, else /bin/false), home
+#   $REBOT_APPS_DIR (default /userdata/rebot-apps, not created here).
+# - Method: BusyBox addgroup/adduser -S when the real /etc/passwd and /etc/group are used and
+#   adduser exists; otherwise (or when adduser fails) a line is appended to the passwd, group
+#   and shadow files. /etc is an overlay on the device, so the files persist.
+# - Files, for tests: REBOT_APP_PASSWD, REBOT_APP_GROUP, REBOT_APP_SHADOW (setting any of them
+#   selects the append method; the shadow file is only written when it exists).
+# - Not touched: the user is never removed (prerm/postrm keep it, so files it owns keep a
+#   stable owner), and group memberships for GPIO / serial devices are a manual step.
+
+APP_USER=${REBOT_APP_USER:-rebot-app}
+APPS_DIR=${REBOT_APPS_DIR:-/userdata/rebot-apps}
+PASSWD=${REBOT_APP_PASSWD:-/etc/passwd}
+GROUP=${REBOT_APP_GROUP:-/etc/group}
+SHADOW=${REBOT_APP_SHADOW:-/etc/shadow}
+
+case "$APP_USER" in
+    ''|root|*[!a-z0-9_-]*) echo "rebot-app-user: invalid user name '$APP_USER'" >&2; exit 2 ;;
+esac
+
+has_entry() { [ -f "$2" ] && grep -q "^$1:" "$2"; }
+
+# free_id: highest id in 100..999 used neither as uid in $PASSWD nor as gid in $GROUP
+free_id() {
+    used=$(cut -d: -f3 "$PASSWD" "$GROUP" 2>/dev/null)
+    id=999
+    while [ "$id" -ge 100 ]; do
+        printf '%s\n' "$used" | grep -qx "$id" || { echo "$id"; return 0; }
+        id=$((id - 1))
+    done
+    return 1
+}
+
+SHELL_PATH=/bin/false
+[ -x /sbin/nologin ] && SHELL_PATH=/sbin/nologin
+
+has_entry "$APP_USER" "$PASSWD" && has_entry "$APP_USER" "$GROUP" && exit 0
+
+custom=0
+[ -n "$REBOT_APP_PASSWD$REBOT_APP_GROUP$REBOT_APP_SHADOW" ] && custom=1
+
+if [ "$custom" -eq 0 ] && command -v adduser >/dev/null 2>&1 && command -v addgroup >/dev/null 2>&1; then
+    has_entry "$APP_USER" "$GROUP" || addgroup -S "$APP_USER" 2>/dev/null
+    has_entry "$APP_USER" "$PASSWD" || adduser -S -D -H -h "$APPS_DIR" -s "$SHELL_PATH" -G "$APP_USER" "$APP_USER" 2>/dev/null
+    has_entry "$APP_USER" "$PASSWD" && has_entry "$APP_USER" "$GROUP" && exit 0
+fi
+
+id=$(free_id) || { echo "rebot-app-user: no free system id" >&2; exit 1; }
+if ! has_entry "$APP_USER" "$GROUP"; then
+    gid=$id
+    printf '%s:x:%s:\n' "$APP_USER" "$gid" >> "$GROUP" || exit 1
+else
+    gid=$(sed -n "s/^$APP_USER:[^:]*:\([0-9]*\):.*/\1/p" "$GROUP")
+fi
+if ! has_entry "$APP_USER" "$PASSWD"; then
+    printf '%s:x:%s:%s:rebot user programs:%s:%s\n' "$APP_USER" "$id" "$gid" "$APPS_DIR" "$SHELL_PATH" >> "$PASSWD" || exit 1
+    if [ -f "$SHADOW" ] && ! has_entry "$APP_USER" "$SHADOW"; then
+        printf '%s:!:0:0:99999:7:::\n' "$APP_USER" >> "$SHADOW"
+    fi
+fi
+exit 0
