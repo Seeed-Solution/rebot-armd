@@ -34,7 +34,7 @@ def http(url: str, body: dict | None = None, method: str | None = None) -> tuple
 def sim():
     s = Simulator(free_port(socket.SOCK_DGRAM), objects="cube,cup")
     yield s
-    s.sock.close()
+    s.close()
 
 
 def test_bad_reset_seed_is_answered_and_physics_keeps_running(sim):
@@ -178,7 +178,7 @@ def test_camera_publishes_no_frame_without_new_physics():
     pport = free_port()
     ready = sim.start_camera(15, (640, 360), "127.0.0.1", free_port(), pport, objects="cube")
     if "error" in ready:
-        sim.sock.close()
+        sim.close()
         pytest.skip(ready["error"])
     base, stop, mu = f"http://127.0.0.1:{pport}", threading.Event(), threading.Lock()
 
@@ -209,9 +209,7 @@ def test_camera_publishes_no_frame_without_new_physics():
     finally:
         stop.set()
         server.join(2)
-        sim.cam_proc.terminate()
-        sim.cam_proc.join(5)
-        sim.sock.close()
+        sim.close()
 
 
 def test_camera_reports_ready_only_after_its_encoders_exist():
@@ -221,12 +219,8 @@ def test_camera_reports_ready_only_after_its_encoders_exist():
     try:  # libx264 rejects an odd frame size when the encoder opens
         ready = s.start_camera(15, (641, 361), "127.0.0.1", free_port(), free_port(), objects="cube", timeout=30)
         assert "error" in ready, ready
-        s.cam_proc.join(5)
-        assert not s.cam_proc.is_alive()
     finally:
-        if s.cam_proc is not None and s.cam_proc.is_alive():
-            s.cam_proc.kill()
-        s.sock.close()
+        s.close()
 
 
 def test_physics_loop_reports_a_dead_camera_process():
@@ -244,6 +238,42 @@ def test_physics_loop_reports_a_dead_camera_process():
         s.run(duration=10)
         assert time.perf_counter() - t0 < 5 and "camera process exited" in s.camera_error
     finally:
-        if s.cam_proc.is_alive():
-            s.cam_proc.kill()
-        s.sock.close()
+        s.close()
+
+
+def _shm_exists(name: str) -> bool:
+    from multiprocessing import shared_memory
+
+    try:
+        shared_memory.SharedMemory(name=name, track=False).close()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def test_close_stops_the_camera_and_frees_everything():
+    from rebot_sim.camera import CameraMount
+
+    s = Simulator(free_port(socket.SOCK_DGRAM), objects="cube", camera_mount=CameraMount())
+    pport = free_port()
+    ready = s.start_camera(15, (640, 360), "127.0.0.1", free_port(), pport, objects="cube")
+    if "error" in ready:
+        s.close()
+        pytest.skip(ready["error"])
+    proc, name = s.cam_proc, s.shared.shm.name
+    s.close()
+    assert not proc.is_alive() and not _shm_exists(name) and s.sock.fileno() == -1
+    with pytest.raises(OSError):
+        urllib.request.urlopen(f"http://127.0.0.1:{pport}/api/mode", timeout=2)
+    s.close()  # idempotent
+
+
+def test_failed_camera_start_frees_the_child_and_shared_memory():
+    from rebot_sim.camera import CameraMount
+
+    s = Simulator(free_port(socket.SOCK_DGRAM), objects="cube", camera_mount=CameraMount())
+    try:
+        assert "error" in s.start_camera(15, (641, 361), "127.0.0.1", free_port(), free_port(), objects="cube")
+        assert s.cam_proc is None and s.shared is None and s.cam_conn is None
+    finally:
+        s.close()

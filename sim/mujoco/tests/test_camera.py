@@ -69,15 +69,14 @@ def live():
     vport, pport = free_port(), free_port()
     ready = sim.start_camera(15, (640, 360), "127.0.0.1", vport, pport, objects="cube,cup")
     if "error" in ready:
+        sim.close()
         pytest.skip(ready["error"])
     runner = threading.Thread(target=sim.run, daemon=True)  # physics: serves the shared state and /sim
     runner.start()
     yield sim, f"ws://127.0.0.1:{vport}/", f"http://127.0.0.1:{pport}"
     sim.stopping = True
     runner.join(2)
-    sim.cam_proc.terminate()
-    sim.cam_proc.join(5)
-    sim.sock.close()
+    sim.close()
 
 
 def test_stream_framing_and_decode(live):
@@ -159,7 +158,7 @@ def test_reset_is_deterministic_by_seed():
         assert a["seed"] == 7 and [o["pos"] for o in a["objects"]] == [o["pos"] for o in b["objects"]]
         assert a["objects"][0]["pos"][:2] == pytest.approx(list(sample_poses(objs, 7)[0][:2]), abs=1e-5)
     finally:
-        sim.sock.close()
+        sim.close()
 
 
 def test_perception_api_v2(live):

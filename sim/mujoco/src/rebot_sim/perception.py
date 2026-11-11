@@ -469,11 +469,24 @@ class SharedState:
         from multiprocessing import shared_memory
 
         size = (HDR + nq + nv) * 8
-        self.shm = shared_memory.SharedMemory(name=name, create=name is None, size=size)
+        self.owner = name is None  # the creator unlinks; an attached reader is not tracked
+        self.shm = shared_memory.SharedMemory(name=name, create=self.owner, size=size, track=self.owner)
         self.arr = np.ndarray((HDR + nq + nv,), dtype=np.float64, buffer=self.shm.buf)
         self.nq, self.nv = nq, nv
-        if name is None:
+        if self.owner:
             self.arr[:] = 0.0
+
+    def close(self) -> None:
+        """Release the mapping; the owner also unlinks the segment. Idempotent."""
+        if self.arr is None:
+            return
+        self.arr = None
+        self.shm.close()
+        if self.owner:
+            try:
+                self.shm.unlink()
+            except FileNotFoundError:
+                pass
 
     def write(self, data) -> None:
         a = self.arr

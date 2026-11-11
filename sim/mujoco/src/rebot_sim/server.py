@@ -344,6 +344,17 @@ class Simulator:
         self.cam_proc = ctx.Process(target=camera_main, name="rebot-sim-camera", daemon=True,
                                     args=(cfg, self.shared.shm.name, self.model.nq, self.model.nv, child, ready_w, os.getpid()))
         self.cam_proc.start()
+        child.close()
+        ready_w.close()
+        try:
+            ready = self._wait_ready(ready_r, timeout)
+        finally:
+            ready_r.close()
+        if "error" in ready:
+            self.stop_camera()
+        return ready
+
+    def _wait_ready(self, ready_r, timeout: float) -> dict:
         deadline = time.monotonic() + timeout
         while not ready_r.poll(0.1):  # watch the child: it can die before it reports
             if not self.cam_proc.is_alive():
@@ -354,6 +365,32 @@ class Simulator:
             return ready_r.recv()
         except EOFError:
             return {"error": "camera process exited during startup"}
+
+    def stop_camera(self) -> None:
+        """Stop and join the camera process, close its pipe, free the shared state. Idempotent."""
+        if self.cam_proc is not None:
+            self.cam_proc.terminate()
+            self.cam_proc.join(5)
+            if self.cam_proc.is_alive():
+                self.cam_proc.kill()
+                self.cam_proc.join(5)
+            self.cam_proc = None
+        if self.cam_conn is not None:
+            self.cam_conn.close()
+            self.cam_conn = None
+        if self.shared is not None:
+            shared, self.shared = self.shared, None
+            shared.close()
+
+    def close(self) -> None:
+        """Stop the physics loop and the camera, release the UDP socket. Idempotent; call it
+        after run() has returned."""
+        self.stopping = True
+        self.stop_camera()
+        self.sock.close()
+        if self.viewer is not None:
+            self.viewer.close()
+            self.viewer = None
 
     def service_camera(self) -> None:
         """Answer the camera process's /sim requests (physics thread)."""
@@ -498,6 +535,7 @@ def main(argv: list[str] | None = None) -> None:
                                  args.scene_stream, args.objects)
         if "error" in ready:
             print(f"rebot-sim: {ready['error']}", file=sys.stderr, flush=True)
+            sim.close()
             sys.exit(1)
         print(f"camera: {w}x{h} @ {args.fps} fps ({ready['backend']}, own process), mount rot {mount.rot_deg:g} tilt {mount.tilt_deg:g} "
               f"offset {mount.offset.round(4).tolist()}; video ws://{args.http_host}:{args.video_port}/, "
@@ -507,7 +545,7 @@ def main(argv: list[str] | None = None) -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        sim.stopping = True
+        sim.close()
     if sim.camera_error:
         sys.exit(1)
 
