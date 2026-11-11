@@ -208,6 +208,8 @@ pub struct SupervisorInner {
     pub unload_settle: Option<UnloadSettle>,
     /// Set while a park started by the lease watchdog is running.
     pub watchdog_park: Option<WatchdogPark>,
+    /// Set when the last park was refused because its path enters a keep-out box.
+    pub park_rejection: Option<SafetyError>,
     /// Duration of the most recently planned NormalUnload trajectory (s).
     pub unload_planned_duration: Option<f64>,
     pub recorder: EpisodeRecorder,
@@ -328,6 +330,7 @@ impl SupervisorInner {
             pending_normal_unload: false,
             unload_settle: None,
             watchdog_park: None,
+            park_rejection: None,
             unload_planned_duration: None,
             recorder: EpisodeRecorder::new(),
             start_time: now,
@@ -505,6 +508,36 @@ impl SupervisorInner {
         samples: impl IntoIterator<Item = &'a [f32]>,
     ) -> Result<(), SafetyError> {
         let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
+        self.check_path_against(ws, cam, start, samples)
+    }
+
+    /// [`check_workspace_path`](Self::check_workspace_path) against the keep-out boxes only
+    /// (no floor / box / reach): the part of the rule park may not bypass.
+    pub fn check_keepout_path<'a>(
+        &self,
+        start: &[f32],
+        samples: impl IntoIterator<Item = &'a [f32]>,
+    ) -> Result<(), SafetyError> {
+        let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
+        if ws.keepout_boxes.is_empty() { return Ok(()); }
+        let only = crate::model::WorkspacePolicy {
+            floor_z_m: f32::NEG_INFINITY,
+            box_min_m: [f32::NEG_INFINITY; 3],
+            box_max_m: [f32::INFINITY; 3],
+            max_reach_m: None,
+            check_points_end_m: ws.check_points_end_m.clone(),
+            keepout_boxes: ws.keepout_boxes.clone(),
+        };
+        self.check_path_against(&only, cam, start, samples)
+    }
+
+    fn check_path_against<'a>(
+        &self,
+        ws: &crate::model::WorkspacePolicy,
+        cam: &crate::model::CameraMount,
+        start: &[f32],
+        samples: impl IntoIterator<Item = &'a [f32]>,
+    ) -> Result<(), SafetyError> {
         let model = &self.config.arm_model;
         let v0 = model.workspace_violation(start, ws, cam);
         for q in samples {
@@ -949,8 +982,17 @@ impl SupervisorInner {
                         Some(1.5),
                         &self.planning_limits(),
                     ) {
-                        // Park is exempt from the workspace check: it must always remain possible.
+                        // Park is exempt from the floor / box / reach limits (it must remain
+                        // possible from a violating pose) but not from the keep-out boxes.
                         let samples = Self::trajectory_samples(&traj);
+                        if let Err(e) = self.check_keepout_path(&clamped_start, samples.iter().map(Vec::as_slice)) {
+                            tracing::warn!("Park path enters a keep-out box ({e}); not parking");
+                            self.park_rejection = Some(e);
+                            self.pending_normal_unload = false;
+                            self.unload_settle = None;
+                            self.active_trajectory = None;
+                            return;
+                        }
                         if let Err(e) = self.check_workspace_path(&clamped_start, samples.iter().map(Vec::as_slice)) {
                             tracing::warn!("Park path leaves the workspace ({e}); parking anyway");
                         }
@@ -1645,12 +1687,15 @@ impl SupervisorInner {
 
     /// Start a park (NormalUnload) and record it as a `park` action. Returns its id when
     /// the park started.
-    pub fn unload_action(&mut self) -> Option<u64> {
+    /// A park whose path enters a keep-out box is `WORKSPACE_VIOLATION`.
+    pub fn unload_action(&mut self) -> Result<Option<u64>, ArmError> {
+        self.park_rejection = None;
         self.execute_stop(StopPolicy::NormalUnload);
-        if !self.pending_normal_unload { return None; }
+        if let Some(e) = self.park_rejection.take() { return Err(e.into()); }
+        if !self.pending_normal_unload { return Ok(None); }
         let id = self.begin_action("park", None);
         if let Some(active) = self.active_trajectory.as_mut() { active.action_id = Some(id); }
-        Some(id)
+        Ok(Some(id))
     }
 
     /// Preconditions shared by Cartesian and gripper actions.

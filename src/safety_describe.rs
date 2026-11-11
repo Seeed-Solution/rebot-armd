@@ -105,7 +105,7 @@ impl SupervisorInner {
                 "effect": watchdog_effect,
                 "outcomes": {
                     "park_then_torque_off": "driver supports automatic unload and the profile has a resting pose: park at the resting pose, settle, torque off",
-                    "hold_and_fault": "otherwise, or when the park cannot start or exceeds its budget: hold position with torque on and latch WATCHDOG_TIMEOUT",
+                    "hold_and_fault": "otherwise, or when the park cannot start (no plan, or its path enters a keep-out box) or exceeds its budget: hold position with torque on and latch WATCHDOG_TIMEOUT",
                 },
                 "park_budget": {
                     "min_ms": ms(WATCHDOG_PARK_TIMEOUT),

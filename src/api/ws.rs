@@ -102,7 +102,7 @@ fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch:
             if !inner.safety.state().is_operational() {
                 return Err(ArmError::Safety(SafetyError::NotArmed(inner.safety.state().clone())).into());
             }
-            let id = inner.unload_action();
+            let id = inner.unload_action()?;
             let duration = inner.active_trajectory.as_ref().map_or(0.0, |t| t.duration()) + 0.8;
             return Ok(id.map(|id| (id, duration)));
         }

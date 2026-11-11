@@ -113,7 +113,7 @@ Servo frames while an action runs are rejected with `MOTION_BUSY`. Jog, preset, 
 
 ## Keep-out boxes / 禁入盒
 
-Axis-aligned boxes in the base frame that no workspace check point may enter. They are checked wherever the workspace rule applies (servo targets, every sample of Cartesian paths, the 21 samples of jog / home / preset / `move_to_pose` quintics; park is exempt as for the other limits) on the same check points (end_link origin, `check_points_end_m`, camera offset). Entering a box is `WORKSPACE_VIOLATION` with `keepout '<name>'` in the message; as with the other limits, a move that starts inside a box and does not go deeper is allowed.
+Axis-aligned boxes in the base frame that no workspace check point may enter. They are checked wherever the workspace rule applies (servo targets, every sample of Cartesian paths, the 21 samples of jog / home / preset / `move_to_pose` quintics; park is checked too: it is exempt from the floor, box and reach limits only, so a park through a box is `WORKSPACE_VIOLATION` and a watchdog park through a box holds position and latches `WATCHDOG_TIMEOUT`) on the same check points (end_link origin, `check_points_end_m`, camera offset). Entering a box is `WORKSPACE_VIOLATION` with `keepout '<name>'` in the message; as with the other limits, a move that starts inside a box and does not go deeper is allowed.
 
 - Profile: `workspace.keepout_boxes` (default empty, at most 16).
 - `GET /api/v1/workspace/keepout` returns `{"boxes":[...], "source":"profile"|"runtime"}`.

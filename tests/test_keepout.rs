@@ -138,3 +138,41 @@ async fn corrupt_keepout_file_is_ignored_and_left_untouched() {
     assert_eq!((state.source, state.boxes.len()), ("profile", 1));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"boxes\": [ broken");
 }
+
+/// A keep-out box on the park path from INSPECT (at the midpoint of the joint-space move home).
+fn park_blocking_box(inner: &SupervisorInner) -> KeepoutBox {
+    let mid: Vec<f32> = INSPECT.iter().zip(&inner.config.home_positions).map(|(a, b)| (a + b) / 2.0).collect();
+    let mut b = cube("on_park_path", tcp(&mid));
+    b.min_m = b.min_m.map(|v| v - 0.03);
+    b.max_m = b.max_m.map(|v| v + 0.03);
+    b
+}
+
+#[test]
+fn explicit_park_through_a_keepout_box_is_workspace_violation() {
+    let probe = sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    let mut inner = sim_at(with_boxes(vec![park_blocking_box(&probe)]), &INSPECT);
+    let err = inner.unload_action().unwrap_err();
+    let api = armd::api::rest::ApiError::from(err);
+    assert_eq!(api.code.as_deref(), Some("WORKSPACE_VIOLATION"), "{api:?}");
+    assert!(api.message.contains("keepout 'on_park_path'"), "{}", api.message);
+    assert!(!inner.pending_normal_unload && inner.active_trajectory.is_none(), "park must not start");
+    assert!(inner.is_torqued, "torque held");
+    // Without the box the same park starts.
+    let mut inner = sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    assert!(inner.unload_action().unwrap().is_some());
+}
+
+#[test]
+fn watchdog_park_through_a_keepout_box_holds_and_latches_watchdog_timeout() {
+    let probe = sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    let mut inner = sim_at(with_boxes(vec![park_blocking_box(&probe)]), &INSPECT);
+    inner.lease_enabled = true;
+    inner.lease_timeout = std::time::Duration::from_millis(10);
+    inner.last_heartbeat = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    inner.tick(0.02);
+    assert!(matches!(inner.safety.state(), armd::SafetyState::Fault(armd::safety::FaultReason::WatchdogTimeout)), "{:?}", inner.safety.state());
+    assert!(!inner.pending_normal_unload && inner.active_trajectory.is_none() && inner.is_torqued);
+    let moved = INSPECT.iter().zip(&inner.commanded_positions).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(moved < 1e-3, "held in place ({moved} rad)");
+}
