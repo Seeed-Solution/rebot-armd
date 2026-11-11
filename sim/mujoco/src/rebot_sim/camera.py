@@ -126,42 +126,27 @@ def grip_pixel_norm(r_end_cam: np.ndarray, offset: np.ndarray, height_m: float) 
             round(float((DETECTION_SIZE[1] / 2 + f * pc[1] / pc[2]) / DETECTION_SIZE[1]), 4)]
 
 
-def geom_points(model: mujoco.MjModel, data: mujoco.MjData, gid: int) -> np.ndarray:
-    """Points on the geom's surface whose projection bounds its image box (world frame)."""
-    size, pos, r = model.geom_size[gid], data.geom_xpos[gid], data.geom_xmat[gid].reshape(3, 3)
-    t = model.geom_type[gid]
-    if t == mujoco.mjtGeom.mjGEOM_BOX:
-        local = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]) * size
-    elif t == mujoco.mjtGeom.mjGEOM_CYLINDER:
-        a = np.linspace(0, 2 * np.pi, 24, endpoint=False)
-        ring = np.column_stack([np.cos(a), np.sin(a)]) * size[0]
-        local = np.vstack([np.column_stack([ring, np.full(24, z)]) for z in (-size[1], size[1])])
-    else:  # sphere and others: bounding sphere samples
-        g = np.array([[x, y, z] for x in (-1, 0, 1) for y in (-1, 0, 1) for z in (-1, 0, 1) if (x, y, z) != (0, 0, 0)], float)
-        local = g / np.linalg.norm(g, axis=1, keepdims=True) * model.geom_rbound[gid]
-    return pos + local @ r.T
+def segmentation_ids(seg: np.ndarray) -> np.ndarray:
+    """Geom id per pixel (-1 elsewhere) from a MuJoCo segmentation render (H x W x 2)."""
+    return np.where(seg[:, :, 1] == mujoco.mjtObj.mjOBJ_GEOM, seg[:, :, 0], -1)
 
 
-def detections(model: mujoco.MjModel, data: mujoco.MjData, cam_id: int, scene) -> list[dict]:
-    """Ground-truth boxes of the scene objects in the wrist image (rebot-vision format).
-
-    Box = bounds of the projected object surface points, clipped to the image; an object with
-    any point behind the camera or entirely outside the image is not reported. Occlusion (by
-    the gripper or other objects) is not modelled.
-    """
+def detections(geom_ids: np.ndarray, scene, min_pixels: int = 20) -> list[dict]:
+    """Ground-truth boxes of the scene objects (rebot-vision format) from a segmentation
+    render at DETECTION_SIZE: the bounds of each object's visible pixels, so occlusion (by the
+    gripper or another object) and the image edge are accounted for. Objects with fewer than
+    `min_pixels` visible pixels are not reported."""
+    h, w = geom_ids.shape
     out = []
-    w, h = DETECTION_SIZE
     for i, (obj, gid) in enumerate(zip(scene.objects, scene.geom_ids)):
-        px, depth = project_points(data, cam_id, geom_points(model, data, gid))
-        if np.any(depth <= 0.01):
+        ys, xs = np.nonzero(geom_ids == gid)
+        if len(xs) < min_pixels:
             continue
-        x0, y0 = np.clip(px.min(axis=0), 0, [w, h])
-        x1, y1 = np.clip(px.max(axis=0), 0, [w, h])
-        if x1 - x0 < 1 or y1 - y0 < 1:
-            continue
+        n0, n1 = round(int(xs.min()) / w, 4), round((int(xs.max()) + 1) / w, 4)
+        m0, m1 = round(int(ys.min()) / h, 4), round((int(ys.max()) + 1) / h, 4)
         out.append({"class_id": i, "format": "xywh_center", "class_name": obj.kind, "name": obj.name,
-                    "confidence": 0.99, "x": round((x0 + x1) / 2 / w, 4), "y": round((y0 + y1) / 2 / h, 4),
-                    "w": round((x1 - x0) / w, 4), "h": round((y1 - y0) / h, 4)})
+                    "confidence": 0.99, "x": (n0 + n1) / 2, "y": (m0 + m1) / 2,
+                    "w": round(n1 - n0, 4), "h": round(m1 - m0, 4), "pixels": int(len(xs))})
     return out
 
 

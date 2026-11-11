@@ -461,6 +461,8 @@ class CameraRig:
             self.model.vis.global_.offwidth = max(self.model.vis.global_.offwidth, w)
             self.model.vis.global_.offheight = max(self.model.vis.global_.offheight, h)
             renderer = mujoco.Renderer(self.model, h, w)
+            seg_renderer = mujoco.Renderer(self.model, self._cam.DETECTION_SIZE[1], self._cam.DETECTION_SIZE[0])
+            seg_renderer.enable_segmentation_rendering()
             self.backend = os.environ.get("MUJOCO_GL", "default")
             opt = mujoco.MjvOption()
             opt.sitegroup[:] = 0
@@ -485,7 +487,8 @@ class CameraRig:
             ts_ms = _now_ms()
             renderer.update_scene(self.data, camera="wrist", scene_option=opt)
             rgb = renderer.render()
-            dets = self._cam.detections(self.model, self.data, self.wrist_id, self.sim.scene)
+            seg_renderer.update_scene(self.data, camera="wrist", scene_option=opt)
+            dets = self._cam.detections(self._cam.segmentation_ids(seg_renderer.render()), self.sim.scene)
             self.frame_id += 1
             self.perception.on_frame(self.frame_id, ts_ms, captured, dets)
             for path, stream in self.streams.items():
