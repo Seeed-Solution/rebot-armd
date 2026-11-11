@@ -264,6 +264,14 @@ pub fn num(body: &Value, key: &str) -> Result<Option<f64>, MotionError> {
     }
 }
 
+/// Optional boolean `key`; `default` when absent or null.
+pub fn flag(body: &Value, key: &str, default: bool) -> Result<bool, MotionError> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v.as_bool().ok_or_else(|| MotionError::InvalidCommand(format!("{key} must be a boolean"))),
+    }
+}
+
 fn vec_n<const N: usize>(v: &Value, key: &str) -> Result<[f64; N], MotionError> {
     let arr = v.as_array().filter(|a| a.len() == N)
         .ok_or_else(|| MotionError::InvalidCommand(format!("{key} must be an array of {N} numbers")))?;

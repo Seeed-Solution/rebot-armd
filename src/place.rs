@@ -22,7 +22,7 @@ use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
 
 pub const DEFAULT_APPROACH_M: f64 = 0.08;
 pub const APPROACH_RANGE_M: (f64, f64) = (0.02, 0.30);
-pub const MIN_SPEED_SCALE: f64 = 0.1;
+pub use crate::poses::MIN_SPEED_SCALE;
 /// Lift is skipped when the TCP is already this close to (or above) the lift height.
 const LIFT_EPS_M: f64 = 1e-3;
 /// One sub-motion wait never exceeds this.
@@ -53,13 +53,6 @@ impl PlaceRequest {
 
 fn invalid(m: impl Into<String>) -> ArmError { MotionError::InvalidCommand(m.into()).into() }
 
-fn boolean(body: &Value, key: &str, default: bool) -> Result<bool, ArmError> {
-    match body.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(v) => v.as_bool().ok_or_else(|| invalid(format!("{key} must be a boolean"))),
-    }
-}
-
 /// Body of `/api/v1/action/place` (named poses looked up in `inner`).
 pub fn parse_place(inner: &SupervisorInner, body: &Value) -> Result<PlaceRequest, ArmError> {
     let has = |k: &str| body.get(k).is_some_and(|v| !v.is_null());
@@ -67,9 +60,7 @@ pub fn parse_place(inner: &SupervisorInner, body: &Value) -> Result<PlaceRequest
     let requested = motion::parse_orientation(body)?;
     let (pose, target, orientation) = if has("pose") {
         let name = body["pose"].as_str().ok_or_else(|| invalid("pose must be a string"))?;
-        let stored = inner.poses.list.poses.iter().find(|p| p.name == name).ok_or_else(|| ArmError::Rejected {
-            status: 404, code: "POSE_NOT_FOUND".into(), message: format!("No pose named '{name}'"),
-        })?;
+        let stored = inner.poses.find(name)?;
         // the stored TCP; poses saved without kinematics carry none, so use FK of the positions
         let tcp = match &stored.tcp {
             Some(t) => Pose::new(kinematics::rpy_to_r(t.rpy[0], t.rpy[1], t.rpy[2]), t.position),
@@ -85,12 +76,11 @@ pub fn parse_place(inner: &SupervisorInner, body: &Value) -> Result<PlaceRequest
     if !(APPROACH_RANGE_M.0..=APPROACH_RANGE_M.1).contains(&approach_m) {
         return Err(invalid(format!("approach_height_m must be in [{}, {}]", APPROACH_RANGE_M.0, APPROACH_RANGE_M.1)));
     }
-    let speed_scale = motion::num(body, "speed_scale")?.unwrap_or(1.0);
-    if !(MIN_SPEED_SCALE..=1.0).contains(&speed_scale) { return Err(invalid(format!("speed_scale must be in [{MIN_SPEED_SCALE}, 1.0]"))); }
+    let speed_scale = crate::poses::speed_scale(body)?;
     Ok(PlaceRequest {
         pose, target, orientation, approach_m,
-        release: boolean(body, "release", true)?,
-        retreat: boolean(body, "retreat", true)?,
+        release: motion::flag(body, "release", true)?,
+        retreat: motion::flag(body, "retreat", true)?,
         speed_scale,
         tag: motion::tag(body)?,
     })

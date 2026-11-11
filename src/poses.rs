@@ -51,11 +51,18 @@ pub struct PoseStore {
     pub path: Option<PathBuf>,
 }
 
+impl PoseStore {
+    /// The stored pose `name`, or `POSE_NOT_FOUND`.
+    pub(crate) fn find(&self, name: &str) -> Result<&NamedPose, ArmError> {
+        self.list.poses.iter().find(|p| p.name == name).ok_or_else(|| not_found(name))
+    }
+}
+
 pub fn valid_name(name: &str) -> bool {
     (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-fn not_found(name: &str) -> ArmError {
+pub(crate) fn not_found(name: &str) -> ArmError {
     ArmError::Rejected { status: 404, code: "POSE_NOT_FOUND".into(), message: format!("No pose named '{name}'") }
 }
 
@@ -105,7 +112,7 @@ impl SupervisorInner {
     /// Joint-space quintic of J1..J6 (and J7 with `include_gripper`) to a stored pose,
     /// recorded as a `move_to_pose` action. Returns (action id, expected duration).
     pub fn move_to_pose(&mut self, name: &str, include_gripper: bool, speed_scale: f64, tag: Option<String>, epoch: u64) -> Result<(u64, f64), ArmError> {
-        let pose = self.poses.list.poses.iter().find(|p| p.name == name).ok_or_else(|| not_found(name))?;
+        let pose = self.poses.find(name)?;
         check_positions(&pose.positions, &self.config).map_err(invalid)?;
         let mut target = self.commanded_positions.clone();
         let gripper_idx = self.config.gripper_index();
@@ -154,17 +161,20 @@ pub fn delete(inner: &mut SupervisorInner, body: &Value) -> Result<Option<Pendin
     Ok(inner.poses_write())
 }
 
-/// Action `/api/v1/action/move_to_pose` `{name, include_gripper?, speed_scale?, tag?}`.
-pub fn start_action(inner: &mut SupervisorInner, body: &Value, epoch: u64) -> Result<(u64, f64), ArmError> {
-    let name = name_of(body)?;
-    let include_gripper = match body.get("include_gripper") {
-        None | Some(Value::Null) => false,
-        Some(v) => v.as_bool().ok_or_else(|| invalid("include_gripper must be a boolean"))?,
-    };
+/// Optional `speed_scale` in [MIN_SPEED_SCALE, 1.0], default 1.0.
+pub(crate) fn speed_scale(body: &Value) -> Result<f64, ArmError> {
     let speed_scale = motion::num(body, "speed_scale")?.unwrap_or(1.0);
     if !(MIN_SPEED_SCALE..=1.0).contains(&speed_scale) {
         return Err(invalid(format!("speed_scale must be in [{MIN_SPEED_SCALE}, 1.0]")));
     }
+    Ok(speed_scale)
+}
+
+/// Action `/api/v1/action/move_to_pose` `{name, include_gripper?, speed_scale?, tag?}`.
+pub fn start_action(inner: &mut SupervisorInner, body: &Value, epoch: u64) -> Result<(u64, f64), ArmError> {
+    let name = name_of(body)?;
+    let include_gripper = motion::flag(body, "include_gripper", false)?;
+    let speed_scale = speed_scale(body)?;
     let tag = motion::tag(body)?;
     inner.move_to_pose(&name, include_gripper, speed_scale, tag, epoch)
 }
