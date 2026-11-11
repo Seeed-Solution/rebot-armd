@@ -90,10 +90,17 @@ init 脚本把 `can0` 设为 1 Mbit/s，与机械臂一致。
 | POS_VEL lag gain 1.5 (basis of the 0.45 rad/s planned-speed cap) | measured 2026-11-09; listed under "needs verification" | docs/agent_action_api.md |
 | Camera image upright with the v5 mount | observed on the arm | `hardware/v7_tilt/README.txt` |
 | Gravity compensation (hand-guiding) | verified on hardware: exit paths held within 1.5 mrad, 30 s recording gave 1509 frames | README, docs/control_safety_contract.md checklist |
+| Collision thresholds in the profile (`collision.thresholds_nm` 2.0, 1.19, 2.82, 1.43, 0.87, 0.28 N·m, `enabled: false`) | `rebot-sysid` on the arm 2026-11-11, one session, ±0.08 rad at two poses; needs validation at more poses before enabling | `profile/rebot-b601dm.json`, docs/simulation.md |
 | Tap-to-grasp | simulation and screenshot tests only | README, docs/plan_tap_to_grasp.md |
 | `camera_mount` (`tilt_deg`, `offset_m`) for camera-frame moves | needs verification | docs/agent_action_api.md |
 | Planning time on the SG2002 | needs verification | docs/agent_action_api.md |
 | v7_tilt mounts | not printed or fitted | `hardware/v7_tilt/README.txt` |
+
+The collision guard stays off in the profile (`collision.enabled: false`). The thresholds come
+from one `rebot-sysid` session on one arm at two poses (B601-DM, 2026-11-11, sweeps ±0.08 rad);
+residuals vary with pose, load and motor temperature, so run `rebot-sysid` at more poses (and
+with warm motors) and compare before enabling the guard in the profile or at runtime
+(`/api/v1/safety/collision`).
 
 Object detection and ArUco come from `rebot-vision`, which is part of this kit's package
 (README "Install on reCamera"); no separate camera app is needed.
@@ -109,10 +116,15 @@ Object detection and ArUco come from `rebot-vision`, which is part of this kit's
 | POS_VEL 滞后增益 1.5（0.45 rad/s 规划限速的依据） | 2026-11-09 实测，列在「需实机核实」 | docs/agent_action_api.md |
 | v5 支架下画面方向为正 | 实机观察 | `hardware/v7_tilt/README.txt` |
 | 重力补偿（拖动示教） | 实机验证：各退出路径位置偏差不超过 1.5 mrad，30 s 录制 1509 帧 | README、docs/control_safety_contract.md 清单 |
+| profile 中的碰撞阈值（`collision.thresholds_nm` 2.0、1.19、2.82、1.43、0.87、0.28 N·m，`enabled: false`） | 2026-11-11 在实机上用 `rebot-sysid` 测得：一次测试、两个姿态、±0.08 rad；启用前须在更多姿态下验证 | `profile/rebot-b601dm.json`、docs/simulation.md |
 | 点框抓取 | 仅仿真与截图测试 | README、docs/plan_tap_to_grasp.md |
 | 相机坐标系运动用的 `camera_mount`（`tilt_deg`、`offset_m`） | 需实机核实 | docs/agent_action_api.md |
 | SG2002 上的规划耗时 | 需实机核实 | docs/agent_action_api.md |
 | v7_tilt 支架 | 未打印、未试装 | `hardware/v7_tilt/README.txt` |
+
+profile 中碰撞检测保持关闭（`collision.enabled: false`）。阈值来自一台机械臂上的一次 `rebot-sysid`
+测试、两个姿态（B601-DM，2026-11-11，扫动 ±0.08 rad）；残差随姿态、负载和电机温度变化，因此在 profile
+或运行时（`/api/v1/safety/collision`）启用前，应在更多姿态下（并在电机升温后）运行 `rebot-sysid` 并对比结果。
 
 目标检测和 ArUco 由 `rebot-vision` 提供，包含在本套件的安装包内（README「在 reCamera 上安装」），无需另装相机应用。
 

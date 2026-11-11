@@ -815,7 +815,13 @@ impl ArmConfig {
                 DamiaoRange::REBOT_DM_J4_J7,
             ]),
             speed_cap: None,
-            collision: None,
+            // rebot-sysid on the real arm (B601-DM, 2026-11-11, ±0.08 rad, one session at two
+            // poses): off until validated at more poses (kits/recamera-b601dm/README.md)
+            collision: Some(crate::collision::CollisionPolicy {
+                enabled: false,
+                thresholds_nm: [2.0, 1.19, 2.82, 1.43, 0.87, 0.28],
+                ..Default::default()
+            }),
             hardware: None,
             urdf: None,
             urdf_sha256: None,

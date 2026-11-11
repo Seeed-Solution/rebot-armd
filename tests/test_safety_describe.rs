@@ -185,7 +185,7 @@ async fn collision_stop_only_with_the_capability_and_follows_the_runtime_setting
     assert!(guarded.get_schema().await.capabilities.collision_guard);
     let d = describe(&guarded).await;
     let c = stop(&d, "collision_protective_stop").unwrap();
-    let p = armd::collision::CollisionPolicy::default();
+    let p = ArmConfig::rebot_dm().collision.unwrap_or_default();
     assert_eq!(c["enabled"], p.enabled);
     assert_eq!(c["sensitivity"], "medium");
     assert_eq!(c["thresholds_nm"], json!(p.thresholds_nm));
