@@ -154,6 +154,16 @@ run_suite() {
     run_fg '../x'
     check "invalid name: runner exits 2" [ "$RC" -eq 2 ]
 
+    # 10b. app.json values are not glob-expanded (a file named entry=other.py in the cwd)
+    new_app glob 'print("must not run")'
+    printf '%s\n' 'print("literal entry")' > "$T/apps/glob/o*.py"
+    printf '%s\n' 'print("globbed entry")' > "$T/apps/glob/other.py"
+    printf '%s\n' '{"entry": "o*.py", "restart": "never"}' > "$T/apps/glob/app.json"
+    mkdir -p "$T/cwd" && : > "$T/cwd/entry=other.py"
+    (cd "$T/cwd" && run_fg glob)
+    check "manifest: entry taken literally" log_has glob "literal entry"
+    check "manifest: no glob expansion" sh -c "! grep -q 'globbed entry' '$T/logs/app-glob.log'"
+
     # 11. program user: REBOT_APP_USER; unknown user or root refuses the start
     new_app who 'import os; print("UID=%d HOME=%s" % (os.getuid(), os.environ["HOME"]))'
     run_fg who

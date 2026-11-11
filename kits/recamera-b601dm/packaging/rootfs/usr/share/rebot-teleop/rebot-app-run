@@ -141,12 +141,14 @@ try:
 except Exception:
     pass
 " "$APP_DIR/app.json" 2>/dev/null)
-    for kv in $out; do
+    while IFS= read -r kv; do
         case "$kv" in
             entry=*) entry=${kv#entry=} ;;
             restart=*) restart=${kv#restart=} ;;
         esac
-    done
+    done <<EOF
+$out
+EOF
 }
 
 main() {
