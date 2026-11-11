@@ -617,13 +617,18 @@ impl CamModel {
 
 /// Rotate `r` minimally so the tool axis (end_link x) points straight down.
 pub fn look_down(r: &Mat3) -> Mat3 {
-    let x = kinematics::column(r, 0);
+    rotate_down(r, kinematics::column(r, 0), kinematics::column(r, 1))
+}
+
+/// Rotate `r` minimally so the base-frame direction `v` points straight down; when `v` points
+/// straight up, turn by pi about `flip`.
+fn rotate_down(r: &Mat3, v: Vec3, flip: Vec3) -> Mat3 {
     let down = [0.0, 0.0, -1.0];
-    let axis = kinematics::cross(&x, &down);
-    let (s, c) = (kinematics::norm(&axis), kinematics::dot(&x, &down));
+    let axis = kinematics::cross(&v, &down);
+    let (s, c) = (kinematics::norm(&axis), kinematics::dot(&v, &down));
     if s < 1e-9 {
         if c > 0.0 { return *r; }
-        return kinematics::mat_mul(&kinematics::axis_r(&kinematics::column(r, 1), std::f64::consts::PI), r);
+        return kinematics::mat_mul(&kinematics::axis_r(&flip, std::f64::consts::PI), r);
     }
     kinematics::mat_mul(&kinematics::axis_r(&kinematics::unit(&axis), s.atan2(c)), r)
 }
@@ -632,16 +637,7 @@ pub fn look_down(r: &Mat3) -> Mat3 {
 /// down. From a tool-vertical `r` this pitches the tool by the mount tilt about x_cam, so the
 /// heading is kept and `look_down` of the result is `r` again.
 pub fn camera_down(r: &Mat3, rec: &Mat3) -> Mat3 {
-    let z = kinematics::mat_vec(r, &kinematics::column(rec, 2));
-    let down = [0.0, 0.0, -1.0];
-    let axis = kinematics::cross(&z, &down);
-    let (s, c) = (kinematics::norm(&axis), kinematics::dot(&z, &down));
-    if s < 1e-9 {
-        if c > 0.0 { return *r; }
-        let x_cam = kinematics::mat_vec(r, &kinematics::column(rec, 0));
-        return kinematics::mat_mul(&kinematics::axis_r(&x_cam, std::f64::consts::PI), r);
-    }
-    kinematics::mat_mul(&kinematics::axis_r(&kinematics::unit(&axis), s.atan2(c)), r)
+    rotate_down(r, kinematics::mat_vec(r, &kinematics::column(rec, 2)), kinematics::mat_vec(r, &kinematics::column(rec, 0)))
 }
 
 /// Whether a grasp with `setup` on `mount` acquires camera-down (`acquire_camera_down`).
@@ -675,11 +671,6 @@ pub fn envelope(ws: Option<&WorkspacePolicy>, mount: &CameraMount, rec: &Mat3) -
     pts
 }
 
-/// Lowest envelope point below the TCP at orientation `r` (m, <= 0; the TCP counts).
-fn lowest_below_tcp(r: &Mat3, pts: &[Vec3]) -> f64 {
-    pts.iter().map(|p| kinematics::mat_vec(r, p)[2]).fold(0.0, f64::min)
-}
-
 /// Samples of the straight Cartesian path `from` → `to` as `motion::plan_cartesian`
 /// interpolates it (linear position, rotation along the geodesic): (s, pose), s in (0, 1].
 fn path_samples(from: &Pose, to: &Pose) -> Vec<(f64, Pose)> {
@@ -689,7 +680,7 @@ fn path_samples(from: &Pose, to: &Pose) -> Vec<(f64, Pose)> {
     (1..=n).map(|k| {
         let s = k as f64 / n as f64;
         let r = if k == n { to.r } else { kinematics::mat_mul(&kinematics::exp_r(&w.map(|v| v * s)), &from.r) };
-        (s, Pose::new(r, [from.p[0] + dp[0] * s, from.p[1] + dp[1] * s, from.p[2] + dp[2] * s]))
+        (s, Pose::new(r, kinematics::add(&from.p, &dp.map(|v| v * s))))
     }).collect()
 }
 
@@ -715,11 +706,13 @@ pub fn acquisition_z(r_cd: &Mat3, setup: &GraspSetup, pts: &[Vec3]) -> f64 {
     let z_end = setup.table_z_m + setup.approach_height_m;
     let bound = setup.table_z_m + TABLE_CLEARANCE_M;
     let w = kinematics::log_v(&kinematics::mul_t(&look_down(r_cd), r_cd));
-    // at s the TCP is at z0 (1 − s) + z_end s and must be at least bound − lowest(s)
+    // at s the TCP is at z0 (1 − s) + z_end s and must be at least bound − lowest(s), with
+    // lowest(s) the lowest envelope point relative to the TCP (<= 0, the TCP counts)
     (0..50).map(|k| {
         let s = k as f64 / 50.0;
         let r = kinematics::mat_mul(&kinematics::exp_r(&w.map(|v| v * s)), r_cd);
-        (bound - lowest_below_tcp(&r, pts) - z_end * s) / (1.0 - s)
+        let lowest = pts.iter().map(|p| kinematics::mat_vec(&r, p)[2]).fold(0.0, f64::min);
+        (bound - lowest - z_end * s) / (1.0 - s)
     }).fold(z_end, f64::max)
 }
 
@@ -836,15 +829,18 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     let target = cam.plane_point(&pose, centre, grasp_plane(setup)).ok_or_else(|| ArmError::from(MotionError::InvalidCommand(
         "the box centre ray does not meet the table plane in front of the camera".into())))?;
     let camera_down = camera_down_mode(setup, &input.cam).map_err(MotionError::InvalidCommand)?;
-    let pts = envelope(input.ws.as_ref(), &input.cam, &cam.rec);
-    let goal = if camera_down { camera_down_pose(&pose.r, &target, setup, &cam, &pts) } else { approach_pose(&pose.r, &target, setup) };
-    if camera_down {
+    let goal = if camera_down {
+        let pts = envelope(input.ws.as_ref(), &input.cam, &cam.rec);
+        let goal = camera_down_pose(&pose.r, &target, setup, &cam, &pts);
         // the pitched envelope stays above the table on the approach and the transition
         let tool = approach_pose(&goal.r, &target, setup);
         if let Some(e) = table_violation(&pose, &goal, &pts, setup.table_z_m).or_else(|| table_violation(&goal, &tool, &pts, setup.table_z_m)) {
             return Err(e.into());
         }
-    }
+        goal
+    } else {
+        approach_pose(&pose.r, &target, setup)
+    };
     let mut open_input = input.clone();
     open_input.j7 = open_rad;
     let path = motion::plan_cartesian(&open_input, goal, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
@@ -1096,10 +1092,7 @@ impl Orchestrator {
 
     /// Camera-down: the straight path `from` → `to` keeps the envelope above the table.
     fn table_clear(&self, from: &Pose, to: &Pose) -> Result<(), Stop> {
-        match table_violation(from, to, &self.envelope, self.setup.table_z_m) {
-            Some(e) => Err(crate::macro_action::arm_fail(e.into())),
-            None => Ok(()),
-        }
+        table_violation(from, to, &self.envelope, self.setup.table_z_m).map_or(Ok(()), |e| Err(crate::macro_action::arm_fail(e.into())))
     }
 
     /// After the camera-down transition, when the model projects the target `t` into the
