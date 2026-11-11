@@ -164,3 +164,51 @@ def test_trigger_adds_its_pipelines_to_the_next_frame_and_shares_the_result(api)
     assert out["pipelines"]["yolo"]["ran"] and out["pipelines"]["aruco"]["ran"] and out["detections"] == dets
     code, lat = http(base + "/api/results/latest")
     assert lat["frame_id"] == 2 and lat["pipelines"] == out["pipelines"] and "requested" not in lat
+
+
+def test_camera_publishes_no_frame_without_new_physics():
+    """The camera process renders only physics states it has not rendered yet; results and
+    /sim/state carry the physics time of the frame."""
+    import threading
+    import time
+
+    from rebot_sim.camera import CameraMount
+
+    sim = Simulator(free_port(socket.SOCK_DGRAM), objects="cube", camera_mount=CameraMount())
+    pport = free_port()
+    ready = sim.start_camera(15, (640, 360), "127.0.0.1", free_port(), pport, objects="cube")
+    if "error" in ready:
+        sim.sock.close()
+        pytest.skip(ready["error"])
+    base, stop, mu = f"http://127.0.0.1:{pport}", threading.Event(), threading.Lock()
+
+    def pipe_only():  # answers /sim requests; the physics does not step
+        while not stop.is_set():
+            with mu:
+                sim.service_camera()
+            time.sleep(0.005)
+
+    server = threading.Thread(target=pipe_only, daemon=True)
+    server.start()
+    try:
+        deadline = time.time() + 20
+        while http(base + "/sim/camera")[1]["render"]["frames"] < 1 and time.time() < deadline:
+            time.sleep(0.05)
+        code, r = http(base + "/api/trigger", {"pipelines": ["yolo"], "wait_ms": 800})
+        assert code == 200 and r["success"] is False and r["timeout"], "frame published without new physics"
+        with mu:
+            for _ in range(3):
+                sim.step()
+        t = round(sim.data.time, 6)
+        code, r = http(base + "/api/trigger", {"pipelines": ["yolo"], "wait_ms": 2000})
+        assert r["success"] and r["physics_time"] == pytest.approx(t, abs=1e-6)
+        code, st = http(base + "/sim/state")
+        assert code == 200 and st["camera"]["physics_time"] == pytest.approx(t, abs=1e-6)
+        assert st["camera"]["lag_s"] == pytest.approx(0.0, abs=1e-6) and st["camera"]["stale"] is False
+        assert st["camera"]["skipped"] > 0
+    finally:
+        stop.set()
+        server.join(2)
+        sim.cam_proc.terminate()
+        sim.cam_proc.join(5)
+        sim.sock.close()

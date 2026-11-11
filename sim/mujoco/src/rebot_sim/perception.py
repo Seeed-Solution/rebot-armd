@@ -164,12 +164,14 @@ class Perception:
                 "expires_in_ms": max(0, int((s["expires"] - time.monotonic()) * 1000))}
 
     # ---- frames
-    def on_frame(self, frame_id: int, ts_ms: int, captured: float, detections: list[dict]) -> None:
+    def on_frame(self, frame_id: int, ts_ms: int, captured: float, detections: list[dict],
+                 physics_time: float = 0.0, physics_step: int = 0) -> None:
         """A rendered wrist frame (called by the render thread); `captured` = time.monotonic()
-        when the simulator state was copied."""
+        when the simulator state (physics step `physics_step` at `physics_time` s) was copied."""
         now = time.monotonic()
         with self.cond:
-            self.frame = {"frame_id": frame_id, "ts_ms": ts_ms, "mono": captured, "detections": detections}
+            self.frame = {"frame_id": frame_id, "ts_ms": ts_ms, "mono": captured, "detections": detections,
+                          "physics_time": round(physics_time, 6), "physics_step": physics_step}
             self.frames_in = [t for t in self.frames_in if now - t < 2.0] + [now]
             # One plan per frame, as rebot-vision's frame_plan: the continuous pipelines when the
             # rate lets this frame through, plus those of every trigger registered before it.
@@ -189,7 +191,8 @@ class Perception:
         ran = {p: p in pipelines for p in PIPELINES}
         body = {
             "api_version": API_VERSION, "success": True, "mode": self.mode, "frame_id": frame["frame_id"],
-            "ts_ms": frame["ts_ms"], "mono": frame["mono"], "inference_time_ms": 0.1, "width": 640, "height": 360,
+            "ts_ms": frame["ts_ms"], "mono": frame["mono"], "physics_time": frame["physics_time"],
+            "physics_step": frame["physics_step"], "inference_time_ms": 0.1, "width": 640, "height": 360,
             "pipelines": {p: {"ran": ran[p], "ms": 0.1 if ran[p] else 0.0} for p in PIPELINES},
             "detections": frame["detections"] if ran["yolo"] else [],
             "count": 0, "family": "aruco4x4_50", "undistorted": False, "rejected": 0, "markers": [],
@@ -455,11 +458,12 @@ class PerceptionServer:
 # 220 Hz, while a separate rendering process left it at 500 Hz. The simulator publishes
 # its state in shared memory (seqlock) and answers /sim requests over a pipe.
 
-HDR = 4  # shared float64 slots: seq, sim time, camera frames, camera ms/frame
+HDR = 5  # shared float64 slots: seq, sim time, camera frames, camera ms/frame, physics step
 
 
 class SharedState:
-    """Simulator state in shared memory: [seq, time, frames, frame_ms, qpos..., qvel...]."""
+    """Simulator state in shared memory: [seq, time, frames, frame_ms, step, qpos..., qvel...].
+    `step` counts the physics states written, so a reader can tell whether physics advanced."""
 
     def __init__(self, nq: int, nv: int, name: str | None = None):
         from multiprocessing import shared_memory
@@ -475,21 +479,26 @@ class SharedState:
         a = self.arr
         a[0] += 1  # odd: writing
         a[1] = data.time
+        a[4] += 1
         a[HDR:HDR + self.nq] = data.qpos
         a[HDR + self.nq:] = data.qvel
         a[0] += 1
 
-    def read(self, data) -> bool:
+    def read(self, data) -> int | None:
+        """Copy a consistent state into `data`; returns its physics step, or None (and leaves
+        `data` alone) when nothing was written yet or no consistent copy was had."""
         a = self.arr
         for _ in range(1000):
             s1 = a[0]
             if s1 % 2:
                 continue
-            qpos, qvel, t = a[HDR:HDR + self.nq].copy(), a[HDR + self.nq:].copy(), a[1]
+            qpos, qvel, t, step = a[HDR:HDR + self.nq].copy(), a[HDR + self.nq:].copy(), a[1], a[4]
             if a[0] == s1:
+                if s1 == 0:
+                    return None
                 data.qpos[:], data.qvel[:], data.time = qpos, qvel, t
-                return s1 > 0
-        return False
+                return int(step)
+        return None
 
 
 class SimLink:
@@ -540,6 +549,8 @@ class CameraRig:
             self.streams["/scene"] = VideoStream()
         self.perception = Perception(max_fps=min(15, self.fps))
         self.frame_id = 0
+        self.physics_step: int | None = None  # physics step of the newest frame
+        self.skipped = 0  # camera ticks without a new physics state (nothing published)
         self.render_ms: list[float] = []
         self.backend = os.environ.get("MUJOCO_GL", "default")
         self._cam = cam
@@ -549,7 +560,18 @@ class CameraRig:
         return self.link.call(("reset", seed))
 
     def sim_state(self):
-        return self.link.call(("state",))
+        """The simulator's state plus the camera's: the newest frame's physics time and how far
+        it is behind the physics now (`stale` past two camera periods)."""
+        out = self.link.call(("state",))
+        with self.perception.cond:
+            frame = self.perception.frame
+        lag = float(self.state.arr[1]) - frame["physics_time"] if frame else None
+        out["camera"] = {"frame_id": frame["frame_id"] if frame else 0,
+                         "physics_time": frame["physics_time"] if frame else None,
+                         "physics_step": frame["physics_step"] if frame else None,
+                         "lag_s": None if lag is None else round(lag, 6), "skipped": self.skipped,
+                         "stale": frame is None or lag > 2.0 / self.fps}
+        return out
 
     def camera_info(self) -> dict:
         cam, m = self._cam, self.mount
@@ -582,23 +604,27 @@ class CameraRig:
         next_t = time.perf_counter()
         while os.getppid() == parent_pid:
             t0 = time.perf_counter()
-            self.state.read(self.data)
-            captured = time.monotonic()
-            ts_ms = _now_ms()
-            mujoco.mj_forward(self.model, self.data)
-            seg_renderer.update_scene(self.data, camera="wrist", scene_option=opt)
-            dets = self._cam.detections(self._cam.segmentation_ids(seg_renderer.render()), self.scene)
-            self.frame_id += 1
-            self.perception.on_frame(self.frame_id, ts_ms, captured, dets)
-            for path, stream in self.streams.items():
-                if not stream.active:
-                    continue
-                renderer.update_scene(self.data, camera="wrist" if path == "/" else "scene", scene_option=opt)
-                au = encoders[path].encode(renderer.render(), keyframe=stream.take_idr_request())
-                if au:
-                    stream.publish(au, ts_ms, 5 in _nal_types(au))
-            self.render_ms = (self.render_ms + [(time.perf_counter() - t0) * 1000])[-100:]
-            self.state.arr[2], self.state.arr[3] = self.frame_id, float(np.mean(self.render_ms))
+            step = self.state.read(self.data)
+            if step is None or step == self.physics_step:  # no new physics: publish nothing
+                self.skipped += 1
+            else:
+                self.physics_step = step
+                captured = time.monotonic()
+                ts_ms = _now_ms()
+                mujoco.mj_forward(self.model, self.data)
+                seg_renderer.update_scene(self.data, camera="wrist", scene_option=opt)
+                dets = self._cam.detections(self._cam.segmentation_ids(seg_renderer.render()), self.scene)
+                self.frame_id += 1
+                self.perception.on_frame(self.frame_id, ts_ms, captured, dets, self.data.time, step)
+                for path, stream in self.streams.items():
+                    if not stream.active:
+                        continue
+                    renderer.update_scene(self.data, camera="wrist" if path == "/" else "scene", scene_option=opt)
+                    au = encoders[path].encode(renderer.render(), keyframe=stream.take_idr_request())
+                    if au:
+                        stream.publish(au, ts_ms, 5 in _nal_types(au))
+                self.render_ms = (self.render_ms + [(time.perf_counter() - t0) * 1000])[-100:]
+                self.state.arr[2], self.state.arr[3] = self.frame_id, float(np.mean(self.render_ms))
             next_t += period
             now = time.perf_counter()
             if next_t > now:
