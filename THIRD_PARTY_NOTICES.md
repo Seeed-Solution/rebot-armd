@@ -57,6 +57,16 @@ DEALINGS IN THE SOFTWARE.
   that are not included here; armd does not load meshes. They are available from the
   upstream repository under the same license.
 
+## reBot B601-RS robot description (URDF)
+
+- File: `assets/ReBot_Arm_RS.urdf`, read at startup by armd when a profile names it
+  (`profiles/rebot_b601_rs.json`).
+- Upstream: https://github.com/Seeed-Projects/reBot-DevArm,
+  `Rebot_Arm_description/RS/urdf/ReBot_Arm_RS.urdf` at commit `a3155aa`, unmodified
+  (sha256 `3838ca8f9d586be22a89b33c7cbdd4abd43d4a92a2de377b294eef4c5bd7654d`).
+- License: CERN-OHL-W-2.0, as the B601-DM URDF above. Not covered by the MIT License of this
+  repository. The meshes it refers to are not included.
+
 ## reCamera mount CAD (kit hardware)
 
 - Files: `kits/recamera-b601dm/hardware/` (v5 and v7_tilt STEP/STL, previews, generator,
