@@ -132,6 +132,8 @@ class Perception:
         self.frame: dict | None = None  # newest rendered frame: id, ts_ms, mono, detections
         self.latest: dict | None = None  # newest published result
         self.triggers = 0
+        self.pending: list[dict] = []  # registered triggers: {"called": mono, "pipelines": [...]}
+        self._gate = 0.0  # mono of the last frame the continuous rate let through
         self.frames_in: list[float] = []
         self.results_out: list[float] = []
 
@@ -169,15 +171,21 @@ class Perception:
         with self.cond:
             self.frame = {"frame_id": frame_id, "ts_ms": ts_ms, "mono": captured, "detections": detections}
             self.frames_in = [t for t in self.frames_in if now - t < 2.0] + [now]
-            cont = self.continuous()
-            if cont["active"]:
-                last = self.latest["mono"] if self.latest else 0.0
-                if now - last >= 1.0 / max(cont["fps"], 1) - 0.005:
-                    self.latest = self.result(self.frame, cont["pipelines"], None)
-                    self.results_out = [t for t in self.results_out if now - t < 2.0] + [now]
+            # One plan per frame, as rebot-vision's frame_plan: the continuous pipelines when the
+            # rate lets this frame through, plus those of every trigger registered before it.
+            cont, plan = self.continuous(), set()
+            if cont["active"] and now - self._gate >= 1.0 / max(cont["fps"], 1) - 0.005:
+                plan |= set(cont["pipelines"])
+                self._gate = now
+            for t in self.pending:
+                if t["called"] < captured:
+                    plan |= set(t["pipelines"])
+            if plan:
+                self.latest = self.result(self.frame, [p for p in PIPELINES if p in plan])
+                self.results_out = [t for t in self.results_out if now - t < 2.0] + [now]
             self.cond.notify_all()
 
-    def result(self, frame: dict, pipelines: list[str], requested: list[str] | None) -> dict:
+    def result(self, frame: dict, pipelines: list[str]) -> dict:
         ran = {p: p in pipelines for p in PIPELINES}
         body = {
             "api_version": API_VERSION, "success": True, "mode": self.mode, "frame_id": frame["frame_id"],
@@ -186,8 +194,6 @@ class Perception:
             "detections": frame["detections"] if ran["yolo"] else [],
             "count": 0, "family": "aruco4x4_50", "undistorted": False, "rejected": 0, "markers": [],
         }
-        if requested is not None:
-            body["requested"] = requested
         return body
 
     @staticmethod
@@ -378,15 +384,24 @@ class PerceptionServer:
             req = _pipelines(body["pipelines"]) if "pipelines" in body else None
             pipes = req if req is not None else (MODE_PIPELINES[p.mode] or MODE_PIPELINES[p.last_active])
             called = time.monotonic()
-            ok = p.cond.wait_for(lambda: p.frame is not None and p.frame["mono"] > called, wait / 1000)
+            after = p.latest["frame_id"] if p.latest else 0
+            entry = {"called": called, "pipelines": pipes}
+            p.pending.append(entry)  # the next frame's plan includes these pipelines
+
+            def fresh() -> bool:
+                r = p.latest
+                return (r is not None and r["frame_id"] > after and r["mono"] > called
+                        and all(r["pipelines"][x]["ran"] for x in pipes))
+
+            try:
+                ok = p.cond.wait_for(fresh, wait / 1000)
+            finally:
+                p.pending.remove(entry)
             if not ok:
                 return 200, {"api_version": API_VERSION, "success": False, "timeout": True, "count": 0,
                              "detections": [], "markers": []}
             p.triggers += 1
-            res = p.result(p.frame, pipes, pipes)
-            if p.latest is None or p.latest["frame_id"] < res["frame_id"]:
-                p.latest = res
-            return 200, p.public(res)
+            return 200, p.public({**p.latest, "requested": pipes})
 
     def latest(self, qs: dict) -> tuple[int, dict]:
         p = self.p

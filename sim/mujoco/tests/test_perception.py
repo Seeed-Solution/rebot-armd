@@ -141,3 +141,26 @@ def test_mode_body_is_validated_before_anything_changes(api, body):
     after = http(base + "/api/mode")[1]
     assert {k: after[k] for k in ("mode", "enabled", "fps", "last_active_mode", "max_fps")} == \
         {k: before[k] for k in ("mode", "enabled", "fps", "last_active_mode", "max_fps")}
+
+
+def test_trigger_adds_its_pipelines_to_the_next_frame_and_shares_the_result(api):
+    """API v2 union (kits/recamera-b601dm/vision VisionControl::frame_plan): a trigger's
+    pipelines join the next frame's continuous plan; that one result answers the trigger and
+    becomes `latest`."""
+    import threading
+    import time
+
+    srv, _, base = api
+    assert http(base + "/api/subscribe", {"client": "t", "pipelines": ["yolo"], "fps": 15})[0] == 200
+    dets = [{"class_name": "cube"}]
+    srv.p.on_frame(1, 1000, time.monotonic(), dets)  # continuous result before the trigger
+    out = {}
+    t = threading.Thread(target=lambda: out.update(http(base + "/api/trigger", {"pipelines": ["aruco"]})[1]))
+    t.start()
+    time.sleep(0.3)  # trigger registered
+    srv.p.on_frame(2, 1100, time.monotonic(), dets)
+    t.join(5)
+    assert out["success"] and out["frame_id"] == 2 and out["requested"] == ["aruco"]
+    assert out["pipelines"]["yolo"]["ran"] and out["pipelines"]["aruco"]["ran"] and out["detections"] == dets
+    code, lat = http(base + "/api/results/latest")
+    assert lat["frame_id"] == 2 and lat["pipelines"] == out["pipelines"] and "requested" not in lat
