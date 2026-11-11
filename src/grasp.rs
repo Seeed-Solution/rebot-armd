@@ -724,6 +724,8 @@ pub struct PlannedGrasp {
     pub approach_duration: f64,
     /// Camera-down acquisition ([`camera_down_mode`]).
     pub camera_down: bool,
+    /// Estimated duration of the camera-down → tool-vertical move (0 without camera-down).
+    pub transition_duration: f64,
 }
 
 /// Under the lock: parse and check preconditions.
@@ -766,7 +768,18 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     let mut open_input = input.clone();
     open_input.j7 = open_rad;
     let path = motion::plan_cartesian(&open_input, goal, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
-    Ok(PlannedGrasp { input, request, target, approach_duration: path.duration, camera_down })
+    let transition_duration = if camera_down { transition_estimate(&goal, &target, setup) } else { 0.0 };
+    Ok(PlannedGrasp { input, request, target, approach_duration: path.duration, camera_down, transition_duration })
+}
+
+/// Duration of the transition from the camera-down pose `from` to the tool-vertical pose
+/// above `target`, from the planner's Cartesian speed bound (quintic peak 1.875 / T, +10 %);
+/// joint speed limits can make it longer.
+pub fn transition_estimate(from: &Pose, target: &Vec3, setup: &GraspSetup) -> f64 {
+    let to = approach_pose(&from.r, target, setup);
+    let length = kinematics::norm(&kinematics::sub(&to.p, &from.p));
+    let theta = kinematics::angle_between(&to.r, &from.r);
+    1.1 * 1.875 * (length / setup.approach_speed_mps).max(theta / motion::DEFAULT_ANGULAR_RPS)
 }
 
 /// Rough total duration for the ack.
@@ -774,7 +787,9 @@ pub fn expected_duration(planned: &PlannedGrasp) -> f64 {
     let s = &planned.request.setup;
     let descend = (s.approach_height_m - s.grasp_height_m) * 1.875 / s.descend_speed_mps;
     let lift = (s.lift_height_m - s.grasp_height_m) * 1.875 / s.descend_speed_mps;
-    6.5 + planned.approach_duration + 4.0 * 1.5 + descend + 2.0 + lift
+    let base = 6.5 + planned.approach_duration + 4.0 * 1.5 + descend + 2.0 + lift;
+    // camera-down: the transition move and its re-check frame
+    if planned.camera_down { base + planned.transition_duration + 1.5 } else { base }
 }
 
 /// Start a grasp without a WS lease check (tests, in-process agents): prepare, plan, begin
