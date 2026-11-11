@@ -142,7 +142,7 @@ rebot-vision perception API version 2 ([detection_api.md](detection_api.md)): `G
 
 `tests/test_camera_grasp.py` starts `rebot-sim --camera` and `armd --follower sim` with `ARMD_DETECTOR_URL` pointing at the simulator, homes, moves the tool down above the cube at 0.20 m, triggers one detection through armd (`/api/v1/detection/trigger`), and sends `/api/v1/action/grasp` with the cube's box. armd gets a copy of the kit profile with `camera_mount.offset_m` set to the simulator's lens centre; the request overrides `grip_pixel_norm` (from `/sim/camera` at the 0.15 m approach height) and `fx_px` / `fy_px` (824). The grasp macro (`src/grasp.rs`) then runs as on the arm: approach, centring on fresh triggered frames, J6 alignment, descend, close, lift. Pass: action `done` with `holding: true`, the cube `grasped` in `/sim/state`, lifted more than 5 cm, within 3 cm of the TCP.
 
-Result (spark-6124, 2026-11-11, `pytest -s tests/test_camera_grasp.py`, 2 passed in 135 s):
+Result (spark-6124, 2026-11-11, `pytest -s tests/test_camera_grasp.py`, v5 cases; 2 passed in 135 s, the same numbers again with the camera-down change, 37.2 s for the seed 3 case):
 
 | case | detection at the view pose (640x360, normalised) | centring corrections | final error | grasp duration | cube after the lift |
 |---|---|---|---|---|---|
@@ -151,7 +151,16 @@ Result (spark-6124, 2026-11-11, `pytest -s tests/test_camera_grasp.py`, 2 passed
 
 In the default case armd's camera model matches the simulator exactly (same mount, lens centre and fx), so the approach lands centred. armd itself does not compute the grip pixel or the lens centre; on the arm they come from the grasp setup and the profile.
 
-v8 holder (tilt −38°): with the tool pointing straight down, the table point under the jaw tips appears at image v = 0.66 (normalised) at 0 m below the tips, 0.10 at 0.05 m and leaves the top of the image (v < 0) beyond about 0.06 m (`grip_pixel_norm` at 0.15 m: v = −0.40). The grasp macro's centring needs that point in the image at the approach height (`grip_pixel_norm` in [0, 1], `approach_height_m` ≥ `grasp_height_m` + 0.02), so the v8 mount does not fit the current look-down macro. Computed from the mount geometry; not tried on the arm.
+v8 holder (tilt −38°): with the tool pointing straight down, the table point under the jaw tips appears at image v = 0.66 (normalised) at 0 m below the tips, 0.10 at 0.05 m and leaves the top of the image (v < 0) beyond about 0.06 m (`grip_pixel_norm` at 0.15 m: v = −0.40), so look-down centring onto `grip_pixel_norm` cannot run at the approach height. armd acquires camera-down for this mount (`acquire_camera_down: auto`, [agent_action_api.md](agent_action_api.md#camera-down-acquisition--相机朝下采集)): approach and centring with the optical axis vertical, then a transition move to the tool-vertical pose above the target.
+
+The v8 cases (`v8_default`, `v8_seed3_cube_cup`) start `rebot-sim` with `--camera-rot-deg 90 --camera-tilt-deg -38` and give armd the same `camera_mount` (`rot_deg` 90, `tilt_deg` −38, the simulator's lens centre). The view pose has the tool pitched half way from vertical toward camera-down (19°), with the image centre ray 2 cm from the cube; the request overrides `fx_px` / `fy_px` and `approach_height_m` 0.15, not `grip_pixel_norm`. Result (same run, 4 passed in 270 s):
+
+| case | detection at the view pose (640x360, normalised) | centring corrections | final error (to the image centre) | grasp duration (expected) | cube after the lift |
+|---|---|---|---|---|---|
+| v8, default cube at (0.30, 0) | x 0.457, y 0.461, w 0.173, h 0.017 (mostly hidden by the jaws) | 2 | 10.0 px | 37.4 s (38.2 s) | `grasped`, lifted 0.105 m, both jaws in contact, 0.1 mm from its start in x, y |
+| v8, `--objects cube,cup --seed 3`, cube at (0.232, −0.074) | x 0.453, y 0.432, w 0.091, h 0.075 | 3 | 5.5 px | 35.8 s (37.4 s) | `grasped`, lifted 0.105 m, cup untouched |
+
+`final_offset_px` is absent in both: at the 0.15 m approach the target under the jaws is outside the image after the transition, so no re-check frame is taken. Simulation only; not tried on the arm.
 
 ## Friction identification (`rebot-sysid`)
 

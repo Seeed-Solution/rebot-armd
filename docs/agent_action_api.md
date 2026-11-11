@@ -84,7 +84,7 @@ Every observation carries `action` (latest record) and, for 2 s after a newer ac
            "holding":null, "gripper_gap_rad":null, "settled":null}
 ```
 
-`kind`: `move_to`, `move_relative`, `gripper`, `grasp`, `place`, `joint_move`, `home`, `park`, `move_to_pose`. A `grasp` record also carries `phase`, `iteration` and `error_px`; a `place` record carries `phase` (all three are null for other kinds). `state`: `running`, `done`, `failed`, `cancelled`. `started_at` / `finished_at` use the observation `timestamp` clock. Clients block by waiting until `action.id == action_id` and `state != "running"`, or until `previous_action.id == action_id`.
+`kind`: `move_to`, `move_relative`, `gripper`, `grasp`, `place`, `joint_move`, `home`, `park`, `move_to_pose`. A `grasp` record also carries `phase`, `iteration` and `error_px`, and, for camera-down acquisition, `final_offset_px` and `acquire_height_m` (fields absent otherwise); a `place` record carries `phase` (all three are null for other kinds). `state`: `running`, `done`, `failed`, `cancelled`. `started_at` / `finished_at` use the observation `timestamp` clock. Clients block by waiting until `action.id == action_id` and `state != "running"`, or until `previous_action.id == action_id`.
 
 A running action ends when its reference goes away:
 
@@ -161,9 +161,9 @@ Needs a 7-DOF profile with `kinematics`, `gripper_policy` and `grasp` (the built
 
 ### Before the ack / 应答之前
 
-Under the lock: lease, epoch, request_id, body, then the same preconditions as other actions (`MOTION_BUSY` etc.). Outside the lock: the box centre ray (setup intrinsics, current commanded pose, `camera_mount`) is intersected with the plane z = `table_z_m + grasp_height_m` to estimate the target; the look-down approach pose above it is planned with the gripper open. A planning failure is a `command_reject` with the planner's code (`IK_UNREACHABLE`, `IK_BRANCH_FLIP`, `WORKSPACE_VIOLATION`, 422); a ray that does not meet the table in front of the camera is `INVALID_COMMAND`. Then the action begins and the ack carries `action_id` and a rough `expected_duration_s`.
+Under the lock: lease, epoch, request_id, body, then the same preconditions as other actions (`MOTION_BUSY` etc.). Outside the lock: the box centre ray (setup intrinsics, current commanded pose, `camera_mount`) is intersected with the plane z = `table_z_m + grasp_height_m` to estimate the target; the approach pose above it (look-down, or camera-down, see [Camera-down acquisition](#camera-down-acquisition--相机朝下采集)) is planned with the gripper open. A planning failure is a `command_reject` with the planner's code (`IK_UNREACHABLE`, `IK_BRANCH_FLIP`, `WORKSPACE_VIOLATION`, 422); a ray that does not meet the table in front of the camera, or `acquire_camera_down: "on"` without `camera_mount.offset_m`, is `INVALID_COMMAND`. Then the action begins and the ack carries `action_id` and a rough `expected_duration_s`.
 
-锁内校验租约、epoch、request_id、请求体和动作前置条件；锁外用框中心射线与平面 z = `table_z_m + grasp_height_m` 求交估计目标位置，并以夹爪张开状态规划俯视接近位姿。规划失败直接 `command_reject`（`IK_UNREACHABLE` / `IK_BRANCH_FLIP` / `WORKSPACE_VIOLATION`，422）；射线不与桌面相交返回 `INVALID_COMMAND`。
+锁内校验租约、epoch、request_id、请求体和动作前置条件；锁外用框中心射线与平面 z = `table_z_m + grasp_height_m` 求交估计目标位置，并以夹爪张开状态规划接近位姿（俯视；相机朝下采集时为光轴竖直）。规划失败直接 `command_reject`（`IK_UNREACHABLE` / `IK_BRANCH_FLIP` / `WORKSPACE_VIOLATION`，422）；射线不与桌面相交、或 `acquire_camera_down: "on"` 而 `camera_mount.offset_m` 未设置，返回 `INVALID_COMMAND`。
 
 ### Phases / 阶段
 
@@ -172,8 +172,9 @@ An async task outside the supervisor lock and the control tick runs the phases; 
 | phase | what happens |
 |---|---|
 | `open` | gripper `open` |
-| `approach` | move_to above the estimate at `table_z_m + approach_height_m`, tool axis (end_link x) straight down, heading kept (minimal rotation) |
-| `centring` | closed loop: wait for frames captured `settle_delay_s` after the last motion settled, match the target, take the median centre of `median_frames` frames; done when within `centre_tol_px` of the grip pixel for `stable_frames` consecutive frames; otherwise step = `servo_gain` × (table point of the box centre − table point of the grip pixel), at most `max_step_m`, as a base-frame move_relative. `iteration` = corrections made, `error_px` = latest error. More than `max_iterations` corrections → `CENTRING_FAILED` |
+| `approach` | move_to above the estimate at `table_z_m + approach_height_m`, tool axis (end_link x) straight down, heading kept (minimal rotation). Camera-down: optical axis straight down instead, lens centre above the estimate (below) |
+| `centring` | closed loop: wait for frames captured `settle_delay_s` after the last motion settled, match the target, take the median centre of `median_frames` frames; done when within `centre_tol_px` of the grip pixel (camera-down: of the image centre) for `stable_frames` consecutive frames; otherwise step = `servo_gain` × (table point of the box centre − table point of the grip pixel / image centre), at most `max_step_m`, as a base-frame move_relative. `iteration` = corrections made, `error_px` = latest error. More than `max_iterations` corrections → `CENTRING_FAILED` |
+| `transition` | camera-down only: one Cartesian move to the tool-vertical pose above the target's table point at approach height; then a re-check frame (below) |
 | `align` | when the box's long / short side ratio ≥ `align_min_aspect` and the jaws (end_link y in the image) would close across the long side: roll ±90° about the tool axis (the sign that keeps J6 inside its limits) |
 | `descend` | straight down to `table_z_m + grasp_height_m` at `descend_speed_mps` |
 | `close` | gripper `close` with grasp detection; `holding` per `gripper_policy` |
@@ -181,9 +182,9 @@ An async task outside the supervisor lock and the control tick runs the phases; 
 | `lift` | straight up to `table_z_m + lift_height_m` |
 | `done` | `state:"done"`, `holding:true`, `gripper_gap_rad`; the jaw keeps its hold target in `commanded_positions[6]` |
 
-由锁外异步任务按阶段执行，`action.phase` / `action.progress` 报告当前阶段。对中阶段只用运动停稳之后拍到的帧；像素误差按粗略内参和 FK 已知高度换算为米，再乘保守增益，所以内参或安装角不准只会多走几步，不会发散。
+由锁外异步任务按阶段执行，`action.phase` / `action.progress` 报告当前阶段：`open` → `approach` → `centring` →（仅相机朝下采集）`transition` → `align` → `descend` → `close` →（未抓住）`release` → `lift` → `done`。对中阶段只用运动停稳之后拍到的帧；停稳之前拍到的帧不延长 `lost_timeout_s`（从请求和停稳时刻中较晚者起算），超时为 `TARGET_LOST`；像素误差按粗略内参和 FK 已知高度换算为米，再乘保守增益，所以内参或安装角不准只会多走几步，不会发散。
 
-Target tracking: same label, centre within `match_dist_px` of the predicted centre or IoU > `match_iou`; the first match after the approach uses the wider `acquire_dist_px` around the projection of the estimate. No match in `lost_frames` fresh frames or for `lost_timeout_s` → `TARGET_LOST`. No frames at all for max(3 s, `lost_timeout_s`) → `TARGET_LOST`; a detector error → `DETECTION_UNAVAILABLE`. If inference was off, the grasp turns it on and turns it off again when it ends (any outcome).
+Target tracking: same label, centre within `match_dist_px` of the predicted centre or IoU > `match_iou`; the first match after the approach uses the wider `acquire_dist_px` around the projection of the estimate. No match in `lost_frames` fresh frames or for `lost_timeout_s` → `TARGET_LOST`; frames captured before the motion settled do not extend `lost_timeout_s` (counted from the later of the request and the settle time). No frames at all for max(3 s, `lost_timeout_s`) → `TARGET_LOST`; a detector error → `DETECTION_UNAVAILABLE`. If inference was off, the grasp turns it on and turns it off again when it ends (any outcome).
 
 Every motion is a sub-motion of the one grasp record: it is installed under the lock only while the grasp is still the running action of the same lease and epoch, and sub-motion results go to the orchestrator, not to `action`. A motion longer than its planned duration × 2 + 5 s (gripper: expected duration + 10 s), capped at `phase_timeout_s`,, or the whole grasp longer than `timeout_s`, stops the motion and ends as `GRASP_TIMEOUT`. Sub-motion failures (`TRACKING_STALL`, `GRIPPER_TIMEOUT`, planner codes) end the grasp with that code.
 
@@ -199,6 +200,31 @@ Ending a grasp from outside:
 The record ends in the same tick; a sub-motion still carrying the grasp is stopped, and the orchestrator issues nothing more. Servo frames are rejected with `MOTION_BUSY` for the whole grasp, including the waits between motions.
 
 外部停止（停止、急停、租约丢失、被新指令替代）在同一 tick 内结束动作记录，仍在执行的子运动被停止，编排任务不再下发任何运动。抓取期间（包括两次运动之间的等待）servo 帧一律返回 `MOTION_BUSY`。
+
+### Camera-down acquisition / 相机朝下采集
+
+For a camera mount pitched toward the jaws (v8 holder: `camera_mount` `rot_deg` 90, `tilt_deg` −38), the table point under the jaw tips is outside the image at approach height when the tool points straight down, so the look-down centring above cannot run. The setup field `acquire_camera_down` selects the acquisition:
+
+| value | acquisition |
+|---|---|
+| `auto` (default) | camera-down when \|`camera_tilt_deg`\| > 5° and `camera_mount.offset_m` is set; look-down otherwise |
+| `on` | camera-down; without `camera_mount.offset_m` the request is `INVALID_COMMAND` |
+| `off` | look-down |
+
+Camera-down phases:
+
+- `approach`: orientation = the look-down orientation rotated minimally so the optical axis (camera z) points straight down, i.e. the tool pitched by the mount tilt about x_cam, heading kept. Position: lens centre (FK + `camera_mount.offset_m`) above the estimate in x, y; TCP at `table_z_m + approach_height_m`.
+- `centring`: the loop above with the image centre (`image_size_px` / 2) as the aim point instead of `grip_pixel_norm`; gains, limits, `stable_frames`, `max_iterations` unchanged.
+- `transition`: the ray through the last matched box centre (within `centre_tol_px` of the image centre) is intersected with the plane z = `table_z_m + grasp_height_m`; one planned Cartesian move (IK, workspace and keep-out checks as every motion) goes to the tool-vertical pose with the TCP above that point at approach height. Then, when the camera model projects the target into the image at the new pose, one fresh frame verifies it before the descent: no match (`lost_frames` / `lost_timeout_s`, gate `acquire_dist_px` around the projection) → `TARGET_LOST`; a detector error → `DETECTION_UNAVAILABLE`; box centre more than `recheck_tol_px` from the projection → `TARGET_DISPLACED`. `final_offset_px` = [dx, dy] of the matched box centre minus `grip_pixel_norm` in pixels (a diagnostic; the displacement check uses the projection, so an uncalibrated grip pixel does not fail it). When the target is not expected in view (for example the v8 holder at a 0.15 m approach) nothing is checked and `final_offset_px` is absent.
+- `align`, `descend`, `close`, `lift`: as above; J6 alignment uses the last box of the centring.
+
+Table clearance (camera-down only): the pitched gripper reaches below the TCP (with the kit check points up to 57 mm at a 38° pitch about the end_link z axis, 21 mm about the y axis), and the workspace check compares against `workspace.floor_z_m`, not the table. The acquisition therefore raises the TCP above `table_z_m + approach_height_m` when needed so that the TCP, every `workspace.check_points_end_m` point, the lens centre and the 8 corners of the camera body box stay at least 5 mm above `table_z_m` at the camera-down orientation and along the transition (the raised height is `action.acquire_height_m`, above the table; absent when not raised). The camera body box is `camera_mount.body_size_m` [width along x_cam, height along y_cam, depth behind the lens along −z_cam] (m, optional, each in (0, 0.2]); the default 0.055 x 0.047 x 0.040 is the reCamera housing (40 x 40 x 36.5 mm) in the v8 holder (walls, ears, support, top bar and rear lip from the holder's generator), lens at the centre of the front face. It is used only for the camera-down clearance, not in the general workspace check, so the look-down grasp and other motions are unchanged; the general check still counts the lens centre only. With the kit check points and the v8 mount the gripper points, not the body, set the raised height; a mount whose body reaches lower than the gripper is rejected or raised by the same rule. The approach path, each centring step and the transition path are sampled (5 mm / 1.1°) against the same bound before they are issued; a violation is `WORKSPACE_VIOLATION` (a `command_reject` for the approach, the action's code later). A path that starts below the bound may move as long as no point goes lower.
+
+The accuracy of the transition depends on `camera_tilt_deg`, `camera_mount.rot_deg` and `offset_m`: an error in them moves the grasp point (in the simulated-camera test, a 2° tilt, 1° rot, 5 % focal length and (6, −4) px principal point error gave a 9 mm grasp point error at a 0.15 m approach). `expected_duration_s` adds the transition move and 1.5 s for the re-check frame. With \|`camera_tilt_deg`\| ≤ 5° (v5 mount) `auto` keeps the look-down acquisition unchanged. Validated in simulation only (`cargo test --test test_grasp camera_down`, `sim/mujoco/tests/test_camera_grasp.py` v8 cases); not run on the arm.
+
+相机安装向夹爪方向俯仰时（v8 支架：`camera_mount` `rot_deg` 90、`tilt_deg` −38），工具竖直朝下时夹爪尖正下方的桌面点在接近高度处不在画面内，上面的俯视对中无法进行。抓取设置字段 `acquire_camera_down` 选择采集方式：`auto`（默认）在 \|`camera_tilt_deg`\| > 5° 且 `camera_mount.offset_m` 已设置时用相机朝下采集，否则俯视；`on` 始终相机朝下，`camera_mount.offset_m` 未设置时请求返回 `INVALID_COMMAND`；`off` 始终俯视。
+
+相机朝下采集的阶段：`approach` 将俯视姿态做最小旋转使光轴竖直向下（工具绕 x_cam 俯仰安装倾角，朝向不变），镜头中心（FK + `camera_mount.offset_m`）在 x、y 上位于估计点正上方，TCP 高度为 `table_z_m + approach_height_m`；`centring` 与上面的闭环相同，目标点改为画面中心（`image_size_px` / 2），增益、步长上限、`stable_frames`、`max_iterations` 不变；`transition` 用最后一次匹配框中心（距画面中心不超过 `centre_tol_px`）的射线与平面 z = `table_z_m + grasp_height_m` 求交，一次规划的笛卡尔运动（与其他运动一样做 IK、工作空间和禁入区检查）移到 TCP 位于该点上方接近高度、工具竖直的位姿；之后若相机模型预测目标在新位姿的画面内，下降前取一帧新图复查：未匹配到（`lost_frames` / `lost_timeout_s`，以投影为中心、门限 `acquire_dist_px`）为 `TARGET_LOST`，检测器出错为 `DETECTION_UNAVAILABLE`，框中心距投影超过 `recheck_tol_px` 为 `TARGET_DISPLACED`；`final_offset_px` = 匹配框中心减 `grip_pixel_norm` 的像素差 [dx, dy]（诊断用；位移判断以投影为准，抓取像素未标定不会导致失败）；预测目标不在画面内时（如 v8 支架、0.15 m 接近高度）不做复查，`final_offset_px` 缺省；`align`、`descend`、`close`、`lift` 不变，J6 对齐使用对中阶段最后一个框。桌面间隙（仅相机朝下采集）：俯仰后的夹爪会低于 TCP（套件检查点在绕 end_link z 轴俯仰 38° 时最多低 57 mm，绕 y 轴时 21 mm），而工作空间检查比较的是 `workspace.floor_z_m`，不是桌面。因此采集时在需要时把 TCP 抬高到 `table_z_m + approach_height_m` 以上，使 TCP、所有 `workspace.check_points_end_m` 点、镜头中心和相机机身方盒的 8 个角点在相机朝下姿态及整个转换过程中都高于 `table_z_m` 至少 5 mm（抬高后的高度见 `action.acquire_height_m`，相对桌面；未抬高时缺省）。相机机身方盒为 `camera_mount.body_size_m` [沿 x_cam 宽、沿 y_cam 高、沿 −z_cam 镜头后方深度]（米，可选，每项 (0, 0.2]），默认 0.055 x 0.047 x 0.040，即 reCamera 外壳（40 x 40 x 36.5 mm）装在 v8 支架内（壁厚、耳、底托、顶杆和后唇取自支架生成脚本），镜头位于前面中心。它只用于相机朝下采集的桌面间隙，不进入通用工作空间检查，因此俯视抓取和其他运动不变；通用检查仍只计镜头中心。使用套件检查点和 v8 支架时，决定抬高量的是夹爪检查点而不是机身；机身比夹爪更低的安装按同一规则抬高或拒绝。接近路径、每个对中步和转换路径在下发前按同一下限采样检查（5 mm / 1.1°），违反时为 `WORKSPACE_VIOLATION`（接近阶段为 `command_reject`，之后为动作失败码）。起点已低于下限的路径，只要没有点变得更低即可执行。转换的精度取决于 `camera_tilt_deg`、`camera_mount.rot_deg` 和 `offset_m`（模拟相机测试中倾角差 2°、旋转差 1°、焦距差 5 %、主点偏 (6, −4) px，在 0.15 m 接近高度下抓取点偏差 9 mm）。`expected_duration_s` 增加转换运动时长和 1.5 s 复查帧。\|`camera_tilt_deg`\| ≤ 5°（v5 支架）时 `auto` 保持原俯视流程不变。仅在仿真中验证（`cargo test --test test_grasp camera_down`、`sim/mujoco/tests/test_camera_grasp.py` 的 v8 用例），未在真机上运行。
 
 Example / 示例:
 
@@ -227,7 +253,7 @@ Persistence: `ARMD_GRASP_SETUP` (default `/userdata/rebot-teleop/grasp_setup.jso
 |---|---|---|
 | `table_z_m` | 0.0 | table surface, base frame (m) |
 | `approach_height_m` / `grasp_height_m` / `lift_height_m` | 0.15 / 0.015 / 0.12 | TCP (end_link origin = jaw tips) above the table (m) |
-| `grip_pixel_norm` | [0.5, 0.5] | where the table point under the jaw tips appears at approach height, looking down |
+| `grip_pixel_norm` | [0.5, 0.5] | where the table point under the jaw tips appears at approach height, looking down (camera-down: only for `final_offset_px`) |
 | `camera_tilt_deg` | `camera_mount.tilt_deg` | camera tilt (deg) |
 | `image_size_px`, `fx_px`, `fy_px` | [640, 360], 600, 600 | rough intrinsics for pixel → metric steps (placeholders) |
 | `centre_tol_px`, `stable_frames`, `median_frames`, `max_iterations` | 10, 3, 3, 10 | centring done / give up |
@@ -237,6 +263,8 @@ Persistence: `ARMD_GRASP_SETUP` (default `/userdata/rebot-teleop/grasp_setup.jso
 | `align_j6`, `align_min_aspect` | true, 1.2 | J6 alignment |
 | `approach_speed_mps`, `descend_speed_mps` | 0.05, 0.03 | linear speeds |
 | `phase_timeout_s`, `timeout_s` | 25, 120 | timeouts |
+| `recheck_tol_px` | 40 | camera-down re-check: largest distance of the target from its projection after the transition |
+| `acquire_camera_down` | `"auto"` | `"auto"`, `"on"` or `"off"`: [camera-down acquisition](#camera-down-acquisition--相机朝下采集); other values → `INVALID_COMMAND` |
 
 The cockpit (`src/api/index.html`) uses this API: with Detect on, tap a box, confirm "Grasp"; the "Grasp setup" HUD button opens the setup drawer. After any `gripper` or `grasp` action the cockpit takes its gripper target from `commanded_positions[6]`, so taking over by teleop does not move the jaw.
 
@@ -361,7 +389,7 @@ SG2002 上电原因 `reset_reason`）；`blackbox?seconds=N` 返回本次启动�
 | `POSE_NOT_FOUND` | 404 |
 | `GRAVITY_COMP_NOT_STATIONARY`, `GRAVITY_COMP_JOINT_LIMIT`, `GRAVITY_COMP_SWITCH_FAILED`, `FEEDBACK_STALE`, `LEASE_REQUIRED` (gravity compensation entry) | 409 |
 
-Codes that only appear in `action.code`: `COLLISION`, `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `ESTOP_ACTIVE`, `FAULT`, `WATCHDOG`, `LEASE_LOST`, `STOPPED`, `SUPERSEDED`, `UNLOAD_FAILED`; for `grasp` also `TARGET_LOST`, `CENTRING_FAILED`, `NOT_HOLDING`, `GRASP_TIMEOUT`, `DETECTION_UNAVAILABLE`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a later phase; for `place` also `PLACE_TIMEOUT`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a re-planned phase.
+Codes that only appear in `action.code`: `COLLISION`, `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `ESTOP_ACTIVE`, `FAULT`, `WATCHDOG`, `LEASE_LOST`, `STOPPED`, `SUPERSEDED`, `UNLOAD_FAILED`; for `grasp` also `TARGET_LOST`, `TARGET_DISPLACED`, `CENTRING_FAILED`, `NOT_HOLDING`, `GRASP_TIMEOUT`, `DETECTION_UNAVAILABLE`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a later phase; for `place` also `PLACE_TIMEOUT`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a re-planned phase.
 
 ## Needs verification on the device / 需实机核实
 
@@ -370,4 +398,4 @@ Codes that only appear in `action.code`: `COLLISION`, `TRACKING_STALL`, `GRIPPER
 - `camera_mount` (`flip`, `tilt_deg`, `offset_m`) for camera-frame moves.
 - Gravity compensation: the Damiao CTRL_MODE register write while enabled, its acknowledgement, the PMAX / VMAX / TMAX values of each B601-DM motor, the URDF torque against the measured hold torque, the POS_VEL transient when the feed-forward ends at the switch back, and the damping / overspeed defaults (checklist in the contract).
 - Planning time on the SG2002: `cargo test --release --test test_actions bench_plan -- --ignored --nocapture`.
-- Grasp: `camera_tilt_deg` sign and value for the new mount, `camera_mount.offset_m`, `grip_pixel_norm`, `table_z_m`; detection rate and latency (`settle_delay_s`, `lost_*`); the jaw closing axis (assumed end_link y) for J6 alignment; `centre_tol_px` against detector jitter; `holding` thresholds under POS_VEL. Simulated-camera tests: `cargo test --test test_grasp -- --nocapture`.
+- Grasp: `camera_tilt_deg` sign and value for the new mount, `camera_mount.offset_m`, `grip_pixel_norm`, `table_z_m`; detection rate and latency (`settle_delay_s`, `lost_*`); the jaw closing axis (assumed end_link y) for J6 alignment; `centre_tol_px` against detector jitter; `holding` thresholds under POS_VEL; camera-down acquisition with the v8 holder (mount tilt, rot and lens centre accuracy, reachability of the pitched approach). Simulated-camera tests: `cargo test --test test_grasp -- --nocapture`.

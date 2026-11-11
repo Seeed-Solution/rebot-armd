@@ -704,7 +704,7 @@ pub struct ActionStatus {
     pub holding: Option<bool>,
     pub gripper_gap_rad: Option<f32>,
     pub settled: Option<bool>,
-    /// Grasp only: open | approach | centring | align | descend | close | release | lift | done.
+    /// Grasp only: open | approach | centring | transition | align | descend | close | release | lift | done.
     #[serde(default)]
     pub phase: Option<String>,
     /// Grasp centring: corrections made so far and the latest pixel error.
@@ -712,6 +712,14 @@ pub struct ActionStatus {
     pub iteration: Option<u32>,
     #[serde(default)]
     pub error_px: Option<f32>,
+    /// Grasp camera-down acquisition: target box centre minus `grip_pixel_norm` (px) in a
+    /// frame after the transition; diagnostic, absent when not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_offset_px: Option<[f32; 2]>,
+    /// Grasp camera-down acquisition: TCP height above the table (m) used instead of
+    /// `approach_height_m`, raised for table clearance; absent when not raised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquire_height_m: Option<f32>,
 }
 
 impl ActionStatus {

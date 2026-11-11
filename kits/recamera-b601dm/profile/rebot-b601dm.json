@@ -226,7 +226,9 @@
     "approach_speed_mps": 0.05,
     "descend_speed_mps": 0.03,
     "phase_timeout_s": 25.0,
-    "timeout_s": 120.0
+    "timeout_s": 120.0,
+    "acquire_camera_down": "auto",
+    "recheck_tol_px": 40.0
   },
   "gravity_comp": {
     "ramp_in_s": 1.0,

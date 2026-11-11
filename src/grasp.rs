@@ -12,6 +12,11 @@
 //! through rough pinhole intrinsics and the FK-known camera height, scaled by a
 //! conservative gain, so wrong intrinsics or mount angles slow convergence but do not
 //! break it.
+//!
+//! Camera-down acquisition (`acquire_camera_down`, for mounts pitched toward the jaws such
+//! as the v8 holder): approach with the optical axis vertical and the camera centre above
+//! the estimate, centre the box on the image centre, then one Cartesian move to the
+//! tool-vertical pose above the table point of the centred ray (`transition`).
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -24,7 +29,7 @@ use serde_json::Value;
 use crate::api::proxy::DetectorUpstream;
 use crate::api::rest::ApiError;
 use crate::kinematics::{self, Mat3, Pose, Vec3};
-use crate::model::CameraMount;
+use crate::model::{CameraMount, WorkspacePolicy};
 use crate::macro_action::{fail, MacroCtx, Stop, SubDone};
 use crate::motion::{self, GoalSpec, GripperCommand, MotionError, PlanInput, RelFrame, Speed};
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
@@ -89,7 +94,27 @@ pub struct GraspSetup {
     /// Limit per motion phase and for the whole grasp (s).
     pub phase_timeout_s: f64,
     pub timeout_s: f64,
+    /// Camera-down acquisition: approach and centre with the optical axis vertical, then
+    /// re-orient to the tool-vertical pose above the target. `auto` = on when
+    /// |`camera_tilt_deg`| > [`CAMERA_DOWN_AUTO_TILT_DEG`] and `camera_mount.offset_m` is set.
+    pub acquire_camera_down: AcquireCameraDown,
+    /// Camera-down re-check after the transition: TARGET_DISPLACED when the target's box
+    /// centre is more than this many pixels from where the model projects it.
+    pub recheck_tol_px: f64,
 }
+
+/// `acquire_camera_down` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AcquireCameraDown {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+/// `acquire_camera_down: auto` turns camera-down acquisition on above this mount tilt (deg).
+pub const CAMERA_DOWN_AUTO_TILT_DEG: f64 = 5.0;
 
 impl Default for GraspSetup {
     fn default() -> Self {
@@ -121,6 +146,8 @@ impl Default for GraspSetup {
             descend_speed_mps: 0.03,
             phase_timeout_s: 25.0,
             timeout_s: 120.0,
+            acquire_camera_down: AcquireCameraDown::Auto,
+            recheck_tol_px: 40.0,
         }
     }
 }
@@ -132,7 +159,7 @@ impl GraspSetup {
             self.grip_pixel_norm[0], self.grip_pixel_norm[1], self.camera_tilt_deg, self.image_size_px[0],
             self.image_size_px[1], self.fx_px, self.fy_px, self.centre_tol_px, self.servo_gain, self.max_step_m,
             self.match_dist_px, self.match_iou, self.acquire_dist_px, self.lost_timeout_s, self.settle_delay_s,
-            self.align_min_aspect, self.approach_speed_mps, self.descend_speed_mps, self.phase_timeout_s, self.timeout_s];
+            self.align_min_aspect, self.approach_speed_mps, self.descend_speed_mps, self.phase_timeout_s, self.timeout_s, self.recheck_tol_px];
         if !all.iter().all(|v| fin(*v)) { return Err("grasp setup values must be finite".into()); }
         let check = |ok: bool, msg: &str| if ok { Ok(()) } else { Err(msg.to_string()) };
         check((-0.5..=0.5).contains(&self.table_z_m), "table_z_m must be in [-0.5, 0.5] m")?;
@@ -155,6 +182,7 @@ impl GraspSetup {
         check(self.lost_timeout_s > 0.0 && self.lost_timeout_s <= 10.0 && (1..=100).contains(&self.lost_frames),
             "lost_timeout_s must be in (0, 10] s and lost_frames 1..100")?;
         check((0.0..=2.0).contains(&self.settle_delay_s), "settle_delay_s must be in [0, 2] s")?;
+        check(self.recheck_tol_px > 0.0 && self.recheck_tol_px <= 500.0, "recheck_tol_px must be in (0, 500]")?;
         check(self.align_min_aspect >= 1.0 && self.align_min_aspect <= 10.0, "align_min_aspect must be in [1, 10]")?;
         let speed_ok = |v: f64| v > 0.0 && v <= motion::MAX_LINEAR_MPS;
         check(speed_ok(self.approach_speed_mps) && speed_ok(self.descend_speed_mps), "speeds must be in (0, 0.15] m/s")?;
@@ -589,15 +617,120 @@ impl CamModel {
 
 /// Rotate `r` minimally so the tool axis (end_link x) points straight down.
 pub fn look_down(r: &Mat3) -> Mat3 {
-    let x = kinematics::column(r, 0);
+    rotate_down(r, kinematics::column(r, 0), kinematics::column(r, 1))
+}
+
+/// Rotate `r` minimally so the base-frame direction `v` points straight down; when `v` points
+/// straight up, turn by pi about `flip`.
+fn rotate_down(r: &Mat3, v: Vec3, flip: Vec3) -> Mat3 {
     let down = [0.0, 0.0, -1.0];
-    let axis = kinematics::cross(&x, &down);
-    let (s, c) = (kinematics::norm(&axis), kinematics::dot(&x, &down));
+    let axis = kinematics::cross(&v, &down);
+    let (s, c) = (kinematics::norm(&axis), kinematics::dot(&v, &down));
     if s < 1e-9 {
         if c > 0.0 { return *r; }
-        return kinematics::mat_mul(&kinematics::axis_r(&kinematics::column(r, 1), std::f64::consts::PI), r);
+        return kinematics::mat_mul(&kinematics::axis_r(&flip, std::f64::consts::PI), r);
     }
     kinematics::mat_mul(&kinematics::axis_r(&kinematics::unit(&axis), s.atan2(c)), r)
+}
+
+/// Rotate `r` minimally so the optical axis (`rec` column 2, in end_link) points straight
+/// down. From a tool-vertical `r` this pitches the tool by the mount tilt about x_cam, so the
+/// heading is kept and `look_down` of the result is `r` again.
+pub fn camera_down(r: &Mat3, rec: &Mat3) -> Mat3 {
+    rotate_down(r, kinematics::mat_vec(r, &kinematics::column(rec, 2)), kinematics::mat_vec(r, &kinematics::column(rec, 0)))
+}
+
+/// Whether a grasp with `setup` on `mount` acquires camera-down (`acquire_camera_down`).
+/// `on` needs the lens centre (`camera_mount.offset_m`): the camera is placed with it.
+pub fn camera_down_mode(setup: &GraspSetup, mount: &CameraMount) -> Result<bool, String> {
+    match setup.acquire_camera_down {
+        AcquireCameraDown::Off => Ok(false),
+        AcquireCameraDown::Auto => Ok(setup.camera_tilt_deg.abs() > CAMERA_DOWN_AUTO_TILT_DEG && mount.offset_m.is_some()),
+        AcquireCameraDown::On if mount.offset_m.is_none() =>
+            Err("acquire_camera_down \"on\" needs camera_mount.offset_m (the lens centre in end_link)".into()),
+        AcquireCameraDown::On => Ok(true),
+    }
+}
+
+/// Clearance between every envelope point and the table during camera-down acquisition (m).
+pub const TABLE_CLEARANCE_M: f64 = 0.005;
+
+/// End_link points kept above the table during camera-down acquisition: the TCP, the
+/// workspace check points, the lens centre and, with a lens centre, the 8 corners of the
+/// camera body box (`camera_mount.body_size_m`: front face centred on the lens, `rec` axes).
+pub fn envelope(ws: Option<&WorkspacePolicy>, mount: &CameraMount, rec: &Mat3) -> Vec<Vec3> {
+    let mut pts = vec![[0.0; 3]];
+    pts.extend(ws.iter().flat_map(|w| w.check_points_end_m.iter().map(|p| p.map(f64::from))));
+    if let Some(o) = mount.offset_m.map(|o| o.map(f64::from)) {
+        pts.push(o);
+        let [w, h, d] = mount.body_size().map(f64::from);
+        for sx in [-0.5, 0.5] { for sy in [-0.5, 0.5] { for z in [0.0, -d] {
+            pts.push(kinematics::add(&o, &kinematics::mat_vec(rec, &[sx * w, sy * h, z])));
+        }}}
+    }
+    pts
+}
+
+/// Samples of the straight Cartesian path `from` → `to` as `motion::plan_cartesian`
+/// interpolates it (linear position, rotation along the geodesic): (s, pose), s in (0, 1].
+fn path_samples(from: &Pose, to: &Pose) -> Vec<(f64, Pose)> {
+    let dp = kinematics::sub(&to.p, &from.p);
+    let w = kinematics::log_v(&kinematics::mul_t(&to.r, &from.r));
+    let n = (kinematics::norm(&dp) / 0.005).max(kinematics::norm(&w) / 0.02).ceil().clamp(1.0, 2000.0) as usize;
+    (1..=n).map(|k| {
+        let s = k as f64 / n as f64;
+        let r = if k == n { to.r } else { kinematics::mat_mul(&kinematics::exp_r(&w.map(|v| v * s)), &from.r) };
+        (s, Pose::new(r, kinematics::add(&from.p, &dp.map(|v| v * s))))
+    }).collect()
+}
+
+/// First sample of the path `from` → `to` where an envelope point is below
+/// `table_z + TABLE_CLEARANCE_M`, as a workspace violation (s, point index, z, bound). A path
+/// that starts below the bound may move as long as it does not go lower.
+pub fn table_violation(from: &Pose, to: &Pose, pts: &[Vec3], table_z: f64) -> Option<MotionError> {
+    let bound = table_z + TABLE_CLEARANCE_M;
+    let low = |pose: &Pose| pts.iter().enumerate().map(|(i, p)| (i, pose.transform_point(p)[2]))
+        .min_by(|a, b| a.1.total_cmp(&b.1)).expect("the envelope has the TCP");
+    let start = low(from).1.min(bound);
+    path_samples(from, to).into_iter().find_map(|(s, pose)| {
+        let (point, z) = low(&pose);
+        (z < start - 1e-6).then(|| MotionError::WorkspaceViolation { s, point, limit: "table_z_m + 0.005".into(), value: z, bound })
+    })
+}
+
+/// TCP height of the camera-down acquisition at orientation `r_cd`: `table_z_m +
+/// approach_height_m`, raised when needed so the envelope stays `TABLE_CLEARANCE_M` above the
+/// table at `r_cd` (approach end, centring) and along the transition to the tool-vertical
+/// pose at approach height (height linear, rotation along the geodesic).
+pub fn acquisition_z(r_cd: &Mat3, setup: &GraspSetup, pts: &[Vec3]) -> f64 {
+    let z_end = setup.table_z_m + setup.approach_height_m;
+    let bound = setup.table_z_m + TABLE_CLEARANCE_M;
+    let w = kinematics::log_v(&kinematics::mul_t(&look_down(r_cd), r_cd));
+    // at s the TCP is at z0 (1 − s) + z_end s and must be at least bound − lowest(s), with
+    // lowest(s) the lowest envelope point relative to the TCP (<= 0, the TCP counts)
+    (0..50).map(|k| {
+        let s = k as f64 / 50.0;
+        let r = kinematics::mat_mul(&kinematics::exp_r(&w.map(|v| v * s)), r_cd);
+        let lowest = pts.iter().map(|p| kinematics::mat_vec(&r, p)[2]).fold(0.0, f64::min);
+        (bound - lowest - z_end * s) / (1.0 - s)
+    }).fold(z_end, f64::max)
+}
+
+/// Camera-down approach pose: optical axis straight down ([`camera_down`] of the
+/// tool-vertical orientation, heading kept), optical centre above `target`, TCP at
+/// [`acquisition_z`] (`table_z_m + approach_height_m` unless the envelope `pts` needs more).
+pub fn camera_down_pose(r_now: &Mat3, target: &Vec3, setup: &GraspSetup, cam: &CamModel, pts: &[Vec3]) -> Pose {
+    let r = camera_down(&look_down(r_now), &cam.rec);
+    let off = kinematics::mat_vec(&r, &cam.offset);
+    Pose::new(r, [target[0] - off[0], target[1] - off[1], acquisition_z(&r, setup, pts)])
+}
+
+/// Camera-down → tool-vertical transition from the centred `pose`: the ray through pixel `px`
+/// meets the grasp plane at the target; the goal is the tool-vertical pose with the TCP above
+/// it at approach height. None when the ray misses the plane.
+pub fn transition_pose(pose: &Pose, px: [f64; 2], setup: &GraspSetup, cam: &CamModel) -> Option<(Vec3, Pose)> {
+    let t = cam.plane_point(pose, px, grasp_plane(setup))?;
+    Some((t, approach_pose(&pose.r, &t, setup)))
 }
 
 // ---- request ----
@@ -654,6 +787,10 @@ pub struct PlannedGrasp {
     /// Estimated target on the grasp plane (base frame).
     pub target: Vec3,
     pub approach_duration: f64,
+    /// Camera-down acquisition ([`camera_down_mode`]).
+    pub camera_down: bool,
+    /// Estimated duration of the camera-down → tool-vertical move (0 without camera-down).
+    pub transition_duration: f64,
 }
 
 /// Under the lock: parse and check preconditions.
@@ -691,10 +828,34 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     let centre = cam.to_px(box_centre(&request.box_norm));
     let target = cam.plane_point(&pose, centre, grasp_plane(setup)).ok_or_else(|| ArmError::from(MotionError::InvalidCommand(
         "the box centre ray does not meet the table plane in front of the camera".into())))?;
+    let camera_down = camera_down_mode(setup, &input.cam).map_err(MotionError::InvalidCommand)?;
+    let goal = if camera_down {
+        let pts = envelope(input.ws.as_ref(), &input.cam, &cam.rec);
+        let goal = camera_down_pose(&pose.r, &target, setup, &cam, &pts);
+        // the pitched envelope stays above the table on the approach and the transition
+        let tool = approach_pose(&goal.r, &target, setup);
+        if let Some(e) = table_violation(&pose, &goal, &pts, setup.table_z_m).or_else(|| table_violation(&goal, &tool, &pts, setup.table_z_m)) {
+            return Err(e.into());
+        }
+        goal
+    } else {
+        approach_pose(&pose.r, &target, setup)
+    };
     let mut open_input = input.clone();
     open_input.j7 = open_rad;
-    let path = motion::plan_cartesian(&open_input, approach_pose(&pose.r, &target, setup), Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
-    Ok(PlannedGrasp { input, request, target, approach_duration: path.duration })
+    let path = motion::plan_cartesian(&open_input, goal, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
+    let transition_duration = if camera_down { transition_estimate(&goal, &target, setup) } else { 0.0 };
+    Ok(PlannedGrasp { input, request, target, approach_duration: path.duration, camera_down, transition_duration })
+}
+
+/// Duration of the transition from the camera-down pose `from` to the tool-vertical pose
+/// above `target`, from the planner's Cartesian speed bound (quintic peak 1.875 / T, +10 %);
+/// joint speed limits can make it longer.
+pub fn transition_estimate(from: &Pose, target: &Vec3, setup: &GraspSetup) -> f64 {
+    let to = approach_pose(&from.r, target, setup);
+    let length = kinematics::norm(&kinematics::sub(&to.p, &from.p));
+    let theta = kinematics::angle_between(&to.r, &from.r);
+    1.1 * 1.875 * (length / setup.approach_speed_mps).max(theta / motion::DEFAULT_ANGULAR_RPS)
 }
 
 /// Rough total duration for the ack.
@@ -702,7 +863,9 @@ pub fn expected_duration(planned: &PlannedGrasp) -> f64 {
     let s = &planned.request.setup;
     let descend = (s.approach_height_m - s.grasp_height_m) * 1.875 / s.descend_speed_mps;
     let lift = (s.lift_height_m - s.grasp_height_m) * 1.875 / s.descend_speed_mps;
-    6.5 + planned.approach_duration + 4.0 * 1.5 + descend + 2.0 + lift
+    let base = 6.5 + planned.approach_duration + 4.0 * 1.5 + descend + 2.0 + lift;
+    // camera-down: the transition move and its re-check frame
+    if planned.camera_down { base + planned.transition_duration + 1.5 } else { base }
 }
 
 /// Start a grasp without a WS lease check (tests, in-process agents): prepare, plan, begin
@@ -735,6 +898,8 @@ struct Orchestrator {
     source: Arc<dyn DetectionSource>,
     setup: GraspSetup,
     cam: CamModel,
+    /// Points kept above the table during camera-down acquisition ([`envelope`]).
+    envelope: Vec<Vec3>,
     /// Each centring step triggers its own frame (perception API 2) instead of reading the
     /// continuous results.
     triggered: bool,
@@ -751,9 +916,14 @@ impl Orchestrator {
     }
 
     /// Next fresh frame (captured after `since` + settle delay) containing the target.
+    /// TARGET_LOST when: frames keep arriving but all predate the settle time, `lost_timeout_s`
+    /// after max(now, settle time) (stale frames do not extend it); no frame arrives for
+    /// max(3 s, `lost_timeout_s`); fresh frames miss the target `lost_frames` times or for
+    /// `lost_timeout_s` from the call.
     async fn fresh_match(&self, tracker: &Tracker, since: Instant, after: &mut Option<u64>) -> Result<Detection, Stop> {
         let not_before = since + Duration::from_secs_f64(self.setup.settle_delay_s);
         let started = Instant::now();
+        let observe_until = started.max(not_before) + Duration::from_secs_f64(self.setup.lost_timeout_s);
         let mut last_frame = Instant::now();
         let mut unmatched = 0u32;
         loop {
@@ -786,7 +956,12 @@ impl Orchestrator {
             };
             *after = Some(frame.frame_id);
             last_frame = Instant::now();
-            if frame.captured_at < not_before { continue; }
+            if frame.captured_at < not_before {
+                if last_frame > observe_until {
+                    return Err(fail("TARGET_LOST", format!("No frame captured after the motion settled within {:.1} s", self.setup.lost_timeout_s)));
+                }
+                continue;
+            }
             if let Some(d) = tracker.find(&frame, &self.setup) { return Ok(d); }
             unmatched += 1;
             if unmatched >= self.setup.lost_frames || started.elapsed().as_secs_f64() > self.setup.lost_timeout_s {
@@ -800,16 +975,27 @@ impl Orchestrator {
         let open = self.gripper_phase("open", 0.02, GripperCommand::Open).await?;
         let _ = open;
 
-        // coarse approach, looking down
+        // coarse approach: tool axis down, or (camera-down) optical axis down with the camera
+        // centre above the estimate
+        let camera_down = planned.camera_down;
         self.phase("approach", 0.1).await?;
         let pose0 = self.pose().await;
         let target = planned.target;
-        let goal = approach_pose(&pose0.r, &target, s);
+        let goal = if camera_down { camera_down_pose(&pose0.r, &target, s, &self.cam, &self.envelope) } else { approach_pose(&pose0.r, &target, s) };
+        if camera_down {
+            let height = goal.p[2] - s.table_z_m;
+            if height > s.approach_height_m + 1e-6 {
+                tracing::info!("Grasp {}: camera-down acquisition at {height:.3} m (approach_height_m {:.3}) for table clearance", self.id, s.approach_height_m);
+                self.sup.inner().write().await.set_action_acquire_height(self.id, height as f32);
+            }
+            self.table_clear(&pose0, &goal)?;
+        }
         let done = self.move_arm("approach", GoalSpec::Absolute { p: goal.p, r: Some(goal.r) }, s.approach_speed_mps).await?;
 
-        // closed-loop centring
+        // closed-loop centring onto the grip pixel, or (camera-down) the image centre
         self.phase("centring", 0.3).await?;
         let grip_px = self.cam.to_px(s.grip_pixel_norm);
+        let (aim_px, aim_name) = if camera_down { ([self.cam.cx, self.cam.cy], "the image centre") } else { (grip_px, "the grip point") };
         let plane = grasp_plane(s);
         let pose = self.pose().await;
         let predicted = self.cam.project(&pose, &target).map(|p| self.cam.to_norm(p)).unwrap_or(s.grip_pixel_norm);
@@ -832,24 +1018,24 @@ impl Orchestrator {
                 last_det = d;
                 xs.push(c[0]);
                 ys.push(c[1]);
-                let err = (c[0] - grip_px[0]).hypot(c[1] - grip_px[1]);
+                let err = (c[0] - aim_px[0]).hypot(c[1] - aim_px[1]);
                 if err <= s.centre_tol_px { consecutive += 1; } else { consecutive = 0; }
                 self.sup.inner().write().await.set_action_phase(self.id, "centring", 0.3, Some(iteration), Some(err as f32));
                 if consecutive >= s.stable_frames { break None; }
                 let m = s.median_frames as usize;
                 if xs.len() >= m {
                     let med = [median(&mut xs[xs.len() - m..].to_vec()), median(&mut ys[ys.len() - m..].to_vec())];
-                    if (med[0] - grip_px[0]).hypot(med[1] - grip_px[1]) > s.centre_tol_px { break Some(med); }
+                    if (med[0] - aim_px[0]).hypot(med[1] - aim_px[1]) > s.centre_tol_px { break Some(med); }
                     if xs.len() >= m + s.stable_frames as usize { break None; }
                 }
             };
             let Some(med) = decision else { break last_det; };
             if iteration >= s.max_iterations {
-                let err = (med[0] - grip_px[0]).hypot(med[1] - grip_px[1]);
-                return Err(fail("CENTRING_FAILED", format!("Target still {err:.0} px from the grip point after {iteration} corrections")));
+                let err = (med[0] - aim_px[0]).hypot(med[1] - aim_px[1]);
+                return Err(fail("CENTRING_FAILED", format!("Target still {err:.0} px from {aim_name} after {iteration} corrections")));
             }
             iteration += 1;
-            let (Some(pt), Some(pg)) = (self.cam.plane_point(&pose, med, plane), self.cam.plane_point(&pose, grip_px, plane)) else {
+            let (Some(pt), Some(pg)) = (self.cam.plane_point(&pose, med, plane), self.cam.plane_point(&pose, aim_px, plane)) else {
                 return Err(fail("CENTRING_FAILED", "Pixel error cannot be mapped onto the table plane"));
             };
             let mut step = [(pt[0] - pg[0]) * s.servo_gain, (pt[1] - pg[1]) * s.servo_gain, 0.0];
@@ -857,10 +1043,24 @@ impl Orchestrator {
             if len > s.max_step_m { step = [step[0] * s.max_step_m / len, step[1] * s.max_step_m / len, 0.0]; }
             // predict where the target lands after the step (same rough model)
             let moved = Pose::new(pose.r, kinematics::add(&pose.p, &step));
+            if camera_down { self.table_clear(&pose, &moved)?; }
             if let Some(p) = self.cam.project(&moved, &pt) { tracker.predict_at(self.cam.to_norm(p)); }
             let done = self.move_arm("centring", GoalSpec::Relative { frame: RelFrame::Base, d: step, dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false }, s.approach_speed_mps).await?;
             since = done.at;
         };
+
+        // camera-down: re-orient to the tool-vertical pose above the target's table point
+        if camera_down {
+            self.phase("transition", 0.5).await?;
+            let pose = self.pose().await;
+            let Some((t, goal)) = transition_pose(&pose, self.cam.to_px(box_centre(&last.box_norm)), s, &self.cam) else {
+                return Err(fail("CENTRING_FAILED", "The target ray does not meet the table plane"));
+            };
+            self.table_clear(&pose, &goal)?;
+            let done = self.move_arm("transition", GoalSpec::Absolute { p: goal.p, r: Some(goal.r) }, s.approach_speed_mps).await?;
+            // verify the target where the model expects it before descending
+            self.recheck(&planned.request.label, &last, &t, grip_px, done.at, &mut after).await?;
+        }
 
         // J6 alignment: close the jaws across the box's short side
         self.phase("align", 0.55).await?;
@@ -888,6 +1088,31 @@ impl Orchestrator {
         let p = self.pose().await.p;
         self.move_arm("lift", lift_to(p), s.descend_speed_mps).await?;
         Ok((true, closed.gripper_gap_rad))
+    }
+
+    /// Camera-down: the straight path `from` → `to` keeps the envelope above the table.
+    fn table_clear(&self, from: &Pose, to: &Pose) -> Result<(), Stop> {
+        table_violation(from, to, &self.envelope, self.setup.table_z_m).map_or(Ok(()), |e| Err(crate::macro_action::arm_fail(e.into())))
+    }
+
+    /// After the camera-down transition, when the model projects the target `t` into the
+    /// image: one fresh frame must show it (else TARGET_LOST / DETECTION_UNAVAILABLE), within
+    /// `recheck_tol_px` of the projection (else TARGET_DISPLACED). Records the box centre minus
+    /// `grip_px` as `final_offset_px`. Nothing is checked when the target is not expected in view.
+    async fn recheck(&self, label: &str, last: &Detection, t: &Vec3, grip_px: [f64; 2], since: Instant, after: &mut Option<u64>) -> Result<(), Stop> {
+        let pose = self.pose().await;
+        let Some(p) = self.cam.project(&pose, t) else { return Ok(()) };
+        if !(p[0] >= 0.0 && p[0] <= self.cam.size[0] && p[1] >= 0.0 && p[1] <= self.cam.size[1]) { return Ok(()); }
+        let mut tracker = Tracker { label: label.to_string(), predicted: last.box_norm, gate_px: self.setup.acquire_dist_px };
+        tracker.predict_at(self.cam.to_norm(p));
+        let d = self.fresh_match(&tracker, since, after).await?;
+        let c = self.cam.to_px(box_centre(&d.box_norm));
+        self.sup.inner().write().await.set_action_final_offset(self.id, [(c[0] - grip_px[0]) as f32, (c[1] - grip_px[1]) as f32]);
+        let moved = (c[0] - p[0]).hypot(c[1] - p[1]);
+        if moved > self.setup.recheck_tol_px {
+            return Err(fail("TARGET_DISPLACED", format!("Target {moved:.0} px from where it was expected after the transition (recheck_tol_px {:.0})", self.setup.recheck_tol_px)));
+        }
+        Ok(())
     }
 
     /// ±pi/2 about the tool axis when the jaws would close across the long side.
@@ -919,7 +1144,8 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
         sup: sup.clone(), id, deadline, phase_timeout_s: setup.phase_timeout_s, timeout_code: "GRASP_TIMEOUT",
         timeout_message: format!("Grasp did not finish within {:.0} s", setup.timeout_s),
     };
-    let orch = Orchestrator { ctx, source: source.clone(), setup, cam, triggered };
+    let envelope = envelope(planned.input.ws.as_ref(), &planned.input.cam, &cam.rec);
+    let orch = Orchestrator { ctx, source: source.clone(), setup, cam, envelope, triggered };
     let result = if let Err(e) = per_request {
         Err(fail("DETECTION_UNAVAILABLE", format!("Cannot reach the vision provider: {e}")))
     } else if triggered {
@@ -1021,5 +1247,135 @@ mod tests {
         // a ray pointing above the horizon never meets the table
         let up = Pose::new(kinematics::axis_r(&[0.0, 1.0, 0.0], std::f64::consts::PI), pose.p);
         assert!(cam.plane_point(&up, [320.0, 180.0], 0.0).is_none());
+    }
+
+    /// v8 holder: rot 90, tilt -38, lens centre behind and above the jaw tips.
+    fn v8() -> (GraspSetup, CameraMount, CamModel) {
+        let setup = GraspSetup { camera_tilt_deg: -38.0, ..Default::default() };
+        let mount = CameraMount { rot_deg: 90.0, tilt_deg: -38.0, offset_m: Some([-0.0731, 0.0005, 0.066]), ..Default::default() };
+        let cam = CamModel::assumed(&crate::chain::ArmModel::RebotDevArm, &setup, &mount);
+        (setup, mount, cam)
+    }
+
+    fn inspect_r() -> Mat3 { kinematics::fk(&[0.0, -1.167, -1.565, 1.435, 0.0, std::f64::consts::FRAC_PI_2]).r }
+
+    fn close(a: &Vec3, b: &Vec3, tol: f64) -> bool { kinematics::norm(&kinematics::sub(a, b)) < tol }
+
+    #[test]
+    fn camera_down_mode_follows_the_setting_tilt_and_lens_centre() {
+        let (setup, mount, _) = v8();
+        assert_eq!(camera_down_mode(&setup, &mount), Ok(true), "auto, tilted, lens centre known");
+        let no_offset = CameraMount { offset_m: None, ..mount.clone() };
+        assert_eq!(camera_down_mode(&setup, &no_offset), Ok(false), "auto without a lens centre");
+        for tilt in [0.0, 4.9, -5.0] {
+            assert_eq!(camera_down_mode(&GraspSetup { camera_tilt_deg: tilt, ..setup.clone() }, &mount), Ok(false), "auto at tilt {tilt}");
+        }
+        assert_eq!(camera_down_mode(&GraspSetup { camera_tilt_deg: -5.1, ..setup.clone() }, &mount), Ok(true));
+        let off = GraspSetup { acquire_camera_down: AcquireCameraDown::Off, ..setup.clone() };
+        assert_eq!(camera_down_mode(&off, &mount), Ok(false));
+        let on = GraspSetup { acquire_camera_down: AcquireCameraDown::On, camera_tilt_deg: 0.0, ..setup.clone() };
+        assert_eq!(camera_down_mode(&on, &mount), Ok(true));
+        assert!(camera_down_mode(&on, &no_offset).is_err(), "on needs the lens centre");
+        // setup field: lowercase strings, default auto, other values rejected
+        let d = GraspSetup::default();
+        assert_eq!(serde_json::to_value(&d).unwrap()["acquire_camera_down"], "auto");
+        assert_eq!(d.patched(&serde_json::json!({"acquire_camera_down": "on"})).unwrap().acquire_camera_down, AcquireCameraDown::On);
+        assert!(d.patched(&serde_json::json!({"recheck_tol_px": 0.0})).is_err() && d.patched(&serde_json::json!({"recheck_tol_px": 501.0})).is_err());
+        assert_eq!(d.patched(&serde_json::json!({"recheck_tol_px": 25.0})).unwrap().recheck_tol_px, 25.0);
+        for bad in [serde_json::json!("yes"), serde_json::json!(true), serde_json::json!(1)] {
+            assert!(d.patched(&serde_json::json!({"acquire_camera_down": bad})).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn camera_down_pose_puts_the_optical_axis_down_over_the_target() {
+        let (setup, _, cam) = v8();
+        let target = [0.28, -0.04, setup.table_z_m + setup.grasp_height_m];
+        let r_now = inspect_r();
+        let pose = camera_down_pose(&r_now, &target, &setup, &cam, &[]);
+        let rc = cam.rotation(&pose);
+        assert!(kinematics::column(&rc, 2)[2] < -1.0 + 1e-12, "optical axis down: {:?}", kinematics::column(&rc, 2));
+        let o = cam.origin(&pose);
+        assert!((o[0] - target[0]).abs() < 1e-12 && (o[1] - target[1]).abs() < 1e-12, "camera centre over the target: {o:?}");
+        assert!((pose.p[2] - (setup.table_z_m + setup.approach_height_m)).abs() < 1e-12, "TCP at approach height");
+        // the tool is pitched by the mount tilt about x_cam; heading (x_cam) kept
+        let tool_from_down = kinematics::column(&pose.r, 0)[2].clamp(-1.0, 1.0).acos();
+        assert!((std::f64::consts::PI - tool_from_down - 38f64.to_radians()).abs() < 1e-9, "tool pitched by 38 deg");
+        let v = look_down(&r_now);
+        let x_cam_v = kinematics::mat_vec(&v, &kinematics::column(&cam.rec, 0));
+        assert!(close(&kinematics::column(&rc, 0), &x_cam_v, 1e-9), "pitch about x_cam");
+        assert!(kinematics::angle_between(&look_down(&pose.r), &v) < 1e-9, "look_down undoes it");
+        // the image centre ray meets the plane straight below the camera
+        let hit = cam.plane_point(&pose, [cam.cx, cam.cy], target[2]).unwrap();
+        assert!(close(&hit, &target, 1e-9), "{hit:?}");
+        // tilt 0: the optical axis already is the tool axis, the orientation is look_down's
+        let flat = CamModel::assumed(&crate::chain::ArmModel::RebotDevArm, &GraspSetup::default(), &CameraMount::default());
+        assert_eq!(camera_down(&v, &flat.rec), v);
+    }
+
+    #[test]
+    fn tilted_ray_meets_the_table_ahead_by_the_tilt() {
+        // tool vertical, camera tilted 38 deg: the image centre ray meets the plane h·tan(38)
+        // from the point below the lens centre
+        let (setup, _, cam) = v8();
+        let pose = Pose::new(look_down(&inspect_r()), [0.25, 0.0, 0.15]);
+        let o = cam.origin(&pose);
+        let plane = setup.table_z_m + setup.grasp_height_m;
+        let hit = cam.plane_point(&pose, [cam.cx, cam.cy], plane).unwrap();
+        let ahead = (hit[0] - o[0]).hypot(hit[1] - o[1]);
+        assert!((ahead - (o[2] - plane) * 38f64.to_radians().tan()).abs() < 1e-9, "ahead {ahead}");
+        let px = cam.project(&pose, &hit).unwrap();
+        assert!((px[0] - cam.cx).abs() < 1e-6 && (px[1] - cam.cy).abs() < 1e-6);
+        // the table point under the jaw tips is outside the image at approach height (v < 0)
+        let under = cam.project(&pose, &[pose.p[0], pose.p[1], setup.table_z_m]).map(|p| cam.to_norm(p));
+        assert!(under.is_none_or(|n| !(0.0..=1.0).contains(&n[1])), "{under:?}");
+    }
+
+    #[test]
+    fn acquisition_height_keeps_the_pitched_envelope_clear() {
+        // rot 0, tilt -38: pitch about the axis along which the kit check points are 92.5 mm out
+        let setup = GraspSetup { camera_tilt_deg: -38.0, table_z_m: 0.10, approach_height_m: 0.035, ..Default::default() };
+        let mount = CameraMount { tilt_deg: -38.0, offset_m: Some([-0.0731, 0.0005, 0.066]), ..Default::default() };
+        let cam = CamModel::assumed(&crate::chain::ArmModel::RebotDevArm, &setup, &mount);
+        let pts = envelope(crate::model::ArmConfig::rebot_dm().workspace.as_ref(), &mount, &cam.rec);
+        assert_eq!(pts.len(), 18, "TCP, 8 check points, lens centre, 8 body corners");
+        let target = [0.28, 0.0, setup.table_z_m + setup.grasp_height_m];
+        let low = camera_down_pose(&inspect_r(), &target, &setup, &cam, &[]);
+        assert!((low.p[2] - 0.135).abs() < 1e-12, "TCP only: approach height");
+        let bound = setup.table_z_m + TABLE_CLEARANCE_M;
+        let min_z = |pose: &Pose| pts.iter().map(|p| pose.transform_point(p)[2]).fold(f64::INFINITY, f64::min);
+        assert!(min_z(&low) < setup.table_z_m - 0.02, "unraised: {:.4}", min_z(&low));
+        let pose = camera_down_pose(&inspect_r(), &target, &setup, &cam, &pts);
+        assert!(pose.p[2] > low.p[2] + 0.02 && (min_z(&pose) - bound).abs() < 1e-3, "raised to the bound: {:.4}", min_z(&pose));
+        let tool = approach_pose(&pose.r, &target, &setup);
+        assert!(path_samples(&pose, &tool).iter().all(|(_, p)| min_z(p) >= bound - 1e-3), "transition clear");
+        assert!(table_violation(&pose, &tool, &pts, setup.table_z_m).is_none());
+        let from = Pose::new(pose.r, [pose.p[0], pose.p[1], pose.p[2] + 0.1]);
+        assert!(table_violation(&from, &low, &pts, setup.table_z_m).is_some(), "a path into the table is reported");
+        // a path from below the bound may move sideways but not lower
+        let side = Pose::new(low.r, [low.p[0] + 0.01, low.p[1], low.p[2]]);
+        assert!(table_violation(&low, &side, &pts, setup.table_z_m).is_none());
+    }
+
+    #[test]
+    fn transition_goes_tool_vertical_above_the_centred_target() {
+        let (setup, _, cam) = v8();
+        let r_now = inspect_r();
+        let target = [0.30, 0.03, setup.table_z_m + setup.grasp_height_m];
+        let pose = camera_down_pose(&r_now, &target, &setup, &cam, &[]);
+        let (t, goal) = transition_pose(&pose, [cam.cx, cam.cy], &setup, &cam).unwrap();
+        assert!(close(&t, &target, 1e-9), "{t:?}");
+        assert!(close(&goal.p, &[target[0], target[1], setup.table_z_m + setup.approach_height_m], 1e-9), "{:?}", goal.p);
+        assert!(kinematics::column(&goal.r, 0)[2] < -1.0 + 1e-12, "tool axis down");
+        assert!(kinematics::angle_between(&goal.r, &look_down(&r_now)) < 1e-9, "heading of the approach kept");
+        // a box centre off the image centre maps to its own table point
+        let off_px = [cam.cx + 30.0, cam.cy - 20.0];
+        let (t2, _) = transition_pose(&pose, off_px, &setup, &cam).unwrap();
+        let px = cam.project(&pose, &t2).unwrap();
+        assert!((px[0] - off_px[0]).abs() < 1e-6 && (px[1] - off_px[1]).abs() < 1e-6);
+        // expected duration of the move: rotation of 38 deg at 0.5 rad/s dominates here
+        let est = transition_estimate(&pose, &target, &setup);
+        let rot = 1.1 * 1.875 * 38f64.to_radians() / motion::DEFAULT_ANGULAR_RPS;
+        assert!(est >= rot - 1e-9 && est < rot + 3.0, "{est} vs {rot}");
     }
 }

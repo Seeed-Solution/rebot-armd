@@ -1,76 +1,24 @@
 //! Collision guard (contract section 11): detection from residual torques, protective stop,
 //! auto-resume, escalation, runtime setting.
 //!
-//! Torques come from `TestArm`, a test `ArmDriver` (the public driver trait, as in
+//! Torques come from `common::TestArm`, a test `ArmDriver` (the public driver trait, as in
 //! tests/test_residual_torques.rs): an ideal position servo that reports the model gravity
 //! torque plus a residual the test sets per joint. Nothing in armd's API can inject torque;
-//! the injection lives only in this file.
+//! the injection lives only in the tests.
 mod common;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use armd::api::rest::ApiError;
 use armd::collision::{CollisionPolicy, Sensitivity};
-use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointMode, JointTarget};
 use armd::kinematics;
-use armd::model::{ArmConfig, JointState};
+use armd::model::ArmConfig;
 use armd::motion::{plan_cartesian, resolve_goal, GoalSpec, Speed};
 use armd::{ArmError, ArmSupervisor, FaultCode, SafetyState, SupervisorInner};
 use serde_json::json;
-use common::INSPECT;
+use common::{TestArm, INSPECT};
 
 const DT: f64 = 0.02;
-
-#[derive(Default)]
-struct ArmState { q: [f32; 7], torqued: bool, extra: [f32; 6], mit: bool }
-
-#[derive(Clone)]
-struct TestArm(Arc<Mutex<ArmState>>);
-
-impl TestArm {
-    fn new() -> Self { Self(Arc::new(Mutex::new(ArmState { q: INSPECT, ..Default::default() }))) }
-    fn set_residual(&self, joint: usize, nm: f32) { self.0.lock().unwrap().extra[joint] = nm; }
-    fn clear(&self) { self.0.lock().unwrap().extra = [0.0; 6]; }
-}
-
-impl ArmDriver for TestArm {
-    fn capabilities(&self) -> DriverCapabilities {
-        DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true }
-    }
-    fn enable_state(&self) -> EnableState {
-        if self.0.lock().unwrap().torqued { EnableState::Enabled } else { EnableState::Disabled }
-    }
-    fn is_feedback_valid(&self) -> bool { true }
-    fn is_enabled(&self) -> bool { self.0.lock().unwrap().torqued }
-    fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
-    fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
-        let s = self.0.lock().unwrap();
-        let mut q6 = [0.0; 6];
-        q6.copy_from_slice(&s.q[..6]);
-        let g = armd::compute_gravity_torques(&q6).unwrap();
-        Ok((0..7).map(|i| JointState {
-            position: s.q[i], velocity: 0.0, temperature: 30.0,
-            torque: if i < 6 { g[i] + s.extra[i] } else { 0.0 },
-        }).collect())
-    }
-    fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
-        let mut s = self.0.lock().unwrap();
-        // Ideal position servo; in MIT mode (gravity compensation) the arm stays put.
-        if !s.mit { for (i, t) in targets.iter().enumerate().take(7) { s.q[i] = t.position; } }
-        Ok(())
-    }
-    fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
-        let mut s = self.0.lock().unwrap();
-        s.torqued = enabled;
-        s.mit = false;
-        Ok(())
-    }
-    fn supports_mit_mode_switch(&self) -> bool { true }
-    fn set_joint_modes(&mut self, modes: &[JointMode], _hold: &[JointTarget]) -> Result<(), ArmDriverError> {
-        self.0.lock().unwrap().mit = modes.iter().take(6).any(|m| *m == JointMode::Mit);
-        Ok(())
-    }
-}
 
 fn policy() -> CollisionPolicy {
     CollisionPolicy { enabled: true, resume_after_s: 0.3, ..CollisionPolicy::default() }

@@ -1829,7 +1829,7 @@ impl SupervisorInner {
         self.last_action = Some(ActionStatus {
             id, kind: kind.into(), tag, state: "running".into(), code: None, message: None, progress: 0.0,
             started_at: now, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
-            phase: None, iteration: None, error_px: None,
+            phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
         });
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
         self.quintic_settle = None;
@@ -2009,6 +2009,20 @@ impl SupervisorInner {
             // centring stats stay in the record after the phase (result of the closed loop)
             if iteration.is_some() { a.iteration = iteration; }
             if error_px.is_some() { a.error_px = error_px; }
+        }
+    }
+
+    /// Grasp camera-down re-check result ([`ActionStatus::final_offset_px`]).
+    pub fn set_action_final_offset(&mut self, id: u64, offset_px: [f32; 2]) {
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
+            a.final_offset_px = Some(offset_px);
+        }
+    }
+
+    /// Grasp camera-down acquisition height ([`ActionStatus::acquire_height_m`]).
+    pub fn set_action_acquire_height(&mut self, id: u64, height_m: f32) {
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
+            a.acquire_height_m = Some(height_m);
         }
     }
 
