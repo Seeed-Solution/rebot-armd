@@ -178,6 +178,17 @@ run_suite() {
     run_fg asroot REBOT_APP_USER=root
     check "root user: refused" sh -c "[ $RC -eq 1 ] && grep -q 'is root; not starting' '$T/logs/app-asroot.log' && ! grep -q 'must not run' '$T/logs/app-asroot.log'"
 
+    # 11b. an app's sitecustomize.py runs only in the program (after the privilege drop),
+    # never in the root launcher: it records the uid and the process it ran in
+    new_app site 'print("main ran", flush=True)'
+    printf '%s\n' "import os; open('$T/site.log', 'a').write(str(os.getuid()) + chr(10))" > "$T/apps/site/sitecustomize.py"
+    rm -f "$T/site.log"
+    (cd "$T/apps/site" && run_fg site PYTHONPATH="$T/apps/site")
+    check "sitecustomize: program ran" log_has site "main ran"
+    check "sitecustomize: ran exactly once (in the program, not the launcher)" sh -c "[ \$(wc -l < '$T/site.log') -eq 1 ]"
+    check "sitecustomize: ran as REBOT_APP_USER" sh -c "[ \"\$(cat '$T/site.log')\" = $(id -u "$APP_USER") ]"
+    check "launcher: python3 -I -S and PYTHONPATH not exported" sh -c "grep -q 'python3 -I -S -c \"\$LAUNCH\"' '$RUNNER' && ! grep -q '^ *export PYTHONPATH' '$RUNNER'"
+
     # 12. process group: stop also ends the processes the program started
     new_app group "import subprocess, time
 p = subprocess.Popen(['sleep', '60'])

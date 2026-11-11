@@ -42,10 +42,13 @@ SDK_PATH=${REBOT_APP_PYTHONPATH:-/usr/share/rebot-teleop/python}
 PYTHON=${REBOT_APP_PYTHON:-python3}
 RUN_USER=${REBOT_APP_USER:-recamera}
 
-# python3 -c "$LAUNCH" <user> <command...>: new session (own process group), drop to <user>
-# (supplementary groups from /etc/group), then exec the command.
+# python3 -I -S -c "$LAUNCH" <user> <pythonpath> <command...>: new session (own process group),
+# drop to <user> (supplementary groups from /etc/group), set PYTHONPATH, exec the command.
+# -I -S: the launcher runs as root, so it reads no PYTHON* variables, no cwd / script dir and
+# no site packages (an app's sitecustomize.py runs only after the drop, in the app's python).
 LAUNCH='import os, pwd, sys
 u = pwd.getpwnam(sys.argv[1])
+pythonpath = sys.argv[2]
 os.setsid()
 if os.getuid() != u.pw_uid:
     os.initgroups(u.pw_name, u.pw_gid)
@@ -53,8 +56,8 @@ if os.getuid() != u.pw_uid:
     os.setuid(u.pw_uid)
 if os.getuid() == 0 or os.geteuid() == 0:
     sys.exit("rebot-app-run: refusing to run the program as root")
-os.environ.update(HOME=u.pw_dir, USER=u.pw_name, LOGNAME=u.pw_name)
-os.execvp(sys.argv[2], sys.argv[2:])'
+os.environ.update(HOME=u.pw_dir, USER=u.pw_name, LOGNAME=u.pw_name, PYTHONPATH=pythonpath)
+os.execvp(sys.argv[3], sys.argv[3:])'
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [rebot-app-run] $*" >> "$LOG" 2>/dev/null; }
 
@@ -129,7 +132,7 @@ read_manifest() {
     restart=on-failure
     [ -f "$APP_DIR/app.json" ] || return 0
     command -v python3 >/dev/null 2>&1 || return 0
-    out=$(python3 -c "
+    out=$(python3 -I -S -c "
 import json, sys
 try:
     with open(sys.argv[1]) as f:
@@ -190,7 +193,9 @@ main() {
     NICE="nice -n 5"
     command -v nice >/dev/null 2>&1 || NICE=""
     export REBOT_HOST=127.0.0.1
-    export PYTHONPATH="$SDK_PATH:$APP_DIR"
+    # set for the program by the launcher after the privilege drop, never for root
+    APP_PYTHONPATH="$SDK_PATH:$APP_DIR"
+    unset PYTHONPATH PYTHONSTARTUP PYTHONHOME
     trap on_term TERM INT
 
     rotate_loop &
@@ -217,7 +222,7 @@ main() {
         starts="$starts $now"
         rotate_log
         cd "$APP_DIR" || { log "cannot enter $APP_DIR"; write_state stopped; result=1; break; }
-        $NICE python3 -c "$LAUNCH" "$RUN_USER" "$PYTHON" -u "$entry" >> "$LOG" 2>&1 < /dev/null &
+        $NICE python3 -I -S -c "$LAUNCH" "$RUN_USER" "$APP_PYTHONPATH" "$PYTHON" -u "$entry" >> "$LOG" 2>&1 < /dev/null &
         child=$!
         total=$((total + 1))
         # a SIGTERM between the fork and the line above found no child to forward to
