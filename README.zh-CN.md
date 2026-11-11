@@ -107,6 +107,8 @@
 
 验证中驱动的协议编码由单元测试覆盖（`tests/test_protocol_vectors.rs`、`tests/test_driver_capabilities.rs`）。它们使用通用 6 关节 profile，没有运动学和工作空间，笛卡尔动作返回 `UNSUPPORTED`。达妙驱动另有带重力前馈的 MIT 模式，但只能在代码中启用（`DamiaoArmDriver::with_control_mode`），命令行和 profile 都不能选择。重力补偿模式在运行时把 J1–J6 切到 MIT 再切回（见[网页驾驶舱](#网页驾驶舱)），该切换已在 B601-DM 上实机验证。
 
+其他机械臂可以从 profile 指定的 URDF 获取运动学和重力模型（`"kinematics": "Urdf"`，字段 `urdf`、`chain`；见 [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md)）。`profiles/rebot_b601_rs.json` 为 B601-RS 提供这样的 profile（`--follower rebot-rs --config profiles/rebot_b601_rs.json`）：FK 和重力在测试中与 RS 的 MuJoCo 模型和 URDF 对比；关节方向、零位偏置、限位和质量未在真实机械臂上验证。它有 6 个手臂关节、没有夹爪关节，因此有工作空间检查和重力模型，没有笛卡尔动作。
+
 TODO / 路线图：
 
 - [ ] 在真实机械臂上验证 `rebot-rs`（RobStride）、`so-arm101`（飞特 STS）和 `fashionstar` / `star-arm102`（FashionStar），并提供带运动学和工作空间的 profile。

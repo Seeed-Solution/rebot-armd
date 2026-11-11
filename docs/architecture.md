@@ -47,7 +47,10 @@ The `ArmConfig` JSON loaded with `armd --config <file>` (`src/model.rs`). Withou
 6-joint profile.
 
 - Version: `profile_version`, currently **1** (`ARM_PROFILE_VERSION`). A profile without the
-  field is version 1; armd refuses newer versions at startup.
+  field is version 1; armd refuses newer versions at startup. The URDF fields (`urdf`,
+  `urdf_sha256`, `chain`, `gripper_joint`) and the `Urdf` model value are optional additions
+  to version 1; a profile without them loads as before. An older armd rejects a profile that
+  sets `kinematics` or `gravity_model` to `Urdf` (unknown variant).
 - Unknown top-level fields are ignored (the `grasp` section rejects unknown fields); every optional
   field has a serde default.
 
@@ -61,9 +64,13 @@ The `ArmConfig` JSON loaded with `armd --config <file>` (`src/model.rs`). Withou
 | `max_jerk`, `planned_max_velocity` | trajectory jerk preference, planned-motion speed cap | no |
 | `speed_cap` | `linear_mps`, `angular_rps`, `joint_velocity_scale` (0, 1]: upper bound for every planned motion, min() with the request and `planned_max_velocity`; each entry optional | no |
 | `collision` | collision guard: `enabled` (default false), `thresholds_nm` (J1..J6, placeholders until measured on a real arm), `persist_ticks`, `clear_ratio`, `resume_after_s`, `max_auto_resumes`, `escalate_window_s`; each entry optional | no |
-| `kinematics` | kinematic model (`RebotDevArm`); null disables Cartesian actions and the workspace check | no |
+| `kinematics` | kinematic model: `RebotDevArm` (built-in B601-DM, needs `dof` 7) or `Urdf` (the `chain` of `urdf`); null disables Cartesian actions and the workspace check | no |
 | `workspace` | Cartesian safety box (`floor_z_m`, `box_min_m`, `box_max_m`, `max_reach_m`, `check_points_end_m`, `keepout_boxes` `[{name, min_m, max_m}]`, at most 16) | no |
-| `gravity_model` | gravity model (`RebotDevArm`) | no |
+| `gravity_model` | gravity model: `RebotDevArm` or `Urdf` (inertials of `urdf`); both model fields must name the same source | no |
+| `urdf` | URDF file for `Urdf`, relative to the profile file; read once at startup | with `Urdf` |
+| `urdf_sha256` | expected sha256 of `urdf`; startup fails on a mismatch | no |
+| `chain` | `base_link`, `tip_link`, `joints` `[{urdf_joint, sign (±1, default 1), offset_rad (default 0)}]`: the arm joints in armd order = revolute joints from base to tip; URDF angle = sign × armd angle + offset_rad | with `Urdf` |
+| `gripper_joint` | gripper joint index (after the arm joints); default: the joint after the arm joints when `dof` = chain length + 1, else none | no |
 | `gravity_comp` | gravity-compensation policy (ramp, scale, damping, torque and speed limits, hold gains); null = unsupported | no |
 | `damiao_ranges` | per-joint Damiao mapping range `{p_max, v_max, t_max}`; null = ±12.5 rad, ±30 rad/s, ±18 N·m | no |
 | `gripper_policy` | gripper action (closed / open angles, holding gap and torque, squeeze, settle) | no |
@@ -74,10 +81,29 @@ Details and units: [control_safety_contract.md](control_safety_contract.md#confi
 
 Not in the profile today:
 
-- URDF: `gravity_model` selects a model compiled into armd. At startup armd checks the sha256
-  of `reBot-DevArm_gripper.urdf` at fixed paths (`assets/`, `/usr/share/rebot-teleop/assets/`,
-  `/usr/share/rebot-teleop/`); the reCamera kit's deb installs it. The path is not a profile
-  field.
+- The built-in URDF check: with `RebotDevArm`, the model is compiled into armd and armd
+  checks the sha256 of `reBot-DevArm_gripper.urdf` at fixed paths (`assets/`,
+  `/usr/share/rebot-teleop/assets/`, `/usr/share/rebot-teleop/`); the reCamera kit's deb
+  installs it. That path is not a profile field; a profile that wants a URDF from its own
+  path uses `Urdf` + `urdf`.
+
+Arm model with `Urdf` (`src/urdf.rs`, `src/chain.rs`): the chain `base_link -> tip_link`
+with 1..8 revolute joints; fixed joints are folded in; links that hang off the chain
+(fingers) count for gravity at joint position 0. The chain gives FK, the geometric Jacobian,
+damped-least-squares IK and gravity torques. `tests/test_chain.rs` builds the chain from the
+B601-DM URDF and compares it with the built-in model over random joint vectors (FK 6e-16 m,
+IK 2e-12 rad, gravity 1e-14 N·m). What each feature needs:
+
+| Feature | Needs |
+|---|---|
+| workspace check, pose TCP, gravity torques | any chain length; `dof` = chain length (+1 with a gripper) |
+| residual torques, collision guard | 6 arm joints |
+| Cartesian actions, grasp, place, gravity compensation | 6 arm joints, gripper at joint 7 (`dof` 7) |
+
+The tip frame is the frame of the workspace check points and Cartesian targets; with a chain
+the camera mount (`cam_mount`) uses the second-to-last joint as the wrist axis. Profiles:
+[`profiles/rebot_b601_rs.json`](../profiles/rebot_b601_rs.json) (B601-RS, not verified on
+hardware), template [`kits/_template/profile/example_urdf.json`](../kits/_template/profile/example_urdf.json).
 - The grasp setup can also come from `ARMD_GRASP_SETUP` (runtime changes, persisted).
 - Runtime keep-out boxes (`ARMD_KEEPOUT`, default `/userdata/rebot-teleop/keepout.json`)
   replace `workspace.keepout_boxes` when present; named poses are stored in `ARMD_POSES`
@@ -153,7 +179,7 @@ have no `capabilities` object; it parses as all false, `version` 0.
 | Field | True when |
 |---|---|
 | `profile_version` | (number) version of the loaded profile |
-| `cartesian` | 7-DOF profile with `kinematics` (Cartesian actions) |
+| `cartesian` | `kinematics` with 6 arm joints and the gripper at joint 7 (Cartesian actions) |
 | `workspace_check` | `kinematics` and `workspace` set |
 | `gripper` | `gripper_policy` set and a 7th joint exists (`/api/v1/action/gripper`) |
 | `grasp` | 7-DOF, `kinematics`, `gripper_policy` and `grasp` set (`/api/v1/action/grasp`) |

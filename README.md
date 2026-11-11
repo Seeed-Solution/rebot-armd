@@ -127,6 +127,14 @@ from code (`DamiaoArmDriver::with_control_mode`), not from the CLI or a profile.
 gravity-compensation mode switches J1–J6 to MIT at runtime and back (see
 [Web cockpit](#web-cockpit)); that switch is verified on the B601-DM.
 
+Other arms can take their kinematic and gravity model from a URDF named in the profile
+(`"kinematics": "Urdf"`, fields `urdf`, `chain`; see
+[docs/architecture.md](docs/architecture.md#1-arm-profile)). `profiles/rebot_b601_rs.json` does
+this for the B601-RS (`--follower rebot-rs --config profiles/rebot_b601_rs.json`): FK and
+gravity are checked against the RS MuJoCo model and URDF in tests; joint signs, offsets,
+limits and masses are not verified on a real arm. With 6 arm joints and no gripper joint it
+gets the workspace check and the gravity model, not the Cartesian actions.
+
 TODO / roadmap:
 
 - [ ] Verify `rebot-rs` (RobStride), `so-arm101` (Feetech STS) and `fashionstar` / `star-arm102`
