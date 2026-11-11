@@ -15,7 +15,7 @@ set -euo pipefail
 #                      RECAMERA_DOCKER=<tpuc_dev container> to build it with
 #                      scripts/build_vision.sh (see that script for the paths)
 #                      REBOT_SDK_DIR=<rebot-companion checkout>: its rebot/ Python
-#                      package goes to /usr/share/rebot-teleop/python (warning if unset)
+#                      package goes to /usr/share/rebot-teleop/python (required)
 #   --flavor lite      core only: the armd binary with LICENSE and
 #                      THIRD_PARTY_NOTICES.md, no init script, no kit files
 #                      -> dist/armd-lite_<VERSION>_riscv64.tar.gz
@@ -42,6 +42,12 @@ case "$FLAVOR" in
     recamera|lite) ;;
     *) echo "Error: --flavor must be recamera or lite (got '${FLAVOR}')" >&2; exit 1 ;;
 esac
+# The recamera deb runs user programs that import the rebot SDK; lite has no SDK.
+if [ "$FLAVOR" = "recamera" ] && { [ -z "${REBOT_SDK_DIR:-}" ] || [ ! -d "${REBOT_SDK_DIR}/rebot" ]; }; then
+    echo "Error: the recamera flavor needs the rebot Python SDK: set REBOT_SDK_DIR=<rebot-companion checkout>" >&2
+    echo "       (a directory with rebot/; got '${REBOT_SDK_DIR:-}')." >&2
+    exit 1
+fi
 
 # SG2002 RISC-V musl toolchain (sophgo host-tools: gcc/riscv64-linux-musl-x86_64).
 # Only its T-Head (lib64v0p7_xthead/lp64d) libraries are used; rust-lld links.
@@ -179,7 +185,7 @@ cp -r "${PACKAGING_DIR}/rootfs/usr/share/rebot-teleop/"* "${STAGING_DIR}/usr/sha
 
 # rebot Python SDK (stdlib only) for user programs run by rebot-app-run: the rebot/ package
 # of a rebot-companion checkout (REBOT_SDK_DIR), without __pycache__
-if [ -n "${REBOT_SDK_DIR:-}" ] && [ -d "${REBOT_SDK_DIR}/rebot" ]; then
+{
     SDK_DEST="${STAGING_DIR}/usr/share/rebot-teleop/python"
     mkdir -p "${SDK_DEST}"
     (cd "${REBOT_SDK_DIR}" && find rebot -name __pycache__ -prune -o -type f ! -name '*.pyc' -print) |
@@ -188,10 +194,7 @@ if [ -n "${REBOT_SDK_DIR:-}" ] && [ -d "${REBOT_SDK_DIR}/rebot" ]; then
             cp -f "${REBOT_SDK_DIR}/$f" "${SDK_DEST}/$f"
         done
     echo "      rebot Python SDK copied from ${REBOT_SDK_DIR}/rebot"
-else
-    echo "Warning: REBOT_SDK_DIR is unset or has no rebot/ directory; the deb has no rebot Python SDK" >&2
-    echo "         (user programs need it: set REBOT_SDK_DIR=<rebot-companion checkout>)." >&2
-fi
+}
 
 # Arm profile of the kit (loaded by the init script with --config)
 mkdir -p "${STAGING_DIR}/usr/share/rebot-teleop/profile"

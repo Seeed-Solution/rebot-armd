@@ -124,8 +124,8 @@ it after a crash and keeps its log. The runner is covered by host tests
 (`scripts/test_app_runner.sh`); it has not been run on a device yet.
 
 1. Write the program with the stdlib-only `rebot` SDK (rebot-companion). The deb carries the
-   `rebot/` package in `/usr/share/rebot-teleop/python` when it was built with
-   `REBOT_SDK_DIR=<rebot-companion checkout>`. Example: `/usr/share/rebot-teleop/examples/hello/main.py`.
+   `rebot/` package in `/usr/share/rebot-teleop/python` (the recamera build requires
+   `REBOT_SDK_DIR=<rebot-companion checkout>`). Example: `/usr/share/rebot-teleop/examples/hello/main.py`.
 2. Copy the program to `/userdata/rebot-apps/<name>/` (entry `main.py`).
 3. Start it: `/etc/init.d/K92rebot-teleop app-start <name>`. Other commands: `app-stop`,
    `app-status`, `app-logs [n]` (default 50 lines).
@@ -150,8 +150,8 @@ reCamera 应用画廊一次只运行一个应用，摄像头为独占资源，�
 不作为独立的画廊应用。`rebot-app-run` 负责运行、崩溃后重启并保留日志。运行器已有主机端测试
 （`scripts/test_app_runner.sh`），尚未在设备上运行。
 
-1. 用仅依赖标准库的 `rebot` SDK（rebot-companion）编写程序。构建 deb 时设置
-   `REBOT_SDK_DIR=<rebot-companion 检出目录>`，`rebot/` 包会装入 `/usr/share/rebot-teleop/python`。
+1. 用仅依赖标准库的 `rebot` SDK（rebot-companion）编写程序。构建 recamera deb 时必须设置
+   `REBOT_SDK_DIR=<rebot-companion 检出目录>`（未设置时构建停止），`rebot/` 包会装入 `/usr/share/rebot-teleop/python`。
    示例：`/usr/share/rebot-teleop/examples/hello/main.py`。
 2. 将程序复制到 `/userdata/rebot-apps/<name>/`（入口 `main.py`）。
 3. 启动：`/etc/init.d/K92rebot-teleop app-start <name>`。其他命令：`app-stop`、`app-status`、

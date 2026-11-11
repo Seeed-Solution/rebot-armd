@@ -231,6 +231,14 @@ check "config: app name" [ "$APP_NAME" = demo ]
 check "config: nothing was executed" sh -c "[ ! -e '$CT/pwned1' ] && [ ! -e '$CT/pwned2' ]"
 rm -rf "$CT"
 
+# build_deb.sh: the recamera flavor without REBOT_SDK_DIR stops before building
+echo "== build_deb.sh REBOT_SDK_DIR"
+out=$(env -u REBOT_SDK_DIR bash "$HERE/build_deb.sh" 2>&1); rc=$?
+check "build_deb: recamera without REBOT_SDK_DIR fails" sh -c "[ $rc -ne 0 ]"
+check "build_deb: the error names REBOT_SDK_DIR" sh -c 'printf "%s" "$1" | grep -q "Error: the recamera flavor needs the rebot Python SDK"' _ "$out"
+out=$(REBOT_SDK_DIR=/nonexistent bash "$HERE/build_deb.sh" 2>&1)
+check "build_deb: REBOT_SDK_DIR without rebot/ fails" sh -c 'printf "%s" "$1" | grep -q "needs the rebot Python SDK"' _ "$out"
+
 run_suite /bin/sh
 if command -v busybox >/dev/null 2>&1 && busybox sh -c : 2>/dev/null; then
     run_suite "busybox sh"
