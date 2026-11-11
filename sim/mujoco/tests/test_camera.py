@@ -7,32 +7,24 @@ The stream is decoded with rebot-companion's snapshot decoder when a checkout is
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
 import socket
 import sys
+import threading
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import mujoco
 import numpy as np
 import pytest
+from test_armd_sim import REPO, free_port
+from test_perception import http, set_arm
 from websockets.sync.client import connect
 
 from rebot_sim.camera import DEFAULT_OFFSET_M, CameraMount, detections, project_points, segmentation_ids
 from rebot_sim.model import load_model
 from rebot_sim.scene import Scene, parse_objects, sample_poses
 from rebot_sim.server import Simulator
-
-REPO = Path(__file__).resolve().parents[3]
-
-
-def free_port(kind=socket.SOCK_STREAM) -> int:
-    with socket.socket(socket.AF_INET, kind) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def companion_snapshot():
@@ -50,34 +42,20 @@ def companion_snapshot():
     pytest.skip("no rebot-companion checkout (set REBOT_COMPANION_DIR)")
 
 
-def http(url: str, body: dict | None = None, method: str | None = None) -> tuple[int, dict]:
-    data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(url, data=data, method=method or ("GET" if body is None else "POST"),
-                                 headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return r.status, json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read())
-
-
 @pytest.fixture(scope="module")
 def live():
-    import threading
-
     sim = Simulator(free_port(socket.SOCK_DGRAM), objects="cube,cup", seed=None, camera_mount=CameraMount())
     vport, pport = free_port(), free_port()
     ready = sim.start_camera(15, (640, 360), "127.0.0.1", vport, pport, objects="cube,cup")
     if "error" in ready:
+        sim.close()
         pytest.skip(ready["error"])
     runner = threading.Thread(target=sim.run, daemon=True)  # physics: serves the shared state and /sim
     runner.start()
     yield sim, f"ws://127.0.0.1:{vport}/", f"http://127.0.0.1:{pport}"
     sim.stopping = True
     runner.join(2)
-    sim.cam_proc.terminate()
-    sim.cam_proc.join(5)
-    sim.sock.close()
+    sim.close()
 
 
 def test_stream_framing_and_decode(live):
@@ -120,9 +98,7 @@ def test_detections_contain_the_projected_object_centre_and_match_the_render():
     scene = Scene(model, objects)
     scene.reset(data, seed=None)
     # a pose (found by sampling) with the cube whole in view and the block cut by the image edge
-    for j, q in zip(range(1, 7), [0.46, -0.63, -1.05, 1.48, 0.43, -0.66]):
-        data.qpos[model.jnt_qposadr[model.joint(f"joint{j}").id]] = q
-    mujoco.mj_forward(model, data)
+    set_arm(model, data, [0.46, -0.63, -1.05, 1.48, 0.43, -0.66])
     cam = model.camera("wrist").id
     renderer = mujoco.Renderer(model, 360, 640)
     renderer.enable_segmentation_rendering()
@@ -159,7 +135,7 @@ def test_reset_is_deterministic_by_seed():
         assert a["seed"] == 7 and [o["pos"] for o in a["objects"]] == [o["pos"] for o in b["objects"]]
         assert a["objects"][0]["pos"][:2] == pytest.approx(list(sample_poses(objs, 7)[0][:2]), abs=1e-5)
     finally:
-        sim.sock.close()
+        sim.close()
 
 
 def test_perception_api_v2(live):
@@ -191,3 +167,23 @@ def test_perception_api_v2(live):
     code, cam = http(base + "/sim/camera")
     assert cam["camera_mount"]["offset_m"] == list(DEFAULT_OFFSET_M) and cam["fx_px"] == pytest.approx(823.8, abs=0.1)
     assert cam["render_backend"] in ("egl", "osmesa", "glfw", "default")
+
+
+def test_view_past_the_table_shows_a_neutral_background():
+    """At this pose the top of the wrist image looks past the table and the floor: that is
+    the scene background (no geom, depth at zfar), which must not render black."""
+    objects = parse_objects("cube")
+    model = load_model(devarm_dir="", objects=objects, camera=CameraMount.from_profile())
+    data = mujoco.MjData(model)
+    Scene(model, objects).reset(data, seed=None)
+    set_arm(model, data, [0.089, -1.034, -1.185, 0.933, -0.386, 1.37])
+    model.vis.global_.offwidth, model.vis.global_.offheight = 1280, 720
+    renderer = mujoco.Renderer(model, 720, 1280)
+    renderer.update_scene(data, camera="wrist")
+    rgb = renderer.render()
+    renderer.enable_segmentation_rendering()
+    renderer.update_scene(data, camera="wrist")
+    background = segmentation_ids(renderer.render()) == -1
+    assert background[:10].all(), "pose no longer looks past the scene"
+    top = rgb[:10].reshape(-1, 3).astype(float)
+    assert top.min() > 60 and np.ptp(top.mean(axis=0)) < 20, top.mean(axis=0)  # light, near grey

@@ -131,6 +131,43 @@ def segmentation_ids(seg: np.ndarray) -> np.ndarray:
     return np.where(seg[:, :, 1] == int(mujoco.mjtObj.mjOBJ_GEOM), seg[:, :, 0], -1)  # int: an enum compares per element in Python
 
 
+class SegmentationError(RuntimeError):
+    """An ID-colour readback with values that are no segmentation id; `diag` describes it."""
+
+    def __init__(self, msg: str, diag: dict):
+        super().__init__(msg)
+        self.diag = diag
+
+
+def decode_segmentation(rgb: np.ndarray, scene: mujoco.MjvScene) -> np.ndarray:
+    """Geom id per pixel (-1 elsewhere) from an ID-colour readback (H x W x 3 uint8) of `scene`.
+    Unlike mujoco's Renderer (4.0.0 indexes its lookup table with the raw values), values above
+    the scene's geom count raise SegmentationError."""
+    seg = rgb[..., 0].astype(np.int64) | (rgb[..., 1].astype(np.int64) << 8) | (rgb[..., 2].astype(np.int64) << 16)
+    n = scene.ngeom
+    bad = seg > n
+    if bad.any():
+        diag = {"bad_pixels": int(bad.sum()), "max_value": int(seg.max()), "ngeom": int(n)}
+        raise SegmentationError(f"segmentation readback out of range: {diag}", diag)
+    lut = np.full(n + 1, -1, np.int32)  # id 0: background
+    for g in scene.geoms[:n]:
+        if g.segid != -1 and g.objtype == int(mujoco.mjtObj.mjOBJ_GEOM):
+            lut[g.segid + 1] = g.objid
+    return lut[seg]
+
+
+def render_segmentation(renderer: mujoco.Renderer) -> np.ndarray:
+    """Segmentation (geom id per pixel) of the renderer's current scene: an ID-colour render
+    read back as RGB and decoded with bounds checks (decode_segmentation)."""
+    flags = renderer.scene.flags
+    flags[mujoco.mjtRndFlag.mjRND_SEGMENT] = flags[mujoco.mjtRndFlag.mjRND_IDCOLOR] = True
+    try:
+        rgb = renderer.render()
+    finally:
+        flags[mujoco.mjtRndFlag.mjRND_SEGMENT] = flags[mujoco.mjtRndFlag.mjRND_IDCOLOR] = False
+    return decode_segmentation(rgb, renderer.scene)
+
+
 def detections(geom_ids: np.ndarray, scene, min_pixels: int = 20) -> list[dict]:
     """Ground-truth boxes of the scene objects (rebot-vision format) from a segmentation
     render at DETECTION_SIZE: the bounds of each object's visible pixels, so occlusion (by the

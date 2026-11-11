@@ -31,7 +31,7 @@ import time
 import mujoco
 import numpy as np
 
-from .camera import CameraMount
+from .camera import PROFILE, CameraMount
 from .model import DOF, Indexer, load_model
 from .scene import Scene, parse_objects
 
@@ -190,13 +190,14 @@ class Simulator:
         self.mount = camera_mount
         self.has_meshes = bool(os.environ.get("REBOT_DEVARM_DIR"))
         self.model = load_model(objects=self.objects, camera=camera_mount)
-        # physics runs under this lock; the camera thread and the HTTP routes read under it
+        # physics and the scene resets run under this lock; sim_state reads under it
         self.lock = threading.Lock()
         self.stopping = False
         self._resets: list[tuple[int | None, threading.Event, dict]] = []
         self.shared = None  # SharedState for the camera process
         self.cam_conn = None
         self.cam_proc = None
+        self.camera_error: str | None = None  # set when the camera process died while running
         self.torque_report = torque_report
         # --torque-report mean: torques of the last physics steps and the command period in steps
         self.tau_hist: collections.deque = collections.deque(maxlen=256)
@@ -279,16 +280,17 @@ class Simulator:
 
     def step(self) -> None:
         with self.lock:
-            if self._resets:
-                for seed, done, out in self._resets:
-                    self.scene.reset(self.data, seed)
-                    out.update(self._state_locked())
-                    done.set()
-                self._resets.clear()
+            for seed, done, out in self._resets:
+                out.update(self._reset_locked(seed))
+                done.set()
+            self._resets.clear()
             self.motors.apply()
             mujoco.mj_step(self.model, self.data)
-        if self.shared is not None:
-            self.shared.write(self.data)
+        if self.shared is not None and self.camera_error is None:
+            try:
+                self.shared.write(self.data)
+            except TimeoutError:  # the camera process died holding the lock
+                self.camera_error = "shared-state lock timeout"
         if self.torque_report == "mean":
             self.tau_hist.append(self.motors.reported_torque())
             self.steps_since_cmd += 1
@@ -303,9 +305,16 @@ class Simulator:
             with self.lock:
                 if (seed, done, out) in self._resets:
                     self._resets.remove((seed, done, out))
-                    self.scene.reset(self.data, seed)
-                    out.update(self._state_locked())
+                    out.update(self._reset_locked(seed))
         return out
+
+    def _reset_locked(self, seed) -> dict:
+        """Reset the scene; a seed the scene rejects gives {"error": ...} and changes nothing."""
+        try:
+            self.scene.reset(self.data, seed)
+        except (ValueError, TypeError, OverflowError) as exc:
+            return {"error": f"reset with seed {seed!r} failed: {exc}"}
+        return self._state_locked()
 
     def _state_locked(self) -> dict:
         d = self.data
@@ -325,9 +334,9 @@ class Simulator:
 
         from .perception import SharedState, camera_main
 
-        self.shared = SharedState(self.model.nq, self.model.nv)
-        self.shared.write(self.data)
         ctx = mp.get_context("spawn")
+        self.shared = SharedState(self.model.nq, self.model.nv, lock=ctx.Lock())
+        self.shared.write(self.data)
         self.cam_conn, child = ctx.Pipe()
         ready_r, ready_w = ctx.Pipe(duplex=False)
         m = self.mount
@@ -335,25 +344,71 @@ class Simulator:
                "perception_port": perception_port, "scene_stream": scene_stream, "objects": objects,
                "mount": [m.flip, m.rot_deg, m.tilt_deg, m.offset_m], "has_meshes": self.has_meshes}
         self.cam_proc = ctx.Process(target=camera_main, name="rebot-sim-camera", daemon=True,
-                                    args=(cfg, self.shared.shm.name, self.model.nq, self.model.nv, child, ready_w, os.getpid()))
+                                    args=(cfg, self.shared.shm.name, self.shared.lock, self.model.nq, self.model.nv, child, ready_w,
+                                          os.getpid()))
         self.cam_proc.start()
-        if not ready_r.poll(timeout):
-            return {"error": "camera process did not start"}
-        return ready_r.recv()
+        child.close()
+        ready_w.close()
+        try:
+            ready = self._wait_ready(ready_r, timeout)
+        finally:
+            ready_r.close()
+        if "error" in ready:
+            self.stop_camera()
+        return ready
+
+    def _wait_ready(self, ready_r, timeout: float) -> dict:
+        deadline = time.monotonic() + timeout
+        while not ready_r.poll(0.1):  # watch the child: it can die before it reports
+            if not self.cam_proc.is_alive():
+                return {"error": f"camera process exited during startup (code {self.cam_proc.exitcode})"}
+            if time.monotonic() > deadline:
+                return {"error": "camera process did not start"}
+        try:
+            return ready_r.recv()
+        except EOFError:
+            return {"error": "camera process exited during startup"}
+
+    def stop_camera(self) -> None:
+        """Stop and join the camera process, close its pipe, free the shared state. Idempotent."""
+        if self.cam_proc is not None:
+            self.cam_proc.terminate()
+            self.cam_proc.join(5)
+            if self.cam_proc.is_alive():
+                self.cam_proc.kill()
+                self.cam_proc.join(5)
+            self.cam_proc = None
+        if self.cam_conn is not None:
+            self.cam_conn.close()
+            self.cam_conn = None
+        if self.shared is not None:
+            shared, self.shared = self.shared, None
+            shared.close()
+
+    def close(self) -> None:
+        """Stop the physics loop and the camera, release the UDP socket. Idempotent; call it
+        after run() has returned."""
+        self.stopping = True
+        self.stop_camera()
+        self.sock.close()
+        if self.viewer is not None:
+            self.viewer.close()
+            self.viewer = None
 
     def service_camera(self) -> None:
         """Answer the camera process's /sim requests (physics thread)."""
-        while self.cam_conn is not None and self.cam_conn.poll():
-            try:
+        try:
+            while self.cam_conn is not None and self.cam_conn.poll():
                 msg = self.cam_conn.recv()
-            except EOFError:
-                self.cam_conn = None
-                return
-            if msg[0] == "reset":
-                self.scene.reset(self.data, msg[1])
-                self.cam_conn.send(self._state_locked())
-            else:
-                self.cam_conn.send(self._state_locked())
+                rid, op = msg[0], msg[1]
+                if op == "reset":
+                    self.cam_conn.send((rid, self._reset_locked(msg[2])))
+                else:
+                    self.cam_conn.send((rid, self._state_locked()))
+        except (EOFError, OSError) as exc:  # the camera process is gone (BrokenPipeError: mid-request)
+            self.cam_conn.close()
+            self.cam_conn = None
+            self.camera_error = f"camera process exited (pipe closed: {exc!r})"
 
     def run(self, duration: float | None = None, stats_every: float = 0.0) -> None:
         dt = self.model.opt.timestep
@@ -364,8 +419,15 @@ class Simulator:
             self.poll_socket()
             self.step()
             steps += 1
+            if self.camera_error:
+                print(f"rebot-sim: {self.camera_error}", file=sys.stderr, flush=True)
+                return
             if steps % 10 == 0 and self.cam_conn is not None:
-                self.service_camera()
+                self.service_camera()  # a closed pipe sets camera_error: the loop ends after the next step
+            if steps % 100 == 0 and self.cam_proc is not None and not self.cam_proc.is_alive():
+                self.camera_error = f"camera process exited (code {self.cam_proc.exitcode})"
+                print(f"rebot-sim: {self.camera_error}", file=sys.stderr, flush=True)
+                return
             if steps % STATE_EVERY == 0 and self.peer is not None:
                 try:
                     self.sock.sendto(self.state_datagram(), self.peer)
@@ -453,7 +515,9 @@ def main(argv: list[str] | None = None) -> None:
         parse_objects(args.objects)
     except ValueError as exc:
         parser.error(f"--objects: {exc}")
-    mount = CameraMount.from_profile(args.profile) if args.profile else CameraMount.from_profile()
+    if args.seed is not None and args.seed < 0:
+        parser.error("--seed must be non-negative")
+    mount = CameraMount.from_profile(args.profile or PROFILE)
     if args.camera_rot_deg is not None or args.camera_tilt_deg is not None or args.camera_offset:
         off = mount.offset_m
         if args.camera_offset:
@@ -478,6 +542,7 @@ def main(argv: list[str] | None = None) -> None:
                                  args.scene_stream, args.objects)
         if "error" in ready:
             print(f"rebot-sim: {ready['error']}", file=sys.stderr, flush=True)
+            sim.close()
             sys.exit(1)
         print(f"camera: {w}x{h} @ {args.fps} fps ({ready['backend']}, own process), mount rot {mount.rot_deg:g} tilt {mount.tilt_deg:g} "
               f"offset {mount.offset.round(4).tolist()}; video ws://{args.http_host}:{args.video_port}/, "
@@ -487,7 +552,9 @@ def main(argv: list[str] | None = None) -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        sim.stopping = True
+        sim.close()
+    if sim.camera_error:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

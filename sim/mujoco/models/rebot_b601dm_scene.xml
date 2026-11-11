@@ -36,6 +36,8 @@
   </visual>
 
   <asset>
+    <!-- background beyond the table and the floor (lab walls): light grey above, darker below -->
+    <texture name="sky_tex" type="skybox" builtin="gradient" rgb1="0.80 0.81 0.82" rgb2="0.52 0.53 0.54" width="512" height="3072"/>
     <texture name="floor_tex" type="2d" builtin="checker" rgb1="0.26 0.45 0.58" rgb2="0.12 0.30 0.43" width="256" height="256"/>
     <material name="floor_mat" texture="floor_tex" texrepeat="8 8" texuniform="true"/>
     <material name="table_mat" rgba="0.34 0.36 0.34 1"/>

@@ -14,6 +14,7 @@ import itertools
 import json
 import os
 import queue
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,10 +28,6 @@ MODES = ("off", "yolo", "aruco", "both")
 MAX_SUBSCRIPTIONS = 16
 IDLE_FPS = 1
 MODE_PIPELINES = {"off": [], "yolo": ["yolo"], "aruco": ["aruco"], "both": ["yolo", "aruco"]}
-
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
 
 
 # --------------------------------------------------------------------------- video
@@ -132,6 +129,8 @@ class Perception:
         self.frame: dict | None = None  # newest rendered frame: id, ts_ms, mono, detections
         self.latest: dict | None = None  # newest published result
         self.triggers = 0
+        self.pending: list[dict] = []  # registered triggers: {"called": mono, "pipelines": [...]}
+        self._gate = 0.0  # mono of the last frame the continuous rate let through
         self.frames_in: list[float] = []
         self.results_out: list[float] = []
 
@@ -144,47 +143,56 @@ class Perception:
     def continuous(self) -> dict:
         self._expire()
         pipes = set(MODE_PIPELINES[self.mode]) if self.enabled else set()
-        fps = self.max_fps if pipes else 0
+        fps = self.max_fps if pipes else 0  # every term is capped at max_fps
         for s in self.subs.values():
             pipes |= set(s["pipelines"])
-            fps = max(fps, s["fps"])
-        active = bool(pipes)
-        return {"active": active, "pipelines": [p for p in PIPELINES if p in pipes],
-                "fps": min(fps, self.max_fps) if active else 0, "subscriptions": len(self.subs)}
+            fps = max(fps, self.sub_fps(s))
+        return {"active": bool(pipes), "pipelines": [p for p in PIPELINES if p in pipes],
+                "fps": fps, "subscriptions": len(self.subs)}
+
+    def sub_fps(self, s: dict) -> int:
+        """Effective rate of a subscription: its requested rate under the current cap."""
+        return min(s["requested_fps"], self.max_fps)
 
     def sub_body(self, s: dict) -> dict:
-        return {"id": s["id"], "client": s["client"], "pipelines": s["pipelines"], "fps": s["fps"],
+        return {"id": s["id"], "client": s["client"], "pipelines": s["pipelines"], "fps": self.sub_fps(s),
                 "requested_fps": s["requested_fps"], "ttl_ms": s["ttl_ms"],
                 "expires_in_ms": max(0, int((s["expires"] - time.monotonic()) * 1000))}
 
     # ---- frames
-    def on_frame(self, frame_id: int, ts_ms: int, captured: float, detections: list[dict]) -> None:
+    def on_frame(self, frame_id: int, ts_ms: int, captured: float, detections: list[dict],
+                 physics_time: float = 0.0, physics_step: int = 0) -> None:
         """A rendered wrist frame (called by the render thread); `captured` = time.monotonic()
-        when the simulator state was copied."""
+        when the simulator state (physics step `physics_step` at `physics_time` s) was copied."""
         now = time.monotonic()
         with self.cond:
-            self.frame = {"frame_id": frame_id, "ts_ms": ts_ms, "mono": captured, "detections": detections}
+            self.frame = {"frame_id": frame_id, "ts_ms": ts_ms, "mono": captured, "detections": detections,
+                          "physics_time": round(physics_time, 6), "physics_step": physics_step}
             self.frames_in = [t for t in self.frames_in if now - t < 2.0] + [now]
-            cont = self.continuous()
-            if cont["active"]:
-                last = self.latest["mono"] if self.latest else 0.0
-                if now - last >= 1.0 / max(cont["fps"], 1) - 0.005:
-                    self.latest = self.result(self.frame, cont["pipelines"], None)
-                    self.results_out = [t for t in self.results_out if now - t < 2.0] + [now]
+            # One plan per frame, as rebot-vision's frame_plan: the continuous pipelines when the
+            # rate lets this frame through, plus those of every trigger registered before it.
+            cont, plan = self.continuous(), set()
+            if cont["active"] and now - self._gate >= 1.0 / max(cont["fps"], 1) - 0.005:
+                plan |= set(cont["pipelines"])
+                self._gate = now
+            for t in self.pending:
+                if t["called"] < captured:
+                    plan |= set(t["pipelines"])
+            if plan:
+                self.latest = self.result(self.frame, [p for p in PIPELINES if p in plan])
+                self.results_out = [t for t in self.results_out if now - t < 2.0] + [now]
             self.cond.notify_all()
 
-    def result(self, frame: dict, pipelines: list[str], requested: list[str] | None) -> dict:
+    def result(self, frame: dict, pipelines: list[str]) -> dict:
         ran = {p: p in pipelines for p in PIPELINES}
-        body = {
+        return {
             "api_version": API_VERSION, "success": True, "mode": self.mode, "frame_id": frame["frame_id"],
-            "ts_ms": frame["ts_ms"], "mono": frame["mono"], "inference_time_ms": 0.1, "width": 640, "height": 360,
+            "ts_ms": frame["ts_ms"], "mono": frame["mono"], "physics_time": frame["physics_time"],
+            "physics_step": frame["physics_step"], "inference_time_ms": 0.1, "width": 640, "height": 360,
             "pipelines": {p: {"ran": ran[p], "ms": 0.1 if ran[p] else 0.0} for p in PIPELINES},
             "detections": frame["detections"] if ran["yolo"] else [],
             "count": 0, "family": "aruco4x4_50", "undistorted": False, "rejected": 0, "markers": [],
         }
-        if requested is not None:
-            body["requested"] = requested
-        return body
 
     @staticmethod
     def public(body: dict) -> dict:
@@ -258,6 +266,10 @@ class _Handler(BaseHTTPRequestHandler):
             code, out = self.app.dispatch(method, url.path.rstrip("/") or "/", qs, body)
         except ValueError as exc:
             code, out = 400, {"error": str(exc)}
+        except TimeoutError as exc:  # the simulator's physics loop did not answer
+            code, out = 504, {"error": str(exc)}
+        except (OSError, EOFError) as exc:  # simulator pipe closed
+            code, out = 503, {"error": f"simulator unavailable: {exc!r}"}
         self._send(code, out)
 
 
@@ -294,24 +306,25 @@ class PerceptionServer:
         if path == "/api/mode" and method == "POST":
             if not body or not set(body) <= {"mode", "enabled", "fps"}:
                 raise ValueError("body needs mode, enabled or fps")
-            with p.cond:
+            if "mode" in body and body["mode"] not in MODES:
+                raise ValueError("bad mode")
+            if "enabled" in body and not isinstance(body["enabled"], bool):
+                raise ValueError("enabled must be a bool")
+            if "fps" in body and (isinstance(body["fps"], bool) or not isinstance(body["fps"], int)
+                                  or not 1 <= body["fps"] <= 15):
+                raise ValueError("fps must be 1..15")
+            with p.cond:  # the whole body is valid: apply it
                 if "mode" in body:
-                    if body["mode"] not in MODES:
-                        raise ValueError("bad mode")
                     p.mode = body["mode"]
                     if p.mode == "off":
                         p.enabled = False
                     else:
                         p.last_active = p.mode
                 if "enabled" in body:
-                    if not isinstance(body["enabled"], bool):
-                        raise ValueError("enabled must be a bool")
                     p.enabled = body["enabled"]
                     if p.enabled and p.mode == "off":
                         p.mode = p.last_active
                 if "fps" in body:
-                    if not isinstance(body["fps"], int) or not 1 <= body["fps"] <= 15:
-                        raise ValueError("fps must be 1..15")
                     p.max_fps = body["fps"]
                 return 200, p.mode_body()
         if path == "/api/inference":
@@ -352,9 +365,10 @@ class PerceptionServer:
                              "continuous": cont, "subscriptions": [p.sub_body(s) for s in p.subs.values()]}
         if path == "/sim/reset" and method == "POST":
             seed = body.get("seed")
-            if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
-                raise ValueError("seed must be an integer or null")
-            return 200, self.sim.request_reset(seed)
+            if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int) or seed < 0):
+                raise ValueError("seed must be a non-negative integer or null")
+            out = self.sim.request_reset(seed)
+            return (500 if "error" in out else 200), out
         if path == "/sim/state" and method == "GET":
             return 200, self.sim.sim_state()
         if path == "/sim/camera" and method == "GET":
@@ -368,15 +382,24 @@ class PerceptionServer:
             req = _pipelines(body["pipelines"]) if "pipelines" in body else None
             pipes = req if req is not None else (MODE_PIPELINES[p.mode] or MODE_PIPELINES[p.last_active])
             called = time.monotonic()
-            ok = p.cond.wait_for(lambda: p.frame is not None and p.frame["mono"] > called, wait / 1000)
+            after = p.latest["frame_id"] if p.latest else 0
+            entry = {"called": called, "pipelines": pipes}
+            p.pending.append(entry)  # the next frame's plan includes these pipelines
+
+            def fresh() -> bool:
+                r = p.latest
+                return (r is not None and r["frame_id"] > after and r["mono"] > called
+                        and all(r["pipelines"][x]["ran"] for x in pipes))
+
+            try:
+                ok = p.cond.wait_for(fresh, wait / 1000)
+            finally:
+                p.pending.remove(entry)
             if not ok:
                 return 200, {"api_version": API_VERSION, "success": False, "timeout": True, "count": 0,
                              "detections": [], "markers": []}
             p.triggers += 1
-            res = p.result(p.frame, pipes, pipes)
-            if p.latest is None or p.latest["frame_id"] < res["frame_id"]:
-                p.latest = res
-            return 200, p.public(res)
+            return 200, p.public({**p.latest, "requested": pipes})
 
     def latest(self, qs: dict) -> tuple[int, dict]:
         p = self.p
@@ -418,7 +441,7 @@ class PerceptionServer:
                     return 503, {"api_version": API_VERSION, "error": "too many subscriptions"}
                 s = {"id": f"s{next(p._ids)}"}
                 p.subs[s["id"]] = s
-            s.update(client=client, pipelines=pipes, fps=min(fps, p.max_fps), requested_fps=fps, ttl_ms=ttl,
+            s.update(client=client, pipelines=pipes, requested_fps=fps, ttl_ms=ttl,
                      expires=time.monotonic() + ttl / 1000)
             return 200, {"api_version": API_VERSION, **p.sub_body(s), "continuous": p.continuous()}
 
@@ -428,57 +451,99 @@ class PerceptionServer:
 # The camera runs in a child process (spawned, so it gets its own GL context and GIL): on a
 # loaded host a render thread in the simulator process cut the 500 Hz physics loop to about
 # 220 Hz, while a separate rendering process left it at 500 Hz. The simulator publishes
-# its state in shared memory (seqlock) and answers /sim requests over a pipe.
+# its state in shared memory under a multiprocessing lock and answers /sim requests over a pipe.
 
-HDR = 4  # shared float64 slots: seq, sim time, camera frames, camera ms/frame
+HDR = 5  # shared float64 slots: writes, sim time, camera frames, camera ms/frame, physics step
 
 
 class SharedState:
-    """Simulator state in shared memory: [seq, time, frames, frame_ms, qpos..., qvel...]."""
+    """Simulator state in shared memory: [writes, time, frames, frame_ms, step, qpos..., qvel...].
+    `step` counts the physics states written, so a reader can tell whether physics advanced.
+    Writes and reads hold `lock` (a multiprocessing lock: it orders the memory accesses across
+    processes, which a seqlock on plain numpy stores does not)."""
 
-    def __init__(self, nq: int, nv: int, name: str | None = None):
+    def __init__(self, nq: int, nv: int, name: str | None = None, lock=None):
         from multiprocessing import shared_memory
 
         size = (HDR + nq + nv) * 8
-        self.shm = shared_memory.SharedMemory(name=name, create=name is None, size=size)
+        self.owner = name is None  # the creator unlinks; an attached reader is not tracked
+        self.shm = shared_memory.SharedMemory(name=name, create=self.owner, size=size, track=self.owner)
         self.arr = np.ndarray((HDR + nq + nv,), dtype=np.float64, buffer=self.shm.buf)
         self.nq, self.nv = nq, nv
-        if name is None:
+        if lock is None:
+            import multiprocessing as mp
+
+            lock = mp.get_context("spawn").Lock()
+        self.lock = lock
+        if self.owner:
             self.arr[:] = 0.0
 
-    def write(self, data) -> None:
-        a = self.arr
-        a[0] += 1  # odd: writing
-        a[1] = data.time
-        a[HDR:HDR + self.nq] = data.qpos
-        a[HDR + self.nq:] = data.qvel
-        a[0] += 1
+    def close(self) -> None:
+        """Release the mapping; the owner also unlinks the segment. Idempotent."""
+        if self.arr is None:
+            return
+        self.arr = None
+        self.shm.close()
+        if self.owner:
+            try:
+                self.shm.unlink()
+            except FileNotFoundError:
+                pass
 
-    def read(self, data) -> bool:
+    LOCK_TIMEOUT_S = 0.2  # a process that died holding the lock never releases it
+
+    def write(self, data) -> None:
+        """Publish `data`; raises TimeoutError when the lock is not had within LOCK_TIMEOUT_S."""
         a = self.arr
-        for _ in range(1000):
-            s1 = a[0]
-            if s1 % 2:
-                continue
-            qpos, qvel, t = a[HDR:HDR + self.nq].copy(), a[HDR + self.nq:].copy(), a[1]
-            if a[0] == s1:
-                data.qpos[:], data.qvel[:], data.time = qpos, qvel, t
-                return s1 > 0
-        return False
+        if not self.lock.acquire(timeout=self.LOCK_TIMEOUT_S):
+            raise TimeoutError("shared-state lock timeout")
+        try:
+            a[0] += 1
+            a[1] = data.time
+            a[4] += 1
+            a[HDR:HDR + self.nq] = data.qpos
+            a[HDR + self.nq:] = data.qvel
+        finally:
+            self.lock.release()
+
+    def read(self, data) -> int | None:
+        """Copy the state into `data`; returns its physics step, or None (and leaves `data`
+        alone) when nothing was written yet or the lock was not had within LOCK_TIMEOUT_S."""
+        a = self.arr
+        if not self.lock.acquire(timeout=self.LOCK_TIMEOUT_S):
+            return None
+        try:
+            if a[0] == 0:
+                return None
+            data.qpos[:], data.qvel[:], data.time = a[HDR:HDR + self.nq], a[HDR + self.nq:], a[1]
+            return int(a[4])
+        finally:
+            self.lock.release()
 
 
 class SimLink:
-    """Child side of the simulator pipe: /sim/reset and /sim/state go to the physics loop."""
+    """Child side of the simulator pipe: /sim/reset and /sim/state go to the physics loop.
+    Requests are `(id, op, *args)`, replies `(id, body)`; a reply to an earlier request that
+    timed out is dropped, so it never answers a later one."""
 
     def __init__(self, conn):
         self.conn, self.lock = conn, threading.Lock()
+        self._ids = itertools.count(1)
 
     def call(self, msg: tuple, timeout: float = 3.0) -> dict:
         with self.lock:
-            self.conn.send(msg)
-            if not self.conn.poll(timeout):
-                raise TimeoutError("simulator did not answer")
-            return self.conn.recv()
+            while self.conn.poll():  # late replies to timed-out requests
+                self.conn.recv()
+            rid = next(self._ids)
+            self.conn.send((rid, *msg))
+            deadline = time.monotonic() + timeout
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0 or not self.conn.poll(left):
+                    raise TimeoutError("simulator did not answer")
+                got, body = self.conn.recv()
+                if got == rid:
+                    return body
 
 
 class CameraRig:
@@ -504,6 +569,11 @@ class CameraRig:
             self.streams["/scene"] = VideoStream()
         self.perception = Perception(max_fps=min(15, self.fps))
         self.frame_id = 0
+        self.physics_step: int | None = None  # physics step of the newest frame
+        self.skipped = 0  # camera ticks without a new physics state (nothing published)
+        self.seg_failures = 0  # segmentation renders that failed (frame published without a result)
+        self.seg_consecutive = 0
+        self.seg_last_error: str | None = None
         self.render_ms: list[float] = []
         self.backend = os.environ.get("MUJOCO_GL", "default")
         self._cam = cam
@@ -513,7 +583,19 @@ class CameraRig:
         return self.link.call(("reset", seed))
 
     def sim_state(self):
-        return self.link.call(("state",))
+        """The simulator's state plus the camera's: the newest frame's physics time and how far
+        it is behind the physics now (`stale` past two camera periods)."""
+        out = self.link.call(("state",))
+        with self.perception.cond:
+            frame = self.perception.frame
+        lag = float(self.state.arr[1]) - frame["physics_time"] if frame else None
+        out["camera"] = {"frame_id": frame["frame_id"] if frame else 0,
+                         "physics_time": frame["physics_time"] if frame else None,
+                         "physics_step": frame["physics_step"] if frame else None,
+                         "lag_s": None if lag is None else round(lag, 6), "skipped": self.skipped,
+                         "seg_failures": self.seg_failures, "seg_last_error": self.seg_last_error,
+                         "stale": frame is None or lag > 2.0 / self.fps}
+        return out
 
     def camera_info(self) -> dict:
         cam, m = self._cam, self.mount
@@ -528,41 +610,82 @@ class CameraRig:
             "render_backend": self.backend, "render": self.stats(),
         }
 
-    def run(self, parent_pid: int) -> None:
+    def setup(self) -> None:
+        """Create the renderers and encoders (raises when no GL backend or libx264 works)."""
         import mujoco
 
         w, h = self.size
         self.model.vis.global_.offwidth = max(self.model.vis.global_.offwidth, w)
         self.model.vis.global_.offheight = max(self.model.vis.global_.offheight, h)
-        renderer = mujoco.Renderer(self.model, h, w)
-        seg_renderer = mujoco.Renderer(self.model, self._cam.DETECTION_SIZE[1], self._cam.DETECTION_SIZE[0])
-        seg_renderer.enable_segmentation_rendering()
-        opt = mujoco.MjvOption()
-        opt.sitegroup[:] = 0
+        self.renderer = mujoco.Renderer(self.model, h, w)
+        # plain renderer: render_segmentation sets the ID-colour flags and decodes with bounds checks
+        self.seg_renderer = mujoco.Renderer(self.model, self._cam.DETECTION_SIZE[1], self._cam.DETECTION_SIZE[0])
+        self.opt = mujoco.MjvOption()
+        self.opt.sitegroup[:] = 0
         if self.cfg["has_meshes"]:
-            opt.geomgroup[3] = 0  # box primitives hidden behind the upstream meshes
-        encoders = {path: self._cam.H264Encoder(w, h, self.fps) for path in self.streams}
+            self.opt.geomgroup[3] = 0  # box primitives hidden behind the upstream meshes
+        self.encoders = {path: self._cam.H264Encoder(w, h, self.fps) for path in self.streams}
+        # one RGB and one segmentation render succeed before readiness is reported
+        self.state.read(self.data)
+        mujoco.mj_forward(self.model, self.data)
+        self.renderer.update_scene(self.data, camera="wrist", scene_option=self.opt)
+        self.renderer.render()
+        while self.detect() is None:  # raises after SEG_MAX_CONSECUTIVE failures
+            pass
+
+    SEG_MAX_CONSECUTIVE = 10
+
+    def detect(self) -> list[dict] | None:
+        """Ground-truth detections of the wrist view of self.data, or None when the segmentation
+        render failed (logged and counted; the frame then gets no result). Raises RuntimeError
+        after SEG_MAX_CONSECUTIVE failures in a row."""
+        r = self.seg_renderer
+        r.update_scene(self.data, camera="wrist", scene_option=self.opt)
+        try:
+            ids = self._cam.render_segmentation(r)
+        except Exception as exc:  # SegmentationError (bad readback) or a GL error
+            self.seg_failures += 1
+            self.seg_consecutive += 1
+            self.seg_last_error = repr(exc)
+            print(f"rebot-sim camera: segmentation failed on frame {self.frame_id + 1} "
+                  f"({self.seg_consecutive} in a row, {self.seg_failures} total): {exc!r}; "
+                  f"diag {getattr(exc, 'diag', {})} nbody {self.model.nbody} ngeom {self.model.ngeom} "
+                  f"scene.ngeom {r.scene.ngeom}", file=sys.stderr, flush=True)
+            if self.seg_consecutive >= self.SEG_MAX_CONSECUTIVE:
+                raise RuntimeError(f"segmentation failed on {self.seg_consecutive} consecutive frames: {exc!r}") from exc
+            return None
+        self.seg_consecutive = 0
+        return self._cam.detections(ids, self.scene)
+
+    def run(self, parent_pid: int) -> None:
+        import mujoco
+
+        renderer, opt, encoders = self.renderer, self.opt, self.encoders
         period = 1.0 / self.fps
         next_t = time.perf_counter()
         while os.getppid() == parent_pid:
             t0 = time.perf_counter()
-            self.state.read(self.data)
-            captured = time.monotonic()
-            ts_ms = _now_ms()
-            mujoco.mj_forward(self.model, self.data)
-            seg_renderer.update_scene(self.data, camera="wrist", scene_option=opt)
-            dets = self._cam.detections(self._cam.segmentation_ids(seg_renderer.render()), self.scene)
-            self.frame_id += 1
-            self.perception.on_frame(self.frame_id, ts_ms, captured, dets)
-            for path, stream in self.streams.items():
-                if not stream.active:
-                    continue
-                renderer.update_scene(self.data, camera="wrist" if path == "/" else "scene", scene_option=opt)
-                au = encoders[path].encode(renderer.render(), keyframe=stream.take_idr_request())
-                if au:
-                    stream.publish(au, ts_ms, 5 in _nal_types(au))
-            self.render_ms = (self.render_ms + [(time.perf_counter() - t0) * 1000])[-100:]
-            self.state.arr[2], self.state.arr[3] = self.frame_id, float(np.mean(self.render_ms))
+            step = self.state.read(self.data)
+            if step is None or step == self.physics_step:  # no new physics: publish nothing
+                self.skipped += 1
+            else:
+                self.physics_step = step
+                captured = time.monotonic()
+                ts_ms = int(time.time() * 1000)
+                mujoco.mj_forward(self.model, self.data)
+                dets = self.detect()
+                self.frame_id += 1
+                if dets is not None:  # a failed segmentation: the video frame goes out, no result
+                    self.perception.on_frame(self.frame_id, ts_ms, captured, dets, self.data.time, step)
+                for path, stream in self.streams.items():
+                    if not stream.active:
+                        continue
+                    renderer.update_scene(self.data, camera="wrist" if path == "/" else "scene", scene_option=opt)
+                    au = encoders[path].encode(renderer.render(), keyframe=stream.take_idr_request())
+                    if au:
+                        stream.publish(au, ts_ms, 5 in _nal_types(au))
+                self.render_ms = (self.render_ms + [(time.perf_counter() - t0) * 1000])[-100:]
+                self.state.arr[2], self.state.arr[3] = self.frame_id, float(np.mean(self.render_ms))
             next_t += period
             now = time.perf_counter()
             if next_t > now:
@@ -576,14 +699,13 @@ class CameraRig:
                 "frame_ms_max": round(float(ms.max()), 2)}
 
 
-def camera_main(cfg: dict, shm_name: str, nq: int, nv: int, conn, ready_conn, parent_pid: int) -> None:
-    """Camera process entry: build the rig, start the servers, report readiness, render."""
-    state = SharedState(nq, nv, shm_name)
+def camera_main(cfg: dict, shm_name: str, lock, nq: int, nv: int, conn, ready_conn, parent_pid: int) -> None:
+    """Camera process entry: build the rig with its renderers and encoders, start the servers,
+    then report readiness and render."""
+    state = SharedState(nq, nv, shm_name, lock)
     try:
         rig = CameraRig(cfg, state, SimLink(conn))
-        import mujoco
-
-        mujoco.Renderer(rig.model, 8, 8).close()  # fails here when no GL backend works
+        rig.setup()  # renderers and encoders before readiness is reported
         serve_video(cfg["host"], cfg["video_port"], rig.streams)
         PerceptionServer(rig.perception, rig, cfg["host"], cfg["perception_port"])
     except Exception as exc:  # no GL backend, no libx264, port in use
