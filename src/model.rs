@@ -1148,6 +1148,13 @@ pub struct ObservationSchema {
     /// Profile speed cap on planned motion; null when the profile sets none.
     #[serde(default)]
     pub speed_cap: Option<SpeedCap>,
+    /// Profile home pose (rad, one value per joint); null in older schemas.
+    #[serde(default)]
+    pub home_positions: Option<Vec<f32>>,
+    /// Profile resting-pose policy (tolerances, stillness and support-torque limits); null
+    /// when the profile has none and in older schemas.
+    #[serde(default)]
+    pub resting_pose: Option<RestingPosePolicy>,
 }
 
 impl ObservationSchema {
@@ -1225,6 +1232,8 @@ impl ObservationSchema {
             servo_max_velocity: config.servo_limits().iter().map(|l| l.max_velocity).collect(),
             servo_max_lead_rad: Some(config.servo_max_lead_rad),
             speed_cap: config.speed_cap,
+            home_positions: Some(config.home_positions.clone()),
+            resting_pose: config.resting_pose.clone(),
         }
     }
 }

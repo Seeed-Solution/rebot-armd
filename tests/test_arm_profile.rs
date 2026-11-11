@@ -194,3 +194,13 @@ fn kit_profile_collision_section_from_sysid() {
     assert_eq!(armd::collision::CollisionPolicy { thresholds_nm: defaults.thresholds_nm, ..policy }, defaults);
     assert!(!policy.enabled);
 }
+
+#[test]
+fn schema_from_kit_profile_publishes_home_and_resting_pose() {
+    let config = ArmConfig::from_profile_file(PROFILE_PATH).unwrap();
+    let schema: serde_json::Value = serde_json::from_str(&serde_json::to_string(&armd::ObservationSchema::from_config(&config)).unwrap()).unwrap();
+    let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(PROFILE_PATH).unwrap()).unwrap();
+    assert_eq!(schema["home_positions"], file["home_positions"]);
+    assert_eq!(schema["resting_pose"], file["resting_pose"]);
+    assert!(!schema["resting_pose"].is_null());
+}
