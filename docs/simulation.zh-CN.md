@@ -6,7 +6,7 @@
 
 ## 运行
 
-需要 Rust 工具链和 [uv](https://docs.astral.sh/uv/)。仿真器是 `sim/mujoco` 下的 uv 项目（依赖 `mujoco`、`numpy`）。
+需要 Rust 工具链和 [uv](https://docs.astral.sh/uv/)。仿真器是 `sim/mujoco` 下的 uv 项目（依赖 `mujoco`、`numpy`、`websockets`，相机视频流另需 `av`（PyAV，含 libx264））。
 
 ```bash
 # 终端 1：仿真器（500 Hz 物理，UDP 47600）
@@ -32,6 +32,12 @@ cockpit 地址 `http://127.0.0.1:8765/`。`--follower-port` 默认 `udp://127.0.
 | `--benchmark N` | 不按实时节拍跑 N 步物理并计时后退出 |
 | `--damping D1,..,D6` | 用给定值（N·m·s/rad）替换场景中 J1..J6 的关节阻尼 |
 | `--frictionloss F1,..,F6` | 用给定值（N·m）替换场景中 J1..J6 的库仑摩擦 |
+| `--objects K1,..` | 场景物体，`cube`、`cup`、`block` 中 1..3 个（默认 `cube`）；见「相机、感知与场景」 |
+| `--seed N` | 物体摆放种子（默认：固定布局） |
+| `--camera` | 腕部相机：H.264 视频流在 `--video-port`（8001），感知接口和 `/sim/*` 在 `--perception-port`（8090），绑定 `--http-host`（127.0.0.1） |
+| `--fps N`、`--camera-size` | 相机帧率 1..30（默认 15）；视频尺寸 `1280x720`（默认）或 `640x360` |
+| `--profile P`、`--camera-rot-deg`、`--camera-tilt-deg`、`--camera-offset X,Y,Z` | 相机安装：取 profile 的 `camera_mount`（默认套件 profile），再按这些参数覆盖 |
+| `--scene-stream` | 另在 `ws://<host>:<video-port>/scene` 推送固定的全景相机 |
 | `--torque-report instant\|mean` | 状态报文中的力矩：瞬时值（默认），或最近一个指令周期内的平均值（滑动窗口；见「摩擦辨识」） |
 
 `REBOT_DEVARM_DIR=<reBot-DevArm 仓库路径>` 时，把上游连杆网格（`Rebot_Arm_description/DM/meshes/collision`）作为可视几何加入窗口显示；物理计算不使用它们。
@@ -42,8 +48,10 @@ cockpit 地址 `http://127.0.0.1:8765/`。`--follower-port` 默认 `udp://127.0.
 cargo test --lib sim_driver            # 驱动 + 假 UDP 对端
 cargo test --test test_sim_fk          # armd 正运动学 vs MuJoCo end_link 位姿
 cd sim/mujoco && uv run pytest -s      # 仿真器 + armd 端到端，FK fixture 是否最新，sysid 回收
-cd sim/mujoco && uv run pytest -s -m "not slow"   # 跳过约 3.5 分钟的 sysid 回收测试
+cd sim/mujoco && uv run pytest -s -m "not slow"   # 跳过约 3.5 分钟的 sysid 回收测试和抓取端到端测试
 ```
+
+`tests/test_camera.py` 检查视频流封装，并分别用 PyAV 和 rebot-companion 的 `snapshot` 解码器解码（需要 `REBOT_COMPANION_DIR` 或仓库旁的 checkout，否则跳过），检查检测框与物体投影中心、感知接口各路由和按种子复位。`tests/test_camera_grasp.py`（标记 `slow`）跑点框抓取端到端（见下）。
 
 端到端测试默认先 `cargo build`，设置 `ARMD_BIN` 时直接用该二进制。流程：上使能、回 home、张开夹爪、工具朝下 `move_to`、检查 J2 / J3 重力力矩、下降到 4 cm 方块、`grasp` 闭合（期望 `holding: true`）、抬起、杀掉仿真器，期望故障码 `BUS_LOSS`。
 
@@ -95,6 +103,55 @@ cd sim/mujoco && uv run pytest -s -m "not slow"   # 跳过约 3.5 分钟的 sysi
 `T` 为 `{"mode":"pos_vel","q":rad,"vlim":rad/s}` 或 `{"mode":"mit","q":rad,"dq":rad/s,"kp":N·m/rad,"kd":N·m·s/rad,"tau":N·m}`。`ack` 为最近应用的指令 `seq`；`session` 在每次启动仿真器时随机生成。
 
 armd 侧（`src/sim_driver.rs`）：后台线程把状态收进缓存，控制周期内的驱动调用不等待网络。版本不符、数组长度不符、含非有限值、或同一 session 内 `seq` 未递增的状态报文被丢弃。反馈超过 200 ms 时 `is_feedback_valid` 为 false、使能状态为 Unknown；连续 500 ms（`BUS_LOSS_TIMEOUT`）无新反馈时监督器锁存 `BUS_LOSS`，与硬件一致。上使能最多等待 80 ms 收到确认该指令的状态（失能 25 ms），与 Damiao 握手相同。
+
+## 相机、感知与场景
+
+`rebot-sim --camera` 加入腕部相机，对外接口与 reCamera 套件一致，驾驶舱、armd 检测代理和 rebot-companion 客户端无需改动：
+
+```bash
+cd sim/mujoco
+uv run rebot-sim --camera --objects cube,cup --seed 3 --stats 2
+ARMD_DETECTOR_URL=http://127.0.0.1:8090 cargo run --bin armd -- --follower sim \
+  --config kits/recamera-b601dm/profile/rebot-b601dm.json --log-dir off --blackbox-dir off
+```
+
+### 相机
+
+- **安装**：沿用 armd 约定（`kinematics::cam_mount`，OpenCV 相机坐标轴）：R_end_cam = [x0 y0 z0] · Rz(`rot_deg`) · Rx(`tilt_deg`)，z0 = end_link x（工具轴），y0 = q6 = π/2 时 J5 轴在 end_link 中的方向。数值取 profile 的 `camera_mount`（套件 profile：v5，`rot_deg` 0，`tilt_deg` 0），可用 `--camera-rot-deg` / `--camera-tilt-deg` 覆盖（armd 符号：负值使光轴朝夹爪倾斜）。镜头中心为 `camera_mount.offset_m`；套件 profile 中为 null（未测量），此时仿真器使用 v8 支架假定的镜头中心 end_link (−0.0731, 0.0005, 0.0660) m（reBot-DevArm `hardware/camera-mounts/recamera-mounts/v8/README.txt` 第 4 节）。
+- **光学**：针孔模型，方形像素，无畸变。VFOV 24.65°，HFOV 42.46°（OV5647 1080p 窗口 2.688 × 1.512 mm，f 3.46 mm；由 v8 README 推导，未用标定板测量）；640x360 下 fx = fy = 824 px。
+- **与 v8 分析对照**：v8 支架（`--camera-rot-deg 90 --camera-tilt-deg -38`）、home 位姿、加载上游网格（`REBOT_DEVARM_DIR`）：闭合夹爪尖位于 1280x720 的像素 (648.5, 477.5)，夹爪占画面 10.8 %，最高行 472；v8 README 为 (648, 477)、10.8 %、472 行。不加载网格时夹爪显示为碰撞方盒（比收窄的指尖厚：占 22.5 %，最高行 337）；加载网格时方盒移到 geom 组 3，相机不渲染该组。
+- **渲染**：MuJoCo `Renderer` 离屏渲染，运行在独立的相机进程中（由 `rebot-sim` 启动，同时运行视频流和 HTTP 服务）。`rebot_sim/__init__.py` 找到 libEGL 时设 `MUJOCO_GL=egl`，否则找到 libOSMesa 时设 `osmesa`；显式设置的 `MUJOCO_GL` 优先。物理循环每步把 qpos / qvel / 时间写入共享内存（seqlock）；相机进程每帧复制到自己的 MjData，并通过管道把 `/sim/reset`、`/sim/state` 交给物理循环处理（每 10 步即 20 ms 轮询一次）。仿真器进程退出后相机进程随之退出。
+- 相机画面中隐藏 tcp 标记点。
+
+### 视频流（`ws://<host>:8001/`）
+
+格式同 reCamera 调试流（rebot-companion `snapshot.py`、驾驶舱 `setupWS`）：每个 H.264 访问单元一条二进制 WebSocket 消息，Annex-B，每个 IDR 前带 SPS + PPS，末尾 8 字节小端 unix 毫秒采集时间。编码器：PyAV 调 libx264（`ultrafast`、`zerolatency`、无 B 帧、GOP = 帧率、CRF 23）。新客户端从强制 IDR 开始；落后 60 条消息的客户端丢弃积压，从下一个 IDR 重新开始。只在有客户端连接时编码。
+
+### 感知（`http://<host>:8090`）
+
+rebot-vision 感知接口版本 2（[detection_api.md](detection_api.md)）：`GET/POST /api/mode`、`GET/POST /api/inference`、`POST /api/trigger`、`GET /api/results/latest?after&wait_ms`、`POST /api/subscribe`、`POST /api/subscribe/{id}/keepalive`、`DELETE /api/subscribe/{id}`、`GET /api/subscriptions`。每个渲染帧都计算真值检测：对腕部相机做一次 640x360 分割渲染，每个场景物体取其可见像素（至少 20 个）的外接框，因此计入遮挡和画面边缘。`class_name` 为物体类别（`cube`、`cup`、`block`），`name` 为物体名，`confidence` 0.99，`format` 为 `xywh_center`，按 640x360 归一化。单次触发返回请求之后复制状态的第一帧。`aruco` 流水线会运行，但场景中没有标记。结果按订阅帧率（最高 min(15, `--fps`)）发布到 `latest`。
+
+### 场景与评估路由
+
+- `--objects`：`cube`（4 cm、30 g，即原场景方块）、`cup`（圆柱 ⌀ 5 cm × 7 cm、50 g）、`block`（6 × 3 × 4 cm、40 g）中 1..3 个；同类重复时命名为 `cube_2` 等。不带 `--seed` 时第一个物体位于 (0.30, 0) m，其余位于 (0.24, ±0.12) m。带种子时位置在 x 0.22..0.36 m、y −0.14..0.14 m 内抽取，偏航 ±90°，中心间距至少 9 cm（`numpy.random.default_rng(seed)`；同一种子得到同一布局）。
+- `POST /sim/reset {"seed": N|null}`：在下一个物理步按种子摆放物体（静止），不移动机械臂。返回状态。
+- `GET /sim/state`：时间、种子、关节位置、TCP（end_link 原点），以及每个物体的 `pos`、`quat`、`lifted_m`（高出静止高度的距离）、`contacts`（`jaws`：左 / 右夹指接触；`table`）和 `grasped`（两侧夹指接触且抬起超过 2 cm）。
+- `GET /sim/camera`：当前安装参数、视场角、640x360 下的 fx、`grip_pixel_norm_at`（工具竖直朝下时夹爪尖正下方桌面点在画面中的位置，按若干接近高度给出，即 armd `grasp.grip_pixel_norm` 应取的值）、渲染后端和每帧耗时。
+
+### 仿真中的点框抓取
+
+`tests/test_camera_grasp.py` 启动 `rebot-sim --camera` 和 `armd --follower sim`（`ARMD_DETECTOR_URL` 指向仿真器），回 home，工具朝下移到方块上方 0.20 m，经 armd 触发一次检测（`/api/v1/detection/trigger`），再以方块的框发送 `/api/v1/action/grasp`。armd 使用套件 profile 的副本，其中 `camera_mount.offset_m` 设为仿真器的镜头中心；请求用 `overrides` 覆盖 `grip_pixel_norm`（`/sim/camera` 中 0.15 m 接近高度的值）和 `fx_px` / `fy_px`（824）。之后抓取宏（`src/grasp.rs`）与真机流程相同：接近、在新触发的帧上对中、J6 对齐、下降、闭合、抬起。通过条件：动作 `done` 且 `holding: true`，`/sim/state` 中方块 `grasped`，抬起超过 5 cm，与 TCP 水平距离小于 3 cm。
+
+结果（spark-6124，2026-11-11，`pytest -s tests/test_camera_grasp.py`，135 s 内 2 项通过）：
+
+| 场景 | 观察位姿处的检测（640x360 归一化） | 对中修正次数 | 最终误差 | 抓取耗时 | 抬起后的方块 |
+|---|---|---|---|---|---|
+| 默认方块 (0.30, 0) | x 0.154, y 0.504, w 0.258, h 0.392 | 0 | 5.2 px | 29.4 s | `grasped`，抬起 0.105 m，两侧夹指接触 |
+| `--objects cube,cup --seed 3`，方块 (0.232, −0.074)，偏航 64° | x 0.159, y 0.504, w 0.319, h 0.547（被画面边缘截断） | 2 | 9.3 px | 37.3 s | `grasped`，抬起 0.105 m，杯子未被碰到 |
+
+默认场景中 armd 的相机模型与仿真器完全一致（安装、镜头中心、fx 相同），接近后即已对中。armd 本身不计算抓取像素和镜头中心；真机上它们来自抓取设置和 profile。
+
+v8 支架（倾斜 −38°）：工具竖直朝下时，夹爪尖正下方桌面点在画面中的归一化 v 值为：距指尖 0 m 时 0.66，0.05 m 时 0.10，约 0.06 m 以外超出画面上沿（v < 0）（0.15 m 处 `grip_pixel_norm` 的 v = −0.40）。抓取宏的对中要求该点在接近高度处位于画面内（`grip_pixel_norm` ∈ [0, 1]，`approach_height_m` ≥ `grasp_height_m` + 0.02），因此 v8 安装不适用于当前的俯视抓取宏。此结论由安装几何计算得出，未在真机上验证。
 
 ## 摩擦辨识（`rebot-sysid`）
 
@@ -166,13 +223,19 @@ armd 以 50 Hz 运行：每个周期先读电机反馈，再发送下一个位�
 | 以 2.0 rad/s 张开夹爪（应答到完成） | 3.56 s（此前 3.52 s） |
 | 闭合夹取方块（`grasp: true`，应答到完成） | 3.66 s，`holding: true`，间隙 2.66 rad，τ7 1.00 N·m（此前 4.02 s、间隙 2.64 rad、τ7 1.01 N·m） |
 | 杀掉仿真器到 `BUS_LOSS` 的时间 | 0.51 s |
+| 相机进程，无视频客户端（状态复制、forward、640x360 分割渲染、检测；`--stats`） | 每帧 3.2 ms；物理 500.0 Hz |
+| 相机 + 视频客户端，1280x720 @ 15 / 30 fps | 每帧 7.6 / 6.5 ms；收到 15.2 / 30.2 条消息/s，解码 90/91、180/181（rebot-companion `_PyAvDecoder`）；采集 → 接收中位数 8 / 9 ms；0.22 / 0.20 Mbit/s；物理 500.0 Hz |
+| 相机 + 视频客户端，640x360 @ 30 fps | 每帧 4.5 ms；30.2 条消息/s；中位数 7 ms；0.09 Mbit/s |
+| 渲染后端 | GB10 上的 EGL（`GL_RENDERER` "NVIDIA GB10/PCIe"，OpenGL 4.6.0 NVIDIA 580.159.03）；默认自由视角 1280x720 渲染 + 读回 1463 / 1622 帧/s（2 次）。OSMesa：本机未安装（找不到 libOSMesa；`MUJOCO_GL=osmesa` 在 PyOpenGL 中报错），未测 |
+| 高负载主机（负载均值约 100，其他任务），相机在独立进程 | 物理 499–500 Hz。测量时分割步骤每帧仍有 68 ms 的 Python 计算（之后已修复）：相机作为仿真器进程内线程、负载 100–300 时，物理为 220–275 Hz。修复后未在高负载下复测 |
 
 ## 未仿真 / 限制
 
 - 电机动力学为简化模型：无电流环、无转矩-转速曲线、无齿槽转矩、无 CAN 延迟或丢帧模型；POS_VEL 积分环用偏置力矩前馈代替。力矩上限、空载转速和转子惯量取自数据手册；环路增益、关节阻尼（0.8 N·m·s/rad）和摩擦（0.05 N·m）在机械臂上辨识（`rebot-sysid`）之前为假设值。
 - 接触参数与摩擦系数（夹指 1.5、方块 1.2）为估计值；碰撞体为方盒而非网格；连杆之间不碰撞。
 - J7 力矩量级：夹持与堵转阈值（`gripper_policy.holding_torque_nm`、0.444 N·m 堵转锁存）由假设的速度环增益满足（KV 0.5 × vlim 2.0 = 1.0 N·m 夹紧力矩，低于 7 N·m 峰值），并非实测夹爪模型。
-- 暂无相机图像：视觉、`grasp`（点框抓取）和检测需要真实相机或另外的图像源。
+- 相机：无畸变针孔模型，无曝光 / 噪声 / 运动模糊，MuJoCo 平光照，机械臂为方盒几何（只有设置 `REBOT_DEVARM_DIR` 时连杆和夹指才用上游网格）。镜头中心和视场角为推导值，非实测。检测为真值（框精确、置信度 0.99、无漏检），不检验基于真实图像训练的检测器。未模拟真实相机的 VI 镜像设置。
+- 主机负载高时相机帧率低于 `--fps`（实测见下）；物理循环不受相机影响。
 - 不模拟电机故障（过温、欠压），温度恒定。不模拟 Damiao 寄存器访问（映射范围检查、CTRL_MODE 写入）：`driver_range_check` 为 null，MIT 切换在本地确认。
 - 默认 `speed` 1.0 rad/s 时，夹爪从闭合到张开在约 5.9 s 后到达 −5.699 rad，来不及在 6 s 默认 `timeout_s` 内满足 200 ms 静止，夹爪动作以 `GRIPPER_TIMEOUT` 结束；测试中以 2.0 rad/s 张开。真实夹爪是否相同未核实。
 - 仿真器只在主机上运行，未打包到 reCamera。

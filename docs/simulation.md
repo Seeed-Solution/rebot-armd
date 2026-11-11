@@ -6,7 +6,7 @@ English | [中文](simulation.zh-CN.md)
 
 ## Run
 
-Requirements: Rust toolchain, [uv](https://docs.astral.sh/uv/). The simulator is a uv project in `sim/mujoco` (dependencies `mujoco`, `numpy`).
+Requirements: Rust toolchain, [uv](https://docs.astral.sh/uv/). The simulator is a uv project in `sim/mujoco` (dependencies `mujoco`, `numpy`, `websockets`, and `av` (PyAV with libx264) for the camera stream).
 
 ```bash
 # terminal 1: simulator (500 Hz physics, UDP 47600)
@@ -32,6 +32,12 @@ Open the cockpit at `http://127.0.0.1:8765/`. `--follower-port` defaults to `udp
 | `--benchmark N` | time N physics steps without real-time pacing and exit |
 | `--damping D1,..,D6` | J1..J6 joint damping in N·m·s/rad instead of the scene values |
 | `--frictionloss F1,..,F6` | J1..J6 Coulomb friction in N·m instead of the scene values |
+| `--objects K1,..` | scene objects, 1..3 of `cube`, `cup`, `block` (default `cube`); see [Camera, perception and scene](#camera-perception-and-scene) |
+| `--seed N` | object placement seed (default: the fixed layout) |
+| `--camera` | wrist camera: H.264 stream on `--video-port` (8001), perception API and `/sim/*` on `--perception-port` (8090), bound to `--http-host` (127.0.0.1) |
+| `--fps N`, `--camera-size` | camera rate, 1..30 (default 15); stream size `1280x720` (default) or `640x360` |
+| `--profile P`, `--camera-rot-deg`, `--camera-tilt-deg`, `--camera-offset X,Y,Z` | camera mount: `camera_mount` of the profile (default: the kit profile), then these overrides |
+| `--scene-stream` | also stream the fixed overview camera at `ws://<host>:<video-port>/scene` |
 | `--torque-report instant\|mean` | torque in state datagrams: instantaneous (default) or the mean over the last command period (sliding window; see Friction identification) |
 
 `REBOT_DEVARM_DIR=<reBot-DevArm checkout>` adds the upstream link meshes (`Rebot_Arm_description/DM/meshes/collision`) as visuals for the viewer. Physics never uses them.
@@ -42,8 +48,10 @@ Open the cockpit at `http://127.0.0.1:8765/`. `--follower-port` defaults to `udp
 cargo test --lib sim_driver            # driver against a fake UDP peer
 cargo test --test test_sim_fk          # armd FK vs MuJoCo end_link poses
 cd sim/mujoco && uv run pytest -s      # simulator + armd end to end, FK fixture current, sysid recovery
-cd sim/mujoco && uv run pytest -s -m "not slow"   # without the 3.5 min sysid recovery test
+cd sim/mujoco && uv run pytest -s -m "not slow"   # without the 3.5 min sysid recovery test and the grasp e2e
 ```
+
+`tests/test_camera.py` checks the stream framing and decodes it with PyAV and with rebot-companion's `snapshot` decoder (a checkout in `REBOT_COMPANION_DIR` or next to the repository; skipped otherwise), detection boxes against the objects' projected centres, the perception API routes and seeded resets. `tests/test_camera_grasp.py` (marker `slow`) runs the tap-to-grasp end to end (below).
 
 The end-to-end test builds armd (`cargo build`) unless `ARMD_BIN` names a binary. It enables the arm, homes it, opens the gripper, runs `move_to` with the tool pointing down, checks J2 / J3 gravity torques, descends onto the 4 cm cube, closes with `grasp` (expects `holding: true`), lifts, kills the simulator and expects fault code `BUS_LOSS`.
 
@@ -95,6 +103,55 @@ One JSON object per datagram.
 `T` is `{"mode":"pos_vel","q":rad,"vlim":rad/s}` or `{"mode":"mit","q":rad,"dq":rad/s,"kp":N·m/rad,"kd":N·m·s/rad,"tau":N·m}`. `ack` is the `seq` of the last applied command; `session` is random per simulator start.
 
 armd side (`src/sim_driver.rs`): a background thread receives state into a cache; driver calls inside the control tick do not wait on the network. State with a wrong version, wrong array length, non-finite values or a `seq` not above the last one of the same session is dropped. Feedback older than 200 ms makes `is_feedback_valid` false and the enable state Unknown; the supervisor latches `BUS_LOSS` after 500 ms without fresh feedback (`BUS_LOSS_TIMEOUT`), as on hardware. Enable waits up to 80 ms for a state that acknowledges the enable command (disable: 25 ms), like the Damiao handshake.
+
+## Camera, perception and scene
+
+`rebot-sim --camera` adds the wrist camera, served like the reCamera kit so the cockpit, armd's detection proxy and rebot-companion clients work unchanged:
+
+```bash
+cd sim/mujoco
+uv run rebot-sim --camera --objects cube,cup --seed 3 --stats 2
+ARMD_DETECTOR_URL=http://127.0.0.1:8090 cargo run --bin armd -- --follower sim \
+  --config kits/recamera-b601dm/profile/rebot-b601dm.json --log-dir off --blackbox-dir off
+```
+
+### Camera
+
+- **Mount**: armd's convention (`kinematics::cam_mount`, OpenCV camera axes): R_end_cam = [x0 y0 z0] · Rz(`rot_deg`) · Rx(`tilt_deg`), z0 = end_link x (tool axis), y0 = J5 axis in end_link at q6 = π/2. Values from the profile's `camera_mount` (kit profile: v5, `rot_deg` 0, `tilt_deg` 0), overridden by `--camera-rot-deg` / `--camera-tilt-deg` (armd sign: negative tilts the optical axis toward the jaws). The lens centre is `camera_mount.offset_m`; the kit profile leaves it null (not measured), and the simulator then uses the v8 holder's assumed lens centre (−0.0731, 0.0005, 0.0660) m in end_link (reBot-DevArm `hardware/camera-mounts/recamera-mounts/v8/README.txt`, section 4).
+- **Optics**: pinhole, square pixels, no distortion. VFOV 24.65°, HFOV 42.46° (OV5647 1080p window 2.688 × 1.512 mm behind f 3.46 mm; derived in the v8 README, not measured on a calibration target); fx = fy = 824 px at 640x360.
+- **Check against the v8 analysis**: v8 holder (`--camera-rot-deg 90 --camera-tilt-deg -38`) at home with the upstream meshes (`REBOT_DEVARM_DIR`): closed jaw tip at pixel (648.5, 477.5) of 1280x720, gripper 10.8 % of the image, highest gripper row 472; the v8 README gives (648, 477), 10.8 %, row 472. Without the meshes the jaws render as the collision boxes (thicker than the tapered fingers: 22.5 % of the image, top row 337); with the meshes the boxes move to geom group 3, which the camera hides.
+- **Rendering**: offscreen, MuJoCo `Renderer`, in a camera process of its own (spawned by `rebot-sim`; it also runs the stream and HTTP servers). `rebot_sim/__init__.py` sets `MUJOCO_GL=egl` when libEGL is found, else `osmesa` when libOSMesa is found; an explicit `MUJOCO_GL` wins. The physics loop publishes qpos / qvel / time in shared memory after every step (seqlock); the camera process copies them into its own MjData per frame and sends `/sim/reset` and `/sim/state` to the physics loop over a pipe, which the loop polls every 10 steps (20 ms). The camera process exits when the simulator process is gone.
+- The tcp site is hidden in the camera image.
+
+### Stream (`ws://<host>:8001/`)
+
+The format of the reCamera debug stream (rebot-companion `snapshot.py`, the cockpit's `setupWS`): one binary WebSocket message per H.264 access unit, Annex-B, SPS + PPS before every IDR, followed by the capture time as 8-byte little-endian unix ms. Encoder: libx264 through PyAV (`ultrafast`, `zerolatency`, no B-frames, GOP = fps, CRF 23). A new client starts at a forced IDR; a client that falls 60 messages behind is dropped back to the next IDR. Frames are encoded only while a client is connected.
+
+### Perception (`http://<host>:8090`)
+
+rebot-vision perception API version 2 ([detection_api.md](detection_api.md)): `GET/POST /api/mode`, `GET/POST /api/inference`, `POST /api/trigger`, `GET /api/results/latest?after&wait_ms`, `POST /api/subscribe`, `POST /api/subscribe/{id}/keepalive`, `DELETE /api/subscribe/{id}`, `GET /api/subscriptions`. Every rendered frame gets ground-truth detections: a 640x360 segmentation render of the wrist camera, and per scene object the bounds of its visible pixels (at least 20), so occlusion and the image edge are accounted for. `class_name` is the object kind (`cube`, `cup`, `block`), `name` the object name, `confidence` 0.99, `format` `xywh_center` normalised to 640x360. A trigger answers with the first frame whose state was copied after the request. The `aruco` pipeline runs but finds nothing (no markers in the scene). Results are published to `latest` at the subscription rate (at most min(15, `--fps`)).
+
+### Scene and evaluation routes
+
+- `--objects`: 1..3 of `cube` (4 cm, 30 g, the former scene cube), `cup` (cylinder ⌀ 5 cm × 7 cm, 50 g), `block` (6 × 3 × 4 cm, 40 g); repeated kinds are named `cube_2`, …. Without `--seed` the first object stands at (0.30, 0) m, the others at (0.24, ±0.12) m. With a seed, positions are drawn in x 0.22..0.36 m, y −0.14..0.14 m with yaw ±90° and at least 9 cm between centres (`numpy.random.default_rng(seed)`; the same seed gives the same layout).
+- `POST /sim/reset {"seed": N|null}`: places the objects for the seed at the next physics step, at rest; the arm is not moved. Returns the state.
+- `GET /sim/state`: time, seed, joint positions, TCP (end_link origin), and per object `pos`, `quat`, `lifted_m` (height above its resting height), `contacts` (`jaws`: left / right jaw touching, `table`) and `grasped` (both jaws and lifted more than 2 cm).
+- `GET /sim/camera`: the mount in use, FOV, fx at 640x360, `grip_pixel_norm_at` (where the table point under the jaw tips appears, looking straight down, for several approach heights: the value for armd's `grasp.grip_pixel_norm`), render backend and frame timing.
+
+### Tap-to-grasp in the simulator
+
+`tests/test_camera_grasp.py` starts `rebot-sim --camera` and `armd --follower sim` with `ARMD_DETECTOR_URL` pointing at the simulator, homes, moves the tool down above the cube at 0.20 m, triggers one detection through armd (`/api/v1/detection/trigger`), and sends `/api/v1/action/grasp` with the cube's box. armd gets a copy of the kit profile with `camera_mount.offset_m` set to the simulator's lens centre; the request overrides `grip_pixel_norm` (from `/sim/camera` at the 0.15 m approach height) and `fx_px` / `fy_px` (824). The grasp macro (`src/grasp.rs`) then runs as on the arm: approach, centring on fresh triggered frames, J6 alignment, descend, close, lift. Pass: action `done` with `holding: true`, the cube `grasped` in `/sim/state`, lifted more than 5 cm, within 3 cm of the TCP.
+
+Result (spark-6124, 2026-11-11, `pytest -s tests/test_camera_grasp.py`, 2 passed in 135 s):
+
+| case | detection at the view pose (640x360, normalised) | centring corrections | final error | grasp duration | cube after the lift |
+|---|---|---|---|---|---|
+| default cube at (0.30, 0) | x 0.154, y 0.504, w 0.258, h 0.392 | 0 | 5.2 px | 29.4 s | `grasped`, lifted 0.105 m, both jaws in contact |
+| `--objects cube,cup --seed 3`, cube at (0.232, −0.074), yaw 64° | x 0.159, y 0.504, w 0.319, h 0.547 (cut by the image edge) | 2 | 9.3 px | 37.3 s | `grasped`, lifted 0.105 m, cup untouched |
+
+In the default case armd's camera model matches the simulator exactly (same mount, lens centre and fx), so the approach lands centred. armd itself does not compute the grip pixel or the lens centre; on the arm they come from the grasp setup and the profile.
+
+v8 holder (tilt −38°): with the tool pointing straight down, the table point under the jaw tips appears at image v = 0.66 (normalised) at 0 m below the tips, 0.10 at 0.05 m and leaves the top of the image (v < 0) beyond about 0.06 m (`grip_pixel_norm` at 0.15 m: v = −0.40). The grasp macro's centring needs that point in the image at the approach height (`grip_pixel_norm` in [0, 1], `approach_height_m` ≥ `grasp_height_m` + 0.02), so the v8 mount does not fit the current look-down macro. Computed from the mount geometry; not tried on the arm.
 
 ## Friction identification (`rebot-sysid`)
 
@@ -166,13 +223,19 @@ Host spark-6124 (aarch64, Cortex-X925, 20 cores), MuJoCo 4.0.0, Python 3.13:
 | gripper open at 2.0 rad/s (ack to done) | 3.56 s (before: 3.52 s) |
 | close on the cube (`grasp: true`, ack to done) | 3.66 s, `holding: true`, gap 2.66 rad, τ7 1.00 N·m (before: 4.02 s, gap 2.64 rad, τ7 1.01 N·m) |
 | time from simulator kill to `BUS_LOSS` | 0.51 s |
+| camera process, no stream client (state copy, forward, 640x360 segmentation, detections; `--stats`) | 3.2 ms per frame; physics 500.0 Hz |
+| camera + stream client, 1280x720 @ 15 / 30 fps | 7.6 / 6.5 ms per frame; 15.2 / 30.2 messages/s received, 90/91 and 180/181 decoded (rebot-companion `_PyAvDecoder`); capture → receipt median 8 / 9 ms; 0.22 / 0.20 Mbit/s; physics 500.0 Hz |
+| camera + stream client, 640x360 @ 30 fps | 4.5 ms per frame; 30.2 messages/s; median 7 ms; 0.09 Mbit/s |
+| render backend | EGL on the GB10 (`GL_RENDERER` "NVIDIA GB10/PCIe", OpenGL 4.6.0 NVIDIA 580.159.03); 1280x720 render + readback of the default free camera 1463 / 1622 frames/s (2 runs). OSMesa: not installed on this host (libOSMesa not found; `MUJOCO_GL=osmesa` fails in PyOpenGL), not measured |
+| loaded host (load average about 100, other jobs), camera in its own process | physics 499–500 Hz. Measured while the segmentation step still took 68 ms of Python per frame (fixed since): with the camera as a thread in the simulator process at load 100–300, physics ran at 220–275 Hz. Not re-measured under load after the fix |
 
 ## Not simulated / limitations
 
 - Motor dynamics are simplified: no current loop, no torque-speed curve, no cogging, no CAN latency or frame loss model; the POS_VEL integrator is replaced by bias-torque feed-forward. Torque limits, no-load speed and rotor inertia are datasheet values; loop gains, joint damping (0.8 N·m·s/rad) and friction loss (0.05 N·m) are assumptions until identified on the arm (`rebot-sysid`).
 - Contact parameters and friction (jaws 1.5, cube 1.2) are guessed; collision shapes are boxes, not meshes. The links do not collide with each other.
 - J7 torque scale: holding and stall thresholds (`gripper_policy.holding_torque_nm`, the 0.444 N·m stall latch) are met through the assumed velocity-loop gain (KV 0.5 × vlim 2.0 = 1.0 N·m squeeze, below the 7 N·m peak), not by a measured gripper model.
-- No camera image yet: vision, `grasp` (point-and-grasp) and detection need the real camera or a separate image source.
+- Camera: pinhole without distortion, no exposure / noise / motion blur, flat MuJoCo lighting and box-primitive arm geometry (upstream meshes only with `REBOT_DEVARM_DIR`, and only for links and fingers). The lens centre and the FOV are derived values, not measurements. Detections are ground truth (perfect boxes, score 0.99, no misses); a detector trained on real images is not exercised. The VI mirror setting of the real camera is not modelled.
+- On a loaded host the camera frame rate drops below `--fps` (measured below); the physics loop is not slowed by the camera.
 - No motor faults (over-temperature, under-voltage); temperature is constant. Damiao register access (mapping-range check, CTRL_MODE writes) is not simulated: `driver_range_check` is null and MIT switching is confirmed locally.
 - With the default `speed` 1.0 rad/s the jaw reached −5.699 rad from closed after about 5.9 s, too late for the 200 ms settle within the 6 s default `timeout_s`: the gripper action ended `GRIPPER_TIMEOUT`. The test opens at 2.0 rad/s. Not verified on the real gripper.
 - The simulator runs on the host only; it is not packaged for the reCamera.
