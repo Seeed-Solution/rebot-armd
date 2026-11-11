@@ -205,12 +205,6 @@ pub fn load_setup(path: &Path, base: &GraspSetup) -> (GraspSetup, LoadOutcome) {
     }
 }
 
-/// Write the setup atomically (temp file + rename), creating the directory.
-pub fn save_setup(path: &Path, setup: &GraspSetup) -> std::io::Result<()> {
-    let text = serde_json::to_string_pretty(setup).map_err(std::io::Error::other)?;
-    crate::persist::write_atomic(path, &text)
-}
-
 /// Load the persisted setup into the supervisor at startup (logs the outcome).
 pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
     let mut inner = supervisor.inner().write().await;
