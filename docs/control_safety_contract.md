@@ -65,7 +65,7 @@ When enable confirmation is unavailable or remains `Unknown`, automatic disable,
 - 跟踪误差故障信息包含关节号与指令/实测值；观测数据包含 `commanded_positions`。
 - `observation.fault` 为 null，或在 Fault / EStop 时为 `{code, message, recoverable}`，故障码由各触发点记录（跟踪误差为 `FOLLOWING_ERROR`，控制周期超过 250 ms 为 `CONTROL_DEADLINE`，输出写入失败或卸力未确认为 `DRIVER_WRITE_FAILED`，碰撞保护升级为 `COLLISION` 等，完整列表见上文英文部分）。`recoverable`（`WATCHDOG_TIMEOUT`、`CONTROL_DEADLINE`、`HANDOVER_UNSETTLED` 为 true）仅为提示，清除故障仍需 `clear_fault`。
 - `observation.residual_torques`（J1..J6 实测力矩减实测位姿下的重力模型力矩）在 profile 有重力模型且驱动报告力矩时发布；重力模型每个周期都计算，与是否输出重力补偿无关。残差本身不触发故障；碰撞保护（见下文，默认关闭）使用它。
-- 笛卡尔工作空间（需 `workspace` 与 `kinematics`，仅 7 轴）：end_link 原点、夹爪包络 8 个角点及可选相机点须高于 `floor_z_m`、位于包围盒内且距肩轴不超过 `max_reach_m`。servo 目标或 jog / home / 预设轨迹的 21 个采样点越界且比起点更差时返回 `422 WORKSPACE_VIOLATION`；从越界位姿向外移动允许。收纳不受限，只记日志。禁入盒（`workspace.keepout_boxes`，或 `/api/v1/workspace/keepout` 设置的运行时列表，最多 16 个）属于同一规则：检查点进入盒内的深度计为越界，报告为 `keepout '<name>'`。schema 公开 `workspace`（含当前生效的禁入盒）与 `camera_mount`。未配置这些字段的 `--config` profile 不做检查，启动时告警。
+- 笛卡尔工作空间（需 `workspace` 与 `kinematics`，仅 7 轴）：end_link 原点、夹爪包络 8 个角点及可选相机点须高于 `floor_z_m`、位于包围盒内且距肩轴不超过 `max_reach_m`。servo 目标或 jog / home / 预设轨迹的 21 个采样点越界且比起点更差时返回 `422 WORKSPACE_VIOLATION`；从越界位姿向外移动允许。收纳不受地面、包围盒与距离限制（只记日志），但受禁入盒限制：路径进入禁入盒的收纳不会开始；显式收纳返回 `WORKSPACE_VIOLATION`，看门狗收纳保持位置并锁存 `WATCHDOG_TIMEOUT`。禁入盒（`workspace.keepout_boxes`，或 `/api/v1/workspace/keepout` 设置的运行时列表，最多 16 个）属于同一规则：检查点进入盒内的深度计为越界，报告为 `keepout '<name>'`。schema 公开 `workspace`（含当前生效的禁入盒）与 `camera_mount`。未配置这些字段的 `--config` profile 不做检查，启动时告警。
 - 动作接口见 `docs/agent_action_api.md`。动作运行时 servo 帧返回 `409 MOTION_BUSY`；动作路径在滞后超过 0.38 rad 时降速，0.45 rad 持续 1 s 结束为 `TRACKING_STALL`。
 
 ## Servo streaming guard / 流式控制保护
