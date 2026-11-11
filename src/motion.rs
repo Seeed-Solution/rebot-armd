@@ -554,7 +554,6 @@ pub struct GripperMotion {
     pub elapsed: f64,
     still_for: f64,
     moved: bool,
-    first: bool,
     phase: GripPhase,
 }
 
@@ -566,7 +565,7 @@ impl GripperMotion {
             GripperCommand::Move => policy.closed_rad + request.fraction.unwrap_or(0.0) as f32 * (policy.open_rad - policy.closed_rad),
         }.clamp(limit.min_position, limit.max_position);
         let limit = JointLimit { max_velocity: request.speed as f32, ..limit };
-        Self { request, policy, limit, target, start, elapsed: 0.0, still_for: 0.0, moved: false, first: true, phase: GripPhase::Moving }
+        Self { request, policy, limit, target, start, elapsed: 0.0, still_for: 0.0, moved: false, phase: GripPhase::Moving }
     }
 
     /// Expected duration (s) for the travel at the requested speed, plus settle.
@@ -583,13 +582,11 @@ impl GripperMotion {
         let (q7, v7c) = (ctx.commanded[6], ctx.commanded_velocities[6]);
         let (m7, mv7) = (ctx.measured[6], ctx.measured_velocities.get(6).copied().unwrap_or(0.0));
         let tau7 = ctx.torques.get(6).copied().unwrap_or(0.0);
-        // direction reversal releases a latched stall (same rule as servo / jog)
-        let clear = self.first && ctx.gripper_stalled && {
-            let delta = self.target - q7;
-            delta * tau7 < -1e-4 || delta * ctx.gripper_stall_sign < -1e-4
-        };
+        // A latch set while J7 pushed the other way (e.g. the squeeze of a grasp, or the push that
+        // lasts while the command unwinds from the squeeze hold) does not block travel away from
+        // it: release it on every tick, not only the first. Only a stall in the travel direction holds.
+        let clear = ctx.gripper_stalled && (self.target - q7) * ctx.gripper_stall_sign < -1e-4;
         let stalled = ctx.gripper_stalled && !clear;
-        self.first = false;
         let progress_of = |q: f32| -> f32 {
             let span = (self.target - self.start).abs();
             if span < 1e-6 { 1.0 } else { (1.0 - (self.target - q).abs() / span).clamp(0.0, 1.0) }
