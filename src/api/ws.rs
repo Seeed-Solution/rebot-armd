@@ -22,6 +22,15 @@ pub fn connection_registry() -> ConnectionRegistry {
 
 static NEXT_CONNECTION: AtomicU64 = AtomicU64::new(1);
 
+/// Test hook: pause (ms) between stamping a delayed command ack with the current epoch and
+/// enqueueing it. 0 (no pause) outside tests.
+pub static TEST_ACK_STAMP_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+async fn test_ack_stamp_delay() {
+    let ms = TEST_ACK_STAMP_DELAY_MS.load(Ordering::Relaxed);
+    if ms > 0 { tokio::time::sleep(std::time::Duration::from_millis(ms)).await; }
+}
+
 /// `?obs_hz=N`: send at most N observations per second on this connection (clamped to
 /// 1..control_frequency_hz). Absent: every tick. Control replies are never decimated.
 pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSupervisor>>,
@@ -302,7 +311,29 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         let mut client_label: Option<String> = None;
         let mut last_sequence: Option<u64> = None;
         let mut last_request: Option<u64> = None;
-        while let Some(Ok(message)) = receiver.next().await {
+        // Delayed acks (sent after a state-file write) come back here and are stamped with
+        // the current epoch and enqueued by this loop, in order with its other replies
+        // (epoch_sync, rejects): the epochs a client receives never go back.
+        let (ack_tx, mut ack_rx) = mpsc::channel::<Value>(64);
+        loop {
+            let message = tokio::select! {
+                biased;
+                Some(mut reply) = ack_rx.recv() => {
+                    {
+                        let inner = recv_supervisor.inner().read().await;
+                        reply["epoch_id"] = json!(inner.safety.epoch_id());
+                        reply["safety_state"] = json!(inner.safety.state());
+                        reply["is_torqued"] = json!(inner.is_torqued);
+                    }
+                    test_ack_stamp_delay().await;
+                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                    continue;
+                }
+                message = receiver.next() => match message {
+                    Some(Ok(message)) => message,
+                    _ => break,
+                },
+            };
             let Message::Text(text) = message else {
                 if matches!(message, Message::Close(_)) { break; }
                 continue;
@@ -548,8 +579,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 // for the disk: the ack (with `persisted`) is sent when the write finished.
                 if let Some(write) = pending_write.take() {
                     let reply = response.take();
-                    let tx = out_tx.clone();
-                    let sup = recv_supervisor.clone();
+                    let tx = ack_tx.clone();
                     tokio::spawn(async move {
                         let result = write.run().await;
                         let Some(mut reply) = reply else { return; };
@@ -557,15 +587,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             Ok(()) => reply["persisted"] = json!(true),
                             Err(e) => { tracing::warn!("State file not saved: {e}"); reply["persisted"] = json!(false); reply["persist_error"] = json!(e); }
                         }
-                        // the ack can follow later replies: it carries the state at send time,
-                        // so a client never rolls its epoch back to the one of the command
-                        {
-                            let inner = sup.inner().read().await;
-                            reply["epoch_id"] = json!(inner.safety.epoch_id());
-                            reply["safety_state"] = json!(inner.safety.state());
-                            reply["is_torqued"] = json!(inner.is_torqued);
-                        }
-                        let _ = tx.send(Message::Text(reply.to_string().into())).await;
+                        // the ack can follow later replies: the receive loop stamps it with the
+                        // state at send time, so a client never rolls its epoch back
+                        let _ = tx.send(reply).await;
                     });
                 }
                 if let Some((evicted_conn, evicted_gen)) = evicted_notify {

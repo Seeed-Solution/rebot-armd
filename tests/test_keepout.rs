@@ -369,11 +369,15 @@ fn servo_step_check_catches_a_box_between_its_samples() {
     inner.servo_step_keepout(&away).expect("a step away from the box is clear");
 }
 
+/// The two tests below set process-wide timing hooks: run them one at a time.
+static ACK_TIMING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The keep-out ack is sent after the file write and can follow later replies (here the
 /// E-stop's epoch_sync): it carries the epoch current when it is sent, never an older one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delayed_persist_ack_carries_the_epoch_at_send_time() {
     use futures_util::StreamExt;
+    let _serial = ACK_TIMING.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let supervisor = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
     armd::keepout::load_into(&supervisor, &dir.path().join("keepout.json")).await;
@@ -440,5 +444,38 @@ fn keepout_sweep_bounds_cover_the_motion() {
                 assert!(dist <= reach[j] + 1e-9, "joint {j}: {dist} > {}", reach[j]);
             }
         }
+    }
+}
+
+/// A delayed ack is stamped and enqueued in the same order as the connection's other
+/// replies: an E-stop arriving while the ack is between stamp and enqueue (test pause) must
+/// not get its epoch_sync out before an ack carrying the older epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_ack_never_follows_a_newer_epoch_sync_with_an_older_epoch() {
+    use futures_util::StreamExt;
+    let _serial = ACK_TIMING.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let supervisor = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    armd::keepout::load_into(&supervisor, &dir.path().join("keepout.json")).await;
+    let (mut ws, generation, epoch, _sup, _) = common::torqued_rig(supervisor, &INSPECT).await;
+    armd::api::ws::TEST_ACK_STAMP_DELAY_MS.store(400, std::sync::atomic::Ordering::Relaxed);
+    common::send(&mut ws, json!({"type":"command", "request_id": 778, "generation": generation, "epoch_id": epoch,
+        "path": "/api/v1/workspace/keepout", "body": {"boxes": [cube("u", [0.3, 0.3, 0.3])]}})).await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await; // ack stamped, not yet enqueued
+    common::send(&mut ws, json!({"type":"estop"})).await;
+    let (mut ack, mut synced) = (None, None::<u64>);
+    while ack.is_none() || synced.is_none() {
+        let text = tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap().into_text().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        match v["type"].as_str() {
+            Some("command_ack") if v["request_id"] == 778 => ack = Some((v["epoch_id"].as_u64().unwrap(), synced)),
+            Some("epoch_sync") => synced = Some(v["epoch_id"].as_u64().unwrap()),
+            _ => {}
+        }
+    }
+    armd::api::ws::TEST_ACK_STAMP_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let (ack_epoch, sync_before) = ack.unwrap();
+    if let Some(sync_epoch) = sync_before {
+        assert!(ack_epoch >= sync_epoch, "ack epoch {ack_epoch} after epoch_sync {sync_epoch}");
     }
 }
