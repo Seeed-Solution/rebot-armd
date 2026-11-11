@@ -394,17 +394,18 @@ class Simulator:
 
     def service_camera(self) -> None:
         """Answer the camera process's /sim requests (physics thread)."""
-        while self.cam_conn is not None and self.cam_conn.poll():
-            try:
+        try:
+            while self.cam_conn is not None and self.cam_conn.poll():
                 msg = self.cam_conn.recv()
-            except EOFError:
-                self.cam_conn = None
-                return
-            rid, op = msg[0], msg[1]
-            if op == "reset":
-                self.cam_conn.send((rid, self._reset_locked(msg[2])))
-            else:
-                self.cam_conn.send((rid, self._state_locked()))
+                rid, op = msg[0], msg[1]
+                if op == "reset":
+                    self.cam_conn.send((rid, self._reset_locked(msg[2])))
+                else:
+                    self.cam_conn.send((rid, self._state_locked()))
+        except (EOFError, OSError) as exc:  # the camera process is gone (BrokenPipeError: mid-request)
+            self.cam_conn.close()
+            self.cam_conn = None
+            self.camera_error = f"camera process exited (pipe closed: {exc!r})"
 
     def run(self, duration: float | None = None, stats_every: float = 0.0) -> None:
         dt = self.model.opt.timestep
@@ -417,6 +418,9 @@ class Simulator:
             steps += 1
             if steps % 10 == 0 and self.cam_conn is not None:
                 self.service_camera()
+                if self.camera_error:
+                    print(f"rebot-sim: {self.camera_error}", file=sys.stderr, flush=True)
+                    return
             if steps % 100 == 0 and self.cam_proc is not None and not self.cam_proc.is_alive():
                 self.camera_error = f"camera process exited (code {self.cam_proc.exitcode})"
                 print(f"rebot-sim: {self.camera_error}", file=sys.stderr, flush=True)

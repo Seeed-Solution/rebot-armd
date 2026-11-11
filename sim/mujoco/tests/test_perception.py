@@ -277,3 +277,15 @@ def test_failed_camera_start_frees_the_child_and_shared_memory():
         assert s.cam_proc is None and s.shared is None and s.cam_conn is None
     finally:
         s.close()
+
+
+def test_camera_dying_mid_request_does_not_break_the_physics_loop(sim):
+    parent, child = mp.Pipe()
+    sim.cam_conn = parent
+    child.send((1, "state"))
+    child.close()  # the camera process is gone before the reply
+    sim.service_camera()
+    assert sim.cam_conn is None and "camera process exited" in sim.camera_error
+    t = sim.data.time
+    sim.step()
+    assert sim.data.time > t
