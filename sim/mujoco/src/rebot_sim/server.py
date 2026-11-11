@@ -16,6 +16,7 @@ Reported torque is the total motor torque; temperatures are a constant 35 C.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import random
@@ -124,9 +125,24 @@ class Motors:
         return self.data.actuator_force[:DOF] + self.extra
 
 
+def set_joint_friction(model: mujoco.MjModel, damping=None, frictionloss=None) -> None:
+    """Override J1..J6 joint damping (N·m·s/rad) and friction loss (N·m), 6 values each."""
+    dofs = Indexer(model).qvel[:6]
+    if damping is not None:
+        model.dof_damping[dofs] = damping
+    if frictionloss is not None:
+        model.dof_frictionloss[dofs] = frictionloss
+
+
 class Simulator:
-    def __init__(self, port: int, host: str = "127.0.0.1", viewer: bool = False):
+    def __init__(self, port: int, host: str = "127.0.0.1", viewer: bool = False, damping=None, frictionloss=None,
+                 torque_report: str = "instant"):
         self.model = load_model()
+        self.torque_report = torque_report
+        # --torque-report mean: torques of the last physics steps and the command period in steps
+        self.tau_hist: collections.deque = collections.deque(maxlen=256)
+        self.steps_since_cmd, self.cmd_period = 0, 10
+        set_joint_friction(self.model, damping, frictionloss)
         self.data = mujoco.MjData(self.model)
         self.motors = Motors(self.model, self.data)
         mujoco.mj_forward(self.model, self.data)
@@ -160,6 +176,9 @@ class Simulator:
             self.rejected += 1
             return
         self.ack = int(msg.get("seq", 0))
+        if self.steps_since_cmd:
+            self.cmd_period = min(self.steps_since_cmd, self.tau_hist.maxlen)
+        self.steps_since_cmd = 0
 
     def poll_socket(self) -> None:
         while True:
@@ -179,15 +198,25 @@ class Simulator:
             "ack": self.ack, "enabled": self.motors.enabled,
             "q": idx.motor_positions(d).round(6).tolist(),
             "dq": idx.motor_velocities(d).round(6).tolist(),
-            "tau": self.motors.reported_torque().round(5).tolist(),
+            "tau": self.torque_feedback().round(5).tolist(),
             "temp": [TEMPERATURE_C] * DOF,
             "t": round(d.time, 4),
         }
         return json.dumps(state, separators=(",", ":")).encode()
 
+    def torque_feedback(self) -> np.ndarray:
+        """Instantaneous motor torque, or with --torque-report mean its mean over the last command
+        period (sliding window of the physics steps between the two latest command datagrams)."""
+        if self.torque_report == "mean" and self.tau_hist:
+            return np.mean(list(self.tau_hist)[-self.cmd_period:], axis=0)
+        return self.motors.reported_torque()
+
     def step(self) -> None:
         self.motors.apply()
         mujoco.mj_step(self.model, self.data)
+        if self.torque_report == "mean":
+            self.tau_hist.append(self.motors.reported_torque())
+            self.steps_since_cmd += 1
 
     def run(self, duration: float | None = None, stats_every: float = 0.0) -> None:
         dt = self.model.opt.timestep
@@ -236,6 +265,13 @@ def benchmark(steps: int) -> float:
     return steps / (time.perf_counter() - t0)
 
 
+def six_floats(text: str) -> list[float]:
+    vals = [float(x) for x in text.split(",")]
+    if len(vals) != 6 or not all(np.isfinite(v) and v >= 0 for v in vals):
+        raise argparse.ArgumentTypeError("needs 6 comma-separated non-negative values")
+    return vals
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="rebot-sim", description=__doc__.splitlines()[0])
     parser.add_argument("--port", type=int, default=47600, help="UDP port (default 47600)")
@@ -245,6 +281,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--stats", type=float, default=0.0, metavar="S", help="print step rate and state every S seconds")
     parser.add_argument("--duration", type=float, default=None, help="exit after this many seconds")
     parser.add_argument("--benchmark", type=int, default=0, metavar="N", help="time N unpaced physics steps and exit")
+    parser.add_argument("--damping", type=six_floats, default=None, metavar="D1,..,D6",
+                        help="J1..J6 joint damping in N·m·s/rad (default: scene values)")
+    parser.add_argument("--frictionloss", type=six_floats, default=None, metavar="F1,..,F6",
+                        help="J1..J6 joint friction loss in N·m (default: scene values)")
+    parser.add_argument("--torque-report", choices=("instant", "mean"), default="instant",
+                        help="torque in state datagrams: instantaneous (default) or mean over the last command period")
     args = parser.parse_args(argv)
     if args.benchmark:
         print(f"{benchmark(args.benchmark):.0f} physics steps/s (timestep 2 ms, unpaced)")
@@ -252,7 +294,8 @@ def main(argv: list[str] | None = None) -> None:
     viewer = args.viewer and not args.headless
     if viewer and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") or sys.platform == "darwin"):
         parser.error("--viewer needs a display (DISPLAY / WAYLAND_DISPLAY not set)")
-    sim = Simulator(args.port, args.host, viewer=viewer)
+    sim = Simulator(args.port, args.host, viewer=viewer, damping=args.damping, frictionloss=args.frictionloss,
+                    torque_report=args.torque_report)
     print(f"rebot-sim listening on udp://{args.host}:{args.port} (session {sim.session})", flush=True)
     try:
         sim.run(args.duration, args.stats)
