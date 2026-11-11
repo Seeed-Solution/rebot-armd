@@ -241,8 +241,8 @@ The official kit's package (`kits/recamera-b601dm/packaging/`, deb `rebot-teleop
 | `/usr/share/rebot-teleop/rebot-teleop.json` (+ `.md`, `.zh.md`) | gallery manifest for the reCamera console, `"requires": ["can"]` |
 | `DEBIAN/control`, `postinst`, `prerm` | `packaging/debian/` |
 
-The init script passes `--config` only for the `rebot-dm` follower and
-only when the profile file exists.
+The init script passes `--config` for the `rebot-dm` and `mock` followers, only when the
+profile file exists, and `--follower-port` for every follower except `mock`.
 
 ## Repository layout
 

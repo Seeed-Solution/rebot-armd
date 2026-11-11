@@ -246,6 +246,10 @@ overrides the channel; `0` or unset keeps the default. If hostapd is not running
 channel after start (checked with `iw dev wlan1 info`), the init script restarts it on
 2.4 GHz channel 6 and writes the fallback to syslog.
 
+On a device without a Wi-Fi interface (no `wlan0`/`wlan1`, for example the PoE model) the
+init script skips the Wi-Fi client, the hotspot and its guard, logs that to syslog, and armd is
+reached over the wired network.
+
 After an install or upgrade, `postinst` starts the app when it is the console's active app
 (or on devices without the console). Open the cockpit at `http://<camera-address>:8765/`.
 

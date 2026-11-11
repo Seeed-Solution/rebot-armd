@@ -169,7 +169,7 @@ schema 的其他字段已描述机械臂：`dof`、`joint_names`、`limits`、`w
 | `/usr/share/rebot-teleop/rebot-teleop.json`（及 `.md`、`.zh.md`） | reCamera 控制台的应用列表 manifest，`"requires": ["can"]` |
 | `DEBIAN/control`、`postinst`、`prerm` | `packaging/debian/` |
 
-init 脚本只对 `rebot-dm` follower、且 profile 文件存在时才传 `--config`。
+init 脚本在 profile 文件存在时，对 `rebot-dm` 和 `mock` follower 传 `--config`；除 `mock` 外的 follower 都传 `--follower-port`。
 
 ## 仓库布局
 
