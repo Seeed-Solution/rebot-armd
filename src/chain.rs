@@ -420,6 +420,24 @@ impl ArmModel {
         Ok(out)
     }
 
+    /// For each arm joint, an upper bound on the distance from its axis to any point fixed
+    /// to the tip at an offset of at most `max_offset` m: the link lengths from the joint
+    /// to the tip plus the offset (configuration independent).
+    pub fn joint_reach(&self, max_offset: f64) -> [f64; MAX_CHAIN_JOINTS] {
+        let n = self.arm_dof();
+        let (origins, end): (Vec<Vec3>, Vec3) = match self {
+            Self::RebotDevArm => { let f = k::frames(&[0.0; 6]); (f.origins.to_vec(), f.end.p) }
+            Self::Chain(c) => { let f = c.frames(&[0.0; MAX_CHAIN_JOINTS]); (f.origins[..n].to_vec(), f.end.p) }
+        };
+        let mut reach = [0.0; MAX_CHAIN_JOINTS];
+        let mut acc = max_offset + k::norm(&k::sub(&end, &origins[n - 1]));
+        for j in (0..n).rev() {
+            reach[j] = acc;
+            if j > 0 { acc += k::norm(&k::sub(&origins[j], &origins[j - 1])); }
+        }
+        reach
+    }
+
     pub fn shoulder_rz(&self) -> [f64; 2] {
         match self { Self::RebotDevArm => k::SHOULDER_RZ, Self::Chain(c) => c.shoulder_rz() }
     }

@@ -121,8 +121,13 @@ pub struct UnloadSettle {
 /// (rad) over `following_error.persistence_ms` is blocked.
 pub const SERVO_BLOCKED_PROGRESS_RAD: f32 = 0.01;
 
-/// Most verification samples of one joint-space trajectory with keep-out boxes.
-pub const MAX_KEEPOUT_SAMPLES: usize = 400;
+/// Most FK evaluations the keep-out sweep check may add for one servo or braking step;
+/// a step that needs more is held like a step into a box.
+pub const MAX_KEEPOUT_EVALS_PER_TICK: usize = 64;
+
+/// Most FK evaluations the keep-out sweep check may add for one joint-space trajectory;
+/// a path that needs more is WORKSPACE_VIOLATION.
+pub const MAX_KEEPOUT_EVALS_PER_PLAN: usize = 4000;
 
 /// `observation.motion_limit` is cleared this long (s) after the limit last applied.
 pub const MOTION_LIMIT_CLEAR_S: f64 = 0.3;
@@ -488,12 +493,119 @@ impl SupervisorInner {
         self.servo_hold(MotionLimitReason::Workspace, None);
     }
 
-    /// Joint-space step from the commanded position to `next` (both ends and the midpoint)
-    /// against the keep-out boxes. Three FK calls; none without boxes.
-    fn servo_step_keepout(&self, next: &[f32]) -> Result<(), SafetyError> {
-        if self.workspace_policy().is_none_or(|(ws, _)| ws.keepout_boxes.is_empty()) { return Ok(()); }
-        let mid: Vec<f32> = self.commanded_positions.iter().zip(next).map(|(a, b)| 0.5 * (a + b)).collect();
-        self.check_keepout_path(&self.commanded_positions, [mid.as_slice(), next])
+    /// Joint-space step from the commanded position to `next` (linear in joint space)
+    /// against the keep-out boxes: the conservative sweep check
+    /// ([`keepout_sweep`](Self::keepout_sweep)) with at most [`MAX_KEEPOUT_EVALS_PER_TICK`]
+    /// added FK evaluations, then the start / midpoint / end rule for boxes the step starts
+    /// in. No FK call without boxes.
+    pub fn servo_step_keepout(&self, next: &[f32]) -> Result<(), SafetyError> {
+        let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
+        if ws.keepout_boxes.is_empty() { return Ok(()); }
+        let a = &self.commanded_positions;
+        let lerp = |t: f64| -> Vec<f32> { a.iter().zip(next).map(|(x, y)| x + (t as f32) * (y - x)).collect() };
+        let travel = |t0: f64, t1: f64| -> Vec<f64> { a.iter().zip(next).map(|(x, y)| f64::from((y - x).abs()) * (t1 - t0)).collect() };
+        self.keepout_sweep(ws, cam, &lerp, &travel, &[0.0, 1.0], MAX_KEEPOUT_EVALS_PER_TICK)?;
+        let mid = lerp(0.5);
+        self.check_keepout_path(a, [mid.as_slice(), next])
+    }
+
+    /// Conservative keep-out check of the joint path `at(t)` over `knots` (ascending).
+    ///
+    /// Every check point (end_link origin, `check_points_end_m`, camera offset) moves along
+    /// an interval `[t0, t1]` at most `L = sum_j travel_j * reach_j`, with `travel` an upper
+    /// bound on each joint's travel and `reach_j` the largest distance from joint `j`'s axis to
+    /// a check point ([`ArmModel::joint_reach`](crate::chain::ArmModel::joint_reach)). A
+    /// point at Euclidean distances `d0`, `d1` from a box at the interval ends cannot enter
+    /// it when `d0 + d1 > L`. An interval where that fails for some point and box is split at
+    /// its midpoint; one with `L` at most [`WORKSPACE_EPS`](crate::kinematics::WORKSPACE_EPS)
+    /// is accepted (the depth rule's tolerance). A sample with a point deeper than the
+    /// tolerance in a box is WORKSPACE_VIOLATION; so is needing more than `budget` added
+    /// evaluations. Boxes a point is already inside at `at(knots[0])` are left to the
+    /// sample rule (a move out of a box is allowed). Returns the evaluated samples in order.
+    pub fn keepout_sweep(
+        &self,
+        ws: &crate::model::WorkspacePolicy,
+        cam: &crate::model::CameraMount,
+        at: &dyn Fn(f64) -> Vec<f32>,
+        travel: &dyn Fn(f64, f64) -> Vec<f64>,
+        knots: &[f64],
+        budget: usize,
+    ) -> Result<Vec<Vec<f32>>, SafetyError> {
+        use crate::kinematics::WORKSPACE_EPS;
+        let model = &self.config.arm_model;
+        let n = model.arm_dof();
+        let local: Vec<[f64; 3]> = std::iter::once([0.0f32; 3]).chain(ws.check_points_end_m.iter().copied())
+            .chain(cam.offset_m).map(|p| p.map(f64::from)).collect();
+        let reach = model.joint_reach(local.iter().map(crate::kinematics::norm).fold(0.0, f64::max));
+        let boxes: Vec<([f64; 3], [f64; 3])> = ws.keepout_boxes.iter().map(|b| (b.min_m.map(f64::from), b.max_m.map(f64::from))).collect();
+        let invalid = || SafetyError::WorkspaceViolation { point: 0, limit: "invalid".into(), value: f32::NAN, bound: 0.0 };
+        // (outside distance, depth inside) of every point to every box at q
+        let measure = |q: &[f32]| -> Option<Vec<(f64, f64)>> {
+            let pose = model.fk_f32(q)?;
+            Some(local.iter().flat_map(|l| {
+                let p = pose.transform_point(l);
+                boxes.iter().map(move |(lo, hi)| {
+                    let out = (0..3).map(|k| (lo[k] - p[k]).max(p[k] - hi[k]).max(0.0).powi(2)).sum::<f64>().sqrt();
+                    let depth = (0..3).map(|k| (p[k] - lo[k]).min(hi[k] - p[k])).fold(f64::INFINITY, f64::min);
+                    (out, depth)
+                })
+            }).collect())
+        };
+        let nb = boxes.len();
+        let first = at(knots[0]);
+        let m0 = measure(&first).ok_or_else(invalid)?;
+        let active: Vec<bool> = m0.iter().map(|&(_, depth)| depth <= 0.0).collect();
+        let check = |m: &[(f64, f64)]| -> Result<(), SafetyError> {
+            match m.iter().enumerate().filter(|(i, (_, depth))| active[*i] && *depth > WORKSPACE_EPS)
+                .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1)) {
+                Some((i, &(_, depth))) => Err(SafetyError::WorkspaceViolation {
+                    point: i / nb,
+                    limit: format!("keepout '{}'", ws.keepout_boxes[i % nb].name),
+                    value: depth as f32, bound: 0.0,
+                }),
+                None => Ok(()),
+            }
+        };
+        let mut samples: Vec<(f64, Vec<f32>)> = vec![(knots[0], first)];
+        let mut ends: Vec<(f64, Vec<(f64, f64)>)> = vec![(knots[0], m0)];
+        for &t in &knots[1..] {
+            let q = at(t);
+            let m = measure(&q).ok_or_else(invalid)?;
+            check(&m)?;
+            samples.push((t, q));
+            ends.push((t, m));
+        }
+        let mut evals = 0usize;
+        let mut stack: Vec<((f64, Vec<(f64, f64)>), (f64, Vec<(f64, f64)>))> = Vec::new();
+        let mut ends = ends.into_iter();
+        let mut prev = ends.next().ok_or_else(invalid)?;
+        for e in ends { stack.push((prev, e.clone())); prev = e; }
+        while let Some(((t0, m0), (t1, m1))) = stack.pop() {
+            let tr = travel(t0, t1);
+            let bound: f64 = tr.iter().take(n).zip(&reach).map(|(d, r)| d * r).sum();
+            if !bound.is_finite() { return Err(invalid()); }
+            if bound <= WORKSPACE_EPS
+                || m0.iter().zip(&m1).zip(&active).all(|((a, b), &on)| !on || a.0 + b.0 > bound) {
+                continue;
+            }
+            if evals >= budget {
+                return Err(SafetyError::WorkspaceViolation {
+                    point: 0,
+                    limit: format!("keepout check: the path needs more than {budget} FK evaluations to clear the keep-out boxes; bound"),
+                    value: bound as f32, bound: WORKSPACE_EPS as f32,
+                });
+            }
+            evals += 1;
+            let tm = 0.5 * (t0 + t1);
+            let q = at(tm);
+            let m = measure(&q).ok_or_else(invalid)?;
+            check(&m)?;
+            samples.push((tm, q));
+            stack.push(((tm, m.clone()), (t1, m1)));
+            stack.push(((t0, m0), (tm, m)));
+        }
+        samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Ok(samples.into_iter().map(|(_, q)| q).collect())
     }
 
     fn servo_hold(&mut self, reason: MotionLimitReason, joint: Option<usize>) {
@@ -586,46 +698,22 @@ impl SupervisorInner {
         (0..=n).map(|k| traj.sample(traj.duration * k as f64 / n as f64).positions).collect()
     }
 
-    /// Workspace verification points of a joint-space trajectory: the 21 planner samples, or,
-    /// with keep-out boxes, enough samples that no check point moves more than half the
-    /// smallest box dimension between two of them (at most [`MAX_KEEPOUT_SAMPLES`]; a path
-    /// that needs more is WORKSPACE_VIOLATION).
+    /// Workspace verification points of a joint-space trajectory: the 21 planner samples,
+    /// plus, with keep-out boxes, the samples of the conservative sweep check
+    /// ([`keepout_sweep`](Self::keepout_sweep), at most [`MAX_KEEPOUT_EVALS_PER_PLAN`] added
+    /// FK evaluations; a path that needs more, or that enters a box, is WORKSPACE_VIOLATION).
     pub fn workspace_samples(&self, traj: &MultiJointQuinticTrajectory) -> Result<Vec<Vec<f32>>, SafetyError> {
-        let samples = Self::trajectory_samples(traj);
-        let Some((ws, cam)) = self.workspace_policy() else { return Ok(samples); };
-        let Some(spacing) = ws.keepout_boxes.iter()
-            .flat_map(|b| (0..3).map(move |k| f64::from(b.max_m[k] - b.min_m[k])))
-            .reduce(f64::min).map(|d| 0.5 * d) else { return Ok(samples); };
-        let points: Vec<[f64; 3]> = std::iter::once([0.0; 3])
-            .chain(ws.check_points_end_m.iter().map(|p| p.map(f64::from)))
-            .chain(cam.offset_m.map(|o| o.map(f64::from)))
-            .collect();
-        let model = &self.config.arm_model;
-        let step = |samples: &[Vec<f32>]| -> f64 {
-            let at: Vec<Option<Vec<[f64; 3]>>> = samples.iter()
-                .map(|q| model.fk_f32(q).map(|pose| points.iter().map(|p| pose.transform_point(p)).collect()))
-                .collect();
-            at.windows(2).map(|w| match (&w[0], &w[1]) {
-                (Some(a), Some(b)) => a.iter().zip(b).map(|(x, y)| crate::kinematics::norm(&crate::kinematics::sub(x, y))).fold(0.0, f64::max),
-                _ => f64::INFINITY,
-            }).fold(0.0, f64::max)
-        };
-        let mut n = 20usize;
-        let mut samples = samples;
-        loop {
-            let max_step = step(&samples);
-            if max_step <= spacing { return Ok(samples); }
-            let next = if max_step.is_finite() { (n as f64 * max_step / spacing * 1.2).ceil() as usize } else { usize::MAX };
-            if n >= MAX_KEEPOUT_SAMPLES || next > MAX_KEEPOUT_SAMPLES * 4 {
-                return Err(SafetyError::WorkspaceViolation {
-                    point: 0,
-                    limit: format!("keepout sampling: the path needs more than {MAX_KEEPOUT_SAMPLES} samples for {spacing:.4} m spacing (half the smallest keep-out box); step"),
-                    value: max_step as f32, bound: spacing as f32,
-                });
-            }
-            n = next.clamp(n + 1, MAX_KEEPOUT_SAMPLES);
-            samples = Self::uniform_samples(traj, n);
-        }
+        self.workspace_samples_with_budget(traj, MAX_KEEPOUT_EVALS_PER_PLAN)
+    }
+
+    /// [`workspace_samples`](Self::workspace_samples) with `budget` added FK evaluations.
+    pub fn workspace_samples_with_budget(&self, traj: &MultiJointQuinticTrajectory, budget: usize) -> Result<Vec<Vec<f32>>, SafetyError> {
+        let Some((ws, cam)) = self.workspace_policy().filter(|(ws, _)| !ws.keepout_boxes.is_empty())
+            else { return Ok(Self::trajectory_samples(traj)); };
+        let knots: Vec<f64> = (0..=20).map(|k| traj.duration * k as f64 / 20.0).collect();
+        let at = |t: f64| traj.sample(t).positions;
+        let travel = |t0: f64, t1: f64| traj.travel_bound(t0, t1);
+        self.keepout_sweep(ws, cam, &at, &travel, &knots, budget)
     }
 
     fn gravity_output_enabled(&self) -> bool {

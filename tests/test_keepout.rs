@@ -272,13 +272,101 @@ fn joint_move_keepout_sampling_is_dense_enough_for_small_boxes() {
     assert!(err.to_string().contains("keepout 'pin'"), "{err}");
     assert!(inner.active_trajectory.is_none());
 
-    // a path that would need more than MAX_KEEPOUT_SAMPLES is refused with a clear message
-    let tiny = KeepoutBox { name: "speck".into(), min_m: [0.9, 0.9, 0.9], max_m: [0.9001, 0.9001, 0.9001] };
-    let mut inner = sim_at(with_boxes(vec![tiny]), &INSPECT);
-    let err = inner.jog(target.to_vec(), None, None).unwrap_err();
-    let api = armd::api::rest::ApiError::from(err);
+    // a box far from the path costs no subdivision and is accepted
+    let far = KeepoutBox { name: "far".into(), min_m: [0.9, 0.9, 0.9], max_m: [0.9001, 0.9001, 0.9001] };
+    let mut inner = sim_at(with_boxes(vec![far]), &INSPECT);
+    inner.jog(target.to_vec(), None, None).expect("a box out of reach does not block the move");
+
+    // a path whose check needs more FK evaluations than the plan budget is refused with a clear message
+    let near = KeepoutBox { name: "near".into(), min_m: c.map(|v| (v + 0.003) as f32), max_m: c.map(|v| (v + 0.02) as f32) };
+    let inner = sim_at(with_boxes(vec![near]), &INSPECT);
+    let err = inner.workspace_samples_with_budget(&traj, 4).unwrap_err();
+    let api = armd::api::rest::ApiError::from(armd::ArmError::from(err));
     assert_eq!(api.code.as_deref(), Some("WORKSPACE_VIOLATION"));
-    assert!(api.message.contains("needs more than 400 samples"), "{}", api.message);
+    assert!(api.message.contains("more than 4 FK evaluations"), "{}", api.message);
+}
+
+/// Workspace check points of `q` in the base frame (TCP, envelope corners, camera point).
+fn check_points(inner: &SupervisorInner, q: &[f32]) -> Vec<[f64; 3]> {
+    let ws = inner.config.workspace.as_ref().unwrap();
+    let pose = inner.config.arm_model.fk_f32(q).unwrap();
+    std::iter::once([0.0f32; 3]).chain(ws.check_points_end_m.iter().copied()).chain(inner.config.camera_mount.offset_m)
+        .map(|p| pose.transform_point(&p.map(f64::from))).collect()
+}
+
+/// The sample set of the former joint-move check: uniform, refined until no check point
+/// moves more than half the smallest box dimension (`spacing`) between two samples.
+fn spacing_samples(inner: &SupervisorInner, traj: &armd::trajectory::MultiJointQuinticTrajectory, spacing: f64) -> Vec<Vec<f32>> {
+    let uniform = |n: usize| -> Vec<Vec<f32>> { (0..=n).map(|k| traj.sample(traj.duration * k as f64 / n as f64).positions).collect() };
+    let mut n = 20;
+    loop {
+        let s = uniform(n);
+        let step = s.windows(2).map(|w| check_points(inner, &w[0]).iter().zip(check_points(inner, &w[1]))
+            .map(|(a, b)| kinematics::norm(&kinematics::sub(a, &b))).fold(0.0, f64::max)).fold(0.0, f64::max);
+        if step <= spacing { return s; }
+        n = ((n as f64 * step / spacing * 1.2).ceil() as usize).max(n + 1);
+    }
+}
+
+fn clear_of(inner: &SupervisorInner, b: &KeepoutBox, samples: &[Vec<f32>]) -> bool {
+    let ws = { let mut w = inner.config.workspace.clone().unwrap(); w.keepout_boxes = vec![b.clone()]; w };
+    samples.iter().all(|q| inner.config.arm_model.workspace_violation(q, &ws, &inner.config.camera_mount).total == 0.0)
+}
+
+/// A 2 cm box whose corner the TCP path clips between two samples of the former
+/// half-box-dimension sampling is found.
+#[test]
+fn joint_move_keepout_check_catches_a_clipped_box_corner() {
+    let mut target = INSPECT;
+    target[0] += 1.2;
+    target[1] -= 0.3;
+    let mut probe = sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    probe.jog(target.to_vec(), None, None).unwrap();
+    let traj = probe.active_trajectory.as_ref().unwrap().as_quintic().unwrap().clone();
+    let (dim, inside) = (0.02f64, 0.0005f64);
+    let old = spacing_samples(&probe, &traj, 0.5 * dim);
+    let n = old.len() - 1;
+    let mut found = None;
+    'search: for k in 0..n {
+        let (ta, tb) = (traj.duration * k as f64 / n as f64, traj.duration * (k + 1) as f64 / n as f64);
+        let (pa, pm, pb) = (tcp(&old[k]), tcp(&traj.sample(0.5 * (ta + tb)).positions), tcp(&old[k + 1]));
+        let (u, w) = (kinematics::sub(&pa, &pm), kinematics::sub(&pb, &pm));
+        for i in 0..3 {
+            for j in (0..3).filter(|&j| j != i) {
+                let (mut lo, mut hi) = (pm.map(|v| v - 0.5 * dim), pm.map(|v| v + 0.5 * dim));
+                for (ax, d) in [(i, u[i]), (j, w[j])] {
+                    if d > 0.0 { hi[ax] = pm[ax] + inside; lo[ax] = hi[ax] - dim; } else { lo[ax] = pm[ax] - inside; hi[ax] = lo[ax] + dim; }
+                }
+                let b = KeepoutBox { name: "corner".into(), min_m: lo.map(|v| v as f32), max_m: hi.map(|v| v as f32) };
+                if clear_of(&probe, &b, &old) { found = Some(b); break 'search; }
+            }
+        }
+    }
+    let b = found.expect("a box corner between two samples of the former sampling");
+    let mut inner = sim_at(with_boxes(vec![b]), &INSPECT);
+    let err = inner.jog(target.to_vec(), None, None).unwrap_err();
+    assert!(err.to_string().contains("keepout 'corner'"), "{err}");
+    assert!(inner.active_trajectory.is_none());
+}
+
+/// One servo step whose TCP passes a narrow box between its start, midpoint and end is
+/// refused; a step clear of the box is not.
+#[test]
+fn servo_step_check_catches_a_box_between_its_samples() {
+    let mut next = INSPECT;
+    next[0] += 0.06;
+    next[1] -= 0.04;
+    let lerp = |t: f32| -> Vec<f32> { INSPECT.iter().zip(&next).map(|(a, b)| a + t * (b - a)).collect() };
+    let c = tcp(&lerp(0.25));
+    let b = KeepoutBox { name: "narrow".into(), min_m: c.map(|v| (v - 0.0005) as f32), max_m: c.map(|v| (v + 0.0005) as f32) };
+    let probe = sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    assert!(clear_of(&probe, &b, &[INSPECT.to_vec(), lerp(0.5), next.to_vec()]), "box must sit between start, midpoint and end");
+    let inner = sim_at(with_boxes(vec![b]), &INSPECT);
+    let err = inner.servo_step_keepout(&next).unwrap_err();
+    assert!(err.to_string().contains("keepout 'narrow'"), "{err}");
+    let mut away = INSPECT;
+    away[0] -= 0.06;
+    inner.servo_step_keepout(&away).expect("a step away from the box is clear");
 }
 
 /// The keep-out ack is sent after the file write and can follow later replies (here the
@@ -314,4 +402,43 @@ async fn delayed_persist_ack_carries_the_epoch_at_send_time() {
         assert_eq!(ack["epoch_id"].as_u64(), Some(now), "ack after epoch_sync must not roll the epoch back: {ack}");
     }
     assert!(after_sync, "the ack is sent after the write, after the immediate E-stop reply");
+}
+
+/// The bounds the sweep check rests on: the joint travel bound covers the sampled travel,
+/// and the per-joint reach covers each check point's distance from the joint axis.
+#[test]
+fn keepout_sweep_bounds_cover_the_motion() {
+    let mut target = INSPECT;
+    target[0] += 1.2;
+    target[2] += 0.5;
+    let mut probe = sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    probe.jog(target.to_vec(), None, None).unwrap();
+    let traj = probe.active_trajectory.as_ref().unwrap().as_quintic().unwrap().clone();
+    for k in 0..10 {
+        let (t0, t1) = (traj.duration * k as f64 / 10.0, traj.duration * (k + 1) as f64 / 10.0);
+        let bound = traj.travel_bound(t0, t1);
+        let mut travel = vec![0.0f64; bound.len()];
+        let mut prev = traj.sample(t0).positions;
+        for s in 1..=100 {
+            let q = traj.sample(t0 + (t1 - t0) * s as f64 / 100.0).positions;
+            for j in 0..travel.len() { travel[j] += f64::from((q[j] - prev[j]).abs()); }
+            prev = q;
+        }
+        for j in 0..travel.len() { assert!(travel[j] <= bound[j] + 1e-6, "joint {j} [{t0}, {t1}]: {} > {}", travel[j], bound[j]); }
+    }
+    let ws = probe.config.workspace.clone().unwrap();
+    let local_max = std::iter::once([0.0f32; 3]).chain(ws.check_points_end_m.iter().copied()).chain(probe.config.camera_mount.offset_m)
+        .map(|p| kinematics::norm(&p.map(f64::from))).fold(0.0, f64::max);
+    let reach = probe.config.arm_model.joint_reach(local_max);
+    for q in [INSPECT, target, [0.0; 7]] {
+        let f = kinematics::frames(&kinematics::q6(&q));
+        for p in check_points(&probe, &q) {
+            for j in 0..6 {
+                let rel = kinematics::sub(&p, &f.origins[j]);
+                let along = kinematics::dot(&rel, &kinematics::unit(&f.axes[j]));
+                let dist = (kinematics::dot(&rel, &rel) - along * along).max(0.0).sqrt();
+                assert!(dist <= reach[j] + 1e-9, "joint {j}: {dist} > {}", reach[j]);
+            }
+        }
+    }
 }
