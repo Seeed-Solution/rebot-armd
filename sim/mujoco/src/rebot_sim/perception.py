@@ -30,10 +30,6 @@ IDLE_FPS = 1
 MODE_PIPELINES = {"off": [], "yolo": ["yolo"], "aruco": ["aruco"], "both": ["yolo", "aruco"]}
 
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-
 # --------------------------------------------------------------------------- video
 
 
@@ -147,13 +143,12 @@ class Perception:
     def continuous(self) -> dict:
         self._expire()
         pipes = set(MODE_PIPELINES[self.mode]) if self.enabled else set()
-        fps = self.max_fps if pipes else 0
+        fps = self.max_fps if pipes else 0  # every term is capped at max_fps
         for s in self.subs.values():
             pipes |= set(s["pipelines"])
             fps = max(fps, self.sub_fps(s))
-        active = bool(pipes)
-        return {"active": active, "pipelines": [p for p in PIPELINES if p in pipes],
-                "fps": min(fps, self.max_fps) if active else 0, "subscriptions": len(self.subs)}
+        return {"active": bool(pipes), "pipelines": [p for p in PIPELINES if p in pipes],
+                "fps": fps, "subscriptions": len(self.subs)}
 
     def sub_fps(self, s: dict) -> int:
         """Effective rate of a subscription: its requested rate under the current cap."""
@@ -190,7 +185,7 @@ class Perception:
 
     def result(self, frame: dict, pipelines: list[str]) -> dict:
         ran = {p: p in pipelines for p in PIPELINES}
-        body = {
+        return {
             "api_version": API_VERSION, "success": True, "mode": self.mode, "frame_id": frame["frame_id"],
             "ts_ms": frame["ts_ms"], "mono": frame["mono"], "physics_time": frame["physics_time"],
             "physics_step": frame["physics_step"], "inference_time_ms": 0.1, "width": 640, "height": 360,
@@ -198,7 +193,6 @@ class Perception:
             "detections": frame["detections"] if ran["yolo"] else [],
             "count": 0, "family": "aruco4x4_50", "undistorted": False, "rejected": 0, "markers": [],
         }
-        return body
 
     @staticmethod
     def public(body: dict) -> dict:
@@ -677,7 +671,7 @@ class CameraRig:
             else:
                 self.physics_step = step
                 captured = time.monotonic()
-                ts_ms = _now_ms()
+                ts_ms = int(time.time() * 1000)
                 mujoco.mj_forward(self.model, self.data)
                 dets = self.detect()
                 self.frame_id += 1

@@ -31,7 +31,7 @@ import time
 import mujoco
 import numpy as np
 
-from .camera import CameraMount
+from .camera import PROFILE, CameraMount
 from .model import DOF, Indexer, load_model
 from .scene import Scene, parse_objects
 
@@ -190,7 +190,7 @@ class Simulator:
         self.mount = camera_mount
         self.has_meshes = bool(os.environ.get("REBOT_DEVARM_DIR"))
         self.model = load_model(objects=self.objects, camera=camera_mount)
-        # physics runs under this lock; the camera thread and the HTTP routes read under it
+        # physics and the scene resets run under this lock; sim_state reads under it
         self.lock = threading.Lock()
         self.stopping = False
         self._resets: list[tuple[int | None, threading.Event, dict]] = []
@@ -280,11 +280,10 @@ class Simulator:
 
     def step(self) -> None:
         with self.lock:
-            if self._resets:
-                for seed, done, out in self._resets:
-                    out.update(self._reset_locked(seed))
-                    done.set()
-                self._resets.clear()
+            for seed, done, out in self._resets:
+                out.update(self._reset_locked(seed))
+                done.set()
+            self._resets.clear()
             self.motors.apply()
             mujoco.mj_step(self.model, self.data)
         if self.shared is not None and self.camera_error is None:
@@ -518,7 +517,7 @@ def main(argv: list[str] | None = None) -> None:
         parser.error(f"--objects: {exc}")
     if args.seed is not None and args.seed < 0:
         parser.error("--seed must be non-negative")
-    mount = CameraMount.from_profile(args.profile) if args.profile else CameraMount.from_profile()
+    mount = CameraMount.from_profile(args.profile or PROFILE)
     if args.camera_rot_deg is not None or args.camera_tilt_deg is not None or args.camera_offset:
         off = mount.offset_m
         if args.camera_offset:
