@@ -49,3 +49,25 @@ def test_malformed_commands_change_nothing():
         assert sim.ack == 6 and not sim.motors.enabled
     finally:
         sim.sock.close()
+
+
+def test_j2_j3_rest_on_their_stops_at_home():
+    # at q = 0 (J2 / J3 upper stops) gravity pushes both into the stop: it carries the load
+    # and the motor torque stays near 0, as on the real arm; off the stop the motor holds it
+    sim = Simulator(free_udp_port())
+    sim.motors.set_enabled(True)
+    for _ in range(1000):
+        sim.step()
+    tau = sim.motors.reported_torque()
+    bias = sim.data.qfrc_bias[sim.motors.dofs[:6]]
+    assert bias[2] < -5.0 and bias[1] < -0.5, bias
+    assert abs(tau[1]) < 0.5 and abs(tau[2]) < 1.0, tau
+    q = sim.motors.idx.motor_positions(sim.data)
+    assert 0.0 <= q[2] < 0.005 and 0.0 <= q[1] < 0.005, q
+    sim.motors.q_t[2] = -0.3
+    for _ in range(1500):
+        sim.step()
+    q = sim.motors.idx.motor_positions(sim.data)
+    tau = sim.motors.reported_torque()
+    assert abs(q[2] + 0.3) < 0.01 and tau[2] < -3.0, (q, tau)
+    sim.sock.close()

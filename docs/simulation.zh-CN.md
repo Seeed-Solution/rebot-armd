@@ -52,7 +52,7 @@ cd sim/mujoco && uv run pytest -s -m "not slow"   # 跳过约 3.5 分钟的 sysi
 - **场景**（`sim/mujoco/models/rebot_b601dm_scene.xml`）：关节链与连杆惯量取自 `assets/reBot-DevArm_gripper.urdf`（armd 重力模型和运动学用的同一组参数）；碰撞体为按上游 DM 网格尺寸设置的方盒；桌面在 z = 0（底座平面，对应 profile `grasp.table_z_m`）；4 cm、30 g 方块位于 (0.30, 0, 0.02) m。连杆与桌面、方块碰撞，连杆之间不碰撞。
 - **关节约定**：J1..J6 电机角 = URDF 角。J7 经齿条驱动两指：单侧开口 = −q7 × 0.0425 / 5.7 m（q7 = 0 闭合，−5.7 rad = 85 mm）。另一指由等式约束跟随。J2、J3 上限位在 0 rad（URDF 限位），机械臂在 q = 0 折叠静置；其余关节范围为 profile 限位 + 0.1 rad。
 - **电机**（物理 500 Hz）：
-  - POS_VEL（armd 常规模式）：v_des = clip(25 · (q_target − q), ±vlim)，力矩 = kv · (v_des − dq) + J1..J6 的模型偏置力矩（重力、科氏力）；vlim 为 armd 下发的 2.0 rad/s。
+  - POS_VEL（armd 常规模式）：v_des = clip(25 · (q_target − q), ±vlim)，力矩 = kv · (v_des − dq) + J1..J6 的模型偏置力矩（重力、科氏力）；vlim 为 armd 下发的 2.0 rad/s。关节处于行程端点 0.005 rad 以内、目标也在该端点且重力把它压向该端点时，不加偏置力矩：由限位承担负载。折叠的 home 姿态下 J2 / J3 以这种方式靠在上限位（q = 0）上，电机力矩接近 0，与真机一致，armd 的下使能稳定检查（`support_torque_limits`）因此通过。
   - MIT（重力补偿按关节切换）：力矩 = kp · (q_target − q) + kd · (dq_target − dq) + τ_ff。
   - 失能：无力矩，机械臂在重力下下落。
   - 力矩上限 = 达妙峰值扭矩：27 N·m（J1..J3）、7 N·m（J4..J7）。POS_VEL 的速度目标限制在电机空载转速以内（5.45 / 20.9 rad/s；armd 下发 vlim 2.0，正常使用时该限制不起作用）。

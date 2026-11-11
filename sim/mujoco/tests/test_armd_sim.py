@@ -240,3 +240,58 @@ def test_armd_on_simulator(rig):
     print(f"after simulator kill ({time.time() - t0:.2f} s): safety={obs['safety_state']} fault={obs.get('fault')} feedback_valid={obs['feedback_valid']}")
     assert obs.get("fault") and obs["fault"]["code"] == "BUS_LOSS"
     print("simulator log tail:\n" + "".join((logs / "sim.log").read_text().splitlines(True)[-3:]))
+
+
+def enable_at_home(client) -> dict:
+    deadline = time.time() + 10
+    while not client.observation()["feedback_valid"] and time.time() < deadline:
+        time.sleep(0.1)
+    client.command("/api/v1/torque", {"enable": True})
+    rec = client.wait_action(client.command("/api/v1/motion/home", {})["action_id"])
+    assert rec["state"] == "done", json.dumps(rec)
+    time.sleep(1.0)
+    return client.observation()
+
+
+def wait_torque_off(client, timeout: float) -> tuple[dict, float]:
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        obs = client.observation()
+        if not obs["is_torqued"] or obs.get("fault"):
+            return obs, time.time() - t0
+        time.sleep(0.05)
+    return client.observation(), time.time() - t0
+
+
+@pytest.mark.slow
+def test_park_at_home_rests_on_the_supports_and_turns_torque_off(rig):
+    # The real B601-DM rests J2 / J3 on mechanical supports at home (J3 torque near 0), so
+    # armd's unload settle check (support_torque_limits J2 2.333, J3 7.0 N·m) passes.
+    client, _, logs = rig
+    obs = enable_at_home(client)
+    tau = obs["torques"]
+    print(f"\nat home: positions={np.round(obs['positions'], 4).tolist()} torques={np.round(tau, 3).tolist()}")
+    assert abs(tau[1]) < 1.0 and abs(tau[2]) < 1.0, "J2 / J3 must rest on their supports at home"
+    t0 = time.time()
+    ack = client.command("/api/v1/motion/unload", {})
+    if ack.get("action_id"):
+        rec = client.wait_action(ack["action_id"], 20)
+        print(f"park: {rec['state']}")
+    obs, _ = wait_torque_off(client, 13.0)
+    dt = time.time() - t0
+    print(f"park: torque {'on' if obs['is_torqued'] else 'off'} after {dt:.2f} s, safety={obs['safety_state']} fault={obs.get('fault')}")
+    assert not obs["is_torqued"] and not obs.get("fault"), (logs / "armd.log").read_text()[-3000:]
+    assert dt < 13.0  # WATCHDOG_PARK_TIMEOUT + WATCHDOG_PARK_MARGIN
+
+
+@pytest.mark.slow
+def test_watchdog_on_a_frozen_client_parks_and_turns_torque_off(rig):
+    client, _, logs = rig
+    enable_at_home(client)
+    client.running = False  # heartbeats stop; the connection and the lease stay
+    obs, dt = wait_torque_off(client, 2.5 + 13.0 + 5.0)  # lease timeout + park budget + settle grace
+    print(f"\nwatchdog: torque {'on' if obs['is_torqued'] else 'off'} after {dt:.2f} s, safety={obs['safety_state']} fault={obs.get('fault')}")
+    log = (logs / "armd.log").read_text()
+    assert not obs["is_torqued"], log[-3000:]
+    assert not (obs.get("fault") or {}).get("code") == "WATCHDOG_TIMEOUT", log[-3000:]
+    assert "latching WatchdogTimeout" not in log

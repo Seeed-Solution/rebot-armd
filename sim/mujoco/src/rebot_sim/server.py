@@ -8,7 +8,10 @@ Motor model per joint, mirroring the Damiao modes armd uses:
 - POS_VEL: v_des = clip(KPOS * (q_target - q), +-vlim); torque = KV * (v_des - dq)
   plus the model's bias torque (gravity, Coriolis) on J1..J6, which stands in for the
   motor's integrator. v_des is also capped at the motor's no-load speed; torque is
-  limited to the motor's peak torque.
+  limited to the motor's peak torque. A joint that rests on its mechanical stop (the joint
+  range end, within STOP_EPS) with its target at that stop and gravity pushing it into the
+  stop gets no bias torque: the stop carries the load, as on the real arm at the folded home
+  pose (J2 / J3 on their supports, motor torque near 0).
 - MIT: torque = kp * (q_target - q) + kd * (dq_target - dq) + tau_ff.
 - Disabled: no torque (the arm falls under gravity, as on hardware).
 Reported torque is the total motor torque; temperatures are a constant 35 C.
@@ -40,6 +43,9 @@ KV = np.array([8.0, 8.0, 8.0, 1.5, 1.5, 1.5, 0.5])
 # rad/s (52 rpm and 200 rpm), both output side.
 TORQUE_LIMIT = np.array([27.0, 27.0, 27.0, 7.0, 7.0, 7.0, 7.0])
 NO_LOAD_SPEED = np.array([52.0] * 3 + [200.0] * 4) * 2 * np.pi / 60
+# A joint within this distance (rad) of a range end, with its target there too, rests on
+# the stop (see the module docstring).
+STOP_EPS = 0.005
 
 
 def _finite(v) -> float | None:
@@ -68,6 +74,10 @@ class Motors:
         # generalized-force mapping of each actuator (gear) on its joint dof
         self.gear = model.actuator_gear[:, 0].copy()
         self.dofs = np.array([model.jnt_dofadr[model.actuator_trnid[i, 0]] for i in range(model.nu)])
+        # J1..J6 range ends (rad, motor angle = joint angle); +-inf for unlimited joints
+        jnts = [model.actuator_trnid[i, 0] for i in range(6)]
+        self.stop_lo = np.array([model.jnt_range[j, 0] if model.jnt_limited[j] else -np.inf for j in jnts])
+        self.stop_hi = np.array([model.jnt_range[j, 1] if model.jnt_limited[j] else np.inf for j in jnts])
 
     def set_enabled(self, enabled: bool) -> None:
         if enabled and not self.enabled:
@@ -132,7 +142,7 @@ class Motors:
                 vmax = min(self.vlim[i], NO_LOAD_SPEED[i])
                 ctrl[i] = np.clip(KPOS[i] * (self.q_t[i] - q[i]), -vmax, vmax)
                 kv[i] = KV[i]
-                if i < 6:
+                if i < 6 and not self.on_stop(i, q[i], bias[i]):
                     extra[i] = bias[i]
             else:
                 ctrl[i] = self.dq_t[i]
@@ -147,6 +157,12 @@ class Motors:
         d.ctrl[:] = ctrl
         d.qfrc_applied[self.dofs] = self.gear * extra
         self.extra = extra
+
+    def on_stop(self, i: int, q: float, bias: float) -> bool:
+        """Joint i (J1..J6) rests on a range end: position and target at it and the load
+        (bias torque: what a motor needs to hold) pushing into it."""
+        hi, lo = self.stop_hi[i] - STOP_EPS, self.stop_lo[i] + STOP_EPS
+        return (q >= hi and self.q_t[i] >= hi and bias < 0) or (q <= lo and self.q_t[i] <= lo and bias > 0)
 
     def reported_torque(self) -> np.ndarray:
         if not self.enabled:
