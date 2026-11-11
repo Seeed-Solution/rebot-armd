@@ -105,6 +105,20 @@
 
 `mock`（进程内仿真，默认值）用于测试和无机械臂时的界面开发。
 
+`sim` 让 armd 连接 `rebot-sim`，即 B601-DM 的 MuJoCo 物理仿真（`sim/mujoco`，UDP，默认 `udp://127.0.0.1:47600`）。armd 自身的检查（关节限位、工作空间、租约看门狗、夹爪夹持判定、残差力矩、总线丢失检测）在仿真的位置、速度和力矩上运行。加 `--camera` 时仿真器同时渲染腕部相机，并按 reCamera 套件的方式提供：H.264 视频流 `ws://127.0.0.1:8001/`、基于真值的感知服务（rebot-vision 感知 API v2）`http://127.0.0.1:8090`，以及用于带种子场景（物体 `cube`、`cup`、`block`）和评测的 `/sim/reset` / `/sim/state` / `/sim/camera`。运行：
+
+```bash
+# 终端 1：带腕部相机的仿真器
+cd sim/mujoco
+uv run rebot-sim --camera --objects cube,cup --seed 3 --stats 2
+
+# 终端 2：使用 B601-DM profile 的 armd，识别来自仿真器
+ARMD_DETECTOR_URL=http://127.0.0.1:8090 cargo run --bin armd -- --follower sim \
+  --config kits/recamera-b601dm/profile/rebot-b601dm.json --log-dir off --blackbox-dir off
+```
+
+不加 `--camera` 时仿真器只运行物理（`uv run rebot-sim --port 47600 --headless`）。依赖、选项、通信协议和仿真实测结果见 [docs/simulation.zh-CN.md](docs/simulation.zh-CN.md)。
+
 验证中驱动的协议编码由单元测试覆盖（`tests/test_protocol_vectors.rs`、`tests/test_driver_capabilities.rs`）。它们使用通用 6 关节 profile，没有运动学和工作空间，笛卡尔动作返回 `UNSUPPORTED`。达妙驱动另有带重力前馈的 MIT 模式，但只能在代码中启用（`DamiaoArmDriver::with_control_mode`），命令行和 profile 都不能选择。重力补偿模式在运行时把 J1–J6 切到 MIT 再切回（见[网页驾驶舱](#网页驾驶舱)），该切换已在 B601-DM 上实机验证。
 
 其他机械臂可以从 profile 指定的 URDF 获取运动学和重力模型（`"kinematics": "Urdf"`，字段 `urdf`、`chain`；见 [docs/architecture.zh-CN.md](docs/architecture.zh-CN.md)）。`profiles/rebot_b601_rs.json` 为 B601-RS 提供这样的 profile（`--follower rebot-rs --config profiles/rebot_b601_rs.json`）：FK 和重力在测试中与 RS 的 MuJoCo 模型和 URDF 对比；关节方向、零位偏置、限位和质量未在真实机械臂上验证。它有 6 个手臂关节、没有夹爪关节，因此有工作空间检查和重力模型，没有笛卡尔动作。
@@ -250,7 +264,7 @@ v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
   目标跟随实测位姿，经 WebSocket 租约流式发送。
 - **识别叠加**：在视频上绘制 YOLO 检测框和 ArUco 标记，可选 YOLO、ArUco 或两者；只有叠加开启且页面可见时，页面才持有视觉订阅。另有单次快照。
 - **手眼标定抽屉**：眼在手上（摄像头装在夹爪上）或眼在手外（固定摄像头），使用 ArUco 标记；采集位姿、求解、导出 rebot-companion 的 `HandEyeCalibration.load_result` 可读取的 JSON。
-- **点框抓取**：开启识别后点一个框并确认，armd 执行 `grasp` 动作（张开、俯视接近、闭环图像对中、J6 对齐 0° / 90°、下降、夹紧并判定、抬起）。任何摇杆、按键、停止或急停都会中止。抓取设置（桌面高度、夹爪位置像素、接近与抓取高度、相机俯角）由 armd 保存。目前只在仿真和截图测试中验证过；需要在真机上确认的项目见 [docs/plan_tap_to_grasp.md](docs/plan_tap_to_grasp.md)。
+- **点框抓取**：开启识别后点一个框并确认，armd 执行 `grasp` 动作（张开、俯视接近、闭环图像对中、J6 对齐 0° / 90°、下降、夹紧并判定、抬起）。任何摇杆、按键、停止或急停都会中止。抓取设置（桌面高度、夹爪位置像素、接近与抓取高度、相机俯角）由 armd 保存。相机向夹爪方向俯仰安装时（v8 支架，`camera_mount` `rot_deg` 90、`tilt_deg` −38），工具竖直朝下时夹爪对应的桌面点不在画面内；此时由抓取设置字段 `acquire_camera_down`（`auto`（默认）、`on`、`off`）选择相机朝下采集：以光轴竖直的姿态接近和对中，再一次移动到目标上方的工具竖直位姿，之后照常下降（`auto`：相机俯角绝对值 > 5° 且 `camera_mount.offset_m` 已设置时启用；见 [docs/agent_action_api.md](docs/agent_action_api.md#camera-down-acquisition--相机朝下采集)）。目前只在仿真和截图测试中验证过（相机朝下采集只在 `rebot-sim` 中验证，未在真机上试过）；需要在真机上确认的项目见 [docs/plan_tap_to_grasp.md](docs/plan_tap_to_grasp.md)。
 - **重力补偿 / 拖动示教**：按住开关 0.6 秒，J1–J6 进入漂浮状态（MIT 模式，kp = 0，带阻尼，以 URDF 重力力矩为前馈，1 秒内渐入）；夹爪保持位置控制。开启期间摇杆、按键和预设不发送指令，夹爪按键发送张开 / 闭合动作，横幅显示渐入进度、录制开关和退出按钮。退出、停止、急停、租约丢失、故障、反馈超时、超速等退出原因都会在实测位姿锁定机械臂，并以提示条显示原因。超速阈值：J1–J3 为 1.5 rad/s，J4–J6 为 3.0 rad/s。在 B601-DM 上测试的五种退出方式（退出、停止、接管、急停、客户端断开）均把机械臂保持在 1.5 mrad 以内；一段 30 秒拖动示教录制得到 1509 帧。
 - **急停**按钮、故障显示与清除、长按使能力矩、收纳。armd 提供 `capabilities.fault_codes` 时，故障显示用一句话说明 `observation.fault.code`，并给出清除前要检查的内容（例如 `BUS_LOSS`：检查电机线缆和电源）。
 - **碰撞保护**（仅在 `capabilities.collision_guard` 为 true 时显示）：`observation.collision.active` 期间，顶部红色横幅显示受阻关节、残余力矩和自动恢复倒计时，不能关闭；保护期间状态显示「碰撞保护中」，点动、摇杆、预设、回零、夹爪和点位「前往」被锁定，急停和使能开关仍可用；碰撞保护关闭时灵敏度按钮不可点；升级为 `COLLISION` 故障后显示清除故障按钮。设置抽屉（顶栏齿轮）可开关碰撞保护并选择灵敏度（低 / 中 / 高）；阈值尚未在机械臂上标定。专家模式显示 J1–J6 残余力矩条（低于阈值 50 % 为绿色，50–100 % 为黄色，触发时为红色）。
@@ -350,8 +364,9 @@ curl -X POST http://192.168.42.1:8765/api/v1/dataset/record/save      # 或 .../
 
 ```text
 armd [OPTIONS]
-    --follower <MODEL>       rebot-dm, rebot-rs, so-arm101, fashionstar, star-arm102, mock（默认）
-    --follower-port <PORT>   CAN 接口（默认 can0）或串口设备（默认 /dev/ttyUSB0）
+    --follower <MODEL>       rebot-dm, rebot-rs, so-arm101, fashionstar, star-arm102, sim, mock（默认）
+    --follower-port <PORT>   CAN 接口（默认 can0）、串口设备（默认 /dev/ttyUSB0），
+                             或 sim 的 udp://HOST:PORT（默认 udp://127.0.0.1:47600）
     --config <JSON>          ArmConfig profile（关节数必须与 follower 一致）
     --port <PORT>            HTTP / WebSocket 端口（默认 8765，或 $PORT）
     --log-dir <DIR>          滚动日志 armd.log，1 MiB x 3 个文件（/userdata 存在时默认
