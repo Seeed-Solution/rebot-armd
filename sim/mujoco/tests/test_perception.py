@@ -117,3 +117,16 @@ def test_simulator_timeout_is_a_server_error(api):
     fake.sim_state = stuck
     code, body = http(base + "/sim/state")
     assert code == 504 and "simulator" in body["error"]
+
+
+def test_subscription_fps_follows_the_current_cap(api):
+    _, _, base = api
+    assert http(base + "/api/mode", {"fps": 5})[0] == 200
+    code, sub = http(base + "/api/subscribe", {"client": "t", "pipelines": ["yolo"], "fps": 10})
+    assert code == 200 and sub["fps"] == 5 and sub["requested_fps"] == 10 and sub["continuous"]["fps"] == 5
+    assert http(base + "/api/mode", {"fps": 15})[0] == 200
+    code, subs = http(base + "/api/subscriptions")
+    assert subs["subscriptions"][0]["fps"] == 10 and subs["continuous"]["fps"] == 10
+    assert http(base + "/api/mode", {"fps": 3})[0] == 200
+    code, subs = http(base + "/api/subscriptions")
+    assert subs["subscriptions"][0]["fps"] == 3 and subs["continuous"]["fps"] == 3

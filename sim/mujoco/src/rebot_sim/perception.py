@@ -147,13 +147,17 @@ class Perception:
         fps = self.max_fps if pipes else 0
         for s in self.subs.values():
             pipes |= set(s["pipelines"])
-            fps = max(fps, s["fps"])
+            fps = max(fps, self.sub_fps(s))
         active = bool(pipes)
         return {"active": active, "pipelines": [p for p in PIPELINES if p in pipes],
                 "fps": min(fps, self.max_fps) if active else 0, "subscriptions": len(self.subs)}
 
+    def sub_fps(self, s: dict) -> int:
+        """Effective rate of a subscription: its requested rate under the current cap."""
+        return min(s["requested_fps"], self.max_fps)
+
     def sub_body(self, s: dict) -> dict:
-        return {"id": s["id"], "client": s["client"], "pipelines": s["pipelines"], "fps": s["fps"],
+        return {"id": s["id"], "client": s["client"], "pipelines": s["pipelines"], "fps": self.sub_fps(s),
                 "requested_fps": s["requested_fps"], "ttl_ms": s["ttl_ms"],
                 "expires_in_ms": max(0, int((s["expires"] - time.monotonic()) * 1000))}
 
@@ -423,7 +427,7 @@ class PerceptionServer:
                     return 503, {"api_version": API_VERSION, "error": "too many subscriptions"}
                 s = {"id": f"s{next(p._ids)}"}
                 p.subs[s["id"]] = s
-            s.update(client=client, pipelines=pipes, fps=min(fps, p.max_fps), requested_fps=fps, ttl_ms=ttl,
+            s.update(client=client, pipelines=pipes, requested_fps=fps, ttl_ms=ttl,
                      expires=time.monotonic() + ttl / 1000)
             return 200, {"api_version": API_VERSION, **p.sub_body(s), "continuous": p.continuous()}
 
