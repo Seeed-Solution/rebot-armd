@@ -129,14 +129,37 @@ pub fn blackbox_body(state: &DiagnosticsState, seconds: u64, prev: bool) -> Stri
     let Some(dir) = &state.blackbox_dir else {
         return body(head(false, false), "records", &[]);
     };
-    let stamped: Vec<(Stamp, String)> = json_lines(&dir.join(blackbox::BB_FILE), blackbox::BB_KEEP)
-        .into_iter()
-        .filter_map(|l| serde_json::from_str::<Stamp>(&l).ok().map(|s| (s, l)))
-        .filter(|(s, _)| s.boot == target)
-        .collect();
-    let last = stamped.last().map(|(s, _)| s.t_ms).unwrap_or(0);
-    let from = last.saturating_sub(seconds.saturating_mul(1000));
-    let mut lines: Vec<String> = stamped.into_iter().filter(|(s, _)| s.t_ms >= from).map(|(_, l)| l).collect();
+    // Newest file first, each read backwards, stopping at the start of the window, at an
+    // older start, or once more than a response's worth is collected, so a short window
+    // reads about one file.
+    let mut chunks: Vec<Vec<String>> = Vec::new();
+    let mut last: Option<u64> = None;
+    let mut bytes = 0usize;
+    for p in files_oldest_first(&dir.join(blackbox::BB_FILE), blackbox::BB_KEEP).iter().rev() {
+        let Ok(text) = std::fs::read_to_string(p) else { continue };
+        let mut kept = Vec::new();
+        let mut done = false;
+        for l in text.lines().rev() {
+            // A line cut by a power loss does not parse and is skipped.
+            let Some(s) = l.starts_with('{').then(|| serde_json::from_str::<Stamp>(l).ok()).flatten() else { continue };
+            if s.boot > target {
+                continue;
+            }
+            let from = last.get_or_insert(s.t_ms).saturating_sub(seconds.saturating_mul(1000));
+            if s.boot < target || s.t_ms < from || bytes > MAX_RESPONSE_BYTES {
+                done = true;
+                break;
+            }
+            bytes += l.len() + 1;
+            kept.push(l.to_string());
+        }
+        kept.reverse();
+        chunks.push(kept);
+        if done {
+            break;
+        }
+    }
+    let mut lines: Vec<String> = chunks.into_iter().rev().flatten().collect();
     let truncated = cap_newest(&mut lines);
     body(head(true, truncated), "records", &lines)
 }
@@ -182,6 +205,25 @@ mod tests {
         let off: serde_json::Value = serde_json::from_str(&blackbox_body(&DiagnosticsState::default(), 10, false)).unwrap();
         assert_eq!(off["enabled"], false);
         assert!(off["records"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn blackbox_window_spans_rotated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let bb = dir.path().join(blackbox::BB_FILE);
+        let lines = |boot: u64, ts: std::ops::Range<u64>| ts.map(|t| format!("{{\"boot\":{boot},\"t_ms\":{}}}\n", t * 1000)).collect::<String>();
+        std::fs::write(RotatingFile::numbered(&bb, 3), lines(6, 0..10)).unwrap();
+        std::fs::write(RotatingFile::numbered(&bb, 2), lines(7, 0..10)).unwrap();
+        std::fs::write(RotatingFile::numbered(&bb, 1), lines(7, 10..20)).unwrap();
+        std::fs::write(&bb, lines(7, 20..30)).unwrap();
+        let state = DiagnosticsState { blackbox_dir: Some(dir.path().to_path_buf()), boot: 7 };
+        let t = |secs, prev| -> Vec<u64> {
+            let v: serde_json::Value = serde_json::from_str(&blackbox_body(&state, secs, prev)).unwrap();
+            v["records"].as_array().unwrap().iter().map(|r| r["t_ms"].as_u64().unwrap() / 1000).collect()
+        };
+        assert_eq!(t(12, false), (17..30).collect::<Vec<_>>(), "window crosses into bb.jsonl.1");
+        assert_eq!(t(3600, false), (0..30).collect::<Vec<_>>(), "whole start, stops at the older start");
+        assert_eq!(t(2, true), vec![7, 8, 9], "previous start behind two files of this one");
     }
 
     #[test]
