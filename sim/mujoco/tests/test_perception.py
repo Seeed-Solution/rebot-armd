@@ -351,17 +351,85 @@ def test_segmentation_decode_rejects_out_of_range_ids_and_matches_mujoco():
         st.close()
 
 
-def test_a_bad_segmentation_frame_is_skipped_and_ten_in_a_row_fail_the_camera():
+def _segmentation_startup(frames: int) -> dict:
+    """One camera start-up (run in a fresh process): setup, then `frames` segmentations of
+    different arm poses against mujoco's own segmentation render of the same scene."""
     rig, st = _rig()
     try:
         rig.setup()
+        ref = mujoco.Renderer(rig.model, 360, 640)
+        ref.enable_segmentation_rendering()
+        rng = np.random.default_rng(os.getpid())
+        out = {"frames": 0, "mismatched": 0, "errors": [], "visible": 0}
+        for i in range(frames):
+            q = np.array([0.46, -0.63, -1.05, 1.48, 0.43, -0.66]) + (rng.normal(0, 0.05, 6) if i else 0)
+            set_arm(rig.model, rig.data, q)
+            r = rig.seg_renderer
+            r.update_scene(rig.data, camera="wrist", scene_option=rig.opt)
+            try:
+                ours = cam.render_segmentation(r)
+            except cam.SegmentationError as exc:
+                out["errors"].append(str(exc))
+                continue
+            ref.update_scene(rig.data, camera="wrist", scene_option=rig.opt)
+            out["frames"] += 1
+            out["mismatched"] += int(not (ours == cam.segmentation_ids(ref.render())).all())
+            out["visible"] += int((ours >= 0).any())
+        ref.close()
+        return out
+    finally:
+        st.close()
+
+
+@pytest.mark.slow
+def test_segmentation_over_many_camera_startups_matches_mujoco():
+    """20 start-ups in fresh processes, 10 frames each: no failed segmentation, every frame equal
+    to mujoco's segmentation (the canary row is outside the read-back image)."""
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(1, maxtasksperchild=1) as pool:
+        runs = [pool.apply(_segmentation_startup, (10,)) for _ in range(20)]
+    assert [r["errors"] for r in runs] == [[]] * 20
+    assert sum(r["frames"] for r in runs) == 200 and sum(r["mismatched"] for r in runs) == 0
+    assert all(r["visible"] == 10 for r in runs)
+
+
+def _drop_gpu_commands(monkeypatch, on: bool) -> None:
+    """Stand-in for the GPU driver out of memory: the frame's draw calls do nothing, so the
+    readback is the previous frame's buffer (all valid ids, with the previous canary)."""
+    for name, f in _GL_DRAW.items():
+        monkeypatch.setattr(mujoco, name, (lambda *a: None) if on else f)
+
+
+_GL_DRAW = {name: getattr(mujoco, name) for name in ("mjr_render", "mjr_rectangle")}
+
+
+def test_a_dropped_segmentation_render_is_detected_by_its_canary(monkeypatch):
+    rig, st = _rig()
+    try:
+        rig.setup()
+        set_arm(rig.model, rig.data, [0.46, -0.63, -1.05, 1.48, 0.43, -0.66])  # cube in view
         r = rig.seg_renderer
-        good = r.render
-        r.render = lambda: np.full((360, 640, 3), 255, np.uint8)  # every pixel out of range
+        r.update_scene(rig.data, camera="wrist", scene_option=rig.opt)
+        before = cam.render_segmentation(r)
+        _drop_gpu_commands(monkeypatch, True)
+        with pytest.raises(cam.SegmentationError, match="not executed") as e:
+            cam.render_segmentation(r)  # the stale buffer holds only valid ids: the bounds check alone passes it
+        assert e.value.diag["canary_read"] != e.value.diag["canary_expected"]
+        _drop_gpu_commands(monkeypatch, False)
+        assert (cam.render_segmentation(r) == before).all()
+    finally:
+        st.close()
+
+
+def test_a_bad_segmentation_frame_is_skipped_and_ten_in_a_row_fail_the_camera(monkeypatch):
+    rig, st = _rig()
+    try:
+        rig.setup()
+        _drop_gpu_commands(monkeypatch, True)
         assert rig.detect() is None and rig.seg_failures == 1
-        r.render = good
+        _drop_gpu_commands(monkeypatch, False)
         assert rig.detect() is not None and rig.seg_failures == 1 and rig.seg_consecutive == 0
-        r.render = lambda: np.full((360, 640, 3), 255, np.uint8)
+        _drop_gpu_commands(monkeypatch, True)
         for _ in range(9):
             assert rig.detect() is None
         with pytest.raises(RuntimeError, match="10 consecutive"):

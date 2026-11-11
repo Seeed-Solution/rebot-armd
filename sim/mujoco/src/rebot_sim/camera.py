@@ -13,6 +13,7 @@ calibration target). Pixels are square: fx = fy = (H / 2) / tan(VFOV / 2), 824 p
 """
 from __future__ import annotations
 
+import itertools
 import json
 import math
 from dataclasses import dataclass
@@ -156,15 +157,43 @@ def decode_segmentation(rgb: np.ndarray, scene: mujoco.MjvScene) -> np.ndarray:
     return lut[seg]
 
 
+_canary_frames = itertools.count(1)
+
+
 def render_segmentation(renderer: mujoco.Renderer) -> np.ndarray:
     """Segmentation (geom id per pixel) of the renderer's current scene: an ID-colour render
-    read back as RGB and decoded with bounds checks (decode_segmentation)."""
+    read back as RGB and decoded with bounds checks (decode_segmentation).
+
+    When the GPU driver runs out of memory (NVRM NV_ERR_NO_MEMORY in the kernel log, seen on
+    the GB10 when other processes hold most of the unified memory), it drops rendering commands
+    without a GL or EGL error, and the readback holds stale or uninitialised memory. To detect
+    that, a canary pixel with a colour that changes every frame and is no segmentation id is
+    drawn after the scene, in the offscreen buffer row just above the read-back image, and read
+    back separately: a missing canary raises SegmentationError. Needs an offscreen buffer
+    taller than the renderer (model.vis.global_.offheight > height)."""
+    con, rect = renderer._mjr_context, renderer._rect  # mujoco 4.0.0 Renderer internals
+    if con.offHeight <= renderer.height:
+        raise ValueError(f"offscreen buffer height {con.offHeight} leaves no canary row above {renderer.height}")
+    canary = (0xFE, next(_canary_frames) % 256, 0xFE)  # value 0xFExxFE: above any geom count
+    canary_rect = mujoco.MjrRect(0, renderer.height, 1, 1)
     flags = renderer.scene.flags
     flags[mujoco.mjtRndFlag.mjRND_SEGMENT] = flags[mujoco.mjtRndFlag.mjRND_IDCOLOR] = True
     try:
-        rgb = renderer.render()
+        if renderer._gl_context:
+            renderer._gl_context.make_current()
+        mujoco.mjr_render(rect, renderer.scene, con)
+        mujoco.mjr_rectangle(canary_rect, *(c / 255 for c in canary), 1.0)
+        rgb = np.empty((renderer.height, renderer.width, 3), np.uint8)
+        mujoco.mjr_readPixels(rgb, None, rect, con)
+        seen = np.empty((1, 1, 3), np.uint8)
+        mujoco.mjr_readPixels(seen, None, canary_rect, con)
     finally:
         flags[mujoco.mjtRndFlag.mjRND_SEGMENT] = flags[mujoco.mjtRndFlag.mjRND_IDCOLOR] = False
+    if tuple(int(c) for c in seen[0, 0]) != canary:
+        diag = {"canary_expected": list(canary), "canary_read": seen[0, 0].tolist()}
+        raise SegmentationError(f"segmentation render not executed (GPU out of memory?): {diag}", diag)
+    if renderer._gl_context:  # EGL / OSMesa / GLFW read back bottom-up
+        rgb = np.flipud(rgb)
     return decode_segmentation(rgb, renderer.scene)
 
 

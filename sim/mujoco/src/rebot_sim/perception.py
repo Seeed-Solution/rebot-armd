@@ -616,9 +616,10 @@ class CameraRig:
 
         w, h = self.size
         self.model.vis.global_.offwidth = max(self.model.vis.global_.offwidth, w)
-        self.model.vis.global_.offheight = max(self.model.vis.global_.offheight, h)
+        # + 1: render_segmentation's canary row above the detection image
+        self.model.vis.global_.offheight = max(self.model.vis.global_.offheight, h, self._cam.DETECTION_SIZE[1] + 1)
         self.renderer = mujoco.Renderer(self.model, h, w)
-        # plain renderer: render_segmentation sets the ID-colour flags and decodes with bounds checks
+        # plain renderer: render_segmentation sets the ID-colour flags, checks a canary pixel and decodes with bounds checks
         self.seg_renderer = mujoco.Renderer(self.model, self._cam.DETECTION_SIZE[1], self._cam.DETECTION_SIZE[0])
         self.opt = mujoco.MjvOption()
         self.opt.sitegroup[:] = 0
