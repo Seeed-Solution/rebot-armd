@@ -440,12 +440,15 @@ printf 'rebot-app:x:997:997:rebot user programs:/userdata/rebot-apps:/bin/false\
 run_tool REBOT_APP_METHOD=native PATH="$UT/bin:$PATH"; r=$?
 check "app-user (native): addgroup called with -g <passwd gid> -S" grep -qx 'addgroup -g 997 -S rebot-app' "$UT/calls"
 check "app-user (native): group has the passwd gid, account complete" sh -c "[ $r -eq 0 ] && grep -qx 'rebot-app:x:997:' '$UT/group' && [ \$(grep -c '^rebot-app:' '$UT/group') -eq 1 ] && grep -q '^rebot-app:!:' '$UT/shadow'"
-# ... and an addgroup that ignores -g (other gid) is caught by the final check
+# ... and an addgroup that ignores -g (other gid) is caught right after addgroup: the group
+# it created stays, nothing else is written (no adduser call, no shadow entry)
 sed -i 's/gid=\$2; shift/shift/' "$UT/bin/addgroup"
 base_files; rm -f "$UT/calls"
 printf 'rebot-app:x:997:997:rebot user programs:/userdata/rebot-apps:/bin/false\n' >> "$UT/passwd"
+cp "$UT/passwd" "$UT/passwd.1"; cp "$UT/shadow" "$UT/shadow.1"
 run_tool REBOT_APP_METHOD=native PATH="$UT/bin:$PATH" 2>/dev/null; r=$?
 check "app-user (native): group created with another gid is refused (exit 4)" [ "$r" -eq 4 ]
+check "app-user (native): after the refusal only the tool's group was added" sh -c "grep -qx 'rebot-app:x:994:' '$UT/group' && [ \$(grep -c '^rebot-app:' '$UT/group') -eq 1 ] && cmp -s '$UT/passwd' '$UT/passwd.1' && cmp -s '$UT/shadow' '$UT/shadow.1' && ! grep -q '^adduser' '$UT/calls'"
 # a fresh account via the native method: addgroup without -g, adduser -G
 base_files; rm -f "$UT/calls"
 run_tool REBOT_APP_METHOD=native PATH="$UT/bin:$PATH"; r=$?

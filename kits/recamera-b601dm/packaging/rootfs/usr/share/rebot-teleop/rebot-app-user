@@ -18,9 +18,12 @@
 #   locked one.
 # - Refused (exit 3, nothing written): an existing account with uid 0, primary gid 0 or the
 #   gid of root / wheel / sudo / adm, or listed as a member of one of those groups.
-# - Refused (exit 4, nothing written): the passwd entry names gid N while the group
-#   $REBOT_APP_USER exists with another gid, or a missing group would get a gid N that
-#   another group already has (checked again after addgroup).
+# - Refused (exit 4): the passwd entry names gid N while the group $REBOT_APP_USER exists
+#   with another gid, or a missing group would get a gid N that another group already has.
+#   For such a mismatch found before any change nothing is written. The check runs again
+#   right after addgroup, before any other account write: when addgroup created the group
+#   with another gid, that group stays in the group file (remove or fix it by hand) and
+#   nothing else is written.
 # - Files, for tests: REBOT_APP_PASSWD, REBOT_APP_GROUP, REBOT_APP_SHADOW (setting any of them
 #   selects the append method; the shadow file is only written when it exists);
 #   REBOT_APP_METHOD=native uses addgroup/adduser from PATH with them anyway.
@@ -137,6 +140,7 @@ if [ "$native" -eq 1 ] && command -v adduser >/dev/null 2>&1 && command -v addgr
         else
             addgroup -S "$APP_USER" 2>/dev/null
         fi
+        check_gid  # a group created with another gid: stop before adduser / shadow writes
     fi
     has_entry "$APP_USER" "$PASSWD" || adduser -S -D -H -h "$APPS_DIR" -s "$SHELL_PATH" -G "$APP_USER" "$APP_USER" 2>/dev/null
 fi
