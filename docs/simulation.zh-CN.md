@@ -120,7 +120,7 @@ ARMD_DETECTOR_URL=http://127.0.0.1:8090 cargo run --bin armd -- --follower sim \
 - **安装**：沿用 armd 约定（`kinematics::cam_mount`，OpenCV 相机坐标轴）：R_end_cam = [x0 y0 z0] · Rz(`rot_deg`) · Rx(`tilt_deg`)，z0 = end_link x（工具轴），y0 = q6 = π/2 时 J5 轴在 end_link 中的方向。数值取 profile 的 `camera_mount`（套件 profile：v5，`rot_deg` 0，`tilt_deg` 0），可用 `--camera-rot-deg` / `--camera-tilt-deg` 覆盖（armd 符号：负值使光轴朝夹爪倾斜）。镜头中心为 `camera_mount.offset_m`；套件 profile 中为 null（未测量），此时仿真器使用 v8 支架假定的镜头中心 end_link (−0.0731, 0.0005, 0.0660) m（reBot-DevArm `hardware/camera-mounts/recamera-mounts/v8/README.txt` 第 4 节）。
 - **光学**：针孔模型，方形像素，无畸变。VFOV 24.65°，HFOV 42.46°（OV5647 1080p 窗口 2.688 × 1.512 mm，f 3.46 mm；由 v8 README 推导，未用标定板测量）；640x360 下 fx = fy = 824 px。
 - **与 v8 分析对照**：v8 支架（`--camera-rot-deg 90 --camera-tilt-deg -38`）、home 位姿、加载上游网格（`REBOT_DEVARM_DIR`）：闭合夹爪尖位于 1280x720 的像素 (648.5, 477.5)，夹爪占画面 10.8 %，最高行 472；v8 README 为 (648, 477)、10.8 %、472 行。不加载网格时夹爪显示为碰撞方盒（比收窄的指尖厚：占 22.5 %，最高行 337）；加载网格时方盒移到 geom 组 3，相机不渲染该组。
-- **渲染**：MuJoCo `Renderer` 离屏渲染，运行在独立的相机进程中（由 `rebot-sim` 启动，同时运行视频流和 HTTP 服务）。`rebot_sim/__init__.py` 找到 libEGL 时设 `MUJOCO_GL=egl`，否则找到 libOSMesa 时设 `osmesa`；显式设置的 `MUJOCO_GL` 优先。物理循环每步把 qpos / qvel / 时间写入共享内存（seqlock）；相机进程每帧复制到自己的 MjData，并通过管道把 `/sim/reset`、`/sim/state` 交给物理循环处理（每 10 步即 20 ms 轮询一次）。相机只在物理步数比上一帧前进时渲染新帧；结果带该帧的 `physics_time` 和 `physics_step`。相机进程在渲染器和编码器创建完成后才报告就绪；相机进程退出时仿真器结束物理循环，仿真器进程退出后相机进程随之退出。嵌入使用时 `Simulator.close()` 停止相机进程并释放管道、套接字和共享内存。
+- **渲染**：MuJoCo `Renderer` 离屏渲染，运行在独立的相机进程中（由 `rebot-sim` 启动，同时运行视频流和 HTTP 服务）。`rebot_sim/__init__.py` 找到 libEGL 时设 `MUJOCO_GL=egl`，否则找到 libOSMesa 时设 `osmesa`；显式设置的 `MUJOCO_GL` 优先。物理循环每步把 qpos / qvel / 时间写入共享内存，写入时持有一个多进程锁，相机进程复制时也持有该锁；相机进程每帧复制到自己的 MjData，并通过管道把 `/sim/reset`、`/sim/state` 交给物理循环处理（每 10 步即 20 ms 轮询一次）。相机只在物理步数比上一帧前进时渲染新帧；结果带该帧的 `physics_time` 和 `physics_step`。相机进程在渲染器和编码器创建完成、且一次 RGB 渲染和一次分割渲染成功后才报告就绪。分割以 ID 颜色渲染，解码时做范围检查（超过场景 geom 数的值被拒绝）。分割失败的帧记录日志（帧号、取值、ngeom、nbody）并计数；该帧视频照常发送，但不产生感知结果，下一帧重试；连续 10 次失败时相机进程退出。间歇性越界读回（mujoco 4.0.0、EGL，出现在相机进程的最初几帧）的原因尚不清楚。相机进程退出或其管道关闭时，仿真器结束物理循环，`rebot-sim` 以退出码 1 退出；仿真器进程退出后相机进程随之退出。嵌入使用时 `Simulator.close()` 停止相机进程并释放管道、套接字和共享内存。
 - 相机画面中隐藏 tcp 标记点。
 
 ### 视频流（`ws://<host>:8001/`）
@@ -135,7 +135,7 @@ rebot-vision 感知接口版本 2（[detection_api.md](detection_api.md)）：`G
 
 - `--objects`：`cube`（4 cm、30 g，即原场景方块）、`cup`（圆柱 ⌀ 5 cm × 7 cm、50 g）、`block`（6 × 3 × 4 cm、40 g）中 1..3 个；同类重复时命名为 `cube_2` 等。不带 `--seed` 时第一个物体位于 (0.30, 0) m，其余位于 (0.24, ±0.12) m。带种子时位置在 x 0.22..0.36 m、y −0.14..0.14 m 内抽取，偏航 ±90°，中心间距至少 9 cm（`numpy.random.default_rng(seed)`；同一种子得到同一布局）。
 - `POST /sim/reset {"seed": N|null}`：在下一个物理步按种子（非负整数，否则 400）摆放物体（静止），不移动机械臂。返回状态。物理循环 3 秒内未应答时 `/sim` 路由返回 504。
-- `GET /sim/state`：时间、种子、关节位置、TCP（end_link 原点），以及每个物体的 `pos`、`quat`、`lifted_m`（高出静止高度的距离）、`contacts`（`jaws`：左 / 右夹指接触；`table`）和 `grasped`（两侧夹指接触且抬起超过 2 cm）。`camera`：最新帧的 `frame_id`、`physics_time`、`physics_step`，落后物理的 `lag_s`，无新物理状态而跳过的相机周期数 `skipped`，以及 `stale`（落后超过两个相机周期）。
+- `GET /sim/state`：时间、种子、关节位置、TCP（end_link 原点），以及每个物体的 `pos`、`quat`、`lifted_m`（高出静止高度的距离）、`contacts`（`jaws`：左 / 右夹指接触；`table`）和 `grasped`（两侧夹指接触且抬起超过 2 cm）。`camera`：最新帧的 `frame_id`、`physics_time`、`physics_step`，落后物理的 `lag_s`，无新物理状态而跳过的相机周期数 `skipped`，`stale`（落后超过两个相机周期），`seg_failures`（分割渲染失败次数）和 `seg_last_error`。
 - `GET /sim/camera`：当前安装参数、视场角、640x360 下的 fx、`grip_pixel_norm_at`（工具竖直朝下时夹爪尖正下方桌面点在画面中的位置，按若干接近高度给出，即 armd `grasp.grip_pixel_norm` 应取的值）、渲染后端和每帧耗时。
 
 ### 仿真中的点框抓取
