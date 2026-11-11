@@ -373,3 +373,74 @@ async fn enabling_without_torque_feedback_is_refused_and_lease_is_required() {
     let state = reqwest::get(format!("http://{addr}/api/v1/safety/collision")).await.unwrap().json::<serde_json::Value>().await.unwrap();
     assert_eq!((state["available"].as_bool(), state["enabled"].as_bool()), (Some(false), Some(false)));
 }
+
+/// A trip during a macro sub-motion ends the macro with COLLISION; its orchestrator can
+/// install nothing more (here: a grasp's next gripper close).
+#[test]
+fn trip_during_a_grasp_sub_motion_ends_the_macro_with_collision() {
+    let (mut inner, arm) = rig(Some(policy()));
+    let input = inner.plan_input().unwrap();
+    let p0 = kinematics::fk(&kinematics::q6(&INSPECT)).p;
+    let goal = resolve_goal(&input, &GoalSpec::Absolute { p: [p0[0] + 0.06, p0[1], p0[2]], r: None });
+    let path = plan_cartesian(&input, goal, Speed { linear: 0.05, angular: 0.5 }).unwrap();
+    let id = inner.begin_macro("grasp", &input, None).unwrap();
+    inner.install_macro_path(id, &input, path).unwrap();
+    ticks(&mut inner, 10);
+    arm.set_residual(1, 9.0);
+    let obs = ticks(&mut inner, 4);
+    let a = obs.action.as_ref().unwrap();
+    assert_eq!((a.id, a.kind.as_str(), a.state.as_str(), a.code.as_deref()), (id, "grasp", "failed", Some("COLLISION")), "{a:?}");
+    assert!(inner.macro_run.is_none() && inner.active_trajectory.is_none());
+    let close = armd::motion::GripperRequest { command: armd::motion::GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: 8.0, tag: None };
+    assert!(inner.start_macro_gripper(id, close).is_err());
+}
+
+/// Full place orchestrator on the 50 Hz ticker: a trip during the approach ends it with
+/// COLLISION and no later phase runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trip_during_place_ends_it_and_no_phase_follows() {
+    let arm = TestArm::new();
+    let sup = Arc::new(ArmSupervisor::new(profile(Some(policy()))).with_driver(Box::new(arm.clone())));
+    {
+        let mut inner = sup.inner().write().await;
+        inner.lease_enabled = false;
+        inner.commanded_positions = INSPECT.to_vec();
+        inner.measured_positions = INSPECT.to_vec();
+        inner.target_positions = INSPECT.to_vec();
+        inner.set_torque(true).unwrap();
+    }
+    let ticker = sup.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(20));
+        loop { interval.tick().await; ticker.tick(DT).await; }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let p0 = kinematics::fk(&kinematics::q6(&INSPECT)).p;
+    let (id, _) = armd::place::start(&sup, &json!({"position": [p0[0] + 0.05, p0[1], p0[2] - 0.06]})).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "approach not reached");
+        let inner = sup.inner().read().await;
+        let moving = inner.active_trajectory.as_ref().is_some_and(|t| t.action_id == Some(id));
+        if inner.last_action.as_ref().unwrap().phase.as_deref() == Some("approach") && moving { break; }
+        drop(inner);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    arm.set_residual(0, 9.0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let a = loop {
+        assert!(std::time::Instant::now() < deadline, "place not ended by the trip");
+        let obs = sup.get_observation().await;
+        let a = obs.action.into_iter().chain(obs.previous_action).find(|a| a.id == id).unwrap();
+        if !a.is_running() { break a; }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_eq!((a.state.as_str(), a.code.as_deref(), a.phase.as_deref()), ("failed", Some("COLLISION"), Some("approach")), "{a:?}");
+    arm.clear();
+    let q0 = sup.inner().read().await.commanded_positions.clone();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let inner = sup.inner().read().await;
+    assert!(inner.macro_run.is_none() && inner.active_trajectory.is_none(), "no phase after the trip");
+    let moved = q0.iter().zip(&inner.commanded_positions).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(moved < 1e-3, "orchestrator issued no motion after the trip ({moved} rad)");
+}
