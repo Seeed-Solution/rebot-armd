@@ -197,6 +197,7 @@ class Simulator:
         self.shared = None  # SharedState for the camera process
         self.cam_conn = None
         self.cam_proc = None
+        self.camera_error: str | None = None  # set when the camera process died while running
         self.torque_report = torque_report
         # --torque-report mean: torques of the last physics steps and the command period in steps
         self.tau_hist: collections.deque = collections.deque(maxlen=256)
@@ -343,9 +344,16 @@ class Simulator:
         self.cam_proc = ctx.Process(target=camera_main, name="rebot-sim-camera", daemon=True,
                                     args=(cfg, self.shared.shm.name, self.model.nq, self.model.nv, child, ready_w, os.getpid()))
         self.cam_proc.start()
-        if not ready_r.poll(timeout):
-            return {"error": "camera process did not start"}
-        return ready_r.recv()
+        deadline = time.monotonic() + timeout
+        while not ready_r.poll(0.1):  # watch the child: it can die before it reports
+            if not self.cam_proc.is_alive():
+                return {"error": f"camera process exited during startup (code {self.cam_proc.exitcode})"}
+            if time.monotonic() > deadline:
+                return {"error": "camera process did not start"}
+        try:
+            return ready_r.recv()
+        except EOFError:
+            return {"error": "camera process exited during startup"}
 
     def service_camera(self) -> None:
         """Answer the camera process's /sim requests (physics thread)."""
@@ -372,6 +380,10 @@ class Simulator:
             steps += 1
             if steps % 10 == 0 and self.cam_conn is not None:
                 self.service_camera()
+            if steps % 100 == 0 and self.cam_proc is not None and not self.cam_proc.is_alive():
+                self.camera_error = f"camera process exited (code {self.cam_proc.exitcode})"
+                print(f"rebot-sim: {self.camera_error}", file=sys.stderr, flush=True)
+                return
             if steps % STATE_EVERY == 0 and self.peer is not None:
                 try:
                     self.sock.sendto(self.state_datagram(), self.peer)
@@ -496,6 +508,8 @@ def main(argv: list[str] | None = None) -> None:
         pass
     finally:
         sim.stopping = True
+    if sim.camera_error:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

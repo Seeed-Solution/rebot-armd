@@ -586,20 +586,26 @@ class CameraRig:
             "render_backend": self.backend, "render": self.stats(),
         }
 
-    def run(self, parent_pid: int) -> None:
+    def setup(self) -> None:
+        """Create the renderers and encoders (raises when no GL backend or libx264 works)."""
         import mujoco
 
         w, h = self.size
         self.model.vis.global_.offwidth = max(self.model.vis.global_.offwidth, w)
         self.model.vis.global_.offheight = max(self.model.vis.global_.offheight, h)
-        renderer = mujoco.Renderer(self.model, h, w)
-        seg_renderer = mujoco.Renderer(self.model, self._cam.DETECTION_SIZE[1], self._cam.DETECTION_SIZE[0])
-        seg_renderer.enable_segmentation_rendering()
-        opt = mujoco.MjvOption()
-        opt.sitegroup[:] = 0
+        self.renderer = mujoco.Renderer(self.model, h, w)
+        self.seg_renderer = mujoco.Renderer(self.model, self._cam.DETECTION_SIZE[1], self._cam.DETECTION_SIZE[0])
+        self.seg_renderer.enable_segmentation_rendering()
+        self.opt = mujoco.MjvOption()
+        self.opt.sitegroup[:] = 0
         if self.cfg["has_meshes"]:
-            opt.geomgroup[3] = 0  # box primitives hidden behind the upstream meshes
-        encoders = {path: self._cam.H264Encoder(w, h, self.fps) for path in self.streams}
+            self.opt.geomgroup[3] = 0  # box primitives hidden behind the upstream meshes
+        self.encoders = {path: self._cam.H264Encoder(w, h, self.fps) for path in self.streams}
+
+    def run(self, parent_pid: int) -> None:
+        import mujoco
+
+        renderer, seg_renderer, opt, encoders = self.renderer, self.seg_renderer, self.opt, self.encoders
         period = 1.0 / self.fps
         next_t = time.perf_counter()
         while os.getppid() == parent_pid:
@@ -639,13 +645,12 @@ class CameraRig:
 
 
 def camera_main(cfg: dict, shm_name: str, nq: int, nv: int, conn, ready_conn, parent_pid: int) -> None:
-    """Camera process entry: build the rig, start the servers, report readiness, render."""
+    """Camera process entry: build the rig with its renderers and encoders, start the servers,
+    then report readiness and render."""
     state = SharedState(nq, nv, shm_name)
     try:
         rig = CameraRig(cfg, state, SimLink(conn))
-        import mujoco
-
-        mujoco.Renderer(rig.model, 8, 8).close()  # fails here when no GL backend works
+        rig.setup()  # renderers and encoders before readiness is reported
         serve_video(cfg["host"], cfg["video_port"], rig.streams)
         PerceptionServer(rig.perception, rig, cfg["host"], cfg["perception_port"])
     except Exception as exc:  # no GL backend, no libx264, port in use

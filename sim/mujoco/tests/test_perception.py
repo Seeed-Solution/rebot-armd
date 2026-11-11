@@ -212,3 +212,38 @@ def test_camera_publishes_no_frame_without_new_physics():
         sim.cam_proc.terminate()
         sim.cam_proc.join(5)
         sim.sock.close()
+
+
+def test_camera_reports_ready_only_after_its_encoders_exist():
+    from rebot_sim.camera import CameraMount
+
+    s = Simulator(free_port(socket.SOCK_DGRAM), objects="cube", camera_mount=CameraMount())
+    try:  # libx264 rejects an odd frame size when the encoder opens
+        ready = s.start_camera(15, (641, 361), "127.0.0.1", free_port(), free_port(), objects="cube", timeout=30)
+        assert "error" in ready, ready
+        s.cam_proc.join(5)
+        assert not s.cam_proc.is_alive()
+    finally:
+        if s.cam_proc is not None and s.cam_proc.is_alive():
+            s.cam_proc.kill()
+        s.sock.close()
+
+
+def test_physics_loop_reports_a_dead_camera_process():
+    import time
+
+    from rebot_sim.camera import CameraMount
+
+    s = Simulator(free_port(socket.SOCK_DGRAM), objects="cube", camera_mount=CameraMount())
+    try:
+        ready = s.start_camera(15, (640, 360), "127.0.0.1", free_port(), free_port(), objects="cube")
+        if "error" in ready:
+            pytest.skip(ready["error"])
+        s.cam_proc.kill()
+        t0 = time.perf_counter()
+        s.run(duration=10)
+        assert time.perf_counter() - t0 < 5 and "camera process exited" in s.camera_error
+    finally:
+        if s.cam_proc.is_alive():
+            s.cam_proc.kill()
+        s.sock.close()
