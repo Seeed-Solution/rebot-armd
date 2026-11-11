@@ -344,6 +344,40 @@ base_files
 printf 'rebot-app:x:996:\n' >> "$UT/group"
 run_tool; r=$?
 check "app-user: missing passwd entry gets the group gid" sh -c "[ $r -eq 0 ] && grep -q '^rebot-app:x:[0-9]*:996:' '$UT/passwd' && [ \$(grep -c '^rebot-app:' '$UT/group') -eq 1 ]"
+# group gid: a group of the same name with another gid, or a gid owned by another group, is
+# refused (exit 4) and nothing is written
+for case in groupgid othergroup; do
+    base_files
+    printf 'rebot-app:x:997:997:rebot user programs:/userdata/rebot-apps:/bin/false\n' >> "$UT/passwd"
+    case $case in
+        groupgid) printf 'rebot-app:x:995:\n' >> "$UT/group" ;;
+        othergroup) printf 'video:x:997:\n' >> "$UT/group" ;;
+    esac
+    cp "$UT/passwd" "$UT/passwd.1"; cp "$UT/group" "$UT/group.1"; cp "$UT/shadow" "$UT/shadow.1"
+    out=$(run_tool 2>&1); r=$?
+    check "app-user: gid mismatch ($case) refused (exit 4), nothing written" sh -c "[ $r -eq 4 ] && cmp -s '$UT/passwd' '$UT/passwd.1' && cmp -s '$UT/group' '$UT/group.1' && cmp -s '$UT/shadow' '$UT/shadow.1'"
+    check "app-user: gid mismatch ($case) names the gids" sh -c 'printf "%s" "$1" | grep -q "has gid 997"' _ "$out"
+done
+# native method (stub addgroup/adduser in PATH): a missing group is created with the passwd gid
+mkdir -p "$UT/bin"
+printf '#!/bin/sh\necho "addgroup $*" >> "%s/calls"\ngid=994\nwhile [ $# -gt 1 ]; do case $1 in -g) gid=$2; shift ;; esac; shift; done\necho "$1:x:$gid:" >> "%s/group"\n' "$UT" "$UT" > "$UT/bin/addgroup"
+printf '#!/bin/sh\necho "adduser $*" >> "%s/calls"\nexit 1\n' "$UT" > "$UT/bin/adduser"
+chmod +x "$UT/bin/addgroup" "$UT/bin/adduser"
+base_files; rm -f "$UT/calls"
+printf 'rebot-app:x:997:997:rebot user programs:/userdata/rebot-apps:/bin/false\n' >> "$UT/passwd"
+run_tool REBOT_APP_METHOD=native PATH="$UT/bin:$PATH"; r=$?
+check "app-user (native): addgroup called with -g <passwd gid> -S" grep -qx 'addgroup -g 997 -S rebot-app' "$UT/calls"
+check "app-user (native): group has the passwd gid, account complete" sh -c "[ $r -eq 0 ] && grep -qx 'rebot-app:x:997:' '$UT/group' && [ \$(grep -c '^rebot-app:' '$UT/group') -eq 1 ] && grep -q '^rebot-app:!:' '$UT/shadow'"
+# ... and an addgroup that ignores -g (other gid) is caught by the final check
+sed -i 's/gid=\$2; shift/shift/' "$UT/bin/addgroup"
+base_files; rm -f "$UT/calls"
+printf 'rebot-app:x:997:997:rebot user programs:/userdata/rebot-apps:/bin/false\n' >> "$UT/passwd"
+run_tool REBOT_APP_METHOD=native PATH="$UT/bin:$PATH" 2>/dev/null; r=$?
+check "app-user (native): group created with another gid is refused (exit 4)" [ "$r" -eq 4 ]
+# a fresh account via the native method: addgroup without -g, adduser -G
+base_files; rm -f "$UT/calls"
+run_tool REBOT_APP_METHOD=native PATH="$UT/bin:$PATH"; r=$?
+check "app-user (native): fresh account, addgroup -S without -g" sh -c "[ $r -eq 0 ] && grep -qx 'addgroup -S rebot-app' '$UT/calls' && grep -q '^adduser -S -D -H .* -G rebot-app rebot-app' '$UT/calls' && grep -q '^rebot-app:x:[0-9]*:994:' '$UT/passwd'"
 # an existing privileged account is refused and left as it is
 for case in uid0 gid0 wheelgid wheelmember; do
     base_files

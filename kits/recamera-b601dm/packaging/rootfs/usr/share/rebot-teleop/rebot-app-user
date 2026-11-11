@@ -12,13 +12,18 @@
 #   /run/rebot-app-user.lock, /var/run without /run) when flock exists, else with the directory $REBOT_APP_LOCK.d
 #   (mkdir is atomic; /run is cleared at boot, so a lock left by a killed run goes away with a
 #   reboot or is removed by hand). Waits at most $REBOT_APP_LOCK_WAIT s (default 30), exit 1.
-# - Repair: a partial account from an interrupted run is completed: a missing group gets the
-#   gid of the passwd entry, a missing passwd entry the gid of the group, a missing shadow
-#   entry (when the shadow file exists) a locked one.
+# - Repair: a partial account from an interrupted run is completed: a missing group gets
+#   exactly the gid of the passwd entry (addgroup -g <gid> -S, else appended), a missing
+#   passwd entry the gid of the group, a missing shadow entry (when the shadow file exists) a
+#   locked one.
 # - Refused (exit 3, nothing written): an existing account with uid 0, primary gid 0 or the
 #   gid of root / wheel / sudo / adm, or listed as a member of one of those groups.
+# - Refused (exit 4, nothing written): the passwd entry names gid N while the group
+#   $REBOT_APP_USER exists with another gid, or a missing group would get a gid N that
+#   another group already has (checked again after addgroup).
 # - Files, for tests: REBOT_APP_PASSWD, REBOT_APP_GROUP, REBOT_APP_SHADOW (setting any of them
-#   selects the append method; the shadow file is only written when it exists).
+#   selects the append method; the shadow file is only written when it exists);
+#   REBOT_APP_METHOD=native uses addgroup/adduser from PATH with them anyway.
 # - Not touched: the user is never removed (prerm/postrm keep it, so files it owns keep a
 #   stable owner), and group memberships for GPIO / serial devices are a manual step.
 
@@ -94,6 +99,22 @@ check_unprivileged() {
     fi
 }
 
+# check_gid: refuse (exit 4) a passwd entry whose gid does not match the group of the same
+# name, or whose gid belongs to another group while that group is missing
+check_gid() {
+    pgid=$(field "$APP_USER" "$PASSWD" 4)
+    [ -n "$pgid" ] || return 0
+    gid=$(field "$APP_USER" "$GROUP" 3)
+    if [ -n "$gid" ]; then
+        [ "$gid" = "$pgid" ] && return 0
+        echo "rebot-app-user: user $APP_USER has gid $pgid but group $APP_USER has gid $gid; refusing (fix /etc/passwd or /etc/group by hand)" >&2; exit 4
+    fi
+    other=$([ -f "$GROUP" ] && awk -F: -v g="$pgid" '$3 == g { print $1; exit }' "$GROUP")
+    if [ -n "$other" ]; then
+        echo "rebot-app-user: user $APP_USER has gid $pgid, which is group $other; refusing (fix /etc/passwd or /etc/group by hand)" >&2; exit 4
+    fi
+}
+
 complete() {
     has_entry "$APP_USER" "$PASSWD" && has_entry "$APP_USER" "$GROUP" \
         && { [ ! -f "$SHADOW" ] || has_entry "$APP_USER" "$SHADOW"; }
@@ -101,13 +122,22 @@ complete() {
 
 lock
 check_unprivileged
+check_gid
 complete && exit 0
 
-custom=0
-[ -n "$REBOT_APP_PASSWD$REBOT_APP_GROUP$REBOT_APP_SHADOW" ] && custom=1
+native=1
+[ -n "$REBOT_APP_PASSWD$REBOT_APP_GROUP$REBOT_APP_SHADOW" ] && native=0
+[ "$REBOT_APP_METHOD" = native ] && native=1
 
-if [ "$custom" -eq 0 ] && command -v adduser >/dev/null 2>&1 && command -v addgroup >/dev/null 2>&1; then
-    has_entry "$APP_USER" "$GROUP" || addgroup -S "$APP_USER" 2>/dev/null
+if [ "$native" -eq 1 ] && command -v adduser >/dev/null 2>&1 && command -v addgroup >/dev/null 2>&1; then
+    if ! has_entry "$APP_USER" "$GROUP"; then
+        pgid=$(field "$APP_USER" "$PASSWD" 4)
+        if [ -n "$pgid" ]; then
+            addgroup -g "$pgid" -S "$APP_USER" 2>/dev/null
+        else
+            addgroup -S "$APP_USER" 2>/dev/null
+        fi
+    fi
     has_entry "$APP_USER" "$PASSWD" || adduser -S -D -H -h "$APPS_DIR" -s "$SHELL_PATH" -G "$APP_USER" "$APP_USER" 2>/dev/null
 fi
 
@@ -134,5 +164,6 @@ if [ -f "$SHADOW" ] && ! has_entry "$APP_USER" "$SHADOW"; then
     printf '%s:!:0:0:99999:7:::\n' "$APP_USER" >> "$SHADOW" || exit 1
 fi
 check_unprivileged
+check_gid
 complete || { echo "rebot-app-user: account $APP_USER still incomplete" >&2; exit 1; }
 exit 0
