@@ -21,27 +21,45 @@ _UPSTREAM_MESHES = {
     "base_link": "base_link.STL", "link1": "link1.STL", "link2": "link2.STL",
     "link3": "link3.STL", "link4": "link4.STL", "link5": "link5.STL",
     "link6": "link6.STL", "end_link": "gripper_base.stl",
+    "finger_left": "left_finger.stl", "finger_right": "right_finger.stl",
 }
+# With the upstream meshes, the box primitives of the arm move to this geom group, which the
+# camera renderer hides (the boxes are thicker than the tapered jaws; physics is unchanged).
+BOX_GROUP = 3
 
 
-def load_model(devarm_dir: str | None = None) -> mujoco.MjModel:
-    """Compile the scene; with a reBot-DevArm checkout, add its link meshes as visuals."""
+def load_model(devarm_dir: str | None = None, objects=None, camera=None) -> mujoco.MjModel:
+    """Compile the scene; with a reBot-DevArm checkout, add its link meshes as visuals.
+
+    `objects` (list of `scene.SceneObject`) replaces the XML's cube; `camera` (a
+    `camera.CameraMount`) adds the `wrist` and `scene` cameras.
+    """
     devarm_dir = devarm_dir if devarm_dir is not None else os.environ.get("REBOT_DEVARM_DIR")
-    if not devarm_dir:
+    if not devarm_dir and objects is None and camera is None:
         return mujoco.MjModel.from_xml_path(str(SCENE_XML))
-    mesh_dir = Path(devarm_dir) / "Rebot_Arm_description" / "DM" / "meshes" / "collision"
     spec = mujoco.MjSpec.from_file(str(SCENE_XML))
-    for body_name, file in _UPSTREAM_MESHES.items():
-        path = mesh_dir / file
-        if not path.exists():
-            raise FileNotFoundError(f"REBOT_DEVARM_DIR: {path} not found")
-        mesh = spec.add_mesh()
-        mesh.name, mesh.file = f"{body_name}_mesh", str(path)
-        geom = spec.body(body_name).add_geom()
-        geom.type, geom.meshname = mujoco.mjtGeom.mjGEOM_MESH, mesh.name
-        geom.contype = geom.conaffinity = 0
-        geom.group = 2
-        geom.rgba = [0.78, 0.80, 0.78, 1.0]
+    if devarm_dir:
+        mesh_dir = Path(devarm_dir) / "Rebot_Arm_description" / "DM" / "meshes" / "collision"
+        for body_name, file in _UPSTREAM_MESHES.items():
+            path = mesh_dir / file
+            if not path.exists():
+                raise FileNotFoundError(f"REBOT_DEVARM_DIR: {path} not found")
+            mesh = spec.add_mesh()
+            mesh.name, mesh.file = f"{body_name}_mesh", str(path)
+            geom = spec.body(body_name).add_geom()
+            geom.type, geom.meshname = mujoco.mjtGeom.mjGEOM_MESH, mesh.name
+            geom.contype = geom.conaffinity = 0
+            geom.group = 2
+            geom.rgba = [0.78, 0.80, 0.78, 1.0]
+        for geom in spec.geoms:
+            if geom.contype == 2 or geom.name in ("palm", "motor_housing") or geom.name.split("_")[0] in ("left", "right"):
+                geom.group = BOX_GROUP
+    if objects is not None:
+        from .scene import add_objects
+        add_objects(spec, objects)
+    if camera is not None:
+        from .camera import add_cameras, mount_rotation
+        add_cameras(spec, mount_rotation(spec.compile(), camera), camera.offset)
     return spec.compile()
 
 
