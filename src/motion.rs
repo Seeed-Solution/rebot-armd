@@ -763,6 +763,10 @@ pub struct ActionStatus {
     pub descend_contact: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub descend_contact_height_m: Option<f32>,
+    /// Grasp holding re-check after the lift: `held`, `regripped` (grip torque gone, a re-grip
+    /// stopped on the object) or `dropped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_lift: Option<String>,
 }
 
 impl ActionStatus {
