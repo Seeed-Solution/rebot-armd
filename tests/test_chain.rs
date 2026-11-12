@@ -112,17 +112,53 @@ fn dm_chain_gravity_matches_builtin() {
     assert!((chain.moving_mass() - total).abs() < 1e-12);
 }
 
+/// The DM URDF chain with the B601-DM motor -> URDF offsets (`chain.joints[].offset_rad`).
+fn dm_motor_chain() -> KinematicChain {
+    let mut spec = dm_spec();
+    for (j, off) in spec.joints.iter_mut().zip(kinematics::B601DM_MODEL_OFFSETS_RAD) { j.offset_rad = off; }
+    KinematicChain::from_urdf_str(include_str!("../assets/reBot-DevArm_gripper.urdf"), &spec).unwrap()
+}
+
 #[test]
 fn dm_chain_shoulder_and_camera_match_builtin() {
-    let model = ArmModel::Chain(dm_chain().into());
+    // the camera mount is taken at the J6 rest angle in armd (motor) angles, so the chain needs
+    // the same offsets as the built-in model
+    let model = ArmModel::Chain(dm_motor_chain().into());
     let s = model.shoulder_rz();
     // SHOULDER_RZ is the rounded URDF value (0.020084 - 0.00008416 = 0.01999984 m).
     assert!((s[0] - kinematics::SHOULDER_RZ[0]).abs() < 1e-6 && (s[1] - kinematics::SHOULDER_RZ[1]).abs() < 1e-9, "{s:?}");
     for (flip, rot, tilt) in [(false, 0.0, 0.0), (true, 30.0, -10.0)] {
         let a = kinematics::cam_mount(flip, rot, tilt);
         let b = model.cam_mount(flip, rot, tilt);
+        let c = ArmModel::REBOT_DEV_ARM.cam_mount(flip, rot, tilt);
         let d = a.iter().flatten().zip(b.iter().flatten()).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
-        assert!(d < 1e-9, "{d:e}");
+        let e = a.iter().flatten().zip(c.iter().flatten()).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+        assert!(d < 1e-9 && e < 1e-15, "{d:e} {e:e}");
+    }
+}
+
+/// The built-in model in armd (motor) angles equals the DM URDF chain with the same offsets:
+/// FK, IK (motor angles out), gravity, joint map.
+#[test]
+fn builtin_motor_angles_match_the_offset_chain() {
+    let chain = ArmModel::Chain(dm_motor_chain().into());
+    let builtin = ArmModel::REBOT_DEV_ARM;
+    assert_eq!(chain.joint_map(), builtin.joint_map());
+    assert_eq!(builtin.joint_map()[5].offset_rad, -std::f64::consts::FRAC_PI_2);
+    let mut rng = Lcg(11);
+    let lo = [-3.1, -2.05, -2.6, -3.1, -2.05, -6.2];
+    let hi = [3.1, 2.05, 2.6, 3.1, 2.05, 6.2];
+    for _ in 0..300 {
+        let q: [f64; 6] = std::array::from_fn(|_| (rng.next() * 2.0 - 1.0) * 2.0);
+        let (a, b) = (builtin.fk(&q), chain.fk(&q));
+        assert!(kinematics::norm(&kinematics::sub(&a.p, &b.p)) < FK_TOL_M && kinematics::angle_between(&a.r, &b.r) < ROT_TOL, "{q:?}");
+        let q32 = q.map(|v| v as f32);
+        let (ga, gb) = (builtin.gravity_torques(&q32).unwrap(), chain.gravity_torques(&q32).unwrap());
+        for i in 0..6 { assert!((ga[i] - gb[i]).abs() < 4e-6, "{q:?} J{}: {} vs {}", i + 1, ga[i], gb[i]); }
+        let q0: [f64; 6] = std::array::from_fn(|i| q[i] + 0.05 * (rng.next() - 0.5));
+        let (ia, ib) = (builtin.solve_dls(&a, &q0, &lo, &hi, kinematics::PAR.w), chain.solve_dls(&a, &q0, &lo, &hi, kinematics::PAR.w));
+        assert_eq!(ia.ok, ib.ok, "{q:?}");
+        for i in 0..6 { assert!((ia.q[i] - ib.q[i]).abs() < 1e-7, "{q:?}: {:?} vs {:?}", ia.q, ib.q); }
     }
 }
 

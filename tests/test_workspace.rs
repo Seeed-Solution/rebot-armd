@@ -1,7 +1,8 @@
 //! Server-side Cartesian safety box (spec 1b).
 mod common;
 
-use armd::kinematics::{self, workspace_violation};
+use armd::chain::ArmModel;
+use armd::kinematics::{self, Violation};
 use armd::model::{ArmConfig, ObservationSchema, WorkspacePolicy};
 use armd::safety::SafetyError;
 use armd::{ArmError, SupervisorInner};
@@ -9,8 +10,14 @@ use armd::{ArmError, SupervisorInner};
 const HOME: [f32; 7] = [0.0, 0.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
 const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
 // Both ends are above the floor; the joint-space midpoint puts a gripper corner ~27 mm below it.
-const DIP_A: [f32; 7] = [0.0, -1.871, -0.64, 1.817, 0.464, std::f32::consts::FRAC_PI_2, 0.0];
-const DIP_B: [f32; 7] = [0.0, -1.856, -1.434, 0.482, -0.61, std::f32::consts::FRAC_PI_2, 0.0];
+// J6 motor = pi (URDF J6 = pi/2): the jaw axis is in the plane where the 92.5 mm corners dip.
+const DIP_A: [f32; 7] = [0.0, -1.871, -0.64, 1.817, 0.464, std::f32::consts::PI, 0.0];
+const DIP_B: [f32; 7] = [0.0, -1.856, -1.434, 0.482, -0.61, std::f32::consts::PI, 0.0];
+
+/// Workspace excess at motor angles `q` (the profile's arm model).
+fn workspace_violation(q: &[f32], ws: &WorkspacePolicy, cam: &armd::model::CameraMount) -> Violation {
+    ArmModel::REBOT_DEV_ARM.workspace_violation(q, ws, cam)
+}
 
 fn total(q: &[f32]) -> f64 {
     let c = ArmConfig::rebot_dm();
@@ -64,7 +71,7 @@ fn violation_function_reports_floor_box_and_reach() {
     assert!(workspace_violation(&HOME, &ws_box, cam).worst.unwrap().limit.starts_with("box_x_max"));
     // camera point is checked when configured
     let mut cam_low = cam.clone();
-    let home_pose = kinematics::fk(&kinematics::q6(&HOME));
+    let home_pose = ArmModel::REBOT_DEV_ARM.fk_f32(&HOME).unwrap();
     let down_in_end = kinematics::mat_vec(&kinematics::transpose(&home_pose.r), &[0.0, 0.0, -0.5]);
     cam_low.offset_m = Some(down_in_end.map(|v| v as f32)); // 0.5 m below end_link in the base frame
     let v = workspace_violation(&HOME, ws, &cam_low);

@@ -31,9 +31,8 @@ async fn residual_is_measured_minus_model_gravity_without_gravity_output() {
     let supervisor = ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(Driver { torque_feedback: true }));
     let obs = supervisor.tick(0.02).await;
     assert!(!obs.gravity_compensated && obs.gravity_torques.is_empty(), "gravity output stays off");
-    let mut q6 = [0.0f32; 6];
-    q6.copy_from_slice(&Q[..6]);
-    let model = armd::compute_gravity_torques(&q6).unwrap();
+    // gravity of the profile's arm model at the motor angles (B601-DM: URDF J6 = motor - pi/2)
+    let model = ArmConfig::rebot_dm().arm_model.gravity_torques(&Q[..6]).unwrap();
     let residual = obs.residual_torques.expect("residual with a gravity model and torque feedback");
     for i in 0..6 {
         assert!((residual[i] - (TAU[i] - model[i])).abs() < 1e-5, "J{}: {} vs {}", i + 1, residual[i], TAU[i] - model[i]);
