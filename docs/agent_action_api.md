@@ -34,6 +34,7 @@ The existing `/api/v1/motion/jog`, `/motion/home`, `/motion/unload` commands and
 | `/api/v1/action/place` | `{"pose":str? \| "position":[x,y,z]?, "orientation"?, "approach_height_m":0.02..0.30? (default 0.08), "release":bool? (default true), "retreat":bool? (default true), "speed_scale":0.1..1.0? (default 1.0), "tag"?}` — see [Place](#place--放置) |
 | `/api/v1/poses/save`, `/api/v1/poses/delete` | `{"name":str, "positions":[dof]?}` / `{"name":str}` (not actions: acknowledged without `action_id`) |
 | `/api/v1/workspace/keepout` | `{"boxes":[{"name":str, "min_m":[x,y,z], "max_m":[x,y,z]}]}` — see [Keep-out boxes](#keep-out-boxes--禁入盒) (not an action) |
+| `/api/v1/action/replay` | `{"episode":str, "speed":0.5\|1.0? (default 0.5), "gripper":bool? (default true), "tag"?}` — see [Replay](#replay--回放) |
 
 - Poses are the end_link pose in base_link, metres and radians (URDF `assets/reBot-DevArm_gripper.urdf`; end_link x is the tool axis). `rpy` is URDF fixed-axis R = Rz(yaw)·Ry(pitch)·Rx(roll). `orientation: null` keeps the current orientation.
 - Motor angle = URDF model angle for J1..J6 (the cockpit's `?iksign` / `?ikoff` overrides are not applied).
@@ -84,7 +85,7 @@ Every observation carries `action` (latest record) and, for 2 s after a newer ac
            "holding":null, "gripper_gap_rad":null, "settled":null}
 ```
 
-`kind`: `move_to`, `move_relative`, `gripper`, `grasp`, `place`, `joint_move`, `home`, `park`, `move_to_pose`. A `grasp` record also carries `phase`, `iteration` and `error_px`, and, for camera-down acquisition, `final_offset_px` and `acquire_height_m` (fields absent otherwise); a `place` record carries `phase` (all three are null for other kinds). `state`: `running`, `done`, `failed`, `cancelled`. `started_at` / `finished_at` use the observation `timestamp` clock. Clients block by waiting until `action.id == action_id` and `state != "running"`, or until `previous_action.id == action_id`.
+`kind`: `move_to`, `move_relative`, `gripper`, `grasp`, `place`, `joint_move`, `home`, `park`, `move_to_pose`, `replay`. A `grasp` record also carries `phase`, `iteration` and `error_px`, and, for camera-down acquisition, `final_offset_px` and `acquire_height_m` (fields absent otherwise); a `place` record carries `phase` (all three are null for other kinds); a `replay` record carries `phase`, `episode` and `t_s` (the last two absent for other kinds). `state`: `running`, `done`, `failed`, `cancelled`. `started_at` / `finished_at` use the observation `timestamp` clock. Clients block by waiting until `action.id == action_id` and `state != "running"`, or until `previous_action.id == action_id`.
 
 A running action ends when its reference goes away:
 
@@ -343,6 +344,60 @@ Example / 示例:
            "code":null, "holding":null, "iteration":null, "error_px":null, ...}
 ```
 
+## Replay / 回放
+
+Replays a saved episode (see the README, "Episode recording"). Episode files are managed over REST without a lease, like the other `/api/v1/dataset/*` routes; they move nothing. Browser requests must be same-origin (`DELETE` included).
+
+| Route | Returns |
+|---|---|
+| `GET /api/v1/dataset/episodes` | `{"enabled", "dir", "episodes":[{"id", "frames", "duration_s", "size_bytes", "created_ms", "dof", "joint_min":[dof], "joint_max":[dof], "error"?}], "total_bytes", "max_bytes", "max_files"}`, newest first. `created_ms` is the file modification time (Unix ms). `error` is set for a file that cannot be read. |
+| `DELETE /api/v1/dataset/episodes/{id}` | `{"status":"deleted", "episode_id"}`; `404 EPISODE_NOT_FOUND`, `400 INVALID_EPISODE_ID` |
+
+WS command (lease, epoch, `request_id` as for every action):
+
+```json
+{"type":"command", "request_id":9, "generation":1, "epoch_id":3,
+ "path":"/api/v1/action/replay", "body":{"episode":"teleop_20261112_101500", "speed":0.5, "gripper":true, "tag":"demo"}}
+```
+
+- `episode` (required): episode id, `^[A-Za-z0-9_-]{1,64}$`. `speed`: `0.5` (default) or `1.0`, a fraction of the recorded speed. `gripper` (default true): replay J7; false holds J7 at its current command. `tag` as for other actions.
+- The ack carries `action_id` and `expected_duration_s` (approach + recorded duration / speed + 0.5 s).
+- The episode file is read and checked on a blocking thread without the supervisor lock. Then, under the lock, epoch, workspace revision, busy rules and the commanded positions (< 1e-4 rad) are checked again (`PLAN_STALE` / the busy codes), the approach is planned and the action starts.
+
+Checks before any motion (rejection, no motion):
+
+| Check | Code (status) |
+|---|---|
+| fewer than 2 frames, or no time span | `REPLAY_EMPTY` (422) |
+| a frame's `observation.state` length differs from the profile's joint count | `REPLAY_JOINT_COUNT` (422) |
+| non-finite angle, timestamps not finite and non-decreasing, unreadable file | `REPLAY_INVALID_EPISODE` (422) |
+| recorded duration over 600 s | `REPLAY_TOO_LONG` (422) |
+| any frame outside the joint soft limits (J7 only with `gripper`) | `SOFT_LIMIT_EXCEEDED` (400) |
+| per-joint speed of the resampled recording × `speed` above the planned-motion limit (`planning_limits()`: `planned_max_velocity` × `speed_cap.joint_velocity_scale`, 0.45 rad/s on rebot-dm; the J7 joint limit for the gripper). The message names the joint, the speed, the time and the highest playback speed that passes. The recording is not clipped. | `REPLAY_TOO_FAST` (422) |
+| any resampled frame against the workspace rule of planned motions (baseline = the commanded pose at the request), and the keep-out sweep over the frames (at most 4000 added FK evaluations) | `WORKSPACE_VIOLATION` (422) |
+| file missing; storage off | `EPISODE_NOT_FOUND` (404); `EPISODES_DISABLED` (409) |
+| a recording is running or saving; gravity compensation; another trajectory, servo stream or motion | `MOTION_BUSY` (409) |
+| collision hold; E-stop; fault; not armed | `COLLISION_HOLD` (409); `ESTOP_ACTIVE`; `FAULT_ACTIVE`; `NOT_ARMED` |
+
+Execution:
+
+1. `observation.state` is resampled by timestamp to the control rate (`control_frequency_hz`, linear between frames).
+2. Approach: a joint-space quintic from the commanded pose to frame 0 at the planned-motion limits, checked like a jog (joint limits, 21 workspace samples, keep-out sweep).
+3. Replay: each tick advances the recording time by dt × `speed` × rate, with the lag-aware rate of planned paths (full speed below 0.38 rad lag on J1–J6, stop at 0.45 rad). A rate at or below 0.1 for 1 s ends the action `failed` / `TRACKING_STALL` with commanded = measured (no Fault).
+4. Settle at the last frame, as for other actions (`settled`).
+
+Gripper with `gripper: true`: J7 follows the recording; while the stall latch holds the jaw (|τ7| high, jaw still), a recorded command further into the stall is held and a command in the opposite direction releases the latch (the servo / jog rule).
+
+Action record: `kind` `replay`, `episode`, `phase` (`approach` → `replay` → `settle`), `t_s` (recording time reached, s; 0 during the approach), `progress` (`t_s` / recorded duration). Stop, E-stop, collision trip, fault, watchdog and lease loss end it with the codes of the table in [Action status](#action-status--动作状态); on lease loss (release, preemption, closed connection) armd also stops the replay reference, so the arm brakes and holds.
+
+保存的录制片段可回放（录制见 README「示教片段录制」）。片段文件通过 REST 管理，与其他 `/api/v1/dataset/*` 路由一样无需租约（不产生运动）；浏览器请求（含 `DELETE`）须同源。`GET /api/v1/dataset/episodes` 按时间倒序返回片段（帧数、时长、大小、保存时间、各关节范围；无法读取的文件带 `error`）；`DELETE /api/v1/dataset/episodes/{id}` 删除片段，不存在返回 `404 EPISODE_NOT_FOUND`，id 不合法返回 `400 INVALID_EPISODE_ID`。
+
+WS 指令 `/api/v1/action/replay`（需租约与 epoch）：`episode` 必填（`^[A-Za-z0-9_-]{1,64}$`）；`speed` 为 `0.5`（默认）或 `1.0`，相对录制速度；`gripper`（默认 true）回放 J7，false 时 J7 保持当前指令。ack 带 `action_id` 与 `expected_duration_s`。片段在阻塞线程中读取与检查，不持有监督器锁；安装前在锁内再次检查 epoch、工作空间版本、忙碌条件和指令位置（`PLAN_STALE` 或对应忙碌码）。
+
+运动前的检查（不通过则拒绝，不运动）：帧数少于 2 或没有时长 `REPLAY_EMPTY`；关节数与 profile 不符 `REPLAY_JOINT_COUNT`；非有限值、时间戳非有限或递减、文件无法读取 `REPLAY_INVALID_EPISODE`；时长超过 600 s `REPLAY_TOO_LONG`；任一帧超出关节软限位（J7 仅在 `gripper` 时检查）`SOFT_LIMIT_EXCEEDED`；重采样后各关节速度 × `speed` 超过规划运动限速（`planning_limits()`，rebot-dm 为 0.45 rad/s；夹爪用 J7 关节限位）`REPLAY_TOO_FAST`，消息给出关节、速度、时刻与可通过的最高回放速度，不对录制做削峰；每个重采样帧按规划运动的工作空间规则检查（基准为请求时的指令位姿），并对禁入盒做扫掠检查（最多追加 4000 次 FK）`WORKSPACE_VIOLATION`；文件不存在 `EPISODE_NOT_FOUND`；存储关闭 `EPISODES_DISABLED`；录制进行或保存中、重力补偿中、其他轨迹 / servo 流 / 运动进行中 `MOTION_BUSY`；碰撞保护中 `COLLISION_HOLD`；急停、故障、未使能为对应错误码。
+
+执行：按时间戳把 `observation.state` 线性重采样到控制频率；先以规划运动限速用关节空间五次多项式移动到第 0 帧（与 jog 相同的检查）；之后每个周期按 dt × `speed` × rate 推进录制时间，rate 与规划路径相同（J1–J6 滞后低于 0.38 rad 全速，0.45 rad 停止），rate ≤ 0.1 持续 1 s 结束为 `failed` / `TRACKING_STALL`，指令设为实测位置，不进入 Fault；最后在末帧做到位确认。`gripper: true` 时 J7 跟随录制；夹爪卡滞锁存期间，继续向卡滞方向的指令保持不动，反向指令解除锁存（与 servo / jog 规则相同）。动作记录：`kind` 为 `replay`，带 `episode`、`phase`（`approach` → `replay` → `settle`）、`t_s`（已回放到的录制时间，接近阶段为 0）与 `progress`。停止、急停、碰撞、故障、看门狗和租约丢失按“动作状态”一节的错误码结束；租约丢失（释放、被接管、连接关闭）时 armd 同时停止回放参考轨迹，机械臂制动并保持。
+
 ## Gravity compensation mode / 重力补偿模式
 
 Verified on the reBot B601-DM (see the README). Full contract: [control_safety_contract.md](control_safety_contract.md#gravity-compensation-hand-guiding--重力补偿拖动示教).
@@ -408,6 +463,11 @@ SG2002 上电原因 `reset_reason`）；`blackbox?seconds=N` 返回本次启动�
 | code | status |
 |---|---|
 | `IK_UNREACHABLE`, `IK_BRANCH_FLIP`, `WORKSPACE_VIOLATION` | 422 |
+| `REPLAY_EMPTY`, `REPLAY_JOINT_COUNT`, `REPLAY_INVALID_EPISODE`, `REPLAY_TOO_LONG`, `REPLAY_TOO_FAST` | 422 |
+| `SOFT_LIMIT_EXCEEDED`, `INVALID_EPISODE_ID`, `INVALID_OUTPUT_PATH` | 400 |
+| `EPISODE_NOT_FOUND` | 404 |
+| `EPISODES_DISABLED`, `EPISODE_EXISTS` | 409 |
+| `EPISODES_FULL` (recording start / save) | 507 |
 | `MOTION_BUSY`, `PLAN_STALE`, `COLLISION_HOLD` | 409 |
 | `INVALID_COMMAND` (bad or missing params, path too long) | 400 |
 | `UNSUPPORTED`, `GRAVITY_MODEL_UNAVAILABLE` | 422 |
@@ -423,5 +483,6 @@ Codes that only appear in `action.code`: `COLLISION`, `TRACKING_STALL`, `GRIPPER
 - `squeeze_rad` 0.15 and `holding_torque_nm` 0.0667 (0.12 as read with the old TMAX 18 mapping of J7, converted to its real TMAX 10) come from the MIT-mode project; grip torque under POS_VEL depends on the motor's internal gains.
 - `camera_mount` (`flip`, `tilt_deg`, `offset_m`) for camera-frame moves.
 - Gravity compensation: the Damiao CTRL_MODE register write while enabled, its acknowledgement, the PMAX / VMAX / TMAX values of each B601-DM motor, the URDF torque against the measured hold torque, the POS_VEL transient when the feed-forward ends at the switch back, and the damping / overspeed defaults (checklist in the contract).
+- Replay: tested in simulation only (first-order servo, `tests/test_replay.rs`); tracking of a replayed hand-guided episode under POS_VEL, and how often hand-guided episodes exceed the 0.45 rad/s planned-motion limit at 0.5x, are not measured on the arm.
 - Planning time on the SG2002: `cargo test --release --test test_actions bench_plan -- --ignored --nocapture`.
 - Grasp: `camera_tilt_deg` sign and value for the new mount, `camera_mount.offset_m`, `grip_pixel_norm`, `table_z_m`; detection rate and latency (`settle_delay_s`, `lost_*`); the jaw closing axis (assumed end_link y) for J6 alignment; `centre_tol_px` against detector jitter; `holding` thresholds under POS_VEL; camera-down acquisition with the v8 holder (mount tilt, rot and lens centre accuracy, reachability of the pitched approach); the v8 lens offset, body box, 5 mm table margin and `recheck_tol_px` per [Real-arm calibration](#real-arm-calibration-v8-mount--真机标定v8-支架). Simulated-camera tests: `cargo test --test test_grasp -- --nocapture`.

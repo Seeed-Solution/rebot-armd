@@ -56,7 +56,7 @@ other hosts and arms are listed under [Hardware](#hardware) with their verificat
   [rebot-companion](https://github.com/Seeed-Solution/rebot-companion) and its MCP server;
 - server-side limits clients cannot raise: a Cartesian workspace with keep-out boxes and a
   profile speed cap; faults are reported with a machine-readable code;
-- recording of joint state and commands to Parquet files;
+- recording of joint state and commands to Parquet files, and replay of saved episodes;
 - object detection (YOLO, on the TPU) and ArUco markers with 3D pose (on the CPU), run only
   when a caller asks for them ([Vision](#vision-recamera-kit));
 - a gravity-compensation mode for hand-guided demonstrations, verified on the B601-DM.
@@ -449,6 +449,10 @@ the header).
 - **Poses drawer** (only when `capabilities.poses` is true): record the current position under
   a name (`^[A-Za-z0-9_-]{1,64}$`), move to a stored pose (`move_to_pose` action at the cockpit
   speed) or delete it.
+- **Saved episodes** (expert recording card, only when `capabilities.replay` is true): the list
+  of saved episodes (id, duration, saved time), replay at 0.5x or 1x with or without the gripper,
+  a progress bar with the phase and recording time, Stop, and Delete with an in-page confirm.
+  The list refreshes after a save; rejections show as a toast with the code.
 
 The cockpit does not take the lease when it opens. It acquires it on the first control input
 (jog, stick, key, Cartesian input, preset, enable, gripper, grasp, gravity compensation, park
@@ -510,6 +514,7 @@ WebSocket that holds the lease.
 | `/api/v1/workspace/keepout` | GET | keep-out boxes in force, each tagged `profile` or `runtime` (the runtime list, set with a WS command, only adds boxes) |
 | `/api/v1/diagnostics/boots`, `/api/v1/diagnostics/blackbox?seconds=N[&prev=1]`, `/api/v1/diagnostics/tick` | GET | boot records, black-box records (state before a reset) and control tick timing, no lease needed ([format](docs/agent_action_api.md#diagnostics--诊断)) |
 | `/api/v1/dataset/record/start` / `save` / `discard` | POST | episode recording |
+| `/api/v1/dataset/episodes`, `/api/v1/dataset/episodes/{id}` | GET, DELETE | list and delete saved episodes, no lease needed ([format](docs/agent_action_api.md#replay--回放)) |
 | `/api/v1/detection/latest`, `/trigger`, `/inference`, `/ws` | GET / POST / WS | detector proxy |
 
 WebSocket sequence:
@@ -555,18 +560,38 @@ memory and written to an uncompressed Parquet file on `save`.
 
 ```bash
 curl -X POST http://192.168.42.1:8765/api/v1/dataset/record/start \
-     -H 'Content-Type: application/json' -d '{"output_path":"/userdata/datasets/episode_001.parquet"}'
+     -H 'Content-Type: application/json' -d '{"episode_id":"episode_001"}'
 curl -X POST http://192.168.42.1:8765/api/v1/dataset/record/save      # or .../discard
+curl http://192.168.42.1:8765/api/v1/dataset/episodes                 # list
+curl -X DELETE http://192.168.42.1:8765/api/v1/dataset/episodes/episode_001
 ```
 
 In gravity-compensation mode the commanded position of J1–J6 follows the measured position,
 so a hand-guided episode has `action` equal to `observation.state` for those joints.
 
-Without `output_path` the file goes to `./data/episodes/<episode_id>.parquet` relative to the
-working directory. The column names follow LeRobot's naming, but armd writes one plain
+Episodes are stored as `<dir>/<episode_id>.parquet` in the episode directory: `--episodes-dir`
+(or `$ARMD_EPISODES_DIR`), default `/userdata/rebot-teleop/episodes` when `/userdata` exists, else
+`./data/episodes` relative to the working directory; `off` disables recording and replay. The
+episode id matches `^[A-Za-z0-9_-]{1,64}$` (default `episode_<UTC date>_<time>`); an existing id
+is `409 EPISODE_EXISTS`. An `output_path` must name `<id>.parquet` directly inside the
+directory (else `400 INVALID_OUTPUT_PATH`). Starting or saving is refused with
+`507 EPISODES_FULL` while the directory holds 500 files or 200 MB; a refused save keeps the
+recording, so it can be saved after deleting episodes. The column names follow LeRobot's naming, but armd writes one plain
 Parquet file per episode, not a LeRobot dataset (no `meta/` files, episode or frame indices,
 or camera frames). Converting it to a LeRobot dataset is not provided here and training on it
 has not been tested.
+
+**Replay.** The WS action `/api/v1/action/replay` `{"episode", "speed": 0.5 | 1.0, "gripper": true}`
+(lease required) moves to the first recorded frame with a planned joint move, then follows the
+measured angles (`observation.state`) resampled to the control rate. Before any motion armd
+checks every frame against the joint limits, the workspace and keep-out boxes, and the
+per-joint speed at the chosen playback speed against the planned-motion limit (0.45 rad/s on
+the B601-DM); an episode that fails is refused with a code (`REPLAY_TOO_FAST` names the joint
+and the highest playback speed that passes). Replay is refused while recording, in gravity
+compensation, in a collision hold and while another motion runs. Stop, E-stop and lease loss
+end it. Rules: [agent API](docs/agent_action_api.md#replay--回放),
+[safety contract](docs/control_safety_contract.md#episode-replay--片段回放). Tested in
+simulation (`tests/test_replay.rs`); not yet run on the arm.
 
 ---
 
@@ -583,6 +608,9 @@ armd [OPTIONS]
                              when /userdata exists, else off; `off` disables; or $ARMD_LOG_DIR)
     --blackbox-dir <DIR>     black box bb.jsonl and boots.log (default /userdata/rebot-teleop/blackbox
                              when /userdata exists, else off; `off` disables; or $ARMD_BLACKBOX_DIR)
+    --episodes-dir <DIR>     recorded episodes (default /userdata/rebot-teleop/episodes when /userdata
+                             exists, else ./data/episodes; `off` disables recording and replay;
+                             or $ARMD_EPISODES_DIR)
     -h, --help
 ```
 
@@ -597,7 +625,7 @@ Environment: `RUST_LOG` (log filter, default `armd=info,tower_http=info`), `PORT
 default `/userdata/rebot-teleop/grasp_setup.json`), `ARMD_KEEPOUT` (runtime keep-out boxes,
 default `/userdata/rebot-teleop/keepout.json`), `ARMD_POSES` (named poses, default
 `/userdata/rebot-teleop/poses.json`), `ARMD_COLLISION` (collision guard setting, default
-`/userdata/rebot-teleop/collision.json`), `ARMD_LOG_DIR`, `ARMD_BLACKBOX_DIR`.
+`/userdata/rebot-teleop/collision.json`), `ARMD_LOG_DIR`, `ARMD_BLACKBOX_DIR`, `ARMD_EPISODES_DIR`.
 
 Without `--config`, `rebot-dm` uses the built-in B601-DM profile (`ArmConfig::rebot_dm()` in
 `src/model.rs`) and the other followers a generic 6-joint profile. A `--config` file is a
