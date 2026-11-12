@@ -1,5 +1,5 @@
 //! Read-only static files for the cockpit 3D view: `GET /assets/model/{*path}` serves the URDF and
-//! the decimated meshes from the kit asset directory (not embedded in the binary), and
+//! the simplified meshes from the kit asset directory (not embedded in the binary), and
 //! `GET /assets/three-urdf.min.js` serves the embedded three.js + urdf-loader bundle.
 use std::path::{Path, PathBuf};
 
@@ -29,7 +29,7 @@ fn content_type(path: &str) -> Option<&'static str> {
     let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
     Some(match ext.as_str() {
         "urdf" => "application/xml; charset=utf-8",
-        "stl" => "model/stl",
+        "bin" => "application/octet-stream",
         "json" => "application/json",
         "md" | "txt" => "text/plain; charset=utf-8",
         _ => return None,
@@ -116,10 +116,10 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(t.path().join("assets/meshes")).unwrap();
         std::fs::write(t.path().join("assets").join(URDF_NAME), "<robot/>").unwrap();
-        std::fs::write(t.path().join("assets/meshes/link1.stl"), "solid").unwrap();
+        std::fs::write(t.path().join("assets/meshes/arm.bin"), "solid").unwrap();
         std::fs::write(t.path().join("assets/meshes/manifest.json"), "{}").unwrap();
         std::fs::write(t.path().join("assets/meshes/run.sh"), "x").unwrap();
-        std::fs::write(t.path().join("assets/meshes/huge.stl"), vec![b's'; (MAX_FILE_BYTES + 1) as usize]).unwrap();
+        std::fs::write(t.path().join("assets/meshes/huge.bin"), vec![b's'; (MAX_FILE_BYTES + 1) as usize]).unwrap();
         std::fs::write(t.path().join("secret.json"), "{}").unwrap();
         t
     }
@@ -129,7 +129,7 @@ mod tests {
         let t = tree();
         let d = t.path().join("assets");
         assert_eq!(resolve(&d, URDF_NAME).unwrap().1, "application/xml; charset=utf-8");
-        assert_eq!(resolve(&d, "meshes/link1.stl").unwrap().1, "model/stl");
+        assert_eq!(resolve(&d, "meshes/arm.bin").unwrap().1, "application/octet-stream");
         assert_eq!(resolve(&d, "meshes/manifest.json").unwrap().1, "application/json");
     }
 
@@ -137,9 +137,9 @@ mod tests {
     fn rejects_traversal_hidden_unknown_and_missing() {
         let t = tree();
         let d = t.path().join("assets");
-        for bad in ["../secret.json", "meshes/../../secret.json", "..", "/etc/passwd", "meshes//link1.stl",
-            ".hidden.json", "meshes/run.sh", "meshes/none.stl", "", "meshes", "a/b/c/d/e.stl", "meshes\\link1.stl",
-            "meshes/link1.stl%00"] {
+        for bad in ["../secret.json", "meshes/../../secret.json", "..", "/etc/passwd", "meshes//arm.bin",
+            ".hidden.json", "meshes/run.sh", "meshes/none.bin", "", "meshes", "a/b/c/d/e.bin", "meshes\\arm.bin",
+            "meshes/arm.bin%00"] {
             assert!(resolve(&d, bad).is_none(), "{bad} must be rejected");
         }
     }
@@ -162,10 +162,10 @@ mod tests {
             .route("/assets/model/{*path}", axum::routing::get(move |UrlPath(rel): UrlPath<String>| async move { serve_from(&d, &rel).await }))
             .route("/assets/three-urdf.min.js", axum::routing::get(serve_three));
         let get = |u: &str| axum::http::Request::get(u).header(header::ACCEPT_ENCODING, "gzip, deflate, br").body(Body::empty()).unwrap();
-        let r = app.clone().oneshot(get("/assets/model/meshes/link1.stl")).await.unwrap();
+        let r = app.clone().oneshot(get("/assets/model/meshes/arm.bin")).await.unwrap();
         assert_eq!(r.status(), StatusCode::OK);
-        assert_eq!(r.headers()[header::CONTENT_TYPE], "model/stl");
-        for bad in ["/assets/model/meshes/huge.stl", "/assets/model/../secret.json", "/assets/model/meshes/%2e%2e/%2e%2e/secret.json", "/assets/model/meshes/run.sh"] {
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "application/octet-stream");
+        for bad in ["/assets/model/meshes/huge.bin", "/assets/model/../secret.json", "/assets/model/meshes/%2e%2e/%2e%2e/secret.json", "/assets/model/meshes/run.sh"] {
             let r = app.clone().oneshot(get(bad)).await.unwrap();
             assert_eq!(r.status(), StatusCode::NOT_FOUND, "{bad}");
         }
