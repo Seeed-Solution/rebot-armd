@@ -1309,8 +1309,9 @@ async fn height_probe_moves_up_over_a_tall_object() {
     println!("0.12 m object: {} {:?}, height {:?} ({:?} {:?}), close height {:?}; probe TCP z min {min_z:.4} max {max_z:.4}, start {start_z:.4} \
               (old downward probe would reach {:.4}, object top {:.3})",
         a.state, a.code, a.object_height_m, a.height_source, a.height_reason, a.close_height_m,
-        start_z - s.height_probe_m, s.table_z_m + 0.12);
+        start_z - 0.04, s.table_z_m + 0.12);
     assert!(min_z.is_finite(), "probe phase observed");
+    assert_eq!(a.probe_dz_m, Some(s.height_probe_m as f32), "{a:?}");
     assert!(min_z >= start_z - 1e-3, "TCP below the start height during the probe: {min_z} < {start_z}");
     assert!(max_z > start_z + s.height_probe_m - 2e-3, "moved up: {max_z}");
     match a.code.as_deref() {
@@ -1318,6 +1319,36 @@ async fn height_probe_moves_up_over_a_tall_object() {
         _ => {
             assert_eq!((a.state.as_str(), a.height_source.as_deref()), ("done", Some("scale")), "{a:?}");
             assert!((f64::from(a.object_height_m.unwrap()) - 0.12).abs() <= 0.01, "{a:?}");
+        }
+    }
+}
+
+/// The workspace ceiling leaves room for a 0.06 m raise but not for the default 0.10 m: the
+/// probe falls back to 0.06 m (`probe_dz_m`) and still estimates the height. Without room for
+/// either it falls back to the setup height with `probe_unreachable`.
+#[tokio::test]
+async fn height_probe_falls_back_to_a_shorter_raise() {
+    // kit check points reach 0.16 m above the TCP with the tool down; the probe starts at 0.15 m
+    for (ceiling, dz) in [(0.15 + 0.16 + 0.08, Some(0.06f32)), (0.15 + 0.16 + 0.03, None)] {
+        let s0 = GraspSetup::default();
+        let rig = rig_mounted(s0.clone(), centred_lens(), 0.0, look_down_start(0.0, 0.18), [0.01, 0.01], false).await;
+        *rig.sim.top.lock().unwrap() = Some(0.08);
+        rig.sup.inner().write().await.config.workspace.as_mut().unwrap().box_max_m[2] = ceiling as f32;
+        let start_r = start_pose(&rig).await.r;
+        let mut s = s0.clone();
+        s.grip_pixel_norm = calibrate_grip(&rig, &s0, &start_r);
+        rig.sup.inner().write().await.set_grasp_setup(s.clone());
+        let (a, _) = run_grasp_close_z(&rig).await;
+        println!("ceiling {ceiling:.2} m: {} {:?}, probe_dz_m {:?}, height {:?} ({:?} {:?})",
+            a.state, a.code, a.probe_dz_m, a.object_height_m, a.height_source, a.height_reason);
+        assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+        assert_eq!(a.probe_dz_m, dz, "{a:?}");
+        match dz {
+            Some(_) => {
+                assert_eq!(a.height_source.as_deref(), Some("scale"), "{a:?}");
+                assert!((f64::from(a.object_height_m.unwrap()) - 0.08).abs() <= 0.01, "{a:?}");
+            }
+            None => assert_eq!(a.height_reason.as_deref(), Some("probe_unreachable"), "{a:?}"),
         }
     }
 }
