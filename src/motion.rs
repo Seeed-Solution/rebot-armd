@@ -791,6 +791,9 @@ pub struct ActionStatus {
     pub align: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_turn_rad: Option<f32>,
+    /// Grasp: measured cross-section width of the target on the table plane (m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grasp_width_m: Option<f32>,
     /// Grasp height probe: `scale` (object top estimated, `object_height_m` above the table) or
     /// `setup` (fallback to `grasp_height_m`, why in `height_reason`).
     #[serde(default, skip_serializing_if = "Option::is_none")]

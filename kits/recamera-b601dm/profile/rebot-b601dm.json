@@ -236,7 +236,8 @@
     "recentre_max_iterations": 3,
     "descend_contact_stop_nm": null,
     "post_lift_settle_ms": 300,
-    "recheck_tol_px": 40.0
+    "recheck_tol_px": 40.0,
+    "max_grasp_width_m": 0.075
   },
   "gravity_comp": {
     "ramp_in_s": 1.0,

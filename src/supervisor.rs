@@ -1825,7 +1825,7 @@ impl SupervisorInner {
             started_at: now, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
             phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
             episode: None, t_s: None, power_scale: None,
-            align: None, align_turn_rad: None, height_source: None, height_reason: None, object_height_m: None, close_height_m: None, probe_dz_m: None,
+            align: None, align_turn_rad: None, grasp_width_m: None, height_source: None, height_reason: None, object_height_m: None, close_height_m: None, probe_dz_m: None,
             recentre: None, recentre_iterations: None, descend_peak_residual_nm: None, descend_peak_tracking_rad: None,
             descend_contact: None, descend_contact_height_m: None, post_lift: None,
         });

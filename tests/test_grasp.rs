@@ -60,6 +60,8 @@ struct SimCamera {
     /// Boxes of the object's top face only, at this height above the table (m), instead of the
     /// whole 0.05 m box.
     top: Mutex<Option<f64>>,
+    /// Target grasp width reported by the detector (pixels).
+    pub width_px: Mutex<Option<f64>>,
 }
 
 impl SimCamera {
@@ -79,11 +81,12 @@ impl SimCamera {
         let captured = Instant::now();
         let q = self.sup.inner().read().await.measured_positions.clone();
         let pose = ARM.fk(&kinematics::q6(&q));
-        let mut detections = vec![Detection { label: "person".into(), score: 0.5, box_norm: [0.0, 0.0, 0.08, 0.1], angle_deg: None, angle_conf: None }];
+        let mut detections = vec![Detection { label: "person".into(), score: 0.5, box_norm: [0.0, 0.0, 0.08, 0.1], angle_deg: None, angle_conf: None, grasp_width_px: None }];
         if self.visible.load(Ordering::SeqCst) {
             if let Some(b) = self.project_box(&pose) {
                 let (angle_deg, angle_conf) = match self.image_angle(&pose) { Some((a, c)) => (Some(a), Some(c)), None => (None, None) };
-                detections.push(Detection { label: self.label.clone(), score: 0.9, box_norm: b, angle_deg, angle_conf });
+                let grasp_width_px = *self.width_px.lock().unwrap();
+                detections.push(Detection { label: self.label.clone(), score: 0.9, box_norm: b, angle_deg, angle_conf, grasp_width_px });
             }
         }
         let frame_id = self.frame.fetch_add(1, Ordering::SeqCst) + 1;
@@ -269,7 +272,7 @@ async fn rig_driven(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start: 
         vision: Mutex::new(None), mode_calls: Mutex::new(Vec::new()), no_yolo: AtomicBool::new(false),
         per_request: AtomicBool::new(false), trigger_calls: Mutex::new(Vec::new()), next_frame_calls: AtomicU64::new(0),
         shift: Mutex::new([0.0; 2]), turned: AtomicBool::new(false), failing: AtomicBool::new(false), stale: AtomicBool::new(false), delayed: AtomicBool::new(false),
-        angle: Mutex::new(None), top: Mutex::new(None),
+        angle: Mutex::new(None), top: Mutex::new(None), width_px: Mutex::new(None),
     });
     let hold = Arc::new(AtomicBool::new(true));
     let (ticker, hold_t) = (sup.clone(), hold.clone());
@@ -1564,4 +1567,73 @@ async fn post_lift_regrip_keeps_a_loose_object() {
     assert_eq!((a.state.as_str(), a.holding, a.post_lift.as_deref()), ("done", Some(true), Some("regripped")), "{a:?}");
     assert!(a.gripper_gap_rad.is_some_and(|g| g >= 0.3), "{a:?}");
     assert!((pose.p[2] - (s.table_z_m + s.lift_height_m)).abs() < 2e-3);
+}
+
+/// A wide object stops the grasp before the descent, with a confident angle and with a low one
+/// (a disc or a square: the width is valid without an angle).
+#[tokio::test]
+async fn too_wide_stops_before_descend() {
+    for conf in [0.9, 0.05] {
+        too_wide_case(conf).await;
+    }
+}
+
+async fn too_wide_case(conf: f64) {
+    let setup = GraspSetup {
+        camera_tilt_deg: 0.0,
+        max_grasp_width_m: 0.060,
+        ..GraspSetup::default()
+    };
+    let rig = rig(setup.clone(), centred_lens(), 0.0, [0.0, 0.0], false).await;
+    let start_r = start_pose(&rig).await.r;
+    let mut s = setup.clone();
+    s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+    rig.sup.inner().write().await.set_grasp_setup(s.clone());
+
+    *rig.sim.angle.lock().unwrap() = Some((0.0, conf));
+    *rig.sim.width_px.lock().unwrap() = Some(350.0);
+
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let sup = rig.sup.clone();
+    let mut min_z = f64::MAX;
+    let a = wait_done(&rig.sup, id, 30.0, |_| {
+        if let Ok(inner) = sup.inner().try_read() {
+            let z = kinematics::fk(&kinematics::q6(&inner.commanded_positions)).p[2];
+            if z < min_z { min_z = z; }
+        }
+    }).await;
+
+    println!("too wide (angle_conf {conf}): {} {:?}, phase {:?}, width {:?}, min TCP z {min_z:.4}", a.state, a.code, a.phase, a.grasp_width_m);
+    assert_eq!(a.state, "failed", "{a:?}");
+    assert_eq!(a.code.as_deref(), Some("TOO_WIDE"), "{a:?}");
+    assert_eq!(a.phase.as_deref(), Some("align"), "{a:?}");
+    let measured_w = a.grasp_width_m.expect("grasp_width_m recorded in action");
+    assert!(measured_w > 0.060, "measured width {measured_w} should exceed 0.060");
+    let approach_z = s.table_z_m + s.approach_height_m;
+    assert!(min_z >= approach_z - 0.005, "TCP descended to {min_z:.4}, below approach height {approach_z:.4}");
+}
+
+#[tokio::test]
+async fn width_within_limit_grasps() {
+    let setup = GraspSetup {
+        camera_tilt_deg: 0.0,
+        max_grasp_width_m: 0.075,
+        ..GraspSetup::default()
+    };
+    let rig = rig(setup.clone(), centred_lens(), 0.0, [0.0, 0.0], false).await;
+    let start_r = start_pose(&rig).await.r;
+    let mut s = setup.clone();
+    s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+    rig.sup.inner().write().await.set_grasp_setup(s.clone());
+
+    *rig.sim.angle.lock().unwrap() = Some((0.0, 0.9));
+    *rig.sim.width_px.lock().unwrap() = Some(160.0);
+
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
+
+    println!("within limit: {} {:?}, holding {:?}, width {:?}", a.state, a.code, a.holding, a.grasp_width_m);
+    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+    let measured_w = a.grasp_width_m.expect("grasp_width_m recorded in action");
+    assert!((measured_w - 0.040).abs() < 0.008, "measured width {measured_w} vs expected ~0.040");
 }

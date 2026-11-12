@@ -127,6 +127,8 @@ pub struct GraspSetup {
     /// Camera-down re-check after the transition: TARGET_DISPLACED when the target's box
     /// centre is more than this many pixels from where the model projects it.
     pub recheck_tol_px: f64,
+    /// Maximum target cross-section width (m) for the jaws; 0 disables the check.
+    pub max_grasp_width_m: f64,
 }
 
 /// `acquire_camera_down` setting.
@@ -182,6 +184,7 @@ impl Default for GraspSetup {
             recentre_max_iterations: 3,
             descend_contact_stop_nm: None,
             post_lift_settle_ms: 300,
+            max_grasp_width_m: 0.075,
         }
     }
 }
@@ -194,7 +197,7 @@ impl GraspSetup {
             self.image_size_px[1], self.fx_px, self.fy_px, self.centre_tol_px, self.servo_gain, self.max_step_m,
             self.match_dist_px, self.match_iou, self.acquire_dist_px, self.lost_timeout_s, self.settle_delay_s,
             self.align_min_aspect, self.align_min_angle_conf, self.approach_speed_mps, self.descend_speed_mps, self.phase_timeout_s, self.timeout_s, self.recheck_tol_px,
-            self.height_probe_m, self.height_grasp_fraction, self.max_grasp_height_m, self.recentre_height_m];
+            self.height_probe_m, self.height_grasp_fraction, self.max_grasp_height_m, self.recentre_height_m, self.max_grasp_width_m];
         if !all.iter().all(|v| fin(*v)) { return Err("grasp setup values must be finite".into()); }
         let check = |ok: bool, msg: &str| if ok { Ok(()) } else { Err(msg.to_string()) };
         check((-0.5..=0.5).contains(&self.table_z_m), "table_z_m must be in [-0.5, 0.5] m")?;
@@ -229,6 +232,7 @@ impl GraspSetup {
         check(self.descend_contact_stop_nm.is_none_or(|v| v.is_finite() && v > 0.0 && v <= 50.0), "descend_contact_stop_nm must be null or in (0, 50] N·m")?;
         check(self.align_min_aspect >= 1.0 && self.align_min_aspect <= 10.0, "align_min_aspect must be in [1, 10]")?;
         check((0.0..=1.0).contains(&self.align_min_angle_conf), "align_min_angle_conf must be in [0, 1]")?;
+        check((0.0..=0.2).contains(&self.max_grasp_width_m), "max_grasp_width_m must be in [0, 0.2] m")?;
         let speed_ok = |v: f64| v > 0.0 && v <= motion::MAX_LINEAR_MPS;
         check(speed_ok(self.approach_speed_mps) && speed_ok(self.descend_speed_mps), "speeds must be in (0, 0.15] m/s")?;
         check(self.phase_timeout_s > 0.0 && self.phase_timeout_s <= 120.0 && self.timeout_s >= self.phase_timeout_s && self.timeout_s <= 600.0,
@@ -348,6 +352,7 @@ pub struct Detection {
     /// wrapped to [-90, 90)) and its confidence [0, 1], when the detector reports them.
     pub angle_deg: Option<f64>,
     pub angle_conf: Option<f64>,
+    pub grasp_width_px: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -559,7 +564,8 @@ pub fn parse_detections(raw: &Value, size: [f64; 2]) -> Vec<Detection> {
         if b[2] <= b[0] || b[3] <= b[1] { continue; }
         let angle_deg = item.is_object().then(|| f(item, &["angle_deg"])).flatten().map(|a| (a + 90.0).rem_euclid(180.0) - 90.0);
         let angle_conf = item.is_object().then(|| f(item, &["angle_conf"])).flatten().map(|c| c.clamp(0.0, 1.0));
-        out.push(Detection { label, score: score.clamp(0.0, 1.0), box_norm: b, angle_deg, angle_conf });
+        let grasp_width_px = item.is_object().then(|| f(item, &["grasp_width_px", "width_px"])).flatten().filter(|w| *w > 0.0);
+        out.push(Detection { label, score: score.clamp(0.0, 1.0), box_norm: b, angle_deg, angle_conf, grasp_width_px });
     }
     out
 }
@@ -1119,6 +1125,28 @@ impl Orchestrator {
         self.phase("align", 0.55).await?;
         let (turn, align) = if s.align_j6 { self.align_turn(&c, plane).await } else { (None, "off".to_string()) };
         self.sup.inner().write().await.update_action(self.id, |a| { a.align = Some(align); a.align_turn_rad = turn.map(|t| t as f32); });
+
+        // the width is measured whatever the angle confidence: a disc or a square has a low
+        // angle_conf but a valid width (any closing direction sees about the same width)
+        if let Some(w_px) = frames_width_px(&c.frames, 0.0) {
+            let alpha = frames_angle(&c.frames, 0.0);
+            let closing_deg = alpha.map(|a| a + 90.0).unwrap_or(90.0);
+            let (u_x, u_y) = (closing_deg.to_radians().cos(), closing_deg.to_radians().sin());
+            let centre_px = self.cam.to_px(box_centre(&c.last.box_norm));
+            let half_w = w_px / 2.0;
+            let p0_px = [centre_px[0] - half_w * u_x, centre_px[1] - half_w * u_y];
+            let p1_px = [centre_px[0] + half_w * u_x, centre_px[1] + half_w * u_y];
+            if let (Some(p0), Some(p1)) = (self.cam.plane_point(&c.pose, p0_px, plane), self.cam.plane_point(&c.pose, p1_px, plane)) {
+                let width_m = kinematics::norm(&kinematics::sub(&p1, &p0));
+                self.sup.inner().write().await.update_action(self.id, |a| {
+                    a.grasp_width_m = Some(width_m as f32);
+                });
+                if s.max_grasp_width_m > 0.0 && width_m > s.max_grasp_width_m {
+                    return Err(fail("TOO_WIDE", format!("Object width {width_m:.3} m exceeds max_grasp_width_m {:.3} m", s.max_grasp_width_m)));
+                }
+            }
+        }
+
         if let Some(turn) = turn {
             self.move_arm("align", GoalSpec::Relative { frame: RelFrame::Tool, d: [0.0; 3], dyaw: 0.0, dpitch: 0.0, droll: turn, level: false }, s.approach_speed_mps).await?;
         }
@@ -1527,6 +1555,22 @@ pub fn frames_angle(frames: &[Detection], min_conf: f64) -> Option<f64> {
     Some((a + 90.0).rem_euclid(180.0) - 90.0)
 }
 
+/// Median grasp width (px) of the frames with `angle_conf >= min_conf` and a positive, finite
+/// `grasp_width_px`; None without such frames.
+pub fn frames_width_px(frames: &[Detection], min_conf: f64) -> Option<f64> {
+    let mut widths: Vec<f64> = frames
+        .iter()
+        .filter(|d| d.angle_conf.unwrap_or(0.0) >= min_conf)
+        .filter_map(|d| d.grasp_width_px)
+        .filter(|w| *w > 0.0 && w.is_finite())
+        .collect();
+    if widths.is_empty() {
+        None
+    } else {
+        Some(median(&mut widths))
+    }
+}
+
 /// Roll about the (vertical, down) tool axis, in [-pi/2, pi/2), that turns the jaw closing
 /// direction `jaw` (base frame) perpendicular to the long side `long` (base frame, horizontal
 /// parts used). Rolling by t about the downward tool axis turns `jaw` by -t about base z.
@@ -1638,7 +1682,7 @@ mod tests {
     }
 
     fn det(b: [f64; 4], angle: Option<(f64, f64)>) -> Detection {
-        Detection { label: "cup".into(), score: 0.9, box_norm: b, angle_deg: angle.map(|a| a.0), angle_conf: angle.map(|a| a.1) }
+        Detection { label: "cup".into(), score: 0.9, box_norm: b, angle_deg: angle.map(|a| a.0), angle_conf: angle.map(|a| a.1), grasp_width_px: None }
     }
 
     #[test]
@@ -1926,5 +1970,87 @@ mod tests {
         let est = transition_estimate(&pose, &target, &setup);
         let rot = 1.1 * 1.875 * 38f64.to_radians() / motion::DEFAULT_ANGULAR_RPS;
         assert!(est >= rot - 1e-9 && est < rot + 3.0, "{est} vs {rot}");
+    }
+
+    #[test]
+    fn test_parse_detections_grasp_width_px() {
+        let raw = serde_json::json!([
+            {"label": "can", "score": 0.9, "box_norm": [0.1, 0.1, 0.3, 0.3], "grasp_width_px": 42.5},
+            {"label": "cup", "score": 0.8, "box_norm": [0.2, 0.2, 0.4, 0.4], "width_px": 35.0},
+            {"label": "box", "score": 0.7, "box_norm": [0.3, 0.3, 0.5, 0.5], "grasp_width_px": 0.0},
+            {"label": "pen", "score": 0.6, "box_norm": [0.4, 0.4, 0.6, 0.6], "width_px": -5.0},
+            {"label": "mug", "score": 0.5, "box_norm": [0.5, 0.5, 0.7, 0.7]},
+            [320.0, 180.0, 64.0, 36.0, 0.9, "arr_obj"]
+        ]);
+        let d = parse_detections(&raw, [640.0, 360.0]);
+        assert_eq!(d.len(), 6);
+        assert_eq!(d[0].grasp_width_px, Some(42.5));
+        assert_eq!(d[1].grasp_width_px, Some(35.0));
+        assert_eq!(d[2].grasp_width_px, None, "zero width rejected");
+        assert_eq!(d[3].grasp_width_px, None, "negative width rejected");
+        assert_eq!(d[4].grasp_width_px, None, "absent width");
+        assert_eq!(d[5].grasp_width_px, None, "array format detection has no grasp_width_px");
+    }
+
+    #[test]
+    fn test_frames_width_px() {
+        let mut d1 = det([0.0; 4], Some((0.0, 0.8)));
+        d1.grasp_width_px = Some(40.0);
+
+        let mut d2 = det([0.0; 4], Some((0.0, 0.9)));
+        d2.grasp_width_px = Some(50.0);
+
+        let mut d3 = det([0.0; 4], Some((0.0, 0.7)));
+        d3.grasp_width_px = Some(45.0);
+
+        // Low confidence detection
+        let mut d_low = det([0.0; 4], Some((0.0, 0.2)));
+        d_low.grasp_width_px = Some(100.0);
+
+        // No width detection
+        let d_nowidth = det([0.0; 4], Some((0.0, 0.9)));
+
+        // Non-positive width
+        let mut d_neg = det([0.0; 4], Some((0.0, 0.9)));
+        d_neg.grasp_width_px = Some(-10.0);
+
+        let frames = vec![d1, d2, d3, d_low, d_nowidth, d_neg];
+
+        // min_conf = 0.5 filters out d_low. Valid widths: [40, 50, 45]. Median of [40, 45, 50] is 45.0.
+        let w = frames_width_px(&frames, 0.5);
+        assert_eq!(w, Some(45.0));
+
+        // Even count: only d1 and d2 (min_conf = 0.75). Widths: [40, 50]. Median is 45.0.
+        let w_even = frames_width_px(&frames, 0.75);
+        assert_eq!(w_even, Some(45.0));
+
+        // min_conf too high: no frames qualify
+        assert_eq!(frames_width_px(&frames, 0.95), None);
+
+        // Empty slice
+        assert_eq!(frames_width_px(&[], 0.5), None);
+    }
+
+    #[test]
+    fn test_plane_point_width_conversion() {
+        let setup = GraspSetup { camera_tilt_deg: 0.0, fx_px: 600.0, fy_px: 600.0, image_size_px: [640.0, 360.0], ..Default::default() };
+        let cam = CamModel::assumed(&crate::chain::ArmModel::REBOT_DEV_ARM, &setup, &CameraMount::default());
+        let pose = Pose::new(look_down(&inspect_r()), [0.3, 0.0, 0.20]);
+        let plane_z = 0.0;
+
+        let centre_px = [320.0, 180.0];
+        let w_px = 60.0;
+        let closing_deg: f64 = 90.0;
+        let (u_x, u_y) = (closing_deg.to_radians().cos(), closing_deg.to_radians().sin());
+        let half_w = w_px / 2.0;
+        let p0_px = [centre_px[0] - half_w * u_x, centre_px[1] - half_w * u_y];
+        let p1_px = [centre_px[0] + half_w * u_x, centre_px[1] + half_w * u_y];
+
+        let p0 = cam.plane_point(&pose, p0_px, plane_z).expect("p0 meets plane");
+        let p1 = cam.plane_point(&pose, p1_px, plane_z).expect("p1 meets plane");
+        let width_m = kinematics::norm(&kinematics::sub(&p1, &p0));
+
+        // Projected width: dx = w_px * height / fx = 60.0 * 0.20 / 600.0 = 0.02 m (20 mm)
+        assert!((width_m - 0.02).abs() < 1e-4, "expected 0.02 m, got {width_m}");
     }
 }
