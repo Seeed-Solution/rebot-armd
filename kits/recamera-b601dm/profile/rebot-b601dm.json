@@ -229,6 +229,9 @@
     "phase_timeout_s": 25.0,
     "timeout_s": 120.0,
     "acquire_camera_down": "auto",
+    "height_probe_m": 0.04,
+    "height_grasp_fraction": 0.5,
+    "max_grasp_height_m": 0.06,
     "recheck_tol_px": 40.0
   },
   "gravity_comp": {

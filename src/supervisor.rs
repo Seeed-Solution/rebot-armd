@@ -1830,7 +1830,7 @@ impl SupervisorInner {
             id, kind: kind.into(), tag, state: "running".into(), code: None, message: None, progress: 0.0,
             started_at: now, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
             phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
-            align: None, align_turn_rad: None,
+            align: None, align_turn_rad: None, height_source: None, height_reason: None, object_height_m: None, close_height_m: None,
         });
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
         self.quintic_settle = None;

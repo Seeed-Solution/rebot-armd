@@ -734,6 +734,17 @@ pub struct ActionStatus {
     pub align: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_turn_rad: Option<f32>,
+    /// Grasp height probe: `scale` (object top estimated, `object_height_m` above the table) or
+    /// `setup` (fallback to `grasp_height_m`, why in `height_reason`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_height_m: Option<f32>,
+    /// Grasp: TCP height above the table at which the jaws close (m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_height_m: Option<f32>,
 }
 
 impl ActionStatus {
