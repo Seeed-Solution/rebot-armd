@@ -265,6 +265,12 @@ pub struct GravityCompPolicy {
     /// The light wrist joints move faster than 1.5 rad/s under normal hand guiding.
     #[serde(default)]
     pub joint_max_speed_rad_s: Vec<f32>,
+    /// Optional per-joint limits (rad/s) for J1..J6 that apply instead of the limits above
+    /// while a joint moves against the model gravity torque (lifted by hand) or carries less
+    /// than [`GRAVITY_DIRECTION_MIN_NM`] of it. Empty: the limits above apply in every
+    /// direction. A joint moving with gravity (falling) always uses the limits above.
+    #[serde(default)]
+    pub lift_max_speed_rad_s: Vec<f32>,
     /// ... for this many consecutive ticks ends the mode with GRAVITY_COMP_OVERSPEED.
     pub overspeed_ticks: u32,
     /// MIT stiffness used while entering (faded out) and while exiting (N·m/rad).
@@ -284,10 +290,24 @@ pub struct GravityCompPolicy {
     pub ramp_max_deviation_rad: f32,
 }
 
+/// A joint whose model gravity torque is below this (N·m) has no falling direction.
+pub const GRAVITY_DIRECTION_MIN_NM: f32 = 0.3;
+
 impl GravityCompPolicy {
     /// Overspeed limit for arm joint `i` (0-based, J1..J6).
     pub fn speed_limit(&self, i: usize) -> f32 {
         self.joint_max_speed_rad_s.get(i).copied().unwrap_or(self.max_speed_rad_s)
+    }
+
+    /// Overspeed limit for arm joint `i` moving at `velocity` (signed, rad/s) with the model
+    /// gravity torque `gravity_nm` (the torque that holds the joint; `None` when unknown).
+    pub fn directional_speed_limit(&self, i: usize, velocity: f32, gravity_nm: Option<f32>) -> f32 {
+        let (Some(&lift), Some(g)) = (self.lift_max_speed_rad_s.get(i), gravity_nm) else {
+            return self.speed_limit(i);
+        };
+        // Falling: the holding torque opposes the motion.
+        let falling = g.abs() >= GRAVITY_DIRECTION_MIN_NM && velocity * g < 0.0;
+        if falling { self.speed_limit(i) } else { lift.max(self.speed_limit(i)) }
     }
 }
 
@@ -306,6 +326,8 @@ impl GravityCompPolicy {
             max_speed_rad_s: 1.5,
             // measured 2026-11-09: a hand flick of the wrist reached 2.5 rad/s on J4
             joint_max_speed_rad_s: vec![1.5, 1.5, 1.5, 3.0, 3.0, 3.0],
+            // measured 2026-11-12: lifting the arm by hand reached 1.59 and 2.16 rad/s on J3
+            lift_max_speed_rad_s: vec![3.0, 3.0, 3.0, 3.0, 3.0, 3.0],
             overspeed_ticks: 3,
             hold_kp: vec![30.0, 30.0, 30.0, 15.0, 10.0, 8.0],
             hold_kd: vec![1.0, 1.0, 1.0, 0.5, 0.3, 0.2],
@@ -329,6 +351,7 @@ impl GravityCompPolicy {
             || !six(&self.torque_limits_nm) || self.torque_limits_nm.iter().any(|t| *t > 18.0)
             || !pos(self.max_speed_rad_s) || self.overspeed_ticks == 0
             || !(self.joint_max_speed_rad_s.is_empty() || (six(&self.joint_max_speed_rad_s) && self.joint_max_speed_rad_s.iter().all(|v| pos(*v))))
+            || !(self.lift_max_speed_rad_s.is_empty() || (six(&self.lift_max_speed_rad_s) && self.lift_max_speed_rad_s.iter().all(|v| pos(*v))))
             || !six(&self.hold_kp) || self.hold_kp.iter().any(|k| *k > 500.0)
             || !six(&self.hold_kd) || self.hold_kd.iter().any(|k| *k > 5.0)
             || self.exit_hold_ms > 2000 || !pos(self.entry_max_velocity) || self.feedback_max_age_ms == 0

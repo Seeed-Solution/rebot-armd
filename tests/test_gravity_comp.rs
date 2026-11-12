@@ -662,6 +662,64 @@ async fn fast_wrist_hand_motion_does_not_exit_but_fast_elbow_does() {
     assert!(exit.message.contains("Joint 3"), "{}", exit.message);
 }
 
+#[tokio::test]
+async fn lifting_the_elbow_fast_does_not_exit_but_falling_does() {
+    // Real arm 2026-11-12: lifting the arm off the folded pose by hand reached 1.59 and
+    // 2.16 rad/s on J3 and ended the mode at the 1.5 rad/s limit. Moving against the model
+    // gravity torque now uses the lift limit (3.0 rad/s); moving with it keeps 1.5 rad/s.
+    let r = rig(0.0).await;
+    r.enter().await.unwrap();
+    r.ticks(60).await;
+    let model = ArmConfig::rebot_dm().arm_model;
+    let q = r.q();
+    let g = model.gravity_torques(&q[..6]).unwrap()[2];
+    assert!(g.abs() > 1.0, "the rig pose loads J3: {g}");
+    let lift = g.signum() * TORQUE_LIFT_NM;
+    { let mut s = r.sim.lock().unwrap(); s.user_torque[2] = lift; }
+    let mut peak = 0.0f32;
+    for _ in 0..12 {
+        let obs = r.ticks(1).await;
+        peak = peak.max(obs.velocities[2].abs());
+        assert_eq!(obs.control_mode, ControlMode::GravityComp, "lifting J3 must not end the mode (J3 {:.2} rad/s)", obs.velocities[2]);
+    }
+    { let mut s = r.sim.lock().unwrap(); s.user_torque = [0.0; 6]; }
+    println!("SIM elbow lift: J3 peak {peak:.2} rad/s");
+    assert!(peak > 1.5 && peak < 3.0, "test must exercise the band between the fall and lift limits: {peak}");
+    r.ticks(40).await;
+
+    // the same push towards gravity is a fall: 1.5 rad/s ends the mode
+    { let mut s = r.sim.lock().unwrap(); s.user_torque[2] = -lift; }
+    let mut exited = false;
+    for _ in 0..100 {
+        let obs = r.ticks(1).await;
+        if obs.gravity_comp.phase.as_deref() == Some("exiting") || obs.control_mode != ControlMode::GravityComp { exited = true; break; }
+    }
+    { let mut s = r.sim.lock().unwrap(); s.user_torque = [0.0; 6]; }
+    assert!(exited, "J3 moving with gravity must still end the mode");
+    let obs = r.sup.get_observation().await;
+    let exit = obs.gravity_comp.last_exit.as_ref().unwrap();
+    assert_eq!(exit.code, "GRAVITY_COMP_OVERSPEED");
+    assert!(exit.message.contains("Joint 3") && exit.message.contains("limit 1.5"), "{}", exit.message);
+}
+
+const TORQUE_LIFT_NM: f32 = 2.0;
+
+/// The trip of 2026-11-12 05:55:27 on the real arm (black box, 200 ms before the exit): J2 and
+/// J3 lifted off the folded pose. Both classify as lifting, so the lift limit applies.
+#[test]
+fn real_lift_off_the_folded_pose_is_a_lift() {
+    let config = ArmConfig::rebot_dm();
+    let gc = config.gravity_comp.as_ref().unwrap();
+    let q = [-0.0f32, -0.32, -0.37, -0.07, 0.0, 1.57];
+    let v = [-0.0f32, -1.07, -1.46, -0.11, -0.15, -0.01];
+    let g = config.arm_model.gravity_torques(&q).unwrap();
+    println!("REAL lift pose: model gravity torque {:?}", &g[..6]);
+    for i in [1, 2] {
+        assert_eq!(gc.directional_speed_limit(i, v[i], Some(g[i])), 3.0, "J{} v {} g {}", i + 1, v[i], g[i]);
+        assert_eq!(gc.directional_speed_limit(i, -v[i], Some(g[i])), 1.5, "J{} reversed is a fall", i + 1);
+    }
+}
+
 #[test]
 fn per_joint_speed_limits_validate() {
     let mut config = ArmConfig::rebot_dm();

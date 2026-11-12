@@ -354,23 +354,29 @@ impl SupervisorInner {
         }
         // Speed: reported velocity, and the position difference over the tick (independent
         // of the velocity mapping range VMAX).
+        // The limit depends on the direction: moving with gravity (falling) uses the
+        // overspeed limit, moving against it (lifted by hand) the lift limit.
         let measured = arm6(&self.measured_positions);
         let prev = run.prev_measured;
-        let mut fastest: Option<(usize, f32)> = None;
+        let gravity = self.config.arm_model.gravity_torques(&measured).ok()
+            .filter(|t| t.len() >= ARM && t.iter().all(|x| x.is_finite()));
+        let mut fastest: Option<(usize, f32, f32)> = None;
         for i in 0..ARM {
-            let reported = self.measured_velocities.get(i).copied().unwrap_or(0.0).abs();
-            let differenced = prev.map_or(0.0, |p| ((measured[i] - p[i]) / dt.max(1e-3) as f32).abs());
-            let speed = reported.max(differenced);
-            if speed > policy.speed_limit(i) && fastest.is_none_or(|(_, s)| speed > s) { fastest = Some((i, speed)); }
+            let reported = self.measured_velocities.get(i).copied().unwrap_or(0.0);
+            let differenced = prev.map_or(0.0, |p| (measured[i] - p[i]) / dt.max(1e-3) as f32);
+            let v = if differenced.abs() > reported.abs() { differenced } else { reported };
+            let speed = v.abs();
+            let limit = policy.directional_speed_limit(i, v, gravity.as_ref().map(|t| t[i]));
+            if speed > limit && fastest.is_none_or(|(_, s, _)| speed > s) { fastest = Some((i, speed, limit)); }
         }
         let run = self.gravity_comp.as_mut()?;
         run.prev_measured = Some(measured);
         match fastest {
-            Some((i, speed)) => {
+            Some((i, speed, limit)) => {
                 run.overspeed_count += 1;
                 if run.overspeed_count >= policy.overspeed_ticks {
                     return Some(("GRAVITY_COMP_OVERSPEED", format!(
-                        "Joint {} at {speed:.2} rad/s for {} ticks (limit {} rad/s)", i + 1, run.overspeed_count, policy.speed_limit(i))));
+                        "Joint {} at {speed:.2} rad/s for {} ticks (limit {limit} rad/s)", i + 1, run.overspeed_count)));
                 }
             }
             None => run.overspeed_count = 0,

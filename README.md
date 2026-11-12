@@ -404,7 +404,8 @@ the header).
   keys send open / close actions, and a banner shows the ramp, the recording toggle and an exit
   button. Exit, stop, E-stop, lease loss, faults, stale feedback, overspeed and the
   other exit causes lock the arm at the measured pose; the reason is shown as a toast.
-  Overspeed limits are 1.5 rad/s for J1–J3 and 3.0 rad/s for J4–J6. On the B601-DM, all five
+  Overspeed limits are 1.5 rad/s for J1–J3 and 3.0 rad/s for J4–J6 when a joint moves with
+  gravity (falling), and 3.0 rad/s for every joint lifted against gravity by hand. On the B601-DM, all five
   exit paths tested (exit, stop, takeover, E-stop, client disconnect) held the arm within
   1.5 mrad, and a 30 s hand-guided recording gave 1509 frames.
 - **E-stop** button, fault display and clear, torque enable by press-and-hold, park. With
