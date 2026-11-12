@@ -99,7 +99,7 @@
 2026-11-12 抓取稳健性（`src/grasp.rs`，仅仿真验证，详见 `docs/agent_action_api.md`「稳健性步骤」）：
 
 - J6 对齐：框贴画面边界（2 px 内）或面积相对对中帧中位数变化超过 40 % 时不转动；检测结果带 `angle_deg` / `angle_conf`（≥ `align_min_angle_conf`）时按角度使夹爪垂直于长边闭合，取 J6 限位内最小转角。
-- 高度探测：对中后竖直下移 `height_probe_m`，由框尺寸变化估计物体顶面高度；之后用顶面平面做像素映射，夹爪在 clamp(高度 · `height_grasp_fraction`, `grasp_height_m`, `max_grasp_height_m`) 处闭合；过高为 `OBJECT_TOO_TALL`，其余情况回退到 `grasp_height_m`。
+- 高度探测：对中后竖直上移 `height_probe_m`（默认 0.10 m，不可达时 0.06 m，实际值见 `probe_dz_m`）再回到起始位姿（向上移动，不会在高度未知时碰到高物体），由框尺寸变化估计物体顶面高度；框尺寸离散导致不确定度超过 0.01 m 或上移位姿不可达时回退；之后用顶面平面做像素映射，夹爪在 clamp(高度 · `height_grasp_fraction`, `grasp_height_m`, `max_grasp_height_m`) 处闭合；过高为 `OBJECT_TOO_TALL`，其余情况回退到 `grasp_height_m`。
 - 俯视时在 `recentre_height_m` 中途再对中（最多 `recentre_max_iterations` 次）；下降时记录 J2/J3 残差和跟踪误差峰值，`descend_contact_stop_nm`（默认关闭）超限时在实测位置停止下降并闭合。
 - 抬起后 `post_lift_settle_ms` 再判夹持，物体脱落为 `DROPPED`。
 

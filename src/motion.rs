@@ -745,6 +745,9 @@ pub struct ActionStatus {
     /// Grasp: TCP height above the table at which the jaws close (m).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_height_m: Option<f32>,
+    /// Grasp height probe: the upward move used (m), absent when the probe did not move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_dz_m: Option<f32>,
     /// Grasp mid-height re-centre (look-down): `done`, `unconverged` or `skipped:<reason>`,
     /// with the corrections made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
