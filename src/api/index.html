@@ -6977,8 +6977,12 @@ async function v3Init() {
   try {
     const [u, m] = await Promise.all([fetch('/assets/model/reBot-DevArm_gripper.urdf'), fetch('/assets/model/meshes/manifest.json')]);
     if (u.ok && m.ok) { urdf = await u.text(); man = await m.json(); }
-  } catch (_) { /* stick figure */ }
-  if (urdf && man && man.links) {
+    if (man && man.format === 'rbm1' && /^[\w.-]+$/.test(man.file || '')) {
+      const b = await fetch('/assets/model/meshes/' + man.file);
+      man.buf = b.ok ? await b.arrayBuffer() : null;
+    } else man = null;
+  } catch (_) { man = null; /* stick figure */ }
+  if (urdf && man && man.links && man.buf && man.buf.byteLength === man.bytes) {
     try { V3.solid = await v3Robot(T, urdf, man, false); V3.ghost = await v3Robot(T, urdf, man, true); V3.mode = 'mesh'; }
     catch (e) { console.warn('3D meshes', e); V3.solid = V3.ghost = null; }
   }
@@ -6988,33 +6992,70 @@ async function v3Init() {
   new ResizeObserver(() => { if (V3.open) v3Resize(); }).observe($('view3d'));
   V3.key = '';
 }
+// One part of meshes/arm.bin (layout: scripts/decimate_meshes.py): Uint16 positions quantized to the
+// part's bbox, then Uint16/Uint32 triangle indices. Returns a non-indexed geometry whose normals are
+// smoothed across edges flatter than V3_CREASE and kept sharp across steeper ones.
+const V3_CREASE = Math.cos(35 * Math.PI / 180);
+function v3Part(T, buf, pt) {
+  const nv = pt.verts, nf = pt.faces, bb = pt.bbox;
+  const q = new Uint16Array(buf, pt.offset, nv * 3);
+  const idx = new (pt.index_bytes === 4 ? Uint32Array : Uint16Array)(buf, pt.offset + Math.ceil(nv * 6 / 4) * 4, nf * 3);
+  const P = new Float32Array(nv * 3);
+  for (let i = 0; i < P.length; i++) { const k = i % 3; P[i] = bb[k] + q[i] * (bb[k + 3] - bb[k]) / 65535; }
+  const A = new Float32Array(nf * 3), N = new Float32Array(nf * 3); // area-weighted and unit face normals
+  const cnt = new Uint32Array(nv + 1);
+  for (let f = 0; f < nf; f++) {
+    const a = idx[3 * f] * 3, b = idx[3 * f + 1] * 3, c = idx[3 * f + 2] * 3;
+    const ux = P[b] - P[a], uy = P[b + 1] - P[a + 1], uz = P[b + 2] - P[a + 2];
+    const vx = P[c] - P[a], vy = P[c + 1] - P[a + 1], vz = P[c + 2] - P[a + 2];
+    const x = uy * vz - uz * vy, y = uz * vx - ux * vz, z = ux * vy - uy * vx, l = Math.hypot(x, y, z) || 1;
+    A[3 * f] = x; A[3 * f + 1] = y; A[3 * f + 2] = z; N[3 * f] = x / l; N[3 * f + 1] = y / l; N[3 * f + 2] = z / l;
+    for (let j = 0; j < 3; j++) cnt[idx[3 * f + j] + 1]++;
+  }
+  for (let v = 0; v < nv; v++) cnt[v + 1] += cnt[v];
+  const inc = new Uint32Array(nf * 3), fill = cnt.slice(0, nv); // faces around each vertex
+  for (let f = 0; f < nf; f++) for (let j = 0; j < 3; j++) inc[fill[idx[3 * f + j]]++] = f;
+  const pos = new Float32Array(nf * 9), nor = new Float32Array(nf * 9);
+  for (let f = 0; f < nf; f++) for (let j = 0; j < 3; j++) {
+    const v = idx[3 * f + j], o = 9 * f + 3 * j;
+    let x = 0, y = 0, z = 0;
+    for (let k = cnt[v]; k < cnt[v + 1]; k++) {
+      const g = inc[k];
+      if (N[3 * f] * N[3 * g] + N[3 * f + 1] * N[3 * g + 1] + N[3 * f + 2] * N[3 * g + 2] >= V3_CREASE) { x += A[3 * g]; y += A[3 * g + 1]; z += A[3 * g + 2]; }
+    }
+    const l = Math.hypot(x, y, z) || 1;
+    pos[o] = P[3 * v]; pos[o + 1] = P[3 * v + 1]; pos[o + 2] = P[3 * v + 2];
+    nor[o] = x / l; nor[o + 1] = y / l; nor[o + 2] = z / l;
+  }
+  const geo = new T.BufferGeometry();
+  geo.setAttribute('position', new T.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('normal', new T.Float32BufferAttribute(nor, 3));
+  return geo;
+}
 function v3Robot(T, urdf, man, ghost) {
-  const pend = [];
   const loader = new T.URDFLoader();
   loader.packages = (pkg) => '/assets/model/' + pkg;
   loader.loadMeshCb = (path, _mgr, _mat, done) => {
     const base = path.split('/').pop().replace(/\.stl$/i, '');
     const parts = man.links[V3_LINK_OF[base] || base] || [];
     const g = new T.Group();
-    pend.push(Promise.all(parts.map(async (pt) => {
-      if (!v3Geo.has(pt.file)) v3Geo.set(pt.file, new T.STLLoader().loadAsync('/assets/model/meshes/' + pt.file));
-      const geo = await v3Geo.get(pt.file);
-      if (!geo.attributes.normal) geo.computeVertexNormals();
+    for (const pt of parts) {
+      if (!v3Geo.has(pt.part)) v3Geo.set(pt.part, v3Part(T, man.buf, pt));
       const mat = ghost ? V3.ghostMat
         : new T.MeshStandardMaterial({ color: new T.Color().setRGB(pt.rgb[0], pt.rgb[1], pt.rgb[2], T.SRGBColorSpace), metalness: 0.25, roughness: 0.6 });
-      g.add(new T.Mesh(geo, mat));
-    })));
+      g.add(new T.Mesh(v3Geo.get(pt.part), mat));
+    }
     done(g);
   };
   const robot = loader.parse(urdf);
-  return Promise.all(pend).then(() => ({
+  return Promise.resolve({
     obj: robot,
     set(q) {
       for (let i = 0; i < 6; i++) robot.setJointValue('joint' + (i + 1), Number(q[i]) || 0);
       if (q.length > 6) { const d = gripFrac(q[6]) * V3_FINGER_M; robot.setJointValue('left_finger_joint', d); robot.setJointValue('right_finger_joint', d); }
     },
     end() { const v = robot.links.end_link.getWorldPosition(new T.Vector3()); V3.root.worldToLocal(v); return [v.x, v.y, v.z]; },
-  }));
+  });
 }
 // stick figure through the URDF joint frames: base, J1..J6 origins, end_link
 function v3Stick(T, ghost) {
