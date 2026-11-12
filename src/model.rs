@@ -497,6 +497,10 @@ pub struct ArmConfig {
     /// Collision guard (`src/collision.rs`); None = defaults, guard off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collision: Option<crate::collision::CollisionPolicy>,
+    /// Torque-saturation guard (`src/torque_guard.rs`); None = off. Needs `damiao_ranges`
+    /// (the per-joint TMAX) when enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torque_guard: Option<crate::torque_guard::TorqueGuardPolicy>,
     /// Facts about the installed hardware published by `/api/v1/safety/describe`;
     /// None = no wired emergency stop and the default notes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -580,6 +584,7 @@ impl Default for ArmConfig {
             damiao_ranges: None,
             speed_cap: None,
             collision: None,
+            torque_guard: None,
             hardware: None,
             urdf: None,
             urdf_sha256: None,
@@ -706,6 +711,12 @@ impl ArmConfig {
         }
         if let Some(cap) = &self.speed_cap { cap.validate()?; }
         if let Some(c) = &self.collision { c.validate()?; }
+        if let Some(t) = &self.torque_guard {
+            t.validate()?;
+            if t.enabled && self.damiao_ranges.is_none() {
+                return Err("torque_guard needs damiao_ranges (the per-joint torque mapping range TMAX)".into());
+            }
+        }
         if let Some(caps) = &self.servo_max_velocity {
             if caps.len() != self.dof || caps.iter().flatten().any(|v| !v.is_finite() || *v <= 0.0) {
                 return Err(format!("servo_max_velocity needs {} entries, each null or positive finite", self.dof));
@@ -881,6 +892,11 @@ impl ArmConfig {
                 rest_exempt_joints: Some([false, true, true, true, false, false]),
                 ..Default::default()
             }),
+            // 60 % of TMAX for 100 ms on J1-J6: 16.8 N·m on J1-J3, 6.0 N·m on J4-J6. Chosen
+            // 2026-11-12 after the J4 stall incident for the Mean Well LRS-150-24 in use
+            // (24 V 6.5 A, overload hiccup measured at ~8.5 A); 0.85 is the value intended
+            // with the recommended LRS-350-24 (14.6 A).
+            torque_guard: Some(crate::torque_guard::TorqueGuardPolicy { ratio: 0.60, ..Default::default() }),
             hardware: None,
             urdf: None,
             urdf_sha256: None,
@@ -979,6 +995,9 @@ pub enum MotionLimitReason {
     Workspace,
     /// The stream ended in a hold: a joint could not follow (no Fault).
     Blocked,
+    /// Torque guard: a joint's |torque| stayed at or above its threshold; motion stopped and
+    /// the joint is held (no Fault). Targets pushing further in are clamped.
+    Torque,
 }
 
 impl MotionLimitReason {
@@ -990,6 +1009,7 @@ impl MotionLimitReason {
             Self::Workspace => 2,
             Self::JointLimit => 3,
             Self::Blocked => 4,
+            Self::Torque => 5,
         }
     }
 }
@@ -1056,7 +1076,7 @@ pub struct SchemaField {
 }
 
 /// Version of the capability summary in the observation schema (`capabilities`).
-pub const CAPABILITIES_VERSION: u32 = 7;
+pub const CAPABILITIES_VERSION: u32 = 8;
 
 /// Vision features armd offers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1147,6 +1167,11 @@ pub struct Capabilities {
     /// (`GET /api/v1/dataset/episodes`, `DELETE /api/v1/dataset/episodes/{id}`). Present from
     /// capabilities version 7. Whether storage is on shows in the listing's `enabled`.
     pub replay: bool,
+    /// Torque-saturation guard (`torque_guard` profile section, `schema.torque_guard`,
+    /// `motion_limit.reason` = `torque`, action code `TORQUE_LIMIT`): enabled in the profile
+    /// with `damiao_ranges`, and a driver that reports torque. Present from capabilities
+    /// version 8.
+    pub torque_guard: bool,
     pub vision: VisionCapabilities,
 }
 
@@ -1181,6 +1206,8 @@ impl Capabilities {
             collision_guard: config.gravity_model.is_some() && six_arm,
             safety_describe: true,
             replay: true,
+            // The driver half is applied by ArmSupervisor::get_schema.
+            torque_guard: crate::torque_guard::TorqueGuardInfo::from_config(config).is_some(),
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }
@@ -1219,6 +1246,9 @@ pub struct ObservationSchema {
     /// when the profile has none and in older schemas.
     #[serde(default)]
     pub resting_pose: Option<RestingPosePolicy>,
+    /// Torque-saturation guard policy; null when the profile has none (and in older schemas).
+    #[serde(default)]
+    pub torque_guard: Option<crate::torque_guard::TorqueGuardInfo>,
 }
 
 impl ObservationSchema {
@@ -1298,6 +1328,7 @@ impl ObservationSchema {
             speed_cap: config.speed_cap,
             home_positions: Some(config.home_positions.clone()),
             resting_pose: config.resting_pose.clone(),
+            torque_guard: crate::torque_guard::TorqueGuardInfo::from_config(config),
         }
     }
 }

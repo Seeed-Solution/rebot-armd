@@ -257,6 +257,8 @@ pub struct SupervisorInner {
     pub residual_torques: Option<[f32; 6]>,
     /// Collision guard state (`src/collision.rs`).
     pub collision: crate::collision::CollisionGuard,
+    /// Torque-saturation guard state (`src/torque_guard.rs`).
+    pub torque_guard: crate::torque_guard::TorqueGuard,
     /// `--follower` model name armd was started with (`safety/describe` `device.follower`).
     pub follower: Option<String>,
 }
@@ -373,6 +375,7 @@ impl SupervisorInner {
             poses: crate::poses::PoseStore::default(),
             residual_torques: None,
             collision: crate::collision::CollisionGuard::from_policy(&collision_policy),
+            torque_guard: crate::torque_guard::TorqueGuard::default(),
             follower: None,
         }
     }
@@ -381,7 +384,9 @@ impl SupervisorInner {
     pub fn schema(&self) -> ObservationSchema {
         let mut schema = ObservationSchema::from_config(&self.config);
         schema.capabilities.gravity_comp = self.gravity_comp_support().is_ok();
-        schema.capabilities.collision_guard &= self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+        let torque_feedback = self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
+        schema.capabilities.collision_guard &= torque_feedback;
+        schema.capabilities.torque_guard &= torque_feedback;
         schema
     }
 
@@ -465,6 +470,7 @@ impl SupervisorInner {
     /// End of tick: keep `blocked` while the hold lasts, clear a limit not seen for
     /// [`MOTION_LIMIT_CLEAR_S`].
     fn expire_motion_limit(&mut self) {
+        if let Some(h) = self.torque_guard.hold { self.note_motion_limit(MotionLimitReason::Torque, Some(h.joint)); }
         if self.servo_blocked_hold {
             let resumed = self.servo_target.is_some() || self.active_trajectory.is_some() || self.macro_run.is_some()
                 || self.gravity_comp.is_some() || !self.is_torqued || self.safety.state().is_stopped();
@@ -545,6 +551,14 @@ impl SupervisorInner {
     }
 
     fn servo_hold(&mut self, reason: MotionLimitReason, joint: Option<usize>) {
+        self.hold_measured_pose();
+        self.note_motion_limit(reason, joint);
+        self.servo_blocked_hold = true;
+    }
+
+    /// End every motion and hold the measured pose (clamped to the limits) with torque on;
+    /// the gripper keeps its command so that a held object stays held.
+    pub(crate) fn hold_measured_pose(&mut self) {
         let gripper_idx = self.config.gripper_index();
         let grip_cmd = gripper_idx.map(|g| self.commanded_positions[g]);
         self.stop_motion();
@@ -561,8 +575,6 @@ impl SupervisorInner {
         self.following_error_since = None;
         self.servo_lead_stall.fill(None);
         self.safety.mark_motion_finished();
-        self.note_motion_limit(reason, joint);
-        self.servo_blocked_hold = true;
     }
 
     /// Workspace policy and camera mount when the Cartesian check applies
@@ -1571,7 +1583,7 @@ impl SupervisorInner {
         Ok(())
     }
 
-    pub fn servo(&mut self, targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
+    pub fn servo(&mut self, mut targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
         self.gravity_comp_servo_busy()?;
         self.collision_hold_check()?;
         if self.handover_settling_since.is_some() {
@@ -1611,6 +1623,7 @@ impl SupervisorInner {
             return Err(e);
         }
         if self.servo_blocked_hold { self.clear_blocked_hold(); }
+        self.torque_hold_filter(&mut targets);
 
         // Only renew lease and motion frame timestamp AFTER command validation succeeds
         self.last_heartbeat = Instant::now();
@@ -1673,6 +1686,7 @@ impl SupervisorInner {
         tag: Option<String>,
         limits: &[crate::model::JointLimit],
     ) -> Result<(u64, u64, f64), ArmError> {
+        let mut target_positions = target_positions;
         self.gravity_comp_motion_busy()?;
         self.collision_hold_check()?;
         if self.handover_settling_since.is_some() {
@@ -1694,6 +1708,7 @@ impl SupervisorInner {
             &target_positions,
             &self.config.limits,
         )?;
+        self.torque_hold_filter(&mut target_positions);
 
         // J7 Gripper stall release check on reverse command
         if self.config.dof >= 7 && self.gripper_stalled && target_positions.len() >= 7 {
@@ -2622,6 +2637,8 @@ impl SupervisorInner {
 
         // Collision guard: a trip stops the reference before it is stepped this tick.
         self.collision_tick(servo_dt);
+        // Torque-saturation guard: same placement (src/torque_guard.rs).
+        self.torque_guard_tick(servo_dt);
         let mut reference_stepped = false;
 
         // 3. Step trajectory if active, or step servo target
