@@ -27,6 +27,7 @@ import pytest
 
 from rebot_sim.camera import CameraMount, axis_r, mount_rotation
 from rebot_sim.model import load_model
+from rebot_sim.server import PROTOCOL_VERSION
 from test_armd_sim import PROFILE, TOOL_DOWN, Client, armd_binary, free_port
 
 
@@ -38,9 +39,22 @@ def http(url: str, body: dict | None = None, timeout: float = 10.0) -> dict:
         return json.loads(r.read())
 
 
-def wait_http(url: str, proc: subprocess.Popen, log, timeout: float = 30.0) -> None:
+def hold_arm(udp_port: int) -> None:
+    """Enable the simulated motors with no target, so they hold where they are (armd disables
+    them again when it connects). The real wrist stays at rest with the torque off (resting_pose
+    J4 tolerance 0.08 rad); the simulated J4 has no holding friction and droops during the camera
+    start-up until the jaws, horizontal at rest, wedge on the table, where the velocity servo's
+    stall torque cannot lift them."""
+    msg = json.dumps({"v": PROTOCOL_VERSION, "type": "cmd", "seq": 0, "enable": True}).encode()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.sendto(msg, ("127.0.0.1", udp_port))
+
+
+def wait_http(url: str, proc: subprocess.Popen, log, timeout: float = 30.0, udp_hold: int | None = None) -> None:
     deadline = time.time() + timeout
     while True:
+        if udp_hold is not None:
+            hold_arm(udp_hold)
         try:
             urllib.request.urlopen(url, timeout=1)
             return
@@ -57,8 +71,8 @@ def wait_http(url: str, proc: subprocess.Popen, log, timeout: float = 30.0) -> N
 CASES = {
     "default": ([], None),
     "seed3_cube_cup": (["--objects", "cube,cup", "--seed", "3"], None),
-    "v8_default": ([], (90.0, -38.0)),
-    "v8_seed3_cube_cup": (["--objects", "cube,cup", "--seed", "3"], (90.0, -38.0)),
+    "v8_default": ([], (0.0, -38.0)),
+    "v8_seed3_cube_cup": (["--objects", "cube,cup", "--seed", "3"], (0.0, -38.0)),
 }
 
 
@@ -91,7 +105,7 @@ def cam_rig(request, tmp_path):
                             "--camera", "--video-port", str(video), "--perception-port", str(percep), *extra],
                            stdout=open(tmp_path / "sim.log", "w"), stderr=subprocess.STDOUT)
     base = f"http://127.0.0.1:{percep}"
-    wait_http(base + "/sim/camera", sim, tmp_path / "sim.log")
+    wait_http(base + "/sim/camera", sim, tmp_path / "sim.log", udp_hold=udp)
     cam = http(base + "/sim/camera")
     profile = json.loads(PROFILE.read_text())
     profile["camera_mount"]["offset_m"] = cam["camera_mount"]["offset_m"]
@@ -123,7 +137,8 @@ def test_tap_to_grasp_the_cube(cam_rig):
     while not client.observation()["feedback_valid"] and time.time() < deadline:
         time.sleep(0.1)
     client.command("/api/v1/torque", {"enable": True})
-    assert client.wait_action(client.command("/api/v1/motion/home", {})["action_id"])["state"] == "done"
+    rec = client.wait_action(client.command("/api/v1/motion/home", {})["action_id"])
+    assert rec["state"] == "done", json.dumps(rec)
 
     # the operator brings the cube into view: v5 tool down above it; v8 tool pitched half way
     # toward camera-down, the image centre 2 cm from the cube
@@ -132,7 +147,7 @@ def test_tap_to_grasp_the_cube(cam_rig):
         view, orientation = view_pose(cam, cube_xy, 0.20, (0.02, -0.01))
         orientation = {"quat": orientation}
     else:
-        view, orientation = [cube_xy[0], cube_xy[1], 0.20], TOOL_DOWN
+        view, orientation = [cube_xy[0], cube_xy[1], 0.25], TOOL_DOWN
     rec = client.wait_action(client.command("/api/v1/action/move_to", {"position": view, "orientation": orientation,
                                                                        "speed": {"linear": 0.1}})["action_id"])
     assert rec["state"] == "done", json.dumps(rec)
@@ -148,7 +163,9 @@ def test_tap_to_grasp_the_cube(cam_rig):
     schema = http(client.base + "/api/v1/observation/schema")
     print(f"schema vision caps: {schema.get('capabilities', {}).get('vision')}")
 
-    approach = 0.15
+    # v5 (tool-axis camera, lens 66 mm above the jaws on end_link +z): the point under the jaw
+    # tips is inside the 24.7 deg tall image from about 0.23 m up (v = 1.18 at 0.15 m, 0.97 at 0.25 m)
+    approach = 0.15 if v8 else 0.25
     overrides = {"fx_px": cam["fx_px"], "fy_px": cam["fx_px"], "approach_height_m": approach}
     if not v8:  # v8: the point under the jaws is outside the image at 0.15 m; camera-down does not use it
         overrides["grip_pixel_norm"] = cam["grip_pixel_norm_at"][f"{approach:.2f}"]

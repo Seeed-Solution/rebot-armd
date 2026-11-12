@@ -97,8 +97,8 @@ def test_detections_contain_the_projected_object_centre_and_match_the_render():
     data = mujoco.MjData(model)
     scene = Scene(model, objects)
     scene.reset(data, seed=None)
-    # a pose (found by sampling) with the cube whole in view and the block cut by the image edge
-    set_arm(model, data, [0.46, -0.63, -1.05, 1.48, 0.43, -0.66])
+    # a pose (found by sampling, motor angles) with the cube whole in view and the block cut by the image edge
+    set_arm(model, data, [0.58, -0.96, -1.04, 1.29, 0.56, -0.64])
     cam = model.camera("wrist").id
     renderer = mujoco.Renderer(model, 360, 640)
     renderer.enable_segmentation_rendering()

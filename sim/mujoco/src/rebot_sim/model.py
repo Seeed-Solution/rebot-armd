@@ -1,6 +1,8 @@
 """B601-DM scene loading and the armd motor <-> MuJoCo joint mapping."""
 from __future__ import annotations
 
+import json
+import math
 import os
 from pathlib import Path
 
@@ -12,6 +14,22 @@ SCENE_XML = MODEL_DIR / "rebot_b601dm_scene.xml"
 
 ARM_JOINTS = [f"joint{i}" for i in range(1, 7)]
 DOF = 7
+KIT_PROFILE = Path(__file__).resolve().parents[4] / "kits" / "recamera-b601dm" / "profile" / "rebot-b601dm.json"
+# armd motor -> URDF (MuJoCo) joint angle offsets J1..J6: URDF = motor + offset. B601-DM: J6 =
+# motor - pi/2 (armd kinematics::B601DM_MODEL_OFFSETS_RAD, profile field model_offsets_rad).
+B601DM_MODEL_OFFSETS_RAD = (0.0, 0.0, 0.0, 0.0, 0.0, -math.pi / 2)
+
+
+def model_offsets(profile: Path | str = KIT_PROFILE) -> np.ndarray:
+    """`model_offsets_rad` of an armd profile; the B601-DM values when the file or field is absent."""
+    try:
+        off = json.loads(Path(profile).read_text()).get("model_offsets_rad")
+    except (OSError, ValueError):
+        off = None
+    return np.array(off if off and len(off) == 6 else B601DM_MODEL_OFFSETS_RAD, dtype=float)
+
+
+MODEL_OFFSETS_RAD = model_offsets()
 # Jaw opening per side (m) per rad of J7: 85 mm clear span at the profile's open_rad -5.7.
 JAW_M_PER_RAD = 0.0425 / 5.7
 
@@ -75,6 +93,7 @@ class Indexer:
     def motor_positions(self, data: mujoco.MjData) -> np.ndarray:
         """armd motor angles J1..J7 (rad)."""
         q = data.qpos[self.qpos].copy()
+        q[:6] -= MODEL_OFFSETS_RAD
         q[6] = -q[6] / JAW_M_PER_RAD
         return q
 
@@ -85,7 +104,7 @@ class Indexer:
 
     def set_motor_positions(self, data: mujoco.MjData, q) -> None:
         q = np.asarray(q, dtype=float)
-        data.qpos[self.qpos[:6]] = q[:6]
+        data.qpos[self.qpos[:6]] = q[:6] + MODEL_OFFSETS_RAD
         if len(q) > 6:
             jaw = -q[6] * JAW_M_PER_RAD
             data.qpos[self.qpos[6]] = jaw
