@@ -662,6 +662,8 @@ pub enum Reference {
     Quintic(MultiJointQuinticTrajectory),
     Path(PathTrajectory),
     Gripper(GripperMotion),
+    /// Episode replay (`crate::replay`).
+    Replay(Box<crate::replay::ReplayMotion>),
 }
 
 #[derive(Debug, Clone)]
@@ -680,6 +682,7 @@ impl ActiveTrajectory {
             Reference::Quintic(t) => t.duration,
             Reference::Path(p) => p.duration(),
             Reference::Gripper(g) => g.expected_duration(),
+            Reference::Replay(r) => r.expected_duration(),
         }
     }
     pub fn as_quintic(&self) -> Option<&MultiJointQuinticTrajectory> {
@@ -691,7 +694,7 @@ impl ActiveTrajectory {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActionStatus {
     pub id: u64,
-    /// move_to | move_relative | gripper | grasp | place | joint_move | home | park | move_to_pose
+    /// move_to | move_relative | gripper | grasp | place | joint_move | home | park | move_to_pose | replay
     pub kind: String,
     pub tag: Option<String>,
     /// running | done | failed | cancelled
@@ -720,6 +723,13 @@ pub struct ActionStatus {
     /// `approach_height_m`, raised for table clearance; absent when not raised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acquire_height_m: Option<f32>,
+    /// Replay only: episode id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode: Option<String>,
+    /// Replay only: recording time reached (s); 0 during the approach (`phase` approach |
+    /// replay | settle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t_s: Option<f32>,
 }
 
 impl ActionStatus {

@@ -1056,7 +1056,7 @@ pub struct SchemaField {
 }
 
 /// Version of the capability summary in the observation schema (`capabilities`).
-pub const CAPABILITIES_VERSION: u32 = 6;
+pub const CAPABILITIES_VERSION: u32 = 7;
 
 /// Vision features armd offers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1143,6 +1143,10 @@ pub struct Capabilities {
     pub collision_guard: bool,
     /// `GET /api/v1/safety/describe`: limits, stops and faults generated from the running config.
     pub safety_describe: bool,
+    /// Episode replay (`/api/v1/action/replay`) and episode management
+    /// (`GET /api/v1/dataset/episodes`, `DELETE /api/v1/dataset/episodes/{id}`). Present from
+    /// capabilities version 7. Whether storage is on shows in the listing's `enabled`.
+    pub replay: bool,
     pub vision: VisionCapabilities,
 }
 
@@ -1176,6 +1180,7 @@ impl Capabilities {
             // The driver half is applied by ArmSupervisor::get_schema.
             collision_guard: config.gravity_model.is_some() && six_arm,
             safety_describe: true,
+            replay: true,
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }

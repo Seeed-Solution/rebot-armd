@@ -44,6 +44,13 @@ pub enum ArmError {
     Rejected { status: u16, code: String, message: String },
 }
 
+impl From<crate::recording::StoreError> for ArmError {
+    fn from(e: crate::recording::StoreError) -> Self {
+        let (status, code) = e.status_code();
+        ArmError::Rejected { status, code: code.into(), message: e.to_string() }
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
 pub enum PreemptError {
     #[error("Preemption cooldown active: {0}ms remaining")]
@@ -224,6 +231,8 @@ pub struct SupervisorInner {
     /// Duration of the most recently planned NormalUnload trajectory (s).
     pub unload_planned_duration: Option<f64>,
     pub recorder: EpisodeRecorder,
+    /// Episode directory (`--episodes-dir`, `src/recording/store.rs`).
+    pub episodes: crate::recording::EpisodeStore,
     pub start_time: Instant,
     pub driver: Option<std::sync::Mutex<Box<dyn ArmDriver>>>,
     pub gravity_compensated: bool,
@@ -345,6 +354,7 @@ impl SupervisorInner {
             workspace_revision: 0,
             unload_planned_duration: None,
             recorder: EpisodeRecorder::new(),
+            episodes: crate::recording::EpisodeStore::new(Some(PathBuf::from(crate::recording::store::FALLBACK_EPISODES_DIR))),
             start_time: now,
             driver: None,
             gravity_compensated,
@@ -531,81 +541,7 @@ impl SupervisorInner {
         knots: &[f64],
         budget: usize,
     ) -> Result<Vec<Vec<f32>>, SafetyError> {
-        use crate::kinematics::WORKSPACE_EPS;
-        let model = &self.config.arm_model;
-        let n = model.arm_dof();
-        let local: Vec<[f64; 3]> = std::iter::once([0.0f32; 3]).chain(ws.check_points_end_m.iter().copied())
-            .chain(cam.offset_m).map(|p| p.map(f64::from)).collect();
-        let reach = model.joint_reach(local.iter().map(crate::kinematics::norm).fold(0.0, f64::max));
-        let boxes: Vec<([f64; 3], [f64; 3])> = ws.keepout_boxes.iter().map(|b| (b.min_m.map(f64::from), b.max_m.map(f64::from))).collect();
-        let invalid = || SafetyError::WorkspaceViolation { point: 0, limit: "invalid".into(), value: f32::NAN, bound: 0.0 };
-        // (outside distance, depth inside) of every point to every box at q
-        let measure = |q: &[f32]| -> Option<Vec<(f64, f64)>> {
-            let pose = model.fk_f32(q)?;
-            Some(local.iter().flat_map(|l| {
-                let p = pose.transform_point(l);
-                boxes.iter().map(move |(lo, hi)| {
-                    let out = (0..3).map(|k| (lo[k] - p[k]).max(p[k] - hi[k]).max(0.0).powi(2)).sum::<f64>().sqrt();
-                    let depth = (0..3).map(|k| (p[k] - lo[k]).min(hi[k] - p[k])).fold(f64::INFINITY, f64::min);
-                    (out, depth)
-                })
-            }).collect())
-        };
-        let nb = boxes.len();
-        let first = at(knots[0]);
-        let m0 = measure(&first).ok_or_else(invalid)?;
-        let active: Vec<bool> = m0.iter().map(|&(_, depth)| depth <= 0.0).collect();
-        let check = |m: &[(f64, f64)]| -> Result<(), SafetyError> {
-            match m.iter().enumerate().filter(|(i, (_, depth))| active[*i] && *depth > WORKSPACE_EPS)
-                .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1)) {
-                Some((i, &(_, depth))) => Err(SafetyError::WorkspaceViolation {
-                    point: i / nb,
-                    limit: format!("keepout '{}'", ws.keepout_boxes[i % nb].name),
-                    value: depth as f32, bound: 0.0,
-                }),
-                None => Ok(()),
-            }
-        };
-        let mut samples: Vec<(f64, Vec<f32>)> = vec![(knots[0], first)];
-        let mut ends: Vec<(f64, Vec<(f64, f64)>)> = vec![(knots[0], m0)];
-        for &t in &knots[1..] {
-            let q = at(t);
-            let m = measure(&q).ok_or_else(invalid)?;
-            check(&m)?;
-            samples.push((t, q));
-            ends.push((t, m));
-        }
-        let mut evals = 0usize;
-        let mut stack: Vec<((f64, Vec<(f64, f64)>), (f64, Vec<(f64, f64)>))> = Vec::new();
-        let mut ends = ends.into_iter();
-        let mut prev = ends.next().ok_or_else(invalid)?;
-        for e in ends { stack.push((prev, e.clone())); prev = e; }
-        while let Some(((t0, m0), (t1, m1))) = stack.pop() {
-            let tr = travel(t0, t1);
-            let bound: f64 = tr.iter().take(n).zip(&reach).map(|(d, r)| d * r).sum();
-            if !bound.is_finite() { return Err(invalid()); }
-            if bound <= WORKSPACE_EPS
-                || m0.iter().zip(&m1).zip(&active).all(|((a, b), &on)| !on || a.0 + b.0 > bound) {
-                continue;
-            }
-            if evals >= budget {
-                return Err(SafetyError::WorkspaceViolation {
-                    point: 0,
-                    limit: format!("keepout check: the path needs more than {budget} FK evaluations to clear the keep-out boxes; bound"),
-                    value: bound as f32, bound: WORKSPACE_EPS as f32,
-                });
-            }
-            evals += 1;
-            let tm = 0.5 * (t0 + t1);
-            let q = at(tm);
-            let m = measure(&q).ok_or_else(invalid)?;
-            check(&m)?;
-            samples.push((tm, q));
-            stack.push(((tm, m.clone()), (t1, m1)));
-            stack.push(((t0, m0), (tm, m)));
-        }
-        samples.sort_by(|a, b| a.0.total_cmp(&b.0));
-        Ok(samples.into_iter().map(|(_, q)| q).collect())
+        keepout_sweep_with(&self.config.arm_model, ws, cam, at, travel, knots, budget)
     }
 
     fn servo_hold(&mut self, reason: MotionLimitReason, joint: Option<usize>) {
@@ -675,18 +611,7 @@ impl SupervisorInner {
         start: &[f32],
         samples: impl IntoIterator<Item = &'a [f32]>,
     ) -> Result<(), SafetyError> {
-        let model = &self.config.arm_model;
-        let v0 = model.workspace_violation(start, ws, cam);
-        for q in samples {
-            let v = model.workspace_violation(q, ws, cam);
-            if crate::kinematics::workspace_rejects(&v, &v0) {
-                let w = v.worst.unwrap_or(crate::kinematics::ViolationDetail { point: 0, limit: "invalid", value: f64::NAN, bound: 0.0, keepout: None });
-                return Err(SafetyError::WorkspaceViolation {
-                    point: w.point, limit: w.label(ws), value: w.value as f32, bound: w.bound as f32,
-                });
-            }
-        }
-        Ok(())
+        check_path_with(&self.config.arm_model, ws, cam, start, samples)
     }
 
     /// The planner's 21 verification points of a trajectory.
@@ -1830,6 +1755,7 @@ impl SupervisorInner {
             id, kind: kind.into(), tag, state: "running".into(), code: None, message: None, progress: 0.0,
             started_at: now, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
             phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
+            episode: None, t_s: None,
         });
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
         self.quintic_settle = None;
@@ -2127,8 +2053,8 @@ impl SupervisorInner {
             _ => None,
         };
         if let Some((state, code, message)) = cause {
-            // a macro sub-motion must not outlive its action
-            if is_macro && carried { self.stop_motion(); }
+            // a macro sub-motion or a replay must not outlive its action
+            if (is_macro || kind == "replay") && carried { self.stop_motion(); }
             self.finish_action(id, state, Some(code), Some(message), None, None, None);
             return;
         }
@@ -2702,7 +2628,7 @@ impl SupervisorInner {
         if self.pending_normal_unload {
             self.last_heartbeat = Instant::now();
         }
-        enum Stepped { Quintic(crate::trajectory::TrajectoryPoint, bool, f32), Action(StepOut) }
+        enum Stepped { Quintic(crate::trajectory::TrajectoryPoint, bool, f32), Action(StepOut), Replay(StepOut, &'static str, f64) }
         let stepped = if let Some(active) = self.active_trajectory.as_mut() {
             let ctx = StepCtx {
                 dt: servo_dt,
@@ -2721,6 +2647,10 @@ impl SupervisorInner {
                 }
                 Reference::Path(path) => Stepped::Action(path.step(&ctx)),
                 Reference::Gripper(grip) => Stepped::Action(grip.step(&ctx)),
+                Reference::Replay(replay) => {
+                    let out = replay.step(&ctx);
+                    Stepped::Replay(out, replay.phase_name(), replay.t_s())
+                }
             };
             Some((active.action_id, out))
         } else { None };
@@ -2728,6 +2658,16 @@ impl SupervisorInner {
             None => {}
             Some((action_id, Stepped::Action(out))) => {
                 reference_stepped = true;
+                self.apply_action_step(action_id, out);
+            }
+            Some((action_id, Stepped::Replay(out, phase, t_s))) => {
+                reference_stepped = true;
+                if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
+                    if a.id == id && a.is_running() {
+                        a.phase = Some(phase.into());
+                        a.t_s = Some(t_s as f32);
+                    }
+                }
                 self.apply_action_step(action_id, out);
             }
             Some((action_id, Stepped::Quintic(point, finished, progress))) => {
@@ -3064,6 +3004,114 @@ impl SupervisorInner {
     }
 }
 
+/// [`SupervisorInner::keepout_sweep`] with an explicit arm model (planning outside the lock).
+pub fn keepout_sweep_with(
+    model: &crate::chain::ArmModel,
+    ws: &crate::model::WorkspacePolicy,
+    cam: &crate::model::CameraMount,
+    at: &dyn Fn(f64) -> Vec<f32>,
+    travel: &dyn Fn(f64, f64) -> Vec<f64>,
+    knots: &[f64],
+    budget: usize,
+) -> Result<Vec<Vec<f32>>, SafetyError> {
+    use crate::kinematics::WORKSPACE_EPS;
+    let n = model.arm_dof();
+    let local: Vec<[f64; 3]> = std::iter::once([0.0f32; 3]).chain(ws.check_points_end_m.iter().copied())
+        .chain(cam.offset_m).map(|p| p.map(f64::from)).collect();
+    let reach = model.joint_reach(local.iter().map(crate::kinematics::norm).fold(0.0, f64::max));
+    let boxes: Vec<([f64; 3], [f64; 3])> = ws.keepout_boxes.iter().map(|b| (b.min_m.map(f64::from), b.max_m.map(f64::from))).collect();
+    let invalid = || SafetyError::WorkspaceViolation { point: 0, limit: "invalid".into(), value: f32::NAN, bound: 0.0 };
+    // (outside distance, depth inside) of every point to every box at q
+    let measure = |q: &[f32]| -> Option<Vec<(f64, f64)>> {
+        let pose = model.fk_f32(q)?;
+        Some(local.iter().flat_map(|l| {
+            let p = pose.transform_point(l);
+            boxes.iter().map(move |(lo, hi)| {
+                let out = (0..3).map(|k| (lo[k] - p[k]).max(p[k] - hi[k]).max(0.0).powi(2)).sum::<f64>().sqrt();
+                let depth = (0..3).map(|k| (p[k] - lo[k]).min(hi[k] - p[k])).fold(f64::INFINITY, f64::min);
+                (out, depth)
+            })
+        }).collect())
+    };
+    let nb = boxes.len();
+    let first = at(knots[0]);
+    let m0 = measure(&first).ok_or_else(invalid)?;
+    let active: Vec<bool> = m0.iter().map(|&(_, depth)| depth <= 0.0).collect();
+    let check = |m: &[(f64, f64)]| -> Result<(), SafetyError> {
+        match m.iter().enumerate().filter(|(i, (_, depth))| active[*i] && *depth > WORKSPACE_EPS)
+            .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1)) {
+            Some((i, &(_, depth))) => Err(SafetyError::WorkspaceViolation {
+                point: i / nb,
+                limit: format!("keepout '{}'", ws.keepout_boxes[i % nb].name),
+                value: depth as f32, bound: 0.0,
+            }),
+            None => Ok(()),
+        }
+    };
+    let mut samples: Vec<(f64, Vec<f32>)> = vec![(knots[0], first)];
+    let mut ends: Vec<(f64, Vec<(f64, f64)>)> = vec![(knots[0], m0)];
+    for &t in &knots[1..] {
+        let q = at(t);
+        let m = measure(&q).ok_or_else(invalid)?;
+        check(&m)?;
+        samples.push((t, q));
+        ends.push((t, m));
+    }
+    let mut evals = 0usize;
+    let mut stack: Vec<((f64, Vec<(f64, f64)>), (f64, Vec<(f64, f64)>))> = Vec::new();
+    let mut ends = ends.into_iter();
+    let mut prev = ends.next().ok_or_else(invalid)?;
+    for e in ends { stack.push((prev, e.clone())); prev = e; }
+    while let Some(((t0, m0), (t1, m1))) = stack.pop() {
+        let tr = travel(t0, t1);
+        let bound: f64 = tr.iter().take(n).zip(&reach).map(|(d, r)| d * r).sum();
+        if !bound.is_finite() { return Err(invalid()); }
+        if bound <= WORKSPACE_EPS
+            || m0.iter().zip(&m1).zip(&active).all(|((a, b), &on)| !on || a.0 + b.0 > bound) {
+            continue;
+        }
+        if evals >= budget {
+            return Err(SafetyError::WorkspaceViolation {
+                point: 0,
+                limit: format!("keepout check: the path needs more than {budget} FK evaluations to clear the keep-out boxes; bound"),
+                value: bound as f32, bound: WORKSPACE_EPS as f32,
+            });
+        }
+        evals += 1;
+        let tm = 0.5 * (t0 + t1);
+        let q = at(tm);
+        let m = measure(&q).ok_or_else(invalid)?;
+        check(&m)?;
+        samples.push((tm, q));
+        stack.push(((tm, m.clone()), (t1, m1)));
+        stack.push(((t0, m0), (tm, m)));
+    }
+    samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(samples.into_iter().map(|(_, q)| q).collect())
+}
+
+/// Workspace rule of [`SupervisorInner::check_workspace_path`] with an explicit arm model:
+/// reject a sample that leaves the workspace further than `start` already is.
+pub fn check_path_with<'a>(
+    model: &crate::chain::ArmModel,
+    ws: &crate::model::WorkspacePolicy,
+    cam: &crate::model::CameraMount,
+    start: &[f32],
+    samples: impl IntoIterator<Item = &'a [f32]>,
+) -> Result<(), SafetyError> {
+    let v0 = model.workspace_violation(start, ws, cam);
+    for q in samples {
+        let v = model.workspace_violation(q, ws, cam);
+        if crate::kinematics::workspace_rejects(&v, &v0) {
+            let w = v.worst.unwrap_or(crate::kinematics::ViolationDetail { point: 0, limit: "invalid", value: f64::NAN, bound: 0.0, keepout: None });
+            return Err(SafetyError::WorkspaceViolation {
+                point: w.point, limit: w.label(ws), value: w.value as f32, bound: w.bound as f32,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Thread-safe Arm Supervisor managing the robotic arm daemon
 pub struct ArmSupervisor {
     inner: Arc<RwLock<SupervisorInner>>,
@@ -3316,9 +3364,25 @@ impl ArmSupervisor {
         episode_id: Option<String>,
         output_path: Option<PathBuf>,
     ) -> Result<(), ArmError> {
+        let store = self.inner.read().await.episodes.clone();
+        // file system checks without the lock (the control tick needs it)
+        let (id, path) = tokio::task::spawn_blocking(move || {
+            let episode = store.new_episode(episode_id.as_deref(), output_path.as_deref())?;
+            store.check_capacity()?;
+            Ok::<_, crate::recording::StoreError>(episode)
+        }).await.map_err(|e| ArmError::Internal(format!("episode check failed: {e}")))??;
         let mut inner = self.inner.write().await;
-        inner.recorder.start(episode_id, output_path)?;
+        inner.recorder.start(Some(id), Some(path))?;
         Ok(())
+    }
+
+    /// Set the episode directory (`None`: storage off).
+    pub async fn set_episodes_dir(&self, dir: Option<PathBuf>) {
+        self.inner.write().await.episodes = crate::recording::EpisodeStore::new(dir);
+    }
+
+    pub async fn episode_store(&self) -> crate::recording::EpisodeStore {
+        self.inner.read().await.episodes.clone()
     }
 
     pub async fn save_recording(&self) -> Result<PathBuf, ArmError> {
@@ -3333,6 +3397,16 @@ impl ArmSupervisor {
     where
         W: FnOnce(&Path, &[RecordFrame]) -> Result<(), ParquetRecordingError> + Send + 'static,
     {
+        let (recording, store) = {
+            let inner = self.inner.read().await;
+            (inner.recorder.state() == &EpisodeState::Recording, inner.episodes.clone())
+        };
+        if recording {
+            // refused before the frames leave the recorder, so the recording can still be
+            // saved after episodes were deleted, or discarded
+            tokio::task::spawn_blocking(move || store.check_capacity()).await
+                .map_err(|e| ArmError::Internal(format!("episode check failed: {e}")))??;
+        }
         let (path, frames) = self.inner.write().await.recorder.begin_save()?;
         let (frames, result) = tokio::task::spawn_blocking(move || {
             let result = write(&path, &frames);

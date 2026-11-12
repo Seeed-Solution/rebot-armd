@@ -15,6 +15,7 @@ struct CliArgs {
     config: Option<String>,
     log_dir: Option<String>,
     blackbox_dir: Option<String>,
+    episodes_dir: Option<String>,
 }
 
 fn parse_cli_args() -> Result<CliArgs, String> {
@@ -29,6 +30,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
                 --port <PORT>            HTTP / WebSocket port (default 8765)\n\
                 --log-dir <DIR>          rotating log armd.log (default /userdata/rebot-teleop/logs when /userdata exists; off disables)\n\
                 --blackbox-dir <DIR>     black box and boot record (default /userdata/rebot-teleop/blackbox when /userdata exists; off disables)\n\
+                --episodes-dir <DIR>     recorded episodes (default /userdata/rebot-teleop/episodes when /userdata exists, else ./data/episodes; off disables recording and replay)\n\
                 --help                   Print help\n\n\
                 Leader-following is not implemented. Hardware failures never fall back to mock.");
             std::process::exit(0);
@@ -40,7 +42,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
         }
         if !matches!(
             arg.as_str(),
-            "--follower" | "--follower-port" | "--port" | "--config" | "--log-dir" | "--blackbox-dir"
+            "--follower" | "--follower-port" | "--port" | "--config" | "--log-dir" | "--blackbox-dir" | "--episodes-dir"
         ) {
             return Err(format!("Unknown argument: {arg}"));
         }
@@ -54,6 +56,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
             "--config" => cli.config = Some(value),
             "--log-dir" => cli.log_dir = Some(value),
             "--blackbox-dir" => cli.blackbox_dir = Some(value),
+            "--episodes-dir" => cli.episodes_dir = Some(value),
             "--port" => {
                 cli.port = Some(
                     value
@@ -192,6 +195,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let supervisor = Arc::new(ArmSupervisor::new(config));
     supervisor.set_follower(follower).await;
     start_blackbox(&supervisor, cli.blackbox_dir.as_deref(), &system, started);
+    let episodes = armd::recording::EpisodeStore::resolve(cli.episodes_dir.as_deref());
+    match episodes.dir() {
+        Some(dir) => info!("Episodes directory {}", dir.display()),
+        None => info!("Episode storage off: recording and replay are refused"),
+    }
+    supervisor.set_episodes_dir(episodes.dir().map(std::path::Path::to_path_buf)).await;
     armd::grasp::load_into(&supervisor, &armd::grasp::setup_path_from_env()).await;
     armd::keepout::load_into(&supervisor, &armd::keepout::path_from_env()).await;
     armd::poses::load_into(&supervisor, &armd::poses::path_from_env()).await;

@@ -45,7 +45,7 @@
 - 用于观测的 REST API 和用于控制的 WebSocket API，执行器指令只接受持有控制租约的连接；
 - 面向 agent 的高层动作（`move_to`、`move_relative`、`gripper`、`grasp`、基于命名姿态的 `move_to_pose`），由 [rebot-companion](https://github.com/Seeed-Solution/rebot-companion) 及其 MCP 服务器使用；
 - 客户端无法放宽的服务端限制：含禁入盒的笛卡尔工作空间与 profile 速度上限；故障带机器可读的故障码；
-- 把关节状态与指令录制为 Parquet 文件；
+- 把关节状态与指令录制为 Parquet 文件，并回放已保存的片段；
 - 目标检测（YOLO，跑在 TPU）与带 3D 位姿的 ArUco 标记（跑在 CPU），只在调用方请求时运行（[视觉](#视觉recamera-套件)）；
 - 用于拖动示教的重力补偿模式，已在 B601-DM 上实机验证。
 
@@ -271,6 +271,7 @@ v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 - **碰撞保护**（仅在 `capabilities.collision_guard` 为 true 时显示）：`observation.collision.active` 期间，顶部红色横幅显示受阻关节、残余力矩和自动恢复倒计时，不能关闭；保护期间状态显示「碰撞保护中」，点动、摇杆、预设、回零、夹爪和点位「前往」被锁定，急停和使能开关仍可用；碰撞保护关闭时灵敏度按钮不可点；升级为 `COLLISION` 故障后显示清除故障按钮。设置抽屉（顶栏齿轮）可开关碰撞保护并选择灵敏度（低 / 中 / 高）；阈值尚未在机械臂上标定。专家模式显示 J1–J6 残余力矩条（低于阈值 50 % 为绿色，50–100 % 为黄色，触发时为红色）。
 - **3D 视图**（视频左上角的「视频 | 3D」切换，方向键切换，Esc 仍是急停）：按 `reBot-DevArm_gripper.urdf` 绘制机械臂，实测关节角为实体，`commanded_positions` 为半透明蓝色（与实测不同时显示），另有地面网格、工作空间框、禁入盒（`GET /api/v1/workspace/keepout`）和已存点位（橙色圆点）。打开时相机对准当前姿态下机械臂的包围盒，使其占画面较窄一边的约 75 %。拖动旋转，双指或滚轮缩放。3D 视图打开时摇杆、滑杆和按钮仍显示在上层并可控制机械臂，在它们以外拖动旋转视角。J1–J6 电机角即 URDF 角；J7 按 `gripper_policy` 的 `closed_rad` 到 `open_rad` 映射为手指行程（0–42.5 mm）。armd 从资源目录（`assets/`，否则 `/usr/share/rebot-teleop/assets/`，或 `ARMD_ASSET_DIR`）只读提供 URDF 和网格，路径 `/assets/model/`；套件 `.deb` 安装 B601-DM 的 34 个外观零件，按 0.5 mm 误差简化后打包为一个文件（`meshes/arm.bin`，4.9 万个三角形，441 KB）。没有网格时（lite 包）显示经过 URDF 关节坐标系的骨架。最多每秒渲染 30 帧，只在姿态、方框或视角变化时渲染。在 `tests/fixtures/fk_points.json` 的各点上，渲染的 `end_link` 与 armd `kinematics::fk` 相差不超过 0.001 mm（`scripts/view3d_shots.mjs`）。
 - **点位抽屉**（仅在 `capabilities.poses` 为 true 时显示）：用名称（`^[A-Za-z0-9_-]{1,64}$`）记录当前位置，按驾驶舱速度前往已存点位（`move_to_pose` 动作），或删除点位。
+- **已保存的录制**（专家模式录制卡片，仅在 `capabilities.replay` 为 true 时显示）：列出已保存的片段（id、时长、保存时间），以 0.5x 或 1x 回放（可选是否包含夹爪），显示阶段与录制时间的进度条、停止按钮，删除需在页面内再点一次确认。保存后列表自动刷新；被拒绝时以提示条显示错误码。
 
 驾驶舱打开时不取得租约，在第一次控制输入（点动、摇杆、按键、笛卡尔输入、预设、使能、夹爪、抓取、重力补偿、收纳或回零）时取得；30 秒无输入后释放，且仅在力矩关闭、没有动作、重力补偿、串流或运动时释放（力矩开启时释放租约，armd 会让机械臂回到停靠位）。因此驾驶舱页面打开时，智能体也能取得租约。其他客户端持有租约时，驾驶舱切换为观察模式，按观测中的 `lease_holder` 显示持有者（另一个驾驶舱页面、AI 智能体 `rebot-mcp` 或该客户端的标签），并提供需确认的接管操作。急停不需要租约。
 
@@ -314,6 +315,7 @@ v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 | `/api/v1/workspace/keepout` | GET | 生效的禁入盒，每个标注 `profile` 或 `runtime`（运行时列表通过 WS 指令设置，只能增加禁入盒） |
 | `/api/v1/diagnostics/boots`、`/api/v1/diagnostics/blackbox?seconds=N[&prev=1]`、`/api/v1/diagnostics/tick` | GET | 启动记录、黑匣子记录（复位前的状态）与控制周期耗时，无需租约（[格式](docs/agent_action_api.md#diagnostics--诊断)） |
 | `/api/v1/dataset/record/start` / `save` / `discard` | POST | 示教片段录制 |
+| `/api/v1/dataset/episodes`、`/api/v1/dataset/episodes/{id}` | GET、DELETE | 列出与删除已保存的片段，无需租约（[格式](docs/agent_action_api.md#replay--回放)） |
 | `/api/v1/detection/latest`、`/trigger`、`/inference`、`/ws` | GET / POST / WS | 检测服务代理 |
 
 WebSocket 时序：
@@ -351,13 +353,17 @@ WebSocket 时序：
 
 ```bash
 curl -X POST http://192.168.42.1:8765/api/v1/dataset/record/start \
-     -H 'Content-Type: application/json' -d '{"output_path":"/userdata/datasets/episode_001.parquet"}'
+     -H 'Content-Type: application/json' -d '{"episode_id":"episode_001"}'
 curl -X POST http://192.168.42.1:8765/api/v1/dataset/record/save      # 或 .../discard
+curl http://192.168.42.1:8765/api/v1/dataset/episodes                 # 列表
+curl -X DELETE http://192.168.42.1:8765/api/v1/dataset/episodes/episode_001
 ```
 
 重力补偿模式下 J1–J6 的指令位置跟随实测位置，因此拖动示教片段中这些关节的 `action` 等于 `observation.state`。
 
-不传 `output_path` 时，文件写到工作目录下的 `./data/episodes/<episode_id>.parquet`。列名沿用 LeRobot 的命名，但 armd 每个片段写一个普通 Parquet 文件，不是 LeRobot 数据集（没有 `meta/` 文件、片段与帧索引，也没有相机画面）。本仓库不提供转换为 LeRobot 数据集的工具，也未测试用它训练。
+片段保存为片段目录下的 `<episode_id>.parquet`：目录由 `--episodes-dir`（或 `$ARMD_EPISODES_DIR`）指定，`/userdata` 存在时默认 `/userdata/rebot-teleop/episodes`，否则为工作目录下的 `./data/episodes`；`off` 关闭录制与回放。片段 id 须匹配 `^[A-Za-z0-9_-]{1,64}$`（默认 `episode_<UTC 日期>_<时间>`），已存在的 id 返回 `409 EPISODE_EXISTS`。`output_path` 必须指向该目录下的 `<id>.parquet`，否则返回 `400 INVALID_OUTPUT_PATH`。目录达到 500 个文件或 200 MB 时，开始和保存录制返回 `507 EPISODES_FULL`；保存被拒绝时录制保留，删除片段后可再保存。列名沿用 LeRobot 的命名，但 armd 每个片段写一个普通 Parquet 文件，不是 LeRobot 数据集（没有 `meta/` 文件、片段与帧索引，也没有相机画面）。本仓库不提供转换为 LeRobot 数据集的工具，也未测试用它训练。
+
+**回放。** WS 动作 `/api/v1/action/replay` `{"episode", "speed": 0.5 | 1.0, "gripper": true}`（需租约）先以规划关节运动移动到录制的第一帧，再跟随按控制频率重采样的实测角度（`observation.state`）。运动前 armd 检查每一帧的关节限位、工作空间与禁入盒，以及所选回放速度下各关节速度是否超过规划运动限速（B601-DM 为 0.45 rad/s）；不通过时以错误码拒绝（`REPLAY_TOO_FAST` 给出关节和可通过的最高回放速度）。录制中、重力补偿中、碰撞保护中或其他运动进行中拒绝回放；停止、急停和租约丢失会结束回放。规则见 [动作接口](docs/agent_action_api.md#replay--回放) 与 [安全契约](docs/control_safety_contract.md#episode-replay--片段回放)。已在仿真中测试（`tests/test_replay.rs`），尚未在机械臂上运行。
 
 ---
 
@@ -374,12 +380,14 @@ armd [OPTIONS]
                              /userdata/rebot-teleop/logs，否则关闭；`off` 关闭；或 $ARMD_LOG_DIR）
     --blackbox-dir <DIR>     黑匣子 bb.jsonl 与 boots.log（/userdata 存在时默认
                              /userdata/rebot-teleop/blackbox，否则关闭；`off` 关闭；或 $ARMD_BLACKBOX_DIR）
+    --episodes-dir <DIR>     录制片段（/userdata 存在时默认 /userdata/rebot-teleop/episodes，
+                             否则 ./data/episodes；`off` 关闭录制与回放；或 $ARMD_EPISODES_DIR）
     -h, --help
 ```
 
 日志同时输出到 stdout。日志或黑匣子目录无法创建或写入时，armd 记一条警告并在没有该功能的情况下运行。黑匣子：每个采样一行 JSON（上力矩或关节运动时 5 Hz，否则每 5 s 一行；上力矩时每行 `fdatasync`），2 MiB x 7 个文件（上力矩时约 75 分钟）；每次启动在 `boots.log` 追加一行，含上一次启动的最后一条记录。详见 [docs/agent_action_api.md](docs/agent_action_api.md#diagnostics--诊断)。
 
-环境变量：`RUST_LOG`（日志过滤，默认 `armd=info,tower_http=info`）、`PORT`、`ARMD_DETECTOR_URL`（默认 `http://127.0.0.1:8090`）、`ARMD_GRASP_SETUP`（抓取设置文件，默认 `/userdata/rebot-teleop/grasp_setup.json`）、`ARMD_KEEPOUT`（运行时禁入盒，默认 `/userdata/rebot-teleop/keepout.json`）、`ARMD_POSES`（命名姿态，默认 `/userdata/rebot-teleop/poses.json`）、`ARMD_COLLISION`（碰撞保护设置，默认 `/userdata/rebot-teleop/collision.json`）、`ARMD_LOG_DIR`、`ARMD_BLACKBOX_DIR`。
+环境变量：`RUST_LOG`（日志过滤，默认 `armd=info,tower_http=info`）、`PORT`、`ARMD_DETECTOR_URL`（默认 `http://127.0.0.1:8090`）、`ARMD_GRASP_SETUP`（抓取设置文件，默认 `/userdata/rebot-teleop/grasp_setup.json`）、`ARMD_KEEPOUT`（运行时禁入盒，默认 `/userdata/rebot-teleop/keepout.json`）、`ARMD_POSES`（命名姿态，默认 `/userdata/rebot-teleop/poses.json`）、`ARMD_COLLISION`（碰撞保护设置，默认 `/userdata/rebot-teleop/collision.json`）、`ARMD_LOG_DIR`、`ARMD_BLACKBOX_DIR`、`ARMD_EPISODES_DIR`。
 
 不带 `--config` 时，`rebot-dm` 使用内置 B601-DM profile（`src/model.rs` 中的 `ArmConfig::rebot_dm()`），其他 follower 使用通用 6 关节 profile。`--config` 文件是完整的 `ArmConfig` JSON。同一份 B601-DM profile 以数据形式放在 [`kits/recamera-b601dm/profile/rebot-b601dm.json`](kits/recamera-b601dm/profile/rebot-b601dm.json)（有测试保证它与 `rebot_dm()` 一致）；deb 把它安装到 `/usr/share/rebot-teleop/profile/rebot-b601dm.json`，follower 为 `rebot-dm` 时 init 脚本用 `--config` 传入。以下为 rebot-dm 取值的节选：
 

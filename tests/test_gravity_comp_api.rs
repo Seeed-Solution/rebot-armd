@@ -63,6 +63,7 @@ async fn ws_mode_command_gates_motion_and_keeps_gripper_and_recording() {
     assert_eq!(r["type"], "command_ack", "{r}");
     let client = reqwest::Client::new();
     let dir = tempfile::tempdir().unwrap();
+    sup.set_episodes_dir(Some(dir.path().to_path_buf())).await;
     let res = client.post(format!("http://{addr}/api/v1/dataset/record/start"))
         .json(&json!({"output_path": dir.path().join("e.parquet")})).send().await.unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::OK);
