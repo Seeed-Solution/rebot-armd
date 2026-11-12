@@ -54,6 +54,12 @@ pub struct ChainJointSpec {
 /// A rigid transform (rotation, translation).
 type Tf = (Mat3, Vec3);
 
+/// m (|c|² E − c cᵀ): inertia of a point mass `m` at `c` about the origin.
+fn parallel_axis(m: f64, c: &Vec3) -> Mat3 {
+    let c2 = k::dot(c, c);
+    std::array::from_fn(|a| std::array::from_fn(|b| m * (if a == b { c2 } else { 0.0 } - c[a] * c[b])))
+}
+
 fn tf_mul(a: &Tf, b: &Tf) -> Tf { (k::mat_mul(&a.0, &b.0), k::add(&a.1, &k::mat_vec(&a.0, &b.1))) }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +82,9 @@ pub struct KinematicChain {
     /// segment `j + 1` moves with joint `j` (expressed in that joint's rotated frame).
     seg_mass: Vec<f64>,
     seg_com: Vec<Vec3>,
+    /// Inertia tensor of each segment about its centre of mass, in the segment frame
+    /// (URDF `<inertia>` of its links, parallel-axis lumped). Used by `src/dynamics.rs`.
+    seg_inertia: Vec<Mat3>,
     /// URDF `<limit>` of each arm joint (URDF angles), when given.
     pub urdf_limits: Vec<Option<(f64, f64)>>,
 }
@@ -158,6 +167,8 @@ impl KinematicChain {
         let n = names.len();
         let mut m_sum = vec![0.0f64; n + 1];
         let mut mc_sum = vec![[0.0f64; 3]; n + 1];
+        // second moments about the segment origin
+        let mut j_sum = vec![[[0.0f64; 3]; 3]; n + 1];
         let mut stack: Vec<(&str, usize, Tf)> = vec![(spec.base_link.as_str(), 0, (IDENTITY, [0.0; 3]))];
         let mut visited = 0usize;
         while let Some((link, seg, t)) = stack.pop() {
@@ -167,6 +178,11 @@ impl KinematicChain {
                 let c = k::add(&t.1, &k::mat_vec(&t.0, &i.com));
                 m_sum[seg] += i.mass;
                 for a in 0..3 { mc_sum[seg][a] += i.mass * c[a]; }
+                let [ixx, ixy, ixz, iyy, iyz, izz] = i.inertia;
+                let r = k::mat_mul(&t.0, &i.rot);
+                let rotated = k::mat_mul(&k::mat_mul(&r, &[[ixx, ixy, ixz], [ixy, iyy, iyz], [ixz, iyz, izz]]), &k::transpose(&r));
+                let shift = parallel_axis(i.mass, &c);
+                for a in 0..3 { for b in 0..3 { j_sum[seg][a][b] += rotated[a][b] + shift[a][b]; } }
             }
             for jt in urdf.child_joints(link) {
                 match names.iter().position(|nm| *nm == jt.name) {
@@ -175,9 +191,13 @@ impl KinematicChain {
                 }
             }
         }
-        let seg_com = m_sum.iter().zip(&mc_sum)
+        let seg_com: Vec<Vec3> = m_sum.iter().zip(&mc_sum)
             .map(|(m, mc)| if *m > 0.0 { [mc[0] / m, mc[1] / m, mc[2] / m] } else { [0.0; 3] })
             .collect();
+        let seg_inertia = (0..=n).map(|sg| {
+            let back = parallel_axis(m_sum[sg], &seg_com[sg]);
+            std::array::from_fn(|a| std::array::from_fn(|b| j_sum[sg][a][b] - back[a][b]))
+        }).collect();
 
         Ok(Self {
             robot: urdf.name.clone(),
@@ -190,6 +210,7 @@ impl KinematicChain {
             tip,
             seg_mass: m_sum,
             seg_com,
+            seg_inertia,
             urdf_limits: movable.iter().map(|j| j.limit).collect(),
         })
     }
@@ -200,6 +221,10 @@ impl KinematicChain {
     }
 
     pub fn dof(&self) -> usize { self.axis.len() }
+
+    /// Mass (kg), centre of mass and inertia about it (segment frame) of the segment that
+    /// moves with joint `j`.
+    pub fn segment(&self, j: usize) -> (f64, Vec3, Mat3) { (self.seg_mass[j + 1], self.seg_com[j + 1], self.seg_inertia[j + 1]) }
 
     /// Total mass that moves with joint 0 (kg); 0 means the URDF has no usable inertials.
     pub fn moving_mass(&self) -> f64 { self.seg_mass[1..].iter().sum() }

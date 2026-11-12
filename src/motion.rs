@@ -29,6 +29,9 @@ pub enum MotionError {
     InvalidCommand(String),
     #[error("{0}")]
     Unsupported(String),
+    /// Power budget planning (`src/power_plan.rs`): even the slowest allowed speed exceeds it.
+    #[error("Power budget: {0}")]
+    PowerBudget(String),
 }
 
 impl MotionError {
@@ -41,6 +44,7 @@ impl MotionError {
             Self::PlanStale(_) => "PLAN_STALE",
             Self::InvalidCommand(_) => "INVALID_COMMAND",
             Self::Unsupported(_) => "UNSUPPORTED",
+            Self::PowerBudget(_) => "POWER_BUDGET",
         }
     }
 }
@@ -91,6 +95,8 @@ pub struct PlanInput {
     pub epoch: u64,
     /// `SupervisorInner::workspace_revision` the plan was checked against.
     pub workspace_revision: u64,
+    /// Power budget whose `planning` section time-scales the path; None = none.
+    pub power: Option<crate::power::PowerBudget>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,10 +106,38 @@ pub struct JointPath {
     /// Normalised path parameter of each sample (0..=1).
     pub s: Vec<f64>,
     pub duration: f64,
+    /// Power-budget time scale applied to `duration` (1 = none, or no budget).
+    pub power_scale: f64,
 }
 
 impl JointPath {
     pub fn last(&self) -> [f32; 7] { *self.q.last().expect("path has samples") }
+
+    /// Joint positions at path time `t` (quintic time law of [`PathTrajectory`]).
+    pub fn position_at_time(&self, t: f64) -> [f32; 7] {
+        let u = (t / self.duration).clamp(0.0, 1.0);
+        let s = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u);
+        if self.s.len() < 2 { return self.q[0]; }
+        let b = self.s.partition_point(|x| *x <= s).clamp(1, self.s.len() - 1);
+        let a = b - 1;
+        let f = ((s - self.s[a]) / (self.s[b] - self.s[a])).clamp(0.0, 1.0) as f32;
+        std::array::from_fn(|i| self.q[a][i] + (self.q[b][i] - self.q[a][i]) * f)
+    }
+
+    /// Fit the path into the power budget's planning limit (`src/power_plan.rs`): the
+    /// duration grows by 1 / scale.
+    pub fn fit_power(&mut self, budget: &crate::power::PowerBudget, arm: &crate::chain::ArmModel) -> Result<crate::power_plan::PlanScale, MotionError> {
+        let p = budget.planning;
+        let n = crate::power_plan::Samples::count(&p, self.duration);
+        let samples = crate::power_plan::Samples::from_positions(self.duration, n, 6, |t| {
+            let q = self.position_at_time(t);
+            std::array::from_fn(|i| if i < 6 { f64::from(q[i]) } else { 0.0 })
+        });
+        let fit = crate::power_plan::plan_scale(budget, arm, &samples)?;
+        self.duration /= fit.scale;
+        self.power_scale = fit.scale;
+        Ok(fit)
+    }
 }
 
 /// Plan a straight-line (position) / slerp (rotation) path from `fk(q0)` to `goal`.
@@ -189,7 +223,14 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
     }
     duration = duration.max(1.875 * length / speed.linear).max(1.875 * theta / speed.angular);
     let duration = (duration * 1.1).max(0.2);
-    Ok(JointPath { q: q_samples, s: s_samples, duration })
+    let mut path = JointPath { q: q_samples, s: s_samples, duration, power_scale: 1.0 };
+    if let Some(b) = input.power.as_ref().filter(|b| b.enabled && b.planning.enabled) {
+        let t0 = std::time::Instant::now();
+        let fit = path.fit_power(b, &input.arm)?;
+        tracing::debug!("Power planning: scale {:.3}, peak {:.2} A (full speed {:.2} A, limit {:.2} A), {} samples, {} µs",
+            fit.scale, fit.peak_a, fit.peak_full_a, fit.limit_a, fit.samples, t0.elapsed().as_micros());
+    }
+    Ok(path)
 }
 
 // ---- goal requests ----
@@ -419,6 +460,8 @@ pub fn parse_gripper(body: &Value) -> Result<GripperRequest, MotionError> {
 /// Measured / commanded state handed to a reference each tick.
 pub struct StepCtx<'a> {
     pub dt: f64,
+    /// Power governor speed scale (1 = none): references advance their time at dt x scale.
+    pub time_scale: f64,
     pub measured: &'a [f32],
     pub measured_velocities: &'a [f32],
     pub commanded: &'a [f32],
@@ -524,7 +567,7 @@ impl PathTrajectory {
         } else {
             self.stalled_for = 0.0;
         }
-        self.elapsed = (self.elapsed + ctx.dt * rate).min(self.path.duration);
+        self.elapsed = (self.elapsed + ctx.dt * rate * ctx.time_scale).min(self.path.duration);
         let u = self.elapsed / self.path.duration;
         let s = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u);
         let q = self.position_at(s);
@@ -723,6 +766,10 @@ pub struct ActionStatus {
     /// `approach_height_m`, raised for table clearance; absent when not raised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acquire_height_m: Option<f32>,
+    /// Power-budget time scale of the planned motion (1 = as planned, < 1 slowed to fit);
+    /// absent without a power budget or for motions it does not plan (gripper).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_scale: Option<f32>,
     /// Replay only: episode id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub episode: Option<String>,

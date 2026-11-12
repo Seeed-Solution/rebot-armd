@@ -479,6 +479,20 @@ body.locked .lock-note { display: flex; }
 body.stopped .lock-note { color: var(--sc-status-danger-fg); background: var(--sc-status-danger-bg); }
 .lock-note.flash { animation: flash .5s ease 2; }
 @keyframes flash { 50% { box-shadow: 0 0 0 3px rgba(150,104,12,0.25); } }
+/* supply load meter: estimated current in % of the supply rating; bar spans 0-120 % */
+.pwr { display: flex; align-items: center; gap: 8px; min-height: 16px; font-size: 12px; color: var(--sc-color-text-secondary); }
+.pwr[hidden] { display: none; }
+.pwr-lbl { flex: none; white-space: nowrap; }
+.pwr-bar { position: relative; flex: 1 1 auto; min-width: 40px; height: 6px; border-radius: 3px; background: rgba(15,23,42,0.12); }
+.pwr-fill { position: absolute; left: 0; top: 0; bottom: 0; width: 0; border-radius: 3px; background: var(--sc-color-primary); transition: width .15s linear; }
+.pwr.warn .pwr-fill { background: #d48806; }
+.pwr.over .pwr-fill { background: var(--sc-status-danger-fg); }
+.pwr-tick { position: absolute; top: -2px; bottom: -2px; width: 1px; background: rgba(15,23,42,0.35); }
+.pwr-peak { position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px; border-radius: 1px; background: #1f2937; display: none; }
+.pwr-pct { flex: none; min-width: 3.2em; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; color: var(--sc-color-text-primary, #1f2937); white-space: nowrap; }
+.pwr.warn .pwr-pct { color: #ad6800; }
+.pwr.over .pwr-pct { color: var(--sc-status-danger-fg); }
+.pwr.na .pwr-pct { color: var(--sc-color-text-tertiary); font-weight: 400; }
 
 /* ---------- simple mode: integrated cockpit ---------- */
 .cockpit {
@@ -1092,6 +1106,13 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   }
   body.ui-simple .safety-row { display: flex; gap: 6px; }
   body.ui-simple .safety .lock-note { display: none; }
+  body.ui-simple .pwr { min-height: 12px; gap: 6px; padding: 0 8px; font-size: 10px; color: #f8fafc; text-shadow: 0 1px 2px rgba(0,0,0,0.45); }
+  body.ui-simple .pwr-bar { height: 4px; background: rgba(255,255,255,0.35); }
+  body.ui-simple .pwr-tick { background: rgba(255,255,255,0.6); }
+  body.ui-simple .pwr-peak { background: #fff; }
+  body.ui-simple .pwr-pct, body.ui-simple .pwr.na .pwr-pct { color: #fff; min-width: 2.8em; }
+  body.ui-simple .pwr.warn .pwr-pct { color: #ffd591; }
+  body.ui-simple .pwr.over .pwr-pct { color: #ffccc7; }
   body.ui-simple .sw { min-height: 40px; padding: 0 10px 0 6px; gap: 8px; border-radius: 20px; background: rgba(255,255,255,0.55); border-color: transparent; }
   body.ui-simple .sw-text small { display: none; }
   body.ui-simple .sw-text b { font-size: 13px; }
@@ -1504,6 +1525,12 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M8 2.5h8l5.5 5.5v8L16 21.5H8L2.5 16V8z"/><path d="M8 12h8" stroke-linecap="round" stroke-width="2.6"/></svg>
             <span><span data-i18n="estop">急停</span><small>E-STOP</small></span>
           </button>
+        </div>
+        <!-- estimated supply load (observation.power): both modes -->
+        <div class="pwr" id="pwr" role="meter" aria-valuemin="0" aria-valuemax="120" aria-valuenow="0" data-i18n-aria="pwr.aria" aria-label="电源负载（估算）" hidden>
+          <span class="pwr-lbl" data-i18n="pwr.label">电源负载</span>
+          <span class="pwr-bar"><i class="pwr-fill" id="pwr-fill"></i><i class="pwr-tick" id="pwr-soft"></i><i class="pwr-tick" id="pwr-hard"></i><i class="pwr-peak" id="pwr-peak"></i></span>
+          <b class="pwr-pct" id="pwr-pct">--</b>
         </div>
         <button class="sw gc-sw" id="btn-gc" role="switch" aria-checked="false" hidden>
           <span class="sw-track"><i class="fill"></i><i class="thumb"></i></span>
@@ -1942,6 +1969,10 @@ const I18N = {
     'ml.limit': '{j} 已到限位，该方向已停止', 'ml.slow_big': '大关节跟不上，已减速', 'ml.slow': '电机跟不上，已减速',
     'ml.blocked': '{j} 受阻，已停在当前位置', 'ml.workspace': '已到工作范围边界，该方向已停止',
     'ml.torque': '{j} 力矩过大，已停住；请反向移出',
+    'ml.power': '电源负载过高，已停住；请减小负载', 'ml.power_slow': '电源负载高，已减速',
+    'pwr.label': '电源负载', 'pwr.aria': '电源负载（估算，额定电流的百分比）',
+    'pwr.title': '估算电源电流 {a} A / 额定 {r} A（{pct}%），5 秒峰值 {pk} A。由电机力矩和速度估算，非实测。',
+    'pwr.na': '无力矩反馈，无法估算电源电流',
     'ik.blocked': 'IK 拦截', 'ik.stream': 'IK 流式 {hz}Hz', 'ik.ready': 'IK 就绪', 'ik.per_solve': ' µs/次',
     'cart.enable_first': '使能后可控制末端位姿', 'cart.following': '目标跟随实测位姿 · 分支 {branch} · {tx}', 'cart.tx_ws': 'WS 流', 'cart.tx_rest': 'REST 伺服',
     'wait_arm': '等待机械臂连接', 'wait_telemetry': '等待遥测', 'ready': '电机就绪 · 可以操控',
@@ -2130,6 +2161,10 @@ const I18N = {
     'ml.limit': '{j} at its limit; this direction stopped', 'ml.slow_big': 'Slowed to what the motors can follow', 'ml.slow': 'Slowed to what the motors can follow',
     'ml.blocked': '{j} blocked; holding position', 'ml.workspace': 'At the workspace boundary; this direction stopped',
     'ml.torque': '{j} torque limit; holding. Move it back out',
+    'ml.power': 'Supply load too high; holding. Reduce the load', 'ml.power_slow': 'Supply load high; slowed down',
+    'pwr.label': 'Supply load', 'pwr.aria': 'Supply load (estimate, percent of the rated current)',
+    'pwr.title': 'Estimated supply current {a} A of {r} A rated ({pct}%), 5 s peak {pk} A. Estimated from motor torque and speed, not measured.',
+    'pwr.na': 'No torque feedback: supply current cannot be estimated',
     'ik.blocked': 'IK blocked', 'ik.stream': 'IK stream {hz} Hz', 'ik.ready': 'IK ready', 'ik.per_solve': ' µs/solve',
     'cart.enable_first': 'Enable to control end-effector pose', 'cart.following': 'Target follows measured pose · branch {branch} · {tx}', 'cart.tx_ws': 'WS stream', 'cart.tx_rest': 'REST servo',
     'wait_arm': 'Waiting for arm connection', 'wait_telemetry': 'Waiting for telemetry', 'ready': 'Motors ready · ready to control',
@@ -2661,6 +2696,7 @@ function connectWS() {
     gcOnObs(o);
     renderActionChip(o);
     renderMotionLimit(o);
+    renderPower(o);
     graspOnObs(o);
     epOnObs(o);
     syncEpoch(o.epoch_id);
@@ -4361,7 +4397,7 @@ function applyJointMap(map) {
 async function loadSchema() {
   try {
     const sc = await api('/api/v1/observation/schema', undefined, { quiet: true, method: 'GET' });
-    if (sc) { S.caps = sc.capabilities || {}; S.wsPolicy = sc.workspace || null; S.home = Array.isArray(sc.home_positions) ? sc.home_positions : null; colOnCaps(); posesOnCaps(); epOnCaps(); V3.sceneAt = 0; }
+    if (sc) { S.caps = sc.capabilities || {}; S.powerGov = (sc.power_budget && sc.power_budget.governor) || null; PWR.key = ''; S.wsPolicy = sc.workspace || null; S.home = Array.isArray(sc.home_positions) ? sc.home_positions : null; colOnCaps(); posesOnCaps(); epOnCaps(); V3.sceneAt = 0; }
     if (sc && Array.isArray(sc.model_joint_map) && sc.model_joint_map.length >= 6) applyJointMap(sc.model_joint_map);
     if (sc && Array.isArray(sc.limits) && sc.limits.length) {
       const oldDof = S.dof;
@@ -4859,6 +4895,34 @@ function renderActionChip(o) {
 // observation.motion_limit (armd's servo guard) as a short hint chip. speed / lead show only
 // after 1 s, and every hint stays 1 s after the limit clears, so short limits do not flicker.
 const ML = { key: '', j: '', until: 0, blocked: false };
+// Supply load meter: o.power (estimate) in % of the rating; ticks at the governor's soft / hard
+// fractions (schema.power_budget.governor, defaults 0.8 / 0.95), peak marker = 5 s peak.
+var PWR = { key: "" };
+function renderPower(o) {
+  const el = $('pwr');
+  if (!el) return;
+  const p = o.power;
+  if (!p || !(p.rated_a > 0)) { if (!el.hidden) el.hidden = true; return; }
+  if (el.hidden) el.hidden = false;
+  const span = 120, pctOf = (a) => Math.max(0, Math.min(span, 100 * a / p.rated_a)) / span * 100;
+  const gov = S.powerGov || {};
+  const soft = 100 * (gov.soft || 0.8), hard = 100 * (gov.hard || 0.95);
+  const pct = p.valid ? 100 * p.bus_a / p.rated_a : null;
+  const band = pct == null ? 'na' : (p.hold || pct >= hard) ? 'over' : (p.limiting || pct >= soft) ? 'warn' : 'ok';
+  const key = [band, pct == null ? '' : Math.round(pct), p.valid ? Math.round(10 * p.peak_a) : '', soft, hard, LANG].join('|');
+  if (key === PWR.key) return;
+  PWR.key = key;
+  el.classList.toggle('na', band === 'na'); el.classList.toggle('warn', band === 'warn'); el.classList.toggle('over', band === 'over');
+  $('pwr-fill').style.width = (pct == null ? 0 : pctOf(p.bus_a)) + '%';
+  $('pwr-soft').style.left = (soft / span * 100) + '%';
+  $('pwr-hard').style.left = (hard / span * 100) + '%';
+  const pk = $('pwr-peak');
+  pk.style.display = p.valid && p.peak_a > 0 ? 'block' : 'none';
+  pk.style.left = pctOf(p.peak_a) + '%';
+  setText($('pwr-pct'), pct == null ? '--' : Math.round(pct) + '%');
+  el.setAttribute('aria-valuenow', pct == null ? '0' : String(Math.round(pct)));
+  el.title = pct == null ? t('pwr.na') : t('pwr.title', { a: p.bus_a.toFixed(2), r: p.rated_a, pct: Math.round(pct), pk: p.peak_a.toFixed(2) });
+}
 function renderMotionLimit(o) {
   const el = $('ml-chip');
   if (!el) return;
@@ -4867,10 +4931,11 @@ function renderMotionLimit(o) {
     const age = o.timestamp * 1000 - ml.since_ms;
     const key = ml.reason === 'joint_limit' ? 'ml.limit' : ml.reason === 'blocked' ? 'ml.blocked'
       : ml.reason === 'torque' ? 'ml.torque' : ml.reason === 'workspace' ? 'ml.workspace'
+      : ml.reason === 'power' ? (o.power && o.power.hold ? 'ml.power' : 'ml.power_slow')
       : age >= 1000 ? (ml.joint != null && ml.joint < 3 ? 'ml.slow_big' : 'ml.slow') : '';
     if (key) { ML.key = key; ML.j = ml.joint == null ? '' : 'J' + (ml.joint + 1); ML.until = now + 1000; }
     // armd ended the stream in a hold: drop the queued motion once so the goal does not pull on
-    const held = ml.reason === 'blocked' || ml.reason === 'torque';
+    const held = ml.reason === 'blocked' || ml.reason === 'torque' || (ml.reason === 'power' && !!(o.power && o.power.hold));
     if (held && !ML.blocked) cartHoldStill();
     ML.blocked = held;
   } else ML.blocked = false;

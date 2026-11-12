@@ -368,12 +368,82 @@
       true
     ]
   },
-  "model_offsets_rad": [
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    -1.5707963267948966
-  ]
+  "power_budget": {
+    "enabled": true,
+    "supply_rated_a": 6.5,
+    "supply_trip_a": 8.5,
+    "v_bus": 24.0,
+    "base_w": 4.0,
+    "k_cu": 1.5,
+    "efficiency": 0.8,
+    "filter_s": 0.25,
+    "joints": [
+      {
+        "kt_nm_per_a": 2.015,
+        "r_phase_ohm": 0.72,
+        "idle_w": 0.5,
+        "viscous_nm_s": 0.0,
+        "coulomb_nm": 0.0
+      },
+      {
+        "kt_nm_per_a": 2.015,
+        "r_phase_ohm": 0.72,
+        "idle_w": 0.5,
+        "viscous_nm_s": 0.0,
+        "coulomb_nm": 0.0
+      },
+      {
+        "kt_nm_per_a": 2.015,
+        "r_phase_ohm": 0.72,
+        "idle_w": 0.5,
+        "viscous_nm_s": 0.0,
+        "coulomb_nm": 0.0
+      },
+      {
+        "kt_nm_per_a": 0.625,
+        "r_phase_ohm": 0.58,
+        "idle_w": 0.5,
+        "viscous_nm_s": 0.0,
+        "coulomb_nm": 0.0
+      },
+      {
+        "kt_nm_per_a": 0.625,
+        "r_phase_ohm": 0.58,
+        "idle_w": 0.5,
+        "viscous_nm_s": 0.0,
+        "coulomb_nm": 0.0
+      },
+      {
+        "kt_nm_per_a": 0.625,
+        "r_phase_ohm": 0.58,
+        "idle_w": 0.5,
+        "viscous_nm_s": 0.0,
+        "coulomb_nm": 0.0
+      },
+      {
+        "kt_nm_per_a": 0.625,
+        "r_phase_ohm": 0.58,
+        "idle_w": 0.5,
+        "viscous_nm_s": 0.0,
+        "coulomb_nm": 0.0
+      }
+    ],
+    "governor": {
+      "enabled": true,
+      "soft": 0.8,
+      "hard": 0.95,
+      "floor_scale": 0.25,
+      "persist_ms": 100,
+      "recover_ms": 300,
+      "down_per_s": 5.0,
+      "up_per_s": 0.5
+    },
+    "planning": {
+      "enabled": true,
+      "fraction": 0.75,
+      "min_scale": 0.2,
+      "sample_dt_s": 0.02,
+      "max_samples": 400
+    }
+  }
 }

@@ -68,6 +68,17 @@ impl Serialize for R3<'_> {
     }
 }
 
+/// Black-box form of `observation.power` (about 40 bytes): estimated supply current `a` and
+/// its 5 s peak `pk` (A), governor scale `s`, `hold` only while a power hold is in force.
+#[derive(Serialize)]
+struct PowerRec {
+    a: f32,
+    pk: f32,
+    s: f32,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    hold: bool,
+}
+
 #[derive(Serialize)]
 struct Record<'a> {
     boot: u64,
@@ -91,6 +102,9 @@ struct Record<'a> {
     feedback_age_ms: &'a [Option<u64>],
     motor_errors: &'a [Option<crate::model::MotorError>],
     motion_limit: &'a Option<crate::model::MotionLimit>,
+    /// Estimated supply current; omitted without a power budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    power: Option<PowerRec>,
     /// Last command source: the latest action as `kind:state`.
     action: Option<String>,
     dropped: u64,
@@ -118,6 +132,12 @@ pub fn record_line(boot: u64, t_ms: u64, dropped: u64, obs: &ArmObservation) -> 
         feedback_age_ms: &obs.feedback_age_ms,
         motor_errors: &obs.motor_errors,
         motion_limit: &obs.motion_limit,
+        power: obs.power.as_ref().filter(|p| p.valid).map(|p| PowerRec {
+            a: (p.bus_a * 100.0).round() / 100.0,
+            pk: (p.peak_a * 100.0).round() / 100.0,
+            s: (p.scale * 100.0).round() / 100.0,
+            hold: p.hold,
+        }),
         action: obs.action.as_ref().map(|a| format!("{}:{}", a.kind, a.state)),
         dropped,
     };
@@ -299,6 +319,15 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&record_line(7, 1234, 2, &o)).unwrap();
         assert_eq!(v["residual_torques"][1], -1.25);
         assert_eq!(v["residual_torques"][5], 0.123);
+        // power: compact, omitted while no estimate exists
+        assert!(v.get("power").is_none(), "no estimate without torque feedback");
+        let mut p = o.power.clone().expect("rebot_dm has a power budget");
+        (p.valid, p.bus_a, p.peak_a, p.scale) = (true, 3.456, 4.5, 1.0);
+        o.power = Some(p);
+        let line = record_line(7, 1234, 2, &o);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["power"], serde_json::json!({"a": 3.46, "pk": 4.5, "s": 1.0}));
+        assert!(line.len() < 1024, "{} bytes", line.len());
     }
 
     struct Collect(Arc<Mutex<Vec<(String, bool)>>>);

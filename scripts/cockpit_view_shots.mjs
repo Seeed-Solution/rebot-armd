@@ -9,6 +9,9 @@
 // viewport, and clicking the pose card opens 3D. Pose card states: moved pose, joint at a motion limit,
 // collision joint, commanded differs from measured, gravity compensation, collapsed (persisted).
 // Redraw rate: none while still, at most 15/s while moving, none while collapsed or hidden.
+// Supply load meter (observation.power) in the safety card: visible in both modes, inside the viewport and
+// the card, percent of rated, colour band (ok / warn / over), peak marker, '--' without an estimate,
+// hidden without a power budget.
 // Writes PNGs (default .cache/cockpit-view-shots/).
 import fs from 'node:fs';
 import http from 'node:http';
@@ -39,7 +42,8 @@ const srv = http.createServer((req, res) => {
     if (rel.includes('..') || !fs.existsSync(f) || !fs.statSync(f).isFile()) { res.writeHead(404); res.end(); return; }
     res.writeHead(200); res.end(fs.readFileSync(f)); return;
   }
-  if (u === '/api/v1/observation/schema') return json({ dof: 7, limits: LIMITS, workspace: WS, home_positions: HOME, capabilities: { version: 6, poses: true, fault_codes: true } });
+  if (u === '/api/v1/observation/schema') return json({ dof: 7, limits: LIMITS, workspace: WS, home_positions: HOME, capabilities: { version: 9, poses: true, fault_codes: true, power_budget: true },
+    power_budget: { supply_rated_a: 6.5, supply_trip_a: 8.5, governor: { soft: 0.8, hard: 0.95 } } });
   if (u === '/api/v1/workspace/keepout') return json({ boxes: [], source: 'runtime' });
   if (u === '/api/v1/poses') return json({ poses: [] });
   res.writeHead(404); res.end();
@@ -60,6 +64,7 @@ const LAYOUTS = [
   ['port_simple', { width: 390, height: 844 }, 3, 'simple'],
   ['port_expert', { width: 390, height: 844 }, 3, 'expert'],
 ];
+const POWER = (a, extra = {}) => ({ valid: true, bus_a: a, peak_a: a, rated_a: 6.5, ratio: a / 6.5, regen_w: 0, per_joint_a: [0.1, 0.4, 0.3, 0.1, 0.05, 0.05, 0.05], scale: 1, limiting: false, hold: false, ...extra });
 const STICKS = ['#pad-sxy', '#pad-sz', '#pad-sgrip', '#s-grip-readout', '.presets'];
 
 const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROME || undefined, args: ['--enable-unsafe-swiftshader', '--use-angle=swiftshader'] });
@@ -94,7 +99,7 @@ try {
         const q = P.moving ? P.q.map((v, i) => (i === 0 ? v + 0.3 * Math.sin(t * 2) : v)) : P.q;
         const o = { timestamp: t, positions: q, velocities: q.map(() => 0), commanded_positions: P.qc || q, safety_state: 'Armed', enable_state: 'Enabled', is_torqued: true,
           feedback_age_ms: q.map(() => 5), torques: q.map(() => 0.5), temperatures: q.map(() => 35), epoch_id: 1, lease_holder: null,
-          driver_capabilities: { velocity_feedback: true, torque_feedback: true, temperature_feedback: true }, motion_limit: null, motor_errors: [], action: null, fault: null, ...P.extra };
+          driver_capabilities: { velocity_feedback: true, torque_feedback: true, temperature_feedback: true }, motion_limit: null, motor_errors: [], action: null, fault: null, power: POWER(1.3, { peak_a: 2.6 }), ...P.extra };
         try { ws.send(JSON.stringify(o)); } catch (_) {}
       }, 20);
     });
@@ -114,6 +119,38 @@ try {
     ok(pc && pc.h <= 150, `${tag} pose card height ${pc && pc.h}`);
     // the card is reachable: in the viewport, or in a scrollable column
     ok(await page.evaluate(() => { const e = document.getElementById('pose-card'); e.scrollIntoView({ block: 'nearest' }); const r = e.getBoundingClientRect(); return r.top >= 0 && r.bottom <= innerHeight + 1 && r.left >= 0 && r.right <= innerWidth + 1; }), `${tag} pose card scrolls into the viewport`);
+    }
+    // ---- supply load meter
+    {
+      const until = (fn, arg) => page.waitForFunction(fn, arg, { timeout: 4000 }).then(() => true, () => false);
+      ok(await visible(page, '#pwr'), `${tag} supply meter visible`);
+      ok(await until(() => document.getElementById('pwr-pct').textContent === '20%'), `${tag} meter shows 20% (1.3 of 6.5 A)`);
+      const m = await rectOf(page, '#pwr'), sc = await rectOf(page, '#safety');
+      ok(m && sc && m.x >= sc.x - 0.5 && m.r <= sc.r + 0.5 && m.y >= sc.y - 0.5 && m.b <= sc.b + 0.5, `${tag} meter inside the safety card ${JSON.stringify(m)} ${JSON.stringify(sc)}`);
+      ok(m && m.h <= 20 && m.r <= viewport.width && m.x >= 0, `${tag} meter height ${m && m.h} within the viewport`);
+      ok(await page.evaluate(() => { const e = document.getElementById('pwr-pct'); return e.scrollWidth <= e.clientWidth + 1; }), `${tag} meter text not clipped`);
+      ok(await page.evaluate(() => { const pk = document.getElementById('pwr-peak'), bar = pk.parentElement.getBoundingClientRect(), r = pk.getBoundingClientRect();
+        return getComputedStyle(pk).display !== 'none' && Math.abs((r.left + r.width / 2 - bar.left) / bar.width - (100 * 2.6 / 6.5) / 120) < 0.02; }), `${tag} peak marker at 40% of rated`);
+      ok(await page.evaluate(() => !document.getElementById('pwr').classList.contains('warn') && !document.getElementById('pwr').classList.contains('over')), `${tag} meter band ok`);
+      await shot('0_power_ok');
+      P.extra = { power: POWER(5.6, { peak_a: 6.0, scale: 0.6, limiting: true }), motion_limit: { reason: 'power', joint: null, since_ms: 1 } };
+      ok(await until(() => document.getElementById('pwr').classList.contains('warn') && document.getElementById('pwr-pct').textContent === '86%'), `${tag} meter band warn at 86%`);
+      await shot('0_power_warn');
+      P.extra = { power: POWER(6.3, { peak_a: 7.9, scale: 0.25, limiting: true, hold: true }), motion_limit: { reason: 'power', joint: 3, since_ms: 1 } };
+      ok(await until(() => document.getElementById('pwr').classList.contains('over')), `${tag} meter band over while held`);
+      ok(await until(() => { const e = document.getElementById('ml-chip'); return e && !e.hidden && /电源负载过高/.test(e.textContent); }), `${tag} power hold hint shown (zh)`);
+      await shot('0_power_hold');
+      P.extra = { power: { ...POWER(0), valid: false } };
+      ok(await until(() => document.getElementById('pwr-pct').textContent === '--' && document.getElementById('pwr').classList.contains('na')), `${tag} meter shows -- without an estimate`);
+      P.extra = { power: null };
+      ok(await until(() => document.getElementById('pwr').hidden), `${tag} meter hidden without a power budget`);
+      await page.click('#btn-lang');
+      P.extra = { power: POWER(6.3, { hold: true, limiting: true }), motion_limit: { reason: 'power', joint: null, since_ms: 1 } };
+      ok(await until(() => { const e = document.getElementById('ml-chip'); return e && !e.hidden && /Supply load too high/.test(e.textContent) && document.querySelector('#pwr .pwr-lbl').textContent === 'Supply load'; }), `${tag} power hint and label (en)`);
+      await shot('0_power_hold_en');
+      await page.click('#btn-lang');
+      P.extra = {};
+      await page.waitForTimeout(1200);
     }
     if (ui === 'simple') for (const s of STICKS) if (await page.$(s)) ok(await visible(page, s) || !(await page.evaluate((x) => document.querySelector(x).offsetParent, s)), `${tag} ${s} state in video view`);
     await page.evaluate(() => window.scrollTo(0, 0));

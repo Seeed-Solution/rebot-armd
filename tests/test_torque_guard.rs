@@ -190,7 +190,7 @@ async fn capability_needs_torque_feedback() {
     assert!(schema.torque_guard.is_some(), "the policy is published from the profile");
     let (inner, _) = rig();
     let schema = inner.schema();
-    assert!(schema.capabilities.torque_guard && schema.capabilities.version == 8);
+    assert!(schema.capabilities.torque_guard && schema.capabilities.version >= 8);
     let d = inner.safety_describe();
     let stop = d["stops"].as_array().unwrap().iter().find(|s| s["id"] == "torque_limit_hold").expect("describe lists the stop");
     assert_eq!(stop["action_code"], "TORQUE_LIMIT");
