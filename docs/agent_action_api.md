@@ -85,7 +85,7 @@ Every observation carries `action` (latest record) and, for 2 s after a newer ac
            "holding":null, "gripper_gap_rad":null, "settled":null}
 ```
 
-`kind`: `move_to`, `move_relative`, `gripper`, `grasp`, `place`, `joint_move`, `home`, `park`, `move_to_pose`, `replay`. A `grasp` record also carries `phase`, `iteration` and `error_px`, and, for camera-down acquisition, `final_offset_px` and `acquire_height_m` (fields absent otherwise); a `place` record carries `phase` (all three are null for other kinds); a `replay` record carries `phase`, `episode` and `t_s` (the last two absent for other kinds). `state`: `running`, `done`, `failed`, `cancelled`. `started_at` / `finished_at` use the observation `timestamp` clock. Clients block by waiting until `action.id == action_id` and `state != "running"`, or until `previous_action.id == action_id`.
+`kind`: `move_to`, `move_relative`, `gripper`, `grasp`, `place`, `joint_move`, `home`, `park`, `move_to_pose`, `replay`. Planned motions carry `power_scale` when the profile has a power budget (see [Power budget](#power-budget--电源功率预算)). A `grasp` record also carries `phase`, `iteration` and `error_px`, and, for camera-down acquisition, `final_offset_px` and `acquire_height_m` (fields absent otherwise); a `place` record carries `phase` (all three are null for other kinds); a `replay` record carries `phase`, `episode` and `t_s` (the last two absent for other kinds). `state`: `running`, `done`, `failed`, `cancelled`. `started_at` / `finished_at` use the observation `timestamp` clock. Clients block by waiting until `action.id == action_id` and `state != "running"`, or until `previous_action.id == action_id`.
 
 A running action ends when its reference goes away:
 
@@ -158,6 +158,26 @@ A joint whose measured |torque| stays at or above `ratio` × its TMAX (`damiao_r
 Client pattern: on `TORQUE_LIMIT`, do not retry the same goal; move the named joint back (opposite to the direction it was moving) and re-plan.
 
 关节实测 |力矩| ≥ `ratio` × 该关节 TMAX（`damiao_ranges[j].t_max`）持续 `persist_ms` 时停止运动（能力 `torque_guard`，能力版本 8；profile 段 `torque_guard`，缺省为关闭）。B601-DM：`ratio` 0.60、`persist_ms` 100，检测 J1–J6：J1–J3 16.8 N·m，J4–J6 6.0 N·m；夹爪不检测。0.60 于 2026-11-12 按当前 24 V 6.5 A 电源设定，配 14.6 A 电源时预期值为 0.85。完整规则见 `docs/control_safety_contract.md`「力矩保护」。`schema.torque_guard` 结构见上，`GET /api/v1/safety/describe` 中为 `torque_limit_hold`。触发（力矩开启、Armed / Moving、位置控制；重力补偿和收纳稳定阶段不检测）后正在执行的动作（规划运动、笛卡尔动作、宏动作、回放、收纳）以 `TORQUE_LIMIT` 失败，所有运动结束，J1–J6 在实测位置保持力矩，夹爪指令不变，`safety_state` 不变，不锁存 Fault；保持期间 `motion_limit` 为 `{"reason": "torque", "joint", "since_ms"}`。保持期间 servo 帧与 jog / joint_move / home 目标若使该关节继续朝施力方向（触发时力矩的符号）越过保持位置，该关节被限制在保持位置，其他关节照常；反方向运动照常通过。关节离开保持位置 0.05 rad 且 |力矩| 低于阈值，或断力矩、急停、Fault、进入重力补偿时保持结束。客户端做法：收到 `TORQUE_LIMIT` 不要重试同一目标，先把该关节反向移出再重新规划。
+
+## Power budget / 电源功率预算
+
+armd estimates the motor supply current from the measured joint torques and velocities with datasheet motor parameters (capability `power_budget`, capabilities version 9; profile section `power_budget`, absent = off). There is no current sensor: the values are estimates, not measurements. B601-DM: Mean Well LRS-150-24, 6.5 A rated, trip ~8.5 A. Full model, parameters and rules: `docs/control_safety_contract.md` "Power budget".
+
+- `observation.power` (null without a budget):
+
+  ```json
+  "power": {"valid": true, "bus_a": 1.42, "peak_a": 2.10, "rated_a": 6.5, "ratio": 0.218, "regen_w": 0.0,
+            "per_joint_a": [0.02, 0.41, 0.33, 0.12, 0.02, 0.02, 0.02], "scale": 1.0, "limiting": false, "hold": false}
+  ```
+
+  `bus_a` estimated supply current (A, 0.25 s low-pass), `peak_a` its 5 s peak, `ratio` = `bus_a / rated_a`, `regen_w` mechanical power fed back by the motors (not credited), `per_joint_a` per-joint share (idle power included, the base load is not), `scale` speed scale the governor applies to every motion this tick, `limiting` the governor slows or holds, `hold` a power hold is in force. `valid: false` (numbers 0) without fresh torque feedback.
+- Governor: above 80 % of the rating motions slow down (`scale` < 1, `motion_limit.reason` `power`); above 95 % for 100 ms while a joint pushes in its torque direction the running action ends `failed` with code `POWER_LIMIT`, every motion ends and the measured pose is held with torque on (`power.hold` true, `motion_limit` `{"reason": "power", "joint"}`); no Fault. During the hold, servo / jog targets that move a pushing joint further in its push direction are clamped; yielding targets pass. The hold ends after the estimate stays below 80 % for 300 ms. Not applied in gravity compensation.
+- Planning: every planned motion (jog / joint_move, home, move_to_pose, move_to, move_relative, grasp and place sub-motions, replay, park) is checked with URDF inverse dynamics before it starts; if its estimated peak exceeds 75 % of the rating it is slowed (duration / scale). The action record carries `power_scale` (1 = as planned, < 1 slowed; absent without a budget and for the gripper action) and `expected_duration_s` includes the slowing. If even 20 % speed does not fit, the command is rejected with `422 POWER_BUDGET`.
+- `GET /api/v1/diagnostics/power` (no lease): `{"enabled", "estimate_only", "observation", "fast_a", "raw_a", "peak_5s_a", "peak_60s_a", "max_a", "max_at_s", "over_rated_s", "idle_a", "governor": {"scale", "limited_s", "holds_total", "hold"}, "budget"}`; `{"enabled": false}` without a budget. `schema.power_budget` is the budget in force; `GET /api/v1/safety/describe` lists the hold as `power_limit_hold`.
+
+Client pattern: on `POWER_LIMIT`, wait for `power.hold` to clear, then retry slower or with less load; on `POWER_BUDGET`, the motion cannot fit the supply at any allowed speed (e.g. the target pose needs more holding current than the budget): choose another target or a larger supply.
+
+armd 根据实测关节力矩、速度和数据手册电机参数估算电机电源电流（能力 `power_budget`，能力版本 9；profile 段 `power_budget`，缺省为关闭）。没有电流传感器：数值是估算值，不是测量值。B601-DM：明纬 LRS-150-24，额定 6.5 A，约 8.5 A 触发。完整模型、参数与规则见 `docs/control_safety_contract.md`「电源功率预算」。`observation.power` 结构见上：`bus_a` 为估算电源电流（A，0.25 s 低通），`peak_a` 为其 5 s 峰值，`ratio` = `bus_a / rated_a`，`regen_w` 为电机回馈的机械功率（不抵扣），`per_joint_a` 为各关节份额（含待机功率，不含基础负载），`scale` 为本周期调速器对所有运动施加的速度比例，`limiting` 表示正在降速或保持，`hold` 表示功率保持生效；无新鲜力矩反馈时 `valid: false`（数值为 0），无预算时为 null。调速：超过额定值 80 % 时运动降速（`scale` < 1，`motion_limit.reason` 为 `power`）；超过 95 % 持续 100 ms 且有关节沿其力矩方向施力时，正在执行的动作以 `POWER_LIMIT` 失败，所有运动结束，在实测位姿保持力矩（`power.hold` 为 true，`motion_limit` 为 `{"reason": "power", "joint"}`），不锁存 Fault；保持期间使施力关节继续朝施力方向运动的 servo / jog 目标被限制，顺从方向照常通过；估算值低于 80 % 持续 300 ms 后保持结束；重力补偿期间不调速。规划：所有规划运动（jog / joint_move、home、move_to_pose、move_to、move_relative、抓取与放置子运动、回放、收纳）开始前用 URDF 逆动力学检查，估算峰值超过额定值 75 % 时放慢（时长 / 比例）；动作记录带 `power_scale`（1 为原规划，< 1 为已放慢；无预算或夹爪动作时缺省），`expected_duration_s` 已包含放慢；20 % 速度仍不满足时以 `422 POWER_BUDGET` 拒绝。`GET /api/v1/diagnostics/power`（无需租约）字段见上；`schema.power_budget` 为生效的预算；`GET /api/v1/safety/describe` 中保持为 `power_limit_hold`。客户端做法：收到 `POWER_LIMIT` 时等 `power.hold` 清除后放慢或减小负载再试；收到 `POWER_BUDGET` 表示任何允许速度下都超出电源（例如目标位姿所需保持电流超过预算），应换目标或换更大的电源。
 
 ## Safety self-description / 安全自描述
 
@@ -444,6 +464,7 @@ directory both return `enabled: false` and empty lists.
 | `/api/v1/diagnostics/blackbox?seconds=N` | `{"enabled", "boot", "current_boot", "seconds", "truncated", "records": [...]}`: this start's records of the last N seconds (default 60, max 3600), oldest first |
 | `/api/v1/diagnostics/blackbox?seconds=N&prev=1` | the same for the previous start: the seconds before the last reset or restart |
 | `/api/v1/diagnostics/tick` | `{"window", "tick_us": {"p50","p99","max"}, "lock_us": {...}, "late_count", "since_boot_ticks"}` over the last 1000 control ticks (in memory, works without a black-box directory) |
+| `/api/v1/diagnostics/power` | supply-current estimate, 5 s / 60 s peaks and governor state (in memory, see [Power budget](#power-budget--电源功率预算)) |
 
 Boot entry (`boots.log`): `boot` (start counter, persisted in `boot_count`), `uptime_s` (kernel
 uptime at armd start), `kernel_boot_id`, `same_kernel_boot` (false: the kernel booted since the
@@ -455,7 +476,7 @@ last black-box record of the previous start, or null).
 Black-box record (`bb.jsonl`): `boot`, `t_ms` (monotonic ms since armd start), `safety_state`,
 `is_torqued`, `enable_state`, `lease_holder`, `control_mode`, `positions`,
 `commanded_positions`, `velocities`, `torques`, `temperatures` (3 decimals), `feedback_valid`,
-`feedback_age_ms`, `motor_errors`, `motion_limit`, `residual_torques` (3 decimals or null), `collision` (the observation field; omitted while null), `action` (latest action as `kind:state`),
+`feedback_age_ms`, `motor_errors`, `motion_limit`, `residual_torques` (3 decimals or null), `collision` (the observation field; omitted while null), `power` (`{"a": estimated supply current, "pk": its 5 s peak (A, 2 decimals), "s": governor scale, "hold": true only during a power hold}`; omitted without an estimate), `action` (latest action as `kind:state`),
 `dropped` (samples dropped so far because the writer was busy). Rate: 5 Hz while torqued or a
 joint moves faster than 0.05 rad/s, otherwise one line every 5 s. Each line is `fdatasync`ed
 while torqued. Files: `bb.jsonl` rotated at 2 MiB, six old files kept (`.1` … `.6`); about 75 min
@@ -469,13 +490,13 @@ Tick timing: `tick_us` is the whole `ArmSupervisor::tick` call (waiting for the 
 最旧的行，`truncated: true`）。没有黑匣子目录时两者都返回 `enabled: false` 和空列表。`boots` 每次
 armd 启动一条（含上一次启动的最后一条记录 `prev_last`、内核 `uptime_s`、`same_kernel_boot`、
 SG2002 上电原因 `reset_reason`）；`blackbox?seconds=N` 返回本次启动最近 N 秒（默认 60，最大
-3600）的记录，`&prev=1` 返回上一次启动的记录，即复位或重启前的那几秒。记录字段与采样率见上文英文部分。`/api/v1/diagnostics/tick` 返回最近 1000 个控制周期的耗时（`tick_us` 为整个周期调用，`lock_us` 为持有监督器写锁的时间，单位 µs）以及启动以来 `dt` 超过两个控制周期的次数 `late_count`。
+3600）的记录，`&prev=1` 返回上一次启动的记录，即复位或重启前的那几秒。记录字段与采样率见上文英文部分。`/api/v1/diagnostics/tick` 返回最近 1000 个控制周期的耗时（`tick_us` 为整个周期调用，`lock_us` 为持有监督器写锁的时间，单位 µs）以及启动以来 `dt` 超过两个控制周期的次数 `late_count`。`/api/v1/diagnostics/power` 返回电源电流估算、5 s / 60 s 峰值与调速器状态（内存数据，见「电源功率预算」）；黑匣子记录的 `power` 字段为 `{"a": 估算电源电流, "pk": 5 s 峰值（A，2 位小数）, "s": 调速比例, "hold": 仅功率保持期间为 true}`，无估算时省略。
 
 ## Errors / 错误码
 
 | code | status |
 |---|---|
-| `IK_UNREACHABLE`, `IK_BRANCH_FLIP`, `WORKSPACE_VIOLATION` | 422 |
+| `IK_UNREACHABLE`, `IK_BRANCH_FLIP`, `WORKSPACE_VIOLATION`, `POWER_BUDGET` | 422 |
 | `REPLAY_EMPTY`, `REPLAY_JOINT_COUNT`, `REPLAY_INVALID_EPISODE`, `REPLAY_TOO_LONG`, `REPLAY_TOO_FAST` | 422 |
 | `SOFT_LIMIT_EXCEEDED`, `INVALID_EPISODE_ID`, `INVALID_OUTPUT_PATH` | 400 |
 | `EPISODE_NOT_FOUND` | 404 |
@@ -488,7 +509,7 @@ SG2002 上电原因 `reset_reason`）；`blackbox?seconds=N` 返回本次启动�
 | `POSE_NOT_FOUND` | 404 |
 | `GRAVITY_COMP_NOT_STATIONARY`, `GRAVITY_COMP_JOINT_LIMIT`, `GRAVITY_COMP_SWITCH_FAILED`, `FEEDBACK_STALE`, `LEASE_REQUIRED` (gravity compensation entry) | 409 |
 
-Codes that only appear in `action.code`: `COLLISION`, `TORQUE_LIMIT`, `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `ESTOP_ACTIVE`, `FAULT`, `WATCHDOG`, `LEASE_LOST`, `STOPPED`, `SUPERSEDED`, `UNLOAD_FAILED`; for `grasp` also `TARGET_LOST`, `TARGET_DISPLACED`, `CENTRING_FAILED`, `NOT_HOLDING`, `GRASP_TIMEOUT`, `DETECTION_UNAVAILABLE`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a later phase; for `place` also `PLACE_TIMEOUT`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a re-planned phase.
+Codes that only appear in `action.code`: `COLLISION`, `TORQUE_LIMIT`, `POWER_LIMIT`, `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `ESTOP_ACTIVE`, `FAULT`, `WATCHDOG`, `LEASE_LOST`, `STOPPED`, `SUPERSEDED`, `UNLOAD_FAILED`; for `grasp` also `TARGET_LOST`, `TARGET_DISPLACED`, `CENTRING_FAILED`, `NOT_HOLDING`, `GRASP_TIMEOUT`, `DETECTION_UNAVAILABLE`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a later phase; for `place` also `PLACE_TIMEOUT`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a re-planned phase.
 
 ## Needs verification on the device / 需实机核实
 
@@ -498,4 +519,5 @@ Codes that only appear in `action.code`: `COLLISION`, `TORQUE_LIMIT`, `TRACKING_
 - Gravity compensation: the Damiao CTRL_MODE register write while enabled, its acknowledgement, the PMAX / VMAX / TMAX values of each B601-DM motor, the URDF torque against the measured hold torque, the POS_VEL transient when the feed-forward ends at the switch back, and the damping / overspeed defaults (checklist in the contract).
 - Replay: tested in simulation only (first-order servo, `tests/test_replay.rs`); tracking of a replayed hand-guided episode under POS_VEL, and how often hand-guided episodes exceed the 0.45 rad/s planned-motion limit at 0.5x, are not measured on the arm.
 - Planning time on the SG2002: `cargo test --release --test test_actions bench_plan -- --ignored --nocapture`.
+- Power budget: the supply current against the estimate (clamp meter) at several poses, speeds and stalls; the datasheet motor parameters, `k_cu`, `efficiency`, idle and reCamera power; the LRS-150-24 trip current and time; power planning time on the SG2002 (`cargo test --release --test test_power_budget -- --nocapture` prints it).
 - Grasp: `camera_tilt_deg` sign and value for the new mount, `camera_mount.offset_m`, `grip_pixel_norm`, `table_z_m`; detection rate and latency (`settle_delay_s`, `lost_*`); the jaw closing axis (assumed end_link y) for J6 alignment; `centre_tol_px` against detector jitter; `holding` thresholds under POS_VEL; camera-down acquisition with the v8 holder (mount tilt, rot and lens centre accuracy, reachability of the pitched approach); the v8 lens offset, body box, 5 mm table margin and `recheck_tol_px` per [Real-arm calibration](#real-arm-calibration-v8-mount--真机标定v8-支架). Simulated-camera tests: `cargo test --test test_grasp -- --nocapture`.

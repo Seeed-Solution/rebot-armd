@@ -208,6 +208,11 @@ TODO / roadmap:
   joint cannot follow, reported as `motion_limit`; torque guard (|torque| at or above
   `torque_guard.ratio` × TMAX for 100 ms on J1–J6 stops the motion and holds with torque on,
   action code `TORQUE_LIMIT`; rebot-dm ratio 0.60: 16.8 N·m on J1–J3, 6.0 N·m on J4–J6);
+  supply power budget (`power_budget`: supply current estimated from motor torque and velocity
+  with datasheet motor parameters, no current sensor; motions slow down above 80 % of the
+  supply rating and hold above 95 % with action code `POWER_LIMIT`; planned motions are
+  time-scaled with URDF inverse dynamics to stay under 75 %, or refused with `POWER_BUDGET`;
+  rebot-dm: 6.5 A LRS-150-24; shown as a supply load meter in the cockpit);
   `is_torqued` false when the motors come back Disabled during a Fault; Cartesian workspace check (floor, box,
   reach); lease watchdog that parks the arm; refusal to cut torque away from the resting pose
   (`ARM_NOT_AT_RESTING_POSE`), so the arm is not dropped.
@@ -515,7 +520,7 @@ WebSocket that holds the lease.
 | `/api/v1/grasp/setup` | GET | grasp setup (changed with a WS command) |
 | `/api/v1/poses` | GET | named poses (saved and deleted with WS commands, used by the `move_to_pose` action; [format](docs/agent_action_api.md#named-poses--命名姿态)) |
 | `/api/v1/workspace/keepout` | GET | keep-out boxes in force, each tagged `profile` or `runtime` (the runtime list, set with a WS command, only adds boxes) |
-| `/api/v1/diagnostics/boots`, `/api/v1/diagnostics/blackbox?seconds=N[&prev=1]`, `/api/v1/diagnostics/tick` | GET | boot records, black-box records (state before a reset) and control tick timing, no lease needed ([format](docs/agent_action_api.md#diagnostics--诊断)) |
+| `/api/v1/diagnostics/boots`, `/api/v1/diagnostics/blackbox?seconds=N[&prev=1]`, `/api/v1/diagnostics/tick`, `/api/v1/diagnostics/power` | GET | boot records, black-box records (state before a reset), control tick timing and the supply-current estimate with recent peaks, no lease needed ([format](docs/agent_action_api.md#diagnostics--诊断)) |
 | `/api/v1/dataset/record/start` / `save` / `discard` | POST | episode recording |
 | `/api/v1/dataset/episodes`, `/api/v1/dataset/episodes/{id}` | GET, DELETE | list and delete saved episodes, no lease needed ([format](docs/agent_action_api.md#replay--回放)) |
 | `/api/v1/detection/latest`, `/trigger`, `/inference`, `/ws` | GET / POST / WS | detector proxy |

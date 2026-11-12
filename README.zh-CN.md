@@ -154,7 +154,7 @@ TODO / 路线图：
 
 - **控制循环**：固定周期 tick（`control_frequency_hz`，内置 profile 为 50 Hz，允许范围 1..1000）。tick 晚于 80 ms 时锁存安全保持，不继续执行旧轨迹。视频不经过 armd：驾驶舱用 JMuxer 直接播放摄像头的 H.264 WebSocket 流（`ws://<host>:8001/`）。
 - **租约**：执行器权限属于发送了 `acquire_lease` 并持续发送 `heartbeat` 的 WebSocket 连接（租约超时 2500 ms）。每条 `command` 都带租约 `generation`、当前安全 `epoch_id` 和严格递增的 `request_id`。REST 执行器路由（`torque`、`motion/*`、`action/*`、`clear_fault`）返回 `409 LEASE_REQUIRED`，不执行动作。急停例外：REST 与 WebSocket 都不需要租约。其他客户端可用 `force` 接管，接管后在机械臂稳定前拒绝运动（`HANDOVER_SETTLING`）。
-- **安全层**（详见 [docs/control_safety_contract.md](docs/control_safety_contract.md)）：关节位置、速度、加速度限位；`max_temperature` 温度保护（内置 profile 为 70 °C）；反馈新鲜度（250 ms）；跟随误差故障（`max_error_rad` 0.5，持续 500 ms）及动作的 `TRACKING_STALL`；规划运动限速（`planned_max_velocity`，rebot-dm 为 0.45 rad/s）；servo 流式限速与领先量上限（`servo_max_velocity`、`servo_max_lead_rad` 0.2），关节跟不上时保持位置而不报 Fault，并在观测 `motion_limit` 中报告；力矩保护（J1–J6 的 |力矩| ≥ `torque_guard.ratio` × TMAX 持续 100 ms 时停止运动并保持力矩，动作码 `TORQUE_LIMIT`；rebot-dm 的 ratio 为 0.60：J1–J3 16.8 N·m，J4–J6 6.0 N·m）；Fault 期间电机以 Disabled 恢复时 `is_torqued` 置为 false；笛卡尔工作空间检查（地面、包围盒、伸展范围）；租约看门狗自动收纳；不在收纳位时拒绝断力矩（`ARM_NOT_AT_RESTING_POSE`），避免机械臂下坠。
+- **安全层**（详见 [docs/control_safety_contract.md](docs/control_safety_contract.md)）：关节位置、速度、加速度限位；`max_temperature` 温度保护（内置 profile 为 70 °C）；反馈新鲜度（250 ms）；跟随误差故障（`max_error_rad` 0.5，持续 500 ms）及动作的 `TRACKING_STALL`；规划运动限速（`planned_max_velocity`，rebot-dm 为 0.45 rad/s）；servo 流式限速与领先量上限（`servo_max_velocity`、`servo_max_lead_rad` 0.2），关节跟不上时保持位置而不报 Fault，并在观测 `motion_limit` 中报告；力矩保护（J1–J6 的 |力矩| ≥ `torque_guard.ratio` × TMAX 持续 100 ms 时停止运动并保持力矩，动作码 `TORQUE_LIMIT`；rebot-dm 的 ratio 为 0.60：J1–J3 16.8 N·m，J4–J6 6.0 N·m）；电源功率预算（`power_budget`：由电机力矩和速度按数据手册参数估算电源电流，无电流传感器；超过电源额定值 80 % 时降速，超过 95 % 时保持，动作码 `POWER_LIMIT`；规划运动用 URDF 逆动力学做时间缩放以保持在 75 % 以下，否则以 `POWER_BUDGET` 拒绝；rebot-dm 为 6.5 A 的 LRS-150-24；驾驶舱显示电源负载条）；Fault 期间电机以 Disabled 恢复时 `is_torqued` 置为 false；笛卡尔工作空间检查（地面、包围盒、伸展范围）；租约看门狗自动收纳；不在收纳位时拒绝断力矩（`ARM_NOT_AT_RESTING_POSE`），避免机械臂下坠。
 
 ### 核心、套件与 agent
 
@@ -313,7 +313,7 @@ v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 | `/api/v1/grasp/setup` | GET | 抓取设置（通过 WS 指令修改） |
 | `/api/v1/poses` | GET | 命名姿态（通过 WS 指令保存、删除，供 `move_to_pose` 动作使用；[格式](docs/agent_action_api.md#named-poses--命名姿态)） |
 | `/api/v1/workspace/keepout` | GET | 生效的禁入盒，每个标注 `profile` 或 `runtime`（运行时列表通过 WS 指令设置，只能增加禁入盒） |
-| `/api/v1/diagnostics/boots`、`/api/v1/diagnostics/blackbox?seconds=N[&prev=1]`、`/api/v1/diagnostics/tick` | GET | 启动记录、黑匣子记录（复位前的状态）与控制周期耗时，无需租约（[格式](docs/agent_action_api.md#diagnostics--诊断)） |
+| `/api/v1/diagnostics/boots`、`/api/v1/diagnostics/blackbox?seconds=N[&prev=1]`、`/api/v1/diagnostics/tick`、`/api/v1/diagnostics/power` | GET | 启动记录、黑匣子记录（复位前的状态）、控制周期耗时与电源电流估算及近期峰值，无需租约（[格式](docs/agent_action_api.md#diagnostics--诊断)） |
 | `/api/v1/dataset/record/start` / `save` / `discard` | POST | 示教片段录制 |
 | `/api/v1/dataset/episodes`、`/api/v1/dataset/episodes/{id}` | GET、DELETE | 列出与删除已保存的片段，无需租约（[格式](docs/agent_action_api.md#replay--回放)） |
 | `/api/v1/detection/latest`、`/trigger`、`/inference`、`/ws` | GET / POST / WS | 检测服务代理 |
