@@ -1097,8 +1097,8 @@ async fn camera_down_rejects_a_camera_body_that_would_reach_the_table() {
 /// approach and centring are clear, so it is acked).
 #[tokio::test]
 async fn look_down_descent_that_would_bring_the_camera_to_the_table_fails() {
-    // the height probe off: the descent starts at the approach height
-    let setup = GraspSetup { height_probe_m: 0.0, ..GraspSetup::default() };
+    // the height probe and the re-centre off: one descent from the approach height
+    let setup = GraspSetup { height_probe_m: 0.0, recentre_height_m: 0.0, ..GraspSetup::default() };
     for (ahead_m, ok) in [(0.009, true), (0.0145, false)] {
         let truth = Truth { offset: [ahead_m, 0.0, 0.03], ..Truth::same() };
         let rig = rig(setup.clone(), truth, 0.0, [0.0, 0.0], false).await;
@@ -1284,4 +1284,92 @@ async fn height_probe_too_tall_object_fails() {
     let z = start_pose(&rig).await.p[2];
     assert!((z - (s.table_z_m + s.approach_height_m - s.height_probe_m)).abs() < 2e-3, "stays at the probe pose: {z}");
     assert_idle_after(&rig.sup, a.id).await;
+}
+
+// ---- mid-height re-centre and descent contact ----
+
+/// Look-down with the lens on the tool axis: the target is re-centred at 0.07 m on the way
+/// down; losing it there skips the re-centre and the grasp completes.
+#[tokio::test]
+async fn recentre_at_mid_height_and_skip_when_lost() {
+    for lose in [false, true] {
+        let (rig, s) = height_rig(0.05, json!({})).await;
+        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+        if lose {
+            wait_phase(&rig.sup, id, "recentre", None).await;
+            rig.sim.visible.store(false, Ordering::SeqCst);
+        }
+        let mut phases: Vec<String> = Vec::new();
+        let a = wait_done(&rig.sup, id, 60.0, |a| {
+            let p = a.phase.clone().unwrap_or_default();
+            if phases.last() != Some(&p) { phases.push(p); }
+        }).await;
+        let final_pose = start_pose(&rig).await;
+        println!("re-centre (lost {lose}): {} {:?} recentre {:?} iterations {:?}, final xy error {:.2} mm, phases {phases:?}",
+            a.state, a.code, a.recentre, a.recentre_iterations, xy_err(&final_pose.p, &rig.object) * 1000.0);
+        assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+        let pos = |p: &str| phases.iter().position(|q| q == p).unwrap_or_else(|| panic!("{p} in {phases:?}"));
+        assert!(pos("recentre") < pos("close"), "{phases:?}");
+        if !lose { assert!(pos("descend") < pos("recentre"), "{phases:?}"); }
+        if lose {
+            assert_eq!(a.recentre.as_deref(), Some("skipped:target_lost"), "{a:?}");
+        } else {
+            assert_eq!(a.recentre.as_deref(), Some("done"), "{a:?}");
+            assert!(xy_err(&final_pose.p, &rig.object) < 0.004);
+        }
+        assert!((final_pose.p[2] - (s.table_z_m + s.lift_height_m)).abs() < 2e-3);
+    }
+}
+
+/// Descent with a driver reporting residual torques: peaks are logged; with
+/// `descend_contact_stop_nm` a J2 residual above it stops the descent where the arm is, and the
+/// jaws close there.
+#[tokio::test]
+async fn descend_logs_residual_peaks_and_stops_on_contact() {
+    for (stop, residual) in [(None, 1.0f32), (Some(2.0), 3.0f32)] {
+        let setup = GraspSetup { height_probe_m: 0.0, recentre_height_m: 0.0, descend_contact_stop_nm: stop, ..GraspSetup::default() };
+        let arm = common::TestArm::new();
+        let rig = rig_driven(setup.clone(), centred_lens(), 0.0, look_down_start(0.0, 0.24), [0.0, 0.0], false, Some(arm.clone())).await;
+        rig.sup.inner().write().await.config.collision = None;
+        let start_r = start_pose(&rig).await.r;
+        let mut s = setup.clone();
+        s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+        rig.sup.inner().write().await.set_grasp_setup(s.clone());
+        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+        wait_phase(&rig.sup, id, "descend", Some(true)).await;
+        // contact below 0.08 m
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while start_pose(&rig).await.p[2] > s.table_z_m + 0.08 {
+            assert!(Instant::now() < deadline, "descent did not reach 0.08 m");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        arm.set_residual(1, residual);
+        let mut close_z = f64::NAN;
+        let sup = rig.sup.clone();
+        let a = wait_done(&rig.sup, id, 40.0, |a| {
+            if a.phase.as_deref() == Some("close") {
+                if let Ok(inner) = sup.inner().try_read() { close_z = kinematics::fk(&kinematics::q6(&inner.commanded_positions)).p[2]; }
+            }
+        }).await;
+        println!("descent stop {stop:?}, residual {residual}: {} {:?}, peaks {:?} N·m / {:?} rad, contact {:?} at {:?} m, TCP z at close {close_z:.4}",
+            a.state, a.code, a.descend_peak_residual_nm, a.descend_peak_tracking_rad, a.descend_contact, a.descend_contact_height_m);
+        // the driver rig does not stop the jaws on the object (its ideal servo reports the
+        // commanded J7), so the close may end NOT_HOLDING; the descent is what is checked here
+        assert!(a.state == "done" || a.code.as_deref() == Some("NOT_HOLDING"), "{a:?}");
+        let pk = a.descend_peak_residual_nm.expect("residual peaks logged");
+        assert!((pk[0] - residual).abs() < 0.05 && pk[1] < 0.05, "{pk:?}");
+        assert!(a.descend_peak_tracking_rad.is_some());
+        match stop {
+            None => {
+                assert_eq!(a.descend_contact, None);
+                assert!((close_z - (s.table_z_m + s.grasp_height_m)).abs() < 2e-3, "full descent: {close_z}");
+            }
+            Some(_) => {
+                assert_eq!(a.descend_contact, Some(true), "{a:?}");
+                let h = f64::from(a.descend_contact_height_m.unwrap());
+                assert!(h > s.grasp_height_m + 0.01 && h < 0.08 + 1e-3, "{h}");
+                assert!((close_z - (s.table_z_m + h)).abs() < 3e-3, "closed where it stopped: {close_z} vs {h}");
+            }
+        }
+    }
 }

@@ -232,6 +232,9 @@
     "height_probe_m": 0.04,
     "height_grasp_fraction": 0.5,
     "max_grasp_height_m": 0.06,
+    "recentre_height_m": 0.07,
+    "recentre_max_iterations": 3,
+    "descend_contact_stop_nm": null,
     "recheck_tol_px": 40.0
   },
   "gravity_comp": {

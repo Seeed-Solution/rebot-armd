@@ -113,6 +113,13 @@ pub struct GraspSetup {
     /// `max_grasp_height_m`) above the table.
     pub height_grasp_fraction: f64,
     pub max_grasp_height_m: f64,
+    /// Look-down: descend first to this TCP height above the table and centre once more
+    /// (at most `recentre_max_iterations` corrections) before the rest of the descent; 0 disables.
+    pub recentre_height_m: f64,
+    pub recentre_max_iterations: u32,
+    /// Stop the descent and close where the arm is when |residual torque| of J2 or J3 exceeds
+    /// this (N·m); None = off (peaks are only logged).
+    pub descend_contact_stop_nm: Option<f64>,
     /// Camera-down re-check after the transition: TARGET_DISPLACED when the target's box
     /// centre is more than this many pixels from where the model projects it.
     pub recheck_tol_px: f64,
@@ -167,6 +174,9 @@ impl Default for GraspSetup {
             height_probe_m: 0.04,
             height_grasp_fraction: 0.5,
             max_grasp_height_m: 0.06,
+            recentre_height_m: 0.07,
+            recentre_max_iterations: 3,
+            descend_contact_stop_nm: None,
         }
     }
 }
@@ -179,7 +189,7 @@ impl GraspSetup {
             self.image_size_px[1], self.fx_px, self.fy_px, self.centre_tol_px, self.servo_gain, self.max_step_m,
             self.match_dist_px, self.match_iou, self.acquire_dist_px, self.lost_timeout_s, self.settle_delay_s,
             self.align_min_aspect, self.align_min_angle_conf, self.approach_speed_mps, self.descend_speed_mps, self.phase_timeout_s, self.timeout_s, self.recheck_tol_px,
-            self.height_probe_m, self.height_grasp_fraction, self.max_grasp_height_m];
+            self.height_probe_m, self.height_grasp_fraction, self.max_grasp_height_m, self.recentre_height_m];
         if !all.iter().all(|v| fin(*v)) { return Err("grasp setup values must be finite".into()); }
         let check = |ok: bool, msg: &str| if ok { Ok(()) } else { Err(msg.to_string()) };
         check((-0.5..=0.5).contains(&self.table_z_m), "table_z_m must be in [-0.5, 0.5] m")?;
@@ -208,6 +218,9 @@ impl GraspSetup {
         check((0.0..=1.0).contains(&self.height_grasp_fraction), "height_grasp_fraction must be in [0, 1]")?;
         check(self.max_grasp_height_m >= self.grasp_height_m && self.max_grasp_height_m <= 0.2,
             "max_grasp_height_m must be in [grasp_height_m, 0.2] m")?;
+        check((0.0..=0.4).contains(&self.recentre_height_m), "recentre_height_m must be in [0, 0.4] m")?;
+        check((1..=30).contains(&self.recentre_max_iterations), "recentre_max_iterations must be 1..30")?;
+        check(self.descend_contact_stop_nm.is_none_or(|v| v.is_finite() && v > 0.0 && v <= 50.0), "descend_contact_stop_nm must be null or in (0, 50] N·m")?;
         check(self.align_min_aspect >= 1.0 && self.align_min_aspect <= 10.0, "align_min_aspect must be in [1, 10]")?;
         check((0.0..=1.0).contains(&self.align_min_angle_conf), "align_min_angle_conf must be in [0, 1]")?;
         let speed_ok = |v: f64| v > 0.0 && v <= motion::MAX_LINEAR_MPS;
@@ -905,7 +918,8 @@ pub fn expected_duration(planned: &PlannedGrasp) -> f64 {
     let descend = (s.approach_height_m - s.grasp_height_m) * 1.875 / s.descend_speed_mps;
     let lift = (s.lift_height_m - s.grasp_height_m) * 1.875 / s.descend_speed_mps;
     let probe = if s.height_probe_m > 0.0 { 2.0 * s.height_probe_m * 1.875 / s.approach_speed_mps + 1.5 } else { 0.0 };
-    let base = 6.5 + planned.approach_duration + 4.0 * 1.5 + descend + 2.0 + lift + probe;
+    let recentre = if s.recentre_height_m > 0.0 && !planned.camera_down { 3.0 } else { 0.0 };
+    let base = 6.5 + planned.approach_duration + 4.0 * 1.5 + descend + 2.0 + lift + probe + recentre;
     // camera-down: the transition move and its re-check frame
     if planned.camera_down { base + planned.transition_duration + 1.5 } else { base }
 }
@@ -1100,10 +1114,14 @@ impl Orchestrator {
             self.move_arm("align", GoalSpec::Relative { frame: RelFrame::Tool, d: [0.0; 3], dyaw: 0.0, dpitch: 0.0, droll: turn, level: false }, s.approach_speed_mps).await?;
         }
 
-        // descend, close, check
+        // descend (look-down: re-centre at mid height on the way), close, check
         self.phase("descend", 0.65).await?;
-        let p = self.pose().await.p;
-        self.move_arm("descend", GoalSpec::Absolute { p: [p[0], p[1], s.table_z_m + close_h], r: None }, s.descend_speed_mps).await?;
+        if !camera_down {
+            let (recentre, iterations) = self.recentre(&c, plane, close_h, &planned.request.label, &mut after).await?;
+            self.sup.inner().write().await.update_action(self.id, |a| { a.recentre = Some(recentre); a.recentre_iterations = iterations; });
+            self.phase("descend", 0.75).await?;
+        }
+        self.descend(close_h).await?;
         let closed = self.gripper_phase("close", 0.8, GripperCommand::Close).await?;
         let holding = closed.holding == Some(true);
         let lift_to = |p: Vec3| GoalSpec::Absolute { p: [p[0], p[1], s.table_z_m + s.lift_height_m], r: None };
@@ -1252,6 +1270,84 @@ impl Orchestrator {
         Ok(Ok(h))
     }
 
+    /// Look-down mid-height re-centre: descend to `recentre_height_m`, then centre the target
+    /// on the grip pixel for that height: the model's projection of the point under the TCP on
+    /// the plane z = `plane`, plus the calibration offset (`grip_pixel_norm` minus the model's
+    /// projection of that point at the centring pose). Returns the `recentre` status and the
+    /// corrections; target lost, table clearance or an unusable aim skip it (the descent goes on).
+    async fn recentre(&self, c: &Centred, plane: f64, close_h: f64, label: &str, after: &mut Option<u64>) -> Result<(String, Option<u32>), Stop> {
+        let s = &self.setup;
+        let skip = |r: &str| Ok((format!("skipped:{r}"), None));
+        if s.recentre_height_m <= 0.0 { return skip("disabled"); }
+        if !self.lens_known { return skip("no_lens_centre"); }
+        let pose = self.pose().await;
+        let z = s.table_z_m + s.recentre_height_m;
+        if s.recentre_height_m <= close_h + 0.02 || z >= pose.p[2] - 1e-3 { return skip("height"); }
+        let grip_px = self.cam.to_px(s.grip_pixel_norm);
+        let Some(m0) = self.cam.project(&c.pose, &[c.pose.p[0], c.pose.p[1], plane]) else { return skip("projection"); };
+        let Some(t3) = self.cam.plane_point(&c.pose, self.cam.to_px(box_centre(&c.last.box_norm)), plane) else { return skip("projection"); };
+        let goal = Pose::new(pose.r, [pose.p[0], pose.p[1], z]);
+        if table_violation(&pose, &goal, &self.envelope, s.table_z_m).is_some() { return skip("table_clearance"); }
+        let done = self.move_arm("descend", GoalSpec::Absolute { p: goal.p, r: None }, s.descend_speed_mps).await?;
+        let now = self.pose().await;
+        let Some(m1) = self.cam.project(&now, &[now.p[0], now.p[1], plane]) else { return skip("projection"); };
+        let aim = [m1[0] + grip_px[0] - m0[0], m1[1] + grip_px[1] - m0[1]];
+        if !(aim[0] >= 0.0 && aim[0] <= self.cam.size[0] && aim[1] >= 0.0 && aim[1] <= self.cam.size[1]) { return skip("aim_outside_image"); }
+        self.phase("recentre", 0.7).await?;
+        let mut tracker = Tracker { label: label.to_string(), predicted: c.last.box_norm, gate_px: s.acquire_dist_px };
+        if let Some(p) = self.cam.project(&now, &t3) { tracker.predict_at(self.cam.to_norm(p)); }
+        match self.centre("recentre", 0.7, &mut tracker, aim, "the grip point", plane, done.at, after, s.recentre_max_iterations, false).await {
+            Ok(r) => Ok(("done".into(), Some(r.iterations))),
+            Err(Stop::Fail(code, _)) if code == "TARGET_LOST" => skip("target_lost"),
+            Err(Stop::Fail(code, _)) if code == "WORKSPACE_VIOLATION" => skip("table_clearance"),
+            Err(Stop::Fail(code, _)) if code == "CENTRING_FAILED" => Ok(("unconverged".into(), Some(s.recentre_max_iterations))),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Straight down to `close_h` above the table. Each poll while it runs records the peak
+    /// |residual| of J2 / J3 and the peak J1..J6 tracking error; with `descend_contact_stop_nm`
+    /// set, a J2 or J3 residual above it ends the descent at the measured position.
+    async fn descend(&self, close_h: f64) -> Result<(), Stop> {
+        let s = &self.setup;
+        let p = self.pose().await.p;
+        let mv = self.move_arm("descend", GoalSpec::Absolute { p: [p[0], p[1], s.table_z_m + close_h], r: None }, s.descend_speed_mps);
+        tokio::pin!(mv);
+        let (mut peak_res, mut peak_trk, mut contact): (Option<[f32; 2]>, Option<f32>, Option<f64>) = (None, None, None);
+        let result = loop {
+            tokio::select! {
+                r = &mut mv => break r,
+                _ = tokio::time::sleep(POLL) => {
+                    let over = {
+                        let inner = self.sup.inner().read().await;
+                        if !inner.active_trajectory.as_ref().is_some_and(|t| t.action_id == Some(self.id)) { continue; }
+                        let trk = (0..6).map(|i| (inner.commanded_positions[i] - inner.measured_positions[i]).abs()).fold(0.0f32, f32::max);
+                        peak_trk = Some(peak_trk.unwrap_or(0.0).max(trk));
+                        let Some(r) = inner.residual_torques else { continue };
+                        let pk = peak_res.get_or_insert([0.0; 2]);
+                        pk[0] = pk[0].max(r[1].abs());
+                        pk[1] = pk[1].max(r[2].abs());
+                        s.descend_contact_stop_nm.is_some_and(|lim| f64::from(r[1].abs()) > lim || f64::from(r[2].abs()) > lim)
+                    };
+                    if over && contact.is_none() {
+                        let mut inner = self.sup.inner().write().await;
+                        if inner.end_macro_motion_at_measured(self.id) {
+                            let z = inner.config.arm_model.fk_f32(&inner.measured_positions).map(|p| p.p[2]).unwrap_or(f64::NAN);
+                            contact = Some(z - s.table_z_m);
+                            tracing::info!("Grasp {}: contact during the descent at {:.3} m above the table", self.id, z - s.table_z_m);
+                        }
+                    }
+                }
+            }
+        };
+        self.sup.inner().write().await.update_action(self.id, |a| {
+            a.descend_peak_residual_nm = peak_res;
+            a.descend_peak_tracking_rad = peak_trk;
+            if let Some(h) = contact { a.descend_contact = Some(true); a.descend_contact_height_m = Some(h as f32); }
+        });
+        result.map(|_| ())
+    }
+
     /// J6 roll (about the tool axis) that closes the jaws across the object's short side, and
     /// the `align` status. From the detector angle when the centring frames carry one with
     /// `angle_conf >= align_min_angle_conf`, else ±pi/2 from the box aspect. No turn when the
@@ -1299,7 +1395,6 @@ struct Centred {
     frames: Vec<Detection>,
     /// Commanded pose at which `frames` were taken.
     pose: Pose,
-    #[allow(dead_code)]
     iterations: u32,
 }
 

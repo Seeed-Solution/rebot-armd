@@ -745,6 +745,24 @@ pub struct ActionStatus {
     /// Grasp: TCP height above the table at which the jaws close (m).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_height_m: Option<f32>,
+    /// Grasp mid-height re-centre (look-down): `done`, `unconverged` or `skipped:<reason>`,
+    /// with the corrections made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recentre: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recentre_iterations: Option<u32>,
+    /// Grasp descent: largest |residual torque| of J2, J3 (N·m; absent without residuals) and
+    /// largest |commanded − measured| of J1..J6 (rad) while the descent ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descend_peak_residual_nm: Option<[f32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descend_peak_tracking_rad: Option<f32>,
+    /// Grasp descent stopped on contact (`descend_contact_stop_nm`) at this TCP height above
+    /// the table (m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descend_contact: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descend_contact_height_m: Option<f32>,
 }
 
 impl ActionStatus {
