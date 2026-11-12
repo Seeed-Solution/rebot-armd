@@ -764,6 +764,32 @@ body.stopped .sw.clear { animation: faultpulse 1.4s ease-in-out infinite; }
 .rec-stat b { font-family: var(--mono); color: var(--sc-color-text); }
 .rec-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
 .rec-last { font-size: 12px; color: var(--sc-color-text-secondary); word-break: break-all; }
+.ep { display: grid; gap: 8px; padding-top: 10px; border-top: 1px solid var(--sc-color-border-neutral); }
+.ep-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; color: var(--sc-color-text-secondary); }
+.ep-head b { color: var(--sc-color-text); font-size: 13px; margin-right: auto; }
+.ep-head .seg button { min-height: 30px; padding: 0 10px; font-size: 12px; }
+.ep-head label { display: inline-flex; align-items: center; gap: 4px; }
+.ep-head .btn { min-height: 30px; padding: 0 10px; font-size: 12px; }
+.ep-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; max-height: 260px; overflow-y: auto; }
+.ep-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 8px; border: 1px solid var(--sc-color-border-neutral); border-radius: var(--sc-radius-base); background: #fff; }
+.ep-list li.playing { border-color: var(--sc-color-primary); background: var(--sc-color-primary-soft); }
+.ep-list .en { display: grid; gap: 2px; min-width: 0; }
+.ep-list .en b { font: 600 12px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ep-list .en small { font-size: 11px; color: var(--sc-color-text-tertiary); }
+.ep-list .ea { display: flex; gap: 6px; flex: none; }
+.ep-list .btn { min-height: 34px; padding: 0 10px; font-size: 12px; touch-action: manipulation; }
+.ep-list .btn.ep-del { color: var(--sc-status-danger-fg); }
+.ep-list .btn.ep-del.armed { background: var(--sc-status-danger-bg); border-color: #ffccc7; }
+.ep-list .ep-empty { justify-content: center; color: var(--sc-color-text-tertiary); font-size: 12px; }
+.ep-play { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 8px; align-items: center; font-size: 12px; }
+.ep-play .ep-bar { grid-column: 1 / -1; height: 6px; border-radius: 3px; background: var(--sc-color-border-neutral); overflow: hidden; }
+.ep-play .ep-bar i { display: block; height: 100%; width: 0; background: var(--sc-color-primary); }
+.ep-play .ep-pt { display: grid; gap: 2px; min-width: 0; }
+.ep-play .ep-pt b { font: 600 12px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ep-play .ep-pt span { font-family: var(--mono); font-size: 11px; color: var(--sc-color-text-secondary); }
+.ep-play .btn { min-height: 34px; padding: 0 12px; color: var(--sc-status-danger-fg); border-color: #ffccc7; }
+.ep-status { font-size: 12px; color: var(--sc-color-text-secondary); min-height: 1em; word-break: break-word; }
+.ep-status.bad { color: var(--sc-status-danger-fg); }
 .kbd-help { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; padding: 0 16px 14px; font-size: 12px; color: var(--sc-color-text-secondary); align-items: center; }
 .kbd-help .sub { grid-column: 1 / -1; margin-top: 6px; font-weight: 600; color: var(--sc-color-text); }
 kbd { display: inline-block; min-width: 20px; padding: 1px 5px; margin-right: 2px; border-radius: var(--sc-radius-sm); border: 1px solid var(--sc-color-border-neutral); border-bottom-width: 2px; background: #fff; font: 600 11px var(--mono); text-align: center; color: var(--sc-color-text); }
@@ -1617,6 +1643,22 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
             <button class="btn" id="btn-discard" data-i18n="rec.discard" disabled>丢弃</button>
           </div>
           <div class="rec-last" id="rec-last"></div>
+          <div class="ep" id="ep" hidden>
+            <div class="ep-head">
+              <b data-i18n="ep.title">已保存的录制</b>
+              <span data-i18n="ep.speed">速度</span>
+              <div class="seg" id="ep-speed" role="radiogroup"><button type="button" data-speed="0.5" class="on" role="radio" aria-checked="true">0.5×</button><button type="button" data-speed="1" role="radio" aria-checked="false">1×</button></div>
+              <label><input type="checkbox" id="ep-grip" checked><span data-i18n="ep.grip">夹爪</span></label>
+              <button class="btn" type="button" id="ep-refresh" data-i18n="ep.refresh">刷新</button>
+            </div>
+            <div class="ep-play" id="ep-play" hidden>
+              <div class="ep-pt"><b id="ep-play-name"></b><span id="ep-play-text"></span></div>
+              <button class="btn ep-stopbtn" type="button" id="ep-stop" data-i18n="ep.stop">停止回放</button>
+              <div class="ep-bar"><i id="ep-bar"></i></div>
+            </div>
+            <ol class="ep-list" id="ep-list"></ol>
+            <div class="ep-status" id="ep-status"></div>
+          </div>
         </div>
       </div>
 
@@ -1877,6 +1919,14 @@ const I18N = {
     'jt.title': '关节状态', 'jt.sub': '角度 / 弧度 / 速度 / 力矩 / 温度', 'jt.joint': '关节', 'jt.deg': '角度°', 'jt.torque': '力矩',
     'rec.title': '数据集录制', 'rec.idle': '空闲', 'rec.recording': '录制中', 'rec.dur': '时长', 'rec.frames': '估计帧数', 'rec.start': '开始录制', 'rec.stop': '停止并保存', 'rec.discard': '丢弃',
     'rec.saved': '已保存 {n} 帧 → {path}', 'rec.saved_toast': '已保存 {n} 帧', 'rec.discarded': '已丢弃',
+    'ep.title': '已保存的录制', 'ep.speed': '速度', 'ep.grip': '夹爪', 'ep.refresh': '刷新', 'ep.stop': '停止回放',
+    'ep.play': '回放', 'ep.del': '删除', 'ep.del.confirm': '确认删除', 'ep.empty': '还没有保存的录制',
+    'ep.off': 'armd 未开启录制存储（--episodes-dir off）', 'ep.count': '共 {n} 条，{size}（上限 {max} MB / {files} 条）',
+    'ep.loading': '加载中…', 'ep.err': '列表加载失败：{e}', 'ep.deleted': '已删除 {id}', 'ep.started': '开始回放 {id}（{x}×）',
+    'ep.phase.approach': '移动到起点', 'ep.phase.replay': '回放中', 'ep.phase.settle': '到位确认',
+    'ep.done': '回放完成：{id}', 'ep.ended': '回放结束（{code}）：{m}', 'ep.unreadable': '文件无法读取',
+    'ep.enable_first': '先使能机械臂，再回放',
+    'ep.code.MOTION_BUSY': '机械臂忙：录制、拖动示教或其他动作进行中，先结束它', 'ep.code.REPLAY_TOO_FAST': '录制中的速度超过规划运动限速：{m}', 'ep.code.WORKSPACE_VIOLATION': '录制轨迹超出允许的工作空间或进入禁入区：{m}', 'ep.code.SOFT_LIMIT_EXCEEDED': '录制轨迹超出关节限位：{m}', 'ep.code.EPISODE_NOT_FOUND': '找不到这条录制：{m}', 'ep.code.REPLAY_EMPTY': '录制为空或太短：{m}', 'ep.code.REPLAY_INVALID_EPISODE': '录制文件无效：{m}', 'ep.code.REPLAY_JOINT_COUNT': '录制的关节数与本机械臂不符：{m}', 'ep.code.REPLAY_TOO_LONG': '录制超过回放时长上限：{m}', 'ep.code.COLLISION_HOLD': '碰撞保护停止中：{m}', 'ep.code.NOT_ARMED': '机械臂未使能：{m}', 'ep.code.EPISODES_DISABLED': 'armd 未开启录制存储', 'ep.code.TRACKING_STALL': '机械臂跟不上回放（受阻），已停止并保持当前位置：{m}', 'ep.code.STOPPED': '已停止', 'ep.code.LEASE_LOST': '控制权已失去', 'ep.code.COLLISION': '检测到碰撞，已停止：{m}', 'ep.code.ESTOP_ACTIVE': '急停', 'ep.code.PLAN_STALE': '检查期间状态已变化，请重试：{m}',
     'fm.estop': '⚠️ 急停已锁定，点击此处复位急停，再长按「使能」。', 'fm.fault': '⚠️ 故障：{d}。点击此处清除故障，再长按「使能」。',
     'kb.title': '键盘快捷键', 'kb.j1': 'J1 底座 逆 / 顺时针', 'kb.j2': 'J2 大臂 后仰 / 前倾', 'kb.j3': 'J3 小臂 下压 / 抬高', 'kb.j4': 'J4 手腕 下倾 / 上翘', 'kb.j5': 'J5 手腕 旋左 / 旋右',
     'kb.j6': 'J6 夹爪 张开 / 夹紧（G 切换）', 'kb.cartsub': '空间位姿 / 简化模式', 'kb.x': 'X 前 / 后', 'kb.y': 'Y 左 / 右', 'kb.z': 'Z 升 / 降', 'kb.p': '俯仰 上抬 / 下压', 'kb.r': '腕转 Roll',
@@ -2056,6 +2106,14 @@ const I18N = {
     'jt.title': 'Joint state', 'jt.sub': 'angle / rad / velocity / torque / temp', 'jt.joint': 'Joint', 'jt.deg': 'Angle°', 'jt.torque': 'Torque',
     'rec.title': 'Dataset recording', 'rec.idle': 'Idle', 'rec.recording': 'Recording', 'rec.dur': 'Duration', 'rec.frames': 'Est. frames', 'rec.start': 'Start recording', 'rec.stop': 'Stop & save', 'rec.discard': 'Discard',
     'rec.saved': 'Saved {n} frames → {path}', 'rec.saved_toast': 'Saved {n} frames', 'rec.discarded': 'Discarded',
+    'ep.title': 'Saved episodes', 'ep.speed': 'Speed', 'ep.grip': 'Gripper', 'ep.refresh': 'Refresh', 'ep.stop': 'Stop replay',
+    'ep.play': 'Play', 'ep.del': 'Delete', 'ep.del.confirm': 'Confirm', 'ep.empty': 'No saved episodes yet',
+    'ep.off': 'Episode storage is off in armd (--episodes-dir off)', 'ep.count': 'Episodes: {n}, {size} (limit {max} MB / {files} files)',
+    'ep.loading': 'Loading…', 'ep.err': 'Could not load the list: {e}', 'ep.deleted': 'Deleted {id}', 'ep.started': 'Replaying {id} ({x}×)',
+    'ep.phase.approach': 'Moving to start', 'ep.phase.replay': 'Replaying', 'ep.phase.settle': 'Settling',
+    'ep.done': 'Replay finished: {id}', 'ep.ended': 'Replay ended ({code}): {m}', 'ep.unreadable': 'file cannot be read',
+    'ep.enable_first': 'Enable the arm first, then replay',
+    'ep.code.MOTION_BUSY': 'Arm busy: recording, hand-guiding or another action is running; end it first', 'ep.code.REPLAY_TOO_FAST': 'The recording moves faster than the planned-motion limit: {m}', 'ep.code.WORKSPACE_VIOLATION': 'The recording leaves the allowed workspace or enters a keep-out box: {m}', 'ep.code.SOFT_LIMIT_EXCEEDED': 'The recording exceeds a joint limit: {m}', 'ep.code.EPISODE_NOT_FOUND': 'Episode not found: {m}', 'ep.code.REPLAY_EMPTY': 'Episode empty or too short: {m}', 'ep.code.REPLAY_INVALID_EPISODE': 'Episode file invalid: {m}', 'ep.code.REPLAY_JOINT_COUNT': 'Episode joint count does not match this arm: {m}', 'ep.code.REPLAY_TOO_LONG': 'Episode longer than the replay limit: {m}', 'ep.code.COLLISION_HOLD': 'Collision hold active: {m}', 'ep.code.NOT_ARMED': 'Arm not enabled: {m}', 'ep.code.EPISODES_DISABLED': 'Episode storage is off in armd', 'ep.code.TRACKING_STALL': 'The arm could not follow the replay (blocked); stopped and holding: {m}', 'ep.code.STOPPED': 'Stopped', 'ep.code.LEASE_LOST': 'Control lease lost', 'ep.code.COLLISION': 'Collision detected, stopped: {m}', 'ep.code.ESTOP_ACTIVE': 'E-stop', 'ep.code.PLAN_STALE': 'State changed during the check, try again: {m}',
     'fm.estop': '⚠️ E-Stop latched. Tap here to reset it, then hold "Enable".', 'fm.fault': '⚠️ Fault: {d}. Tap here to clear it, then hold "Enable".',
     'kb.title': 'Keyboard shortcuts', 'kb.j1': 'J1 Base CCW / CW', 'kb.j2': 'J2 Shoulder back / forward', 'kb.j3': 'J3 Elbow down / up', 'kb.j4': 'J4 Wrist tilt down / up', 'kb.j5': 'J5 Wrist rotate L / R',
     'kb.j6': 'J6 Gripper open / close (G toggles)', 'kb.cartsub': 'Cartesian / Simple mode', 'kb.x': 'X fwd / back', 'kb.y': 'Y left / right', 'kb.z': 'Z up / down', 'kb.p': 'Pitch up / down', 'kb.r': 'Wrist Roll',
@@ -2601,6 +2659,7 @@ function connectWS() {
     renderActionChip(o);
     renderMotionLimit(o);
     graspOnObs(o);
+    epOnObs(o);
     syncEpoch(o.epoch_id);
     const st = parseState(o.safety_state);
     const wasStopped = isStopped();
@@ -4288,7 +4347,7 @@ function initCalib() {
 async function loadSchema() {
   try {
     const sc = await api('/api/v1/observation/schema', undefined, { quiet: true, method: 'GET' });
-    if (sc) { S.caps = sc.capabilities || {}; S.wsPolicy = sc.workspace || null; S.home = Array.isArray(sc.home_positions) ? sc.home_positions : null; colOnCaps(); posesOnCaps(); V3.sceneAt = 0; }
+    if (sc) { S.caps = sc.capabilities || {}; S.wsPolicy = sc.workspace || null; S.home = Array.isArray(sc.home_positions) ? sc.home_positions : null; colOnCaps(); posesOnCaps(); epOnCaps(); V3.sceneAt = 0; }
     if (sc && Array.isArray(sc.limits) && sc.limits.length) {
       const oldDof = S.dof;
       S.limits = sc.limits;
@@ -5886,6 +5945,7 @@ $('btn-rec').addEventListener('click', async () => {
       S.recLast = { n: r.frame_count ?? '?', path: r.path ?? '' }; renderRecLast();
       toast(t('rec.saved_toast', { n: r.frame_count ?? '?' }), 'ok');
       $('rec-id').value = defaultEpisodeId();
+      epLoad(true);
     } catch (_) {}
   }
 });
@@ -5893,6 +5953,119 @@ $('btn-discard').addEventListener('click', async () => {
   try { await api('/api/v1/dataset/record/discard'); setRecording(false); S.recLast = 'discarded'; renderRecLast(); } catch (_) {}
 });
 
+
+/* =================================================================
+   Saved episodes and replay (capability replay): GET /api/v1/dataset/episodes,
+   DELETE /api/v1/dataset/episodes/{id}, action /api/v1/action/replay.
+   ================================================================= */
+const EP = { list: [], loaded: false, info: null, delArmed: null, delTimer: 0, speed: 0.5, actionId: null, toasted: null, playing: null };
+function epOnCaps() {
+  const on = !!(S.caps && S.caps.replay);
+  $('ep').hidden = !on;
+  if (on && !EP.loaded) epLoad(true);
+}
+function epFmtSize(b) { return b < 1048576 ? Math.max(1, Math.round(b / 1024)) + ' KB' : (b / 1048576).toFixed(1) + ' MB'; }
+function epFmtDur(s) { return Number.isFinite(s) ? (s < 60 ? s.toFixed(1) + ' s' : fmtTime(s * 1000)) : '--'; }
+async function epLoad(quiet) {
+  if (!quiet) setText($('ep-status'), t('ep.loading'));
+  try {
+    const res = await fetch('/api/v1/dataset/episodes', { cache: 'no-store' });
+    const d = await res.json();
+    if (!res.ok) throw new Error(d && (d.message || d.error) || 'HTTP ' + res.status);
+    EP.info = d; EP.list = Array.isArray(d.episodes) ? d.episodes : []; EP.loaded = true;
+    epRender(d.enabled === false ? t('ep.off') : t('ep.count', { n: EP.list.length, size: epFmtSize(d.total_bytes), max: Math.round(d.max_bytes / 1048576), files: d.max_files }));
+  } catch (e) { epRender(t('ep.err', { e: e.message })); }
+}
+function epRender(status, bad) {
+  const ol = $('ep-list');
+  ol.textContent = '';
+  if (!EP.list.length) {
+    const li = document.createElement('li'); li.className = 'ep-empty'; li.textContent = EP.loaded ? t('ep.empty') : '--'; ol.appendChild(li);
+  }
+  for (const e of EP.list) {
+    const li = document.createElement('li');
+    li.dataset.id = e.id;
+    li.classList.toggle('playing', EP.playing === e.id);
+    li.innerHTML = '<span class="en"><b></b><small></small></span><span class="ea"><button class="btn ep-go" type="button"></button><button class="btn ep-del" type="button"></button></span>';
+    li.querySelector('b').textContent = e.id;
+    const when = e.created_ms > 0 ? new Date(e.created_ms).toLocaleString(LANG === 'zh' ? 'zh-CN' : 'en-GB', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+    li.querySelector('small').textContent = e.error ? t('ep.unreadable') : [epFmtDur(e.duration_s), when].filter(Boolean).join(' · ');
+    const go = li.querySelector('.ep-go');
+    go.textContent = t('ep.play');
+    go.disabled = !!e.error || !!EP.playing;
+    const del = li.querySelector('.ep-del');
+    const armed = EP.delArmed === e.id;
+    del.textContent = armed ? t('ep.del.confirm') : t('ep.del');
+    del.classList.toggle('armed', armed);
+    ol.appendChild(li);
+  }
+  if (status !== undefined) { setText($('ep-status'), status); $('ep-status').classList.toggle('bad', !!bad); }
+}
+function epCodeText(e) {
+  const k = 'ep.code.' + (e.code || '');
+  return I18N.zh[k] !== undefined ? t(k, { m: e.message || '' }) : (e.message || e.code || t('err.rejected'));
+}
+async function epPlay(id) {
+  if (!isLive() || !canMove()) { toast(isLive() && !isStopped() && !colHold() && leaseOther() == null ? t('ep.enable_first') : lockReason(), 'err'); flashLock(); return; }
+  try {
+    const d = await commandRPC('/api/v1/action/replay', { episode: id, speed: EP.speed, gripper: $('ep-grip').checked, tag: 'cockpit' });
+    syncEpoch(d.epoch_id);
+    EP.actionId = d.action_id; EP.playing = id;
+    toast(t('ep.started', { id, x: EP.speed }), 'ok');
+    epRender(t('ep.started', { id, x: EP.speed }));
+  } catch (e) { const m = epCodeText(e); toast(m, 'err', e.code || ''); epRender(m, true); }
+}
+async function epDelete(id) {
+  if (EP.delArmed !== id) {
+    EP.delArmed = id; clearTimeout(EP.delTimer);
+    EP.delTimer = setTimeout(() => { EP.delArmed = null; epRender(); }, 3000);
+    epRender(); return;
+  }
+  EP.delArmed = null; clearTimeout(EP.delTimer);
+  try {
+    await api('/api/v1/dataset/episodes/' + encodeURIComponent(id), undefined, { method: 'DELETE' });
+    toast(t('ep.deleted', { id }), 'ok');
+    await epLoad(true);
+    setText($('ep-status'), t('ep.deleted', { id }));
+  } catch (e) { epRender(epCodeText(e), true); }
+}
+function epOnObs(o) {
+  const a = o.action;
+  const run = a && a.kind === 'replay' && a.state === 'running' ? a : null;
+  $('ep-play').hidden = !run;
+  if (run) {
+    const info = EP.list.find((e) => e.id === run.episode);
+    const total = info ? info.duration_s : null;
+    const phase = t('ep.phase.' + (run.phase || 'replay'));
+    setText($('ep-play-name'), run.episode || '');
+    setText($('ep-play-text'), `${phase} · ${(run.t_s ?? 0).toFixed(1)}${total != null ? ' / ' + total.toFixed(1) : ''} s`);
+    $('ep-bar').style.width = (100 * clamp(run.progress || 0, 0, 1)).toFixed(1) + '%';
+    if (EP.playing !== run.episode) { EP.playing = run.episode; EP.actionId = run.id; epRender(); }
+    return;
+  }
+  // ended: report the result of the replay started here (or seen running) once
+  for (const r of [a, o.previous_action]) {
+    if (!r || r.kind !== 'replay' || r.state === 'running' || r.id !== EP.actionId || EP.toasted === r.id) continue;
+    EP.toasted = r.id;
+    if (r.state === 'done') { toast(t('ep.done', { id: r.episode }), 'ok'); epRender(t('ep.done', { id: r.episode })); }
+    else { const m = t('ep.ended', { code: r.code || r.state, m: epCodeText({ code: r.code, message: r.message }) }); toast(m, r.state === 'failed' ? 'err' : 'warn', r.code || ''); epRender(m, true); }
+  }
+  if (EP.playing) { EP.playing = null; epRender(); }
+}
+$('ep-speed').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  EP.speed = Number(b.dataset.speed);
+  for (const x of $('ep-speed').children) { const on = x === b; x.classList.toggle('on', on); x.setAttribute('aria-checked', String(on)); }
+});
+$('ep-refresh').addEventListener('click', () => epLoad(false));
+$('ep-stop').addEventListener('click', () => { api('/api/v1/motion/stop', {}).catch(() => {}); });
+$('ep-list').addEventListener('click', (e) => {
+  const b = e.target.closest('button'), li = e.target.closest('li');
+  if (!b || !li || !li.dataset.id) return;
+  if (b.classList.contains('ep-go')) epPlay(li.dataset.id);
+  else if (b.classList.contains('ep-del')) epDelete(li.dataset.id);
+});
+i18nHooks.push(() => { if (EP.loaded) epLoad(true); });
 
 /* =================================================================
    Live video: camera WS H.264 (JMuxer), or ?video= MJPEG
