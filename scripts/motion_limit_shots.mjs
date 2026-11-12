@@ -3,7 +3,7 @@
 //   PLAYWRIGHT=/path/to/playwright/index.mjs CHROME=/path/to/chrome OUT=/dir node scripts/motion_limit_shots.mjs
 // Serves src/api/index.html with a mocked 7-DOF schema and feeds synthetic observations carrying
 // observation.motion_limit (docs/control_safety_contract.md "Servo streaming guard"). For simple / expert
-// x zh / en x 1280x800 / 375x812: joint_limit, blocked and workspace show at once with the joint name;
+// x zh / en x 1280x800 / 375x812: joint_limit, blocked, torque and workspace show at once with the joint name;
 // speed / lead stay hidden for the first second and then show; the chip hides again about 1 s after the
 // limit clears; the reworded ik.lag text has no "safely stopped". Writes PNGs (default .cache/motion-limit-shots/).
 import fs from 'node:fs';
@@ -50,8 +50,8 @@ const feed = () => {
   window.__setMl = (ml) => { window.__ml = ml; window.__mlSince = Math.round(performance.now() - t0); };
 };
 const EXPECT = {
-  zh: { joint_limit: 'J3 已到限位，该方向已停止', blocked: 'J2 受阻，已停在当前位置', workspace: '已到工作范围边界，该方向已停止', slow: '大关节跟不上，已减速', lag: '电机跟不上，已暂停该方向' },
-  en: { joint_limit: 'J3 at its limit; this direction stopped', blocked: 'J2 blocked; holding position', workspace: 'At the workspace boundary; this direction stopped', slow: 'Slowed to what the motors can follow', lag: "Motors can't keep up; paused this direction" },
+  zh: { joint_limit: 'J3 已到限位，该方向已停止', blocked: 'J2 受阻，已停在当前位置', torque: 'J4 力矩过大，已停住；请反向移出', workspace: '已到工作范围边界，该方向已停止', slow: '大关节跟不上，已减速', lag: '电机跟不上，已暂停该方向' },
+  en: { joint_limit: 'J3 at its limit; this direction stopped', blocked: 'J2 blocked; holding position', torque: 'J4 torque limit; holding. Move it back out', workspace: 'At the workspace boundary; this direction stopped', slow: 'Slowed to what the motors can follow', lag: "Motors can't keep up; paused this direction" },
 };
 const shots = [];
 for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (const [vp, viewport] of [['1280x800', { width: 1280, height: 800 }], ['375x812', { width: 375, height: 812 }]]) {
@@ -73,15 +73,15 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
   const E = EXPECT[lang];
   let c = await chip();
   ok(c.hidden, `${tag} hidden without a limit`);
-  for (const [reason, joint, text] of [['joint_limit', 2, E.joint_limit], ['workspace', null, E.workspace], ['blocked', 1, E.blocked]]) {
+  for (const [reason, joint, text] of [['joint_limit', 2, E.joint_limit], ['workspace', null, E.workspace], ['blocked', 1, E.blocked], ['torque', 3, E.torque]]) {
     await page.evaluate(([r, j]) => window.__setMl({ reason: r, joint: j }), [reason, joint]);
     await page.waitForTimeout(120);
     c = await chip();
     ok(c.visible && c.text === text, `${tag} ${reason}: "${c.text}" visible=${c.visible}`);
     ok(c.inView, `${tag} ${reason} chip inside the viewport`);
     ok(c.sw <= c.iw, `${tag} no horizontal scroll (${c.sw} > ${c.iw})`);
-    if (reason === 'blocked') {
-      const file = path.join(out, `motion_limit_${tag}_blocked.png`);
+    if (reason === 'blocked' || reason === 'torque') {
+      const file = path.join(out, `motion_limit_${tag}_${reason}.png`);
       await page.screenshot({ path: file }); shots.push(file);
     }
   }

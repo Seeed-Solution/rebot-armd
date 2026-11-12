@@ -1941,6 +1941,7 @@ const I18N = {
     'ik.jump': '该位姿需要翻转关节构型，已拒绝', 'ik.pose': '该姿态超出可达范围，已拒绝', 'ik.floor': '已到达安装平面高度下限', 'ik.lag': '电机跟不上，已暂停该方向',
     'ml.limit': '{j} 已到限位，该方向已停止', 'ml.slow_big': '大关节跟不上，已减速', 'ml.slow': '电机跟不上，已减速',
     'ml.blocked': '{j} 受阻，已停在当前位置', 'ml.workspace': '已到工作范围边界，该方向已停止',
+    'ml.torque': '{j} 力矩过大，已停住；请反向移出',
     'ik.blocked': 'IK 拦截', 'ik.stream': 'IK 流式 {hz}Hz', 'ik.ready': 'IK 就绪', 'ik.per_solve': ' µs/次',
     'cart.enable_first': '使能后可控制末端位姿', 'cart.following': '目标跟随实测位姿 · 分支 {branch} · {tx}', 'cart.tx_ws': 'WS 流', 'cart.tx_rest': 'REST 伺服',
     'wait_arm': '等待机械臂连接', 'wait_telemetry': '等待遥测', 'ready': '电机就绪 · 可以操控',
@@ -2128,6 +2129,7 @@ const I18N = {
     'ik.jump': 'Pose needs a joint configuration flip, rejected', 'ik.pose': 'Pose out of reach, rejected', 'ik.floor': 'Reached the mounting-plane height limit', 'ik.lag': "Motors can't keep up; paused this direction",
     'ml.limit': '{j} at its limit; this direction stopped', 'ml.slow_big': 'Slowed to what the motors can follow', 'ml.slow': 'Slowed to what the motors can follow',
     'ml.blocked': '{j} blocked; holding position', 'ml.workspace': 'At the workspace boundary; this direction stopped',
+    'ml.torque': '{j} torque limit; holding. Move it back out',
     'ik.blocked': 'IK blocked', 'ik.stream': 'IK stream {hz} Hz', 'ik.ready': 'IK ready', 'ik.per_solve': ' µs/solve',
     'cart.enable_first': 'Enable to control end-effector pose', 'cart.following': 'Target follows measured pose · branch {branch} · {tx}', 'cart.tx_ws': 'WS stream', 'cart.tx_rest': 'REST servo',
     'wait_arm': 'Waiting for arm connection', 'wait_telemetry': 'Waiting for telemetry', 'ready': 'Motors ready · ready to control',
@@ -4845,12 +4847,13 @@ function renderMotionLimit(o) {
   if (ml) {
     const age = o.timestamp * 1000 - ml.since_ms;
     const key = ml.reason === 'joint_limit' ? 'ml.limit' : ml.reason === 'blocked' ? 'ml.blocked'
-      : ml.reason === 'workspace' ? 'ml.workspace'
+      : ml.reason === 'torque' ? 'ml.torque' : ml.reason === 'workspace' ? 'ml.workspace'
       : age >= 1000 ? (ml.joint != null && ml.joint < 3 ? 'ml.slow_big' : 'ml.slow') : '';
     if (key) { ML.key = key; ML.j = ml.joint == null ? '' : 'J' + (ml.joint + 1); ML.until = now + 1000; }
     // armd ended the stream in a hold: drop the queued motion once so the goal does not pull on
-    if (ml.reason === 'blocked' && !ML.blocked) cartHoldStill();
-    ML.blocked = ml.reason === 'blocked';
+    const held = ml.reason === 'blocked' || ml.reason === 'torque';
+    if (held && !ML.blocked) cartHoldStill();
+    ML.blocked = held;
   } else ML.blocked = false;
   const show = !!ML.key && now < ML.until;
   el.hidden = !show;
