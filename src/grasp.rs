@@ -1143,13 +1143,24 @@ impl Orchestrator {
         self.phase("lift", 0.9).await?;
         let p = self.pose().await.p;
         self.move_arm("lift", lift_to(p), s.descend_speed_mps).await?;
-        // the object may slip out while lifting: the jaw closes further and the grip torque drops
+        // the object may slip out while lifting. Under position control the jaw settles on its
+        // hold target and the grip torque fades when the object only shifted or turned in the
+        // jaws, so a failed torque rule is decided by a re-grip: a close with grasp detection
+        // stops on the object (holding) or runs to closed (dropped)
         let (held, gap) = self.holding_now().await?;
-        if !held {
-            self.sup.inner().write().await.update_action(self.id, |a| a.gripper_gap_rad = Some(gap));
-            return Err(fail("DROPPED", format!("Object no longer held after the lift (gap {gap:.2} rad)")));
+        if held {
+            self.sup.inner().write().await.update_action(self.id, |a| a.post_lift = Some("held".into()));
+            return Ok((true, closed.gripper_gap_rad));
         }
-        Ok((true, closed.gripper_gap_rad))
+        tracing::info!("Grasp {}: grip torque gone after the lift (gap {gap:.2} rad), re-gripping", self.id);
+        let regrip = self.gripper_phase("regrip", 0.95, GripperCommand::Close).await?;
+        let gap = regrip.gripper_gap_rad.unwrap_or(gap);
+        if regrip.holding == Some(true) {
+            self.sup.inner().write().await.update_action(self.id, |a| a.post_lift = Some("regripped".into()));
+            return Ok((true, Some(gap)));
+        }
+        self.sup.inner().write().await.update_action(self.id, |a| { a.post_lift = Some("dropped".into()); a.gripper_gap_rad = Some(gap); });
+        Err(fail("DROPPED", format!("Object no longer held after the lift: the re-grip closed to {gap:.2} rad from closed")))
     }
 
     /// `holding` after `post_lift_settle_ms` from the measured J7, with the gripper policy's rule
@@ -1297,9 +1308,8 @@ impl Orchestrator {
         let s2 = median(&mut sizes);
         let (z1, z2) = (self.cam.origin(&pose)[2], self.cam.origin(&now)[2]);
         let ratio = s2 / s1;
-        if ratio.is_nan() || ratio < 1.03 { return Ok(Err(format!("scale_change:{:.3}", s2 / s1))); }
-        let d1 = (z1 - z2) * s2 / (s2 - s1);
-        let h = z1 - d1 - s.table_z_m;
+        if ratio.is_nan() || ratio < 1.03 { return Ok(Err(format!("scale_change:{ratio:.3}"))); }
+        let h = z1 - (z1 - z2) * s2 / (s2 - s1) - s.table_z_m;
         if !h.is_finite() { return skip("not_finite"); }
         if h < 0.0 { return Ok(Err(format!("below_table:{h:.3}"))); }
         if h >= s.approach_height_m - 0.02 {

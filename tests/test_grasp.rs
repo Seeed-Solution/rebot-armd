@@ -1377,7 +1377,8 @@ async fn descend_logs_residual_peaks_and_stops_on_contact() {
 // ---- holding re-check after the lift ----
 
 /// Held through the lift: done. The object slips out after the close (the jaw closes onto its
-/// hold target, the grip torque drops): DROPPED at lift height, gripper not reopened.
+/// hold target, the grip torque drops): the re-grip closes the jaws fully, DROPPED at lift
+/// height, gripper not reopened.
 #[tokio::test]
 async fn post_lift_recheck_reports_a_dropped_object() {
     for drop_it in [false, true] {
@@ -1402,11 +1403,39 @@ async fn post_lift_recheck_reports_a_dropped_object() {
         assert!((pose.p[2] - (s.table_z_m + s.lift_height_m)).abs() < 2e-3, "at lift height");
         if drop_it {
             assert_eq!((a.state.as_str(), a.code.as_deref(), a.holding), ("failed", Some("DROPPED"), Some(false)), "{a:?}");
-            assert!(a.gripper_gap_rad.is_some());
+            assert_eq!(a.post_lift.as_deref(), Some("dropped"));
+            assert!(a.gripper_gap_rad.is_some_and(|g| g < 0.3), "re-grip closed: {a:?}");
             assert!(j7 > OBJECT_J7 - 0.3, "gripper not reopened: {j7}");
             assert_idle_after(&rig.sup, id).await;
         } else {
-            assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+            assert_eq!((a.state.as_str(), a.holding, a.post_lift.as_deref()), ("done", Some(true), Some("held")), "{a:?}");
         }
     }
+}
+
+/// The object is still in the jaws after the lift but the grip torque is gone (it turned in the
+/// jaws; the jaw rests on its hold target): the re-grip stops on it, done with `regripped`.
+#[tokio::test]
+async fn post_lift_regrip_keeps_a_loose_object() {
+    let setup = GraspSetup::default();
+    let rig = rig(setup.clone(), centred_lens(), 0.0, [0.0, 0.0], false).await;
+    let start_r = start_pose(&rig).await.r;
+    let mut s = setup.clone();
+    s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+    rig.sup.inner().write().await.set_grasp_setup(s.clone());
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+    wait_phase(&rig.sup, id, "lift", Some(true)).await;
+    // loose: the jaw reaches its hold target, no grip torque
+    rig.hold.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    rig.sup.inner().write().await.torques[6] = 0.0;
+    // the object is still between the jaws: the re-grip stops on it
+    wait_phase(&rig.sup, id, "regrip", None).await;
+    rig.hold.store(true, Ordering::SeqCst);
+    let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
+    let pose = start_pose(&rig).await;
+    println!("loose object: {} {:?} holding {:?} gap {:?} post_lift {:?}, TCP z {:.3}", a.state, a.code, a.holding, a.gripper_gap_rad, a.post_lift, pose.p[2]);
+    assert_eq!((a.state.as_str(), a.holding, a.post_lift.as_deref()), ("done", Some(true), Some("regripped")), "{a:?}");
+    assert!(a.gripper_gap_rad.is_some_and(|g| g >= 0.3), "{a:?}");
+    assert!((pose.p[2] - (s.table_z_m + s.lift_height_m)).abs() < 2e-3);
 }

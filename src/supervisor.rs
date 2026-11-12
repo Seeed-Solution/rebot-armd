@@ -1832,7 +1832,7 @@ impl SupervisorInner {
             phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
             align: None, align_turn_rad: None, height_source: None, height_reason: None, object_height_m: None, close_height_m: None,
             recentre: None, recentre_iterations: None, descend_peak_residual_nm: None, descend_peak_tracking_rad: None,
-            descend_contact: None, descend_contact_height_m: None,
+            descend_contact: None, descend_contact_height_m: None, post_lift: None,
         });
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
         self.quintic_settle = None;
