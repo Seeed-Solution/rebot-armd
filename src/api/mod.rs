@@ -89,6 +89,8 @@ pub fn create_router_full(
         .route("/api/v1/dataset/record/start", post(rest::dataset_record_start))
         .route("/api/v1/dataset/record/save", post(rest::dataset_record_save))
         .route("/api/v1/dataset/record/discard", post(rest::dataset_record_discard))
+        .route("/api/v1/dataset/episodes", get(rest::dataset_episodes))
+        .route("/api/v1/dataset/episodes/{id}", axum::routing::delete(rest::dataset_episode_delete))
         .route("/api/v1/diagnostics/boots", get(diagnostics::get_boots))
         .route("/api/v1/diagnostics/blackbox", get(diagnostics::get_blackbox))
         .route("/api/v1/diagnostics/tick", get(diagnostics::get_tick))

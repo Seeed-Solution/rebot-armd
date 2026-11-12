@@ -80,6 +80,9 @@ pub struct RecordActionResponse {
     pub status: String,
     pub path: Option<String>,
     pub frame_count: Option<usize>,
+    /// Id of the episode (file stem in the episode directory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -365,10 +368,15 @@ pub async fn dataset_record_start(
 ) -> Result<Json<RecordActionResponse>, ApiError> {
     let path = payload.output_path.map(PathBuf::from);
     supervisor.start_recording(payload.episode_id, path).await?;
+    let (id, path) = {
+        let inner = supervisor.inner().read().await;
+        (inner.recorder.episode_id().to_string(), inner.recorder.output_path().to_string_lossy().to_string())
+    };
     Ok(Json(RecordActionResponse {
         status: "recording_started".to_string(),
-        path: None,
+        path: Some(path),
         frame_count: Some(0),
+        episode_id: Some(id),
     }))
 }
 
@@ -378,10 +386,12 @@ pub async fn dataset_record_save(
 ) -> Result<Json<RecordActionResponse>, ApiError> {
     let (_, count) = supervisor.get_recording_state().await;
     let path = supervisor.save_recording().await?;
+    let id = supervisor.inner().read().await.recorder.episode_id().to_string();
     Ok(Json(RecordActionResponse {
         status: "saved".to_string(),
         path: Some(path.to_string_lossy().to_string()),
         frame_count: Some(count),
+        episode_id: Some(id),
     }))
 }
 
@@ -394,7 +404,34 @@ pub async fn dataset_record_discard(
         status: "discarded".to_string(),
         path: None,
         frame_count: Some(0),
+        episode_id: None,
     }))
+}
+
+/// `GET /api/v1/dataset/episodes`: saved episodes, newest first (no lease).
+pub async fn dataset_episodes(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+) -> Result<Json<crate::recording::EpisodeList>, ApiError> {
+    let store = supervisor.episode_store().await;
+    let list = tokio::task::spawn_blocking(move || store.list()).await
+        .map_err(|e| ArmError::Internal(format!("episode listing failed: {e}")))?
+        .map_err(ArmError::from)?;
+    Ok(Json(list))
+}
+
+/// `DELETE /api/v1/dataset/episodes/{id}`: remove a saved episode. Like the other
+/// `/api/v1/dataset/*` routes it needs no lease (it moves nothing); the same-origin rule
+/// for browser requests applies.
+pub async fn dataset_episode_delete(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = supervisor.episode_store().await;
+    let id2 = id.clone();
+    tokio::task::spawn_blocking(move || store.delete(&id2)).await
+        .map_err(|e| ArmError::Internal(format!("episode delete failed: {e}")))?
+        .map_err(ArmError::from)?;
+    Ok(Json(serde_json::json!({"status": "deleted", "episode_id": id})))
 }
 
 /// GET /api/v1/grasp/setup: the runtime grasp setup (change it with the WS command

@@ -44,6 +44,13 @@ pub enum ArmError {
     Rejected { status: u16, code: String, message: String },
 }
 
+impl From<crate::recording::StoreError> for ArmError {
+    fn from(e: crate::recording::StoreError) -> Self {
+        let (status, code) = e.status_code();
+        ArmError::Rejected { status, code: code.into(), message: e.to_string() }
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
 pub enum PreemptError {
     #[error("Preemption cooldown active: {0}ms remaining")]
@@ -224,6 +231,8 @@ pub struct SupervisorInner {
     /// Duration of the most recently planned NormalUnload trajectory (s).
     pub unload_planned_duration: Option<f64>,
     pub recorder: EpisodeRecorder,
+    /// Episode directory (`--episodes-dir`, `src/recording/store.rs`).
+    pub episodes: crate::recording::EpisodeStore,
     pub start_time: Instant,
     pub driver: Option<std::sync::Mutex<Box<dyn ArmDriver>>>,
     pub gravity_compensated: bool,
@@ -345,6 +354,7 @@ impl SupervisorInner {
             workspace_revision: 0,
             unload_planned_duration: None,
             recorder: EpisodeRecorder::new(),
+            episodes: crate::recording::EpisodeStore::new(Some(PathBuf::from(crate::recording::store::FALLBACK_EPISODES_DIR))),
             start_time: now,
             driver: None,
             gravity_compensated,
@@ -3316,9 +3326,25 @@ impl ArmSupervisor {
         episode_id: Option<String>,
         output_path: Option<PathBuf>,
     ) -> Result<(), ArmError> {
+        let store = self.inner.read().await.episodes.clone();
+        // file system checks without the lock (the control tick needs it)
+        let (id, path) = tokio::task::spawn_blocking(move || {
+            let episode = store.new_episode(episode_id.as_deref(), output_path.as_deref())?;
+            store.check_capacity()?;
+            Ok::<_, crate::recording::StoreError>(episode)
+        }).await.map_err(|e| ArmError::Internal(format!("episode check failed: {e}")))??;
         let mut inner = self.inner.write().await;
-        inner.recorder.start(episode_id, output_path)?;
+        inner.recorder.start(Some(id), Some(path))?;
         Ok(())
+    }
+
+    /// Set the episode directory (`None`: storage off).
+    pub async fn set_episodes_dir(&self, dir: Option<PathBuf>) {
+        self.inner.write().await.episodes = crate::recording::EpisodeStore::new(dir);
+    }
+
+    pub async fn episode_store(&self) -> crate::recording::EpisodeStore {
+        self.inner.read().await.episodes.clone()
     }
 
     pub async fn save_recording(&self) -> Result<PathBuf, ArmError> {
@@ -3333,6 +3359,16 @@ impl ArmSupervisor {
     where
         W: FnOnce(&Path, &[RecordFrame]) -> Result<(), ParquetRecordingError> + Send + 'static,
     {
+        let (recording, store) = {
+            let inner = self.inner.read().await;
+            (inner.recorder.state() == &EpisodeState::Recording, inner.episodes.clone())
+        };
+        if recording {
+            // refused before the frames leave the recorder, so the recording can still be
+            // saved after episodes were deleted, or discarded
+            tokio::task::spawn_blocking(move || store.check_capacity()).await
+                .map_err(|e| ArmError::Internal(format!("episode check failed: {e}")))??;
+        }
         let (path, frames) = self.inner.write().await.recorder.begin_save()?;
         let (frames, result) = tokio::task::spawn_blocking(move || {
             let result = write(&path, &frames);

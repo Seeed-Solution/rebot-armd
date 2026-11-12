@@ -144,7 +144,8 @@ async fn test_rest_api_dataset_recording() {
     let (addr, supervisor) = spawn_test_server().await;
     let client = reqwest::Client::new();
     let temp_dir = tempdir().unwrap();
-    let episode_path = temp_dir.path().join("api_ep.parquet");
+    supervisor.set_episodes_dir(Some(temp_dir.path().to_path_buf())).await;
+    let episode_path = temp_dir.path().join("test_api_ep.parquet");
 
     // 1. Start recording
     let start_req = StartRecordRequest {
@@ -179,7 +180,7 @@ async fn test_rest_api_dataset_recording() {
     assert!(episode_path.exists());
 
     // 3. Start another and discard
-    let discard_path = temp_dir.path().join("discarded.parquet");
+    let discard_path = temp_dir.path().join("ep_discard.parquet");
     let start_req2 = StartRecordRequest {
         episode_id: Some("ep_discard".to_string()),
         output_path: Some(discard_path.to_string_lossy().to_string()),

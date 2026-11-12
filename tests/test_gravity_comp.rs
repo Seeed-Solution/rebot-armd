@@ -569,6 +569,7 @@ async fn hand_motion_does_not_trip_tracking_and_is_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("teach.parquet");
     let r = rig(0.0).await;
+    r.sup.set_episodes_dir(Some(dir.path().to_path_buf())).await;
     r.sup.start_recording(Some("teach".into()), Some(path.clone())).await.unwrap();
     r.enter().await.unwrap();
     r.ticks(55).await;

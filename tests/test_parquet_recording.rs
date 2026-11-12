@@ -140,6 +140,7 @@ async fn test_slow_save_does_not_block_control_tick() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("slow.parquet");
     let supervisor = recording_supervisor();
+    supervisor.set_episodes_dir(Some(dir.path().to_path_buf())).await;
     supervisor.start_recording(Some("slow".into()), Some(path.clone())).await.unwrap();
     for _ in 0..5 {
         supervisor.tick(0.02).await;
@@ -180,6 +181,7 @@ async fn test_slow_save_does_not_block_control_tick() {
 async fn test_failed_save_leaves_finalizing() {
     let dir = tempdir().unwrap();
     let supervisor = recording_supervisor();
+    supervisor.set_episodes_dir(Some(dir.path().to_path_buf())).await;
     supervisor
         .start_recording(Some("fail".into()), Some(dir.path().join("fail.parquet")))
         .await
@@ -197,7 +199,9 @@ async fn test_failed_save_leaves_finalizing() {
 
 #[tokio::test]
 async fn test_panicking_writer_does_not_wedge_recorder() {
+    let dir = tempdir().unwrap();
     let supervisor = recording_supervisor();
+    supervisor.set_episodes_dir(Some(dir.path().to_path_buf())).await;
     supervisor.start_recording(Some("panic".into()), None).await.unwrap();
     supervisor.tick(0.02).await;
 
