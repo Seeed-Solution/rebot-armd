@@ -48,6 +48,12 @@ struct SimCamera {
     stale: AtomicBool,
     /// Detector latency: each result arrives 120..250 ms after its capture.
     delayed: AtomicBool,
+    /// The detector reports the long side's image angle: (base-frame direction of the long
+    /// side (rad), angle_conf).
+    angle: Mutex<Option<(f64, f64)>>,
+    /// Boxes of the object's top face only, at this height above the table (m), instead of the
+    /// whole 0.05 m box.
+    top: Mutex<Option<f64>>,
 }
 
 impl SimCamera {
@@ -67,9 +73,12 @@ impl SimCamera {
         let captured = Instant::now();
         let q = self.sup.inner().read().await.measured_positions.clone();
         let pose = kinematics::fk(&kinematics::q6(&q));
-        let mut detections = vec![Detection { label: "person".into(), score: 0.5, box_norm: [0.0, 0.0, 0.08, 0.1] }];
+        let mut detections = vec![Detection { label: "person".into(), score: 0.5, box_norm: [0.0, 0.0, 0.08, 0.1], angle_deg: None, angle_conf: None }];
         if self.visible.load(Ordering::SeqCst) {
-            if let Some(b) = self.project_box(&pose) { detections.push(Detection { label: self.label.clone(), score: 0.9, box_norm: b }); }
+            if let Some(b) = self.project_box(&pose) {
+                let (angle_deg, angle_conf) = match self.image_angle(&pose) { Some((a, c)) => (Some(a), Some(c)), None => (None, None) };
+                detections.push(Detection { label: self.label.clone(), score: 0.9, box_norm: b, angle_deg, angle_conf });
+            }
         }
         let frame_id = self.frame.fetch_add(1, Ordering::SeqCst) + 1;
         if self.delayed.load(Ordering::SeqCst) {
@@ -79,12 +88,26 @@ impl SimCamera {
         DetectionFrame { frame_id, captured_at, detections }
     }
 
+    /// Image angle (deg, [-90, 90)) of the object's long side when the rig reports one.
+    fn image_angle(&self, pose: &Pose) -> Option<(f64, f64)> {
+        let (dir, conf) = (*self.angle.lock().unwrap())?;
+        let o = &self.object;
+        let sh = *self.shift.lock().unwrap();
+        let top = self.top.lock().unwrap().unwrap_or(o.height);
+        let c = [o.centre[0] + sh[0], o.centre[1] + sh[1], o.centre[2] + top];
+        let p0 = self.cam.project(pose, &c)?;
+        let p1 = self.cam.project(pose, &[c[0] + 0.02 * dir.cos(), c[1] + 0.02 * dir.sin(), c[2]])?;
+        let a = (p1[1] - p0[1]).atan2(p1[0] - p0[0]).to_degrees();
+        Some(((a + 90.0).rem_euclid(180.0) - 90.0, conf))
+    }
+
     fn project_box(&self, pose: &Pose) -> Option<[f64; 4]> {
         let o = &self.object;
         let sh = *self.shift.lock().unwrap();
         let o = Object { centre: [o.centre[0] + sh[0], o.centre[1] + sh[1], o.centre[2]], half: o.half, height: o.height };
+        let zs = match *self.top.lock().unwrap() { Some(t) => vec![o.centre[2] + t], None => vec![o.centre[2], o.centre[2] + o.height] };
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-        for sx in [-1.0, 1.0] { for sy in [-1.0, 1.0] { for z in [o.centre[2], o.centre[2] + o.height] {
+        for sx in [-1.0, 1.0] { for sy in [-1.0, 1.0] { for &z in &zs {
             let p = self.cam.project(pose, &[o.centre[0] + sx * o.half[0], o.centre[1] + sy * o.half[1], z])?;
             x0 = x0.min(p[0]); y0 = y0.min(p[1]); x1 = x1.max(p[0]); y1 = y1.max(p[1]);
         }}}
@@ -239,6 +262,7 @@ async fn rig_driven(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start: 
         vision: Mutex::new(None), mode_calls: Mutex::new(Vec::new()), no_yolo: AtomicBool::new(false),
         per_request: AtomicBool::new(false), trigger_calls: Mutex::new(Vec::new()), next_frame_calls: AtomicU64::new(0),
         shift: Mutex::new([0.0; 2]), failing: AtomicBool::new(false), stale: AtomicBool::new(false), delayed: AtomicBool::new(false),
+        angle: Mutex::new(None), top: Mutex::new(None),
     });
     let hold = Arc::new(AtomicBool::new(true));
     let (ticker, hold_t) = (sup.clone(), hold.clone());
@@ -1073,7 +1097,8 @@ async fn camera_down_rejects_a_camera_body_that_would_reach_the_table() {
 /// approach and centring are clear, so it is acked).
 #[tokio::test]
 async fn look_down_descent_that_would_bring_the_camera_to_the_table_fails() {
-    let setup = GraspSetup::default();
+    // the height probe and the re-centre off: one descent from the approach height
+    let setup = GraspSetup { height_probe_m: 0.0, recentre_height_m: 0.0, ..GraspSetup::default() };
     for (ahead_m, ok) in [(0.009, true), (0.0145, false)] {
         let truth = Truth { offset: [ahead_m, 0.0, 0.03], ..Truth::same() };
         let rig = rig(setup.clone(), truth, 0.0, [0.0, 0.0], false).await;
@@ -1134,6 +1159,254 @@ async fn delayed_detector_recovers_from_stale_frames() {
             assert!(a.final_offset_px.is_some(), "{mode} {phase}: re-check ran");
             let o = Outcome { status: a, centred_err_m: f64::NAN, final_pose: start_pose(&rig).await };
             assert_holding_done(&o, &s, &rig.object, 0.004);
+        }
+    }
+}
+
+// ---- J6 alignment ----
+
+/// The detector reports the long side at 30 deg from base x: the J6 roll turns the jaw closing
+/// direction (end_link y) perpendicular to it, from the angle rather than the box aspect.
+#[tokio::test]
+async fn align_from_detector_angle_closes_across_the_long_side() {
+    let setup = GraspSetup::default();
+    let rig = rig(setup.clone(), centred_lens(), 0.0, [0.01, -0.01], false).await;
+    let start_r = start_pose(&rig).await.r;
+    let mut s = setup.clone();
+    s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+    rig.sup.inner().write().await.set_grasp_setup(s.clone());
+    let long = 30f64.to_radians();
+    *rig.sim.angle.lock().unwrap() = Some((long, 0.9));
+    let image_angle = rig.sim.image_angle(&start_pose(&rig).await).unwrap().0;
+    let o = run_grasp(&rig).await;
+    let jaw = kinematics::mat_vec(&o.final_pose.r, &[0.0, 1.0, 0.0]);
+    let dot = (jaw[0] * long.cos() + jaw[1] * long.sin()) / jaw[0].hypot(jaw[1]);
+    println!("angle 30 deg (image {image_angle:.1} deg): {} {:?} align {:?} turn {:?} rad, jaw . long side {dot:.4}",
+        o.status.state, o.status.code, o.status.align, o.status.align_turn_rad);
+    assert_holding_done(&o, &s, &rig.object, 0.004);
+    assert_eq!(o.status.align.as_deref(), Some("turned:angle"), "{:?}", o.status);
+    assert!(dot.abs() < 3f64.to_radians().sin(), "jaws close across the long side: {dot}");
+    let turn = f64::from(o.status.align_turn_rad.unwrap());
+    assert!(turn.abs() <= std::f64::consts::PI, "{turn}");
+    // the expected roll from the pre-align jaw direction (start heading: look-down of the start)
+    let jaw0 = kinematics::mat_vec(&grasp::look_down(&start_r), &[0.0, 1.0, 0.0]);
+    let t0 = grasp::roll_across_long_side(jaw0, [long.cos(), long.sin(), 0.0]);
+    let d = (turn - t0).rem_euclid(std::f64::consts::PI);
+    assert!(d.min(std::f64::consts::PI - d) < 2f64.to_radians(), "turn {turn} vs expected {t0} (mod pi)");
+    // low confidence: the box aspect decides as before
+    let rig = rig_low_conf(&s).await;
+    let o = run_grasp(&rig).await;
+    assert_holding_done(&o, &s, &rig.object, 0.004);
+    assert!(o.status.align.as_deref().is_some_and(|a| a.ends_with(":box")), "{:?}", o.status.align);
+}
+
+/// Lens on the tool axis, 6 cm behind the jaw tips: the object under the jaws is in the middle
+/// of the image (with `Truth::same` its box reaches the image border at approach height).
+fn centred_lens() -> Truth { Truth { offset: [-0.06, 0.0, 0.0], ..Truth::same() } }
+
+async fn rig_low_conf(s: &GraspSetup) -> Rig {
+    let rig = rig(s.clone(), centred_lens(), 0.0, [0.01, -0.01], false).await;
+    rig.sup.inner().write().await.set_grasp_setup(s.clone());
+    *rig.sim.angle.lock().unwrap() = Some((30f64.to_radians(), 0.1));
+    rig
+}
+
+// ---- object height from the box scale change ----
+
+/// Rig with the lens on the tool axis, the detector boxing the object's top face at `top` m,
+/// grip pixel calibrated (`overrides` applied to the setup).
+async fn height_rig(top: f64, overrides: Value) -> (Rig, GraspSetup) { height_rig_with(top, overrides, centred_lens()).await }
+
+async fn height_rig_with(top: f64, overrides: Value, truth: Truth) -> (Rig, GraspSetup) {
+    let setup = GraspSetup::default().patched(&overrides).unwrap();
+    let rig = rig(setup.clone(), truth, 0.0, [0.01, 0.01], false).await;
+    *rig.sim.top.lock().unwrap() = Some(top);
+    let start_r = start_pose(&rig).await.r;
+    let mut s = setup.clone();
+    s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+    rig.sup.inner().write().await.set_grasp_setup(s.clone());
+    (rig, s)
+}
+
+/// TCP z (lowest seen) while the jaws close.
+async fn run_grasp_close_z(rig: &Rig) -> (armd::motion::ActionStatus, f64) {
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(rig).await).await.expect("grasp accepted");
+    let sup = rig.sup.clone();
+    let mut close_z = f64::NAN;
+    let a = wait_done(&rig.sup, id, 60.0, |a| {
+        if a.phase.as_deref() == Some("close") {
+            if let Ok(inner) = sup.inner().try_read() { close_z = kinematics::fk(&kinematics::q6(&inner.commanded_positions)).p[2]; }
+        }
+    }).await;
+    (a, close_z)
+}
+
+#[tokio::test]
+async fn height_probe_estimates_a_tall_object_and_grasps_part_way_up() {
+    let (rig, s) = height_rig(0.08, json!({})).await;
+    let (a, close_z) = run_grasp_close_z(&rig).await;
+    println!("0.08 m object: {} {:?}, height {:?} ({:?} {:?}), close height {:?}, TCP z at close {close_z:.4}",
+        a.state, a.code, a.object_height_m, a.height_source, a.height_reason, a.close_height_m);
+    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+    assert_eq!(a.height_source.as_deref(), Some("scale"), "{a:?}");
+    let h = f64::from(a.object_height_m.unwrap());
+    assert!((h - 0.08).abs() <= 0.01, "estimate {h}");
+    assert!((f64::from(a.close_height_m.unwrap()) - 0.04).abs() < 0.006, "{a:?}");
+    assert!((close_z - (s.table_z_m + f64::from(a.close_height_m.unwrap()))).abs() < 2e-3, "TCP at the close height: {close_z}");
+}
+
+#[tokio::test]
+async fn height_probe_flat_object_and_disabled_keep_the_grasp_height() {
+    for (top, overrides) in [(0.0, json!({})), (0.08, json!({"height_probe_m": 0.0}))] {
+        let (rig, s) = height_rig(top, overrides.clone()).await;
+        let (a, close_z) = run_grasp_close_z(&rig).await;
+        println!("top {top} {overrides}: {} {:?}, height {:?} ({:?} {:?}), close height {:?}, TCP z at close {close_z:.4}",
+            a.state, a.code, a.object_height_m, a.height_source, a.height_reason, a.close_height_m);
+        assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+        match a.height_source.as_deref() {
+            Some("scale") => assert!(f64::from(a.object_height_m.unwrap()).abs() < 0.01, "{a:?}"),
+            Some("setup") => {}
+            other => panic!("{other:?}"),
+        }
+        if top > 0.0 { assert_eq!(a.height_reason.as_deref(), Some("disabled")); }
+        assert!((f64::from(a.close_height_m.unwrap()) - s.grasp_height_m).abs() < 0.006, "{a:?}");
+        assert!((close_z - (s.table_z_m + s.grasp_height_m)).abs() < 0.006, "{close_z}");
+    }
+}
+
+#[tokio::test]
+async fn height_probe_too_tall_object_fails() {
+    // lens 12 cm behind the jaw tips: the close top face stays inside the image
+    let (rig, s) = height_rig_with(0.135, json!({}), Truth { offset: [-0.12, 0.0, 0.0], ..Truth::same() }).await;
+    let (a, _) = run_grasp_close_z(&rig).await;
+    println!("0.135 m object: {} {:?} {:?}", a.state, a.code, a.message);
+    assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("OBJECT_TOO_TALL")), "{a:?}");
+    let z = start_pose(&rig).await.p[2];
+    assert!((z - (s.table_z_m + s.approach_height_m - s.height_probe_m)).abs() < 2e-3, "stays at the probe pose: {z}");
+    assert_idle_after(&rig.sup, a.id).await;
+}
+
+// ---- mid-height re-centre and descent contact ----
+
+/// Look-down with the lens on the tool axis: the target is re-centred at 0.07 m on the way
+/// down; losing it there skips the re-centre and the grasp completes.
+#[tokio::test]
+async fn recentre_at_mid_height_and_skip_when_lost() {
+    for lose in [false, true] {
+        let (rig, s) = height_rig(0.05, json!({})).await;
+        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+        if lose {
+            wait_phase(&rig.sup, id, "recentre", None).await;
+            rig.sim.visible.store(false, Ordering::SeqCst);
+        }
+        let mut phases: Vec<String> = Vec::new();
+        let a = wait_done(&rig.sup, id, 60.0, |a| {
+            let p = a.phase.clone().unwrap_or_default();
+            if phases.last() != Some(&p) { phases.push(p); }
+        }).await;
+        let final_pose = start_pose(&rig).await;
+        println!("re-centre (lost {lose}): {} {:?} recentre {:?} iterations {:?}, final xy error {:.2} mm, phases {phases:?}",
+            a.state, a.code, a.recentre, a.recentre_iterations, xy_err(&final_pose.p, &rig.object) * 1000.0);
+        assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+        let pos = |p: &str| phases.iter().position(|q| q == p).unwrap_or_else(|| panic!("{p} in {phases:?}"));
+        assert!(pos("recentre") < pos("close"), "{phases:?}");
+        if !lose { assert!(pos("descend") < pos("recentre"), "{phases:?}"); }
+        if lose {
+            assert_eq!(a.recentre.as_deref(), Some("skipped:target_lost"), "{a:?}");
+        } else {
+            assert_eq!(a.recentre.as_deref(), Some("done"), "{a:?}");
+            assert!(xy_err(&final_pose.p, &rig.object) < 0.004);
+        }
+        assert!((final_pose.p[2] - (s.table_z_m + s.lift_height_m)).abs() < 2e-3);
+    }
+}
+
+/// Descent with a driver reporting residual torques: peaks are logged; with
+/// `descend_contact_stop_nm` a J2 residual above it stops the descent where the arm is, and the
+/// jaws close there.
+#[tokio::test]
+async fn descend_logs_residual_peaks_and_stops_on_contact() {
+    for (stop, residual) in [(None, 1.0f32), (Some(2.0), 3.0f32)] {
+        let setup = GraspSetup { height_probe_m: 0.0, recentre_height_m: 0.0, descend_contact_stop_nm: stop, ..GraspSetup::default() };
+        let arm = common::TestArm::new();
+        let rig = rig_driven(setup.clone(), centred_lens(), 0.0, look_down_start(0.0, 0.24), [0.0, 0.0], false, Some(arm.clone())).await;
+        rig.sup.inner().write().await.config.collision = None;
+        let start_r = start_pose(&rig).await.r;
+        let mut s = setup.clone();
+        s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+        rig.sup.inner().write().await.set_grasp_setup(s.clone());
+        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+        wait_phase(&rig.sup, id, "descend", Some(true)).await;
+        // contact below 0.08 m
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while start_pose(&rig).await.p[2] > s.table_z_m + 0.08 {
+            assert!(Instant::now() < deadline, "descent did not reach 0.08 m");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        arm.set_residual(1, residual);
+        let mut close_z = f64::NAN;
+        let sup = rig.sup.clone();
+        let a = wait_done(&rig.sup, id, 40.0, |a| {
+            if a.phase.as_deref() == Some("close") {
+                if let Ok(inner) = sup.inner().try_read() { close_z = kinematics::fk(&kinematics::q6(&inner.commanded_positions)).p[2]; }
+            }
+        }).await;
+        println!("descent stop {stop:?}, residual {residual}: {} {:?}, peaks {:?} N·m / {:?} rad, contact {:?} at {:?} m, TCP z at close {close_z:.4}",
+            a.state, a.code, a.descend_peak_residual_nm, a.descend_peak_tracking_rad, a.descend_contact, a.descend_contact_height_m);
+        // the driver rig does not stop the jaws on the object (its ideal servo reports the
+        // commanded J7), so the close may end NOT_HOLDING; the descent is what is checked here
+        assert!(a.state == "done" || a.code.as_deref() == Some("NOT_HOLDING"), "{a:?}");
+        let pk = a.descend_peak_residual_nm.expect("residual peaks logged");
+        assert!((pk[0] - residual).abs() < 0.05 && pk[1] < 0.05, "{pk:?}");
+        assert!(a.descend_peak_tracking_rad.is_some());
+        match stop {
+            None => {
+                assert_eq!(a.descend_contact, None);
+                assert!((close_z - (s.table_z_m + s.grasp_height_m)).abs() < 2e-3, "full descent: {close_z}");
+            }
+            Some(_) => {
+                assert_eq!(a.descend_contact, Some(true), "{a:?}");
+                let h = f64::from(a.descend_contact_height_m.unwrap());
+                assert!(h > s.grasp_height_m + 0.01 && h < 0.08 + 1e-3, "{h}");
+                assert!((close_z - (s.table_z_m + h)).abs() < 3e-3, "closed where it stopped: {close_z} vs {h}");
+            }
+        }
+    }
+}
+
+// ---- holding re-check after the lift ----
+
+/// Held through the lift: done. The object slips out after the close (the jaw closes onto its
+/// hold target, the grip torque drops): DROPPED at lift height, gripper not reopened.
+#[tokio::test]
+async fn post_lift_recheck_reports_a_dropped_object() {
+    for drop_it in [false, true] {
+        let setup = GraspSetup::default();
+        let rig = rig(setup.clone(), centred_lens(), 0.0, [0.0, 0.0], false).await;
+        let start_r = start_pose(&rig).await.r;
+        let mut s = setup.clone();
+        s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+        rig.sup.inner().write().await.set_grasp_setup(s.clone());
+        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+        if drop_it {
+            wait_phase(&rig.sup, id, "lift", Some(true)).await;
+            rig.hold.store(false, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            rig.sup.inner().write().await.torques[6] = 0.0;
+        }
+        let a = wait_done(&rig.sup, id, 60.0, |_| {}).await;
+        let pose = start_pose(&rig).await;
+        let j7 = rig.sup.inner().read().await.commanded_positions[6];
+        println!("post-lift (dropped {drop_it}): {} {:?} {:?} holding {:?} gap {:?}, TCP z {:.3}, J7 command {j7:.2}",
+            a.state, a.code, a.message, a.holding, a.gripper_gap_rad, pose.p[2]);
+        assert!((pose.p[2] - (s.table_z_m + s.lift_height_m)).abs() < 2e-3, "at lift height");
+        if drop_it {
+            assert_eq!((a.state.as_str(), a.code.as_deref(), a.holding), ("failed", Some("DROPPED"), Some(false)), "{a:?}");
+            assert!(a.gripper_gap_rad.is_some());
+            assert!(j7 > OBJECT_J7 - 0.3, "gripper not reopened: {j7}");
+            assert_idle_after(&rig.sup, id).await;
+        } else {
+            assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
         }
     }
 }

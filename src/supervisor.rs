@@ -1830,6 +1830,9 @@ impl SupervisorInner {
             id, kind: kind.into(), tag, state: "running".into(), code: None, message: None, progress: 0.0,
             started_at: now, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
             phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
+            align: None, align_turn_rad: None, height_source: None, height_reason: None, object_height_m: None, close_height_m: None,
+            recentre: None, recentre_iterations: None, descend_peak_residual_nm: None, descend_peak_tracking_rad: None,
+            descend_contact: None, descend_contact_height_m: None,
         });
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
         self.quintic_settle = None;
@@ -2024,6 +2027,34 @@ impl SupervisorInner {
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
             a.acquire_height_m = Some(height_m);
         }
+    }
+
+    /// Change diagnostic fields of the running action `id` (grasp status fields).
+    pub fn update_action(&mut self, id: u64, f: impl FnOnce(&mut ActionStatus)) {
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) { f(a); }
+    }
+
+    /// Stop the running sub-motion of macro action `id` where the arm is (J1..J6 commanded to
+    /// the measured positions, the gripper keeps its command) and report it done to the
+    /// orchestrator. False when no sub-motion of `id` is running.
+    pub fn end_macro_motion_at_measured(&mut self, id: u64) -> bool {
+        if !self.macro_alive(id) || !self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { return false; }
+        self.stop_motion();
+        let n = self.measured_positions.len().min(self.commanded_positions.len()).min(6);
+        if self.measured_positions[..n].iter().all(|q| q.is_finite()) {
+            for i in 0..n {
+                let l = &self.config.limits[i];
+                self.commanded_positions[i] = self.measured_positions[i].clamp(l.min_position, l.max_position);
+            }
+        }
+        self.commanded_velocities.fill(0.0);
+        self.commanded_accelerations.fill(0.0);
+        self.target_positions = self.commanded_positions.clone();
+        self.safety.mark_motion_finished();
+        if let Some(m) = self.macro_run.as_mut() {
+            m.sub = SubState::Done(SubDone { settled: None, holding: None, gripper_gap_rad: None, at: Instant::now() });
+        }
+        true
     }
 
     fn macro_sub_ready(&self, id: u64) -> Result<u64, ArmError> {
