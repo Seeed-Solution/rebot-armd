@@ -195,7 +195,6 @@ impl SupervisorInner {
     /// Enter gravity compensation. Idempotent while the mode is on.
     pub fn enter_gravity_comp(&mut self, request: GravityCompRequest) -> Result<(), ArmError> {
         if self.gravity_comp.is_some() { return Ok(()); }
-        self.collision_hold_check()?;
         if let Some(r) = self.gravity_comp_blocker() { return Err(Self::reject(&r.code, r.message)); }
         let policy = self.gravity_comp_policy().cloned().ok_or_else(|| Self::reject("UNSUPPORTED", "no policy".into()))?;
         let [lo, hi] = policy.scale_range;
@@ -259,6 +258,11 @@ impl SupervisorInner {
             prev_measured: None,
             lease_generation: self.active_lease.as_ref().map(|l| l.generation),
         });
+        // Hand guiding is the way out of a collision hold: the guard does not watch while
+        // floating, so the hold ends here.
+        if let Some(h) = self.collision.hold.take() {
+            tracing::info!("Collision hold on joint {} ended: gravity compensation entered", h.joint + 1);
+        }
         tracing::info!("Gravity compensation on (scale {scale}, kd {damping:?})");
         Ok(())
     }

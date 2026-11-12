@@ -119,7 +119,6 @@ fn trip_cancels_a_running_move_to_holds_rejects_motion_and_auto_resumes() {
     assert_eq!(code_of(inner.jog_action(INSPECT.to_vec(), None, None, "joint_move").unwrap_err()), (409, "COLLISION_HOLD".into()));
     let epoch = inner.safety.epoch_id();
     assert_eq!(code_of(inner.servo(INSPECT.to_vec(), epoch).unwrap_err().into()), (409, "COLLISION_HOLD".into()));
-    assert_eq!(code_of(inner.enter_gravity_comp(Default::default()).unwrap_err()), (409, "COLLISION_HOLD".into()));
 
     // residual still high: the hold stays
     let obs = ticks(&mut inner, 30);
@@ -134,6 +133,26 @@ fn trip_cancels_a_running_move_to_holds_rejects_motion_and_auto_resumes() {
     assert!(!c.active && c.joint.is_none() && c.trips_in_window == 1, "{c:?}");
     println!("collision after auto-resume: {}", serde_json::to_string(&obs.collision).unwrap());
     start_move(&mut inner);
+}
+
+/// Real arm 2026-11-12: a trip held the arm and gravity-compensation entry was refused with
+/// COLLISION_HOLD, so the arm could not be taken by hand. Entry now ends the hold.
+#[test]
+fn gravity_comp_entry_ends_a_collision_hold() {
+    let (mut inner, arm) = rig(Some(policy()));
+    if inner.gravity_comp_support().is_err() {
+        eprintln!("skipped: gravity model URDF not found ({:?})", inner.gravity_comp_support());
+        return;
+    }
+    arm.set_residual(2, -8.0);
+    ticks(&mut inner, 5);
+    assert!(inner.collision.hold.is_some(), "tripped");
+    inner.enter_gravity_comp(Default::default()).unwrap();
+    assert!(inner.collision.hold.is_none(), "entry ends the hold");
+    let obs = ticks(&mut inner, 5);
+    assert!(inner.gravity_comp.is_some());
+    let c = obs.collision.unwrap();
+    assert!(!c.active && c.trips_in_window == 1, "{c:?}");
 }
 
 #[test]
@@ -394,21 +413,30 @@ async fn trip_during_place_ends_it_and_no_phase_follows() {
 }
 
 /// Real B601-DM at the folded home pose: J3 rests on its support with ~7.5 N·m residual
-/// (J2 ~1.2). Supported joints (`resting_pose.support_torque_limits`) are not watched while the
+/// (J2 ~1.2, J4 ~2.1). Exempt joints (`collision.rest_exempt_joints`) are not watched while the
 /// arm is within the resting-pose tolerances; other joints, and the same joint off home, are.
 #[test]
 fn supported_joints_at_the_resting_pose_do_not_trip() {
-    let (mut inner, arm) = rig(Some(policy()));
-    let home: Vec<f32> = inner.config.home_positions.clone();
-    arm.0.lock().unwrap().q.copy_from_slice(&home);
-    inner.commanded_positions = home.clone();
-    inner.target_positions = home.clone();
-    ticks(&mut inner, 3);
+    let at_home = |p: CollisionPolicy| {
+        let (mut inner, arm) = rig(Some(p));
+        let home: Vec<f32> = inner.config.home_positions.clone();
+        arm.0.lock().unwrap().q.copy_from_slice(&home);
+        inner.commanded_positions = home.clone();
+        inner.target_positions = home.clone();
+        ticks(&mut inner, 3);
+        (inner, arm)
+    };
+    // without `rest_exempt_joints`: the joints of `resting_pose.support_torque_limits`
+    let (inner, _) = at_home(policy());
     assert_eq!(inner.collision_supported_joints(), [false, true, true, false, false, false]);
+    let kit = ArmConfig::rebot_dm().collision.unwrap().rest_exempt_joints;
+    let (mut inner, arm) = at_home(CollisionPolicy { rest_exempt_joints: kit, ..policy() });
+    assert_eq!(inner.collision_supported_joints(), [false, true, true, true, false, false]);
     arm.set_residual(2, 7.5);
     arm.set_residual(1, 1.2);
+    arm.set_residual(3, 2.15); // real arm 2026-11-12: J4 at the folded pose, threshold 1.43
     ticks(&mut inner, 20);
-    assert!(inner.collision.hold.is_none(), "J3 on its support must not trip at home");
+    assert!(inner.collision.hold.is_none(), "J2..J4 on their support must not trip at home");
     arm.set_residual(0, 7.0);
     ticks(&mut inner, 5);
     assert_eq!(inner.collision.hold.map(|h| h.joint), Some(0), "J1 is not supported: trips");

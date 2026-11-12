@@ -182,16 +182,19 @@ fn template_urdf_profile_is_a_valid_profile() {
 
 /// The kit profile carries the collision thresholds from the real-arm rebot-sysid session
 /// (B601-DM, 2026-11-11, ±0.08 rad, two poses), with the guard off until they are validated
-/// at more poses; the other collision settings are the defaults.
+/// at more poses, and J2..J4 exempt at the folded pose (2026-11-12); the other collision
+/// settings are the defaults.
 #[test]
 fn kit_profile_collision_section_from_sysid() {
     let file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(PROFILE_PATH).unwrap()).unwrap();
     let c = &file["collision"];
     assert_eq!(c["enabled"], serde_json::json!(false));
     assert_eq!(c["thresholds_nm"], serde_json::json!([2.0, 1.19, 2.82, 1.43, 0.87, 0.28]));
+    assert_eq!(c["rest_exempt_joints"], serde_json::json!([false, true, true, true, false, false]));
     let policy = ArmConfig::rebot_dm().collision.expect("rebot_dm collision section");
+    assert_eq!(policy.rest_exempt_joints, Some([false, true, true, true, false, false]));
     let defaults = armd::collision::CollisionPolicy::default();
-    assert_eq!(armd::collision::CollisionPolicy { thresholds_nm: defaults.thresholds_nm, ..policy }, defaults);
+    assert_eq!(armd::collision::CollisionPolicy { thresholds_nm: defaults.thresholds_nm, rest_exempt_joints: None, ..policy }, defaults);
     assert!(!policy.enabled);
 }
 

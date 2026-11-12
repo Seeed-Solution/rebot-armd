@@ -875,6 +875,10 @@ impl ArmConfig {
             collision: Some(crate::collision::CollisionPolicy {
                 enabled: false,
                 thresholds_nm: [2.0, 1.19, 2.82, 1.43, 0.87, 0.28],
+                // J2 and J3 rest on their supports at the folded pose, and J4 shows ~2.1 N·m
+                // residual there (0.4 N·m once lifted), above its 1.43 N·m threshold
+                // (real arm, 2026-11-12)
+                rest_exempt_joints: Some([false, true, true, true, false, false]),
                 ..Default::default()
             }),
             hardware: None,

@@ -48,6 +48,10 @@ pub struct CollisionPolicy {
     /// Trips within `escalate_window_s` that still auto-resume; the next one latches Fault.
     pub max_auto_resumes: u32,
     pub escalate_window_s: f64,
+    /// J1..J6 not watched while every arm joint is within `resting_pose.position_tolerances`
+    /// of home (they rest on a mechanical support, which shows up as residual). `None`: the
+    /// joints listed in `resting_pose.support_torque_limits`.
+    pub rest_exempt_joints: Option<[bool; 6]>,
 }
 
 impl Default for CollisionPolicy {
@@ -60,6 +64,7 @@ impl Default for CollisionPolicy {
             resume_after_s: 2.0,
             max_auto_resumes: 3,
             escalate_window_s: 60.0,
+            rest_exempt_joints: None,
         }
     }
 }
@@ -262,8 +267,8 @@ impl SupervisorInner {
 
     /// One control tick of the guard, after the residuals of this tick are known and
     /// before the motion reference is stepped. `dt` is the control-loop step (s).
-    /// J1..J6 resting on their support: listed in `resting_pose.support_torque_limits` and
-    /// every arm joint (`ArmConfig::resting_arm_joints`) within `resting_pose.position_tolerances`
+    /// J1..J6 resting on their support: listed in `collision.rest_exempt_joints` (default: the
+    /// joints of `resting_pose.support_torque_limits`) and every arm joint (`ArmConfig::resting_arm_joints`) within `resting_pose.position_tolerances`
     /// of home (measured positions).
     pub fn collision_supported_joints(&self) -> [bool; 6] {
         let mut out = [false; 6];
@@ -279,7 +284,10 @@ impl SupervisorInner {
             }
         });
         if at_rest {
-            for &(i, _) in &policy.support_torque_limits { if i < 6 { out[i] = true; } }
+            match self.collision_policy().rest_exempt_joints {
+                Some(exempt) => out = exempt,
+                None => for &(i, _) in &policy.support_torque_limits { if i < 6 { out[i] = true; } },
+            }
         }
         out
     }
