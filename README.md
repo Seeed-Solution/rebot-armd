@@ -427,7 +427,8 @@ the header).
   as the URDF angle; J7 is mapped to the finger travel (0–42.5 mm) between `gripper_policy`
   `closed_rad` and `open_rad`. armd serves the URDF and meshes read-only from the asset directory
   (`assets/`, else `/usr/share/rebot-teleop/assets/`, or `ARMD_ASSET_DIR`) at `/assets/model/`;
-  the kit `.deb` installs 34 decimated B601-DM meshes (2.8 MB). Without the meshes (lite
+  the kit `.deb` installs the 34 B601-DM visual parts, simplified to 0.5 mm and packed into one
+  file (`meshes/arm.bin`, 49 k triangles, 441 KB). Without the meshes (lite
   tarball) the view draws a stick figure through the URDF joint frames. It renders at most
   30 frames/s and only when the pose, the boxes or the camera changed. The rendered `end_link`
   matches armd's `kinematics::fk` within 0.001 mm at the points in `tests/fixtures/fk_points.json`

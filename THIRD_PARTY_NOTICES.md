@@ -106,16 +106,16 @@ without specific prior written permission.
 
 ## reBot B601-DM visual meshes (cockpit 3D view)
 
-- Files: `kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/assets/meshes/` (34 STL
-  files, `manifest.json`, `NOTICE.md`, `LICENSE-CERN-OHL-W-2.0.txt`; 2.8 MB), installed by the
+- Files: `kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/assets/meshes/` (34 parts
+  packed in `arm.bin`, `manifest.json`, `NOTICE.md`, `LICENSE-CERN-OHL-W-2.0.txt`; 467 KB), installed by the
   `.deb` to `/usr/share/rebot-teleop/assets/meshes/` and served by armd at
   `/assets/model/meshes/`. Not embedded in the binary and not part of the lite tarball.
 - Upstream: https://github.com/Seeed-Projects/reBot-DevArm, `Rebot_Arm_description/DM/meshes/visual`
   and `meshes/shared`, commit `b2287b6`. Copyright 2026 Seeed Studio Co., Ltd.
 - License: CERN-OHL-W-2.0; the full text is installed next to the meshes.
-- Modifications (2026-11-11): simplified to about 12 % of the triangles (at least 300 per part) by
-  `scripts/decimate_meshes.py`, `colored_` prefix removed, `manifest.json` added (part to link
-  mapping and colours from the upstream URDF materials). See `NOTICE.md` in that directory.
+- Modifications (2026-11-12): simplified to a surface deviation of at most 0.5 mm (meshoptimizer)
+  and packed with quantized 16-bit positions into `arm.bin` by `scripts/decimate_meshes.py`;
+  `manifest.json` added (part to link mapping, colours from the upstream URDF materials, offsets). See `NOTICE.md` in that directory.
 
 ## reBot B601-RS robot description (URDF)
 
