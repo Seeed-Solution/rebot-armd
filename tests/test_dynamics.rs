@@ -49,13 +49,15 @@ fn pos_def(m: &[[f64; 6]; 6]) -> bool {
 #[test]
 fn rnea_at_rest_equals_the_gravity_model() {
     let mut rng = Lcg(7);
-    let builtin = ArmModel::RebotDevArm;
+    let builtin = ArmModel::REBOT_DEV_ARM;
     let mut dev = 0.0f64;
     for _ in 0..5000 {
         let q = rng.v(std::f64::consts::PI);
         let tau = builtin.inverse_dynamics(&q, &Z, &Z, true);
-        let g = armd::gravity::gravity_torques_f64(&std::array::from_fn(|i| q[i]));
-        let chain_g = rebot_dm_chain().gravity_torques(&q);
+        // gravity.rs takes model (URDF) angles; q is in motor angles
+        let off = armd::kinematics::B601DM_MODEL_OFFSETS_RAD;
+        let g = armd::gravity::gravity_torques_f64(&std::array::from_fn(|i| q[i] + off[i]));
+        let chain_g = rebot_dm_chain(&armd::kinematics::B601DM_MODEL_OFFSETS_RAD).gravity_torques(&q);
         for j in 0..6 { dev = dev.max((tau[j] - g[j]).abs()).max((tau[j] - chain_g[j]).abs()); }
     }
     eprintln!("RNEA(q, 0, 0) vs gravity.rs / chain gravity: max deviation {dev:.3e} N·m over 5000 poses");
@@ -83,7 +85,7 @@ fn rnea_matches_a_urdf_chain_profile() {
 
 #[test]
 fn mass_matrix_is_symmetric_positive_definite_and_gives_the_kinetic_energy() {
-    let c = rebot_dm_chain();
+    let c = rebot_dm_chain(&armd::kinematics::B601DM_MODEL_OFFSETS_RAD);
     let mut rng = Lcg(3);
     let (mut asym, mut ke_dev, mut lin_dev) = (0.0f64, 0.0f64, 0.0f64);
     for _ in 0..500 {
@@ -113,7 +115,7 @@ fn mass_matrix_is_symmetric_positive_definite_and_gives_the_kinetic_energy() {
 /// planner relies on: tau_dyn(q, s q', s² q'') = s² tau_dyn(q, q', q'').
 #[test]
 fn power_balance_and_time_scaling() {
-    let c = rebot_dm_chain();
+    let c = rebot_dm_chain(&armd::kinematics::B601DM_MODEL_OFFSETS_RAD);
     let mut rng = Lcg(11);
     let (mut worst, mut scale_dev) = (0.0f64, 0.0f64);
     for _ in 0..50 {
@@ -147,7 +149,7 @@ fn power_balance_and_time_scaling() {
 /// Per-call cost (printed): one RNEA of the 6-joint chain.
 #[test]
 fn rnea_cost() {
-    let c = rebot_dm_chain();
+    let c = rebot_dm_chain(&armd::kinematics::B601DM_MODEL_OFFSETS_RAD);
     let mut rng = Lcg(5);
     let qs: Vec<_> = (0..1000).map(|_| (rng.v(2.0), rng.v(1.0), rng.v(3.0))).collect();
     let t0 = std::time::Instant::now();

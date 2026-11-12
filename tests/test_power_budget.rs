@@ -56,7 +56,7 @@ impl ArmDriver for SimArm {
         let s = self.0.lock().unwrap();
         let g: [f32; 6] = if s.dynamic {
             let f = |v: &[f32; 7]| -> [f64; 8] { std::array::from_fn(|i| if i < 6 { f64::from(v[i]) } else { 0.0 }) };
-            let t = armd::chain::ArmModel::RebotDevArm.inverse_dynamics(&f(&s.q), &f(&s.v), &f(&s.a), true);
+            let t = armd::chain::ArmModel::REBOT_DEV_ARM.inverse_dynamics(&f(&s.q), &f(&s.v), &f(&s.a), true);
             std::array::from_fn(|i| t[i] as f32)
         } else { armd::compute_gravity_torques(&std::array::from_fn(|i| s.q[i])).unwrap() };
         Ok((0..7).map(|i| JointState {
@@ -554,7 +554,7 @@ fn planning_policy_defaults_and_validation() {
 #[test]
 fn bisection_finds_the_largest_scale_that_fits() {
     let b = dm();
-    let arm = armd::chain::ArmModel::RebotDevArm;
+    let arm = armd::chain::ArmModel::REBOT_DEV_ARM;
     let traj = swing(STRETCHED, -1.0);
     let s = quintic_samples(&b.planning, &traj, 6);
     let t0 = std::time::Instant::now();
@@ -585,7 +585,7 @@ fn bisection_finds_the_largest_scale_that_fits() {
 fn refused_when_even_the_slowest_speed_exceeds_the_budget() {
     let mut b = dm();
     b.supply_rated_a = 4.0; // planning limit 3.0 A
-    let arm = armd::chain::ArmModel::RebotDevArm;
+    let arm = armd::chain::ArmModel::REBOT_DEV_ARM;
     // from a light pose into the stretched one: the static load at the end alone is ~3.5 A
     let mut from = STRETCHED;
     from[1] = -1.4;
@@ -665,7 +665,7 @@ fn fast_stretched_move_is_slowed_to_fit() {
 #[test]
 fn cartesian_path_fit_and_action_record() {
     let b = dm();
-    let arm = armd::chain::ArmModel::RebotDevArm;
+    let arm = armd::chain::ArmModel::REBOT_DEV_ARM;
     let n = 60;
     let q: Vec<[f32; 7]> = (0..=n).map(|k| { let mut q = STRETCHED; q[1] -= k as f32 / n as f32; q }).collect();
     let s: Vec<f64> = (0..=n).map(|k| k as f64 / n as f64).collect();

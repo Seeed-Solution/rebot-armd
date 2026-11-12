@@ -82,23 +82,33 @@ pub fn kinetic_energy(chain: &KinematicChain, q: &[f64], qd: &[f64]) -> f64 {
 }
 
 /// Chain of the built-in B601-DM model, built once from the embedded URDF.
-pub fn rebot_dm_chain() -> &'static KinematicChain {
-    static CHAIN: OnceLock<KinematicChain> = OnceLock::new();
-    CHAIN.get_or_init(|| {
-        let spec = ChainSpec {
-            base_link: "base_link".into(),
-            tip_link: "end_link".into(),
-            joints: (1..=6).map(|i| ChainJointSpec { urdf_joint: format!("joint{i}"), sign: 1.0, offset_rad: 0.0 }).collect(),
-        };
+/// The built-in B601-DM chain from the embedded URDF with the given motor -> model offsets
+/// (`model_offsets_rad`). Built once per distinct offset set and kept for the process life
+/// (in practice one set per profile).
+pub fn rebot_dm_chain(offsets: &[f64; 6]) -> &'static KinematicChain {
+    static CHAINS: OnceLock<std::sync::Mutex<Vec<([u64; 6], &'static KinematicChain)>>> = OnceLock::new();
+    let key = offsets.map(f64::to_bits);
+    let mut chains = CHAINS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, c)) = chains.iter().find(|(k, _)| *k == key) {
+        return c;
+    }
+    let spec = ChainSpec {
+        base_link: "base_link".into(),
+        tip_link: "end_link".into(),
+        joints: (1..=6).map(|i| ChainJointSpec { urdf_joint: format!("joint{i}"), sign: 1.0, offset_rad: offsets[i - 1] }).collect(),
+    };
+    let chain: &'static KinematicChain = Box::leak(Box::new(
         KinematicChain::from_urdf_str(include_str!("../assets/reBot-DevArm_gripper.urdf"), &spec)
-            .expect("embedded B601-DM URDF builds a chain")
-    })
+            .expect("embedded B601-DM URDF builds a chain"),
+    ));
+    chains.push((key, chain));
+    chain
 }
 
 impl ArmModel {
     /// The chain the dynamics use (the built-in model's chain from the embedded URDF).
     pub fn dynamics_chain(&self) -> &KinematicChain {
-        match self { Self::RebotDevArm => rebot_dm_chain(), Self::Chain(c) => c }
+        match self { Self::RebotDevArm(off) => rebot_dm_chain(off), Self::Chain(c) => c }
     }
 
     /// [`rnea`] for this model.
