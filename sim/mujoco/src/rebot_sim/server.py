@@ -321,6 +321,7 @@ class Simulator:
         return {"t": round(d.time, 4), "seed": self.scene.seed, "enabled": self.motors.enabled,
                 "q": self.motors.idx.motor_positions(d).round(5).tolist(),
                 "tcp": [round(float(v), 5) for v in d.body("end_link").xpos],
+                "tcp_quat": [round(float(v), 5) for v in d.body("end_link").xquat],  # w, x, y, z
                 "objects": self.scene.state(d)}
 
     def sim_state(self) -> dict:

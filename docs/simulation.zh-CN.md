@@ -154,7 +154,7 @@ rebot-vision 感知接口版本 2（[detection_api.md](detection_api.md)）：`G
 
 - `--objects`：`cube`（4 cm、30 g，即原场景方块）、`cup`（圆柱 ⌀ 5 cm × 7 cm、50 g）、`block`（6 × 3 × 4 cm、40 g）中 1..3 个；同类重复时命名为 `cube_2` 等。不带 `--seed` 时第一个物体位于 (0.30, 0) m，其余位于 (0.24, ±0.12) m。带种子时位置在 x 0.22..0.36 m、y −0.14..0.14 m 内抽取，偏航 ±90°，中心间距至少 9 cm（`numpy.random.default_rng(seed)`；同一种子得到同一布局）。
 - `POST /sim/reset {"seed": N|null}`：在下一个物理步按种子（非负整数，否则 400）摆放物体（静止），不移动机械臂。返回状态。物理循环 3 秒内未应答时 `/sim` 路由返回 504。
-- `GET /sim/state`：时间、种子、关节位置、TCP（end_link 原点），以及每个物体的 `pos`、`quat`、`lifted_m`（高出静止高度的距离）、`contacts`（`jaws`：左 / 右夹指接触；`table`）和 `grasped`（两侧夹指接触且抬起超过 2 cm）。`camera`：最新帧的 `frame_id`、`physics_time`、`physics_step`，落后物理的 `lag_s`，无新物理状态而跳过的相机周期数 `skipped`，`stale`（落后超过两个相机周期），`seg_failures`（分割渲染失败次数）和 `seg_last_error`。
+- `GET /sim/state`：时间、种子、关节位置、TCP（end_link 原点）、`tcp_quat`（end_link 姿态，w x y z），以及每个物体的 `pos`、`quat`、`lifted_m`（高出静止高度的距离）、`contacts`（`jaws`：左 / 右夹指接触；`table`）和 `grasped`（两侧夹指接触且抬起超过 2 cm）。`camera`：最新帧的 `frame_id`、`physics_time`、`physics_step`，落后物理的 `lag_s`，无新物理状态而跳过的相机周期数 `skipped`，`stale`（落后超过两个相机周期），`seg_failures`（分割渲染失败次数）和 `seg_last_error`。
 - `GET /sim/camera`：当前安装参数、视场角、640x360 下的 fx、`grip_pixel_norm_at`（工具竖直朝下时夹爪尖正下方桌面点在画面中的位置，按若干接近高度给出，即 armd `grasp.grip_pixel_norm` 应取的值）、渲染后端和每帧耗时。
 
 ### 仿真中的点框抓取

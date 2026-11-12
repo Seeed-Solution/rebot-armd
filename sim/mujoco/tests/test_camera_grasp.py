@@ -72,10 +72,16 @@ CASES = {
     "v8_noise": (NOISE, (90.0, -38.0)),
     "axis_cube": (AXIS_LENS, None),
     "axis_cup": ([*AXIS_LENS, "--objects", "cup"], None),
+    # axis_block: the 6 x 3 cm block turned 36.5 deg (seed 14); J6 turns the jaws across its long
+    # side from the detector's mask angle
+    "axis_block": ([*AXIS_LENS, "--objects", "block", "--seed", "14"], None),
 }
 # object the case grasps (default: the cube) and its height (scene.py KINDS)
-TARGETS = {"axis_cup": "cup"}
+TARGETS = {"axis_cup": "cup", "axis_block": "block"}
 HEIGHTS_M = {"cube": 0.04, "cup": 0.07, "block": 0.04}
+# approach height per case (default 0.15 m); at 0.15 m the 6 cm block's box reaches the image
+# border and the J6 alignment is skipped
+APPROACH_M = {"axis_block": 0.20}
 
 
 def view_pose(cam: dict, cube_xy, z: float, miss_m=(0.0, 0.0)):
@@ -168,7 +174,7 @@ def test_tap_to_grasp_the_cube(cam_rig):
     schema = http(client.base + "/api/v1/observation/schema")
     print(f"schema vision caps: {schema.get('capabilities', {}).get('vision')}")
 
-    approach = 0.15
+    approach = APPROACH_M.get(case, 0.15)
     overrides = {"fx_px": cam["fx_px"], "fy_px": cam["fx_px"], "approach_height_m": approach}
     if not v8:  # v8: the point under the jaws is outside the image at 0.15 m; camera-down does not use it
         overrides["grip_pixel_norm"] = cam["grip_pixel_norm_at"][f"{approach:.2f}"]
@@ -212,3 +218,13 @@ def test_tap_to_grasp_the_cube(cam_rig):
         assert abs(rec["object_height_m"] - h) <= 0.01, json.dumps(rec)
         expect_close = min(max(rec["object_height_m"] * 0.5, 0.015), 0.06)
         assert abs(rec["close_height_m"] - expect_close) < 1e-3, json.dumps(rec)
+    if case == "axis_block":
+        # the jaws turned from the mask angle, and after the lift the block lies across them
+        # (block long side, body x, about perpendicular to the jaw closing direction, tool y)
+        assert rec["align"] == "turned:angle", json.dumps(rec)
+        long_side, jaw = np.zeros(3), np.zeros(3)
+        mujoco.mju_rotVecQuat(long_side, [1.0, 0.0, 0.0], cube["quat"])
+        mujoco.mju_rotVecQuat(jaw, [0.0, 1.0, 0.0], state["tcp_quat"])
+        cross_deg = math.degrees(math.acos(min(1.0, abs(float(long_side @ jaw)))))
+        print(f"block long side vs jaw closing direction {cross_deg:.1f} deg, align_turn_rad={rec.get('align_turn_rad')}")
+        assert cross_deg > 70.0, cross_deg
