@@ -21,7 +21,7 @@ from test_armd_sim import free_port
 
 from rebot_sim import camera as cam
 from rebot_sim.camera import CameraMount
-from rebot_sim.model import load_model
+from rebot_sim.model import MODEL_OFFSETS_RAD, load_model
 from rebot_sim.perception import (
     CameraRig,
     Perception,
@@ -44,9 +44,9 @@ def http(url: str, body: dict | None = None, method: str | None = None) -> tuple
 
 
 def set_arm(model: mujoco.MjModel, data: mujoco.MjData, q) -> None:
-    """Put J1..J6 at `q` (rad) and update the kinematics."""
+    """Put J1..J6 at armd motor angles `q` (rad) and update the kinematics."""
     for j, v in zip(range(1, 7), q):
-        data.qpos[model.jnt_qposadr[model.joint(f"joint{j}").id]] = v
+        data.qpos[model.jnt_qposadr[model.joint(f"joint{j}").id]] = v + MODEL_OFFSETS_RAD[j - 1]
     mujoco.mj_forward(model, data)
 
 

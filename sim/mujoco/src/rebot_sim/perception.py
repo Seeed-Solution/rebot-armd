@@ -606,7 +606,7 @@ class CameraRig:
             "hfov_deg": round(cam.HFOV_DEG, 3), "vfov_deg": round(cam.VFOV_DEG, 3),
             "stream_size": list(self.size), "fps": self.fps, "detection_size": list(cam.DETECTION_SIZE),
             "fx_px": round(cam.focal_px(cam.DETECTION_SIZE[1]), 2),
-            "grip_pixel_norm_at": {f"{h:.2f}": cam.grip_pixel_norm(r, m.offset, h) for h in (0.10, 0.12, 0.15, 0.18, 0.20)},
+            "grip_pixel_norm_at": {f"{h:.2f}": cam.grip_pixel_norm(r, m.offset, h) for h in (0.10, 0.12, 0.15, 0.18, 0.20, 0.25, 0.30)},
             "render_backend": self.backend, "render": self.stats(),
         }
 

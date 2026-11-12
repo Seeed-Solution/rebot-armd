@@ -1143,7 +1143,9 @@ impl Orchestrator {
         if jaw_along_x == short_along_x { return None; }
         let inner = self.sup.inner().read().await;
         let (q6, lim) = (f64::from(inner.commanded_positions[5]), &inner.config.limits[5]);
-        let room = |t: f64| q6 + t >= f64::from(lim.min_position) + 0.1 && q6 + t <= f64::from(lim.max_position) - 0.1;
+        // a roll t about the tool axis moves the J6 motor by sign * t
+        let sign = inner.config.arm_model.joint_map().get(5).map_or(1.0, |m| m.sign);
+        let room = |t: f64| { let q = q6 + sign * t; q >= f64::from(lim.min_position) + 0.1 && q <= f64::from(lim.max_position) - 0.1 };
         let half = std::f64::consts::FRAC_PI_2;
         // roll about +x_tool; J6 turns with it when its axis is the tool axis
         [half, -half].into_iter().find(|t| room(*t)).or(Some(half))
@@ -1254,26 +1256,28 @@ mod tests {
     #[allow(clippy::approx_constant)]
     fn ray_and_projection_round_trip() {
         let setup = GraspSetup { camera_tilt_deg: 20.0, ..Default::default() };
-        let cam = CamModel::assumed(&crate::chain::ArmModel::RebotDevArm, &setup, &CameraMount::default());
-        let pose = Pose::new(look_down(&kinematics::fk(&[0.0, -1.167, -1.565, 1.435, 0.0, 1.5708]).r), [0.3, 0.05, 0.2]);
+        let cam = CamModel::assumed(&crate::chain::ArmModel::REBOT_DEV_ARM, &setup, &CameraMount::default());
+        let pose = Pose::new(look_down(&inspect_r()), [0.3, 0.05, 0.2]);
         assert!(kinematics::column(&pose.r, 0)[2] < -0.999999);
         let p = cam.plane_point(&pose, [300.0, 200.0], 0.01).unwrap();
         let px = cam.project(&pose, &p).unwrap();
         assert!((px[0] - 300.0).abs() < 1e-6 && (px[1] - 200.0).abs() < 1e-6, "{px:?}");
-        // a ray pointing above the horizon never meets the table
-        let up = Pose::new(kinematics::axis_r(&[0.0, 1.0, 0.0], std::f64::consts::PI), pose.p);
+        // a ray pointing above the horizon never meets the table (tool axis up, optical axis
+        // 20 deg off it)
+        let up = Pose::new(kinematics::axis_r(&[0.0, 1.0, 0.0], -std::f64::consts::FRAC_PI_2), pose.p);
         assert!(cam.plane_point(&up, [320.0, 180.0], 0.0).is_none());
     }
 
-    /// v8 holder: rot 90, tilt -38, lens centre behind and above the jaw tips.
+    /// v8 holder: rot 0, tilt -38, lens centre behind and above the jaw tips.
     fn v8() -> (GraspSetup, CameraMount, CamModel) {
         let setup = GraspSetup { camera_tilt_deg: -38.0, ..Default::default() };
-        let mount = CameraMount { rot_deg: 90.0, tilt_deg: -38.0, offset_m: Some([-0.0731, 0.0005, 0.066]), ..Default::default() };
-        let cam = CamModel::assumed(&crate::chain::ArmModel::RebotDevArm, &setup, &mount);
+        let mount = CameraMount { rot_deg: 0.0, tilt_deg: -38.0, offset_m: Some([-0.0731, 0.0005, 0.066]), ..Default::default() };
+        let cam = CamModel::assumed(&crate::chain::ArmModel::REBOT_DEV_ARM, &setup, &mount);
         (setup, mount, cam)
     }
 
-    fn inspect_r() -> Mat3 { kinematics::fk(&[0.0, -1.167, -1.565, 1.435, 0.0, std::f64::consts::FRAC_PI_2]).r }
+    /// End rotation at the inspect preset (motor angles, J6 at its rest angle).
+    fn inspect_r() -> Mat3 { crate::chain::ArmModel::REBOT_DEV_ARM.fk(&[0.0, -1.167, -1.565, 1.435, 0.0, std::f64::consts::FRAC_PI_2]).r }
 
     fn close(a: &Vec3, b: &Vec3, tol: f64) -> bool { kinematics::norm(&kinematics::sub(a, b)) < tol }
 
@@ -1325,7 +1329,7 @@ mod tests {
         let hit = cam.plane_point(&pose, [cam.cx, cam.cy], target[2]).unwrap();
         assert!(close(&hit, &target, 1e-9), "{hit:?}");
         // tilt 0: the optical axis already is the tool axis, the orientation is look_down's
-        let flat = CamModel::assumed(&crate::chain::ArmModel::RebotDevArm, &GraspSetup::default(), &CameraMount::default());
+        let flat = CamModel::assumed(&crate::chain::ArmModel::REBOT_DEV_ARM, &GraspSetup::default(), &CameraMount::default());
         assert_eq!(camera_down(&v, &flat.rec), v);
     }
 
@@ -1349,10 +1353,11 @@ mod tests {
 
     #[test]
     fn acquisition_height_keeps_the_pitched_envelope_clear() {
-        // rot 0, tilt -38: pitch about the axis along which the kit check points are 92.5 mm out
+        // rot 90, tilt -38: pitch about end_link z, the axis along which the kit check points
+        // are 92.5 mm out
         let setup = GraspSetup { camera_tilt_deg: -38.0, table_z_m: 0.10, approach_height_m: 0.035, ..Default::default() };
-        let mount = CameraMount { tilt_deg: -38.0, offset_m: Some([-0.0731, 0.0005, 0.066]), ..Default::default() };
-        let cam = CamModel::assumed(&crate::chain::ArmModel::RebotDevArm, &setup, &mount);
+        let mount = CameraMount { rot_deg: 90.0, tilt_deg: -38.0, offset_m: Some([-0.0731, 0.0005, 0.066]), ..Default::default() };
+        let cam = CamModel::assumed(&crate::chain::ArmModel::REBOT_DEV_ARM, &setup, &mount);
         let pts = envelope(crate::model::ArmConfig::rebot_dm().workspace.as_ref(), &mount, &cam.rec);
         assert_eq!(pts.len(), 18, "TCP, 8 check points, lens centre, 8 body corners");
         let target = [0.28, 0.0, setup.table_z_m + setup.grasp_height_m];

@@ -89,7 +89,9 @@ check('b. FK->IK round trip (200, start +-0.1 rad)', bad === 0, `fail ${bad}, wo
 // ---- c. continuity
 const Rec = VIK.camMount(false, 0);
 const LEVEL = Math.cos(15 / D);
-const START = [0, -1.167, -1.565, 1.435, 0, Math.PI / 2]; // cockpit "inspect" preset, J6 at pi/2
+// URDF model angles (VIK works in them): cockpit "inspect" preset with J6 at its rest angle, motor
+// pi/2 = URDF 0 (B601-DM: URDF J6 = motor J6 - pi/2)
+const START = [0, -1.167, -1.565, 1.435, 0, 0];
 function runPath(name, v, nTicks, vl, wl) {
   let q = START.slice(), T = VIK.level(VIK.fk(q), Rec, LEVEL);
   const r0 = VIK.solve(T, q, { lo, hi });
@@ -118,8 +120,8 @@ runPath('pitch up 25 deg', { x: 0, y: 0, z: 0, p: -1, r: 0 }, Math.ceil((25 / D)
 
 // ---- d. semantics
 const o = { vl: 0.1, wl: 0.8, Rec, levelCos: LEVEL };
-const cRaw = VIK.camAxes(VIK.fk(START), Rec), cZero = VIK.camAxes(VIK.fk([0, 0, 0, 0, 0, Math.PI / 2]), Rec);
-check('d. default mount (camFlip off) level and upright at q6 = pi/2', cRaw.y[2] < 0 && Math.abs(cRaw.x[2]) < 1e-4 && cZero.y[2] < -0.999,
+const cRaw = VIK.camAxes(VIK.fk(START), Rec), cZero = VIK.camAxes(VIK.fk([0, 0, 0, 0, 0, 0]), Rec);
+check('d. default mount (camFlip off) level and upright at the J6 rest angle', cRaw.y[2] < 0 && Math.abs(cRaw.x[2]) < 1e-4 && cZero.y[2] < -0.999,
   `inspect pose: x_cam.Z ${cRaw.x[2].toExponential(1)}, y_cam.Z ${cRaw.y[2].toFixed(4)}; zero pose: y_cam.Z ${cZero.y[2].toFixed(4)}`);
 const T0 = VIK.level(VIK.fk(START), Rec, LEVEL), c0 = VIK.camAxes(T0, Rec);
 const step = (v) => VIK.integrate(T0, { x: 0, y: 0, z: 0, p: 0, r: 0, ...v }, 0.1, o);
@@ -143,7 +145,7 @@ for (const rollDeg of [20, -35, 90, 170, -150]) {
 check('d. auto-level from rolled poses (20..170 deg)', lvWorst < 1e-9 && lvDown, `max |x_cam.Z| ${lvWorst.toExponential(1)}, y_cam.Z <= 0: ${lvDown}`);
 // a pure translation keeps the orientation as it is (the cockpit's look stick moves the wrist joints and may
 // leave a roll; translation must not level it away)
-const Trl = VIK.fk([0, -1.167, -1.565, 1.435, 0.3, Math.PI / 2]), Ttr = VIK.integrate(Trl, { x: 1, y: -0.5, z: 0.3, p: 0, r: 0 }, 0.1, o);
+const Trl = VIK.fk([0, -1.167, -1.565, 1.435, 0.3, 0]), Ttr = VIK.integrate(Trl, { x: 1, y: -0.5, z: 0.3, p: 0, r: 0 }, 0.1, o);
 const rTr = VIK.diff(Trl, Ttr);
 check('d. translation keeps a rolled orientation (no auto-level)', rTr.a < 1e-12 && rTr.d > 0.005, `rot change ${rTr.a.toExponential(1)} rad, moved ${(rTr.d * 1000).toFixed(1)} mm, x_cam.Z ${VIK.camAxes(Trl, Rec).x[2].toFixed(4)}`);
 const Tdown = CALM.make(CALM.mul(CALM.axisR([0, 1, 0], 85 / D), CALM.rotOf(CALM.make([[1, 0, 0], [0, 0, -1], [0, 1, 0]], [0, 0, 0]))), [0.3, 0, 0.2]); // tool axis 85 deg down
@@ -158,7 +160,7 @@ try {
   rn = VIK.solve(CALM.make(CALM.rotOf(T0), [NaN, 0, 0.3]), START, { lo, hi });
 } catch (e) { threw = e.message; }
 check('e. unreachable target rejected', !threw && rf.ok === false && rf.err === 'pose' && rn.ok === false, threw || `far: ok ${rf.ok} err ${rf.err} (${(rf.ep * 1000).toFixed(0)} mm left); NaN: ok ${rn.ok}`);
-const Tlim = VIK.fk([0, -1.167, -1.565, 1.435, 2.3, Math.PI / 2]); // J5 beyond its limit
+const Tlim = VIK.fk([0, -1.167, -1.565, 1.435, 2.3, 0]); // J5 beyond its limit
 const rl = VIK.solve(Tlim, START, { lo, hi });
 check('e. target needing J5 past its limit rejected', rl.ok === false && rl.q[4] <= hi[4] + 1e-12, `ok ${rl.ok}, q5 ${rl.q[4].toFixed(3)} <= ${hi[4].toFixed(3)}`);
 

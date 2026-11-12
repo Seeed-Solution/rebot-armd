@@ -8,7 +8,8 @@
 //!
 //! Joint mapping: URDF angle = `sign * armd angle + offset_rad`.
 //!
-//! The built-in B601-DM model (`kinematics.rs`, `gravity.rs`) stays the default; this module
+//! The built-in B601-DM model (`kinematics.rs`, `gravity.rs`) stays the default ([`ArmModel`]
+//! maps motor to model angles there with the profile's `model_offsets_rad`); this module
 //! is used when the profile names a URDF (`kinematics` / `gravity_model` = `Urdf`).
 //! `tests/test_chain.rs` checks that a chain built from the DM URDF reproduces the built-in
 //! model.
@@ -67,8 +68,8 @@ pub struct KinematicChain {
     pre_p: Vec<Vec3>,
     /// Unit joint axis in the joint frame.
     axis: Vec<Vec3>,
-    sign: Vec<f64>,
-    offset: Vec<f64>,
+    pub(crate) sign: Vec<f64>,
+    pub(crate) offset: Vec<f64>,
     /// Last joint's frame -> tip_link.
     tip: Tf,
     /// Lumped mass (kg) and centre of mass of each segment; segment 0 is fixed to the base,
@@ -347,28 +348,56 @@ impl KinematicChain {
     }
 }
 
-/// The arm model the profile selects: the built-in B601-DM code or a URDF chain.
-#[derive(Debug, Clone, Default)]
+/// Mapping of one armd joint to its model (URDF) joint: model angle = `sign * armd angle +
+/// offset_rad` (the [`ChainJointSpec`] convention). Published in the observation schema as
+/// `model_joint_map`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct JointMap {
+    pub sign: f64,
+    pub offset_rad: f64,
+}
+
+/// The arm model the profile selects: the built-in B601-DM code with its motor -> model
+/// offsets (model angle = motor angle + offset, profile `model_offsets_rad`, default
+/// [`k::B601DM_MODEL_OFFSETS_RAD`]) or a URDF chain (sign / offset per joint in the chain spec).
+#[derive(Debug, Clone)]
 pub enum ArmModel {
-    #[default]
-    RebotDevArm,
+    RebotDevArm([f64; 6]),
     Chain(Arc<KinematicChain>),
 }
 
+impl Default for ArmModel {
+    fn default() -> Self { Self::REBOT_DEV_ARM }
+}
+
 impl ArmModel {
+    /// The built-in model with the measured B601-DM offsets.
+    pub const REBOT_DEV_ARM: Self = Self::RebotDevArm(k::B601DM_MODEL_OFFSETS_RAD);
+
+    /// armd -> model mapping of each arm joint.
+    pub fn joint_map(&self) -> Vec<JointMap> {
+        match self {
+            Self::RebotDevArm(off) => off.iter().map(|o| JointMap { sign: 1.0, offset_rad: *o }).collect(),
+            Self::Chain(c) => c.sign.iter().zip(&c.offset).map(|(s, o)| JointMap { sign: *s, offset_rad: *o }).collect(),
+        }
+    }
+
+    /// Model angles of the built-in model for armd angles `q` (at least 6 entries).
+    fn builtin_q(off: &[f64; 6], q: &[f64]) -> [f64; 6] { std::array::from_fn(|i| q[i] + off[i]) }
+
     /// Number of arm joints (armd joints `0..arm_dof`).
     pub fn arm_dof(&self) -> usize {
-        match self { Self::RebotDevArm => 6, Self::Chain(c) => c.dof() }
+        match self { Self::RebotDevArm(_) => 6, Self::Chain(c) => c.dof() }
     }
 
     pub fn chain(&self) -> Option<&KinematicChain> {
-        match self { Self::RebotDevArm => None, Self::Chain(c) => Some(c) }
+        match self { Self::RebotDevArm(_) => None, Self::Chain(c) => Some(c) }
     }
 
     /// Tip pose for armd angles `q` (at least `arm_dof` entries).
     pub fn fk(&self, q: &[f64]) -> Pose {
         match self {
-            Self::RebotDevArm => k::fk(&std::array::from_fn(|i| q[i])),
+            Self::RebotDevArm(off) => k::fk(&Self::builtin_q(off, q)),
             Self::Chain(c) => c.fk(q),
         }
     }
@@ -386,7 +415,11 @@ impl ArmModel {
     /// `ok: false`.
     pub fn solve_dls(&self, goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], w: f64) -> IkResult {
         match self {
-            Self::RebotDevArm => k::solve_dls(goal, q0, lo, hi, w),
+            Self::RebotDevArm(off) => {
+                let m = |q: &[f64; 6]| Self::builtin_q(off, q);
+                let r = k::solve_dls(goal, &m(q0), &m(lo), &m(hi), w);
+                IkResult { q: std::array::from_fn(|i| r.q[i] - off[i]), ..r }
+            }
             Self::Chain(c) if c.dof() == 6 => {
                 let r = c.solve_dls(goal, q0, lo, hi, w, PAR.iters);
                 IkResult { ok: r.ok, q: std::array::from_fn(|i| r.q[i]), ep: r.ep, er: r.er, iterations: r.iterations }
@@ -406,8 +439,9 @@ impl ArmModel {
         }
         let mut out = [0.0f32; MAX_CHAIN_JOINTS];
         match self {
-            Self::RebotDevArm => {
-                let tau = crate::gravity::compute_gravity_torques(&std::array::from_fn(|i| q[i]))?;
+            Self::RebotDevArm(off) => {
+                // offsets are f64; the model angle in f32 loses < 1e-7 rad
+                let tau = crate::gravity::compute_gravity_torques(&std::array::from_fn(|i| (f64::from(q[i]) + off[i]) as f32))?;
                 out[..6].copy_from_slice(&tau);
             }
             Self::Chain(c) => {
@@ -426,7 +460,7 @@ impl ArmModel {
     pub fn joint_reach(&self, max_offset: f64) -> [f64; MAX_CHAIN_JOINTS] {
         let n = self.arm_dof();
         let (origins, end): (Vec<Vec3>, Vec3) = match self {
-            Self::RebotDevArm => { let f = k::frames(&[0.0; 6]); (f.origins.to_vec(), f.end.p) }
+            Self::RebotDevArm(off) => { let f = k::frames(off); (f.origins.to_vec(), f.end.p) }
             Self::Chain(c) => { let f = c.frames(&[0.0; MAX_CHAIN_JOINTS]); (f.origins[..n].to_vec(), f.end.p) }
         };
         let mut reach = [0.0; MAX_CHAIN_JOINTS];
@@ -439,14 +473,15 @@ impl ArmModel {
     }
 
     pub fn shoulder_rz(&self) -> [f64; 2] {
-        match self { Self::RebotDevArm => k::SHOULDER_RZ, Self::Chain(c) => c.shoulder_rz() }
+        match self { Self::RebotDevArm(_) => k::SHOULDER_RZ, Self::Chain(c) => c.shoulder_rz() }
     }
 
-    /// Camera mount R_tip_cam (`kinematics::cam_mount`): for a chain, the wrist axis is the
-    /// second-to-last joint seen at last joint = pi/2.
+    /// Camera mount R_tip_cam (`kinematics::cam_mount`): the wrist axis (second-to-last joint)
+    /// seen in the tip frame with the last joint at armd angle pi/2 (the B601-DM rest angle of
+    /// J6), the other joints at armd 0.
     pub fn cam_mount(&self, flip: bool, rot_deg: f64, tilt_deg: f64) -> Mat3 {
         match self {
-            Self::RebotDevArm => k::cam_mount(flip, rot_deg, tilt_deg),
+            Self::RebotDevArm(off) => k::cam_mount_with(off, flip, rot_deg, tilt_deg),
             Self::Chain(c) => {
                 let n = c.dof();
                 let mut q = [0.0; MAX_CHAIN_JOINTS];
@@ -460,12 +495,9 @@ impl ArmModel {
 
     /// Workspace excess for armd joint positions `q` (`kinematics::workspace_violation`).
     pub fn workspace_violation(&self, q: &[f32], ws: &crate::model::WorkspacePolicy, cam: &crate::model::CameraMount) -> k::Violation {
-        match self {
-            Self::RebotDevArm => k::workspace_violation(q, ws, cam),
-            Self::Chain(_) => match self.fk_f32(q) {
-                Some(pose) => k::workspace_violation_pose_at(&pose, ws, cam, self.shoulder_rz()),
-                None => k::Violation::invalid(),
-            },
+        match self.fk_f32(q) {
+            Some(pose) => k::workspace_violation_pose_at(&pose, ws, cam, self.shoulder_rz()),
+            None => k::Violation::invalid(),
         }
     }
 }

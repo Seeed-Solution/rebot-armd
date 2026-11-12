@@ -10,13 +10,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use armd::grasp::{self, BoxFuture, CamModel, Detection, DetectionFrame, DetectionSource, GraspDeps, GraspSetup, VisionMode};
+use armd::chain::ArmModel;
 use armd::kinematics::{self, Pose, Vec3};
 use armd::model::CameraMount;
 use armd::{ArmConfig, ArmSupervisor};
 use serde_json::{json, Value};
 
 const DT: f64 = 0.02;
+/// Motor angles of the cockpit inspect preset, J6 at its rest angle.
 const INSPECT: [f64; 6] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f64::consts::FRAC_PI_2];
+/// The profile's arm model: motor angles -> FK / IK (B601-DM offsets).
+const ARM: ArmModel = ArmModel::REBOT_DEV_ARM;
 /// J7 where the jaws touch the test object (closed = 0, open = -5.7).
 const OBJECT_J7: f32 = -1.5;
 
@@ -42,6 +46,8 @@ struct SimCamera {
     next_frame_calls: AtomicU64,
     /// The object moved by this much (m, base x, y) since the rig was built.
     shift: Mutex<[f64; 2]>,
+    /// The object is turned 90 deg about world z (long side along world y).
+    turned: AtomicBool,
     /// Every frame request fails (detector error).
     failing: AtomicBool,
     /// Frames keep arriving but were captured 30 s ago (a stalled camera behind a live API).
@@ -66,7 +72,7 @@ impl SimCamera {
         tokio::time::sleep(Duration::from_millis(15)).await;
         let captured = Instant::now();
         let q = self.sup.inner().read().await.measured_positions.clone();
-        let pose = kinematics::fk(&kinematics::q6(&q));
+        let pose = ARM.fk(&kinematics::q6(&q));
         let mut detections = vec![Detection { label: "person".into(), score: 0.5, box_norm: [0.0, 0.0, 0.08, 0.1] }];
         if self.visible.load(Ordering::SeqCst) {
             if let Some(b) = self.project_box(&pose) { detections.push(Detection { label: self.label.clone(), score: 0.9, box_norm: b }); }
@@ -82,7 +88,8 @@ impl SimCamera {
     fn project_box(&self, pose: &Pose) -> Option<[f64; 4]> {
         let o = &self.object;
         let sh = *self.shift.lock().unwrap();
-        let o = Object { centre: [o.centre[0] + sh[0], o.centre[1] + sh[1], o.centre[2]], half: o.half, height: o.height };
+        let half = if self.turned.load(Ordering::SeqCst) { [o.half[1], o.half[0]] } else { o.half };
+        let o = Object { centre: [o.centre[0] + sh[0], o.centre[1] + sh[1], o.centre[2]], half, height: o.height };
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for sx in [-1.0, 1.0] { for sy in [-1.0, 1.0] { for z in [o.centre[2], o.centre[2] + o.height] {
             let p = self.cam.project(pose, &[o.centre[0] + sx * o.half[0], o.centre[1] + sy * o.half[1], z])?;
@@ -150,7 +157,7 @@ impl DetectionSource for SimCamera {
 struct Truth { tilt_deg: f64, rot_deg: f64, fx: f64, fy: f64, cx_off: f64, cy_off: f64, offset: Vec3, known_offset: bool }
 
 impl Truth {
-    fn same() -> Self { Self { tilt_deg: 0.0, rot_deg: 0.0, fx: 600.0, fy: 600.0, cx_off: 0.0, cy_off: 0.0, offset: [-0.06, 0.04, 0.0], known_offset: true } }
+    fn same() -> Self { Self { tilt_deg: 0.0, rot_deg: 0.0, fx: 600.0, fy: 600.0, cx_off: 0.0, cy_off: 0.0, offset: [-0.06, 0.0, 0.04], known_offset: true } }
     fn cam(&self, setup: &GraspSetup) -> CamModel {
         CamModel {
             rec: kinematics::cam_mount(false, self.rot_deg, setup.camera_tilt_deg + self.tilt_deg),
@@ -164,8 +171,8 @@ impl Truth {
 struct Rig { sup: Arc<ArmSupervisor>, sim: Arc<SimCamera>, object: Vec3, hold: Arc<AtomicBool> }
 
 fn look_down_start(tilt_from_vertical_deg: f64, z: f64) -> ([f32; 7], Pose) {
-    let r0 = grasp::look_down(&kinematics::fk(&INSPECT).r);
-    let p0 = kinematics::fk(&INSPECT).p;
+    let r0 = grasp::look_down(&ARM.fk(&INSPECT).r);
+    let p0 = ARM.fk(&INSPECT).p;
     let radial = kinematics::unit(&[p0[0], p0[1], 0.0]);
     let axis = [-radial[1], radial[0], 0.0];
     let r = kinematics::mat_mul(&kinematics::axis_r(&axis, tilt_from_vertical_deg.to_radians()), &r0);
@@ -174,10 +181,10 @@ fn look_down_start(tilt_from_vertical_deg: f64, z: f64) -> ([f32; 7], Pose) {
 
 /// Start with the tool pitched `fraction` of the way from vertical to camera-down (mount `rec`).
 fn pitched_start(rec: &kinematics::Mat3, fraction: f64, z: f64) -> ([f32; 7], Pose) {
-    let r0 = grasp::look_down(&kinematics::fk(&INSPECT).r);
+    let r0 = grasp::look_down(&ARM.fk(&INSPECT).r);
     let w = kinematics::log_v(&kinematics::mul_t(&grasp::camera_down(&r0, rec), &r0));
     let r = kinematics::mat_mul(&kinematics::exp_r(&w.map(|v| v * fraction)), &r0);
-    let p0 = kinematics::fk(&INSPECT).p;
+    let p0 = ARM.fk(&INSPECT).p;
     solve_start(Pose::new(r, [p0[0], p0[1], z]))
 }
 
@@ -186,11 +193,11 @@ fn solve_start(goal: Pose) -> ([f32; 7], Pose) {
     let hi = [3.1, 2.05, 2.6, 3.1, 2.05, 6.2];
     let mut q = INSPECT;
     for _ in 0..20 {
-        let sol = kinematics::solve_dls(&goal, &q, &lo, &hi, kinematics::PAR.w);
+        let sol = ARM.solve_dls(&goal, &q, &lo, &hi, kinematics::PAR.w);
         q = sol.q;
         if sol.ok { break; }
     }
-    let pose = kinematics::fk(&q);
+    let pose = ARM.fk(&q);
     assert!(kinematics::norm(&kinematics::sub(&pose.p, &goal.p)) < 2e-3, "start pose reachable");
     (std::array::from_fn(|i| if i < 6 { q[i] as f32 } else { 0.0 }), pose)
 }
@@ -238,7 +245,7 @@ async fn rig_driven(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start: 
         visible: AtomicBool::new(true), enabled: AtomicBool::new(false), frame: AtomicU64::new(0), inference_calls: Mutex::new(Vec::new()),
         vision: Mutex::new(None), mode_calls: Mutex::new(Vec::new()), no_yolo: AtomicBool::new(false),
         per_request: AtomicBool::new(false), trigger_calls: Mutex::new(Vec::new()), next_frame_calls: AtomicU64::new(0),
-        shift: Mutex::new([0.0; 2]), failing: AtomicBool::new(false), stale: AtomicBool::new(false), delayed: AtomicBool::new(false),
+        shift: Mutex::new([0.0; 2]), turned: AtomicBool::new(false), failing: AtomicBool::new(false), stale: AtomicBool::new(false), delayed: AtomicBool::new(false),
     });
     let hold = Arc::new(AtomicBool::new(true));
     let (ticker, hold_t) = (sup.clone(), hold.clone());
@@ -269,7 +276,7 @@ fn calibrate_grip(rig: &Rig, setup: &GraspSetup, start_r: &kinematics::Mat3) -> 
     grasp::box_centre(&b)
 }
 
-async fn start_pose(rig: &Rig) -> Pose { kinematics::fk(&kinematics::q6(&rig.sup.inner().read().await.commanded_positions)) }
+async fn start_pose(rig: &Rig) -> Pose { ARM.fk(&kinematics::q6(&rig.sup.inner().read().await.commanded_positions)) }
 
 /// The box the user taps: the current simulated detection of the object.
 async fn tap(rig: &Rig) -> Value {
@@ -309,7 +316,7 @@ async fn wait_phase(sup: &ArmSupervisor, id: u64, phase: &str, needs_motion: Opt
 
 fn xy_err(p: &Vec3, o: &Vec3) -> f64 { (p[0] - o[0]).hypot(p[1] - o[1]) }
 
-struct Outcome { status: armd::motion::ActionStatus, centred_err_m: f64, final_pose: Pose }
+struct Outcome { status: armd::motion::ActionStatus, centred_err_m: f64, final_pose: Pose, turned: bool }
 
 async fn run_grasp(rig: &Rig) -> Outcome {
     let body = tap(rig).await;
@@ -323,13 +330,13 @@ async fn run_grasp(rig: &Rig) -> Outcome {
         if !seen_align && matches!(a.phase.as_deref(), Some("align" | "descend")) {
             seen_align = true;
             if let Ok(inner) = sup.inner().try_read() {
-                centred_err_m = xy_err(&kinematics::fk(&kinematics::q6(&inner.commanded_positions)).p, &object);
+                centred_err_m = xy_err(&ARM.fk(&kinematics::q6(&inner.commanded_positions)).p, &object);
             }
         }
     }).await;
     let final_pose = start_pose(rig).await;
     if centred_err_m.is_nan() { centred_err_m = xy_err(&final_pose.p, &rig.object); }
-    Outcome { status, centred_err_m, final_pose }
+    Outcome { status, centred_err_m, final_pose, turned: rig.sim.turned.load(Ordering::SeqCst) }
 }
 
 fn assert_holding_done(o: &Outcome, setup: &GraspSetup, object: &Vec3, max_err_m: f64) {
@@ -342,6 +349,44 @@ fn assert_holding_done(o: &Outcome, setup: &GraspSetup, object: &Vec3, max_err_m
     assert!(err <= max_err_m, "final TCP xy error {:.2} mm", err * 1000.0);
     assert!((o.final_pose.p[2] - (setup.table_z_m + setup.lift_height_m)).abs() < 2e-3, "lifted: z {}", o.final_pose.p[2]);
     assert!(kinematics::column(&o.final_pose.r, 0)[2] < -0.99, "tool axis vertical");
+    assert_jaws_across_short_side(&o.final_pose, o.turned);
+}
+
+/// The jaws (end_link y) close along the object's short side in the world: world y for the
+/// object as placed (50 x 30 mm along x / y), world x when it is turned.
+fn assert_jaws_across_short_side(pose: &Pose, turned: bool) {
+    let jaw = kinematics::column(&pose.r, 1);
+    let along = if turned { jaw[0] } else { jaw[1] };
+    assert!(along.abs() > 0.99, "jaw axis {jaw:?} not across the short side (turned {turned})");
+}
+
+/// J6 alignment in world terms: with the object as placed and turned by 90 deg, the grasp
+/// ends with the jaws across the short side; the align phase runs only for the orientation
+/// where the start heading has them across the long side.
+#[tokio::test]
+async fn grasp_align_closes_the_jaws_across_the_short_side() {
+    let setup = GraspSetup { camera_tilt_deg: -20.0, ..GraspSetup::default() };
+    let mut aligned = Vec::new();
+    for turned in [false, true] {
+        let rig = rig(setup.clone(), Truth::same(), 0.0, [0.0, 0.0], false).await;
+        rig.sim.turned.store(turned, Ordering::SeqCst);
+        let start = start_pose(&rig).await;
+        let start_jaw = kinematics::column(&start.r, 1);
+        let mut s = setup.clone();
+        s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start.r);
+        rig.sup.inner().write().await.set_grasp_setup(s.clone());
+        let body = tap(&rig).await;
+        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &body).await.expect("grasp accepted");
+        let mut saw_align = false;
+        let status = wait_done(&rig.sup, id, 40.0, |a| { saw_align |= a.phase.as_deref() == Some("align") && a.is_running(); }).await;
+        let final_pose = start_pose(&rig).await;
+        let j6 = rig.sup.inner().read().await.commanded_positions[5];
+        println!("turned {turned}: {} {:?}, start jaw {start_jaw:?}, final jaw {:?}, J6 motor {j6:.3}", status.state, status.code, kinematics::column(&final_pose.r, 1));
+        assert_eq!((status.state.as_str(), status.holding), ("done", Some(true)), "{status:?}");
+        assert_jaws_across_short_side(&final_pose, turned);
+        aligned.push(saw_align);
+    }
+    assert_ne!(aligned[0], aligned[1], "exactly one orientation needs the J6 turn: {aligned:?}");
 }
 
 #[tokio::test]
@@ -369,7 +414,7 @@ async fn grasp_converges_with_wrong_intrinsics_and_mount() {
     // tilt -11, rot 5 deg, camera 6 cm behind and 4 cm above the tip
     let setup = GraspSetup { camera_tilt_deg: -8.0, ..GraspSetup::default() };
     for (start_tilt, offset) in [(0.0, [0.02, 0.025]), (20.0, [-0.02, 0.0])] {
-        let truth = Truth { tilt_deg: -3.0, rot_deg: 5.0, fx: 690.0, fy: 560.0, cx_off: 14.0, cy_off: -9.0, offset: [-0.06, 0.04, 0.0], known_offset: false };
+        let truth = Truth { tilt_deg: -3.0, rot_deg: 5.0, fx: 690.0, fy: 560.0, cx_off: 14.0, cy_off: -9.0, offset: [-0.06, 0.0, 0.04], known_offset: false };
         let rig = rig(setup.clone(), truth, start_tilt, offset, false).await;
         let start_r = start_pose(&rig).await.r;
         let mut s = setup.clone();
@@ -781,15 +826,15 @@ fn camera_tilt_change_is_busy_while_a_macro_runs() {
     assert_eq!(inner.config.camera_mount.tilt_deg, 25.0);
 }
 
-// ---- camera-down acquisition (v8 holder: rot 90, tilt -38) ----
+// ---- camera-down acquisition (v8 holder: rot 0, tilt -38) ----
 
 const V8_OFFSET: Vec3 = [-0.0731, 0.0005, 0.066];
 
 /// v8 setup, truth = controller, and a start with the tool pitched half way to camera-down.
 fn v8_setup() -> (GraspSetup, Truth, ([f32; 7], Pose)) {
     let setup = GraspSetup { camera_tilt_deg: -38.0, ..GraspSetup::default() };
-    let truth = Truth { rot_deg: 90.0, offset: V8_OFFSET, ..Truth::same() };
-    (setup, truth, pitched_start(&kinematics::cam_mount(false, 90.0, -38.0), 0.5, 0.22))
+    let truth = Truth { rot_deg: 0.0, offset: V8_OFFSET, ..Truth::same() };
+    (setup, truth, pitched_start(&kinematics::cam_mount(false, 0.0, -38.0), 0.5, 0.22))
 }
 
 /// Camera-down grasps with the v8 mount: approach and centre with the optical axis down, then
@@ -799,13 +844,13 @@ async fn camera_down_grasp_with_the_v8_mount() {
     let setup = GraspSetup { camera_tilt_deg: -38.0, ..GraspSetup::default() };
     // controller = truth, then truth off by 2 deg tilt, 1 deg rot and fx / fy 5 %
     let cases = [
-        ("same", Truth { tilt_deg: 0.0, rot_deg: 90.0, fx: 600.0, fy: 600.0, cx_off: 0.0, cy_off: 0.0, offset: V8_OFFSET, known_offset: true }, [0.0, 0.0], 0.004),
-        ("same, offset", Truth { tilt_deg: 0.0, rot_deg: 90.0, fx: 600.0, fy: 600.0, cx_off: 0.0, cy_off: 0.0, offset: V8_OFFSET, known_offset: true }, [0.03, -0.02], 0.004),
-        ("perturbed", Truth { tilt_deg: -2.0, rot_deg: 91.0, fx: 630.0, fy: 570.0, cx_off: 6.0, cy_off: -4.0, offset: V8_OFFSET, known_offset: true }, [-0.02, 0.025], 0.012),
+        ("same", Truth { tilt_deg: 0.0, rot_deg: 0.0, fx: 600.0, fy: 600.0, cx_off: 0.0, cy_off: 0.0, offset: V8_OFFSET, known_offset: true }, [0.0, 0.0], 0.004),
+        ("same, offset", Truth { tilt_deg: 0.0, rot_deg: 0.0, fx: 600.0, fy: 600.0, cx_off: 0.0, cy_off: 0.0, offset: V8_OFFSET, known_offset: true }, [0.03, -0.02], 0.004),
+        ("perturbed", Truth { tilt_deg: -2.0, rot_deg: 1.0, fx: 630.0, fy: 570.0, cx_off: 6.0, cy_off: -4.0, offset: V8_OFFSET, known_offset: true }, [-0.02, 0.025], 0.012),
     ];
     for (name, truth, offset, max_err) in cases {
         // the operator has the tool pitched half way, so the table below is in view
-        let rig = rig_mounted(setup.clone(), truth, 90.0, v8_setup().2, offset, false).await;
+        let rig = rig_mounted(setup.clone(), truth, 0.0, v8_setup().2, offset, false).await;
         let body = tap(&rig).await;
         let (id, duration) = grasp::start(&rig.sup, rig.sim.clone(), &body).await.expect("grasp accepted");
         let mut phases: Vec<String> = Vec::new();
@@ -818,7 +863,7 @@ async fn camera_down_grasp_with_the_v8_mount() {
                 // optical axis at the end of the centring (first look at the transition phase)
                 if p == "transition" {
                     if let Ok(inner) = sup.inner().try_read() {
-                        let pose = kinematics::fk(&kinematics::q6(&inner.commanded_positions));
+                        let pose = ARM.fk(&kinematics::q6(&inner.commanded_positions));
                         down_err = (kinematics::column(&cam.rotation(&pose), 2)[2] + 1.0).abs();
                     }
                 }
@@ -830,11 +875,13 @@ async fn camera_down_grasp_with_the_v8_mount() {
         println!("v8 {name} offset {offset:?}: {} {:?}, iterations {:?}, error {:.2} px, final offset {:?} px, final xy error {:.2} mm, \
                   expected {duration:.1} s, phases {phases:?}",
             status.state, status.code, status.iteration, status.error_px.unwrap_or(f32::NAN), status.final_offset_px, err * 1000.0);
-        let o = Outcome { status, centred_err_m: f64::NAN, final_pose };
+        let o = Outcome { status, centred_err_m: f64::NAN, final_pose, turned: false };
         assert_holding_done(&o, &setup, &rig.object, max_err);
-        let order: Vec<&str> = ["approach", "centring", "transition", "align", "descend", "close", "lift", "done"].into_iter()
+        // align runs only when the jaws would close across the long side (assert_holding_done
+        // checks the final jaw direction)
+        let order: Vec<&str> = ["approach", "centring", "transition", "descend", "close", "lift", "done"].into_iter()
             .filter(|p| phases.iter().any(|q| q == p)).collect();
-        assert_eq!(order, ["approach", "centring", "transition", "align", "descend", "close", "lift", "done"], "{phases:?}");
+        assert_eq!(order, ["approach", "centring", "transition", "descend", "close", "lift", "done"], "{phases:?}");
         let pos = |p: &str| phases.iter().position(|q| q == p).unwrap();
         assert!(pos("centring") < pos("transition") && pos("transition") < pos("descend"), "{phases:?}");
         if name.starts_with("same") { assert!(down_err < 1e-3, "optical axis vertical while centring: {down_err}"); }
@@ -873,7 +920,7 @@ async fn camera_down_on_without_lens_centre_is_rejected() {
 
 /// Lowest base-frame z of the TCP, the workspace check points and the lens centre at `q`.
 fn envelope_min_z(config: &ArmConfig, q: &[f32]) -> f64 {
-    let pose = kinematics::fk(&kinematics::q6(q));
+    let pose = ARM.fk(&kinematics::q6(q));
     let mut pts: Vec<Vec3> = vec![[0.0; 3]];
     pts.extend(config.workspace.iter().flat_map(|w| w.check_points_end_m.iter().map(|p| p.map(f64::from))));
     pts.extend(config.camera_mount.offset_m.map(|o| o.map(f64::from)));
@@ -887,11 +934,12 @@ fn envelope_min_z(config: &ArmConfig, q: &[f32]) -> f64 {
 #[tokio::test]
 async fn camera_down_keeps_the_pitched_envelope_above_a_raised_table() {
     let setup = GraspSetup { camera_tilt_deg: -38.0, table_z_m: 0.10, grasp_height_m: 0.015, approach_height_m: 0.035, ..GraspSetup::default() };
-    // rot 0: the tilt pitches the tool about the axis along which the check points are
-    // 92.5 mm off the tool axis (v8's rot 90 pitches about the 34.7 mm one)
-    let truth = Truth { rot_deg: 0.0, offset: V8_OFFSET, ..Truth::same() };
-    let start = pitched_start(&kinematics::cam_mount(false, 0.0, -38.0), 0.5, 0.30);
-    let rig = rig_mounted(setup.clone(), truth, 0.0, start, [0.0, 0.0], false).await;
+    // rot 90: the tilt pitches the tool about end_link z, the axis along which the check points
+    // are 92.5 mm off the tool axis (v8's rot 0 pitches about the jaw axis, end_link y, where
+    // they are 34.7 mm off)
+    let truth = Truth { rot_deg: 90.0, offset: V8_OFFSET, ..Truth::same() };
+    let start = pitched_start(&kinematics::cam_mount(false, 90.0, -38.0), 0.5, 0.30);
+    let rig = rig_mounted(setup.clone(), truth, 90.0, start, [0.0, 0.0], false).await;
     let config = rig.sup.inner().read().await.config.clone();
     let body = tap(&rig).await;
     let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &body).await.expect("grasp accepted");
@@ -918,7 +966,11 @@ async fn v8_recheck_rig() -> (Rig, GraspSetup) {
     let (setup, truth, start) = v8_setup();
     let setup = GraspSetup { approach_height_m: 0.06, ..setup };
     let start_r = start.1.r;
-    let rig = rig_mounted(setup.clone(), truth, 90.0, start, [0.01, 0.0], false).await;
+    let rig = rig_mounted(setup.clone(), truth, 0.0, start, [0.01, 0.0], false).await;
+    // long side along the camera's offset direction: the box centre then stays within
+    // recheck_tol_px of the projected target at this 0.06 m approach (turned the other way
+    // the 3D box's image centre is ~54 px from it)
+    rig.sim.turned.store(true, Ordering::SeqCst);
     let mut s = setup.clone();
     s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
     rig.sup.inner().write().await.set_grasp_setup(s.clone());
@@ -935,7 +987,7 @@ async fn camera_down_recheck_failures_end_the_grasp_before_descent() {
         wait_phase(&rig.sup, id, "transition", Some(true)).await;
         match case {
             "lost" => rig.sim.visible.store(false, Ordering::SeqCst),
-            "displaced" => *rig.sim.shift.lock().unwrap() = [0.02, 0.0],
+            "displaced" => *rig.sim.shift.lock().unwrap() = [0.0, 0.02],
             _ => rig.sim.failing.store(true, Ordering::SeqCst),
         }
         let mut phases = Vec::new();
@@ -977,7 +1029,7 @@ async fn stale_frames_end_the_observation_as_target_lost() {
 #[tokio::test]
 async fn camera_down_stop_during_the_transition() {
     let (setup, truth, start) = v8_setup();
-    let rig = rig_mounted(setup, truth, 90.0, start, [0.0, 0.0], false).await;
+    let rig = rig_mounted(setup, truth, 0.0, start, [0.0, 0.0], false).await;
     let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
     wait_phase(&rig.sup, id, "transition", Some(true)).await;
     {
@@ -994,7 +1046,7 @@ async fn camera_down_stop_during_the_transition() {
 #[tokio::test]
 async fn camera_down_lease_loss_during_the_transition() {
     let (setup, truth, start) = v8_setup();
-    let rig = rig_mounted(setup, truth, 90.0, start, [0.0, 0.0], true).await;
+    let rig = rig_mounted(setup, truth, 0.0, start, [0.0, 0.0], true).await;
     let mut w = ws_rig_on(rig, None).await;
     let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", tap(&w.rig).await).await;
     let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("ack {ack}"));
@@ -1022,7 +1074,7 @@ async fn camera_down_lease_loss_during_the_transition() {
 async fn camera_down_collision_during_the_transition_holds() {
     let (setup, truth, start) = v8_setup();
     let arm = common::TestArm::new();
-    let rig = rig_driven(setup, truth, 90.0, start, [0.0, 0.0], false, Some(arm.clone())).await;
+    let rig = rig_driven(setup, truth, 0.0, start, [0.0, 0.0], false, Some(arm.clone())).await;
     let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
     wait_phase(&rig.sup, id, "transition", Some(true)).await;
     arm.set_residual(1, -20.0);
@@ -1075,7 +1127,8 @@ async fn camera_down_rejects_a_camera_body_that_would_reach_the_table() {
 async fn look_down_descent_that_would_bring_the_camera_to_the_table_fails() {
     let setup = GraspSetup::default();
     for (ahead_m, ok) in [(0.009, true), (0.0145, false)] {
-        let truth = Truth { offset: [ahead_m, 0.0, 0.03], ..Truth::same() };
+        // lens 30 mm beside the tool axis along the jaws (along x_cam, the wide image axis)
+        let truth = Truth { offset: [ahead_m, -0.03, 0.0], ..Truth::same() };
         let rig = rig(setup.clone(), truth, 0.0, [0.0, 0.0], false).await;
         let start_r = start_pose(&rig).await.r;
         let mut s = setup.clone();
@@ -1132,7 +1185,7 @@ async fn delayed_detector_recovers_from_stale_frames() {
                 a.state, a.code, a.message, a.iteration, a.final_offset_px);
             assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{mode} {phase}: {a:?}");
             assert!(a.final_offset_px.is_some(), "{mode} {phase}: re-check ran");
-            let o = Outcome { status: a, centred_err_m: f64::NAN, final_pose: start_pose(&rig).await };
+            let o = Outcome { status: a, centred_err_m: f64::NAN, final_pose: start_pose(&rig).await, turned: rig.sim.turned.load(Ordering::SeqCst) };
             assert_holding_done(&o, &s, &rig.object, 0.004);
         }
     }

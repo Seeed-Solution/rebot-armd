@@ -10,7 +10,9 @@ fn dm_chain_json() -> serde_json::Value {
     serde_json::json!({
         "base_link": "base_link",
         "tip_link": "end_link",
-        "joints": (1..=6).map(|i| serde_json::json!({"urdf_joint": format!("joint{i}")})).collect::<Vec<_>>(),
+        // the B601-DM motor -> URDF offsets (J6: URDF = motor - pi/2), as the built-in model
+        "joints": armd::kinematics::B601DM_MODEL_OFFSETS_RAD.iter().enumerate()
+            .map(|(i, off)| serde_json::json!({"urdf_joint": format!("joint{}", i + 1), "offset_rad": off})).collect::<Vec<_>>(),
     })
 }
 
@@ -23,6 +25,7 @@ fn dm_as_urdf() -> ArmConfig {
     o.insert("urdf".into(), DM_URDF.into());
     o.insert("urdf_sha256".into(), armd::gravity::EXPECTED_URDF_SHA256.into());
     o.insert("chain".into(), dm_chain_json());
+    o.remove("model_offsets_rad");
     let mut c: ArmConfig = serde_json::from_value(v).unwrap();
     c.load_arm_model(None).unwrap();
     c.validate().unwrap();
@@ -74,6 +77,12 @@ fn urdf_profile_errors() {
     let mut c = ArmConfig::rebot_dm();
     c.urdf = Some(DM_URDF.into());
     assert!(c.load_arm_model(None).is_err());
+
+    // the built-in offsets field is refused with a URDF chain (offset_rad per chain joint)
+    let mut c = dm_as_urdf();
+    c.model_offsets_rad = Some(vec![0.0; 6]);
+    assert!(c.validate().unwrap_err().contains("model_offsets_rad"));
+    assert!(c.load_arm_model(None).unwrap_err().contains("model_offsets_rad"));
 
     let mut c = dm_as_urdf();
     c.gripper_joint = Some(3);

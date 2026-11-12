@@ -189,6 +189,10 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
         Loaded::Loaded(list) => {
             tracing::info!("{} named poses loaded from {}", list.poses.len(), path.display());
             inner.poses.list = list;
+            // a saved TCP follows from the positions; files saved under another kinematic model
+            // (before the J6 offset, 2026-11-12) carry a stale one
+            let tcps: Vec<_> = inner.poses.list.poses.iter().map(|p| p.tcp.as_ref().and(inner.pose_tcp(&p.positions))).collect();
+            for (p, tcp) in inner.poses.list.poses.iter_mut().zip(tcps) { if tcp.is_some() { p.tcp = tcp; } }
         }
         Loaded::Missing => {}
         Loaded::Invalid(e) => tracing::warn!("Ignoring poses file: {e}; starting with no poses"),

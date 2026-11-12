@@ -37,11 +37,11 @@ The existing `/api/v1/motion/jog`, `/motion/home`, `/motion/unload` commands and
 | `/api/v1/action/replay` | `{"episode":str, "speed":0.5\|1.0? (default 0.5), "gripper":bool? (default true), "tag"?}` — see [Replay](#replay--回放) |
 
 - Poses are the end_link pose in base_link, metres and radians (URDF `assets/reBot-DevArm_gripper.urdf`; end_link x is the tool axis). `rpy` is URDF fixed-axis R = Rz(yaw)·Ry(pitch)·Rx(roll). `orientation: null` keeps the current orientation.
-- Motor angle = URDF model angle for J1..J6 (the cockpit's `?iksign` / `?ikoff` overrides are not applied).
+- Motor angle = URDF model angle for J1..J5; URDF J6 = motor J6 − π/2 (B601-DM, profile `model_offsets_rad`, published as `model_joint_map` in `GET /api/v1/observation/schema`: URDF angle = `sign` × motor angle + `offset_rad`). Joint positions in requests, observations and stored poses are motor angles. The cockpit's `?iksign` / `?ikoff` overrides are not applied. URDF J6 = motor J6 − π/2 was found on 2026-11-12: at the rest pose (motor J6 = π/2) photos of the arm show the jaws opening left-right and the camera holder (end_link +z) on top, which URDF FK gives only at URDF J6 = 0. J1–J5 directions were checked on the arm on 2026-11-09.
 - `tag`: string ≤ 64 bytes, echoed in the action record.
 - `width_m` for the gripper returns `UNSUPPORTED` until the jaw angle-to-width mapping is measured.
 
-位姿为 end_link 在 base_link 下的位姿（米、弧度），end_link x 为工具轴。`rpy` 为 URDF 固定轴 Rz·Ry·Rx。`orientation: null` 保持当前姿态。J1..J6 电机角 = URDF 模型角。
+位姿为 end_link 在 base_link 下的位姿（米、弧度），end_link x 为工具轴。`rpy` 为 URDF 固定轴 Rz·Ry·Rx。`orientation: null` 保持当前姿态。J1..J5 电机角 = URDF 模型角；URDF J6 = 电机 J6 − π/2（B601-DM，profile 字段 `model_offsets_rad`，在 `GET /api/v1/observation/schema` 中以 `model_joint_map` 发布：URDF 角 = `sign` × 电机角 + `offset_rad`）。请求、观测和已存点位中的关节角都是电机角。不使用 cockpit 的 `?iksign` / `?ikoff`。URDF J6 = 电机 J6 − π/2 为 2026-11-12 的结论：静置位姿（电机 J6 = π/2）下的真机照片中夹爪左右张合、相机支架（end_link +z）在上方，URDF 正运动学只在 URDF J6 = 0 时得到这一姿态。J1–J5 的方向于 2026-11-09 在真机上检查过。
 
 ### `move_relative` frames / 坐标系
 
@@ -51,7 +51,9 @@ The existing `/api/v1/motion/jog`, `/motion/home`, `/motion/unload` commands and
 | `tool` | end_link axes | `droll` / `dpitch` / `dyaw` about end_link x / y / z (intrinsic, applied z·y·x) |
 | `camera` | OpenCV camera axes (x right, y down, z optical) | `dpitch` > 0 looks down (−dpitch about x_cam); `dyaw` > 0 looks right (−dyaw about world Z); `droll` about z_cam. `level` (default true) then rolls x_cam horizontal unless the optical axis is within 15° of vertical |
 
-The camera rotation is R_base_cam = R_base_end · R_end_cam, R_end_cam from `config.camera_mount` (`flip`, `rot_deg`, `tilt_deg`; defaults = cockpit defaults, optical axis = end_link x). `level` is only accepted for `camera`.
+The camera rotation is R_base_cam = R_base_end · R_end_cam, R_end_cam from `config.camera_mount` (`flip`, `rot_deg`, `tilt_deg`; defaults = cockpit defaults, optical axis = end_link x). With `rot_deg` 0 and `flip` false, image y (down) = −end_link z and image x = −end_link y: a camera above the jaws whose image is upright at the rest pose (the mount is referenced to J6 at its rest angle, motor π/2). `level` is only accepted for `camera`.
+
+相机旋转 R_base_cam = R_base_end · R_end_cam，R_end_cam 来自 `config.camera_mount`（`flip`、`rot_deg`、`tilt_deg`；默认值同 cockpit，光轴 = end_link x）。`rot_deg` 0、`flip` false 时，图像 y（向下）= −end_link z，图像 x = −end_link y，即相机位于夹爪上方、静置位姿下图像正立（安装以 J6 静置角、电机 π/2 为参考）。`level` 只用于 `camera`。
 
 ### Speed / 速度
 
@@ -229,7 +231,7 @@ The bound is the same for every point, the TCP included. `grasp_height_m` is val
 
 ### Camera-down acquisition / 相机朝下采集
 
-For a camera mount pitched toward the jaws (v8 holder: `camera_mount` `rot_deg` 90, `tilt_deg` −38), the table point under the jaw tips is outside the image at approach height when the tool points straight down, so the look-down centring above cannot run. The setup field `acquire_camera_down` selects the acquisition:
+For a camera mount pitched toward the jaws (v8 holder: `camera_mount` `rot_deg` 0, `tilt_deg` −38), the table point under the jaw tips is outside the image at approach height when the tool points straight down, so the look-down centring above cannot run. The setup field `acquire_camera_down` selects the acquisition:
 
 | value | acquisition |
 |---|---|
@@ -248,7 +250,7 @@ Table clearance at the camera-down acquisition (the rule for every phase is in [
 
 The accuracy of the transition depends on `camera_tilt_deg`, `camera_mount.rot_deg` and `offset_m`: an error in them moves the grasp point (in the simulated-camera test, a 2° tilt, 1° rot, 5 % focal length and (6, −4) px principal point error gave a 9 mm grasp point error at a 0.15 m approach). `expected_duration_s` adds the transition move and 1.5 s for the re-check frame. With \|`camera_tilt_deg`\| ≤ 5° (v5 mount) `auto` keeps the look-down acquisition unchanged. Validated in simulation only (`cargo test --test test_grasp camera_down`, `sim/mujoco/tests/test_camera_grasp.py` v8 cases); not run on the arm.
 
-相机安装向夹爪方向俯仰时（v8 支架：`camera_mount` `rot_deg` 90、`tilt_deg` −38），工具竖直朝下时夹爪尖正下方的桌面点在接近高度处不在画面内，上面的俯视对中无法进行。抓取设置字段 `acquire_camera_down` 选择采集方式：`auto`（默认）在 \|`camera_tilt_deg`\| > 5° 且 `camera_mount.offset_m` 已设置时用相机朝下采集，否则俯视；`on` 始终相机朝下，`camera_mount.offset_m` 未设置时请求返回 `INVALID_COMMAND`；`off` 始终俯视。
+相机安装向夹爪方向俯仰时（v8 支架：`camera_mount` `rot_deg` 0、`tilt_deg` −38），工具竖直朝下时夹爪尖正下方的桌面点在接近高度处不在画面内，上面的俯视对中无法进行。抓取设置字段 `acquire_camera_down` 选择采集方式：`auto`（默认）在 \|`camera_tilt_deg`\| > 5° 且 `camera_mount.offset_m` 已设置时用相机朝下采集，否则俯视；`on` 始终相机朝下，`camera_mount.offset_m` 未设置时请求返回 `INVALID_COMMAND`；`off` 始终俯视。
 
 相机朝下采集的阶段：`approach` 将俯视姿态做最小旋转使光轴竖直向下（工具绕 x_cam 俯仰安装倾角，朝向不变），镜头中心（FK + `camera_mount.offset_m`）在 x、y 上位于估计点正上方，TCP 高度为 `table_z_m + approach_height_m`；`centring` 与上面的闭环相同，目标点改为画面中心（`image_size_px` / 2），增益、步长上限、`stable_frames`、`max_iterations` 不变；`transition` 用最后一次匹配框中心（距画面中心不超过 `centre_tol_px`）的射线与平面 z = `table_z_m + grasp_height_m` 求交，一次规划的笛卡尔运动（与其他运动一样做 IK、工作空间和禁入区检查）移到 TCP 位于该点上方接近高度、工具竖直的位姿；之后若相机模型预测目标在新位姿的画面内，下降前取一帧新图复查：未匹配到（`lost_frames` / `lost_timeout_s`，以投影为中心、门限 `acquire_dist_px`）为 `TARGET_LOST`，检测器出错为 `DETECTION_UNAVAILABLE`，框中心距投影超过 `recheck_tol_px` 为 `TARGET_DISPLACED`；`final_offset_px` = 匹配框中心减 `grip_pixel_norm` 的像素差 [dx, dy]（诊断用；位移判断以投影为准，抓取像素未标定不会导致失败）；预测目标不在画面内时（如 v8 支架、0.15 m 接近高度）不做复查，`final_offset_px` 缺省；`align`、`descend`、`close`、`lift` 不变，J6 对齐使用对中阶段最后一个框。相机朝下采集时的桌面间隙（所有阶段的规则见[桌面间隙](#table-clearance--桌面间隙)）：俯仰后的夹爪会低于 TCP（套件检查点在绕 end_link z 轴俯仰 38° 时最多低 57 mm，绕 y 轴时 21 mm），而工作空间检查比较的是 `workspace.floor_z_m`，不是桌面。因此采集时在需要时把 TCP 抬高到 `table_z_m + approach_height_m` 以上，使 TCP、所有 `workspace.check_points_end_m` 点、镜头中心和相机机身方盒的 8 个角点在相机朝下姿态及整个转换过程中都高于 `table_z_m` 至少 5 mm（抬高后的高度见 `action.acquire_height_m`，相对桌面；未抬高时缺省）。相机机身方盒为 `camera_mount.body_size_m` [沿 x_cam 宽、沿 y_cam 高、沿 −z_cam 镜头后方深度]（米，可选，每项 (0, 0.2]），默认 0.055 x 0.047 x 0.040，即 reCamera 外壳（40 x 40 x 36.5 mm）装在 v8 支架内（壁厚、耳、底托、顶杆和后唇取自支架生成脚本），镜头位于前面中心。它只用于抓取的桌面间隙，不进入通用工作空间检查，因此其他运动不变；通用检查仍只计镜头中心。使用套件检查点和 v8 支架时，决定抬高量的是夹爪检查点而不是机身；机身比夹爪更低的安装按同一规则抬高或拒绝。接近路径、每个对中步和转换路径与抓取的其他子运动按同一下限检查。转换的精度取决于 `camera_tilt_deg`、`camera_mount.rot_deg` 和 `offset_m`（模拟相机测试中倾角差 2°、旋转差 1°、焦距差 5 %、主点偏 (6, −4) px，在 0.15 m 接近高度下抓取点偏差 9 mm）。`expected_duration_s` 增加转换运动时长和 1.5 s 复查帧。\|`camera_tilt_deg`\| ≤ 5°（v5 支架）时 `auto` 保持原俯视流程不变。仅在仿真中验证（`cargo test --test test_grasp camera_down`、`sim/mujoco/tests/test_camera_grasp.py` 的 v8 用例），未在真机上运行。
 

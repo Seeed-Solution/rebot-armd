@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::api::rest::ApiError;
-use crate::kinematics::{self, Pose};
+use crate::kinematics::Pose;
 use crate::motion::{self, GoalSpec, GripperCommand, GripperRequest, Speed};
 use crate::supervisor::{ArmError, ArmSupervisor};
 
@@ -99,7 +99,8 @@ impl MacroCtx {
     /// FK of the commanded J1..J6.
     pub async fn pose(&self) -> Pose {
         let inner = self.sup.inner().read().await;
-        inner.config.arm_model.fk_f32(&inner.commanded_positions).unwrap_or_else(|| kinematics::fk(&kinematics::q6(&inner.commanded_positions)))
+        let arm = &inner.config.arm_model;
+        arm.fk_f32(&inner.commanded_positions).unwrap_or_else(|| arm.fk(&[0.0; crate::chain::MAX_CHAIN_JOINTS]))
     }
 
     /// Wait for the installed sub-motion; stop it on a timeout.

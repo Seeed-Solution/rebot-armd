@@ -32,7 +32,7 @@ import mujoco
 import numpy as np
 
 from .camera import PROFILE, CameraMount
-from .model import DOF, Indexer, load_model
+from .model import DOF, MODEL_OFFSETS_RAD, Indexer, load_model
 from .scene import Scene, parse_objects
 
 PROTOCOL_VERSION = 1
@@ -77,10 +77,10 @@ class Motors:
         # generalized-force mapping of each actuator (gear) on its joint dof
         self.gear = model.actuator_gear[:, 0].copy()
         self.dofs = np.array([model.jnt_dofadr[model.actuator_trnid[i, 0]] for i in range(model.nu)])
-        # J1..J6 range ends (rad, motor angle = joint angle); +-inf for unlimited joints
+        # J1..J6 range ends in motor angles (joint angle - model offset); +-inf for unlimited joints
         jnts = [model.actuator_trnid[i, 0] for i in range(6)]
-        self.stop_lo = np.array([model.jnt_range[j, 0] if model.jnt_limited[j] else -np.inf for j in jnts])
-        self.stop_hi = np.array([model.jnt_range[j, 1] if model.jnt_limited[j] else np.inf for j in jnts])
+        self.stop_lo = np.array([model.jnt_range[j, 0] if model.jnt_limited[j] else -np.inf for j in jnts]) - MODEL_OFFSETS_RAD
+        self.stop_hi = np.array([model.jnt_range[j, 1] if model.jnt_limited[j] else np.inf for j in jnts]) - MODEL_OFFSETS_RAD
 
     def set_enabled(self, enabled: bool) -> None:
         if enabled and not self.enabled:

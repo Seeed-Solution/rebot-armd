@@ -2,7 +2,8 @@
 
 Mount convention = armd `kinematics::cam_mount` (OpenCV camera frame: x right, y down,
 z = optical axis): R_end_cam = [x0 y0 z0] · Rz(rot_deg) · Rx(tilt_deg) with z0 = end_link x,
-y0 = flip · (J5 axis in end_link at q6 = pi/2, x part removed), x0 = y0 × z0. The optical
+y0 = flip · (J5 axis in end_link at the J6 rest angle, motor pi/2 = URDF pi/2 + offset; x part
+removed), x0 = y0 × z0. The optical
 centre sits at `offset_m` in end_link. armd's profile leaves `offset_m` null (not measured);
 the simulator then uses the v8 holder's assumed lens centre (reBot-DevArm
 hardware/camera-mounts/recamera-mounts/v8/README.txt section 4).
@@ -63,10 +64,10 @@ def axis_r(k, a: float) -> np.ndarray:
 
 def mount_rotation(model: mujoco.MjModel, mount: CameraMount) -> np.ndarray:
     """R_end_cam (OpenCV camera axes as columns, in end_link), armd `cam_mount`."""
+    from .model import MODEL_OFFSETS_RAD
     data = mujoco.MjData(model)
-    for j in range(1, 6):
-        data.qpos[model.jnt_qposadr[model.joint(f"joint{j}").id]] = 0.0
-    data.qpos[model.jnt_qposadr[model.joint("joint6").id]] = math.pi / 2
+    for j, motor in enumerate((0.0, 0.0, 0.0, 0.0, 0.0, math.pi / 2), start=1):
+        data.qpos[model.jnt_qposadr[model.joint(f"joint{j}").id]] = motor + MODEL_OFFSETS_RAD[j - 1]
     mujoco.mj_kinematics(model, data)
     end_r = data.body("end_link").xmat.reshape(3, 3)
     a_end = end_r.T @ data.xaxis[model.joint("joint5").id]

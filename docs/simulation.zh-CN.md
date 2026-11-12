@@ -58,7 +58,7 @@ cd sim/mujoco && uv run pytest -s -m "not slow"   # 跳过约 3.5 分钟的 sysi
 ## 仿真内容
 
 - **场景**（`sim/mujoco/models/rebot_b601dm_scene.xml`）：关节链与连杆惯量取自 `assets/reBot-DevArm_gripper.urdf`（armd 重力模型和运动学用的同一组参数）；碰撞体为按上游 DM 网格尺寸设置的方盒；桌面在 z = 0（底座平面，对应 profile `grasp.table_z_m`）；4 cm、30 g 方块位于 (0.30, 0, 0.02) m。连杆与桌面、方块碰撞，连杆之间不碰撞。
-- **关节约定**：J1..J6 电机角 = URDF 角。J7 经齿条驱动两指：单侧开口 = −q7 × 0.0425 / 5.7 m（q7 = 0 闭合，−5.7 rad = 85 mm）。另一指由等式约束跟随。J2、J3 上限位在 0 rad（URDF 限位），机械臂在 q = 0 折叠静置；其余关节范围为 profile 限位 + 0.1 rad。
+- **关节约定**：J1..J5 电机角 = URDF 角；URDF J6 = 电机 J6 − π/2（套件 profile 的 `model_offsets_rad`，由 `rebot_sim.model` 读取；场景中 joint6 的范围相应平移 −π/2）。`tests/fixtures/mujoco_fk_samples.json` 中为电机角。J7 经齿条驱动两指：单侧开口 = −q7 × 0.0425 / 5.7 m（q7 = 0 闭合，−5.7 rad = 85 mm）。另一指由等式约束跟随。J2、J3 上限位在 0 rad（URDF 限位），机械臂在 q = 0 折叠静置；其余关节范围为 profile 限位 + 0.1 rad。
 - **电机**（物理 500 Hz）：
   - POS_VEL（armd 常规模式）：v_des = clip(25 · (q_target − q), ±vlim)，力矩 = kv · (v_des − dq) + J1..J6 的模型偏置力矩（重力、科氏力）；vlim 为 armd 下发的 2.0 rad/s。关节处于行程端点 0.005 rad 以内、目标也在该端点且重力把它压向该端点时，不加偏置力矩：由限位承担负载。折叠的 home 姿态下 J2 / J3 以这种方式靠在上限位（q = 0）上，电机力矩接近 0，与真机一致，armd 的下使能稳定检查（`support_torque_limits`）因此通过。
   - MIT（重力补偿按关节切换）：力矩 = kp · (q_target − q) + kd · (dq_target − dq) + τ_ff。
@@ -140,9 +140,9 @@ rebot-vision 感知接口版本 2（[detection_api.md](detection_api.md)）：`G
 
 ### 仿真中的点框抓取
 
-`tests/test_camera_grasp.py` 启动 `rebot-sim --camera` 和 `armd --follower sim`（`ARMD_DETECTOR_URL` 指向仿真器），回 home，工具朝下移到方块上方 0.20 m，经 armd 触发一次检测（`/api/v1/detection/trigger`），再以方块的框发送 `/api/v1/action/grasp`。armd 使用套件 profile 的副本，其中 `camera_mount.offset_m` 设为仿真器的镜头中心；请求用 `overrides` 覆盖 `grip_pixel_norm`（`/sim/camera` 中 0.15 m 接近高度的值）和 `fx_px` / `fy_px`（824）。之后抓取宏（`src/grasp.rs`）与真机流程相同：接近、在新触发的帧上对中、J6 对齐、下降、闭合、抬起。通过条件：动作 `done` 且 `holding: true`，`/sim/state` 中方块 `grasped`，抬起超过 5 cm，与 TCP 水平距离小于 3 cm。
+`tests/test_camera_grasp.py` 启动 `rebot-sim --camera` 和 `armd --follower sim`（`ARMD_DETECTOR_URL` 指向仿真器），回 home，工具朝下移到方块上方 0.25 m，经 armd 触发一次检测（`/api/v1/detection/trigger`），再以方块的框发送 `/api/v1/action/grasp`。armd 使用套件 profile 的副本，其中 `camera_mount.offset_m` 设为仿真器的镜头中心；请求用 `overrides` 覆盖 `grip_pixel_norm`（`/sim/camera` 中 0.25 m 接近高度的值：镜头在夹爪上方 66 mm（end_link +z），约 0.23 m 以下时夹爪尖正下方的桌面点在画面下沿之外）和 `fx_px` / `fy_px`（824）。之后抓取宏（`src/grasp.rs`）与真机流程相同：接近、在新触发的帧上对中、J6 对齐、下降、闭合、抬起。通过条件：动作 `done` 且 `holding: true`，`/sim/state` 中方块 `grasped`，抬起超过 5 cm，与 TCP 水平距离小于 3 cm。
 
-结果（spark-6124，2026-11-11，`pytest -s tests/test_camera_grasp.py`，v5 用例；135 s 内 2 项通过；加入相机朝下采集后重跑数值相同，seed 3 用例 37.2 s）：
+J6 偏移之前的结果（spark-6124，2026-11-11，URDF J6 = 电机 J6，观察高度 0.20 m、接近高度 0.15 m，`pytest -s tests/test_camera_grasp.py`，v5 用例；135 s 内 2 项通过；加入相机朝下采集后重跑数值相同，seed 3 用例 37.2 s）：
 
 | 场景 | 观察位姿处的检测（640x360 归一化） | 对中修正次数 | 最终误差 | 抓取耗时 | 抬起后的方块 |
 |---|---|---|---|---|---|
@@ -153,7 +153,7 @@ rebot-vision 感知接口版本 2（[detection_api.md](detection_api.md)）：`G
 
 v8 支架（倾斜 −38°）：工具竖直朝下时，夹爪尖正下方桌面点在画面中的归一化 v 值为：距指尖 0 m 时 0.66，0.05 m 时 0.10，约 0.06 m 以外超出画面上沿（v < 0）（0.15 m 处 `grip_pixel_norm` 的 v = −0.40），因此在接近高度无法以俯视方式对中到 `grip_pixel_norm`。armd 对该安装使用相机朝下采集（`acquire_camera_down: auto`，见 [agent_action_api.md](agent_action_api.md#camera-down-acquisition--相机朝下采集)）：光轴竖直完成接近和对中，再转换到目标上方工具竖直的位姿。
 
-v8 用例（`v8_default`、`v8_seed3_cube_cup`）以 `--camera-rot-deg 90 --camera-tilt-deg -38` 启动 `rebot-sim`，armd 使用相同的 `camera_mount`（`rot_deg` 90、`tilt_deg` −38、仿真器的镜头中心）。观察位姿为工具从竖直向相机朝下俯仰一半（19°），画面中心射线距方块 2 cm；请求覆盖 `fx_px` / `fy_px` 和 `approach_height_m` 0.15，不覆盖 `grip_pixel_norm`。结果（同一次运行，270 s 内 4 项通过）：
+v8 用例（`v8_default`、`v8_seed3_cube_cup`）以 `--camera-rot-deg 0 --camera-tilt-deg -38` 启动 `rebot-sim`，armd 使用相同的 `camera_mount`（`rot_deg` 0、`tilt_deg` −38、仿真器的镜头中心）。J6 偏移之前（2026-11-12 以前）同一物理安装写作 `rot_deg` 90。观察位姿为工具从竖直向相机朝下俯仰一半（19°），画面中心射线距方块 2 cm；请求覆盖 `fx_px` / `fy_px` 和 `approach_height_m` 0.15，不覆盖 `grip_pixel_norm`。结果（与上面同一次运行，J6 偏移之前，`rot_deg` 90；270 s 内 4 项通过）：
 
 | 场景 | 观察位姿处的检测（640x360 归一化） | 对中修正次数 | 最终误差（相对画面中心） | 抓取耗时（预计） | 抬起后的方块 |
 |---|---|---|---|---|---|

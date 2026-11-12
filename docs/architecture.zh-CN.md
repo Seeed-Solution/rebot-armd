@@ -59,6 +59,7 @@ rebot-armd 分三层。核心可在任何受支持的控制器上运行；套件
 | `urdf` | `Urdf` 使用的 URDF 文件，相对 profile 文件所在目录；启动时读取一次 | 使用 `Urdf` 时必填 |
 | `urdf_sha256` | `urdf` 的期望 sha256；不一致时启动失败 | 否 |
 | `chain` | `base_link`、`tip_link`、`joints` `[{urdf_joint, sign（±1，默认 1）, offset_rad（默认 0）}]`：按 armd 关节顺序列出的手臂关节，即从 base 到 tip 的转动关节；URDF 角度 = sign × armd 角度 + offset_rad | 使用 `Urdf` 时必填 |
+| `model_offsets_rad` | 仅用于内置模型：J1..J6 电机到 URDF 的偏移（rad），URDF 角度 = 电机角度 + 偏移；缺省为 B601-DM 的值 [0, 0, 0, 0, 0, −π/2]（`kinematics::B601DM_MODEL_OFFSETS_RAD`）；在观测 schema 中以 `model_joint_map` 发布 | 否 |
 | `gripper_joint` | 夹爪关节序号（位于手臂关节之后）；默认：`dof` = 链长 + 1 时为手臂关节之后的那个关节，否则无夹爪 | 否 |
 | `gravity_comp` | 重力补偿策略（渐入、比例、阻尼、力矩与速度限制、保持增益）；为 null 表示不支持 | 否 |
 | `damiao_ranges` | 每个关节的达妙映射范围 `{p_max, v_max, t_max}`；为 null 时为 ±12.5 rad、±30 rad/s、±18 N·m | 否 |

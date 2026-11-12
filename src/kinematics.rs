@@ -6,8 +6,11 @@
 //! values the JS produces (`tests/fixtures/vik_samples.json`).
 //!
 //! Conventions
-//! - Joint angles are URDF model angles J1..J6 (rad). armd treats motor angle = model angle;
-//!   the cockpit's `?iksign` / `?ikoff` URL overrides are not applied here.
+//! - Joint angles here are URDF model angles J1..J6 (rad). armd joint (motor) angles map to
+//!   them as model = motor + offset, offsets [`B601DM_MODEL_OFFSETS_RAD`] (J6 = motor - pi/2)
+//!   or the profile's `model_offsets_rad`; [`crate::chain::ArmModel`] applies the mapping, so
+//!   callers holding motor angles go through it. The cockpit's `?iksign` / `?ikoff` URL
+//!   overrides are not applied here.
 //! - A [`Pose`] is T_base_end_link (CALM.fk convention, end_link x = tool axis).
 //! - Camera frame is OpenCV (x right, y down, z optical axis = end_link x at zero tilt).
 use std::sync::LazyLock;
@@ -26,6 +29,13 @@ pub const END_TRANS: Vec3 = [0.0, 0.0, 0.15539];
 #[allow(clippy::approx_constant)]
 pub const END_RPY: Vec3 = [0.0, -1.5708, 3.1415];
 static END_ROT: LazyLock<Mat3> = LazyLock::new(|| rpy_to_r(END_RPY[0], END_RPY[1], END_RPY[2]));
+
+/// Motor -> model offsets of the B601-DM (model angle = motor angle + offset, rad). J1..J5:
+/// motor angle = URDF angle (axis directions checked on the arm, 2026-11-09). J6: URDF angle =
+/// motor angle - pi/2. At the rest pose (motor J6 = pi/2) the real jaws open horizontally and
+/// the camera holder (end_link +z) is on top (photos of the arm, 2026-11-12); FK puts end_link
+/// y horizontal and +z up only at URDF J6 = 0.
+pub const B601DM_MODEL_OFFSETS_RAD: [f64; 6] = [0.0, 0.0, 0.0, 0.0, 0.0, -std::f64::consts::FRAC_PI_2];
 
 /// J2 axis in the arm plane at J1 = 0 as (radius, height) in m (cockpit `IK` S0); the
 /// workspace reach is measured from this axis, as `IK.reach` does.
@@ -372,11 +382,20 @@ pub fn solve_dls_with(goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], 
 // ---- camera ----
 
 /// Camera mount R_end_cam (`VIK.camMount`, then · Rx(tilt)): z_cam = end_link x; y_cam = flip ·
-/// J5 axis seen in end_link at q6 = pi/2 (x part removed); x_cam = y_cam × z_cam; then `rot_deg`
-/// about the optical axis. `tilt_deg` (new, not in the cockpit) rotates about the resulting x_cam
-/// (right-handed: positive tilt turns the optical axis toward -y_cam, i.e. up in the image).
+/// J5 axis seen in end_link at the rest angle of J6 (motor pi/2, model pi/2 + offset; x part
+/// removed); x_cam = y_cam × z_cam; then `rot_deg` about the optical axis. `tilt_deg` (new, not
+/// in the cockpit) rotates about the resulting x_cam (right-handed: positive tilt turns the
+/// optical axis toward -y_cam, i.e. up in the image). With the B601-DM offsets and rot 0:
+/// y_cam = -end_link z, x_cam = -end_link y (a camera above the jaws, image upright at rest).
 pub fn cam_mount(flip: bool, rot_deg: f64, tilt_deg: f64) -> Mat3 {
-    let f = frames(&[0.0, 0.0, 0.0, 0.0, 0.0, std::f64::consts::PI / 2.0]);
+    cam_mount_with(&B601DM_MODEL_OFFSETS_RAD, flip, rot_deg, tilt_deg)
+}
+
+/// [`cam_mount`] for the motor -> model offsets `off`.
+pub fn cam_mount_with(off: &[f64; 6], flip: bool, rot_deg: f64, tilt_deg: f64) -> Mat3 {
+    let mut q = *off;
+    q[5] += std::f64::consts::FRAC_PI_2;
+    let f = frames(&q);
     cam_mount_from(&f.end.r, &f.axes[4], flip, rot_deg, tilt_deg)
 }
 
@@ -462,7 +481,8 @@ pub const WORKSPACE_EPS: f64 = 1e-4;
 
 const BOX_LIMITS: [[&str; 2]; 3] = [["box_x_min", "box_x_max"], ["box_y_min", "box_y_max"], ["box_z_min", "box_z_max"]];
 
-/// Workspace excess for joint positions `q` (at least J1..J6, model = motor angles).
+/// Workspace excess for model angles `q` (at least J1..J6). For armd (motor) angles use
+/// [`crate::chain::ArmModel::workspace_violation`].
 pub fn workspace_violation(q: &[f32], ws: &crate::model::WorkspacePolicy, cam: &crate::model::CameraMount) -> Violation {
     if q.len() < 6 || q[..6].iter().any(|v| !v.is_finite()) {
         return Violation::invalid();

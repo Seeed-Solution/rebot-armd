@@ -71,6 +71,7 @@ The `ArmConfig` JSON loaded with `armd --config <file>` (`src/model.rs`). Withou
 | `urdf` | URDF file for `Urdf`, relative to the profile file; read once at startup | with `Urdf` |
 | `urdf_sha256` | expected sha256 of `urdf`; startup fails on a mismatch | no |
 | `chain` | `base_link`, `tip_link`, `joints` `[{urdf_joint, sign (±1, default 1), offset_rad (default 0)}]`: the arm joints in armd order = revolute joints from base to tip; URDF angle = sign × armd angle + offset_rad | with `Urdf` |
+| `model_offsets_rad` | built-in model only: motor → URDF offset of J1..J6 (rad), URDF angle = motor angle + offset; absent = B601-DM values [0, 0, 0, 0, 0, −π/2] (`kinematics::B601DM_MODEL_OFFSETS_RAD`); published as `model_joint_map` in the observation schema | no |
 | `gripper_joint` | gripper joint index (after the arm joints); default: the joint after the arm joints when `dof` = chain length + 1, else none | no |
 | `gravity_comp` | gravity-compensation policy (ramp, scale, damping, torque and speed limits, hold gains); null = unsupported | no |
 | `damiao_ranges` | per-joint Damiao mapping range `{p_max, v_max, t_max}`; null = ±12.5 rad, ±30 rad/s, ±18 N·m | no |

@@ -61,12 +61,13 @@ pub fn parse_place(inner: &SupervisorInner, body: &Value) -> Result<PlaceRequest
     let (pose, target, orientation) = if has("pose") {
         let name = body["pose"].as_str().ok_or_else(|| invalid("pose must be a string"))?;
         let stored = inner.poses.find(name)?;
-        // the stored TCP; poses saved without kinematics carry none, so use FK of the positions
-        let tcp = match &stored.tcp {
-            Some(t) => Pose::new(kinematics::rpy_to_r(t.rpy[0], t.rpy[1], t.rpy[2]), t.position),
-            None if stored.positions.len() >= 6 => inner.config.arm_model.fk_f32(&stored.positions)
-                .ok_or_else(|| invalid(format!("pose '{name}' positions are not a valid joint vector")))?,
-            None => return Err(invalid(format!("pose '{name}' has no TCP"))),
+        // FK of the stored joint positions (the saved TCP may come from an older kinematic
+        // model); the saved TCP only when the positions are not a valid joint vector
+        let tcp = match (inner.config.arm_model.fk_f32(&stored.positions), &stored.tcp) {
+            (Some(pose), _) => pose,
+            (None, Some(t)) => Pose::new(kinematics::rpy_to_r(t.rpy[0], t.rpy[1], t.rpy[2]), t.position),
+            (None, None) if stored.positions.len() >= 6 => return Err(invalid(format!("pose '{name}' positions are not a valid joint vector"))),
+            (None, None) => return Err(invalid(format!("pose '{name}' has no TCP"))),
         };
         (Some(name.to_string()), tcp.p, Some(requested.unwrap_or(tcp.r)))
     } else {

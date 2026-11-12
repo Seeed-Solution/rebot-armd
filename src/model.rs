@@ -515,6 +515,11 @@ pub struct ArmConfig {
     /// Arm chain inside `urdf` and its joint mapping (src/chain.rs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<crate::chain::ChainSpec>,
+    /// Built-in model only: motor -> model (URDF) offset per arm joint J1..J6, model angle =
+    /// motor angle + offset (rad). Absent = [`crate::kinematics::B601DM_MODEL_OFFSETS_RAD`].
+    /// URDF chains set `chain.joints[].offset_rad` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_offsets_rad: Option<Vec<f64>>,
     /// Gripper joint index. Absent: the joint after the arm joints when `dof` has one more
     /// joint than the arm model (index 6 for the B601-DM), otherwise none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -589,8 +594,9 @@ impl Default for ArmConfig {
             urdf: None,
             urdf_sha256: None,
             chain: None,
+            model_offsets_rad: None,
             gripper_joint: None,
-            arm_model: crate::chain::ArmModel::RebotDevArm,
+            arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
 }
@@ -642,12 +648,15 @@ impl ArmConfig {
             if self.urdf.is_some() || self.chain.is_some() {
                 return Err("urdf / chain are set but neither kinematics nor gravity_model is \"Urdf\"".into());
             }
-            self.arm_model = crate::chain::ArmModel::RebotDevArm;
+            self.arm_model = crate::chain::ArmModel::RebotDevArm(self.builtin_model_offsets()?);
             return Ok(());
         }
         let (Some(rel), Some(spec)) = (&self.urdf, &self.chain) else {
             return Err("kinematics / gravity_model \"Urdf\" needs the urdf and chain fields".into());
         };
+        if self.model_offsets_rad.is_some() {
+            return Err("model_offsets_rad is for the built-in model; a URDF chain sets chain.joints[].offset_rad".into());
+        }
         let path = match profile_dir {
             Some(dir) if std::path::Path::new(rel).is_relative() => dir.join(rel),
             _ => std::path::PathBuf::from(rel),
@@ -667,6 +676,17 @@ impl ArmConfig {
         }
         self.arm_model = crate::chain::ArmModel::Chain(std::sync::Arc::new(chain));
         Ok(())
+    }
+
+    /// `model_offsets_rad`, or the B601-DM default when absent.
+    fn builtin_model_offsets(&self) -> Result<[f64; 6], String> {
+        match &self.model_offsets_rad {
+            None => Ok(crate::kinematics::B601DM_MODEL_OFFSETS_RAD),
+            Some(v) if v.len() == 6 && v.iter().all(|o| o.is_finite() && o.abs() <= std::f64::consts::TAU) => {
+                Ok(std::array::from_fn(|i| v[i]))
+            }
+            Some(_) => Err("model_offsets_rad needs 6 finite values in [-2pi, 2pi] (J1..J6)".into()),
+        }
     }
 
     /// Validate configuration invariants and auto-normalize joint names
@@ -731,6 +751,14 @@ impl ArmConfig {
         let builtin = self.kinematics == Some(KinematicsModel::RebotDevArm) || self.gravity_model == Some(GravityModel::RebotDevArm);
         if builtin && self.uses_urdf() {
             return Err("kinematics and gravity_model must both be RebotDevArm or both Urdf".into());
+        }
+        if self.uses_urdf() {
+            if self.model_offsets_rad.is_some() {
+                return Err("model_offsets_rad is for the built-in model; a URDF chain sets chain.joints[].offset_rad".into());
+            }
+        } else {
+            // the built-in model needs no file; keep it in step with the profile offsets
+            self.arm_model = crate::chain::ArmModel::RebotDevArm(self.builtin_model_offsets()?);
         }
         if self.uses_urdf() != self.arm_model.chain().is_some() {
             return Err("kinematics / gravity_model \"Urdf\" needs a loaded URDF chain (ArmConfig::load_arm_model)".into());
@@ -901,8 +929,9 @@ impl ArmConfig {
             urdf: None,
             urdf_sha256: None,
             chain: None,
+            model_offsets_rad: Some(crate::kinematics::B601DM_MODEL_OFFSETS_RAD.to_vec()),
             gripper_joint: None,
-            arm_model: crate::chain::ArmModel::RebotDevArm,
+            arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
 }
@@ -1249,6 +1278,11 @@ pub struct ObservationSchema {
     /// Torque-saturation guard policy; null when the profile has none (and in older schemas).
     #[serde(default)]
     pub torque_guard: Option<crate::torque_guard::TorqueGuardInfo>,
+    /// armd joint -> kinematic model (URDF) joint, one entry per arm joint: model angle =
+    /// `sign * position + offset_rad`. Every pose, FK and IK of the API uses this mapping.
+    /// Empty in older schemas (those assumed model = motor for J1..J6).
+    #[serde(default)]
+    pub model_joint_map: Vec<crate::chain::JointMap>,
 }
 
 impl ObservationSchema {
@@ -1329,6 +1363,7 @@ impl ObservationSchema {
             home_positions: Some(config.home_positions.clone()),
             resting_pose: config.resting_pose.clone(),
             torque_guard: crate::torque_guard::TorqueGuardInfo::from_config(config),
+            model_joint_map: config.arm_model.joint_map(),
         }
     }
 }

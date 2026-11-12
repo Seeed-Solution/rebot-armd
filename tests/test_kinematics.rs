@@ -123,12 +123,72 @@ fn cam_mount_level_and_rotation_helpers_match_js() {
 
 #[test]
 fn home_pose_matches_spec_numbers() {
-    let home = kinematics::fk(&[0.0, 0.0, 0.0, 0.0, 0.0, std::f64::consts::FRAC_PI_2]);
+    // motor angles of the profile home and the cockpit inspect preset
+    let arm = armd::chain::ArmModel::REBOT_DEV_ARM;
+    let home = arm.fk(&[0.0, 0.0, 0.0, 0.0, 0.0, std::f64::consts::FRAC_PI_2]);
     assert!(max_diff_v(&home.p, &[0.260, 0.0, 0.192]) < 1.5e-3, "{:?}", home.p);
     assert!(home.r[0][0] > 0.999, "tool x forward");
-    let inspect = kinematics::fk(&[0.0, -1.167, -1.565, 1.435, 0.0, std::f64::consts::FRAC_PI_2]);
+    let inspect = arm.fk(&[0.0, -1.167, -1.565, 1.435, 0.0, std::f64::consts::FRAC_PI_2]);
     assert!(max_diff_v(&inspect.p, &[0.250, 0.0, 0.300]) < 1.5e-3, "{:?}", inspect.p);
     assert!(max_diff_v(&kinematics::column(&inspect.r, 0), &[0.509, 0.0, -0.861]) < 2e-3);
+}
+
+/// At the profile home (motor J6 = pi/2) the real B601-DM's jaws open left-right and the
+/// camera holder (end_link +z) is on top (photos of the arm, 2026-11-12): end_link y is
+/// world-horizontal, end_link +z world-up. The URDF angle of J6 there is 0.
+#[test]
+fn home_pose_jaws_horizontal_and_camera_side_up() {
+    let config = armd::ArmConfig::rebot_dm();
+    let home = config.arm_model.fk_f32(&config.home_positions).unwrap();
+    let (jaw, cam_side) = (kinematics::column(&home.r, 1), kinematics::column(&home.r, 2));
+    // within 1e-3 (0.06 deg): the URDF end_joint rpy is rounded (-1.5708, 3.1415)
+    assert!(jaw[2].abs() < 1e-3 && jaw[1] > 0.9999, "jaw axis (end_link y) along world +y: {jaw:?}");
+    assert!(cam_side[2] > 0.9999, "end_link +z up: {cam_side:?}");
+    // the camera holder's lens centre (v8, end_link [-0.0731, 0.0005, 0.066]) sits 66 mm above the TCP
+    let lens = home.transform_point(&[-0.0731, 0.0005, 0.066]);
+    assert!((lens[2] - home.p[2] - 0.066).abs() < 1e-6, "{lens:?} vs {:?}", home.p);
+    // model angle of J6 at home = motor - pi/2
+    let map = config.arm_model.joint_map();
+    assert!((map[5].sign * f64::from(config.home_positions[5]) + map[5].offset_rad).abs() < 1e-6);
+    assert!(map[..5].iter().all(|m| m.sign == 1.0 && m.offset_rad == 0.0));
+    // the previous mapping (URDF J6 = motor J6) put the jaw axis vertical
+    let old = kinematics::fk(&kinematics::q6(&config.home_positions));
+    assert!(kinematics::column(&old.r, 1)[2].abs() > 0.9999);
+}
+
+/// FK / IK round trip in motor angles through the B601-DM offsets: IK returns motor angles
+/// (J6 seeded and solved in motor space), FK of them reaches the goal, and the result equals
+/// the model-space solve shifted by the offsets.
+#[test]
+fn fk_ik_round_trip_in_motor_angles() {
+    let arm = armd::chain::ArmModel::REBOT_DEV_ARM;
+    let off = kinematics::B601DM_MODEL_OFFSETS_RAD;
+    let (lo, hi) = limits(0.05);
+    let mut rng = Rng(7);
+    let mut n_ok = 0;
+    for _ in 0..200 {
+        let q: [f64; 6] = std::array::from_fn(|i| lo[i] * 0.6 + (hi[i] - lo[i]) * 0.6 * rng.next());
+        let goal = arm.fk(&q);
+        let q_model: [f64; 6] = std::array::from_fn(|i| q[i] + off[i]);
+        assert!(kinematics::angle_between(&goal.r, &kinematics::fk(&q_model).r) < 1e-12);
+        let seed: [f64; 6] = std::array::from_fn(|i| q[i] + 0.1 * (rng.next() - 0.5));
+        let sol = arm.solve_dls(&goal, &seed, &lo, &hi, kinematics::PAR.w);
+        let seed_m: [f64; 6] = std::array::from_fn(|i| seed[i] + off[i]);
+        let lo_m: [f64; 6] = std::array::from_fn(|i| lo[i] + off[i]);
+        let hi_m: [f64; 6] = std::array::from_fn(|i| hi[i] + off[i]);
+        let sol_m = kinematics::solve_dls(&goal, &seed_m, &lo_m, &hi_m, kinematics::PAR.w);
+        assert_eq!(sol.ok, sol_m.ok);
+        for i in 0..6 { assert!((sol.q[i] + off[i] - sol_m.q[i]).abs() < 1e-12, "{:?} vs {:?}", sol.q, sol_m.q); }
+        if sol.ok {
+            n_ok += 1;
+            let reached = arm.fk(&sol.q);
+            assert!(kinematics::norm(&kinematics::sub(&reached.p, &goal.p)) <= kinematics::PAR.tol_pos);
+            assert!(kinematics::angle_between(&reached.r, &goal.r) <= kinematics::PAR.tol_rot);
+            // motor limits (widened to contain the seed) hold
+            assert!((0..6).all(|i| sol.q[i] >= lo[i].min(seed[i]) - 1e-12 && sol.q[i] <= hi[i].max(seed[i]) + 1e-12), "{:?}", sol.q);
+        }
+    }
+    assert!(n_ok > 150, "{n_ok}");
 }
 
 /// Smallest singular value of the w-scaled Jacobian (numeric), as scripts/view_ik_selftest.mjs.

@@ -14,6 +14,7 @@
     inertials moved to the jaw blades, joint ranges set to the armd B601-DM profile
     limits plus 0.1 rad except the J2 / J3 upper stops at 0 (URDF upper limits: the
     folded resting pose q = 0 leans on them), velocity-servo actuators, table and cube.
+  - Modified 2026-11-12: joint6 range shifted by -pi/2 (URDF J6 = motor J6 - pi/2).
   - This file is a modified Covered Source under CERN-OHL-W-2.0
     (https://ohwr.org/cern_ohl_w_v2.txt) and is not covered by the MIT License of
     this repository. No upstream meshes are included; set REBOT_DEVARM_DIR to a
@@ -95,7 +96,8 @@
                 <inertial pos="-0.00502802058982517 1.73866206692364e-06 0.0386233236326755" mass="0.383" fullinertia="0.00019772 0.00021737 0.00017191 -6.2e-07 -2.426e-05 2e-08"/>
                 <geom name="link5" type="box" pos="-0.0028 0 0.0355" size="0.035 0.0385 0.0425"/>
                 <body name="link6" pos="0.028008 0 0.04" euler="0 1.5708 0">
-                  <joint name="joint6" axis="0 0 1" range="-6.38318 6.38318" armature="0.0018"/>
+                  <!-- URDF angle = motor angle - pi/2 (armd model_offsets_rad): motor range +-6.38318 -->
+                  <joint name="joint6" axis="0 0 1" range="-7.95398 4.81238" armature="0.0018"/>
                   <inertial pos="3.76418727127126e-06 -0.000100908819946677 0.0253308606425965" mass="0.3663" fullinertia="0.00015554 0.00015554 0.00013966 0 0 0"/>
                   <geom name="link6" type="box" pos="0 0 0.0242" size="0.0385 0.0318 0.029"/>
                   <!-- end_link origin = jaw tips (TCP); end_link x = tool axis, jaws close along y -->
