@@ -93,6 +93,9 @@ pub struct GraspSetup {
     /// Rotate J6 by 90 deg when the box's long / short side ratio is at least this.
     pub align_min_aspect: f64,
     pub align_j6: bool,
+    /// Detections with `angle_deg` and `angle_conf` at least this decide the J6 roll from the
+    /// angle (long side across the jaws) instead of the box aspect.
+    pub align_min_angle_conf: f64,
     /// Linear speeds (m/s) for the approach / centring and for descend / lift.
     pub approach_speed_mps: f64,
     pub descend_speed_mps: f64,
@@ -147,6 +150,7 @@ impl Default for GraspSetup {
             settle_delay_s: 0.1,
             align_min_aspect: 1.2,
             align_j6: true,
+            align_min_angle_conf: 0.3,
             approach_speed_mps: 0.05,
             descend_speed_mps: 0.03,
             phase_timeout_s: 25.0,
@@ -164,7 +168,7 @@ impl GraspSetup {
             self.grip_pixel_norm[0], self.grip_pixel_norm[1], self.camera_tilt_deg, self.image_size_px[0],
             self.image_size_px[1], self.fx_px, self.fy_px, self.centre_tol_px, self.servo_gain, self.max_step_m,
             self.match_dist_px, self.match_iou, self.acquire_dist_px, self.lost_timeout_s, self.settle_delay_s,
-            self.align_min_aspect, self.approach_speed_mps, self.descend_speed_mps, self.phase_timeout_s, self.timeout_s, self.recheck_tol_px];
+            self.align_min_aspect, self.align_min_angle_conf, self.approach_speed_mps, self.descend_speed_mps, self.phase_timeout_s, self.timeout_s, self.recheck_tol_px];
         if !all.iter().all(|v| fin(*v)) { return Err("grasp setup values must be finite".into()); }
         let check = |ok: bool, msg: &str| if ok { Ok(()) } else { Err(msg.to_string()) };
         check((-0.5..=0.5).contains(&self.table_z_m), "table_z_m must be in [-0.5, 0.5] m")?;
@@ -190,6 +194,7 @@ impl GraspSetup {
         check((0.0..=2.0).contains(&self.settle_delay_s), "settle_delay_s must be in [0, 2] s")?;
         check(self.recheck_tol_px > 0.0 && self.recheck_tol_px <= 500.0, "recheck_tol_px must be in (0, 500]")?;
         check(self.align_min_aspect >= 1.0 && self.align_min_aspect <= 10.0, "align_min_aspect must be in [1, 10]")?;
+        check((0.0..=1.0).contains(&self.align_min_angle_conf), "align_min_angle_conf must be in [0, 1]")?;
         let speed_ok = |v: f64| v > 0.0 && v <= motion::MAX_LINEAR_MPS;
         check(speed_ok(self.approach_speed_mps) && speed_ok(self.descend_speed_mps), "speeds must be in (0, 0.15] m/s")?;
         check(self.phase_timeout_s > 0.0 && self.phase_timeout_s <= 120.0 && self.timeout_s >= self.phase_timeout_s && self.timeout_s <= 600.0,
@@ -305,6 +310,10 @@ pub struct Detection {
     pub score: f64,
     /// Normalised [x0, y0, x1, y1].
     pub box_norm: [f64; 4],
+    /// Orientation of the object's long side in the image (deg, from +x toward +y, y down,
+    /// wrapped to [-90, 90)) and its confidence [0, 1], when the detector reports them.
+    pub angle_deg: Option<f64>,
+    pub angle_conf: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -449,7 +458,8 @@ fn f(v: &Value, keys: &[&str]) -> Option<f64> {
 /// Detector boxes → normalised boxes. Accepts `[cx, cy, w, h, score, label]` arrays and
 /// objects with `box_norm`, or `format` `xyxy` / `xywh_center` / `xywh_top_left` (as the
 /// cockpit's `parseDetections`), or centre `x`, `y`, `w`, `h` without `format` (rebot-vision
-/// 1.2). Values above 1.05 are pixels of `size`.
+/// 1.2). Values above 1.05 are pixels of `size`. Objects may carry `angle_deg` (long side,
+/// wrapped to [-90, 90)) and `angle_conf` (clamped to [0, 1]).
 pub fn parse_detections(raw: &Value, size: [f64; 2]) -> Vec<Detection> {
     let Some(items) = raw.as_array() else { return Vec::new(); };
     let mut out = Vec::new();
@@ -513,7 +523,9 @@ pub fn parse_detections(raw: &Value, size: [f64; 2]) -> Vec<Detection> {
         let (sx, sy) = if pixel { (size[0], size[1]) } else { (1.0, 1.0) };
         let b = [(cx - w / 2.0) / sx, (cy - h / 2.0) / sy, (cx + w / 2.0) / sx, (cy + h / 2.0) / sy].map(|v| v.clamp(0.0, 1.0));
         if b[2] <= b[0] || b[3] <= b[1] { continue; }
-        out.push(Detection { label, score: score.clamp(0.0, 1.0), box_norm: b });
+        let angle_deg = item.is_object().then(|| f(item, &["angle_deg"])).flatten().map(|a| (a + 90.0).rem_euclid(180.0) - 90.0);
+        let angle_conf = item.is_object().then(|| f(item, &["angle_conf"])).flatten().map(|c| c.clamp(0.0, 1.0));
+        out.push(Detection { label, score: score.clamp(0.0, 1.0), box_norm: b, angle_deg, angle_conf });
     }
     out
 }
@@ -1024,52 +1036,9 @@ impl Orchestrator {
         let predicted = self.cam.project(&pose, &target).map(|p| self.cam.to_norm(p)).unwrap_or(s.grip_pixel_norm);
         let mut tracker = Tracker { label: planned.request.label.clone(), predicted: planned.request.box_norm, gate_px: s.acquire_dist_px };
         tracker.predict_at(predicted);
-        let mut since = done.at;
         let mut after = None;
-        let mut iteration = 0u32;
-        let last = loop {
-            let pose = self.pose().await;
-            let mut xs = Vec::new();
-            let mut ys = Vec::new();
-            let mut consecutive = 0u32;
-            let mut last_det;
-            let decision = loop {
-                let d = self.fresh_match(&tracker, since, &mut after).await?;
-                tracker.gate_px = s.match_dist_px;
-                tracker.predicted = d.box_norm;
-                let c = self.cam.to_px(box_centre(&d.box_norm));
-                last_det = d;
-                xs.push(c[0]);
-                ys.push(c[1]);
-                let err = (c[0] - aim_px[0]).hypot(c[1] - aim_px[1]);
-                if err <= s.centre_tol_px { consecutive += 1; } else { consecutive = 0; }
-                self.sup.inner().write().await.set_action_phase(self.id, "centring", 0.3, Some(iteration), Some(err as f32));
-                if consecutive >= s.stable_frames { break None; }
-                let m = s.median_frames as usize;
-                if xs.len() >= m {
-                    let med = [median(&mut xs[xs.len() - m..].to_vec()), median(&mut ys[ys.len() - m..].to_vec())];
-                    if (med[0] - aim_px[0]).hypot(med[1] - aim_px[1]) > s.centre_tol_px { break Some(med); }
-                    if xs.len() >= m + s.stable_frames as usize { break None; }
-                }
-            };
-            let Some(med) = decision else { break last_det; };
-            if iteration >= s.max_iterations {
-                let err = (med[0] - aim_px[0]).hypot(med[1] - aim_px[1]);
-                return Err(fail("CENTRING_FAILED", format!("Target still {err:.0} px from {aim_name} after {iteration} corrections")));
-            }
-            iteration += 1;
-            let (Some(pt), Some(pg)) = (self.cam.plane_point(&pose, med, plane), self.cam.plane_point(&pose, aim_px, plane)) else {
-                return Err(fail("CENTRING_FAILED", "Pixel error cannot be mapped onto the table plane"));
-            };
-            let mut step = [(pt[0] - pg[0]) * s.servo_gain, (pt[1] - pg[1]) * s.servo_gain, 0.0];
-            let len = step[0].hypot(step[1]);
-            if len > s.max_step_m { step = [step[0] * s.max_step_m / len, step[1] * s.max_step_m / len, 0.0]; }
-            // predict where the target lands after the step (same rough model)
-            let moved = Pose::new(pose.r, kinematics::add(&pose.p, &step));
-            if let Some(p) = self.cam.project(&moved, &pt) { tracker.predict_at(self.cam.to_norm(p)); }
-            let done = self.move_arm("centring", GoalSpec::Relative { frame: RelFrame::Base, d: step, dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false }, s.approach_speed_mps).await?;
-            since = done.at;
-        };
+        let c = self.centre("centring", 0.3, &mut tracker, aim_px, aim_name, plane, done.at, &mut after, s.max_iterations, true).await?;
+        let last = c.last.clone();
 
         // camera-down: re-orient to the tool-vertical pose above the target's table point
         if camera_down {
@@ -1083,12 +1052,12 @@ impl Orchestrator {
             self.recheck(&planned.request.label, &last, &t, grip_px, done.at, &mut after).await?;
         }
 
-        // J6 alignment: close the jaws across the box's short side
+        // J6 alignment: close the jaws across the object's short side
         self.phase("align", 0.55).await?;
-        if s.align_j6 {
-            if let Some(turn) = self.align_turn(&last).await {
-                self.move_arm("align", GoalSpec::Relative { frame: RelFrame::Tool, d: [0.0; 3], dyaw: 0.0, dpitch: 0.0, droll: turn, level: false }, s.approach_speed_mps).await?;
-            }
+        let (turn, align) = if s.align_j6 { self.align_turn(&c, plane).await } else { (None, "off".to_string()) };
+        self.sup.inner().write().await.update_action(self.id, |a| { a.align = Some(align); a.align_turn_rad = turn.map(|t| t as f32); });
+        if let Some(turn) = turn {
+            self.move_arm("align", GoalSpec::Relative { frame: RelFrame::Tool, d: [0.0; 3], dyaw: 0.0, dpitch: 0.0, droll: turn, level: false }, s.approach_speed_mps).await?;
         }
 
         // descend, close, check
@@ -1131,23 +1100,151 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// ±pi/2 about the tool axis when the jaws would close across the long side.
-    async fn align_turn(&self, det: &Detection) -> Option<f64> {
-        let b = det.box_norm;
+    /// Closed-loop centring: drive the target's median box centre onto `aim_px` (pixel errors
+    /// mapped onto the plane z = `plane`), at most `max_iter` corrections, else CENTRING_FAILED.
+    /// `report`: publish `iteration` / `error_px` in the action status.
+    #[allow(clippy::too_many_arguments)]
+    async fn centre(&self, phase: &str, progress: f32, tracker: &mut Tracker, aim_px: [f64; 2], aim_name: &str, plane: f64,
+                    mut since: Instant, after: &mut Option<u64>, max_iter: u32, report: bool) -> Result<Centred, Stop> {
+        let s = &self.setup;
+        let mut iteration = 0u32;
+        loop {
+            let pose = self.pose().await;
+            let mut xs = Vec::new();
+            let mut ys = Vec::new();
+            let mut frames = Vec::new();
+            let mut consecutive = 0u32;
+            let decision = loop {
+                let d = self.fresh_match(tracker, since, after).await?;
+                tracker.gate_px = s.match_dist_px;
+                tracker.predicted = d.box_norm;
+                let c = self.cam.to_px(box_centre(&d.box_norm));
+                frames.push(d);
+                xs.push(c[0]);
+                ys.push(c[1]);
+                let err = (c[0] - aim_px[0]).hypot(c[1] - aim_px[1]);
+                if err <= s.centre_tol_px { consecutive += 1; } else { consecutive = 0; }
+                let (it, e) = if report { (Some(iteration), Some(err as f32)) } else { (None, None) };
+                self.sup.inner().write().await.set_action_phase(self.id, phase, progress, it, e);
+                if consecutive >= s.stable_frames { break None; }
+                let m = s.median_frames as usize;
+                if xs.len() >= m {
+                    let med = [median(&mut xs[xs.len() - m..].to_vec()), median(&mut ys[ys.len() - m..].to_vec())];
+                    if (med[0] - aim_px[0]).hypot(med[1] - aim_px[1]) > s.centre_tol_px { break Some(med); }
+                    if xs.len() >= m + s.stable_frames as usize { break None; }
+                }
+            };
+            let Some(med) = decision else {
+                let last = frames.last().cloned().expect("at least one matched frame");
+                return Ok(Centred { last, frames, pose, iterations: iteration });
+            };
+            if iteration >= max_iter {
+                let err = (med[0] - aim_px[0]).hypot(med[1] - aim_px[1]);
+                return Err(fail("CENTRING_FAILED", format!("Target still {err:.0} px from {aim_name} after {iteration} corrections")));
+            }
+            iteration += 1;
+            let (Some(pt), Some(pg)) = (self.cam.plane_point(&pose, med, plane), self.cam.plane_point(&pose, aim_px, plane)) else {
+                return Err(fail("CENTRING_FAILED", "Pixel error cannot be mapped onto the table plane"));
+            };
+            let mut step = [(pt[0] - pg[0]) * s.servo_gain, (pt[1] - pg[1]) * s.servo_gain, 0.0];
+            let len = step[0].hypot(step[1]);
+            if len > s.max_step_m { step = [step[0] * s.max_step_m / len, step[1] * s.max_step_m / len, 0.0]; }
+            // predict where the target lands after the step (same rough model)
+            let moved = Pose::new(pose.r, kinematics::add(&pose.p, &step));
+            if let Some(p) = self.cam.project(&moved, &pt) { tracker.predict_at(self.cam.to_norm(p)); }
+            let done = self.move_arm(phase, GoalSpec::Relative { frame: RelFrame::Base, d: step, dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false }, s.approach_speed_mps).await?;
+            since = done.at;
+        }
+    }
+
+    /// J6 roll (about the tool axis) that closes the jaws across the object's short side, and
+    /// the `align` status. From the detector angle when the centring frames carry one with
+    /// `angle_conf >= align_min_angle_conf`, else ±pi/2 from the box aspect. No turn when the
+    /// last box is unreliable ([`align_guard`]) or no candidate fits J6's limits.
+    async fn align_turn(&self, c: &Centred, plane: f64) -> (Option<f64>, String) {
+        if let Err(reason) = align_guard(&c.last, &c.frames, self.cam.size) { return (None, format!("skipped:{reason}")); }
+        let pose = self.pose().await;
+        let inner = self.sup.inner().read().await;
+        let (q6, lim) = (f64::from(inner.commanded_positions[5]), inner.config.limits[5].clone());
+        drop(inner);
+        let room = |t: f64| q6 + t >= f64::from(lim.min_position) + 0.1 && q6 + t <= f64::from(lim.max_position) - 0.1;
+        if let Some(alpha) = frames_angle(&c.frames, self.setup.align_min_angle_conf) {
+            // the long side on the plane, seen from the pose of the centring frames
+            let px = self.cam.to_px(box_centre(&c.last.box_norm));
+            let (a, b) = (alpha.to_radians().cos(), alpha.to_radians().sin());
+            let (Some(p0), Some(p1)) = (self.cam.plane_point(&c.pose, px, plane), self.cam.plane_point(&c.pose, [px[0] + 20.0 * a, px[1] + 20.0 * b], plane)) else {
+                return (None, "skipped:ray".into());
+            };
+            let jaw = kinematics::mat_vec(&pose.r, &[0.0, 1.0, 0.0]);
+            let t0 = roll_across_long_side(jaw, kinematics::sub(&p1, &p0));
+            let pi = std::f64::consts::PI;
+            let Some(t) = [t0, t0 + pi, t0 - pi].into_iter().filter(|t| room(*t)).min_by(|x, y| x.abs().total_cmp(&y.abs())) else {
+                return (None, "skipped:j6_limits".into());
+            };
+            return if t.abs() < 1e-3 { (None, "kept:angle".into()) } else { (Some(t), "turned:angle".into()) };
+        }
+        let b = c.last.box_norm;
         let (w, h) = ((b[2] - b[0]) * self.cam.size[0], (b[3] - b[1]) * self.cam.size[1]);
-        if w.max(h) / w.min(h).max(1e-6) < self.setup.align_min_aspect { return None; }
+        if w.max(h) / w.min(h).max(1e-6) < self.setup.align_min_aspect { return (None, "skipped:aspect".into()); }
         // jaw closing direction (end_link y) seen in the image
         let jaw = kinematics::mat_vec(&kinematics::transpose(&self.cam.rec), &[0.0, 1.0, 0.0]);
         let jaw_along_x = jaw[0].abs() >= jaw[1].abs();
         let short_along_x = w < h;
-        if jaw_along_x == short_along_x { return None; }
-        let inner = self.sup.inner().read().await;
-        let (q6, lim) = (f64::from(inner.commanded_positions[5]), &inner.config.limits[5]);
-        let room = |t: f64| q6 + t >= f64::from(lim.min_position) + 0.1 && q6 + t <= f64::from(lim.max_position) - 0.1;
+        if jaw_along_x == short_along_x { return (None, "kept:box".into()); }
         let half = std::f64::consts::FRAC_PI_2;
         // roll about +x_tool; J6 turns with it when its axis is the tool axis
-        [half, -half].into_iter().find(|t| room(*t)).or(Some(half))
+        let t = [half, -half].into_iter().find(|t| room(*t)).unwrap_or(half);
+        (Some(t), "turned:box".into())
     }
+}
+
+/// Matched frames of the last centring pose.
+struct Centred {
+    last: Detection,
+    frames: Vec<Detection>,
+    /// Commanded pose at which `frames` were taken.
+    pose: Pose,
+    #[allow(dead_code)]
+    iterations: u32,
+}
+
+/// Why the last box cannot decide the J6 roll: `border` when an edge is within 2 px of the
+/// image border, `occluded` when its area differs by more than 40 % from the median area of
+/// `frames` (the jaws or a hand cover part of it).
+pub fn align_guard(last: &Detection, frames: &[Detection], size: [f64; 2]) -> Result<(), &'static str> {
+    let b = last.box_norm;
+    let [w, h] = size;
+    if b[0] * w <= 2.0 || b[1] * h <= 2.0 || b[2] * w >= w - 2.0 || b[3] * h >= h - 2.0 { return Err("border"); }
+    let area = |b: &[f64; 4]| (b[2] - b[0]) * (b[3] - b[1]);
+    let mut areas: Vec<f64> = frames.iter().map(|d| area(&d.box_norm)).collect();
+    if !areas.is_empty() {
+        let m = median(&mut areas);
+        if m > 0.0 && (area(&b) / m - 1.0).abs() > 0.4 { return Err("occluded"); }
+    }
+    Ok(())
+}
+
+/// Mean long-side angle (deg, [-90, 90)) of the frames with `angle_conf >= min_conf`, averaged
+/// on doubled angles (an axis, not a direction); None without such frames.
+pub fn frames_angle(frames: &[Detection], min_conf: f64) -> Option<f64> {
+    let (mut c, mut s, mut n) = (0.0, 0.0, 0);
+    for d in frames {
+        if let (Some(a), Some(conf)) = (d.angle_deg, d.angle_conf) {
+            if conf >= min_conf { c += (2.0 * a.to_radians()).cos(); s += (2.0 * a.to_radians()).sin(); n += 1; }
+        }
+    }
+    if n == 0 || c.hypot(s) < 1e-9 { return None; }
+    let a = (s.atan2(c) / 2.0).to_degrees();
+    Some((a + 90.0).rem_euclid(180.0) - 90.0)
+}
+
+/// Roll about the (vertical, down) tool axis, in [-pi/2, pi/2), that turns the jaw closing
+/// direction `jaw` (base frame) perpendicular to the long side `long` (base frame, horizontal
+/// parts used). Rolling by t about the downward tool axis turns `jaw` by -t about base z.
+pub fn roll_across_long_side(jaw: Vec3, long: Vec3) -> f64 {
+    let pi = std::f64::consts::PI;
+    let t = jaw[1].atan2(jaw[0]) - long[1].atan2(long[0]) - pi / 2.0;
+    (t + pi / 2.0).rem_euclid(pi) - pi / 2.0
 }
 
 async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64, planned: PlannedGrasp) {
@@ -1248,6 +1345,48 @@ mod tests {
         assert!((d[0].box_norm[0] - 0.45).abs() < 1e-9 && (d[0].box_norm[3] - 0.55).abs() < 1e-9);
         assert!(d[1].box_norm.iter().zip([0.1, 0.2, 0.3, 0.4]).all(|(a, b)| (a - b).abs() < 1e-9));
         assert_eq!(d[2].label, "mouse");
+    }
+
+    fn det(b: [f64; 4], angle: Option<(f64, f64)>) -> Detection {
+        Detection { label: "cup".into(), score: 0.9, box_norm: b, angle_deg: angle.map(|a| a.0), angle_conf: angle.map(|a| a.1) }
+    }
+
+    #[test]
+    fn align_guard_skips_border_and_occluded_boxes() {
+        let size = [640.0, 360.0];
+        let b = [0.3, 0.3, 0.5, 0.6];
+        let frames = vec![det(b, None), det([0.31, 0.3, 0.51, 0.6], None), det(b, None)];
+        assert_eq!(align_guard(&det(b, None), &frames, size), Ok(()));
+        // an edge within 2 px of the border (left, bottom)
+        assert_eq!(align_guard(&det([0.002, 0.3, 0.2, 0.6], None), &frames, size), Err("border"));
+        assert_eq!(align_guard(&det([0.3, 0.3, 0.5, 0.995], None), &frames, size), Err("border"));
+        // the last box shrank to half its height (jaws in front of it): area -50 %
+        let shrunk = det([0.3, 0.3, 0.5, 0.45], None);
+        let mut with_last = frames.clone();
+        with_last.push(shrunk.clone());
+        assert_eq!(align_guard(&shrunk, &with_last, size), Err("occluded"));
+        // -30 % passes
+        assert_eq!(align_guard(&det([0.3, 0.3, 0.5, 0.51], None), &frames, size), Ok(()));
+    }
+
+    #[test]
+    fn detector_angle_parsing_and_doubled_mean() {
+        let raw = serde_json::json!([{"label": "pen", "score": 0.9, "box_norm": [0.1, 0.1, 0.3, 0.2], "angle_deg": 120.0, "angle_conf": 1.4},
+                                     {"label": "pen", "score": 0.9, "box_norm": [0.1, 0.1, 0.3, 0.2]}]);
+        let d = parse_detections(&raw, [640.0, 360.0]);
+        assert_eq!((d[0].angle_deg, d[0].angle_conf), (Some(-60.0), Some(1.0)));
+        assert_eq!((d[1].angle_deg, d[1].angle_conf), (None, None));
+        // 89 and -89 are 2 deg apart: mean at the wrap, not 0
+        let fr = [det([0.0; 4], Some((89.0, 0.9))), det([0.0; 4], Some((-89.0, 0.9))), det([0.0; 4], Some((10.0, 0.1)))];
+        let a = frames_angle(&fr, 0.3).unwrap();
+        assert!(a.abs() > 89.9, "{a}");
+        assert_eq!(frames_angle(&fr[2..], 0.3), None, "below align_min_angle_conf");
+        // the roll turns the jaw by -t about z
+        let t = roll_across_long_side([0.0, 1.0, 0.0], [1.0, 0.0, 0.0]);
+        assert!(t.abs() < 1e-12, "jaw already across a long side along x: {t}");
+        let t = roll_across_long_side([1.0, 0.0, 0.0], [30f64.to_radians().cos(), 30f64.to_radians().sin(), 0.0]);
+        assert!((t - (-120f64 + 180.0).to_radians()).abs() < 1e-9, "{}", t.to_degrees());
+        assert!(GraspSetup::default().patched(&serde_json::json!({"align_min_angle_conf": 1.5})).is_err());
     }
 
     #[test]

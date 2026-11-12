@@ -1830,6 +1830,7 @@ impl SupervisorInner {
             id, kind: kind.into(), tag, state: "running".into(), code: None, message: None, progress: 0.0,
             started_at: now, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
             phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
+            align: None, align_turn_rad: None,
         });
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
         self.quintic_settle = None;
@@ -2024,6 +2025,11 @@ impl SupervisorInner {
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
             a.acquire_height_m = Some(height_m);
         }
+    }
+
+    /// Change diagnostic fields of the running action `id` (grasp status fields).
+    pub fn update_action(&mut self, id: u64, f: impl FnOnce(&mut ActionStatus)) {
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) { f(a); }
     }
 
     fn macro_sub_ready(&self, id: u64) -> Result<u64, ArmError> {

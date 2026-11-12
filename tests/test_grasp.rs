@@ -48,6 +48,9 @@ struct SimCamera {
     stale: AtomicBool,
     /// Detector latency: each result arrives 120..250 ms after its capture.
     delayed: AtomicBool,
+    /// The detector reports the long side's image angle: (base-frame direction of the long
+    /// side (rad), angle_conf).
+    angle: Mutex<Option<(f64, f64)>>,
 }
 
 impl SimCamera {
@@ -67,9 +70,12 @@ impl SimCamera {
         let captured = Instant::now();
         let q = self.sup.inner().read().await.measured_positions.clone();
         let pose = kinematics::fk(&kinematics::q6(&q));
-        let mut detections = vec![Detection { label: "person".into(), score: 0.5, box_norm: [0.0, 0.0, 0.08, 0.1] }];
+        let mut detections = vec![Detection { label: "person".into(), score: 0.5, box_norm: [0.0, 0.0, 0.08, 0.1], angle_deg: None, angle_conf: None }];
         if self.visible.load(Ordering::SeqCst) {
-            if let Some(b) = self.project_box(&pose) { detections.push(Detection { label: self.label.clone(), score: 0.9, box_norm: b }); }
+            if let Some(b) = self.project_box(&pose) {
+                let (angle_deg, angle_conf) = match self.image_angle(&pose) { Some((a, c)) => (Some(a), Some(c)), None => (None, None) };
+                detections.push(Detection { label: self.label.clone(), score: 0.9, box_norm: b, angle_deg, angle_conf });
+            }
         }
         let frame_id = self.frame.fetch_add(1, Ordering::SeqCst) + 1;
         if self.delayed.load(Ordering::SeqCst) {
@@ -77,6 +83,18 @@ impl SimCamera {
         }
         let captured_at = if self.stale.load(Ordering::SeqCst) { captured - Duration::from_secs(30) } else { captured };
         DetectionFrame { frame_id, captured_at, detections }
+    }
+
+    /// Image angle (deg, [-90, 90)) of the object's long side when the rig reports one.
+    fn image_angle(&self, pose: &Pose) -> Option<(f64, f64)> {
+        let (dir, conf) = (*self.angle.lock().unwrap())?;
+        let o = &self.object;
+        let sh = *self.shift.lock().unwrap();
+        let c = [o.centre[0] + sh[0], o.centre[1] + sh[1], o.centre[2] + o.height];
+        let p0 = self.cam.project(pose, &c)?;
+        let p1 = self.cam.project(pose, &[c[0] + 0.02 * dir.cos(), c[1] + 0.02 * dir.sin(), c[2]])?;
+        let a = (p1[1] - p0[1]).atan2(p1[0] - p0[0]).to_degrees();
+        Some(((a + 90.0).rem_euclid(180.0) - 90.0, conf))
     }
 
     fn project_box(&self, pose: &Pose) -> Option<[f64; 4]> {
@@ -239,6 +257,7 @@ async fn rig_driven(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start: 
         vision: Mutex::new(None), mode_calls: Mutex::new(Vec::new()), no_yolo: AtomicBool::new(false),
         per_request: AtomicBool::new(false), trigger_calls: Mutex::new(Vec::new()), next_frame_calls: AtomicU64::new(0),
         shift: Mutex::new([0.0; 2]), failing: AtomicBool::new(false), stale: AtomicBool::new(false), delayed: AtomicBool::new(false),
+        angle: Mutex::new(None),
     });
     let hold = Arc::new(AtomicBool::new(true));
     let (ticker, hold_t) = (sup.clone(), hold.clone());
@@ -1136,4 +1155,52 @@ async fn delayed_detector_recovers_from_stale_frames() {
             assert_holding_done(&o, &s, &rig.object, 0.004);
         }
     }
+}
+
+// ---- J6 alignment ----
+
+/// The detector reports the long side at 30 deg from base x: the J6 roll turns the jaw closing
+/// direction (end_link y) perpendicular to it, from the angle rather than the box aspect.
+#[tokio::test]
+async fn align_from_detector_angle_closes_across_the_long_side() {
+    let setup = GraspSetup::default();
+    let rig = rig(setup.clone(), centred_lens(), 0.0, [0.01, -0.01], false).await;
+    let start_r = start_pose(&rig).await.r;
+    let mut s = setup.clone();
+    s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+    rig.sup.inner().write().await.set_grasp_setup(s.clone());
+    let long = 30f64.to_radians();
+    *rig.sim.angle.lock().unwrap() = Some((long, 0.9));
+    let image_angle = rig.sim.image_angle(&start_pose(&rig).await).unwrap().0;
+    let o = run_grasp(&rig).await;
+    let jaw = kinematics::mat_vec(&o.final_pose.r, &[0.0, 1.0, 0.0]);
+    let dot = (jaw[0] * long.cos() + jaw[1] * long.sin()) / jaw[0].hypot(jaw[1]);
+    println!("angle 30 deg (image {image_angle:.1} deg): {} {:?} align {:?} turn {:?} rad, jaw . long side {dot:.4}",
+        o.status.state, o.status.code, o.status.align, o.status.align_turn_rad);
+    assert_holding_done(&o, &s, &rig.object, 0.004);
+    assert_eq!(o.status.align.as_deref(), Some("turned:angle"), "{:?}", o.status);
+    assert!(dot.abs() < 3f64.to_radians().sin(), "jaws close across the long side: {dot}");
+    let turn = f64::from(o.status.align_turn_rad.unwrap());
+    assert!(turn.abs() <= std::f64::consts::PI, "{turn}");
+    // the expected roll from the pre-align jaw direction (start heading: look-down of the start)
+    let jaw0 = kinematics::mat_vec(&grasp::look_down(&start_r), &[0.0, 1.0, 0.0]);
+    let t0 = grasp::roll_across_long_side(jaw0, [long.cos(), long.sin(), 0.0]);
+    let d = (turn - t0).rem_euclid(std::f64::consts::PI);
+    assert!(d.min(std::f64::consts::PI - d) < 2f64.to_radians(), "turn {turn} vs expected {t0} (mod pi)");
+    // low confidence: the box aspect decides as before
+    let rig = rig_low_conf(&s).await;
+    let o = run_grasp(&rig).await;
+    assert_holding_done(&o, &s, &rig.object, 0.004);
+    assert!(o.status.align.as_deref().is_some_and(|a| a.ends_with(":box")), "{:?}", o.status.align);
+}
+
+/// Lens on the tool axis, 6 cm behind the jaw tips: the object under the jaws is in the middle
+/// of the image (with `Truth::same` its box reaches the image border at approach height).
+fn centred_lens() -> Truth { Truth { offset: [-0.06, 0.0, 0.0], ..Truth::same() } }
+
+async fn rig_low_conf(s: &GraspSetup) -> Rig {
+    let rig = rig(s.clone(), centred_lens(), 0.0, [0.01, -0.01], false).await;
+    rig.sup.inner().write().await.set_grasp_setup(s.clone());
+    *rig.sim.angle.lock().unwrap() = Some((30f64.to_radians(), 0.1));
+    rig
 }

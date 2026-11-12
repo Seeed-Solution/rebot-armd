@@ -728,6 +728,12 @@ pub struct ActionStatus {
     /// `approach_height_m`, raised for table clearance; absent when not raised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acquire_height_m: Option<f32>,
+    /// Grasp J6 alignment: `turned:box` / `turned:angle` (roll in `align_turn_rad`),
+    /// `kept:box` / `kept:angle` (no turn needed), `skipped:<reason>` or `off`; absent before the phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align_turn_rad: Option<f32>,
 }
 
 impl ActionStatus {
