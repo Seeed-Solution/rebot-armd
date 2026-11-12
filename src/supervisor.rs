@@ -2488,7 +2488,11 @@ impl SupervisorInner {
                     self.gripper_high_torque_ticks += 1;
                     if self.gripper_high_torque_ticks >= 6 {
                         self.gripper_stalled = true;
-                        self.gripper_stall_sign = if tau_7 >= 0.0 { 1.0 } else { -1.0 };
+                        // Direction J7 is driven into the obstacle: commanded minus measured,
+                        // independent of the driver's torque sign; torque sign only as fallback.
+                        let push = self.commanded_positions[6] - self.measured_positions[6];
+                        let dir = if push.abs() > 1e-3 { push } else { tau_7 };
+                        self.gripper_stall_sign = if dir >= 0.0 { 1.0 } else { -1.0 };
                         self.gripper_low_torque_ticks = 0;
                         let hold = self.measured_positions[6];
                         self.commanded_positions[6] = hold;
