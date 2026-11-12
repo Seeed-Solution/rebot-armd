@@ -159,7 +159,7 @@ struct PendingPlan {
     tag: Option<String>,
 }
 
-enum ActionStart { Started(u64, f64), Plan(PendingPlan), Macro(PendingMacro) }
+enum ActionStart { Started(u64, f64), Plan(PendingPlan), Macro(PendingMacro), Replay(crate::replay::ReplayInput) }
 
 /// A macro action (crate::macro_action) checked under the lock, planned without it.
 enum PendingMacro { Grasp(crate::grasp::PendingGrasp), Place(crate::place::PendingPlace) }
@@ -208,6 +208,10 @@ fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: 
         }
         "/api/v1/action/grasp" => return Ok(ActionStart::Macro(PendingMacro::Grasp(crate::grasp::prepare(inner, body, epoch)?))),
         "/api/v1/action/place" => return Ok(ActionStart::Macro(PendingMacro::Place(crate::place::prepare(inner, body, epoch)?))),
+        "/api/v1/action/replay" => {
+            let request = crate::replay::parse_replay(body).map_err(ArmError::from)?;
+            return Ok(ActionStart::Replay(inner.replay_input(request, epoch)?));
+        }
         "/api/v1/action/move_to_pose" => {
             let (id, duration) = crate::poses::start_action(inner, body, epoch)?;
             return Ok(ActionStart::Started(id, duration));
@@ -344,6 +348,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let mut evicted_notify: Option<(String, u64)> = None;
             let mut pending_plan: Option<(PendingPlan, u64)> = None;
             let mut pending_macro: Option<(Value, PendingMacro, u64)> = None;
+            let mut pending_replay: Option<(Value, crate::replay::ReplayInput, u64)> = None;
             let mut pending_write: Option<crate::persist::PendingWrite> = None;
             if kind == "estop" || kind == "e_stop" {
                 let (state, epoch) = recv_supervisor.trigger_e_stop().await;
@@ -471,6 +476,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             Ok(ActionStart::Started(id, duration)) => Some(command_ack(&inner, &value["request_id"], Some((id, duration)))),
                                             Ok(ActionStart::Plan(plan)) => { pending_plan = Some((plan, local_generation)); None }
                                             Ok(ActionStart::Macro(m)) => { pending_macro = Some((value["request_id"].clone(), m, local_generation)); None }
+                                            Ok(ActionStart::Replay(input)) => { pending_replay = Some((value["request_id"].clone(), input, local_generation)); None }
                                             Err(error) => Some(command_reject(&inner, &value["request_id"], error)),
                                         };
                                     } else if let Some(result) = state_command(&mut inner, path, &value["body"], recv_deps.setup_path.as_ref()) {
@@ -568,6 +574,25 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
                             } else {
                                 match planned.start(&mut inner, &recv_supervisor, &recv_deps) {
+                                    Ok(started) => command_ack(&inner, &request_id, Some(started)),
+                                    Err(error) => command_reject(&inner, &request_id, error.into()),
+                                }
+                            }
+                        }
+                    });
+                }
+                // Replay: the episode is read and checked without the lock; install re-checks.
+                if let Some((request_id, input, generation)) = pending_replay.take() {
+                    let planned = tokio::task::spawn_blocking(move || crate::replay::plan(input)).await;
+                    let mut inner = recv_supervisor.inner().write().await;
+                    response = Some(match planned {
+                        Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("replay check task failed: {e}")).into()),
+                        Ok(Err(error)) => command_reject(&inner, &request_id, error.into()),
+                        Ok(Ok(plan)) => {
+                            if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
+                                json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while the episode was checked", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
+                            } else {
+                                match inner.install_replay(plan) {
                                     Ok(started) => command_ack(&inner, &request_id, Some(started)),
                                     Err(error) => command_reject(&inner, &request_id, error.into()),
                                 }

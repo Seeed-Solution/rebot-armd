@@ -1,0 +1,478 @@
+//! Episode replay (action kind `replay`): load a saved episode, resample its measured
+//! joint angles (`observation.state`) to the control rate, check it, then drive it as an
+//! action reference: a planned joint move to the first frame, then the frames.
+//!
+//! Loading and the checks run without the supervisor lock ([`plan`]); the install
+//! ([`SupervisorInner::install_replay`]) re-checks everything that may have changed.
+use serde_json::Value;
+
+use crate::chain::ArmModel;
+use crate::model::{CameraMount, JointLimit, WorkspacePolicy};
+use crate::motion::{self, MotionError, Settle, StepCtx, StepOut, StepStatus, LAG_FULL, LAG_STOP, STALL_TIMEOUT_S};
+use crate::recording::RecordFrame;
+use crate::safety::SafetyError;
+use crate::supervisor::{ArmError, SupervisorInner, MAX_KEEPOUT_EVALS_PER_PLAN};
+use crate::trajectory::{MultiJointQuinticTrajectory, TrajectoryPlanner};
+
+/// Playback speeds accepted by `/api/v1/action/replay` (fraction of the recorded speed).
+pub const REPLAY_SPEEDS: [f64; 2] = [0.5, 1.0];
+pub const DEFAULT_REPLAY_SPEED: f64 = 0.5;
+/// Longest episode that can be replayed (recorded time, s).
+pub const MAX_REPLAY_DURATION_S: f64 = 600.0;
+/// Tolerance on the per-joint speed check (rad/s), above float rounding.
+pub const SPEED_CHECK_EPS: f32 = 1e-3;
+/// Playback rate (fraction of the chosen speed) at or below which the replay counts as
+/// stalled; [`STALL_TIMEOUT_S`] of that fails it with TRACKING_STALL.
+pub const STALL_RATE: f64 = 0.1;
+
+/// Body of `/api/v1/action/replay`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayRequest {
+    pub episode: String,
+    pub speed: f64,
+    /// Replay the gripper joint; false holds it where it is.
+    pub gripper: bool,
+    pub tag: Option<String>,
+}
+
+/// `{episode, speed: 0.5 | 1.0 (default 0.5), gripper: bool (default true), tag?}`.
+pub fn parse_replay(body: &Value) -> Result<ReplayRequest, MotionError> {
+    let episode = body.get("episode").and_then(Value::as_str)
+        .ok_or_else(|| MotionError::InvalidCommand("episode must be an episode id string".into()))?;
+    if !crate::recording::valid_episode_id(episode) {
+        return Err(MotionError::InvalidCommand(format!("episode '{episode}' is not a valid id (1-64 characters from A-Z a-z 0-9 _ -)")));
+    }
+    let speed = motion::num(body, "speed")?.unwrap_or(DEFAULT_REPLAY_SPEED);
+    if !REPLAY_SPEEDS.iter().any(|s| (s - speed).abs() < 1e-9) {
+        return Err(MotionError::InvalidCommand(format!("speed must be one of {REPLAY_SPEEDS:?}")));
+    }
+    Ok(ReplayRequest { episode: episode.into(), speed, gripper: motion::flag(body, "gripper", true)?, tag: motion::tag(body)? })
+}
+
+/// Supervisor state a replay is checked against (taken under the lock).
+#[derive(Debug, Clone)]
+pub struct ReplayInput {
+    pub request: ReplayRequest,
+    pub path: std::path::PathBuf,
+    pub dof: usize,
+    pub gripper_idx: Option<usize>,
+    /// Joint soft limits (`config.limits`).
+    pub limits: Vec<JointLimit>,
+    /// Planned-motion limits (`planning_limits()`): the speed bound of the check.
+    pub speed_limits: Vec<JointLimit>,
+    pub ws: Option<(WorkspacePolicy, CameraMount)>,
+    pub arm: ArmModel,
+    /// Commanded positions when the replay was requested (workspace rule baseline).
+    pub start: Vec<f32>,
+    pub control_hz: u32,
+    pub epoch: u64,
+    pub workspace_revision: u64,
+}
+
+/// A checked replay ready to install.
+#[derive(Debug, Clone)]
+pub struct ReplayPlan {
+    pub input: ReplayInput,
+    /// Recording resampled at `sample_dt` (recorded time); `samples[k]` is at `k * sample_dt`.
+    pub samples: Vec<Vec<f32>>,
+    pub sample_dt: f64,
+    /// Recorded duration (s).
+    pub duration: f64,
+}
+
+fn rejected(status: u16, code: &str, message: String) -> ArmError {
+    ArmError::Rejected { status, code: code.into(), message }
+}
+
+/// Resample `frames` (by timestamp) at `dt`, linear between frames. Timestamps must be
+/// finite and non-decreasing; frames with the same timestamp keep the last one.
+pub fn resample(frames: &[RecordFrame], dt: f64) -> Result<(Vec<Vec<f32>>, f64), ArmError> {
+    if frames.len() < 2 {
+        return Err(rejected(422, "REPLAY_EMPTY", format!("episode has {} frame(s); replay needs at least 2", frames.len())));
+    }
+    let t0 = frames[0].timestamp;
+    for (k, w) in frames.windows(2).enumerate() {
+        if !w[0].timestamp.is_finite() || !w[1].timestamp.is_finite() || w[1].timestamp < w[0].timestamp {
+            return Err(rejected(422, "REPLAY_INVALID_EPISODE", format!("timestamps are not finite and non-decreasing at frame {}", k + 1)));
+        }
+    }
+    let duration = frames[frames.len() - 1].timestamp - t0;
+    if duration <= 0.0 {
+        return Err(rejected(422, "REPLAY_EMPTY", "episode has no duration (all frames at one timestamp)".into()));
+    }
+    if duration > MAX_REPLAY_DURATION_S {
+        return Err(rejected(422, "REPLAY_TOO_LONG", format!("episode lasts {duration:.1} s; replay is limited to {MAX_REPLAY_DURATION_S} s")));
+    }
+    let n = (duration / dt + 1e-9).floor() as usize;
+    // a tail shorter than a quarter period is dropped (the last grid sample interpolates
+    // into it), so the last segment is never so short that rounding inflates its speed
+    let mut duration = duration;
+    let tail = duration - n as f64 * dt;
+    if tail > 1e-9 && tail <= 0.25 * dt { duration = n as f64 * dt; }
+    let mut out = Vec::with_capacity(n + 2);
+    let mut i = 0;
+    for k in 0..=n {
+        let t = t0 + (k as f64 * dt).min(duration);
+        while i + 2 < frames.len() && frames[i + 1].timestamp <= t { i += 1; }
+        out.push(lerp_frames(&frames[i], &frames[i + 1], t));
+    }
+    // the last frame itself, when the grid stops short of it
+    if (n as f64) * dt < duration - 1e-9 { out.push(frames[frames.len() - 1].observation_state.clone()); }
+    Ok((out, duration))
+}
+
+fn lerp_frames(a: &RecordFrame, b: &RecordFrame, t: f64) -> Vec<f32> {
+    let span = b.timestamp - a.timestamp;
+    let f = if span > 0.0 { ((t - a.timestamp) / span).clamp(0.0, 1.0) as f32 } else { 1.0 };
+    a.observation_state.iter().zip(&b.observation_state).map(|(x, y)| x + (y - x) * f).collect()
+}
+
+/// Load, resample and check an episode for replay. Pure (file read, no lock).
+pub fn plan(input: ReplayInput) -> Result<ReplayPlan, ArmError> {
+    let frames = match crate::recording::read_frames_from_parquet(&input.path) {
+        Ok(f) => f,
+        Err(crate::recording::ParquetRecordingError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(rejected(404, "EPISODE_NOT_FOUND", format!("Episode '{}' not found", input.request.episode)));
+        }
+        Err(e) => return Err(rejected(422, "REPLAY_INVALID_EPISODE", format!("episode '{}' cannot be read: {e}", input.request.episode))),
+    };
+    plan_frames(input, &frames)
+}
+
+/// [`plan`] for frames already in memory.
+pub fn plan_frames(input: ReplayInput, frames: &[RecordFrame]) -> Result<ReplayPlan, ArmError> {
+    if frames.is_empty() {
+        return Err(rejected(422, "REPLAY_EMPTY", "episode has no frames".into()));
+    }
+    if let Some((k, f)) = frames.iter().enumerate().find(|(_, f)| f.observation_state.len() != input.dof) {
+        return Err(rejected(422, "REPLAY_JOINT_COUNT", format!(
+            "frame {k} has {} joints; this arm has {}", f.observation_state.len(), input.dof)));
+    }
+    if let Some(k) = frames.iter().position(|f| f.observation_state.iter().any(|q| !q.is_finite())) {
+        return Err(rejected(422, "REPLAY_INVALID_EPISODE", format!("frame {k} has a non-finite joint angle")));
+    }
+    let sample_dt = 1.0 / f64::from(input.control_hz.max(1));
+    let (samples, duration) = resample(frames, sample_dt)?;
+    let replayed = |j: usize| input.request.gripper || Some(j) != input.gripper_idx;
+
+    // joint soft limits, every frame
+    for f in frames {
+        for (j, (&q, l)) in f.observation_state.iter().zip(&input.limits).enumerate() {
+            if replayed(j) && (q < l.min_position || q > l.max_position) {
+                return Err(rejected(400, "SOFT_LIMIT_EXCEEDED", format!(
+                    "joint {} ({}) is {q:.4} rad at t={:.2} s, outside [{:.4}, {:.4}]",
+                    j + 1, l.name, f.timestamp - frames[0].timestamp, l.min_position, l.max_position)));
+            }
+        }
+    }
+
+    // per-joint speed at the chosen playback speed, against the planned-motion limits
+    let speed = input.request.speed as f32;
+    let mut worst: Option<(usize, f32, usize)> = None; // (joint, ratio, sample)
+    for (k, w) in samples.windows(2).enumerate() {
+        let h = if k + 2 == samples.len() { (duration - k as f64 * sample_dt).max(1e-9) } else { sample_dt };
+        for j in (0..input.dof).filter(|&j| replayed(j)) {
+            let v = (w[1][j] - w[0][j]).abs() / h as f32 * speed;
+            let limit = input.speed_limits[j].max_velocity;
+            if v > limit + SPEED_CHECK_EPS {
+                let ratio = v / limit;
+                if worst.is_none_or(|(_, r, _)| ratio > r) { worst = Some((j, ratio, k)); }
+            }
+        }
+    }
+    if let Some((j, ratio, k)) = worst {
+        let limit = input.speed_limits[j].max_velocity;
+        let max_speed = input.request.speed / f64::from(ratio);
+        return Err(rejected(422, "REPLAY_TOO_FAST", format!(
+            "joint {} moves at {:.3} rad/s at {}x (t={:.2} s); the planned-motion limit is {limit:.3} rad/s, so this episode needs a playback speed of at most {max_speed:.2}x",
+            j + 1, limit * ratio, input.request.speed, k as f64 * sample_dt)));
+    }
+
+    // workspace and keep-out boxes over every resampled frame, with the planned-motion rule
+    if let Some((ws, cam)) = input.ws.as_ref() {
+        let held = |q: &[f32]| -> Vec<f32> {
+            let mut q = q.to_vec();
+            if let (false, Some(g)) = (input.request.gripper, input.gripper_idx) { q[g] = input.start[g]; }
+            q
+        };
+        let path: Vec<Vec<f32>> = samples.iter().map(|q| held(q)).collect();
+        crate::supervisor::check_path_with(&input.arm, ws, cam, &input.start, path.iter().map(Vec::as_slice))
+            .map_err(workspace_reject)?;
+        if !ws.keepout_boxes.is_empty() {
+            let at = |t: f64| -> Vec<f32> {
+                let k = (t.floor() as usize).min(path.len() - 1);
+                let b = (k + 1).min(path.len() - 1);
+                let f = (t - k as f64).clamp(0.0, 1.0) as f32;
+                path[k].iter().zip(&path[b]).map(|(x, y)| x + (y - x) * f).collect()
+            };
+            let travel = |t0: f64, t1: f64| -> Vec<f64> {
+                // linear segments: per-joint travel is the sum over the segments crossed
+                let (a, b) = (t0.min(t1).max(0.0), t0.max(t1).min((path.len() - 1) as f64));
+                let mut tr = vec![0.0f64; input.dof];
+                let mut k = a.floor() as usize;
+                while (k as f64) < b && k + 1 < path.len() {
+                    let lo = a.max(k as f64);
+                    let hi = b.min(k as f64 + 1.0);
+                    for (j, t) in tr.iter_mut().enumerate() { *t += f64::from((path[k + 1][j] - path[k][j]).abs()) * (hi - lo); }
+                    k += 1;
+                }
+                tr
+            };
+            let knots: Vec<f64> = (0..path.len()).map(|k| k as f64).collect();
+            crate::supervisor::keepout_sweep_with(&input.arm, ws, cam, &at, &travel, &knots, MAX_KEEPOUT_EVALS_PER_PLAN)
+                .map_err(workspace_reject)?;
+        }
+    }
+    Ok(ReplayPlan { input, samples, sample_dt, duration })
+}
+
+fn workspace_reject(e: SafetyError) -> ArmError {
+    rejected(422, "WORKSPACE_VIOLATION", format!("episode leaves the allowed workspace: {e}"))
+}
+
+#[derive(Debug, Clone)]
+enum Phase {
+    Approach(MultiJointQuinticTrajectory),
+    Follow { t: f64, stalled_for: f64 },
+    Settle(Settle),
+}
+
+/// Action reference of a replay: approach quintic, then the resampled frames.
+#[derive(Debug, Clone)]
+pub struct ReplayMotion {
+    pub episode: String,
+    pub speed: f64,
+    pub gripper: bool,
+    pub gripper_idx: Option<usize>,
+    pub samples: Vec<Vec<f32>>,
+    pub sample_dt: f64,
+    pub duration: f64,
+    /// Gripper command held when `gripper` is false.
+    hold_gripper: Option<f32>,
+    approach_duration: f64,
+    phase: Phase,
+}
+
+impl ReplayMotion {
+    /// Recording time reached (s): 0 during the approach.
+    pub fn t_s(&self) -> f64 {
+        match &self.phase { Phase::Approach(_) => 0.0, Phase::Follow { t, .. } => *t, Phase::Settle(_) => self.duration }
+    }
+
+    pub fn phase_name(&self) -> &'static str {
+        match self.phase { Phase::Approach(_) => "approach", Phase::Follow { .. } => "replay", Phase::Settle(_) => "settle" }
+    }
+
+    /// Approach + playback at `speed` + settle allowance (s).
+    pub fn expected_duration(&self) -> f64 { self.approach_duration + self.duration / self.speed + 0.5 }
+
+    fn sample_at(&self, t: f64) -> Vec<f32> {
+        let x = (t / self.sample_dt).max(0.0);
+        let k = (x.floor() as usize).min(self.samples.len() - 1);
+        let b = (k + 1).min(self.samples.len() - 1);
+        // the last segment may be shorter than sample_dt
+        let seg = if b + 1 == self.samples.len() { (self.duration - k as f64 * self.sample_dt).max(1e-9) } else { self.sample_dt };
+        let f = ((t - k as f64 * self.sample_dt) / seg).clamp(0.0, 1.0) as f32;
+        self.samples[k].iter().zip(&self.samples[b]).map(|(x, y)| x + (y - x) * f).collect()
+    }
+
+    /// Gripper joint of `q`: held when not replayed; while the stall latch holds it, a
+    /// command further into the stall direction is held and a reversal releases the latch
+    /// (the servo / jog rule). Returns whether the latch is to be cleared.
+    fn apply_gripper(&self, q: &mut [f32], ctx: &StepCtx) -> bool {
+        let Some(g) = self.gripper_idx.filter(|g| *g < q.len()) else { return false; };
+        if let Some(h) = self.hold_gripper { q[g] = h; return false; }
+        if !ctx.gripper_stalled { return false; }
+        let delta = q[g] - ctx.commanded[g];
+        let tau = ctx.torques.get(g).copied().unwrap_or(0.0);
+        if delta * tau < -1e-4 || delta * ctx.gripper_stall_sign < -1e-4 { return true; }
+        q[g] = ctx.commanded[g];
+        false
+    }
+
+    pub fn step(&mut self, ctx: &StepCtx) -> StepOut {
+        let n = ctx.commanded.len();
+        let progress = (self.t_s() / self.duration).clamp(0.0, 1.0) as f32;
+        match &mut self.phase {
+            Phase::Approach(traj) => {
+                let point = traj.step(ctx.dt);
+                let finished = traj.is_finished();
+                let mut q = point.positions;
+                let mut v = point.velocities;
+                let clear = self.apply_gripper(&mut q, ctx);
+                if let Some(g) = self.gripper_idx { if q[g] == ctx.commanded[g] { v[g] = 0.0; } }
+                if finished { self.phase = Phase::Follow { t: 0.0, stalled_for: 0.0 }; }
+                StepOut { positions: q, velocities: v, status: StepStatus::Running, progress: 0.0, clear_gripper_stall: clear }
+            }
+            Phase::Follow { t, stalled_for } => {
+                // lag-aware time scaling, as for planned paths
+                let lag = (0..n).filter(|&i| Some(i) != self.gripper_idx)
+                    .map(|i| f64::from((ctx.commanded[i] - ctx.measured[i]).abs())).fold(0.0, f64::max);
+                let lag = if lag.is_finite() { lag } else { f64::INFINITY };
+                let rate = ((LAG_STOP - lag) / (LAG_STOP - LAG_FULL)).clamp(0.0, 1.0);
+                // the rate approaches 0 as the lag approaches LAG_STOP; below STALL_RATE the
+                // replay counts as not progressing
+                if rate <= STALL_RATE {
+                    *stalled_for += ctx.dt;
+                    if *stalled_for >= STALL_TIMEOUT_S - 1e-9 {
+                        return StepOut {
+                            positions: ctx.commanded.to_vec(), velocities: vec![0.0; n], progress, clear_gripper_stall: false,
+                            status: StepStatus::Failed { code: "TRACKING_STALL", message: format!(
+                                "Arm did not follow the replay for {STALL_TIMEOUT_S} s (lag {lag:.3} rad); motion stopped") },
+                        };
+                    }
+                } else {
+                    *stalled_for = 0.0;
+                }
+                *t = (*t + ctx.dt * self.speed * rate).min(self.duration);
+                let t_now = *t;
+                let mut q = self.sample_at(t_now);
+                let clear = self.apply_gripper(&mut q, ctx);
+                let velocities: Vec<f32> = (0..n).map(|i| ((q[i] - ctx.commanded[i]) as f64 / ctx.dt) as f32).collect();
+                if t_now >= self.duration { self.phase = Phase::Settle(Settle::default()); }
+                StepOut { positions: q, velocities, status: StepStatus::Running, progress: (t_now / self.duration).min(1.0) as f32, clear_gripper_stall: clear }
+            }
+            Phase::Settle(settle) => {
+                let status = match settle.step(ctx.dt, ctx.commanded, ctx.measured, ctx.measured_velocities) {
+                    Some(settled) => StepStatus::Done { settled: Some(settled), holding: None, gripper_gap_rad: None },
+                    None => StepStatus::Running,
+                };
+                StepOut { positions: ctx.commanded.to_vec(), velocities: vec![0.0; n], status, progress: 1.0, clear_gripper_stall: false }
+            }
+        }
+    }
+}
+
+impl SupervisorInner {
+    /// Busy rules of a replay, in addition to [`action_preconditions`](Self::action_preconditions).
+    fn replay_preconditions(&self) -> Result<(), ArmError> {
+        if self.recorder.state() == &crate::recording::EpisodeState::Recording
+            || self.recorder.state() == &crate::recording::EpisodeState::Finalizing {
+            return Err(MotionError::MotionBusy("an episode recording is running; save or discard it first".into()).into());
+        }
+        self.gravity_comp_motion_busy()?;
+        self.action_preconditions()
+    }
+
+    /// Snapshot for [`plan`] (under the lock, after the lease / epoch checks).
+    pub fn replay_input(&self, request: ReplayRequest, epoch: u64) -> Result<ReplayInput, ArmError> {
+        if epoch != self.safety.epoch_id() {
+            return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
+        }
+        let path = self.episodes.path_of(&request.episode)?;
+        self.replay_preconditions()?;
+        Ok(ReplayInput {
+            path,
+            dof: self.config.dof,
+            gripper_idx: self.config.gripper_index(),
+            limits: self.config.limits.clone(),
+            speed_limits: self.planning_limits(),
+            ws: self.workspace_policy().map(|(ws, cam)| (ws.clone(), cam.clone())),
+            arm: self.config.arm_model.clone(),
+            start: self.commanded_positions.clone(),
+            control_hz: self.config.control_frequency_hz,
+            epoch,
+            workspace_revision: self.workspace_revision,
+            request,
+        })
+    }
+
+    /// Install a checked replay: plan the approach to the first frame at the planned-motion
+    /// limits, then start the action. Returns (action id, expected duration).
+    pub fn install_replay(&mut self, plan: ReplayPlan) -> Result<(u64, f64), ArmError> {
+        let input = &plan.input;
+        if self.safety.epoch_id() != input.epoch {
+            return Err(MotionError::PlanStale("epoch changed while loading the episode".into()).into());
+        }
+        if self.workspace_revision != input.workspace_revision {
+            return Err(MotionError::PlanStale("workspace or keep-out boxes changed while loading the episode".into()).into());
+        }
+        self.replay_preconditions()?;
+        if self.commanded_positions.iter().zip(&input.start).any(|(a, b)| (a - b).abs() >= 1e-4) {
+            return Err(MotionError::PlanStale("commanded positions changed while loading the episode".into()).into());
+        }
+        let gripper_idx = input.gripper_idx;
+        let hold_gripper = gripper_idx.filter(|_| !input.request.gripper).map(|g| self.commanded_positions[g]);
+        let mut first = plan.samples[0].clone();
+        if let (Some(g), Some(h)) = (gripper_idx, hold_gripper) { first[g] = h; }
+        self.safety.validate_motion_command(Some(input.epoch), &first, &self.config.limits)?;
+        let limits = self.planning_limits();
+        let traj = TrajectoryPlanner::plan(&self.commanded_positions, &self.commanded_velocities, &first,
+            &vec![0.0; self.config.dof], None, &limits)?;
+        let checks = self.workspace_samples(&traj)?;
+        self.check_workspace_path(&self.commanded_positions, checks.iter().map(Vec::as_slice))?;
+
+        let ReplayPlan { input, samples, sample_dt, duration } = plan;
+        let motion = ReplayMotion {
+            episode: input.request.episode.clone(), speed: input.request.speed, gripper: input.request.gripper,
+            gripper_idx, samples, sample_dt, duration, hold_gripper,
+            approach_duration: traj.duration, phase: Phase::Approach(traj),
+        };
+        let expected = motion.expected_duration();
+        self.servo_target = None;
+        self.servo_settled_ticks.fill(0);
+        self.target_positions = first;
+        self.safety.mark_motion_started()?;
+        self.last_heartbeat = std::time::Instant::now();
+        let id = self.begin_action("replay", input.request.tag.clone());
+        if let Some(a) = self.last_action.as_mut() {
+            a.episode = Some(input.request.episode.clone());
+            a.phase = Some("approach".into());
+            a.t_s = Some(0.0);
+        }
+        self.active_trajectory = Some(crate::motion::ActiveTrajectory { action_id: Some(id), reference: crate::motion::Reference::Replay(Box::new(motion)) });
+        tracing::info!("Replay of '{}' started (action {id}, {}x, gripper {}, {:.1} s recorded)",
+            input.request.episode, input.request.speed, input.request.gripper, duration);
+        Ok((id, expected))
+    }
+
+    /// Check and start a replay under the caller's lock (tests, in-process callers). The WS
+    /// command loads and checks the episode without the lock.
+    pub fn start_replay(&mut self, request: ReplayRequest, epoch: u64) -> Result<(u64, f64), ArmError> {
+        let input = self.replay_input(request, epoch)?;
+        let plan = plan(input)?;
+        self.install_replay(plan)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(t: f64, q: &[f32]) -> RecordFrame { RecordFrame { timestamp: t, observation_state: q.to_vec(), action: q.to_vec() } }
+
+    #[test]
+    fn parse_rules() {
+        let r = parse_replay(&serde_json::json!({"episode": "ep_1"})).unwrap();
+        assert_eq!((r.speed, r.gripper), (0.5, true));
+        let r = parse_replay(&serde_json::json!({"episode": "ep_1", "speed": 1.0, "gripper": false, "tag": "x"})).unwrap();
+        assert_eq!((r.speed, r.gripper, r.tag.as_deref()), (1.0, false, Some("x")));
+        for bad in [serde_json::json!({}), serde_json::json!({"episode": "../a"}), serde_json::json!({"episode": "a", "speed": 2.0}),
+                    serde_json::json!({"episode": "a", "speed": 0.7}), serde_json::json!({"episode": "a", "gripper": 1})] {
+            assert_eq!(parse_replay(&bad).unwrap_err().code(), "INVALID_COMMAND", "{bad}");
+        }
+    }
+
+    #[test]
+    fn resample_by_timestamp() {
+        // 3 frames with uneven spacing, resampled at 0.02 s
+        let frames = vec![frame(5.0, &[0.0]), frame(5.03, &[0.3]), frame(5.05, &[0.3]), frame(5.05, &[0.5]), frame(5.07, &[0.5])];
+        let (s, d) = resample(&frames, 0.02).unwrap();
+        assert!((d - 0.07).abs() < 1e-12);
+        let got: Vec<f32> = s.iter().map(|q| q[0]).collect();
+        // t = 0, 0.02, 0.04, 0.06, then the last frame (0.07)
+        let want = [0.0, 0.2, 0.3, 0.5, 0.5];
+        assert_eq!(got.len(), want.len(), "{got:?}");
+        for (g, w) in got.iter().zip(want) { assert!((g - w).abs() < 1e-5, "{got:?}"); }
+        // exact grid: no extra sample
+        let frames: Vec<_> = (0..5).map(|k| frame(k as f64 * 0.02, &[k as f32])).collect();
+        assert_eq!(resample(&frames, 0.02).unwrap().0.len(), 5);
+        // errors
+        let code = |e: ArmError| match e { ArmError::Rejected { code, .. } => code, e => panic!("{e:?}") };
+        assert_eq!(code(resample(&frames[..1], 0.02).unwrap_err()), "REPLAY_EMPTY");
+        assert_eq!(code(resample(&[frame(1.0, &[0.0]), frame(1.0, &[0.0])], 0.02).unwrap_err()), "REPLAY_EMPTY");
+        assert_eq!(code(resample(&[frame(1.0, &[0.0]), frame(0.5, &[0.0])], 0.02).unwrap_err()), "REPLAY_INVALID_EPISODE");
+        assert_eq!(code(resample(&[frame(0.0, &[0.0]), frame(f64::NAN, &[0.0])], 0.02).unwrap_err()), "REPLAY_INVALID_EPISODE");
+        assert_eq!(code(resample(&[frame(0.0, &[0.0]), frame(601.0, &[0.0])], 0.02).unwrap_err()), "REPLAY_TOO_LONG");
+    }
+}
