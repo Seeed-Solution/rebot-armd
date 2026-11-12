@@ -57,6 +57,12 @@ def wait_http(url: str, proc: subprocess.Popen, log, timeout: float = 30.0) -> N
 # v5_noise / v8_noise: detector-like errors (jitter, size jitter, drops, 100 ms latency).
 NOISE = ["--det-jitter-px", "3", "--det-size-jitter", "0.05", "--det-drop-rate", "0.1", "--det-latency-ms", "100",
          "--det-noise-seed", "1"]
+# axis_*: lens 45 mm off the tool axis (AXIS_LENS, end_link) instead of the v8 holder's 66 mm,
+# just outside the gripper (the kit check points reach 34.7 mm), so the object under the jaws
+# stays inside the image at the approach height and armd's height probe runs. With the 66 mm
+# lens centre the box reaches the image border (u about 0.04) and the probe falls back with
+# height_reason "border"; a lens on the tool axis sees only the gripper.
+AXIS_LENS = ["--camera-offset=-0.0731,0.0005,0.045"]
 CASES = {
     "default": ([], None),
     "seed3_cube_cup": (["--objects", "cube,cup", "--seed", "3"], None),
@@ -64,7 +70,12 @@ CASES = {
     "v8_seed3_cube_cup": (["--objects", "cube,cup", "--seed", "3"], (90.0, -38.0)),
     "v5_noise": (NOISE, None),
     "v8_noise": (NOISE, (90.0, -38.0)),
+    "axis_cube": (AXIS_LENS, None),
+    "axis_cup": ([*AXIS_LENS, "--objects", "cup"], None),
 }
+# object the case grasps (default: the cube) and its height (scene.py KINDS)
+TARGETS = {"axis_cup": "cup"}
+HEIGHTS_M = {"cube": 0.04, "cup": 0.07, "block": 0.04}
 
 
 def view_pose(cam: dict, cube_xy, z: float, miss_m=(0.0, 0.0)):
@@ -111,7 +122,7 @@ def cam_rig(request, tmp_path):
                             env=env, stdout=open(tmp_path / "armd.log", "w"), stderr=subprocess.STDOUT)
     wait_http(f"http://127.0.0.1:{http_port}/api/v1/observation", armd, tmp_path / "armd.log")
     client = Client(http_port)
-    yield client, base, cam, tmp_path, v8 is not None
+    yield client, base, cam, tmp_path, v8 is not None, request.param
     client.close()
     for p in (armd, sim):
         p.terminate()
@@ -123,7 +134,8 @@ def cam_rig(request, tmp_path):
 
 @pytest.mark.slow
 def test_tap_to_grasp_the_cube(cam_rig):
-    client, base, cam, logs, v8 = cam_rig
+    client, base, cam, logs, v8, case = cam_rig
+    target = TARGETS.get(case, "cube")
     deadline = time.time() + 10
     while not client.observation()["feedback_valid"] and time.time() < deadline:
         time.sleep(0.1)
@@ -132,7 +144,7 @@ def test_tap_to_grasp_the_cube(cam_rig):
 
     # the operator brings the cube into view: v5 tool down above it; v8 tool pitched half way
     # toward camera-down, the image centre 2 cm from the cube
-    cube_xy = next(o for o in http(base + "/sim/state")["objects"] if o["name"] == "cube")["pos"][:2]
+    cube_xy = next(o for o in http(base + "/sim/state")["objects"] if o["name"] == target)["pos"][:2]
     if v8:
         view, orientation = view_pose(cam, cube_xy, 0.20, (0.02, -0.01))
         orientation = {"quat": orientation}
@@ -147,7 +159,7 @@ def test_tap_to_grasp_the_cube(cam_rig):
     for _ in range(5):  # a noisy detector may miss the cube in a frame (--det-drop-rate)
         det = http(client.base + "/api/v1/detection/trigger?wait_ms=2000", {"pipelines": ["yolo"]})
         print(f"\ntrigger via armd: frame {det.get('frame_id')} detections {det.get('detections')}")
-        cubes = [d for d in det["detections"] if d["class_name"] == "cube"]
+        cubes = [d for d in det["detections"] if d["class_name"] == target]
         if cubes:
             break
     assert cubes, det
@@ -161,7 +173,7 @@ def test_tap_to_grasp_the_cube(cam_rig):
     if not v8:  # v8: the point under the jaws is outside the image at 0.15 m; camera-down does not use it
         overrides["grip_pixel_norm"] = cam["grip_pixel_norm_at"][f"{approach:.2f}"]
     t0 = time.time()
-    ack = client.command("/api/v1/action/grasp", {"label": "cube", "box_norm": box, "frame_id": det["frame_id"],
+    ack = client.command("/api/v1/action/grasp", {"label": target, "box_norm": box, "frame_id": det["frame_id"],
                                                   "overrides": overrides})
     rec = None
     while time.time() - t0 < 120:
@@ -177,15 +189,26 @@ def test_tap_to_grasp_the_cube(cam_rig):
         time.sleep(0.2)
     dt = time.time() - t0
     state = http(base + "/sim/state")
-    cube = next(o for o in state["objects"] if o["name"] == "cube")
-    print(f"grasp: {rec and rec['state']} code={rec and rec.get('code')} holding={rec and rec.get('holding')} "
-          f"iterations={rec and rec.get('iteration')} error_px={rec and rec.get('error_px')} "
-          f"final_offset_px={rec and rec.get('final_offset_px')} expected={ack.get('expected_duration_s')} s in {dt:.1f} s")
-    print(f"cube after the grasp: {cube}")
+    cube = next(o for o in state["objects"] if o["name"] == target)
+    r = rec or {}
+    print(f"grasp: {r.get('state')} code={r.get('code')} holding={r.get('holding')} "
+          f"iterations={r.get('iteration')} error_px={r.get('error_px')} "
+          f"final_offset_px={r.get('final_offset_px')} expected={ack.get('expected_duration_s')} s in {dt:.1f} s "
+          f"height_source={r.get('height_source')} height_reason={r.get('height_reason')} "
+          f"object_height_m={r.get('object_height_m')} close_height_m={r.get('close_height_m')} probe_dz_m={r.get('probe_dz_m')} "
+          f"align={r.get('align')} recentre={r.get('recentre')} post_lift={r.get('post_lift')}")
+    print(f"{target} after the grasp: {cube}")
     assert rec is not None and rec["state"] == "done" and rec["holding"] is True, \
         json.dumps(rec) + "\n" + (logs / "armd.log").read_text()[-3000:]
     assert cube["grasped"] and cube["lifted_m"] > 0.05, cube
     assert math.hypot(cube["pos"][0] - state["tcp"][0], cube["pos"][1] - state["tcp"][1]) < 0.03
-    others = [o for o in state["objects"] if o["name"] != "cube"]
+    others = [o for o in state["objects"] if o["name"] != target]
     assert all(not o["contacts"]["jaws"] for o in others), others
-    print(f"cube started at {cube_xy}")
+    print(f"{target} started at {cube_xy}")
+    if case.startswith("axis_"):
+        # the height probe ran: the object's top within 10 mm, the jaws closed part way up
+        h = HEIGHTS_M[target]
+        assert rec["height_source"] == "scale", json.dumps(rec)
+        assert abs(rec["object_height_m"] - h) <= 0.01, json.dumps(rec)
+        expect_close = min(max(rec["object_height_m"] * 0.5, 0.015), 0.06)
+        assert abs(rec["close_height_m"] - expect_close) < 1e-3, json.dumps(rec)
