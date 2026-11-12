@@ -178,7 +178,7 @@ impl Default for GraspSetup {
             height_probe_m: 0.10,
             height_grasp_fraction: 0.5,
             max_grasp_height_m: 0.06,
-            recentre_height_m: 0.07,
+            recentre_height_m: 0.0,
             recentre_max_iterations: 3,
             descend_contact_stop_nm: None,
             post_lift_settle_ms: 300,

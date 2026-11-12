@@ -1355,12 +1355,12 @@ async fn height_probe_falls_back_to_a_shorter_raise() {
 
 // ---- mid-height re-centre and descent contact ----
 
-/// Look-down with the lens on the tool axis: the target is re-centred at 0.07 m on the way
-/// down; losing it there skips the re-centre and the grasp completes.
+/// Look-down with the lens on the tool axis, re-centre enabled at 0.07 m (off by default): the
+/// target is re-centred on the way down; losing it there skips the re-centre and the grasp completes.
 #[tokio::test]
 async fn recentre_at_mid_height_and_skip_when_lost() {
     for lose in [false, true] {
-        let (rig, s) = height_rig(0.05, json!({})).await;
+        let (rig, s) = height_rig(0.05, json!({"recentre_height_m": 0.07})).await;
         let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
         if lose {
             wait_phase(&rig.sup, id, "recentre", None).await;

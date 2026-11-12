@@ -300,7 +300,7 @@ Persistence: `ARMD_GRASP_SETUP` (default `/userdata/rebot-teleop/grasp_setup.jso
 | `align_min_angle_conf` | 0.3 | [0, 1]: detector angles with at least this confidence decide the J6 roll ([robustness steps](#robustness-steps--稳健性步骤)) |
 | `height_probe_m` | 0.10 | [0, 0.1] m: upward height probe distance (0.06 m when that pose is unreachable); 0 disables |
 | `height_grasp_fraction`, `max_grasp_height_m` | 0.5, 0.06 | close height = clamp(top · fraction, `grasp_height_m`, `max_grasp_height_m`); fraction [0, 1], max in [`grasp_height_m`, 0.2] m |
-| `recentre_height_m`, `recentre_max_iterations` | 0.07, 3 | look-down mid-height re-centre; height [0, 0.4] m (0 disables; skipped at run time unless above the close height + 0.02 and below the TCP), iterations 1..30 |
+| `recentre_height_m`, `recentre_max_iterations` | 0 (off), 3 | look-down mid-height re-centre; height [0, 0.4] m (0 disables; off by default: in the camera e2e cases it was always skipped with `aim_outside_image`; 0.07 enables it; skipped at run time unless above the close height + 0.02 and below the TCP), iterations 1..30 |
 | `descend_contact_stop_nm` | null | null or (0, 50] N·m: J2 / J3 residual that stops the descent |
 | `post_lift_settle_ms` | 300 | [0, 5000]: wait before the holding re-check after the lift |
 
