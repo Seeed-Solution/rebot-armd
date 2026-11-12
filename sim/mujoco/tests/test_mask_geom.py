@@ -80,10 +80,13 @@ def test_stretched_rect_matches_unstretched(vectors):
 
     res_0 = mask_cross_section(xs_0, ys_0, scale_x=sx_0, scale_y=sy_0)
     res_str = mask_cross_section(xs_str, ys_str, scale_x=sx_str, scale_y=sy_str)
-    assert res_str == res_0
-
-    # Also test mask_orientation matches
-    assert mask_orientation(xs_str, ys_str, scale_x=sx_str, scale_y=sy_str) == mask_orientation(xs_0, ys_0, scale_x=sx_0, scale_y=sy_0)
+    # a resampled mask differs from the original only by discretisation
+    assert abs((res_str[0] - res_0[0] + 90) % 180 - 90) <= 0.5, (res_str, res_0)
+    assert abs(res_str[2] - res_0[2]) <= 1.0, (res_str, res_0)
+    assert abs(res_str[1] - res_0[1]) <= 0.03, (res_str, res_0)
+    a_str, c_str = mask_orientation(xs_str, ys_str, scale_x=sx_str, scale_y=sy_str)
+    a_0, c_0 = mask_orientation(xs_0, ys_0, scale_x=sx_0, scale_y=sy_0)
+    assert abs((a_str - a_0 + 90) % 180 - 90) <= 0.5 and abs(c_str - c_0) <= 0.03
 
 
 def test_disc_confidence_low(vectors):

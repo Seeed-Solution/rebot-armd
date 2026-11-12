@@ -269,7 +269,8 @@ def mask_cross_section(
         in_band = np.abs(n_dot) <= (band_px / 2.0)
         if np.any(in_band):
             proj = cos_t * dx[in_band] + sin_t * dy[in_band]
-            widths[theta] = float(proj.max() - proj.min() + 1.0)
+            # + one sample's extent along the closing direction: a mask sample is scale_x x scale_y px
+            widths[theta] = float(proj.max() - proj.min() + abs(cos_t) * scale_x + abs(sin_t) * scale_y)
         else:
             widths[theta] = 0.0
 
