@@ -382,6 +382,7 @@ static void test_latest() {
     v.ts_ms = 1000000;
     v.mode = Mode::Both;
     v.ran_yolo = v.ran_aruco = true;
+    v.mask_ms = 4.2f;
     v.detections_json = "[]";
     v.markers_json = R"([{"id":1}])";
     v.count = 1;
@@ -389,6 +390,12 @@ static void test_latest() {
     r = req(c, "GET", "/api/results/latest");
     CHECK(r["frame_id"] == 7 && r["age_ms"] == 100 && !r.contains("timeout"));
     CHECK(r["mode"] == "both" && r["family"] == "aruco4x4_50" && r["count"] == 1);
+    CHECK(std::abs(r["pipelines"]["yolo"]["mask_ms"].get<double>() - 4.2) < 1e-3);
+
+    v.mask_ms = -1.0f;
+    c.publish(v);
+    r = req(c, "GET", "/api/results/latest");
+    CHECK(!r["pipelines"]["yolo"].contains("mask_ms"));
     r = req(c, "GET", "/api/results/latest?after=7&wait_ms=50");
     CHECK(r["timeout"] == true);
 
@@ -426,6 +433,24 @@ static void test_result_json() {
     d[0].y = 140.0f / 640.0f;
     j = json::parse(detections_json(d, content_rect(640, 640, 1280, 720), 640, 640));
     CHECK(std::abs(j[0]["y"].get<double>()) < 1e-3);
+
+    // finite angle and grasp width
+    d[0].angle_deg = 45.25f;
+    d[0].angle_conf = 0.952f;
+    d[0].grasp_width_px = 32.50f;
+    j = json::parse(detections_json(d, content_rect(640, 640, 1280, 720), 640, 640));
+    CHECK(std::abs(j[0]["angle_deg"].get<double>() - 45.25) < 1e-2);
+    CHECK(std::abs(j[0]["angle_conf"].get<double>() - 0.952) < 1e-3);
+    CHECK(std::abs(j[0]["grasp_width_px"].get<double>() - 32.50) < 1e-2);
+
+    // NAN angle and grasp width should be omitted from JSON
+    d[0].angle_deg = NAN;
+    d[0].angle_conf = NAN;
+    d[0].grasp_width_px = NAN;
+    j = json::parse(detections_json(d, content_rect(640, 640, 1280, 720), 640, 640));
+    CHECK(!j[0].contains("angle_deg"));
+    CHECK(!j[0].contains("angle_conf"));
+    CHECK(!j[0].contains("grasp_width_px"));
 
     MarkerOut m;
     m.id = 3;
@@ -704,8 +729,56 @@ static void test_http_server() {
     server.stop();
 }
 
+static void test_status_endpoint() {
+    // 1. Detect options: model_kind = "detect", mask = false
+    {
+        VisionControl::Options o = opts(Mode::Yolo);
+        o.model_kind = "detect";
+        o.mask = false;
+        VisionControl c(o, nullptr);
+        int st = 0;
+        json j = req(c, "GET", "/api/status", "", &st);
+        CHECK(st == 200);
+        CHECK(j.contains("model"));
+        CHECK(j["model"]["name"] == "yolo11n");
+        CHECK(j["model"]["path"] == "/userdata/local/models/yolo11n.cvimodel");
+        CHECK(j["model"]["kind"] == "detect");
+        CHECK(j["model"]["mask"] == false);
+    }
+    // 2. Segment options: model_kind = "segment", mask = true
+    {
+        VisionControl::Options o = opts(Mode::Yolo);
+        o.model_name = "yolo11n-seg";
+        o.model_path = "/userdata/local/models/yolo11n-seg.cvimodel";
+        o.model_kind = "segment";
+        o.mask = true;
+        VisionControl c(o, nullptr);
+        int st = 0;
+        json j = req(c, "GET", "/api/status", "", &st);
+        CHECK(st == 200);
+        CHECK(j.contains("model"));
+        CHECK(j["model"]["name"] == "yolo11n-seg");
+        CHECK(j["model"]["path"] == "/userdata/local/models/yolo11n-seg.cvimodel");
+        CHECK(j["model"]["kind"] == "segment");
+        CHECK(j["model"]["mask"] == true);
+    }
+    // 3. Segment options with mask = false
+    {
+        VisionControl::Options o = opts(Mode::Yolo);
+        o.model_kind = "segment";
+        o.mask = false;
+        VisionControl c(o, nullptr);
+        int st = 0;
+        json j = req(c, "GET", "/api/status", "", &st);
+        CHECK(st == 200);
+        CHECK(j["model"]["kind"] == "segment");
+        CHECK(j["model"]["mask"] == false);
+    }
+}
+
 int main() {
     test_modes();
+    test_status_endpoint();
     test_yolo_unavailable();
     test_trigger_each_mode();
     test_trigger_timeout_and_continuous();

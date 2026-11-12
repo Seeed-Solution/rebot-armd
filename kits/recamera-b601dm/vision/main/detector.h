@@ -1,13 +1,16 @@
 #ifndef _DETECTOR_H_
 #define _DETECTOR_H_
 
-#include <vector>
-#include <string>
+#include <cmath>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include <sscma.h>
 
 namespace yolo {
+
+enum Kind { Detect, Segment };
 
 struct Detection {
     float x;            // Normalized [0-1]
@@ -17,7 +20,12 @@ struct Detection {
     float confidence;
     int class_id;
     int id;
+    float angle_deg = NAN;
+    float angle_conf = NAN;
+    float grasp_width_px = NAN;
 };
+
+class SegModel;
 
 class Detector {
 public:
@@ -29,6 +37,13 @@ public:
 
     std::vector<Detection> detect(ma_img_t* img);
 
+    Kind getKind() const { return kind_; }
+    float mask_ms() const;
+
+    void setMaskEnabled(bool enabled);
+    void setMaskMaxBoxes(int max_boxes);
+    void setScale(float sx, float sy);
+
     int getInputWidth() const { return input_width_; }
     int getInputHeight() const { return input_height_; }
     bool isInitialized() const { return initialized_; }
@@ -38,6 +53,8 @@ public:
 private:
     std::unique_ptr<ma::engine::EngineCVI> engine_;
     ma::model::Detector* model_;
+    std::unique_ptr<SegModel> seg_model_;
+    Kind kind_;
     float threshold_;
     int input_width_;
     int input_height_;

@@ -99,6 +99,7 @@ struct VisionResult {
     bool ran_aruco = false;
     float yolo_ms = 0;
     float aruco_ms = 0;
+    float mask_ms = -1.0f;
     int width = 640;   ///< visible image size that detections / markers refer to
     int height = 360;
     std::string detections_json = "[]";  ///< normalised to width x height
@@ -149,6 +150,9 @@ public:
         bool yolo_available = true;
         std::string model_name;
         std::string model_path;
+        std::string model_kind = "detect";
+        bool mask = false;
+        int mask_max_boxes = 3;
         std::string family = "aruco4x4_50";
     };
 
@@ -191,6 +195,9 @@ public:
     bool yolo_available() const noexcept { return yolo_available_; }
     const std::string& model_name() const noexcept { return model_name_; }
     const std::string& model_path() const noexcept { return model_path_; }
+    const std::string& model_kind() const noexcept { return model_kind_; }
+    bool mask_enabled() const noexcept { return mask_; }
+    int mask_max_boxes() const noexcept { return mask_max_boxes_; }
     const std::string& family() const noexcept { return family_; }
 
     /** Camera gate rate requested last (camera_gate_fps for the current state). */
@@ -268,6 +275,9 @@ private:
     const bool yolo_available_;
     const std::string model_name_;
     const std::string model_path_;
+    const std::string model_kind_;
+    const bool mask_;
+    const int mask_max_boxes_;
     const std::string family_;
     OnChange on_change_;
     mutable std::mutex mu_;

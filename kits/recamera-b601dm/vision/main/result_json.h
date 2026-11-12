@@ -3,6 +3,7 @@
 #ifndef REBOT_VISION_RESULT_JSON_H_
 #define REBOT_VISION_RESULT_JSON_H_
 
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,9 @@ struct DetBox {
     float confidence = 0;
     int class_id = 0;
     const char* class_name = "unknown";
+    float angle_deg = NAN;
+    float angle_conf = NAN;
+    float grasp_width_px = NAN;
 };
 
 /**

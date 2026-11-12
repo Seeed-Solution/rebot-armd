@@ -45,6 +45,7 @@ struct Config {
     float conf_threshold = 0.25f;
     rv::Mode mode = rv::Mode::Yolo;
     bool inference_enabled = false;
+    bool mask_enabled = true;
     int fps = 5;  // one inference rate for every mode
 
     int inference_w = 640;
@@ -162,6 +163,7 @@ void load_config_file(const std::string& path) {
     boolean("lazy_clusters", g_cfg.aruco.lazy_clusters);
     boolean("reuse_buffers", g_cfg.aruco.reuse_buffers);
     boolean("size_gate", g_cfg.aruco.size_gate);
+    boolean("mask", g_cfg.mask_enabled);
     num("adaptive_decimate", g_cfg.aruco.adaptive_decimate);
     num("adaptive_min_side", g_cfg.aruco.adaptive_min_side_px);
     boolean("roi_tracking", g_cfg.aruco.roi_tracking);
@@ -178,6 +180,7 @@ void print_usage(const char* prog) {
     printf("  --config PATH            JSON config file (keys as the long options, '_' for '-')\n");
     printf("  --mode off|yolo|aruco|both  Base mode at start [default: yolo]\n");
     printf("  --inference on|off       Default subscription (the mode API) at start [default: off = standby]\n");
+    printf("  --mask on|off            Decode instance segmentation masks [default: off]\n");
     printf("  --fps N                  Inference rate of the default subscription and cap of every\n");
     printf("                           subscription, 1..15 [default: 5]\n");
     printf("  -m, --model PATH         YOLO .cvimodel [default: first of /userdata/rebot-teleop/models/yolo11n.cvimodel,\n");
@@ -210,12 +213,13 @@ bool parse_double(const char* s, double& out, bool non_negative = false) {
 bool parse_args(int argc, char** argv) {
     enum {
         kConfig = 1000, kMode, kInference, kFps, kFx, kFy, kCx, kCy, kK1, kK2, kP1, kP2, kK3, kDecimate,
-        kMinMargin, kMinSide, kIds, kStreamFps, kStreamBitrate, kDebugPort, kControlPort
+        kMinMargin, kMinSide, kIds, kStreamFps, kStreamBitrate, kDebugPort, kControlPort, kMask
     };
     static struct option long_opts[] = {
         {"config", required_argument, nullptr, kConfig},
         {"mode", required_argument, nullptr, kMode},
         {"inference", required_argument, nullptr, kInference},
+        {"mask", required_argument, nullptr, kMask},
         {"fps", required_argument, nullptr, kFps},
         {"model", required_argument, nullptr, 'm'},
         {"conf-threshold", required_argument, nullptr, 'c'},
@@ -265,6 +269,13 @@ bool parse_args(int argc, char** argv) {
                     return false;
                 }
                 g_cfg.inference_enabled = std::strcmp(optarg, "on") == 0;
+                break;
+            case kMask:
+                if (std::strcmp(optarg, "on") && std::strcmp(optarg, "off")) {
+                    fprintf(stderr, "Invalid --mask '%s' (on|off)\n", optarg);
+                    return false;
+                }
+                g_cfg.mask_enabled = std::strcmp(optarg, "on") == 0;
                 break;
             case kFps: g_cfg.fps = std::atoi(optarg); break;
             case 'm': g_cfg.model_path = optarg; break;
@@ -378,6 +389,8 @@ int main(int argc, char** argv) {
                 model.empty() ? "default paths" : model.c_str());
     } else if (detector.init(model)) {
         detector.setThreshold(g_cfg.conf_threshold);
+        detector.setMaskEnabled(g_cfg.mask_enabled);
+        detector.setScale(4.0f, 4.0f);
         yolo_ok = true;
     } else {
         MA_LOGE(TAG, "YOLO model %s failed to load; yolo/both unavailable", model.c_str());
@@ -417,6 +430,8 @@ int main(int argc, char** argv) {
     vo.yolo_available = yolo_ok;
     vo.model_name = yolo_ok ? base_name(model) : "";
     vo.model_path = yolo_ok ? model : "";
+    vo.model_kind = (detector.getKind() == yolo::Kind::Segment ? "segment" : "detect");
+    vo.mask = g_cfg.mask_enabled && (detector.getKind() == yolo::Kind::Segment);
     vo.family = g_cfg.aruco.family;
     ma::Camera* camera = device_camera();
     rv::VisionControl ctl(vo, [&app, camera](bool on, int gate_fps) {
@@ -492,7 +507,8 @@ int main(int argc, char** argv) {
             const auto t0 = std::chrono::steady_clock::now();
             ma_img_t img = af::to_ma_img(frame);
             for (const auto& d : detector.detect(&img)) {
-                dets.push_back({d.x, d.y, d.w, d.h, d.confidence, d.class_id, yolo::Detector::getClassName(d.class_id)});
+                dets.push_back({d.x, d.y, d.w, d.h, d.confidence, d.class_id, yolo::Detector::getClassName(d.class_id),
+                                d.angle_deg, d.angle_conf, d.grasp_width_px});
                 af::Box b;  // centre pixels in the inference frame; the debug sink maps them to the display
                 b.x = d.x * frame.width;
                 b.y = d.y * frame.height;
@@ -505,6 +521,9 @@ int main(int argc, char** argv) {
             }
             vr.ran_yolo = true;
             vr.yolo_ms = ms_since(t0);
+            if (detector.getKind() == yolo::Kind::Segment) {
+                vr.mask_ms = detector.mask_ms();
+            }
             vr.detections_json = rv::detections_json(dets, content, frame.width, frame.height);
         }
         std::string display_markers;

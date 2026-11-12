@@ -89,6 +89,9 @@ VisionControl::VisionControl(const Options& opt, OnChange on_change)
     : yolo_available_(opt.yolo_available),
       model_name_(opt.model_name),
       model_path_(opt.model_path),
+      model_kind_(opt.model_kind),
+      mask_(opt.mask),
+      mask_max_boxes_(opt.mask_max_boxes),
       family_(opt.family),
       on_change_(std::move(on_change)),
       fps_(clamp_fps(opt.fps)) {
@@ -462,7 +465,7 @@ static nlohmann::json subscription_json(const Subscription& s, uint64_t now_ms, 
             {"ttl_ms", s.ttl_ms}, {"expires_in_ms", left < 0 ? 0 : left}};
 }
 
-static std::string mode_body(const VisionControl& ctl) {
+static std::string status_json(const VisionControl& ctl) {
     const uint64_t now = mono_ms();
     const Mode m = ctl.mode();
     const Pipelines p = pipelines_of(m);
@@ -486,10 +489,14 @@ static std::string mode_body(const VisionControl& ctl) {
         {"max_fps", ctl.active_fps()},
         {"continuous", continuous_json(ctl.continuous())},
         {"available", {{"yolo", ctl.yolo_available()}, {"aruco", true}}},
-        {"model", {{"name", ctl.model_name()}, {"path", ctl.model_path()}}},
+        {"model", {{"name", ctl.model_name()}, {"path", ctl.model_path()}, {"kind", ctl.model_kind()}, {"mask", ctl.mask_enabled()}}},
         {"family", ctl.family()},
     };
     return j.dump();
+}
+
+static std::string mode_body(const VisionControl& ctl) {
+    return status_json(ctl);
 }
 
 static bool query_param(const std::string& query, const std::string& key, std::string& value) {
@@ -534,8 +541,11 @@ static void put_result(std::ostringstream& s, const VisionResult& r, const std::
     s << std::fixed << ",\"mode\":\"" << mode_name(r.mode) << "\",\"frame_id\":" << r.frame_id
       << ",\"ts_ms\":" << r.ts_ms << ",\"age_ms\":" << (age < 0 ? 0 : age) << ",\"inference_time_ms\":"
       << std::setprecision(1) << r.inference_ms << ",\"width\":" << r.width << ",\"height\":" << r.height
-      << ",\"pipelines\":{\"yolo\":{\"ran\":" << (r.ran_yolo ? "true" : "false") << ",\"ms\":" << r.yolo_ms
-      << "},\"aruco\":{\"ran\":" << (r.ran_aruco ? "true" : "false") << ",\"ms\":" << r.aruco_ms;
+      << ",\"pipelines\":{\"yolo\":{\"ran\":" << (r.ran_yolo ? "true" : "false") << ",\"ms\":" << r.yolo_ms;
+    if (r.mask_ms >= 0.0f) {
+        s << ",\"mask_ms\":" << r.mask_ms;
+    }
+    s << "},\"aruco\":{\"ran\":" << (r.ran_aruco ? "true" : "false") << ",\"ms\":" << r.aruco_ms;
     if (!r.aruco_stages_json.empty()) s << ",\"stages\":" << r.aruco_stages_json;
     s << "}}"
       << ",\"detections\":" << r.detections_json << ",\"count\":" << r.count << ",\"family\":\"" << family
@@ -768,9 +778,9 @@ HttpReply handle_control_request(VisionControl& ctl, const std::string& method, 
             ctl.set_enabled(it->get<bool>());
             return {200, inference_body(ctl)};
         }
-    } else if (path == "/api/mode") {
-        if (method == "GET") return {200, mode_body(ctl)};
-        if (method == "POST") return post_mode(ctl, body);
+    } else if (path == "/api/mode" || path == "/api/status") {
+        if (method == "GET") return {200, status_json(ctl)};
+        if (method == "POST" && path == "/api/mode") return post_mode(ctl, body);
     } else if (path == "/api/results/latest" && method == "GET") {
         return latest_reply(ctl, query, now_ms);
     } else if (path == "/api/trigger" && method == "POST") {

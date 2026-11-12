@@ -57,6 +57,18 @@ target_include_directories(capture_time_test PRIVATE ${MAIN})
 target_compile_options(capture_time_test PRIVATE -Wall -Wextra)
 add_test(NAME capture_time COMMAND capture_time_test)
 
+add_executable(mask_geom_test ${CMAKE_CURRENT_LIST_DIR}/mask_geom_test.cpp ${MAIN}/mask_geom.cpp)
+target_include_directories(mask_geom_test PRIVATE ${MAIN})
+target_compile_definitions(mask_geom_test PRIVATE TEST_DATA_DIR="${CMAKE_CURRENT_LIST_DIR}/data")
+target_compile_options(mask_geom_test PRIVATE -Wall -Wextra)
+target_link_libraries(mask_geom_test PRIVATE rv_json)
+add_test(NAME mask_geom COMMAND mask_geom_test)
+
+add_executable(seg_decode_test ${CMAKE_CURRENT_LIST_DIR}/seg_decode_test.cpp ${MAIN}/mask_geom.cpp)
+target_include_directories(seg_decode_test PRIVATE ${MAIN})
+target_compile_options(seg_decode_test PRIVATE -Wall -Wextra)
+add_test(NAME seg_decode COMMAND seg_decode_test)
+
 # ArUco stage benchmark (time per frame and recall, baseline vs tuned detector settings):
 # needs the apriltag sources from SSCMA_ROOT/components/apriltag (with the patched files of
 # ../apriltag_patched), so it is only built when SSCMA_ROOT is set. Built with -O2 so
