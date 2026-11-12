@@ -11,10 +11,11 @@ async fn rebot_dm_schema_declares_its_features() {
     assert_eq!(caps.version, CAPABILITIES_VERSION);
     assert_eq!(caps.profile_version, ARM_PROFILE_VERSION);
     assert!(caps.cartesian && caps.workspace_check && caps.gripper && caps.grasp && caps.damiao_ranges);
-    assert_eq!(caps.version, 8);
+    assert_eq!(caps.version, 9);
     assert!(caps.obs_rate && caps.fault_codes && caps.poses && caps.keepout && caps.speed_cap
         && caps.residual_torques && caps.tick_stats && caps.place && caps.safety_describe && caps.replay);
     assert!(!caps.torque_guard, "no driver: no torque feedback");
+    assert!(!caps.power_budget, "no driver: no torque feedback");
     assert!(caps.vision.detection_proxy);
     assert_eq!(caps.vision.mode_endpoint, "/api/v1/vision/mode");
     assert!(caps.vision.modes.is_empty() && caps.vision.mode.is_none(), "provider fields come from the API layer");

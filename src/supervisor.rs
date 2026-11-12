@@ -259,6 +259,8 @@ pub struct SupervisorInner {
     pub collision: crate::collision::CollisionGuard,
     /// Torque-saturation guard state (`src/torque_guard.rs`).
     pub torque_guard: crate::torque_guard::TorqueGuard,
+    /// Supply-current estimate (`src/power.rs`).
+    pub power: crate::power::PowerMonitor,
     /// `--follower` model name armd was started with (`safety/describe` `device.follower`).
     pub follower: Option<String>,
 }
@@ -376,6 +378,7 @@ impl SupervisorInner {
             residual_torques: None,
             collision: crate::collision::CollisionGuard::from_policy(&collision_policy),
             torque_guard: crate::torque_guard::TorqueGuard::default(),
+            power: crate::power::PowerMonitor::default(),
             follower: None,
         }
     }
@@ -387,6 +390,7 @@ impl SupervisorInner {
         let torque_feedback = self.driver.as_ref().is_some_and(|d| d.lock().is_ok_and(|drv| drv.capabilities().torque_feedback));
         schema.capabilities.collision_guard &= torque_feedback;
         schema.capabilities.torque_guard &= torque_feedback;
+        schema.capabilities.power_budget &= torque_feedback;
         schema
     }
 
@@ -741,6 +745,7 @@ impl SupervisorInner {
             fault: self.safety.fault(),
             residual_torques: self.residual_torques,
             collision: self.collision_observation(),
+            power: self.power_observation(),
         }
     }
 
@@ -2670,6 +2675,8 @@ impl SupervisorInner {
         self.collision_tick(servo_dt);
         // Torque-saturation guard: same placement (src/torque_guard.rs).
         self.torque_guard_tick(servo_dt);
+        // Supply-current estimate (src/power.rs).
+        self.power_tick(servo_dt);
         let mut reference_stepped = false;
 
         // 3. Step trajectory if active, or step servo target

@@ -501,6 +501,10 @@ pub struct ArmConfig {
     /// (the per-joint TMAX) when enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub torque_guard: Option<crate::torque_guard::TorqueGuardPolicy>,
+    /// Supply power budget (`src/power.rs`): supply-current estimate from motor feedback;
+    /// None = off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_budget: Option<crate::power::PowerBudget>,
     /// Facts about the installed hardware published by `/api/v1/safety/describe`;
     /// None = no wired emergency stop and the default notes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -585,6 +589,7 @@ impl Default for ArmConfig {
             speed_cap: None,
             collision: None,
             torque_guard: None,
+            power_budget: None,
             hardware: None,
             urdf: None,
             urdf_sha256: None,
@@ -717,6 +722,7 @@ impl ArmConfig {
                 return Err("torque_guard needs damiao_ranges (the per-joint torque mapping range TMAX)".into());
             }
         }
+        if let Some(p) = &self.power_budget { p.validate(self.dof)?; }
         if let Some(caps) = &self.servo_max_velocity {
             if caps.len() != self.dof || caps.iter().flatten().any(|v| !v.is_finite() || *v <= 0.0) {
                 return Err(format!("servo_max_velocity needs {} entries, each null or positive finite", self.dof));
@@ -897,6 +903,11 @@ impl ArmConfig {
             // (24 V 6.5 A, overload hiccup measured at ~8.5 A); 0.85 is the value intended
             // with the recommended LRS-350-24 (14.6 A).
             torque_guard: Some(crate::torque_guard::TorqueGuardPolicy { ratio: 0.60, ..Default::default() }),
+            // Mean Well LRS-150-24 in use: 6.5 A rated, overload hiccup measured at ~8.5 A in a
+            // teardown. For the recommended LRS-350-24 set supply_rated_a 14.6 and
+            // supply_trip_a ~18 (its datasheet overload range is 110-140 % of rated; not
+            // measured). Motor parameters are datasheet values (src/power.rs).
+            power_budget: Some(crate::power::PowerBudget::rebot_dm()),
             hardware: None,
             urdf: None,
             urdf_sha256: None,
@@ -972,6 +983,10 @@ pub struct ArmObservation {
     /// Collision guard state; null while the guard is disabled or unavailable.
     #[serde(default)]
     pub collision: Option<crate::collision::CollisionObservation>,
+    /// Estimated supply current and the power governor state (`src/power.rs`); null when the
+    /// profile has no enabled `power_budget`. An estimate from motor feedback, not a measurement.
+    #[serde(default)]
+    pub power: Option<crate::power::PowerObservation>,
 }
 
 /// A motor fault code reported in the motor's feedback (`observation.motor_errors`).
@@ -1076,7 +1091,7 @@ pub struct SchemaField {
 }
 
 /// Version of the capability summary in the observation schema (`capabilities`).
-pub const CAPABILITIES_VERSION: u32 = 8;
+pub const CAPABILITIES_VERSION: u32 = 9;
 
 /// Vision features armd offers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1172,6 +1187,10 @@ pub struct Capabilities {
     /// with `damiao_ranges`, and a driver that reports torque. Present from capabilities
     /// version 8.
     pub torque_guard: bool,
+    /// Supply power budget (`power_budget` profile section, `observation.power`,
+    /// `schema.power_budget`, `GET /api/v1/diagnostics/power`): enabled in the profile and a
+    /// driver that reports torque. Present from capabilities version 9.
+    pub power_budget: bool,
     pub vision: VisionCapabilities,
 }
 
@@ -1208,6 +1227,8 @@ impl Capabilities {
             replay: true,
             // The driver half is applied by ArmSupervisor::get_schema.
             torque_guard: crate::torque_guard::TorqueGuardInfo::from_config(config).is_some(),
+            // The driver half is applied by ArmSupervisor::get_schema.
+            power_budget: config.power_budget.as_ref().is_some_and(|p| p.enabled),
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }
@@ -1249,6 +1270,9 @@ pub struct ObservationSchema {
     /// Torque-saturation guard policy; null when the profile has none (and in older schemas).
     #[serde(default)]
     pub torque_guard: Option<crate::torque_guard::TorqueGuardInfo>,
+    /// Supply power budget in force; null when the profile has none (and in older schemas).
+    #[serde(default)]
+    pub power_budget: Option<crate::power::PowerBudget>,
 }
 
 impl ObservationSchema {
@@ -1329,6 +1353,7 @@ impl ObservationSchema {
             home_positions: Some(config.home_positions.clone()),
             resting_pose: config.resting_pose.clone(),
             torque_guard: crate::torque_guard::TorqueGuardInfo::from_config(config),
+            power_budget: config.power_budget.clone().filter(|p| p.enabled),
         }
     }
 }

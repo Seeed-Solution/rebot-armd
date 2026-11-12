@@ -367,5 +367,66 @@
       true,
       true
     ]
+  },
+  "power_budget": {
+    "enabled": true,
+    "supply_rated_a": 6.5,
+    "supply_trip_a": 8.5,
+    "v_bus": 24.0,
+    "base_w": 4.0,
+    "k_cu": 1.5,
+    "efficiency": 0.8,
+    "filter_s": 0.25,
+    "joints": [
+      {
+        "kt_nm_per_a": 2.015,
+        "r_phase_ohm": 0.72,
+        "idle_w": 0.5,
+        "viscous_nm_s": 0.0,
+        "coulomb_nm": 0.0
+      },
+      {
+        "kt_nm_per_a": 2.015,
+        "r_phase_ohm": 0.72,
+        "idle_w": 0.5,
+        "viscous_nm_s": 0.0,
+        "coulomb_nm": 0.0
+      },
+      {
+        "kt_nm_per_a": 2.015,
+        "r_phase_ohm": 0.72,
+        "idle_w": 0.5,
+        "viscous_nm_s": 0.0,
+        "coulomb_nm": 0.0
+      },
+      {
+        "kt_nm_per_a": 0.625,
+        "r_phase_ohm": 0.58,
+        "idle_w": 0.5,
+        "viscous_nm_s": 0.0,
+        "coulomb_nm": 0.0
+      },
+      {
+        "kt_nm_per_a": 0.625,
+        "r_phase_ohm": 0.58,
+        "idle_w": 0.5,
+        "viscous_nm_s": 0.0,
+        "coulomb_nm": 0.0
+      },
+      {
+        "kt_nm_per_a": 0.625,
+        "r_phase_ohm": 0.58,
+        "idle_w": 0.5,
+        "viscous_nm_s": 0.0,
+        "coulomb_nm": 0.0
+      },
+      {
+        "kt_nm_per_a": 0.625,
+        "r_phase_ohm": 0.58,
+        "idle_w": 0.5,
+        "viscous_nm_s": 0.0,
+        "coulomb_nm": 0.0
+      }
+    ]
   }
 }

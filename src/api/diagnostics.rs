@@ -46,3 +46,9 @@ pub async fn get_blackbox(Extension(state): Extension<DiagnosticsState>, Query(q
 pub async fn get_tick(axum::extract::State(supervisor): axum::extract::State<std::sync::Arc<crate::supervisor::ArmSupervisor>>) -> Response {
     axum::Json(supervisor.tick_stats()).into_response()
 }
+
+/// `GET /api/v1/diagnostics/power`: supply-current estimate, recent peaks and the budget in
+/// force (`{"enabled": false}` without one).
+pub async fn get_power(axum::extract::State(supervisor): axum::extract::State<std::sync::Arc<crate::supervisor::ArmSupervisor>>) -> Response {
+    axum::Json(supervisor.inner().read().await.power_diagnostics()).into_response()
+}

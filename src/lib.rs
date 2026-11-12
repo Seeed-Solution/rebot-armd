@@ -14,6 +14,7 @@ pub mod motion;
 pub mod persist;
 pub mod place;
 pub mod poses;
+pub mod power;
 pub mod protocol;
 pub mod recording;
 pub mod replay;
