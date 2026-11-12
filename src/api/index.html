@@ -388,9 +388,21 @@ body.offline .banner { display: block; }
   box-shadow: var(--sc-shadow);
 }
 .armview canvas { width: 100%; height: 100%; display: block; }
-.hud .v3-btn { pointer-events: auto; }
-.v3-btn::before { display: none; }
-.v3-btn[aria-pressed="true"] { background: var(--sc-color-primary-dark); color: #fff; }
+/* view switch: top-left of the stage, above the video and the 3D view; the HUD row starts after it */
+.view-switch {
+  --vs-w: 116px;
+  position: absolute; z-index: 7; top: 10px; left: 12px; width: var(--vs-w); height: 32px; display: flex; padding: 2px; box-sizing: border-box;
+  border-radius: 16px; background: rgba(255,255,255,0.55); border: 1px solid rgba(255,255,255,0.7);
+  backdrop-filter: blur(12px) saturate(140%); -webkit-backdrop-filter: blur(12px) saturate(140%); box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+}
+.view-switch button {
+  flex: 1 1 0; min-width: 0; height: 100%; padding: 0 6px; border: 0; border-radius: 13px; background: transparent; cursor: pointer;
+  font: 600 13px var(--sc-font, inherit); color: #374151; white-space: nowrap;
+  -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+}
+.view-switch button[aria-checked="true"] { background: var(--sc-color-primary-dark, #5B7D15); color: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.18); }
+.view-switch button:focus-visible { outline: 2px solid var(--sc-color-primary, #8CC020); outline-offset: 1px; }
+.hud::before { content: ''; flex: none; width: 116px; height: 1px; }
 .view3d { position: absolute; inset: 0; z-index: 6; background: #eef2ea; border-radius: inherit; overflow: hidden; }
 .view3d canvas { width: 100%; height: 100%; display: block; touch-action: none; }
 .v3-legend { position: absolute; left: 10px; bottom: 8px; display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: #374151; pointer-events: none; }
@@ -399,8 +411,7 @@ body.offline .banner { display: block; }
 .v3-legend .k-cmd i { background: rgba(59, 130, 246, 0.45); }
 .v3-legend .k-ws i { border: 1.5px solid #5B7D15; }
 .v3-legend .k-ko i { background: rgba(220, 38, 38, 0.35); border: 1px solid #dc2626; }
-.v3-status { position: absolute; left: 10px; top: 8px; right: 52px; font-size: 12px; color: #374151; pointer-events: none; }
-.v3-x { position: absolute; top: 6px; right: 6px; width: 40px; height: 40px; min-height: 40px; padding: 0; font-size: 20px; border-radius: 12px; background: rgba(255,255,255,0.85); }
+.v3-status { position: absolute; left: 10px; right: 10px; bottom: 30px; font-size: 12px; color: #374151; pointer-events: none; }
 .armview .tag { position: absolute; left: 8px; top: 6px; font-size: 11px; color: var(--sc-color-text-tertiary); }
 body.offline .armview { bottom: 56px; }
 
@@ -1020,6 +1031,16 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
 
   /* video HUD: tiny glass pills, bottom centre */
   body.ui-simple .hud { top: auto; bottom: 12px; left: 50%; transform: translateX(-50%); }
+  body.ui-simple .hud::before { display: none; }
+  /* view switch: below the safety capsule (--safety-h is its measured height) */
+  body.ui-simple .view-switch {
+    position: fixed; z-index: 160; top: calc(8px + var(--safety-h, 50px) + 6px); left: max(12px, env(safe-area-inset-left));
+    background: rgba(255,255,255,0.3); border-color: rgba(255,255,255,0.45); box-shadow: 0 6px 18px rgba(0,0,0,0.18);
+  }
+  body.ui-simple .view-switch button[aria-checked="false"] { color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.4); }
+  body.ui-simple.v3-open .view-switch button[aria-checked="false"] { color: #1f2937; text-shadow: none; }
+  /* 3D view open: the joysticks, sliders and preset buttons step aside; the safety capsule stays */
+  body.ui-simple.v3-open .cockpit > :not(#ck-safety) { visibility: hidden; }
   body.ui-simple .hud .sc-status-badge { background: rgba(255,255,255,0.4); border-radius: 12px; box-shadow: none; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.4); }
 
   /* no cards: the cockpit dissolves into floating controls */
@@ -1253,8 +1274,10 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
             <button class="btn vhint-btn" id="vhint-retry" data-i18n="v.retry">立即重试</button>
           </div>
         </div>
+        <div class="view-switch" id="view-switch" role="radiogroup" data-i18n-aria="vs.label" aria-label="画面">
+          <button type="button" role="radio" id="vs-video" aria-checked="true" tabindex="0" data-i18n="vs.video">视频</button><button type="button" role="radio" id="vs-3d" aria-checked="false" tabindex="-1" aria-controls="view3d">3D</button>
+        </div>
         <div class="hud">
-          <button class="btn det-btn v3-btn" id="btn-3d" type="button" aria-pressed="false" aria-controls="view3d" data-i18n-aria="v3.aria" aria-label="3D 视图">3D</button>
           <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button><span class="seg seg-sm vmode" id="vmode" role="radiogroup" data-i18n-aria="vm.label" aria-label="视觉模式" hidden><button type="button" role="radio" data-vm="off" data-i18n="vm.off">关</button><button type="button" role="radio" data-vm="yolo" data-i18n="vm.yolo">YOLO</button><button type="button" role="radio" data-vm="aruco" data-i18n="vm.aruco">ArUco</button><button type="button" role="radio" data-vm="both" data-i18n="vm.both">两者</button></span><button class="btn det-btn det-trig" id="btn-trigger" type="button" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span><button class="btn det-btn det-gset" id="btn-gset" type="button" data-i18n="gset.open" hidden>抓取设置</button></span>
           <span class="sc-status-badge" id="cam-chip" data-i18n="v.chip.connecting">连接中</span>
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
@@ -1272,7 +1295,6 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           <canvas id="v3-canvas"></canvas>
           <span class="v3-status" id="v3-status" role="status"></span>
           <div class="v3-legend"><span class="k-meas"><i></i><b data-i18n="v3.leg.meas">实测</b></span><span class="k-cmd"><i></i><b data-i18n="v3.leg.cmd">指令</b></span><span class="k-ws"><i></i><b data-i18n="v3.leg.ws">工作空间</b></span><span class="k-ko"><i></i><b data-i18n="v3.leg.ko">禁入区</b></span></div>
-          <button class="btn v3-x" id="v3-close" type="button" data-i18n-aria="v3.close" aria-label="关闭 3D 视图">×</button>
         </div>
         <div class="grasp-bar" id="grasp-bar" role="group" data-i18n-aria="grasp.aria" aria-label="点框抓取" hidden>
           <div class="grasp-info" id="grasp-info"><b id="grasp-label">--</b><span class="mono" id="grasp-score">--</span></div>
@@ -1780,7 +1802,7 @@ const I18N = {
     'calib.ok.solve.eih': '标定完成，位置 RMSE {rmse} mm，姿态 RMSE {rot}°', 'calib.rmse.warn.eih': '残差偏大：检查标记是否固定不动、采集时机械臂是否静止，删除标黄的位姿后重新求解',
     'calib.r.frame': '结果', 'calib.r.rmse_pos': '位置残差 RMSE', 'calib.r.rmse_rot': '姿态残差 RMSE',
     'rec.chip0': '录制 00:00', 'rec.chip': '录制 ',
-    'v3.aria': '3D 视图', 'v3.close': '关闭 3D 视图', 'v3.loading': '正在加载 3D 视图…', 'v3.err': '3D 视图加载失败：{m}', 'v3.stick': '未安装机械臂网格，显示关节骨架', 'v3.offline': '无遥测，显示最后姿态', 'v3.hint': '拖动旋转 · 双指缩放',
+    'v3.aria': '3D 视图', 'vs.label': '画面', 'vs.video': '视频', 'v3.loading': '正在加载 3D 视图…', 'v3.err': '3D 视图加载失败：{m}', 'v3.stick': '未安装机械臂网格，显示关节骨架', 'v3.offline': '无遥测，显示最后姿态', 'v3.hint': '拖动旋转 · 双指缩放',
     'v3.leg.meas': '实测', 'v3.leg.cmd': '指令', 'v3.leg.ws': '工作空间', 'v3.leg.ko': '禁入区',
     'armview.tag': '姿态示意 · 侧视', 'banner.lock': '遥测断开 · 控制已锁定',
     'ctl.mode': '控制方式', 'mode.joint': '关节点动', 'mode.cart': '空间位姿', 'home': '回零',
@@ -1961,7 +1983,7 @@ const I18N = {
     'calib.ok.solve.eih': 'Calibration solved, position RMSE {rmse} mm, rotation RMSE {rot}°', 'calib.rmse.warn.eih': 'High residual: check the marker is fixed and the arm was still; delete the highlighted poses and solve again',
     'calib.r.frame': 'Result', 'calib.r.rmse_pos': 'Position RMSE', 'calib.r.rmse_rot': 'Rotation RMSE',
     'rec.chip0': 'REC 00:00', 'rec.chip': 'REC ',
-    'v3.aria': '3D view', 'v3.close': 'Close 3D view', 'v3.loading': 'Loading 3D view…', 'v3.err': '3D view failed to load: {m}', 'v3.stick': 'Arm meshes not installed; showing the joint skeleton', 'v3.offline': 'No telemetry; showing the last pose', 'v3.hint': 'Drag to rotate · pinch to zoom',
+    'v3.aria': '3D view', 'vs.label': 'View', 'vs.video': 'Video', 'v3.loading': 'Loading 3D view…', 'v3.err': '3D view failed to load: {m}', 'v3.stick': 'Arm meshes not installed; showing the joint skeleton', 'v3.offline': 'No telemetry; showing the last pose', 'v3.hint': 'Drag to rotate · pinch to zoom',
     'v3.leg.meas': 'Measured', 'v3.leg.cmd': 'Commanded', 'v3.leg.ws': 'Workspace', 'v3.leg.ko': 'Keep-out',
     'armview.tag': 'Pose preview · side view', 'banner.lock': 'Telemetry lost · controls locked',
     'ctl.mode': 'Control mode', 'mode.joint': 'Joint jog', 'mode.cart': 'Cartesian', 'home': 'Home',
@@ -6945,10 +6967,13 @@ const v3Geo = new Map();
 function v3Toggle(open) {
   V3.open = open;
   $('view3d').hidden = !open;
-  $('btn-3d').setAttribute('aria-pressed', String(open));
-  if (open) v3Start();
-  else { cancelAnimationFrame(V3.raf); V3.raf = 0; $('btn-3d').focus({ preventScroll: true }); }
+  document.body.classList.toggle('v3-open', open);
+  for (const [id, on] of [['vs-video', !open], ['vs-3d', open]]) { const b = $(id); b.setAttribute('aria-checked', String(on)); b.tabIndex = on ? 0 : -1; }
+  if (open) { if (S.ui === 'simple') releaseAll(); v3Start(); } // simple: the sticks are hidden under the 3D view
+  else { cancelAnimationFrame(V3.raf); V3.raf = 0; }
 }
+// height of the safety card, for the simple-mode overlay layout (view switch and pose card sit below it)
+new ResizeObserver(() => { document.documentElement.style.setProperty('--safety-h', $('safety').offsetHeight + 'px'); }).observe($('safety'));
 async function v3Start() {
   try { await (V3.init ||= v3Init()); } catch (e) { V3.init = null; setText($('v3-status'), t('v3.err', { m: e.message || String(e) })); return; }
   if (!V3.open) return;
@@ -7112,8 +7137,16 @@ function v3Tick(ts) {
   V3.dirty = false; V3.last = ts; V3.renders++;
   V3.r.render(V3.scene, V3.cam);
 }
-$('btn-3d').addEventListener('click', () => v3Toggle(!V3.open));
-$('v3-close').addEventListener('click', () => v3Toggle(false));
+// view switch (radiogroup): click, arrow keys / Home / End move the selection; Escape stays the E-stop key
+$('vs-video').addEventListener('click', () => { if (V3.open) v3Toggle(false); });
+$('vs-3d').addEventListener('click', () => { if (!V3.open) v3Toggle(true); });
+$('view-switch').addEventListener('keydown', (e) => {
+  const open = { ArrowLeft: false, ArrowUp: false, Home: false, ArrowRight: true, ArrowDown: true, End: true }[e.key];
+  if (open === undefined) return;
+  e.preventDefault(); e.stopPropagation();
+  if (open !== V3.open) v3Toggle(open);
+  $(open ? 'vs-3d' : 'vs-video').focus({ preventScroll: true });
+});
 i18nHooks.push(() => { V3.key = ''; });
 
 function renderCollision(live, ts) {
