@@ -1087,6 +1087,11 @@ impl SupervisorInner {
                         Some(1.5),
                         &self.planning_limits(),
                     ) {
+                        // power budget: slowed to fit, never refused
+                        let traj = match self.power_fit_quintic(traj.clone(), &clamped_start, &self.commanded_velocities, &home, &self.planning_limits(), false) {
+                            Ok((t, _)) => t,
+                            Err(e) => { tracing::warn!("Park power planning failed ({e}); parking as planned"); traj }
+                        };
                         // Park is exempt from the floor / box / reach limits (it must remain
                         // possible from a violating pose) but not from the keep-out boxes.
                         let samples = match self.workspace_samples(&traj) {
@@ -1772,6 +1777,9 @@ impl SupervisorInner {
             duration_secs,
             limits,
         )?;
+        // 2.1 Power budget: slow the move to fit (or refuse with POWER_BUDGET); the workspace
+        // check below runs on the trajectory that will be executed
+        let (traj, power_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, &target_positions, limits, true)?;
         let samples = self.workspace_samples(&traj)?;
         self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice))?;
 
@@ -1783,6 +1791,7 @@ impl SupervisorInner {
         self.safety.mark_motion_started()?;
         let duration = traj.duration;
         let id = self.begin_action(kind, tag);
+        if let Some(s) = power_scale { self.note_action_power_scale(id, s); }
         self.active_trajectory = Some(ActiveTrajectory::quintic(traj, Some(id)));
 
         Ok((self.safety.epoch_id(), id, duration))
@@ -1812,7 +1821,7 @@ impl SupervisorInner {
             id, kind: kind.into(), tag, state: "running".into(), code: None, message: None, progress: 0.0,
             started_at: now, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
             phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
-            episode: None, t_s: None,
+            episode: None, t_s: None, power_scale: None,
         });
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
         self.quintic_settle = None;
@@ -1900,6 +1909,7 @@ impl SupervisorInner {
             arm: self.config.arm_model.clone(),
             epoch: self.safety.epoch_id(),
             workspace_revision: self.workspace_revision,
+            power: self.power_budget().cloned(),
         })
     }
 
@@ -1909,6 +1919,7 @@ impl SupervisorInner {
         self.check_plan_fresh(input)?;
         let duration = self.start_path_motion(input, &path)?;
         let id = self.begin_action(kind, tag);
+        if input.power.is_some() { self.note_action_power_scale(id, path.power_scale); }
         self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Path(PathTrajectory::new(path)) });
         Ok((id, duration + 0.5))
     }
@@ -2024,6 +2035,7 @@ impl SupervisorInner {
         if input.epoch != epoch { return Err(MotionError::PlanStale("epoch changed during the action".into()).into()); }
         self.check_plan_fresh(input)?;
         let duration = self.start_path_motion(input, &path)?;
+        if input.power.is_some() { self.note_action_power_scale(id, path.power_scale); }
         self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Path(PathTrajectory::new(path)) });
         if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
         Ok(duration + 0.5)

@@ -67,6 +67,8 @@ pub struct ReplayInput {
     pub control_hz: u32,
     pub epoch: u64,
     pub workspace_revision: u64,
+    /// Power budget whose `planning` section time-scales the playback; None = none.
+    pub power: Option<crate::power::PowerBudget>,
 }
 
 /// A checked replay ready to install.
@@ -78,6 +80,9 @@ pub struct ReplayPlan {
     pub sample_dt: f64,
     /// Recorded duration (s).
     pub duration: f64,
+    /// Power-budget time scale of the playback (1 = at the requested speed); None without a
+    /// planning budget.
+    pub power_scale: Option<f64>,
 }
 
 fn rejected(status: u16, code: &str, message: String) -> ArmError {
@@ -223,7 +228,29 @@ pub fn plan_frames(input: ReplayInput, frames: &[RecordFrame]) -> Result<ReplayP
                 .map_err(workspace_reject)?;
         }
     }
-    Ok(ReplayPlan { input, samples, sample_dt, duration })
+    // power budget: the playback (at the chosen speed) is slowed to fit, or refused
+    let power_scale = match input.power.as_ref().filter(|b| b.enabled && b.planning.enabled) {
+        None => None,
+        Some(b) => {
+            let t0 = std::time::Instant::now();
+            let dof = input.arm.arm_dof().min(input.dof);
+            let played = duration / input.request.speed;
+            let n = crate::power_plan::Samples::count(&b.planning, played);
+            let at = |t: f64| -> [f64; crate::chain::MAX_CHAIN_JOINTS] {
+                let x = (t * input.request.speed / sample_dt).max(0.0);
+                let k = (x.floor() as usize).min(samples.len() - 1);
+                let nb = (k + 1).min(samples.len() - 1);
+                let f = (x - k as f64).clamp(0.0, 1.0);
+                std::array::from_fn(|j| if j < dof { f64::from(samples[k][j]) + (f64::from(samples[nb][j]) - f64::from(samples[k][j])) * f } else { 0.0 })
+            };
+            let ps = crate::power_plan::Samples::from_positions(played, n, dof, at);
+            let fit = crate::power_plan::plan_scale(b, &input.arm, &ps).map_err(|e| rejected(422, e.code(), format!("episode '{}': {e}", input.request.episode)))?;
+            tracing::debug!("Power planning (replay): scale {:.3}, peak {:.2} A (full {:.2} A), {} samples, {} µs",
+                fit.scale, fit.peak_a, fit.peak_full_a, fit.samples, t0.elapsed().as_micros());
+            Some(fit.scale)
+        }
+    };
+    Ok(ReplayPlan { input, samples, sample_dt, duration, power_scale })
 }
 
 fn workspace_reject(e: SafetyError) -> ArmError {
@@ -373,6 +400,7 @@ impl SupervisorInner {
             control_hz: self.config.control_frequency_hz,
             epoch,
             workspace_revision: self.workspace_revision,
+            power: self.power_budget().cloned(),
             request,
         })
     }
@@ -399,12 +427,13 @@ impl SupervisorInner {
         let limits = self.planning_limits();
         let traj = TrajectoryPlanner::plan(&self.commanded_positions, &self.commanded_velocities, &first,
             &vec![0.0; self.config.dof], None, &limits)?;
+        let (traj, approach_scale) = self.power_fit_quintic(traj, &self.commanded_positions, &self.commanded_velocities, &first, &limits, true)?;
         let checks = self.workspace_samples(&traj)?;
         self.check_workspace_path(&self.commanded_positions, checks.iter().map(Vec::as_slice))?;
 
-        let ReplayPlan { input, samples, sample_dt, duration } = plan;
+        let ReplayPlan { input, samples, sample_dt, duration, power_scale } = plan;
         let motion = ReplayMotion {
-            episode: input.request.episode.clone(), speed: input.request.speed, gripper: input.request.gripper,
+            episode: input.request.episode.clone(), speed: input.request.speed * power_scale.unwrap_or(1.0), gripper: input.request.gripper,
             gripper_idx, samples, sample_dt, duration, hold_gripper,
             approach_duration: traj.duration, phase: Phase::Approach(traj),
         };
@@ -415,6 +444,8 @@ impl SupervisorInner {
         self.safety.mark_motion_started()?;
         self.last_heartbeat = std::time::Instant::now();
         let id = self.begin_action("replay", input.request.tag.clone());
+        if let Some(s) = power_scale { self.note_action_power_scale(id, s); }
+        if let Some(s) = approach_scale { self.note_action_power_scale(id, s); }
         if let Some(a) = self.last_action.as_mut() {
             a.episode = Some(input.request.episode.clone());
             a.phase = Some("approach".into());

@@ -29,6 +29,9 @@ struct ArmState {
     /// against a resisting load while it moves).
     visc: [f32; 7],
     bias: [f32; 7],
+    /// Report rigid-body torques (RNEA of the commanded motion) instead of gravity only.
+    dynamic: bool,
+    a: [f32; 7],
 }
 
 /// Ideal position servo: follows the commanded position and velocity, reports the built-in
@@ -51,7 +54,11 @@ impl ArmDriver for SimArm {
     fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         let s = self.0.lock().unwrap();
-        let g = armd::compute_gravity_torques(&std::array::from_fn(|i| s.q[i])).unwrap();
+        let g: [f32; 6] = if s.dynamic {
+            let f = |v: &[f32; 7]| -> [f64; 8] { std::array::from_fn(|i| if i < 6 { f64::from(v[i]) } else { 0.0 }) };
+            let t = armd::chain::ArmModel::RebotDevArm.inverse_dynamics(&f(&s.q), &f(&s.v), &f(&s.a), true);
+            std::array::from_fn(|i| t[i] as f32)
+        } else { armd::compute_gravity_torques(&std::array::from_fn(|i| s.q[i])).unwrap() };
         Ok((0..7).map(|i| JointState {
             position: s.q[i], velocity: s.v[i], temperature: 30.0,
             torque: s.forced[i].unwrap_or(if i < 6 { g[i] } else { 0.0 } + s.visc[i] * s.v[i]
@@ -62,8 +69,10 @@ impl ArmDriver for SimArm {
         let mut s = self.0.lock().unwrap();
         if !s.torqued { return Ok(()); }
         for (i, t) in targets.iter().enumerate().take(7) {
+            let v = t.velocity.unwrap_or(0.0);
+            s.a[i] = (v - s.v[i]) / DT as f32;
             s.q[i] = t.position;
-            s.v[i] = t.velocity.unwrap_or(0.0);
+            s.v[i] = v;
         }
         Ok(())
     }
@@ -514,4 +523,184 @@ fn static_overload_does_not_hold() {
     for _ in 0..400 { inner.tick(DT); if !inner.last_action.as_ref().unwrap().is_running() { break; } }
     let a = inner.last_action.clone().unwrap();
     assert_eq!((a.id, a.state.as_str()), (id, "done"), "{a:?}");
+}
+
+// ---------------------------------------------------------------- planning (time scaling)
+
+use armd::power_plan::{plan_scale, quintic_samples, PlanningPolicy};
+use armd::TrajectoryPlanner;
+
+/// Stretched-out pose with the largest J2 gravity torque on the 0.1 rad grid (16.3 N·m).
+const STRETCHED: [f32; 7] = [0.0, 0.2, -2.6, 0.0, 0.0, 0.0, 0.0];
+
+fn fast_limits() -> Vec<armd::JointLimit> { ArmConfig::rebot_dm().limits } // 2 rad/s, 5 rad/s² on J1-J3
+
+fn swing(from: [f32; 7], dq2: f32) -> armd::MultiJointQuinticTrajectory {
+    let mut to = from;
+    to[1] += dq2;
+    TrajectoryPlanner::plan(&from, &[0.0; 7], &to, &[0.0; 7], None, &fast_limits()).unwrap()
+}
+
+#[test]
+fn planning_policy_defaults_and_validation() {
+    let p = PlanningPolicy::default();
+    assert_eq!((p.enabled, p.fraction, p.min_scale, p.sample_dt_s, p.max_samples), (true, 0.75, 0.2, 0.02, 400));
+    p.validate(0.8).unwrap();
+    assert!(PlanningPolicy { fraction: 0.85, ..p }.validate(0.8).is_err(), "above the governor's soft fraction");
+    assert!(PlanningPolicy { min_scale: 0.0, ..p }.validate(0.8).is_err());
+    assert!(PlanningPolicy { max_samples: 1, ..p }.validate(0.8).is_err());
+}
+
+#[test]
+fn bisection_finds_the_largest_scale_that_fits() {
+    let b = dm();
+    let arm = armd::chain::ArmModel::RebotDevArm;
+    let traj = swing(STRETCHED, -1.0);
+    let s = quintic_samples(&b.planning, &traj, 6);
+    let t0 = std::time::Instant::now();
+    let fit = plan_scale(&b, &arm, &s).unwrap();
+    let us = t0.elapsed().as_secs_f64() * 1e6;
+    eprintln!("stretched J2 swing -1 rad in {:.2} s: full speed {:.2} A, limit {:.2} A -> scale {:.3} ({:.2} s), peak {:.2} A; {} samples, {us:.0} µs",
+        traj.duration, fit.peak_full_a, fit.limit_a, fit.scale, traj.duration / fit.scale, fit.peak_a, fit.samples);
+    assert!(fit.peak_full_a > fit.limit_a && fit.scale < 1.0 && fit.scale > b.planning.min_scale);
+    assert!(fit.peak_a <= fit.limit_a + 1e-4);
+    assert!((fit.limit_a - 0.75 * 6.5).abs() < 1e-5);
+    // tight: 1 % faster no longer fits
+    let mut faster = b.clone();
+    faster.planning.min_scale = (fit.scale * 1.01).min(1.0);
+    assert!(plan_scale(&faster, &arm, &s).is_err(), "scale x 1.01 must exceed the limit");
+    // a slow move fits as planned
+    let slow = swing([0.0, -1.167, -1.565, 1.435, 0.0, 1.57, 0.0], 0.3);
+    let fit = plan_scale(&b, &arm, &quintic_samples(&b.planning, &slow, 6)).unwrap();
+    assert_eq!(fit.scale, 1.0);
+}
+
+#[test]
+fn refused_when_even_the_slowest_speed_exceeds_the_budget() {
+    let mut b = dm();
+    b.supply_rated_a = 4.0; // planning limit 3.0 A
+    let arm = armd::chain::ArmModel::RebotDevArm;
+    // from a light pose into the stretched one: the static load at the end alone is ~3.5 A
+    let mut from = STRETCHED;
+    from[1] = -1.4;
+    let traj = TrajectoryPlanner::plan(&from, &[0.0; 7], &STRETCHED, &[0.0; 7], None, &fast_limits()).unwrap();
+    let err = plan_scale(&b, &arm, &quintic_samples(&b.planning, &traj, 6)).unwrap_err();
+    eprintln!("refusal: {err}");
+    assert_eq!(err.code(), "POWER_BUDGET");
+    // from the stretched pose (static load above the limit), a base rotation that adds no
+    // load is not refused: the limit becomes the start's static load + 5 % of the rating
+    let mut turned = STRETCHED;
+    turned[0] = 0.5;
+    let turn = TrajectoryPlanner::plan(&STRETCHED, &[0.0; 7], &turned, &[0.0; 7], None, &fast_limits()).unwrap();
+    let fit = plan_scale(&b, &arm, &quintic_samples(&b.planning, &turn, 6)).unwrap();
+    eprintln!("base turn at the stretched pose: scale {:.3}, peak {:.2} A, limit {:.2} A (start static load + 0.2 A)", fit.scale, fit.peak_a, fit.limit_a);
+    assert!(fit.limit_a > 3.0 && fit.scale > 0.2);
+}
+
+fn fast_cfg() -> ArmConfig {
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.planned_max_velocity = None;
+    cfg.workspace = None;
+    cfg.torque_guard = None; // the stretched pose holds J2 near its threshold
+    cfg
+}
+
+/// Joint move of the stretched arm at the joint limits (2 rad/s, 5 rad/s²): slowed before it
+/// starts, the action reports power_scale and the longer expected duration; executed on a
+/// rigid-body sim the governor does not have to act.
+#[test]
+fn fast_stretched_move_is_slowed_to_fit() {
+    let (mut inner, arm) = rig_at(fast_cfg(), STRETCHED);
+    arm.with(|s| s.dynamic = true);
+    let mut target = STRETCHED.to_vec();
+    target[1] -= 1.0;
+    let full = swing(STRETCHED, -1.0).duration;
+    let epoch = inner.safety.epoch_id();
+    let t0 = std::time::Instant::now();
+    let (_, id, planned) = inner.jog_action(target, None, Some(epoch), "joint_move").unwrap();
+    let plan_us = t0.elapsed().as_secs_f64() * 1e6;
+    let scale = inner.last_action.as_ref().unwrap().power_scale.unwrap();
+    eprintln!("stretched joint_move: {full:.2} s at the limits -> {planned:.2} s, power_scale {scale:.3}; jog_action took {plan_us:.0} µs");
+    assert!(scale < 0.6 && (planned - full / f64::from(scale)).abs() < 0.02 * planned, "{scale} {planned}");
+    let (mut peak, mut min_gov) = (0.0f32, 1.0f32);
+    let mut n = 0;
+    while inner.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running()) && n < 1500 {
+        let p = power(&inner.tick(DT));
+        peak = peak.max(p.bus_a);
+        min_gov = min_gov.min(p.scale);
+        n += 1;
+    }
+    eprintln!("executed in {:.2} s: estimate peak {peak:.2} A (planning limit 4.88 A, soft 5.20 A), governor scale min {min_gov:.2}", n as f64 * DT);
+    assert_eq!(inner.last_action.as_ref().unwrap().state, "done");
+    assert!(peak < 5.2 && min_gov == 1.0);
+    // without the planning step the same move runs into the governor
+    let mut cfg = fast_cfg();
+    cfg.power_budget.as_mut().unwrap().planning.enabled = false;
+    let (mut inner, arm) = rig_at(cfg, STRETCHED);
+    arm.with(|s| s.dynamic = true);
+    let mut target = STRETCHED.to_vec();
+    target[1] -= 1.0;
+    let epoch = inner.safety.epoch_id();
+    let (_, id, _) = inner.jog_action(target, None, Some(epoch), "joint_move").unwrap();
+    assert!(inner.last_action.as_ref().unwrap().power_scale.is_none());
+    let (mut peak, mut min_gov) = (0.0f32, 1.0f32);
+    for _ in 0..1500 {
+        let p = power(&inner.tick(DT));
+        peak = peak.max(p.bus_a);
+        min_gov = min_gov.min(p.scale);
+        if !inner.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running()) { break; }
+    }
+    let a = inner.last_action.clone().unwrap();
+    eprintln!("planning off: {} {:?}, estimate peak {peak:.2} A, governor scale min {min_gov:.2}", a.state, a.code);
+    assert!(min_gov < 1.0);
+}
+
+/// A Cartesian path is fitted the same way (JointPath::fit_power) and the action records it.
+#[test]
+fn cartesian_path_fit_and_action_record() {
+    let b = dm();
+    let arm = armd::chain::ArmModel::RebotDevArm;
+    let n = 60;
+    let q: Vec<[f32; 7]> = (0..=n).map(|k| { let mut q = STRETCHED; q[1] -= k as f32 / n as f32; q }).collect();
+    let s: Vec<f64> = (0..=n).map(|k| k as f64 / n as f64).collect();
+    let mut path = armd::motion::JointPath { q, s, duration: 1.0, power_scale: 1.0 };
+    let fit = path.fit_power(&b, &arm).unwrap();
+    eprintln!("Cartesian-style path, 1 rad on J2 in 1 s: scale {:.3}, duration {:.2} s, peak {:.2} A of {:.2} A at full speed", fit.scale, path.duration, fit.peak_a, fit.peak_full_a);
+    assert!(fit.scale < 1.0 && (path.duration - 1.0 / fit.scale).abs() < 1e-9 && path.power_scale == fit.scale);
+    // move_to through the planner: the default 5 cm/s needs no slowing; the action says 1
+    let mut inner = common::sim_at(ArmConfig::rebot_dm(), &INSPECT);
+    let input = inner.plan_input().unwrap();
+    assert!(input.power.is_some());
+    let mut goal = input.arm.fk(&input.q0);
+    goal.p[2] += 0.03;
+    let path = armd::motion::plan_cartesian(&input, goal, armd::motion::Speed { linear: 0.05, angular: 0.5 }).unwrap();
+    assert_eq!(path.power_scale, 1.0);
+    let (id, _) = inner.install_path(&input, path, "move_to", None).unwrap();
+    let a = inner.last_action.clone().unwrap();
+    assert_eq!((a.id, a.power_scale), (id, Some(1.0)));
+    assert!(serde_json::to_value(&a).unwrap()["power_scale"] == 1.0);
+}
+
+/// Replay: a fast recorded swing of the stretched arm is played slower to fit.
+#[test]
+fn replay_is_slowed_to_fit() {
+    let inner = common::sim_at(fast_cfg(), &STRETCHED);
+    let frames: Vec<armd::RecordFrame> = (0..=50).map(|k| {
+        let t = k as f64 * 0.02;
+        let u = t / 1.0;
+        let mut q = STRETCHED.to_vec();
+        q[1] -= (u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)) as f32;
+        armd::RecordFrame { timestamp: t, observation_state: q.clone(), action: q }
+    }).collect();
+    let input = armd::replay::ReplayInput {
+        request: armd::replay::ReplayRequest { episode: "swing".into(), speed: 1.0, gripper: false, tag: None },
+        path: std::path::PathBuf::from("/nonexistent"), dof: 7, gripper_idx: Some(6),
+        limits: inner.config.limits.clone(), speed_limits: inner.planning_limits(), ws: None,
+        arm: inner.config.arm_model.clone(), start: STRETCHED.to_vec(), control_hz: 50, epoch: inner.safety.epoch_id(),
+        workspace_revision: 0, power: inner.power_budget().cloned(),
+    };
+    let t0 = std::time::Instant::now();
+    let plan = armd::replay::plan_frames(input, &frames).unwrap();
+    eprintln!("replay of a 1 s stretched swing: power_scale {:?} ({} µs)", plan.power_scale, t0.elapsed().as_micros());
+    assert!(plan.power_scale.is_some_and(|s| s < 1.0));
 }

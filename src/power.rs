@@ -201,6 +201,8 @@ pub struct PowerBudget {
     pub filter_s: f32,
     pub joints: Vec<JointPower>,
     pub governor: GovernorPolicy,
+    /// Time scaling of planned motions (`src/power_plan.rs`).
+    pub planning: crate::power_plan::PlanningPolicy,
 }
 
 impl Default for PowerBudget {
@@ -216,6 +218,7 @@ impl Default for PowerBudget {
             filter_s: 0.25,
             joints: Vec::new(),
             governor: GovernorPolicy::default(),
+            planning: crate::power_plan::PlanningPolicy::default(),
         }
     }
 }
@@ -269,6 +272,7 @@ impl PowerBudget {
             return Err(format!("power_budget.joints needs {dof} entries (one per joint, at most {MAX_JOINTS})"));
         }
         self.governor.validate(self)?;
+        self.planning.validate(self.governor.soft)?;
         for (j, p) in self.joints.iter().enumerate() {
             if !pos(p.kt_nm_per_a) || !nonneg(p.r_phase_ohm) || !nonneg(p.idle_w) || !nonneg(p.viscous_nm_s) || !nonneg(p.coulomb_nm) {
                 return Err(format!("power_budget.joints[{j}]: kt_nm_per_a must be positive; r_phase_ohm, idle_w, viscous_nm_s, coulomb_nm >= 0"));
@@ -590,6 +594,49 @@ impl SupervisorInner {
             }
         }
         if let Some(j) = clamped { self.note_motion_limit(MotionLimitReason::Power, Some(j)); }
+    }
+
+    /// Record the power-budget time scale of a planned motion on action `id` (the smallest
+    /// of its sub-motions for a macro action).
+    pub(crate) fn note_action_power_scale(&mut self, id: u64, scale: f64) {
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+            let s = r3(scale as f32);
+            a.power_scale = Some(a.power_scale.map_or(s, |old| old.min(s)));
+        }
+    }
+
+    /// Fit a joint quintic from `start` / `v0` to `target` into the power budget
+    /// (`src/power_plan.rs`): returns the trajectory to run (re-planned longer when slowed)
+    /// and its scale (None without a planning budget). `refuse`: return POWER_BUDGET when even
+    /// `min_scale` does not fit; otherwise run at `min_scale` (park).
+    pub(crate) fn power_fit_quintic(&self, traj: crate::trajectory::MultiJointQuinticTrajectory, start: &[f32], v0: &[f32], target: &[f32],
+        limits: &[crate::model::JointLimit], refuse: bool) -> Result<(crate::trajectory::MultiJointQuinticTrajectory, Option<f64>), crate::supervisor::ArmError> {
+        use crate::power_plan::{plan_scale, quintic_samples};
+        let Some(b) = self.power_budget().filter(|b| b.planning.enabled) else { return Ok((traj, None)); };
+        let t0 = std::time::Instant::now();
+        let (p, arm, dof) = (b.planning, &self.config.arm_model, self.config.arm_dof());
+        let fit = |t: &crate::trajectory::MultiJointQuinticTrajectory| plan_scale(b, arm, &quintic_samples(&p, t, dof));
+        let mut s = match fit(&traj) {
+            Ok(f) if f.scale >= 1.0 => return Ok((traj, Some(1.0))),
+            Ok(f) => f.scale,
+            Err(e) if refuse => return Err(e.into()),
+            Err(_) => p.min_scale,
+        };
+        let full = traj.duration;
+        let zeros = vec![0.0; target.len()];
+        // with a start velocity the longer quintic is not an exact time scaling: re-check it
+        let mut best = None;
+        for _ in 0..6 {
+            let t2 = crate::trajectory::TrajectoryPlanner::plan(start, v0, target, &zeros, Some(full / s), limits)?;
+            let ok = fit(&t2).is_ok_and(|f| f.scale >= 0.999);
+            best = Some(t2);
+            if ok || s <= p.min_scale + 1e-9 { break; }
+            s = (s * 0.9).max(p.min_scale);
+        }
+        let t2 = best.expect("at least one plan");
+        let scale = full / t2.duration;
+        tracing::debug!("Power planning (joint move): scale {scale:.3}, {:.2} s -> {:.2} s, {} µs", full, t2.duration, t0.elapsed().as_micros());
+        Ok((t2, Some(scale)))
     }
 
     /// `observation.power`.
