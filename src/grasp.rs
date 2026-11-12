@@ -1287,7 +1287,7 @@ impl Orchestrator {
             return skip("table_clearance");
         }
         let size = |d: &Detection| (((d.box_norm[2] - d.box_norm[0]) * self.cam.size[0]) * ((d.box_norm[3] - d.box_norm[1]) * self.cam.size[1])).sqrt();
-        let s1 = median(&mut c.frames.iter().map(size).collect::<Vec<_>>());
+        let before: Vec<f64> = c.frames.iter().map(size).collect();
         self.phase("probe", 0.45).await?;
         let done = self.move_arm("probe", GoalSpec::Relative { frame: RelFrame::Base, d: [0.0, 0.0, -s.height_probe_m], dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false }, s.approach_speed_mps).await?;
         let now = self.pose().await;
@@ -1305,11 +1305,11 @@ impl Orchestrator {
             tracker.predicted = d.box_norm;
             sizes.push(size(&d));
         }
-        let s2 = median(&mut sizes);
         let (z1, z2) = (self.cam.origin(&pose)[2], self.cam.origin(&now)[2]);
-        let ratio = s2 / s1;
-        if ratio.is_nan() || ratio < 1.03 { return Ok(Err(format!("scale_change:{ratio:.3}"))); }
-        let h = z1 - (z1 - z2) * s2 / (s2 - s1) - s.table_z_m;
+        let h = match scale_height(&before, &sizes, z1 - z2) {
+            Ok(d1) => z1 - d1 - s.table_z_m,
+            Err(reason) => return Ok(Err(reason)),
+        };
         if !h.is_finite() { return skip("not_finite"); }
         if h < 0.0 { return Ok(Err(format!("below_table:{h:.3}"))); }
         if h >= s.approach_height_m - 0.02 {
@@ -1459,6 +1459,29 @@ pub fn align_guard(last: &Detection, frames: &[Detection], size: [f64; 2]) -> Re
         if m > 0.0 && (area(&b) / m - 1.0).abs() > 0.4 { return Err("occluded"); }
     }
     Ok(())
+}
+
+/// Largest height uncertainty (m) the probe accepts: box size noise beyond it makes the
+/// estimate fall back to `grasp_height_m`.
+pub const HEIGHT_PROBE_TOL_M: f64 = 0.01;
+
+/// Lens-to-top distance before the probe from box sizes (px) before and after moving `dz`
+/// closer: D1 = dz · s2 / (s2 − s1) with the medians. Err (fallback reason) when s2 / s1 <
+/// 1.03 or when the frames' size spread (half range / median of each set) makes D1 uncertain
+/// by more than [`HEIGHT_PROBE_TOL_M`]: dD1 = dz / (r − 1)² · dr, dr = r · √(e1² + e2²).
+pub fn scale_height(before: &[f64], after: &[f64], dz: f64) -> Result<f64, String> {
+    let stats = |v: &[f64]| -> Option<(f64, f64)> {
+        if v.is_empty() { return None; }
+        let m = median(&mut v.to_vec());
+        let (lo, hi) = v.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), x| (a.min(*x), b.max(*x)));
+        (m > 0.0).then(|| (m, (hi - lo) / 2.0 / m))
+    };
+    let (Some((s1, e1)), Some((s2, e2))) = (stats(before), stats(after)) else { return Err("no_frames".into()); };
+    let r = s2 / s1;
+    if r.is_nan() || r < 1.03 { return Err(format!("scale_change:{r:.3}")); }
+    let unc = dz / (r - 1.0).powi(2) * r * e1.hypot(e2);
+    if unc.is_nan() || unc > HEIGHT_PROBE_TOL_M { return Err(format!("scale_noise:{unc:.3}")); }
+    Ok(dz * r / (r - 1.0))
 }
 
 /// A box edge within 2 px of the image border (the box may be cut off).
@@ -1611,6 +1634,20 @@ mod tests {
         assert_eq!(align_guard(&shrunk, &with_last, size), Err("occluded"));
         // -30 % passes
         assert_eq!(align_guard(&det([0.3, 0.3, 0.5, 0.51], None), &frames, size), Ok(()));
+    }
+
+    #[test]
+    fn scale_height_rejects_noisy_sizes() {
+        // lens 0.17 m above the top, 0.04 m probe: sizes scale by 0.17 / 0.13
+        let (s1, s2) = (100.0, 100.0 * 0.17 / 0.13);
+        let d1 = scale_height(&[s1, s1, s1], &[s2, s2, s2], 0.04).unwrap();
+        assert!((d1 - 0.17).abs() < 1e-9, "{d1}");
+        // 5 % size jitter: about 4 cm of height uncertainty
+        let e = scale_height(&[s1 * 0.95, s1, s1 * 1.05], &[s2 * 1.05, s2 * 0.95, s2], 0.04).unwrap_err();
+        assert!(e.starts_with("scale_noise:"), "{e}");
+        // 0.3 % jitter passes
+        assert!(scale_height(&[s1 * 0.997, s1, s1 * 1.003], &[s2, s2 * 1.003, s2], 0.04).is_ok());
+        assert!(scale_height(&[s1], &[s1 * 1.01], 0.04).unwrap_err().starts_with("scale_change:"));
     }
 
     #[test]
