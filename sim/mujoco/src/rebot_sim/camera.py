@@ -212,11 +212,27 @@ def render_segmentation(renderer: mujoco.Renderer) -> np.ndarray:
     return decode_segmentation(rgb, renderer.scene)
 
 
+def mask_orientation(xs: np.ndarray, ys: np.ndarray) -> tuple[float, float]:
+    """Orientation of the long side of a pixel set (second moments): (angle_deg, angle_conf).
+    The angle runs from image +x toward image +y (y down) in [-90, 90); angle_conf is
+    1 - minor/major eigenvalue ratio, 0 for a round or square footprint (angle ambiguous)."""
+    dx, dy = xs - xs.mean(), ys - ys.mean()
+    cxx, cyy, cxy = float((dx * dx).mean()), float((dy * dy).mean()), float((dx * dy).mean())
+    angle = math.degrees(0.5 * math.atan2(2 * cxy, cxx - cyy))  # (-90, 90]
+    if angle >= 90.0 - 1e-9:
+        angle -= 180.0
+    half = math.hypot((cxx - cyy) / 2, cxy)
+    major, minor = (cxx + cyy) / 2 + half, (cxx + cyy) / 2 - half
+    conf = 0.0 if major <= 1e-9 else 1.0 - max(minor, 0.0) / major
+    return round(angle, 2), round(min(max(conf, 0.0), 1.0), 3)
+
+
 def detections(geom_ids: np.ndarray, scene, min_pixels: int = 20) -> list[dict]:
     """Ground-truth boxes of the scene objects (rebot-vision format) from a segmentation
     render at DETECTION_SIZE: the bounds of each object's visible pixels, so occlusion (by the
     gripper or another object) and the image edge are accounted for. Objects with fewer than
-    `min_pixels` visible pixels are not reported."""
+    `min_pixels` visible pixels are not reported. `angle_deg` / `angle_conf` give the in-image
+    orientation of the object's mask (mask_orientation)."""
     h, w = geom_ids.shape
     out = []
     for i, (obj, gid) in enumerate(zip(scene.objects, scene.geom_ids)):
@@ -225,9 +241,11 @@ def detections(geom_ids: np.ndarray, scene, min_pixels: int = 20) -> list[dict]:
             continue
         n0, n1 = round(int(xs.min()) / w, 4), round((int(xs.max()) + 1) / w, 4)
         m0, m1 = round(int(ys.min()) / h, 4), round((int(ys.max()) + 1) / h, 4)
+        angle, conf = mask_orientation(xs.astype(np.float64), ys.astype(np.float64))
         out.append({"class_id": i, "format": "xywh_center", "class_name": obj.kind, "name": obj.name,
                     "confidence": 0.99, "x": (n0 + n1) / 2, "y": (m0 + m1) / 2,
-                    "w": round(n1 - n0, 4), "h": round(m1 - m0, 4), "pixels": int(len(xs))})
+                    "w": round(n1 - n0, 4), "h": round(m1 - m0, 4), "pixels": int(len(xs)),
+                    "angle_deg": angle, "angle_conf": conf})
     return out
 
 
