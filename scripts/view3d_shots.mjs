@@ -99,8 +99,8 @@ try {
     const st = await page.evaluate(() => ({ mode: V3.mode, status: document.getElementById('v3-status').textContent, hidden: document.getElementById('view3d').hidden }));
     ok(!st.hidden && st.mode === (lite ? 'stick' : 'mesh'), `${tag} 3D view open in ${st.mode} mode`);
     ok(lite ? st.status === '未安装机械臂网格，显示关节骨架' : st.status === '', `${tag} status "${st.status}"`);
-    const loaded = reqs.filter((r) => r.startsWith('/assets/model/meshes/') && r.endsWith('.stl')).length;
-    ok(lite ? loaded === 0 : loaded >= 30, `${tag} ${loaded} mesh files requested`);
+    const loaded = reqs.filter((r) => r === '/assets/model/meshes/arm.bin').length;
+    ok(lite ? loaded === 0 : loaded === 1, `${tag} arm.bin requested ${loaded} time(s)`);
 
     // canvas pixels (render and read back in the same task)
     const px = await page.evaluate(() => {
