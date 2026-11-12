@@ -37,6 +37,7 @@ Open the cockpit at `http://127.0.0.1:8765/`. `--follower-port` defaults to `udp
 | `--camera` | wrist camera: H.264 stream on `--video-port` (8001), perception API and `/sim/*` on `--perception-port` (8090), bound to `--http-host` (127.0.0.1) |
 | `--fps N`, `--camera-size` | camera rate, 1..30 (default 15); stream size `1280x720` (default) or `640x360` |
 | `--profile P`, `--camera-rot-deg`, `--camera-tilt-deg`, `--camera-offset X,Y,Z` | camera mount: `camera_mount` of the profile (default: the kit profile), then these overrides |
+| `--det-jitter-px`, `--det-size-jitter`, `--det-drop-rate`, `--det-latency-ms`, `--det-false-rate`, `--det-angle-jitter-deg`, `--det-noise-seed` | detection noise (all off by default); see "Detection noise and orientation" |
 | `--scene-stream` | also stream the fixed overview camera at `ws://<host>:<video-port>/scene` |
 | `--torque-report instant\|mean` | torque in state datagrams: instantaneous (default) or the mean over the last command period (sliding window; see Friction identification) |
 
@@ -130,6 +131,24 @@ The format of the reCamera debug stream (rebot-companion `snapshot.py`, the cock
 ### Perception (`http://<host>:8090`)
 
 rebot-vision perception API version 2 ([detection_api.md](detection_api.md)): `GET/POST /api/mode`, `GET/POST /api/inference`, `POST /api/trigger`, `GET /api/results/latest?after&wait_ms`, `POST /api/subscribe`, `POST /api/subscribe/{id}/keepalive`, `DELETE /api/subscribe/{id}`, `GET /api/subscriptions`. Every rendered frame gets ground-truth detections: a 640x360 segmentation render of the wrist camera, and per scene object the bounds of its visible pixels (at least 20), so occlusion and the image edge are accounted for. `class_name` is the object kind (`cube`, `cup`, `block`), `name` the object name, `confidence` 0.99, `format` `xywh_center` normalised to 640x360. A trigger answers with the first frame whose state was copied after the request. The `aruco` pipeline runs but finds nothing (no markers in the scene). Results are published to `latest` at the subscription rate (at most min(15, `--fps`)).
+
+#### Detection noise and orientation
+
+Each ground-truth detection also carries `angle_deg` (orientation of the object's long side in the 640x360 image, from image +x toward +y with y down, range [-90, 90), from the second moments of its mask) and `angle_conf` (1 − minor/major eigenvalue ratio of the mask; about 0 for a square or round footprint, where the angle is ambiguous). The existing fields are unchanged.
+
+All options below are off by default (detections are then the ground truth). Pixels refer to the 640x360 detection image. The noise is applied to the detections of each frame before they are published; `/sim/state` keeps the ground truth.
+
+| Option | Effect |
+|---|---|
+| `--det-jitter-px S` | Gaussian noise, σ = S px, on the box centre x and y (independent) |
+| `--det-size-jitter F` | w and h are each multiplied by (1 + N(0, F)) |
+| `--det-drop-rate P` | each detection is dropped with probability P per frame |
+| `--det-latency-ms L` | a frame's detections are published L ms after its capture; `age_ms` includes the delay and the detections are those of the older frame |
+| `--det-false-rate P` | with probability P per frame one false detection is added: random existing label, random place and size, `confidence` 0.3..0.6, `angle_conf` 0 |
+| `--det-angle-jitter-deg S` | Gaussian noise, σ = S degrees, on `angle_deg` (wrapped into [-90, 90)) |
+| `--det-noise-seed N` | RNG seed (default `--seed`, else 0); the errors of a frame depend on (seed, frame id) |
+
+Boxes are clipped to the image; boxes under 2 px wide or high are dropped. Example: `rebot-sim --camera --det-jitter-px 3 --det-size-jitter 0.05 --det-drop-rate 0.1 --det-latency-ms 100 --det-noise-seed 1` (the `v5_noise` / `v8_noise` cases of `tests/test_camera_grasp.py`).
 
 ### Scene and evaluation routes
 
