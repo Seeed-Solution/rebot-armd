@@ -19,6 +19,7 @@ KINDS = {
     "cube": (mujoco.mjtGeom.mjGEOM_BOX, (0.02, 0.02, 0.02), 0.03, (0.92, 0.18, 0.12, 1)),
     "cup": (mujoco.mjtGeom.mjGEOM_CYLINDER, (0.025, 0.035, 0.0), 0.05, (0.15, 0.40, 0.85, 1)),
     "block": (mujoco.mjtGeom.mjGEOM_BOX, (0.03, 0.015, 0.02), 0.04, (0.20, 0.70, 0.25, 1)),
+    "slab": (mujoco.mjtGeom.mjGEOM_BOX, (0.05, 0.05, 0.01), 0.05, (0.80, 0.60, 0.20, 1)),
 }
 MAX_OBJECTS = 3
 DEFAULT_XY = [(0.30, 0.0), (0.24, 0.12), (0.24, -0.12)]
