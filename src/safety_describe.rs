@@ -187,6 +187,27 @@ impl SupervisorInner {
             }));
         }
 
+        if capabilities.torque_guard {
+            if let Some(p) = c.torque_guard {
+                stops.push(json!({
+                    "id": "torque_limit_hold",
+                    "trigger": "|measured torque| at or above ratio x the joint's TMAX for persist_ms on a watched joint (J1..J6, gripper excluded), torqued in position control",
+                    "ratio": p.ratio,
+                    "persist_ms": p.persist_ms,
+                    "thresholds_nm": self.torque_guard_thresholds(),
+                    "not_watched": ["gravity_comp", "unload_settle", "gripper"],
+                    "lease_required": false,
+                    "effect": "cancel_motion_hold_torque_on",
+                    "action_code": "TORQUE_LIMIT",
+                    "motion_limit_reason": "torque",
+                    "while_held": "servo and jog targets that move the held joint further in the push direction (sign of the torque at the trip) are clamped to the hold position; targets that keep it or move it the other way pass",
+                    "release_rad": crate::torque_guard::TORQUE_HOLD_RELEASE_RAD,
+                    "invalidates_commands": false,
+                    "clear": ["move_joint_away_from_push_direction"],
+                }));
+            }
+        }
+
         let cap = c.speed_cap;
         let workspace = self.workspace_policy().map(|(ws, _)| json!({
             "floor_z_m": ws.floor_z_m,

@@ -168,14 +168,14 @@ without `/api/mode` (404) get the old inference on / off toggle.
 the cockpit and MCP clients can adapt without probing routes. Schemas from older armd versions
 have no `capabilities` object; it parses as all false, `version` 0.
 
-- Version: `capabilities.version`, currently **7** (`CAPABILITIES_VERSION`). Version 2 added
+- Version: `capabilities.version`, currently **8** (`CAPABILITIES_VERSION`). Version 2 added
   the `vision.*` fields after `detection_proxy`; version 3 added `vision.per_request_pipelines`
   and `vision.subscriptions`; version 4 added `servo_guard` (with the schema fields
   `servo_max_velocity` and `servo_max_lead_rad`, and `observation.motion_limit`); version 5 added
   `diagnostics`; version 6 added `obs_rate`, `fault_codes`, `poses`, `keepout`, `speed_cap`,
   `residual_torques` and `tick_stats` (with the schema field `speed_cap` and the observation
   fields `fault` and `residual_torques`), `place`, `collision_guard` (with the observation
-  field `collision`), and `safety_describe`; version 7 added `replay`. Clients check each field and fall back
+  field `collision`), and `safety_describe`; version 7 added `replay`; version 8 added `torque_guard` (with the schema field `torque_guard` and `motion_limit.reason` `torque`). Clients check each field and fall back
   when it is false or missing.
 
 | Field | True when |
@@ -200,6 +200,7 @@ have no `capabilities` object; it parses as all false, `version` 0.
 | `collision_guard` | the profile has a gravity model on a 6/7-DOF arm and the driver reports torque: the `collision` profile section, `/api/v1/safety/collision` and `observation.collision` apply (the guard itself is off unless enabled; version 6) |
 | `safety_describe` | always true: `GET /api/v1/safety/describe` lists limits, stops and faults generated from the running config (version 6) |
 | `replay` | always true: `GET /api/v1/dataset/episodes`, `DELETE /api/v1/dataset/episodes/{id}` and the action `/api/v1/action/replay`; the listing's `enabled` is false when episode storage is off (version 7) |
+| `torque_guard` | the profile enables `torque_guard` with `damiao_ranges` and the driver reports torque: a joint at or above `ratio` × TMAX for `persist_ms` stops the motion (action code `TORQUE_LIMIT`, `motion_limit.reason` `torque`); the policy is `schema.torque_guard` (version 8) |
 | `vision.detection_proxy` | always true: the detection routes exist; reachability of the provider is not checked |
 | `vision.mode_endpoint` | (string) always `/api/v1/vision/mode` |
 | `vision.modes` | (list) modes the provider reports (`off`, `yolo`, `aruco`, `both`); empty when it is unreachable or has no `/api/mode` |

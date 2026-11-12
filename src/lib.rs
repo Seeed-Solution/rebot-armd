@@ -21,6 +21,7 @@ pub mod safety;
 pub mod safety_describe;
 pub mod sim_driver;
 pub mod supervisor;
+pub mod torque_guard;
 pub mod trajectory;
 pub mod urdf;
 pub mod transport;

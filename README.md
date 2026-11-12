@@ -205,7 +205,10 @@ TODO / roadmap:
   (`max_error_rad` 0.5 for 500 ms) and `TRACKING_STALL` for actions; planned-motion speed cap
   (`planned_max_velocity`, 0.45 rad/s on rebot-dm); servo-stream speed and lead caps
   (`servo_max_velocity`, `servo_max_lead_rad` 0.2) with a hold instead of a Fault when a
-  joint cannot follow, reported as `motion_limit`; Cartesian workspace check (floor, box,
+  joint cannot follow, reported as `motion_limit`; torque guard (|torque| at or above
+  `torque_guard.ratio` × TMAX for 100 ms on J1–J6 stops the motion and holds with torque on,
+  action code `TORQUE_LIMIT`; rebot-dm ratio 0.60: 16.8 N·m on J1–J3, 6.0 N·m on J4–J6);
+  `is_torqued` false when the motors come back Disabled during a Fault; Cartesian workspace check (floor, box,
   reach); lease watchdog that parks the arm; refusal to cut torque away from the resting pose
   (`ARM_NOT_AT_RESTING_POSE`), so the arm is not dropped.
 
@@ -504,7 +507,7 @@ WebSocket that holds the lease.
 
 | Path | Method | Purpose |
 |---|---|---|
-| `/api/v1/observation` | GET | positions, velocities, torques, temperatures, safety state, `commanded_positions`, latest `action`, driver capabilities, `driver_range_check` (Damiao mapping ranges read from the motors at startup), `motion_limit` (servo speed / lead cap, joint limit, workspace or blocked hold shaping the motion; [contract](docs/control_safety_contract.md#servo-streaming-guard--流式控制保护)), `motor_errors` (per-joint motor fault code), `fault` (`{code, message, recoverable}` in Fault / EStop), `residual_torques` (measured minus model gravity torque, J1..J6) |
+| `/api/v1/observation` | GET | positions, velocities, torques, temperatures, safety state, `commanded_positions`, latest `action`, driver capabilities, `driver_range_check` (Damiao mapping ranges read from the motors at startup), `motion_limit` (servo speed / lead cap, joint limit, workspace, blocked hold or torque hold shaping the motion; [contract](docs/control_safety_contract.md#servo-streaming-guard--流式控制保护)), `motor_errors` (per-joint motor fault code), `fault` (`{code, message, recoverable}` in Fault / EStop), `residual_torques` (measured minus model gravity torque, J1..J6) |
 | `/api/v1/observation/schema` | GET | DOF, joint names, limits, workspace, camera mount, `speed_cap`, `capabilities` ([fields](docs/architecture.md#3-capability-discovery)) |
 | `/api/v1/ws` | WS | lease (`acquire_lease`, `heartbeat`), `command` / `command_ack` / `command_reject`, telemetry; `?obs_hz=N` limits telemetry on that connection to N per second |
 | `/api/v1/safety/e_stop` | POST | E-stop, no lease needed |

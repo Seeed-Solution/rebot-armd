@@ -145,6 +145,7 @@ impl Rig {
         let mut driver = DamiaoArmDriver::new(MockCanTransport::new(), (1..=7).collect());
         if old {
             config.damiao_ranges = None;
+            config.torque_guard = None; // needs damiao_ranges (TMAX per joint)
             let p = config.resting_pose.as_mut().unwrap();
             p.joint_max_velocities.clear();
             p.max_velocity = OLD_REST_VEL;
