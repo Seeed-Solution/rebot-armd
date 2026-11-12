@@ -120,6 +120,9 @@ pub struct GraspSetup {
     /// Stop the descent and close where the arm is when |residual torque| of J2 or J3 exceeds
     /// this (N·m); None = off (peaks are only logged).
     pub descend_contact_stop_nm: Option<f64>,
+    /// After the lift: wait this long (ms), then check `holding` again on the measured J7
+    /// position and torque (DROPPED when the object is gone).
+    pub post_lift_settle_ms: u64,
     /// Camera-down re-check after the transition: TARGET_DISPLACED when the target's box
     /// centre is more than this many pixels from where the model projects it.
     pub recheck_tol_px: f64,
@@ -177,6 +180,7 @@ impl Default for GraspSetup {
             recentre_height_m: 0.07,
             recentre_max_iterations: 3,
             descend_contact_stop_nm: None,
+            post_lift_settle_ms: 300,
         }
     }
 }
@@ -219,6 +223,7 @@ impl GraspSetup {
         check(self.max_grasp_height_m >= self.grasp_height_m && self.max_grasp_height_m <= 0.2,
             "max_grasp_height_m must be in [grasp_height_m, 0.2] m")?;
         check((0.0..=0.4).contains(&self.recentre_height_m), "recentre_height_m must be in [0, 0.4] m")?;
+        check(self.post_lift_settle_ms <= 5000, "post_lift_settle_ms must be at most 5000")?;
         check((1..=30).contains(&self.recentre_max_iterations), "recentre_max_iterations must be 1..30")?;
         check(self.descend_contact_stop_nm.is_none_or(|v| v.is_finite() && v > 0.0 && v <= 50.0), "descend_contact_stop_nm must be null or in (0, 50] N·m")?;
         check(self.align_min_aspect >= 1.0 && self.align_min_aspect <= 10.0, "align_min_aspect must be in [1, 10]")?;
@@ -831,7 +836,8 @@ pub fn parse_grasp(body: &Value, base: &GraspSetup) -> Result<GraspRequest, Moti
 /// A request checked under the lock, ready to be planned outside it.
 pub struct PendingGrasp {
     pub input: PlanInput,
-    pub request: GraspRequest,
+    /// Boxed: the setup makes the request large.
+    pub request: Box<GraspRequest>,
     pub open_rad: f32,
 }
 
@@ -862,7 +868,7 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Pend
         return Err(crate::safety::SafetyError::EpochMismatch { expected: inner.safety.epoch_id(), received: epoch }.into());
     }
     let input = inner.plan_input()?;
-    Ok(PendingGrasp { input, request, open_rad: policy.open_rad })
+    Ok(PendingGrasp { input, request: Box::new(request), open_rad: policy.open_rad })
 }
 
 /// TCP height of the grasp plane (where box centres are assumed to lie).
@@ -877,6 +883,7 @@ fn approach_pose(r_now: &Mat3, target: &Vec3, setup: &GraspSetup) -> Pose {
 /// with the gripper open (feasibility check, so an unreachable target is rejected up front).
 pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     let PendingGrasp { input, request, open_rad } = pending;
+    let request = *request;
     let setup = &request.setup;
     let pose = input.arm.fk(&input.q0);
     let cam = CamModel::assumed(&input.arm, setup, &input.cam);
@@ -919,7 +926,8 @@ pub fn expected_duration(planned: &PlannedGrasp) -> f64 {
     let lift = (s.lift_height_m - s.grasp_height_m) * 1.875 / s.descend_speed_mps;
     let probe = if s.height_probe_m > 0.0 { 2.0 * s.height_probe_m * 1.875 / s.approach_speed_mps + 1.5 } else { 0.0 };
     let recentre = if s.recentre_height_m > 0.0 && !planned.camera_down { 3.0 } else { 0.0 };
-    let base = 6.5 + planned.approach_duration + 4.0 * 1.5 + descend + 2.0 + lift + probe + recentre;
+    let lift_check = s.post_lift_settle_ms as f64 / 1000.0;
+    let base = lift_check + 6.5 + planned.approach_duration + 4.0 * 1.5 + descend + 2.0 + lift + probe + recentre;
     // camera-down: the transition move and its re-check frame
     if planned.camera_down { base + planned.transition_duration + 1.5 } else { base }
 }
@@ -1135,7 +1143,37 @@ impl Orchestrator {
         self.phase("lift", 0.9).await?;
         let p = self.pose().await.p;
         self.move_arm("lift", lift_to(p), s.descend_speed_mps).await?;
+        // the object may slip out while lifting: the jaw closes further and the grip torque drops
+        let (held, gap) = self.holding_now().await?;
+        if !held {
+            self.sup.inner().write().await.update_action(self.id, |a| a.gripper_gap_rad = Some(gap));
+            return Err(fail("DROPPED", format!("Object no longer held after the lift (gap {gap:.2} rad)")));
+        }
         Ok((true, closed.gripper_gap_rad))
+    }
+
+    /// `holding` after `post_lift_settle_ms` from the measured J7, with the gripper policy's rule
+    /// (as the close: gap from closed >= `holding_gap_rad` and median |J7 torque| over the window
+    /// >= `holding_torque_nm`). Returns (holding, gap).
+    async fn holding_now(&self) -> Result<(bool, f32), Stop> {
+        let until = Instant::now() + Duration::from_millis(self.setup.post_lift_settle_ms);
+        let mut taus = Vec::new();
+        loop {
+            self.check().await?;
+            let (gap, tau, policy) = {
+                let inner = self.sup.inner().read().await;
+                let Some(policy) = inner.config.gripper_policy.clone() else { return Err(fail("UNSUPPORTED", "No gripper policy")); };
+                let dir = if policy.closed_rad >= policy.open_rad { 1.0 } else { -1.0 };
+                let m7 = inner.measured_positions.get(6).copied().unwrap_or(f32::NAN);
+                ((policy.closed_rad - m7) * dir, inner.torques.get(6).copied().unwrap_or(0.0).abs(), policy)
+            };
+            taus.push(f64::from(tau));
+            if Instant::now() >= until {
+                let tau = median(&mut taus);
+                return Ok((gap >= policy.holding_gap_rad && tau >= f64::from(policy.holding_torque_nm), gap));
+            }
+            tokio::time::sleep(POLL).await;
+        }
     }
 
     /// After the camera-down transition, when the model projects the target `t` into the
@@ -1503,7 +1541,7 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
         Ok((holding, gap)) => inner.finish_macro(id, "done", None, None, Some(holding), gap),
         Err(Stop::Fail(code, message)) => {
             tracing::info!("Grasp {id} failed: {code} {message}");
-            let holding = if code == "NOT_HOLDING" { Some(false) } else { None };
+            let holding = if code == "NOT_HOLDING" || code == "DROPPED" { Some(false) } else { None };
             inner.finish_macro(id, "failed", Some(&code), Some(message), holding, None);
         }
         Err(Stop::Cancelled) => inner.finish_macro(id, "cancelled", None, None, None, None),

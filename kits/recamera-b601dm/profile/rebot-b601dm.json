@@ -235,6 +235,7 @@
     "recentre_height_m": 0.07,
     "recentre_max_iterations": 3,
     "descend_contact_stop_nm": null,
+    "post_lift_settle_ms": 300,
     "recheck_tol_px": 40.0
   },
   "gravity_comp": {

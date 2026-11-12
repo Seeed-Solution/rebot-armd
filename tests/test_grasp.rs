@@ -1373,3 +1373,40 @@ async fn descend_logs_residual_peaks_and_stops_on_contact() {
         }
     }
 }
+
+// ---- holding re-check after the lift ----
+
+/// Held through the lift: done. The object slips out after the close (the jaw closes onto its
+/// hold target, the grip torque drops): DROPPED at lift height, gripper not reopened.
+#[tokio::test]
+async fn post_lift_recheck_reports_a_dropped_object() {
+    for drop_it in [false, true] {
+        let setup = GraspSetup::default();
+        let rig = rig(setup.clone(), centred_lens(), 0.0, [0.0, 0.0], false).await;
+        let start_r = start_pose(&rig).await.r;
+        let mut s = setup.clone();
+        s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+        rig.sup.inner().write().await.set_grasp_setup(s.clone());
+        let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.unwrap();
+        if drop_it {
+            wait_phase(&rig.sup, id, "lift", Some(true)).await;
+            rig.hold.store(false, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            rig.sup.inner().write().await.torques[6] = 0.0;
+        }
+        let a = wait_done(&rig.sup, id, 60.0, |_| {}).await;
+        let pose = start_pose(&rig).await;
+        let j7 = rig.sup.inner().read().await.commanded_positions[6];
+        println!("post-lift (dropped {drop_it}): {} {:?} {:?} holding {:?} gap {:?}, TCP z {:.3}, J7 command {j7:.2}",
+            a.state, a.code, a.message, a.holding, a.gripper_gap_rad, pose.p[2]);
+        assert!((pose.p[2] - (s.table_z_m + s.lift_height_m)).abs() < 2e-3, "at lift height");
+        if drop_it {
+            assert_eq!((a.state.as_str(), a.code.as_deref(), a.holding), ("failed", Some("DROPPED"), Some(false)), "{a:?}");
+            assert!(a.gripper_gap_rad.is_some());
+            assert!(j7 > OBJECT_J7 - 0.3, "gripper not reopened: {j7}");
+            assert_idle_after(&rig.sup, id).await;
+        } else {
+            assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+        }
+    }
+}
