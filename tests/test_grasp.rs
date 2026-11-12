@@ -940,7 +940,9 @@ async fn camera_down_keeps_the_pitched_envelope_above_a_raised_table() {
 /// grip pixel calibrated.
 async fn v8_recheck_rig() -> (Rig, GraspSetup) {
     let (setup, truth, start) = v8_setup();
-    let setup = GraspSetup { approach_height_m: 0.06, ..setup };
+    // probe off: the 0.05 m test object is within 0.02 m of this approach height, the probe
+    // would end the grasp OBJECT_TOO_TALL before the transition these tests look at
+    let setup = GraspSetup { approach_height_m: 0.06, height_probe_m: 0.0, ..setup };
     let start_r = start.1.r;
     let rig = rig_mounted(setup.clone(), truth, 90.0, start, [0.01, 0.0], false).await;
     let mut s = setup.clone();
@@ -1282,8 +1284,42 @@ async fn height_probe_too_tall_object_fails() {
     println!("0.135 m object: {} {:?} {:?}", a.state, a.code, a.message);
     assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("OBJECT_TOO_TALL")), "{a:?}");
     let z = start_pose(&rig).await.p[2];
-    assert!((z - (s.table_z_m + s.approach_height_m - s.height_probe_m)).abs() < 2e-3, "stays at the probe pose: {z}");
+    assert!((z - (s.table_z_m + s.approach_height_m)).abs() < 2e-3, "back at the start pose of the probe: {z}");
     assert_idle_after(&rig.sup, a.id).await;
+}
+
+/// A 0.12 m object, taller than approach_height_m − height_probe_m (where the former downward
+/// probe took the jaw tips): the probe moves up from the start pose and back, the TCP never goes
+/// below the start height during it, and the estimate is valid (or OBJECT_TOO_TALL).
+#[tokio::test]
+async fn height_probe_moves_up_over_a_tall_object() {
+    let (rig, s) = height_rig(0.12, json!({})).await;
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let sup = rig.sup.clone();
+    let (mut start_z, mut min_z, mut max_z) = (f64::NAN, f64::INFINITY, f64::NEG_INFINITY);
+    let a = wait_done(&rig.sup, id, 60.0, |a| {
+        let Ok(inner) = sup.inner().try_read() else { return };
+        let z = kinematics::fk(&kinematics::q6(&inner.commanded_positions)).p[2];
+        match a.phase.as_deref() {
+            Some("centring") => start_z = z,
+            Some("probe") => { min_z = min_z.min(z); max_z = max_z.max(z); }
+            _ => {}
+        }
+    }).await;
+    println!("0.12 m object: {} {:?}, height {:?} ({:?} {:?}), close height {:?}; probe TCP z min {min_z:.4} max {max_z:.4}, start {start_z:.4} \
+              (old downward probe would reach {:.4}, object top {:.3})",
+        a.state, a.code, a.object_height_m, a.height_source, a.height_reason, a.close_height_m,
+        start_z - s.height_probe_m, s.table_z_m + 0.12);
+    assert!(min_z.is_finite(), "probe phase observed");
+    assert!(min_z >= start_z - 1e-3, "TCP below the start height during the probe: {min_z} < {start_z}");
+    assert!(max_z > start_z + s.height_probe_m - 2e-3, "moved up: {max_z}");
+    match a.code.as_deref() {
+        Some("OBJECT_TOO_TALL") => {}
+        _ => {
+            assert_eq!((a.state.as_str(), a.height_source.as_deref()), ("done", Some("scale")), "{a:?}");
+            assert!((f64::from(a.object_height_m.unwrap()) - 0.12).abs() <= 0.01, "{a:?}");
+        }
+    }
 }
 
 // ---- mid-height re-centre and descent contact ----

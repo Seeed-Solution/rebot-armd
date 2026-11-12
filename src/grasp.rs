@@ -1085,7 +1085,7 @@ impl Orchestrator {
         // centres map onto the object's top plane, the jaws close part way up the object
         let mut close_h = s.grasp_height_m;
         let mut plane = plane;
-        match self.probe_height(&c, &planned.request.label, camera_down, &mut after).await? {
+        match self.probe_height(&c, &planned.request.label, &mut after).await? {
             Ok(h) => {
                 plane = s.table_z_m + s.grasp_height_m.max(h);
                 close_h = (h * s.height_grasp_fraction).clamp(s.grasp_height_m, s.max_grasp_height_m);
@@ -1264,13 +1264,15 @@ impl Orchestrator {
         }
     }
 
-    /// Height probe: from the centred pose `c.pose` move straight down by `height_probe_m`, take
-    /// `median_frames` fresh matched frames and compare the median box size s = sqrt(w·h) (px)
-    /// with the centring frames' (s1 before, s2 after). Lens-to-top distance before the probe
-    /// D1 = dz · s2 / (s2 − s1); top height = lens z − D1 − `table_z_m`. `Ok(Ok(h))` on
-    /// success; `Ok(Err(reason))` when the probe was skipped or its result is unreliable (the
-    /// grasp goes on with `grasp_height_m`); OBJECT_TOO_TALL when h >= `approach_height_m` − 0.02.
-    async fn probe_height(&self, c: &Centred, label: &str, camera_down: bool, after: &mut Option<u64>) -> Result<Result<f64, String>, Stop> {
+    /// Height probe: from the centred pose `c.pose` move straight up by `height_probe_m`, take
+    /// `median_frames` fresh matched frames, and return to `c.pose`. The median box size
+    /// s = sqrt(w·h) (px) of the centring frames (s_low) and of the raised frames (s_high) give
+    /// the lens-to-top distance at the start pose D_low = dz · s_high / (s_low − s_high)
+    /// ([`scale_height`]); top height = lens z − D_low − `table_z_m`. Moving up keeps the jaws
+    /// away from an object whose height is not known yet. `Ok(Ok(h))` on success; `Ok(Err(reason))`
+    /// when the probe was skipped or its result is unreliable (the grasp goes on with
+    /// `grasp_height_m`); OBJECT_TOO_TALL when h >= `approach_height_m` − 0.02.
+    async fn probe_height(&self, c: &Centred, label: &str, after: &mut Option<u64>) -> Result<Result<f64, String>, Stop> {
         let s = &self.setup;
         let skip = |r: &str| Ok(Err(r.to_string()));
         if s.height_probe_m <= 0.0 { return skip("disabled"); }
@@ -1278,36 +1280,42 @@ impl Orchestrator {
         let pose = c.pose;
         if kinematics::column(&self.cam.rotation(&pose), 2)[2] > -(5f64.to_radians().cos()) { return skip("camera_not_vertical"); }
         if c.frames.iter().any(|d| touches_border(&d.box_norm, self.cam.size)) { return skip("border"); }
-        let probe = Pose::new(pose.r, [pose.p[0], pose.p[1], pose.p[2] - s.height_probe_m]);
-        if probe.p[2] - s.table_z_m < s.grasp_height_m + 0.02 { return skip("no_room"); }
+        let up = Pose::new(pose.r, [pose.p[0], pose.p[1], pose.p[2] + s.height_probe_m]);
         let centre_px = self.cam.to_px(box_centre(&c.last.box_norm));
         let Some(est) = self.cam.plane_point(&pose, centre_px, grasp_plane(s)) else { return skip("ray"); };
-        if table_violation(&pose, &probe, &self.envelope, s.table_z_m).is_some()
-            || (camera_down && table_violation(&probe, &approach_pose(&probe.r, &est, s), &self.envelope, s.table_z_m).is_some()) {
-            return skip("table_clearance");
-        }
+        if table_violation(&pose, &up, &self.envelope, s.table_z_m).is_some() { return skip("table_clearance"); }
         let size = |d: &Detection| (((d.box_norm[2] - d.box_norm[0]) * self.cam.size[0]) * ((d.box_norm[3] - d.box_norm[1]) * self.cam.size[1])).sqrt();
-        let before: Vec<f64> = c.frames.iter().map(size).collect();
+        let low: Vec<f64> = c.frames.iter().map(size).collect();
         self.phase("probe", 0.45).await?;
-        let done = self.move_arm("probe", GoalSpec::Relative { frame: RelFrame::Base, d: [0.0, 0.0, -s.height_probe_m], dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false }, s.approach_speed_mps).await?;
+        let up_spec = GoalSpec::Relative { frame: RelFrame::Base, d: [0.0, 0.0, s.height_probe_m], dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false };
+        let done = match self.move_arm("probe", up_spec, s.approach_speed_mps).await {
+            Ok(d) => d,
+            // rejected by the planner before anything was installed: the arm is still at the start
+            Err(Stop::Fail(code, _)) if code.starts_with("IK_") || code == "WORKSPACE_VIOLATION" => return skip("probe_unreachable"),
+            Err(e) => return Err(e),
+        };
         let now = self.pose().await;
         let mut tracker = Tracker { label: label.to_string(), predicted: c.last.box_norm, gate_px: s.acquire_dist_px };
         if let Some(p) = self.cam.project(&now, &est) { tracker.predict_at(self.cam.to_norm(p)); }
-        let mut sizes = Vec::new();
-        while sizes.len() < s.median_frames as usize {
+        let mut high = Vec::new();
+        let mut reason = None;
+        while high.len() < s.median_frames as usize {
             let d = match self.fresh_match(&tracker, done.at, after).await {
                 Ok(d) => d,
-                Err(Stop::Fail(code, _)) if code == "TARGET_LOST" => return skip("target_lost"),
+                Err(Stop::Fail(code, _)) if code == "TARGET_LOST" => { reason = Some("target_lost".to_string()); break; }
                 Err(e) => return Err(e),
             };
-            if touches_border(&d.box_norm, self.cam.size) { return skip("border"); }
+            if touches_border(&d.box_norm, self.cam.size) { reason = Some("border".to_string()); break; }
             tracker.gate_px = s.match_dist_px;
             tracker.predicted = d.box_norm;
-            sizes.push(size(&d));
+            high.push(size(&d));
         }
-        let (z1, z2) = (self.cam.origin(&pose)[2], self.cam.origin(&now)[2]);
-        let h = match scale_height(&before, &sizes, z1 - z2) {
-            Ok(d1) => z1 - d1 - s.table_z_m,
+        // back to the start pose: the later steps start from it
+        self.move_arm("probe", GoalSpec::Absolute { p: pose.p, r: Some(pose.r) }, s.approach_speed_mps).await?;
+        if let Some(r) = reason { return Ok(Err(r)); }
+        let (z_low, z_high) = (self.cam.origin(&pose)[2], self.cam.origin(&now)[2]);
+        let h = match scale_height(&low, &high, z_high - z_low) {
+            Ok(d_low) => z_low - d_low - s.table_z_m,
             Err(reason) => return Ok(Err(reason)),
         };
         if !h.is_finite() { return skip("not_finite"); }
@@ -1465,23 +1473,24 @@ pub fn align_guard(last: &Detection, frames: &[Detection], size: [f64; 2]) -> Re
 /// estimate fall back to `grasp_height_m`.
 pub const HEIGHT_PROBE_TOL_M: f64 = 0.01;
 
-/// Lens-to-top distance before the probe from box sizes (px) before and after moving `dz`
-/// closer: D1 = dz · s2 / (s2 − s1) with the medians. Err (fallback reason) when s2 / s1 <
-/// 1.03 or when the frames' size spread (half range / median of each set) makes D1 uncertain
-/// by more than [`HEIGHT_PROBE_TOL_M`]: dD1 = dz / (r − 1)² · dr, dr = r · √(e1² + e2²).
-pub fn scale_height(before: &[f64], after: &[f64], dz: f64) -> Result<f64, String> {
+/// Lens-to-top distance at the low pose from box sizes (px) there (`low`) and after moving
+/// `dz` farther away (`high`): with r = s_low / s_high (medians), D_low = dz · s_high /
+/// (s_low − s_high) = dz / (r − 1). Err (fallback reason) when r < 1.03 or when the frames'
+/// size spread (half range / median of each set) makes D_low uncertain by more than
+/// [`HEIGHT_PROBE_TOL_M`]: dD = dz / (r − 1)² · dr, dr = r · √(e_low² + e_high²).
+pub fn scale_height(low: &[f64], high: &[f64], dz: f64) -> Result<f64, String> {
     let stats = |v: &[f64]| -> Option<(f64, f64)> {
         if v.is_empty() { return None; }
         let m = median(&mut v.to_vec());
         let (lo, hi) = v.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), x| (a.min(*x), b.max(*x)));
         (m > 0.0).then(|| (m, (hi - lo) / 2.0 / m))
     };
-    let (Some((s1, e1)), Some((s2, e2))) = (stats(before), stats(after)) else { return Err("no_frames".into()); };
-    let r = s2 / s1;
+    let (Some((s_low, e1)), Some((s_high, e2))) = (stats(low), stats(high)) else { return Err("no_frames".into()); };
+    let r = s_low / s_high;
     if r.is_nan() || r < 1.03 { return Err(format!("scale_change:{r:.3}")); }
     let unc = dz / (r - 1.0).powi(2) * r * e1.hypot(e2);
     if unc.is_nan() || unc > HEIGHT_PROBE_TOL_M { return Err(format!("scale_noise:{unc:.3}")); }
-    Ok(dz * r / (r - 1.0))
+    Ok(dz / (r - 1.0))
 }
 
 /// A box edge within 2 px of the image border (the box may be cut off).
@@ -1638,16 +1647,57 @@ mod tests {
 
     #[test]
     fn scale_height_rejects_noisy_sizes() {
-        // lens 0.17 m above the top, 0.04 m probe: sizes scale by 0.17 / 0.13
-        let (s1, s2) = (100.0, 100.0 * 0.17 / 0.13);
-        let d1 = scale_height(&[s1, s1, s1], &[s2, s2, s2], 0.04).unwrap();
-        assert!((d1 - 0.17).abs() < 1e-9, "{d1}");
-        // 5 % size jitter: about 4 cm of height uncertainty
-        let e = scale_height(&[s1 * 0.95, s1, s1 * 1.05], &[s2 * 1.05, s2 * 0.95, s2], 0.04).unwrap_err();
+        // lens 0.13 m above the top, 0.04 m up: sizes scale by 0.13 / 0.17
+        let (s_low, s_high) = (100.0, 100.0 * 0.13 / 0.17);
+        let d = scale_height(&[s_low; 3], &[s_high; 3], 0.04).unwrap();
+        assert!((d - 0.13).abs() < 1e-9, "{d}");
+        // 5 % size jitter: several cm of height uncertainty
+        let e = scale_height(&[s_low * 0.95, s_low, s_low * 1.05], &[s_high * 1.05, s_high * 0.95, s_high], 0.04).unwrap_err();
         assert!(e.starts_with("scale_noise:"), "{e}");
         // 0.3 % jitter passes
-        assert!(scale_height(&[s1 * 0.997, s1, s1 * 1.003], &[s2, s2 * 1.003, s2], 0.04).is_ok());
-        assert!(scale_height(&[s1], &[s1 * 1.01], 0.04).unwrap_err().starts_with("scale_change:"));
+        assert!(scale_height(&[s_low * 0.997, s_low, s_low * 1.003], &[s_high, s_high * 1.003, s_high], 0.04).is_ok());
+        assert!(scale_height(&[s_low], &[s_low / 1.01], 0.04).unwrap_err().starts_with("scale_change:"));
+    }
+
+    /// The former downward probe's estimator (lens-to-top distance at the start pose from the
+    /// start sizes and the sizes `dz` closer), kept here only for the comparison below.
+    fn down_probe_distance(start: &[f64], near: &[f64], dz: f64) -> f64 {
+        let r = median(&mut near.to_vec()) / median(&mut start.to_vec());
+        dz * r / (r - 1.0)
+    }
+
+    /// Same synthetic noisy sizes (Gaussian size jitter, 3 frames per pose, 0.04 m move) for
+    /// the up and the down probe: distance errors without the noise gate.
+    #[test]
+    fn up_and_down_probe_estimates_under_size_noise() {
+        let mut seed = 12345u64;
+        let mut gauss = || {
+            let mut u = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((seed >> 11) as f64 + 0.5) / (1u64 << 53) as f64 };
+            let (a, b) = (u(), u());
+            (-2.0 * a.ln()).sqrt() * (2.0 * std::f64::consts::PI * b).cos()
+        };
+        let dz = 0.04;
+        for (d, jitter) in [(0.13, 0.01), (0.13, 0.03), (0.13, 0.05), (0.20, 0.01), (0.20, 0.03)] {
+            let (mut up, mut down) = (Vec::new(), Vec::new());
+            let (mut up_ok, mut down_ok) = (0, 0);
+            let n = 2000;
+            for _ in 0..n {
+                let mut frames = |dist: f64| -> Vec<f64> { (0..3).map(|_| 100.0 / dist * (1.0 + jitter * gauss())).collect() };
+                let (start, high, near) = (frames(d), frames(d + dz), frames(d - dz));
+                let u = dz / (median(&mut start.clone()) / median(&mut high.clone()) - 1.0);
+                up.push((u - d).abs());
+                if scale_height(&start, &high, dz).is_ok() { up_ok += 1; }
+                down.push((down_probe_distance(&start, &near, dz) - d).abs());
+                if scale_height(&near, &start, dz).is_ok() { down_ok += 1; }
+            }
+            let stat = |v: &mut Vec<f64>| { v.sort_by(|a, b| a.total_cmp(b)); (v.iter().sum::<f64>() / v.len() as f64, v[v.len() / 2], v[v.len() - 1]) };
+            let (um, umed, umax) = stat(&mut up);
+            let (dm, dmed, dmax) = stat(&mut down);
+            println!("D {d:.2} m, jitter {:.0} %: up mean {:.1} median {:.1} max {:.1} mm (accepted {up_ok}/{n}); down mean {:.1} median {:.1} max {:.1} mm (accepted {down_ok}/{n})",
+                jitter * 100.0, um * 1e3, umed * 1e3, umax * 1e3, dm * 1e3, dmed * 1e3, dmax * 1e3);
+            // the up probe sees a smaller scale change for the same dz
+            assert!(umed >= dmed * 0.9, "up {umed} down {dmed}");
+        }
     }
 
     #[test]
