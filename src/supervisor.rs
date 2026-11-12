@@ -1203,6 +1203,36 @@ impl SupervisorInner {
         }
     }
 
+    /// In Fault / EStop with torque on: fresh feedback from every motor reporting Disabled
+    /// (Damiao: all fresh 0xCC / feedback states 0) means the motors lost torque, e.g. a
+    /// motor power reset during a bus loss (real arm, 2026-11-12: all seven motors came
+    /// back Disabled after BusLoss and armd kept `is_torqued: true`). armd then records
+    /// torque off (`is_torqued` false, re-arm needs the full enable handshake) and keeps the
+    /// Fault until `clear_fault`. Not applied during gravity compensation (its exit path
+    /// owns the motor modes) or while a disable is pending.
+    fn sync_torque_state_after_stop(&mut self) {
+        if !self.is_torqued || self.disable_pending || self.gravity_comp.is_some() || !self.safety.state().is_stopped() {
+            return;
+        }
+        let Some(d) = self.driver.as_ref() else { return; };
+        let off = d.lock().is_ok_and(|drv| drv.capabilities().enable_feedback && drv.is_feedback_valid()
+            && drv.enable_state() == EnableState::Disabled);
+        if !off || !self.hardware_feedback_fresh(Duration::from_millis(250)) { return; }
+        if let Ok(mut drv) = d.lock() { drv.set_torque_flag(false); }
+        tracing::warn!("Motors report Disabled with fresh feedback in {:?}: torque is off (is_torqued = false); the fault stays latched until clear_fault",
+            self.safety.state());
+        self.is_torqued = false;
+        self.pending_rearm = true;
+        self.output_suspended = false;
+        self.stop_motion();
+        if self.measured_positions.iter().all(|q| q.is_finite()) {
+            self.commanded_positions = self.measured_positions.clone();
+            self.target_positions = self.measured_positions.clone();
+        }
+        self.commanded_velocities.fill(0.0);
+        self.commanded_accelerations.fill(0.0);
+    }
+
     pub fn clear_fault(&mut self) -> Result<SafetyState, SafetyError> {
         if !self.safety.state().is_stopped() { return Ok(self.safety.state().clone()); }
         if self.gravity_comp_blocks_clear() {
@@ -2518,6 +2548,7 @@ impl SupervisorInner {
         {
             self.execute_stop(StopPolicy::BusLossFallback);
         }
+        self.sync_torque_state_after_stop();
 
         // Check hardware motor faults / error flags from feedback
         if self.is_torqued && !self.safety.state().is_stopped() {

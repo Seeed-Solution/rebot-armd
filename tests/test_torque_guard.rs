@@ -1,4 +1,5 @@
-//! Torque-saturation guard (docs/control_safety_contract.md "Torque guard") on a simulated arm.
+//! Torque-saturation guard (docs/control_safety_contract.md "Torque guard") and the torque
+//! state after a bus loss, on a simulated arm.
 //!
 //! `StopArm` is an ideal position servo that reports the model gravity torque plus, for a
 //! joint pushed past a simulated mechanical stop, `STIFFNESS` x the overshoot, saturated at
@@ -16,7 +17,7 @@ use armd::model::{ArmConfig, JointState, MotionLimitReason};
 use armd::recording::{write_frames_to_parquet, RecordFrame};
 use armd::replay::ReplayRequest;
 use armd::torque_guard::{TorqueGuardInfo, TorqueGuardPolicy, TORQUE_HOLD_RELEASE_RAD};
-use armd::{ArmObservation, SupervisorInner};
+use armd::{ArmObservation, FaultCode, SafetyState, SupervisorInner};
 use common::INSPECT;
 
 const DT: f64 = 0.02;
@@ -421,4 +422,44 @@ fn j4_incident_ramp_trips_before_9_5_is_held_100_ms() {
         t_trip - t_over, t_trip - t_peak);
     assert!(t_trip - t_over <= 100.0 + 1e-6 && t_trip - t_over >= 80.0 - 1e-6, "trip {} ms after the threshold", t_trip - t_over);
     assert!(t_trip - t_peak < 100.0, "9.5 N·m held {} ms before the trip", t_trip - t_peak);
+}
+
+/// Bus loss, then the motors come back Disabled (power reset): torque state off, Fault kept.
+#[test]
+fn bus_loss_then_motors_back_disabled_sets_torque_off_and_keeps_the_fault() {
+    let (mut inner, arm) = rig();
+    arm.with(|s| s.stale = true);
+    let obs = ticks(&mut inner, 3);
+    assert!(matches!(obs.safety_state, SafetyState::Fault(_)), "{:?}", obs.safety_state);
+    assert_eq!(obs.fault.as_ref().unwrap().code, FaultCode::BusLoss);
+    assert!(obs.is_torqued, "torque state unknown while feedback is stale");
+    // feedback returns, every motor reports Disabled
+    arm.with(|s| { s.stale = false; s.torqued = false; });
+    let obs = ticks(&mut inner, 1);
+    println!("SIM bus loss + power reset: is_torqued {} enable_state {:?} fault {:?}", obs.is_torqued, obs.enable_state, obs.fault.as_ref().map(|f| f.code));
+    assert!(!obs.is_torqued, "motors are off");
+    assert_eq!(obs.enable_state, EnableState::Disabled);
+    assert_eq!(obs.fault.as_ref().unwrap().code, FaultCode::BusLoss, "fault kept until clear_fault");
+    let obs = ticks(&mut inner, 20);
+    assert!(!obs.is_torqued && matches!(obs.safety_state, SafetyState::Fault(_)));
+    // clear_fault works and leaves torque off; re-arm is a normal torque-on
+    inner.clear_fault().unwrap();
+    let obs = ticks(&mut inner, 2);
+    assert!(!obs.is_torqued && obs.fault.is_none(), "{:?}", obs.safety_state);
+    inner.set_torque(true).unwrap();
+    assert!(ticks(&mut inner, 2).is_torqued);
+}
+
+/// Bus loss, motors come back Enabled: unchanged behaviour (torque on, Fault kept).
+#[test]
+fn bus_loss_then_motors_back_enabled_is_unchanged() {
+    let (mut inner, arm) = rig();
+    arm.with(|s| s.stale = true);
+    ticks(&mut inner, 3);
+    arm.with(|s| s.stale = false);
+    let obs = ticks(&mut inner, 10);
+    assert!(obs.is_torqued);
+    assert_eq!(obs.fault.as_ref().unwrap().code, FaultCode::BusLoss);
+    inner.clear_fault().unwrap();
+    assert!(ticks(&mut inner, 2).is_torqued);
 }
