@@ -11,7 +11,8 @@ const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FR
 
 /// First-order lag arm; J7 is blocked by an object (or the closed stop) at `block`,
 /// producing torque `stiffness * (cmd - q)` while pressed.
-struct Rig { q: [f32; 7], v: [f32; 7], tau: [f32; 7], block: Option<f32>, frozen_j7: bool, open_stop: Option<f32>, enabled: EnableState }
+/// `stiffness`: N·m per rad of command past the block; `tau_sign`: sign the driver reports J7 torque with.
+struct Rig { q: [f32; 7], v: [f32; 7], tau: [f32; 7], block: Option<f32>, frozen_j7: bool, open_stop: Option<f32>, enabled: EnableState, stiffness: f32, tau_sign: f32 }
 struct RigDriver(Arc<Mutex<Rig>>);
 const STIFFNESS: f32 = 3.0;
 impl ArmDriver for RigDriver {
@@ -23,7 +24,7 @@ impl ArmDriver for RigDriver {
     fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         let r = self.0.lock().unwrap();
-        Ok((0..7).map(|i| JointState { position: r.q[i], velocity: r.v[i], torque: r.tau[i], temperature: 30.0 }).collect())
+        Ok((0..7).map(|i| JointState { position: r.q[i], velocity: r.v[i], torque: if i == 6 { r.tau_sign * r.tau[i] } else { r.tau[i] }, temperature: 30.0 }).collect())
     }
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
         let mut r = self.0.lock().unwrap();
@@ -36,7 +37,7 @@ impl ArmDriver for RigDriver {
             if i == 6 {
                 if let Some(o) = r.open_stop { if q <= o { q = o; vv = 0.0; } }
                 if let Some(b) = r.block {
-                    if q >= b { q = b; vv = 0.0; r.tau[6] = (STIFFNESS * (t.position - b)).max(0.0); }
+                    if q >= b { q = b; vv = 0.0; r.tau[6] = (r.stiffness * (t.position - b)).max(0.0); }
                 }
             }
             r.q[i] = q;
@@ -53,7 +54,7 @@ impl ArmDriver for RigDriver {
 fn rig(j7: f32, block: Option<f32>, frozen_j7: bool) -> (SupervisorInner, Arc<Mutex<Rig>>) {
     let mut q = INSPECT;
     q[6] = j7;
-    let rig = Arc::new(Mutex::new(Rig { q, v: [0.0; 7], tau: [0.0; 7], block, frozen_j7, open_stop: None, enabled: EnableState::Disabled }));
+    let rig = Arc::new(Mutex::new(Rig { q, v: [0.0; 7], tau: [0.0; 7], block, frozen_j7, open_stop: None, enabled: EnableState::Disabled, stiffness: STIFFNESS, tau_sign: 1.0 }));
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm()).with_driver(Box::new(RigDriver(rig.clone())));
     inner.lease_enabled = false;
     inner.tick(DT);
@@ -62,7 +63,7 @@ fn rig(j7: f32, block: Option<f32>, frozen_j7: bool) -> (SupervisorInner, Arc<Mu
 }
 
 fn request(command: GripperCommand, fraction: Option<f64>, grasp: bool, timeout_s: f64) -> GripperRequest {
-    GripperRequest { command, fraction, grasp, speed: 1.0, timeout_s, tag: Some("t".into()) }
+    GripperRequest { command, fraction, grasp, speed: 1.0, timeout_s: Some(timeout_s), tag: Some("t".into()) }
 }
 
 fn run(inner: &mut SupervisorInner, id: u64, max_s: f64) -> armd::motion::ActionStatus {
@@ -179,5 +180,78 @@ fn open_blocked_far_from_the_target_still_times_out() {
     let epoch = inner.safety.epoch_id();
     let (id, _) = inner.start_gripper(request(GripperCommand::Open, None, false, 8.0), epoch).unwrap();
     let a = run(&mut inner, id, 10.0);
+    assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("GRIPPER_TIMEOUT")), "{a:?}");
+}
+
+/// Grasp with the stall latch tripped by the squeeze, carry, then open (sim 2026-11-11: the open
+/// reported done after 0.14 s with J7 still in the grasp). Both torque signs; a soft object where
+/// the latch is only set before the open, and a stiff one where the push during the unwind from
+/// the squeeze hold sets it again.
+#[test]
+fn open_after_a_latched_grasp_travels_to_open() {
+    let open_rad = GripperPolicy::rebot_dm().open_rad;
+    for (stiffness, tau_sign) in [(STIFFNESS, 1.0), (STIFFNESS, -1.0), (10.0, 1.0), (10.0, -1.0)] {
+        let case = format!("stiffness {stiffness}, torque sign {tau_sign}");
+        let (mut inner, rig) = rig(-5.0, Some(-2.0), false);
+        { let mut r = rig.lock().unwrap(); r.stiffness = stiffness; r.tau_sign = tau_sign; }
+        let epoch = inner.safety.epoch_id();
+        let (id, _) = inner.start_gripper(request(GripperCommand::Close, None, true, 8.0), epoch).unwrap();
+        let a = run(&mut inner, id, 8.0);
+        assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{case}: {a:?}");
+        // the arm holds the object for a while; the squeeze keeps the latch set
+        for _ in 0..50 { inner.tick(DT); }
+        assert!(inner.gripper_stalled, "{case}: squeeze sets the stall latch");
+        assert_eq!(inner.gripper_stall_sign, 1.0, "{case}: latch direction is closing");
+        // the object stays between the jaws; the block only stops travel toward closed
+        let (id, _) = inner.start_gripper(request(GripperCommand::Open, None, false, 10.0), epoch).unwrap();
+        let mut ticks = 0;
+        let a = loop {
+            inner.tick(DT);
+            ticks += 1;
+            let a = inner.last_action.clone().unwrap();
+            assert_eq!(a.id, id);
+            if !a.is_running() { break a; }
+            assert!(ticks < 600, "{case}: open still running");
+        };
+        assert_eq!(a.state, "done", "{case}: {a:?}");
+        assert!(ticks as f64 * DT > 3.0, "{case}: done after {:.2} s", ticks as f64 * DT);
+        assert!((inner.measured_positions[6] - open_rad).abs() < 0.05, "{case}: J7 {}", inner.measured_positions[6]);
+        assert!((a.gripper_gap_rad.unwrap() + open_rad).abs() < 0.05, "{case}: {a:?}");
+        assert!(!inner.gripper_stalled, "{case}");
+    }
+}
+
+/// A stall in the travel direction still holds J7 (motor protection), whatever the torque sign.
+#[test]
+fn close_into_an_obstacle_latches_and_holds_at_measured() {
+    for tau_sign in [1.0, -1.0] {
+        let (mut inner, rig) = rig(-5.0, Some(-2.0), false);
+        { let mut r = rig.lock().unwrap(); r.stiffness = 10.0; r.tau_sign = tau_sign; }
+        let epoch = inner.safety.epoch_id();
+        let (id, _) = inner.start_gripper(request(GripperCommand::Close, None, false, 8.0), epoch).unwrap();
+        let a = run(&mut inner, id, 8.0);
+        assert_eq!(a.state, "done", "torque sign {tau_sign}: {a:?}");
+        assert!(inner.gripper_stalled && inner.gripper_stall_sign == 1.0, "torque sign {tau_sign}");
+        assert!((inner.commanded_positions[6] - inner.measured_positions[6]).abs() < 1e-3,
+            "torque sign {tau_sign}: J7 command {} held at measured {}", inner.commanded_positions[6], inner.measured_positions[6]);
+        assert!((inner.measured_positions[6] + 2.0).abs() < 1e-3);
+    }
+}
+
+#[test]
+fn default_timeout_covers_a_full_stroke() {
+    let req = armd::motion::parse_gripper(&serde_json::json!({"command": "open"})).unwrap();
+    assert_eq!((req.speed, req.timeout_s), (1.0, None));
+    let (mut inner, _rig) = rig(0.0, None, false);
+    let epoch = inner.safety.epoch_id();
+    let (id, expected) = inner.start_gripper(req, epoch).unwrap();
+    assert!(expected > 6.0, "{expected}");
+    let a = run(&mut inner, id, 12.0);
+    assert_eq!(a.state, "done", "{a:?}");
+    assert!((inner.measured_positions[6] - GripperPolicy::rebot_dm().open_rad).abs() < 0.05);
+    // an explicit timeout_s still applies as given
+    let req = armd::motion::parse_gripper(&serde_json::json!({"command": "close", "grasp": false, "timeout_s": 3.0})).unwrap();
+    let (id, _) = inner.start_gripper(req, epoch).unwrap();
+    let a = run(&mut inner, id, 5.0);
     assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("GRIPPER_TIMEOUT")), "{a:?}");
 }

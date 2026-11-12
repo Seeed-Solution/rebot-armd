@@ -233,7 +233,7 @@ async fn stop_between_phases_refuses_the_next_sub_motion() {
     inner.stop_motion();
     inner.request_macro_stop();
     let j7 = inner.commanded_positions[6];
-    let open = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: 8.0, tag: None };
+    let open = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(8.0), tag: None };
     assert!(inner.start_macro_gripper(id, open).is_err(), "gripper sub-motion installed after stop");
     assert!(inner.active_trajectory.is_none() && inner.macro_run.is_none());
     assert_eq!(inner.commanded_positions[6], j7);

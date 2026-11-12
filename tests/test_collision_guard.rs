@@ -358,7 +358,7 @@ fn trip_during_a_grasp_sub_motion_ends_the_macro_with_collision() {
     let a = obs.action.as_ref().unwrap();
     assert_eq!((a.id, a.kind.as_str(), a.state.as_str(), a.code.as_deref()), (id, "grasp", "failed", Some("COLLISION")), "{a:?}");
     assert!(inner.macro_run.is_none() && inner.active_trajectory.is_none());
-    let close = armd::motion::GripperRequest { command: armd::motion::GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: 8.0, tag: None };
+    let close = armd::motion::GripperRequest { command: armd::motion::GripperCommand::Close, fraction: None, grasp: true, speed: 1.0, timeout_s: Some(8.0), tag: None };
     assert!(inner.start_macro_gripper(id, close).is_err());
 }
 

@@ -321,6 +321,7 @@ class Simulator:
         return {"t": round(d.time, 4), "seed": self.scene.seed, "enabled": self.motors.enabled,
                 "q": self.motors.idx.motor_positions(d).round(5).tolist(),
                 "tcp": [round(float(v), 5) for v in d.body("end_link").xpos],
+                "tcp_quat": [round(float(v), 5) for v in d.body("end_link").xquat],  # w, x, y, z
                 "objects": self.scene.state(d)}
 
     def sim_state(self) -> dict:
@@ -328,7 +329,8 @@ class Simulator:
             return self._state_locked()
 
     def start_camera(self, fps: int, size: tuple[int, int], host: str, video_port: int, perception_port: int,
-                     scene_stream: bool = False, objects: str = "cube", timeout: float = 60.0) -> dict:
+                     scene_stream: bool = False, objects: str = "cube", timeout: float = 60.0,
+                     noise: dict | None = None) -> dict:
         """Spawn the camera process (perception.camera_main); returns its ready message."""
         import multiprocessing as mp
 
@@ -342,7 +344,8 @@ class Simulator:
         m = self.mount
         cfg = {"fps": fps, "size": list(size), "host": host, "video_port": video_port,
                "perception_port": perception_port, "scene_stream": scene_stream, "objects": objects,
-               "mount": [m.flip, m.rot_deg, m.tilt_deg, m.offset_m], "has_meshes": self.has_meshes}
+               "mount": [m.flip, m.rot_deg, m.tilt_deg, m.offset_m], "has_meshes": self.has_meshes,
+               "noise": noise or {}}
         self.cam_proc = ctx.Process(target=camera_main, name="rebot-sim-camera", daemon=True,
                                     args=(cfg, self.shared.shm.name, self.shared.lock, self.model.nq, self.model.nv, child, ready_w,
                                           os.getpid()))
@@ -508,6 +511,18 @@ def main(argv: list[str] | None = None) -> None:
                         help="override camera_mount.tilt_deg (armd sign: negative turns the axis toward the jaws)")
     parser.add_argument("--camera-offset", default=None, metavar="X,Y,Z",
                         help="lens centre in end_link (m); default camera_mount.offset_m, else the v8 holder value")
+    det = parser.add_argument_group("detection noise (the perception API's detections; all off by default)")
+    det.add_argument("--det-jitter-px", type=float, default=0.0, metavar="S",
+                     help="Gaussian sigma (pixels at 640x360) added to the box centre x and y")
+    det.add_argument("--det-size-jitter", type=float, default=0.0, metavar="F",
+                     help="w and h are multiplied by (1 + N(0, F)) independently")
+    det.add_argument("--det-drop-rate", type=float, default=0.0, metavar="P", help="drop each detection with probability P per frame")
+    det.add_argument("--det-latency-ms", type=float, default=0.0, metavar="L",
+                     help="publish detections L ms after their frame was captured (age_ms includes it)")
+    det.add_argument("--det-false-rate", type=float, default=0.0, metavar="P",
+                     help="per frame, add one false detection (random label and place, score 0.3..0.6) with probability P")
+    det.add_argument("--det-angle-jitter-deg", type=float, default=0.0, metavar="S", help="Gaussian sigma on angle_deg")
+    det.add_argument("--det-noise-seed", type=int, default=None, metavar="N", help="noise RNG seed (default: --seed, else 0)")
     args = parser.parse_args(argv)
     if not 1 <= args.fps <= 30:
         parser.error("--fps must be 1..30")
@@ -526,6 +541,17 @@ def main(argv: list[str] | None = None) -> None:
                 parser.error("--camera-offset needs 3 values")
         mount = CameraMount(mount.flip, mount.rot_deg if args.camera_rot_deg is None else args.camera_rot_deg,
                             mount.tilt_deg if args.camera_tilt_deg is None else args.camera_tilt_deg, off)
+    for flag, value in (("jitter-px", args.det_jitter_px), ("size-jitter", args.det_size_jitter),
+                        ("latency-ms", args.det_latency_ms), ("angle-jitter-deg", args.det_angle_jitter_deg)):
+        if value < 0:
+            parser.error(f"--det-{flag} must be >= 0")
+    for flag, value in (("drop-rate", args.det_drop_rate), ("false-rate", args.det_false_rate)):
+        if not 0.0 <= value <= 1.0:
+            parser.error(f"--det-{flag} must be 0..1")
+    noise = {"jitter_px": args.det_jitter_px, "size_jitter": args.det_size_jitter, "drop_rate": args.det_drop_rate,
+             "latency_ms": args.det_latency_ms, "false_rate": args.det_false_rate,
+             "angle_jitter_deg": args.det_angle_jitter_deg,
+             "seed": args.det_noise_seed if args.det_noise_seed is not None else (args.seed or 0)}
     if args.benchmark:
         print(f"{benchmark(args.benchmark):.0f} physics steps/s (timestep 2 ms, unpaced)")
         return
@@ -539,7 +565,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.camera:
         w, h = (int(v) for v in args.camera_size.split("x"))
         ready = sim.start_camera(args.fps, (w, h), args.http_host, args.video_port, args.perception_port,
-                                 args.scene_stream, args.objects)
+                                 args.scene_stream, args.objects, noise=noise)
         if "error" in ready:
             print(f"rebot-sim: {ready['error']}", file=sys.stderr, flush=True)
             sim.close()

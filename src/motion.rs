@@ -414,9 +414,15 @@ pub struct GripperRequest {
     pub grasp: bool,
     /// J7 speed (rad/s), <= 2.0.
     pub speed: f64,
-    pub timeout_s: f64,
+    /// Deadline (s). None: `max(GRIPPER_DEFAULT_TIMEOUT_S, expected duration + GRIPPER_TIMEOUT_MARGIN_S)`.
+    pub timeout_s: Option<f64>,
     pub tag: Option<String>,
 }
+
+/// Shortest default gripper deadline (s).
+pub const GRIPPER_DEFAULT_TIMEOUT_S: f64 = 6.0;
+/// Added to the expected duration for the default gripper deadline (s).
+pub const GRIPPER_TIMEOUT_MARGIN_S: f64 = 2.0;
 
 /// Body of `/api/v1/action/gripper`.
 pub fn parse_gripper(body: &Value) -> Result<GripperRequest, MotionError> {
@@ -448,8 +454,8 @@ pub fn parse_gripper(body: &Value) -> Result<GripperRequest, MotionError> {
     if !(speed > 0.0 && speed <= 2.0) {
         return Err(MotionError::InvalidCommand("speed must be in (0, 2.0] rad/s".into()));
     }
-    let timeout_s = num(body, "timeout_s")?.unwrap_or(6.0);
-    if !(timeout_s > 0.0 && timeout_s <= 30.0) {
+    let timeout_s = num(body, "timeout_s")?;
+    if timeout_s.is_some_and(|t| !(t > 0.0 && t <= 30.0)) {
         return Err(MotionError::InvalidCommand("timeout_s must be in (0, 30] s".into()));
     }
     Ok(GripperRequest { command, fraction, grasp, speed, timeout_s, tag: tag(body)? })
@@ -595,9 +601,10 @@ pub struct GripperMotion {
     pub target: f32,
     pub start: f32,
     pub elapsed: f64,
+    /// Deadline (s): the request's timeout_s, else the default rule.
+    pub timeout_s: f64,
     still_for: f64,
     moved: bool,
-    first: bool,
     phase: GripPhase,
 }
 
@@ -609,7 +616,10 @@ impl GripperMotion {
             GripperCommand::Move => policy.closed_rad + request.fraction.unwrap_or(0.0) as f32 * (policy.open_rad - policy.closed_rad),
         }.clamp(limit.min_position, limit.max_position);
         let limit = JointLimit { max_velocity: request.speed as f32, ..limit };
-        Self { request, policy, limit, target, start, elapsed: 0.0, still_for: 0.0, moved: false, first: true, phase: GripPhase::Moving }
+        let mut m = Self { request, policy, limit, target, start, elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, moved: false, phase: GripPhase::Moving };
+        m.timeout_s = m.request.timeout_s
+            .unwrap_or_else(|| GRIPPER_DEFAULT_TIMEOUT_S.max(m.expected_duration() + GRIPPER_TIMEOUT_MARGIN_S));
+        m
     }
 
     /// Expected duration (s) for the travel at the requested speed, plus settle.
@@ -626,13 +636,11 @@ impl GripperMotion {
         let (q7, v7c) = (ctx.commanded[6], ctx.commanded_velocities[6]);
         let (m7, mv7) = (ctx.measured[6], ctx.measured_velocities.get(6).copied().unwrap_or(0.0));
         let tau7 = ctx.torques.get(6).copied().unwrap_or(0.0);
-        // direction reversal releases a latched stall (same rule as servo / jog)
-        let clear = self.first && ctx.gripper_stalled && {
-            let delta = self.target - q7;
-            delta * tau7 < -1e-4 || delta * ctx.gripper_stall_sign < -1e-4
-        };
+        // A latch set while J7 pushed the other way (e.g. the squeeze of a grasp, or the push that
+        // lasts while the command unwinds from the squeeze hold) does not block travel away from
+        // it: release it on every tick, not only the first. Only a stall in the travel direction holds.
+        let clear = ctx.gripper_stalled && (self.target - q7) * ctx.gripper_stall_sign < -1e-4;
         let stalled = ctx.gripper_stalled && !clear;
-        self.first = false;
         let progress_of = |q: f32| -> f32 {
             let span = (self.target - self.start).abs();
             if span < 1e-6 { 1.0 } else { (1.0 - (self.target - q).abs() / span).clamp(0.0, 1.0) }
@@ -654,11 +662,11 @@ impl GripperMotion {
             return StepOut { positions, velocities, status, progress: 1.0, clear_gripper_stall: clear };
         }
 
-        if self.elapsed > self.request.timeout_s {
+        if self.elapsed > self.timeout_s {
             positions[6] = m7;
             return StepOut { positions, velocities, progress: progress_of(m7), clear_gripper_stall: clear,
                 status: StepStatus::Failed { code: "GRIPPER_TIMEOUT", message: format!(
-                    "Gripper did not finish within {:.1} s (at {m7:.3} rad, target {:.3} rad)", self.request.timeout_s, self.target) } };
+                    "Gripper did not finish within {:.1} s (at {m7:.3} rad, target {:.3} rad)", self.timeout_s, self.target) } };
         }
 
         // Step J7 toward the target unless the stall latch holds it.
@@ -777,6 +785,48 @@ pub struct ActionStatus {
     /// replay | settle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub t_s: Option<f32>,
+    /// Grasp J6 alignment: `turned:box` / `turned:angle` (roll in `align_turn_rad`),
+    /// `kept:box` / `kept:angle` (no turn needed), `skipped:<reason>` or `off`; absent before the phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align_turn_rad: Option<f32>,
+    /// Grasp height probe: `scale` (object top estimated, `object_height_m` above the table) or
+    /// `setup` (fallback to `grasp_height_m`, why in `height_reason`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_height_m: Option<f32>,
+    /// Grasp: TCP height above the table at which the jaws close (m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_height_m: Option<f32>,
+    /// Grasp height probe: the upward move used (m), absent when the probe did not move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_dz_m: Option<f32>,
+    /// Grasp mid-height re-centre (look-down): `done`, `unconverged` or `skipped:<reason>`,
+    /// with the corrections made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recentre: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recentre_iterations: Option<u32>,
+    /// Grasp descent: largest |residual torque| of J2, J3 (N·m; absent without residuals) and
+    /// largest |commanded − measured| of J1..J6 (rad) while the descent ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descend_peak_residual_nm: Option<[f32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descend_peak_tracking_rad: Option<f32>,
+    /// Grasp descent stopped on contact (`descend_contact_stop_nm`) at this TCP height above
+    /// the table (m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descend_contact: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descend_contact_height_m: Option<f32>,
+    /// Grasp holding re-check after the lift: `held`, `regripped` (grip torque gone, a re-grip
+    /// stopped on the object) or `dropped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_lift: Option<String>,
 }
 
 impl ActionStatus {

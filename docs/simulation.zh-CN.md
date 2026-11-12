@@ -37,6 +37,7 @@ cockpit 地址 `http://127.0.0.1:8765/`。`--follower-port` 默认 `udp://127.0.
 | `--camera` | 腕部相机：H.264 视频流在 `--video-port`（8001），感知接口和 `/sim/*` 在 `--perception-port`（8090），绑定 `--http-host`（127.0.0.1） |
 | `--fps N`、`--camera-size` | 相机帧率 1..30（默认 15）；视频尺寸 `1280x720`（默认）或 `640x360` |
 | `--profile P`、`--camera-rot-deg`、`--camera-tilt-deg`、`--camera-offset X,Y,Z` | 相机安装：取 profile 的 `camera_mount`（默认套件 profile），再按这些参数覆盖 |
+| `--det-jitter-px`、`--det-size-jitter`、`--det-drop-rate`、`--det-latency-ms`、`--det-false-rate`、`--det-angle-jitter-deg`、`--det-noise-seed` | 检测噪声（默认全部关闭），见“检测噪声与朝向” |
 | `--scene-stream` | 另在 `ws://<host>:<video-port>/scene` 推送固定的全景相机 |
 | `--torque-report instant\|mean` | 状态报文中的力矩：瞬时值（默认），或最近一个指令周期内的平均值（滑动窗口；见「摩擦辨识」） |
 
@@ -120,7 +121,7 @@ ARMD_DETECTOR_URL=http://127.0.0.1:8090 cargo run --bin armd -- --follower sim \
 - **安装**：沿用 armd 约定（`kinematics::cam_mount`，OpenCV 相机坐标轴）：R_end_cam = [x0 y0 z0] · Rz(`rot_deg`) · Rx(`tilt_deg`)，z0 = end_link x（工具轴），y0 = q6 = π/2 时 J5 轴在 end_link 中的方向。数值取 profile 的 `camera_mount`（套件 profile：v5，`rot_deg` 0，`tilt_deg` 0），可用 `--camera-rot-deg` / `--camera-tilt-deg` 覆盖（armd 符号：负值使光轴朝夹爪倾斜）。镜头中心为 `camera_mount.offset_m`；套件 profile 中为 null（未测量），此时仿真器使用 v8 支架假定的镜头中心 end_link (−0.0731, 0.0005, 0.0660) m（reBot-DevArm `hardware/camera-mounts/recamera-mounts/v8/README.txt` 第 4 节）。
 - **光学**：针孔模型，方形像素，无畸变。VFOV 24.65°，HFOV 42.46°（OV5647 1080p 窗口 2.688 × 1.512 mm，f 3.46 mm；由 v8 README 推导，未用标定板测量）；640x360 下 fx = fy = 824 px。
 - **与 v8 分析对照**：v8 支架（`--camera-rot-deg 90 --camera-tilt-deg -38`）、home 位姿、加载上游网格（`REBOT_DEVARM_DIR`）：闭合夹爪尖位于 1280x720 的像素 (648.5, 477.5)，夹爪占画面 10.8 %，最高行 472；v8 README 为 (648, 477)、10.8 %、472 行。不加载网格时夹爪显示为碰撞方盒（比收窄的指尖厚：占 22.5 %，最高行 337）；加载网格时方盒移到 geom 组 3，相机不渲染该组。
-- **渲染**：MuJoCo `Renderer` 离屏渲染，运行在独立的相机进程中（由 `rebot-sim` 启动，同时运行视频流和 HTTP 服务）。`rebot_sim/__init__.py` 找到 libEGL 时设 `MUJOCO_GL=egl`，否则找到 libOSMesa 时设 `osmesa`；显式设置的 `MUJOCO_GL` 优先。物理循环每步把 qpos / qvel / 时间写入共享内存，写入时持有一个多进程锁，相机进程复制时也持有该锁（两侧等待该锁最多 0.2 s：物理侧超时则仿真器以 "shared-state lock timeout" 停止，退出码 1；相机侧超时则跳过该相机周期）；相机进程每帧复制到自己的 MjData，并通过管道把 `/sim/reset`、`/sim/state` 交给物理循环处理（每 10 步即 20 ms 轮询一次）。相机只在物理步数比上一帧前进时渲染新帧；结果带该帧的 `physics_time` 和 `physics_step`。相机进程在渲染器和编码器创建完成、且一次 RGB 渲染和一次分割渲染成功后才报告就绪。分割以 ID 颜色渲染，解码时做范围检查（超过场景 geom 数的值被拒绝）。场景渲染后，在离屏缓冲区中图像上方一行画一个校验像素（颜色每帧变化，且不是任何分割 id）；一次读回同时取图像和该行，校验像素不对时该帧分割判为失败。校验像素能检出两次绘制（场景和校验像素）都丢失、或只丢失校验像素绘制的帧；检不出只丢失场景绘制、且旧缓冲区内容全是有效 id 的帧（校验像素存在，范围检查也通过；见 `test_a_dropped_scene_with_the_canary_drawn_is_not_detected`），也不覆盖 RGB 视频帧。间歇性越界读回（如 20 个 geom 时读到 0xFE0AB0；mujoco 4.0.0、EGL、NVIDIA GB10）的原因：GPU 与主机上其他 GPU 进程共用主机内存，NVIDIA 驱动分配失败时（内核日志：`NVRM ... NV_ERR_NO_MEMORY ... kgrctxAllocCtxBuffers`）会丢弃渲染命令且不报 GL / EGL 错误，读回的是旧数据或未初始化内存。2026-11-11 出现的失败都落在有这类内核日志的几分钟内。复现方法：持有约 31 GB 的渲染器，从第 259 个渲染器起，478 次分割渲染中 21 次结果错误，之前渲染正常的渲染器也出错；没有一次返回 GL 错误，画在图像角上的校验像素（较早的实现）检出了全部 21 次，释放内存后渲染恢复正确。现行方案（校验像素位于图像上方一行，一次读回）尚未在真实的驱动内存不足条件下运行过：之后四次尝试都没有再次触发该条件。视频渲染器受同样影响（错误的视频帧不会被检出）。分割失败的帧记录日志（帧号、取值、ngeom、nbody）并计数；该帧视频照常发送，但不产生感知结果，下一帧重试；连续 10 次失败时相机进程退出。相机进程退出或其管道关闭时，仿真器结束物理循环，`rebot-sim` 以退出码 1 退出；仿真器进程退出后相机进程随之退出。嵌入使用时 `Simulator.close()` 停止相机进程并释放管道、套接字和共享内存。
+- **渲染**：MuJoCo `Renderer` 离屏渲染，运行在独立的相机进程中（由 `rebot-sim` 启动，同时运行视频流和 HTTP 服务）。`rebot_sim/__init__.py` 找到 libEGL 时设 `MUJOCO_GL=egl`，否则找到 libOSMesa 时设 `osmesa`；显式设置的 `MUJOCO_GL` 优先。NVIDIA 驱动内存不足时（相机初始化报 `segmentation render not executed (GPU out of memory?)`），可用 Mesa 的软件 EGL 渲染、不经过 GPU：`__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json MUJOCO_GL=egl`（2026-11-13 在 spark 上跑相机抓取测试时使用）。物理循环每步把 qpos / qvel / 时间写入共享内存，写入时持有一个多进程锁，相机进程复制时也持有该锁（两侧等待该锁最多 0.2 s：物理侧超时则仿真器以 "shared-state lock timeout" 停止，退出码 1；相机侧超时则跳过该相机周期）；相机进程每帧复制到自己的 MjData，并通过管道把 `/sim/reset`、`/sim/state` 交给物理循环处理（每 10 步即 20 ms 轮询一次）。相机只在物理步数比上一帧前进时渲染新帧；结果带该帧的 `physics_time` 和 `physics_step`。相机进程在渲染器和编码器创建完成、且一次 RGB 渲染和一次分割渲染成功后才报告就绪。分割以 ID 颜色渲染，解码时做范围检查（超过场景 geom 数的值被拒绝）。场景渲染后，在离屏缓冲区中图像上方一行画一个校验像素（颜色每帧变化，且不是任何分割 id）；一次读回同时取图像和该行，校验像素不对时该帧分割判为失败。校验像素能检出两次绘制（场景和校验像素）都丢失、或只丢失校验像素绘制的帧；检不出只丢失场景绘制、且旧缓冲区内容全是有效 id 的帧（校验像素存在，范围检查也通过；见 `test_a_dropped_scene_with_the_canary_drawn_is_not_detected`），也不覆盖 RGB 视频帧。间歇性越界读回（如 20 个 geom 时读到 0xFE0AB0；mujoco 4.0.0、EGL、NVIDIA GB10）的原因：GPU 与主机上其他 GPU 进程共用主机内存，NVIDIA 驱动分配失败时（内核日志：`NVRM ... NV_ERR_NO_MEMORY ... kgrctxAllocCtxBuffers`）会丢弃渲染命令且不报 GL / EGL 错误，读回的是旧数据或未初始化内存。2026-11-11 出现的失败都落在有这类内核日志的几分钟内。复现方法：持有约 31 GB 的渲染器，从第 259 个渲染器起，478 次分割渲染中 21 次结果错误，之前渲染正常的渲染器也出错；没有一次返回 GL 错误，画在图像角上的校验像素（较早的实现）检出了全部 21 次，释放内存后渲染恢复正确。现行方案（校验像素位于图像上方一行，一次读回）尚未在真实的驱动内存不足条件下运行过：之后四次尝试都没有再次触发该条件。视频渲染器受同样影响（错误的视频帧不会被检出）。分割失败的帧记录日志（帧号、取值、ngeom、nbody）并计数；该帧视频照常发送，但不产生感知结果，下一帧重试；连续 10 次失败时相机进程退出。相机进程退出或其管道关闭时，仿真器结束物理循环，`rebot-sim` 以退出码 1 退出；仿真器进程退出后相机进程随之退出。嵌入使用时 `Simulator.close()` 停止相机进程并释放管道、套接字和共享内存。
 - 相机画面中隐藏 tcp 标记点。
 
 ### 视频流（`ws://<host>:8001/`）
@@ -131,11 +132,29 @@ ARMD_DETECTOR_URL=http://127.0.0.1:8090 cargo run --bin armd -- --follower sim \
 
 rebot-vision 感知接口版本 2（[detection_api.md](detection_api.md)）：`GET/POST /api/mode`、`GET/POST /api/inference`、`POST /api/trigger`、`GET /api/results/latest?after&wait_ms`、`POST /api/subscribe`、`POST /api/subscribe/{id}/keepalive`、`DELETE /api/subscribe/{id}`、`GET /api/subscriptions`。每个渲染帧都计算真值检测：对腕部相机做一次 640x360 分割渲染，每个场景物体取其可见像素（至少 20 个）的外接框，因此计入遮挡和画面边缘。`class_name` 为物体类别（`cube`、`cup`、`block`），`name` 为物体名，`confidence` 0.99，`format` 为 `xywh_center`，按 640x360 归一化。单次触发返回请求之后复制状态的第一帧。`aruco` 流水线会运行，但场景中没有标记。结果按订阅帧率（最高 min(15, `--fps`)）发布到 `latest`。
 
+#### 检测噪声与朝向
+
+每个真值检测还带有 `angle_deg`（物体长边在 640x360 图像中的朝向，从图像 +x 转向 +y，y 向下，范围 [-90, 90)，由物体掩码的二阶矩计算）和 `angle_conf`（掩码特征值之比 1 − 小/大；方形或圆形底面约为 0，此时角度不确定）。原有字段不变。
+
+下列选项默认全部关闭（此时检测即真值）。像素指 640x360 检测图像。噪声加在每帧检测发布之前；`/sim/state` 保持真值。
+
+| 选项 | 作用 |
+|---|---|
+| `--det-jitter-px S` | 框中心 x、y 各自加高斯噪声，σ = S 像素 |
+| `--det-size-jitter F` | w、h 各自乘以 (1 + N(0, F)) |
+| `--det-drop-rate P` | 每帧每个检测以概率 P 丢弃 |
+| `--det-latency-ms L` | 检测在帧采集 L ms 之后发布；`age_ms` 含该延迟，检测内容为较早那一帧 |
+| `--det-false-rate P` | 每帧以概率 P 增加一个误检：随机已有类别、随机位置和大小，`confidence` 0.3..0.6，`angle_conf` 为 0 |
+| `--det-angle-jitter-deg S` | `angle_deg` 加高斯噪声，σ = S 度（折回 [-90, 90)） |
+| `--det-noise-seed N` | 随机种子（默认 `--seed`，否则 0）；每帧的误差由（种子、帧号）决定 |
+
+框裁剪到画面内；宽或高不足 2 像素的框丢弃。示例：`rebot-sim --camera --det-jitter-px 3 --det-size-jitter 0.05 --det-drop-rate 0.1 --det-latency-ms 100 --det-noise-seed 1`（即 `tests/test_camera_grasp.py` 的 `v5_noise` / `v8_noise` 用例）。
+
 ### 场景与评估路由
 
 - `--objects`：`cube`（4 cm、30 g，即原场景方块）、`cup`（圆柱 ⌀ 5 cm × 7 cm、50 g）、`block`（6 × 3 × 4 cm、40 g）中 1..3 个；同类重复时命名为 `cube_2` 等。不带 `--seed` 时第一个物体位于 (0.30, 0) m，其余位于 (0.24, ±0.12) m。带种子时位置在 x 0.22..0.36 m、y −0.14..0.14 m 内抽取，偏航 ±90°，中心间距至少 9 cm（`numpy.random.default_rng(seed)`；同一种子得到同一布局）。
 - `POST /sim/reset {"seed": N|null}`：在下一个物理步按种子（非负整数，否则 400）摆放物体（静止），不移动机械臂。返回状态。物理循环 3 秒内未应答时 `/sim` 路由返回 504。
-- `GET /sim/state`：时间、种子、关节位置、TCP（end_link 原点），以及每个物体的 `pos`、`quat`、`lifted_m`（高出静止高度的距离）、`contacts`（`jaws`：左 / 右夹指接触；`table`）和 `grasped`（两侧夹指接触且抬起超过 2 cm）。`camera`：最新帧的 `frame_id`、`physics_time`、`physics_step`，落后物理的 `lag_s`，无新物理状态而跳过的相机周期数 `skipped`，`stale`（落后超过两个相机周期），`seg_failures`（分割渲染失败次数）和 `seg_last_error`。
+- `GET /sim/state`：时间、种子、关节位置、TCP（end_link 原点）、`tcp_quat`（end_link 姿态，w x y z），以及每个物体的 `pos`、`quat`、`lifted_m`（高出静止高度的距离）、`contacts`（`jaws`：左 / 右夹指接触；`table`）和 `grasped`（两侧夹指接触且抬起超过 2 cm）。`camera`：最新帧的 `frame_id`、`physics_time`、`physics_step`，落后物理的 `lag_s`，无新物理状态而跳过的相机周期数 `skipped`，`stale`（落后超过两个相机周期），`seg_failures`（分割渲染失败次数）和 `seg_last_error`。
 - `GET /sim/camera`：当前安装参数、视场角、640x360 下的 fx、`grip_pixel_norm_at`（工具竖直朝下时夹爪尖正下方桌面点在画面中的位置，按若干接近高度给出，即 armd `grasp.grip_pixel_norm` 应取的值）、渲染后端和每帧耗时。
 
 ### 仿真中的点框抓取
@@ -246,5 +265,5 @@ armd 以 50 Hz 运行：每个周期先读电机反馈，再发送下一个位�
 - 相机：无畸变针孔模型，无曝光 / 噪声 / 运动模糊，MuJoCo 平光照，机械臂为方盒几何（只有设置 `REBOT_DEVARM_DIR` 时连杆和夹指才用上游网格）。镜头中心和视场角为推导值，非实测。检测为真值（框精确、置信度 0.99、无漏检），不检验基于真实图像训练的检测器。未模拟真实相机的 VI 镜像设置。
 - 主机负载高时相机帧率低于 `--fps`（实测见下）；物理循环不受相机影响。
 - 不模拟电机故障（过温、欠压），温度恒定。不模拟 Damiao 寄存器访问（映射范围检查、CTRL_MODE 写入）：`driver_range_check` 为 null，MIT 切换在本地确认。
-- 默认 `speed` 1.0 rad/s 时，夹爪从闭合到张开在约 5.9 s 后到达 −5.699 rad，来不及在 6 s 默认 `timeout_s` 内满足 200 ms 静止，夹爪动作以 `GRIPPER_TIMEOUT` 结束；测试中以 2.0 rad/s 张开。真实夹爪是否相同未核实。
+- 默认 `speed` 1.0 rad/s 时，夹爪从闭合到张开在约 5.9 s 后到达 −5.699 rad，张开动作在 6.2 s 完成（2026-11-11），在该行程的默认 `timeout_s` 8.5 s 之内（原为固定 6 s，会以 `GRIPPER_TIMEOUT` 结束）；测试中以 2.0 rad/s 张开。真实夹爪是否相同未核实。
 - 仿真器只在主机上运行，未打包到 reCamera。

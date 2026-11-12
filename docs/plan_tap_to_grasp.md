@@ -96,4 +96,11 @@
 | 目标跟踪：中心距 < 35 px 或 IoU > 0.45 | 相同，预测位置为上一帧位置（运动后为按模型投影的位置）；接近后的第一次匹配放宽到 160 px | 接近位姿由粗估计得到，第一帧偏差较大 |
 | 步骤 0 夹爪零位校验 | 未实施 | 不在本次范围 |
 
+2026-11-12 抓取稳健性（`src/grasp.rs`，仅仿真验证，详见 `docs/agent_action_api.md`「稳健性步骤」）：
+
+- J6 对齐：框贴画面边界（2 px 内）或面积相对对中帧中位数变化超过 40 % 时不转动；检测结果带 `angle_deg` / `angle_conf`（≥ `align_min_angle_conf`）时按角度使夹爪垂直于长边闭合，取 J6 限位内最小转角。
+- 高度探测：对中后竖直上移 `height_probe_m`（默认 0.10 m，不可达时 0.06 m，实际值见 `probe_dz_m`）再回到起始位姿（向上移动，不会在高度未知时碰到高物体），由框尺寸变化估计物体顶面高度；框尺寸离散导致不确定度超过 0.01 m 或上移位姿不可达时回退；之后用顶面平面做像素映射，夹爪在 clamp(高度 · `height_grasp_fraction`, `grasp_height_m`, `max_grasp_height_m`) 处闭合；过高为 `OBJECT_TOO_TALL`，其余情况回退到 `grasp_height_m`。
+- 俯视时在 `recentre_height_m` 中途再对中（最多 `recentre_max_iterations` 次；默认 0 即关闭，相机 e2e 中该步均因 `aim_outside_image` 跳过，设为 0.07 启用）；下降时记录 J2/J3 残差和跟踪误差峰值，`descend_contact_stop_nm`（默认关闭）超限时在实测位置停止下降并闭合。
+- 抬起后 `post_lift_settle_ms` 再判夹持，物体脱落为 `DROPPED`。
+
 需真机确认（新增）：新支架的 `camera_tilt_deg` 符号与数值（默认安装下负值朝夹爪方向）、`camera_mount.offset_m`、夹爪闭合方向在画面中的轴（J6 对齐假设为 end_link y）、检测帧率与延迟对 `settle_delay_s` / `lost_*` 的影响、`centre_tol_px` 与检测抖动、POS_VEL 下的 `holding` 阈值。

@@ -568,6 +568,9 @@ class CameraRig:
         if cfg["scene_stream"]:
             self.streams["/scene"] = VideoStream()
         self.perception = Perception(max_fps=min(15, self.fps))
+        self.noise = cam.DetNoise(**cfg.get("noise", {}))
+        self.labels = [(i, o.kind) for i, o in enumerate(objects)]  # what a false detection may be
+        self.delayed: list[tuple] = []  # frames (on_frame arguments) waiting out noise.latency_ms
         self.frame_id = 0
         self.physics_step: int | None = None  # physics step of the newest frame
         self.skipped = 0  # camera ticks without a new physics state (nothing published)
@@ -659,6 +662,17 @@ class CameraRig:
         self.seg_consecutive = 0
         return self._cam.detections(ids, self.scene)
 
+    def publish_frame(self, frame: tuple) -> None:
+        """Hand a frame (on_frame's arguments) to perception, noise.latency_ms after its capture:
+        the frame keeps its capture time, so its age_ms includes the delay."""
+        if self.noise.latency_ms <= 0:
+            self.perception.on_frame(*frame)
+            return
+        self.delayed.append(frame)
+        now = time.monotonic()
+        while self.delayed and now - self.delayed[0][2] >= self.noise.latency_ms / 1000.0:
+            self.perception.on_frame(*self.delayed.pop(0))
+
     def run(self, parent_pid: int) -> None:
         import mujoco
 
@@ -678,7 +692,8 @@ class CameraRig:
                 dets = self.detect()
                 self.frame_id += 1
                 if dets is not None:  # a failed segmentation: the video frame goes out, no result
-                    self.perception.on_frame(self.frame_id, ts_ms, captured, dets, self.data.time, step)
+                    dets = self._cam.perturb(dets, self.noise, self.frame_id, self.labels)
+                    self.publish_frame((self.frame_id, ts_ms, captured, dets, self.data.time, step))
                 for path, stream in self.streams.items():
                     if not stream.active:
                         continue
