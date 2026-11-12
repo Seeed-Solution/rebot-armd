@@ -249,6 +249,72 @@ def detections(geom_ids: np.ndarray, scene, min_pixels: int = 20) -> list[dict]:
     return out
 
 
+@dataclass(frozen=True)
+class DetNoise:
+    """Detector-like errors added to the ground-truth detections (all off by default).
+    Pixels refer to DETECTION_SIZE, the size the perception API reports."""
+    jitter_px: float = 0.0  # Gaussian sigma on the box centre x and y
+    size_jitter: float = 0.0  # w and h are multiplied by (1 + N(0, size_jitter)) independently
+    drop_rate: float = 0.0  # probability to drop a detection, per frame
+    latency_ms: float = 0.0  # detections published this long after the frame was captured
+    false_rate: float = 0.0  # probability per frame of one false detection (score 0.3..0.6)
+    angle_jitter_deg: float = 0.0  # Gaussian sigma on angle_deg
+    seed: int = 0
+
+    @property
+    def perturbs(self) -> bool:
+        return bool(self.jitter_px or self.size_jitter or self.drop_rate or self.false_rate or self.angle_jitter_deg)
+
+
+def perturb(dets: list[dict], cfg: DetNoise, frame_id: int, labels: list[tuple[int, str]] | None = None) -> list[dict]:
+    """Detections as a noisy detector would report them. Without noise (cfg.perturbs False) `dets`
+    is returned unchanged. The random stream is seeded by (cfg.seed, frame_id), so a frame gets the
+    same errors on every run. `labels` are the (class_id, class_name) a false detection may carry
+    (default: those of `dets`). Boxes are clipped to the image; degenerate boxes (under 2 px) are dropped."""
+    if not cfg.perturbs:
+        return dets
+    rng = np.random.default_rng((cfg.seed, frame_id))
+    w_img, h_img = DETECTION_SIZE
+    out = []
+    for d in dets:
+        if cfg.drop_rate and rng.random() < cfg.drop_rate:
+            continue
+        cx, cy, bw, bh = d["x"], d["y"], d["w"], d["h"]
+        if cfg.jitter_px:
+            cx += rng.normal(0.0, cfg.jitter_px) / w_img
+            cy += rng.normal(0.0, cfg.jitter_px) / h_img
+        if cfg.size_jitter:
+            bw *= 1.0 + rng.normal(0.0, cfg.size_jitter)
+            bh *= 1.0 + rng.normal(0.0, cfg.size_jitter)
+        n = dict(d)
+        if cfg.angle_jitter_deg and "angle_deg" in d:
+            a = d["angle_deg"] + rng.normal(0.0, cfg.angle_jitter_deg)
+            n["angle_deg"] = round((a + 90.0) % 180.0 - 90.0, 2)
+        if _set_box(n, cx, cy, bw, bh):
+            out.append(n)
+    if cfg.false_rate and rng.random() < cfg.false_rate:
+        pool = labels or sorted({(d["class_id"], d["class_name"]) for d in dets})
+        if pool:
+            class_id, kind = pool[int(rng.integers(len(pool)))]
+            bw, bh = rng.uniform(0.04, 0.2), rng.uniform(0.06, 0.3)
+            f = {"class_id": class_id, "format": "xywh_center", "class_name": kind, "name": f"false_{kind}",
+                 "confidence": round(float(rng.uniform(0.3, 0.6)), 3), "pixels": int(bw * bh * w_img * h_img),
+                 "angle_deg": round(float(rng.uniform(-90.0, 90.0)), 2), "angle_conf": 0.0}
+            if _set_box(f, rng.uniform(0.0, 1.0), rng.uniform(0.0, 1.0), bw, bh):
+                out.append(f)
+    return out
+
+
+def _set_box(d: dict, cx: float, cy: float, bw: float, bh: float) -> bool:
+    """Write the box (centre / size, normalised) into d clipped to the image; False when it is degenerate."""
+    x0, x1 = max(0.0, cx - bw / 2), min(1.0, cx + bw / 2)
+    y0, y1 = max(0.0, cy - bh / 2), min(1.0, cy + bh / 2)
+    if (x1 - x0) * DETECTION_SIZE[0] < 2.0 or (y1 - y0) * DETECTION_SIZE[1] < 2.0:
+        return False
+    d.update(x=round((x0 + x1) / 2, 4), y=round((y0 + y1) / 2, 4), w=round(x1 - x0, 4), h=round(y1 - y0, 4))
+    return True
+
+
 class H264Encoder:
     """libx264 (PyAV), one Annex-B access unit per frame, SPS / PPS before every IDR."""
 
