@@ -475,6 +475,10 @@ impl SupervisorInner {
     /// [`MOTION_LIMIT_CLEAR_S`].
     fn expire_motion_limit(&mut self) {
         if let Some(h) = self.torque_guard.hold { self.note_motion_limit(MotionLimitReason::Torque, Some(h.joint)); }
+        if self.power.gov.hold.is_some() {
+            let j = self.motion_limit.as_ref().filter(|l| l.reason == MotionLimitReason::Power).and_then(|l| l.joint);
+            self.note_motion_limit(MotionLimitReason::Power, j);
+        }
         if self.servo_blocked_hold {
             let resumed = self.servo_target.is_some() || self.active_trajectory.is_some() || self.macro_run.is_some()
                 || self.gravity_comp.is_some() || !self.is_torqued || self.safety.state().is_stopped();
@@ -1480,7 +1484,8 @@ impl SupervisorInner {
             }
             return;
         }
-        if dt.is_finite() && dt > 0.0 { park.elapsed_s += dt; }
+        // budget in reference time: the power governor may slow the park
+        if dt.is_finite() && dt > 0.0 { park.elapsed_s += dt * self.motion_time_scale(); }
         if park.elapsed_s < park.budget_s {
             self.watchdog_park = Some(park);
             return;
@@ -1659,6 +1664,7 @@ impl SupervisorInner {
         }
         if self.servo_blocked_hold { self.clear_blocked_hold(); }
         self.torque_hold_filter(&mut targets);
+        self.power_hold_filter(&mut targets);
 
         // Only renew lease and motion frame timestamp AFTER command validation succeeds
         self.last_heartbeat = Instant::now();
@@ -1744,6 +1750,7 @@ impl SupervisorInner {
             &self.config.limits,
         )?;
         self.torque_hold_filter(&mut target_positions);
+        self.power_hold_filter(&mut target_positions);
 
         // J7 Gripper stall release check on reverse command
         if self.config.dof >= 7 && self.gripper_stalled && target_positions.len() >= 7 {
@@ -2684,9 +2691,11 @@ impl SupervisorInner {
             self.last_heartbeat = Instant::now();
         }
         enum Stepped { Quintic(crate::trajectory::TrajectoryPoint, bool, f32), Action(StepOut), Replay(StepOut, &'static str, f64) }
+        let time_scale = self.motion_time_scale();
         let stepped = if let Some(active) = self.active_trajectory.as_mut() {
             let ctx = StepCtx {
                 dt: servo_dt,
+                time_scale,
                 measured: &self.measured_positions,
                 measured_velocities: &self.measured_velocities,
                 commanded: &self.commanded_positions,
@@ -2697,7 +2706,9 @@ impl SupervisorInner {
             };
             let out = match &mut active.reference {
                 Reference::Quintic(traj) => {
-                    let point = traj.step(dt);
+                    // power governor: the reference advances at dt x scale (velocities scaled with it)
+                    let mut point = traj.step(dt * time_scale);
+                    if time_scale < 1.0 { for v in point.velocities.iter_mut() { *v *= time_scale as f32; } }
                     Stepped::Quintic(point, traj.is_finished(), (traj.elapsed / traj.duration).min(1.0) as f32)
                 }
                 Reference::Path(path) => Stepped::Action(path.step(&ctx)),
@@ -2785,7 +2796,16 @@ impl SupervisorInner {
                     // of travel the stepper target stays within servo_max_lead_rad of the measured
                     // position (torque on, fresh feedback), so the tracking error stays below the bound
                     // whatever the client sends.
-                    let step_limits = self.servo_limits();
+                    let mut step_limits = self.servo_limits();
+                    // power governor: scale the velocity cap, never below what the joint can brake
+                    // to in this tick (the stepper stays feasible); acceleration unchanged
+                    if time_scale < 1.0 {
+                        for (i, l) in step_limits.iter_mut().enumerate() {
+                            if Some(i) == gripper_idx { continue; }
+                            let brake = self.commanded_velocities.get(i).map_or(0.0, |v| v.abs()) - 0.9 * l.max_acceleration * servo_dt as f32;
+                            l.max_velocity = (l.max_velocity * time_scale as f32).max(brake).max(1e-3);
+                        }
+                    }
                     let lead = self.config.servo_max_lead_rad;
                     let lead_gate = self.driver.is_some() && self.is_torqued
                         && self.hardware_feedback_fresh(Duration::from_millis(100));

@@ -295,10 +295,10 @@ impl ReplayMotion {
         let progress = (self.t_s() / self.duration).clamp(0.0, 1.0) as f32;
         match &mut self.phase {
             Phase::Approach(traj) => {
-                let point = traj.step(ctx.dt);
+                let point = traj.step(ctx.dt * ctx.time_scale);
                 let finished = traj.is_finished();
                 let mut q = point.positions;
-                let mut v = point.velocities;
+                let mut v: Vec<f32> = point.velocities.iter().map(|x| x * ctx.time_scale as f32).collect();
                 let clear = self.apply_gripper(&mut q, ctx);
                 if let Some(g) = self.gripper_idx { if q[g] == ctx.commanded[g] { v[g] = 0.0; } }
                 if finished { self.phase = Phase::Follow { t: 0.0, stalled_for: 0.0 }; }
@@ -324,7 +324,7 @@ impl ReplayMotion {
                 } else {
                     *stalled_for = 0.0;
                 }
-                *t = (*t + ctx.dt * self.speed * rate).min(self.duration);
+                *t = (*t + ctx.dt * self.speed * rate * ctx.time_scale).min(self.duration);
                 let t_now = *t;
                 let mut q = self.sample_at(t_now);
                 let clear = self.apply_gripper(&mut q, ctx);

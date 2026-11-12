@@ -419,6 +419,8 @@ pub fn parse_gripper(body: &Value) -> Result<GripperRequest, MotionError> {
 /// Measured / commanded state handed to a reference each tick.
 pub struct StepCtx<'a> {
     pub dt: f64,
+    /// Power governor speed scale (1 = none): references advance their time at dt x scale.
+    pub time_scale: f64,
     pub measured: &'a [f32],
     pub measured_velocities: &'a [f32],
     pub commanded: &'a [f32],
@@ -524,7 +526,7 @@ impl PathTrajectory {
         } else {
             self.stalled_for = 0.0;
         }
-        self.elapsed = (self.elapsed + ctx.dt * rate).min(self.path.duration);
+        self.elapsed = (self.elapsed + ctx.dt * rate * ctx.time_scale).min(self.path.duration);
         let u = self.elapsed / self.path.duration;
         let s = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u);
         let q = self.position_at(s);

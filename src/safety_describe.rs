@@ -208,6 +208,32 @@ impl SupervisorInner {
             }
         }
 
+        if capabilities.power_budget {
+            if let Some(b) = c.power_budget.as_ref().filter(|b| b.enabled && b.governor.enabled) {
+                let g = b.governor;
+                stops.push(json!({
+                    "id": "power_limit_hold",
+                    "trigger": "estimated supply current (from motor torque and velocity, not measured) at or above hard x supply_rated_a for persist_ms while a motion runs and a heavy joint is commanded in the direction of its torque; between soft and hard the motion is slowed instead",
+                    "estimate_only": true,
+                    "supply_rated_a": b.supply_rated_a,
+                    "supply_trip_a": b.supply_trip_a,
+                    "soft": g.soft,
+                    "hard": g.hard,
+                    "floor_scale": g.floor_scale,
+                    "persist_ms": g.persist_ms,
+                    "recover_ms": g.recover_ms,
+                    "not_applied": ["gravity_comp"],
+                    "lease_required": false,
+                    "effect": "cancel_motion_hold_torque_on",
+                    "action_code": "POWER_LIMIT",
+                    "motion_limit_reason": "power",
+                    "while_held": "servo and jog targets that move a joint that was pushing further in its push direction are clamped to the hold position; targets that keep it or move it the other way pass",
+                    "invalidates_commands": false,
+                    "clear": ["estimate_below_soft_for_recover_ms", "torque_off", "stop"],
+                }));
+            }
+        }
+
         let cap = c.speed_cap;
         let workspace = self.workspace_policy().map(|(ws, _)| json!({
             "floor_z_m": ws.floor_z_m,

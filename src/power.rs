@@ -21,15 +21,130 @@
 //! 0.25 s). Peaks are kept in fixed bucket windows (5 s and 60 s) of `fast_a`.
 //!
 //! Per tick the estimate is O(joints) and allocates nothing.
+//!
+//! Governor (`governor`), on every motion in position control (servo streams, jog, actions,
+//! replay, park). With r = fast_a / supply_rated_a:
+//!
+//! - speed scale target: 1 for r <= soft, falling linearly to `floor_scale` at r = hard; the
+//!   applied scale follows the target at most `down_per_s` / `up_per_s` per second.
+//!   [`SupervisorInner::motion_time_scale`] is the one value every reference reads: planned
+//!   references (joint quintics, Cartesian paths, replay) advance their time at dt x scale;
+//!   servo streams scale the velocity cap (never below what the joint can brake to in one
+//!   tick, so the stepper stays feasible) and keep the acceleration limit.
+//! - hold: r >= hard for `persist_ms` while a motion is running and a heavy joint (at least
+//!   [`HEAVY_SHARE`] of the joint load above idle) is commanded in the direction of its torque
+//!   (pushing): the running action fails with `POWER_LIMIT`, every motion ends and the measured
+//!   pose is held with torque on (`motion_limit.reason` = `power`). While held, servo and jog
+//!   targets that move a joint that was pushing further in its push direction are clamped to
+//!   the hold position; targets that keep it or move it the other way (yielding, which lowers
+//!   its torque) pass. Holding still above hard does not trip (stopping cannot lower a static
+//!   load); it is logged once.
+//! - recovery: the hold ends once `bus_a` stays below soft for `recover_ms`, or on torque
+//!   off, stop, Fault or gravity compensation.
+//! - gravity compensation: estimated and published, never scaled or held; r >= hard is logged
+//!   once per session.
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::MotionLimitReason;
 use crate::supervisor::SupervisorInner;
 
 /// Most joints the per-tick arrays hold.
 pub const MAX_JOINTS: usize = 8;
 /// Time constant (s) of the fast filter (the governor input). At 50 Hz this is 2 ticks.
 pub const FAST_FILTER_S: f32 = 0.04;
+/// A joint counts as heavy for the hold rule at this share of the joints' load above idle.
+pub const HEAVY_SHARE: f32 = 0.25;
+
+/// Section `power_budget.governor`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct GovernorPolicy {
+    pub enabled: bool,
+    /// Fraction of `supply_rated_a` where slowing starts.
+    pub soft: f32,
+    /// Fraction of `supply_rated_a` where the scale reaches `floor_scale` and the hold applies;
+    /// `hard x supply_rated_a` must stay below `supply_trip_a`.
+    pub hard: f32,
+    /// Lowest speed scale before the hold.
+    pub floor_scale: f32,
+    /// Time above hard (control-loop time) before the hold (ms).
+    pub persist_ms: u64,
+    /// Time below soft that ends a hold (ms).
+    pub recover_ms: u64,
+    /// Largest scale change per second, down / up.
+    pub down_per_s: f32,
+    pub up_per_s: f32,
+}
+
+impl Default for GovernorPolicy {
+    fn default() -> Self {
+        Self { enabled: true, soft: 0.8, hard: 0.95, floor_scale: 0.25, persist_ms: 100, recover_ms: 300, down_per_s: 5.0, up_per_s: 0.5 }
+    }
+}
+
+impl GovernorPolicy {
+    /// Scale target for the load ratio `r` (estimate / rating).
+    pub fn target_scale(&self, r: f32) -> f32 {
+        if !r.is_finite() { return self.floor_scale; }
+        if r <= self.soft { return 1.0; }
+        if r >= self.hard { return self.floor_scale; }
+        1.0 - (r - self.soft) / (self.hard - self.soft) * (1.0 - self.floor_scale)
+    }
+
+    pub fn validate(&self, budget: &PowerBudget) -> Result<(), String> {
+        if !(self.soft > 0.2 && self.soft < self.hard && self.hard <= 1.2) {
+            return Err("power_budget.governor: need 0.2 < soft < hard <= 1.2".into());
+        }
+        if self.hard * budget.supply_rated_a >= budget.supply_trip_a {
+            return Err(format!("power_budget.governor.hard x supply_rated_a ({:.2} A) must be below supply_trip_a ({} A)",
+                self.hard * budget.supply_rated_a, budget.supply_trip_a));
+        }
+        if !(0.05..=1.0).contains(&self.floor_scale) || self.persist_ms == 0 || self.persist_ms > 2000 || self.recover_ms > 10_000 {
+            return Err("power_budget.governor: floor_scale in [0.05, 1], persist_ms in 1..=2000, recover_ms <= 10000".into());
+        }
+        if !(self.down_per_s > 0.0 && self.down_per_s <= 100.0 && self.up_per_s > 0.0 && self.up_per_s <= 100.0) {
+            return Err("power_budget.governor: down_per_s and up_per_s in (0, 100]".into());
+        }
+        Ok(())
+    }
+}
+
+/// A power hold in force.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PowerHold {
+    /// Per joint: sign of the torque of a joint that was pushing at the trip (+1 / -1), 0 = free.
+    pub push: [f32; MAX_JOINTS],
+    /// Commanded (held) position per joint at the trip.
+    pub hold_q: [f32; MAX_JOINTS],
+    /// Estimate at the trip (A).
+    pub bus_a: f32,
+    pub since_s: f64,
+}
+
+/// Governor runtime state.
+#[derive(Debug, Clone)]
+pub struct Governor {
+    /// Scale applied this tick.
+    pub scale: f32,
+    pub hold: Option<PowerHold>,
+    over_s: f64,
+    below_s: f64,
+    /// Scaling is logged (a transition is logged once).
+    limiting: bool,
+    static_warned: bool,
+    gc_warned: bool,
+    pub holds_total: u64,
+    /// Time with scale below 1 (s).
+    pub limited_s: f64,
+}
+
+impl Default for Governor {
+    fn default() -> Self {
+        Self { scale: 1.0, hold: None, over_s: 0.0, below_s: 0.0, limiting: false, static_warned: false, gc_warned: false, holds_total: 0, limited_s: 0.0 }
+    }
+}
+
 /// Peak window shown with the meter (`observation.power.peak_a`), s.
 pub const PEAK_WINDOW_S: f64 = 5.0;
 
@@ -85,6 +200,7 @@ pub struct PowerBudget {
     /// Time constant (s) of the displayed estimate `bus_a`.
     pub filter_s: f32,
     pub joints: Vec<JointPower>,
+    pub governor: GovernorPolicy,
 }
 
 impl Default for PowerBudget {
@@ -99,8 +215,19 @@ impl Default for PowerBudget {
             efficiency: 0.8,
             filter_s: 0.25,
             joints: Vec::new(),
+            governor: GovernorPolicy::default(),
         }
     }
+}
+
+/// The scalar part of the budget the governor needs, copied each tick without allocation
+/// (the supervisor is borrowed mutably while it runs).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PolicyView {
+    pub supply_rated_a: f32,
+    pub v_bus: f32,
+    pub idle_w: [f32; MAX_JOINTS],
+    pub governor: GovernorPolicy,
 }
 
 /// One estimate (no allocation).
@@ -141,6 +268,7 @@ impl PowerBudget {
         if self.joints.len() != dof || dof > MAX_JOINTS {
             return Err(format!("power_budget.joints needs {dof} entries (one per joint, at most {MAX_JOINTS})"));
         }
+        self.governor.validate(self)?;
         for (j, p) in self.joints.iter().enumerate() {
             if !pos(p.kt_nm_per_a) || !nonneg(p.r_phase_ohm) || !nonneg(p.idle_w) || !nonneg(p.viscous_nm_s) || !nonneg(p.coulomb_nm) {
                 return Err(format!("power_budget.joints[{j}]: kt_nm_per_a must be positive; r_phase_ohm, idle_w, viscous_nm_s, coulomb_nm >= 0"));
@@ -172,6 +300,12 @@ impl PowerBudget {
             regen += back;
         }
         Estimate { bus_a: total / self.v_bus, regen_w: regen, joint_a, n }
+    }
+
+    pub(crate) fn clone_policy(&self) -> PolicyView {
+        let mut idle_w = [0.0; MAX_JOINTS];
+        for (o, p) in idle_w.iter_mut().zip(&self.joints) { *o = p.idle_w; }
+        PolicyView { supply_rated_a: self.supply_rated_a, v_bus: self.v_bus, idle_w, governor: self.governor }
     }
 
     /// Supply current with every joint at rest and torque-free (A): idle and base load.
@@ -233,6 +367,7 @@ pub struct PowerMonitor {
     pub max_at_s: f64,
     /// Time with `fast_a` above the supply rating (s).
     pub over_rated_s: f64,
+    pub gov: Governor,
     primed: bool,
 }
 
@@ -241,7 +376,7 @@ impl Default for PowerMonitor {
         Self {
             valid: false, raw_a: 0.0, fast_a: 0.0, bus_a: 0.0, regen_w: 0.0, joint_a: [0.0; MAX_JOINTS],
             peak_5s: PeakWindow::new(PEAK_WINDOW_S / 10.0), peak_60s: PeakWindow::new(1.0),
-            max_a: 0.0, max_at_s: 0.0, over_rated_s: 0.0, primed: false,
+            max_a: 0.0, max_at_s: 0.0, over_rated_s: 0.0, gov: Governor::default(), primed: false,
         }
     }
 }
@@ -317,6 +452,144 @@ impl SupervisorInner {
         let e = budget.estimate(&self.torques, &self.measured_velocities);
         let now = self.start_time.elapsed().as_secs_f64();
         self.power.update(budget, &e, dt as f32, now);
+        let budget = budget.clone_policy();
+        self.governor_tick(&budget, &e, dt);
+    }
+
+    /// Speed scale every motion reference applies this tick (1 = unchanged). Gravity
+    /// compensation is never scaled.
+    pub fn motion_time_scale(&self) -> f64 {
+        if self.gravity_comp.is_some() { 1.0 } else { f64::from(self.power.gov.scale) }
+    }
+
+    fn governor_tick(&mut self, b: &PolicyView, e: &Estimate, dt: f64) {
+        let g = b.governor;
+        if !g.enabled { self.power.gov.scale = 1.0; return; }
+        let rated = b.supply_rated_a;
+        let r = self.power.fast_a / rated;
+        let operational = self.is_torqued && self.safety.state().is_operational() && !self.disable_pending && !self.pending_rearm;
+        let gc = self.gravity_comp.is_some();
+        if gc {
+            self.power.gov.scale = 1.0;
+            self.power.gov.over_s = 0.0;
+            if r >= g.hard && !self.power.gov.gc_warned {
+                tracing::warn!("Power estimate {:.2} A ({:.0}% of {rated} A rated) during gravity compensation; not limited (hand guiding)", self.power.fast_a, r * 100.0);
+                self.power.gov.gc_warned = true;
+            }
+        } else {
+            self.power.gov.gc_warned = false;
+        }
+        // hold end
+        if self.power.gov.hold.is_some() {
+            if !operational || gc {
+                tracing::info!("Power hold ended (stop, torque off or gravity compensation)");
+                self.end_power_hold();
+            } else if self.power.bus_a < g.soft * rated {
+                self.power.gov.below_s += dt;
+                if self.power.gov.below_s >= g.recover_ms as f64 / 1000.0 - 1e-6 {
+                    tracing::info!("Power hold ended: estimate {:.2} A below {:.0}% of rated for {} ms", self.power.bus_a, g.soft * 100.0, g.recover_ms);
+                    self.end_power_hold();
+                }
+            } else {
+                self.power.gov.below_s = 0.0;
+            }
+        }
+        if gc { return; }
+        // scale, rate limited
+        let target = g.target_scale(r);
+        let s = self.power.gov.scale;
+        let dtf = dt as f32;
+        let next = if target < s { (s - g.down_per_s * dtf).max(target) } else { (s + g.up_per_s * dtf).min(target) };
+        self.power.gov.scale = next.clamp(g.floor_scale, 1.0);
+        let moving = self.active_trajectory.is_some() || self.servo_target.is_some();
+        let limiting = self.power.gov.scale < 0.999;
+        if limiting { self.power.gov.limited_s += dt; }
+        if limiting != self.power.gov.limiting {
+            if limiting {
+                tracing::warn!("Power governor: estimate {:.2} A ({:.0}% of {rated} A rated), slowing motion (scale {:.2})", self.power.fast_a, r * 100.0, self.power.gov.scale);
+            } else {
+                tracing::info!("Power governor: estimate {:.2} A, full speed again", self.power.fast_a);
+            }
+            self.power.gov.limiting = limiting;
+        }
+        if limiting && moving { self.note_motion_limit(MotionLimitReason::Power, None); }
+        // hold rule: above hard while a heavy joint pushes
+        let n = e.n.min(self.commanded_velocities.len()).min(self.torques.len());
+        let idle_a = |j: usize| b.idle_w[j] / b.v_bus;
+        let dyn_sum: f32 = (0..n).map(|j| (e.joint_a[j] - idle_a(j)).max(0.0)).sum();
+        let mut push = [0.0f32; MAX_JOINTS];
+        let mut worst: Option<(usize, f32)> = None;
+        for j in 0..n {
+            let load = (e.joint_a[j] - idle_a(j)).max(0.0);
+            let (tau, v) = (self.torques[j], self.commanded_velocities[j]);
+            if dyn_sum > 0.0 && load >= HEAVY_SHARE * dyn_sum && tau * v > 0.0 && v.abs() > 1e-3 {
+                push[j] = tau.signum();
+                if worst.is_none_or(|(_, w)| load > w) { worst = Some((j, load)); }
+            }
+        }
+        let over = operational && r >= g.hard;
+        if over && moving && worst.is_some() {
+            self.power.gov.over_s += dt;
+        } else {
+            self.power.gov.over_s = 0.0;
+        }
+        if over && worst.is_none() && !self.power.gov.static_warned && self.power.gov.hold.is_none() {
+            tracing::warn!("Power estimate {:.2} A ({:.0}% of {rated} A rated) with no joint pushing; not holding (stopping does not lower a static load)",
+                self.power.fast_a, r * 100.0);
+            self.power.gov.static_warned = true;
+        } else if r < g.soft {
+            self.power.gov.static_warned = false;
+        }
+        if self.power.gov.over_s >= g.persist_ms as f64 / 1000.0 - 1e-6 {
+            if let Some((j, _)) = worst { self.power_trip(j, push, rated, g.persist_ms); }
+        }
+    }
+
+    fn end_power_hold(&mut self) {
+        self.power.gov.hold = None;
+        self.power.gov.below_s = 0.0;
+        if self.motion_limit.as_ref().is_some_and(|l| l.reason == MotionLimitReason::Power) { self.motion_limit = None; }
+    }
+
+    /// Trip: fail the running action with `POWER_LIMIT`, end every motion and hold the
+    /// measured pose with torque on (gripper keeps its command).
+    fn power_trip(&mut self, joint: usize, push: [f32; MAX_JOINTS], rated: f32, persist_ms: u64) {
+        let gov = &mut self.power.gov;
+        gov.over_s = 0.0;
+        gov.holds_total += 1;
+        let a = self.power.fast_a;
+        let message = format!("Power limit: estimated supply current {a:.2} A ({:.0}% of {rated} A rated) for {persist_ms} ms, joint {} pushing",
+            a / rated * 100.0, joint + 1);
+        if self.power.gov.hold.is_some() {
+            tracing::debug!("{message}; holding the new measured position");
+        } else {
+            tracing::warn!("{message}; motion stopped, holding position");
+        }
+        if let Some(id) = self.last_action.as_ref().filter(|a| a.is_running()).map(|a| a.id) {
+            self.finish_action(id, "failed", Some("POWER_LIMIT"), Some(message), None, None, None);
+        }
+        self.macro_run = None;
+        self.hold_measured_pose();
+        self.note_motion_limit(MotionLimitReason::Power, Some(joint));
+        let mut hold_q = [0.0f32; MAX_JOINTS];
+        for (o, q) in hold_q.iter_mut().zip(&self.commanded_positions) { *o = *q; }
+        let mut merged = push;
+        if let Some(h) = self.power.gov.hold { for j in 0..MAX_JOINTS { if merged[j] == 0.0 { merged[j] = h.push[j]; } } }
+        self.power.gov.hold = Some(PowerHold { push: merged, hold_q, bus_a: a, since_s: self.start_time.elapsed().as_secs_f64() });
+    }
+
+    /// While a power hold is in force: a servo / jog target that moves a joint that was
+    /// pushing further in its push direction is clamped to the hold position.
+    pub(crate) fn power_hold_filter(&mut self, targets: &mut [f32]) {
+        let Some(h) = self.power.gov.hold else { return; };
+        let mut clamped = None;
+        for (j, t) in targets.iter_mut().enumerate().take(MAX_JOINTS) {
+            if h.push[j] != 0.0 && (*t - h.hold_q[j]) * h.push[j] > 0.0 {
+                *t = h.hold_q[j];
+                clamped.get_or_insert(j);
+            }
+        }
+        if let Some(j) = clamped { self.note_motion_limit(MotionLimitReason::Power, Some(j)); }
     }
 
     /// `observation.power`.
@@ -333,9 +606,9 @@ impl SupervisorInner {
             ratio: v(m.bus_a / budget.supply_rated_a),
             regen_w: v(m.regen_w),
             per_joint_a: m.joint_a[..n].iter().map(|a| v(*a)).collect(),
-            scale: 1.0,
-            limiting: false,
-            hold: false,
+            scale: r3(m.gov.scale),
+            limiting: m.gov.scale < 0.999 || m.gov.hold.is_some(),
+            hold: m.gov.hold.is_some(),
         })
     }
 
@@ -356,6 +629,13 @@ impl SupervisorInner {
             "max_a": r3(m.max_a),
             "max_at_s": m.max_at_s,
             "over_rated_s": m.over_rated_s,
+            "governor": {
+                "scale": r3(m.gov.scale),
+                "limited_s": m.gov.limited_s,
+                "holds_total": m.gov.holds_total,
+                "hold": m.gov.hold.map(|h| serde_json::json!({"bus_a": r3(h.bus_a), "since_s": h.since_s,
+                    "push": h.push[..budget.joints.len().min(MAX_JOINTS)].to_vec()})),
+            },
             "idle_a": r3(budget.idle_a()),
             "budget": budget,
         })

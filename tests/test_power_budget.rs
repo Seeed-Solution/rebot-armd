@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget};
 use armd::model::JointState;
-use armd::power::{JointPower, PeakWindow, PowerBudget};
+use armd::model::MotionLimitReason;
+use armd::power::{GovernorPolicy, JointPower, PeakWindow, PowerBudget};
 use armd::{ArmConfig, ArmObservation, SupervisorInner};
 use common::INSPECT;
 
@@ -24,6 +25,10 @@ struct ArmState {
     torqued: bool,
     /// Reported torque override per joint.
     forced: [Option<f32>; 7],
+    /// Motion load: torque visc x v + bias x sign(v) on top of gravity (the motor pushes
+    /// against a resisting load while it moves).
+    visc: [f32; 7],
+    bias: [f32; 7],
 }
 
 /// Ideal position servo: follows the commanded position and velocity, reports the built-in
@@ -49,7 +54,8 @@ impl ArmDriver for SimArm {
         let g = armd::compute_gravity_torques(&std::array::from_fn(|i| s.q[i])).unwrap();
         Ok((0..7).map(|i| JointState {
             position: s.q[i], velocity: s.v[i], temperature: 30.0,
-            torque: s.forced[i].unwrap_or(if i < 6 { g[i] } else { 0.0 }),
+            torque: s.forced[i].unwrap_or(if i < 6 { g[i] } else { 0.0 } + s.visc[i] * s.v[i]
+                + if s.v[i].abs() > 0.01 { s.bias[i] * s.v[i].signum() } else { 0.0 }),
         }).collect())
     }
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
@@ -300,4 +306,212 @@ fn estimate_cost_per_tick() {
     let per = t0.elapsed().as_secs_f64() / n as f64;
     eprintln!("estimate + filters: {:.0} ns per tick ({acc:.0})", per * 1e9);
     assert!(per < 20e-6);
+}
+
+// ---------------------------------------------------------------- governor
+
+#[test]
+fn governor_scale_curve_and_validation() {
+    let g = GovernorPolicy::default();
+    assert_eq!((g.soft, g.hard, g.floor_scale, g.persist_ms, g.recover_ms), (0.8, 0.95, 0.25, 100, 300));
+    assert_eq!(g.target_scale(0.5), 1.0);
+    assert_eq!(g.target_scale(0.8), 1.0);
+    assert!((g.target_scale(0.875) - 0.625).abs() < 1e-6, "linear: half-way gives 1 - 0.5 x 0.75");
+    assert_eq!(g.target_scale(0.95), 0.25);
+    assert_eq!(g.target_scale(3.0), 0.25);
+    assert_eq!(g.target_scale(f32::NAN), 0.25);
+    let b = dm();
+    g.validate(&b).unwrap();
+    let bad = |f: &dyn Fn(&mut GovernorPolicy, &mut PowerBudget)| { let (mut g, mut b) = (GovernorPolicy::default(), dm()); f(&mut g, &mut b); g.validate(&b).is_err() };
+    assert!(bad(&|g, _| g.soft = 0.96), "soft above hard");
+    assert!(bad(&|_, b| b.supply_trip_a = 6.1), "hard x rated (6.18 A) at or above the trip");
+    assert!(bad(&|g, _| g.floor_scale = 0.0));
+    assert!(bad(&|g, _| g.persist_ms = 0));
+    assert!(bad(&|g, _| g.down_per_s = 0.0));
+    // through the profile
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.power_budget.as_mut().unwrap().supply_trip_a = 6.1;
+    assert!(cfg.validate().unwrap_err().contains("supply_trip_a"));
+}
+
+fn power(obs: &ArmObservation) -> armd::power::PowerObservation { obs.power.clone().unwrap() }
+
+/// One teleop servo frame: J2 +, J3 +, J4 - at `rate` x their servo speed caps from `q0`.
+fn stream_frame(inner: &mut SupervisorInner, target: &mut [f32; 7], rate: f32) -> Result<(), armd::SafetyError> {
+    let caps = [0.0, 0.45, 0.45, -1.5, 0.0, 0.0, 0.0];
+    for j in 0..7 { target[j] += caps[j] * rate * DT as f32; }
+    // keep the target within one-tick reach of the command (no dirty jumps)
+    for j in 0..7 { target[j] = target[j].clamp(inner.commanded_positions[j] - 0.3, inner.commanded_positions[j] + 0.3); }
+    let epoch = inner.safety.epoch_id();
+    inner.servo(target.to_vec(), epoch)
+}
+
+/// Teleop servo stream against a speed-dependent load: slowed to the band between soft and
+/// hard; a speed-independent load on top then holds it; removing the load recovers.
+#[test]
+fn servo_stream_at_high_load_is_slowed_then_held() {
+    let (mut inner, arm) = rig_at(ArmConfig::rebot_dm(), INSPECT);
+    // viscous load: at full servo speed J2 / J3 ~14.4 N·m, J4 ~4.5 N·m (under the torque guard's 16.8 / 6.0)
+    arm.with(|s| { s.visc[1] = 32.0; s.visc[2] = 32.0; s.visc[3] = 3.0; });
+    let mut target: [f32; 7] = std::array::from_fn(|i| inner.commanded_positions[i]);
+    let (mut min_scale, mut max_ratio, mut first_slow) = (1.0f32, 0.0f32, None);
+    for k in 0..75 {
+        stream_frame(&mut inner, &mut target, 1.0).unwrap();
+        let p = power(&inner.tick(DT));
+        if p.scale < 0.999 && first_slow.is_none() { first_slow = Some(k); }
+        min_scale = min_scale.min(p.scale);
+        max_ratio = max_ratio.max(p.ratio);
+        assert!(!p.hold, "viscous load alone must not hold (tick {k}, {:?})", p);
+    }
+    let p = power(&inner.tick(DT));
+    let v2 = inner.commanded_velocities[1];
+    eprintln!("viscous stream: slowed from tick {first_slow:?}, scale now {:.2} (min {min_scale:.2}), J2 cmd {v2:.3} rad/s (cap 0.45), estimate {:.2} A (ratio max {max_ratio:.2})",
+        p.scale, p.bus_a);
+    assert!(first_slow.is_some() && p.scale < 0.95 && p.scale > 0.25, "{p:?}");
+    assert!(v2 < 0.45 * 0.97, "J2 slowed: {v2}");
+    assert!(inner.motion_limit.as_ref().is_some_and(|l| l.reason == MotionLimitReason::Power));
+    assert!(inner.safety.state().is_operational());
+    // contact-like load that does not drop with speed: held within persist (100 ms) + filters
+    // (with gravity J2 ~13.4, J3 ~13.6, J4 ~-5 N·m: under the torque guard thresholds 16.8 / 6.0 N·m)
+    arm.with(|s| { s.visc = [0.0; 7]; s.bias[1] = 14.0; s.bias[2] = 20.0; s.bias[3] = 3.0; });
+    let mut held_at = None;
+    for k in 0..50 {
+        let _ = stream_frame(&mut inner, &mut target, 1.0);
+        let obs = inner.tick(DT);
+        let p = power(&obs);
+        if std::env::var_os("TRACE").is_some() { eprintln!("{k}: fast {:.2} bus {:.2} s {:.2} ml {:?} tau {:?} v {:?}", inner.power.fast_a, p.bus_a, p.scale, obs.motion_limit, &obs.torques[..4], &inner.commanded_velocities[..4]); }
+        if p.hold { held_at = Some((k, p.bus_a, p.scale)); break; }
+    }
+    let (k, a, sc) = held_at.expect("power hold");
+    eprintln!("bias load: power hold after {} ms at {a:.2} A (scale {sc:.2})", (k + 1) * 20);
+    assert!(k <= 8, "{k}");
+    let held: Vec<f32> = inner.commanded_positions.clone();
+    assert!(inner.servo_target.is_none() && inner.commanded_velocities.iter().all(|v| *v == 0.0));
+    assert!(inner.motion_limit.as_ref().is_some_and(|l| l.reason == MotionLimitReason::Power));
+    assert!(inner.safety.state().is_operational(), "no Fault: {:?}", inner.safety.state());
+    // while held: pushing further is clamped, the other way passes
+    let epoch = inner.safety.epoch_id();
+    let mut further = held.clone();
+    further[1] += 0.1;
+    inner.servo(further, epoch).unwrap();
+    assert_eq!(inner.servo_target.as_ref().unwrap()[1], held[1], "push direction clamped");
+    let mut back = held.clone();
+    back[1] -= 0.05;
+    inner.servo(back.clone(), epoch).unwrap();
+    assert_eq!(inner.servo_target.as_ref().unwrap()[1], back[1], "yielding passes");
+    // the load goes away: below soft for 300 ms ends the hold
+    arm.with(|s| { s.bias = [0.0; 7]; s.visc = [0.0; 7]; });
+    let mut ended = None;
+    for k in 0..60 {
+        let p = power(&inner.tick(DT));
+        if !p.hold { ended = Some(k); break; }
+    }
+    eprintln!("load removed: hold ended after {:?} ms", ended.map(|k| (k + 1) * 20));
+    assert!(ended.is_some_and(|k| k >= 14), "{ended:?}");
+    assert_eq!(inner.power.gov.holds_total, 1);
+}
+
+/// The 2026-11-12 incident as black-box samples (5 Hz, held between samples): J4 driven up into
+/// a stop with torque -2.0, -6.8, +8.8, +9.5 N·m, J2 2.4 and J3 3.2 N·m. The supply tripped
+/// about 0.4 s after the 9.5 N·m sample (~1.0 s here).
+fn incident(torque_guard: bool) -> (Option<usize>, Option<usize>, Vec<f32>) {
+    let mut cfg = ArmConfig::rebot_dm();
+    if !torque_guard { cfg.torque_guard = None; }
+    let (mut inner, arm) = rig_at(cfg, INSPECT);
+    let samples = [-2.0f32, -6.8, 8.8, 9.5, 9.5, 9.5];
+    let (mut torque_at, mut power_at, mut amps) = (None, None, Vec::new());
+    let mut target: [f32; 7] = std::array::from_fn(|i| inner.commanded_positions[i]);
+    for k in 0..60 {
+        let tau4 = samples[(k / 10).min(samples.len() - 1)];
+        arm.with(|s| { s.forced[1] = Some(2.4); s.forced[2] = Some(3.2); s.forced[J4] = Some(tau4); });
+        if torque_at.is_none() && power_at.is_none() {
+            target[J4] = inner.commanded_positions[J4] + 0.03;
+            let epoch = inner.safety.epoch_id();
+            let _ = inner.servo(target.to_vec(), epoch);
+        }
+        let obs = inner.tick(DT);
+        amps.push(power(&obs).bus_a);
+        match obs.motion_limit.as_ref().map(|l| l.reason) {
+            Some(MotionLimitReason::Torque) if torque_at.is_none() => torque_at = Some(k),
+            _ => {}
+        }
+        if power(&obs).hold && power_at.is_none() { power_at = Some(k); }
+    }
+    (torque_at, power_at, amps)
+}
+
+#[test]
+fn incident_reproduction_torque_guard_then_power_governor() {
+    let (t, p, amps) = incident(true);
+    eprintln!("with the torque guard: torque hold at {:?} ms, power hold at {:?} ms; estimate at 0.2/0.4/0.6 s: {:.2} / {:.2} / {:.2} A",
+        t.map(|k| k * 20), p.map(|k| k * 20), amps[10], amps[20], amps[30]);
+    assert!(t.is_some_and(|k| (14..=17).contains(&k)), "torque guard 100 ms after the -6.8 N·m sample: {t:?}");
+    assert!(p.is_none(), "the torque hold stopped the push first");
+    let (t, p, amps) = incident(false);
+    eprintln!("power governor only: power hold at {:?} ms (9.5 N·m sample at 600 ms); estimate peak {:.2} A",
+        p.map(|k| k * 20), amps.iter().copied().fold(0.0, f32::max));
+    assert!(t.is_none());
+    assert!(p.is_some_and(|k| (21..=26).contains(&k)), "power hold after the +8.8 N·m sample (400 ms): {p:?}");
+}
+
+/// A planned joint move under load: the reference is slowed (time-scaled) by the governor and
+/// a speed-independent overload fails the action with POWER_LIMIT.
+#[test]
+fn planned_move_is_slowed_and_fails_with_power_limit() {
+    let (mut inner, arm) = rig_at(ArmConfig::rebot_dm(), INSPECT);
+    let mut target = INSPECT.to_vec();
+    target[1] += 0.5;
+    target[2] += 0.5;
+    target[3] += 0.5;
+    let epoch = inner.safety.epoch_id();
+    let (_, id, planned) = inner.jog_action(target.clone(), None, Some(epoch), "joint_move").unwrap();
+    arm.with(|s| { s.visc[1] = 36.0; s.visc[2] = 36.0; s.visc[3] = 10.0; });
+    let mut n = 0;
+    let mut min_scale = 1.0f32;
+    while inner.last_action.as_ref().is_some_and(|a| a.id == id && a.is_running()) && n < 1000 {
+        min_scale = min_scale.min(power(&inner.tick(DT)).scale);
+        n += 1;
+    }
+    let a = inner.last_action.clone().unwrap();
+    eprintln!("joint_move planned {planned:.2} s, ran {:.2} s under a viscous load (min scale {min_scale:.2}), state {}", n as f64 * DT, a.state);
+    assert_eq!(a.state, "done");
+    assert!(min_scale < 0.95 && n as f64 * DT > planned + 0.1, "{min_scale} {n}");
+    // overload that slowing does not remove (J2 ~12, J3 ~15, J4 ~-5.8 N·m with gravity)
+    arm.with(|s| { s.visc = [0.0; 7]; s.bias[1] = 14.0; s.bias[2] = 20.0; s.bias[3] = 5.5; });
+    let mut back = INSPECT.to_vec();
+    back[3] -= 0.6;
+    back[1] += 0.2;
+    back[2] += 0.2;
+    let back: Vec<f32> = back.iter().zip(&inner.commanded_positions).enumerate().map(|(j, (b, c))| if j == 1 || j == 2 { c + 0.3 } else { *b }).collect();
+    let epoch = inner.safety.epoch_id();
+    let (_, id, _) = inner.jog_action(back, None, Some(epoch), "joint_move").unwrap();
+    for k in 0..200 {
+        let obs = inner.tick(DT);
+        if std::env::var_os("TRACE").is_some() && k % 5 == 0 { eprintln!("{k}: fast {:.2} s {:.2} tau {:?} v {:?} pa {:?}", inner.power.fast_a, power(&obs).scale, &obs.torques[..4], &inner.commanded_velocities[..4], power(&obs).per_joint_a); }
+        if !inner.last_action.as_ref().unwrap().is_running() { break; }
+    }
+    let a = inner.last_action.clone().unwrap();
+    eprintln!("overloaded joint_move: {} {:?} {:?}", a.state, a.code, a.message);
+    assert_eq!((a.id, a.state.as_str(), a.code.as_deref()), (id, "failed", Some("POWER_LIMIT")));
+    assert!(power(&inner.tick(DT)).hold);
+    let d = inner.safety_describe();
+    assert!(d["stops"].as_array().unwrap().iter().any(|s| s["id"] == "power_limit_hold" && s["action_code"] == "POWER_LIMIT"));
+}
+
+/// Holding still above hard: no hold (stopping cannot lower a static load), scale at the floor.
+#[test]
+fn static_overload_does_not_hold() {
+    let (mut inner, arm) = rig_at(ArmConfig::rebot_dm(), INSPECT);
+    arm.with(|s| { s.forced[1] = Some(14.0); s.forced[2] = Some(14.0); s.forced[3] = Some(5.5); });
+    let obs = ticks(&mut inner, 25);
+    let p = power(&obs);
+    assert!(p.ratio > 0.95 && !p.hold && p.scale == 0.25, "{p:?}");
+    // a jog yielding J2 (against its torque) runs
+    let mut t = inner.commanded_positions.clone();
+    t[1] -= 0.1;
+    let epoch = inner.safety.epoch_id();
+    let (_, id, _) = inner.jog_action(t, None, Some(epoch), "joint_move").unwrap();
+    for _ in 0..400 { inner.tick(DT); if !inner.last_action.as_ref().unwrap().is_running() { break; } }
+    let a = inner.last_action.clone().unwrap();
+    assert_eq!((a.id, a.state.as_str()), (id, "done"), "{a:?}");
 }

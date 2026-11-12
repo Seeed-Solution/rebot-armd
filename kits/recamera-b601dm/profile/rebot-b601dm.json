@@ -427,6 +427,16 @@
         "viscous_nm_s": 0.0,
         "coulomb_nm": 0.0
       }
-    ]
+    ],
+    "governor": {
+      "enabled": true,
+      "soft": 0.8,
+      "hard": 0.95,
+      "floor_scale": 0.25,
+      "persist_ms": 100,
+      "recover_ms": 300,
+      "down_per_s": 5.0,
+      "up_per_s": 0.5
+    }
   }
 }

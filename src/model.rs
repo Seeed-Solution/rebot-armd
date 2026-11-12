@@ -1013,6 +1013,9 @@ pub enum MotionLimitReason {
     /// Torque guard: a joint's |torque| stayed at or above its threshold; motion stopped and
     /// the joint is held (no Fault). Targets pushing further in are clamped.
     Torque,
+    /// Power governor (`src/power.rs`): the estimated supply current is above the soft
+    /// fraction (motion slowed) or a power hold is in force (`observation.power.hold`).
+    Power,
 }
 
 impl MotionLimitReason {
@@ -1024,7 +1027,8 @@ impl MotionLimitReason {
             Self::Workspace => 2,
             Self::JointLimit => 3,
             Self::Blocked => 4,
-            Self::Torque => 5,
+            Self::Power => 5,
+            Self::Torque => 6,
         }
     }
 }
