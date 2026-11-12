@@ -54,11 +54,16 @@ def wait_http(url: str, proc: subprocess.Popen, log, timeout: float = 30.0) -> N
 # mount). v5: optical axis along the tool, look-down acquisition onto the grip pixel. v8 (38 deg
 # toward the jaws): with the tool pointing down the table point under the jaws leaves the image
 # above about 0.06 m, so armd acquires camera-down.
+# v5_noise / v8_noise: detector-like errors (jitter, size jitter, drops, 100 ms latency).
+NOISE = ["--det-jitter-px", "3", "--det-size-jitter", "0.05", "--det-drop-rate", "0.1", "--det-latency-ms", "100",
+         "--det-noise-seed", "1"]
 CASES = {
     "default": ([], None),
     "seed3_cube_cup": (["--objects", "cube,cup", "--seed", "3"], None),
     "v8_default": ([], (90.0, -38.0)),
     "v8_seed3_cube_cup": (["--objects", "cube,cup", "--seed", "3"], (90.0, -38.0)),
+    "v5_noise": (NOISE, None),
+    "v8_noise": (NOISE, (90.0, -38.0)),
 }
 
 
@@ -139,9 +144,12 @@ def test_tap_to_grasp_the_cube(cam_rig):
     time.sleep(0.3)
 
     # detection through armd's proxy (single trigger, perception API 2)
-    det = http(client.base + "/api/v1/detection/trigger?wait_ms=2000", {"pipelines": ["yolo"]})
-    print(f"\ntrigger via armd: frame {det.get('frame_id')} detections {det.get('detections')}")
-    cubes = [d for d in det["detections"] if d["class_name"] == "cube"]
+    for _ in range(5):  # a noisy detector may miss the cube in a frame (--det-drop-rate)
+        det = http(client.base + "/api/v1/detection/trigger?wait_ms=2000", {"pipelines": ["yolo"]})
+        print(f"\ntrigger via armd: frame {det.get('frame_id')} detections {det.get('detections')}")
+        cubes = [d for d in det["detections"] if d["class_name"] == "cube"]
+        if cubes:
+            break
     assert cubes, det
     d = cubes[0]
     box = [min(1.0, max(0.0, v)) for v in (d["x"] - d["w"] / 2, d["y"] - d["h"] / 2, d["x"] + d["w"] / 2, d["y"] + d["h"] / 2)]

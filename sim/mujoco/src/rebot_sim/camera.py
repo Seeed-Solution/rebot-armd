@@ -212,11 +212,27 @@ def render_segmentation(renderer: mujoco.Renderer) -> np.ndarray:
     return decode_segmentation(rgb, renderer.scene)
 
 
+def mask_orientation(xs: np.ndarray, ys: np.ndarray) -> tuple[float, float]:
+    """Orientation of the long side of a pixel set (second moments): (angle_deg, angle_conf).
+    The angle runs from image +x toward image +y (y down) in [-90, 90); angle_conf is
+    1 - minor/major eigenvalue ratio, 0 for a round or square footprint (angle ambiguous)."""
+    dx, dy = xs - xs.mean(), ys - ys.mean()
+    cxx, cyy, cxy = float((dx * dx).mean()), float((dy * dy).mean()), float((dx * dy).mean())
+    angle = math.degrees(0.5 * math.atan2(2 * cxy, cxx - cyy))  # (-90, 90]
+    if angle >= 90.0 - 1e-9:
+        angle -= 180.0
+    half = math.hypot((cxx - cyy) / 2, cxy)
+    major, minor = (cxx + cyy) / 2 + half, (cxx + cyy) / 2 - half
+    conf = 0.0 if major <= 1e-9 else 1.0 - max(minor, 0.0) / major
+    return round(angle, 2), round(min(max(conf, 0.0), 1.0), 3)
+
+
 def detections(geom_ids: np.ndarray, scene, min_pixels: int = 20) -> list[dict]:
     """Ground-truth boxes of the scene objects (rebot-vision format) from a segmentation
     render at DETECTION_SIZE: the bounds of each object's visible pixels, so occlusion (by the
     gripper or another object) and the image edge are accounted for. Objects with fewer than
-    `min_pixels` visible pixels are not reported."""
+    `min_pixels` visible pixels are not reported. `angle_deg` / `angle_conf` give the in-image
+    orientation of the object's mask (mask_orientation)."""
     h, w = geom_ids.shape
     out = []
     for i, (obj, gid) in enumerate(zip(scene.objects, scene.geom_ids)):
@@ -225,10 +241,78 @@ def detections(geom_ids: np.ndarray, scene, min_pixels: int = 20) -> list[dict]:
             continue
         n0, n1 = round(int(xs.min()) / w, 4), round((int(xs.max()) + 1) / w, 4)
         m0, m1 = round(int(ys.min()) / h, 4), round((int(ys.max()) + 1) / h, 4)
+        angle, conf = mask_orientation(xs.astype(np.float64), ys.astype(np.float64))
         out.append({"class_id": i, "format": "xywh_center", "class_name": obj.kind, "name": obj.name,
                     "confidence": 0.99, "x": (n0 + n1) / 2, "y": (m0 + m1) / 2,
-                    "w": round(n1 - n0, 4), "h": round(m1 - m0, 4), "pixels": int(len(xs))})
+                    "w": round(n1 - n0, 4), "h": round(m1 - m0, 4), "pixels": int(len(xs)),
+                    "angle_deg": angle, "angle_conf": conf})
     return out
+
+
+@dataclass(frozen=True)
+class DetNoise:
+    """Detector-like errors added to the ground-truth detections (all off by default).
+    Pixels refer to DETECTION_SIZE, the size the perception API reports."""
+    jitter_px: float = 0.0  # Gaussian sigma on the box centre x and y
+    size_jitter: float = 0.0  # w and h are multiplied by (1 + N(0, size_jitter)) independently
+    drop_rate: float = 0.0  # probability to drop a detection, per frame
+    latency_ms: float = 0.0  # detections published this long after the frame was captured
+    false_rate: float = 0.0  # probability per frame of one false detection (score 0.3..0.6)
+    angle_jitter_deg: float = 0.0  # Gaussian sigma on angle_deg
+    seed: int = 0
+
+    @property
+    def perturbs(self) -> bool:
+        return bool(self.jitter_px or self.size_jitter or self.drop_rate or self.false_rate or self.angle_jitter_deg)
+
+
+def perturb(dets: list[dict], cfg: DetNoise, frame_id: int, labels: list[tuple[int, str]] | None = None) -> list[dict]:
+    """Detections as a noisy detector would report them. Without noise (cfg.perturbs False) `dets`
+    is returned unchanged. The random stream is seeded by (cfg.seed, frame_id), so a frame gets the
+    same errors on every run. `labels` are the (class_id, class_name) a false detection may carry
+    (default: those of `dets`). Boxes are clipped to the image; degenerate boxes (under 2 px) are dropped."""
+    if not cfg.perturbs:
+        return dets
+    rng = np.random.default_rng((cfg.seed, frame_id))
+    w_img, h_img = DETECTION_SIZE
+    out = []
+    for d in dets:
+        if cfg.drop_rate and rng.random() < cfg.drop_rate:
+            continue
+        cx, cy, bw, bh = d["x"], d["y"], d["w"], d["h"]
+        if cfg.jitter_px:
+            cx += rng.normal(0.0, cfg.jitter_px) / w_img
+            cy += rng.normal(0.0, cfg.jitter_px) / h_img
+        if cfg.size_jitter:
+            bw *= 1.0 + rng.normal(0.0, cfg.size_jitter)
+            bh *= 1.0 + rng.normal(0.0, cfg.size_jitter)
+        n = dict(d)
+        if cfg.angle_jitter_deg and "angle_deg" in d:
+            a = d["angle_deg"] + rng.normal(0.0, cfg.angle_jitter_deg)
+            n["angle_deg"] = round((a + 90.0) % 180.0 - 90.0, 2)
+        if _set_box(n, cx, cy, bw, bh):
+            out.append(n)
+    if cfg.false_rate and rng.random() < cfg.false_rate:
+        pool = labels or sorted({(d["class_id"], d["class_name"]) for d in dets})
+        if pool:
+            class_id, kind = pool[int(rng.integers(len(pool)))]
+            bw, bh = rng.uniform(0.04, 0.2), rng.uniform(0.06, 0.3)
+            f = {"class_id": class_id, "format": "xywh_center", "class_name": kind, "name": f"false_{kind}",
+                 "confidence": round(float(rng.uniform(0.3, 0.6)), 3), "pixels": int(bw * bh * w_img * h_img),
+                 "angle_deg": round(float(rng.uniform(-90.0, 90.0)), 2), "angle_conf": 0.0}
+            if _set_box(f, rng.uniform(0.0, 1.0), rng.uniform(0.0, 1.0), bw, bh):
+                out.append(f)
+    return out
+
+
+def _set_box(d: dict, cx: float, cy: float, bw: float, bh: float) -> bool:
+    """Write the box (centre / size, normalised) into d clipped to the image; False when it is degenerate."""
+    x0, x1 = max(0.0, cx - bw / 2), min(1.0, cx + bw / 2)
+    y0, y1 = max(0.0, cy - bh / 2), min(1.0, cy + bh / 2)
+    if (x1 - x0) * DETECTION_SIZE[0] < 2.0 or (y1 - y0) * DETECTION_SIZE[1] < 2.0:
+        return False
+    d.update(x=round((x0 + x1) / 2, 4), y=round((y0 + y1) / 2, 4), w=round(x1 - x0, 4), h=round(y1 - y0, 4))
+    return True
 
 
 class H264Encoder:

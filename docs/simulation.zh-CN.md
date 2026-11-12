@@ -37,6 +37,7 @@ cockpit 地址 `http://127.0.0.1:8765/`。`--follower-port` 默认 `udp://127.0.
 | `--camera` | 腕部相机：H.264 视频流在 `--video-port`（8001），感知接口和 `/sim/*` 在 `--perception-port`（8090），绑定 `--http-host`（127.0.0.1） |
 | `--fps N`、`--camera-size` | 相机帧率 1..30（默认 15）；视频尺寸 `1280x720`（默认）或 `640x360` |
 | `--profile P`、`--camera-rot-deg`、`--camera-tilt-deg`、`--camera-offset X,Y,Z` | 相机安装：取 profile 的 `camera_mount`（默认套件 profile），再按这些参数覆盖 |
+| `--det-jitter-px`、`--det-size-jitter`、`--det-drop-rate`、`--det-latency-ms`、`--det-false-rate`、`--det-angle-jitter-deg`、`--det-noise-seed` | 检测噪声（默认全部关闭），见“检测噪声与朝向” |
 | `--scene-stream` | 另在 `ws://<host>:<video-port>/scene` 推送固定的全景相机 |
 | `--torque-report instant\|mean` | 状态报文中的力矩：瞬时值（默认），或最近一个指令周期内的平均值（滑动窗口；见「摩擦辨识」） |
 
@@ -130,6 +131,24 @@ ARMD_DETECTOR_URL=http://127.0.0.1:8090 cargo run --bin armd -- --follower sim \
 ### 感知（`http://<host>:8090`）
 
 rebot-vision 感知接口版本 2（[detection_api.md](detection_api.md)）：`GET/POST /api/mode`、`GET/POST /api/inference`、`POST /api/trigger`、`GET /api/results/latest?after&wait_ms`、`POST /api/subscribe`、`POST /api/subscribe/{id}/keepalive`、`DELETE /api/subscribe/{id}`、`GET /api/subscriptions`。每个渲染帧都计算真值检测：对腕部相机做一次 640x360 分割渲染，每个场景物体取其可见像素（至少 20 个）的外接框，因此计入遮挡和画面边缘。`class_name` 为物体类别（`cube`、`cup`、`block`），`name` 为物体名，`confidence` 0.99，`format` 为 `xywh_center`，按 640x360 归一化。单次触发返回请求之后复制状态的第一帧。`aruco` 流水线会运行，但场景中没有标记。结果按订阅帧率（最高 min(15, `--fps`)）发布到 `latest`。
+
+#### 检测噪声与朝向
+
+每个真值检测还带有 `angle_deg`（物体长边在 640x360 图像中的朝向，从图像 +x 转向 +y，y 向下，范围 [-90, 90)，由物体掩码的二阶矩计算）和 `angle_conf`（掩码特征值之比 1 − 小/大；方形或圆形底面约为 0，此时角度不确定）。原有字段不变。
+
+下列选项默认全部关闭（此时检测即真值）。像素指 640x360 检测图像。噪声加在每帧检测发布之前；`/sim/state` 保持真值。
+
+| 选项 | 作用 |
+|---|---|
+| `--det-jitter-px S` | 框中心 x、y 各自加高斯噪声，σ = S 像素 |
+| `--det-size-jitter F` | w、h 各自乘以 (1 + N(0, F)) |
+| `--det-drop-rate P` | 每帧每个检测以概率 P 丢弃 |
+| `--det-latency-ms L` | 检测在帧采集 L ms 之后发布；`age_ms` 含该延迟，检测内容为较早那一帧 |
+| `--det-false-rate P` | 每帧以概率 P 增加一个误检：随机已有类别、随机位置和大小，`confidence` 0.3..0.6，`angle_conf` 为 0 |
+| `--det-angle-jitter-deg S` | `angle_deg` 加高斯噪声，σ = S 度（折回 [-90, 90)） |
+| `--det-noise-seed N` | 随机种子（默认 `--seed`，否则 0）；每帧的误差由（种子、帧号）决定 |
+
+框裁剪到画面内；宽或高不足 2 像素的框丢弃。示例：`rebot-sim --camera --det-jitter-px 3 --det-size-jitter 0.05 --det-drop-rate 0.1 --det-latency-ms 100 --det-noise-seed 1`（即 `tests/test_camera_grasp.py` 的 `v5_noise` / `v8_noise` 用例）。
 
 ### 场景与评估路由
 
