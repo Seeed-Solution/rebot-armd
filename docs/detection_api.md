@@ -91,19 +91,19 @@ The single-shot button calls `/api/v1/detection/trigger` with the selector's pip
  "per_request_pipelines":true,"subscriptions":true,"max_fps":5,
  "continuous":{"active":true,"pipelines":["yolo","aruco"],"fps":5,"subscriptions":0},
  "available":{"yolo":true,"aruco":true},
- "model":{"name":"yolo11n_detection_cv181x_int8","path":"/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel"},
+ "model":{"name":"yolo11n_detection_cv181x_int8","path":"/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel","kind":"detect"},
  "family":"aruco4x4_50"}
 ```
 
-Result envelope of `latest` and `trigger` (versions 1 and 2; `requested` on a trigger and `format` on detections are new in version 2). `detections` and `markers` are always present (empty when that pipeline did not run), so a client reading one list works in every mode. `width`/`height` give the visible image size the coordinates refer to: `detections` are normalised to it (centre `x`, `y`, `w`, `h`), `markers` are pixels in it. `pipelines` tells what ran on this frame. `count` is the number of accepted markers (as aruco-detector); `rejected` the markers dropped by the false-positive filter.
+Result envelope of `latest` and `trigger` (versions 1 and 2; `requested` on a trigger and `format` on detections are new in version 2). `detections` and `markers` are always present (empty when that pipeline did not run), so a client reading one list works in every mode. `width`/`height` give the visible image size the coordinates refer to: `detections` are normalised to it (centre `x`, `y`, `w`, `h`), `markers` are pixels in it. Segmentation models (`model.kind: "segment"`) also provide `angle_deg` (object long side, [-90, 90) deg), `angle_conf` ([0, 1]), and `grasp_width_px` (cross-section grasp width in visible image pixels). `pipelines` tells what ran on this frame. `count` is the number of accepted markers (as aruco-detector); `rejected` the markers dropped by the false-positive filter.
 
-`latest` / `trigger` 的结果（版本 1）：`detections` 与 `markers` 始终存在（对应流水线未运行时为空）。`width`/`height` 为坐标所对应的可见画面尺寸：`detections` 按其归一化（中心点），`markers` 为其像素坐标。
+`latest` / `trigger` 的结果（版本 1）：`detections` 与 `markers` 始终存在（对应流水线未运行时为空）。`width`/`height` 为坐标所对应的可见画面尺寸：`detections` 按其归一化（中心点），`markers` 为其像素坐标。分割模型（`model.kind: "segment"`）另提供 `angle_deg`（目标长边角度，[-90, 90) 度）、`angle_conf`（[0, 1]）与 `grasp_width_px`（可见画面像素下的横截面抓取宽度）。
 
 ```json
 {"api_version":2,"success":true,"requested":["yolo","aruco"],"mode":"both","frame_id":42,"ts_ms":1762680000123,"age_ms":35,
  "inference_time_ms":81.2,"width":640,"height":360,
  "pipelines":{"yolo":{"ran":true,"ms":74.0},"aruco":{"ran":true,"ms":6.1}},
- "detections":[{"class_id":39,"format":"xywh_center","class_name":"bottle","confidence":0.710,"x":0.4200,"y":0.5500,"w":0.0800,"h":0.2100}],
+ "detections":[{"class_id":39,"format":"xywh_center","class_name":"bottle","confidence":0.710,"x":0.4200,"y":0.5500,"w":0.0800,"h":0.2100,"angle_deg":15.00,"angle_conf":0.850,"grasp_width_px":28.50}],
  "count":1,"family":"aruco4x4_50","undistorted":false,"rejected":0,
  "markers":[{"id":3,"margin":61.0,"center":[182.0,212.0],"corners":[[150.0,244.0],[214.0,244.0],[214.0,180.0],[150.0,180.0]],
    "pose":{"t":[-0.0921,0.0213,0.4502],"r_deg":[178.20,1.50,3.00],"error":0.0004}}]}

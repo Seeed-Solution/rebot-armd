@@ -130,11 +130,11 @@ ARMD_DETECTOR_URL=http://127.0.0.1:8090 cargo run --bin armd -- --follower sim \
 
 ### 感知（`http://<host>:8090`）
 
-rebot-vision 感知接口版本 2（[detection_api.md](detection_api.md)）：`GET/POST /api/mode`、`GET/POST /api/inference`、`POST /api/trigger`、`GET /api/results/latest?after&wait_ms`、`POST /api/subscribe`、`POST /api/subscribe/{id}/keepalive`、`DELETE /api/subscribe/{id}`、`GET /api/subscriptions`。每个渲染帧都计算真值检测：对腕部相机做一次 640x360 分割渲染，每个场景物体取其可见像素（至少 20 个）的外接框，因此计入遮挡和画面边缘。`class_name` 为物体类别（`cube`、`cup`、`block`），`name` 为物体名，`confidence` 0.99，`format` 为 `xywh_center`，按 640x360 归一化。单次触发返回请求之后复制状态的第一帧。`aruco` 流水线会运行，但场景中没有标记。结果按订阅帧率（最高 min(15, `--fps`)）发布到 `latest`。
+rebot-vision 感知接口版本 2（[detection_api.md](detection_api.md)）：`GET/POST /api/mode`、`GET/POST /api/inference`、`POST /api/trigger`、`GET /api/results/latest?after&wait_ms`、`POST /api/subscribe`、`POST /api/subscribe/{id}/keepalive`、`DELETE /api/subscribe/{id}`、`GET /api/subscriptions`。每个渲染帧都计算真值检测：对腕部相机做一次 640x360 分割渲染，每个场景物体取其可见像素（至少 20 个）的外接框，因此计入遮挡和画面边缘。`class_name` 为物体类别（`cube`、`cup`、`block`、`slab`），`name` 为物体名，`confidence` 0.99，`format` 为 `xywh_center`，按 640x360 归一化。单次触发返回请求之后复制状态的第一帧。`aruco` 流水线会运行，但场景中没有标记。结果按订阅帧率（最高 min(15, `--fps`)）发布到 `latest`。
 
 #### 检测噪声与朝向
 
-每个真值检测还带有 `angle_deg`（物体长边在 640x360 图像中的朝向，从图像 +x 转向 +y，y 向下，范围 [-90, 90)，由物体掩码的二阶矩计算）和 `angle_conf`（掩码特征值之比 1 − 小/大；方形或圆形底面约为 0，此时角度不确定）。原有字段不变。
+每个真值检测还带有 `angle_deg`（物体长边在 640x360 图像中的朝向，从图像 +x 转向 +y，y 向下，范围 [-90, 90)，由物体掩码横截面 / 二阶矩计算）、`angle_conf`（掩码横截面宽比 1 − 小/大；方形或圆形底面约为 0，此时角度不确定）与 `grasp_width_px`（像素下的横截面抓取宽度）。开启 `--det-size-jitter` 时，`grasp_width_px` 随框尺寸抖动。原有字段不变。
 
 下列选项默认全部关闭（此时检测即真值）。像素指 640x360 检测图像。噪声加在每帧检测发布之前；`/sim/state` 保持真值。
 

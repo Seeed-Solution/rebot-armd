@@ -213,11 +213,15 @@ def render_segmentation(renderer: mujoco.Renderer) -> np.ndarray:
     return decode_segmentation(rgb, renderer.scene)
 
 
-def mask_orientation(xs: np.ndarray, ys: np.ndarray) -> tuple[float, float]:
+def mask_orientation(xs: np.ndarray, ys: np.ndarray, scale_x: float = 1.0, scale_y: float = 1.0) -> tuple[float, float]:
     """Orientation of the long side of a pixel set (second moments): (angle_deg, angle_conf).
     The angle runs from image +x toward image +y (y down) in [-90, 90); angle_conf is
     1 - minor/major eigenvalue ratio, 0 for a round or square footprint (angle ambiguous)."""
-    dx, dy = xs - xs.mean(), ys - ys.mean()
+    px = np.asarray(xs, dtype=np.float64) * scale_x
+    py = np.asarray(ys, dtype=np.float64) * scale_y
+    if len(px) == 0:
+        return 0.0, 0.0
+    dx, dy = px - px.mean(), py - py.mean()
     cxx, cyy, cxy = float((dx * dx).mean()), float((dy * dy).mean()), float((dx * dy).mean())
     angle = math.degrees(0.5 * math.atan2(2 * cxy, cxx - cyy))  # (-90, 90]
     if angle >= 90.0 - 1e-9:
@@ -228,12 +232,82 @@ def mask_orientation(xs: np.ndarray, ys: np.ndarray) -> tuple[float, float]:
     return round(angle, 2), round(min(max(conf, 0.0), 1.0), 3)
 
 
+def mask_cross_section(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    step_deg: int = 5,
+    band_px: float = 8.0,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+) -> tuple[float, float, float]:
+    """Orientation and grasp width of a pixel set via minimum cross section.
+    Returns (angle_deg, angle_conf, grasp_width_px).
+    angle_deg is the orientation of the long side in [-90, 90) (closing direction perpendicular).
+    grasp_width_px is the cross-section width along the short axis.
+    angle_conf is 1 - w_min / w_max in [0, 1] (0.0 if w_max < 12.0)."""
+    px = np.asarray(xs, dtype=np.float64) * scale_x
+    py = np.asarray(ys, dtype=np.float64) * scale_y
+    if len(px) == 0:
+        return 0.0, 0.0, 0.0
+
+    gx, gy = float(px.mean()), float(py.mean())
+    mask_pts = set(zip(np.round(xs).astype(int), np.round(ys).astype(int)))
+    qx, qy = int(round(gx / scale_x)), int(round(gy / scale_y))
+    if (qx, qy) not in mask_pts:
+        dists_sq = (px - gx) ** 2 + (py - gy) ** 2
+        best_idx = int(np.argmin(dists_sq))
+        gx, gy = float(px[best_idx]), float(py[best_idx])
+
+    dx = px - gx
+    dy = py - gy
+    thetas = list(range(0, 180, step_deg))
+    widths: dict[int, float] = {}
+    for theta in thetas:
+        rad = math.radians(theta)
+        cos_t, sin_t = math.cos(rad), math.sin(rad)
+        n_dot = -sin_t * dx + cos_t * dy
+        in_band = np.abs(n_dot) <= (band_px / 2.0)
+        if np.any(in_band):
+            proj = cos_t * dx[in_band] + sin_t * dy[in_band]
+            widths[theta] = float(proj.max() - proj.min() + 1.0)
+        else:
+            widths[theta] = 0.0
+
+    vals = list(widths.values())
+    w_min = min(vals)
+    w_max = max(vals)
+
+    thresh = max(w_min + 1.0, w_min * 1.05)
+    candidates = [t for t in thetas if widths[t] <= thresh]
+
+    moments_angle, _ = mask_orientation(xs, ys, scale_x=scale_x, scale_y=scale_y)
+    pca_short = moments_angle + 90.0
+
+    best_cand = candidates[0]
+    best_key = None
+    for theta in candidates:
+        ang_dist = abs((theta - pca_short + 90.0) % 180.0 - 90.0)
+        key = (round(ang_dist, 5), round(widths[theta], 5))
+        if best_key is None or key < best_key:
+            best_key = key
+            best_cand = theta
+
+    theta_star = best_cand
+    angle_deg = ((theta_star + 90.0 + 90.0) % 180.0) - 90.0
+    if angle_deg >= 90.0 - 1e-9:
+        angle_deg = -90.0
+
+    grasp_width_px = widths[theta_star]
+    angle_conf = 0.0 if w_max < 12.0 else min(max(1.0 - w_min / w_max, 0.0), 1.0)
+    return round(angle_deg, 2), round(angle_conf, 3), round(grasp_width_px, 2)
+
+
 def detections(geom_ids: np.ndarray, scene, min_pixels: int = 20) -> list[dict]:
     """Ground-truth boxes of the scene objects (rebot-vision format) from a segmentation
     render at DETECTION_SIZE: the bounds of each object's visible pixels, so occlusion (by the
     gripper or another object) and the image edge are accounted for. Objects with fewer than
-    `min_pixels` visible pixels are not reported. `angle_deg` / `angle_conf` give the in-image
-    orientation of the object's mask (mask_orientation)."""
+    `min_pixels` visible pixels are not reported. `angle_deg` / `angle_conf` / `grasp_width_px`
+    give the in-image orientation and grasp width of the object's mask (mask_cross_section)."""
     h, w = geom_ids.shape
     out = []
     for i, (obj, gid) in enumerate(zip(scene.objects, scene.geom_ids)):
@@ -242,11 +316,11 @@ def detections(geom_ids: np.ndarray, scene, min_pixels: int = 20) -> list[dict]:
             continue
         n0, n1 = round(int(xs.min()) / w, 4), round((int(xs.max()) + 1) / w, 4)
         m0, m1 = round(int(ys.min()) / h, 4), round((int(ys.max()) + 1) / h, 4)
-        angle, conf = mask_orientation(xs.astype(np.float64), ys.astype(np.float64))
+        angle, conf, grasp_width = mask_cross_section(xs.astype(np.float64), ys.astype(np.float64))
         out.append({"class_id": i, "format": "xywh_center", "class_name": obj.kind, "name": obj.name,
                     "confidence": 0.99, "x": (n0 + n1) / 2, "y": (m0 + m1) / 2,
                     "w": round(n1 - n0, 4), "h": round(m1 - m0, 4), "pixels": int(len(xs)),
-                    "angle_deg": angle, "angle_conf": conf})
+                    "angle_deg": angle, "angle_conf": conf, "grasp_width_px": round(grasp_width, 2)})
     return out
 
 
@@ -288,6 +362,8 @@ def perturb(dets: list[dict], cfg: DetNoise, frame_id: int, labels: list[tuple[i
             bw *= 1.0 + rng.normal(0.0, cfg.size_jitter)
             bh *= 1.0 + rng.normal(0.0, cfg.size_jitter)
         n = dict(d)
+        if cfg.size_jitter and "grasp_width_px" in d:
+            n["grasp_width_px"] = round(float(d["grasp_width_px"] * (1.0 + rng.normal(0.0, cfg.size_jitter))), 2)
         if cfg.angle_jitter_deg and "angle_deg" in d:
             a = d["angle_deg"] + rng.normal(0.0, cfg.angle_jitter_deg)
             n["angle_deg"] = round((a + 90.0) % 180.0 - 90.0, 2)
@@ -298,9 +374,11 @@ def perturb(dets: list[dict], cfg: DetNoise, frame_id: int, labels: list[tuple[i
         if pool:
             class_id, kind = pool[int(rng.integers(len(pool)))]
             bw, bh = rng.uniform(0.04, 0.2), rng.uniform(0.06, 0.3)
+            gw = round(float(min(bw * w_img, bh * h_img) * rng.uniform(0.7, 1.0)), 2)
             f = {"class_id": class_id, "format": "xywh_center", "class_name": kind, "name": f"false_{kind}",
                  "confidence": round(float(rng.uniform(0.3, 0.6)), 3), "pixels": int(bw * bh * w_img * h_img),
-                 "angle_deg": round(float(rng.uniform(-90.0, 90.0)), 2), "angle_conf": 0.0}
+                 "angle_deg": round(float(rng.uniform(-90.0, 90.0)), 2), "angle_conf": 0.0,
+                 "grasp_width_px": gw}
             if _set_box(f, rng.uniform(0.0, 1.0), rng.uniform(0.0, 1.0), bw, bh):
                 out.append(f)
     return out

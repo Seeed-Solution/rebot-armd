@@ -120,13 +120,13 @@ def test_mask_angle_is_measured_from_x_toward_y_down(angle):
     d = cam.detections(ids, _scene([1]))[0]
     err = (d["angle_deg"] - angle + 90) % 180 - 90
     assert abs(err) < 2.0, d
-    assert -90 <= d["angle_deg"] < 90 and d["angle_conf"] > 0.7
+    assert -90 <= d["angle_deg"] < 90 and d["angle_conf"] > 0.6
 
 
 def test_square_mask_has_no_angle_confidence():
     ids = np.zeros((H, W), np.int32)
     ids[_rect_mask(30, 30, 30)] = 1
-    assert cam.detections(ids, _scene([1]))[0]["angle_conf"] < 0.1
+    assert cam.detections(ids, _scene([1]))[0]["angle_conf"] < 0.3
 
 
 def _block_angle(rig, yaw_deg: float) -> dict:
