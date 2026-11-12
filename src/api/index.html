@@ -382,15 +382,21 @@ body.recording #rec-chip { display: inline-flex; }
   background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); border: 1px solid #ffccc7;
 }
 body.offline .banner { display: block; }
-.armview {
-  position: absolute; right: 12px; bottom: 12px; width: 220px; height: 160px;
-  border-radius: var(--sc-radius-md); background: rgba(255,255,255,0.9); border: 1px solid var(--sc-color-border);
-  box-shadow: var(--sc-shadow);
+/* view switch: top-left of the stage, above the video and the 3D view; the HUD row starts after it */
+.view-switch {
+  --vs-w: 116px;
+  position: absolute; z-index: 7; top: 10px; left: 12px; width: var(--vs-w); height: 32px; display: flex; padding: 2px; box-sizing: border-box;
+  border-radius: 16px; background: rgba(255,255,255,0.55); border: 1px solid rgba(255,255,255,0.7);
+  backdrop-filter: blur(12px) saturate(140%); -webkit-backdrop-filter: blur(12px) saturate(140%); box-shadow: 0 2px 8px rgba(0,0,0,0.12);
 }
-.armview canvas { width: 100%; height: 100%; display: block; }
-.hud .v3-btn { pointer-events: auto; }
-.v3-btn::before { display: none; }
-.v3-btn[aria-pressed="true"] { background: var(--sc-color-primary-dark); color: #fff; }
+.view-switch button {
+  flex: 1 1 0; min-width: 0; height: 100%; padding: 0 6px; border: 0; border-radius: 13px; background: transparent; cursor: pointer;
+  font: 600 13px var(--sc-font, inherit); color: #374151; white-space: nowrap;
+  -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+}
+.view-switch button[aria-checked="true"] { background: var(--sc-color-primary-dark, #5B7D15); color: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.18); }
+.view-switch button:focus-visible { outline: 2px solid var(--sc-color-primary, #8CC020); outline-offset: 1px; }
+.hud::before { content: ''; flex: none; width: 116px; height: 1px; }
 .view3d { position: absolute; inset: 0; z-index: 6; background: #eef2ea; border-radius: inherit; overflow: hidden; }
 .view3d canvas { width: 100%; height: 100%; display: block; touch-action: none; }
 .v3-legend { position: absolute; left: 10px; bottom: 8px; display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: #374151; pointer-events: none; }
@@ -399,10 +405,20 @@ body.offline .banner { display: block; }
 .v3-legend .k-cmd i { background: rgba(59, 130, 246, 0.45); }
 .v3-legend .k-ws i { border: 1.5px solid #5B7D15; }
 .v3-legend .k-ko i { background: rgba(220, 38, 38, 0.35); border: 1px solid #dc2626; }
-.v3-status { position: absolute; left: 10px; top: 8px; right: 52px; font-size: 12px; color: #374151; pointer-events: none; }
-.v3-x { position: absolute; top: 6px; right: 6px; width: 40px; height: 40px; min-height: 40px; padding: 0; font-size: 20px; border-radius: 12px; background: rgba(255,255,255,0.85); }
-.armview .tag { position: absolute; left: 8px; top: 6px; font-size: 11px; color: var(--sc-color-text-tertiary); }
-body.offline .armview { bottom: 56px; }
+.v3-status { position: absolute; left: 10px; right: 10px; bottom: 30px; font-size: 12px; color: #374151; pointer-events: none; }
+/* pose card (side column, both modes): URDF side view of the arm, click opens the 3D view */
+.pose-card { padding: 6px 10px 8px; display: flex; flex-direction: column; gap: 2px; }
+.pc-head { display: flex; align-items: center; gap: 8px; min-height: 28px; }
+.pc-title { font-size: 13px; font-weight: 600; color: var(--sc-color-text); white-space: nowrap; }
+.pc-hint { flex: 1; min-width: 0; font-size: 11px; color: var(--sc-color-text-tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pc-toggle { flex: none; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 8px; background: transparent; color: var(--sc-color-text-secondary); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
+.pc-toggle:hover { background: rgba(120,120,128,0.12); }
+.pc-toggle svg { width: 16px; height: 16px; transition: transform .2s; }
+.pose-card.collapsed .pc-toggle svg { transform: rotate(-90deg); }
+.pose-card canvas { display: block; width: 100%; height: 86px; border-radius: 10px; background: rgba(255,255,255,0.55); cursor: pointer; touch-action: manipulation; }
+.pose-card canvas:focus-visible, .pc-toggle:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 1px; }
+.pose-card.collapsed canvas { display: none; }
+.pose-card.collapsed .pc-hint { visibility: hidden; }
 
 /* ---------- safety card (both modes) ---------- */
 .safety { padding: 14px; display: grid; gap: 12px; }
@@ -794,6 +810,7 @@ kbd { display: inline-block; min-width: 20px; padding: 1px 5px; margin-right: 2p
   .safety { order: 1; position: sticky; top: calc(var(--head-h) + 8px); z-index: 150; box-shadow: var(--sc-shadow-float); }
   .ops { order: 2; }
   .side > .sc-card:not(.safety) { order: 3; }
+  .side > .sc-card.pose-card { order: 1; } /* right below the safety card, before the controls */
   .cart-ctl { grid-template-columns: minmax(0, 1fr); }
   .cart-read { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
@@ -816,7 +833,6 @@ kbd { display: inline-block; min-width: 20px; padding: 1px 5px; margin-right: 2p
   .btn-estop { min-height: 64px; }
   .sw { min-height: 64px; }
   .jog-list { grid-template-columns: minmax(0, 1fr); }
-  .armview { width: 150px; height: 110px; }
   .stick-zone { grid-template-columns: 1fr 1fr; }
   .stick-center { grid-column: 1 / -1; grid-row: 2; justify-content: center; }
 }
@@ -957,7 +973,6 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
 .jbtn.pressed { background: rgba(140, 192, 32, 0.85); box-shadow: 0 0 18px rgba(140, 192, 32, 0.4); }
 .pad { background: var(--glass-soft); border: 1px solid rgba(255, 255, 255, 0.8); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.04), inset 0 1px 0 #fff; }
 .pad .knob { background: rgba(140, 192, 32, 0.85); border: 1.5px solid rgba(255, 255, 255, 0.6); box-shadow: inset 0 2px 4px rgba(255, 255, 255, 0.65), 0 4px 14px rgba(140, 192, 32, 0.3); }
-.armview { background: rgba(255, 255, 255, 0.6); border: 1px solid var(--glass-edge); border-radius: 16px; backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur); }
 .toast { background: rgba(255, 255, 255, 0.75); border: 1px solid var(--glass-edge); border-radius: 14px; backdrop-filter: var(--glass-blur); -webkit-backdrop-filter: var(--glass-blur); box-shadow: 0 10px 32px rgba(0, 0, 0, 0.08); }
 
 /* ---------- responsive: phone landscape, simple mode — full-screen video + glass HUD ---------- */
@@ -1020,6 +1035,26 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
 
   /* video HUD: tiny glass pills, bottom centre */
   body.ui-simple .hud { top: auto; bottom: 12px; left: 50%; transform: translateX(-50%); }
+  body.ui-simple .hud::before { display: none; }
+  /* view switch: below the safety capsule (--safety-h is its measured height) */
+  body.ui-simple .view-switch {
+    position: fixed; z-index: 160; top: calc(8px + var(--safety-h, 50px) + 6px); left: max(12px, env(safe-area-inset-left));
+    background: rgba(255,255,255,0.3); border-color: rgba(255,255,255,0.45); box-shadow: 0 6px 18px rgba(0,0,0,0.18);
+  }
+  body.ui-simple .view-switch button[aria-checked="false"] { color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.4); }
+  body.ui-simple.v3-open .view-switch button[aria-checked="false"] { color: #1f2937; text-shadow: none; }
+  /* 3D view open: the joysticks, sliders and preset buttons step aside; the safety capsule stays */
+  body.ui-simple.v3-open .cockpit > :not(#ck-safety) { visibility: hidden; }
+  /* pose card: below the view switch; its canvas shrinks so the card ends above the left joystick */
+  body.ui-simple .pose-card {
+    --pc-top: calc(8px + var(--safety-h, 50px) + 6px + 32px + 6px);
+    position: fixed; z-index: 155; top: var(--pc-top); left: max(12px, env(safe-area-inset-left)); width: 200px; box-sizing: border-box;
+    padding: 2px 8px 6px; border-radius: 16px; background: rgba(255,255,255,0.72); border: 1px solid rgba(255,255,255,0.6);
+    box-shadow: 0 6px 18px rgba(0,0,0,0.18); backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
+  }
+  body.ui-simple .pose-card .pc-head { min-height: 26px; }
+  body.ui-simple .pose-card canvas { height: clamp(40px, calc(100dvh - var(--pc-top) - 36px - var(--disc) - 16px - 12px), 86px); background: rgba(255,255,255,0.5); }
+  body.ui-simple.v3-open .pose-card { display: none; }
   body.ui-simple .hud .sc-status-badge { background: rgba(255,255,255,0.4); border-radius: 12px; box-shadow: none; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.4); }
 
   /* no cards: the cockpit dissolves into floating controls */
@@ -1253,8 +1288,10 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
             <button class="btn vhint-btn" id="vhint-retry" data-i18n="v.retry">立即重试</button>
           </div>
         </div>
+        <div class="view-switch" id="view-switch" role="radiogroup" data-i18n-aria="vs.label" aria-label="画面">
+          <button type="button" role="radio" id="vs-video" aria-checked="true" tabindex="0" data-i18n="vs.video">视频</button><button type="button" role="radio" id="vs-3d" aria-checked="false" tabindex="-1" aria-controls="view3d">3D</button>
+        </div>
         <div class="hud">
-          <button class="btn det-btn v3-btn" id="btn-3d" type="button" aria-pressed="false" aria-controls="view3d" data-i18n-aria="v3.aria" aria-label="3D 视图">3D</button>
           <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button><span class="seg seg-sm vmode" id="vmode" role="radiogroup" data-i18n-aria="vm.label" aria-label="视觉模式" hidden><button type="button" role="radio" data-vm="off" data-i18n="vm.off">关</button><button type="button" role="radio" data-vm="yolo" data-i18n="vm.yolo">YOLO</button><button type="button" role="radio" data-vm="aruco" data-i18n="vm.aruco">ArUco</button><button type="button" role="radio" data-vm="both" data-i18n="vm.both">两者</button></span><button class="btn det-btn det-trig" id="btn-trigger" type="button" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span><button class="btn det-btn det-gset" id="btn-gset" type="button" data-i18n="gset.open" hidden>抓取设置</button></span>
           <span class="sc-status-badge" id="cam-chip" data-i18n="v.chip.connecting">连接中</span>
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
@@ -1264,15 +1301,10 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           <span class="sc-status-badge" id="act-chip" role="status" aria-live="polite" hidden></span>
           <span class="sc-status-badge is-info" id="ml-chip" role="status" aria-live="polite" hidden></span>
         </div>
-        <div class="armview only-expert" id="armview">
-          <span class="tag" data-i18n="armview.tag">姿态示意 · 侧视</span>
-          <canvas id="arm-canvas"></canvas>
-        </div>
         <div class="view3d" id="view3d" role="region" data-i18n-aria="v3.aria" aria-label="3D 视图" hidden>
           <canvas id="v3-canvas"></canvas>
           <span class="v3-status" id="v3-status" role="status"></span>
           <div class="v3-legend"><span class="k-meas"><i></i><b data-i18n="v3.leg.meas">实测</b></span><span class="k-cmd"><i></i><b data-i18n="v3.leg.cmd">指令</b></span><span class="k-ws"><i></i><b data-i18n="v3.leg.ws">工作空间</b></span><span class="k-ko"><i></i><b data-i18n="v3.leg.ko">禁入区</b></span></div>
-          <button class="btn v3-x" id="v3-close" type="button" data-i18n-aria="v3.close" aria-label="关闭 3D 视图">×</button>
         </div>
         <div class="grasp-bar" id="grasp-bar" role="group" data-i18n-aria="grasp.aria" aria-label="点框抓取" hidden>
           <div class="grasp-info" id="grasp-info"><b id="grasp-label">--</b><span class="mono" id="grasp-score">--</span></div>
@@ -1461,6 +1493,15 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 7h11l-3-3"/><path d="M17 17H6l3 3"/></svg>
           <span class="preempt-lbl"><span data-i18n="preempt.btn">接管控制权</span><small id="preempt-who"></small></span>
         </button>
+      </div>
+
+      <!-- pose card: after the safety card in both modes (moved by setUi) -->
+      <div class="sc-card pose-card" id="pose-card">
+        <div class="pc-head">
+          <span class="pc-title" data-i18n="pc.title">姿态 · 侧视</span><span class="pc-hint" data-i18n="pc.hint">点按查看 3D</span>
+          <button class="pc-toggle" id="pose-toggle" type="button" aria-expanded="true" aria-controls="pose-canvas" aria-label="收起姿态图"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button>
+        </div>
+        <canvas id="pose-canvas" role="button" tabindex="0" data-i18n-aria="pc.aria" aria-label="机械臂姿态侧视图，点按打开 3D 视图"></canvas>
       </div>
 
       <!-- gravity compensation status: top of the cockpit (simple) or below the safety card (expert), moved by setUi -->
@@ -1780,9 +1821,9 @@ const I18N = {
     'calib.ok.solve.eih': '标定完成，位置 RMSE {rmse} mm，姿态 RMSE {rot}°', 'calib.rmse.warn.eih': '残差偏大：检查标记是否固定不动、采集时机械臂是否静止，删除标黄的位姿后重新求解',
     'calib.r.frame': '结果', 'calib.r.rmse_pos': '位置残差 RMSE', 'calib.r.rmse_rot': '姿态残差 RMSE',
     'rec.chip0': '录制 00:00', 'rec.chip': '录制 ',
-    'v3.aria': '3D 视图', 'v3.close': '关闭 3D 视图', 'v3.loading': '正在加载 3D 视图…', 'v3.err': '3D 视图加载失败：{m}', 'v3.stick': '未安装机械臂网格，显示关节骨架', 'v3.offline': '无遥测，显示最后姿态', 'v3.hint': '拖动旋转 · 双指缩放',
+    'v3.aria': '3D 视图', 'vs.label': '画面', 'vs.video': '视频', 'v3.loading': '正在加载 3D 视图…', 'v3.err': '3D 视图加载失败：{m}', 'v3.stick': '未安装机械臂网格，显示关节骨架', 'v3.offline': '无遥测，显示最后姿态', 'v3.hint': '拖动旋转 · 双指缩放',
     'v3.leg.meas': '实测', 'v3.leg.cmd': '指令', 'v3.leg.ws': '工作空间', 'v3.leg.ko': '禁入区',
-    'armview.tag': '姿态示意 · 侧视', 'banner.lock': '遥测断开 · 控制已锁定',
+    'pc.title': '姿态 · 侧视', 'pc.hint': '点按查看 3D', 'pc.aria': '机械臂姿态侧视图，点按打开 3D 视图', 'pc.collapse': '收起姿态图', 'pc.expand': '展开姿态图', 'pc.cmd': '指令', 'banner.lock': '遥测断开 · 控制已锁定',
     'ctl.mode': '控制方式', 'mode.joint': '关节点动', 'mode.cart': '空间位姿', 'home': '回零',
     'input.mode': '输入方式', 'input.btn': '按键', 'input.stick': '摇杆',
     'c.x': 'X 前后 mm', 'c.y': 'Y 左右 mm', 'c.z': 'Z 高度 mm', 'c.roll': 'Roll 腕转', 'c.pitch': 'Pitch 俯仰', 'c.yaw': 'Yaw 朝向', 'c.reach': '臂展 R /',
@@ -1961,9 +2002,9 @@ const I18N = {
     'calib.ok.solve.eih': 'Calibration solved, position RMSE {rmse} mm, rotation RMSE {rot}°', 'calib.rmse.warn.eih': 'High residual: check the marker is fixed and the arm was still; delete the highlighted poses and solve again',
     'calib.r.frame': 'Result', 'calib.r.rmse_pos': 'Position RMSE', 'calib.r.rmse_rot': 'Rotation RMSE',
     'rec.chip0': 'REC 00:00', 'rec.chip': 'REC ',
-    'v3.aria': '3D view', 'v3.close': 'Close 3D view', 'v3.loading': 'Loading 3D view…', 'v3.err': '3D view failed to load: {m}', 'v3.stick': 'Arm meshes not installed; showing the joint skeleton', 'v3.offline': 'No telemetry; showing the last pose', 'v3.hint': 'Drag to rotate · pinch to zoom',
+    'v3.aria': '3D view', 'vs.label': 'View', 'vs.video': 'Video', 'v3.loading': 'Loading 3D view…', 'v3.err': '3D view failed to load: {m}', 'v3.stick': 'Arm meshes not installed; showing the joint skeleton', 'v3.offline': 'No telemetry; showing the last pose', 'v3.hint': 'Drag to rotate · pinch to zoom',
     'v3.leg.meas': 'Measured', 'v3.leg.cmd': 'Commanded', 'v3.leg.ws': 'Workspace', 'v3.leg.ko': 'Keep-out',
-    'armview.tag': 'Pose preview · side view', 'banner.lock': 'Telemetry lost · controls locked',
+    'pc.title': 'Pose · side view', 'pc.hint': 'Tap for 3D', 'pc.aria': 'Arm pose side view; tap to open the 3D view', 'pc.collapse': 'Collapse pose view', 'pc.expand': 'Expand pose view', 'pc.cmd': 'Commanded', 'banner.lock': 'Telemetry lost · controls locked',
     'ctl.mode': 'Control mode', 'mode.joint': 'Joint jog', 'mode.cart': 'Cartesian', 'home': 'Home',
     'input.mode': 'Input type', 'input.btn': 'Buttons', 'input.stick': 'Sticks',
     'c.x': 'X fwd/back mm', 'c.y': 'Y left/right mm', 'c.z': 'Z height mm', 'c.roll': 'Roll', 'c.pitch': 'Pitch', 'c.yaw': 'Yaw', 'c.reach': 'Reach R /',
@@ -4247,7 +4288,7 @@ function initCalib() {
 async function loadSchema() {
   try {
     const sc = await api('/api/v1/observation/schema', undefined, { quiet: true, method: 'GET' });
-    if (sc) { S.caps = sc.capabilities || {}; S.wsPolicy = sc.workspace || null; colOnCaps(); posesOnCaps(); V3.sceneAt = 0; }
+    if (sc) { S.caps = sc.capabilities || {}; S.wsPolicy = sc.workspace || null; S.home = Array.isArray(sc.home_positions) ? sc.home_positions : null; colOnCaps(); posesOnCaps(); V3.sceneAt = 0; }
     if (sc && Array.isArray(sc.limits) && sc.limits.length) {
       const oldDof = S.dof;
       S.limits = sc.limits;
@@ -5803,6 +5844,8 @@ function setUi(ui) {
   else $('side').insertBefore($('safety'), $('side').firstChild);
   if (ui === 'simple') $('cockpit').insertBefore($('gc-banner'), $('cockpit').firstChild);
   else $('side').insertBefore($('gc-banner'), $('safety').nextSibling);
+  if (ui === 'simple') $('ck-safety').appendChild($('pose-card'));
+  else $('side').insertBefore($('pose-card'), $('gc-banner').nextSibling);
   if (ui === 'simple') setMode('cart', 'btn');
   else {
     const legacy = store('rebot.mode'); // pre-cartesian builds stored jog | stick
@@ -6381,84 +6424,158 @@ function drawAruco(g, d, rect, alpha, color) {
 }
 
 /* =================================================================
-   Arm pose canvas (side view, planar J2/J3/J4 chain + J1/J5 gauges)
+   Pose card: side view in the arm's own plane (URDF chain through VIK.frames, rotated by -J1),
+   J1 yaw dial, J6 roll mark, gripper opening; commanded pose dashed when it differs from the
+   measured one (same thresholds as the 3D ghost), profile rest pose as a faint outline, a joint
+   named by observation.motion_limit (0-based) or observation.collision (1-based) in red.
+   Redraws at most ~15 fps and only when an angle moved > 0.00175 rad or a drawn state changed;
+   nothing while the page is hidden, the card is collapsed or not displayed.
    ================================================================= */
-const arm = { cv: $('arm-canvas'), ctx: null };
-arm.ctx = arm.cv.getContext('2d');
-function drawArm(q, act) {
-  const { w, h, dpr } = fitCanvas(arm.cv, $('armview'));
-  const g = arm.ctx; g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, w, h);
-  const small = w < 220 * dpr;
-  const L = [0.16, 0.30, 0.26, 0.12]; // base height, upper arm, forearm, hand (relative)
-  const reach = L[1] + L[2] + L[3];
-  const s = Math.min(w / (2 * reach + 0.1), h / (reach + L[0] + 0.12)) * 0.92;
-  const bx = w / 2, by = h - h * 0.1;
-  const P = (x, y) => [bx + x * s, by - y * s];
-  const ON = '#5B7D15', OFF = '#94a3b8';
-
-  g.strokeStyle = 'rgba(31,41,55,0.15)'; g.lineWidth = dpr;
-  g.beginPath(); g.moveTo(0, by); g.lineTo(w, by); g.stroke();
-  g.setLineDash([3 * dpr, 5 * dpr]); g.strokeStyle = 'rgba(140,192,32,0.35)';
-  const [sx, sy] = P(0, L[0]);
-  g.beginPath(); g.arc(sx, sy, reach * s, Math.PI, 2 * Math.PI); g.stroke(); g.setLineDash([]);
-
-  // forward kinematics in the sagittal plane (0 rad = upright)
-  const a1 = Math.PI / 2 - (q[1] || 0);
-  const a2 = a1 - (q[2] || 0);
-  const a3 = a2 - (q[3] || 0);
-  const p0 = [0, 0], p1 = [0, L[0]];
-  const p2 = [p1[0] + L[1] * Math.cos(a1), p1[1] + L[1] * Math.sin(a1)];
-  const p3 = [p2[0] + L[2] * Math.cos(a2), p2[1] + L[2] * Math.sin(a2)];
-  const p4 = [p3[0] + L[3] * Math.cos(a3), p3[1] + L[3] * Math.sin(a3)];
-
-  const [b0x, b0y] = P(-0.07, 0), bw = 0.14 * s, bh = L[0] * s * 0.55;
-  g.fillStyle = act[0] ? 'rgba(140,192,32,0.3)' : '#f1f5f9'; g.strokeStyle = act[0] ? ON : '#cbd5e1'; g.lineWidth = 1.5 * dpr;
-  g.beginPath(); if (g.roundRect) g.roundRect(b0x, b0y - bh, bw, bh, 3 * dpr); else g.rect(b0x, b0y - bh, bw, bh); g.fill(); g.stroke();
-
-  const link = (a, b, width, on) => {
-    const [ax, ay] = P(...a), [bx2, by2] = P(...b);
-    g.lineCap = 'round';
-    g.strokeStyle = 'rgba(255,255,255,0.9)'; g.lineWidth = width + 3 * dpr; g.beginPath(); g.moveTo(ax, ay); g.lineTo(bx2, by2); g.stroke();
-    g.strokeStyle = on ? ON : OFF; g.lineWidth = width;
-    g.shadowColor = on ? 'rgba(140,192,32,0.6)' : 'transparent'; g.shadowBlur = on ? 6 * dpr : 0;
-    g.beginPath(); g.moveTo(ax, ay); g.lineTo(bx2, by2); g.stroke(); g.shadowBlur = 0;
-  };
-  const jw = (small ? 6 : 9) * dpr;
-  link(p0, p1, jw * 1.2, act[0]);
-  link(p1, p2, jw, act[1]);
-  link(p2, p3, jw * 0.85, act[2]);
-  link(p3, p4, jw * 0.6, act[3] || act[4]);
-
-  const open = gripFrac(q[GRIP] || 0);
-  const [tx, ty] = P(...p4), fl = 0.07 * s, spread = 0.15 + open * 0.55;
-  g.strokeStyle = act[GRIP] ? ON : '#d48806'; g.lineWidth = 2.5 * dpr; g.lineCap = 'round';
-  for (const sgn of [-1, 1]) {
-    const ang = -a3 + sgn * spread;
-    g.beginPath(); g.moveTo(tx, ty); g.lineTo(tx + Math.cos(ang) * fl, ty + Math.sin(ang) * fl); g.stroke();
-  }
-  const joint = (p, label, r, on) => {
-    const [x, y] = P(...p);
-    g.fillStyle = '#ffffff'; g.strokeStyle = on ? ON : '#64748b'; g.lineWidth = 1.8 * dpr;
-    g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); g.stroke();
-    if (!small) { g.fillStyle = on ? ON : '#64748b'; g.font = `${9 * dpr}px ui-monospace, Menlo, monospace`; g.fillText(label, x + r + 3 * dpr, y - r); }
-  };
-  joint(p1, 'J2', 4.5 * dpr, act[1]); joint(p2, 'J3', 4 * dpr, act[2]); joint(p3, 'J4', 3.5 * dpr, act[3]);
-
-  const [wx, wy] = P(...p3), rr = 8 * dpr;
-  g.strokeStyle = act[4] ? ON : '#d48806'; g.lineWidth = 2 * dpr;
-  g.beginPath(); g.arc(wx, wy, rr, -Math.PI / 2, -Math.PI / 2 + (q[4] || 0), (q[4] || 0) < 0); g.stroke();
-
-  // J1 top-view yaw dial
-  const dr = (small ? 12 : 20) * dpr, dx = w - dr - 8 * dpr, dy = dr + (small ? 8 : 20) * dpr;
-  g.strokeStyle = act[0] ? ON : '#cbd5e1'; g.lineWidth = 1.2 * dpr;
-  g.beginPath(); g.arc(dx, dy, dr, 0, Math.PI * 2); g.stroke();
-  const yaw = -(q[0] || 0) - Math.PI / 2;
-  g.strokeStyle = ON; g.lineWidth = 2.2 * dpr; g.lineCap = 'round';
-  g.beginPath(); g.moveTo(dx, dy); g.lineTo(dx + Math.cos(yaw) * dr * 0.85, dy + Math.sin(yaw) * dr * 0.85); g.stroke();
-  g.fillStyle = '#64748b'; g.font = `${(small ? 8 : 9) * dpr}px ui-monospace, Menlo, monospace`; g.textAlign = 'center';
-  g.fillText('J1 ' + ((q[0] || 0) * DEG).toFixed(0) + '°', dx, dy + dr + 11 * dpr);
-  g.textAlign = 'left';
+const PCARD = { cv: $('pose-canvas'), g: null, last: 0, key: '', win: null, q: null, c: null, draws: 0, hot: [], ghost: false, collapsed: store('rebot.poseCard') === '0' };
+PCARD.g = PCARD.cv.getContext('2d');
+const PCARD_EPS = 0.00175;
+// planar points [x along the arm's heading, z] for model angles q: base, J1..J6 origins, end_link; plus the tool axis
+function posePlanar(q) {
+  const qq = Array.from({ length: 6 }, (_, i) => Number(q[i]) || 0);
+  const f = VIK.frames(qq), c = Math.cos(qq[0]), s = Math.sin(qq[0]);
+  const pl = (p) => [p[0] * c + p[1] * s, p[2]];
+  const ax = pl([f.R[0], f.R[3], f.R[6]]);
+  return { pts: [[0, 0], ...f.o.map(pl), pl(f.p)], ax };
 }
+function poseSetCollapsed(on) {
+  PCARD.collapsed = on; PCARD.key = '';
+  $('pose-card').classList.toggle('collapsed', on);
+  const b = $('pose-toggle');
+  b.setAttribute('aria-expanded', String(!on));
+  b.setAttribute('aria-label', t(on ? 'pc.expand' : 'pc.collapse'));
+  store('rebot.poseCard', on ? '0' : '1');
+}
+function poseTick(ts) {
+  if (PCARD.collapsed || document.hidden || ts - PCARD.last < 66) return;
+  const o = S.obs, live = isLive();
+  const q = o && Array.isArray(o.positions) ? o.positions : null;
+  const rest = Array.isArray(S.home) && S.home.length >= 6 ? S.home : CFG.presets.park;
+  const meas = q || rest;
+  const cmd = o && Array.isArray(o.commanded_positions) ? o.commanded_positions : meas;
+  const ghost = !!q && cmd.some((v, i) => Math.abs(v - (meas[i] ?? v)) > (i === GRIP ? 0.05 : 0.005));
+  const hot = [];
+  const ml = o && o.motion_limit;
+  if (live && ml && Number.isInteger(ml.joint)) hot.push(ml.joint);
+  const col = o && o.collision;
+  if (live && col && col.active && Number.isInteger(col.joint) && !hot.includes(col.joint - 1)) hot.push(col.joint - 1);
+  const gc = live && o && o.control_mode === 'gravity_comp';
+  const cv = PCARD.cv;
+  const key = [hot.join('.'), gc, ghost, live, cv.clientWidth, cv.clientHeight, devicePixelRatio, LANG, rest.join()].join('|');
+  const moved = (a, b) => !b || a.length !== b.length || a.some((v, i) => Math.abs(v - b[i]) > PCARD_EPS);
+  if (key === PCARD.key && !moved(meas, PCARD.q) && (!ghost || !moved(cmd, PCARD.c))) return;
+  if (!cv.getClientRects().length || !cv.clientWidth) return; // not displayed
+  PCARD.last = ts; PCARD.key = key; PCARD.q = meas.slice(); PCARD.c = cmd.slice(); PCARD.hot = hot; PCARD.ghost = ghost;
+  PCARD.draws++;
+  poseDraw(meas, ghost ? cmd : null, rest, hot, gc, live);
+}
+function poseDraw(meas, cmd, rest, hot, gc, live) {
+  const cv = PCARD.cv, g = PCARD.g;
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  const w = Math.max(1, Math.round(cv.clientWidth * dpr)), h = Math.max(1, Math.round(cv.clientHeight * dpr));
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, w, h);
+  const u = dpr, font = (px, wt = 500) => `${wt} ${px * u}px ui-monospace, Menlo, monospace`;
+  const M = posePlanar(meas), C = cmd ? posePlanar(cmd) : null, R = posePlanar(rest);
+  // view window (m): the drawn poses plus a margin, at least 0.36 m tall; kept while the poses fit and
+  // the window is less than 1.6x the needed height, so the scale does not change on every small move
+  let x0 = -0.12, x1 = 0.12, z0 = 0, z1 = 0.1;
+  for (const P of [M, C, R]) if (P) for (const [x, z] of P.pts) { x0 = Math.min(x0, x - 0.05); x1 = Math.max(x1, x + 0.05); z0 = Math.min(z0, z - 0.02); z1 = Math.max(z1, z + 0.05); }
+  if (z1 - z0 < 0.36) z1 = z0 + 0.36;
+  const W0 = PCARD.win;
+  if (W0 && x0 >= W0[0] && x1 <= W0[1] && z0 >= W0[2] && z1 <= W0[3] && W0[3] - W0[2] < 1.6 * (z1 - z0)) [x0, x1, z0, z1] = W0;
+  else PCARD.win = [x0 - 0.04, x1 + 0.04, z0, z1 + 0.04], [x0, x1, z0, z1] = PCARD.win;
+  const dialR = Math.min(13 * u, h * 0.2), dialW = dialR * 2 + 12 * u;
+  const pad = 4 * u, aw = w - dialW - pad * 2, ah = h - pad * 2;
+  const k = Math.min(aw / (x1 - x0), ah / (z1 - z0));
+  const ox = pad + (aw - (x1 - x0) * k) / 2 - x0 * k, oz = h - pad - (ah - (z1 - z0) * k) / 2 + z0 * k;
+  const X = (p) => [ox + p[0] * k, oz - p[1] * k];
+  const RED = '#dc2626', LINK = !live ? '#94a3b8' : gc ? '#b45309' : '#334155', JOINT = !live ? '#94a3b8' : gc ? '#d97706' : '#5B7D15';
+  // ground
+  g.strokeStyle = 'rgba(31,41,55,0.18)'; g.lineWidth = u;
+  const [, gy] = X([0, 0]); g.beginPath(); g.moveTo(pad, gy); g.lineTo(w - dialW, gy); g.stroke();
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  const path = (pts, a, b) => { g.beginPath(); pts.slice(a, b).forEach((p, i) => { const [x, y] = X(p); if (i) g.lineTo(x, y); else g.moveTo(x, y); }); };
+  // rest pose: faint outline
+  g.strokeStyle = 'rgba(100,116,139,0.22)'; g.lineWidth = 6 * u; path(R.pts, 1, 8); g.stroke();
+  // measured
+  const jw = Math.max(3, 4.5 * u);
+  g.lineCap = 'butt'; g.strokeStyle = hot.includes(0) ? RED : LINK; g.lineWidth = jw * 1.8; path(M.pts, 0, 3); g.stroke(); g.lineCap = 'round'; // base column up to J2
+  for (let i = 2; i < 7; i++) {
+    g.strokeStyle = hot.includes(i - 1) ? RED : LINK; g.lineWidth = i >= 5 ? jw * 0.8 : jw;
+    path(M.pts, i, i + 2); g.stroke();
+  }
+  // gripper jaws at end_link, along the tool axis, spread by the opening
+  const end = M.pts[7];
+  let ax = M.ax; const an = Math.hypot(ax[0], ax[1]);
+  if (an < 0.2) { const d = [end[0] - M.pts[6][0], end[1] - M.pts[6][1]], dn = Math.hypot(...d) || 1; ax = [d[0] / dn, d[1] / dn]; } else ax = [ax[0] / an, ax[1] / an];
+  const nrm = [-ax[1], ax[0]], open = meas.length > GRIP ? gripFrac(Number(meas[GRIP]) || 0) : 0, spread = 0.012 + 0.03 * open;
+  g.strokeStyle = hot.includes(GRIP) ? RED : !live ? '#94a3b8' : '#d48806'; g.lineWidth = Math.max(2, 2.4 * u);
+  for (const sg of [-1, 1]) {
+    const a = [end[0] - ax[0] * 0.05 + nrm[0] * spread * sg, end[1] - ax[1] * 0.05 + nrm[1] * spread * sg], b = [end[0] + nrm[0] * spread * sg, end[1] + nrm[1] * spread * sg];
+    const [axp, ayp] = X(a), [bxp, byp] = X(b), [cx, cy] = X([end[0] - ax[0] * 0.05, end[1] - ax[1] * 0.05]);
+    g.beginPath(); g.moveTo(cx, cy); g.lineTo(axp, ayp); g.lineTo(bxp, byp); g.stroke();
+  }
+  // commanded: dashed, on top of the measured pose
+  if (C) {
+    g.strokeStyle = '#3b82f6'; g.lineWidth = Math.max(1.5, 2 * u); g.setLineDash([4 * u, 3 * u]);
+    path(C.pts, 2, 8); g.stroke(); g.setLineDash([]);
+  }
+  // joints J2..J5 (J1 is the dial, J6 the roll mark)
+  for (let i = 1; i <= 4; i++) {
+    const [x, y] = X(M.pts[i + 1]), r = (i === 1 ? 4 : 3.4) * u, on = hot.includes(i);
+    g.fillStyle = on ? RED : '#fff'; g.strokeStyle = on ? RED : JOINT; g.lineWidth = 1.6 * u;
+    g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); g.stroke();
+  }
+  // J6 roll mark: small dial on the gripper body, tick at the roll angle (0 = up)
+  {
+    const m = [(M.pts[6][0] + end[0]) / 2, (M.pts[6][1] + end[1]) / 2], [x, y] = X(m), r = 4.5 * u, a = (Number(meas[5]) || 0) - Math.PI / 2;
+    g.fillStyle = '#fff'; g.strokeStyle = hot.includes(5) ? RED : JOINT; g.lineWidth = 1.4 * u;
+    g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); g.stroke();
+    g.beginPath(); g.moveTo(x, y); g.lineTo(x + Math.cos(a) * r, y + Math.sin(a) * r); g.stroke();
+  }
+  g.textBaseline = 'middle';
+  // labels of highlighted joints
+  // labels of highlighted joints: red text on a white pill, below-left of the joint
+  g.font = font(10, 700); g.textAlign = 'left';
+  for (const j of hot) {
+    if (j < 1 || j > 6) continue;
+    const p = j === 5 ? [(M.pts[6][0] + end[0]) / 2, (M.pts[6][1] + end[1]) / 2] : M.pts[j + 1], [x, y] = X(p);
+    const txt = 'J' + (j + 1), tw = g.measureText(txt).width, bw = tw + 6 * u, bh = 13 * u;
+    const bx = clamp(x - bw - 5 * u, 1, w - dialW - bw), by = clamp(y + 3 * u, 1, h - bh - 1);
+    g.fillStyle = 'rgba(255,255,255,0.92)'; g.strokeStyle = RED; g.lineWidth = u;
+    g.beginPath(); if (g.roundRect) g.roundRect(bx, by, bw, bh, 4 * u); else g.rect(bx, by, bw, bh); g.fill(); g.stroke();
+    g.fillStyle = RED; g.fillText(txt, bx + 3 * u, by + bh / 2 + 0.5 * u);
+  }
+  // J1 yaw dial (top view, forward = up, positive = counter-clockwise)
+  const dx = w - dialR - 6 * u, dy = dialR + 4 * u, q0 = Number(meas[0]) || 0, j1hot = hot.includes(0);
+  g.strokeStyle = j1hot ? RED : 'rgba(100,116,139,0.55)'; g.lineWidth = 1.2 * u;
+  g.beginPath(); g.arc(dx, dy, dialR, 0, Math.PI * 2); g.stroke();
+  g.strokeStyle = j1hot ? RED : JOINT; g.lineWidth = 2.2 * u;
+  g.beginPath(); g.moveTo(dx, dy); g.lineTo(dx + Math.cos(-Math.PI / 2 - q0) * dialR * 0.85, dy + Math.sin(-Math.PI / 2 - q0) * dialR * 0.85); g.stroke();
+  g.font = font(10); g.textAlign = 'center'; g.fillStyle = j1hot ? RED : '#475569';
+  g.fillText('J1 ' + (q0 >= 0 ? '+' : '−') + Math.abs(q0 * DEG).toFixed(0) + '°', dx - 2 * u, dy + dialR + 9 * u);
+  // legend: commanded / gravity compensation
+  g.textAlign = 'right'; g.font = font(10, 600);
+  let ly = h - 7 * u;
+  if (gc) { g.fillStyle = '#b45309'; g.fillText(t('gc.chip'), w - 4 * u, ly); ly -= 13 * u; }
+  if (C) {
+    g.fillStyle = '#2563eb'; const tw = g.measureText(t('pc.cmd')).width; g.fillText(t('pc.cmd'), w - 4 * u, ly);
+    g.strokeStyle = '#3b82f6'; g.lineWidth = 2 * u; g.setLineDash([3 * u, 2 * u]);
+    g.beginPath(); g.moveTo(w - 4 * u - tw - 16 * u, ly); g.lineTo(w - 4 * u - tw - 4 * u, ly); g.stroke(); g.setLineDash([]);
+  }
+  g.textAlign = 'left'; g.textBaseline = 'alphabetic';
+}
+$('pose-toggle').addEventListener('click', () => poseSetCollapsed(!PCARD.collapsed));
+PCARD.cv.addEventListener('click', () => { if (!V3.open) v3Toggle(true); });
+PCARD.cv.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); if (!V3.open) v3Toggle(true); } });
+document.addEventListener('visibilitychange', () => { PCARD.key = ''; });
+i18nHooks.push(() => { PCARD.key = ''; $('pose-toggle').setAttribute('aria-label', t(PCARD.collapsed ? 'pc.expand' : 'pc.collapse')); });
+poseSetCollapsed(PCARD.collapsed);
 
 const jtab = CFG.joints.map((jd, i) => {
   const tr = document.createElement('tr');
@@ -6945,15 +7062,19 @@ const v3Geo = new Map();
 function v3Toggle(open) {
   V3.open = open;
   $('view3d').hidden = !open;
-  $('btn-3d').setAttribute('aria-pressed', String(open));
-  if (open) v3Start();
-  else { cancelAnimationFrame(V3.raf); V3.raf = 0; $('btn-3d').focus({ preventScroll: true }); }
+  document.body.classList.toggle('v3-open', open);
+  for (const [id, on] of [['vs-video', !open], ['vs-3d', open]]) { const b = $(id); b.setAttribute('aria-checked', String(on)); b.tabIndex = on ? 0 : -1; }
+  if (open) { if (S.ui === 'simple') releaseAll(); v3Start(); } // simple: the sticks are hidden under the 3D view
+  else { cancelAnimationFrame(V3.raf); V3.raf = 0; }
 }
+// height of the safety card, for the simple-mode overlay layout (view switch and pose card sit below it)
+new ResizeObserver(() => { document.documentElement.style.setProperty('--safety-h', $('safety').offsetHeight + 'px'); }).observe($('safety'));
 async function v3Start() {
   try { await (V3.init ||= v3Init()); } catch (e) { V3.init = null; setText($('v3-status'), t('v3.err', { m: e.message || String(e) })); return; }
   if (!V3.open) return;
   if (Date.now() - V3.sceneAt > 5000) v3Extras();
   v3Resize();
+  v3Frame();
   if (!V3.raf) V3.raf = requestAnimationFrame(v3Tick);
 }
 async function v3Init() {
@@ -7095,20 +7216,20 @@ async function v3Extras() {
   const g = V3.extras = new T.Group();
   const ws = S.wsPolicy;
   const floor = ws && Number.isFinite(ws.floor_z_m) ? ws.floor_z_m : 0;
-  const grid = new T.GridHelper(1.2, 24, 0x9aa395, 0xc9cfc4);
+  const grid = new T.GridHelper(1.2, 24, 0xb4bbae, 0xd9ded4);
   grid.rotation.x = Math.PI / 2; grid.position.z = floor; g.add(grid);
-  const box = (lo, hi, color, fill, name) => {
+  const box = (lo, hi, color, fill, name, opacity = 1) => {
     const s = [0, 1, 2].map((k) => Math.max(1e-3, hi[k] - lo[k]));
     const geo = new T.BoxGeometry(s[0], s[1], s[2]);
     const c = [0, 1, 2].map((k) => (hi[k] + lo[k]) / 2);
-    const edges = new T.LineSegments(new T.EdgesGeometry(geo), new T.LineBasicMaterial({ color }));
+    const edges = new T.LineSegments(new T.EdgesGeometry(geo), new T.LineBasicMaterial({ color, transparent: opacity < 1, opacity, depthWrite: opacity >= 1 }));
     edges.position.set(c[0], c[1], c[2]); edges.name = name; g.add(edges);
     if (fill) { const m = new T.Mesh(geo, new T.MeshBasicMaterial({ color, transparent: true, opacity: 0.18, depthWrite: false })); m.position.copy(edges.position); m.name = name; g.add(m); }
   };
   if (ws && Array.isArray(ws.box_min_m) && Array.isArray(ws.box_max_m)) {
     const lo = ws.box_min_m.slice(), hi = ws.box_max_m.slice();
     lo[2] = Math.max(lo[2], floor);
-    if (hi[2] > lo[2]) box(lo, hi, 0x5b7d15, false, 'workspace');
+    if (hi[2] > lo[2]) box(lo, hi, 0x6f9420, false, 'workspace', 0.3); // faint: the box is far larger than the arm
   }
   for (const b of boxes) if (Array.isArray(b.min_m) && Array.isArray(b.max_m)) box(b.min_m, b.max_m, 0xdc2626, true, 'keepout:' + b.name);
   const dot = new T.SphereGeometry(0.012, 12, 8), dm = new T.MeshBasicMaterial({ color: 0xf59e0b });
@@ -7124,14 +7245,33 @@ function v3Resize() {
   if (!V3.r || !w || !h) return;
   V3.r.setSize(w, h, false);
   V3.cam.aspect = w / h; V3.cam.updateProjectionMatrix();
-  if (!V3.fitted) { // first layout: fit a 0.45 m sphere around the arm into the narrower field of view
-    V3.fitted = true;
-    const half = Math.atan(Math.tan((V3.cam.fov * Math.PI) / 360) * Math.min(1, V3.cam.aspect));
-    const d = 0.45 / Math.sin(half);
-    V3.cam.position.set(0.62, 0.42, 0.66).normalize().multiplyScalar(d).add(V3.ctl.target);
-    V3.ctl.update();
-  }
+  if (!V3.framed) v3Frame();
   V3.dirty = true;
+}
+// on every open: aim at the robot's bounding box in the current pose and pull back until its corners
+// fill about 75 % of the narrower side of the view (fixed viewing direction; orbit / zoom stay free)
+function v3Frame() {
+  const T = V3.T, el = $('view3d');
+  if (!T || !V3.solid || !el.clientWidth || !el.clientHeight) return;
+  const o = S.obs;
+  if (o && Array.isArray(o.positions)) { V3.solid.set(o.positions); V3.key = ''; }
+  V3.scene.updateMatrixWorld(true);
+  const box = new T.Box3().setFromObject(V3.solid.obj);
+  if (box.isEmpty()) return;
+  const c = box.getCenter(new T.Vector3()), dir = new T.Vector3(0.62, 0.42, 0.66).normalize(), v = new T.Vector3();
+  const corners = [];
+  for (const x of [box.min.x, box.max.x]) for (const y of [box.min.y, box.max.y]) for (const z of [box.min.z, box.max.z]) corners.push(new T.Vector3(x, y, z));
+  let d = box.getSize(v).length();
+  for (let k = 0; k < 3; k++) { // the on-screen extent shrinks about linearly with the distance
+    V3.cam.position.copy(dir).multiplyScalar(d).add(c); V3.cam.lookAt(c); V3.cam.updateMatrixWorld(true);
+    let m = 0;
+    for (const p of corners) { v.copy(p).project(V3.cam); m = Math.max(m, Math.abs(v.x), Math.abs(v.y)); }
+    if (!(m > 0)) break;
+    d = clamp(d * m / 0.75, V3.ctl.minDistance, V3.ctl.maxDistance);
+  }
+  V3.cam.position.copy(dir).multiplyScalar(d).add(c);
+  V3.ctl.target.copy(c); V3.ctl.update();
+  V3.framed = true; V3.dirty = true;
 }
 function v3Tick(ts) {
   V3.raf = V3.open ? requestAnimationFrame(v3Tick) : 0;
@@ -7153,8 +7293,16 @@ function v3Tick(ts) {
   V3.dirty = false; V3.last = ts; V3.renders++;
   V3.r.render(V3.scene, V3.cam);
 }
-$('btn-3d').addEventListener('click', () => v3Toggle(!V3.open));
-$('v3-close').addEventListener('click', () => v3Toggle(false));
+// view switch (radiogroup): click, arrow keys / Home / End move the selection; Escape stays the E-stop key
+$('vs-video').addEventListener('click', () => { if (V3.open) v3Toggle(false); });
+$('vs-3d').addEventListener('click', () => { if (!V3.open) v3Toggle(true); });
+$('view-switch').addEventListener('keydown', (e) => {
+  const open = { ArrowLeft: false, ArrowUp: false, Home: false, ArrowRight: true, ArrowDown: true, End: true }[e.key];
+  if (open === undefined) return;
+  e.preventDefault(); e.stopPropagation();
+  if (open !== V3.open) v3Toggle(open);
+  $(open ? 'vs-3d' : 'vs-video').focus({ preventScroll: true });
+});
 i18nHooks.push(() => { V3.key = ''; });
 
 function renderCollision(live, ts) {
@@ -7215,7 +7363,7 @@ function frame(ts) {
   const torqued = !!(S.obs && S.obs.is_torqued);
   const act = v.map((x) => op && x !== 0);
   if (S.mode === 'cart' && op && C.sending) { for (let i = 0; i < 4; i++) act[i] = true; act[GRIP] = Date.now() - S.gripCmdAt < 400; }
-  drawArm(q, act);
+  poseTick(ts);
   drawOverlay();
   graspCheckInput(v);
   if (ts - lastUi < 60) return; // DOM updates at ~16 Hz

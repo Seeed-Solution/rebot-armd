@@ -91,9 +91,9 @@ try {
     await page.waitForTimeout(800);
     const early = reqs.filter((r) => r.startsWith('/assets/three') || r.startsWith('/assets/model'));
     ok(early.length === 0, `${tag} no 3D request before opening (${early.join(',')})`);
-    ok(await page.isVisible('#btn-3d'), `${tag} 3D button visible`);
+    ok(await page.isVisible('#vs-3d'), `${tag} 3D switch visible`);
 
-    await page.click('#btn-3d');
+    await page.click('#vs-3d');
     await page.waitForFunction(() => V3.renders > 0, null, { timeout: 15000 });
     await page.waitForTimeout(600);
     const st = await page.evaluate(() => ({ mode: V3.mode, status: document.getElementById('v3-status').textContent, hidden: document.getElementById('view3d').hidden }));
@@ -151,7 +151,7 @@ try {
     const still = (await page.evaluate(() => V3.renders)) - n0;
     ok(moving >= 5 && moving <= 31, `${tag} renders while moving ${moving}/s`);
     ok(still === 0, `${tag} renders while still ${still}/s`);
-    await page.click('#v3-close');
+    await page.click('#vs-video');
     ok(await page.evaluate(() => document.getElementById('view3d').hidden && V3.raf === 0), `${tag} closed, render loop stopped`);
     const noH = await page.evaluate(() => document.scrollingElement.scrollWidth <= innerWidth);
     ok(noH, `${tag} no horizontal scroll`);
