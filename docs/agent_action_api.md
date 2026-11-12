@@ -125,10 +125,10 @@ Axis-aligned boxes in the base frame that no workspace check point may enter. Th
 ## Observation rate, faults and residual torques / 观测频率、故障与残差力矩
 
 - `/api/v1/ws?obs_hz=N` (integer >= 0, clamped to 1..`control_frequency_hz`, so 0 and 1 mean 1 Hz; anything else: `400` before the upgrade) sends at most N observations per second on that connection, always the newest. Lease, ack, reject, `lease_lost` and `epoch_sync` messages are not decimated. `action` keeps the latest record and `previous_action` stays 2 s, so N ≥ 1 does not lose a terminal action state.
-- `fault`: null, or `{"code", "message", "recoverable"}` while `safety_state` is Fault or EStop (`safety_state` keeps its shape). Codes: `ESTOP`, `BUS_LOSS`, `THERMAL_TRIP`, `JOINT_LIMIT`, `WATCHDOG_TIMEOUT`, `FOLLOWING_ERROR`, `CONTROL_DEADLINE`, `INVALID_TELEMETRY`, `DRIVER_WRITE_FAILED`, `HARDWARE_FAULT`, `ENABLE_FAILED`, `SERVO_NO_BRAKE`, `HANDOVER_UNSETTLED`, `GRAVITY_COMP_FAILED`, `COLLISION`, `OTHER`. `recoverable` is true only for `WATCHDOG_TIMEOUT`, `CONTROL_DEADLINE`, `HANDOVER_UNSETTLED`; it is a hint for client policies, armd never clears a fault by itself.
+- `fault`: null, or `{"code", "message", "recoverable"}` while `safety_state` is Fault or EStop (`safety_state` keeps its shape). Codes: `ESTOP`, `BUS_LOSS`, `THERMAL_TRIP`, `JOINT_LIMIT`, `WATCHDOG_TIMEOUT`, `FOLLOWING_ERROR`, `CONTROL_DEADLINE`, `INVALID_TELEMETRY`, `DRIVER_WRITE_FAILED`, `HARDWARE_FAULT`, `ENABLE_FAILED`, `SERVO_NO_BRAKE`, `HANDOVER_UNSETTLED`, `GRAVITY_COMP_FAILED`, `COLLISION`, `OTHER`. `recoverable` is true only for `WATCHDOG_TIMEOUT`, `CONTROL_DEADLINE`, `HANDOVER_UNSETTLED`; it is a hint for client policies, armd never clears a fault by itself. In Fault / EStop, when every motor reports fresh feedback with enable state Disabled (e.g. a motor power reset during `BUS_LOSS`), `is_torqued` becomes false and the fault stays until `clear_fault`.
 - `residual_torques`: measured torque minus model gravity torque for J1..J6 (N·m), null without a gravity model or valid torque feedback (also null with the mock follower). The residual raises no fault itself; the collision guard below uses it.
 
-`?obs_hz=N` 限制该连接每秒最多 N 条观测（取 1..`control_frequency_hz`），租约、应答、拒绝、`lease_lost`、`epoch_sync` 不降频。`fault` 在 Fault / EStop 时为 `{code, message, recoverable}`，否则为 null；`recoverable` 仅对 `WATCHDOG_TIMEOUT`、`CONTROL_DEADLINE`、`HANDOVER_UNSETTLED` 为 true，只是给客户端的提示，armd 不会自行清除故障。`residual_torques` 为 J1..J6 实测力矩减模型重力力矩，无重力模型或无有效力矩反馈时为 null，本身不触发故障，碰撞保护（见下）使用它。
+`?obs_hz=N` 限制该连接每秒最多 N 条观测（取 1..`control_frequency_hz`），租约、应答、拒绝、`lease_lost`、`epoch_sync` 不降频。`fault` 在 Fault / EStop 时为 `{code, message, recoverable}`，否则为 null；`recoverable` 仅对 `WATCHDOG_TIMEOUT`、`CONTROL_DEADLINE`、`HANDOVER_UNSETTLED` 为 true，只是给客户端的提示，armd 不会自行清除故障。Fault / EStop 期间若所有电机反馈新鲜且使能状态为 Disabled（例如 `BUS_LOSS` 期间电机掉电复位），`is_torqued` 变为 false，故障保持到 `clear_fault`。`residual_torques` 为 J1..J6 实测力矩减模型重力力矩，无重力模型或无有效力矩反馈时为 null，本身不触发故障，碰撞保护（见下）使用它。
 
 ## Collision guard / 碰撞保护
 
@@ -145,6 +145,19 @@ Contact detection with a protective stop, built on `residual_torques` (capabilit
 Client pattern: on an action failing with `COLLISION`, wait until `collision.active` is false (raise if `fault.code` is `COLLISION`), then retry the step once; on escalation stop.
 
 基于 `residual_torques` 的接触检测与保护性停止（能力 `collision_guard`：profile 有重力模型且驱动报告力矩）。它是接触检测，不是经过认证的安全功能；默认阈值在真机实测前为占位值，因此**默认关闭**；阈值须来自 rebot-sysid。`collision.rest_exempt_joints` 中的关节（缺省时取 `resting_pose.support_torque_limits` 的关节；B601-DM 为 J2、J3、J4）在收纳位姿不参与检测。完整规则见 `docs/control_safety_contract.md`“碰撞保护”。profile 段 `collision` 字段同上；`GET /api/v1/safety/collision`（无需租约）返回含缩放后阈值的生效配置；WS 指令 `/api/v1/safety/collision`（需租约）设置 `enabled` 与 `sensitivity`（low / medium / high，阈值乘以 1.5 / 1.0 / 0.7），写入 `ARMD_COLLISION`（默认 `/userdata/rebot-teleop/collision.json`），下次启动加载；关闭保护会立即结束保持。触发后正在执行的动作以 `COLLISION` 失败，机械臂在实测位置保持力矩，`safety_state` 不变；保持期间运动类指令返回 `409 COLLISION_HOLD`，急停、停止、`clear_fault`、断力矩仍可用；可以进入重力补偿，进入时保持结束。残差低于 `clear_ratio` × 阈值持续 `resume_after_s` 后自动恢复；`escalate_window_s` 内第 `max_auto_resumes`+1 次触发锁存 Fault `COLLISION`，须 `clear_fault`。观测字段 `collision` 结构见上。
+
+## Torque guard / 力矩保护
+
+A joint whose measured |torque| stays at or above `ratio` × its TMAX (`damiao_ranges[j].t_max`) for `persist_ms` stops the motion (capability `torque_guard`, capabilities version 8; profile section `torque_guard`, absent = off). B601-DM: `ratio` 0.60, `persist_ms` 100, J1–J6 watched: 16.8 N·m on J1–J3, 6.0 N·m on J4–J6; the gripper is not watched. 0.60 was set on 2026-11-12 for the 24 V 6.5 A supply in use; 0.85 is the value intended with a 14.6 A supply. Full rules: `docs/control_safety_contract.md` "Torque guard".
+
+- `schema.torque_guard`: `{"ratio", "persist_ms", "thresholds_nm": [per joint, null = not watched], "release_rad"}`; `GET /api/v1/safety/describe` lists it as `torque_limit_hold`.
+- Trip (torqued, Armed / Moving, position control; not in gravity compensation or the park settle phase): the running action (planned motion, Cartesian action, macro, replay, park) ends `failed` with code `TORQUE_LIMIT` (message names the joint, torque and threshold); every motion ends; J1–J6 hold the measured pose with torque on, the gripper keeps its command. `safety_state` does not change, no Fault.
+- `motion_limit` = `{"reason": "torque", "joint": <0-based>, "since_ms"}` while the hold lasts.
+- While held: servo frames and jog / joint_move / home targets that move the held joint further in the push direction (sign of the torque at the trip) are clamped to the hold position for that joint, the other joints follow; moves the other way pass. The hold ends when the joint is 0.05 rad from the hold position with |torque| below the threshold, or on torque off, E-stop, Fault or gravity-compensation entry.
+
+Client pattern: on `TORQUE_LIMIT`, do not retry the same goal; move the named joint back (opposite to the direction it was moving) and re-plan.
+
+关节实测 |力矩| ≥ `ratio` × 该关节 TMAX（`damiao_ranges[j].t_max`）持续 `persist_ms` 时停止运动（能力 `torque_guard`，能力版本 8；profile 段 `torque_guard`，缺省为关闭）。B601-DM：`ratio` 0.60、`persist_ms` 100，检测 J1–J6：J1–J3 16.8 N·m，J4–J6 6.0 N·m；夹爪不检测。0.60 于 2026-11-12 按当前 24 V 6.5 A 电源设定，配 14.6 A 电源时预期值为 0.85。完整规则见 `docs/control_safety_contract.md`「力矩保护」。`schema.torque_guard` 结构见上，`GET /api/v1/safety/describe` 中为 `torque_limit_hold`。触发（力矩开启、Armed / Moving、位置控制；重力补偿和收纳稳定阶段不检测）后正在执行的动作（规划运动、笛卡尔动作、宏动作、回放、收纳）以 `TORQUE_LIMIT` 失败，所有运动结束，J1–J6 在实测位置保持力矩，夹爪指令不变，`safety_state` 不变，不锁存 Fault；保持期间 `motion_limit` 为 `{"reason": "torque", "joint", "since_ms"}`。保持期间 servo 帧与 jog / joint_move / home 目标若使该关节继续朝施力方向（触发时力矩的符号）越过保持位置，该关节被限制在保持位置，其他关节照常；反方向运动照常通过。关节离开保持位置 0.05 rad 且 |力矩| 低于阈值，或断力矩、急停、Fault、进入重力补偿时保持结束。客户端做法：收到 `TORQUE_LIMIT` 不要重试同一目标，先把该关节反向移出再重新规划。
 
 ## Safety self-description / 安全自描述
 
@@ -475,7 +488,7 @@ SG2002 上电原因 `reset_reason`）；`blackbox?seconds=N` 返回本次启动�
 | `POSE_NOT_FOUND` | 404 |
 | `GRAVITY_COMP_NOT_STATIONARY`, `GRAVITY_COMP_JOINT_LIMIT`, `GRAVITY_COMP_SWITCH_FAILED`, `FEEDBACK_STALE`, `LEASE_REQUIRED` (gravity compensation entry) | 409 |
 
-Codes that only appear in `action.code`: `COLLISION`, `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `ESTOP_ACTIVE`, `FAULT`, `WATCHDOG`, `LEASE_LOST`, `STOPPED`, `SUPERSEDED`, `UNLOAD_FAILED`; for `grasp` also `TARGET_LOST`, `TARGET_DISPLACED`, `CENTRING_FAILED`, `NOT_HOLDING`, `GRASP_TIMEOUT`, `DETECTION_UNAVAILABLE`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a later phase; for `place` also `PLACE_TIMEOUT`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a re-planned phase.
+Codes that only appear in `action.code`: `COLLISION`, `TORQUE_LIMIT`, `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `ESTOP_ACTIVE`, `FAULT`, `WATCHDOG`, `LEASE_LOST`, `STOPPED`, `SUPERSEDED`, `UNLOAD_FAILED`; for `grasp` also `TARGET_LOST`, `TARGET_DISPLACED`, `CENTRING_FAILED`, `NOT_HOLDING`, `GRASP_TIMEOUT`, `DETECTION_UNAVAILABLE`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a later phase; for `place` also `PLACE_TIMEOUT`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a re-planned phase.
 
 ## Needs verification on the device / 需实机核实
 
