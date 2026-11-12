@@ -270,6 +270,9 @@ impl SupervisorInner {
         config.validate().expect("Invalid ArmConfig: invariant violation");
         let dof = config.dof;
         let collision_policy = config.collision.unwrap_or_default();
+        // power planning: build the dynamics chain now (the built-in model parses the embedded
+        // URDF once), not on the first planned motion
+        if config.power_budget.as_ref().is_some_and(|b| b.enabled && b.planning.enabled) { let _ = config.arm_model.dynamics_chain(); }
         let positions = config.home_positions.clone();
         let target_positions = positions.clone();
         let lease_timeout = Duration::from_millis(config.lease_timeout_ms);

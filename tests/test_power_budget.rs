@@ -559,7 +559,13 @@ fn bisection_finds_the_largest_scale_that_fits() {
     let s = quintic_samples(&b.planning, &traj, 6);
     let t0 = std::time::Instant::now();
     let fit = plan_scale(&b, &arm, &s).unwrap();
-    let us = t0.elapsed().as_secs_f64() * 1e6;
+    let mut us = t0.elapsed().as_secs_f64() * 1e6;
+    // warm (the first call may build the built-in dynamics chain from the embedded URDF)
+    let t1 = std::time::Instant::now();
+    for _ in 0..20 { plan_scale(&b, &arm, &quintic_samples(&b.planning, &traj, 6)).unwrap(); }
+    let warm = t1.elapsed().as_secs_f64() * 1e6 / 20.0;
+    eprintln!("planning cost: first call {us:.0} µs, warm {warm:.0} µs (sampling + RNEA + bisection)");
+    us = warm;
     eprintln!("stretched J2 swing -1 rad in {:.2} s: full speed {:.2} A, limit {:.2} A -> scale {:.3} ({:.2} s), peak {:.2} A; {} samples, {us:.0} µs",
         traj.duration, fit.peak_full_a, fit.limit_a, fit.scale, traj.duration / fit.scale, fit.peak_a, fit.samples);
     assert!(fit.peak_full_a > fit.limit_a && fit.scale < 1.0 && fit.scale > b.planning.min_scale);

@@ -624,6 +624,13 @@ impl SupervisorInner {
         };
         let full = traj.duration;
         let zeros = vec![0.0; target.len()];
+        // from rest the longer quintic is an exact time scaling of this one: no re-check
+        if v0.iter().all(|v| v.abs() < 1e-6) {
+            let t2 = crate::trajectory::TrajectoryPlanner::plan(start, v0, target, &zeros, Some(full / s), limits)?;
+            let scale = full / t2.duration;
+            tracing::debug!("Power planning (joint move): scale {scale:.3}, {:.2} s -> {:.2} s, {} µs", full, t2.duration, t0.elapsed().as_micros());
+            return Ok((t2, Some(scale)));
+        }
         // with a start velocity the longer quintic is not an exact time scaling: re-check it
         let mut best = None;
         for _ in 0..6 {
