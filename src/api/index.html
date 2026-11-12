@@ -1043,8 +1043,6 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   }
   body.ui-simple .view-switch button[aria-checked="false"] { color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.4); }
   body.ui-simple.v3-open .view-switch button[aria-checked="false"] { color: #1f2937; text-shadow: none; }
-  /* 3D view open: the joysticks, sliders and preset buttons step aside; the safety capsule stays */
-  body.ui-simple.v3-open .cockpit > :not(#ck-safety) { visibility: hidden; }
   /* pose card: below the view switch; its canvas shrinks so the card ends above the left joystick */
   body.ui-simple .pose-card {
     --pc-top: calc(8px + var(--safety-h, 50px) + 6px + 32px + 6px);
@@ -7064,7 +7062,7 @@ function v3Toggle(open) {
   $('view3d').hidden = !open;
   document.body.classList.toggle('v3-open', open);
   for (const [id, on] of [['vs-video', !open], ['vs-3d', open]]) { const b = $(id); b.setAttribute('aria-checked', String(on)); b.tabIndex = on ? 0 : -1; }
-  if (open) { if (S.ui === 'simple') releaseAll(); v3Start(); } // simple: the sticks are hidden under the 3D view
+  if (open) v3Start(); // the joysticks and sliders stay on top and keep working; the view rotates outside them
   else { cancelAnimationFrame(V3.raf); V3.raf = 0; }
 }
 // height of the safety card, for the simple-mode overlay layout (view switch and pose card sit below it)

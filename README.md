@@ -435,8 +435,8 @@ the header).
   differ), a floor grid, the workspace box, keep-out boxes (`GET /api/v1/workspace/keepout`) and
   stored poses as orange dots. On opening, the camera aims at the robot's bounding box in the
   current pose so that it fills about 75 % of the narrower side. Drag to rotate, pinch or scroll
-  to zoom. In simple mode on a landscape screen the joysticks, sliders and preset buttons are
-  hidden while the 3D view is open; Enable and E-stop stay. J1–J6 use the motor angle
+  to zoom. The joysticks, sliders and buttons stay on top of the 3D view and keep
+  controlling the arm; dragging outside them rotates the view. J1–J6 use the motor angle
   as the URDF angle; J7 is mapped to the finger travel (0–42.5 mm) between `gripper_policy`
   `closed_rad` and `open_rad`. armd serves the URDF and meshes read-only from the asset directory
   (`assets/`, else `/usr/share/rebot-teleop/assets/`, or `ARMD_ASSET_DIR`) at `/assets/model/`;

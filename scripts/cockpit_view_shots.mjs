@@ -133,9 +133,11 @@ try {
       return { w: (x1 - x0) / 2, h: (y1 - y0) / 2 };
     });
     ok(Math.max(fill.w, fill.h) > 0.45, `${tag} robot box spans ${JSON.stringify(fill)} of the view`);
-    // simple overlay layout (landscape): the joystick overlays step aside; portrait keeps them below the stage
-    const overlay = ui === 'simple' && viewport.width > viewport.height;
-    if (overlay) for (const s of STICKS) ok(!(await visible(page, s)), `${tag} ${s} hidden in 3D`);
+    // the joysticks and sliders stay usable in 3D: same visibility as with the video, and on top of the 3D canvas
+    if (ui === 'simple') for (const s of STICKS) {
+      ok((await visible(page, s)) === sticksBefore[s], `${tag} ${s} same visibility in 3D`);
+      if (sticksBefore[s]) ok(await onTop(page, s), `${tag} ${s} on top of the 3D view`);
+    }
     if (ui === 'simple') {
       ok(await visible(page, '#btn-estop') && await onTop(page, '#btn-estop'), `${tag} E-stop visible in 3D`);
       ok(await visible(page, '#btn-enable'), `${tag} enable visible in 3D`);
