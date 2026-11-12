@@ -40,7 +40,7 @@ const srv = http.createServer((req, res) => {
     if (lite || rel.includes('..') || !fs.existsSync(f) || !fs.statSync(f).isFile()) { res.writeHead(404); res.end(); return; }
     res.writeHead(200); res.end(fs.readFileSync(f)); return;
   }
-  if (u === '/api/v1/observation/schema') return json({ dof: 7, limits: LIMITS, workspace: WS, capabilities: { version: 6, poses: true, fault_codes: true } });
+  if (u === '/api/v1/observation/schema') return json({ dof: 7, limits: LIMITS, workspace: WS, capabilities: { version: 6, poses: true, fault_codes: true }, model_joint_map: JOINT_MAP });
   if (u === '/api/v1/workspace/keepout') return json(KEEPOUT);
   if (u === '/api/v1/poses') return json({ poses: POSES });
   res.writeHead(404); res.end();
@@ -52,6 +52,9 @@ let bad = 0, checks = 0;
 const ok = (c, m) => { checks++; if (!c) { bad++; console.log('  FAIL ' + m); } };
 const shots = [];
 const Q = [0, -1.167, -1.565, 1.435, 0, 1.5708, -2.85];
+const HOME = [0, 0, 0, 0, 0, 1.5707963, 0];
+// armd schema model_joint_map of the B601-DM: URDF J6 = motor J6 - pi/2
+const JOINT_MAP = [0, 0, 0, 0, 0, -Math.PI / 2].map((o) => ({ sign: 1, offset_rad: o }));
 const QC = [0.35, -1.0, -1.3, 1.2, 0, 1.5708, -2.85]; // commanded: ghost differs from measured
 
 const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROME || undefined, args: ['--enable-unsafe-swiftshader', '--use-angle=swiftshader'] });
@@ -79,10 +82,11 @@ try {
       });
       P.feed = setInterval(() => {
         const t = (Date.now() - P.t0) / 1000;
-        const q = P.moving ? Q.map((v, i) => (i === 0 ? v + 0.3 * Math.sin(t * 2) : v)) : Q;
+        const q = P.home ? HOME : P.moving ? Q.map((v, i) => (i === 0 ? v + 0.3 * Math.sin(t * 2) : v)) : Q;
         const o = { timestamp: t, positions: q, velocities: q.map(() => 0), commanded_positions: QC, safety_state: 'Armed', enable_state: 'Enabled', is_torqued: true,
           feedback_age_ms: q.map(() => 5), torques: q.map(() => 0.5), temperatures: q.map(() => 35), epoch_id: 1, lease_holder: null,
           driver_capabilities: { velocity_feedback: true, torque_feedback: true, temperature_feedback: true }, motion_limit: null, motor_errors: [], action: null, fault: null };
+        if (P.home) o.commanded_positions = HOME;
         try { ws.send(JSON.stringify(o)); } catch (_) {}
       }, 20);
     });
@@ -141,6 +145,28 @@ try {
     await page.evaluate(() => { V3.key = ''; });
     await page.waitForTimeout(300);
     const f = path.join(out, `view3d_${tag}.png`); await page.screenshot({ path: f }); shots.push(f);
+    // profile home (motor J6 = pi/2): the jaw axis (end_link y) is horizontal and end_link +z (the
+    // camera side) points up, as on the real arm at rest; URDF joint6 is 0 there
+    P.home = true; await page.waitForTimeout(300);
+    const home = await page.evaluate(() => {
+      V3.key = '';
+      const m = (o) => { o.updateMatrixWorld(true); const e = o.matrixWorld.elements; return [[e[0], e[4], e[8]], [e[1], e[5], e[9]], [e[2], e[6], e[10]]]; };
+      const w = m(V3.root), a = V3.solid.obj.links ? m(V3.solid.obj.links.end_link) : null;
+      // end_link axes in the root (base_link) frame: R_root^T R_end
+      const col = (R, k) => [R[0][k], R[1][k], R[2][k]];
+      const inRoot = (v) => [0, 1, 2].map((i) => w[0][i] * v[0] + w[1][i] * v[1] + w[2][i] * v[2]);
+      return { j6: V3.solid.obj.joints ? V3.solid.obj.joints.joint6.angle : null, y: a && inRoot(col(a, 1)), z: a && inRoot(col(a, 2)), off: CFG.cart.off.slice() };
+    });
+    ok(Math.abs(home.off[5] - Math.PI / 2) < 1e-12, `${tag} joint map from the schema: motor J6 offset ${home.off[5]}`);
+    if (!lite) {
+      ok(Math.abs(home.j6) < 1e-6, `${tag} home: URDF joint6 ${home.j6}`);
+      ok(Math.abs(home.y[2]) < 1e-3 && Math.abs(home.y[1]) > 0.9999, `${tag} home: jaw axis horizontal ${JSON.stringify(home.y)}`);
+      ok(home.z[2] > 0.9999, `${tag} home: end_link +z up ${JSON.stringify(home.z)}`);
+      console.log(`  ${tag} home end_link y ${home.y.map((v) => v.toFixed(4))}, z ${home.z.map((v) => v.toFixed(4))}`);
+    }
+    await page.waitForTimeout(200);
+    const fh = path.join(out, `view3d_home_${tag}.png`); await page.screenshot({ path: fh }); shots.push(fh);
+    P.home = false; await page.waitForTimeout(300);
 
     // render rate: moving <= ~30 fps, still -> no renders
     P.moving = true; await page.waitForTimeout(300);

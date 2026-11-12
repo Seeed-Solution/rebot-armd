@@ -2371,17 +2371,20 @@ CFG.cart = {
   tailMs: 300,                // keep streaming this long after the last change
   settleMs: 2000,             // ... and while the arm is still converging, up to this long
   tx: QS.get('tx') === 'rest' ? 'rest' : 'ws', // ws = cartesian_joint_stream frames, rest = /motion/servo
-  // motor rad = sign * model rad + offset, J1..J4. Model = URDF joint angles.
-  // Override with ?iksign=1,1,1,1&ikoff=0,0,0,0 (offset in degrees).
-  sign: [1, 1, 1, 1],
-  off: [0, 0, 0, 0],
+  // motor rad = sign * model rad + offset, J1..J6. Model = URDF joint angles. Set from the schema's
+  // model_joint_map (armd: model = s * motor + o, so sign = s, off = -s * o); the defaults are the
+  // B601-DM values (J6: URDF angle = motor angle - pi/2). J1..J4 can be overridden with
+  // ?iksign=1,1,1,1&ikoff=0,0,0,0 (offset in degrees).
+  sign: [1, 1, 1, 1, 1, 1],
+  off: [0, 0, 0, 0, 0, Math.PI / 2],
 };
-(() => {
+function cartUrlMap() {
   const sg = (QS.get('iksign') || '').split(',').map(Number);
-  if (sg.length === 4 && sg.every((x) => x === 1 || x === -1)) CFG.cart.sign = sg;
+  if (sg.length === 4 && sg.every((x) => x === 1 || x === -1)) CFG.cart.sign.splice(0, 4, ...sg);
   const of = (QS.get('ikoff') || '').split(',').map(Number);
-  if (of.length === 4 && of.every(Number.isFinite)) CFG.cart.off = of.map((d) => d / 180 * Math.PI);
-})();
+  if (of.length === 4 && of.every(Number.isFinite)) CFG.cart.off.splice(0, 4, ...of.map((d) => d / 180 * Math.PI));
+}
+cartUrlMap();
 // camera-view cartesian frame (7-DOF arm only). camFlip / camRotDeg tune the camera mount on the real arm
 // (?camflip=1 flips the image vertical, ?camrot=<deg> adds a roll about the optical axis).
 CFG.view = {
@@ -3728,9 +3731,9 @@ const calEih = () => CAL.mode === 'eye_in_hand';
 const calMin = () => (calEih() ? 5 : 3);
 // eye_in_hand quality limits: position RMSE 5 mm, rotation RMSE 1 deg; eye_to_hand: point RMSE 10 mm
 const calWarn = (r) => (r.rotRmse != null ? r.rmse > 0.005 || r.rotRmse > 1 : r.rmse > 0.01);
-// T_base_gripper from raw motor positions: J1..J4 through toModel (CFG.cart sign / offset), index 4 = URDF
-// joint5 and, on 7-DOF arms, index 5 = URDF joint6, 1:1 (index 5 is the gripper on 6-DOF arms)
-const calGripper = (pos) => CALM.fk([...toModel(pos), pos[4] || 0, S.dof === 7 ? pos[5] || 0 : 0]);
+// T_base_gripper from raw motor positions through toModel6 (CFG.cart sign / offset, J1..J6); on 6-DOF
+// arms index 5 is the gripper and URDF joint6 stays at 0
+const calGripper = (pos) => { const q = toModel6(pos); if (S.dof !== 7) q[5] = 0; return CALM.fk(q); };
 /* CALIB-MATH-BEGIN */
 // Pure hand-eye calibration math: no DOM and no page state. scripts/calib_selftest.mjs evaluates this
 // block in Node and checks it against the rebot-companion SDK. 4x4 transforms are row-major nested
@@ -4093,9 +4096,10 @@ const VIK = (() => {
   }
 
   // camera mount R_end_cam (nested 3x3): z_cam = end_link x; y_cam = flip * J5 axis seen in end_link at
-  // q6 = pi/2 (x part removed); x_cam = y_cam x z_cam; then rotDeg about the optical axis.
-  function camMount(flip, rotDeg) {
-    const f = frames([0, 0, 0, 0, 0, Math.PI / 2]);
+  // the model angles qRef (default: the B601-DM rest angle of J6, motor pi/2 = model 0; x part removed);
+  // x_cam = y_cam x z_cam; then rotDeg about the optical axis. armd kinematics::cam_mount_with.
+  function camMount(flip, rotDeg, qRef = [0, 0, 0, 0, 0, 0]) {
+    const f = frames(qRef);
     const aEnd = mv([f.R[0], f.R[3], f.R[6], f.R[1], f.R[4], f.R[7], f.R[2], f.R[5], f.R[8]], f.a[4]); // R^T a
     const y = unit([0, aEnd[1] * (flip ? -1 : 1), aEnd[2] * (flip ? -1 : 1)]), z = [1, 0, 0], x = cross(y, z);
     let R = [x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2]];
@@ -4344,10 +4348,21 @@ function initCalib() {
   i18nHooks.push(() => { if (!$('calib').hidden) calRender(); });
 }
 
+// schema model_joint_map (armd: model = sign * motor + offset_rad) -> CFG.cart (motor = sign * model + off);
+// the ?iksign / ?ikoff URL overrides still win for J1..J4
+function applyJointMap(map) {
+  const ok = map.slice(0, 6).every((m) => m && (m.sign === 1 || m.sign === -1) && Number.isFinite(m.offset_rad));
+  if (!ok) return;
+  for (let i = 0; i < 6; i++) { CFG.cart.sign[i] = map[i].sign; CFG.cart.off[i] = -map[i].sign * map[i].offset_rad; }
+  cartUrlMap();
+  camMountNow();
+  V3.key = ''; PCARD.key = '';
+}
 async function loadSchema() {
   try {
     const sc = await api('/api/v1/observation/schema', undefined, { quiet: true, method: 'GET' });
     if (sc) { S.caps = sc.capabilities || {}; S.wsPolicy = sc.workspace || null; S.home = Array.isArray(sc.home_positions) ? sc.home_positions : null; colOnCaps(); posesOnCaps(); epOnCaps(); V3.sceneAt = 0; }
+    if (sc && Array.isArray(sc.model_joint_map) && sc.model_joint_map.length >= 6) applyJointMap(sc.model_joint_map);
     if (sc && Array.isArray(sc.limits) && sc.limits.length) {
       const oldDof = S.dof;
       S.limits = sc.limits;
@@ -4779,7 +4794,11 @@ function toastOnce(e) { if (Date.now() - lastErrAt > 2000) { lastErrAt = Date.no
    5-DOF cartesian teleop: XYZ + wrist pitch -> client IK -> joint stream
    ================================================================= */
 const toModel = (pos) => [0, 1, 2, 3].map((i) => (pos[i] - CFG.cart.off[i]) / CFG.cart.sign[i]);
-const toMotor = (q) => q.map((x, i) => (CFG.cart.sign[i] ?? 1) * x + (CFG.cart.off[i] ?? 0));
+// J1..J4 only; further entries (presets: J5, J6, gripper) are motor angles and pass through
+const toMotor = (q) => q.map((x, i) => (i < 4 ? CFG.cart.sign[i] * x + CFG.cart.off[i] : x));
+// motor J1..J6 (missing = 0) <-> model J1..J6
+const toModel6 = (pos) => [0, 1, 2, 3, 4, 5].map((i) => ((Number(pos[i]) || 0) - CFG.cart.off[i]) / CFG.cart.sign[i]);
+const toMotor6 = (q) => [0, 1, 2, 3, 4, 5].map((i) => CFG.cart.sign[i] * q[i] + CFG.cart.off[i]);
 function inMotorLimits(q) {
   const m = toMotor(q);
   const curM = (S.obs && Array.isArray(S.obs.positions)) ? S.obs.positions : null;
@@ -4811,7 +4830,7 @@ function cartSync(pos) {
   C.goal = { ...C.cmd };
   C.j5 = pos[4] ?? 0;
   C.branch = null;
-  if (pos.length >= 6) { C.q6 = [...C.q, pos[4], pos[5]]; C.T = C.Tg = VIK.fk(C.q6); }
+  if (pos.length >= 6) { C.q6 = toModel6(pos); C.T = C.Tg = VIK.fk(C.q6); }
   C.wq = [0, 0];
 }
 // drop queued motion: the goal snaps back to the last solved pose (both frames)
@@ -5070,20 +5089,21 @@ function cartTick() {
   t = t.map((x, i) => clamp(x, pos[i] - (i === GRIP ? CFG.gripLead : CFG.maxLead), pos[i] + (i === GRIP ? CFG.gripLead : CFG.maxLead)));
   if (now <= C.tailUntil || (settling && converging)) { C.sending = true; if (!S.presetRunning) cartSend(t); }
 }
-CFG.view.Rec = VIK.camMount(CFG.view.camFlip, CFG.view.camRotDeg);
-// model-space limits for J1..J6: motor soft limits minus the margin, J1..J4 through sign / offset
+// camera mount at the J6 rest angle (motor pi/2), recomputed when the schema brings the joint map
+const camMountNow = () => { CFG.view.Rec = VIK.camMount(CFG.view.camFlip, CFG.view.camRotDeg, toModel6([0, 0, 0, 0, 0, Math.PI / 2])); };
+camMountNow();
+// model-space limits for J1..J6: motor soft limits minus the margin, through sign / offset
 function modelLimits6() {
   const lo = [], hi = [];
   for (let i = 0; i < 6; i++) {
     const L = S.limits[i];
     if (!L) { lo.push(-Infinity); hi.push(Infinity); continue; }
     let a = L.min_position + CFG.limitMargin, b = L.max_position - CFG.limitMargin;
-    if (i < 4) { a = (a - CFG.cart.off[i]) / CFG.cart.sign[i]; b = (b - CFG.cart.off[i]) / CFG.cart.sign[i]; }
+    a = (a - CFG.cart.off[i]) / CFG.cart.sign[i]; b = (b - CFG.cart.off[i]) / CFG.cart.sign[i];
     lo.push(Math.min(a, b)); hi.push(Math.max(a, b));
   }
   return { lo, hi };
 }
-const toMotor6 = (q) => [...toMotor(q.slice(0, 4)), q[4], q[5]];
 // Camera-view frame: left stick = forward (optical axis) / strafe (image x), lift = world Z, both through
 // the 6-joint IK with the orientation held; right stick = wrist only: up / down drives J4, left / right
 // drives J5 as joint velocities (J1..J3 and J6 stay put). Same guards as cartTick.
@@ -6608,9 +6628,9 @@ function drawAruco(g, d, rect, alpha, color) {
 const PCARD = { cv: $('pose-canvas'), g: null, last: 0, key: '', win: null, q: null, c: null, draws: 0, hot: [], ghost: false, collapsed: store('rebot.poseCard') === '0' };
 PCARD.g = PCARD.cv.getContext('2d');
 const PCARD_EPS = 0.00175;
-// planar points [x along the arm's heading, z] for model angles q: base, J1..J6 origins, end_link; plus the tool axis
+// planar points [x along the arm's heading, z] for motor angles q: base, J1..J6 origins, end_link; plus the tool axis
 function posePlanar(q) {
-  const qq = Array.from({ length: 6 }, (_, i) => Number(q[i]) || 0);
+  const qq = toModel6(q);
   const f = VIK.frames(qq), c = Math.cos(qq[0]), s = Math.sin(qq[0]);
   const pl = (p) => [p[0] * c + p[1] * s, p[2]];
   const ax = pl([f.R[0], f.R[3], f.R[6]]);
@@ -7346,7 +7366,8 @@ function v3Robot(T, urdf, man, ghost) {
   return Promise.resolve({
     obj: robot,
     set(q) {
-      for (let i = 0; i < 6; i++) robot.setJointValue('joint' + (i + 1), Number(q[i]) || 0);
+      const m = toModel6(q);
+      for (let i = 0; i < 6; i++) robot.setJointValue('joint' + (i + 1), m[i]);
       if (q.length > 6) { const d = gripFrac(q[6]) * V3_FINGER_M; robot.setJointValue('left_finger_joint', d); robot.setJointValue('right_finger_joint', d); }
     },
     end() { const v = robot.links.end_link.getWorldPosition(new T.Vector3()); V3.root.worldToLocal(v); return [v.x, v.y, v.z]; },
@@ -7364,7 +7385,7 @@ function v3Stick(T, ghost) {
   return {
     obj,
     set(q) {
-      const f = VIK.frames(q.slice(0, 6).map((v) => Number(v) || 0));
+      const f = VIK.frames(toModel6(q));
       const pts = [[0, 0, 0], ...f.o, f.p];
       pts.forEach((p, i) => balls[i].position.set(p[0], p[1], p[2]));
       for (let i = 0; i < 7; i++) {
@@ -7721,7 +7742,7 @@ function renderCart(live, op) {
   // readouts from the full FK of the commanded joints: view = solved pose, base = IK J1..J4 + J5 + measured J6
   const view = viewActive();
   const pos6 = S.obs && S.obs.positions;
-  const T = view ? C.T : (C.cmd && C.q ? VIK.fk([...C.q, C.j5, (pos6 && pos6[5]) || 0]) : null);
+  const T = view ? C.T : (C.cmd && C.q ? VIK.fk(toModel6([...toMotor(C.q), C.j5, (pos6 && pos6[5]) || 0])) : null);
   const p = T ? { x: T[0][3], y: T[1][3], z: T[2][3], pitch: Math.asin(clamp(-T[2][0], -1, 1)), yaw: Math.atan2(T[1][0], T[0][0]) } : null;
   const mm = (m) => (m >= 0 ? '+' : '−') + Math.abs(m * 1000).toFixed(1);
   setText($('c-x'), p ? mm(p.x) : '--'); setText($('c-y'), p ? mm(p.y) : '--');
@@ -7730,7 +7751,7 @@ function renderCart(live, op) {
   setText($('c-r'), R == null ? '--' : Math.round(R * 1000) + ' mm');
   $('c-rfill').style.width = (clamp(frac, 0, 1) * 100).toFixed(1) + '%';
   setCls($('c-reach'), 'reach' + (frac > 1 ? ' bad' : frac > 0.92 ? ' warn' : ''));
-  setText($('c-r5'), !live ? '--' : view ? (C.q6 ? fmtDeg(C.q6[5]) + '°' : '--') : fmtDeg(C.j5) + '°');
+  setText($('c-r5'), !live ? '--' : view ? (C.q6 ? fmtDeg(toMotor6(C.q6)[5]) + '°' : '--') : fmtDeg(C.j5) + '°');
   setText($('c-yaw'), p ? fmtDeg(p.yaw) + '°' : '--');
   const bad = C.status !== 'ok' && C.status !== 'idle';
   const badge = $('ik-badge');
