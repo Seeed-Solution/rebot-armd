@@ -32,6 +32,8 @@ struct ArmState {
     /// Report rigid-body torques (RNEA of the commanded motion) instead of gravity only.
     dynamic: bool,
     a: [f32; 7],
+    /// Reported feedback age of every joint (ms).
+    age_ms: u64,
 }
 
 /// Ideal position servo: follows the commanded position and velocity, reports the built-in
@@ -51,7 +53,7 @@ impl ArmDriver for SimArm {
     fn enable_state(&self) -> EnableState { if self.0.lock().unwrap().torqued { EnableState::Enabled } else { EnableState::Disabled } }
     fn is_feedback_valid(&self) -> bool { true }
     fn is_enabled(&self) -> bool { self.0.lock().unwrap().torqued }
-    fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::from_millis(self.0.lock().unwrap().age_ms)); 7] }
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         let s = self.0.lock().unwrap();
         let g: [f32; 6] = if s.dynamic {
@@ -285,6 +287,28 @@ fn observation_carries_the_filtered_estimate() {
     let (mut inner, _) = rig_at(cfg, INSPECT);
     assert!(ticks(&mut inner, 2).power.is_none());
     assert_eq!(inner.power_diagnostics()["enabled"], false);
+}
+
+/// Damiao feedback ages of 100-250 ms are common on the arm: the meter keeps the last estimate
+/// through such gaps and only goes invalid after `STALE_HOLD_S` without fresh feedback.
+#[test]
+fn short_stale_feedback_keeps_the_estimate() {
+    let (mut inner, arm) = rig_at(ArmConfig::rebot_dm(), INSPECT);
+    let before = power(&ticks(&mut inner, 30));
+    assert!(before.valid && before.bus_a > 0.0);
+    arm.with(|s| s.age_ms = 150);
+    let hold_ticks = (armd::power::STALE_HOLD_S as f64 / DT) as usize - 2;
+    let p = power(&ticks(&mut inner, hold_ticks));
+    assert!(p.valid && p.bus_a == before.bus_a, "held through {hold_ticks} stale ticks: {p:?}");
+    arm.with(|s| s.age_ms = 0);
+    assert!(power(&ticks(&mut inner, 1)).valid);
+    // a gap longer than the hold: invalid, then the filters restart from fresh feedback
+    arm.with(|s| s.age_ms = 150);
+    let p = power(&ticks(&mut inner, hold_ticks + 4));
+    assert!(!p.valid && p.bus_a == 0.0, "{p:?}");
+    arm.with(|s| s.age_ms = 0);
+    let p = power(&ticks(&mut inner, 1));
+    assert!(p.valid && p.bus_a > 0.0);
 }
 
 #[tokio::test]
