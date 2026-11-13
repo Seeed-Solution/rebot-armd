@@ -119,7 +119,17 @@ impl SimCamera {
         Some(((a + 90.0).rem_euclid(180.0) - 90.0, conf))
     }
 
+    /// The detector's box: [`Self::project_box_whole`] clamped to the image; None when less
+    /// than 4 px of it is inside the image along either axis.
     fn project_box(&self, pose: &Pose) -> Option<[f64; 4]> {
+        let [x0, y0, x1, y1] = self.project_box_whole(pose)?;
+        let [w, h] = self.cam.size;
+        if x1.min(w) - x0.max(0.0) < 4.0 || y1.min(h) - y0.max(0.0) < 4.0 { return None; }
+        Some([(x0 / w).clamp(0.0, 1.0), (y0 / h).clamp(0.0, 1.0), (x1 / w).clamp(0.0, 1.0), (y1 / h).clamp(0.0, 1.0)])
+    }
+
+    /// The object's whole image box (px), also past the image border.
+    fn project_box_whole(&self, pose: &Pose) -> Option<[f64; 4]> {
         let o = &self.object;
         let sh = *self.shift.lock().unwrap();
         let half = if self.turned.load(Ordering::SeqCst) { [o.half[1], o.half[0]] } else { o.half };
@@ -130,10 +140,7 @@ impl SimCamera {
             let p = self.cam.project(pose, &[o.centre[0] + sx * o.half[0], o.centre[1] + sy * o.half[1], z])?;
             x0 = x0.min(p[0]); y0 = y0.min(p[1]); x1 = x1.max(p[0]); y1 = y1.max(p[1]);
         }}}
-        let [w, h] = self.cam.size;
-        let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
-        if !(cx > 0.0 && cx < w && cy > 0.0 && cy < h) { return None; }
-        Some([(x0 / w).clamp(0.0, 1.0), (y0 / h).clamp(0.0, 1.0), (x1 / w).clamp(0.0, 1.0), (y1 / h).clamp(0.0, 1.0)])
+        Some([x0, y0, x1, y1])
     }
 }
 
@@ -1298,6 +1305,42 @@ async fn rig_low_conf(s: &GraspSetup) -> Rig {
     rig.sup.inner().write().await.set_grasp_setup(s.clone());
     *rig.sim.angle.lock().unwrap() = Some((30f64.to_radians(), 0.1));
     rig
+}
+
+/// Look-down with the lens 4 cm off the tool axis (`Truth::same`, no tilt): with the object
+/// under the jaws at approach height its box runs past the image border. The grip pixel is, as
+/// `grip_pixel_norm` is defined, where the table point under the jaws appears there. The
+/// centring on the grip pixel sees a cut box; the grasp centres it uncut at an aim inside the
+/// image, takes the height and the J6 alignment from those frames, and moves the TCP over the
+/// box centre's point on the object's top plane (`shift`): the TCP ends over the object.
+#[tokio::test]
+async fn border_cut_box_is_centred_uncut_then_shifted() {
+    let setup = GraspSetup::default();
+    let rig = rig(setup.clone(), Truth::same(), 0.0, [0.01, 0.01], false).await;
+    let start_r = start_pose(&rig).await.r;
+    let under = Pose::new(grasp::look_down(&start_r), [rig.object[0], rig.object[1], setup.table_z_m + setup.approach_height_m]);
+    let whole = rig.sim.project_box_whole(&under).expect("object in front of the camera");
+    let [w, h] = setup.image_size_px;
+    let cut = rig.sim.project_box(&under).expect("box centre inside the image");
+    assert!(grasp::touches_border(&cut, setup.image_size_px), "the box under the jaws reaches the border: {whole:?}");
+    let mut s = setup.clone();
+    let g = rig.sim.cam.project(&under, &[rig.object[0], rig.object[1], setup.table_z_m]).expect("table point in front of the camera");
+    s.grip_pixel_norm = [g[0] / w, g[1] / h];
+    rig.sup.inner().write().await.set_grasp_setup(s.clone());
+    let o = run_grasp(&rig).await;
+    let a = &o.status;
+    println!("border cut: {} {:?}, border {:?} shift {:?} px, height {:?} {:?} {:?}, align {:?}, centred xy error {:.2} mm, final {:.2} mm",
+        a.state, a.code, a.border, a.border_shift_px, a.height_source, a.height_reason, a.object_height_m, a.align,
+        o.centred_err_m * 1000.0, xy_err(&o.final_pose.p, &rig.object) * 1000.0);
+    assert_eq!(a.border.as_deref(), Some("shifted"), "{a:?}");
+    assert!(a.border_shift_px.is_some_and(|d| d[0].hypot(d[1]) > 20.0), "{a:?}");
+    // the height probe and the J6 alignment ran on the uncut box
+    assert_eq!(a.height_source.as_deref(), Some("scale"), "{a:?}");
+    assert!(!a.align.as_deref().unwrap_or("").starts_with("skipped"), "{a:?}");
+    assert!(a.phase_ms.contains_key("shift"), "{:?}", a.phase_ms);
+    // centred on the cut box, without the shift, the TCP ended 1.96 mm off
+    assert!(o.centred_err_m <= 0.001, "centred xy error {:.2} mm", o.centred_err_m * 1000.0);
+    assert_holding_done(&o, &s, &rig.object, 0.004);
 }
 
 // ---- object height from the box scale change ----

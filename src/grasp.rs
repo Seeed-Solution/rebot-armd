@@ -687,7 +687,9 @@ fn median(v: &mut [f64]) -> f64 {
 }
 
 /// Follows the picked target across frames: same label, and centre within the gate of the
-/// predicted centre or IoU above `match_iou` with the predicted box.
+/// predicted centre or IoU above `match_iou` with the predicted box. While the predicted box
+/// touches the image border the gate is at least `acquire_dist_px`: the centre of a cut box
+/// moves by up to half the hidden part as the box comes into view.
 #[derive(Debug, Clone)]
 pub struct Tracker {
     pub label: String,
@@ -700,12 +702,13 @@ impl Tracker {
     pub fn find(&self, frame: &DetectionFrame, setup: &GraspSetup) -> Option<Detection> {
         let [w, h] = setup.image_size_px;
         let pc = box_centre(&self.predicted);
+        let gate = if touches_border(&self.predicted, [w, h]) { self.gate_px.max(setup.acquire_dist_px) } else { self.gate_px };
         frame.detections.iter()
             .filter(|d| d.label.eq_ignore_ascii_case(&self.label))
             .filter_map(|d| {
                 let c = box_centre(&d.box_norm);
                 let dist = ((c[0] - pc[0]) * w).hypot((c[1] - pc[1]) * h);
-                (dist <= self.gate_px || iou(&d.box_norm, &self.predicted) > setup.match_iou).then_some((dist, d))
+                (dist <= gate || iou(&d.box_norm, &self.predicted) > setup.match_iou).then_some((dist, d))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, d)| d.clone())
@@ -1232,7 +1235,26 @@ impl Orchestrator {
         let mut tracker = Tracker { label: planned.request.label.clone(), predicted: planned.request.box_norm, gate_px: s.acquire_dist_px };
         tracker.predict_at(predicted);
         let mut after = None;
-        let c = self.centre("centring", 0.3, &mut tracker, aim_px, aim_name, plane, done.at, &mut after, s.max_iterations, true).await?;
+        let mut c = self.centre("centring", 0.3, &mut tracker, aim_px, aim_name, plane, done.at, &mut after, s.max_iterations, true).await?;
+        // a box cut by the image border at the aim (look-down v5: the point under the jaws is
+        // near the bottom edge) has its centre off the target's: centre the box uncut at an aim
+        // inside the image; the later steps use those frames, and the `shift` phase moves the
+        // target onto the aim
+        let mut centred_at = aim_px;
+        for attempt in 0..BORDER_SHIFTS {
+            let Some(inner) = border_free_aim(&c.frames, centred_at, self.cam.size, s.centre_tol_px + 4.0, attempt) else { break };
+            tracing::info!("Grasp {}: box cut by the image border at {aim_name}, centring at ({:.0}, {:.0}) px", self.id, inner[0], inner[1]);
+            c = self.centre("centring", 0.3, &mut tracker, inner, "the border-free aim", plane, Instant::now(), &mut after, s.max_iterations, true).await?;
+            centred_at = inner;
+        }
+        let shifted = centred_at != aim_px;
+        let cut = c.frames.iter().any(|d| touches_border(&d.box_norm, self.cam.size));
+        if shifted || cut {
+            self.sup.inner().write().await.update_action(self.id, |a| {
+                a.border = Some(if cut { "cut" } else { "shifted" }.into());
+                a.border_shift_px = shifted.then(|| [(centred_at[0] - aim_px[0]) as f32, (centred_at[1] - aim_px[1]) as f32]);
+            });
+        }
         let last = c.last.clone();
 
         // object height from the box scale change over a short straight-down probe: box
@@ -1255,6 +1277,28 @@ impl Orchestrator {
             }),
         }
         self.sup.inner().write().await.update_action(self.id, |a| a.close_height_m = Some(close_h as f32));
+
+        // look-down, centred at a border-free aim: one base move that puts the TCP over the box
+        // centre's point on the plane z = `plane`, seen from the centring pose. The point under
+        // the TCP on that plane is the grip pixel (the table point under the jaws) moved by the
+        // model's parallax between the table and the plane (camera-down: the transition starts
+        // from the box centre's ray anyway)
+        if shifted && !camera_down {
+            self.phase("shift", 0.5).await?;
+            let mut xs: Vec<f64> = c.frames.iter().map(|d| self.cam.to_px(box_centre(&d.box_norm))[0]).collect();
+            let mut ys: Vec<f64> = c.frames.iter().map(|d| self.cam.to_px(box_centre(&d.box_norm))[1]).collect();
+            let centre = [median(&mut xs), median(&mut ys)];
+            let under = |z: f64| self.cam.project(&c.pose, &[c.pose.p[0], c.pose.p[1], z]);
+            let aim = match (under(plane), under(s.table_z_m)) {
+                (Some(m), Some(m0)) => [aim_px[0] + m[0] - m0[0], aim_px[1] + m[1] - m0[1]],
+                _ => aim_px,
+            };
+            let (Some(pt), Some(pg)) = (self.cam.plane_point(&c.pose, centre, plane), self.cam.plane_point(&c.pose, aim, plane)) else {
+                return Err(fail("CENTRING_FAILED", "Border shift cannot be mapped onto the table plane"));
+            };
+            let d = [pt[0] - pg[0], pt[1] - pg[1], 0.0];
+            self.move_arm("shift", GoalSpec::Relative { frame: RelFrame::Base, d, dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false }, s.approach_speed_mps).await?;
+        }
 
         // camera-down: re-orient to the tool-vertical pose above the target's table point
         if camera_down {
@@ -1806,6 +1850,36 @@ pub fn scale_height(low: &[f64], high: &[f64], dz: f64) -> Result<f64, String> {
     Ok(dz / (r - 1.0))
 }
 
+/// Attempts at a border-free aim ([`border_free_aim`]) after the centring on the grip pixel.
+pub const BORDER_SHIFTS: u32 = 3;
+
+/// Aim pixel at which a target whose box, centred on `aim` (px), is cut by the image border
+/// would be seen whole: on each axis where the median box edge of `frames` is within 2 px of
+/// one border, the estimated full extent (the larger of the visible extent and the box's
+/// extent along the other axis when that one is uncut, times 1 + 0.25 · (`attempt` + 1)) is
+/// placed `margin` px inside that border; other axes keep `aim`. None when no axis is cut, an
+/// axis is cut on both sides, or the estimate does not fit in the image.
+pub fn border_free_aim(frames: &[Detection], aim: [f64; 2], size: [f64; 2], margin: f64, attempt: u32) -> Option<[f64; 2]> {
+    if frames.is_empty() { return None; }
+    let edge = |k: usize| median(&mut frames.iter().map(|d| d.box_norm[k] * size[k % 2]).collect::<Vec<_>>());
+    let (lo, hi) = ([edge(0), edge(1)], [edge(2), edge(3)]);
+    let cut = |k: usize| (lo[k] <= 2.0, hi[k] >= size[k] - 2.0);
+    let mut out = aim;
+    let mut any = false;
+    for k in 0..2 {
+        let (low, high) = cut(k);
+        if !low && !high { continue; }
+        if low && high { return None; }
+        let o = 1 - k;
+        let other = if cut(o) == (false, false) { hi[o] - lo[o] } else { 0.0 };
+        let est = (hi[k] - lo[k]).max(other) * (1.0 + 0.25 * f64::from(attempt + 1));
+        if est + 2.0 * margin > size[k] { return None; }
+        out[k] = if high { size[k] - margin - est / 2.0 } else { margin + est / 2.0 };
+        any = true;
+    }
+    any.then_some(out)
+}
+
 /// A box edge within 2 px of the image border (the box may be cut off).
 pub fn touches_border(b: &[f64; 4], size: [f64; 2]) -> bool {
     let [w, h] = size;
@@ -2010,6 +2084,42 @@ mod tests {
         assert_eq!(align_guard(&shrunk, &with_last, size), Err("occluded"));
         // -30 % passes
         assert_eq!(align_guard(&det([0.3, 0.3, 0.5, 0.51], None), &frames, size), Ok(()));
+    }
+
+    #[test]
+    fn border_free_aim_moves_a_cut_axis_inside() {
+        let size = [640.0, 360.0];
+        let n = |b: [f64; 4]| det([b[0] / 640.0, b[1] / 360.0, b[2] / 640.0, b[3] / 360.0], None);
+        // uncut: no new aim
+        assert_eq!(border_free_aim(&[n([280.0, 200.0, 360.0, 280.0])], [320.0, 240.0], size, 14.0, 0), None);
+        // cut at the bottom, 80 px wide: v so that 1.25 x 80 px fits 14 px above the bottom, u kept
+        let a = border_free_aim(&[n([280.0, 320.0, 360.0, 360.0])], [320.0, 340.0], size, 14.0, 0).unwrap();
+        assert_eq!(a[0], 320.0);
+        assert!((a[1] - (360.0 - 14.0 - 50.0)).abs() < 1e-9, "{a:?}");
+        // the estimate grows with the attempt; the visible extent counts when it is the larger
+        let b = border_free_aim(&[n([280.0, 200.0, 360.0, 360.0])], [320.0, 340.0], size, 14.0, 1).unwrap();
+        assert!((b[1] - (360.0 - 14.0 - 160.0 * 1.5 / 2.0)).abs() < 1e-9, "{b:?}");
+        // cut at the left: u moves right
+        let c = border_free_aim(&[n([0.0, 150.0, 40.0, 210.0])], [10.0, 180.0], size, 14.0, 0).unwrap();
+        assert!((c[0] - (14.0 + 75.0 / 2.0)).abs() < 1e-9 && c[1] == 180.0, "{c:?}");
+        // cut on both sides of an axis, or too large to fit: none
+        assert_eq!(border_free_aim(&[n([100.0, 0.0, 200.0, 360.0])], [150.0, 180.0], size, 14.0, 0), None);
+        assert_eq!(border_free_aim(&[n([100.0, 200.0, 400.0, 360.0])], [250.0, 340.0], size, 14.0, 0), None);
+        // the median edge decides: one cut frame of three does not
+        let frames = [n([280.0, 200.0, 360.0, 300.0]), n([280.0, 200.0, 360.0, 301.0]), n([280.0, 200.0, 360.0, 359.0])];
+        assert_eq!(border_free_aim(&frames, [320.0, 250.0], size, 14.0, 0), None);
+    }
+
+    #[test]
+    fn tracker_widens_the_gate_for_a_box_at_the_border() {
+        let setup = GraspSetup::default();
+        let frame = |b: [f64; 4]| DetectionFrame { frame_id: 1, captured_at: Instant::now(), detections: vec![Detection { label: "cube".into(), ..det(b, None) }] };
+        // predicted cut box (v 0.9..1.0) after a step; the box seen whole is 96 px higher
+        let seen = frame([0.4, 300.0 / 360.0 - 0.3, 0.5, 300.0 / 360.0]);
+        let cut = Tracker { label: "cube".into(), predicted: [0.4, 0.9, 0.5, 1.0], gate_px: setup.match_dist_px };
+        assert!(cut.find(&seen, &setup).is_some());
+        let uncut = Tracker { predicted: [0.4, 0.8, 0.5, 0.99], ..cut };
+        assert!(uncut.find(&seen, &setup).is_none());
     }
 
     #[test]
