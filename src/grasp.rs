@@ -96,6 +96,8 @@ pub struct GraspSetup {
     /// Detections with `angle_deg` and `angle_conf` at least this decide the J6 roll from the
     /// angle (long side across the jaws) instead of the box aspect.
     pub align_min_angle_conf: f64,
+    /// Angle dispersion threshold (deg) above which J6 alignment from angle is skipped (0 disables).
+    pub align_max_angle_spread_deg: f64,
     /// Linear speeds (m/s) for the approach / centring and for descend / lift.
     pub approach_speed_mps: f64,
     pub descend_speed_mps: f64,
@@ -127,6 +129,26 @@ pub struct GraspSetup {
     /// Camera-down re-check after the transition: TARGET_DISPLACED when the target's box
     /// centre is more than this many pixels from where the model projects it.
     pub recheck_tol_px: f64,
+    /// Maximum target cross-section width (m) for the jaws; 0 disables the check.
+    pub max_grasp_width_m: f64,
+    /// Detected labels treated as spill-safe (placed upright with tilt at most `spill_max_tilt_deg`).
+    pub spill_safe_labels: Vec<String>,
+    /// Maximum allowed tilt (deg) when placing a spill-safe object.
+    pub spill_max_tilt_deg: f64,
+    /// Width-based pre-open before descend: `auto` (default, only when calibrated), `on` (also uncalibrated), `off`.
+    pub pre_open: PreOpen,
+    /// Margin (m) added to the measured width for the pre-open opening.
+    pub pre_open_margin_m: f64,
+}
+
+/// `pre_open` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PreOpen {
+    #[default]
+    Auto,
+    On,
+    Off,
 }
 
 /// `acquire_camera_down` setting.
@@ -169,6 +191,7 @@ impl Default for GraspSetup {
             align_min_aspect: 1.2,
             align_j6: true,
             align_min_angle_conf: 0.3,
+            align_max_angle_spread_deg: 15.0,
             approach_speed_mps: 0.05,
             descend_speed_mps: 0.03,
             phase_timeout_s: 25.0,
@@ -182,6 +205,11 @@ impl Default for GraspSetup {
             recentre_max_iterations: 3,
             descend_contact_stop_nm: None,
             post_lift_settle_ms: 300,
+            max_grasp_width_m: 0.075,
+            spill_safe_labels: vec!["cup".into(), "bottle".into(), "wine glass".into(), "bowl".into(), "vase".into()],
+            spill_max_tilt_deg: 8.0,
+            pre_open: PreOpen::Auto,
+            pre_open_margin_m: 0.015,
         }
     }
 }
@@ -193,8 +221,8 @@ impl GraspSetup {
             self.grip_pixel_norm[0], self.grip_pixel_norm[1], self.camera_tilt_deg, self.image_size_px[0],
             self.image_size_px[1], self.fx_px, self.fy_px, self.centre_tol_px, self.servo_gain, self.max_step_m,
             self.match_dist_px, self.match_iou, self.acquire_dist_px, self.lost_timeout_s, self.settle_delay_s,
-            self.align_min_aspect, self.align_min_angle_conf, self.approach_speed_mps, self.descend_speed_mps, self.phase_timeout_s, self.timeout_s, self.recheck_tol_px,
-            self.height_probe_m, self.height_grasp_fraction, self.max_grasp_height_m, self.recentre_height_m];
+            self.align_min_aspect, self.align_min_angle_conf, self.align_max_angle_spread_deg, self.approach_speed_mps, self.descend_speed_mps, self.phase_timeout_s, self.timeout_s, self.recheck_tol_px,
+            self.height_probe_m, self.height_grasp_fraction, self.max_grasp_height_m, self.recentre_height_m, self.max_grasp_width_m, self.spill_max_tilt_deg, self.pre_open_margin_m];
         if !all.iter().all(|v| fin(*v)) { return Err("grasp setup values must be finite".into()); }
         let check = |ok: bool, msg: &str| if ok { Ok(()) } else { Err(msg.to_string()) };
         check((-0.5..=0.5).contains(&self.table_z_m), "table_z_m must be in [-0.5, 0.5] m")?;
@@ -229,6 +257,10 @@ impl GraspSetup {
         check(self.descend_contact_stop_nm.is_none_or(|v| v.is_finite() && v > 0.0 && v <= 50.0), "descend_contact_stop_nm must be null or in (0, 50] N·m")?;
         check(self.align_min_aspect >= 1.0 && self.align_min_aspect <= 10.0, "align_min_aspect must be in [1, 10]")?;
         check((0.0..=1.0).contains(&self.align_min_angle_conf), "align_min_angle_conf must be in [0, 1]")?;
+        check((0.0..=90.0).contains(&self.align_max_angle_spread_deg), "align_max_angle_spread_deg must be in [0, 90]")?;
+        check((0.0..=0.2).contains(&self.max_grasp_width_m), "max_grasp_width_m must be in [0, 0.2] m")?;
+        check((1.0..=30.0).contains(&self.spill_max_tilt_deg), "spill_max_tilt_deg must be in [1, 30]")?;
+        check((0.005..=0.05).contains(&self.pre_open_margin_m), "pre_open_margin_m must be in [0.005, 0.05] m")?;
         let speed_ok = |v: f64| v > 0.0 && v <= motion::MAX_LINEAR_MPS;
         check(speed_ok(self.approach_speed_mps) && speed_ok(self.descend_speed_mps), "speeds must be in (0, 0.15] m/s")?;
         check(self.phase_timeout_s > 0.0 && self.phase_timeout_s <= 120.0 && self.timeout_s >= self.phase_timeout_s && self.timeout_s <= 600.0,
@@ -348,6 +380,15 @@ pub struct Detection {
     /// wrapped to [-90, 90)) and its confidence [0, 1], when the detector reports them.
     pub angle_deg: Option<f64>,
     pub angle_conf: Option<f64>,
+    pub grasp_width_px: Option<f64>,
+    pub mask_focus: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaskFocus {
+    pub label: Option<String>,
+    pub box_norm: [f64; 4],
+    pub ttl_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -389,8 +430,16 @@ pub trait DetectionSource: Send + Sync {
     }
     /// One inference running exactly `pipelines` on a frame newer than the call, waiting up to
     /// `wait_ms`. `Ok(None)` = no fresh frame in time.
-    fn trigger(&self, _pipelines: &'static [&'static str], _wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
+    fn trigger(&self, pipelines: &'static [&'static str], wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
+        self.trigger_with_focus(pipelines, wait_ms, None)
+    }
+    /// One inference with optional mask focus.
+    fn trigger_with_focus(&self, _pipelines: &'static [&'static str], _wait_ms: u64, _focus: Option<&MaskFocus>) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
         Box::pin(async { Err("per-request pipelines not supported".to_string()) })
+    }
+    /// Sets mask focus for subsequent frames until expiry or clears it (`ttl_ms` = 0).
+    fn set_mask_focus(&self, _label: Option<String>, _box_norm: [f64; 4], _ttl_ms: u64) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async { Ok(()) })
     }
     fn inference_enabled(&self) -> BoxFuture<'_, Result<bool, String>>;
     fn set_inference(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>>;
@@ -441,11 +490,58 @@ impl DetectionSource for HttpDetectionSource {
         })
     }
     fn trigger(&self, pipelines: &'static [&'static str], wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
+        self.trigger_with_focus(pipelines, wait_ms, None)
+    }
+    fn trigger_with_focus(&self, pipelines: &'static [&'static str], wait_ms: u64, focus: Option<&MaskFocus>) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
+        let focus = focus.cloned();
         Box::pin(async move {
             let wait_ms = wait_ms.min(5000);
-            let body = serde_json::json!({"pipelines": pipelines, "wait_ms": wait_ms}).to_string();
-            let v = crate::api::proxy::request_json(&self.upstream, "POST", "/api/trigger", Some(body.as_bytes()), Duration::from_millis(wait_ms + 2000)).await?;
+            let mut obj = serde_json::json!({"pipelines": pipelines, "wait_ms": wait_ms});
+            if let Some(ref f) = focus {
+                let mut mf = serde_json::json!({
+                    "box_norm": f.box_norm,
+                    "ttl_ms": f.ttl_ms,
+                });
+                if let Some(ref l) = f.label {
+                    mf["label"] = serde_json::Value::String(l.clone());
+                }
+                obj["mask_focus"] = mf;
+            }
+            let body = obj.to_string();
+            let v = match crate::api::proxy::request_json(&self.upstream, "POST", "/api/trigger", Some(body.as_bytes()), Duration::from_millis(wait_ms + 2000)).await {
+                Ok(v) => v,
+                // an older rebot-vision ignores the unknown field; retry only on a rejected body
+                Err(e) if focus.is_some() && e.starts_with("detector returned 400") => {
+                    tracing::debug!("Trigger with mask_focus failed ({e}), retrying without focus");
+                    let fallback = serde_json::json!({"pipelines": pipelines, "wait_ms": wait_ms}).to_string();
+                    crate::api::proxy::request_json(&self.upstream, "POST", "/api/trigger", Some(fallback.as_bytes()), Duration::from_millis(wait_ms + 2000)).await?
+                }
+                Err(e) => return Err(e),
+            };
             Ok(self.frame(&v, None, Instant::now()))
+        })
+    }
+    fn set_mask_focus(&self, label: Option<String>, box_norm: [f64; 4], ttl_ms: u64) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            let body = if ttl_ms == 0 {
+                serde_json::json!({"ttl_ms": 0}).to_string()
+            } else {
+                let mut j = serde_json::json!({
+                    "box_norm": box_norm,
+                    "ttl_ms": ttl_ms,
+                });
+                if let Some(l) = label {
+                    j["label"] = serde_json::Value::String(l);
+                }
+                j.to_string()
+            };
+            match crate::api::proxy::request_json_opt(&self.upstream, "POST", "/api/mask_focus", Some(body.as_bytes()), Duration::from_secs(2)).await {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    tracing::debug!("POST /api/mask_focus failed ({e}), ignored");
+                    Ok(())
+                }
+            }
         })
     }
     fn inference_enabled(&self) -> BoxFuture<'_, Result<bool, String>> {
@@ -559,9 +655,19 @@ pub fn parse_detections(raw: &Value, size: [f64; 2]) -> Vec<Detection> {
         if b[2] <= b[0] || b[3] <= b[1] { continue; }
         let angle_deg = item.is_object().then(|| f(item, &["angle_deg"])).flatten().map(|a| (a + 90.0).rem_euclid(180.0) - 90.0);
         let angle_conf = item.is_object().then(|| f(item, &["angle_conf"])).flatten().map(|c| c.clamp(0.0, 1.0));
-        out.push(Detection { label, score: score.clamp(0.0, 1.0), box_norm: b, angle_deg, angle_conf });
+        let grasp_width_px = item.is_object().then(|| f(item, &["grasp_width_px", "width_px"])).flatten().filter(|w| *w > 0.0);
+        let mask_focus = item.is_object().then(|| item.get("mask_focus").and_then(Value::as_bool)).flatten().unwrap_or(false);
+        out.push(Detection { label, score: score.clamp(0.0, 1.0), box_norm: b, angle_deg, angle_conf, grasp_width_px, mask_focus });
     }
     out
+}
+
+pub fn box_changed_px(a: &[f64; 4], b: &[f64; 4], size: [f64; 2]) -> bool {
+    let dx0 = (a[0] - b[0]).abs() * size[0];
+    let dy0 = (a[1] - b[1]).abs() * size[1];
+    let dx1 = (a[2] - b[2]).abs() * size[0];
+    let dy1 = (a[3] - b[3]).abs() * size[1];
+    dx0 > 5.0 || dy0 > 5.0 || dx1 > 5.0 || dy1 > 5.0
 }
 
 pub fn box_centre(b: &[f64; 4]) -> [f64; 2] { [(b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0] }
@@ -894,19 +1000,31 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     let camera_down = camera_down_mode(setup, &input.cam).map_err(MotionError::InvalidCommand)?;
     let pts = envelope(input.ws.as_ref(), &input.cam, &cam.rec);
     // the envelope stays above the table on the approach and (camera-down) the transition
-    let goal = if camera_down {
+    let (goal, tool) = if camera_down {
         let goal = camera_down_pose(&pose.r, &target, setup, &cam, &pts);
         let tool = approach_pose(&goal.r, &target, setup);
         if let Some(e) = table_violation(&goal, &tool, &pts, setup.table_z_m) { return Err(e.into()); }
-        goal
+        (goal, tool)
     } else {
-        approach_pose(&pose.r, &target, setup)
+        let goal = approach_pose(&pose.r, &target, setup);
+        (goal, goal)
     };
     if let Some(e) = table_violation(&pose, &goal, &pts, setup.table_z_m) { return Err(e.into()); }
-    let mut open_input = input.clone();
-    open_input.j7 = open_rad;
-    let path = motion::plan_cartesian(&open_input, goal, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
-    let transition_duration = if camera_down { transition_estimate(&goal, &target, setup) } else { 0.0 };
+    let mut cur = input.clone();
+    cur.j7 = open_rad;
+    let path = motion::plan_cartesian(&cur, goal, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
+    let last = path.last();
+    cur.q0 = std::array::from_fn(|i| f64::from(last[i]));
+    let transition_duration = if camera_down {
+        let trans_path = motion::plan_cartesian(&cur, tool, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
+        let last = trans_path.last();
+        cur.q0 = std::array::from_fn(|i| f64::from(last[i]));
+        transition_estimate(&goal, &target, setup)
+    } else {
+        0.0
+    };
+    let grasp_pose = Pose::new(tool.r, [target[0], target[1], setup.table_z_m + setup.grasp_height_m]);
+    let _descend_path = motion::plan_cartesian(&cur, grasp_pose, Speed { linear: setup.descend_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
     Ok(PlannedGrasp { input, request, target, approach_duration: path.duration, camera_down, transition_duration })
 }
 
@@ -931,6 +1049,29 @@ pub fn expected_duration(planned: &PlannedGrasp) -> f64 {
     let base = lift_check + 6.5 + planned.approach_duration + 4.0 * 1.5 + descend + 2.0 + lift + probe + recentre;
     // camera-down: the transition move and its re-check frame
     if planned.camera_down { base + planned.transition_duration + 1.5 } else { base }
+}
+
+/// Dry-run reachability check: prepare + plan only, no macro started, no orchestrator spawned.
+/// Returns (reachable, code, message).
+pub async fn dry_run(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, Option<String>, Option<String>) {
+    let pending_res = {
+        let inner = supervisor.inner().read().await;
+        prepare(&inner, body, inner.safety.epoch_id())
+    };
+    match pending_res {
+        Ok(pending) => match tokio::task::spawn_blocking(move || plan(pending)).await {
+            Ok(Ok(_planned)) => (true, None, None),
+            Ok(Err(e)) => {
+                let api = ApiError::from(e);
+                (false, api.code.or(Some(api.error)), Some(api.message))
+            }
+            Err(e) => (false, Some("INTERNAL".into()), Some(format!("planner task failed: {e}"))),
+        },
+        Err(e) => {
+            let api = ApiError::from(e);
+            (false, api.code.or(Some(api.error)), Some(api.message))
+        }
+    }
 }
 
 /// Start a grasp without a WS lease check (tests, in-process agents): prepare, plan, begin
@@ -993,6 +1134,12 @@ impl Orchestrator {
         self.ctx.move_arm(phase, spec, Speed { linear, angular: motion::DEFAULT_ANGULAR_RPS }).await
     }
 
+    async fn set_mask_focus(&self, label: Option<String>, box_norm: [f64; 4], ttl_ms: u64) {
+        if let Err(e) = self.source.set_mask_focus(label, box_norm, ttl_ms).await {
+            tracing::debug!("Mask focus request failed (ignored): {e}");
+        }
+    }
+
     /// Next fresh frame (captured after `since` + settle delay) containing the target.
     /// TARGET_LOST when: frames keep arriving but all predate the settle time, `lost_timeout_s`
     /// after max(now, settle time) (stale frames do not extend it); no frame arrives for
@@ -1009,11 +1156,16 @@ impl Orchestrator {
             let source = self.source.clone();
             let a = *after;
             let triggered = self.triggered;
+            let focus = MaskFocus {
+                label: Some(tracker.label.clone()),
+                box_norm: tracker.predicted,
+                ttl_ms: 2000,
+            };
             let get = async move {
                 if triggered {
                     // the triggered frame is taken once the arm has settled
                     tokio::time::sleep(not_before.saturating_duration_since(Instant::now())).await;
-                    source.trigger(GRASP_PIPELINES, TRIGGER_WAIT_MS).await
+                    source.trigger_with_focus(GRASP_PIPELINES, TRIGGER_WAIT_MS, Some(&focus)).await
                 } else {
                     source.next_frame(a, 200).await
                 }
@@ -1071,6 +1223,7 @@ impl Orchestrator {
 
         // closed-loop centring onto the grip pixel, or (camera-down) the image centre
         self.phase("centring", 0.3).await?;
+        self.set_mask_focus(Some(planned.request.label.clone()), planned.request.box_norm, 2000).await;
         let grip_px = self.cam.to_px(s.grip_pixel_norm);
         let (aim_px, aim_name) = if camera_down { ([self.cam.cx, self.cam.cy], "the image centre") } else { (grip_px, "the grip point") };
         let plane = grasp_plane(s);
@@ -1118,9 +1271,118 @@ impl Orchestrator {
         // J6 alignment: close the jaws across the object's short side
         self.phase("align", 0.55).await?;
         let (turn, align) = if s.align_j6 { self.align_turn(&c, plane).await } else { (None, "off".to_string()) };
-        self.sup.inner().write().await.update_action(self.id, |a| { a.align = Some(align); a.align_turn_rad = turn.map(|t| t as f32); });
+        self.sup.inner().write().await.update_action(self.id, |a| { a.align = Some(align.clone()); a.align_turn_rad = turn.map(|t| t as f32); });
+
+        // the width is measured whatever the angle confidence: a disc or a square has a low
+        // angle_conf but a valid width (any closing direction sees about the same width)
+        let mut measured_width_m = None;
+        if let Some(w_px) = frames_width_px(&c.frames, 0.0) {
+            let accepted_angle = frames_angle(&c.frames, s.align_min_angle_conf)
+                .filter(|&(_alpha, spread)| s.align_max_angle_spread_deg <= 0.0 || spread <= s.align_max_angle_spread_deg);
+            let (u_x, u_y) = if let Some((alpha, _spread)) = accepted_angle {
+                let closing_deg = alpha + 90.0;
+                (closing_deg.to_radians().cos(), closing_deg.to_radians().sin())
+            } else {
+                let jaw = kinematics::mat_vec(&kinematics::transpose(&self.cam.rec), &[0.0, 1.0, 0.0]);
+                let n = jaw[0].hypot(jaw[1]);
+                if n > 1e-6 { (jaw[0] / n, jaw[1] / n) } else { (0.0, 1.0) }
+            };
+            let centre_px = self.cam.to_px(box_centre(&c.last.box_norm));
+            let half_w = w_px / 2.0;
+            let p0_px = [centre_px[0] - half_w * u_x, centre_px[1] - half_w * u_y];
+            let p1_px = [centre_px[0] + half_w * u_x, centre_px[1] + half_w * u_y];
+            if let (Some(p0), Some(p1)) = (self.cam.plane_point(&c.pose, p0_px, plane), self.cam.plane_point(&c.pose, p1_px, plane)) {
+                let width_m = kinematics::norm(&kinematics::sub(&p1, &p0));
+                measured_width_m = Some(width_m);
+                self.sup.inner().write().await.update_action(self.id, |a| {
+                    a.grasp_width_m = Some(width_m as f32);
+                });
+                let max_w = {
+                    let inner = self.sup.inner().read().await;
+                    let policy = inner.config.gripper_policy.as_ref();
+                    if policy.is_some_and(|p| p.is_calibrated()) {
+                        let p = policy.unwrap();
+                        let calib_limit = (p.opening_m(p.open_rad) as f64) - s.pre_open_margin_m;
+                        if s.max_grasp_width_m > 0.0 {
+                            s.max_grasp_width_m.min(calib_limit)
+                        } else {
+                            calib_limit
+                        }
+                    } else {
+                        s.max_grasp_width_m
+                    }
+                };
+                if max_w > 0.0 && width_m > max_w {
+                    return Err(fail("TOO_WIDE", format!("Object width {width_m:.3} m exceeds max_grasp_width_m {:.3} m", max_w)));
+                }
+            }
+        }
+
         if let Some(turn) = turn {
             self.move_arm("align", GoalSpec::Relative { frame: RelFrame::Tool, d: [0.0; 3], dyaw: 0.0, dpitch: 0.0, droll: turn, level: false }, s.approach_speed_mps).await?;
+        }
+
+        // width-based pre-open before descend
+        let (pre_open_decision, pre_open_target) = {
+            let inner = self.sup.inner().read().await;
+            let policy = inner.config.gripper_policy.clone();
+            drop(inner);
+            match policy {
+                None => (Some("skipped:no_policy".to_string()), None),
+                Some(policy) => {
+                    let calibrated = policy.is_calibrated();
+                    if s.pre_open == PreOpen::Off {
+                        (Some("off".to_string()), None)
+                    } else if s.pre_open == PreOpen::Auto && !calibrated {
+                        (Some("skipped:uncalibrated".to_string()), None)
+                    } else if !matches!(align.as_str(), "turned:angle" | "kept:angle")
+                        && frames_angle(&c.frames, s.align_min_angle_conf).is_some()
+                    {
+                        // an elongated mask (confident angle): its narrowest cross-section is the
+                        // width across the jaws only once J6 is aligned to it; a round or square
+                        // mask (no confident angle) has about the same width in every direction
+                        (Some("skipped:not_aligned".to_string()), None)
+                    } else if let Err(reason) = align_guard(&c.last, &c.frames, self.cam.size) {
+                        (Some(format!("skipped:{reason}")), None)
+                    } else if let Some(w) = measured_width_m {
+                        let target_w = (w + s.pre_open_margin_m) as f32;
+                        let target_j7 = policy.j7_for(target_w);
+                        let full_open_w = policy.opening_m(policy.open_rad);
+                        let at_or_beyond_open = target_w >= full_open_w
+                            || (target_j7 - policy.open_rad).abs() < 1e-4
+                            || if policy.open_rad > policy.closed_rad {
+                                target_j7 >= policy.open_rad
+                            } else {
+                                target_j7 <= policy.open_rad
+                            };
+                        if at_or_beyond_open {
+                            (Some("skipped:open_rad".to_string()), None)
+                        } else {
+                            let min_j7 = policy.closed_rad.min(policy.open_rad);
+                            let max_j7 = policy.closed_rad.max(policy.open_rad);
+                            let clamped_j7 = target_j7.clamp(min_j7, max_j7);
+                            let span = policy.open_rad - policy.closed_rad;
+                            let frac = if span.abs() < 1e-6 { 0.0 } else { ((clamped_j7 - policy.closed_rad) / span).clamp(0.0, 1.0) as f64 };
+                            (None, Some((frac, target_w)))
+                        }
+                    } else {
+                        (Some("skipped:no_width".to_string()), None)
+                    }
+                }
+            }
+        };
+
+        if let Some((fraction, target_w)) = pre_open_target {
+            self.phase("preopen", 0.6).await?;
+            self.gripper_move("preopen", fraction).await?;
+            self.sup.inner().write().await.update_action(self.id, |a| {
+                a.pre_open = Some("done".into());
+                a.pre_open_m = Some(target_w);
+            });
+        } else if let Some(reason) = pre_open_decision {
+            self.sup.inner().write().await.update_action(self.id, |a| {
+                a.pre_open = Some(reason);
+            });
         }
 
         // descend (look-down: re-centre at mid height on the way), close, check
@@ -1132,6 +1394,16 @@ impl Orchestrator {
         }
         self.descend(close_h).await?;
         let closed = self.gripper_phase("close", 0.8, GripperCommand::Close).await?;
+        let held_width = {
+            let inner = self.sup.inner().read().await;
+            inner.config.gripper_policy.as_ref().map(|p| {
+                let m7 = inner.measured_positions.get(6).copied().unwrap_or(0.0);
+                p.opening_m(m7)
+            })
+        };
+        if let Some(w) = held_width {
+            self.sup.inner().write().await.update_action(self.id, |a| a.held_width_m = Some(w));
+        }
         let holding = closed.holding == Some(true);
         let lift_to = |p: Vec3| GoalSpec::Absolute { p: [p[0], p[1], s.table_z_m + s.lift_height_m], r: None };
         if !holding {
@@ -1144,6 +1416,10 @@ impl Orchestrator {
         self.phase("lift", 0.9).await?;
         let p = self.pose().await.p;
         self.move_arm("lift", lift_to(p), s.descend_speed_mps).await?;
+        let r_lift = self.pose().await.r;
+        let tool_z = kinematics::column(&r_lift, 2)[2];
+        let tilt = (-tool_z).clamp(-1.0, 1.0).acos().to_degrees();
+        tracing::info!("Grasp {}: lift tilt {:.2}°", self.id, tilt);
         // the object may slip out while lifting. Under position control the jaw settles on its
         // hold target and the grip torque fades when the object only shifted or turned in the
         // jaws, so a failed torque rule is decided by a re-grip: a close with grasp detection
@@ -1157,6 +1433,16 @@ impl Orchestrator {
         let regrip = self.gripper_phase("regrip", 0.95, GripperCommand::Close).await?;
         let gap = regrip.gripper_gap_rad.unwrap_or(gap);
         if regrip.holding == Some(true) {
+            let held_width = {
+                let inner = self.sup.inner().read().await;
+                inner.config.gripper_policy.as_ref().map(|p| {
+                    let m7 = inner.measured_positions.get(6).copied().unwrap_or(0.0);
+                    p.opening_m(m7)
+                })
+            };
+            if let Some(w) = held_width {
+                self.sup.inner().write().await.update_action(self.id, |a| a.held_width_m = Some(w));
+            }
             self.sup.inner().write().await.update_action(self.id, |a| a.post_lift = Some("regripped".into()));
             return Ok((true, Some(gap)));
         }
@@ -1216,6 +1502,7 @@ impl Orchestrator {
                     mut since: Instant, after: &mut Option<u64>, max_iter: u32, report: bool) -> Result<Centred, Stop> {
         let s = &self.setup;
         let mut iteration = 0u32;
+        let mut last_focus_box = tracker.predicted;
         loop {
             let pose = self.pose().await;
             let mut xs = Vec::new();
@@ -1226,6 +1513,12 @@ impl Orchestrator {
                 let d = self.fresh_match(tracker, since, after).await?;
                 tracker.gate_px = s.match_dist_px;
                 tracker.predicted = d.box_norm;
+                if self.triggered {
+                    self.set_mask_focus(Some(tracker.label.clone()), d.box_norm, 2000).await;
+                } else if box_changed_px(&d.box_norm, &last_focus_box, self.cam.size) {
+                    self.set_mask_focus(Some(tracker.label.clone()), d.box_norm, 2000).await;
+                    last_focus_box = d.box_norm;
+                }
                 let c = self.cam.to_px(box_centre(&d.box_norm));
                 frames.push(d);
                 xs.push(c[0]);
@@ -1426,7 +1719,13 @@ impl Orchestrator {
         let sign = inner.config.arm_model.joint_map().get(5).map_or(1.0, |m| m.sign);
         drop(inner);
         let room = |t: f64| { let q = q6 + sign * t; q >= f64::from(lim.min_position) + 0.1 && q <= f64::from(lim.max_position) - 0.1 };
-        if let Some(alpha) = frames_angle(&c.frames, self.setup.align_min_angle_conf) {
+        if let Some((alpha, spread)) = frames_angle(&c.frames, self.setup.align_min_angle_conf) {
+            self.sup.inner().write().await.update_action(self.id, |a| {
+                a.angle_spread_deg = Some(spread as f32);
+            });
+            if self.setup.align_max_angle_spread_deg > 0.0 && spread > self.setup.align_max_angle_spread_deg {
+                return (None, "skipped:angle_spread".into());
+            }
             // the long side on the plane, seen from the pose of the centring frames
             let px = self.cam.to_px(box_centre(&c.last.box_norm));
             let (a, b) = (alpha.to_radians().cos(), alpha.to_radians().sin());
@@ -1513,9 +1812,9 @@ pub fn touches_border(b: &[f64; 4], size: [f64; 2]) -> bool {
     b[0] * w <= 2.0 || b[1] * h <= 2.0 || b[2] * w >= w - 2.0 || b[3] * h >= h - 2.0
 }
 
-/// Mean long-side angle (deg, [-90, 90)) of the frames with `angle_conf >= min_conf`, averaged
-/// on doubled angles (an axis, not a direction); None without such frames.
-pub fn frames_angle(frames: &[Detection], min_conf: f64) -> Option<f64> {
+/// Mean long-side angle (deg, [-90, 90)) and dispersion (deg) of the frames with
+/// `angle_conf >= min_conf`, averaged on doubled angles (an axis, not a direction); None without such frames.
+pub fn frames_angle(frames: &[Detection], min_conf: f64) -> Option<(f64, f64)> {
     let (mut c, mut s, mut n) = (0.0, 0.0, 0);
     for d in frames {
         if let (Some(a), Some(conf)) = (d.angle_deg, d.angle_conf) {
@@ -1523,8 +1822,27 @@ pub fn frames_angle(frames: &[Detection], min_conf: f64) -> Option<f64> {
         }
     }
     if n == 0 || c.hypot(s) < 1e-9 { return None; }
+    let r = (c.hypot(s) / n as f64).clamp(1e-12, 1.0);
+    let spread = if n <= 1 { 0.0 } else { ((-2.0 * r.ln()).sqrt() / 2.0).to_degrees() };
     let a = (s.atan2(c) / 2.0).to_degrees();
-    Some((a + 90.0).rem_euclid(180.0) - 90.0)
+    let mean = (a + 90.0).rem_euclid(180.0) - 90.0;
+    Some((mean, spread))
+}
+
+/// Median grasp width (px) of the frames with `angle_conf >= min_conf` and a positive, finite
+/// `grasp_width_px`; None without such frames.
+pub fn frames_width_px(frames: &[Detection], min_conf: f64) -> Option<f64> {
+    let mut widths: Vec<f64> = frames
+        .iter()
+        .filter(|d| d.angle_conf.unwrap_or(0.0) >= min_conf)
+        .filter_map(|d| d.grasp_width_px)
+        .filter(|w| *w > 0.0 && w.is_finite())
+        .collect();
+    if widths.is_empty() {
+        None
+    } else {
+        Some(median(&mut widths))
+    }
 }
 
 /// Roll about the (vertical, down) tool axis, in [-pi/2, pi/2), that turns the jaw closing
@@ -1592,15 +1910,30 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
         }
         Err(e) => Err(fail("DETECTION_UNAVAILABLE", format!("Cannot read the vision mode: {e}"))),
     } };
+    let _ = source.set_mask_focus(None, [0.0; 4], 0).await;
     let mut inner = sup.inner().write().await;
     match result {
-        Ok((holding, gap)) => inner.finish_macro(id, "done", None, None, Some(holding), gap),
+        Ok((holding, gap)) => {
+            // a grasp stopped meanwhile must not overwrite newer held state
+            if holding && inner.macro_alive(id) {
+                let spill_safe = planned.request.setup.spill_safe_labels.iter().any(|s| s.eq_ignore_ascii_case(&planned.request.label));
+                inner.held = Some(crate::supervisor::HeldObject {
+                    label: planned.request.label.clone(),
+                    spill_safe,
+                });
+            }
+            inner.finish_macro(id, "done", None, None, Some(holding), gap);
+        }
         Err(Stop::Fail(code, message)) => {
-            tracing::info!("Grasp {id} failed: {code} {message}");
             let holding = if code == "NOT_HOLDING" || code == "DROPPED" { Some(false) } else { None };
             inner.finish_macro(id, "failed", Some(&code), Some(message), holding, None);
         }
         Err(Stop::Cancelled) => inner.finish_macro(id, "cancelled", None, None, None, None),
+    }
+    if let Some(a) = inner.last_action.as_ref().filter(|a| a.id == id) {
+        let code = a.code.as_deref().unwrap_or(if a.state == "done" { "OK" } else { &a.state });
+        let worst = a.motions.iter().max_by(|x, y| x.track_mm.total_cmp(&y.track_mm));
+        tracing::info!("Grasp {id} {code}: phase_ms {:?}, worst motion {:?}", a.phase_ms, worst);
     }
 }
 
@@ -1638,7 +1971,27 @@ mod tests {
     }
 
     fn det(b: [f64; 4], angle: Option<(f64, f64)>) -> Detection {
-        Detection { label: "cup".into(), score: 0.9, box_norm: b, angle_deg: angle.map(|a| a.0), angle_conf: angle.map(|a| a.1) }
+        Detection { label: "cup".into(), score: 0.9, box_norm: b, angle_deg: angle.map(|a| a.0), angle_conf: angle.map(|a| a.1), grasp_width_px: None, mask_focus: false }
+    }
+
+    #[test]
+    fn test_box_changed_and_iou() {
+        let size = [640.0, 360.0];
+        let b0 = [0.1, 0.1, 0.3, 0.3];
+        // small shift <= 5 px (4 px in x: 4/640 = 0.00625)
+        let b_small = [0.1 + 4.0 / 640.0, 0.1, 0.3 + 4.0 / 640.0, 0.3];
+        assert!(!box_changed_px(&b0, &b_small, size));
+        // large shift > 5 px (6 px in x: 6/640 = 0.009375)
+        let b_large = [0.1 + 6.0 / 640.0, 0.1, 0.3 + 6.0 / 640.0, 0.3];
+        assert!(box_changed_px(&b0, &b_large, size));
+
+        // IoU matching unit test
+        let b1 = [0.0, 0.0, 1.0, 1.0];
+        let b2 = [0.5, 0.0, 1.5, 1.0];
+        // intersection: 0.5 * 1.0 = 0.5; union: 1.0 + 1.0 - 0.5 = 1.5 -> iou = 1/3
+        assert!((iou(&b1, &b2) - 1.0 / 3.0).abs() < 1e-6);
+        let b_disjoint = [2.0, 2.0, 3.0, 3.0];
+        assert_eq!(iou(&b1, &b_disjoint), 0.0);
     }
 
     #[test]
@@ -1731,9 +2084,25 @@ mod tests {
         assert_eq!((d[1].angle_deg, d[1].angle_conf), (None, None));
         // 89 and -89 are 2 deg apart: mean at the wrap, not 0
         let fr = [det([0.0; 4], Some((89.0, 0.9))), det([0.0; 4], Some((-89.0, 0.9))), det([0.0; 4], Some((10.0, 0.1)))];
-        let a = frames_angle(&fr, 0.3).unwrap();
+        let (a, spread) = frames_angle(&fr, 0.3).unwrap();
         assert!(a.abs() > 89.9, "{a}");
+        assert!(spread < 2.0, "spread for 89 and -89 should be small: {spread}");
         assert_eq!(frames_angle(&fr[2..], 0.3), None, "below align_min_angle_conf");
+
+        // dispersion units: identical -> 0, ±40° -> ~40°, one frame -> 0
+        let fr_ident = [det([0.0; 4], Some((30.0, 0.9))), det([0.0; 4], Some((30.0, 0.9)))];
+        let (a_id, sp_id) = frames_angle(&fr_ident, 0.3).unwrap();
+        assert!((a_id - 30.0).abs() < 1e-6);
+        assert!(sp_id.abs() < 1e-6);
+
+        let fr_pm = [det([0.0; 4], Some((40.0, 0.9))), det([0.0; 4], Some((-40.0, 0.9)))];
+        let (a_pm, sp_pm) = frames_angle(&fr_pm, 0.3).unwrap();
+        assert!(a_pm.abs() < 1e-6);
+        assert!((sp_pm - 53.6).abs() < 1.0, "spread was {sp_pm}");
+
+        let fr_single = [det([0.0; 4], Some((40.0, 0.9)))];
+        let (_, sp_single) = frames_angle(&fr_single, 0.3).unwrap();
+        assert_eq!(sp_single, 0.0);
         // the roll turns the jaw by -t about z
         let t = roll_across_long_side([0.0, 1.0, 0.0], [1.0, 0.0, 0.0]);
         assert!(t.abs() < 1e-12, "jaw already across a long side along x: {t}");
@@ -1926,5 +2295,87 @@ mod tests {
         let est = transition_estimate(&pose, &target, &setup);
         let rot = 1.1 * 1.875 * 38f64.to_radians() / motion::DEFAULT_ANGULAR_RPS;
         assert!(est >= rot - 1e-9 && est < rot + 3.0, "{est} vs {rot}");
+    }
+
+    #[test]
+    fn test_parse_detections_grasp_width_px() {
+        let raw = serde_json::json!([
+            {"label": "can", "score": 0.9, "box_norm": [0.1, 0.1, 0.3, 0.3], "grasp_width_px": 42.5},
+            {"label": "cup", "score": 0.8, "box_norm": [0.2, 0.2, 0.4, 0.4], "width_px": 35.0},
+            {"label": "box", "score": 0.7, "box_norm": [0.3, 0.3, 0.5, 0.5], "grasp_width_px": 0.0},
+            {"label": "pen", "score": 0.6, "box_norm": [0.4, 0.4, 0.6, 0.6], "width_px": -5.0},
+            {"label": "mug", "score": 0.5, "box_norm": [0.5, 0.5, 0.7, 0.7]},
+            [320.0, 180.0, 64.0, 36.0, 0.9, "arr_obj"]
+        ]);
+        let d = parse_detections(&raw, [640.0, 360.0]);
+        assert_eq!(d.len(), 6);
+        assert_eq!(d[0].grasp_width_px, Some(42.5));
+        assert_eq!(d[1].grasp_width_px, Some(35.0));
+        assert_eq!(d[2].grasp_width_px, None, "zero width rejected");
+        assert_eq!(d[3].grasp_width_px, None, "negative width rejected");
+        assert_eq!(d[4].grasp_width_px, None, "absent width");
+        assert_eq!(d[5].grasp_width_px, None, "array format detection has no grasp_width_px");
+    }
+
+    #[test]
+    fn test_frames_width_px() {
+        let mut d1 = det([0.0; 4], Some((0.0, 0.8)));
+        d1.grasp_width_px = Some(40.0);
+
+        let mut d2 = det([0.0; 4], Some((0.0, 0.9)));
+        d2.grasp_width_px = Some(50.0);
+
+        let mut d3 = det([0.0; 4], Some((0.0, 0.7)));
+        d3.grasp_width_px = Some(45.0);
+
+        // Low confidence detection
+        let mut d_low = det([0.0; 4], Some((0.0, 0.2)));
+        d_low.grasp_width_px = Some(100.0);
+
+        // No width detection
+        let d_nowidth = det([0.0; 4], Some((0.0, 0.9)));
+
+        // Non-positive width
+        let mut d_neg = det([0.0; 4], Some((0.0, 0.9)));
+        d_neg.grasp_width_px = Some(-10.0);
+
+        let frames = vec![d1, d2, d3, d_low, d_nowidth, d_neg];
+
+        // min_conf = 0.5 filters out d_low. Valid widths: [40, 50, 45]. Median of [40, 45, 50] is 45.0.
+        let w = frames_width_px(&frames, 0.5);
+        assert_eq!(w, Some(45.0));
+
+        // Even count: only d1 and d2 (min_conf = 0.75). Widths: [40, 50]. Median is 45.0.
+        let w_even = frames_width_px(&frames, 0.75);
+        assert_eq!(w_even, Some(45.0));
+
+        // min_conf too high: no frames qualify
+        assert_eq!(frames_width_px(&frames, 0.95), None);
+
+        // Empty slice
+        assert_eq!(frames_width_px(&[], 0.5), None);
+    }
+
+    #[test]
+    fn test_plane_point_width_conversion() {
+        let setup = GraspSetup { camera_tilt_deg: 0.0, fx_px: 600.0, fy_px: 600.0, image_size_px: [640.0, 360.0], ..Default::default() };
+        let cam = CamModel::assumed(&crate::chain::ArmModel::REBOT_DEV_ARM, &setup, &CameraMount::default());
+        let pose = Pose::new(look_down(&inspect_r()), [0.3, 0.0, 0.20]);
+        let plane_z = 0.0;
+
+        let centre_px = [320.0, 180.0];
+        let w_px = 60.0;
+        let closing_deg: f64 = 90.0;
+        let (u_x, u_y) = (closing_deg.to_radians().cos(), closing_deg.to_radians().sin());
+        let half_w = w_px / 2.0;
+        let p0_px = [centre_px[0] - half_w * u_x, centre_px[1] - half_w * u_y];
+        let p1_px = [centre_px[0] + half_w * u_x, centre_px[1] + half_w * u_y];
+
+        let p0 = cam.plane_point(&pose, p0_px, plane_z).expect("p0 meets plane");
+        let p1 = cam.plane_point(&pose, p1_px, plane_z).expect("p1 meets plane");
+        let width_m = kinematics::norm(&kinematics::sub(&p1, &p0));
+
+        // Projected width: dx = w_px * height / fx = 60.0 * 0.20 / 600.0 = 0.02 m (20 mm)
+        assert!((width_m - 0.02).abs() < 1e-4, "expected 0.02 m, got {width_m}");
     }
 }

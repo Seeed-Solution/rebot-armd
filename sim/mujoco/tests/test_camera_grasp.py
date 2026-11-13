@@ -92,13 +92,15 @@ CASES = {
     # axis_block: the 6 x 3 cm block turned 36.5 deg (seed 14); J6 turns the jaws across its long
     # side from the detector's mask angle
     "axis_block": ([*AXIS_LENS, "--objects", "block", "--seed", "14"], None),
+    "axis_slab": ([*AXIS_LENS, "--objects", "slab"], None),
+    "axis_cube_preopen": (AXIS_LENS, None),
 }
 # object the case grasps (default: the cube) and its height (scene.py KINDS)
-TARGETS = {"axis_cup": "cup", "axis_block": "block"}
-HEIGHTS_M = {"cube": 0.04, "cup": 0.07, "block": 0.04}
+TARGETS = {"axis_cup": "cup", "axis_block": "block", "axis_slab": "slab", "axis_cube_preopen": "cube"}
+HEIGHTS_M = {"cube": 0.04, "cup": 0.07, "block": 0.04, "slab": 0.02}
 # approach height per case (default: v8 0.15 m, v5 0.25 m); axis_cube / axis_cup 0.15 m; axis_block
 # 0.20 m (at 0.15 m the 6 cm block's box reaches the image border and the J6 alignment is skipped)
-APPROACH_M = {"axis_cube": 0.15, "axis_cup": 0.15, "axis_block": 0.20}
+APPROACH_M = {"axis_cube": 0.15, "axis_cup": 0.15, "axis_block": 0.20, "axis_slab": 0.15, "axis_cube_preopen": 0.15}
 
 
 def view_pose(cam: dict, cube_xy, z: float, miss_m=(0.0, 0.0)):
@@ -197,14 +199,21 @@ def test_tap_to_grasp_the_cube(cam_rig):
     overrides = {"fx_px": cam["fx_px"], "fy_px": cam["fx_px"], "approach_height_m": approach}
     if not v8:  # v8: the point under the jaws is outside the image at 0.15 m; camera-down does not use it
         overrides["grip_pixel_norm"] = cam["grip_pixel_norm_at"][f"{approach:.2f}"]
+    if case == "axis_cube_preopen":
+        overrides["pre_open"] = "on"
     t0 = time.time()
     ack = client.command("/api/v1/action/grasp", {"label": target, "box_norm": box, "frame_id": det["frame_id"],
                                                   "overrides": overrides})
     rec = None
+    pre_descend_j7 = None
     while time.time() - t0 < 120:
         obs = client.observation()
         a = obs.get("action")
         if a and a["id"] == ack["action_id"]:
+            if a.get("phase") == "descend" and pre_descend_j7 is None:
+                positions = obs.get("commanded_positions") or obs.get("measured_positions") or []
+                if len(positions) > 6:
+                    pre_descend_j7 = positions[6]
             if a["state"] != "running":
                 rec = a
                 break
@@ -221,8 +230,17 @@ def test_tap_to_grasp_the_cube(cam_rig):
           f"final_offset_px={r.get('final_offset_px')} expected={ack.get('expected_duration_s')} s in {dt:.1f} s "
           f"height_source={r.get('height_source')} height_reason={r.get('height_reason')} "
           f"object_height_m={r.get('object_height_m')} close_height_m={r.get('close_height_m')} probe_dz_m={r.get('probe_dz_m')} "
-          f"align={r.get('align')} recentre={r.get('recentre')} post_lift={r.get('post_lift')}")
+          f"align={r.get('align')} recentre={r.get('recentre')} post_lift={r.get('post_lift')} grasp_width_m={r.get('grasp_width_m')} "
+          f"pre_open={r.get('pre_open')} pre_open_m={r.get('pre_open_m')} held_width_m={r.get('held_width_m')}")
     print(f"{target} after the grasp: {cube}")
+    if case == "axis_slab":
+        print(f"slab final status: {json.dumps(rec)}")
+        assert rec is not None and rec["state"] == "failed" and rec["code"] == "TOO_WIDE", json.dumps(rec)
+        assert rec.get("phase") == "align", json.dumps(rec)
+        assert rec.get("grasp_width_m") is not None and rec["grasp_width_m"] > 0.075, json.dumps(rec)
+        assert not cube["grasped"], cube
+        assert state["tcp"][2] >= approach - 0.01, f"tcp z {state['tcp'][2]} descended below approach {approach}"
+        return
     assert rec is not None and rec["state"] == "done" and rec["holding"] is True, \
         json.dumps(rec) + "\n" + (logs / "armd.log").read_text()[-3000:]
     assert cube["grasped"] and cube["lifted_m"] > 0.05, cube
@@ -237,6 +255,12 @@ def test_tap_to_grasp_the_cube(cam_rig):
         assert abs(rec["object_height_m"] - h) <= 0.01, json.dumps(rec)
         expect_close = min(max(rec["object_height_m"] * 0.5, 0.015), 0.06)
         assert abs(rec["close_height_m"] - expect_close) < 1e-3, json.dumps(rec)
+    if case == "axis_cube_preopen":
+        assert rec["pre_open"] == "done", json.dumps(rec)
+        assert rec.get("pre_open_m") is not None and abs(rec["pre_open_m"] - 0.055) < 0.008, json.dumps(rec)
+        assert rec.get("held_width_m") is not None and abs(rec["held_width_m"] - 0.040) < 0.010, json.dumps(rec)
+        if pre_descend_j7 is not None:
+            assert abs(pre_descend_j7 - (-3.688)) < 0.4, f"pre-descend j7 {pre_descend_j7}"
     if case == "axis_block":
         # the jaws turned from the mask angle, and after the lift the block lies across them
         # (block long side, body x, about perpendicular to the jaw closing direction, tool y)

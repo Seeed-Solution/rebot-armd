@@ -92,6 +92,8 @@ pub struct PendingPlace {
     pub input: PlanInput,
     pub request: PlaceRequest,
     pub open_rad: f32,
+    pub held_spill_safe: bool,
+    pub spill_max_tilt_deg: f64,
 }
 
 /// A place whose phases were found feasible from the start state.
@@ -102,6 +104,7 @@ pub struct PlannedPlace {
     pub r_place: Mat3,
     /// Planned durations of lift, approach, descend, retreat (0 when skipped).
     pub durations: [f64; 4],
+    pub orientation_levelled: bool,
 }
 
 /// Under the lock: parse and check preconditions.
@@ -119,7 +122,9 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Pend
         return Err(crate::safety::SafetyError::EpochMismatch { expected: inner.safety.epoch_id(), received: epoch }.into());
     }
     let input = inner.plan_input()?;
-    Ok(PendingPlace { input, request, open_rad })
+    let held_spill_safe = inner.held.as_ref().is_some_and(|h| h.spill_safe);
+    let spill_max_tilt_deg = inner.grasp_setup().map_or(8.0, |s| s.spill_max_tilt_deg);
+    Ok(PendingPlace { input, request, open_rad, held_spill_safe, spill_max_tilt_deg })
 }
 
 /// Height the lift phase goes to from `z`.
@@ -129,10 +134,19 @@ fn above(req: &PlaceRequest) -> Vec3 { [req.target[0], req.target[1], req.target
 
 /// Outside the lock: plan lift → approach → descend → retreat chained from the start state.
 pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
-    let PendingPlace { input, request, open_rad } = pending;
+    let PendingPlace { input, request, open_rad, held_spill_safe, spill_max_tilt_deg } = pending;
     let speed = request.speed();
     let start = input.arm.fk(&input.q0);
-    let r_place = request.orientation.unwrap_or(start.r);
+    let mut r_place = request.orientation.unwrap_or(start.r);
+    let mut orientation_levelled = false;
+    if held_spill_safe {
+        let tool_z = kinematics::column(&r_place, 0)[2];
+        let tilt = (-tool_z).clamp(-1.0, 1.0).acos().to_degrees();
+        if tilt > spill_max_tilt_deg {
+            r_place = crate::grasp::look_down(&r_place);
+            orientation_levelled = true;
+        }
+    }
     let mut cur = input.clone();
     let step = |cur: &mut PlanInput, goal: Pose| -> Result<f64, ArmError> {
         let path = motion::plan_cartesian(cur, goal, speed)?;
@@ -151,7 +165,7 @@ pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
         let goal = motion::resolve_goal(&cur, &GoalSpec::Absolute { p: [p[0], p[1], p[2] + request.approach_m], r: None });
         step(&mut cur, goal)?
     } else { 0.0 };
-    Ok(PlannedPlace { input, request, r_place, durations: [lift, approach, descend, retreat] })
+    Ok(PlannedPlace { input, request, r_place, durations: [lift, approach, descend, retreat], orientation_levelled })
 }
 
 /// Rough total duration for the ack (paths + 0.5 s settle each, gripper open 2 s).
@@ -170,6 +184,11 @@ pub async fn start(supervisor: &Arc<ArmSupervisor>, body: &Value) -> Result<(u64
     let planned = tokio::task::spawn_blocking(move || plan(pending)).await
         .map_err(|e| ArmError::Internal(format!("planner task failed: {e}")))??;
     let id = supervisor.inner().write().await.begin_macro("place", &planned.input, planned.request.tag.clone())?;
+    if planned.orientation_levelled {
+        supervisor.inner().write().await.update_action(id, |a| {
+            a.orientation = Some("levelled".into());
+        });
+    }
     let duration = expected_duration(&planned);
     spawn(supervisor.clone(), id, planned);
     Ok((id, duration))
@@ -222,9 +241,13 @@ async fn run(sup: Arc<ArmSupervisor>, id: u64, planned: PlannedPlace) {
         // released: the jaws are open, nothing is held
         Ok(()) => inner.finish_macro(id, "done", None, None, planned.request.release.then_some(false), None),
         Err(Stop::Fail(code, message)) => {
-            tracing::info!("Place {id} failed: {code} {message}");
             inner.finish_macro(id, "failed", Some(&code), Some(message), None, None);
         }
         Err(Stop::Cancelled) => inner.finish_macro(id, "cancelled", None, None, None, None),
+    }
+    if let Some(a) = inner.last_action.as_ref().filter(|a| a.id == id) {
+        let code = a.code.as_deref().unwrap_or(if a.state == "done" { "OK" } else { &a.state });
+        let worst = a.motions.iter().max_by(|x, y| x.track_mm.total_cmp(&y.track_mm));
+        tracing::info!("Place {id} {code}: phase_ms {:?}, worst motion {:?}", a.phase_ms, worst);
     }
 }

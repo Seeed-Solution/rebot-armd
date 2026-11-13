@@ -5,6 +5,7 @@
 //!   slerp in rotation, one DLS IK solve per sample, single quintic time scaling.
 //! - [`PathTrajectory`] executes such a path with lag-aware time scaling.
 //! - [`GripperMotion`] runs open / close / move of the 7-DOF gripper with grasp detection.
+use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -404,7 +405,7 @@ pub fn parse_move_relative(body: &Value) -> Result<(GoalSpec, Speed, Option<Stri
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GripperCommand { Open, Close, Move }
+pub enum GripperCommand { Open, Close, Move, Seek }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GripperRequest {
@@ -614,6 +615,10 @@ impl GripperMotion {
             GripperCommand::Open => policy.open_rad,
             GripperCommand::Close => policy.closed_rad,
             GripperCommand::Move => policy.closed_rad + request.fraction.unwrap_or(0.0) as f32 * (policy.open_rad - policy.closed_rad),
+            GripperCommand::Seek => {
+                let dir = if policy.closed_rad >= policy.open_rad { 1.0 } else { -1.0 };
+                policy.closed_rad + dir * 0.6
+            }
         }.clamp(limit.min_position, limit.max_position);
         let limit = JointLimit { max_velocity: request.speed as f32, ..limit };
         let mut m = Self { request, policy, limit, target, start, elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, moved: false, phase: GripPhase::Moving };
@@ -697,7 +702,7 @@ impl GripperMotion {
             positions[6] = q7;
             velocities[6] = 0.0;
             done(None, Some((self.policy.closed_rad - m7) * self.close_dir()))
-        } else if still && ((m7 - self.target).abs() < SETTLE_POS_RAD as f32
+        } else if self.request.command != GripperCommand::Seek && still && ((m7 - self.target).abs() < SETTLE_POS_RAD as f32
             || (cmd_at_target && (m7 - self.target).abs() < GRIPPER_STOP_SHORT_RAD)) {
             // the jaw stopped close to the target: the real gripper opens to about -5.61 against a
             // -5.70 command (mechanical stop / POS_VEL offset); stopping farther away is a jam -> timeout
@@ -791,6 +796,15 @@ pub struct ActionStatus {
     pub align: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_turn_rad: Option<f32>,
+    /// Grasp J6 alignment: angle dispersion across centring frames (deg).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle_spread_deg: Option<f32>,
+    /// Place orientation override (`levelled` when tilt was reduced for a spill-safe object).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<String>,
+    /// Grasp: measured cross-section width of the target on the table plane (m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grasp_width_m: Option<f32>,
     /// Grasp height probe: `scale` (object top estimated, `object_height_m` above the table) or
     /// `setup` (fallback to `grasp_height_m`, why in `height_reason`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -827,6 +841,43 @@ pub struct ActionStatus {
     /// stopped on the object) or `dropped`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_lift: Option<String>,
+    /// Grasp width-based pre-open: `done`, `off` or `skipped:<reason>`; absent before the phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_open: Option<String>,
+    /// Grasp pre-open opening width (m) before descend; absent when pre-open did not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_open_m: Option<f32>,
+    /// Grasp opening width (m) from measured J7 after the close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_width_m: Option<f32>,
+    /// Gripper zero check: measured J7 position at the stall stop (rad).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_rad: Option<f32>,
+    /// Gripper zero check: stop_rad minus base closed_rad (rad).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_rad: Option<f32>,
+    /// Gripper zero check: true when |offset_rad| <= threshold_rad.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass: Option<bool>,
+    /// Accumulated runtime per macro phase (ms).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub phase_ms: BTreeMap<String, u32>,
+    /// Execution diagnostics for each arm sub-motion of the macro action.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub motions: Vec<MacroMotionDiag>,
+}
+
+/// Execution diagnostics for one sub-motion in a macro action (grasp, place).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MacroMotionDiag {
+    pub phase: String,
+    pub ms: u32,
+    pub track_mm: f32,
+    pub track_deg: f32,
+    pub goal_mm: f32,
+    pub goal_deg: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact: Option<bool>,
 }
 
 impl ActionStatus {

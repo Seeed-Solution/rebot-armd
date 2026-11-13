@@ -7,6 +7,7 @@ pub mod dynamics;
 pub mod grasp;
 pub mod gravity;
 pub mod gravity_comp;
+pub mod gripper_calib;
 pub mod keepout;
 pub mod kinematics;
 pub mod macro_action;

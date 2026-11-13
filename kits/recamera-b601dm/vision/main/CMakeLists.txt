@@ -19,6 +19,8 @@ set(srcs
     ${CMAKE_CURRENT_LIST_DIR}/marker_filter.cpp
     ${CMAKE_CURRENT_LIST_DIR}/camera_model.cpp
     ${CMAKE_CURRENT_LIST_DIR}/detector.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mask_geom.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/seg_model.cpp
 )
 
 component_register(

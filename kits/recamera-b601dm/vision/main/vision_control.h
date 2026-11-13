@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "mask_geom.h"
+
 namespace rv {
 
 /** Perception provider API version, reported as "api_version" in every :8090 body. */
@@ -99,6 +101,7 @@ struct VisionResult {
     bool ran_aruco = false;
     float yolo_ms = 0;
     float aruco_ms = 0;
+    float mask_ms = -1.0f;
     int width = 640;   ///< visible image size that detections / markers refer to
     int height = 360;
     std::string detections_json = "[]";  ///< normalised to width x height
@@ -149,6 +152,9 @@ public:
         bool yolo_available = true;
         std::string model_name;
         std::string model_path;
+        std::string model_kind = "detect";
+        bool mask = false;
+        int mask_max_boxes = 3;
         std::string family = "aruco4x4_50";
     };
 
@@ -156,8 +162,8 @@ public:
 
     class TriggerScope {
     public:
-        TriggerScope(VisionControl& c, uint64_t request_ms, Pipelines p) : c_(&c), req_(request_ms) {
-            c_->trigger_begin(req_, p);
+        TriggerScope(VisionControl& c, uint64_t request_ms, Pipelines p, const MaskFocus* focus = nullptr) : c_(&c), req_(request_ms) {
+            c_->trigger_begin(req_, p, focus);
         }
         ~TriggerScope() { release(); }
         TriggerScope(const TriggerScope&) = delete;
@@ -191,6 +197,9 @@ public:
     bool yolo_available() const noexcept { return yolo_available_; }
     const std::string& model_name() const noexcept { return model_name_; }
     const std::string& model_path() const noexcept { return model_path_; }
+    const std::string& model_kind() const noexcept { return model_kind_; }
+    bool mask_enabled() const noexcept { return mask_; }
+    int mask_max_boxes() const noexcept { return mask_max_boxes_; }
     const std::string& family() const noexcept { return family_; }
 
     /** Camera gate rate requested last (camera_gate_fps for the current state). */
@@ -201,15 +210,20 @@ public:
      * mono_ms() the frame is known to be newer than. Drops subscriptions expired by frame_ms,
      * runs the continuous pipelines at their rate (RateGate) and adds the pipelines of every
      * trigger requested at or before frame_ms. triggered (optional): the pipelines of those
-     * triggers alone.
+     * triggers alone. focus_out (optional): active mask focus for this frame.
      */
-    Pipelines frame_plan(uint64_t frame_ms, Pipelines* triggered = nullptr);
+    Pipelines frame_plan(uint64_t frame_ms, Pipelines* triggered = nullptr, MaskFocus* focus_out = nullptr);
     /** frame_plan() calls so far (frames offered to the pipelines). */
     uint32_t offered() const;
 
     /** Frames offered to frame_plan() and results published, per second (last 2 s). */
     double input_fps(uint64_t now_ms) const;
     double result_fps(uint64_t now_ms) const;
+
+    /** Persistent mask focus methods. */
+    void set_mask_focus(const MaskFocus& f);
+    void clear_mask_focus();
+    bool get_mask_focus(uint64_t now_ms, MaskFocus& out) const;
 
     /**
      * Change any of mode / continuous enable / rate in one step. Mode off forces enabled
@@ -234,10 +248,14 @@ public:
 
     /** A trigger without pipelines: the default subscription's, else the last active mode's. */
     Pipelines default_trigger_pipelines() const;
-    void trigger_begin(uint64_t request_ms, Pipelines p);
+    void trigger_begin(uint64_t request_ms, Pipelines p, const MaskFocus* focus = nullptr);
     void trigger_end(uint64_t request_ms);
-    TriggerScope trigger_scope(uint64_t request_ms, Pipelines p) { return TriggerScope(*this, request_ms, p); }
-    TriggerScope trigger_scope(uint64_t request_ms) { return TriggerScope(*this, request_ms, default_trigger_pipelines()); }
+    TriggerScope trigger_scope(uint64_t request_ms, Pipelines p, const MaskFocus* focus = nullptr) {
+        return TriggerScope(*this, request_ms, p, focus);
+    }
+    TriggerScope trigger_scope(uint64_t request_ms) {
+        return TriggerScope(*this, request_ms, default_trigger_pipelines(), nullptr);
+    }
 
     void publish(const VisionResult& r);
     /** As aruco-detector: returns true when no result exists or the wait was not satisfied. */
@@ -253,6 +271,8 @@ private:
     struct Trigger {
         uint64_t request_ms;
         Pipelines pipelines;
+        bool has_focus = false;
+        MaskFocus focus;
     };
     Continuous continuous_locked() const noexcept;
     bool processing_locked() const noexcept { return continuous_locked().active() || !triggers_.empty(); }
@@ -268,6 +288,9 @@ private:
     const bool yolo_available_;
     const std::string model_name_;
     const std::string model_path_;
+    const std::string model_kind_;
+    const bool mask_;
+    const int mask_max_boxes_;
     const std::string family_;
     OnChange on_change_;
     mutable std::mutex mu_;
@@ -276,6 +299,7 @@ private:
     Mode last_active_ = Mode::Yolo;
     bool continuous_ = false;
     int fps_ = 5;
+    MaskFocus persistent_focus_;
     std::vector<Trigger> triggers_;  ///< pending triggers
     std::vector<Subscription> subs_;
     uint64_t next_sub_id_ = 1;

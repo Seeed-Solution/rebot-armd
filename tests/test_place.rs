@@ -241,3 +241,69 @@ async fn stop_between_phases_refuses_the_next_sub_motion() {
     let a = inner.last_action.clone().unwrap();
     assert_eq!((a.id, a.state.as_str(), a.code.as_deref()), (id, "cancelled", Some("STOPPED")), "{a:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn place_spill_safe_cup_is_levelled_and_pen_is_kept() {
+    let arm = armd::chain::ArmModel::REBOT_DEV_ARM;
+    let lo = [-3.1, -2.05, -2.6, -3.1, -2.05, -6.2];
+    let hi = [3.1, 2.05, 2.6, 3.1, 2.05, 6.2];
+    let target = [0.25, 0.05, 0.15];
+    let r_start = kinematics::fk(&kinematics::q6(&START)).r;
+    let r_level = armd::grasp::look_down(&r_start);
+    let r_tilted = kinematics::mat_mul(&kinematics::axis_r(&[0.0, 1.0, 0.0], 20.0f64.to_radians()), &r_level);
+    let sol = arm.solve_dls(&kinematics::Pose::new(r_tilted, target), &std::array::from_fn(|i| START[i] as f64), &lo, &hi, kinematics::PAR.w);
+    assert!(sol.ok, "tilted pose reachable: ok={}, ep={}, er={}", sol.ok, sol.ep, sol.er);
+    let mut bin = [0.0f32; 7];
+    for i in 0..6 { bin[i] = sol.q[i] as f32; }
+    bin[6] = -1.5;
+
+    let r_pose = kinematics::fk(&kinematics::q6(&bin)).r;
+    let tool_z = kinematics::column(&r_pose, 0)[2];
+    let tilt = (-tool_z).clamp(-1.0, 1.0).acos().to_degrees();
+    assert!(tilt > 15.0, "bin pose is tilted: {tilt:.2}°");
+
+    // 1. Holding a cup (spill_safe: true) -> levelled
+    {
+        let mut r = rig(vec![]).await;
+        let ack = r.rpc("/api/v1/poses/save", json!({"name": "bin_tilted", "positions": bin})).await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        r.sup.inner().write().await.held = Some(armd::supervisor::HeldObject {
+            label: "cup".into(),
+            spill_safe: true,
+        });
+        let id = r.place(json!({"pose": "bin_tilted", "tag": "cup"})).await;
+        let (_, _, a) = r.run(id).await;
+        assert_eq!((a.state.as_str(), a.orientation.as_deref()), ("done", Some("levelled")), "{a:?}");
+        let q = r.q().await;
+        let r_cup = kinematics::fk(&kinematics::q6(&q)).r;
+        let cup_tool_z = kinematics::column(&r_cup, 0)[2];
+        let cup_tilt = (-cup_tool_z).clamp(-1.0, 1.0).acos().to_degrees();
+        assert!(cup_tilt < 1.0, "cup was levelled: {cup_tilt:.2}°");
+        assert!(r.sup.inner().read().await.held.is_none());
+    }
+
+    // 2. Holding a pen (spill_safe: false) -> kept
+    {
+        let mut r = rig(vec![]).await;
+        let ack = r.rpc("/api/v1/poses/save", json!({"name": "bin_tilted", "positions": bin})).await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        r.sup.inner().write().await.held = Some(armd::supervisor::HeldObject {
+            label: "pen".into(),
+            spill_safe: false,
+        });
+        let id = r.place(json!({"pose": "bin_tilted", "tag": "pen"})).await;
+        let (_, _, a) = r.run(id).await;
+        assert_eq!((a.state.as_str(), a.orientation.as_deref()), ("done", None), "{a:?}");
+        let q = r.q().await;
+        let r_pen = kinematics::fk(&kinematics::q6(&q)).r;
+        assert!(kinematics::norm(&kinematics::log_v(&kinematics::mul_t(&r_pen, &r_pose))) < 0.02, "pen kept pose orientation");
+        assert!(r.sup.inner().read().await.held.is_none());
+    }
+}
+
+
+
+
+
+
+

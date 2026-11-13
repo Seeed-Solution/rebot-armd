@@ -159,7 +159,7 @@ struct PendingPlan {
     tag: Option<String>,
 }
 
-enum ActionStart { Started(u64, f64), Plan(PendingPlan), Macro(PendingMacro), Replay(crate::replay::ReplayInput) }
+enum ActionStart { Started(u64, f64), Plan(PendingPlan), Macro(PendingMacro), Replay(crate::replay::ReplayInput), DryRunGrasp(Value) }
 
 /// A macro action (crate::macro_action) checked under the lock, planned without it.
 enum PendingMacro { Grasp(crate::grasp::PendingGrasp), Place(crate::place::PendingPlace) }
@@ -187,6 +187,11 @@ impl PlannedMacro {
             }
             Self::Place(planned) => {
                 let id = inner.begin_macro("place", &planned.input, planned.request.tag.clone())?;
+                if planned.orientation_levelled {
+                    inner.update_action(id, |a| {
+                        a.orientation = Some("levelled".into());
+                    });
+                }
                 let duration = crate::place::expected_duration(&planned);
                 crate::place::spawn(supervisor.clone(), id, planned);
                 Ok((id, duration))
@@ -206,7 +211,16 @@ fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: 
             let (id, duration) = inner.start_gripper(request, epoch)?;
             return Ok(ActionStart::Started(id, duration));
         }
-        "/api/v1/action/grasp" => return Ok(ActionStart::Macro(PendingMacro::Grasp(crate::grasp::prepare(inner, body, epoch)?))),
+        "/api/v1/action/gripper_zero_check" => {
+            let (id, duration) = inner.start_gripper_zero_check(body, epoch)?;
+            return Ok(ActionStart::Started(id, duration));
+        }
+        "/api/v1/action/grasp" => {
+            if body.get("dry_run").and_then(Value::as_bool) == Some(true) {
+                return Ok(ActionStart::DryRunGrasp(body.clone()));
+            }
+            return Ok(ActionStart::Macro(PendingMacro::Grasp(crate::grasp::prepare(inner, body, epoch)?)));
+        }
         "/api/v1/action/place" => return Ok(ActionStart::Macro(PendingMacro::Place(crate::place::prepare(inner, body, epoch)?))),
         "/api/v1/action/replay" => {
             let request = crate::replay::parse_replay(body).map_err(ArmError::from)?;
@@ -250,6 +264,14 @@ fn state_command(inner: &mut SupervisorInner, path: &str, body: &Value, setup_pa
         "/api/v1/safety/collision" => crate::collision::update(inner, body).map(|(config, write)| (vec![("collision", json!(config))], write)),
         "/api/v1/workspace/keepout" => crate::keepout::update(inner, body)
             .map(|(state, write)| (vec![("boxes", json!(state.boxes)), ("source", json!(state.source))], write)),
+        "/api/v1/gripper/calibration" => crate::gripper_calib::update(inner, body).map(|(policy, write)| {
+            (vec![
+                ("policy", json!(policy)),
+                ("closed_rad", json!(policy.closed_rad)),
+                ("open_rad", json!(policy.open_rad)),
+                ("jaw_opening", json!(policy.jaw_opening)),
+            ], write)
+        }),
         _ => return None,
     })
 }
@@ -349,6 +371,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let mut pending_plan: Option<(PendingPlan, u64)> = None;
             let mut pending_macro: Option<(Value, PendingMacro, u64)> = None;
             let mut pending_replay: Option<(Value, crate::replay::ReplayInput, u64)> = None;
+            let mut pending_dry_run_grasp: Option<(Value, Value)> = None;
             let mut pending_write: Option<crate::persist::PendingWrite> = None;
             if kind == "estop" || kind == "e_stop" {
                 let (state, epoch) = recv_supervisor.trigger_e_stop().await;
@@ -437,9 +460,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         let supplied_generation_ok = generation == local_generation || (kind == "heartbeat" && generation == 0);
                         let authorized = local_generation != 0 && supplied_generation_ok && label_matches
                             && inner.validate_servo_lease(&recv_connection, local_generation);
+                        let is_dry_run = kind == "command" && value.get("path").and_then(Value::as_str) == Some("/api/v1/action/grasp") && value.get("body").and_then(|b| b.get("dry_run")).and_then(Value::as_bool) == Some(true);
                         if (kind == "servo" || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream")) && value.get("generation").and_then(Value::as_u64).is_none() {
                             response = Some(json!({"type":"servo_reject", "reason":"missing_generation"}));
-                        } else if !authorized {
+                        } else if !authorized && !is_dry_run {
                             response = Some(if kind == "command" {
                                 json!({"type":"command_reject", "request_id":value.get("request_id"), "status":409, "code":"LEASE_LOST", "message":"This connection does not own an active lease", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
                             } else if kind == "release_lease" {
@@ -457,7 +481,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             response = Some(json!({"type":"lease_released", "success":released}));
                         } else {
                             let epoch = inner.safety.epoch_id();
-                            if value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
+                            if !is_dry_run && value.get("epoch_id").and_then(Value::as_u64) != Some(epoch) {
                                 response = Some(if kind == "command" {
                                     json!({"type":"command_reject", "request_id":value.get("request_id"), "status":409, "code":"EPOCH_MISMATCH", "message":"Command epoch is no longer current", "error":"EPOCH_MISMATCH", "epoch_id":epoch})
                                 } else { json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":inner.safety.state()}) });
@@ -477,6 +501,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             Ok(ActionStart::Plan(plan)) => { pending_plan = Some((plan, local_generation)); None }
                                             Ok(ActionStart::Macro(m)) => { pending_macro = Some((value["request_id"].clone(), m, local_generation)); None }
                                             Ok(ActionStart::Replay(input)) => { pending_replay = Some((value["request_id"].clone(), input, local_generation)); None }
+                                            Ok(ActionStart::DryRunGrasp(body)) => { pending_dry_run_grasp = Some((value["request_id"].clone(), body)); None }
                                             Err(error) => Some(command_reject(&inner, &value["request_id"], error)),
                                         };
                                     } else if let Some(result) = state_command(&mut inner, path, &value["body"], recv_deps.setup_path.as_ref()) {
@@ -599,6 +624,15 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             }
                         }
                     });
+                }
+                if let Some((request_id, body)) = pending_dry_run_grasp.take() {
+                    let (reachable, code, message) = crate::grasp::dry_run(&recv_supervisor, &body).await;
+                    let inner = recv_supervisor.inner().read().await;
+                    let mut ack = command_ack(&inner, &request_id, None);
+                    ack["reachable"] = json!(reachable);
+                    ack["code"] = json!(code);
+                    ack["message"] = json!(message);
+                    response = Some(ack);
                 }
                 // State files are written by the single persist writer; this loop does not wait
                 // for the disk: the ack (with `persisted`) is sent when the write finished.

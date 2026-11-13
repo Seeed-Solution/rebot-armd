@@ -337,9 +337,24 @@ pub async fn motion_unload(
 
 /// POST /api/v1/action/{move_to,move_relative,gripper}: actions run only on the
 /// WebSocket that holds the lease (`docs/agent_action_api.md`).
+/// Grasp dry run (`dry_run: true`) is allowed without a lease and returns 200 OK with reachability.
 pub async fn action_requires_lease(
     State(supervisor): State<Arc<ArmSupervisor>>,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if uri.path() == "/api/v1/action/grasp" {
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&body) {
+            if val.get("dry_run").and_then(serde_json::Value::as_bool) == Some(true) {
+                let (reachable, code, message) = crate::grasp::dry_run(&supervisor, &val).await;
+                return Ok(Json(serde_json::json!({
+                    "reachable": reachable,
+                    "code": code,
+                    "message": message,
+                })));
+            }
+        }
+    }
     Err(actuator_requires_connection_lease(&supervisor).await)
 }
 
@@ -466,4 +481,9 @@ pub async fn get_collision(State(supervisor): State<Arc<ArmSupervisor>>) -> Resp
 /// `GET /api/v1/safety/describe`: limits, stops and faults of this armd (no lease).
 pub async fn get_safety_describe(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
     Json(supervisor.inner().read().await.safety_describe()).into_response()
+}
+
+/// `GET /api/v1/gripper/calibration`: current gripper calibration and effective policy (no lease).
+pub async fn get_gripper_calibration(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
+    Json(supervisor.inner().read().await.gripper_calibration_response()).into_response()
 }

@@ -224,6 +224,7 @@
     "align_min_aspect": 1.2,
     "align_j6": true,
     "align_min_angle_conf": 0.3,
+    "align_max_angle_spread_deg": 15.0,
     "approach_speed_mps": 0.05,
     "descend_speed_mps": 0.03,
     "phase_timeout_s": 25.0,
@@ -236,7 +237,18 @@
     "recentre_max_iterations": 3,
     "descend_contact_stop_nm": null,
     "post_lift_settle_ms": 300,
-    "recheck_tol_px": 40.0
+    "recheck_tol_px": 40.0,
+    "max_grasp_width_m": 0.075,
+    "spill_safe_labels": [
+      "cup",
+      "bottle",
+      "wine glass",
+      "bowl",
+      "vase"
+    ],
+    "spill_max_tilt_deg": 8.0,
+    "pre_open": "auto",
+    "pre_open_margin_m": 0.015
   },
   "gravity_comp": {
     "ramp_in_s": 1.0,

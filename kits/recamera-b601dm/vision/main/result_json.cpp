@@ -1,5 +1,6 @@
 #include "result_json.h"
 
+#include <cmath>
 #include <cstdio>
 #include <iomanip>
 #include <sstream>
@@ -43,7 +44,12 @@ std::string detections_json(const std::vector<DetBox>& dets, const ContentRect& 
         s << "{\"class_id\":" << d.class_id << ",\"format\":\"xywh_center\",\"class_name\":\"";
         json_escape(s, d.class_name);
         s << "\",\"confidence\":" << std::setprecision(3) << d.confidence << ",\"x\":" << std::setprecision(4) << x
-          << ",\"y\":" << y << ",\"w\":" << w << ",\"h\":" << h << '}';
+          << ",\"y\":" << y << ",\"w\":" << w << ",\"h\":" << h;
+        if (std::isfinite(d.angle_deg)) s << ",\"angle_deg\":" << std::setprecision(2) << d.angle_deg;
+        if (std::isfinite(d.angle_conf)) s << ",\"angle_conf\":" << std::setprecision(3) << d.angle_conf;
+        if (std::isfinite(d.grasp_width_px)) s << ",\"grasp_width_px\":" << std::setprecision(2) << d.grasp_width_px;
+        if (d.mask_focus) s << ",\"mask_focus\":true";
+        s << '}';
     }
     s << ']';
     return s.str();

@@ -30,6 +30,46 @@ IDLE_FPS = 1
 MODE_PIPELINES = {"off": [], "yolo": ["yolo"], "aruco": ["aruco"], "both": ["yolo", "aruco"]}
 
 
+def _box_iou(b1: list[float], b2: list[float]) -> float:
+    ix0 = max(b1[0], b2[0])
+    iy0 = max(b1[1], b2[1])
+    ix1 = min(b1[2], b2[2])
+    iy1 = min(b1[3], b2[3])
+    iw = max(0.0, ix1 - ix0)
+    ih = max(0.0, iy1 - iy0)
+    inter = iw * ih
+    a1 = max(0.0, b1[2] - b1[0]) * max(0.0, b1[3] - b1[1])
+    a2 = max(0.0, b2[2] - b2[0]) * max(0.0, b2[3] - b2[1])
+    union = a1 + a2 - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _apply_mask_focus(detections: list[dict], focus: dict | None) -> list[dict]:
+    out = [dict(d) for d in detections]
+    for d in out:
+        d.pop("mask_focus", None)
+    if not focus or "box_norm" not in focus:
+        return out
+    fbox = focus["box_norm"]
+    flabel = focus.get("label")
+    best_iou = 0.099999
+    best_det = None
+    for d in out:
+        if flabel and d.get("class_name") != flabel and d.get("name") != flabel:
+            continue
+        if "x" not in d or "y" not in d or "w" not in d or "h" not in d:
+            continue
+        cx, cy, w, h = d["x"], d["y"], d["w"], d["h"]
+        dbox = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
+        iou = _box_iou(fbox, dbox)
+        if iou > best_iou:
+            best_iou = iou
+            best_det = d
+    if best_det is not None:
+        best_det["mask_focus"] = True
+    return out
+
+
 # --------------------------------------------------------------------------- video
 
 
@@ -130,6 +170,7 @@ class Perception:
         self.latest: dict | None = None  # newest published result
         self.triggers = 0
         self.pending: list[dict] = []  # registered triggers: {"called": mono, "pipelines": [...]}
+        self.mask_focus: dict | None = None
         self._gate = 0.0  # mono of the last frame the continuous rate let through
         self.frames_in: list[float] = []
         self.results_out: list[float] = []
@@ -139,6 +180,24 @@ class Perception:
         now = time.monotonic()
         for sid in [s for s, v in self.subs.items() if v["expires"] <= now]:
             del self.subs[sid]
+        if self.mask_focus is not None and self.mask_focus["expires"] <= now:
+            self.mask_focus = None
+
+    def mask_focus_body(self) -> dict | None:
+        self._expire()
+        if self.mask_focus is None:
+            return None
+        now = time.monotonic()
+        left = max(0, int((self.mask_focus["expires"] - now) * 1000))
+        out = {
+            "box_norm": list(self.mask_focus["box_norm"]),
+            "ttl_ms": self.mask_focus["ttl_ms"],
+            "expires_in_ms": left,
+            "remaining_ttl_ms": left,
+        }
+        if self.mask_focus.get("label"):
+            out["label"] = self.mask_focus["label"]
+        return out
 
     def continuous(self) -> dict:
         self._expire()
@@ -175,22 +234,30 @@ class Perception:
             if cont["active"] and now - self._gate >= 1.0 / max(cont["fps"], 1) - 0.005:
                 plan |= set(cont["pipelines"])
                 self._gate = now
+            frame_focus = None
             for t in self.pending:
                 if t["called"] < captured:
                     plan |= set(t["pipelines"])
+                    if t.get("mask_focus"):
+                        frame_focus = t["mask_focus"]
+            if frame_focus is None:
+                self._expire()
+                if self.mask_focus is not None:
+                    frame_focus = self.mask_focus
             if plan:
-                self.latest = self.result(self.frame, [p for p in PIPELINES if p in plan])
+                self.latest = self.result(self.frame, [p for p in PIPELINES if p in plan], focus=frame_focus)
                 self.results_out = [t for t in self.results_out if now - t < 2.0] + [now]
             self.cond.notify_all()
 
-    def result(self, frame: dict, pipelines: list[str]) -> dict:
+    def result(self, frame: dict, pipelines: list[str], focus: dict | None = None) -> dict:
         ran = {p: p in pipelines for p in PIPELINES}
+        detections = _apply_mask_focus(frame["detections"], focus) if ran["yolo"] else []
         return {
             "api_version": API_VERSION, "success": True, "mode": self.mode, "frame_id": frame["frame_id"],
             "ts_ms": frame["ts_ms"], "mono": frame["mono"], "physics_time": frame["physics_time"],
             "physics_step": frame["physics_step"], "inference_time_ms": 0.1, "width": 640, "height": 360,
             "pipelines": {p: {"ran": ran[p], "ms": 0.1 if ran[p] else 0.0} for p in PIPELINES},
-            "detections": frame["detections"] if ran["yolo"] else [],
+            "detections": detections,
             "count": 0, "family": "aruco4x4_50", "undistorted": False, "rejected": 0, "markers": [],
         }
 
@@ -213,7 +280,8 @@ class Perception:
                          "result_fps": round(len([t for t in self.results_out if now - t < 2.0]) / 2, 1)},
             "trigger": True, "per_request_pipelines": True, "subscriptions": True, "max_fps": self.max_fps,
             "continuous": cont, "available": {"yolo": True, "aruco": True},
-            "model": {"name": "rebot-sim-ground-truth", "path": None}, "family": "aruco4x4_50",
+            "model": {"name": "rebot-sim-ground-truth", "path": None, "mask_max_boxes": 3}, "family": "aruco4x4_50",
+            "mask_focus": self.mask_focus_body(),
         }
 
 
@@ -300,7 +368,7 @@ class PerceptionServer:
 
     def dispatch(self, method: str, path: str, qs: dict, body: dict) -> tuple[int, dict]:
         p = self.p
-        if path == "/api/mode" and method == "GET":
+        if (path == "/api/mode" or path == "/api/status") and method == "GET":
             with p.cond:
                 return 200, p.mode_body()
         if path == "/api/mode" and method == "POST":
@@ -327,6 +395,32 @@ class PerceptionServer:
                 if "fps" in body:
                     p.max_fps = body["fps"]
                 return 200, p.mode_body()
+        if path == "/api/mask_focus":
+            if method == "GET":
+                with p.cond:
+                    return 200, {"api_version": API_VERSION, "mask_focus": p.mask_focus_body()}
+            if method == "POST":
+                with p.cond:
+                    if not body or (isinstance(body.get("ttl_ms"), int) and body["ttl_ms"] == 0):
+                        p.mask_focus = None
+                        return 200, {"api_version": API_VERSION, "mask_focus": None}
+                    box_norm = body.get("box_norm")
+                    if not isinstance(box_norm, list) or len(box_norm) != 4 or not all(isinstance(x, (int, float)) for x in box_norm):
+                        raise ValueError("box_norm must be a list of 4 numbers")
+                    ttl = body.get("ttl_ms", 2000)
+                    if not isinstance(ttl, int):
+                        raise ValueError("ttl_ms must be an integer")
+                    ttl = max(100, min(10000, ttl))
+                    label = body.get("label")
+                    if label is not None and not isinstance(label, str):
+                        raise ValueError("label must be a string")
+                    p.mask_focus = {
+                        "box_norm": [float(x) for x in box_norm],
+                        "ttl_ms": ttl,
+                        "expires": time.monotonic() + ttl / 1000.0,
+                        "label": label if label else None,
+                    }
+                    return 200, {"api_version": API_VERSION, "mask_focus": p.mask_focus_body()}
         if path == "/api/inference":
             with p.cond:
                 if method == "POST":
@@ -383,7 +477,17 @@ class PerceptionServer:
             pipes = req if req is not None else (MODE_PIPELINES[p.mode] or MODE_PIPELINES[p.last_active])
             called = time.monotonic()
             after = p.latest["frame_id"] if p.latest else 0
-            entry = {"called": called, "pipelines": pipes}
+            focus = None
+            if "mask_focus" in body and isinstance(body["mask_focus"], dict):
+                mf = body["mask_focus"]
+                box_norm = mf.get("box_norm")
+                if isinstance(box_norm, list) and len(box_norm) == 4 and all(isinstance(x, (int, float)) for x in box_norm):
+                    label = mf.get("label")
+                    focus = {
+                        "box_norm": [float(x) for x in box_norm],
+                        "label": label if isinstance(label, str) and label else None,
+                    }
+            entry = {"called": called, "pipelines": pipes, "mask_focus": focus}
             p.pending.append(entry)  # the next frame's plan includes these pipelines
 
             def fresh() -> bool:

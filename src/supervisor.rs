@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::driver::{ArmDriver, JointTarget, EnableState, DriverCapabilities};
@@ -15,7 +16,7 @@ use crate::safety::{FaultCode, FaultReason, SafetyError, SafetyManager, SafetySt
 use crate::trajectory::{MultiJointQuinticTrajectory, TrajectoryError, TrajectoryPlanner};
 use crate::macro_action::{MacroRun, SubDone, SubState};
 use crate::motion::{
-    ActionStatus, ActiveTrajectory, GripperMotion, GripperRequest, JointPath, MotionError, PathTrajectory,
+    ActionStatus, ActiveTrajectory, GripperCommand, GripperMotion, GripperRequest, JointPath, MotionError, PathTrajectory,
     PlanInput, Reference, Settle, StepCtx, StepOut, StepStatus,
 };
 
@@ -160,10 +161,21 @@ pub struct ActiveLease {
     pub last_valid_motion_instant: Option<Instant>,
 }
 
+/// An object currently held in the gripper jaws.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeldObject {
+    pub label: String,
+    pub spill_safe: bool,
+}
+
 /// Internal mutable state of the robotic arm supervisor
 pub struct SupervisorInner {
     pub config: ArmConfig,
     pub safety: SafetyManager,
+    pub held: Option<HeldObject>,
+    /// A gripper Open is running: `held` is cleared when it completes, not when it starts, so an
+    /// interrupted release still counts as holding.
+    pub releasing: bool,
     pub measured_positions: Vec<f32>,
     pub measured_velocities: Vec<f32>,
     pub commanded_positions: Vec<f32>,
@@ -263,6 +275,35 @@ pub struct SupervisorInner {
     pub power: crate::power::PowerMonitor,
     /// `--follower` model name armd was started with (`safety/describe` `device.follower`).
     pub follower: Option<String>,
+    /// Base gripper policy from profile (unshifted).
+    pub base_gripper_policy: Option<crate::model::GripperPolicy>,
+    /// Persisted gripper calibration offset (rad).
+    pub gripper_calib_offset: Option<f32>,
+    /// Persisted nominal jaw opening curve.
+    pub gripper_calib_jaw_opening: Option<crate::model::JawOpening>,
+    /// File path for gripper calibration (`gripper_calib.json`).
+    pub gripper_calib_path: Option<PathBuf>,
+    /// Set to true once an active zero check action has completed.
+    pub gripper_zero_checked: bool,
+    /// Set to true if startup loading encountered an invalid calibration file.
+    pub gripper_calib_invalid: bool,
+    /// Last measured zero check offset (rad).
+    pub last_zero_check_offset: Option<f32>,
+    /// Mock follower stall offset (rad); None = stall at closed_rad.
+    pub mock_gripper_stall_offset: Option<f32>,
+    /// The mock follower set torques[6] for a simulated stall (cleared when the stall ends).
+    pub mock_gripper_stall_torque: bool,
+    /// Running zero check parameters (id, store_offset, threshold_rad, base_closed_rad).
+    pub zero_check_params: Option<ZeroCheckParams>,
+}
+
+/// Parameters of a running gripper zero check action.
+#[derive(Debug, Clone)]
+pub struct ZeroCheckParams {
+    pub action_id: u64,
+    pub store_offset: bool,
+    pub threshold_rad: f32,
+    pub base_closed_rad: f32,
 }
 
 impl SupervisorInner {
@@ -309,9 +350,14 @@ impl SupervisorInner {
             tracing::warn!("Running in degraded mode without gravity compensation.");
         }
 
+        let base_gripper_policy = config.gripper_policy.clone();
+        let mock_gripper_stall_offset = std::env::var("ARMD_MOCK_GRIPPER_STALL_OFFSET").ok().and_then(|s| s.parse::<f32>().ok());
+
         Self {
             config,
             safety: SafetyManager::new(),
+            held: None,
+            releasing: false,
             measured_positions: positions.clone(),
             measured_velocities: vec![0.0; dof],
             commanded_positions: positions,
@@ -383,6 +429,16 @@ impl SupervisorInner {
             torque_guard: crate::torque_guard::TorqueGuard::default(),
             power: crate::power::PowerMonitor::default(),
             follower: None,
+            base_gripper_policy,
+            gripper_calib_offset: None,
+            gripper_calib_jaw_opening: None,
+            gripper_calib_path: None,
+            gripper_zero_checked: false,
+            gripper_calib_invalid: false,
+            last_zero_check_offset: None,
+            mock_gripper_stall_offset,
+            mock_gripper_stall_torque: false,
+            zero_check_params: None,
         }
     }
 
@@ -753,6 +809,7 @@ impl SupervisorInner {
             residual_torques: self.residual_torques,
             collision: self.collision_observation(),
             power: self.power_observation(),
+            gripper_zero: self.gripper_zero_observation(),
         }
     }
 
@@ -1825,9 +1882,12 @@ impl SupervisorInner {
             started_at: now, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
             phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
             episode: None, t_s: None, power_scale: None,
-            align: None, align_turn_rad: None, height_source: None, height_reason: None, object_height_m: None, close_height_m: None, probe_dz_m: None,
+            align: None, align_turn_rad: None, angle_spread_deg: None, orientation: None, grasp_width_m: None, height_source: None, height_reason: None, object_height_m: None, close_height_m: None, probe_dz_m: None,
             recentre: None, recentre_iterations: None, descend_peak_residual_nm: None, descend_peak_tracking_rad: None,
             descend_contact: None, descend_contact_height_m: None, post_lift: None,
+            pre_open: None, pre_open_m: None, held_width_m: None,
+            stop_rad: None, offset_rad: None, pass: None,
+            phase_ms: std::collections::BTreeMap::new(), motions: Vec::new(),
         });
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
         self.quintic_settle = None;
@@ -1837,6 +1897,7 @@ impl SupervisorInner {
     pub(crate) fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
                      settled: Option<bool>, holding: Option<bool>, gap: Option<f32>) {
         let now = self.now_s();
+        let mut store_offset_val = None;
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
             a.state = state.into();
             a.code = code.map(Into::into);
@@ -1846,7 +1907,49 @@ impl SupervisorInner {
             if settled.is_some() { a.settled = settled; }
             if holding.is_some() { a.holding = holding; }
             if gap.is_some() { a.gripper_gap_rad = gap; }
+            if a.kind == "gripper_zero_check" {
+                if let Some(params) = self.zero_check_params.take().filter(|p| p.action_id == id) {
+                    if state == "done" {
+                        let stop_rad = self.measured_positions.get(6).copied().unwrap_or(0.0);
+                        let offset_rad = stop_rad - params.base_closed_rad;
+                        let pass = offset_rad.abs() <= params.threshold_rad;
+                        a.stop_rad = Some(stop_rad);
+                        a.offset_rad = Some(offset_rad);
+                        a.pass = Some(pass);
+                        self.gripper_zero_checked = true;
+                        self.last_zero_check_offset = Some(offset_rad);
+                        if params.store_offset {
+                            if offset_rad.abs() <= 0.5 {
+                                store_offset_val = Some(offset_rad);
+                            } else {
+                                tracing::warn!("Gripper zero check offset {offset_rad:.4} exceeds 0.5 rad; storing refused");
+                            }
+                        }
+                    }
+                }
+            }
             tracing::info!("Action {} ({}) {}{}", id, a.kind, state, code.map(|c| format!(" {c}")).unwrap_or_default());
+        }
+        if let Some(offset_rad) = store_offset_val {
+            self.apply_gripper_calibration(Some(offset_rad), self.gripper_calib_jaw_opening.clone());
+            let path = self.gripper_calib_path.clone().unwrap_or_else(crate::gripper_calib::path_from_env);
+            let file = crate::gripper_calib::GripperCalibFile {
+                offset_rad: Some(offset_rad),
+                jaw_opening: self.gripper_calib_jaw_opening.clone(),
+                ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())),
+            };
+            let text = serde_json::to_string_pretty(&file).unwrap_or_default();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let write = crate::persist::PendingWrite::new(path, text);
+                handle.spawn(async move { let _ = write.run().await; });
+            } else {
+                let _ = crate::persist::write_atomic(&path, &text);
+            }
+        }
+        if holding == Some(false) { self.held = None; }
+        // a standalone close that detected an object counts as holding until a release completes
+        if holding == Some(true) && self.held.is_none() {
+            self.held = Some(HeldObject { label: String::new(), spill_safe: false });
         }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
         if self.macro_run.as_ref().is_some_and(|m| m.id == id) { self.macro_run = None; }
@@ -1986,7 +2089,7 @@ impl SupervisorInner {
     pub fn begin_macro(&mut self, kind: &str, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
         self.check_plan_fresh(input)?;
         let id = self.begin_action(kind, tag);
-        self.macro_run = Some(MacroRun { id, epoch: input.epoch, sub: SubState::Idle, stop_requested: false });
+        self.macro_run = Some(MacroRun { id, epoch: input.epoch, sub: SubState::Idle, stop_requested: false, phase: None, phase_start: None });
         self.set_action_phase(id, "start", 0.0, None, None);
         Ok(id)
     }
@@ -2003,6 +2106,19 @@ impl SupervisorInner {
 
     /// Set `phase` / `progress` (and centring stats) of the running action `id`.
     pub fn set_action_phase(&mut self, id: u64, phase: &str, progress: f32, iteration: Option<u32>, error_px: Option<f32>) {
+        if let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) {
+            let now = Instant::now();
+            if m.phase.as_deref() != Some(phase) {
+                if let (Some(prev_phase), Some(phase_start)) = (m.phase.take(), m.phase_start.take()) {
+                    let elapsed_ms = now.duration_since(phase_start).as_millis() as u32;
+                    if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                        *a.phase_ms.entry(prev_phase).or_insert(0) += elapsed_ms;
+                    }
+                }
+                m.phase = Some(phase.to_string());
+                m.phase_start = Some(now);
+            }
+        }
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
             a.phase = Some(phase.into());
             a.progress = progress;
@@ -2083,6 +2199,7 @@ impl SupervisorInner {
         };
         if epoch != self.safety.epoch_id() { return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into()); }
         self.action_preconditions()?;
+        self.releasing = matches!(request.command, GripperCommand::Open);
         let motion = GripperMotion::new(request, policy, self.config.limits[6].clone(), self.commanded_positions[6]);
         let duration = motion.expected_duration();
         self.servo_target = None;
@@ -2102,18 +2219,31 @@ impl SupervisorInner {
         if !self.macro_alive(id) { return; }
         if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { self.stop_motion(); }
         if state == "done" { self.set_action_phase(id, "done", 1.0, None, None); }
+        if let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) {
+            if let (Some(prev_phase), Some(phase_start)) = (m.phase.take(), m.phase_start.take()) {
+                let ms = Instant::now().duration_since(phase_start).as_millis() as u32;
+                if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                    *a.phase_ms.entry(prev_phase).or_insert(0) += ms;
+                }
+            }
+        }
         self.finish_action(id, state, code, message, None, holding, gap);
     }
 
     /// `/motion/stop`: ends the running macro action now, under the caller's lock, so its
     /// orchestrator cannot install another sub-motion before the next tick.
     pub fn request_macro_stop(&mut self) {
-        let Some(m) = self.macro_run.as_mut() else { return; };
+        let Some(mut m) = self.macro_run.take() else { return; };
         m.stop_requested = true;
         let id = m.id;
         if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { self.stop_motion(); }
+        if let (Some(prev_phase), Some(phase_start)) = (m.phase.take(), m.phase_start.take()) {
+            let ms = Instant::now().duration_since(phase_start).as_millis() as u32;
+            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                *a.phase_ms.entry(prev_phase).or_insert(0) += ms;
+            }
+        }
         self.finish_action(id, "cancelled", Some("STOPPED"), Some("Motion stopped".into()), None, None, None);
-        self.macro_run = None;
     }
 
     /// Start a gripper action. Returns (action id, expected duration).
@@ -2125,6 +2255,7 @@ impl SupervisorInner {
             return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
         }
         self.action_preconditions()?;
+        self.releasing = matches!(request.command, GripperCommand::Open);
         let motion = GripperMotion::new(request, policy, self.config.limits[6].clone(), self.commanded_positions[6]);
         let duration = motion.expected_duration();
         let tag = motion.request.tag.clone();
@@ -2138,6 +2269,132 @@ impl SupervisorInner {
         let id = self.begin_action("gripper", tag);
         self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Gripper(motion) });
         Ok((id, duration))
+    }
+
+    /// Start a gripper zero check action. Returns (action id, expected duration).
+    pub fn start_gripper_zero_check(&mut self, body: &serde_json::Value, epoch: u64) -> Result<(u64, f64), ArmError> {
+        let Some(policy) = self.config.gripper_policy.clone().filter(|_| self.config.dof >= 7) else {
+            return Err(MotionError::Unsupported("Gripper zero check needs a 7-DOF profile with a gripper policy".into()).into());
+        };
+        if epoch != self.safety.epoch_id() {
+            return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
+        }
+        self.action_preconditions()?;
+        if !self.is_torqued {
+            return Err(SafetyError::NotArmed(self.safety.state().clone()).into());
+        }
+        if self.held.is_some() {
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "OBJECT_HELD".into(),
+                message: "Gripper holds an object (or its release did not finish); open the gripper fully before the zero check".into(),
+            });
+        }
+        let store_offset = body.get("store_offset").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let threshold_rad = body.get("threshold_rad").and_then(serde_json::Value::as_f64).map(|v| v as f32).unwrap_or(0.10);
+        if !threshold_rad.is_finite() || threshold_rad <= 0.0 {
+            return Err(MotionError::InvalidCommand("threshold_rad must be positive and finite".into()).into());
+        }
+
+        let request = GripperRequest {
+            command: GripperCommand::Seek,
+            fraction: None,
+            grasp: false,
+            speed: 0.3,
+            // derived from the travel at 0.3 rad/s (fully open -> closed takes about 20 s)
+            timeout_s: None,
+            tag: None,
+        };
+        let motion = GripperMotion::new(request, policy, self.config.limits[6].clone(), self.commanded_positions[6]);
+        let duration = motion.expected_duration();
+        self.servo_target = None;
+        self.servo_settled_ticks.fill(0);
+        let mut target = self.commanded_positions.clone();
+        target[6] = motion.target;
+        self.target_positions = target;
+        self.safety.mark_motion_started()?;
+        self.last_heartbeat = Instant::now();
+        let id = self.begin_action("gripper_zero_check", None);
+        self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Gripper(motion) });
+        let base_closed_rad = self.base_gripper_policy.as_ref().map_or(0.0, |p| p.closed_rad);
+        self.gripper_stalled = false;
+        self.gripper_high_torque_ticks = 0;
+        self.gripper_low_torque_ticks = 0;
+        self.zero_check_params = Some(ZeroCheckParams { action_id: id, store_offset, threshold_rad, base_closed_rad });
+        Ok((id, duration))
+    }
+
+    /// Apply gripper calibration: offset shifts closed_rad, open_rad and jaw points.
+    pub fn apply_gripper_calibration(&mut self, offset_rad: Option<f32>, jaw_opening: Option<crate::model::JawOpening>) {
+        if self.base_gripper_policy.is_none() {
+            self.base_gripper_policy = self.config.gripper_policy.clone();
+        }
+        let Some(base) = self.base_gripper_policy.clone() else { return; };
+        let mut policy = base.clone();
+        self.gripper_calib_offset = offset_rad;
+        if jaw_opening.is_some() {
+            self.gripper_calib_jaw_opening = jaw_opening.clone();
+        }
+        let offset = offset_rad.unwrap_or(0.0);
+        policy.closed_rad = base.closed_rad + offset;
+        policy.open_rad = base.open_rad + offset;
+        if let Some(mut jo) = jaw_opening.or_else(|| self.gripper_calib_jaw_opening.clone()).or(base.jaw_opening) {
+            for pt in &mut jo.points {
+                pt[0] += offset;
+            }
+            policy.jaw_opening = Some(jo);
+        } else {
+            let mut jo = crate::model::JawOpening::sim_default();
+            for pt in &mut jo.points {
+                pt[0] += offset;
+            }
+            policy.jaw_opening = Some(jo);
+        }
+        self.config.gripper_policy = Some(policy);
+    }
+
+    pub fn gripper_zero_observation(&self) -> Option<crate::model::GripperZeroObservation> {
+        if self.config.dof < 7 || self.config.gripper_policy.is_none() {
+            return None;
+        }
+        let j7 = self.measured_positions.get(6).copied().unwrap_or(0.0);
+        let offset_rad = self.gripper_calib_offset.or(self.last_zero_check_offset);
+        let state = if self.gripper_calib_invalid {
+            "calib_invalid".to_string()
+        } else if self.gripper_zero_checked {
+            "checked".to_string()
+        } else {
+            let policy = self.config.gripper_policy.as_ref().unwrap();
+            let min_j7 = policy.closed_rad.min(policy.open_rad) - 0.3;
+            let max_j7 = policy.closed_rad.max(policy.open_rad) + 0.3;
+            if j7 < min_j7 || j7 > max_j7 {
+                "out_of_range".to_string()
+            } else {
+                "ok".to_string()
+            }
+        };
+        Some(crate::model::GripperZeroObservation {
+            state,
+            j7,
+            offset_rad,
+        })
+    }
+
+    pub fn gripper_calibration_response(&self) -> crate::gripper_calib::GripperCalibrationResponse {
+        let policy = self.config.gripper_policy.clone();
+        let calibrated = policy.as_ref().is_some_and(|p| p.is_calibrated());
+        let jaw_opening = policy.as_ref().and_then(|p| p.jaw_opening.clone());
+        crate::gripper_calib::GripperCalibrationResponse {
+            offset_rad: self.gripper_calib_offset,
+            jaw_opening,
+            calibrated,
+            policy,
+            ts: None,
+        }
+    }
+
+    pub fn set_mock_gripper_stall_offset(&mut self, offset: Option<f32>) {
+        self.mock_gripper_stall_offset = offset;
     }
 
     /// Single place that ends a running action whose reference went away (spec 2.3).
@@ -2224,6 +2481,10 @@ impl SupervisorInner {
         match out.status {
             StepStatus::Running => {}
             StepStatus::Done { settled, holding, gripper_gap_rad } => {
+                if self.releasing && matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_))) {
+                    self.releasing = false;
+                    self.held = None;
+                }
                 self.active_trajectory = None;
                 self.commanded_velocities.fill(0.0);
                 self.target_positions = self.commanded_positions.clone();
@@ -3095,6 +3356,34 @@ impl SupervisorInner {
         if self.driver.is_none() {
             self.measured_positions = self.commanded_positions.clone();
             self.measured_velocities = self.commanded_velocities.clone();
+            if self.config.dof >= 7 {
+                let gripper_moving = matches!(&self.active_trajectory, Some(ActiveTrajectory { reference: Reference::Gripper(_), .. }));
+                // the stall torque lasts only while the jaw pushes on the stop; a stale value would
+                // end the next gripper motion at once as a stall
+                let mut stalled = false;
+                if gripper_moving {
+                    if let Some(policy) = self.config.gripper_policy.as_ref() {
+                        let base_closed = self.base_gripper_policy.as_ref().map_or(policy.closed_rad, |p| p.closed_rad);
+                        let stall_offset = self.mock_gripper_stall_offset.unwrap_or(0.0);
+                        let stop_rad = base_closed + stall_offset;
+                        let dir = if policy.closed_rad >= policy.open_rad { 1.0 } else { -1.0 };
+                        let push = (self.commanded_positions[6] - stop_rad) * dir;
+                        if push > 1e-4 {
+                            self.measured_positions[6] = stop_rad;
+                            self.measured_velocities[6] = 0.0;
+                            self.torques[6] = dir * (GRIPPER_STALL_LATCH_NM * 1.5 + push * 2.0);
+                            stalled = true;
+                        }
+                    }
+                }
+                // clear only the torque this mock stall set (tests may inject torques themselves)
+                if stalled {
+                    self.mock_gripper_stall_torque = true;
+                } else if self.mock_gripper_stall_torque {
+                    self.torques[6] = 0.0;
+                    self.mock_gripper_stall_torque = false;
+                }
+            }
         }
 
         if let Some(settling_since) = self.handover_settling_since {
@@ -3577,5 +3866,13 @@ impl ArmSupervisor {
     /// Timing of the last ticks (`GET /api/v1/diagnostics/tick`).
     pub fn tick_stats(&self) -> crate::diagnostics::tick::TickSnapshot {
         self.tick_stats.lock().unwrap_or_else(|e| e.into_inner()).snapshot()
+    }
+
+    pub async fn set_mock_gripper_stall_offset(&self, offset: Option<f32>) {
+        self.inner.write().await.mock_gripper_stall_offset = offset;
+    }
+
+    pub async fn gripper_calibration_response(&self) -> crate::gripper_calib::GripperCalibrationResponse {
+        self.inner.read().await.gripper_calibration_response()
     }
 }

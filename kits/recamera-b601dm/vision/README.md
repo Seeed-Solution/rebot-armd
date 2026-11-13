@@ -229,7 +229,9 @@ Differences from the spec are listed at the end of this file.
 | `main/vision_control.*` | `aruco-detector/main/inference_control.*`, with modes and the combined result |
 | `main/aruco_stage.*` | `aruco-detector/main/main.cpp` frame handler |
 | `main/http_control.*` | `aruco-detector/main/http_control.*` |
-| `main/detector.*` | `yolo-detector/main/detector.*`, unchanged |
+| `main/detector.*` | `yolo-detector/main/detector.*`, updated for SegModel auto-detection |
+| `main/mask_geom.*` | new (PCA moments, minimum cross section, crop mask decode) |
+| `main/seg_model.*` | new (SegModel : ma::model::Segmentor, anchor indexing, budget-capped mask decode) |
 | `main/marker_filter.*`, `camera_model.*`, `capture_time.h` | `aruco-detector/main/`, unchanged |
 | `main/result_json.*` | new (letterbox geometry, detections / markers JSON) |
 | `apriltag_patched/` | `components/apriltag` `apriltag.c`, `apriltag_quad_thresh.c` (BSD-2-Clause), modified: stage time stamps, cluster step options, size gate (see each file's header); `apriltag.cmake` builds them in place of the SDK's files |
@@ -333,8 +335,14 @@ YOLO model: not in the repository or the deb. The first existing file of `vision
 `/userdata/rebot-teleop/models/yolo11n.cvimodel`,
 `/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel`,
 `/userdata/local/models/yolo11n_detection_cv181x_int8.cvimodel`,
-`/userdata/local/models/yolo11n_cv181x_int8.cvimodel` is loaded. Without a model `yolo` and `both`
+`/userdata/local/models/yolo11n_cv181x_int8.cvimodel`,
+`/usr/share/supervisor/models/yolo11n_segment_cv181x_int8.cvimodel`,
+`/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel` is loaded. Without a model `yolo` and `both`
 answer 409 and ArUco works.
+
+Model options: command-line `--model PATH`, `--mask on|off` (default: off; decode instance segmentation masks when using a segmentation model), `--mask-max-boxes N` (1..20, default 3; max boxes for mask decoding), and `vision.json` keys `"model"`, `"mask": true|false`, and `"mask_max_boxes": 1..20`.
+When a 2-output YOLO11-seg model is loaded (e.g. `yolo11n_segment_cv181x_int8.cvimodel`), `rebot-vision` auto-detects `model.kind: "segment"`. When `--mask on` (or `vision.json` `"mask": true`), it decodes cropped instance masks for up to `mask_max_boxes` detections within a 160x160 cell budget and computes mask orientation, confidence, and grasp width.
+Segmentation timing from the standalone bench: Forward 71.2 ms, crop mask decode measured before the cache fix 15.6 ms (bench numbers; new on-device numbers: not measured).
 
 ## Differences from the spec
 
