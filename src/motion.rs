@@ -821,7 +821,7 @@ pub struct ActionStatus {
     /// Grasp height probe: the upward move used (m), absent when the probe did not move.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_dz_m: Option<f32>,
-    /// Grasp depth anchoring source (`metric_table`, `metric_prior`, `oblique_ransac`, `two_height_fk`).
+    /// Grasp depth anchoring source (`metric_table`, `oblique_ransac`, `two_height_fk`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depth_anchor: Option<String>,
     /// Grasp: measured optical depth of the target foreground (m).

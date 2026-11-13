@@ -119,6 +119,38 @@ static void test_tilted_plane_recovery() {
     CHECK(res.depth_conf > 0.5f);
 }
 
+// Oblique view: the table disparity changes steeply with v and the object fills only the upper part
+// of its box. The exported pair must describe one location (protrusion 0.03), not the raw object
+// disparity against the plane at the box centre (0.03 + slope * offset = ~0.17).
+static void test_fg_bg_matched_location() {
+    const int grid_w = 384, grid_h = 224;
+    const float content_w = 640.0f, content_h = 360.0f;
+    const float p0 = 0.60f, pv = -0.004f, uc = 320.0f, vc = 180.0f;
+    std::vector<float> disp_map(grid_w * grid_h);
+    DepthBox target{260.0f, 120.0f, 380.0f, 240.0f};
+    float sum_v = 0.0f;
+    int n_obj = 0;
+    for (int gy = 0; gy < grid_h; ++gy) {
+        const float v_px = (gy + 0.5f) * (content_h / static_cast<float>(grid_h));
+        for (int gx = 0; gx < grid_w; ++gx) {
+            const float u_px = (gx + 0.5f) * (content_w / static_cast<float>(grid_w));
+            float d = p0 + pv * (v_px - vc);
+            if (u_px >= target.x0 && u_px <= target.x1 && v_px >= 120.0f && v_px <= 170.0f) {
+                d += 0.03f;
+                sum_v += v_px;
+                ++n_obj;
+            }
+            disp_map[gy * grid_w + gx] = d;
+        }
+    }
+    auto res = analyze_box_depth(disp_map.data(), grid_w, grid_h, target, {}, content_w, content_h);
+    CHECK(res.valid);
+    const float protrusion = res.disp_fg - res.disp_bg;
+    CHECK(std::abs(protrusion - 0.03f) < 0.003f);
+    const float bg_at_obj = p0 + pv * (sum_v / static_cast<float>(n_obj) - vc);
+    CHECK(std::abs(res.disp_bg - bg_at_obj) < 0.01f);
+}
+
 static void test_pca_aspect_correction() {
     const int grid_w = 384, grid_h = 224;
     const float content_w = 640.0f, content_h = 360.0f;
@@ -396,6 +428,7 @@ static void test_non_finite_handling() {
 int main() {
     test_bilinear_resize();
     test_tilted_plane_recovery();
+    test_fg_bg_matched_location();
     test_pca_aspect_correction();
     test_jaw_clear();
     test_sample_table_disparity();
