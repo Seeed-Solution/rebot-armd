@@ -5,6 +5,7 @@
 //!   slerp in rotation, one DLS IK solve per sample, single quintic time scaling.
 //! - [`PathTrajectory`] executes such a path with lag-aware time scaling.
 //! - [`GripperMotion`] runs open / close / move of the 7-DOF gripper with grasp detection.
+use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -791,6 +792,12 @@ pub struct ActionStatus {
     pub align: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_turn_rad: Option<f32>,
+    /// Grasp J6 alignment: angle dispersion across centring frames (deg).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle_spread_deg: Option<f32>,
+    /// Place orientation override (`levelled` when tilt was reduced for a spill-safe object).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<String>,
     /// Grasp: measured cross-section width of the target on the table plane (m).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grasp_width_m: Option<f32>,
@@ -830,6 +837,25 @@ pub struct ActionStatus {
     /// stopped on the object) or `dropped`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_lift: Option<String>,
+    /// Accumulated runtime per macro phase (ms).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub phase_ms: BTreeMap<String, u32>,
+    /// Execution diagnostics for each arm sub-motion of the macro action.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub motions: Vec<MacroMotionDiag>,
+}
+
+/// Execution diagnostics for one sub-motion in a macro action (grasp, place).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MacroMotionDiag {
+    pub phase: String,
+    pub ms: u32,
+    pub track_mm: f32,
+    pub track_deg: f32,
+    pub goal_mm: f32,
+    pub goal_deg: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact: Option<bool>,
 }
 
 impl ActionStatus {

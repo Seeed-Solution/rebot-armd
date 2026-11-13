@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::driver::{ArmDriver, JointTarget, EnableState, DriverCapabilities};
@@ -15,7 +16,7 @@ use crate::safety::{FaultCode, FaultReason, SafetyError, SafetyManager, SafetySt
 use crate::trajectory::{MultiJointQuinticTrajectory, TrajectoryError, TrajectoryPlanner};
 use crate::macro_action::{MacroRun, SubDone, SubState};
 use crate::motion::{
-    ActionStatus, ActiveTrajectory, GripperMotion, GripperRequest, JointPath, MotionError, PathTrajectory,
+    ActionStatus, ActiveTrajectory, GripperCommand, GripperMotion, GripperRequest, JointPath, MotionError, PathTrajectory,
     PlanInput, Reference, Settle, StepCtx, StepOut, StepStatus,
 };
 
@@ -160,10 +161,18 @@ pub struct ActiveLease {
     pub last_valid_motion_instant: Option<Instant>,
 }
 
+/// An object currently held in the gripper jaws.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeldObject {
+    pub label: String,
+    pub spill_safe: bool,
+}
+
 /// Internal mutable state of the robotic arm supervisor
 pub struct SupervisorInner {
     pub config: ArmConfig,
     pub safety: SafetyManager,
+    pub held: Option<HeldObject>,
     pub measured_positions: Vec<f32>,
     pub measured_velocities: Vec<f32>,
     pub commanded_positions: Vec<f32>,
@@ -312,6 +321,7 @@ impl SupervisorInner {
         Self {
             config,
             safety: SafetyManager::new(),
+            held: None,
             measured_positions: positions.clone(),
             measured_velocities: vec![0.0; dof],
             commanded_positions: positions,
@@ -1825,9 +1835,10 @@ impl SupervisorInner {
             started_at: now, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
             phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
             episode: None, t_s: None, power_scale: None,
-            align: None, align_turn_rad: None, grasp_width_m: None, height_source: None, height_reason: None, object_height_m: None, close_height_m: None, probe_dz_m: None,
+            align: None, align_turn_rad: None, angle_spread_deg: None, orientation: None, grasp_width_m: None, height_source: None, height_reason: None, object_height_m: None, close_height_m: None, probe_dz_m: None,
             recentre: None, recentre_iterations: None, descend_peak_residual_nm: None, descend_peak_tracking_rad: None,
             descend_contact: None, descend_contact_height_m: None, post_lift: None,
+            phase_ms: std::collections::BTreeMap::new(), motions: Vec::new(),
         });
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
         self.quintic_settle = None;
@@ -1848,6 +1859,7 @@ impl SupervisorInner {
             if gap.is_some() { a.gripper_gap_rad = gap; }
             tracing::info!("Action {} ({}) {}{}", id, a.kind, state, code.map(|c| format!(" {c}")).unwrap_or_default());
         }
+        if holding == Some(false) { self.held = None; }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
         if self.macro_run.as_ref().is_some_and(|m| m.id == id) { self.macro_run = None; }
     }
@@ -1986,7 +1998,7 @@ impl SupervisorInner {
     pub fn begin_macro(&mut self, kind: &str, input: &PlanInput, tag: Option<String>) -> Result<u64, ArmError> {
         self.check_plan_fresh(input)?;
         let id = self.begin_action(kind, tag);
-        self.macro_run = Some(MacroRun { id, epoch: input.epoch, sub: SubState::Idle, stop_requested: false });
+        self.macro_run = Some(MacroRun { id, epoch: input.epoch, sub: SubState::Idle, stop_requested: false, phase: None, phase_start: None });
         self.set_action_phase(id, "start", 0.0, None, None);
         Ok(id)
     }
@@ -2003,6 +2015,19 @@ impl SupervisorInner {
 
     /// Set `phase` / `progress` (and centring stats) of the running action `id`.
     pub fn set_action_phase(&mut self, id: u64, phase: &str, progress: f32, iteration: Option<u32>, error_px: Option<f32>) {
+        if let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) {
+            let now = Instant::now();
+            if m.phase.as_deref() != Some(phase) {
+                if let (Some(prev_phase), Some(phase_start)) = (m.phase.take(), m.phase_start.take()) {
+                    let elapsed_ms = now.duration_since(phase_start).as_millis() as u32;
+                    if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                        *a.phase_ms.entry(prev_phase).or_insert(0) += elapsed_ms;
+                    }
+                }
+                m.phase = Some(phase.to_string());
+                m.phase_start = Some(now);
+            }
+        }
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
             a.phase = Some(phase.into());
             a.progress = progress;
@@ -2083,6 +2108,7 @@ impl SupervisorInner {
         };
         if epoch != self.safety.epoch_id() { return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into()); }
         self.action_preconditions()?;
+        if matches!(request.command, GripperCommand::Open) { self.held = None; }
         let motion = GripperMotion::new(request, policy, self.config.limits[6].clone(), self.commanded_positions[6]);
         let duration = motion.expected_duration();
         self.servo_target = None;
@@ -2102,18 +2128,31 @@ impl SupervisorInner {
         if !self.macro_alive(id) { return; }
         if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { self.stop_motion(); }
         if state == "done" { self.set_action_phase(id, "done", 1.0, None, None); }
+        if let Some(m) = self.macro_run.as_mut().filter(|m| m.id == id) {
+            if let (Some(prev_phase), Some(phase_start)) = (m.phase.take(), m.phase_start.take()) {
+                let ms = Instant::now().duration_since(phase_start).as_millis() as u32;
+                if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                    *a.phase_ms.entry(prev_phase).or_insert(0) += ms;
+                }
+            }
+        }
         self.finish_action(id, state, code, message, None, holding, gap);
     }
 
     /// `/motion/stop`: ends the running macro action now, under the caller's lock, so its
     /// orchestrator cannot install another sub-motion before the next tick.
     pub fn request_macro_stop(&mut self) {
-        let Some(m) = self.macro_run.as_mut() else { return; };
+        let Some(mut m) = self.macro_run.take() else { return; };
         m.stop_requested = true;
         let id = m.id;
         if self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id)) { self.stop_motion(); }
+        if let (Some(prev_phase), Some(phase_start)) = (m.phase.take(), m.phase_start.take()) {
+            let ms = Instant::now().duration_since(phase_start).as_millis() as u32;
+            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                *a.phase_ms.entry(prev_phase).or_insert(0) += ms;
+            }
+        }
         self.finish_action(id, "cancelled", Some("STOPPED"), Some("Motion stopped".into()), None, None, None);
-        self.macro_run = None;
     }
 
     /// Start a gripper action. Returns (action id, expected duration).
@@ -2125,6 +2164,7 @@ impl SupervisorInner {
             return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
         }
         self.action_preconditions()?;
+        if matches!(request.command, GripperCommand::Open) { self.held = None; }
         let motion = GripperMotion::new(request, policy, self.config.limits[6].clone(), self.commanded_positions[6]);
         let duration = motion.expected_duration();
         let tag = motion.request.tag.clone();

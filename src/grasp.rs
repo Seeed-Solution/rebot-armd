@@ -96,6 +96,8 @@ pub struct GraspSetup {
     /// Detections with `angle_deg` and `angle_conf` at least this decide the J6 roll from the
     /// angle (long side across the jaws) instead of the box aspect.
     pub align_min_angle_conf: f64,
+    /// Angle dispersion threshold (deg) above which J6 alignment from angle is skipped (0 disables).
+    pub align_max_angle_spread_deg: f64,
     /// Linear speeds (m/s) for the approach / centring and for descend / lift.
     pub approach_speed_mps: f64,
     pub descend_speed_mps: f64,
@@ -129,6 +131,10 @@ pub struct GraspSetup {
     pub recheck_tol_px: f64,
     /// Maximum target cross-section width (m) for the jaws; 0 disables the check.
     pub max_grasp_width_m: f64,
+    /// Detected labels treated as spill-safe (placed upright with tilt at most `spill_max_tilt_deg`).
+    pub spill_safe_labels: Vec<String>,
+    /// Maximum allowed tilt (deg) when placing a spill-safe object.
+    pub spill_max_tilt_deg: f64,
 }
 
 /// `acquire_camera_down` setting.
@@ -171,6 +177,7 @@ impl Default for GraspSetup {
             align_min_aspect: 1.2,
             align_j6: true,
             align_min_angle_conf: 0.3,
+            align_max_angle_spread_deg: 15.0,
             approach_speed_mps: 0.05,
             descend_speed_mps: 0.03,
             phase_timeout_s: 25.0,
@@ -185,6 +192,8 @@ impl Default for GraspSetup {
             descend_contact_stop_nm: None,
             post_lift_settle_ms: 300,
             max_grasp_width_m: 0.075,
+            spill_safe_labels: vec!["cup".into(), "bottle".into(), "wine glass".into(), "bowl".into(), "vase".into()],
+            spill_max_tilt_deg: 8.0,
         }
     }
 }
@@ -196,8 +205,8 @@ impl GraspSetup {
             self.grip_pixel_norm[0], self.grip_pixel_norm[1], self.camera_tilt_deg, self.image_size_px[0],
             self.image_size_px[1], self.fx_px, self.fy_px, self.centre_tol_px, self.servo_gain, self.max_step_m,
             self.match_dist_px, self.match_iou, self.acquire_dist_px, self.lost_timeout_s, self.settle_delay_s,
-            self.align_min_aspect, self.align_min_angle_conf, self.approach_speed_mps, self.descend_speed_mps, self.phase_timeout_s, self.timeout_s, self.recheck_tol_px,
-            self.height_probe_m, self.height_grasp_fraction, self.max_grasp_height_m, self.recentre_height_m, self.max_grasp_width_m];
+            self.align_min_aspect, self.align_min_angle_conf, self.align_max_angle_spread_deg, self.approach_speed_mps, self.descend_speed_mps, self.phase_timeout_s, self.timeout_s, self.recheck_tol_px,
+            self.height_probe_m, self.height_grasp_fraction, self.max_grasp_height_m, self.recentre_height_m, self.max_grasp_width_m, self.spill_max_tilt_deg];
         if !all.iter().all(|v| fin(*v)) { return Err("grasp setup values must be finite".into()); }
         let check = |ok: bool, msg: &str| if ok { Ok(()) } else { Err(msg.to_string()) };
         check((-0.5..=0.5).contains(&self.table_z_m), "table_z_m must be in [-0.5, 0.5] m")?;
@@ -232,7 +241,9 @@ impl GraspSetup {
         check(self.descend_contact_stop_nm.is_none_or(|v| v.is_finite() && v > 0.0 && v <= 50.0), "descend_contact_stop_nm must be null or in (0, 50] N·m")?;
         check(self.align_min_aspect >= 1.0 && self.align_min_aspect <= 10.0, "align_min_aspect must be in [1, 10]")?;
         check((0.0..=1.0).contains(&self.align_min_angle_conf), "align_min_angle_conf must be in [0, 1]")?;
+        check((0.0..=90.0).contains(&self.align_max_angle_spread_deg), "align_max_angle_spread_deg must be in [0, 90]")?;
         check((0.0..=0.2).contains(&self.max_grasp_width_m), "max_grasp_width_m must be in [0, 0.2] m")?;
+        check((1.0..=30.0).contains(&self.spill_max_tilt_deg), "spill_max_tilt_deg must be in [1, 30]")?;
         let speed_ok = |v: f64| v > 0.0 && v <= motion::MAX_LINEAR_MPS;
         check(speed_ok(self.approach_speed_mps) && speed_ok(self.descend_speed_mps), "speeds must be in (0, 0.15] m/s")?;
         check(self.phase_timeout_s > 0.0 && self.phase_timeout_s <= 120.0 && self.timeout_s >= self.phase_timeout_s && self.timeout_s <= 600.0,
@@ -900,19 +911,31 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     let camera_down = camera_down_mode(setup, &input.cam).map_err(MotionError::InvalidCommand)?;
     let pts = envelope(input.ws.as_ref(), &input.cam, &cam.rec);
     // the envelope stays above the table on the approach and (camera-down) the transition
-    let goal = if camera_down {
+    let (goal, tool) = if camera_down {
         let goal = camera_down_pose(&pose.r, &target, setup, &cam, &pts);
         let tool = approach_pose(&goal.r, &target, setup);
         if let Some(e) = table_violation(&goal, &tool, &pts, setup.table_z_m) { return Err(e.into()); }
-        goal
+        (goal, tool)
     } else {
-        approach_pose(&pose.r, &target, setup)
+        let goal = approach_pose(&pose.r, &target, setup);
+        (goal, goal)
     };
     if let Some(e) = table_violation(&pose, &goal, &pts, setup.table_z_m) { return Err(e.into()); }
-    let mut open_input = input.clone();
-    open_input.j7 = open_rad;
-    let path = motion::plan_cartesian(&open_input, goal, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
-    let transition_duration = if camera_down { transition_estimate(&goal, &target, setup) } else { 0.0 };
+    let mut cur = input.clone();
+    cur.j7 = open_rad;
+    let path = motion::plan_cartesian(&cur, goal, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
+    let last = path.last();
+    cur.q0 = std::array::from_fn(|i| f64::from(last[i]));
+    let transition_duration = if camera_down {
+        let trans_path = motion::plan_cartesian(&cur, tool, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
+        let last = trans_path.last();
+        cur.q0 = std::array::from_fn(|i| f64::from(last[i]));
+        transition_estimate(&goal, &target, setup)
+    } else {
+        0.0
+    };
+    let grasp_pose = Pose::new(tool.r, [target[0], target[1], setup.table_z_m + setup.grasp_height_m]);
+    let _descend_path = motion::plan_cartesian(&cur, grasp_pose, Speed { linear: setup.descend_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
     Ok(PlannedGrasp { input, request, target, approach_duration: path.duration, camera_down, transition_duration })
 }
 
@@ -937,6 +960,29 @@ pub fn expected_duration(planned: &PlannedGrasp) -> f64 {
     let base = lift_check + 6.5 + planned.approach_duration + 4.0 * 1.5 + descend + 2.0 + lift + probe + recentre;
     // camera-down: the transition move and its re-check frame
     if planned.camera_down { base + planned.transition_duration + 1.5 } else { base }
+}
+
+/// Dry-run reachability check: prepare + plan only, no macro started, no orchestrator spawned.
+/// Returns (reachable, code, message).
+pub async fn dry_run(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, Option<String>, Option<String>) {
+    let pending_res = {
+        let inner = supervisor.inner().read().await;
+        prepare(&inner, body, inner.safety.epoch_id())
+    };
+    match pending_res {
+        Ok(pending) => match tokio::task::spawn_blocking(move || plan(pending)).await {
+            Ok(Ok(_planned)) => (true, None, None),
+            Ok(Err(e)) => {
+                let api = ApiError::from(e);
+                (false, api.code.or(Some(api.error)), Some(api.message))
+            }
+            Err(e) => (false, Some("INTERNAL".into()), Some(format!("planner task failed: {e}"))),
+        },
+        Err(e) => {
+            let api = ApiError::from(e);
+            (false, api.code.or(Some(api.error)), Some(api.message))
+        }
+    }
 }
 
 /// Start a grasp without a WS lease check (tests, in-process agents): prepare, plan, begin
@@ -1129,9 +1175,16 @@ impl Orchestrator {
         // the width is measured whatever the angle confidence: a disc or a square has a low
         // angle_conf but a valid width (any closing direction sees about the same width)
         if let Some(w_px) = frames_width_px(&c.frames, 0.0) {
-            let alpha = frames_angle(&c.frames, 0.0);
-            let closing_deg = alpha.map(|a| a + 90.0).unwrap_or(90.0);
-            let (u_x, u_y) = (closing_deg.to_radians().cos(), closing_deg.to_radians().sin());
+            let accepted_angle = frames_angle(&c.frames, s.align_min_angle_conf)
+                .filter(|&(_alpha, spread)| s.align_max_angle_spread_deg <= 0.0 || spread <= s.align_max_angle_spread_deg);
+            let (u_x, u_y) = if let Some((alpha, _spread)) = accepted_angle {
+                let closing_deg = alpha + 90.0;
+                (closing_deg.to_radians().cos(), closing_deg.to_radians().sin())
+            } else {
+                let jaw = kinematics::mat_vec(&kinematics::transpose(&self.cam.rec), &[0.0, 1.0, 0.0]);
+                let n = jaw[0].hypot(jaw[1]);
+                if n > 1e-6 { (jaw[0] / n, jaw[1] / n) } else { (0.0, 1.0) }
+            };
             let centre_px = self.cam.to_px(box_centre(&c.last.box_norm));
             let half_w = w_px / 2.0;
             let p0_px = [centre_px[0] - half_w * u_x, centre_px[1] - half_w * u_y];
@@ -1172,6 +1225,10 @@ impl Orchestrator {
         self.phase("lift", 0.9).await?;
         let p = self.pose().await.p;
         self.move_arm("lift", lift_to(p), s.descend_speed_mps).await?;
+        let r_lift = self.pose().await.r;
+        let tool_z = kinematics::column(&r_lift, 2)[2];
+        let tilt = (-tool_z).clamp(-1.0, 1.0).acos().to_degrees();
+        tracing::info!("Grasp {}: lift tilt {:.2}°", self.id, tilt);
         // the object may slip out while lifting. Under position control the jaw settles on its
         // hold target and the grip torque fades when the object only shifted or turned in the
         // jaws, so a failed torque rule is decided by a re-grip: a close with grasp detection
@@ -1454,7 +1511,13 @@ impl Orchestrator {
         let sign = inner.config.arm_model.joint_map().get(5).map_or(1.0, |m| m.sign);
         drop(inner);
         let room = |t: f64| { let q = q6 + sign * t; q >= f64::from(lim.min_position) + 0.1 && q <= f64::from(lim.max_position) - 0.1 };
-        if let Some(alpha) = frames_angle(&c.frames, self.setup.align_min_angle_conf) {
+        if let Some((alpha, spread)) = frames_angle(&c.frames, self.setup.align_min_angle_conf) {
+            self.sup.inner().write().await.update_action(self.id, |a| {
+                a.angle_spread_deg = Some(spread as f32);
+            });
+            if self.setup.align_max_angle_spread_deg > 0.0 && spread > self.setup.align_max_angle_spread_deg {
+                return (None, "skipped:angle_spread".into());
+            }
             // the long side on the plane, seen from the pose of the centring frames
             let px = self.cam.to_px(box_centre(&c.last.box_norm));
             let (a, b) = (alpha.to_radians().cos(), alpha.to_radians().sin());
@@ -1541,9 +1604,9 @@ pub fn touches_border(b: &[f64; 4], size: [f64; 2]) -> bool {
     b[0] * w <= 2.0 || b[1] * h <= 2.0 || b[2] * w >= w - 2.0 || b[3] * h >= h - 2.0
 }
 
-/// Mean long-side angle (deg, [-90, 90)) of the frames with `angle_conf >= min_conf`, averaged
-/// on doubled angles (an axis, not a direction); None without such frames.
-pub fn frames_angle(frames: &[Detection], min_conf: f64) -> Option<f64> {
+/// Mean long-side angle (deg, [-90, 90)) and dispersion (deg) of the frames with
+/// `angle_conf >= min_conf`, averaged on doubled angles (an axis, not a direction); None without such frames.
+pub fn frames_angle(frames: &[Detection], min_conf: f64) -> Option<(f64, f64)> {
     let (mut c, mut s, mut n) = (0.0, 0.0, 0);
     for d in frames {
         if let (Some(a), Some(conf)) = (d.angle_deg, d.angle_conf) {
@@ -1551,8 +1614,11 @@ pub fn frames_angle(frames: &[Detection], min_conf: f64) -> Option<f64> {
         }
     }
     if n == 0 || c.hypot(s) < 1e-9 { return None; }
+    let r = (c.hypot(s) / n as f64).clamp(1e-12, 1.0);
+    let spread = if n <= 1 { 0.0 } else { ((-2.0 * r.ln()).sqrt() / 2.0).to_degrees() };
     let a = (s.atan2(c) / 2.0).to_degrees();
-    Some((a + 90.0).rem_euclid(180.0) - 90.0)
+    let mean = (a + 90.0).rem_euclid(180.0) - 90.0;
+    Some((mean, spread))
 }
 
 /// Median grasp width (px) of the frames with `angle_conf >= min_conf` and a positive, finite
@@ -1638,13 +1704,26 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
     } };
     let mut inner = sup.inner().write().await;
     match result {
-        Ok((holding, gap)) => inner.finish_macro(id, "done", None, None, Some(holding), gap),
+        Ok((holding, gap)) => {
+            if holding {
+                let spill_safe = planned.request.setup.spill_safe_labels.iter().any(|s| s.eq_ignore_ascii_case(&planned.request.label));
+                inner.held = Some(crate::supervisor::HeldObject {
+                    label: planned.request.label.clone(),
+                    spill_safe,
+                });
+            }
+            inner.finish_macro(id, "done", None, None, Some(holding), gap);
+        }
         Err(Stop::Fail(code, message)) => {
-            tracing::info!("Grasp {id} failed: {code} {message}");
             let holding = if code == "NOT_HOLDING" || code == "DROPPED" { Some(false) } else { None };
             inner.finish_macro(id, "failed", Some(&code), Some(message), holding, None);
         }
         Err(Stop::Cancelled) => inner.finish_macro(id, "cancelled", None, None, None, None),
+    }
+    if let Some(a) = inner.last_action.as_ref().filter(|a| a.id == id) {
+        let code = a.code.as_deref().unwrap_or(if a.state == "done" { "OK" } else { &a.state });
+        let worst = a.motions.iter().max_by(|x, y| x.track_mm.total_cmp(&y.track_mm));
+        tracing::info!("Grasp {id} {code}: phase_ms {:?}, worst motion {:?}", a.phase_ms, worst);
     }
 }
 
@@ -1775,9 +1854,25 @@ mod tests {
         assert_eq!((d[1].angle_deg, d[1].angle_conf), (None, None));
         // 89 and -89 are 2 deg apart: mean at the wrap, not 0
         let fr = [det([0.0; 4], Some((89.0, 0.9))), det([0.0; 4], Some((-89.0, 0.9))), det([0.0; 4], Some((10.0, 0.1)))];
-        let a = frames_angle(&fr, 0.3).unwrap();
+        let (a, spread) = frames_angle(&fr, 0.3).unwrap();
         assert!(a.abs() > 89.9, "{a}");
+        assert!(spread < 2.0, "spread for 89 and -89 should be small: {spread}");
         assert_eq!(frames_angle(&fr[2..], 0.3), None, "below align_min_angle_conf");
+
+        // dispersion units: identical -> 0, ±40° -> ~40°, one frame -> 0
+        let fr_ident = [det([0.0; 4], Some((30.0, 0.9))), det([0.0; 4], Some((30.0, 0.9)))];
+        let (a_id, sp_id) = frames_angle(&fr_ident, 0.3).unwrap();
+        assert!((a_id - 30.0).abs() < 1e-6);
+        assert!(sp_id.abs() < 1e-6);
+
+        let fr_pm = [det([0.0; 4], Some((40.0, 0.9))), det([0.0; 4], Some((-40.0, 0.9)))];
+        let (a_pm, sp_pm) = frames_angle(&fr_pm, 0.3).unwrap();
+        assert!(a_pm.abs() < 1e-6);
+        assert!((sp_pm - 53.6).abs() < 1.0, "spread was {sp_pm}");
+
+        let fr_single = [det([0.0; 4], Some((40.0, 0.9)))];
+        let (_, sp_single) = frames_angle(&fr_single, 0.3).unwrap();
+        assert_eq!(sp_single, 0.0);
         // the roll turns the jaw by -t about z
         let t = roll_across_long_side([0.0, 1.0, 0.0], [1.0, 0.0, 0.0]);
         assert!(t.abs() < 1e-12, "jaw already across a long side along x: {t}");

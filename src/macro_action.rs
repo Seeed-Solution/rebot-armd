@@ -63,6 +63,8 @@ pub struct MacroRun {
     pub sub: SubState,
     /// `/motion/stop` arrived while no sub-motion was running.
     pub stop_requested: bool,
+    pub phase: Option<String>,
+    pub phase_start: Option<Instant>,
 }
 
 /// Orchestrator handle of one macro action: alive checks, phase reports, sub-motions.
@@ -146,7 +148,36 @@ impl MacroCtx {
             if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
             inner.install_macro_path(self.id, &input, path).map_err(arm_fail)?
         };
-        self.wait_sub(phase, limit * 2.0 + 5.0).await
+        let t0 = Instant::now();
+        let sub_res = self.wait_sub(phase, limit * 2.0 + 5.0).await;
+        let ms = t0.elapsed().as_millis() as u32;
+        {
+            let mut inner = self.sup.inner().write().await;
+            let arm_model = inner.config.arm_model.clone();
+            let meas_opt = arm_model.fk_f32(&inner.measured_positions);
+            let cmd_opt = arm_model.fk_f32(&inner.commanded_positions);
+            if let (Some(meas), Some(cmd)) = (meas_opt, cmd_opt) {
+                let track_mm = (crate::kinematics::norm(&crate::kinematics::sub(&meas.p, &cmd.p)) * 1000.0) as f32;
+                let track_deg = crate::kinematics::angle_between(&meas.r, &cmd.r).to_degrees() as f32;
+                let goal_mm = (crate::kinematics::norm(&crate::kinematics::sub(&meas.p, &goal.p)) * 1000.0) as f32;
+                let goal_deg = crate::kinematics::angle_between(&meas.r, &goal.r).to_degrees() as f32;
+                let contact = inner.last_action.as_ref().filter(|a| a.id == self.id).and_then(|a| a.descend_contact);
+                if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == self.id) {
+                    if a.motions.len() < 32 {
+                        a.motions.push(motion::MacroMotionDiag {
+                            phase: phase.to_string(),
+                            ms,
+                            track_mm,
+                            track_deg,
+                            goal_mm,
+                            goal_deg,
+                            contact,
+                        });
+                    }
+                }
+            }
+        }
+        sub_res
     }
 
     /// Run a gripper open / close sub-motion and wait for it.
