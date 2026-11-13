@@ -55,6 +55,10 @@ pub const MAX_JOINTS: usize = 8;
 pub const FAST_FILTER_S: f32 = 0.04;
 /// A joint counts as heavy for the hold rule at this share of the joints' load above idle.
 pub const HEAVY_SHARE: f32 = 0.25;
+/// Stale feedback (any joint older than the 100 ms bound) keeps the last estimate this long
+/// before it counts as lost (s). Damiao feedback ages reach 100-250 ms on 13 % (torque on) to
+/// 52 % (torque off) of black-box samples on the B601-DM, so a per-tick reset blanked the meter.
+pub const STALE_HOLD_S: f32 = 0.5;
 
 /// Section `power_budget.governor`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -354,7 +358,8 @@ impl<const N: usize> PeakWindow<N> {
 /// Runtime estimate kept in the supervisor.
 #[derive(Debug, Clone)]
 pub struct PowerMonitor {
-    /// An estimate from fresh, valid torque feedback exists this tick.
+    /// An estimate exists: fresh, valid torque feedback this tick, or within the last
+    /// [`STALE_HOLD_S`] (the last estimate is kept through short feedback gaps).
     pub valid: bool,
     /// Unfiltered value of this tick (A).
     pub raw_a: f32,
@@ -373,6 +378,8 @@ pub struct PowerMonitor {
     pub over_rated_s: f64,
     pub gov: Governor,
     primed: bool,
+    /// Time since the last fresh feedback (s).
+    stale_s: f32,
 }
 
 impl Default for PowerMonitor {
@@ -380,7 +387,7 @@ impl Default for PowerMonitor {
         Self {
             valid: false, raw_a: 0.0, fast_a: 0.0, bus_a: 0.0, regen_w: 0.0, joint_a: [0.0; MAX_JOINTS],
             peak_5s: PeakWindow::new(PEAK_WINDOW_S / 10.0), peak_60s: PeakWindow::new(1.0),
-            max_a: 0.0, max_at_s: 0.0, over_rated_s: 0.0, gov: Governor::default(), primed: false,
+            max_a: 0.0, max_at_s: 0.0, over_rated_s: 0.0, gov: Governor::default(), primed: false, stale_s: 0.0,
         }
     }
 }
@@ -399,6 +406,7 @@ impl PowerMonitor {
             (self.fast_a, self.bus_a, self.regen_w, self.joint_a) = (e.bus_a, e.bus_a, e.regen_w, e.joint_a);
         }
         self.valid = true;
+        self.stale_s = 0.0;
         self.raw_a = e.bus_a;
         self.peak_5s.push(now_s, self.fast_a);
         self.peak_60s.push(now_s, self.fast_a);
@@ -406,7 +414,14 @@ impl PowerMonitor {
         if self.fast_a > budget.supply_rated_a { self.over_rated_s += f64::from(dt); }
     }
 
-    /// No estimate this tick (stale or invalid feedback): the filters restart from the next one.
+    /// Feedback is stale this tick: keep the last estimate for up to [`STALE_HOLD_S`], then
+    /// invalidate.
+    pub fn stale(&mut self, dt: f32) {
+        self.stale_s += dt;
+        if self.stale_s >= STALE_HOLD_S { self.invalidate(); }
+    }
+
+    /// No estimate (lost or invalid feedback): the filters restart from the next one.
     pub fn invalidate(&mut self) {
         self.valid = false;
         self.primed = false;
@@ -418,7 +433,7 @@ fn r3(v: f32) -> f32 { (v * 1000.0).round() / 1000.0 }
 /// `observation.power`: null when the profile has no enabled `power_budget`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PowerObservation {
-    /// An estimate from fresh, valid torque feedback exists; the numbers below are 0 otherwise.
+    /// An estimate exists (fresh feedback within [`STALE_HOLD_S`]); the numbers below are 0 otherwise.
     pub valid: bool,
     /// Estimated supply current (A), filtered (`filter_s`).
     pub bus_a: f32,
@@ -447,10 +462,12 @@ impl SupervisorInner {
     /// One control tick, after this tick's feedback. `dt` is the control-loop step (s).
     pub(crate) fn power_tick(&mut self, dt: f64) {
         let Some(budget) = self.config.power_budget.as_ref().filter(|p| p.enabled) else { return; };
-        let fresh = self.driver.is_some() && self.collision.torque_feedback && self.feedback_numeric_valid
-            && self.hardware_feedback_fresh(std::time::Duration::from_millis(100));
-        if !fresh {
+        if self.driver.is_none() || !self.collision.torque_feedback || !self.feedback_numeric_valid {
             self.power.invalidate();
+            return;
+        }
+        if !self.hardware_feedback_fresh(std::time::Duration::from_millis(100)) {
+            self.power.stale(dt as f32);
             return;
         }
         let e = budget.estimate(&self.torques, &self.measured_velocities);
