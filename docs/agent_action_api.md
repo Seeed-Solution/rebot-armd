@@ -28,6 +28,8 @@ The existing `/api/v1/motion/jog`, `/motion/home`, `/motion/unload` commands and
 | `/api/v1/action/move_to` | `{"position":[x,y,z], "orientation": {"rpy":[r,p,y]} \| {"quat":[w,x,y,z]} \| null, "speed": {"linear":m/s, "angular":rad/s}?, "tag": str?}` |
 | `/api/v1/action/move_relative` | `{"frame":"base"\|"tool"\|"camera", "d":[dx,dy,dz]?, "dyaw":rad?, "dpitch":rad?, "droll":rad?, "level":bool?, "speed"?, "tag"?}` |
 | `/api/v1/action/gripper` | `{"command":"open"\|"close"\|"move", "fraction":0..1? (move only; 0 closed, 1 open), "grasp":bool? (close only, default true), "speed":rad/s? (≤2.0, default 1.0), "timeout_s":? (≤30; default max(6, expected duration + 2 s), expected duration = travel / speed + 0.5 s + settle_ms, e.g. 8.5 s for the full 5.7 rad stroke at 1 rad/s; an explicit value applies as given), "tag"?}` |
+| `/api/v1/action/gripper_zero_check` | `{"store_offset":bool? (default false), "threshold_rad":float? (default 0.10), "tag":str?}` — see [Gripper zero check and calibration](#gripper-zero-check-and-calibration--夹爪零位检查与标定) |
+| `/api/v1/gripper/calibration` | `{"offset_rad":float?, "jaw_opening":{"points":[[rad,m],...],"calibrated":bool?}?}` (WS command, lease required; REST `GET` exposed without lease) — see [Gripper zero check and calibration](#gripper-zero-check-and-calibration--夹爪零位检查与标定) |
 | `/api/v1/action/grasp` | `{"label":str, "box_norm":[x0,y0,x1,y1], "frame_id":int?, "ts_ms":number?, "overrides":{setup fields}?, "dry_run":bool? (default false), "tag"?}` — see [Grasp](#grasp--点框抓取) |
 | `/api/v1/grasp/setup` | grasp setup patch, see [Grasp setup](#grasp-setup--抓取设置) (not an action: acknowledged without `action_id`) |
 | `/api/v1/action/move_to_pose` | `{"name":str, "include_gripper":bool? (default false), "speed_scale":0.1..1.0? (default 1.0), "tag"?}` — see [Named poses](#named-poses--命名姿态) |
@@ -87,9 +89,9 @@ Every observation carries `action` (latest record) and, for 2 s after a newer ac
            "holding":null, "gripper_gap_rad":null, "settled":null}
 ```
 
-`kind`: `move_to`, `move_relative`, `gripper`, `grasp`, `place`, `joint_move`, `home`, `park`, `move_to_pose`, `replay`. Planned motions carry `power_scale` when the profile has a power budget (see [Power budget](#power-budget--电源功率预算)). A `grasp` record also carries `phase`, `iteration`, `error_px`, `angle_spread_deg` (degrees; circular dispersion of accepted detector angles), and, for camera-down acquisition, `final_offset_px` and `acquire_height_m` (fields absent otherwise); a `place` record carries `phase` and, when a spill-safe container was levelled, `orientation: "levelled"` (null otherwise); a `replay` record carries `phase`, `episode` and `t_s` (the last two absent for other kinds). Macro actions (`grasp`, `place`) record `phase_ms` (per-phase duration in milliseconds) and `motions` (diagnostics per Cartesian sub-motion, up to 32 entries: `{phase, ms, track_mm, track_deg, goal_mm, goal_deg, contact}`). `state`: `running`, `done`, `failed`, `cancelled`. `started_at` / `finished_at` use the observation `timestamp` clock. Clients block by waiting until `action.id == action_id` and `state != "running"`, or until `previous_action.id == action_id`.
+`kind`: `move_to`, `move_relative`, `gripper`, `gripper_zero_check`, `grasp`, `place`, `joint_move`, `home`, `park`, `move_to_pose`, `replay`. Planned motions carry `power_scale` when the profile has a power budget (see [Power budget](#power-budget--电源功率预算)). A `gripper_zero_check` record carries `stop_rad`, `offset_rad` and `pass: bool` (null while running). A `grasp` record also carries `phase`, `iteration`, `error_px`, `angle_spread_deg` (degrees; circular dispersion of accepted detector angles), and, for camera-down acquisition, `final_offset_px` and `acquire_height_m` (fields absent otherwise); a `place` record carries `phase` and, when a spill-safe container was levelled, `orientation: "levelled"` (null otherwise); a `replay` record carries `phase`, `episode` and `t_s` (the last two absent for other kinds). Macro actions (`grasp`, `place`) record `phase_ms` (per-phase duration in milliseconds) and `motions` (diagnostics per Cartesian sub-motion, up to 32 entries: `{phase, ms, track_mm, track_deg, goal_mm, goal_deg, contact}`). `state`: `running`, `done`, `failed`, `cancelled`. `started_at` / `finished_at` use the observation `timestamp` clock. Clients block by waiting until `action.id == action_id` and `state != "running"`, or until `previous_action.id == action_id`.
 
-`kind`：`move_to`、`move_relative`、`gripper`、`grasp`、`place`、`joint_move`、`home`、`park`、`move_to_pose`、`replay`。规划运动在 profile 包含电源预算时携带 `power_scale`（见[电源功率预算](#power-budget--电源功率预算)）。`grasp` 记录另带 `phase`、`iteration`、`error_px`、`angle_spread_deg`（度；检测角度的圆周离散度），相机朝下采集时另带 `final_offset_px` 和 `acquire_height_m`；`place` 记录带 `phase`，在防倾洒调平时带 `orientation: "levelled"`（其余为 null）；`replay` 记录带 `phase`、`episode` 和 `t_s`。宏动作（`grasp`、`place`）记录 `phase_ms`（各阶段耗时毫秒）和 `motions`（各笛卡尔子运动诊断，最多 32 条：`{phase, ms, track_mm, track_deg, goal_mm, goal_deg, contact}`）。`state`：`running`、`done`、`failed`、`cancelled`。`started_at` / `finished_at` 使用观测的 `timestamp` 时钟。客户端通过等待 `action.id == action_id` 且 `state != "running"` 或 `previous_action.id == action_id` 阻塞同步。
+`kind`：`move_to`、`move_relative`、`gripper`、`gripper_zero_check`、`grasp`、`place`、`joint_move`、`home`、`park`、`move_to_pose`、`replay`。规划运动在 profile 包含电源预算时携带 `power_scale`（见[电源功率预算](#power-budget--电源功率预算)）。`gripper_zero_check` 记录携带 `stop_rad`、`offset_rad` 与 `pass: bool`（运行中为 null）。`grasp` 记录另带 `phase`、`iteration`、`error_px`、`angle_spread_deg`（度；检测角度的圆周离散度），相机朝下采集时另带 `final_offset_px` 和 `acquire_height_m`；`place` 记录带 `phase`，在防倾洒调平时带 `orientation: "levelled"`（其余为 null）；`replay` 记录带 `phase`、`episode` 和 `t_s`。宏动作（`grasp`、`place`）记录 `phase_ms`（各阶段耗时毫秒）和 `motions`（各笛卡尔子运动诊断，最多 32 条：`{phase, ms, track_mm, track_deg, goal_mm, goal_deg, contact}`）。`state`：`running`、`done`、`failed`、`cancelled`。`started_at` / `finished_at` 使用观测的 `timestamp` 时钟。客户端通过等待 `action.id == action_id` 且 `state != "running"` 或 `previous_action.id == action_id` 阻塞同步。
 
 A running action ends when its reference goes away:
 
@@ -371,8 +373,9 @@ The defaults below are simulation values. Measure them on the v8 mount before re
 | `camera_mount.body_size_m` | 0.055 x 0.047 x 0.040 | measure the printed holder with the camera installed (width along x_cam, height along y_cam, depth behind the lens) and confirm the lens sits at the centre of the front face; set the field when the box does not contain the holder |
 | table margin | 5 mm (`TABLE_CLEARANCE_M`, `src/grasp.rs`) | set `table_z_m` with `table_z_from_tcp` at several points of the work area; the margin must exceed the spread of those readings plus the TCP height error at the grasp height. The margin is a constant: a larger one needs a code change |
 | `recheck_tol_px` | 40 | hold the arm still over a static target, record the box centre of 100 consecutive frames, take the jitter (largest distance from the mean centre); set `recheck_tol_px` ≥ 3 × that jitter + the model error (distance between the projected and the detected centre after a transition with the target in place) |
+| gripper calibration | `offset_rad: 0.0`, nominal jaw points | Mechanical zero: run `/api/v1/action/gripper_zero_check` with an empty gripper to detect mechanical stall zero and persist `offset_rad`; opening curve: measure jaw opening with calipers at multiple J7 angles and submit via WS `/api/v1/gripper/calibration` |
 
-下表默认值来自仿真，在 v8 支架上使用前须实测：`camera_mount.offset_m`（默认未设置，仿真测试用 [−0.0731, 0.0005, 0.066]）为 end_link 坐标系下的镜头中心（米），从夹爪尖（end_link 原点）用尺量或取自机械臂与打印支架的 CAD，再点动使镜头位于桌面标记上方、比较 FK + 偏移与标记位置来验证；`camera_mount.body_size_m`（默认 0.055 x 0.047 x 0.040）量装好相机的打印支架（沿 x_cam 宽、沿 y_cam 高、镜头后方深度），确认镜头位于前面中心，方盒包不住支架时设置该字段；桌面余量 5 mm（`src/grasp.rs` 的 `TABLE_CLEARANCE_M`）须大于在工作区内多点用 `table_z_from_tcp` 测得的 `table_z_m` 差值加抓取高度处的 TCP 高度误差，余量是常量，改大需改代码；`recheck_tol_px`（默认 40）：机械臂静止对准静止目标，记录连续 100 帧的框中心，取抖动（到平均中心的最大距离），设 `recheck_tol_px` ≥ 3 × 抖动 + 模型误差（目标不动时转换后投影中心与检测中心的距离）。
+下表默认值来自仿真，在 v8 支架上使用前须实测：`camera_mount.offset_m`（默认未设置，仿真测试用 [−0.0731, 0.0005, 0.066]）为 end_link 坐标系下的镜头中心（米），从夹爪尖（end_link 原点）用尺量或取自机械臂与打印支架的 CAD，再点动使镜头位于桌面标记上方、比较 FK + 偏移与标记位置来验证；`camera_mount.body_size_m`（默认 0.055 x 0.047 x 0.040）量装好相机的打印支架（沿 x_cam 宽、沿 y_cam 高、镜头后方深度），确认镜头位于前面中心，方盒包不住支架时设置该字段；桌面余量 5 mm（`src/grasp.rs` 的 `TABLE_CLEARANCE_M`）须大于在工作区内多点用 `table_z_from_tcp` 测得的 `table_z_m` 差值加抓取高度处的 TCP 高度误差，余量是常量，改大需改代码；`recheck_tol_px`（默认 40）：机械臂静止对准静止目标，记录连续 100 帧的框中心，取抖动（到平均中心的最大距离），设 `recheck_tol_px` ≥ 3 × 抖动 + 模型误差（目标不动时转换后投影中心与检测中心的距离）；夹爪标定（默认 `offset_rad: 0.0` 及名义开度点）：空爪执行 `/api/v1/action/gripper_zero_check` 测定机械闭合零位并持久化 `offset_rad`，用游标卡尺测量多个 J7 角度下的实际爪间距并通过 WS `/api/v1/gripper/calibration` 写入校准曲线。
 
 ## Place / 放置
 
@@ -475,6 +478,64 @@ WS 指令 `/api/v1/action/replay`（需租约与 epoch）：`episode` 必填（`
 运动前的检查（不通过则拒绝，不运动）：帧数少于 2 或没有时长 `REPLAY_EMPTY`；关节数与 profile 不符 `REPLAY_JOINT_COUNT`；非有限值、时间戳非有限或递减、文件无法读取 `REPLAY_INVALID_EPISODE`；时长超过 600 s `REPLAY_TOO_LONG`；任一帧超出关节软限位（J7 仅在 `gripper` 时检查）`SOFT_LIMIT_EXCEEDED`；重采样后各关节速度 × `speed` 超过规划运动限速（`planning_limits()`，rebot-dm 为 0.45 rad/s；夹爪用 J7 关节限位）`REPLAY_TOO_FAST`，消息给出关节、速度、时刻与可通过的最高回放速度，不对录制做削峰；每个重采样帧按规划运动的工作空间规则检查（基准为请求时的指令位姿），并对禁入盒做扫掠检查（最多追加 4000 次 FK）`WORKSPACE_VIOLATION`；文件不存在 `EPISODE_NOT_FOUND`；存储关闭 `EPISODES_DISABLED`；录制进行或保存中、重力补偿中、其他轨迹 / servo 流 / 运动进行中 `MOTION_BUSY`；碰撞保护中 `COLLISION_HOLD`；急停、故障、未使能为对应错误码。
 
 执行：按时间戳把 `observation.state` 线性重采样到控制频率；先以规划运动限速用关节空间五次多项式移动到第 0 帧（与 jog 相同的检查）；之后每个周期按 dt × `speed` × rate 推进录制时间，rate 与规划路径相同（J1–J6 滞后低于 0.38 rad 全速，0.45 rad 停止），rate ≤ 0.1 持续 1 s 结束为 `failed` / `TRACKING_STALL`，指令设为实测位置，不进入 Fault；最后在末帧做到位确认。`gripper: true` 时 J7 跟随录制；夹爪卡滞锁存期间，继续向卡滞方向的指令保持不动，反向指令解除锁存（与 servo / jog 规则相同）。动作记录：`kind` 为 `replay`，带 `episode`、`phase`（`approach` → `replay` → `settle`）、`t_s`（已回放到的录制时间，接近阶段为 0）与 `progress`。停止、急停、碰撞、故障、看门狗和租约丢失按“动作状态”一节的错误码结束；租约丢失（释放、被接管、连接关闭）时 armd 同时停止回放参考轨迹，机械臂制动并保持。
+
+## Gripper zero check and calibration / 夹爪零位检查与标定
+
+The gripper zero check measures the mechanical stall position of the gripper jaws to determine zero offset, and the calibration endpoint configures runtime opening-to-angle mapping.
+
+### Gripper zero check / 零位检查动作
+
+The action `/api/v1/action/gripper_zero_check` never runs automatically. It requires an active control lease and an armed/torqued robot. It is refused with `409 OBJECT_HELD` if the supervisor reports an object is held (`holding`).
+
+- **Command body**: `{"store_offset": bool? (default false), "threshold_rad": float? (default 0.10), "tag": str?}`.
+- **Execution**: Closes J7 at 0.3 rad/s toward `closed_rad + 0.6` (bounded inside J7 limits). J7 stops upon latching the stall detector (`GRIPPER_STALL_LATCH_NM` = 0.444 N·m for 6 consecutive ticks). Timeout is 10 s (`GRIPPER_TIMEOUT`).
+- **Action status**: Reports `stop_rad` (measured position at stall), `offset_rad` (`stop_rad - base_closed_rad`), and `pass: bool` (`|offset_rad| <= threshold_rad`).
+- **Offset persistence**: If `store_offset: true`, `pass: true`, and `|offset_rad| <= 0.5`, the offset is persisted to `gripper_calib.json` (env `ARMD_GRIPPER_CALIB`, default `/userdata/rebot-teleop/gripper_calib.json`) via atomic write, shifting `closed_rad`, `open_rad`, and `jaw_opening` curve points in the active policy. If `|offset_rad| > 0.5`, storing is refused.
+
+零位检查动作 `/api/v1/action/gripper_zero_check` 不会自动运行，需要有效控制租约且机械臂处于使能状态。若机械臂当前处于抓持状态（`holding`），拒绝执行并返回 `409 OBJECT_HELD`。
+
+- **请求体**：`{"store_offset": bool?（默认 false）, "threshold_rad": float?（默认 0.10）, "tag": str?}`。
+- **执行过程**：J7 以 0.3 rad/s 向 `closed_rad + 0.6`（受 J7 限位约束）闭合，触发卡滞锁存（连续 6 周期 |τ7| ≥ 0.444 N·m）时停止。超时时间 10 s。
+- **动作状态**：报告 `stop_rad`（停止时的实测角度）、`offset_rad`（相对基准闭合角的偏差）以及 `pass: bool`（`|offset_rad| <= threshold_rad`）。
+- **偏差持久化**：若 `store_offset: true`、`pass: true` 且 `|offset_rad| <= 0.5`，偏差原子写入 `gripper_calib.json`（环境变量 `ARMD_GRIPPER_CALIB`，默认 `/userdata/rebot-teleop/gripper_calib.json`），并同步平移当前策略中的 `closed_rad`、`open_rad` 和 `jaw_opening` 各点。若 `|offset_rad| > 0.5` 则拒绝保存。
+
+### Observation field / 观测字段
+
+7-DOF profiles with a gripper policy publish `observation.gripper_zero`:
+```json
+"gripper_zero": {
+  "state": "ok",
+  "j7": -0.02,
+  "offset_rad": 0.0
+}
+```
+- `state`:
+  - `"ok"`: passive boot check passed (J7 is within `[open_rad - 0.3, closed_rad + 0.3]`).
+  - `"out_of_range"`: J7 is outside the valid range during passive boot check.
+  - `"checked"`: an active zero check action completed successfully.
+  - `"calib_invalid"`: startup load detected a corrupt or invalid `gripper_calib.json` (the file is ignored and runtime policy remains unshifted).
+- `j7`: current measured J7 angle (rad).
+- `offset_rad`: currently active calibration offset (from persisted file or latest zero check).
+
+带有夹爪策略的 7 轴机械臂发布 `observation.gripper_zero`：
+- `state`：`"ok"`（被动开机检查通过，J7 处于 `[open_rad - 0.3, closed_rad + 0.3]` 范围内）；`"out_of_range"`（开机位置超出合理范围）；`"checked"`（已完成主动零位检查）；`"calib_invalid"`（启动时读取到损坏或无效的标定文件，忽略该文件并保持基准策略）。
+- `j7`：当前 J7 实测关节角（rad）。
+- `offset_rad`：当前生效的标定偏差。
+
+### Runtime calibration endpoint / 运行时标定接口
+
+- **WS command** `/api/v1/gripper/calibration` (lease required):
+  ```json
+  {"type":"command", "request_id":12, "generation":1, "epoch_id":1,
+   "path":"/api/v1/gripper/calibration",
+   "body":{"offset_rad":0.02, "jaw_opening":{"points":[[0.0,0.0],[-5.0,0.08]], "calibrated":true}}}
+  ```
+  Validates that `jaw_opening` is monotonic, has ≥ 2 points, J7 angles lie within joint limits, and openings are in [0, 0.2] m. Validates `|offset_rad| <= 0.5`. Invalid input is rejected with `400 INVALID_COMMAND`. On success, atomically saves to `gripper_calib.json` and replies with `command_ack` carrying the effective policy (`closed_rad`, `open_rad`, `jaw_opening`, `persisted: true`).
+- **REST** `GET /api/v1/gripper/calibration` (no lease required):
+  Returns `{"offset_rad": float?, "jaw_opening": {...}?, "calibrated": bool, "policy": {...}?, "ts": float?}` allowing inspection tools to read current calibration without acquiring control.
+
+- **WS 指令** `/api/v1/gripper/calibration`（需租约）：验证 `jaw_opening` 单调递增、至少 2 个点、角度在 J7 限位内、开度在 [0, 0.2] m 范围内；验证 `|offset_rad| <= 0.5`。不合法输入返回 `400 INVALID_COMMAND`。成功后原子写入 `gripper_calib.json` 并在 `command_ack` 中返回生效的完整策略。
+- **REST** `GET /api/v1/gripper/calibration`（无需租约）：返回当前生效的标定配置与策略，供工具读取。
 
 ## Gravity compensation mode / 重力补偿模式
 

@@ -1229,6 +1229,19 @@ pub struct ArmObservation {
     /// profile has no enabled `power_budget`. An estimate from motor feedback, not a measurement.
     #[serde(default)]
     pub power: Option<crate::power::PowerObservation>,
+    /// Gripper zero check state (`src/gripper_calib.rs`); null without a gripper policy or < 7 DOF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gripper_zero: Option<GripperZeroObservation>,
+}
+
+/// Gripper zero state published in `observation.gripper_zero`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GripperZeroObservation {
+    /// `ok`, `out_of_range`, `checked`, or `calib_invalid`.
+    pub state: String,
+    pub j7: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_rad: Option<f32>,
 }
 
 /// A motor fault code reported in the motor's feedback (`observation.motor_errors`).

@@ -211,6 +211,10 @@ fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: 
             let (id, duration) = inner.start_gripper(request, epoch)?;
             return Ok(ActionStart::Started(id, duration));
         }
+        "/api/v1/action/gripper_zero_check" => {
+            let (id, duration) = inner.start_gripper_zero_check(body, epoch)?;
+            return Ok(ActionStart::Started(id, duration));
+        }
         "/api/v1/action/grasp" => {
             if body.get("dry_run").and_then(Value::as_bool) == Some(true) {
                 return Ok(ActionStart::DryRunGrasp(body.clone()));
@@ -260,6 +264,14 @@ fn state_command(inner: &mut SupervisorInner, path: &str, body: &Value, setup_pa
         "/api/v1/safety/collision" => crate::collision::update(inner, body).map(|(config, write)| (vec![("collision", json!(config))], write)),
         "/api/v1/workspace/keepout" => crate::keepout::update(inner, body)
             .map(|(state, write)| (vec![("boxes", json!(state.boxes)), ("source", json!(state.source))], write)),
+        "/api/v1/gripper/calibration" => crate::gripper_calib::update(inner, body).map(|(policy, write)| {
+            (vec![
+                ("policy", json!(policy)),
+                ("closed_rad", json!(policy.closed_rad)),
+                ("open_rad", json!(policy.open_rad)),
+                ("jaw_opening", json!(policy.jaw_opening)),
+            ], write)
+        }),
         _ => return None,
     })
 }

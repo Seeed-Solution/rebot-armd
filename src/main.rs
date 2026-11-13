@@ -205,6 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     armd::keepout::load_into(&supervisor, &armd::keepout::path_from_env()).await;
     armd::poses::load_into(&supervisor, &armd::poses::path_from_env()).await;
     armd::collision::load_into(&supervisor, &armd::collision::path_from_env()).await;
+    armd::gripper_calib::load_into(&supervisor, &armd::gripper_calib::path_from_env()).await;
     match follower {
         "rebot-rs" | "rebot-dm" => {
             #[cfg(target_os = "linux")]

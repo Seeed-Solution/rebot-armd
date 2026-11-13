@@ -482,3 +482,8 @@ pub async fn get_collision(State(supervisor): State<Arc<ArmSupervisor>>) -> Resp
 pub async fn get_safety_describe(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
     Json(supervisor.inner().read().await.safety_describe()).into_response()
 }
+
+/// `GET /api/v1/gripper/calibration`: current gripper calibration and effective policy (no lease).
+pub async fn get_gripper_calibration(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
+    Json(supervisor.inner().read().await.gripper_calibration_response()).into_response()
+}

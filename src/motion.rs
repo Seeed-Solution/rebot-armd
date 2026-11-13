@@ -405,7 +405,7 @@ pub fn parse_move_relative(body: &Value) -> Result<(GoalSpec, Speed, Option<Stri
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GripperCommand { Open, Close, Move }
+pub enum GripperCommand { Open, Close, Move, Seek }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GripperRequest {
@@ -615,6 +615,10 @@ impl GripperMotion {
             GripperCommand::Open => policy.open_rad,
             GripperCommand::Close => policy.closed_rad,
             GripperCommand::Move => policy.closed_rad + request.fraction.unwrap_or(0.0) as f32 * (policy.open_rad - policy.closed_rad),
+            GripperCommand::Seek => {
+                let dir = if policy.closed_rad >= policy.open_rad { 1.0 } else { -1.0 };
+                policy.closed_rad + dir * 0.6
+            }
         }.clamp(limit.min_position, limit.max_position);
         let limit = JointLimit { max_velocity: request.speed as f32, ..limit };
         let mut m = Self { request, policy, limit, target, start, elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, moved: false, phase: GripPhase::Moving };
@@ -698,7 +702,7 @@ impl GripperMotion {
             positions[6] = q7;
             velocities[6] = 0.0;
             done(None, Some((self.policy.closed_rad - m7) * self.close_dir()))
-        } else if still && ((m7 - self.target).abs() < SETTLE_POS_RAD as f32
+        } else if self.request.command != GripperCommand::Seek && still && ((m7 - self.target).abs() < SETTLE_POS_RAD as f32
             || (cmd_at_target && (m7 - self.target).abs() < GRIPPER_STOP_SHORT_RAD)) {
             // the jaw stopped close to the target: the real gripper opens to about -5.61 against a
             // -5.70 command (mechanical stop / POS_VEL offset); stopping farther away is a jam -> timeout
@@ -846,6 +850,15 @@ pub struct ActionStatus {
     /// Grasp opening width (m) from measured J7 after the close.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_width_m: Option<f32>,
+    /// Gripper zero check: measured J7 position at the stall stop (rad).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_rad: Option<f32>,
+    /// Gripper zero check: stop_rad minus base closed_rad (rad).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_rad: Option<f32>,
+    /// Gripper zero check: true when |offset_rad| <= threshold_rad.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass: Option<bool>,
     /// Accumulated runtime per macro phase (ms).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub phase_ms: BTreeMap<String, u32>,
