@@ -503,3 +503,77 @@ def test_physics_stops_when_the_camera_dies_holding_the_shared_state_lock(sim):
     t0 = time.perf_counter()
     sim.run(duration=5)
     assert time.perf_counter() - t0 < 1.0 and sim.camera_error == "shared-state lock timeout"
+
+
+def test_mask_focus_control_and_echo(api):
+    srv, _, base = api
+    # Status initially has model.mask_max_boxes == 3 and mask_focus == None
+    code, status = http(base + "/api/status")
+    assert code == 200
+    assert status["model"]["mask_max_boxes"] == 3
+    assert status["mask_focus"] is None
+
+    code, mf = http(base + "/api/mask_focus")
+    assert code == 200
+    assert mf["mask_focus"] is None
+
+    # Validation
+    assert http(base + "/api/mask_focus", {"box_norm": [0.1, 0.2]})[0] == 400
+    assert http(base + "/api/mask_focus", {"box_norm": [0.1, 0.2, 0.3, 0.4], "ttl_ms": "bad"})[0] == 400
+
+    # Set focus
+    code, res = http(base + "/api/mask_focus", {
+        "box_norm": [0.15, 0.15, 0.25, 0.25],
+        "ttl_ms": 1500,
+        "label": "cube",
+    })
+    assert code == 200
+    assert res["mask_focus"]["box_norm"] == [0.15, 0.15, 0.25, 0.25]
+    assert res["mask_focus"]["label"] == "cube"
+    assert res["mask_focus"]["ttl_ms"] == 1500
+    assert 0 <= res["mask_focus"]["remaining_ttl_ms"] <= 1500
+
+    # Status reflects it
+    code, status = http(base + "/api/status")
+    assert status["mask_focus"] is not None
+    assert status["mask_focus"]["label"] == "cube"
+
+    # Clearing via ttl_ms = 0
+    code, res = http(base + "/api/mask_focus", {"ttl_ms": 0})
+    assert code == 200 and res["mask_focus"] is None
+
+    # Clearing via empty body
+    http(base + "/api/mask_focus", {"box_norm": [0.1, 0.1, 0.3, 0.3]})
+    code, res = http(base + "/api/mask_focus", {})
+    assert code == 200 and res["mask_focus"] is None
+
+    # TTL expiry
+    http(base + "/api/mask_focus", {"box_norm": [0.1, 0.1, 0.3, 0.3], "ttl_ms": 100})
+    time.sleep(0.15)
+    code, res = http(base + "/api/mask_focus")
+    assert code == 200 and res["mask_focus"] is None
+
+    # Detection echoing with trigger focus
+    dets = [
+        {"class_name": "cube", "x": 0.2, "y": 0.2, "w": 0.1, "h": 0.1},
+        {"class_name": "cup", "x": 0.8, "y": 0.8, "w": 0.1, "h": 0.1},
+    ]
+    out = {}
+    t = threading.Thread(target=lambda: out.update(http(base + "/api/trigger", {
+        "pipelines": ["yolo"],
+        "mask_focus": {"box_norm": [0.15, 0.15, 0.25, 0.25]},
+    })[1]))
+    t.start()
+    time.sleep(0.1)
+    srv.p.on_frame(1, 1000, time.monotonic(), dets)
+    t.join(5)
+    assert out["success"] and len(out["detections"]) == 2
+    assert out["detections"][0].get("mask_focus") is True
+    assert out["detections"][1].get("mask_focus") is not True
+
+    # Trigger focus does not persist to subsequent frame
+    assert http(base + "/api/subscribe", {"client": "t", "pipelines": ["yolo"], "fps": 15})[0] == 200
+    srv.p.on_frame(2, 1100, time.monotonic(), dets)
+    code, lat = http(base + "/api/results/latest")
+    assert code == 200 and lat["frame_id"] == 2
+    assert lat["detections"][0].get("mask_focus") is not True

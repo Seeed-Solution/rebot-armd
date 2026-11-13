@@ -462,6 +462,19 @@ fn trigger_body_wait_ms(body: &[u8]) -> Option<u64> {
     serde_json::from_slice::<serde_json::Value>(body).ok()?.get("wait_ms")?.as_u64().map(|w| w.min(MAX_WAIT_MS))
 }
 
+/// GET /api/v1/detection/mask_focus -> upstream GET /api/mask_focus
+pub async fn get_detection_mask_focus(Extension(up): Extension<DetectorUpstream>) -> Response {
+    forward(&up, Method::GET, "/api/mask_focus".to_string(), None, Duration::from_secs(2)).await
+}
+
+/// POST /api/v1/detection/mask_focus -> upstream POST /api/mask_focus
+pub async fn post_detection_mask_focus(
+    Extension(up): Extension<DetectorUpstream>,
+    body: Bytes,
+) -> Response {
+    forward(&up, Method::POST, "/api/mask_focus".to_string(), Some(json_body(body)), Duration::from_secs(2)).await
+}
+
 // ---------------------------------------------------------------------------
 // Vision subscriptions (perception API 2): continuous inference per caller
 // ---------------------------------------------------------------------------

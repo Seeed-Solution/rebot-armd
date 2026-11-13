@@ -64,6 +64,8 @@ struct SimCamera {
     pub width_px: Mutex<Option<f64>>,
     /// Alternating noise (deg) added to `angle_deg` between frames.
     pub angle_noise: Mutex<Option<f64>>,
+    pub focus_calls: Mutex<Vec<(Option<String>, [f64; 4], u64)>>,
+    pub focus_error: AtomicBool,
 }
 
 impl SimCamera {
@@ -83,17 +85,17 @@ impl SimCamera {
         let captured = Instant::now();
         let q = self.sup.inner().read().await.measured_positions.clone();
         let pose = ARM.fk(&kinematics::q6(&q));
-        let mut detections = vec![Detection { label: "person".into(), score: 0.5, box_norm: [0.0, 0.0, 0.08, 0.1], angle_deg: None, angle_conf: None, grasp_width_px: None }];
+        let mut detections = vec![Detection { label: "person".into(), score: 0.5, box_norm: [0.0, 0.0, 0.08, 0.1], angle_deg: None, angle_conf: None, grasp_width_px: None, mask_focus: false }];
         if self.visible.load(Ordering::SeqCst) {
             if let Some(b) = self.project_box(&pose) {
                 let (mut angle_deg, angle_conf) = match self.image_angle(&pose) { Some((a, c)) => (Some(a), Some(c)), None => (None, None) };
                 if let (Some(a), Some(noise)) = (angle_deg, *self.angle_noise.lock().unwrap()) {
                     let frame_id = self.frame.load(Ordering::SeqCst);
-                    let sign = if frame_id % 2 == 0 { 1.0 } else { -1.0 };
+                    let sign = if frame_id.is_multiple_of(2) { 1.0 } else { -1.0 };
                     angle_deg = Some(a + sign * noise);
                 }
                 let grasp_width_px = *self.width_px.lock().unwrap();
-                detections.push(Detection { label: self.label.clone(), score: 0.9, box_norm: b, angle_deg, angle_conf, grasp_width_px });
+                detections.push(Detection { label: self.label.clone(), score: 0.9, box_norm: b, angle_deg, angle_conf, grasp_width_px, mask_focus: false });
             }
         }
         let frame_id = self.frame.fetch_add(1, Ordering::SeqCst) + 1;
@@ -173,6 +175,21 @@ impl DetectionSource for SimCamera {
     }
     fn per_request_pipelines(&self) -> BoxFuture<'_, Result<bool, String>> {
         Box::pin(async move { Ok(self.per_request.load(Ordering::SeqCst)) })
+    }
+    fn set_mask_focus(&self, label: Option<String>, box_norm: [f64; 4], ttl_ms: u64) -> BoxFuture<'_, Result<(), String>> {
+        if self.focus_error.load(Ordering::SeqCst) {
+            return Box::pin(async { Err("simulated focus error".to_string()) });
+        }
+        self.focus_calls.lock().unwrap().push((label, box_norm, ttl_ms));
+        Box::pin(async { Ok(()) })
+    }
+    fn trigger_with_focus(&self, pipelines: &'static [&'static str], wait_ms: u64, focus: Option<&armd::grasp::MaskFocus>) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
+        if let Some(f) = focus {
+            if !self.focus_error.load(Ordering::SeqCst) {
+                self.focus_calls.lock().unwrap().push((f.label.clone(), f.box_norm, f.ttl_ms));
+            }
+        }
+        self.trigger(pipelines, wait_ms)
     }
     fn trigger(&self, pipelines: &'static [&'static str], _wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
         Box::pin(async move {
@@ -280,6 +297,7 @@ async fn rig_driven(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start: 
         per_request: AtomicBool::new(false), trigger_calls: Mutex::new(Vec::new()), next_frame_calls: AtomicU64::new(0),
         shift: Mutex::new([0.0; 2]), turned: AtomicBool::new(false), failing: AtomicBool::new(false), stale: AtomicBool::new(false), delayed: AtomicBool::new(false),
         angle: Mutex::new(None), top: Mutex::new(None), width_px: Mutex::new(None), angle_noise: Mutex::new(None),
+        focus_calls: Mutex::new(Vec::new()), focus_error: AtomicBool::new(false),
     });
     let hold = Arc::new(AtomicBool::new(true));
     let (ticker, hold_t) = (sup.clone(), hold.clone());
@@ -1918,6 +1936,56 @@ async fn calibrated_too_wide_limit() {
     assert_eq!(a.code.as_deref(), Some("TOO_WIDE"));
     let measured_w = a.grasp_width_m.expect("width recorded");
     assert!(measured_w > 0.065 && measured_w < 0.075, "width {measured_w} between calib limit 0.065 and max 0.075");
+}
+
+#[tokio::test]
+async fn grasp_records_focus_calls_and_clears_at_end() {
+    let setup = GraspSetup { camera_tilt_deg: -20.0, ..GraspSetup::default() };
+    let r = rig(setup.clone(), Truth::same(), 0.0, [0.0, 0.0], false).await;
+    let start_r = start_pose(&r).await.r;
+    let mut s = setup.clone();
+    s.grip_pixel_norm = calibrate_grip(&r, &setup, &start_r);
+    r.sup.inner().write().await.set_grasp_setup(s.clone());
+
+    let body = tap(&r).await;
+    let b = body["box_norm"].as_array().unwrap();
+    let tapped_box = [
+        b[0].as_f64().unwrap(),
+        b[1].as_f64().unwrap(),
+        b[2].as_f64().unwrap(),
+        b[3].as_f64().unwrap(),
+    ];
+
+    let (id, _) = grasp::start(&r.sup, r.sim.clone(), &body).await.expect("grasp accepted");
+    let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
+    assert_eq!(a.state, "done");
+
+    let calls = r.sim.focus_calls.lock().unwrap().clone();
+    assert!(!calls.is_empty(), "focus calls should be recorded");
+    // First focus call is set at centring start with the tapped box and label
+    assert_eq!(calls[0].0.as_deref(), Some("cup"));
+    assert_eq!(calls[0].1, tapped_box);
+    assert_eq!(calls[0].2, 2000);
+    // Last focus call clears focus with ttl 0
+    assert_eq!(calls.last().unwrap().2, 0);
+}
+
+#[tokio::test]
+async fn grasp_completes_when_mask_focus_fails() {
+    let setup = GraspSetup { camera_tilt_deg: -20.0, ..GraspSetup::default() };
+    let r = rig(setup.clone(), Truth::same(), 0.0, [0.0, 0.0], false).await;
+    let start_r = start_pose(&r).await.r;
+    let mut s = setup.clone();
+    s.grip_pixel_norm = calibrate_grip(&r, &setup, &start_r);
+    r.sup.inner().write().await.set_grasp_setup(s.clone());
+
+    // Simulate focus failure (e.g. older detector returning error)
+    r.sim.focus_error.store(true, Ordering::SeqCst);
+
+    let (id, _) = grasp::start(&r.sup, r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
+    let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
+    assert_eq!(a.state, "done");
+    assert_eq!(a.holding, Some(true));
 }
 
 

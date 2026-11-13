@@ -108,6 +108,10 @@ pub fn create_router_full(
         )
         .route("/api/v1/detection/latest", get(proxy::get_detection_latest))
         .route("/api/v1/detection/trigger", post(proxy::post_detection_trigger))
+        .route(
+            "/api/v1/detection/mask_focus",
+            get(proxy::get_detection_mask_focus).post(proxy::post_detection_mask_focus),
+        )
         .route("/api/v1/vision/mode", get(proxy::get_vision_mode).post(proxy::post_vision_mode))
         .route("/api/v1/vision/subscribe", post(proxy::post_vision_subscribe))
         .route("/api/v1/vision/subscribe/{id}", axum::routing::delete(proxy::delete_vision_subscribe))

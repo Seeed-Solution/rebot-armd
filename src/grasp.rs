@@ -381,6 +381,14 @@ pub struct Detection {
     pub angle_deg: Option<f64>,
     pub angle_conf: Option<f64>,
     pub grasp_width_px: Option<f64>,
+    pub mask_focus: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaskFocus {
+    pub label: Option<String>,
+    pub box_norm: [f64; 4],
+    pub ttl_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -422,8 +430,16 @@ pub trait DetectionSource: Send + Sync {
     }
     /// One inference running exactly `pipelines` on a frame newer than the call, waiting up to
     /// `wait_ms`. `Ok(None)` = no fresh frame in time.
-    fn trigger(&self, _pipelines: &'static [&'static str], _wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
+    fn trigger(&self, pipelines: &'static [&'static str], wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
+        self.trigger_with_focus(pipelines, wait_ms, None)
+    }
+    /// One inference with optional mask focus.
+    fn trigger_with_focus(&self, _pipelines: &'static [&'static str], _wait_ms: u64, _focus: Option<&MaskFocus>) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
         Box::pin(async { Err("per-request pipelines not supported".to_string()) })
+    }
+    /// Sets mask focus for subsequent frames until expiry or clears it (`ttl_ms` = 0).
+    fn set_mask_focus(&self, _label: Option<String>, _box_norm: [f64; 4], _ttl_ms: u64) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async { Ok(()) })
     }
     fn inference_enabled(&self) -> BoxFuture<'_, Result<bool, String>>;
     fn set_inference(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>>;
@@ -474,11 +490,58 @@ impl DetectionSource for HttpDetectionSource {
         })
     }
     fn trigger(&self, pipelines: &'static [&'static str], wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
+        self.trigger_with_focus(pipelines, wait_ms, None)
+    }
+    fn trigger_with_focus(&self, pipelines: &'static [&'static str], wait_ms: u64, focus: Option<&MaskFocus>) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
+        let focus = focus.cloned();
         Box::pin(async move {
             let wait_ms = wait_ms.min(5000);
-            let body = serde_json::json!({"pipelines": pipelines, "wait_ms": wait_ms}).to_string();
-            let v = crate::api::proxy::request_json(&self.upstream, "POST", "/api/trigger", Some(body.as_bytes()), Duration::from_millis(wait_ms + 2000)).await?;
+            let mut obj = serde_json::json!({"pipelines": pipelines, "wait_ms": wait_ms});
+            if let Some(ref f) = focus {
+                let mut mf = serde_json::json!({
+                    "box_norm": f.box_norm,
+                    "ttl_ms": f.ttl_ms,
+                });
+                if let Some(ref l) = f.label {
+                    mf["label"] = serde_json::Value::String(l.clone());
+                }
+                obj["mask_focus"] = mf;
+            }
+            let body = obj.to_string();
+            let v = match crate::api::proxy::request_json(&self.upstream, "POST", "/api/trigger", Some(body.as_bytes()), Duration::from_millis(wait_ms + 2000)).await {
+                Ok(v) => v,
+                // an older rebot-vision ignores the unknown field; retry only on a rejected body
+                Err(e) if focus.is_some() && e.starts_with("detector returned 400") => {
+                    tracing::debug!("Trigger with mask_focus failed ({e}), retrying without focus");
+                    let fallback = serde_json::json!({"pipelines": pipelines, "wait_ms": wait_ms}).to_string();
+                    crate::api::proxy::request_json(&self.upstream, "POST", "/api/trigger", Some(fallback.as_bytes()), Duration::from_millis(wait_ms + 2000)).await?
+                }
+                Err(e) => return Err(e),
+            };
             Ok(self.frame(&v, None, Instant::now()))
+        })
+    }
+    fn set_mask_focus(&self, label: Option<String>, box_norm: [f64; 4], ttl_ms: u64) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            let body = if ttl_ms == 0 {
+                serde_json::json!({"ttl_ms": 0}).to_string()
+            } else {
+                let mut j = serde_json::json!({
+                    "box_norm": box_norm,
+                    "ttl_ms": ttl_ms,
+                });
+                if let Some(l) = label {
+                    j["label"] = serde_json::Value::String(l);
+                }
+                j.to_string()
+            };
+            match crate::api::proxy::request_json_opt(&self.upstream, "POST", "/api/mask_focus", Some(body.as_bytes()), Duration::from_secs(2)).await {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    tracing::debug!("POST /api/mask_focus failed ({e}), ignored");
+                    Ok(())
+                }
+            }
         })
     }
     fn inference_enabled(&self) -> BoxFuture<'_, Result<bool, String>> {
@@ -593,9 +656,18 @@ pub fn parse_detections(raw: &Value, size: [f64; 2]) -> Vec<Detection> {
         let angle_deg = item.is_object().then(|| f(item, &["angle_deg"])).flatten().map(|a| (a + 90.0).rem_euclid(180.0) - 90.0);
         let angle_conf = item.is_object().then(|| f(item, &["angle_conf"])).flatten().map(|c| c.clamp(0.0, 1.0));
         let grasp_width_px = item.is_object().then(|| f(item, &["grasp_width_px", "width_px"])).flatten().filter(|w| *w > 0.0);
-        out.push(Detection { label, score: score.clamp(0.0, 1.0), box_norm: b, angle_deg, angle_conf, grasp_width_px });
+        let mask_focus = item.is_object().then(|| item.get("mask_focus").and_then(Value::as_bool)).flatten().unwrap_or(false);
+        out.push(Detection { label, score: score.clamp(0.0, 1.0), box_norm: b, angle_deg, angle_conf, grasp_width_px, mask_focus });
     }
     out
+}
+
+pub fn box_changed_px(a: &[f64; 4], b: &[f64; 4], size: [f64; 2]) -> bool {
+    let dx0 = (a[0] - b[0]).abs() * size[0];
+    let dy0 = (a[1] - b[1]).abs() * size[1];
+    let dx1 = (a[2] - b[2]).abs() * size[0];
+    let dy1 = (a[3] - b[3]).abs() * size[1];
+    dx0 > 5.0 || dy0 > 5.0 || dx1 > 5.0 || dy1 > 5.0
 }
 
 pub fn box_centre(b: &[f64; 4]) -> [f64; 2] { [(b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0] }
@@ -1062,6 +1134,12 @@ impl Orchestrator {
         self.ctx.move_arm(phase, spec, Speed { linear, angular: motion::DEFAULT_ANGULAR_RPS }).await
     }
 
+    async fn set_mask_focus(&self, label: Option<String>, box_norm: [f64; 4], ttl_ms: u64) {
+        if let Err(e) = self.source.set_mask_focus(label, box_norm, ttl_ms).await {
+            tracing::debug!("Mask focus request failed (ignored): {e}");
+        }
+    }
+
     /// Next fresh frame (captured after `since` + settle delay) containing the target.
     /// TARGET_LOST when: frames keep arriving but all predate the settle time, `lost_timeout_s`
     /// after max(now, settle time) (stale frames do not extend it); no frame arrives for
@@ -1078,11 +1156,16 @@ impl Orchestrator {
             let source = self.source.clone();
             let a = *after;
             let triggered = self.triggered;
+            let focus = MaskFocus {
+                label: Some(tracker.label.clone()),
+                box_norm: tracker.predicted,
+                ttl_ms: 2000,
+            };
             let get = async move {
                 if triggered {
                     // the triggered frame is taken once the arm has settled
                     tokio::time::sleep(not_before.saturating_duration_since(Instant::now())).await;
-                    source.trigger(GRASP_PIPELINES, TRIGGER_WAIT_MS).await
+                    source.trigger_with_focus(GRASP_PIPELINES, TRIGGER_WAIT_MS, Some(&focus)).await
                 } else {
                     source.next_frame(a, 200).await
                 }
@@ -1140,6 +1223,7 @@ impl Orchestrator {
 
         // closed-loop centring onto the grip pixel, or (camera-down) the image centre
         self.phase("centring", 0.3).await?;
+        self.set_mask_focus(Some(planned.request.label.clone()), planned.request.box_norm, 2000).await;
         let grip_px = self.cam.to_px(s.grip_pixel_norm);
         let (aim_px, aim_name) = if camera_down { ([self.cam.cx, self.cam.cy], "the image centre") } else { (grip_px, "the grip point") };
         let plane = grasp_plane(s);
@@ -1187,7 +1271,7 @@ impl Orchestrator {
         // J6 alignment: close the jaws across the object's short side
         self.phase("align", 0.55).await?;
         let (turn, align) = if s.align_j6 { self.align_turn(&c, plane).await } else { (None, "off".to_string()) };
-        self.sup.inner().write().await.update_action(self.id, |a| { a.align = Some(align); a.align_turn_rad = turn.map(|t| t as f32); });
+        self.sup.inner().write().await.update_action(self.id, |a| { a.align = Some(align.clone()); a.align_turn_rad = turn.map(|t| t as f32); });
 
         // the width is measured whatever the angle confidence: a disc or a square has a low
         // angle_conf but a valid width (any closing direction sees about the same width)
@@ -1251,6 +1335,13 @@ impl Orchestrator {
                         (Some("off".to_string()), None)
                     } else if s.pre_open == PreOpen::Auto && !calibrated {
                         (Some("skipped:uncalibrated".to_string()), None)
+                    } else if !matches!(align.as_str(), "turned:angle" | "kept:angle")
+                        && frames_angle(&c.frames, s.align_min_angle_conf).is_some()
+                    {
+                        // an elongated mask (confident angle): its narrowest cross-section is the
+                        // width across the jaws only once J6 is aligned to it; a round or square
+                        // mask (no confident angle) has about the same width in every direction
+                        (Some("skipped:not_aligned".to_string()), None)
                     } else if let Err(reason) = align_guard(&c.last, &c.frames, self.cam.size) {
                         (Some(format!("skipped:{reason}")), None)
                     } else if let Some(w) = measured_width_m {
@@ -1411,6 +1502,7 @@ impl Orchestrator {
                     mut since: Instant, after: &mut Option<u64>, max_iter: u32, report: bool) -> Result<Centred, Stop> {
         let s = &self.setup;
         let mut iteration = 0u32;
+        let mut last_focus_box = tracker.predicted;
         loop {
             let pose = self.pose().await;
             let mut xs = Vec::new();
@@ -1421,6 +1513,12 @@ impl Orchestrator {
                 let d = self.fresh_match(tracker, since, after).await?;
                 tracker.gate_px = s.match_dist_px;
                 tracker.predicted = d.box_norm;
+                if self.triggered {
+                    self.set_mask_focus(Some(tracker.label.clone()), d.box_norm, 2000).await;
+                } else if box_changed_px(&d.box_norm, &last_focus_box, self.cam.size) {
+                    self.set_mask_focus(Some(tracker.label.clone()), d.box_norm, 2000).await;
+                    last_focus_box = d.box_norm;
+                }
                 let c = self.cam.to_px(box_centre(&d.box_norm));
                 frames.push(d);
                 xs.push(c[0]);
@@ -1812,10 +1910,12 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
         }
         Err(e) => Err(fail("DETECTION_UNAVAILABLE", format!("Cannot read the vision mode: {e}"))),
     } };
+    let _ = source.set_mask_focus(None, [0.0; 4], 0).await;
     let mut inner = sup.inner().write().await;
     match result {
         Ok((holding, gap)) => {
-            if holding {
+            // a grasp stopped meanwhile must not overwrite newer held state
+            if holding && inner.macro_alive(id) {
                 let spill_safe = planned.request.setup.spill_safe_labels.iter().any(|s| s.eq_ignore_ascii_case(&planned.request.label));
                 inner.held = Some(crate::supervisor::HeldObject {
                     label: planned.request.label.clone(),
@@ -1871,7 +1971,27 @@ mod tests {
     }
 
     fn det(b: [f64; 4], angle: Option<(f64, f64)>) -> Detection {
-        Detection { label: "cup".into(), score: 0.9, box_norm: b, angle_deg: angle.map(|a| a.0), angle_conf: angle.map(|a| a.1), grasp_width_px: None }
+        Detection { label: "cup".into(), score: 0.9, box_norm: b, angle_deg: angle.map(|a| a.0), angle_conf: angle.map(|a| a.1), grasp_width_px: None, mask_focus: false }
+    }
+
+    #[test]
+    fn test_box_changed_and_iou() {
+        let size = [640.0, 360.0];
+        let b0 = [0.1, 0.1, 0.3, 0.3];
+        // small shift <= 5 px (4 px in x: 4/640 = 0.00625)
+        let b_small = [0.1 + 4.0 / 640.0, 0.1, 0.3 + 4.0 / 640.0, 0.3];
+        assert!(!box_changed_px(&b0, &b_small, size));
+        // large shift > 5 px (6 px in x: 6/640 = 0.009375)
+        let b_large = [0.1 + 6.0 / 640.0, 0.1, 0.3 + 6.0 / 640.0, 0.3];
+        assert!(box_changed_px(&b0, &b_large, size));
+
+        // IoU matching unit test
+        let b1 = [0.0, 0.0, 1.0, 1.0];
+        let b2 = [0.5, 0.0, 1.5, 1.0];
+        // intersection: 0.5 * 1.0 = 0.5; union: 1.0 + 1.0 - 0.5 = 1.5 -> iou = 1/3
+        assert!((iou(&b1, &b2) - 1.0 / 3.0).abs() < 1e-6);
+        let b_disjoint = [2.0, 2.0, 3.0, 3.0];
+        assert_eq!(iou(&b1, &b_disjoint), 0.0);
     }
 
     #[test]

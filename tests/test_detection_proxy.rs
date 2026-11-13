@@ -87,6 +87,8 @@ async fn spawn_mock_upstream() -> (SocketAddr, Arc<Mutex<Vec<SeenRequest>>>) {
                         }
                     }
                     ("GET", "/api/inference") => ("200 OK", state(*enabled.lock().unwrap()), false),
+                    ("GET", "/api/mask_focus") => ("200 OK", r#"{"api_version":2,"mask_focus":null}"#.to_string(), false),
+                    ("POST", "/api/mask_focus") => ("200 OK", r#"{"api_version":2,"mask_focus":{"ttl_ms":2000}}"#.to_string(), false),
                     ("POST", "/api/inference") => match serde_json::from_str::<serde_json::Value>(&req.body).ok().and_then(|v| v["enabled"].as_bool()) {
                         Some(on) => {
                             *enabled.lock().unwrap() = on;
@@ -512,4 +514,20 @@ async fn http_detection_source_triggers_with_pipelines() {
     // older provider (no /api/mode): no per-request pipelines
     let old = HttpDetectionSource { upstream: DetectorUpstream::parse(&format!("http://{up}/old")).unwrap(), image_size_px: [640.0, 360.0] };
     assert!(!old.per_request_pipelines().await.unwrap());
+}
+
+#[tokio::test]
+async fn detection_mask_focus_passes_through() {
+    let (up, seen) = spawn_mock_upstream().await;
+    let addr = spawn_armd(&format!("http://{up}")).await;
+    let c = reqwest::Client::new();
+    let r = c.get(format!("http://{addr}/api/v1/detection/mask_focus")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let r = c.post(format!("http://{addr}/api/v1/detection/mask_focus"))
+        .json(&serde_json::json!({"box_norm": [0.1, 0.2, 0.3, 0.4], "ttl_ms": 1000}))
+        .send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen.iter().any(|s| s.target == "/api/mask_focus" && s.method == "GET"));
+    assert!(seen.iter().any(|s| s.target == "/api/mask_focus" && s.method == "POST"));
 }
