@@ -291,6 +291,8 @@ pub struct SupervisorInner {
     pub last_zero_check_offset: Option<f32>,
     /// Mock follower stall offset (rad); None = stall at closed_rad.
     pub mock_gripper_stall_offset: Option<f32>,
+    /// The mock follower set torques[6] for a simulated stall (cleared when the stall ends).
+    pub mock_gripper_stall_torque: bool,
     /// Running zero check parameters (id, store_offset, threshold_rad, base_closed_rad).
     pub zero_check_params: Option<ZeroCheckParams>,
 }
@@ -435,6 +437,7 @@ impl SupervisorInner {
             gripper_calib_invalid: false,
             last_zero_check_offset: None,
             mock_gripper_stall_offset,
+            mock_gripper_stall_torque: false,
             zero_check_params: None,
         }
     }
@@ -3355,6 +3358,9 @@ impl SupervisorInner {
             self.measured_velocities = self.commanded_velocities.clone();
             if self.config.dof >= 7 {
                 let gripper_moving = matches!(&self.active_trajectory, Some(ActiveTrajectory { reference: Reference::Gripper(_), .. }));
+                // the stall torque lasts only while the jaw pushes on the stop; a stale value would
+                // end the next gripper motion at once as a stall
+                let mut stalled = false;
                 if gripper_moving {
                     if let Some(policy) = self.config.gripper_policy.as_ref() {
                         let base_closed = self.base_gripper_policy.as_ref().map_or(policy.closed_rad, |p| p.closed_rad);
@@ -3366,8 +3372,16 @@ impl SupervisorInner {
                             self.measured_positions[6] = stop_rad;
                             self.measured_velocities[6] = 0.0;
                             self.torques[6] = dir * (GRIPPER_STALL_LATCH_NM * 1.5 + push * 2.0);
+                            stalled = true;
                         }
                     }
+                }
+                // clear only the torque this mock stall set (tests may inject torques themselves)
+                if stalled {
+                    self.mock_gripper_stall_torque = true;
+                } else if self.mock_gripper_stall_torque {
+                    self.torques[6] = 0.0;
+                    self.mock_gripper_stall_torque = false;
                 }
             }
         }

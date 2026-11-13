@@ -429,3 +429,22 @@ fn test_interrupted_release_still_counts_as_holding() {
     assert_eq!(a.state, "done");
     assert!(inner.held.is_none(), "held kept after a completed release");
 }
+
+#[test]
+fn test_gripper_moves_after_a_zero_check() {
+    // the mock's stall torque must end with the stall: a stale torque ended later closing moves at
+    // once as a stall (J7 stayed at the open position)
+    use armd::motion::{GripperCommand, GripperRequest};
+    let mv = |f: f64| GripperRequest { command: GripperCommand::Move, fraction: Some(f), grasp: false, speed: 1.0, timeout_s: Some(10.0), tag: None };
+    let mut inner = sim_at(&INSPECT);
+    inner.set_mock_gripper_stall_offset(Some(0.0));
+    let epoch = inner.safety.epoch_id();
+    let (id, _) = inner.start_gripper_zero_check(&json!({}), epoch).unwrap();
+    assert_eq!(run_ticks(&mut inner, id, 30.0).state, "done");
+    for f in [1.0, 0.5, 0.0] {
+        let (id, _) = inner.start_gripper(mv(f), epoch).unwrap();
+        assert_eq!(run_ticks(&mut inner, id, 15.0).state, "done");
+        let target = -5.7 * f as f32;
+        assert!((inner.measured_positions[6] - target).abs() < 0.15, "fraction {f}: j7 {} vs {target}", inner.measured_positions[6]);
+    }
+}
