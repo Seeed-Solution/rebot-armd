@@ -32,6 +32,7 @@ struct DepthSim {
     a0: f64,
     b0: f64,
     occluded_table: bool,
+    occluded_above_z: Option<f64>,
     depth_conf: Option<f64>,
     jaw_clear: Option<bool>,
     length_px: Option<f64>,
@@ -110,7 +111,7 @@ impl SimCamera {
             };
             let table_z = 0.0;
             let mut table_samples = Vec::new();
-            if !sim.occluded_table {
+            if !sim.occluded_table && !sim.occluded_above_z.is_some_and(|z| pose.p[2] > z) {
                 for u in [20.0, 160.0, 320.0, 480.0, 620.0] {
                     for v in [10.0, 90.0, 180.0, 270.0, 350.0] {
                         if let Some(z_table) = self.cam.table_optical_depth(&pose, [u, v], table_z) {
@@ -165,7 +166,7 @@ impl SimCamera {
             tokio::time::sleep(Duration::from_millis(120 + (frame_id * 37) % 131)).await;
         }
         let captured_at = if self.stale.load(Ordering::SeqCst) { captured - Duration::from_secs(30) } else { captured };
-        DetectionFrame { frame_id, captured_at, detections, depth }
+        DetectionFrame { frame_id, captured_at, image_size_px: self.cam.size, detections, depth }
     }
 
     /// Image angle (deg, [-90, 90)) of the object's long side when the rig reports one.
@@ -2210,6 +2211,7 @@ async fn depth_oblique_ransac_skips_probe_and_grasps() {
         a0: 2.7,
         b0: 0.45,
         occluded_table: false,
+        occluded_above_z: None,
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(65.0),
@@ -2250,6 +2252,7 @@ async fn depth_metric_model_vertical_and_occluded() {
         a0: 1.0,
         b0: 0.0,
         occluded_table: false,
+        occluded_above_z: None,
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(60.0),
@@ -2280,6 +2283,7 @@ async fn depth_metric_model_vertical_and_occluded() {
         a0: 1.0,
         b0: 0.0,
         occluded_table: true,
+        occluded_above_z: None,
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(60.0),
@@ -2311,6 +2315,7 @@ async fn depth_metric_model_vertical_and_occluded() {
         a0: 1.0,
         b0: 0.0,
         occluded_table: false,
+        occluded_above_z: None,
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(60.0),
@@ -2341,6 +2346,7 @@ async fn depth_unanchored_or_low_conf_falls_back_to_probe_height() {
         a0: 1.0,
         b0: 0.0,
         occluded_table: false,
+        occluded_above_z: None,
         depth_conf: Some(0.20),
         jaw_clear: Some(true),
         length_px: Some(60.0),
@@ -2368,6 +2374,7 @@ async fn depth_unanchored_or_low_conf_falls_back_to_probe_height() {
         a0: 2.7,
         b0: 0.45,
         occluded_table: true,
+        occluded_above_z: None,
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(60.0),
@@ -2399,6 +2406,7 @@ async fn depth_tall_object_fast_fails_object_too_tall() {
         a0: 1.0,
         b0: 0.0,
         occluded_table: false,
+        occluded_above_z: None,
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(60.0),
@@ -2431,6 +2439,7 @@ async fn depth_guards_lens_unknown_table_conflict_and_drift() {
         a0: 1.0,
         b0: 0.0,
         occluded_table: false,
+        occluded_above_z: None,
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(60.0),
@@ -2458,6 +2467,7 @@ async fn depth_guards_lens_unknown_table_conflict_and_drift() {
         a0: 1.8,
         b0: 0.0,
         occluded_table: false,
+        occluded_above_z: None,
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(60.0),
@@ -2488,6 +2498,7 @@ async fn depth_guards_lens_unknown_table_conflict_and_drift() {
         a0: 2.7,
         b0: 0.45,
         occluded_table: false,
+        occluded_above_z: None,
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(60.0),
@@ -2520,6 +2531,7 @@ async fn depth_guards_lens_unknown_table_conflict_and_drift() {
         a0: 2.7,
         b0: 0.45,
         occluded_table: false,
+        occluded_above_z: None,
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(60.0),
@@ -2532,6 +2544,39 @@ async fn depth_guards_lens_unknown_table_conflict_and_drift() {
     assert_eq!(a4.holding, Some(true));
     assert_eq!(a4.height_source.as_deref(), Some("scale"));
     assert!(a4.probe_dz_m.is_some(), "probe_height should have run on drift");
+
+    // 5. metric_model: true, a0: 1.8, occluded_above_z: Some(0.20) starting at look_down_start(0.0, 0.26)
+    // with approach_height_m: 0.15 (frame0 at z = 0.26 is occluded and caches metric_prior,
+    // overhead_frame at z = 0.15 sees conflicting table -> invalidates cached_meas and falls back to probe_height)
+    let s5_base = GraspSetup { camera_tilt_deg: 0.0, approach_height_m: 0.15, height_probe_m: 0.04, ..GraspSetup::default() };
+    let rig5 = rig_mounted(s5_base.clone(), Truth::same(), 0.0, look_down_start(0.0, 0.26), [0.0, 0.0], false).await;
+    let start_r5 = start_pose(&rig5).await.r;
+    let mut s5 = s5_base.clone();
+    s5.grip_pixel_norm = calibrate_grip(&rig5, &s5_base, &start_r5);
+    rig5.sup.inner().write().await.set_grasp_setup(s5.clone());
+
+    rig5.sim.per_request.store(true, Ordering::SeqCst);
+    rig5.sim.depth_available.store(true, Ordering::SeqCst);
+    *rig5.sim.width_px.lock().unwrap() = Some(35.0);
+    *rig5.sim.depth_sim.lock().unwrap() = Some(DepthSim {
+        metric_model: true,
+        a0: 1.8,
+        b0: 0.0,
+        occluded_table: false,
+        occluded_above_z: Some(0.20),
+        depth_conf: Some(0.95),
+        jaw_clear: Some(true),
+        length_px: Some(60.0),
+        drift_per_frame: false,
+    });
+
+    let (id5, _) = grasp::start(&rig5.sup, rig5.sim.clone(), &tap(&rig5).await).await.expect("grasp accepted");
+    let a5 = wait_done(&rig5.sup, id5, 30.0, |_| {}).await;
+    assert_eq!(a5.state, "done");
+    assert_eq!(a5.holding, Some(true));
+    assert!(a5.depth_anchor.is_none());
+    assert_eq!(a5.height_source.as_deref(), Some("scale"));
+    assert!(a5.probe_dz_m.is_some(), "probe_height should have run when table contradicted prior");
 }
 
 

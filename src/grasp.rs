@@ -426,6 +426,7 @@ pub struct DetectionFrame {
     pub frame_id: u64,
     /// Capture time on this host's clock (response time − `age_ms`).
     pub captured_at: Instant,
+    pub image_size_px: [f64; 2],
     pub detections: Vec<Detection>,
     pub depth: Option<DepthFrameInfo>,
 }
@@ -510,11 +511,9 @@ impl HttpDetectionSource {
         let age = v.get("age_ms").and_then(Value::as_f64).filter(|a| a.is_finite() && *a >= 0.0).unwrap_or(0.0);
         let captured_at = received.checked_sub(Duration::from_secs_f64(age / 1000.0)).unwrap_or(received);
         let size = match (v.get("width").and_then(Value::as_f64), v.get("height").and_then(Value::as_f64)) {
-            (Some(w), Some(h)) if w > 0.0 && h > 0.0 => [w, h],
+            (Some(w), Some(h)) if w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 => [w, h],
             _ => self.image_size_px,
         };
-        let rx = self.image_size_px[0] / size[0];
-        let ry = self.image_size_px[1] / size[1];
         let depth = v.get("depth").and_then(|d| {
             let metric_model = d.get("metric_model").and_then(Value::as_bool).unwrap_or(false);
             let table_samples = d.get("table_samples").and_then(Value::as_array).map(|arr| {
@@ -525,7 +524,7 @@ impl HttpDetectionSource {
                         let v = s[1].as_f64()?;
                         let disp = s[2].as_f64()?;
                         if u.is_finite() && v.is_finite() && disp.is_finite() {
-                            return Some([u * rx, v * ry, disp]);
+                            return Some([u, v, disp]);
                         }
                     }
                     None
@@ -533,27 +532,58 @@ impl HttpDetectionSource {
             }).unwrap_or_default();
             Some(DepthFrameInfo { metric_model, table_samples })
         });
-        let mut detections = parse_detections(v.get("detections").unwrap_or(&Value::Null), size);
-        if (rx - 1.0).abs() > 1e-6 || (ry - 1.0).abs() > 1e-6 {
-            let isotropic = (rx * ry).sqrt();
-            for det in &mut detections {
-                let (sw, sl) = match det.angle_deg {
-                    Some(deg) => {
-                        let (sin_t, cos_t) = deg.to_radians().sin_cos();
-                        ((-sin_t * rx).hypot(cos_t * ry), (cos_t * rx).hypot(sin_t * ry))
-                    }
-                    None => (isotropic, isotropic),
-                };
-                if let Some(w) = det.grasp_width_px.as_mut() {
-                    *w *= sw;
-                }
-                if let Some(l) = det.length_px.as_mut() {
-                    *l *= sl;
-                }
+        let detections = parse_detections(v.get("detections").unwrap_or(&Value::Null), size);
+        Some(DetectionFrame { frame_id, captured_at, image_size_px: size, detections, depth })
+    }
+}
+
+pub fn rescale_frame_to_cam(frame: &mut DetectionFrame, cam: &CamModel) {
+    if !(frame.image_size_px[0] > 0.0 && frame.image_size_px[1] > 0.0 && cam.size[0] > 0.0 && cam.size[1] > 0.0) {
+        return;
+    }
+    let rx = cam.size[0] / frame.image_size_px[0];
+    let ry = cam.size[1] / frame.image_size_px[1];
+    if (rx - 1.0).abs() <= 1e-6 && (ry - 1.0).abs() <= 1e-6 {
+        frame.image_size_px = cam.size;
+        return;
+    }
+    if let Some(ref mut d) = frame.depth {
+        for sample in &mut d.table_samples {
+            sample[0] *= rx;
+            sample[1] *= ry;
+        }
+    }
+    for det in &mut frame.detections {
+        let isotropic = (rx * ry).sqrt();
+        if let Some(deg) = det.angle_deg {
+            let (sin_t, cos_t) = deg.to_radians().sin_cos();
+            let sl = (cos_t * rx).hypot(sin_t * ry);
+            let theta_cam = (sin_t * ry).atan2(cos_t * rx);
+            let deg_cam = (theta_cam.to_degrees() + 90.0).rem_euclid(180.0) - 90.0;
+            det.angle_deg = Some(deg_cam);
+            let (sin_cam, cos_cam) = deg_cam.to_radians().sin_cos();
+            let denom = (-sin_cam / cam.fx).hypot(cos_cam / cam.fy);
+            let sw = if denom > 1e-12 {
+                (-sin_t * rx / cam.fx).hypot(cos_t * ry / cam.fy) / denom
+            } else {
+                isotropic
+            };
+            if let Some(w) = det.grasp_width_px.as_mut() {
+                *w *= sw;
+            }
+            if let Some(l) = det.length_px.as_mut() {
+                *l *= sl;
+            }
+        } else {
+            if let Some(w) = det.grasp_width_px.as_mut() {
+                *w *= isotropic;
+            }
+            if let Some(l) = det.length_px.as_mut() {
+                *l *= isotropic;
             }
         }
-        Some(DetectionFrame { frame_id, captured_at, detections, depth })
     }
+    frame.image_size_px = cam.size;
 }
 
 impl DetectionSource for HttpDetectionSource {
@@ -1074,12 +1104,16 @@ pub fn calibrate_depth(
             let a = median(&mut ratios);
             let b = 0.0;
             if (0.25..=4.0).contains(&a) {
-                let mut rel_errs: Vec<f64> = valid_samples.iter().map(|&(_, disp, z_fk)| {
+                // Ensure samples agree with both the metric prior and the fitted table scale a.
+                let mut prior_errs: Vec<f64> = valid_samples.iter().map(|&(_, disp, z_fk)| {
                     let z_pred = 1.0 / (a_prior * disp);
                     (z_pred - z_fk).abs() / z_fk
                 }).collect();
-                let med_err = median(&mut rel_errs);
-                if med_err <= 0.12 {
+                let mut fit_errs: Vec<f64> = valid_samples.iter().map(|&(_, disp, z_fk)| {
+                    let z_pred = 1.0 / (a * disp);
+                    (z_pred - z_fk).abs() / z_fk
+                }).collect();
+                if median(&mut prior_errs) <= 0.12 && median(&mut fit_errs) <= 0.12 {
                     return Some(DepthCalibration { a, b, source: "metric_table" });
                 }
             }
@@ -1135,6 +1169,16 @@ pub fn calibrate_depth(
     }
 
     None
+}
+
+fn metric_table_contradicts_fk(cam: &CamModel, pose: &Pose, depth: Option<&DepthFrameInfo>, table_z_m: f64) -> bool {
+    let Some(d) = depth else { return false; };
+    if !d.metric_model { return false; }
+    let valid_count = d.table_samples.iter().filter(|s| {
+        let [u, v, disp] = **s;
+        disp > 1e-3 && disp.is_finite() && cam.table_optical_depth(pose, [u, v], table_z_m).is_some()
+    }).count();
+    valid_count >= 3 && calibrate_depth(cam, pose, Some(d), None, table_z_m).is_none()
 }
 
 pub fn measure_detection_depth_with_cal(
@@ -1603,7 +1647,7 @@ impl Orchestrator {
                 r = get => r,
                 _ = async { loop { tokio::time::sleep(POLL).await; if !self.alive().await { break; } } } => return Err(Stop::Cancelled),
             };
-            let frame = match next {
+            let mut frame = match next {
                 Ok(Some(frame)) => frame,
                 Ok(None) => {
                     if last_frame.elapsed().as_secs_f64() > self.setup.lost_timeout_s.max(3.0) {
@@ -1613,6 +1657,7 @@ impl Orchestrator {
                 }
                 Err(e) => return Err(fail("DETECTION_UNAVAILABLE", format!("Detection source failed: {e}"))),
             };
+            rescale_frame_to_cam(&mut frame, &self.cam);
             *after = Some(frame.frame_id);
             last_frame = Instant::now();
             if frame.captured_at < not_before {
@@ -1648,7 +1693,8 @@ impl Orchestrator {
                 box_norm: planned.request.box_norm,
                 ttl_ms: 2000,
             };
-            if let Ok(Some(frame0)) = self.source.trigger_with_focus(&["yolo", "depth"], TRIGGER_WAIT_MS, Some(&focus)).await {
+            if let Ok(Some(mut frame0)) = self.source.trigger_with_focus(&["yolo", "depth"], TRIGGER_WAIT_MS, Some(&focus)).await {
+                rescale_frame_to_cam(&mut frame0, &self.cam);
                 if let Some(ref d) = frame0.depth {
                     cached_prior = extract_table_obs(&self.cam, &pose0, d, s.table_z_m);
                     let cal0 = calibrate_depth(&self.cam, &pose0, Some(d), None, s.table_z_m);
@@ -1719,8 +1765,13 @@ impl Orchestrator {
                 box_norm: c.last.box_norm,
                 ttl_ms: 2000,
             };
-            if let Ok(Some(overhead_frame)) = self.source.trigger_with_focus(&["yolo", "depth"], TRIGGER_WAIT_MS, Some(&focus)).await {
+            if let Ok(Some(mut overhead_frame)) = self.source.trigger_with_focus(&["yolo", "depth"], TRIGGER_WAIT_MS, Some(&focus)).await {
+                rescale_frame_to_cam(&mut overhead_frame, &self.cam);
                 after = Some(overhead_frame.frame_id);
+                if metric_table_contradicts_fk(&self.cam, &c.pose, overhead_frame.depth.as_ref(), s.table_z_m) {
+                    tracing::debug!("Overhead table samples contradict FK; invalidating cached start-frame depth measurement");
+                    cached_meas = None;
+                }
                 let tracker = Tracker {
                     label: planned.request.label.clone(),
                     predicted: c.last.box_norm,
@@ -2873,7 +2924,7 @@ mod tests {
     #[test]
     fn tracker_widens_the_gate_for_a_box_at_the_border() {
         let setup = GraspSetup::default();
-        let frame = |b: [f64; 4]| DetectionFrame { frame_id: 1, captured_at: Instant::now(), detections: vec![Detection { label: "cube".into(), ..det(b, None) }], depth: None };
+        let frame = |b: [f64; 4]| DetectionFrame { frame_id: 1, captured_at: Instant::now(), image_size_px: [640.0, 360.0], detections: vec![Detection { label: "cube".into(), ..det(b, None) }], depth: None };
         // predicted cut box (v 0.9..1.0) after a step; the box seen whole is 96 px higher
         let seen = frame([0.4, 300.0 / 360.0 - 0.3, 0.5, 300.0 / 360.0]);
         let cut = Tracker { label: "cube".into(), predicted: [0.4, 0.9, 0.5, 1.0], gate_px: setup.match_dist_px };
@@ -3463,9 +3514,76 @@ mod tests {
                 "grasp_width_px": 40.0,
             }]
         });
-        let frame = src.frame(&raw, None, Instant::now()).expect("frame parsed");
-        assert_eq!(frame.depth.as_ref().unwrap().table_samples[0], [50.0, 100.0, 0.85]);
-        assert_eq!(frame.detections[0].length_px, Some(40.0));
-        assert_eq!(frame.detections[0].grasp_width_px, Some(20.0));
+        let mut frame = src.frame(&raw, None, Instant::now()).expect("frame parsed");
+        assert_eq!(frame.image_size_px, [1280.0, 720.0]);
+        assert_eq!(frame.depth.as_ref().unwrap().table_samples[0], [100.0, 200.0, 0.85]);
+        assert_eq!(frame.detections[0].length_px, Some(80.0));
+        assert_eq!(frame.detections[0].grasp_width_px, Some(40.0));
+
+        let cam_iso = CamModel {
+            rec: crate::kinematics::IDENTITY,
+            offset: [0.0; 3],
+            fx: 900.0,
+            fy: 900.0,
+            cx: 480.0,
+            cy: 270.0,
+            size: [960.0, 540.0],
+        };
+        rescale_frame_to_cam(&mut frame, &cam_iso);
+        assert_eq!(frame.image_size_px, [960.0, 540.0]);
+        assert_eq!(frame.depth.as_ref().unwrap().table_samples[0], [75.0, 150.0, 0.85]);
+        assert_eq!(frame.detections[0].length_px, Some(60.0));
+        assert_eq!(frame.detections[0].grasp_width_px, Some(30.0));
+
+        let cal = DepthCalibration { a: 1.0, b: 0.0, source: "test" };
+        let pose = Pose::new(crate::kinematics::IDENTITY, [0.0; 3]);
+        let mut det_iso = frame.detections[0].clone();
+        det_iso.depth_conf = Some(0.9);
+        det_iso.disp_fg = Some(1.0);
+        det_iso.disp_bg = Some(0.5);
+        let meas_iso = measure_detection_depth_with_cal(&cam_iso, &pose, &det_iso, &cal).expect("measured");
+        let expected_l_iso = 80.0 / 1200.0;
+        let expected_w_iso = 40.0 / 1200.0;
+        assert!((meas_iso.length_m.unwrap() - expected_l_iso).abs() < 1e-9);
+        assert!((meas_iso.width_m.unwrap() - expected_w_iso).abs() < 1e-9);
+
+        // Anisotropic rescaling:
+        let mut frame_aniso = DetectionFrame {
+            frame_id: 2,
+            captured_at: Instant::now(),
+            image_size_px: [640.0, 360.0],
+            detections: vec![Detection {
+                label: "cup".into(),
+                score: 0.9,
+                box_norm: [0.3, 0.3, 0.7, 0.7],
+                angle_deg: Some(45.0),
+                angle_conf: Some(0.9),
+                grasp_width_px: Some(120.0),
+                mask_focus: false,
+                disp_fg: Some(1.0),
+                disp_bg: Some(0.5),
+                depth_conf: Some(0.9),
+                length_px: Some(240.0),
+                jaw_clear: Some(true),
+            }],
+            depth: None,
+        };
+        let cam_aniso = CamModel {
+            rec: crate::kinematics::IDENTITY,
+            offset: [0.0; 3],
+            fx: 1200.0,
+            fy: 1800.0,
+            cx: 640.0,
+            cy: 540.0,
+            size: [1280.0, 1080.0],
+        };
+        rescale_frame_to_cam(&mut frame_aniso, &cam_aniso);
+        assert_eq!(frame_aniso.image_size_px, [1280.0, 1080.0]);
+
+        let meas_aniso = measure_detection_depth_with_cal(&cam_aniso, &pose, &frame_aniso.detections[0], &cal).expect("measured");
+        let expected_l_aniso = 240.0 / 600.0;
+        let expected_w_aniso = 120.0 / 600.0;
+        assert!((meas_aniso.length_m.unwrap() - expected_l_aniso).abs() < 1e-9);
+        assert!((meas_aniso.width_m.unwrap() - expected_w_aniso).abs() < 1e-9);
     }
 }
