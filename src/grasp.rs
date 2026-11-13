@@ -1119,7 +1119,9 @@ pub fn calibrate_depth(
             }
             return None;
         }
-        return Some(DepthCalibration { a: a_prior, b: 0.0, source: "metric_prior" });
+        // Fewer than 3 table samples (table occluded): the nominal scale alone is not checked
+        // against FK, so it must not replace the mechanical probe.
+        return None;
     }
 
     if valid_samples.len() >= 8 {
@@ -1817,35 +1819,31 @@ impl Orchestrator {
         let mut close_h = s.grasp_height_m;
         let mut plane = plane;
         let mut depth_used = false;
+        let mut depth_too_tall: Option<Stop> = None;
 
         if let Some(ref meas) = depth_meas {
-            let height_res = match self.accept_height(meas.height_m) {
-                Ok(res) => Some(res),
-                Err(err) if meas.source == "metric_prior" => {
-                    tracing::debug!("Metric prior height rejected ({err:?}), falling back to probe_height");
-                    None
+            // A depth height that fails the checks does not decide alone: the mechanical probe
+            // measures again. A too-tall depth height still ends the grasp when the probe cannot
+            // measure (a tall object close to the camera often touches the image border).
+            match self.accept_height(meas.height_m) {
+                Ok(Ok(h)) => {
+                    depth_used = true;
+                    plane = s.table_z_m + s.grasp_height_m.max(h);
+                    close_h = (h * s.height_grasp_fraction).clamp(s.grasp_height_m, s.max_grasp_height_m);
+                    tracing::info!("Grasp {}: object top {h:.3} m above the table (depth:{}), closing at {close_h:.3} m", self.id, meas.source);
+                    self.sup.inner().write().await.update_action(self.id, |a| {
+                        a.height_source = Some("depth".into());
+                        a.object_height_m = Some(h as f32);
+                        a.depth_anchor = Some(meas.source.into());
+                        a.object_depth_m = Some(meas.depth_m as f32);
+                        a.object_length_m = meas.length_m.map(|l| l as f32);
+                        a.jaw_clear = meas.jaw_clear;
+                    });
                 }
-                Err(err) => return Err(err),
-            };
-            if let Some(res) = height_res {
-                match res {
-                    Ok(h) => {
-                        depth_used = true;
-                        plane = s.table_z_m + s.grasp_height_m.max(h);
-                        close_h = (h * s.height_grasp_fraction).clamp(s.grasp_height_m, s.max_grasp_height_m);
-                        tracing::info!("Grasp {}: object top {h:.3} m above the table (depth:{}), closing at {close_h:.3} m", self.id, meas.source);
-                        self.sup.inner().write().await.update_action(self.id, |a| {
-                            a.height_source = Some("depth".into());
-                            a.object_height_m = Some(h as f32);
-                            a.depth_anchor = Some(meas.source.into());
-                            a.object_depth_m = Some(meas.depth_m as f32);
-                            a.object_length_m = meas.length_m.map(|l| l as f32);
-                            a.jaw_clear = meas.jaw_clear;
-                        });
-                    }
-                    Err(reason) => {
-                        tracing::debug!("Depth height rejected ({reason}), falling back to probe_height");
-                    }
+                Ok(Err(reason)) => tracing::debug!("Depth height rejected ({reason}), falling back to probe_height"),
+                Err(fail) => {
+                    tracing::debug!("Depth height too tall ({:.3} m), confirming with probe_height", meas.height_m);
+                    depth_too_tall = Some(fail);
                 }
             }
         }
@@ -1861,10 +1859,15 @@ impl Orchestrator {
                         a.object_height_m = Some(h as f32);
                     });
                 }
-                Err(reason) => self.sup.inner().write().await.update_action(self.id, |a| {
-                    a.height_source = Some("setup".into());
-                    a.height_reason = Some(reason);
-                }),
+                Err(reason) => {
+                    if let Some(fail) = depth_too_tall {
+                        return Err(fail);
+                    }
+                    self.sup.inner().write().await.update_action(self.id, |a| {
+                        a.height_source = Some("setup".into());
+                        a.height_reason = Some(reason);
+                    });
+                }
             }
         }
         self.sup.inner().write().await.update_action(self.id, |a| a.close_height_m = Some(close_h as f32));
@@ -3442,14 +3445,11 @@ mod tests {
         assert_eq!(meas.source, "metric_table");
         assert_eq!(meas.jaw_clear, Some(true));
 
-        // 2. Metric prior when table occluded (0 samples)
+        // 2. Table occluded (0 samples): no calibration, the grasp probes instead
         let occluded_depth = DepthFrameInfo { metric_model: true, table_samples: Vec::new() };
-        let cal_prior = calibrate_depth(&cam, &pose, Some(&occluded_depth), None, table_z).expect("metric_prior calibrated");
-        assert_eq!(cal_prior.source, "metric_prior");
-        assert_eq!(cal_prior.a, 1.0);
-        assert_eq!(cal_prior.b, 0.0);
+        assert!(calibrate_depth(&cam, &pose, Some(&occluded_depth), None, table_z).is_none(), "occluded table must not calibrate");
 
-        // 3. Metric model with table samples contradicting FK returns None rather than metric_prior
+        // 3. Metric model with table samples contradicting FK returns None
         let conflicting_samples = vec![
             [320.0, 180.0, disp_table * 2.0],
             [300.0, 160.0, disp_table],

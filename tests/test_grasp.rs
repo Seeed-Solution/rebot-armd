@@ -2268,7 +2268,7 @@ async fn depth_metric_model_vertical_and_occluded() {
     assert_eq!(a.depth_anchor.as_deref(), Some("metric_table"));
     assert!((a.object_height_m.unwrap() as f64 - rig1.sim.object.height).abs() < 0.005);
 
-    // 2. Occluded table falls back to metric_prior
+    // 2. Occluded table: no depth calibration, the box-scale probe measures the height
     let rig2 = rig(setup.clone(), Truth::same(), 0.0, [0.0, 0.0], false).await;
     let start_r2 = start_pose(&rig2).await.r;
     let mut s2 = setup.clone();
@@ -2294,10 +2294,9 @@ async fn depth_metric_model_vertical_and_occluded() {
     let a2 = wait_done(&rig2.sup, id2, 30.0, |_| {}).await;
     assert_eq!(a2.state, "done");
     assert_eq!(a2.holding, Some(true));
-    assert_eq!(a2.probe_dz_m, None);
-    assert_eq!(a2.height_source.as_deref(), Some("depth"));
-    assert_eq!(a2.depth_anchor.as_deref(), Some("metric_prior"));
-    assert!((a2.object_height_m.unwrap() as f64 - rig2.sim.object.height).abs() < 0.005);
+    assert!(a2.probe_dz_m.is_some(), "probe_height should run when the table is occluded");
+    assert_eq!(a2.height_source.as_deref(), Some("scale"));
+    assert!(a2.depth_anchor.is_none());
 
     // 3. TOO_WIDE rejection with wide grasp_width_px
     let rig3 = rig(setup.clone(), Truth::same(), 0.0, [0.0, 0.0], false).await;
@@ -2390,7 +2389,7 @@ async fn depth_unanchored_or_low_conf_falls_back_to_probe_height() {
 }
 
 #[tokio::test]
-async fn depth_tall_object_fast_fails_object_too_tall() {
+async fn depth_tall_object_fails_when_the_probe_cannot_measure() {
     let setup = GraspSetup { camera_tilt_deg: 0.0, approach_height_m: 0.10, height_probe_m: 0.04, ..GraspSetup::default() };
     let rig = rig(setup.clone(), Truth::same(), 0.0, [0.0, 0.0], false).await;
     let start_r = start_pose(&rig).await.r;
@@ -2417,7 +2416,9 @@ async fn depth_tall_object_fast_fails_object_too_tall() {
     let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
     assert_eq!(a.state, "failed");
     assert_eq!(a.code.as_deref(), Some("OBJECT_TOO_TALL"));
-    assert_eq!(a.probe_dz_m, None, "mechanical height probe should not run when depth measures a tall object");
+    // the probe ran and could not measure (the close object touches the border), so the depth
+    // height decides
+    assert_eq!(a.height_source, None);
 }
 
 #[tokio::test]
@@ -2452,7 +2453,7 @@ async fn depth_guards_lens_unknown_table_conflict_and_drift() {
     assert_eq!(a1.holding, Some(true));
     assert!(a1.depth_anchor.is_none(), "depth_anchor should be None when lens is unknown");
 
-    // 2. metric_model: true, a0: 1.8, occluded_table: false (visible table contradicts FK) rejects metric_prior and falls back to probe_height
+    // 2. metric_model: true, a0: 1.8, occluded_table: false (visible table contradicts FK) falls back to probe_height
     let rig2 = rig(setup.clone(), Truth::same(), 0.0, [0.0, 0.0], false).await;
     let start_r2 = start_pose(&rig2).await.r;
     let mut s2 = setup.clone();
@@ -2546,8 +2547,8 @@ async fn depth_guards_lens_unknown_table_conflict_and_drift() {
     assert!(a4.probe_dz_m.is_some(), "probe_height should have run on drift");
 
     // 5. metric_model: true, a0: 1.8, occluded_above_z: Some(0.20) starting at look_down_start(0.0, 0.26)
-    // with approach_height_m: 0.15 (frame0 at z = 0.26 is occluded and caches metric_prior,
-    // overhead_frame at z = 0.15 sees conflicting table -> invalidates cached_meas and falls back to probe_height)
+    // with approach_height_m: 0.15 (frame0 at z = 0.26 is occluded and gives no calibration,
+    // overhead_frame at z = 0.15 sees conflicting table -> falls back to probe_height)
     let s5_base = GraspSetup { camera_tilt_deg: 0.0, approach_height_m: 0.15, height_probe_m: 0.04, ..GraspSetup::default() };
     let rig5 = rig_mounted(s5_base.clone(), Truth::same(), 0.0, look_down_start(0.0, 0.26), [0.0, 0.0], false).await;
     let start_r5 = start_pose(&rig5).await.r;
