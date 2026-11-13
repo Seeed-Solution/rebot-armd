@@ -422,7 +422,8 @@ BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
         is_self_fg[static_cast<size_t>(pt.gy * grid_w + pt.gx)] = true;
     }
 
-    int total_jaw_cells = 0;
+    int footprint_jaw_cells = 0;
+    int valid_jaw_cells = 0;
     int conflict_cells = 0;
 
     for (int gy = 0; gy < grid_h; ++gy) {
@@ -440,11 +441,14 @@ BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
                                 (p_min < p5_min && p_min >= p5_min - jaw_pad_px);
             if (!in_jaw) continue;
 
-            ++total_jaw_cells;
+            ++footprint_jaw_cells;
             const size_t idx = static_cast<size_t>(gy * grid_w + gx);
-            if (!is_self_fg[idx]) {
+            if (is_self_fg[idx]) {
+                ++valid_jaw_cells;
+            } else {
                 const float d_hat = disp_map[idx];
                 if (!std::isfinite(d_hat)) continue;
+                ++valid_jaw_cells;
                 const float disp_bg_hat = fit.p0 + fit.pu * static_cast<float>(u_px - uc) +
                                           fit.pv * static_cast<float>(v_px - vc);
                 if (d_hat - disp_bg_hat > conflict_thresh) {
@@ -454,10 +458,10 @@ BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
         }
     }
 
-    const float conflict_ratio = (total_jaw_cells > 0)
-                                     ? (static_cast<float>(conflict_cells) / static_cast<float>(total_jaw_cells))
-                                     : 0.0f;
-    res.jaw_clear = (conflict_ratio < 0.15f) ? 1 : 0;
+    if (footprint_jaw_cells > 0 && valid_jaw_cells > 0 && valid_jaw_cells * 2 >= footprint_jaw_cells) {
+        const float conflict_ratio = static_cast<float>(conflict_cells) / static_cast<float>(valid_jaw_cells);
+        res.jaw_clear = (conflict_ratio < 0.15f) ? 1 : 0;
+    }
 
     return res;
 }

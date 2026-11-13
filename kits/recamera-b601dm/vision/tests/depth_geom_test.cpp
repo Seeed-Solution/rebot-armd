@@ -1,9 +1,11 @@
 #include "depth_geom.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 using namespace rv;
@@ -198,6 +200,94 @@ static void test_jaw_clear() {
             }
         }
         auto res = analyze_box_depth(map_blocked.data(), grid_w, grid_h, target, {}, content_w, content_h);
+        CHECK(res.valid);
+        CHECK(res.jaw_clear == 0);
+    }
+
+    auto get_jaw_band_cells = [&]() {
+        const float cell_w_px = content_w / static_cast<float>(grid_w);
+        const float cell_h_px = content_h / static_cast<float>(grid_h);
+        const float mean_u = 320.0f;
+        const float mean_v = 180.0f;
+        std::vector<float> proj_maj, proj_min;
+        for (int gy = 0; gy < grid_h; ++gy) {
+            float v_px = (gy + 0.5f) * cell_h_px;
+            for (int gx = 0; gx < grid_w; ++gx) {
+                float u_px = (gx + 0.5f) * cell_w_px;
+                if (u_px >= 280.0f && u_px <= 360.0f && v_px >= 172.0f && v_px <= 188.0f) {
+                    proj_maj.push_back(u_px - mean_u);
+                    proj_min.push_back(v_px - mean_v);
+                }
+            }
+        }
+        std::sort(proj_maj.begin(), proj_maj.end());
+        std::sort(proj_min.begin(), proj_min.end());
+        auto calc_p = [](const std::vector<float>& vals, float p) {
+            float rank = p * static_cast<float>(vals.size() - 1);
+            size_t low = static_cast<size_t>(rank);
+            size_t high = std::min(low + 1, vals.size() - 1);
+            float frac = rank - static_cast<float>(low);
+            return vals[low] + frac * (vals[high] - vals[low]);
+        };
+        const float p5_maj = calc_p(proj_maj, 0.05f);
+        const float p95_maj = calc_p(proj_maj, 0.95f);
+        const float p5_min = calc_p(proj_min, 0.05f);
+        const float p95_min = calc_p(proj_min, 0.95f);
+        const float major_span = (p95_maj - p5_maj) + cell_w_px;
+        const float maj_bound = 0.20f * major_span;
+        const float jaw_pad_px = 18.0f;
+
+        std::vector<size_t> jaw_cells;
+        for (int gy = 0; gy < grid_h; ++gy) {
+            float v_px = (gy + 0.5f) * cell_h_px;
+            float dv = v_px - mean_v;
+            for (int gx = 0; gx < grid_w; ++gx) {
+                float u_px = (gx + 0.5f) * cell_w_px;
+                float du = u_px - mean_u;
+                if (du < -maj_bound || du > maj_bound) continue;
+                bool in_jaw = (dv > p95_min && dv <= p95_min + jaw_pad_px) ||
+                              (dv < p5_min && dv >= p5_min - jaw_pad_px);
+                bool in_fg = (u_px >= 280.0f && u_px <= 360.0f && v_px >= 172.0f && v_px <= 188.0f);
+                if (in_jaw && !in_fg) {
+                    jaw_cells.push_back(static_cast<size_t>(gy * grid_w + gx));
+                }
+            }
+        }
+        return jaw_cells;
+    };
+
+    // Case C: All cells in lateral jaw clearance bands are NAN while foreground + border ring are finite
+    {
+        auto map_nan_jaw = make_map();
+        auto jaw_cells = get_jaw_band_cells();
+        CHECK(!jaw_cells.empty());
+        for (size_t idx : jaw_cells) {
+            map_nan_jaw[idx] = NAN;
+        }
+        auto res = analyze_box_depth(map_nan_jaw.data(), grid_w, grid_h, target, {}, content_w, content_h);
+        CHECK(res.valid);
+        CHECK(res.jaw_clear == -1);
+    }
+
+    // Case D: 60% of jaw band cells are finite with 25% of those finite cells conflicting
+    // (which would have been diluted to 0.15 < 0.15 if NaNs inflated denominator) -> jaw_clear == 0
+    {
+        auto map_partial_nan = make_map();
+        auto jaw_cells = get_jaw_band_cells();
+        CHECK(!jaw_cells.empty());
+        const size_t n = jaw_cells.size();
+        const size_t nan_count = static_cast<size_t>(0.40f * static_cast<float>(n));
+        const size_t finite_count = n - nan_count;
+        const size_t conflict_count = static_cast<size_t>(0.25f * static_cast<float>(finite_count));
+
+        for (size_t i = 0; i < nan_count; ++i) {
+            map_partial_nan[jaw_cells[i]] = NAN;
+        }
+        // Place conflict cells at the end of jaw_cells (upper jaw band outside target box)
+        for (size_t i = 0; i < conflict_count; ++i) {
+            map_partial_nan[jaw_cells[n - 1 - i]] = 0.80f;  // obstacle in jaw footprint
+        }
+        auto res = analyze_box_depth(map_partial_nan.data(), grid_w, grid_h, target, {}, content_w, content_h);
         CHECK(res.valid);
         CHECK(res.jaw_clear == 0);
     }
