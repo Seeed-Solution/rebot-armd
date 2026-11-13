@@ -94,13 +94,19 @@ CASES = {
     "axis_block": ([*AXIS_LENS, "--objects", "block", "--seed", "14"], None),
     "axis_slab": ([*AXIS_LENS, "--objects", "slab"], None),
     "axis_cube_preopen": (AXIS_LENS, None),
+    # axis_cube_lateral: the height probe moves ±20 mm along the image x axis (height_probe_mode
+    # lateral) and estimates the top from the box-centre parallax; approach 0.20 m (at 0.15 m the
+    # cube's box sits at u 0.24 and the predicted −20 mm shift reaches the image border, so the
+    # probe falls back to up with height_reason lateral_fallback:border)
+    "axis_cube_lateral": (AXIS_LENS, None),
 }
 # object the case grasps (default: the cube) and its height (scene.py KINDS)
-TARGETS = {"axis_cup": "cup", "axis_block": "block", "axis_slab": "slab", "axis_cube_preopen": "cube"}
+TARGETS = {"axis_cup": "cup", "axis_block": "block", "axis_slab": "slab", "axis_cube_preopen": "cube", "axis_cube_lateral": "cube"}
 HEIGHTS_M = {"cube": 0.04, "cup": 0.07, "block": 0.04, "slab": 0.02}
 # approach height per case (default: v8 0.15 m, v5 0.25 m); axis_cube / axis_cup 0.15 m; axis_block
 # 0.20 m (at 0.15 m the 6 cm block's box reaches the image border and the J6 alignment is skipped)
-APPROACH_M = {"axis_cube": 0.15, "axis_cup": 0.15, "axis_block": 0.20, "axis_slab": 0.15, "axis_cube_preopen": 0.15}
+APPROACH_M = {"axis_cube": 0.15, "axis_cup": 0.15, "axis_block": 0.20, "axis_slab": 0.15, "axis_cube_preopen": 0.15,
+              "axis_cube_lateral": 0.20}
 
 
 def view_pose(cam: dict, cube_xy, z: float, miss_m=(0.0, 0.0)):
@@ -201,6 +207,8 @@ def test_tap_to_grasp_the_cube(cam_rig):
         overrides["grip_pixel_norm"] = cam["grip_pixel_norm_at"][f"{approach:.2f}"]
     if case == "axis_cube_preopen":
         overrides["pre_open"] = "on"
+    if case == "axis_cube_lateral":
+        overrides["height_probe_mode"] = "lateral"
     t0 = time.time()
     ack = client.command("/api/v1/action/grasp", {"label": target, "box_norm": box, "frame_id": det["frame_id"],
                                                   "overrides": overrides})
@@ -230,6 +238,8 @@ def test_tap_to_grasp_the_cube(cam_rig):
           f"final_offset_px={r.get('final_offset_px')} expected={ack.get('expected_duration_s')} s in {dt:.1f} s "
           f"height_source={r.get('height_source')} height_reason={r.get('height_reason')} "
           f"object_height_m={r.get('object_height_m')} close_height_m={r.get('close_height_m')} probe_dz_m={r.get('probe_dz_m')} "
+          f"probe_mode={r.get('probe_mode')} lateral_baseline_m={r.get('lateral_baseline_m')} "
+          f"lateral_baseline_err_mm={r.get('lateral_baseline_err_mm')} "
           f"align={r.get('align')} recentre={r.get('recentre')} post_lift={r.get('post_lift')} grasp_width_m={r.get('grasp_width_m')} "
           f"pre_open={r.get('pre_open')} pre_open_m={r.get('pre_open_m')} held_width_m={r.get('held_width_m')}")
     print(f"{target} after the grasp: {cube}")
@@ -251,7 +261,7 @@ def test_tap_to_grasp_the_cube(cam_rig):
     if case.startswith("axis_"):
         # the height probe ran: the object's top within 10 mm, the jaws closed part way up
         h = HEIGHTS_M[target]
-        assert rec["height_source"] == "scale", json.dumps(rec)
+        assert rec["height_source"] == ("parallax" if case == "axis_cube_lateral" else "scale"), json.dumps(rec)
         assert abs(rec["object_height_m"] - h) <= 0.01, json.dumps(rec)
         expect_close = min(max(rec["object_height_m"] * 0.5, 0.015), 0.06)
         assert abs(rec["close_height_m"] - expect_close) < 1e-3, json.dumps(rec)

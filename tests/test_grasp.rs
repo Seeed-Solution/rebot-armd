@@ -1338,6 +1338,7 @@ async fn height_probe_estimates_a_tall_object_and_grasps_part_way_up() {
         a.state, a.code, a.object_height_m, a.height_source, a.height_reason, a.close_height_m);
     assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
     assert_eq!(a.height_source.as_deref(), Some("scale"), "{a:?}");
+    assert_eq!((a.probe_mode.as_deref(), a.lateral_baseline_m), (Some("up"), None), "{a:?}");
     let h = f64::from(a.object_height_m.unwrap());
     assert!((h - 0.08).abs() <= 0.01, "estimate {h}");
     assert!((f64::from(a.close_height_m.unwrap()) - 0.04).abs() < 0.006, "{a:?}");
@@ -1438,6 +1439,101 @@ async fn height_probe_falls_back_to_a_shorter_raise() {
             None => assert_eq!(a.height_reason.as_deref(), Some("probe_unreachable"), "{a:?}"),
         }
     }
+}
+
+// ---- lateral (parallax) height probe ----
+
+/// Lateral probe on a 0.08 m object: the tool moves ±B/2 along the image x axis at the
+/// centring height, the box-centre parallax gives the top within a few mm, and the arm is back
+/// at the start pose before the descent. B = 0.02 m: the 138 px wide box (lens 0.13 m above the
+/// top) then straddles the principal point at both poses; with 0.04 m it lies on either side of
+/// it, no box edge is on the top face at both poses, and the probe falls back (`edge`).
+#[tokio::test]
+async fn lateral_probe_estimates_the_top_from_parallax() {
+    let (rig, s) = height_rig(0.08, json!({"height_probe_mode": "lateral", "lateral_probe_m": 0.02})).await;
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let sup = rig.sup.clone();
+    let (mut start, mut min_z, mut max_xy) = (None::<Vec3>, f64::INFINITY, 0.0f64);
+    let mut after_probe = None::<Vec3>;
+    let a = wait_done(&rig.sup, id, 60.0, |a| {
+        let Ok(inner) = sup.inner().try_read() else { return };
+        let p = kinematics::fk(&kinematics::q6(&inner.commanded_positions)).p;
+        match a.phase.as_deref() {
+            Some("centring") => start = Some(p),
+            Some("probe") => if let Some(st) = start { min_z = min_z.min(p[2]); max_xy = max_xy.max(xy_err(&p, &st)); },
+            Some(_) if min_z.is_finite() && after_probe.is_none() => after_probe = Some(p),
+            _ => {}
+        }
+    }).await;
+    println!("lateral 0.08 m: {} {:?}, height {:?} ({:?} {:?} {:?}), baseline {:?} m err {:?} mm; probe min z {min_z:.4}, max xy {max_xy:.4}",
+        a.state, a.code, a.object_height_m, a.height_source, a.height_reason, a.probe_mode, a.lateral_baseline_m, a.lateral_baseline_err_mm);
+    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+    assert_eq!((a.height_source.as_deref(), a.probe_mode.as_deref(), a.height_reason.as_deref()), (Some("parallax"), Some("lateral"), None), "{a:?}");
+    let h = f64::from(a.object_height_m.unwrap());
+    assert!((h - 0.08).abs() <= 0.004, "estimate {h}");
+    assert!((f64::from(a.lateral_baseline_m.unwrap()) - s.lateral_probe_m).abs() < 1e-3, "{a:?}");
+    assert!(a.lateral_baseline_err_mm.unwrap().abs() < 1.0, "{a:?}");
+    assert!(a.probe_dz_m.is_none(), "no up move: {a:?}");
+    let st = start.expect("centring observed");
+    assert!(min_z >= st[2] - 1e-3, "TCP below the start height during the probe: {min_z} < {}", st[2]);
+    assert!((max_xy - s.lateral_probe_m / 2.0).abs() < 2e-3, "moved ±B/2 sideways: {max_xy}");
+    let back = after_probe.expect("phase after the probe observed");
+    assert!(kinematics::norm(&kinematics::sub(&back, &st)) < 2e-3, "back at the start pose: {back:?} vs {st:?}");
+}
+
+/// The box would reach the image border at a lateral pose (0.08 m baseline, 0.03 m object at
+/// 0.06 m approach height: box 200 x 333 px, predicted shift ±228 px): no lateral move, the up probe
+/// runs and the reason is recorded.
+#[tokio::test]
+async fn lateral_probe_falls_back_to_up_at_the_border() {
+    let (rig, _s) = height_rig(0.03, json!({"height_probe_mode": "lateral", "lateral_probe_m": 0.08, "approach_height_m": 0.06})).await;
+    let (a, _) = run_grasp_close_z(&rig).await;
+    println!("lateral at the border: {} {:?}, height {:?} ({:?} {:?} {:?})", a.state, a.code, a.object_height_m, a.height_source, a.height_reason, a.probe_mode);
+    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+    assert_eq!((a.height_source.as_deref(), a.probe_mode.as_deref()), (Some("scale"), Some("up")), "{a:?}");
+    assert_eq!(a.height_reason.as_deref(), Some("lateral_fallback:border"), "{a:?}");
+    assert!(a.lateral_baseline_m.is_none(), "{a:?}");
+    assert!((f64::from(a.object_height_m.unwrap()) - 0.03).abs() <= 0.01, "{a:?}");
+}
+
+/// With the default 0.04 m baseline the 138 px box lies right of the principal point at the
+/// −B/2 pose and left of it at the +B/2 pose (the shift predicted from the table distance,
+/// ±61 px, keeps it across; the seen shift is ±92 px): no edge is on the top face at both
+/// poses, the arm returns to the start and the up probe runs (`lateral_fallback:edge`).
+#[tokio::test]
+async fn lateral_probe_falls_back_to_up_without_a_common_top_face_edge() {
+    let (rig, _s) = height_rig(0.08, json!({"height_probe_mode": "lateral"})).await;
+    let (a, _) = run_grasp_close_z(&rig).await;
+    println!("lateral without a common edge: {} {:?}, height {:?} ({:?} {:?} {:?})", a.state, a.code, a.object_height_m, a.height_source, a.height_reason, a.probe_mode);
+    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+    assert_eq!((a.height_source.as_deref(), a.probe_mode.as_deref()), (Some("scale"), Some("up")), "{a:?}");
+    assert_eq!(a.height_reason.as_deref(), Some("lateral_fallback:edge"), "{a:?}");
+    assert!((f64::from(a.object_height_m.unwrap()) - 0.08).abs() <= 0.01, "{a:?}");
+}
+
+/// A keep-out box where the TCP would be at the +B/2 pose: the lateral probe does not move and
+/// the up probe runs (`lateral_fallback:unreachable`).
+#[tokio::test]
+async fn lateral_probe_falls_back_to_up_when_a_pose_is_unreachable() {
+    let (rig, s) = height_rig(0.08, json!({"height_probe_mode": "lateral"})).await;
+    // base-frame direction of the image x axis at the (look-down) centring orientation
+    let r = start_pose(&rig).await.r;
+    let x = kinematics::column(&kinematics::cam_rotation(&Pose::new(r, [0.0; 3]), &rig.sim.cam.rec), 0);
+    let n = x[0].hypot(x[1]);
+    let dir = [x[0] / n, x[1] / n];
+    // the TCP is above the object at the centring pose; the box covers 12..40 mm along +dir
+    let (c, z) = (rig.object, s.table_z_m + s.approach_height_m);
+    let (p0, p1) = ([c[0] + 0.012 * dir[0], c[1] + 0.012 * dir[1]], [c[0] + 0.04 * dir[0], c[1] + 0.04 * dir[1]]);
+    let lo = [p0[0].min(p1[0]) - 0.008, p0[1].min(p1[1]) - 0.008, z - 0.005].map(|v| v as f32);
+    let hi = [p0[0].max(p1[0]) + 0.008, p0[1].max(p1[1]) + 0.008, z + 0.005].map(|v| v as f32);
+    rig.sup.inner().write().await.config.workspace.as_mut().unwrap().keepout_boxes =
+        vec![armd::model::KeepoutBox { name: "probe".into(), min_m: lo, max_m: hi }];
+    let (a, _) = run_grasp_close_z(&rig).await;
+    println!("lateral unreachable: {} {:?} {:?}, height {:?} ({:?} {:?} {:?})", a.state, a.code, a.message, a.object_height_m, a.height_source, a.height_reason, a.probe_mode);
+    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+    assert_eq!((a.height_source.as_deref(), a.probe_mode.as_deref()), (Some("scale"), Some("up")), "{a:?}");
+    assert_eq!(a.height_reason.as_deref(), Some("lateral_fallback:unreachable"), "{a:?}");
+    assert!((f64::from(a.object_height_m.unwrap()) - 0.08).abs() <= 0.01, "{a:?}");
 }
 
 // ---- mid-height re-centre and descent contact ----

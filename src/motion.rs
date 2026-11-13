@@ -805,8 +805,10 @@ pub struct ActionStatus {
     /// Grasp: measured cross-section width of the target on the table plane (m).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grasp_width_m: Option<f32>,
-    /// Grasp height probe: `scale` (object top estimated, `object_height_m` above the table) or
-    /// `setup` (fallback to `grasp_height_m`, why in `height_reason`).
+    /// Grasp height probe: `scale` (up probe: object top from the box size change), `parallax`
+    /// (lateral probe: object top from the box-centre shift), `object_height_m` above the table,
+    /// or `setup` (fallback to `grasp_height_m`, why in `height_reason`). `height_reason` also
+    /// carries `lateral_fallback:<why>` when the lateral probe gave way to the up probe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -819,6 +821,15 @@ pub struct ActionStatus {
     /// Grasp height probe: the upward move used (m), absent when the probe did not move.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_dz_m: Option<f32>,
+    /// Grasp height probe that ran: `up` or `lateral` (absent when the probe was skipped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_mode: Option<String>,
+    /// Lateral probe: measured lens displacement along the image x axis between the two poses
+    /// (m, FK of the measured joints) and its difference from `lateral_probe_m` (mm).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lateral_baseline_m: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lateral_baseline_err_mm: Option<f32>,
     /// Grasp mid-height re-centre (look-down): `done`, `unconverged` or `skipped:<reason>`,
     /// with the corrections made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
