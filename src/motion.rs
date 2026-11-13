@@ -819,6 +819,14 @@ pub struct ActionStatus {
     /// Grasp height probe: the upward move used (m), absent when the probe did not move.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_dz_m: Option<f32>,
+    /// Grasp centring with the target's box cut by the image border: `shifted` (centred uncut
+    /// at an aim pixel inside the image, `border_shift_px` from the grip pixel / image centre,
+    /// then moved by the model's offset between the two) or `cut` (still cut: centred on the
+    /// cut box); absent when the box was not cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border_shift_px: Option<[f32; 2]>,
     /// Grasp mid-height re-centre (look-down): `done`, `unconverged` or `skipped:<reason>`,
     /// with the corrections made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
