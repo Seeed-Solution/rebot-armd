@@ -191,6 +191,24 @@ impl MacroCtx {
         self.wait_sub(phase, limit + 10.0).await
     }
 
+    /// Run a gripper move sub-motion with a fraction in [0, 1] and wait for it.
+    pub async fn gripper_move(&self, phase: &str, fraction: f64) -> Result<SubDone, Stop> {
+        let request = GripperRequest {
+            command: GripperCommand::Move,
+            fraction: Some(fraction),
+            grasp: false,
+            speed: 1.0,
+            timeout_s: Some(8.0),
+            tag: None,
+        };
+        let limit = {
+            let mut inner = self.sup.inner().write().await;
+            if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
+            inner.start_macro_gripper(self.id, request).map_err(arm_fail)?
+        };
+        self.wait_sub(phase, limit + 10.0).await
+    }
+
     /// [`phase`](Self::phase) followed by [`gripper`](Self::gripper).
     pub async fn gripper_phase(&self, phase: &str, progress: f32, command: GripperCommand) -> Result<SubDone, Stop> {
         self.phase(phase, progress).await?;

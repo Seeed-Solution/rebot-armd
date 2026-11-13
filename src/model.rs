@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 use crate::safety::SafetyState;
 use crate::driver::{DriverCapabilities, DriverRangeCheck, EnableState};
@@ -215,6 +216,116 @@ impl CameraMount {
     pub fn body_size(&self) -> [f32; 3] { self.body_size_m.unwrap_or(CAMERA_BODY_DEFAULT_M) }
 }
 
+/// Mapping between J7 angle (rad) and jaw opening (m).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JawOpening {
+    /// [[j7_rad, opening_m], ...]
+    pub points: Vec<[f32; 2]>,
+    pub calibrated: bool,
+}
+
+impl JawOpening {
+    pub const SIM_DEFAULT_POINTS: [[f32; 2]; 2] = [[0.0, 0.0], [-5.7, 0.085]];
+
+    pub fn sim_default() -> Self {
+        Self {
+            points: Self::SIM_DEFAULT_POINTS.to_vec(),
+            calibrated: false,
+        }
+    }
+
+    /// Validate: piecewise-linear, monotonic, >= 2 points, inside J7 limits, openings in [0, 0.2] m.
+    pub fn validate(&self, j7_limit: Option<&JointLimit>) -> Result<(), String> {
+        if self.points.len() < 2 {
+            return Err("jaw_opening requires at least 2 points".into());
+        }
+        for (i, p) in self.points.iter().enumerate() {
+            let [j7, w] = *p;
+            if !j7.is_finite() || !w.is_finite() {
+                return Err(format!("jaw_opening point {i} values must be finite"));
+            }
+            if !(0.0..=0.2).contains(&w) {
+                return Err(format!("jaw_opening opening {w} must be in [0, 0.2] m"));
+            }
+            if let Some(lim) = j7_limit {
+                if j7 < lim.min_position - 1e-4 || j7 > lim.max_position + 1e-4 {
+                    return Err(format!("jaw_opening j7 {j7} outside J7 limits [{}, {}]", lim.min_position, lim.max_position));
+                }
+            }
+        }
+        let d_j7_0 = self.points[1][0] - self.points[0][0];
+        let d_w_0 = self.points[1][1] - self.points[0][1];
+        if d_j7_0.abs() < 1e-6 || d_w_0.abs() < 1e-6 {
+            return Err("jaw_opening points must be strictly monotonic".into());
+        }
+        for w in self.points.windows(2) {
+            let dj = w[1][0] - w[0][0];
+            let dw = w[1][1] - w[0][1];
+            if dj.abs() < 1e-6 || dw.abs() < 1e-6 {
+                return Err("jaw_opening points must be strictly monotonic".into());
+            }
+            if (dj > 0.0) != (d_j7_0 > 0.0) || (dw > 0.0) != (d_w_0 > 0.0) {
+                return Err("jaw_opening points must be strictly monotonic".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Piecewise linear lookup of jaw opening (m) for joint J7 (rad).
+    pub fn opening_m(&self, j7_rad: f32) -> f32 {
+        if self.points.is_empty() { return 0.0; }
+        if self.points.len() == 1 { return self.points[0][1]; }
+        let p_first = self.points[0];
+        let p_last = self.points[self.points.len() - 1];
+        let dir = p_last[0] - p_first[0];
+        if dir > 0.0 {
+            if j7_rad <= p_first[0] { return p_first[1]; }
+            if j7_rad >= p_last[0] { return p_last[1]; }
+        } else {
+            if j7_rad >= p_first[0] { return p_first[1]; }
+            if j7_rad <= p_last[0] { return p_last[1]; }
+        }
+        for w in self.points.windows(2) {
+            let (p0, p1) = (w[0], w[1]);
+            let span = p1[0] - p0[0];
+            if span.abs() > 1e-6 {
+                let t = (j7_rad - p0[0]) / span;
+                if (0.0..=1.0).contains(&t) {
+                    return p0[1] + t * (p1[1] - p0[1]);
+                }
+            }
+        }
+        p_last[1]
+    }
+
+    /// Inverse lookup: target J7 (rad) for a given jaw opening (m).
+    pub fn j7_for(&self, opening: f32) -> f32 {
+        if self.points.is_empty() { return 0.0; }
+        if self.points.len() == 1 { return self.points[0][0]; }
+        let p_first = self.points[0];
+        let p_last = self.points[self.points.len() - 1];
+        let dir = p_last[1] - p_first[1];
+        if dir > 0.0 {
+            if opening <= p_first[1] { return p_first[0]; }
+            if opening >= p_last[1] { return p_last[0]; }
+        } else {
+            if opening >= p_first[1] { return p_first[0]; }
+            if opening <= p_last[1] { return p_last[0]; }
+        }
+        for w in self.points.windows(2) {
+            let (p0, p1) = (w[0], w[1]);
+            let span = p1[1] - p0[1];
+            if span.abs() > 1e-6 {
+                let t = (opening - p0[1]) / span;
+                if (0.0..=1.0).contains(&t) {
+                    return p0[0] + t * (p1[0] - p0[0]);
+                }
+            }
+        }
+        p_last[0]
+    }
+}
+
 /// Gripper action parameters (`/api/v1/action/gripper`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GripperPolicy {
@@ -230,6 +341,9 @@ pub struct GripperPolicy {
     pub squeeze_rad: f32,
     /// Squeeze window before the holding verdict (ms).
     pub settle_ms: u64,
+    /// Angle-to-opening calibration mapping; absent by default (uses built-in sim model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jaw_opening: Option<JawOpening>,
 }
 
 impl GripperPolicy {
@@ -237,7 +351,103 @@ impl GripperPolicy {
     /// holding_torque_nm 0.0667 is the former 0.12 read with TMAX 18, converted to the
     /// J7 motor's real TMAX 10 (0.12 × 10 / 18).
     pub fn rebot_dm() -> Self {
-        Self { closed_rad: 0.0, open_rad: -5.7, holding_gap_rad: 0.30, holding_torque_nm: 0.0667, squeeze_rad: 0.15, settle_ms: 300 }
+        Self { closed_rad: 0.0, open_rad: -5.7, holding_gap_rad: 0.30, holding_torque_nm: 0.0667, squeeze_rad: 0.15, settle_ms: 300, jaw_opening: None }
+    }
+
+    /// Jaw opening model (or the built-in uncalibrated sim default).
+    pub fn jaw_opening(&self) -> Cow<'_, JawOpening> {
+        match &self.jaw_opening {
+            Some(jo) => Cow::Borrowed(jo),
+            None => Cow::Owned(JawOpening::sim_default()),
+        }
+    }
+
+    pub fn opening_m(&self, j7_rad: f32) -> f32 {
+        self.jaw_opening().opening_m(j7_rad)
+    }
+
+    pub fn j7_for(&self, opening: f32) -> f32 {
+        self.jaw_opening().j7_for(opening)
+    }
+
+    pub fn is_calibrated(&self) -> bool {
+        self.jaw_opening.as_ref().is_some_and(|jo| jo.calibrated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jaw_opening_interpolation_and_clamping() {
+        let jo = JawOpening::sim_default();
+        assert!((jo.opening_m(0.0) - 0.0).abs() < 1e-6);
+        assert!((jo.opening_m(-5.7) - 0.085).abs() < 1e-6);
+        assert!((jo.opening_m(-2.85) - 0.0425).abs() < 1e-6);
+
+        // Clamping outside bounds
+        assert!((jo.opening_m(1.0) - 0.0).abs() < 1e-6);
+        assert!((jo.opening_m(-10.0) - 0.085).abs() < 1e-6);
+
+        // Inverse lookup
+        assert!((jo.j7_for(0.0) - 0.0).abs() < 1e-6);
+        assert!((jo.j7_for(0.085) - (-5.7)).abs() < 1e-6);
+        let j7_55 = jo.j7_for(0.055);
+        let expected_j7_55 = -5.7 * (0.055 / 0.085);
+        assert!((j7_55 - expected_j7_55).abs() < 1e-5, "got {j7_55}, expected {expected_j7_55}");
+
+        // Inverse clamping
+        assert!((jo.j7_for(-0.1) - 0.0).abs() < 1e-6);
+        assert!((jo.j7_for(0.2) - (-5.7)).abs() < 1e-6);
+
+        // Multi-point piecewise linear
+        let multi = JawOpening {
+            points: vec![[0.0, 0.0], [-2.0, 0.030], [-5.7, 0.085]],
+            calibrated: true,
+        };
+        assert!((multi.opening_m(-1.0) - 0.015).abs() < 1e-5);
+        assert!((multi.j7_for(0.015) - (-1.0)).abs() < 1e-5);
+        assert!((multi.opening_m(-3.85) - 0.0575).abs() < 1e-5);
+    }
+
+    #[test]
+    fn jaw_opening_validation() {
+        let lim = JointLimit::new("j7", -6.28, 6.28, 5.0, 10.0);
+
+        // Default passes
+        assert!(JawOpening::sim_default().validate(Some(&lim)).is_ok());
+
+        // Less than 2 points fails
+        let one_point = JawOpening { points: vec![[0.0, 0.0]], calibrated: false };
+        assert!(one_point.validate(Some(&lim)).is_err());
+
+        // Non-finite values fail
+        let non_fin = JawOpening { points: vec![[0.0, 0.0], [f32::NAN, 0.085]], calibrated: false };
+        assert!(non_fin.validate(Some(&lim)).is_err());
+
+        // Opening out of [0, 0.2] fails
+        let neg_w = JawOpening { points: vec![[0.0, -0.01], [-5.7, 0.085]], calibrated: false };
+        assert!(neg_w.validate(Some(&lim)).is_err());
+        let big_w = JawOpening { points: vec![[0.0, 0.0], [-5.7, 0.25]], calibrated: false };
+        assert!(big_w.validate(Some(&lim)).is_err());
+
+        // Outside J7 limits fails
+        let out_j7 = JawOpening { points: vec![[0.0, 0.0], [-7.0, 0.085]], calibrated: false };
+        assert!(out_j7.validate(Some(&lim)).is_err());
+
+        // Non-monotonic fails
+        let non_mono_j7 = JawOpening {
+            points: vec![[0.0, 0.0], [-3.0, 0.040], [-2.0, 0.085]],
+            calibrated: false,
+        };
+        assert!(non_mono_j7.validate(Some(&lim)).is_err());
+
+        let non_mono_w = JawOpening {
+            points: vec![[0.0, 0.0], [-2.0, 0.050], [-5.7, 0.030]],
+            calibrated: false,
+        };
+        assert!(non_mono_w.validate(Some(&lim)).is_err());
     }
 }
 
@@ -794,6 +1004,9 @@ impl ArmConfig {
                 || g.holding_gap_rad < 0.0 || g.holding_torque_nm < 0.0
                 || !(0.0..=0.5).contains(&g.squeeze_rad) || g.settle_ms == 0 || g.settle_ms > 5000 {
                 return Err("Invalid gripper policy (needs dof 7, open/closed inside the J7 limits, 0 <= squeeze_rad <= 0.5)".into());
+            }
+            if let Some(jo) = &g.jaw_opening {
+                jo.validate(lim).map_err(|e| format!("Invalid gripper policy: {e}"))?;
             }
         }
         if let Some(ranges) = &self.damiao_ranges {

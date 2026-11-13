@@ -837,6 +837,15 @@ pub struct ActionStatus {
     /// stopped on the object) or `dropped`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_lift: Option<String>,
+    /// Grasp width-based pre-open: `done`, `off` or `skipped:<reason>`; absent before the phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_open: Option<String>,
+    /// Grasp pre-open opening width (m) before descend; absent when pre-open did not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_open_m: Option<f32>,
+    /// Grasp opening width (m) from measured J7 after the close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_width_m: Option<f32>,
     /// Accumulated runtime per macro phase (ms).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub phase_ms: BTreeMap<String, u32>,

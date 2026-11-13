@@ -1756,4 +1756,168 @@ async fn grasp_diagnostics_phase_ms_and_motions_with_tracking_error() {
     assert!(a.motions.iter().any(|m| m.track_mm > 1.0), "track_mm should reflect measured offset: {:?}", a.motions);
 }
 
+#[tokio::test]
+async fn orchestrator_test_pre_open_j7_before_descend() {
+    // 4 cm object with pre_open "on": preopens to width (0.040) + margin (0.015) = 0.055 m.
+    // Sim model: [[0, 0], [-5.7, 0.085]] -> j7_for(0.055) ≈ -3.688 rad.
+    // Also tests that pre-open is allowed without an accepted angle (angle_conf low 0.1).
+    let setup = GraspSetup {
+        pre_open: armd::grasp::PreOpen::On,
+        pre_open_margin_m: 0.015,
+        ..GraspSetup::default()
+    };
+    let rig = rig(setup.clone(), centred_lens(), 0.0, [0.0, 0.0], false).await;
+    let start_r = start_pose(&rig).await.r;
+    let mut s = setup.clone();
+    s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+    rig.sup.inner().write().await.set_grasp_setup(s.clone());
+
+    // Low confidence angle: no accepted angle, but pre-open still runs along the jaw axis
+    *rig.sim.angle.lock().unwrap() = Some((0.0, 0.1));
+    *rig.sim.width_px.lock().unwrap() = Some(160.0); // ~0.040 m width on table
+
+    let sup = rig.sup.clone();
+    let mut pre_descend_j7 = None;
+
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let a = wait_done(&rig.sup, id, 40.0, |_| {
+        if let Ok(inner) = sup.inner().try_read() {
+            if let Some(act) = &inner.last_action {
+                if act.phase.as_deref() == Some("descend") && pre_descend_j7.is_none() {
+                    pre_descend_j7 = inner.commanded_positions.get(6).copied();
+                }
+            }
+        }
+    }).await;
+
+    assert_eq!(a.state, "done");
+    assert_eq!(a.holding, Some(true));
+    assert_eq!(a.pre_open.as_deref(), Some("done"));
+    let pre_w = a.pre_open_m.expect("pre_open_m recorded");
+    assert!((pre_w - 0.055).abs() < 0.008, "pre_open_m {pre_w} should be near 0.055 m");
+
+    let j7 = pre_descend_j7.expect("J7 captured during descend phase");
+    let expected_j7 = -5.7 * (pre_w / 0.085);
+    assert!((j7 - expected_j7).abs() < 0.2, "J7 {j7} before descend should be near {expected_j7} (far from open_rad -5.7)");
+
+    let held_w = a.held_width_m.expect("held_width_m recorded");
+    assert!(held_w > 0.02 && held_w < 0.06, "held_width_m {held_w} within object bounds");
+}
+
+#[tokio::test]
+async fn pre_open_skip_conditions() {
+    // 1. PreOpen::Auto without calibration skips with "skipped:uncalibrated"
+    {
+        let setup_auto = GraspSetup {
+            pre_open: armd::grasp::PreOpen::Auto,
+            ..GraspSetup::default()
+        };
+        let r = rig(setup_auto.clone(), centred_lens(), 0.0, [0.0, 0.0], false).await;
+        let start_r = start_pose(&r).await.r;
+        let mut s = setup_auto.clone();
+        s.grip_pixel_norm = calibrate_grip(&r, &setup_auto, &start_r);
+        r.sup.inner().write().await.set_grasp_setup(s.clone());
+        *r.sim.width_px.lock().unwrap() = Some(160.0);
+
+        let (id, _) = grasp::start(&r.sup, r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
+        let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
+        assert_eq!(a.pre_open.as_deref(), Some("skipped:uncalibrated"));
+    }
+
+    // 2. PreOpen::Off records "off"
+    {
+        let setup_off = GraspSetup {
+            pre_open: armd::grasp::PreOpen::Off,
+            ..GraspSetup::default()
+        };
+        let r = rig(setup_off.clone(), centred_lens(), 0.0, [0.0, 0.0], false).await;
+        let start_r = start_pose(&r).await.r;
+        let mut s = setup_off.clone();
+        s.grip_pixel_norm = calibrate_grip(&r, &setup_off, &start_r);
+        r.sup.inner().write().await.set_grasp_setup(s.clone());
+        *r.sim.width_px.lock().unwrap() = Some(160.0);
+
+        let (id, _) = grasp::start(&r.sup, r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
+        let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
+        assert_eq!(a.pre_open.as_deref(), Some("off"));
+    }
+
+    // 3. PreOpen::On with width reaching/exceeding open_rad skips with "skipped:open_rad"
+    // At approach height 0.15 m, fx 600, 310 px -> ~0.077 m + 0.015 margin = 0.092 m >= 0.085 m (open_rad)
+    {
+        let setup_wide = GraspSetup {
+            pre_open: armd::grasp::PreOpen::On,
+            pre_open_margin_m: 0.015,
+            max_grasp_width_m: 0.10, // allow wider object to pass TOO_WIDE
+            ..GraspSetup::default()
+        };
+        let r = rig(setup_wide.clone(), centred_lens(), 0.0, [0.0, 0.0], false).await;
+        let start_r = start_pose(&r).await.r;
+        let mut s = setup_wide.clone();
+        s.grip_pixel_norm = calibrate_grip(&r, &setup_wide, &start_r);
+        r.sup.inner().write().await.set_grasp_setup(s.clone());
+        *r.sim.width_px.lock().unwrap() = Some(310.0);
+
+        let (id, _) = grasp::start(&r.sup, r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
+        let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
+        assert_eq!(a.pre_open.as_deref(), Some("skipped:open_rad"));
+    }
+
+    // 4. No width reported -> "skipped:no_width"
+    {
+        let setup_nowidth = GraspSetup {
+            pre_open: armd::grasp::PreOpen::On,
+            ..GraspSetup::default()
+        };
+        let r = rig(setup_nowidth.clone(), centred_lens(), 0.0, [0.0, 0.0], false).await;
+        let start_r = start_pose(&r).await.r;
+        let mut s = setup_nowidth.clone();
+        s.grip_pixel_norm = calibrate_grip(&r, &setup_nowidth, &start_r);
+        r.sup.inner().write().await.set_grasp_setup(s.clone());
+        *r.sim.width_px.lock().unwrap() = None;
+
+        let (id, _) = grasp::start(&r.sup, r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
+        let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
+        assert_eq!(a.pre_open.as_deref(), Some("skipped:no_width"));
+    }
+}
+
+#[tokio::test]
+async fn calibrated_too_wide_limit() {
+    let setup = GraspSetup {
+        max_grasp_width_m: 0.075,
+        pre_open_margin_m: 0.015,
+        ..GraspSetup::default()
+    };
+    let r = rig(setup.clone(), centred_lens(), 0.0, [0.0, 0.0], false).await;
+    let start_r = start_pose(&r).await.r;
+    let mut s = setup.clone();
+    s.grip_pixel_norm = calibrate_grip(&r, &setup, &start_r);
+    r.sup.inner().write().await.set_grasp_setup(s.clone());
+
+    // Set calibrated jaw opening: open_rad -5.7 gives 0.080 m opening.
+    // Calibrated limit = 0.080 - 0.015 = 0.065 m (below max_grasp_width_m 0.075).
+    {
+        let mut inner = r.sup.inner().write().await;
+        if let Some(p) = inner.config.gripper_policy.as_mut() {
+            p.jaw_opening = Some(armd::model::JawOpening {
+                points: vec![[0.0, 0.0], [-5.7, 0.080]],
+                calibrated: true,
+            });
+        }
+    }
+
+    // Width is 275 px -> ~0.069 m (between 0.065 and 0.075)
+    *r.sim.angle.lock().unwrap() = Some((0.0, 0.9));
+    *r.sim.width_px.lock().unwrap() = Some(275.0);
+
+    let (id, _) = grasp::start(&r.sup, r.sim.clone(), &tap(&r).await).await.expect("grasp accepted");
+    let a = wait_done(&r.sup, id, 30.0, |_| {}).await;
+
+    assert_eq!(a.state, "failed");
+    assert_eq!(a.code.as_deref(), Some("TOO_WIDE"));
+    let measured_w = a.grasp_width_m.expect("width recorded");
+    assert!(measured_w > 0.065 && measured_w < 0.075, "width {measured_w} between calib limit 0.065 and max 0.075");
+}
+
 

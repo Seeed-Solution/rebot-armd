@@ -1838,6 +1838,7 @@ impl SupervisorInner {
             align: None, align_turn_rad: None, angle_spread_deg: None, orientation: None, grasp_width_m: None, height_source: None, height_reason: None, object_height_m: None, close_height_m: None, probe_dz_m: None,
             recentre: None, recentre_iterations: None, descend_peak_residual_nm: None, descend_peak_tracking_rad: None,
             descend_contact: None, descend_contact_height_m: None, post_lift: None,
+            pre_open: None, pre_open_m: None, held_width_m: None,
             phase_ms: std::collections::BTreeMap::new(), motions: Vec::new(),
         });
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);

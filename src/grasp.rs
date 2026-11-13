@@ -135,6 +135,20 @@ pub struct GraspSetup {
     pub spill_safe_labels: Vec<String>,
     /// Maximum allowed tilt (deg) when placing a spill-safe object.
     pub spill_max_tilt_deg: f64,
+    /// Width-based pre-open before descend: `auto` (default, only when calibrated), `on` (also uncalibrated), `off`.
+    pub pre_open: PreOpen,
+    /// Margin (m) added to the measured width for the pre-open opening.
+    pub pre_open_margin_m: f64,
+}
+
+/// `pre_open` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PreOpen {
+    #[default]
+    Auto,
+    On,
+    Off,
 }
 
 /// `acquire_camera_down` setting.
@@ -194,6 +208,8 @@ impl Default for GraspSetup {
             max_grasp_width_m: 0.075,
             spill_safe_labels: vec!["cup".into(), "bottle".into(), "wine glass".into(), "bowl".into(), "vase".into()],
             spill_max_tilt_deg: 8.0,
+            pre_open: PreOpen::Auto,
+            pre_open_margin_m: 0.015,
         }
     }
 }
@@ -206,7 +222,7 @@ impl GraspSetup {
             self.image_size_px[1], self.fx_px, self.fy_px, self.centre_tol_px, self.servo_gain, self.max_step_m,
             self.match_dist_px, self.match_iou, self.acquire_dist_px, self.lost_timeout_s, self.settle_delay_s,
             self.align_min_aspect, self.align_min_angle_conf, self.align_max_angle_spread_deg, self.approach_speed_mps, self.descend_speed_mps, self.phase_timeout_s, self.timeout_s, self.recheck_tol_px,
-            self.height_probe_m, self.height_grasp_fraction, self.max_grasp_height_m, self.recentre_height_m, self.max_grasp_width_m, self.spill_max_tilt_deg];
+            self.height_probe_m, self.height_grasp_fraction, self.max_grasp_height_m, self.recentre_height_m, self.max_grasp_width_m, self.spill_max_tilt_deg, self.pre_open_margin_m];
         if !all.iter().all(|v| fin(*v)) { return Err("grasp setup values must be finite".into()); }
         let check = |ok: bool, msg: &str| if ok { Ok(()) } else { Err(msg.to_string()) };
         check((-0.5..=0.5).contains(&self.table_z_m), "table_z_m must be in [-0.5, 0.5] m")?;
@@ -244,6 +260,7 @@ impl GraspSetup {
         check((0.0..=90.0).contains(&self.align_max_angle_spread_deg), "align_max_angle_spread_deg must be in [0, 90]")?;
         check((0.0..=0.2).contains(&self.max_grasp_width_m), "max_grasp_width_m must be in [0, 0.2] m")?;
         check((1.0..=30.0).contains(&self.spill_max_tilt_deg), "spill_max_tilt_deg must be in [1, 30]")?;
+        check((0.005..=0.05).contains(&self.pre_open_margin_m), "pre_open_margin_m must be in [0.005, 0.05] m")?;
         let speed_ok = |v: f64| v > 0.0 && v <= motion::MAX_LINEAR_MPS;
         check(speed_ok(self.approach_speed_mps) && speed_ok(self.descend_speed_mps), "speeds must be in (0, 0.15] m/s")?;
         check(self.phase_timeout_s > 0.0 && self.phase_timeout_s <= 120.0 && self.timeout_s >= self.phase_timeout_s && self.timeout_s <= 600.0,
@@ -1174,6 +1191,7 @@ impl Orchestrator {
 
         // the width is measured whatever the angle confidence: a disc or a square has a low
         // angle_conf but a valid width (any closing direction sees about the same width)
+        let mut measured_width_m = None;
         if let Some(w_px) = frames_width_px(&c.frames, 0.0) {
             let accepted_angle = frames_angle(&c.frames, s.align_min_angle_conf)
                 .filter(|&(_alpha, spread)| s.align_max_angle_spread_deg <= 0.0 || spread <= s.align_max_angle_spread_deg);
@@ -1191,17 +1209,89 @@ impl Orchestrator {
             let p1_px = [centre_px[0] + half_w * u_x, centre_px[1] + half_w * u_y];
             if let (Some(p0), Some(p1)) = (self.cam.plane_point(&c.pose, p0_px, plane), self.cam.plane_point(&c.pose, p1_px, plane)) {
                 let width_m = kinematics::norm(&kinematics::sub(&p1, &p0));
+                measured_width_m = Some(width_m);
                 self.sup.inner().write().await.update_action(self.id, |a| {
                     a.grasp_width_m = Some(width_m as f32);
                 });
-                if s.max_grasp_width_m > 0.0 && width_m > s.max_grasp_width_m {
-                    return Err(fail("TOO_WIDE", format!("Object width {width_m:.3} m exceeds max_grasp_width_m {:.3} m", s.max_grasp_width_m)));
+                let max_w = {
+                    let inner = self.sup.inner().read().await;
+                    let policy = inner.config.gripper_policy.as_ref();
+                    if policy.is_some_and(|p| p.is_calibrated()) {
+                        let p = policy.unwrap();
+                        let calib_limit = (p.opening_m(p.open_rad) as f64) - s.pre_open_margin_m;
+                        if s.max_grasp_width_m > 0.0 {
+                            s.max_grasp_width_m.min(calib_limit)
+                        } else {
+                            calib_limit
+                        }
+                    } else {
+                        s.max_grasp_width_m
+                    }
+                };
+                if max_w > 0.0 && width_m > max_w {
+                    return Err(fail("TOO_WIDE", format!("Object width {width_m:.3} m exceeds max_grasp_width_m {:.3} m", max_w)));
                 }
             }
         }
 
         if let Some(turn) = turn {
             self.move_arm("align", GoalSpec::Relative { frame: RelFrame::Tool, d: [0.0; 3], dyaw: 0.0, dpitch: 0.0, droll: turn, level: false }, s.approach_speed_mps).await?;
+        }
+
+        // width-based pre-open before descend
+        let (pre_open_decision, pre_open_target) = {
+            let inner = self.sup.inner().read().await;
+            let policy = inner.config.gripper_policy.clone();
+            drop(inner);
+            match policy {
+                None => (Some("skipped:no_policy".to_string()), None),
+                Some(policy) => {
+                    let calibrated = policy.is_calibrated();
+                    if s.pre_open == PreOpen::Off {
+                        (Some("off".to_string()), None)
+                    } else if s.pre_open == PreOpen::Auto && !calibrated {
+                        (Some("skipped:uncalibrated".to_string()), None)
+                    } else if let Err(reason) = align_guard(&c.last, &c.frames, self.cam.size) {
+                        (Some(format!("skipped:{reason}")), None)
+                    } else if let Some(w) = measured_width_m {
+                        let target_w = (w + s.pre_open_margin_m) as f32;
+                        let target_j7 = policy.j7_for(target_w);
+                        let full_open_w = policy.opening_m(policy.open_rad);
+                        let at_or_beyond_open = target_w >= full_open_w
+                            || (target_j7 - policy.open_rad).abs() < 1e-4
+                            || if policy.open_rad > policy.closed_rad {
+                                target_j7 >= policy.open_rad
+                            } else {
+                                target_j7 <= policy.open_rad
+                            };
+                        if at_or_beyond_open {
+                            (Some("skipped:open_rad".to_string()), None)
+                        } else {
+                            let min_j7 = policy.closed_rad.min(policy.open_rad);
+                            let max_j7 = policy.closed_rad.max(policy.open_rad);
+                            let clamped_j7 = target_j7.clamp(min_j7, max_j7);
+                            let span = policy.open_rad - policy.closed_rad;
+                            let frac = if span.abs() < 1e-6 { 0.0 } else { ((clamped_j7 - policy.closed_rad) / span).clamp(0.0, 1.0) as f64 };
+                            (None, Some((frac, target_w)))
+                        }
+                    } else {
+                        (Some("skipped:no_width".to_string()), None)
+                    }
+                }
+            }
+        };
+
+        if let Some((fraction, target_w)) = pre_open_target {
+            self.phase("preopen", 0.6).await?;
+            self.gripper_move("preopen", fraction).await?;
+            self.sup.inner().write().await.update_action(self.id, |a| {
+                a.pre_open = Some("done".into());
+                a.pre_open_m = Some(target_w);
+            });
+        } else if let Some(reason) = pre_open_decision {
+            self.sup.inner().write().await.update_action(self.id, |a| {
+                a.pre_open = Some(reason);
+            });
         }
 
         // descend (look-down: re-centre at mid height on the way), close, check
@@ -1213,6 +1303,16 @@ impl Orchestrator {
         }
         self.descend(close_h).await?;
         let closed = self.gripper_phase("close", 0.8, GripperCommand::Close).await?;
+        let held_width = {
+            let inner = self.sup.inner().read().await;
+            inner.config.gripper_policy.as_ref().map(|p| {
+                let m7 = inner.measured_positions.get(6).copied().unwrap_or(0.0);
+                p.opening_m(m7)
+            })
+        };
+        if let Some(w) = held_width {
+            self.sup.inner().write().await.update_action(self.id, |a| a.held_width_m = Some(w));
+        }
         let holding = closed.holding == Some(true);
         let lift_to = |p: Vec3| GoalSpec::Absolute { p: [p[0], p[1], s.table_z_m + s.lift_height_m], r: None };
         if !holding {
@@ -1242,6 +1342,16 @@ impl Orchestrator {
         let regrip = self.gripper_phase("regrip", 0.95, GripperCommand::Close).await?;
         let gap = regrip.gripper_gap_rad.unwrap_or(gap);
         if regrip.holding == Some(true) {
+            let held_width = {
+                let inner = self.sup.inner().read().await;
+                inner.config.gripper_policy.as_ref().map(|p| {
+                    let m7 = inner.measured_positions.get(6).copied().unwrap_or(0.0);
+                    p.opening_m(m7)
+                })
+            };
+            if let Some(w) = held_width {
+                self.sup.inner().write().await.update_action(self.id, |a| a.held_width_m = Some(w));
+            }
             self.sup.inner().write().await.update_action(self.id, |a| a.post_lift = Some("regripped".into()));
             return Ok((true, Some(gap)));
         }

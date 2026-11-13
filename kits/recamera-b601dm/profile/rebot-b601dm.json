@@ -246,7 +246,9 @@
       "bowl",
       "vase"
     ],
-    "spill_max_tilt_deg": 8.0
+    "spill_max_tilt_deg": 8.0,
+    "pre_open": "auto",
+    "pre_open_margin_m": 0.015
   },
   "gravity_comp": {
     "ramp_in_s": 1.0,
