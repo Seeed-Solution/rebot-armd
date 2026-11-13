@@ -110,8 +110,15 @@ pub struct GraspSetup {
     pub acquire_camera_down: AcquireCameraDown,
     /// Height probe after the centring: move straight up this far (m; [`PROBE_FALLBACK_DZ_M`]
     /// when that pose is unreachable), estimate the object's top from the change of the box
-    /// size and move back; 0 disables.
+    /// size and move back; 0 disables the probe in either `height_probe_mode`.
     pub height_probe_m: f64,
+    /// Height probe motion: `up` (default, box scale change over `height_probe_m`) or
+    /// `lateral` (box-centre parallax over a horizontal baseline of `lateral_probe_m` along the
+    /// image x axis; falls back to `up` when the shifted box would reach the image border or a
+    /// lateral pose is unreachable).
+    pub height_probe_mode: HeightProbeMode,
+    /// Lateral probe baseline (m): the tool moves to −B/2 and +B/2 from the centring pose.
+    pub lateral_probe_m: f64,
     /// With an estimated top height h, the jaws close at clamp(h · this, `grasp_height_m`,
     /// `max_grasp_height_m`) above the table.
     pub height_grasp_fraction: f64,
@@ -149,6 +156,15 @@ pub enum PreOpen {
     Auto,
     On,
     Off,
+}
+
+/// `height_probe_mode` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HeightProbeMode {
+    #[default]
+    Up,
+    Lateral,
 }
 
 /// `acquire_camera_down` setting.
@@ -199,6 +215,8 @@ impl Default for GraspSetup {
             acquire_camera_down: AcquireCameraDown::Auto,
             recheck_tol_px: 40.0,
             height_probe_m: 0.10,
+            height_probe_mode: HeightProbeMode::Up,
+            lateral_probe_m: 0.04,
             height_grasp_fraction: 0.5,
             max_grasp_height_m: 0.06,
             recentre_height_m: 0.0,
@@ -222,7 +240,7 @@ impl GraspSetup {
             self.image_size_px[1], self.fx_px, self.fy_px, self.centre_tol_px, self.servo_gain, self.max_step_m,
             self.match_dist_px, self.match_iou, self.acquire_dist_px, self.lost_timeout_s, self.settle_delay_s,
             self.align_min_aspect, self.align_min_angle_conf, self.align_max_angle_spread_deg, self.approach_speed_mps, self.descend_speed_mps, self.phase_timeout_s, self.timeout_s, self.recheck_tol_px,
-            self.height_probe_m, self.height_grasp_fraction, self.max_grasp_height_m, self.recentre_height_m, self.max_grasp_width_m, self.spill_max_tilt_deg, self.pre_open_margin_m];
+            self.height_probe_m, self.lateral_probe_m, self.height_grasp_fraction, self.max_grasp_height_m, self.recentre_height_m, self.max_grasp_width_m, self.spill_max_tilt_deg, self.pre_open_margin_m];
         if !all.iter().all(|v| fin(*v)) { return Err("grasp setup values must be finite".into()); }
         let check = |ok: bool, msg: &str| if ok { Ok(()) } else { Err(msg.to_string()) };
         check((-0.5..=0.5).contains(&self.table_z_m), "table_z_m must be in [-0.5, 0.5] m")?;
@@ -248,6 +266,7 @@ impl GraspSetup {
         check((0.0..=2.0).contains(&self.settle_delay_s), "settle_delay_s must be in [0, 2] s")?;
         check(self.recheck_tol_px > 0.0 && self.recheck_tol_px <= 500.0, "recheck_tol_px must be in (0, 500]")?;
         check((0.0..=0.1).contains(&self.height_probe_m), "height_probe_m must be in [0, 0.1] m")?;
+        check((0.01..=0.08).contains(&self.lateral_probe_m), "lateral_probe_m must be in [0.01, 0.08] m")?;
         check((0.0..=1.0).contains(&self.height_grasp_fraction), "height_grasp_fraction must be in [0, 1]")?;
         check(self.max_grasp_height_m >= self.grasp_height_m && self.max_grasp_height_m <= 0.2,
             "max_grasp_height_m must be in [grasp_height_m, 0.2] m")?;
@@ -1046,7 +1065,9 @@ pub fn expected_duration(planned: &PlannedGrasp) -> f64 {
     let s = &planned.request.setup;
     let descend = (s.approach_height_m - s.grasp_height_m) * 1.875 / s.descend_speed_mps;
     let lift = (s.lift_height_m - s.grasp_height_m) * 1.875 / s.descend_speed_mps;
-    let probe = if s.height_probe_m > 0.0 { 2.0 * s.height_probe_m * 1.875 / s.approach_speed_mps + 1.5 } else { 0.0 };
+    let mut probe = if s.height_probe_m > 0.0 { 2.0 * s.height_probe_m * 1.875 / s.approach_speed_mps + 1.5 } else { 0.0 };
+    // lateral: B/2 + B + B/2 of motion and two frame sets, on top of a possible up fallback
+    if s.height_probe_m > 0.0 && s.height_probe_mode == HeightProbeMode::Lateral { probe += 2.0 * 1.875 * s.lateral_probe_m / s.approach_speed_mps + 1.5; }
     let recentre = if s.recentre_height_m > 0.0 && !planned.camera_down { 3.0 } else { 0.0 };
     let lift_check = s.post_lift_settle_ms as f64 / 1000.0;
     let base = lift_check + 6.5 + planned.approach_duration + 4.0 * 1.5 + descend + 2.0 + lift + probe + recentre;
@@ -1262,12 +1283,12 @@ impl Orchestrator {
         let mut close_h = s.grasp_height_m;
         let mut plane = plane;
         match self.probe_height(&c, &planned.request.label, &mut after).await? {
-            Ok(h) => {
+            Ok((h, source)) => {
                 plane = s.table_z_m + s.grasp_height_m.max(h);
                 close_h = (h * s.height_grasp_fraction).clamp(s.grasp_height_m, s.max_grasp_height_m);
-                tracing::info!("Grasp {}: object top {h:.3} m above the table (scale), closing at {close_h:.3} m", self.id);
+                tracing::info!("Grasp {}: object top {h:.3} m above the table ({source}), closing at {close_h:.3} m", self.id);
                 self.sup.inner().write().await.update_action(self.id, |a| {
-                    a.height_source = Some("scale".into());
+                    a.height_source = Some(source.into());
                     a.object_height_m = Some(h as f32);
                 });
             }
@@ -1602,24 +1623,66 @@ impl Orchestrator {
         }
     }
 
-    /// Height probe: from the centred pose `c.pose` move straight up by `height_probe_m`, take
-    /// `median_frames` fresh matched frames, and return to `c.pose`. The median box size
-    /// s = sqrt(w·h) (px) of the centring frames (s_low) and of the raised frames (s_high) give
-    /// the lens-to-top distance at the start pose D_low = dz · s_high / (s_low − s_high)
-    /// ([`scale_height`]); top height = lens z − D_low − `table_z_m`. Moving up keeps the jaws
-    /// away from an object whose height is not known yet. `Ok(Ok(h))` on success; `Ok(Err(reason))`
-    /// when the probe was skipped or its result is unreliable (the grasp goes on with
-    /// `grasp_height_m`); OBJECT_TOO_TALL when h >= `approach_height_m` − 0.02.
-    async fn probe_height(&self, c: &Centred, label: &str, after: &mut Option<u64>) -> Result<Result<f64, String>, Stop> {
+    /// Height probe after the centring (`height_probe_mode`): `Ok(Ok((h, source)))` with the
+    /// object's top h above the table and `source` `scale` (up probe) or `parallax` (lateral
+    /// probe); `Ok(Err(reason))` when the probe was skipped or its result is unreliable (the
+    /// grasp goes on with `grasp_height_m`); OBJECT_TOO_TALL when h >= `approach_height_m` − 0.02.
+    /// Both modes need the optical axis within 5 deg of vertical and the lens centre; the
+    /// lateral probe gives way to the up probe (`lateral_fallback:<why>` in `height_reason`)
+    /// when the shifted box would reach the image border, a lateral pose is unreachable, or the
+    /// target was cut off or lost at a lateral pose.
+    async fn probe_height(&self, c: &Centred, label: &str, after: &mut Option<u64>) -> Result<Result<(f64, &'static str), String>, Stop> {
         let s = &self.setup;
         let skip = |r: &str| Ok(Err(r.to_string()));
         if s.height_probe_m <= 0.0 { return skip("disabled"); }
         if !self.lens_known { return skip("no_lens_centre"); }
-        let pose = c.pose;
-        if kinematics::column(&self.cam.rotation(&pose), 2)[2] > -(5f64.to_radians().cos()) { return skip("camera_not_vertical"); }
+        if kinematics::column(&self.cam.rotation(&c.pose), 2)[2] > -(5f64.to_radians().cos()) { return skip("camera_not_vertical"); }
         if c.frames.iter().any(|d| touches_border(&d.box_norm, self.cam.size)) { return skip("border"); }
         let centre_px = self.cam.to_px(box_centre(&c.last.box_norm));
-        let Some(est) = self.cam.plane_point(&pose, centre_px, grasp_plane(s)) else { return skip("ray"); };
+        let Some(est) = self.cam.plane_point(&c.pose, centre_px, grasp_plane(s)) else { return skip("ray"); };
+        let mut fallback = None;
+        if s.height_probe_mode == HeightProbeMode::Lateral {
+            match self.probe_lateral(c, &est, label, after).await? {
+                Lateral::Done(r) => return Ok(match r { Ok(h) => self.accept_height(h)?.map(|h| (h, "parallax")), Err(e) => Err(e) }),
+                Lateral::Fallback(why) => {
+                    tracing::info!("Grasp {}: lateral height probe falls back to up ({why})", self.id);
+                    fallback = Some(format!("lateral_fallback:{why}"));
+                }
+            }
+        }
+        let up = match self.probe_up(c, &est, label, after).await? { Ok(h) => self.accept_height(h)?, Err(e) => Err(e) };
+        Ok(match (up, fallback) {
+            (Ok(h), Some(f)) => {
+                self.sup.inner().write().await.update_action(self.id, |a| a.height_reason = Some(f));
+                Ok((h, "scale"))
+            }
+            (Ok(h), None) => Ok((h, "scale")),
+            (Err(e), Some(f)) => Err(format!("{f},{e}")),
+            (Err(e), None) => Err(e),
+        })
+    }
+
+    /// The acceptance rules shared by both probe modes: finite, not below the table, and
+    /// OBJECT_TOO_TALL when h >= `approach_height_m` − 0.02.
+    fn accept_height(&self, h: f64) -> Result<Result<f64, String>, Stop> {
+        let s = &self.setup;
+        if !h.is_finite() { return Ok(Err("not_finite".into())); }
+        if h < 0.0 { return Ok(Err(format!("below_table:{h:.3}"))); }
+        if h >= s.approach_height_m - 0.02 {
+            return Err(fail("OBJECT_TOO_TALL", format!("Object top {h:.3} m above the table, approach_height_m {:.3} m leaves less than 0.02 m", s.approach_height_m)));
+        }
+        Ok(Ok(h))
+    }
+
+    /// Up probe: from the centred pose `c.pose` move straight up by `height_probe_m`, take
+    /// `median_frames` fresh matched frames, and return to `c.pose`. The median box size
+    /// s = sqrt(w·h) (px) of the centring frames (s_low) and of the raised frames (s_high) give
+    /// the lens-to-top distance at the start pose D_low = dz · s_high / (s_low − s_high)
+    /// ([`scale_height`]); top height = lens z − D_low − `table_z_m` (not yet accepted). Moving
+    /// up keeps the jaws away from an object whose height is not known yet.
+    async fn probe_up(&self, c: &Centred, est: &Vec3, label: &str, after: &mut Option<u64>) -> Result<Result<f64, String>, Stop> {
+        let s = &self.setup;
+        let pose = c.pose;
         let size = |d: &Detection| (((d.box_norm[2] - d.box_norm[0]) * self.cam.size[0]) * ((d.box_norm[3] - d.box_norm[1]) * self.cam.size[1])).sqrt();
         let low: Vec<f64> = c.frames.iter().map(size).collect();
         self.phase("probe", 0.45).await?;
@@ -1638,11 +1701,11 @@ impl Orchestrator {
                 Err(e) => return Err(e),
             }
         }
-        let Some((done, dz)) = moved else { return skip("probe_unreachable"); };
-        self.sup.inner().write().await.update_action(self.id, |a| a.probe_dz_m = Some(dz as f32));
+        let Some((done, dz)) = moved else { return Ok(Err("probe_unreachable".into())); };
+        self.sup.inner().write().await.update_action(self.id, |a| { a.probe_dz_m = Some(dz as f32); a.probe_mode = Some("up".into()); });
         let now = self.pose().await;
         let mut tracker = Tracker { label: label.to_string(), predicted: c.last.box_norm, gate_px: s.acquire_dist_px };
-        if let Some(p) = self.cam.project(&now, &est) { tracker.predict_at(self.cam.to_norm(p)); }
+        if let Some(p) = self.cam.project(&now, est) { tracker.predict_at(self.cam.to_norm(p)); }
         let mut high = Vec::new();
         let mut reason = None;
         while high.len() < s.median_frames as usize {
@@ -1660,16 +1723,113 @@ impl Orchestrator {
         self.move_arm("probe", GoalSpec::Absolute { p: pose.p, r: Some(pose.r) }, s.approach_speed_mps).await?;
         if let Some(r) = reason { return Ok(Err(r)); }
         let (z_low, z_high) = (self.cam.origin(&pose)[2], self.cam.origin(&now)[2]);
-        let h = match scale_height(&low, &high, z_high - z_low) {
-            Ok(d_low) => z_low - d_low - s.table_z_m,
-            Err(reason) => return Ok(Err(reason)),
-        };
-        if !h.is_finite() { return skip("not_finite"); }
-        if h < 0.0 { return Ok(Err(format!("below_table:{h:.3}"))); }
-        if h >= s.approach_height_m - 0.02 {
-            return Err(fail("OBJECT_TOO_TALL", format!("Object top {h:.3} m above the table, approach_height_m {:.3} m leaves less than 0.02 m", s.approach_height_m)));
+        Ok(scale_height(&low, &high, z_high - z_low).map(|d_low| z_low - d_low - s.table_z_m))
+    }
+
+    /// Lateral probe: from the centred pose `c.pose` move horizontally (orientation kept) to
+    /// −B/2 and then +B/2 along the base-frame direction of the image x axis (B =
+    /// `lateral_probe_m`), take `median_frames` fresh matched frames at each pose, and return to
+    /// `c.pose`. Before moving: [`Lateral::Fallback`] `border` when the box shifted by the
+    /// predicted parallax fx · B/2 / D0 (D0 = lens height above the grasp plane) comes within
+    /// 2 px of the image border at either pose, `unreachable` when either pose fails the table
+    /// clearance or the planner (IK, workspace), `edge` when no box feature is on the top face at
+    /// both predicted (or, after the moves, seen) poses ([`top_face_u`]). The distance D = fx · B_meas / |du|
+    /// ([`parallax_distance`]) uses the median u of a top-face feature at each pose
+    /// ([`top_face_u`]: box centre or outer edge) and B_meas, the image-x
+    /// component of the lens displacement between the poses from FK of the measured joints;
+    /// top height = mean measured lens z − D − `table_z_m` (not yet accepted).
+    async fn probe_lateral(&self, c: &Centred, est: &Vec3, label: &str, after: &mut Option<u64>) -> Result<Lateral, Stop> {
+        let s = &self.setup;
+        let pose = c.pose;
+        let x_cam = kinematics::column(&self.cam.rotation(&pose), 0);
+        let n = x_cam[0].hypot(x_cam[1]);
+        // within 5 deg of a vertical optical axis the image x axis is nearly horizontal
+        if n < 0.5 { return Ok(Lateral::Fallback("direction")); }
+        let half = s.lateral_probe_m / 2.0;
+        let at = |k: f64| Pose::new(pose.r, [pose.p[0] + k * half * x_cam[0] / n, pose.p[1] + k * half * x_cam[1] / n, pose.p[2]]);
+        let (neg, pos) = (at(-1.0), at(1.0));
+        // predicted shift: a point at D0 moves by −fx · dx / D0 when the camera moves dx along x_cam
+        let d0 = self.cam.origin(&pose)[2] - grasp_plane(s);
+        if d0.is_nan() || d0 <= 0.01 { return Ok(Lateral::Fallback("border")); }
+        let shift_norm = self.cam.fx * half * n / d0 / self.cam.size[0];
+        let shifted = |b: &[f64; 4], du: f64| [b[0] + du, b[1], b[2] + du, b[3]];
+        if c.frames.iter().any(|d| [shift_norm, -shift_norm].iter().any(|du| touches_border(&shifted(&d.box_norm, *du), self.cam.size))) {
+            return Ok(Lateral::Fallback("border"));
         }
-        Ok(Ok(h))
+        // a box feature on the object's top face at both predicted poses
+        let px = |b: [f64; 4]| [b[0] * self.cam.size[0], b[1] * self.cam.size[1], b[2] * self.cam.size[0], b[3] * self.cam.size[1]];
+        let predicted = |du: f64| c.frames.iter().map(|d| px(shifted(&d.box_norm, du))).collect::<Vec<_>>();
+        if top_face_u(&predicted(shift_norm), &predicted(-shift_norm), self.cam.cx).is_none() { return Ok(Lateral::Fallback("edge")); }
+        if [(&pose, &neg), (&neg, &pos), (&pos, &pose)].iter().any(|(a, b)| table_violation(a, b, &self.envelope, s.table_z_m).is_some()) {
+            return Ok(Lateral::Fallback("unreachable"));
+        }
+        {
+            let mut input = self.sup.inner().read().await.plan_input().map_err(crate::macro_action::arm_fail)?;
+            let speed = Speed { linear: s.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS };
+            for goal in [neg, pos] {
+                match motion::plan_cartesian(&input, goal, speed) {
+                    Ok(path) => { let q = path.last(); input.q0 = std::array::from_fn(|i| f64::from(q[i])); }
+                    Err(_) => return Ok(Lateral::Fallback("unreachable")),
+                }
+            }
+        }
+        self.phase("probe", 0.45).await?;
+        // per pose: boxes (px), measured lens centres, measured camera rotation
+        let mut sides: Vec<(Vec<[f64; 4]>, Vec<Vec3>, Mat3)> = Vec::new();
+        let mut reason = None;
+        let mut moved = false;
+        'poses: for goal in [neg, pos] {
+            let done = match self.move_arm("probe", GoalSpec::Absolute { p: goal.p, r: Some(goal.r) }, s.approach_speed_mps).await {
+                Ok(d) => d,
+                // rejected by the planner before anything was installed
+                Err(Stop::Fail(code, _)) if code.starts_with("IK_") || code == "WORKSPACE_VIOLATION" => { reason = Some("unreachable"); break; }
+                Err(e) => return Err(e),
+            };
+            if !moved {
+                moved = true;
+                self.sup.inner().write().await.update_action(self.id, |a| a.probe_mode = Some("lateral".into()));
+            }
+            let mut tracker = Tracker { label: label.to_string(), predicted: c.last.box_norm, gate_px: s.acquire_dist_px };
+            if let Some(p) = self.cam.project(&goal, est) { tracker.predict_at(self.cam.to_norm(p)); }
+            let (mut boxes, mut lens, mut rot) = (Vec::new(), Vec::new(), None);
+            while boxes.len() < s.median_frames as usize {
+                let d = match self.fresh_match(&tracker, done.at, after).await {
+                    Ok(d) => d,
+                    Err(Stop::Fail(code, _)) if code == "TARGET_LOST" => { reason = Some("target_lost"); break 'poses; }
+                    Err(e) => return Err(e),
+                };
+                if touches_border(&d.box_norm, self.cam.size) { reason = Some("border"); break 'poses; }
+                tracker.gate_px = s.match_dist_px;
+                tracker.predicted = d.box_norm;
+                boxes.push(px(d.box_norm));
+                let meas = {
+                    let inner = self.sup.inner().read().await;
+                    inner.config.arm_model.fk_f32(&inner.measured_positions)
+                };
+                let meas = meas.unwrap_or(goal);
+                lens.push(self.cam.origin(&meas));
+                rot.get_or_insert(self.cam.rotation(&meas));
+            }
+            sides.push((boxes, lens, rot.unwrap_or_else(|| self.cam.rotation(&goal))));
+        }
+        // back to the start pose: the later steps start from it
+        if moved { self.move_arm("probe", GoalSpec::Absolute { p: pose.p, r: Some(pose.r) }, s.approach_speed_mps).await?; }
+        if let Some(r) = reason { return Ok(Lateral::Fallback(r)); }
+        let mean = |v: &[Vec3]| { let k = v.len().max(1) as f64; v.iter().fold([0.0; 3], |a, p| kinematics::add(&a, p)).map(|x| x / k) };
+        let (l_neg, l_pos) = (mean(&sides[0].1), mean(&sides[1].1));
+        let x_meas = kinematics::column(&sides[0].2, 0);
+        let b_meas = kinematics::dot(&kinematics::sub(&l_pos, &l_neg), &x_meas);
+        // commanded: the image-x component of the commanded lens displacement (B · n)
+        let b_cmd = kinematics::dot(&kinematics::sub(&self.cam.origin(&pos), &self.cam.origin(&neg)), &x_cam);
+        self.sup.inner().write().await.update_action(self.id, |a| {
+            a.lateral_baseline_m = Some(b_meas as f32);
+            a.lateral_baseline_err_mm = Some(((b_meas - b_cmd) * 1000.0) as f32);
+        });
+        tracing::info!("Grasp {}: lateral probe baseline {:.4} m measured, {:.4} m commanded", self.id, b_meas, b_cmd);
+        let z = (l_neg[2] + l_pos[2]) / 2.0;
+        let Some((u_neg, u_pos, feature)) = top_face_u(&sides[0].0, &sides[1].0, self.cam.cx) else { return Ok(Lateral::Fallback("edge")); };
+        tracing::info!("Grasp {}: lateral probe parallax of the box {feature}", self.id);
+        Ok(Lateral::Done(parallax_distance(&u_neg, &u_pos, self.cam.fx, b_meas).map(|d| z - d - s.table_z_m)))
     }
 
     /// Look-down mid-height re-centre: descend to `recentre_height_m`, then centre the target
@@ -1799,6 +1959,12 @@ impl Orchestrator {
     }
 }
 
+/// Lateral probe outcome: a height estimate (or why it is unreliable), or why the up probe runs instead.
+enum Lateral {
+    Done(Result<f64, String>),
+    Fallback(&'static str),
+}
+
 /// Matched frames of the last centring pose.
 struct Centred {
     last: Detection,
@@ -1829,6 +1995,53 @@ pub const HEIGHT_PROBE_TOL_M: f64 = 0.01;
 
 /// Shorter upward probe tried when the `height_probe_m` pose is unreachable or outside the workspace.
 pub const PROBE_FALLBACK_DZ_M: f64 = 0.06;
+
+/// u (px) of a box feature that lies on the object's top face at both lateral-probe poses,
+/// from the boxes [x0, y0, x1, y1] (px) at the −B/2 (`neg`) and +B/2 (`pos`) poses and the
+/// principal point `cx`, with the feature's name. Looking down, the box edge on the far side of
+/// `cx` is the top face's (a closer point projects farther from the principal point); an edge
+/// on the near side of `cx` is the bottom of the far side face. So: the centre when every box
+/// straddles `cx` (both edges on the top face), else the left edge when it is left of `cx` in
+/// every box, else the right edge when it is right of `cx` in every box; None otherwise. With the
+/// centre of a box seen off-centre the parallax measures a depth between top and bottom (MuJoCo
+/// `axis_cube_lateral`, 0.04 m cube at u 0.3: 0.023 m from the centre).
+pub fn top_face_u(neg: &[[f64; 4]], pos: &[[f64; 4]], cx: f64) -> Option<(Vec<f64>, Vec<f64>, &'static str)> {
+    let all = || neg.iter().chain(pos);
+    let pick = |f: fn(&[f64; 4]) -> f64| (neg.iter().map(f).collect(), pos.iter().map(f).collect());
+    if all().all(|b| b[0] <= cx && b[2] >= cx) {
+        let (n, p) = pick(|b| (b[0] + b[2]) / 2.0);
+        return Some((n, p, "centre"));
+    }
+    if all().all(|b| b[0] <= cx) { let (n, p) = pick(|b| b[0]); return Some((n, p, "left edge")); }
+    if all().all(|b| b[2] >= cx) { let (n, p) = pick(|b| b[2]); return Some((n, p, "right edge")); }
+    None
+}
+
+/// Smallest box-centre shift (px) between the two lateral-probe poses the parallax estimate accepts.
+pub const LATERAL_MIN_SHIFT_PX: f64 = 5.0;
+
+/// Lens-to-top distance from the box-centre u (px) at the −B/2 pose (`u_neg`) and the +B/2
+/// pose (`u_pos`) of the lateral probe ([`top_face_u`]) and the measured baseline along the image x axis
+/// `baseline_m`: D = fx · |B| / |du|, du = median(u_pos) − median(u_neg). Err (fallback reason)
+/// when |B| < 1 mm, |du| < [`LATERAL_MIN_SHIFT_PX`], or the frames' centre spread (half range
+/// e of each set) makes D uncertain by more than [`HEIGHT_PROBE_TOL_M`]:
+/// dD = D / |du| · √(e_neg² + e_pos²).
+pub fn parallax_distance(u_neg: &[f64], u_pos: &[f64], fx: f64, baseline_m: f64) -> Result<f64, String> {
+    let stats = |v: &[f64]| -> Option<(f64, f64)> {
+        if v.is_empty() { return None; }
+        let (lo, hi) = v.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), x| (a.min(*x), b.max(*x)));
+        Some((median(&mut v.to_vec()), (hi - lo) / 2.0))
+    };
+    let (Some((m_neg, e1)), Some((m_pos, e2))) = (stats(u_neg), stats(u_pos)) else { return Err("no_frames".into()); };
+    let b = baseline_m.abs();
+    if b.is_nan() || b < 1e-3 { return Err(format!("parallax_baseline:{baseline_m:.4}")); }
+    let du = (m_pos - m_neg).abs();
+    if du.is_nan() || du < LATERAL_MIN_SHIFT_PX { return Err(format!("parallax_shift:{du:.1}")); }
+    let d = fx * b / du;
+    let unc = d / du * e1.hypot(e2);
+    if unc.is_nan() || unc > HEIGHT_PROBE_TOL_M { return Err(format!("parallax_noise:{unc:.3}")); }
+    Ok(d)
+}
 
 /// Lens-to-top distance at the low pose from box sizes (px) there (`low`) and after moving
 /// `dz` farther away (`high`): with r = s_low / s_high (medians), D_low = dz · s_high /
@@ -2136,6 +2349,41 @@ mod tests {
         assert!(scale_height(&[s_low], &[s_low / 1.01], 0.04).unwrap_err().starts_with("scale_change:"));
     }
 
+    #[test]
+    fn parallax_distance_and_its_noise_gate() {
+        // lens 0.13 m above the top, 0.04 m baseline, fx 600: the centre moves by 600 · 0.04 / 0.13 px
+        let du = 600.0 * 0.04 / 0.13;
+        let (un, up) = (320.0 + du / 2.0, 320.0 - du / 2.0);
+        let d = parallax_distance(&[un; 3], &[up; 3], 600.0, 0.04).unwrap();
+        assert!((d - 0.13).abs() < 1e-9, "{d}");
+        // either direction of the shift and of the baseline gives the same distance
+        assert!((parallax_distance(&[up; 3], &[un; 3], 600.0, -0.04).unwrap() - 0.13).abs() < 1e-9);
+        // 3 px centre jitter: dD = 0.13 / 185 · √(3² + 3²) ≈ 3 mm, accepted
+        assert!(parallax_distance(&[un - 3.0, un, un + 3.0], &[up + 3.0, up, up - 3.0], 600.0, 0.04).is_ok());
+        // 10 px jitter on a 1 cm baseline (46 px shift): dD ≈ 40 mm, rejected
+        let du1 = 600.0 * 0.01 / 0.13;
+        let e = parallax_distance(&[320.0 + du1 / 2.0 - 10.0, 320.0 + du1 / 2.0 + 10.0], &[320.0 - du1 / 2.0 - 10.0, 320.0 - du1 / 2.0 + 10.0], 600.0, 0.01).unwrap_err();
+        assert!(e.starts_with("parallax_noise:"), "{e}");
+        assert!(parallax_distance(&[320.0], &[318.0], 600.0, 0.04).unwrap_err().starts_with("parallax_shift:"));
+        assert!(parallax_distance(&[un], &[up], 600.0, 0.0005).unwrap_err().starts_with("parallax_baseline:"));
+        assert_eq!(parallax_distance(&[], &[up], 600.0, 0.04).unwrap_err(), "no_frames");
+    }
+
+    #[test]
+    fn top_face_feature_for_the_parallax() {
+        let cx = 320.0;
+        // straddling the principal point at both poses: the centre
+        let (n, p, f) = top_face_u(&[[250.0, 0.0, 410.0, 1.0]], &[[200.0, 0.0, 360.0, 1.0]], cx).unwrap();
+        assert_eq!((n, p, f), (vec![330.0], vec![280.0], "centre"));
+        // left of it at one pose: the left edge (top face) in both
+        let (n, p, f) = top_face_u(&[[200.0, 0.0, 330.0, 1.0]], &[[100.0, 0.0, 250.0, 1.0]], cx).unwrap();
+        assert_eq!((n, p, f), (vec![200.0], vec![100.0], "left edge"));
+        let (n, p, f) = top_face_u(&[[400.0, 0.0, 500.0, 1.0]], &[[300.0, 0.0, 420.0, 1.0]], cx).unwrap();
+        assert_eq!((n, p, f), (vec![500.0], vec![420.0], "right edge"));
+        // entirely right at one pose and entirely left at the other: no common top-face edge
+        assert!(top_face_u(&[[330.0, 0.0, 380.0, 1.0]], &[[250.0, 0.0, 300.0, 1.0]], cx).is_none());
+    }
+
     /// The former downward probe's estimator (lens-to-top distance at the start pose from the
     /// start sizes and the sizes `dz` closer), kept here only for the comparison below.
     fn down_probe_distance(start: &[f64], near: &[f64], dz: f64) -> f64 {
@@ -2269,6 +2517,12 @@ mod tests {
         let d = GraspSetup::default();
         assert_eq!(serde_json::to_value(&d).unwrap()["acquire_camera_down"], "auto");
         assert_eq!(d.patched(&serde_json::json!({"acquire_camera_down": "on"})).unwrap().acquire_camera_down, AcquireCameraDown::On);
+        assert_eq!((d.height_probe_mode, d.lateral_probe_m), (HeightProbeMode::Up, 0.04));
+        assert_eq!(d.patched(&serde_json::json!({"height_probe_mode": "lateral"})).unwrap().height_probe_mode, HeightProbeMode::Lateral);
+        assert!(d.patched(&serde_json::json!({"height_probe_mode": "sideways"})).is_err());
+        for (b, ok) in [(0.009, false), (0.01, true), (0.08, true), (0.081, false)] {
+            assert_eq!(d.patched(&serde_json::json!({"lateral_probe_m": b})).is_ok(), ok, "{b}");
+        }
         assert!(d.patched(&serde_json::json!({"recheck_tol_px": 0.0})).is_err() && d.patched(&serde_json::json!({"recheck_tol_px": 501.0})).is_err());
         assert_eq!(d.patched(&serde_json::json!({"recheck_tol_px": 25.0})).unwrap().recheck_tol_px, 25.0);
         for bad in [serde_json::json!("yes"), serde_json::json!(true), serde_json::json!(1)] {
