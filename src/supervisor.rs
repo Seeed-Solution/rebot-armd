@@ -95,6 +95,15 @@ pub const WATCHDOG_PARK_MARGIN: Duration = Duration::from_secs(3);
 pub const WATCHDOG_PARK_SETTLE_GRACE: Duration = Duration::from_secs(5);
 /// Time the arm must stay at the resting pose before an unload cuts torque.
 pub const UNLOAD_SETTLE_HOLD: Duration = Duration::from_millis(800);
+/// Park with an object in the gripper: at the resting pose J7 opens this far past the contact
+/// point (rad, about a third of the B601-DM stroke) to drop it, then closes.
+pub const PARK_RELEASE_OPEN_RAD: f32 = 2.0;
+/// J7 speed of the park release (rad/s), as macro gripper moves.
+pub const PARK_RELEASE_SPEED: f64 = 1.0;
+
+/// Gripper release at the end of a park that carried an object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkRelease { Opening, Closing }
 /// Stationary evidence over the settle hold window, per joint: max - min measured
 /// position (rad). 4 mrad in 0.8 s bounds the average speed at 0.005 rad/s.
 pub const UNLOAD_STILL_POSITION_SPAN_RAD: f32 = 0.004;
@@ -231,6 +240,13 @@ pub struct SupervisorInner {
     pub gripper_high_torque_ticks: u32,
     pub gripper_low_torque_ticks: u32,
     pub gripper_stall_sign: f32,
+    /// J7 freeze during a whole-arm reference (joint quintic, path, replay): (hold, closing sign).
+    /// Set once J7 stalls or an object is held; the reference may not drive J7 further in the
+    /// stall direction until it ends or moves J7 the other way.
+    pub gripper_motion_hold: Option<(f32, f32)>,
+    /// A park carried an object (J7 frozen short of closed): release it at the resting pose.
+    pub park_gripper_contact: bool,
+    pub park_release: Option<ParkRelease>,
     pub pending_normal_unload: bool,
     pub unload_settle: Option<UnloadSettle>,
     /// Set while a park started by the lease watchdog is running.
@@ -293,6 +309,10 @@ pub struct SupervisorInner {
     pub mock_gripper_stall_offset: Option<f32>,
     /// The mock follower set torques[6] for a simulated stall (cleared when the stall ends).
     pub mock_gripper_stall_torque: bool,
+    /// Simulation only (no driver): an object in the jaw at this J7 position, blocking every
+    /// reference (not only gripper moves); `true` once touched. It falls out when the jaw
+    /// opens 0.5 rad past it after contact.
+    pub mock_gripper_object: Option<(f32, bool)>,
     /// Running zero check parameters (id, store_offset, threshold_rad, base_closed_rad).
     pub zero_check_params: Option<ZeroCheckParams>,
 }
@@ -400,6 +420,9 @@ impl SupervisorInner {
             gripper_high_torque_ticks: 0,
             gripper_low_torque_ticks: 0,
             gripper_stall_sign: 1.0,
+            gripper_motion_hold: None,
+            park_gripper_contact: false,
+            park_release: None,
             pending_normal_unload: false,
             unload_settle: None,
             watchdog_park: None,
@@ -438,6 +461,7 @@ impl SupervisorInner {
             last_zero_check_offset: None,
             mock_gripper_stall_offset,
             mock_gripper_stall_torque: false,
+            mock_gripper_object: None,
             zero_check_params: None,
         }
     }
@@ -1183,6 +1207,8 @@ impl SupervisorInner {
                         self.target_positions = home;
                         self.pending_normal_unload = true;
                         self.unload_settle = None;
+                        self.park_gripper_contact = false;
+                        self.park_release = None;
                         let now = Instant::now();
                         self.last_heartbeat = now;
                         self.last_motion_frame = now;
@@ -2488,7 +2514,7 @@ impl SupervisorInner {
                 self.active_trajectory = None;
                 self.commanded_velocities.fill(0.0);
                 self.target_positions = self.commanded_positions.clone();
-                self.safety.mark_motion_finished();
+                if !self.pending_normal_unload { self.safety.mark_motion_finished(); }
                 if macro_sub {
                     if let Some(m) = self.macro_run.as_mut() {
                         m.sub = SubState::Done(SubDone { settled, holding, gripper_gap_rad, at: Instant::now() });
@@ -2507,7 +2533,7 @@ impl SupervisorInner {
                 }
                 self.commanded_velocities.fill(0.0);
                 self.target_positions = self.commanded_positions.clone();
-                self.safety.mark_motion_finished();
+                if !self.pending_normal_unload { self.safety.mark_motion_finished(); }
                 if macro_sub {
                     if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Failed { code: code.into(), message }; }
                 } else if let Some(id) = action_id { self.finish_action(id, "failed", Some(code), Some(message), None, None, None); }
@@ -2640,6 +2666,88 @@ impl SupervisorInner {
         self.safety.trigger_fault_coded(FaultCode::ServoNoBrake, reason);
     }
 
+    /// J7 stall freeze for whole-arm references. A joint quintic (park, home, presets), path or
+    /// replay writes all seven joints each tick; without this a J7 target past an object in the
+    /// jaw is driven at full motor torque (the stall latch alone is overwritten next tick, and
+    /// re-arms after the torque drops, squeezing in steps). Once J7 is stalled, or an object is
+    /// held, J7 stays at the hold point while the reference pushes further in the stall
+    /// direction; a reference moving J7 the other way ends the freeze.
+    fn gripper_hold_filter(&mut self, positions: &mut [f32], velocities: &mut [f32]) {
+        if self.config.dof < 7 || positions.len() < 7 || self.commanded_positions.len() < 7 { return; }
+        if self.gripper_motion_hold.is_none() {
+            let close_sign = self.config.gripper_policy.as_ref()
+                .map_or(1.0, |p| if p.closed_rad >= p.open_rad { 1.0 } else { -1.0 });
+            if self.gripper_stalled {
+                self.gripper_motion_hold = Some((self.commanded_positions[6], self.gripper_stall_sign));
+            } else if self.held.is_some() {
+                self.gripper_motion_hold = Some((self.commanded_positions[6], close_sign));
+            }
+        }
+        let Some((hold, sign)) = self.gripper_motion_hold else { return; };
+        let push = (positions[6] - hold) * sign;
+        if push > 0.0 {
+            positions[6] = hold;
+            if velocities.len() > 6 { velocities[6] = 0.0; }
+        } else if push < -1e-3 {
+            self.gripper_motion_hold = None;
+            return;
+        }
+        if self.pending_normal_unload {
+            // a hold at the jaw's own closed stop is not an object
+            let gap = self.config.gripper_policy.as_ref().map_or(f32::INFINITY, |p| (hold - p.closed_rad).abs() - p.holding_gap_rad);
+            if gap >= 0.0 && !self.park_gripper_contact {
+                tracing::info!("Park: J7 held at {hold:.3} rad (object in the jaw); releasing it at the resting pose");
+                self.park_gripper_contact = true;
+            }
+        }
+    }
+
+    /// Release step of a park that carried an object, run once the park trajectory ends:
+    /// open [`PARK_RELEASE_OPEN_RAD`] past the contact, then close (stall-protected gripper
+    /// moves), then the unload settle. Returns true while the release owns the tick.
+    fn step_park_release(&mut self) -> bool {
+        let next = match self.park_release {
+            None if self.park_gripper_contact => ParkRelease::Opening,
+            Some(ParkRelease::Opening) => ParkRelease::Closing,
+            Some(ParkRelease::Closing) => {
+                self.park_release = None;
+                self.park_gripper_contact = false;
+                return false;
+            }
+            None => return false,
+        };
+        let Some(policy) = self.config.gripper_policy.clone().filter(|_| self.config.dof >= 7) else {
+            self.park_gripper_contact = false;
+            return false;
+        };
+        let (command, fraction) = match next {
+            ParkRelease::Opening => {
+                let open_sign = if policy.open_rad >= policy.closed_rad { 1.0 } else { -1.0 };
+                let target = self.commanded_positions[6] + open_sign * PARK_RELEASE_OPEN_RAD;
+                let span = policy.open_rad - policy.closed_rad;
+                let f = if span.abs() > 1e-6 { ((target - policy.closed_rad) / span).clamp(0.0, 1.0) } else { 1.0 };
+                (GripperCommand::Move, Some(f64::from(f)))
+            }
+            ParkRelease::Closing => (GripperCommand::Close, None),
+        };
+        let request = GripperRequest { command, fraction, grasp: false, speed: PARK_RELEASE_SPEED, timeout_s: None, tag: None };
+        // the stall latch of the carry would block the opening move's first ticks otherwise
+        self.gripper_stalled = false;
+        self.gripper_high_torque_ticks = 0;
+        self.gripper_low_torque_ticks = 0;
+        self.gripper_motion_hold = None;
+        if next == ParkRelease::Opening { self.releasing = true; }
+        let motion = GripperMotion::new(request, policy, self.config.limits[6].clone(), self.commanded_positions[6]);
+        let duration = motion.expected_duration();
+        tracing::info!("Park release: {} J7 {:.3} -> {:.3} rad", if next == ParkRelease::Opening { "opening" } else { "closing" },
+            self.commanded_positions[6], motion.target);
+        if let Some(park) = self.watchdog_park.as_mut() { park.budget_s += motion.timeout_s.max(duration); }
+        self.target_positions[6] = motion.target;
+        self.active_trajectory = Some(ActiveTrajectory { action_id: None, reference: Reference::Gripper(motion) });
+        self.park_release = Some(next);
+        true
+    }
+
     /// One control tick of the unload settle: the static resting-pose conditions must hold
     /// continuously for [`UNLOAD_SETTLE_HOLD`] and the arm must be stationary over that
     /// window ([`Self::unload_still_violation`]); then torque is cut. A settle pending past
@@ -2684,9 +2792,12 @@ impl SupervisorInner {
             tracing::warn!("Unload settle pending for {:.1} s: {blocker}", settle.pending_s);
             settle.last_report_s = Some(settle.pending_s);
         }
-        // Not yet stably at rest: hold the home target.
-        self.commanded_positions = self.config.home_positions.clone();
-        self.target_positions = self.config.home_positions.clone();
+        // Not yet stably at rest: hold the home target. J7 keeps its command: driving it to the
+        // home value would squeeze anything still in the jaw at full motor torque.
+        let mut home = self.config.home_positions.clone();
+        if home.len() > 6 && self.commanded_positions.len() > 6 { home[6] = self.commanded_positions[6]; }
+        self.commanded_positions = home.clone();
+        self.target_positions = home;
         self.commanded_velocities = vec![0.0; self.config.dof];
         self.unload_settle = Some(settle);
     }
@@ -2998,10 +3109,14 @@ impl SupervisorInner {
         let mut reference_stepped = false;
 
         // 3. Step trajectory if active, or step servo target
+        if self.active_trajectory.is_none() && !self.pending_normal_unload { self.gripper_motion_hold = None; }
+        if !self.pending_normal_unload { self.park_gripper_contact = false; self.park_release = None; }
         if self.pending_normal_unload {
             self.last_heartbeat = Instant::now();
         }
-        enum Stepped { Quintic(crate::trajectory::TrajectoryPoint, bool, f32), Action(StepOut), Replay(StepOut, &'static str, f64) }
+        // Action: the gripper reference (its own stall handling); Arm / Replay / Quintic move
+        // J7 as part of a whole-arm reference and pass the J7 stall freeze.
+        enum Stepped { Quintic(crate::trajectory::TrajectoryPoint, bool, f32), Action(StepOut), Arm(StepOut), Replay(StepOut, &'static str, f64) }
         let time_scale = self.motion_time_scale();
         let stepped = if let Some(active) = self.active_trajectory.as_mut() {
             let ctx = StepCtx {
@@ -3022,7 +3137,7 @@ impl SupervisorInner {
                     if time_scale < 1.0 { for v in point.velocities.iter_mut() { *v *= time_scale as f32; } }
                     Stepped::Quintic(point, traj.is_finished(), (traj.elapsed / traj.duration).min(1.0) as f32)
                 }
-                Reference::Path(path) => Stepped::Action(path.step(&ctx)),
+                Reference::Path(path) => Stepped::Arm(path.step(&ctx)),
                 Reference::Gripper(grip) => Stepped::Action(grip.step(&ctx)),
                 Reference::Replay(replay) => {
                     let out = replay.step(&ctx);
@@ -3037,8 +3152,14 @@ impl SupervisorInner {
                 reference_stepped = true;
                 self.apply_action_step(action_id, out);
             }
-            Some((action_id, Stepped::Replay(out, phase, t_s))) => {
+            Some((action_id, Stepped::Arm(mut out))) => {
                 reference_stepped = true;
+                self.gripper_hold_filter(&mut out.positions, &mut out.velocities);
+                self.apply_action_step(action_id, out);
+            }
+            Some((action_id, Stepped::Replay(mut out, phase, t_s))) => {
+                reference_stepped = true;
+                self.gripper_hold_filter(&mut out.positions, &mut out.velocities);
                 if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
                     if a.id == id && a.is_running() {
                         a.phase = Some(phase.into());
@@ -3047,8 +3168,9 @@ impl SupervisorInner {
                 }
                 self.apply_action_step(action_id, out);
             }
-            Some((action_id, Stepped::Quintic(point, finished, progress))) => {
+            Some((action_id, Stepped::Quintic(mut point, finished, progress))) => {
                 reference_stepped = true;
+                self.gripper_hold_filter(&mut point.positions, &mut point.velocities);
                 self.commanded_positions = point.positions;
                 self.commanded_velocities = point.velocities;
                 if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
@@ -3067,7 +3189,7 @@ impl SupervisorInner {
 
         // 3.1 Handle pending normal unload settling phase
         if self.pending_normal_unload && self.active_trajectory.is_none() {
-            self.step_unload_settle(servo_dt);
+            if !self.step_park_release() { self.step_unload_settle(servo_dt); }
         } else if let Some(ref target) = self.servo_target.clone() {
             // Check continuous motion frame timeout:
             // If > 200ms without a new pose frame, clear servo_target to begin controlled smooth deceleration
@@ -3374,6 +3496,20 @@ impl SupervisorInner {
                             self.torques[6] = dir * (GRIPPER_STALL_LATCH_NM * 1.5 + push * 2.0);
                             stalled = true;
                         }
+                    }
+                }
+                if let (Some((obj, touched)), Some(policy)) = (self.mock_gripper_object, self.config.gripper_policy.as_ref()) {
+                    let dir = if policy.closed_rad >= policy.open_rad { 1.0 } else { -1.0 };
+                    let push = (self.commanded_positions[6] - obj) * dir;
+                    if push > 1e-4 {
+                        // squeeze torque rises with the command past the contact (POS_VEL stiffness)
+                        self.measured_positions[6] = obj;
+                        self.measured_velocities[6] = 0.0;
+                        self.torques[6] = dir * (GRIPPER_STALL_LATCH_NM * 1.5 + push * 2.0);
+                        stalled = true;
+                        self.mock_gripper_object = Some((obj, true));
+                    } else if touched && push < -0.5 {
+                        self.mock_gripper_object = None;
                     }
                 }
                 // clear only the torque this mock stall set (tests may inject torques themselves)
