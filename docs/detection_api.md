@@ -21,7 +21,9 @@ Every `rebot-vision` response body has `"api_version"`: 2 from 1.3.0, 1 in 1.2. 
 | `/api/v1/detection/inference` | `GET` | `GET /api/inference` | `{"enabled":bool,"fps":n,"active_fps":n,"idle_fps":1}` |
 | `/api/v1/detection/inference` | `POST` | `POST /api/inference` | Body `{"enabled":true\|false}`; same shape as GET. A bad body returns 400 `{"error":...}` |
 | `/api/v1/detection/latest` | `GET` | `GET /api/results/latest` (query string passed through) | `{"enabled":bool,"frame_id":u32,"ts_ms":n,"age_ms":n,"inference_time_ms":n,"detections":[...],"timeout"?:true}` |
-| `/api/v1/detection/trigger` | `POST` | `POST /api/trigger` (query string and JSON body passed through) | Body (version 2) `{"pipelines"?: ["yolo"] \| ["aruco"] \| ["yolo","aruco"], "wait_ms"?: 0..5000}`. `{"success":true,"requested":[...],"frame_id":u32,...}` (result envelope below) or `{"success":false,"timeout":true,"count":0,"detections":[],"markers":[]}`. Bad `pipelines` → 400, `yolo` without a model → 409 |
+| `/api/v1/detection/trigger` | `POST` | `POST /api/trigger` (query string and JSON body passed through) | Body (version 2) `{"pipelines"?: ["yolo"] \| ["aruco"] \| ["yolo","aruco"], "wait_ms"?: 0..5000, "mask_focus"?: {"label"?: string, "box_norm": [x0,y0,x1,y1]}}`. `{"success":true,"requested":[...],"frame_id":u32,...}` (result envelope below) or `{"success":false,"timeout":true,"count":0,"detections":[],"markers":[]}`. Bad `pipelines` → 400, `yolo` without a model → 409 |
+| `/api/v1/detection/mask_focus` | `GET` | `GET /api/mask_focus` | `{"api_version":2,"mask_focus":{...}\|null}` |
+| `/api/v1/detection/mask_focus` | `POST` | `POST /api/mask_focus` | Body `{"label"?: string, "box_norm": [x0,y0,x1,y1], "ttl_ms"?: 100..10000}`; empty `{}` or `ttl_ms: 0` clears it. Returns same shape as GET |
 | `/api/v1/vision/mode` | `GET` | `GET /api/mode` | mode body below |
 | `/api/v1/vision/mode` | `POST` | `POST /api/mode` | Body `{"mode"?: "off"\|"yolo"\|"aruco"\|"both", "enabled"?: bool, "fps"?: 1..15}` (at least one key); same body as GET. Bad value → 400, YOLO mode without a model → 409 `{"error":"yolo unavailable"}`. Version 2: the default subscription, `fps` the cap of every subscription |
 | `/api/v1/vision/subscribe` | `POST` | `POST /api/subscribe` | Body `{"client": "1..64 chars", "pipelines": [...], "fps"?: 1..15, "ttl_ms"?: 500..60000, "id"?}` → subscription body (version 2). 400 bad body, 409 `yolo` without a model, 503 more than 16 subscriptions |
@@ -30,6 +32,8 @@ Every `rebot-vision` response body has `"api_version"`: 2 from 1.3.0, 1 in 1.2. 
 | `/api/v1/vision/subscriptions` | `GET` | `GET /api/subscriptions` | list body below |
 
 - Status code and JSON body are passed through unchanged. 状态码和 JSON 原样透传。
+- `mask_focus` (API version 2): sets persistent focus on the grasp target object. `POST /api/v1/detection/mask_focus` takes `{"label"?: string, "box_norm": [x0, y0, x1, y1], "ttl_ms"?: 100..10000}` (default 2000 ms). Empty `{}` or `ttl_ms: 0` clears it. `GET /api/v1/detection/mask_focus` returns the active focus and its remaining TTL. When active, segmentation models decode the matching target box first (IoU >= 0.1) before taking other boxes by score. Detections decoded via mask focus carry `"mask_focus": true`. `POST /api/v1/detection/trigger` also accepts an optional `"mask_focus"` field in its body, applying to that trigger's frame only without persisting.
+- 掩码焦点（接口版本 2）：设置抓取目标焦点。`POST /api/v1/detection/mask_focus` 接收 `{"label"?: string, "box_norm": [x0, y0, x1, y1], "ttl_ms"?: 100..10000}`（默认 2000 毫秒）；空对象 `{}` 或 `ttl_ms: 0` 清空焦点。`GET /api/v1/detection/mask_focus` 查询当前焦点及剩余 TTL。生效时分割模型优先解码与焦点匹配的目标框（IoU >= 0.1）。经焦点解码的检测结果包含 `"mask_focus": true`。`POST /api/v1/detection/trigger` 亦可在请求体中传入 `"mask_focus"`，仅作用于该次单次触发的帧，不产生持续焦点。
 - `latest?after=<frame_id>&wait_ms=<0..5000>` long-polls until a frame newer than `after` exists or `wait_ms` elapses (`"timeout":true`). The upstream caps `wait_ms` at 5000. armd waits `wait_ms` (capped at 5000) + 2 s for the upstream. 长轮询：等到比 `after` 新的帧或超时；armd 的上游超时为 `wait_ms`（上限 5000）+ 2 秒。
 - `trigger?wait_ms=<0..5000>` (default 2500; a body `wait_ms` wins) runs one inference on a frame newer than the call and returns it, without changing any continuous inference, so it does not interfere with other clients. Version 2 runs the body's `pipelines` (without `pipelines`: the default subscription's mode, or the last active mode when that is `off`, as in version 1). No fresh frame within `wait_ms` → `"success":false,"timeout":true`. armd waits `wait_ms` (default 2500, capped at 5000) + 2 s. Detector builds without this route return 404, which armd passes through; use the enable → `latest` → disable sequence below for those. 单次触发：对调用之后的新帧推理一次并返回，不改变持续推理开关，不影响其他已开启推理的客户端；`wait_ms` 内无新帧返回 `success:false`。armd 上游超时为 `wait_ms`（默认 2500，上限 5000）+ 2 秒。旧版检测程序无此路由时返回 404（原样透传），此时改用下方 开启 → `latest` → 关闭 流程。
 - Detector unreachable or timed out: `502 {"error":"detector unreachable"}`. 检测程序不可达或超时返回 502。
@@ -81,7 +85,7 @@ The single-shot button calls `/api/v1/detection/trigger` with the selector's pip
 
 `GET /api/v1/vision/mode`:
 
-`per_request_pipelines`, `subscriptions`, `max_fps` and `continuous` are new in version 2.
+`per_request_pipelines`, `subscriptions`, `max_fps` and `continuous` are new in version 2. `model.mask_max_boxes` (1..20, default 3) and `mask_focus` (active focus or `null`) report mask focus and budget configuration.
 
 ```json
 {"api_version":2,"mode":"both","modes":["off","yolo","aruco","both"],
@@ -91,19 +95,20 @@ The single-shot button calls `/api/v1/detection/trigger` with the selector's pip
  "per_request_pipelines":true,"subscriptions":true,"max_fps":5,
  "continuous":{"active":true,"pipelines":["yolo","aruco"],"fps":5,"subscriptions":0},
  "available":{"yolo":true,"aruco":true},
- "model":{"name":"yolo11n_detection_cv181x_int8","path":"/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel","kind":"detect","mask":false},
- "family":"aruco4x4_50"}
+ "model":{"name":"yolo11n_detection_cv181x_int8","path":"/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel","kind":"detect","mask":false,"mask_max_boxes":3},
+ "family":"aruco4x4_50",
+ "mask_focus":{"box_norm":[0.35,0.40,0.50,0.65],"ttl_ms":2000,"expires_in_ms":1850,"remaining_ttl_ms":1850,"label":"bottle"}}
 ```
 
-Result envelope of `latest` and `trigger` (versions 1 and 2; `requested` on a trigger and `format` on detections are new in version 2). `detections` and `markers` are always present (empty when that pipeline did not run), so a client reading one list works in every mode. `width`/`height` give the visible image size the coordinates refer to: `detections` are normalised to it (centre `x`, `y`, `w`, `h`), `markers` are pixels in it. Segmentation models (`model.kind: "segment"`) with mask decoding enabled (`model.mask: true`, flag `--mask on`, `vision.json` `"mask"`) also provide `angle_deg` (object long side, [-90, 90) deg), `angle_conf` ([0, 1]), and `grasp_width_px` (cross-section grasp width in visible image pixels) on finite detections, and report `mask_ms` in `pipelines.yolo`. When a standard detection model is loaded, `angle_deg`, `angle_conf`, `grasp_width_px`, and `mask_ms` are omitted, maintaining byte-identical output. `pipelines` tells what ran on this frame. `count` is the number of accepted markers (as aruco-detector); `rejected` the markers dropped by the false-positive filter.
+Result envelope of `latest` and `trigger` (versions 1 and 2; `requested` on a trigger and `format` on detections are new in version 2). `detections` and `markers` are always present (empty when that pipeline did not run), so a client reading one list works in every mode. `width`/`height` give the visible image size the coordinates refer to: `detections` are normalised to it (centre `x`, `y`, `w`, `h`), `markers` are pixels in it. Segmentation models (`model.kind: "segment"`) with mask decoding enabled (`model.mask: true`, flag `--mask on`, `vision.json` `"mask"`) also provide `angle_deg` (object long side, [-90, 90) deg), `angle_conf` ([0, 1]), and `grasp_width_px` (cross-section grasp width in visible image pixels) on finite detections, and report `mask_ms` in `pipelines.yolo`. When a detection is decoded via mask focus, it carries `"mask_focus": true`. When a standard detection model is loaded, `angle_deg`, `angle_conf`, `grasp_width_px`, and `mask_ms` are omitted, maintaining byte-identical output. `pipelines` tells what ran on this frame. `count` is the number of accepted markers (as aruco-detector); `rejected` the markers dropped by the false-positive filter.
 
-`latest` / `trigger` 的结果（版本 1）：`detections` 与 `markers` 始终存在（对应流水线未运行时为空）。`width`/`height` 为坐标所对应的可见画面尺寸：`detections` 按其归一化（中心点），`markers` 为其像素坐标。分割模型（`model.kind: "segment"`）在开启掩码解码（`model.mask: true`，参数 `--mask on` 或 `vision.json` `"mask"`）时，有限检测结果另提供 `angle_deg`（目标长边角度，[-90, 90) 度）、`angle_conf`（[0, 1]）与 `grasp_width_px`（可见画面像素下的横截面抓取宽度），并在 `pipelines.yolo` 中输出掩码耗时 `mask_ms`。使用普通检测模型时，上述字段均省略以保持输出字节级一致。
+`latest` / `trigger` 的结果（版本 1）：`detections` 与 `markers` 始终存在（对应流水线未运行时为空）。`width`/`height` 为坐标所对应的可见画面尺寸：`detections` 按其归一化（中心点），`markers` 为其像素坐标。分割模型（`model.kind: "segment"`）在开启掩码解码（`model.mask: true`，参数 `--mask on` 或 `vision.json` `"mask"`）时，有限检测结果另提供 `angle_deg`（目标长边角度，[-90, 90) 度）、`angle_conf`（[0, 1]）与 `grasp_width_px`（可见画面像素下的横截面抓取宽度），并在 `pipelines.yolo` 中输出掩码耗时 `mask_ms`。经掩码焦点解码的目标检测框带有 `"mask_focus": true`。使用普通检测模型时，上述字段均省略以保持输出字节级一致。
 
 ```json
 {"api_version":2,"success":true,"requested":["yolo","aruco"],"mode":"both","frame_id":42,"ts_ms":1762680000123,"age_ms":35,
  "inference_time_ms":81.2,"width":640,"height":360,
  "pipelines":{"yolo":{"ran":true,"ms":74.0,"mask_ms":15.6},"aruco":{"ran":true,"ms":6.1}},
- "detections":[{"class_id":39,"format":"xywh_center","class_name":"bottle","confidence":0.710,"x":0.4200,"y":0.5500,"w":0.0800,"h":0.2100,"angle_deg":15.00,"angle_conf":0.850,"grasp_width_px":28.50}],
+ "detections":[{"class_id":39,"format":"xywh_center","class_name":"bottle","confidence":0.710,"x":0.4200,"y":0.5500,"w":0.0800,"h":0.2100,"angle_deg":15.00,"angle_conf":0.850,"grasp_width_px":28.50,"mask_focus":true}],
  "count":1,"family":"aruco4x4_50","undistorted":false,"rejected":0,
  "markers":[{"id":3,"margin":61.0,"center":[182.0,212.0],"corners":[[150.0,244.0],[214.0,244.0],[214.0,180.0],[150.0,180.0]],
    "pose":{"t":[-0.0921,0.0213,0.4502],"r_deg":[178.20,1.50,3.00],"error":0.0004}}]}

@@ -204,9 +204,11 @@ int VisionControl::current_fps() const {
     return fps_locked();
 }
 
-Pipelines VisionControl::frame_plan(uint64_t frame_ms, Pipelines* triggered) {
+Pipelines VisionControl::frame_plan(uint64_t frame_ms, Pipelines* triggered, MaskFocus* focus_out) {
     bool expired = false;
     Pipelines p;
+    MaskFocus active_focus;
+    bool has_active_focus = false;
     {
         std::lock_guard<std::mutex> lk(mu_);
         input_meter_.add(frame_ms);
@@ -218,11 +220,36 @@ Pipelines VisionControl::frame_plan(uint64_t frame_ms, Pipelines* triggered) {
         const Continuous c = continuous_locked();
         if (c.active() && gate_.accept(frame_ms, c.fps)) p = c.pipelines;
         Pipelines tp;
-        for (const Trigger& t : triggers_) {
-            if (t.request_ms <= frame_ms) tp = tp | t.pipelines;
+        for (Trigger& t : triggers_) {
+            if (t.request_ms <= frame_ms) {
+                tp = tp | t.pipelines;
+                if (!has_active_focus && t.has_focus) {
+                    active_focus = t.focus;
+                    has_active_focus = true;
+                    t.has_focus = false;
+                }
+            }
         }
         p = p | tp;
         if (triggered) *triggered = tp;
+
+        if (!has_active_focus) {
+            if (persistent_focus_.active) {
+                if (frame_ms < persistent_focus_.expires_ms) {
+                    active_focus = persistent_focus_;
+                    has_active_focus = true;
+                } else {
+                    persistent_focus_.active = false;
+                }
+            }
+        }
+        if (focus_out) {
+            if (has_active_focus) {
+                *focus_out = active_focus;
+            } else {
+                *focus_out = MaskFocus{};
+            }
+        }
     }
     if (expired) cv_.notify_all();
     return p;
@@ -350,15 +377,45 @@ void VisionControl::expire(uint64_t now_ms) {
     if (changed) cv_.notify_all();
 }
 
+void VisionControl::set_mask_focus(const MaskFocus& f) {
+    std::lock_guard<std::mutex> lk(mu_);
+    persistent_focus_ = f;
+}
+
+void VisionControl::clear_mask_focus() {
+    std::lock_guard<std::mutex> lk(mu_);
+    persistent_focus_.active = false;
+}
+
+bool VisionControl::get_mask_focus(uint64_t now_ms, MaskFocus& out) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (persistent_focus_.active) {
+        if (now_ms < persistent_focus_.expires_ms) {
+            out = persistent_focus_;
+            return true;
+        }
+    }
+    return false;
+}
+
 Pipelines VisionControl::default_trigger_pipelines() const {
     std::lock_guard<std::mutex> lk(mu_);
     return pipelines_of(mode_ != Mode::Off ? mode_ : last_active_);
 }
 
-void VisionControl::trigger_begin(uint64_t request_ms, Pipelines p) {
+void VisionControl::trigger_begin(uint64_t request_ms, Pipelines p, const MaskFocus* focus) {
     {
         std::lock_guard<std::mutex> lk(mu_);
-        triggers_.push_back({request_ms, p});
+        Trigger t;
+        t.request_ms = request_ms;
+        t.pipelines = p;
+        if (focus && focus->active) {
+            t.has_focus = true;
+            t.focus = *focus;
+        } else {
+            t.has_focus = false;
+        }
+        triggers_.push_back(t);
         notify_locked();
     }
     cv_.notify_all();
@@ -465,10 +522,28 @@ static nlohmann::json subscription_json(const Subscription& s, uint64_t now_ms, 
             {"ttl_ms", s.ttl_ms}, {"expires_in_ms", left < 0 ? 0 : left}};
 }
 
-static std::string status_json(const VisionControl& ctl) {
-    const uint64_t now = mono_ms();
+static nlohmann::json mask_focus_json(const MaskFocus& f, uint64_t now_ms) {
+    if (!f.active || f.expires_ms <= now_ms) {
+        return nullptr;
+    }
+    const long long left = static_cast<long long>(f.expires_ms) - static_cast<long long>(now_ms);
+    nlohmann::json j = {
+        {"box_norm", {f.box_norm[0], f.box_norm[1], f.box_norm[2], f.box_norm[3]}},
+        {"ttl_ms", f.ttl_ms},
+        {"expires_in_ms", left < 0 ? 0 : left},
+        {"remaining_ttl_ms", left < 0 ? 0 : left}
+    };
+    if (!f.label.empty()) {
+        j["label"] = f.label;
+    }
+    return j;
+}
+
+static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0) {
+    const uint64_t now = now_ms ? now_ms : mono_ms();
     const Mode m = ctl.mode();
     const Pipelines p = pipelines_of(m);
+    MaskFocus mf;
     nlohmann::json j = {
         {"api_version", kApiVersion},
         {"mode", mode_name(m)},
@@ -489,14 +564,15 @@ static std::string status_json(const VisionControl& ctl) {
         {"max_fps", ctl.active_fps()},
         {"continuous", continuous_json(ctl.continuous())},
         {"available", {{"yolo", ctl.yolo_available()}, {"aruco", true}}},
-        {"model", {{"name", ctl.model_name()}, {"path", ctl.model_path()}, {"kind", ctl.model_kind()}, {"mask", ctl.mask_enabled()}}},
+        {"model", {{"name", ctl.model_name()}, {"path", ctl.model_path()}, {"kind", ctl.model_kind()}, {"mask", ctl.mask_enabled()}, {"mask_max_boxes", ctl.mask_max_boxes()}}},
         {"family", ctl.family()},
+        {"mask_focus", ctl.get_mask_focus(now, mf) ? mask_focus_json(mf, now) : nullptr},
     };
     return j.dump();
 }
 
-static std::string mode_body(const VisionControl& ctl) {
-    return status_json(ctl);
+static std::string mode_body(const VisionControl& ctl, uint64_t now_ms = 0) {
+    return status_json(ctl, now_ms);
 }
 
 static bool query_param(const std::string& query, const std::string& key, std::string& value) {
@@ -615,6 +691,56 @@ static bool parse_pipelines(const nlohmann::json& v, Pipelines& out) {
 
 static const char* kPipelinesError = "\"pipelines\" must be a non-empty list of \"yolo\", \"aruco\"";
 
+static bool parse_mask_focus(const nlohmann::json& v, MaskFocus& out) {
+    if (!v.is_object()) return false;
+    out = MaskFocus{};
+    if (auto it = v.find("label"); it != v.end()) {
+        if (!it->is_string()) return false;
+        out.label = it->get<std::string>();
+    }
+    auto it_box = v.find("box_norm");
+    if (it_box == v.end() || !it_box->is_array() || it_box->size() != 4) return false;
+    for (size_t i = 0; i < 4; ++i) {
+        if (!(*it_box)[i].is_number()) return false;
+        out.box_norm[i] = (*it_box)[i].get<float>();
+    }
+    if (auto it_ttl = v.find("ttl_ms"); it_ttl != v.end()) {
+        if (!it_ttl->is_number_integer()) return false;
+        out.ttl_ms = it_ttl->get<int>();
+    } else {
+        out.ttl_ms = 2000;
+    }
+    out.active = true;
+    return true;
+}
+
+static HttpReply post_mask_focus(VisionControl& ctl, const std::string& body, uint64_t now_ms) {
+    nlohmann::json j;
+    if (!body_object(body, j)) return {400, error_body("body must be a JSON object")};
+    if (j.empty()) {
+        ctl.clear_mask_focus();
+        nlohmann::json res = {{"api_version", kApiVersion}, {"mask_focus", nullptr}};
+        return {200, res.dump()};
+    }
+    if (j.contains("ttl_ms") && j["ttl_ms"].is_number_integer() && j["ttl_ms"].get<int>() == 0) {
+        ctl.clear_mask_focus();
+        nlohmann::json res = {{"api_version", kApiVersion}, {"mask_focus", nullptr}};
+        return {200, res.dump()};
+    }
+    MaskFocus f;
+    if (!parse_mask_focus(j, f)) {
+        return {400, error_body("invalid mask_focus")};
+    }
+    int ttl = f.ttl_ms;
+    if (ttl < 100) ttl = 100;
+    if (ttl > 10000) ttl = 10000;
+    f.ttl_ms = ttl;
+    f.expires_ms = now_ms + static_cast<uint64_t>(ttl);
+    ctl.set_mask_focus(f);
+    nlohmann::json res = {{"api_version", kApiVersion}, {"mask_focus", mask_focus_json(f, now_ms)}};
+    return {200, res.dump()};
+}
+
 static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, const std::string& body,
                                uint64_t now_ms, const RequestTimes* times) {
     int wait_ms = 2500;  // aruco-detector default for the single shot
@@ -630,6 +756,14 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, con
         if (!parse_pipelines(*it, want)) return {400, error_body(kPipelinesError)};
         if (want.yolo && !ctl.yolo_available()) return yolo_unavailable_reply();
     }
+    bool has_focus = false;
+    MaskFocus focus;
+    if (auto it = j.find("mask_focus"); it != j.end()) {
+        if (!it->is_null()) {
+            if (!parse_mask_focus(*it, focus)) return {400, error_body("invalid mask_focus")};
+            has_focus = true;
+        }
+    }
 
     VisionResult current;
     ctl.latest(false, 0, 0, current);
@@ -644,7 +778,7 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, con
     uint64_t gate_ms = 0;
     uint64_t wake_ms = 0;
     {
-        auto scope = ctl.trigger_scope(request_ms, want);
+        auto scope = ctl.trigger_scope(request_ms, want, has_focus ? &focus : nullptr);
         gate_ms = mono_ms();
         timeout = ctl.wait_fresh(baseline, request_ms, want, wait_ms, r);
         wake_ms = mono_ms();
@@ -767,6 +901,7 @@ HttpReply handle_control_request(VisionControl& ctl, const std::string& method, 
     const size_t q = target.find('?');
     const std::string path = target.substr(0, q);
     const std::string query = q == std::string::npos ? "" : target.substr(q + 1);
+    const uint64_t now = now_ms ? now_ms : mono_ms();
 
     if (path == "/api/inference") {
         if (method == "GET") return {200, inference_body(ctl)};
@@ -779,8 +914,16 @@ HttpReply handle_control_request(VisionControl& ctl, const std::string& method, 
             return {200, inference_body(ctl)};
         }
     } else if (path == "/api/mode" || path == "/api/status") {
-        if (method == "GET") return {200, status_json(ctl)};
+        if (method == "GET") return {200, status_json(ctl, now)};
         if (method == "POST" && path == "/api/mode") return post_mode(ctl, body);
+    } else if (path == "/api/mask_focus") {
+        if (method == "GET") {
+            MaskFocus f;
+            bool active = ctl.get_mask_focus(now, f);
+            nlohmann::json res = {{"api_version", kApiVersion}, {"mask_focus", active ? mask_focus_json(f, now) : nullptr}};
+            return {200, res.dump()};
+        }
+        if (method == "POST") return post_mask_focus(ctl, body, now);
     } else if (path == "/api/results/latest" && method == "GET") {
         return latest_reply(ctl, query, now_ms);
     } else if (path == "/api/trigger" && method == "POST") {

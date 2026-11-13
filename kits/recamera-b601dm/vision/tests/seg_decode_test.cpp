@@ -145,10 +145,97 @@ static void test_edge_cases() {
     for (int i = 0; i < 4; ++i) CHECK(out[i] == 0);
 }
 
+static FocusCandidate make_candidate(float cx_cont, float cy_cont, float w_cont, float h_cont,
+                                      float score, int class_id, const std::string& label) {
+    float cx_px = cx_cont * 640.0f;
+    float cy_px = 140.0f + cy_cont * 360.0f;
+    float w_px = w_cont * 640.0f;
+    float h_px = h_cont * 360.0f;
+    FocusCandidate c;
+    c.x = cx_px / 640.0f;
+    c.y = cy_px / 640.0f;
+    c.w = w_px / 640.0f;
+    c.h = h_px / 640.0f;
+    c.score = score;
+    c.class_id = class_id;
+    c.label = label;
+    return c;
+}
+
+static void test_mask_focus_selection() {
+    // 1. Focus selects the 4th-ranked box
+    std::vector<FocusCandidate> candidates = {
+        make_candidate(0.10f, 0.10f, 0.10f, 0.10f, 0.95f, 0, "obj"),
+        make_candidate(0.30f, 0.10f, 0.10f, 0.10f, 0.90f, 0, "obj"),
+        make_candidate(0.50f, 0.10f, 0.10f, 0.10f, 0.85f, 0, "obj"),
+        make_candidate(0.70f, 0.10f, 0.10f, 0.10f, 0.80f, 0, "obj"),  // 4th ranked
+        make_candidate(0.10f, 0.50f, 0.10f, 0.10f, 0.75f, 0, "obj"),
+    };
+
+    MaskFocus focus;
+    focus.active = true;
+    // Box 3 content bounds: [0.65, 0.05, 0.75, 0.15]
+    focus.box_norm[0] = 0.65f;
+    focus.box_norm[1] = 0.05f;
+    focus.box_norm[2] = 0.75f;
+    focus.box_norm[3] = 0.15f;
+
+    int sel = select_focus_box(focus, candidates, 0, 140, 640, 360, 640, 640);
+    CHECK_MSG(sel == 3, "Focus must select the 4th-ranked box");
+
+    // 2. Label filter
+    std::vector<FocusCandidate> multi_label = {
+        make_candidate(0.30f, 0.30f, 0.20f, 0.20f, 0.95f, 0, "cup"),
+        make_candidate(0.32f, 0.32f, 0.20f, 0.20f, 0.80f, 1, "bottle"),
+    };
+    MaskFocus bottle_focus;
+    bottle_focus.active = true;
+    bottle_focus.label = "bottle";
+    bottle_focus.box_norm[0] = 0.20f;
+    bottle_focus.box_norm[1] = 0.20f;
+    bottle_focus.box_norm[2] = 0.40f;
+    bottle_focus.box_norm[3] = 0.40f;
+
+    int sel_bottle = select_focus_box(bottle_focus, multi_label, 0, 140, 640, 360, 640, 640);
+    CHECK_MSG(sel_bottle == 1, "Focus with label 'bottle' must ignore 'cup' even with higher IoU");
+
+    MaskFocus any_focus = bottle_focus;
+    any_focus.label = "";  // empty matches any label
+    int sel_any = select_focus_box(any_focus, multi_label, 0, 140, 640, 360, 640, 640);
+    CHECK_MSG(sel_any == 0, "Focus with empty label must match highest IoU candidate");
+
+    // 3. IoU threshold (< 0.1 rejected, >= 0.1 accepted)
+    std::vector<FocusCandidate> single_cand = {
+        make_candidate(0.10f, 0.10f, 0.20f, 0.20f, 0.90f, 0, "obj"),  // bounds: [0, 0, 0.2, 0.2]
+    };
+    MaskFocus low_iou_focus;
+    low_iou_focus.active = true;
+    // Overlap [0.18, 0.18, 0.20, 0.20] has area 0.0004, union ~0.0796 -> IoU ~0.005 < 0.1
+    low_iou_focus.box_norm[0] = 0.18f;
+    low_iou_focus.box_norm[1] = 0.18f;
+    low_iou_focus.box_norm[2] = 0.38f;
+    low_iou_focus.box_norm[3] = 0.38f;
+
+    int sel_low = select_focus_box(low_iou_focus, single_cand, 0, 140, 640, 360, 640, 640);
+    CHECK_MSG(sel_low == -1, "IoU < 0.1 must be rejected");
+
+    MaskFocus high_iou_focus;
+    high_iou_focus.active = true;
+    // Overlap [0.10, 0.10, 0.20, 0.20] has area 0.01, union 0.07 -> IoU ~0.14 >= 0.1
+    high_iou_focus.box_norm[0] = 0.10f;
+    high_iou_focus.box_norm[1] = 0.10f;
+    high_iou_focus.box_norm[2] = 0.30f;
+    high_iou_focus.box_norm[3] = 0.30f;
+
+    int sel_high = select_focus_box(high_iou_focus, single_cand, 0, 140, 640, 360, 640, 640);
+    CHECK_MSG(sel_high == 0, "IoU >= 0.1 must be accepted");
+}
+
 int main() {
     std::printf("Running seg_decode tests...\n");
     test_random_crops();
     test_edge_cases();
+    test_mask_focus_selection();
 
     if (g_fail == 0) {
         std::printf("All seg_decode tests passed!\n");

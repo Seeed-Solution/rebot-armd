@@ -358,4 +358,56 @@ void decode_crop_mask(
     }
 }
 
+float box_iou(float ax0, float ay0, float ax1, float ay1,
+              float bx0, float by0, float bx1, float by1) {
+    const float ix0 = std::max(ax0, bx0);
+    const float iy0 = std::max(ay0, by0);
+    const float ix1 = std::min(ax1, bx1);
+    const float iy1 = std::min(ay1, by1);
+    const float iw = std::max(0.0f, ix1 - ix0);
+    const float ih = std::max(0.0f, iy1 - iy0);
+    const float inter = iw * ih;
+    const float area_a = std::max(0.0f, ax1 - ax0) * std::max(0.0f, ay1 - ay0);
+    const float area_b = std::max(0.0f, bx1 - bx0) * std::max(0.0f, by1 - by0);
+    const float u = area_a + area_b - inter;
+    return u > 0.0f ? (inter / u) : 0.0f;
+}
+
+int select_focus_box(const MaskFocus& focus,
+                     const std::vector<FocusCandidate>& candidates,
+                     float content_x, float content_y,
+                     float content_w, float content_h,
+                     float iw, float ih) {
+    if (!focus.active) return -1;
+    const float rw = content_w > 0.0f ? content_w : (iw > 0.0f ? iw : 640.0f);
+    const float rh = content_h > 0.0f ? content_h : (ih > 0.0f ? ih : 640.0f);
+    const float cur_iw = iw > 0.0f ? iw : 640.0f;
+    const float cur_ih = ih > 0.0f ? ih : 640.0f;
+
+    int best_idx = -1;
+    float best_iou = 0.09999f;  // IoU must be >= 0.1
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const auto& c = candidates[i];
+        if (!focus.label.empty() && focus.label != c.label) {
+            continue;
+        }
+        const float bx0_inf = c.x - c.w * 0.5f;
+        const float by0_inf = c.y - c.h * 0.5f;
+        const float bx1_inf = c.x + c.w * 0.5f;
+        const float by1_inf = c.y + c.h * 0.5f;
+        const float bx0 = (bx0_inf * cur_iw - content_x) / rw;
+        const float by0 = (by0_inf * cur_ih - content_y) / rh;
+        const float bx1 = (bx1_inf * cur_iw - content_x) / rw;
+        const float by1 = (by1_inf * cur_ih - content_y) / rh;
+        const float iou = box_iou(focus.box_norm[0], focus.box_norm[1],
+                                  focus.box_norm[2], focus.box_norm[3],
+                                  bx0, by0, bx1, by1);
+        if (iou > best_iou) {
+            best_iou = iou;
+            best_idx = static_cast<int>(i);
+        }
+    }
+    return best_idx;
+}
+
 }  // namespace rv

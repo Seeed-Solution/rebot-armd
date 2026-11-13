@@ -34,8 +34,8 @@ static int g_fail = 0;
     } while (0)
 
 static json req(VisionControl& c, const std::string& m, const std::string& t, const std::string& b = "",
-                int* status = nullptr) {
-    HttpReply r = handle_control_request(c, m, t, b, 1000100);
+                int* status = nullptr, uint64_t now_ms = 1000100) {
+    HttpReply r = handle_control_request(c, m, t, b, now_ms);
     if (status) *status = r.status;
     return json::parse(r.body);
 }
@@ -744,6 +744,8 @@ static void test_status_endpoint() {
         CHECK(j["model"]["path"] == "/userdata/local/models/yolo11n.cvimodel");
         CHECK(j["model"]["kind"] == "detect");
         CHECK(j["model"]["mask"] == false);
+        CHECK(j["model"]["mask_max_boxes"] == 3);
+        CHECK(j["mask_focus"].is_null());
     }
     // 2. Segment options: model_kind = "segment", mask = true
     {
@@ -752,6 +754,7 @@ static void test_status_endpoint() {
         o.model_path = "/userdata/local/models/yolo11n-seg.cvimodel";
         o.model_kind = "segment";
         o.mask = true;
+        o.mask_max_boxes = 5;
         VisionControl c(o, nullptr);
         int st = 0;
         json j = req(c, "GET", "/api/status", "", &st);
@@ -761,6 +764,7 @@ static void test_status_endpoint() {
         CHECK(j["model"]["path"] == "/userdata/local/models/yolo11n-seg.cvimodel");
         CHECK(j["model"]["kind"] == "segment");
         CHECK(j["model"]["mask"] == true);
+        CHECK(j["model"]["mask_max_boxes"] == 5);
     }
     // 3. Segment options with mask = false
     {
@@ -774,6 +778,102 @@ static void test_status_endpoint() {
         CHECK(j["model"]["kind"] == "segment");
         CHECK(j["model"]["mask"] == false);
     }
+}
+
+static void test_mask_focus_control() {
+    VisionControl::Options o = opts(Mode::Yolo);
+    VisionControl c(o, nullptr);
+    int st = 0;
+
+    // 1. Initial status has mask_focus = null
+    json j0 = req(c, "GET", "/api/status", "", &st, 1000000);
+    CHECK(st == 200 && j0["mask_focus"].is_null());
+
+    // 2. Persistent focus POST sets focus with TTL
+    json set_body = {
+        {"label", "target_box"},
+        {"box_norm", {0.1f, 0.2f, 0.3f, 0.4f}},
+        {"ttl_ms", 500}
+    };
+    json post_res = req(c, "POST", "/api/mask_focus", set_body.dump(), &st, 1000000);
+    CHECK(st == 200);
+    CHECK(!post_res["mask_focus"].is_null());
+    CHECK(post_res["mask_focus"]["label"] == "target_box");
+    CHECK(post_res["mask_focus"]["ttl_ms"] == 500);
+    CHECK(post_res["mask_focus"]["remaining_ttl_ms"] == 500);
+
+    // 3. Status during active TTL shows focus and remaining TTL
+    json j_mid = req(c, "GET", "/api/status", "", &st, 1000200);
+    CHECK(st == 200);
+    CHECK(!j_mid["mask_focus"].is_null());
+    CHECK(j_mid["mask_focus"]["remaining_ttl_ms"] == 300);
+
+    // GET /api/mask_focus also shows focus
+    json get_mf = req(c, "GET", "/api/mask_focus", "", &st, 1000200);
+    CHECK(st == 200);
+    CHECK(!get_mf["mask_focus"].is_null());
+    CHECK(get_mf["mask_focus"]["label"] == "target_box");
+
+    // 4. TTL expiry: after 500 ms (at t = 1000501), focus is expired
+    json j_exp = req(c, "GET", "/api/status", "", &st, 1000600);
+    CHECK(st == 200);
+    CHECK(j_exp["mask_focus"].is_null());
+
+    json get_exp = req(c, "GET", "/api/mask_focus", "", &st, 1000600);
+    CHECK(st == 200);
+    CHECK(get_exp["mask_focus"].is_null());
+
+    // 5. POST /api/mask_focus {} clears focus immediately
+    req(c, "POST", "/api/mask_focus", set_body.dump(), &st, 2000000);
+    json j_active = req(c, "GET", "/api/status", "", &st, 2000100);
+    CHECK(!j_active["mask_focus"].is_null());
+
+    json clear_res = req(c, "POST", "/api/mask_focus", "{}", &st, 2000150);
+    CHECK(st == 200);
+    CHECK(clear_res["mask_focus"].is_null());
+    json j_cleared = req(c, "GET", "/api/status", "", &st, 2000200);
+    CHECK(j_cleared["mask_focus"].is_null());
+
+    // 6. POST /api/mask_focus {"ttl_ms": 0} also clears focus
+    req(c, "POST", "/api/mask_focus", set_body.dump(), &st, 3000000);
+    json clear_res2 = req(c, "POST", "/api/mask_focus", "{\"ttl_ms\": 0}", &st, 3000100);
+    CHECK(st == 200);
+    CHECK(clear_res2["mask_focus"].is_null());
+    json j_cleared2 = req(c, "GET", "/api/status", "", &st, 3000200);
+    CHECK(j_cleared2["mask_focus"].is_null());
+
+    // 7. Trigger-only focus does not persist
+    MaskFocus trig_focus;
+    trig_focus.active = true;
+    trig_focus.label = "trig_target";
+    trig_focus.box_norm[0] = 0.2f;
+    trig_focus.box_norm[1] = 0.2f;
+    trig_focus.box_norm[2] = 0.4f;
+    trig_focus.box_norm[3] = 0.4f;
+
+    c.trigger_begin(4000100, Pipelines{true, false}, &trig_focus);
+
+    // Frame that serves the trigger
+    Pipelines triggered;
+    MaskFocus frame1_focus;
+    Pipelines p1 = c.frame_plan(4000150, &triggered, &frame1_focus);
+    CHECK(p1.yolo);
+    CHECK(frame1_focus.active == true);
+    CHECK(frame1_focus.label == "trig_target");
+
+    // Next frame: trigger focus does NOT persist
+    MaskFocus frame2_focus;
+    Pipelines p2 = c.frame_plan(4000200, &triggered, &frame2_focus);
+    (void)p2;
+    CHECK(frame2_focus.active == false);
+
+    // Persistent focus was never set
+    MaskFocus status_focus;
+    CHECK(c.get_mask_focus(4000250, status_focus) == false);
+    json j_after_trig = req(c, "GET", "/api/status", "", &st, 4000250);
+    CHECK(j_after_trig["mask_focus"].is_null());
+
+    c.trigger_end(4000100);
 }
 
 int main() {
@@ -793,6 +893,7 @@ int main() {
     test_subscription_expiry();
     test_trigger_pipelines();
     test_mode_endpoint_compat();
+    test_mask_focus_control();
     test_http_server();
     if (g_fail) {
         std::printf("%d check(s) failed\n", g_fail);

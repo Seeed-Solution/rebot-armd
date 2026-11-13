@@ -113,7 +113,9 @@ void Detector::setThreshold(float threshold) {
     }
 }
 
-std::vector<Detection> Detector::detect(ma_img_t* img) {
+std::vector<Detection> Detector::detect(ma_img_t* img, const rv::MaskFocus* focus,
+                                         float content_x, float content_y,
+                                         float content_w, float content_h) {
     std::vector<Detection> results;
 
     if (!initialized_ || img == nullptr) {
@@ -124,6 +126,7 @@ std::vector<Detection> Detector::detect(ma_img_t* img) {
         if (!seg_model_) {
             return results;
         }
+        seg_model_->setMaskFocus(focus, content_x, content_y, content_w, content_h);
         ma_err_t ret = seg_model_->run(img);
         if (ret != MA_OK) {
             MA_LOGE(TAG, "Segmentation run failed: %d", ret);
@@ -180,6 +183,13 @@ void Detector::setMaskEnabled(bool enabled) {
 void Detector::setMaskMaxBoxes(int max_boxes) {
     if (seg_model_) {
         seg_model_->setMaskMaxBoxes(max_boxes);
+    }
+}
+
+void Detector::setMaskFocus(const rv::MaskFocus* focus, float content_x, float content_y,
+                            float content_w, float content_h) {
+    if (seg_model_) {
+        seg_model_->setMaskFocus(focus, content_x, content_y, content_w, content_h);
     }
 }
 

@@ -46,6 +46,7 @@ struct Config {
     rv::Mode mode = rv::Mode::Yolo;
     bool inference_enabled = false;
     bool mask_enabled = true;
+    int mask_max_boxes = 3;
     int fps = 5;  // one inference rate for every mode
 
     int inference_w = 640;
@@ -164,6 +165,9 @@ void load_config_file(const std::string& path) {
     boolean("reuse_buffers", g_cfg.aruco.reuse_buffers);
     boolean("size_gate", g_cfg.aruco.size_gate);
     boolean("mask", g_cfg.mask_enabled);
+    num("mask_max_boxes", g_cfg.mask_max_boxes);
+    if (g_cfg.mask_max_boxes < 1) g_cfg.mask_max_boxes = 1;
+    if (g_cfg.mask_max_boxes > 20) g_cfg.mask_max_boxes = 20;
     num("adaptive_decimate", g_cfg.aruco.adaptive_decimate);
     num("adaptive_min_side", g_cfg.aruco.adaptive_min_side_px);
     boolean("roi_tracking", g_cfg.aruco.roi_tracking);
@@ -181,6 +185,7 @@ void print_usage(const char* prog) {
     printf("  --mode off|yolo|aruco|both  Base mode at start [default: yolo]\n");
     printf("  --inference on|off       Default subscription (the mode API) at start [default: off = standby]\n");
     printf("  --mask on|off            Decode instance segmentation masks [default: off]\n");
+    printf("  --mask-max-boxes N       Max boxes with decoded segmentation masks, 1..20 [default: 3]\n");
     printf("  --fps N                  Inference rate of the default subscription and cap of every\n");
     printf("                           subscription, 1..15 [default: 5]\n");
     printf("  -m, --model PATH         YOLO .cvimodel [default: first of /userdata/rebot-teleop/models/yolo11n.cvimodel,\n");
@@ -213,13 +218,14 @@ bool parse_double(const char* s, double& out, bool non_negative = false) {
 bool parse_args(int argc, char** argv) {
     enum {
         kConfig = 1000, kMode, kInference, kFps, kFx, kFy, kCx, kCy, kK1, kK2, kP1, kP2, kK3, kDecimate,
-        kMinMargin, kMinSide, kIds, kStreamFps, kStreamBitrate, kDebugPort, kControlPort, kMask
+        kMinMargin, kMinSide, kIds, kStreamFps, kStreamBitrate, kDebugPort, kControlPort, kMask, kMaskMaxBoxes
     };
     static struct option long_opts[] = {
         {"config", required_argument, nullptr, kConfig},
         {"mode", required_argument, nullptr, kMode},
         {"inference", required_argument, nullptr, kInference},
         {"mask", required_argument, nullptr, kMask},
+        {"mask-max-boxes", required_argument, nullptr, kMaskMaxBoxes},
         {"fps", required_argument, nullptr, kFps},
         {"model", required_argument, nullptr, 'm'},
         {"conf-threshold", required_argument, nullptr, 'c'},
@@ -277,6 +283,15 @@ bool parse_args(int argc, char** argv) {
                 }
                 g_cfg.mask_enabled = std::strcmp(optarg, "on") == 0;
                 break;
+            case kMaskMaxBoxes: {
+                int n = std::atoi(optarg);
+                if (n < 1 || n > 20) {
+                    fprintf(stderr, "Invalid --mask-max-boxes '%s' (1..20)\n", optarg);
+                    return false;
+                }
+                g_cfg.mask_max_boxes = n;
+                break;
+            }
             case kFps: g_cfg.fps = std::atoi(optarg); break;
             case 'm': g_cfg.model_path = optarg; break;
             case 'c': g_cfg.conf_threshold = static_cast<float>(std::atof(optarg)); break;
@@ -390,6 +405,7 @@ int main(int argc, char** argv) {
     } else if (detector.init(model)) {
         detector.setThreshold(g_cfg.conf_threshold);
         detector.setMaskEnabled(g_cfg.mask_enabled);
+        detector.setMaskMaxBoxes(g_cfg.mask_max_boxes);
         detector.setScale(4.0f, 4.0f);
         yolo_ok = true;
     } else {
@@ -432,6 +448,7 @@ int main(int argc, char** argv) {
     vo.model_path = yolo_ok ? model : "";
     vo.model_kind = (detector.getKind() == yolo::Kind::Segment ? "segment" : "detect");
     vo.mask = g_cfg.mask_enabled && (detector.getKind() == yolo::Kind::Segment);
+    vo.mask_max_boxes = g_cfg.mask_max_boxes;
     vo.family = g_cfg.aruco.family;
     ma::Camera* camera = device_camera();
     rv::VisionControl ctl(vo, [&app, camera](bool on, int gate_fps) {
@@ -483,7 +500,8 @@ int main(int argc, char** argv) {
         const uint64_t frame_ms = grab_ms > before_grab_ms ? grab_ms : last_grab_ms;
         last_grab_ms = grab_ms;
         rv::Pipelines triggered;
-        const rv::Pipelines p = ctl.frame_plan(frame_ms, &triggered);
+        rv::MaskFocus frame_focus;
+        const rv::Pipelines p = ctl.frame_plan(frame_ms, &triggered, &frame_focus);
         if (!p.any() || !frame.valid() || !frame.cpu_accessible()) {
             r.publish = false;  // standby: no /results; the stream and snapshot keep running
             return;
@@ -506,9 +524,11 @@ int main(int argc, char** argv) {
         if (p.yolo) {
             const auto t0 = std::chrono::steady_clock::now();
             ma_img_t img = af::to_ma_img(frame);
-            for (const auto& d : detector.detect(&img)) {
+            for (const auto& d : detector.detect(&img, frame_focus.active ? &frame_focus : nullptr,
+                                                 static_cast<float>(crop.x), static_cast<float>(crop.y),
+                                                 static_cast<float>(crop.w), static_cast<float>(crop.h))) {
                 dets.push_back({d.x, d.y, d.w, d.h, d.confidence, d.class_id, yolo::Detector::getClassName(d.class_id),
-                                d.angle_deg, d.angle_conf, d.grasp_width_px});
+                                d.angle_deg, d.angle_conf, d.grasp_width_px, d.mask_focus});
                 af::Box b;  // centre pixels in the inference frame; the debug sink maps them to the display
                 b.x = d.x * frame.width;
                 b.y = d.y * frame.height;

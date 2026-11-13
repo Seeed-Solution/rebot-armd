@@ -32,6 +32,7 @@ struct DetBox {
     float angle_deg = NAN;
     float angle_conf = NAN;
     float grasp_width_px = NAN;
+    bool mask_focus = false;
 };
 
 /**

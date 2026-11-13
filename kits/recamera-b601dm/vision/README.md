@@ -340,8 +340,8 @@ YOLO model: not in the repository or the deb. The first existing file of `vision
 `/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel` is loaded. Without a model `yolo` and `both`
 answer 409 and ArUco works.
 
-Model options: command-line `--model PATH`, `--mask on|off` (default: off; decode instance segmentation masks when using a segmentation model), and `vision.json` keys `"model"` and `"mask": true|false`.
-When a 2-output YOLO11-seg model is loaded (e.g. `yolo11n_segment_cv181x_int8.cvimodel`), `rebot-vision` auto-detects `model.kind: "segment"`. When `--mask on` (or `vision.json` `"mask": true`), it decodes cropped instance masks for up to the top 3 detections within a 160x160 cell budget and computes mask orientation, confidence, and grasp width.
+Model options: command-line `--model PATH`, `--mask on|off` (default: off; decode instance segmentation masks when using a segmentation model), `--mask-max-boxes N` (1..20, default 3; max boxes for mask decoding), and `vision.json` keys `"model"`, `"mask": true|false`, and `"mask_max_boxes": 1..20`.
+When a 2-output YOLO11-seg model is loaded (e.g. `yolo11n_segment_cv181x_int8.cvimodel`), `rebot-vision` auto-detects `model.kind: "segment"`. When `--mask on` (or `vision.json` `"mask": true`), it decodes cropped instance masks for up to `mask_max_boxes` detections within a 160x160 cell budget and computes mask orientation, confidence, and grasp width.
 Segmentation timing from the standalone bench: Forward 71.2 ms, crop mask decode measured before the cache fix 15.6 ms (bench numbers; new on-device numbers: not measured).
 
 ## Differences from the spec

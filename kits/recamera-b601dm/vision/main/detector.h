@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <sscma.h>
+#include "mask_geom.h"
 
 namespace yolo {
 
@@ -23,6 +24,7 @@ struct Detection {
     float angle_deg = NAN;
     float angle_conf = NAN;
     float grasp_width_px = NAN;
+    bool mask_focus = false;
 };
 
 class SegModel;
@@ -35,13 +37,17 @@ public:
     bool init(const std::string& model_path);
     void setThreshold(float threshold);
 
-    std::vector<Detection> detect(ma_img_t* img);
+    std::vector<Detection> detect(ma_img_t* img, const rv::MaskFocus* focus = nullptr,
+                                  float content_x = 0, float content_y = 0,
+                                  float content_w = 0, float content_h = 0);
 
     Kind getKind() const { return kind_; }
     float mask_ms() const;
 
     void setMaskEnabled(bool enabled);
     void setMaskMaxBoxes(int max_boxes);
+    void setMaskFocus(const rv::MaskFocus* focus, float content_x = 0, float content_y = 0,
+                      float content_w = 0, float content_h = 0);
     void setScale(float sx, float sy);
 
     int getInputWidth() const { return input_width_; }
