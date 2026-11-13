@@ -232,12 +232,84 @@ static void test_sample_table_disparity() {
     }
 }
 
+static void test_non_finite_handling() {
+    const int grid_w = 384, grid_h = 224;
+    const float content_w = 640.0f, content_h = 360.0f;
+
+    // 1. Inject NAN and INFINITY into disp_map for sample_table_disparity
+    {
+        std::vector<float> disp_map(grid_w * grid_h, 0.50f);
+        for (int i = 0; i < grid_w * grid_h; i += 7) {
+            disp_map[i] = (i % 2 == 0) ? NAN : INFINITY;
+        }
+        for (int i = 3; i < grid_w * grid_h; i += 11) {
+            disp_map[i] = -INFINITY;
+        }
+
+        auto samples = sample_table_disparity(disp_map.data(), grid_w, grid_h, {}, content_w, content_h);
+        CHECK(!samples.empty());
+        for (const auto& s : samples) {
+            CHECK(std::isfinite(s.u_px));
+            CHECK(std::isfinite(s.v_px));
+            CHECK(std::isfinite(s.disp));
+        }
+    }
+
+    // 2. Verify an all-NaN ring around target returns !res.valid cleanly
+    {
+        std::vector<float> disp_map(grid_w * grid_h, NAN);
+        DepthBox target{280.0f, 150.0f, 360.0f, 210.0f};
+        for (int gy = 0; gy < grid_h; ++gy) {
+            float v_px = (gy + 0.5f) * (content_h / static_cast<float>(grid_h));
+            for (int gx = 0; gx < grid_w; ++gx) {
+                float u_px = (gx + 0.5f) * (content_w / static_cast<float>(grid_w));
+                if (u_px >= target.x0 && u_px <= target.x1 && v_px >= target.y0 && v_px <= target.y1) {
+                    disp_map[gy * grid_w + gx] = 0.80f;
+                }
+            }
+        }
+        auto res = analyze_box_depth(disp_map.data(), grid_w, grid_h, target, {}, content_w, content_h);
+        CHECK(!res.valid);
+    }
+
+    // 3. Verify isolated NAN pixels inside target are skipped while res.valid remains true with finite metrics
+    {
+        std::vector<float> disp_map(grid_w * grid_h, 0.50f);
+        DepthBox target{280.0f, 150.0f, 360.0f, 210.0f};
+        int pt = 0;
+        for (int gy = 0; gy < grid_h; ++gy) {
+            float v_px = (gy + 0.5f) * (content_h / static_cast<float>(grid_h));
+            for (int gx = 0; gx < grid_w; ++gx) {
+                float u_px = (gx + 0.5f) * (content_w / static_cast<float>(grid_w));
+                if (u_px >= target.x0 && u_px <= target.x1 && v_px >= target.y0 && v_px <= target.y1) {
+                    ++pt;
+                    if (pt % 10 == 0) {
+                        disp_map[gy * grid_w + gx] = NAN;
+                    } else {
+                        disp_map[gy * grid_w + gx] = 0.80f;
+                    }
+                }
+            }
+        }
+        auto res = analyze_box_depth(disp_map.data(), grid_w, grid_h, target, {}, content_w, content_h);
+        CHECK(res.valid);
+        CHECK(std::isfinite(res.disp_fg));
+        CHECK(std::isfinite(res.disp_bg));
+        CHECK(std::isfinite(res.depth_conf));
+        CHECK(std::isfinite(res.angle_deg));
+        CHECK(std::isfinite(res.angle_conf));
+        CHECK(std::isfinite(res.length_px));
+        CHECK(std::isfinite(res.grasp_width_px));
+    }
+}
+
 int main() {
     test_bilinear_resize();
     test_tilted_plane_recovery();
     test_pca_aspect_correction();
     test_jaw_clear();
     test_sample_table_disparity();
+    test_non_finite_handling();
 
     if (g_fail == 0) {
         std::printf("ALL %s tests passed!\n", __FILE__);

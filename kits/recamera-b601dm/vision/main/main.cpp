@@ -680,16 +680,21 @@ int main(int argc, char** argv) {
                    << ",\"grid_w\":" << depth_stage.grid_w()
                    << ",\"grid_h\":" << depth_stage.grid_h()
                    << ",\"table_samples\":[";
+                bool first = true;
                 for (size_t i = 0; i < table_samples.size(); ++i) {
-                    if (i) ds << ',';
-                    ds << '[' << std::setprecision(1) << table_samples[i].u_px << ','
-                       << table_samples[i].v_px << ',' << std::setprecision(4) << table_samples[i].disp << ']';
+                    const auto& s = table_samples[i];
+                    if (!std::isfinite(s.u_px) || !std::isfinite(s.v_px) || !std::isfinite(s.disp)) continue;
+                    if (!first) ds << ',';
+                    first = false;
+                    ds << '[' << std::setprecision(1) << s.u_px << ','
+                       << s.v_px << ',' << std::setprecision(4) << s.disp << ']';
                 }
                 ds << "]}";
                 vr.depth_json = ds.str();
             } else {
-                vr.ran_depth = true;
+                vr.ran_depth = false;
                 vr.depth_ms = ms_since(t0);
+                MA_LOGW(TAG, "Depth pipeline failed on frame %u", vr.frame_id);
             }
         }
         vr.inference_ms = ms_since(t_frame);

@@ -258,6 +258,7 @@ BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
             const float du = u_px - uc;
             const float dv = v_px - vc;
             const float d = disp_map[gy * grid_w + gx];
+            if (!std::isfinite(d)) continue;
 
             ring_dus.push_back(du);
             ring_dvs.push_back(dv);
@@ -271,6 +272,8 @@ BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
             quad_counts[q]++;
         }
     }
+
+    if (ring_ds.empty()) return res;
 
     int num_quadrants = 0;
     for (int q = 0; q < 4; ++q) {
@@ -310,6 +313,7 @@ BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
             if (!in_box(u_px, v_px, x0, y0, x1, y1)) continue;
 
             const float d_hat = disp_map[gy * grid_w + gx];
+            if (!std::isfinite(d_hat)) continue;
             const float disp_bg_hat = fit.p0 + fit.pu * (u_px - uc) + fit.pv * (v_px - vc);
             const float delta_d = d_hat - disp_bg_hat;
 
@@ -440,6 +444,7 @@ BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
             const size_t idx = static_cast<size_t>(gy * grid_w + gx);
             if (!is_self_fg[idx]) {
                 const float d_hat = disp_map[idx];
+                if (!std::isfinite(d_hat)) continue;
                 const float disp_bg_hat = fit.p0 + fit.pu * static_cast<float>(u_px - uc) +
                                           fit.pv * static_cast<float>(v_px - vc);
                 if (d_hat - disp_bg_hat > conflict_thresh) {
@@ -527,7 +532,10 @@ std::vector<TableSample> sample_table_disparity(const float* disp_map, int grid_
 
                     if (in_any_exp_box(u_px, v_px)) continue;
 
-                    patch_disps.push_back(disp_map[gy * grid_w + gx]);
+                    const float d = disp_map[gy * grid_w + gx];
+                    if (!std::isfinite(d)) continue;
+
+                    patch_disps.push_back(d);
                     sum_u += u_px;
                     sum_v += v_px;
                 }
@@ -538,6 +546,7 @@ std::vector<TableSample> sample_table_disparity(const float* disp_map, int grid_
             std::vector<float> p_copy = patch_disps;
             float med = calc_median(p_copy);
             float mad_val = calc_mad(patch_disps);
+            if (!std::isfinite(med) || !std::isfinite(mad_val)) continue;
             float mad_thresh = 0.05f * std::max(med, 1e-3f);
 
             if (mad_val > mad_thresh) continue;
