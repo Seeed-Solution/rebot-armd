@@ -330,11 +330,11 @@ BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
     const float fg_thresh = std::max(3.0f * mad_bg, 0.25f * delta_d_P80);
 
     std::vector<FgPoint> fg_pts;
-    std::vector<float> fg_disp;
+    std::vector<float> fg_deltas;
     for (size_t i = 0; i < box_pts.size(); ++i) {
         if (box_deltas[i] > fg_thresh) {
             fg_pts.push_back(box_pts[i]);
-            fg_disp.push_back(box_pts[i].disp);
+            fg_deltas.push_back(box_deltas[i]);
         }
     }
 
@@ -346,8 +346,19 @@ BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
     }
 
     res.valid = true;
-    res.disp_fg = calc_percentile(fg_disp, 0.75f);
-    res.disp_bg = std::max(0.0f, fit.p0);
+    // Foreground and background at the same image location: the table plane is evaluated at the
+    // foreground centroid and the object top is that value plus the P75 residual above the plane.
+    // Raw foreground disparity would include the table's own slope across an oblique view.
+    float fg_u = 0.0f;
+    float fg_v = 0.0f;
+    for (const auto& pt : fg_pts) {
+        fg_u += pt.u;
+        fg_v += pt.v;
+    }
+    fg_u /= static_cast<float>(fg_count);
+    fg_v /= static_cast<float>(fg_count);
+    res.disp_bg = std::max(0.0f, fit.p0 + fit.pu * (fg_u - uc) + fit.pv * (fg_v - vc));
+    res.disp_fg = res.disp_bg + calc_percentile(fg_deltas, 0.75f);
 
     const float snr = std::max(0.0f, (res.disp_fg - res.disp_bg) / mad_bg);
     const float snr_term = std::clamp(snr / (snr + 6.0f), 0.0f, 1.0f);
