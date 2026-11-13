@@ -49,6 +49,11 @@ std::string detections_json(const std::vector<DetBox>& dets, const ContentRect& 
         if (std::isfinite(d.angle_conf)) s << ",\"angle_conf\":" << std::setprecision(3) << d.angle_conf;
         if (std::isfinite(d.grasp_width_px)) s << ",\"grasp_width_px\":" << std::setprecision(2) << d.grasp_width_px;
         if (d.mask_focus) s << ",\"mask_focus\":true";
+        if (std::isfinite(d.disp_fg)) s << ",\"disp_fg\":" << std::setprecision(4) << d.disp_fg;
+        if (std::isfinite(d.disp_bg)) s << ",\"disp_bg\":" << std::setprecision(4) << d.disp_bg;
+        if (std::isfinite(d.depth_conf)) s << ",\"depth_conf\":" << std::setprecision(3) << d.depth_conf;
+        if (std::isfinite(d.length_px)) s << ",\"length_px\":" << std::setprecision(2) << d.length_px;
+        if (d.jaw_clear >= 0) s << ",\"jaw_clear\":" << (d.jaw_clear ? "true" : "false");
         s << '}';
     }
     s << ']';

@@ -17,6 +17,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -28,6 +30,8 @@
 
 #include "aruco_stage.h"
 #include "capture_time.h"
+#include "depth_geom.h"
+#include "depth_stage.h"
 #include "detector.h"
 #include "http_control.h"
 #include "json.hpp"
@@ -60,6 +64,9 @@ struct Config {
 
     rv::ArucoConfig aruco;
     int aruco_stats_every = 200;  ///< log p50/p95 of the ArUco stages every N ArUco frames (0 = off)
+    std::string depth_model_path;  // empty: first existing default; "off": disabled
+    std::string depth_metric_str = "auto";  // "auto", "on", "off"
+    bool depth_metric = false;
     bool verbose = false;
 } g_cfg;
 
@@ -68,6 +75,13 @@ const char* kDefaultModels[] = {
     "/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel",
     "/userdata/local/models/yolo11n_detection_cv181x_int8.cvimodel",
     "/userdata/local/models/yolo11n_cv181x_int8.cvimodel",
+};
+
+const char* kDefaultDepthModels[] = {
+    "/userdata/rebot-teleop/models/zipdepth_metric_384x224_bf16_rgb.cvimodel",
+    "/userdata/rebot-teleop/models/zipdepth_base_384x224_bf16_rgb.cvimodel",
+    "/userdata/local/models/zipdepth_metric_384x224_bf16_rgb.cvimodel",
+    "/userdata/local/models/zipdepth_base_384x224_bf16_rgb.cvimodel",
 };
 
 /** Collects ArUco frame timings and logs p50/p95 per stage every n frames. */
@@ -176,6 +190,8 @@ void load_config_file(const std::string& path) {
         if (!aruco::parse_id_list(it->get<std::string>(), g_cfg.aruco.filter.ids, &err))
             MA_LOGW(TAG, "%s: bad ids: %s", path.c_str(), err.c_str());
     }
+    str("depth_model", g_cfg.depth_model_path);
+    str("depth_metric", g_cfg.depth_metric_str);
 }
 
 void print_usage(const char* prog) {
@@ -186,6 +202,8 @@ void print_usage(const char* prog) {
     printf("  --inference on|off       Default subscription (the mode API) at start [default: off = standby]\n");
     printf("  --mask on|off            Decode instance segmentation masks [default: off]\n");
     printf("  --mask-max-boxes N       Max boxes with decoded segmentation masks, 1..20 [default: 3]\n");
+    printf("  --depth-model PATH       ZipDepth .cvimodel (or \"off\" to disable) [default: first existing]\n");
+    printf("  --depth-metric auto|on|off  Metric depth mode (auto detects \"metric\" in filename) [default: auto]\n");
     printf("  --fps N                  Inference rate of the default subscription and cap of every\n");
     printf("                           subscription, 1..15 [default: 5]\n");
     printf("  -m, --model PATH         YOLO .cvimodel [default: first of /userdata/rebot-teleop/models/yolo11n.cvimodel,\n");
@@ -218,7 +236,8 @@ bool parse_double(const char* s, double& out, bool non_negative = false) {
 bool parse_args(int argc, char** argv) {
     enum {
         kConfig = 1000, kMode, kInference, kFps, kFx, kFy, kCx, kCy, kK1, kK2, kP1, kP2, kK3, kDecimate,
-        kMinMargin, kMinSide, kIds, kStreamFps, kStreamBitrate, kDebugPort, kControlPort, kMask, kMaskMaxBoxes
+        kMinMargin, kMinSide, kIds, kStreamFps, kStreamBitrate, kDebugPort, kControlPort, kMask, kMaskMaxBoxes,
+        kDepthModel, kDepthMetric
     };
     static struct option long_opts[] = {
         {"config", required_argument, nullptr, kConfig},
@@ -226,6 +245,8 @@ bool parse_args(int argc, char** argv) {
         {"inference", required_argument, nullptr, kInference},
         {"mask", required_argument, nullptr, kMask},
         {"mask-max-boxes", required_argument, nullptr, kMaskMaxBoxes},
+        {"depth-model", required_argument, nullptr, kDepthModel},
+        {"depth-metric", required_argument, nullptr, kDepthMetric},
         {"fps", required_argument, nullptr, kFps},
         {"model", required_argument, nullptr, 'm'},
         {"conf-threshold", required_argument, nullptr, 'c'},
@@ -292,6 +313,14 @@ bool parse_args(int argc, char** argv) {
                 g_cfg.mask_max_boxes = n;
                 break;
             }
+            case kDepthModel: g_cfg.depth_model_path = optarg; break;
+            case kDepthMetric:
+                if (std::strcmp(optarg, "auto") && std::strcmp(optarg, "on") && std::strcmp(optarg, "off")) {
+                    fprintf(stderr, "Invalid --depth-metric '%s' (auto|on|off)\n", optarg);
+                    return false;
+                }
+                g_cfg.depth_metric_str = optarg;
+                break;
             case kFps: g_cfg.fps = std::atoi(optarg); break;
             case 'm': g_cfg.model_path = optarg; break;
             case 'c': g_cfg.conf_threshold = static_cast<float>(std::atof(optarg)); break;
@@ -420,6 +449,40 @@ int main(int argc, char** argv) {
             g_cfg.aruco.filter.min_margin, g_cfg.aruco.filter.min_side_px,
             aruco::format_id_list(g_cfg.aruco.filter.ids).c_str());
 
+    std::string depth_model = g_cfg.depth_model_path;
+    bool depth_disabled = (depth_model == "off");
+    if (!depth_disabled && depth_model.empty()) {
+        for (const char* p : kDefaultDepthModels) {
+            if (file_exists(p)) {
+                depth_model = p;
+                break;
+            }
+        }
+    }
+    rv::DepthStage depth_stage;
+    bool depth_ok = false;
+    if (depth_disabled) {
+        MA_LOGI(TAG, "Depth pipeline disabled (--depth-model off)");
+    } else if (depth_model.empty() || !file_exists(depth_model)) {
+        MA_LOGW(TAG, "No depth model found (%s); depth unavailable",
+                depth_model.empty() ? "default paths" : depth_model.c_str());
+    } else if (depth_stage.init(depth_model)) {
+        depth_ok = true;
+        if (g_cfg.depth_metric_str == "on") {
+            g_cfg.depth_metric = true;
+        } else if (g_cfg.depth_metric_str == "off") {
+            g_cfg.depth_metric = false;
+        } else {
+            // "auto"
+            g_cfg.depth_metric = (base_name(depth_model).find("metric") != std::string::npos);
+        }
+        MA_LOGI(TAG, "Depth model %s loaded (%s, %dx%d)", depth_model.c_str(),
+                g_cfg.depth_metric ? "metric" : "relative",
+                depth_stage.grid_w(), depth_stage.grid_h());
+    } else {
+        MA_LOGE(TAG, "Depth model %s failed to load; depth unavailable", depth_model.c_str());
+    }
+
     af::App app("rebot-vision");
     af::CameraOptions cam;
     cam.width = static_cast<uint16_t>(g_cfg.inference_w);
@@ -450,6 +513,10 @@ int main(int argc, char** argv) {
     vo.mask = g_cfg.mask_enabled && (detector.getKind() == yolo::Kind::Segment);
     vo.mask_max_boxes = g_cfg.mask_max_boxes;
     vo.family = g_cfg.aruco.family;
+    vo.depth_available = depth_ok;
+    vo.depth_model_name = depth_ok ? base_name(depth_model) : "";
+    vo.depth_model_path = depth_ok ? depth_model : "";
+    vo.depth_metric = g_cfg.depth_metric;
     ma::Camera* camera = device_camera();
     rv::VisionControl ctl(vo, [&app, camera](bool on, int gate_fps) {
         // set_camera_fps() is applied by the frame thread at its next loop, but that thread
@@ -564,6 +631,67 @@ int main(int argc, char** argv) {
             vr.markers_json = rv::markers_json(markers);
             display_markers = rv::markers_json(markers, disp_sx, disp_sy);
         }
+        if (p.depth && depth_ok) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const af::VideoFrame sub = frame.sub_frame(crop);
+            if (sub.valid() && depth_stage.run(static_cast<const uint8_t*>(sub.data()), sub.width, sub.height, static_cast<int>(sub.stride()))) {
+                vr.ran_depth = true;
+                vr.depth_ms = ms_since(t0);
+
+                // Convert DetBoxes to DepthBoxes in content pixel coordinates
+                std::vector<rv::DepthBox> all_depth_boxes;
+                all_depth_boxes.reserve(dets.size());
+                for (const auto& d : dets) {
+                    const float x = (d.x * frame.width - content.x) / content.w;
+                    const float y = (d.y * frame.height - content.y) / content.h;
+                    const float w = d.w * frame.width / content.w;
+                    const float h = d.h * frame.height / content.h;
+                    all_depth_boxes.push_back({
+                        (x - w * 0.5f) * content.w,
+                        (y - h * 0.5f) * content.h,
+                        (x + w * 0.5f) * content.w,
+                        (y + h * 0.5f) * content.h
+                    });
+                }
+
+                // Analyze each detection box
+                for (size_t i = 0; i < dets.size(); ++i) {
+                    auto res = rv::analyze_box_depth(depth_stage.depth_map(), depth_stage.grid_w(), depth_stage.grid_h(),
+                                                     i, all_depth_boxes, content.w, content.h);
+                    if (res.valid) {
+                        dets[i].disp_fg = res.disp_fg;
+                        dets[i].disp_bg = res.disp_bg;
+                        dets[i].depth_conf = res.depth_conf;
+                        dets[i].length_px = res.length_px;
+                        dets[i].jaw_clear = res.jaw_clear;
+                        if (!std::isfinite(dets[i].angle_deg)) {
+                            dets[i].angle_deg = res.angle_deg;
+                            dets[i].angle_conf = res.angle_conf;
+                            dets[i].grasp_width_px = res.grasp_width_px;
+                        }
+                    }
+                }
+                vr.detections_json = rv::detections_json(dets, content, frame.width, frame.height);
+
+                auto table_samples = rv::sample_table_disparity(depth_stage.depth_map(), depth_stage.grid_w(), depth_stage.grid_h(),
+                                                                all_depth_boxes, content.w, content.h);
+                std::ostringstream ds;
+                ds << std::fixed << "{\"metric_model\":" << (g_cfg.depth_metric ? "true" : "false")
+                   << ",\"grid_w\":" << depth_stage.grid_w()
+                   << ",\"grid_h\":" << depth_stage.grid_h()
+                   << ",\"table_samples\":[";
+                for (size_t i = 0; i < table_samples.size(); ++i) {
+                    if (i) ds << ',';
+                    ds << '[' << std::setprecision(1) << table_samples[i].u_px << ','
+                       << table_samples[i].v_px << ',' << std::setprecision(4) << table_samples[i].disp << ']';
+                }
+                ds << "]}";
+                vr.depth_json = ds.str();
+            } else {
+                vr.ran_depth = true;
+                vr.depth_ms = ms_since(t0);
+            }
+        }
         vr.inference_ms = ms_since(t_frame);
         ctl.publish(vr);
 
@@ -575,8 +703,9 @@ int main(int argc, char** argv) {
         r.debug_extra = extra;
 
         if (g_cfg.verbose) {
-            MA_LOGI(TAG, "Frame %u %s: %zu detections (%.0f ms), %zu markers (%.0f ms)", vr.frame_id,
-                    rv::mode_name(vr.mode), dets.size(), vr.yolo_ms, markers.size(), vr.aruco_ms);
+            MA_LOGI(TAG, "Frame %u %s: %zu detections (%.0f ms), %zu markers (%.0f ms), depth %s (%.0f ms)",
+                    vr.frame_id, rv::mode_name(vr.mode), dets.size(), vr.yolo_ms, markers.size(), vr.aruco_ms,
+                    vr.ran_depth ? "on" : "off", vr.depth_ms);
         }
     });
 

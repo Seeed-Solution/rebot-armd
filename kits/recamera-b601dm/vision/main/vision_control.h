@@ -24,11 +24,18 @@ enum class Mode : uint8_t { Off, Yolo, Aruco, Both };
 struct Pipelines {
     bool yolo = false;
     bool aruco = false;
-    bool any() const noexcept { return yolo || aruco; }
-    bool operator==(const Pipelines& o) const noexcept { return yolo == o.yolo && aruco == o.aruco; }
-    Pipelines operator|(const Pipelines& o) const noexcept { return {yolo || o.yolo, aruco || o.aruco}; }
+    bool depth = false;
+    bool any() const noexcept { return yolo || aruco || depth; }
+    bool operator==(const Pipelines& o) const noexcept {
+        return yolo == o.yolo && aruco == o.aruco && depth == o.depth;
+    }
+    Pipelines operator|(const Pipelines& o) const noexcept {
+        return {yolo || o.yolo, aruco || o.aruco, depth || o.depth};
+    }
     /** Every pipeline of `o` is in this set. */
-    bool covers(const Pipelines& o) const noexcept { return (yolo || !o.yolo) && (aruco || !o.aruco); }
+    bool covers(const Pipelines& o) const noexcept {
+        return (yolo || !o.yolo) && (aruco || !o.aruco) && (depth || !o.depth);
+    }
 };
 
 /**
@@ -99,8 +106,10 @@ struct VisionResult {
     Mode mode = Mode::Off;  ///< base mode when the frame ran
     bool ran_yolo = false;
     bool ran_aruco = false;
+    bool ran_depth = false;
     float yolo_ms = 0;
     float aruco_ms = 0;
+    float depth_ms = 0;
     float mask_ms = -1.0f;
     int width = 640;   ///< visible image size that detections / markers refer to
     int height = 360;
@@ -110,6 +119,7 @@ struct VisionResult {
     bool undistorted = false;
     std::string markers_json = "[]";  ///< pixels in width x height
     std::string aruco_stages_json;    ///< pipelines.aruco.stages object (ms per stage); empty: omitted
+    std::string depth_json;           ///< top-level depth object; empty: omitted
     // Frame thread timeline (mono_ms()), reported in a trigger's "timing" object.
     uint64_t wait_ms = 0;     ///< the frame thread started waiting for this frame
     uint64_t grab_ms = 0;     ///< retrieveFrame() returned it
@@ -156,9 +166,13 @@ public:
         bool mask = false;
         int mask_max_boxes = 3;
         std::string family = "aruco4x4_50";
+        bool depth_available = false;
+        std::string depth_model_name;
+        std::string depth_model_path;
+        bool depth_metric = false;
     };
 
-    enum class Status { Ok, BadFps, YoloUnavailable, Full, NotFound };
+    enum class Status { Ok, BadFps, YoloUnavailable, DepthUnavailable, Full, NotFound };
 
     class TriggerScope {
     public:
@@ -201,6 +215,10 @@ public:
     bool mask_enabled() const noexcept { return mask_; }
     int mask_max_boxes() const noexcept { return mask_max_boxes_; }
     const std::string& family() const noexcept { return family_; }
+    bool depth_available() const noexcept { return depth_available_; }
+    const std::string& depth_model_name() const noexcept { return depth_model_name_; }
+    const std::string& depth_model_path() const noexcept { return depth_model_path_; }
+    bool depth_metric() const noexcept { return depth_metric_; }
 
     /** Camera gate rate requested last (camera_gate_fps for the current state). */
     int camera_fps() const;
@@ -292,6 +310,10 @@ private:
     const bool mask_;
     const int mask_max_boxes_;
     const std::string family_;
+    const bool depth_available_;
+    const std::string depth_model_name_;
+    const std::string depth_model_path_;
+    const bool depth_metric_;
     OnChange on_change_;
     mutable std::mutex mu_;
     std::condition_variable cv_;

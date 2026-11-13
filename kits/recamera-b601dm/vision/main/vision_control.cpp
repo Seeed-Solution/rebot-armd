@@ -93,6 +93,10 @@ VisionControl::VisionControl(const Options& opt, OnChange on_change)
       mask_(opt.mask),
       mask_max_boxes_(opt.mask_max_boxes),
       family_(opt.family),
+      depth_available_(opt.depth_available),
+      depth_model_name_(opt.depth_model_name),
+      depth_model_path_(opt.depth_model_path),
+      depth_metric_(opt.depth_metric),
       on_change_(std::move(on_change)),
       fps_(clamp_fps(opt.fps)) {
     Mode m = opt.mode;
@@ -301,6 +305,7 @@ VisionControl::Status VisionControl::subscribe(const std::string& client, const 
                                                int fps, int ttl_ms, uint64_t now_ms, Subscription& out) {
     if (fps != 0 && (fps < kMinFps || fps > kMaxFps)) return Status::BadFps;
     if (p.yolo && !yolo_available_) return Status::YoloUnavailable;
+    if (p.depth && !depth_available_) return Status::DepthUnavailable;
     ttl_ms = std::max(kMinTtlMs, std::min(kMaxTtlMs, ttl_ms));
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -453,7 +458,7 @@ bool VisionControl::wait_fresh(uint32_t after, uint64_t request_ms, Pipelines ne
     // lack its pipelines; the next one has them.
     auto fresh = [&] {
         return latest_.frame_id > after && latest_.frame_ms >= request_ms &&
-               Pipelines{latest_.ran_yolo, latest_.ran_aruco}.covers(need);
+               Pipelines{latest_.ran_yolo, latest_.ran_aruco, latest_.ran_depth}.covers(need);
     };
     cv_.wait_for(lk, std::chrono::milliseconds(wait_ms), [&] { return fresh() || stopping_; });
     out = latest_;
@@ -505,6 +510,7 @@ static nlohmann::json pipeline_list(Pipelines p) {
     nlohmann::json a = nlohmann::json::array();
     if (p.yolo) a.push_back("yolo");
     if (p.aruco) a.push_back("aruco");
+    if (p.depth) a.push_back("depth");
     return a;
 }
 
@@ -548,7 +554,7 @@ static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0) {
         {"api_version", kApiVersion},
         {"mode", mode_name(m)},
         {"modes", {"off", "yolo", "aruco", "both"}},
-        {"pipelines", {{"yolo", p.yolo}, {"aruco", p.aruco}}},
+        {"pipelines", {{"yolo", p.yolo}, {"aruco", p.aruco}, {"depth", p.depth}}},
         {"last_active_mode", mode_name(ctl.last_active_mode())},
         {"enabled", ctl.continuous_enabled()},
         {"processing", ctl.processing()},
@@ -563,8 +569,9 @@ static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0) {
         {"subscriptions", true},
         {"max_fps", ctl.active_fps()},
         {"continuous", continuous_json(ctl.continuous())},
-        {"available", {{"yolo", ctl.yolo_available()}, {"aruco", true}}},
+        {"available", {{"yolo", ctl.yolo_available()}, {"aruco", true}, {"depth", ctl.depth_available()}}},
         {"model", {{"name", ctl.model_name()}, {"path", ctl.model_path()}, {"kind", ctl.model_kind()}, {"mask", ctl.mask_enabled()}, {"mask_max_boxes", ctl.mask_max_boxes()}}},
+        {"depth_model", ctl.depth_available() ? nlohmann::json{{"name", ctl.depth_model_name()}, {"path", ctl.depth_model_path()}, {"metric", ctl.depth_metric()}} : nullptr},
         {"family", ctl.family()},
         {"mask_focus", ctl.get_mask_focus(now, mf) ? mask_focus_json(mf, now) : nullptr},
     };
@@ -623,10 +630,13 @@ static void put_result(std::ostringstream& s, const VisionResult& r, const std::
     }
     s << "},\"aruco\":{\"ran\":" << (r.ran_aruco ? "true" : "false") << ",\"ms\":" << r.aruco_ms;
     if (!r.aruco_stages_json.empty()) s << ",\"stages\":" << r.aruco_stages_json;
-    s << "}}"
+    s << "},\"depth\":{\"ran\":" << (r.ran_depth ? "true" : "false") << ",\"ms\":" << r.depth_ms << "}}"
       << ",\"detections\":" << r.detections_json << ",\"count\":" << r.count << ",\"family\":\"" << family
       << "\",\"undistorted\":" << (r.undistorted ? "true" : "false") << ",\"rejected\":" << r.rejected
       << ",\"markers\":" << r.markers_json;
+    if (r.ran_depth && !r.depth_json.empty()) {
+        s << ",\"depth\":" << r.depth_json;
+    }
 }
 
 static HttpReply latest_reply(VisionControl& ctl, const std::string& query, uint64_t now_ms) {
@@ -664,6 +674,12 @@ static HttpReply yolo_unavailable_reply() {
     return {409, j.dump()};
 }
 
+static HttpReply depth_unavailable_reply() {
+    nlohmann::json j = {{"api_version", kApiVersion}, {"error", "depth unavailable"},
+                        {"detail", "the depth model did not load"}};
+    return {409, j.dump()};
+}
+
 /** Body as a JSON object; an empty or blank body is {}. False when it is not an object. */
 static bool body_object(const std::string& body, nlohmann::json& out) {
     if (body.find_first_not_of(" \t\r\n") == std::string::npos) {
@@ -674,7 +690,7 @@ static bool body_object(const std::string& body, nlohmann::json& out) {
     return !out.is_discarded() && out.is_object();
 }
 
-/** "pipelines": a non-empty list of "yolo" / "aruco" (duplicates allowed). */
+/** "pipelines": a non-empty list of "yolo" / "aruco" / "depth" (duplicates allowed). */
 static bool parse_pipelines(const nlohmann::json& v, Pipelines& out) {
     if (!v.is_array() || v.empty()) return false;
     Pipelines p;
@@ -683,13 +699,14 @@ static bool parse_pipelines(const nlohmann::json& v, Pipelines& out) {
         const std::string s = x.get<std::string>();
         if (s == "yolo") p.yolo = true;
         else if (s == "aruco") p.aruco = true;
+        else if (s == "depth") p.depth = true;
         else return false;
     }
     out = p;
     return true;
 }
 
-static const char* kPipelinesError = "\"pipelines\" must be a non-empty list of \"yolo\", \"aruco\"";
+static const char* kPipelinesError = "\"pipelines\" must be a non-empty list of \"yolo\", \"aruco\", \"depth\"";
 
 static bool parse_mask_focus(const nlohmann::json& v, MaskFocus& out) {
     if (!v.is_object()) return false;
@@ -755,6 +772,7 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, con
     if (auto it = j.find("pipelines"); it != j.end()) {
         if (!parse_pipelines(*it, want)) return {400, error_body(kPipelinesError)};
         if (want.yolo && !ctl.yolo_available()) return yolo_unavailable_reply();
+        if (want.depth && !ctl.depth_available()) return depth_unavailable_reply();
     }
     bool has_focus = false;
     MaskFocus focus;
@@ -809,6 +827,7 @@ static HttpReply status_reply(VisionControl::Status st, const std::string& ok_bo
         case VisionControl::Status::BadFps:
             return {400, error_body("fps must be an integer in 1..15")};
         case VisionControl::Status::YoloUnavailable: return yolo_unavailable_reply();
+        case VisionControl::Status::DepthUnavailable: return depth_unavailable_reply();
         case VisionControl::Status::Full: return {503, error_body("too many subscriptions")};
         case VisionControl::Status::NotFound: return {404, error_body("no such subscription")};
         default: return {200, ok_body};

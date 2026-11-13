@@ -21,6 +21,8 @@ set(srcs
     ${CMAKE_CURRENT_LIST_DIR}/detector.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mask_geom.cpp
     ${CMAKE_CURRENT_LIST_DIR}/seg_model.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/depth_geom.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/depth_stage.cpp
 )
 
 component_register(

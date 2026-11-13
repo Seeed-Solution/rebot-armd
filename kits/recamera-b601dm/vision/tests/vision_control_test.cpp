@@ -47,7 +47,7 @@ struct Calls {
     }
 };
 
-static VisionControl::Options opts(Mode m, bool enabled = false, int fps = 10, bool yolo = true) {
+static VisionControl::Options opts(Mode m, bool enabled = false, int fps = 10, bool yolo = true, bool depth = false) {
     VisionControl::Options o;
     o.mode = m;
     o.enabled = enabled;
@@ -55,6 +55,10 @@ static VisionControl::Options opts(Mode m, bool enabled = false, int fps = 10, b
     o.yolo_available = yolo;
     o.model_name = "yolo11n";
     o.model_path = "/userdata/local/models/yolo11n.cvimodel";
+    o.depth_available = depth;
+    o.depth_model_name = depth ? "zipdepth_base_384x224_bf16_rgb" : "";
+    o.depth_model_path = depth ? "/userdata/local/models/zipdepth_base_384x224_bf16_rgb.cvimodel" : "";
+    o.depth_metric = false;
     return o;
 }
 
@@ -85,9 +89,13 @@ private:
             r.mode = c_.mode();
             r.ran_yolo = p.yolo;
             r.ran_aruco = p.aruco;
+            r.ran_depth = p.depth;
             r.detections_json = p.yolo ? R"([{"class_id":39,"class_name":"bottle","confidence":0.7,"x":0.5,"y":0.5,"w":0.1,"h":0.2}])" : "[]";
             r.markers_json = p.aruco ? R"([{"id":3,"center":[320.0,180.0]}])" : "[]";
             r.count = p.aruco ? 1 : 0;
+            if (p.depth) {
+                r.depth_json = R"({"grid_h":224,"grid_w":384,"metric_model":false,"table_samples":[[320.0,180.0,0.5]]})";
+            }
             c_.publish(r);
             ++processed;
         }
@@ -109,6 +117,7 @@ static void test_modes() {
     CHECK(m["api_version"] == kApiVersion);
     CHECK(m["mode"] == "yolo" && m["enabled"] == false && m["fps"] == 1 && m["active_fps"] == 10);
     CHECK(m["available"]["yolo"] == true && m["available"]["aruco"] == true && m["trigger"] == true);
+    CHECK(m["available"]["depth"] == false && m["depth_model"].is_null());
     CHECK(m["modes"].size() == 4);
 
     // mode + enabled in one call; rate follows
@@ -876,10 +885,85 @@ static void test_mask_focus_control() {
     c.trigger_end(4000100);
 }
 
+static void test_depth_unavailable() {
+    VisionControl c(opts(Mode::Off, false, 10, true, /*depth=*/false), nullptr);
+    int st = 0;
+    json e = req(c, "POST", "/api/trigger", R"({"pipelines":["depth"]})", &st);
+    CHECK(st == 409 && e["error"] == "depth unavailable" && e["detail"] == "the depth model did not load");
+
+    req(c, "POST", "/api/subscribe", R"({"client":"sub1","pipelines":["depth"]})", &st);
+    CHECK(st == 409);
+
+    json m = req(c, "GET", "/api/mode");
+    CHECK(m["available"]["depth"] == false);
+    CHECK(m["pipelines"]["depth"] == false);
+    CHECK(m["depth_model"].is_null());
+}
+
+static void test_depth_trigger_and_status() {
+    VisionControl c(opts(Mode::Off, false, 10, true, /*depth=*/true), nullptr);
+    json m = req(c, "GET", "/api/mode");
+    CHECK(m["available"]["depth"] == true);
+    CHECK(!m["depth_model"].is_null());
+    CHECK(m["depth_model"]["name"] == "zipdepth_base_384x224_bf16_rgb");
+    CHECK(m["depth_model"]["metric"] == false);
+
+    FakeCamera cam(c, 20);
+    int st = 0;
+    json r = req(c, "POST", "/api/trigger?wait_ms=2000", R"({"pipelines":["depth"]})", &st);
+    CHECK(st == 200 && r["success"] == true);
+    CHECK(r["requested"] == json({"depth"}));
+    CHECK(r["pipelines"]["depth"]["ran"] == true);
+    CHECK(r.contains("depth"));
+    CHECK(r["depth"]["grid_w"] == 384);
+    CHECK(r["depth"]["grid_h"] == 224);
+    CHECK(r["depth"]["metric_model"] == false);
+    CHECK(r["depth"]["table_samples"].is_array());
+    CHECK(r["depth"]["table_samples"].size() == 1);
+    CHECK(r["depth"]["table_samples"][0][0] == 320.0);
+    CHECK(r["depth"]["table_samples"][0][2] == 0.5);
+}
+
+static void test_detections_json_depth() {
+    DetBox d;
+    d.x = 0.5f; d.y = 0.5f; d.w = 0.2f; d.h = 0.2f;
+    d.confidence = 0.85f;
+    d.class_id = 1;
+    d.class_name = "cube";
+    d.disp_fg = 0.75f;
+    d.disp_bg = 0.40f;
+    d.depth_conf = 0.92f;
+    d.length_px = 54.3f;
+    d.jaw_clear = 1;
+
+    ContentRect cr{0, 0, 640, 360};
+    std::string s = detections_json({d}, cr, 640, 360);
+    json j = json::parse(s);
+    CHECK(j.is_array() && j.size() == 1);
+    CHECK(std::abs(j[0]["disp_fg"].get<float>() - 0.75f) < 1e-3);
+    CHECK(std::abs(j[0]["disp_bg"].get<float>() - 0.40f) < 1e-3);
+    CHECK(std::abs(j[0]["depth_conf"].get<float>() - 0.92f) < 1e-3);
+    CHECK(std::abs(j[0]["length_px"].get<float>() - 54.3f) < 1e-1);
+    CHECK(j[0]["jaw_clear"] == true);
+
+    d.jaw_clear = 0;
+    s = detections_json({d}, cr, 640, 360);
+    j = json::parse(s);
+    CHECK(j[0]["jaw_clear"] == false);
+
+    d.jaw_clear = -1;
+    s = detections_json({d}, cr, 640, 360);
+    j = json::parse(s);
+    CHECK(!j[0].contains("jaw_clear"));
+}
+
 int main() {
     test_modes();
     test_status_endpoint();
     test_yolo_unavailable();
+    test_depth_unavailable();
+    test_depth_trigger_and_status();
+    test_detections_json_depth();
     test_trigger_each_mode();
     test_trigger_timeout_and_continuous();
     test_rate_gate();

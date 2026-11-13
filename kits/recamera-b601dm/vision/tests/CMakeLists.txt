@@ -69,6 +69,11 @@ target_include_directories(seg_decode_test PRIVATE ${MAIN})
 target_compile_options(seg_decode_test PRIVATE -Wall -Wextra)
 add_test(NAME seg_decode COMMAND seg_decode_test)
 
+add_executable(depth_geom_test ${CMAKE_CURRENT_LIST_DIR}/depth_geom_test.cpp ${MAIN}/depth_geom.cpp)
+target_include_directories(depth_geom_test PRIVATE ${MAIN})
+target_compile_options(depth_geom_test PRIVATE -Wall -Wextra)
+add_test(NAME depth_geom COMMAND depth_geom_test)
+
 # ArUco stage benchmark (time per frame and recall, baseline vs tuned detector settings):
 # needs the apriltag sources from SSCMA_ROOT/components/apriltag (with the patched files of
 # ../apriltag_patched), so it is only built when SSCMA_ROOT is set. Built with -O2 so
