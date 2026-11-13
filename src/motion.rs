@@ -821,6 +821,18 @@ pub struct ActionStatus {
     /// Grasp height probe: the upward move used (m), absent when the probe did not move.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_dz_m: Option<f32>,
+    /// Grasp depth anchoring source (`metric_table`, `metric_prior`, `oblique_ransac`, `two_height_fk`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth_anchor: Option<String>,
+    /// Grasp: measured optical depth of the target foreground (m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_depth_m: Option<f32>,
+    /// Grasp: measured object length on the table plane (m).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_length_m: Option<f32>,
+    /// Grasp: true when depth inference confirms the jaw descent corridor is clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jaw_clear: Option<bool>,
     /// Grasp centring with the target's box cut by the image border: `shifted` (centred uncut
     /// at an aim pixel inside the image, `border_shift_px` from the grip pixel / image centre,
     /// then moved by the model's offset between the two) or `cut` (still cut: centred on the

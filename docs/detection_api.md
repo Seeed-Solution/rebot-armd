@@ -21,7 +21,7 @@ Every `rebot-vision` response body has `"api_version"`: 2 from 1.3.0, 1 in 1.2. 
 | `/api/v1/detection/inference` | `GET` | `GET /api/inference` | `{"enabled":bool,"fps":n,"active_fps":n,"idle_fps":1}` |
 | `/api/v1/detection/inference` | `POST` | `POST /api/inference` | Body `{"enabled":true\|false}`; same shape as GET. A bad body returns 400 `{"error":...}` |
 | `/api/v1/detection/latest` | `GET` | `GET /api/results/latest` (query string passed through) | `{"enabled":bool,"frame_id":u32,"ts_ms":n,"age_ms":n,"inference_time_ms":n,"detections":[...],"timeout"?:true}` |
-| `/api/v1/detection/trigger` | `POST` | `POST /api/trigger` (query string and JSON body passed through) | Body (version 2) `{"pipelines"?: ["yolo"] \| ["aruco"] \| ["yolo","aruco"], "wait_ms"?: 0..5000, "mask_focus"?: {"label"?: string, "box_norm": [x0,y0,x1,y1]}}`. `{"success":true,"requested":[...],"frame_id":u32,...}` (result envelope below) or `{"success":false,"timeout":true,"count":0,"detections":[],"markers":[]}`. Bad `pipelines` → 400, `yolo` without a model → 409 |
+| `/api/v1/detection/trigger` | `POST` | `POST /api/trigger` (query string and JSON body passed through) | Body (version 2) `{"pipelines"?: ["yolo"] \| ["aruco"] \| ["depth"] \| ["yolo","depth"] \| ..., "wait_ms"?: 0..5000, "mask_focus"?: {"label"?: string, "box_norm": [x0,y0,x1,y1]}}`. `{"success":true,"requested":[...],"frame_id":u32,...}` (result envelope below) or `{"success":false,"timeout":true,"count":0,"detections":[],"markers":[]}`. Bad `pipelines` → 400, `yolo`/`depth` without a model → 409 |
 | `/api/v1/detection/mask_focus` | `GET` | `GET /api/mask_focus` | `{"api_version":2,"mask_focus":{...}\|null}` |
 | `/api/v1/detection/mask_focus` | `POST` | `POST /api/mask_focus` | Body `{"label"?: string, "box_norm": [x0,y0,x1,y1], "ttl_ms"?: 100..10000}`; empty `{}` or `ttl_ms: 0` clears it. Returns same shape as GET |
 | `/api/v1/vision/mode` | `GET` | `GET /api/mode` | mode body below |
@@ -85,7 +85,7 @@ The single-shot button calls `/api/v1/detection/trigger` with the selector's pip
 
 `GET /api/v1/vision/mode`:
 
-`per_request_pipelines`, `subscriptions`, `max_fps` and `continuous` are new in version 2. `model.mask_max_boxes` (1..20, default 3) and `mask_focus` (active focus or `null`) report mask focus and budget configuration.
+`per_request_pipelines`, `subscriptions`, `max_fps` and `continuous` are new in version 2. `available.depth` and `depth_model` (`null` or `{"name": string, "path": string, "metric": bool}`) report monocular depth availability. `model.mask_max_boxes` (1..20, default 3) and `mask_focus` (active focus or `null`) report mask focus and budget configuration.
 
 ```json
 {"api_version":2,"mode":"both","modes":["off","yolo","aruco","both"],
@@ -94,21 +94,23 @@ The single-shot button calls `/api/v1/detection/trigger` with the selector's pip
  "measured":{"input_fps":7.5,"result_fps":5.0},"trigger":true,
  "per_request_pipelines":true,"subscriptions":true,"max_fps":5,
  "continuous":{"active":true,"pipelines":["yolo","aruco"],"fps":5,"subscriptions":0},
- "available":{"yolo":true,"aruco":true},
+ "available":{"yolo":true,"aruco":true,"depth":true},
  "model":{"name":"yolo11n_detection_cv181x_int8","path":"/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel","kind":"detect","mask":false,"mask_max_boxes":3},
+ "depth_model":{"name":"depth_anything_v2_vits_cv181x_bf16","path":"/usr/share/supervisor/models/depth_anything_v2_vits_cv181x_bf16.cvimodel","metric":false},
  "family":"aruco4x4_50",
  "mask_focus":{"box_norm":[0.35,0.40,0.50,0.65],"ttl_ms":2000,"expires_in_ms":1850,"remaining_ttl_ms":1850,"label":"bottle"}}
 ```
 
-Result envelope of `latest` and `trigger` (versions 1 and 2; `requested` on a trigger and `format` on detections are new in version 2). `detections` and `markers` are always present (empty when that pipeline did not run), so a client reading one list works in every mode. `width`/`height` give the visible image size the coordinates refer to: `detections` are normalised to it (centre `x`, `y`, `w`, `h`), `markers` are pixels in it. Segmentation models (`model.kind: "segment"`) with mask decoding enabled (`model.mask: true`, flag `--mask on`, `vision.json` `"mask"`) also provide `angle_deg` (object long side, [-90, 90) deg), `angle_conf` ([0, 1]), and `grasp_width_px` (cross-section grasp width in visible image pixels) on finite detections, and report `mask_ms` in `pipelines.yolo`. When a detection is decoded via mask focus, it carries `"mask_focus": true`. When a standard detection model is loaded, `angle_deg`, `angle_conf`, `grasp_width_px`, and `mask_ms` are omitted, maintaining byte-identical output. `pipelines` tells what ran on this frame. `count` is the number of accepted markers (as aruco-detector); `rejected` the markers dropped by the false-positive filter.
+Result envelope of `latest` and `trigger` (versions 1 and 2; `requested` on a trigger and `format` on detections are new in version 2). `detections` and `markers` are always present (empty when that pipeline did not run), so a client reading one list works in every mode. `width`/`height` give the visible image size the coordinates refer to: `detections` are normalised to it (centre `x`, `y`, `w`, `h`), `markers` are pixels in it. Segmentation models (`model.kind: "segment"`) with mask decoding enabled (`model.mask: true`, flag `--mask on`, `vision.json` `"mask"`) also provide `angle_deg` (object long side, [-90, 90) deg), `angle_conf` ([0, 1]), and `grasp_width_px` (cross-section grasp width in visible image pixels) on finite detections, and report `mask_ms` in `pipelines.yolo`. When a detection is decoded via mask focus, it carries `"mask_focus": true`. When the `"depth"` pipeline runs, each detection carries `disp_fg` (foreground disparity), `disp_bg` (table background disparity around object), `depth_conf` ([0, 1] disparity confidence), `length_px` (object major axis length in pixels), and `jaw_clear` (gripper jaw collision clearance flag). A top-level `"depth"` object provides `metric_model` (bool), `grid_w`/`grid_h` (grid resolution, e.g. 384x224), and `table_samples` (`[[u_px, v_px, disp], ...]`). When a standard detection model is loaded, optional segmentation and depth fields are omitted, maintaining byte-identical output. `pipelines` tells what ran on this frame. `count` is the number of accepted markers (as aruco-detector); `rejected` the markers dropped by the false-positive filter.
 
-`latest` / `trigger` 的结果（版本 1）：`detections` 与 `markers` 始终存在（对应流水线未运行时为空）。`width`/`height` 为坐标所对应的可见画面尺寸：`detections` 按其归一化（中心点），`markers` 为其像素坐标。分割模型（`model.kind: "segment"`）在开启掩码解码（`model.mask: true`，参数 `--mask on` 或 `vision.json` `"mask"`）时，有限检测结果另提供 `angle_deg`（目标长边角度，[-90, 90) 度）、`angle_conf`（[0, 1]）与 `grasp_width_px`（可见画面像素下的横截面抓取宽度），并在 `pipelines.yolo` 中输出掩码耗时 `mask_ms`。经掩码焦点解码的目标检测框带有 `"mask_focus": true`。使用普通检测模型时，上述字段均省略以保持输出字节级一致。
+`latest` / `trigger` 的结果（版本 1 / 2）：`detections` 与 `markers` 始终存在（对应流水线未运行时为空）。`width`/`height` 为坐标所对应的可见画面尺寸：`detections` 按其归一化（中心点），`markers` 为其像素坐标。分割模型（`model.kind: "segment"`）在开启掩码解码（`model.mask: true`，参数 `--mask on` 或 `vision.json` `"mask"`）时，有限检测结果另提供 `angle_deg`（目标长边角度，[-90, 90) 度）、`angle_conf`（[0, 1]）与 `grasp_width_px`（可见画面像素下的横截面抓取宽度），并在 `pipelines.yolo` 中输出掩码耗时 `mask_ms`。经掩码焦点解码的目标检测框带有 `"mask_focus": true`。当运行 `"depth"` 深度流水线时，每项检测包含 `disp_fg`（前景视差）、`disp_bg`（背景桌面视差）、`depth_conf`（深度置信度）、`length_px`（目标长轴像素长度）与 `jaw_clear`（夹爪净空无碰撞标志）；顶层 `"depth"` 对象包含 `metric_model`（是否度量模型）、`grid_w`/`grid_h`（网格分辨率）与 `table_samples`（桌面采样点 `[[u_px, v_px, disp], ...]`）。使用普通检测模型且未运行深度时，上述字段均省略以保持输出字节级一致。
 
 ```json
-{"api_version":2,"success":true,"requested":["yolo","aruco"],"mode":"both","frame_id":42,"ts_ms":1762680000123,"age_ms":35,
- "inference_time_ms":81.2,"width":640,"height":360,
- "pipelines":{"yolo":{"ran":true,"ms":74.0,"mask_ms":15.6},"aruco":{"ran":true,"ms":6.1}},
- "detections":[{"class_id":39,"format":"xywh_center","class_name":"bottle","confidence":0.710,"x":0.4200,"y":0.5500,"w":0.0800,"h":0.2100,"angle_deg":15.00,"angle_conf":0.850,"grasp_width_px":28.50,"mask_focus":true}],
+{"api_version":2,"success":true,"requested":["yolo","depth"],"mode":"both","frame_id":42,"ts_ms":1762680000123,"age_ms":35,
+ "inference_time_ms":95.4,"width":640,"height":360,
+ "pipelines":{"yolo":{"ran":true,"ms":74.0,"mask_ms":15.6},"depth":{"ran":true,"ms":14.2},"aruco":{"ran":false}},
+ "detections":[{"class_id":39,"format":"xywh_center","class_name":"bottle","confidence":0.710,"x":0.4200,"y":0.5500,"w":0.0800,"h":0.2100,"angle_deg":15.00,"angle_conf":0.850,"grasp_width_px":28.50,"length_px":65.0,"disp_fg":1.82,"disp_bg":0.85,"depth_conf":0.92,"jaw_clear":true,"mask_focus":true}],
+ "depth":{"metric_model":false,"grid_w":384,"grid_h":224,"table_samples":[[40.0,20.0,0.85],[320.0,180.0,0.81],[600.0,340.0,0.76]]},
  "count":1,"family":"aruco4x4_50","undistorted":false,"rejected":0,
  "markers":[{"id":3,"margin":61.0,"center":[182.0,212.0],"corners":[[150.0,244.0],[214.0,244.0],[214.0,180.0],[150.0,180.0]],
    "pose":{"t":[-0.0921,0.0213,0.4502],"r_deg":[178.20,1.50,3.00],"error":0.0004}}]}
