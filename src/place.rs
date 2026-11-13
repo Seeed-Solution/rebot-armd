@@ -122,7 +122,7 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Pend
         return Err(crate::safety::SafetyError::EpochMismatch { expected: inner.safety.epoch_id(), received: epoch }.into());
     }
     let input = inner.plan_input()?;
-    let held_spill_safe = inner.held.as_ref().map_or(false, |h| h.spill_safe);
+    let held_spill_safe = inner.held.as_ref().is_some_and(|h| h.spill_safe);
     let spill_max_tilt_deg = inner.grasp_setup().map_or(8.0, |s| s.spill_max_tilt_deg);
     Ok(PendingPlace { input, request, open_rad, held_spill_safe, spill_max_tilt_deg })
 }

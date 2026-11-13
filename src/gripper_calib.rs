@@ -79,7 +79,7 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
     }
 
     let j7_limit = inner.config.limits.get(6);
-    b.jaw_opening.validate(j7_limit).map_err(|e| MotionError::InvalidCommand(e))?;
+    b.jaw_opening.validate(j7_limit).map_err(MotionError::InvalidCommand)?;
 
     let offset = b.offset_rad.or(inner.gripper_calib_offset);
     inner.apply_gripper_calibration(offset, Some(b.jaw_opening.clone()));

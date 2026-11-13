@@ -390,3 +390,42 @@ async fn test_ws_zero_check_e2e() {
     assert!((a.offset_rad.unwrap() - 0.04).abs() < 1e-3);
     assert_eq!(a.pass, Some(true));
 }
+
+#[test]
+fn test_zero_check_from_fully_open_finishes_before_its_deadline() {
+    // 0.3 rad/s from the open limit to the stall takes about 19 s: the deadline follows the travel
+    let mut inner = sim_at(&INSPECT);
+    inner.measured_positions[6] = -5.7;
+    inner.commanded_positions[6] = -5.7;
+    inner.target_positions[6] = -5.7;
+    inner.set_mock_gripper_stall_offset(Some(0.0));
+    let epoch = inner.safety.epoch_id();
+    let (id, _) = inner.start_gripper_zero_check(&json!({}), epoch).unwrap();
+    let a = run_ticks(&mut inner, id, 40.0);
+    assert_eq!(a.state, "done", "{:?} {:?}", a.code, a.message);
+    assert!(a.offset_rad.unwrap().abs() < 1e-2, "offset_rad was {:?}", a.offset_rad);
+}
+
+#[test]
+fn test_interrupted_release_still_counts_as_holding() {
+    use armd::motion::{GripperCommand, GripperRequest};
+    let open = || GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(10.0), tag: None };
+    let mut inner = sim_at(&INSPECT);
+    let epoch = inner.safety.epoch_id();
+    inner.held = Some(SupHeldObject { label: "cube".into(), spill_safe: false });
+
+    // an Open stopped halfway keeps the object held: the zero check is refused
+    let (_id, _) = inner.start_gripper(open(), epoch).unwrap();
+    for _ in 0..10 { inner.tick(DT); }
+    inner.stop_motion();
+    inner.commanded_velocities.fill(0.0);
+    assert!(inner.held.is_some(), "held cleared by an unfinished release");
+    let err = inner.start_gripper_zero_check(&json!({}), epoch).unwrap_err();
+    assert!(matches!(err, ArmError::Rejected { ref code, .. } if code == "OBJECT_HELD"), "{err:?}");
+
+    // a completed Open clears it
+    let (id, _) = inner.start_gripper(open(), epoch).unwrap();
+    let a = run_ticks(&mut inner, id, 12.0);
+    assert_eq!(a.state, "done");
+    assert!(inner.held.is_none(), "held kept after a completed release");
+}

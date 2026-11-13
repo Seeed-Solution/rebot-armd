@@ -173,6 +173,9 @@ pub struct SupervisorInner {
     pub config: ArmConfig,
     pub safety: SafetyManager,
     pub held: Option<HeldObject>,
+    /// A gripper Open is running: `held` is cleared when it completes, not when it starts, so an
+    /// interrupted release still counts as holding.
+    pub releasing: bool,
     pub measured_positions: Vec<f32>,
     pub measured_velocities: Vec<f32>,
     pub commanded_positions: Vec<f32>,
@@ -352,6 +355,7 @@ impl SupervisorInner {
             config,
             safety: SafetyManager::new(),
             held: None,
+            releasing: false,
             measured_positions: positions.clone(),
             measured_velocities: vec![0.0; dof],
             commanded_positions: positions,
@@ -1940,6 +1944,10 @@ impl SupervisorInner {
             }
         }
         if holding == Some(false) { self.held = None; }
+        // a standalone close that detected an object counts as holding until a release completes
+        if holding == Some(true) && self.held.is_none() {
+            self.held = Some(HeldObject { label: String::new(), spill_safe: false });
+        }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) { self.quintic_settle = None; }
         if self.macro_run.as_ref().is_some_and(|m| m.id == id) { self.macro_run = None; }
     }
@@ -2188,7 +2196,7 @@ impl SupervisorInner {
         };
         if epoch != self.safety.epoch_id() { return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into()); }
         self.action_preconditions()?;
-        if matches!(request.command, GripperCommand::Open) { self.held = None; }
+        self.releasing = matches!(request.command, GripperCommand::Open);
         let motion = GripperMotion::new(request, policy, self.config.limits[6].clone(), self.commanded_positions[6]);
         let duration = motion.expected_duration();
         self.servo_target = None;
@@ -2244,7 +2252,7 @@ impl SupervisorInner {
             return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
         }
         self.action_preconditions()?;
-        if matches!(request.command, GripperCommand::Open) { self.held = None; }
+        self.releasing = matches!(request.command, GripperCommand::Open);
         let motion = GripperMotion::new(request, policy, self.config.limits[6].clone(), self.commanded_positions[6]);
         let duration = motion.expected_duration();
         let tag = motion.request.tag.clone();
@@ -2276,7 +2284,7 @@ impl SupervisorInner {
             return Err(ArmError::Rejected {
                 status: 409,
                 code: "OBJECT_HELD".into(),
-                message: "Gripper holds an object; release before zero check".into(),
+                message: "Gripper holds an object (or its release did not finish); open the gripper fully before the zero check".into(),
             });
         }
         let store_offset = body.get("store_offset").and_then(serde_json::Value::as_bool).unwrap_or(false);
@@ -2290,7 +2298,8 @@ impl SupervisorInner {
             fraction: None,
             grasp: false,
             speed: 0.3,
-            timeout_s: Some(10.0),
+            // derived from the travel at 0.3 rad/s (fully open -> closed takes about 20 s)
+            timeout_s: None,
             tag: None,
         };
         let motion = GripperMotion::new(request, policy, self.config.limits[6].clone(), self.commanded_positions[6]);
@@ -2469,6 +2478,10 @@ impl SupervisorInner {
         match out.status {
             StepStatus::Running => {}
             StepStatus::Done { settled, holding, gripper_gap_rad } => {
+                if self.releasing && matches!(self.active_trajectory.as_ref().map(|a| &a.reference), Some(Reference::Gripper(_))) {
+                    self.releasing = false;
+                    self.held = None;
+                }
                 self.active_trajectory = None;
                 self.commanded_velocities.fill(0.0);
                 self.target_positions = self.commanded_positions.clone();

@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn jaw_opening_validation() {
-        let lim = JointLimit::new("j7", -6.28, 6.28, 5.0, 10.0);
+        let lim = JointLimit::new("j7", -6.0, 6.0, 5.0, 10.0);
 
         // Default passes
         assert!(JawOpening::sim_default().validate(Some(&lim)).is_ok());
