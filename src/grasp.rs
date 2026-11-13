@@ -513,6 +513,8 @@ impl HttpDetectionSource {
             (Some(w), Some(h)) if w > 0.0 && h > 0.0 => [w, h],
             _ => self.image_size_px,
         };
+        let rx = self.image_size_px[0] / size[0];
+        let ry = self.image_size_px[1] / size[1];
         let depth = v.get("depth").and_then(|d| {
             let metric_model = d.get("metric_model").and_then(Value::as_bool).unwrap_or(false);
             let table_samples = d.get("table_samples").and_then(Value::as_array).map(|arr| {
@@ -523,7 +525,7 @@ impl HttpDetectionSource {
                         let v = s[1].as_f64()?;
                         let disp = s[2].as_f64()?;
                         if u.is_finite() && v.is_finite() && disp.is_finite() {
-                            return Some([u, v, disp]);
+                            return Some([u * rx, v * ry, disp]);
                         }
                     }
                     None
@@ -531,7 +533,26 @@ impl HttpDetectionSource {
             }).unwrap_or_default();
             Some(DepthFrameInfo { metric_model, table_samples })
         });
-        Some(DetectionFrame { frame_id, captured_at, detections: parse_detections(v.get("detections").unwrap_or(&Value::Null), size), depth })
+        let mut detections = parse_detections(v.get("detections").unwrap_or(&Value::Null), size);
+        if (rx - 1.0).abs() > 1e-6 || (ry - 1.0).abs() > 1e-6 {
+            let isotropic = (rx * ry).sqrt();
+            for det in &mut detections {
+                let (sw, sl) = match det.angle_deg {
+                    Some(deg) => {
+                        let (sin_t, cos_t) = deg.to_radians().sin_cos();
+                        ((-sin_t * rx).hypot(cos_t * ry), (cos_t * rx).hypot(sin_t * ry))
+                    }
+                    None => (isotropic, isotropic),
+                };
+                if let Some(w) = det.grasp_width_px.as_mut() {
+                    *w *= sw;
+                }
+                if let Some(l) = det.length_px.as_mut() {
+                    *l *= sl;
+                }
+            }
+        }
+        Some(DetectionFrame { frame_id, captured_at, detections, depth })
     }
 }
 
@@ -873,10 +894,11 @@ pub struct DepthCalibration {
     pub source: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TableObs {
     pub inv_z_fk: f64,
     pub disp_table: f64,
+    pub samples: Vec<(f64, f64, f64)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -895,21 +917,24 @@ pub fn extract_table_obs(
     depth: &DepthFrameInfo,
     table_z_m: f64,
 ) -> Option<TableObs> {
+    let mut samples: Vec<(f64, f64, f64)> = Vec::new();
     let mut inv_zs = Vec::new();
     let mut disps = Vec::new();
     for sample in &depth.table_samples {
         let [u, v, disp] = *sample;
         if disp > 1e-3 && disp.is_finite() {
             if let Some(z_fk) = cam.table_optical_depth(pose, [u, v], table_z_m) {
+                samples.push((1.0 / z_fk, disp, z_fk));
                 inv_zs.push(1.0 / z_fk);
                 disps.push(disp);
             }
         }
     }
-    if inv_zs.is_empty() { return None; }
+    if samples.len() < 6 { return None; }
     Some(TableObs {
         inv_z_fk: median(&mut inv_zs),
         disp_table: median(&mut disps),
+        samples,
     })
 }
 
@@ -1043,13 +1068,14 @@ pub fn calibrate_depth(
     }
 
     if depth.metric_model {
+        let a_prior = (600.0 / 640.0) / (cam.fx / cam.size[0].max(1.0));
         if valid_samples.len() >= 3 {
             let mut ratios: Vec<f64> = valid_samples.iter().map(|&(inv_z, disp, _)| inv_z / disp).collect();
             let a = median(&mut ratios);
             let b = 0.0;
             if (0.25..=4.0).contains(&a) {
                 let mut rel_errs: Vec<f64> = valid_samples.iter().map(|&(_, disp, z_fk)| {
-                    let z_pred = 1.0 / (a * disp);
+                    let z_pred = 1.0 / (a_prior * disp);
                     (z_pred - z_fk).abs() / z_fk
                 }).collect();
                 let med_err = median(&mut rel_errs);
@@ -1057,9 +1083,9 @@ pub fn calibrate_depth(
                     return Some(DepthCalibration { a, b, source: "metric_table" });
                 }
             }
+            return None;
         }
-        let a = (600.0 / 640.0) / (cam.fx / cam.size[0].max(1.0));
-        return Some(DepthCalibration { a, b: 0.0, source: "metric_prior" });
+        return Some(DepthCalibration { a: a_prior, b: 0.0, source: "metric_prior" });
     }
 
     if valid_samples.len() >= 8 {
@@ -1077,18 +1103,32 @@ pub fn calibrate_depth(
     }
 
     if let Some(prior_obs) = prior {
-        if !valid_samples.is_empty() {
+        if !depth.metric_model && prior_obs.samples.len() >= 6 && valid_samples.len() >= 6 {
             let mut inv_zs: Vec<f64> = valid_samples.iter().map(|s| s.0).collect();
             let mut disps: Vec<f64> = valid_samples.iter().map(|s| s.1).collect();
             let inv_z_2 = median(&mut inv_zs);
             let d_2 = median(&mut disps);
-            let inv_z_1 = prior_obs.inv_z_fk;
-            let d_1 = prior_obs.disp_table;
-            if (inv_z_2 - inv_z_1).abs() >= 0.35 && (d_2 - d_1).abs() >= 0.02 {
-                let a = (inv_z_2 - inv_z_1) / (d_2 - d_1);
-                let b = inv_z_2 - a * d_2;
-                if a > 1e-4 && b.is_finite() {
-                    return Some(DepthCalibration { a, b, source: "two_height_fk" });
+            let d_inv_z = inv_z_2 - prior_obs.inv_z_fk;
+            let d_disp = d_2 - prior_obs.disp_table;
+
+            if d_inv_z.abs() >= 0.35 && d_disp.abs() >= 0.05 && (d_inv_z * d_disp > 0.0) {
+                let mut combined = prior_obs.samples.clone();
+                combined.extend_from_slice(&valid_samples);
+                if let Some(cal) = fit_oblique_ransac(&combined) {
+                    if (0.05..=20.0).contains(&cal.a) {
+                        let check_inliers = |samples: &[(f64, f64, f64)]| -> bool {
+                            let inliers = samples.iter().filter(|&&(_, x, z_fk)| {
+                                let pred_inv_z = cal.a * x + cal.b;
+                                if pred_inv_z <= 1e-4 { return false; }
+                                let z_pred = 1.0 / pred_inv_z;
+                                (z_pred - z_fk).abs() / z_fk <= 0.08
+                            }).count();
+                            inliers as f64 >= 0.60 * samples.len() as f64
+                        };
+                        if check_inliers(&prior_obs.samples) && check_inliers(&valid_samples) {
+                            return Some(DepthCalibration { a: cal.a, b: cal.b, source: "two_height_fk" });
+                        }
+                    }
                 }
             }
         }
@@ -1120,8 +1160,22 @@ pub fn measure_detection_depth_with_cal(
     let h = h_raw.max(0.005);
 
     let depth_m = z_fg;
-    let width_m = det.grasp_width_px.filter(|w| *w > 0.0).map(|w| w * z_fg / cam.fx);
-    let length_m = det.length_px.filter(|l| *l > 0.0).map(|l| l * z_fg / cam.fx);
+    let (sin_t, cos_t) = det.angle_deg.map(|deg| deg.to_radians().sin_cos()).unwrap_or((0.0, 0.0));
+    let f_geom = (cam.fx * cam.fy).sqrt();
+    let width_m = det.grasp_width_px.filter(|w| *w > 0.0).map(|w| {
+        if det.angle_deg.is_some() {
+            w * z_fg * (-sin_t / cam.fx).hypot(cos_t / cam.fy)
+        } else {
+            w * z_fg / f_geom
+        }
+    });
+    let length_m = det.length_px.filter(|l| *l > 0.0).map(|l| {
+        if det.angle_deg.is_some() {
+            l * z_fg * (cos_t / cam.fx).hypot(sin_t / cam.fy)
+        } else {
+            l * z_fg / f_geom
+        }
+    });
     Some(DepthMeasurement {
         height_m: h,
         depth_m,
@@ -1139,7 +1193,6 @@ pub fn measure_detection_depth(
     depth: Option<&DepthFrameInfo>,
     prior: Option<&TableObs>,
     table_z_m: f64,
-    _setup: &GraspSetup,
 ) -> Option<DepthMeasurement> {
     let cal = calibrate_depth(cam, pose, depth, prior, table_z_m)?;
     measure_detection_depth_with_cal(cam, pose, det, &cal)
@@ -1587,8 +1640,9 @@ impl Orchestrator {
         let pose0 = self.pose().await;
         let mut cached_prior: Option<TableObs> = None;
         let mut cached_meas: Option<DepthMeasurement> = None;
+        let mut cached_det0: Option<Detection> = None;
 
-        if self.triggered && self.depth_available {
+        if self.triggered && self.depth_available && self.lens_known {
             let focus = MaskFocus {
                 label: Some(planned.request.label.clone()),
                 box_norm: planned.request.box_norm,
@@ -1604,6 +1658,7 @@ impl Orchestrator {
                         gate_px: s.acquire_dist_px,
                     };
                     if let Some(det0) = tracker0.find(&frame0, s) {
+                        cached_det0 = Some(det0.clone());
                         if let Some(ref cal) = cal0 {
                             cached_meas = measure_detection_depth_with_cal(&self.cam, &pose0, &det0, cal);
                         }
@@ -1658,7 +1713,7 @@ impl Orchestrator {
         let last = c.last.clone();
 
         let mut depth_meas: Option<DepthMeasurement> = None;
-        if self.triggered && self.depth_available {
+        if self.triggered && self.depth_available && self.lens_known {
             let focus = MaskFocus {
                 label: Some(planned.request.label.clone()),
                 box_norm: c.last.box_norm,
@@ -1683,7 +1738,19 @@ impl Orchestrator {
                     }
                     if depth_meas.is_none() {
                         if let Some(cal) = calibrate_depth(&self.cam, &c.pose, overhead_frame.depth.as_ref(), cached_prior.as_ref(), s.table_z_m) {
-                            depth_meas = measure_detection_depth_with_cal(&self.cam, &c.pose, &overhead_det, &cal);
+                            if cal.source == "two_height_fk" {
+                                if let (Some(ref det0), Some(m1)) = (&cached_det0, measure_detection_depth_with_cal(&self.cam, &c.pose, &overhead_det, &cal)) {
+                                    if let Some(m0) = measure_detection_depth_with_cal(&self.cam, &pose0, det0, &cal) {
+                                        if (m0.height_m - m1.height_m).abs() <= (0.20 * m1.height_m).max(0.008) {
+                                            depth_meas = Some(m1);
+                                        } else {
+                                            tracing::debug!("two_height_fk rejected: height drifted between frames (m0={:.3}, m1={:.3})", m0.height_m, m1.height_m);
+                                        }
+                                    }
+                                }
+                            } else {
+                                depth_meas = measure_detection_depth_with_cal(&self.cam, &c.pose, &overhead_det, &cal);
+                            }
                         }
                     }
                 }
@@ -1701,23 +1768,33 @@ impl Orchestrator {
         let mut depth_used = false;
 
         if let Some(ref meas) = depth_meas {
-            match self.accept_height(meas.height_m)? {
-                Ok(h) => {
-                    depth_used = true;
-                    plane = s.table_z_m + s.grasp_height_m.max(h);
-                    close_h = (h * s.height_grasp_fraction).clamp(s.grasp_height_m, s.max_grasp_height_m);
-                    tracing::info!("Grasp {}: object top {h:.3} m above the table (depth:{}), closing at {close_h:.3} m", self.id, meas.source);
-                    self.sup.inner().write().await.update_action(self.id, |a| {
-                        a.height_source = Some("depth".into());
-                        a.object_height_m = Some(h as f32);
-                        a.depth_anchor = Some(meas.source.into());
-                        a.object_depth_m = Some(meas.depth_m as f32);
-                        a.object_length_m = meas.length_m.map(|l| l as f32);
-                        a.jaw_clear = meas.jaw_clear;
-                    });
+            let height_res = match self.accept_height(meas.height_m) {
+                Ok(res) => Some(res),
+                Err(err) if meas.source == "metric_prior" => {
+                    tracing::debug!("Metric prior height rejected ({err:?}), falling back to probe_height");
+                    None
                 }
-                Err(reason) => {
-                    tracing::debug!("Depth height rejected ({reason}), falling back to probe_height");
+                Err(err) => return Err(err),
+            };
+            if let Some(res) = height_res {
+                match res {
+                    Ok(h) => {
+                        depth_used = true;
+                        plane = s.table_z_m + s.grasp_height_m.max(h);
+                        close_h = (h * s.height_grasp_fraction).clamp(s.grasp_height_m, s.max_grasp_height_m);
+                        tracing::info!("Grasp {}: object top {h:.3} m above the table (depth:{}), closing at {close_h:.3} m", self.id, meas.source);
+                        self.sup.inner().write().await.update_action(self.id, |a| {
+                            a.height_source = Some("depth".into());
+                            a.object_height_m = Some(h as f32);
+                            a.depth_anchor = Some(meas.source.into());
+                            a.object_depth_m = Some(meas.depth_m as f32);
+                            a.object_length_m = meas.length_m.map(|l| l as f32);
+                            a.jaw_clear = meas.jaw_clear;
+                        });
+                    }
+                    Err(reason) => {
+                        tracing::debug!("Depth height rejected ({reason}), falling back to probe_height");
+                    }
                 }
             }
         }
@@ -3309,7 +3386,7 @@ mod tests {
             length_px: Some(50.0),
             jaw_clear: Some(true),
         };
-        let meas = measure_detection_depth(&cam, &pose, &det, Some(&depth_info), None, table_z, &setup).expect("measurement valid");
+        let meas = measure_detection_depth(&cam, &pose, &det, Some(&depth_info), None, table_z).expect("measurement valid");
         assert!((meas.height_m - 0.04).abs() < 0.005, "height error: {}", (meas.height_m - 0.04).abs());
         assert_eq!(meas.source, "metric_table");
         assert_eq!(meas.jaw_clear, Some(true));
@@ -3320,5 +3397,75 @@ mod tests {
         assert_eq!(cal_prior.source, "metric_prior");
         assert_eq!(cal_prior.a, 1.0);
         assert_eq!(cal_prior.b, 0.0);
+
+        // 3. Metric model with table samples contradicting FK returns None rather than metric_prior
+        let conflicting_samples = vec![
+            [320.0, 180.0, disp_table * 2.0],
+            [300.0, 160.0, disp_table],
+            [340.0, 200.0, disp_table * 2.0],
+            [360.0, 220.0, disp_table],
+        ];
+        let conflicting_depth = DepthFrameInfo { metric_model: true, table_samples: conflicting_samples };
+        assert!(calibrate_depth(&cam, &pose, Some(&conflicting_depth), None, table_z).is_none(), "contradicting table samples should return None");
+    }
+
+    #[test]
+    fn test_anisotropic_camera_sizing() {
+        let setup = GraspSetup { camera_tilt_deg: 0.0, fx_px: 600.0, fy_px: 400.0, image_size_px: [640.0, 360.0], ..Default::default() };
+        let cam = CamModel::assumed(&crate::chain::ArmModel::REBOT_DEV_ARM, &setup, &CameraMount::default());
+        let pose = Pose::new(look_down(&inspect_r()), [0.3, 0.0, 0.20]);
+        let z_fg = 0.16;
+        let cal = DepthCalibration { a: 1.0, b: 0.0, source: "metric_table" };
+        let det = Detection {
+            label: "obj".into(),
+            score: 0.9,
+            box_norm: [0.45, 0.45, 0.55, 0.55],
+            angle_deg: Some(90.0),
+            angle_conf: Some(0.9),
+            grasp_width_px: Some(30.0),
+            mask_focus: false,
+            disp_fg: Some(1.0 / z_fg),
+            disp_bg: Some(1.0 / 0.20),
+            depth_conf: Some(0.95),
+            length_px: Some(50.0),
+            jaw_clear: Some(true),
+        };
+        let meas = measure_detection_depth_with_cal(&cam, &pose, &det, &cal).expect("valid measurement");
+        let expected_w = 30.0 * z_fg / 600.0;
+        let expected_l = 50.0 * z_fg / 400.0;
+        assert!((meas.width_m.unwrap() - expected_w).abs() < 1e-6);
+        assert!((meas.length_m.unwrap() - expected_l).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_http_detection_source_rescaling() {
+        let src = HttpDetectionSource {
+            upstream: DetectorUpstream::parse("http://127.0.0.1:8090").unwrap(),
+            image_size_px: [640.0, 360.0],
+        };
+        let raw = serde_json::json!({
+            "frame_id": 1,
+            "width": 1280,
+            "height": 720,
+            "depth": {
+                "metric_model": true,
+                "table_samples": [[100.0, 200.0, 0.85]],
+            },
+            "detections": [{
+                "label": "cup",
+                "score": 0.9,
+                "format": "xywh_center",
+                "x": 640.0,
+                "y": 360.0,
+                "w": 100.0,
+                "h": 100.0,
+                "length_px": 80.0,
+                "grasp_width_px": 40.0,
+            }]
+        });
+        let frame = src.frame(&raw, None, Instant::now()).expect("frame parsed");
+        assert_eq!(frame.depth.as_ref().unwrap().table_samples[0], [50.0, 100.0, 0.85]);
+        assert_eq!(frame.detections[0].length_px, Some(40.0));
+        assert_eq!(frame.detections[0].grasp_width_px, Some(20.0));
     }
 }

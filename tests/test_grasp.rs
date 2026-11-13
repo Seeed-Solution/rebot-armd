@@ -35,6 +35,7 @@ struct DepthSim {
     depth_conf: Option<f64>,
     jaw_clear: Option<bool>,
     length_px: Option<f64>,
+    drift_per_frame: bool,
 }
 
 struct SimCamera {
@@ -102,13 +103,18 @@ impl SimCamera {
         let (mut disp_fg, mut disp_bg, mut depth_conf, mut length_px, mut jaw_clear) = (None, None, None, None, None);
         let mut depth = None;
         if let Some(ref sim) = *self.depth_sim.lock().unwrap() {
+            let (a_eff, b_eff) = if sim.drift_per_frame && pose.p[2] < 0.20 {
+                (sim.a0 * 1.6, sim.b0 - 0.35)
+            } else {
+                (sim.a0, sim.b0)
+            };
             let table_z = 0.0;
             let mut table_samples = Vec::new();
             if !sim.occluded_table {
                 for u in [20.0, 160.0, 320.0, 480.0, 620.0] {
                     for v in [10.0, 90.0, 180.0, 270.0, 350.0] {
                         if let Some(z_table) = self.cam.table_optical_depth(&pose, [u, v], table_z) {
-                            let disp = ((1.0 / z_table) - sim.b0) / sim.a0;
+                            let disp = ((1.0 / z_table) - b_eff) / a_eff;
                             table_samples.push([u, v, disp]);
                         }
                     }
@@ -131,8 +137,8 @@ impl SimCamera {
                 .unwrap_or(z_fg + top_h);
 
             if z_fg > 0.05 && z_bg > z_fg {
-                let d_fg = ((1.0 / z_fg) - sim.b0) / sim.a0;
-                let d_bg = ((1.0 / z_bg) - sim.b0) / sim.a0;
+                let d_fg = ((1.0 / z_fg) - b_eff) / a_eff;
+                let d_bg = ((1.0 / z_bg) - b_eff) / a_eff;
                 disp_fg = Some(d_fg);
                 disp_bg = Some(d_bg);
                 depth_conf = sim.depth_conf.or(Some(0.95));
@@ -2207,6 +2213,7 @@ async fn depth_oblique_ransac_skips_probe_and_grasps() {
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(65.0),
+        drift_per_frame: false,
     });
 
     let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
@@ -2246,6 +2253,7 @@ async fn depth_metric_model_vertical_and_occluded() {
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(60.0),
+        drift_per_frame: false,
     });
 
     let (id, _) = grasp::start(&rig1.sup, rig1.sim.clone(), &tap(&rig1).await).await.expect("grasp accepted");
@@ -2275,6 +2283,7 @@ async fn depth_metric_model_vertical_and_occluded() {
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(60.0),
+        drift_per_frame: false,
     });
 
     let (id2, _) = grasp::start(&rig2.sup, rig2.sim.clone(), &tap(&rig2).await).await.expect("grasp accepted");
@@ -2305,6 +2314,7 @@ async fn depth_metric_model_vertical_and_occluded() {
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(60.0),
+        drift_per_frame: false,
     });
 
     let (id3, _) = grasp::start(&rig3.sup, rig3.sim.clone(), &tap(&rig3).await).await.expect("grasp accepted");
@@ -2334,6 +2344,7 @@ async fn depth_unanchored_or_low_conf_falls_back_to_probe_height() {
         depth_conf: Some(0.20),
         jaw_clear: Some(true),
         length_px: Some(60.0),
+        drift_per_frame: false,
     });
 
     let (id1, _) = grasp::start(&rig1.sup, rig1.sim.clone(), &tap(&rig1).await).await.expect("grasp accepted");
@@ -2360,6 +2371,7 @@ async fn depth_unanchored_or_low_conf_falls_back_to_probe_height() {
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(60.0),
+        drift_per_frame: false,
     });
 
     let (id2, _) = grasp::start(&rig2.sup, rig2.sim.clone(), &tap(&rig2).await).await.expect("grasp accepted");
@@ -2390,6 +2402,7 @@ async fn depth_tall_object_fast_fails_object_too_tall() {
         depth_conf: Some(0.95),
         jaw_clear: Some(true),
         length_px: Some(60.0),
+        drift_per_frame: false,
     });
 
     let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
@@ -2397,6 +2410,128 @@ async fn depth_tall_object_fast_fails_object_too_tall() {
     assert_eq!(a.state, "failed");
     assert_eq!(a.code.as_deref(), Some("OBJECT_TOO_TALL"));
     assert_eq!(a.probe_dz_m, None, "mechanical height probe should not run when depth measures a tall object");
+}
+
+#[tokio::test]
+async fn depth_guards_lens_unknown_table_conflict_and_drift() {
+    let setup = GraspSetup { camera_tilt_deg: 0.0, height_probe_m: 0.04, ..GraspSetup::default() };
+
+    // 1. Truth { known_offset: false, ..Truth::same() } (!lens_known) with depth_available = true skips FK depth anchoring
+    let rig1 = rig(setup.clone(), Truth { known_offset: false, ..Truth::same() }, 0.0, [0.0, 0.0], false).await;
+    let start_r1 = start_pose(&rig1).await.r;
+    let mut s1 = setup.clone();
+    s1.grip_pixel_norm = calibrate_grip(&rig1, &setup, &start_r1);
+    rig1.sup.inner().write().await.set_grasp_setup(s1.clone());
+
+    rig1.sim.per_request.store(true, Ordering::SeqCst);
+    rig1.sim.depth_available.store(true, Ordering::SeqCst);
+    *rig1.sim.width_px.lock().unwrap() = Some(35.0);
+    *rig1.sim.depth_sim.lock().unwrap() = Some(DepthSim {
+        metric_model: true,
+        a0: 1.0,
+        b0: 0.0,
+        occluded_table: false,
+        depth_conf: Some(0.95),
+        jaw_clear: Some(true),
+        length_px: Some(60.0),
+        drift_per_frame: false,
+    });
+
+    let (id1, _) = grasp::start(&rig1.sup, rig1.sim.clone(), &tap(&rig1).await).await.expect("grasp accepted");
+    let a1 = wait_done(&rig1.sup, id1, 30.0, |_| {}).await;
+    assert_eq!(a1.state, "done");
+    assert_eq!(a1.holding, Some(true));
+    assert!(a1.depth_anchor.is_none(), "depth_anchor should be None when lens is unknown");
+
+    // 2. metric_model: true, a0: 1.8, occluded_table: false (visible table contradicts FK) rejects metric_prior and falls back to probe_height
+    let rig2 = rig(setup.clone(), Truth::same(), 0.0, [0.0, 0.0], false).await;
+    let start_r2 = start_pose(&rig2).await.r;
+    let mut s2 = setup.clone();
+    s2.grip_pixel_norm = calibrate_grip(&rig2, &setup, &start_r2);
+    rig2.sup.inner().write().await.set_grasp_setup(s2.clone());
+
+    rig2.sim.per_request.store(true, Ordering::SeqCst);
+    rig2.sim.depth_available.store(true, Ordering::SeqCst);
+    *rig2.sim.width_px.lock().unwrap() = Some(35.0);
+    *rig2.sim.depth_sim.lock().unwrap() = Some(DepthSim {
+        metric_model: true,
+        a0: 1.8,
+        b0: 0.0,
+        occluded_table: false,
+        depth_conf: Some(0.95),
+        jaw_clear: Some(true),
+        length_px: Some(60.0),
+        drift_per_frame: false,
+    });
+
+    let (id2, _) = grasp::start(&rig2.sup, rig2.sim.clone(), &tap(&rig2).await).await.expect("grasp accepted");
+    let a2 = wait_done(&rig2.sup, id2, 30.0, |_| {}).await;
+    assert_eq!(a2.state, "done");
+    assert_eq!(a2.holding, Some(true));
+    assert_eq!(a2.height_source.as_deref(), Some("scale"));
+    assert!(a2.probe_dz_m.is_some(), "probe_height should have run");
+
+    // 3. Stationary vertical relative model (metric_model: false, a0: 2.7, b0: 0.45, drift_per_frame: false)
+    // starting at look_down_start(0.0, 0.26) with approach_height_m: 0.15 calibrates via two_height_fk
+    let s3_base = GraspSetup { camera_tilt_deg: 0.0, approach_height_m: 0.15, height_probe_m: 0.04, ..GraspSetup::default() };
+    let rig3 = rig_mounted(s3_base.clone(), Truth::same(), 0.0, look_down_start(0.0, 0.26), [0.0, 0.0], false).await;
+    let start_r3 = start_pose(&rig3).await.r;
+    let mut s3 = s3_base.clone();
+    s3.grip_pixel_norm = calibrate_grip(&rig3, &s3_base, &start_r3);
+    rig3.sup.inner().write().await.set_grasp_setup(s3.clone());
+
+    rig3.sim.per_request.store(true, Ordering::SeqCst);
+    rig3.sim.depth_available.store(true, Ordering::SeqCst);
+    *rig3.sim.width_px.lock().unwrap() = Some(35.0);
+    *rig3.sim.depth_sim.lock().unwrap() = Some(DepthSim {
+        metric_model: false,
+        a0: 2.7,
+        b0: 0.45,
+        occluded_table: false,
+        depth_conf: Some(0.95),
+        jaw_clear: Some(true),
+        length_px: Some(60.0),
+        drift_per_frame: false,
+    });
+
+    let (id3, _) = grasp::start(&rig3.sup, rig3.sim.clone(), &tap(&rig3).await).await.expect("grasp accepted");
+    let a3 = wait_done(&rig3.sup, id3, 30.0, |_| {}).await;
+    assert_eq!(a3.state, "done");
+    assert_eq!(a3.holding, Some(true));
+    assert_eq!(a3.depth_anchor.as_deref(), Some("two_height_fk"));
+    assert!(
+        (a3.object_height_m.unwrap() as f64 - rig3.sim.object.height).abs() < 0.005,
+        "two_height_fk height error: {:?}",
+        a3.object_height_m
+    );
+
+    // whereas drift_per_frame: true rejects two_height_fk and falls back to probe_height
+    let rig4 = rig_mounted(s3_base.clone(), Truth::same(), 0.0, look_down_start(0.0, 0.26), [0.0, 0.0], false).await;
+    let start_r4 = start_pose(&rig4).await.r;
+    let mut s4 = s3_base.clone();
+    s4.grip_pixel_norm = calibrate_grip(&rig4, &s3_base, &start_r4);
+    rig4.sup.inner().write().await.set_grasp_setup(s4.clone());
+
+    rig4.sim.per_request.store(true, Ordering::SeqCst);
+    rig4.sim.depth_available.store(true, Ordering::SeqCst);
+    *rig4.sim.width_px.lock().unwrap() = Some(35.0);
+    *rig4.sim.depth_sim.lock().unwrap() = Some(DepthSim {
+        metric_model: false,
+        a0: 2.7,
+        b0: 0.45,
+        occluded_table: false,
+        depth_conf: Some(0.95),
+        jaw_clear: Some(true),
+        length_px: Some(60.0),
+        drift_per_frame: true,
+    });
+
+    let (id4, _) = grasp::start(&rig4.sup, rig4.sim.clone(), &tap(&rig4).await).await.expect("grasp accepted");
+    let a4 = wait_done(&rig4.sup, id4, 30.0, |_| {}).await;
+    assert_eq!(a4.state, "done");
+    assert_eq!(a4.holding, Some(true));
+    assert_eq!(a4.height_source.as_deref(), Some("scale"));
+    assert!(a4.probe_dz_m.is_some(), "probe_height should have run on drift");
 }
 
 
