@@ -1906,7 +1906,7 @@ impl SupervisorInner {
         self.last_action = Some(ActionStatus {
             id, kind: kind.into(), tag, state: "running".into(), code: None, message: None, progress: 0.0,
             started_at: now, finished_at: None, holding: None, gripper_gap_rad: None, settled: None,
-            phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
+            task: None, phase: None, iteration: None, error_px: None, final_offset_px: None, acquire_height_m: None,
             episode: None, t_s: None, power_scale: None,
             align: None, align_turn_rad: None, angle_spread_deg: None, orientation: None, grasp_width_m: None, height_source: None, height_reason: None, object_height_m: None, close_height_m: None, probe_dz_m: None, depth_anchor: None, object_depth_m: None, object_length_m: None, jaw_clear: None, border: None, border_shift_px: None, probe_mode: None, lateral_baseline_m: None, lateral_baseline_err_mm: None, height_estimates: Vec::new(), yaw_estimates: Vec::new(), width_estimates: Vec::new(),
             recentre: None, recentre_iterations: None, descend_peak_residual_nm: None, descend_peak_tracking_rad: None,

@@ -269,7 +269,8 @@
       "mask",
       "depth"
     ],
-    "width_record": []
+    "width_record": [],
+    "tasks": {}
   },
   "gravity_comp": {
     "ramp_in_s": 1.0,

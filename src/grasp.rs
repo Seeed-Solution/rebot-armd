@@ -172,6 +172,84 @@ pub struct GraspSetup {
     pub width_sources: Vec<WidthSource>,
     /// Width sources evaluated and reported in `width_estimates` without deciding.
     pub width_record: Vec<WidthSource>,
+    /// Named grasp tasks: stored overrides plus perception requirements, selected per request
+    /// with `task`. Changed only as a whole through the setup (`/api/v1/grasp/setup`, the
+    /// setup file); request and task `overrides` cannot contain it.
+    pub tasks: BTreeMap<String, GraspTask>,
+}
+
+/// A named grasp task (`GraspSetup.tasks`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraspTask {
+    /// Grasp setup fields applied on top of the setup (before the request's `overrides`).
+    #[serde(default)]
+    pub overrides: serde_json::Map<String, Value>,
+    /// What the vision provider must offer; checked before the grasp begins.
+    #[serde(default, skip_serializing_if = "TaskRequires::is_empty")]
+    pub requires: TaskRequires,
+    /// Free text, at most 200 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Perception requirements of a grasp task, compared with the provider's `GET /api/mode`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TaskRequires {
+    /// `model.kind` of the loaded YOLO model (`detect` | `segment`); exact match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_kind: Option<ModelKind>,
+    /// Depth pipeline: `any` (`available.depth`) or `metric` (also `depth_model.metric`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth: Option<DepthReq>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelKind { Detect, Segment }
+
+impl ModelKind {
+    pub fn name(self) -> &'static str {
+        match self { Self::Detect => "detect", Self::Segment => "segment" }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DepthReq { Any, Metric }
+
+impl TaskRequires {
+    pub fn is_empty(&self) -> bool { self.model_kind.is_none() && self.depth.is_none() }
+
+    /// `Err(reason)` when the provider (`mode`) cannot serve the requirements of task `task`.
+    pub fn check(&self, task: &str, mode: &ModeInfo) -> Result<(), String> {
+        if let Some(kind) = self.model_kind {
+            match mode.model_kind.as_deref().filter(|_| mode.reported) {
+                None => return Err(format!("task {task} needs model_kind {}, provider does not report model.kind", kind.name())),
+                Some(have) if have != kind.name() => return Err(format!("task {task} needs model_kind {}, provider has {have}", kind.name())),
+                Some(_) => {}
+            }
+        }
+        if let Some(depth) = self.depth {
+            let want = match depth { DepthReq::Any => "any", DepthReq::Metric => "metric" };
+            if !mode.reported {
+                return Err(format!("task {task} needs depth {want}, provider does not report depth"));
+            }
+            if !mode.depth_available {
+                return Err(format!("task {task} needs depth {want}, provider has no depth pipeline"));
+            }
+            if depth == DepthReq::Metric && !mode.depth_metric {
+                return Err(format!("task {task} needs depth metric, provider depth model is not metric"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Task names: 1..=32 of `[a-z0-9_-]`.
+fn valid_task_name(name: &str) -> bool {
+    (1..=32).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 /// Object height source (`height_sources`, `height_record`).
@@ -299,6 +377,7 @@ impl Default for GraspSetup {
             yaw_record: vec![YawSource::Depth],
             width_sources: vec![WidthSource::Mask, WidthSource::Depth],
             width_record: Vec::new(),
+            tasks: BTreeMap::new(),
         }
     }
 }
@@ -365,21 +444,53 @@ impl GraspSetup {
         check(speed_ok(self.approach_speed_mps) && speed_ok(self.descend_speed_mps), "speeds must be in (0, 0.15] m/s")?;
         check(self.phase_timeout_s > 0.0 && self.phase_timeout_s <= 120.0 && self.timeout_s >= self.phase_timeout_s && self.timeout_s <= 600.0,
             "phase_timeout_s in (0, 120] s, timeout_s in [phase_timeout_s, 600] s")?;
+        if !self.tasks.is_empty() {
+            // every stored task is valid against this setup (its task-free copy)
+            let base = self.without_tasks();
+            for (name, task) in &self.tasks {
+                check(valid_task_name(name), &format!("grasp task name {name:?} must be 1..32 characters of a-z, 0-9, _ and -"))?;
+                check(task.description.as_ref().is_none_or(|d| d.len() <= 200), &format!("grasp task {name}: description must be at most 200 bytes"))?;
+                check(!task.overrides.contains_key("tasks"), &format!("grasp task {name}: overrides cannot contain tasks"))?;
+                base.apply_fields(&task.overrides).and_then(|s| s.validate()).map_err(|e| format!("grasp task {name}: {e}"))?;
+            }
+        }
         Ok(())
     }
 
-    /// Apply a JSON object of field overrides; unknown keys and invalid results are rejected.
-    pub fn patched(&self, patch: &Value) -> Result<Self, String> {
-        let Some(obj) = patch.as_object() else { return Err("grasp setup must be a JSON object".into()); };
+    /// This setup with an empty task registry.
+    pub fn without_tasks(&self) -> Self {
+        let mut s = self.clone();
+        s.tasks.clear();
+        s
+    }
+
+    /// Set the fields of `obj` (unknown keys rejected) without validating the result.
+    fn apply_fields(&self, obj: &serde_json::Map<String, Value>) -> Result<Self, String> {
         let mut base = serde_json::to_value(self).map_err(|e| e.to_string())?;
         let fields = base.as_object_mut().expect("setup serialises to an object");
         for (k, v) in obj {
             if !fields.contains_key(k) { return Err(format!("unknown grasp setup field: {k}")); }
             fields.insert(k.clone(), v.clone());
         }
-        let out: Self = serde_json::from_value(base).map_err(|e| format!("invalid grasp setup: {e}"))?;
+        serde_json::from_value(base).map_err(|e| format!("invalid grasp setup: {e}"))
+    }
+
+    /// Configuration patch (setup API, setup file): apply a JSON object of field changes;
+    /// unknown keys and invalid results are rejected. `tasks` replaces the whole task map
+    /// (`{}` deletes all tasks).
+    pub fn patched(&self, patch: &Value) -> Result<Self, String> {
+        let Some(obj) = patch.as_object() else { return Err("grasp setup must be a JSON object".into()); };
+        let out = self.apply_fields(obj)?;
         out.validate()?;
         Ok(out)
+    }
+
+    /// Request patch (`overrides` of one grasp) on a task-free setup: like [`Self::patched`],
+    /// but `tasks` is rejected.
+    pub fn patched_request(&self, patch: &Value) -> Result<Self, String> {
+        let Some(obj) = patch.as_object() else { return Err("grasp setup must be a JSON object".into()); };
+        if obj.contains_key("tasks") { return Err("tasks cannot be overridden per request".into()); }
+        self.patched(patch)
     }
 }
 
@@ -527,6 +638,59 @@ pub struct VisionMode {
     pub enabled: bool,
 }
 
+/// One reading of the provider's `GET /api/mode`, shared by a grasp's task check and its
+/// perception negotiation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModeInfo {
+    /// The provider has a mode API (false: `/api/mode` 404, an older detector).
+    pub reported: bool,
+    /// `per_request_pipelines` (perception API 2).
+    pub per_request_pipelines: bool,
+    /// `available.depth`.
+    pub depth_available: bool,
+    /// `depth_model.metric`.
+    pub depth_metric: bool,
+    /// `model.kind` (`detect` | `segment`), when reported.
+    pub model_kind: Option<String>,
+    /// `mode` / `enabled` (`Ok(None)` without a mode API); used only without per-request
+    /// pipelines.
+    pub vision: Result<Option<VisionMode>, String>,
+}
+
+impl ModeInfo {
+    /// Parse a `GET /api/mode` body (`None` = 404).
+    pub fn parse(v: Option<&Value>) -> Self {
+        let Some(v) = v else {
+            return Self { reported: false, per_request_pipelines: false, depth_available: false, depth_metric: false, model_kind: None, vision: Ok(None) };
+        };
+        let vision = match v.get("mode").and_then(Value::as_str) {
+            Some(mode) => Ok(Some(VisionMode { mode: mode.to_string(), enabled: v.get("enabled").and_then(Value::as_bool).unwrap_or(false) })),
+            None => Err("vision mode missing".to_string()),
+        };
+        Self {
+            reported: true,
+            per_request_pipelines: v.get("per_request_pipelines").and_then(Value::as_bool) == Some(true),
+            depth_available: v.get("available").and_then(|a| a.get("depth")).and_then(Value::as_bool).unwrap_or(false),
+            depth_metric: v.get("depth_model").and_then(|d| d.get("metric")).and_then(Value::as_bool).unwrap_or(false),
+            model_kind: v.get("model").and_then(|m| m.get("kind")).and_then(Value::as_str).map(str::to_string),
+            vision,
+        }
+    }
+
+    /// From the separate queries of a source without its own [`DetectionSource::mode_info`]:
+    /// a per-request query error is the error; a depth query error reads as no depth; the
+    /// vision mode is read only without per-request pipelines.
+    pub async fn compose(source: &(impl DetectionSource + ?Sized)) -> Result<Self, String> {
+        let per_request_pipelines = source.per_request_pipelines().await?;
+        let depth_available = source.depth_available().await.unwrap_or(false);
+        let vision = if per_request_pipelines { Ok(None) } else { source.vision_mode().await };
+        Ok(Self {
+            reported: per_request_pipelines || matches!(vision, Ok(Some(_))),
+            per_request_pipelines, depth_available, depth_metric: false, model_kind: None, vision,
+        })
+    }
+}
+
 /// The mode a grasp needs: YOLO, plus ArUco when it was running.
 pub fn grasp_mode(current: &str) -> &'static str {
     match current {
@@ -574,6 +738,11 @@ pub trait DetectionSource: Send + Sync {
     /// Sets mode and continuous inference in one request.
     fn set_vision_mode(&self, _mode: &VisionMode) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async { Err("vision mode not supported".to_string()) })
+    }
+    /// Everything a grasp reads from the provider's mode, once per grasp (one `GET /api/mode`
+    /// for the HTTP source). `Err` = provider unreachable.
+    fn mode_info(&self) -> BoxFuture<'_, Result<ModeInfo, String>> {
+        Box::pin(ModeInfo::compose(self))
     }
     /// The next frame with `frame_id > after` (any frame when `after` is None), waiting up to
     /// `wait_ms`. `Ok(None)` = no new frame in time.
@@ -683,6 +852,12 @@ pub fn rescale_frame_to_cam(frame: &mut DetectionFrame, cam: &CamModel) {
 }
 
 impl DetectionSource for HttpDetectionSource {
+    fn mode_info(&self) -> BoxFuture<'_, Result<ModeInfo, String>> {
+        Box::pin(async move {
+            let v = crate::api::proxy::request_json_opt(&self.upstream, "GET", "/api/mode", None, Duration::from_secs(2)).await?;
+            Ok(ModeInfo::parse(v.as_ref()))
+        })
+    }
     fn per_request_pipelines(&self) -> BoxFuture<'_, Result<bool, String>> {
         Box::pin(async move {
             let v = crate::api::proxy::request_json_opt(&self.upstream, "GET", "/api/mode", None, Duration::from_secs(2)).await?;
@@ -1530,11 +1705,17 @@ pub struct GraspRequest {
     pub label: String,
     pub box_norm: [f64; 4],
     pub frame_id: Option<u64>,
+    /// Effective setup: base, then the task's overrides, then the request's (no `tasks`).
     pub setup: GraspSetup,
     pub tag: Option<String>,
+    /// Name of the task in `GraspSetup.tasks`, when the request named one.
+    pub task: Option<String>,
+    /// The task's perception requirements (empty without a task).
+    pub requires: TaskRequires,
 }
 
-/// Body of `/api/v1/action/grasp`: `{label, box_norm, frame_id?, ts_ms?, overrides?, tag?}`.
+/// Body of `/api/v1/action/grasp`: `{label, box_norm, frame_id?, ts_ms?, task?, overrides?, tag?}`.
+/// The setup is `base`, then the overrides of `task`, then `overrides`.
 pub fn parse_grasp(body: &Value, base: &GraspSetup) -> Result<GraspRequest, MotionError> {
     let bad = |m: &str| MotionError::InvalidCommand(m.to_string());
     let label = body.get("label").and_then(Value::as_str).filter(|l| !l.is_empty() && l.len() <= 64)
@@ -1551,16 +1732,29 @@ pub fn parse_grasp(body: &Value, base: &GraspSetup) -> Result<GraspRequest, Moti
         Some(v) => Some(v.as_u64().ok_or_else(|| bad("frame_id must be a non-negative integer"))?),
     };
     if body.get("ts_ms").is_some_and(|v| !v.is_null() && !v.is_number()) { return Err(bad("ts_ms must be a number")); }
-    let setup = match body.get("overrides") {
-        None | Some(Value::Null) => base.clone(),
-        Some(o) => base.patched(o).map_err(MotionError::InvalidCommand)?,
+    let task = match body.get("task") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => return Err(bad("task must be a string")),
     };
+    let mut setup = base.without_tasks();
+    let mut requires = TaskRequires::default();
+    if let Some(name) = &task {
+        let t = base.tasks.get(name).ok_or_else(|| bad(&format!("unknown grasp task: {name}")))?;
+        setup = setup.patched_request(&Value::Object(t.overrides.clone()))
+            .map_err(|e| MotionError::InvalidCommand(format!("grasp task {name}: {e}")))?;
+        requires = t.requires;
+    }
+    match body.get("overrides") {
+        None | Some(Value::Null) => {}
+        Some(o) => setup = setup.patched_request(o).map_err(MotionError::InvalidCommand)?,
+    }
     let tag = match body.get("tag") {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) if s.len() <= 64 => Some(s.clone()),
         _ => return Err(bad("tag must be a string of at most 64 bytes")),
     };
-    Ok(GraspRequest { label, box_norm, frame_id, setup, tag })
+    Ok(GraspRequest { label, box_norm, frame_id, setup, tag, task, requires })
 }
 
 /// A request checked under the lock, ready to be planned outside it.
@@ -1582,6 +1776,9 @@ pub struct PlannedGrasp {
     pub camera_down: bool,
     /// Estimated duration of the camera-down → tool-vertical move (0 without camera-down).
     pub transition_duration: f64,
+    /// The provider's mode read by [`preflight`] (a task with requirements); the orchestrator
+    /// reads it itself when None.
+    pub mode: Option<Result<ModeInfo, String>>,
 }
 
 /// Under the lock: parse and check preconditions.
@@ -1648,7 +1845,7 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     };
     let grasp_pose = Pose::new(tool.r, [target[0], target[1], setup.table_z_m + setup.grasp_height_m]);
     let _descend_path = motion::plan_cartesian(&cur, grasp_pose, Speed { linear: setup.descend_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
-    Ok(PlannedGrasp { input, request, target, approach_duration: path.duration, camera_down, transition_duration })
+    Ok(PlannedGrasp { input, request, target, approach_duration: path.duration, camera_down, transition_duration, mode: None })
 }
 
 /// Duration of the transition from the camera-down pose `from` to the tool-vertical pose
@@ -1676,42 +1873,132 @@ pub fn expected_duration(planned: &PlannedGrasp) -> f64 {
     if planned.camera_down { base + planned.transition_duration + 1.5 } else { base }
 }
 
+/// Code of a grasp rejected because the provider cannot serve the task's requirements.
+pub const TASK_UNSUPPORTED: &str = "TASK_UNSUPPORTED";
+
+fn task_unsupported(message: String) -> ArmError {
+    ArmError::Rejected { status: 422, code: TASK_UNSUPPORTED.to_string(), message }
+}
+
+/// Task requirement check of a planned grasp, outside the supervisor lock and before the
+/// action begins. Without requirements nothing is read. Otherwise one mode reading, kept in
+/// `planned.mode` for the orchestrator; a provider that cannot be read is not a task failure
+/// (the grasp then fails as without a task).
+pub async fn preflight(source: &dyn DetectionSource, planned: &mut PlannedGrasp) -> Result<(), ArmError> {
+    let (Some(task), false) = (planned.request.task.as_deref(), planned.request.requires.is_empty()) else { return Ok(()); };
+    let mode = source.mode_info().await;
+    let verdict = match &mode {
+        Ok(m) => planned.request.requires.check(task, m),
+        Err(_) => Ok(()),
+    };
+    planned.mode = Some(mode);
+    verdict.map_err(task_unsupported)
+}
+
+/// Result of a grasp dry run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DryRun {
+    pub reachable: bool,
+    pub code: Option<String>,
+    pub message: Option<String>,
+    /// Requests with a task: whether the provider serves its requirements (true when it has
+    /// none or the provider cannot be read) and why not.
+    pub task: Option<(bool, Option<String>)>,
+}
+
+impl DryRun {
+    /// The reply fields: `reachable`, `code`, `message`, and with a task `task_supported`,
+    /// `task_reason`.
+    pub fn fields(&self) -> serde_json::Map<String, Value> {
+        let mut m = serde_json::Map::new();
+        m.insert("reachable".into(), serde_json::json!(self.reachable));
+        m.insert("code".into(), serde_json::json!(self.code));
+        m.insert("message".into(), serde_json::json!(self.message));
+        if let Some((supported, reason)) = &self.task {
+            m.insert("task_supported".into(), serde_json::json!(supported));
+            m.insert("task_reason".into(), serde_json::json!(reason));
+        }
+        m
+    }
+}
+
 /// Dry-run reachability check: prepare + plan only, no macro started, no orchestrator spawned.
-/// Returns (reachable, code, message).
+/// Returns (reachable, code, message). The task requirements are not checked (see
+/// [`dry_run_task`]).
 pub async fn dry_run(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, Option<String>, Option<String>) {
+    let (reachable, code, message, _) = dry_run_plan(supervisor, body).await;
+    (reachable, code, message)
+}
+
+/// [`dry_run`] plus the task requirement check: one `/api/mode` reading when the request's
+/// task has requirements, none otherwise. The requirement result does not change `reachable`.
+pub async fn dry_run_task(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSource, body: &Value) -> DryRun {
+    let (reachable, code, message, request) = dry_run_plan(supervisor, body).await;
+    let task = match request {
+        Some((Some(name), requires)) => Some(if requires.is_empty() {
+            (true, None)
+        } else {
+            match source.mode_info().await {
+                Ok(m) => match requires.check(&name, &m) { Ok(()) => (true, None), Err(r) => (false, Some(r)) },
+                Err(_) => (true, None),
+            }
+        }),
+        _ => None,
+    };
+    DryRun { reachable, code, message, task }
+}
+
+/// (reachable, code, message, (task, requires) when the request parsed).
+async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, Option<String>, Option<String>, Option<(Option<String>, TaskRequires)>) {
     let pending_res = {
         let inner = supervisor.inner().read().await;
         prepare(&inner, body, inner.safety.epoch_id())
     };
+    let rejected = |e: ArmError| {
+        let api = ApiError::from(e);
+        (false, api.code.or(Some(api.error)), Some(api.message))
+    };
     match pending_res {
-        Ok(pending) => match tokio::task::spawn_blocking(move || plan(pending)).await {
-            Ok(Ok(_planned)) => (true, None, None),
-            Ok(Err(e)) => {
-                let api = ApiError::from(e);
-                (false, api.code.or(Some(api.error)), Some(api.message))
-            }
-            Err(e) => (false, Some("INTERNAL".into()), Some(format!("planner task failed: {e}"))),
-        },
+        Ok(pending) => {
+            let task = Some((pending.request.task.clone(), pending.request.requires));
+            let (reachable, code, message) = match tokio::task::spawn_blocking(move || plan(pending)).await {
+                Ok(Ok(_planned)) => (true, None, None),
+                Ok(Err(e)) => rejected(e),
+                Err(e) => (false, Some("INTERNAL".into()), Some(format!("planner task failed: {e}"))),
+            };
+            (reachable, code, message, task)
+        }
         Err(e) => {
-            let api = ApiError::from(e);
-            (false, api.code.or(Some(api.error)), Some(api.message))
+            let (reachable, code, message) = rejected(e);
+            (reachable, code, message, None)
         }
     }
 }
 
-/// Start a grasp without a WS lease check (tests, in-process agents): prepare, plan, begin
-/// and spawn the orchestrator. Returns (action id, expected duration).
+/// Begin a planned grasp under the write lock: the action record (with its `task`) and the
+/// orchestrator. Returns (action id, expected duration).
+pub fn begin(inner: &mut SupervisorInner, supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, planned: PlannedGrasp) -> Result<(u64, f64), ArmError> {
+    let id = inner.begin_macro("grasp", &planned.input, planned.request.tag.clone())?;
+    if let Some(task) = &planned.request.task {
+        inner.update_action(id, |a| a.task = Some(task.clone()));
+    }
+    let duration = expected_duration(&planned);
+    spawn(supervisor.clone(), source, id, planned);
+    Ok((id, duration))
+}
+
+/// Start a grasp without a WS lease check (tests, in-process agents): prepare, plan, task
+/// check, begin and spawn the orchestrator. Returns (action id, expected duration).
 pub async fn start(supervisor: &Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, body: &Value) -> Result<(u64, f64), ApiError> {
     let pending = {
         let inner = supervisor.inner().read().await;
         prepare(&inner, body, inner.safety.epoch_id())?
     };
-    let planned = tokio::task::spawn_blocking(move || plan(pending)).await
+    let mut planned = tokio::task::spawn_blocking(move || plan(pending)).await
         .map_err(|e| ArmError::Internal(format!("planner task failed: {e}")))??;
-    let id = supervisor.inner().write().await.begin_macro("grasp", &planned.input, planned.request.tag.clone())?;
-    let duration = expected_duration(&planned);
-    spawn(supervisor.clone(), source, id, planned);
-    Ok((id, duration))
+    preflight(source.as_ref(), &mut planned).await?;
+    let mut inner = supervisor.inner().write().await;
+    Ok(begin(&mut inner, supervisor, source, planned)?)
 }
 
 /// Spawn the orchestrator for an action begun with `SupervisorInner::begin_macro("grasp", ..)`.
@@ -3091,13 +3378,19 @@ pub fn roll_across_long_side(jaw: Vec3, long: Vec3) -> f64 {
     (t + pi / 2.0).rem_euclid(pi) - pi / 2.0
 }
 
-async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64, planned: PlannedGrasp) {
+async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64, mut planned: PlannedGrasp) {
     let setup = planned.request.setup.clone();
     let cam = CamModel::assumed(&planned.input.arm, &setup, &planned.input.cam);
     let deadline = Instant::now() + Duration::from_secs_f64(setup.timeout_s);
-    let per_request = source.per_request_pipelines().await;
+    // one mode reading per grasp: the preflight's, else read here
+    let mode = match planned.mode.take() {
+        Some(m) => m,
+        None => source.mode_info().await,
+    };
+    let per_request = mode.as_ref().map(|m| m.per_request_pipelines).map_err(Clone::clone);
     let triggered = per_request == Ok(true);
-    let depth_available = source.depth_available().await.unwrap_or(false);
+    let depth_available = mode.as_ref().is_ok_and(|m| m.depth_available);
+    let vision = mode.map_or(Ok(None), |m| m.vision);
     let ctx = MacroCtx {
         sup: sup.clone(), id, deadline, phase_timeout_s: setup.phase_timeout_s, timeout_code: "GRASP_TIMEOUT",
         timeout_message: format!("Grasp did not finish within {:.0} s", setup.timeout_s),
@@ -3110,7 +3403,7 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
     } else if triggered {
         // perception API 2: a ["yolo"] trigger per centring step, no mode change to restore
         orch.run(&planned).await
-    } else { match source.vision_mode().await {
+    } else { match vision {
         // perception API 1 (rebot-vision 1.2): YOLO (both when ArUco was running) with inference
         // on for the duration, then the previous mode
         Ok(Some(prev)) => {
@@ -3178,6 +3471,97 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tasks_setup(tasks: Value) -> Result<GraspSetup, String> { GraspSetup::default().patched(&serde_json::json!({"tasks": tasks})) }
+
+    #[test]
+    fn task_registry_validation() {
+        let ok = tasks_setup(serde_json::json!({"cup-2_a": {"description": "d", "requires": {"model_kind": "segment", "depth": "any"},
+            "overrides": {"yaw_sources": ["mask"]}}, "x": {}})).unwrap();
+        assert_eq!(ok.tasks["cup-2_a"].requires, TaskRequires { model_kind: Some(ModelKind::Segment), depth: Some(DepthReq::Any) });
+        assert!(ok.tasks["x"].requires.is_empty() && ok.tasks["x"].overrides.is_empty());
+        let long = "a".repeat(33);
+        for (tasks, msg) in [
+            (serde_json::json!({"Cup": {}}), "name"),
+            (serde_json::json!({"": {}}), "name"),
+            (serde_json::json!({long: {}}), "name"),
+            (serde_json::json!({"a b": {}}), "name"),
+            (serde_json::json!({"a": {"description": "x".repeat(201)}}), "description"),
+            (serde_json::json!({"a": {"overrides": {"tasks": {}}}}), "overrides cannot contain tasks"),
+            (serde_json::json!({"a": {"overrides": {"bogus": 1}}}), "unknown grasp setup field: bogus"),
+            (serde_json::json!({"a": {"overrides": {"grasp_height_m": 5.0}}}), "grasp_height_m"),
+            (serde_json::json!({"a": {"overrides": {"yaw_sources": ["mask", "mask"]}}}), "repeat"),
+            (serde_json::json!({"a": {"requires": {"model_kind": "obb"}}}), "invalid grasp setup"),
+            (serde_json::json!({"a": {"requires": {"depth": "stereo"}}}), "invalid grasp setup"),
+            (serde_json::json!({"a": {"requires": {"gpu": true}}}), "invalid grasp setup"),
+            (serde_json::json!({"a": {"model": "x"}}), "invalid grasp setup"),
+        ] {
+            let e = tasks_setup(tasks.clone()).unwrap_err();
+            assert!(e.contains(msg), "{tasks}: {e}");
+        }
+        // a task is checked against the setup it is stored with; a base change that breaks it is rejected
+        let s = tasks_setup(serde_json::json!({"low": {"overrides": {"max_grasp_height_m": 0.05}}})).unwrap();
+        assert!(GraspSetup::default().patched(&serde_json::json!({"grasp_height_m": 0.055})).is_ok());
+        let e = s.patched(&serde_json::json!({"grasp_height_m": 0.055})).unwrap_err();
+        assert!(e.starts_with("grasp task low: max_grasp_height_m"), "{e}");
+        // replacing the map in the same patch fixes it; `{}` deletes all tasks
+        assert!(s.patched(&serde_json::json!({"grasp_height_m": 0.055, "tasks": {}})).unwrap().tasks.is_empty());
+        // tasks always serialise (first insertion through a patch of the default)
+        assert_eq!(serde_json::to_value(GraspSetup::default()).unwrap()["tasks"], serde_json::json!({}));
+        assert_eq!(serde_json::to_value(&s).unwrap()["tasks"], serde_json::json!({"low": {"overrides": {"max_grasp_height_m": 0.05}}}));
+    }
+
+    #[test]
+    fn grasp_request_applies_base_then_task_then_overrides() {
+        let base = tasks_setup(serde_json::json!({
+            "t": {"requires": {"depth": "metric"}, "overrides": {"lift_height_m": 0.13, "approach_height_m": 0.2}},
+            "low": {"overrides": {"max_grasp_height_m": 0.05}},
+        })).unwrap();
+        let body = |extra: Value| {
+            let mut b = serde_json::json!({"label": "cup", "box_norm": [0.4, 0.4, 0.6, 0.6]});
+            for (k, v) in extra.as_object().unwrap() { b[k] = v.clone(); }
+            b
+        };
+        let r = parse_grasp(&body(serde_json::json!({"task": "t", "overrides": {"approach_height_m": 0.18}})), &base).unwrap();
+        assert_eq!((r.setup.lift_height_m, r.setup.approach_height_m, r.setup.table_z_m), (0.13, 0.18, base.table_z_m), "request override wins");
+        assert_eq!((r.task.as_deref(), r.requires.depth), (Some("t"), Some(DepthReq::Metric)));
+        assert!(r.setup.tasks.is_empty(), "the effective setup carries no tasks");
+        let r = parse_grasp(&body(serde_json::json!({})), &base).unwrap();
+        assert_eq!((r.task, r.requires, r.setup), (None, TaskRequires::default(), base.without_tasks()));
+        let err = |extra: Value| match parse_grasp(&body(extra), &base) { Err(MotionError::InvalidCommand(m)) => m, other => panic!("{other:?}") };
+        assert_eq!(err(serde_json::json!({"task": "nope"})), "unknown grasp task: nope");
+        assert_eq!(err(serde_json::json!({"task": ["t"]})), "task must be a string");
+        assert_eq!(err(serde_json::json!({"overrides": {"tasks": {}}})), "tasks cannot be overridden per request");
+        // only the final effective setup is validated: the request's grasp height against the task's max
+        assert!(err(serde_json::json!({"task": "low", "overrides": {"grasp_height_m": 0.055}})).contains("max_grasp_height_m"));
+        assert!(parse_grasp(&body(serde_json::json!({"overrides": {"grasp_height_m": 0.055}})), &base).is_ok(), "no task: the tasks do not constrain overrides");
+    }
+
+    #[test]
+    fn mode_info_parse_and_task_requirement_check() {
+        let legacy = ModeInfo::parse(None);
+        assert!(!legacy.reported && legacy.vision == Ok(None));
+        let full = ModeInfo::parse(Some(&serde_json::json!({"mode": "yolo", "enabled": true, "per_request_pipelines": true,
+            "model": {"kind": "segment"}, "available": {"depth": true}, "depth_model": {"metric": true}})));
+        assert_eq!(full, ModeInfo { reported: true, per_request_pipelines: true, depth_available: true, depth_metric: true,
+            model_kind: Some("segment".into()), vision: Ok(Some(VisionMode { mode: "yolo".into(), enabled: true })) });
+        // available.depth is read independently of depth_model.metric
+        let depth_off = ModeInfo::parse(Some(&serde_json::json!({"available": {"depth": false}, "depth_model": {"metric": true}})));
+        assert!(!depth_off.depth_available && depth_off.depth_metric && depth_off.vision.is_err());
+        let relative = ModeInfo { depth_metric: false, model_kind: Some("detect".into()), ..full.clone() };
+        let req = |k: Option<ModelKind>, d: Option<DepthReq>| TaskRequires { model_kind: k, depth: d };
+        assert_eq!(req(None, None).check("t", &legacy), Ok(()));
+        assert_eq!(req(Some(ModelKind::Segment), Some(DepthReq::Metric)).check("t", &full), Ok(()));
+        assert_eq!(req(Some(ModelKind::Segment), None).check("t", &relative).unwrap_err(), "task t needs model_kind segment, provider has detect");
+        assert_eq!(req(Some(ModelKind::Detect), None).check("t", &relative), Ok(()));
+        assert_eq!(req(None, Some(DepthReq::Any)).check("t", &relative), Ok(()));
+        assert_eq!(req(None, Some(DepthReq::Metric)).check("t", &relative).unwrap_err(), "task t needs depth metric, provider depth model is not metric");
+        assert_eq!(req(None, Some(DepthReq::Any)).check("t", &depth_off).unwrap_err(), "task t needs depth any, provider has no depth pipeline");
+        assert_eq!(req(Some(ModelKind::Detect), None).check("t", &ModeInfo { model_kind: None, ..full.clone() }).unwrap_err(),
+            "task t needs model_kind detect, provider does not report model.kind");
+        assert_eq!(req(Some(ModelKind::Detect), None).check("t", &legacy).unwrap_err(), "task t needs model_kind detect, provider does not report model.kind");
+        assert_eq!(req(None, Some(DepthReq::Any)).check("t", &legacy).unwrap_err(), "task t needs depth any, provider does not report depth");
+    }
 
     #[test]
     fn patch_rejects_unknown_and_invalid_fields() {

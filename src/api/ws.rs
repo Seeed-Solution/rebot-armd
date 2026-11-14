@@ -179,12 +179,7 @@ impl PlannedMacro {
     /// Begin the action and spawn its orchestrator. Returns (action id, expected duration).
     fn start(self, inner: &mut SupervisorInner, supervisor: &Arc<ArmSupervisor>, deps: &crate::grasp::GraspDeps) -> Result<(u64, f64), ArmError> {
         match self {
-            Self::Grasp(planned) => {
-                let id = inner.begin_macro("grasp", &planned.input, planned.request.tag.clone())?;
-                let duration = crate::grasp::expected_duration(&planned);
-                crate::grasp::spawn(supervisor.clone(), deps.source.clone(), id, planned);
-                Ok((id, duration))
-            }
+            Self::Grasp(planned) => crate::grasp::begin(inner, supervisor, deps.source.clone(), planned),
             Self::Place(planned) => {
                 let id = inner.begin_macro("place", &planned.input, planned.request.tag.clone())?;
                 if planned.orientation_levelled {
@@ -589,7 +584,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 // Macro actions (grasp, place): the first motions are planned without the lock
                 // (feasibility check), then the action begins and the orchestrator task takes over.
                 if let Some((request_id, pending, generation)) = pending_macro.take() {
-                    let planned = tokio::task::spawn_blocking(move || pending.plan()).await;
+                    let mut planned = tokio::task::spawn_blocking(move || pending.plan()).await;
+                    // grasp task requirements: checked without the lock, before the action begins
+                    if let Ok(Ok(PlannedMacro::Grasp(g))) = &mut planned {
+                        if let Err(e) = crate::grasp::preflight(recv_deps.source.as_ref(), g).await { planned = Ok(Err(e)); }
+                    }
                     let mut inner = recv_supervisor.inner().write().await;
                     response = Some(match planned {
                         Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
@@ -626,12 +625,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     });
                 }
                 if let Some((request_id, body)) = pending_dry_run_grasp.take() {
-                    let (reachable, code, message) = crate::grasp::dry_run(&recv_supervisor, &body).await;
+                    let dry = crate::grasp::dry_run_task(&recv_supervisor, recv_deps.source.as_ref(), &body).await;
                     let inner = recv_supervisor.inner().read().await;
                     let mut ack = command_ack(&inner, &request_id, None);
-                    ack["reachable"] = json!(reachable);
-                    ack["code"] = json!(code);
-                    ack["message"] = json!(message);
+                    for (k, v) in dry.fields() { ack[k.as_str()] = v; }
                     response = Some(ack);
                 }
                 // State files are written by the single persist writer; this loop does not wait

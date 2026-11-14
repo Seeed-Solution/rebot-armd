@@ -1401,6 +1401,8 @@ pub struct Capabilities {
     pub gripper: bool,
     /// `/api/v1/action/grasp`: 7-DOF, kinematics, gripper policy and grasp setup.
     pub grasp: bool,
+    /// Grasp tasks (`GraspSetup.tasks`, request `task`, `TASK_UNSUPPORTED`); same value as `grasp`.
+    pub grasp_tasks: bool,
     /// Gravity-compensation mode; same value as `observation.gravity_comp.supported`.
     pub gravity_comp: bool,
     /// The profile sets per-joint Damiao mapping ranges (`damiao_ranges`); the startup
@@ -1461,13 +1463,15 @@ impl Capabilities {
         let kin = config.kinematics.is_some();
         let six_arm = config.arm_dof() == 6 && matches!(config.dof, 6 | 7);
         let gripper = config.dof >= 7 && config.gripper_policy.is_some();
+        let grasp = seven && kin && config.gripper_policy.is_some() && config.grasp.is_some();
         Self {
             version: CAPABILITIES_VERSION,
             profile_version: config.profile_version,
             cartesian: seven && kin,
             workspace_check: kin && config.workspace.is_some(),
             gripper,
-            grasp: seven && kin && config.gripper_policy.is_some() && config.grasp.is_some(),
+            grasp,
+            grasp_tasks: grasp,
             gravity_comp: seven && config.gravity_model.is_some() && config.gravity_comp.is_some(),
             damiao_ranges: config.damiao_ranges.is_some(),
             servo_guard: true,

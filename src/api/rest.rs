@@ -340,18 +340,15 @@ pub async fn motion_unload(
 /// Grasp dry run (`dry_run: true`) is allowed without a lease and returns 200 OK with reachability.
 pub async fn action_requires_lease(
     State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>,
     uri: axum::http::Uri,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if uri.path() == "/api/v1/action/grasp" {
         if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&body) {
             if val.get("dry_run").and_then(serde_json::Value::as_bool) == Some(true) {
-                let (reachable, code, message) = crate::grasp::dry_run(&supervisor, &val).await;
-                return Ok(Json(serde_json::json!({
-                    "reachable": reachable,
-                    "code": code,
-                    "message": message,
-                })));
+                let dry = crate::grasp::dry_run_task(&supervisor, deps.source.as_ref(), &val).await;
+                return Ok(Json(serde_json::Value::Object(dry.fields())));
             }
         }
     }

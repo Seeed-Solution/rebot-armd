@@ -531,3 +531,21 @@ async fn detection_mask_focus_passes_through() {
     assert!(seen.iter().any(|s| s.target == "/api/mask_focus" && s.method == "GET"));
     assert!(seen.iter().any(|s| s.target == "/api/mask_focus" && s.method == "POST"));
 }
+
+#[tokio::test]
+async fn http_detection_source_reads_the_mode_once() {
+    use armd::grasp::{DetectionSource, HttpDetectionSource, VisionMode};
+    let (up, seen) = spawn_mock_upstream().await;
+    let src = HttpDetectionSource { upstream: DetectorUpstream::parse(&format!("http://{up}")).unwrap(), image_size_px: [640.0, 360.0] };
+    let m = src.mode_info().await.unwrap();
+    assert!(m.reported && m.per_request_pipelines && !m.depth_available && m.model_kind.is_none());
+    assert_eq!(m.vision, Ok(Some(VisionMode { mode: "yolo".into(), enabled: false })));
+    assert_eq!(seen.lock().unwrap().iter().map(|s| (s.method.as_str(), s.target.as_str())).collect::<Vec<_>>(), [("GET", "/api/mode")],
+        "one GET /api/mode for everything a grasp reads");
+    // older detector: 404 -> no mode API; provider down -> error
+    let old = HttpDetectionSource { upstream: DetectorUpstream::parse(&format!("http://{up}/old")).unwrap(), image_size_px: [640.0, 360.0] };
+    let m = old.mode_info().await.unwrap();
+    assert!(!m.reported && !m.per_request_pipelines && m.vision == Ok(None));
+    let down = HttpDetectionSource { upstream: DetectorUpstream::parse("http://127.0.0.1:1").unwrap(), image_size_px: [640.0, 360.0] };
+    assert!(down.mode_info().await.is_err());
+}
