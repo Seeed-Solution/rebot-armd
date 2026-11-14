@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
@@ -271,6 +271,8 @@ pub struct SupervisorInner {
     pub last_can_feedback_instant: Option<Instant>,
     pub bus_loss_instant: Option<Instant>,
     pub e_stop_latched: Arc<AtomicBool>,
+    pub requested_estop_count: Arc<AtomicU64>,
+    pub applied_estop_count: u64,
     pub last_preemption: Option<Instant>,
     /// Connection and generation most recently evicted by a forced acquire.
     pub last_evicted: Option<(String, u64)>,
@@ -442,6 +444,8 @@ impl SupervisorInner {
             last_can_feedback_instant: None,
             bus_loss_instant: None,
             e_stop_latched: Arc::new(AtomicBool::new(false)),
+            requested_estop_count: Arc::new(AtomicU64::new(0)),
+            applied_estop_count: 0,
             last_preemption: None,
             last_evicted: None,
             handover_settling_since: None,
@@ -481,6 +485,10 @@ impl SupervisorInner {
             schema.feetech_joints = self.config.feetech.as_ref().map(|f| f.joints.clone());
         }
         schema
+    }
+
+    pub fn effective_gripper_policy(&self) -> Option<&crate::model::GripperPolicy> {
+        self.config.gripper_policy.as_ref()
     }
 
     pub fn with_driver(mut self, driver: Box<dyn ArmDriver>) -> Self {
@@ -1551,6 +1559,15 @@ impl SupervisorInner {
     }
 
     pub fn clear_fault(&mut self) -> Result<SafetyState, SafetyError> {
+        let check_concurrent_estop = |inner: &mut Self| -> Result<(), SafetyError> {
+            if inner.requested_estop_count.load(Ordering::SeqCst) != inner.applied_estop_count {
+                inner.e_stop_latched.store(true, Ordering::SeqCst);
+                inner.apply_stop_policy(StopPolicy::EStopLatch);
+                return Err(SafetyError::EStopActive);
+            }
+            Ok(())
+        };
+        check_concurrent_estop(self)?;
         if !self.safety.state().is_stopped() { return Ok(self.safety.state().clone()); }
         if self.gravity_comp_blocks_clear() {
             return Err(SafetyError::ClearFaultRejected("Gravity compensation: the switch back to POS_VEL is not confirmed yet".into()));
@@ -1656,6 +1673,7 @@ impl SupervisorInner {
         self.commanded_accelerations.fill(0.0);
         self.following_error_since = None;
         self.bus_loss_instant = None;
+        check_concurrent_estop(self)?;
         let state = self.safety.clear_fault()?;
         self.handover_settling_since = None;
         self.e_stop_latched.store(false, Ordering::SeqCst);
@@ -3214,7 +3232,12 @@ impl SupervisorInner {
                 let is_stalled = if has_torque_feedback {
                     tau_g.abs() >= GRIPPER_STALL_LATCH_NM && v_g.abs() < 0.10
                 } else {
-                    let load_condition = if has_load_feedback { load_g.abs() > 0.35 } else { true };
+                    let stall_load_thresh = self.effective_gripper_policy()
+                        .filter(|p| p.holding_mode == crate::model::HoldingMode::LoadAndGap)
+                        .and_then(|p| p.holding_load_fraction)
+                        .map(|frac| (frac * 1.25).clamp(0.18, 0.35))
+                        .unwrap_or(0.35);
+                    let load_condition = if has_load_feedback { load_g.abs() > stall_load_thresh } else { true };
                     gap.abs() > 0.08 && v_g.abs() < 0.05 && load_condition
                 };
                 let required_ticks = if has_torque_feedback { 6 } else { 10 };
@@ -4022,6 +4045,7 @@ pub struct ArmSupervisor {
     inner: Arc<RwLock<SupervisorInner>>,
     telemetry_tx: broadcast::Sender<ArmObservation>,
     pub e_stop_latched: Arc<AtomicBool>,
+    pub requested_estop_count: Arc<AtomicU64>,
     tick_stats: std::sync::Mutex<crate::diagnostics::tick::TickStats>,
 }
 
@@ -4029,12 +4053,15 @@ impl ArmSupervisor {
     pub fn new(config: ArmConfig) -> Self {
         let (tx, _) = broadcast::channel(128);
         let e_stop_latched = Arc::new(AtomicBool::new(false));
+        let requested_estop_count = Arc::new(AtomicU64::new(0));
         let mut inner = SupervisorInner::new(config);
         inner.e_stop_latched = e_stop_latched.clone();
+        inner.requested_estop_count = requested_estop_count.clone();
         Self {
             inner: Arc::new(RwLock::new(inner)),
             telemetry_tx: tx,
             e_stop_latched,
+            requested_estop_count,
             tick_stats: std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default()),
         }
     }
@@ -4248,8 +4275,10 @@ impl ArmSupervisor {
     }
 
     pub async fn trigger_e_stop(&self) -> (SafetyState, u64) {
+        self.requested_estop_count.fetch_add(1, Ordering::SeqCst);
         self.e_stop_latched.store(true, Ordering::SeqCst);
         let mut inner = self.inner.write().await;
+        inner.applied_estop_count += 1;
         inner.e_stop_latched.store(true, Ordering::SeqCst);
         inner.apply_stop_policy(StopPolicy::EStopLatch);
         (inner.safety.state().clone(), inner.safety.epoch_id())

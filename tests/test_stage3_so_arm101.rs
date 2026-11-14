@@ -1209,3 +1209,97 @@ fn test_cross_threshold_cartesian_slerp_tilted_to_vertical() {
         .expect("Cartesian slerp from tilted to vertical must succeed without IkBranchFlip");
     assert!(path.q.len() >= 2);
 }
+
+#[test]
+fn test_so_arm101_holding_load_fraction_validation() {
+    let base_cfg = load_so101_config();
+
+    // 1. NaN is rejected
+    let mut cfg_nan = base_cfg.clone();
+    cfg_nan.gripper_policy.as_mut().unwrap().holding_load_fraction = Some(f32::NAN);
+    assert!(cfg_nan.validate().is_err(), "NaN holding_load_fraction must be rejected");
+
+    // 2. < 0 is rejected
+    let mut cfg_neg = base_cfg.clone();
+    cfg_neg.gripper_policy.as_mut().unwrap().holding_load_fraction = Some(-0.01);
+    assert!(cfg_neg.validate().is_err(), "< 0 holding_load_fraction must be rejected");
+
+    // 3. > 1 is rejected
+    let mut cfg_gt1 = base_cfg.clone();
+    cfg_gt1.gripper_policy.as_mut().unwrap().holding_load_fraction = Some(1.05);
+    assert!(cfg_gt1.validate().is_err(), "> 1 holding_load_fraction must be rejected");
+
+    // 4. 0.0 with LoadAndGap is rejected
+    let mut cfg_zero = base_cfg.clone();
+    cfg_zero.gripper_policy.as_mut().unwrap().holding_mode = armd::model::HoldingMode::LoadAndGap;
+    cfg_zero.gripper_policy.as_mut().unwrap().holding_load_fraction = Some(0.0);
+    assert!(cfg_zero.validate().is_err(), "0.0 holding_load_fraction with LoadAndGap must be rejected");
+
+    // 5. Valid holding_load_fraction (0.18) is accepted
+    let mut cfg_valid = base_cfg.clone();
+    cfg_valid.gripper_policy.as_mut().unwrap().holding_mode = armd::model::HoldingMode::LoadAndGap;
+    cfg_valid.gripper_policy.as_mut().unwrap().holding_load_fraction = Some(0.18);
+    assert!(cfg_valid.validate().is_ok());
+}
+
+#[tokio::test]
+async fn test_so_arm101_gripper_stall_at_load_threshold() {
+    struct So101LoadDriver {
+        loads: Vec<f32>,
+    }
+
+    impl ArmDriver for So101LoadDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: false,
+                temperature_feedback: false,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: true,
+            }
+        }
+        fn enable_state(&self) -> EnableState { EnableState::Enabled }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 6] }
+        fn joint_loads(&self) -> Option<Vec<f32>> { Some(self.loads.clone()) }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            Ok((0..6).map(|i| JointState {
+                position: if i == 5 { 0.2 } else { 0.0 }, // gap: cmd (0.4) - meas (0.2) = 0.2 > 0.08
+                velocity: 0.0,
+                torque: 0.0,
+                temperature: 28.0,
+            }).collect())
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+    }
+
+    let config = load_so101_config();
+    assert_eq!(config.dof, 6);
+    assert_eq!(config.gripper_joint, Some(5));
+
+    let mut loads = vec![0.0f32; 6];
+    loads[5] = 0.23;
+
+    let driver = So101LoadDriver { loads };
+    let supervisor = ArmSupervisor::new(config).with_driver(Box::new(driver));
+
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.is_torqued = true;
+        inner.commanded_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.4];
+        inner.measured_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.2];
+        inner.measured_velocities = vec![0.0; 6];
+        inner.loads = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.23];
+        inner.last_can_feedback_instant = Some(std::time::Instant::now());
+    }
+
+    for _ in 0..10 {
+        let _ = supervisor.tick(0.02).await;
+    }
+
+    assert!(supervisor.is_gripper_stalled().await, "Gripper must be stalled at |load| = 0.23");
+    let obs = supervisor.get_observation().await;
+    assert_eq!(obs.gripper.as_ref().map(|g| g.stalled), Some(true));
+}

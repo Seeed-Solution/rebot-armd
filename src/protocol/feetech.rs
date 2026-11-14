@@ -356,7 +356,7 @@ pub fn raw_speed_to_rad_s(raw: u16) -> f32 {
 
 /// Encode signed integer into sign-magnitude representation with sign_bit.
 pub fn encode_sign_magnitude(val: i16, sign_bit: u16) -> u16 {
-    let mask = sign_bit - 1;
+    let mask = sign_bit.saturating_sub(1);
     if val < 0 {
         let mag = val.unsigned_abs().min(mask);
         sign_bit | mag
@@ -367,8 +367,8 @@ pub fn encode_sign_magnitude(val: i16, sign_bit: u16) -> u16 {
 
 /// Decode sign-magnitude raw representation with sign_bit into signed integer.
 pub fn decode_sign_magnitude(raw: u16, sign_bit: u16) -> i16 {
-    let mask = sign_bit - 1;
-    let mag = (raw & mask) as i16;
+    let mask = sign_bit.saturating_sub(1);
+    let mag = (raw & mask).min(i16::MAX as u16) as i16;
     if (raw & sign_bit) != 0 {
         -mag
     } else {

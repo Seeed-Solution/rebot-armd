@@ -208,7 +208,8 @@
   "hardware": {
     "physical_estop": false,
     "notes": [
-      "SO-ARM100 5-DOF arm + gripper with Feetech STS3215 serial bus servos"
+      "SO-ARM100 5-DOF arm + gripper with Feetech STS3215 serial bus servos",
+      "so_arm100 currently approximates SO-100 using the SO-ARM101 kinematic chain geometry pending dedicated SO-100 CAD meshes/URDF."
     ]
   },
   "feetech": {

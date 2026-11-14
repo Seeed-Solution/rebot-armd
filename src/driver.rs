@@ -284,6 +284,7 @@ pub struct FeetechArmDriver<T: Transport> {
     partial_enable_known: bool,
     joint_torque_enabled: Vec<Option<bool>>,
     abort_flag: Option<Arc<AtomicBool>>,
+    pub last_enable_poll: Option<Instant>,
 }
 
 impl<T: Transport> FeetechArmDriver<T> {
@@ -320,6 +321,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             partial_enable_known: false,
             joint_torque_enabled: vec![None; dof],
             abort_flag: None,
+            last_enable_poll: None,
         }
     }
 
@@ -355,6 +357,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             self.tx_echo_auto = false;
         }
         let old_ids = self.servo_ids.clone();
+        let old_joints = self.config.joints.clone();
         self.config = cfg;
         if self.config.joints.is_empty() {
             self.config.joints = self
@@ -370,7 +373,7 @@ impl<T: Transport> FeetechArmDriver<T> {
         }
 
         let dof = self.servo_ids.len();
-        if self.servo_ids != old_ids {
+        if self.servo_ids != old_ids || self.config.joints != old_joints {
             self.cached_states = vec![JointState::default(); dof];
             self.cached_loads = vec![0.0; dof];
             self.motor_status = vec![0; dof];
@@ -385,10 +388,12 @@ impl<T: Transport> FeetechArmDriver<T> {
             if self.effective_ranges.len() != dof {
                 self.effective_ranges.resize(dof, (0, 4095));
             }
-            self.joint_torque_enabled = vec![None; dof];
-            self.poll_cursor = 0;
-            self.confirmed_enable_state = EnableState::Unknown;
-            self.partial_enable_known = false;
+            if self.servo_ids != old_ids {
+                self.joint_torque_enabled = vec![None; dof];
+                self.poll_cursor = 0;
+                self.confirmed_enable_state = EnableState::Unknown;
+                self.partial_enable_known = false;
+            }
         } else {
             self.effective_ranges = self
                 .config
@@ -512,7 +517,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             while !self.rx_buffer.is_empty() {
                 match feetech::parse_response(&self.rx_buffer) {
                     Ok((pkt, consumed)) => {
-                        let is_req_echo = !skipped_echo && consumed == req.len() && self.rx_buffer[..consumed] == req[..];
+                        let is_req_echo = !skipped_echo && consumed >= req.len() && self.rx_buffer[consumed - req.len()..consumed] == req[..];
                         self.rx_buffer.drain(..consumed);
                         if is_req_echo {
                             skipped_echo = true;
@@ -568,7 +573,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             while !self.rx_buffer.is_empty() {
                 match feetech::parse_response(&self.rx_buffer) {
                     Ok((pkt, consumed)) => {
-                        let is_req_echo = !skipped_echo && consumed == req.len() && self.rx_buffer[..consumed] == req[..];
+                        let is_req_echo = !skipped_echo && consumed >= req.len() && self.rx_buffer[consumed - req.len()..consumed] == req[..];
                         self.rx_buffer.drain(..consumed);
                         if is_req_echo {
                             skipped_echo = true;
@@ -1088,25 +1093,27 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 ));
             }
             for (i, &raw) in self.cached_raw_steps.iter().enumerate() {
-                let (min_step, max_step) = self.effective_ranges.get(i).copied().unwrap_or((0, 4095));
+                let (r_min, r_max) = self.effective_ranges.get(i).copied().unwrap_or((0, 4095));
                 let calib = self.config.joints.get(i);
-                let min_allowed = if let Some(c) = calib {
-                    if c.range_min_steps.is_some() {
-                        min_step as i32
+                let (min_allowed, max_allowed) = if let Some(c) = calib {
+                    if c.homing_applied_in_hw {
+                        (r_min as i32, r_max as i32)
                     } else {
-                        (min_step as i32 + c.homing_offset_steps as i32).min(0)
+                        let shift = c.homing_offset_steps as i32;
+                        let min_a = if c.range_min_steps.is_some() {
+                            r_min as i32 - shift
+                        } else {
+                            (0 - shift).min(0)
+                        };
+                        let max_a = if c.range_max_steps.is_some() {
+                            r_max as i32 - shift
+                        } else {
+                            (4095 - shift).max(4095)
+                        };
+                        (min_a, max_a)
                     }
                 } else {
-                    min_step as i32
-                };
-                let max_allowed = if let Some(c) = calib {
-                    if c.range_max_steps.is_some() {
-                        max_step as i32
-                    } else {
-                        (max_step as i32 + c.homing_offset_steps as i32).max(4095)
-                    }
-                } else {
-                    max_step as i32
+                    (r_min as i32, r_max as i32)
                 };
                 if raw < min_allowed || raw > max_allowed {
                     return Err(ArmDriverError::HardwareFault(format!(
@@ -1200,6 +1207,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             if all_enabled && one_count == ids.len() {
                 self.confirmed_enable_state = EnableState::Enabled;
                 self.partial_enable_known = false;
+                self.last_enable_poll = Some(Instant::now());
                 Ok(())
             } else {
                 let mut rb_write_err = false;
@@ -1327,6 +1335,74 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         let start_time = Instant::now();
         let mut temp_chunk = [0u8; 1];
 
+        self.read_poll_count += 1;
+        let did_enable_poll = (self.confirmed_enable_state == EnableState::Enabled || self.partial_enable_known)
+            && (self.read_poll_count.is_multiple_of(10) || self.last_enable_poll.is_none_or(|t| t.elapsed() >= Duration::from_millis(200)));
+        if did_enable_poll {
+            self.last_enable_poll = Some(Instant::now());
+            self.transport.clear_input_buffer();
+            self.rx_buffer.clear();
+            if let Ok(sync_read) = feetech::build_sync_read(&self.servo_ids, feetech::REG_TORQUE_ENABLE, 1) {
+                let _ = self.transport.write_all(&sync_read);
+                let _ = self.transport.flush();
+                let _ = self.drain_tx_echo(&sync_read);
+
+                let mut temp_en = [0u8; 1];
+                let start_en = Instant::now();
+                let mut replies: std::collections::HashMap<u8, u8> = std::collections::HashMap::new();
+
+                while replies.len() < self.servo_ids.len()
+                    && start_en.elapsed() < Duration::from_millis(3)
+                    && start_time.elapsed() < Duration::from_millis(10)
+                {
+                    if let Ok(n) = self.transport.read(&mut temp_en) {
+                        if n > 0 {
+                            self.rx_buffer.extend_from_slice(&temp_en[..n]);
+                        }
+                    }
+                    while !self.rx_buffer.is_empty() {
+                        match feetech::parse_response(&self.rx_buffer) {
+                            Ok((pkt, consumed)) => {
+                                self.rx_buffer.drain(..consumed);
+                                if pkt.id != feetech::BROADCAST_ID && self.servo_ids.contains(&pkt.id) && pkt.params.len() == 1 {
+                                    replies.insert(pkt.id, pkt.params[0]);
+                                }
+                            }
+                            Err(feetech::FeetechError::IncompleteFrame { .. }) => break,
+                            Err(_) => {
+                                self.rx_buffer.remove(0);
+                            }
+                        }
+                    }
+                    if replies.len() < self.servo_ids.len() {
+                        std::thread::yield_now();
+                    }
+                }
+
+                let prev_holding_lost = self.partial_enable_known && self.servo_ids.iter().enumerate().any(|(idx, id)| {
+                    self.joint_torque_enabled.get(idx).copied().flatten() == Some(true)
+                        && replies.get(id).copied() == Some(0)
+                });
+
+                for (idx, &id) in self.servo_ids.iter().enumerate() {
+                    if let Some(&v) = replies.get(&id) {
+                        self.joint_torque_enabled[idx] = Some(v != 0);
+                    }
+                }
+
+                if replies.len() == self.servo_ids.len() && replies.values().all(|&v| v == 0) {
+                    self.confirmed_enable_state = EnableState::Disabled;
+                    self.partial_enable_known = false;
+                } else if self.confirmed_enable_state == EnableState::Enabled && replies.values().any(|&v| v == 0) {
+                    self.confirmed_enable_state = EnableState::Unknown;
+                    self.partial_enable_known = false;
+                } else if prev_holding_lost {
+                    self.partial_enable_known = false;
+                    self.confirmed_enable_state = EnableState::Unknown;
+                }
+            }
+        }
+
         let chunks: Vec<Vec<u8>> = self.servo_ids.chunks(MAX_SYNC_READ_SERVOS).map(|c| c.to_vec()).collect();
         let num_chunks = chunks.len();
         let start_chunk = self.poll_cursor % num_chunks;
@@ -1341,6 +1417,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 break 'chunk_loop;
             }
 
+            if offset > 0 || did_enable_poll || !matches!(feetech::parse_response(&self.rx_buffer), Err(feetech::FeetechError::IncompleteFrame { .. })) {
+                self.transport.clear_input_buffer();
+                self.rx_buffer.clear();
+            }
             let sync_read = feetech::build_sync_read(chunk, feetech::REG_PRESENT_POSITION_L, 8)
                 .map_err(|e| ArmDriverError::Protocol(e.to_string()))?;
 
@@ -1437,72 +1517,6 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             }
 
             self.poll_cursor = (chunk_idx + 1) % num_chunks;
-        }
-
-        self.read_poll_count += 1;
-        if (self.confirmed_enable_state == EnableState::Enabled || self.partial_enable_known)
-            && self.read_poll_count.is_multiple_of(10)
-            && start_time.elapsed() < MAX_READ_DURATION
-        {
-            if let Ok(sync_read) = feetech::build_sync_read(&self.servo_ids, feetech::REG_TORQUE_ENABLE, 1) {
-                let _ = self.transport.write_all(&sync_read);
-                let _ = self.transport.flush();
-                let _ = self.drain_tx_echo(&sync_read);
-
-                let mut temp_en = [0u8; 1];
-                let start_en = Instant::now();
-                let mut replies: std::collections::HashMap<u8, u8> = std::collections::HashMap::new();
-
-                while replies.len() < self.servo_ids.len()
-                    && start_en.elapsed() < Duration::from_millis(3)
-                    && start_time.elapsed() < Duration::from_millis(10)
-                {
-                    if let Ok(n) = self.transport.read(&mut temp_en) {
-                        if n > 0 {
-                            self.rx_buffer.extend_from_slice(&temp_en[..n]);
-                        }
-                    }
-                    while !self.rx_buffer.is_empty() {
-                        match feetech::parse_response(&self.rx_buffer) {
-                            Ok((pkt, consumed)) => {
-                                self.rx_buffer.drain(..consumed);
-                                if pkt.id != feetech::BROADCAST_ID && self.servo_ids.contains(&pkt.id) && pkt.params.len() == 1 {
-                                    replies.insert(pkt.id, pkt.params[0]);
-                                }
-                            }
-                            Err(feetech::FeetechError::IncompleteFrame { .. }) => break,
-                            Err(_) => {
-                                self.rx_buffer.remove(0);
-                            }
-                        }
-                    }
-                    if replies.len() < self.servo_ids.len() {
-                        std::thread::yield_now();
-                    }
-                }
-
-                let prev_holding_lost = self.partial_enable_known && self.servo_ids.iter().enumerate().any(|(idx, id)| {
-                    self.joint_torque_enabled.get(idx).copied().flatten() == Some(true)
-                        && replies.get(id).copied() == Some(0)
-                });
-
-                for (idx, &id) in self.servo_ids.iter().enumerate() {
-                    if let Some(&v) = replies.get(&id) {
-                        self.joint_torque_enabled[idx] = Some(v != 0);
-                    }
-                }
-
-                if replies.len() == self.servo_ids.len() && replies.values().all(|&v| v == 0) {
-                    self.confirmed_enable_state = EnableState::Disabled;
-                    self.partial_enable_known = false;
-                } else if self.confirmed_enable_state == EnableState::Enabled && replies.values().any(|&v| v == 0) {
-                    self.confirmed_enable_state = EnableState::Unknown;
-                    self.partial_enable_known = false;
-                } else if prev_holding_lost {
-                    self.partial_enable_known = false;
-                    self.confirmed_enable_state = EnableState::Unknown;
-                }
-            }
         }
 
         if self.rx_buffer.len() > 512 {

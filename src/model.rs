@@ -354,6 +354,8 @@ pub enum HoldingMode {
     LoadAndGap,
 }
 
+pub type HoldingDetection = HoldingMode;
+
 /// Gripper action parameters (`/api/v1/action/gripper`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GripperPolicy {
@@ -1082,6 +1084,14 @@ impl ArmConfig {
                 || !(0.0..=0.5).contains(&g.squeeze_rad) || g.settle_ms == 0 || g.settle_ms > 5000 {
                 return Err("Invalid gripper policy (open/closed inside the gripper joint limits, 0 <= squeeze_rad <= 0.5)".into());
             }
+            if let Some(frac) = g.holding_load_fraction {
+                if !frac.is_finite() || !(0.0..=1.0).contains(&frac) {
+                    return Err("Invalid gripper policy: holding_load_fraction must be in 0.0..=1.0".into());
+                }
+            }
+            if g.holding_mode == HoldingMode::LoadAndGap && g.holding_load_fraction.unwrap_or(0.0) <= 0.0 {
+                return Err("Invalid gripper policy: LoadAndGap holding mode requires holding_load_fraction > 0.0".into());
+            }
             if let Some(jo) = &g.jaw_opening {
                 jo.validate(lim).map_err(|e| format!("Invalid gripper policy: {e}"))?;
             }
@@ -1149,6 +1159,9 @@ impl ArmConfig {
                 }
                 let mut ids = std::collections::HashSet::new();
                 for (i, j) in ft.joints.iter().enumerate() {
+                    if j.id == 0 || j.id >= 0xFE {
+                        return Err(format!("Feetech servo ID {} must be in 1..=253", j.id));
+                    }
                     if !ids.insert(j.id) {
                         return Err(format!(
                             "Duplicate Feetech servo ID {} at joint index {}",

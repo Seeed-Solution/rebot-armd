@@ -14,8 +14,8 @@ use armd::protocol::feetech::{
     REG_P_COEF, REG_RETURN_DELAY, REG_STATUS_RETURN_LEVEL, REG_TORQUE_ENABLE,
     STEPS_PER_REVOLUTION,
 };
-use armd::safety::FaultCode;
-use armd::supervisor::ArmSupervisor;
+use armd::safety::{FaultCode, SafetyError, SafetyState};
+use armd::supervisor::{ArmError, ArmSupervisor};
 use armd::transport::{MockTransport, SerialTransportConfig, Transport, TransportError};
 
 #[derive(Clone, Default)]
@@ -2295,29 +2295,112 @@ async fn test_feetech_gripper_load_and_gap_stall_release_requires_reverse_comman
 // -------------------------------------------------------------------------
 #[tokio::test]
 async fn test_supervisor_clear_fault_does_not_overwrite_concurrent_estop() {
+    struct ConcurrentEstopDriver {
+        read_started: Arc<tokio::sync::Notify>,
+        read_proceed: Arc<AtomicBool>,
+        delay_enabled: Arc<AtomicBool>,
+    }
+
+    impl ArmDriver for ConcurrentEstopDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: false,
+                temperature_feedback: false,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn enable_state(&self) -> EnableState { EnableState::Disabled }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO)] }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            if self.delay_enabled.load(Ordering::SeqCst) {
+                self.read_started.notify_one();
+                while !self.read_proceed.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            Ok(vec![JointState {
+                position: 0.0,
+                velocity: 0.0,
+                torque: 0.0,
+                temperature: 25.0,
+            }])
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+    }
+
     let mut config = ArmConfig::default();
     config.dof = 1;
     config.limits = vec![JointLimit::new("j1", -PI, PI, 1.0, 1.0)];
     config.home_positions = vec![0.0];
+
+    let read_started = Arc::new(tokio::sync::Notify::new());
+    let read_proceed = Arc::new(AtomicBool::new(false));
+    let delay_enabled = Arc::new(AtomicBool::new(false));
+
+    let driver = ConcurrentEstopDriver {
+        read_started: read_started.clone(),
+        read_proceed: read_proceed.clone(),
+        delay_enabled: delay_enabled.clone(),
+    };
+
     let supervisor = Arc::new(ArmSupervisor::new(config));
+    supervisor.set_driver(Box::new(driver)).await;
 
+    // Initial E-stop
     supervisor.trigger_e_stop().await;
     assert!(supervisor.e_stop_latched.load(Ordering::SeqCst));
+    assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::EStop);
 
-    let sup = supervisor.clone();
+    // Now enable delay for clear_fault's read_joint_states call
+    delay_enabled.store(true, Ordering::SeqCst);
+    read_proceed.store(false, Ordering::SeqCst);
+
+    let sup1 = supervisor.clone();
+    let clear_handle = tokio::spawn(async move {
+        sup1.clear_fault().await
+    });
+
+    // Wait until clear_fault is inside read_joint_states holding inner in spawn_blocking
+    read_started.notified().await;
+
+    // Trigger concurrent e-stop while clear_fault holds inner lock in spawn_blocking
     let sup2 = supervisor.clone();
-
-    let h1 = tokio::spawn(async move {
-        let _ = sup.clear_fault().await;
-    });
-    let h2 = tokio::spawn(async move {
-        sup2.trigger_e_stop().await;
+    let estop_handle = tokio::spawn(async move {
+        sup2.trigger_e_stop().await
     });
 
-    let _ = tokio::join!(h1, h2);
-    // Directly verify that trigger_e_stop can never be wiped out
-    supervisor.trigger_e_stop().await;
+    // Wait until trigger_e_stop has incremented requested_estop_count (from 1 to 2) and set e_stop_latched
+    while supervisor.requested_estop_count.load(Ordering::SeqCst) < 2 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Now unblock read_joint_states so clear_fault can continue
+    read_proceed.store(true, Ordering::SeqCst);
+
+    let (clear_res, _) = tokio::join!(clear_handle, estop_handle);
+    let clear_res = clear_res.unwrap();
+
+    // 1) clear_res is Err(ArmError::Safety(SafetyError::EStopActive))
+    assert!(
+        matches!(clear_res, Err(ArmError::Safety(SafetyError::EStopActive))),
+        "Expected EStopActive, got {:?}",
+        clear_res
+    );
+    // 2) sup.e_stop_latched is true
     assert!(supervisor.e_stop_latched.load(Ordering::SeqCst));
+    // 3) observation safety_state == SafetyState::EStop
+    assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::EStop);
+
+    // 4) A subsequent non-concurrent sup.clear_fault().await (with healthy feedback) succeeds!
+    delay_enabled.store(false, Ordering::SeqCst);
+    let second_res = supervisor.clear_fault().await;
+    assert!(second_res.is_ok(), "Subsequent non-concurrent clear_fault must succeed, got {:?}", second_res);
+    assert!(!supervisor.e_stop_latched.load(Ordering::SeqCst));
 }
 
 // -------------------------------------------------------------------------
@@ -2350,4 +2433,135 @@ fn test_checked_rad_to_steps_in_range_tolerance_and_rejection() {
 
     let rad_far_max = (3600.0 - 2048.0) * (2.0 * PI / 4096.0);
     assert!(calib.checked_rad_to_steps_in_range(rad_far_max, range).is_err());
+}
+
+// -------------------------------------------------------------------------
+// 47. Noise-prefixed TX echo filter in direct register reads
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_direct_register_reads_filter_noise_prefixed_echo() {
+    let mock = MockTransport::new();
+    let id = 1u8;
+    let mut driver = FeetechArmDriver::new(mock, vec![id]);
+
+    // 1. read_register_u8_direct with [0x00] prefix before echo
+    let reg_u8 = REG_TORQUE_ENABLE;
+    let req_u8 = feetech::build_read(id, reg_u8, 1);
+    let val_u8 = 55u8;
+    let cs_u8 = calculate_checksum(id, 3, 0x00, &[val_u8]);
+    let reply_u8 = vec![0xFF, 0xFF, id, 3, 0x00, val_u8, cs_u8];
+
+    let mut stream_u8 = vec![0x00];
+    stream_u8.extend_from_slice(&req_u8);
+    stream_u8.extend_from_slice(&reply_u8);
+    driver.transport_mut().provide_rx(&stream_u8);
+
+    let res_u8 = driver.read_register_u8_direct(id, reg_u8).expect("read_register_u8_direct must succeed");
+    assert_eq!(res_u8, val_u8, "Must return real register value 55, not echo parameter");
+
+    // 2. read_register_u16_direct with [0x00] prefix before echo
+    let reg_u16 = REG_PRESENT_POSITION_L;
+    let req_u16 = feetech::build_read(id, reg_u16, 2);
+    let val_u16: u16 = 2500;
+    let val_bytes = val_u16.to_le_bytes();
+    let cs_u16 = calculate_checksum(id, 4, 0x00, &[val_bytes[0], val_bytes[1]]);
+    let reply_u16 = vec![0xFF, 0xFF, id, 4, 0x00, val_bytes[0], val_bytes[1], cs_u16];
+
+    let mut stream_u16 = vec![0x00];
+    stream_u16.extend_from_slice(&req_u16);
+    stream_u16.extend_from_slice(&reply_u16);
+    driver.transport_mut().provide_rx(&stream_u16);
+
+    let res_u16 = driver.read_register_u16_direct(id, reg_u16).expect("read_register_u16_direct must succeed");
+    assert_eq!(res_u16, val_u16, "Must return real register value 2500, not [reg, len] echo");
+}
+
+// -------------------------------------------------------------------------
+// 48. Invalidate cached feedback on calibration change in with_config
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_feedback_invalidated_on_calibration_change() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1]);
+
+    let pos = 2048u16.to_le_bytes();
+    let params = [pos[0], pos[1], 0, 0, 0, 0, 0, 30];
+    let cs = calculate_checksum(1, 10, 0x00, &params);
+    let mut fb = vec![0xFF, 0xFF, 1, 10, 0x00];
+    fb.extend_from_slice(&params);
+    fb.push(cs);
+
+    // Initial feedback makes is_feedback_valid() true
+    driver.transport_mut().provide_rx(&fb);
+    driver.read_joint_states().unwrap();
+    assert!(driver.is_feedback_valid());
+
+    // zero_step change invalidates feedback
+    let mut cfg1 = driver.config().clone();
+    cfg1.joints[0].zero_step = 2100;
+    driver = driver.with_config(cfg1);
+    assert!(!driver.is_feedback_valid(), "Feedback must be invalidated when zero_step changes");
+
+    // Provide fresh feedback
+    driver.transport_mut().provide_rx(&fb);
+    driver.read_joint_states().unwrap();
+    assert!(driver.is_feedback_valid());
+
+    // homing_offset_steps change invalidates feedback
+    let mut cfg2 = driver.config().clone();
+    cfg2.joints[0].homing_offset_steps = 50;
+    driver = driver.with_config(cfg2);
+    assert!(!driver.is_feedback_valid(), "Feedback must be invalidated when homing_offset_steps changes");
+}
+
+// -------------------------------------------------------------------------
+// 49. REG_TORQUE_ENABLE polling unstarves and detects torque loss after >= 200ms
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_enable_poll_unstarves_when_position_chunk_timeouts() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1]).with_calibrated(true);
+
+    // Provide feedback and enable torque
+    let pos = 2048u16.to_le_bytes();
+    let params = [pos[0], pos[1], 0, 0, 0, 0, 70, 35];
+    let cs = calculate_checksum(1, 10, 0x00, &params);
+    let mut fb = vec![0xFF, 0xFF, 1, 10, 0x00];
+    fb.extend_from_slice(&params);
+    fb.push(cs);
+
+    // Initial feedback so driver has verified feedback
+    driver.transport_mut().provide_rx(&fb);
+    driver.read_joint_states().unwrap();
+    assert!(driver.is_feedback_valid());
+
+    let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
+    let rx_tq1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1];
+
+    let mut init_rx = Vec::new();
+    init_rx.extend_from_slice(&fb);
+    init_rx.extend_from_slice(&rx_tq1);
+    driver.transport_mut().provide_rx(&init_rx);
+
+    driver.set_torque(true).unwrap();
+    assert_eq!(driver.enable_state(), EnableState::Enabled);
+    let _ = driver.transport_mut().take_tx();
+
+    // Fast-forward last_enable_poll by setting it in the past (> 200ms)
+    driver.last_enable_poll = Some(Instant::now() - Duration::from_millis(250));
+
+    // Provide only the REG_TORQUE_ENABLE response with value 0 (disabled!),
+    // NO position chunk feedback is provided, so position chunk read will hit timeout.
+    let cs_tq0 = calculate_checksum(1, 3, 0x00, &[0]);
+    let rx_tq0 = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_tq0];
+    driver.transport_mut().provide_rx(&rx_tq0);
+
+    // read_joint_states() should poll REG_TORQUE_ENABLE first (before position chunks),
+    // detect disabled torque, and update enable_state to Disabled!
+    let _ = driver.read_joint_states();
+    assert_eq!(
+        driver.enable_state(),
+        EnableState::Disabled,
+        "Torque disable must be detected even when position chunk hits timeout"
+    );
 }
