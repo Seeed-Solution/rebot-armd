@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <string>
 
@@ -488,6 +489,24 @@ std::vector<ObbBox> decode_obb_layout_b(const ObbTensorView* tensors, size_t num
     const int num_classes = info.num_classes;
     const float score_thresh_non_sig = inverse_sigmoid(score_threshold);
 
+    size_t max_grid_l = 0;
+    for (int s = 0; s < 3; ++s) {
+        if (info.grid_h[s] > 0 && info.grid_w[s] > 0) {
+            const size_t l = static_cast<size_t>(info.grid_h[s]) * static_cast<size_t>(info.grid_w[s]);
+            if (l > max_grid_l) max_grid_l = l;
+        }
+    }
+
+    std::vector<int8_t> cell_max_s8;
+    std::vector<float> cell_max_f32;
+    if (is_nchw && max_grid_l > 0 && num_classes > 1) {
+        if (info.dtype == ObbDataType::INT8) {
+            cell_max_s8.resize(max_grid_l);
+        } else if (info.dtype == ObbDataType::FP32) {
+            cell_max_f32.resize(max_grid_l);
+        }
+    }
+
     for (int s = 0; s < 3; ++s) {
         const auto& t_box = tensors[info.box_indices[s]];
         const auto& t_cls = tensors[info.cls_indices[s]];
@@ -496,101 +515,235 @@ std::vector<ObbBox> decode_obb_layout_b(const ObbTensorView* tensors, size_t num
         const int grid_w = info.grid_w[s];
         if (grid_h <= 0 || grid_w <= 0) continue;
 
+        const size_t grid_l = static_cast<size_t>(grid_h) * static_cast<size_t>(grid_w);
         const float stride = img_w / static_cast<float>(grid_w);
 
-        auto read_float_elem = [&](const ObbTensorView& tv, int c, int gy, int gx, int total_c) -> float {
-            size_t idx = 0;
-            if (is_nchw) {
-                idx = static_cast<size_t>(c) * (grid_h * grid_w) + gy * grid_w + gx;
-            } else {
-                idx = (static_cast<size_t>(gy) * grid_w + gx) * total_c + c;
+        auto emit_cell = [&](int gy, int gx, size_t cell_idx, int best_cls, float score) {
+            auto read_box = [&](int ch) -> float {
+                const size_t idx = is_nchw
+                    ? (static_cast<size_t>(ch) * grid_l + cell_idx)
+                    : (cell_idx * 64 + static_cast<size_t>(ch));
+                if (t_box.is_int8) {
+                    const auto* p = static_cast<const int8_t*>(t_box.data);
+                    return dequantize(p[idx], t_box.scale, t_box.zero_point);
+                } else {
+                    const auto* p = static_cast<const float*>(t_box.data);
+                    return p[idx];
+                }
+            };
+
+            auto read_ang = [&]() -> float {
+                // ang_c == 1, so offset is cell_idx for both NCHW and NHWC
+                if (t_ang.is_int8) {
+                    const auto* p = static_cast<const int8_t*>(t_ang.data);
+                    return dequantize(p[cell_idx], t_ang.scale, t_ang.zero_point);
+                } else {
+                    const auto* p = static_cast<const float*>(t_ang.data);
+                    return p[cell_idx];
+                }
+            };
+
+            // Box DFL softmax across 4 coordinates (16 bins each)
+            float dist[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int b = 0; b < 4; ++b) {
+                float bin_vals[16];
+                float max_bin = -1e9f;
+                for (int k = 0; k < 16; ++k) {
+                    const int ch = b * 16 + k;
+                    const float val = read_box(ch);
+                    bin_vals[k] = val;
+                    if (val > max_bin) max_bin = val;
+                }
+
+                float exp_sum = 0.0f;
+                float exp_v[16];
+                for (int k = 0; k < 16; ++k) {
+                    exp_v[k] = std::exp(bin_vals[k] - max_bin);
+                    exp_sum += exp_v[k];
+                }
+
+                float acc = 0.0f;
+                if (exp_sum > 1e-9f) {
+                    for (int k = 0; k < 16; ++k) {
+                        acc += (exp_v[k] / exp_sum) * static_cast<float>(k);
+                    }
+                }
+                dist[b] = acc * stride;
             }
-            if (tv.is_int8) {
-                const auto* p = static_cast<const int8_t*>(tv.data);
-                return dequantize(p[idx], tv.scale, tv.zero_point);
-            } else {
-                const auto* p = static_cast<const float*>(tv.data);
-                return p[idx];
+
+            // Angle decoding: a = (sigmoid(raw_ang) - 0.25f) * pi
+            const float raw_ang = read_ang();
+            const float a = (sigmoid(raw_ang) - 0.25f) * kPi;
+
+            // dist2rbox
+            const float lt_x = dist[0];
+            const float lt_y = dist[1];
+            const float rb_x = dist[2];
+            const float rb_y = dist[3];
+
+            const float xf = (rb_x - lt_x) * 0.5f;
+            const float yf = (rb_y - lt_y) * 0.5f;
+            const float cos_a = std::cos(a);
+            const float sin_a = std::sin(a);
+            const float dx = xf * cos_a - yf * sin_a;
+            const float dy = xf * sin_a + yf * cos_a;
+
+            ObbBox obb;
+            obb.cx = (static_cast<float>(gx) + 0.5f) * stride + dx;
+            obb.cy = (static_cast<float>(gy) + 0.5f) * stride + dy;
+            obb.w = lt_x + rb_x;
+            obb.h = lt_y + rb_y;
+            obb.angle_rad = a;
+            obb.score = score;
+            obb.class_id = best_cls;
+
+            if (!(obb.w > 0.0f && obb.h > 0.0f) ||
+                !std::isfinite(obb.cx) || !std::isfinite(obb.cy) || !std::isfinite(obb.angle_rad) ||
+                !std::isfinite(obb.w) || !std::isfinite(obb.h) || !std::isfinite(obb.score)) {
+                return;
             }
+            boxes.push_back(obb);
         };
 
-        for (int gy = 0; gy < grid_h; ++gy) {
-            for (int gx = 0; gx < grid_w; ++gx) {
-                // Class score
-                float max_cls_dequant = -1e9f;
-                int best_cls = -1;
-                for (int c = 0; c < num_classes; ++c) {
-                    const float val = read_float_elem(t_cls, c, gy, gx, num_classes);
-                    if (val > max_cls_dequant) {
-                        max_cls_dequant = val;
-                        best_cls = c;
-                    }
+        const bool is_valid_int8 = t_cls.is_int8 && t_cls.scale > 1e-30f && std::isfinite(t_cls.scale) &&
+                                   std::abs(static_cast<double>(t_cls.zero_point)) < 1e7;
+
+        if (is_nchw && is_valid_int8) {
+            // Path A: Fast Path NCHW INT8
+            int q_min = 128;
+            for (int q = -128; q <= 127; ++q) {
+                const float dq = dequantize(static_cast<int8_t>(q), t_cls.scale, t_cls.zero_point);
+                if (dq > -1e9f && dq >= score_thresh_non_sig && sigmoid(dq) >= score_threshold) {
+                    q_min = q;
+                    break;
                 }
+            }
 
-                if (max_cls_dequant < score_thresh_non_sig) continue;
-                const float score = sigmoid(max_cls_dequant);
-                if (score < score_threshold) continue;
+            if (q_min > 127) {
+                continue;
+            }
 
-                // Box DFL softmax across 4 coordinates (16 bins each)
-                float dist[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                for (int b = 0; b < 4; ++b) {
-                    float bin_vals[16];
-                    float max_bin = -1e9f;
-                    for (int k = 0; k < 16; ++k) {
-                        const int ch = b * 16 + k;
-                        const float val = read_float_elem(t_box, ch, gy, gx, 64);
-                        bin_vals[k] = val;
-                        if (val > max_bin) max_bin = val;
-                    }
-
-                    float exp_sum = 0.0f;
-                    float exp_v[16];
-                    for (int k = 0; k < 16; ++k) {
-                        exp_v[k] = std::exp(bin_vals[k] - max_bin);
-                        exp_sum += exp_v[k];
-                    }
-
-                    float acc = 0.0f;
-                    if (exp_sum > 1e-9f) {
-                        for (int k = 0; k < 16; ++k) {
-                            acc += (exp_v[k] / exp_sum) * static_cast<float>(k);
+            const auto* cls_ptr = static_cast<const int8_t*>(t_cls.data);
+            if (num_classes == 1) {
+                for (size_t n = 0; n < grid_l; ++n) {
+                    const int8_t val_q = cls_ptr[n];
+                    if (static_cast<int>(val_q) < q_min) continue;
+                    const float score = sigmoid(dequantize(val_q, t_cls.scale, t_cls.zero_point));
+                    if (score < score_threshold) continue;
+                    const int gy = static_cast<int>(n / static_cast<size_t>(grid_w));
+                    const int gx = static_cast<int>(n % static_cast<size_t>(grid_w));
+                    emit_cell(gy, gx, n, 0, score);
+                }
+            } else {
+                int8_t* dst = cell_max_s8.data();
+                std::memcpy(dst, cls_ptr, grid_l);
+                for (int c = 1; c < num_classes; ++c) {
+                    const int8_t* plane = cls_ptr + static_cast<size_t>(c) * grid_l;
+                    for (size_t n = 0; n < grid_l; ++n) {
+                        const int8_t v = plane[n];
+                        if (v > dst[n]) {
+                            dst[n] = v;
                         }
                     }
-                    dist[b] = acc * stride;
                 }
 
-                // Angle decoding: a = (sigmoid(raw_ang) - 0.25f) * pi
-                const float raw_ang = read_float_elem(t_ang, 0, gy, gx, 1);
-                const float a = (sigmoid(raw_ang) - 0.25f) * kPi;
-
-                // dist2rbox
-                const float lt_x = dist[0];
-                const float lt_y = dist[1];
-                const float rb_x = dist[2];
-                const float rb_y = dist[3];
-
-                const float xf = (rb_x - lt_x) * 0.5f;
-                const float yf = (rb_y - lt_y) * 0.5f;
-                const float cos_a = std::cos(a);
-                const float sin_a = std::sin(a);
-                const float dx = xf * cos_a - yf * sin_a;
-                const float dy = xf * sin_a + yf * cos_a;
-
-                ObbBox obb;
-                obb.cx = (static_cast<float>(gx) + 0.5f) * stride + dx;
-                obb.cy = (static_cast<float>(gy) + 0.5f) * stride + dy;
-                obb.w = lt_x + rb_x;
-                obb.h = lt_y + rb_y;
-                obb.angle_rad = a;
-                obb.score = score;
-                obb.class_id = best_cls;
-
-                if (!(obb.w > 0.0f && obb.h > 0.0f) ||
-                    !std::isfinite(obb.cx) || !std::isfinite(obb.cy) || !std::isfinite(obb.angle_rad) ||
-                    !std::isfinite(obb.w) || !std::isfinite(obb.h) || !std::isfinite(obb.score)) {
-                    continue;
+                for (size_t n = 0; n < grid_l; ++n) {
+                    const int8_t max_q = dst[n];
+                    if (static_cast<int>(max_q) < q_min) continue;
+                    int best_cls = 0;
+                    for (int c = 0; c < num_classes; ++c) {
+                        if (cls_ptr[static_cast<size_t>(c) * grid_l + n] == max_q) {
+                            best_cls = c;
+                            break;
+                        }
+                    }
+                    const float score = sigmoid(dequantize(max_q, t_cls.scale, t_cls.zero_point));
+                    if (score < score_threshold) continue;
+                    const int gy = static_cast<int>(n / static_cast<size_t>(grid_w));
+                    const int gx = static_cast<int>(n % static_cast<size_t>(grid_w));
+                    emit_cell(gy, gx, n, best_cls, score);
                 }
-                boxes.push_back(obb);
+            }
+        } else if (is_nchw && !t_cls.is_int8) {
+            // Path B: Fast Path NCHW FP32
+            const auto* cls_ptr = static_cast<const float*>(t_cls.data);
+            if (num_classes == 1) {
+                for (size_t n = 0; n < grid_l; ++n) {
+                    const float max_cls = cls_ptr[n];
+                    if (max_cls < score_thresh_non_sig) continue;
+                    const float score = sigmoid(max_cls);
+                    if (score < score_threshold) continue;
+                    const int gy = static_cast<int>(n / static_cast<size_t>(grid_w));
+                    const int gx = static_cast<int>(n % static_cast<size_t>(grid_w));
+                    emit_cell(gy, gx, n, 0, score);
+                }
+            } else {
+                float* dst = cell_max_f32.data();
+                std::fill_n(dst, grid_l, -1e9f);
+                for (int c = 0; c < num_classes; ++c) {
+                    const float* plane = cls_ptr + static_cast<size_t>(c) * grid_l;
+                    for (size_t n = 0; n < grid_l; ++n) {
+                        const float v = plane[n];
+                        if (v > dst[n]) {
+                            dst[n] = v;
+                        }
+                    }
+                }
+
+                for (size_t n = 0; n < grid_l; ++n) {
+                    const float max_cls = dst[n];
+                    if (max_cls < score_thresh_non_sig) continue;
+                    const float score = sigmoid(max_cls);
+                    if (score < score_threshold) continue;
+                    int best_cls = 0;
+                    for (int c = 0; c < num_classes; ++c) {
+                        if (cls_ptr[static_cast<size_t>(c) * grid_l + n] == max_cls) {
+                            best_cls = c;
+                            break;
+                        }
+                    }
+                    const int gy = static_cast<int>(n / static_cast<size_t>(grid_w));
+                    const int gx = static_cast<int>(n % static_cast<size_t>(grid_w));
+                    emit_cell(gy, gx, n, best_cls, score);
+                }
+            }
+        } else {
+            // Fallback Path: Generic NHWC or edge cases
+            auto read_cls_elem = [&](int c, int gy, int gx) -> float {
+                size_t idx = 0;
+                if (is_nchw) {
+                    idx = static_cast<size_t>(c) * grid_l + static_cast<size_t>(gy) * static_cast<size_t>(grid_w) + static_cast<size_t>(gx);
+                } else {
+                    idx = (static_cast<size_t>(gy) * static_cast<size_t>(grid_w) + static_cast<size_t>(gx)) * static_cast<size_t>(num_classes) + static_cast<size_t>(c);
+                }
+                if (t_cls.is_int8) {
+                    const auto* p = static_cast<const int8_t*>(t_cls.data);
+                    return dequantize(p[idx], t_cls.scale, t_cls.zero_point);
+                } else {
+                    const auto* p = static_cast<const float*>(t_cls.data);
+                    return p[idx];
+                }
+            };
+
+            for (int gy = 0; gy < grid_h; ++gy) {
+                for (int gx = 0; gx < grid_w; ++gx) {
+                    const size_t cell_idx = static_cast<size_t>(gy) * static_cast<size_t>(grid_w) + static_cast<size_t>(gx);
+                    float max_cls_dequant = -1e9f;
+                    int best_cls = -1;
+                    for (int c = 0; c < num_classes; ++c) {
+                        const float val = read_cls_elem(c, gy, gx);
+                        if (val > max_cls_dequant) {
+                            max_cls_dequant = val;
+                            best_cls = c;
+                        }
+                    }
+
+                    if (max_cls_dequant < score_thresh_non_sig) continue;
+                    const float score = sigmoid(max_cls_dequant);
+                    if (score < score_threshold) continue;
+
+                    emit_cell(gy, gx, cell_idx, best_cls, score);
+                }
             }
         }
     }

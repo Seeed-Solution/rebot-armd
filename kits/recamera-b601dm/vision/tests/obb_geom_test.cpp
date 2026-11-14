@@ -603,6 +603,330 @@ static void test_decode_layout_b_null_data() {
     CHECK(res.empty());
 }
 
+static void test_decode_layout_b_nchw_multiclass_and_ties() {
+    // 1. Multi-class (nc = 15, grids [80x80, 40x40, 20x20], NCHW INT8)
+    // with detections at multiple scales (c = 0, c = 7, c = 14) and tie-breaking (c = 3, c = 9)
+    const float scale = 0.05f;
+    const int32_t zp = 10;
+    auto q = [scale, zp](float v) -> int8_t {
+        double val = std::round(static_cast<double>(v) / scale) + zp;
+        if (val < -128.0) val = -128.0;
+        if (val > 127.0) val = 127.0;
+        return static_cast<int8_t>(val);
+    };
+
+    const int nc = 15;
+    // Scale 0: 80x80
+    std::vector<int8_t> box0(64 * 80 * 80, q(-10.0f));
+    std::vector<int8_t> cls0(nc * 80 * 80, q(-10.0f));
+    std::vector<int8_t> ang0(1 * 80 * 80, q(0.0f));
+
+    // Scale 1: 40x40
+    std::vector<int8_t> box1(64 * 40 * 40, q(-10.0f));
+    std::vector<int8_t> cls1(nc * 40 * 40, q(-10.0f));
+    std::vector<int8_t> ang1(1 * 40 * 40, q(0.0f));
+
+    // Scale 2: 20x20
+    std::vector<int8_t> box2(64 * 20 * 20, q(-10.0f));
+    std::vector<int8_t> cls2(nc * 20 * 20, q(-10.0f));
+    std::vector<int8_t> ang2(1 * 20 * 20, q(0.0f));
+
+    // Detection 1 on Scale 0 (80x80): gy=10, gx=20, class 0
+    const int cell_0 = 10 * 80 + 20;
+    cls0[0 * (80 * 80) + cell_0] = q(4.0f); // score ~ 0.982
+    for (int b = 0; b < 4; ++b) {
+        box0[(b * 16 + 4) * (80 * 80) + cell_0] = q(10.0f); // bin 4
+    }
+    ang0[cell_0] = q(0.0f); // 0.25 * pi
+
+    // Detection 2 (tie-breaking) on Scale 0 (80x80): gy=30, gx=40, tied classes 3 and 9
+    const int cell_tie = 30 * 80 + 40;
+    cls0[3 * (80 * 80) + cell_tie] = q(4.2f);
+    cls0[9 * (80 * 80) + cell_tie] = q(4.2f);
+    for (int b = 0; b < 4; ++b) {
+        box0[(b * 16 + 1) * (80 * 80) + cell_tie] = q(10.0f); // bin 1
+    }
+    ang0[cell_tie] = q(0.0f); // 0.25 * pi
+
+    // Detection 3 on Scale 1 (40x40): gy=15, gx=25, class 7
+    const int cell_1 = 15 * 40 + 25;
+    cls1[7 * (40 * 40) + cell_1] = q(3.5f); // score ~ 0.97
+    for (int b = 0; b < 4; ++b) {
+        box1[(b * 16 + 2) * (40 * 40) + cell_1] = q(10.0f); // bin 2
+    }
+    ang1[cell_1] = q(0.0f); // 0.25 * pi
+
+    // Detection 4 on Scale 2 (20x20): gy=5, gx=8, class 14
+    const int cell_2 = 5 * 20 + 8;
+    cls2[14 * (20 * 20) + cell_2] = q(4.5f); // score ~ 0.989
+    for (int b = 0; b < 4; ++b) {
+        box2[(b * 16 + 3) * (20 * 20) + cell_2] = q(10.0f); // bin 3
+    }
+    ang2[cell_2] = q(0.0f); // 0.25 * pi
+
+    std::array<ObbTensorView, 9> views{};
+    auto set_view = [&](size_t idx, const int8_t* ptr, std::array<int32_t, 4> dims, float sc, int32_t z) {
+        views[idx].data = ptr;
+        views[idx].is_int8 = true;
+        views[idx].scale = sc;
+        views[idx].zero_point = z;
+        views[idx].dims = dims;
+        views[idx].num_dims = 4;
+    };
+
+    set_view(0, box0.data(), {1, 64, 80, 80}, scale, zp);
+    set_view(1, cls0.data(), {1, nc, 80, 80}, scale, zp);
+    set_view(2, ang0.data(), {1, 1, 80, 80}, scale, zp);
+
+    set_view(3, box1.data(), {1, 64, 40, 40}, scale, zp);
+    set_view(4, cls1.data(), {1, nc, 40, 40}, scale, zp);
+    set_view(5, ang1.data(), {1, 1, 40, 40}, scale, zp);
+
+    set_view(6, box2.data(), {1, 64, 20, 20}, scale, zp);
+    set_view(7, cls2.data(), {1, nc, 20, 20}, scale, zp);
+    set_view(8, ang2.data(), {1, 1, 20, 20}, scale, zp);
+
+    auto res = decode_obb_layout_b(views.data(), 9, 640.0f, 640.0f, 0.5f);
+    CHECK(res.size() == 4);
+
+    // Box 0: Scale 0, cell_0, class 0
+    CHECK(res[0].class_id == 0);
+    CHECK(res[0].score > 0.90f);
+    CHECK(std::abs(res[0].w - 64.0f) < 0.2f);
+    CHECK(std::abs(res[0].h - 64.0f) < 0.2f);
+    CHECK(std::abs(res[0].cx - 164.0f) < 0.2f);
+    CHECK(std::abs(res[0].cy - 84.0f) < 0.2f);
+    CHECK(std::abs(res[0].angle_rad - 0.25f * 3.14159265f) < 0.05f);
+
+    // Box 1: Scale 0, cell_tie, class 3 (tie-breaking between 3 and 9 selects 3)
+    CHECK(res[1].class_id == 3);
+    CHECK(res[1].score > 0.90f);
+    CHECK(std::abs(res[1].w - 16.0f) < 0.2f);
+    CHECK(std::abs(res[1].h - 16.0f) < 0.2f);
+    CHECK(std::abs(res[1].cx - 324.0f) < 0.2f);
+    CHECK(std::abs(res[1].cy - 244.0f) < 0.2f);
+    CHECK(std::abs(res[1].angle_rad - 0.25f * 3.14159265f) < 0.05f);
+
+    // Box 2: Scale 1, cell_1, class 7
+    CHECK(res[2].class_id == 7);
+    CHECK(res[2].score > 0.90f);
+    CHECK(std::abs(res[2].w - 64.0f) < 0.2f);
+    CHECK(std::abs(res[2].h - 64.0f) < 0.2f);
+    CHECK(std::abs(res[2].cx - 408.0f) < 0.2f);
+    CHECK(std::abs(res[2].cy - 248.0f) < 0.2f);
+    CHECK(std::abs(res[2].angle_rad - 0.25f * 3.14159265f) < 0.05f);
+
+    // Box 3: Scale 2, cell_2, class 14
+    CHECK(res[3].class_id == 14);
+    CHECK(res[3].score > 0.90f);
+    CHECK(std::abs(res[3].w - 192.0f) < 0.2f);
+    CHECK(std::abs(res[3].h - 192.0f) < 0.2f);
+    CHECK(std::abs(res[3].cx - 272.0f) < 0.2f);
+    CHECK(std::abs(res[3].cy - 176.0f) < 0.2f);
+    CHECK(std::abs(res[3].angle_rad - 0.25f * 3.14159265f) < 0.05f);
+
+    // 2. Unreachable INT8 threshold (q_min > 127) -> returns 0 boxes
+    // e.g. scale = 0.01f, zp = 0, threshold = 0.90f (max dq at q=127 is 1.27, sigmoid(1.27) ~ 0.78 < 0.90)
+    std::array<ObbTensorView, 9> views_unreach = views;
+    for (size_t i = 0; i < 9; ++i) {
+        views_unreach[i].scale = 0.01f;
+        views_unreach[i].zero_point = 0;
+    }
+    auto res_unreach = decode_obb_layout_b(views_unreach.data(), 9, 640.0f, 640.0f, 0.90f);
+    CHECK(res_unreach.empty());
+
+    // 3. Exact 3-path equivalence (NCHW INT8 vs NCHW FP32 vs NHWC INT8)
+    // with non-zero zero_points (zp = -12 and zp = 5) and non-round threshold (0.37f)
+    auto test_equivalence_for_zp = [](int32_t test_zp, float test_scale, float thresh) {
+        auto q_fn = [test_scale, test_zp](float v) -> int8_t {
+            double val = std::round(static_cast<double>(v) / test_scale) + test_zp;
+            if (val < -128.0) val = -128.0;
+            if (val > 127.0) val = 127.0;
+            return static_cast<int8_t>(val);
+        };
+        auto dq_fn = [test_scale, test_zp](int8_t v) -> float {
+            return static_cast<float>(static_cast<int32_t>(v) - test_zp) * test_scale;
+        };
+
+        const int test_nc = 15;
+        const int grids[3] = {80, 40, 20};
+
+        std::vector<int8_t> nchw_box_int8[3];
+        std::vector<int8_t> nchw_cls_int8[3];
+        std::vector<int8_t> nchw_ang_int8[3];
+
+        std::vector<float> nchw_box_fp32[3];
+        std::vector<float> nchw_cls_fp32[3];
+        std::vector<float> nchw_ang_fp32[3];
+
+        std::vector<int8_t> nhwc_box_int8[3];
+        std::vector<int8_t> nhwc_cls_int8[3];
+        std::vector<int8_t> nhwc_ang_int8[3];
+
+        for (int s = 0; s < 3; ++s) {
+            const int g = grids[s];
+            const size_t gl = static_cast<size_t>(g) * g;
+            nchw_box_int8[s].assign(64 * gl, q_fn(-5.0f));
+            nchw_cls_int8[s].assign(test_nc * gl, q_fn(-5.0f));
+            nchw_ang_int8[s].assign(1 * gl, q_fn(0.0f));
+
+            // Add several diverse detections on each scale
+            // Cell A: above thresh
+            int ca = (s * 3 + 2) * g + (s * 4 + 3);
+            nchw_cls_int8[s][(s * 3) * gl + ca] = q_fn(1.2f); // sigmoid(1.2) ~ 0.77 > 0.37
+            for (int b = 0; b < 4; ++b) {
+                nchw_box_int8[s][(b * 16 + (b + s + 1)) * gl + ca] = q_fn(8.0f);
+            }
+            nchw_ang_int8[s][ca] = q_fn(0.4f * static_cast<float>(s));
+
+            // Cell B: tie breaking
+            int cb = (s * 5 + 7) * g + (s * 6 + 9);
+            nchw_cls_int8[s][2 * gl + cb] = q_fn(0.8f); // sigmoid(0.8) ~ 0.69 > 0.37
+            nchw_cls_int8[s][8 * gl + cb] = q_fn(0.8f);
+            for (int b = 0; b < 4; ++b) {
+                nchw_box_int8[s][(b * 16 + 3) * gl + cb] = q_fn(6.0f);
+            }
+            nchw_ang_int8[s][cb] = q_fn(-0.3f);
+
+            // Cell C: near threshold
+            int cc = (s * 2 + 1) * g + (s * 5 + 4);
+            nchw_cls_int8[s][11 * gl + cc] = q_fn(-0.45f); // sigmoid(-0.45) ~ 0.389 > 0.37
+            for (int b = 0; b < 4; ++b) {
+                nchw_box_int8[s][(b * 16 + 2) * gl + cc] = q_fn(7.0f);
+            }
+            nchw_ang_int8[s][cc] = q_fn(0.1f);
+
+            // Materialize NCHW FP32 via exact dequantize
+            nchw_box_fp32[s].resize(nchw_box_int8[s].size());
+            for (size_t i = 0; i < nchw_box_int8[s].size(); ++i) {
+                nchw_box_fp32[s][i] = dq_fn(nchw_box_int8[s][i]);
+            }
+            nchw_cls_fp32[s].resize(nchw_cls_int8[s].size());
+            for (size_t i = 0; i < nchw_cls_int8[s].size(); ++i) {
+                nchw_cls_fp32[s][i] = dq_fn(nchw_cls_int8[s][i]);
+            }
+            nchw_ang_fp32[s].resize(nchw_ang_int8[s].size());
+            for (size_t i = 0; i < nchw_ang_int8[s].size(); ++i) {
+                nchw_ang_fp32[s][i] = dq_fn(nchw_ang_int8[s][i]);
+            }
+
+            // Materialize NHWC INT8 via exact transpose
+            nhwc_box_int8[s].resize(64 * gl);
+            for (int c = 0; c < 64; ++c) {
+                for (size_t n = 0; n < gl; ++n) {
+                    nhwc_box_int8[s][n * 64 + c] = nchw_box_int8[s][static_cast<size_t>(c) * gl + n];
+                }
+            }
+            nhwc_cls_int8[s].resize(test_nc * gl);
+            for (int c = 0; c < test_nc; ++c) {
+                for (size_t n = 0; n < gl; ++n) {
+                    nhwc_cls_int8[s][n * test_nc + c] = nchw_cls_int8[s][static_cast<size_t>(c) * gl + n];
+                }
+            }
+            nhwc_ang_int8[s] = nchw_ang_int8[s]; // ang_c == 1, identical layout
+        }
+
+        std::array<ObbTensorView, 9> v_nchw_int8{};
+        std::array<ObbTensorView, 9> v_nchw_fp32{};
+        std::array<ObbTensorView, 9> v_nhwc_int8{};
+
+        for (int s = 0; s < 3; ++s) {
+            const int g = grids[s];
+            // NCHW INT8
+            v_nchw_int8[s * 3 + 0].data = nchw_box_int8[s].data();
+            v_nchw_int8[s * 3 + 0].is_int8 = true;
+            v_nchw_int8[s * 3 + 0].scale = test_scale;
+            v_nchw_int8[s * 3 + 0].zero_point = test_zp;
+            v_nchw_int8[s * 3 + 0].dims = {1, 64, g, g};
+            v_nchw_int8[s * 3 + 0].num_dims = 4;
+
+            v_nchw_int8[s * 3 + 1].data = nchw_cls_int8[s].data();
+            v_nchw_int8[s * 3 + 1].is_int8 = true;
+            v_nchw_int8[s * 3 + 1].scale = test_scale;
+            v_nchw_int8[s * 3 + 1].zero_point = test_zp;
+            v_nchw_int8[s * 3 + 1].dims = {1, test_nc, g, g};
+            v_nchw_int8[s * 3 + 1].num_dims = 4;
+
+            v_nchw_int8[s * 3 + 2].data = nchw_ang_int8[s].data();
+            v_nchw_int8[s * 3 + 2].is_int8 = true;
+            v_nchw_int8[s * 3 + 2].scale = test_scale;
+            v_nchw_int8[s * 3 + 2].zero_point = test_zp;
+            v_nchw_int8[s * 3 + 2].dims = {1, 1, g, g};
+            v_nchw_int8[s * 3 + 2].num_dims = 4;
+
+            // NCHW FP32
+            v_nchw_fp32[s * 3 + 0].data = nchw_box_fp32[s].data();
+            v_nchw_fp32[s * 3 + 0].is_int8 = false;
+            v_nchw_fp32[s * 3 + 0].dims = {1, 64, g, g};
+            v_nchw_fp32[s * 3 + 0].num_dims = 4;
+
+            v_nchw_fp32[s * 3 + 1].data = nchw_cls_fp32[s].data();
+            v_nchw_fp32[s * 3 + 1].is_int8 = false;
+            v_nchw_fp32[s * 3 + 1].dims = {1, test_nc, g, g};
+            v_nchw_fp32[s * 3 + 1].num_dims = 4;
+
+            v_nchw_fp32[s * 3 + 2].data = nchw_ang_fp32[s].data();
+            v_nchw_fp32[s * 3 + 2].is_int8 = false;
+            v_nchw_fp32[s * 3 + 2].dims = {1, 1, g, g};
+            v_nchw_fp32[s * 3 + 2].num_dims = 4;
+
+            // NHWC INT8
+            v_nhwc_int8[s * 3 + 0].data = nhwc_box_int8[s].data();
+            v_nhwc_int8[s * 3 + 0].is_int8 = true;
+            v_nhwc_int8[s * 3 + 0].scale = test_scale;
+            v_nhwc_int8[s * 3 + 0].zero_point = test_zp;
+            v_nhwc_int8[s * 3 + 0].dims = {1, g, g, 64};
+            v_nhwc_int8[s * 3 + 0].num_dims = 4;
+
+            v_nhwc_int8[s * 3 + 1].data = nhwc_cls_int8[s].data();
+            v_nhwc_int8[s * 3 + 1].is_int8 = true;
+            v_nhwc_int8[s * 3 + 1].scale = test_scale;
+            v_nhwc_int8[s * 3 + 1].zero_point = test_zp;
+            v_nhwc_int8[s * 3 + 1].dims = {1, g, g, test_nc};
+            v_nhwc_int8[s * 3 + 1].num_dims = 4;
+
+            v_nhwc_int8[s * 3 + 2].data = nhwc_ang_int8[s].data();
+            v_nhwc_int8[s * 3 + 2].is_int8 = true;
+            v_nhwc_int8[s * 3 + 2].scale = test_scale;
+            v_nhwc_int8[s * 3 + 2].zero_point = test_zp;
+            v_nhwc_int8[s * 3 + 2].dims = {1, g, g, 1};
+            v_nhwc_int8[s * 3 + 2].num_dims = 4;
+        }
+
+        auto res_int8 = decode_obb_layout_b(v_nchw_int8.data(), 9, 640.0f, 640.0f, thresh);
+        auto res_fp32 = decode_obb_layout_b(v_nchw_fp32.data(), 9, 640.0f, 640.0f, thresh);
+        auto res_nhwc = decode_obb_layout_b(v_nhwc_int8.data(), 9, 640.0f, 640.0f, thresh);
+
+        CHECK(!res_int8.empty());
+        CHECK(res_int8.size() == res_fp32.size());
+        CHECK(res_int8.size() == res_nhwc.size());
+
+        for (size_t i = 0; i < res_int8.size(); ++i) {
+            CHECK(res_int8[i].class_id == res_fp32[i].class_id);
+            CHECK(res_int8[i].class_id == res_nhwc[i].class_id);
+
+            CHECK(std::fabs(res_int8[i].cx - res_fp32[i].cx) < 1e-6f);
+            CHECK(std::fabs(res_int8[i].cy - res_fp32[i].cy) < 1e-6f);
+            CHECK(std::fabs(res_int8[i].w - res_fp32[i].w) < 1e-6f);
+            CHECK(std::fabs(res_int8[i].h - res_fp32[i].h) < 1e-6f);
+            CHECK(std::fabs(res_int8[i].angle_rad - res_fp32[i].angle_rad) < 1e-6f);
+            CHECK(std::fabs(res_int8[i].score - res_fp32[i].score) < 1e-6f);
+
+            CHECK(std::fabs(res_int8[i].cx - res_nhwc[i].cx) < 1e-6f);
+            CHECK(std::fabs(res_int8[i].cy - res_nhwc[i].cy) < 1e-6f);
+            CHECK(std::fabs(res_int8[i].w - res_nhwc[i].w) < 1e-6f);
+            CHECK(std::fabs(res_int8[i].h - res_nhwc[i].h) < 1e-6f);
+            CHECK(std::fabs(res_int8[i].angle_rad - res_nhwc[i].angle_rad) < 1e-6f);
+            CHECK(std::fabs(res_int8[i].score - res_nhwc[i].score) < 1e-6f);
+        }
+    };
+
+    // Test equivalence with negative zero_point (-12)
+    test_equivalence_for_zp(-12, 0.04f, 0.37f);
+    // Test equivalence with positive zero_point (5)
+    test_equivalence_for_zp(5, 0.035f, 0.37f);
+}
+
 int main() {
     test_prob_iou();
     test_obb_nms();
@@ -614,6 +938,7 @@ int main() {
     test_decode_layout_b_int8();
     test_decode_layout_b_grouped_and_nhwc();
     test_decode_layout_b_null_data();
+    test_decode_layout_b_nchw_multiclass_and_ties();
     test_shape_validators();
 
     if (g_fail == 0) {
