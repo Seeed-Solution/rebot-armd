@@ -510,6 +510,73 @@ fn test_5dof_grasp_table_violation_rejection() {
     assert!(viol.is_some(), "Path plunging below table must trigger table violation");
 }
 
+#[test]
+fn test_so_arm_default_grasp_no_workspace_violation() {
+    for profile in ["profiles/so_arm101.json", "profiles/so_arm100.json"] {
+        let config = ArmConfig::from_profile_file(profile).expect("profile loads");
+        let setup = config.grasp.as_ref().expect("grasp setup exists");
+        let cam = grasp::CamModel::assumed(&config.arm_model, setup, &config.camera_mount);
+        let pts = grasp::envelope(config.workspace.as_ref(), &config.camera_mount, &cam.rec);
+
+        // 1. Check points are all behind or at TCP (x <= 0) in tool frame
+        for (i, p) in pts.iter().enumerate() {
+            assert!(
+                p[0] <= 1e-4,
+                "{profile}: envelope point {i} ({:?}) has x > 0 ({}), protruding forward past TCP",
+                p, p[0]
+            );
+        }
+
+        // 2. Test acquisition_z and table_violation at downward grasp
+        let r_down = grasp::look_down(&kinematics::IDENTITY);
+        let acq_z = grasp::acquisition_z(&r_down, setup, &pts);
+        assert!(acq_z.is_finite());
+        assert!(acq_z >= setup.table_z_m + setup.approach_height_m);
+
+        let target = [0.22, 0.0, setup.table_z_m];
+        let approach = Pose::new(r_down, [target[0], target[1], setup.table_z_m + setup.approach_height_m]);
+        let grasp_pose = Pose::new(r_down, [target[0], target[1], setup.table_z_m + setup.grasp_height_m]);
+        let viol = grasp::table_violation(&approach, &grasp_pose, &pts, setup.table_z_m);
+        assert!(
+            viol.is_none(),
+            "{profile}: downward grasp path from approach ({:.3}m) to grasp height ({:.3}m) must not violate table: got {:?}",
+            approach.p[2], grasp_pose.p[2], viol
+        );
+
+        // 3. Test grasp::plan at nominal target
+        let mut inner = SupervisorInner::new(config.clone());
+        inner.lease_enabled = false;
+        inner.set_torque(true).unwrap();
+        let target_nom = [0.22, 0.0, setup.table_z_m + setup.grasp_height_m];
+        let r_down = grasp::look_down(&kinematics::IDENTITY);
+        let goal = Pose::new(r_down, [target_nom[0], target_nom[1], setup.table_z_m + setup.approach_height_m]);
+        let arm = &config.arm_model;
+        let lo = std::array::from_fn(|i| f64::from(config.limits[i].min_position));
+        let hi = std::array::from_fn(|i| f64::from(config.limits[i].max_position));
+        let q_home = std::array::from_fn(|i| f64::from(config.home_positions[i]));
+        let sol = arm.solve_dls_ex(&goal, &q_home, &lo, &hi, kinematics::PAR.w, true);
+        assert!(sol.ok, "{profile}: initial solve for downward approach pose must succeed");
+
+        let q32: Vec<f32> = sol.q.iter().map(|&x| x as f32).collect();
+        inner.commanded_positions = q32.clone();
+        inner.measured_positions = q32;
+        let body = serde_json::json!({
+            "label": "object",
+            "box_norm": [0.45, 0.45, 0.55, 0.55],
+        });
+        let pending = grasp::prepare(&inner, &body, inner.safety.epoch_id()).expect("prepare succeeds");
+        let planned = grasp::plan(pending);
+        assert!(
+            planned.is_ok(),
+            "{profile}: grasp::plan failed: {:?}",
+            planned.err()
+        );
+        let plan = planned.unwrap();
+        assert!(plan.approach_duration > 0.0, "{profile}: approach duration should be > 0");
+        assert!(!plan.camera_down, "{profile}: camera_down should be off for 5-DOF SO-ARM");
+    }
+}
+
 struct MockLoadDriver {
     caps: DriverCapabilities,
     loads: Arc<Mutex<Vec<f32>>>,

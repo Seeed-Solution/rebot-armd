@@ -400,6 +400,36 @@ fn test_feetech_configure_servos_torque_enabled_refuses() {
     // REG_TORQUE_ENABLE = 1
     let torq_cs = calculate_checksum(1, 3, 0x00, &[1]);
     rx.extend_from_slice(&[0xFF, 0xFF, 1, 3, 0x00, 1, torq_cs]);
+
+    let addrs_and_vals: &[(u8, u16)] = &[
+        (REG_RETURN_DELAY, 10), // Differs from target (0) to force EEPROM write attempt
+        (REG_STATUS_RETURN_LEVEL, 1),
+        (REG_MIN_ANGLE_LIMIT_L, 0),
+        (REG_MAX_ANGLE_LIMIT_L, 4095),
+        (REG_P_COEF, 16),
+        (REG_D_COEF, 32),
+        (REG_I_COEF, 0),
+        (REG_MAX_TORQUE_L, 1000),
+        (REG_PROTECTION_CURRENT_L, 500),
+        (REG_OVERLOAD_TORQUE, 25),
+        (REG_OPERATING_MODE, 0),
+    ];
+    for &(addr, val) in addrs_and_vals {
+        let is_16 = addr == REG_MIN_ANGLE_LIMIT_L
+            || addr == REG_MAX_ANGLE_LIMIT_L
+            || addr == REG_MAX_TORQUE_L
+            || addr == REG_PROTECTION_CURRENT_L;
+        let params: Vec<u8> = if is_16 {
+            val.to_le_bytes().to_vec()
+        } else {
+            vec![val as u8]
+        };
+        let len = (params.len() + 2) as u8;
+        let cs = calculate_checksum(1, len, 0x00, &params);
+        rx.extend_from_slice(&[0xFF, 0xFF, 1, len, 0x00]);
+        rx.extend_from_slice(&params);
+        rx.push(cs);
+    }
     driver.transport_mut().provide_rx(&rx);
 
     let res = driver.configure_servos();
@@ -464,11 +494,117 @@ fn test_feetech_configure_servos_already_matching_zero_writes() {
     driver.transport_mut().provide_rx(&rx);
 
     driver.configure_servos().unwrap();
+    assert_eq!(driver.enable_state(), EnableState::Disabled);
 
     let tx = driver.transport_mut().take_tx();
     for window in tx.windows(8) {
         if window[0] == 0xFF && window[1] == 0xFF && window[4] == INST_WRITE {
             panic!("no write commands allowed when registers already match");
+        }
+    }
+}
+
+#[test]
+fn test_feetech_configure_servos_already_matching_torque_enabled_succeeds() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+
+    let mut rx = Vec::new();
+    let model_bytes = 777u16.to_le_bytes();
+    let model_len = (model_bytes.len() + 2) as u8;
+    let model_cs = calculate_checksum(1, model_len, 0x00, &model_bytes);
+    rx.extend_from_slice(&[0xFF, 0xFF, 1, model_len, 0x00]);
+    rx.extend_from_slice(&model_bytes);
+    rx.push(model_cs);
+
+    // REG_TORQUE_ENABLE = 1
+    let torq_cs = calculate_checksum(1, 3, 0x00, &[1]);
+    rx.extend_from_slice(&[0xFF, 0xFF, 1, 3, 0x00, 1, torq_cs]);
+
+    let addrs_and_vals: &[(u8, u16)] = &[
+        (REG_RETURN_DELAY, 0),
+        (REG_STATUS_RETURN_LEVEL, 1),
+        (REG_MIN_ANGLE_LIMIT_L, 0),
+        (REG_MAX_ANGLE_LIMIT_L, 4095),
+        (REG_P_COEF, 16),
+        (REG_D_COEF, 32),
+        (REG_I_COEF, 0),
+        (REG_MAX_TORQUE_L, 1000),
+        (REG_PROTECTION_CURRENT_L, 500),
+        (REG_OVERLOAD_TORQUE, 25),
+        (REG_OPERATING_MODE, 0),
+    ];
+    for &(addr, val) in addrs_and_vals {
+        let is_16 = addr == REG_MIN_ANGLE_LIMIT_L
+            || addr == REG_MAX_ANGLE_LIMIT_L
+            || addr == REG_MAX_TORQUE_L
+            || addr == REG_PROTECTION_CURRENT_L;
+        let params: Vec<u8> = if is_16 {
+            val.to_le_bytes().to_vec()
+        } else {
+            vec![val as u8]
+        };
+        let len = (params.len() + 2) as u8;
+        let cs = calculate_checksum(1, len, 0x00, &params);
+        rx.extend_from_slice(&[0xFF, 0xFF, 1, len, 0x00]);
+        rx.extend_from_slice(&params);
+        rx.push(cs);
+    }
+    driver.transport_mut().provide_rx(&rx);
+
+    driver.configure_servos().unwrap();
+    assert_eq!(driver.enable_state(), EnableState::Enabled);
+
+    let tx = driver.transport_mut().take_tx();
+    for window in tx.windows(8) {
+        if window[0] == 0xFF && window[1] == 0xFF && window[4] == INST_WRITE {
+            panic!("no write commands allowed when registers already match even with torque enabled");
+        }
+    }
+}
+
+#[test]
+fn test_feetech_set_torque_already_enabled_no_rollback_on_failure() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1, 2];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+
+    // First enable successfully so driver.enable_state() == Enabled
+    let cs1 = calculate_checksum(1, 3, 0x00, &[1]);
+    let resp1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs1];
+    let cs2 = calculate_checksum(2, 3, 0x00, &[1]);
+    let resp2 = vec![0xFF, 0xFF, 2, 3, 0x00, 1, cs2];
+    let mut rx = Vec::new();
+    rx.extend_from_slice(&resp1);
+    rx.extend_from_slice(&resp2);
+    driver.transport_mut().provide_rx(&rx);
+    driver.set_torque(true).unwrap();
+    assert_eq!(driver.enable_state(), EnableState::Enabled);
+    let _ = driver.transport_mut().take_tx();
+
+    // Now call set_torque(true) again, but simulate readback failure (servo 2 reports 0)
+    let cs1 = calculate_checksum(1, 3, 0x00, &[1]);
+    let resp1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs1];
+    let cs2_zero = calculate_checksum(2, 3, 0x00, &[0]);
+    let resp2_zero = vec![0xFF, 0xFF, 2, 3, 0x00, 0, cs2_zero];
+    let mut rx_fail = Vec::new();
+    rx_fail.extend_from_slice(&resp1);
+    rx_fail.extend_from_slice(&resp2_zero);
+    driver.transport_mut().provide_rx(&rx_fail);
+
+    let res = driver.set_torque(true);
+    assert!(res.is_err());
+    assert!(matches!(res.unwrap_err(), ArmDriverError::HardwareFault(_)));
+    assert_eq!(driver.enable_state(), EnableState::Unknown);
+
+    // TX should contain 2 enable writes + 2 readback reads = 4 packets (32 bytes).
+    // It must NOT contain rollback disable writes (which would be another 16 bytes with value 0).
+    let tx = driver.transport_mut().take_tx();
+    assert_eq!(tx.len(), 32);
+    for window in tx.windows(8) {
+        if window[0] == 0xFF && window[1] == 0xFF && window[4] == INST_WRITE && window[5] == REG_TORQUE_ENABLE {
+            assert_eq!(window[6], 1, "Must never send torque disable rollback when already enabled");
         }
     }
 }

@@ -530,6 +530,9 @@ impl<T: Transport> FeetechArmDriver<T> {
 
     /// Configure EEPROM and RAM registers for all servos based on `FeetechConfig`.
     pub fn configure_servos(&mut self) -> Result<(), ArmDriverError> {
+        let mut all_disabled = true;
+        let mut all_enabled = true;
+
         for joint_idx in 0..self.servo_ids.len() {
             let id = self.servo_ids[joint_idx];
             let calib = self.config.joints.get(joint_idx).cloned().unwrap_or(feetech::FeetechJointCalib {
@@ -546,12 +549,12 @@ impl<T: Transport> FeetechArmDriver<T> {
                 )));
             }
 
-            // 2. Torque must be disabled during EEPROM write
+            // 2. Read torque enable status
             let torque_en = self.read_register_u8_direct(id, feetech::REG_TORQUE_ENABLE)?;
-            if torque_en != 0 {
-                return Err(ArmDriverError::HardwareFault(
-                    "cannot configure EEPROM while torque is enabled".to_string(),
-                ));
+            if torque_en == 0 {
+                all_enabled = false;
+            } else {
+                all_disabled = false;
             }
 
             // 3. Read current registers
@@ -593,6 +596,12 @@ impl<T: Transport> FeetechArmDriver<T> {
                 || cur_operating_mode != target_operating_mode;
 
             if differs {
+                if torque_en != 0 {
+                    return Err(ArmDriverError::HardwareFault(
+                        "cannot configure EEPROM while torque is enabled".to_string(),
+                    ));
+                }
+
                 // Unlock EEPROM
                 self.write_register_u8_direct(id, feetech::REG_LOCK, 0)?;
 
@@ -639,6 +648,17 @@ impl<T: Transport> FeetechArmDriver<T> {
                 lock_res?;
             }
         }
+
+        if !self.servo_ids.is_empty() {
+            if all_disabled {
+                self.confirmed_enable_state = EnableState::Disabled;
+            } else if all_enabled {
+                self.confirmed_enable_state = EnableState::Enabled;
+            } else {
+                self.confirmed_enable_state = EnableState::Unknown;
+            }
+        }
+
         Ok(())
     }
 }
@@ -692,6 +712,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
         let ids = self.servo_ids.clone();
         if enabled {
+            let prev_state = self.confirmed_enable_state;
             if !self.last_feedback_instant.is_empty() && self.last_feedback_instant.iter().all(Option::is_some) {
                 let targets: Vec<JointTarget> = self.cached_states.iter().map(|s| JointTarget::position(s.position)).collect();
                 self.write_joint_targets(&targets)?;
@@ -735,11 +756,13 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 } else {
                     self.confirmed_enable_state = EnableState::Unknown;
                 }
-                for &id in &ids {
-                    let pkt = feetech::build_set_torque(id, false);
-                    let _ = self.transport.write_all(&pkt);
-                    let _ = self.transport.flush();
-                    let _ = self.drain_tx_echo(&pkt);
+                if prev_state != EnableState::Enabled {
+                    for &id in &ids {
+                        let pkt = feetech::build_set_torque(id, false);
+                        let _ = self.transport.write_all(&pkt);
+                        let _ = self.transport.flush();
+                        let _ = self.drain_tx_echo(&pkt);
+                    }
                 }
                 Err(ArmDriverError::HardwareFault(format!(
                     "Torque enable readback failed: {}",

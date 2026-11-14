@@ -34,7 +34,7 @@ use serde_json::Value;
 use crate::api::proxy::DetectorUpstream;
 use crate::api::rest::ApiError;
 use crate::kinematics::{self, Mat3, Pose, Vec3};
-use crate::model::{CameraMount, WorkspacePolicy};
+use crate::model::{CameraMount, HoldingMode, WorkspacePolicy};
 use crate::macro_action::{fail, MacroCtx, Stop, SubDone};
 use crate::motion::{self, GoalSpec, GripperCommand, MotionError, PlanInput, RelFrame, Speed};
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
@@ -1483,11 +1483,12 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
     if let Some(e) = table_violation(&pose, &goal, &pts, setup.table_z_m) { return Err(e.into()); }
     let mut cur = input.clone();
     cur.j7 = open_rad;
-    let path = motion::plan_cartesian(&cur, goal, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
+    let is_5dof = input.arm.arm_dof() == 5;
+    let path = motion::plan_cartesian_ex(&cur, goal, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS }, is_5dof)?;
     let last = path.last();
     cur.q0 = std::array::from_fn(|i| f64::from(last[i]));
     let transition_duration = if camera_down {
-        let trans_path = motion::plan_cartesian(&cur, tool, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
+        let trans_path = motion::plan_cartesian_ex(&cur, tool, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS }, is_5dof)?;
         let last = trans_path.last();
         cur.q0 = std::array::from_fn(|i| f64::from(last[i]));
         transition_estimate(&goal, &target, setup)
@@ -1495,7 +1496,7 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
         0.0
     };
     let grasp_pose = Pose::new(tool.r, [target[0], target[1], setup.table_z_m + setup.grasp_height_m]);
-    let _descend_path = motion::plan_cartesian(&cur, grasp_pose, Speed { linear: setup.descend_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS })?;
+    let _descend_path = motion::plan_cartesian_ex(&cur, grasp_pose, Speed { linear: setup.descend_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS }, is_5dof)?;
     Ok(PlannedGrasp { input, request, target, approach_duration: path.duration, camera_down, transition_duration })
 }
 
@@ -2062,8 +2063,9 @@ impl Orchestrator {
         let held_width = {
             let inner = self.sup.inner().read().await;
             inner.config.gripper_policy.as_ref().map(|p| {
-                let m7 = inner.measured_positions.get(6).copied().unwrap_or(0.0);
-                p.opening_m(m7)
+                let idx = inner.config.gripper_index().unwrap_or(6);
+                let m = inner.measured_positions.get(idx).copied().unwrap_or(0.0);
+                p.opening_m(m)
             })
         };
         if let Some(w) = held_width {
@@ -2101,8 +2103,9 @@ impl Orchestrator {
             let held_width = {
                 let inner = self.sup.inner().read().await;
                 inner.config.gripper_policy.as_ref().map(|p| {
-                    let m7 = inner.measured_positions.get(6).copied().unwrap_or(0.0);
-                    p.opening_m(m7)
+                    let idx = inner.config.gripper_index().unwrap_or(6);
+                    let m = inner.measured_positions.get(idx).copied().unwrap_or(0.0);
+                    p.opening_m(m)
                 })
             };
             if let Some(w) = held_width {
@@ -2115,25 +2118,75 @@ impl Orchestrator {
         Err(fail("DROPPED", format!("Object no longer held after the lift: the re-grip closed to {gap:.2} rad from closed")))
     }
 
-    /// `holding` after `post_lift_settle_ms` from the measured J7, with the gripper policy's rule
-    /// (as the close: gap from closed >= `holding_gap_rad` and median |J7 torque| over the window
-    /// >= `holding_torque_nm`). Returns (holding, gap).
+    /// `holding` after `post_lift_settle_ms` from the measured gripper joint, with the gripper policy's rule
+    /// (matching GripperMotion in motion.rs). Returns (holding, gap).
     async fn holding_now(&self) -> Result<(bool, f32), Stop> {
         let until = Instant::now() + Duration::from_millis(self.setup.post_lift_settle_ms);
         let mut taus = Vec::new();
+        let mut loads = Vec::new();
+        let mut vels = Vec::new();
         loop {
             self.check().await?;
-            let (gap, tau, policy) = {
+            let (gap, tau, load, vel, policy, feedback_fresh, torque_feedback, load_feedback) = {
                 let inner = self.sup.inner().read().await;
-                let Some(policy) = inner.config.gripper_policy.clone() else { return Err(fail("UNSUPPORTED", "No gripper policy")); };
+                let Some(policy) = inner.config.gripper_policy.clone() else {
+                    return Err(fail("UNSUPPORTED", "No gripper policy"));
+                };
+                let g_idx = inner.config.gripper_index().unwrap_or(6);
                 let dir = if policy.closed_rad >= policy.open_rad { 1.0 } else { -1.0 };
-                let m7 = inner.measured_positions.get(6).copied().unwrap_or(f32::NAN);
-                ((policy.closed_rad - m7) * dir, inner.torques.get(6).copied().unwrap_or(0.0).abs(), policy)
+                let m_g = inner.measured_positions.get(g_idx).copied().unwrap_or(f32::NAN);
+                let gap = (policy.closed_rad - m_g) * dir;
+                let tau = inner.torques.get(g_idx).copied().unwrap_or(0.0).abs();
+                let load = inner.loads.get(g_idx).copied().unwrap_or(0.0).abs();
+                let vel = inner.measured_velocities.get(g_idx).copied().unwrap_or(0.0);
+
+                let (torque_fb, load_fb) = if let Some(ref d) = inner.driver {
+                    if let Ok(driver) = d.lock() {
+                        let caps = driver.capabilities();
+                        (caps.torque_feedback, caps.load_feedback)
+                    } else {
+                        (false, false)
+                    }
+                } else {
+                    (true, !inner.loads.is_empty())
+                };
+                let fresh = if inner.driver.is_some() {
+                    inner.hardware_feedback_fresh(Duration::from_millis(250))
+                } else {
+                    true
+                };
+
+                (gap, tau, load, vel, policy, fresh, torque_fb, load_fb)
             };
             taus.push(f64::from(tau));
+            loads.push(f64::from(load));
+            vels.push(f64::from(vel));
+
             if Instant::now() >= until {
-                let tau = median(&mut taus);
-                return Ok((gap >= policy.holding_gap_rad && tau >= f64::from(policy.holding_torque_nm), gap));
+                let tau_median = if taus.is_empty() { 0.0 } else { median(&mut taus) };
+                let load_median = if loads.is_empty() { 0.0 } else { median(&mut loads) };
+                let vel_median = if vels.is_empty() { 0.0 } else { median(&mut vels) };
+
+                let holding = match policy.holding_mode {
+                    HoldingMode::TorqueAndGap => {
+                        torque_feedback
+                            && gap >= policy.holding_gap_rad
+                            && tau_median >= f64::from(policy.holding_torque_nm)
+                    }
+                    HoldingMode::PositionGap => {
+                        feedback_fresh
+                            && vel_median.abs() < motion::SETTLE_VEL
+                            && gap >= policy.holding_gap_rad
+                    }
+                    HoldingMode::LoadAndGap => {
+                        let req = policy.holding_load_fraction.unwrap_or(0.15) as f64;
+                        feedback_fresh
+                            && load_feedback
+                            && gap >= policy.holding_gap_rad
+                            && load_median >= req
+                    }
+                };
+                return Ok((holding, gap));
             }
             tokio::time::sleep(POLL).await;
         }
@@ -3587,5 +3640,69 @@ mod tests {
         let expected_w_aniso = 120.0 / 600.0;
         assert!((meas_aniso.length_m.unwrap() - expected_l_aniso).abs() < 1e-9);
         assert!((meas_aniso.width_m.unwrap() - expected_w_aniso).abs() < 1e-9);
+    }
+
+    struct DummyDetectionSource;
+    impl DetectionSource for DummyDetectionSource {
+        fn inference_enabled(&self) -> BoxFuture<'_, Result<bool, String>> { Box::pin(async { Ok(true) }) }
+        fn set_inference(&self, _enabled: bool) -> BoxFuture<'_, Result<(), String>> { Box::pin(async { Ok(()) }) }
+        fn next_frame(&self, _after: Option<u64>, _wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> { Box::pin(async { Ok(None) }) }
+    }
+
+    #[tokio::test]
+    async fn test_orchestrator_holding_now_load_and_gap_on_6dof() {
+        let config = crate::model::ArmConfig::from_profile_file("profiles/so_arm101.json").expect("loads");
+        let policy = config.gripper_policy.clone().expect("gripper_policy");
+
+        let mut setup = GraspSetup::default();
+        setup.post_lift_settle_ms = 10;
+
+        let sup = Arc::new(ArmSupervisor::new(config));
+        let id = {
+            let mut inner = sup.inner().write().await;
+            inner.lease_enabled = false;
+            inner.set_torque(true).unwrap();
+            inner.commanded_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
+            inner.measured_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
+            inner.loads = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.35];
+            let plan_in = inner.plan_input().unwrap();
+            inner.begin_macro("grasp", &plan_in, None).unwrap()
+        };
+
+        let source = Arc::new(DummyDetectionSource);
+        let cam = CamModel::assumed(&sup.inner().read().await.config.arm_model, &setup, &CameraMount::default());
+        let ctx = MacroCtx {
+            sup: sup.clone(),
+            id,
+            deadline: Instant::now() + Duration::from_secs(10),
+            phase_timeout_s: setup.phase_timeout_s,
+            timeout_code: "GRASP_TIMEOUT",
+            timeout_message: "timeout".into(),
+        };
+        let orch = Orchestrator {
+            ctx,
+            source,
+            setup: setup.clone(),
+            cam,
+            envelope: vec![],
+            triggered: false,
+            lens_known: false,
+            depth_available: false,
+        };
+
+        let (holding, gap) = orch.holding_now().await.expect("holding_now should succeed");
+        assert!(holding);
+        assert!((gap - 0.5).abs() < 1e-4);
+
+        // Test held_width calculation on 6-DOF
+        let held_width = {
+            let inner = sup.inner().read().await;
+            inner.config.gripper_policy.as_ref().map(|p| {
+                let idx = inner.config.gripper_index().unwrap_or(6);
+                let m = inner.measured_positions.get(idx).copied().unwrap_or(0.0);
+                p.opening_m(m)
+            })
+        };
+        assert_eq!(held_width, Some(policy.opening_m(0.5)));
     }
 }

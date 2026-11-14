@@ -4253,10 +4253,15 @@ function calRender() {
     li.append(b, a, x);
     list.appendChild(li);
   });
-  $('calib-solve').disabled = n < calMin() || CAL.busy;
+  const isSoArm = isSoArmProfile() || (S.armDof != null && S.armDof !== 6);
+  $('calib-solve').disabled = n < calMin() || CAL.busy || isSoArm;
   $('calib-export').disabled = n === 0;
-  $('calib-cap').disabled = CAL.busy;
-  setText($('calib-cap'), t(CAL.busy ? 'calib.cap.busy' : 'calib.cap'));
+  $('calib-cap').disabled = CAL.busy || isSoArm;
+  if (isSoArm) {
+    setText($('calib-cap'), 'Hand-Eye FK calibration supports 6-arm-DOF B601 only');
+  } else {
+    setText($('calib-cap'), t(CAL.busy ? 'calib.cap.busy' : 'calib.cap'));
+  }
   const rb = $('calib-reset'), armed = Date.now() < CAL.resetArmedUntil;
   rb.classList.toggle('armed', armed);
   setText(rb, t(armed ? 'calib.reset.confirm' : 'calib.reset'));
@@ -4292,6 +4297,10 @@ function calLive() {
 }
 async function calCapture() {
   if (CAL.busy) return;
+  if (isSoArmProfile() || (S.armDof != null && S.armDof !== 6)) {
+    toast('Hand-Eye FK calibration currently supports 6-arm-DOF B601 only', 'warn');
+    return;
+  }
   if (!isLive() || !S.obs || !Array.isArray(S.obs.positions) || S.obs.positions.length < 4) { toast(t('calib.e.offline'), 'warn'); return; }
   if (Array.isArray(S.obs.velocities) && S.obs.velocities.some((v) => Math.abs(v) > 0.02)) { toast(t('calib.e.moving'), 'warn'); return; }
   const eih = calEih();
@@ -5240,7 +5249,10 @@ function cartTick() {
 
     if (v.p || v.r || gripMoving) {
       const wl = CFG.cart.wmax * scale;
-      let t = pos.slice(0, S.dof);
+      const cmdPos = (Array.isArray(S.obs?.commanded_positions) && S.obs.commanded_positions.length >= S.dof
+        && S.obs.commanded_positions.slice(0, S.dof).every(Number.isFinite))
+        ? S.obs.commanded_positions : pos;
+      let t = cmdPos.slice(0, S.dof);
       while (t.length < S.dof) t.push(0);
       if (t.length > 3 && v.p) t[3] = clamp(t[3] + v.p * wl * dt, S.limits[3].min_position, S.limits[3].max_position);
       if (t.length > 4 && v.r) t[4] = clamp(t[4] + v.r * wl * dt, S.limits[4].min_position, S.limits[4].max_position);
@@ -6007,7 +6019,7 @@ function renderGc() {
   const gc = S.obs?.gravity_comp, on = gcOn(), live = isLive();
   document.body.classList.toggle('gc', on && live);
   const sw = $('btn-gc');
-  const supported = !!(gc && gc.supported) && (S.caps ? S.caps.gravity_compensation !== false : true);
+  const supported = !!(gc && gc.supported) && (S.caps ? S.caps.gravity_comp !== false : true);
   sw.hidden = !supported;
   const why = on ? null : gcBlockText();
   sw.classList.toggle('on', on);

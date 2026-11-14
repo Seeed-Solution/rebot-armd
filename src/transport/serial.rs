@@ -109,13 +109,13 @@ impl SerialTransport {
             let rs485_needed = config.resolve_rs485_rts_on_send();
             if rs485_needed {
                 let mut rs485 = SerialRs485::default();
-                if unsafe { libc::ioctl(fd, TIOCGRS485, &mut rs485) } < 0 {
+                if unsafe { libc::ioctl(fd, TIOCGRS485 as _, &mut rs485) } < 0 {
                     rs485 = SerialRs485::default();
                 }
                 rs485.flags = (rs485.flags & !SER_RS485_RTS_AFTER_SEND) | SER_RS485_ENABLED | SER_RS485_RTS_ON_SEND;
                 rs485.delay_rts_before_send = 0;
                 rs485.delay_rts_after_send = 0;
-                let rc = unsafe { libc::ioctl(fd, TIOCSRS485, &rs485) };
+                let rc = unsafe { libc::ioctl(fd, TIOCSRS485 as _, &rs485) };
                 if rc < 0 {
                     let err = std::io::Error::last_os_error();
                     return Err(TransportError::Serial(format!(
@@ -192,10 +192,10 @@ impl SerialTransport {
         const ASYNC_LOW_LATENCY: libc::c_int = 0x2000;
 
         let mut ss: SerialStruct = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::ioctl(fd, TIOCGSERIAL, &mut ss) };
+        let rc = unsafe { libc::ioctl(fd, TIOCGSERIAL as _, &mut ss) };
         if rc == 0 {
             ss.flags |= ASYNC_LOW_LATENCY;
-            let set_rc = unsafe { libc::ioctl(fd, TIOCSSERIAL, &ss) };
+            let set_rc = unsafe { libc::ioctl(fd, TIOCSSERIAL as _, &ss) };
             if set_rc != 0 {
                 let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 if err != libc::ENOTTY && err != libc::EINVAL && err != libc::EOPNOTSUPP {
