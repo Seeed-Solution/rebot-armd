@@ -656,20 +656,11 @@ int main(int argc, char** argv) {
 
                 // Analyze each detection box
                 for (size_t i = 0; i < dets.size(); ++i) {
+                    // jaw_clear across the mask-angle closing direction when a seg model gave one
                     auto res = rv::analyze_box_depth(depth_stage.depth_map(), depth_stage.grid_w(), depth_stage.grid_h(),
-                                                     i, all_depth_boxes, content.w, content.h);
-                    if (res.valid) {
-                        dets[i].disp_fg = res.disp_fg;
-                        dets[i].disp_bg = res.disp_bg;
-                        dets[i].depth_conf = res.depth_conf;
-                        dets[i].length_px = res.length_px;
-                        dets[i].jaw_clear = res.jaw_clear;
-                        if (!std::isfinite(dets[i].angle_deg)) {
-                            dets[i].angle_deg = res.angle_deg;
-                            dets[i].angle_conf = res.angle_conf;
-                            dets[i].grasp_width_px = res.grasp_width_px;
-                        }
-                    }
+                                                     i, all_depth_boxes, content.w, content.h,
+                                                     rv::jaw_close_deg(dets[i]));
+                    rv::apply_box_depth(dets[i], res);
                 }
                 vr.detections_json = rv::detections_json(dets, content, frame.width, frame.height);
 

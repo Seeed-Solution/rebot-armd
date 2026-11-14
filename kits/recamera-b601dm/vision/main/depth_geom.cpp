@@ -196,7 +196,7 @@ void resize_rgb888_bilinear(const uint8_t* src, int src_w, int src_h, int src_st
 BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
                                  const DepthBox& target_box,
                                  const std::vector<DepthBox>& other_boxes,
-                                 float content_w, float content_h) {
+                                 float content_w, float content_h, float jaw_close_deg) {
     BoxDepthResult res;
     if (disp_map == nullptr || grid_w <= 0 || grid_h <= 0) return res;
 
@@ -422,10 +422,35 @@ BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
     res.length_px = (p95_maj - p5_maj) + cell_w_px;
     res.grasp_width_px = (p95_min - p5_min) + cell_w_px;
 
-    // Jaw clear test
+    // Jaw clear test. The jaws close along the closing axis; (cos_j, sin_j) is the axis across it.
+    // Default: closing along the PCA minor axis, so the across axis is the major axis (cos_t, sin_t)
+    // and the bounds are the ones computed above. With a given closing direction (for example the
+    // mask angle + 90 deg) the bounds are recomputed from the foreground along the new axes.
+    double cos_j = cos_t;
+    double sin_j = sin_t;
+    float p5_close = p5_min;
+    float p95_close = p95_min;
+    float across_span = res.length_px;
+    if (std::isfinite(jaw_close_deg)) {
+        const double jc = static_cast<double>(jaw_close_deg) * (M_PI / 180.0);
+        cos_j = std::sin(jc);
+        sin_j = -std::cos(jc);
+        std::vector<float> proj_across(fg_count);
+        std::vector<float> proj_close(fg_count);
+        for (int i = 0; i < fg_count; ++i) {
+            const double du = fg_pts[i].u - mean_u;
+            const double dv = fg_pts[i].v - mean_v;
+            proj_across[i] = static_cast<float>(du * cos_j + dv * sin_j);
+            proj_close[i] = static_cast<float>(-du * sin_j + dv * cos_j);
+        }
+        p5_close = calc_percentile(proj_close, 0.05f);
+        p95_close = calc_percentile(proj_close, 0.95f);
+        const float p5_across = calc_percentile(proj_across, 0.05f);
+        const float p95_across = calc_percentile(proj_across, 0.95f);
+        across_span = (p95_across - p5_across) + cell_w_px;
+    }
     const float jaw_pad_px = 18.0f;
-    const float major_span = res.length_px;
-    const float maj_bound = 0.20f * major_span;
+    const float maj_bound = 0.20f * across_span;
     const float conflict_thresh = 0.5f * (res.disp_fg - res.disp_bg);
 
     std::vector<bool> is_self_fg(static_cast<size_t>(grid_w * grid_h), false);
@@ -444,12 +469,12 @@ BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
             const float u_px = (gx + 0.5f) * cell_w_px;
             const double du = u_px - mean_u;
 
-            const double p_maj = du * cos_t + dv * sin_t;
+            const double p_maj = du * cos_j + dv * sin_j;
             if (p_maj < -maj_bound || p_maj > maj_bound) continue;
 
-            const double p_min = -du * sin_t + dv * cos_t;
-            const bool in_jaw = (p_min > p95_min && p_min <= p95_min + jaw_pad_px) ||
-                                (p_min < p5_min && p_min >= p5_min - jaw_pad_px);
+            const double p_min = -du * sin_j + dv * cos_j;
+            const bool in_jaw = (p_min > p95_close && p_min <= p95_close + jaw_pad_px) ||
+                                (p_min < p5_close && p_min >= p5_close - jaw_pad_px);
             if (!in_jaw) continue;
 
             ++footprint_jaw_cells;
@@ -480,14 +505,15 @@ BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
 BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
                                  size_t target_idx,
                                  const std::vector<DepthBox>& all_boxes,
-                                 float content_w, float content_h) {
+                                 float content_w, float content_h, float jaw_close_deg) {
     if (target_idx >= all_boxes.size()) return BoxDepthResult{};
     std::vector<DepthBox> other_boxes;
     other_boxes.reserve(all_boxes.size() > 0 ? all_boxes.size() - 1 : 0);
     for (size_t i = 0; i < all_boxes.size(); ++i) {
         if (i != target_idx) other_boxes.push_back(all_boxes[i]);
     }
-    return analyze_box_depth(disp_map, grid_w, grid_h, all_boxes[target_idx], other_boxes, content_w, content_h);
+    return analyze_box_depth(disp_map, grid_w, grid_h, all_boxes[target_idx], other_boxes, content_w, content_h,
+                             jaw_close_deg);
 }
 
 std::vector<TableSample> sample_table_disparity(const float* disp_map, int grid_w, int grid_h,
