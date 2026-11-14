@@ -102,6 +102,7 @@ pub struct PlanInput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct JointPath {
+    pub dof: usize,
     /// Samples, the first one is the start.
     pub q: Vec<[f32; 7]>,
     /// Normalised path parameter of each sample (0..=1).
@@ -113,6 +114,8 @@ pub struct JointPath {
 
 impl JointPath {
     pub fn last(&self) -> [f32; 7] { *self.q.last().expect("path has samples") }
+
+    pub fn last_slice(&self) -> &[f32] { &self.q.last().expect("path has samples")[..self.dof] }
 
     /// Joint positions at path time `t` (quintic time law of [`PathTrajectory`]).
     pub fn position_at_time(&self, t: f64) -> [f32; 7] {
@@ -144,6 +147,11 @@ impl JointPath {
 
 /// Plan a straight-line (position) / slerp (rotation) path from `fk(q0)` to `goal`.
 pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<JointPath, MotionError> {
+    plan_cartesian_ex(input, goal, speed, false)
+}
+
+/// Plan a Cartesian path from `fk(q0)` to `goal`, with optional `yaw_free` for 5-DOF arms.
+pub fn plan_cartesian_ex(input: &PlanInput, goal: Pose, speed: Speed, yaw_free: bool) -> Result<JointPath, MotionError> {
     let arm_dof = input.arm.arm_dof();
     if input.limits.len() < arm_dof + 1 {
         return Err(MotionError::Unsupported(format!("Cartesian actions need at least {} joints", arm_dof + 1)));
@@ -202,11 +210,11 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
         let r = if k == n { goal.r } else {
             kinematics::mat_mul(&kinematics::exp_r(&[w_rel[0] * s, w_rel[1] * s, w_rel[2] * s]), &start.r)
         };
-        let sol = input.arm.solve_dls(&Pose::new(r, p), &prev, &lo, &hi, kinematics::PAR.w);
+        let sol = input.arm.solve_dls_ex(&Pose::new(r, p), &prev, &lo, &hi, kinematics::PAR.w, yaw_free);
         if !sol.ok {
             return Err(MotionError::IkUnreachable { s, ep: sol.ep, er: sol.er });
         }
-        if let Some((joint, dq)) = (0..6).map(|i| (i, (sol.q[i] - prev[i]).abs())).max_by(|a, b| a.1.total_cmp(&b.1)) {
+        if let Some((joint, dq)) = (0..arm_dof).map(|i| (i, (sol.q[i] - prev[i]).abs())).max_by(|a, b| a.1.total_cmp(&b.1)) {
             if dq > MAX_SAMPLE_JUMP_RAD {
                 return Err(MotionError::IkBranchFlip { s, joint: joint + 1, dq });
             }
@@ -228,7 +236,7 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
     let mut duration: f64 = 0.0;
     for seg in 1..q_samples.len() {
         let ds = s_samples[seg] - s_samples[seg - 1];
-        for j in 0..6 {
+        for j in 0..arm_dof {
             let slope = f64::from((q_samples[seg][j] - q_samples[seg - 1][j]).abs()) / ds;
             let vcap = f64::from(input.limits[j].max_velocity);
             let acap = f64::from(input.limits[j].max_acceleration).min(ACTION_MAX_ACCELERATION);
@@ -238,7 +246,8 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
     }
     duration = duration.max(1.875 * length / speed.linear).max(1.875 * theta / speed.angular);
     let duration = (duration * 1.1).max(0.2);
-    let mut path = JointPath { q: q_samples, s: s_samples, duration, power_scale: 1.0 };
+    let dof = input.limits.len();
+    let mut path = JointPath { dof, q: q_samples, s: s_samples, duration, power_scale: 1.0 };
     if let Some(b) = input.power.as_ref().filter(|b| b.enabled && b.planning.enabled) {
         let t0 = std::time::Instant::now();
         let fit = path.fit_power(b, &input.arm)?;
@@ -258,17 +267,49 @@ pub enum RelFrame { Base, Tool, Camera }
 pub enum GoalSpec {
     /// Absolute end_link pose; `r = None` keeps the current orientation.
     Absolute { p: [f64; 3], r: Option<kinematics::Mat3> },
+    AbsoluteEx { p: [f64; 3], r: Option<kinematics::Mat3>, auto_yaw: bool },
     Relative { frame: RelFrame, d: [f64; 3], dyaw: f64, dpitch: f64, droll: f64, level: bool },
 }
 
 /// Resolve a goal request against the start pose `fk(q0)`.
 pub fn resolve_goal(input: &PlanInput, spec: &GoalSpec) -> Pose {
+    resolve_goal_ex(input, spec).0
+}
+
+/// Resolve a goal request against the start pose `fk(q0)`, returning `(pose, yaw_free)`.
+pub fn resolve_goal_ex(input: &PlanInput, spec: &GoalSpec) -> (Pose, bool) {
     let start = input.arm.fk(&input.q0);
     match spec {
-        GoalSpec::Absolute { p, r } => Pose::new(r.unwrap_or(start.r), *p),
+        GoalSpec::Absolute { p, r } => {
+            let auto_yaw = input.arm.arm_dof() == 5 && r.is_none();
+            let mut target_r = r.unwrap_or(start.r);
+            if auto_yaw {
+                let r_start = (start.p[0] * start.p[0] + start.p[1] * start.p[1]).sqrt();
+                let r_target = (p[0] * p[0] + p[1] * p[1]).sqrt();
+                if r_start >= 0.03 && r_target >= 0.03 {
+                    let dpsi = p[1].atan2(p[0]) - start.p[1].atan2(start.p[0]);
+                    let rz = kinematics::axis_r(&[0.0, 0.0, 1.0], dpsi);
+                    target_r = kinematics::mat_mul(&rz, &target_r);
+                }
+            }
+            (Pose::new(target_r, *p), auto_yaw)
+        }
+        GoalSpec::AbsoluteEx { p, r, auto_yaw } => {
+            let mut target_r = r.unwrap_or(start.r);
+            if *auto_yaw && input.arm.arm_dof() == 5 {
+                let r_start = (start.p[0] * start.p[0] + start.p[1] * start.p[1]).sqrt();
+                let r_target = (p[0] * p[0] + p[1] * p[1]).sqrt();
+                if r_start >= 0.03 && r_target >= 0.03 {
+                    let dpsi = p[1].atan2(p[0]) - start.p[1].atan2(start.p[0]);
+                    let rz = kinematics::axis_r(&[0.0, 0.0, 1.0], dpsi);
+                    target_r = kinematics::mat_mul(&rz, &target_r);
+                }
+            }
+            (Pose::new(target_r, *p), *auto_yaw)
+        }
         GoalSpec::Relative { frame, d, dyaw, dpitch, droll, level } => {
             let x_tool = kinematics::column(&start.r, 0);
-            match frame {
+            let pose = match frame {
                 RelFrame::Base => {
                     let p = kinematics::add(&start.p, d);
                     let mut r = start.r;
@@ -307,7 +348,8 @@ pub fn resolve_goal(input: &PlanInput, spec: &GoalSpec) -> Pose {
                     let goal = Pose::new(r, p);
                     if *level { kinematics::level(&goal, &rec, level_cos()) } else { goal }
                 }
-            }
+            };
+            (pose, false)
         }
     }
 }
@@ -369,7 +411,17 @@ pub fn parse_speed(body: &Value) -> Result<Speed, MotionError> {
 /// Body of `/api/v1/action/move_to`.
 pub fn parse_move_to(body: &Value) -> Result<(GoalSpec, Speed, Option<String>), MotionError> {
     let p = parse_position(body)?;
-    Ok((GoalSpec::Absolute { p, r: parse_orientation(body)? }, parse_speed(body)?, tag(body)?))
+    let r = parse_orientation(body)?;
+    let auto_yaw = match body.get("auto_yaw") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return Err(MotionError::InvalidCommand("auto_yaw must be a boolean".into())),
+    };
+    let spec = match auto_yaw {
+        Some(ay) => GoalSpec::AbsoluteEx { p, r, auto_yaw: ay },
+        None => GoalSpec::Absolute { p, r },
+    };
+    Ok((spec, parse_speed(body)?, tag(body)?))
 }
 
 /// `position: [x, y, z]` (finite numbers).

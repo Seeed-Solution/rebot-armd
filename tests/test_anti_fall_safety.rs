@@ -203,6 +203,7 @@ async fn test_is_at_safe_resting_pose_criteria() {
         JointState { position: 0.0, velocity: 0.0, torque: 3.2, temperature: 25.0 },
     ]);
     config.resting_pose = Some(armd::model::RestingPosePolicy {
+        positions: None,
         position_tolerances: vec![0.15, 0.08, 0.08], max_total_deviation: 0.22,
         max_velocity: 0.015, joint_max_velocities: vec![], support_torque_limits: vec![(1, 1.5), (2, 4.5)], support_load_limits: vec![], feedback_max_age_ms: 100,
     });

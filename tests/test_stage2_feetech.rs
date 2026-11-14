@@ -366,6 +366,7 @@ async fn test_supervisor_automatic_unload_with_load_feedback() {
     config.home_positions = vec![0.0, 0.0];
     // Policy with support_load_limits (no torque limits)
     config.resting_pose = Some(RestingPosePolicy {
+        positions: None,
         position_tolerances: vec![0.08, 0.08],
         max_total_deviation: 0.16,
         max_velocity: 0.015,

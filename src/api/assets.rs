@@ -14,15 +14,18 @@ use axum::{
 /// `SupervisorInner::new` (`assets/`, then the kit's `/usr/share/rebot-teleop/assets/`).
 /// `ARMD_ASSET_DIR` replaces the list.
 pub const ASSET_DIRS: [&str; 2] = ["assets", "/usr/share/rebot-teleop/assets"];
-const URDF_NAME: &str = "reBot-DevArm_gripper.urdf";
+pub const URDF_NAMES: [&str; 2] = ["reBot-DevArm_gripper.urdf", "so101_new_calib.urdf"];
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
-/// The first directory that holds the URDF, or `ARMD_ASSET_DIR` when set.
+/// The first directory that holds a known URDF, or `ARMD_ASSET_DIR` when set.
 pub fn asset_dir() -> Option<PathBuf> {
     if let Some(d) = std::env::var_os("ARMD_ASSET_DIR") {
         return Some(PathBuf::from(d));
     }
-    ASSET_DIRS.iter().map(PathBuf::from).find(|d| d.join(URDF_NAME).is_file())
+    ASSET_DIRS
+        .iter()
+        .map(PathBuf::from)
+        .find(|d| URDF_NAMES.iter().any(|name| d.join(name).is_file()))
 }
 
 fn content_type(path: &str) -> Option<&'static str> {
@@ -115,9 +118,14 @@ mod tests {
     fn tree() -> tempfile::TempDir {
         let t = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(t.path().join("assets/meshes")).unwrap();
-        std::fs::write(t.path().join("assets").join(URDF_NAME), "<robot/>").unwrap();
+        std::fs::create_dir_all(t.path().join("assets/so101_meshes")).unwrap();
+        for name in URDF_NAMES {
+            std::fs::write(t.path().join("assets").join(name), "<robot/>").unwrap();
+        }
         std::fs::write(t.path().join("assets/meshes/arm.bin"), "solid").unwrap();
         std::fs::write(t.path().join("assets/meshes/manifest.json"), "{}").unwrap();
+        std::fs::write(t.path().join("assets/so101_meshes/arm.bin"), "so101_solid").unwrap();
+        std::fs::write(t.path().join("assets/so101_meshes/manifest.json"), "{}").unwrap();
         std::fs::write(t.path().join("assets/meshes/run.sh"), "x").unwrap();
         std::fs::write(t.path().join("assets/meshes/huge.bin"), vec![b's'; (MAX_FILE_BYTES + 1) as usize]).unwrap();
         std::fs::write(t.path().join("secret.json"), "{}").unwrap();
@@ -128,9 +136,13 @@ mod tests {
     fn serves_known_files_under_the_dir() {
         let t = tree();
         let d = t.path().join("assets");
-        assert_eq!(resolve(&d, URDF_NAME).unwrap().1, "application/xml; charset=utf-8");
+        for name in URDF_NAMES {
+            assert_eq!(resolve(&d, name).unwrap().1, "application/xml; charset=utf-8");
+        }
         assert_eq!(resolve(&d, "meshes/arm.bin").unwrap().1, "application/octet-stream");
         assert_eq!(resolve(&d, "meshes/manifest.json").unwrap().1, "application/json");
+        assert_eq!(resolve(&d, "so101_meshes/arm.bin").unwrap().1, "application/octet-stream");
+        assert_eq!(resolve(&d, "so101_meshes/manifest.json").unwrap().1, "application/json");
     }
 
     #[test]

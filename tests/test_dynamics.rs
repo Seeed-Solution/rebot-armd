@@ -69,6 +69,7 @@ fn rnea_matches_a_urdf_chain_profile() {
     // the RobStride URDF (profiles/rebot_b601_rs.json chain) through the same chain code
     let spec = ChainSpec {
         base_link: "base_link".into(), tip_link: "gripper_end".into(),
+        tip_rpy_rad: [0.0; 3], canonical_end_frame: false,
         joints: (1..=6).map(|i| ChainJointSpec { urdf_joint: format!("joint{i}"), sign: 1.0, offset_rad: 0.0 }).collect(),
     };
     let chain = KinematicChain::from_urdf_str(include_str!("../assets/ReBot_Arm_RS.urdf"), &spec).unwrap();

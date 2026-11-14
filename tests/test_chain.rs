@@ -14,6 +14,8 @@ fn dm_spec() -> ChainSpec {
     ChainSpec {
         base_link: "base_link".into(),
         tip_link: "end_link".into(),
+        tip_rpy_rad: [0.0; 3],
+        canonical_end_frame: false,
         joints: (1..=6).map(|i| ChainJointSpec { urdf_joint: format!("joint{i}"), sign: 1.0, offset_rad: 0.0 }).collect(),
     }
 }

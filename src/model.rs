@@ -54,6 +54,9 @@ impl Default for JointState {
 /// Hardware-specific evidence required before automatic torque release.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestingPosePolicy {
+    /// Optional resting joint target (rad, length `dof`) used by `park` / `NormalUnload` instead of `home_positions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions: Option<Vec<f32>>,
     pub position_tolerances: Vec<f32>,
     pub max_total_deviation: f32,
     /// |velocity| limit (rad/s) for every joint without an entry in `joint_max_velocities`.
@@ -74,6 +77,7 @@ impl RestingPosePolicy {
     /// physical limits are 0.015 / 3 rad/s on J1-J3 and 1.5 / 4.5 N·m × 28 / 18 on J2 / J3.
     pub fn rebot_dm() -> Self {
         Self {
+            positions: None,
             position_tolerances: vec![0.15, 0.08, 0.08, 0.08, 0.08, 0.08],
             max_total_deviation: 0.22,
             max_velocity: 0.015,
@@ -869,6 +873,14 @@ impl ArmConfig {
     /// Number of arm joints of the kinematic / gravity model (6 for the built-in model).
     pub fn arm_dof(&self) -> usize { self.arm_model.arm_dof() }
 
+    /// Target joint positions for `NormalUnload` (`park`) and resting-pose checks.
+    pub fn resting_positions(&self) -> &[f32] {
+        self.resting_pose
+            .as_ref()
+            .and_then(|p| p.positions.as_deref())
+            .unwrap_or(&self.home_positions)
+    }
+
     /// Joints the resting-pose position check must cover: every joint before a trailing
     /// gripper (all joints when the gripper is not the last one or there is none).
     pub fn resting_arm_joints(&self) -> usize {
@@ -1107,6 +1119,13 @@ impl ArmConfig {
                 || policy.support_torque_limits.iter().any(|(i, t)| *i >= self.dof || !t.is_finite() || *t < 0.0)
                 || policy.support_load_limits.iter().any(|(i, l)| *i >= self.dof || !l.is_finite() || *l < 0.0) {
                 return Err("Invalid resting-pose policy".into());
+            }
+            if let Some(pos) = &policy.positions {
+                if pos.len() != self.dof
+                    || !pos.iter().zip(&self.limits).all(|(p, l)| p.is_finite() && *p >= l.min_position && *p <= l.max_position)
+                {
+                    return Err("Invalid resting-pose positions: must match dof, be finite, and stay within joint limits".into());
+                }
             }
         }
         if let Some(ft) = &self.feetech {
@@ -1349,6 +1368,9 @@ pub struct ArmObservation {
     /// Gripper joint state; null without a gripper joint and policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gripper: Option<GripperObs>,
+    /// Normalized servo load fraction per joint when `driver_capabilities.load_feedback` is true; omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loads: Option<Vec<f32>>,
 }
 
 /// Gripper zero state published in `observation.gripper_zero`.

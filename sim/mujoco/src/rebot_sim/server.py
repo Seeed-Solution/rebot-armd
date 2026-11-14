@@ -60,39 +60,55 @@ def _finite(v) -> float | None:
 
 
 class Motors:
-    """Damiao-like motor state and control law for the 7 actuators."""
+    """Motor state and control law for actuators (B601-DM 7-DOF or SO-101 6-DOF)."""
 
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData):
         self.model, self.data = model, data
         self.idx = Indexer(model)
+        self.dof = self.idx.dof
+        self.robot = self.idx.robot
         self.enabled = False
-        self.mode = ["pos_vel"] * DOF
-        self.q_t = np.zeros(DOF)
-        self.vlim = np.full(DOF, 2.0)
-        self.dq_t = np.zeros(DOF)
-        self.kp = np.zeros(DOF)
-        self.kd = np.zeros(DOF)
-        self.tau_ff = np.zeros(DOF)
-        self.extra = np.zeros(DOF)
+        self.mode = ["pos_vel"] * self.dof
+        self.q_t = np.zeros(self.dof)
+        self.vlim = np.full(self.dof, 2.0)
+        self.dq_t = np.zeros(self.dof)
+        self.kp = np.zeros(self.dof)
+        self.kd = np.zeros(self.dof)
+        self.tau_ff = np.zeros(self.dof)
+        self.extra = np.zeros(self.dof)
         # generalized-force mapping of each actuator (gear) on its joint dof
         self.gear = model.actuator_gear[:, 0].copy()
         self.dofs = np.array([model.jnt_dofadr[model.actuator_trnid[i, 0]] for i in range(model.nu)])
-        # J1..J6 range ends in motor angles (joint angle - model offset); +-inf for unlimited joints
-        jnts = [model.actuator_trnid[i, 0] for i in range(6)]
-        self.stop_lo = np.array([model.jnt_range[j, 0] if model.jnt_limited[j] else -np.inf for j in jnts]) - MODEL_OFFSETS_RAD
-        self.stop_hi = np.array([model.jnt_range[j, 1] if model.jnt_limited[j] else np.inf for j in jnts]) - MODEL_OFFSETS_RAD
+        if self.robot == "so-arm101":
+            self.torque_limit = np.full(self.dof, 2.94)
+            self.no_load_speed = np.full(self.dof, 50.0 * 2 * np.pi / 60)
+            self.kpos = np.full(self.dof, 25.0)
+            self.kv = np.full(self.dof, 2.0)
+            jnts = [model.actuator_trnid[i, 0] for i in range(min(model.nu, 5))]
+            self.stop_lo = np.array([model.jnt_range[j, 0] if model.jnt_limited[j] else -np.inf for j in jnts])
+            self.stop_hi = np.array([model.jnt_range[j, 1] if model.jnt_limited[j] else np.inf for j in jnts])
+        else:
+            self.torque_limit = TORQUE_LIMIT.copy()
+            self.no_load_speed = NO_LOAD_SPEED.copy()
+            self.kpos = KPOS.copy()
+            self.kv = KV.copy()
+            # J1..J6 range ends in motor angles (joint angle - model offset); +-inf for unlimited joints
+            jnts = [model.actuator_trnid[i, 0] for i in range(6)]
+            self.stop_lo = np.array([model.jnt_range[j, 0] if model.jnt_limited[j] else -np.inf for j in jnts]) - MODEL_OFFSETS_RAD
+            self.stop_hi = np.array([model.jnt_range[j, 1] if model.jnt_limited[j] else np.inf for j in jnts]) - MODEL_OFFSETS_RAD
 
     def set_enabled(self, enabled: bool) -> None:
         if enabled and not self.enabled:
             # On enable the motors hold where they are until a target arrives.
             self.q_t = self.idx.motor_positions(self.data)
-            self.mode = ["pos_vel"] * DOF
+            self.mode = ["pos_vel"] * self.dof
         self.enabled = enabled
 
-    @staticmethod
-    def parse_targets(targets) -> list[tuple] | None:
+    @classmethod
+    def parse_targets(cls, targets, dof: int | None = None) -> list[tuple] | None:
         """Validated targets (one tuple per joint), or None when any field is malformed."""
-        if not isinstance(targets, list) or len(targets) != DOF:
+        target_dof = DOF if dof is None else dof
+        if not isinstance(targets, list) or len(targets) != target_dof:
             return None
         out = []
         for t in targets:
@@ -115,7 +131,7 @@ class Motors:
 
     def set_targets(self, targets) -> bool:
         """Apply all targets, or none of them when one is malformed."""
-        parsed = self.parse_targets(targets)
+        parsed = self.parse_targets(targets, self.dof)
         if parsed is None:
             return False
         for i, t in enumerate(parsed):
@@ -134,43 +150,46 @@ class Motors:
             m.actuator_gainprm[:, 0] = 0.0
             m.actuator_biasprm[:, 2] = 0.0
             d.ctrl[:] = 0.0
-            m.actuator_forcerange[:, 0], m.actuator_forcerange[:, 1] = -TORQUE_LIMIT, TORQUE_LIMIT
-            self.extra = np.zeros(DOF)
+            m.actuator_forcerange[:, 0], m.actuator_forcerange[:, 1] = -self.torque_limit, self.torque_limit
+            self.extra = np.zeros(self.dof)
             return
-        extra = np.zeros(DOF)  # torque applied outside the velocity servo (N·m, motor side)
-        kv, ctrl = np.zeros(DOF), np.zeros(DOF)
-        bias = d.qfrc_bias[self.dofs[:6]]
-        for i in range(DOF):
+        extra = np.zeros(self.dof)  # torque applied outside the velocity servo (N·m, motor side)
+        kv, ctrl = np.zeros(self.dof), np.zeros(self.dof)
+        bias = d.qfrc_bias[self.dofs[:min(6, self.dof)]]
+        arm_dof = 5 if self.robot == "so-arm101" else 6
+        for i in range(self.dof):
             if self.mode[i] == "pos_vel":
-                vmax = min(self.vlim[i], NO_LOAD_SPEED[i])
-                ctrl[i] = np.clip(KPOS[i] * (self.q_t[i] - q[i]), -vmax, vmax)
-                kv[i] = KV[i]
-                if i < 6 and not self.on_stop(i, q[i], bias[i]):
+                vmax = min(self.vlim[i], self.no_load_speed[i])
+                ctrl[i] = np.clip(self.kpos[i] * (self.q_t[i] - q[i]), -vmax, vmax)
+                kv[i] = self.kv[i]
+                if i < arm_dof and not self.on_stop(i, q[i], bias[i]):
                     extra[i] = bias[i]
             else:
                 ctrl[i] = self.dq_t[i]
                 kv[i] = max(self.kd[i], 0.0)
                 extra[i] = self.kp[i] * (self.q_t[i] - q[i]) + self.tau_ff[i]
-        extra = np.clip(extra, -TORQUE_LIMIT, TORQUE_LIMIT)
+        extra = np.clip(extra, -self.torque_limit, self.torque_limit)
         m.actuator_gainprm[:, 0] = kv
         m.actuator_biasprm[:, 2] = -kv
         # the servo gets whatever torque the limit leaves after the extra term
-        m.actuator_forcerange[:, 0] = -TORQUE_LIMIT - extra
-        m.actuator_forcerange[:, 1] = TORQUE_LIMIT - extra
+        m.actuator_forcerange[:, 0] = -self.torque_limit - extra
+        m.actuator_forcerange[:, 1] = self.torque_limit - extra
         d.ctrl[:] = ctrl
         d.qfrc_applied[self.dofs] = self.gear * extra
         self.extra = extra
 
     def on_stop(self, i: int, q: float, bias: float) -> bool:
-        """Joint i (J1..J6) rests on a range end: position and target at it and the load
+        """Joint i (J1..J6 or J1..J5) rests on a range end: position and target at it and the load
         (bias torque: what a motor needs to hold) pushing into it."""
+        if i >= len(self.stop_hi):
+            return False
         hi, lo = self.stop_hi[i] - STOP_EPS, self.stop_lo[i] + STOP_EPS
         return (q >= hi and self.q_t[i] >= hi and bias < 0) or (q <= lo and self.q_t[i] <= lo and bias > 0)
 
     def reported_torque(self) -> np.ndarray:
         if not self.enabled:
-            return np.zeros(DOF)
-        return self.data.actuator_force[:DOF] + self.extra
+            return np.zeros(self.dof)
+        return self.data.actuator_force[:self.dof] + self.extra
 
 
 def set_joint_friction(model: mujoco.MjModel, damping=None, frictionloss=None) -> None:
@@ -185,11 +204,12 @@ def set_joint_friction(model: mujoco.MjModel, damping=None, frictionloss=None) -
 class Simulator:
     def __init__(self, port: int, host: str = "127.0.0.1", viewer: bool = False, damping=None, frictionloss=None,
                  torque_report: str = "instant", objects: str = "cube", seed: int | None = None,
-                 camera_mount: CameraMount | None = None):
+                 camera_mount: CameraMount | None = None, robot: str = "b601dm"):
+        self.robot = (robot or os.environ.get("REBOT_SIM_ROBOT") or "b601dm").lower()
         self.objects = parse_objects(objects)
         self.mount = camera_mount
         self.has_meshes = bool(os.environ.get("REBOT_DEVARM_DIR"))
-        self.model = load_model(objects=self.objects, camera=camera_mount)
+        self.model = load_model(objects=self.objects, camera=camera_mount, robot=self.robot)
         # physics and the scene resets run under this lock; sim_state reads under it
         self.lock = threading.Lock()
         self.stopping = False
@@ -233,7 +253,7 @@ class Simulator:
             self.peer = addr
             return
         enable, seq, targets = msg.get("enable", False), msg.get("seq", 0), msg.get("targets")
-        parsed = None if targets is None else Motors.parse_targets(targets)
+        parsed = None if targets is None else self.motors.parse_targets(targets, self.motors.dof)
         if (not isinstance(enable, bool) or isinstance(seq, bool) or not isinstance(seq, int) or seq < 0
                 or (targets is not None and parsed is None)):
             self.rejected += 1
@@ -260,15 +280,18 @@ class Simulator:
     def state_datagram(self) -> bytes:
         idx, d = self.motors.idx, self.data
         self.seq += 1
+        tau = self.torque_feedback()
         state = {
             "v": PROTOCOL_VERSION, "type": "state", "session": self.session, "seq": self.seq,
             "ack": self.ack, "enabled": self.motors.enabled,
             "q": idx.motor_positions(d).round(6).tolist(),
             "dq": idx.motor_velocities(d).round(6).tolist(),
-            "tau": self.torque_feedback().round(5).tolist(),
-            "temp": [TEMPERATURE_C] * DOF,
+            "tau": tau.round(5).tolist(),
+            "temp": [TEMPERATURE_C] * self.motors.dof,
             "t": round(d.time, 4),
         }
+        if self.motors.robot == "so-arm101":
+            state["loads"] = np.clip(np.abs(tau) / 2.94, 0.0, 1.0).round(4).tolist()
         return json.dumps(state, separators=(",", ":")).encode()
 
     def torque_feedback(self) -> np.ndarray:
@@ -482,6 +505,9 @@ def six_floats(text: str) -> list[float]:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="rebot-sim", description=__doc__.splitlines()[0])
+    parser.add_argument("--robot", choices=("b601dm", "so-arm101", "so_arm101"),
+                        default=os.environ.get("REBOT_SIM_ROBOT", "b601dm"),
+                        help="robot model: b601dm (default) or so-arm101")
     parser.add_argument("--port", type=int, default=47600, help="UDP port (default 47600)")
     parser.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1)")
     parser.add_argument("--headless", action="store_true", help="no viewer (the default; kept for scripts)")
@@ -560,7 +586,7 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("--viewer needs a display (DISPLAY / WAYLAND_DISPLAY not set)")
     sim = Simulator(args.port, args.host, viewer=viewer, damping=args.damping, frictionloss=args.frictionloss,
                     torque_report=args.torque_report, objects=args.objects, seed=args.seed,
-                    camera_mount=mount if args.camera else None)
+                    camera_mount=mount if args.camera else None, robot=args.robot)
     print(f"rebot-sim listening on udp://{args.host}:{args.port} (session {sim.session})", flush=True)
     if args.camera:
         w, h = (int(v) for v in args.camera_size.split("x"))

@@ -1,0 +1,226 @@
+{
+  "_note": "SO-ARM101 5-DOF follower arm with Feetech STS3215 bus servos (TheRobotStudio SO-ARM100/101 geometry and reCamera Eye-in-Hand camera mount).",
+  "profile_id": "so_arm101",
+  "profile_version": 1,
+  "dof": 6,
+  "joint_names": [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper"
+  ],
+  "limits": [
+    {
+      "name": "shoulder_pan",
+      "min_position": -1.91986,
+      "max_position": 1.91986,
+      "max_velocity": 2.0,
+      "max_acceleration": 5.0
+    },
+    {
+      "name": "shoulder_lift",
+      "min_position": -1.74533,
+      "max_position": 1.74533,
+      "max_velocity": 2.0,
+      "max_acceleration": 5.0
+    },
+    {
+      "name": "elbow_flex",
+      "min_position": -1.69,
+      "max_position": 1.69,
+      "max_velocity": 2.0,
+      "max_acceleration": 5.0
+    },
+    {
+      "name": "wrist_flex",
+      "min_position": -1.65806,
+      "max_position": 1.65806,
+      "max_velocity": 2.0,
+      "max_acceleration": 5.0
+    },
+    {
+      "name": "wrist_roll",
+      "min_position": -2.74,
+      "max_position": 2.74,
+      "max_velocity": 3.0,
+      "max_acceleration": 8.0
+    },
+    {
+      "name": "gripper",
+      "min_position": -0.174533,
+      "max_position": 1.745329,
+      "max_velocity": 3.0,
+      "max_acceleration": 8.0
+    }
+  ],
+  "home_positions": [
+    0.0,
+    -0.2,
+    0.5,
+    0.5,
+    0.0,
+    0.0
+  ],
+  "lease_timeout_ms": 2500,
+  "max_temperature": 70.0,
+  "control_frequency_hz": 50,
+  "planned_max_velocity": 0.5,
+  "kinematics": "Urdf",
+  "gravity_model": "Urdf",
+  "urdf": "../assets/so101_new_calib.urdf",
+  "urdf_sha256": "93d70892729a2f99813787a19dcb63fd5aba03c3a4c9928e1b6f18b5cd0ecba7",
+  "chain": {
+    "base_link": "base_link",
+    "tip_link": "gripper_frame_link",
+    "tip_rpy_rad": [
+      0.0,
+      -1.5707963267948966,
+      -1.5707963267948966
+    ],
+    "canonical_end_frame": true,
+    "joints": [
+      {
+        "urdf_joint": "shoulder_pan",
+        "sign": 1.0,
+        "offset_rad": 0.0
+      },
+      {
+        "urdf_joint": "shoulder_lift",
+        "sign": 1.0,
+        "offset_rad": 0.0
+      },
+      {
+        "urdf_joint": "elbow_flex",
+        "sign": 1.0,
+        "offset_rad": 0.0
+      },
+      {
+        "urdf_joint": "wrist_flex",
+        "sign": 1.0,
+        "offset_rad": 0.0
+      },
+      {
+        "urdf_joint": "wrist_roll",
+        "sign": 1.0,
+        "offset_rad": 0.0
+      }
+    ]
+  },
+  "gripper_joint": 5,
+  "camera_mount": {
+    "flip": false,
+    "rot_deg": 0.0,
+    "tilt_deg": -34.9454,
+    "offset_m": [
+      -0.047563,
+      -0.0079,
+      0.043112
+    ],
+    "body_size_m": [
+      0.046,
+      0.046,
+      0.046
+    ]
+  },
+  "resting_pose": {
+    "positions": [
+      0.0,
+      -1.65,
+      1.55,
+      0.5,
+      0.0,
+      0.0
+    ],
+    "position_tolerances": [
+      0.15,
+      0.15,
+      0.15,
+      0.15,
+      0.15
+    ],
+    "max_total_deviation": 0.3,
+    "max_velocity": 0.05,
+    "joint_max_velocities": [
+      0.05,
+      0.05,
+      0.05,
+      0.05,
+      0.05,
+      0.05
+    ],
+    "support_torque_limits": [],
+    "support_load_limits": [
+      [1, 0.25],
+      [2, 0.3]
+    ],
+    "feedback_max_age_ms": 100
+  },
+  "gripper_policy": {
+    "closed_rad": 0.0,
+    "open_rad": 1.5,
+    "holding_gap_rad": 0.08,
+    "holding_torque_nm": 0.0,
+    "holding_mode": "load_and_gap",
+    "holding_load_fraction": 0.18,
+    "squeeze_rad": 0.05,
+    "settle_ms": 300,
+    "zero_check_supported": false,
+    "jaw_opening": {
+      "points": [
+        [0.0, 0.0],
+        [1.5, 0.065]
+      ],
+      "calibrated": false
+    }
+  },
+  "workspace": {
+    "floor_z_m": 0.0,
+    "box_min_m": [
+      -0.45,
+      -0.45,
+      -0.05
+    ],
+    "box_max_m": [
+      0.45,
+      0.45,
+      0.45
+    ],
+    "max_reach_m": 0.40,
+    "check_points_end_m": [
+      [0.0, 0.0, 0.0],
+      [0.03, 0.0, 0.0]
+    ]
+  },
+  "grasp": {
+    "table_z_m": 0.0,
+    "approach_height_m": 0.14,
+    "grasp_height_m": 0.015,
+    "lift_height_m": 0.11,
+    "camera_tilt_deg": -34.9454,
+    "align_j6": false
+  },
+  "hardware": {
+    "physical_estop": false,
+    "notes": [
+      "SO-101 5-DOF arm + gripper with Feetech STS3215 serial bus servos"
+    ]
+  },
+  "feetech": {
+    "return_delay_raw": 0,
+    "p_coef": 32,
+    "d_coef": 32,
+    "i_coef": 0,
+    "max_torque_raw": 1000,
+    "protection_current_raw": 250,
+    "joints": [
+      { "id": 1, "zero_step": 2048 },
+      { "id": 2, "zero_step": 2048 },
+      { "id": 3, "zero_step": 2048 },
+      { "id": 4, "zero_step": 2048 },
+      { "id": 5, "zero_step": 2048 },
+      { "id": 6, "zero_step": 2048 }
+    ]
+  }
+}

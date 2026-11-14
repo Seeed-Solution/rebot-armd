@@ -95,6 +95,8 @@ pub fn rebot_dm_chain(offsets: &[f64; 6]) -> &'static KinematicChain {
     let spec = ChainSpec {
         base_link: "base_link".into(),
         tip_link: "end_link".into(),
+        tip_rpy_rad: [0.0; 3],
+        canonical_end_frame: false,
         joints: (1..=6).map(|i| ChainJointSpec { urdf_joint: format!("joint{i}"), sign: 1.0, offset_rad: offsets[i - 1] }).collect(),
     };
     let chain: &'static KinematicChain = Box::leak(Box::new(

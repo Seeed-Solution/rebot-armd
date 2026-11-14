@@ -832,6 +832,7 @@ impl SupervisorInner {
         } else {
             None
         };
+        let driver_capabilities = self.driver.as_ref().and_then(|d| d.lock().ok().map(|drv| drv.capabilities())).unwrap_or_default();
         ArmObservation {
             timestamp,
             positions: self.measured_positions.clone(),
@@ -843,7 +844,7 @@ impl SupervisorInner {
             epoch_id: self.safety.epoch_id(),
             gravity_compensated: self.gravity_output_enabled(),
             gravity_torques: self.gravity_torques.clone(),
-            driver_capabilities: self.driver.as_ref().and_then(|d| d.lock().ok().map(|drv| drv.capabilities())).unwrap_or_default(),
+            driver_capabilities,
             enable_state: self.driver.as_ref().map_or(if self.is_torqued { EnableState::Enabled } else { EnableState::Disabled }, |d| d.lock().map_or(EnableState::Unknown, |drv| drv.enable_state())),
             feedback_age_ms: self.driver.as_ref().and_then(|d| d.lock().ok().map(|drv| drv.feedback_ages().iter().map(|a| a.map(|v| v.as_millis().min(u64::MAX as u128) as u64)).collect())).unwrap_or_else(|| vec![Some(0); self.config.dof]),
             disable_pending: self.disable_pending,
@@ -864,6 +865,7 @@ impl SupervisorInner {
             gripper_zero: self.gripper_zero_observation(),
             tcp,
             gripper,
+            loads: (driver_capabilities.load_feedback && self.loads.len() == self.config.dof).then(|| self.loads.clone()),
         }
     }
 
@@ -922,8 +924,9 @@ impl SupervisorInner {
         }
         let mut failures = Vec::new();
         let mut total = 0.0;
+        let rest = self.config.resting_positions();
         for (i, tolerance) in policy.position_tolerances.iter().enumerate().take(dof) {
-            let dev = (self.measured_positions[i] - self.config.home_positions[i]).abs();
+            let dev = (self.measured_positions[i] - rest[i]).abs();
             if !dev.is_finite() || dev > *tolerance {
                 failures.push(format!("joint {} off home by {dev:.4} rad (limit {tolerance})", i + 1));
             }
@@ -1129,7 +1132,7 @@ impl SupervisorInner {
             tracing::warn!("Torque off refused, not at resting pose: {reason}");
             return Err(SafetyError::ArmNotAtRestingPose {
                 current: self.measured_positions.clone(),
-                expected: self.config.home_positions.clone(),
+                expected: self.config.resting_positions().to_vec(),
             });
         }
 
@@ -1197,7 +1200,7 @@ impl SupervisorInner {
                     || matches!(self.safety.state(), SafetyState::Idle)
                 );
                 if can_unload {
-                    let home = self.config.home_positions.clone();
+                    let home = self.config.resting_positions().to_vec();
                     let clamped_start: Vec<f32> = self
                         .commanded_positions
                         .iter()
@@ -2136,7 +2139,7 @@ impl SupervisorInner {
     }
 
     fn start_path_motion(&mut self, input: &PlanInput, path: &JointPath) -> Result<f64, ArmError> {
-        let last = path.last().to_vec();
+        let last = path.last_slice().to_vec();
         self.safety.validate_motion_command(Some(input.epoch), &last, &self.config.limits)?;
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
@@ -2866,7 +2869,7 @@ impl SupervisorInner {
         }
         // Not yet stably at rest: hold the home target. Gripper keeps its command: driving it to the
         // home value would squeeze anything still in the jaw at full motor torque.
-        let mut home = self.config.home_positions.clone();
+        let mut home = self.config.resting_positions().to_vec();
         if let Some(g_idx) = self.config.gripper_index() {
             if home.len() > g_idx && self.commanded_positions.len() > g_idx { home[g_idx] = self.commanded_positions[g_idx]; }
         }

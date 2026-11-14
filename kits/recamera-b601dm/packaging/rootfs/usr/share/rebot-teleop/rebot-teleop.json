@@ -30,7 +30,7 @@
             "type": "select",
             "title": "Arm Model",
             "title_zh": "机械臂型号",
-            "options": ["rebot-dm", "mock"],
+            "options": ["rebot-dm", "so-arm101", "mock"],
             "default": "rebot-dm"
           },
           {
@@ -38,6 +38,7 @@
             "type": "serial_port",
             "title": "Port / CAN Interface",
             "title_zh": "从手通信端口/CAN接口",
+            "options": ["can0", "/dev/ttySC0", "/dev/ttyACM0", "/dev/ttyUSB0"],
             "default": "can0"
           },
           {

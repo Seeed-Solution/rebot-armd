@@ -32,6 +32,10 @@ pub const G: f64 = 9.81;
 pub struct ChainSpec {
     pub base_link: String,
     pub tip_link: String,
+    #[serde(default)]
+    pub tip_rpy_rad: [f64; 3],
+    #[serde(default)]
+    pub canonical_end_frame: bool,
     /// One entry per arm joint, armd joint order (= URDF path order).
     pub joints: Vec<ChainJointSpec>,
 }
@@ -78,6 +82,9 @@ pub struct KinematicChain {
     pub(crate) offset: Vec<f64>,
     /// Last joint's frame -> tip_link.
     tip: Tf,
+    /// Fixed rotation from tip_link to canonical end_link.
+    pub tip_rot: Mat3,
+    pub canonical_end_frame: bool,
     /// Lumped mass (kg) and centre of mass of each segment; segment 0 is fixed to the base,
     /// segment `j + 1` moves with joint `j` (expressed in that joint's rotated frame).
     seg_mass: Vec<f64>,
@@ -199,6 +206,8 @@ impl KinematicChain {
             std::array::from_fn(|a| std::array::from_fn(|b| j_sum[sg][a][b] - back[a][b]))
         }).collect();
 
+        let tip_rot = k::rpy_to_r(spec.tip_rpy_rad[0], spec.tip_rpy_rad[1], spec.tip_rpy_rad[2]);
+
         Ok(Self {
             robot: urdf.name.clone(),
             base_link: spec.base_link.clone(),
@@ -208,6 +217,8 @@ impl KinematicChain {
             sign: spec.joints.iter().map(|j| j.sign).collect(),
             offset: spec.joints.iter().map(|j| j.offset_rad).collect(),
             tip,
+            tip_rot,
+            canonical_end_frame: spec.canonical_end_frame,
             seg_mass: m_sum,
             seg_com,
             seg_inertia,
@@ -249,6 +260,7 @@ impl KinematicChain {
         }
         p = k::add(&p, &k::mat_vec(&r, &self.tip.1));
         r = k::mat_mul(&r, &self.tip.0);
+        r = k::mat_mul(&r, &self.tip_rot);
         ChainFrames { n, end: Pose { r, p }, axes, origins, seg_r }
     }
 
@@ -268,6 +280,11 @@ impl KinematicChain {
     /// dq = Jᵀ (J Jᵀ + λ² I)⁻¹ e with the 6x6 system solved by Cholesky. `q0`, `lo`, `hi`
     /// need at least `n` entries.
     pub fn solve_dls(&self, goal: &Pose, q0: &[f64], lo: &[f64], hi: &[f64], w: f64, iters: usize) -> ChainIk {
+        self.solve_dls_ex(goal, q0, lo, hi, w, iters, false)
+    }
+
+    /// Damped-least-squares IK for `n` joints, with optional `yaw_free` (auto_yaw) for 5-DOF chains.
+    pub fn solve_dls_ex(&self, goal: &Pose, q0: &[f64], lo: &[f64], hi: &[f64], w: f64, iters: usize, yaw_free: bool) -> ChainIk {
         let n = self.dof();
         let mut lo_w = [0.0; MAX_CHAIN_JOINTS];
         let mut hi_w = [0.0; MAX_CHAIN_JOINTS];
@@ -280,7 +297,27 @@ impl KinematicChain {
         let q_start = q;
         let (rg, pg) = (&goal.r, &goal.p);
         let mut f = self.frames(&q);
-        let mut e = k::pose_err_end(&f.end, rg, pg, w);
+
+        let x_tool = k::column(rg, 0);
+        let vertical = (1.0 - x_tool[2].abs()) < 1e-3;
+        let r_xy = (goal.p[0] * goal.p[0] + goal.p[1] * goal.p[1]).sqrt();
+        let use_auto_yaw = yaw_free && n == 5 && !vertical && r_xy >= 0.03;
+
+        let align_rot = |r_curr: &Mat3| -> Mat3 {
+            if use_auto_yaw {
+                let m = k::mat_mul(rg, &k::transpose(r_curr));
+                let a = m[0][0] + m[1][1];
+                let b = m[0][1] - m[1][0];
+                let dpsi = b.atan2(a);
+                k::mat_mul(&k::axis_r(&[0.0, 0.0, 1.0], dpsi), rg)
+            } else {
+                *rg
+            }
+        };
+
+        let mut r_eff = align_rot(&f.end.r);
+        let mut e = k::pose_err_end(&f.end, &r_eff, pg, w);
+        if use_auto_yaw { e.e[5] = 0.0; }
         let mut lam = PAR.lam_min;
         let mut it = 0;
         if !(e.ep < f64::INFINITY && e.er < f64::INFINITY) {
@@ -292,7 +329,8 @@ impl KinematicChain {
             for j in 0..n {
                 let a = f.axes[j];
                 let v = k::cross(&a, &k::sub(&f.end.p, &f.origins[j]));
-                jac[j] = [v[0], v[1], v[2], w * a[0], w * a[1], w * a[2]];
+                let az = if use_auto_yaw { 0.0 } else { w * a[2] };
+                jac[j] = [v[0], v[1], v[2], w * a[0], w * a[1], az];
             }
             let mut m = [0.0f64; 36];
             for r in 0..6 {
@@ -316,15 +354,18 @@ impl KinematicChain {
             let mut qn = [0.0; MAX_CHAIN_JOINTS];
             for i in 0..n { qn[i] = hi_w[i].min(lo_w[i].max(q[i] + kk * dq[i])); }
             let fn_ = self.frames(&qn);
-            let en = k::pose_err_end(&fn_.end, rg, pg, w);
+            let r_eff_n = align_rot(&fn_.end.r);
+            let mut en = k::pose_err_end(&fn_.end, &r_eff_n, pg, w);
+            if use_auto_yaw { en.e[5] = 0.0; }
             if en.ep + w * en.er < e.ep + w * e.er {
-                q = qn; f = fn_; e = en; lam = PAR.lam_min;
+                q = qn; f = fn_; e = en; r_eff = r_eff_n; lam = PAR.lam_min;
             } else if lam < PAR.lam_max {
                 lam = PAR.lam_max;
             } else {
-                q = qn; f = fn_; e = en;
+                q = qn; f = fn_; e = en; r_eff = r_eff_n;
             }
         }
+        let _ = r_eff;
         ChainIk { ok: e.ep <= PAR.tol_pos && e.er <= PAR.tol_rot, q, ep: e.ep, er: e.er, iterations: it }
     }
 
@@ -436,9 +477,13 @@ impl ArmModel {
         Some(self.fk(&q64))
     }
 
-    /// 6-joint DLS IK (the Cartesian actions). A chain with another joint count returns
-    /// `ok: false`.
+    /// DLS IK (the Cartesian actions).
     pub fn solve_dls(&self, goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], w: f64) -> IkResult {
+        self.solve_dls_ex(goal, q0, lo, hi, w, false)
+    }
+
+    /// DLS IK with optional `yaw_free` for 5-DOF chains.
+    pub fn solve_dls_ex(&self, goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], w: f64, yaw_free: bool) -> IkResult {
         match self {
             Self::RebotDevArm(off) => {
                 let m = |q: &[f64; 6]| Self::builtin_q(off, q);
@@ -448,6 +493,13 @@ impl ArmModel {
             Self::Chain(c) if c.dof() == 6 => {
                 let r = c.solve_dls(goal, q0, lo, hi, w, PAR.iters);
                 IkResult { ok: r.ok, q: std::array::from_fn(|i| r.q[i]), ep: r.ep, er: r.er, iterations: r.iterations }
+            }
+            Self::Chain(c) if c.dof() == 5 => {
+                let iters = 35;
+                let r = c.solve_dls_ex(goal, q0, lo, hi, w, iters, yaw_free);
+                let mut q = *q0;
+                q[..5].copy_from_slice(&r.q[..5]);
+                IkResult { ok: r.ok, q, ep: r.ep, er: r.er, iterations: r.iterations }
             }
             Self::Chain(_) => IkResult { ok: false, q: *q0, ep: f64::INFINITY, er: f64::INFINITY, iterations: 0 },
         }
@@ -503,10 +555,15 @@ impl ArmModel {
 
     /// Camera mount R_tip_cam (`kinematics::cam_mount`): the wrist axis (second-to-last joint)
     /// seen in the tip frame with the last joint at armd angle pi/2 (the B601-DM rest angle of
-    /// J6), the other joints at armd 0.
+    /// J6), the other joints at armd 0. For a canonical end frame, computes R_end_cam directly.
     pub fn cam_mount(&self, flip: bool, rot_deg: f64, tilt_deg: f64) -> Mat3 {
         match self {
             Self::RebotDevArm(off) => k::cam_mount_with(off, flip, rot_deg, tilt_deg),
+            Self::Chain(c) if c.canonical_end_frame => {
+                let end_r = k::IDENTITY;
+                let wrist_axis = [0.0, 0.0, -1.0];
+                k::cam_mount_from(&end_r, &wrist_axis, flip, rot_deg, tilt_deg)
+            }
             Self::Chain(c) => {
                 let n = c.dof();
                 let mut q = [0.0; MAX_CHAIN_JOINTS];

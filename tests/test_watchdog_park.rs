@@ -10,7 +10,7 @@ use armd::{ArmSupervisor, SafetyState};
 const LEASE_MS: u64 = 50;
 
 fn policy(dof: usize) -> RestingPosePolicy {
-    RestingPosePolicy { position_tolerances: vec![0.08; dof], max_total_deviation: 0.08 * dof as f32,
+    RestingPosePolicy { positions: None, position_tolerances: vec![0.08; dof], max_total_deviation: 0.08 * dof as f32,
         max_velocity: 0.015, joint_max_velocities: vec![], support_torque_limits: vec![(0, 1.0)], support_load_limits: vec![], feedback_max_age_ms: 100 }
 }
 

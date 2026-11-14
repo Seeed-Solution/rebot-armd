@@ -138,6 +138,16 @@ pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
     let speed = request.speed();
     let start = input.arm.fk(&input.q0);
     let mut r_place = request.orientation.unwrap_or(start.r);
+    let is_5dof = input.arm.arm_dof() == 5;
+    if is_5dof && request.orientation.is_none() && request.pose.is_none() {
+        let r_start = (start.p[0] * start.p[0] + start.p[1] * start.p[1]).sqrt();
+        let r_target = (request.target[0] * request.target[0] + request.target[1] * request.target[1]).sqrt();
+        if r_start >= 0.03 && r_target >= 0.03 {
+            let dpsi = request.target[1].atan2(request.target[0]) - start.p[1].atan2(start.p[0]);
+            let rz = kinematics::axis_r(&[0.0, 0.0, 1.0], dpsi);
+            r_place = kinematics::mat_mul(&rz, &r_place);
+        }
+    }
     let mut orientation_levelled = false;
     if held_spill_safe {
         let tool_z = kinematics::column(&r_place, 0)[2];
@@ -147,9 +157,10 @@ pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
             orientation_levelled = true;
         }
     }
+    let yaw_free = is_5dof && request.orientation.is_none();
     let mut cur = input.clone();
     let step = |cur: &mut PlanInput, goal: Pose| -> Result<f64, ArmError> {
-        let path = motion::plan_cartesian(cur, goal, speed)?;
+        let path = motion::plan_cartesian_ex(cur, goal, speed, yaw_free)?;
         let last = path.last();
         cur.q0 = std::array::from_fn(|i| f64::from(last[i]));
         Ok(path.duration)

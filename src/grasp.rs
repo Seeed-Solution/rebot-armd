@@ -514,7 +514,7 @@ impl HttpDetectionSource {
             (Some(w), Some(h)) if w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 => [w, h],
             _ => self.image_size_px,
         };
-        let depth = v.get("depth").and_then(|d| {
+        let depth = v.get("depth").map(|d| {
             let metric_model = d.get("metric_model").and_then(Value::as_bool).unwrap_or(false);
             let table_samples = d.get("table_samples").and_then(Value::as_array).map(|arr| {
                 arr.iter().filter_map(|item| {
@@ -530,7 +530,7 @@ impl HttpDetectionSource {
                     None
                 }).collect::<Vec<[f64; 3]>>()
             }).unwrap_or_default();
-            Some(DepthFrameInfo { metric_model, table_samples })
+            DepthFrameInfo { metric_model, table_samples }
         });
         let detections = parse_detections(v.get("detections").unwrap_or(&Value::Null), size);
         Some(DetectionFrame { frame_id, captured_at, image_size_px: size, detections, depth })
@@ -1191,7 +1191,7 @@ pub fn measure_detection_depth_with_cal(
 ) -> Option<DepthMeasurement> {
     if det.depth_conf.unwrap_or(0.0) < 0.35 { return None; }
     let (Some(disp_fg), Some(disp_bg)) = (det.disp_fg, det.disp_bg) else { return None; };
-    if !(disp_fg > disp_bg) { return None; }
+    if disp_fg <= disp_bg { return None; }
     let denom_fg = cal.a * disp_fg + cal.b;
     let denom_bg = cal.a * disp_bg + cal.b;
     if !(denom_fg > 0.1 && denom_bg > 0.1) { return None; }
@@ -1202,7 +1202,7 @@ pub fn measure_detection_depth_with_cal(
     let centre_px = cam.to_px(box_centre(&det.box_norm));
     let ray = cam.ray_world_per_z(pose, centre_px);
     let h_raw = (z_bg - z_fg) * ray[2].abs();
-    if !(h_raw > 0.002) { return None; }
+    if h_raw <= 0.002 { return None; }
     let h = h_raw.max(0.005);
 
     let depth_m = z_fg;
@@ -1436,7 +1436,7 @@ pub struct PlannedGrasp {
 pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<PendingGrasp, ArmError> {
     if !body.is_object() { return Err(MotionError::InvalidCommand("Command body must be an object".into()).into()); }
     let Some(base) = inner.grasp_setup() else {
-        return Err(MotionError::Unsupported("Grasp needs a 7-DOF profile with kinematics, a gripper policy and a grasp setup".into()).into());
+        return Err(MotionError::Unsupported("Grasp needs a profile with kinematics, a gripper policy and a grasp setup".into()).into());
     };
     let Some(policy) = inner.config.gripper_policy.clone() else {
         return Err(MotionError::Unsupported("Grasp needs a gripper policy".into()).into());
@@ -2483,7 +2483,8 @@ impl Orchestrator {
                     let over = {
                         let inner = self.sup.inner().read().await;
                         if !inner.active_trajectory.as_ref().is_some_and(|t| t.action_id == Some(self.id)) { continue; }
-                        let trk = (0..6).map(|i| (inner.commanded_positions[i] - inner.measured_positions[i]).abs()).fold(0.0f32, f32::max);
+                        let arm_dof = inner.config.arm_dof();
+                        let trk = (0..arm_dof).map(|i| (inner.commanded_positions[i] - inner.measured_positions[i]).abs()).fold(0.0f32, f32::max);
                         peak_trk = Some(peak_trk.unwrap_or(0.0).max(trk));
                         let Some(r) = inner.residual_torques else { continue };
                         let pk = peak_res.get_or_insert([0.0; 2]);
@@ -2518,11 +2519,12 @@ impl Orchestrator {
         if let Err(reason) = align_guard(&c.last, &c.frames, self.cam.size) { return (None, format!("skipped:{reason}")); }
         let pose = self.pose().await;
         let inner = self.sup.inner().read().await;
-        let (q6, lim) = (f64::from(inner.commanded_positions[5]), inner.config.limits[5].clone());
-        // a roll t about the tool axis moves the J6 motor by sign * t
-        let sign = inner.config.arm_model.joint_map().get(5).map_or(1.0, |m| m.sign);
+        let roll_idx = inner.config.arm_dof() - 1;
+        let (q_roll, lim) = (f64::from(inner.commanded_positions[roll_idx]), inner.config.limits[roll_idx].clone());
+        // a roll t about the tool axis moves the roll motor by sign * t
+        let sign = inner.config.arm_model.joint_map().get(roll_idx).map_or(1.0, |m| m.sign);
         drop(inner);
-        let room = |t: f64| { let q = q6 + sign * t; q >= f64::from(lim.min_position) + 0.1 && q <= f64::from(lim.max_position) - 0.1 };
+        let room = |t: f64| { let q = q_roll + sign * t; q >= f64::from(lim.min_position) + 0.1 && q <= f64::from(lim.max_position) - 0.1 };
         if let Some((alpha, spread)) = frames_angle(&c.frames, self.setup.align_min_angle_conf) {
             self.sup.inner().write().await.update_action(self.id, |a| {
                 a.angle_spread_deg = Some(spread as f32);

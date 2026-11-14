@@ -592,7 +592,19 @@ start() {
     start_wifi
 
     # 探测实际端口与 CAN 总线初始化
-    if [ "$FOLLOWER_PORT" = "can0" ]; then
+    if [ "$FOLLOWER_MODEL" = "so-arm101" ] || [ "$FOLLOWER_MODEL" = "so-arm100" ]; then
+        if [ -z "$FOLLOWER_PORT" ] || [ "$FOLLOWER_PORT" = "can0" ] || [ ! -e "$FOLLOWER_PORT" ]; then
+            if [ -e "/dev/ttySC0" ]; then
+                FOLLOWER_PORT="/dev/ttySC0"
+            elif [ -e "/dev/ttyACM0" ]; then
+                FOLLOWER_PORT="/dev/ttyACM0"
+            elif [ -e "/dev/ttyUSB0" ]; then
+                FOLLOWER_PORT="/dev/ttyUSB0"
+            else
+                FOLLOWER_PORT="/dev/ttySC0"
+            fi
+        fi
+    elif [ "$FOLLOWER_PORT" = "can0" ]; then
         echo "[rebot-teleop] Ensuring can0 interface is up (1Mbps, restart-ms 100, qlen 1000)..."
         ip link set can0 down 2>/dev/null || true
         ip link set can0 type can bitrate 1000000 restart-ms 100 2>/dev/null || true
@@ -616,6 +628,10 @@ start() {
     # that arm (7 joints, Cartesian actions). Other followers keep their built-in profile.
     if { [ "$FOLLOWER_MODEL" = "rebot-dm" ] || [ "$FOLLOWER_MODEL" = "mock" ]; } && [ -f "$PROFILE" ]; then
         DAEMON_OPTS="$DAEMON_OPTS --config $PROFILE"
+    elif [ "$FOLLOWER_MODEL" = "so-arm101" ] && [ -f "/usr/share/rebot-teleop/profile/so_arm101.json" ]; then
+        DAEMON_OPTS="$DAEMON_OPTS --config /usr/share/rebot-teleop/profile/so_arm101.json"
+    elif [ "$FOLLOWER_MODEL" = "so-arm100" ] && [ -f "/usr/share/rebot-teleop/profile/so_arm100.json" ]; then
+        DAEMON_OPTS="$DAEMON_OPTS --config /usr/share/rebot-teleop/profile/so_arm100.json"
     fi
 
     # armd runs as root; it falls back to stdout only when these cannot be written

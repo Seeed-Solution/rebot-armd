@@ -1218,6 +1218,7 @@ async fn unsupported_automatic_unload_rejects_without_motion_but_home_remains_av
         {
             let mut inner = supervisor.inner().write().await;
             inner.config.resting_pose = if missing == "profile" { None } else { Some(armd::model::RestingPosePolicy {
+                positions: None,
                 position_tolerances: vec![0.08; 2], max_total_deviation: 0.16, max_velocity: 0.015, joint_max_velocities: vec![],
                 support_torque_limits: vec![(1, 1.0)], support_load_limits: vec![], feedback_max_age_ms: 100,
             }) };
@@ -1259,6 +1260,7 @@ async fn unsupported_automatic_unload_rejects_without_motion_but_home_remains_av
     supervisor.set_driver(Box::new(UnloadCapabilityDriver { capabilities: full })).await;
     let mut inner = supervisor.inner().write().await;
     inner.config.resting_pose = Some(armd::model::RestingPosePolicy {
+        positions: None,
         position_tolerances: vec![0.08; 2], max_total_deviation: 0.16, max_velocity: 0.015, joint_max_velocities: vec![],
         support_torque_limits: vec![(1, 1.0)], support_load_limits: vec![], feedback_max_age_ms: 100,
     });

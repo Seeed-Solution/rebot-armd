@@ -11,10 +11,13 @@ import numpy as np
 
 MODEL_DIR = Path(__file__).resolve().parents[2] / "models"
 SCENE_XML = MODEL_DIR / "rebot_b601dm_scene.xml"
+SO101_SCENE_XML = MODEL_DIR / "so_arm101_scene.xml"
 
 ARM_JOINTS = [f"joint{i}" for i in range(1, 7)]
+SO101_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 DOF = 7
 KIT_PROFILE = Path(__file__).resolve().parents[4] / "kits" / "recamera-b601dm" / "profile" / "rebot-b601dm.json"
+SO101_PROFILE = Path(__file__).resolve().parents[4] / "profiles" / "so_arm101.json"
 # armd motor -> URDF (MuJoCo) joint angle offsets J1..J6: URDF = motor + offset. B601-DM: J6 =
 # motor - pi/2 (armd kinematics::B601DM_MODEL_OFFSETS_RAD, profile field model_offsets_rad).
 B601DM_MODEL_OFFSETS_RAD = (0.0, 0.0, 0.0, 0.0, 0.0, -math.pi / 2)
@@ -46,12 +49,23 @@ _UPSTREAM_MESHES = {
 BOX_GROUP = 3
 
 
-def load_model(devarm_dir: str | None = None, objects=None, camera=None) -> mujoco.MjModel:
+def load_model(devarm_dir: str | None = None, objects=None, camera=None, robot: str | None = None) -> mujoco.MjModel:
     """Compile the scene; with a reBot-DevArm checkout, add its link meshes as visuals.
 
     `objects` (list of `scene.SceneObject`) replaces the XML's cube; `camera` (a
     `camera.CameraMount`) adds the `wrist` and `scene` cameras.
     """
+    target_robot = (robot or os.environ.get("REBOT_SIM_ROBOT") or "b601dm").lower()
+    if target_robot in ("so-arm101", "so_arm101"):
+        scene_xml = SO101_SCENE_XML
+        if objects is None and camera is None:
+            return mujoco.MjModel.from_xml_path(str(scene_xml))
+        spec = mujoco.MjSpec.from_file(str(scene_xml))
+        if objects is not None:
+            from .scene import add_objects
+            add_objects(spec, objects)
+        return spec.compile()
+
     devarm_dir = devarm_dir if devarm_dir is not None else os.environ.get("REBOT_DEVARM_DIR")
     if not devarm_dir and objects is None and camera is None:
         return mujoco.MjModel.from_xml_path(str(SCENE_XML))
@@ -82,30 +96,47 @@ def load_model(devarm_dir: str | None = None, objects=None, camera=None) -> mujo
 
 
 class Indexer:
-    """qpos / qvel addresses of the arm joints and the left jaw slide."""
+    """qpos / qvel addresses of the arm joints and gripper."""
 
     def __init__(self, model: mujoco.MjModel):
-        joints = ARM_JOINTS + ["finger_left"]
-        self.qpos = np.array([model.jnt_qposadr[model.joint(j).id] for j in joints])
-        self.qvel = np.array([model.jnt_dofadr[model.joint(j).id] for j in joints])
-        self.right_qpos = model.jnt_qposadr[model.joint("finger_right").id]
+        joint_names = {model.joint(i).name for i in range(model.njnt)}
+        if "shoulder_pan" in joint_names:
+            self.robot = "so-arm101"
+            self.dof = 6
+            self.joints = SO101_JOINTS
+            self.qpos = np.array([model.jnt_qposadr[model.joint(j).id] for j in self.joints])
+            self.qvel = np.array([model.jnt_dofadr[model.joint(j).id] for j in self.joints])
+            self.right_qpos = None
+        else:
+            self.robot = "b601dm"
+            self.dof = 7
+            self.joints = ARM_JOINTS + ["finger_left"]
+            self.qpos = np.array([model.jnt_qposadr[model.joint(j).id] for j in self.joints])
+            self.qvel = np.array([model.jnt_dofadr[model.joint(j).id] for j in self.joints])
+            self.right_qpos = model.jnt_qposadr[model.joint("finger_right").id] if "finger_right" in joint_names else None
 
     def motor_positions(self, data: mujoco.MjData) -> np.ndarray:
-        """armd motor angles J1..J7 (rad)."""
+        """armd motor angles (rad)."""
         q = data.qpos[self.qpos].copy()
-        q[:6] -= MODEL_OFFSETS_RAD
-        q[6] = -q[6] / JAW_M_PER_RAD
+        if self.robot == "b601dm":
+            q[:6] -= MODEL_OFFSETS_RAD
+            q[6] = -q[6] / JAW_M_PER_RAD
         return q
 
     def motor_velocities(self, data: mujoco.MjData) -> np.ndarray:
         dq = data.qvel[self.qvel].copy()
-        dq[6] = -dq[6] / JAW_M_PER_RAD
+        if self.robot == "b601dm":
+            dq[6] = -dq[6] / JAW_M_PER_RAD
         return dq
 
     def set_motor_positions(self, data: mujoco.MjData, q) -> None:
         q = np.asarray(q, dtype=float)
-        data.qpos[self.qpos[:6]] = q[:6] + MODEL_OFFSETS_RAD
-        if len(q) > 6:
-            jaw = -q[6] * JAW_M_PER_RAD
-            data.qpos[self.qpos[6]] = jaw
-            data.qpos[self.right_qpos] = jaw
+        if self.robot == "b601dm":
+            data.qpos[self.qpos[:6]] = q[:6] + MODEL_OFFSETS_RAD
+            if len(q) > 6:
+                jaw = -q[6] * JAW_M_PER_RAD
+                data.qpos[self.qpos[6]] = jaw
+                if self.right_qpos is not None:
+                    data.qpos[self.right_qpos] = jaw
+        else:
+            data.qpos[self.qpos[:len(q)]] = q

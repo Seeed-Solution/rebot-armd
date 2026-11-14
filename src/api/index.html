@@ -2469,9 +2469,14 @@ const S = {
   detections: [],
   detLastReceivedAt: 0,
   ui: 'simple',               // simple | expert
+  uiUserSet: false,
+  profileId: null,
+  rest: null,
   hb: { n: 0, hz: 0, at: 0 }, // lease heartbeats sent: count this second, rate, last send time
   preset: null,               // { name, until } while a preset motion runs
 };
+const isSoArmProfile = () => !!(S.profileId && S.profileId.startsWith('so_arm'));
+let schemaReady = null;
 const speedScale = () => CFG.speeds[S.speedIdx];
 // 5-DOF cartesian teleop state (model frame, metres / radians)
 const C = {
@@ -4397,7 +4402,37 @@ function applyJointMap(map) {
 async function loadSchema() {
   try {
     const sc = await api('/api/v1/observation/schema', undefined, { quiet: true, method: 'GET' });
-    if (sc) { S.caps = sc.capabilities || {}; S.powerGov = (sc.power_budget && sc.power_budget.governor) || null; PWR.key = ''; S.wsPolicy = sc.workspace || null; S.home = Array.isArray(sc.home_positions) ? sc.home_positions : null; colOnCaps(); posesOnCaps(); epOnCaps(); V3.sceneAt = 0; }
+    const oldProfile = S.profileId;
+    const oldClosed = CFG.gripClosed;
+    const oldOpen = CFG.gripOpen;
+    if (sc) {
+      S.profileId = sc.profile_id || null;
+      S.armDof = sc.arm_dof || (sc.dof ? (sc.dof === 7 ? 6 : sc.dof - 1) : 6);
+      S.gripperJoint = Number.isInteger(sc.gripper_joint) ? sc.gripper_joint : (sc.dof ? sc.dof - 1 : 6);
+      S.orientationDof = sc.orientation_dof != null ? sc.orientation_dof : (S.armDof >= 6 ? 3 : 2);
+      S.jointNames = sc.joint_names || null;
+      S.caps = sc.capabilities || {};
+      S.zeroCheckSupported = sc.gripper_policy ? !!sc.gripper_policy.zero_check_supported : (sc.capabilities ? !!sc.capabilities.zero_check_supported : false);
+      S.powerGov = (sc.power_budget && sc.power_budget.governor) || null;
+      PWR.key = '';
+      S.wsPolicy = sc.workspace || null;
+      S.home = Array.isArray(sc.home_positions) ? sc.home_positions : null;
+      S.rest = Array.isArray(sc.resting_pose?.positions) ? sc.resting_pose.positions : S.home;
+      if (sc.gripper_policy && Number.isFinite(sc.gripper_policy.closed_rad) && Number.isFinite(sc.gripper_policy.open_rad)) {
+        CFG.gripClosed = sc.gripper_policy.closed_rad;
+        CFG.gripOpen = sc.gripper_policy.open_rad;
+        if (oldClosed !== CFG.gripClosed || oldOpen !== CFG.gripOpen) {
+          S.grip = null;
+          PCARD.key = '';
+        }
+      }
+      if (sc.workspace && Number.isFinite(sc.workspace.max_reach_m)) {
+        CFG.cart.reachMax = sc.workspace.max_reach_m;
+        const rmaxEl = $('c-rmax');
+        if (rmaxEl) rmaxEl.textContent = Math.round(CFG.cart.reachMax * 1000);
+      }
+      colOnCaps(); posesOnCaps(); epOnCaps(); V3.sceneAt = 0;
+    }
     if (sc && Array.isArray(sc.model_joint_map) && sc.model_joint_map.length >= 6) applyJointMap(sc.model_joint_map);
     if (sc && Array.isArray(sc.limits) && sc.limits.length) {
       const oldDof = S.dof;
@@ -4405,16 +4440,26 @@ async function loadSchema() {
       S.dof = sc.dof || sc.limits.length;
       // mirror the server's Cartesian floor so the cockpit stops at the same height
       if (sc.workspace && Number.isFinite(sc.workspace.floor_z_m)) CFG.cart.zMin = sc.workspace.floor_z_m;
-      GRIP = S.dof - 1;
+      GRIP = Number.isInteger(sc.gripper_joint) ? sc.gripper_joint : S.dof - 1;
       S.hold = Array.from({ length: S.dof }, () => [0, 0]);
       // S.dof defaults to 7, so the 7-DOF text variant is set on every schema load, not only on a DOF change.
       const variant = S.dof === 7 ? '@7' : '';
       document.querySelectorAll('.kb-dof7').forEach((el) => { el.hidden = S.dof !== 7; });
-      if (oldDof !== S.dof || variant !== I18N_VARIANT) {
+      if (oldDof !== S.dof || oldProfile !== S.profileId || variant !== I18N_VARIANT) {
         I18N_VARIANT = variant;
         renderJogRows();
         renderGripCol();
+        if (typeof renderJtable === 'function') renderJtable();
         applyI18n();
+      }
+      if (isSoArmProfile() && oldProfile !== S.profileId && !QS.get('ui') && !S.uiUserSet) {
+        setUi('expert');
+      }
+      if (oldProfile !== S.profileId && V3.r) {
+        if (V3.solid) { V3.root.remove(V3.solid.obj); V3.solid = null; }
+        if (V3.ghost) { V3.root.remove(V3.ghost.obj); V3.ghost = null; }
+        V3.init = null;
+        if (V3.open) v3Start();
       }
       applyFrame();
     }
@@ -4509,7 +4554,7 @@ function bindHold(btn, j, s) {
 function jogButton(j, s, label, key) {
   const b = document.createElement('button');
   b.className = 'jbtn ' + (s > 0 ? 'pos' : 'neg');
-  const list = (S.dof === 7) ? JOINTS_7DOF : CFG.joints;
+  const list = activeJoints();
   const name = list[j]?.key ?? ('J' + (j + 1));
   b.setAttribute('aria-label', `${name} ${label}`);
   b.innerHTML = s > 0
@@ -4529,6 +4574,17 @@ const JOINTS_7DOF = [
   { key: 'J7', part: 'jd.grip.part', motion: 'jd.grip.motion', en: 'Gripper', neg: 'jd.grip.neg', pos: 'jd.grip.pos', kn: 'Z', kp: 'X' },
 ];
 
+const JOINTS_SO_ARM = [
+  { key: 'J1', part: 'jd.base.part', motion: 'jd.base.motion', en: 'Shoulder Pan', neg: 'jd.base.neg', pos: 'jd.base.pos', kn: 'A', kp: 'D' },
+  { key: 'J2', part: 'jd.shoulder.part', motion: 'jd.shoulder.motion', en: 'Shoulder Lift', neg: 'jd.shoulder.neg', pos: 'jd.shoulder.pos', kn: 'S', kp: 'W' },
+  { key: 'J3', part: 'jd.elbow.part', motion: 'jd.elbow.motion', en: 'Elbow Flex', neg: 'jd.elbow.neg', pos: 'jd.elbow.pos', kn: '↓', kp: '↑' },
+  { key: 'J4', part: 'jd.wpitch.part', motion: 'jd.wpitch.motion', en: 'Wrist Flex', neg: 'jd.wpitch.neg', pos: 'jd.wpitch.pos', kn: 'Q', kp: 'E' },
+  { key: 'J5', part: 'jd.wroll.part', motion: 'jd.wroll.motion', en: 'Wrist Roll', neg: 'jd.wroll.neg', pos: 'jd.wroll.pos', kn: '←', kp: '→' },
+  { key: 'J6', part: 'jd.grip.part', motion: 'jd.grip.motion', en: 'Gripper', neg: 'jd.grip.neg', pos: 'jd.grip.pos', kn: 'Z', kp: 'X' },
+];
+
+const activeJoints = () => (S.dof === 7) ? JOINTS_7DOF : isSoArmProfile() ? JOINTS_SO_ARM : CFG.joints;
+
 /* ---------- jog rows (dynamically rendered) ---------- */
 let rows = [];
 function renderJogRows() {
@@ -4536,7 +4592,7 @@ function renderJogRows() {
   if (!container) return;
   container.innerHTML = '';
   holdButtons.length = 0;
-  const list = (S.dof === 7) ? JOINTS_7DOF : CFG.joints;
+  const list = activeJoints();
   rows = list.map((jd, i) => {
     const row = document.createElement('div');
     row.className = 'jrow' + (i === GRIP ? ' grip' : '');
@@ -4861,6 +4917,18 @@ const IK_MSG = {
 // Simple mode always uses it; the stored view/base choice applies to expert mode only.
 const viewActive = () => S.dof === 7 && (S.ui === 'simple' || C.frame === 'view');
 function cartSync(pos) {
+  if (isSoArmProfile()) {
+    const tcp = S.obs?.tcp;
+    C.cmd = tcp && Array.isArray(tcp.xyz_m) ? { x: tcp.xyz_m[0], y: tcp.xyz_m[1], z: tcp.xyz_m[2], pitch: tcp.rpy_rad?.[1] ?? 0 } : { x: 0.25, y: 0, z: 0.10, pitch: 0 };
+    C.goal = { ...C.cmd };
+    C.j5 = pos[4] ?? 0;
+    C.branch = 'URDF';
+    C.T = null;
+    C.Tg = null;
+    C.q6 = null;
+    C.wq = [0, 0];
+    return;
+  }
   C.q = toModel(pos);
   C.cmd = IK.fk(C.q);
   C.goal = { ...C.cmd };
@@ -4997,6 +5065,26 @@ function clampJ5(x) {
 }
 function cartKick() { C.lastInput = performance.now(); C.tailUntil = C.lastInput + CFG.cart.tailMs; }
 function cartStep(ax, s) {
+  if (isSoArmProfile()) {
+    const n = CFG.cart.steps[C.stepIdx];
+    if (ax === 'x' || ax === 'y' || ax === 'z') {
+      commandRPC('/api/v1/action/move_relative', {
+        dx: ax === 'x' ? s * n / 1000 : 0,
+        dy: ax === 'y' ? s * n / 1000 : 0,
+        dz: ax === 'z' ? s * n / 1000 : 0,
+        frame: 'base',
+      }).catch(toastOnce);
+    } else if (ax === 'p' || ax === 'r') {
+      const pos = (S.obs && Array.isArray(S.obs.positions)) ? S.obs.positions : (S.home || []);
+      const jIdx = ax === 'p' ? 3 : 4;
+      const nextPos = pos.slice(0, S.dof);
+      while (nextPos.length < S.dof) nextPos.push(0);
+      nextPos[jIdx] = (nextPos[jIdx] || 0) + s * n / DEG;
+      commandRPC('/api/v1/motion/jog', { target_positions: clampTarget(nextPos) }).catch(toastOnce);
+    }
+    cartKick();
+    return;
+  }
   if (viewActive()) {
     if (!C.Tg) return;
     const n = CFG.cart.steps[C.stepIdx], v = { x: 0, y: 0, z: 0, p: 0, r: 0 };
@@ -5060,6 +5148,52 @@ function cartTick() {
   C.lastTick = now;
   if (!isLive() || !canMove() || S.epoch == null) {
     cartSync(pos); C.tailUntil = 0; C.status = 'idle'; C.msg = '';
+    return;
+  }
+  if (isSoArmProfile()) {
+    const tcp = S.obs.tcp;
+    if (tcp && Array.isArray(tcp.xyz_m)) {
+      C.cmd = { x: tcp.xyz_m[0], y: tcp.xyz_m[1], z: tcp.xyz_m[2], pitch: tcp.rpy_rad?.[1] ?? 0 };
+      C.goal = { ...C.cmd };
+    }
+    const v = cartVelocity();
+    const gv = cartGripVel();
+    const scale = speedScale();
+    const hasInput = v.x || v.y || v.z || v.p || v.r || gv;
+    if (hasInput) cartKick();
+
+    if (pos.length > GRIP && gv) {
+      const cur = S.grip ?? gripFrac(pos[GRIP]);
+      S.grip = gripNoWindup(clamp(cur + gv * CFG.gripRate * scale * dt, 0, 1), pos[GRIP]);
+      S.gripCmdAt = Date.now();
+    }
+
+    if (v.x || v.y || v.z) {
+      C.status = 'ok';
+      C.msg = '';
+      if (!C.inflight && !S.presetRunning) {
+        C.inflight = true;
+        const stepM = scale * 0.015;
+        commandRPC('/api/v1/action/move_relative', {
+          dx: v.x * stepM,
+          dy: v.y * stepM,
+          dz: v.z * stepM,
+          frame: 'base'
+        }).catch(toastOnce).finally(() => { C.inflight = false; });
+      }
+    }
+
+    if (v.p || v.r || gv) {
+      const wl = CFG.cart.wmax * scale;
+      let t = pos.slice(0, S.dof);
+      while (t.length < S.dof) t.push(0);
+      if (t.length > 3 && v.p) t[3] = clamp(t[3] + v.p * wl * dt, S.limits[3].min_position, S.limits[3].max_position);
+      if (t.length > 4 && v.r) t[4] = clamp(t[4] + v.r * wl * dt, S.limits[4].min_position, S.limits[4].max_position);
+      if (t.length > GRIP) t[GRIP] = gripRad();
+      t = clampTarget(t);
+      C.sending = true;
+      if (!S.presetRunning) cartSend(t);
+    }
     return;
   }
   const v = cartVelocity();
@@ -5818,7 +5952,8 @@ function renderGc() {
   const gc = S.obs?.gravity_comp, on = gcOn(), live = isLive();
   document.body.classList.toggle('gc', on && live);
   const sw = $('btn-gc');
-  sw.hidden = !gc || !gc.supported;
+  const supported = !!(gc && gc.supported) && (S.caps ? S.caps.gravity_compensation !== false : true);
+  sw.hidden = !supported;
   const why = on ? null : gcBlockText();
   sw.classList.toggle('on', on);
   sw.classList.toggle('blocked', !on && !!why);
@@ -5914,6 +6049,9 @@ const PRESET_NAME = { home: 'pn.home', inspect: 'pn.inspect', park: 'pn.park' };
 function presetName(n) { return PRESET_NAME[n] ? t(PRESET_NAME[n]) : ''; }
 function presetTarget(name) {
   const pos = (S.obs && Array.isArray(S.obs.positions)) ? S.obs.positions : [];
+  if (isSoArmProfile() && name === 'inspect') {
+    return clampTarget([0.0, -0.45, 0.45, 0.95, 0.0, pos[GRIP] ?? CFG.gripClosed]);
+  }
   let t = pos.slice(0, S.dof);
   while (t.length < S.dof) t.push(0);
   const m = toMotor(CFG.presets[name] || []);
@@ -5997,7 +6135,7 @@ function setUi(ui) {
     setMode(store('rebot.ctl') || 'joint', store('rebot.input') || (legacy === 'stick' ? 'stick' : 'btn'));
   }
 }
-$('ui-seg').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) setUi(b.dataset.ui); });
+$('ui-seg').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { S.uiUserSet = true; setUi(b.dataset.ui); } });
 
 /* =================================================================
    Dataset recording
@@ -6695,6 +6833,20 @@ PCARD.g = PCARD.cv.getContext('2d');
 const PCARD_EPS = 0.00175;
 // planar points [x along the arm's heading, z] for motor angles q: base, J1..J6 origins, end_link; plus the tool axis
 function posePlanar(q) {
+  if (isSoArmProfile() && Array.isArray(q) && q.length >= 5) {
+    const rot = (a, dx, dz) => [dx * Math.cos(a) + dz * Math.sin(a), -dx * Math.sin(a) + dz * Math.cos(a)];
+    const p0 = [0, 0], p1 = [0.03884, 0.0624], p2 = [0.06923, 0.1166];
+    const a1 = Number(q[1]) || 0, a2 = a1 + (Number(q[2]) || 0), a3 = a2 + (Number(q[3]) || 0);
+    const u2 = rot(a1, 0.028, 0.11257), p3 = [p2[0] + u2[0], p2[1] + u2[1]];
+    const u3 = rot(a2, 0.1349, 0.0052), p4 = [p3[0] + u3[0], p3[1] + u3[1]];
+    const u4 = rot(a3, 0.0611, 0.0), p5 = [p4[0] + u4[0], p4[1] + u4[1]];
+    const p6 = p5;
+    const u7 = rot(a3, 0.10352, -0.00573), p7 = [p5[0] + u7[0], p5[1] + u7[1]];
+    return { pts: [p0, p1, p2, p3, p4, p5, p6, p7], ax: [Math.cos(a3), -Math.sin(a3)] };
+  }
+  if (S.armDof !== 6 || (S.profileId && S.profileId.startsWith('so_arm'))) {
+    return { pts: [], ax: [1, 0] };
+  }
   const qq = toModel6(q);
   const f = VIK.frames(qq), c = Math.cos(qq[0]), s = Math.sin(qq[0]);
   const pl = (p) => [p[0] * c + p[1] * s, p[2]];
@@ -6713,7 +6865,7 @@ function poseTick(ts) {
   if (PCARD.collapsed || document.hidden || ts - PCARD.last < 66) return;
   const o = S.obs, live = isLive();
   const q = o && Array.isArray(o.positions) ? o.positions : null;
-  const rest = Array.isArray(S.home) && S.home.length >= 6 ? S.home : CFG.presets.park;
+  const rest = Array.isArray(S.rest) && S.rest.length >= S.dof ? S.rest : (Array.isArray(S.home) && S.home.length >= 6 ? S.home : CFG.presets.park);
   const meas = q || rest;
   const cmd = o && Array.isArray(o.commanded_positions) ? o.commanded_positions : meas;
   const ghost = !!q && cmd.some((v, i) => Math.abs(v - (meas[i] ?? v)) > (i === GRIP ? 0.05 : 0.005));
@@ -6740,6 +6892,7 @@ function poseDraw(meas, cmd, rest, hot, gc, live) {
   g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, w, h);
   const u = dpr, font = (px, wt = 500) => `${wt} ${px * u}px ui-monospace, Menlo, monospace`;
   const M = posePlanar(meas), C = cmd ? posePlanar(cmd) : null, R = posePlanar(rest);
+  if (!M.pts.length) return;
   // view window (m): the drawn poses plus a margin, at least 0.36 m tall; kept while the poses fit and
   // the window is less than 1.6x the needed height, so the scale does not change on every small move
   let x0 = -0.12, x1 = 0.12, z0 = 0, z1 = 0.1;
@@ -6790,10 +6943,11 @@ function poseDraw(meas, cmd, rest, hot, gc, live) {
     g.fillStyle = on ? RED : '#fff'; g.strokeStyle = on ? RED : JOINT; g.lineWidth = 1.6 * u;
     g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); g.stroke();
   }
-  // J6 roll mark: small dial on the gripper body, tick at the roll angle (0 = up)
+  // J5/J6 roll mark: small dial on the gripper body, tick at the roll angle (0 = up)
   {
-    const m = [(M.pts[6][0] + end[0]) / 2, (M.pts[6][1] + end[1]) / 2], [x, y] = X(m), r = 4.5 * u, a = (Number(meas[5]) || 0) - Math.PI / 2;
-    g.fillStyle = '#fff'; g.strokeStyle = hot.includes(5) ? RED : JOINT; g.lineWidth = 1.4 * u;
+    const rollIdx = isSoArmProfile() ? 4 : 5;
+    const m = [(M.pts[6][0] + end[0]) / 2, (M.pts[6][1] + end[1]) / 2], [x, y] = X(m), r = 4.5 * u, a = (Number(meas[rollIdx]) || 0) - Math.PI / 2;
+    g.fillStyle = '#fff'; g.strokeStyle = hot.includes(rollIdx) ? RED : JOINT; g.lineWidth = 1.4 * u;
     g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); g.stroke();
     g.beginPath(); g.moveTo(x, y); g.lineTo(x + Math.cos(a) * r, y + Math.sin(a) * r); g.stroke();
   }
@@ -6836,12 +6990,20 @@ document.addEventListener('visibilitychange', () => { PCARD.key = ''; });
 i18nHooks.push(() => { PCARD.key = ''; $('pose-toggle').setAttribute('aria-label', t(PCARD.collapsed ? 'pc.expand' : 'pc.collapse')); });
 poseSetCollapsed(PCARD.collapsed);
 
-const jtab = CFG.joints.map((jd, i) => {
-  const tr = document.createElement('tr');
-  tr.innerHTML = `<td>${jd.key}</td><td>--</td><td>--</td><td>--</td><td>--</td><td>--</td>`;
-  $('jtable-body').appendChild(tr);
-  return { tr, c: Array.from(tr.children) };
-});
+let jtab = [];
+function renderJtable() {
+  const tbody = $('jtable-body');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+  const list = activeJoints();
+  jtab = list.map((jd, i) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${jd.key}</td><td>--</td><td>--</td><td>--</td><td>--</td><td>--</td>`;
+    tbody.appendChild(tr);
+    return { tr, c: Array.from(tr.children) };
+  });
+}
+renderJtable();
 
 /* =================================================================
    Render loop
@@ -6875,7 +7037,7 @@ function graspRunningAction() {
   const a = S.obs && S.obs.action;
   return a && a.kind === 'grasp' && a.state === 'running' ? a : null;
 }
-const graspDetOn = () => S.dof === 7 && DET.avail && DET.enabled;
+const graspDetOn = () => (S.dof === 7 || isSoArmProfile()) && DET.avail && DET.enabled;
 function graspRPC(path, body) {
   return commandRPC(path, body).then((d) => { syncEpoch(d.epoch_id); return d; }, (e) => {
     toast(e.code && e.code !== 'LEASE_REQUIRED' && e.code !== 'COMMAND_TIMEOUT' ? graspCodeText(e.code, e.message) : e.message, 'err', e.code || '');
@@ -7119,7 +7281,7 @@ graspLoadSetup(true);
    Everything stays hidden on an armd without the guard.
    ================================================================= */
 const COL = { cfg: null, thr: null, barAt: 0, busy: false };
-const colAvail = () => !!(S.caps && S.caps.collision_guard) || !!(S.obs && S.obs.collision);
+const colAvail = () => (S.caps ? !!S.caps.collision_guard : !!(S.obs && S.obs.collision));
 function colThresholds(c) {
   if (!c) return null;
   const e = c.effective || c;
@@ -7338,6 +7500,7 @@ async function v3Start() {
 }
 async function v3Init() {
   setText($('v3-status'), t('v3.loading'));
+  if (schemaReady) await Promise.race([schemaReady, new Promise((r) => setTimeout(r, 1500))]);
   const T = V3.T = await import('/assets/three-urdf.min.js');
   const cv = $('v3-canvas');
   V3.r = new T.WebGLRenderer({ canvas: cv, antialias: true });
@@ -7354,11 +7517,15 @@ async function v3Init() {
   V3.root = new T.Group(); V3.root.rotation.x = -Math.PI / 2; scene.add(V3.root);
   V3.ghostMat = new T.MeshBasicMaterial({ color: 0x3b82f6, transparent: true, opacity: 0.28, depthWrite: false });
   let urdf = null, man = null;
+  const isSoArm = S.profileId && S.profileId.startsWith('so_arm');
+  const urdfFile = isSoArm ? '/assets/model/so101_new_calib.urdf' : '/assets/model/reBot-DevArm_gripper.urdf';
+  const manFile = isSoArm ? '/assets/model/so101_meshes/manifest.json' : '/assets/model/meshes/manifest.json';
+  const binDir = isSoArm ? '/assets/model/so101_meshes/' : '/assets/model/meshes/';
   try {
-    const [u, m] = await Promise.all([fetch('/assets/model/reBot-DevArm_gripper.urdf'), fetch('/assets/model/meshes/manifest.json')]);
+    const [u, m] = await Promise.all([fetch(urdfFile), fetch(manFile)]);
     if (u.ok && m.ok) { urdf = await u.text(); man = await m.json(); }
     if (man && man.format === 'rbm1' && /^[\w.-]+$/.test(man.file || '')) {
-      const b = await fetch('/assets/model/meshes/' + man.file);
+      const b = await fetch(binDir + man.file);
       man.buf = b.ok ? await b.arrayBuffer() : null;
     } else man = null;
   } catch (_) { man = null; /* stick figure */ }
@@ -7431,11 +7598,25 @@ function v3Robot(T, urdf, man, ghost) {
   return Promise.resolve({
     obj: robot,
     set(q) {
-      const m = toModel6(q);
-      for (let i = 0; i < 6; i++) robot.setJointValue('joint' + (i + 1), m[i]);
-      if (q.length > 6) { const d = gripFrac(q[6]) * V3_FINGER_M; robot.setJointValue('left_finger_joint', d); robot.setJointValue('right_finger_joint', d); }
+      const isSoArm = S.profileId && S.profileId.startsWith('so_arm');
+      if (isSoArm) {
+        const jNames = S.jointNames || ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper'];
+        for (let i = 0; i < Math.min(q.length, jNames.length); i++) {
+          robot.setJointValue(jNames[i], q[i]);
+        }
+      } else {
+        const m = toModel6(q);
+        for (let i = 0; i < 6; i++) robot.setJointValue('joint' + (i + 1), m[i]);
+        if (q.length > 6) { const d = gripFrac(q[6]) * V3_FINGER_M; robot.setJointValue('left_finger_joint', d); robot.setJointValue('right_finger_joint', d); }
+      }
     },
-    end() { const v = robot.links.end_link.getWorldPosition(new T.Vector3()); V3.root.worldToLocal(v); return [v.x, v.y, v.z]; },
+    end() {
+      const link = robot.links.end_link || robot.links.gripper_frame_link || robot.links.moving_jaw_so101_v1_link || robot.links.gripper_link;
+      if (!link) return [0, 0, 0];
+      const v = link.getWorldPosition(new T.Vector3());
+      V3.root.worldToLocal(v);
+      return [v.x, v.y, v.z];
+    },
   });
 }
 // stick figure through the URDF joint frames: base, J1..J6 origins, end_link
@@ -7450,6 +7631,9 @@ function v3Stick(T, ghost) {
   return {
     obj,
     set(q) {
+      if (S.armDof !== 6 || (S.profileId && S.profileId.startsWith('so_arm'))) {
+        return;
+      }
       const f = VIK.frames(toModel6(q));
       const pts = [[0, 0, 0], ...f.o, f.p];
       pts.forEach((p, i) => balls[i].position.set(p[0], p[1], p[2]));
@@ -7743,7 +7927,15 @@ function frame(ts) {
       setText(r.c[1], ok ? fmtDeg(p) : '--');
       setText(r.c[2], ok ? p.toFixed(3) : '--');
       setText(r.c[3], freshJoint(i) && cap.velocity_feedback && vel[i] != null ? (vel[i] * DEG).toFixed(0) : '--');
-      setText(r.c[4], freshJoint(i) && cap.torque_feedback && tq[i] != null ? tq[i].toFixed(2) : '--');
+      let tqStr = '--';
+      if (freshJoint(i)) {
+        if (cap.torque_feedback && tq[i] != null) tqStr = tq[i].toFixed(2);
+        else if (cap.load_feedback) {
+          const ld = S.obs?.loads?.[i];
+          if (ld != null && Number.isFinite(ld)) tqStr = Math.round(ld * 100) + '%';
+        }
+      }
+      setText(r.c[4], tqStr);
       setText(r.c[5], freshJoint(i) && cap.temperature_feedback && temps[i] != null ? temps[i].toFixed(0) : '--');
       r.tr.classList.toggle('hot', act[i]);
     });
@@ -7807,17 +7999,28 @@ function renderCart(live, op) {
   // readouts from the full FK of the commanded joints: view = solved pose, base = IK J1..J4 + J5 + measured J6
   const view = viewActive();
   const pos6 = S.obs && S.obs.positions;
-  const T = view ? C.T : (C.cmd && C.q ? VIK.fk(toModel6([...toMotor(C.q), C.j5, (pos6 && pos6[5]) || 0])) : null);
-  const p = T ? { x: T[0][3], y: T[1][3], z: T[2][3], pitch: Math.asin(clamp(-T[2][0], -1, 1)), yaw: Math.atan2(T[1][0], T[0][0]) } : null;
+  const isSoArm = S.profileId && S.profileId.startsWith('so_arm');
+  const isCoupledYaw = S.orientationDof === 2 || isSoArm;
+  let p = null;
+  if (isSoArm && S.obs && S.obs.tcp && Array.isArray(S.obs.tcp.xyz_m) && Array.isArray(S.obs.tcp.rpy_rad)) {
+    const tcp = S.obs.tcp;
+    p = { x: tcp.xyz_m[0], y: tcp.xyz_m[1], z: tcp.xyz_m[2], pitch: tcp.rpy_rad[1], yaw: tcp.rpy_rad[2] };
+  } else {
+    const T = view ? C.T : (C.cmd && C.q ? VIK.fk(toModel6([...toMotor(C.q), C.j5, (pos6 && pos6[5]) || 0])) : null);
+    p = T ? { x: T[0][3], y: T[1][3], z: T[2][3], pitch: Math.asin(clamp(-T[2][0], -1, 1)), yaw: Math.atan2(T[1][0], T[0][0]) } : null;
+  }
   const mm = (m) => (m >= 0 ? '+' : '−') + Math.abs(m * 1000).toFixed(1);
   setText($('c-x'), p ? mm(p.x) : '--'); setText($('c-y'), p ? mm(p.y) : '--');
   setText($('c-z'), p ? mm(p.z) : '--'); setText($('c-p'), p ? fmtDeg(p.pitch) + '°' : '--');
-  const R = p ? IK.reach(p) : null, frac = R == null ? 0 : R / CFG.cart.reachMax;
+  const R = p ? Math.hypot(p.x, p.y) : null, frac = R == null ? 0 : R / CFG.cart.reachMax;
   setText($('c-r'), R == null ? '--' : Math.round(R * 1000) + ' mm');
   $('c-rfill').style.width = (clamp(frac, 0, 1) * 100).toFixed(1) + '%';
   setCls($('c-reach'), 'reach' + (frac > 1 ? ' bad' : frac > 0.92 ? ' warn' : ''));
-  setText($('c-r5'), !live ? '--' : view ? (C.q6 ? fmtDeg(toMotor6(C.q6)[5]) + '°' : '--') : fmtDeg(C.j5) + '°');
-  setText($('c-yaw'), p ? fmtDeg(p.yaw) + '°' : '--');
+  setText($('c-r5'), !live ? '--' : isSoArm ? (pos6 && pos6.length > 4 ? fmtDeg(pos6[4]) + '°' : '--') : view ? (C.q6 ? fmtDeg(toMotor6(C.q6)[5]) + '°' : '--') : fmtDeg(C.j5) + '°');
+  setText($('c-yaw'), p ? fmtDeg(p.yaw) + '°' + (isCoupledYaw ? ' (auto)' : '') : '--');
+  if ($('c-yaw')) {
+    $('c-yaw').title = isCoupledYaw ? (LANG === 'zh' ? '5自由度机械臂偏航角跟随径向方位角' : '5-DOF yaw follows radial azimuth') : '';
+  }
   const bad = C.status !== 'ok' && C.status !== 'idle';
   const badge = $('ik-badge');
   setText(badge, !live ? 'IK --' : bad ? t('ik.blocked') : C.sending ? t('ik.stream', { hz: CFG.cart.hz }) : t('ik.ready'));
@@ -7896,7 +8099,7 @@ window.V = V;
   const st = store('rebot.step'); setStep(st != null && /^[0-2]$/.test(st) ? Number(st) : 1);
   $('c-rmax').textContent = Math.round(CFG.cart.reachMax * 1000);
 }
-loadSchema();
+schemaReady = loadSchema();
 connectWS();
 connectDetectionWS();
 initDetToggle();

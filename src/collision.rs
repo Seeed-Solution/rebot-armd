@@ -273,7 +273,7 @@ impl SupervisorInner {
     pub fn collision_supported_joints(&self) -> [bool; 6] {
         let mut out = [false; 6];
         let Some(policy) = self.config.resting_pose.as_ref() else { return out; };
-        let home = &self.config.home_positions;
+        let home = self.config.resting_positions();
         // Every arm joint needs a tolerance and a reading within it (a short tolerance vector
         // would leave the joints past its end unchecked).
         let n = self.config.resting_arm_joints();
