@@ -1158,11 +1158,11 @@ impl ArmConfig {
                     if j.zero_step > 4095 {
                         return Err(format!("Feetech joint {} zero_step must be <= 4095, got {}", i, j.zero_step));
                     }
-                    if j.homing_offset_steps.abs() > 2047 {
+                    if !(-2047..=2047).contains(&j.homing_offset_steps) {
                         return Err(format!("Feetech joint {} homing_offset_steps abs must be <= 2047, got {}", i, j.homing_offset_steps));
                     }
                     if let Some(exp) = j.expected_homing_offset_steps {
-                        if exp.abs() > 2047 {
+                        if !(-2047..=2047).contains(&exp) {
                             return Err(format!("Feetech joint {} expected_homing_offset_steps abs must be <= 2047, got {}", i, exp));
                         }
                     }

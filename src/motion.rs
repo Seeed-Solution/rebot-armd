@@ -282,7 +282,7 @@ pub fn resolve_goal(input: &PlanInput, spec: &GoalSpec) -> Pose {
 pub fn apply_auto_yaw(start_p: &[f64; 3], goal_p: &[f64; 3], mut target_r: kinematics::Mat3) -> kinematics::Mat3 {
     let r_start = (start_p[0] * start_p[0] + start_p[1] * start_p[1]).sqrt();
     let r_target = (goal_p[0] * goal_p[0] + goal_p[1] * goal_p[1]).sqrt();
-    if r_start >= 0.03 && r_target >= 0.03 {
+    if r_start >= 0.03 && r_target >= 0.03 && !crate::chain::is_tool_vertical(&target_r) {
         let dpsi = goal_p[1].atan2(goal_p[0]) - start_p[1].atan2(start_p[0]);
         let rz = kinematics::axis_r(&[0.0, 0.0, 1.0], dpsi);
         target_r = kinematics::mat_mul(&rz, &target_r);

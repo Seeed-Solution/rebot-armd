@@ -476,7 +476,7 @@ impl SupervisorInner {
         schema.capabilities.collision_guard &= torque_feedback;
         schema.capabilities.torque_guard &= torque_feedback;
         schema.capabilities.power_budget &= torque_feedback;
-        schema.capabilities.auto_yaw = true;
+        schema.capabilities.auto_yaw = self.config.arm_dof() == 5;
         if schema.feetech_joints.is_none() {
             schema.feetech_joints = self.config.feetech.as_ref().map(|f| f.joints.clone());
         }
@@ -3243,8 +3243,6 @@ impl SupervisorInner {
                 self.gripper_high_torque_ticks = 0;
                 let is_released = if has_torque_feedback {
                     tau_g.abs() < GRIPPER_STALL_RELEASE_NM
-                } else if has_load_feedback {
-                    (gap * self.gripper_stall_sign < -0.005) || load_g.abs() < 0.15
                 } else {
                     gap * self.gripper_stall_sign < -0.005
                 };
@@ -4258,18 +4256,11 @@ impl ArmSupervisor {
     }
 
     pub async fn clear_fault(&self) -> Result<SafetyState, ArmError> {
-        let e_stop = self.e_stop_latched.clone();
         let mut inner = self.inner.clone().write_owned().await;
         let res = tokio::task::spawn_blocking(move || inner.clear_fault())
             .await
             .map_err(|e| ArmError::Internal(format!("clear_fault blocking task failed: {e}")))?;
-        match res {
-            Ok(new_state) => {
-                e_stop.store(false, Ordering::SeqCst);
-                Ok(new_state)
-            }
-            Err(e) => Err(ArmError::Safety(e)),
-        }
+        res.map_err(ArmError::Safety)
     }
 
     pub async fn apply_stop_policy(&self, policy: StopPolicy) {

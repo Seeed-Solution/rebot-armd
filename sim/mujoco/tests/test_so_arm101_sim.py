@@ -142,7 +142,6 @@ def test_so101_sim_state_tcp_pose():
     finally:
         sim.close()
 
-
 def test_so101_scene_jaw_ids():
     model = load_model(robot="so-arm101")
     objects = parse_objects("cube")
@@ -172,7 +171,6 @@ def test_so101_camera_rig_and_mount_rotation():
         assert "backend" in ready
     finally:
         sim.close()
-
 
 def test_so101_fk_parity_with_daemon_profile():
     """Verify numerical parity of MuJoCo TCP site pose against daemon KinematicChain FK (< 2 microns position deviation)."""
@@ -209,5 +207,3 @@ def test_so101_fk_parity_with_daemon_profile():
         np.testing.assert_allclose(st_nz["tcp_quat"], [0.78759, -0.59997, 0.1394, -0.01742], atol=1e-3)
     finally:
         sim.close()
-
-

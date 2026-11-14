@@ -70,7 +70,7 @@
   "kinematics": "Urdf",
   "gravity_model": "Urdf",
   "urdf": "../assets/so101_new_calib.urdf",
-  "urdf_sha256": "93d70892729a2f99813787a19dcb63fd5aba03c3a4c9928e1b6f18b5cd0ecba7",
+  "urdf_sha256": "a8c94aaff62965ec58dd33f91eb3b49e102f28870b9a11750de938e55fe1afa4",
   "chain": {
     "base_link": "base_link",
     "tip_link": "gripper_frame_link",

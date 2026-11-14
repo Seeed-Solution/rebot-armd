@@ -34,7 +34,7 @@ fn test_profiles_load_and_validate() {
     assert_eq!(c101.dof, 6);
     assert_eq!(c101.gripper_joint, Some(5));
     assert_eq!(c101.arm_dof(), 5);
-    assert_eq!(c101.urdf_sha256.as_deref(), Some("93d70892729a2f99813787a19dcb63fd5aba03c3a4c9928e1b6f18b5cd0ecba7"));
+    assert_eq!(c101.urdf_sha256.as_deref(), Some("a8c94aaff62965ec58dd33f91eb3b49e102f28870b9a11750de938e55fe1afa4"));
     assert!(c101.kinematics.is_some());
     assert!(c101.workspace.is_some());
     assert!(c101.gripper_policy.is_some());
@@ -1065,4 +1065,147 @@ fn test_feetech_model_validation_rejects_invalid_parameters() {
     let mut gripper_cfg = config.clone();
     gripper_cfg.feetech.as_mut().unwrap().joints[5].overload_torque_raw = Some(25);
     assert!(gripper_cfg.validate().is_ok());
+}
+
+#[test]
+fn test_feetech_homing_offset_steps_bounds_check() {
+    let mut config = load_so101_config();
+    assert!(config.validate().is_ok());
+
+    // Test homing_offset_steps
+    for (val, should_be_ok) in [
+        (i16::MIN, false),
+        (-2048, false),
+        (-2047, true),
+        (0, true),
+        (2047, true),
+        (2048, false),
+    ] {
+        let mut cfg = config.clone();
+        cfg.feetech.as_mut().unwrap().joints[0].homing_offset_steps = val;
+        let res = cfg.validate();
+        assert_eq!(
+            res.is_ok(),
+            should_be_ok,
+            "homing_offset_steps = {} expected is_ok == {}, got {:?}",
+            val,
+            should_be_ok,
+            res
+        );
+    }
+
+    // Test expected_homing_offset_steps
+    for (val, should_be_ok) in [
+        (Some(i16::MIN), false),
+        (Some(-2048), false),
+        (Some(-2047), true),
+        (Some(0), true),
+        (Some(2047), true),
+        (Some(2048), false),
+    ] {
+        let mut cfg = config.clone();
+        cfg.feetech.as_mut().unwrap().joints[0].expected_homing_offset_steps = val;
+        let res = cfg.validate();
+        assert_eq!(
+            res.is_ok(),
+            should_be_ok,
+            "expected_homing_offset_steps = {:?} expected is_ok == {}, got {:?}",
+            val,
+            should_be_ok,
+            res
+        );
+    }
+}
+
+#[test]
+fn test_vertical_pose_translation_preserves_roll_for_move_to_relative_and_place() {
+    let config = load_so101_config();
+    let arm = &config.arm_model;
+    let lo: [f64; 6] = std::array::from_fn(|i| f64::from(config.limits[i].min_position));
+    let hi: [f64; 6] = std::array::from_fn(|i| f64::from(config.limits[i].max_position));
+    let q_home: [f64; 6] = std::array::from_fn(|i| f64::from(config.home_positions[i]));
+
+    // 1. Initial vertical pose
+    let r_vertical = kinematics::rpy_to_r(0.0, std::f64::consts::FRAC_PI_2, 0.0);
+    assert!(armd::chain::is_tool_vertical(&r_vertical));
+    let sol_down = arm.solve_dls_ex(&Pose::new(r_vertical, [0.22, 0.0, 0.08]), &q_home, &lo, &hi, kinematics::PAR.w, false);
+    assert!(sol_down.ok);
+
+    let mut input = plan_input_at_home(&config);
+    input.q0 = sol_down.q;
+    let start = input.arm.fk(&input.q0);
+    assert!(armd::chain::is_tool_vertical(&start.r));
+
+    // A. GoalSpec::Absolute (move_to without explicit orientation, auto_yaw kicks in)
+    let spec_abs = GoalSpec::Absolute {
+        p: [0.20, 0.05, 0.08],
+        r: None,
+    };
+    let (goal_abs, _yaw_free_abs) = motion::resolve_goal_ex(&input, &spec_abs);
+    let rot_diff_abs = kinematics::angle_between(&goal_abs.r, &start.r);
+    assert!(rot_diff_abs < 1e-4, "move_to from vertical pose must keep initial orientation, got rot_diff = {rot_diff_abs}");
+
+    // B. GoalSpec::Relative (move_relative translation-only in Base frame)
+    let spec_rel = GoalSpec::Relative {
+        frame: RelFrame::Base,
+        d: [-0.02, 0.05, 0.0],
+        dyaw: 0.0,
+        dpitch: 0.0,
+        droll: 0.0,
+        level: false,
+        auto_yaw: None,
+    };
+    let (goal_rel, _yaw_free_rel) = motion::resolve_goal_ex(&input, &spec_rel);
+    let rot_diff_rel = kinematics::angle_between(&goal_rel.r, &start.r);
+    assert!(rot_diff_rel < 1e-4, "move_relative from vertical pose must keep initial orientation, got rot_diff = {rot_diff_rel}");
+
+    // C. place::plan starting from vertical pose without explicit orientation
+    let req = PlaceRequest {
+        target: [0.20, 0.05, 0.02],
+        approach_m: 0.05,
+        pose: None,
+        orientation: None,
+        auto_yaw: Some(true),
+        speed_scale: 0.3,
+        release: true,
+        retreat: true,
+        tag: None,
+    };
+    let pending = PendingPlace {
+        input,
+        request: req,
+        open_rad: config.gripper_policy.as_ref().unwrap().open_rad,
+        held_spill_safe: false,
+        spill_max_tilt_deg: 8.0,
+    };
+    let planned = place::plan(pending).expect("place::plan must succeed from vertical pose");
+    assert!(planned.durations.iter().any(|&d| d > 0.0));
+}
+
+#[test]
+fn test_cross_threshold_cartesian_slerp_tilted_to_vertical() {
+    let config = load_so101_config();
+    let arm = &config.arm_model;
+    let lo: [f64; 6] = std::array::from_fn(|i| f64::from(config.limits[i].min_position));
+    let hi: [f64; 6] = std::array::from_fn(|i| f64::from(config.limits[i].max_position));
+    let q_home: [f64; 6] = std::array::from_fn(|i| f64::from(config.home_positions[i]));
+
+    // Start pose: tilted at pitch = 45 deg
+    let r_tilted = kinematics::rpy_to_r(0.0, std::f64::consts::FRAC_PI_4, 0.0);
+    let p_start = [0.22, 0.0, 0.12];
+    let sol_start = arm.solve_dls_ex(&Pose::new(r_tilted, p_start), &q_home, &lo, &hi, kinematics::PAR.w, true);
+    assert!(sol_start.ok, "Start pose at 45 deg pitch must solve cleanly");
+
+    let mut input = plan_input_at_home(&config);
+    input.q0 = sol_start.q;
+
+    // End pose: vertical at pitch = 90 deg (FRAC_PI_2)
+    let r_vert = kinematics::rpy_to_r(0.0, std::f64::consts::FRAC_PI_2, 0.0);
+    let p_end = [0.22, 0.0, 0.08];
+    let goal_vert = Pose::new(r_vert, p_end);
+
+    let speed = Speed { linear: 0.05, angular: 1.0 };
+    let path = motion::plan_cartesian_ex(&input, goal_vert, speed, true)
+        .expect("Cartesian slerp from tilted to vertical must succeed without IkBranchFlip");
+    assert!(path.q.len() >= 2);
 }

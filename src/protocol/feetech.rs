@@ -376,6 +376,17 @@ pub fn decode_sign_magnitude(raw: u16, sign_bit: u16) -> i16 {
     }
 }
 
+/// Decode STS3215 Present_Position 16-bit register value into signed continuous steps.
+/// Bit 15 (0x8000) indicates negative sign, bits 0..=14 are magnitude in steps.
+pub fn decode_present_position(raw: u16) -> i32 {
+    let mag = (raw & 0x7FFF) as i32;
+    if (raw & 0x8000) != 0 {
+        -mag
+    } else {
+        mag
+    }
+}
+
 /// Decode Feetech STS3215 status/error byte into human-readable flags
 pub fn feetech_error_name(status_byte: u8) -> Option<String> {
     if status_byte == 0 {
@@ -468,7 +479,7 @@ impl FeetechJointCalib {
         )
     }
 
-    pub fn steps_to_rad(&self, raw: u16) -> f32 {
+    pub fn steps_to_rad(&self, raw: i32) -> f32 {
         let effective_zero = if self.homing_applied_in_hw {
             self.zero_step as f32
         } else {
@@ -527,6 +538,13 @@ impl FeetechJointCalib {
         };
         let target = raw_f.round() as i32;
         let (min, max) = range;
+        const STEP_TOLERANCE: i32 = 2;
+        if target < (min as i32 - STEP_TOLERANCE) || target > (max as i32 + STEP_TOLERANCE) {
+            return Err(FeetechError::ParameterError(format!(
+                "Joint target step {} (from rad = {}) outside range [{}, {}] for servo ID {}",
+                target, rad, min, max, self.id
+            )));
+        }
         let clamped = target.clamp(min as i32, max as i32);
         Ok(clamped as u16)
     }

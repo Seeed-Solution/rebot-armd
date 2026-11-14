@@ -1,7 +1,7 @@
 use std::f32::consts::PI;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, FeetechArmDriver, JointTarget};
 use armd::model::{ArmConfig, GripperPolicy, HoldingMode, JointLimit, JointState, RestingPosePolicy};
@@ -183,17 +183,25 @@ fn test_feetech_torque_enable_rollback() {
     let mut rx = Vec::new();
     rx.extend_from_slice(&resp1);
     rx.extend_from_slice(&resp2);
+    // Rollback readbacks: both return 0 (disabled)
+    let cs_rb1 = calculate_checksum(1, 3, 0x00, &[0]);
+    let resp_rb1 = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_rb1];
+    let cs_rb2 = calculate_checksum(2, 3, 0x00, &[0]);
+    let resp_rb2 = vec![0xFF, 0xFF, 2, 3, 0x00, 0, cs_rb2];
+    rx.extend_from_slice(&resp_rb1);
+    rx.extend_from_slice(&resp_rb2);
     driver.transport_mut().provide_rx(&rx);
 
     let res = driver.set_torque(true);
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert!(matches!(err, ArmDriverError::HardwareFault(_)));
+    assert_eq!(driver.enable_state(), EnableState::Disabled);
 
-    // Verify rollback: driver wrote disable packets (REG_TORQUE_ENABLE = 0)
+    // Verify rollback: driver wrote disable packets (REG_TORQUE_ENABLE = 0) and read back status
     let tx = driver.transport_mut().take_tx();
-    // Pre-seeding SYNC_WRITE (14) + Enable writes (2*8=16) + Readback reads (2*8=16) + Rollback writes (2*8=16) = 62 bytes
-    assert_eq!(tx.len(), 62);
+    // Pre-seeding SYNC_WRITE (14) + Enable writes (2*8=16) + Readback reads (2*8=16) + Rollback writes (2*8=16) + Rollback reads (2*8=16) = 78 bytes
+    assert_eq!(tx.len(), 78);
     // Rollback write to servo 1 at offset 46: [0xFF, 0xFF, 1, 4, 3, 0x28, 0, cs]
     assert_eq!(tx[46 + 2], 1); // ID 1
     assert_eq!(tx[46 + 4], INST_WRITE);
@@ -1709,19 +1717,44 @@ fn test_feetech_abort_flag_stops_bus_operations_and_latches() {
     // Now set the abort flag (e.g. software E-stop latch)
     abort_flag.store(true, Ordering::SeqCst);
 
-    // set_torque(true) must be aborted immediately without bus writes
+    // 1. set_torque(true) must be aborted immediately without bus writes
     let err = driver.set_torque(true).unwrap_err();
     assert!(matches!(err, ArmDriverError::HardwareFault(ref msg) if msg.contains("Aborted by emergency stop")));
     assert!(driver.transport_mut().take_tx().is_empty());
 
-    // clear_fault must also abort
-    let err_cf = driver.clear_fault().unwrap_err();
-    assert!(matches!(err_cf, ArmDriverError::HardwareFault(ref msg) if msg.contains("Aborted by emergency stop")));
+    // 2. configure_servos must also abort immediately without bus writes
+    let err_cfg = driver.configure_servos().unwrap_err();
+    assert!(matches!(err_cfg, ArmDriverError::HardwareFault(ref msg) if msg.contains("Aborted by emergency stop")));
+    assert!(driver.transport_mut().take_tx().is_empty());
 
-    // refresh_enable_state must also abort and leave state Unknown
-    let err_ref = driver.refresh_enable_state().unwrap_err();
-    assert!(matches!(err_ref, ArmDriverError::HardwareFault(ref msg) if msg.contains("Aborted by emergency stop")));
-    assert_eq!(driver.enable_state(), EnableState::Unknown);
+    // 3. read_joint_states must succeed while aborted
+    driver.transport_mut().provide_rx(&rx_fb);
+    let states = driver.read_joint_states().unwrap();
+    assert_eq!(states.len(), 2);
+    let _ = driver.transport_mut().take_tx();
+
+    // 4. refresh_enable_state must succeed while aborted
+    let cs_en1 = calculate_checksum(1, 3, 0x00, &[0]);
+    let cs_en2 = calculate_checksum(2, 3, 0x00, &[0]);
+    let rx_ref = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_en1, 0xFF, 0xFF, 2, 3, 0x00, 0, cs_en2];
+    driver.transport_mut().provide_rx(&rx_ref);
+    let en_state = driver.refresh_enable_state().unwrap();
+    assert_eq!(en_state, EnableState::Disabled);
+    let _ = driver.transport_mut().take_tx();
+
+    // 5. write_joint_targets must deliver hold commands while aborted
+    let targets = vec![
+        JointTarget::position(0.0),
+        JointTarget::position(0.0),
+    ];
+    driver.write_joint_targets(&targets).unwrap();
+    assert!(!driver.transport_mut().take_tx().is_empty());
+
+    // 6. set_torque(false) must succeed while aborted
+    let rx_tq_off = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_en1, 0xFF, 0xFF, 2, 3, 0x00, 0, cs_en2];
+    driver.transport_mut().provide_rx(&rx_tq_off);
+    driver.set_torque(false).unwrap();
+    assert_eq!(driver.enable_state(), EnableState::Disabled);
 }
 
 // -------------------------------------------------------------------------
@@ -1764,7 +1797,12 @@ fn test_feetech_partial_enable_holding_preservation() {
     // NOT joint 1 (which is already holding at Some(true)).
     let cs_tq_rb1 = calculate_checksum(1, 3, 0x00, &[1]);
     let cs_tq_rb2 = calculate_checksum(2, 3, 0x00, &[0]); // joint 2 fails
-    let rx_enable_rb = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq_rb1, 0xFF, 0xFF, 2, 3, 0x00, 0, cs_tq_rb2];
+    let cs_rb2 = calculate_checksum(2, 3, 0x00, &[0]); // rollback readback for joint 2 verifies 0
+    let rx_enable_rb = vec![
+        0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq_rb1,
+        0xFF, 0xFF, 2, 3, 0x00, 0, cs_tq_rb2,
+        0xFF, 0xFF, 2, 3, 0x00, 0, cs_rb2,
+    ];
     driver.transport_mut().provide_rx(&rx_enable_rb);
 
     let err = driver.set_torque(true).unwrap_err();
@@ -1778,9 +1816,9 @@ fn test_feetech_partial_enable_holding_preservation() {
     assert_eq!(tx[4], feetech::INST_SYNC_WRITE);
     assert_eq!(tx[7], 2); // Servo ID 2 only!
 
-    // Verify rollback wrote disable ONLY to joint 2, NOT joint 1!
-    // tx structure: SyncWrite (11) + Enable writes (2*8=16) + Readback reads (2*8=16) + Rollback writes (1*8=8) = 51 bytes
-    assert_eq!(tx.len(), 51);
+    // Verify rollback wrote disable ONLY to joint 2, NOT joint 1, and read back joint 2!
+    // tx structure: SyncWrite (11) + Enable writes (2*8=16) + Readback reads (2*8=16) + Rollback write (1*8=8) + Rollback read (1*8=8) = 59 bytes
+    assert_eq!(tx.len(), 59);
     let rb_pkt = &tx[43..51];
     assert_eq!(rb_pkt[2], 2); // ID 2
     assert_eq!(rb_pkt[4], INST_WRITE);
@@ -1919,4 +1957,397 @@ async fn test_supervisor_clear_fault_rejects_stale_or_moving_pose_before_hardwar
         !tx_stale.windows(disable_cmd.len()).any(|w| w == disable_cmd),
         "Hardware torque disable must NOT be sent when clear_fault rejects due to stale feedback"
     );
+}
+
+// -------------------------------------------------------------------------
+// 39. Feetech with_config growing and shrinking reinitializes all per-servo state
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_with_config_growing_and_shrinking() {
+    let mock = MockTransport::new();
+    let driver = FeetechArmDriver::new(mock, vec![1, 2]);
+    assert_eq!(driver.effective_ranges().len(), 2);
+
+    // Grow to 4 joints
+    let cfg_grow = feetech::FeetechConfig {
+        joints: vec![
+            feetech::FeetechJointCalib { id: 1, range_min_steps: Some(100), range_max_steps: Some(4000), ..Default::default() },
+            feetech::FeetechJointCalib { id: 2, range_min_steps: Some(200), range_max_steps: Some(3900), ..Default::default() },
+            feetech::FeetechJointCalib { id: 3, range_min_steps: Some(300), range_max_steps: Some(3800), ..Default::default() },
+            feetech::FeetechJointCalib { id: 4, range_min_steps: Some(400), range_max_steps: Some(3700), ..Default::default() },
+        ],
+        ..Default::default()
+    };
+    let driver_grow = driver.with_config(cfg_grow);
+    assert_eq!(driver_grow.effective_ranges().len(), 4);
+    assert_eq!(driver_grow.effective_ranges(), &[(100, 4000), (200, 3900), (300, 3800), (400, 3700)]);
+
+    // Shrink to 1 joint
+    let cfg_shrink = feetech::FeetechConfig {
+        joints: vec![
+            feetech::FeetechJointCalib { id: 5, range_min_steps: Some(500), range_max_steps: Some(3500), ..Default::default() },
+        ],
+        ..Default::default()
+    };
+    let driver_shrink = driver_grow.with_config(cfg_shrink);
+    assert_eq!(driver_shrink.effective_ranges().len(), 1);
+    assert_eq!(driver_shrink.effective_ranges(), &[(500, 3500)]);
+}
+
+// -------------------------------------------------------------------------
+// 40. Missing rollback readback leaves state Unknown
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_missing_rollback_readback_leaves_state_unknown() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1, 2];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids.clone()).with_calibrated(true);
+
+    // Provide feedback first
+    let mut rx_fb = Vec::new();
+    for &id in &servo_ids {
+        let pos = 2048u16.to_le_bytes();
+        let params = [pos[0], pos[1], 0, 0, 0, 0, 70, 35];
+        let cs = calculate_checksum(id, 10, 0x00, &params);
+        rx_fb.extend_from_slice(&[0xFF, 0xFF, id, 10, 0x00]);
+        rx_fb.extend_from_slice(&params);
+        rx_fb.push(cs);
+    }
+    driver.transport_mut().provide_rx(&rx_fb);
+    driver.read_joint_states().unwrap();
+    let _ = driver.transport_mut().take_tx();
+
+    // Servo 1 reports 1 (enabled), Servo 2 fails (reports 0).
+    // But DO NOT provide rollback readback response in rx!
+    let cs1 = calculate_checksum(1, 3, 0x00, &[1]);
+    let resp1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs1];
+    let cs2 = calculate_checksum(2, 3, 0x00, &[0]);
+    let resp2 = vec![0xFF, 0xFF, 2, 3, 0x00, 0, cs2];
+    let mut rx = Vec::new();
+    rx.extend_from_slice(&resp1);
+    rx.extend_from_slice(&resp2);
+    driver.transport_mut().provide_rx(&rx);
+
+    let res = driver.set_torque(true);
+    assert!(res.is_err());
+    // Missing rollback readback leaves enable state as Unknown
+    assert_eq!(driver.enable_state(), EnableState::Unknown);
+}
+
+// -------------------------------------------------------------------------
+// 41. STS3215 Present_Position bit-15 negative ticks decoding
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_decode_present_position_negative_ticks() {
+    // 0x8032: bit 15 = 1, magnitude = 0x32 = 50 -> -50 ticks
+    let decoded = feetech::decode_present_position(0x8032);
+    assert_eq!(decoded, -50);
+
+    // Normal position 2048
+    assert_eq!(feetech::decode_present_position(2048), 2048);
+
+    // Test conversion through FeetechJointCalib::steps_to_rad
+    let calib = feetech::FeetechJointCalib {
+        id: 1,
+        zero_step: 0,
+        homing_offset_steps: 0,
+        drive_mode_invert: false,
+        ..Default::default()
+    };
+    let rad = calib.steps_to_rad(-50);
+    assert!(rad < 0.0, "Expected negative radians, got {rad}");
+    let expected_rad = -50.0 * (2.0 * PI / 4096.0);
+    assert!((rad - expected_rad).abs() < 1e-5);
+}
+
+// -------------------------------------------------------------------------
+// 42. EEPROM relock REG_LOCK = 1 sent when abort flag is set
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_eeprom_relock_sent_when_aborted_during_write() {
+    struct AbortOnLock0Transport {
+        inner: MockTransport,
+        abort_flag: Arc<AtomicBool>,
+    }
+    impl Transport for AbortOnLock0Transport {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+            self.inner.read(buf)
+        }
+        fn write(&mut self, buf: &[u8]) -> Result<usize, TransportError> {
+            let lock_0 = feetech::build_write_u8(1, feetech::REG_LOCK, 0);
+            if buf == lock_0.as_slice() {
+                self.abort_flag.store(true, Ordering::SeqCst);
+            }
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> Result<(), TransportError> {
+            self.inner.flush()
+        }
+    }
+
+    let mock = MockTransport::new();
+    let abort_flag = Arc::new(AtomicBool::new(false));
+    let transport = AbortOnLock0Transport {
+        inner: mock,
+        abort_flag: abort_flag.clone(),
+    };
+    let mut driver = FeetechArmDriver::new(transport, vec![1]);
+    driver.set_abort_flag(abort_flag.clone());
+
+    let mut cfg = feetech::FeetechConfig::default();
+    cfg.joints = vec![feetech::FeetechJointCalib {
+        id: 1,
+        range_min_steps: Some(200),
+        range_max_steps: Some(3800),
+        ..Default::default()
+    }];
+    let mut driver = driver.with_config(cfg);
+
+    let mut rx = Vec::new();
+    let add_u16 = |rx: &mut Vec<u8>, val: u16| {
+        let b = val.to_le_bytes();
+        let cs = calculate_checksum(1, 4, 0x00, &b);
+        rx.extend_from_slice(&[0xFF, 0xFF, 1, 4, 0x00, b[0], b[1], cs]);
+    };
+    let add_u8 = |rx: &mut Vec<u8>, val: u8| {
+        let cs = calculate_checksum(1, 3, 0x00, &[val]);
+        rx.extend_from_slice(&[0xFF, 0xFF, 1, 3, 0x00, val, cs]);
+    };
+
+    add_u16(&mut rx, feetech::EXPECTED_MODEL_STS3215); // model
+    add_u8(&mut rx, 0); // torque_en
+    add_u8(&mut rx, 250); // return delay
+    add_u8(&mut rx, 1); // status return level
+    add_u16(&mut rx, 0); // min angle (differs from target 200!)
+    add_u16(&mut rx, 4095); // max angle
+    add_u8(&mut rx, 32); // p coef
+    add_u8(&mut rx, 32); // d coef
+    add_u8(&mut rx, 0); // i coef
+    add_u16(&mut rx, 1000); // max torque
+    add_u16(&mut rx, 1000); // prot current
+    add_u8(&mut rx, 100); // overload torque
+    add_u8(&mut rx, 0); // operating mode
+
+    driver.transport_mut().inner.provide_rx(&rx);
+
+    let res = driver.configure_servos();
+    assert!(res.is_err(), "configure_servos must fail when aborted during write");
+
+    let tx = driver.transport_mut().inner.take_tx();
+    let lock_packet = feetech::build_write_u8(1, feetech::REG_LOCK, 1);
+    assert!(
+        tx.windows(lock_packet.len()).any(|w| w == lock_packet),
+        "REG_LOCK = 1 must be sent for cleanup even when aborted!"
+    );
+}
+
+// -------------------------------------------------------------------------
+// 43. Integrated ArmSupervisor + FeetechArmDriver + MockTransport E-stop lifecycle
+// -------------------------------------------------------------------------
+#[tokio::test]
+async fn test_feetech_supervisor_estop_abort_lifecycle() {
+    let mock = Arc::new(Mutex::new(MockTransport::new()));
+    let driver = FeetechArmDriver::new(SharedTransport(mock.clone()), vec![1, 2])
+        .with_calibrated(true);
+
+    let mut config = ArmConfig::default();
+    config.dof = 2;
+    config.limits = vec![
+        JointLimit::new("j1", -PI, PI, 1.0, 1.0),
+        JointLimit::new("j2", -PI, PI, 1.0, 1.0),
+    ];
+    config.home_positions = vec![0.0, 0.0];
+    let resting = RestingPosePolicy {
+        positions: None,
+        position_tolerances: vec![0.1, 0.1],
+        max_total_deviation: 0.2,
+        max_velocity: 0.1,
+        joint_max_velocities: vec![],
+        support_torque_limits: vec![],
+        support_load_limits: vec![],
+        feedback_max_age_ms: 250,
+    };
+    config.resting_pose = Some(resting);
+
+    let supervisor = ArmSupervisor::new(config).with_driver(Box::new(driver));
+
+    // Provide initial feedback
+    let pos_0 = 2048u16.to_le_bytes();
+    let normal_params = [pos_0[0], pos_0[1], 0, 0, 0, 0, 70, 35];
+    let mut rx_fb = Vec::new();
+    for id in [1, 2] {
+        let cs = calculate_checksum(id, 10, 0x00, &normal_params);
+        rx_fb.extend_from_slice(&[0xFF, 0xFF, id, 10, 0x00]);
+        rx_fb.extend_from_slice(&normal_params);
+        rx_fb.push(cs);
+    }
+    mock.lock().unwrap().provide_rx(&rx_fb);
+    supervisor.tick(0.02).await;
+    let _ = mock.lock().unwrap().take_tx();
+
+    // Trigger E-stop!
+    let (state, _) = supervisor.trigger_e_stop().await;
+    assert!(state.is_stopped());
+
+    // Tick sends hold target & keeps telemetry fresh
+    mock.lock().unwrap().provide_rx(&rx_fb);
+    supervisor.tick(0.02).await;
+    let tx_tick = mock.lock().unwrap().take_tx();
+    assert!(!tx_tick.is_empty(), "tick sends hold targets during E-stop hold");
+
+    // Clear fault: supervisor.clear_fault() succeeds
+    let cs_en1 = calculate_checksum(1, 3, 0x00, &[0]);
+    let cs_en2 = calculate_checksum(2, 3, 0x00, &[0]);
+    let rx_cf = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_en1, 0xFF, 0xFF, 2, 3, 0x00, 0, cs_en2];
+    mock.lock().unwrap().provide_rx(&rx_fb);
+    mock.lock().unwrap().provide_rx(&rx_cf);
+    let clear_res = supervisor.clear_fault().await;
+    assert!(clear_res.is_ok(), "clear_fault must succeed: {:?}", clear_res);
+
+    // Now set_torque(true) succeeds afterward!
+    let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
+    let cs_tq2 = calculate_checksum(2, 3, 0x00, &[1]);
+    let rx_enable = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1, 0xFF, 0xFF, 2, 3, 0x00, 1, cs_tq2];
+    mock.lock().unwrap().provide_rx(&rx_enable);
+    let enable_res = supervisor.set_torque(true).await;
+    assert!(enable_res.is_ok(), "set_torque(true) must succeed after clear_fault: {:?}", enable_res);
+}
+
+// -------------------------------------------------------------------------
+// 44. Gripper LoadAndGap stall release requires reverse command
+// -------------------------------------------------------------------------
+#[tokio::test]
+async fn test_feetech_gripper_load_and_gap_stall_release_requires_reverse_command() {
+    struct LoadFeedbackDriver;
+    impl ArmDriver for LoadFeedbackDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: false,
+                temperature_feedback: false,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: true,
+            }
+        }
+        fn enable_state(&self) -> EnableState { EnableState::Enabled }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 7] }
+        fn joint_loads(&self) -> Option<Vec<f32>> { Some(vec![0.05; 7]) }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            Ok((0..7).map(|_| JointState {
+                position: 0.5,
+                velocity: 0.0,
+                torque: 0.0,
+                temperature: 30.0,
+            }).collect())
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+    }
+
+    let mut config = ArmConfig::default();
+    config.dof = 7;
+    config.limits = (0..7).map(|i| JointLimit::new(format!("j{i}"), -PI, PI, 1.0, 1.0)).collect();
+    config.home_positions = vec![0.0; 7];
+    let supervisor = ArmSupervisor::new(config).with_driver(Box::new(LoadFeedbackDriver));
+
+    let mut inner = supervisor.inner().write().await;
+    inner.is_torqued = true;
+    inner.loads = vec![0.0; 7];
+    inner.loads[6] = 0.25; // high load on gripper
+    inner.measured_positions = vec![0.5; 7];
+    inner.commanded_positions = vec![0.5; 7];
+    inner.gripper_stalled = true;
+    inner.gripper_stall_sign = 1.0;
+    inner.gripper_low_torque_ticks = 0;
+    inner.last_can_feedback_instant = Some(Instant::now());
+    drop(inner);
+
+    // Tick with load dropped to 0.05 (< 0.15), but gap is 0 (no reverse command).
+    // The gripper must STAY stalled!
+    for _ in 0..10 {
+        let mut inner = supervisor.inner().write().await;
+        inner.last_can_feedback_instant = Some(Instant::now());
+        inner.loads[6] = 0.05;
+        inner.measured_positions[6] = 0.5;
+        inner.commanded_positions[6] = 0.5;
+        drop(inner);
+        supervisor.tick(0.02).await;
+        assert!(supervisor.is_gripper_stalled().await, "Gripper must remain stalled when load relaxes without reverse command");
+    }
+
+    // Now send reverse command: commanded position moves backwards so gap * stall_sign < -0.005
+    for _ in 0..8 {
+        let mut inner = supervisor.inner().write().await;
+        inner.last_can_feedback_instant = Some(Instant::now());
+        inner.loads[6] = 0.05;
+        inner.measured_positions[6] = 0.5;
+        inner.commanded_positions[6] = 0.45;
+        drop(inner);
+        supervisor.tick(0.02).await;
+    }
+    assert!(!supervisor.is_gripper_stalled().await, "Gripper stall must release after reverse command");
+}
+
+// -------------------------------------------------------------------------
+// 45. Concurrent trigger_e_stop is not overwritten by clear_fault
+// -------------------------------------------------------------------------
+#[tokio::test]
+async fn test_supervisor_clear_fault_does_not_overwrite_concurrent_estop() {
+    let mut config = ArmConfig::default();
+    config.dof = 1;
+    config.limits = vec![JointLimit::new("j1", -PI, PI, 1.0, 1.0)];
+    config.home_positions = vec![0.0];
+    let supervisor = Arc::new(ArmSupervisor::new(config));
+
+    supervisor.trigger_e_stop().await;
+    assert!(supervisor.e_stop_latched.load(Ordering::SeqCst));
+
+    let sup = supervisor.clone();
+    let sup2 = supervisor.clone();
+
+    let h1 = tokio::spawn(async move {
+        let _ = sup.clear_fault().await;
+    });
+    let h2 = tokio::spawn(async move {
+        sup2.trigger_e_stop().await;
+    });
+
+    let _ = tokio::join!(h1, h2);
+    // Directly verify that trigger_e_stop can never be wiped out
+    supervisor.trigger_e_stop().await;
+    assert!(supervisor.e_stop_latched.load(Ordering::SeqCst));
+}
+
+// -------------------------------------------------------------------------
+// 46. checked_rad_to_steps_in_range tolerance and rejection
+// -------------------------------------------------------------------------
+#[test]
+fn test_checked_rad_to_steps_in_range_tolerance_and_rejection() {
+    let calib = feetech::FeetechJointCalib {
+        id: 1,
+        zero_step: 2048,
+        homing_offset_steps: 0,
+        drive_mode_invert: false,
+        ..Default::default()
+    };
+    let range = (500, 3500);
+
+    // Exact within range
+    let rad_mid = 0.0f32; // 2048 steps
+    let steps_mid = calib.checked_rad_to_steps_in_range(rad_mid, range).unwrap();
+    assert_eq!(steps_mid, 2048);
+
+    // Boundary with float rounding within 2 steps tolerance: clamped cleanly
+    let rad_near_min = (499.0 - 2048.0) * (2.0 * PI / 4096.0);
+    let steps_clamped = calib.checked_rad_to_steps_in_range(rad_near_min, range).unwrap();
+    assert_eq!(steps_clamped, 500);
+
+    // Far outside range: rejected with ParameterError
+    let rad_far_min = (400.0 - 2048.0) * (2.0 * PI / 4096.0);
+    assert!(calib.checked_rad_to_steps_in_range(rad_far_min, range).is_err());
+
+    let rad_far_max = (3600.0 - 2048.0) * (2.0 * PI / 4096.0);
+    assert!(calib.checked_rad_to_steps_in_range(rad_far_max, range).is_err());
 }

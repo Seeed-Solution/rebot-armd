@@ -149,13 +149,7 @@ pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
     let is_5dof = input.arm.arm_dof() == 5;
     let yaw_free = is_5dof && request.auto_yaw.unwrap_or(request.orientation.is_none());
     if yaw_free && request.orientation.is_none() && request.pose.is_none() {
-        let r_start = (start.p[0] * start.p[0] + start.p[1] * start.p[1]).sqrt();
-        let r_target = (request.target[0] * request.target[0] + request.target[1] * request.target[1]).sqrt();
-        if r_start >= 0.03 && r_target >= 0.03 {
-            let dpsi = request.target[1].atan2(request.target[0]) - start.p[1].atan2(start.p[0]);
-            let rz = kinematics::axis_r(&[0.0, 0.0, 1.0], dpsi);
-            r_place = kinematics::mat_mul(&rz, &r_place);
-        }
+        r_place = motion::apply_auto_yaw(&start.p, &request.target, r_place);
         let x_tool = kinematics::column(&r_place, 0);
         if -x_tool[2] < std::f64::consts::FRAC_1_SQRT_2 {
             let down = [0.0, 0.0, -1.0];

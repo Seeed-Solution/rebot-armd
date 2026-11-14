@@ -308,14 +308,30 @@ impl KinematicChain {
         let mut f = self.frames(&q);
 
         let r_xy = (goal.p[0] * goal.p[0] + goal.p[1] * goal.p[1]).sqrt();
-        let use_auto_yaw = yaw_free && n == 5 && r_xy >= 0.03 && !is_tool_vertical(rg);
+        let use_auto_yaw = yaw_free && n == 5 && r_xy >= 0.03;
+
+        let (free_yaw, z_weight) = if use_auto_yaw {
+            let rg_x_z = k::column(rg, 0)[2];
+            let perp = (1.0 - rg_x_z * rg_x_z).max(0.0).sqrt();
+            if perp <= 0.045 {
+                (0.0, 1.0)
+            } else if perp >= 0.14 {
+                (1.0, 0.0)
+            } else {
+                let t = (perp - 0.045) / (0.14 - 0.045);
+                let fy = t * t * (3.0 - 2.0 * t);
+                (fy, 1.0 - fy)
+            }
+        } else {
+            (0.0, 1.0)
+        };
 
         let align_rot = |r_curr: &Mat3| -> Mat3 {
-            if use_auto_yaw {
+            if free_yaw > 0.0 {
                 let m = k::mat_mul(rg, &k::transpose(r_curr));
                 let a = m[0][0] + m[1][1];
                 let b = m[0][1] - m[1][0];
-                let dpsi = b.atan2(a);
+                let dpsi = b.atan2(a) * free_yaw;
                 k::mat_mul(&k::axis_r(&[0.0, 0.0, 1.0], dpsi), rg)
             } else {
                 *rg
@@ -324,7 +340,13 @@ impl KinematicChain {
 
         let mut r_eff = align_rot(&f.end.r);
         let mut e = k::pose_err_end(&f.end, &r_eff, pg, w);
-        if use_auto_yaw { e.e[5] = 0.0; }
+        e.e[5] *= z_weight;
+        let er_eff = if w > 1e-9 {
+            (e.e[3] * e.e[3] + e.e[4] * e.e[4] + e.e[5] * e.e[5]).sqrt() / w
+        } else {
+            e.er
+        };
+        e.er = er_eff;
         let mut lam = PAR.lam_min;
         let mut it = 0;
         if !(e.ep < f64::INFINITY && e.er < f64::INFINITY) {
@@ -336,7 +358,7 @@ impl KinematicChain {
             for j in 0..n {
                 let a = f.axes[j];
                 let v = k::cross(&a, &k::sub(&f.end.p, &f.origins[j]));
-                let az = if use_auto_yaw { 0.0 } else { w * a[2] };
+                let az = w * a[2] * z_weight;
                 jac[j] = [v[0], v[1], v[2], w * a[0], w * a[1], az];
             }
             let mut m = [0.0f64; 36];
@@ -363,7 +385,13 @@ impl KinematicChain {
             let fn_ = self.frames(&qn);
             let r_eff_n = align_rot(&fn_.end.r);
             let mut en = k::pose_err_end(&fn_.end, &r_eff_n, pg, w);
-            if use_auto_yaw { en.e[5] = 0.0; }
+            en.e[5] *= z_weight;
+            let en_er_eff = if w > 1e-9 {
+                (en.e[3] * en.e[3] + en.e[4] * en.e[4] + en.e[5] * en.e[5]).sqrt() / w
+            } else {
+                en.er
+            };
+            en.er = en_er_eff;
             if en.ep + w * en.er < e.ep + w * e.er {
                 q = qn; f = fn_; e = en; r_eff = r_eff_n; lam = PAR.lam_min;
             } else if lam < PAR.lam_max {
