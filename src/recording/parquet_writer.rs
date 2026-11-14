@@ -139,10 +139,12 @@ pub fn write_frames_to_parquet_with_meta(
         vec![timestamps_arr, obs_list_arr, act_list_arr],
     )?;
 
-    let file = File::create(path)?;
+    let tmp_path = path.with_extension("parquet.tmp");
+    let file = File::create(&tmp_path)?;
     let mut writer = ArrowWriter::try_new(file, schema, None)?;
     writer.write(&batch)?;
     writer.close()?;
+    std::fs::rename(&tmp_path, path)?;
 
     if let Some(m) = meta {
         let meta_path = path.with_extension("meta.json");
@@ -167,41 +169,59 @@ pub fn write_frames_to_parquet(path: &Path, frames: &[RecordFrame]) -> Result<()
 /// Read back metadata from sidecar <id>.meta.json, Parquet schema metadata, or dir meta.json fallback
 pub fn read_metadata_from_parquet(path: &Path) -> Result<Option<EpisodeMetadata>, ParquetRecordingError> {
     let meta_path = path.with_extension("meta.json");
-    if meta_path.exists() {
+    let mut meta: Option<EpisodeMetadata> = if meta_path.exists() {
         let data = std::fs::read_to_string(&meta_path)?;
         let m = serde_json::from_str::<EpisodeMetadata>(&data)
             .map_err(|e| ParquetRecordingError::Corrupted(format!("Failed to parse sidecar {}: {e}", meta_path.display())))?;
-        return Ok(Some(m));
-    }
-    let file = File::open(path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let meta_map = builder.schema().metadata();
-    let mut meta = EpisodeMetadata::default();
-    let mut found = false;
-    if let Some(pid_str) = meta_map.get("profile_id") {
-        meta.profile_id = Some(pid_str.clone());
-        found = true;
-    }
-    if let Some(ad_str) = meta_map.get("arm_dof") {
-        if let Ok(ad) = ad_str.parse::<usize>() {
-            meta.arm_dof = Some(ad);
-            found = true;
+        Some(m)
+    } else {
+        None
+    };
+
+    let needs_fallback = match &meta {
+        Some(m) => m.profile_id.is_none() || m.arm_dof.is_none() || m.gripper_joint.is_none() || m.joint_names.is_none(),
+        None => true,
+    };
+
+    if needs_fallback && path.exists() {
+        if let Ok(file) = File::open(path) {
+            if let Ok(builder) = ParquetRecordBatchReaderBuilder::try_new(file) {
+                let meta_map = builder.schema().metadata();
+                let m = meta.get_or_insert_with(EpisodeMetadata::default);
+                if m.profile_id.is_none() {
+                    if let Some(pid_str) = meta_map.get("profile_id") {
+                        m.profile_id = Some(pid_str.clone());
+                    }
+                }
+                if m.arm_dof.is_none() {
+                    if let Some(ad_str) = meta_map.get("arm_dof") {
+                        if let Ok(ad) = ad_str.parse::<usize>() {
+                            m.arm_dof = Some(ad);
+                        }
+                    }
+                }
+                if m.gripper_joint.is_none() {
+                    if let Some(gj_str) = meta_map.get("gripper_joint") {
+                        if let Ok(gj) = gj_str.parse::<usize>() {
+                            m.gripper_joint = Some(gj);
+                        }
+                    }
+                }
+                if m.joint_names.is_none() {
+                    if let Some(jn_str) = meta_map.get("joint_names") {
+                        if let Ok(jn) = serde_json::from_str::<Vec<String>>(jn_str) {
+                            m.joint_names = Some(jn);
+                        }
+                    }
+                }
+            }
         }
     }
-    if let Some(gj_str) = meta_map.get("gripper_joint") {
-        if let Ok(gj) = gj_str.parse::<usize>() {
-            meta.gripper_joint = Some(gj);
-            found = true;
+
+    if let Some(m) = meta {
+        if m.profile_id.is_some() || m.arm_dof.is_some() || m.gripper_joint.is_some() || m.joint_names.is_some() {
+            return Ok(Some(m));
         }
-    }
-    if let Some(jn_str) = meta_map.get("joint_names") {
-        if let Ok(jn) = serde_json::from_str::<Vec<String>>(jn_str) {
-            meta.joint_names = Some(jn);
-            found = true;
-        }
-    }
-    if found {
-        return Ok(Some(meta));
     }
 
     let dir_meta = path.with_file_name("meta.json");

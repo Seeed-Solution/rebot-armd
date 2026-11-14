@@ -113,7 +113,7 @@
                 <geom type="mesh" class="visual" pos="8.32667e-17 -0.000218214 0.000949706" quat="0 1 0 0" mesh="wrist_roll_follower_so101_v1" material="3d_printed_mat"/>
                 <geom name="wrist_roll_follower_so101_v1" type="mesh" class="jaw" pos="8.32667e-17 -0.000218214 0.000949706" quat="0 1 0 0" mesh="wrist_roll_follower_so101_v1" material="3d_printed_mat"/>
 
-                <site name="tcp" pos="-0.005731 -0.000159 -0.103516" size="0.006" rgba="1 0.34 0.16 1"/>
+                <site name="tcp" pos="-0.0079 -0.000218121 -0.0981274" quat="0.500000663 -0.500000663 0.499999337 0.499999337" size="0.006" rgba="1 0.34 0.16 1"/>
                 <camera name="hand_cam" pos="0 0.042894 -0.050564" xyaxes="1 0 0 0 0.819698 -0.572796" fovy="24.65"/>
                 <camera name="wrist" pos="0 0.042894 -0.050564" xyaxes="1 0 0 0 0.819698 -0.572796" fovy="24.65"/>
 

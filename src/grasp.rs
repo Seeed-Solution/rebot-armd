@@ -1202,7 +1202,7 @@ pub fn measure_detection_depth_with_cal(
     let centre_px = cam.to_px(box_centre(&det.box_norm));
     let ray = cam.ray_world_per_z(pose, centre_px);
     let h_raw = (z_bg - z_fg) * ray[2].abs();
-    if h_raw <= 0.002 { return None; }
+    if h_raw <= 0.002 || h_raw.is_nan() { return None; }
     let h = h_raw.max(0.005);
 
     let depth_m = z_fg;

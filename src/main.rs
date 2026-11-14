@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use armd::{create_router, ArmConfig, ArmSupervisor, StopPolicy, SupervisorInner};
@@ -258,14 +258,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("{follower} requires Linux SocketCAN").into());
         }
         "so-arm101" | "so-arm100" => {
+            let Some(cfg) = feetech_config else {
+                return Err(format!("{follower} requires feetech configuration in profile").into());
+            };
             let port = resolve_serial_port(cli.follower_port.as_deref());
             let baud = 1_000_000;
             let transport = armd::transport::SerialTransport::open_default(&port, baud)?;
             let mut driver = armd::driver::FeetechArmDriver::new(transport, (1..=6).collect())
-                .with_port_name(&port);
-            if let Some(cfg) = feetech_config {
-                driver = driver.with_config(cfg);
-            }
+                .with_port_name(&port)
+                .with_config(cfg);
             driver.configure_servos().map_err(|e| format!("Feetech servo configuration failed on {port}: {e}"))?;
             supervisor.set_driver(Box::new(driver)).await;
             info!("Mounted {} on {}", follower, port);
@@ -322,7 +323,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_late_log = Some(now);
             }
             // Preserve real elapsed time so the supervisor can detect stalled control ticks.
-            runtime.block_on(control_supervisor.tick(dt));
+            let tick_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(control_supervisor.tick(dt));
+            }));
+            if let Err(e) = tick_res {
+                control_supervisor.e_stop_latched.store(true, Ordering::SeqCst);
+                error!("Control thread panicked during tick: {:?}", e);
+                std::process::exit(1);
+            }
         }
     })?;
 

@@ -415,7 +415,6 @@ fn default_p_coef() -> u8 { 16 }
 fn default_d_coef() -> u8 { 32 }
 fn default_max_torque() -> u16 { 1000 }
 fn default_prot_current() -> u16 { 500 }
-fn default_overload() -> u8 { 25 }
 
 /// Per-joint Feetech servo calibration and limits
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -556,8 +555,8 @@ pub struct FeetechConfig {
     pub max_torque_raw: u16,
     #[serde(default = "default_prot_current")]
     pub protection_current_raw: u16,
-    #[serde(default = "default_overload")]
-    pub overload_torque_raw: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overload_torque_raw: Option<u8>,
     #[serde(default)]
     pub joints: Vec<FeetechJointCalib>,
 }
@@ -565,7 +564,7 @@ pub struct FeetechConfig {
 impl Default for FeetechConfig {
     fn default() -> Self {
         Self {
-            calibrated: true,
+            calibrated: false,
             tx_echo: None,
             return_delay_raw: 0,
             p_coef: 16,
@@ -573,7 +572,7 @@ impl Default for FeetechConfig {
             d_coef: 32,
             max_torque_raw: 1000,
             protection_current_raw: 500,
-            overload_torque_raw: 25,
+            overload_torque_raw: None,
             joints: Vec::new(),
         }
     }

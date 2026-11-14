@@ -164,6 +164,9 @@ pub trait Transport: Send {
     /// Flush pending writes to the underlying hardware
     fn flush(&mut self) -> Result<(), TransportError>;
 
+    /// Discard unread bytes from the hardware input buffer if supported
+    fn clear_input_buffer(&mut self) {}
+
     /// Write entire buffer until finished
     fn write_all(&mut self, mut buf: &[u8]) -> Result<(), TransportError> {
         while !buf.is_empty() {

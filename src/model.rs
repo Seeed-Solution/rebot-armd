@@ -1129,6 +1129,17 @@ impl ArmConfig {
             }
         }
         if let Some(ft) = &self.feetech {
+            if !(1..=1000).contains(&ft.max_torque_raw) {
+                return Err(format!("feetech.max_torque_raw must be 1..=1000, got {}", ft.max_torque_raw));
+            }
+            if !(1..=1000).contains(&ft.protection_current_raw) {
+                return Err(format!("feetech.protection_current_raw must be 1..=1000, got {}", ft.protection_current_raw));
+            }
+            if let Some(ot) = ft.overload_torque_raw {
+                if !(1..=100).contains(&ot) {
+                    return Err(format!("feetech.overload_torque_raw must be 1..=100, got {}", ot));
+                }
+            }
             if !ft.joints.is_empty() {
                 if ft.joints.len() != self.dof {
                     return Err(format!(
@@ -1143,6 +1154,35 @@ impl ArmConfig {
                             "Duplicate Feetech servo ID {} at joint index {}",
                             j.id, i
                         ));
+                    }
+                    if j.zero_step > 4095 {
+                        return Err(format!("Feetech joint {} zero_step must be <= 4095, got {}", i, j.zero_step));
+                    }
+                    if j.homing_offset_steps.abs() > 2047 {
+                        return Err(format!("Feetech joint {} homing_offset_steps abs must be <= 2047, got {}", i, j.homing_offset_steps));
+                    }
+                    if let Some(exp) = j.expected_homing_offset_steps {
+                        if exp.abs() > 2047 {
+                            return Err(format!("Feetech joint {} expected_homing_offset_steps abs must be <= 2047, got {}", i, exp));
+                        }
+                    }
+                    if let Some(mt) = j.max_torque_raw {
+                        if !(1..=1000).contains(&mt) {
+                            return Err(format!("Feetech joint {} max_torque_raw must be 1..=1000, got {}", i, mt));
+                        }
+                    }
+                    if let Some(pc) = j.protection_current_raw {
+                        if !(1..=1000).contains(&pc) {
+                            return Err(format!("Feetech joint {} protection_current_raw must be 1..=1000, got {}", i, pc));
+                        }
+                    }
+                    if let Some(ot) = j.overload_torque_raw {
+                        if !(1..=100).contains(&ot) {
+                            return Err(format!("Feetech joint {} overload_torque_raw must be 1..=100, got {}", i, ot));
+                        }
+                        if i < self.arm_dof() && ot < 50 {
+                            return Err(format!("Feetech arm joint {} overload_torque_raw must be >= 50, got {}", i, ot));
+                        }
                     }
                     let (eff_min, eff_max) = j.effective_range_steps();
                     if eff_min >= eff_max || eff_max > 4095 {

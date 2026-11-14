@@ -212,19 +212,20 @@
     ]
   },
   "feetech": {
+    "calibrated": false,
     "return_delay_raw": 0,
     "p_coef": 32,
     "d_coef": 32,
     "i_coef": 0,
     "max_torque_raw": 1000,
-    "protection_current_raw": 250,
+    "protection_current_raw": 500,
     "joints": [
       { "id": 1, "zero_step": 2048 },
       { "id": 2, "zero_step": 2048 },
       { "id": 3, "zero_step": 2048 },
       { "id": 4, "zero_step": 2048 },
       { "id": 5, "zero_step": 2048 },
-      { "id": 6, "zero_step": 2048 }
+      { "id": 6, "zero_step": 2048, "protection_current_raw": 250, "overload_torque_raw": 25 }
     ]
   }
 }

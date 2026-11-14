@@ -103,6 +103,7 @@ impl SerialTransport {
         })?;
 
         let _ = port.clear_break();
+        let _ = port.clear(serialport::ClearBuffer::Input);
 
         #[cfg(target_os = "linux")]
         {
@@ -122,6 +123,20 @@ impl SerialTransport {
                         "Failed to configure RS-485 (TIOCSRS485) on {}: {}",
                         normalized_port, err
                     )));
+                }
+            } else if config.rs485_rts_on_send == Some(false) {
+                let mut rs485 = SerialRs485::default();
+                let rc = unsafe { libc::ioctl(fd, TIOCGRS485 as _, &mut rs485) };
+                if rc == 0 && (rs485.flags & SER_RS485_ENABLED) != 0 {
+                    rs485.flags &= !(SER_RS485_ENABLED | SER_RS485_RTS_ON_SEND | SER_RS485_RTS_AFTER_SEND);
+                    let rc_set = unsafe { libc::ioctl(fd, TIOCSRS485 as _, &rs485) };
+                    if rc_set < 0 {
+                        let err = std::io::Error::last_os_error();
+                        return Err(TransportError::Serial(format!(
+                            "Failed to disable RS-485 (TIOCSRS485) on {}: {}",
+                            normalized_port, err
+                        )));
+                    }
                 }
             }
 
@@ -259,6 +274,10 @@ impl Transport for SerialTransport {
 
     fn flush(&mut self) -> Result<(), TransportError> {
         self.port.flush().map_err(TransportError::Io)
+    }
+
+    fn clear_input_buffer(&mut self) {
+        let _ = self.port.clear(serialport::ClearBuffer::Input);
     }
 }
 

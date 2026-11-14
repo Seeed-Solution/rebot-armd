@@ -984,3 +984,67 @@ fn test_5dof_place_plan_slightly_past_vertical_pose_succeeds_cleanly() {
     let planned = place::plan(pending).expect("place::plan must succeed cleanly without pi flip");
     assert!(planned.durations.iter().any(|&d| d > 0.0));
 }
+
+#[test]
+fn test_auto_yaw_bypassed_when_tool_is_vertical() {
+    let config = load_so101_config();
+    let arm = config.arm_model.chain().unwrap();
+
+    // Vertical tool pose (pointing straight down): pitch ~ 90 deg (1.58 rad)
+    let r_vertical = kinematics::rpy_to_r(0.0, 1.58, 0.0);
+    assert!(armd::chain::is_tool_vertical(&r_vertical));
+
+    let goal_vert = Pose::new(r_vertical, [0.22, 0.0, 0.08]);
+    let lo: [f64; 6] = std::array::from_fn(|i| f64::from(config.limits[i].min_position));
+    let hi: [f64; 6] = std::array::from_fn(|i| f64::from(config.limits[i].max_position));
+    let q_home: [f64; 6] = std::array::from_fn(|i| f64::from(config.home_positions[i]));
+
+    // Solve with yaw_free = true (auto_yaw): because tool is vertical, auto-yaw must be bypassed
+    let sol = arm.solve_dls_ex(&goal_vert, &q_home, &lo, &hi, kinematics::PAR.w, 80, true);
+    assert!(sol.ok);
+
+    // Forward kinematics of solution must stay vertical without being flipped
+    let fk = arm.fk(&sol.q);
+    assert!(armd::chain::is_tool_vertical(&fk.r));
+}
+
+#[test]
+fn test_feetech_model_validation_rejects_invalid_parameters() {
+    let mut config = load_so101_config();
+    assert!(config.validate().is_ok());
+
+    // 1. max_torque_raw == 0 rejected
+    let mut bad_cfg = config.clone();
+    bad_cfg.feetech.as_mut().unwrap().max_torque_raw = 0;
+    assert!(bad_cfg.validate().is_err());
+
+    // 2. max_torque_raw > 1000 rejected
+    let mut bad_cfg = config.clone();
+    bad_cfg.feetech.as_mut().unwrap().max_torque_raw = 1001;
+    assert!(bad_cfg.validate().is_err());
+
+    // 3. protection_current_raw == 0 rejected
+    let mut bad_cfg = config.clone();
+    bad_cfg.feetech.as_mut().unwrap().protection_current_raw = 0;
+    assert!(bad_cfg.validate().is_err());
+
+    // 4. protection_current_raw > 1000 rejected
+    let mut bad_cfg = config.clone();
+    bad_cfg.feetech.as_mut().unwrap().protection_current_raw = 1001;
+    assert!(bad_cfg.validate().is_err());
+
+    // 5. joint overload_torque_raw > 100 rejected
+    let mut bad_cfg = config.clone();
+    bad_cfg.feetech.as_mut().unwrap().joints[0].overload_torque_raw = Some(101);
+    assert!(bad_cfg.validate().is_err());
+
+    // 6. Arm joint overload_torque_raw < 50 rejected
+    let mut bad_cfg = config.clone();
+    bad_cfg.feetech.as_mut().unwrap().joints[0].overload_torque_raw = Some(49);
+    assert!(bad_cfg.validate().is_err());
+
+    // 7. Gripper joint (index 5) overload_torque_raw allowed < 50 (e.g. 25 on so-arm100)
+    let mut gripper_cfg = config.clone();
+    gripper_cfg.feetech.as_mut().unwrap().joints[5].overload_torque_raw = Some(25);
+    assert!(gripper_cfg.validate().is_ok());
+}

@@ -173,3 +173,41 @@ def test_so101_camera_rig_and_mount_rotation():
     finally:
         sim.close()
 
+
+def test_so101_fk_parity_with_daemon_profile():
+    """Verify numerical parity of MuJoCo TCP site pose against daemon KinematicChain FK (< 2 microns position deviation)."""
+    udp_port = free_udp_port()
+    sim = Simulator(udp_port, objects="cube", robot="so-arm101")
+    try:
+        idx = Indexer(sim.model)
+
+        # 1. Home position FK parity
+        # q_home = [0.0, -0.2, 0.5, 0.5, 0.0, 0.0]
+        # Daemon KinematicChain FK: p = [0.3099907, -9.3325e-6, 0.0778639]
+        q_home = [0.0, -0.2, 0.5, 0.5, 0.0, 0.0]
+        idx.set_motor_positions(sim.data, q_home)
+        mujoco.mj_kinematics(sim.model, sim.data)
+
+        st_home = sim.sim_state()
+        p_home_expected = np.array([0.3099907, -9.3325e-6, 0.0778639])
+        np.testing.assert_allclose(st_home["tcp"], p_home_expected, atol=2e-5)
+        # Verify quaternion matches expected canonical frame orientation
+        # Daemon home quat ~ [0.66695, -0.63525, 0.28198, 0.26858]
+        np.testing.assert_allclose(st_home["tcp_quat"], [0.66695, -0.63525, 0.28198, 0.26858], atol=1e-3)
+
+        # 2. Non-zero targets FK parity
+        # q_nz = [0.2, -0.3, 0.4, 0.1, -0.2, 0.0]
+        # Daemon KinematicChain FK: p = [0.3460510, -0.0606870, 0.1849334]
+        q_nz = [0.2, -0.3, 0.4, 0.1, -0.2, 0.0]
+        idx.set_motor_positions(sim.data, q_nz)
+        mujoco.mj_kinematics(sim.model, sim.data)
+
+        st_nz = sim.sim_state()
+        p_nz_expected = np.array([0.3460510, -0.0606870, 0.1849334])
+        np.testing.assert_allclose(st_nz["tcp"], p_nz_expected, atol=2e-5)
+        # Daemon nz quat ~ [0.78759, -0.59997, 0.1394, -0.01742]
+        np.testing.assert_allclose(st_nz["tcp_quat"], [0.78759, -0.59997, 0.1394, -0.01742], atol=1e-3)
+    finally:
+        sim.close()
+
+

@@ -165,7 +165,7 @@ fn test_feetech_radian_step_conversions() {
 fn test_feetech_driver_mock_loopback() {
     let mock = MockTransport::new();
     let servo_ids = vec![1, 2, 3];
-    let mut driver = FeetechArmDriver::new(mock, servo_ids.clone());
+    let mut driver = FeetechArmDriver::new(mock, servo_ids.clone()).with_calibrated(true);
 
     // 1. Test initial feedback invalid, then read_joint_states with simulated responses
     // For each servo, prepare an 8-byte response frame
