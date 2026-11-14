@@ -188,6 +188,9 @@ pub struct GraspTask {
     /// What the vision provider must offer; checked before the grasp begins.
     #[serde(default, skip_serializing_if = "TaskRequires::is_empty")]
     pub requires: TaskRequires,
+    /// Models the provider loads for the task (`POST /api/models` before the grasp begins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<TaskModels>,
     /// Free text, at most 200 bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -203,6 +206,55 @@ pub struct TaskRequires {
     /// Depth pipeline: `any` (`available.depth`) or `metric` (also `depth_model.metric`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub depth: Option<DepthReq>,
+}
+
+/// The provider's model slots a task sets (names of the provider catalogue, `GET /api/mode`
+/// `models.catalogue`). Per slot: absent = keep, `null` = unload, a name = load.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskModels {
+    #[serde(default, deserialize_with = "some_or_null", skip_serializing_if = "Option::is_none")]
+    pub detector: Option<Option<String>>,
+    #[serde(default, deserialize_with = "some_or_null", skip_serializing_if = "Option::is_none")]
+    pub depth: Option<Option<String>>,
+}
+
+/// A present field: `null` -> `Some(None)` (an absent one stays `None` through `default`).
+fn some_or_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
+}
+
+impl TaskModels {
+    fn slots(&self) -> [(&'static str, &Option<Option<String>>); 2] { [("detector", &self.detector), ("depth", &self.depth)] }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.detector.is_none() && self.depth.is_none() { return Err("models needs detector or depth".into()); }
+        for (slot, v) in self.slots() {
+            if let Some(Some(name)) = v {
+                if name.is_empty() || name.len() > 64 { return Err(format!("models.{slot} must be null or a name of 1..64 bytes")); }
+            }
+        }
+        Ok(())
+    }
+
+    /// The resident set after the switch (the provider's `resident`, with the slots this names).
+    fn after(&self, resident: &ResidentModels) -> ResidentModels {
+        ResidentModels {
+            detector: self.detector.clone().unwrap_or_else(|| resident.detector.clone()),
+            depth: self.depth.clone().unwrap_or_else(|| resident.depth.clone()),
+        }
+    }
+
+    /// `POST /api/models` body when the provider's resident set differs (every slot this names;
+    /// a provider without `models` in its mode always differs).
+    pub fn switch_body(&self, mode: &ModeInfo) -> Option<Value> {
+        if mode.models.as_ref().is_some_and(|m| self.after(&m.resident) == m.resident) { return None; }
+        let mut body = serde_json::Map::new();
+        for (slot, v) in self.slots() {
+            if let Some(name) = v { body.insert(slot.into(), serde_json::json!(name)); }
+        }
+        Some(Value::Object(body))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,6 +503,7 @@ impl GraspSetup {
                 check(valid_task_name(name), &format!("grasp task name {name:?} must be 1..32 characters of a-z, 0-9, _ and -"))?;
                 check(task.description.as_ref().is_none_or(|d| d.len() <= 200), &format!("grasp task {name}: description must be at most 200 bytes"))?;
                 check(!task.overrides.contains_key("tasks"), &format!("grasp task {name}: overrides cannot contain tasks"))?;
+                if let Some(m) = &task.models { m.validate().map_err(|e| format!("grasp task {name}: {e}"))?; }
                 base.apply_fields(&task.overrides).and_then(|s| s.validate()).map_err(|e| format!("grasp task {name}: {e}"))?;
             }
         }
@@ -627,6 +680,8 @@ pub struct DetectionFrame {
     pub image_size_px: [f64; 2],
     pub detections: Vec<Detection>,
     pub depth: Option<DepthFrameInfo>,
+    /// `model_generation`: the provider's model set the frame ran with, when reported.
+    pub model_generation: Option<u64>,
 }
 
 /// A provider's vision mode (`GET /api/mode` of rebot-vision).
@@ -655,13 +710,77 @@ pub struct ModeInfo {
     /// `mode` / `enabled` (`Ok(None)` without a mode API); used only without per-request
     /// pipelines.
     pub vision: Result<Option<VisionMode>, String>,
+    /// `models` and `ion` (a provider that can switch models, `POST /api/models`).
+    pub models: Option<ProviderModels>,
+}
+
+/// Names of the provider's loaded models (`models.resident`); None = slot empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResidentModels {
+    pub detector: Option<String>,
+    pub depth: Option<String>,
+}
+
+/// The provider's model state (`GET /api/mode` `models`, `ion`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderModels {
+    /// +1 per executed swap; every result carries the one it ran with (`model_generation`).
+    pub generation: u64,
+    pub resident: ResidentModels,
+    /// `swap.state`: `idle`, `pending`, `running` or `failed`.
+    pub swap_state: String,
+    pub swap_error: Option<String>,
+    /// Catalogue name -> `ion_mb` (None when not reported).
+    pub catalogue: BTreeMap<String, Option<f64>>,
+    /// `ion` (`base_mb`, `total_mb`, `reserve_mb`), when reported.
+    pub ion: Option<[f64; 3]>,
+}
+
+impl ProviderModels {
+    fn parse(v: &Value) -> Option<Self> {
+        let m = v.get("models")?;
+        let name = |s: Option<&Value>| s.and_then(Value::as_str).map(str::to_string);
+        let resident = m.get("resident");
+        let swap = m.get("swap");
+        let catalogue = m.get("catalogue").and_then(Value::as_array).map(|a| a.iter().filter_map(|e| {
+            Some((e.get("name")?.as_str()?.to_string(), f(e, &["ion_mb"])))
+        }).collect()).unwrap_or_default();
+        let ion = v.get("ion").and_then(|i| Some([f(i, &["base_mb"])?, f(i, &["total_mb"])?, f(i, &["reserve_mb"])?]));
+        Some(Self {
+            generation: m.get("generation").and_then(Value::as_u64)?,
+            resident: ResidentModels { detector: name(resident.and_then(|r| r.get("detector"))), depth: name(resident.and_then(|r| r.get("depth"))) },
+            swap_state: name(swap.and_then(|s| s.get("state"))).unwrap_or_else(|| "idle".into()),
+            swap_error: name(swap.and_then(|s| s.get("error"))),
+            catalogue,
+            ion,
+        })
+    }
+
+    /// The ION budget check of `set` from the catalogue (`Err(reason)` when it does not fit);
+    /// None when the provider does not report the catalogue's `ion_mb` or its `ion` budget.
+    fn budget(&self, set: &ResidentModels) -> Option<Result<(), String>> {
+        let [base, total, reserve] = self.ion?;
+        let mut need = base + reserve;
+        for name in [&set.detector, &set.depth].into_iter().flatten() {
+            need += (*self.catalogue.get(name)?)?;
+        }
+        Some(if need <= total + 1e-9 { Ok(()) } else { Err(refusal_message("ION_BUDGET", Some(need), Some(total))) })
+    }
+}
+
+/// A provider's refusal (`error`, with `need_mb` / `limit_mb` for `ION_BUDGET`).
+fn refusal_message(error: &str, need: Option<f64>, limit: Option<f64>) -> String {
+    match (need, limit) {
+        (Some(n), Some(l)) => format!("{error} (need {n:.1} MB, limit {l:.1} MB)"),
+        _ => error.to_string(),
+    }
 }
 
 impl ModeInfo {
     /// Parse a `GET /api/mode` body (`None` = 404).
     pub fn parse(v: Option<&Value>) -> Self {
         let Some(v) = v else {
-            return Self { reported: false, per_request_pipelines: false, depth_available: false, depth_metric: false, model_kind: None, vision: Ok(None) };
+            return Self { reported: false, per_request_pipelines: false, depth_available: false, depth_metric: false, model_kind: None, vision: Ok(None), models: None };
         };
         let vision = match v.get("mode").and_then(Value::as_str) {
             Some(mode) => Ok(Some(VisionMode { mode: mode.to_string(), enabled: v.get("enabled").and_then(Value::as_bool).unwrap_or(false) })),
@@ -674,6 +793,7 @@ impl ModeInfo {
             depth_metric: v.get("depth_model").and_then(|d| d.get("metric")).and_then(Value::as_bool).unwrap_or(false),
             model_kind: v.get("model").and_then(|m| m.get("kind")).and_then(Value::as_str).map(str::to_string),
             vision,
+            models: ProviderModels::parse(v),
         }
     }
 
@@ -686,7 +806,7 @@ impl ModeInfo {
         let vision = if per_request_pipelines { Ok(None) } else { source.vision_mode().await };
         Ok(Self {
             reported: per_request_pipelines || matches!(vision, Ok(Some(_))),
-            per_request_pipelines, depth_available, depth_metric: false, model_kind: None, vision,
+            per_request_pipelines, depth_available, depth_metric: false, model_kind: None, vision, models: None,
         })
     }
 }
@@ -739,6 +859,11 @@ pub trait DetectionSource: Send + Sync {
     fn set_vision_mode(&self, _mode: &VisionMode) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async { Err("vision mode not supported".to_string()) })
     }
+    /// `POST /api/models` with `body`: the reply's status and JSON body (`Err` = unreachable or
+    /// timed out). Default: a provider without the route (404).
+    fn set_models(&self, _body: &Value) -> BoxFuture<'_, Result<(u16, Value), String>> {
+        Box::pin(async { Ok((404, Value::Null)) })
+    }
     /// Everything a grasp reads from the provider's mode, once per grasp (one `GET /api/mode`
     /// for the HTTP source). `Err` = provider unreachable.
     fn mode_info(&self) -> BoxFuture<'_, Result<ModeInfo, String>> {
@@ -789,7 +914,8 @@ impl HttpDetectionSource {
             Some(DepthFrameInfo { metric_model, table_samples })
         });
         let detections = parse_detections(v.get("detections").unwrap_or(&Value::Null), size);
-        Some(DetectionFrame { frame_id, captured_at, image_size_px: size, detections, depth })
+        let model_generation = v.get("model_generation").and_then(Value::as_u64);
+        Some(DetectionFrame { frame_id, captured_at, image_size_px: size, detections, depth, model_generation })
     }
 }
 
@@ -856,6 +982,13 @@ impl DetectionSource for HttpDetectionSource {
         Box::pin(async move {
             let v = crate::api::proxy::request_json_opt(&self.upstream, "GET", "/api/mode", None, Duration::from_secs(2)).await?;
             Ok(ModeInfo::parse(v.as_ref()))
+        })
+    }
+    fn set_models(&self, body: &Value) -> BoxFuture<'_, Result<(u16, Value), String>> {
+        let body = body.to_string();
+        Box::pin(async move {
+            let (status, v) = crate::api::proxy::request_status_json(&self.upstream, "POST", "/api/models", Some(body.as_bytes()), Duration::from_secs(2)).await?;
+            Ok((status.as_u16(), v))
         })
     }
     fn per_request_pipelines(&self) -> BoxFuture<'_, Result<bool, String>> {
@@ -1712,6 +1845,8 @@ pub struct GraspRequest {
     pub task: Option<String>,
     /// The task's perception requirements (empty without a task).
     pub requires: TaskRequires,
+    /// The task's model switch (None without a task or when it names no models).
+    pub models: Option<TaskModels>,
 }
 
 /// Body of `/api/v1/action/grasp`: `{label, box_norm, frame_id?, ts_ms?, task?, overrides?, tag?}`.
@@ -1739,11 +1874,13 @@ pub fn parse_grasp(body: &Value, base: &GraspSetup) -> Result<GraspRequest, Moti
     };
     let mut setup = base.without_tasks();
     let mut requires = TaskRequires::default();
+    let mut models = None;
     if let Some(name) = &task {
         let t = base.tasks.get(name).ok_or_else(|| bad(&format!("unknown grasp task: {name}")))?;
         setup = setup.patched_request(&Value::Object(t.overrides.clone()))
             .map_err(|e| MotionError::InvalidCommand(format!("grasp task {name}: {e}")))?;
         requires = t.requires;
+        models = t.models.clone();
     }
     match body.get("overrides") {
         None | Some(Value::Null) => {}
@@ -1754,7 +1891,7 @@ pub fn parse_grasp(body: &Value, base: &GraspSetup) -> Result<GraspRequest, Moti
         Some(Value::String(s)) if s.len() <= 64 => Some(s.clone()),
         _ => return Err(bad("tag must be a string of at most 64 bytes")),
     };
-    Ok(GraspRequest { label, box_norm, frame_id, setup, tag, task, requires })
+    Ok(GraspRequest { label, box_norm, frame_id, setup, tag, task, requires, models })
 }
 
 /// A request checked under the lock, ready to be planned outside it.
@@ -1880,19 +2017,85 @@ fn task_unsupported(message: String) -> ArmError {
     ArmError::Rejected { status: 422, code: TASK_UNSUPPORTED.to_string(), message }
 }
 
-/// Task requirement check of a planned grasp, outside the supervisor lock and before the
-/// action begins. Without requirements nothing is read. Otherwise one mode reading, kept in
-/// `planned.mode` for the orchestrator; a provider that cannot be read is not a task failure
-/// (the grasp then fails as without a task).
+/// One model-changing preflight at a time (armd talks to one provider; its swap is one at a time).
+static MODEL_SWITCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// How long a preflight waits for the provider's swap (`/api/mode` polled).
+const MODEL_SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Task check of a planned grasp, outside the supervisor lock and before the action begins.
+/// Without requirements and models nothing is read. Otherwise one mode reading, kept in
+/// `planned.mode` for the orchestrator; with `models` and a different resident set the provider
+/// switches models first (serialized, [`switch_models`]) and the post-switch reading is kept. A
+/// provider that cannot be read is not a task failure (the grasp then fails as without a task).
 pub async fn preflight(source: &dyn DetectionSource, planned: &mut PlannedGrasp) -> Result<(), ArmError> {
-    let (Some(task), false) = (planned.request.task.as_deref(), planned.request.requires.is_empty()) else { return Ok(()); };
-    let mode = source.mode_info().await;
+    let request = &planned.request;
+    let Some(task) = request.task.as_deref().filter(|_| !request.requires.is_empty() || request.models.is_some()) else { return Ok(()); };
+    let _serial = if request.models.is_some() { Some(MODEL_SWITCH.lock().await) } else { None };
+    let mut mode = source.mode_info().await;
+    if let (Some(models), Ok(m)) = (&request.models, &mode) {
+        if let Some(body) = models.switch_body(m) {
+            mode = switch_models(source, &body, task).await?;
+        }
+    }
     let verdict = match &mode {
-        Ok(m) => planned.request.requires.check(task, m),
+        Ok(m) => request.requires.check(task, m),
         Err(_) => Ok(()),
     };
     planned.mode = Some(mode);
     verdict.map_err(task_unsupported)
+}
+
+/// `POST /api/models`, then `/api/mode` polled until the provider published the returned
+/// generation and its swap is idle (or failed). Refusals are TASK_UNSUPPORTED; an unreachable
+/// provider or a swap that does not finish in time is the returned `Err` reading.
+async fn switch_models(source: &dyn DetectionSource, body: &Value, task: &str) -> Result<Result<ModeInfo, String>, ArmError> {
+    let refused = |why: String| task_unsupported(format!("task {task}: {why}"));
+    let (status, reply) = match source.set_models(body).await {
+        Ok(r) => r,
+        Err(e) => return Ok(Err(format!("model switch failed: {e}"))),
+    };
+    let error = reply.get("error").and_then(Value::as_str).unwrap_or("refused");
+    match status {
+        200..=299 => {}
+        404 => return Err(refused("provider cannot switch models".into())),
+        409 if error == "SWAP_BUSY" => return Err(refused("model switch busy".into())),
+        400..=499 => return Err(refused(format!("model switch refused: {}", refusal_message(error, f(&reply, &["need_mb"]), f(&reply, &["limit_mb"]))))),
+        _ => return Ok(Err(format!("model switch failed: detector returned {status}"))),
+    }
+    let Some(generation) = reply.get("generation").and_then(Value::as_u64) else {
+        return Ok(Err("model switch reply has no generation".into()));
+    };
+    let deadline = Instant::now() + MODEL_SWITCH_TIMEOUT;
+    loop {
+        let m = match source.mode_info().await {
+            Ok(m) => m,
+            Err(e) => return Ok(Err(e)),
+        };
+        if let Some(pm) = m.models.as_ref().filter(|pm| pm.generation >= generation && matches!(pm.swap_state.as_str(), "idle" | "failed")) {
+            if pm.swap_state == "failed" {
+                return Err(refused(format!("model switch failed: {}", pm.swap_error.as_deref().unwrap_or("unknown error"))));
+            }
+            return Ok(Ok(m));
+        }
+        if Instant::now() >= deadline {
+            return Ok(Err(format!("model switch did not finish within {} s", MODEL_SWITCH_TIMEOUT.as_secs())));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The dry-run task verdict on one mode reading (no switch): a budget refusal computed from the
+/// provider's catalogue, else `needs model switch` (supported) when the resident set differs,
+/// else the requirement check on the current set.
+fn task_verdict(task: &str, requires: &TaskRequires, models: Option<&TaskModels>, mode: &ModeInfo) -> (bool, Option<String>) {
+    if let Some(want) = models.filter(|w| w.switch_body(mode).is_some()) {
+        let budget = mode.models.as_ref().and_then(|pm| pm.budget(&want.after(&pm.resident)));
+        return match budget {
+            Some(Err(why)) => (false, Some(format!("task {task}: model switch refused: {why}"))),
+            _ => (true, Some("needs model switch".into())),
+        };
+    }
+    match requires.check(task, mode) { Ok(()) => (true, None), Err(r) => (false, Some(r)) }
 }
 
 /// Result of a grasp dry run.
@@ -1902,7 +2105,8 @@ pub struct DryRun {
     pub code: Option<String>,
     pub message: Option<String>,
     /// Requests with a task: whether the provider serves its requirements (true when it has
-    /// none or the provider cannot be read) and why not.
+    /// none or the provider cannot be read) and why not (`needs model switch`, supported, when
+    /// the task's models differ from the resident ones).
     pub task: Option<(bool, Option<String>)>,
 }
 
@@ -1930,16 +2134,17 @@ pub async fn dry_run(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, Op
     (reachable, code, message)
 }
 
-/// [`dry_run`] plus the task requirement check: one `/api/mode` reading when the request's
-/// task has requirements, none otherwise. The requirement result does not change `reachable`.
+/// [`dry_run`] plus the task check ([`task_verdict`]): one `/api/mode` reading when the
+/// request's task has requirements or models, none otherwise; never a model switch. The task
+/// result does not change `reachable`.
 pub async fn dry_run_task(supervisor: &Arc<ArmSupervisor>, source: &dyn DetectionSource, body: &Value) -> DryRun {
     let (reachable, code, message, request) = dry_run_plan(supervisor, body).await;
     let task = match request {
-        Some((Some(name), requires)) => Some(if requires.is_empty() {
+        Some((Some(name), requires, models)) => Some(if requires.is_empty() && models.is_none() {
             (true, None)
         } else {
             match source.mode_info().await {
-                Ok(m) => match requires.check(&name, &m) { Ok(()) => (true, None), Err(r) => (false, Some(r)) },
+                Ok(m) => task_verdict(&name, &requires, models.as_ref(), &m),
                 Err(_) => (true, None),
             }
         }),
@@ -1948,8 +2153,8 @@ pub async fn dry_run_task(supervisor: &Arc<ArmSupervisor>, source: &dyn Detectio
     DryRun { reachable, code, message, task }
 }
 
-/// (reachable, code, message, (task, requires) when the request parsed).
-async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, Option<String>, Option<String>, Option<(Option<String>, TaskRequires)>) {
+/// (reachable, code, message, (task, requires, models) when the request parsed).
+async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, Option<String>, Option<String>, Option<(Option<String>, TaskRequires, Option<TaskModels>)>) {
     let pending_res = {
         let inner = supervisor.inner().read().await;
         prepare(&inner, body, inner.safety.epoch_id())
@@ -1960,7 +2165,7 @@ async fn dry_run_plan(supervisor: &Arc<ArmSupervisor>, body: &Value) -> (bool, O
     };
     match pending_res {
         Ok(pending) => {
-            let task = Some((pending.request.task.clone(), pending.request.requires));
+            let task = Some((pending.request.task.clone(), pending.request.requires, pending.request.models.clone()));
             let (reachable, code, message) = match tokio::task::spawn_blocking(move || plan(pending)).await {
                 Ok(Ok(_planned)) => (true, None, None),
                 Ok(Err(e)) => rejected(e),
@@ -2025,6 +2230,8 @@ struct Orchestrator {
     lens_known: bool,
     /// Perception API depth pipeline is available.
     depth_available: bool,
+    /// The provider's model generation at the start: a frame from another one fails the grasp.
+    generation: Option<u64>,
 }
 
 impl std::ops::Deref for Orchestrator {
@@ -2046,6 +2253,11 @@ impl Orchestrator {
             return Err(crate::macro_action::arm_fail(e.into()));
         }
         self.ctx.move_arm(phase, spec, Speed { linear, angular: motion::DEFAULT_ANGULAR_RPS }).await
+    }
+
+    /// The frame ran with the model set the grasp started with (or either side does not report it).
+    fn same_models(&self, frame: &DetectionFrame) -> bool {
+        !matches!((self.generation, frame.model_generation), (Some(a), Some(b)) if a != b)
     }
 
     async fn set_mask_focus(&self, label: Option<String>, box_norm: [f64; 4], ttl_ms: u64) {
@@ -2098,6 +2310,7 @@ impl Orchestrator {
                 }
                 Err(e) => return Err(fail("DETECTION_UNAVAILABLE", format!("Detection source failed: {e}"))),
             };
+            if !self.same_models(&frame) { return Err(fail("DETECTION_UNAVAILABLE", "model changed during grasp")); }
             rescale_frame_to_cam(&mut frame, &self.cam);
             *after = Some(frame.frame_id);
             last_frame = Instant::now();
@@ -2577,7 +2790,8 @@ impl Orchestrator {
             box_norm: planned.request.box_norm,
             ttl_ms: 2000,
         };
-        if let Ok(Some(mut frame0)) = self.source.trigger_with_focus(&["yolo", "depth"], TRIGGER_WAIT_MS, Some(&focus)).await {
+        // a frame of another model set is no depth frame (the next centring frame fails the grasp)
+        if let Ok(Some(mut frame0)) = self.source.trigger_with_focus(&["yolo", "depth"], TRIGGER_WAIT_MS, Some(&focus)).await.map(|f| f.filter(|f| self.same_models(f))) {
             rescale_frame_to_cam(&mut frame0, &self.cam);
             if let Some(ref d) = frame0.depth {
                 cache.prior = extract_table_obs(&self.cam, pose0, d, s.table_z_m);
@@ -2621,7 +2835,7 @@ impl Orchestrator {
             box_norm: c.last.box_norm,
             ttl_ms: 2000,
         };
-        if let Ok(Some(mut overhead_frame)) = self.source.trigger_with_focus(&["yolo", "depth"], TRIGGER_WAIT_MS, Some(&focus)).await {
+        if let Ok(Some(mut overhead_frame)) = self.source.trigger_with_focus(&["yolo", "depth"], TRIGGER_WAIT_MS, Some(&focus)).await.map(|f| f.filter(|f| self.same_models(f))) {
             rescale_frame_to_cam(&mut overhead_frame, &self.cam);
             *after = Some(overhead_frame.frame_id);
             if metric_table_contradicts_fk(&self.cam, &c.pose, overhead_frame.depth.as_ref(), s.table_z_m) {
@@ -3390,6 +3604,7 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
     let per_request = mode.as_ref().map(|m| m.per_request_pipelines).map_err(Clone::clone);
     let triggered = per_request == Ok(true);
     let depth_available = mode.as_ref().is_ok_and(|m| m.depth_available);
+    let generation = mode.as_ref().ok().and_then(|m| m.models.as_ref()).map(|pm| pm.generation);
     let vision = mode.map_or(Ok(None), |m| m.vision);
     let ctx = MacroCtx {
         sup: sup.clone(), id, deadline, phase_timeout_s: setup.phase_timeout_s, timeout_code: "GRASP_TIMEOUT",
@@ -3397,7 +3612,7 @@ async fn run(sup: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, id: u64,
     };
     let envelope = envelope(planned.input.ws.as_ref(), &planned.input.cam, &cam.rec);
     let lens_known = planned.input.cam.offset_m.is_some();
-    let orch = Orchestrator { ctx, source: source.clone(), setup, cam, envelope, triggered, lens_known, depth_available };
+    let orch = Orchestrator { ctx, source: source.clone(), setup, cam, envelope, triggered, lens_known, depth_available, generation };
     let result = if let Err(e) = per_request {
         Err(fail("DETECTION_UNAVAILABLE", format!("Cannot reach the vision provider: {e}")))
     } else if triggered {
@@ -3544,7 +3759,7 @@ mod tests {
         let full = ModeInfo::parse(Some(&serde_json::json!({"mode": "yolo", "enabled": true, "per_request_pipelines": true,
             "model": {"kind": "segment"}, "available": {"depth": true}, "depth_model": {"metric": true}})));
         assert_eq!(full, ModeInfo { reported: true, per_request_pipelines: true, depth_available: true, depth_metric: true,
-            model_kind: Some("segment".into()), vision: Ok(Some(VisionMode { mode: "yolo".into(), enabled: true })) });
+            model_kind: Some("segment".into()), vision: Ok(Some(VisionMode { mode: "yolo".into(), enabled: true })), models: None });
         // available.depth is read independently of depth_model.metric
         let depth_off = ModeInfo::parse(Some(&serde_json::json!({"available": {"depth": false}, "depth_model": {"metric": true}})));
         assert!(!depth_off.depth_available && depth_off.depth_metric && depth_off.vision.is_err());
@@ -3561,6 +3776,47 @@ mod tests {
             "task t needs model_kind detect, provider does not report model.kind");
         assert_eq!(req(Some(ModelKind::Detect), None).check("t", &legacy).unwrap_err(), "task t needs model_kind detect, provider does not report model.kind");
         assert_eq!(req(None, Some(DepthReq::Any)).check("t", &legacy).unwrap_err(), "task t needs depth any, provider does not report depth");
+    }
+
+    #[test]
+    fn task_models_are_tri_state_per_slot() {
+        let s = tasks_setup(serde_json::json!({
+            "a": {"models": {"detector": "seg"}}, "b": {"models": {"depth": null}}, "c": {"models": {"detector": null, "depth": "zd"}}})).unwrap();
+        let m = |t: &str| s.tasks[t].models.clone().unwrap();
+        assert_eq!(m("a"), TaskModels { detector: Some(Some("seg".into())), depth: None });
+        assert_eq!(m("b"), TaskModels { detector: None, depth: Some(None) });
+        assert_eq!(m("c"), TaskModels { detector: Some(None), depth: Some(Some("zd".into())) });
+        // round trip: absent stays absent, null stays null
+        assert_eq!(serde_json::to_value(&s.tasks["b"]).unwrap(), serde_json::json!({"overrides": {}, "models": {"depth": null}}));
+        for bad in [serde_json::json!({"models": {}}), serde_json::json!({"models": {"detector": ""}}),
+                    serde_json::json!({"models": {"detector": "x".repeat(65)}}), serde_json::json!({"models": {"gpu": "x"}}),
+                    serde_json::json!({"models": {"detector": 3}})] {
+            assert!(tasks_setup(serde_json::json!({"a": bad.clone()})).is_err(), "{bad}");
+        }
+        // the switch body names every slot of the task when the resident set differs
+        let mode = |det: Option<&str>, depth: Option<&str>| ModeInfo::parse(Some(&serde_json::json!({"mode": "yolo",
+            "models": {"generation": 3, "swap": {"state": "idle", "generation": 3}, "resident": {"detector": det, "depth": depth},
+                       "catalogue": [{"name": "seg", "kind": "segment", "ion_mb": 19.5}, {"name": "zd", "kind": "depth", "ion_mb": 20.5},
+                                     {"name": "det", "kind": "detect"}]},
+            "ion": {"base_mb": 21.5, "used_mb": 41.0, "total_mb": 62.9, "reserve_mb": 8.0}})));
+        assert_eq!(m("a").switch_body(&mode(Some("seg"), Some("zd"))), None);
+        assert_eq!(m("a").switch_body(&mode(Some("det"), None)), Some(serde_json::json!({"detector": "seg"})));
+        assert_eq!(m("c").switch_body(&mode(Some("det"), None)), Some(serde_json::json!({"detector": null, "depth": "zd"})));
+        assert_eq!(m("b").switch_body(&mode(Some("det"), None)), None);
+        assert!(m("b").switch_body(&ModeInfo::parse(Some(&serde_json::json!({"mode": "yolo"})))).is_some(), "no models: always switch");
+        // provider state and the catalogue budget
+        let pm = mode(Some("det"), None).models.unwrap();
+        assert_eq!((pm.generation, pm.swap_state.as_str(), pm.ion), (3, "idle", Some([21.5, 62.9, 8.0])));
+        assert_eq!(pm.catalogue.get("det"), Some(&None));
+        let set = |d: &str, z: Option<&str>| ResidentModels { detector: Some(d.into()), depth: z.map(str::to_string) };
+        assert_eq!(pm.budget(&set("seg", None)), Some(Ok(())));
+        assert_eq!(pm.budget(&set("seg", Some("zd"))), Some(Err("ION_BUDGET (need 69.5 MB, limit 62.9 MB)".into())));
+        assert_eq!(pm.budget(&set("det", Some("zd"))), None, "det has no ion_mb");
+        let req = TaskRequires { model_kind: Some(ModelKind::Segment), depth: None };
+        assert_eq!(task_verdict("a", &req, Some(&m("a")), &mode(Some("det"), Some("zd"))),
+                   (false, Some("task a: model switch refused: ION_BUDGET (need 69.5 MB, limit 62.9 MB)".into())));
+        assert_eq!(task_verdict("a", &req, Some(&m("a")), &mode(Some("det"), None)), (true, Some("needs model switch".into())));
+        assert!(!task_verdict("a", &req, Some(&m("a")), &mode(Some("seg"), None)).0, "model.kind not reported");
     }
 
     #[test]
@@ -3724,7 +3980,7 @@ mod tests {
     #[test]
     fn tracker_widens_the_gate_for_a_box_at_the_border() {
         let setup = GraspSetup::default();
-        let frame = |b: [f64; 4]| DetectionFrame { frame_id: 1, captured_at: Instant::now(), image_size_px: [640.0, 360.0], detections: vec![Detection { label: "cube".into(), ..det(b, None) }], depth: None };
+        let frame = |b: [f64; 4]| DetectionFrame { frame_id: 1, captured_at: Instant::now(), image_size_px: [640.0, 360.0], detections: vec![Detection { label: "cube".into(), ..det(b, None) }], depth: None, model_generation: None };
         // predicted cut box (v 0.9..1.0) after a step; the box seen whole is 96 px higher
         let seen = frame([0.4, 300.0 / 360.0 - 0.3, 0.5, 300.0 / 360.0]);
         let cut = Tracker { label: "cube".into(), predicted: [0.4, 0.9, 0.5, 1.0], gate_px: setup.match_dist_px };
@@ -4373,6 +4629,7 @@ mod tests {
                 depth_width_px: None,
             }],
             depth: None,
+            model_generation: None,
         };
         let cam_aniso = CamModel {
             rec: crate::kinematics::IDENTITY,
@@ -4556,7 +4813,7 @@ mod tests {
             depth_angle_deg: (!mask).then_some(30.0), depth_width_px: (!mask).then_some(40.0),
             ..det([0.4, 0.4, 0.6, 0.6], None)
         };
-        let frame = |d: Detection| DetectionFrame { frame_id: 1, captured_at: Instant::now(), image_size_px: [1280.0, 540.0], detections: vec![d], depth: None };
+        let frame = |d: Detection| DetectionFrame { frame_id: 1, captured_at: Instant::now(), image_size_px: [1280.0, 540.0], detections: vec![d], depth: None, model_generation: None };
         let (mut fm, mut fd) = (frame(mk(true)), frame(mk(false)));
         rescale_frame_to_cam(&mut fm, &cam);
         rescale_frame_to_cam(&mut fd, &cam);

@@ -35,6 +35,7 @@ enable_testing()
 add_executable(vision_control_test
     ${CMAKE_CURRENT_LIST_DIR}/vision_control_test.cpp
     ${MAIN}/vision_control.cpp
+    ${MAIN}/model_catalogue.cpp
     ${MAIN}/result_json.cpp
     ${MAIN}/depth_geom.cpp
     ${MAIN}/http_control.cpp)
@@ -42,6 +43,12 @@ target_include_directories(vision_control_test PRIVATE ${MAIN})
 target_compile_options(vision_control_test PRIVATE -Wall -Wextra)
 target_link_libraries(vision_control_test PRIVATE rv_json Threads::Threads)
 add_test(NAME vision_control COMMAND vision_control_test)
+
+add_executable(model_catalogue_test ${CMAKE_CURRENT_LIST_DIR}/model_catalogue_test.cpp ${MAIN}/model_catalogue.cpp)
+target_include_directories(model_catalogue_test PRIVATE ${MAIN})
+target_compile_options(model_catalogue_test PRIVATE -Wall -Wextra)
+target_link_libraries(model_catalogue_test PRIVATE rv_json)
+add_test(NAME model_catalogue COMMAND model_catalogue_test)
 
 add_executable(camera_model_test ${CMAKE_CURRENT_LIST_DIR}/camera_model_test.cpp ${MAIN}/camera_model.cpp)
 target_include_directories(camera_model_test PRIVATE ${MAIN})

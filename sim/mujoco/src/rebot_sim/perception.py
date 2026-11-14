@@ -12,6 +12,10 @@
   / length_px / jaw_clear and the body a `depth` object with table_samples, computed from the
   rendered depth and the ground-truth masks (camera.depth_result). Box noise does not change
   the depth fields; detections without a mask (false detections) get none.
+- `POST /api/models` as rebot-vision (202 + generation, SWAP_BUSY, ION_BUDGET from the catalogue
+  ion_mb): catalogue `seg` (kind segment), `det` (kind detect: no angle_deg / angle_conf /
+  grasp_width_px, as --no-mask-angle) and, with a depth model, `depth`. The swap is applied on the
+  next frame. The startup set (--no-mask-angle, --depth) is not budget-checked.
 """
 from __future__ import annotations
 
@@ -33,6 +37,10 @@ MODES = ("off", "yolo", "aruco", "both")
 MAX_SUBSCRIPTIONS = 16
 IDLE_FPS = 1
 MODE_PIPELINES = {"off": [], "yolo": ["yolo"], "aruco": ["aruco"], "both": ["yolo", "aruco"]}
+# model catalogue (kind, ion_mb) and ION budget as rebot-vision's defaults: seg + depth does not fit
+MODELS = {"seg": ("segment", 19.5), "det": ("detect", 8.5), "depth": ("depth", 20.5)}
+ION = {"base_mb": 21.5, "total_mb": 62.9, "reserve_mb": 8.0}
+MASK_FIELDS = ("angle_deg", "angle_conf", "grasp_width_px")
 
 
 def _box_iou(b1: list[float], b2: list[float]) -> float:
@@ -167,11 +175,14 @@ class Perception:
 
     def __init__(self, max_fps: int, depth=None, model_kind: str = "segment"):
         self.max_fps = max_fps
-        # /api/mode model.kind: "segment" (mask angle and width), "detect" with --no-mask-angle
-        self.model_kind = model_kind
-        self.depth_model = depth if depth is not None and depth.enabled else None
-        # "depth" only with a depth model: without one every body is as before
-        self.pipelines = PIPELINES + ("depth",) if self.depth_model else PIPELINES
+        self._depth = depth if depth is not None and depth.enabled else None  # what `depth` loads
+        # resident models: "seg" (mask angle and width) or "det" (--no-mask-angle), and "depth"
+        self.detector: str | None = "seg" if model_kind == "segment" else "det"
+        self.depth_model = self._depth
+        self.catalogue = {n: v for n, v in MODELS.items() if n != "depth" or self._depth}
+        self.generation = 0
+        self.swap: dict | None = None  # the pending swap: {"detector"?: name|None, "depth"?: name|None}
+        self.swap_state = "idle"
         self.mode, self.enabled, self.last_active = "off", False, "yolo"
         self.subs: dict[str, dict] = {}
         self._ids = itertools.count(1)
@@ -184,6 +195,56 @@ class Perception:
         self._gate = 0.0  # mono of the last frame the continuous rate let through
         self.frames_in: list[float] = []
         self.results_out: list[float] = []
+
+    @property
+    def model_kind(self) -> str:
+        """/api/mode model.kind of the resident detector ("detect" with the slot empty)."""
+        return MODELS[self.detector][0] if self.detector else "detect"
+
+    @property
+    def pipelines(self) -> tuple[str, ...]:
+        # "depth" only with a depth model: without one every body is as before
+        return PIPELINES + ("depth",) if self.depth_model else PIPELINES
+
+    # ---- models
+    def _budget(self, detector: str | None, depth: str | None) -> tuple[bool, float]:
+        need = ION["base_mb"] + ION["reserve_mb"] + sum(self.catalogue[n][1] for n in (detector, depth) if n)
+        return need <= ION["total_mb"] + 1e-9, need
+
+    def request_swap(self, body: dict) -> tuple[int, dict]:
+        """POST /api/models: validate, budget-check the resident set with the request applied and
+        store it as the single pending swap (applied by the next frame)."""
+        if not body or not set(body) <= {"detector", "depth"}:
+            raise ValueError("body needs detector or depth (and nothing else)")
+        for slot, name in body.items():
+            if name is not None and (name not in self.catalogue or (self.catalogue[name][0] == "depth") != (slot == "depth")):
+                raise ValueError(f"no {slot} model named {name!r}")
+        if self.swap is not None:
+            return 409, {"api_version": API_VERSION, "error": "SWAP_BUSY"}
+        ok, need = self._budget(body.get("detector", self.detector), body.get("depth", self._resident_depth()))
+        if not ok:
+            return 409, {"api_version": API_VERSION, "error": "ION_BUDGET", "need_mb": round(need, 3), "limit_mb": ION["total_mb"]}
+        self.swap, self.swap_state = dict(body), "pending"
+        return 202, {"api_version": API_VERSION, "generation": self.generation + 1}
+
+    def _resident_depth(self) -> str | None:
+        return "depth" if self.depth_model else None
+
+    def _apply_swap(self) -> None:
+        """The pending swap, on the frame thread (under cond)."""
+        if "detector" in self.swap:
+            self.detector = self.swap["detector"]
+        if "depth" in self.swap:
+            self.depth_model = self._depth if self.swap["depth"] else None
+        self.swap, self.swap_state = None, "idle"
+        self.generation += 1
+
+    def models_body(self) -> dict:
+        return {"generation": self.generation,
+                "swap": {"state": self.swap_state, "generation": self.generation + (self.swap is not None)},
+                "resident": {"detector": self.detector, "depth": self._resident_depth()},
+                "catalogue": [{"name": n, "kind": k, "path": f"sim:{n}", "ion_mb": mb,
+                               "resident": n in (self.detector, self._resident_depth())} for n, (k, mb) in self.catalogue.items()]}
 
     # ---- subscriptions
     def _expire(self) -> None:
@@ -243,6 +304,8 @@ class Perception:
         `depth`: camera.depth_result of the same render (with its physics_step), or None."""
         now = time.monotonic()
         with self.cond:
+            if self.swap is not None:
+                self._apply_swap()
             self.frame = {"frame_id": frame_id, "ts_ms": ts_ms, "mono": captured, "detections": detections,
                           "physics_time": round(physics_time, 6), "physics_step": physics_step, "depth": depth}
             self.frames_in = [t for t in self.frames_in if now - t < 2.0] + [now]
@@ -272,7 +335,10 @@ class Perception:
         depth = frame.get("depth")
         if "depth" in ran:  # depth runs only on a frame whose depth render belongs to it
             ran["depth"] = ran["depth"] and depth is not None and depth.get("physics_step") == frame["physics_step"]
+        ran["yolo"] = ran["yolo"] and self.detector is not None  # an empty slot reports ran: false
         detections = _apply_mask_focus(frame["detections"], focus) if ran["yolo"] else []
+        if self.model_kind != "segment":  # a plain detection model has no mask angle / width
+            detections = [{k: v for k, v in d.items() if k not in MASK_FIELDS} for d in detections]
         if ran.get("depth"):
             detections = [{**d, **depth["objects"][d.get("name")]} if d.get("name") in depth["objects"] else d
                           for d in detections]
@@ -283,6 +349,7 @@ class Perception:
             "pipelines": {p: {"ran": ran[p], "ms": 0.1 if ran[p] else 0.0} for p in self.pipelines},
             "detections": detections,
             "count": 0, "family": "aruco4x4_50", "undistorted": False, "rejected": 0, "markers": [],
+            "model_generation": self.generation,
         }
         if ran.get("depth"):
             from .camera import DEPTH_GRID  # mujoco: imported only where depth runs
@@ -310,9 +377,11 @@ class Perception:
             "measured": {"input_fps": round(len([t for t in self.frames_in if now - t < 2.0]) / 2, 1),
                          "result_fps": round(len([t for t in self.results_out if now - t < 2.0]) / 2, 1)},
             "trigger": True, "per_request_pipelines": True, "subscriptions": True, "max_fps": self.max_fps,
-            "continuous": cont, "available": {"yolo": True, "aruco": True},
+            "continuous": cont, "available": {"yolo": self.detector is not None, "aruco": True},
             "model": {"name": "rebot-sim-ground-truth", "path": None, "kind": self.model_kind, "mask_max_boxes": 3}, "family": "aruco4x4_50",
             "mask_focus": self.mask_focus_body(),
+            "models": self.models_body(),
+            "ion": {**ION, "used_mb": round(self._budget(self.detector, self._resident_depth())[1] - ION["reserve_mb"], 3)},
         }
         if self.depth_model:
             dm = self.depth_model
@@ -431,6 +500,9 @@ class PerceptionServer:
                 if "fps" in body:
                     p.max_fps = body["fps"]
                 return 200, p.mode_body()
+        if path == "/api/models" and method == "POST":
+            with p.cond:
+                return p.request_swap(body)
         if path == "/api/mask_focus":
             if method == "GET":
                 with p.cond:
@@ -510,6 +582,8 @@ class PerceptionServer:
         wait = _wait_ms(qs, body, 2500)
         with p.cond:
             req = _pipelines(body["pipelines"], p.pipelines) if "pipelines" in body else None
+            if req and "yolo" in req and p.detector is None:
+                return 409, {"api_version": API_VERSION, "error": "yolo unavailable"}
             pipes = req if req is not None else (MODE_PIPELINES[p.mode] or MODE_PIPELINES[p.last_active])
             called = time.monotonic()
             after = p.latest["frame_id"] if p.latest else 0
@@ -708,11 +782,10 @@ class CameraRig:
         if cfg["scene_stream"]:
             self.streams["/scene"] = VideoStream()
         self.depth_model = cam.DepthModel(**cfg.get("depth", {}))
-        # False: a plain detection model (no mask): detections carry no angle_deg / angle_conf /
-        # grasp_width_px (the depth pipeline still reports its depth_* fields)
-        self.mask_angle = cfg.get("mask_angle", True)
+        # False: a plain detection model (no mask, model "det"): detections carry no angle_deg /
+        # angle_conf / grasp_width_px (the depth pipeline still reports its depth_* fields)
         self.perception = Perception(max_fps=min(15, self.fps), depth=self.depth_model,
-                                     model_kind="segment" if self.mask_angle else "detect")
+                                     model_kind="segment" if cfg.get("mask_angle", True) else "detect")
         self.noise = cam.DetNoise(**cfg.get("noise", {}))
         self.labels = [(i, o.kind) for i, o in enumerate(objects)]  # what a false detection may be
         self.delayed: list[tuple] = []  # frames (on_frame arguments) waiting out noise.latency_ms
@@ -857,9 +930,6 @@ class CameraRig:
                 self.frame_id += 1
                 if dets is not None:  # a failed segmentation: the video frame goes out, no result
                     dets = self._cam.perturb(dets, self.noise, self.frame_id, self.labels)
-                    if not self.mask_angle:
-                        dets = [{k: v for k, v in d.items() if k not in ("angle_deg", "angle_conf", "grasp_width_px")}
-                                for d in dets]
                     self.publish_frame((self.frame_id, ts_ms, captured, dets, self.data.time, step, self.frame_depth))
                 for path, stream in self.streams.items():
                     if not stream.active:

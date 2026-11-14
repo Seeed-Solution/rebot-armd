@@ -367,6 +367,22 @@ pub(crate) async fn request_json(
     serde_json::from_slice(&r.body).map_err(|e| format!("detector returned invalid JSON: {e}"))
 }
 
+/// One JSON request to the detector whose status the caller interprets: `(status, body)` for
+/// any status (a body that is not JSON is `null`); `Err` only when unreachable or timed out.
+pub(crate) async fn request_status_json(
+    up: &DetectorUpstream,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<(StatusCode, serde_json::Value), String> {
+    let m = Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
+    let r = tokio::time::timeout(timeout, upstream_request(up, m, path_and_query, body))
+        .await
+        .map_err(|_| "detector timed out".to_string())??;
+    Ok((r.status, serde_json::from_slice(&r.body).unwrap_or(serde_json::Value::Null)))
+}
+
 /// As [`request_json`], but a 404 (provider without the route) is `Ok(None)`.
 pub(crate) async fn request_json_opt(
     up: &DetectorUpstream,

@@ -589,3 +589,45 @@ def test_model_kind_detect_without_mask_angle():
     finally:
         srv.httpd.shutdown()
         srv.httpd.server_close()
+
+
+def test_models_swap_contract():
+    """POST /api/models as rebot-vision: 202 + generation, applied on the next frame, SWAP_BUSY while
+    pending, ION_BUDGET for seg + depth, and the detect model's results carry no mask fields."""
+    from rebot_sim.camera import DepthModel
+
+    srv = PerceptionServer(Perception(max_fps=15, depth=DepthModel("metric"), model_kind="detect"), FakeSim(), "127.0.0.1", 0)
+    base = f"http://127.0.0.1:{srv.httpd.server_address[1]}"
+    p = srv.p
+    det = {"class_id": 41, "class_name": "cup", "confidence": 0.9, "x": 0.5, "y": 0.5, "w": 0.1, "h": 0.1,
+           "angle_deg": 12.0, "angle_conf": 0.8, "grasp_width_px": 30.0}
+    try:
+        mode = http(base + "/api/mode")[1]
+        assert mode["models"]["resident"] == {"detector": "det", "depth": "depth"} and mode["models"]["generation"] == 0
+        assert [m["name"] for m in mode["models"]["catalogue"]] == ["seg", "det", "depth"]
+        assert mode["ion"] == {"base_mb": 21.5, "total_mb": 62.9, "reserve_mb": 8.0, "used_mb": 50.5}
+        assert http(base + "/api/models", {"detector": "seg"}) == (
+            409, {"api_version": 2, "error": "ION_BUDGET", "need_mb": 69.5, "limit_mb": 62.9})
+        assert http(base + "/api/models", {"detector": "nope"})[0] == 400
+        assert http(base + "/api/models", {"depth": "seg"})[0] == 400
+        assert http(base + "/api/models", {})[0] == 400
+        p.on_frame(1, 1001, time.monotonic(), [det])
+        assert "angle_deg" not in p.result(p.frame, ["yolo"])["detections"][0]
+        assert http(base + "/api/models", {"detector": "seg", "depth": None}) == (202, {"api_version": 2, "generation": 1})
+        assert http(base + "/api/models", {"depth": "depth"})[1]["error"] == "SWAP_BUSY"
+        assert http(base + "/api/mode")[1]["models"]["swap"] == {"state": "pending", "generation": 1}
+        p.on_frame(2, 1002, time.monotonic(), [det])
+        mode = http(base + "/api/mode")[1]
+        assert mode["models"]["generation"] == 1 and mode["models"]["swap"] == {"state": "idle", "generation": 1}
+        assert mode["model"]["kind"] == "segment" and "depth" not in mode["available"]
+        r = p.result(p.frame, ["yolo"])
+        assert r["model_generation"] == 1 and r["detections"][0]["angle_deg"] == 12.0
+        # an empty detector slot: yolo unavailable, results report ran: false
+        assert http(base + "/api/models", {"detector": None})[0] == 202
+        p.on_frame(3, 1003, time.monotonic(), [det])
+        assert http(base + "/api/mode")[1]["available"]["yolo"] is False
+        assert http(base + "/api/trigger", {"pipelines": ["yolo"], "wait_ms": 100})[0] == 409
+        assert p.result(p.frame, ["yolo"])["pipelines"]["yolo"]["ran"] is False
+    finally:
+        srv.httpd.shutdown()
+        srv.httpd.server_close()

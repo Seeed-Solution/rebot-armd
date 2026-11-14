@@ -18,6 +18,7 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -35,6 +36,7 @@
 #include "detector.h"
 #include "http_control.h"
 #include "json.hpp"
+#include "model_catalogue.h"
 #include "result_json.h"
 #include "version.h"
 #include "vision_control.h"
@@ -66,8 +68,8 @@ struct Config {
     int aruco_stats_every = 200;  ///< log p50/p95 of the ArUco stages every N ArUco frames (0 = off)
     std::string depth_model_path;  // empty: first existing default; "off": disabled
     std::string depth_metric_str = "auto";  // "auto", "on", "off"
-    bool depth_metric = false;
     std::string model_kind_str = "auto";    // "auto", "detect", "segment", "obb"
+    rv::Catalogue catalogue;  // vision.json "models" and "ion_*_mb", plus the startup models
     bool verbose = false;
 } g_cfg;
 
@@ -206,6 +208,9 @@ void load_config_file(const std::string& path) {
                 path.c_str(), g_cfg.model_kind_str.c_str());
         g_cfg.model_kind_str = "auto";
     }
+    std::vector<std::string> warnings;
+    rv::parse_catalogue(j.dump(), g_cfg.catalogue, warnings);
+    for (const std::string& w : warnings) MA_LOGW(TAG, "%s: %s", path.c_str(), w.c_str());
 }
 
 void print_usage(const char* prog) {
@@ -424,6 +429,71 @@ float ms_since(std::chrono::steady_clock::time_point t0) {
 }
 
 /** The camera singleton that af::App's CameraHub drives (CH0 is its selected channel). */
+yolo::ModelKindHint kind_hint_of(const std::string& kind) {
+    if (kind == "detect") return yolo::ModelKindHint::Detect;
+    if (kind == "segment") return yolo::ModelKindHint::Segment;
+    if (kind == "obb") return yolo::ModelKindHint::Obb;
+    return yolo::ModelKindHint::Auto;
+}
+
+const char* kind_name(yolo::Kind k) {
+    return k == yolo::Kind::Segment ? "segment" : (k == yolo::Kind::Obb ? "obb" : "detect");
+}
+
+/**
+ * A fresh Detector for `path` with the frame-owned settings applied (threshold, mask, scale);
+ * null when it fails (the failed object is destroyed, which frees what its init allocated).
+ */
+std::unique_ptr<yolo::Detector> load_detector(const std::string& path, yolo::ModelKindHint hint) {
+    if (!file_exists(path)) return nullptr;
+    auto d = std::make_unique<yolo::Detector>();
+    if (!d->init(path, hint)) return nullptr;
+    d->setThreshold(g_cfg.conf_threshold);
+    d->setMaskEnabled(g_cfg.mask_enabled);
+    d->setMaskMaxBoxes(g_cfg.mask_max_boxes);
+    if (d->getKind() == yolo::Kind::Segment) d->setScale(4.0f, 4.0f);
+    return d;
+}
+
+std::unique_ptr<rv::DepthStage> load_depth(const std::string& path) {
+    if (!file_exists(path)) return nullptr;
+    auto d = std::make_unique<rv::DepthStage>();
+    return d->init(path) ? std::move(d) : nullptr;
+}
+
+/** --depth-metric: on, off, or auto ("metric" in the file name). */
+bool depth_metric_of(const std::string& path) {
+    if (g_cfg.depth_metric_str == "on") return true;
+    if (g_cfg.depth_metric_str == "off") return false;
+    return base_name(path).find("metric") != std::string::npos;
+}
+
+/** Catalogue name of a startup model: the entry with this path, else a legacy entry (file stem, kind table). */
+std::string register_startup(rv::Catalogue& cat, const std::string& path, const std::string& kind) {
+    for (const rv::ModelEntry& m : cat.models) {
+        if (m.path == path) return m.name;
+    }
+    std::string name = base_name(path);
+    if (cat.find(name) != nullptr) name += "-startup";
+    cat.models.push_back({name, path, kind, rv::legacy_ion_mb(kind)});
+    return name;
+}
+
+void set_detector(rv::ModelSet& s, const yolo::Detector* d, const std::string& name, const std::string& path) {
+    s.yolo_available = d != nullptr;
+    s.model_name = d ? name : "";
+    s.model_path = d ? path : "";
+    s.model_kind = kind_name(d ? d->getKind() : yolo::Kind::Detect);
+    s.mask = d && g_cfg.mask_enabled && d->getKind() == yolo::Kind::Segment;
+}
+
+void set_depth(rv::ModelSet& s, const rv::DepthStage* d, const std::string& name, const std::string& path) {
+    s.depth_available = d != nullptr;
+    s.depth_model_name = d ? name : "";
+    s.depth_model_path = d ? path : "";
+    s.depth_metric = d && depth_metric_of(path);
+}
+
 ma::Camera* device_camera() {
     ma::Device* dev = ma::Device::getInstance();
     if (dev == nullptr) return nullptr;
@@ -450,24 +520,15 @@ int main(int argc, char** argv) {
             }
         }
     }
-    yolo::Detector detector;
-    bool yolo_ok = false;
-    yolo::ModelKindHint kind_hint = yolo::ModelKindHint::Auto;
-    if (g_cfg.model_kind_str == "detect") kind_hint = yolo::ModelKindHint::Detect;
-    else if (g_cfg.model_kind_str == "segment") kind_hint = yolo::ModelKindHint::Segment;
-    else if (g_cfg.model_kind_str == "obb") kind_hint = yolo::ModelKindHint::Obb;
-
+    // the frame thread owns both slots; a swap replaces them with fresh objects
+    std::unique_ptr<yolo::Detector> detector;
+    std::unique_ptr<rv::DepthStage> depth_stage;
+    rv::ModelSet resident;
     if (!file_exists(model)) {
         MA_LOGW(TAG, "No YOLO model found (%s); yolo/both unavailable, aruco works",
                 model.empty() ? "default paths" : model.c_str());
-    } else if (detector.init(model, kind_hint)) {
-        detector.setThreshold(g_cfg.conf_threshold);
-        detector.setMaskEnabled(g_cfg.mask_enabled);
-        detector.setMaskMaxBoxes(g_cfg.mask_max_boxes);
-        if (detector.getKind() == yolo::Kind::Segment) {
-            detector.setScale(4.0f, 4.0f);
-        }
-        yolo_ok = true;
+    } else if ((detector = load_detector(model, kind_hint_of(g_cfg.model_kind_str)))) {
+        set_detector(resident, detector.get(), register_startup(g_cfg.catalogue, model, kind_name(detector->getKind())), model);
     } else {
         MA_LOGE(TAG, "YOLO model %s failed to load; yolo/both unavailable", model.c_str());
     }
@@ -490,28 +551,26 @@ int main(int argc, char** argv) {
             }
         }
     }
-    rv::DepthStage depth_stage;
-    bool depth_ok = false;
     if (depth_disabled) {
         MA_LOGI(TAG, "Depth pipeline disabled (--depth-model off)");
     } else if (depth_model.empty() || !file_exists(depth_model)) {
         MA_LOGW(TAG, "No depth model found (%s); depth unavailable",
                 depth_model.empty() ? "default paths" : depth_model.c_str());
-    } else if (depth_stage.init(depth_model)) {
-        depth_ok = true;
-        if (g_cfg.depth_metric_str == "on") {
-            g_cfg.depth_metric = true;
-        } else if (g_cfg.depth_metric_str == "off") {
-            g_cfg.depth_metric = false;
-        } else {
-            // "auto"
-            g_cfg.depth_metric = (base_name(depth_model).find("metric") != std::string::npos);
-        }
-        MA_LOGI(TAG, "Depth model %s loaded (%s, %dx%d)", depth_model.c_str(),
-                g_cfg.depth_metric ? "metric" : "relative",
-                depth_stage.grid_w(), depth_stage.grid_h());
     } else {
-        MA_LOGE(TAG, "Depth model %s failed to load; depth unavailable", depth_model.c_str());
+        // over the ION budget the depth model is not loaded: a load without free ION aborts the
+        // process, and a near-full carveout makes the VENC fail
+        const std::string name = register_startup(g_cfg.catalogue, depth_model, "depth");
+        const rv::BudgetCheck b = rv::check_budget(g_cfg.catalogue, resident.model_name, name);
+        if (!b.ok) {
+            MA_LOGW(TAG, "Depth model %s not loaded: %s + %s need %.1f MB ION, limit %.1f MB; depth unavailable",
+                    depth_model.c_str(), resident.model_name.c_str(), name.c_str(), b.need_mb, b.limit_mb);
+        } else if ((depth_stage = load_depth(depth_model))) {
+            set_depth(resident, depth_stage.get(), name, depth_model);
+            MA_LOGI(TAG, "Depth model %s loaded (%s, %dx%d)", depth_model.c_str(),
+                    resident.depth_metric ? "metric" : "relative", depth_stage->grid_w(), depth_stage->grid_h());
+        } else {
+            MA_LOGE(TAG, "Depth model %s failed to load; depth unavailable", depth_model.c_str());
+        }
     }
 
     af::App app("rebot-vision");
@@ -537,17 +596,18 @@ int main(int argc, char** argv) {
     vo.fps = g_cfg.fps;
     vo.mode = g_cfg.mode;
     vo.enabled = g_cfg.inference_enabled;
-    vo.yolo_available = yolo_ok;
-    vo.model_name = yolo_ok ? base_name(model) : "";
-    vo.model_path = yolo_ok ? model : "";
-    vo.model_kind = (detector.getKind() == yolo::Kind::Segment ? "segment" : (detector.getKind() == yolo::Kind::Obb ? "obb" : "detect"));
-    vo.mask = g_cfg.mask_enabled && (detector.getKind() == yolo::Kind::Segment);
+    vo.yolo_available = resident.yolo_available;
+    vo.model_name = resident.model_name;
+    vo.model_path = resident.model_path;
+    vo.model_kind = resident.model_kind;
+    vo.mask = resident.mask;
     vo.mask_max_boxes = g_cfg.mask_max_boxes;
     vo.family = g_cfg.aruco.family;
-    vo.depth_available = depth_ok;
-    vo.depth_model_name = depth_ok ? base_name(depth_model) : "";
-    vo.depth_model_path = depth_ok ? depth_model : "";
-    vo.depth_metric = g_cfg.depth_metric;
+    vo.depth_available = resident.depth_available;
+    vo.depth_model_name = resident.depth_model_name;
+    vo.depth_model_path = resident.depth_model_path;
+    vo.depth_metric = resident.depth_metric;
+    vo.catalogue = g_cfg.catalogue;
     ma::Camera* camera = device_camera();
     rv::VisionControl ctl(vo, [&app, camera](bool on, int gate_fps) {
         // set_camera_fps() is applied by the frame thread at its next loop, but that thread
@@ -591,12 +651,47 @@ int main(int argc, char** argv) {
     // queued, it arrived after the previous grab.
     uint64_t before_grab_ms = 0;
     uint64_t last_grab_ms = 0;
+    uint64_t model_generation = 0;
+
+    // A swap (POST /api/models) on the frame thread, the only user of the slots: the changed
+    // slots are unloaded first, then loaded into fresh objects, so the ION peak stays within the
+    // new set. A failed load leaves its slot empty; the other slot keeps its new state.
+    auto apply_swap = [&](const rv::SwapRequest& s) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (s.detector.change) {
+            detector.reset();
+            set_detector(resident, nullptr, "", "");
+        }
+        if (s.depth.change) {
+            depth_stage.reset();
+            set_depth(resident, nullptr, "", "");
+        }
+        std::string failed;
+        if (const rv::ModelEntry* m = ctl.catalogue().find(s.detector.name)) {
+            detector = load_detector(m->path, kind_hint_of(m->kind));
+            set_detector(resident, detector.get(), m->name, m->path);
+            if (!detector) failed = "detector";
+        }
+        if (const rv::ModelEntry* m = ctl.catalogue().find(s.depth.name)) {
+            depth_stage = load_depth(m->path);
+            set_depth(resident, depth_stage.get(), m->name, m->path);
+            if (!depth_stage) failed += failed.empty() ? "depth" : ",depth";
+        }
+        model_generation = ctl.finish_swap(resident, failed.empty() ? "" : "LOAD_FAILED:" + failed);
+        MA_LOGI(TAG, "Model swap to generation %llu in %.0f ms: detector %s, depth %s%s%s",
+                static_cast<unsigned long long>(model_generation), ms_since(t0),
+                resident.model_name.empty() ? "-" : resident.model_name.c_str(),
+                resident.depth_model_name.empty() ? "-" : resident.depth_model_name.c_str(),
+                failed.empty() ? "" : ", load failed: ", failed.c_str());
+    };
 
     app.on_started(set_ae_fixed_frame_rate).on_before_grab([&] { before_grab_ms = rv::mono_ms(); });
     app.on_frame([&](const af::VideoFrame& frame, af::Result& r) {
         const uint64_t grab_ms = rv::mono_ms();
         const uint64_t frame_ms = grab_ms > before_grab_ms ? grab_ms : last_grab_ms;
         last_grab_ms = grab_ms;
+        rv::SwapRequest swap;
+        if (ctl.take_swap(swap)) apply_swap(swap);
         rv::Pipelines triggered;
         rv::MaskFocus frame_focus;
         const rv::Pipelines p = ctl.frame_plan(frame_ms, &triggered, &frame_focus);
@@ -615,14 +710,15 @@ int main(int argc, char** argv) {
         vr.mode = ctl.mode();
         vr.width = crop.w;
         vr.height = crop.h;
+        vr.model_generation = model_generation;
         boxes.clear();
         dets.clear();
         markers.clear();
 
-        if (p.yolo) {
+        if (p.yolo && detector) {  // an empty slot reports ran: false
             const auto t0 = std::chrono::steady_clock::now();
             ma_img_t img = af::to_ma_img(frame);
-            for (const auto& d : detector.detect(&img, frame_focus.active ? &frame_focus : nullptr,
+            for (const auto& d : detector->detect(&img, frame_focus.active ? &frame_focus : nullptr,
                                                  static_cast<float>(crop.x), static_cast<float>(crop.y),
                                                  static_cast<float>(crop.w), static_cast<float>(crop.h))) {
                 rv::DetBox det{d.x, d.y, d.w, d.h, d.confidence, d.class_id, yolo::Detector::getClassName(d.class_id),
@@ -643,8 +739,8 @@ int main(int argc, char** argv) {
             }
             vr.ran_yolo = true;
             vr.yolo_ms = ms_since(t0);
-            if (detector.getKind() == yolo::Kind::Segment) {
-                vr.mask_ms = detector.mask_ms();
+            if (detector->getKind() == yolo::Kind::Segment) {
+                vr.mask_ms = detector->mask_ms();
             }
             vr.detections_json = rv::detections_json(dets, content, frame.width, frame.height);
         }
@@ -666,10 +762,10 @@ int main(int argc, char** argv) {
             vr.markers_json = rv::markers_json(markers);
             display_markers = rv::markers_json(markers, disp_sx, disp_sy);
         }
-        if (p.depth && depth_ok) {
+        if (p.depth && depth_stage) {
             const auto t0 = std::chrono::steady_clock::now();
             const af::VideoFrame sub = frame.sub_frame(crop);
-            if (sub.valid() && depth_stage.run(static_cast<const uint8_t*>(sub.data()), sub.width, sub.height, static_cast<int>(sub.stride()))) {
+            if (sub.valid() && depth_stage->run(static_cast<const uint8_t*>(sub.data()), sub.width, sub.height, static_cast<int>(sub.stride()))) {
                 vr.ran_depth = true;
                 vr.depth_ms = ms_since(t0);
 
@@ -692,19 +788,19 @@ int main(int argc, char** argv) {
                 // Analyze each detection box
                 for (size_t i = 0; i < dets.size(); ++i) {
                     // jaw_clear across the mask-angle closing direction when a seg model gave one
-                    auto res = rv::analyze_box_depth(depth_stage.depth_map(), depth_stage.grid_w(), depth_stage.grid_h(),
+                    auto res = rv::analyze_box_depth(depth_stage->depth_map(), depth_stage->grid_w(), depth_stage->grid_h(),
                                                      i, all_depth_boxes, content.w, content.h,
                                                      rv::jaw_close_deg(dets[i]));
                     rv::apply_box_depth(dets[i], res);
                 }
                 vr.detections_json = rv::detections_json(dets, content, frame.width, frame.height);
 
-                auto table_samples = rv::sample_table_disparity(depth_stage.depth_map(), depth_stage.grid_w(), depth_stage.grid_h(),
+                auto table_samples = rv::sample_table_disparity(depth_stage->depth_map(), depth_stage->grid_w(), depth_stage->grid_h(),
                                                                 all_depth_boxes, content.w, content.h);
                 std::ostringstream ds;
-                ds << std::fixed << "{\"metric_model\":" << (g_cfg.depth_metric ? "true" : "false")
-                   << ",\"grid_w\":" << depth_stage.grid_w()
-                   << ",\"grid_h\":" << depth_stage.grid_h()
+                ds << std::fixed << "{\"metric_model\":" << (resident.depth_metric ? "true" : "false")
+                   << ",\"grid_w\":" << depth_stage->grid_w()
+                   << ",\"grid_h\":" << depth_stage->grid_h()
                    << ",\"table_samples\":[";
                 bool first = true;
                 for (size_t i = 0; i < table_samples.size(); ++i) {

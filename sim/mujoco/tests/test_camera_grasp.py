@@ -122,26 +122,43 @@ CASES = {
     # _depth_decides: --depth metric, as depth_metric_decides
     "task_requires_depth_unsupported": (AXIS_LENS, None),
     "task_depth_decides": ([*AXIS_LENS, "--depth", "metric"], None),
+    # task_swap_det: the simulator starts with the segmentation model (seg); the task names the
+    # detection model (det), so armd switches models (POST /api/models) before the grasp: the
+    # detections then carry no mask angle and the box aspect of the seed 24 block decides the J6
+    # roll. task_seg_depth_budget: det + depth resident, the task names seg + depth, which the
+    # provider's ION budget refuses: TASK_UNSUPPORTED before anything moves, models unchanged
+    "task_swap_det": ([*AXIS_LENS, "--objects", "block", "--seed", "24"], None),
+    "task_seg_depth_budget": ([*AXIS_LENS, "--depth", "metric", "--no-mask-angle"], None),
 }
 TASK = {"description": "thin part, depth height", "requires": {"depth": "metric"},
         "overrides": {"height_sources": ["depth", "probe"]}}
+# stored task per task_* case: (name, task)
+TASKS = {"task_requires_depth_unsupported": ("flat", TASK), "task_depth_decides": ("flat", TASK),
+         "task_swap_det": ("det", {"requires": {"model_kind": "detect"}, "models": {"detector": "det"}}),
+         "task_seg_depth_budget": ("segdepth", {"models": {"detector": "seg", "depth": "depth"}})}
+# task cases rejected with TASK_UNSUPPORTED: (task_reason of the dry run, the command's message)
+REJECTED = {
+    "task_requires_depth_unsupported": ("task flat needs depth metric, provider has no depth pipeline",) * 2,
+    "task_seg_depth_budget": ("task segdepth: model switch refused: ION_BUDGET (need 69.5 MB, limit 62.9 MB)",) * 2,
+}
 # generator model per depth case (the simulator's --depth options) and the setup patch
 DEPTH_MODELS = {"depth_metric_decides": DepthModel("metric"), "depth_metric_record_only": DepthModel("metric"),
                 "depth_metric_scale_rejected": DepthModel("metric", scale=1.5), "depth_relative": DepthModel("relative"),
                 "axis_block_detect_depth_record": DepthModel("metric"), "axis_block_detect_depth_yaw": DepthModel("metric"),
-                "task_depth_decides": DepthModel("metric")}
+                "task_depth_decides": DepthModel("metric"), "task_seg_depth_budget": DepthModel("metric")}
 DETECT_DEPTH = {"axis_block_detect_depth_record", "axis_block_detect_depth_yaw"}
 # depth recorded, the probe decides the height
 DEPTH_RECORD_ONLY = {"depth_metric_record_only", *DETECT_DEPTH}
 DEPTH_DECIDES = {"depth_metric_decides", "depth_metric_scale_rejected", "depth_relative", "task_depth_decides"}
 # object the case grasps (default: the cube) and its height (scene.py KINDS)
 TARGETS = {"axis_cup": "cup", "axis_block": "block", "axis_slab": "slab", "axis_cube_preopen": "cube", "axis_cube_lateral": "cube",
-           **{c: "block" for c in DETECT_DEPTH}}
+           **{c: "block" for c in DETECT_DEPTH}, "task_swap_det": "block"}
 HEIGHTS_M = {"cube": 0.04, "cup": 0.07, "block": 0.04, "slab": 0.02}
 # approach height per case (default: v8 0.15 m, v5 0.25 m); axis_cube / axis_cup 0.15 m; axis_block
 # 0.20 m (at 0.15 m the 6 cm block's box reaches the image border and the J6 alignment is skipped)
 APPROACH_M = {**{c: 0.15 for c in DEPTH_MODELS}, "axis_cube": 0.15, "axis_cup": 0.15, "axis_block": 0.20, "axis_slab": 0.15, "axis_cube_preopen": 0.15,
-              "axis_cube_lateral": 0.20, **{c: 0.20 for c in DETECT_DEPTH}, "task_requires_depth_unsupported": 0.15}
+              "axis_cube_lateral": 0.20, **{c: 0.20 for c in DETECT_DEPTH}, "task_requires_depth_unsupported": 0.15,
+              "task_swap_det": 0.20}
 
 
 def view_pose(cam: dict, cube_xy, z: float, miss_m=(0.0, 0.0)):
@@ -272,29 +289,42 @@ def test_tap_to_grasp_the_cube(cam_rig):
     request = {"label": target, "box_norm": box, "frame_id": det["frame_id"], "overrides": overrides}
     if case.startswith("task_"):
         # the task is stored in the setup; the request names it (height_sources come from it)
-        setup = client.command("/api/v1/grasp/setup", {"tasks": {"flat": TASK}})["setup"]
-        assert setup["tasks"] == {"flat": TASK}, setup
-        request["task"] = "flat"
-    if case == "task_requires_depth_unsupported":
+        name, task = TASKS[case]
+        setup = client.command("/api/v1/grasp/setup", {"tasks": {name: task}})["setup"]
+        assert setup["tasks"] == {name: {"overrides": {}, **task}}, setup  # armd reports overrides always
+        request["task"] = name
+    mode0 = http(client.base + "/api/v1/vision/mode")
+    if case == "task_swap_det":  # the segmentation model is resident: its detections have the mask angle
+        assert mode0["model"]["kind"] == "segment" and mode0["models"]["resident"]["detector"] == "seg", mode0
+        assert d.get("angle_deg") is not None and det["model_generation"] == 0, det
+        dry = http(client.base + "/api/v1/action/grasp", {**request, "dry_run": True})
+        print(f"dry run: {dry}")
+        assert dry["task_supported"] is True and dry["task_reason"] == "needs model switch", dry
+    if case in REJECTED:
         q0 = client.observation()["positions"]
-        mode = http(client.base + "/api/v1/vision/mode")
-        assert mode["model"]["kind"] == "segment" and not mode["available"].get("depth"), mode
+        if case == "task_requires_depth_unsupported":
+            assert mode0["model"]["kind"] == "segment" and not mode0["available"].get("depth"), mode0
+        else:
+            assert mode0["models"]["resident"] == {"detector": "det", "depth": "depth"}, mode0
         dry = http(client.base + "/api/v1/action/grasp", {**request, "dry_run": True})
         print(f"dry run: {dry}")
         assert dry["reachable"] is True and dry["task_supported"] is False, dry
+        assert dry["task_reason"] == REJECTED[case][0], dry
         client.request_id += 1
         client.send({"type": "command", "request_id": client.request_id, "generation": client.generation,
                      "epoch_id": client.observation()["epoch_id"], "path": "/api/v1/action/grasp", "body": request})
         reply = client.reply({"command_ack", "command_reject"})
         print(f"grasp reply: {reply}")
         assert reply["type"] == "command_reject" and reply["code"] == "TASK_UNSUPPORTED", reply
-        assert reply["message"] == "task flat needs depth metric, provider has no depth pipeline", reply
+        assert reply["message"] == REJECTED[case][1], reply
         time.sleep(1.0)
         obs = client.observation()
         assert obs.get("action") is None or obs["action"]["kind"] != "grasp", obs.get("action")
         moved = max(abs(a - b) for a, b in zip(obs["positions"], q0))
         print(f"largest joint change after the rejection: {moved:.5f} rad")
         assert moved < 0.01, (q0, obs["positions"])
+        models = http(client.base + "/api/v1/vision/mode")["models"]
+        assert models["generation"] == mode0["models"]["generation"] and models["resident"] == mode0["models"]["resident"], models
         return
     t0 = time.time()
     ack = client.command("/api/v1/action/grasp", request)
@@ -395,6 +425,18 @@ def test_tap_to_grasp_the_cube(cam_rig):
         cross_deg = math.degrees(math.acos(min(1.0, abs(float(long_side @ jaw)))))
         print(f"block long side vs jaw closing direction {cross_deg:.1f} deg, align_turn_rad={rec.get('align_turn_rad')}")
         assert cross_deg > 70.0, cross_deg
+    if case == "task_swap_det":
+        # armd switched to det before the grasp and pinned that generation; the provider keeps it
+        mode = http(client.base + "/api/v1/vision/mode")
+        print(f"models after the grasp: {mode['models']}")
+        assert mode["model"]["kind"] == "detect" and mode["models"]["resident"]["detector"] == "det", mode
+        assert mode["models"]["generation"] == 1 and mode["models"]["swap"]["state"] == "idle", mode
+        after = http(client.base + "/api/v1/detection/trigger?wait_ms=2000", {"pipelines": ["yolo"]})
+        assert after["model_generation"] == 1 and after["detections"], after
+        assert all(not {"angle_deg", "angle_conf", "grasp_width_px"} & set(x) for x in after["detections"]), after
+        yaw = {e["source"]: e for e in rec.get("yaw_estimates") or []}
+        assert rec["task"] == "det" and rec["align"] in ("turned:box", "kept:box"), json.dumps(rec)
+        assert yaw["mask"]["reason"] == "no_angle" and yaw["box"]["used"], json.dumps(rec)
     if case in DETECT_DEPTH:
         yaw = {e["source"]: e for e in rec.get("yaw_estimates") or []}
         if case == "axis_block_detect_depth_record":

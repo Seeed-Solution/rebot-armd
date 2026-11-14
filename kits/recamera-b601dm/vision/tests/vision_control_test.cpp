@@ -1087,7 +1087,104 @@ static void test_vision_control_obb_kind() {
     CHECK(r["model"]["kind"] == "obb");
 }
 
+static void test_model_swap() {
+    VisionControl::Options o = opts(Mode::Yolo, false, 10, true, true);
+    o.model_name = "det";
+    o.depth_model_name = "depth";
+    o.depth_metric = true;
+    std::vector<std::string> w;
+    parse_catalogue(std::string(R"({"models": {
+        "det": {"path": "/m/det.cvimodel", "kind": "detect", "ion_mb": 8.5},
+        "seg": {"path": "/m/seg.cvimodel", "kind": "segment", "ion_mb": 19.5},
+        "depth": {"path": "/m/depth.cvimodel", "kind": "depth", "ion_mb": 20.5}}})"),
+                    o.catalogue, w);
+    Calls calls;
+    VisionControl c(o, calls.fn());
+    json m = req(c, "GET", "/api/mode");
+    CHECK(m["models"]["generation"] == 0 && m["models"]["swap"]["state"] == "idle" && m["models"]["swap"]["generation"] == 0);
+    CHECK(m["models"]["resident"] == json({{"detector", "det"}, {"depth", "depth"}}));
+    // catalogue in name order (vision.json object keys)
+    CHECK(m["models"]["catalogue"].size() == 3 && m["models"]["catalogue"][1] ==
+          json({{"name", "det"}, {"kind", "detect"}, {"path", "/m/det.cvimodel"}, {"ion_mb", 8.5}, {"resident", true}}));
+    CHECK(m["models"]["catalogue"][0]["resident"] == true && m["models"]["catalogue"][2]["resident"] == false);
+    CHECK(m["ion"]["used_mb"] == 50.5 && m["ion"]["total_mb"] == 62.9 && m["ion"]["reserve_mb"] == 8.0);
+
+    // seg next to the resident depth model: over the budget, nothing changes
+    int st = 0;
+    json e = req(c, "POST", "/api/models", R"({"detector":"seg"})", &st);
+    CHECK(st == 409 && e["error"] == "ION_BUDGET" && e["need_mb"] == 69.5 && e["limit_mb"] == 62.9);
+    e = req(c, "POST", "/api/models", R"({"detector":"nope"})", &st);
+    CHECK(st == 400 && e["error"] == "no model named \"nope\"");
+    CHECK(c.swap_state() == SwapState::Idle);
+
+    // accepted at once (202), a second request is busy; the pending swap opens the camera gate
+    const size_t n_calls = calls.v.size();
+    e = req(c, "POST", "/api/models", R"({"detector":"seg","depth":null})", &st);
+    CHECK(st == 202 && e["generation"] == 1);
+    CHECK(calls.v.size() == n_calls + 1 && calls.v.back().second == VisionControl::kOpenGateFps);
+    e = req(c, "POST", "/api/models", R"({"depth":"depth"})", &st);
+    CHECK(st == 409 && e["error"] == "SWAP_BUSY");
+    m = req(c, "GET", "/api/mode");
+    CHECK(m["models"]["swap"]["state"] == "pending" && m["models"]["swap"]["generation"] == 1 && m["models"]["generation"] == 0);
+
+    // the frame thread takes it, loads, publishes
+    SwapRequest s;
+    CHECK(c.take_swap(s) && s.detector.name == "seg" && s.depth.change && s.depth.name.empty());
+    CHECK(c.swap_state() == SwapState::Running && !c.take_swap(s));
+    CHECK(calls.v.back().second == VisionControl::kIdleFps);  // gate back to idle once taken
+    ModelSet now = c.models();
+    now.model_name = "seg";
+    now.model_kind = "segment";
+    now.mask = true;
+    now.depth_available = false;
+    now.depth_model_name.clear();
+    CHECK(c.finish_swap(now, "") == 1);
+    m = req(c, "GET", "/api/mode");
+    CHECK(m["models"]["generation"] == 1 && m["models"]["swap"]["state"] == "idle" && !m["models"]["swap"].contains("error"));
+    CHECK(m["model"]["kind"] == "segment" && m["available"]["depth"] == false && m["depth_model"].is_null());
+    CHECK(m["models"]["resident"] == json({{"detector", "seg"}, {"depth", nullptr}}));
+    req(c, "POST", "/api/trigger", R"({"pipelines":["depth"]})", &st);
+    CHECK(st == 409);
+
+    // a failed load: that slot stays empty, the generation still advances, the state says why
+    e = req(c, "POST", "/api/models", R"({"detector":"det","depth":"depth"})", &st);
+    CHECK(st == 202 && e["generation"] == 2);
+    CHECK(c.take_swap(s));
+    now = c.models();
+    now.model_name = "det";
+    now.model_kind = "detect";
+    CHECK(c.finish_swap(now, "LOAD_FAILED:depth") == 2);
+    m = req(c, "GET", "/api/mode");
+    CHECK(m["models"]["swap"] == json({{"state", "failed"}, {"generation", 2}, {"error", "LOAD_FAILED:depth"}}));
+
+    // detector unloaded: yolo is unavailable to triggers and modes, results carry the generation
+    e = req(c, "POST", "/api/models", R"({"detector":null})", &st);
+    CHECK(st == 202 && c.take_swap(s));
+    now = c.models();
+    now.yolo_available = false;
+    now.model_name.clear();
+    c.finish_swap(now, "");
+    CHECK(!c.yolo_available());
+    req(c, "POST", "/api/trigger", R"({"pipelines":["yolo"]})", &st);
+    CHECK(st == 409);
+    req(c, "POST", "/api/mode", R"({"mode":"both"})", &st);
+    CHECK(st == 409);
+    VisionResult r;
+    r.frame_id = 1;
+    r.model_generation = 3;
+    c.publish(r);
+    json l = req(c, "GET", "/api/results/latest");
+    CHECK(l["model_generation"] == 3);
+
+    // shutdown drops a pending swap
+    req(c, "POST", "/api/models", R"({"detector":"det"})", &st);
+    CHECK(st == 202 && c.swap_state() == SwapState::Pending);
+    c.shutdown();
+    CHECK(c.swap_state() == SwapState::Idle && !c.take_swap(s));
+}
+
 int main() {
+    test_model_swap();
     test_modes();
     test_status_endpoint();
     test_yolo_unavailable();

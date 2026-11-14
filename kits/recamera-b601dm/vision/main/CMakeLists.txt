@@ -12,6 +12,7 @@ component_register(
 set(srcs
     ${CMAKE_CURRENT_LIST_DIR}/main.cpp
     ${CMAKE_CURRENT_LIST_DIR}/vision_control.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/model_catalogue.cpp
     ${CMAKE_CURRENT_LIST_DIR}/result_json.cpp
     ${CMAKE_CURRENT_LIST_DIR}/http_control.cpp
     ${CMAKE_CURRENT_LIST_DIR}/aruco_stage.cpp

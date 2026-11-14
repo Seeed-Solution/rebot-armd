@@ -101,6 +101,20 @@ The single-shot button calls `/api/v1/detection/trigger` with the selector's pip
  "mask_focus":{"box_norm":[0.35,0.40,0.50,0.65],"ttl_ms":2000,"expires_in_ms":1850,"remaining_ttl_ms":1850,"label":"bottle"}}
 ```
 
+`models` and `ion` (builds with model switching): `models.generation` (+1 per executed swap), `models.swap` (`state` `idle` / `pending` / `running` / `failed`, the `generation` it publishes or published, `error` when failed), `models.resident` (catalogue names of the loaded YOLO and depth models, `null` for an empty slot) and `models.catalogue` (`name`, `kind`, `path`, `ion_mb`, `resident`); `ion` is the ION budget (`base_mb`, `used_mb` = base + resident models, `total_mb`, `reserve_mb`). See [Model switching](#model-switching--模型切换).
+
+`models` 与 `ion`（支持模型切换的构建）：`models.generation`（每执行一次切换 +1）、`models.swap`（`state` 为 `idle` / `pending` / `running` / `failed`，其发布或已发布的 `generation`，失败时的 `error`）、`models.resident`（已加载的 YOLO 与深度模型的目录名称，空槽位为 `null`）与 `models.catalogue`（`name`、`kind`、`path`、`ion_mb`、`resident`）；`ion` 为 ION 预算（`base_mb`、`used_mb` = 基础 + 常驻模型、`total_mb`、`reserve_mb`）。见[模型切换](#model-switching--模型切换)。
+
+```json
+"models":{"generation":1,"swap":{"state":"idle","generation":1},
+ "resident":{"detector":"det","depth":"depth"},
+ "catalogue":[{"name":"depth","kind":"depth","path":"/userdata/local/models/zipdepth_metric_384x224_bf16_rgb.cvimodel","ion_mb":20.5,"resident":true},
+              {"name":"det","kind":"detect","path":"/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel","ion_mb":8.5,"resident":true},
+              {"name":"obb","kind":"obb","path":"/userdata/local/models/yolo11n_obb_cv181x_int8_fuse_qout.cvimodel","ion_mb":8.0,"resident":false},
+              {"name":"seg","kind":"segment","path":"/usr/share/supervisor/models/yolo11n_segment_cv181x_int8.cvimodel","ion_mb":19.5,"resident":false}]},
+"ion":{"base_mb":21.5,"used_mb":50.5,"total_mb":62.9,"reserve_mb":8.0}
+```
+
 Result envelope of `latest` and `trigger` (versions 1 and 2; `requested` on a trigger and `format` on detections are new in version 2). `detections` and `markers` are always present (empty when that pipeline did not run), so a client reading one list works in every mode. `width`/`height` give the visible image size the coordinates refer to: `detections` are normalised to it (centre `x`, `y`, `w`, `h`), `markers` are pixels in it. Segmentation models (`model.kind: "segment"`) with mask decoding enabled (`model.mask: true`, flag `--mask on`, `vision.json` `"mask"`) provide `angle_deg` (object long side, [-90, 90) deg), `angle_conf` ([0, 1]), and `grasp_width_px` (cross-section grasp width in visible image pixels) on finite detections, and report `mask_ms` in `pipelines.yolo`. Oriented bounding box models (`model.kind: "obb"`, configured via `--model-kind auto|detect|segment|obb` or `vision.json` `"model_kind"`) decode oriented boxes and provide `angle_deg`, `angle_conf`, `grasp_width_px`, `length_px`, and `"obb_corners"` (4 normalised corners in perimeter order `[[u0,v0],[u1,v1],[u2,v2],[u3,v3]]` mapped to the visible image) on finite detections. Supported OBB layouts include Layout A (Ultralytics 1-output FP32 `[1, 5 + nc, N]`) and Layout B (decoupled 9-output INT8/FP32 across 3 scale strides, interleaved or grouped, NHWC or NCHW). When a detection is decoded via mask focus, it carries `"mask_focus": true`. When the `"depth"` pipeline runs, each detection carries `disp_fg` (foreground disparity), `disp_bg` (table background disparity around object), `depth_conf` ([0, 1] disparity confidence), `length_px` (object major axis length in pixels), `jaw_clear` (gripper jaw collision clearance flag), and the depth PCA geometry `depth_angle_deg` (long side, [-90, 90) deg), `depth_angle_conf` ([0, 1]) and `depth_width_px` (cross-section width in visible image pixels); each is omitted when not finite. The depth values are never written into `angle_deg` / `angle_conf` / `grasp_width_px`: with a plain detection model those stay absent while depth runs. `jaw_clear` checks strips beside the object along the jaw closing direction: the detector `angle_deg` + 90 deg when the detection has a mask or OBB angle, else the depth PCA minor axis. A top-level `"depth"` object provides `metric_model` (bool, auto-detected from `"metric"` in model filename or `--depth-metric`), `grid_w`/`grid_h` (grid resolution, e.g. 384x224), and `table_samples` (`[[u_px, v_px, disp], ...]`). When a standard detection model is loaded and depth is not running, optional segmentation, OBB, and depth fields are omitted, maintaining byte-identical output. `pipelines` tells what ran on this frame. `count` is the number of accepted markers (as aruco-detector); `rejected` the markers dropped by the false-positive filter.
 
 `latest` / `trigger` 的结果（版本 1 / 2）：`detections` 与 `markers` 始终存在（对应流水线未运行时为空）。`width`/`height` 为坐标所对应的可见画面尺寸：`detections` 按其归一化（中心点），`markers` 为其像素坐标。分割模型（`model.kind: "segment"`）在开启掩码解码（`model.mask: true`，参数 `--mask on` 或 `vision.json` `"mask"`）时，有限检测结果另提供 `angle_deg`（目标长边角度，[-90, 90) 度）、`angle_conf`（[0, 1]）与 `grasp_width_px`（可见画面像素下的横截面抓取宽度），并在 `pipelines.yolo` 中输出掩码耗时 `mask_ms`。旋转框检测模型（`model.kind: "obb"`，可通过 `--model-kind auto|detect|segment|obb` 或 `vision.json` `"model_kind"` 配置）解码旋转框并在检测结果中直接输出 `angle_deg`、`angle_conf`、`grasp_width_px`、`length_px` 与 `"obb_corners"`（映射至可见画面的 4 个顺次归一化角点坐标 `[[u0,v0],[u1,v1],[u2,v2],[u3,v3]]`）。支持的 OBB 架构包括 Layout A（Ultralytics 单输出 FP32 `[1, 5 + nc, N]`）与 Layout B（解耦 9 输出 INT8/FP32，覆盖 3 个特征尺度，支持交错/分组及 NHWC/NCHW 格式）。经掩码焦点解码的目标检测框带有 `"mask_focus": true`。当运行 `"depth"` 深度流水线时，每项检测包含 `disp_fg`（前景视差）、`disp_bg`（背景桌面视差）、`depth_conf`（深度置信度）、`length_px`（目标长轴像素长度）、`jaw_clear`（夹爪净空无碰撞标志），以及深度 PCA 几何 `depth_angle_deg`（长边角度，[-90, 90) 度）、`depth_angle_conf`（[0, 1]）与 `depth_width_px`（可见画面像素下的横截面宽度），非有限值时省略。深度结果不会写入 `angle_deg` / `angle_conf` / `grasp_width_px`：普通检测模型运行深度时这三个字段仍不出现。`jaw_clear` 检查物体两侧沿夹爪闭合方向的条带：检测带掩码或旋转框角度时为 `angle_deg` + 90 度，否则为深度 PCA 短轴方向；顶层 `"depth"` 对象包含 `metric_model`（是否度量模型，根据模型文件名含 `"metric"` 或 `--depth-metric` 自动识别）、`grid_w`/`grid_h`（网格分辨率）与 `table_samples`（桌面采样点 `[[u_px, v_px, disp], ...]`）。使用普通检测模型且未运行深度时，上述字段均省略以保持输出字节级一致。
@@ -120,6 +134,8 @@ From `rebot-teleop` 1.3.1, `pipelines.aruco` also has `"stages"`: ms per ArUco s
 
 A trigger reply from builds after `rebot-teleop` 1.3.1 also has `"timing"`: CLOCK_MONOTONIC ms (node `process.hrtime`) of `accept_ms`, `read_ms`, `request_ms`, `gate_ms`, `wait_ms`, `grab_ms`, `frame_ms`, `done_ms`, `wake_ms`, `reply_ms`, and `skipped` (frames that did not serve the trigger); fields in `kits/recamera-b601dm/vision/README.md`. 1.3.1 之后的构建中，触发结果另含 `"timing"`：连接接受、请求读完、登记、开闸、取帧、发布、唤醒、回复各时刻（CLOCK_MONOTONIC 毫秒）及未用于该触发的帧数 `skipped`。
 
+Builds with model switching add `"model_generation"` to every result: the `models.generation` the frame ran with. 支持模型切换的构建在每个结果中加入 `"model_generation"`：该帧运行时的 `models.generation`。
+
 `latest` has `"enabled"` in place of `"success"`, and `"timeout":true` when no newer frame arrived within `wait_ms`. The trigger timeout body is `{"api_version":2,"success":false,"timeout":true,"count":0,"detections":[],"markers":[]}`.
 
 Coordinate change against yolo-detector: the inference frame is 640x640 with the 16:9 camera image letterboxed into the band y = 140..500. yolo-detector normalised boxes to the whole 640x640 frame; `rebot-vision` normalises them to the visible 640x360 band, the image size the grasp and the cockpit assume. Markers are detected on that band (same pixels and intrinsics as aruco-detector's 640x360 channel). The debug stream `/results` (video overlay) is unchanged for boxes (display pixels) and adds `"mode"` and `"markers"` in display pixels.
@@ -129,6 +145,50 @@ Coordinate change against yolo-detector: the inference frame is 640x640 with the
 The cockpit's vision selector (video HUD, next to Detect) picks the pipelines of the page's overlay subscription with a version 2 provider (YOLO / ArUco / Both turn the overlay on, Off turns it off) and never sets the global mode; with a version 1 provider it reads and writes `/api/v1/vision/mode` as before. It is hidden when the route answers 404. The hand-eye calibration drawer holds an ArUco subscription for its live preview while it is open and the page is visible, and captures each pose with one `["aruco"]` trigger. The grasp action triggers `["yolo"]` once per centring step and changes no mode. With a version 1 provider the drawer and the grasp switch the mode and restore it afterwards.
 
 驾驶舱视频区「识别」旁的模式选择在版本 2 上游下选择本页叠加层订阅的流水线（YOLO / ArUco / 两者 开启叠加层，「关」关闭），不修改全局模式；版本 1 上游下仍读取并设置 `/api/v1/vision/mode`。路由返回 404 时隐藏。手眼标定抽屉打开且页面可见期间持有一个 ArUco 订阅用于实时预览，每次采样用一次 `["aruco"]` 单次触发。抓取动作每次对准用一次 `["yolo"]` 单次触发，不修改模式。版本 1 上游下标定抽屉和抓取仍切换模式并在结束后恢复。
+
+## Model switching / 模型切换
+
+rebot-vision loads one YOLO model (the `detector` slot: kind `detect`, `segment` or `obb`) and at most one depth model (the `depth` slot) at a time and can swap them in-process on request. Measured on the SG2002 test unit (2026-11-14, rebot-vision 1.3.10): all ION is allocated at startup (peak during triggers = idle); detect 29.2 MB, detect + depth 49.2 MB, segment 39.9 MB, segment + depth 59.9 MB (3.0 MB free of the 62.9 MB carveout), obb + depth 48.7 MB. With a 3.9 MB buffer left by another process, segment + depth made the VENC fail to allocate and the process could not exit until a reboot; a model registration without free ION aborts the process. So every load is preceded by a static budget check:
+
+rebot-vision 同一时刻加载一个 YOLO 模型（`detector` 槽位：类型 `detect`、`segment` 或 `obb`）和至多一个深度模型（`depth` 槽位），可按请求在进程内切换。SG2002 测试机实测（2026-11-14，rebot-vision 1.3.10）：ION 全部在启动时分配（触发期间峰值 = 空闲值）；detect 29.2 MB，detect + depth 49.2 MB，segment 39.9 MB，segment + depth 59.9 MB（62.9 MB 预留区剩 3.0 MB），obb + depth 48.7 MB。其他进程残留 3.9 MB 缓冲时，segment + depth 使 VENC 分配失败，进程直到重启都无法退出；无空闲 ION 时注册模型会使进程中止。因此每次加载前做静态预算检查：
+
+`ion_base_mb` + sum(`ion_mb` of the resident set) + `ion_reserve_mb` <= `ion_total_mb` (defaults 21.5, 8, 62.9 MB in `vision.json`). The budget holds only from a clean ION baseline (no other ION user on the unit); it is not a fail-safe allocator. No source of free ION other than debugfs was found, so the check uses the catalogue's numbers, not a reading. With the measured ion_mb (+ ~5 %: detect 8.5, segment 19.5, obb 8.0, depth 20.5): detect + depth 58.5, obb + depth 58.0, segment alone 49.0 fit; segment + depth 69.5 > 62.9 is refused.
+
+`ion_base_mb` + 常驻模型的 `ion_mb` 之和 + `ion_reserve_mb` <= `ion_total_mb`（`vision.json` 默认 21.5、8、62.9 MB）。该预算只在 ION 基线干净（本机无其他 ION 使用者）时成立，不是可靠的分配器。除 debugfs 外未找到读取空闲 ION 的途径，因此检查使用目录中的数值而非实时读数。按实测 ion_mb（约 +5 %：detect 8.5、segment 19.5、obb 8.0、depth 20.5）：detect + depth 58.5、obb + depth 58.0、单独 segment 49.0 可加载；segment + depth 69.5 > 62.9 被拒绝。
+
+Catalogue in `vision.json` (optional) / `vision.json` 中的目录（可选）:
+
+```json
+{"models": {
+   "det":   {"path": "/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel", "kind": "detect",  "ion_mb": 8.5},
+   "seg":   {"path": "/usr/share/supervisor/models/yolo11n_segment_cv181x_int8.cvimodel",   "kind": "segment", "ion_mb": 19.5},
+   "obb":   {"path": "/userdata/local/models/yolo11n_obb_cv181x_int8_fuse_qout.cvimodel",   "kind": "obb",     "ion_mb": 8.0},
+   "depth": {"path": "/userdata/local/models/zipdepth_metric_384x224_bf16_rgb.cvimodel",    "kind": "depth",   "ion_mb": 20.5}},
+ "ion_base_mb": 21.5, "ion_total_mb": 62.9, "ion_reserve_mb": 8}
+```
+
+- Every catalogue entry states `ion_mb` (finite, >= 0, measured for that model file); entries without it, with another kind or a name that is not 1..64 of letters, digits, `_`, `-`, `.` are skipped with a warning. 每个目录项必须给出 `ion_mb`（有限值，>= 0，按该模型文件实测）；缺少该值、类型不符或名称不是 1..64 个字母、数字、`_`、`-`、`.` 的项被跳过并记录警告。
+- The startup models stay today's (`model` / `depth_model`, else the first existing default file). A startup model whose path is in the catalogue uses that entry; otherwise it is added as an entry named from its file stem with `ion_mb` from the kind table above (the YOLO kind as loaded). 启动模型不变（`model` / `depth_model`，否则第一个存在的默认文件）。路径在目录中的启动模型使用该目录项；否则以文件名主干为名加入目录，`ion_mb` 取上表中对应类型的值（YOLO 类型以实际加载结果为准）。
+- The startup set is checked too: when the YOLO model and the depth model together exceed the budget, only the YOLO model is loaded and the log says why (`Depth model ... not loaded: ... need 69.5 MB ION, limit 62.9 MB`). This changes the behaviour of a segment + depth startup configuration, which earlier loaded both. 启动组合同样检查：YOLO 模型与深度模型合计超出预算时只加载 YOLO 模型，并在日志中说明原因。这改变了 segment + depth 启动配置的行为（之前两者都加载）。
+
+`POST /api/models` on the provider (`:8090`; armd sends it for a [grasp task](agent_action_api.md#grasp-tasks--抓取任务) with `models` and does not proxy it):
+
+提供端 `POST /api/models`（`:8090`；带 `models` 的[抓取任务](agent_action_api.md#grasp-tasks--抓取任务)由 armd 发送，armd 不代理此路由）：
+
+| Body | Reply |
+|---|---|
+| `{"detector"?: name\|null, "depth"?: name\|null}` (absent = keep, `null` = unload) | 202 `{"api_version":2,"generation":n}`: accepted, applied by the frame thread |
+| unknown name, a name of the wrong kind for its slot, other keys, no slot | 400 `{"error":"..."}` |
+| the resident set with the request applied exceeds the budget | 409 `{"error":"ION_BUDGET","need_mb":69.5,"limit_mb":62.9}` |
+| a swap is pending or running | 409 `{"error":"SWAP_BUSY"}` |
+
+- One swap at a time, asynchronous: the reply does not wait for the load. The frame thread (the only user of the models) applies the pending swap at the start of its next frame, also in standby (a pending swap opens the camera gate as a trigger does); it re-checks the budget against the resident set, unloads the changed slots first, then loads each into a fresh model object (so the ION peak stays within the new set), reapplies the threshold, mask and scale settings, and publishes the new set with `generation` + 1. The control lock is not held while loading. 一次只处理一个切换，异步：回复不等待加载。帧线程（唯一使用模型的线程）在下一帧开始时执行待处理的切换，待机时也一样（待处理的切换像触发一样打开取帧闸门）；它按常驻模型重新检查预算，先卸载要更换的槽位，再把每个模型加载到新建的模型对象中（ION 峰值不超过新组合），重新应用阈值、掩码与缩放设置，然后以 `generation` + 1 发布新组合。加载期间不持有控制锁。
+- Poll `GET /api/mode` until `models.generation` reaches the returned generation and `models.swap.state` is `idle` (done) or `failed`. A slot whose load failed stays empty (`error` `LOAD_FAILED:detector` / `LOAD_FAILED:depth`), the other slot keeps its new state, and the generation still advances. 轮询 `GET /api/mode`，直到 `models.generation` 达到返回的代号且 `models.swap.state` 为 `idle`（完成）或 `failed`。加载失败的槽位保持为空（`error` 为 `LOAD_FAILED:detector` / `LOAD_FAILED:depth`），另一槽位保持其新状态，代号照常增加。
+- While the YOLO slot is empty, results report `pipelines.yolo.ran: false`, `available.yolo` is false and YOLO triggers, subscriptions and modes are refused with 409 `yolo unavailable`; with the depth slot empty, depth requests get 409 `depth unavailable`. Existing subscriptions stay registered and get no results for that pipeline; waiting triggers end with their timeout. YOLO 槽位为空时结果报告 `pipelines.yolo.ran: false`，`available.yolo` 为 false，YOLO 触发、订阅与模式以 409 `yolo unavailable` 拒绝；深度槽位为空时深度请求返回 409 `depth unavailable`。已有订阅保持注册，该流水线不再有结果；等待中的触发按其超时结束。
+- `available`, `model` and `depth_model` in the mode body follow the resident set; every result carries `model_generation`. A pending swap is dropped at shutdown. 模式中的 `available`、`model` 与 `depth_model` 随常驻组合变化；每个结果带 `model_generation`。退出时丢弃待处理的切换。
+- Not measured on the device yet: ION after each swap through the model wrappers, and the swap latency (raw cviruntime register/cleanup: 27.5 ms seg, 18 ms detect, ION back to 0 after 60 cycles). 尚未实机测量：经模型封装切换后的 ION 与切换耗时（裸 cviruntime 注册/释放：seg 27.5 ms、detect 18 ms，60 次后 ION 回到 0）。
+
+The MuJoCo simulator's perception server has the same route and budget numbers (catalogue `seg`, `det`, `depth`; [simulation](simulation.md)). MuJoCo 仿真的感知服务提供同样的路由与预算数值（目录 `seg`、`det`、`depth`）。
 
 ## Agent loop example / Agent 调用示例
 

@@ -40,6 +40,7 @@ static constexpr size_t kMaxRequestBytes = 8192;
 static const char* status_text(int code) {
     switch (code) {
         case 200: return "OK";
+        case 202: return "Accepted";
         case 400: return "Bad Request";
         case 404: return "Not Found";
         case 408: return "Request Timeout";
