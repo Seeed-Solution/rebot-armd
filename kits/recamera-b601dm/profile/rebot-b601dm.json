@@ -250,7 +250,14 @@
     ],
     "spill_max_tilt_deg": 8.0,
     "pre_open": "auto",
-    "pre_open_margin_m": 0.015
+    "pre_open_margin_m": 0.015,
+    "height_sources": [
+      "probe"
+    ],
+    "height_record": [
+      "depth"
+    ],
+    "height_priors": {}
   },
   "gravity_comp": {
     "ramp_in_s": 1.0,

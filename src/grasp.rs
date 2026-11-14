@@ -22,6 +22,7 @@
 //! keeps the TCP, the gripper check points and the camera (lens, body box) above
 //! `table_z_m + 0.005` along its path. The approach (and the camera-down transition) is
 //! checked before the ack; every sub-motion again before it is installed.
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -35,6 +36,7 @@ use crate::api::proxy::DetectorUpstream;
 use crate::api::rest::ApiError;
 use crate::kinematics::{self, Mat3, Pose, Vec3};
 use crate::model::{CameraMount, WorkspacePolicy};
+use crate::estimate::{HeightChain, SourceResult};
 use crate::macro_action::{fail, MacroCtx, Stop, SubDone};
 use crate::motion::{self, GoalSpec, GripperCommand, MotionError, PlanInput, RelFrame, Speed};
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
@@ -146,6 +148,24 @@ pub struct GraspSetup {
     pub pre_open: PreOpen,
     /// Margin (m) added to the measured width for the pre-open opening.
     pub pre_open_margin_m: f64,
+    /// Object height sources that decide, in this order: `depth`, `probe` (`height_probe_mode`),
+    /// `prior` (`height_priors`); the first accepted height is used, `grasp_height_m` is the last
+    /// fallback (`height_source` `setup`).
+    pub height_sources: Vec<HeightSource>,
+    /// Sources evaluated and reported in `height_estimates` without deciding (`depth`, `prior`);
+    /// those also in `height_sources` decide instead.
+    pub height_record: Vec<HeightSource>,
+    /// Object height above the table (m) per detected label (case-insensitive), for `prior`.
+    pub height_priors: BTreeMap<String, f64>,
+}
+
+/// Object height source (`height_sources`, `height_record`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeightSource {
+    Depth,
+    Probe,
+    Prior,
 }
 
 /// `pre_open` setting.
@@ -228,6 +248,9 @@ impl Default for GraspSetup {
             spill_max_tilt_deg: 8.0,
             pre_open: PreOpen::Auto,
             pre_open_margin_m: 0.015,
+            height_sources: vec![HeightSource::Probe],
+            height_record: vec![HeightSource::Depth],
+            height_priors: BTreeMap::new(),
         }
     }
 }
@@ -280,6 +303,12 @@ impl GraspSetup {
         check((0.0..=0.2).contains(&self.max_grasp_width_m), "max_grasp_width_m must be in [0, 0.2] m")?;
         check((1.0..=30.0).contains(&self.spill_max_tilt_deg), "spill_max_tilt_deg must be in [1, 30]")?;
         check((0.005..=0.05).contains(&self.pre_open_margin_m), "pre_open_margin_m must be in [0.005, 0.05] m")?;
+        let unique = |l: &[HeightSource]| l.iter().enumerate().all(|(i, x)| !l[..i].contains(x));
+        check(unique(&self.height_sources) && unique(&self.height_record), "height_sources / height_record must not repeat a source")?;
+        check(!self.height_record.contains(&HeightSource::Probe), "height_record allows only depth and prior")?;
+        check(self.height_priors.values().all(|h| h.is_finite() && *h > 0.0 && *h <= 0.5), "height_priors must be in (0, 0.5] m")?;
+        let labels: Vec<String> = self.height_priors.keys().map(|k| k.to_ascii_lowercase()).collect();
+        check(labels.iter().enumerate().all(|(i, k)| !labels[..i].contains(k)), "height_priors labels must be unique ignoring case")?;
         let speed_ok = |v: f64| v > 0.0 && v <= motion::MAX_LINEAR_MPS;
         check(speed_ok(self.approach_speed_mps) && speed_ok(self.descend_speed_mps), "speeds must be in (0, 0.15] m/s")?;
         check(self.phase_timeout_s > 0.0 && self.phase_timeout_s <= 120.0 && self.timeout_s >= self.phase_timeout_s && self.timeout_s <= 600.0,
@@ -922,6 +951,14 @@ pub struct DepthCalibration {
     pub a: f64,
     pub b: f64,
     pub source: &'static str,
+}
+
+/// Start-frame depth kept for the overhead measurement (`two_height_fk` needs both frames).
+#[derive(Default)]
+struct DepthCache {
+    prior: Option<TableObs>,
+    meas: Option<DepthMeasurement>,
+    det0: Option<Detection>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1685,35 +1722,10 @@ impl Orchestrator {
         // centre above the estimate
         let camera_down = planned.camera_down;
         let pose0 = self.pose().await;
-        let mut cached_prior: Option<TableObs> = None;
-        let mut cached_meas: Option<DepthMeasurement> = None;
-        let mut cached_det0: Option<Detection> = None;
-
-        if self.triggered && self.depth_available && self.lens_known {
-            let focus = MaskFocus {
-                label: Some(planned.request.label.clone()),
-                box_norm: planned.request.box_norm,
-                ttl_ms: 2000,
-            };
-            if let Ok(Some(mut frame0)) = self.source.trigger_with_focus(&["yolo", "depth"], TRIGGER_WAIT_MS, Some(&focus)).await {
-                rescale_frame_to_cam(&mut frame0, &self.cam);
-                if let Some(ref d) = frame0.depth {
-                    cached_prior = extract_table_obs(&self.cam, &pose0, d, s.table_z_m);
-                    let cal0 = calibrate_depth(&self.cam, &pose0, Some(d), None, s.table_z_m);
-                    let tracker0 = Tracker {
-                        label: planned.request.label.clone(),
-                        predicted: planned.request.box_norm,
-                        gate_px: s.acquire_dist_px,
-                    };
-                    if let Some(det0) = tracker0.find(&frame0, s) {
-                        cached_det0 = Some(det0.clone());
-                        if let Some(ref cal) = cal0 {
-                            cached_meas = measure_detection_depth_with_cal(&self.cam, &pose0, &det0, cal);
-                        }
-                    }
-                }
-            }
-        }
+        // depth capture runs when depth is a height source or recorded (`height_record`)
+        let depth = self.triggered && self.depth_available && self.lens_known
+            && (s.height_sources.contains(&HeightSource::Depth) || s.height_record.contains(&HeightSource::Depth));
+        let depth_cache = if depth { self.depth_start_frame(planned, &pose0).await } else { DepthCache::default() };
 
         self.phase("approach", 0.1).await?;
         let target = planned.target;
@@ -1760,115 +1772,70 @@ impl Orchestrator {
         }
         let last = c.last.clone();
 
-        let mut depth_meas: Option<DepthMeasurement> = None;
-        if self.triggered && self.depth_available && self.lens_known {
-            let focus = MaskFocus {
-                label: Some(planned.request.label.clone()),
-                box_norm: c.last.box_norm,
-                ttl_ms: 2000,
+        // the overhead depth trigger replaces `after` and `c.last` / `c.frames` with its frame
+        // whenever it runs, also when depth is record-only (only the height selection ignores it)
+        let depth_meas = if depth { self.depth_overhead(&planned.request.label, &mut c, &mut after, &pose0, depth_cache).await } else { None };
+
+        // object height: record-only sources first (they do not move the arm), then the
+        // `height_sources` in order until one accepts; `grasp_height_m` when none does. Box
+        // centres map onto the object's top plane, the jaws close part way up the object
+        let label = &planned.request.label;
+        let record: Vec<HeightSource> = s.height_record.iter().copied().filter(|x| !s.height_sources.contains(x)).collect();
+        let mut chain = HeightChain::new();
+        for src in &record {
+            let (name, value, r) = if *src == HeightSource::Depth { self.depth_source(depth, depth_meas.as_ref()) } else { self.prior_source(label) };
+            chain.offer(&name, value, r, true);
+        }
+        self.write_estimates(&chain).await;
+        let mut reasons: Vec<String> = Vec::new();
+        for src in &s.height_sources {
+            if chain.done() { break; }
+            // a prior does not override a measured too-tall result
+            if *src == HeightSource::Prior && chain.vetoed() { continue; }
+            let (name, value, r) = match src {
+                HeightSource::Depth => self.depth_source(depth, depth_meas.as_ref()),
+                HeightSource::Prior => self.prior_source(label),
+                // only a too-tall measurement is a result; stop / fault / other failures end the grasp
+                HeightSource::Probe => match self.probe_height(&c, label, &mut after).await {
+                    Ok(Ok((h, source))) => (source.to_string(), None, SourceResult::Accept(h)),
+                    Ok(Err(reason)) => ("probe".to_string(), None, SourceResult::Reject(reason)),
+                    Err(Stop::Fail(code, msg)) if code == "OBJECT_TOO_TALL" => ("probe".to_string(), None, SourceResult::Veto(Stop::Fail(code, msg))),
+                    Err(stop) => return Err(stop),
+                },
             };
-            if let Ok(Some(mut overhead_frame)) = self.source.trigger_with_focus(&["yolo", "depth"], TRIGGER_WAIT_MS, Some(&focus)).await {
-                rescale_frame_to_cam(&mut overhead_frame, &self.cam);
-                after = Some(overhead_frame.frame_id);
-                if metric_table_contradicts_fk(&self.cam, &c.pose, overhead_frame.depth.as_ref(), s.table_z_m) {
-                    tracing::debug!("Overhead table samples contradict FK; invalidating cached start-frame depth measurement");
-                    cached_meas = None;
-                }
-                let tracker = Tracker {
-                    label: planned.request.label.clone(),
-                    predicted: c.last.box_norm,
-                    gate_px: s.match_dist_px,
-                };
-                if let Some(overhead_det) = tracker.find(&overhead_frame, s) {
-                    c.last = overhead_det.clone();
-                    c.frames.push(overhead_det.clone());
-
-                    if let Some(cal) = calibrate_depth(&self.cam, &c.pose, overhead_frame.depth.as_ref(), None, s.table_z_m) {
-                        depth_meas = measure_detection_depth_with_cal(&self.cam, &c.pose, &overhead_det, &cal);
-                    }
-                    if depth_meas.is_none() {
-                        depth_meas = cached_meas.clone();
-                    }
-                    if depth_meas.is_none() {
-                        if let Some(cal) = calibrate_depth(&self.cam, &c.pose, overhead_frame.depth.as_ref(), cached_prior.as_ref(), s.table_z_m) {
-                            if cal.source == "two_height_fk" {
-                                if let (Some(ref det0), Some(m1)) = (&cached_det0, measure_detection_depth_with_cal(&self.cam, &c.pose, &overhead_det, &cal)) {
-                                    if let Some(m0) = measure_detection_depth_with_cal(&self.cam, &pose0, det0, &cal) {
-                                        if (m0.height_m - m1.height_m).abs() <= (0.20 * m1.height_m).max(0.008) {
-                                            depth_meas = Some(m1);
-                                        } else {
-                                            tracing::debug!("two_height_fk rejected: height drifted between frames (m0={:.3}, m1={:.3})", m0.height_m, m1.height_m);
-                                        }
-                                    }
-                                }
-                            } else {
-                                depth_meas = measure_detection_depth_with_cal(&self.cam, &c.pose, &overhead_det, &cal);
-                            }
-                        }
-                    }
-                }
-            }
+            // `height_reason` keeps the reasons of the non-depth sources (depth's are in `height_estimates`)
+            if let (SourceResult::Reject(reason), false) = (&r, *src == HeightSource::Depth) { reasons.push(reason.clone()); }
+            chain.offer(&name, value, r, false);
+            self.write_estimates(&chain).await;
         }
-        if depth_meas.is_none() {
-            depth_meas = cached_meas;
-        }
+        let chosen = match chain.finish() { Ok((chosen, _)) => chosen, Err((stop, _)) => return Err(stop) };
 
-        // object height: from depth inference if available and anchored, else from the box scale
-        // change over a short straight-down probe: box centres map onto the object's top plane,
-        // the jaws close part way up the object
         let mut close_h = s.grasp_height_m;
         let mut plane = plane;
-        let mut depth_used = false;
-        let mut depth_too_tall: Option<Stop> = None;
-
-        if let Some(ref meas) = depth_meas {
-            // A depth height that fails the checks does not decide alone: the mechanical probe
-            // measures again. A too-tall depth height still ends the grasp when the probe cannot
-            // measure (a tall object close to the camera often touches the image border).
-            match self.accept_height(meas.height_m) {
-                Ok(Ok(h)) => {
-                    depth_used = true;
-                    plane = s.table_z_m + s.grasp_height_m.max(h);
-                    close_h = (h * s.height_grasp_fraction).clamp(s.grasp_height_m, s.max_grasp_height_m);
-                    tracing::info!("Grasp {}: object top {h:.3} m above the table (depth:{}), closing at {close_h:.3} m", self.id, meas.source);
-                    self.sup.inner().write().await.update_action(self.id, |a| {
-                        a.height_source = Some("depth".into());
-                        a.object_height_m = Some(h as f32);
-                        a.depth_anchor = Some(meas.source.into());
-                        a.object_depth_m = Some(meas.depth_m as f32);
-                        a.object_length_m = meas.length_m.map(|l| l as f32);
-                        a.jaw_clear = meas.jaw_clear;
-                    });
-                }
-                Ok(Err(reason)) => tracing::debug!("Depth height rejected ({reason}), falling back to probe_height"),
-                Err(fail) => {
-                    tracing::debug!("Depth height too tall ({:.3} m), confirming with probe_height", meas.height_m);
-                    depth_too_tall = Some(fail);
-                }
+        let depth_chosen = chosen.as_ref().is_some_and(|(_, source)| source.starts_with("depth"));
+        match chosen {
+            Some((h, source)) => {
+                plane = s.table_z_m + s.grasp_height_m.max(h);
+                close_h = (h * s.height_grasp_fraction).clamp(s.grasp_height_m, s.max_grasp_height_m);
+                tracing::info!("Grasp {}: object top {h:.3} m above the table ({source}), closing at {close_h:.3} m", self.id);
+                self.sup.inner().write().await.update_action(self.id, |a| {
+                    a.height_source = Some(if depth_chosen { "depth".into() } else { source });
+                    a.object_height_m = Some(h as f32);
+                });
             }
+            None => self.sup.inner().write().await.update_action(self.id, |a| {
+                a.height_source = Some("setup".into());
+                a.height_reason = (!reasons.is_empty()).then(|| reasons.join(","));
+            }),
         }
-
-        if !depth_used {
-            match self.probe_height(&c, &planned.request.label, &mut after).await? {
-                Ok((h, source)) => {
-                    plane = s.table_z_m + s.grasp_height_m.max(h);
-                    close_h = (h * s.height_grasp_fraction).clamp(s.grasp_height_m, s.max_grasp_height_m);
-                    tracing::info!("Grasp {}: object top {h:.3} m above the table ({source}), closing at {close_h:.3} m", self.id);
-                    self.sup.inner().write().await.update_action(self.id, |a| {
-                        a.height_source = Some(source.into());
-                        a.object_height_m = Some(h as f32);
-                    });
-                }
-                Err(reason) => {
-                    if let Some(fail) = depth_too_tall {
-                        return Err(fail);
-                    }
-                    self.sup.inner().write().await.update_action(self.id, |a| {
-                        a.height_source = Some("setup".into());
-                        a.height_reason = Some(reason);
-                    });
-                }
-            }
+        // depth measurement fields: when depth decided or is record-only (diagnostic)
+        if let Some(meas) = depth_meas.as_ref().filter(|_| depth_chosen || record.contains(&HeightSource::Depth)) {
+            self.sup.inner().write().await.update_action(self.id, |a| {
+                a.depth_anchor = Some(meas.source.into());
+                a.object_depth_m = Some(meas.depth_m as f32);
+                a.object_length_m = meas.length_m.map(|l| l as f32);
+                a.jaw_clear = meas.jaw_clear;
+            });
         }
         self.sup.inner().write().await.update_action(self.id, |a| a.close_height_m = Some(close_h as f32));
 
@@ -2221,6 +2188,125 @@ impl Orchestrator {
             let done = self.move_arm(phase, GoalSpec::Relative { frame: RelFrame::Base, d: step, dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false }, s.approach_speed_mps).await?;
             since = done.at;
         }
+    }
+
+    /// Start-frame depth: table samples (`two_height_fk` prior), the matched detection and its
+    /// measurement at the start pose `pose0`.
+    async fn depth_start_frame(&self, planned: &PlannedGrasp, pose0: &Pose) -> DepthCache {
+        let s = &self.setup;
+        let mut cache = DepthCache::default();
+        let focus = MaskFocus {
+            label: Some(planned.request.label.clone()),
+            box_norm: planned.request.box_norm,
+            ttl_ms: 2000,
+        };
+        if let Ok(Some(mut frame0)) = self.source.trigger_with_focus(&["yolo", "depth"], TRIGGER_WAIT_MS, Some(&focus)).await {
+            rescale_frame_to_cam(&mut frame0, &self.cam);
+            if let Some(ref d) = frame0.depth {
+                cache.prior = extract_table_obs(&self.cam, pose0, d, s.table_z_m);
+                let cal0 = calibrate_depth(&self.cam, pose0, Some(d), None, s.table_z_m);
+                let tracker0 = Tracker {
+                    label: planned.request.label.clone(),
+                    predicted: planned.request.box_norm,
+                    gate_px: s.acquire_dist_px,
+                };
+                if let Some(det0) = tracker0.find(&frame0, s) {
+                    cache.det0 = Some(det0.clone());
+                    if let Some(ref cal) = cal0 {
+                        cache.meas = measure_detection_depth_with_cal(&self.cam, pose0, &det0, cal);
+                    }
+                }
+            }
+        }
+        cache
+    }
+
+    /// Overhead depth trigger at the centred pose: its frame becomes `after`, and its matched
+    /// detection `c.last` (appended to `c.frames`). Returns the overhead measurement, else the
+    /// start-frame one.
+    async fn depth_overhead(&self, label: &str, c: &mut Centred, after: &mut Option<u64>, pose0: &Pose, cache: DepthCache) -> Option<DepthMeasurement> {
+        let s = &self.setup;
+        let DepthCache { prior: cached_prior, meas: mut cached_meas, det0: cached_det0 } = cache;
+        let mut depth_meas: Option<DepthMeasurement> = None;
+        let focus = MaskFocus {
+            label: Some(label.to_string()),
+            box_norm: c.last.box_norm,
+            ttl_ms: 2000,
+        };
+        if let Ok(Some(mut overhead_frame)) = self.source.trigger_with_focus(&["yolo", "depth"], TRIGGER_WAIT_MS, Some(&focus)).await {
+            rescale_frame_to_cam(&mut overhead_frame, &self.cam);
+            *after = Some(overhead_frame.frame_id);
+            if metric_table_contradicts_fk(&self.cam, &c.pose, overhead_frame.depth.as_ref(), s.table_z_m) {
+                tracing::debug!("Overhead table samples contradict FK; invalidating cached start-frame depth measurement");
+                cached_meas = None;
+            }
+            let tracker = Tracker {
+                label: label.to_string(),
+                predicted: c.last.box_norm,
+                gate_px: s.match_dist_px,
+            };
+            if let Some(overhead_det) = tracker.find(&overhead_frame, s) {
+                c.last = overhead_det.clone();
+                c.frames.push(overhead_det.clone());
+
+                if let Some(cal) = calibrate_depth(&self.cam, &c.pose, overhead_frame.depth.as_ref(), None, s.table_z_m) {
+                    depth_meas = measure_detection_depth_with_cal(&self.cam, &c.pose, &overhead_det, &cal);
+                }
+                if depth_meas.is_none() {
+                    depth_meas = cached_meas.clone();
+                }
+                if depth_meas.is_none() {
+                    if let Some(cal) = calibrate_depth(&self.cam, &c.pose, overhead_frame.depth.as_ref(), cached_prior.as_ref(), s.table_z_m) {
+                        if cal.source == "two_height_fk" {
+                            if let (Some(ref det0), Some(m1)) = (&cached_det0, measure_detection_depth_with_cal(&self.cam, &c.pose, &overhead_det, &cal)) {
+                                if let Some(m0) = measure_detection_depth_with_cal(&self.cam, pose0, det0, &cal) {
+                                    if (m0.height_m - m1.height_m).abs() <= (0.20 * m1.height_m).max(0.008) {
+                                        depth_meas = Some(m1);
+                                    } else {
+                                        tracing::debug!("two_height_fk rejected: height drifted between frames (m0={:.3}, m1={:.3})", m0.height_m, m1.height_m);
+                                    }
+                                }
+                            }
+                        } else {
+                            depth_meas = measure_detection_depth_with_cal(&self.cam, &c.pose, &overhead_det, &cal);
+                        }
+                    }
+                }
+            }
+        }
+        depth_meas.or(cached_meas)
+    }
+
+    /// Height source `depth` (entry name `depth:<anchor>`); `ran`: the depth capture ran.
+    fn depth_source(&self, ran: bool, meas: Option<&DepthMeasurement>) -> (String, Option<f64>, SourceResult) {
+        let reject = |r: &str| ("depth".to_string(), None, SourceResult::Reject(r.into()));
+        match meas {
+            Some(m) => (format!("depth:{}", m.source), Some(m.height_m), self.height_result(m.height_m)),
+            None if ran => reject("no_measurement"),
+            None if !self.lens_known => reject("no_lens_centre"),
+            None => reject("unavailable"),
+        }
+    }
+
+    /// Height source `prior`: `height_priors` for the target's label (case-insensitive).
+    fn prior_source(&self, label: &str) -> (String, Option<f64>, SourceResult) {
+        match self.setup.height_priors.iter().find(|(k, _)| k.eq_ignore_ascii_case(label)) {
+            Some((_, &h)) => ("prior".into(), Some(h), self.height_result(h)),
+            None => ("prior".into(), None, SourceResult::Reject("no_prior".into())),
+        }
+    }
+
+    fn height_result(&self, h: f64) -> SourceResult {
+        match self.accept_height(h) {
+            Ok(Ok(h)) => SourceResult::Accept(h),
+            Ok(Err(reason)) => SourceResult::Reject(reason),
+            Err(stop) => SourceResult::Veto(stop),
+        }
+    }
+
+    async fn write_estimates(&self, chain: &HeightChain) {
+        let entries = chain.entries().to_vec();
+        self.sup.inner().write().await.update_action(self.id, |a| a.height_estimates = entries);
     }
 
     /// Height probe after the centring (`height_probe_mode`): `Ok(Ok((h, source)))` with the
@@ -2837,6 +2923,32 @@ mod tests {
         assert!(s.patched(&serde_json::json!({"grasp_height_m": 0.5})).is_err());
         let p = s.patched(&serde_json::json!({"table_z_m": 0.02, "grip_pixel_norm": [0.4, 0.7]})).unwrap();
         assert_eq!((p.table_z_m, p.grip_pixel_norm), (0.02, [0.4, 0.7]));
+    }
+
+    #[test]
+    fn height_source_settings_default_validate_and_patch() {
+        let d = GraspSetup::default();
+        assert_eq!((d.height_sources.as_slice(), d.height_record.as_slice()), ([HeightSource::Probe].as_slice(), [HeightSource::Depth].as_slice()));
+        assert!(d.height_priors.is_empty());
+        // a setup file without the keys gets the defaults
+        let old: GraspSetup = serde_json::from_value(serde_json::json!({"table_z_m": 0.01})).unwrap();
+        assert_eq!((old.height_sources, old.height_record, old.height_priors), (d.height_sources.clone(), d.height_record.clone(), BTreeMap::new()));
+        let p = d.patched(&serde_json::json!({"height_sources": ["depth", "probe", "prior"], "height_record": ["prior"], "height_priors": {"cup": 0.09}})).unwrap();
+        assert_eq!(p.height_sources, [HeightSource::Depth, HeightSource::Probe, HeightSource::Prior]);
+        assert_eq!(p.height_priors.get("cup"), Some(&0.09));
+        // the default height_record may name a deciding source: it decides instead
+        assert!(d.patched(&serde_json::json!({"height_sources": ["depth", "probe"]})).is_ok());
+        for bad in [
+            serde_json::json!({"height_sources": ["probe", "probe"]}),
+            serde_json::json!({"height_record": ["depth", "depth"]}),
+            serde_json::json!({"height_record": ["probe"]}),
+            serde_json::json!({"height_sources": ["scale"]}),
+            serde_json::json!({"height_priors": {"cup": 0.0}}),
+            serde_json::json!({"height_priors": {"cup": 0.6}}),
+            serde_json::json!({"height_priors": {"cup": 0.05, "Cup": 0.06}}),
+        ] {
+            assert!(d.patched(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

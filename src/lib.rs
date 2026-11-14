@@ -4,6 +4,7 @@ pub mod collision;
 pub mod diagnostics;
 pub mod driver;
 pub mod dynamics;
+pub mod estimate;
 pub mod grasp;
 pub mod gravity;
 pub mod gravity_comp;

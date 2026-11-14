@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::estimate::EstimateEntry;
 use crate::kinematics::{self, Pose};
 use crate::model::{CameraMount, GripperPolicy, JointLimit, WorkspacePolicy};
 use crate::trajectory::MultiJointQuinticTrajectory;
@@ -815,6 +816,10 @@ pub struct ActionStatus {
     pub height_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_height_m: Option<f32>,
+    /// Grasp: every evaluated height source in evaluation order (`height_sources`,
+    /// `height_record`), with its value, reject reason or veto code, and whether it decided.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub height_estimates: Vec<EstimateEntry>,
     /// Grasp: TCP height above the table at which the jaws close (m).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_height_m: Option<f32>,

@@ -9,9 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use armd::grasp::{self, BoxFuture, CamModel, DepthFrameInfo, Detection, DetectionFrame, DetectionSource, GraspDeps, GraspSetup, VisionMode};
+use armd::grasp::{self, BoxFuture, CamModel, DepthFrameInfo, Detection, DetectionFrame, DetectionSource, GraspDeps, GraspSetup, HeightSource, VisionMode};
 use armd::chain::ArmModel;
+use armd::estimate::EstimateEntry;
 use armd::kinematics::{self, Pose, Vec3};
+use armd::motion::ActionStatus;
 use armd::model::CameraMount;
 use armd::{ArmConfig, ArmSupervisor};
 use serde_json::{json, Value};
@@ -2196,7 +2198,7 @@ async fn grasp_completes_when_mask_focus_fails() {
 
 #[tokio::test]
 async fn depth_oblique_ransac_skips_probe_and_grasps() {
-    let setup = GraspSetup { camera_tilt_deg: 0.0, ..GraspSetup::default() };
+    let setup = GraspSetup { camera_tilt_deg: 0.0, height_sources: DEPTH_DECIDES.to_vec(), ..GraspSetup::default() };
     let rig = rig(setup.clone(), Truth::same(), 20.0, [0.0, 0.0], false).await;
     let start_r = start_pose(&rig).await.r;
     let mut s = setup.clone();
@@ -2237,7 +2239,7 @@ async fn depth_oblique_ransac_skips_probe_and_grasps() {
 
 #[tokio::test]
 async fn depth_metric_model_vertical_and_occluded() {
-    let setup = GraspSetup { camera_tilt_deg: 0.0, ..GraspSetup::default() };
+    let setup = GraspSetup { camera_tilt_deg: 0.0, height_sources: DEPTH_DECIDES.to_vec(), ..GraspSetup::default() };
     let rig1 = rig(setup.clone(), Truth::same(), 0.0, [0.0, 0.0], false).await;
     let start_r1 = start_pose(&rig1).await.r;
     let mut s1 = setup.clone();
@@ -2329,7 +2331,7 @@ async fn depth_metric_model_vertical_and_occluded() {
 
 #[tokio::test]
 async fn depth_unanchored_or_low_conf_falls_back_to_probe_height() {
-    let setup = GraspSetup { camera_tilt_deg: 0.0, height_probe_m: 0.04, ..GraspSetup::default() };
+    let setup = GraspSetup { camera_tilt_deg: 0.0, height_sources: DEPTH_DECIDES.to_vec(), height_probe_m: 0.04, ..GraspSetup::default() };
 
     // 1. Low confidence depth (< 0.35 threshold) falls back to probe_height
     let rig1 = rig(setup.clone(), Truth::same(), 0.0, [0.0, 0.0], false).await;
@@ -2390,7 +2392,7 @@ async fn depth_unanchored_or_low_conf_falls_back_to_probe_height() {
 
 #[tokio::test]
 async fn depth_tall_object_fails_when_the_probe_cannot_measure() {
-    let setup = GraspSetup { camera_tilt_deg: 0.0, approach_height_m: 0.10, height_probe_m: 0.04, ..GraspSetup::default() };
+    let setup = GraspSetup { camera_tilt_deg: 0.0, height_sources: DEPTH_DECIDES.to_vec(), approach_height_m: 0.10, height_probe_m: 0.04, ..GraspSetup::default() };
     let rig = rig(setup.clone(), Truth::same(), 0.0, [0.0, 0.0], false).await;
     let start_r = start_pose(&rig).await.r;
     let mut s = setup.clone();
@@ -2423,7 +2425,7 @@ async fn depth_tall_object_fails_when_the_probe_cannot_measure() {
 
 #[tokio::test]
 async fn depth_guards_lens_unknown_table_conflict_and_drift() {
-    let setup = GraspSetup { camera_tilt_deg: 0.0, height_probe_m: 0.04, ..GraspSetup::default() };
+    let setup = GraspSetup { camera_tilt_deg: 0.0, height_sources: DEPTH_DECIDES.to_vec(), height_probe_m: 0.04, ..GraspSetup::default() };
 
     // 1. Truth { known_offset: false, ..Truth::same() } (!lens_known) with depth_available = true skips FK depth anchoring
     let rig1 = rig(setup.clone(), Truth { known_offset: false, ..Truth::same() }, 0.0, [0.0, 0.0], false).await;
@@ -2484,7 +2486,7 @@ async fn depth_guards_lens_unknown_table_conflict_and_drift() {
 
     // 3. Stationary vertical relative model (metric_model: false, a0: 2.7, b0: 0.45, drift_per_frame: false)
     // starting at look_down_start(0.0, 0.26) with approach_height_m: 0.15 calibrates via two_height_fk
-    let s3_base = GraspSetup { camera_tilt_deg: 0.0, approach_height_m: 0.15, height_probe_m: 0.04, ..GraspSetup::default() };
+    let s3_base = GraspSetup { camera_tilt_deg: 0.0, height_sources: DEPTH_DECIDES.to_vec(), approach_height_m: 0.15, height_probe_m: 0.04, ..GraspSetup::default() };
     let rig3 = rig_mounted(s3_base.clone(), Truth::same(), 0.0, look_down_start(0.0, 0.26), [0.0, 0.0], false).await;
     let start_r3 = start_pose(&rig3).await.r;
     let mut s3 = s3_base.clone();
@@ -2549,7 +2551,7 @@ async fn depth_guards_lens_unknown_table_conflict_and_drift() {
     // 5. metric_model: true, a0: 1.8, occluded_above_z: Some(0.20) starting at look_down_start(0.0, 0.26)
     // with approach_height_m: 0.15 (frame0 at z = 0.26 is occluded and gives no calibration,
     // overhead_frame at z = 0.15 sees conflicting table -> falls back to probe_height)
-    let s5_base = GraspSetup { camera_tilt_deg: 0.0, approach_height_m: 0.15, height_probe_m: 0.04, ..GraspSetup::default() };
+    let s5_base = GraspSetup { camera_tilt_deg: 0.0, height_sources: DEPTH_DECIDES.to_vec(), approach_height_m: 0.15, height_probe_m: 0.04, ..GraspSetup::default() };
     let rig5 = rig_mounted(s5_base.clone(), Truth::same(), 0.0, look_down_start(0.0, 0.26), [0.0, 0.0], false).await;
     let start_r5 = start_pose(&rig5).await.r;
     let mut s5 = s5_base.clone();
@@ -2580,5 +2582,135 @@ async fn depth_guards_lens_unknown_table_conflict_and_drift() {
     assert!(a5.probe_dz_m.is_some(), "probe_height should have run when table contradicted prior");
 }
 
+/// e537a3f behaviour: a depth height decides before the probe.
+const DEPTH_DECIDES: [HeightSource; 2] = [HeightSource::Depth, HeightSource::Probe];
 
+fn metric_depth() -> DepthSim {
+    DepthSim { metric_model: true, a0: 1.0, b0: 0.0, occluded_table: false, occluded_above_z: None, depth_conf: Some(0.95), jaw_clear: Some(true), length_px: Some(60.0), drift_per_frame: false }
+}
 
+/// Vertical start, triggered frames with depth inference, grip pixel calibrated.
+async fn depth_rig(setup: GraspSetup, depth: DepthSim, width_px: Option<f64>, top: Option<f64>) -> Rig {
+    let rig = rig(setup.clone(), Truth::same(), 0.0, [0.0, 0.0], false).await;
+    let start_r = start_pose(&rig).await.r;
+    let mut s = setup.clone();
+    s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+    rig.sup.inner().write().await.set_grasp_setup(s);
+    rig.sim.per_request.store(true, Ordering::SeqCst);
+    rig.sim.depth_available.store(true, Ordering::SeqCst);
+    *rig.sim.width_px.lock().unwrap() = width_px;
+    *rig.sim.top.lock().unwrap() = top;
+    *rig.sim.depth_sim.lock().unwrap() = Some(depth);
+    rig
+}
+
+async fn run_to_end(rig: &Rig) -> ActionStatus {
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(rig).await).await.expect("grasp accepted");
+    wait_done(&rig.sup, id, 30.0, |_| {}).await
+}
+
+/// (source, value, used, record_only, reason) of every height estimate.
+fn estimates(a: &ActionStatus) -> Vec<(String, Option<f32>, bool, bool, Option<String>)> {
+    a.height_estimates.iter().map(|e: &EstimateEntry| (e.source.clone(), e.value, e.used, e.record_only, e.reason.clone())).collect()
+}
+
+#[tokio::test]
+async fn default_setup_records_depth_and_the_probe_decides() {
+    let rig = depth_rig(GraspSetup { camera_tilt_deg: 0.0, ..GraspSetup::default() }, metric_depth(), Some(35.0), None).await;
+    let a = run_to_end(&rig).await;
+    println!("record-only depth: {} {:?}, {:?} {:?}, estimates {:?}", a.state, a.code, a.height_source, a.object_height_m, a.height_estimates);
+    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+    assert_eq!(a.height_source.as_deref(), Some("scale"));
+    assert!(a.probe_dz_m.is_some(), "the probe decides");
+    // record-only depth still reports its measurement
+    assert_eq!(a.depth_anchor.as_deref(), Some("metric_table"));
+    let e = estimates(&a);
+    assert_eq!(e.len(), 2, "{e:?}");
+    assert_eq!((e[0].0.as_str(), e[0].2, e[0].3, e[0].4.as_deref()), ("depth:metric_table", false, true, None));
+    assert!((f64::from(e[0].1.unwrap()) - rig.sim.object.height).abs() < 0.005, "{e:?}");
+    assert_eq!((e[1].0.as_str(), e[1].2, e[1].3), ("scale", true, false));
+    assert_eq!(e[1].1, a.object_height_m);
+}
+
+#[tokio::test]
+async fn height_selection_follows_the_order_of_height_sources() {
+    let probe_first = GraspSetup { camera_tilt_deg: 0.0, height_sources: vec![HeightSource::Probe, HeightSource::Depth], ..GraspSetup::default() };
+    let a = run_to_end(&depth_rig(probe_first, metric_depth(), Some(35.0), None).await).await;
+    assert_eq!((a.state.as_str(), a.height_source.as_deref()), ("done", Some("scale")), "{a:?}");
+    assert!(a.probe_dz_m.is_some());
+    // depth comes after the accepted probe: not evaluated, not reported
+    assert_eq!(estimates(&a).iter().map(|e| e.0.as_str()).collect::<Vec<_>>(), ["scale"]);
+    assert_eq!(a.depth_anchor, None);
+
+    let depth_first = GraspSetup { camera_tilt_deg: 0.0, height_sources: DEPTH_DECIDES.to_vec(), ..GraspSetup::default() };
+    let a = run_to_end(&depth_rig(depth_first, metric_depth(), Some(35.0), None).await).await;
+    assert_eq!((a.state.as_str(), a.height_source.as_deref()), ("done", Some("depth")), "{a:?}");
+    assert_eq!(a.probe_dz_m, None);
+    let e = estimates(&a);
+    assert_eq!((e.len(), e[0].0.as_str(), e[0].2, e[0].3), (1, "depth:metric_table", true, false), "{e:?}");
+}
+
+#[tokio::test]
+async fn prior_decides_when_the_probe_is_disabled() {
+    let (rig, s) = height_rig(0.08, json!({"height_probe_m": 0.0, "height_sources": ["probe", "prior"], "height_priors": {"CUP": 0.08}})).await;
+    let (a, close_z) = run_grasp_close_z(&rig).await;
+    println!("prior: {} {:?}, {:?} {:?}, close {:?}, TCP z at close {close_z:.4}, estimates {:?}", a.state, a.code, a.height_source, a.object_height_m, a.close_height_m, a.height_estimates);
+    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+    assert_eq!((a.height_source.as_deref(), a.object_height_m, a.height_reason.as_deref()), (Some("prior"), Some(0.08), None));
+    assert!((f64::from(a.close_height_m.unwrap()) - 0.04).abs() < 1e-6, "{a:?}");
+    assert!((close_z - (s.table_z_m + 0.04)).abs() < 2e-3, "TCP at the close height: {close_z}");
+    assert_eq!(estimates(&a), [
+        ("depth".to_string(), None, false, true, Some("unavailable".to_string())),
+        ("probe".to_string(), None, false, false, Some("disabled".to_string())),
+        ("prior".to_string(), Some(0.08), true, false, None),
+    ]);
+}
+
+#[tokio::test]
+async fn record_only_too_tall_prior_is_ignored() {
+    let (rig, _) = height_rig(0.08, json!({"height_record": ["depth", "prior"], "height_priors": {"cup": 0.3}})).await;
+    let (a, _) = run_grasp_close_z(&rig).await;
+    assert_eq!((a.state.as_str(), a.holding, a.height_source.as_deref()), ("done", Some(true), Some("scale")), "{a:?}");
+    let e = estimates(&a);
+    assert_eq!(e[1], ("prior".to_string(), Some(0.3), false, true, Some("OBJECT_TOO_TALL".to_string())), "{e:?}");
+    assert_eq!((e[2].0.as_str(), e[2].2), ("scale", true));
+}
+
+/// The depth_tall_object_fails_when_the_probe_cannot_measure scene with depth record-only: the
+/// too-tall depth height does not end the grasp; the probe cannot measure, the grasp goes on at
+/// grasp_height_m. The width check is the same as with depth deciding.
+#[tokio::test]
+async fn record_only_too_tall_depth_falls_back_to_the_setup_height() {
+    let setup = GraspSetup { camera_tilt_deg: 0.0, approach_height_m: 0.10, height_probe_m: 0.04, ..GraspSetup::default() };
+    let a = run_to_end(&depth_rig(setup.clone(), metric_depth(), None, Some(0.09)).await).await;
+    println!("record-only tall depth: {} {:?}, {:?} {:?}, estimates {:?}", a.state, a.code, a.height_source, a.height_reason, a.height_estimates);
+    assert_eq!(a.state, "done", "{a:?}");
+    assert_eq!(a.height_source.as_deref(), Some("setup"));
+    assert_eq!(a.height_reason.as_deref(), Some("border"), "{a:?}");
+    let e = estimates(&a);
+    assert_eq!((e.len(), e[0].0.as_str(), e[0].2, e[0].3, e[0].4.as_deref()), (2, "depth:metric_table", false, true, Some("OBJECT_TOO_TALL")), "{e:?}");
+    assert_eq!(e[1], ("probe".to_string(), None, false, false, Some("border".to_string())));
+    assert_eq!(a.depth_anchor.as_deref(), Some("metric_table"));
+
+    let narrow = GraspSetup { max_grasp_width_m: 0.02, ..setup };
+    let a = run_to_end(&depth_rig(narrow, metric_depth(), Some(250.0), Some(0.09)).await).await;
+    assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("TOO_WIDE")), "{a:?}");
+    assert!(a.grasp_width_m.is_some_and(|w| w > 0.02), "{a:?}");
+}
+
+#[tokio::test]
+async fn stop_during_the_probe_ends_the_grasp_with_the_estimates_so_far() {
+    let (rig, _) = height_rig(0.08, json!({})).await;
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    wait_phase(&rig.sup, id, "probe", Some(true)).await;
+    {
+        let mut inner = rig.sup.inner().write().await;
+        inner.stop_motion();
+        inner.request_macro_stop();
+    }
+    let a = wait_done(&rig.sup, id, 5.0, |_| {}).await;
+    assert_eq!((a.state.as_str(), a.code.as_deref()), ("cancelled", Some("STOPPED")), "{a:?}");
+    assert_eq!(a.height_source, None);
+    assert_eq!(estimates(&a), [("depth".to_string(), None, false, true, Some("unavailable".to_string()))]);
+    assert_idle_after(&rig.sup, id).await;
+}
