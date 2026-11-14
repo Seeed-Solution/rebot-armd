@@ -77,8 +77,11 @@ const char* kDefaultModels[] = {
     "/userdata/local/models/yolo11n_detection_cv181x_int8.cvimodel",
     "/userdata/local/models/yolo11n_cv181x_int8.cvimodel",
     "/userdata/rebot-teleop/models/yolo11n-obb.cvimodel",
+    "/userdata/local/models/yolo11n_obb_cv181x_int8_fuse_qout.cvimodel",
     "/userdata/local/models/yolo11n_obb_cv181x_int8.cvimodel",
     "/userdata/local/models/yolo26n_obb_cv181x_int8.cvimodel",
+    "/usr/share/supervisor/models/yolo11n_segment_cv181x_int8.cvimodel",
+    "/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel",
 };
 
 const char* kDefaultDepthModels[] = {

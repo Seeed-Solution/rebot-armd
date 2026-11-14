@@ -338,6 +338,10 @@ YOLO model: not in the repository or the deb. The first existing file of `vision
 `/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel`,
 `/userdata/local/models/yolo11n_detection_cv181x_int8.cvimodel`,
 `/userdata/local/models/yolo11n_cv181x_int8.cvimodel`,
+`/userdata/rebot-teleop/models/yolo11n-obb.cvimodel`,
+`/userdata/local/models/yolo11n_obb_cv181x_int8_fuse_qout.cvimodel`,
+`/userdata/local/models/yolo11n_obb_cv181x_int8.cvimodel`,
+`/userdata/local/models/yolo26n_obb_cv181x_int8.cvimodel`,
 `/usr/share/supervisor/models/yolo11n_segment_cv181x_int8.cvimodel`,
 `/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel` is loaded. Without a model `yolo` and `both`
 answer 409 and ArUco works.
@@ -434,6 +438,50 @@ OBB CPU utilization and latency are lower than `detect` in this test because DOT
 - CV181X TPU-MLIR `TopToTpuPass` lacks lowering support for `top.Cos` and `top.Sin` emitted by Ultralytics rotated box decoding, so export truncates the ONNX head to the 9 raw conv outputs (`cv2.{0,1,2}`, `cv3.{0,1,2}`, `cv4.{0,1,2}`) before DFL and rotated decode.
 - Compile with `--fuse_preprocess --customization_format RGB_PACKED` so the cvimodel expects `UINT8 [1, 640, 640, 3]` (`ma::model::Detector` feeds `UINT8`), reducing standalone `CVI_NN_Forward` from `151.59 ms` / `12.68 MB` ION (unfused FP32 NCHW) to `37.96 ms` / `9.17 MB` ION in the standalone `cviruntime` bench (and `36.306 ms` / `9.17 MB` ION in `obb_stage_bench`).
 - Compile with `--quant_output` to emit 9 `INT8` outputs directly with zero extra quantization (`CosineSim > 0.999997` and raw `int8` diff `0.000000` vs intermediate pre-cast outputs of `int8_fuse`, matching `ObbModel` / `decode_obb_layout_b` `MA_TENSOR_TYPE_S8` support), while keeping input `UINT8 [1, 640, 640, 3]` via `--fuse_preprocess --customization_format RGB_PACKED` rather than signed `INT8` (`--quant_input`) which triggers `u8[i] -= 128` CPU subtraction inside `ma::model::Detector::preprocess`.
+
+#### Reproducible TPU-MLIR v1.7 build recipe
+
+Configuration: `UINT8 [1, 640, 640, 3]` `RGB_PACKED` fused input + 9 `INT8` direct outputs, `7.24 MB` ION footprint.
+
+1. Export ONNX (downgrade ONNX IR version to `<= 8` if required by `tpu_mlir==1.7`):
+```sh
+yolo export model=yolo11n-obb.pt format=onnx opset=17 simplify=True imgsz=640
+```
+
+2. Transform ONNX to MLIR with fused preprocessing and truncated head (raw conv outputs before DFL and rotated decode; head index `23` for YOLO11-OBB, `22` for YOLOv8-OBB):
+```sh
+model_transform.py \
+    --model_name yolo11n_obb \
+    --model_def yolo11n-obb.onnx \
+    --input_shapes [[1,3,640,640]] \
+    --mean 0.0,0.0,0.0 \
+    --scale 0.0039216,0.0039216,0.0039216 \
+    --keep_aspect_ratio \
+    --pixel_format rgb \
+    --output_names /model.23/cv2.0/cv2.0.2/Conv_output_0,/model.23/cv3.0/cv3.0.2/Conv_output_0,/model.23/cv4.0/cv4.0.2/Conv_output_0,/model.23/cv2.1/cv2.1.2/Conv_output_0,/model.23/cv3.1/cv3.1.2/Conv_output_0,/model.23/cv4.1/cv4.1.2/Conv_output_0,/model.23/cv2.2/cv2.2.2/Conv_output_0,/model.23/cv3.2/cv3.2.2/Conv_output_0,/model.23/cv4.2/cv4.2.2/Conv_output_0 \
+    --mlir yolo11n_obb.mlir
+```
+
+3. Calibrate INT8 quantization:
+```sh
+run_calibration.py yolo11n_obb.mlir \
+    --dataset <calib_dir> \
+    --input_num 100 \
+    -o yolo11n_obb_cali_table
+```
+
+4. Deploy cvimodel with fused `RGB_PACKED` input and direct `INT8` quantized output (do not pass `--quant_input`, so input remains `UINT8` to avoid CPU `u8 - 128` subtraction):
+```sh
+model_deploy.py \
+    --mlir yolo11n_obb.mlir \
+    --quantize INT8 \
+    --chip cv181x \
+    --calibration_table yolo11n_obb_cali_table \
+    --fuse_preprocess \
+    --customization_format RGB_PACKED \
+    --quant_output \
+    --model yolo11n_obb_cv181x_int8_fuse_qout.cvimodel
+```
 
 ## Differences from the spec
 
