@@ -1,6 +1,7 @@
 #ifndef _DETECTOR_H_
 #define _DETECTOR_H_
 
+#include <array>
 #include <cmath>
 #include <memory>
 #include <string>
@@ -11,7 +12,8 @@
 
 namespace yolo {
 
-enum Kind { Detect, Segment };
+enum Kind { Detect, Segment, Obb };
+enum class ModelKindHint { Auto, Detect, Segment, Obb };
 
 struct Detection {
     float x;            // Normalized [0-1]
@@ -25,16 +27,20 @@ struct Detection {
     float angle_conf = NAN;
     float grasp_width_px = NAN;
     bool mask_focus = false;
+    float length_px = NAN;
+    bool has_obb = false;
+    std::array<std::array<float, 2>, 4> obb_corners{};
 };
 
 class SegModel;
+class ObbModel;
 
 class Detector {
 public:
     Detector();
     ~Detector();
 
-    bool init(const std::string& model_path);
+    bool init(const std::string& model_path, ModelKindHint hint = ModelKindHint::Auto);
     void setThreshold(float threshold);
 
     std::vector<Detection> detect(ma_img_t* img, const rv::MaskFocus* focus = nullptr,
@@ -60,6 +66,7 @@ private:
     std::unique_ptr<ma::engine::EngineCVI> engine_;
     ma::model::Detector* model_;
     std::unique_ptr<SegModel> seg_model_;
+    std::unique_ptr<ObbModel> obb_model_;
     Kind kind_;
     float threshold_;
     int input_width_;

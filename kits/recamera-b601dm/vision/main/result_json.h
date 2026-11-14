@@ -3,6 +3,7 @@
 #ifndef REBOT_VISION_RESULT_JSON_H_
 #define REBOT_VISION_RESULT_JSON_H_
 
+#include <array>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -42,11 +43,13 @@ struct DetBox {
     float depth_angle_deg = NAN;   ///< depth PCA long-side angle; never copied into angle_deg
     float depth_angle_conf = NAN;
     float depth_width_px = NAN;    ///< depth PCA cross-section width
+    bool has_obb = false;
+    std::array<std::array<float, 2>, 4> obb_corners{};
 };
 
 /**
  * Jaw closing direction for analyze_box_depth: the mask angle + 90 deg when the detection has a
- * finite angle_deg (segmentation model), else NAN (the depth PCA minor axis).
+ * finite angle_deg (segmentation or OBB model), else NAN (the depth PCA minor axis).
  */
 float jaw_close_deg(const DetBox& d) noexcept;
 

@@ -1000,11 +1000,91 @@ static void test_detections_json_depth_angle_split() {
     CHECK(std::abs(j[0]["grasp_width_px"].get<float>() - 20.0f) < 1e-3f);
     CHECK(j[0].contains("depth_angle_deg"));
 
+    // OBB model: angle_deg = -25.0f, angle_conf = 0.85f, grasp_width_px = 24.0f, length_px = 68.0f, has_obb = true, finite obb_corners
+    DetBox obb;
+    obb.x = 0.5f; obb.y = 0.5f; obb.w = 0.1f; obb.h = 0.2f;
+    obb.confidence = 0.9f;
+    obb.class_name = "block";
+    obb.angle_deg = -25.0f;
+    obb.angle_conf = 0.85f;
+    obb.grasp_width_px = 24.0f;
+    obb.length_px = 68.0f;
+    obb.has_obb = true;
+    obb.obb_corners = {{{0.45f, 0.40f}, {0.55f, 0.40f}, {0.55f, 0.60f}, {0.45f, 0.60f}}};
+    CHECK(std::abs(jaw_close_deg(obb) - 65.0f) < 1e-4f);
+    apply_box_depth(obb, r);
+    CHECK(std::abs(obb.angle_deg - (-25.0f)) < 1e-4f);
+    CHECK(std::abs(obb.angle_conf - 0.85f) < 1e-4f);
+    CHECK(std::abs(obb.grasp_width_px - 24.0f) < 1e-4f);
+    CHECK(std::abs(obb.length_px - 68.0f) < 1e-4f);
+    CHECK(obb.has_obb);
+    CHECK(obb.obb_corners[0][0] == 0.45f && obb.obb_corners[0][1] == 0.40f);
+    CHECK(obb.obb_corners[1][0] == 0.55f && obb.obb_corners[1][1] == 0.40f);
+    CHECK(obb.obb_corners[2][0] == 0.55f && obb.obb_corners[2][1] == 0.60f);
+    CHECK(obb.obb_corners[3][0] == 0.45f && obb.obb_corners[3][1] == 0.60f);
+    CHECK(std::isfinite(obb.depth_angle_deg));
+    CHECK(std::isfinite(obb.depth_angle_conf));
+    CHECK(std::isfinite(obb.depth_width_px));
+    CHECK(obb.jaw_clear >= 0);
+    j = json::parse(detections_json({obb}, cr, 640, 360));
+    CHECK(j[0].contains("obb_corners"));
+    CHECK(std::abs(j[0]["angle_deg"].get<float>() - (-25.0f)) < 1e-3f);
+    CHECK(std::abs(j[0]["grasp_width_px"].get<float>() - 24.0f) < 1e-3f);
+    CHECK(std::abs(j[0]["length_px"].get<float>() - 68.0f) < 1e-1f);
+    CHECK(j[0].contains("depth_angle_deg"));
+    CHECK(j[0].contains("depth_angle_conf"));
+    CHECK(j[0].contains("depth_width_px"));
+    CHECK(j[0].contains("jaw_clear"));
+
     // invalid depth result: nothing written
     DetBox e;
     apply_box_depth(e, BoxDepthResult{});
     j = json::parse(detections_json({e}, cr, 640, 360));
     CHECK(!j[0].contains("depth_angle_deg") && !j[0].contains("depth_conf"));
+}
+
+static void test_detections_json_obb() {
+    DetBox d;
+    d.x = 0.5f; d.y = 0.5f; d.w = 0.1f; d.h = 0.2f;
+    d.confidence = 0.90f;
+    d.class_id = 39;
+    d.class_name = "bottle";
+    d.has_obb = true;
+    d.obb_corners = {{
+        {0.45f, 0.40f},
+        {0.55f, 0.40f},
+        {0.55f, 0.60f},
+        {0.45f, 0.60f}
+    }};
+    d.angle_deg = -15.5f;
+    d.angle_conf = 0.82f;
+    d.grasp_width_px = 30.0f;
+    d.length_px = 75.0f;
+
+    ContentRect cr{0, 0, 640, 360};
+    std::string s = detections_json({d}, cr, 640, 360);
+    json j = json::parse(s);
+    CHECK(j.is_array() && j.size() == 1);
+    CHECK(j[0].contains("obb_corners"));
+    CHECK(!j[0].contains("corners"));
+    CHECK(!j[0].contains("polygon"));
+    CHECK(j[0]["obb_corners"].size() == 4);
+    CHECK(std::abs(j[0]["obb_corners"][0][0].get<float>() - 0.45f) < 1e-3);
+    CHECK(std::abs(j[0]["obb_corners"][0][1].get<float>() - 0.40f) < 1e-3);
+    CHECK(std::abs(j[0]["length_px"].get<float>() - 75.0f) < 1e-1);
+
+    d.has_obb = false;
+    s = detections_json({d}, cr, 640, 360);
+    j = json::parse(s);
+    CHECK(!j[0].contains("obb_corners"));
+}
+
+static void test_vision_control_obb_kind() {
+    VisionControl::Options o = opts(Mode::Yolo, false, 10, true, false);
+    o.model_kind = "obb";
+    VisionControl c(o, nullptr);
+    json r = req(c, "GET", "/api/mode");
+    CHECK(r["model"]["kind"] == "obb");
 }
 
 int main() {
@@ -1015,6 +1095,8 @@ int main() {
     test_depth_trigger_and_status();
     test_detections_json_depth();
     test_detections_json_depth_angle_split();
+    test_detections_json_obb();
+    test_vision_control_obb_kind();
     test_trigger_each_mode();
     test_trigger_timeout_and_continuous();
     test_rate_gate();
