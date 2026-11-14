@@ -1891,7 +1891,7 @@ impl Orchestrator {
                 return Err(fail("CENTRING_FAILED", "Border shift cannot be mapped onto the table plane"));
             };
             let d = [pt[0] - pg[0], pt[1] - pg[1], 0.0];
-            self.move_arm("shift", GoalSpec::Relative { frame: RelFrame::Base, d, dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false }, s.approach_speed_mps).await?;
+            self.move_arm("shift", GoalSpec::Relative { frame: RelFrame::Base, d, dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false, auto_yaw: None }, s.approach_speed_mps).await?;
         }
 
         // camera-down: re-orient to the tool-vertical pose above the target's table point
@@ -1984,7 +1984,7 @@ impl Orchestrator {
         }
 
         if let Some(turn) = turn {
-            self.move_arm("align", GoalSpec::Relative { frame: RelFrame::Tool, d: [0.0; 3], dyaw: 0.0, dpitch: 0.0, droll: turn, level: false }, s.approach_speed_mps).await?;
+            self.move_arm("align", GoalSpec::Relative { frame: RelFrame::Tool, d: [0.0; 3], dyaw: 0.0, dpitch: 0.0, droll: turn, level: false, auto_yaw: None }, s.approach_speed_mps).await?;
         }
 
         // width-based pre-open before descend
@@ -2218,7 +2218,7 @@ impl Orchestrator {
             // predict where the target lands after the step (same rough model)
             let moved = Pose::new(pose.r, kinematics::add(&pose.p, &step));
             if let Some(p) = self.cam.project(&moved, &pt) { tracker.predict_at(self.cam.to_norm(p)); }
-            let done = self.move_arm(phase, GoalSpec::Relative { frame: RelFrame::Base, d: step, dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false }, s.approach_speed_mps).await?;
+            let done = self.move_arm(phase, GoalSpec::Relative { frame: RelFrame::Base, d: step, dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false, auto_yaw: None }, s.approach_speed_mps).await?;
             since = done.at;
         }
     }
@@ -2293,7 +2293,7 @@ impl Orchestrator {
         for dz in dzs {
             let up = Pose::new(pose.r, [pose.p[0], pose.p[1], pose.p[2] + dz]);
             if table_violation(&pose, &up, &self.envelope, s.table_z_m).is_some() { continue; }
-            let spec = GoalSpec::Relative { frame: RelFrame::Base, d: [0.0, 0.0, dz], dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false };
+            let spec = GoalSpec::Relative { frame: RelFrame::Base, d: [0.0, 0.0, dz], dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false, auto_yaw: None };
             match self.move_arm("probe", spec, s.approach_speed_mps).await {
                 Ok(d) => { moved = Some((d, dz)); break; }
                 // rejected by the planner before anything was installed: the arm is still at the start

@@ -206,12 +206,14 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
         positions: vec![0.0; 6],
         tcp: None,
         saved_at_ms: 100,
+        profile_id: None,
         arm_dof: Some(5),
         gripper_joint: Some(5),
         joint_names: Some(vec!["j1".into(), "j2".into(), "j3".into(), "j4".into(), "j5".into(), "gripper".into()]),
     };
 
     let list_51 = PoseList {
+        profile_id: None,
         arm_dof: Some(5),
         gripper_joint: Some(5),
         joint_names: Some(vec!["j1".into(), "j2".into(), "j3".into(), "j4".into(), "j5".into(), "gripper".into()]),
@@ -242,6 +244,7 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
         RecordFrame { timestamp: 0.1, observation_state: vec![0.0; 6], action: vec![0.0; 6] },
     ];
     let meta_51 = EpisodeMetadata {
+        profile_id: None,
         arm_dof: Some(5),
         gripper_joint: Some(5),
         joint_names: Some(vec!["j1".into(), "j2".into(), "j3".into(), "j4".into(), "j5".into(), "gripper".into()]),
@@ -251,6 +254,7 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
     let replay_input_60 = ReplayInput {
         request: ReplayRequest { episode: "ep51".into(), speed: 1.0, gripper: false, tag: None },
         path: ep_path.clone(),
+        profile_id: c60.profile_id.clone(),
         dof: 6,
         arm_dof: 6,
         gripper_idx: None,
@@ -281,6 +285,7 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
     let replay_input_legacy = ReplayInput {
         request: ReplayRequest { episode: "legacy".into(), speed: 1.0, gripper: false, tag: None },
         path: legacy_path,
+        profile_id: c60.profile_id.clone(),
         dof: 6,
         arm_dof: 6,
         gripper_idx: None,
@@ -297,4 +302,299 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
     };
     let plan_res = plan(replay_input_legacy);
     assert!(plan_res.is_ok(), "expected legacy replay to succeed, got: {plan_res:?}");
+}
+
+#[test]
+fn test_profile_id_pose_and_replay_rejection() {
+    let c_so101 = so_arm101_config();
+    assert_eq!(c_so101.profile_id.as_deref(), Some("so_arm101"));
+
+    // 1) Pose with profile_id = "so_arm100" tested against active profile "so_arm101"
+    let pose_100 = NamedPose {
+        name: "pose_100".into(),
+        positions: vec![0.0; 6],
+        tcp: None,
+        saved_at_ms: 200,
+        profile_id: Some("so_arm100".into()),
+        arm_dof: Some(5),
+        gripper_joint: Some(5),
+        joint_names: Some(vec!["j1".into(), "j2".into(), "j3".into(), "j4".into(), "j5".into(), "gripper".into()]),
+    };
+    let list_100 = PoseList {
+        profile_id: Some("so_arm100".into()),
+        arm_dof: Some(5),
+        gripper_joint: Some(5),
+        joint_names: Some(vec!["j1".into(), "j2".into(), "j3".into(), "j4".into(), "j5".into(), "gripper".into()]),
+        poses: vec![pose_100.clone()],
+    };
+
+    let err = armd::poses::validate_list(&list_100, &c_so101).unwrap_err();
+    assert!(err.contains("POSE_DOF_MISMATCH"), "expected POSE_DOF_MISMATCH, got: {err}");
+    assert!(err.contains("so_arm100"), "expected so_arm100 in error, got: {err}");
+
+    let mut sup = SupervisorInner::new(c_so101.clone());
+    sup.poses.list.poses.push(pose_100);
+    let move_err = sup.move_to_pose("pose_100", false, 1.0, None, 0).unwrap_err();
+    match move_err {
+        ArmError::Rejected { code, message, .. } => {
+            assert_eq!(code, "POSE_DOF_MISMATCH");
+            assert!(message.contains("so_arm100"), "{message}");
+        }
+        other => panic!("expected POSE_DOF_MISMATCH rejection, got: {other:?}"),
+    }
+
+    // 2) Replay with profile_id = "so_arm100" against active profile "so_arm101"
+    let dir = tempfile::tempdir().unwrap();
+    let ep_path = dir.path().join("ep100.parquet");
+    let frames = vec![
+        RecordFrame { timestamp: 0.0, observation_state: vec![0.0; 6], action: vec![0.0; 6] },
+        RecordFrame { timestamp: 0.1, observation_state: vec![0.0; 6], action: vec![0.0; 6] },
+    ];
+    let meta_100 = EpisodeMetadata {
+        profile_id: Some("so_arm100".into()),
+        arm_dof: Some(5),
+        gripper_joint: Some(5),
+        joint_names: Some(vec!["j1".into(), "j2".into(), "j3".into(), "j4".into(), "j5".into(), "gripper".into()]),
+    };
+    write_frames_to_parquet_with_meta(&ep_path, &frames, Some(&meta_100)).unwrap();
+
+    let replay_input = ReplayInput {
+        request: ReplayRequest { episode: "ep100".into(), speed: 1.0, gripper: false, tag: None },
+        path: ep_path,
+        profile_id: c_so101.profile_id.clone(),
+        dof: 6,
+        arm_dof: 5,
+        gripper_idx: Some(5),
+        joint_names: c_so101.limits.iter().map(|l| l.name.clone()).collect(),
+        limits: c_so101.limits.clone(),
+        speed_limits: c_so101.limits.clone(),
+        ws: None,
+        arm: c_so101.arm_model.clone(),
+        start: vec![0.0; 6],
+        control_hz: 50,
+        epoch: 0,
+        workspace_revision: 0,
+        power: None,
+    };
+    let replay_err = plan(replay_input).unwrap_err();
+    match replay_err {
+        ArmError::Rejected { code, message, .. } => {
+            assert_eq!(code, "REPLAY_DOF_MISMATCH");
+            assert!(message.contains("so_arm100"), "{message}");
+        }
+        other => panic!("expected REPLAY_DOF_MISMATCH, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_legacy_metadata_guard_5dof_vs_6dof_7dof() {
+    let c_so101 = so_arm101_config(); // 5-DOF
+    let c_60 = config_6_plus_0();      // 6-DOF (6+0)
+    let c_7d = ArmConfig::rebot_dm();  // 7-DOF
+
+    // Empty list on 5-DOF is valid
+    let empty_list = PoseList { poses: vec![], ..Default::default() };
+    assert!(armd::poses::validate_list(&empty_list, &c_so101).is_ok());
+
+    // Non-empty pose missing arm_dof:
+    let legacy_pose_6 = NamedPose {
+        name: "legacy".into(),
+        positions: vec![0.0; 6],
+        tcp: None,
+        saved_at_ms: 10,
+        profile_id: None,
+        arm_dof: None,
+        gripper_joint: None,
+        joint_names: None,
+    };
+    let legacy_list_6 = PoseList {
+        profile_id: None,
+        arm_dof: None,
+        gripper_joint: None,
+        joint_names: None,
+        poses: vec![legacy_pose_6.clone()],
+    };
+
+    // 1) 5-DOF rejects metadata-less pose
+    let err_5d = armd::poses::validate_list(&legacy_list_6, &c_so101).unwrap_err();
+    assert!(err_5d.contains("POSE_DOF_MISMATCH") && err_5d.contains("missing arm_dof"), "{err_5d}");
+
+    let mut sup_5d = SupervisorInner::new(c_so101.clone());
+    sup_5d.poses.list.poses.push(legacy_pose_6.clone());
+    let move_err = sup_5d.move_to_pose("legacy", false, 1.0, None, 0).unwrap_err();
+    match move_err {
+        ArmError::Rejected { code, message, .. } => {
+            assert_eq!(code, "POSE_DOF_MISMATCH");
+            assert!(message.contains("missing arm_dof"), "{message}");
+        }
+        other => panic!("expected POSE_DOF_MISMATCH, got: {other:?}"),
+    }
+
+    // 2) 6-DOF (6+0) accepts metadata-less legacy pose
+    assert!(armd::poses::validate_list(&legacy_list_6, &c_60).is_ok());
+
+    // 3) 7-DOF accepts metadata-less legacy pose (dof=7)
+    let legacy_pose_7 = NamedPose {
+        name: "legacy7".into(),
+        positions: vec![0.0; 7],
+        ..Default::default()
+    };
+    let legacy_list_7 = PoseList {
+        poses: vec![legacy_pose_7],
+        ..Default::default()
+    };
+    assert!(armd::poses::validate_list(&legacy_list_7, &c_7d).is_ok());
+
+    // 4) Replay: metadata-less episode rejected on 5-DOF, accepted on 6+0 and 7-DOF
+    let dir = tempfile::tempdir().unwrap();
+    let legacy_ep = dir.path().join("legacy_bare.parquet");
+    let frames6 = vec![
+        RecordFrame { timestamp: 0.0, observation_state: vec![0.0; 6], action: vec![0.0; 6] },
+        RecordFrame { timestamp: 0.1, observation_state: vec![0.0; 6], action: vec![0.0; 6] },
+    ];
+    write_frames_to_parquet(&legacy_ep, &frames6).unwrap();
+
+    let replay_5d = ReplayInput {
+        request: ReplayRequest { episode: "legacy_bare".into(), speed: 1.0, gripper: false, tag: None },
+        path: legacy_ep.clone(),
+        profile_id: c_so101.profile_id.clone(),
+        dof: 6,
+        arm_dof: 5,
+        gripper_idx: Some(5),
+        joint_names: c_so101.limits.iter().map(|l| l.name.clone()).collect(),
+        limits: c_so101.limits.clone(),
+        speed_limits: c_so101.limits.clone(),
+        ws: None,
+        arm: c_so101.arm_model.clone(),
+        start: vec![0.0; 6],
+        control_hz: 50,
+        epoch: 0,
+        workspace_revision: 0,
+        power: None,
+    };
+    let rep_err_5d = plan(replay_5d).unwrap_err();
+    match rep_err_5d {
+        ArmError::Rejected { code, message, .. } => {
+            assert_eq!(code, "REPLAY_DOF_MISMATCH");
+            assert!(message.contains("missing arm_dof"), "{message}");
+        }
+        other => panic!("expected REPLAY_DOF_MISMATCH on 5-DOF, got: {other:?}"),
+    }
+
+    // 6-DOF accepts legacy bare replay
+    let replay_60 = ReplayInput {
+        request: ReplayRequest { episode: "legacy_bare".into(), speed: 1.0, gripper: false, tag: None },
+        path: legacy_ep,
+        profile_id: c_60.profile_id.clone(),
+        dof: 6,
+        arm_dof: 6,
+        gripper_idx: None,
+        joint_names: c_60.limits.iter().map(|l| l.name.clone()).collect(),
+        limits: c_60.limits.clone(),
+        speed_limits: c_60.limits.clone(),
+        ws: None,
+        arm: c_60.arm_model.clone(),
+        start: vec![0.0; 6],
+        control_hz: 50,
+        epoch: 0,
+        workspace_revision: 0,
+        power: None,
+    };
+    assert!(plan(replay_60).is_ok());
+}
+
+#[test]
+fn test_parquet_metadata_error_propagation() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1) Nonexistent file -> 404 EPISODE_NOT_FOUND
+    let input_nonexistent = ReplayInput {
+        request: ReplayRequest { episode: "nonexistent".into(), speed: 1.0, gripper: false, tag: None },
+        path: dir.path().join("nonexistent.parquet"),
+        profile_id: None,
+        dof: 6,
+        arm_dof: 6,
+        gripper_idx: None,
+        joint_names: vec![],
+        limits: vec![],
+        speed_limits: vec![],
+        ws: None,
+        arm: ArmConfig::rebot_dm().arm_model,
+        start: vec![0.0; 6],
+        control_hz: 50,
+        epoch: 0,
+        workspace_revision: 0,
+        power: None,
+    };
+    let err = plan(input_nonexistent).unwrap_err();
+    match err {
+        ArmError::Rejected { code, status, .. } => {
+            assert_eq!(code, "EPISODE_NOT_FOUND");
+            assert_eq!(status, 404);
+        }
+        other => panic!("expected 404 EPISODE_NOT_FOUND, got {other:?}"),
+    }
+
+    // 2) Corrupt sidecar JSON -> 422 REPLAY_INVALID_EPISODE
+    let ep_corrupt_json = dir.path().join("corrupt_sidecar.parquet");
+    std::fs::write(&ep_corrupt_json, b"dummy parquet content").unwrap();
+    let sidecar_json = dir.path().join("corrupt_sidecar.meta.json");
+    std::fs::write(&sidecar_json, b"{not valid json").unwrap();
+
+    let input_corrupt_json = ReplayInput {
+        request: ReplayRequest { episode: "corrupt_sidecar".into(), speed: 1.0, gripper: false, tag: None },
+        path: ep_corrupt_json,
+        profile_id: None,
+        dof: 6,
+        arm_dof: 6,
+        gripper_idx: None,
+        joint_names: vec![],
+        limits: vec![],
+        speed_limits: vec![],
+        ws: None,
+        arm: ArmConfig::rebot_dm().arm_model,
+        start: vec![0.0; 6],
+        control_hz: 50,
+        epoch: 0,
+        workspace_revision: 0,
+        power: None,
+    };
+    let err = plan(input_corrupt_json).unwrap_err();
+    match err {
+        ArmError::Rejected { code, status, .. } => {
+            assert_eq!(code, "REPLAY_INVALID_EPISODE");
+            assert_eq!(status, 422);
+        }
+        other => panic!("expected 422 REPLAY_INVALID_EPISODE, got {other:?}"),
+    }
+
+    // 3) Corrupt parquet binary content -> 422 REPLAY_INVALID_EPISODE
+    let ep_corrupt_parquet = dir.path().join("corrupt_bin.parquet");
+    std::fs::write(&ep_corrupt_parquet, b"PAR1garbage").unwrap();
+    let input_corrupt_bin = ReplayInput {
+        request: ReplayRequest { episode: "corrupt_bin".into(), speed: 1.0, gripper: false, tag: None },
+        path: ep_corrupt_parquet,
+        profile_id: None,
+        dof: 6,
+        arm_dof: 6,
+        gripper_idx: None,
+        joint_names: vec![],
+        limits: vec![],
+        speed_limits: vec![],
+        ws: None,
+        arm: ArmConfig::rebot_dm().arm_model,
+        start: vec![0.0; 6],
+        control_hz: 50,
+        epoch: 0,
+        workspace_revision: 0,
+        power: None,
+    };
+    let err = plan(input_corrupt_bin).unwrap_err();
+    match err {
+        ArmError::Rejected { code, status, .. } => {
+            assert_eq!(code, "REPLAY_INVALID_EPISODE");
+            assert_eq!(status, 422);
+        }
+        other => panic!("expected 422 REPLAY_INVALID_EPISODE, got {other:?}"),
+    }
 }

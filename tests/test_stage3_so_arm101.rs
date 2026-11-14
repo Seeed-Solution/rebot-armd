@@ -9,7 +9,7 @@ use armd::kinematics::{self, Pose};
 use armd::model::{ArmConfig, JointState};
 use armd::motion::{self, GoalSpec, MotionError, PlanInput, RelFrame, Speed};
 use armd::place::{self, PendingPlace, PlaceRequest};
-use armd::supervisor::ArmSupervisor;
+use armd::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
 use armd::grasp;
 
 fn load_so101_config() -> ArmConfig {
@@ -177,6 +177,7 @@ fn test_5dof_move_relative_lateral_auto_yaw() {
         dpitch: 0.0,
         droll: 0.0,
         level: false,
+        auto_yaw: None,
     };
 
     let (goal, yaw_free) = motion::resolve_goal_ex(&input, &spec);
@@ -185,6 +186,147 @@ fn test_5dof_move_relative_lateral_auto_yaw() {
         .expect("lateral move_relative on 5-DOF SO-101 with auto_yaw should succeed");
     assert_eq!(path.dof, 6);
     assert!(path.q.len() >= 2);
+}
+
+#[test]
+fn test_5dof_move_relative_explicit_auto_yaw() {
+    let config = load_so101_config();
+    let input = plan_input_at_home(&config);
+    let speed = Speed::default();
+
+    // 1. Explicit auto_yaw: Some(true) on lateral move succeeds
+    let spec_ay_true = GoalSpec::Relative {
+        frame: RelFrame::Base,
+        d: [0.0, 0.06, 0.0],
+        dyaw: 0.0,
+        dpitch: 0.0,
+        droll: 0.0,
+        level: false,
+        auto_yaw: Some(true),
+    };
+    let (goal_true, yaw_free_true) = motion::resolve_goal_ex(&input, &spec_ay_true);
+    assert!(yaw_free_true, "auto_yaw: Some(true) must yield yaw_free == true");
+    let path_true = motion::plan_cartesian_ex(&input, goal_true, speed, yaw_free_true)
+        .expect("move_relative with auto_yaw: true should succeed");
+    assert_eq!(path_true.dof, 6);
+
+    // 2. Explicit auto_yaw: Some(false) on lateral move forces yaw_free == false and fails IK
+    let spec_ay_false = GoalSpec::Relative {
+        frame: RelFrame::Base,
+        d: [0.0, 0.06, 0.0],
+        dyaw: 0.0,
+        dpitch: 0.0,
+        droll: 0.0,
+        level: false,
+        auto_yaw: Some(false),
+    };
+    let (goal_false, yaw_free_false) = motion::resolve_goal_ex(&input, &spec_ay_false);
+    assert!(!yaw_free_false, "auto_yaw: Some(false) must yield yaw_free == false");
+    let err = motion::plan_cartesian_ex(&input, goal_false, speed, yaw_free_false)
+        .expect_err("lateral move_relative without auto_yaw must fail with IkUnreachable");
+    assert!(matches!(err, MotionError::IkUnreachable { .. }));
+
+    // 3. parse_move_relative parses "auto_yaw" boolean
+    let body_true = serde_json::json!({
+        "frame": "base",
+        "d": [0.0, 0.02, 0.0],
+        "auto_yaw": true,
+    });
+    let (parsed_spec_true, _, _) = motion::parse_move_relative(&body_true).unwrap();
+    assert_eq!(parsed_spec_true, GoalSpec::Relative {
+        frame: RelFrame::Base,
+        d: [0.0, 0.02, 0.0],
+        dyaw: 0.0,
+        dpitch: 0.0,
+        droll: 0.0,
+        level: false,
+        auto_yaw: Some(true),
+    });
+
+    let body_false = serde_json::json!({
+        "frame": "base",
+        "d": [0.0, 0.02, 0.0],
+        "auto_yaw": false,
+    });
+    let (parsed_spec_false, _, _) = motion::parse_move_relative(&body_false).unwrap();
+    assert_eq!(parsed_spec_false, GoalSpec::Relative {
+        frame: RelFrame::Base,
+        d: [0.0, 0.02, 0.0],
+        dyaw: 0.0,
+        dpitch: 0.0,
+        droll: 0.0,
+        level: false,
+        auto_yaw: Some(false),
+    });
+}
+
+#[test]
+fn test_5dof_place_explicit_auto_yaw() {
+    let config = load_so101_config();
+    let input = plan_input_at_home(&config);
+    let r_target = kinematics::rpy_to_r(0.0, 0.5, 0.0);
+
+    // 1. Explicit orientation + auto_yaw: Some(true) aligns to target azimuth and plans cleanly
+    let req_true = PlaceRequest {
+        target: [0.20, 0.08, 0.10],
+        approach_m: 0.05,
+        pose: None,
+        orientation: Some(r_target),
+        auto_yaw: Some(true),
+        speed_scale: 0.5,
+        release: true,
+        retreat: true,
+        tag: None,
+    };
+    let pending_true = PendingPlace {
+        input: input.clone(),
+        request: req_true,
+        open_rad: config.gripper_policy.as_ref().unwrap().open_rad,
+        held_spill_safe: false,
+        spill_max_tilt_deg: 8.0,
+    };
+    let planned_true = place::plan(pending_true).expect("place with explicit auto_yaw: true should succeed");
+    assert!(planned_true.durations[1] > 0.0);
+
+    // 2. Explicit orientation + auto_yaw: Some(false) fails IK on coupled 5-DOF
+    let req_false = PlaceRequest {
+        target: [0.20, 0.08, 0.10],
+        approach_m: 0.05,
+        pose: None,
+        orientation: Some(r_target),
+        auto_yaw: Some(false),
+        speed_scale: 0.5,
+        release: true,
+        retreat: true,
+        tag: None,
+    };
+    let pending_false = PendingPlace {
+        input: input.clone(),
+        request: req_false,
+        open_rad: config.gripper_policy.as_ref().unwrap().open_rad,
+        held_spill_safe: false,
+        spill_max_tilt_deg: 8.0,
+    };
+    let res_false = place::plan(pending_false);
+    assert!(res_false.is_err(), "place with explicit auto_yaw: false should fail");
+    let err_false = res_false.unwrap_err();
+    assert!(matches!(err_false, ArmError::Motion(MotionError::IkUnreachable { .. })));
+
+    // 3. parse_place parses "auto_yaw" boolean
+    let inner = SupervisorInner::new(config.clone());
+    let body_true = serde_json::json!({
+        "position": [0.20, 0.05, 0.05],
+        "auto_yaw": true,
+    });
+    let parsed_req_true = place::parse_place(&inner, &body_true).unwrap();
+    assert_eq!(parsed_req_true.auto_yaw, Some(true));
+
+    let body_false = serde_json::json!({
+        "position": [0.20, 0.05, 0.05],
+        "auto_yaw": false,
+    });
+    let parsed_req_false = place::parse_place(&inner, &body_false).unwrap();
+    assert_eq!(parsed_req_false.auto_yaw, Some(false));
 }
 
 #[test]
@@ -238,6 +380,7 @@ fn test_5dof_place_planning_lateral() {
         dpitch: 0.0,
         droll: 0.0,
         level: false,
+        auto_yaw: None,
     });
     let path2 = motion::plan_cartesian_ex(&input, goal_rel, Speed { linear: 0.05, angular: 1.0 }, yaw_free_rel).unwrap();
     let last2 = path2.last();
@@ -249,6 +392,7 @@ fn test_5dof_place_planning_lateral() {
         approach_m: 0.05,
         pose: None,
         orientation: None,
+        auto_yaw: None,
         speed_scale: 0.5,
         release: true,
         retreat: true,
@@ -279,6 +423,7 @@ fn test_5dof_place_planning() {
         approach_m: 0.06,
         pose: None,
         orientation: None,
+        auto_yaw: None,
         speed_scale: 1.0,
         release: true,
         retreat: true,

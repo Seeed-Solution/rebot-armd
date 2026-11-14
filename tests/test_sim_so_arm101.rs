@@ -54,7 +54,13 @@ fn settle() {
 #[test]
 fn test_sim_so101_capabilities_6dof_vs_7dof() {
     let sim = MockSim::new();
-    let drv6 = SimArmDriver::connect(&sim.addr(), 6).unwrap();
+    let drv6_default = SimArmDriver::connect(&sim.addr(), 6).unwrap();
+    let cap6_def = drv6_default.capabilities();
+    assert!(cap6_def.torque_feedback, "Default 6-DOF SimArmDriver must preserve torque_feedback true");
+    assert!(!cap6_def.load_feedback, "Default 6-DOF SimArmDriver must have load_feedback false");
+    assert!(drv6_default.joint_loads().is_none(), "Default 6-DOF SimArmDriver must return None for joint_loads");
+
+    let drv6 = SimArmDriver::connect(&sim.addr(), 6).unwrap().with_load_only_feedback(true);
     let cap6 = drv6.capabilities();
     assert!(!cap6.torque_feedback, "6-DOF SimArmDriver must have torque_feedback false (Feetech mode)");
     assert!(cap6.load_feedback, "6-DOF SimArmDriver must have load_feedback true");
@@ -74,7 +80,7 @@ fn test_sim_so101_capabilities_6dof_vs_7dof() {
 #[test]
 fn test_sim_so101_handshake_enable_disable() {
     let mut sim = MockSim::new();
-    let mut drv = SimArmDriver::connect(&sim.addr(), 6).unwrap();
+    let mut drv = SimArmDriver::connect(&sim.addr(), 6).unwrap().with_load_only_feedback(true);
 
     let handle = std::thread::spawn(move || {
         let cmd = sim.recv_kind("cmd");
@@ -133,7 +139,7 @@ fn test_sim_so101_handshake_enable_disable() {
 #[test]
 fn test_sim_so101_targets_6dof_and_mismatch() {
     let mut sim = MockSim::new();
-    let mut drv = SimArmDriver::connect(&sim.addr(), 6).unwrap();
+    let mut drv = SimArmDriver::connect(&sim.addr(), 6).unwrap().with_load_only_feedback(true);
 
     // Writing 7 targets to 6-DOF driver fails with JointCountMismatch
     let err7 = drv.write_joint_targets(&vec![JointTarget::position(0.0); 7]).unwrap_err();
@@ -186,7 +192,7 @@ fn test_sim_so101_targets_6dof_and_mismatch() {
 #[test]
 fn test_sim_so101_loads_computed_from_tau() {
     let mut sim = MockSim::new();
-    let mut drv = SimArmDriver::connect(&sim.addr(), 6).unwrap();
+    let mut drv = SimArmDriver::connect(&sim.addr(), 6).unwrap().with_load_only_feedback(true);
 
     // State datagram with tau in N·m, no explicit loads field.
     // 2.94 N·m is the STS3215 stall torque.
@@ -233,7 +239,7 @@ fn test_sim_so101_loads_computed_from_tau() {
 #[test]
 fn test_sim_so101_loads_explicit_from_simulator() {
     let mut sim = MockSim::new();
-    let mut drv = SimArmDriver::connect(&sim.addr(), 6).unwrap();
+    let mut drv = SimArmDriver::connect(&sim.addr(), 6).unwrap().with_load_only_feedback(true);
 
     let explicit_loads = vec![0.12, 0.34, 0.56, 0.78, 0.90, 0.15];
     let st = SimState {

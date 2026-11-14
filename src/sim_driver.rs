@@ -128,6 +128,7 @@ pub struct SimArmDriver {
     cached: Vec<JointState>,
     cached_loads: Vec<f32>,
     cached_torques: Vec<f32>,
+    load_only_feedback: bool,
 }
 
 impl SimArmDriver {
@@ -155,7 +156,13 @@ impl SimArmDriver {
             cached: vec![JointState::default(); dof],
             cached_loads: vec![0.0; dof],
             cached_torques: vec![0.0; dof],
+            load_only_feedback: false,
         })
+    }
+
+    pub fn with_load_only_feedback(mut self, enabled: bool) -> Self {
+        self.load_only_feedback = enabled;
+        self
     }
 
     /// Datagrams dropped as malformed, out of order or for the wrong joint count.
@@ -169,9 +176,9 @@ impl SimArmDriver {
         self.cached_torques.clone()
     }
 
-    /// Return normalized load fractions in `[-1.0, 1.0]` when supported (dof == 6).
+    /// Return normalized load fractions in `[-1.0, 1.0]` when supported (load_only_feedback).
     pub fn joint_loads(&self) -> Option<Vec<f32>> {
-        if self.dof == 6 {
+        if self.load_only_feedback {
             Some(self.cached_loads.clone())
         } else {
             None
@@ -251,7 +258,7 @@ fn receiver_loop(socket: UdpSocket, dof: usize, shared: Arc<Mutex<Shared>>, stop
 
 impl ArmDriver for SimArmDriver {
     fn capabilities(&self) -> DriverCapabilities {
-        if self.dof == 6 {
+        if self.load_only_feedback {
             DriverCapabilities {
                 velocity_feedback: true,
                 torque_feedback: false,
@@ -294,7 +301,7 @@ impl ArmDriver for SimArmDriver {
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         if let (Some(state), _) = self.snapshot() {
             self.cached_torques = state.tau.clone();
-            if self.dof == 6 {
+            if self.load_only_feedback {
                 if let Some(ref loads) = state.loads {
                     if loads.len() == self.dof {
                         self.cached_loads = loads.iter().map(|&l| l.clamp(-1.0, 1.0)).collect();
@@ -309,7 +316,7 @@ impl ArmDriver for SimArmDriver {
                 *js = JointState {
                     position: state.q[i],
                     velocity: state.dq[i],
-                    torque: if self.dof == 6 { 0.0 } else { state.tau[i] },
+                    torque: if self.load_only_feedback { 0.0 } else { state.tau[i] },
                     temperature: state.temp[i],
                 };
             }
@@ -318,7 +325,7 @@ impl ArmDriver for SimArmDriver {
     }
 
     fn joint_loads(&self) -> Option<Vec<f32>> {
-        if self.dof == 6 {
+        if self.load_only_feedback {
             Some(self.cached_loads.clone())
         } else {
             None

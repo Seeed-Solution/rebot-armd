@@ -21,6 +21,8 @@ const TIOCSRS485: libc::c_ulong = 0x542F;
 const SER_RS485_ENABLED: u32 = 1 << 0;
 #[cfg(target_os = "linux")]
 const SER_RS485_RTS_ON_SEND: u32 = 1 << 1;
+#[cfg(target_os = "linux")]
+const SER_RS485_RTS_AFTER_SEND: u32 = 1 << 2;
 
 /// Configuration for opening a serial port transport
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,8 +109,10 @@ impl SerialTransport {
             let rs485_needed = config.resolve_rs485_rts_on_send();
             if rs485_needed {
                 let mut rs485 = SerialRs485::default();
-                unsafe { libc::ioctl(fd, TIOCGRS485, &mut rs485) };
-                rs485.flags = SER_RS485_ENABLED | SER_RS485_RTS_ON_SEND;
+                if unsafe { libc::ioctl(fd, TIOCGRS485, &mut rs485) } < 0 {
+                    rs485 = SerialRs485::default();
+                }
+                rs485.flags = (rs485.flags & !SER_RS485_RTS_AFTER_SEND) | SER_RS485_ENABLED | SER_RS485_RTS_ON_SEND;
                 rs485.delay_rts_before_send = 0;
                 rs485.delay_rts_after_send = 0;
                 let rc = unsafe { libc::ioctl(fd, TIOCSRS485, &rs485) };

@@ -283,9 +283,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         "sim" => {
             let addr = cli.follower_port.as_deref().unwrap_or(armd::sim_driver::DEFAULT_SIM_ADDR);
-            let driver = armd::sim_driver::SimArmDriver::connect(addr, config_dof)?;
+            let is_feetech = feetech_config.is_some();
+            let driver = armd::sim_driver::SimArmDriver::connect(addr, config_dof)?
+                .with_load_only_feedback(is_feetech);
             supervisor.set_driver(Box::new(driver)).await;
-            info!("Mounted sim follower (physics simulator at {addr}, B601-DM semantics)");
+            if is_feetech {
+                info!("Mounted sim follower (physics simulator at {addr}, SO-ARM Feetech load-only feedback semantics)");
+            } else {
+                info!("Mounted sim follower (physics simulator at {addr}, B601-DM semantics)");
+            }
         }
         "mock" => info!("Follower configured as mock simulation"),
         _ => unreachable!(),

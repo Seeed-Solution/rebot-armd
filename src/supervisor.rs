@@ -4059,6 +4059,7 @@ impl ArmSupervisor {
         let meta = {
             let inner = self.inner.read().await;
             crate::recording::EpisodeMetadata {
+                profile_id: inner.config.profile_id.clone(),
                 arm_dof: Some(inner.config.arm_dof()),
                 gripper_joint: inner.config.gripper_index(),
                 joint_names: Some(inner.config.limits.iter().map(|l| l.name.clone()).collect()),

@@ -777,3 +777,135 @@ fn test_feetech_drive_mode_invert_decodes_velocity_and_load() {
     assert!((states[0].velocity + states[1].velocity).abs() < 1e-4, "Velocity inverted");
     assert!((loads[0] + loads[1]).abs() < 1e-4, "Load inverted");
 }
+
+// -------------------------------------------------------------------------
+// 21. read_register_u16_direct: accepting error=0x02 and echo filtering
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_read_u16_sensor_error_bit_and_echo_filtering() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
+
+    // Request is read 2 bytes from ID 1, reg 0x38 (present position)
+    let req = feetech::build_read(1, feetech::REG_PRESENT_POSITION_L, 2);
+
+    // Stream contains:
+    // 1. Un-drained request echo (e.g. from an RS-485 transceiver or kernel buffer)
+    // 2. Real response packet from servo ID 1 with error byte = 0x02 (Sensor Error bit)
+    let val_expected = 2048u16;
+    let params = val_expected.to_le_bytes();
+    let err_byte = 0x02u8; // Sensor Error bit in STS3215 status
+    let cs = calculate_checksum(1, (params.len() + 2) as u8, err_byte, &params);
+    let resp = vec![0xFF, 0xFF, 1, (params.len() + 2) as u8, err_byte, params[0], params[1], cs];
+
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&req);
+    stream.extend_from_slice(&resp);
+
+    driver.transport_mut().provide_rx(&stream);
+
+    let val = driver.read_register_u16_direct(1, feetech::REG_PRESENT_POSITION_L)
+        .expect("read_register_u16_direct should filter un-drained req echo and accept error byte 0x02");
+    assert_eq!(val, val_expected);
+}
+
+// -------------------------------------------------------------------------
+// 22. with_port_name auto-downgrade of tx_echo when no echo arrives
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_port_name_auto_echo_downgrade() {
+    let mock = MockTransport::new();
+    // Default constructor with /dev/ttySC0 auto-detects echo=true, auto=true
+    let mut driver = FeetechArmDriver::new(mock, vec![1]).with_port_name("/dev/ttySC0");
+    assert_eq!(driver.tx_echo(), Some(true));
+    assert!(driver.tx_echo_auto());
+
+    // Provide a valid read response without any preceding echo
+    let val_expected = 1u8;
+    let params = [val_expected];
+    let cs = calculate_checksum(1, 3, 0x00, &params);
+    let resp = vec![0xFF, 0xFF, 1, 3, 0x00, val_expected, cs];
+    driver.transport_mut().provide_rx(&resp);
+
+    // Call read_register_u8_direct: drain_tx_echo will wait up to 5 ms, find no echo,
+    // and auto-downgrade tx_echo to Some(false) and tx_echo_auto to false
+    let val = driver.read_register_u8_direct(1, REG_TORQUE_ENABLE).unwrap();
+    assert_eq!(val, val_expected);
+    assert_eq!(driver.tx_echo(), Some(false));
+    assert!(!driver.tx_echo_auto());
+
+    // Explicit override via with_tx_echo clears tx_echo_auto
+    let driver2 = FeetechArmDriver::new(MockTransport::new(), vec![1])
+        .with_port_name("/dev/ttySC0")
+        .with_tx_echo(Some(true));
+    assert_eq!(driver2.tx_echo(), Some(true));
+    assert!(!driver2.tx_echo_auto());
+}
+
+// -------------------------------------------------------------------------
+// 23. set_torque(true) pre-seeding Goal Position when feedback is valid
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_set_torque_preseeding_goal_position() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1, 2]);
+
+    // 1. Initially without feedback: set_torque(true) should NOT send SYNC_WRITE
+    let cs1 = calculate_checksum(1, 3, 0x00, &[1]);
+    let cs2 = calculate_checksum(2, 3, 0x00, &[1]);
+    driver.transport_mut().provide_rx(&[
+        0xFF, 0xFF, 1, 3, 0x00, 1, cs1,
+        0xFF, 0xFF, 2, 3, 0x00, 1, cs2,
+    ]);
+    driver.set_torque(true).unwrap();
+    let tx_no_fb = driver.transport_mut().take_tx();
+    // Two write packets (TORQUE_ENABLE = 1) + two read packets (readback REG_TORQUE_ENABLE)
+    assert!(!tx_no_fb.windows(2).any(|w| w == [INST_SYNC_READ, feetech::REG_GOAL_POSITION_L]
+        || w == [feetech::INST_SYNC_WRITE, feetech::REG_GOAL_POSITION_L]),
+        "Without feedback, set_torque should not send SYNC_WRITE to Goal Position");
+
+    // 2. Now feed telemetry so feedback is valid
+    let pos_1 = 2200u16.to_le_bytes();
+    let pos_2 = 1800u16.to_le_bytes();
+    let params_1 = [pos_1[0], pos_1[1], 0, 0, 0, 0, 70, 35];
+    let params_2 = [pos_2[0], pos_2[1], 0, 0, 0, 0, 70, 35];
+    let cs_fb1 = calculate_checksum(1, 10, 0x00, &params_1);
+    let cs_fb2 = calculate_checksum(2, 10, 0x00, &params_2);
+    let mut rx_fb = Vec::new();
+    rx_fb.extend_from_slice(&[0xFF, 0xFF, 1, 10, 0x00]);
+    rx_fb.extend_from_slice(&params_1);
+    rx_fb.push(cs_fb1);
+    rx_fb.extend_from_slice(&[0xFF, 0xFF, 2, 10, 0x00]);
+    rx_fb.extend_from_slice(&params_2);
+    rx_fb.push(cs_fb2);
+    driver.transport_mut().provide_rx(&rx_fb);
+
+    let states = driver.read_joint_states().unwrap();
+    assert_eq!(states.len(), 2);
+    assert!(driver.is_feedback_valid());
+
+    // 3. Now call set_torque(true) with feedback present
+    driver.transport_mut().take_tx(); // clear previous TX
+    driver.transport_mut().provide_rx(&[
+        0xFF, 0xFF, 1, 3, 0x00, 1, cs1,
+        0xFF, 0xFF, 2, 3, 0x00, 1, cs2,
+    ]);
+    driver.set_torque(true).unwrap();
+
+    let tx_with_fb = driver.transport_mut().take_tx();
+    // The very first packet in TX must be SYNC_WRITE (0x83) targeting REG_GOAL_POSITION_L (0x2A)
+    assert!(tx_with_fb.len() >= 13);
+    assert_eq!(tx_with_fb[0], 0xFF);
+    assert_eq!(tx_with_fb[1], 0xFF);
+    assert_eq!(tx_with_fb[2], feetech::BROADCAST_ID);
+    assert_eq!(tx_with_fb[4], feetech::INST_SYNC_WRITE);
+    assert_eq!(tx_with_fb[5], feetech::REG_GOAL_POSITION_L);
+    // Data length per servo = 2 (u16 position)
+    assert_eq!(tx_with_fb[6], 2);
+    // Servo 1 ID & position
+    assert_eq!(tx_with_fb[7], 1);
+    assert_eq!([tx_with_fb[8], tx_with_fb[9]], pos_1);
+    // Servo 2 ID & position
+    assert_eq!(tx_with_fb[10], 2);
+    assert_eq!([tx_with_fb[11], tx_with_fb[12]], pos_2);
+}

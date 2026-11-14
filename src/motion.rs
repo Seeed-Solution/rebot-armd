@@ -268,7 +268,7 @@ pub enum GoalSpec {
     /// Absolute end_link pose; `r = None` keeps the current orientation.
     Absolute { p: [f64; 3], r: Option<kinematics::Mat3> },
     AbsoluteEx { p: [f64; 3], r: Option<kinematics::Mat3>, auto_yaw: bool },
-    Relative { frame: RelFrame, d: [f64; 3], dyaw: f64, dpitch: f64, droll: f64, level: bool },
+    Relative { frame: RelFrame, d: [f64; 3], dyaw: f64, dpitch: f64, droll: f64, level: bool, auto_yaw: Option<bool> },
 }
 
 /// Resolve a goal request against the start pose `fk(q0)`.
@@ -322,7 +322,7 @@ pub fn resolve_goal_ex(input: &PlanInput, spec: &GoalSpec) -> (Pose, bool) {
             }
             (Pose::new(target_r, *p), *auto_yaw)
         }
-        GoalSpec::Relative { frame, d, dyaw, dpitch, droll, level } => {
+        GoalSpec::Relative { frame, d, dyaw, dpitch, droll, level, auto_yaw } => {
             let x_tool = kinematics::column(&start.r, 0);
             let mut pose = match frame {
                 RelFrame::Base => {
@@ -364,7 +364,11 @@ pub fn resolve_goal_ex(input: &PlanInput, spec: &GoalSpec) -> (Pose, bool) {
                     if *level { kinematics::level(&goal, &rec, level_cos()) } else { goal }
                 }
             };
-            let auto_yaw = input.arm.arm_dof() == 5 && *dyaw == 0.0 && *dpitch == 0.0 && *droll == 0.0 && (*frame != RelFrame::Camera || !*level);
+            let is_5dof = input.arm.arm_dof() == 5;
+            let auto_yaw = match auto_yaw {
+                Some(b) => *b && is_5dof,
+                None => is_5dof && *dyaw == 0.0 && *dpitch == 0.0 && *droll == 0.0 && (*frame != RelFrame::Camera || !*level),
+            };
             if auto_yaw {
                 pose.r = apply_auto_yaw(&start.p, &pose.p, pose.r);
                 (pose, true)
@@ -488,7 +492,12 @@ pub fn parse_move_relative(body: &Value) -> Result<(GoalSpec, Speed, Option<Stri
     if level && frame != RelFrame::Camera {
         return Err(MotionError::InvalidCommand("level applies to the camera frame only".into()));
     }
-    Ok((GoalSpec::Relative { frame, d, dyaw, dpitch, droll, level }, parse_speed(body)?, tag(body)?))
+    let auto_yaw = match body.get("auto_yaw") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return Err(MotionError::InvalidCommand("auto_yaw must be boolean".into())),
+    };
+    Ok((GoalSpec::Relative { frame, d, dyaw, dpitch, droll, level, auto_yaw }, parse_speed(body)?, tag(body)?))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

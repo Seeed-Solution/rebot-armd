@@ -250,6 +250,7 @@ pub struct FeetechArmDriver<T: Transport> {
     last_feedback_instant: Vec<Option<Instant>>,
     confirmed_enable_state: EnableState,
     tx_echo: Option<bool>,
+    tx_echo_auto: bool,
     poll_cursor: usize,
     rx_buffer: Vec<u8>,
 }
@@ -277,6 +278,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             last_feedback_instant: vec![None; dof],
             confirmed_enable_state: EnableState::Unknown,
             tx_echo: None,
+            tx_echo_auto: false,
             poll_cursor: 0,
             rx_buffer: Vec::with_capacity(256),
         }
@@ -294,6 +296,7 @@ impl<T: Transport> FeetechArmDriver<T> {
     pub fn with_config(mut self, cfg: feetech::FeetechConfig) -> Self {
         if cfg.tx_echo.is_some() {
             self.tx_echo = cfg.tx_echo;
+            self.tx_echo_auto = false;
         }
         self.config = cfg;
         if self.config.joints.is_empty() {
@@ -320,14 +323,24 @@ impl<T: Transport> FeetechArmDriver<T> {
 
     pub fn with_tx_echo(mut self, tx_echo: Option<bool>) -> Self {
         self.tx_echo = tx_echo;
+        self.tx_echo_auto = false;
         self
     }
 
     pub fn with_port_name(mut self, port: &str) -> Self {
-        if port.starts_with("/dev/ttySC") {
+        if port.starts_with("/dev/ttySC") && self.tx_echo.is_none() {
             self.tx_echo = Some(true);
+            self.tx_echo_auto = true;
         }
         self
+    }
+
+    pub fn tx_echo(&self) -> Option<bool> {
+        self.tx_echo
+    }
+
+    pub fn tx_echo_auto(&self) -> bool {
+        self.tx_echo_auto
     }
 
     pub fn transport_mut(&mut self) -> &mut T {
@@ -353,9 +366,23 @@ impl<T: Transport> FeetechArmDriver<T> {
                 }
             }
 
-            if self.tx_echo.is_none() && !self.rx_buffer.is_empty() && !tx.starts_with(&self.rx_buffer) {
+            if (self.tx_echo.is_none() || (self.tx_echo == Some(true) && self.tx_echo_auto))
+                && !self.rx_buffer.is_empty()
+                && !tx.starts_with(&self.rx_buffer)
+            {
+                tracing::warn!("Auto-detected tx_echo on /dev/ttySC* received non-echo response; disabling tx_echo");
                 self.tx_echo = Some(false);
+                self.tx_echo_auto = false;
                 break;
+            }
+        }
+
+        if self.tx_echo == Some(true) && self.tx_echo_auto {
+            let has_echo = self.rx_buffer.starts_with(tx) || self.rx_buffer.windows(tx.len()).any(|w| w == tx);
+            if !has_echo {
+                tracing::warn!("Auto-detected tx_echo=true on /dev/ttySC* but no echo received within timeout; disabling tx_echo");
+                self.tx_echo = Some(false);
+                self.tx_echo_auto = false;
             }
         }
 
@@ -377,7 +404,7 @@ impl<T: Transport> FeetechArmDriver<T> {
         Ok(())
     }
 
-    fn read_register_u8_direct(&mut self, id: u8, reg: u8) -> Result<u8, ArmDriverError> {
+    pub fn read_register_u8_direct(&mut self, id: u8, reg: u8) -> Result<u8, ArmDriverError> {
         let req = feetech::build_read(id, reg, 1);
         self.transport.write_all(&req)?;
         self.transport.flush()?;
@@ -386,12 +413,18 @@ impl<T: Transport> FeetechArmDriver<T> {
         let mut temp = [0u8; 64];
         let start = Instant::now();
         const READ_TIMEOUT: Duration = Duration::from_millis(25);
+        let mut skipped_echo = false;
 
         loop {
             while !self.rx_buffer.is_empty() {
                 match feetech::parse_response(&self.rx_buffer) {
                     Ok((pkt, consumed)) => {
+                        let is_req_echo = !skipped_echo && consumed == req.len() && self.rx_buffer[..consumed] == req[..];
                         self.rx_buffer.drain(..consumed);
+                        if is_req_echo {
+                            skipped_echo = true;
+                            continue;
+                        }
                         if pkt.id == feetech::BROADCAST_ID {
                             continue;
                         }
@@ -425,7 +458,7 @@ impl<T: Transport> FeetechArmDriver<T> {
         Err(ArmDriverError::Timeout(id))
     }
 
-    fn read_register_u16_direct(&mut self, id: u8, reg: u8) -> Result<u16, ArmDriverError> {
+    pub fn read_register_u16_direct(&mut self, id: u8, reg: u8) -> Result<u16, ArmDriverError> {
         let req = feetech::build_read(id, reg, 2);
         self.transport.write_all(&req)?;
         self.transport.flush()?;
@@ -434,16 +467,22 @@ impl<T: Transport> FeetechArmDriver<T> {
         let mut temp = [0u8; 64];
         let start = Instant::now();
         const READ_TIMEOUT: Duration = Duration::from_millis(25);
+        let mut skipped_echo = false;
 
         loop {
             while !self.rx_buffer.is_empty() {
                 match feetech::parse_response(&self.rx_buffer) {
                     Ok((pkt, consumed)) => {
+                        let is_req_echo = !skipped_echo && consumed == req.len() && self.rx_buffer[..consumed] == req[..];
                         self.rx_buffer.drain(..consumed);
+                        if is_req_echo {
+                            skipped_echo = true;
+                            continue;
+                        }
                         if pkt.id == feetech::BROADCAST_ID {
                             continue;
                         }
-                        if pkt.id == id && pkt.params.len() == 2 && pkt.error != feetech::INST_READ {
+                        if pkt.id == id && pkt.params.len() == 2 {
                             return Ok(u16::from_le_bytes([pkt.params[0], pkt.params[1]]));
                         }
                     }
@@ -653,6 +692,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
         let ids = self.servo_ids.clone();
         if enabled {
+            if !self.last_feedback_instant.is_empty() && self.last_feedback_instant.iter().all(Option::is_some) {
+                let targets: Vec<JointTarget> = self.cached_states.iter().map(|s| JointTarget::position(s.position)).collect();
+                self.write_joint_targets(&targets)?;
+            }
             for &id in &ids {
                 let pkt = feetech::build_set_torque(id, true);
                 self.transport.write_all(&pkt)?;

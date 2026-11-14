@@ -2495,6 +2495,7 @@ const C = {
   lastTick: 0, lastInput: 0, tailUntil: 0, stallSince: 0,
   gripJog: 0,                 // -1 (close) .. +1 (open) continuous rate jog
   status: 'idle', msg: '', solveUs: null, inflight: false, sending: false, gripDrag: false,
+  cartHoldActive: false, cartActionId: null, cartActionUntil: 0, stopPending: false, stepInflight: false, stepActionId: null,
 };
 
 /* =================================================================
@@ -4766,14 +4767,22 @@ function releaseAll() {
   for (const k in C.hold) { C.hold[k][0] = 0; C.hold[k][1] = 0; }
   if (C.cmd) C.goal = { ...C.cmd }; // drop any queued step that has not been executed yet
   if (C.T) C.Tg = C.T;
+  if (C.stepInflight || (C.stepActionId != null && S.obs?.action?.id === C.stepActionId && S.obs?.action?.state === 'running')) {
+    C.cartHoldActive = true;
+  }
   requestMotionStop();
 }
 function requestMotionStop() {
-  if (!S.streamActive || S.presetRunning) return;
+  if ((!S.streamActive && !C.cartHoldActive && !C.inflight) || S.presetRunning) return;
   S.streamActive = false;
   S.servoTarget = null;
   C.tailUntil = 0; C.lastInput = -Infinity;
   S.gripCmdAt = 0;
+  if (C.inflight || C.stepInflight) C.stopPending = true;
+  C.cartHoldActive = false;
+  C.cartActionId = null;
+  C.cartActionUntil = 0;
+  C.stepActionId = null;
   if (S.obs && S.obs.positions.length >= 5) cartSync(S.obs.positions);
   api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e));
 }
@@ -5069,6 +5078,7 @@ function cartStep(ax, s) {
   if (isSoArmProfile()) {
     const n = CFG.cart.steps[C.stepIdx];
     if (ax === 'x' || ax === 'y' || ax === 'z') {
+      C.stepInflight = true;
       commandRPC('/api/v1/action/move_relative', {
         frame: 'base',
         d: [
@@ -5076,7 +5086,17 @@ function cartStep(ax, s) {
           ax === 'y' ? s * n / 1000 : 0,
           ax === 'z' ? s * n / 1000 : 0,
         ],
-      }).catch(toastOnce);
+      }).then((ack) => {
+        syncEpoch(ack?.epoch_id);
+        C.stepActionId = ack?.action_id ?? null;
+        if (C.stopPending) {
+          C.stopPending = false;
+          C.stepActionId = null;
+          api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e));
+        }
+      }).catch(toastOnce).finally(() => {
+        C.stepInflight = false;
+      });
     } else if (ax === 'p' || ax === 'r') {
       const pos = (S.obs && Array.isArray(S.obs.positions)) ? S.obs.positions : (S.home || []);
       const jIdx = ax === 'p' ? 3 : 4;
@@ -5174,16 +5194,47 @@ function cartTick() {
       S.gripCmdAt = Date.now();
     }
 
+    const actionRunning = S.obs?.action?.state === 'running';
+    if (C.cartActionId != null && S.obs?.action?.id === C.cartActionId && !actionRunning) {
+      C.cartActionId = null;
+      C.cartActionUntil = 0;
+    }
+    const actionBusy = actionRunning || (C.cartActionId != null && now < C.cartActionUntil);
+
     if (v.x || v.y || v.z) {
       C.status = 'ok';
       C.msg = '';
-      if (!C.inflight && !S.presetRunning) {
+      if (!C.inflight && !actionBusy && !S.presetRunning) {
         C.inflight = true;
+        C.cartHoldActive = true;
+        C.stopPending = false;
         const stepM = scale * 0.015;
+        const speed = {
+          linear: clamp(0.05 * scale, 0.01, 0.15),
+          angular: clamp(0.5 * scale, 0.05, 1.0),
+        };
         commandRPC('/api/v1/action/move_relative', {
           frame: 'base',
           d: [v.x * stepM, v.y * stepM, v.z * stepM],
-        }).catch(toastOnce).finally(() => { C.inflight = false; });
+          speed,
+        }).then((ack) => {
+          syncEpoch(ack?.epoch_id);
+          C.cartActionId = ack?.action_id ?? null;
+          C.cartActionUntil = performance.now() + Math.min(400, (ack?.expected_duration_s || 0.2) * 1000);
+          if (C.stopPending) {
+            C.stopPending = false;
+            C.cartHoldActive = false;
+            C.cartActionId = null;
+            C.cartActionUntil = 0;
+            api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e));
+          }
+        }).catch((e) => {
+          if (e && e.code === 'MOTION_BUSY') return;
+          C.cartHoldActive = false;
+          toastOnce(e);
+        }).finally(() => {
+          C.inflight = false;
+        });
       }
     }
 
@@ -5196,7 +5247,7 @@ function cartTick() {
       if (t.length > GRIP) t[GRIP] = gripRad();
       t = clampTarget(t);
       C.sending = true;
-      if (!S.presetRunning) cartSend(t);
+      if (!S.presetRunning && !(v.x || v.y || v.z) && !C.inflight && !actionBusy) cartSend(t);
     }
     return;
   }

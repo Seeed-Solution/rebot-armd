@@ -36,6 +36,8 @@ pub struct NamedPose {
     /// Unix time (ms) of the save.
     pub saved_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arm_dof: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gripper_joint: Option<usize>,
@@ -46,6 +48,8 @@ pub struct NamedPose {
 /// File body and `GET /api/v1/poses` body.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct PoseList {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arm_dof: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,6 +94,11 @@ fn name_of(body: &Value) -> Result<String, ArmError> {
 pub fn validate_list(list: &PoseList, config: &crate::model::ArmConfig) -> Result<(), String> {
     if list.poses.len() > MAX_POSES { return Err(format!("more than {MAX_POSES} poses")); }
     let cfg_joint_names: Vec<String> = config.limits.iter().map(|l| l.name.clone()).collect();
+    if let (Some(ref list_pid), Some(ref cfg_pid)) = (&list.profile_id, &config.profile_id) {
+        if list_pid != cfg_pid {
+            return Err(format!("POSE_DOF_MISMATCH: pose list profile_id '{list_pid}' does not match config profile_id '{cfg_pid}'"));
+        }
+    }
     if let Some(ad) = list.arm_dof {
         if ad != config.arm_dof() {
             return Err(format!("POSE_DOF_MISMATCH: pose list arm_dof {ad} does not match config arm_dof {}", config.arm_dof()));
@@ -108,7 +117,16 @@ pub fn validate_list(list: &PoseList, config: &crate::model::ArmConfig) -> Resul
     for (i, p) in list.poses.iter().enumerate() {
         if !valid_name(&p.name) { return Err(format!("invalid pose name '{}'", p.name)); }
         if list.poses[..i].iter().any(|q| q.name == p.name) { return Err(format!("duplicate pose name '{}'", p.name)); }
-        if let Some(ad) = p.arm_dof {
+        if let (Some(ref p_pid), Some(ref cfg_pid)) = (&p.profile_id, &config.profile_id) {
+            if p_pid != cfg_pid {
+                return Err(format!("POSE_DOF_MISMATCH: pose '{}' profile_id '{p_pid}' does not match config profile_id '{cfg_pid}'", p.name));
+            }
+        }
+        let effective_arm_dof = p.arm_dof.or(list.arm_dof);
+        if config.arm_dof() == 5 && effective_arm_dof.is_none() {
+            return Err(format!("POSE_DOF_MISMATCH: pose '{}' missing arm_dof on 5-DOF profile", p.name));
+        }
+        if let Some(ad) = effective_arm_dof {
             if ad != config.arm_dof() {
                 return Err(format!("POSE_DOF_MISMATCH: pose '{}' arm_dof {ad} does not match config arm_dof {}", p.name, config.arm_dof()));
             }
@@ -157,7 +175,25 @@ impl SupervisorInner {
     pub fn move_to_pose(&mut self, name: &str, include_gripper: bool, speed_scale: f64, tag: Option<String>, epoch: u64) -> Result<(u64, f64), ArmError> {
         let pose = self.poses.find(name)?;
         let cfg_joint_names: Vec<String> = self.config.limits.iter().map(|l| l.name.clone()).collect();
-        if let Some(ad) = pose.arm_dof {
+        let effective_pid = pose.profile_id.as_ref().or(self.poses.list.profile_id.as_ref());
+        if let (Some(pose_pid), Some(ref cfg_pid)) = (effective_pid, &self.config.profile_id) {
+            if pose_pid != cfg_pid {
+                return Err(ArmError::Rejected {
+                    status: 400,
+                    code: "POSE_DOF_MISMATCH".into(),
+                    message: format!("Pose '{name}' profile_id '{pose_pid}' does not match active config profile_id '{cfg_pid}'"),
+                });
+            }
+        }
+        let effective_arm_dof = pose.arm_dof.or(self.poses.list.arm_dof);
+        if self.config.arm_dof() == 5 && effective_arm_dof.is_none() {
+            return Err(ArmError::Rejected {
+                status: 400,
+                code: "POSE_DOF_MISMATCH".into(),
+                message: format!("Pose '{name}' missing arm_dof on 5-DOF profile"),
+            });
+        }
+        if let Some(ad) = effective_arm_dof {
             if ad != self.config.arm_dof() {
                 return Err(ArmError::Rejected {
                     status: 400,
@@ -214,6 +250,7 @@ pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Opt
         return Err(invalid(format!("at most {MAX_POSES} poses; delete one first")));
     }
     let saved_at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    let profile_id = inner.config.profile_id.clone();
     let arm_dof = inner.config.arm_dof();
     let gripper_joint = inner.config.gripper_index();
     let joint_names: Vec<String> = inner.config.limits.iter().map(|l| l.name.clone()).collect();
@@ -222,10 +259,12 @@ pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Opt
         name,
         positions,
         saved_at_ms,
+        profile_id: profile_id.clone(),
         arm_dof: Some(arm_dof),
         gripper_joint,
         joint_names: Some(joint_names.clone()),
     };
+    inner.poses.list.profile_id = profile_id;
     inner.poses.list.arm_dof = Some(arm_dof);
     inner.poses.list.gripper_joint = gripper_joint;
     inner.poses.list.joint_names = Some(joint_names);

@@ -13,6 +13,8 @@ use super::episode::RecordFrame;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct EpisodeMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arm_dof: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gripper_joint: Option<usize>,
@@ -42,6 +44,9 @@ pub enum ParquetRecordingError {
 pub fn lerobot_arrow_schema_with_meta(meta: Option<&EpisodeMetadata>) -> Arc<Schema> {
     let mut metadata = std::collections::HashMap::new();
     if let Some(m) = meta {
+        if let Some(ref pid) = m.profile_id {
+            metadata.insert("profile_id".into(), pid.clone());
+        }
         if let Some(ad) = m.arm_dof {
             metadata.insert("arm_dof".into(), ad.to_string());
         }
@@ -158,49 +163,50 @@ pub fn write_frames_to_parquet(path: &Path, frames: &[RecordFrame]) -> Result<()
 pub fn read_metadata_from_parquet(path: &Path) -> Result<Option<EpisodeMetadata>, ParquetRecordingError> {
     let meta_path = path.with_extension("meta.json");
     if meta_path.exists() {
-        if let Ok(data) = std::fs::read_to_string(&meta_path) {
-            if let Ok(m) = serde_json::from_str::<EpisodeMetadata>(&data) {
-                return Ok(Some(m));
-            }
-        }
+        let data = std::fs::read_to_string(&meta_path)?;
+        let m = serde_json::from_str::<EpisodeMetadata>(&data)
+            .map_err(|e| ParquetRecordingError::Corrupted(format!("Failed to parse sidecar {}: {e}", meta_path.display())))?;
+        return Ok(Some(m));
     }
     let dir_meta = path.with_file_name("meta.json");
     if dir_meta.exists() {
-        if let Ok(data) = std::fs::read_to_string(&dir_meta) {
-            if let Ok(m) = serde_json::from_str::<EpisodeMetadata>(&data) {
-                return Ok(Some(m));
-            }
+        let data = std::fs::read_to_string(&dir_meta)?;
+        let m = serde_json::from_str::<EpisodeMetadata>(&data)
+            .map_err(|e| ParquetRecordingError::Corrupted(format!("Failed to parse dir metadata {}: {e}", dir_meta.display())))?;
+        return Ok(Some(m));
+    }
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    let meta_map = builder.schema().metadata();
+    let mut meta = EpisodeMetadata::default();
+    let mut found = false;
+    if let Some(pid_str) = meta_map.get("profile_id") {
+        meta.profile_id = Some(pid_str.clone());
+        found = true;
+    }
+    if let Some(ad_str) = meta_map.get("arm_dof") {
+        if let Ok(ad) = ad_str.parse::<usize>() {
+            meta.arm_dof = Some(ad);
+            found = true;
         }
     }
-    if let Ok(file) = File::open(path) {
-        if let Ok(builder) = ParquetRecordBatchReaderBuilder::try_new(file) {
-            let meta_map = builder.schema().metadata();
-            let mut meta = EpisodeMetadata::default();
-            let mut found = false;
-            if let Some(ad_str) = meta_map.get("arm_dof") {
-                if let Ok(ad) = ad_str.parse::<usize>() {
-                    meta.arm_dof = Some(ad);
-                    found = true;
-                }
-            }
-            if let Some(gj_str) = meta_map.get("gripper_joint") {
-                if let Ok(gj) = gj_str.parse::<usize>() {
-                    meta.gripper_joint = Some(gj);
-                    found = true;
-                }
-            }
-            if let Some(jn_str) = meta_map.get("joint_names") {
-                if let Ok(jn) = serde_json::from_str::<Vec<String>>(jn_str) {
-                    meta.joint_names = Some(jn);
-                    found = true;
-                }
-            }
-            if found {
-                return Ok(Some(meta));
-            }
+    if let Some(gj_str) = meta_map.get("gripper_joint") {
+        if let Ok(gj) = gj_str.parse::<usize>() {
+            meta.gripper_joint = Some(gj);
+            found = true;
         }
     }
-    Ok(None)
+    if let Some(jn_str) = meta_map.get("joint_names") {
+        if let Ok(jn) = serde_json::from_str::<Vec<String>>(jn_str) {
+            meta.joint_names = Some(jn);
+            found = true;
+        }
+    }
+    if found {
+        Ok(Some(meta))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Read back frames from a LeRobot Parquet file for verification
