@@ -90,6 +90,13 @@ struct SimCamera {
     pub mode_down: AtomicBool,
     /// Mode readings (`mode_info`, one `GET /api/mode` on the HTTP source).
     pub mode_info_calls: AtomicU64,
+    /// `models` of the mode (None: a provider that cannot switch models, POST /api/models 404).
+    pub models: Mutex<Option<grasp::ProviderModels>>,
+    /// `POST /api/models` bodies; the reply when set (else 202 and the switch is applied).
+    pub set_models_calls: Mutex<Vec<Value>>,
+    pub set_models_reply: Mutex<Option<(u16, Value)>>,
+    /// Frames report this `model_generation` instead of the models' generation.
+    pub frame_generation: Mutex<Option<u64>>,
 }
 
 impl SimCamera {
@@ -175,7 +182,8 @@ impl SimCamera {
             tokio::time::sleep(Duration::from_millis(120 + (frame_id * 37) % 131)).await;
         }
         let captured_at = if self.stale.load(Ordering::SeqCst) { captured - Duration::from_secs(30) } else { captured };
-        DetectionFrame { frame_id, captured_at, image_size_px: self.cam.size, detections, depth }
+        let model_generation = (*self.frame_generation.lock().unwrap()).or_else(|| self.models.lock().unwrap().as_ref().map(|m| m.generation));
+        DetectionFrame { frame_id, captured_at, image_size_px: self.cam.size, detections, depth, model_generation }
     }
 
     /// Image angle (deg, [-90, 90)) of the object's long side when the rig reports one.
@@ -264,7 +272,28 @@ impl DetectionSource for SimCamera {
             let mut m = ModeInfo::compose(self).await?;
             m.model_kind = self.model_kind.lock().unwrap().clone();
             m.depth_metric = self.depth_metric.load(Ordering::SeqCst);
+            m.models = self.models.lock().unwrap().clone();
             Ok(m)
+        })
+    }
+    fn set_models(&self, body: &Value) -> BoxFuture<'_, Result<(u16, Value), String>> {
+        let body = body.clone();
+        Box::pin(async move {
+            self.set_models_calls.lock().unwrap().push(body.clone());
+            if let Some(r) = self.set_models_reply.lock().unwrap().clone() { return Ok(r); }
+            let mut models = self.models.lock().unwrap();
+            let Some(m) = models.as_mut() else { return Ok((404, json!({"error": "not found"}))) };
+            // applied at once (the swap's frame): the detector name is its kind
+            if let Some(d) = body.get("detector") {
+                m.resident.detector = d.as_str().map(str::to_string);
+                *self.model_kind.lock().unwrap() = m.resident.detector.clone();
+            }
+            if let Some(d) = body.get("depth") {
+                m.resident.depth = d.as_str().map(str::to_string);
+                self.depth_available.store(m.resident.depth.is_some(), Ordering::SeqCst);
+            }
+            m.generation += 1;
+            Ok((202, json!({"generation": m.generation})))
         })
     }
     fn depth_available(&self) -> BoxFuture<'_, Result<bool, String>> {
@@ -394,6 +423,7 @@ async fn rig_driven(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start: 
         focus_calls: Mutex::new(Vec::new()), focus_error: AtomicBool::new(false),
         depth_available: AtomicBool::new(false), depth_sim: Mutex::new(None),
         model_kind: Mutex::new(None), depth_metric: AtomicBool::new(false), mode_down: AtomicBool::new(false), mode_info_calls: AtomicU64::new(0),
+        models: Mutex::new(None), set_models_calls: Mutex::new(Vec::new()), set_models_reply: Mutex::new(None), frame_generation: Mutex::new(None),
     });
     let hold = Arc::new(AtomicBool::new(true));
     let (ticker, hold_t) = (sup.clone(), hold.clone());
@@ -3039,4 +3069,147 @@ async fn capabilities_advertise_grasp_tasks() {
     let w = ws_rig(None).await;
     let v: Value = reqwest::get(format!("http://{}/api/v1/observation/schema", w.addr)).await.unwrap().json().await.unwrap();
     assert_eq!((v["capabilities"]["grasp"].as_bool(), v["capabilities"]["grasp_tasks"].as_bool()), (Some(true), Some(true)), "{}", v["capabilities"]);
+}
+
+// ---- task models (POST /api/models before the grasp, generation pin) ----
+
+/// A provider that can switch models: `detect` resident (its kind is its name), budget as
+/// rebot-vision's defaults (`segment` + `depth` does not fit).
+fn switching_models() -> grasp::ProviderModels {
+    grasp::ProviderModels {
+        generation: 0,
+        resident: grasp::ResidentModels { detector: Some("detect".into()), depth: None },
+        swap_state: "idle".into(),
+        swap_error: None,
+        catalogue: [("detect", 8.5), ("segment", 19.5), ("depth", 20.5)].into_iter().map(|(n, mb)| (n.to_string(), Some(mb))).collect(),
+        ion: Some([21.5, 62.9, 8.0]),
+    }
+}
+
+/// [`task_rig`] with tasks that switch models: `seg` (segment, requires it), `segdepth` (segment
+/// and depth, over the budget), `nodepth` (unload depth only).
+async fn models_rig() -> WsRig {
+    let w = task_rig(None).await;
+    let mut s = w.rig.sup.inner().read().await.grasp_setup().unwrap();
+    s.tasks = serde_json::from_value(json!({
+        "seg": {"requires": {"model_kind": "segment"}, "models": {"detector": "segment"}},
+        "segdepth": {"models": {"detector": "segment", "depth": "depth"}},
+        "nodepth": {"models": {"depth": null}}
+    })).unwrap();
+    s.validate().unwrap();
+    w.rig.sup.inner().write().await.set_grasp_setup(s);
+    *w.rig.sim.models.lock().unwrap() = Some(switching_models());
+    *w.rig.sim.model_kind.lock().unwrap() = Some("detect".into());
+    w
+}
+
+#[tokio::test]
+async fn task_models_switch_before_the_grasp_once() {
+    let mut w = models_rig().await;
+    let mut body = tap(&w.rig).await;
+    body["task"] = json!("seg");
+    let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body.clone()).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let a = heartbeat_until_done(&mut w, ack["action_id"].as_u64().unwrap(), 40.0).await;
+    assert_eq!((a["state"].as_str(), a["task"].as_str()), (Some("done"), Some("seg")), "{a}");
+    // only the slot the task names; the post-switch reading checked `requires` and was reused
+    assert_eq!(*w.rig.sim.set_models_calls.lock().unwrap(), vec![json!({"detector": "segment"})]);
+    let m = w.rig.sim.models.lock().unwrap().clone().unwrap();
+    assert_eq!((m.generation, m.resident.detector.as_deref()), (1, Some("segment")));
+    assert_eq!(w.rig.sim.mode_info_calls.load(Ordering::SeqCst), 2, "one reading before, one after the switch");
+    // the resident set already matches: no switch; no swap back after the grasp
+    let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body).await;
+    let a = heartbeat_until_done(&mut w, ack["action_id"].as_u64().unwrap(), 40.0).await;
+    assert_eq!(a["state"], "done", "{a}");
+    assert_eq!(w.rig.sim.set_models_calls.lock().unwrap().len(), 1);
+    assert_eq!(w.rig.sim.mode_info_calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn task_models_refusals_reject_without_motion() {
+    let mut w = models_rig().await;
+    let q0 = w.rig.sup.get_observation().await.commanded_positions;
+    let mut body = tap(&w.rig).await;
+    body["task"] = json!("segdepth");
+    let load_failed = grasp::ProviderModels { generation: 1, swap_state: "failed".into(), swap_error: Some("LOAD_FAILED:depth".into()), ..switching_models() };
+    let cases = [
+        (Some((409, json!({"error": "ION_BUDGET", "need_mb": 69.5, "limit_mb": 62.9}))), Some(switching_models()),
+         "task segdepth: model switch refused: ION_BUDGET (need 69.5 MB, limit 62.9 MB)"),
+        (Some((409, json!({"error": "SWAP_BUSY"}))), Some(switching_models()), "task segdepth: model switch busy"),
+        (Some((400, json!({"error": "no model named \"segment\""}))), Some(switching_models()),
+         "task segdepth: model switch refused: no model named \"segment\""),
+        (None, None, "task segdepth: provider cannot switch models"),
+        // accepted, but the provider's load failed: the poll reads it
+        (Some((202, json!({"generation": 1}))), Some(load_failed), "task segdepth: model switch failed: LOAD_FAILED:depth"),
+    ];
+    for (reply, models, msg) in cases {
+        *w.rig.sim.set_models_reply.lock().unwrap() = reply;
+        *w.rig.sim.models.lock().unwrap() = models;
+        let reply = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body.clone()).await;
+        assert_eq!((reply["type"].as_str(), reply["code"].as_str(), reply["status"].as_u64()), (Some("command_reject"), Some("TASK_UNSUPPORTED"), Some(422)), "{reply}");
+        assert_eq!(reply["message"], msg, "{reply}");
+    }
+    assert_eq!(w.rig.sim.set_models_calls.lock().unwrap().len(), 5);
+    let obs = w.rig.sup.get_observation().await;
+    assert!(obs.action.is_none(), "no action started: {:?}", obs.action);
+    assert_eq!(obs.commanded_positions, q0, "no motion commanded");
+    assert!(w.rig.sim.trigger_calls.lock().unwrap().is_empty(), "no detection triggered");
+}
+
+#[tokio::test]
+async fn task_models_switch_unreachable_fails_as_a_provider_error() {
+    let mut w = models_rig().await;
+    *w.rig.sim.set_models_reply.lock().unwrap() = Some((503, json!({"error": "busy"})));
+    w.rig.sim.models.lock().unwrap().as_mut().unwrap().resident.depth = Some("depth".into());
+    let mut body = tap(&w.rig).await;
+    body["task"] = json!("nodepth");
+    let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let a = wait_done(&w.rig.sup, ack["action_id"].as_u64().unwrap(), 5.0, |_| {}).await;
+    assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("DETECTION_UNAVAILABLE")), "{a:?}");
+    assert!(a.message.as_deref().unwrap().contains("model switch failed: detector returned 503"), "{a:?}");
+}
+
+#[tokio::test]
+async fn a_frame_from_another_model_generation_fails_the_grasp() {
+    let mut w = models_rig().await;
+    *w.rig.sim.frame_generation.lock().unwrap() = Some(7);
+    let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", tap(&w.rig).await).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let a = heartbeat_until_done(&mut w, ack["action_id"].as_u64().unwrap(), 20.0).await;
+    assert_eq!((a["state"].as_str(), a["code"].as_str(), a["message"].as_str()),
+               (Some("failed"), Some("DETECTION_UNAVAILABLE"), Some("model changed during grasp")), "{a}");
+    // frames of the generation the grasp started with
+    *w.rig.sim.frame_generation.lock().unwrap() = None;
+    let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", tap(&w.rig).await).await;
+    let a = heartbeat_until_done(&mut w, ack["action_id"].as_u64().unwrap(), 40.0).await;
+    assert_eq!(a["state"], "done", "{a}");
+}
+
+#[tokio::test]
+async fn dry_run_task_models_precedence() {
+    let mut w = models_rig().await;
+    let mut body = tap(&w.rig).await;
+    body["dry_run"] = json!(true);
+    let verdict = |res: &Value| (res["task_supported"].as_bool(), res["task_reason"].as_str().map(str::to_string));
+    // budget refusal from the catalogue
+    body["task"] = json!("segdepth");
+    let res = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body.clone()).await;
+    assert_eq!(verdict(&res), (Some(false), Some("task segdepth: model switch refused: ION_BUDGET (need 69.5 MB, limit 62.9 MB)".into())), "{res}");
+    // a switch that fits: supported, the requirement is not checked on the current set
+    body["task"] = json!("seg");
+    let res = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body.clone()).await;
+    assert_eq!(verdict(&res), (Some(true), Some("needs model switch".into())), "{res}");
+    // without the provider's ion budget nothing is computed
+    w.rig.sim.models.lock().unwrap().as_mut().unwrap().ion = None;
+    body["task"] = json!("segdepth");
+    let res = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body.clone()).await;
+    assert_eq!(verdict(&res), (Some(true), Some("needs model switch".into())), "{res}");
+    // the resident set matches: the requirement check on the current set
+    w.rig.sim.models.lock().unwrap().as_mut().unwrap().resident.detector = Some("segment".into());
+    body["task"] = json!("seg");
+    let res = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body).await;
+    assert_eq!(verdict(&res), (Some(false), Some("task seg needs model_kind segment, provider has detect".into())), "{res}");
+    assert!(w.rig.sim.set_models_calls.lock().unwrap().is_empty(), "dry runs never switch");
+    assert!(w.rig.sup.get_observation().await.action.is_none());
 }
