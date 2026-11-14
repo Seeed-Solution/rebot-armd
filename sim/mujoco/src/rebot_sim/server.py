@@ -31,7 +31,7 @@ import time
 import mujoco
 import numpy as np
 
-from .camera import PROFILE, CameraMount
+from .camera import PROFILE, SO101_PROFILE, CameraMount
 from .model import DOF, MODEL_OFFSETS_RAD, Indexer, load_model
 from .scene import Scene, parse_objects
 
@@ -341,10 +341,11 @@ class Simulator:
 
     def _state_locked(self) -> dict:
         d = self.data
+        tcp_pos, tcp_quat = self.motors.idx.tcp_pose(d)
         return {"t": round(d.time, 4), "seed": self.scene.seed, "enabled": self.motors.enabled,
                 "q": self.motors.idx.motor_positions(d).round(5).tolist(),
-                "tcp": [round(float(v), 5) for v in d.body("end_link").xpos],
-                "tcp_quat": [round(float(v), 5) for v in d.body("end_link").xquat],  # w, x, y, z
+                "tcp": [round(float(v), 5) for v in tcp_pos],
+                "tcp_quat": [round(float(v), 5) for v in tcp_quat],  # w, x, y, z
                 "objects": self.scene.state(d)}
 
     def sim_state(self) -> dict:
@@ -368,7 +369,7 @@ class Simulator:
         cfg = {"fps": fps, "size": list(size), "host": host, "video_port": video_port,
                "perception_port": perception_port, "scene_stream": scene_stream, "objects": objects,
                "mount": [m.flip, m.rot_deg, m.tilt_deg, m.offset_m], "has_meshes": self.has_meshes,
-               "noise": noise or {}}
+               "noise": noise or {}, "robot": self.robot}
         self.cam_proc = ctx.Process(target=camera_main, name="rebot-sim-camera", daemon=True,
                                     args=(cfg, self.shared.shm.name, self.shared.lock, self.model.nq, self.model.nv, child, ready_w,
                                           os.getpid()))
@@ -558,7 +559,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error(f"--objects: {exc}")
     if args.seed is not None and args.seed < 0:
         parser.error("--seed must be non-negative")
-    mount = CameraMount.from_profile(args.profile or PROFILE)
+    default_profile = SO101_PROFILE if args.robot in ("so-arm101", "so_arm101") else PROFILE
+    mount = CameraMount.from_profile(args.profile or default_profile)
     if args.camera_rot_deg is not None or args.camera_tilt_deg is not None or args.camera_offset:
         off = mount.offset_m
         if args.camera_offset:

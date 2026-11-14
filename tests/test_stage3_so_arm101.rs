@@ -7,7 +7,7 @@ use std::time::Duration;
 use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget};
 use armd::kinematics::{self, Pose};
 use armd::model::{ArmConfig, JointState};
-use armd::motion::{self, GoalSpec, MotionError, PlanInput, Speed};
+use armd::motion::{self, GoalSpec, MotionError, PlanInput, RelFrame, Speed};
 use armd::place::{self, PendingPlace, PlaceRequest};
 use armd::supervisor::ArmSupervisor;
 use armd::grasp;
@@ -161,6 +161,30 @@ fn test_5dof_move_to_auto_yaw_and_strict_yaw() {
         MotionError::IkUnreachable { .. } => {}
         other => panic!("expected IkUnreachable, got {other:?}"),
     }
+}
+
+#[test]
+fn test_5dof_move_relative_lateral_auto_yaw() {
+    let config = load_so101_config();
+    let input = plan_input_at_home(&config);
+    let speed = Speed::default();
+
+    // Lateral translation with frame: Base, d: [0.0, 0.06, 0.0], zero orientation deltas
+    let spec = GoalSpec::Relative {
+        frame: RelFrame::Base,
+        d: [0.0, 0.06, 0.0],
+        dyaw: 0.0,
+        dpitch: 0.0,
+        droll: 0.0,
+        level: false,
+    };
+
+    let (goal, yaw_free) = motion::resolve_goal_ex(&input, &spec);
+    assert!(yaw_free, "5-DOF translation-only relative move must enable auto_yaw (yaw_free=true)");
+    let path = motion::plan_cartesian_ex(&input, goal, speed, yaw_free)
+        .expect("lateral move_relative on 5-DOF SO-101 with auto_yaw should succeed");
+    assert_eq!(path.dof, 6);
+    assert!(path.q.len() >= 2);
 }
 
 #[test]

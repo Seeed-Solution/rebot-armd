@@ -665,7 +665,7 @@ class CameraRig:
         self.fps, self.size = cfg["fps"], tuple(cfg["size"])
         self.mount = cam.CameraMount(*cfg["mount"])
         objects = parse_objects(cfg["objects"])
-        self.model = load_model(objects=objects, camera=self.mount)
+        self.model = load_model(objects=objects, camera=self.mount, robot=cfg.get("robot"))
         self.data = mujoco.MjData(self.model)
         self.scene = Scene(self.model, objects)
         self.streams = {"/": VideoStream()}

@@ -31,6 +31,7 @@ DEFAULT_OFFSET_M = (-0.0731, 0.0005, 0.0660)  # v8 holder lens centre in end_lin
 # Detections are normalised to the visible 640x360 band, like rebot-vision.
 DETECTION_SIZE = (640, 360)
 PROFILE = Path(__file__).resolve().parents[4] / "kits" / "recamera-b601dm" / "profile" / "rebot-b601dm.json"
+SO101_PROFILE = Path(__file__).resolve().parents[4] / "profiles" / "so_arm101.json"
 
 
 @dataclass(frozen=True)
@@ -64,8 +65,15 @@ def axis_r(k, a: float) -> np.ndarray:
 
 def mount_rotation(model: mujoco.MjModel, mount: CameraMount) -> np.ndarray:
     """R_end_cam (OpenCV camera axes as columns, in end_link), armd `cam_mount`."""
-    from .model import MODEL_OFFSETS_RAD
     data = mujoco.MjData(model)
+    joint_names = {model.joint(i).name for i in range(model.njnt)}
+    if "shoulder_pan" in joint_names:
+        mujoco.mj_forward(model, data)
+        end_r = data.body("gripper").xmat.reshape(3, 3)
+        cam_r = data.cam_xmat[model.camera("wrist").id].reshape(3, 3)
+        r_end_mj = end_r.T @ cam_r
+        return np.column_stack([r_end_mj[:, 0], -r_end_mj[:, 1], -r_end_mj[:, 2]])
+    from .model import MODEL_OFFSETS_RAD
     for j, motor in enumerate((0.0, 0.0, 0.0, 0.0, 0.0, math.pi / 2), start=1):
         data.qpos[model.jnt_qposadr[model.joint(f"joint{j}").id]] = motor + MODEL_OFFSETS_RAD[j - 1]
     mujoco.mj_kinematics(model, data)

@@ -140,3 +140,11 @@ class Indexer:
                     data.qpos[self.right_qpos] = jaw
         else:
             data.qpos[self.qpos[:len(q)]] = q
+
+    def tcp_pose(self, data: mujoco.MjData) -> tuple[np.ndarray, np.ndarray]:
+        if self.robot == "so-arm101":
+            pos = data.site("tcp").xpos.copy()
+            quat = np.zeros(4)
+            mujoco.mju_mat2Quat(quat, data.site("tcp").xmat)
+            return pos, quat
+        return data.body("end_link").xpos.copy(), data.body("end_link").xquat.copy()

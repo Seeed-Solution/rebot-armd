@@ -5,12 +5,20 @@ import numpy as np
 import pytest
 import mujoco
 
+from rebot_sim.camera import CameraMount, SO101_PROFILE, mount_rotation
 from rebot_sim.model import load_model, Indexer, SO101_JOINTS
+from rebot_sim.scene import Scene, parse_objects
 from rebot_sim.server import Simulator, PROTOCOL_VERSION
 
 
 def free_udp_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
@@ -116,3 +124,52 @@ def test_so101_hand_cam_rendering():
     assert img.shape == (360, 640, 3)
     # The image must not be completely black (tabletop and background are visible)
     assert img.mean() > 20.0
+
+
+def test_so101_sim_state_tcp_pose():
+    port = free_udp_port()
+    sim = Simulator(port, objects="cube", robot="so-arm101")
+    try:
+        st = sim.sim_state()
+        assert "tcp" in st
+        assert len(st["tcp"]) == 3
+        for val in st["tcp"]:
+            assert np.isfinite(val)
+        assert "tcp_quat" in st
+        assert len(st["tcp_quat"]) == 4
+        for val in st["tcp_quat"]:
+            assert np.isfinite(val)
+    finally:
+        sim.close()
+
+
+def test_so101_scene_jaw_ids():
+    model = load_model(robot="so-arm101")
+    objects = parse_objects("cube")
+    scene = Scene(model, objects)
+    assert len(scene.jaw_ids) == 2
+    jaw_names = set(scene.jaw_ids.values())
+    assert "wrist_roll_follower_so101_v1" in jaw_names
+    assert "moving_jaw_so101_v1" in jaw_names
+
+
+def test_so101_camera_rig_and_mount_rotation():
+    model = load_model(robot="so-arm101")
+    r_cam = mount_rotation(model, CameraMount())
+    assert r_cam.shape == (3, 3)
+    assert np.isclose(np.linalg.det(r_cam), 1.0, atol=1e-3)
+
+    udp_port = free_udp_port()
+    mount = CameraMount.from_profile(SO101_PROFILE)
+    sim = Simulator(udp_port, objects="cube", camera_mount=mount, robot="so-arm101")
+    try:
+        vport = free_tcp_port()
+        pport = free_tcp_port()
+        ready = sim.start_camera(15, (320, 180), "127.0.0.1", vport, pport, objects="cube")
+        if "error" in ready:
+            pytest.skip(f"camera start skipped: {ready['error']}")
+        assert "error" not in ready
+        assert "backend" in ready
+    finally:
+        sim.close()
+

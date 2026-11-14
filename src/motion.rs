@@ -276,6 +276,18 @@ pub fn resolve_goal(input: &PlanInput, spec: &GoalSpec) -> Pose {
     resolve_goal_ex(input, spec).0
 }
 
+/// Apply auto-yaw rotation about world Z for 5-DOF arms based on radial azimuth change.
+pub fn apply_auto_yaw(start_p: &[f64; 3], goal_p: &[f64; 3], mut target_r: kinematics::Mat3) -> kinematics::Mat3 {
+    let r_start = (start_p[0] * start_p[0] + start_p[1] * start_p[1]).sqrt();
+    let r_target = (goal_p[0] * goal_p[0] + goal_p[1] * goal_p[1]).sqrt();
+    if r_start >= 0.03 && r_target >= 0.03 {
+        let dpsi = goal_p[1].atan2(goal_p[0]) - start_p[1].atan2(start_p[0]);
+        let rz = kinematics::axis_r(&[0.0, 0.0, 1.0], dpsi);
+        target_r = kinematics::mat_mul(&rz, &target_r);
+    }
+    target_r
+}
+
 /// Resolve a goal request against the start pose `fk(q0)`, returning `(pose, yaw_free)`.
 pub fn resolve_goal_ex(input: &PlanInput, spec: &GoalSpec) -> (Pose, bool) {
     let start = input.arm.fk(&input.q0);
@@ -284,32 +296,20 @@ pub fn resolve_goal_ex(input: &PlanInput, spec: &GoalSpec) -> (Pose, bool) {
             let auto_yaw = input.arm.arm_dof() == 5 && r.is_none();
             let mut target_r = r.unwrap_or(start.r);
             if auto_yaw {
-                let r_start = (start.p[0] * start.p[0] + start.p[1] * start.p[1]).sqrt();
-                let r_target = (p[0] * p[0] + p[1] * p[1]).sqrt();
-                if r_start >= 0.03 && r_target >= 0.03 {
-                    let dpsi = p[1].atan2(p[0]) - start.p[1].atan2(start.p[0]);
-                    let rz = kinematics::axis_r(&[0.0, 0.0, 1.0], dpsi);
-                    target_r = kinematics::mat_mul(&rz, &target_r);
-                }
+                target_r = apply_auto_yaw(&start.p, p, target_r);
             }
             (Pose::new(target_r, *p), auto_yaw)
         }
         GoalSpec::AbsoluteEx { p, r, auto_yaw } => {
             let mut target_r = r.unwrap_or(start.r);
             if *auto_yaw && input.arm.arm_dof() == 5 {
-                let r_start = (start.p[0] * start.p[0] + start.p[1] * start.p[1]).sqrt();
-                let r_target = (p[0] * p[0] + p[1] * p[1]).sqrt();
-                if r_start >= 0.03 && r_target >= 0.03 {
-                    let dpsi = p[1].atan2(p[0]) - start.p[1].atan2(start.p[0]);
-                    let rz = kinematics::axis_r(&[0.0, 0.0, 1.0], dpsi);
-                    target_r = kinematics::mat_mul(&rz, &target_r);
-                }
+                target_r = apply_auto_yaw(&start.p, p, target_r);
             }
             (Pose::new(target_r, *p), *auto_yaw)
         }
         GoalSpec::Relative { frame, d, dyaw, dpitch, droll, level } => {
             let x_tool = kinematics::column(&start.r, 0);
-            let pose = match frame {
+            let mut pose = match frame {
                 RelFrame::Base => {
                     let p = kinematics::add(&start.p, d);
                     let mut r = start.r;
@@ -349,7 +349,13 @@ pub fn resolve_goal_ex(input: &PlanInput, spec: &GoalSpec) -> (Pose, bool) {
                     if *level { kinematics::level(&goal, &rec, level_cos()) } else { goal }
                 }
             };
-            (pose, false)
+            let auto_yaw = input.arm.arm_dof() == 5 && *dyaw == 0.0 && *dpitch == 0.0 && *droll == 0.0 && (*frame != RelFrame::Camera || !*level);
+            if auto_yaw {
+                pose.r = apply_auto_yaw(&start.p, &pose.p, pose.r);
+                (pose, true)
+            } else {
+                (pose, false)
+            }
         }
     }
 }

@@ -111,7 +111,7 @@
                 <geom type="mesh" class="visual" pos="0.0077 0.0001 -0.0234" quat="0.707107 -0.707107 0 0" mesh="sts3215_03a_v1" material="sts3215_mat"/>
                 <geom type="mesh" class="arm" pos="0.0077 0.0001 -0.0234" quat="0.707107 -0.707107 0 0" mesh="sts3215_03a_v1" material="sts3215_mat"/>
                 <geom type="mesh" class="visual" pos="8.32667e-17 -0.000218214 0.000949706" quat="0 1 0 0" mesh="wrist_roll_follower_so101_v1" material="3d_printed_mat"/>
-                <geom type="mesh" class="jaw" pos="8.32667e-17 -0.000218214 0.000949706" quat="0 1 0 0" mesh="wrist_roll_follower_so101_v1" material="3d_printed_mat"/>
+                <geom name="wrist_roll_follower_so101_v1" type="mesh" class="jaw" pos="8.32667e-17 -0.000218214 0.000949706" quat="0 1 0 0" mesh="wrist_roll_follower_so101_v1" material="3d_printed_mat"/>
 
                 <site name="tcp" pos="-0.005731 -0.000159 -0.103516" size="0.006" rgba="1 0.34 0.16 1"/>
                 <camera name="hand_cam" pos="0 0.042894 -0.050564" xyaxes="1 0 0 0 0.819698 -0.572796" fovy="24.65"/>
@@ -121,7 +121,7 @@
                   <joint axis="0 0 1" name="gripper" type="hinge" range="-0.17453 1.74533"/>
                   <inertial pos="-0.00157495 -0.0300244 0.0192755" mass="0.012" fullinertia="6.61427e-06 1.89032e-06 5.28738e-06 -3.19807e-07 -5.90717e-09 -1.09945e-07"/>
                   <geom type="mesh" class="visual" pos="-5.55112e-17 -5.55112e-17 0.0189" quat="1 0 0 0" mesh="moving_jaw_so101_v1" material="3d_printed_mat"/>
-                  <geom type="mesh" class="jaw" pos="-5.55112e-17 -5.55112e-17 0.0189" quat="1 0 0 0" mesh="moving_jaw_so101_v1" material="3d_printed_mat"/>
+                  <geom name="moving_jaw_so101_v1" type="mesh" class="jaw" pos="-5.55112e-17 -5.55112e-17 0.0189" quat="1 0 0 0" mesh="moving_jaw_so101_v1" material="3d_printed_mat"/>
                 </body>
               </body>
             </body>
