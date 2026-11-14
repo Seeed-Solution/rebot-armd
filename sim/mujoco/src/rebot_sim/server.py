@@ -330,7 +330,7 @@ class Simulator:
 
     def start_camera(self, fps: int, size: tuple[int, int], host: str, video_port: int, perception_port: int,
                      scene_stream: bool = False, objects: str = "cube", timeout: float = 60.0,
-                     noise: dict | None = None) -> dict:
+                     noise: dict | None = None, depth: dict | None = None) -> dict:
         """Spawn the camera process (perception.camera_main); returns its ready message."""
         import multiprocessing as mp
 
@@ -345,7 +345,7 @@ class Simulator:
         cfg = {"fps": fps, "size": list(size), "host": host, "video_port": video_port,
                "perception_port": perception_port, "scene_stream": scene_stream, "objects": objects,
                "mount": [m.flip, m.rot_deg, m.tilt_deg, m.offset_m], "has_meshes": self.has_meshes,
-               "noise": noise or {}}
+               "noise": noise or {}, "depth": depth or {}}
         self.cam_proc = ctx.Process(target=camera_main, name="rebot-sim-camera", daemon=True,
                                     args=(cfg, self.shared.shm.name, self.shared.lock, self.model.nq, self.model.nv, child, ready_w,
                                           os.getpid()))
@@ -523,6 +523,15 @@ def main(argv: list[str] | None = None) -> None:
                      help="per frame, add one false detection (random label and place, score 0.3..0.6) with probability P")
     det.add_argument("--det-angle-jitter-deg", type=float, default=0.0, metavar="S", help="Gaussian sigma on angle_deg")
     det.add_argument("--det-noise-seed", type=int, default=None, metavar="N", help="noise RNG seed (default: --seed, else 0)")
+    dep = parser.add_argument_group("depth pipeline (emulated monocular depth model; off by default)")
+    dep.add_argument("--depth", choices=("off", "metric", "relative"), default="off",
+                     help="offer the perception API's depth pipeline with this model kind (default off)")
+    dep.add_argument("--depth-scale", type=float, default=1.0, metavar="S",
+                     help="metric: disparity scale error (1 = matches armd's metric prior)")
+    dep.add_argument("--depth-noise-rel", type=float, default=0.0, metavar="F", help="Gaussian relative noise per grid cell")
+    dep.add_argument("--depth-a", type=float, default=2.7, metavar="A", help="relative: disp = A / Z + B")
+    dep.add_argument("--depth-b", type=float, default=0.45, metavar="B", help="relative: disp = A / Z + B")
+    dep.add_argument("--depth-conf", type=float, default=0.95, metavar="C", help="depth_conf reported per detection")
     args = parser.parse_args(argv)
     if not 1 <= args.fps <= 30:
         parser.error("--fps must be 1..30")
@@ -552,6 +561,10 @@ def main(argv: list[str] | None = None) -> None:
              "latency_ms": args.det_latency_ms, "false_rate": args.det_false_rate,
              "angle_jitter_deg": args.det_angle_jitter_deg,
              "seed": args.det_noise_seed if args.det_noise_seed is not None else (args.seed or 0)}
+    if args.depth_scale <= 0 or args.depth_noise_rel < 0 or args.depth_a <= 0 or not 0.0 <= args.depth_conf <= 1.0:
+        parser.error("--depth-scale and --depth-a must be > 0, --depth-noise-rel >= 0, --depth-conf 0..1")
+    depth = {"kind": args.depth, "scale": args.depth_scale, "noise_rel": args.depth_noise_rel, "a": args.depth_a,
+             "b": args.depth_b, "conf": args.depth_conf, "seed": noise["seed"]}
     if args.benchmark:
         print(f"{benchmark(args.benchmark):.0f} physics steps/s (timestep 2 ms, unpaced)")
         return
@@ -565,7 +578,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.camera:
         w, h = (int(v) for v in args.camera_size.split("x"))
         ready = sim.start_camera(args.fps, (w, h), args.http_host, args.video_port, args.perception_port,
-                                 args.scene_stream, args.objects, noise=noise)
+                                 args.scene_stream, args.objects, noise=noise, depth=depth)
         if "error" in ready:
             print(f"rebot-sim: {ready['error']}", file=sys.stderr, flush=True)
             sim.close()

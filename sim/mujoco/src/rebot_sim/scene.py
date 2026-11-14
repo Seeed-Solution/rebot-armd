@@ -37,6 +37,11 @@ class SceneObject:
     kind: str
 
     @property
+    def height_m(self) -> float:
+        """Height of the object standing on the table (ground truth for depth / probe checks)."""
+        return 2 * self.rest_z
+
+    @property
     def rest_z(self) -> float:
         """Centre height when the object stands on the table (z = 0)."""
         return KINDS[self.kind][1][2] if self.kind != "cup" else KINDS["cup"][1][1]
@@ -130,7 +135,7 @@ class Scene:
                 "name": obj.name, "label": obj.kind,
                 "pos": [round(float(v), 5) for v in data.qpos[qa:qa + 3]],
                 "quat": [round(float(v), 5) for v in data.qpos[qa + 3:qa + 7]],
-                "lifted_m": round(lifted, 5), "contacts": {"jaws": sorted(jaws), "table": on_table},
+                "lifted_m": round(lifted, 5), "height_m": round(obj.height_m, 5), "contacts": {"jaws": sorted(jaws), "table": on_table},
                 "grasped": len(jaws) == 2 and lifted > LIFTED_M,
             })
         return out

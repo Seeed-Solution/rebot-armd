@@ -325,6 +325,187 @@ def detections(geom_ids: np.ndarray, scene, min_pixels: int = 20) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------- monocular depth (emulated)
+#
+# rebot-vision's depth pipeline (kits/recamera-b601dm/vision/main/depth_geom.cpp) runs a
+# monocular model on a 384x224 grid over the 640x360 content and reports per-detection
+# disparities and table samples (docs/detection_api.md). The simulator renders the true
+# optical-axis depth Z, turns it into the disparity a model would output (DepthModel) and
+# computes the same fields from the ground-truth segmentation: it emits what a correct
+# rebot-vision would report, without its foreground heuristics.
+
+DEPTH_GRID = (384, 224)
+# armd's metric prior (calibrate_depth a_prior): a metric model trained at fx / W = 600 / 640
+METRIC_FX_PER_W = 600.0 / 640.0
+
+
+@dataclass(frozen=True)
+class DepthModel:
+    """Disparity a depth model outputs for optical depth Z (m). `kind` off / metric / relative.
+    metric: disp = scale * (fx / W) / (600 / 640) / Z, times (1 + N(0, noise_rel)) per cell; scale 1
+    matches armd's metric prior exactly. relative: disp = a / Z + b (plus the same noise).
+    Seeded per (seed, frame_id)."""
+    kind: str = "off"
+    scale: float = 1.0
+    noise_rel: float = 0.0
+    a: float = 2.7
+    b: float = 0.45
+    conf: float = 0.95
+    seed: int = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.kind != "off"
+
+    @property
+    def metric(self) -> bool:
+        return self.kind == "metric"
+
+    def disparity(self, z: np.ndarray, frame_id: int = 0, fx_per_w: float | None = None) -> np.ndarray:
+        """Disparity for optical depths `z` (non-finite or non-positive z: NaN)."""
+        z = np.asarray(z, dtype=np.float64)
+        ok = np.isfinite(z) & (z > 0)
+        zz = np.where(ok, z, 1.0)
+        if self.metric:
+            fxw = focal_px(DETECTION_SIZE[1]) / DETECTION_SIZE[0] if fx_per_w is None else fx_per_w
+            d = self.scale * fxw / METRIC_FX_PER_W / zz
+        else:
+            d = self.a / zz + self.b
+        if self.noise_rel:
+            rng = np.random.default_rng((self.seed, frame_id))
+            d = d * (1.0 + rng.normal(0.0, self.noise_rel, d.shape))
+        return np.where(ok, d, np.nan)
+
+    def inverse_z(self, disp, fx_per_w: float | None = None):
+        """1 / Z of a noise-free disparity (the generator's inverse; tests and diagnostics)."""
+        disp = np.asarray(disp, dtype=np.float64)
+        if self.metric:
+            fxw = focal_px(DETECTION_SIZE[1]) / DETECTION_SIZE[0] if fx_per_w is None else fx_per_w
+            return disp * METRIC_FX_PER_W / fxw / self.scale
+        return (disp - self.b) / self.a
+
+
+def render_depth(renderer: mujoco.Renderer) -> np.ndarray:
+    """Optical-axis depth Z (m) per pixel of the renderer's current scene (H x W float32, rows top
+    down). mujoco.Renderer.render() with depth rendering already returns metric Z (mujoco 4.0.0:
+    it maps the depth buffer through znear / zfar); the flags it changes are restored."""
+    renderer.enable_depth_rendering()
+    try:
+        return renderer.render()
+    finally:
+        renderer.disable_depth_rendering()
+
+
+def grid_cells(size=DETECTION_SIZE, grid=DEPTH_GRID) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Grid cell centres in content pixels (u, v: 1-D) and the pixel indices they sample (ix, iy)."""
+    cw, ch = size[0] / grid[0], size[1] / grid[1]
+    u = (np.arange(grid[0]) + 0.5) * cw
+    v = (np.arange(grid[1]) + 0.5) * ch
+    return u, v, np.minimum(u.astype(int), size[0] - 1), np.minimum(v.astype(int), size[1] - 1)
+
+
+def _plane_fit(du: np.ndarray, dv: np.ndarray, d: np.ndarray) -> tuple[float, float, float]:
+    """Least-squares disp = p0 + pu du + pv dv; median (flat) below 12 cells, as depth_geom.cpp."""
+    if len(d) >= 12:
+        a = np.column_stack([np.ones_like(du), du, dv])
+        sol, *_ = np.linalg.lstsq(a, d, rcond=None)
+        return float(sol[0]), float(sol[1]), float(sol[2])
+    return float(np.median(d)), 0.0, 0.0
+
+
+def _mad(x: np.ndarray) -> float:
+    return float(np.median(np.abs(x - np.median(x))))
+
+
+def depth_result(geom_ids: np.ndarray, z: np.ndarray, scene, model: DepthModel, frame_id: int = 0,
+                 min_pixels: int = 20) -> dict:
+    """Depth fields of a frame: {"table_samples": [[u, v, disp], ...], "objects": {name: fields},
+    "finite": bool}. `geom_ids` / `z` at DETECTION_SIZE; fields per object as rebot-vision
+    reports them (disp_fg, disp_bg, depth_conf, length_px, jaw_clear), computed on the 384x224
+    grid from the ground-truth mask:
+    - foreground: the object's cells (none reported under 6 cells);
+    - table plane: least-squares plane over table cells in the ring box expanded by
+      max(25 %, 4 cells) minus the box; disp_bg = plane at the foreground centroid, disp_fg =
+      disp_bg + P75(foreground disp - plane);
+    - length_px: extent of the full-resolution mask along its long axis (mask_orientation);
+    - jaw_clear: simplified, False when another object's pixels lie in the box expanded by 18 px.
+    Table samples as sample_table_disparity: 8 x 6 patches of 5 x 5 cells over [8 %, 92 %], table
+    cells outside every object box expanded by 15 %, >= 9 cells, MAD <= 0.05 median, coordinates the
+    mean of the retained cells."""
+    w, h = DETECTION_SIZE
+    gw, gh = DEPTH_GRID
+    cw, ch = w / gw, h / gh
+    u, v, ix, iy = grid_cells()
+    ids_g = geom_ids[np.ix_(iy, ix)]
+    z_g = z[np.ix_(iy, ix)].astype(np.float64)
+    finite = bool(np.isfinite(z_g).all() and (z_g > 0).all())
+    disp = model.disparity(z_g, frame_id)
+    uu, vv = np.meshgrid(u, v)
+    table = (ids_g == scene.table_id) & np.isfinite(disp)
+
+    boxes: dict[str, tuple[float, float, float, float]] = {}
+    masks: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for obj, gid in zip(scene.objects, scene.geom_ids):
+        ys, xs = np.nonzero(geom_ids == gid)
+        if len(xs) < min_pixels:
+            continue
+        boxes[obj.name] = (float(xs.min()), float(ys.min()), float(xs.max() + 1), float(ys.max() + 1))
+        masks[obj.name] = (xs, ys)
+
+    objects: dict[str, dict] = {}
+    for obj, gid in zip(scene.objects, scene.geom_ids):
+        if obj.name not in boxes:
+            continue
+        x0, y0, x1, y1 = boxes[obj.name]
+        fg = (ids_g == gid) & np.isfinite(disp)
+        if fg.sum() < 6:
+            continue
+        mx, my = max(0.25 * (x1 - x0), 4 * cw), max(0.25 * (y1 - y0), 4 * ch)
+        in_ring = (uu >= x0 - mx) & (uu <= x1 + mx) & (vv >= y0 - my) & (vv <= y1 + my)
+        in_box = (uu >= x0) & (uu <= x1) & (vv >= y0) & (vv <= y1)
+        ring = in_ring & ~in_box & table
+        if not ring.any():
+            continue
+        uc, vc = (x0 + x1) / 2, (y0 + y1) / 2
+        p0, pu, pv = _plane_fit(uu[ring] - uc, vv[ring] - vc, disp[ring])
+        fu, fv, fd = uu[fg], vv[fg], disp[fg]
+        deltas = fd - (p0 + pu * (fu - uc) + pv * (fv - vc))
+        disp_bg = max(0.0, p0 + pu * (fu.mean() - uc) + pv * (fv.mean() - vc))
+        disp_fg = disp_bg + float(np.percentile(deltas, 75))
+        xs, ys = masks[obj.name]
+        angle, _ = mask_orientation(xs, ys)
+        t = math.radians(angle)
+        proj = xs * math.cos(t) + ys * math.sin(t)
+        length = float(proj.max() - proj.min() + abs(math.cos(t)) + abs(math.sin(t)))
+        clear = True
+        for other, (ox, oy) in masks.items():
+            if other != obj.name and ((ox >= x0 - 18) & (ox < x1 + 18) & (oy >= y0 - 18) & (oy < y1 + 18)).any():
+                clear = False
+        objects[obj.name] = {"disp_fg": round(disp_fg, 5), "disp_bg": round(disp_bg, 5), "depth_conf": model.conf,
+                             "length_px": round(length, 2), "jaw_clear": clear}
+
+    excl = np.zeros_like(table)
+    for x0, y0, x1, y1 in boxes.values():
+        bw, bh = x1 - x0, y1 - y0
+        excl |= (uu >= x0 - 0.15 * bw) & (uu <= x1 + 0.15 * bw) & (vv >= y0 - 0.15 * bh) & (vv <= y1 + 0.15 * bh)
+    usable = table & ~excl
+    samples = []
+    for jy in range(6):
+        cgy = int(round((0.08 + 0.84 * jy / 5) * (gh - 1)))
+        for jx in range(8):
+            cgx = int(round((0.08 + 0.84 * jx / 7) * (gw - 1)))
+            sl = (slice(max(cgy - 2, 0), cgy + 3), slice(max(cgx - 2, 0), cgx + 3))
+            keep = usable[sl]
+            if keep.sum() < 9:
+                continue
+            d = disp[sl][keep]
+            med = float(np.median(d))
+            if not math.isfinite(med) or _mad(d) > 0.05 * max(med, 1e-3):
+                continue
+            samples.append([round(float(uu[sl][keep].mean()), 2), round(float(vv[sl][keep].mean()), 2), round(med, 5)])
+    return {"table_samples": samples, "objects": objects, "finite": finite}
+
+
 @dataclass(frozen=True)
 class DetNoise:
     """Detector-like errors added to the ground-truth detections (all off by default).
