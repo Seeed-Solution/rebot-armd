@@ -193,6 +193,58 @@ fn test_5dof_place_planning() {
     assert!(planned.durations[3] > 0.0, "retreat duration > 0");
 }
 
+#[tokio::test]
+async fn test_5dof_place_execution_lateral_target() {
+    let config = load_so101_config();
+    let sup = Arc::new(ArmSupervisor::new(config));
+    {
+        let mut inner = sup.inner().write().await;
+        inner.lease_enabled = false;
+        inner.set_torque(true).unwrap();
+    }
+
+    let ticker = sup.clone();
+    let ticker_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            interval.tick().await;
+            ticker.tick(0.01).await;
+        }
+    });
+
+    // Lateral target with y != 0 requiring coupled yaw
+    let body = serde_json::json!({
+        "position": [0.20, 0.06, 0.03],
+        "approach_height_m": 0.06,
+        "release": true,
+        "retreat": true,
+    });
+    let (id, _) = place::start(&sup, &body).await.expect("place::start should succeed");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut seen_phases = Vec::new();
+    let a = loop {
+        assert!(std::time::Instant::now() < deadline, "place execution timed out");
+        let obs = sup.get_observation().await;
+        if let Some(act) = obs.action.as_ref().or(obs.previous_action.as_ref()).filter(|a| a.id == id) {
+            if let Some(ref p) = act.phase {
+                if seen_phases.last() != Some(p) {
+                    seen_phases.push(p.clone());
+                }
+            }
+            if !act.is_running() {
+                break act.clone();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    ticker_task.abort();
+    assert_eq!(a.state, "done", "Place should succeed without IK_UNREACHABLE error, got status: {:?}", a);
+    assert!(seen_phases.contains(&"approach".to_string()), "approach phase seen");
+    assert!(seen_phases.contains(&"descend".to_string()), "descend phase seen");
+}
+
 #[test]
 fn test_5dof_grasp_table_violation_rejection() {
     let config = load_so101_config();

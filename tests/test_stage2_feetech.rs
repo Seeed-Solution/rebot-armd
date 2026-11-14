@@ -661,3 +661,119 @@ fn test_feetech_split_rx_frame_reassembly() {
     assert!((states[0].temperature - 42.0).abs() < 1e-4);
     assert!(driver.feedback_ages()[0].is_some());
 }
+
+// -------------------------------------------------------------------------
+// 14. with_config updates servo_ids used in bus operations
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_with_config_updates_servo_ids_in_bus_ops() {
+    let mock = MockTransport::new();
+    let default_ids = vec![1, 2, 3];
+    let driver = FeetechArmDriver::new(mock, default_ids);
+
+    let custom_ids = [11, 12, 13];
+    let cfg = feetech::FeetechConfig {
+        joints: custom_ids.iter().map(|&id| feetech::FeetechJointCalib {
+            id,
+            ..Default::default()
+        }).collect(),
+        ..Default::default()
+    };
+    let mut driver = driver.with_config(cfg);
+
+    // 1. write_joint_targets must write to custom IDs 11, 12, 13
+    driver.write_joint_targets(&[
+        JointTarget::position(0.0),
+        JointTarget::position(0.0),
+        JointTarget::position(0.0),
+    ]).unwrap();
+
+    let tx = driver.transport_mut().take_tx();
+    assert!(!tx.is_empty());
+    // Packet for SYNC_WRITE
+    // Header: FF FF FE LEN 83 REG(0x2A) DATA_LEN(0x02) [ID POS_L POS_H] ...
+    // Verify each custom ID appears at the entry positions (offset 7, 10, 13)
+    assert_eq!(tx[7], 11);
+    assert_eq!(tx[10], 12);
+    assert_eq!(tx[13], 13);
+
+    // 2. read_joint_states must poll and decode using custom IDs
+    let pos = 2048u16.to_le_bytes();
+    let spd = 0u16.to_le_bytes();
+    let load = 100u16.to_le_bytes();
+    let params = [pos[0], pos[1], spd[0], spd[1], load[0], load[1], 75, 30];
+    let cs = calculate_checksum(11, (params.len() + 2) as u8, 0x00, &params);
+    let mut rx = vec![0xFF, 0xFF, 11, (params.len() + 2) as u8, 0x00];
+    rx.extend_from_slice(&params);
+    rx.push(cs);
+    driver.transport_mut().provide_rx(&rx);
+
+    let states = driver.read_joint_states().unwrap();
+    assert_eq!(states.len(), 3);
+    assert!((states[0].position - 0.0).abs() < 1e-4);
+    assert!(driver.feedback_ages()[0].is_some());
+    assert!(driver.feedback_ages()[1].is_none());
+}
+
+// -------------------------------------------------------------------------
+// 15. drive_mode_invert negates velocity and load consistently with position
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_drive_mode_invert_decodes_velocity_and_load() {
+    let mock = MockTransport::new();
+    let driver = FeetechArmDriver::new(mock, vec![1, 2]);
+
+    let cfg = feetech::FeetechConfig {
+        joints: vec![
+            feetech::FeetechJointCalib {
+                id: 1,
+                drive_mode_invert: false,
+                zero_step: 2048,
+                ..Default::default()
+            },
+            feetech::FeetechJointCalib {
+                id: 2,
+                drive_mode_invert: true,
+                zero_step: 2048,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let mut driver = driver.with_config(cfg);
+
+    // Provide response for joint 1 (non-inverted) and joint 2 (inverted):
+    // raw position: 2148 (+100 steps from zero)
+    // raw speed: 50 steps/s positive (bit 15 = 0)
+    // raw load: 150 (+0.15 fraction, bit 10 = 0)
+    let pos_raw = 2148u16.to_le_bytes();
+    let spd_raw = 50u16.to_le_bytes();
+    let load_raw = 150u16.to_le_bytes();
+    let params = [pos_raw[0], pos_raw[1], spd_raw[0], spd_raw[1], load_raw[0], load_raw[1], 70, 35];
+
+    let mut rx = Vec::new();
+    for id in [1u8, 2u8] {
+        let cs = calculate_checksum(id, (params.len() + 2) as u8, 0x00, &params);
+        rx.extend_from_slice(&[0xFF, 0xFF, id, (params.len() + 2) as u8, 0x00]);
+        rx.extend_from_slice(&params);
+        rx.push(cs);
+    }
+    driver.transport_mut().provide_rx(&rx);
+
+    let states = driver.read_joint_states().unwrap();
+    let loads = driver.joint_loads().unwrap();
+
+    // Joint 1: standard direction (positive pos, positive vel, positive load)
+    assert!(states[0].position > 0.0, "Joint 1 position > 0");
+    assert!(states[0].velocity > 0.0, "Joint 1 velocity > 0");
+    assert!(loads[0] > 0.0, "Joint 1 load > 0");
+
+    // Joint 2: inverted direction (negated pos, negated vel, negated load)
+    assert!(states[1].position < 0.0, "Joint 2 position < 0");
+    assert!(states[1].velocity < 0.0, "Joint 2 velocity < 0");
+    assert!(loads[1] < 0.0, "Joint 2 load < 0");
+
+    assert!((states[0].position + states[1].position).abs() < 1e-4, "Position inverted");
+    assert!((states[0].velocity + states[1].velocity).abs() < 1e-4, "Velocity inverted");
+    assert!((loads[0] + loads[1]).abs() < 1e-4, "Load inverted");
+}

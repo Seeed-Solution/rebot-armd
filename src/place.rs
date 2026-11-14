@@ -213,26 +213,28 @@ pub fn spawn(supervisor: Arc<ArmSupervisor>, id: u64, planned: PlannedPlace) {
 async fn phases(ctx: &MacroCtx, planned: &PlannedPlace) -> Result<(), Stop> {
     let req = &planned.request;
     let speed = req.speed();
+    let is_5dof = planned.input.arm.arm_dof() == 5;
+    let yaw_free = is_5dof && req.orientation.is_none();
 
     ctx.phase("lift", 0.05).await?;
     let p = ctx.pose().await.p;
     let z = lift_z(p[2], req);
     if z - p[2] > LIFT_EPS_M {
-        ctx.move_arm("lift", GoalSpec::Absolute { p: [p[0], p[1], z], r: None }, speed).await?;
+        ctx.move_arm("lift", GoalSpec::AbsoluteEx { p: [p[0], p[1], z], r: None, auto_yaw: yaw_free }, speed).await?;
     }
 
     ctx.phase("approach", 0.2).await?;
-    ctx.move_arm("approach", GoalSpec::Absolute { p: above(req), r: Some(planned.r_place) }, speed).await?;
+    ctx.move_arm("approach", GoalSpec::AbsoluteEx { p: above(req), r: Some(planned.r_place), auto_yaw: yaw_free }, speed).await?;
 
     ctx.phase("descend", 0.55).await?;
-    ctx.move_arm("descend", GoalSpec::Absolute { p: req.target, r: Some(planned.r_place) }, speed).await?;
+    ctx.move_arm("descend", GoalSpec::AbsoluteEx { p: req.target, r: Some(planned.r_place), auto_yaw: yaw_free }, speed).await?;
 
     if req.release { ctx.gripper_phase("open", 0.75, GripperCommand::Open).await?; }
 
     if req.retreat {
         ctx.phase("retreat", 0.85).await?;
         let p = ctx.pose().await.p;
-        ctx.move_arm("retreat", GoalSpec::Absolute { p: [p[0], p[1], p[2] + req.approach_m], r: None }, speed).await?;
+        ctx.move_arm("retreat", GoalSpec::AbsoluteEx { p: [p[0], p[1], p[2] + req.approach_m], r: None, auto_yaw: yaw_free }, speed).await?;
     }
     Ok(())
 }

@@ -5069,10 +5069,12 @@ function cartStep(ax, s) {
     const n = CFG.cart.steps[C.stepIdx];
     if (ax === 'x' || ax === 'y' || ax === 'z') {
       commandRPC('/api/v1/action/move_relative', {
-        dx: ax === 'x' ? s * n / 1000 : 0,
-        dy: ax === 'y' ? s * n / 1000 : 0,
-        dz: ax === 'z' ? s * n / 1000 : 0,
         frame: 'base',
+        d: [
+          ax === 'x' ? s * n / 1000 : 0,
+          ax === 'y' ? s * n / 1000 : 0,
+          ax === 'z' ? s * n / 1000 : 0,
+        ],
       }).catch(toastOnce);
     } else if (ax === 'p' || ax === 'r') {
       const pos = (S.obs && Array.isArray(S.obs.positions)) ? S.obs.positions : (S.home || []);
@@ -5159,7 +5161,10 @@ function cartTick() {
     const v = cartVelocity();
     const gv = cartGripVel();
     const scale = speedScale();
-    const hasInput = v.x || v.y || v.z || v.p || v.r || gv;
+    const gripErr = pos.length > GRIP ? Math.abs(gripRad() - pos[GRIP]) : 0;
+    const gripStalled = Date.now() - S.gripCmdAt > 1200 && Math.abs(S.obs.velocities?.[GRIP] ?? 0) < 0.05;
+    const gripMoving = (gripErr > 0.015 && !gripStalled) || gv !== 0;
+    const hasInput = v.x || v.y || v.z || v.p || v.r || gripMoving;
     if (hasInput) cartKick();
 
     if (pos.length > GRIP && gv) {
@@ -5175,15 +5180,13 @@ function cartTick() {
         C.inflight = true;
         const stepM = scale * 0.015;
         commandRPC('/api/v1/action/move_relative', {
-          dx: v.x * stepM,
-          dy: v.y * stepM,
-          dz: v.z * stepM,
-          frame: 'base'
+          frame: 'base',
+          d: [v.x * stepM, v.y * stepM, v.z * stepM],
         }).catch(toastOnce).finally(() => { C.inflight = false; });
       }
     }
 
-    if (v.p || v.r || gv) {
+    if (v.p || v.r || gripMoving) {
       const wl = CFG.cart.wmax * scale;
       let t = pos.slice(0, S.dof);
       while (t.length < S.dof) t.push(0);

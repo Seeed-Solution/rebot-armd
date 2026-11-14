@@ -305,6 +305,15 @@ impl<T: Transport> FeetechArmDriver<T> {
                     ..Default::default()
                 })
                 .collect();
+        } else {
+            self.servo_ids = self.config.joints.iter().map(|j| j.id).collect();
+            let dof = self.servo_ids.len();
+            if dof != self.cached_states.len() {
+                self.cached_states.resize(dof, JointState::default());
+                self.cached_loads.resize(dof, 0.0);
+                self.motor_status.resize(dof, 0);
+                self.last_feedback_instant.resize(dof, None);
+            }
         }
         self
     }
@@ -814,13 +823,17 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                                     let temp_raw = pkt.params[7];
 
                                     let calib = self.config.joints.get(joint_idx).unwrap_or(&default_calib);
+                                    let raw_vel = feetech::raw_speed_to_rad_s(speed_raw);
+                                    let velocity = if calib.drive_mode_invert { -raw_vel } else { raw_vel };
+                                    let raw_load = feetech::raw_load_to_fraction(load_raw);
+                                    let load = if calib.drive_mode_invert { -raw_load } else { raw_load };
                                     self.cached_states[joint_idx] = JointState {
                                         position: calib.steps_to_rad(pos_raw),
-                                        velocity: feetech::raw_speed_to_rad_s(speed_raw),
+                                        velocity,
                                         torque: 0.0,
                                         temperature: feetech::raw_to_temperature(temp_raw),
                                     };
-                                    self.cached_loads[joint_idx] = feetech::raw_load_to_fraction(load_raw);
+                                    self.cached_loads[joint_idx] = load;
                                     self.motor_status[joint_idx] = pkt.error;
                                     self.last_feedback_instant[joint_idx] = Some(Instant::now());
 

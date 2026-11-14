@@ -139,8 +139,11 @@ impl MacroCtx {
             if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
             inner.plan_input().map_err(arm_fail)?
         };
-        let goal = motion::resolve_goal(&input, &spec);
-        let (input, planned) = tokio::task::spawn_blocking(move || { let p = motion::plan_cartesian(&input, goal, speed); (input, p) }).await
+        let (goal, yaw_free) = motion::resolve_goal_ex(&input, &spec);
+        let (input, planned) = tokio::task::spawn_blocking(move || {
+            let p = motion::plan_cartesian_ex(&input, goal, speed, yaw_free);
+            (input, p)
+        }).await
             .map_err(|e| fail("INTERNAL", format!("planner task failed: {e}")))?;
         let path = planned.map_err(|e| arm_fail(e.into()))?;
         let limit = {
