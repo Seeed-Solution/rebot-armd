@@ -150,17 +150,6 @@ pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
     let yaw_free = is_5dof && request.auto_yaw.unwrap_or(request.orientation.is_none());
     if yaw_free && request.orientation.is_none() && request.pose.is_none() {
         r_place = motion::apply_auto_yaw(&start.p, &request.target, r_place);
-        let x_tool = kinematics::column(&r_place, 0);
-        if -x_tool[2] < std::f64::consts::FRAC_1_SQRT_2 {
-            let down = [0.0, 0.0, -1.0];
-            let axis = kinematics::cross(&x_tool, &down);
-            let angle = (-x_tool[2]).clamp(-1.0, 1.0).acos() - std::f64::consts::FRAC_PI_4;
-            if kinematics::norm(&axis) > 1e-9 && angle > 1e-4 {
-                r_place = kinematics::mat_mul(&kinematics::axis_r(&kinematics::unit(&axis), angle), &r_place);
-            } else if -x_tool[2] <= -1.0 + 1e-9 {
-                r_place = crate::grasp::look_down(&r_place);
-            }
-        }
     } else if yaw_free && request.orientation.is_some() {
         r_place = motion::align_auto_yaw(&request.target, r_place);
     }

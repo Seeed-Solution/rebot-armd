@@ -1149,6 +1149,9 @@ impl ArmConfig {
                 if !(1..=100).contains(&ot) {
                     return Err(format!("feetech.overload_torque_raw must be 1..=100, got {}", ot));
                 }
+                if ft.joints.is_empty() && self.arm_dof() > 0 && ot < 50 {
+                    return Err(format!("feetech.overload_torque_raw must be >= 50 for arm joints, got {}", ot));
+                }
             }
             if !ft.joints.is_empty() {
                 if ft.joints.len() != self.dof {
@@ -1189,7 +1192,7 @@ impl ArmConfig {
                             return Err(format!("Feetech joint {} protection_current_raw must be 1..=1000, got {}", i, pc));
                         }
                     }
-                    if let Some(ot) = j.overload_torque_raw {
+                    if let Some(ot) = j.overload_torque_raw.or(ft.overload_torque_raw) {
                         if !(1..=100).contains(&ot) {
                             return Err(format!("Feetech joint {} overload_torque_raw must be 1..=100, got {}", i, ot));
                         }

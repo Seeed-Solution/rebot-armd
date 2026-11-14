@@ -216,6 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let damiao_limits: Option<Vec<_>> = config.damiao_ranges.as_ref().map(|r| r.iter().map(|r| r.limits()).collect());
     let config_dof = config.dof;
     let feetech_config = config.feetech.clone();
+    let gripper_index = config.gripper_index();
     let supervisor = Arc::new(ArmSupervisor::new(config));
     supervisor.set_follower(follower).await;
     start_blackbox(&supervisor, cli.blackbox_dir.as_deref(), &system, started);
@@ -266,7 +267,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let transport = armd::transport::SerialTransport::open_default(&port, baud)?;
             let mut driver = armd::driver::FeetechArmDriver::new(transport, (1..=6).collect())
                 .with_port_name(&port)
-                .with_config(cfg);
+                .with_config(cfg)
+                .with_gripper_index(gripper_index);
             driver.configure_servos().map_err(|e| format!("Feetech servo configuration failed on {port}: {e}"))?;
             supervisor.set_driver(Box::new(driver)).await;
             info!("Mounted {} on {}", follower, port);

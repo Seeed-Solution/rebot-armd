@@ -335,14 +335,14 @@ fn test_5dof_place_planning_lateral() {
     let mut input = plan_input_at_home(&config);
 
     // Verify GoalSpec::Absolute with explicit r resolves with yaw_free == false
-    let r_target = kinematics::rpy_to_r(0.0, 0.5, 0.0);
+    let r_target = kinematics::rpy_to_r(0.0, std::f64::consts::FRAC_PI_4, 0.0);
     let (_strict_goal, strict_yaw_free) = motion::resolve_goal_ex(&input, &GoalSpec::Absolute {
         p: [0.20, 0.08, 0.15],
         r: Some(r_target),
     });
     assert!(!strict_yaw_free, "GoalSpec::Absolute with explicit r must have yaw_free == false");
 
-    // 1. Move to (0.20, 0.08, 0.15) with rpy=(0.0, 0.5, 0.0) and auto_yaw: true
+    // 1. Move to (0.20, 0.08, 0.15) with rpy=(0.0, FRAC_PI_4, 0.0) and auto_yaw: true
     let (goal_pose, yaw_free) = motion::resolve_goal_ex(&input, &GoalSpec::AbsoluteEx {
         p: [0.20, 0.08, 0.15],
         r: Some(r_target),
@@ -355,7 +355,7 @@ fn test_5dof_place_planning_lateral() {
     println!("after move_to: q0 = {:?}", input.q0);
 
     // Verify cross-azimuth move from non-zero-azimuth start with explicit r and auto_yaw: true
-    let cross_target_r = kinematics::rpy_to_r(0.0, 0.5, 0.0);
+    let cross_target_r = kinematics::rpy_to_r(0.0, std::f64::consts::FRAC_PI_4, 0.0);
     let (cross_goal, cross_yaw_free) = motion::resolve_goal_ex(&input, &GoalSpec::AbsoluteEx {
         p: [0.20, -0.08, 0.15],
         r: Some(cross_target_r),
@@ -1065,6 +1065,12 @@ fn test_feetech_model_validation_rejects_invalid_parameters() {
     let mut gripper_cfg = config.clone();
     gripper_cfg.feetech.as_mut().unwrap().joints[5].overload_torque_raw = Some(25);
     assert!(gripper_cfg.validate().is_ok());
+
+    // 8. Global feetech.overload_torque_raw < 50 rejected when arm joints inherit it (overload_torque_raw = None)
+    let mut bad_global_cfg = config.clone();
+    bad_global_cfg.feetech.as_mut().unwrap().overload_torque_raw = Some(25);
+    bad_global_cfg.feetech.as_mut().unwrap().joints[0].overload_torque_raw = None;
+    assert!(bad_global_cfg.validate().is_err());
 }
 
 #[test]
@@ -1302,4 +1308,63 @@ async fn test_so_arm101_gripper_stall_at_load_threshold() {
     assert!(supervisor.is_gripper_stalled().await, "Gripper must be stalled at |load| = 0.23");
     let obs = supervisor.get_observation().await;
     assert_eq!(obs.gripper.as_ref().map(|g| g.stalled), Some(true));
+}
+
+// -------------------------------------------------------------------------
+// 26. place::plan with orientation: None preserves start pitch/roll while updating yaw
+// -------------------------------------------------------------------------
+#[test]
+fn test_place_plan_orientation_none_preserves_start_pitch_roll_and_updates_yaw() {
+    let config = load_so101_config();
+    let mut input = plan_input_at_home(&config);
+
+    // Initial non-vertical orientation with non-zero roll, pitch, yaw
+    let start_roll = 0.05;
+    let start_pitch = 0.85; // ~48.7 degrees down
+    let start_yaw = 0.10;
+    let r_start = kinematics::rpy_to_r(start_roll, start_pitch, start_yaw);
+    let (start_goal, yaw_free_start) = motion::resolve_goal_ex(&input, &GoalSpec::AbsoluteEx {
+        p: [0.20, 0.05, 0.18],
+        r: Some(r_start),
+        auto_yaw: true,
+    });
+    let start_path = motion::plan_cartesian_ex(&input, start_goal, Speed { linear: 0.05, angular: 1.0 }, yaw_free_start).unwrap();
+    input.q0 = std::array::from_fn(|i| f64::from(start_path.last()[i]));
+
+    let fk_before = input.arm.fk(&input.q0);
+    let [roll_before, pitch_before, _] = kinematics::r_to_rpy(&fk_before.r);
+    assert!((roll_before - start_roll).abs() < 1e-2);
+    assert!((pitch_before - start_pitch).abs() < 1e-2);
+
+    // Place to target at [0.20, -0.06, 0.12] with orientation: None
+    let target = [0.20, -0.06, 0.12];
+    let req = PlaceRequest {
+        target,
+        approach_m: 0.05,
+        pose: None,
+        orientation: None,
+        auto_yaw: None,
+        speed_scale: 0.5,
+        release: true,
+        retreat: true,
+        tag: None,
+    };
+    let pending = PendingPlace {
+        input,
+        request: req,
+        open_rad: config.gripper_policy.as_ref().unwrap().open_rad,
+        held_spill_safe: false,
+        spill_max_tilt_deg: 8.0,
+    };
+
+    let planned = place::plan(pending).expect("place::plan with orientation: None should succeed");
+    let [r_plan_roll, r_plan_pitch, r_plan_yaw] = kinematics::r_to_rpy(&planned.r_place);
+
+    // Pitch and roll MUST be preserved from start pose (no forced 45° tilt override!)
+    assert!((r_plan_roll - roll_before).abs() < 1e-2, "Roll must be preserved: got {}, expected {}", r_plan_roll, roll_before);
+    assert!((r_plan_pitch - pitch_before).abs() < 1e-2, "Pitch must be preserved: got {}, expected {}", r_plan_pitch, pitch_before);
+
+    // Yaw MUST be updated towards target azimuth
+    let expected_target_yaw = (-0.06_f64).atan2(0.20);
+    assert!((r_plan_yaw - expected_target_yaw).abs() < 0.15, "Yaw must update towards target: got {}, expected ~{}", r_plan_yaw, expected_target_yaw);
 }

@@ -993,7 +993,7 @@ fn test_feetech_drive_mode_invert_decodes_velocity_and_load() {
 #[test]
 fn test_feetech_read_u16_sensor_error_bit_and_echo_filtering() {
     let mock = MockTransport::new();
-    let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
+    let mut driver = FeetechArmDriver::new(mock, vec![1]);
 
     // Request is read 2 bytes from ID 1, reg 0x38 (present position)
     let req = feetech::build_read(1, feetech::REG_PRESENT_POSITION_L, 2);
@@ -2564,4 +2564,237 @@ fn test_feetech_enable_poll_unstarves_when_position_chunk_timeouts() {
         EnableState::Disabled,
         "Torque disable must be detected even when position chunk hits timeout"
     );
+}
+
+// -------------------------------------------------------------------------
+// 50. Pending requested_estop_count > applied_estop_count rejects operations
+// -------------------------------------------------------------------------
+#[tokio::test]
+async fn test_supervisor_pending_estop_count_rejects_clear_fault_set_torque_and_servo() {
+    let mut config = ArmConfig::default();
+    config.dof = 1;
+    config.limits = vec![JointLimit::new("j1", -PI, PI, 1.0, 1.0)];
+    config.home_positions = vec![0.0];
+
+    struct DummyDriver;
+    impl ArmDriver for DummyDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: false,
+                temperature_feedback: false,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: false,
+            }
+        }
+        fn enable_state(&self) -> EnableState { EnableState::Disabled }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO)] }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            Ok(vec![JointState {
+                position: 0.0,
+                velocity: 0.0,
+                torque: 0.0,
+                temperature: 25.0,
+            }])
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+    }
+
+    let supervisor = Arc::new(ArmSupervisor::new(config));
+    supervisor.set_driver(Box::new(DummyDriver)).await;
+
+    // Simulate pending requested_estop_count increment without applied_estop_count
+    supervisor.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+
+    // 1. clear_fault fails with EStopActive
+    let clear_res = supervisor.clear_fault().await;
+    assert!(matches!(clear_res, Err(ArmError::Safety(SafetyError::EStopActive))));
+    assert!(supervisor.e_stop_latched.load(Ordering::SeqCst));
+
+    // 2. set_torque(true) fails with EStopActive
+    let torque_res = supervisor.set_torque(true).await;
+    assert!(matches!(torque_res, Err(ArmError::Safety(SafetyError::EStopActive))));
+
+    // 3. servo fails with EStopActive
+    let servo_res = supervisor.servo(vec![0.0], 1).await;
+    assert!(matches!(servo_res, Err(ArmError::Safety(SafetyError::EStopActive))));
+}
+
+// -------------------------------------------------------------------------
+// 51. Stale REG_TORQUE_ENABLE degradation to Unknown and HardwareFault
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_stale_enable_poll_degrades_to_unknown_and_hardware_fault() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1]).with_calibrated(true);
+
+    let pos = 2048u16.to_le_bytes();
+    let params = [pos[0], pos[1], 0, 0, 0, 0, 70, 35];
+    let cs = calculate_checksum(1, 10, 0x00, &params);
+    let mut fb = vec![0xFF, 0xFF, 1, 10, 0x00];
+    fb.extend_from_slice(&params);
+    fb.push(cs);
+
+    let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
+    let rx_tq1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1];
+
+    // Initial feedback so feedback is valid
+    driver.transport_mut().provide_rx(&fb);
+    driver.read_joint_states().unwrap();
+    assert!(driver.is_feedback_valid());
+
+    driver.transport_mut().provide_rx(&rx_tq1);
+    driver.set_torque(true).unwrap();
+    assert_eq!(driver.enable_state(), EnableState::Enabled);
+    let _ = driver.transport_mut().take_tx();
+
+    // Now position telemetry stays fresh, but enable responses either return 2 or are suppressed
+    // First, test unexpected value 2 immediately degrades to Unknown:
+    driver.last_enable_poll = Some(Instant::now() - Duration::from_millis(250));
+    let cs_tq2 = calculate_checksum(1, 3, 0x00, &[2]);
+    let rx_tq2 = vec![0xFF, 0xFF, 1, 3, 0x00, 2, cs_tq2];
+    let mut poll_rx = Vec::new();
+    poll_rx.extend_from_slice(&rx_tq2);
+    poll_rx.extend_from_slice(&fb);
+    driver.transport_mut().provide_rx(&poll_rx);
+    let _ = driver.read_joint_states();
+    assert_eq!(driver.enable_state(), EnableState::Unknown);
+
+    // Re-enable and test 3 consecutive missed enable polls degrades to Unknown
+    driver.transport_mut().provide_rx(&fb);
+    driver.read_joint_states().unwrap();
+    driver.transport_mut().provide_rx(&rx_tq1);
+    driver.set_torque(true).unwrap();
+    assert_eq!(driver.enable_state(), EnableState::Enabled);
+
+    for _ in 0..3 {
+        driver.last_enable_poll = Some(Instant::now() - Duration::from_millis(250));
+        // Provide ONLY position feedback; enable poll receives no response
+        driver.transport_mut().provide_rx(&fb);
+        let _ = driver.read_joint_states();
+    }
+    assert_eq!(driver.enable_state(), EnableState::Unknown);
+}
+
+// -------------------------------------------------------------------------
+// 52. Gripper overload 0x20 handling vs arm joint faults
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_gripper_benign_overload_vs_arm_fault() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1, 2, 3, 4, 5, 6];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids)
+        .with_calibrated(true)
+        .with_gripper_index(Some(5));
+
+    // Case 1: Arm joint 0 has 0x20 overload -> check_hardware_status fails!
+    driver.motor_status[0] = 0x20;
+    assert!(driver.check_hardware_status().is_err());
+    driver.motor_status[0] = 0;
+
+    // Case 2: Gripper joint 5 has 0x04 overheat -> check_hardware_status fails!
+    driver.motor_status[5] = 0x04;
+    assert!(driver.check_hardware_status().is_err());
+
+    // Case 3: Gripper joint 5 has 0x24 (overheat + overload) -> check_hardware_status fails!
+    driver.motor_status[5] = 0x24;
+    assert!(driver.check_hardware_status().is_err());
+
+    // Case 4: Gripper joint 5 has 0x20 benign overload -> check_hardware_status SUCCEEDS!
+    driver.motor_status[5] = 0x20;
+    assert!(driver.check_hardware_status().is_ok());
+
+    // And clear_fault_disables_joints() does NOT include gripper joint 5 when status is 0x20
+    let disable_joints = driver.clear_fault_disables_joints();
+    assert!(!disable_joints.contains(&5));
+}
+
+// -------------------------------------------------------------------------
+// 53. Late drained frames and incomplete_chunk_idx handling
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_late_drained_frames_and_incomplete_chunk_idx() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1, 2, 3];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+
+    let build_resp = |id: u8| -> Vec<u8> {
+        let pos = 2048u16.to_le_bytes();
+        let spd = 0u16.to_le_bytes();
+        let load = 100u16.to_le_bytes();
+        let params = [pos[0], pos[1], spd[0], spd[1], load[0], load[1], 75, 40];
+        let cs = calculate_checksum(id, (params.len() + 2) as u8, 0x00, &params);
+        let mut pkt = vec![0xFF, 0xFF, id, (params.len() + 2) as u8, 0x00];
+        pkt.extend_from_slice(&params);
+        pkt.push(cs);
+        pkt
+    };
+
+    // Provide complete servos 1, 2, and incomplete servo 3 header
+    let resp3 = build_resp(3);
+    let mut rx = Vec::new();
+    rx.extend_from_slice(&build_resp(1));
+    rx.extend_from_slice(&build_resp(2));
+    rx.extend_from_slice(&resp3[..4]); // incomplete frame!
+    driver.transport_mut().provide_rx(&rx);
+
+    let _ = driver.read_joint_states();
+    assert_eq!(driver.incomplete_chunk_idx, Some(0));
+
+    // Next call, supply the rest of servo 3
+    let mut rx2 = Vec::new();
+    rx2.extend_from_slice(&resp3[4..]);
+    driver.transport_mut().provide_rx(&rx2);
+
+    let states = driver.read_joint_states().unwrap();
+    assert_eq!(states.len(), 3);
+    assert!(driver.feedback_ages()[2].is_some(), "Servo 3 reassembled across reads");
+}
+
+// -------------------------------------------------------------------------
+// 54. Preserving hardware-derived effective_ranges in with_config
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_preserve_hw_effective_ranges_in_with_config() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1]).with_calibrated(true);
+
+    // Simulate configure_servos recording hw angle limits: min=120, max=3950
+    driver.hw_angle_limits = vec![Some((120, 3950))];
+    driver.effective_ranges = vec![(120, 3950)];
+
+    // with_config with new config where range_min_steps and range_max_steps are None
+    let mut new_cfg = driver.config().clone();
+    new_cfg.joints[0].range_min_steps = None;
+    new_cfg.joints[0].range_max_steps = None;
+    new_cfg.p_coef = 45;
+
+    let updated_driver = driver.with_config(new_cfg);
+    assert_eq!(
+        updated_driver.effective_ranges(),
+        &[(120, 3950)],
+        "Hardware-derived angle limits must be preserved in effective_ranges when range steps are None"
+    );
+}
+
+// -------------------------------------------------------------------------
+// 55. Reading REG_HOMING_OFFSET_L with tx_echo=Some(false) and matching byte response
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_read_u16_tx_echo_false_matching_bytes_not_skipped() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
+
+    // Request: [0xFF, 0xFF, 0x01, 0x04, 0x02, 0x1F, 0x02, 0xD7]
+    // Response: id=1, len=4, status=0x02, params=[0x1F, 0x02], cs=0xD7
+    // Response bytes are byte-for-byte identical to request!
+    let resp = vec![0xFF, 0xFF, 0x01, 0x04, 0x02, 0x1F, 0x02, 0xD7];
+    driver.transport_mut().provide_rx(&resp);
+
+    let val = driver.read_register_u16_direct(1, 0x1F).expect("Must return response and not treat as echo");
+    let expected_val = u16::from_le_bytes([0x1F, 0x02]);
+    assert_eq!(val, expected_val);
 }

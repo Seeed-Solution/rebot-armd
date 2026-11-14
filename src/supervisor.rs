@@ -491,7 +491,8 @@ impl SupervisorInner {
         self.config.gripper_policy.as_ref()
     }
 
-    pub fn with_driver(mut self, driver: Box<dyn ArmDriver>) -> Self {
+    pub fn with_driver(mut self, mut driver: Box<dyn ArmDriver>) -> Self {
+        driver.set_gripper_index(self.config.gripper_index());
         if driver.capabilities().load_feedback {
             self.loads = vec![f32::NAN; self.config.dof];
         }
@@ -1151,7 +1152,7 @@ impl SupervisorInner {
             }
             if self.disable_pending { return Err(SafetyError::ClearFaultRejected("Torque disable is still pending".into())); }
             // Atomic e-stop check
-            if self.e_stop_latched.load(Ordering::SeqCst) {
+            if self.e_stop_latched.load(Ordering::SeqCst) || self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count {
                 return Err(SafetyError::EStopActive);
             }
 
@@ -1174,11 +1175,11 @@ impl SupervisorInner {
 
             if let Some(ref d) = self.driver {
                 // Secondary double-check latch right before hardware actuation
-                if self.e_stop_latched.load(Ordering::SeqCst) {
+                if self.e_stop_latched.load(Ordering::SeqCst) || self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count {
                     return Err(SafetyError::EStopActive);
                 }
                 let mut driver = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
-                if self.e_stop_latched.load(Ordering::SeqCst) {
+                if self.e_stop_latched.load(Ordering::SeqCst) || self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count {
                     return Err(SafetyError::EStopActive);
                 }
                 if !driver.is_feedback_valid() {
@@ -1677,6 +1678,11 @@ impl SupervisorInner {
         let state = self.safety.clear_fault()?;
         self.handover_settling_since = None;
         self.e_stop_latched.store(false, Ordering::SeqCst);
+        if self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count {
+            self.e_stop_latched.store(true, Ordering::SeqCst);
+            self.apply_stop_policy(StopPolicy::EStopLatch);
+            return Err(SafetyError::EStopActive);
+        }
         self.last_heartbeat = Instant::now();
         self.last_motion_frame = Instant::now();
         Ok(state)
@@ -2007,7 +2013,7 @@ impl SupervisorInner {
             return Err(SafetyError::HandoverSettling);
         }
 
-        if self.e_stop_latched.load(Ordering::SeqCst) {
+        if self.e_stop_latched.load(Ordering::SeqCst) || self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count {
             return Err(SafetyError::EStopActive);
         }
 
@@ -3225,9 +3231,34 @@ impl SupervisorInner {
             let v_g = self.measured_velocities.get(g_idx).copied().unwrap_or(0.0);
             let gap = p_cmd - p_meas;
 
+            let gripper_hw_overload = self
+                .motor_errors
+                .get(g_idx)
+                .and_then(|e| e.as_ref())
+                .is_some_and(|e| (e.code & 0x20) != 0);
+
             if !is_bus_fresh {
                 self.gripper_high_torque_ticks = 0;
                 self.gripper_low_torque_ticks = 0;
+            } else if !self.gripper_stalled && gripper_hw_overload {
+                self.gripper_stalled = true;
+                let dir = if gap.abs() > 1e-3 { gap } else { tau_g };
+                self.gripper_stall_sign = if dir >= 0.0 { 1.0 } else { -1.0 };
+                self.gripper_low_torque_ticks = 0;
+                self.gripper_high_torque_ticks = 0;
+                if let Some(&hold) = self.measured_positions.get(g_idx) {
+                    if g_idx < self.commanded_positions.len() {
+                        self.commanded_positions[g_idx] = hold;
+                    }
+                    if g_idx < self.target_positions.len() {
+                        self.target_positions[g_idx] = hold;
+                    }
+                    if let Some(ref mut st) = self.servo_target {
+                        if st.len() > g_idx {
+                            st[g_idx] = hold;
+                        }
+                    }
+                }
             } else if !self.gripper_stalled {
                 let is_stalled = if has_torque_feedback {
                     tau_g.abs() >= GRIPPER_STALL_LATCH_NM && v_g.abs() < 0.10
@@ -4097,6 +4128,7 @@ impl ArmSupervisor {
     pub async fn set_driver(&self, mut driver: Box<dyn ArmDriver>) {
         driver.set_abort_flag(self.e_stop_latched.clone());
         let mut inner = self.inner.write().await;
+        driver.set_gripper_index(inner.config.gripper_index());
         let mut drv = driver;
         let caps = drv.capabilities();
         if caps.load_feedback {
@@ -4121,6 +4153,7 @@ impl ArmSupervisor {
     pub fn with_driver(self, mut driver: Box<dyn ArmDriver>) -> Self {
         driver.set_abort_flag(self.e_stop_latched.clone());
         if let Ok(mut inner) = self.inner.try_write() {
+            driver.set_gripper_index(inner.config.gripper_index());
             if driver.capabilities().load_feedback {
                 inner.loads = vec![f32::NAN; inner.config.dof];
             }
@@ -4137,7 +4170,7 @@ impl ArmSupervisor {
         let e_stop = self.e_stop_latched.clone();
         let mut inner = self.inner.clone().write_owned().await;
         // Post-lock double-check: verify atomic e-stop latch again after acquiring write lock
-        if enable && e_stop.load(Ordering::SeqCst) {
+        if enable && (e_stop.load(Ordering::SeqCst) || inner.requested_estop_count.load(Ordering::SeqCst) != inner.applied_estop_count) {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
         tokio::task::spawn_blocking(move || inner.set_torque(enable))
@@ -4226,6 +4259,9 @@ impl ArmSupervisor {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
         let mut inner = self.inner.write().await;
+        if self.e_stop_latched.load(Ordering::SeqCst) || inner.requested_estop_count.load(Ordering::SeqCst) != inner.applied_estop_count {
+            return Err(ArmError::Safety(SafetyError::EStopActive));
+        }
         inner.servo(targets, epoch_id)?;
         Ok(())
     }
