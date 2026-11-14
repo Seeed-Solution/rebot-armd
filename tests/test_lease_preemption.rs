@@ -101,6 +101,7 @@ impl DummyDriver {
                 temperature_feedback: true,
                 torque_feedforward: false,
                 enable_feedback: true,
+                load_feedback: false,
             },
             enable_state: EnableState::Enabled,
             velocities: vec![0.0; dof],
@@ -672,6 +673,7 @@ fn test_dormant_disabled_arm_with_stale_feedback_preempts_without_handover_fault
                 temperature_feedback: true,
                 torque_feedforward: false,
                 enable_feedback: true,
+                load_feedback: false,
             }
         }
         fn enable_state(&self) -> EnableState {

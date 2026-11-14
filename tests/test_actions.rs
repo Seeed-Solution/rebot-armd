@@ -236,7 +236,7 @@ struct Blocked { q: Vec<f32>, enabled: EnableState }
 struct BlockedDriver(Arc<Mutex<Blocked>>);
 impl ArmDriver for BlockedDriver {
     fn capabilities(&self) -> DriverCapabilities {
-        DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true }
+        DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true, load_feedback: false }
     }
     fn enable_state(&self) -> EnableState { self.0.lock().unwrap().enabled }
     fn is_feedback_valid(&self) -> bool { true }

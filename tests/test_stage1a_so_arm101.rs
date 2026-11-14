@@ -40,8 +40,8 @@ fn so_arm101_config() -> ArmConfig {
     c.joint_names = vec!["j1".into(), "j2".into(), "j3".into(), "j4".into(), "j5".into(), "gripper".into()];
     c.limits = (0..6).map(|i| JointLimit {
         name: if i < 5 { format!("j{}", i + 1) } else { "gripper".into() },
-        min_position: -3.14,
-        max_position: 3.14,
+        min_position: -std::f32::consts::PI,
+        max_position: std::f32::consts::PI,
         max_velocity: 1.0,
         max_acceleration: 2.0,
     }).collect();

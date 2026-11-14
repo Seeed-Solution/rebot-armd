@@ -1204,7 +1204,7 @@ impl armd::driver::ArmDriver for UnloadCapabilityDriver {
 async fn unsupported_automatic_unload_rejects_without_motion_but_home_remains_available() {
     use armd::driver::DriverCapabilities;
     let full = DriverCapabilities { velocity_feedback: true, torque_feedback: true,
-        temperature_feedback: true, torque_feedforward: false, enable_feedback: true };
+        temperature_feedback: true, torque_feedforward: false, enable_feedback: true, load_feedback: false };
     for missing in ["velocity", "torque", "enable", "profile"] {
         let (addr, supervisor) = spawn_test_server().await;
         let mut capabilities = full;
@@ -1219,7 +1219,7 @@ async fn unsupported_automatic_unload_rejects_without_motion_but_home_remains_av
             let mut inner = supervisor.inner().write().await;
             inner.config.resting_pose = if missing == "profile" { None } else { Some(armd::model::RestingPosePolicy {
                 position_tolerances: vec![0.08; 2], max_total_deviation: 0.16, max_velocity: 0.015, joint_max_velocities: vec![],
-                support_torque_limits: vec![(1, 1.0)], feedback_max_age_ms: 100,
+                support_torque_limits: vec![(1, 1.0)], support_load_limits: vec![], feedback_max_age_ms: 100,
             }) };
             // Arrange an operational controller with a queued target, so a rejected
             // unload must not secretly cancel or replace an existing command.
@@ -1260,7 +1260,7 @@ async fn unsupported_automatic_unload_rejects_without_motion_but_home_remains_av
     let mut inner = supervisor.inner().write().await;
     inner.config.resting_pose = Some(armd::model::RestingPosePolicy {
         position_tolerances: vec![0.08; 2], max_total_deviation: 0.16, max_velocity: 0.015, joint_max_velocities: vec![],
-        support_torque_limits: vec![(1, 1.0)], feedback_max_age_ms: 100,
+        support_torque_limits: vec![(1, 1.0)], support_load_limits: vec![], feedback_max_age_ms: 100,
     });
     inner.safety.set_torque(true).unwrap();
     inner.is_torqued = true;

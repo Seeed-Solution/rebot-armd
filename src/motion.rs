@@ -488,6 +488,10 @@ pub struct StepCtx<'a> {
     pub commanded: &'a [f32],
     pub commanded_velocities: &'a [f32],
     pub torques: &'a [f32],
+    pub loads: &'a [f32],
+    pub feedback_fresh: bool,
+    pub torque_feedback: bool,
+    pub load_feedback: bool,
     pub gripper_stalled: bool,
     pub gripper_stall_sign: f32,
 }
@@ -606,8 +610,8 @@ impl PathTrajectory {
 #[derive(Debug, Clone, PartialEq)]
 enum GripPhase {
     Moving,
-    /// Squeezing an object: hold target, samples of |τ_gripper|.
-    Squeeze { hold: f32, elapsed: f64, taus: Vec<f32> },
+    /// Squeezing an object: hold target, samples of |τ_gripper| and |load_gripper|.
+    Squeeze { hold: f32, elapsed: f64, taus: Vec<f32>, loads: Vec<f32> },
 }
 
 #[derive(Debug, Clone)]
@@ -670,21 +674,33 @@ impl GripperMotion {
         };
         let done = |holding: Option<bool>, gap: Option<f32>| StepStatus::Done { settled: None, holding, gripper_gap_rad: gap };
 
-        if let GripPhase::Squeeze { hold, elapsed, taus } = &mut self.phase {
+        if let GripPhase::Squeeze { hold, elapsed, taus, loads } = &mut self.phase {
             *elapsed += ctx.dt;
             taus.push(tau_g.abs());
+            loads.push(ctx.loads.get(idx).copied().unwrap_or(0.0).abs());
             if idx < positions.len() { positions[idx] = *hold; }
             let status = if *elapsed * 1000.0 >= self.policy.settle_ms as f64 - 1e-6 {
                 let mut sorted = taus.clone();
                 sorted.sort_by(|a, b| a.total_cmp(b));
                 let tau = sorted[sorted.len() / 2];
+                let mut sorted_loads = loads.clone();
+                sorted_loads.sort_by(|a, b| a.total_cmp(b));
+                let median_abs_load = if sorted_loads.is_empty() { 0.0 } else { sorted_loads[sorted_loads.len() / 2] };
                 let gap = (self.policy.closed_rad - m_g) * self.close_dir();
                 let holding = match self.policy.holding_mode {
-                    HoldingMode::TorqueAndGap => gap >= self.policy.holding_gap_rad && tau >= self.policy.holding_torque_nm,
-                    HoldingMode::PositionGap => gap >= self.policy.holding_gap_rad,
+                    HoldingMode::TorqueAndGap => ctx.torque_feedback && gap >= self.policy.holding_gap_rad && tau >= self.policy.holding_torque_nm,
+                    HoldingMode::PositionGap => {
+                        ctx.feedback_fresh
+                            && (self.moved || (self.start - m_g).abs() < 0.05)
+                            && mv_g.abs() < SETTLE_VEL as f32
+                            && gap >= self.policy.holding_gap_rad
+                    }
                     HoldingMode::LoadAndGap => {
-                        let req = self.policy.holding_load_fraction.unwrap_or(self.policy.holding_torque_nm);
-                        gap >= self.policy.holding_gap_rad && tau >= req
+                        let req = self.policy.holding_load_fraction.unwrap_or(0.15);
+                        ctx.feedback_fresh
+                            && ctx.load_feedback
+                            && gap >= self.policy.holding_gap_rad
+                            && median_abs_load >= req
                     }
                 };
                 done(Some(holding), Some(gap))
@@ -725,7 +741,7 @@ impl GripperMotion {
                     .clamp(self.limit.min_position, self.limit.max_position);
                 if idx < positions.len() { positions[idx] = hold; }
                 if idx < velocities.len() { velocities[idx] = 0.0; }
-                self.phase = GripPhase::Squeeze { hold, elapsed: 0.0, taus: Vec::new() };
+                self.phase = GripPhase::Squeeze { hold, elapsed: 0.0, taus: Vec::new(), loads: Vec::new() };
                 StepStatus::Running
             } else { StepStatus::Running }
         } else if stalled {

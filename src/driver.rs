@@ -7,7 +7,7 @@ use crate::model::JointState;
 use crate::protocol::damiao::{self, DamiaoLimits};
 pub use crate::protocol::damiao::{build_pos_force_frame, DAMIAO_GRIPPER_POSFORCE_VEL_RAW};
 use crate::protocol::fashionstar::{self, FashionStarPacket};
-use crate::protocol::feetech::{self, FeetechPacket};
+use crate::protocol::feetech;
 use crate::protocol::robstride::{self, RobStrideLimits};
 use crate::transport::{CanFrame, CanTransport, Transport, TransportError};
 
@@ -87,6 +87,8 @@ pub struct DriverCapabilities {
     pub temperature_feedback: bool,
     pub torque_feedforward: bool,
     pub enable_feedback: bool,
+    #[serde(default)]
+    pub load_feedback: bool,
 }
 
 /// Universal robotic arm hardware driver trait
@@ -149,6 +151,16 @@ pub trait ArmDriver: Send {
     /// Return per-joint motor status or error code if supported by the driver
     fn motor_status(&self) -> Option<Vec<u8>> {
         None
+    }
+
+    /// Return per-joint load telemetry (normalized fraction in [-1.0, 1.0]) if supported
+    fn joint_loads(&self) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// Decode motor fault/status code into descriptive string
+    fn decode_motor_error(&self, code: u8) -> Option<String> {
+        damiao_fault_name(code).map(str::to_string)
     }
 
     /// Update internal software enabled flag without transmitting physical frames
@@ -231,9 +243,13 @@ pub enum JointMode {
 pub struct FeetechArmDriver<T: Transport> {
     transport: T,
     servo_ids: Vec<u8>,
-    zero_offsets: Vec<u16>,
+    config: feetech::FeetechConfig,
     cached_states: Vec<JointState>,
+    cached_loads: Vec<f32>,
+    motor_status: Vec<u8>,
     last_feedback_instant: Vec<Option<Instant>>,
+    confirmed_enable_state: EnableState,
+    tx_echo: Option<bool>,
     poll_cursor: usize,
     rx_buffer: Vec<u8>,
 }
@@ -241,29 +257,359 @@ pub struct FeetechArmDriver<T: Transport> {
 impl<T: Transport> FeetechArmDriver<T> {
     pub fn new(transport: T, servo_ids: Vec<u8>) -> Self {
         let dof = servo_ids.len();
+        let joints = servo_ids
+            .iter()
+            .map(|&id| feetech::FeetechJointCalib {
+                id,
+                ..Default::default()
+            })
+            .collect();
         Self {
             transport,
             servo_ids,
-            zero_offsets: vec![feetech::DEFAULT_ZERO_OFFSET; dof],
+            config: feetech::FeetechConfig {
+                joints,
+                ..Default::default()
+            },
             cached_states: vec![JointState::default(); dof],
+            cached_loads: vec![0.0; dof],
+            motor_status: vec![0; dof],
             last_feedback_instant: vec![None; dof],
+            confirmed_enable_state: EnableState::Unknown,
+            tx_echo: None,
             poll_cursor: 0,
             rx_buffer: Vec::with_capacity(256),
         }
     }
 
     pub fn with_zero_offsets(mut self, offsets: Vec<u16>) -> Self {
-        self.zero_offsets = offsets;
+        for (i, &offset) in offsets.iter().enumerate() {
+            if i < self.config.joints.len() {
+                self.config.joints[i].zero_step = offset;
+            }
+        }
+        self
+    }
+
+    pub fn with_config(mut self, cfg: feetech::FeetechConfig) -> Self {
+        if cfg.tx_echo.is_some() {
+            self.tx_echo = cfg.tx_echo;
+        }
+        self.config = cfg;
+        if self.config.joints.is_empty() {
+            self.config.joints = self
+                .servo_ids
+                .iter()
+                .map(|&id| feetech::FeetechJointCalib {
+                    id,
+                    ..Default::default()
+                })
+                .collect();
+        }
+        self
+    }
+
+    pub fn with_tx_echo(mut self, tx_echo: Option<bool>) -> Self {
+        self.tx_echo = tx_echo;
+        self
+    }
+
+    pub fn with_port_name(mut self, port: &str) -> Self {
+        if port.starts_with("/dev/ttySC") {
+            self.tx_echo = Some(true);
+        }
         self
     }
 
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
     }
+
+    fn drain_tx_echo(&mut self, tx: &[u8]) -> Result<(), ArmDriverError> {
+        if tx.is_empty() || self.tx_echo == Some(false) {
+            return Ok(());
+        }
+
+        let mut temp = [0u8; 64];
+        let start = Instant::now();
+        const DRAIN_TIMEOUT: Duration = Duration::from_millis(5);
+
+        while self.rx_buffer.len() < tx.len() && start.elapsed() < DRAIN_TIMEOUT {
+            match self.transport.read(&mut temp) {
+                Ok(n) if n > 0 => {
+                    self.rx_buffer.extend_from_slice(&temp[..n]);
+                }
+                _ => {
+                    std::thread::yield_now();
+                }
+            }
+
+            if self.tx_echo.is_none() && !self.rx_buffer.is_empty() && !tx.starts_with(&self.rx_buffer) {
+                self.tx_echo = Some(false);
+                break;
+            }
+        }
+
+        if self.tx_echo == Some(true) {
+            if self.rx_buffer.starts_with(tx) {
+                self.rx_buffer.drain(..tx.len());
+            } else if let Some(pos) = self.rx_buffer.windows(tx.len()).position(|w| w == tx) {
+                self.rx_buffer.drain(..pos + tx.len());
+            }
+        } else if self.tx_echo.is_none() {
+            if self.rx_buffer.starts_with(tx) {
+                self.tx_echo = Some(true);
+                self.rx_buffer.drain(..tx.len());
+            } else if !self.rx_buffer.is_empty() {
+                self.tx_echo = Some(false);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn read_register_u8_direct(&mut self, id: u8, reg: u8) -> Result<u8, ArmDriverError> {
+        let req = feetech::build_read(id, reg, 1);
+        self.transport.write_all(&req)?;
+        self.transport.flush()?;
+        self.drain_tx_echo(&req)?;
+
+        let mut temp = [0u8; 64];
+        let start = Instant::now();
+        const READ_TIMEOUT: Duration = Duration::from_millis(25);
+
+        loop {
+            while !self.rx_buffer.is_empty() {
+                match feetech::parse_response(&self.rx_buffer) {
+                    Ok((pkt, consumed)) => {
+                        self.rx_buffer.drain(..consumed);
+                        if pkt.id == feetech::BROADCAST_ID {
+                            continue;
+                        }
+                        if pkt.id == id && pkt.params.len() == 1 {
+                            return Ok(pkt.params[0]);
+                        }
+                    }
+                    Err(feetech::FeetechError::IncompleteFrame { .. }) => {
+                        break;
+                    }
+                    Err(_) => {
+                        self.rx_buffer.remove(0);
+                    }
+                }
+            }
+
+            if start.elapsed() >= READ_TIMEOUT {
+                break;
+            }
+
+            match self.transport.read(&mut temp) {
+                Ok(n) if n > 0 => {
+                    self.rx_buffer.extend_from_slice(&temp[..n]);
+                }
+                _ => {
+                    std::thread::yield_now();
+                }
+            }
+        }
+
+        Err(ArmDriverError::Timeout(id))
+    }
+
+    fn read_register_u16_direct(&mut self, id: u8, reg: u8) -> Result<u16, ArmDriverError> {
+        let req = feetech::build_read(id, reg, 2);
+        self.transport.write_all(&req)?;
+        self.transport.flush()?;
+        self.drain_tx_echo(&req)?;
+
+        let mut temp = [0u8; 64];
+        let start = Instant::now();
+        const READ_TIMEOUT: Duration = Duration::from_millis(25);
+
+        loop {
+            while !self.rx_buffer.is_empty() {
+                match feetech::parse_response(&self.rx_buffer) {
+                    Ok((pkt, consumed)) => {
+                        self.rx_buffer.drain(..consumed);
+                        if pkt.id == feetech::BROADCAST_ID {
+                            continue;
+                        }
+                        if pkt.id == id && pkt.params.len() == 2 && pkt.error != feetech::INST_READ {
+                            return Ok(u16::from_le_bytes([pkt.params[0], pkt.params[1]]));
+                        }
+                    }
+                    Err(feetech::FeetechError::IncompleteFrame { .. }) => {
+                        break;
+                    }
+                    Err(_) => {
+                        self.rx_buffer.remove(0);
+                    }
+                }
+            }
+
+            if start.elapsed() >= READ_TIMEOUT {
+                break;
+            }
+
+            match self.transport.read(&mut temp) {
+                Ok(n) if n > 0 => {
+                    self.rx_buffer.extend_from_slice(&temp[..n]);
+                }
+                _ => {
+                    std::thread::yield_now();
+                }
+            }
+        }
+
+        Err(ArmDriverError::Timeout(id))
+    }
+
+    fn write_register_u8_direct(&mut self, id: u8, reg: u8, val: u8) -> Result<(), ArmDriverError> {
+        let pkt = feetech::build_write_u8(id, reg, val);
+        self.transport.write_all(&pkt)?;
+        self.transport.flush()?;
+        self.drain_tx_echo(&pkt)?;
+        Ok(())
+    }
+
+    fn write_register_u16_direct(&mut self, id: u8, reg: u8, val: u16) -> Result<(), ArmDriverError> {
+        let pkt = feetech::build_write_u16(id, reg, val);
+        self.transport.write_all(&pkt)?;
+        self.transport.flush()?;
+        self.drain_tx_echo(&pkt)?;
+        Ok(())
+    }
+
+    /// Configure EEPROM and RAM registers for all servos based on `FeetechConfig`.
+    pub fn configure_servos(&mut self) -> Result<(), ArmDriverError> {
+        for joint_idx in 0..self.servo_ids.len() {
+            let id = self.servo_ids[joint_idx];
+            let calib = self.config.joints.get(joint_idx).cloned().unwrap_or(feetech::FeetechJointCalib {
+                id,
+                ..Default::default()
+            });
+
+            // 1. Verify model
+            let model = self.read_register_u16_direct(id, feetech::REG_MODEL_L)?;
+            if model != feetech::EXPECTED_MODEL_STS3215 {
+                return Err(ArmDriverError::Protocol(format!(
+                    "Servo ID {} reported model {}, expected STS3215 ({})",
+                    id, model, feetech::EXPECTED_MODEL_STS3215
+                )));
+            }
+
+            // 2. Torque must be disabled during EEPROM write
+            let torque_en = self.read_register_u8_direct(id, feetech::REG_TORQUE_ENABLE)?;
+            if torque_en != 0 {
+                return Err(ArmDriverError::HardwareFault(
+                    "cannot configure EEPROM while torque is enabled".to_string(),
+                ));
+            }
+
+            // 3. Read current registers
+            let cur_return_delay = self.read_register_u8_direct(id, feetech::REG_RETURN_DELAY)?;
+            let cur_status_level = self.read_register_u8_direct(id, feetech::REG_STATUS_RETURN_LEVEL)?;
+            let cur_min_angle = self.read_register_u16_direct(id, feetech::REG_MIN_ANGLE_LIMIT_L)?;
+            let cur_max_angle = self.read_register_u16_direct(id, feetech::REG_MAX_ANGLE_LIMIT_L)?;
+            let cur_p_coef = self.read_register_u8_direct(id, feetech::REG_P_COEF)?;
+            let cur_d_coef = self.read_register_u8_direct(id, feetech::REG_D_COEF)?;
+            let cur_i_coef = self.read_register_u8_direct(id, feetech::REG_I_COEF)?;
+            let cur_max_torque = self.read_register_u16_direct(id, feetech::REG_MAX_TORQUE_L)?;
+            let cur_prot_current = self.read_register_u16_direct(id, feetech::REG_PROTECTION_CURRENT_L)?;
+            let cur_overload_torque = self.read_register_u8_direct(id, feetech::REG_OVERLOAD_TORQUE)?;
+            let cur_operating_mode = self.read_register_u8_direct(id, feetech::REG_OPERATING_MODE)?;
+
+            // Targets
+            let target_return_delay = self.config.return_delay_raw;
+            let target_status_level = 1u8;
+            let target_min_angle = calib.range_min_steps;
+            let target_max_angle = calib.range_max_steps;
+            let target_p_coef = self.config.p_coef;
+            let target_d_coef = self.config.d_coef;
+            let target_i_coef = self.config.i_coef;
+            let target_max_torque = self.config.max_torque_raw;
+            let target_prot_current = self.config.protection_current_raw;
+            let target_overload_torque = self.config.overload_torque_raw;
+            let target_operating_mode = 0u8;
+
+            let differs = cur_return_delay != target_return_delay
+                || cur_status_level != target_status_level
+                || cur_min_angle != target_min_angle
+                || cur_max_angle != target_max_angle
+                || cur_p_coef != target_p_coef
+                || cur_d_coef != target_d_coef
+                || cur_i_coef != target_i_coef
+                || cur_max_torque != target_max_torque
+                || cur_prot_current != target_prot_current
+                || cur_overload_torque != target_overload_torque
+                || cur_operating_mode != target_operating_mode;
+
+            if differs {
+                // Unlock EEPROM
+                self.write_register_u8_direct(id, feetech::REG_LOCK, 0)?;
+
+                let write_res = (|| -> Result<(), ArmDriverError> {
+                    if cur_return_delay != target_return_delay {
+                        self.write_register_u8_direct(id, feetech::REG_RETURN_DELAY, target_return_delay)?;
+                    }
+                    if cur_status_level != target_status_level {
+                        self.write_register_u8_direct(id, feetech::REG_STATUS_RETURN_LEVEL, target_status_level)?;
+                    }
+                    if cur_min_angle != target_min_angle {
+                        self.write_register_u16_direct(id, feetech::REG_MIN_ANGLE_LIMIT_L, target_min_angle)?;
+                    }
+                    if cur_max_angle != target_max_angle {
+                        self.write_register_u16_direct(id, feetech::REG_MAX_ANGLE_LIMIT_L, target_max_angle)?;
+                    }
+                    if cur_p_coef != target_p_coef {
+                        self.write_register_u8_direct(id, feetech::REG_P_COEF, target_p_coef)?;
+                    }
+                    if cur_d_coef != target_d_coef {
+                        self.write_register_u8_direct(id, feetech::REG_D_COEF, target_d_coef)?;
+                    }
+                    if cur_i_coef != target_i_coef {
+                        self.write_register_u8_direct(id, feetech::REG_I_COEF, target_i_coef)?;
+                    }
+                    if cur_max_torque != target_max_torque {
+                        self.write_register_u16_direct(id, feetech::REG_MAX_TORQUE_L, target_max_torque)?;
+                    }
+                    if cur_prot_current != target_prot_current {
+                        self.write_register_u16_direct(id, feetech::REG_PROTECTION_CURRENT_L, target_prot_current)?;
+                    }
+                    if cur_overload_torque != target_overload_torque {
+                        self.write_register_u8_direct(id, feetech::REG_OVERLOAD_TORQUE, target_overload_torque)?;
+                    }
+                    if cur_operating_mode != target_operating_mode {
+                        self.write_register_u8_direct(id, feetech::REG_OPERATING_MODE, target_operating_mode)?;
+                    }
+                    Ok(())
+                })();
+
+                // ALWAYS lock EEPROM before returning
+                let lock_res = self.write_register_u8_direct(id, feetech::REG_LOCK, 1);
+                write_res?;
+                lock_res?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
-    fn capabilities(&self) -> DriverCapabilities { DriverCapabilities { velocity_feedback: true, temperature_feedback: true, ..DriverCapabilities::default() } }
+    fn capabilities(&self) -> DriverCapabilities {
+        DriverCapabilities {
+            velocity_feedback: true,
+            torque_feedback: false,
+            temperature_feedback: true,
+            torque_feedforward: false,
+            enable_feedback: true,
+            load_feedback: true,
+        }
+    }
+
+    fn enable_state(&self) -> EnableState {
+        self.confirmed_enable_state
+    }
 
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()
@@ -279,29 +625,107 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             .all(|opt| opt.is_some_and(|instant| instant.elapsed() <= FRESHNESS_LIMIT))
     }
 
+    fn is_enabled(&self) -> bool {
+        self.confirmed_enable_state == EnableState::Enabled && self.is_feedback_valid()
+    }
+
+    fn motor_status(&self) -> Option<Vec<u8>> {
+        Some(self.motor_status.clone())
+    }
+
+    fn joint_loads(&self) -> Option<Vec<f32>> {
+        Some(self.cached_loads.clone())
+    }
+
+    fn decode_motor_error(&self, code: u8) -> Option<String> {
+        feetech::feetech_error_name(code)
+    }
+
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
-        if !enabled {
-            let mut last_err = None;
-            for &id in &self.servo_ids {
-                let pkt = feetech::build_set_torque(id, false);
-                if let Err(e) = self.transport.write_all(&pkt) {
-                    last_err = Some(e.into());
-                }
-            }
-            if let Err(e) = self.transport.flush() {
-                last_err = Some(e.into());
-            }
-            if let Some(e) = last_err {
-                return Err(e);
-            }
-            Ok(())
-        } else {
-            for &id in &self.servo_ids {
+        let ids = self.servo_ids.clone();
+        if enabled {
+            for &id in &ids {
                 let pkt = feetech::build_set_torque(id, true);
                 self.transport.write_all(&pkt)?;
+                self.transport.flush()?;
+                self.drain_tx_echo(&pkt)?;
             }
-            self.transport.flush()?;
-            Ok(())
+
+            let mut all_enabled = true;
+            let mut read_errors = Vec::new();
+            let mut zero_count = 0;
+
+            for &id in &ids {
+                match self.read_register_u8_direct(id, feetech::REG_TORQUE_ENABLE) {
+                    Ok(1) => {}
+                    Ok(0) => {
+                        all_enabled = false;
+                        zero_count += 1;
+                        read_errors.push(format!("servo {} returned 0", id));
+                    }
+                    Ok(v) => {
+                        all_enabled = false;
+                        read_errors.push(format!("servo {} returned unexpected value {}", id, v));
+                    }
+                    Err(e) => {
+                        all_enabled = false;
+                        read_errors.push(format!("servo {} read failed: {}", id, e));
+                    }
+                }
+            }
+
+            if all_enabled {
+                self.confirmed_enable_state = EnableState::Enabled;
+                Ok(())
+            } else {
+                if zero_count == ids.len() {
+                    self.confirmed_enable_state = EnableState::Disabled;
+                } else {
+                    self.confirmed_enable_state = EnableState::Unknown;
+                }
+                for &id in &ids {
+                    let pkt = feetech::build_set_torque(id, false);
+                    let _ = self.transport.write_all(&pkt);
+                    let _ = self.transport.flush();
+                    let _ = self.drain_tx_echo(&pkt);
+                }
+                Err(ArmDriverError::HardwareFault(format!(
+                    "Torque enable readback failed: {}",
+                    read_errors.join("; ")
+                )))
+            }
+        } else {
+            let mut write_err = None;
+            for &id in &ids {
+                let pkt = feetech::build_set_torque(id, false);
+                if let Err(e) = self.transport.write_all(&pkt) {
+                    write_err = Some(e.into());
+                }
+                let _ = self.transport.flush();
+                let _ = self.drain_tx_echo(&pkt);
+            }
+
+            let mut all_disabled = true;
+            for &id in &ids {
+                match self.read_register_u8_direct(id, feetech::REG_TORQUE_ENABLE) {
+                    Ok(0) => {}
+                    _ => {
+                        all_disabled = false;
+                    }
+                }
+            }
+
+            if all_disabled {
+                self.confirmed_enable_state = EnableState::Disabled;
+            } else {
+                self.confirmed_enable_state = EnableState::Unknown;
+            }
+
+            if let Some(e) = write_err {
+                Err(e)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -314,8 +738,10 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         }
 
         let mut positions = Vec::with_capacity(targets.len());
+        let default_calib = feetech::FeetechJointCalib::default();
         for (i, target) in targets.iter().enumerate() {
-            let raw_steps = feetech::rad_to_steps(target.position, self.zero_offsets[i]);
+            let calib = self.config.joints.get(i).unwrap_or(&default_calib);
+            let raw_steps = calib.rad_to_steps(target.position);
             positions.push((self.servo_ids[i], raw_steps));
         }
 
@@ -324,6 +750,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
 
         self.transport.write_all(&sync_pkt)?;
         self.transport.flush()?;
+        self.drain_tx_echo(&sync_pkt)?;
         Ok(())
     }
 
@@ -333,85 +760,96 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             return Ok(Vec::new());
         }
 
-        let mut temp_chunk = [0u8; 64];
+        const MAX_SYNC_READ_SERVOS: usize = 3;
+        const MAX_READ_DURATION: Duration = Duration::from_millis(8);
         let start_time = Instant::now();
-        const MAX_READ_DURATION: Duration = Duration::from_millis(3);
-        const MAX_TOTAL_BYTES: usize = 256;
-        let mut total_bytes_read = 0;
-        let start_cursor = self.poll_cursor;
+        let mut temp_chunk = [0u8; 64];
 
-        'poll: for offset in 0..dof {
-            let joint_idx = (start_cursor + offset) % dof;
-            let id = self.servo_ids[joint_idx];
+        let chunks: Vec<Vec<u8>> = self.servo_ids.chunks(MAX_SYNC_READ_SERVOS).map(|c| c.to_vec()).collect();
+        let num_chunks = chunks.len();
+        let start_chunk = self.poll_cursor % num_chunks;
+        let default_calib = feetech::FeetechJointCalib::default();
 
-            if start_time.elapsed() >= MAX_READ_DURATION || total_bytes_read >= MAX_TOTAL_BYTES {
-                self.poll_cursor = joint_idx;
-                break 'poll;
+        'chunk_loop: for offset in 0..num_chunks {
+            let chunk_idx = (start_chunk + offset) % num_chunks;
+            let chunk = &chunks[chunk_idx];
+
+            if start_time.elapsed() >= MAX_READ_DURATION {
+                self.poll_cursor = chunk_idx;
+                break 'chunk_loop;
             }
 
-            // Read present position, speed, load, voltage, temp (start 0x38, len 8)
-            let read_req = feetech::build_read(id, feetech::REG_PRESENT_POSITION, 8);
-            self.transport.write_all(&read_req)?;
-            self.transport.flush()?;
+            let sync_read = feetech::build_sync_read(chunk, feetech::REG_PRESENT_POSITION_L, 8)
+                .map_err(|e| ArmDriverError::Protocol(e.to_string()))?;
 
-            // Attempt to parse response from rx_buffer, reading more if needed
-            let mut attempts = 0;
-            while attempts < 10 {
-                if start_time.elapsed() >= MAX_READ_DURATION || total_bytes_read >= MAX_TOTAL_BYTES {
-                    self.poll_cursor = (joint_idx + 1) % dof;
-                    break 'poll;
+            self.transport.write_all(&sync_read)?;
+            self.transport.flush()?;
+            self.drain_tx_echo(&sync_read)?;
+
+            let expected_ids: std::collections::HashSet<u8> = chunk.iter().copied().collect();
+            let mut replied_ids = std::collections::HashSet::new();
+            let chunk_start = Instant::now();
+            const CHUNK_TIMEOUT: Duration = Duration::from_millis(4);
+
+            while replied_ids.len() < chunk.len() && chunk_start.elapsed() < CHUNK_TIMEOUT && start_time.elapsed() < MAX_READ_DURATION {
+                match self.transport.read(&mut temp_chunk) {
+                    Ok(n) if n > 0 => {
+                        self.rx_buffer.extend_from_slice(&temp_chunk[..n]);
+                    }
+                    _ => {}
                 }
 
-                match feetech::parse_response(&self.rx_buffer) {
-                    Ok((FeetechPacket { id: pkt_id, params, .. }, consumed)) => {
-                        self.rx_buffer.drain(..consumed);
-                        if pkt_id == id && params.len() >= 8 {
-                            let pos_raw = u16::from_le_bytes([params[0], params[1]]);
-                            let speed_raw = i16::from_le_bytes([params[2], params[3]]);
-                            let load_raw = u16::from_le_bytes([params[4], params[5]]);
-                            let temp_raw = params[7];
+                while !self.rx_buffer.is_empty() {
+                    match feetech::parse_response(&self.rx_buffer) {
+                        Ok((pkt, consumed)) => {
+                            self.rx_buffer.drain(..consumed);
+                            if pkt.id == feetech::BROADCAST_ID {
+                                continue;
+                            }
+                            if let Some(joint_idx) = self.servo_ids.iter().position(|&id| id == pkt.id) {
+                                if pkt.params.len() == 8 {
+                                    let pos_raw = u16::from_le_bytes([pkt.params[0], pkt.params[1]]);
+                                    let speed_raw = u16::from_le_bytes([pkt.params[2], pkt.params[3]]);
+                                    let load_raw = u16::from_le_bytes([pkt.params[4], pkt.params[5]]);
+                                    let temp_raw = pkt.params[7];
 
-                            self.cached_states[joint_idx] = JointState {
-                                position: feetech::steps_to_rad(pos_raw, self.zero_offsets[joint_idx]),
-                                velocity: feetech::raw_speed_to_rad_s(speed_raw),
-                                torque: feetech::raw_load_to_torque(load_raw),
-                                temperature: feetech::raw_to_temperature(temp_raw),
-                            };
-                            self.last_feedback_instant[joint_idx] = Some(Instant::now());
+                                    let calib = self.config.joints.get(joint_idx).unwrap_or(&default_calib);
+                                    self.cached_states[joint_idx] = JointState {
+                                        position: calib.steps_to_rad(pos_raw),
+                                        velocity: feetech::raw_speed_to_rad_s(speed_raw),
+                                        torque: 0.0,
+                                        temperature: feetech::raw_to_temperature(temp_raw),
+                                    };
+                                    self.cached_loads[joint_idx] = feetech::raw_load_to_fraction(load_raw);
+                                    self.motor_status[joint_idx] = pkt.error;
+                                    self.last_feedback_instant[joint_idx] = Some(Instant::now());
+
+                                    if expected_ids.contains(&pkt.id) {
+                                        replied_ids.insert(pkt.id);
+                                    }
+                                }
+                            }
+                        }
+                        Err(feetech::FeetechError::IncompleteFrame { .. }) => {
                             break;
                         }
-                    }
-                    Err(feetech::FeetechError::IncompleteFrame { .. }) => {
-                        // Incomplete frame; read more bytes from transport
-                    }
-                    Err(_) => {
-                        // Checksum mismatch or corruption: slide window by 1 byte to recover
-                        if !self.rx_buffer.is_empty() {
+                        Err(_) => {
                             self.rx_buffer.remove(0);
                         }
                     }
                 }
 
-                // Bound buffer size to prevent memory leaks / lockups
-                if self.rx_buffer.len() > 1024 {
-                    let trim = self.rx_buffer.len() - 256;
-                    self.rx_buffer.drain(..trim);
-                }
-
-                // Read more data into rx_buffer
-                match self.transport.read(&mut temp_chunk) {
-                    Ok(n) if n > 0 => {
-                        total_bytes_read += n;
-                        self.rx_buffer.extend_from_slice(&temp_chunk[..n]);
-                    }
-                    _ => {
-                        attempts += 1;
-                        if attempts >= 3 {
-                            break;
-                        }
-                    }
+                if replied_ids.len() < chunk.len() {
+                    std::thread::yield_now();
                 }
             }
+
+            self.poll_cursor = (chunk_idx + 1) % num_chunks;
+        }
+
+        if self.rx_buffer.len() > 1024 {
+            let trim = self.rx_buffer.len() - 256;
+            self.rx_buffer.drain(..trim);
         }
 
         Ok(self.cached_states.clone())
@@ -967,6 +1405,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             temperature_feedback: true,
             torque_feedforward: self.control_mode == DamiaoControlMode::Mit,
             enable_feedback: true,
+            load_feedback: false,
         }
     }
 
@@ -1575,7 +2014,7 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
 }
 
 impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
-    fn capabilities(&self) -> DriverCapabilities { DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: true, enable_feedback: false } }
+    fn capabilities(&self) -> DriverCapabilities { DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: true, enable_feedback: false, load_feedback: false } }
 
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         self.last_feedback_instant.iter().map(|t| t.map(|t| t.elapsed())).collect()

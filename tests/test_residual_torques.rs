@@ -14,7 +14,7 @@ impl ArmDriver for Driver {
     fn capabilities(&self) -> DriverCapabilities {
         // No torque feed-forward: gravity output stays off, the model still runs.
         DriverCapabilities { velocity_feedback: true, torque_feedback: self.torque_feedback, temperature_feedback: true,
-            torque_feedforward: false, enable_feedback: true }
+            torque_feedforward: false, enable_feedback: true, load_feedback: false }
     }
     fn enable_state(&self) -> EnableState { EnableState::Disabled }
     fn is_feedback_valid(&self) -> bool { true }

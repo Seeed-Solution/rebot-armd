@@ -1,0 +1,662 @@
+use std::f32::consts::PI;
+use std::time::Duration;
+
+use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, FeetechArmDriver, JointTarget};
+use armd::model::{ArmConfig, GripperPolicy, HoldingMode, JointLimit, JointState, RestingPosePolicy};
+use armd::motion::{GripperCommand, GripperMotion, GripperRequest, StepCtx, StepStatus};
+use armd::protocol::feetech::{
+    self, calculate_checksum, decode_sign_magnitude, encode_sign_magnitude, feetech_error_name,
+    raw_load_to_fraction, raw_speed_to_rad_s, INST_SYNC_READ, INST_WRITE, REG_D_COEF,
+    REG_I_COEF, REG_LOCK, REG_MAX_ANGLE_LIMIT_L, REG_MAX_TORQUE_L, REG_MIN_ANGLE_LIMIT_L,
+    REG_OPERATING_MODE, REG_OVERLOAD_TORQUE, REG_PRESENT_POSITION_L, REG_PROTECTION_CURRENT_L,
+    REG_P_COEF, REG_RETURN_DELAY, REG_STATUS_RETURN_LEVEL, REG_TORQUE_ENABLE,
+    STEPS_PER_REVOLUTION,
+};
+use armd::supervisor::ArmSupervisor;
+use armd::transport::{MockTransport, SerialTransportConfig};
+
+// -------------------------------------------------------------------------
+// 1. Sign-magnitude velocity & homing offset conversions
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_sign_magnitude_velocity() {
+    // 0 and negative-0 must decode to 0.0 rad/s
+    assert_eq!(raw_speed_to_rad_s(0x0000), 0.0);
+    assert_eq!(raw_speed_to_rad_s(0x8000), 0.0);
+
+    let step_rad = (2.0 * PI) / STEPS_PER_REVOLUTION;
+    // 1 step/sec positive
+    assert!((raw_speed_to_rad_s(0x0001) - step_rad).abs() < 1e-6);
+    // 1 step/sec negative (bit 15 set)
+    assert!((raw_speed_to_rad_s(0x8001) - (-step_rad)).abs() < 1e-6);
+
+    // 100 steps/sec
+    assert!((raw_speed_to_rad_s(100) - (100.0 * step_rad)).abs() < 1e-5);
+    assert!((raw_speed_to_rad_s(0x8000 | 100) - (-100.0 * step_rad)).abs() < 1e-5);
+
+    // General sign-magnitude encoding/decoding helper
+    assert_eq!(encode_sign_magnitude(100, 0x8000), 100);
+    assert_eq!(encode_sign_magnitude(-100, 0x8000), 0x8064);
+    assert_eq!(decode_sign_magnitude(0x8064, 0x8000), -100);
+    assert_eq!(decode_sign_magnitude(100, 0x8000), 100);
+
+    // Homing offset with sign_bit = 0x0800 (bit 11)
+    assert_eq!(encode_sign_magnitude(50, 0x0800), 50);
+    assert_eq!(encode_sign_magnitude(-50, 0x0800), 0x0800 | 50);
+    assert_eq!(decode_sign_magnitude(0x0800 | 50, 0x0800), -50);
+}
+
+// -------------------------------------------------------------------------
+// 2. Load fraction and error name decoding
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_load_fraction_and_error_names() {
+    assert_eq!(raw_load_to_fraction(0), 0.0);
+    // CCW / positive direction (bit 10 is 0)
+    assert!((raw_load_to_fraction(500) - 0.5).abs() < 1e-5);
+    // CW / negative direction (bit 10 is 1)
+    assert!((raw_load_to_fraction(0x0400 | 500) - (-0.5)).abs() < 1e-5);
+    // Clamping to 1000 / 1.0 (bits 0..=9 clamped to 1000)
+    assert_eq!(raw_load_to_fraction(1000), 1.0);
+    assert_eq!(raw_load_to_fraction(0x0400 | 1000), -1.0);
+
+    // Status / error decoding
+    assert_eq!(feetech_error_name(0x00), None);
+    assert_eq!(feetech_error_name(0x01), Some("Voltage".to_string()));
+    assert_eq!(feetech_error_name(0x02), Some("Sensor".to_string()));
+    assert_eq!(feetech_error_name(0x04), Some("Overtemperature".to_string()));
+    assert_eq!(feetech_error_name(0x08), Some("Overcurrent".to_string()));
+    assert_eq!(feetech_error_name(0x20), Some("Overload".to_string()));
+    assert_eq!(feetech_error_name(0x05), Some("Voltage | Overtemperature".to_string()));
+    assert_eq!(feetech_error_name(0x24), Some("Overtemperature | Overload".to_string()));
+    assert_eq!(feetech_error_name(0x40), Some("Error(0x40)".to_string()));
+}
+
+// -------------------------------------------------------------------------
+// 3. Serial RS-485 auto-probe and config
+// -------------------------------------------------------------------------
+#[test]
+fn test_serial_transport_rs485_config() {
+    assert!(SerialTransportConfig::default().port.is_empty());
+    let cfg_sc = SerialTransportConfig {
+        port: "/dev/ttySC0".to_string(),
+        baud_rate: 1_000_000,
+        timeout: Duration::from_millis(10),
+        low_latency_1ms: true,
+        rs485_rts_on_send: None,
+    };
+    // None defaults cleanly for /dev/ttySC*
+    assert_eq!(cfg_sc.rs485_rts_on_send, None);
+    assert!(cfg_sc.port.starts_with("/dev/ttySC"));
+}
+
+// -------------------------------------------------------------------------
+// 4. FeetechArmDriver TX echo stripping (SC16IS752 half-duplex transceiver)
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_tx_echo_drain() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids).with_tx_echo(Some(true));
+
+    // Prepare response: TX packet echoed first, followed by RX response
+    let pkt_write = feetech::build_set_torque(1, true);
+    let params = [1u8];
+    let len = (params.len() + 2) as u8;
+    let cs = calculate_checksum(1, len, 0x00, &params);
+    let pkt_read_resp = vec![0xFF, 0xFF, 1, len, 0x00, 1, cs];
+
+    let mut stream = Vec::new();
+    // 1. Echo of write command
+    stream.extend_from_slice(&pkt_write);
+    // 2. Read command will be sent by set_torque -> echo of read command
+    let pkt_read_cmd = feetech::build_read(1, REG_TORQUE_ENABLE, 1);
+    stream.extend_from_slice(&pkt_read_cmd);
+    // 3. Real response to read command
+    stream.extend_from_slice(&pkt_read_resp);
+
+    driver.transport_mut().provide_rx(&stream);
+    driver.set_torque(true).unwrap();
+    assert_eq!(driver.enable_state(), EnableState::Enabled);
+}
+
+// -------------------------------------------------------------------------
+// 5. Readback-verified set_torque enable, rollback on failure, and disable
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_torque_enable_rollback() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1, 2];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+
+    // Servo 1 reports 1 (enabled), Servo 2 fails (reports 0)
+    let cs1 = calculate_checksum(1, 3, 0x00, &[1]);
+    let resp1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs1];
+    let cs2 = calculate_checksum(2, 3, 0x00, &[0]);
+    let resp2 = vec![0xFF, 0xFF, 2, 3, 0x00, 0, cs2];
+
+    let mut rx = Vec::new();
+    rx.extend_from_slice(&resp1);
+    rx.extend_from_slice(&resp2);
+    driver.transport_mut().provide_rx(&rx);
+
+    let res = driver.set_torque(true);
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(matches!(err, ArmDriverError::HardwareFault(_)));
+
+    // Verify rollback: driver wrote disable packets (REG_TORQUE_ENABLE = 0)
+    let tx = driver.transport_mut().take_tx();
+    // Enable writes (2*8=16) + Readback reads (2*8=16) + Rollback writes (2*8=16) = 48 bytes
+    assert_eq!(tx.len(), 48);
+    // Rollback write to servo 1 at offset 32: [0xFF, 0xFF, 1, 4, 3, 0x28, 0, cs]
+    assert_eq!(tx[32 + 2], 1); // ID 1
+    assert_eq!(tx[32 + 4], INST_WRITE);
+    assert_eq!(tx[32 + 5], REG_TORQUE_ENABLE);
+    assert_eq!(tx[32 + 6], 0); // Torque disable
+}
+
+// -------------------------------------------------------------------------
+// 6. SYNC_READ 3-servo chunking for 6-DOF arm
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_sync_read_chunking_6dof() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1, 2, 3, 4, 5, 6];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+
+    // Provide responses for Chunk 0 (servos 1, 2, 3)
+    let mut rx = Vec::new();
+    for id in 1..=3 {
+        let pos = 2048u16.to_le_bytes();
+        let spd = 0u16.to_le_bytes();
+        let load = 200u16.to_le_bytes();
+        let params = [pos[0], pos[1], spd[0], spd[1], load[0], load[1], 75, 40];
+        let cs = calculate_checksum(id, (params.len() + 2) as u8, 0x00, &params);
+        rx.extend_from_slice(&[0xFF, 0xFF, id, (params.len() + 2) as u8, 0x00]);
+        rx.extend_from_slice(&params);
+        rx.push(cs);
+    }
+    driver.transport_mut().provide_rx(&rx);
+
+    let states = driver.read_joint_states().unwrap();
+    assert_eq!(states.len(), 6);
+    // Servos 1..3 should have valid feedback
+    assert!((states[0].position - 0.0).abs() < 1e-4);
+    let loads = driver.joint_loads().unwrap();
+    assert!((loads[0] - 0.2).abs() < 1e-4);
+
+    // Verify SYNC_READ packet structure sent
+    let tx = driver.transport_mut().take_tx();
+    assert!(!tx.is_empty());
+    assert_eq!(tx[4], INST_SYNC_READ);
+    assert_eq!(tx[5], REG_PRESENT_POSITION_L);
+    assert_eq!(tx[6], 8); // 8 bytes requested per servo
+    assert_eq!(tx[7], 1); // Servo 1
+    assert_eq!(tx[8], 2); // Servo 2
+    assert_eq!(tx[9], 3); // Servo 3
+}
+
+// -------------------------------------------------------------------------
+// 7. configure_servos: compare, unlock, write, lock
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_configure_servos() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids.clone());
+
+    // Provide EEPROM read responses: first model (STS3215 = 777), then default return delay = 250
+    // (differs from target 0) and other registers matching defaults
+    let mut rx = Vec::new();
+    let model_bytes = 777u16.to_le_bytes();
+    let model_len = (model_bytes.len() + 2) as u8;
+    let model_cs = calculate_checksum(1, model_len, 0x00, &model_bytes);
+    rx.extend_from_slice(&[0xFF, 0xFF, 1, model_len, 0x00]);
+    rx.extend_from_slice(&model_bytes);
+    rx.push(model_cs);
+
+    // Torque enable check (must be 0)
+    let torq_cs = calculate_checksum(1, 3, 0x00, &[0]);
+    rx.extend_from_slice(&[0xFF, 0xFF, 1, 3, 0x00, 0, torq_cs]);
+
+    let addrs_and_vals: &[(u8, u16)] = &[
+        (REG_RETURN_DELAY, 250),
+        (REG_STATUS_RETURN_LEVEL, 1),
+        (REG_MIN_ANGLE_LIMIT_L, 0),
+        (REG_MAX_ANGLE_LIMIT_L, 4095),
+        (REG_P_COEF, 16),
+        (REG_D_COEF, 32),
+        (REG_I_COEF, 0),
+        (REG_MAX_TORQUE_L, 1000),
+        (REG_PROTECTION_CURRENT_L, 500),
+        (REG_OVERLOAD_TORQUE, 25),
+        (REG_OPERATING_MODE, 0),
+    ];
+    for &(addr, val) in addrs_and_vals {
+        let is_16 = addr == REG_MIN_ANGLE_LIMIT_L
+            || addr == REG_MAX_ANGLE_LIMIT_L
+            || addr == REG_MAX_TORQUE_L
+            || addr == REG_PROTECTION_CURRENT_L;
+        let params: Vec<u8> = if is_16 {
+            val.to_le_bytes().to_vec()
+        } else {
+            vec![val as u8]
+        };
+        let len = (params.len() + 2) as u8;
+        let cs = calculate_checksum(1, len, 0x00, &params);
+        rx.extend_from_slice(&[0xFF, 0xFF, 1, len, 0x00]);
+        rx.extend_from_slice(&params);
+        rx.push(cs);
+    }
+    driver.transport_mut().provide_rx(&rx);
+
+    driver.configure_servos().unwrap();
+
+    let tx = driver.transport_mut().take_tx();
+    // Verify that EEPROM was unlocked with REG_LOCK = 0, then REG_RETURN_DELAY written with 0,
+    // and finally EEPROM was locked with REG_LOCK = 1
+    assert!(!tx.is_empty());
+    let mut lock_writes = Vec::new();
+    for window in tx.windows(8) {
+        if window[0] == 0xFF && window[1] == 0xFF && window[2] == 1 && window[4] == INST_WRITE && window[5] == REG_LOCK {
+            lock_writes.push(window[6]);
+        }
+    }
+    assert_eq!(lock_writes, vec![0, 1]); // Unlocked (0), then Locked (1)
+}
+
+// -------------------------------------------------------------------------
+// 8. GripperMotion torque-less holding detection (PositionGap)
+// -------------------------------------------------------------------------
+#[test]
+fn test_gripper_motion_torque_less_holding() {
+    let req = GripperRequest {
+        command: GripperCommand::Close,
+        fraction: None,
+        grasp: true,
+        speed: 1.0,
+        timeout_s: Some(5.0),
+        tag: None,
+    };
+    let mut policy = GripperPolicy::rebot_dm();
+    policy.closed_rad = 0.0;
+    policy.open_rad = 1.0;
+    policy.holding_mode = HoldingMode::PositionGap;
+    policy.holding_gap_rad = 0.05;
+
+    let limit = JointLimit::new("gripper", -0.2, 1.5, 2.0, 5.0);
+    let mut motion = GripperMotion::new(req, policy, limit, 1.0, 6);
+
+    let measured = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.10]; // Jaw stopped at 0.10 rad
+    let measured_v = [0.0; 7];
+    let commanded = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]; // Commanded into 0.0 -> gap 0.10 rad > 0.05
+    let commanded_v = [0.0; 7];
+    let torques = [0.0; 7];
+    let loads = [0.0; 7];
+
+    let ctx = StepCtx {
+        dt: 0.02,
+        time_scale: 1.0,
+        measured: &measured,
+        measured_velocities: &measured_v,
+        commanded: &commanded,
+        commanded_velocities: &commanded_v,
+        torques: &torques,
+        loads: &loads,
+        feedback_fresh: true,
+        torque_feedback: false, // Feetech torque-less
+        load_feedback: false,
+        gripper_stalled: false,
+        gripper_stall_sign: 1.0,
+    };
+
+    // Squeeze takes settled ticks to declare holding
+    let mut status = StepStatus::Running;
+    for _ in 0..100 {
+        let out = motion.step(&ctx);
+        status = out.status;
+        if status != StepStatus::Running {
+            break;
+        }
+    }
+    assert_eq!(
+        status,
+        StepStatus::Done {
+            settled: None,
+            holding: Some(true),
+            gripper_gap_rad: Some(0.10),
+        }
+    );
+}
+
+// -------------------------------------------------------------------------
+// 9. Supervisor automatic unload support with load feedback
+// -------------------------------------------------------------------------
+#[tokio::test]
+async fn test_supervisor_automatic_unload_with_load_feedback() {
+    struct FeetechTestDriver;
+    impl ArmDriver for FeetechTestDriver {
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: false,
+                temperature_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: true,
+            }
+        }
+        fn enable_state(&self) -> EnableState { EnableState::Enabled }
+        fn is_feedback_valid(&self) -> bool { true }
+        fn feedback_ages(&self) -> Vec<Option<Duration>> { vec![Some(Duration::ZERO); 2] }
+        fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+            Ok(vec![JointState::default(), JointState::default()])
+        }
+        fn write_joint_targets(&mut self, _: &[JointTarget]) -> Result<(), ArmDriverError> { Ok(()) }
+        fn set_torque(&mut self, _: bool) -> Result<(), ArmDriverError> { Ok(()) }
+    }
+
+    let mut config = ArmConfig::default();
+    config.dof = 2;
+    config.limits = vec![
+        JointLimit::new("j1", -3.0, 3.0, 2.0, 5.0),
+        JointLimit::new("j2", -3.0, 3.0, 2.0, 5.0),
+    ];
+    config.home_positions = vec![0.0, 0.0];
+    // Policy with support_load_limits (no torque limits)
+    config.resting_pose = Some(RestingPosePolicy {
+        position_tolerances: vec![0.08, 0.08],
+        max_total_deviation: 0.16,
+        max_velocity: 0.015,
+        joint_max_velocities: vec![],
+        support_torque_limits: vec![],
+        support_load_limits: vec![(0, 0.5)],
+        feedback_max_age_ms: 100,
+    });
+
+    let supervisor = ArmSupervisor::new(config).with_driver(Box::new(FeetechTestDriver));
+    assert!(supervisor.inner().read().await.supports_automatic_unload());
+}
+
+// -------------------------------------------------------------------------
+// 10. configure_servos refuses when torque enabled, and zero writes on match
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_configure_servos_torque_enabled_refuses() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+
+    let mut rx = Vec::new();
+    let model_bytes = 777u16.to_le_bytes();
+    let model_len = (model_bytes.len() + 2) as u8;
+    let model_cs = calculate_checksum(1, model_len, 0x00, &model_bytes);
+    rx.extend_from_slice(&[0xFF, 0xFF, 1, model_len, 0x00]);
+    rx.extend_from_slice(&model_bytes);
+    rx.push(model_cs);
+
+    // REG_TORQUE_ENABLE = 1
+    let torq_cs = calculate_checksum(1, 3, 0x00, &[1]);
+    rx.extend_from_slice(&[0xFF, 0xFF, 1, 3, 0x00, 1, torq_cs]);
+    driver.transport_mut().provide_rx(&rx);
+
+    let res = driver.configure_servos();
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(matches!(err, ArmDriverError::HardwareFault(_)));
+
+    let tx = driver.transport_mut().take_tx();
+    for window in tx.windows(8) {
+        if window[0] == 0xFF && window[1] == 0xFF && window[4] == INST_WRITE {
+            panic!("no write commands allowed when torque enabled check fails");
+        }
+    }
+}
+
+#[test]
+fn test_feetech_configure_servos_already_matching_zero_writes() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+
+    let mut rx = Vec::new();
+    let model_bytes = 777u16.to_le_bytes();
+    let model_len = (model_bytes.len() + 2) as u8;
+    let model_cs = calculate_checksum(1, model_len, 0x00, &model_bytes);
+    rx.extend_from_slice(&[0xFF, 0xFF, 1, model_len, 0x00]);
+    rx.extend_from_slice(&model_bytes);
+    rx.push(model_cs);
+
+    let torq_cs = calculate_checksum(1, 3, 0x00, &[0]);
+    rx.extend_from_slice(&[0xFF, 0xFF, 1, 3, 0x00, 0, torq_cs]);
+
+    let addrs_and_vals: &[(u8, u16)] = &[
+        (REG_RETURN_DELAY, 0),
+        (REG_STATUS_RETURN_LEVEL, 1),
+        (REG_MIN_ANGLE_LIMIT_L, 0),
+        (REG_MAX_ANGLE_LIMIT_L, 4095),
+        (REG_P_COEF, 16),
+        (REG_D_COEF, 32),
+        (REG_I_COEF, 0),
+        (REG_MAX_TORQUE_L, 1000),
+        (REG_PROTECTION_CURRENT_L, 500),
+        (REG_OVERLOAD_TORQUE, 25),
+        (REG_OPERATING_MODE, 0),
+    ];
+    for &(addr, val) in addrs_and_vals {
+        let is_16 = addr == REG_MIN_ANGLE_LIMIT_L
+            || addr == REG_MAX_ANGLE_LIMIT_L
+            || addr == REG_MAX_TORQUE_L
+            || addr == REG_PROTECTION_CURRENT_L;
+        let params: Vec<u8> = if is_16 {
+            val.to_le_bytes().to_vec()
+        } else {
+            vec![val as u8]
+        };
+        let len = (params.len() + 2) as u8;
+        let cs = calculate_checksum(1, len, 0x00, &params);
+        rx.extend_from_slice(&[0xFF, 0xFF, 1, len, 0x00]);
+        rx.extend_from_slice(&params);
+        rx.push(cs);
+    }
+    driver.transport_mut().provide_rx(&rx);
+
+    driver.configure_servos().unwrap();
+
+    let tx = driver.transport_mut().take_tx();
+    for window in tx.windows(8) {
+        if window[0] == 0xFF && window[1] == 0xFF && window[4] == INST_WRITE {
+            panic!("no write commands allowed when registers already match");
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
+// 11. LoadAndGap holding detection (succeeds and fails based on load)
+// -------------------------------------------------------------------------
+#[test]
+fn test_gripper_motion_load_and_gap_holding() {
+    let req = GripperRequest {
+        command: GripperCommand::Close,
+        fraction: None,
+        grasp: true,
+        speed: 1.0,
+        timeout_s: Some(5.0),
+        tag: None,
+    };
+    let mut policy = GripperPolicy::rebot_dm();
+    policy.closed_rad = 0.0;
+    policy.open_rad = 1.0;
+    policy.holding_mode = HoldingMode::LoadAndGap;
+    policy.holding_gap_rad = 0.05;
+    policy.holding_load_fraction = Some(0.30);
+
+    let limit = JointLimit::new("gripper", -0.2, 1.5, 2.0, 5.0);
+
+    // Case A: High load (0.40 >= 0.30) with sufficient gap (0.10 >= 0.05) -> holding: Some(true)
+    {
+        let mut motion = GripperMotion::new(req.clone(), policy.clone(), limit.clone(), 1.0, 6);
+        let measured = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.10];
+        let measured_v = [0.0; 7];
+        let commanded = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let commanded_v = [0.0; 7];
+        let torques = [0.0; 7];
+        let loads = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.40];
+
+        let ctx = StepCtx {
+            dt: 0.02,
+            time_scale: 1.0,
+            measured: &measured,
+            measured_velocities: &measured_v,
+            commanded: &commanded,
+            commanded_velocities: &commanded_v,
+            torques: &torques,
+            loads: &loads,
+            feedback_fresh: true,
+            torque_feedback: false,
+            load_feedback: true,
+            gripper_stalled: false,
+            gripper_stall_sign: 1.0,
+        };
+
+        let mut status = StepStatus::Running;
+        for _ in 0..100 {
+            let out = motion.step(&ctx);
+            status = out.status;
+            if status != StepStatus::Running {
+                break;
+            }
+        }
+        assert_eq!(
+            status,
+            StepStatus::Done {
+                settled: None,
+                holding: Some(true),
+                gripper_gap_rad: Some(0.10),
+            }
+        );
+    }
+
+    // Case B: Low load (0.10 < 0.30) even with gap -> holding: Some(false)
+    {
+        let mut motion = GripperMotion::new(req, policy, limit, 1.0, 6);
+        let measured = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.10];
+        let measured_v = [0.0; 7];
+        let commanded = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let commanded_v = [0.0; 7];
+        let torques = [0.0; 7];
+        let loads = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.10];
+
+        let ctx = StepCtx {
+            dt: 0.02,
+            time_scale: 1.0,
+            measured: &measured,
+            measured_velocities: &measured_v,
+            commanded: &commanded,
+            commanded_velocities: &commanded_v,
+            torques: &torques,
+            loads: &loads,
+            feedback_fresh: true,
+            torque_feedback: false,
+            load_feedback: true,
+            gripper_stalled: false,
+            gripper_stall_sign: 1.0,
+        };
+
+        let mut status = StepStatus::Running;
+        for _ in 0..100 {
+            let out = motion.step(&ctx);
+            status = out.status;
+            if status != StepStatus::Running {
+                break;
+            }
+        }
+        assert_eq!(
+            status,
+            StepStatus::Done {
+                settled: None,
+                holding: Some(false),
+                gripper_gap_rad: Some(0.10),
+            }
+        );
+    }
+}
+
+// -------------------------------------------------------------------------
+// 12. Partial and out-of-order SYNC_READ chunking
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_sync_read_partial_out_of_order_chunking() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1, 2, 3, 4, 5, 6];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+
+    let build_resp = |id: u8| -> Vec<u8> {
+        let pos = 2048u16.to_le_bytes();
+        let spd = 0u16.to_le_bytes();
+        let load = 100u16.to_le_bytes();
+        let params = [pos[0], pos[1], spd[0], spd[1], load[0], load[1], 75, 40];
+        let cs = calculate_checksum(id, (params.len() + 2) as u8, 0x00, &params);
+        let mut pkt = vec![0xFF, 0xFF, id, (params.len() + 2) as u8, 0x00];
+        pkt.extend_from_slice(&params);
+        pkt.push(cs);
+        pkt
+    };
+
+    let mut rx = Vec::new();
+    // Chunk 0: Servos 1, 2, 3 respond
+    rx.extend_from_slice(&build_resp(1));
+    rx.extend_from_slice(&build_resp(2));
+    rx.extend_from_slice(&build_resp(3));
+    // Chunk 1: Servo 6 arrives first, then Servo 4; Servo 5 is missing/dropped!
+    rx.extend_from_slice(&build_resp(6));
+    rx.extend_from_slice(&build_resp(4));
+
+    driver.transport_mut().provide_rx(&rx);
+    let states = driver.read_joint_states().unwrap();
+    assert_eq!(states.len(), 6);
+
+    let ages = driver.feedback_ages();
+    assert!(ages[0].is_some(), "Servo 1 replied");
+    assert!(ages[1].is_some(), "Servo 2 replied");
+    assert!(ages[2].is_some(), "Servo 3 replied");
+    assert!(ages[3].is_some(), "Servo 4 replied");
+    assert!(ages[4].is_none(), "Servo 5 was missing and must have None age");
+    assert!(ages[5].is_some(), "Servo 6 replied out-of-order");
+}
+
+// -------------------------------------------------------------------------
+// 13. Split/partial RX frame reassembly in read_joint_states
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_split_rx_frame_reassembly() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+
+    let pos = 2048u16.to_le_bytes();
+    let spd = 0u16.to_le_bytes();
+    let load = 150u16.to_le_bytes();
+    let params = [pos[0], pos[1], spd[0], spd[1], load[0], load[1], 75, 42];
+    let cs = calculate_checksum(1, (params.len() + 2) as u8, 0x00, &params);
+    let mut full_pkt = vec![0xFF, 0xFF, 1, (params.len() + 2) as u8, 0x00];
+    full_pkt.extend_from_slice(&params);
+    full_pkt.push(cs);
+
+    // Provide fragmented bytes: first 3 bytes, then 2 bytes, then the rest
+    driver.transport_mut().provide_rx(&full_pkt[..3]);
+    let _ = driver.read_joint_states();
+    assert!(driver.feedback_ages()[0].is_none(), "Incomplete header cannot yield state");
+
+    driver.transport_mut().provide_rx(&full_pkt[3..5]);
+    let _ = driver.read_joint_states();
+    assert!(driver.feedback_ages()[0].is_none(), "Incomplete payload cannot yield state");
+
+    driver.transport_mut().provide_rx(&full_pkt[5..]);
+    let states = driver.read_joint_states().unwrap();
+    assert_eq!(states.len(), 1);
+    assert!((states[0].position - 0.0).abs() < 1e-4);
+    assert!((states[0].temperature - 42.0).abs() < 1e-4);
+    assert!(driver.feedback_ages()[0].is_some());
+}

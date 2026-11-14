@@ -36,7 +36,7 @@ impl DummyDriver {
 
 impl ArmDriver for DummyDriver {
     fn capabilities(&self) -> armd::driver::DriverCapabilities {
-        armd::driver::DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true }
+        armd::driver::DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true, load_feedback: false }
     }
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
         vec![if self.feedback_valid.load(Ordering::SeqCst) { Some(Duration::ZERO) } else { None }; self.states.len()]
@@ -204,7 +204,7 @@ async fn test_is_at_safe_resting_pose_criteria() {
     ]);
     config.resting_pose = Some(armd::model::RestingPosePolicy {
         position_tolerances: vec![0.15, 0.08, 0.08], max_total_deviation: 0.22,
-        max_velocity: 0.015, joint_max_velocities: vec![], support_torque_limits: vec![(1, 1.5), (2, 4.5)], feedback_max_age_ms: 100,
+        max_velocity: 0.015, joint_max_velocities: vec![], support_torque_limits: vec![(1, 1.5), (2, 4.5)], support_load_limits: vec![], feedback_max_age_ms: 100,
     });
     let supervisor_hw = ArmSupervisor::new(config.clone());
     supervisor_hw.set_driver(Box::new(dummy)).await;

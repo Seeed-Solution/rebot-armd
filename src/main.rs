@@ -354,6 +354,7 @@ mod shutdown_tests {
                 temperature_feedback: true,
                 torque_feedforward: false,
                 enable_feedback: true,
+                load_feedback: false,
             }
         }
         fn enable_state(&self) -> EnableState {

@@ -63,6 +63,8 @@ pub struct RestingPosePolicy {
     #[serde(default)]
     pub joint_max_velocities: Vec<f32>,
     pub support_torque_limits: Vec<(usize, f32)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub support_load_limits: Vec<(usize, f32)>,
     pub feedback_max_age_ms: u64,
 }
 
@@ -77,6 +79,7 @@ impl RestingPosePolicy {
             max_velocity: 0.015,
             joint_max_velocities: vec![0.005, 0.005, 0.005, 0.015, 0.015, 0.015, 0.015],
             support_torque_limits: vec![(1, 2.333), (2, 7.0)],
+            support_load_limits: Vec::new(),
             feedback_max_age_ms: 100,
         }
     }
@@ -779,6 +782,9 @@ pub struct ArmConfig {
     /// joint than the arm model (index 6 for the B601-DM), otherwise none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gripper_joint: Option<usize>,
+    /// Feetech STS3215 bus and joint calibration settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feetech: Option<crate::protocol::feetech::FeetechConfig>,
     /// Arm model built from the fields above (not part of the profile JSON).
     #[serde(skip)]
     pub arm_model: crate::chain::ArmModel,
@@ -853,6 +859,7 @@ impl Default for ArmConfig {
             chain: None,
             model_offsets_rad: None,
             gripper_joint: None,
+            feetech: None,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -1097,8 +1104,34 @@ impl ArmConfig {
                 || policy.joint_max_velocities.len() > self.dof
                 || policy.joint_max_velocities.iter().any(|v| !v.is_finite() || *v <= 0.0)
                 || policy.feedback_max_age_ms == 0
-                || policy.support_torque_limits.iter().any(|(i, t)| *i >= self.dof || !t.is_finite() || *t < 0.0) {
+                || policy.support_torque_limits.iter().any(|(i, t)| *i >= self.dof || !t.is_finite() || *t < 0.0)
+                || policy.support_load_limits.iter().any(|(i, l)| *i >= self.dof || !l.is_finite() || *l < 0.0) {
                 return Err("Invalid resting-pose policy".into());
+            }
+        }
+        if let Some(ft) = &self.feetech {
+            if !ft.joints.is_empty() {
+                if ft.joints.len() != self.dof {
+                    return Err(format!(
+                        "feetech.joints length {} does not match DOF {}",
+                        ft.joints.len(), self.dof
+                    ));
+                }
+                let mut ids = std::collections::HashSet::new();
+                for (i, j) in ft.joints.iter().enumerate() {
+                    if !ids.insert(j.id) {
+                        return Err(format!(
+                            "Duplicate Feetech servo ID {} at joint index {}",
+                            j.id, i
+                        ));
+                    }
+                    if j.range_min_steps >= j.range_max_steps || j.range_max_steps > 4095 {
+                        return Err(format!(
+                            "Invalid Feetech step range [{}, {}] for servo ID {} at joint {}",
+                            j.range_min_steps, j.range_max_steps, j.id, i
+                        ));
+                    }
+                }
             }
         }
         for (i, lim) in self.limits.iter().enumerate() {
@@ -1214,6 +1247,7 @@ impl ArmConfig {
             chain: None,
             model_offsets_rad: Some(crate::kinematics::B601DM_MODEL_OFFSETS_RAD.to_vec()),
             gripper_joint: None,
+            feetech: None,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }

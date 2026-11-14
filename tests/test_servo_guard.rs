@@ -33,7 +33,7 @@ struct FakeDriver(Arc<Mutex<Arm>>);
 impl ArmDriver for FakeDriver {
     fn capabilities(&self) -> DriverCapabilities {
         DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true,
-            torque_feedforward: true, enable_feedback: true }
+            torque_feedforward: true, enable_feedback: true, load_feedback: false }
     }
     fn enable_state(&self) -> EnableState { self.0.lock().unwrap().enabled }
     fn is_feedback_valid(&self) -> bool { true }

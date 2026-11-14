@@ -26,7 +26,7 @@ impl ArmDriver for CapsDriver {
 }
 
 fn full_caps() -> DriverCapabilities {
-    DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true }
+    DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true, load_feedback: false }
 }
 
 async fn describe(supervisor: &ArmSupervisor) -> Value {

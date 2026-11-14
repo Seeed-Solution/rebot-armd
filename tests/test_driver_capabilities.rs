@@ -24,6 +24,7 @@ fn capabilities_follow_active_protocol_and_do_not_claim_estimates_as_measurement
             temperature_feedback: true,
             torque_feedforward: false,
             enable_feedback: true,
+            load_feedback: false,
         }
     );
     assert_eq!(dm.max_command_velocity(0), Some(1.2));
@@ -46,6 +47,8 @@ fn capabilities_follow_active_protocol_and_do_not_claim_estimates_as_measurement
         !ft.capabilities().torque_feedback,
         "load-based estimate is not measured Nm"
     );
+    assert!(ft.capabilities().load_feedback);
+    assert!(ft.capabilities().enable_feedback);
     let fs = FashionStarArmDriver::new(MockTransport::new(), vec![1]);
     assert_eq!(fs.capabilities(), DriverCapabilities::default());
 }
@@ -54,7 +57,6 @@ fn capabilities_follow_active_protocol_and_do_not_claim_estimates_as_measurement
 fn unconfirmed_enable_is_unknown_for_non_damiao_drivers() {
     let mut drivers: Vec<Box<dyn ArmDriver>> = vec![
         Box::new(RobStrideArmDriver::new(MockCanTransport::new(), vec![1])),
-        Box::new(FeetechArmDriver::new(MockTransport::new(), vec![1])),
         Box::new(FashionStarArmDriver::new(MockTransport::new(), vec![1])),
     ];
     for driver in &mut drivers {

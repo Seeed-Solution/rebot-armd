@@ -95,7 +95,7 @@ struct SimArm(Arc<Mutex<Sim>>);
 
 impl ArmDriver for SimArm {
     fn capabilities(&self) -> DriverCapabilities {
-        DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true }
+        DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true, load_feedback: false }
     }
     fn enable_state(&self) -> EnableState {
         if self.0.lock().unwrap().torqued { EnableState::Enabled } else { EnableState::Disabled }

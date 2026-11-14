@@ -167,11 +167,21 @@ fn test_feetech_driver_mock_loopback() {
     let servo_ids = vec![1, 2, 3];
     let mut driver = FeetechArmDriver::new(mock, servo_ids.clone());
 
+    // Provide readback responses for REG_TORQUE_ENABLE (1 byte, value 1)
+    let mut enable_rx = Vec::new();
+    for &id in &servo_ids {
+        let params = [1u8];
+        let length = (params.len() + 2) as u8;
+        let cs = feetech::calculate_checksum(id, length, 0x00, &params);
+        enable_rx.extend_from_slice(&[0xFF, 0xFF, id, length, 0x00, 1, cs]);
+    }
+    driver.transport_mut().provide_rx(&enable_rx);
+
     // 1. Test set_torque(true)
     driver.set_torque(true).unwrap();
     let tx_bytes = driver.transport_mut().take_tx();
-    // 3 servos * 8 bytes each = 24 bytes
-    assert_eq!(tx_bytes.len(), 24);
+    // 3 servos write (8 bytes each) + 3 servos read (8 bytes each) = 48 bytes
+    assert_eq!(tx_bytes.len(), 48);
 
     // 2. Test write_joint_targets
     let targets = vec![

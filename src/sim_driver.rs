@@ -231,6 +231,7 @@ impl ArmDriver for SimArmDriver {
             // through the per-joint MIT switch used by gravity compensation.
             torque_feedforward: false,
             enable_feedback: true,
+            load_feedback: false,
         }
     }
 
