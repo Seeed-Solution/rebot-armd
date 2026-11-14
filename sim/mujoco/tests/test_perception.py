@@ -511,6 +511,7 @@ def test_mask_focus_control_and_echo(api):
     code, status = http(base + "/api/status")
     assert code == 200
     assert status["model"]["mask_max_boxes"] == 3
+    assert status["model"]["kind"] == "segment"
     assert status["mask_focus"] is None
 
     code, mf = http(base + "/api/mask_focus")
@@ -577,3 +578,14 @@ def test_mask_focus_control_and_echo(api):
     code, lat = http(base + "/api/results/latest")
     assert code == 200 and lat["frame_id"] == 2
     assert lat["detections"][0].get("mask_focus") is not True
+
+
+def test_model_kind_detect_without_mask_angle():
+    """--no-mask-angle stands for a plain detection model: /api/mode model.kind is "detect"."""
+    srv = PerceptionServer(Perception(max_fps=15, model_kind="detect"), FakeSim(), "127.0.0.1", 0)
+    try:
+        code, mode = http(f"http://127.0.0.1:{srv.httpd.server_address[1]}/api/mode")
+        assert code == 200 and mode["model"]["kind"] == "detect"
+    finally:
+        srv.httpd.shutdown()
+        srv.httpd.server_close()

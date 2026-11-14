@@ -165,8 +165,10 @@ def serve_video(host: str, port: int, streams: dict[str, VideoStream]):
 class Perception:
     """Perception API v2 state: default subscription (mode), subscriptions, frames, triggers."""
 
-    def __init__(self, max_fps: int, depth=None):
+    def __init__(self, max_fps: int, depth=None, model_kind: str = "segment"):
         self.max_fps = max_fps
+        # /api/mode model.kind: "segment" (mask angle and width), "detect" with --no-mask-angle
+        self.model_kind = model_kind
         self.depth_model = depth if depth is not None and depth.enabled else None
         # "depth" only with a depth model: without one every body is as before
         self.pipelines = PIPELINES + ("depth",) if self.depth_model else PIPELINES
@@ -309,7 +311,7 @@ class Perception:
                          "result_fps": round(len([t for t in self.results_out if now - t < 2.0]) / 2, 1)},
             "trigger": True, "per_request_pipelines": True, "subscriptions": True, "max_fps": self.max_fps,
             "continuous": cont, "available": {"yolo": True, "aruco": True},
-            "model": {"name": "rebot-sim-ground-truth", "path": None, "mask_max_boxes": 3}, "family": "aruco4x4_50",
+            "model": {"name": "rebot-sim-ground-truth", "path": None, "kind": self.model_kind, "mask_max_boxes": 3}, "family": "aruco4x4_50",
             "mask_focus": self.mask_focus_body(),
         }
         if self.depth_model:
@@ -706,11 +708,12 @@ class CameraRig:
         if cfg["scene_stream"]:
             self.streams["/scene"] = VideoStream()
         self.depth_model = cam.DepthModel(**cfg.get("depth", {}))
-        self.perception = Perception(max_fps=min(15, self.fps), depth=self.depth_model)
-        self.noise = cam.DetNoise(**cfg.get("noise", {}))
         # False: a plain detection model (no mask): detections carry no angle_deg / angle_conf /
         # grasp_width_px (the depth pipeline still reports its depth_* fields)
         self.mask_angle = cfg.get("mask_angle", True)
+        self.perception = Perception(max_fps=min(15, self.fps), depth=self.depth_model,
+                                     model_kind="segment" if self.mask_angle else "detect")
+        self.noise = cam.DetNoise(**cfg.get("noise", {}))
         self.labels = [(i, o.kind) for i, o in enumerate(objects)]  # what a false detection may be
         self.delayed: list[tuple] = []  # frames (on_frame arguments) waiting out noise.latency_ms
         self.frame_id = 0
