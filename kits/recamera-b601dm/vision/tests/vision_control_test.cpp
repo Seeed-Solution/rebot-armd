@@ -957,6 +957,56 @@ static void test_detections_json_depth() {
     CHECK(!j[0].contains("jaw_clear"));
 }
 
+// A plain detection model with depth: the depth PCA angle/width are reported as depth_* fields,
+// angle_deg / angle_conf / grasp_width_px stay absent. A seg model keeps its mask values.
+static void test_detections_json_depth_angle_split() {
+    const int grid_w = 384, grid_h = 224;
+    const float cw = 640.0f, ch = 360.0f;
+    std::vector<float> dmap(grid_w * grid_h, 0.40f);
+    for (int gy = 0; gy < grid_h; ++gy) {
+        const float v = (gy + 0.5f) * (ch / grid_h);
+        for (int gx = 0; gx < grid_w; ++gx) {
+            const float u = (gx + 0.5f) * (cw / grid_w);
+            if (u >= 280.0f && u <= 360.0f && v >= 172.0f && v <= 188.0f) dmap[gy * grid_w + gx] = 0.85f;
+        }
+    }
+    DetBox d;
+    d.x = 320.0f / 640.0f; d.y = 180.0f / 360.0f; d.w = 100.0f / 640.0f; d.h = 30.0f / 360.0f;
+    d.confidence = 0.8f;
+    d.class_name = "block";
+    CHECK(std::isnan(jaw_close_deg(d)));
+    DepthBox box{270.0f, 165.0f, 370.0f, 195.0f};
+    BoxDepthResult r = analyze_box_depth(dmap.data(), grid_w, grid_h, box, {}, cw, ch, jaw_close_deg(d));
+    CHECK(r.valid);
+    apply_box_depth(d, r);
+    ContentRect cr{0, 0, 640, 360};
+    json j = json::parse(detections_json({d}, cr, 640, 360));
+    CHECK(!j[0].contains("angle_deg"));
+    CHECK(!j[0].contains("angle_conf"));
+    CHECK(!j[0].contains("grasp_width_px"));
+    CHECK(j[0].contains("depth_angle_deg") && std::abs(j[0]["depth_angle_deg"].get<float>()) < 1.0f);
+    CHECK(j[0].contains("depth_angle_conf") && j[0]["depth_angle_conf"].get<float>() > 0.0f);
+    CHECK(j[0].contains("depth_width_px") && std::abs(j[0]["depth_width_px"].get<float>() - r.grasp_width_px) < 0.01f);
+    CHECK(j[0].contains("depth_conf") && j[0].contains("length_px") && j[0].contains("jaw_clear"));
+
+    // seg model: mask angle 30 deg, width 20 px -> unchanged; jaws close at 120 deg
+    DetBox s = d;
+    s.angle_deg = 30.0f; s.angle_conf = 0.9f; s.grasp_width_px = 20.0f;
+    s.depth_angle_deg = s.depth_angle_conf = s.depth_width_px = NAN;
+    CHECK(std::abs(jaw_close_deg(s) - 120.0f) < 1e-4f);
+    apply_box_depth(s, r);
+    j = json::parse(detections_json({s}, cr, 640, 360));
+    CHECK(std::abs(j[0]["angle_deg"].get<float>() - 30.0f) < 1e-3f);
+    CHECK(std::abs(j[0]["grasp_width_px"].get<float>() - 20.0f) < 1e-3f);
+    CHECK(j[0].contains("depth_angle_deg"));
+
+    // invalid depth result: nothing written
+    DetBox e;
+    apply_box_depth(e, BoxDepthResult{});
+    j = json::parse(detections_json({e}, cr, 640, 360));
+    CHECK(!j[0].contains("depth_angle_deg") && !j[0].contains("depth_conf"));
+}
+
 int main() {
     test_modes();
     test_status_endpoint();
@@ -964,6 +1014,7 @@ int main() {
     test_depth_unavailable();
     test_depth_trigger_and_status();
     test_detections_json_depth();
+    test_detections_json_depth_angle_split();
     test_trigger_each_mode();
     test_trigger_timeout_and_continuous();
     test_rate_gate();

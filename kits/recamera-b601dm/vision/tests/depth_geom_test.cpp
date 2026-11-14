@@ -325,6 +325,73 @@ static void test_jaw_clear() {
     }
 }
 
+// jaw_clear strips follow the given closing direction, not the depth PCA minor axis.
+static void test_jaw_clear_direction() {
+    const int grid_w = 384, grid_h = 224;
+    const float content_w = 640.0f, content_h = 360.0f;
+    // Horizontal bar (PCA angle 0, minor axis vertical); the box is the bar itself.
+    DepthBox target{280.0f, 172.0f, 360.0f, 188.0f};
+    auto make_map = [&](bool obstacle_at_end, bool obstacle_above) {
+        std::vector<float> dmap(grid_w * grid_h, 0.40f);
+        for (int gy = 0; gy < grid_h; ++gy) {
+            float v_px = (gy + 0.5f) * (content_h / static_cast<float>(grid_h));
+            for (int gx = 0; gx < grid_w; ++gx) {
+                float u_px = (gx + 0.5f) * (content_w / static_cast<float>(grid_w));
+                if (u_px >= 280.0f && u_px <= 360.0f && v_px >= 172.0f && v_px <= 188.0f) {
+                    dmap[gy * grid_w + gx] = 0.85f;  // target object
+                }
+                // beside the bar's right end, i.e. in the strip of jaws closing along u
+                if (obstacle_at_end && u_px >= 362.0f && u_px <= 374.0f && v_px >= 176.0f && v_px <= 184.0f) {
+                    dmap[gy * grid_w + gx] = 0.80f;
+                }
+                // above the bar's middle, i.e. in the strip of jaws closing along v (PCA minor axis)
+                if (obstacle_above && u_px >= 300.0f && u_px <= 340.0f && v_px >= 189.0f && v_px <= 205.0f) {
+                    dmap[gy * grid_w + gx] = 0.80f;
+                }
+            }
+        }
+        return dmap;
+    };
+
+    // Obstacle at the bar's end: clear for the PCA minor axis and for closing at 90 deg,
+    // blocked when the jaws close along the bar (0 deg, e.g. a mask angle of -90 deg).
+    {
+        auto m = make_map(true, false);
+        auto pca = analyze_box_depth(m.data(), grid_w, grid_h, target, {}, content_w, content_h);
+        CHECK(pca.valid);
+        CHECK(std::abs(pca.angle_deg) < 1.0f);
+        CHECK(pca.jaw_clear == 1);
+        auto across = analyze_box_depth(m.data(), grid_w, grid_h, target, {}, content_w, content_h, 90.0f);
+        CHECK(across.jaw_clear == 1);
+        auto along = analyze_box_depth(m.data(), grid_w, grid_h, target, {}, content_w, content_h, 0.0f);
+        CHECK(along.valid);
+        CHECK(along.jaw_clear == 0);
+        // the closing direction only moves the jaw strips; angle, width and length are the PCA values
+        CHECK(along.angle_deg == pca.angle_deg);
+        CHECK(along.grasp_width_px == pca.grasp_width_px);
+        CHECK(along.length_px == pca.length_px);
+        CHECK(along.depth_conf == pca.depth_conf);
+    }
+    // Obstacle above the bar's middle: blocked for the PCA minor axis and for 90 deg (and -90),
+    // clear when the jaws close along the bar.
+    {
+        auto m = make_map(false, true);
+        auto pca = analyze_box_depth(m.data(), grid_w, grid_h, target, {}, content_w, content_h);
+        CHECK(pca.jaw_clear == 0);
+        CHECK(analyze_box_depth(m.data(), grid_w, grid_h, target, {}, content_w, content_h, 90.0f).jaw_clear == 0);
+        CHECK(analyze_box_depth(m.data(), grid_w, grid_h, target, {}, content_w, content_h, -90.0f).jaw_clear == 0);
+        CHECK(analyze_box_depth(m.data(), grid_w, grid_h, target, {}, content_w, content_h, 0.0f).jaw_clear == 1);
+        CHECK(analyze_box_depth(m.data(), grid_w, grid_h, target, {}, content_w, content_h, 180.0f).jaw_clear == 1);
+    }
+    // Index overload passes the direction through.
+    {
+        auto m = make_map(true, false);
+        std::vector<DepthBox> all{target};
+        CHECK(analyze_box_depth(m.data(), grid_w, grid_h, size_t{0}, all, content_w, content_h, 0.0f).jaw_clear == 0);
+        CHECK(analyze_box_depth(m.data(), grid_w, grid_h, size_t{0}, all, content_w, content_h).jaw_clear == 1);
+    }
+}
+
 static void test_sample_table_disparity() {
     const int grid_w = 384, grid_h = 224;
     const float content_w = 640.0f, content_h = 360.0f;
@@ -431,6 +498,7 @@ int main() {
     test_fg_bg_matched_location();
     test_pca_aspect_correction();
     test_jaw_clear();
+    test_jaw_clear_direction();
     test_sample_table_disparity();
     test_non_finite_handling();
 

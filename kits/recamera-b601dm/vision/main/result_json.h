@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "depth_geom.h"
 #include "vision_control.h"
 
 namespace rv {
@@ -38,7 +39,23 @@ struct DetBox {
     float depth_conf = NAN;
     float length_px = NAN;
     int jaw_clear = -1;
+    float depth_angle_deg = NAN;   ///< depth PCA long-side angle; never copied into angle_deg
+    float depth_angle_conf = NAN;
+    float depth_width_px = NAN;    ///< depth PCA cross-section width
 };
+
+/**
+ * Jaw closing direction for analyze_box_depth: the mask angle + 90 deg when the detection has a
+ * finite angle_deg (segmentation model), else NAN (the depth PCA minor axis).
+ */
+float jaw_close_deg(const DetBox& d) noexcept;
+
+/**
+ * Copies a valid depth result into the detection. The depth PCA angle and width go to
+ * depth_angle_deg / depth_angle_conf / depth_width_px only; angle_deg / angle_conf /
+ * grasp_width_px stay what the detector reported (absent for a plain detection model).
+ */
+void apply_box_depth(DetBox& d, const BoxDepthResult& r) noexcept;
 
 /**
  * Detections JSON array (the yolo-detector field set) normalised to the content rect,

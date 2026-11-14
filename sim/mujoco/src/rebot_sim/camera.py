@@ -421,13 +421,16 @@ def depth_result(geom_ids: np.ndarray, z: np.ndarray, scene, model: DepthModel, 
                  min_pixels: int = 20) -> dict:
     """Depth fields of a frame: {"table_samples": [[u, v, disp], ...], "objects": {name: fields},
     "finite": bool}. `geom_ids` / `z` at DETECTION_SIZE; fields per object as rebot-vision
-    reports them (disp_fg, disp_bg, depth_conf, length_px, jaw_clear), computed on the 384x224
-    grid from the ground-truth mask:
+    reports them (disp_fg, disp_bg, depth_conf, length_px, jaw_clear, depth_angle_deg,
+    depth_angle_conf, depth_width_px), computed on the 384x224 grid from the ground-truth mask:
     - foreground: the object's cells (none reported under 6 cells);
     - table plane: least-squares plane over table cells in the ring box expanded by
       max(25 %, 4 cells) minus the box; disp_bg = plane at the foreground centroid, disp_fg =
       disp_bg + P75(foreground disp - plane);
     - length_px: extent of the full-resolution mask along its long axis (mask_orientation);
+    - depth_angle_deg / depth_width_px: the full-resolution mask's cross section
+      (mask_cross_section, as angle_deg / grasp_width_px); depth_angle_conf = its angle_conf x
+      depth_conf (as rebot-vision scales the PCA confidence by depth_conf);
     - jaw_clear: simplified, False when another object's pixels lie in the box expanded by 18 px.
     Table samples as sample_table_disparity: 8 x 6 patches of 5 x 5 cells over [8 %, 92 %], table
     cells outside every object box expanded by 15 %, >= 9 cells, MAD <= 0.05 median, coordinates the
@@ -481,8 +484,10 @@ def depth_result(geom_ids: np.ndarray, z: np.ndarray, scene, model: DepthModel, 
         for other, (ox, oy) in masks.items():
             if other != obj.name and ((ox >= x0 - 18) & (ox < x1 + 18) & (oy >= y0 - 18) & (oy < y1 + 18)).any():
                 clear = False
+        d_angle, d_conf, d_width = mask_cross_section(xs.astype(np.float64), ys.astype(np.float64))
         objects[obj.name] = {"disp_fg": round(disp_fg, 5), "disp_bg": round(disp_bg, 5), "depth_conf": model.conf,
-                             "length_px": round(length, 2), "jaw_clear": clear}
+                             "length_px": round(length, 2), "jaw_clear": clear, "depth_angle_deg": d_angle,
+                             "depth_angle_conf": round(d_conf * model.conf, 3), "depth_width_px": round(d_width, 2)}
 
     excl = np.zeros_like(table)
     for x0, y0, x1, y1 in boxes.values():

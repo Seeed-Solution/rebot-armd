@@ -35,6 +35,7 @@ struct BoxDepthResult {
     float grasp_width_px = NAN;
     float length_px = NAN;
     int jaw_clear = -1;  ///< -1: not evaluated; 0: false (conflict); 1: true (clear)
+                         ///< evaluated across the jaw closing direction (see jaw_close_deg)
     int fg_count = 0;
 };
 
@@ -50,17 +51,22 @@ struct BoxDepthResult {
  * @param other_boxes Other detection boxes to exclude from the border ring.
  * @param content_w Visible content width in pixels (default: 640.0f).
  * @param content_h Visible content height in pixels (default: 360.0f).
+ * @param jaw_close_deg Direction the jaws close along, degrees in content pixels (atan2(dv, du)).
+ *        The jaw_clear strips lie beyond the foreground's extent along this direction and span
+ *        +-20% of its extent across it. NAN (default): the depth PCA minor axis.
  */
 BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
                                  const DepthBox& target_box,
                                  const std::vector<DepthBox>& other_boxes,
-                                 float content_w = 640.0f, float content_h = 360.0f);
+                                 float content_w = 640.0f, float content_h = 360.0f,
+                                 float jaw_close_deg = NAN);
 
 /** Overload accepting all boxes and the target box index. */
 BoxDepthResult analyze_box_depth(const float* disp_map, int grid_w, int grid_h,
                                  size_t target_idx,
                                  const std::vector<DepthBox>& all_boxes,
-                                 float content_w = 640.0f, float content_h = 360.0f);
+                                 float content_w = 640.0f, float content_h = 360.0f,
+                                 float jaw_close_deg = NAN);
 
 /** A sparse patch sample of the background table plane. */
 struct TableSample {

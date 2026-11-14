@@ -36,6 +36,7 @@ add_executable(vision_control_test
     ${CMAKE_CURRENT_LIST_DIR}/vision_control_test.cpp
     ${MAIN}/vision_control.cpp
     ${MAIN}/result_json.cpp
+    ${MAIN}/depth_geom.cpp
     ${MAIN}/http_control.cpp)
 target_include_directories(vision_control_test PRIVATE ${MAIN})
 target_compile_options(vision_control_test PRIVATE -Wall -Wextra)

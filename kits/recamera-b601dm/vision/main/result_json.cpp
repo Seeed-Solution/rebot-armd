@@ -21,6 +21,22 @@ ContentRect content_rect(int inference_w, int inference_h, int display_w, int di
     return r;
 }
 
+float jaw_close_deg(const DetBox& d) noexcept {
+    return std::isfinite(d.angle_deg) ? d.angle_deg + 90.0f : NAN;
+}
+
+void apply_box_depth(DetBox& d, const BoxDepthResult& r) noexcept {
+    if (!r.valid) return;
+    d.disp_fg = r.disp_fg;
+    d.disp_bg = r.disp_bg;
+    d.depth_conf = r.depth_conf;
+    d.length_px = r.length_px;
+    d.jaw_clear = r.jaw_clear;
+    d.depth_angle_deg = r.angle_deg;
+    d.depth_angle_conf = r.angle_conf;
+    d.depth_width_px = r.grasp_width_px;
+}
+
 static void json_escape(std::ostringstream& s, const char* str) {
     for (const char* c = str ? str : ""; *c; ++c) {
         if (*c == '"' || *c == '\\') s << '\\' << *c;
@@ -54,6 +70,10 @@ std::string detections_json(const std::vector<DetBox>& dets, const ContentRect& 
         if (std::isfinite(d.depth_conf)) s << ",\"depth_conf\":" << std::setprecision(3) << d.depth_conf;
         if (std::isfinite(d.length_px)) s << ",\"length_px\":" << std::setprecision(2) << d.length_px;
         if (d.jaw_clear >= 0) s << ",\"jaw_clear\":" << (d.jaw_clear ? "true" : "false");
+        if (std::isfinite(d.depth_angle_deg)) s << ",\"depth_angle_deg\":" << std::setprecision(2) << d.depth_angle_deg;
+        if (std::isfinite(d.depth_angle_conf))
+            s << ",\"depth_angle_conf\":" << std::setprecision(3) << d.depth_angle_conf;
+        if (std::isfinite(d.depth_width_px)) s << ",\"depth_width_px\":" << std::setprecision(2) << d.depth_width_px;
         s << '}';
     }
     s << ']';

@@ -708,6 +708,9 @@ class CameraRig:
         self.depth_model = cam.DepthModel(**cfg.get("depth", {}))
         self.perception = Perception(max_fps=min(15, self.fps), depth=self.depth_model)
         self.noise = cam.DetNoise(**cfg.get("noise", {}))
+        # False: a plain detection model (no mask): detections carry no angle_deg / angle_conf /
+        # grasp_width_px (the depth pipeline still reports its depth_* fields)
+        self.mask_angle = cfg.get("mask_angle", True)
         self.labels = [(i, o.kind) for i, o in enumerate(objects)]  # what a false detection may be
         self.delayed: list[tuple] = []  # frames (on_frame arguments) waiting out noise.latency_ms
         self.frame_id = 0
@@ -851,6 +854,9 @@ class CameraRig:
                 self.frame_id += 1
                 if dets is not None:  # a failed segmentation: the video frame goes out, no result
                     dets = self._cam.perturb(dets, self.noise, self.frame_id, self.labels)
+                    if not self.mask_angle:
+                        dets = [{k: v for k, v in d.items() if k not in ("angle_deg", "angle_conf", "grasp_width_px")}
+                                for d in dets]
                     self.publish_frame((self.frame_id, ts_ms, captured, dets, self.data.time, step, self.frame_depth))
                 for path, stream in self.streams.items():
                     if not stream.active:

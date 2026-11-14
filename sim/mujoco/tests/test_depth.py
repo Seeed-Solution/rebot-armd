@@ -169,6 +169,18 @@ def test_object_height_from_disp_fg_and_disp_bg(rig, kind):
     assert len(d["table_samples"]) >= 3
 
 
+
+def test_depth_angle_and_width_from_the_mask_cross_section(rig):
+    """depth_angle_deg / depth_width_px are the mask's cross section (as angle_deg / grasp_width_px),
+    depth_angle_conf = angle_conf x depth_conf."""
+    _pose(rig, DOWN_Q, "axis")
+    ids, z = _render(rig)
+    d = cam.depth_result(ids, z, rig.scene, DepthModel("metric"))
+    det = next(x for x in cam.detections(ids, rig.scene) if x["name"] == "cube")
+    f = d["objects"]["cube"]
+    assert f["depth_angle_deg"] == det["angle_deg"] and f["depth_width_px"] == det["grasp_width_px"], (f, det)
+    assert f["depth_angle_conf"] == round(det["angle_conf"] * 0.95, 3), (f, det)
+
 def test_detect_renders_depth_only_when_wanted_on_the_same_physics_step(rig):
     _pose(rig, DOWN_Q, "axis")
     assert rig.detect() is not None and rig.frame_depth is None

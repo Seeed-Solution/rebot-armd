@@ -820,6 +820,13 @@ pub struct ActionStatus {
     /// `height_record`), with its value, reject reason or veto code, and whether it decided.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub height_estimates: Vec<EstimateEntry>,
+    /// Grasp: every evaluated J6 yaw source (`yaw_sources`, `yaw_record`); value = the object's
+    /// long side in the image (deg).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub yaw_estimates: Vec<EstimateEntry>,
+    /// Grasp: every evaluated width source (`width_sources`, `width_record`); value = width (m).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub width_estimates: Vec<EstimateEntry>,
     /// Grasp: TCP height above the table at which the jaws close (m).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_height_m: Option<f32>,

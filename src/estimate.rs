@@ -1,5 +1,6 @@
-//! Estimate chain for one grasp quantity (step 1: the object height, `height_sources`,
-//! `height_record`, docs/agent_action_api.md).
+//! Estimate chain for one grasp quantity: the object height (`height_sources`, `height_record`),
+//! the J6 yaw (`yaw_sources`, `yaw_record`) and the grasp width (`width_sources`,
+//! `width_record`), docs/agent_action_api.md.
 //!
 //! Sources are offered in evaluation order. The first deciding source that accepts is chosen;
 //! record-only sources are reported but never chosen and never veto. A veto (OBJECT_TOO_TALL)
@@ -15,12 +16,15 @@ pub enum SourceResult {
     Veto(Stop),
 }
 
-/// One evaluated source, reported in `ActionStatus.height_estimates`.
+/// One evaluated source, reported in `ActionStatus.height_estimates` / `yaw_estimates` /
+/// `width_estimates`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EstimateEntry {
-    /// `depth:<anchor>`, `depth`, `scale`, `parallax`, `probe`, `prior`.
+    /// Height: `depth:<anchor>`, `depth`, `scale`, `parallax`, `probe`, `prior`.
+    /// Yaw: `mask`, `depth`, `box`. Width: `mask`, `depth`.
     pub source: String,
-    /// Height above the table (m) the source measured, also when rejected or vetoed.
+    /// The value the source measured, also when rejected or vetoed: height above the table (m),
+    /// yaw = the object's long side in the image (deg, [-90, 90)), width across the jaws (m).
     pub value: Option<f32>,
     pub used: bool,
     pub record_only: bool,
@@ -29,16 +33,19 @@ pub struct EstimateEntry {
 }
 
 #[derive(Default)]
-pub struct HeightChain {
+pub struct EstimateChain {
     entries: Vec<EstimateEntry>,
     veto: Option<Stop>,
     chosen: Option<(f64, String)>,
 }
 
-impl HeightChain {
+/// The height chain of step 1 (same type).
+pub type HeightChain = EstimateChain;
+
+impl EstimateChain {
     pub fn new() -> Self { Self::default() }
 
-    /// Record the result of `source` (`value`: the measured height, if any); true when it is
+    /// Record the result of `source` (`value`: the measured value, if any); true when it is
     /// chosen now.
     pub fn offer(&mut self, source: &str, value: Option<f64>, r: SourceResult, record_only: bool) -> bool {
         let mut entry = EstimateEntry { source: source.into(), value: value.map(|v| v as f32), used: false, record_only, reason: None };
@@ -68,7 +75,7 @@ impl HeightChain {
 
     pub fn entries(&self) -> &[EstimateEntry] { &self.entries }
 
-    /// Chosen (height, source) -> Ok(Some); nothing chosen and a veto -> Err(veto); neither -> Ok(None).
+    /// Chosen (value, source) -> Ok(Some); nothing chosen and a veto -> Err(veto); neither -> Ok(None).
     pub fn finish(self) -> Result<(Option<(f64, String)>, Vec<EstimateEntry>), (Stop, Vec<EstimateEntry>)> {
         match (self.chosen, self.veto) {
             (Some(c), _) => Ok((Some(c), self.entries)),
@@ -126,6 +133,17 @@ mod tests {
         c.offer("depth", Some(0.2), tall(), false);
         c.offer("scale", None, SourceResult::Accept(0.05), false);
         assert_eq!(c.finish().ok().unwrap().0, Some((0.05, "scale".to_string())));
+    }
+
+    #[test]
+    fn estimate_chain_is_the_height_chain() {
+        let mut c: EstimateChain = HeightChain::new();
+        assert!(!c.offer("depth", Some(12.0), SourceResult::Accept(12.0), true));
+        assert!(c.offer("mask", None, SourceResult::Accept(-30.0), false));
+        let (chosen, entries) = c.finish().ok().unwrap();
+        assert_eq!(chosen, Some((-30.0, "mask".to_string())));
+        assert_eq!(entries[0].value, Some(12.0));
+        assert!(entries[0].record_only);
     }
 
     #[test]

@@ -36,7 +36,7 @@ use crate::api::proxy::DetectorUpstream;
 use crate::api::rest::ApiError;
 use crate::kinematics::{self, Mat3, Pose, Vec3};
 use crate::model::{CameraMount, WorkspacePolicy};
-use crate::estimate::{HeightChain, SourceResult};
+use crate::estimate::{EstimateChain, EstimateEntry, SourceResult};
 use crate::macro_action::{fail, MacroCtx, Stop, SubDone};
 use crate::motion::{self, GoalSpec, GripperCommand, MotionError, PlanInput, RelFrame, Speed};
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
@@ -157,6 +157,21 @@ pub struct GraspSetup {
     pub height_record: Vec<HeightSource>,
     /// Object height above the table (m) per detected label (case-insensitive), for `prior`.
     pub height_priors: BTreeMap<String, f64>,
+    /// J6 yaw sources that decide, in this order: `mask` (the detector's `angle_deg`),
+    /// `depth` (`depth_angle_deg` of the depth frame), `box` (the box aspect). The first that
+    /// accepts decides the roll; an angle source whose frames disagree (`angle_spread`), whose
+    /// long side does not meet the plane (`ray`) or that does not fit J6 (`j6_limits`) ends
+    /// the alignment without a turn.
+    pub yaw_sources: Vec<YawSource>,
+    /// Yaw sources evaluated and reported in `yaw_estimates` without deciding; those also in
+    /// `yaw_sources` decide instead.
+    pub yaw_record: Vec<YawSource>,
+    /// Grasp width sources that decide, in this order: `mask` (the detector's `grasp_width_px`
+    /// on the grasp plane), `depth` (the depth measurement's width). The first that accepts is
+    /// `grasp_width_m`.
+    pub width_sources: Vec<WidthSource>,
+    /// Width sources evaluated and reported in `width_estimates` without deciding.
+    pub width_record: Vec<WidthSource>,
 }
 
 /// Object height source (`height_sources`, `height_record`).
@@ -166,6 +181,35 @@ pub enum HeightSource {
     Depth,
     Probe,
     Prior,
+}
+
+/// J6 yaw source (`yaw_sources`, `yaw_record`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum YawSource {
+    Mask,
+    Depth,
+    Box,
+}
+
+impl YawSource {
+    pub fn name(self) -> &'static str {
+        match self { Self::Mask => "mask", Self::Depth => "depth", Self::Box => "box" }
+    }
+}
+
+/// Grasp width source (`width_sources`, `width_record`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WidthSource {
+    Mask,
+    Depth,
+}
+
+impl WidthSource {
+    pub fn name(self) -> &'static str {
+        match self { Self::Mask => "mask", Self::Depth => "depth" }
+    }
 }
 
 /// `pre_open` setting.
@@ -251,6 +295,10 @@ impl Default for GraspSetup {
             height_sources: vec![HeightSource::Probe],
             height_record: vec![HeightSource::Depth],
             height_priors: BTreeMap::new(),
+            yaw_sources: vec![YawSource::Mask, YawSource::Box],
+            yaw_record: vec![YawSource::Depth],
+            width_sources: vec![WidthSource::Mask, WidthSource::Depth],
+            width_record: Vec::new(),
         }
     }
 }
@@ -306,6 +354,10 @@ impl GraspSetup {
         let unique = |l: &[HeightSource]| l.iter().enumerate().all(|(i, x)| !l[..i].contains(x));
         check(unique(&self.height_sources) && unique(&self.height_record), "height_sources / height_record must not repeat a source")?;
         check(!self.height_record.contains(&HeightSource::Probe), "height_record allows only depth and prior")?;
+        let unique_yaw = |l: &[YawSource]| l.iter().enumerate().all(|(i, x)| !l[..i].contains(x));
+        check(unique_yaw(&self.yaw_sources) && unique_yaw(&self.yaw_record), "yaw_sources / yaw_record must not repeat a source")?;
+        let unique_width = |l: &[WidthSource]| l.iter().enumerate().all(|(i, x)| !l[..i].contains(x));
+        check(unique_width(&self.width_sources) && unique_width(&self.width_record), "width_sources / width_record must not repeat a source")?;
         check(self.height_priors.values().all(|h| h.is_finite() && *h > 0.0 && *h <= 0.5), "height_priors must be in (0, 0.5] m")?;
         let labels: Vec<String> = self.height_priors.keys().map(|k| k.to_ascii_lowercase()).collect();
         check(labels.iter().enumerate().all(|(i, k)| !labels[..i].contains(k)), "height_priors labels must be unique ignoring case")?;
@@ -435,6 +487,12 @@ pub struct Detection {
     pub depth_conf: Option<f64>,
     pub length_px: Option<f64>,
     pub jaw_clear: Option<bool>,
+    /// The depth pipeline's own long-side angle (deg, as `angle_deg`), its confidence and
+    /// cross-section width (px), when the depth pipeline ran (rebot-vision `depth_angle_deg`,
+    /// `depth_angle_conf`, `depth_width_px`). Never mixed into `angle_deg` / `grasp_width_px`.
+    pub depth_angle_deg: Option<f64>,
+    pub depth_angle_conf: Option<f64>,
+    pub depth_width_px: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -566,6 +624,35 @@ impl HttpDetectionSource {
     }
 }
 
+/// Rescales a long-side angle (deg) and the width across it (px) from a frame scaled by
+/// (rx, ry) to the camera model's image; returns the scale along the long side (for a length),
+/// None without an angle (the width then scales isotropically).
+fn rescale_angle_width(angle_deg: &mut Option<f64>, width_px: &mut Option<f64>, rx: f64, ry: f64, cam: &CamModel) -> Option<f64> {
+    let isotropic = (rx * ry).sqrt();
+    let Some(deg) = *angle_deg else {
+        if let Some(w) = width_px.as_mut() {
+            *w *= isotropic;
+        }
+        return None;
+    };
+    let (sin_t, cos_t) = deg.to_radians().sin_cos();
+    let sl = (cos_t * rx).hypot(sin_t * ry);
+    let theta_cam = (sin_t * ry).atan2(cos_t * rx);
+    let deg_cam = (theta_cam.to_degrees() + 90.0).rem_euclid(180.0) - 90.0;
+    *angle_deg = Some(deg_cam);
+    let (sin_cam, cos_cam) = deg_cam.to_radians().sin_cos();
+    let denom = (-sin_cam / cam.fx).hypot(cos_cam / cam.fy);
+    let sw = if denom > 1e-12 {
+        (-sin_t * rx / cam.fx).hypot(cos_t * ry / cam.fy) / denom
+    } else {
+        isotropic
+    };
+    if let Some(w) = width_px.as_mut() {
+        *w *= sw;
+    }
+    Some(sl)
+}
+
 pub fn rescale_frame_to_cam(frame: &mut DetectionFrame, cam: &CamModel) {
     if !(frame.image_size_px[0] > 0.0 && frame.image_size_px[1] > 0.0 && cam.size[0] > 0.0 && cam.size[1] > 0.0) {
         return;
@@ -584,32 +671,12 @@ pub fn rescale_frame_to_cam(frame: &mut DetectionFrame, cam: &CamModel) {
     }
     for det in &mut frame.detections {
         let isotropic = (rx * ry).sqrt();
-        if let Some(deg) = det.angle_deg {
-            let (sin_t, cos_t) = deg.to_radians().sin_cos();
-            let sl = (cos_t * rx).hypot(sin_t * ry);
-            let theta_cam = (sin_t * ry).atan2(cos_t * rx);
-            let deg_cam = (theta_cam.to_degrees() + 90.0).rem_euclid(180.0) - 90.0;
-            det.angle_deg = Some(deg_cam);
-            let (sin_cam, cos_cam) = deg_cam.to_radians().sin_cos();
-            let denom = (-sin_cam / cam.fx).hypot(cos_cam / cam.fy);
-            let sw = if denom > 1e-12 {
-                (-sin_t * rx / cam.fx).hypot(cos_t * ry / cam.fy) / denom
-            } else {
-                isotropic
-            };
-            if let Some(w) = det.grasp_width_px.as_mut() {
-                *w *= sw;
-            }
-            if let Some(l) = det.length_px.as_mut() {
-                *l *= sl;
-            }
-        } else {
-            if let Some(w) = det.grasp_width_px.as_mut() {
-                *w *= isotropic;
-            }
-            if let Some(l) = det.length_px.as_mut() {
-                *l *= isotropic;
-            }
+        let sl_mask = rescale_angle_width(&mut det.angle_deg, &mut det.grasp_width_px, rx, ry, cam);
+        let sl_depth = rescale_angle_width(&mut det.depth_angle_deg, &mut det.depth_width_px, rx, ry, cam);
+        // the length follows the detector angle, else the depth angle (the angle the vision
+        // pipeline measured it along)
+        if let Some(l) = det.length_px.as_mut() {
+            *l *= sl_mask.or(sl_depth).unwrap_or(isotropic);
         }
     }
     frame.image_size_px = cam.size;
@@ -805,7 +872,11 @@ pub fn parse_detections(raw: &Value, size: [f64; 2]) -> Vec<Detection> {
         let depth_conf = item.is_object().then(|| f(item, &["depth_conf"])).flatten().map(|c| c.clamp(0.0, 1.0));
         let length_px = item.is_object().then(|| f(item, &["length_px"])).flatten().filter(|l| *l > 0.0);
         let jaw_clear = item.is_object().then(|| item.get("jaw_clear").and_then(Value::as_bool)).flatten();
-        out.push(Detection { label, score: score.clamp(0.0, 1.0), box_norm: b, angle_deg, angle_conf, grasp_width_px, mask_focus, disp_fg, disp_bg, depth_conf, length_px, jaw_clear });
+        let depth_angle_deg = item.is_object().then(|| f(item, &["depth_angle_deg"])).flatten().map(|a| (a + 90.0).rem_euclid(180.0) - 90.0);
+        let depth_angle_conf = item.is_object().then(|| f(item, &["depth_angle_conf"])).flatten().map(|c| c.clamp(0.0, 1.0));
+        let depth_width_px = item.is_object().then(|| f(item, &["depth_width_px"])).flatten().filter(|w| *w > 0.0);
+        out.push(Detection { label, score: score.clamp(0.0, 1.0), box_norm: b, angle_deg, angle_conf, grasp_width_px, mask_focus, disp_fg, disp_bg, depth_conf, length_px, jaw_clear,
+            depth_angle_deg, depth_angle_conf, depth_width_px });
     }
     out
 }
@@ -959,6 +1030,8 @@ struct DepthCache {
     prior: Option<TableObs>,
     meas: Option<DepthMeasurement>,
     det0: Option<Detection>,
+    /// Why `meas` is None.
+    why: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1122,8 +1195,24 @@ pub fn calibrate_depth(
     prior: Option<&TableObs>,
     table_z_m: f64,
 ) -> Option<DepthCalibration> {
-    let depth = depth?;
-    
+    calibrate_depth_why(cam, pose, depth, prior, table_z_m).ok()
+}
+
+/// [`calibrate_depth`] with the reason it failed: `no_depth_frame` (the frame has no depth),
+/// `too_few_samples` (metric: < 3 table samples; relative: < 8 and no two-height pair),
+/// `table_contradicts_fk` (the table samples do not fit the FK table depths),
+/// `no_oblique_spread` (relative: the table's inverse depth spans < 0.35 1/m),
+/// `no_two_height_spread` / `two_height_fit` (relative with a start frame: the two views are
+/// too close, or the combined fit fails).
+pub fn calibrate_depth_why(
+    cam: &CamModel,
+    pose: &Pose,
+    depth: Option<&DepthFrameInfo>,
+    prior: Option<&TableObs>,
+    table_z_m: f64,
+) -> Result<DepthCalibration, &'static str> {
+    let depth = depth.ok_or("no_depth_frame")?;
+
     let mut valid_samples: Vec<(f64, f64, f64)> = Vec::new();
     for sample in &depth.table_samples {
         let [u, v, disp] = *sample;
@@ -1151,16 +1240,17 @@ pub fn calibrate_depth(
                     (z_pred - z_fk).abs() / z_fk
                 }).collect();
                 if median(&mut prior_errs) <= 0.12 && median(&mut fit_errs) <= 0.12 {
-                    return Some(DepthCalibration { a, b, source: "metric_table" });
+                    return Ok(DepthCalibration { a, b, source: "metric_table" });
                 }
             }
-            return None;
+            return Err("table_contradicts_fk");
         }
         // Fewer than 3 table samples (table occluded): the nominal scale alone is not checked
         // against FK, so it must not replace the mechanical probe.
-        return None;
+        return Err("too_few_samples");
     }
 
+    let mut why = "too_few_samples";
     if valid_samples.len() >= 8 {
         let mut min_inv_z = f64::INFINITY;
         let mut max_inv_z = f64::NEG_INFINITY;
@@ -1170,8 +1260,11 @@ pub fn calibrate_depth(
         }
         if max_inv_z - min_inv_z >= 0.35 {
             if let Some(cal) = fit_oblique_ransac(&valid_samples) {
-                return Some(cal);
+                return Ok(cal);
             }
+            why = "table_contradicts_fk";
+        } else {
+            why = "no_oblique_spread";
         }
     }
 
@@ -1184,7 +1277,9 @@ pub fn calibrate_depth(
             let d_inv_z = inv_z_2 - prior_obs.inv_z_fk;
             let d_disp = d_2 - prior_obs.disp_table;
 
+            why = "no_two_height_spread";
             if d_inv_z.abs() >= 0.35 && d_disp.abs() >= 0.05 && (d_inv_z * d_disp > 0.0) {
+                why = "two_height_fit";
                 let mut combined = prior_obs.samples.clone();
                 combined.extend_from_slice(&valid_samples);
                 if let Some(cal) = fit_oblique_ransac(&combined) {
@@ -1199,7 +1294,7 @@ pub fn calibrate_depth(
                             inliers as f64 >= 0.60 * samples.len() as f64
                         };
                         if check_inliers(&prior_obs.samples) && check_inliers(&valid_samples) {
-                            return Some(DepthCalibration { a: cal.a, b: cal.b, source: "two_height_fk" });
+                            return Ok(DepthCalibration { a: cal.a, b: cal.b, source: "two_height_fk" });
                         }
                     }
                 }
@@ -1207,7 +1302,7 @@ pub fn calibrate_depth(
         }
     }
 
-    None
+    Err(why)
 }
 
 fn metric_table_contradicts_fk(cam: &CamModel, pose: &Pose, depth: Option<&DepthFrameInfo>, table_z_m: f64) -> bool {
@@ -1226,40 +1321,60 @@ pub fn measure_detection_depth_with_cal(
     det: &Detection,
     cal: &DepthCalibration,
 ) -> Option<DepthMeasurement> {
-    if det.depth_conf.unwrap_or(0.0) < 0.35 { return None; }
-    let (Some(disp_fg), Some(disp_bg)) = (det.disp_fg, det.disp_bg) else { return None; };
-    if !(disp_fg > disp_bg) { return None; }
+    measure_detection_depth_with_cal_why(cam, pose, det, cal).ok()
+}
+
+/// [`measure_detection_depth_with_cal`] with the reason it failed: `low_conf` (`depth_conf`
+/// < 0.35), `no_disparity`, `bad_disparity` (foreground not nearer than the table, or depths
+/// out of range), `too_flat` (< 2 mm above the table).
+pub fn measure_detection_depth_with_cal_why(
+    cam: &CamModel,
+    pose: &Pose,
+    det: &Detection,
+    cal: &DepthCalibration,
+) -> Result<DepthMeasurement, &'static str> {
+    if det.depth_conf.unwrap_or(0.0) < 0.35 { return Err("low_conf"); }
+    let (Some(disp_fg), Some(disp_bg)) = (det.disp_fg, det.disp_bg) else { return Err("no_disparity"); };
+    if !(disp_fg > disp_bg) { return Err("bad_disparity"); }
     let denom_fg = cal.a * disp_fg + cal.b;
     let denom_bg = cal.a * disp_bg + cal.b;
-    if !(denom_fg > 0.1 && denom_bg > 0.1) { return None; }
+    if !(denom_fg > 0.1 && denom_bg > 0.1) { return Err("bad_disparity"); }
     let z_fg = 1.0 / denom_fg;
     let z_bg = 1.0 / denom_bg;
-    if !( (0.06..=2.0).contains(&z_fg) && z_bg > z_fg ) { return None; }
+    if !( (0.06..=2.0).contains(&z_fg) && z_bg > z_fg ) { return Err("bad_disparity"); }
 
     let centre_px = cam.to_px(box_centre(&det.box_norm));
     let ray = cam.ray_world_per_z(pose, centre_px);
     let h_raw = (z_bg - z_fg) * ray[2].abs();
-    if !(h_raw > 0.002) { return None; }
+    if !(h_raw > 0.002) { return Err("too_flat"); }
     let h = h_raw.max(0.005);
 
     let depth_m = z_fg;
-    let (sin_t, cos_t) = det.angle_deg.map(|deg| deg.to_radians().sin_cos()).unwrap_or((0.0, 0.0));
+    // the detector's width and angle (a segmentation mask) when it reports them, else the
+    // depth pipeline's own (a plain detection model): the same inputs as before rebot-vision
+    // reported the depth values separately
+    let (width_px, angle_deg) = if det.angle_deg.is_some() || det.grasp_width_px.is_some() {
+        (det.grasp_width_px, det.angle_deg)
+    } else {
+        (det.depth_width_px, det.depth_angle_deg)
+    };
+    let (sin_t, cos_t) = angle_deg.map(|deg| deg.to_radians().sin_cos()).unwrap_or((0.0, 0.0));
     let f_geom = (cam.fx * cam.fy).sqrt();
-    let width_m = det.grasp_width_px.filter(|w| *w > 0.0).map(|w| {
-        if det.angle_deg.is_some() {
+    let width_m = width_px.filter(|w| *w > 0.0).map(|w| {
+        if angle_deg.is_some() {
             w * z_fg * (-sin_t / cam.fx).hypot(cos_t / cam.fy)
         } else {
             w * z_fg / f_geom
         }
     });
     let length_m = det.length_px.filter(|l| *l > 0.0).map(|l| {
-        if det.angle_deg.is_some() {
+        if angle_deg.is_some() {
             l * z_fg * (cos_t / cam.fx).hypot(sin_t / cam.fy)
         } else {
             l * z_fg / f_geom
         }
     });
-    Some(DepthMeasurement {
+    Ok(DepthMeasurement {
         height_m: h,
         depth_m,
         width_m,
@@ -1722,9 +1837,12 @@ impl Orchestrator {
         // centre above the estimate
         let camera_down = planned.camera_down;
         let pose0 = self.pose().await;
-        // depth capture runs when depth is a height source or recorded (`height_record`)
+        // depth capture runs when depth is a height source or recorded (`height_record`), or
+        // decides the yaw (`yaw_sources`); the depth yaw / width record and the depth width
+        // source use it when it ran
         let depth = self.triggered && self.depth_available && self.lens_known
-            && (s.height_sources.contains(&HeightSource::Depth) || s.height_record.contains(&HeightSource::Depth));
+            && (s.height_sources.contains(&HeightSource::Depth) || s.height_record.contains(&HeightSource::Depth)
+                || s.yaw_sources.contains(&YawSource::Depth));
         let depth_cache = if depth { self.depth_start_frame(planned, &pose0).await } else { DepthCache::default() };
 
         self.phase("approach", 0.1).await?;
@@ -1774,16 +1892,24 @@ impl Orchestrator {
 
         // the overhead depth trigger replaces `after` and `c.last` / `c.frames` with its frame
         // whenever it runs, also when depth is record-only (only the height selection ignores it)
-        let depth_meas = if depth { self.depth_overhead(&planned.request.label, &mut c, &mut after, &pose0, depth_cache).await } else { None };
+        let (depth_meas, depth_why) = if depth {
+            match self.depth_overhead(&planned.request.label, &mut c, &mut after, &pose0, depth_cache).await {
+                Ok(m) => (Some(m), "no_measurement"),
+                Err(why) => (None, why),
+            }
+        } else {
+            (None, "unavailable")
+        };
+        let depth_res = depth_meas.as_ref().ok_or(depth_why);
 
         // object height: record-only sources first (they do not move the arm), then the
         // `height_sources` in order until one accepts; `grasp_height_m` when none does. Box
         // centres map onto the object's top plane, the jaws close part way up the object
         let label = &planned.request.label;
         let record: Vec<HeightSource> = s.height_record.iter().copied().filter(|x| !s.height_sources.contains(x)).collect();
-        let mut chain = HeightChain::new();
+        let mut chain = EstimateChain::new();
         for src in &record {
-            let (name, value, r) = if *src == HeightSource::Depth { self.depth_source(depth, depth_meas.as_ref()) } else { self.prior_source(label) };
+            let (name, value, r) = if *src == HeightSource::Depth { self.depth_source(depth, depth_res) } else { self.prior_source(label) };
             chain.offer(&name, value, r, true);
         }
         self.write_estimates(&chain).await;
@@ -1793,7 +1919,7 @@ impl Orchestrator {
             // a prior does not override a measured too-tall result
             if *src == HeightSource::Prior && chain.vetoed() { continue; }
             let (name, value, r) = match src {
-                HeightSource::Depth => self.depth_source(depth, depth_meas.as_ref()),
+                HeightSource::Depth => self.depth_source(depth, depth_res),
                 HeightSource::Prior => self.prior_source(label),
                 // only a too-tall measurement is a result; stop / fault / other failures end the grasp
                 HeightSource::Probe => match self.probe_height(&c, label, &mut after).await {
@@ -1878,75 +2004,39 @@ impl Orchestrator {
         let (turn, align) = if s.align_j6 { self.align_turn(&c, plane).await } else { (None, "off".to_string()) };
         self.sup.inner().write().await.update_action(self.id, |a| { a.align = Some(align.clone()); a.align_turn_rad = turn.map(|t| t as f32); });
 
-        // the width is measured whatever the angle confidence: a disc or a square has a low
-        // angle_conf but a valid width (any closing direction sees about the same width)
-        let mut measured_width_m = None;
-        if let Some(w_px) = frames_width_px(&c.frames, 0.0) {
-            let accepted_angle = frames_angle(&c.frames, s.align_min_angle_conf)
-                .filter(|&(_alpha, spread)| s.align_max_angle_spread_deg <= 0.0 || spread <= s.align_max_angle_spread_deg);
-            let (u_x, u_y) = if let Some((alpha, _spread)) = accepted_angle {
-                let closing_deg = alpha + 90.0;
-                (closing_deg.to_radians().cos(), closing_deg.to_radians().sin())
-            } else {
-                let jaw = kinematics::mat_vec(&kinematics::transpose(&self.cam.rec), &[0.0, 1.0, 0.0]);
-                let n = jaw[0].hypot(jaw[1]);
-                if n > 1e-6 { (jaw[0] / n, jaw[1] / n) } else { (0.0, 1.0) }
+        // grasp width: `width_record` sources first (reported only), then `width_sources` in
+        // order until one accepts; one limit check on the chosen width. The width is measured
+        // whatever the angle confidence: a disc or a square has a low angle_conf but a valid
+        // width (any closing direction sees about the same width)
+        let width_record: Vec<WidthSource> = s.width_record.iter().copied().filter(|x| !s.width_sources.contains(x)).collect();
+        let mut wchain = EstimateChain::new();
+        let width_of = |src: WidthSource| -> SourceResult {
+            let r = match src {
+                WidthSource::Mask => self.mask_width_m(&c, plane),
+                WidthSource::Depth => match depth_res {
+                    Ok(m) => m.width_m.ok_or("no_width"),
+                    Err(why) => Err(if depth { why } else { "unavailable" }),
+                },
             };
-            let centre_px = self.cam.to_px(box_centre(&c.last.box_norm));
-            let half_w = w_px / 2.0;
-            let p0_px = [centre_px[0] - half_w * u_x, centre_px[1] - half_w * u_y];
-            let p1_px = [centre_px[0] + half_w * u_x, centre_px[1] + half_w * u_y];
-            if let (Some(p0), Some(p1)) = (self.cam.plane_point(&c.pose, p0_px, plane), self.cam.plane_point(&c.pose, p1_px, plane)) {
-                let width_m = kinematics::norm(&kinematics::sub(&p1, &p0));
-                measured_width_m = Some(width_m);
-                self.sup.inner().write().await.update_action(self.id, |a| {
-                    a.grasp_width_m = Some(width_m as f32);
-                });
-                let max_w = {
-                    let inner = self.sup.inner().read().await;
-                    let policy = inner.config.gripper_policy.as_ref();
-                    if policy.is_some_and(|p| p.is_calibrated()) {
-                        let p = policy.unwrap();
-                        let calib_limit = (p.opening_m(p.open_rad) as f64) - s.pre_open_margin_m;
-                        if s.max_grasp_width_m > 0.0 {
-                            s.max_grasp_width_m.min(calib_limit)
-                        } else {
-                            calib_limit
-                        }
-                    } else {
-                        s.max_grasp_width_m
-                    }
-                };
-                if max_w > 0.0 && width_m > max_w {
-                    return Err(fail("TOO_WIDE", format!("Object width {width_m:.3} m exceeds max_grasp_width_m {:.3} m", max_w)));
-                }
-            }
+            match r { Ok(w) => SourceResult::Accept(w), Err(why) => SourceResult::Reject(why.into()) }
+        };
+        for src in &width_record {
+            wchain.offer(src.name(), None, width_of(*src), true);
         }
-
-        if measured_width_m.is_none() {
-            if let Some(w) = depth_meas.as_ref().and_then(|m| m.width_m) {
-                measured_width_m = Some(w);
-                self.sup.inner().write().await.update_action(self.id, |a| {
-                    a.grasp_width_m = Some(w as f32);
-                });
-                let max_w = {
-                    let inner = self.sup.inner().read().await;
-                    let policy = inner.config.gripper_policy.as_ref();
-                    if policy.is_some_and(|p| p.is_calibrated()) {
-                        let p = policy.unwrap();
-                        let calib_limit = (p.opening_m(p.open_rad) as f64) - s.pre_open_margin_m;
-                        if s.max_grasp_width_m > 0.0 {
-                            s.max_grasp_width_m.min(calib_limit)
-                        } else {
-                            calib_limit
-                        }
-                    } else {
-                        s.max_grasp_width_m
-                    }
-                };
-                if max_w > 0.0 && w > max_w {
-                    return Err(fail("TOO_WIDE", format!("Object width {w:.3} m exceeds max_grasp_width_m {:.3} m", max_w)));
-                }
+        for src in &s.width_sources {
+            if wchain.done() { break; }
+            wchain.offer(src.name(), None, width_of(*src), false);
+        }
+        let (chosen_width, width_entries) = match wchain.finish() { Ok(r) => r, Err((_, e)) => (None, e) };
+        let measured_width_m = chosen_width.map(|(w, _)| w);
+        self.sup.inner().write().await.update_action(self.id, |a| {
+            a.width_estimates = width_entries;
+            if let Some(w) = measured_width_m { a.grasp_width_m = Some(w as f32); }
+        });
+        if let Some(w) = measured_width_m {
+            let max_w = self.max_grasp_width().await;
+            if max_w > 0.0 && w > max_w {
+                return Err(fail("TOO_WIDE", format!("Object width {w:.3} m exceeds max_grasp_width_m {:.3} m", max_w)));
             }
         }
 
@@ -2204,7 +2294,7 @@ impl Orchestrator {
             rescale_frame_to_cam(&mut frame0, &self.cam);
             if let Some(ref d) = frame0.depth {
                 cache.prior = extract_table_obs(&self.cam, pose0, d, s.table_z_m);
-                let cal0 = calibrate_depth(&self.cam, pose0, Some(d), None, s.table_z_m);
+                let cal0 = calibrate_depth_why(&self.cam, pose0, Some(d), None, s.table_z_m);
                 let tracker0 = Tracker {
                     label: planned.request.label.clone(),
                     predicted: planned.request.box_norm,
@@ -2212,22 +2302,33 @@ impl Orchestrator {
                 };
                 if let Some(det0) = tracker0.find(&frame0, s) {
                     cache.det0 = Some(det0.clone());
-                    if let Some(ref cal) = cal0 {
-                        cache.meas = measure_detection_depth_with_cal(&self.cam, pose0, &det0, cal);
+                    match cal0 {
+                        Ok(ref cal) => match measure_detection_depth_with_cal_why(&self.cam, pose0, &det0, cal) {
+                            Ok(m) => cache.meas = Some(m),
+                            Err(why) => cache.why = Some(why),
+                        },
+                        Err(why) => cache.why = Some(why),
                     }
+                } else {
+                    cache.why = Some("target_lost");
                 }
+            } else {
+                cache.why = Some("no_depth_frame");
             }
+        } else {
+            cache.why = Some("no_depth_frame");
         }
         cache
     }
 
     /// Overhead depth trigger at the centred pose: its frame becomes `after`, and its matched
     /// detection `c.last` (appended to `c.frames`). Returns the overhead measurement, else the
-    /// start-frame one.
-    async fn depth_overhead(&self, label: &str, c: &mut Centred, after: &mut Option<u64>, pose0: &Pose, cache: DepthCache) -> Option<DepthMeasurement> {
+    /// start-frame one, else why there is none (the last failed attempt).
+    async fn depth_overhead(&self, label: &str, c: &mut Centred, after: &mut Option<u64>, pose0: &Pose, cache: DepthCache) -> Result<DepthMeasurement, &'static str> {
         let s = &self.setup;
-        let DepthCache { prior: cached_prior, meas: mut cached_meas, det0: cached_det0 } = cache;
+        let DepthCache { prior: cached_prior, meas: mut cached_meas, det0: cached_det0, why: cached_why } = cache;
         let mut depth_meas: Option<DepthMeasurement> = None;
+        let mut why = cached_why.unwrap_or("no_depth_frame");
         let focus = MaskFocus {
             label: Some(label.to_string()),
             box_norm: c.last.box_norm,
@@ -2239,6 +2340,7 @@ impl Orchestrator {
             if metric_table_contradicts_fk(&self.cam, &c.pose, overhead_frame.depth.as_ref(), s.table_z_m) {
                 tracing::debug!("Overhead table samples contradict FK; invalidating cached start-frame depth measurement");
                 cached_meas = None;
+                why = "table_contradicts_fk";
             }
             let tracker = Tracker {
                 label: label.to_string(),
@@ -2249,42 +2351,56 @@ impl Orchestrator {
                 c.last = overhead_det.clone();
                 c.frames.push(overhead_det.clone());
 
-                if let Some(cal) = calibrate_depth(&self.cam, &c.pose, overhead_frame.depth.as_ref(), None, s.table_z_m) {
-                    depth_meas = measure_detection_depth_with_cal(&self.cam, &c.pose, &overhead_det, &cal);
+                match calibrate_depth_why(&self.cam, &c.pose, overhead_frame.depth.as_ref(), None, s.table_z_m)
+                    .and_then(|cal| measure_detection_depth_with_cal_why(&self.cam, &c.pose, &overhead_det, &cal)) {
+                    Ok(m) => depth_meas = Some(m),
+                    Err(w) => why = w,
                 }
                 if depth_meas.is_none() {
                     depth_meas = cached_meas.clone();
                 }
                 if depth_meas.is_none() {
-                    if let Some(cal) = calibrate_depth(&self.cam, &c.pose, overhead_frame.depth.as_ref(), cached_prior.as_ref(), s.table_z_m) {
-                        if cal.source == "two_height_fk" {
-                            if let (Some(ref det0), Some(m1)) = (&cached_det0, measure_detection_depth_with_cal(&self.cam, &c.pose, &overhead_det, &cal)) {
-                                if let Some(m0) = measure_detection_depth_with_cal(&self.cam, pose0, det0, &cal) {
-                                    if (m0.height_m - m1.height_m).abs() <= (0.20 * m1.height_m).max(0.008) {
-                                        depth_meas = Some(m1);
-                                    } else {
-                                        tracing::debug!("two_height_fk rejected: height drifted between frames (m0={:.3}, m1={:.3})", m0.height_m, m1.height_m);
-                                    }
+                    match calibrate_depth_why(&self.cam, &c.pose, overhead_frame.depth.as_ref(), cached_prior.as_ref(), s.table_z_m) {
+                        Ok(cal) if cal.source == "two_height_fk" => {
+                            if let Some(ref det0) = cached_det0 {
+                                match measure_detection_depth_with_cal_why(&self.cam, &c.pose, &overhead_det, &cal) {
+                                    Ok(m1) => match measure_detection_depth_with_cal_why(&self.cam, pose0, det0, &cal) {
+                                        Ok(m0) => {
+                                            if (m0.height_m - m1.height_m).abs() <= (0.20 * m1.height_m).max(0.008) {
+                                                depth_meas = Some(m1);
+                                            } else {
+                                                tracing::debug!("two_height_fk rejected: height drifted between frames (m0={:.3}, m1={:.3})", m0.height_m, m1.height_m);
+                                                why = "two_height_mismatch";
+                                            }
+                                        }
+                                        Err(w) => why = w,
+                                    },
+                                    Err(w) => why = w,
                                 }
                             }
-                        } else {
-                            depth_meas = measure_detection_depth_with_cal(&self.cam, &c.pose, &overhead_det, &cal);
                         }
+                        Ok(cal) => match measure_detection_depth_with_cal_why(&self.cam, &c.pose, &overhead_det, &cal) {
+                            Ok(m) => depth_meas = Some(m),
+                            Err(w) => why = w,
+                        },
+                        Err(w) => why = w,
                     }
                 }
+            } else {
+                why = "target_lost";
             }
         }
-        depth_meas.or(cached_meas)
+        depth_meas.or(cached_meas).ok_or(why)
     }
 
     /// Height source `depth` (entry name `depth:<anchor>`); `ran`: the depth capture ran.
-    fn depth_source(&self, ran: bool, meas: Option<&DepthMeasurement>) -> (String, Option<f64>, SourceResult) {
+    fn depth_source(&self, ran: bool, meas: Result<&DepthMeasurement, &'static str>) -> (String, Option<f64>, SourceResult) {
         let reject = |r: &str| ("depth".to_string(), None, SourceResult::Reject(r.into()));
         match meas {
-            Some(m) => (format!("depth:{}", m.source), Some(m.height_m), self.height_result(m.height_m)),
-            None if ran => reject("no_measurement"),
-            None if !self.lens_known => reject("no_lens_centre"),
-            None => reject("unavailable"),
+            Ok(m) => (format!("depth:{}", m.source), Some(m.height_m), self.height_result(m.height_m)),
+            Err(why) if ran => reject(why),
+            Err(_) if !self.lens_known => reject("no_lens_centre"),
+            Err(_) => reject("unavailable"),
         }
     }
 
@@ -2304,7 +2420,7 @@ impl Orchestrator {
         }
     }
 
-    async fn write_estimates(&self, chain: &HeightChain) {
+    async fn write_estimates(&self, chain: &EstimateChain) {
         let entries = chain.entries().to_vec();
         self.sup.inner().write().await.update_action(self.id, |a| a.height_estimates = entries);
     }
@@ -2597,11 +2713,11 @@ impl Orchestrator {
     }
 
     /// J6 roll (about the tool axis) that closes the jaws across the object's short side, and
-    /// the `align` status. From the detector angle when the centring frames carry one with
+    /// the `align` status, from the yaw chain ([`yaw_chain`], `yaw_sources` default `mask`
+    /// then `box`): the detector angle when the centring frames carry one with
     /// `angle_conf >= align_min_angle_conf`, else ±pi/2 from the box aspect. No turn when the
     /// last box is unreliable ([`align_guard`]) or no candidate fits J6's limits.
     async fn align_turn(&self, c: &Centred, plane: f64) -> (Option<f64>, String) {
-        if let Err(reason) = align_guard(&c.last, &c.frames, self.cam.size) { return (None, format!("skipped:{reason}")); }
         let pose = self.pose().await;
         let inner = self.sup.inner().read().await;
         let (q6, lim) = (f64::from(inner.commanded_positions[5]), inner.config.limits[5].clone());
@@ -2609,40 +2725,183 @@ impl Orchestrator {
         let sign = inner.config.arm_model.joint_map().get(5).map_or(1.0, |m| m.sign);
         drop(inner);
         let room = |t: f64| { let q = q6 + sign * t; q >= f64::from(lim.min_position) + 0.1 && q <= f64::from(lim.max_position) - 0.1 };
-        if let Some((alpha, spread)) = frames_angle(&c.frames, self.setup.align_min_angle_conf) {
-            self.sup.inner().write().await.update_action(self.id, |a| {
-                a.angle_spread_deg = Some(spread as f32);
-            });
-            if self.setup.align_max_angle_spread_deg > 0.0 && spread > self.setup.align_max_angle_spread_deg {
-                return (None, "skipped:angle_spread".into());
-            }
-            // the long side on the plane, seen from the pose of the centring frames
+        // an image angle: the long side on the plane, seen from the pose of the centring frames
+        let angle_turn = |alpha: f64| -> Result<Option<f64>, &'static str> {
             let px = self.cam.to_px(box_centre(&c.last.box_norm));
             let (a, b) = (alpha.to_radians().cos(), alpha.to_radians().sin());
             let (Some(p0), Some(p1)) = (self.cam.plane_point(&c.pose, px, plane), self.cam.plane_point(&c.pose, [px[0] + 20.0 * a, px[1] + 20.0 * b], plane)) else {
-                return (None, "skipped:ray".into());
+                return Err("ray");
             };
             let jaw = kinematics::mat_vec(&pose.r, &[0.0, 1.0, 0.0]);
             let t0 = roll_across_long_side(jaw, kinematics::sub(&p1, &p0));
             let pi = std::f64::consts::PI;
             let Some(t) = [t0, t0 + pi, t0 - pi].into_iter().filter(|t| room(*t)).min_by(|x, y| x.abs().total_cmp(&y.abs())) else {
-                return (None, "skipped:j6_limits".into());
+                return Err("j6_limits");
             };
-            return if t.abs() < 1e-3 { (None, "kept:angle".into()) } else { (Some(t), "turned:angle".into()) };
-        }
-        let b = c.last.box_norm;
-        let (w, h) = ((b[2] - b[0]) * self.cam.size[0], (b[3] - b[1]) * self.cam.size[1]);
-        if w.max(h) / w.min(h).max(1e-6) < self.setup.align_min_aspect { return (None, "skipped:aspect".into()); }
-        // jaw closing direction (end_link y) seen in the image
-        let jaw = kinematics::mat_vec(&kinematics::transpose(&self.cam.rec), &[0.0, 1.0, 0.0]);
-        let jaw_along_x = jaw[0].abs() >= jaw[1].abs();
-        let short_along_x = w < h;
-        if jaw_along_x == short_along_x { return (None, "kept:box".into()); }
-        let half = std::f64::consts::FRAC_PI_2;
-        // roll about +x_tool; J6 turns with it when its axis is the tool axis
-        let t = [half, -half].into_iter().find(|t| room(*t)).unwrap_or(half);
-        (Some(t), "turned:box".into())
+            Ok((t.abs() >= 1e-3).then_some(t))
+        };
+        // the box: ±pi/2 when the short side is along the jaw closing direction (end_link y)
+        // seen in the image
+        let box_turn = |short_along_x: bool| -> Option<f64> {
+            let jaw = kinematics::mat_vec(&kinematics::transpose(&self.cam.rec), &[0.0, 1.0, 0.0]);
+            let jaw_along_x = jaw[0].abs() >= jaw[1].abs();
+            if jaw_along_x == short_along_x { return None; }
+            let half = std::f64::consts::FRAC_PI_2;
+            // roll about +x_tool; J6 turns with it when its axis is the tool axis
+            Some([half, -half].into_iter().find(|t| room(*t)).unwrap_or(half))
+        };
+        let out = yaw_chain(&self.setup, &c.last, &c.frames, self.cam.size, &angle_turn, &box_turn);
+        self.sup.inner().write().await.update_action(self.id, |a| {
+            if let Some(spread) = out.angle_spread_deg { a.angle_spread_deg = Some(spread as f32); }
+            a.yaw_estimates = out.entries.clone();
+        });
+        (out.turn, out.align)
     }
+
+    /// Grasp width source `mask`: the median `grasp_width_px` of the centring frames across the
+    /// mask angle (when it is confident and consistent; else along the jaw axis), on the plane.
+    fn mask_width_m(&self, c: &Centred, plane: f64) -> Result<f64, &'static str> {
+        let s = &self.setup;
+        let Some(w_px) = frames_width_px(&c.frames, 0.0) else { return Err("no_width") };
+        let accepted_angle = frames_angle(&c.frames, s.align_min_angle_conf)
+            .filter(|&(_alpha, spread)| s.align_max_angle_spread_deg <= 0.0 || spread <= s.align_max_angle_spread_deg);
+        let (u_x, u_y) = if let Some((alpha, _spread)) = accepted_angle {
+            let closing_deg = alpha + 90.0;
+            (closing_deg.to_radians().cos(), closing_deg.to_radians().sin())
+        } else {
+            let jaw = kinematics::mat_vec(&kinematics::transpose(&self.cam.rec), &[0.0, 1.0, 0.0]);
+            let n = jaw[0].hypot(jaw[1]);
+            if n > 1e-6 { (jaw[0] / n, jaw[1] / n) } else { (0.0, 1.0) }
+        };
+        let centre_px = self.cam.to_px(box_centre(&c.last.box_norm));
+        let half_w = w_px / 2.0;
+        let p0_px = [centre_px[0] - half_w * u_x, centre_px[1] - half_w * u_y];
+        let p1_px = [centre_px[0] + half_w * u_x, centre_px[1] + half_w * u_y];
+        match (self.cam.plane_point(&c.pose, p0_px, plane), self.cam.plane_point(&c.pose, p1_px, plane)) {
+            (Some(p0), Some(p1)) => Ok(kinematics::norm(&kinematics::sub(&p1, &p0))),
+            _ => Err("ray"),
+        }
+    }
+
+    /// TOO_WIDE limit (m; 0 = off): the calibrated full opening minus `pre_open_margin_m`, at
+    /// most `max_grasp_width_m` (when > 0); `max_grasp_width_m` without a calibrated policy.
+    async fn max_grasp_width(&self) -> f64 {
+        let s = &self.setup;
+        let inner = self.sup.inner().read().await;
+        match inner.config.gripper_policy.as_ref().filter(|p| p.is_calibrated()) {
+            Some(p) => {
+                let calib_limit = (p.opening_m(p.open_rad) as f64) - s.pre_open_margin_m;
+                if s.max_grasp_width_m > 0.0 { s.max_grasp_width_m.min(calib_limit) } else { calib_limit }
+            }
+            None => s.max_grasp_width_m,
+        }
+    }
+}
+
+/// Result of [`yaw_chain`]: the roll, the `align` status, the `yaw_estimates` entries and the
+/// mask angle dispersion (`angle_spread_deg`, written only by a deciding `mask` source).
+#[derive(Debug, Clone, PartialEq)]
+pub struct YawOutcome {
+    pub turn: Option<f64>,
+    pub align: String,
+    pub entries: Vec<EstimateEntry>,
+    pub angle_spread_deg: Option<f64>,
+}
+
+/// Mean angle and dispersion of an angle source's frames (`mask`: `angle_deg` / `angle_conf`,
+/// `depth`: `depth_angle_deg` / `depth_angle_conf`).
+fn yaw_angle(src: YawSource, frames: &[Detection], min_conf: f64) -> Option<(f64, f64)> {
+    match src {
+        YawSource::Mask => frames_angle(frames, min_conf),
+        YawSource::Depth => frames_angle_by(frames, min_conf, |d| (d.depth_angle_deg, d.depth_angle_conf)),
+        YawSource::Box => None,
+    }
+}
+
+/// The J6 yaw estimate chain (`yaw_sources`, `yaw_record`). Record-only sources are evaluated
+/// first (value only, no turn). [`align_guard`] then decides for every source (`skipped:<why>`).
+/// The deciding sources run in order: `mask` / `depth` without a confident angle pass to the
+/// next source; with one, they decide: `skipped:angle_spread` (frames disagree), `skipped:ray`
+/// / `skipped:j6_limits` (from `angle_turn`), else `kept:angle` / `turned:angle` (`mask`) or
+/// `kept:depth` / `turned:depth` (`depth`). `box` passes on `aspect` (box ratio below
+/// `align_min_aspect`), else `kept:box` / `turned:box` (`box_turn(short side along image x)`).
+/// When every source passes: `skipped:<reason of the last one>`.
+pub fn yaw_chain(
+    s: &GraspSetup,
+    last: &Detection,
+    frames: &[Detection],
+    size: [f64; 2],
+    angle_turn: &dyn Fn(f64) -> Result<Option<f64>, &'static str>,
+    box_turn: &dyn Fn(bool) -> Option<f64>,
+) -> YawOutcome {
+    let spread_ok = |spread: f64| s.align_max_angle_spread_deg <= 0.0 || spread <= s.align_max_angle_spread_deg;
+    let b = last.box_norm;
+    let (w, h) = ((b[2] - b[0]) * size[0], (b[3] - b[1]) * size[1]);
+    let aspect_ok = w.max(h) / w.min(h).max(1e-6) >= s.align_min_aspect;
+    // the box's long side in the image: along x (0 deg) or along y (-90 deg)
+    let box_alpha = if w >= h { 0.0 } else { -90.0 };
+    let mut chain = EstimateChain::new();
+    let mut out = YawOutcome { turn: None, align: String::new(), entries: Vec::new(), angle_spread_deg: None };
+    let finish = |chain: EstimateChain, mut out: YawOutcome, turn: Option<f64>, align: String| {
+        out.turn = turn;
+        out.align = align;
+        out.entries = match chain.finish() { Ok((_, e)) | Err((_, e)) => e };
+        out
+    };
+    for src in s.yaw_record.iter().filter(|x| !s.yaw_sources.contains(x)) {
+        let r = match src {
+            YawSource::Box if aspect_ok => (Some(box_alpha), SourceResult::Accept(box_alpha)),
+            YawSource::Box => (Some(box_alpha), SourceResult::Reject("aspect".into())),
+            _ => match yaw_angle(*src, frames, s.align_min_angle_conf) {
+                Some((alpha, spread)) if spread_ok(spread) => (Some(alpha), SourceResult::Accept(alpha)),
+                Some((alpha, _)) => (Some(alpha), SourceResult::Reject("angle_spread".into())),
+                None => (None, SourceResult::Reject("no_angle".into())),
+            },
+        };
+        chain.offer(src.name(), r.0, r.1, true);
+    }
+    if let Err(reason) = align_guard(last, frames, size) {
+        return finish(chain, out, None, format!("skipped:{reason}"));
+    }
+    let mut passed = "no_source";
+    for src in &s.yaw_sources {
+        if *src == YawSource::Box {
+            if !aspect_ok {
+                chain.offer("box", Some(box_alpha), SourceResult::Reject("aspect".into()), false);
+                passed = "aspect";
+                continue;
+            }
+            chain.offer("box", Some(box_alpha), SourceResult::Accept(box_alpha), false);
+            return match box_turn(w < h) {
+                None => finish(chain, out, None, "kept:box".into()),
+                Some(t) => finish(chain, out, Some(t), "turned:box".into()),
+            };
+        }
+        let Some((alpha, spread)) = yaw_angle(*src, frames, s.align_min_angle_conf) else {
+            chain.offer(src.name(), None, SourceResult::Reject("no_angle".into()), false);
+            passed = "no_angle";
+            continue;
+        };
+        if *src == YawSource::Mask { out.angle_spread_deg = Some(spread); }
+        // a confident angle decides: a failure below ends the alignment without a turn
+        if !spread_ok(spread) {
+            chain.offer(src.name(), Some(alpha), SourceResult::Reject("angle_spread".into()), false);
+            return finish(chain, out, None, "skipped:angle_spread".into());
+        }
+        let tag = if *src == YawSource::Mask { "angle" } else { "depth" };
+        return match angle_turn(alpha) {
+            Err(why) => {
+                chain.offer(src.name(), Some(alpha), SourceResult::Reject(why.into()), false);
+                finish(chain, out, None, format!("skipped:{why}"))
+            }
+            Ok(turn) => {
+                chain.offer(src.name(), Some(alpha), SourceResult::Accept(alpha), false);
+                let align = format!("{}:{tag}", if turn.is_some() { "turned" } else { "kept" });
+                finish(chain, out, turn, align)
+            }
+        };
+    }
+    finish(chain, out, None, format!("skipped:{passed}"))
 }
 
 /// Lateral probe outcome: a height estimate (or why it is unreliable), or why the up probe runs instead.
@@ -2788,9 +3047,14 @@ pub fn touches_border(b: &[f64; 4], size: [f64; 2]) -> bool {
 /// Mean long-side angle (deg, [-90, 90)) and dispersion (deg) of the frames with
 /// `angle_conf >= min_conf`, averaged on doubled angles (an axis, not a direction); None without such frames.
 pub fn frames_angle(frames: &[Detection], min_conf: f64) -> Option<(f64, f64)> {
+    frames_angle_by(frames, min_conf, |d| (d.angle_deg, d.angle_conf))
+}
+
+/// [`frames_angle`] over the (angle, confidence) pair `pick` returns per frame.
+pub fn frames_angle_by(frames: &[Detection], min_conf: f64, pick: impl Fn(&Detection) -> (Option<f64>, Option<f64>)) -> Option<(f64, f64)> {
     let (mut c, mut s, mut n) = (0.0, 0.0, 0);
     for d in frames {
-        if let (Some(a), Some(conf)) = (d.angle_deg, d.angle_conf) {
+        if let (Some(a), Some(conf)) = pick(d) {
             if conf >= min_conf { c += (2.0 * a.to_radians()).cos(); s += (2.0 * a.to_radians()).sin(); n += 1; }
         }
     }
@@ -2971,7 +3235,7 @@ mod tests {
     }
 
     fn det(b: [f64; 4], angle: Option<(f64, f64)>) -> Detection {
-        Detection { label: "cup".into(), score: 0.9, box_norm: b, angle_deg: angle.map(|a| a.0), angle_conf: angle.map(|a| a.1), grasp_width_px: None, mask_focus: false, disp_fg: None, disp_bg: None, depth_conf: None, length_px: None, jaw_clear: None }
+        Detection { label: "cup".into(), score: 0.9, box_norm: b, angle_deg: angle.map(|a| a.0), angle_conf: angle.map(|a| a.1), grasp_width_px: None, mask_focus: false, disp_fg: None, disp_bg: None, depth_conf: None, length_px: None, jaw_clear: None, depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None }
     }
 
     #[test]
@@ -3551,6 +3815,9 @@ mod tests {
             depth_conf: Some(0.95),
             length_px: Some(50.0),
             jaw_clear: Some(true),
+            depth_angle_deg: None,
+            depth_angle_conf: None,
+            depth_width_px: None,
         };
         let meas = measure_detection_depth(&cam, &pose, &det, Some(&depth_info), None, table_z).expect("measurement valid");
         assert!((meas.height_m - 0.04).abs() < 0.005, "height error: {}", (meas.height_m - 0.04).abs());
@@ -3592,6 +3859,9 @@ mod tests {
             depth_conf: Some(0.95),
             length_px: Some(50.0),
             jaw_clear: Some(true),
+            depth_angle_deg: None,
+            depth_angle_conf: None,
+            depth_width_px: None,
         };
         let meas = measure_detection_depth_with_cal(&cam, &pose, &det, &cal).expect("valid measurement");
         let expected_w = 30.0 * z_fg / 600.0;
@@ -3677,6 +3947,9 @@ mod tests {
                 depth_conf: Some(0.9),
                 length_px: Some(240.0),
                 jaw_clear: Some(true),
+                depth_angle_deg: None,
+                depth_angle_conf: None,
+                depth_width_px: None,
             }],
             depth: None,
         };
@@ -3697,5 +3970,230 @@ mod tests {
         let expected_w_aniso = 120.0 / 600.0;
         assert!((meas_aniso.length_m.unwrap() - expected_l_aniso).abs() < 1e-9);
         assert!((meas_aniso.width_m.unwrap() - expected_w_aniso).abs() < 1e-9);
+    }
+
+
+    #[test]
+    fn yaw_and_width_source_settings_default_validate_and_patch() {
+        let d = GraspSetup::default();
+        assert_eq!(d.yaw_sources, [YawSource::Mask, YawSource::Box]);
+        assert_eq!(d.yaw_record, [YawSource::Depth]);
+        assert_eq!(d.width_sources, [WidthSource::Mask, WidthSource::Depth]);
+        assert!(d.width_record.is_empty());
+        // a setup file without the keys loads the defaults
+        let old: GraspSetup = serde_json::from_value(serde_json::json!({"table_z_m": 0.01})).unwrap();
+        assert_eq!((old.yaw_sources, old.yaw_record, old.width_sources, old.width_record),
+            (d.yaw_sources.clone(), d.yaw_record.clone(), d.width_sources.clone(), d.width_record.clone()));
+        let p = d.patched(&serde_json::json!({"yaw_sources": ["depth", "box"], "yaw_record": ["mask"], "width_sources": ["depth"], "width_record": ["mask"]})).unwrap();
+        assert_eq!(p.yaw_sources, [YawSource::Depth, YawSource::Box]);
+        assert_eq!(p.width_record, [WidthSource::Mask]);
+        // the default yaw_record may name a deciding source: it decides instead
+        assert!(d.patched(&serde_json::json!({"yaw_sources": ["depth", "mask", "box"]})).is_ok());
+        for bad in [
+            serde_json::json!({"yaw_sources": ["mask", "mask"]}),
+            serde_json::json!({"yaw_record": ["depth", "depth"]}),
+            serde_json::json!({"width_sources": ["mask", "mask"]}),
+            serde_json::json!({"width_record": ["depth", "depth"]}),
+            serde_json::json!({"yaw_sources": ["probe"]}),
+            serde_json::json!({"width_sources": ["box"]}),
+        ] {
+            assert!(d.patched(&bad).is_err(), "{bad} accepted");
+        }
+    }
+
+    /// A centred, elongated box (aspect 2) with mask and / or depth angles per frame.
+    fn yaw_frames(mask: &[f64], depth: &[f64]) -> (Detection, Vec<Detection>) {
+        let n = mask.len().max(depth.len()).max(1);
+        let frames: Vec<Detection> = (0..n).map(|i| Detection {
+            angle_deg: mask.get(i).copied(), angle_conf: mask.get(i).map(|_| 0.9),
+            depth_angle_deg: depth.get(i).copied(), depth_angle_conf: depth.get(i).map(|_| 0.8),
+            ..det([0.4, 0.45, 0.6, 0.55], None)
+        }).collect();
+        (frames[n - 1].clone(), frames)
+    }
+
+    const SIZE: [f64; 2] = [640.0, 360.0];
+
+    fn turn_by(t: f64) -> impl Fn(f64) -> Result<Option<f64>, &'static str> { move |_| Ok(Some(t)) }
+
+    fn summary(o: &YawOutcome) -> Vec<(&str, bool, bool, Option<&str>)> {
+        o.entries.iter().map(|e| (e.source.as_str(), e.used, e.record_only, e.reason.as_deref())).collect()
+    }
+
+    #[test]
+    fn yaw_chain_default_mask_decides_and_depth_is_recorded() {
+        let s = GraspSetup::default();
+        let (last, frames) = yaw_frames(&[30.0], &[-40.0]);
+        let o = yaw_chain(&s, &last, &frames, SIZE, &turn_by(0.4), &|_| Some(1.0));
+        assert_eq!((o.turn, o.align.as_str()), (Some(0.4), "turned:angle"));
+        assert_eq!(summary(&o), [("depth", false, true, None), ("mask", true, false, None)]);
+        assert_eq!(o.entries[0].value, Some(-40.0));
+        assert_eq!(o.entries[1].value, Some(30.0));
+        assert_eq!(o.angle_spread_deg, Some(0.0));
+        // a turn below 1e-3 rad keeps J6
+        let o = yaw_chain(&s, &last, &frames, SIZE, &|_| Ok(None), &|_| Some(1.0));
+        assert_eq!((o.turn, o.align.as_str()), (None, "kept:angle"));
+    }
+
+    #[test]
+    fn yaw_chain_depth_first_decides_with_both_present() {
+        let s = GraspSetup { yaw_sources: vec![YawSource::Depth, YawSource::Mask, YawSource::Box], ..GraspSetup::default() };
+        let (last, frames) = yaw_frames(&[30.0], &[-40.0]);
+        let seen = std::cell::Cell::new(f64::NAN);
+        let angle_turn = |alpha: f64| { seen.set(alpha); Ok(Some(0.2)) };
+        let o = yaw_chain(&s, &last, &frames, SIZE, &angle_turn, &|_| Some(1.0));
+        assert_eq!((o.turn, o.align.as_str()), (Some(0.2), "turned:depth"));
+        assert_eq!(seen.get(), -40.0);
+        // depth is a deciding source here (not recorded twice), the mask is not evaluated
+        assert_eq!(summary(&o), [("depth", true, false, None)]);
+        // the depth source never writes angle_spread_deg
+        assert_eq!(o.angle_spread_deg, None);
+        let o = yaw_chain(&s, &last, &frames, SIZE, &|_| Ok(None), &|_| Some(1.0));
+        assert_eq!(o.align, "kept:depth");
+    }
+
+    #[test]
+    fn yaw_chain_record_only_depth_never_turns_and_box_decides_without_a_mask() {
+        let s = GraspSetup::default();
+        // a plain detection model: no mask angle, a depth angle
+        let (last, frames) = yaw_frames(&[], &[-40.0]);
+        let angle_turn = |_: f64| -> Result<Option<f64>, &'static str> { panic!("no angle source decides") };
+        let o = yaw_chain(&s, &last, &frames, SIZE, &angle_turn, &|short_x| { assert!(!short_x); Some(1.5) });
+        assert_eq!((o.turn, o.align.as_str()), (Some(1.5), "turned:box"));
+        assert_eq!(summary(&o), [("depth", false, true, None), ("mask", false, false, Some("no_angle")), ("box", true, false, None)]);
+        assert_eq!(o.entries[0].value, Some(-40.0));
+        assert_eq!(o.entries[2].value, Some(0.0), "box long side along image x");
+        assert_eq!(o.angle_spread_deg, None);
+        let o = yaw_chain(&s, &last, &frames, SIZE, &angle_turn, &|_| None);
+        assert_eq!((o.turn, o.align.as_str()), (None, "kept:box"));
+        // a square box: the aspect rejects, nothing else: skipped:aspect as before the chain
+        let sq = Detection { box_norm: [0.45, 0.4, 0.55, 0.578], ..last.clone() };
+        let o = yaw_chain(&s, &sq, std::slice::from_ref(&sq), SIZE, &angle_turn, &|_| Some(1.0));
+        assert_eq!((o.turn, o.align.as_str()), (None, "skipped:aspect"));
+        assert_eq!(o.entries.last().unwrap().reason.as_deref(), Some("aspect"));
+    }
+
+    #[test]
+    fn yaw_chain_spread_gate_is_terminal_per_angle_source() {
+        // mask frames 0 / 60 deg disagree: skipped:angle_spread, the box does not decide
+        let s = GraspSetup::default();
+        let (last, frames) = yaw_frames(&[0.0, 60.0], &[]);
+        let o = yaw_chain(&s, &last, &frames, SIZE, &turn_by(0.3), &|_| Some(1.0));
+        assert_eq!((o.turn, o.align.as_str()), (None, "skipped:angle_spread"));
+        assert!(o.angle_spread_deg.is_some_and(|a| a > 15.0));
+        assert_eq!(summary(&o).last().unwrap(), &("mask", false, false, Some("angle_spread")));
+        // the same for a deciding depth source, which does not write angle_spread_deg
+        let s = GraspSetup { yaw_sources: vec![YawSource::Depth, YawSource::Box], yaw_record: vec![], ..GraspSetup::default() };
+        let (last, frames) = yaw_frames(&[], &[0.0, 60.0]);
+        let o = yaw_chain(&s, &last, &frames, SIZE, &turn_by(0.3), &|_| Some(1.0));
+        assert_eq!((o.turn, o.align.as_str(), o.angle_spread_deg), (None, "skipped:angle_spread", None));
+        // record-only: the spread only rejects the entry
+        let s = GraspSetup::default();
+        let (last, frames) = yaw_frames(&[10.0, 10.0], &[0.0, 60.0]);
+        let o = yaw_chain(&s, &last, &frames, SIZE, &turn_by(0.3), &|_| Some(1.0));
+        assert_eq!(o.align, "turned:angle");
+        assert_eq!(summary(&o)[0], ("depth", false, true, Some("angle_spread")));
+        // spread 0 disables the gate
+        let s = GraspSetup { align_max_angle_spread_deg: 0.0, ..GraspSetup::default() };
+        let (last, frames) = yaw_frames(&[0.0, 60.0], &[]);
+        assert_eq!(yaw_chain(&s, &last, &frames, SIZE, &turn_by(0.3), &|_| Some(1.0)).align, "turned:angle");
+    }
+
+    #[test]
+    fn yaw_chain_guard_ray_and_limits_end_the_alignment() {
+        let s = GraspSetup::default();
+        let (last, frames) = yaw_frames(&[30.0], &[-40.0]);
+        // the box at the image border: skipped:border before any source, the record is kept
+        let cut = Detection { box_norm: [0.0, 0.45, 0.2, 0.55], ..last.clone() };
+        let o = yaw_chain(&s, &cut, std::slice::from_ref(&cut), SIZE, &turn_by(0.3), &|_| Some(1.0));
+        assert_eq!((o.turn, o.align.as_str()), (None, "skipped:border"));
+        assert_eq!(summary(&o), [("depth", false, true, None)]);
+        for why in ["ray", "j6_limits"] {
+            let o = yaw_chain(&s, &last, &frames, SIZE, &|_| Err(why), &|_| Some(1.0));
+            assert_eq!((o.turn, o.align), (None, format!("skipped:{why}")));
+            assert_eq!(o.entries.last().unwrap().reason.as_deref(), Some(why));
+        }
+        // no deciding source
+        let s = GraspSetup { yaw_sources: vec![], ..GraspSetup::default() };
+        assert_eq!(yaw_chain(&s, &last, &frames, SIZE, &turn_by(0.3), &|_| Some(1.0)).align, "skipped:no_source");
+    }
+
+    #[test]
+    fn depth_angle_fields_parse_and_rescale_like_the_mask_angle() {
+        let raw = serde_json::json!([{"label": "block", "score": 0.9, "box_norm": [0.1, 0.1, 0.3, 0.2],
+            "depth_angle_deg": 120.0, "depth_angle_conf": 1.5, "depth_width_px": 20.0},
+            {"label": "block", "score": 0.9, "box_norm": [0.1, 0.1, 0.3, 0.2], "depth_width_px": -1.0}]);
+        let d = parse_detections(&raw, [640.0, 360.0]);
+        assert_eq!((d[0].depth_angle_deg, d[0].depth_angle_conf, d[0].depth_width_px), (Some(-60.0), Some(1.0), Some(20.0)));
+        assert_eq!((d[0].angle_deg, d[0].grasp_width_px), (None, None), "depth values stay separate");
+        assert_eq!((d[1].depth_angle_deg, d[1].depth_width_px), (None, None));
+        // the same rescale as angle_deg / grasp_width_px
+        let setup = GraspSetup { fx_px: 600.0, fy_px: 600.0, image_size_px: [640.0, 360.0], ..Default::default() };
+        let cam = CamModel::assumed(&crate::chain::ArmModel::REBOT_DEV_ARM, &setup, &CameraMount::default());
+        let mk = |mask: bool| Detection {
+            angle_deg: mask.then_some(30.0), grasp_width_px: mask.then_some(40.0), length_px: Some(80.0),
+            depth_angle_deg: (!mask).then_some(30.0), depth_width_px: (!mask).then_some(40.0),
+            ..det([0.4, 0.4, 0.6, 0.6], None)
+        };
+        let frame = |d: Detection| DetectionFrame { frame_id: 1, captured_at: Instant::now(), image_size_px: [1280.0, 540.0], detections: vec![d], depth: None };
+        let (mut fm, mut fd) = (frame(mk(true)), frame(mk(false)));
+        rescale_frame_to_cam(&mut fm, &cam);
+        rescale_frame_to_cam(&mut fd, &cam);
+        let (m, dd) = (&fm.detections[0], &fd.detections[0]);
+        assert_eq!(m.angle_deg, dd.depth_angle_deg);
+        assert_eq!(m.grasp_width_px, dd.depth_width_px);
+        assert_eq!(m.length_px, dd.length_px, "the length follows the depth angle without a mask angle");
+        assert!((m.angle_deg.unwrap() - 30.0).abs() > 1.0, "anisotropic rescale changed the angle");
+    }
+
+    #[test]
+    fn depth_measurement_width_from_the_detector_else_the_depth_pipeline() {
+        let setup = GraspSetup { camera_tilt_deg: 0.0, fx_px: 600.0, fy_px: 600.0, image_size_px: [640.0, 360.0], ..Default::default() };
+        let cam = CamModel::assumed(&crate::chain::ArmModel::REBOT_DEV_ARM, &setup, &CameraMount::default());
+        let pose = Pose::new(look_down(&inspect_r()), [0.3, 0.0, 0.20]);
+        let cal = DepthCalibration { a: 1.0, b: 0.0, source: "metric_table" };
+        let base = Detection { disp_fg: Some(6.25), disp_bg: Some(5.0), depth_conf: Some(0.95), length_px: Some(50.0), ..det([0.45, 0.45, 0.55, 0.55], None) };
+        // a detection model: depth PCA width 30 px at 90 deg -> the numbers of grasp_width_px / angle_deg
+        let old = Detection { angle_deg: Some(90.0), grasp_width_px: Some(30.0), ..base.clone() };
+        let new = Detection { depth_angle_deg: Some(90.0), depth_width_px: Some(30.0), ..base.clone() };
+        let (mo, mn) = (measure_detection_depth_with_cal(&cam, &pose, &old, &cal).unwrap(), measure_detection_depth_with_cal(&cam, &pose, &new, &cal).unwrap());
+        assert_eq!((mo.width_m, mo.length_m), (mn.width_m, mn.length_m));
+        assert!(mn.width_m.is_some());
+        // a segmentation model: the mask width decides the measurement's width, as before
+        let seg = Detection { grasp_width_px: Some(20.0), angle_deg: Some(90.0), ..new.clone() };
+        let ms = measure_detection_depth_with_cal(&cam, &pose, &seg, &cal).unwrap();
+        let only_mask = Detection { depth_angle_deg: None, depth_width_px: None, ..seg.clone() };
+        assert_eq!(ms, measure_detection_depth_with_cal(&cam, &pose, &only_mask, &cal).unwrap());
+    }
+
+    #[test]
+    fn depth_calibration_and_measurement_report_why_they_fail() {
+        let setup = GraspSetup { camera_tilt_deg: 0.0, fx_px: 600.0, fy_px: 600.0, image_size_px: [640.0, 360.0], ..Default::default() };
+        let cam = CamModel::assumed(&crate::chain::ArmModel::REBOT_DEV_ARM, &setup, &CameraMount::default());
+        let pose = Pose::new(look_down(&inspect_r()), [0.3, 0.0, 0.20]);
+        let why = |d: Option<&DepthFrameInfo>| calibrate_depth_why(&cam, &pose, d, None, 0.0).err();
+        assert_eq!(why(None), Some("no_depth_frame"));
+        let metric = |samples: Vec<[f64; 3]>| DepthFrameInfo { metric_model: true, table_samples: samples };
+        assert_eq!(why(Some(&metric(vec![]))), Some("too_few_samples"));
+        assert_eq!(why(Some(&metric(vec![[320.0, 180.0, 10.0], [300.0, 160.0, 5.0], [340.0, 200.0, 2.5]]))), Some("table_contradicts_fk"));
+        // metric 50 % off the prior (the simulator's --depth-scale 1.5): contradicts FK
+        assert_eq!(why(Some(&metric(vec![[320.0, 180.0, 5.0 / 1.5], [300.0, 160.0, 5.0 / 1.5], [340.0, 200.0, 5.0 / 1.5]]))), Some("table_contradicts_fk"));
+        assert_eq!(why(Some(&metric(vec![[320.0, 180.0, 5.0], [300.0, 160.0, 5.0], [340.0, 200.0, 5.0]]))), None);
+        // relative: a flat look-down table spans no inverse depth
+        let grid: Vec<[f64; 3]> = (0..12).map(|i| [100.0 + 40.0 * i as f64, 100.0 + 15.0 * i as f64, 2.0]).collect();
+        let rel = |samples: Vec<[f64; 3]>| DepthFrameInfo { metric_model: false, table_samples: samples };
+        assert_eq!(why(Some(&rel(grid.clone()))), Some("no_oblique_spread"));
+        assert_eq!(why(Some(&rel(grid[..5].to_vec()))), Some("too_few_samples"));
+        // the boolean API is unchanged
+        assert!(calibrate_depth(&cam, &pose, Some(&rel(grid)), None, 0.0).is_none());
+
+        let cal = DepthCalibration { a: 1.0, b: 0.0, source: "metric_table" };
+        let ok = Detection { disp_fg: Some(6.25), disp_bg: Some(5.0), depth_conf: Some(0.95), ..det([0.45, 0.45, 0.55, 0.55], None) };
+        let m = |d: Detection| measure_detection_depth_with_cal_why(&cam, &pose, &d, &cal).err();
+        assert_eq!(m(ok.clone()), None);
+        assert_eq!(m(Detection { depth_conf: Some(0.2), ..ok.clone() }), Some("low_conf"));
+        assert_eq!(m(Detection { disp_fg: None, ..ok.clone() }), Some("no_disparity"));
+        assert_eq!(m(Detection { disp_fg: Some(4.0), ..ok.clone() }), Some("bad_disparity"));
+        assert_eq!(m(Detection { disp_fg: Some(5.001), ..ok.clone() }), Some("too_flat"));
     }
 }
