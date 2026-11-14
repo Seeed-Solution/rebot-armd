@@ -1603,7 +1603,15 @@ impl Orchestrator {
             if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
             inner.plan_input().map_err(crate::macro_action::arm_fail)?
         };
-        let goal = motion::resolve_goal(&input, &spec);
+        let spec = if input.arm.arm_dof() == 5 {
+            match spec {
+                GoalSpec::Absolute { p, r } => GoalSpec::AbsoluteEx { p, r, auto_yaw: true },
+                other => other,
+            }
+        } else {
+            spec
+        };
+        let (goal, _yaw_free) = motion::resolve_goal_ex(&input, &spec);
         if let Some(e) = table_violation(&input.arm.fk(&input.q0), &goal, &self.envelope, self.setup.table_z_m) {
             return Err(crate::macro_action::arm_fail(e.into()));
         }
@@ -2419,8 +2427,9 @@ impl Orchestrator {
         {
             let mut input = self.sup.inner().read().await.plan_input().map_err(crate::macro_action::arm_fail)?;
             let speed = Speed { linear: s.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS };
+            let is_5dof = input.arm.arm_dof() == 5;
             for goal in [neg, pos] {
-                match motion::plan_cartesian(&input, goal, speed) {
+                match motion::plan_cartesian_ex(&input, goal, speed, is_5dof) {
                     Ok(path) => { let q = path.last(); input.q0 = std::array::from_fn(|i| f64::from(q[i])); }
                     Err(_) => return Ok(Lateral::Fallback("unreachable")),
                 }

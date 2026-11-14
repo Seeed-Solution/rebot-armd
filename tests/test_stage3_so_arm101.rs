@@ -577,6 +577,65 @@ fn test_so_arm_default_grasp_no_workspace_violation() {
     }
 }
 
+#[test]
+fn test_5dof_grasp_off_axis_yaw_free_orchestrator_and_plan() {
+    let config = load_so101_config();
+    let setup = config.grasp.as_ref().expect("grasp setup exists");
+    let _cam = grasp::CamModel::assumed(&config.arm_model, setup, &config.camera_mount);
+    let target = [0.20, 0.06, setup.table_z_m + setup.grasp_height_m];
+
+    // 1. Initial downward solve at approach height for off-axis target
+    let r_down = grasp::look_down(&kinematics::IDENTITY);
+    let goal = Pose::new(r_down, [target[0], target[1], setup.table_z_m + setup.approach_height_m]);
+    let arm = &config.arm_model;
+    let lo = std::array::from_fn(|i| f64::from(config.limits[i].min_position));
+    let hi = std::array::from_fn(|i| f64::from(config.limits[i].max_position));
+    let q_home = std::array::from_fn(|i| f64::from(config.home_positions[i]));
+    let sol = arm.solve_dls_ex(&goal, &q_home, &lo, &hi, kinematics::PAR.w, true);
+    assert!(sol.ok, "initial solve for off-axis downward approach pose must succeed");
+
+    // 2. Test grasp::plan feasibility check on off-axis target
+    let mut inner = SupervisorInner::new(config.clone());
+    inner.lease_enabled = false;
+    inner.set_torque(true).unwrap();
+    let q32: Vec<f32> = sol.q.iter().map(|&x| x as f32).collect();
+    inner.commanded_positions = q32.clone();
+    inner.measured_positions = q32;
+
+    let body = serde_json::json!({
+        "label": "object",
+        "box_norm": [0.45, 0.45, 0.55, 0.55],
+    });
+    let pending = grasp::prepare(&inner, &body, inner.safety.epoch_id()).expect("prepare succeeds");
+    let planned = grasp::plan(pending).expect("grasp::plan on off-axis 5-DOF target must succeed");
+    assert!(planned.approach_duration > 0.0);
+
+    // 3. Test Orchestrator::move_arm mapping for non-vertical pitched motion (e.g. approach / transition / probe)
+    // to an off-axis target from home:
+    let input_start = plan_input_at_home(&config);
+    let r_pitched = kinematics::rpy_to_r(0.0, 0.5, 0.0);
+    let pitched_goal = [0.20, 0.08, 0.12];
+    let spec = GoalSpec::Absolute { p: pitched_goal, r: Some(r_pitched) };
+    let mapped_spec = if input_start.arm.arm_dof() == 5 {
+        match spec {
+            GoalSpec::Absolute { p, r } => GoalSpec::AbsoluteEx { p, r, auto_yaw: true },
+            other => other,
+        }
+    } else {
+        spec
+    };
+    let (resolved_goal, yaw_free) = motion::resolve_goal_ex(&input_start, &mapped_spec);
+    assert!(yaw_free, "5-DOF move_arm mapping must set yaw_free = true");
+    let path = motion::plan_cartesian_ex(&input_start, resolved_goal, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS }, yaw_free);
+    assert!(path.is_ok(), "Orchestrator-equivalent move_arm must succeed without IK_UNREACHABLE on off-axis 5-DOF target: got {:?}", path.err());
+
+    // Without auto_yaw (strict orientation on coupled 5-DOF), move to off-axis Y target fails IK
+    let (strict_goal, strict_yaw_free) = motion::resolve_goal_ex(&input_start, &GoalSpec::Absolute { p: pitched_goal, r: Some(r_pitched) });
+    assert!(!strict_yaw_free);
+    let strict_path = motion::plan_cartesian_ex(&input_start, strict_goal, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS }, strict_yaw_free);
+    assert!(strict_path.is_err(), "strict orientation without auto_yaw on off-axis 5-DOF must fail IK");
+}
+
 struct MockLoadDriver {
     caps: DriverCapabilities,
     loads: Arc<Mutex<Vec<f32>>>,
