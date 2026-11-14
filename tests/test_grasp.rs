@@ -150,7 +150,7 @@ impl SimCamera {
             }
         }
 
-        let mut detections = vec![Detection { label: "person".into(), score: 0.5, box_norm: [0.0, 0.0, 0.08, 0.1], angle_deg: None, angle_conf: None, grasp_width_px: None, mask_focus: false, disp_fg: None, disp_bg: None, depth_conf: None, length_px: None, jaw_clear: None }];
+        let mut detections = vec![Detection { label: "person".into(), score: 0.5, box_norm: [0.0, 0.0, 0.08, 0.1], angle_deg: None, angle_conf: None, grasp_width_px: None, mask_focus: false, disp_fg: None, disp_bg: None, depth_conf: None, length_px: None, jaw_clear: None, depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None }];
         if self.visible.load(Ordering::SeqCst) {
             if let Some(b) = self.project_box(&pose) {
                 let (mut angle_deg, angle_conf) = match self.image_angle(&pose) { Some((a, c)) => (Some(a), Some(c)), None => (None, None) };
@@ -160,7 +160,7 @@ impl SimCamera {
                     angle_deg = Some(a + sign * noise);
                 }
                 let grasp_width_px = *self.width_px.lock().unwrap();
-                detections.push(Detection { label: self.label.clone(), score: 0.9, box_norm: b, angle_deg, angle_conf, grasp_width_px, mask_focus: false, disp_fg, disp_bg, depth_conf, length_px, jaw_clear });
+                detections.push(Detection { label: self.label.clone(), score: 0.9, box_norm: b, angle_deg, angle_conf, grasp_width_px, mask_focus: false, disp_fg, disp_bg, depth_conf, length_px, jaw_clear, depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None });
             }
         }
         let frame_id = self.frame.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2713,4 +2713,72 @@ async fn stop_during_the_probe_ends_the_grasp_with_the_estimates_so_far() {
     assert_eq!(a.height_source, None);
     assert_eq!(estimates(&a), [("depth".to_string(), None, false, true, Some("unavailable".to_string()))]);
     assert_idle_after(&rig.sup, id).await;
+}
+
+/// Depth rig of `depth_oblique_ransac_skips_probe_and_grasps` with a setup patch.
+async fn depth_estimates_rig(setup: GraspSetup, occluded_table: bool, metric_model: bool) -> Rig {
+    let rig = rig(setup.clone(), Truth::same(), 20.0, [0.0, 0.0], false).await;
+    let start_r = start_pose(&rig).await.r;
+    let mut s = setup.clone();
+    s.grip_pixel_norm = calibrate_grip(&rig, &setup, &start_r);
+    rig.sup.inner().write().await.set_grasp_setup(s);
+    rig.sim.per_request.store(true, Ordering::SeqCst);
+    rig.sim.depth_available.store(true, Ordering::SeqCst);
+    *rig.sim.width_px.lock().unwrap() = Some(40.0);
+    *rig.sim.depth_sim.lock().unwrap() = Some(DepthSim {
+        metric_model,
+        a0: if metric_model { 1.0 } else { 2.7 },
+        b0: if metric_model { 0.0 } else { 0.45 },
+        occluded_table,
+        occluded_above_z: None,
+        depth_conf: Some(0.95),
+        jaw_clear: Some(true),
+        length_px: Some(65.0),
+        drift_per_frame: false,
+    });
+    rig
+}
+
+fn entries(e: &[EstimateEntry]) -> Vec<(&str, bool, bool, Option<&str>)> {
+    e.iter().map(|e| (e.source.as_str(), e.used, e.record_only, e.reason.as_deref())).collect()
+}
+
+#[tokio::test]
+async fn yaw_and_width_estimates_follow_the_source_order() {
+    // default: the mask width decides; the depth yaw is recorded (the mock reports no depth angle)
+    let setup = GraspSetup { camera_tilt_deg: 0.0, height_sources: DEPTH_DECIDES.to_vec(), ..GraspSetup::default() };
+    let rig = depth_estimates_rig(setup.clone(), false, false).await;
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
+    println!("default: {} align {:?} yaw {:?} width {:?} grasp_width_m {:?}", a.state, a.align, a.yaw_estimates, a.width_estimates, a.grasp_width_m);
+    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+    assert_eq!(entries(&a.width_estimates), [("mask", true, false, None)]);
+    assert_eq!(a.width_estimates[0].value, a.grasp_width_m);
+    assert_eq!(entries(&a.yaw_estimates)[0], ("depth", false, true, Some("no_angle")));
+    let mask_w = f64::from(a.grasp_width_m.unwrap());
+
+    // width_sources [depth], width_record [mask]: the depth measurement's width decides (the detector's width
+    // at the measured depth); the mask width is recorded
+    let setup = GraspSetup { width_sources: vec![grasp::WidthSource::Depth], width_record: vec![grasp::WidthSource::Mask], ..setup };
+    let rig = depth_estimates_rig(setup, false, false).await;
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
+    println!("depth first: {} width {:?} grasp_width_m {:?}", a.state, a.width_estimates, a.grasp_width_m);
+    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+    assert_eq!(entries(&a.width_estimates), [("mask", false, true, None), ("depth", true, false, None)]);
+    let depth_w = f64::from(a.grasp_width_m.unwrap());
+    assert!((depth_w - mask_w).abs() < 0.01, "depth width {depth_w} vs mask width {mask_w}");
+}
+
+#[tokio::test]
+async fn depth_entry_reports_why_there_is_no_measurement() {
+    // a metric model with the table occluded: fewer than 3 table samples
+    let setup = GraspSetup { camera_tilt_deg: 0.0, ..GraspSetup::default() };
+    let rig = depth_estimates_rig(setup, true, true).await;
+    let (id, _) = grasp::start(&rig.sup, rig.sim.clone(), &tap(&rig).await).await.expect("grasp accepted");
+    let a = wait_done(&rig.sup, id, 30.0, |_| {}).await;
+    println!("occluded: {} height {:?}", a.state, a.height_estimates);
+    assert_eq!(a.state, "done", "{a:?}");
+    let dep = a.height_estimates.iter().find(|e| e.source.starts_with("depth")).expect("depth entry");
+    assert_eq!((dep.source.as_str(), dep.reason.as_deref(), dep.record_only), ("depth", Some("too_few_samples"), true));
 }

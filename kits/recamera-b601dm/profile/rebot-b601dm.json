@@ -257,7 +257,19 @@
     "height_record": [
       "depth"
     ],
-    "height_priors": {}
+    "height_priors": {},
+    "yaw_sources": [
+      "mask",
+      "box"
+    ],
+    "yaw_record": [
+      "depth"
+    ],
+    "width_sources": [
+      "mask",
+      "depth"
+    ],
+    "width_record": []
   },
   "gravity_comp": {
     "ramp_in_s": 1.0,
