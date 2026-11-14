@@ -85,25 +85,32 @@ static int clamp_fps(int f) {
     return f < VisionControl::kMinFps ? VisionControl::kMinFps : (f > VisionControl::kMaxFps ? VisionControl::kMaxFps : f);
 }
 
+static ModelSet model_set_of(const VisionControl::Options& o) {
+    ModelSet m;
+    m.yolo_available = o.yolo_available;
+    m.model_name = o.model_name;
+    m.model_path = o.model_path;
+    m.model_kind = o.model_kind;
+    m.mask = o.mask;
+    m.depth_available = o.depth_available;
+    m.depth_model_name = o.depth_model_name;
+    m.depth_model_path = o.depth_model_path;
+    m.depth_metric = o.depth_metric;
+    return m;
+}
+
 VisionControl::VisionControl(const Options& opt, OnChange on_change)
-    : yolo_available_(opt.yolo_available),
-      model_name_(opt.model_name),
-      model_path_(opt.model_path),
-      model_kind_(opt.model_kind),
-      mask_(opt.mask),
-      mask_max_boxes_(opt.mask_max_boxes),
+    : mask_max_boxes_(opt.mask_max_boxes),
       family_(opt.family),
-      depth_available_(opt.depth_available),
-      depth_model_name_(opt.depth_model_name),
-      depth_model_path_(opt.depth_model_path),
-      depth_metric_(opt.depth_metric),
+      catalogue_(opt.catalogue),
       on_change_(std::move(on_change)),
-      fps_(clamp_fps(opt.fps)) {
+      fps_(clamp_fps(opt.fps)),
+      models_(model_set_of(opt)) {
     Mode m = opt.mode;
     // Without a model, YOLO modes fall back to what still works.
-    if (!yolo_available_) m = (m == Mode::Both || m == Mode::Aruco) ? Mode::Aruco : Mode::Off;
+    if (!opt.yolo_available) m = (m == Mode::Both || m == Mode::Aruco) ? Mode::Aruco : Mode::Off;
     mode_ = m;
-    last_active_ = m != Mode::Off ? m : (yolo_available_ ? Mode::Yolo : Mode::Aruco);
+    last_active_ = m != Mode::Off ? m : (opt.yolo_available ? Mode::Yolo : Mode::Aruco);
     continuous_ = opt.enabled && m != Mode::Off;
     latest_.mode = mode_;
     reported_proc_ = processing_locked();
@@ -142,7 +149,9 @@ int VisionControl::fps_locked() const noexcept {
 
 int VisionControl::gate_locked() const noexcept {
     const Continuous c = continuous_locked();
-    return camera_gate_fps(c.active() || !triggers_.empty(), !triggers_.empty(), c.active() ? c.fps : fps_);
+    // a pending swap opens the gate like a trigger: the frame thread applies it on the next frame
+    const bool wake = !triggers_.empty() || swap_ == SwapState::Pending;
+    return camera_gate_fps(c.active() || wake, wake, c.active() ? c.fps : fps_);
 }
 
 bool VisionControl::expire_locked(uint64_t now_ms) {
@@ -276,9 +285,9 @@ double VisionControl::result_fps(uint64_t now_ms) const {
 
 VisionControl::Status VisionControl::apply(const Mode* mode, const bool* enabled, const int* fps) {
     if (fps && (*fps < kMinFps || *fps > kMaxFps)) return Status::BadFps;
-    if (mode && pipelines_of(*mode).yolo && !yolo_available_) return Status::YoloUnavailable;
     {
         std::lock_guard<std::mutex> lk(mu_);
+        if (mode && pipelines_of(*mode).yolo && !models_.yolo_available) return Status::YoloUnavailable;
         if (fps) fps_ = *fps;
         if (mode) {
             mode_ = *mode;
@@ -304,11 +313,11 @@ bool VisionControl::set_enabled(bool on) {
 VisionControl::Status VisionControl::subscribe(const std::string& client, const std::string& id, Pipelines p,
                                                int fps, int ttl_ms, uint64_t now_ms, Subscription& out) {
     if (fps != 0 && (fps < kMinFps || fps > kMaxFps)) return Status::BadFps;
-    if (p.yolo && !yolo_available_) return Status::YoloUnavailable;
-    if (p.depth && !depth_available_) return Status::DepthUnavailable;
     ttl_ms = std::max(kMinTtlMs, std::min(kMaxTtlMs, ttl_ms));
     {
         std::lock_guard<std::mutex> lk(mu_);
+        if (p.yolo && !models_.yolo_available) return Status::YoloUnavailable;
+        if (p.depth && !models_.depth_available) return Status::DepthUnavailable;
         expire_locked(now_ms);
         auto it = subs_.end();
         if (!id.empty()) {
@@ -478,10 +487,64 @@ bool VisionControl::latest(bool has_after, uint32_t after, int wait_ms, VisionRe
     return latest_.frame_id == 0 || !satisfied();
 }
 
+ModelSet VisionControl::models() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return models_;
+}
+
+VisionControl::Status VisionControl::request_swap(const SwapRequest& req, uint64_t& generation, BudgetCheck& budget) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (swap_ == SwapState::Pending || swap_ == SwapState::Running) return Status::SwapBusy;
+    budget = check_budget(catalogue_, after_swap(req.detector, models_.model_name),
+                          after_swap(req.depth, models_.depth_model_name));
+    if (!budget.ok) return Status::IonBudget;
+    swap_ = SwapState::Pending;
+    swap_req_ = req;
+    swap_error_.clear();
+    generation = models_.generation + 1;
+    notify_locked();
+    return Status::Ok;
+}
+
+bool VisionControl::take_swap(SwapRequest& out) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (swap_ != SwapState::Pending) return false;
+    // the resident set can differ from the request's time only by a slot a failed load left empty
+    if (!check_budget(catalogue_, after_swap(swap_req_.detector, models_.model_name),
+                      after_swap(swap_req_.depth, models_.depth_model_name)).ok) {
+        swap_ = SwapState::Failed;
+        swap_error_ = "ION_BUDGET";
+        ++models_.generation;
+        notify_locked();
+        return false;
+    }
+    swap_ = SwapState::Running;
+    out = swap_req_;
+    notify_locked();
+    return true;
+}
+
+uint64_t VisionControl::finish_swap(ModelSet now, const std::string& error) {
+    std::lock_guard<std::mutex> lk(mu_);
+    now.generation = models_.generation + 1;
+    models_ = std::move(now);
+    swap_ = error.empty() ? SwapState::Idle : SwapState::Failed;
+    swap_error_ = error;
+    return models_.generation;
+}
+
+SwapState VisionControl::swap_state(std::string* error, uint64_t* generation) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (error) *error = swap_error_;
+    if (generation) *generation = models_.generation + (swap_ == SwapState::Pending || swap_ == SwapState::Running ? 1 : 0);
+    return swap_;
+}
+
 void VisionControl::shutdown() {
     {
         std::lock_guard<std::mutex> lk(mu_);
         stopping_ = true;
+        if (swap_ == SwapState::Pending) swap_ = SwapState::Idle;  // a pending swap is dropped
     }
     cv_.notify_all();
 }
@@ -545,10 +608,45 @@ static nlohmann::json mask_focus_json(const MaskFocus& f, uint64_t now_ms) {
     return j;
 }
 
+static const char* swap_state_name(SwapState s) {
+    switch (s) {
+        case SwapState::Pending: return "pending";
+        case SwapState::Running: return "running";
+        case SwapState::Failed: return "failed";
+        default: return "idle";
+    }
+}
+
+static nlohmann::json name_or_null(const std::string& s) {
+    return s.empty() ? nlohmann::json(nullptr) : nlohmann::json(s);
+}
+
+/** `models` (generation, swap, resident, catalogue) and `ion` of the mode body. */
+static void put_models(nlohmann::json& j, const VisionControl& ctl, const ModelSet& ms) {
+    std::string error;
+    uint64_t swap_generation = 0;
+    const SwapState st = ctl.swap_state(&error, &swap_generation);
+    nlohmann::json swap = {{"state", swap_state_name(st)}, {"generation", swap_generation}};
+    if (!error.empty()) swap["error"] = error;
+    const Catalogue& cat = ctl.catalogue();
+    nlohmann::json list = nlohmann::json::array();
+    for (const ModelEntry& m : cat.models) {
+        list.push_back({{"name", m.name}, {"kind", m.kind}, {"path", m.path}, {"ion_mb", m.ion_mb},
+                        {"resident", m.name == ms.model_name || m.name == ms.depth_model_name}});
+    }
+    j["models"] = {{"generation", ms.generation}, {"swap", swap},
+                   {"resident", {{"detector", name_or_null(ms.model_name)}, {"depth", name_or_null(ms.depth_model_name)}}},
+                   {"catalogue", list}};
+    const BudgetCheck used = check_budget(cat, ms.model_name, ms.depth_model_name);
+    j["ion"] = {{"base_mb", cat.ion.base_mb}, {"used_mb", used.need_mb - cat.ion.reserve_mb},
+                {"total_mb", cat.ion.total_mb}, {"reserve_mb", cat.ion.reserve_mb}};
+}
+
 static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0) {
     const uint64_t now = now_ms ? now_ms : mono_ms();
     const Mode m = ctl.mode();
     const Pipelines p = pipelines_of(m);
+    const ModelSet ms = ctl.models();
     MaskFocus mf;
     nlohmann::json j = {
         {"api_version", kApiVersion},
@@ -569,12 +667,13 @@ static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0) {
         {"subscriptions", true},
         {"max_fps", ctl.active_fps()},
         {"continuous", continuous_json(ctl.continuous())},
-        {"available", {{"yolo", ctl.yolo_available()}, {"aruco", true}, {"depth", ctl.depth_available()}}},
-        {"model", {{"name", ctl.model_name()}, {"path", ctl.model_path()}, {"kind", ctl.model_kind()}, {"mask", ctl.mask_enabled()}, {"mask_max_boxes", ctl.mask_max_boxes()}}},
-        {"depth_model", ctl.depth_available() ? nlohmann::json{{"name", ctl.depth_model_name()}, {"path", ctl.depth_model_path()}, {"metric", ctl.depth_metric()}} : nullptr},
+        {"available", {{"yolo", ms.yolo_available}, {"aruco", true}, {"depth", ms.depth_available}}},
+        {"model", {{"name", ms.model_name}, {"path", ms.model_path}, {"kind", ms.model_kind}, {"mask", ms.mask}, {"mask_max_boxes", ctl.mask_max_boxes()}}},
+        {"depth_model", ms.depth_available ? nlohmann::json{{"name", ms.depth_model_name}, {"path", ms.depth_model_path}, {"metric", ms.depth_metric}} : nullptr},
         {"family", ctl.family()},
         {"mask_focus", ctl.get_mask_focus(now, mf) ? mask_focus_json(mf, now) : nullptr},
     };
+    put_models(j, ctl, ms);
     return j.dump();
 }
 
@@ -633,7 +732,7 @@ static void put_result(std::ostringstream& s, const VisionResult& r, const std::
     s << "},\"depth\":{\"ran\":" << (r.ran_depth ? "true" : "false") << ",\"ms\":" << r.depth_ms << "}}"
       << ",\"detections\":" << r.detections_json << ",\"count\":" << r.count << ",\"family\":\"" << family
       << "\",\"undistorted\":" << (r.undistorted ? "true" : "false") << ",\"rejected\":" << r.rejected
-      << ",\"markers\":" << r.markers_json;
+      << ",\"markers\":" << r.markers_json << ",\"model_generation\":" << r.model_generation;
     if (r.ran_depth && !r.depth_json.empty()) {
         s << ",\"depth\":" << r.depth_json;
     }
@@ -830,6 +929,7 @@ static HttpReply status_reply(VisionControl::Status st, const std::string& ok_bo
         case VisionControl::Status::DepthUnavailable: return depth_unavailable_reply();
         case VisionControl::Status::Full: return {503, error_body("too many subscriptions")};
         case VisionControl::Status::NotFound: return {404, error_body("no such subscription")};
+        case VisionControl::Status::SwapBusy: return {409, error_body("SWAP_BUSY")};
         default: return {200, ok_body};
     }
 }
@@ -861,6 +961,22 @@ static HttpReply post_mode(VisionControl& ctl, const std::string& body) {
     if (!pm && !pe && !pf) return {400, error_body("body needs \"mode\", \"enabled\" or \"fps\"")};
     const VisionControl::Status st = ctl.apply(pm, pe, pf);
     return status_reply(st, st == VisionControl::Status::Ok ? mode_body(ctl) : "");
+}
+
+static HttpReply post_models(VisionControl& ctl, const std::string& body) {
+    SwapRequest req;
+    std::string err;
+    if (!parse_swap_request(body, ctl.catalogue(), req, err)) return {400, error_body(err)};
+    uint64_t generation = 0;
+    BudgetCheck budget;
+    const VisionControl::Status st = ctl.request_swap(req, generation, budget);
+    if (st == VisionControl::Status::IonBudget) {
+        const nlohmann::json e = {{"api_version", kApiVersion}, {"error", "ION_BUDGET"},
+                                  {"need_mb", budget.need_mb}, {"limit_mb", budget.limit_mb}};
+        return {409, e.dump()};
+    }
+    if (st != VisionControl::Status::Ok) return status_reply(st, "");
+    return {202, nlohmann::json{{"api_version", kApiVersion}, {"generation", generation}}.dump()};
 }
 
 static std::string subscription_body(VisionControl& ctl, const Subscription& s, uint64_t mono) {
@@ -947,6 +1063,8 @@ HttpReply handle_control_request(VisionControl& ctl, const std::string& method, 
         return latest_reply(ctl, query, now_ms);
     } else if (path == "/api/trigger" && method == "POST") {
         return trigger_reply(ctl, query, body, now_ms, times);
+    } else if (path == "/api/models" && method == "POST") {
+        return post_models(ctl, body);
     } else if (path == "/api/subscriptions" && method == "GET") {
         return {200, subscriptions_body(ctl, mono_ms())};
     } else if (path == "/api/subscribe" && method == "POST") {

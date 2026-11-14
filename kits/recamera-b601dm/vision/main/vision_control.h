@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "mask_geom.h"
+#include "model_catalogue.h"
 
 namespace rv {
 
@@ -125,7 +126,25 @@ struct VisionResult {
     uint64_t grab_ms = 0;     ///< retrieveFrame() returned it
     uint64_t done_ms = 0;     ///< publish() (pipelines done)
     uint32_t offered = 0;     ///< frame_plan() calls up to and including this frame
+    uint64_t model_generation = 0;  ///< ModelSet generation the frame ran with
 };
+
+/** What is loaded: one snapshot, copied under VisionControl's lock. */
+struct ModelSet {
+    bool yolo_available = false;
+    std::string model_name;  ///< catalogue name of the YOLO slot (empty: slot empty)
+    std::string model_path;
+    std::string model_kind = "detect";
+    bool mask = false;
+    bool depth_available = false;
+    std::string depth_model_name;  ///< catalogue name of the depth slot (empty: slot empty)
+    std::string depth_model_path;
+    bool depth_metric = false;
+    uint64_t generation = 0;  ///< +1 per executed swap
+};
+
+/** State of the model swap (POST /api/models). */
+enum class SwapState { Idle, Pending, Running, Failed };
 
 class VisionControl {
 public:
@@ -170,9 +189,10 @@ public:
         std::string depth_model_name;
         std::string depth_model_path;
         bool depth_metric = false;
+        Catalogue catalogue;  ///< models POST /api/models can load, and the ION budget
     };
 
-    enum class Status { Ok, BadFps, YoloUnavailable, DepthUnavailable, Full, NotFound };
+    enum class Status { Ok, BadFps, YoloUnavailable, DepthUnavailable, Full, NotFound, SwapBusy, IonBudget };
 
     class TriggerScope {
     public:
@@ -208,17 +228,36 @@ public:
     /** Configured rate: the default subscription's rate and the cap of every subscription. */
     int active_fps() const;
     int current_fps() const;
-    bool yolo_available() const noexcept { return yolo_available_; }
-    const std::string& model_name() const noexcept { return model_name_; }
-    const std::string& model_path() const noexcept { return model_path_; }
-    const std::string& model_kind() const noexcept { return model_kind_; }
-    bool mask_enabled() const noexcept { return mask_; }
+    /** The loaded models (copy). */
+    ModelSet models() const;
+    bool yolo_available() const { return models().yolo_available; }
+    std::string model_name() const { return models().model_name; }
+    std::string model_path() const { return models().model_path; }
+    std::string model_kind() const { return models().model_kind; }
+    bool mask_enabled() const { return models().mask; }
     int mask_max_boxes() const noexcept { return mask_max_boxes_; }
     const std::string& family() const noexcept { return family_; }
-    bool depth_available() const noexcept { return depth_available_; }
-    const std::string& depth_model_name() const noexcept { return depth_model_name_; }
-    const std::string& depth_model_path() const noexcept { return depth_model_path_; }
-    bool depth_metric() const noexcept { return depth_metric_; }
+    bool depth_available() const { return models().depth_available; }
+    std::string depth_model_name() const { return models().depth_model_name; }
+    std::string depth_model_path() const { return models().depth_model_path; }
+    bool depth_metric() const { return models().depth_metric; }
+    const Catalogue& catalogue() const noexcept { return catalogue_; }
+
+    /**
+     * POST /api/models: store `req` as the single pending swap when the resident set with it
+     * applied fits the ION budget. Ok: `generation` = the generation the swap will publish.
+     * SwapBusy: a swap is pending or running. IonBudget: `budget` has need / limit.
+     */
+    Status request_swap(const SwapRequest& req, uint64_t& generation, BudgetCheck& budget);
+    /**
+     * Frame thread: take the pending swap (state running), re-validated against the resident
+     * set. False when none is pending, or (finished as failed, ION_BUDGET) it no longer fits.
+     */
+    bool take_swap(SwapRequest& out);
+    /** Frame thread: publish the set after a swap (generation +1); `error` empty = idle, else failed. */
+    uint64_t finish_swap(ModelSet now, const std::string& error);
+    /** Swap state, its error and the generation it publishes (pending / running) or published. */
+    SwapState swap_state(std::string* error = nullptr, uint64_t* generation = nullptr) const;
 
     /** Camera gate rate requested last (camera_gate_fps for the current state). */
     int camera_fps() const;
@@ -303,17 +342,9 @@ private:
      */
     void notify_locked();
 
-    const bool yolo_available_;
-    const std::string model_name_;
-    const std::string model_path_;
-    const std::string model_kind_;
-    const bool mask_;
     const int mask_max_boxes_;
     const std::string family_;
-    const bool depth_available_;
-    const std::string depth_model_name_;
-    const std::string depth_model_path_;
-    const bool depth_metric_;
+    const Catalogue catalogue_;
     OnChange on_change_;
     mutable std::mutex mu_;
     std::condition_variable cv_;
@@ -335,6 +366,10 @@ private:
     uint32_t offered_ = 0;
     VisionResult latest_;
     bool stopping_ = false;
+    ModelSet models_;
+    SwapState swap_ = SwapState::Idle;
+    SwapRequest swap_req_;
+    std::string swap_error_;
 };
 
 /** When the HTTP server accepted the connection and finished reading the request (mono_ms()). */
@@ -356,6 +391,7 @@ struct HttpReply {
  *   POST /api/trigger[?wait_ms=<0..5000>] {"pipelines"?: ["yolo"|"aruco", ...], "wait_ms"?}
  *   POST /api/subscribe {"client", "pipelines", "fps"?, "ttl_ms"?, "id"?}
  *   POST /api/subscribe/<id>/keepalive  DELETE /api/subscribe/<id>  GET /api/subscriptions
+ *   POST /api/models {"detector"?: name|null, "depth"?: name|null}  (202 {"generation"})
  */
 HttpReply handle_control_request(VisionControl& ctl, const std::string& method, const std::string& target,
                                  const std::string& body, uint64_t now_ms = 0, const RequestTimes* times = nullptr);

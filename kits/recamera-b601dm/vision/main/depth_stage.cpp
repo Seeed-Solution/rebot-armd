@@ -8,7 +8,9 @@
 namespace rv {
 
 DepthStage::DepthStage() = default;
-DepthStage::~DepthStage() = default;
+// The engine holds the TPU buffers behind input_ / output_ (no wrapper objects); a swap
+// destroys the whole object.
+DepthStage::~DepthStage() { engine_.reset(); }
 
 bool DepthStage::init(const std::string& model_path) {
     MA_LOGI(TAG, "Loading depth model: %s", model_path.c_str());

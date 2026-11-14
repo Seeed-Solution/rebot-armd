@@ -34,11 +34,16 @@ Detector::Detector()
       initialized_(false),
       detection_id_counter_(0) {}
 
+// Explicit order: the model wrappers hold the engine's tensors, so they go first, then the
+// engine (its TPU buffers and the cvimodel registration). A swap destroys the whole object.
 Detector::~Detector() {
     if (model_) {
         ma::ModelFactory::remove(model_);
         model_ = nullptr;
     }
+    obb_model_.reset();
+    seg_model_.reset();
+    engine_.reset();
 }
 
 bool Detector::init(const std::string& model_path, ModelKindHint hint) {
