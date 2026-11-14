@@ -96,13 +96,6 @@ pub fn write_frames_to_parquet_with_meta(
         std::fs::create_dir_all(parent)?;
     }
 
-    if let Some(m) = meta {
-        let meta_path = path.with_extension("meta.json");
-        if let Ok(text) = serde_json::to_string_pretty(m) {
-            let _ = std::fs::write(meta_path, text);
-        }
-    }
-
     let schema = lerobot_arrow_schema_with_meta(meta);
     let num_rows = frames.len();
 
@@ -151,6 +144,18 @@ pub fn write_frames_to_parquet_with_meta(
     writer.write(&batch)?;
     writer.close()?;
 
+    if let Some(m) = meta {
+        let meta_path = path.with_extension("meta.json");
+        let tmp_meta_path = path.with_extension("meta.json.tmp");
+        if let Ok(text) = serde_json::to_string_pretty(m) {
+            if let Err(e) = std::fs::write(&tmp_meta_path, text) {
+                tracing::warn!("Failed to write temporary metadata file {}: {e}", tmp_meta_path.display());
+            } else if let Err(e) = std::fs::rename(&tmp_meta_path, &meta_path) {
+                tracing::warn!("Failed to rename {} to {}: {e}", tmp_meta_path.display(), meta_path.display());
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -170,10 +175,17 @@ pub fn read_metadata_from_parquet(path: &Path) -> Result<Option<EpisodeMetadata>
     }
     let dir_meta = path.with_file_name("meta.json");
     if dir_meta.exists() {
-        let data = std::fs::read_to_string(&dir_meta)?;
-        let m = serde_json::from_str::<EpisodeMetadata>(&data)
-            .map_err(|e| ParquetRecordingError::Corrupted(format!("Failed to parse dir metadata {}: {e}", dir_meta.display())))?;
-        return Ok(Some(m));
+        match std::fs::read_to_string(&dir_meta) {
+            Ok(data) => match serde_json::from_str::<EpisodeMetadata>(&data) {
+                Ok(m) => return Ok(Some(m)),
+                Err(e) => {
+                    tracing::warn!("Failed to parse dir metadata {}: {e}", dir_meta.display());
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Failed to read dir metadata {}: {e}", dir_meta.display());
+            }
+        }
     }
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;

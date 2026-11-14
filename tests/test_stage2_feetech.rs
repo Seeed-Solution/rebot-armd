@@ -1,4 +1,5 @@
 use std::f32::consts::PI;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, FeetechArmDriver, JointTarget};
@@ -12,8 +13,24 @@ use armd::protocol::feetech::{
     REG_P_COEF, REG_RETURN_DELAY, REG_STATUS_RETURN_LEVEL, REG_TORQUE_ENABLE,
     STEPS_PER_REVOLUTION,
 };
+use armd::safety::FaultCode;
 use armd::supervisor::ArmSupervisor;
-use armd::transport::{MockTransport, SerialTransportConfig};
+use armd::transport::{MockTransport, SerialTransportConfig, Transport, TransportError};
+
+#[derive(Clone, Default)]
+struct SharedTransport(Arc<Mutex<MockTransport>>);
+
+impl Transport for SharedTransport {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+        self.0.lock().unwrap().read(buf)
+    }
+    fn write(&mut self, buf: &[u8]) -> Result<usize, TransportError> {
+        self.0.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> Result<(), TransportError> {
+        self.0.lock().unwrap().flush()
+    }
+}
 
 // -------------------------------------------------------------------------
 // 1. Sign-magnitude velocity & homing offset conversions
@@ -222,7 +239,7 @@ fn test_feetech_configure_servos() {
 
     let addrs_and_vals: &[(u8, u16)] = &[
         (REG_RETURN_DELAY, 250),
-        (REG_STATUS_RETURN_LEVEL, 1),
+        (REG_STATUS_RETURN_LEVEL, 0),
         (REG_MIN_ANGLE_LIMIT_L, 0),
         (REG_MAX_ANGLE_LIMIT_L, 4095),
         (REG_P_COEF, 16),
@@ -403,7 +420,7 @@ fn test_feetech_configure_servos_torque_enabled_refuses() {
 
     let addrs_and_vals: &[(u8, u16)] = &[
         (REG_RETURN_DELAY, 10), // Differs from target (0) to force EEPROM write attempt
-        (REG_STATUS_RETURN_LEVEL, 1),
+        (REG_STATUS_RETURN_LEVEL, 0),
         (REG_MIN_ANGLE_LIMIT_L, 0),
         (REG_MAX_ANGLE_LIMIT_L, 4095),
         (REG_P_COEF, 16),
@@ -464,7 +481,7 @@ fn test_feetech_configure_servos_already_matching_zero_writes() {
 
     let addrs_and_vals: &[(u8, u16)] = &[
         (REG_RETURN_DELAY, 0),
-        (REG_STATUS_RETURN_LEVEL, 1),
+        (REG_STATUS_RETURN_LEVEL, 0),
         (REG_MIN_ANGLE_LIMIT_L, 0),
         (REG_MAX_ANGLE_LIMIT_L, 4095),
         (REG_P_COEF, 16),
@@ -524,7 +541,7 @@ fn test_feetech_configure_servos_already_matching_torque_enabled_succeeds() {
 
     let addrs_and_vals: &[(u8, u16)] = &[
         (REG_RETURN_DELAY, 0),
-        (REG_STATUS_RETURN_LEVEL, 1),
+        (REG_STATUS_RETURN_LEVEL, 0),
         (REG_MIN_ANGLE_LIMIT_L, 0),
         (REG_MAX_ANGLE_LIMIT_L, 4095),
         (REG_P_COEF, 16),
@@ -1044,4 +1061,133 @@ fn test_feetech_set_torque_preseeding_goal_position() {
     // Servo 2 ID & position
     assert_eq!(tx_with_fb[10], 2);
     assert_eq!([tx_with_fb[11], tx_with_fb[12]], pos_2);
+}
+
+// -------------------------------------------------------------------------
+// 24. Overload status byte (0x20) triggers HardwareFault and supervisor clear_fault
+// -------------------------------------------------------------------------
+#[tokio::test]
+async fn test_feetech_overload_status_hardware_fault_and_supervisor_clear_fault() {
+    let mock = Arc::new(Mutex::new(MockTransport::new()));
+    let driver = FeetechArmDriver::new(SharedTransport(mock.clone()), vec![1]);
+
+    let mut config = ArmConfig::default();
+    config.dof = 1;
+    config.limits = vec![JointLimit::new("j1", -3.0, 3.0, 2.0, 5.0)];
+    config.home_positions = vec![0.0];
+
+    let supervisor = ArmSupervisor::new(config).with_driver(Box::new(driver));
+
+    // First, feed normal feedback and enable torque so arm is Armed/Idle
+    let pos_1 = 2048u16.to_le_bytes();
+    let normal_params = [pos_1[0], pos_1[1], 0, 0, 0, 0, 70, 35];
+    let cs_normal = calculate_checksum(1, 10, 0x00, &normal_params);
+    let mut rx_normal = vec![0xFF, 0xFF, 1, 10, 0x00];
+    rx_normal.extend_from_slice(&normal_params);
+    rx_normal.push(cs_normal);
+
+    // Provide response for set_torque readback (REG_TORQUE_ENABLE = 1),
+    // followed by feedback for supervisor's post-torque read_joint_states() call.
+    let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
+    let rx_tq1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1];
+
+    mock.lock().unwrap().provide_rx(&rx_tq1);
+    mock.lock().unwrap().provide_rx(&rx_normal);
+
+    supervisor.set_torque(true).await.unwrap();
+    assert!(supervisor.inner().read().await.is_torqued);
+
+    // Now feed an overload status byte (0x20 in the error byte of Feetech packet)
+    let cs_overload = calculate_checksum(1, 10, 0x20, &normal_params);
+    let mut rx_overload = vec![0xFF, 0xFF, 1, 10, 0x20];
+    rx_overload.extend_from_slice(&normal_params);
+    rx_overload.push(cs_overload);
+
+    mock.lock().unwrap().provide_rx(&rx_overload);
+
+    // Supervisor tick reads joint states, encounters 0x20 status, and transitions to Fault(HardwareFault)
+    let obs = supervisor.tick(0.02).await;
+    assert!(obs.fault.is_some(), "Supervisor must transition to fault on hardware error");
+    let fault = obs.fault.unwrap();
+    assert_eq!(fault.code, FaultCode::HardwareFault);
+    assert!(fault.message.contains("fault 0x20: Overload"));
+
+    // Attempting clear_fault() calls drv.clear_fault(), which disables torque on the bus (REG_TORQUE_ENABLE = 0),
+    // and asks to wait for fresh fault-free feedback before retrying.
+    let cs_tq0 = calculate_checksum(1, 3, 0x00, &[0]);
+    let rx_tq0 = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_tq0];
+    mock.lock().unwrap().provide_rx(&rx_tq0);
+
+    let clear_err = supervisor.clear_fault().await.unwrap_err();
+    assert!(
+        clear_err.to_string().contains("wait for fresh fault-free feedback"),
+        "clear_fault must reject and ask to wait for fresh feedback: got {clear_err}"
+    );
+
+    // Fresh 0x00 feedback arrives and is ingested by tick
+    let mut rx_fresh = vec![0xFF, 0xFF, 1, 10, 0x00];
+    rx_fresh.extend_from_slice(&normal_params);
+    rx_fresh.push(cs_normal);
+    mock.lock().unwrap().provide_rx(&rx_fresh);
+
+    supervisor.tick(0.02).await;
+
+    // Provide another fresh feedback frame for clear_fault's own read_joint_states() call
+    let mut rx_fresh2 = vec![0xFF, 0xFF, 1, 10, 0x00];
+    rx_fresh2.extend_from_slice(&normal_params);
+    rx_fresh2.push(cs_normal);
+    mock.lock().unwrap().provide_rx(&rx_fresh2);
+
+    // Now clear_fault succeeds cleanly
+    let clear_ok = supervisor.clear_fault().await;
+    assert!(clear_ok.is_ok(), "clear_fault must succeed with fresh fault-free feedback: got {:?}", clear_ok.err());
+}
+
+// -------------------------------------------------------------------------
+// 25. set_torque(true) rejects stale feedback (>250ms)
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_set_torque_rejects_stale_feedback() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1]);
+
+    let pos_1 = 2048u16.to_le_bytes();
+    let params_1 = [pos_1[0], pos_1[1], 0, 0, 0, 0, 70, 35];
+    let cs1 = calculate_checksum(1, 10, 0x00, &params_1);
+    let mut rx = vec![0xFF, 0xFF, 1, 10, 0x00];
+    rx.extend_from_slice(&params_1);
+    rx.push(cs1);
+    driver.transport_mut().provide_rx(&rx);
+
+    driver.read_joint_states().unwrap();
+    assert!(driver.is_feedback_valid());
+
+    // Wait > 250ms for feedback to become stale
+    std::thread::sleep(Duration::from_millis(260));
+    assert!(!driver.is_feedback_valid());
+
+    driver.transport_mut().take_tx(); // clear any previous packets
+
+    let res = driver.set_torque(true);
+    assert!(
+        matches!(res, Err(ArmDriverError::HardwareFault(ref msg)) if msg.contains("Stale joint feedback")),
+        "Expected stale feedback error, got {:?}",
+        res
+    );
+    assert_ne!(driver.enable_state(), EnableState::Enabled);
+    assert!(driver.transport_mut().take_tx().is_empty(), "No command packets should be sent when feedback is stale");
+}
+
+// -------------------------------------------------------------------------
+// 26. parse_response rejects length = 254 (> 64)
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_parse_response_rejects_oversized_length() {
+    let buf = [0xFF, 0xFF, 1, 254, 0x00, 0x00];
+    let res = feetech::parse_response(&buf);
+    assert!(
+        matches!(res, Err(feetech::FeetechError::ParameterError(ref msg)) if msg.contains("254")),
+        "Expected ParameterError for length 254, got {:?}",
+        res
+    );
 }

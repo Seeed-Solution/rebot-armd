@@ -572,7 +572,7 @@ impl<T: Transport> FeetechArmDriver<T> {
 
             // Targets
             let target_return_delay = self.config.return_delay_raw;
-            let target_status_level = 1u8;
+            let target_status_level = 0u8;
             let target_min_angle = calib.range_min_steps;
             let target_max_angle = calib.range_max_steps;
             let target_p_coef = self.config.p_coef;
@@ -709,11 +709,38 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         feetech::feetech_error_name(code)
     }
 
+    fn check_hardware_status(&self) -> Result<(), ArmDriverError> {
+        for (i, &status) in self.motor_status.iter().enumerate() {
+            if status != 0 {
+                let id = self.servo_ids.get(i).copied().unwrap_or(0);
+                let desc = feetech::feetech_error_name(status)
+                    .unwrap_or_else(|| format!("0x{:02X}", status));
+                return Err(ArmDriverError::HardwareFault(format!(
+                    "Feetech joint {} (ID {}) fault 0x{:02X}: {}",
+                    i, id, status, desc
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_fault(&mut self) -> Result<(), ArmDriverError> {
+        self.set_torque(false)
+    }
+
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
         let ids = self.servo_ids.clone();
         if enabled {
             let prev_state = self.confirmed_enable_state;
-            if !self.last_feedback_instant.is_empty() && self.last_feedback_instant.iter().all(Option::is_some) {
+            if !self.last_feedback_instant.is_empty()
+                && self.last_feedback_instant.iter().any(Option::is_some)
+                && !self.is_feedback_valid()
+            {
+                return Err(ArmDriverError::HardwareFault(
+                    "Stale joint feedback (>250ms); refusing to enable torque with stale goal positions".into(),
+                ));
+            }
+            if !self.last_feedback_instant.is_empty() && self.is_feedback_valid() {
                 let targets: Vec<JointTarget> = self.cached_states.iter().map(|s| JointTarget::position(s.position)).collect();
                 self.write_joint_targets(&targets)?;
             }

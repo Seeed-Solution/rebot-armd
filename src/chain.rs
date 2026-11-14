@@ -119,7 +119,16 @@ pub struct ChainIk {
     pub iterations: usize,
 }
 
+/// Check whether tool X axis is vertical (pointing straight up or down).
+pub fn is_tool_vertical(r: &k::Mat3) -> bool {
+    (1.0 - k::column(r, 0)[2].abs()) < 1e-3
+}
+
 impl KinematicChain {
+    pub fn is_tool_vertical(r: &k::Mat3) -> bool {
+        is_tool_vertical(r)
+    }
+
     /// Build the chain `spec` from a parsed URDF.
     pub fn from_urdf(urdf: &Urdf, spec: &ChainSpec) -> Result<Self, String> {
         if urdf.link(&spec.base_link).is_none() { return Err(format!("chain base_link '{}' is not in the URDF", spec.base_link)); }
@@ -298,10 +307,8 @@ impl KinematicChain {
         let (rg, pg) = (&goal.r, &goal.p);
         let mut f = self.frames(&q);
 
-        let x_tool = k::column(rg, 0);
-        let vertical = (1.0 - x_tool[2].abs()) < 1e-3;
         let r_xy = (goal.p[0] * goal.p[0] + goal.p[1] * goal.p[1]).sqrt();
-        let use_auto_yaw = yaw_free && n == 5 && !vertical && r_xy >= 0.03;
+        let use_auto_yaw = yaw_free && n == 5 && r_xy >= 0.03;
 
         let align_rot = |r_curr: &Mat3| -> Mat3 {
             if use_auto_yaw {

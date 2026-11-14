@@ -270,7 +270,7 @@ pub fn parse_response(buf: &[u8]) -> Result<(FeetechPacket, usize), FeetechError
 
     let id = slice[2];
     let length = slice[3] as usize;
-    if length < 2 {
+    if !(2..=64).contains(&length) {
         return Err(FeetechError::ParameterError(format!(
             "Invalid Feetech packet length field: {}",
             length

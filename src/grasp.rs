@@ -1470,20 +1470,25 @@ pub fn plan(pending: PendingGrasp) -> Result<PlannedGrasp, ArmError> {
         "the box centre ray does not meet the table plane in front of the camera".into())))?;
     let camera_down = camera_down_mode(setup, &input.cam).map_err(MotionError::InvalidCommand)?;
     let pts = envelope(input.ws.as_ref(), &input.cam, &cam.rec);
+    let is_5dof = input.arm.arm_dof() == 5;
+    let r_ref = if is_5dof {
+        motion::apply_auto_yaw(&pose.p, &target, pose.r)
+    } else {
+        pose.r
+    };
     // the envelope stays above the table on the approach and (camera-down) the transition
     let (goal, tool) = if camera_down {
-        let goal = camera_down_pose(&pose.r, &target, setup, &cam, &pts);
+        let goal = camera_down_pose(&r_ref, &target, setup, &cam, &pts);
         let tool = approach_pose(&goal.r, &target, setup);
         if let Some(e) = table_violation(&goal, &tool, &pts, setup.table_z_m) { return Err(e.into()); }
         (goal, tool)
     } else {
-        let goal = approach_pose(&pose.r, &target, setup);
+        let goal = approach_pose(&r_ref, &target, setup);
         (goal, goal)
     };
     if let Some(e) = table_violation(&pose, &goal, &pts, setup.table_z_m) { return Err(e.into()); }
     let mut cur = input.clone();
     cur.j7 = open_rad;
-    let is_5dof = input.arm.arm_dof() == 5;
     let path = motion::plan_cartesian_ex(&cur, goal, Speed { linear: setup.approach_speed_mps, angular: motion::DEFAULT_ANGULAR_RPS }, is_5dof)?;
     let last = path.last();
     cur.q0 = std::array::from_fn(|i| f64::from(last[i]));
@@ -1573,20 +1578,20 @@ pub fn spawn(supervisor: Arc<ArmSupervisor>, source: Arc<dyn DetectionSource>, i
 const POLL: Duration = crate::macro_action::POLL;
 
 /// Grasp phases on top of the shared macro-action primitives ([`MacroCtx`], via `Deref`).
-struct Orchestrator {
-    ctx: MacroCtx,
-    source: Arc<dyn DetectionSource>,
-    setup: GraspSetup,
-    cam: CamModel,
+pub struct Orchestrator {
+    pub ctx: MacroCtx,
+    pub source: Arc<dyn DetectionSource>,
+    pub setup: GraspSetup,
+    pub cam: CamModel,
     /// Points kept above the table on every sub-motion ([`envelope`]).
-    envelope: Vec<Vec3>,
+    pub envelope: Vec<Vec3>,
     /// Each centring step triggers its own frame (perception API 2) instead of reading the
     /// continuous results.
-    triggered: bool,
+    pub triggered: bool,
     /// `camera_mount.offset_m` is set: the lens position (height probe) is known.
-    lens_known: bool,
+    pub lens_known: bool,
     /// Perception API depth pipeline is available.
-    depth_available: bool,
+    pub depth_available: bool,
 }
 
 impl std::ops::Deref for Orchestrator {
@@ -1726,7 +1731,9 @@ impl Orchestrator {
 
         self.phase("approach", 0.1).await?;
         let target = planned.target;
-        let goal = if camera_down { camera_down_pose(&pose0.r, &target, s, &self.cam, &self.envelope) } else { approach_pose(&pose0.r, &target, s) };
+        let is_5dof = self.sup.inner().read().await.config.arm_model.arm_dof() == 5;
+        let r_ref = if is_5dof { motion::apply_auto_yaw(&pose0.p, &target, pose0.r) } else { pose0.r };
+        let goal = if camera_down { camera_down_pose(&r_ref, &target, s, &self.cam, &self.envelope) } else { approach_pose(&r_ref, &target, s) };
         if camera_down {
             let height = goal.p[2] - s.table_z_m;
             if height > s.approach_height_m + 1e-6 {
@@ -2399,7 +2406,10 @@ impl Orchestrator {
     /// ([`top_face_u`]: box centre or outer edge) and B_meas, the image-x
     /// component of the lens displacement between the poses from FK of the measured joints;
     /// top height = mean measured lens z − D − `table_z_m` (not yet accepted).
-    async fn probe_lateral(&self, c: &Centred, est: &Vec3, label: &str, after: &mut Option<u64>) -> Result<Lateral, Stop> {
+    pub async fn probe_lateral(&self, c: &Centred, est: &Vec3, label: &str, after: &mut Option<u64>) -> Result<Lateral, Stop> {
+        if self.sup.inner().read().await.config.arm_model.arm_dof() == 5 {
+            return Ok(Lateral::Fallback("unreachable"));
+        }
         let s = &self.setup;
         let pose = c.pose;
         let x_cam = kinematics::column(&self.cam.rotation(&pose), 0);
@@ -2624,18 +2634,19 @@ impl Orchestrator {
 }
 
 /// Lateral probe outcome: a height estimate (or why it is unreliable), or why the up probe runs instead.
-enum Lateral {
+#[derive(Debug, PartialEq)]
+pub enum Lateral {
     Done(Result<f64, String>),
     Fallback(&'static str),
 }
 
 /// Matched frames of the last centring pose.
-struct Centred {
-    last: Detection,
-    frames: Vec<Detection>,
+pub struct Centred {
+    pub last: Detection,
+    pub frames: Vec<Detection>,
     /// Commanded pose at which `frames` were taken.
-    pose: Pose,
-    iterations: u32,
+    pub pose: Pose,
+    pub iterations: u32,
 }
 
 /// Why the last box cannot decide the J6 roll: `border` when an edge is within 2 px of the

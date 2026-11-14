@@ -156,10 +156,16 @@ pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
             let rz = kinematics::axis_r(&[0.0, 0.0, 1.0], dpsi);
             r_place = kinematics::mat_mul(&rz, &r_place);
         }
-        let [roll, pitch, yaw] = kinematics::r_to_rpy(&r_place);
-        let adapted_pitch = pitch.clamp(std::f64::consts::FRAC_PI_4, 1.25);
-        if (adapted_pitch - pitch).abs() > 1e-4 {
-            r_place = kinematics::rpy_to_r(roll, adapted_pitch, yaw);
+        let x_tool = kinematics::column(&r_place, 0);
+        if -x_tool[2] < std::f64::consts::FRAC_1_SQRT_2 {
+            let down = [0.0, 0.0, -1.0];
+            let axis = kinematics::cross(&x_tool, &down);
+            let angle = (-x_tool[2]).clamp(-1.0, 1.0).acos() - std::f64::consts::FRAC_PI_4;
+            if kinematics::norm(&axis) > 1e-9 && angle > 1e-4 {
+                r_place = kinematics::mat_mul(&kinematics::axis_r(&kinematics::unit(&axis), angle), &r_place);
+            } else if -x_tool[2] <= -1.0 + 1e-9 {
+                r_place = crate::grasp::look_down(&r_place);
+            }
         }
     } else if yaw_free && request.orientation.is_some() {
         r_place = motion::align_auto_yaw(&request.target, r_place);

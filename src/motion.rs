@@ -290,7 +290,7 @@ pub fn apply_auto_yaw(start_p: &[f64; 3], goal_p: &[f64; 3], mut target_r: kinem
 
 pub fn align_auto_yaw(goal_p: &[f64; 3], target_r: kinematics::Mat3) -> kinematics::Mat3 {
     let r_target = (goal_p[0] * goal_p[0] + goal_p[1] * goal_p[1]).sqrt();
-    if r_target >= 0.03 && target_r[0][0].hypot(target_r[1][0]) >= 1e-6 {
+    if r_target >= 0.03 && !crate::chain::is_tool_vertical(&target_r) {
         let psi_goal = goal_p[1].atan2(goal_p[0]);
         let psi_cur = target_r[1][0].atan2(target_r[0][0]);
         let rz = kinematics::axis_r(&[0.0, 0.0, 1.0], psi_goal - psi_cur);

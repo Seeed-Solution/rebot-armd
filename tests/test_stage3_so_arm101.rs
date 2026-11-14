@@ -553,7 +553,7 @@ fn test_so_arm_default_grasp_no_workspace_violation() {
         let arm = &config.arm_model;
         let lo = std::array::from_fn(|i| f64::from(config.limits[i].min_position));
         let hi = std::array::from_fn(|i| f64::from(config.limits[i].max_position));
-        let q_home = std::array::from_fn(|i| f64::from(config.home_positions[i]));
+        let q_home: [f64; 6] = std::array::from_fn(|i| f64::from(config.home_positions[i]));
         let sol = arm.solve_dls_ex(&goal, &q_home, &lo, &hi, kinematics::PAR.w, true);
         assert!(sol.ok, "{profile}: initial solve for downward approach pose must succeed");
 
@@ -590,7 +590,7 @@ fn test_5dof_grasp_off_axis_yaw_free_orchestrator_and_plan() {
     let arm = &config.arm_model;
     let lo = std::array::from_fn(|i| f64::from(config.limits[i].min_position));
     let hi = std::array::from_fn(|i| f64::from(config.limits[i].max_position));
-    let q_home = std::array::from_fn(|i| f64::from(config.home_positions[i]));
+    let q_home: [f64; 6] = std::array::from_fn(|i| f64::from(config.home_positions[i]));
     let sol = arm.solve_dls_ex(&goal, &q_home, &lo, &hi, kinematics::PAR.w, true);
     assert!(sol.ok, "initial solve for off-axis downward approach pose must succeed");
 
@@ -786,4 +786,201 @@ async fn test_so101_park_uses_folded_resting_pose_and_load_limits() {
         !supervisor.is_at_safe_resting_pose().await,
         "Refuse unload when J3 load exceeds limit"
     );
+}
+
+#[test]
+fn test_5dof_align_auto_yaw_preserves_near_vertical_orientation() {
+    let r_near_vert = kinematics::rpy_to_r(0.0, 1.58, 0.0);
+    assert!(
+        armd::chain::is_tool_vertical(&r_near_vert),
+        "rpy=[0.0, 1.58, 0.0] must be identified as vertical tool orientation"
+    );
+    let goal_p = [0.20, 0.08, 0.15];
+    let aligned = motion::align_auto_yaw(&goal_p, r_near_vert);
+    // When is_tool_vertical is true, align_auto_yaw returns target_r unchanged
+    for r in 0..3 {
+        for c in 0..3 {
+            assert!(
+                (aligned[r][c] - r_near_vert[r][c]).abs() < 1e-9,
+                "align_auto_yaw must preserve near-vertical orientation without pi flip"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_5dof_grasp_plan_from_tilted_scan_to_off_axis_target_no_branch_flip() {
+    let config = load_so101_config();
+    let setup = config.grasp.as_ref().expect("grasp setup exists");
+    let cam = grasp::CamModel::assumed(&config.arm_model, setup, &config.camera_mount);
+    let arm = &config.arm_model;
+
+    // Scan pose with tool pitched down ~45 deg (-x_tool[2] in [0.6, 0.85]):
+    let q_scan = [0.0633, -1.2361, 0.2976, 1.6581, -1.5221, 0.0];
+    let sp = arm.fk(&q_scan);
+    let s_az = sp.p[1].atan2(sp.p[0]);
+    let xt = kinematics::column(&sp.r, 0);
+    let pitch_sin = -xt[2];
+    assert!(
+        pitch_sin > 0.6 && pitch_sin < 0.85,
+        "tool should be pitched down ~45 deg (got pitch_sin = {:.3})",
+        pitch_sin
+    );
+
+    // Target detection located off-axis:
+    let box_norm = [0.80, 0.40, 0.90, 0.60];
+    let centre = cam.to_px(grasp::box_centre(&box_norm));
+    let tgt = cam.plane_point(&sp, centre, setup.table_z_m + setup.grasp_height_m).expect("target plane point exists");
+    let t_az = tgt[1].atan2(tgt[0]);
+    let delta_psi = (t_az - s_az).abs();
+    assert!(
+        delta_psi > 0.35,
+        "test requires off-axis target with |Δψ| > 0.35 rad (got {:.3} rad)",
+        delta_psi
+    );
+
+    let mut inner = SupervisorInner::new(config.clone());
+    inner.lease_enabled = false;
+    inner.set_torque(true).unwrap();
+    let q32: Vec<f32> = q_scan.iter().map(|&x| x as f32).collect();
+    inner.commanded_positions = q32.clone();
+    inner.measured_positions = q32;
+
+    let body = serde_json::json!({
+        "label": "object",
+        "box_norm": box_norm,
+    });
+    let pending = grasp::prepare(&inner, &body, inner.safety.epoch_id()).expect("prepare succeeds");
+    let planned = grasp::plan(pending).expect("grasp::plan from tilted scan pose to off-axis target must succeed without IK_BRANCH_FLIP");
+    assert!(planned.approach_duration > 0.0);
+}
+
+#[tokio::test]
+async fn test_5dof_orchestrator_probe_lateral_returns_fallback() {
+    let config = load_so101_config();
+    let setup = config.grasp.as_ref().expect("grasp setup exists").clone();
+    let target = [0.20, 0.06, setup.table_z_m + setup.grasp_height_m];
+    let r_down = grasp::look_down(&kinematics::IDENTITY);
+    let goal = Pose::new(r_down, [target[0], target[1], setup.table_z_m + setup.approach_height_m]);
+    let arm = &config.arm_model;
+    let lo = std::array::from_fn(|i| f64::from(config.limits[i].min_position));
+    let hi = std::array::from_fn(|i| f64::from(config.limits[i].max_position));
+    let q_home: [f64; 6] = std::array::from_fn(|i| f64::from(config.home_positions[i]));
+    let sol = arm.solve_dls_ex(&goal, &q_home, &lo, &hi, kinematics::PAR.w, true);
+    assert!(sol.ok);
+
+    let driver = MockLoadDriver {
+        caps: DriverCapabilities {
+            velocity_feedback: true,
+            torque_feedback: false,
+            temperature_feedback: true,
+            torque_feedforward: false,
+            enable_feedback: true,
+            load_feedback: false,
+        },
+        loads: std::sync::Arc::new(std::sync::Mutex::new(vec![0.0; 6])),
+        positions: std::sync::Arc::new(std::sync::Mutex::new(sol.q.iter().map(|&x| x as f32).collect())),
+    };
+
+    let supervisor = std::sync::Arc::new(ArmSupervisor::new(config.clone()).with_driver(Box::new(driver)));
+    supervisor.set_torque(true).await.unwrap();
+
+    struct DummyDetectionSource;
+    impl grasp::DetectionSource for DummyDetectionSource {
+        fn inference_enabled(&self) -> grasp::BoxFuture<'_, Result<bool, String>> { Box::pin(async { Ok(true) }) }
+        fn set_inference(&self, _enabled: bool) -> grasp::BoxFuture<'_, Result<(), String>> { Box::pin(async { Ok(()) }) }
+        fn next_frame(&self, _after: Option<u64>, _wait_ms: u64) -> grasp::BoxFuture<'_, Result<Option<grasp::DetectionFrame>, String>> { Box::pin(async { Ok(None) }) }
+    }
+
+    let cam = grasp::CamModel::assumed(&config.arm_model, &setup, &config.camera_mount);
+    let ctx = armd::macro_action::MacroCtx {
+        sup: supervisor.clone(),
+        id: 1,
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+        phase_timeout_s: setup.phase_timeout_s,
+        timeout_code: "GRASP_TIMEOUT",
+        timeout_message: "timeout".into(),
+    };
+    let orch = grasp::Orchestrator {
+        ctx,
+        source: Arc::new(DummyDetectionSource),
+        setup: setup.clone(),
+        cam,
+        envelope: vec![],
+        triggered: false,
+        lens_known: false,
+        depth_available: false,
+    };
+    let dummy_det = grasp::Detection {
+        label: "cup".into(),
+        score: 0.9,
+        box_norm: [0.4, 0.4, 0.6, 0.6],
+        angle_deg: None,
+        angle_conf: None,
+        grasp_width_px: None,
+        mask_focus: false,
+        disp_fg: None,
+        disp_bg: None,
+        depth_conf: None,
+        length_px: None,
+        jaw_clear: None,
+    };
+    let c = grasp::Centred {
+        last: dummy_det.clone(),
+        frames: vec![dummy_det],
+        pose: goal,
+        iterations: 1,
+    };
+    let mut after = None;
+    let est = [0.20, 0.06, 0.0];
+    let lat_res = orch.probe_lateral(&c, &est, "cup", &mut after).await.unwrap();
+    assert!(
+        matches!(lat_res, grasp::Lateral::Fallback("unreachable")),
+        "5-DOF probe_lateral must immediately return Lateral::Fallback"
+    );
+}
+
+#[test]
+fn test_5dof_place_plan_slightly_past_vertical_pose_succeeds_cleanly() {
+    let config = load_so101_config();
+    let arm = &config.arm_model;
+
+    // Start pose with orientation slightly past vertical (pitch = 1.58 rad > pi/2)
+    let r_start = kinematics::rpy_to_r(0.0, 1.58, 0.0);
+    assert!(
+        armd::chain::is_tool_vertical(&r_start),
+        "r_start must be identified as vertical tool orientation"
+    );
+    let p_start = [0.22, 0.0, 0.08];
+    let goal_start = Pose::new(r_start, p_start);
+    let lo = std::array::from_fn(|i| f64::from(config.limits[i].min_position));
+    let hi = std::array::from_fn(|i| f64::from(config.limits[i].max_position));
+    let q_home: [f64; 6] = std::array::from_fn(|i| f64::from(config.home_positions[i]));
+    let sol = arm.solve_dls_ex(&goal_start, &q_home, &lo, &hi, kinematics::PAR.w, false);
+    assert!(sol.ok);
+
+    let mut input = plan_input_at_home(&config);
+    input.q0 = sol.q;
+
+    // Place request without explicit orientation inheriting slightly past-vertical start pose
+    let req = PlaceRequest {
+        target: [0.20, 0.06, 0.02],
+        approach_m: 0.05,
+        pose: None,
+        orientation: None,
+        auto_yaw: Some(true),
+        speed_scale: 0.5,
+        release: true,
+        retreat: true,
+        tag: None,
+    };
+    let pending = PendingPlace {
+        input,
+        request: req,
+        open_rad: config.gripper_policy.as_ref().unwrap().open_rad,
+        held_spill_safe: false,
+        spill_max_tilt_deg: 8.0,
+    };
+    let planned = place::plan(pending).expect("place::plan must succeed cleanly without pi flip");
+    assert!(planned.durations.iter().any(|&d| d > 0.0));
 }
