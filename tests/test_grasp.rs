@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use armd::grasp::{self, BoxFuture, CamModel, DepthFrameInfo, Detection, DetectionFrame, DetectionSource, GraspDeps, GraspSetup, HeightSource, VisionMode};
+use armd::grasp::{self, BoxFuture, CamModel, DepthFrameInfo, Detection, DetectionFrame, DetectionSource, GraspDeps, GraspSetup, HeightSource, ModeInfo, VisionMode};
 use armd::chain::ArmModel;
 use armd::estimate::EstimateEntry;
 use armd::kinematics::{self, Pose, Vec3};
@@ -83,6 +83,13 @@ struct SimCamera {
     pub focus_error: AtomicBool,
     pub depth_available: AtomicBool,
     pub depth_sim: Mutex<Option<DepthSim>>,
+    /// `/api/mode` `model.kind` and `depth_model.metric` (grasp tasks).
+    pub model_kind: Mutex<Option<String>>,
+    pub depth_metric: AtomicBool,
+    /// The provider's mode cannot be read (connection refused).
+    pub mode_down: AtomicBool,
+    /// Mode readings (`mode_info`, one `GET /api/mode` on the HTTP source).
+    pub mode_info_calls: AtomicU64,
 }
 
 impl SimCamera {
@@ -246,7 +253,19 @@ impl DetectionSource for SimCamera {
         })
     }
     fn per_request_pipelines(&self) -> BoxFuture<'_, Result<bool, String>> {
-        Box::pin(async move { Ok(self.per_request.load(Ordering::SeqCst)) })
+        Box::pin(async move {
+            if self.mode_down.load(Ordering::SeqCst) { return Err("connection refused".into()); }
+            Ok(self.per_request.load(Ordering::SeqCst))
+        })
+    }
+    fn mode_info(&self) -> BoxFuture<'_, Result<ModeInfo, String>> {
+        Box::pin(async move {
+            self.mode_info_calls.fetch_add(1, Ordering::SeqCst);
+            let mut m = ModeInfo::compose(self).await?;
+            m.model_kind = self.model_kind.lock().unwrap().clone();
+            m.depth_metric = self.depth_metric.load(Ordering::SeqCst);
+            Ok(m)
+        })
     }
     fn depth_available(&self) -> BoxFuture<'_, Result<bool, String>> {
         Box::pin(async move { Ok(self.depth_available.load(Ordering::SeqCst)) })
@@ -374,6 +393,7 @@ async fn rig_driven(setup: GraspSetup, truth: Truth, mount_rot_deg: f32, start: 
         angle: Mutex::new(None), top: Mutex::new(None), width_px: Mutex::new(None), angle_noise: Mutex::new(None),
         focus_calls: Mutex::new(Vec::new()), focus_error: AtomicBool::new(false),
         depth_available: AtomicBool::new(false), depth_sim: Mutex::new(None),
+        model_kind: Mutex::new(None), depth_metric: AtomicBool::new(false), mode_down: AtomicBool::new(false), mode_info_calls: AtomicU64::new(0),
     });
     let hold = Arc::new(AtomicBool::new(true));
     let (ticker, hold_t) = (sup.clone(), hold.clone());
@@ -2781,4 +2801,242 @@ async fn depth_entry_reports_why_there_is_no_measurement() {
     assert_eq!(a.state, "done", "{a:?}");
     let dep = a.height_estimates.iter().find(|e| e.source.starts_with("depth")).expect("depth entry");
     assert_eq!((dep.source.as_str(), dep.reason.as_deref(), dep.record_only), ("depth", Some("too_few_samples"), true));
+}
+
+// ---- grasp tasks (GraspSetup.tasks, request `task`, TASK_UNSUPPORTED) ----
+
+/// The setup with the documentation's example tasks: `cup` needs a segmentation model,
+/// `flat` a metric depth model, `plain` needs nothing.
+fn with_tasks(mut s: GraspSetup) -> GraspSetup {
+    s.tasks = serde_json::from_value(json!({
+        "cup": {"description": "upright cup, mask yaw", "requires": {"model_kind": "segment"},
+                "overrides": {"yaw_sources": ["mask"], "height_priors": {"cup": 0.095}, "height_sources": ["probe", "prior"]}},
+        "flat": {"description": "thin part, depth height", "requires": {"depth": "metric"},
+                 "overrides": {"height_sources": ["depth", "probe"], "yaw_sources": ["mask", "depth", "box"]}},
+        "plain": {"overrides": {"max_grasp_height_m": 0.05}}
+    })).unwrap();
+    s.validate().unwrap();
+    s
+}
+
+/// [`ws_rig`] with the example tasks stored, the grip pixel calibrated and perception API 2.
+async fn task_rig(setup_path: Option<std::path::PathBuf>) -> WsRig {
+    let r = rig(GraspSetup::default(), Truth::same(), 0.0, [0.0, 0.0], true).await;
+    let start_r = start_pose(&r).await.r;
+    let mut s = with_tasks(GraspSetup::default());
+    s.grip_pixel_norm = calibrate_grip(&r, &s, &start_r);
+    r.sup.inner().write().await.set_grasp_setup(s);
+    r.sim.per_request.store(true, Ordering::SeqCst);
+    ws_rig_on(r, setup_path).await
+}
+
+#[tokio::test]
+async fn task_requirement_mismatch_rejects_the_command_without_motion() {
+    let mut w = task_rig(None).await;
+    *w.rig.sim.model_kind.lock().unwrap() = Some("detect".into());
+    let q0 = w.rig.sup.get_observation().await.commanded_positions;
+    // model_kind: a detection model for the segment task
+    let mut body = tap(&w.rig).await;
+    body["task"] = json!("cup");
+    let reply = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body.clone()).await;
+    assert_eq!((reply["type"].as_str(), reply["code"].as_str(), reply["status"].as_u64()), (Some("command_reject"), Some("TASK_UNSUPPORTED"), Some(422)), "{reply}");
+    assert_eq!(reply["message"], "task cup needs model_kind segment, provider has detect", "{reply}");
+    // depth: no depth pipeline, then a relative one, for the metric task
+    body["task"] = json!("flat");
+    let reply = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body.clone()).await;
+    assert_eq!(reply["code"], "TASK_UNSUPPORTED", "{reply}");
+    assert!(reply["message"].as_str().unwrap().contains("no depth pipeline"), "{reply}");
+    w.rig.sim.depth_available.store(true, Ordering::SeqCst);
+    let reply = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body.clone()).await;
+    assert_eq!(reply["code"], "TASK_UNSUPPORTED", "{reply}");
+    assert!(reply["message"].as_str().unwrap().contains("not metric"), "{reply}");
+    // the in-process start rejects the same way
+    let err = grasp::start(&w.rig.sup, w.rig.sim.clone(), &body).await.unwrap_err();
+    assert_eq!(err.code.as_deref(), Some("TASK_UNSUPPORTED"), "{err:?}");
+    // one mode reading per command, no action, nothing moved
+    assert_eq!(w.rig.sim.mode_info_calls.load(Ordering::SeqCst), 4);
+    let obs = w.rig.sup.get_observation().await;
+    assert!(obs.action.is_none(), "no action started: {:?}", obs.action);
+    assert_eq!(obs.commanded_positions, q0, "no motion commanded");
+    assert!(w.rig.sim.trigger_calls.lock().unwrap().is_empty(), "no detection triggered");
+}
+
+#[tokio::test]
+async fn task_requirement_met_runs_to_done_with_the_task_in_status() {
+    let mut w = task_rig(None).await;
+    *w.rig.sim.model_kind.lock().unwrap() = Some("segment".into());
+    let mut body = tap(&w.rig).await;
+    body["task"] = json!("cup");
+    let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let a = heartbeat_until_done(&mut w, ack["action_id"].as_u64().unwrap(), 40.0).await;
+    assert_eq!((a["state"].as_str(), a["task"].as_str(), a["holding"].as_bool()), (Some("done"), Some("cup"), Some(true)), "{a}");
+    // the task's overrides applied: yaw_sources [mask] (no box source), the probe decided the height
+    let yaw: Vec<&str> = a["yaw_estimates"].as_array().unwrap().iter().map(|e| e["source"].as_str().unwrap()).collect();
+    assert!(yaw.contains(&"mask") && !yaw.contains(&"box"), "{a}");
+    assert_eq!(a["height_source"], "scale", "{a}");
+    // the preflight's reading is reused: one per grasp
+    assert_eq!(w.rig.sim.mode_info_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn grasp_without_a_task_reads_the_mode_once_and_has_no_task_field() {
+    let mut w = task_rig(None).await;
+    let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", tap(&w.rig).await).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let a = heartbeat_until_done(&mut w, ack["action_id"].as_u64().unwrap(), 40.0).await;
+    assert_eq!(a["state"], "done", "{a}");
+    assert!(a.get("task").is_none(), "{a}");
+    assert_eq!(w.rig.sim.mode_info_calls.load(Ordering::SeqCst), 1);
+    // a task without requirements: no check before the ack, the orchestrator's one reading
+    let mut body = tap(&w.rig).await;
+    body["task"] = json!("plain");
+    let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let id = ack["action_id"].as_u64().unwrap();
+    let a = w.rig.sup.get_observation().await.action.unwrap();
+    assert_eq!((a.id, a.task.as_deref()), (id, Some("plain")));
+    let _ = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/motion/stop", json!({})).await;
+    wait_done(&w.rig.sup, id, 5.0, |_| {}).await;
+    assert_eq!(w.rig.sim.mode_info_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn task_requirement_on_a_legacy_provider_and_provider_down() {
+    let mut w = task_rig(None).await;
+    // an older detector: no /api/mode (no per-request pipelines, no mode API)
+    w.rig.sim.per_request.store(false, Ordering::SeqCst);
+    let mut body = tap(&w.rig).await;
+    for (task, what) in [("cup", "model.kind"), ("flat", "depth")] {
+        body["task"] = json!(task);
+        let reply = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body.clone()).await;
+        assert_eq!(reply["code"], "TASK_UNSUPPORTED", "{reply}");
+        assert!(reply["message"].as_str().unwrap().ends_with(&format!("provider does not report {what}")), "{reply}");
+    }
+    // provider unreachable: not a task failure; the grasp fails as without a task
+    w.rig.sim.per_request.store(true, Ordering::SeqCst);
+    w.rig.sim.mode_down.store(true, Ordering::SeqCst);
+    let mut results = Vec::new();
+    for task in [None, Some("cup")] {
+        let mut b = tap(&w.rig).await;
+        if let Some(t) = task { b["task"] = json!(t); }
+        let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", b).await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        let a = wait_done(&w.rig.sup, ack["action_id"].as_u64().unwrap(), 5.0, |_| {}).await;
+        results.push((a.state.clone(), a.code.clone(), a.message.clone()));
+    }
+    assert_eq!(results[0], results[1]);
+    assert_eq!((results[0].0.as_str(), results[0].1.as_deref()), ("failed", Some("DETECTION_UNAVAILABLE")), "{results:?}");
+    // 2 legacy checks + one reading per accepted grasp (the task's preflight reading is reused)
+    assert_eq!(w.rig.sim.mode_info_calls.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn task_request_errors_are_invalid_command() {
+    let mut w = task_rig(None).await;
+    let base = tap(&w.rig).await;
+    let cases = [
+        (json!({"task": "bogus"}), "unknown grasp task: bogus"),
+        (json!({"task": 3}), "task must be a string"),
+        (json!({"overrides": {"tasks": {}}}), "tasks cannot be overridden per request"),
+        (json!({"task": "plain", "overrides": {"tasks": {}}}), "tasks cannot be overridden per request"),
+        // the request's overrides make the task's setup invalid (plain: max_grasp_height_m 0.05)
+        (json!({"task": "plain", "overrides": {"grasp_height_m": 0.055}}), "max_grasp_height_m"),
+    ];
+    for (extra, msg) in cases {
+        let mut body = base.clone();
+        for (k, v) in extra.as_object().unwrap() { body[k] = v.clone(); }
+        let reply = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body).await;
+        assert_eq!((reply["code"].as_str(), reply["status"].as_u64()), (Some("INVALID_COMMAND"), Some(400)), "{reply}");
+        assert!(reply["message"].as_str().unwrap().contains(msg), "{msg}: {reply}");
+    }
+    assert_eq!(w.rig.sim.mode_info_calls.load(Ordering::SeqCst), 0);
+    assert!(w.rig.sup.get_observation().await.action.is_none());
+}
+
+#[tokio::test]
+async fn dry_run_reports_the_task_requirement() {
+    let mut w = task_rig(None).await;
+    *w.rig.sim.model_kind.lock().unwrap() = Some("detect".into());
+    let mut body = tap(&w.rig).await;
+    body["dry_run"] = json!(true);
+    // no task: no mode reading, no task fields
+    let res = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body.clone()).await;
+    assert_eq!((res["type"].as_str(), res["reachable"].as_bool()), (Some("command_ack"), Some(true)), "{res}");
+    assert!(res.get("task_supported").is_none(), "{res}");
+    assert_eq!(w.rig.sim.mode_info_calls.load(Ordering::SeqCst), 0);
+    // unsupported task: reachable stays the geometry's, one reading
+    body["task"] = json!("cup");
+    let res = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body.clone()).await;
+    assert_eq!((res["reachable"].as_bool(), res["task_supported"].as_bool()), (Some(true), Some(false)), "{res}");
+    assert_eq!(res["task_reason"], "task cup needs model_kind segment, provider has detect", "{res}");
+    assert_eq!(w.rig.sim.mode_info_calls.load(Ordering::SeqCst), 1);
+    // REST, no lease needed
+    let c = reqwest::Client::new();
+    let rest: Value = c.post(format!("http://{}/api/v1/action/grasp", w.addr)).json(&body).send().await.unwrap().json().await.unwrap();
+    assert_eq!((rest["reachable"].as_bool(), rest["task_supported"].as_bool()), (Some(true), Some(false)), "{rest}");
+    // supported task and a task without requirements (no reading)
+    *w.rig.sim.model_kind.lock().unwrap() = Some("segment".into());
+    let rest: Value = c.post(format!("http://{}/api/v1/action/grasp", w.addr)).json(&body).send().await.unwrap().json().await.unwrap();
+    assert_eq!((rest["task_supported"].as_bool(), rest["task_reason"].is_null()), (Some(true), true), "{rest}");
+    body["task"] = json!("plain");
+    let res = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body.clone()).await;
+    assert_eq!(res["task_supported"], true, "{res}");
+    assert_eq!(w.rig.sim.mode_info_calls.load(Ordering::SeqCst), 3);
+    // an unknown task fails the dry run itself
+    body["task"] = json!("bogus");
+    let res = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body).await;
+    assert_eq!((res["reachable"].as_bool(), res["code"].as_str()), (Some(false), Some("INVALID_COMMAND")), "{res}");
+    assert!(res.get("task_supported").is_none(), "{res}");
+    assert!(w.rig.sup.get_observation().await.action.is_none(), "dry runs start nothing");
+}
+
+#[tokio::test]
+async fn grasp_tasks_through_the_setup_api_persist_and_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("grasp_setup.json");
+    let mut w = ws_rig(Some(path.clone())).await;
+    let v: Value = reqwest::get(format!("http://{}/api/v1/grasp/setup", w.addr)).await.unwrap().json().await.unwrap();
+    assert_eq!(v["setup"]["tasks"], json!({}), "an empty task map is reported");
+    // first insertion
+    let tasks = serde_json::to_value(&with_tasks(GraspSetup::default()).tasks).unwrap();
+    let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/grasp/setup", json!({"tasks": tasks})).await;
+    assert_eq!((ack["type"].as_str(), ack["persisted"].as_bool()), (Some("command_ack"), Some(true)), "{ack}");
+    assert_eq!(ack["setup"]["tasks"], tasks);
+    // a setup change that makes a stored task invalid is rejected as a whole
+    // (plain sets max_grasp_height_m 0.05, below grasp_height_m 0.055; valid without the task)
+    assert!(GraspSetup::default().patched(&json!({"grasp_height_m": 0.055})).is_ok());
+    let reply = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/grasp/setup", json!({"grasp_height_m": 0.055})).await;
+    assert_eq!(reply["code"], "INVALID_COMMAND", "{reply}");
+    assert!(reply["message"].as_str().unwrap().starts_with("grasp task plain:"), "{reply}");
+    // invalid tasks: bad name, nested tasks, unknown field, unknown task key
+    for bad in [json!({"Cup": {}}), json!({"a": {"overrides": {"tasks": {}}}}), json!({"a": {"overrides": {"bogus": 1}}}),
+                json!({"a": {"needs": {}}}), json!({"a": {"requires": {"model_kind": "obb"}}})] {
+        let reply = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/grasp/setup", json!({"tasks": bad})).await;
+        assert_eq!(reply["code"], "INVALID_COMMAND", "{bad}: {reply}");
+    }
+    let stored = w.rig.sup.inner().read().await.grasp_setup().unwrap();
+    assert_eq!(serde_json::to_value(&stored.tasks).unwrap(), tasks, "rejected updates change nothing");
+    // the file reloads with the tasks
+    let fresh = ArmSupervisor::new(ArmConfig::rebot_dm());
+    grasp::load_into(&fresh, &path).await;
+    assert_eq!(fresh.inner().read().await.grasp_setup().unwrap().tasks, stored.tasks);
+    // a file whose task does not fit its setup is ignored as a whole
+    let base = GraspSetup::default();
+    let bad = dir.path().join("bad.json");
+    std::fs::write(&bad, json!({"grasp_height_m": 0.055, "tasks": {"plain": {"overrides": {"max_grasp_height_m": 0.05}}}}).to_string()).unwrap();
+    let (s, outcome) = grasp::load_setup(&bad, &base);
+    assert!(matches!(outcome, grasp::LoadOutcome::Invalid(_)) && s == base, "{outcome:?}");
+    // `{}` deletes all tasks
+    let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/grasp/setup", json!({"tasks": {}})).await;
+    assert_eq!(ack["setup"]["tasks"], json!({}), "{ack}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["tasks"], json!({}));
+}
+
+#[tokio::test]
+async fn capabilities_advertise_grasp_tasks() {
+    let w = ws_rig(None).await;
+    let v: Value = reqwest::get(format!("http://{}/api/v1/observation/schema", w.addr)).await.unwrap().json().await.unwrap();
+    assert_eq!((v["capabilities"]["grasp"].as_bool(), v["capabilities"]["grasp_tasks"].as_bool()), (Some(true), Some(true)), "{}", v["capabilities"]);
 }

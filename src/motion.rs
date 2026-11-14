@@ -764,6 +764,9 @@ pub struct ActionStatus {
     pub holding: Option<bool>,
     pub gripper_gap_rad: Option<f32>,
     pub settled: Option<bool>,
+    /// Grasp: the request's task (`GraspSetup.tasks`); absent without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
     /// Grasp only: open | approach | centring | transition | align | descend | close | release | lift | done.
     #[serde(default)]
     pub phase: Option<String>,

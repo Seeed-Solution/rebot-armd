@@ -116,15 +116,24 @@ CASES = {
     # _yaw: yaw_sources [depth, box], the depth pipeline's angle decides
     "axis_block_detect_depth_record": ([*AXIS_LENS, "--objects", "block", "--seed", "24", "--depth", "metric", "--no-mask-angle"], None),
     "axis_block_detect_depth_yaw": ([*AXIS_LENS, "--objects", "block", "--seed", "24", "--depth", "metric", "--no-mask-angle"], None),
+    # task_*: a stored grasp task (TASK) that needs a metric depth model and sets height_sources
+    # [depth, probe]; the request names it instead of passing height_sources. _unsupported: sim
+    # depth off, the command is rejected with TASK_UNSUPPORTED before anything moves;
+    # _depth_decides: --depth metric, as depth_metric_decides
+    "task_requires_depth_unsupported": (AXIS_LENS, None),
+    "task_depth_decides": ([*AXIS_LENS, "--depth", "metric"], None),
 }
+TASK = {"description": "thin part, depth height", "requires": {"depth": "metric"},
+        "overrides": {"height_sources": ["depth", "probe"]}}
 # generator model per depth case (the simulator's --depth options) and the setup patch
 DEPTH_MODELS = {"depth_metric_decides": DepthModel("metric"), "depth_metric_record_only": DepthModel("metric"),
                 "depth_metric_scale_rejected": DepthModel("metric", scale=1.5), "depth_relative": DepthModel("relative"),
-                "axis_block_detect_depth_record": DepthModel("metric"), "axis_block_detect_depth_yaw": DepthModel("metric")}
+                "axis_block_detect_depth_record": DepthModel("metric"), "axis_block_detect_depth_yaw": DepthModel("metric"),
+                "task_depth_decides": DepthModel("metric")}
 DETECT_DEPTH = {"axis_block_detect_depth_record", "axis_block_detect_depth_yaw"}
 # depth recorded, the probe decides the height
 DEPTH_RECORD_ONLY = {"depth_metric_record_only", *DETECT_DEPTH}
-DEPTH_DECIDES = {"depth_metric_decides", "depth_metric_scale_rejected", "depth_relative"}
+DEPTH_DECIDES = {"depth_metric_decides", "depth_metric_scale_rejected", "depth_relative", "task_depth_decides"}
 # object the case grasps (default: the cube) and its height (scene.py KINDS)
 TARGETS = {"axis_cup": "cup", "axis_block": "block", "axis_slab": "slab", "axis_cube_preopen": "cube", "axis_cube_lateral": "cube",
            **{c: "block" for c in DETECT_DEPTH}}
@@ -132,7 +141,7 @@ HEIGHTS_M = {"cube": 0.04, "cup": 0.07, "block": 0.04, "slab": 0.02}
 # approach height per case (default: v8 0.15 m, v5 0.25 m); axis_cube / axis_cup 0.15 m; axis_block
 # 0.20 m (at 0.15 m the 6 cm block's box reaches the image border and the J6 alignment is skipped)
 APPROACH_M = {**{c: 0.15 for c in DEPTH_MODELS}, "axis_cube": 0.15, "axis_cup": 0.15, "axis_block": 0.20, "axis_slab": 0.15, "axis_cube_preopen": 0.15,
-              "axis_cube_lateral": 0.20, **{c: 0.20 for c in DETECT_DEPTH}}
+              "axis_cube_lateral": 0.20, **{c: 0.20 for c in DETECT_DEPTH}, "task_requires_depth_unsupported": 0.15}
 
 
 def view_pose(cam: dict, cube_xy, z: float, miss_m=(0.0, 0.0)):
@@ -256,13 +265,39 @@ def test_tap_to_grasp_the_cube(cam_rig):
         overrides["pre_open"] = "on"
     if case == "axis_cube_lateral":
         overrides["height_probe_mode"] = "lateral"
-    if case in DEPTH_DECIDES:
+    if case in DEPTH_DECIDES and not case.startswith("task_"):
         overrides["height_sources"] = ["depth", "probe"]
     if case == "axis_block_detect_depth_yaw":
         overrides["yaw_sources"] = ["depth", "box"]
+    request = {"label": target, "box_norm": box, "frame_id": det["frame_id"], "overrides": overrides}
+    if case.startswith("task_"):
+        # the task is stored in the setup; the request names it (height_sources come from it)
+        setup = client.command("/api/v1/grasp/setup", {"tasks": {"flat": TASK}})["setup"]
+        assert setup["tasks"] == {"flat": TASK}, setup
+        request["task"] = "flat"
+    if case == "task_requires_depth_unsupported":
+        q0 = client.observation()["positions"]
+        mode = http(client.base + "/api/v1/vision/mode")
+        assert mode["model"]["kind"] == "segment" and not mode["available"].get("depth"), mode
+        dry = http(client.base + "/api/v1/action/grasp", {**request, "dry_run": True})
+        print(f"dry run: {dry}")
+        assert dry["reachable"] is True and dry["task_supported"] is False, dry
+        client.request_id += 1
+        client.send({"type": "command", "request_id": client.request_id, "generation": client.generation,
+                     "epoch_id": client.observation()["epoch_id"], "path": "/api/v1/action/grasp", "body": request})
+        reply = client.reply({"command_ack", "command_reject"})
+        print(f"grasp reply: {reply}")
+        assert reply["type"] == "command_reject" and reply["code"] == "TASK_UNSUPPORTED", reply
+        assert reply["message"] == "task flat needs depth metric, provider has no depth pipeline", reply
+        time.sleep(1.0)
+        obs = client.observation()
+        assert obs.get("action") is None or obs["action"]["kind"] != "grasp", obs.get("action")
+        moved = max(abs(a - b) for a, b in zip(obs["positions"], q0))
+        print(f"largest joint change after the rejection: {moved:.5f} rad")
+        assert moved < 0.01, (q0, obs["positions"])
+        return
     t0 = time.time()
-    ack = client.command("/api/v1/action/grasp", {"label": target, "box_norm": box, "frame_id": det["frame_id"],
-                                                  "overrides": overrides})
+    ack = client.command("/api/v1/action/grasp", request)
     rec = None
     pre_descend_j7 = None
     while time.time() - t0 < 120:
@@ -317,6 +352,8 @@ def test_tap_to_grasp_the_cube(cam_rig):
                 assert r["height_source"] == "scale" and abs(e["value"] - truth) <= 0.01, json.dumps(rec)
             else:
                 assert e["used"] and r["height_source"] == "depth" and r.get("probe_dz_m") is None, json.dumps(rec)
+                if case == "task_depth_decides":
+                    assert r["task"] == "flat", json.dumps(rec)
                 anchor = "metric_table" if model.metric else ("two_height_fk", "oblique_ransac")
                 assert r["depth_anchor"] in (anchor if isinstance(anchor, tuple) else (anchor,)), json.dumps(rec)
                 assert abs(r["object_height_m"] - truth) <= (0.005 if model.metric else 0.01), json.dumps(rec)
