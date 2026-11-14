@@ -330,7 +330,7 @@ class Simulator:
 
     def start_camera(self, fps: int, size: tuple[int, int], host: str, video_port: int, perception_port: int,
                      scene_stream: bool = False, objects: str = "cube", timeout: float = 60.0,
-                     noise: dict | None = None, depth: dict | None = None) -> dict:
+                     noise: dict | None = None, depth: dict | None = None, mask_angle: bool = True) -> dict:
         """Spawn the camera process (perception.camera_main); returns its ready message."""
         import multiprocessing as mp
 
@@ -345,7 +345,7 @@ class Simulator:
         cfg = {"fps": fps, "size": list(size), "host": host, "video_port": video_port,
                "perception_port": perception_port, "scene_stream": scene_stream, "objects": objects,
                "mount": [m.flip, m.rot_deg, m.tilt_deg, m.offset_m], "has_meshes": self.has_meshes,
-               "noise": noise or {}, "depth": depth or {}}
+               "noise": noise or {}, "depth": depth or {}, "mask_angle": mask_angle}
         self.cam_proc = ctx.Process(target=camera_main, name="rebot-sim-camera", daemon=True,
                                     args=(cfg, self.shared.shm.name, self.shared.lock, self.model.nq, self.model.nv, child, ready_w,
                                           os.getpid()))
@@ -522,6 +522,8 @@ def main(argv: list[str] | None = None) -> None:
     det.add_argument("--det-false-rate", type=float, default=0.0, metavar="P",
                      help="per frame, add one false detection (random label and place, score 0.3..0.6) with probability P")
     det.add_argument("--det-angle-jitter-deg", type=float, default=0.0, metavar="S", help="Gaussian sigma on angle_deg")
+    det.add_argument("--no-mask-angle", action="store_true",
+                     help="a plain detection model: detections omit angle_deg / angle_conf / grasp_width_px")
     det.add_argument("--det-noise-seed", type=int, default=None, metavar="N", help="noise RNG seed (default: --seed, else 0)")
     dep = parser.add_argument_group("depth pipeline (emulated monocular depth model; off by default)")
     dep.add_argument("--depth", choices=("off", "metric", "relative"), default="off",
@@ -578,7 +580,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.camera:
         w, h = (int(v) for v in args.camera_size.split("x"))
         ready = sim.start_camera(args.fps, (w, h), args.http_host, args.video_port, args.perception_port,
-                                 args.scene_stream, args.objects, noise=noise, depth=depth)
+                                 args.scene_stream, args.objects, noise=noise, depth=depth,
+                                 mask_angle=not args.no_mask_angle)
         if "error" in ready:
             print(f"rebot-sim: {ready['error']}", file=sys.stderr, flush=True)
             sim.close()

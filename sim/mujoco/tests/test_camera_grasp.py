@@ -109,18 +109,30 @@ CASES = {
     "depth_metric_record_only": ([*AXIS_LENS, "--depth", "metric"], None),
     "depth_metric_scale_rejected": ([*AXIS_LENS, "--depth", "metric", "--depth-scale", "1.5"], None),
     "depth_relative": ([*AXIS_LENS, "--depth", "relative"], None),
+    # axis_block_detect_depth_*: a plain detection model (--no-mask-angle: no angle_deg /
+    # grasp_width_px) with the metric depth pipeline, the 6 x 3 cm block turned 13.5 deg (seed 24,
+    # box aspect about 1.5 > align_min_aspect 1.2; seed 14's 36.5 deg gives about 1.1).
+    # _record: default setup, the box aspect decides the J6 roll and the depth angle is recorded;
+    # _yaw: yaw_sources [depth, box], the depth pipeline's angle decides
+    "axis_block_detect_depth_record": ([*AXIS_LENS, "--objects", "block", "--seed", "24", "--depth", "metric", "--no-mask-angle"], None),
+    "axis_block_detect_depth_yaw": ([*AXIS_LENS, "--objects", "block", "--seed", "24", "--depth", "metric", "--no-mask-angle"], None),
 }
 # generator model per depth case (the simulator's --depth options) and the setup patch
 DEPTH_MODELS = {"depth_metric_decides": DepthModel("metric"), "depth_metric_record_only": DepthModel("metric"),
-                "depth_metric_scale_rejected": DepthModel("metric", scale=1.5), "depth_relative": DepthModel("relative")}
+                "depth_metric_scale_rejected": DepthModel("metric", scale=1.5), "depth_relative": DepthModel("relative"),
+                "axis_block_detect_depth_record": DepthModel("metric"), "axis_block_detect_depth_yaw": DepthModel("metric")}
+DETECT_DEPTH = {"axis_block_detect_depth_record", "axis_block_detect_depth_yaw"}
+# depth recorded, the probe decides the height
+DEPTH_RECORD_ONLY = {"depth_metric_record_only", *DETECT_DEPTH}
 DEPTH_DECIDES = {"depth_metric_decides", "depth_metric_scale_rejected", "depth_relative"}
 # object the case grasps (default: the cube) and its height (scene.py KINDS)
-TARGETS = {"axis_cup": "cup", "axis_block": "block", "axis_slab": "slab", "axis_cube_preopen": "cube", "axis_cube_lateral": "cube"}
+TARGETS = {"axis_cup": "cup", "axis_block": "block", "axis_slab": "slab", "axis_cube_preopen": "cube", "axis_cube_lateral": "cube",
+           **{c: "block" for c in DETECT_DEPTH}}
 HEIGHTS_M = {"cube": 0.04, "cup": 0.07, "block": 0.04, "slab": 0.02}
 # approach height per case (default: v8 0.15 m, v5 0.25 m); axis_cube / axis_cup 0.15 m; axis_block
 # 0.20 m (at 0.15 m the 6 cm block's box reaches the image border and the J6 alignment is skipped)
 APPROACH_M = {**{c: 0.15 for c in DEPTH_MODELS}, "axis_cube": 0.15, "axis_cup": 0.15, "axis_block": 0.20, "axis_slab": 0.15, "axis_cube_preopen": 0.15,
-              "axis_cube_lateral": 0.20}
+              "axis_cube_lateral": 0.20, **{c: 0.20 for c in DETECT_DEPTH}}
 
 
 def view_pose(cam: dict, cube_xy, z: float, miss_m=(0.0, 0.0)):
@@ -223,6 +235,13 @@ def test_tap_to_grasp_the_cube(cam_rig):
               f"length_px {d.get('length_px')} jaw_clear {d.get('jaw_clear')}")
         assert det["pipelines"]["depth"]["ran"] and det["depth"]["metric_model"] == model.metric, det
         assert len(samples) >= (3 if model.metric else 8), det["depth"]
+    if case in DETECT_DEPTH:  # a plain detection model: no mask fields, the depth angle; the box aspect decides
+        aspect = max(d["w"] * 640, d["h"] * 360) / min(d["w"] * 640, d["h"] * 360)
+        print(f"preflight detect model: box aspect {aspect:.2f}, depth_angle_deg {d.get('depth_angle_deg')} "
+              f"depth_angle_conf {d.get('depth_angle_conf')} depth_width_px {d.get('depth_width_px')}")
+        assert not {"angle_deg", "angle_conf", "grasp_width_px"} & set(d), d
+        assert d.get("depth_angle_deg") is not None and d.get("depth_width_px") is not None, d
+        assert aspect > 1.3, aspect
     box = [min(1.0, max(0.0, v)) for v in (d["x"] - d["w"] / 2, d["y"] - d["h"] / 2, d["x"] + d["w"] / 2, d["y"] + d["h"] / 2)]
     schema = http(client.base + "/api/v1/observation/schema")
     print(f"schema vision caps: {schema.get('capabilities', {}).get('vision')}")
@@ -239,6 +258,8 @@ def test_tap_to_grasp_the_cube(cam_rig):
         overrides["height_probe_mode"] = "lateral"
     if case in DEPTH_DECIDES:
         overrides["height_sources"] = ["depth", "probe"]
+    if case == "axis_block_detect_depth_yaw":
+        overrides["yaw_sources"] = ["depth", "box"]
     t0 = time.time()
     ack = client.command("/api/v1/action/grasp", {"label": target, "box_norm": box, "frame_id": det["frame_id"],
                                                   "overrides": overrides})
@@ -273,6 +294,7 @@ def test_tap_to_grasp_the_cube(cam_rig):
           f"align={r.get('align')} recentre={r.get('recentre')} post_lift={r.get('post_lift')} grasp_width_m={r.get('grasp_width_m')} "
           f"pre_open={r.get('pre_open')} pre_open_m={r.get('pre_open_m')} held_width_m={r.get('held_width_m')}")
     print(f"{target} after the grasp: {cube}")
+    print(f"estimates: yaw {json.dumps(r.get('yaw_estimates'))} width {json.dumps(r.get('width_estimates'))}")
     if model is not None:
         truth = cube["height_m"]
         dep = [e for e in r.get("height_estimates") or [] if e["source"].startswith("depth")]
@@ -285,12 +307,12 @@ def test_tap_to_grasp_the_cube(cam_rig):
         e = dep[0]
         if case == "depth_metric_scale_rejected":
             # the table contradicts the metric prior: no depth anchor, the probe decides
-            assert e["source"] == "depth" and e["value"] is None and e["reason"] == "no_measurement", json.dumps(rec)
+            assert e["source"] == "depth" and e["value"] is None and e["reason"] == "table_contradicts_fk", json.dumps(rec)
             assert r.get("depth_anchor") is None and r["height_source"] == "scale", json.dumps(rec)
         else:
             # a depth measurement with an anchor; a fallback without one fails the case
             assert e["source"].startswith("depth:") and e["value"] is not None, json.dumps(rec)
-            if case == "depth_metric_record_only":
+            if case in DEPTH_RECORD_ONLY:
                 assert e["source"] == "depth:metric_table" and e["record_only"] and not e["used"], json.dumps(rec)
                 assert r["height_source"] == "scale" and abs(e["value"] - truth) <= 0.01, json.dumps(rec)
             else:
@@ -336,3 +358,24 @@ def test_tap_to_grasp_the_cube(cam_rig):
         cross_deg = math.degrees(math.acos(min(1.0, abs(float(long_side @ jaw)))))
         print(f"block long side vs jaw closing direction {cross_deg:.1f} deg, align_turn_rad={rec.get('align_turn_rad')}")
         assert cross_deg > 70.0, cross_deg
+    if case in DETECT_DEPTH:
+        yaw = {e["source"]: e for e in rec.get("yaw_estimates") or []}
+        if case == "axis_block_detect_depth_record":
+            # the box aspect decides, the depth angle is recorded (no turn from it)
+            assert rec["align"] in ("turned:box", "kept:box"), json.dumps(rec)
+            assert yaw["depth"]["record_only"] and not yaw["depth"]["used"] and yaw["depth"]["value"] is not None, json.dumps(rec)
+            assert yaw["box"]["used"] and not yaw["mask"]["used"] and yaw["mask"]["reason"] == "no_angle", json.dumps(rec)
+        else:
+            assert rec["align"] == "turned:depth", json.dumps(rec)
+            assert yaw["depth"]["used"] and not yaw["depth"]["record_only"] and "box" not in yaw, json.dumps(rec)
+        # no mask width: the depth measurement's width decides
+        width = [(e["source"], e["used"]) for e in rec.get("width_estimates") or []]
+        assert width == [("mask", False), ("depth", True)], json.dumps(rec)
+        long_side, jaw = np.zeros(3), np.zeros(3)
+        mujoco.mju_rotVecQuat(long_side, [1.0, 0.0, 0.0], cube["quat"])
+        mujoco.mju_rotVecQuat(jaw, [0.0, 1.0, 0.0], state["tcp_quat"])
+        cross_deg = math.degrees(math.acos(min(1.0, abs(float(long_side @ jaw)))))
+        print(f"block long side vs jaw closing direction {cross_deg:.1f} deg, align={rec['align']} "
+              f"align_turn_rad={rec.get('align_turn_rad')} grasp_width_m={rec.get('grasp_width_m')}")
+        if case == "axis_block_detect_depth_yaw":
+            assert cross_deg > 70.0, cross_deg
