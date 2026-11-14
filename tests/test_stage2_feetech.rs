@@ -114,7 +114,20 @@ fn test_serial_transport_rs485_config() {
 fn test_feetech_tx_echo_drain() {
     let mock = MockTransport::new();
     let servo_ids = vec![1];
-    let mut driver = FeetechArmDriver::new(mock, servo_ids).with_tx_echo(Some(true));
+    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+
+    // Provide feedback for servo 1 first
+    let pos = 2048u16.to_le_bytes();
+    let params = [pos[0], pos[1], 0, 0, 0, 0, 70, 35];
+    let cs = calculate_checksum(1, 10, 0x00, &params);
+    let mut fb = vec![0xFF, 0xFF, 1, 10, 0x00];
+    fb.extend_from_slice(&params);
+    fb.push(cs);
+    driver.transport_mut().provide_rx(&fb);
+    driver.read_joint_states().unwrap();
+    let _ = driver.transport_mut().take_tx();
+
+    let mut driver = driver.with_tx_echo(Some(true));
 
     // Prepare response: TX packet echoed first, followed by RX response
     let pkt_write = feetech::build_set_torque(1, true);
@@ -144,7 +157,21 @@ fn test_feetech_tx_echo_drain() {
 fn test_feetech_torque_enable_rollback() {
     let mock = MockTransport::new();
     let servo_ids = vec![1, 2];
-    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+    let mut driver = FeetechArmDriver::new(mock, servo_ids.clone());
+
+    // Provide feedback first
+    let mut rx_fb = Vec::new();
+    for &id in &servo_ids {
+        let pos = 2048u16.to_le_bytes();
+        let params = [pos[0], pos[1], 0, 0, 0, 0, 70, 35];
+        let cs = calculate_checksum(id, 10, 0x00, &params);
+        rx_fb.extend_from_slice(&[0xFF, 0xFF, id, 10, 0x00]);
+        rx_fb.extend_from_slice(&params);
+        rx_fb.push(cs);
+    }
+    driver.transport_mut().provide_rx(&rx_fb);
+    driver.read_joint_states().unwrap();
+    let _ = driver.transport_mut().take_tx();
 
     // Servo 1 reports 1 (enabled), Servo 2 fails (reports 0)
     let cs1 = calculate_checksum(1, 3, 0x00, &[1]);
@@ -164,13 +191,13 @@ fn test_feetech_torque_enable_rollback() {
 
     // Verify rollback: driver wrote disable packets (REG_TORQUE_ENABLE = 0)
     let tx = driver.transport_mut().take_tx();
-    // Enable writes (2*8=16) + Readback reads (2*8=16) + Rollback writes (2*8=16) = 48 bytes
-    assert_eq!(tx.len(), 48);
-    // Rollback write to servo 1 at offset 32: [0xFF, 0xFF, 1, 4, 3, 0x28, 0, cs]
-    assert_eq!(tx[32 + 2], 1); // ID 1
-    assert_eq!(tx[32 + 4], INST_WRITE);
-    assert_eq!(tx[32 + 5], REG_TORQUE_ENABLE);
-    assert_eq!(tx[32 + 6], 0); // Torque disable
+    // Pre-seeding SYNC_WRITE (14) + Enable writes (2*8=16) + Readback reads (2*8=16) + Rollback writes (2*8=16) = 62 bytes
+    assert_eq!(tx.len(), 62);
+    // Rollback write to servo 1 at offset 46: [0xFF, 0xFF, 1, 4, 3, 0x28, 0, cs]
+    assert_eq!(tx[46 + 2], 1); // ID 1
+    assert_eq!(tx[46 + 4], INST_WRITE);
+    assert_eq!(tx[46 + 5], REG_TORQUE_ENABLE);
+    assert_eq!(tx[46 + 6], 0); // Torque disable
 }
 
 // -------------------------------------------------------------------------
@@ -266,6 +293,11 @@ fn test_feetech_configure_servos() {
         rx.extend_from_slice(&params);
         rx.push(cs);
     }
+
+    // Readback verification response for changed REG_RETURN_DELAY (value 0)
+    let ret_cs = calculate_checksum(1, 3, 0x00, &[0]);
+    rx.extend_from_slice(&[0xFF, 0xFF, 1, 3, 0x00, 0, ret_cs]);
+
     driver.transport_mut().provide_rx(&rx);
 
     driver.configure_servos().unwrap();
@@ -585,7 +617,21 @@ fn test_feetech_configure_servos_already_matching_torque_enabled_succeeds() {
 fn test_feetech_set_torque_already_enabled_no_rollback_on_failure() {
     let mock = MockTransport::new();
     let servo_ids = vec![1, 2];
-    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+    let mut driver = FeetechArmDriver::new(mock, servo_ids.clone());
+
+    // Provide feedback first
+    let mut rx_fb = Vec::new();
+    for &id in &servo_ids {
+        let pos = 2048u16.to_le_bytes();
+        let params = [pos[0], pos[1], 0, 0, 0, 0, 70, 35];
+        let cs = calculate_checksum(id, 10, 0x00, &params);
+        rx_fb.extend_from_slice(&[0xFF, 0xFF, id, 10, 0x00]);
+        rx_fb.extend_from_slice(&params);
+        rx_fb.push(cs);
+    }
+    driver.transport_mut().provide_rx(&rx_fb);
+    driver.read_joint_states().unwrap();
+    let _ = driver.transport_mut().take_tx();
 
     // First enable successfully so driver.enable_state() == Enabled
     let cs1 = calculate_checksum(1, 3, 0x00, &[1]);
@@ -615,10 +661,10 @@ fn test_feetech_set_torque_already_enabled_no_rollback_on_failure() {
     assert!(matches!(res.unwrap_err(), ArmDriverError::HardwareFault(_)));
     assert_eq!(driver.enable_state(), EnableState::Unknown);
 
-    // TX should contain 2 enable writes + 2 readback reads = 4 packets (32 bytes).
+    // TX should contain pre-seeding SYNC_WRITE (14) + 2 enable writes + 2 readback reads = 46 bytes.
     // It must NOT contain rollback disable writes (which would be another 16 bytes with value 0).
     let tx = driver.transport_mut().take_tx();
-    assert_eq!(tx.len(), 32);
+    assert_eq!(tx.len(), 46);
     for window in tx.windows(8) {
         if window[0] == 0xFF && window[1] == 0xFF && window[4] == INST_WRITE && window[5] == REG_TORQUE_ENABLE {
             assert_eq!(window[6], 1, "Must never send torque disable rollback when already enabled");
@@ -1003,19 +1049,11 @@ fn test_feetech_set_torque_preseeding_goal_position() {
     let mock = MockTransport::new();
     let mut driver = FeetechArmDriver::new(mock, vec![1, 2]);
 
-    // 1. Initially without feedback: set_torque(true) should NOT send SYNC_WRITE
-    let cs1 = calculate_checksum(1, 3, 0x00, &[1]);
-    let cs2 = calculate_checksum(2, 3, 0x00, &[1]);
-    driver.transport_mut().provide_rx(&[
-        0xFF, 0xFF, 1, 3, 0x00, 1, cs1,
-        0xFF, 0xFF, 2, 3, 0x00, 1, cs2,
-    ]);
-    driver.set_torque(true).unwrap();
-    let tx_no_fb = driver.transport_mut().take_tx();
-    // Two write packets (TORQUE_ENABLE = 1) + two read packets (readback REG_TORQUE_ENABLE)
-    assert!(!tx_no_fb.windows(2).any(|w| w == [INST_SYNC_READ, feetech::REG_GOAL_POSITION_L]
-        || w == [feetech::INST_SYNC_WRITE, feetech::REG_GOAL_POSITION_L]),
-        "Without feedback, set_torque should not send SYNC_WRITE to Goal Position");
+    // 1. Initially without feedback: set_torque(true) must be rejected
+    let res = driver.set_torque(true);
+    assert!(res.is_err());
+    assert!(matches!(res.unwrap_err(), ArmDriverError::HardwareFault(_)));
+    assert!(driver.transport_mut().take_tx().is_empty());
 
     // 2. Now feed telemetry so feedback is valid
     let pos_1 = 2200u16.to_le_bytes();
@@ -1038,6 +1076,8 @@ fn test_feetech_set_torque_preseeding_goal_position() {
     assert!(driver.is_feedback_valid());
 
     // 3. Now call set_torque(true) with feedback present
+    let cs1 = calculate_checksum(1, 3, 0x00, &[1]);
+    let cs2 = calculate_checksum(2, 3, 0x00, &[1]);
     driver.transport_mut().take_tx(); // clear previous TX
     driver.transport_mut().provide_rx(&[
         0xFF, 0xFF, 1, 3, 0x00, 1, cs1,
@@ -1075,6 +1115,16 @@ async fn test_feetech_overload_status_hardware_fault_and_supervisor_clear_fault(
     config.dof = 1;
     config.limits = vec![JointLimit::new("j1", -3.0, 3.0, 2.0, 5.0)];
     config.home_positions = vec![0.0];
+    config.resting_pose = Some(RestingPosePolicy {
+        positions: None,
+        position_tolerances: vec![0.08],
+        max_total_deviation: 0.16,
+        max_velocity: 0.015,
+        joint_max_velocities: vec![],
+        support_torque_limits: vec![],
+        support_load_limits: vec![],
+        feedback_max_age_ms: 100,
+    });
 
     let supervisor = ArmSupervisor::new(config).with_driver(Box::new(driver));
 
@@ -1086,11 +1136,13 @@ async fn test_feetech_overload_status_hardware_fault_and_supervisor_clear_fault(
     rx_normal.extend_from_slice(&normal_params);
     rx_normal.push(cs_normal);
 
-    // Provide response for set_torque readback (REG_TORQUE_ENABLE = 1),
-    // followed by feedback for supervisor's post-torque read_joint_states() call.
+    // Provide feedback for pre-enable read_joint_states,
+    // followed by response for set_torque readback (REG_TORQUE_ENABLE = 1),
+    // followed by feedback for supervisor's post-torque sync call.
     let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
     let rx_tq1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1];
 
+    mock.lock().unwrap().provide_rx(&rx_normal);
     mock.lock().unwrap().provide_rx(&rx_tq1);
     mock.lock().unwrap().provide_rx(&rx_normal);
 
@@ -1190,4 +1242,415 @@ fn test_feetech_parse_response_rejects_oversized_length() {
         "Expected ParameterError for length 254, got {:?}",
         res
     );
+}
+
+// -------------------------------------------------------------------------
+// 27. Omitting range_min_steps/range_max_steps preserves existing EEPROM angle limits
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_omitted_range_steps_preserves_eeprom() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+
+    assert!(driver.config().joints[0].range_min_steps.is_none());
+    assert!(driver.config().joints[0].range_max_steps.is_none());
+
+    let mut rx = Vec::new();
+    let model_bytes = 777u16.to_le_bytes();
+    let model_len = (model_bytes.len() + 2) as u8;
+    let model_cs = calculate_checksum(1, model_len, 0x00, &model_bytes);
+    rx.extend_from_slice(&[0xFF, 0xFF, 1, model_len, 0x00]);
+    rx.extend_from_slice(&model_bytes);
+    rx.push(model_cs);
+
+    let torq_cs = calculate_checksum(1, 3, 0x00, &[0]);
+    rx.extend_from_slice(&[0xFF, 0xFF, 1, 3, 0x00, 0, torq_cs]);
+
+    let addrs_and_vals: &[(u8, u16)] = &[
+        (REG_RETURN_DELAY, 0),
+        (REG_STATUS_RETURN_LEVEL, 0),
+        (REG_MIN_ANGLE_LIMIT_L, 100),
+        (REG_MAX_ANGLE_LIMIT_L, 3900),
+        (REG_P_COEF, 16),
+        (REG_D_COEF, 32),
+        (REG_I_COEF, 0),
+        (REG_MAX_TORQUE_L, 1000),
+        (REG_PROTECTION_CURRENT_L, 500),
+        (REG_OVERLOAD_TORQUE, 25),
+        (REG_OPERATING_MODE, 0),
+    ];
+    for &(addr, val) in addrs_and_vals {
+        let is_16 = addr == REG_MIN_ANGLE_LIMIT_L
+            || addr == REG_MAX_ANGLE_LIMIT_L
+            || addr == REG_MAX_TORQUE_L
+            || addr == REG_PROTECTION_CURRENT_L;
+        let params: Vec<u8> = if is_16 {
+            val.to_le_bytes().to_vec()
+        } else {
+            vec![val as u8]
+        };
+        let len = (params.len() + 2) as u8;
+        let cs = calculate_checksum(1, len, 0x00, &params);
+        rx.extend_from_slice(&[0xFF, 0xFF, 1, len, 0x00]);
+        rx.extend_from_slice(&params);
+        rx.push(cs);
+    }
+    driver.transport_mut().provide_rx(&rx);
+
+    driver.configure_servos().unwrap();
+    assert_eq!(driver.effective_ranges(), &[(100, 3900)]);
+
+    let tx = driver.transport_mut().take_tx();
+    for window in tx.windows(8) {
+        if window[0] == 0xFF && window[1] == 0xFF && window[4] == INST_WRITE {
+            assert!(
+                window[5] != REG_MIN_ANGLE_LIMIT_L && window[5] != REG_MAX_ANGLE_LIMIT_L,
+                "Must never overwrite EEPROM angle limits when omitted in calib"
+            );
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
+// 28. Uncalibrated FeetechConfig { calibrated: false, .. } rejects set_torque(true)
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_uncalibrated_rejects_set_torque() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1]).with_calibrated(false);
+
+    let pos = 2048u16.to_le_bytes();
+    let params = [pos[0], pos[1], 0, 0, 0, 0, 70, 35];
+    let cs = calculate_checksum(1, 10, 0x00, &params);
+    let mut fb = vec![0xFF, 0xFF, 1, 10, 0x00];
+    fb.extend_from_slice(&params);
+    fb.push(cs);
+    driver.transport_mut().provide_rx(&fb);
+    driver.read_joint_states().unwrap();
+
+    let err = driver.set_torque(true).unwrap_err();
+    assert!(
+        matches!(err, ArmDriverError::HardwareFault(ref msg) if msg.contains("uncalibrated")),
+        "Expected uncalibrated error, got: {:?}", err
+    );
+    assert_ne!(driver.enable_state(), EnableState::Enabled);
+}
+
+// -------------------------------------------------------------------------
+// 29. Out-of-range raw feedback rejects set_torque(true)
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_out_of_range_feedback_rejects_set_torque() {
+    let mock = MockTransport::new();
+    let driver = FeetechArmDriver::new(mock, vec![1]);
+
+    let mut cfg = feetech::FeetechConfig::default();
+    cfg.joints = vec![feetech::FeetechJointCalib {
+        id: 1,
+        range_min_steps: Some(500),
+        range_max_steps: Some(3500),
+        ..Default::default()
+    }];
+    let mut driver = driver.with_config(cfg);
+
+    let pos = 400u16.to_le_bytes();
+    let params = [pos[0], pos[1], 0, 0, 0, 0, 70, 35];
+    let cs = calculate_checksum(1, 10, 0x00, &params);
+    let mut fb = vec![0xFF, 0xFF, 1, 10, 0x00];
+    fb.extend_from_slice(&params);
+    fb.push(cs);
+    driver.transport_mut().provide_rx(&fb);
+    driver.read_joint_states().unwrap();
+
+    let err = driver.set_torque(true).unwrap_err();
+    assert!(
+        matches!(err, ArmDriverError::HardwareFault(ref msg) if msg.contains("outside calibrated range")),
+        "Expected out of range error, got: {:?}", err
+    );
+    assert_ne!(driver.enable_state(), EnableState::Enabled);
+}
+
+// -------------------------------------------------------------------------
+// 30. All-None feedback rejects set_torque(true)
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_all_none_feedback_rejects_set_torque() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1, 2]);
+
+    assert!(!driver.is_feedback_valid());
+    let err = driver.set_torque(true).unwrap_err();
+    assert!(
+        matches!(err, ArmDriverError::HardwareFault(ref msg) if msg.contains("No valid joint feedback received")),
+        "Expected no valid feedback error, got: {:?}", err
+    );
+}
+
+// -------------------------------------------------------------------------
+// 31. Partial faulted servo clear_fault ONLY disables faulted servo and tracks partial enable
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_partial_fault_disables_only_faulted_and_detects_partial_enable() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1, 2];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+
+    let mut rx_fb = Vec::new();
+    for &id in &[1u8, 2u8] {
+        let pos = 2048u16.to_le_bytes();
+        let params = [pos[0], pos[1], 0, 0, 0, 0, 70, 35];
+        let cs = calculate_checksum(id, 10, 0x00, &params);
+        rx_fb.extend_from_slice(&[0xFF, 0xFF, id, 10, 0x00]);
+        rx_fb.extend_from_slice(&params);
+        rx_fb.push(cs);
+    }
+    driver.transport_mut().provide_rx(&rx_fb);
+    driver.read_joint_states().unwrap();
+    let _ = driver.transport_mut().take_tx();
+
+    let mut rx_err = Vec::new();
+    let pos = 2048u16.to_le_bytes();
+    let p1 = [pos[0], pos[1], 0, 0, 0, 0, 70, 35];
+    let cs1 = calculate_checksum(1, 10, 0x00, &p1);
+    rx_err.extend_from_slice(&[0xFF, 0xFF, 1, 10, 0x00]);
+    rx_err.extend_from_slice(&p1);
+    rx_err.push(cs1);
+
+    let p2 = [pos[0], pos[1], 0, 0, 0, 0, 70, 35];
+    let cs2 = calculate_checksum(2, 10, 0x20, &p2);
+    rx_err.extend_from_slice(&[0xFF, 0xFF, 2, 10, 0x20]);
+    rx_err.extend_from_slice(&p2);
+    rx_err.push(cs2);
+
+    driver.transport_mut().provide_rx(&rx_err);
+    let _ = driver.read_joint_states().unwrap();
+
+    assert_eq!(driver.clear_fault_disables_joints(), vec![1]);
+
+    let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
+    let cs_tq2 = calculate_checksum(2, 3, 0x00, &[0]);
+    driver.transport_mut().provide_rx(&[
+        0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1,
+        0xFF, 0xFF, 2, 3, 0x00, 0, cs_tq2,
+    ]);
+
+    let _ = driver.transport_mut().take_tx();
+    driver.clear_fault().unwrap();
+
+    let tx = driver.transport_mut().take_tx();
+    assert_eq!(tx.len(), 24);
+    assert_eq!(tx[2], 2);
+    assert_eq!(tx[4], INST_WRITE);
+    assert_eq!(tx[5], REG_TORQUE_ENABLE);
+    assert_eq!(tx[6], 0);
+
+    assert!(driver.has_known_partial_enable());
+}
+
+// -------------------------------------------------------------------------
+// 32. Runtime REG_TORQUE_ENABLE poll detects torque loss and triggers HardwareFault
+// -------------------------------------------------------------------------
+#[tokio::test]
+async fn test_feetech_periodic_enable_poll_detects_torque_loss_and_triggers_fault() {
+    let mock = Arc::new(Mutex::new(MockTransport::new()));
+    let driver = FeetechArmDriver::new(SharedTransport(mock.clone()), vec![1]);
+
+    let mut config = ArmConfig::default();
+    config.dof = 1;
+    config.limits = vec![JointLimit::new("j1", -3.0, 3.0, 2.0, 5.0)];
+    config.home_positions = vec![0.0];
+    config.resting_pose = Some(RestingPosePolicy {
+        positions: None,
+        position_tolerances: vec![0.08],
+        max_total_deviation: 0.16,
+        max_velocity: 0.015,
+        joint_max_velocities: vec![],
+        support_torque_limits: vec![],
+        support_load_limits: vec![],
+        feedback_max_age_ms: 100,
+    });
+
+    let supervisor = ArmSupervisor::new(config).with_driver(Box::new(driver));
+
+    let pos_1 = 2048u16.to_le_bytes();
+    let normal_params = [pos_1[0], pos_1[1], 0, 0, 0, 0, 70, 35];
+    let cs_normal = calculate_checksum(1, 10, 0x00, &normal_params);
+    let mut rx_normal = vec![0xFF, 0xFF, 1, 10, 0x00];
+    rx_normal.extend_from_slice(&normal_params);
+    rx_normal.push(cs_normal);
+
+    let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
+    let rx_tq1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1];
+
+    mock.lock().unwrap().provide_rx(&rx_normal);
+    mock.lock().unwrap().provide_rx(&rx_tq1);
+    mock.lock().unwrap().provide_rx(&rx_normal);
+
+    supervisor.set_torque(true).await.unwrap();
+    assert!(supervisor.inner().read().await.is_torqued);
+
+    // Initial enable consumed polls 1 and 2. Ticks 1..7 advance polls to 9.
+    for _ in 0..7 {
+        mock.lock().unwrap().provide_rx(&rx_normal);
+        let obs = supervisor.tick(0.02).await;
+        assert!(obs.fault.is_none());
+    }
+
+    // On 8th tick (poll 10), driver does a SYNC_READ of REG_TORQUE_ENABLE.
+    // Provide normal feedback followed by torque enable response reporting 0 (torque lost!)
+    let cs_tq0 = calculate_checksum(1, 3, 0x00, &[0]);
+    let rx_tq0 = vec![0xFF, 0xFF, 1, 3, 0x00, 0, cs_tq0];
+    mock.lock().unwrap().provide_rx(&rx_normal);
+    mock.lock().unwrap().provide_rx(&rx_tq0);
+
+    let obs = supervisor.tick(0.02).await;
+    assert!(obs.fault.is_some());
+    assert_eq!(obs.fault.unwrap().code, FaultCode::HardwareFault);
+}
+
+// -------------------------------------------------------------------------
+// 33. set_torque & clear_fault sync loads and enforce support_load_limits
+// -------------------------------------------------------------------------
+#[tokio::test]
+async fn test_supervisor_set_torque_and_clear_fault_sync_loads_enforcing_support_limits() {
+    let mock = Arc::new(Mutex::new(MockTransport::new()));
+    let driver = FeetechArmDriver::new(SharedTransport(mock.clone()), vec![1]);
+
+    let mut config = ArmConfig::default();
+    config.dof = 1;
+    config.limits = vec![JointLimit::new("j1", -3.0, 3.0, 2.0, 5.0)];
+    config.home_positions = vec![0.0];
+    config.resting_pose = Some(RestingPosePolicy {
+        positions: None,
+        position_tolerances: vec![0.08],
+        max_total_deviation: 0.16,
+        max_velocity: 0.015,
+        joint_max_velocities: vec![],
+        support_torque_limits: vec![],
+        support_load_limits: vec![(0, 0.30)],
+        feedback_max_age_ms: 100,
+    });
+
+    let supervisor = ArmSupervisor::new(config).with_driver(Box::new(driver));
+
+    let pos_1 = 2048u16.to_le_bytes();
+    let load_bytes = 600u16.to_le_bytes();
+    let heavy_params = [pos_1[0], pos_1[1], 0, 0, load_bytes[0], load_bytes[1], 70, 35];
+    let cs_heavy = calculate_checksum(1, 10, 0x00, &heavy_params);
+    let mut rx_heavy = vec![0xFF, 0xFF, 1, 10, 0x00];
+    rx_heavy.extend_from_slice(&heavy_params);
+    rx_heavy.push(cs_heavy);
+
+    let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
+    let rx_tq1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1];
+
+    mock.lock().unwrap().provide_rx(&rx_heavy);
+    mock.lock().unwrap().provide_rx(&rx_tq1);
+    mock.lock().unwrap().provide_rx(&rx_heavy);
+
+    supervisor.set_torque(true).await.unwrap();
+
+    let loads = supervisor.inner().read().await.loads.clone();
+    assert!((loads[0] - 0.60).abs() < 1e-3);
+
+    let inner = supervisor.inner().read().await;
+    assert!(inner.resting_pose_static_violation().is_some());
+}
+
+// -------------------------------------------------------------------------
+// 34. Gripper stall latched with load feedback and unlatches on load drop or reversal
+// -------------------------------------------------------------------------
+#[tokio::test]
+async fn test_gripper_stall_latched_with_load_feedback_and_unlatches() {
+    let mut config = ArmConfig::default();
+    config.dof = 1;
+    config.limits = vec![JointLimit::new("gripper", 0.0, 1.0, 1.0, 1.0)];
+    config.home_positions = vec![0.0];
+    let supervisor = ArmSupervisor::new(config);
+
+    let mut inner = supervisor.inner().write().await;
+    inner.is_torqued = true;
+    inner.loads = vec![0.25];
+    inner.measured_positions = vec![0.5];
+    inner.commanded_positions = vec![0.5];
+    inner.gripper_stalled = true;
+    inner.gripper_stall_sign = 1.0;
+
+    let load_g = inner.loads[0].abs();
+    let gap = (inner.measured_positions[0] - inner.commanded_positions[0]).abs();
+    let dir = 1.0f32;
+    let same_dir = (dir > 0.0) == (inner.gripper_stall_sign > 0.0);
+    let keep_latched = (gap > 0.02) || (load_g >= 0.15 && same_dir);
+    assert!(keep_latched);
+
+    inner.loads[0] = 0.05;
+    let load_g = inner.loads[0].abs();
+    let keep_latched = (gap > 0.02) || (load_g >= 0.15 && same_dir);
+    assert!(!keep_latched);
+
+    inner.loads[0] = 0.25;
+    let dir_rev = -1.0f32;
+    let same_dir_rev = (dir_rev > 0.0) == (inner.gripper_stall_sign > 0.0);
+    let keep_latched_rev = (gap > 0.02) || (inner.loads[0].abs() >= 0.15 && same_dir_rev);
+    assert!(!keep_latched_rev);
+}
+
+// -------------------------------------------------------------------------
+// 35. Parquet metadata precedence: sidecar > embedded > dir meta.json
+// -------------------------------------------------------------------------
+#[test]
+fn test_parquet_embedded_metadata_precedence_over_directory_meta_json() {
+    use std::fs;
+    use tempfile::tempdir;
+    use armd::RecordFrame;
+    use armd::recording::parquet_writer::{read_metadata_from_parquet, write_frames_to_parquet_with_meta, EpisodeMetadata};
+
+    let dir = tempdir().unwrap();
+    let file_path = dir.path().join("episode_000000.parquet");
+    let dir_meta = dir.path().join("meta.json");
+
+    let frames = vec![RecordFrame {
+        timestamp: 0.0,
+        observation_state: vec![0.0],
+        action: vec![0.0],
+    }];
+
+    // 1. Write parquet with embedded metadata: profile_id = "embedded_profile"
+    let mut embedded_meta = EpisodeMetadata::default();
+    embedded_meta.profile_id = Some("embedded_profile".into());
+    embedded_meta.arm_dof = Some(6);
+    write_frames_to_parquet_with_meta(&file_path, &frames, Some(&embedded_meta)).unwrap();
+
+    // Write directory meta.json with profile_id = "dir_profile"
+    let mut dir_meta_obj = EpisodeMetadata::default();
+    dir_meta_obj.profile_id = Some("dir_profile".into());
+    dir_meta_obj.arm_dof = Some(7);
+    fs::write(&dir_meta, serde_json::to_string(&dir_meta_obj).unwrap()).unwrap();
+
+    // Embedded metadata MUST take precedence over directory meta.json!
+    let read_meta = read_metadata_from_parquet(&file_path).unwrap().unwrap();
+    assert_eq!(read_meta.profile_id.as_deref(), Some("embedded_profile"));
+    assert_eq!(read_meta.arm_dof, Some(6));
+
+    // 2. Now write a sidecar <id>.meta.json with profile_id = "sidecar_profile"
+    let sidecar_path = dir.path().join("episode_000000.meta.json");
+    let mut sidecar_meta = EpisodeMetadata::default();
+    sidecar_meta.profile_id = Some("sidecar_profile".into());
+    sidecar_meta.arm_dof = Some(5);
+    fs::write(&sidecar_path, serde_json::to_string(&sidecar_meta).unwrap()).unwrap();
+
+    // Sidecar MUST take precedence over embedded!
+    let read_sidecar = read_metadata_from_parquet(&file_path).unwrap().unwrap();
+    assert_eq!(read_sidecar.profile_id.as_deref(), Some("sidecar_profile"));
+    assert_eq!(read_sidecar.arm_dof, Some(5));
+
+    // 3. Remove sidecar, write parquet WITHOUT embedded metadata, dir meta.json should be used
+    fs::remove_file(&sidecar_path).unwrap();
+    let empty_meta_file = dir.path().join("episode_empty.parquet");
+    write_frames_to_parquet_with_meta(&empty_meta_file, &frames, None).unwrap();
+
+    let read_fallback = read_metadata_from_parquet(&empty_meta_file).unwrap().unwrap();
+    assert_eq!(read_fallback.profile_id.as_deref(), Some("dir_profile"));
+    assert_eq!(read_fallback.arm_dof, Some(7));
 }

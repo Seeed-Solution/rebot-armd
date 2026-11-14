@@ -693,7 +693,7 @@ fn cartesian_path_fit_and_action_record() {
     let n = 60;
     let q: Vec<[f32; 7]> = (0..=n).map(|k| { let mut q = STRETCHED; q[1] -= k as f32 / n as f32; q }).collect();
     let s: Vec<f64> = (0..=n).map(|k| k as f64 / n as f64).collect();
-    let mut path = armd::motion::JointPath { dof: 7, q, s, duration: 1.0, power_scale: 1.0 };
+    let mut path = armd::motion::JointPath { dof: 7, arm_dof: 6, q, s, duration: 1.0, power_scale: 1.0 };
     let fit = path.fit_power(&b, &arm).unwrap();
     eprintln!("Cartesian-style path, 1 rad on J2 in 1 s: scale {:.3}, duration {:.2} s, peak {:.2} A of {:.2} A at full speed", fit.scale, path.duration, fit.peak_a, fit.peak_full_a);
     assert!(fit.scale < 1.0 && (path.duration - 1.0 / fit.scale).abs() < 1e-9 && path.power_scale == fit.scale);

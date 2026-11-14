@@ -103,6 +103,7 @@ pub struct PlanInput {
 #[derive(Debug, Clone, PartialEq)]
 pub struct JointPath {
     pub dof: usize,
+    pub arm_dof: usize,
     /// Samples, the first one is the start.
     pub q: Vec<[f32; 7]>,
     /// Normalised path parameter of each sample (0..=1).
@@ -247,7 +248,8 @@ pub fn plan_cartesian_ex(input: &PlanInput, goal: Pose, speed: Speed, yaw_free: 
     duration = duration.max(1.875 * length / speed.linear).max(1.875 * theta / speed.angular);
     let duration = (duration * 1.1).max(0.2);
     let dof = input.limits.len();
-    let mut path = JointPath { dof, q: q_samples, s: s_samples, duration, power_scale: 1.0 };
+    let arm_dof = input.arm.arm_dof();
+    let mut path = JointPath { dof, arm_dof, q: q_samples, s: s_samples, duration, power_scale: 1.0 };
     if let Some(b) = input.power.as_ref().filter(|b| b.enabled && b.planning.enabled) {
         let t0 = std::time::Instant::now();
         let fit = path.fit_power(b, &input.arm)?;
@@ -659,7 +661,7 @@ impl PathTrajectory {
             };
             return StepOut { positions: last, velocities: vec![0.0; dof], status, progress: 1.0, clear_gripper_stall: false };
         }
-        let arm_joints = dof.saturating_sub(1);
+        let arm_joints = self.path.arm_dof.min(dof);
         let lag = (0..arm_joints).map(|i| f64::from((ctx.commanded[i] - ctx.measured[i]).abs())).fold(0.0, f64::max);
         let lag = if lag.is_finite() { lag } else { f64::INFINITY };
         let rate = ((LAG_STOP - lag) / (LAG_STOP - LAG_FULL)).clamp(0.0, 1.0);

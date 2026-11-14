@@ -1144,10 +1144,11 @@ impl ArmConfig {
                             j.id, i
                         ));
                     }
-                    if j.range_min_steps >= j.range_max_steps || j.range_max_steps > 4095 {
+                    let (eff_min, eff_max) = j.effective_range_steps();
+                    if eff_min >= eff_max || eff_max > 4095 {
                         return Err(format!(
                             "Invalid Feetech step range [{}, {}] for servo ID {} at joint {}",
-                            j.range_min_steps, j.range_max_steps, j.id, i
+                            eff_min, eff_max, j.id, i
                         ));
                     }
                 }
@@ -1589,6 +1590,8 @@ pub struct Capabilities {
     /// `schema.power_budget`, `GET /api/v1/diagnostics/power`): enabled in the profile and a
     /// driver that reports torque. Present from capabilities version 9.
     pub power_budget: bool,
+    #[serde(default)]
+    pub auto_yaw: bool,
     pub vision: VisionCapabilities,
 }
 
@@ -1627,6 +1630,7 @@ impl Capabilities {
             torque_guard: crate::torque_guard::TorqueGuardInfo::from_config(config).is_some(),
             // The driver half is applied by ArmSupervisor::get_schema.
             power_budget: config.power_budget.as_ref().is_some_and(|p| p.enabled),
+            auto_yaw: false,
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }
@@ -1685,6 +1689,8 @@ pub struct ObservationSchema {
     /// Supply power budget in force; null when the profile has none (and in older schemas).
     #[serde(default)]
     pub power_budget: Option<crate::power::PowerBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feetech_joints: Option<Vec<crate::protocol::feetech::FeetechJointCalib>>,
 }
 
 impl ObservationSchema {
@@ -1783,6 +1789,7 @@ impl ObservationSchema {
             torque_guard: crate::torque_guard::TorqueGuardInfo::from_config(config),
             model_joint_map: config.arm_model.joint_map(),
             power_budget: config.power_budget.clone().filter(|p| p.enabled),
+            feetech_joints: config.feetech.as_ref().map(|f| f.joints.clone()),
         }
     }
 }

@@ -164,7 +164,7 @@ pub fn write_frames_to_parquet(path: &Path, frames: &[RecordFrame]) -> Result<()
     write_frames_to_parquet_with_meta(path, frames, None)
 }
 
-/// Read back metadata from sidecar <id>.meta.json, meta.json, or Parquet schema metadata
+/// Read back metadata from sidecar <id>.meta.json, Parquet schema metadata, or dir meta.json fallback
 pub fn read_metadata_from_parquet(path: &Path) -> Result<Option<EpisodeMetadata>, ParquetRecordingError> {
     let meta_path = path.with_extension("meta.json");
     if meta_path.exists() {
@@ -172,20 +172,6 @@ pub fn read_metadata_from_parquet(path: &Path) -> Result<Option<EpisodeMetadata>
         let m = serde_json::from_str::<EpisodeMetadata>(&data)
             .map_err(|e| ParquetRecordingError::Corrupted(format!("Failed to parse sidecar {}: {e}", meta_path.display())))?;
         return Ok(Some(m));
-    }
-    let dir_meta = path.with_file_name("meta.json");
-    if dir_meta.exists() {
-        match std::fs::read_to_string(&dir_meta) {
-            Ok(data) => match serde_json::from_str::<EpisodeMetadata>(&data) {
-                Ok(m) => return Ok(Some(m)),
-                Err(e) => {
-                    tracing::warn!("Failed to parse dir metadata {}: {e}", dir_meta.display());
-                }
-            },
-            Err(e) => {
-                tracing::warn!("Failed to read dir metadata {}: {e}", dir_meta.display());
-            }
-        }
     }
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
@@ -215,10 +201,25 @@ pub fn read_metadata_from_parquet(path: &Path) -> Result<Option<EpisodeMetadata>
         }
     }
     if found {
-        Ok(Some(meta))
-    } else {
-        Ok(None)
+        return Ok(Some(meta));
     }
+
+    let dir_meta = path.with_file_name("meta.json");
+    if dir_meta.exists() {
+        match std::fs::read_to_string(&dir_meta) {
+            Ok(data) => match serde_json::from_str::<EpisodeMetadata>(&data) {
+                Ok(m) => return Ok(Some(m)),
+                Err(e) => {
+                    tracing::warn!("Failed to parse dir metadata {}: {e}", dir_meta.display());
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Failed to read dir metadata {}: {e}", dir_meta.display());
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Read back frames from a LeRobot Parquet file for verification

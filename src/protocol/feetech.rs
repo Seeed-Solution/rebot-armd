@@ -358,9 +358,10 @@ pub fn raw_speed_to_rad_s(raw: u16) -> f32 {
 pub fn encode_sign_magnitude(val: i16, sign_bit: u16) -> u16 {
     let mask = sign_bit - 1;
     if val < 0 {
-        sign_bit | (val.unsigned_abs() & mask)
+        let mag = val.unsigned_abs().min(mask);
+        sign_bit | mag
     } else {
-        (val as u16) & mask
+        (val as u16).min(mask)
     }
 }
 
@@ -410,7 +411,6 @@ pub fn feetech_error_name(status_byte: u8) -> Option<String> {
 
 fn default_zero_step() -> u16 { 2048 }
 fn default_true() -> bool { true }
-fn default_max_step() -> u16 { 4095 }
 fn default_p_coef() -> u8 { 16 }
 fn default_d_coef() -> u8 { 32 }
 fn default_max_torque() -> u16 { 1000 }
@@ -429,10 +429,18 @@ pub struct FeetechJointCalib {
     pub homing_offset_steps: i16,
     #[serde(default = "default_true")]
     pub homing_applied_in_hw: bool,
-    #[serde(default)]
-    pub range_min_steps: u16,
-    #[serde(default = "default_max_step")]
-    pub range_max_steps: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_min_steps: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_max_steps: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_homing_offset_steps: Option<i16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_torque_raw: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protection_current_raw: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overload_torque_raw: Option<u8>,
 }
 
 impl Default for FeetechJointCalib {
@@ -443,13 +451,24 @@ impl Default for FeetechJointCalib {
             zero_step: 2048,
             homing_offset_steps: 0,
             homing_applied_in_hw: true,
-            range_min_steps: 0,
-            range_max_steps: 4095,
+            range_min_steps: None,
+            range_max_steps: None,
+            expected_homing_offset_steps: None,
+            max_torque_raw: None,
+            protection_current_raw: None,
+            overload_torque_raw: None,
         }
     }
 }
 
 impl FeetechJointCalib {
+    pub fn effective_range_steps(&self) -> (u16, u16) {
+        (
+            self.range_min_steps.unwrap_or(0),
+            self.range_max_steps.unwrap_or(4095),
+        )
+    }
+
     pub fn steps_to_rad(&self, raw: u16) -> f32 {
         let effective_zero = if self.homing_applied_in_hw {
             self.zero_step as f32
@@ -465,6 +484,10 @@ impl FeetechJointCalib {
     }
 
     pub fn rad_to_steps(&self, rad: f32) -> u16 {
+        let (min, max) = self.effective_range_steps();
+        if !rad.is_finite() {
+            return self.zero_step.clamp(min, max);
+        }
         let delta = rad * STEPS_PER_REVOLUTION / (2.0 * PI);
         let effective_zero = if self.homing_applied_in_hw {
             self.zero_step as f32
@@ -477,14 +500,48 @@ impl FeetechJointCalib {
             effective_zero + delta
         };
         let target = raw_f.round() as i32;
-        let clamped = target.clamp(self.range_min_steps as i32, self.range_max_steps as i32);
+        let clamped = target.clamp(min as i32, max as i32);
         clamped as u16
+    }
+
+    pub fn checked_rad_to_steps_in_range(
+        &self,
+        rad: f32,
+        range: (u16, u16),
+    ) -> Result<u16, FeetechError> {
+        if !rad.is_finite() {
+            return Err(FeetechError::ParameterError(format!(
+                "Non-finite joint target position (rad = {}) for servo ID {}",
+                rad, self.id
+            )));
+        }
+        let delta = rad * STEPS_PER_REVOLUTION / (2.0 * PI);
+        let effective_zero = if self.homing_applied_in_hw {
+            self.zero_step as f32
+        } else {
+            self.zero_step as f32 + self.homing_offset_steps as f32
+        };
+        let raw_f = if self.drive_mode_invert {
+            effective_zero - delta
+        } else {
+            effective_zero + delta
+        };
+        let target = raw_f.round() as i32;
+        let (min, max) = range;
+        let clamped = target.clamp(min as i32, max as i32);
+        Ok(clamped as u16)
+    }
+
+    pub fn checked_rad_to_steps(&self, rad: f32) -> Result<u16, FeetechError> {
+        self.checked_rad_to_steps_in_range(rad, self.effective_range_steps())
     }
 }
 
 /// Global Feetech bus configuration and default servo parameters
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FeetechConfig {
+    #[serde(default)]
+    pub calibrated: bool,
     #[serde(default)]
     pub tx_echo: Option<bool>,
     #[serde(default)]
@@ -508,6 +565,7 @@ pub struct FeetechConfig {
 impl Default for FeetechConfig {
     fn default() -> Self {
         Self {
+            calibrated: true,
             tx_echo: None,
             return_delay_raw: 0,
             p_coef: 16,
