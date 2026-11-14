@@ -3241,13 +3241,19 @@ function parseDetections(rawData, refRes) {
       aruco = { id: aru.id != null ? aru.id : track_id, corners, t: aru.t, R: aru.R, rpy: aru.R ? POSE.rpyDeg(aru.R) : null };
     }
 
+    let obbCorners = null;
+    if (Array.isArray(item.obb_corners) && item.obb_corners.length === 4) {
+      obbCorners = item.obb_corners.map(([u, v]) => (isPixelUnit ? [Number(u) / refW, Number(v) / refH] : [Number(u), Number(v)]));
+    }
+
     results.push({
       x0, y0, x1, y1,
       cx, cy, w, h,
       label: String(label),
       score,
       track_id: track_id != null ? track_id : null,
-      aruco
+      aruco,
+      obbCorners
     });
   }
   return results;
@@ -6494,14 +6500,37 @@ function drawOverlay() {
     g.globalAlpha = alpha;
 
     // 1. 目标边界框与半透明轻微底色
-    g.strokeStyle = color;
-    g.lineWidth = 2;
-    g.strokeRect(bx, by, bw, bh);
+    if (d.obbCorners && Array.isArray(d.obbCorners) && d.obbCorners.length === 4) {
+      g.strokeStyle = color;
+      g.lineWidth = 2;
+      g.beginPath();
+      g.moveTo(rect.x + d.obbCorners[0][0] * rect.w, rect.y + d.obbCorners[0][1] * rect.h);
+      for (let k = 1; k < 4; ++k) {
+        g.lineTo(rect.x + d.obbCorners[k][0] * rect.w, rect.y + d.obbCorners[k][1] * rect.h);
+      }
+      g.closePath();
+      g.stroke();
 
-    g.fillStyle = color;
-    g.globalAlpha = alpha * 0.08;
-    g.fillRect(bx, by, bw, bh);
-    g.globalAlpha = alpha;
+      g.fillStyle = color;
+      g.globalAlpha = alpha * 0.08;
+      g.beginPath();
+      g.moveTo(rect.x + d.obbCorners[0][0] * rect.w, rect.y + d.obbCorners[0][1] * rect.h);
+      for (let k = 1; k < 4; ++k) {
+        g.lineTo(rect.x + d.obbCorners[k][0] * rect.w, rect.y + d.obbCorners[k][1] * rect.h);
+      }
+      g.closePath();
+      g.fill();
+      g.globalAlpha = alpha;
+    } else {
+      g.strokeStyle = color;
+      g.lineWidth = 2;
+      g.strokeRect(bx, by, bw, bh);
+
+      g.fillStyle = color;
+      g.globalAlpha = alpha * 0.08;
+      g.fillRect(bx, by, bw, bh);
+      g.globalAlpha = alpha;
+    }
 
     // 2. 目标中心微型十字准星 (半径 4px，带白色中心点与半透明外圈)
     const cx = rect.x + d.cx * rect.w;

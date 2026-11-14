@@ -30,7 +30,7 @@ void apply_box_depth(DetBox& d, const BoxDepthResult& r) noexcept {
     d.disp_fg = r.disp_fg;
     d.disp_bg = r.disp_bg;
     d.depth_conf = r.depth_conf;
-    d.length_px = r.length_px;
+    if (!std::isfinite(d.length_px)) d.length_px = r.length_px;
     d.jaw_clear = r.jaw_clear;
     d.depth_angle_deg = r.angle_deg;
     d.depth_angle_conf = r.angle_conf;
@@ -61,6 +61,25 @@ std::string detections_json(const std::vector<DetBox>& dets, const ContentRect& 
         json_escape(s, d.class_name);
         s << "\",\"confidence\":" << std::setprecision(3) << d.confidence << ",\"x\":" << std::setprecision(4) << x
           << ",\"y\":" << y << ",\"w\":" << w << ",\"h\":" << h;
+        if (d.has_obb) {
+            bool all_finite = true;
+            for (size_t k = 0; k < 4; ++k) {
+                if (!std::isfinite(d.obb_corners[k][0]) || !std::isfinite(d.obb_corners[k][1])) {
+                    all_finite = false;
+                    break;
+                }
+            }
+            if (all_finite) {
+                s << ",\"obb_corners\":[";
+                for (size_t k = 0; k < 4; ++k) {
+                    if (k) s << ',';
+                    const float cu = (d.obb_corners[k][0] * inference_w - rect.x) / rw;
+                    const float cv = (d.obb_corners[k][1] * inference_h - rect.y) / rh;
+                    s << '[' << std::setprecision(4) << cu << ',' << cv << ']';
+                }
+                s << ']';
+            }
+        }
         if (std::isfinite(d.angle_deg)) s << ",\"angle_deg\":" << std::setprecision(2) << d.angle_deg;
         if (std::isfinite(d.angle_conf)) s << ",\"angle_conf\":" << std::setprecision(3) << d.angle_conf;
         if (std::isfinite(d.grasp_width_px)) s << ",\"grasp_width_px\":" << std::setprecision(2) << d.grasp_width_px;

@@ -3216,6 +3216,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_obb_v2_detections() {
+        let raw = serde_json::json!([{
+            "class_id": 39,
+            "format": "xywh_center",
+            "class_name": "bottle",
+            "confidence": 0.88,
+            "x": 0.45,
+            "y": 0.55,
+            "w": 0.12,
+            "h": 0.24,
+            "obb_corners": [
+                [0.40, 0.45],
+                [0.50, 0.45],
+                [0.50, 0.65],
+                [0.40, 0.65]
+            ],
+            "angle_deg": -25.5,
+            "angle_conf": 0.85,
+            "grasp_width_px": 28.5,
+            "length_px": 72.0
+        }]);
+        let d = parse_detections(&raw, [640.0, 360.0]);
+        assert_eq!(d.len(), 1);
+        let det = &d[0];
+        assert_eq!(det.label, "bottle");
+        assert!((det.score - 0.88).abs() < 1e-6);
+        assert!((det.box_norm[0] - 0.39).abs() < 1e-6);
+        assert!((det.box_norm[1] - 0.43).abs() < 1e-6);
+        assert!((det.box_norm[2] - 0.51).abs() < 1e-6);
+        assert!((det.box_norm[3] - 0.67).abs() < 1e-6);
+        assert_eq!(det.angle_deg, Some(-25.5));
+        assert_eq!(det.angle_conf, Some(0.85));
+        assert_eq!(det.grasp_width_px, Some(28.5));
+        assert_eq!(det.length_px, Some(72.0));
+    }
+
+    #[test]
     fn parses_detector_formats() {
         let raw = serde_json::json!([
             [320.0, 180.0, 64.0, 36.0, 0.9, "cup"],

@@ -5,7 +5,14 @@ cmake_minimum_required(VERSION 3.5.0)
 #   SG200X_SDK_PATH   reCamera OS SDK (env), toolchain riscv64-unknown-linux-musl-* in PATH
 # scripts/build_vision.sh runs this inside the tpuc_dev container.
 
-project(rebot-vision VERSION 1.3.9 LANGUAGES C CXX)
+project(rebot-vision VERSION 1.3.10 LANGUAGES C CXX)
+
+option(BUILD_TESTING "Build host tests" OFF)
+if(BUILD_TESTING)
+    enable_testing()
+    add_subdirectory(tests)
+    return()
+endif()
 
 get_filename_component(PROJECT_DIR ${CMAKE_CURRENT_LIST_DIR} ABSOLUTE)
 

@@ -1,5 +1,6 @@
 #include "detector.h"
 #include "seg_model.h"
+#include "obb_model.h"
 
 #include <algorithm>
 
@@ -25,6 +26,7 @@ Detector::Detector()
     : engine_(nullptr),
       model_(nullptr),
       seg_model_(nullptr),
+      obb_model_(nullptr),
       kind_(Kind::Detect),
       threshold_(0.25f),
       input_width_(640),
@@ -39,8 +41,8 @@ Detector::~Detector() {
     }
 }
 
-bool Detector::init(const std::string& model_path) {
-    MA_LOGI(TAG, "Initializing detector with model: %s", model_path.c_str());
+bool Detector::init(const std::string& model_path, ModelKindHint hint) {
+    MA_LOGI(TAG, "Initializing detector with model: %s (hint: %d)", model_path.c_str(), static_cast<int>(hint));
 
     engine_ = std::make_unique<ma::engine::EngineCVI>();
     ma_err_t ret = engine_->init();
@@ -60,18 +62,53 @@ bool Detector::init(const std::string& model_path) {
     int num_outputs = engine_->getOutputSize();
     MA_LOGI(TAG, "Model loaded: %d inputs, %d outputs", num_inputs, num_outputs);
 
-    if (num_outputs == 2 && ma::model::Yolo11Seg::isValid(engine_.get())) {
-        seg_model_ = std::make_unique<SegModel>(engine_.get());
-        kind_ = Kind::Segment;
-        const ma_img_t* model_input = static_cast<const ma_img_t*>(seg_model_->getInput());
-        if (model_input) {
-            input_width_ = model_input->width;
-            input_height_ = model_input->height;
+    if (hint == ModelKindHint::Segment ||
+        (hint == ModelKindHint::Auto && num_outputs == 2 && ma::model::Yolo11Seg::isValid(engine_.get()))) {
+        if (num_outputs == 2 && ma::model::Yolo11Seg::isValid(engine_.get())) {
+            seg_model_ = std::make_unique<SegModel>(engine_.get());
+            kind_ = Kind::Segment;
+            const ma_img_t* model_input = static_cast<const ma_img_t*>(seg_model_->getInput());
+            if (model_input) {
+                input_width_ = model_input->width;
+                input_height_ = model_input->height;
+            }
+            MA_LOGI(TAG, "Segmentor initialized (type: %s, input: %dx%d)",
+                    seg_model_->getName(), input_width_, input_height_);
+            initialized_ = true;
+            return true;
+        } else if (hint == ModelKindHint::Segment) {
+            MA_LOGE(TAG, "Requested segment model kind, but model is not a valid segmentor");
+            return false;
         }
-        MA_LOGI(TAG, "Segmentor initialized (type: %s, input: %dx%d)",
-                seg_model_->getName(), input_width_, input_height_);
-        initialized_ = true;
-        return true;
+    }
+
+    if (hint == ModelKindHint::Obb || hint == ModelKindHint::Auto) {
+        bool path_has_obb = false;
+        std::string lower_path = model_path;
+        std::transform(lower_path.begin(), lower_path.end(), lower_path.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (lower_path.find("obb") != std::string::npos) {
+            path_has_obb = true;
+        }
+
+        const bool allow_1out = (hint == ModelKindHint::Obb) ? true : path_has_obb;
+        if (ObbModel::isValid(engine_.get(), allow_1out, model_path.c_str())) {
+            obb_model_ = std::make_unique<ObbModel>(engine_.get());
+            kind_ = Kind::Obb;
+            const ma_img_t* model_input = static_cast<const ma_img_t*>(obb_model_->getInput());
+            if (model_input) {
+                input_width_ = model_input->width;
+                input_height_ = model_input->height;
+            }
+            MA_LOGI(TAG, "OBB Detector initialized (type: %s, input: %dx%d)",
+                    obb_model_->getName(), input_width_, input_height_);
+            initialized_ = true;
+            return true;
+        } else if (hint == ModelKindHint::Obb) {
+            MA_LOGE(TAG, "Requested OBB model kind, but model is not a valid OBB model");
+            return false;
+        }
     }
 
     kind_ = Kind::Detect;
@@ -111,6 +148,9 @@ void Detector::setThreshold(float threshold) {
     if (seg_model_) {
         seg_model_->setConfig(MA_MODEL_CFG_OPT_THRESHOLD, static_cast<double>(threshold_));
     }
+    if (obb_model_) {
+        obb_model_->setConfig(MA_MODEL_CFG_OPT_THRESHOLD, static_cast<double>(threshold_));
+    }
 }
 
 std::vector<Detection> Detector::detect(ma_img_t* img, const rv::MaskFocus* focus,
@@ -133,6 +173,22 @@ std::vector<Detection> Detector::detect(ma_img_t* img, const rv::MaskFocus* focu
             return results;
         }
         results = seg_model_->getDetections();
+        for (auto& det : results) {
+            det.id = detection_id_counter_++;
+        }
+        return results;
+    }
+
+    if (kind_ == Kind::Obb) {
+        if (!obb_model_) {
+            return results;
+        }
+        ma_err_t ret = obb_model_->run(img);
+        if (ret != MA_OK) {
+            MA_LOGE(TAG, "OBB run failed: %d", ret);
+            return results;
+        }
+        results = obb_model_->getDetections();
         for (auto& det : results) {
             det.id = detection_id_counter_++;
         }

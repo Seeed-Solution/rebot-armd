@@ -229,9 +229,11 @@ Differences from the spec are listed at the end of this file.
 | `main/vision_control.*` | `aruco-detector/main/inference_control.*`, with modes and the combined result |
 | `main/aruco_stage.*` | `aruco-detector/main/main.cpp` frame handler |
 | `main/http_control.*` | `aruco-detector/main/http_control.*` |
-| `main/detector.*` | `yolo-detector/main/detector.*`, updated for SegModel auto-detection |
+| `main/detector.*` | `yolo-detector/main/detector.*`, updated for SegModel and ObbModel auto-detection |
 | `main/mask_geom.*` | new (PCA moments, minimum cross section, crop mask decode) |
 | `main/seg_model.*` | new (SegModel : ma::model::Segmentor, anchor indexing, budget-capped mask decode) |
+| `main/obb_geom.*` | new (letterbox-safe rotated quad geometry, ProbIoU rotated NMS) |
+| `main/obb_model.*` | new (`ObbModel : ma::model::Detector`, Layout A FP32 & Layout B 9-output INT8/FP32 OBB decoder) |
 | `main/marker_filter.*`, `camera_model.*`, `capture_time.h` | `aruco-detector/main/`, unchanged |
 | `main/result_json.*` | new (letterbox geometry, detections / markers JSON) |
 | `apriltag_patched/` | `components/apriltag` `apriltag.c`, `apriltag_quad_thresh.c` (BSD-2-Clause), modified: stage time stamps, cluster step options, size gate (see each file's header); `apriltag.cmake` builds them in place of the SDK's files |
@@ -336,13 +338,150 @@ YOLO model: not in the repository or the deb. The first existing file of `vision
 `/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel`,
 `/userdata/local/models/yolo11n_detection_cv181x_int8.cvimodel`,
 `/userdata/local/models/yolo11n_cv181x_int8.cvimodel`,
+`/userdata/rebot-teleop/models/yolo11n-obb.cvimodel`,
+`/userdata/local/models/yolo11n_obb_cv181x_int8_fuse_qout.cvimodel`,
+`/userdata/local/models/yolo11n_obb_cv181x_int8.cvimodel`,
+`/userdata/local/models/yolo26n_obb_cv181x_int8.cvimodel`,
 `/usr/share/supervisor/models/yolo11n_segment_cv181x_int8.cvimodel`,
 `/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel` is loaded. Without a model `yolo` and `both`
 answer 409 and ArUco works.
 
-Model options: command-line `--model PATH`, `--mask on|off` (default: off; decode instance segmentation masks when using a segmentation model), `--mask-max-boxes N` (1..20, default 3; max boxes for mask decoding), and `vision.json` keys `"model"`, `"mask": true|false`, and `"mask_max_boxes": 1..20`.
+Model options: command-line `--model PATH`, `--model-kind auto|detect|segment|obb` (default: auto), `--mask on|off` (default: off; decode instance segmentation masks when using a segmentation model), `--mask-max-boxes N` (1..20, default 3; max boxes for mask decoding), and `vision.json` keys `"model"`, `"model_kind": "auto"|"detect"|"segment"|"obb"`, `"mask": true|false`, and `"mask_max_boxes": 1..20`.
 When a 2-output YOLO11-seg model is loaded (e.g. `yolo11n_segment_cv181x_int8.cvimodel`), `rebot-vision` auto-detects `model.kind: "segment"`. When `--mask on` (or `vision.json` `"mask": true`), it decodes cropped instance masks for up to `mask_max_boxes` detections within a 160x160 cell budget and computes mask orientation, confidence, and grasp width.
-Segmentation timing from the standalone bench: Forward 71.2 ms, crop mask decode measured before the cache fix 15.6 ms (bench numbers; new on-device numbers: not measured).
+When an oriented bounding box (OBB) model is loaded, `rebot-vision` auto-detects (or forces via `--model-kind obb`) `model.kind: "obb"`. It supports both Layout A (Ultralytics 1-output FP32 `[1, 5 + nc, N]`) and Layout B (decoupled 9-output INT8/FP32 across 3 scale strides, interleaved or grouped, NHWC or NCHW). OBB models decode rotated boxes directly via ProbIoU NMS and provide `angle_deg`, `angle_conf`, `grasp_width_px`, `length_px`, and 4 normalised quad corners in `"obb_corners"`.
+Segmentation timing from the standalone bench: Forward 71.2 ms, crop mask decode measured before the cache fix 15.6 ms (bench numbers; on-device `rebot-vision` measurements for detection, OBB, and segmentation (`--mask on`) are recorded in `## YOLO model comparison (SG2002)` below).
+
+## YOLO model comparison (SG2002)
+
+### Models and memory footprint
+
+Measurements from `model_tool --info` and live `rebot-vision` v1.3.10 on SG2002:
+
+- `detect` (`yolo11n_detection_cv181x_int8.cvimodel`, 80 COCO classes): file `3,113,208 B` (`2.97 MB`), ION `7.69 MB`, input `images_raw` (`uint8 [1, 640, 640, 3]`), 6 `int8` outputs (`cv2.{0,1,2}` `[1,64,H,W]` + `cv3.{0,1,2}` `[1,80,H,W]` at `80x80`, `40x40`, `20x20`). Live `rebot-vision`: standby `VmRSS 11,420 kB` (`VmPeak 32,012 kB`), `15 fps` `VmRSS 13,848 kB` (`VmPeak 35,684 kB`).
+- `obb (fp32 out)` (`yolo11n_obb_cv181x_int8_fuse.cvimodel`, 15 DOTAv1 classes): file `3,201,512 B` (`3.05 MB`), ION `9.17 MB`, input `images_raw` (`uint8 [1, 640, 640, 3]`), 9 `fp32` outputs (`cv2.{0,1,2}` `[1,64,H,W]` + `cv3.{0,1,2}` `[1,15,H,W]` + `cv4.{0,1,2}` `[1,1,H,W]` at `80x80`, `40x40`, `20x20`). Live `rebot-vision`: standby `VmRSS 11,548 kB` (`VmPeak 33,604 kB`), `15 fps` `VmRSS 16,060 kB` (`VmPeak 36,340 kB`).
+- `obb (int8 quant_output)` (`yolo11n_obb_cv181x_int8_fuse_qout.cvimodel`, 15 DOTAv1 classes): file `3,187,696 B` (`3.04 MB`), ION `7.24 MB`, input `images_raw` (`uint8 [1, 640, 640, 3]`), 9 `int8` outputs (`cv2.{0,1,2}` `[1,64,H,W]` + `cv3.{0,1,2}` `[1,15,H,W]` + `cv4.{0,1,2}` `[1,1,H,W]` at `80x80`, `40x40`, `20x20`, totaling `672,000 B` (`656.25 KiB`) vs `2,688,000 B` (`2.56 MiB`) for `fp32`). Live `rebot-vision`: standby `VmRSS 11,376 kB` (`VmPeak 31,620 kB`), `15 fps` `VmRSS 12,588 kB` (`VmPeak 32,832 kB`).
+- Unfused OBB note (`yolo11n_obb_cv181x_int8.cvimodel`): file `3,194,880 B` (`3.05 MB`), ION `12.68 MB`, input `images` (`fp32 [1, 3, 640, 640]`), 9 `fp32` outputs; not compatible with `ma::model::Detector` (feeds `uint8`), and standalone `CVI_NN_Forward` measured `151.59 ms` vs `37.96 ms` fused.
+- `segment` (`yolo11n_segment_cv181x_int8.cvimodel`, 80 COCO classes): file `4,043,296 B` (`3.86 MB`), ION `17.91 MB`, input `images_raw` (`uint8 [1, 640, 640, 3]`), 2 `fp32` outputs (`output0_Concat_f32 [1, 116, 8400, 1]`, `output1_Mul_f32 [1, 32, 160, 160]`). Live `rebot-vision` (`--mask on`): standby `VmRSS 11,556 kB` (`VmPeak 42,736 kB`), `15 fps` `VmRSS 17,620 kB` (`VmPeak 48,792 kB`).
+
+### Live rebot-vision v1.3.10 HTTP API v2 benchmark
+
+Measured on a physical SG2002 reCamera. Test conditions: `rebot-vision` started with `nice -n 10 --depth-model off`, external client over USB-RNDIS, triggers N=30 at 1.2 s spacing, continuous streaming measured over a 12 s window + 20 polled frames.
+
+Scene and class-count asymmetry: indoor desk scene yielded 0 detections for DOTAv1 15-class OBB and COCO 80-class detection, and 0..2 detections (mean 0.3 on triggers, 0.2 at 5 fps, 0.35 at 15 fps) for segmentation with `--mask on`.
+
+#### Standby (10 s)
+
+| Model | Chip CPU | Process CPU |
+|---|---|---|
+| `obb (fp32 out)` | 15.74% | 9.47% |
+| `obb (int8 qout)` | 15.77% | 9.69% |
+| `detect` | 15.64% | 9.36% |
+| `segment (--mask on)` | 15.91% | 9.55% |
+
+#### Triggers (N=30, skipped = 0)
+
+| Metric | `obb (fp32 out)` | `obb (int8 qout)` | `detect` | `segment (--mask on)` |
+|---|---|---|---|---|
+| `yolo_ms` mean (p50, p95, max) | 42.79 (42.7, 43.4, 43.7) | 38.81 (38.8, 38.9, 39.8) | 46.46 (46.4, 47.0, 47.4) | 93.83 (86.1, 119.3, 120.4) |
+| `mask_ms` mean (p50, p95, max) | - | - | - | 7.72 (0.0, 33.2, 34.3) |
+| Server `grab-gate` mean / p50 (ms) | 38.03 / 38 | 31.57 / 32 | 39.83 / 39 | 70.53 / 71 |
+| Server `done-frame` mean / p50 (ms) | 42.9 / 43 | 38.90 / 39 | 46.6 / 47 | 93.83 / 86 |
+| Server `reply-accept` mean / p50 (ms) | 82.1 / 82 | 71.27 / 71 | 88.33 / 87 | 166.3 / 159 |
+| Client HTTP RTT mean (p50, p95) (ms) | 92.81 (93.00, 94.45) | 78.58 (78.91, 80.30) | 96.66 (96.39, 98.99) | 176.61 (169.31, 202.96) |
+
+#### Continuous streaming
+
+| Workload | Chip CPU | Process CPU | VmRSS (VmPeak) | Input / Result FPS | `yolo_ms` mean (p50, p95) | `mask_ms` mean (p50, p95) |
+|---|---|---|---|---|---|---|
+| `yolo @ 5 fps` `obb (fp32 out)` | 22.47% | 16.21% | 12,448 kB (33,932 kB) | 7.5 / 5.0 | 42.67 (42.7, 42.8) | - |
+| `yolo @ 5 fps` `obb (int8 qout)` | 20.67% | 14.73% | 11,384 kB (31,808 kB) | 7.5 / 5.0 | 38.73 (38.7, 38.8) | - |
+| `yolo @ 5 fps` `detect` | 24.85% | 18.42% | 11,436 kB (33,240 kB) | 7.5 / 5.0 | 46.34 (46.3, 46.4) | - |
+| `yolo @ 5 fps` `segment (--mask on)` | 31.68% | 24.77% | 11,600 kB (46,824 kB) | 7.5 / 5.0 | 92.20 (85.6, 119.3) | 6.63 (0.0, 33.4) |
+| `yolo @ 15 fps` `obb (fp32 out)` | 33.45% | 26.45% | 16,060 kB (36,340 kB) | 14.5 / 14.0 | 43.08 (43.0, 44.0) | - |
+| `yolo @ 15 fps` `obb (int8 qout)` | 28.80% | 21.97% | 12,588 kB (32,832 kB) | 15.0 / 14.5 | 38.85 (38.8, 39.8) | - |
+| `yolo @ 15 fps` `detect` | 40.09% | 33.16% | 13,848 kB (35,684 kB) | 15.0 / 14.5 | 48.78 (46.8, 87.7) | - |
+| `yolo @ 15 fps` `segment (--mask on)` | 45.81% | 38.36% | 17,620 kB (48,792 kB) | 9.5 / 8.0 | 112.93 (92.6, 337.3) | 18.65 (0.0, 160.5) |
+
+At requested 15 fps, segmentation with `--mask on` saturated below the target rate (input 9.5 fps, result 8.0 fps).
+
+### OBB stage breakdown on SG2002
+
+Measured with `obb_stage_bench` (standalone binary, 5 warmup + 50 runs on 640x640 DOTA input):
+- Baseline (`int8_fuse`, 9 `fp32` outputs, cell-major decoder): `CVI_NN_RegisterModel` `20.29 ms`, `VmPeak 13,892 kB`, `VmRSS 3,368 kB`, `VmHWM 3,372 kB`.
+- Optimized FP32 (`int8_fuse`, 9 `fp32` outputs, NCHW plane-major decoder): `CVI_NN_RegisterModel` `20.46 ms`, `VmPeak 13,932 kB`, `VmRSS 3,380 kB`, `VmHWM 3,384 kB`.
+- Optimized INT8 (`int8_fuse_qout`, 9 `int8` outputs, NCHW plane-major `int8` decoder with `q_min` threshold pre-filter): `CVI_NN_RegisterModel` `20.11 ms`, `VmPeak 11,920 kB`, `VmRSS 3,356 kB`, `VmHWM 3,360 kB`.
+
+#### Nominal config: `conf=0.25, nms_iou=0.45` (Candidates Raw Decoded: 35, After NMS: 4)
+
+| Stage | Baseline (`int8_fuse`, FP32 out, cell-major) | Optimized FP32 (`int8_fuse`, plane-major) | Optimized INT8 (`int8_fuse_qout`, plane-major + `q_min`) |
+|---|---|---|---|
+| `CVI_NN_Forward` (TPU) | mean 36.306, p50 36.280, p95 36.479, max 36.526 ms | mean 36.284, p50 36.278, p95 36.338, max 36.436 ms | mean 35.167, p50 35.164, p95 35.202, max 35.214 ms |
+| `rv::decode_obb_layout_b` (CPU) | mean 4.645, p50 4.626, p95 4.721, max 4.872 ms | mean 2.830, p50 2.831, p95 2.893, max 2.925 ms | mean 1.727, p50 1.705, p95 1.764, max 1.801 ms |
+| `rv::obb_nms` (CPU ProbIoU NMS) | mean 0.094, p50 0.094, p95 0.096, max 0.137 ms | mean 0.094, p50 0.092, p95 0.094, max 0.157 ms | mean 0.092, p50 0.091, p95 0.093, max 0.145 ms |
+| `rv::obb_to_geom + detections_json` | mean 0.695, p50 0.680, p95 0.750, max 0.790 ms | mean 0.676, p50 0.665, p95 0.735, max 0.859 ms | mean 0.692, p50 0.681, p95 0.750, max 0.767 ms |
+| Total pipeline | mean 41.741, p50 41.720, p95 41.943, max 42.200 ms (23.96 FPS) | mean 39.883, p50 39.870, p95 39.966, max 40.056 ms (25.07 FPS) | mean 37.678, p50 37.691, p95 37.735, max 37.782 ms (26.54 FPS) |
+
+#### Stress config: `conf=0.05, nms_iou=0.45` (Candidates Raw Decoded: 50, After NMS: 4)
+
+| Stage | Baseline (`int8_fuse`, FP32 out, cell-major) | Optimized FP32 (`int8_fuse`, plane-major) | Optimized INT8 (`int8_fuse_qout`, plane-major + `q_min`) |
+|---|---|---|---|
+| `CVI_NN_Forward` (TPU) | mean 36.326, p50 36.281, p95 36.348, max 38.327 ms | mean 36.290, p50 36.280, p95 36.385, max 36.413 ms | mean 35.171, p50 35.166, p95 35.211, max 35.255 ms |
+| `rv::decode_obb_layout_b` (CPU) | mean 4.817, p50 4.802, p95 4.892, max 4.922 ms | mean 2.962, p50 2.999, p95 3.049, max 3.107 ms | mean 1.881, p50 1.870, p95 1.966, max 2.064 ms |
+| `rv::obb_nms` (CPU ProbIoU NMS) | mean 0.119, p50 0.115, p95 0.162, max 0.163 ms | mean 0.114, p50 0.114, p95 0.115, max 0.165 ms | mean 0.112, p50 0.112, p95 0.113, max 0.165 ms |
+| `rv::obb_to_geom + detections_json` | mean 0.671, p50 0.680, p95 0.747, max 0.749 ms | mean 0.664, p50 0.662, p95 0.732, max 0.739 ms | mean 0.674, p50 0.678, p95 0.749, max 0.763 ms |
+| Total pipeline | mean 41.933, p50 41.910, p95 42.031, max 43.940 ms (23.85 FPS) | mean 40.030, p50 40.067, p95 40.160, max 40.213 ms (24.98 FPS) | mean 37.838, p50 37.872, p95 37.960, max 38.016 ms (26.43 FPS) |
+
+OBB CPU utilization and latency are lower than `detect` in this test because DOTAv1 has 15 classes compared to 80 COCO classes, and `decode_obb_layout_b` skips DFL softmax unless class score exceeds the inverse-sigmoid threshold. Switching from strided cell-major to NCHW plane-major sequential class scanning reduced FP32 CPU decode latency from 4.645 ms to 2.830 ms (conf=0.25). Compiling with `--quant_output` emits 9 INT8 outputs directly, eliminating 9 trailing `tpu.Cast` ops, saving 1.93 MB ION memory (7.24 MB vs 9.17 MB) and 1.14 ms TPU execution time (35.167 ms vs 36.306 ms); applying exact INT8 score threshold pre-filtering (`q_min`) further reduced CPU decode latency from 2.830 ms to 1.727 ms.
+
+### CV181X OBB export requirements
+
+- CV181X TPU-MLIR `TopToTpuPass` lacks lowering support for `top.Cos` and `top.Sin` emitted by Ultralytics rotated box decoding, so export truncates the ONNX head to the 9 raw conv outputs (`cv2.{0,1,2}`, `cv3.{0,1,2}`, `cv4.{0,1,2}`) before DFL and rotated decode.
+- Compile with `--fuse_preprocess --customization_format RGB_PACKED` so the cvimodel expects `UINT8 [1, 640, 640, 3]` (`ma::model::Detector` feeds `UINT8`), reducing standalone `CVI_NN_Forward` from `151.59 ms` / `12.68 MB` ION (unfused FP32 NCHW) to `37.96 ms` / `9.17 MB` ION in the standalone `cviruntime` bench (and `36.306 ms` / `9.17 MB` ION in `obb_stage_bench`).
+- Compile with `--quant_output` to emit 9 `INT8` outputs directly with zero extra quantization (`CosineSim > 0.999997` and raw `int8` diff `0.000000` vs intermediate pre-cast outputs of `int8_fuse`, matching `ObbModel` / `decode_obb_layout_b` `MA_TENSOR_TYPE_S8` support), while keeping input `UINT8 [1, 640, 640, 3]` via `--fuse_preprocess --customization_format RGB_PACKED` rather than signed `INT8` (`--quant_input`) which triggers `u8[i] -= 128` CPU subtraction inside `ma::model::Detector::preprocess`.
+
+#### Reproducible TPU-MLIR v1.7 build recipe
+
+Configuration: `UINT8 [1, 640, 640, 3]` `RGB_PACKED` fused input + 9 `INT8` direct outputs, `7.24 MB` ION footprint.
+
+1. Export ONNX (downgrade ONNX IR version to `<= 8` if required by `tpu_mlir==1.7`):
+```sh
+yolo export model=yolo11n-obb.pt format=onnx opset=17 simplify=True imgsz=640
+```
+
+2. Transform ONNX to MLIR with fused preprocessing and truncated head (raw conv outputs before DFL and rotated decode; head index `23` for YOLO11-OBB, `22` for YOLOv8-OBB):
+```sh
+model_transform.py \
+    --model_name yolo11n_obb \
+    --model_def yolo11n-obb.onnx \
+    --input_shapes [[1,3,640,640]] \
+    --mean 0.0,0.0,0.0 \
+    --scale 0.0039216,0.0039216,0.0039216 \
+    --keep_aspect_ratio \
+    --pixel_format rgb \
+    --output_names /model.23/cv2.0/cv2.0.2/Conv_output_0,/model.23/cv3.0/cv3.0.2/Conv_output_0,/model.23/cv4.0/cv4.0.2/Conv_output_0,/model.23/cv2.1/cv2.1.2/Conv_output_0,/model.23/cv3.1/cv3.1.2/Conv_output_0,/model.23/cv4.1/cv4.1.2/Conv_output_0,/model.23/cv2.2/cv2.2.2/Conv_output_0,/model.23/cv3.2/cv3.2.2/Conv_output_0,/model.23/cv4.2/cv4.2.2/Conv_output_0 \
+    --mlir yolo11n_obb.mlir
+```
+
+3. Calibrate INT8 quantization:
+```sh
+run_calibration.py yolo11n_obb.mlir \
+    --dataset <calib_dir> \
+    --input_num 100 \
+    -o yolo11n_obb_cali_table
+```
+
+4. Deploy cvimodel with fused `RGB_PACKED` input and direct `INT8` quantized output (do not pass `--quant_input`, so input remains `UINT8` to avoid CPU `u8 - 128` subtraction):
+```sh
+model_deploy.py \
+    --mlir yolo11n_obb.mlir \
+    --quantize INT8 \
+    --chip cv181x \
+    --calibration_table yolo11n_obb_cali_table \
+    --fuse_preprocess \
+    --customization_format RGB_PACKED \
+    --quant_output \
+    --model yolo11n_obb_cv181x_int8_fuse_qout.cvimodel
+```
 
 ## Differences from the spec
 

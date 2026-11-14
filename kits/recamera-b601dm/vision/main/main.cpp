@@ -67,6 +67,7 @@ struct Config {
     std::string depth_model_path;  // empty: first existing default; "off": disabled
     std::string depth_metric_str = "auto";  // "auto", "on", "off"
     bool depth_metric = false;
+    std::string model_kind_str = "auto";    // "auto", "detect", "segment", "obb"
     bool verbose = false;
 } g_cfg;
 
@@ -75,6 +76,12 @@ const char* kDefaultModels[] = {
     "/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel",
     "/userdata/local/models/yolo11n_detection_cv181x_int8.cvimodel",
     "/userdata/local/models/yolo11n_cv181x_int8.cvimodel",
+    "/userdata/rebot-teleop/models/yolo11n-obb.cvimodel",
+    "/userdata/local/models/yolo11n_obb_cv181x_int8_fuse_qout.cvimodel",
+    "/userdata/local/models/yolo11n_obb_cv181x_int8.cvimodel",
+    "/userdata/local/models/yolo26n_obb_cv181x_int8.cvimodel",
+    "/usr/share/supervisor/models/yolo11n_segment_cv181x_int8.cvimodel",
+    "/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel",
 };
 
 const char* kDefaultDepthModels[] = {
@@ -192,6 +199,13 @@ void load_config_file(const std::string& path) {
     }
     str("depth_model", g_cfg.depth_model_path);
     str("depth_metric", g_cfg.depth_metric_str);
+    str("model_kind", g_cfg.model_kind_str);
+    if (g_cfg.model_kind_str != "auto" && g_cfg.model_kind_str != "detect" &&
+        g_cfg.model_kind_str != "segment" && g_cfg.model_kind_str != "obb") {
+        MA_LOGW(TAG, "%s: unknown model_kind '%s', falling back to auto",
+                path.c_str(), g_cfg.model_kind_str.c_str());
+        g_cfg.model_kind_str = "auto";
+    }
 }
 
 void print_usage(const char* prog) {
@@ -200,6 +214,7 @@ void print_usage(const char* prog) {
     printf("  --config PATH            JSON config file (keys as the long options, '_' for '-')\n");
     printf("  --mode off|yolo|aruco|both  Base mode at start [default: yolo]\n");
     printf("  --inference on|off       Default subscription (the mode API) at start [default: off = standby]\n");
+    printf("  --model-kind auto|detect|segment|obb  Model kind hint [default: auto]\n");
     printf("  --mask on|off            Decode instance segmentation masks [default: off]\n");
     printf("  --mask-max-boxes N       Max boxes with decoded segmentation masks, 1..20 [default: 3]\n");
     printf("  --depth-model PATH       ZipDepth .cvimodel (or \"off\" to disable) [default: first existing]\n");
@@ -237,12 +252,13 @@ bool parse_args(int argc, char** argv) {
     enum {
         kConfig = 1000, kMode, kInference, kFps, kFx, kFy, kCx, kCy, kK1, kK2, kP1, kP2, kK3, kDecimate,
         kMinMargin, kMinSide, kIds, kStreamFps, kStreamBitrate, kDebugPort, kControlPort, kMask, kMaskMaxBoxes,
-        kDepthModel, kDepthMetric
+        kDepthModel, kDepthMetric, kModelKind
     };
     static struct option long_opts[] = {
         {"config", required_argument, nullptr, kConfig},
         {"mode", required_argument, nullptr, kMode},
         {"inference", required_argument, nullptr, kInference},
+        {"model-kind", required_argument, nullptr, kModelKind},
         {"mask", required_argument, nullptr, kMask},
         {"mask-max-boxes", required_argument, nullptr, kMaskMaxBoxes},
         {"depth-model", required_argument, nullptr, kDepthModel},
@@ -314,6 +330,14 @@ bool parse_args(int argc, char** argv) {
                 break;
             }
             case kDepthModel: g_cfg.depth_model_path = optarg; break;
+            case kModelKind:
+                if (std::strcmp(optarg, "auto") && std::strcmp(optarg, "detect") &&
+                    std::strcmp(optarg, "segment") && std::strcmp(optarg, "obb")) {
+                    fprintf(stderr, "Invalid --model-kind '%s' (auto|detect|segment|obb)\n", optarg);
+                    return false;
+                }
+                g_cfg.model_kind_str = optarg;
+                break;
             case kDepthMetric:
                 if (std::strcmp(optarg, "auto") && std::strcmp(optarg, "on") && std::strcmp(optarg, "off")) {
                     fprintf(stderr, "Invalid --depth-metric '%s' (auto|on|off)\n", optarg);
@@ -428,14 +452,21 @@ int main(int argc, char** argv) {
     }
     yolo::Detector detector;
     bool yolo_ok = false;
+    yolo::ModelKindHint kind_hint = yolo::ModelKindHint::Auto;
+    if (g_cfg.model_kind_str == "detect") kind_hint = yolo::ModelKindHint::Detect;
+    else if (g_cfg.model_kind_str == "segment") kind_hint = yolo::ModelKindHint::Segment;
+    else if (g_cfg.model_kind_str == "obb") kind_hint = yolo::ModelKindHint::Obb;
+
     if (!file_exists(model)) {
         MA_LOGW(TAG, "No YOLO model found (%s); yolo/both unavailable, aruco works",
                 model.empty() ? "default paths" : model.c_str());
-    } else if (detector.init(model)) {
+    } else if (detector.init(model, kind_hint)) {
         detector.setThreshold(g_cfg.conf_threshold);
         detector.setMaskEnabled(g_cfg.mask_enabled);
         detector.setMaskMaxBoxes(g_cfg.mask_max_boxes);
-        detector.setScale(4.0f, 4.0f);
+        if (detector.getKind() == yolo::Kind::Segment) {
+            detector.setScale(4.0f, 4.0f);
+        }
         yolo_ok = true;
     } else {
         MA_LOGE(TAG, "YOLO model %s failed to load; yolo/both unavailable", model.c_str());
@@ -509,7 +540,7 @@ int main(int argc, char** argv) {
     vo.yolo_available = yolo_ok;
     vo.model_name = yolo_ok ? base_name(model) : "";
     vo.model_path = yolo_ok ? model : "";
-    vo.model_kind = (detector.getKind() == yolo::Kind::Segment ? "segment" : "detect");
+    vo.model_kind = (detector.getKind() == yolo::Kind::Segment ? "segment" : (detector.getKind() == yolo::Kind::Obb ? "obb" : "detect"));
     vo.mask = g_cfg.mask_enabled && (detector.getKind() == yolo::Kind::Segment);
     vo.mask_max_boxes = g_cfg.mask_max_boxes;
     vo.family = g_cfg.aruco.family;
@@ -594,8 +625,12 @@ int main(int argc, char** argv) {
             for (const auto& d : detector.detect(&img, frame_focus.active ? &frame_focus : nullptr,
                                                  static_cast<float>(crop.x), static_cast<float>(crop.y),
                                                  static_cast<float>(crop.w), static_cast<float>(crop.h))) {
-                dets.push_back({d.x, d.y, d.w, d.h, d.confidence, d.class_id, yolo::Detector::getClassName(d.class_id),
-                                d.angle_deg, d.angle_conf, d.grasp_width_px, d.mask_focus});
+                rv::DetBox det{d.x, d.y, d.w, d.h, d.confidence, d.class_id, yolo::Detector::getClassName(d.class_id),
+                               d.angle_deg, d.angle_conf, d.grasp_width_px, d.mask_focus};
+                det.length_px = d.length_px;
+                det.has_obb = d.has_obb;
+                det.obb_corners = d.obb_corners;
+                dets.push_back(det);
                 af::Box b;  // centre pixels in the inference frame; the debug sink maps them to the display
                 b.x = d.x * frame.width;
                 b.y = d.y * frame.height;
