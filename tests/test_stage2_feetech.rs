@@ -1826,3 +1826,97 @@ fn test_feetech_refresh_enable_state_bus_recovery() {
     assert!(!driver.has_known_partial_enable());
     assert!(driver.has_any_joint_enabled());
 }
+
+// -------------------------------------------------------------------------
+// 38. supervisor.clear_fault rejects stale or moving pose before disabling faulted joint
+// -------------------------------------------------------------------------
+#[tokio::test]
+async fn test_supervisor_clear_fault_rejects_stale_or_moving_pose_before_hardware_disable() {
+    let mock = Arc::new(Mutex::new(MockTransport::new()));
+    let driver = FeetechArmDriver::new(SharedTransport(mock.clone()), vec![1]).with_calibrated(true);
+
+    let mut config = ArmConfig::default();
+    config.dof = 1;
+    config.limits = vec![JointLimit::new("j1", -3.0, 3.0, 2.0, 5.0)];
+    config.home_positions = vec![0.0];
+    config.resting_pose = Some(RestingPosePolicy {
+        positions: None,
+        position_tolerances: vec![0.08],
+        max_total_deviation: 0.16,
+        max_velocity: 0.015,
+        joint_max_velocities: vec![],
+        support_torque_limits: vec![],
+        support_load_limits: vec![],
+        feedback_max_age_ms: 100,
+    });
+
+    let supervisor = ArmSupervisor::new(config).with_driver(Box::new(driver));
+
+    let pos_1 = 2048u16.to_le_bytes();
+    let normal_params = [pos_1[0], pos_1[1], 0, 0, 0, 0, 70, 35];
+    let cs_normal = calculate_checksum(1, 10, 0x00, &normal_params);
+    let mut rx_normal = vec![0xFF, 0xFF, 1, 10, 0x00];
+    rx_normal.extend_from_slice(&normal_params);
+    rx_normal.push(cs_normal);
+
+    let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
+    let rx_tq1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1];
+
+    mock.lock().unwrap().provide_rx(&rx_normal);
+    mock.lock().unwrap().provide_rx(&rx_tq1);
+    mock.lock().unwrap().provide_rx(&rx_normal);
+
+    supervisor.set_torque(true).await.unwrap();
+    assert!(supervisor.inner().read().await.is_torqued);
+
+    // Inject hardware overload fault (0x20)
+    let cs_overload = calculate_checksum(1, 10, 0x20, &normal_params);
+    let mut rx_overload = vec![0xFF, 0xFF, 1, 10, 0x20];
+    rx_overload.extend_from_slice(&normal_params);
+    rx_overload.push(cs_overload);
+    mock.lock().unwrap().provide_rx(&rx_overload);
+
+    let obs = supervisor.tick(0.02).await;
+    assert!(obs.fault.is_some());
+    assert_eq!(obs.fault.unwrap().code, FaultCode::HardwareFault);
+
+    // Drain TX buffer before testing clear_fault
+    mock.lock().unwrap().take_tx();
+
+    // Case 1: Feedback indicates arm joint is moving (speed != 0, velocity > max_velocity 0.015)
+    let moving_speed = 100u16.to_le_bytes();
+    let moving_params = [pos_1[0], pos_1[1], moving_speed[0], moving_speed[1], 0, 0, 70, 35];
+    let cs_moving = calculate_checksum(1, 10, 0x20, &moving_params);
+    let mut rx_moving = vec![0xFF, 0xFF, 1, 10, 0x20];
+    rx_moving.extend_from_slice(&moving_params);
+    rx_moving.push(cs_moving);
+    mock.lock().unwrap().provide_rx(&rx_moving);
+
+    let res_moving = supervisor.clear_fault().await;
+    assert!(res_moving.is_err(), "clear_fault must reject when arm is moving");
+    let err_str = res_moving.unwrap_err().to_string();
+    assert!(
+        err_str.contains("away from resting pose") || err_str.contains("velocity"),
+        "Expected resting pose/velocity violation error, got: {err_str}"
+    );
+    assert!(supervisor.inner().read().await.is_torqued, "is_torqued must be preserved on rejected clear_fault");
+
+    // Verify no torque disable command was sent to hardware
+    let tx_moving = mock.lock().unwrap().take_tx();
+    let disable_cmd = feetech::build_set_torque(1, false);
+    assert!(
+        !tx_moving.windows(disable_cmd.len()).any(|w| w == disable_cmd),
+        "Hardware torque disable must NOT be sent when clear_fault rejects due to motion"
+    );
+
+    // Case 2: Feedback is stale (no response provided to sync_read, or age > feedback_max_age_ms)
+    let res_stale = supervisor.clear_fault().await;
+    assert!(res_stale.is_err(), "clear_fault must reject when feedback is stale/unavailable");
+    assert!(supervisor.inner().read().await.is_torqued, "is_torqued must be preserved");
+
+    let tx_stale = mock.lock().unwrap().take_tx();
+    assert!(
+        !tx_stale.windows(disable_cmd.len()).any(|w| w == disable_cmd),
+        "Hardware torque disable must NOT be sent when clear_fault rejects due to stale feedback"
+    );
+}

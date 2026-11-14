@@ -810,7 +810,10 @@ fn test_5dof_align_auto_yaw_preserves_near_vertical_orientation() {
 
 #[test]
 fn test_5dof_grasp_plan_from_tilted_scan_to_off_axis_target_no_branch_flip() {
-    let config = load_so101_config();
+    let mut config = load_so101_config();
+    if let Some(ref mut grasp) = config.grasp {
+        grasp.acquire_camera_down = armd::grasp::AcquireCameraDown::Auto;
+    }
     let setup = config.grasp.as_ref().expect("grasp setup exists");
     let cam = grasp::CamModel::assumed(&config.arm_model, setup, &config.camera_mount);
     let arm = &config.arm_model;
@@ -990,22 +993,37 @@ fn test_auto_yaw_bypassed_when_tool_is_vertical() {
     let config = load_so101_config();
     let arm = config.arm_model.chain().unwrap();
 
-    // Vertical tool pose (pointing straight down): pitch ~ 90 deg (1.58 rad)
-    let r_vertical = kinematics::rpy_to_r(0.0, 1.58, 0.0);
-    assert!(armd::chain::is_tool_vertical(&r_vertical));
-
-    let goal_vert = Pose::new(r_vertical, [0.22, 0.0, 0.08]);
     let lo: [f64; 6] = std::array::from_fn(|i| f64::from(config.limits[i].min_position));
     let hi: [f64; 6] = std::array::from_fn(|i| f64::from(config.limits[i].max_position));
     let q_home: [f64; 6] = std::array::from_fn(|i| f64::from(config.home_positions[i]));
 
-    // Solve with yaw_free = true (auto_yaw): because tool is vertical, auto-yaw must be bypassed
-    let sol = arm.solve_dls_ex(&goal_vert, &q_home, &lo, &hi, kinematics::PAR.w, 80, true);
-    assert!(sol.ok);
+    // Vertical tool pose (pointing straight down): pitch ~ 90 deg (FRAC_PI_2)
+    let r_vertical = kinematics::rpy_to_r(0.0, std::f64::consts::FRAC_PI_2, 0.0);
+    assert!(armd::chain::is_tool_vertical(&r_vertical));
 
-    // Forward kinematics of solution must stay vertical without being flipped
+    let goal_vert = Pose::new(r_vertical, [0.22, 0.0, 0.08]);
+
+    // Step 1: Solve with yaw_free = false from q_home to reach initial downward pose
+    let sol_down = arm.solve_dls_ex(&goal_vert, &q_home, &lo, &hi, kinematics::PAR.w, 100, false);
+    assert!(sol_down.ok, "Must reach initial downward pose");
+    let fk_down = arm.fk(&sol_down.q);
+    assert!(armd::chain::is_tool_vertical(&fk_down.r));
+
+    // Step 2: Rotate downward orientation by 0.7 rad around world Z (which is the tool X axis when vertical)
+    let r_rolled = kinematics::mat_mul(&kinematics::axis_r(&[0.0, 0.0, 1.0], 0.7), &r_vertical);
+    assert!(armd::chain::is_tool_vertical(&r_rolled));
+
+    let goal_rolled = Pose::new(r_rolled, [0.22, 0.0, 0.08]);
+
+    // Solve with yaw_free = true (auto_yaw requested):
+    // Because tool is vertical, auto-yaw must be bypassed, preserving wrist roll!
+    let sol = arm.solve_dls_ex(&goal_rolled, &sol_down.q, &lo, &hi, kinematics::PAR.w, 100, true);
+    assert!(sol.ok, "IK must solve cleanly");
+
     let fk = arm.fk(&sol.q);
     assert!(armd::chain::is_tool_vertical(&fk.r));
+    let rot_err = kinematics::angle_between(&fk.r, &r_rolled);
+    assert!(rot_err < 0.02, "Wrist roll must be executed, not discarded: rot_err = {rot_err}");
 }
 
 #[test]

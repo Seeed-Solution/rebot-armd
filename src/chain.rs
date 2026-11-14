@@ -308,7 +308,7 @@ impl KinematicChain {
         let mut f = self.frames(&q);
 
         let r_xy = (goal.p[0] * goal.p[0] + goal.p[1] * goal.p[1]).sqrt();
-        let use_auto_yaw = yaw_free && n == 5 && r_xy >= 0.03;
+        let use_auto_yaw = yaw_free && n == 5 && r_xy >= 0.03 && !is_tool_vertical(rg);
 
         let align_rot = |r_curr: &Mat3| -> Mat3 {
             if use_auto_yaw {
