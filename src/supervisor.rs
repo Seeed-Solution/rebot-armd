@@ -9,7 +9,7 @@ use thiserror::Error;
 use crate::driver::{ArmDriver, JointTarget, EnableState, DriverCapabilities};
 use crate::model::{ArmConfig, ArmObservation, MotionLimit, MotionLimitReason, ObservationSchema, RestingPosePolicy};
 use crate::recording::{
-    write_frames_to_parquet, EpisodeRecorder, EpisodeState, ParquetRecordingError, RecordFrame,
+    EpisodeRecorder, EpisodeState, ParquetRecordingError, RecordFrame,
     RecordingError,
 };
 use crate::safety::{FaultCode, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
@@ -804,6 +804,37 @@ impl SupervisorInner {
 
     pub fn current_observation(&self) -> ArmObservation {
         let timestamp = self.start_time.elapsed().as_secs_f64();
+        let tcp = if self.config.kinematics.is_some() {
+            self.config.arm_model.fk_f32(&self.measured_positions).map(|pose| {
+                let rpy = crate::kinematics::r_to_rpy(&pose.r);
+                let quat = crate::kinematics::r_to_quat(&pose.r);
+                crate::model::TcpState {
+                    xyz_m: [pose.p[0] as f32, pose.p[1] as f32, pose.p[2] as f32],
+                    rpy_rad: [rpy[0] as f32, rpy[1] as f32, rpy[2] as f32],
+                    quat_wxyz: [quat[0] as f32, quat[1] as f32, quat[2] as f32, quat[3] as f32],
+                }
+            })
+        } else {
+            None
+        };
+        let gripper = if let (Some(idx), Some(policy)) = (self.config.gripper_index(), self.config.gripper_policy.as_ref()) {
+            if let Some(&rad) = self.measured_positions.get(idx) {
+                let span = policy.open_rad - policy.closed_rad;
+                let fraction = if span.abs() < 1e-6 { 0.0 } else { ((rad - policy.closed_rad) / span).clamp(0.0, 1.0) };
+                let opening_m = policy.jaw_opening.as_ref().map(|jo| jo.opening_m(rad));
+                Some(crate::model::GripperObs {
+                    joint: idx,
+                    rad,
+                    fraction,
+                    opening_m,
+                    stalled: self.gripper_stalled,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         ArmObservation {
             timestamp,
             positions: self.measured_positions.clone(),
@@ -834,6 +865,8 @@ impl SupervisorInner {
             collision: self.collision_observation(),
             power: self.power_observation(),
             gripper_zero: self.gripper_zero_observation(),
+            tcp,
+            gripper,
         }
     }
 
@@ -1764,14 +1797,16 @@ impl SupervisorInner {
             l.last_valid_motion_instant = Some(Instant::now());
         }
 
-        // J7 Gripper stall release check on reverse command
-        if self.config.dof >= 7 && self.gripper_stalled && targets.len() >= 7 {
-            let delta = targets[6] - self.commanded_positions[6];
-            let tau_7 = self.torques.get(6).copied().unwrap_or(0.0);
-            if (delta * tau_7 < -1e-4) || (delta * self.gripper_stall_sign < -1e-4) {
-                self.gripper_stalled = false;
-                self.gripper_high_torque_ticks = 0;
-                self.gripper_low_torque_ticks = 0;
+        // Gripper stall release check on reverse command
+        if let Some(g_idx) = self.config.gripper_index() {
+            if self.gripper_stalled && targets.len() > g_idx && self.commanded_positions.len() > g_idx {
+                let delta = targets[g_idx] - self.commanded_positions[g_idx];
+                let tau_g = self.torques.get(g_idx).copied().unwrap_or(0.0);
+                if (delta * tau_g < -1e-4) || (delta * self.gripper_stall_sign < -1e-4) {
+                    self.gripper_stalled = false;
+                    self.gripper_high_torque_ticks = 0;
+                    self.gripper_low_torque_ticks = 0;
+                }
             }
         }
 
@@ -1843,14 +1878,16 @@ impl SupervisorInner {
         self.torque_hold_filter(&mut target_positions);
         self.power_hold_filter(&mut target_positions);
 
-        // J7 Gripper stall release check on reverse command
-        if self.config.dof >= 7 && self.gripper_stalled && target_positions.len() >= 7 {
-            let delta = target_positions[6] - self.commanded_positions[6];
-            let tau_7 = self.torques.get(6).copied().unwrap_or(0.0);
-            if (delta * tau_7 < -1e-4) || (delta * self.gripper_stall_sign < -1e-4) {
-                self.gripper_stalled = false;
-                self.gripper_high_torque_ticks = 0;
-                self.gripper_low_torque_ticks = 0;
+        // Gripper stall release check on reverse command
+        if let Some(g_idx) = self.config.gripper_index() {
+            if self.gripper_stalled && target_positions.len() > g_idx && self.commanded_positions.len() > g_idx {
+                let delta = target_positions[g_idx] - self.commanded_positions[g_idx];
+                let tau_g = self.torques.get(g_idx).copied().unwrap_or(0.0);
+                if (delta * tau_g < -1e-4) || (delta * self.gripper_stall_sign < -1e-4) {
+                    self.gripper_stalled = false;
+                    self.gripper_high_torque_ticks = 0;
+                    self.gripper_low_torque_ticks = 0;
+                }
             }
         }
 
@@ -1936,7 +1973,7 @@ impl SupervisorInner {
             if a.kind == "gripper_zero_check" {
                 if let Some(params) = self.zero_check_params.take().filter(|p| p.action_id == id) {
                     if state == "done" {
-                        let stop_rad = self.measured_positions.get(6).copied().unwrap_or(0.0);
+                        let stop_rad = self.config.gripper_index().and_then(|idx| self.measured_positions.get(idx)).copied().unwrap_or(0.0);
                         let offset_rad = stop_rad - params.base_closed_rad;
                         let pass = offset_rad.abs() <= params.threshold_rad;
                         a.stop_rad = Some(stop_rad);
@@ -2029,14 +2066,16 @@ impl SupervisorInner {
 
     /// Snapshot for planning a Cartesian action outside the lock.
     pub fn plan_input(&self) -> Result<PlanInput, ArmError> {
-        if self.config.kinematics.is_none() || !self.config.six_plus_gripper() {
-            return Err(MotionError::Unsupported("Cartesian actions need a kinematics model with 6 arm joints and the gripper at joint 7".into()).into());
+        if self.config.kinematics.is_none() || !self.config.has_cartesian_with_gripper() {
+            return Err(MotionError::Unsupported("Cartesian actions need a kinematics model and an arm with gripper".into()).into());
         }
         self.action_preconditions()?;
         self.gravity_comp_motion_busy()?;
+        let arm_dof = self.config.arm_dof();
+        let gripper_idx = self.config.gripper_index().unwrap_or(arm_dof);
         Ok(PlanInput {
-            q0: crate::kinematics::q6(&self.commanded_positions),
-            j7: self.commanded_positions[6],
+            q0: crate::kinematics::q6(&self.commanded_positions[..arm_dof.min(self.commanded_positions.len())]),
+            j7: self.commanded_positions.get(gripper_idx).copied().unwrap_or(0.0),
             limits: self.planning_limits(),
             speed_cap: self.config.speed_cap,
             ws: self.workspace_policy().map(|(ws, _)| ws.clone()),
@@ -2073,8 +2112,10 @@ impl SupervisorInner {
             }
             other => other?,
         }
-        let moved = (0..6).any(|i| (f64::from(self.commanded_positions[i]) - input.q0[i]).abs() >= 1e-4)
-            || (self.commanded_positions[6] - input.j7).abs() >= 1e-4;
+        let arm_dof = input.arm.arm_dof();
+        let gripper_idx = self.config.gripper_index().unwrap_or(arm_dof);
+        let moved = (0..arm_dof).any(|i| (f64::from(self.commanded_positions[i]) - input.q0[i]).abs() >= 1e-4)
+            || (self.commanded_positions.get(gripper_idx).copied().unwrap_or(0.0) - input.j7).abs() >= 1e-4;
         if moved { return Err(MotionError::PlanStale("commanded positions changed while planning".into()).into()); }
         Ok(())
     }
@@ -2095,7 +2136,7 @@ impl SupervisorInner {
     /// Runtime grasp setup (`config.grasp`, with the camera tilt taken from `camera_mount`).
     /// None when the profile cannot grasp (no kinematics, gripper policy or grasp section).
     pub fn grasp_setup(&self) -> Option<crate::grasp::GraspSetup> {
-        if !self.config.six_plus_gripper() || self.config.kinematics.is_none() || self.config.gripper_policy.is_none() { return None; }
+        if !self.config.has_cartesian_with_gripper() || self.config.kinematics.is_none() || self.config.gripper_policy.is_none() { return None; }
         let mut s = self.config.grasp.clone()?;
         s.camera_tilt_deg = f64::from(self.config.camera_mount.tilt_deg);
         Some(s)
@@ -2220,18 +2261,21 @@ impl SupervisorInner {
     /// Start a gripper sub-motion of macro action `id`. Returns its expected duration.
     pub fn start_macro_gripper(&mut self, id: u64, request: GripperRequest) -> Result<f64, ArmError> {
         let epoch = self.macro_sub_ready(id)?;
-        let Some(policy) = self.config.gripper_policy.clone().filter(|_| self.config.dof >= 7) else {
-            return Err(MotionError::Unsupported("Gripper actions need a 7-DOF profile with a gripper policy".into()).into());
+        let gripper_idx = self.config.gripper_index().ok_or_else(|| {
+            MotionError::Unsupported("Gripper actions need a profile with a gripper joint".into())
+        })?;
+        let Some(policy) = self.config.gripper_policy.clone() else {
+            return Err(MotionError::Unsupported("Gripper actions need a profile with a gripper policy".into()).into());
         };
         if epoch != self.safety.epoch_id() { return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into()); }
         self.action_preconditions()?;
         self.releasing = matches!(request.command, GripperCommand::Open);
-        let motion = GripperMotion::new(request, policy, self.config.limits[6].clone(), self.commanded_positions[6]);
+        let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx);
         let duration = motion.expected_duration();
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         let mut target = self.commanded_positions.clone();
-        target[6] = motion.target;
+        target[gripper_idx] = motion.target;
         self.target_positions = target;
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
@@ -2274,21 +2318,24 @@ impl SupervisorInner {
 
     /// Start a gripper action. Returns (action id, expected duration).
     pub fn start_gripper(&mut self, request: GripperRequest, epoch: u64) -> Result<(u64, f64), ArmError> {
-        let Some(policy) = self.config.gripper_policy.clone().filter(|_| self.config.dof >= 7) else {
-            return Err(MotionError::Unsupported("Gripper actions need a 7-DOF profile with a gripper policy".into()).into());
+        let gripper_idx = self.config.gripper_index().ok_or_else(|| {
+            MotionError::Unsupported("Gripper actions need a profile with a gripper joint".into())
+        })?;
+        let Some(policy) = self.config.gripper_policy.clone() else {
+            return Err(MotionError::Unsupported("Gripper actions need a profile with a gripper policy".into()).into());
         };
         if epoch != self.safety.epoch_id() {
             return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
         }
         self.action_preconditions()?;
         self.releasing = matches!(request.command, GripperCommand::Open);
-        let motion = GripperMotion::new(request, policy, self.config.limits[6].clone(), self.commanded_positions[6]);
+        let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx);
         let duration = motion.expected_duration();
         let tag = motion.request.tag.clone();
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         let mut target = self.commanded_positions.clone();
-        target[6] = motion.target;
+        target[gripper_idx] = motion.target;
         self.target_positions = target;
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
@@ -2299,9 +2346,15 @@ impl SupervisorInner {
 
     /// Start a gripper zero check action. Returns (action id, expected duration).
     pub fn start_gripper_zero_check(&mut self, body: &serde_json::Value, epoch: u64) -> Result<(u64, f64), ArmError> {
-        let Some(policy) = self.config.gripper_policy.clone().filter(|_| self.config.dof >= 7) else {
-            return Err(MotionError::Unsupported("Gripper zero check needs a 7-DOF profile with a gripper policy".into()).into());
+        let gripper_idx = self.config.gripper_index().ok_or_else(|| {
+            MotionError::Unsupported("Gripper zero check needs a profile with a gripper joint".into())
+        })?;
+        let Some(policy) = self.config.gripper_policy.clone() else {
+            return Err(MotionError::Unsupported("Gripper zero check needs a profile with a gripper policy".into()).into());
         };
+        if !policy.zero_check_supported {
+            return Err(MotionError::Unsupported("Gripper zero check is not supported for this gripper policy".into()).into());
+        }
         if epoch != self.safety.epoch_id() {
             return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
         }
@@ -2331,12 +2384,12 @@ impl SupervisorInner {
             timeout_s: None,
             tag: None,
         };
-        let motion = GripperMotion::new(request, policy, self.config.limits[6].clone(), self.commanded_positions[6]);
+        let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx);
         let duration = motion.expected_duration();
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         let mut target = self.commanded_positions.clone();
-        target[6] = motion.target;
+        target[gripper_idx] = motion.target;
         self.target_positions = target;
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
@@ -2380,10 +2433,11 @@ impl SupervisorInner {
     }
 
     pub fn gripper_zero_observation(&self) -> Option<crate::model::GripperZeroObservation> {
-        if self.config.dof < 7 || self.config.gripper_policy.is_none() {
+        let idx = self.config.gripper_index()?;
+        if self.config.gripper_policy.is_none() {
             return None;
         }
-        let j7 = self.measured_positions.get(6).copied().unwrap_or(0.0);
+        let j7 = self.measured_positions.get(idx).copied().unwrap_or(0.0);
         let offset_rad = self.gripper_calib_offset.or(self.last_zero_check_offset);
         let state = if self.gripper_calib_invalid {
             "calib_invalid".to_string()
@@ -2673,21 +2727,22 @@ impl SupervisorInner {
     /// held, J7 stays at the hold point while the reference pushes further in the stall
     /// direction; a reference moving J7 the other way ends the freeze.
     fn gripper_hold_filter(&mut self, positions: &mut [f32], velocities: &mut [f32]) {
-        if self.config.dof < 7 || positions.len() < 7 || self.commanded_positions.len() < 7 { return; }
+        let Some(g_idx) = self.config.gripper_index() else { return; };
+        if positions.len() <= g_idx || self.commanded_positions.len() <= g_idx { return; }
         if self.gripper_motion_hold.is_none() {
             let close_sign = self.config.gripper_policy.as_ref()
                 .map_or(1.0, |p| if p.closed_rad >= p.open_rad { 1.0 } else { -1.0 });
             if self.gripper_stalled {
-                self.gripper_motion_hold = Some((self.commanded_positions[6], self.gripper_stall_sign));
+                self.gripper_motion_hold = Some((self.commanded_positions[g_idx], self.gripper_stall_sign));
             } else if self.held.is_some() {
-                self.gripper_motion_hold = Some((self.commanded_positions[6], close_sign));
+                self.gripper_motion_hold = Some((self.commanded_positions[g_idx], close_sign));
             }
         }
         let Some((hold, sign)) = self.gripper_motion_hold else { return; };
-        let push = (positions[6] - hold) * sign;
+        let push = (positions[g_idx] - hold) * sign;
         if push > 0.0 {
-            positions[6] = hold;
-            if velocities.len() > 6 { velocities[6] = 0.0; }
+            positions[g_idx] = hold;
+            if velocities.len() > g_idx { velocities[g_idx] = 0.0; }
         } else if push < -1e-3 {
             self.gripper_motion_hold = None;
             return;
@@ -2696,7 +2751,7 @@ impl SupervisorInner {
             // a hold at the jaw's own closed stop is not an object
             let gap = self.config.gripper_policy.as_ref().map_or(f32::INFINITY, |p| (hold - p.closed_rad).abs() - p.holding_gap_rad);
             if gap >= 0.0 && !self.park_gripper_contact {
-                tracing::info!("Park: J7 held at {hold:.3} rad (object in the jaw); releasing it at the resting pose");
+                tracing::info!("Park: gripper held at {hold:.3} rad (object in the jaw); releasing it at the resting pose");
                 self.park_gripper_contact = true;
             }
         }
@@ -2716,14 +2771,18 @@ impl SupervisorInner {
             }
             None => return false,
         };
-        let Some(policy) = self.config.gripper_policy.clone().filter(|_| self.config.dof >= 7) else {
+        let Some(gripper_idx) = self.config.gripper_index() else {
+            self.park_gripper_contact = false;
+            return false;
+        };
+        let Some(policy) = self.config.gripper_policy.clone() else {
             self.park_gripper_contact = false;
             return false;
         };
         let (command, fraction) = match next {
             ParkRelease::Opening => {
                 let open_sign = if policy.open_rad >= policy.closed_rad { 1.0 } else { -1.0 };
-                let target = self.commanded_positions[6] + open_sign * PARK_RELEASE_OPEN_RAD;
+                let target = self.commanded_positions[gripper_idx] + open_sign * PARK_RELEASE_OPEN_RAD;
                 let span = policy.open_rad - policy.closed_rad;
                 let f = if span.abs() > 1e-6 { ((target - policy.closed_rad) / span).clamp(0.0, 1.0) } else { 1.0 };
                 (GripperCommand::Move, Some(f64::from(f)))
@@ -2737,12 +2796,12 @@ impl SupervisorInner {
         self.gripper_low_torque_ticks = 0;
         self.gripper_motion_hold = None;
         if next == ParkRelease::Opening { self.releasing = true; }
-        let motion = GripperMotion::new(request, policy, self.config.limits[6].clone(), self.commanded_positions[6]);
+        let motion = GripperMotion::new(request, policy, self.config.limits[gripper_idx].clone(), self.commanded_positions[gripper_idx], gripper_idx);
         let duration = motion.expected_duration();
-        tracing::info!("Park release: {} J7 {:.3} -> {:.3} rad", if next == ParkRelease::Opening { "opening" } else { "closing" },
-            self.commanded_positions[6], motion.target);
+        tracing::info!("Park release: {} joint {} {:.3} -> {:.3} rad", if next == ParkRelease::Opening { "opening" } else { "closing" },
+            gripper_idx + 1, self.commanded_positions[gripper_idx], motion.target);
         if let Some(park) = self.watchdog_park.as_mut() { park.budget_s += motion.timeout_s.max(duration); }
-        self.target_positions[6] = motion.target;
+        self.target_positions[gripper_idx] = motion.target;
         self.active_trajectory = Some(ActiveTrajectory { action_id: None, reference: Reference::Gripper(motion) });
         self.park_release = Some(next);
         true
@@ -2792,10 +2851,12 @@ impl SupervisorInner {
             tracing::warn!("Unload settle pending for {:.1} s: {blocker}", settle.pending_s);
             settle.last_report_s = Some(settle.pending_s);
         }
-        // Not yet stably at rest: hold the home target. J7 keeps its command: driving it to the
+        // Not yet stably at rest: hold the home target. Gripper keeps its command: driving it to the
         // home value would squeeze anything still in the jaw at full motor torque.
         let mut home = self.config.home_positions.clone();
-        if home.len() > 6 && self.commanded_positions.len() > 6 { home[6] = self.commanded_positions[6]; }
+        if let Some(g_idx) = self.config.gripper_index() {
+            if home.len() > g_idx && self.commanded_positions.len() > g_idx { home[g_idx] = self.commanded_positions[g_idx]; }
+        }
         self.commanded_positions = home.clone();
         self.target_positions = home;
         self.commanded_velocities = vec![0.0; self.config.dof];
@@ -2865,8 +2926,8 @@ impl SupervisorInner {
         let dt = if dt.is_finite() && dt > 0.0 { dt.min(0.080) } else { 0.020 };
         let before_velocities = self.commanded_velocities.clone();
 
-        // 0.1 Gripper stall protection state machine for J7 (joint 6)
-        if self.config.dof >= 7 {
+        // 0.1 Gripper stall protection state machine
+        if let Some(g_idx) = self.config.gripper_index() {
             let is_bus_fresh = if let Some(ref d) = self.driver {
                 if let Ok(driver) = d.lock() {
                     self.last_can_feedback_instant.is_some_and(|t| t.elapsed() < Duration::from_millis(50)) && driver.is_feedback_valid() && driver.capabilities().torque_feedback
@@ -2877,30 +2938,32 @@ impl SupervisorInner {
                 true // In simulation without a physical driver
             };
 
-            let tau_7 = self.torques.get(6).copied().unwrap_or(0.0);
+            let tau_g = self.torques.get(g_idx).copied().unwrap_or(0.0);
             if !is_bus_fresh {
                 self.gripper_high_torque_ticks = 0;
                 self.gripper_low_torque_ticks = 0;
             } else if !self.gripper_stalled {
                 // A stall is high torque with the jaw not moving. Torque alone also rises
-                // from friction during free travel over the 5.9 rad stroke.
-                let v_7 = self.measured_velocities.get(6).copied().unwrap_or(0.0);
-                if tau_7.abs() >= GRIPPER_STALL_LATCH_NM && v_7.abs() < 0.10 {
+                // from friction during free travel over the stroke.
+                let v_g = self.measured_velocities.get(g_idx).copied().unwrap_or(0.0);
+                if tau_g.abs() >= GRIPPER_STALL_LATCH_NM && v_g.abs() < 0.10 {
                     self.gripper_high_torque_ticks += 1;
                     if self.gripper_high_torque_ticks >= 6 {
                         self.gripper_stalled = true;
-                        // Direction J7 is driven into the obstacle: commanded minus measured,
+                        // Direction gripper is driven into the obstacle: commanded minus measured,
                         // independent of the driver's torque sign; torque sign only as fallback.
-                        let push = self.commanded_positions[6] - self.measured_positions[6];
-                        let dir = if push.abs() > 1e-3 { push } else { tau_7 };
+                        let push = self.commanded_positions.get(g_idx).copied().unwrap_or(0.0)
+                            - self.measured_positions.get(g_idx).copied().unwrap_or(0.0);
+                        let dir = if push.abs() > 1e-3 { push } else { tau_g };
                         self.gripper_stall_sign = if dir >= 0.0 { 1.0 } else { -1.0 };
                         self.gripper_low_torque_ticks = 0;
-                        let hold = self.measured_positions[6];
-                        self.commanded_positions[6] = hold;
-                        self.target_positions[6] = hold;
-                        if let Some(ref mut st) = self.servo_target {
-                            if st.len() > 6 {
-                                st[6] = hold;
+                        if let Some(&hold) = self.measured_positions.get(g_idx) {
+                            if g_idx < self.commanded_positions.len() { self.commanded_positions[g_idx] = hold; }
+                            if g_idx < self.target_positions.len() { self.target_positions[g_idx] = hold; }
+                            if let Some(ref mut st) = self.servo_target {
+                                if st.len() > g_idx {
+                                    st[g_idx] = hold;
+                                }
                             }
                         }
                     }
@@ -2909,8 +2972,8 @@ impl SupervisorInner {
                 }
             } else {
                 self.gripper_high_torque_ticks = 0;
-                // Exit condition B: |tau_7| < GRIPPER_STALL_RELEASE_NM for 6 consecutive ticks
-                if tau_7.abs() < GRIPPER_STALL_RELEASE_NM {
+                // Exit condition B: |tau_g| < GRIPPER_STALL_RELEASE_NM for 6 consecutive ticks
+                if tau_g.abs() < GRIPPER_STALL_RELEASE_NM {
                     self.gripper_low_torque_ticks += 1;
                     if self.gripper_low_torque_ticks >= 6 {
                         self.gripper_stalled = false;
@@ -3248,8 +3311,8 @@ impl SupervisorInner {
                         if i < self.config.dof {
                             let limit = &step_limits[i];
                             let clamped_tgt = tgt.clamp(limit.min_position, limit.max_position);
-                            let mut actual_tgt = if i == 6 && self.gripper_stalled {
-                                self.commanded_positions[6]
+                            let mut actual_tgt = if Some(i) == gripper_idx && self.gripper_stalled {
+                                self.commanded_positions.get(i).copied().unwrap_or(clamped_tgt)
                             } else {
                                 clamped_tgt
                             };
@@ -3478,7 +3541,7 @@ impl SupervisorInner {
         if self.driver.is_none() {
             self.measured_positions = self.commanded_positions.clone();
             self.measured_velocities = self.commanded_velocities.clone();
-            if self.config.dof >= 7 {
+            if let Some(g_idx) = self.config.gripper_index() {
                 let gripper_moving = matches!(&self.active_trajectory, Some(ActiveTrajectory { reference: Reference::Gripper(_), .. }));
                 // the stall torque lasts only while the jaw pushes on the stop; a stale value would
                 // end the next gripper motion at once as a stall
@@ -3489,23 +3552,23 @@ impl SupervisorInner {
                         let stall_offset = self.mock_gripper_stall_offset.unwrap_or(0.0);
                         let stop_rad = base_closed + stall_offset;
                         let dir = if policy.closed_rad >= policy.open_rad { 1.0 } else { -1.0 };
-                        let push = (self.commanded_positions[6] - stop_rad) * dir;
+                        let push = (self.commanded_positions[g_idx] - stop_rad) * dir;
                         if push > 1e-4 {
-                            self.measured_positions[6] = stop_rad;
-                            self.measured_velocities[6] = 0.0;
-                            self.torques[6] = dir * (GRIPPER_STALL_LATCH_NM * 1.5 + push * 2.0);
+                            self.measured_positions[g_idx] = stop_rad;
+                            self.measured_velocities[g_idx] = 0.0;
+                            self.torques[g_idx] = dir * (GRIPPER_STALL_LATCH_NM * 1.5 + push * 2.0);
                             stalled = true;
                         }
                     }
                 }
                 if let (Some((obj, touched)), Some(policy)) = (self.mock_gripper_object, self.config.gripper_policy.as_ref()) {
                     let dir = if policy.closed_rad >= policy.open_rad { 1.0 } else { -1.0 };
-                    let push = (self.commanded_positions[6] - obj) * dir;
+                    let push = (self.commanded_positions[g_idx] - obj) * dir;
                     if push > 1e-4 {
                         // squeeze torque rises with the command past the contact (POS_VEL stiffness)
-                        self.measured_positions[6] = obj;
-                        self.measured_velocities[6] = 0.0;
-                        self.torques[6] = dir * (GRIPPER_STALL_LATCH_NM * 1.5 + push * 2.0);
+                        self.measured_positions[g_idx] = obj;
+                        self.measured_velocities[g_idx] = 0.0;
+                        self.torques[g_idx] = dir * (GRIPPER_STALL_LATCH_NM * 1.5 + push * 2.0);
                         stalled = true;
                         self.mock_gripper_object = Some((obj, true));
                     } else if touched && push < -0.5 {
@@ -3516,7 +3579,7 @@ impl SupervisorInner {
                 if stalled {
                     self.mock_gripper_stall_torque = true;
                 } else if self.mock_gripper_stall_torque {
-                    self.torques[6] = 0.0;
+                    self.torques[g_idx] = 0.0;
                     self.mock_gripper_stall_torque = false;
                 }
             }
@@ -3936,7 +3999,15 @@ impl ArmSupervisor {
     }
 
     pub async fn save_recording(&self) -> Result<PathBuf, ArmError> {
-        self.save_recording_with(write_frames_to_parquet).await
+        let meta = {
+            let inner = self.inner.read().await;
+            crate::recording::EpisodeMetadata {
+                arm_dof: Some(inner.config.arm_dof()),
+                gripper_joint: inner.config.gripper_index(),
+                joint_names: Some(inner.config.limits.iter().map(|l| l.name.clone()).collect()),
+            }
+        };
+        self.save_recording_with(move |p, f| crate::recording::write_frames_to_parquet_with_meta(p, f, Some(&meta))).await
     }
 
     /// Save with a caller-supplied writer. The lock is held only to move the

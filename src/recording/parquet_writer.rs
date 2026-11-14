@@ -6,8 +6,19 @@ use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use super::episode::RecordFrame;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct EpisodeMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm_dof: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gripper_joint: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joint_names: Option<Vec<String>>,
+}
 
 #[derive(Debug, Error)]
 pub enum ParquetRecordingError {
@@ -27,25 +38,51 @@ pub enum ParquetRecordingError {
     Corrupted(String),
 }
 
-/// Create the canonical LeRobot parquet Arrow schema
-pub fn lerobot_arrow_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("timestamp", DataType::Float64, false),
-        Field::new(
-            "observation.state",
-            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
-            false,
-        ),
-        Field::new(
-            "action",
-            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
-            false,
-        ),
-    ]))
+/// Create the canonical LeRobot parquet Arrow schema with optional metadata
+pub fn lerobot_arrow_schema_with_meta(meta: Option<&EpisodeMetadata>) -> Arc<Schema> {
+    let mut metadata = std::collections::HashMap::new();
+    if let Some(m) = meta {
+        if let Some(ad) = m.arm_dof {
+            metadata.insert("arm_dof".into(), ad.to_string());
+        }
+        if let Some(gj) = m.gripper_joint {
+            metadata.insert("gripper_joint".into(), gj.to_string());
+        }
+        if let Some(ref jn) = m.joint_names {
+            if let Ok(s) = serde_json::to_string(jn) {
+                metadata.insert("joint_names".into(), s);
+            }
+        }
+    }
+    Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("timestamp", DataType::Float64, false),
+            Field::new(
+                "observation.state",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                false,
+            ),
+            Field::new(
+                "action",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                false,
+            ),
+        ],
+        metadata,
+    ))
 }
 
-/// Write a list of RecordFrames to a Parquet file following the LeRobot specification
-pub fn write_frames_to_parquet(path: &Path, frames: &[RecordFrame]) -> Result<(), ParquetRecordingError> {
+/// Create the canonical LeRobot parquet Arrow schema
+pub fn lerobot_arrow_schema() -> Arc<Schema> {
+    lerobot_arrow_schema_with_meta(None)
+}
+
+/// Write a list of RecordFrames to a Parquet file following the LeRobot specification, with optional metadata
+pub fn write_frames_to_parquet_with_meta(
+    path: &Path,
+    frames: &[RecordFrame],
+    meta: Option<&EpisodeMetadata>,
+) -> Result<(), ParquetRecordingError> {
     if frames.is_empty() {
         return Err(ParquetRecordingError::EmptyFrames);
     }
@@ -54,7 +91,14 @@ pub fn write_frames_to_parquet(path: &Path, frames: &[RecordFrame]) -> Result<()
         std::fs::create_dir_all(parent)?;
     }
 
-    let schema = lerobot_arrow_schema();
+    if let Some(m) = meta {
+        let meta_path = path.with_extension("meta.json");
+        if let Ok(text) = serde_json::to_string_pretty(m) {
+            let _ = std::fs::write(meta_path, text);
+        }
+    }
+
+    let schema = lerobot_arrow_schema_with_meta(meta);
     let num_rows = frames.len();
 
     // 1. Timestamps
@@ -103,6 +147,60 @@ pub fn write_frames_to_parquet(path: &Path, frames: &[RecordFrame]) -> Result<()
     writer.close()?;
 
     Ok(())
+}
+
+/// Write a list of RecordFrames to a Parquet file following the LeRobot specification
+pub fn write_frames_to_parquet(path: &Path, frames: &[RecordFrame]) -> Result<(), ParquetRecordingError> {
+    write_frames_to_parquet_with_meta(path, frames, None)
+}
+
+/// Read back metadata from sidecar <id>.meta.json, meta.json, or Parquet schema metadata
+pub fn read_metadata_from_parquet(path: &Path) -> Result<Option<EpisodeMetadata>, ParquetRecordingError> {
+    let meta_path = path.with_extension("meta.json");
+    if meta_path.exists() {
+        if let Ok(data) = std::fs::read_to_string(&meta_path) {
+            if let Ok(m) = serde_json::from_str::<EpisodeMetadata>(&data) {
+                return Ok(Some(m));
+            }
+        }
+    }
+    let dir_meta = path.with_file_name("meta.json");
+    if dir_meta.exists() {
+        if let Ok(data) = std::fs::read_to_string(&dir_meta) {
+            if let Ok(m) = serde_json::from_str::<EpisodeMetadata>(&data) {
+                return Ok(Some(m));
+            }
+        }
+    }
+    if let Ok(file) = File::open(path) {
+        if let Ok(builder) = ParquetRecordBatchReaderBuilder::try_new(file) {
+            let meta_map = builder.schema().metadata();
+            let mut meta = EpisodeMetadata::default();
+            let mut found = false;
+            if let Some(ad_str) = meta_map.get("arm_dof") {
+                if let Ok(ad) = ad_str.parse::<usize>() {
+                    meta.arm_dof = Some(ad);
+                    found = true;
+                }
+            }
+            if let Some(gj_str) = meta_map.get("gripper_joint") {
+                if let Ok(gj) = gj_str.parse::<usize>() {
+                    meta.gripper_joint = Some(gj);
+                    found = true;
+                }
+            }
+            if let Some(jn_str) = meta_map.get("joint_names") {
+                if let Ok(jn) = serde_json::from_str::<Vec<String>>(jn_str) {
+                    meta.joint_names = Some(jn);
+                    found = true;
+                }
+            }
+            if found {
+                return Ok(Some(meta));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Read back frames from a LeRobot Parquet file for verification

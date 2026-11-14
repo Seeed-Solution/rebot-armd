@@ -78,7 +78,7 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
         }
     }
 
-    let j7_limit = inner.config.limits.get(6);
+    let j7_limit = inner.config.gripper_index().and_then(|idx| inner.config.limits.get(idx));
     b.jaw_opening.validate(j7_limit).map_err(MotionError::InvalidCommand)?;
 
     let offset = b.offset_rad.or(inner.gripper_calib_offset);
@@ -107,7 +107,7 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
 pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
     let mut inner = supervisor.inner().write().await;
     inner.gripper_calib_path = Some(path.to_path_buf());
-    let j7_lim = inner.config.limits.get(6).cloned();
+    let j7_lim = inner.config.gripper_index().and_then(|idx| inner.config.limits.get(idx)).cloned();
     match persist::load::<GripperCalibFile>(path, |f| f.validate(j7_lim.as_ref())) {
         Loaded::Loaded(calib) => {
             tracing::info!("Gripper calibration loaded from {}", path.display());

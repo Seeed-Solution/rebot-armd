@@ -11,7 +11,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::kinematics::{self, Pose};
-use crate::model::{CameraMount, GripperPolicy, JointLimit, WorkspacePolicy};
+use crate::model::{CameraMount, GripperPolicy, HoldingMode, JointLimit, WorkspacePolicy};
 use crate::trajectory::MultiJointQuinticTrajectory;
 
 #[derive(Debug, Clone, PartialEq, Error)]
@@ -130,9 +130,10 @@ impl JointPath {
     pub fn fit_power(&mut self, budget: &crate::power::PowerBudget, arm: &crate::chain::ArmModel) -> Result<crate::power_plan::PlanScale, MotionError> {
         let p = budget.planning;
         let n = crate::power_plan::Samples::count(&p, self.duration);
-        let samples = crate::power_plan::Samples::from_positions(self.duration, n, 6, |t| {
+        let arm_dof = arm.arm_dof();
+        let samples = crate::power_plan::Samples::from_positions(self.duration, n, arm_dof, |t| {
             let q = self.position_at_time(t);
-            std::array::from_fn(|i| if i < 6 { f64::from(q[i]) } else { 0.0 })
+            std::array::from_fn(|i| if i < arm_dof { f64::from(q[i]) } else { 0.0 })
         });
         let fit = crate::power_plan::plan_scale(budget, arm, &samples)?;
         self.duration /= fit.scale;
@@ -143,8 +144,9 @@ impl JointPath {
 
 /// Plan a straight-line (position) / slerp (rotation) path from `fk(q0)` to `goal`.
 pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<JointPath, MotionError> {
-    if input.limits.len() < 7 {
-        return Err(MotionError::Unsupported("Cartesian actions need a 7-DOF arm".into()));
+    let arm_dof = input.arm.arm_dof();
+    if input.limits.len() < arm_dof + 1 {
+        return Err(MotionError::Unsupported(format!("Cartesian actions need at least {} joints", arm_dof + 1)));
     }
     if !goal.p.iter().chain(goal.r.iter().flatten()).all(|v| v.is_finite()) {
         return Err(MotionError::InvalidCommand("goal pose must be finite".into()));
@@ -172,9 +174,21 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
     }
     let n = raw as usize;
 
-    let lo: [f64; 6] = std::array::from_fn(|i| f64::from(input.limits[i].min_position) + IK_LIMIT_MARGIN);
-    let hi: [f64; 6] = std::array::from_fn(|i| f64::from(input.limits[i].max_position) - IK_LIMIT_MARGIN);
-    let start_q32: [f32; 7] = std::array::from_fn(|i| if i < 6 { input.q0[i] as f32 } else { input.j7 });
+    let lo: [f64; 6] = std::array::from_fn(|i| {
+        if i < input.limits.len() {
+            f64::from(input.limits[i].min_position) + IK_LIMIT_MARGIN
+        } else {
+            -std::f64::consts::PI
+        }
+    });
+    let hi: [f64; 6] = std::array::from_fn(|i| {
+        if i < input.limits.len() {
+            f64::from(input.limits[i].max_position) - IK_LIMIT_MARGIN
+        } else {
+            std::f64::consts::PI
+        }
+    });
+    let start_q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { input.q0[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });
     let v_start = input.ws.as_ref().map(|ws| input.arm.workspace_violation(&start_q32, ws, &input.cam));
 
     let mut q_samples = Vec::with_capacity(n + 1);
@@ -197,7 +211,7 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
                 return Err(MotionError::IkBranchFlip { s, joint: joint + 1, dq });
             }
         }
-        let q32: [f32; 7] = std::array::from_fn(|i| if i < 6 { sol.q[i] as f32 } else { input.j7 });
+        let q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { sol.q[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });
         if let (Some(ws), Some(v0)) = (input.ws.as_ref(), v_start.as_ref()) {
             let v = input.arm.workspace_violation(&q32, ws, &input.cam);
             if kinematics::workspace_rejects(&v, v0) {
@@ -550,22 +564,24 @@ impl PathTrajectory {
     }
 
     pub fn step(&mut self, ctx: &StepCtx) -> StepOut {
-        let last = self.path.last().to_vec();
+        let dof = ctx.commanded.len();
+        let last = self.path.last()[..dof].to_vec();
         if let Some(settle) = self.settle.as_mut() {
             let status = match settle.step(ctx.dt, ctx.commanded, ctx.measured, ctx.measured_velocities) {
                 Some(settled) => StepStatus::Done { settled: Some(settled), holding: None, gripper_gap_rad: None },
                 None => StepStatus::Running,
             };
-            return StepOut { positions: last, velocities: vec![0.0; 7], status, progress: 1.0, clear_gripper_stall: false };
+            return StepOut { positions: last, velocities: vec![0.0; dof], status, progress: 1.0, clear_gripper_stall: false };
         }
-        let lag = (0..6).map(|i| f64::from((ctx.commanded[i] - ctx.measured[i]).abs())).fold(0.0, f64::max);
+        let arm_joints = dof.saturating_sub(1);
+        let lag = (0..arm_joints).map(|i| f64::from((ctx.commanded[i] - ctx.measured[i]).abs())).fold(0.0, f64::max);
         let lag = if lag.is_finite() { lag } else { f64::INFINITY };
         let rate = ((LAG_STOP - lag) / (LAG_STOP - LAG_FULL)).clamp(0.0, 1.0);
         if rate == 0.0 {
             self.stalled_for += ctx.dt;
             if self.stalled_for >= STALL_TIMEOUT_S - 1e-9 {
                 return StepOut {
-                    positions: ctx.commanded.to_vec(), velocities: vec![0.0; 7],
+                    positions: ctx.commanded.to_vec(), velocities: vec![0.0; dof],
                     status: StepStatus::Failed { code: "TRACKING_STALL", message: format!(
                         "Arm did not follow the path for {STALL_TIMEOUT_S} s (lag {lag:.3} rad); motion stopped") },
                     progress: (self.elapsed / self.path.duration) as f32, clear_gripper_stall: false,
@@ -578,19 +594,19 @@ impl PathTrajectory {
         let u = self.elapsed / self.path.duration;
         let s = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u);
         let q = self.position_at(s);
-        let velocities: Vec<f32> = (0..7).map(|i| ((q[i] - ctx.commanded[i]) as f64 / ctx.dt) as f32).collect();
+        let velocities: Vec<f32> = (0..dof).map(|i| ((q[i] - ctx.commanded[i]) as f64 / ctx.dt) as f32).collect();
         if self.elapsed >= self.path.duration {
             self.settle = Some(Settle::default());
-            return StepOut { positions: last, velocities: vec![0.0; 7], status: StepStatus::Running, progress: 1.0, clear_gripper_stall: false };
+            return StepOut { positions: last, velocities: vec![0.0; dof], status: StepStatus::Running, progress: 1.0, clear_gripper_stall: false };
         }
-        StepOut { positions: q.to_vec(), velocities, status: StepStatus::Running, progress: u as f32, clear_gripper_stall: false }
+        StepOut { positions: q[..dof].to_vec(), velocities, status: StepStatus::Running, progress: u as f32, clear_gripper_stall: false }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum GripPhase {
     Moving,
-    /// Squeezing an object: hold target, samples of |τ7|.
+    /// Squeezing an object: hold target, samples of |τ_gripper|.
     Squeeze { hold: f32, elapsed: f64, taus: Vec<f32> },
 }
 
@@ -601,6 +617,7 @@ pub struct GripperMotion {
     pub limit: JointLimit,
     pub target: f32,
     pub start: f32,
+    pub gripper_index: usize,
     pub elapsed: f64,
     /// Deadline (s): the request's timeout_s, else the default rule.
     pub timeout_s: f64,
@@ -610,7 +627,7 @@ pub struct GripperMotion {
 }
 
 impl GripperMotion {
-    pub fn new(request: GripperRequest, policy: GripperPolicy, limit: JointLimit, start: f32) -> Self {
+    pub fn new(request: GripperRequest, policy: GripperPolicy, limit: JointLimit, start: f32, gripper_index: usize) -> Self {
         let target = match request.command {
             GripperCommand::Open => policy.open_rad,
             GripperCommand::Close => policy.closed_rad,
@@ -621,7 +638,7 @@ impl GripperMotion {
             }
         }.clamp(limit.min_position, limit.max_position);
         let limit = JointLimit { max_velocity: request.speed as f32, ..limit };
-        let mut m = Self { request, policy, limit, target, start, elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, moved: false, phase: GripPhase::Moving };
+        let mut m = Self { request, policy, limit, target, start, gripper_index, elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, moved: false, phase: GripPhase::Moving };
         m.timeout_s = m.request.timeout_s
             .unwrap_or_else(|| GRIPPER_DEFAULT_TIMEOUT_S.max(m.expected_duration() + GRIPPER_TIMEOUT_MARGIN_S));
         m
@@ -638,13 +655,14 @@ impl GripperMotion {
         self.elapsed += ctx.dt;
         let mut positions: Vec<f32> = ctx.commanded.to_vec();
         let mut velocities = vec![0.0f32; positions.len()];
-        let (q7, v7c) = (ctx.commanded[6], ctx.commanded_velocities[6]);
-        let (m7, mv7) = (ctx.measured[6], ctx.measured_velocities.get(6).copied().unwrap_or(0.0));
-        let tau7 = ctx.torques.get(6).copied().unwrap_or(0.0);
-        // A latch set while J7 pushed the other way (e.g. the squeeze of a grasp, or the push that
+        let idx = self.gripper_index;
+        let (q_g, v_gc) = (ctx.commanded.get(idx).copied().unwrap_or(0.0), ctx.commanded_velocities.get(idx).copied().unwrap_or(0.0));
+        let (m_g, mv_g) = (ctx.measured.get(idx).copied().unwrap_or(0.0), ctx.measured_velocities.get(idx).copied().unwrap_or(0.0));
+        let tau_g = ctx.torques.get(idx).copied().unwrap_or(0.0);
+        // A latch set while gripper pushed the other way (e.g. the squeeze of a grasp, or the push that
         // lasts while the command unwinds from the squeeze hold) does not block travel away from
         // it: release it on every tick, not only the first. Only a stall in the travel direction holds.
-        let clear = ctx.gripper_stalled && (self.target - q7) * ctx.gripper_stall_sign < -1e-4;
+        let clear = ctx.gripper_stalled && (self.target - q_g) * ctx.gripper_stall_sign < -1e-4;
         let stalled = ctx.gripper_stalled && !clear;
         let progress_of = |q: f32| -> f32 {
             let span = (self.target - self.start).abs();
@@ -654,61 +672,73 @@ impl GripperMotion {
 
         if let GripPhase::Squeeze { hold, elapsed, taus } = &mut self.phase {
             *elapsed += ctx.dt;
-            taus.push(tau7.abs());
-            positions[6] = *hold;
+            taus.push(tau_g.abs());
+            if idx < positions.len() { positions[idx] = *hold; }
             let status = if *elapsed * 1000.0 >= self.policy.settle_ms as f64 - 1e-6 {
                 let mut sorted = taus.clone();
                 sorted.sort_by(|a, b| a.total_cmp(b));
                 let tau = sorted[sorted.len() / 2];
-                let gap = (self.policy.closed_rad - m7) * self.close_dir();
-                let holding = gap >= self.policy.holding_gap_rad && tau >= self.policy.holding_torque_nm;
+                let gap = (self.policy.closed_rad - m_g) * self.close_dir();
+                let holding = match self.policy.holding_mode {
+                    HoldingMode::TorqueAndGap => gap >= self.policy.holding_gap_rad && tau >= self.policy.holding_torque_nm,
+                    HoldingMode::PositionGap => gap >= self.policy.holding_gap_rad,
+                    HoldingMode::LoadAndGap => {
+                        let req = self.policy.holding_load_fraction.unwrap_or(self.policy.holding_torque_nm);
+                        gap >= self.policy.holding_gap_rad && tau >= req
+                    }
+                };
                 done(Some(holding), Some(gap))
             } else { StepStatus::Running };
             return StepOut { positions, velocities, status, progress: 1.0, clear_gripper_stall: clear };
         }
 
         if self.elapsed > self.timeout_s {
-            positions[6] = m7;
-            return StepOut { positions, velocities, progress: progress_of(m7), clear_gripper_stall: clear,
+            if idx < positions.len() { positions[idx] = m_g; }
+            return StepOut { positions, velocities, progress: progress_of(m_g), clear_gripper_stall: clear,
                 status: StepStatus::Failed { code: "GRIPPER_TIMEOUT", message: format!(
-                    "Gripper did not finish within {:.1} s (at {m7:.3} rad, target {:.3} rad)", self.timeout_s, self.target) } };
+                    "Gripper did not finish within {:.1} s (at {m_g:.3} rad, target {:.3} rad)", self.timeout_s, self.target) } };
         }
 
-        // Step J7 toward the target unless the stall latch holds it.
+        // Step gripper toward the target unless the stall latch holds it.
         if !stalled {
-            match crate::supervisor::SupervisorInner::bounded_servo_step(q7, self.target, v7c, ctx.dt, &self.limit) {
-                Some((q, v, _)) => { positions[6] = q; velocities[6] = v; }
-                None => { positions[6] = q7; }
+            match crate::supervisor::SupervisorInner::bounded_servo_step(q_g, self.target, v_gc, ctx.dt, &self.limit) {
+                Some((q, v, _)) => {
+                    if idx < positions.len() { positions[idx] = q; }
+                    if idx < velocities.len() { velocities[idx] = v; }
+                }
+                None => {
+                    if idx < positions.len() { positions[idx] = q_g; }
+                }
             }
         }
-        if (m7 - self.start).abs() > 0.05 { self.moved = true; }
-        let cmd_at_target = (positions[6] - self.target).abs() < 1e-4;
-        if mv7.abs() < SETTLE_VEL as f32 && (self.moved || cmd_at_target) { self.still_for += ctx.dt; } else { self.still_for = 0.0; }
+        if (m_g - self.start).abs() > 0.05 { self.moved = true; }
+        let cmd_at_target = idx < positions.len() && (positions[idx] - self.target).abs() < 1e-4;
+        if mv_g.abs() < SETTLE_VEL as f32 && (self.moved || cmd_at_target) { self.still_for += ctx.dt; } else { self.still_for = 0.0; }
         let still = self.still_for >= SETTLE_HOLD_S - 1e-9;
 
         let grasping = self.request.command == GripperCommand::Close && self.request.grasp;
         let status = if grasping {
             if stalled || still {
                 let dir = self.close_dir();
-                let squeezed = m7 + dir * self.policy.squeeze_rad;
+                let squeezed = m_g + dir * self.policy.squeeze_rad;
                 let hold = if dir > 0.0 { squeezed.min(self.policy.closed_rad) } else { squeezed.max(self.policy.closed_rad) }
                     .clamp(self.limit.min_position, self.limit.max_position);
-                positions[6] = hold;
-                velocities[6] = 0.0;
+                if idx < positions.len() { positions[idx] = hold; }
+                if idx < velocities.len() { velocities[idx] = 0.0; }
                 self.phase = GripPhase::Squeeze { hold, elapsed: 0.0, taus: Vec::new() };
                 StepStatus::Running
             } else { StepStatus::Running }
         } else if stalled {
-            positions[6] = q7;
-            velocities[6] = 0.0;
-            done(None, Some((self.policy.closed_rad - m7) * self.close_dir()))
-        } else if self.request.command != GripperCommand::Seek && still && ((m7 - self.target).abs() < SETTLE_POS_RAD as f32
-            || (cmd_at_target && (m7 - self.target).abs() < GRIPPER_STOP_SHORT_RAD)) {
+            if idx < positions.len() { positions[idx] = q_g; }
+            if idx < velocities.len() { velocities[idx] = 0.0; }
+            done(None, Some((self.policy.closed_rad - m_g) * self.close_dir()))
+        } else if self.request.command != GripperCommand::Seek && still && ((m_g - self.target).abs() < SETTLE_POS_RAD as f32
+            || (cmd_at_target && (m_g - self.target).abs() < GRIPPER_STOP_SHORT_RAD)) {
             // the jaw stopped close to the target: the real gripper opens to about -5.61 against a
             // -5.70 command (mechanical stop / POS_VEL offset); stopping farther away is a jam -> timeout
-            done(None, Some((self.policy.closed_rad - m7) * self.close_dir()))
+            done(None, Some((self.policy.closed_rad - m_g) * self.close_dir()))
         } else { StepStatus::Running };
-        StepOut { positions, velocities, status, progress: progress_of(m7), clear_gripper_stall: clear }
+        StepOut { positions, velocities, status, progress: progress_of(m_g), clear_gripper_stall: clear }
     }
 }
 

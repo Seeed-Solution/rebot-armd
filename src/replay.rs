@@ -55,7 +55,9 @@ pub struct ReplayInput {
     pub request: ReplayRequest,
     pub path: std::path::PathBuf,
     pub dof: usize,
+    pub arm_dof: usize,
     pub gripper_idx: Option<usize>,
+    pub joint_names: Vec<String>,
     /// Joint soft limits (`config.limits`).
     pub limits: Vec<JointLimit>,
     /// Planned-motion limits (`planning_limits()`): the speed bound of the check.
@@ -134,6 +136,29 @@ fn lerp_frames(a: &RecordFrame, b: &RecordFrame, t: f64) -> Vec<f32> {
 
 /// Load, resample and check an episode for replay. Pure (file read, no lock).
 pub fn plan(input: ReplayInput) -> Result<ReplayPlan, ArmError> {
+    if let Ok(Some(meta)) = crate::recording::read_metadata_from_parquet(&input.path) {
+        if let Some(ad) = meta.arm_dof {
+            if ad != input.arm_dof {
+                return Err(rejected(400, "REPLAY_DOF_MISMATCH", format!(
+                    "Episode '{}' arm_dof {ad} does not match active config arm_dof {}", input.request.episode, input.arm_dof
+                )));
+            }
+        }
+        if let Some(gj) = meta.gripper_joint {
+            if Some(gj) != input.gripper_idx {
+                return Err(rejected(400, "REPLAY_DOF_MISMATCH", format!(
+                    "Episode '{}' gripper_joint {gj} does not match active config gripper_joint {:?}", input.request.episode, input.gripper_idx
+                )));
+            }
+        }
+        if let Some(ref jn) = meta.joint_names {
+            if jn != &input.joint_names {
+                return Err(rejected(400, "REPLAY_DOF_MISMATCH", format!(
+                    "Episode '{}' joint_names do not match active config joint_names", input.request.episode
+                )));
+            }
+        }
+    }
     let frames = match crate::recording::read_frames_from_parquet(&input.path) {
         Ok(f) => f,
         Err(crate::recording::ParquetRecordingError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -391,7 +416,9 @@ impl SupervisorInner {
         Ok(ReplayInput {
             path,
             dof: self.config.dof,
+            arm_dof: self.config.arm_dof(),
             gripper_idx: self.config.gripper_index(),
+            joint_names: self.config.limits.iter().map(|l| l.name.clone()).collect(),
             limits: self.config.limits.clone(),
             speed_limits: self.planning_limits(),
             ws: self.workspace_policy().map(|(ws, cam)| (ws.clone(), cam.clone())),

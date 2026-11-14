@@ -724,7 +724,8 @@ fn replay_is_slowed_to_fit() {
     }).collect();
     let input = armd::replay::ReplayInput {
         request: armd::replay::ReplayRequest { episode: "swing".into(), speed: 1.0, gripper: false, tag: None },
-        path: std::path::PathBuf::from("/nonexistent"), dof: 7, gripper_idx: Some(6),
+        path: std::path::PathBuf::from("/nonexistent"), dof: 7, arm_dof: 6, gripper_idx: Some(6),
+        joint_names: inner.config.limits.iter().map(|l| l.name.clone()).collect(),
         limits: inner.config.limits.clone(), speed_limits: inner.planning_limits(), ws: None,
         arm: inner.config.arm_model.clone(), start: STRETCHED.to_vec(), control_hz: 50, epoch: inner.safety.epoch_id(),
         workspace_revision: 0, power: inner.power_budget().cloned(),

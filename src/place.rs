@@ -66,7 +66,7 @@ pub fn parse_place(inner: &SupervisorInner, body: &Value) -> Result<PlaceRequest
         let tcp = match (inner.config.arm_model.fk_f32(&stored.positions), &stored.tcp) {
             (Some(pose), _) => pose,
             (None, Some(t)) => Pose::new(kinematics::rpy_to_r(t.rpy[0], t.rpy[1], t.rpy[2]), t.position),
-            (None, None) if stored.positions.len() >= 6 => return Err(invalid(format!("pose '{name}' positions are not a valid joint vector"))),
+            (None, None) if stored.positions.len() >= inner.config.arm_dof() => return Err(invalid(format!("pose '{name}' positions are not a valid joint vector"))),
             (None, None) => return Err(invalid(format!("pose '{name}' has no TCP"))),
         };
         (Some(name.to_string()), tcp.p, Some(requested.unwrap_or(tcp.r)))
@@ -110,8 +110,8 @@ pub struct PlannedPlace {
 /// Under the lock: parse and check preconditions.
 pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<PendingPlace, ArmError> {
     if !body.is_object() { return Err(invalid("Command body must be an object")); }
-    if !inner.config.six_plus_gripper() || inner.config.kinematics.is_none() {
-        return Err(MotionError::Unsupported("Place needs a 7-DOF profile with kinematics and a gripper policy".into()).into());
+    if !inner.config.has_cartesian_with_gripper() || inner.config.kinematics.is_none() {
+        return Err(MotionError::Unsupported("Place needs an arm with kinematics and a gripper policy".into()).into());
     }
     let Some(policy) = inner.config.gripper_policy.as_ref() else {
         return Err(MotionError::Unsupported("Place needs a gripper policy".into()).into());

@@ -326,6 +326,27 @@ impl JawOpening {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+fn is_default_holding_mode(m: &HoldingMode) -> bool {
+    matches!(m, HoldingMode::TorqueAndGap)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldingMode {
+    #[default]
+    TorqueAndGap,
+    PositionGap,
+    LoadAndGap,
+}
+
 /// Gripper action parameters (`/api/v1/action/gripper`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GripperPolicy {
@@ -344,6 +365,12 @@ pub struct GripperPolicy {
     /// Angle-to-opening calibration mapping; absent by default (uses built-in sim model).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jaw_opening: Option<JawOpening>,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub zero_check_supported: bool,
+    #[serde(default, skip_serializing_if = "is_default_holding_mode")]
+    pub holding_mode: HoldingMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holding_load_fraction: Option<f32>,
 }
 
 impl GripperPolicy {
@@ -351,7 +378,18 @@ impl GripperPolicy {
     /// holding_torque_nm 0.0667 is the former 0.12 read with TMAX 18, converted to the
     /// J7 motor's real TMAX 10 (0.12 × 10 / 18).
     pub fn rebot_dm() -> Self {
-        Self { closed_rad: 0.0, open_rad: -5.7, holding_gap_rad: 0.30, holding_torque_nm: 0.0667, squeeze_rad: 0.15, settle_ms: 300, jaw_opening: None }
+        Self {
+            closed_rad: 0.0,
+            open_rad: -5.7,
+            holding_gap_rad: 0.30,
+            holding_torque_nm: 0.0667,
+            squeeze_rad: 0.15,
+            settle_ms: 300,
+            jaw_opening: None,
+            zero_check_supported: true,
+            holding_mode: HoldingMode::TorqueAndGap,
+            holding_load_fraction: None,
+        }
     }
 
     /// Jaw opening model (or the built-in uncalibrated sim default).
@@ -645,6 +683,9 @@ impl SpeedCap {
 /// Robotic arm hardware/control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArmConfig {
+    /// Optional profile identifier (e.g. "rebot_b601dm", "rebot_b601rs", "so_arm101").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
     /// Arm profile contract version; missing in older profiles, which are version 1.
     #[serde(default = "default_profile_version")]
     pub profile_version: u32,
@@ -779,6 +820,7 @@ impl Default for ArmConfig {
         let home_positions = vec![0.0; dof];
 
         Self {
+            profile_id: None,
             profile_version: ARM_PROFILE_VERSION,
             dof,
             joint_names,
@@ -838,6 +880,12 @@ impl ArmConfig {
     /// actions use: 6 arm joints followed by the gripper at index 6.
     pub fn six_plus_gripper(&self) -> bool {
         self.dof == 7 && self.arm_dof() == 6 && self.gripper_index() == Some(6)
+    }
+
+    /// Whether the configuration supports Cartesian actions with a trailing gripper
+    /// (5 or 6 arm joints + gripper at index arm_dof).
+    pub fn has_cartesian_with_gripper(&self) -> bool {
+        matches!(self.arm_dof(), 5 | 6) && self.gripper_index() == Some(self.arm_dof()) && self.dof == self.arm_dof() + 1
     }
 
     /// Profile uses the URDF chain for kinematics or gravity.
@@ -990,6 +1038,16 @@ impl ArmConfig {
         if self.uses_urdf() && (self.dof < self.arm_dof() || self.dof > self.arm_dof() + 1) {
             return Err(format!("the URDF chain has {} joints; dof must be {} or {} (with a gripper)", self.arm_dof(), self.arm_dof(), self.arm_dof() + 1));
         }
+        if self.kinematics.is_some() || self.gripper_joint.is_some() {
+            let valid = (self.gripper_index().is_none() && self.dof == self.arm_dof())
+                || (self.gripper_index() == Some(self.arm_dof()) && self.dof == self.arm_dof() + 1);
+            if !valid {
+                return Err(format!(
+                    "Invalid joint layout: arm has {} joints (dof {}), expected either {} arm joints (no gripper) or {} arm joints + gripper at index {}",
+                    self.arm_dof(), self.dof, self.arm_dof(), self.arm_dof(), self.arm_dof()
+                ));
+            }
+        }
         if let Some(ws) = &self.workspace { ws.validate()?; }
         let cam = &self.camera_mount;
         if !cam.rot_deg.is_finite() || !cam.tilt_deg.is_finite()
@@ -997,13 +1055,13 @@ impl ArmConfig {
             return Err("Invalid camera mount".into());
         }
         if let Some(g) = &self.gripper_policy {
-            let lim = if self.dof >= 7 { Some(&self.limits[6]) } else { None };
+            let lim = self.gripper_index().and_then(|idx| self.limits.get(idx));
             let in_lim = |v: f32| lim.is_some_and(|l| v >= l.min_position && v <= l.max_position);
             if ![g.closed_rad, g.open_rad, g.holding_gap_rad, g.holding_torque_nm, g.squeeze_rad].iter().all(|v| v.is_finite())
                 || !in_lim(g.closed_rad) || !in_lim(g.open_rad) || (g.closed_rad - g.open_rad).abs() < 0.1
                 || g.holding_gap_rad < 0.0 || g.holding_torque_nm < 0.0
                 || !(0.0..=0.5).contains(&g.squeeze_rad) || g.settle_ms == 0 || g.settle_ms > 5000 {
-                return Err("Invalid gripper policy (needs dof 7, open/closed inside the J7 limits, 0 <= squeeze_rad <= 0.5)".into());
+                return Err("Invalid gripper policy (open/closed inside the gripper joint limits, 0 <= squeeze_rad <= 0.5)".into());
             }
             if let Some(jo) = &g.jaw_opening {
                 jo.validate(lim).map_err(|e| format!("Invalid gripper policy: {e}"))?;
@@ -1100,6 +1158,7 @@ impl ArmConfig {
         let home_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0];
 
         Self {
+            profile_id: None,
             profile_version: ARM_PROFILE_VERSION,
             dof,
             joint_names,
@@ -1158,6 +1217,24 @@ impl ArmConfig {
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
+}
+
+/// Cartesian TCP pose and orientation of the end link in the base frame.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TcpState {
+    pub xyz_m: [f32; 3],
+    pub rpy_rad: [f32; 3],
+    pub quat_wxyz: [f32; 4],
+}
+
+/// Gripper state observation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GripperObs {
+    pub joint: usize,
+    pub rad: f32,
+    pub fraction: f32,
+    pub opening_m: Option<f32>,
+    pub stalled: bool,
 }
 
 /// Full arm telemetry / observation
@@ -1232,6 +1309,12 @@ pub struct ArmObservation {
     /// Gripper zero check state (`src/gripper_calib.rs`); null without a gripper policy or < 7 DOF.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gripper_zero: Option<GripperZeroObservation>,
+    /// Cartesian TCP pose and orientation of the end link in the base frame; null when kinematics is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<TcpState>,
+    /// Gripper joint state; null without a gripper joint and policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gripper: Option<GripperObs>,
 }
 
 /// Gripper zero state published in `observation.gripper_zero`.
@@ -1457,18 +1540,18 @@ impl Capabilities {
     /// Capabilities that follow from the profile alone. `gravity_comp` also depends on
     /// the driver and the URDF check; this sets it from the profile only.
     pub fn from_config(config: &ArmConfig) -> Self {
-        let seven = config.six_plus_gripper();
+        let arm_with_gripper = config.has_cartesian_with_gripper();
         let kin = config.kinematics.is_some();
         let six_arm = config.arm_dof() == 6 && matches!(config.dof, 6 | 7);
-        let gripper = config.dof >= 7 && config.gripper_policy.is_some();
+        let gripper = config.gripper_index().is_some() && config.gripper_policy.is_some();
         Self {
             version: CAPABILITIES_VERSION,
             profile_version: config.profile_version,
-            cartesian: seven && kin,
+            cartesian: arm_with_gripper && kin,
             workspace_check: kin && config.workspace.is_some(),
             gripper,
-            grasp: seven && kin && config.gripper_policy.is_some() && config.grasp.is_some(),
-            gravity_comp: seven && config.gravity_model.is_some() && config.gravity_comp.is_some(),
+            grasp: arm_with_gripper && kin && config.gripper_policy.is_some() && config.grasp.is_some(),
+            gravity_comp: config.six_plus_gripper() && config.gravity_model.is_some() && config.gravity_comp.is_some(),
             damiao_ranges: config.damiao_ranges.is_some(),
             servo_guard: true,
             diagnostics: true,
@@ -1479,7 +1562,7 @@ impl Capabilities {
             speed_cap: true,
             residual_torques: config.gravity_model.is_some() && six_arm,
             tick_stats: true,
-            place: seven && kin && config.gripper_policy.is_some(),
+            place: arm_with_gripper && kin && config.gripper_policy.is_some(),
             // The driver half is applied by ArmSupervisor::get_schema.
             collision_guard: config.gravity_model.is_some() && six_arm,
             safety_describe: true,
@@ -1496,11 +1579,18 @@ impl Capabilities {
 /// Observation schema for clients
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservationSchema {
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub arm_dof: usize,
+    #[serde(default)]
+    pub gripper_joint: Option<usize>,
+    #[serde(default)]
+    pub orientation_dof: usize,
     pub dof: usize,
     pub joint_names: Vec<String>,
     pub fields: Vec<SchemaField>,
     pub limits: Vec<JointLimit>,
-    /// Cartesian safety box enforced by the server (None = not checked).
     #[serde(default)]
     pub workspace: Option<WorkspacePolicy>,
     #[serde(default)]
@@ -1509,6 +1599,8 @@ pub struct ObservationSchema {
     pub kinematics: Option<KinematicsModel>,
     #[serde(default)]
     pub capabilities: Capabilities,
+    #[serde(default)]
+    pub gripper_policy: Option<GripperPolicy>,
     /// Effective servo-streaming speed cap per joint (rad/s): min(`servo_max_velocity`,
     /// joint limit); the joint limit where no cap applies. Empty in older schemas.
     #[serde(default)]
@@ -1541,7 +1633,22 @@ pub struct ObservationSchema {
 
 impl ObservationSchema {
     pub fn from_config(config: &ArmConfig) -> Self {
+        let orientation_dof = if config.kinematics.is_some() {
+            if config.arm_dof() >= 6 {
+                3
+            } else if config.arm_dof() == 5 {
+                2
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         Self {
+            profile_id: config.profile_id.clone(),
+            arm_dof: config.arm_dof(),
+            gripper_joint: config.gripper_index(),
+            orientation_dof,
             dof: config.dof,
             joint_names: config.joint_names.clone(),
             fields: vec![
@@ -1602,7 +1709,7 @@ impl ObservationSchema {
                 SchemaField {
                     name: "gravity_torques".to_string(),
                     dtype: "float32".to_string(),
-                    shape: vec![6],
+                    shape: vec![config.arm_dof()],
                     unit: Some("Nm".to_string()),
                 },
             ],
@@ -1611,6 +1718,7 @@ impl ObservationSchema {
             camera_mount: config.camera_mount.clone(),
             kinematics: config.kinematics,
             capabilities: Capabilities::from_config(config),
+            gripper_policy: config.gripper_policy.clone(),
             servo_max_velocity: config.servo_limits().iter().map(|l| l.max_velocity).collect(),
             servo_max_lead_rad: Some(config.servo_max_lead_rad),
             speed_cap: config.speed_cap,
