@@ -735,11 +735,12 @@ body.input-stick .cart-sticks { display: flex; }
 .vlab b { font-size: 11px; color: var(--sc-color-text-secondary); font-weight: 600; }
 .cbtn b { font: 600 10px var(--mono); color: var(--sc-color-text-tertiary); }
 .cbtn.pressed b { color: #fff; }
-.cart-side { display: grid; gap: 10px; }
+.cart-side { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; min-width: 0; }
 body.input-stick #step-seg { display: none; }
-.grip-slider { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px; font-size: 12px; color: var(--sc-color-text-secondary); }
+.grip-slider { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; font-size: 12px; color: var(--sc-color-text-secondary); min-width: 0; }
 .grip-slider b { color: var(--sc-color-primary-dark); margin-right: 3px; }
 .grip-slider output { font: 600 12px var(--mono); color: var(--sc-color-text); min-width: 36px; text-align: right; }
+.grip-slider input[type=range] { width: 100%; min-width: 0; }
 input[type=range] { -webkit-appearance: none; appearance: none; height: 6px; border-radius: 3px; touch-action: none;
   background: linear-gradient(to right, var(--sc-color-primary) var(--v, 0%), #e5ecd9 var(--v, 0%)); }
 input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; border-radius: 50%; background: #fff; border: 2px solid var(--sc-color-primary-dark); box-shadow: 0 1px 3px rgba(0,0,0,0.15); }
@@ -7478,7 +7479,7 @@ i18nHooks.push(() => { if (!$('pset').hidden) { posesRender(); poseNameCheck(); 
    to the finger travel via the profile gripper_policy (CFG.gripClosed / gripOpen). Renders at most
    ~30 fps and only when the pose, the scene or the camera changed.
    ================================================================= */
-const V3 = { open: false, init: null, T: null, r: null, scene: null, cam: null, ctl: null, root: null, solid: null, ghost: null,
+const V3 = window.V3 = { open: false, init: null, T: null, r: null, scene: null, cam: null, ctl: null, root: null, solid: null, ghost: null,
   extras: null, mode: '', dirty: true, last: 0, raf: 0, key: '', sceneAt: 0, renders: 0, ghostMat: null };
 const V3_FINGER_M = 0.0425; // URDF left/right_finger_joint upper limit (m)
 const V3_LINK_OF = { gripper_body: 'end_link', finger_L: 'left_finger', finger_R: 'right_finger' };

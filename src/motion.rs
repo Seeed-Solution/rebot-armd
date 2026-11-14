@@ -288,6 +288,18 @@ pub fn apply_auto_yaw(start_p: &[f64; 3], goal_p: &[f64; 3], mut target_r: kinem
     target_r
 }
 
+pub fn align_auto_yaw(goal_p: &[f64; 3], target_r: kinematics::Mat3) -> kinematics::Mat3 {
+    let r_target = (goal_p[0] * goal_p[0] + goal_p[1] * goal_p[1]).sqrt();
+    if r_target >= 0.03 && target_r[0][0].hypot(target_r[1][0]) >= 1e-6 {
+        let psi_goal = goal_p[1].atan2(goal_p[0]);
+        let psi_cur = target_r[1][0].atan2(target_r[0][0]);
+        let rz = kinematics::axis_r(&[0.0, 0.0, 1.0], psi_goal - psi_cur);
+        kinematics::mat_mul(&rz, &target_r)
+    } else {
+        target_r
+    }
+}
+
 /// Resolve a goal request against the start pose `fk(q0)`, returning `(pose, yaw_free)`.
 pub fn resolve_goal_ex(input: &PlanInput, spec: &GoalSpec) -> (Pose, bool) {
     let start = input.arm.fk(&input.q0);
@@ -303,7 +315,10 @@ pub fn resolve_goal_ex(input: &PlanInput, spec: &GoalSpec) -> (Pose, bool) {
         GoalSpec::AbsoluteEx { p, r, auto_yaw } => {
             let mut target_r = r.unwrap_or(start.r);
             if *auto_yaw && input.arm.arm_dof() == 5 {
-                target_r = apply_auto_yaw(&start.p, p, target_r);
+                target_r = match r {
+                    None => apply_auto_yaw(&start.p, p, start.r),
+                    Some(explicit_r) => align_auto_yaw(p, *explicit_r),
+                };
             }
             (Pose::new(target_r, *p), *auto_yaw)
         }

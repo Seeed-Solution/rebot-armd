@@ -188,6 +188,88 @@ fn test_5dof_move_relative_lateral_auto_yaw() {
 }
 
 #[test]
+fn test_5dof_place_planning_lateral() {
+    let config = load_so101_config();
+    let mut input = plan_input_at_home(&config);
+
+    // Verify GoalSpec::Absolute with explicit r resolves with yaw_free == false
+    let r_target = kinematics::rpy_to_r(0.0, 0.5, 0.0);
+    let (_strict_goal, strict_yaw_free) = motion::resolve_goal_ex(&input, &GoalSpec::Absolute {
+        p: [0.20, 0.08, 0.15],
+        r: Some(r_target),
+    });
+    assert!(!strict_yaw_free, "GoalSpec::Absolute with explicit r must have yaw_free == false");
+
+    // 1. Move to (0.20, 0.08, 0.15) with rpy=(0.0, 0.5, 0.0) and auto_yaw: true
+    let (goal_pose, yaw_free) = motion::resolve_goal_ex(&input, &GoalSpec::AbsoluteEx {
+        p: [0.20, 0.08, 0.15],
+        r: Some(r_target),
+        auto_yaw: true,
+    });
+    assert!(yaw_free);
+    let path1 = motion::plan_cartesian_ex(&input, goal_pose, Speed { linear: 0.05, angular: 1.0 }, yaw_free).unwrap();
+    let last = path1.last();
+    input.q0 = std::array::from_fn(|i| f64::from(last[i]));
+    println!("after move_to: q0 = {:?}", input.q0);
+
+    // Verify cross-azimuth move from non-zero-azimuth start with explicit r and auto_yaw: true
+    let cross_target_r = kinematics::rpy_to_r(0.0, 0.5, 0.0);
+    let (cross_goal, cross_yaw_free) = motion::resolve_goal_ex(&input, &GoalSpec::AbsoluteEx {
+        p: [0.20, -0.08, 0.15],
+        r: Some(cross_target_r),
+        auto_yaw: true,
+    });
+    assert!(cross_yaw_free);
+    let expected_psi = (-0.08_f64).atan2(0.20);
+    let actual_psi = cross_goal.r[1][0].atan2(cross_goal.r[0][0]);
+    assert!(
+        (actual_psi - expected_psi).abs() < 1e-6,
+        "tool X azimuth should align to atan2(-0.08, 0.20): got {actual_psi}, expected {expected_psi}"
+    );
+    let cross_path = motion::plan_cartesian_ex(&input, cross_goal, Speed { linear: 0.05, angular: 1.0 }, cross_yaw_free)
+        .expect("cross-azimuth move from non-zero-azimuth start should plan cleanly");
+    assert!(cross_path.q.len() >= 2);
+
+    // 2. Move relative dy = -0.04
+    let (goal_rel, yaw_free_rel) = motion::resolve_goal_ex(&input, &GoalSpec::Relative {
+        frame: RelFrame::Base,
+        d: [0.0, -0.04, 0.0],
+        dyaw: 0.0,
+        dpitch: 0.0,
+        droll: 0.0,
+        level: false,
+    });
+    let path2 = motion::plan_cartesian_ex(&input, goal_rel, Speed { linear: 0.05, angular: 1.0 }, yaw_free_rel).unwrap();
+    let last2 = path2.last();
+    input.q0 = std::array::from_fn(|i| f64::from(last2[i]));
+    println!("after move_relative: q0 = {:?}", input.q0);
+
+    let req = PlaceRequest {
+        target: [0.20, -0.06, 0.10],
+        approach_m: 0.05,
+        pose: None,
+        orientation: None,
+        speed_scale: 0.5,
+        release: true,
+        retreat: true,
+        tag: None,
+    };
+
+    let pending = PendingPlace {
+        input,
+        request: req,
+        open_rad: config.gripper_policy.as_ref().unwrap().open_rad,
+        held_spill_safe: false,
+        spill_max_tilt_deg: 8.0,
+    };
+
+    let planned = place::plan(pending).expect("lateral place planning on 5-DOF SO-101 should succeed");
+    assert!(planned.durations[1] > 0.0, "approach duration > 0");
+    assert!(planned.durations[2] > 0.0, "descend duration > 0");
+    assert!(planned.durations[3] > 0.0, "retreat duration > 0");
+}
+
+#[test]
 fn test_5dof_place_planning() {
     let config = load_so101_config();
     let input = plan_input_at_home(&config);

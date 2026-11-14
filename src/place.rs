@@ -147,6 +147,11 @@ pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
             let rz = kinematics::axis_r(&[0.0, 0.0, 1.0], dpsi);
             r_place = kinematics::mat_mul(&rz, &r_place);
         }
+        let [roll, pitch, yaw] = kinematics::r_to_rpy(&r_place);
+        let adapted_pitch = pitch.clamp(std::f64::consts::FRAC_PI_4, 1.25);
+        if (adapted_pitch - pitch).abs() > 1e-4 {
+            r_place = kinematics::rpy_to_r(roll, adapted_pitch, yaw);
+        }
     }
     let mut orientation_levelled = false;
     if held_spill_safe {
@@ -168,7 +173,8 @@ pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
     let z = lift_z(start.p[2], &request);
     let lift = if z - start.p[2] > LIFT_EPS_M { step(&mut cur, Pose::new(start.r, [start.p[0], start.p[1], z]))? } else { 0.0 };
     let approach = step(&mut cur, Pose::new(r_place, above(&request)))?;
-    let descend = step(&mut cur, Pose::new(r_place, request.target))?;
+    let r_descend = if is_5dof && request.orientation.is_none() { cur.arm.fk(&cur.q0).r } else { r_place };
+    let descend = step(&mut cur, Pose::new(r_descend, request.target))?;
     if request.release { cur.j7 = open_rad; }
     // as the runtime phase: straight up by approach_m from where descend ended, same orientation
     let retreat = if request.retreat {
@@ -227,7 +233,8 @@ async fn phases(ctx: &MacroCtx, planned: &PlannedPlace) -> Result<(), Stop> {
     ctx.move_arm("approach", GoalSpec::AbsoluteEx { p: above(req), r: Some(planned.r_place), auto_yaw: yaw_free }, speed).await?;
 
     ctx.phase("descend", 0.55).await?;
-    ctx.move_arm("descend", GoalSpec::AbsoluteEx { p: req.target, r: Some(planned.r_place), auto_yaw: yaw_free }, speed).await?;
+    let r_descend = if is_5dof && req.orientation.is_none() { None } else { Some(planned.r_place) };
+    ctx.move_arm("descend", GoalSpec::AbsoluteEx { p: req.target, r: r_descend, auto_yaw: yaw_free }, speed).await?;
 
     if req.release { ctx.gripper_phase("open", 0.75, GripperCommand::Open).await?; }
 
