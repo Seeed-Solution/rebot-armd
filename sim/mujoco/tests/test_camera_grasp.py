@@ -25,7 +25,7 @@ import mujoco
 import numpy as np
 import pytest
 
-from rebot_sim.camera import CameraMount, axis_r, mount_rotation
+from rebot_sim.camera import DETECTION_SIZE, CameraMount, DepthModel, axis_r, mount_rotation
 from rebot_sim.model import load_model
 from rebot_sim.server import PROTOCOL_VERSION
 from test_armd_sim import PROFILE, TOOL_DOWN, Client, armd_binary, free_port
@@ -99,13 +99,27 @@ CASES = {
     # cube's box sits at u 0.24 and the predicted −20 mm shift reaches the image border, so the
     # probe falls back to up with height_reason lateral_fallback:border)
     "axis_cube_lateral": (AXIS_LENS, None),
+    # depth_*: the simulator's depth pipeline (--depth, camera.DepthModel) on the axis_cube scene.
+    # metric_decides: height_sources [depth, probe], depth decides from the metric_table anchor;
+    # metric_record_only: default setup, the probe decides and depth is recorded; scale_rejected:
+    # a metric model 50 % off armd's prior (calibrate_depth rejects > 12 %), the probe decides;
+    # relative: an affine model (disp = 2.7 / Z + 0.45), height_sources [depth, probe]: the view
+    # at 0.25 m and the overhead frame at 0.15 m are two heights (two_height_fk)
+    "depth_metric_decides": ([*AXIS_LENS, "--depth", "metric"], None),
+    "depth_metric_record_only": ([*AXIS_LENS, "--depth", "metric"], None),
+    "depth_metric_scale_rejected": ([*AXIS_LENS, "--depth", "metric", "--depth-scale", "1.5"], None),
+    "depth_relative": ([*AXIS_LENS, "--depth", "relative"], None),
 }
+# generator model per depth case (the simulator's --depth options) and the setup patch
+DEPTH_MODELS = {"depth_metric_decides": DepthModel("metric"), "depth_metric_record_only": DepthModel("metric"),
+                "depth_metric_scale_rejected": DepthModel("metric", scale=1.5), "depth_relative": DepthModel("relative")}
+DEPTH_DECIDES = {"depth_metric_decides", "depth_metric_scale_rejected", "depth_relative"}
 # object the case grasps (default: the cube) and its height (scene.py KINDS)
 TARGETS = {"axis_cup": "cup", "axis_block": "block", "axis_slab": "slab", "axis_cube_preopen": "cube", "axis_cube_lateral": "cube"}
 HEIGHTS_M = {"cube": 0.04, "cup": 0.07, "block": 0.04, "slab": 0.02}
 # approach height per case (default: v8 0.15 m, v5 0.25 m); axis_cube / axis_cup 0.15 m; axis_block
 # 0.20 m (at 0.15 m the 6 cm block's box reaches the image border and the J6 alignment is skipped)
-APPROACH_M = {"axis_cube": 0.15, "axis_cup": 0.15, "axis_block": 0.20, "axis_slab": 0.15, "axis_cube_preopen": 0.15,
+APPROACH_M = {**{c: 0.15 for c in DEPTH_MODELS}, "axis_cube": 0.15, "axis_cup": 0.15, "axis_block": 0.20, "axis_slab": 0.15, "axis_cube_preopen": 0.15,
               "axis_cube_lateral": 0.20}
 
 
@@ -187,14 +201,28 @@ def test_tap_to_grasp_the_cube(cam_rig):
     time.sleep(0.3)
 
     # detection through armd's proxy (single trigger, perception API 2)
+    model = DEPTH_MODELS.get(case)
+    if model is not None:  # preflight: armd sees the simulator's depth model
+        mode = http(client.base + "/api/v1/vision/mode")
+        print(f"\npreflight: available {mode.get('available')} depth_model {mode.get('depth_model')}")
+        assert mode["available"].get("depth") is True and mode["depth_model"]["metric"] == model.metric, mode
     for _ in range(5):  # a noisy detector may miss the cube in a frame (--det-drop-rate)
-        det = http(client.base + "/api/v1/detection/trigger?wait_ms=2000", {"pipelines": ["yolo"]})
+        det = http(client.base + "/api/v1/detection/trigger?wait_ms=2000",
+                   {"pipelines": ["yolo", "depth"] if model is not None else ["yolo"]})
         print(f"\ntrigger via armd: frame {det.get('frame_id')} detections {det.get('detections')}")
         cubes = [d for d in det["detections"] if d["class_name"] == target]
         if cubes:
             break
     assert cubes, det
     d = cubes[0]
+    if model is not None:  # one depth response at the view pose: table samples and their inverse-Z spread
+        samples = np.array(det["depth"]["table_samples"])
+        inv_z = model.inverse_z(samples[:, 2], cam["fx_px"] / DETECTION_SIZE[0]) if len(samples) else np.zeros(1)
+        print(f"preflight depth at the view pose: {len(samples)} table samples, inverse-Z {inv_z.min():.3f}..{inv_z.max():.3f} "
+              f"(spread {inv_z.max() - inv_z.min():.3f}) 1/m; cube disp_fg {d.get('disp_fg')} disp_bg {d.get('disp_bg')} "
+              f"length_px {d.get('length_px')} jaw_clear {d.get('jaw_clear')}")
+        assert det["pipelines"]["depth"]["ran"] and det["depth"]["metric_model"] == model.metric, det
+        assert len(samples) >= (3 if model.metric else 8), det["depth"]
     box = [min(1.0, max(0.0, v)) for v in (d["x"] - d["w"] / 2, d["y"] - d["h"] / 2, d["x"] + d["w"] / 2, d["y"] + d["h"] / 2)]
     schema = http(client.base + "/api/v1/observation/schema")
     print(f"schema vision caps: {schema.get('capabilities', {}).get('vision')}")
@@ -209,6 +237,8 @@ def test_tap_to_grasp_the_cube(cam_rig):
         overrides["pre_open"] = "on"
     if case == "axis_cube_lateral":
         overrides["height_probe_mode"] = "lateral"
+    if case in DEPTH_DECIDES:
+        overrides["height_sources"] = ["depth", "probe"]
     t0 = time.time()
     ack = client.command("/api/v1/action/grasp", {"label": target, "box_norm": box, "frame_id": det["frame_id"],
                                                   "overrides": overrides})
@@ -243,6 +273,31 @@ def test_tap_to_grasp_the_cube(cam_rig):
           f"align={r.get('align')} recentre={r.get('recentre')} post_lift={r.get('post_lift')} grasp_width_m={r.get('grasp_width_m')} "
           f"pre_open={r.get('pre_open')} pre_open_m={r.get('pre_open_m')} held_width_m={r.get('held_width_m')}")
     print(f"{target} after the grasp: {cube}")
+    if model is not None:
+        truth = cube["height_m"]
+        dep = [e for e in r.get("height_estimates") or [] if e["source"].startswith("depth")]
+        print(f"height_estimates: {json.dumps(r.get('height_estimates'))}")
+        print(f"depth: anchor={r.get('depth_anchor')} object_depth_m={r.get('object_depth_m')} object_length_m={r.get('object_length_m')} "
+              f"jaw_clear={r.get('jaw_clear')}; depth entry {dep}; object_height_m {r.get('object_height_m')} vs truth {truth} "
+              f"(error {None if r.get('object_height_m') is None else round((r['object_height_m'] - truth) * 1000, 2)} mm)"
+              + "".join(f"; depth entry error {(e['value'] - truth) * 1000:.2f} mm" for e in dep if e.get("value") is not None))
+        assert len(dep) == 1, json.dumps(rec)
+        e = dep[0]
+        if case == "depth_metric_scale_rejected":
+            # the table contradicts the metric prior: no depth anchor, the probe decides
+            assert e["source"] == "depth" and e["value"] is None and e["reason"] == "no_measurement", json.dumps(rec)
+            assert r.get("depth_anchor") is None and r["height_source"] == "scale", json.dumps(rec)
+        else:
+            # a depth measurement with an anchor; a fallback without one fails the case
+            assert e["source"].startswith("depth:") and e["value"] is not None, json.dumps(rec)
+            if case == "depth_metric_record_only":
+                assert e["source"] == "depth:metric_table" and e["record_only"] and not e["used"], json.dumps(rec)
+                assert r["height_source"] == "scale" and abs(e["value"] - truth) <= 0.01, json.dumps(rec)
+            else:
+                assert e["used"] and r["height_source"] == "depth" and r.get("probe_dz_m") is None, json.dumps(rec)
+                anchor = "metric_table" if model.metric else ("two_height_fk", "oblique_ransac")
+                assert r["depth_anchor"] in (anchor if isinstance(anchor, tuple) else (anchor,)), json.dumps(rec)
+                assert abs(r["object_height_m"] - truth) <= (0.005 if model.metric else 0.01), json.dumps(rec)
     if case == "axis_slab":
         print(f"slab final status: {json.dumps(rec)}")
         assert rec is not None and rec["state"] == "failed" and rec["code"] == "TOO_WIDE", json.dumps(rec)

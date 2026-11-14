@@ -6,7 +6,12 @@
   the fixed overview camera when it is enabled.
 - HTTP `:<perception-port>` (default 8090): rebot-vision perception API version 2
   (rebot-armd docs/detection_api.md) with detections computed from the simulator's ground
-  truth, plus `POST /sim/reset`, `GET /sim/state`, `GET /sim/camera`.
+  truth, plus `POST /sim/reset`, `GET /sim/state`, `GET /sim/camera`. With a depth model
+  (`--depth metric|relative`, camera.DepthModel) the trigger also accepts the `depth` pipeline
+  (trigger-only, as rebot-vision on demand): detections then carry disp_fg / disp_bg / depth_conf
+  / length_px / jaw_clear and the body a `depth` object with table_samples, computed from the
+  rendered depth and the ground-truth masks (camera.depth_result). Box noise does not change
+  the depth fields; detections without a mask (false detections) get none.
 """
 from __future__ import annotations
 
@@ -160,8 +165,11 @@ def serve_video(host: str, port: int, streams: dict[str, VideoStream]):
 class Perception:
     """Perception API v2 state: default subscription (mode), subscriptions, frames, triggers."""
 
-    def __init__(self, max_fps: int):
+    def __init__(self, max_fps: int, depth=None):
         self.max_fps = max_fps
+        self.depth_model = depth if depth is not None and depth.enabled else None
+        # "depth" only with a depth model: without one every body is as before
+        self.pipelines = PIPELINES + ("depth",) if self.depth_model else PIPELINES
         self.mode, self.enabled, self.last_active = "off", False, "yolo"
         self.subs: dict[str, dict] = {}
         self._ids = itertools.count(1)
@@ -219,14 +227,22 @@ class Perception:
                 "expires_in_ms": max(0, int((s["expires"] - time.monotonic()) * 1000))}
 
     # ---- frames
+    def wants_depth(self, captured: float) -> bool:
+        """A registered trigger asks for depth on a frame captured at `captured` (the plan of
+        that frame will include it): the render thread then renders depth for it."""
+        with self.cond:
+            return self.depth_model is not None and any(
+                "depth" in t["pipelines"] and t["called"] < captured for t in self.pending)
+
     def on_frame(self, frame_id: int, ts_ms: int, captured: float, detections: list[dict],
-                 physics_time: float = 0.0, physics_step: int = 0) -> None:
+                 physics_time: float = 0.0, physics_step: int = 0, depth: dict | None = None) -> None:
         """A rendered wrist frame (called by the render thread); `captured` = time.monotonic()
-        when the simulator state (physics step `physics_step` at `physics_time` s) was copied."""
+        when the simulator state (physics step `physics_step` at `physics_time` s) was copied.
+        `depth`: camera.depth_result of the same render (with its physics_step), or None."""
         now = time.monotonic()
         with self.cond:
             self.frame = {"frame_id": frame_id, "ts_ms": ts_ms, "mono": captured, "detections": detections,
-                          "physics_time": round(physics_time, 6), "physics_step": physics_step}
+                          "physics_time": round(physics_time, 6), "physics_step": physics_step, "depth": depth}
             self.frames_in = [t for t in self.frames_in if now - t < 2.0] + [now]
             # One plan per frame, as rebot-vision's frame_plan: the continuous pipelines when the
             # rate lets this frame through, plus those of every trigger registered before it.
@@ -245,21 +261,34 @@ class Perception:
                 if self.mask_focus is not None:
                     frame_focus = self.mask_focus
             if plan:
-                self.latest = self.result(self.frame, [p for p in PIPELINES if p in plan], focus=frame_focus)
+                self.latest = self.result(self.frame, [p for p in self.pipelines if p in plan], focus=frame_focus)
                 self.results_out = [t for t in self.results_out if now - t < 2.0] + [now]
             self.cond.notify_all()
 
     def result(self, frame: dict, pipelines: list[str], focus: dict | None = None) -> dict:
-        ran = {p: p in pipelines for p in PIPELINES}
+        ran = {p: p in pipelines for p in self.pipelines}
+        depth = frame.get("depth")
+        if "depth" in ran:  # depth runs only on a frame whose depth render belongs to it
+            ran["depth"] = ran["depth"] and depth is not None and depth.get("physics_step") == frame["physics_step"]
         detections = _apply_mask_focus(frame["detections"], focus) if ran["yolo"] else []
-        return {
+        if ran.get("depth"):
+            detections = [{**d, **depth["objects"][d.get("name")]} if d.get("name") in depth["objects"] else d
+                          for d in detections]
+        body = {
             "api_version": API_VERSION, "success": True, "mode": self.mode, "frame_id": frame["frame_id"],
             "ts_ms": frame["ts_ms"], "mono": frame["mono"], "physics_time": frame["physics_time"],
             "physics_step": frame["physics_step"], "inference_time_ms": 0.1, "width": 640, "height": 360,
-            "pipelines": {p: {"ran": ran[p], "ms": 0.1 if ran[p] else 0.0} for p in PIPELINES},
+            "pipelines": {p: {"ran": ran[p], "ms": 0.1 if ran[p] else 0.0} for p in self.pipelines},
             "detections": detections,
             "count": 0, "family": "aruco4x4_50", "undistorted": False, "rejected": 0, "markers": [],
         }
+        if ran.get("depth"):
+            from .camera import DEPTH_GRID  # mujoco: imported only where depth runs
+
+            gw, gh = DEPTH_GRID
+            body["depth"] = {"metric_model": self.depth_model.metric, "grid_w": gw, "grid_h": gh,
+                             "table_samples": [list(t) for t in depth["table_samples"]]}
+        return body
 
     @staticmethod
     def public(body: dict) -> dict:
@@ -271,7 +300,7 @@ class Perception:
     def mode_body(self) -> dict:
         cont = self.continuous()
         now = time.monotonic()
-        return {
+        body = {
             "api_version": API_VERSION, "mode": self.mode, "modes": list(MODES),
             "pipelines": {"yolo": True, "aruco": True}, "last_active_mode": self.last_active,
             "enabled": self.enabled, "processing": cont["active"], "fps": cont["fps"] or IDLE_FPS,
@@ -283,6 +312,11 @@ class Perception:
             "model": {"name": "rebot-sim-ground-truth", "path": None, "mask_max_boxes": 3}, "family": "aruco4x4_50",
             "mask_focus": self.mask_focus_body(),
         }
+        if self.depth_model:
+            dm = self.depth_model
+            body["pipelines"]["depth"] = body["available"]["depth"] = True
+            body["depth_model"] = {"name": f"rebot-sim-depth-{dm.kind}", "path": f"sim:{dm.kind}", "metric": dm.metric}
+        return body
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -350,10 +384,10 @@ def _wait_ms(qs: dict, body: dict, default: int) -> int:
     return max(0, min(5000, v))
 
 
-def _pipelines(v) -> list[str]:
-    if not isinstance(v, list) or not v or any(p not in PIPELINES for p in v):
-        raise ValueError("pipelines must be a non-empty list of yolo / aruco")
-    return [p for p in PIPELINES if p in v]
+def _pipelines(v, allowed: tuple[str, ...] = PIPELINES) -> list[str]:
+    if not isinstance(v, list) or not v or any(p not in allowed for p in v):
+        raise ValueError(f"pipelines must be a non-empty list of {' / '.join(allowed)}")
+    return [p for p in allowed if p in v]
 
 
 class PerceptionServer:
@@ -473,7 +507,7 @@ class PerceptionServer:
         p = self.p
         wait = _wait_ms(qs, body, 2500)
         with p.cond:
-            req = _pipelines(body["pipelines"]) if "pipelines" in body else None
+            req = _pipelines(body["pipelines"], p.pipelines) if "pipelines" in body else None
             pipes = req if req is not None else (MODE_PIPELINES[p.mode] or MODE_PIPELINES[p.last_active])
             called = time.monotonic()
             after = p.latest["frame_id"] if p.latest else 0
@@ -671,7 +705,8 @@ class CameraRig:
         self.streams = {"/": VideoStream()}
         if cfg["scene_stream"]:
             self.streams["/scene"] = VideoStream()
-        self.perception = Perception(max_fps=min(15, self.fps))
+        self.depth_model = cam.DepthModel(**cfg.get("depth", {}))
+        self.perception = Perception(max_fps=min(15, self.fps), depth=self.depth_model)
         self.noise = cam.DetNoise(**cfg.get("noise", {}))
         self.labels = [(i, o.kind) for i, o in enumerate(objects)]  # what a false detection may be
         self.delayed: list[tuple] = []  # frames (on_frame arguments) waiting out noise.latency_ms
@@ -682,6 +717,9 @@ class CameraRig:
         self.seg_consecutive = 0
         self.seg_last_error: str | None = None
         self.render_ms: list[float] = []
+        self.depth_ms: list[float] = []  # depth render + fields, frames that had a depth trigger
+        self.depth_failures = 0  # depth renders with non-finite or non-positive Z (frame gets no depth)
+        self.frame_depth: dict | None = None  # depth_result of the newest detect(want_depth=True)
         self.backend = os.environ.get("MUJOCO_GL", "default")
         self._cam = cam
 
@@ -715,6 +753,9 @@ class CameraRig:
             "fx_px": round(cam.focal_px(cam.DETECTION_SIZE[1]), 2),
             "grip_pixel_norm_at": {f"{h:.2f}": cam.grip_pixel_norm(r, m.offset, h) for h in (0.10, 0.12, 0.15, 0.18, 0.20, 0.25, 0.30)},
             "render_backend": self.backend, "render": self.stats(),
+            "depth": {"kind": self.depth_model.kind, "scale": self.depth_model.scale, "noise_rel": self.depth_model.noise_rel,
+                      "a": self.depth_model.a, "b": self.depth_model.b, "conf": self.depth_model.conf,
+                      "grid": list(cam.DEPTH_GRID), "failures": self.depth_failures},
         }
 
     def setup(self) -> None:
@@ -744,10 +785,13 @@ class CameraRig:
 
     SEG_MAX_CONSECUTIVE = 10
 
-    def detect(self) -> list[dict] | None:
+    def detect(self, want_depth: bool = False, physics_step: int = 0) -> list[dict] | None:
         """Ground-truth detections of the wrist view of self.data, or None when the segmentation
         render failed (logged and counted; the frame then gets no result). Raises RuntimeError
-        after SEG_MAX_CONSECUTIVE failures in a row."""
+        after SEG_MAX_CONSECUTIVE failures in a row. `want_depth` (with a depth model): a second
+        pass on the same scene renders depth, and self.frame_depth gets its depth_result tagged
+        with `physics_step` (None when the depth was not finite)."""
+        self.frame_depth = None
         r = self.seg_renderer
         r.update_scene(self.data, camera="wrist", scene_option=self.opt)
         try:
@@ -764,6 +808,16 @@ class CameraRig:
                 raise RuntimeError(f"segmentation failed on {self.seg_consecutive} consecutive frames: {exc!r}") from exc
             return None
         self.seg_consecutive = 0
+        if want_depth and self.depth_model.enabled:
+            t0 = time.perf_counter()
+            z = self._cam.render_depth(r)  # same mjvScene as the segmentation: same physics state
+            d = self._cam.depth_result(ids, z, self.scene, self.depth_model, self.frame_id + 1)
+            if d["finite"]:
+                self.frame_depth = {**d, "physics_step": physics_step}
+            else:
+                self.depth_failures += 1
+                print(f"rebot-sim camera: depth render not finite on frame {self.frame_id + 1}", file=sys.stderr, flush=True)
+            self.depth_ms = (self.depth_ms + [(time.perf_counter() - t0) * 1000])[-100:]
         return self._cam.detections(ids, self.scene)
 
     def publish_frame(self, frame: tuple) -> None:
@@ -793,11 +847,11 @@ class CameraRig:
                 captured = time.monotonic()
                 ts_ms = int(time.time() * 1000)
                 mujoco.mj_forward(self.model, self.data)
-                dets = self.detect()
+                dets = self.detect(self.perception.wants_depth(captured), step)
                 self.frame_id += 1
                 if dets is not None:  # a failed segmentation: the video frame goes out, no result
                     dets = self._cam.perturb(dets, self.noise, self.frame_id, self.labels)
-                    self.publish_frame((self.frame_id, ts_ms, captured, dets, self.data.time, step))
+                    self.publish_frame((self.frame_id, ts_ms, captured, dets, self.data.time, step, self.frame_depth))
                 for path, stream in self.streams.items():
                     if not stream.active:
                         continue
@@ -816,8 +870,12 @@ class CameraRig:
 
     def stats(self) -> dict:
         ms = np.array(self.render_ms) if self.render_ms else np.zeros(1)
-        return {"frames": self.frame_id, "frame_ms_mean": round(float(ms.mean()), 2),
-                "frame_ms_max": round(float(ms.max()), 2)}
+        out = {"frames": self.frame_id, "frame_ms_mean": round(float(ms.mean()), 2),
+               "frame_ms_max": round(float(ms.max()), 2)}
+        if self.depth_ms:
+            out["depth_ms_mean"] = round(float(np.mean(self.depth_ms)), 2)
+            out["depth_frames"] = len(self.depth_ms)
+        return out
 
 
 def camera_main(cfg: dict, shm_name: str, lock, nq: int, nv: int, conn, ready_conn, parent_pid: int) -> None:
