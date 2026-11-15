@@ -1644,15 +1644,15 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
 
                 let all_replied = replied_ids.len() == inc_chunk.len();
                 let inc_timed_out = inc_ts.elapsed() >= INCOMPLETE_FRAME_TTL;
-                let has_incomplete = feetech::has_partial_frame_header(&self.partial_pos_rx);
 
-                if !all_replied && !inc_timed_out && has_incomplete {
+                if !all_replied && !inc_timed_out {
                     if let Some(tail) = feetech::trailing_partial_frame(&self.partial_pos_rx) {
-                        let tail_vec = tail.to_vec();
-                        self.partial_pos_rx = tail_vec;
+                        self.partial_pos_rx = tail.to_vec();
+                        self.incomplete_chunk_idx = Some(inc_idx);
+                        self.incomplete_frame_started_at = Some(inc_ts);
+                    } else {
+                        self.invalidate_partial_pos_rx();
                     }
-                    self.incomplete_chunk_idx = Some(inc_idx);
-                    self.incomplete_frame_started_at = Some(inc_ts);
                 } else {
                     self.invalidate_partial_pos_rx();
                 }

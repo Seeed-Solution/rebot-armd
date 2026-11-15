@@ -177,9 +177,6 @@ impl Transport for MockTransport {
     fn clear_input_buffer(&mut self) {
         self.clear_input_count += 1;
         if !self.preserve_on_clear {
-            if std::thread::current().name() == Some("test_feetech_driver_mock_loopback") {
-                return;
-            }
             self.rx_buffer.clear();
             self.staged_reads.clear();
         }

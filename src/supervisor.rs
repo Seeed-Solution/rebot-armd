@@ -546,21 +546,19 @@ impl SupervisorInner {
         }
     }
 
-    fn apply_driver_limits(&mut self, driver: &dyn ArmDriver) {
+    pub fn apply_driver_limits(&mut self, driver: &dyn ArmDriver) {
         let vel: Vec<_> = (0..self.config.dof).map(|i| driver.max_command_velocity(i)).collect();
         let pos: Vec<_> = (0..self.config.dof).map(|i| driver.position_limits(i)).collect();
         self.apply_extracted_driver_limits(&vel, &pos);
     }
 
-    fn apply_extracted_driver_limits(
+    pub fn apply_extracted_driver_limits(
         &mut self,
         vel_limits: &[Option<f32>],
         pos_limits: &[Option<(f32, f32)>],
     ) {
         self.driver_config_error = None;
         let mut candidate = self.config.clone();
-        let orig_limits = self.config.limits.clone();
-        let mut narrowed_joints = Vec::new();
 
         for (i, limit) in candidate.limits.iter_mut().enumerate() {
             if let Some(Some(max)) = vel_limits.get(i) {
@@ -605,7 +603,6 @@ impl SupervisorInner {
                         "Intersected joint '{}' position limits with driver range: profile=[{:.4}, {:.4}], hw=[{:.4}, {:.4}] -> [{:.4}, {:.4}]",
                         limit.name, limit.min_position, limit.max_position, d_min, d_max, new_min, new_max
                     );
-                    narrowed_joints.push(i);
                 }
                 limit.min_position = new_min;
                 limit.max_position = new_max;
@@ -622,31 +619,9 @@ impl SupervisorInner {
                 tracing::warn!("Driver limits invalidated outdated calibrated gripper policy; reverting to base uncalibrated policy");
                 self.gripper_calib_invalid = true;
                 self.gripper_calib_offset = None;
+                self.gripper_calib_jaw_opening = None;
                 self.config.gripper_policy = self.base_gripper_policy.clone();
                 candidate = base_test;
-            }
-        }
-
-        if candidate.validate().is_err() {
-            for &i in &narrowed_joints {
-                let mut test_skip = candidate.clone();
-                test_skip.limits[i] = orig_limits[i].clone();
-                if test_skip.validate().is_err() && self.base_gripper_policy.is_some() {
-                    test_skip.gripper_policy = self.base_gripper_policy.clone();
-                }
-                if test_skip.validate().is_ok() {
-                    tracing::warn!(
-                        "Driver limits for joint '{}' conflict with home position or gripper policy; skipping narrowing for this joint to maintain non-bricking operation",
-                        orig_limits[i].name
-                    );
-                    if test_skip.gripper_policy != candidate.gripper_policy {
-                        self.gripper_calib_invalid = true;
-                        self.gripper_calib_offset = None;
-                        self.config.gripper_policy = self.base_gripper_policy.clone();
-                    }
-                    candidate = test_skip;
-                    break;
-                }
             }
         }
 

@@ -3217,7 +3217,7 @@ fn test_feetech_partial_rx_frame_survives_50hz_tick_gap() {
 
     // Provide remaining bytes
     driver.transport_mut().provide_rx(&resp1[4..]);
-    let states = driver.read_joint_states().expect("Reassembly must survive 22ms tick gap");
+    let states = driver.read_joint_states().expect("Reassembly must survive 18ms tick gap");
     assert_eq!(states.len(), 1);
     assert_eq!(driver.incomplete_chunk_idx(), None);
     assert!(driver.feedback_ages()[0].is_some_and(|a| a < Duration::from_millis(60)));

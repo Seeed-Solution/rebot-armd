@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget};
 use armd::model::{ArmConfig, GravityModel, JointLimit, JointState, RestingPosePolicy};
 use armd::{ArmSupervisor, SafetyState, SupervisorInner};
-use armd::safety::FaultReason;
+use armd::safety::{FaultCode, FaultReason};
 
 struct Hardware {
     states: Vec<JointState>,
@@ -463,4 +463,139 @@ async fn test_estop_during_bus_loss_preserves_bus_loss_and_requires_two_stage_cl
     let state2 = supervisor.clear_fault().await.unwrap();
     assert_eq!(state2, SafetyState::Idle);
     assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::Idle);
+}
+
+struct DynamicLimitsDriver {
+    limits: Arc<Mutex<Vec<Option<(f32, f32)>>>>,
+}
+
+impl ArmDriver for DynamicLimitsDriver {
+    fn capabilities(&self) -> DriverCapabilities {
+        DriverCapabilities {
+            velocity_feedback: true,
+            torque_feedback: false,
+            temperature_feedback: false,
+            torque_feedforward: false,
+            enable_feedback: true,
+            load_feedback: false,
+        }
+    }
+    fn enable_state(&self) -> EnableState {
+        EnableState::Disabled
+    }
+    fn is_feedback_valid(&self) -> bool {
+        true
+    }
+    fn feedback_ages(&self) -> Vec<Option<Duration>> {
+        vec![Some(Duration::ZERO)]
+    }
+    fn position_limits(&self, joint: usize) -> Option<(f32, f32)> {
+        self.limits.lock().unwrap().get(joint).copied().flatten()
+    }
+    fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+        Ok(vec![JointState::default()])
+    }
+    fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        Ok(())
+    }
+    fn set_torque(&mut self, _on: bool) -> Result<(), ArmDriverError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_apply_driver_limits_gripper_narrowing_invalidates_calib_and_falls_back() {
+    let config = ArmConfig::rebot_dm();
+    let j7_idx = config.gripper_index().unwrap();
+    let base_policy = config.gripper_policy.clone().unwrap();
+
+    let supervisor = Arc::new(ArmSupervisor::new(config));
+    let mut inner = supervisor.inner().write().await;
+
+    // Apply initial calibrated offset within DM limits [-5.75, 0.10]:
+    // base closed=0.0, open=-5.7. With offset 0.05 -> closed=0.05, open=-5.65.
+    inner.apply_gripper_calibration(Some(0.05), None).unwrap();
+    assert_eq!(inner.gripper_calib_offset, Some(0.05));
+    assert!(!inner.gripper_calib_invalid);
+    assert_ne!(inner.config.gripper_policy, Some(base_policy.clone()));
+
+    // Driver narrows gripper joint limit to [-5.75, 0.02]:
+    // Calibrated policy (closed=0.05 > 0.02) fails candidate.validate().
+    // Base policy (closed=0.0 <= 0.02) passes candidate.validate().
+    let mut pos_limits: Vec<Option<(f32, f32)>> = vec![None; 7];
+    pos_limits[j7_idx] = Some((-5.75, 0.02));
+    let vel_limits = vec![None; 7];
+
+    inner.apply_extracted_driver_limits(&vel_limits, &pos_limits);
+
+    // Invariants:
+    // Outdated calibration must be invalidated and cleared
+    assert!(inner.gripper_calib_invalid, "gripper_calib_invalid must be true");
+    assert_eq!(inner.gripper_calib_offset, None, "gripper_calib_offset must be None");
+    assert_eq!(inner.gripper_calib_jaw_opening, None, "gripper_calib_jaw_opening must be None");
+    // Falls back cleanly to base_gripper_policy
+    assert_eq!(inner.config.gripper_policy, Some(base_policy), "Must fall back to base_gripper_policy");
+    // driver_config_error must be None (without faulting)
+    assert!(inner.driver_config_error.is_none(), "driver_config_error must be None");
+    assert!(!inner.safety.state().is_stopped(), "Must not fault on clean fallback");
+    assert!(inner.safety.fault().is_none(), "Must not have fault info on clean fallback");
+    assert_eq!(inner.config.limits[j7_idx].max_position, 0.02, "Gripper max_position must be narrowed");
+}
+
+#[tokio::test]
+async fn test_apply_driver_limits_home_positions_conflict_fails_closed_and_recovers() {
+    let mut config = ArmConfig::default();
+    config.dof = 1;
+    config.limits = vec![JointLimit::new("axis", -2.0, 2.0, 2.0, 5.0)];
+    config.home_positions = vec![0.0];
+
+    let limits_holder = Arc::new(Mutex::new(vec![Some((0.5, 1.5))]));
+    let driver = Box::new(DynamicLimitsDriver {
+        limits: limits_holder.clone(),
+    });
+
+    let supervisor = Arc::new(ArmSupervisor::new(config).with_driver(driver));
+
+    // Initially, driver limit [0.5, 1.5] conflicts with home_positions[0] = 0.0.
+    {
+        let inner = supervisor.inner().read().await;
+        // 1. driver_config_error must be Some
+        assert!(inner.driver_config_error.is_some(), "driver_config_error must be Some on conflict with home_positions");
+        let err_msg = inner.driver_config_error.as_ref().unwrap();
+        assert!(err_msg.contains("conflict") || err_msg.contains("violated"));
+
+        // 2. FaultCode::JointLimit must be latched
+        assert_eq!(inner.safety.fault().map(|f| f.code), Some(FaultCode::JointLimit));
+
+        // 3. Hardware limit NOT dropped: config was NOT updated to silently discard EEPROM limits
+        assert_eq!(inner.config.limits[0].min_position, -2.0, "Original limits must not be corrupted or partially applied");
+        assert_eq!(inner.config.limits[0].max_position, 2.0);
+    }
+
+    // 4. clear_fault() must be rejected while driver limit conflict persists
+    let clear_err = supervisor.clear_fault().await.unwrap_err();
+    assert!(
+        clear_err.to_string().contains("Driver limit configuration error"),
+        "clear_fault must be rejected, got: {clear_err}"
+    );
+
+    // 5. Resolve the driver limits conflict to include home_positions [0.0]
+    *limits_holder.lock().unwrap() = vec![Some((-1.0, 1.0))];
+
+    // 6. Recovery via reapply_driver_limits()
+    {
+        let mut inner = supervisor.inner().write().await;
+        let recovered = inner.reapply_driver_limits();
+        assert!(recovered, "reapply_driver_limits must return true once limits resolved");
+        assert!(inner.driver_config_error.is_none(), "driver_config_error must be None after recovery");
+        assert_eq!(inner.config.limits[0].min_position, -1.0, "Resolved narrowed limits must now be applied");
+        assert_eq!(inner.config.limits[0].max_position, 1.0);
+    }
+
+    // 7. Fault can now be cleared successfully
+    let state = supervisor.clear_fault().await.unwrap();
+    assert_eq!(state, SafetyState::Idle);
+    let obs = supervisor.get_observation().await;
+    assert_eq!(obs.safety_state, SafetyState::Idle);
+    assert!(obs.fault.is_none(), "Fault must be cleared");
 }
