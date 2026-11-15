@@ -11,7 +11,9 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::kinematics::{self, Pose};
-use crate::model::{CameraMount, GripperPolicy, HoldingMode, JointLimit, WorkspacePolicy};
+use crate::model::{CameraMount, JointLimit, WorkspacePolicy};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::model::{GripperPolicy, HoldingMode};
 use crate::trajectory::MultiJointQuinticTrajectory;
 
 #[derive(Debug, Clone, PartialEq, Error)]
@@ -251,8 +253,13 @@ pub fn plan_cartesian_ex(input: &PlanInput, goal: Pose, speed: Speed, yaw_free: 
     let arm_dof = input.arm.arm_dof();
     let mut path = JointPath { dof, arm_dof, q: q_samples, s: s_samples, duration, power_scale: 1.0 };
     if let Some(b) = input.power.as_ref().filter(|b| b.enabled && b.planning.enabled) {
+        #[cfg(not(target_arch = "wasm32"))]
         let t0 = std::time::Instant::now();
+        #[cfg(not(target_arch = "wasm32"))]
         let fit = path.fit_power(b, &input.arm)?;
+        #[cfg(target_arch = "wasm32")]
+        let _fit = path.fit_power(b, &input.arm)?;
+        #[cfg(not(target_arch = "wasm32"))]
         tracing::debug!("Power planning: scale {:.3}, peak {:.2} A (full speed {:.2} A, limit {:.2} A), {} samples, {} µs",
             fit.scale, fit.peak_a, fit.peak_full_a, fit.limit_a, fit.samples, t0.elapsed().as_micros());
     }
@@ -691,6 +698,7 @@ impl PathTrajectory {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, PartialEq)]
 enum GripPhase {
     Moving,
@@ -698,6 +706,7 @@ enum GripPhase {
     Squeeze { hold: f32, elapsed: f64, taus: Vec<f32>, loads: Vec<f32> },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 pub struct GripperMotion {
     pub request: GripperRequest,
@@ -714,6 +723,7 @@ pub struct GripperMotion {
     phase: GripPhase,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl GripperMotion {
     pub fn new(request: GripperRequest, policy: GripperPolicy, limit: JointLimit, start: f32, gripper_index: usize) -> Self {
         let target = match request.command {
@@ -847,8 +857,10 @@ impl GripperMotion {
 pub enum Reference {
     Quintic(MultiJointQuinticTrajectory),
     Path(PathTrajectory),
+    #[cfg(not(target_arch = "wasm32"))]
     Gripper(GripperMotion),
     /// Episode replay (`crate::replay`).
+    #[cfg(not(target_arch = "wasm32"))]
     Replay(Box<crate::replay::ReplayMotion>),
 }
 
@@ -867,7 +879,9 @@ impl ActiveTrajectory {
         match &self.reference {
             Reference::Quintic(t) => t.duration,
             Reference::Path(p) => p.duration(),
+            #[cfg(not(target_arch = "wasm32"))]
             Reference::Gripper(g) => g.expected_duration(),
+            #[cfg(not(target_arch = "wasm32"))]
             Reference::Replay(r) => r.expected_duration(),
         }
     }

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::model::JointState;
+pub use crate::model::{DriverCapabilities, DriverRangeCheck, EnableState, JointRangeReading, RangeCheckStatus};
 use crate::protocol::damiao::{self, DamiaoLimits};
 pub use crate::protocol::damiao::{build_pos_force_frame, DAMIAO_GRIPPER_POSFORCE_VEL_RAW};
 use crate::protocol::fashionstar::{self, FashionStarPacket};
@@ -68,28 +69,6 @@ pub enum ArmDriverError {
 
     #[error("Timeout waiting for response from joint {0}")]
     Timeout(u8),
-}
-
-/// Hardware enable state confirmed by fresh telemetry, not by a successful write.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EnableState {
-    Enabled,
-    Disabled,
-    #[default]
-    Unknown,
-}
-
-/// Telemetry and command features implemented by a driver in its active mode.
-/// A false feedback flag means the numeric placeholder is not a measurement.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DriverCapabilities {
-    pub velocity_feedback: bool,
-    pub torque_feedback: bool,
-    pub temperature_feedback: bool,
-    pub torque_feedforward: bool,
-    pub enable_feedback: bool,
-    #[serde(default)]
-    pub load_feedback: bool,
 }
 
 /// Universal robotic arm hardware driver trait
@@ -215,43 +194,6 @@ pub trait ArmDriver: Send {
     /// Result of the startup check of the motors' mapping ranges against the
     /// configured ones; None when the driver has no such check or it has not run.
     fn range_check(&self) -> Option<DriverRangeCheck> { None }
-}
-
-/// Outcome of a mapping-range check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RangeCheckStatus {
-    /// Every motor answered and its ranges equal the configured ones.
-    Passed,
-    /// At least one motor reports a different range: arming is refused.
-    Mismatch,
-    /// At least one motor did not answer: the configured ranges are used unverified.
-    Unverified,
-}
-
-/// Registers read from one motor by the range check.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct JointRangeReading {
-    /// 1-based joint number.
-    pub joint: usize,
-    pub motor_id: u16,
-    pub status: RangeCheckStatus,
-    /// CTRL_MODE register (1 = MIT, 2 = POS_VEL); None without a reply.
-    pub ctrl_mode: Option<u32>,
-    /// PMAX / VMAX / TMAX read from the motor; None without a reply.
-    pub reported: Option<[f32; 3]>,
-    /// PMAX / VMAX / TMAX the driver decodes and encodes this joint with.
-    pub configured: [f32; 3],
-}
-
-/// Startup check of the motors' mapping ranges (published as `driver_range_check`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DriverRangeCheck {
-    pub status: RangeCheckStatus,
-    pub message: String,
-    pub joints: Vec<JointRangeReading>,
-    /// Time the check took (ms).
-    pub duration_ms: u64,
 }
 
 /// Output mode of one joint on drivers that can switch at runtime.

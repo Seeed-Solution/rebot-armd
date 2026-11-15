@@ -46,7 +46,9 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::model::MotionLimitReason;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::supervisor::SupervisorInner;
 
 /// Most joints the per-tick arrays hold.
@@ -146,6 +148,114 @@ pub struct Governor {
 impl Default for Governor {
     fn default() -> Self {
         Self { scale: 1.0, hold: None, over_s: 0.0, below_s: 0.0, limiting: false, static_warned: false, gc_warned: false, holds_total: 0, limited_s: 0.0 }
+    }
+}
+
+/// Inputs to the pure power governor. Hardware freshness is checked by the caller.
+#[derive(Debug, Clone, Copy)]
+pub struct GovernorInput<'a> {
+    pub operational: bool,
+    pub gravity_comp: bool,
+    pub moving: bool,
+    pub torques: &'a [f32],
+    pub commanded_velocities: &'a [f32],
+    /// Positions to hold on a trip; native adapters apply their joint-limit clamping.
+    pub hold_positions: &'a [f32],
+}
+
+/// Events returned by the pure transition, for caller-owned logging and motion effects.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GovernorStep {
+    pub released: bool,
+    pub released_by_stop: bool,
+    pub limiting_changed: Option<bool>,
+    pub limit_motion: bool,
+    pub warn_gravity_comp: bool,
+    pub warn_static: bool,
+    pub trip_joint: Option<usize>,
+    pub repeated_trip: bool,
+}
+
+impl Governor {
+    fn step(&mut self, b: &PolicyView, e: &Estimate, fast_a: f32, bus_a: f32,
+        dt: f64, now_s: f64, input: GovernorInput<'_>) -> GovernorStep {
+        let mut result = GovernorStep::default();
+        let g = b.governor;
+        if !g.enabled { self.scale = 1.0; return result; }
+        let rated = b.supply_rated_a;
+        let r = fast_a / rated;
+        if input.gravity_comp {
+            self.scale = 1.0;
+            self.over_s = 0.0;
+            if r >= g.hard && !self.gc_warned {
+                result.warn_gravity_comp = true;
+                self.gc_warned = true;
+            }
+        } else {
+            self.gc_warned = false;
+        }
+        if self.hold.is_some() {
+            if !input.operational || input.gravity_comp {
+                result.released = true;
+                result.released_by_stop = true;
+            } else if bus_a < g.soft * rated {
+                self.below_s += dt;
+                result.released = self.below_s >= g.recover_ms as f64 / 1000.0 - 1e-6;
+            } else {
+                self.below_s = 0.0;
+            }
+            if result.released { self.hold = None; self.below_s = 0.0; }
+        }
+        if input.gravity_comp { return result; }
+        let target = g.target_scale(r);
+        let s = self.scale;
+        let dtf = dt as f32;
+        let next = if target < s { (s - g.down_per_s * dtf).max(target) } else { (s + g.up_per_s * dtf).min(target) };
+        self.scale = next.clamp(g.floor_scale, 1.0);
+        let limiting = self.scale < 0.999;
+        if limiting { self.limited_s += dt; }
+        if limiting != self.limiting {
+            result.limiting_changed = Some(limiting);
+            self.limiting = limiting;
+        }
+        result.limit_motion = limiting && input.moving;
+        let n = e.n.min(MAX_JOINTS).min(input.commanded_velocities.len()).min(input.torques.len());
+        let idle_a = |j: usize| b.idle_w[j] / b.v_bus;
+        let dyn_sum: f32 = (0..n).map(|j| (e.joint_a[j] - idle_a(j)).max(0.0)).sum();
+        let mut push = [0.0f32; MAX_JOINTS];
+        let mut worst: Option<(usize, f32)> = None;
+        for j in 0..n {
+            let load = (e.joint_a[j] - idle_a(j)).max(0.0);
+            let (tau, v) = (input.torques[j], input.commanded_velocities[j]);
+            if dyn_sum > 0.0 && load >= HEAVY_SHARE * dyn_sum && tau * v > 0.0 && v.abs() > 1e-3 {
+                push[j] = tau.signum();
+                if worst.is_none_or(|(_, w)| load > w) { worst = Some((j, load)); }
+            }
+        }
+        let over = input.operational && r >= g.hard;
+        if over && input.moving && worst.is_some() { self.over_s += dt; }
+        else { self.over_s = 0.0; }
+        if over && worst.is_none() && !self.static_warned && self.hold.is_none() {
+            result.warn_static = true;
+            self.static_warned = true;
+        } else if r < g.soft {
+            self.static_warned = false;
+        }
+        if self.over_s >= g.persist_ms as f64 / 1000.0 - 1e-6 {
+            if let Some((j, _)) = worst {
+                self.over_s = 0.0;
+                self.holds_total += 1;
+                result.trip_joint = Some(j);
+                result.repeated_trip = self.hold.is_some();
+                let mut hold_q = [0.0; MAX_JOINTS];
+                for (o, q) in hold_q.iter_mut().zip(input.hold_positions) { *o = *q; }
+                if let Some(h) = self.hold {
+                    for j in 0..MAX_JOINTS { if push[j] == 0.0 { push[j] = h.push[j]; } }
+                }
+                self.hold = Some(PowerHold { push, hold_q, bus_a: fast_a, since_s: now_s });
+            }
+        }
+        result
     }
 }
 
@@ -426,8 +536,18 @@ impl PowerMonitor {
         self.valid = false;
         self.primed = false;
     }
+
+    /// Advance filters and the governor using caller-supplied simulation time.
+    pub fn step(&mut self, budget: &PowerBudget, estimate: &Estimate, dt_s: f64,
+        now_s: f64, input: GovernorInput<'_>) -> GovernorStep {
+        self.update(budget, estimate, dt_s as f32, now_s);
+        self.gov.step(&budget.clone_policy(), estimate, self.fast_a, self.bus_a,
+            dt_s, now_s, input)
+    }
+
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn r3(v: f32) -> f32 { (v * 1000.0).round() / 1000.0 }
 
 /// `observation.power`: null when the profile has no enabled `power_budget`.
@@ -455,6 +575,7 @@ pub struct PowerObservation {
     pub hold: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl SupervisorInner {
     /// The enabled power budget of the profile.
     pub fn power_budget(&self) -> Option<&PowerBudget> { self.config.power_budget.as_ref().filter(|p| p.enabled) }
@@ -472,9 +593,18 @@ impl SupervisorInner {
         }
         let e = budget.estimate(&self.torques, &self.measured_velocities);
         let now = self.start_time.elapsed().as_secs_f64();
-        self.power.update(budget, &e, dt as f32, now);
-        let budget = budget.clone_policy();
-        self.governor_tick(&budget, &e, dt);
+        let rated = budget.supply_rated_a;
+        let policy = budget.governor;
+        let result = self.power.step(budget, &e, dt, now, GovernorInput {
+            operational: self.is_torqued && self.safety.state().is_operational()
+                && !self.disable_pending && !self.pending_rearm,
+            gravity_comp: self.gravity_comp.is_some(),
+            moving: self.active_trajectory.is_some() || self.servo_target.is_some(),
+            torques: &self.torques,
+            commanded_velocities: &self.commanded_velocities,
+            hold_positions: &self.measured_positions,
+        });
+        self.apply_governor_step(result, rated, policy);
     }
 
     /// Speed scale every motion reference applies this tick (1 = unchanged). Gravity
@@ -483,105 +613,44 @@ impl SupervisorInner {
         if self.gravity_comp.is_some() { 1.0 } else { f64::from(self.power.gov.scale) }
     }
 
-    fn governor_tick(&mut self, b: &PolicyView, e: &Estimate, dt: f64) {
-        let g = b.governor;
-        if !g.enabled { self.power.gov.scale = 1.0; return; }
-        let rated = b.supply_rated_a;
-        let r = self.power.fast_a / rated;
-        let operational = self.is_torqued && self.safety.state().is_operational() && !self.disable_pending && !self.pending_rearm;
-        let gc = self.gravity_comp.is_some();
-        if gc {
-            self.power.gov.scale = 1.0;
-            self.power.gov.over_s = 0.0;
-            if r >= g.hard && !self.power.gov.gc_warned {
-                tracing::warn!("Power estimate {:.2} A ({:.0}% of {rated} A rated) during gravity compensation; not limited (hand guiding)", self.power.fast_a, r * 100.0);
-                self.power.gov.gc_warned = true;
-            }
-        } else {
-            self.power.gov.gc_warned = false;
+    fn apply_governor_step(&mut self, result: GovernorStep, rated: f32, policy: GovernorPolicy) {
+        let a = self.power.fast_a;
+        let r = a / rated;
+        if result.warn_gravity_comp {
+            tracing::warn!("Power estimate {a:.2} A ({:.0}% of {rated} A rated) during gravity compensation; not limited (hand guiding)", r * 100.0);
         }
-        // hold end
-        if self.power.gov.hold.is_some() {
-            if !operational || gc {
+        if result.released {
+            if result.released_by_stop {
                 tracing::info!("Power hold ended (stop, torque off or gravity compensation)");
-                self.end_power_hold();
-            } else if self.power.bus_a < g.soft * rated {
-                self.power.gov.below_s += dt;
-                if self.power.gov.below_s >= g.recover_ms as f64 / 1000.0 - 1e-6 {
-                    tracing::info!("Power hold ended: estimate {:.2} A below {:.0}% of rated for {} ms", self.power.bus_a, g.soft * 100.0, g.recover_ms);
-                    self.end_power_hold();
-                }
             } else {
-                self.power.gov.below_s = 0.0;
+                tracing::info!("Power hold ended: estimate {:.2} A below {:.0}% of rated for {} ms", self.power.bus_a, policy.soft * 100.0, policy.recover_ms);
+            }
+            if self.motion_limit.as_ref().is_some_and(|l| l.reason == MotionLimitReason::Power) {
+                self.motion_limit = None;
             }
         }
-        if gc { return; }
-        // scale, rate limited
-        let target = g.target_scale(r);
-        let s = self.power.gov.scale;
-        let dtf = dt as f32;
-        let next = if target < s { (s - g.down_per_s * dtf).max(target) } else { (s + g.up_per_s * dtf).min(target) };
-        self.power.gov.scale = next.clamp(g.floor_scale, 1.0);
-        let moving = self.active_trajectory.is_some() || self.servo_target.is_some();
-        let limiting = self.power.gov.scale < 0.999;
-        if limiting { self.power.gov.limited_s += dt; }
-        if limiting != self.power.gov.limiting {
+        if let Some(limiting) = result.limiting_changed {
             if limiting {
-                tracing::warn!("Power governor: estimate {:.2} A ({:.0}% of {rated} A rated), slowing motion (scale {:.2})", self.power.fast_a, r * 100.0, self.power.gov.scale);
+                tracing::warn!("Power governor: estimate {a:.2} A ({:.0}% of {rated} A rated), slowing motion (scale {:.2})", r * 100.0, self.power.gov.scale);
             } else {
-                tracing::info!("Power governor: estimate {:.2} A, full speed again", self.power.fast_a);
-            }
-            self.power.gov.limiting = limiting;
-        }
-        if limiting && moving { self.note_motion_limit(MotionLimitReason::Power, None); }
-        // hold rule: above hard while a heavy joint pushes
-        let n = e.n.min(self.commanded_velocities.len()).min(self.torques.len());
-        let idle_a = |j: usize| b.idle_w[j] / b.v_bus;
-        let dyn_sum: f32 = (0..n).map(|j| (e.joint_a[j] - idle_a(j)).max(0.0)).sum();
-        let mut push = [0.0f32; MAX_JOINTS];
-        let mut worst: Option<(usize, f32)> = None;
-        for j in 0..n {
-            let load = (e.joint_a[j] - idle_a(j)).max(0.0);
-            let (tau, v) = (self.torques[j], self.commanded_velocities[j]);
-            if dyn_sum > 0.0 && load >= HEAVY_SHARE * dyn_sum && tau * v > 0.0 && v.abs() > 1e-3 {
-                push[j] = tau.signum();
-                if worst.is_none_or(|(_, w)| load > w) { worst = Some((j, load)); }
+                tracing::info!("Power governor: estimate {a:.2} A, full speed again");
             }
         }
-        let over = operational && r >= g.hard;
-        if over && moving && worst.is_some() {
-            self.power.gov.over_s += dt;
-        } else {
-            self.power.gov.over_s = 0.0;
+        if result.limit_motion { self.note_motion_limit(MotionLimitReason::Power, None); }
+        if result.warn_static {
+            tracing::warn!("Power estimate {a:.2} A ({:.0}% of {rated} A rated) with no joint pushing; not holding (stopping does not lower a static load)", r * 100.0);
         }
-        if over && worst.is_none() && !self.power.gov.static_warned && self.power.gov.hold.is_none() {
-            tracing::warn!("Power estimate {:.2} A ({:.0}% of {rated} A rated) with no joint pushing; not holding (stopping does not lower a static load)",
-                self.power.fast_a, r * 100.0);
-            self.power.gov.static_warned = true;
-        } else if r < g.soft {
-            self.power.gov.static_warned = false;
-        }
-        if self.power.gov.over_s >= g.persist_ms as f64 / 1000.0 - 1e-6 {
-            if let Some((j, _)) = worst { self.power_trip(j, push, rated, g.persist_ms); }
+        if let Some(joint) = result.trip_joint {
+            self.power_trip(joint, rated, policy.persist_ms, result.repeated_trip);
         }
     }
 
-    fn end_power_hold(&mut self) {
-        self.power.gov.hold = None;
-        self.power.gov.below_s = 0.0;
-        if self.motion_limit.as_ref().is_some_and(|l| l.reason == MotionLimitReason::Power) { self.motion_limit = None; }
-    }
-
-    /// Trip: fail the running action with `POWER_LIMIT`, end every motion and hold the
-    /// measured pose with torque on (gripper keeps its command).
-    fn power_trip(&mut self, joint: usize, push: [f32; MAX_JOINTS], rated: f32, persist_ms: u64) {
-        let gov = &mut self.power.gov;
-        gov.over_s = 0.0;
-        gov.holds_total += 1;
+    /// Apply the motion side effects of a pure governor trip.
+    fn power_trip(&mut self, joint: usize, rated: f32, persist_ms: u64, again: bool) {
         let a = self.power.fast_a;
         let message = format!("Power limit: estimated supply current {a:.2} A ({:.0}% of {rated} A rated) for {persist_ms} ms, joint {} pushing",
             a / rated * 100.0, joint + 1);
-        if self.power.gov.hold.is_some() {
+        if again {
             tracing::debug!("{message}; holding the new measured position");
         } else {
             tracing::warn!("{message}; motion stopped, holding position");
@@ -592,11 +661,11 @@ impl SupervisorInner {
         self.macro_run = None;
         self.hold_measured_pose();
         self.note_motion_limit(MotionLimitReason::Power, Some(joint));
-        let mut hold_q = [0.0f32; MAX_JOINTS];
-        for (o, q) in hold_q.iter_mut().zip(&self.commanded_positions) { *o = *q; }
-        let mut merged = push;
-        if let Some(h) = self.power.gov.hold { for j in 0..MAX_JOINTS { if merged[j] == 0.0 { merged[j] = h.push[j]; } } }
-        self.power.gov.hold = Some(PowerHold { push: merged, hold_q, bus_a: a, since_s: self.start_time.elapsed().as_secs_f64() });
+        // The supervisor clamps measured positions and preserves the gripper command.
+        // The pure transition owns the hold, push mask, counter and timestamp.
+        if let Some(hold) = self.power.gov.hold.as_mut() {
+            for (o, q) in hold.hold_q.iter_mut().zip(&self.commanded_positions) { *o = *q; }
+        }
     }
 
     /// While a power hold is in force: a servo / jog target that moves a joint that was
@@ -710,5 +779,80 @@ impl SupervisorInner {
             "idle_a": r3(budget.idle_a()),
             "budget": budget,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input<'a>(velocities: &'a [f32], positions: &'a [f32]) -> GovernorInput<'a> {
+        GovernorInput { operational: true, gravity_comp: false, moving: true,
+            torques: &[2.0], commanded_velocities: velocities, hold_positions: positions }
+    }
+
+    #[test]
+    fn pure_governor_rate_limits_persists_and_recovers() {
+        let budget = PowerBudget::rebot_dm();
+        let policy = budget.clone_policy();
+        let high = Estimate { bus_a: 7.0, regen_w: 0.0, joint_a: [7.0; MAX_JOINTS], n: 1 };
+        let mut monitor = PowerMonitor::default();
+        let first = monitor.step(&budget, &high, 0.05, 10.0, input(&[0.2], &[0.3]));
+        assert_eq!(first.limiting_changed, Some(true));
+        assert_eq!(first.trip_joint, None);
+        assert!((monitor.gov.scale - 0.75).abs() < 1e-6);
+        let second = monitor.step(&budget, &high, 0.05, 10.05, input(&[0.2], &[0.3]));
+        assert_eq!(second.trip_joint, Some(0));
+        assert_eq!(monitor.gov.holds_total, 1);
+        let hold = monitor.gov.hold.unwrap();
+        assert_eq!(hold.hold_q[0], 0.3);
+        assert_eq!(hold.push[0], 1.0);
+        assert_eq!(hold.since_s, 10.05);
+        // Recovery uses display current and continuous simulated time, independently
+        // of filter convergence; this is the exact transition called by step above.
+        let low = Estimate { bus_a: 1.0, joint_a: [1.0; MAX_JOINTS], ..high };
+        let stopped = GovernorInput { moving: false, ..input(&[0.0], &[0.3]) };
+        assert!(!monitor.gov.step(&policy, &low, 1.0, 1.0, 0.15, 11.0, stopped).released);
+        assert!(monitor.gov.step(&policy, &low, 1.0, 1.0, 0.15, 11.15, stopped).released);
+        assert!(monitor.gov.hold.is_none());
+        assert_eq!(monitor.gov.holds_total, 1);
+    }
+
+    #[test]
+    fn pure_governor_static_load_and_gravity_comp_do_not_trip() {
+        let budget = PowerBudget::rebot_dm();
+        let high = Estimate { bus_a: 7.0, regen_w: 0.0, joint_a: [7.0; MAX_JOINTS], n: 1 };
+        let mut monitor = PowerMonitor::default();
+        let static_input = input(&[0.0], &[0.0]);
+        let first = monitor.step(&budget, &high, 0.2, 2.0, static_input);
+        assert!(first.warn_static);
+        assert!(first.trip_joint.is_none());
+        assert!(!monitor.step(&budget, &high, 0.2, 2.2, static_input).warn_static);
+        let gc = GovernorInput { gravity_comp: true, ..input(&[0.2], &[0.0]) };
+        let result = monitor.step(&budget, &high, 1.0, 3.2, gc);
+        assert!(result.warn_gravity_comp);
+        assert_eq!(monitor.gov.scale, 1.0);
+        assert_eq!(monitor.gov.holds_total, 0);
+        assert!(!monitor.step(&budget, &high, 1.0, 4.2, gc).warn_gravity_comp);
+    }
+
+    #[test]
+    fn pure_governor_stop_releases_and_retrips_merge_push_masks() {
+        let budget = PowerBudget::rebot_dm();
+        let high = Estimate { bus_a: 7.0, regen_w: 0.0, joint_a: [3.5; MAX_JOINTS], n: 2 };
+        let mut monitor = PowerMonitor::default();
+        let first_input = GovernorInput { torques: &[2.0, -2.0], ..input(&[0.2, 0.0], &[0.3, 0.4]) };
+        assert_eq!(monitor.step(&budget, &high, 0.1, 5.0, first_input).trip_joint, Some(0));
+        let second_input = GovernorInput { torques: &[2.0, -2.0], ..input(&[0.0, -0.2], &[0.5, 0.6]) };
+        let result = monitor.step(&budget, &high, 0.1, 5.1, second_input);
+        assert_eq!(result.trip_joint, Some(1));
+        assert!(result.repeated_trip);
+        let hold = monitor.gov.hold.unwrap();
+        assert_eq!(&hold.push[..2], &[1.0, -1.0]);
+        assert_eq!(&hold.hold_q[..2], &[0.5, 0.6]);
+        let result = monitor.step(&budget, &high, 0.1, 5.2, GovernorInput { operational: false, ..second_input });
+        assert!(result.released && result.released_by_stop);
+        assert!(monitor.gov.hold.is_none());
+        assert_eq!(monitor.gov.holds_total, 2);
     }
 }

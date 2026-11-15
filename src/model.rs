@@ -1,7 +1,66 @@
 use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 use crate::safety::SafetyState;
-use crate::driver::{DriverCapabilities, DriverRangeCheck, EnableState};
+/// Hardware enable state confirmed by fresh telemetry, not by a successful write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnableState {
+    Enabled,
+    Disabled,
+    #[default]
+    Unknown,
+}
+
+/// Telemetry and command features implemented by a driver in its active mode.
+/// A false feedback flag means the numeric placeholder is not a measurement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriverCapabilities {
+    pub velocity_feedback: bool,
+    pub torque_feedback: bool,
+    pub temperature_feedback: bool,
+    pub torque_feedforward: bool,
+    pub enable_feedback: bool,
+    #[serde(default)]
+    pub load_feedback: bool,
+}
+
+/// Outcome of a mapping-range check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RangeCheckStatus {
+    /// Every motor answered and its ranges equal the configured ones.
+    Passed,
+    /// At least one motor reports a different range: arming is refused.
+    Mismatch,
+    /// At least one motor did not answer: the configured ranges are used unverified.
+    Unverified,
+}
+
+/// Registers read from one motor by the range check.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JointRangeReading {
+    /// 1-based joint number.
+    pub joint: usize,
+    pub motor_id: u16,
+    pub status: RangeCheckStatus,
+    /// CTRL_MODE register (1 = MIT, 2 = POS_VEL); None without a reply.
+    pub ctrl_mode: Option<u32>,
+    /// PMAX / VMAX / TMAX read from the motor; None without a reply.
+    pub reported: Option<[f32; 3]>,
+    /// PMAX / VMAX / TMAX the driver decodes and encodes this joint with.
+    pub configured: [f32; 3],
+}
+
+/// Startup check of the motors' mapping ranges (published as `driver_range_check`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DriverRangeCheck {
+    pub status: RangeCheckStatus,
+    pub message: String,
+    pub joints: Vec<JointRangeReading>,
+    /// Time the check took (ms).
+    pub duration_ms: u64,
+}
+
+
 
 /// Limits for a single joint
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -180,7 +239,7 @@ impl WorkspacePolicy {
         }
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         let finite3 = |v: &[f32; 3]| v.iter().all(|x| x.is_finite());
         if !self.floor_z_m.is_finite() || !finite3(&self.box_min_m) || !finite3(&self.box_max_m)
             || self.box_min_m.iter().zip(&self.box_max_m).any(|(lo, hi)| lo >= hi)
@@ -639,6 +698,7 @@ impl DamiaoRange {
     /// B601-DM J4-J7 (J7 = gripper), read from the motors 2026-11-09.
     pub const REBOT_DM_J4_J7: Self = Self { p_max: 12.5, v_max: 30.0, t_max: 10.0 };
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn limits(&self) -> crate::protocol::damiao::DamiaoLimits {
         crate::protocol::damiao::DamiaoLimits::symmetric(self.p_max, self.v_max, self.t_max)
     }
@@ -743,6 +803,7 @@ pub struct ArmConfig {
     pub gripper_policy: Option<GripperPolicy>,
     /// Tap-to-grasp setup; None disables `/api/v1/action/grasp`.
     #[serde(default)]
+    #[cfg(not(target_arch = "wasm32"))]
     pub grasp: Option<crate::grasp::GraspSetup>,
     /// Gravity compensation (hand-guiding); None means unsupported.
     #[serde(default)]
@@ -790,6 +851,7 @@ pub struct ArmConfig {
     pub gripper_joint: Option<usize>,
     /// Feetech STS3215 bus and joint calibration settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub feetech: Option<crate::protocol::feetech::FeetechConfig>,
     /// Arm model built from the fields above (not part of the profile JSON).
     #[serde(skip)]
@@ -852,7 +914,7 @@ impl Default for ArmConfig {
             workspace: None,
             camera_mount: CameraMount::default(),
             gripper_policy: None,
-            grasp: None,
+            #[cfg(not(target_arch = "wasm32"))] grasp: None,
             gravity_comp: None,
             damiao_ranges: None,
             speed_cap: None,
@@ -865,7 +927,7 @@ impl Default for ArmConfig {
             chain: None,
             model_offsets_rad: None,
             gripper_joint: None,
-            feetech: None,
+            #[cfg(not(target_arch = "wasm32"))] feetech: None,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -916,6 +978,7 @@ impl ArmConfig {
 
     /// Read a profile JSON file and build its arm model (`urdf` relative to the file).
     /// The result still needs [`Self::validate`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_profile_file(path: impl AsRef<std::path::Path>) -> Result<Self, String> {
         let path = path.as_ref();
         let file = std::fs::File::open(path).map_err(|e| format!("profile {}: {e}", path.display()))?;
@@ -927,6 +990,7 @@ impl ArmConfig {
 
     /// Build [`Self::arm_model`] from `urdf` + `chain` when the profile uses `Urdf`;
     /// `profile_dir` resolves a relative `urdf` path. Call before [`Self::validate`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_arm_model(&mut self, profile_dir: Option<&std::path::Path>) -> Result<(), String> {
         if !self.uses_urdf() {
             if self.urdf.is_some() || self.chain.is_some() {
@@ -957,6 +1021,36 @@ impl ArmConfig {
             .map_err(|e| format!("urdf {}: {e}", path.display()))?;
         if self.gravity_model == Some(GravityModel::Urdf) && chain.moving_mass() <= 0.0 {
             return Err(format!("urdf {}: gravity_model \"Urdf\" but the chain links have no mass", path.display()));
+        }
+        self.arm_model = crate::chain::ArmModel::Chain(std::sync::Arc::new(chain));
+        Ok(())
+    }
+
+    /// Build the arm model without filesystem access. Checks the same model mapping,
+    /// optional URDF checksum and mass requirements as native profile loading.
+    pub fn init_arm_model_in_memory(&mut self, urdf_xml: Option<&str>) -> Result<(), String> {
+        if !self.uses_urdf() {
+            if self.urdf.is_some() || self.chain.is_some() {
+                return Err("urdf / chain are set but neither kinematics nor gravity_model is \"Urdf\"".into());
+            }
+            self.arm_model = crate::chain::ArmModel::RebotDevArm(self.builtin_model_offsets()?);
+            return Ok(());
+        }
+        let text = urdf_xml.ok_or("URDF XML is required for this profile")?;
+        let spec = self.chain.as_ref().ok_or("URDF profile requires chain")?;
+        if self.model_offsets_rad.is_some() {
+            return Err("model_offsets_rad is for the built-in model; a URDF chain sets chain.joints[].offset_rad".into());
+        }
+        if let Some(expected) = &self.urdf_sha256 {
+            let actual = crate::gravity::compute_sha256(text.as_bytes());
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(format!("urdf: sha256 {actual} does not match urdf_sha256 {expected}"));
+            }
+        }
+        let chain = crate::chain::KinematicChain::from_urdf_str(text, spec)
+            .map_err(|e| format!("urdf: {e}"))?;
+        if self.gravity_model == Some(GravityModel::Urdf) && chain.moving_mass() <= 0.0 {
+            return Err("urdf: gravity_model \"Urdf\" but the chain links have no mass".into());
         }
         self.arm_model = crate::chain::ArmModel::Chain(std::sync::Arc::new(chain));
         Ok(())
@@ -1113,6 +1207,7 @@ impl ArmConfig {
                 }
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(g) = &self.grasp { g.validate().map_err(|e| format!("Invalid grasp setup: {e}"))?; }
         if let Some(policy) = &self.resting_pose {
             if policy.position_tolerances.len() < self.resting_arm_joints() {
@@ -1138,6 +1233,7 @@ impl ArmConfig {
                 }
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(ft) = &self.feetech {
             if !(1..=1000).contains(&ft.max_torque_raw) {
                 return Err(format!("feetech.max_torque_raw must be 1..=1000, got {}", ft.max_torque_raw));
@@ -1288,7 +1384,7 @@ impl ArmConfig {
             workspace: Some(WorkspacePolicy::rebot_dm()),
             camera_mount: CameraMount::default(),
             gripper_policy: Some(GripperPolicy::rebot_dm()),
-            grasp: Some(crate::grasp::GraspSetup::default()),
+            #[cfg(not(target_arch = "wasm32"))] grasp: Some(crate::grasp::GraspSetup::default()),
             gravity_comp: Some(GravityCompPolicy::rebot_dm()),
             damiao_ranges: Some(vec![
                 DamiaoRange::REBOT_DM_J1_J3, DamiaoRange::REBOT_DM_J1_J3, DamiaoRange::REBOT_DM_J1_J3,
@@ -1323,7 +1419,7 @@ impl ArmConfig {
             chain: None,
             model_offsets_rad: Some(crate::kinematics::B601DM_MODEL_OFFSETS_RAD.to_vec()),
             gripper_joint: None,
-            feetech: None,
+            #[cfg(not(target_arch = "wasm32"))] feetech: None,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -1665,7 +1761,10 @@ impl Capabilities {
             cartesian: arm_with_gripper && kin,
             workspace_check: kin && config.workspace.is_some(),
             gripper,
+            #[cfg(not(target_arch = "wasm32"))]
             grasp: arm_with_gripper && kin && config.gripper_policy.is_some() && config.grasp.is_some(),
+            #[cfg(target_arch = "wasm32")]
+            grasp: false,
             gravity_comp: config.six_plus_gripper() && config.gravity_model.is_some() && config.gravity_comp.is_some(),
             damiao_ranges: config.damiao_ranges.is_some(),
             servo_guard: true,
@@ -1746,6 +1845,7 @@ pub struct ObservationSchema {
     #[serde(default)]
     pub power_budget: Option<crate::power::PowerBudget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub feetech_joints: Option<Vec<crate::protocol::feetech::FeetechJointCalib>>,
 }
 
@@ -1845,7 +1945,50 @@ impl ObservationSchema {
             torque_guard: crate::torque_guard::TorqueGuardInfo::from_config(config),
             model_joint_map: config.arm_model.joint_map(),
             power_budget: config.power_budget.clone().filter(|p| p.enabled),
+            #[cfg(not(target_arch = "wasm32"))]
             feetech_joints: config.feetech.as_ref().map(|f| f.joints.clone()),
+
         }
+    }
+}
+
+#[cfg(test)]
+mod in_memory_model_tests {
+    use super::*;
+
+    #[test]
+    fn built_in_in_memory_model_uses_motor_offsets() {
+        let mut config = ArmConfig::rebot_dm();
+        config.model_offsets_rad = None;
+        config.init_arm_model_in_memory(None).unwrap();
+        let map = config.arm_model.joint_map();
+        assert_eq!(map[5].offset_rad, -std::f64::consts::FRAC_PI_2);
+        let default_pose = ArmConfig::rebot_dm().arm_model.fk(&[0.0; 6]);
+        assert_eq!(config.arm_model.fk(&[0.0; 6]), default_pose);
+    }
+
+    #[test]
+    fn urdf_in_memory_validates_checksum_and_preserves_model_on_failure() {
+        let mut config: ArmConfig = serde_json::from_str(include_str!("../profiles/so_arm101.json")).unwrap();
+        let xml = include_str!("../assets/so101_new_calib.urdf");
+        config.init_arm_model_in_memory(Some(xml)).unwrap();
+        assert_eq!(config.arm_dof(), 5);
+        let before = config.arm_model.fk(&[0.0; 6]);
+        config.urdf_sha256 = Some("0".repeat(64));
+        assert!(config.init_arm_model_in_memory(Some(xml)).unwrap_err().contains("sha256"));
+        assert_eq!(config.arm_model.fk(&[0.0; 6]), before);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_and_in_memory_profile_models_are_identical() {
+        let profile = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles/so_arm101.json");
+        let native = ArmConfig::from_profile_file(profile).unwrap();
+        let mut memory: ArmConfig = serde_json::from_str(include_str!("../profiles/so_arm101.json")).unwrap();
+        memory.init_arm_model_in_memory(Some(include_str!("../assets/so101_new_calib.urdf"))).unwrap();
+        assert_eq!(native.arm_model.joint_map(), memory.arm_model.joint_map());
+        assert_eq!(native.arm_model.chain(), memory.arm_model.chain());
+        assert_eq!(native.arm_model.fk(&[0.2, -0.3, 0.4, 0.1, -0.2, 0.0]),
+            memory.arm_model.fk(&[0.2, -0.3, 0.4, 0.1, -0.2, 0.0]));
     }
 }
