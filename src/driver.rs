@@ -551,71 +551,45 @@ impl<T: Transport> FeetechArmDriver<T> {
         Ok(drained)
     }
 
-    pub fn read_register_u8_direct(&mut self, id: u8, reg: u8) -> Result<u8, ArmDriverError> {
-        self.transport.clear_input_buffer();
-        self.rx_buffer.clear();
-        let req = feetech::build_read(id, reg, 1);
-        self.transport.write_all(&req)?;
-        self.transport.flush()?;
-        let echo_drained = self.drain_tx_echo(&req)?;
-
-        let mut temp = [0u8; 1];
-        let start = Instant::now();
-        const READ_TIMEOUT: Duration = Duration::from_millis(25);
-        let mut can_skip_echo = !echo_drained && self.tx_echo != Some(false);
-
-        loop {
-            while !self.rx_buffer.is_empty() {
-                match feetech::parse_response(&self.rx_buffer) {
-                    Ok((pkt, consumed)) => {
-                        let is_req_echo = can_skip_echo && consumed >= req.len() && self.rx_buffer[consumed - req.len()..consumed] == req[..];
-                        self.rx_buffer.drain(..consumed);
-                        if is_req_echo {
-                            can_skip_echo = false;
-                            self.tx_echo = Some(true);
-                            self.tx_echo_auto = false;
-                            continue;
-                        }
-                        if pkt.id == feetech::BROADCAST_ID {
-                            continue;
-                        }
-                        if pkt.id == id && pkt.params.len() == 1 {
-                            if self.tx_echo.is_none() {
-                                self.tx_echo = Some(false);
-                            }
-                            return Ok(pkt.params[0]);
-                        }
-                    }
-                    Err(feetech::FeetechError::IncompleteFrame { .. }) => {
-                        break;
-                    }
-                    Err(_) => {
-                        self.rx_buffer.remove(0);
-                    }
+    /// Reads REG_TORQUE_ENABLE from each servo in `ids` (indexed like `servo_ids`), records
+    /// the per-joint state, and returns (disabled count, enabled count, read errors).
+    fn read_torque_enable_states(&mut self, ids: &[u8]) -> (usize, usize, Vec<String>) {
+        let mut count_0 = 0;
+        let mut count_1 = 0;
+        let mut read_errors = Vec::new();
+        for (idx, &id) in ids.iter().enumerate() {
+            match self.read_register_u8_direct(id, feetech::REG_TORQUE_ENABLE) {
+                Ok(v @ (0 | 1)) => {
+                    if v == 0 { count_0 += 1; } else { count_1 += 1; }
+                    self.joint_torque_enabled[idx] = Some(v == 1);
+                    self.last_enable_confirmed[idx] = Some(Instant::now());
+                    self.missed_enable_polls[idx] = 0;
                 }
-            }
-
-            if start.elapsed() >= READ_TIMEOUT {
-                break;
-            }
-
-            match self.transport.read(&mut temp) {
-                Ok(n) if n > 0 => {
-                    self.rx_buffer.extend_from_slice(&temp[..n]);
+                Ok(v) => {
+                    self.joint_torque_enabled[idx] = None;
+                    read_errors.push(format!("servo {} returned unexpected value {}", id, v));
                 }
-                _ => {
-                    std::thread::yield_now();
+                Err(e) => {
+                    self.joint_torque_enabled[idx] = None;
+                    read_errors.push(format!("servo {} read failed: {}", id, e));
                 }
             }
         }
+        (count_0, count_1, read_errors)
+    }
 
-        Err(ArmDriverError::Timeout(id))
+    pub fn read_register_u8_direct(&mut self, id: u8, reg: u8) -> Result<u8, ArmDriverError> {
+        self.read_register_direct(id, reg, 1).map(|p| p[0])
     }
 
     pub fn read_register_u16_direct(&mut self, id: u8, reg: u8) -> Result<u16, ArmDriverError> {
+        self.read_register_direct(id, reg, 2).map(|p| u16::from_le_bytes([p[0], p[1]]))
+    }
+
+    fn read_register_direct(&mut self, id: u8, reg: u8, len: u8) -> Result<Vec<u8>, ArmDriverError> {
         self.transport.clear_input_buffer();
         self.rx_buffer.clear();
-        let req = feetech::build_read(id, reg, 2);
+        let req = feetech::build_read(id, reg, len);
         self.transport.write_all(&req)?;
         self.transport.flush()?;
         let echo_drained = self.drain_tx_echo(&req)?;
@@ -640,11 +614,11 @@ impl<T: Transport> FeetechArmDriver<T> {
                         if pkt.id == feetech::BROADCAST_ID {
                             continue;
                         }
-                        if pkt.id == id && pkt.params.len() == 2 {
+                        if pkt.id == id && pkt.params.len() == len as usize {
                             if self.tx_echo.is_none() {
                                 self.tx_echo = Some(false);
                             }
-                            return Ok(u16::from_le_bytes([pkt.params[0], pkt.params[1]]));
+                            return Ok(pkt.params);
                         }
                     }
                     Err(feetech::FeetechError::IncompleteFrame { .. }) => {
@@ -1112,30 +1086,9 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         if self.servo_ids.is_empty() {
             return Ok(self.confirmed_enable_state);
         }
-        let mut count_0 = 0;
-        let mut count_1 = 0;
-        let mut read_all_valid = true;
         let ids = self.servo_ids.clone();
-        for (idx, &id) in ids.iter().enumerate() {
-            match self.read_register_u8_direct(id, feetech::REG_TORQUE_ENABLE) {
-                Ok(0) => {
-                    self.joint_torque_enabled[idx] = Some(false);
-                    self.last_enable_confirmed[idx] = Some(Instant::now());
-                    self.missed_enable_polls[idx] = 0;
-                    count_0 += 1;
-                }
-                Ok(1) => {
-                    self.joint_torque_enabled[idx] = Some(true);
-                    self.last_enable_confirmed[idx] = Some(Instant::now());
-                    self.missed_enable_polls[idx] = 0;
-                    count_1 += 1;
-                }
-                _ => {
-                    self.joint_torque_enabled[idx] = None;
-                    read_all_valid = false;
-                }
-            }
-        }
+        let (count_0, count_1, read_errors) = self.read_torque_enable_states(&ids);
+        let read_all_valid = read_errors.is_empty();
 
         if read_all_valid && count_0 == ids.len() {
             self.confirmed_enable_state = EnableState::Disabled;
@@ -1179,34 +1132,8 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             return Err(e);
         }
 
-        let mut read_errors = Vec::new();
-        let mut count_0 = 0;
-        let mut count_1 = 0;
         let ids = self.servo_ids.clone();
-        for (idx, &id) in ids.iter().enumerate() {
-            match self.read_register_u8_direct(id, feetech::REG_TORQUE_ENABLE) {
-                Ok(0) => {
-                    count_0 += 1;
-                    self.joint_torque_enabled[idx] = Some(false);
-                    self.last_enable_confirmed[idx] = Some(Instant::now());
-                    self.missed_enable_polls[idx] = 0;
-                }
-                Ok(1) => {
-                    count_1 += 1;
-                    self.joint_torque_enabled[idx] = Some(true);
-                    self.last_enable_confirmed[idx] = Some(Instant::now());
-                    self.missed_enable_polls[idx] = 0;
-                }
-                Ok(v) => {
-                    self.joint_torque_enabled[idx] = None;
-                    read_errors.push(format!("servo {} returned unexpected value {}", id, v));
-                }
-                Err(e) => {
-                    self.joint_torque_enabled[idx] = None;
-                    read_errors.push(format!("servo {} read failed: {}", id, e));
-                }
-            }
-        }
+        let (count_0, count_1, read_errors) = self.read_torque_enable_states(&ids);
 
         if !read_errors.is_empty() {
             self.confirmed_enable_state = EnableState::Unknown;
@@ -1430,28 +1357,9 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 let _ = self.drain_tx_echo(&pkt);
             }
 
-            let mut all_disabled = true;
-            for (idx, &id) in ids.iter().enumerate() {
-                match self.read_register_u8_direct(id, feetech::REG_TORQUE_ENABLE) {
-                    Ok(0) => {
-                        self.joint_torque_enabled[idx] = Some(false);
-                        self.last_enable_confirmed[idx] = Some(Instant::now());
-                        self.missed_enable_polls[idx] = 0;
-                    }
-                    Ok(1) => {
-                        all_disabled = false;
-                        self.joint_torque_enabled[idx] = Some(true);
-                        self.last_enable_confirmed[idx] = Some(Instant::now());
-                        self.missed_enable_polls[idx] = 0;
-                    }
-                    _ => {
-                        all_disabled = false;
-                        self.joint_torque_enabled[idx] = None;
-                    }
-                }
-            }
+            let (count_0, _, _) = self.read_torque_enable_states(&ids);
 
-            if all_disabled {
+            if count_0 == ids.len() {
                 self.confirmed_enable_state = EnableState::Disabled;
                 self.partial_enable_known = false;
             } else {

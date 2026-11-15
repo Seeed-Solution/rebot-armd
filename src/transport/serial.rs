@@ -81,7 +81,7 @@ impl SerialTransport {
             .timeout(config.timeout);
 
         #[cfg(target_os = "linux")]
-        let (mut port, fd) = {
+        let (port, fd) = {
             use std::os::unix::io::AsRawFd;
             let native_port = builder.open_native().map_err(|e| {
                 TransportError::Serial(format!(
@@ -95,7 +95,7 @@ impl SerialTransport {
         };
 
         #[cfg(not(target_os = "linux"))]
-        let mut port = builder.open().map_err(|e| {
+        let port = builder.open().map_err(|e| {
             TransportError::Serial(format!(
                 "Failed to open serial port {}: {}",
                 normalized_port, e
@@ -141,14 +141,7 @@ impl SerialTransport {
             }
 
             if config.low_latency_1ms {
-                Self::apply_low_latency_fd(fd, &mut *port, &normalized_port);
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            if config.low_latency_1ms {
-                Self::apply_low_latency(&mut *port, &normalized_port);
+                Self::apply_low_latency_fd(fd);
             }
         }
 
@@ -179,7 +172,7 @@ impl SerialTransport {
     }
 
     #[cfg(target_os = "linux")]
-    fn apply_low_latency_fd(fd: std::os::unix::io::RawFd, port: &mut dyn serialport::SerialPort, _port_path: &str) {
+    fn apply_low_latency_fd(fd: std::os::unix::io::RawFd) {
         #[repr(C)]
         struct SerialStruct {
             line_type: libc::c_int,
@@ -210,29 +203,8 @@ impl SerialTransport {
         let rc = unsafe { libc::ioctl(fd, TIOCGSERIAL as _, &mut ss) };
         if rc == 0 {
             ss.flags |= ASYNC_LOW_LATENCY;
-            let set_rc = unsafe { libc::ioctl(fd, TIOCSSERIAL as _, &ss) };
-            if set_rc != 0 {
-                let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                if err != libc::ENOTTY && err != libc::EINVAL && err != libc::EOPNOTSUPP {
-                    // benign no-op
-                }
-            }
-        } else {
-            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            if err != libc::ENOTTY && err != libc::EINVAL && err != libc::EOPNOTSUPP {
-                // benign no-op
-            }
-        }
-
-        if let Ok(settings) = port.read_carrier_detect() {
-            let _ = settings;
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn apply_low_latency(port: &mut dyn serialport::SerialPort, _port_path: &str) {
-        if let Ok(settings) = port.read_carrier_detect() {
-            let _ = settings;
+            // Best effort: drivers without TIOCSSERIAL support keep their default latency.
+            let _ = unsafe { libc::ioctl(fd, TIOCSSERIAL as _, &ss) };
         }
     }
 
