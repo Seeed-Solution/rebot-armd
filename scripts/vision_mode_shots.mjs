@@ -115,6 +115,11 @@ const hud = (page) => page.evaluate(() => {
     sw: document.scrollingElement.scrollWidth, iw: window.innerWidth };
 });
 
+// simple mode: Detect, the vision mode selector, single shot and grasp setup live in the recognition popover (#btn-vis)
+const openVis = (page) => page.evaluate(() => {
+  const b = document.getElementById('btn-vis');
+  if (document.body.classList.contains('ui-simple') && !document.body.classList.contains('vis-open') && b && !b.hidden) b.click();
+});
 const subCalls = () => CALLS.filter(([, u]) => u.startsWith('/api/v1/vision/subscribe'));
 const setHidden = (page, hidden) => page.evaluate((h) => {
   Object.defineProperty(document, 'hidden', { value: h, configurable: true });
@@ -135,14 +140,16 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
   await page.waitForTimeout(600);
 
   // 1. standby: no subscription, selector shows Off (this page's overlay is off)
+  await openVis(page);
   let h = await hud(page);
   check(`${tag} selector`, h.shown && JSON.stringify(h.labels) === JSON.stringify(T[lang]) && h.on.join() === 'off' && h.inside, JSON.stringify(h));
   check(`${tag} standby`, SUBS.size === 0 && subCalls().length === 0, JSON.stringify(CALLS));
   let file = path.join(out, `vision_standby_${tag}.png`); await page.screenshot({ path: file }); shots.push(file);
 
   // 2. Both: one subscription {client, pipelines [yolo, aruco], ttl_ms}; overlay draws box + marker; kept alive
-  await page.click('#vmode button[data-vm="both"]');
+  await openVis(page); await page.click('#vmode button[data-vm="both"]');
   await page.waitForTimeout(1300);
+  await openVis(page);
   h = await hud(page);
   const ov = await page.evaluate(() => ({ n: S.detections.length, aruco: S.detections.filter((d) => d.aruco).length, labels: S.detections.map((d) => d.label) }));
   const sc = subCalls();
@@ -160,34 +167,37 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
 
   // 3. single shot with the selected pipelines
   CALLS.length = 0;
-  await page.click('#btn-trigger'); await page.waitForTimeout(300);
+  await openVis(page); await page.click('#btn-trigger'); await page.waitForTimeout(300);
   const trig = CALLS.find(([, u]) => u === '/api/v1/detection/trigger');
   check(`${tag} trigger body`, trig && JSON.stringify(trig[2]) === '{"pipelines":["yolo","aruco"]}', JSON.stringify(CALLS));
 
   // 4. ArUco updates the same subscription in place, Off deletes it
   CALLS.length = 0;
-  await page.click('#vmode button[data-vm="aruco"]'); await page.waitForTimeout(250);
+  await openVis(page); await page.click('#vmode button[data-vm="aruco"]'); await page.waitForTimeout(250);
   check(`${tag} aruco`, SUBS.size === 1 && SUBS.get(sid) && JSON.stringify(SUBS.get(sid).pipelines) === '["aruco"]', JSON.stringify([...SUBS]));
-  await page.click('#vmode button[data-vm="off"]'); await page.waitForTimeout(300);
+  await openVis(page); await page.click('#vmode button[data-vm="off"]'); await page.waitForTimeout(300);
+  await openVis(page);
   h = await hud(page);
   const n = await page.evaluate(() => S.detections.length);
   check(`${tag} off deletes`, SUBS.size === 0 && subCalls().some(([m, u]) => m === 'DELETE' && u === `/api/v1/vision/subscribe/${sid}`) && h.on.join() === 'off' && n === 0,
     JSON.stringify({ calls: subCalls(), h, n }));
 
   // 5. Detect toggle from Off subscribes with the last pipelines (ArUco); page hide deletes, visible again re-subscribes
-  await page.click('#btn-det'); await page.waitForTimeout(300);
+  await openVis(page); await page.click('#btn-det'); await page.waitForTimeout(300);
+  await openVis(page);
   h = await hud(page);
   check(`${tag} detect from off`, SUBS.size === 1 && JSON.stringify([...SUBS.values()][0].pipelines) === '["aruco"]' && h.on.join() === 'aruco', JSON.stringify({ subs: [...SUBS], h }));
   await setHidden(page, true); await page.waitForTimeout(300);
   check(`${tag} hidden deletes`, SUBS.size === 0, JSON.stringify([...SUBS]));
   await setHidden(page, false); await page.waitForTimeout(300);
   check(`${tag} visible resubscribes`, SUBS.size === 1, JSON.stringify([...SUBS]));
-  await page.click('#btn-det'); await page.waitForTimeout(300);
+  await openVis(page); await page.click('#btn-det'); await page.waitForTimeout(300);
   check(`${tag} detect off`, SUBS.size === 0 && POSTS.length === 0, JSON.stringify({ subs: [...SUBS], POSTS }));
 
   // 6. no YOLO model: YOLO / Both disabled
   V.yolo = false;
   await page.evaluate(() => window.__vision.vmRefresh()); await page.waitForTimeout(150);
+  await openVis(page);
   h = await hud(page);
   check(`${tag} no model`, h.disabled.sort().join() === 'both,yolo', JSON.stringify(h));
   if (ui === 'expert') { file = path.join(out, `vision_nomodel_${tag}.png`); await page.screenshot({ path: file }); shots.push(file); }
@@ -195,12 +205,13 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
   // 7. API 1 provider (no subscriptions): the selector sets the global mode as before
   V = { ...V, v2: false, yolo: true, mode: 'yolo', enabled: false };
   await page.evaluate(() => window.__vision.vmRefresh()); await page.waitForTimeout(150);
-  await page.click('#vmode button[data-vm="both"]'); await page.waitForTimeout(300);
+  await openVis(page); await page.click('#vmode button[data-vm="both"]'); await page.waitForTimeout(300);
   check(`${tag} api1 mode post`, JSON.stringify(POSTS.at(-1)) === JSON.stringify({ mode: 'both', enabled: true }) && V.enabled, JSON.stringify(POSTS));
 
   // 8. provider without /api/mode: selector hidden, Detect stays
   V.route = false;
   await page.evaluate(() => window.__vision.vmRefresh()); await page.waitForTimeout(150);
+  await openVis(page);
   h = await hud(page);
   check(`${tag} old provider hides selector`, !h.shown, JSON.stringify(h));
 

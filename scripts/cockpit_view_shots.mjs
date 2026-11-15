@@ -69,10 +69,13 @@ const STICKS = ['#pad-sxy', '#pad-sz', '#pad-sgrip', '#s-grip-readout', '.preset
 
 const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROME || undefined, args: ['--enable-unsafe-swiftshader', '--use-angle=swiftshader'] });
 const rectOf = (page, sel) => page.evaluate((s) => { const e = document.querySelector(s); if (!e) return null; const r = e.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height, b: r.bottom, r: r.right }; }, sel);
-// element at the centre of sel is sel itself or inside it (nothing covers it)
+// element at the centre of sel is sel itself or inside it (nothing covers it); scrolled into view if needed
 const onTop = (page, sel) => page.evaluate((s) => {
   const e = document.querySelector(s); if (!e) return false;
-  const r = e.getBoundingClientRect(); const h = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+  let r = e.getBoundingClientRect();
+  // a scrolling page (phone portrait): bring the target on screen first, elementFromPoint only sees the viewport
+  if (r.bottom > innerHeight || r.top < 0) { e.scrollIntoView({ block: 'center' }); r = e.getBoundingClientRect(); }
+  const h = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
   return !!h && (h === e || e.contains(h));
 }, sel);
 const visible = (page, sel) => page.evaluate((s) => { const e = document.querySelector(s); if (!e) return false; const r = e.getBoundingClientRect(); const cs = getComputedStyle(e); return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none'; }, sel);
