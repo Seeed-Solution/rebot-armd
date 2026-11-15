@@ -79,174 +79,7 @@ pub async fn upload_concurrency_middleware(
 // Pure-Rust cryptographic & encoding helpers (zero extra crates)
 // ---------------------------------------------------------------------------
 
-/// Streaming SHA-256 implementation according to FIPS 180-4.
-///
-/// Uses an internal 64-byte block buffer to avoid unnecessary memory allocations
-/// and copies when streaming large slices or files.
-#[derive(Clone, Debug)]
-pub struct Sha256 {
-    state: [u32; 8],
-    buffer: [u8; 64],
-    buffer_len: usize,
-    total_len: u64,
-}
-
-impl Default for Sha256 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Sha256 {
-    pub const fn new() -> Self {
-        Self {
-            state: [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-                0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-            ],
-            buffer: [0u8; 64],
-            buffer_len: 0,
-            total_len: 0,
-        }
-    }
-
-    fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
-        const K: [u32; 64] = [
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
-            0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-            0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
-            0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-            0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
-            0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
-            0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-            0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-        ];
-
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
-                block[4 * i],
-                block[4 * i + 1],
-                block[4 * i + 2],
-                block[4 * i + 3],
-            ]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-
-        let mut a = state[0];
-        let mut b = state[1];
-        let mut c = state[2];
-        let mut d = state[3];
-        let mut e = state[4];
-        let mut f = state[5];
-        let mut g = state[6];
-        let mut h_val = state[7];
-
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = h_val.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-
-            h_val = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-
-        state[0] = state[0].wrapping_add(a);
-        state[1] = state[1].wrapping_add(b);
-        state[2] = state[2].wrapping_add(c);
-        state[3] = state[3].wrapping_add(d);
-        state[4] = state[4].wrapping_add(e);
-        state[5] = state[5].wrapping_add(f);
-        state[6] = state[6].wrapping_add(g);
-        state[7] = state[7].wrapping_add(h_val);
-    }
-
-    pub fn update(&mut self, mut data: &[u8]) {
-        self.total_len = self.total_len.wrapping_add(data.len() as u64);
-
-        if self.buffer_len > 0 {
-            let to_copy = (64 - self.buffer_len).min(data.len());
-            self.buffer[self.buffer_len..self.buffer_len + to_copy].copy_from_slice(&data[..to_copy]);
-            self.buffer_len += to_copy;
-            data = &data[to_copy..];
-
-            if self.buffer_len == 64 {
-                let block = self.buffer;
-                Self::compress(&mut self.state, &block);
-                self.buffer_len = 0;
-            }
-        }
-
-        while data.len() >= 64 {
-            let chunk: &[u8; 64] = data[..64].try_into().expect("slice has at least 64 bytes");
-            Self::compress(&mut self.state, chunk);
-            data = &data[64..];
-        }
-
-        if !data.is_empty() {
-            self.buffer[..data.len()].copy_from_slice(data);
-            self.buffer_len = data.len();
-        }
-    }
-
-    pub fn finalize(mut self) -> [u8; 32] {
-        let bit_len = self.total_len.wrapping_mul(8);
-
-        self.buffer[self.buffer_len] = 0x80;
-        self.buffer_len += 1;
-
-        if self.buffer_len > 56 {
-            self.buffer[self.buffer_len..64].fill(0);
-            let block = self.buffer;
-            Self::compress(&mut self.state, &block);
-            self.buffer.fill(0);
-            self.buffer_len = 0;
-        } else {
-            self.buffer[self.buffer_len..56].fill(0);
-        }
-
-        self.buffer[56..64].copy_from_slice(&bit_len.to_be_bytes());
-        let block = self.buffer;
-        Self::compress(&mut self.state, &block);
-
-        let mut out = [0u8; 32];
-        for (i, val) in self.state.iter().enumerate() {
-            out[i * 4..i * 4 + 4].copy_from_slice(&val.to_be_bytes());
-        }
-        out
-    }
-
-    pub fn finalize_hex(self) -> String {
-        let digest = self.finalize();
-        let mut out = String::with_capacity(64);
-        for b in digest {
-            use std::fmt::Write;
-            let _ = write!(&mut out, "{:02x}", b);
-        }
-        out
-    }
-}
+pub use crate::gravity::Sha256;
 
 /// Computes the SHA-256 hex digest of the given bytes according to FIPS 180-4.
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -737,6 +570,39 @@ pub async fn get_catalog(Extension(state): Extension<Arc<SandboxState>>) -> Json
 // Pack uploads
 // ---------------------------------------------------------------------------
 
+enum FileValueError {
+    Base64(String),
+    Unsupported,
+}
+
+/// Decodes an uploaded file value: a string, or `{"encoding": "base64"|"utf8", "data": ...}`.
+/// With `marked_base64_only`, a string is decoded only when it carries a `base64:` or
+/// `;base64,` marker and a bad decode is an error; otherwise a string is decoded when it is
+/// valid Base64 and kept as text when it is not.
+fn decode_file_value(val: serde_json::Value, marked_base64_only: bool) -> Result<Vec<u8>, FileValueError> {
+    match val {
+        serde_json::Value::String(s) => {
+            if !marked_base64_only {
+                Ok(base64_decode(&s).unwrap_or_else(|_| s.into_bytes()))
+            } else if s.starts_with("base64:") || s.contains(";base64,") {
+                base64_decode(&s).map_err(FileValueError::Base64)
+            } else {
+                Ok(s.into_bytes())
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let enc = map.get("encoding").and_then(|v| v.as_str()).unwrap_or("utf8");
+            let data = map.get("data").and_then(|v| v.as_str()).unwrap_or("");
+            if enc.eq_ignore_ascii_case("base64") {
+                base64_decode(data).map_err(FileValueError::Base64)
+            } else {
+                Ok(data.as_bytes().to_vec())
+            }
+        }
+        _ => Err(FileValueError::Unsupported),
+    }
+}
+
 fn extract_files_map(
     files: Option<HashMap<String, serde_json::Value>>,
     primary_json: Option<(&str, &serde_json::Value)>,
@@ -750,25 +616,10 @@ fn extract_files_map(
             if !is_safe_relative_path(&rel) {
                 return Err((StatusCode::BAD_REQUEST, format!("Invalid or escaping relative path: {rel}")));
             }
-            let bytes = match val {
-                serde_json::Value::String(s) => {
-                    if s.starts_with("base64:") || s.contains(";base64,") {
-                        base64_decode(&s).map_err(|e| (StatusCode::BAD_REQUEST, format!("Base64 decode error on {rel}: {e}")))?
-                    } else {
-                        s.into_bytes()
-                    }
-                }
-                serde_json::Value::Object(map) => {
-                    let enc = map.get("encoding").and_then(|v| v.as_str()).unwrap_or("utf8");
-                    let data = map.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                    if enc.eq_ignore_ascii_case("base64") {
-                        base64_decode(data).map_err(|e| (StatusCode::BAD_REQUEST, format!("Base64 decode error on {rel}: {e}")))?
-                    } else {
-                        data.as_bytes().to_vec()
-                    }
-                }
-                _ => return Err((StatusCode::BAD_REQUEST, format!("Unsupported file value format for {rel}"))),
-            };
+            let bytes = decode_file_value(val, true).map_err(|e| match e {
+                FileValueError::Base64(e) => (StatusCode::BAD_REQUEST, format!("Base64 decode error on {rel}: {e}")),
+                FileValueError::Unsupported => (StatusCode::BAD_REQUEST, format!("Unsupported file value format for {rel}")),
+            })?;
             out.insert(rel, bytes);
         }
     }
@@ -788,21 +639,10 @@ fn extract_files_map(
             if !is_safe_relative_path(&rel) {
                 return Err((StatusCode::BAD_REQUEST, format!("Invalid asset relative path: {rel}")));
             }
-            let bytes = match val {
-                serde_json::Value::String(s) => {
-                    base64_decode(&s).unwrap_or_else(|_| s.into_bytes())
-                }
-                serde_json::Value::Object(map) => {
-                    let enc = map.get("encoding").and_then(|v| v.as_str()).unwrap_or("utf8");
-                    let data = map.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                    if enc.eq_ignore_ascii_case("base64") {
-                        base64_decode(data).map_err(|e| (StatusCode::BAD_REQUEST, format!("Base64 decode error on {rel}: {e}")))?
-                    } else {
-                        data.as_bytes().to_vec()
-                    }
-                }
-                _ => return Err((StatusCode::BAD_REQUEST, format!("Unsupported asset value format for {rel}"))),
-            };
+            let bytes = decode_file_value(val, false).map_err(|e| match e {
+                FileValueError::Base64(e) => (StatusCode::BAD_REQUEST, format!("Base64 decode error on {rel}: {e}")),
+                FileValueError::Unsupported => (StatusCode::BAD_REQUEST, format!("Unsupported asset value format for {rel}")),
+            })?;
             out.insert(rel, bytes);
         }
     }
@@ -1158,21 +998,10 @@ pub async fn upload_policy(
                 if !is_safe_relative_path(&rel) {
                     return Err((StatusCode::BAD_REQUEST, format!("Invalid path {rel}")));
                 }
-                let bytes = match val {
-                    serde_json::Value::String(s) => {
-                        base64_decode(&s).unwrap_or_else(|_| s.into_bytes())
-                    }
-                    serde_json::Value::Object(map) => {
-                        let enc = map.get("encoding").and_then(|v| v.as_str()).unwrap_or("utf8");
-                        let data = map.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                        if enc.eq_ignore_ascii_case("base64") {
-                            base64_decode(data).map_err(|e| (StatusCode::BAD_REQUEST, e))?
-                        } else {
-                            data.as_bytes().to_vec()
-                        }
-                    }
-                    _ => return Err((StatusCode::BAD_REQUEST, "Invalid file format".to_string())),
-                };
+                let bytes = decode_file_value(val, false).map_err(|e| match e {
+                    FileValueError::Base64(e) => (StatusCode::BAD_REQUEST, e),
+                    FileValueError::Unsupported => (StatusCode::BAD_REQUEST, "Invalid file format".to_string()),
+                })?;
                 file_map.insert(rel, bytes);
             }
         }
@@ -1551,27 +1380,7 @@ pub async fn activate(
             "seed": payload.seed.unwrap_or(cur_seed),
         })).unwrap();
 
-        let req_fut = proxy::upstream_request(&upstream, Method::POST, "/sim/scene", Some(&body_bytes));
-        match tokio::time::timeout(std::time::Duration::from_secs(10), req_fut).await {
-            Ok(Ok(resp)) => {
-                if !resp.status.is_success() {
-                    let err_msg = String::from_utf8_lossy(&resp.body).to_string();
-                    return Err((resp.status, Json(serde_json::json!({"error": format!("rebot-sim error: {err_msg}"), "sim_url": sim_url}))));
-                }
-            }
-            Ok(Err(e)) => {
-                return Err((StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                    "error": format!("Cannot connect to rebot-sim at {sim_url}: {e}"),
-                    "sim_url": sim_url,
-                }))));
-            }
-            Err(_elapsed) => {
-                return Err((StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({
-                    "error": format!("Timeout connecting to rebot-sim at {sim_url}"),
-                    "sim_url": sim_url,
-                }))));
-            }
-        }
+        sim_post(&upstream, &sim_url, "/sim/scene", &body_bytes).await?;
     }
 
     // Success: mutate ONLY mode, active packs, seed, auto_start_policy and updated_at_ms
@@ -1616,6 +1425,31 @@ pub async fn activate(
         "scene_manifest": scene_manifest,
         "tool_manifest": tool_manifest,
     })))
+}
+
+/// POSTs `body` to rebot-sim; a non-2xx reply, connect failure or 10 s timeout becomes the handler error.
+async fn sim_post(
+    upstream: &DetectorUpstream,
+    sim_url: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let req_fut = proxy::upstream_request(upstream, Method::POST, path, Some(body));
+    match tokio::time::timeout(std::time::Duration::from_secs(10), req_fut).await {
+        Ok(Ok(resp)) if !resp.status.is_success() => {
+            let err_msg = String::from_utf8_lossy(&resp.body).to_string();
+            Err((resp.status, Json(serde_json::json!({"error": format!("rebot-sim error: {err_msg}"), "sim_url": sim_url}))))
+        }
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, Json(serde_json::json!({
+            "error": format!("Cannot connect to rebot-sim at {sim_url}: {e}"),
+            "sim_url": sim_url,
+        })))),
+        Err(_elapsed) => Err((StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({
+            "error": format!("Timeout connecting to rebot-sim at {sim_url}"),
+            "sim_url": sim_url,
+        })))),
+    }
 }
 
 /// GET /api/v1/sandbox/bundle
@@ -1755,30 +1589,7 @@ pub async fn reset(
         let upstream = DetectorUpstream::parse(&sim_url)
             .map_err(|e| (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e, "sim_url": sim_url}))))?;
         let body = serde_json::to_vec(&serde_json::json!({"seed": seed})).unwrap();
-        let req_fut = proxy::upstream_request(&upstream, Method::POST, "/sim/reset", Some(&body));
-        match tokio::time::timeout(std::time::Duration::from_secs(10), req_fut).await {
-            Ok(Ok(resp)) => {
-                if !resp.status.is_success() {
-                    let err_msg = String::from_utf8_lossy(&resp.body).to_string();
-                    return Err((resp.status, Json(serde_json::json!({
-                        "error": format!("rebot-sim error: {err_msg}"),
-                        "sim_url": sim_url,
-                    }))));
-                }
-            }
-            Ok(Err(e)) => {
-                return Err((StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                    "error": format!("Cannot connect to rebot-sim at {sim_url}: {e}"),
-                    "sim_url": sim_url,
-                }))));
-            }
-            Err(_elapsed) => {
-                return Err((StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({
-                    "error": format!("Timeout connecting to rebot-sim at {sim_url}"),
-                    "sim_url": sim_url,
-                }))));
-            }
-        }
+        sim_post(&upstream, &sim_url, "/sim/reset", &body).await?;
     }
 
     let (seq, final_seed) = {
@@ -1825,30 +1636,7 @@ pub async fn set_io(
         let upstream = DetectorUpstream::parse(&sim_url)
             .map_err(|e| (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e, "sim_url": sim_url}))))?;
         let req_body = serde_json::to_vec(&updates).unwrap();
-        let req_fut = proxy::upstream_request(&upstream, Method::POST, "/sim/io", Some(&req_body));
-        match tokio::time::timeout(std::time::Duration::from_secs(10), req_fut).await {
-            Ok(Ok(resp)) => {
-                if !resp.status.is_success() {
-                    let err_msg = String::from_utf8_lossy(&resp.body).to_string();
-                    return Err((resp.status, Json(serde_json::json!({
-                        "error": format!("rebot-sim error: {err_msg}"),
-                        "sim_url": sim_url,
-                    }))));
-                }
-            }
-            Ok(Err(e)) => {
-                return Err((StatusCode::BAD_GATEWAY, Json(serde_json::json!({
-                    "error": format!("Cannot connect to rebot-sim at {sim_url}: {e}"),
-                    "sim_url": sim_url,
-                }))));
-            }
-            Err(_elapsed) => {
-                return Err((StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({
-                    "error": format!("Timeout connecting to rebot-sim at {sim_url}"),
-                    "sim_url": sim_url,
-                }))));
-            }
-        }
+        sim_post(&upstream, &sim_url, "/sim/io", &req_body).await?;
     }
 
     let (io_seq, desired) = {
