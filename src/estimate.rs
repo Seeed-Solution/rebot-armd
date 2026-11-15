@@ -5,31 +5,14 @@
 //! Sources are offered in evaluation order. The first deciding source that accepts is chosen;
 //! record-only sources are reported but never chosen and never veto. A veto (OBJECT_TOO_TALL)
 //! from a deciding source is kept (the first one) and returned only when no later source accepts.
-use serde::{Deserialize, Serialize};
-
 use crate::macro_action::Stop;
+pub use crate::motion::EstimateEntry;
 
 /// Result of one source.
 pub enum SourceResult {
     Accept(f64),
     Reject(String),
     Veto(Stop),
-}
-
-/// One evaluated source, reported in `ActionStatus.height_estimates` / `yaw_estimates` /
-/// `width_estimates`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EstimateEntry {
-    /// Height: `depth:<anchor>`, `depth`, `scale`, `parallax`, `probe`, `prior`.
-    /// Yaw: `mask`, `depth`, `box`. Width: `mask`, `depth`.
-    pub source: String,
-    /// The value the source measured, also when rejected or vetoed: height above the table (m),
-    /// yaw = the object's long side in the image (deg, [-90, 90)), width across the jaws (m).
-    pub value: Option<f32>,
-    pub used: bool,
-    pub record_only: bool,
-    /// Reject reason or veto code.
-    pub reason: Option<String>,
 }
 
 #[derive(Default)]

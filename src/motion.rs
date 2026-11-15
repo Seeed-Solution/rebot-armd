@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::estimate::EstimateEntry;
 use crate::kinematics::{self, Pose};
 use crate::model::{CameraMount, JointLimit, WorkspacePolicy};
 #[cfg(not(target_arch = "wasm32"))]
@@ -1072,4 +1071,20 @@ pub struct MacroMotionDiag {
 
 impl ActionStatus {
     pub fn is_running(&self) -> bool { self.state == "running" }
+}
+
+/// One evaluated source, reported in `ActionStatus.height_estimates` / `yaw_estimates` /
+/// `width_estimates`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EstimateEntry {
+    /// Height: `depth:<anchor>`, `depth`, `scale`, `parallax`, `probe`, `prior`.
+    /// Yaw: `mask`, `depth`, `box`. Width: `mask`, `depth`.
+    pub source: String,
+    /// The value the source measured, also when rejected or vetoed: height above the table (m),
+    /// yaw = the object's long side in the image (deg, [-90, 90)), width across the jaws (m).
+    pub value: Option<f32>,
+    pub used: bool,
+    pub record_only: bool,
+    /// Reject reason or veto code.
+    pub reason: Option<String>,
 }
