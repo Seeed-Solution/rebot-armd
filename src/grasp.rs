@@ -257,13 +257,15 @@ impl TaskModels {
     }
 }
 
+/// `requires.model_kind`, compared exactly with the provider's `model.kind` (rebot-vision:
+/// `detect`, `segment` for an instance segmentation model, `obb` for an oriented box model).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ModelKind { Detect, Segment }
+pub enum ModelKind { Detect, Segment, Obb }
 
 impl ModelKind {
     pub fn name(self) -> &'static str {
-        match self { Self::Detect => "detect", Self::Segment => "segment" }
+        match self { Self::Detect => "detect", Self::Segment => "segment", Self::Obb => "obb" }
     }
 }
 
@@ -3779,6 +3781,9 @@ mod tests {
             "overrides": {"yaw_sources": ["mask"]}}, "x": {}})).unwrap();
         assert_eq!(ok.tasks["cup-2_a"].requires, TaskRequires { model_kind: Some(ModelKind::Segment), depth: Some(DepthReq::Any) });
         assert!(ok.tasks["x"].requires.is_empty() && ok.tasks["x"].overrides.is_empty());
+        let obb = tasks_setup(serde_json::json!({"part": {"requires": {"model_kind": "obb"}}})).unwrap();
+        assert_eq!(obb.tasks["part"].requires.model_kind, Some(ModelKind::Obb));
+        assert_eq!(serde_json::to_value(&obb.tasks["part"]).unwrap()["requires"], serde_json::json!({"model_kind": "obb"}));
         let long = "a".repeat(33);
         for (tasks, msg) in [
             (serde_json::json!({"Cup": {}}), "name"),
@@ -3790,7 +3795,7 @@ mod tests {
             (serde_json::json!({"a": {"overrides": {"bogus": 1}}}), "unknown grasp setup field: bogus"),
             (serde_json::json!({"a": {"overrides": {"grasp_height_m": 5.0}}}), "grasp_height_m"),
             (serde_json::json!({"a": {"overrides": {"yaw_sources": ["mask", "mask"]}}}), "repeat"),
-            (serde_json::json!({"a": {"requires": {"model_kind": "obb"}}}), "invalid grasp setup"),
+            (serde_json::json!({"a": {"requires": {"model_kind": "pose"}}}), "invalid grasp setup"),
             (serde_json::json!({"a": {"requires": {"depth": "stereo"}}}), "invalid grasp setup"),
             (serde_json::json!({"a": {"requires": {"gpu": true}}}), "invalid grasp setup"),
             (serde_json::json!({"a": {"model": "x"}}), "invalid grasp setup"),
@@ -3869,6 +3874,11 @@ mod tests {
             assert_eq!(req(None, Some(DepthReq::Any)).check("t", &empty), Ok(()), "depth alone needs no detector");
         }
         assert!(full.yolo_available, "available.yolo not reported: a detector is assumed");
+        // obb: an oriented box model satisfies obb only; segment stays the segmentation model
+        let obb = ModeInfo { model_kind: Some("obb".into()), ..full.clone() };
+        assert_eq!(req(Some(ModelKind::Obb), None).check("t", &obb), Ok(()));
+        assert_eq!(req(Some(ModelKind::Segment), None).check("t", &obb).unwrap_err(), "task t needs model_kind segment, provider has obb");
+        assert_eq!(req(Some(ModelKind::Obb), None).check("t", &full).unwrap_err(), "task t needs model_kind obb, provider has segment");
     }
 
     #[test]

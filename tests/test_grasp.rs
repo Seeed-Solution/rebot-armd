@@ -3067,7 +3067,7 @@ async fn grasp_tasks_through_the_setup_api_persist_and_reload() {
     assert!(reply["message"].as_str().unwrap().starts_with("grasp task plain:"), "{reply}");
     // invalid tasks: bad name, nested tasks, unknown field, unknown task key
     for bad in [json!({"Cup": {}}), json!({"a": {"overrides": {"tasks": {}}}}), json!({"a": {"overrides": {"bogus": 1}}}),
-                json!({"a": {"needs": {}}}), json!({"a": {"requires": {"model_kind": "obb"}}})] {
+                json!({"a": {"needs": {}}}), json!({"a": {"requires": {"model_kind": "pose"}}})] {
         let reply = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/grasp/setup", json!({"tasks": bad})).await;
         assert_eq!(reply["code"], "INVALID_COMMAND", "{bad}: {reply}");
     }
