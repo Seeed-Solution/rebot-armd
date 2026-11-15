@@ -241,6 +241,7 @@ pub struct SupervisorInner {
     pub gripper_high_torque_ticks: u32,
     pub gripper_low_torque_ticks: u32,
     pub gripper_stall_sign: f32,
+    pub gripper_prev_hw_overload: bool,
     /// J7 freeze during a whole-arm reference (joint quintic, path, replay): (hold, closing sign).
     /// Set once J7 stalls or an object is held; the reference may not drive J7 further in the
     /// stall direction until it ends or moves J7 the other way.
@@ -423,7 +424,8 @@ impl SupervisorInner {
             gripper_stalled: false,
             gripper_high_torque_ticks: 0,
             gripper_low_torque_ticks: 0,
-            gripper_stall_sign: 1.0,
+            gripper_stall_sign: 0.0,
+            gripper_prev_hw_overload: false,
             gripper_motion_hold: None,
             park_gripper_contact: false,
             park_release: None,
@@ -542,9 +544,59 @@ impl SupervisorInner {
     }
 
     fn apply_driver_limits(&mut self, driver: &dyn ArmDriver) {
+        let gripper_idx = self.config.gripper_index();
         for (i, limit) in self.config.limits.iter_mut().enumerate() {
             if let Some(max) = driver.max_command_velocity(i) {
                 if max.is_finite() && max > 0.0 { limit.max_velocity = limit.max_velocity.min(max); }
+            }
+            if let Some((d_min, d_max)) = driver.position_limits(i) {
+                if d_min.is_finite() && d_max.is_finite() && d_min < d_max {
+                    let new_min = limit.min_position.max(d_min);
+                    let new_max = limit.max_position.min(d_max);
+                    if new_max - new_min >= 1e-2 {
+                        if (new_min - limit.min_position).abs() > 1e-4 || (new_max - limit.max_position).abs() > 1e-4 {
+                            tracing::info!(
+                                "Intersected joint '{}' position limits with driver range: profile=[{:.4}, {:.4}], hw=[{:.4}, {:.4}] -> [{:.4}, {:.4}]",
+                                limit.name, limit.min_position, limit.max_position, d_min, d_max, new_min, new_max
+                            );
+                        }
+                        limit.min_position = new_min;
+                        limit.max_position = new_max;
+                        if i < self.config.home_positions.len() {
+                            self.config.home_positions[i] = self.config.home_positions[i].clamp(new_min, new_max);
+                        }
+                        if let Some(ref mut resting) = self.config.resting_pose {
+                            if let Some(ref mut pos) = resting.positions {
+                                if i < pos.len() {
+                                    pos[i] = pos[i].clamp(new_min, new_max);
+                                }
+                            }
+                        }
+                        if gripper_idx == Some(i) {
+                            if let Some(ref mut policy) = self.config.gripper_policy {
+                                let c = policy.closed_rad.clamp(new_min, new_max);
+                                let o = policy.open_rad.clamp(new_min, new_max);
+                                if (c - o).abs() > 1e-3 {
+                                    policy.closed_rad = c;
+                                    policy.open_rad = o;
+                                }
+                            }
+                            if let Some(ref mut base) = self.base_gripper_policy {
+                                let c = base.closed_rad.clamp(new_min, new_max);
+                                let o = base.open_rad.clamp(new_min, new_max);
+                                if (c - o).abs() > 1e-3 {
+                                    base.closed_rad = c;
+                                    base.open_rad = o;
+                                }
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            "Driver position limits [{:.4}, {:.4}] for joint '{}' would collapse profile limits [{:.4}, {:.4}]; keeping profile limits",
+                            d_min, d_max, limit.name, limit.min_position, limit.max_position
+                        );
+                    }
+                }
             }
         }
     }
@@ -1318,6 +1370,11 @@ impl SupervisorInner {
             return Err(error);
         }
         let state = self.safety.set_torque(false)?;
+        self.gripper_stalled = false;
+        self.gripper_stall_sign = 0.0;
+        self.gripper_prev_hw_overload = false;
+        self.gripper_high_torque_ticks = 0;
+        self.gripper_low_torque_ticks = 0;
         if self.driver.is_none() { self.measured_velocities.fill(0.0); }
         Ok(state)
     }
@@ -1456,6 +1513,11 @@ impl SupervisorInner {
                 self.unload_settle = None;
                 self.is_torqued = false;
                 self.active_trajectory = None;
+                self.gripper_stalled = false;
+                self.gripper_stall_sign = 0.0;
+                self.gripper_prev_hw_overload = false;
+                self.gripper_high_torque_ticks = 0;
+                self.gripper_low_torque_ticks = 0;
                 self.commanded_velocities = vec![0.0; self.config.dof];
                 if self.driver.is_none() {
                     self.measured_velocities = vec![0.0; self.config.dof];
@@ -1550,6 +1612,9 @@ impl SupervisorInner {
         self.is_torqued = false;
         self.pending_rearm = true;
         self.output_suspended = false;
+        self.gripper_stalled = false;
+        self.gripper_stall_sign = 0.0;
+        self.gripper_prev_hw_overload = false;
         self.stop_motion();
         if self.measured_positions.iter().all(|q| q.is_finite()) {
             self.commanded_positions = self.measured_positions.clone();
@@ -1559,16 +1624,27 @@ impl SupervisorInner {
         self.commanded_accelerations.fill(0.0);
     }
 
+    pub(crate) fn consume_pending_estop(&mut self) -> bool {
+        let req = self.requested_estop_count.load(Ordering::SeqCst);
+        if req > self.applied_estop_count {
+            self.applied_estop_count = req;
+            self.e_stop_latched.store(true, Ordering::SeqCst);
+            self.apply_stop_policy(StopPolicy::EStopLatch);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn check_concurrent_estop(inner: &mut SupervisorInner) -> Result<(), SafetyError> {
+        if inner.consume_pending_estop() {
+            return Err(SafetyError::EStopActive);
+        }
+        Ok(())
+    }
+
     pub fn clear_fault(&mut self) -> Result<SafetyState, SafetyError> {
-        let check_concurrent_estop = |inner: &mut Self| -> Result<(), SafetyError> {
-            if inner.requested_estop_count.load(Ordering::SeqCst) != inner.applied_estop_count {
-                inner.e_stop_latched.store(true, Ordering::SeqCst);
-                inner.apply_stop_policy(StopPolicy::EStopLatch);
-                return Err(SafetyError::EStopActive);
-            }
-            Ok(())
-        };
-        check_concurrent_estop(self)?;
+        Self::check_concurrent_estop(self)?;
         if !self.safety.state().is_stopped() { return Ok(self.safety.state().clone()); }
         if self.gravity_comp_blocks_clear() {
             return Err(SafetyError::ClearFaultRejected("Gravity compensation: the switch back to POS_VEL is not confirmed yet".into()));
@@ -1674,15 +1750,16 @@ impl SupervisorInner {
         self.commanded_accelerations.fill(0.0);
         self.following_error_since = None;
         self.bus_loss_instant = None;
-        check_concurrent_estop(self)?;
+        self.gripper_stalled = false;
+        self.gripper_stall_sign = 0.0;
+        self.gripper_prev_hw_overload = false;
+        self.gripper_high_torque_ticks = 0;
+        self.gripper_low_torque_ticks = 0;
+        Self::check_concurrent_estop(self)?;
         let state = self.safety.clear_fault()?;
         self.handover_settling_since = None;
         self.e_stop_latched.store(false, Ordering::SeqCst);
-        if self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count {
-            self.e_stop_latched.store(true, Ordering::SeqCst);
-            self.apply_stop_policy(StopPolicy::EStopLatch);
-            return Err(SafetyError::EStopActive);
-        }
+        Self::check_concurrent_estop(self)?;
         self.last_heartbeat = Instant::now();
         self.last_motion_frame = Instant::now();
         Ok(state)
@@ -3128,8 +3205,9 @@ impl SupervisorInner {
     }
 
     pub fn tick(&mut self, dt: f64) -> ArmObservation {
+        self.consume_pending_estop();
         // Immediate atomic e-stop latch check before any processing
-        if self.e_stop_latched.load(Ordering::SeqCst) && !self.safety.state().is_stopped() {
+        if self.e_stop_latched.load(Ordering::SeqCst) && *self.safety.state() != SafetyState::EStop {
             self.apply_stop_policy(StopPolicy::EStopLatch);
         }
 
@@ -3174,7 +3252,9 @@ impl SupervisorInner {
                 }
             }
         }
-        self.update_motor_errors(motor_errors.unwrap_or_default());
+        if let Some(errors) = motor_errors {
+            self.update_motor_errors(errors);
+        }
         if invalid_feedback && self.is_torqued && !self.safety.state().is_stopped() {
             self.stop_motion();
             self.commanded_velocities.fill(0.0);
@@ -3237,12 +3317,48 @@ impl SupervisorInner {
                 .and_then(|e| e.as_ref())
                 .is_some_and(|e| (e.code & 0x20) != 0);
 
+            let hw_overload_rising = is_bus_fresh && gripper_hw_overload && !self.gripper_prev_hw_overload;
+            self.gripper_prev_hw_overload = is_bus_fresh && gripper_hw_overload;
+
+            if !gripper_hw_overload && !self.gripper_stalled {
+                self.gripper_stall_sign = 0.0;
+            }
+
+            let desired_g = self.servo_target.as_ref().and_then(|st| st.get(g_idx).copied())
+                .or_else(|| self.target_positions.get(g_idx).copied())
+                .unwrap_or(p_cmd);
+            let close_dir = self.effective_gripper_policy()
+                .map(|p| if p.closed_rad < p.open_rad { -1.0_f32 } else { 1.0_f32 })
+                .unwrap_or(1.0_f32);
+            let pushing_into_stall = self.gripper_stall_sign != 0.0
+                && ((desired_g - p_cmd) * self.gripper_stall_sign > 1e-4
+                    || (desired_g - p_meas) * self.gripper_stall_sign > 1e-2);
+            let escaping_known_stall = self.gripper_stall_sign != 0.0
+                && (desired_g - p_cmd) * self.gripper_stall_sign < -1e-4;
+            let should_latch_hw_overload = if hw_overload_rising {
+                !escaping_known_stall
+            } else {
+                self.gripper_stall_sign == 0.0 || pushing_into_stall
+            };
+
             if !is_bus_fresh {
                 self.gripper_high_torque_ticks = 0;
                 self.gripper_low_torque_ticks = 0;
-            } else if !self.gripper_stalled && gripper_hw_overload {
+            } else if !self.gripper_stalled && gripper_hw_overload && should_latch_hw_overload {
                 self.gripper_stalled = true;
-                let dir = if gap.abs() > 1e-3 { gap } else { tau_g };
+                let dir = if gap.abs() > 1e-3 {
+                    gap
+                } else if (desired_g - p_meas).abs() > 1e-3 {
+                    desired_g - p_meas
+                } else if has_torque_feedback && tau_g.abs() > 1e-3 {
+                    tau_g
+                } else if has_load_feedback && load_g.abs() > 1e-3 {
+                    load_g
+                } else if self.gripper_stall_sign != 0.0 {
+                    self.gripper_stall_sign
+                } else {
+                    close_dir
+                };
                 self.gripper_stall_sign = if dir >= 0.0 { 1.0 } else { -1.0 };
                 self.gripper_low_torque_ticks = 0;
                 self.gripper_high_torque_ticks = 0;
@@ -3259,7 +3375,7 @@ impl SupervisorInner {
                         }
                     }
                 }
-            } else if !self.gripper_stalled {
+            } else if !self.gripper_stalled && !gripper_hw_overload {
                 let is_stalled = if has_torque_feedback {
                     tau_g.abs() >= GRIPPER_STALL_LATCH_NM && v_g.abs() < 0.10
                 } else {
@@ -3293,7 +3409,7 @@ impl SupervisorInner {
                 } else {
                     self.gripper_high_torque_ticks = 0;
                 }
-            } else {
+            } else if self.gripper_stalled {
                 self.gripper_high_torque_ticks = 0;
                 let is_released = if has_torque_feedback {
                     tau_g.abs() < GRIPPER_STALL_RELEASE_NM
@@ -3309,6 +3425,9 @@ impl SupervisorInner {
                 } else {
                     self.gripper_low_torque_ticks = 0;
                 }
+            } else {
+                self.gripper_high_torque_ticks = 0;
+                self.gripper_low_torque_ticks = 0;
             }
         }
 
@@ -4311,13 +4430,27 @@ impl ArmSupervisor {
     }
 
     pub async fn trigger_e_stop(&self) -> (SafetyState, u64) {
-        self.requested_estop_count.fetch_add(1, Ordering::SeqCst);
         self.e_stop_latched.store(true, Ordering::SeqCst);
-        let mut inner = self.inner.write().await;
-        inner.applied_estop_count += 1;
-        inner.e_stop_latched.store(true, Ordering::SeqCst);
-        inner.apply_stop_policy(StopPolicy::EStopLatch);
-        (inner.safety.state().clone(), inner.safety.epoch_id())
+        self.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+        let inner = Arc::clone(&self.inner);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let jh = handle.spawn(async move {
+                let mut guard = inner.write().await;
+                guard.consume_pending_estop();
+                (guard.safety.state().clone(), guard.safety.epoch_id())
+            });
+            match jh.await {
+                Ok(res) => res,
+                Err(_) => {
+                    let guard = self.inner.read().await;
+                    (guard.safety.state().clone(), guard.safety.epoch_id())
+                }
+            }
+        } else {
+            let mut guard = inner.write().await;
+            guard.consume_pending_estop();
+            (guard.safety.state().clone(), guard.safety.epoch_id())
+        }
     }
 
     pub async fn clear_fault(&self) -> Result<SafetyState, ArmError> {

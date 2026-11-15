@@ -2798,3 +2798,247 @@ fn test_feetech_read_u16_tx_echo_false_matching_bytes_not_skipped() {
     let expected_val = u16::from_le_bytes([0x1F, 0x02]);
     assert_eq!(val, expected_val);
 }
+
+// -------------------------------------------------------------------------
+// 56. Cancelled trigger_e_stop() self-healing on tick() and single clear_fault()
+// -------------------------------------------------------------------------
+#[tokio::test]
+async fn test_cancelled_trigger_estop_self_heals_on_tick_and_single_clear_fault() {
+    let mut config = ArmConfig::default();
+    config.dof = 1;
+    config.limits = vec![JointLimit::new("j1", -PI, PI, 1.0, 1.0)];
+    config.home_positions = vec![0.0];
+
+    let supervisor = Arc::new(ArmSupervisor::new(config));
+
+    // Acquire write lock to simulate ongoing work holding the lock
+    let guard = supervisor.inner().write().await;
+
+    // Concurrently trigger e-stop with timeout so the future is dropped/cancelled
+    // while waiting for the inner write lock
+    let sup_clone = Arc::clone(&supervisor);
+    let _ = tokio::time::timeout(Duration::from_millis(10), async move {
+        sup_clone.trigger_e_stop().await;
+    })
+    .await;
+
+    // requested_estop_count was incremented before write lock acquisition
+    assert!(supervisor.requested_estop_count.load(Ordering::SeqCst) > 0);
+
+    // Release write lock
+    drop(guard);
+
+    // tick() reconciles applied_estop_count via consume_pending_estop()
+    supervisor.tick(0.01).await;
+
+    // A single clear_fault() must now succeed!
+    let res = supervisor.clear_fault().await;
+    assert!(res.is_ok(), "Expected single clear_fault() to succeed, got: {:?}", res);
+    assert!(!supervisor.e_stop_latched.load(Ordering::SeqCst));
+}
+
+// -------------------------------------------------------------------------
+// 57. Persistent 0x20 gripper overload allows reverse escape while blocking squeeze
+// -------------------------------------------------------------------------
+#[tokio::test]
+async fn test_gripper_persistent_hw_overload_reverse_escape_and_re_squeeze() {
+    let mut config = ArmConfig::default();
+    config.dof = 7;
+    config.gripper_joint = Some(6);
+    config.limits = (0..7)
+        .map(|i| JointLimit::new(format!("j{}", i + 1), -3.14, 3.14, 1.0, 1.0))
+        .collect();
+    config.home_positions = vec![0.0; 7];
+    let mut gp = GripperPolicy::rebot_dm();
+    gp.closed_rad = 1.5;
+    gp.open_rad = 0.0;
+    gp.holding_mode = HoldingMode::LoadAndGap;
+    gp.holding_gap_rad = 0.02;
+    gp.holding_load_fraction = Some(0.2);
+    config.gripper_policy = Some(gp);
+
+    let supervisor = Arc::new(ArmSupervisor::new(config));
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.lease_enabled = false;
+        inner.set_torque(true).unwrap();
+        inner.measured_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
+        inner.commanded_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
+        inner.target_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
+        // Inject motor error 0x20 on gripper (index 6)
+        inner.motor_errors = vec![
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(armd::model::MotorError {
+                code: 0x20,
+                name: "Overload".into(),
+            }),
+        ];
+        inner.last_can_feedback_instant = Some(Instant::now());
+    }
+
+    // Tick: HW overload rises, gripper latches stall
+    supervisor.tick(0.01).await;
+    assert!(supervisor.is_gripper_stalled().await, "Gripper must latch stall on 0x20");
+
+    // Reverse servo command (moving towards open_rad=0.0, delta is negative)
+    let rev_targets = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3];
+    let servo_res = supervisor.servo(rev_targets, 1).await;
+    assert!(servo_res.is_ok(), "Reverse servo command must be accepted");
+    assert!(!supervisor.is_gripper_stalled().await, "Reverse servo command un-stalls gripper");
+
+    // Tick multiple times while 0x20 persists: should NOT re-latch because escaping known stall
+    for _ in 0..5 {
+        {
+            let mut inner = supervisor.inner().write().await;
+            inner.last_can_feedback_instant = Some(Instant::now());
+        }
+        supervisor.tick(0.01).await;
+        assert!(!supervisor.is_gripper_stalled().await, "Must not re-latch while escaping known stall");
+    }
+
+    // Now send squeeze command (towards closed_rad=1.5, delta is positive)
+    let squeeze_targets = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.8];
+    let sq_res = supervisor.servo(squeeze_targets, 1).await;
+    assert!(sq_res.is_ok(), "Squeeze command accepted");
+
+    // Tick: since 0x20 still asserted and pushing into stall, it must re-latch!
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.last_can_feedback_instant = Some(Instant::now());
+    }
+    supervisor.tick(0.01).await;
+    assert!(supervisor.is_gripper_stalled().await, "Must re-latch when pushing into stall with 0x20");
+}
+
+// -------------------------------------------------------------------------
+// 58. [0xFF]-prefixed echo + partial echo in read_register_u16_direct returns model 777
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_drain_tx_echo_ff_noise_and_partial_echo_returns_model_777() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1]);
+    driver.tx_echo = None;
+    driver.tx_echo_auto = true;
+
+    // Read model (id=1, reg=0x03, len=2)
+    let req = feetech::build_read(1, feetech::REG_MODEL_L, 2);
+
+    // Provide RX with leading 0xFF noise byte + full echo + model response (777 = 0x0309)
+    let model_bytes = 777u16.to_le_bytes();
+    let cs = calculate_checksum(1, 4, 0x00, &model_bytes);
+    let mut rx = Vec::new();
+    rx.push(0xFF); // noise byte
+    rx.extend_from_slice(&req); // full echo
+    rx.extend_from_slice(&[0xFF, 0xFF, 1, 4, 0x00, model_bytes[0], model_bytes[1], cs]);
+
+    driver.transport_mut().provide_rx(&rx);
+
+    let val = driver.read_register_u16_direct(1, feetech::REG_MODEL_L).expect("Read model must succeed");
+    assert_eq!(val, 777, "Expected model 777, got {}", val);
+    assert_eq!(driver.tx_echo, Some(true));
+}
+
+// -------------------------------------------------------------------------
+// 59. 6-servo (2-chunk) incomplete_chunk_idx cross-call reassembly + ghost-header non-starvation
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_6servo_incomplete_chunk_idx_cross_call_reassembly_and_ghost_header() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1, 2, 3, 4, 5, 6];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+
+    let build_resp = |id: u8| -> Vec<u8> {
+        let pos = 2048u16.to_le_bytes();
+        let spd = 0u16.to_le_bytes();
+        let load = 100u16.to_le_bytes();
+        let params = [pos[0], pos[1], spd[0], spd[1], load[0], load[1], 75, 40];
+        let cs = calculate_checksum(id, (params.len() + 2) as u8, 0x00, &params);
+        let mut pkt = vec![0xFF, 0xFF, id, (params.len() + 2) as u8, 0x00];
+        pkt.extend_from_slice(&params);
+        pkt.push(cs);
+        pkt
+    };
+
+    // Call 1: Chunk 0 (servos 1, 2, 3) complete, Chunk 1 (servos 4, 5) complete, servo 6 incomplete (4 bytes)
+    let resp6 = build_resp(6);
+    let mut rx1 = Vec::new();
+    for id in 1..=5 {
+        rx1.extend_from_slice(&build_resp(id));
+    }
+    rx1.extend_from_slice(&resp6[..4]); // incomplete servo 6!
+    driver.transport_mut().provide_rx(&rx1);
+
+    let _ = driver.read_joint_states();
+    assert_eq!(driver.incomplete_chunk_idx, Some(1), "Chunk 1 must be marked incomplete");
+
+    // Call 2: Supply the rest of servo 6, plus next cycle's Chunk 0 (servos 1, 2, 3)
+    let mut rx2 = Vec::new();
+    rx2.extend_from_slice(&resp6[4..]); // remaining bytes of servo 6
+    for id in 1..=3 {
+        rx2.extend_from_slice(&build_resp(id));
+    }
+    driver.transport_mut().provide_rx(&rx2);
+
+    let states = driver.read_joint_states().unwrap();
+    assert_eq!(states.len(), 6);
+    assert!(driver.feedback_ages()[5].is_some(), "Servo 6 reassembled across calls");
+
+    // Now test ghost header non-starvation: inject incomplete ghost header bytes
+    let ghost = vec![0xFF, 0xFF, 0x42]; // non-existent servo 0x42 incomplete header
+    driver.transport_mut().provide_rx(&ghost);
+    driver.incomplete_chunk_idx = Some(0); // simulate incomplete flag set
+
+    // Next call should discard ghost header after timeout/drained limit and not starve
+    let mut rx3 = Vec::new();
+    for id in 1..=3 {
+        rx3.extend_from_slice(&build_resp(id));
+    }
+    driver.transport_mut().provide_rx(&rx3);
+
+    let res3 = driver.read_joint_states();
+    assert!(res3.is_ok(), "Must not starve or fail on ghost header");
+}
+
+// -------------------------------------------------------------------------
+// 60. FeetechArmDriver narrower effective_ranges narrows config.limits via apply_driver_limits
+// -------------------------------------------------------------------------
+#[tokio::test]
+async fn test_feetech_narrower_effective_ranges_narrows_config_limits() {
+    let mut config = ArmConfig::default();
+    config.dof = 1;
+    config.limits = vec![JointLimit::new("j1", -3.14, 3.14, 1.0, 1.0)];
+    config.home_positions = vec![0.0];
+
+    let supervisor = Arc::new(ArmSupervisor::new(config));
+
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1]);
+    // Steps 1024..3072 is narrower than full 0..4095
+    driver.effective_ranges = vec![(1024, 3072)];
+
+    let calib = driver.config().joints[0].clone();
+    let expected_min = calib.steps_to_rad(1024).min(calib.steps_to_rad(3072));
+    let expected_max = calib.steps_to_rad(1024).max(calib.steps_to_rad(3072));
+
+    supervisor.set_driver(Box::new(driver)).await;
+
+    let inner = supervisor.inner().read().await;
+    let limit = &inner.config.limits[0];
+    assert!(
+        (limit.min_position - expected_min).abs() < 1e-4,
+        "min_position should be narrowed to {:.4}, got {:.4}",
+        expected_min,
+        limit.min_position
+    );
+    assert!(
+        (limit.max_position - expected_max).abs() < 1e-4,
+        "max_position should be narrowed to {:.4}, got {:.4}",
+        expected_max,
+        limit.max_position
+    );
+}

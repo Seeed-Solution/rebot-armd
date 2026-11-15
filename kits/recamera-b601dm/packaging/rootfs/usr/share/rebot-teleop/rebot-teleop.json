@@ -30,7 +30,12 @@
             "type": "select",
             "title": "Arm Model",
             "title_zh": "机械臂型号",
-            "options": ["rebot-dm", "so-arm101", "mock"],
+            "options": [
+              "rebot-dm",
+              "so-arm101",
+              {"value": "so-arm100", "label": "SO-ARM100 (Feetech UART /dev/ttySC0)"},
+              "mock"
+            ],
             "default": "rebot-dm"
           },
           {

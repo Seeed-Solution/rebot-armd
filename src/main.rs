@@ -181,6 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let name = if follower == "so-arm100" { "so_arm100.json" } else { "so_arm101.json" };
         let candidates = [
             format!("profiles/{name}"),
+            format!("/userdata/rebot-teleop/profile/{name}"),
             format!("/usr/share/rebot-teleop/profile/{name}"),
         ];
         let path = candidates.iter().find(|p| std::path::Path::new(p).exists())

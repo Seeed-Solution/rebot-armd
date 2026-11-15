@@ -1372,3 +1372,63 @@ fn test_place_plan_orientation_none_preserves_start_pitch_roll_and_updates_yaw()
     let expected_target_yaw = (-0.06_f64).atan2(0.20);
     assert!((r_plan_yaw - expected_target_yaw).abs() < 0.15, "Yaw must update towards target: got {}, expected ~{}", r_plan_yaw, expected_target_yaw);
 }
+
+#[tokio::test]
+async fn test_so101_persistent_gripper_hw_overload_reverse_escape_and_re_squeeze() {
+    let config = load_so101_config();
+    let supervisor = Arc::new(ArmSupervisor::new(config));
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.lease_enabled = false;
+        inner.set_torque(true).unwrap();
+        inner.measured_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
+        inner.commanded_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
+        inner.target_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.5];
+        // Inject motor error 0x20 on gripper (joint 5)
+        inner.motor_errors = vec![
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(armd::model::MotorError {
+                code: 0x20,
+                name: "Overload".into(),
+            }),
+        ];
+        inner.last_can_feedback_instant = Some(std::time::Instant::now());
+    }
+
+    // Tick: HW overload rises, gripper latches stall
+    supervisor.tick(0.01).await;
+    assert!(supervisor.is_gripper_stalled().await, "SO-ARM101 gripper must latch stall on 0x20");
+
+    // Reverse servo command (opening jaw towards open_rad=1.5)
+    let rev_targets = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.8];
+    let servo_res = supervisor.servo(rev_targets, 1).await;
+    assert!(servo_res.is_ok(), "Reverse servo command must be accepted");
+    assert!(!supervisor.is_gripper_stalled().await, "Reverse servo command un-stalls gripper");
+
+    // Ticks while 0x20 persists: escaping known stall must not re-latch
+    for _ in 0..5 {
+        {
+            let mut inner = supervisor.inner().write().await;
+            inner.last_can_feedback_instant = Some(std::time::Instant::now());
+        }
+        supervisor.tick(0.01).await;
+        assert!(!supervisor.is_gripper_stalled().await, "Must not re-latch while escaping known stall");
+    }
+
+    // Squeeze command towards closed_rad=0.0
+    let squeeze_targets = vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.2];
+    let sq_res = supervisor.servo(squeeze_targets, 1).await;
+    assert!(sq_res.is_ok(), "Squeeze command accepted");
+
+    // Tick: since 0x20 still asserted and pushing into stall, it must re-latch!
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.last_can_feedback_instant = Some(std::time::Instant::now());
+    }
+    supervisor.tick(0.01).await;
+    assert!(supervisor.is_gripper_stalled().await, "Must re-latch when pushing into stall with 0x20");
+}
