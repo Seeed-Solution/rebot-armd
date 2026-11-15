@@ -125,7 +125,7 @@ static void test_tilted_plane_recovery() {
 static void test_fg_bg_matched_location() {
     const int grid_w = 384, grid_h = 224;
     const float content_w = 640.0f, content_h = 360.0f;
-    const float p0 = 0.60f, pv = -0.004f, uc = 320.0f, vc = 180.0f;
+    const float p0 = 0.60f, pv = -0.004f, vc = 180.0f;
     std::vector<float> disp_map(grid_w * grid_h);
     DepthBox target{260.0f, 120.0f, 380.0f, 240.0f};
     float sum_v = 0.0f;

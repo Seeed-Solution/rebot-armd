@@ -1635,6 +1635,8 @@ pub fn measure_detection_depth_with_cal(
 /// [`measure_detection_depth_with_cal`] with the reason it failed: `low_conf` (`depth_conf`
 /// < 0.35), `no_disparity`, `bad_disparity` (foreground not nearer than the table, or depths
 /// out of range), `too_flat` (< 2 mm above the table).
+// `!(a > b)` also rejects NaN
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
 pub fn measure_detection_depth_with_cal_why(
     cam: &CamModel,
     pose: &Pose,
