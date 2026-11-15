@@ -220,14 +220,14 @@ pub struct FeetechArmDriver<T: Transport> {
     cached_loads: Vec<f32>,
     pub motor_status: Vec<u8>,
     last_feedback_instant: Vec<Option<Instant>>,
-    confirmed_enable_state: EnableState,
+    pub confirmed_enable_state: EnableState,
     pub tx_echo: Option<bool>,
     pub tx_echo_auto: bool,
     poll_cursor: usize,
     rx_buffer: Vec<u8>,
     pub effective_ranges: Vec<(u16, u16)>,
     cached_raw_steps: Vec<i32>,
-    read_poll_count: u64,
+    pub read_poll_count: u64,
     missed_poll_replies: u64,
     partial_enable_known: bool,
     joint_torque_enabled: Vec<Option<bool>>,
@@ -1489,31 +1489,46 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
 
         if let Some(inc_idx) = self.incomplete_chunk_idx.take() {
             let inc_ts = self.incomplete_frame_started_at.take().unwrap_or_else(Instant::now);
-            if let Some(inc_chunk) = self.servo_ids.chunks(MAX_SYNC_READ_SERVOS).nth(inc_idx) {
+            let mut inc_timed_out = inc_ts.elapsed() >= Duration::from_millis(15);
+            let mut all_replied = false;
+
+            if let Some(inc_chunk) = self.servo_ids.chunks(MAX_SYNC_READ_SERVOS).nth(inc_idx).map(|c| c.to_vec()) {
                 let expected_ids: std::collections::HashSet<u8> = inc_chunk.iter().copied().collect();
                 let mut replied_ids = std::collections::HashSet::new();
                 self.decode_position_frames(&expected_ids, &mut replied_ids, inc_ts);
 
-                let mut b1 = [0u8; 1];
-                let mut drained = 0;
-                while !self.rx_buffer.is_empty()
-                    && matches!(feetech::parse_response(&self.rx_buffer), Err(feetech::FeetechError::IncompleteFrame { .. }))
-                    && drained < 64
+                let reassembly_start = Instant::now();
+                const REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(4);
+                let mut drain_buf = [0u8; 32];
+
+                while replied_ids.len() < inc_chunk.len()
+                    && !inc_timed_out
+                    && reassembly_start.elapsed() < REASSEMBLY_TIMEOUT
+                    && start_time.elapsed() < MAX_READ_DURATION
                 {
-                    match self.transport.read(&mut b1) {
+                    match self.transport.read(&mut drain_buf) {
                         Ok(n) if n > 0 => {
-                            self.rx_buffer.extend_from_slice(&b1[..n]);
-                            drained += n;
-                            self.decode_position_frames(&expected_ids, &mut replied_ids, inc_ts);
+                            let now = Instant::now();
+                            self.rx_buffer.extend_from_slice(&drain_buf[..n]);
+                            self.decode_position_frames(&expected_ids, &mut replied_ids, now);
                         }
-                        _ => break,
+                        _ => {
+                            std::thread::yield_now();
+                        }
+                    }
+                    if inc_ts.elapsed() >= Duration::from_millis(15) {
+                        inc_timed_out = true;
+                        break;
                     }
                 }
+
+                all_replied = replied_ids.len() == inc_chunk.len();
             }
-            if !self.rx_buffer.is_empty()
-                && matches!(feetech::parse_response(&self.rx_buffer), Err(feetech::FeetechError::IncompleteFrame { .. }))
-                && inc_ts.elapsed() < Duration::from_millis(15)
-            {
+
+            let has_incomplete = !self.rx_buffer.is_empty()
+                && matches!(feetech::parse_response(&self.rx_buffer), Err(feetech::FeetechError::IncompleteFrame { .. }));
+
+            if !all_replied && !inc_timed_out && has_incomplete {
                 self.incomplete_chunk_idx = Some(inc_idx);
                 self.incomplete_frame_started_at = Some(inc_ts);
             } else {
@@ -1522,7 +1537,8 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         }
 
         self.read_poll_count += 1;
-        let did_enable_poll = (self.confirmed_enable_state == EnableState::Enabled || self.partial_enable_known)
+        let did_enable_poll = self.incomplete_chunk_idx.is_none()
+            && (self.confirmed_enable_state == EnableState::Enabled || self.partial_enable_known)
             && (self.read_poll_count.is_multiple_of(10) || self.last_enable_poll.is_none_or(|t| t.elapsed() >= Duration::from_millis(200)));
         if did_enable_poll {
             self.last_enable_poll = Some(Instant::now());
@@ -1691,7 +1707,8 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 }
             }
 
-            if !self.rx_buffer.is_empty()
+            if replied_ids.len() < chunk.len()
+                && !self.rx_buffer.is_empty()
                 && matches!(feetech::parse_response(&self.rx_buffer), Err(feetech::FeetechError::IncompleteFrame { .. }))
             {
                 self.incomplete_chunk_idx = Some(chunk_idx);
@@ -1701,6 +1718,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             } else {
                 self.incomplete_chunk_idx = None;
                 self.incomplete_frame_started_at = None;
+                self.rx_buffer.clear();
                 self.poll_cursor = (chunk_idx + 1) % num_chunks;
             }
         }

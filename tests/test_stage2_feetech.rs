@@ -3002,6 +3002,15 @@ fn test_feetech_6servo_incomplete_chunk_idx_cross_call_reassembly_and_ghost_head
 
     let res3 = driver.read_joint_states();
     assert!(res3.is_ok(), "Must not starve or fail on ghost header");
+    let ages = driver.feedback_ages();
+    for id in 0..3 {
+        assert!(
+            ages[id].is_some_and(|a| a < Duration::from_millis(50)),
+            "Joint {} feedback age must be fresh (< 50ms) after recovering from ghost header, got {:?}",
+            id + 1,
+            ages[id]
+        );
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -3041,4 +3050,227 @@ async fn test_feetech_narrower_effective_ranges_narrows_config_limits() {
         expected_max,
         limit.max_position
     );
+}
+
+// -------------------------------------------------------------------------
+// 61. Incomplete frame preserved across enable poll and completed on next call
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_next_call() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
+    driver.confirmed_enable_state = EnableState::Enabled;
+    driver.read_poll_count = 8;
+    driver.last_enable_poll = Some(Instant::now());
+
+    let build_resp = |id: u8| -> Vec<u8> {
+        let pos = 2048u16.to_le_bytes();
+        let spd = 0u16.to_le_bytes();
+        let load = 100u16.to_le_bytes();
+        let params = [pos[0], pos[1], spd[0], spd[1], load[0], load[1], 75, 40];
+        let cs = calculate_checksum(id, (params.len() + 2) as u8, 0x00, &params);
+        let mut pkt = vec![0xFF, 0xFF, id, (params.len() + 2) as u8, 0x00];
+        pkt.extend_from_slice(&params);
+        pkt.push(cs);
+        pkt
+    };
+
+    let resp1 = build_resp(1);
+    // Call 1 (poll_count -> 9, no enable poll): supply partial frame for servo 1 (first 4 bytes)
+    driver.transport_mut().provide_rx(&resp1[..4]);
+
+    let _ = driver.read_joint_states();
+    assert_eq!(driver.incomplete_chunk_idx, Some(0), "Chunk 0 must be marked incomplete");
+
+    // Call 2 (poll_count -> 10, enable poll due): supply the remainder of servo 1.
+    // If enable poll had erroneously run while incomplete_chunk_idx was Some,
+    // clear_input_buffer() and rx_buffer.clear() would have wiped the partial frame!
+    driver.last_enable_poll = Some(Instant::now() - Duration::from_millis(500));
+    driver.transport_mut().provide_rx(&resp1[4..]);
+
+    let states = driver.read_joint_states().expect("Reassembly must succeed without enable-poll wiping rx_buffer");
+    assert_eq!(states.len(), 1);
+    assert_eq!(driver.incomplete_chunk_idx, None);
+    assert!(driver.feedback_ages()[0].is_some_and(|a| a < Duration::from_millis(50)));
+}
+
+// -------------------------------------------------------------------------
+// 62. Multi-servo chunk reassembly: servo 4 split across calls, 5 & 6 arrive right after
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_multiservo_chunk_reassembly_split_first_servo_and_following_servos_complete() {
+    let mock = MockTransport::new();
+    let servo_ids = vec![1, 2, 3, 4, 5, 6];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+
+    let build_resp_pos = |id: u8, pos_steps: u16| -> Vec<u8> {
+        let pos = pos_steps.to_le_bytes();
+        let spd = 0u16.to_le_bytes();
+        let load = 100u16.to_le_bytes();
+        let params = [pos[0], pos[1], spd[0], spd[1], load[0], load[1], 75, 40];
+        let cs = calculate_checksum(id, (params.len() + 2) as u8, 0x00, &params);
+        let mut pkt = vec![0xFF, 0xFF, id, (params.len() + 2) as u8, 0x00];
+        pkt.extend_from_slice(&params);
+        pkt.push(cs);
+        pkt
+    };
+
+    // Call 1: Chunk 0 (servos 1, 2, 3) complete, Chunk 1 servo 4 split (first 4 bytes only).
+    // Servos 5 and 6 are NOT provided yet.
+    let mut rx1 = Vec::new();
+    for id in 1..=3 {
+        rx1.extend_from_slice(&build_resp_pos(id, 2048));
+    }
+    let resp4 = build_resp_pos(4, 2500);
+    rx1.extend_from_slice(&resp4[..4]); // split servo 4!
+    driver.transport_mut().provide_rx(&rx1);
+
+    let _ = driver.read_joint_states();
+    assert_eq!(driver.incomplete_chunk_idx, Some(1), "Chunk 1 must be marked incomplete");
+
+    // Call 2: supply remainder of servo 4 AND complete frames for servos 5 & 6 in that chunk
+    let mut rx2 = Vec::new();
+    rx2.extend_from_slice(&resp4[4..]); // remainder of servo 4
+    rx2.extend_from_slice(&build_resp_pos(5, 2600)); // servo 5
+    rx2.extend_from_slice(&build_resp_pos(6, 2700)); // servo 6
+    driver.transport_mut().provide_rx(&rx2);
+
+    let states = driver.read_joint_states().expect("Multi-servo chunk reassembly must succeed");
+    assert_eq!(states.len(), 6);
+    assert_eq!(driver.incomplete_chunk_idx, None, "Incomplete chunk index must be cleared after reassembly");
+
+    // Verify all 3 servos in Chunk 1 (indices 3, 4, 5) updated
+    let calib4 = driver.config().joints[3].clone();
+    let calib5 = driver.config().joints[4].clone();
+    let calib6 = driver.config().joints[5].clone();
+
+    assert!((states[3].position - calib4.steps_to_rad(2500)).abs() < 1e-4, "Servo 4 position updated");
+    assert!((states[4].position - calib5.steps_to_rad(2600)).abs() < 1e-4, "Servo 5 position updated");
+    assert!((states[5].position - calib6.steps_to_rad(2700)).abs() < 1e-4, "Servo 6 position updated");
+
+    let ages = driver.feedback_ages();
+    assert!(ages[3].is_some_and(|a| a < Duration::from_millis(50)), "Servo 4 age fresh");
+    assert!(ages[4].is_some_and(|a| a < Duration::from_millis(50)), "Servo 5 age fresh");
+    assert!(ages[5].is_some_and(|a| a < Duration::from_millis(50)), "Servo 6 age fresh");
+}
+
+// -------------------------------------------------------------------------
+// 63. apply_driver_limits rejection leaves home_positions & resting_pose unchanged and latches unclearable fault
+// -------------------------------------------------------------------------
+#[tokio::test]
+async fn test_apply_driver_limits_rejection_leaves_poses_unchanged_and_latches_unclearable_fault() {
+    let mut config = ArmConfig::default();
+    config.dof = 1;
+    config.limits = vec![JointLimit::new("j1", -1.0, 1.0, 1.0, 1.0)];
+    config.home_positions = vec![0.5];
+    config.resting_pose = Some(RestingPosePolicy {
+        positions: Some(vec![0.5]),
+        position_tolerances: vec![0.08],
+        max_total_deviation: 0.16,
+        max_velocity: 0.015,
+        joint_max_velocities: vec![],
+        support_torque_limits: vec![],
+        support_load_limits: vec![],
+        feedback_max_age_ms: 100,
+    });
+
+    let supervisor = Arc::new(ArmSupervisor::new(config));
+
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1]);
+    // Steps 100..200 corresponds to negative angles far from 0.5 rad (e.g. [-0.8, -0.2])
+    driver.effective_ranges = vec![(100, 200)];
+
+    supervisor.set_driver(Box::new(driver)).await;
+
+    let inner = supervisor.inner().read().await;
+    assert!(inner.driver_config_error.is_some(), "Must latch driver_config_error");
+    // Crucial check: poses must NOT be silently clamped!
+    assert_eq!(inner.config.home_positions, vec![0.5], "home_positions must remain unchanged on rejection");
+    assert_eq!(
+        inner.config.resting_pose.as_ref().unwrap().positions,
+        Some(vec![0.5]),
+        "resting_pose.positions must remain unchanged on rejection"
+    );
+    match inner.safety.state() {
+        SafetyState::Fault(reason) => {
+            assert!(reason.message().contains("Driver limits violated config invariants") || reason.message().contains("conflict"));
+        }
+        other => panic!("Expected Fault state, got {:?}", other),
+    }
+    drop(inner);
+
+    // clear_fault must be blocked while driver_config_error persists
+    let clear_err = supervisor.clear_fault().await.unwrap_err();
+    assert!(
+        clear_err.to_string().contains("Driver limit configuration error"),
+        "clear_fault must be blocked with clear message, got: {clear_err}"
+    );
+
+    // set_torque must also be blocked
+    let tq_err = supervisor.set_torque(true).await.unwrap_err();
+    assert!(
+        tq_err.to_string().contains("Driver limit configuration error")
+            || tq_err.to_string().contains("Motion forbidden")
+            || tq_err.to_string().contains("Fault active"),
+        "set_torque must be blocked, got: {tq_err}"
+    );
+}
+
+// -------------------------------------------------------------------------
+// 64. Feetech driver-backed 0x20 overload stale->rising edge triggers HardwareFault
+// -------------------------------------------------------------------------
+#[tokio::test]
+async fn test_feetech_driver_backed_arm_joint_0x20_rising_edge_triggers_hardware_fault() {
+    let mock = Arc::new(Mutex::new(MockTransport::new()));
+    let driver = FeetechArmDriver::new(SharedTransport(mock.clone()), vec![1]).with_calibrated(true);
+
+    let mut config = ArmConfig::default();
+    config.dof = 1;
+    config.limits = vec![JointLimit::new("j1", -3.0, 3.0, 2.0, 5.0)];
+    config.home_positions = vec![0.0];
+
+    let supervisor = ArmSupervisor::new(config).with_driver(Box::new(driver));
+
+    // Provide normal feedback with error = 0x00
+    let pos_1 = 2048u16.to_le_bytes();
+    let normal_params = [pos_1[0], pos_1[1], 0, 0, 0, 0, 70, 35];
+    let cs_normal = calculate_checksum(1, 10, 0x00, &normal_params);
+    let mut rx_normal = vec![0xFF, 0xFF, 1, 10, 0x00];
+    rx_normal.extend_from_slice(&normal_params);
+    rx_normal.push(cs_normal);
+
+    let cs_tq1 = calculate_checksum(1, 3, 0x00, &[1]);
+    let rx_tq1 = vec![0xFF, 0xFF, 1, 3, 0x00, 1, cs_tq1];
+
+    mock.lock().unwrap().provide_rx(&rx_normal);
+    mock.lock().unwrap().provide_rx(&rx_tq1);
+    mock.lock().unwrap().provide_rx(&rx_normal);
+
+    supervisor.set_torque(true).await.unwrap();
+    assert!(supervisor.inner().read().await.is_torqued);
+
+    // Initial tick with normal 0x00 feedback -> arm stays Armed/Idle
+    supervisor.tick(0.02).await;
+    let obs = supervisor.get_observation().await;
+    assert_eq!(obs.safety_state, armd::safety::SafetyState::Armed);
+    assert!(obs.fault.is_none());
+
+    // Allow feedback to age / tick without fresh bytes (stale condition)
+    std::thread::sleep(Duration::from_millis(5));
+    supervisor.tick(0.02).await;
+
+    // Now rising edge: hardware packet arrives with error byte 0x20 on arm joint 1
+    let cs_overload = calculate_checksum(1, 10, 0x20, &normal_params);
+    let mut rx_overload = vec![0xFF, 0xFF, 1, 10, 0x20];
+    rx_overload.extend_from_slice(&normal_params);
+    rx_overload.push(cs_overload);
+    mock.lock().unwrap().provide_rx(&rx_overload);
+
+    // Tick: Feetech driver decodes 0x20, check_hardware_status detects rising edge and faults
+    let obs_fault = supervisor.tick(0.02).await;
+    assert!(obs_fault.fault.is_some(), "Supervisor must fault on 0x20 rising edge");
+    let fault = obs_fault.fault.unwrap();
+    assert_eq!(fault.code, FaultCode::HardwareFault);
+    assert!(fault.message.contains("0x20"));
 }

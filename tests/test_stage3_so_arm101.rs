@@ -4,12 +4,16 @@
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointTarget};
+use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, FeetechArmDriver, JointTarget};
+use armd::protocol::feetech::calculate_checksum;
 use armd::kinematics::{self, Pose};
 use armd::model::{ArmConfig, JointState};
 use armd::motion::{self, GoalSpec, MotionError, PlanInput, RelFrame, Speed};
 use armd::place::{self, PendingPlace, PlaceRequest};
+use armd::safety::{FaultCode, SafetyState};
 use armd::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
+use armd::transport::mock::MockTransport;
+use armd::transport::Transport;
 use armd::grasp;
 
 fn load_so101_config() -> ArmConfig {
@@ -1431,4 +1435,86 @@ async fn test_so101_persistent_gripper_hw_overload_reverse_escape_and_re_squeeze
     }
     supervisor.tick(0.01).await;
     assert!(supervisor.is_gripper_stalled().await, "Must re-latch when pushing into stall with 0x20");
+}
+
+#[tokio::test]
+async fn test_so101_feetech_driver_backed_arm_joint_0x20_overload_triggers_estop() {
+    let config = load_so101_config();
+
+    // Custom MockTransport wrapper for FeetechArmDriver
+    struct SharedTransport(Arc<Mutex<MockTransport>>);
+    impl Transport for SharedTransport {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, armd::transport::TransportError> {
+            self.0.lock().unwrap().read(buf)
+        }
+        fn write(&mut self, buf: &[u8]) -> Result<usize, armd::transport::TransportError> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn flush(&mut self) -> Result<(), armd::transport::TransportError> {
+            self.0.lock().unwrap().flush()
+        }
+    }
+
+    let mock = Arc::new(Mutex::new(MockTransport::new()));
+    let servo_ids = vec![1, 2, 3, 4, 5, 6];
+    let driver = FeetechArmDriver::new(SharedTransport(mock.clone()), servo_ids)
+        .with_gripper_index(Some(5))
+        .with_calibrated(true);
+
+    let supervisor = ArmSupervisor::new(config).with_driver(Box::new(driver));
+    supervisor.inner().write().await.lease_enabled = false;
+
+    let build_resp = |id: u8, err: u8| -> Vec<u8> {
+        let pos = 2048u16.to_le_bytes();
+        let spd = 0u16.to_le_bytes();
+        let load = 0u16.to_le_bytes();
+        let params = [pos[0], pos[1], spd[0], spd[1], load[0], load[1], 70, 35];
+        let cs = calculate_checksum(id, (params.len() + 2) as u8, err, &params);
+        let mut pkt = vec![0xFF, 0xFF, id, (params.len() + 2) as u8, err];
+        pkt.extend_from_slice(&params);
+        pkt.push(cs);
+        pkt
+    };
+
+    // Provide initial feedback for all 6 servos with error = 0x00
+    let mut rx_normal = Vec::new();
+    for id in 1..=6 {
+        rx_normal.extend_from_slice(&build_resp(id, 0x00));
+    }
+    // Also provide torque enable response
+    let mut rx_tq = Vec::new();
+    for id in 1..=6 {
+        let cs = calculate_checksum(id, 3, 0x00, &[1]);
+        rx_tq.extend_from_slice(&[0xFF, 0xFF, id, 3, 0x00, 1, cs]);
+    }
+
+    mock.lock().unwrap().provide_rx(&rx_normal);
+    mock.lock().unwrap().provide_rx(&rx_tq);
+    mock.lock().unwrap().provide_rx(&rx_normal);
+
+    supervisor.set_torque(true).await.unwrap();
+    assert!(supervisor.inner().read().await.is_torqued);
+
+    supervisor.tick(0.02).await;
+    let obs = supervisor.get_observation().await;
+    assert_eq!(obs.safety_state, SafetyState::Armed);
+
+    // Stale period: ticks pass without new packets
+    std::thread::sleep(Duration::from_millis(5));
+    supervisor.tick(0.02).await;
+
+    // Rising edge: Arm joint 1 (servo ID 1) reports 0x20 Overload
+    let mut rx_overload = Vec::new();
+    rx_overload.extend_from_slice(&build_resp(1, 0x20));
+    for id in 2..=6 {
+        rx_overload.extend_from_slice(&build_resp(id, 0x00));
+    }
+    mock.lock().unwrap().provide_rx(&rx_overload);
+
+    // Tick: Arm joint 0x20 triggers HardwareFault
+    let obs_fault = supervisor.tick(0.02).await;
+    assert!(obs_fault.fault.is_some(), "Arm joint 0x20 rising edge must fault supervisor");
+    let fault = obs_fault.fault.unwrap();
+    assert_eq!(fault.code, FaultCode::HardwareFault);
+    assert!(fault.message.contains("0x20: Overload"));
 }

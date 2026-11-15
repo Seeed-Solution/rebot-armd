@@ -317,6 +317,8 @@ pub struct SupervisorInner {
     /// reference (not only gripper moves); `true` once touched. It falls out when the jaw
     /// opens 0.5 rad past it after contact.
     pub mock_gripper_object: Option<(f32, bool)>,
+    /// Active driver limit configuration error; prevents clearing faults and enabling torque until resolved.
+    pub driver_config_error: Option<String>,
     /// Running zero check parameters (id, store_offset, threshold_rad, base_closed_rad).
     pub zero_check_params: Option<ZeroCheckParams>,
 }
@@ -470,6 +472,7 @@ impl SupervisorInner {
             mock_gripper_stall_offset,
             mock_gripper_stall_torque: false,
             mock_gripper_object: None,
+            driver_config_error: None,
             zero_check_params: None,
         }
     }
@@ -544,61 +547,50 @@ impl SupervisorInner {
     }
 
     fn apply_driver_limits(&mut self, driver: &dyn ArmDriver) {
-        let gripper_idx = self.config.gripper_index();
-        for (i, limit) in self.config.limits.iter_mut().enumerate() {
+        self.driver_config_error = None;
+        let mut candidate = self.config.clone();
+        for (i, limit) in candidate.limits.iter_mut().enumerate() {
             if let Some(max) = driver.max_command_velocity(i) {
                 if max.is_finite() && max > 0.0 { limit.max_velocity = limit.max_velocity.min(max); }
             }
             if let Some((d_min, d_max)) = driver.position_limits(i) {
-                if d_min.is_finite() && d_max.is_finite() && d_min < d_max {
-                    let new_min = limit.min_position.max(d_min);
-                    let new_max = limit.max_position.min(d_max);
-                    if new_max - new_min >= 1e-2 {
-                        if (new_min - limit.min_position).abs() > 1e-4 || (new_max - limit.max_position).abs() > 1e-4 {
-                            tracing::info!(
-                                "Intersected joint '{}' position limits with driver range: profile=[{:.4}, {:.4}], hw=[{:.4}, {:.4}] -> [{:.4}, {:.4}]",
-                                limit.name, limit.min_position, limit.max_position, d_min, d_max, new_min, new_max
-                            );
-                        }
-                        limit.min_position = new_min;
-                        limit.max_position = new_max;
-                        if i < self.config.home_positions.len() {
-                            self.config.home_positions[i] = self.config.home_positions[i].clamp(new_min, new_max);
-                        }
-                        if let Some(ref mut resting) = self.config.resting_pose {
-                            if let Some(ref mut pos) = resting.positions {
-                                if i < pos.len() {
-                                    pos[i] = pos[i].clamp(new_min, new_max);
-                                }
-                            }
-                        }
-                        if gripper_idx == Some(i) {
-                            if let Some(ref mut policy) = self.config.gripper_policy {
-                                let c = policy.closed_rad.clamp(new_min, new_max);
-                                let o = policy.open_rad.clamp(new_min, new_max);
-                                if (c - o).abs() > 1e-3 {
-                                    policy.closed_rad = c;
-                                    policy.open_rad = o;
-                                }
-                            }
-                            if let Some(ref mut base) = self.base_gripper_policy {
-                                let c = base.closed_rad.clamp(new_min, new_max);
-                                let o = base.open_rad.clamp(new_min, new_max);
-                                if (c - o).abs() > 1e-3 {
-                                    base.closed_rad = c;
-                                    base.open_rad = o;
-                                }
-                            }
-                        }
-                    } else {
-                        tracing::warn!(
-                            "Driver position limits [{:.4}, {:.4}] for joint '{}' would collapse profile limits [{:.4}, {:.4}]; keeping profile limits",
-                            d_min, d_max, limit.name, limit.min_position, limit.max_position
-                        );
-                    }
+                if !d_min.is_finite() || !d_max.is_finite() || d_min >= d_max {
+                    let reason = format!(
+                        "Driver position limits [{:.4}, {:.4}] for joint '{}' are invalid",
+                        d_min, d_max, limit.name
+                    );
+                    self.driver_config_error = Some(reason.clone());
+                    self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                    return;
                 }
+                let new_min = limit.min_position.max(d_min);
+                let new_max = limit.max_position.min(d_max);
+                if !new_min.is_finite() || !new_max.is_finite() || new_max - new_min < 1e-2 {
+                    let reason = format!(
+                        "Driver position limits [{:.4}, {:.4}] for joint '{}' conflict with profile limits [{:.4}, {:.4}] (intersected range < 0.01)",
+                        d_min, d_max, limit.name, limit.min_position, limit.max_position
+                    );
+                    self.driver_config_error = Some(reason.clone());
+                    self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                    return;
+                }
+                if (new_min - limit.min_position).abs() > 1e-4 || (new_max - limit.max_position).abs() > 1e-4 {
+                    tracing::info!(
+                        "Intersected joint '{}' position limits with driver range: profile=[{:.4}, {:.4}], hw=[{:.4}, {:.4}] -> [{:.4}, {:.4}]",
+                        limit.name, limit.min_position, limit.max_position, d_min, d_max, new_min, new_max
+                    );
+                }
+                limit.min_position = new_min;
+                limit.max_position = new_max;
             }
         }
+        if let Err(err) = candidate.validate() {
+            let reason = format!("Driver limits violated config invariants: {err}");
+            self.driver_config_error = Some(reason.clone());
+            self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+            return;
+        }
+        self.config = candidate;
     }
 
     /// Joint limits used for planning and servo stepping: `config.limits` with
@@ -1199,6 +1191,9 @@ impl SupervisorInner {
         // Torque changes and re-arming are refused in gravity compensation: exit first.
         self.gravity_comp_servo_busy()?;
         if enable {
+            if let Some(ref err) = self.driver_config_error {
+                return Err(SafetyError::MotionForbiddenInFaultState(format!("Driver limit configuration error: {err}")));
+            }
             if self.handover_settling_since.is_some() {
                 return Err(SafetyError::HandoverSettling);
             }
@@ -1647,6 +1642,9 @@ impl SupervisorInner {
 
     pub fn clear_fault(&mut self) -> Result<SafetyState, SafetyError> {
         Self::check_concurrent_estop(self)?;
+        if let Some(ref err) = self.driver_config_error {
+            return Err(SafetyError::ClearFaultRejected(format!("Driver limit configuration error: {err}")));
+        }
         if !self.safety.state().is_stopped() { return Ok(self.safety.state().clone()); }
         if self.gravity_comp_blocks_clear() {
             return Err(SafetyError::ClearFaultRejected("Gravity compensation: the switch back to POS_VEL is not confirmed yet".into()));
@@ -2755,15 +2753,26 @@ impl SupervisorInner {
         let offset = offset_rad.unwrap_or(0.0);
         policy.closed_rad = base.closed_rad + offset;
         policy.open_rad = base.open_rad + offset;
+        let lim = self.config.gripper_index().and_then(|idx| self.config.limits.get(idx));
         if let Some(mut jo) = jaw_opening.or_else(|| self.gripper_calib_jaw_opening.clone()).or(base.jaw_opening) {
             for pt in &mut jo.points {
                 pt[0] += offset;
+            }
+            if let Err(e) = jo.validate(lim) {
+                tracing::warn!("Invalid jaw_opening calibration against joint limits: {e}");
+                self.gripper_calib_invalid = true;
+                return;
             }
             policy.jaw_opening = Some(jo);
         } else {
             let mut jo = crate::model::JawOpening::sim_default();
             for pt in &mut jo.points {
                 pt[0] += offset;
+            }
+            if let Err(e) = jo.validate(lim) {
+                tracing::warn!("Invalid default jaw_opening calibration against joint limits: {e}");
+                self.gripper_calib_invalid = true;
+                return;
             }
             policy.jaw_opening = Some(jo);
         }
@@ -4435,8 +4444,8 @@ impl ArmSupervisor {
     }
 
     pub async fn trigger_e_stop(&self) -> (SafetyState, u64) {
-        self.e_stop_latched.store(true, Ordering::SeqCst);
         self.requested_estop_count.fetch_add(1, Ordering::SeqCst);
+        self.e_stop_latched.store(true, Ordering::SeqCst);
         let inner = Arc::clone(&self.inner);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let jh = handle.spawn(async move {

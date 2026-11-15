@@ -11,6 +11,7 @@ pub struct MockTransport {
     error_on_next_read: Option<String>,
     error_on_next_write: Option<String>,
     write_responses: Vec<(Vec<u8>, Vec<u8>)>,
+    staged_reads: VecDeque<Vec<u8>>,
 }
 
 impl MockTransport {
@@ -66,9 +67,15 @@ impl MockTransport {
         self.tx_buffer.len()
     }
 
+    /// Opt-in queue of staged RX byte chunks returned in sequence across consecutive reads.
+    pub fn queue_staged_read(&mut self, chunk: &[u8]) {
+        self.staged_reads.push_back(chunk.to_vec());
+    }
+
     pub fn clear(&mut self) {
         self.rx_buffer.clear();
         self.tx_buffer.clear();
+        self.staged_reads.clear();
     }
 }
 
@@ -82,6 +89,21 @@ impl Transport for MockTransport {
 
         if buf.is_empty() {
             return Ok(0);
+        }
+
+        if let Some(mut chunk) = self.staged_reads.pop_front() {
+            let max_read = if let Some(limit) = self.chunk_size_limit {
+                buf.len().min(limit)
+            } else {
+                buf.len()
+            };
+            let n = chunk.len().min(max_read);
+            buf[..n].copy_from_slice(&chunk[..n]);
+            if n < chunk.len() {
+                chunk.drain(..n);
+                self.staged_reads.push_front(chunk);
+            }
+            return Ok(n);
         }
 
         let max_read = if let Some(limit) = self.chunk_size_limit {
