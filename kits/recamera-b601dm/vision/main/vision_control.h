@@ -231,16 +231,9 @@ public:
     /** The loaded models (copy). */
     ModelSet models() const;
     bool yolo_available() const { return models().yolo_available; }
-    std::string model_name() const { return models().model_name; }
-    std::string model_path() const { return models().model_path; }
-    std::string model_kind() const { return models().model_kind; }
-    bool mask_enabled() const { return models().mask; }
     int mask_max_boxes() const noexcept { return mask_max_boxes_; }
     const std::string& family() const noexcept { return family_; }
     bool depth_available() const { return models().depth_available; }
-    std::string depth_model_name() const { return models().depth_model_name; }
-    std::string depth_model_path() const { return models().depth_model_path; }
-    bool depth_metric() const { return models().depth_metric; }
     const Catalogue& catalogue() const noexcept { return catalogue_; }
 
     /**

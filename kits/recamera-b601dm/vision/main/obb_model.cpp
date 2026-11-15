@@ -6,6 +6,25 @@
 
 namespace yolo {
 
+namespace {
+
+rv::ObbDataType obb_dtype(ma_tensor_type_t type) {
+    return (type == MA_TENSOR_TYPE_S8) ? rv::ObbDataType::INT8 :
+           (type == MA_TENSOR_TYPE_F32) ? rv::ObbDataType::FP32 : rv::ObbDataType::Unknown;
+}
+
+rv::ObbTensorSpec obb_spec(const ma_shape_t& shape, rv::ObbDataType dtype) {
+    rv::ObbTensorSpec spec;
+    spec.dtype = dtype;
+    spec.num_dims = static_cast<int>(shape.size);
+    for (size_t d = 0; d < 4 && d < shape.size; ++d) {
+        spec.dims[d] = shape.dims[d];
+    }
+    return spec;
+}
+
+}  // namespace
+
 ObbModel::ObbModel(Engine* engine)
     : Detector(engine, "yolo-obb", MA_MODEL_TYPE_UNDEFINED) {
     if (engine) {
@@ -45,22 +64,8 @@ bool ObbModel::isValid(Engine* engine, bool allow_auto_1out, const char* model_p
         const auto in_tensor = engine->getInput(0);
         const auto out_tensor = engine->getOutput(0);
 
-        rv::ObbTensorSpec in_spec;
-        in_spec.dtype = (in_tensor.type == MA_TENSOR_TYPE_S8) ? rv::ObbDataType::INT8 :
-                        (in_tensor.type == MA_TENSOR_TYPE_F32) ? rv::ObbDataType::FP32 : rv::ObbDataType::Unknown;
-        in_spec.num_dims = static_cast<int>(in_shape.size);
-        for (size_t d = 0; d < 4 && d < in_shape.size; ++d) {
-            in_spec.dims[d] = in_shape.dims[d];
-        }
-
-        rv::ObbTensorSpec out_spec;
-        out_spec.dtype = (out_tensor.type == MA_TENSOR_TYPE_S8) ? rv::ObbDataType::INT8 :
-                         (out_tensor.type == MA_TENSOR_TYPE_F32) ? rv::ObbDataType::FP32 : rv::ObbDataType::Unknown;
-        out_spec.num_dims = static_cast<int>(out_shape.size);
-        for (size_t d = 0; d < 4 && d < out_shape.size; ++d) {
-            out_spec.dims[d] = out_shape.dims[d];
-        }
-
+        const rv::ObbTensorSpec in_spec = obb_spec(in_shape, obb_dtype(in_tensor.type));
+        const rv::ObbTensorSpec out_spec = obb_spec(out_shape, obb_dtype(out_tensor.type));
         return rv::validate_obb_layout_a(in_spec, out_spec, allow_auto_1out, model_path);
     }
 
@@ -69,12 +74,7 @@ bool ObbModel::isValid(Engine* engine, bool allow_auto_1out, const char* model_p
         for (size_t i = 0; i < 9; ++i) {
             const auto s = engine->getOutputShape(i);
             const auto t = engine->getOutput(i);
-            specs[i].dtype = (t.type == MA_TENSOR_TYPE_S8) ? rv::ObbDataType::INT8 :
-                             (t.type == MA_TENSOR_TYPE_F32) ? rv::ObbDataType::FP32 : rv::ObbDataType::Unknown;
-            specs[i].num_dims = static_cast<int>(s.size);
-            for (size_t d = 0; d < 4 && d < s.size; ++d) {
-                specs[i].dims[d] = s.dims[d];
-            }
+            specs[i] = obb_spec(s, obb_dtype(t.type));
         }
 
         const auto info = rv::resolve_obb_layout_b(specs.data(), 9);
@@ -110,20 +110,8 @@ ma_err_t ObbModel::postprocess() {
         if (t.type != MA_TENSOR_TYPE_F32 || !t.data.f32) {
             return MA_EINVAL;
         }
-        rv::ObbTensorSpec in_spec;
-        in_spec.dtype = rv::ObbDataType::FP32;
-        in_spec.num_dims = static_cast<int>(in_shape.size);
-        for (size_t d = 0; d < 4 && d < in_shape.size; ++d) {
-            in_spec.dims[d] = in_shape.dims[d];
-        }
-
-        rv::ObbTensorSpec out_spec;
-        out_spec.dtype = rv::ObbDataType::FP32;
-        out_spec.num_dims = static_cast<int>(t.shape.size);
-        for (size_t d = 0; d < 4 && d < t.shape.size; ++d) {
-            out_spec.dims[d] = t.shape.dims[d];
-        }
-
+        const rv::ObbTensorSpec in_spec = obb_spec(in_shape, rv::ObbDataType::FP32);
+        const rv::ObbTensorSpec out_spec = obb_spec(t.shape, rv::ObbDataType::FP32);
         const auto info = rv::resolve_obb_layout_a(in_spec, out_spec, true, nullptr);
         if (!info.valid) {
             return MA_EINVAL;
