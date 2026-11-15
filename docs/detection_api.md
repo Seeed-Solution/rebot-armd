@@ -85,7 +85,7 @@ The single-shot button calls `/api/v1/detection/trigger` with the selector's pip
 
 `GET /api/v1/vision/mode`:
 
-`per_request_pipelines`, `subscriptions`, `max_fps` and `continuous` are new in version 2. `available.depth` and `depth_model` (`null` or `{"name": string, "path": string, "metric": bool}`) report monocular depth availability (`metric`: the catalogue entry's `"metric"`, else `--depth-metric on|off` for the startup depth model, else `"metric"` in the model file name; see [Model switching](#model-switching--模型切换)). `model.mask_max_boxes` (1..20, default 3) and `mask_focus` (active focus or `null`) report mask focus and budget configuration.
+`per_request_pipelines`, `subscriptions`, `max_fps` and `continuous` are new in version 2. `available.depth` and `depth_model` (`null` or `{"name": string, "path": string, "metric": bool}`) report monocular depth availability (`metric`: the catalogue entry's `"metric"`, else `--depth-metric on|off` for the startup depth model, else `"metric"` in the model file name; see [Model switching](#model-switching--模型切换)). `model.kind` is `detect`, `segment` or `obb`, and `null` when no YOLO model is loaded (`available.yolo` false; 1.3.10 and earlier reported `detect`). `model.mask_max_boxes` (1..20, default 3) and `mask_focus` (active focus or `null`) report mask focus and budget configuration.
 
 ```json
 {"api_version":2,"mode":"both","modes":["off","yolo","aruco","both"],

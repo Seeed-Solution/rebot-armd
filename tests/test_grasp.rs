@@ -271,6 +271,7 @@ impl DetectionSource for SimCamera {
             self.mode_info_calls.fetch_add(1, Ordering::SeqCst);
             let mut m = ModeInfo::compose(self).await?;
             m.model_kind = self.model_kind.lock().unwrap().clone();
+            m.yolo_available = !self.no_yolo.load(Ordering::SeqCst);
             m.depth_metric = self.depth_metric.load(Ordering::SeqCst);
             m.models = self.models.lock().unwrap().clone();
             Ok(m)
@@ -2888,6 +2889,31 @@ async fn task_requirement_mismatch_rejects_the_command_without_motion() {
     let obs = w.rig.sup.get_observation().await;
     assert!(obs.action.is_none(), "no action started: {:?}", obs.action);
     assert_eq!(obs.commanded_positions, q0, "no motion commanded");
+    assert!(w.rig.sim.trigger_calls.lock().unwrap().is_empty(), "no detection triggered");
+}
+
+/// The detector slot empty: a provider that still reports `model.kind` `detect` (older
+/// rebot-vision) does not satisfy a task that needs a model kind; depth-only tasks are not affected.
+#[tokio::test]
+async fn task_model_kind_without_a_loaded_detector_is_unsupported() {
+    let mut w = task_rig(None).await;
+    *w.rig.sim.model_kind.lock().unwrap() = Some("detect".into());
+    w.rig.sim.no_yolo.store(true, Ordering::SeqCst);
+    {
+        let mut inner = w.rig.sup.inner().write().await;
+        let mut s = inner.grasp_setup().unwrap();
+        s.tasks.insert("det".into(), serde_json::from_value(json!({"requires": {"model_kind": "detect"}})).unwrap());
+        inner.set_grasp_setup(s);
+    }
+    let mut body = tap(&w.rig).await;
+    for task in ["cup", "det"] {
+        body["task"] = json!(task);
+        let reply = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/action/grasp", body.clone()).await;
+        assert_eq!((reply["code"].as_str(), reply["status"].as_u64()), (Some("TASK_UNSUPPORTED"), Some(422)), "{reply}");
+        let kind = if task == "cup" { "segment" } else { "detect" };
+        assert_eq!(reply["message"], format!("task {task} needs model_kind {kind}, provider has no detector loaded"), "{reply}");
+    }
+    assert!(w.rig.sup.get_observation().await.action.is_none(), "no action started");
     assert!(w.rig.sim.trigger_calls.lock().unwrap().is_empty(), "no detection triggered");
 }
 

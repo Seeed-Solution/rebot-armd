@@ -562,6 +562,9 @@ static void test_subscription_union() {
     VisionControl n(opts(Mode::Aruco, false, 5, /*yolo=*/false), nullptr);
     json e = req(n, "POST", "/api/subscribe", sub_body("x", R"(["aruco","yolo"])"), &st);
     CHECK(st == 409 && e["error"] == "yolo unavailable" && !n.processing());
+    // no YOLO model: no kind (Options.model_kind is ignored)
+    e = req(n, "GET", "/api/mode");
+    CHECK(e["model"]["kind"].is_null() && e["available"]["yolo"] == false);
 }
 
 static void test_subscription_expiry() {
@@ -1165,8 +1168,11 @@ static void test_model_swap() {
     now = c.models();
     now.yolo_available = false;
     now.model_name.clear();
+    now.model_kind.clear();  // main.cpp set_detector(nullptr)
     c.finish_swap(now, "");
     CHECK(!c.yolo_available());
+    m = req(c, "GET", "/api/mode");
+    CHECK(m["model"]["kind"].is_null() && m["available"]["yolo"] == false && m["models"]["resident"]["detector"].is_null());
     req(c, "POST", "/api/trigger", R"({"pipelines":["yolo"]})", &st);
     CHECK(st == 409);
     req(c, "POST", "/api/mode", R"({"mode":"both"})", &st);

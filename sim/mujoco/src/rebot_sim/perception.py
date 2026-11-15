@@ -209,9 +209,9 @@ class Perception:
         self.results_out: list[float] = []
 
     @property
-    def model_kind(self) -> str:
-        """/api/mode model.kind of the resident detector ("detect" with the slot empty)."""
-        return MODELS[self.detector][0] if self.detector else "detect"
+    def model_kind(self) -> str | None:
+        """/api/mode model.kind of the resident detector (None with the slot empty, as rebot-vision)."""
+        return MODELS[self.detector][0] if self.detector else None
 
     @property
     def pipelines(self) -> tuple[str, ...]:

@@ -277,6 +277,9 @@ impl TaskRequires {
     /// `Err(reason)` when the provider (`mode`) cannot serve the requirements of task `task`.
     pub fn check(&self, task: &str, mode: &ModeInfo) -> Result<(), String> {
         if let Some(kind) = self.model_kind {
+            if mode.reported && !mode.yolo_available {
+                return Err(format!("task {task} needs model_kind {}, provider has no detector loaded", kind.name()));
+            }
             match mode.model_kind.as_deref().filter(|_| mode.reported) {
                 None => return Err(format!("task {task} needs model_kind {}, provider does not report model.kind", kind.name())),
                 Some(have) if have != kind.name() => return Err(format!("task {task} needs model_kind {}, provider has {have}", kind.name())),
@@ -701,11 +704,14 @@ pub struct ModeInfo {
     pub reported: bool,
     /// `per_request_pipelines` (perception API 2).
     pub per_request_pipelines: bool,
+    /// `available.yolo` (true when not reported): a detector is loaded. An older provider
+    /// reports `model.kind` `detect` with the slot empty, so the kind alone does not tell.
+    pub yolo_available: bool,
     /// `available.depth`.
     pub depth_available: bool,
     /// `depth_model.metric`.
     pub depth_metric: bool,
-    /// `model.kind` (`detect` | `segment`), when reported.
+    /// `model.kind` (`detect` | `segment` | `obb`), when reported (null with the detector slot empty).
     pub model_kind: Option<String>,
     /// `mode` / `enabled` (`Ok(None)` without a mode API); used only without per-request
     /// pipelines.
@@ -780,7 +786,7 @@ impl ModeInfo {
     /// Parse a `GET /api/mode` body (`None` = 404).
     pub fn parse(v: Option<&Value>) -> Self {
         let Some(v) = v else {
-            return Self { reported: false, per_request_pipelines: false, depth_available: false, depth_metric: false, model_kind: None, vision: Ok(None), models: None };
+            return Self { reported: false, per_request_pipelines: false, yolo_available: true, depth_available: false, depth_metric: false, model_kind: None, vision: Ok(None), models: None };
         };
         let vision = match v.get("mode").and_then(Value::as_str) {
             Some(mode) => Ok(Some(VisionMode { mode: mode.to_string(), enabled: v.get("enabled").and_then(Value::as_bool).unwrap_or(false) })),
@@ -789,6 +795,7 @@ impl ModeInfo {
         Self {
             reported: true,
             per_request_pipelines: v.get("per_request_pipelines").and_then(Value::as_bool) == Some(true),
+            yolo_available: v.get("available").and_then(|a| a.get("yolo")).and_then(Value::as_bool).unwrap_or(true),
             depth_available: v.get("available").and_then(|a| a.get("depth")).and_then(Value::as_bool).unwrap_or(false),
             depth_metric: v.get("depth_model").and_then(|d| d.get("metric")).and_then(Value::as_bool).unwrap_or(false),
             model_kind: v.get("model").and_then(|m| m.get("kind")).and_then(Value::as_str).map(str::to_string),
@@ -806,7 +813,7 @@ impl ModeInfo {
         let vision = if per_request_pipelines { Ok(None) } else { source.vision_mode().await };
         Ok(Self {
             reported: per_request_pipelines || matches!(vision, Ok(Some(_))),
-            per_request_pipelines, depth_available, depth_metric: false, model_kind: None, vision, models: None,
+            per_request_pipelines, yolo_available: true, depth_available, depth_metric: false, model_kind: None, vision, models: None,
         })
     }
 }
@@ -3835,7 +3842,7 @@ mod tests {
         assert!(!legacy.reported && legacy.vision == Ok(None));
         let full = ModeInfo::parse(Some(&serde_json::json!({"mode": "yolo", "enabled": true, "per_request_pipelines": true,
             "model": {"kind": "segment"}, "available": {"depth": true}, "depth_model": {"metric": true}})));
-        assert_eq!(full, ModeInfo { reported: true, per_request_pipelines: true, depth_available: true, depth_metric: true,
+        assert_eq!(full, ModeInfo { reported: true, per_request_pipelines: true, yolo_available: true, depth_available: true, depth_metric: true,
             model_kind: Some("segment".into()), vision: Ok(Some(VisionMode { mode: "yolo".into(), enabled: true })), models: None });
         // available.depth is read independently of depth_model.metric
         let depth_off = ModeInfo::parse(Some(&serde_json::json!({"available": {"depth": false}, "depth_model": {"metric": true}})));
@@ -3853,6 +3860,15 @@ mod tests {
             "task t needs model_kind detect, provider does not report model.kind");
         assert_eq!(req(Some(ModelKind::Detect), None).check("t", &legacy).unwrap_err(), "task t needs model_kind detect, provider does not report model.kind");
         assert_eq!(req(None, Some(DepthReq::Any)).check("t", &legacy).unwrap_err(), "task t needs depth any, provider does not report depth");
+        // detector slot empty: an older provider still reports model.kind "detect", a newer one null
+        let mode = |kind: Value| ModeInfo::parse(Some(&serde_json::json!({"mode": "aruco", "per_request_pipelines": true,
+            "available": {"yolo": false, "aruco": true, "depth": true}, "model": {"name": "", "kind": kind}})));
+        for empty in [mode(serde_json::json!("detect")), mode(Value::Null)] {
+            assert!(!empty.yolo_available);
+            assert_eq!(req(Some(ModelKind::Detect), None).check("t", &empty).unwrap_err(), "task t needs model_kind detect, provider has no detector loaded");
+            assert_eq!(req(None, Some(DepthReq::Any)).check("t", &empty), Ok(()), "depth alone needs no detector");
+        }
+        assert!(full.yolo_available, "available.yolo not reported: a detector is assumed");
     }
 
     #[test]

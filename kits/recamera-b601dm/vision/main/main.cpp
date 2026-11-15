@@ -468,7 +468,7 @@ void set_detector(rv::ModelSet& s, const yolo::Detector* d, const std::string& n
     s.yolo_available = d != nullptr;
     s.model_name = d ? name : "";
     s.model_path = d ? path : "";
-    s.model_kind = kind_name(d ? d->getKind() : yolo::Kind::Detect);
+    s.model_kind = d ? kind_name(d->getKind()) : "";  // an empty slot has no kind (model.kind null)
     s.mask = d && g_cfg.mask_enabled && d->getKind() == yolo::Kind::Segment;
 }
 
