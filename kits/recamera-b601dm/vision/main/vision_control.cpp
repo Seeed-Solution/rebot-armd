@@ -90,7 +90,7 @@ static ModelSet model_set_of(const VisionControl::Options& o) {
     m.yolo_available = o.yolo_available;
     m.model_name = o.model_name;
     m.model_path = o.model_path;
-    m.model_kind = o.model_kind;
+    m.model_kind = o.yolo_available ? o.model_kind : "";
     m.mask = o.mask;
     m.depth_available = o.depth_available;
     m.depth_model_name = o.depth_model_name;
@@ -631,8 +631,10 @@ static void put_models(nlohmann::json& j, const VisionControl& ctl, const ModelS
     const Catalogue& cat = ctl.catalogue();
     nlohmann::json list = nlohmann::json::array();
     for (const ModelEntry& m : cat.models) {
-        list.push_back({{"name", m.name}, {"kind", m.kind}, {"path", m.path}, {"ion_mb", m.ion_mb},
-                        {"resident", m.name == ms.model_name || m.name == ms.depth_model_name}});
+        nlohmann::json e = {{"name", m.name}, {"kind", m.kind}, {"path", m.path}, {"ion_mb", m.ion_mb},
+                            {"resident", m.name == ms.model_name || m.name == ms.depth_model_name}};
+        if (m.kind == "depth") e["metric"] = depth_metric_of(m);
+        list.push_back(e);
     }
     j["models"] = {{"generation", ms.generation}, {"swap", swap},
                    {"resident", {{"detector", name_or_null(ms.model_name)}, {"depth", name_or_null(ms.depth_model_name)}}},
@@ -668,7 +670,7 @@ static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0) {
         {"max_fps", ctl.active_fps()},
         {"continuous", continuous_json(ctl.continuous())},
         {"available", {{"yolo", ms.yolo_available}, {"aruco", true}, {"depth", ms.depth_available}}},
-        {"model", {{"name", ms.model_name}, {"path", ms.model_path}, {"kind", ms.model_kind}, {"mask", ms.mask}, {"mask_max_boxes", ctl.mask_max_boxes()}}},
+        {"model", {{"name", ms.model_name}, {"path", ms.model_path}, {"kind", name_or_null(ms.model_kind)}, {"mask", ms.mask}, {"mask_max_boxes", ctl.mask_max_boxes()}}},
         {"depth_model", ms.depth_available ? nlohmann::json{{"name", ms.depth_model_name}, {"path", ms.depth_model_path}, {"metric", ms.depth_metric}} : nullptr},
         {"family", ctl.family()},
         {"mask_focus", ctl.get_mask_focus(now, mf) ? mask_focus_json(mf, now) : nullptr},

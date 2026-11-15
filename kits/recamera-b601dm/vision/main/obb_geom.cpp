@@ -128,32 +128,35 @@ ObbGeom obb_to_geom(const ObbBox& box, float img_w, float img_h,
     return geom;
 }
 
-float prob_iou(const ObbBox& b1, const ObbBox& b2) {
+namespace {
+
+/** Covariance terms of a box's Gaussian (ProbIoU), computed once per box. */
+struct ObbCov {
+    float a = 0.0f;
+    float b = 0.0f;
+    float c = 0.0f;
+};
+
+ObbCov obb_cov(const ObbBox& box) {
+    const float a = (box.w * box.w) / 12.0f;
+    const float b_var = (box.h * box.h) / 12.0f;
+    const float cos_t = std::cos(box.angle_rad);
+    const float sin_t = std::sin(box.angle_rad);
+    const float cos_sq = cos_t * cos_t;
+    const float sin_sq = sin_t * sin_t;
+    ObbCov s;
+    s.a = a * cos_sq + b_var * sin_sq;
+    s.b = a * sin_sq + b_var * cos_sq;
+    s.c = (a - b_var) * cos_t * sin_t;
+    return s;
+}
+
+float prob_iou_cov(const ObbBox& b1, const ObbCov& s1, const ObbBox& b2, const ObbCov& s2) {
     constexpr float eps = 1e-7f;
 
-    const float a1 = (b1.w * b1.w) / 12.0f;
-    const float b_var1 = (b1.h * b1.h) / 12.0f;
-    const float cos1 = std::cos(b1.angle_rad);
-    const float sin1 = std::sin(b1.angle_rad);
-    const float cos1_sq = cos1 * cos1;
-    const float sin1_sq = sin1 * sin1;
-    const float sigma1_a = a1 * cos1_sq + b_var1 * sin1_sq;
-    const float sigma1_b = a1 * sin1_sq + b_var1 * cos1_sq;
-    const float sigma1_c = (a1 - b_var1) * cos1 * sin1;
-
-    const float a2 = (b2.w * b2.w) / 12.0f;
-    const float b_var2 = (b2.h * b2.h) / 12.0f;
-    const float cos2 = std::cos(b2.angle_rad);
-    const float sin2 = std::sin(b2.angle_rad);
-    const float cos2_sq = cos2 * cos2;
-    const float sin2_sq = sin2 * sin2;
-    const float sigma2_a = a2 * cos2_sq + b_var2 * sin2_sq;
-    const float sigma2_b = a2 * sin2_sq + b_var2 * cos2_sq;
-    const float sigma2_c = (a2 - b_var2) * cos2 * sin2;
-
-    const float sa = sigma1_a + sigma2_a;
-    const float sb = sigma1_b + sigma2_b;
-    const float sc = sigma1_c + sigma2_c;
+    const float sa = s1.a + s2.a;
+    const float sb = s1.b + s2.b;
+    const float sc = s1.c + s2.c;
     const float denom = sa * sb - sc * sc + eps;
 
     const float dx = b1.cx - b2.cx;
@@ -162,8 +165,8 @@ float prob_iou(const ObbBox& b1, const ObbBox& b2) {
     const float t1 = ((sa * dy * dy + sb * dx * dx) / denom) * 0.25f;
     const float t2 = ((sc * (b2.cx - b1.cx) * (b1.cy - b2.cy)) / denom) * 0.5f;
 
-    const float det1 = std::max(0.0f, sigma1_a * sigma1_b - sigma1_c * sigma1_c);
-    const float det2 = std::max(0.0f, sigma2_a * sigma2_b - sigma2_c * sigma2_c);
+    const float det1 = std::max(0.0f, s1.a * s1.b - s1.c * s1.c);
+    const float det2 = std::max(0.0f, s2.a * s2.b - s2.c * s2.c);
     const float ratio = denom / (4.0f * std::sqrt(det1 * det2) + eps);
     const float t3 = 0.5f * std::log(std::max(1e-7f, ratio));
 
@@ -172,26 +175,38 @@ float prob_iou(const ObbBox& b1, const ObbBox& b2) {
     return std::clamp(1.0f - hd, 0.0f, 1.0f);
 }
 
-std::vector<ObbBox> obb_nms(std::vector<ObbBox>& boxes, float iou_threshold, bool class_aware) {
+}  // namespace
+
+float prob_iou(const ObbBox& b1, const ObbBox& b2) {
+    return prob_iou_cov(b1, obb_cov(b1), b2, obb_cov(b2));
+}
+
+std::vector<ObbBox> obb_nms(std::vector<ObbBox>& boxes, float iou_threshold, bool class_aware,
+                            size_t max_nms, size_t max_det) {
     std::vector<ObbBox> out;
-    if (boxes.empty()) return out;
+    if (boxes.empty() || max_det == 0) return out;
 
     std::sort(boxes.begin(), boxes.end(), [](const ObbBox& a, const ObbBox& b) {
         return a.score > b.score;
     });
+    if (boxes.size() > max_nms) boxes.resize(max_nms);  // the top max_nms by score
+
+    std::vector<ObbCov> cov(boxes.size());
+    for (size_t i = 0; i < boxes.size(); ++i) cov[i] = obb_cov(boxes[i]);
 
     std::vector<bool> suppressed(boxes.size(), false);
     for (size_t i = 0; i < boxes.size(); ++i) {
         if (suppressed[i]) continue;
         const auto& b1 = boxes[i];
         out.push_back(b1);
+        if (out.size() >= max_det) break;
 
         for (size_t j = i + 1; j < boxes.size(); ++j) {
             if (suppressed[j]) continue;
             const auto& b2 = boxes[j];
             if (class_aware && b1.class_id != b2.class_id) continue;
 
-            const float iou = prob_iou(b1, b2);
+            const float iou = prob_iou_cov(b1, cov[i], b2, cov[j]);
             if (iou > iou_threshold) {
                 suppressed[j] = true;
             }

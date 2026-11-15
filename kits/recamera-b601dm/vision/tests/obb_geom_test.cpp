@@ -1,5 +1,8 @@
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #include "json.hpp"
@@ -80,6 +83,201 @@ static void test_obb_nms() {
     CHECK(kept_class_agnostic.size() == 2);
     CHECK(kept_class_agnostic[0].score == 0.95f);
     CHECK(kept_class_agnostic[1].score == 0.80f);
+}
+
+// ---- reference: obb_nms / prob_iou before the caps and the per-box covariance (verbatim) ----
+
+static float ref_prob_iou(const ObbBox& b1, const ObbBox& b2) {
+    constexpr float eps = 1e-7f;
+
+    const float a1 = (b1.w * b1.w) / 12.0f;
+    const float b_var1 = (b1.h * b1.h) / 12.0f;
+    const float cos1 = std::cos(b1.angle_rad);
+    const float sin1 = std::sin(b1.angle_rad);
+    const float cos1_sq = cos1 * cos1;
+    const float sin1_sq = sin1 * sin1;
+    const float sigma1_a = a1 * cos1_sq + b_var1 * sin1_sq;
+    const float sigma1_b = a1 * sin1_sq + b_var1 * cos1_sq;
+    const float sigma1_c = (a1 - b_var1) * cos1 * sin1;
+
+    const float a2 = (b2.w * b2.w) / 12.0f;
+    const float b_var2 = (b2.h * b2.h) / 12.0f;
+    const float cos2 = std::cos(b2.angle_rad);
+    const float sin2 = std::sin(b2.angle_rad);
+    const float cos2_sq = cos2 * cos2;
+    const float sin2_sq = sin2 * sin2;
+    const float sigma2_a = a2 * cos2_sq + b_var2 * sin2_sq;
+    const float sigma2_b = a2 * sin2_sq + b_var2 * cos2_sq;
+    const float sigma2_c = (a2 - b_var2) * cos2 * sin2;
+
+    const float sa = sigma1_a + sigma2_a;
+    const float sb = sigma1_b + sigma2_b;
+    const float sc = sigma1_c + sigma2_c;
+    const float denom = sa * sb - sc * sc + eps;
+
+    const float dx = b1.cx - b2.cx;
+    const float dy = b1.cy - b2.cy;
+
+    const float t1 = ((sa * dy * dy + sb * dx * dx) / denom) * 0.25f;
+    const float t2 = ((sc * (b2.cx - b1.cx) * (b1.cy - b2.cy)) / denom) * 0.5f;
+
+    const float det1 = std::max(0.0f, sigma1_a * sigma1_b - sigma1_c * sigma1_c);
+    const float det2 = std::max(0.0f, sigma2_a * sigma2_b - sigma2_c * sigma2_c);
+    const float ratio = denom / (4.0f * std::sqrt(det1 * det2) + eps);
+    const float t3 = 0.5f * std::log(std::max(1e-7f, ratio));
+
+    const float bd = std::clamp(t1 + t2 + t3, 0.0f, 100.0f);
+    const float hd = std::sqrt(std::max(0.0f, 1.0f - std::exp(-bd)));
+    return std::clamp(1.0f - hd, 0.0f, 1.0f);
+}
+
+static std::vector<ObbBox> ref_obb_nms(std::vector<ObbBox>& boxes, float iou_threshold, bool class_aware) {
+    std::vector<ObbBox> out;
+    if (boxes.empty()) return out;
+
+    std::sort(boxes.begin(), boxes.end(), [](const ObbBox& a, const ObbBox& b) {
+        return a.score > b.score;
+    });
+
+    std::vector<bool> suppressed(boxes.size(), false);
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        if (suppressed[i]) continue;
+        const auto& b1 = boxes[i];
+        out.push_back(b1);
+
+        for (size_t j = i + 1; j < boxes.size(); ++j) {
+            if (suppressed[j]) continue;
+            const auto& b2 = boxes[j];
+            if (class_aware && b1.class_id != b2.class_id) continue;
+
+            const float iou = ref_prob_iou(b1, b2);
+            if (iou > iou_threshold) {
+                suppressed[j] = true;
+            }
+        }
+    }
+
+    return out;
+}
+
+static bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(float)) == 0; }
+
+static bool same_boxes(const std::vector<ObbBox>& a, const std::vector<ObbBox>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const ObbBox& x = a[i];
+        const ObbBox& y = b[i];
+        if (!same_bits(x.cx, y.cx) || !same_bits(x.cy, y.cy) || !same_bits(x.w, y.w) || !same_bits(x.h, y.h) ||
+            !same_bits(x.angle_rad, y.angle_rad) || !same_bits(x.score, y.score) || x.class_id != y.class_id) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** Deterministic clutter: n boxes in 640x640, clustered so that many overlap, `nc` classes. */
+static std::vector<ObbBox> clutter(size_t n, int nc, uint32_t seed) {
+    uint32_t st = seed;
+    auto rnd = [&st]() {
+        st = st * 1664525u + 1013904223u;
+        return static_cast<float>(st >> 8) / static_cast<float>(1u << 24);
+    };
+    std::vector<ObbBox> v;
+    v.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        ObbBox b;
+        const float cluster_x = 40.0f + 80.0f * std::floor(rnd() * 7.0f);
+        const float cluster_y = 40.0f + 80.0f * std::floor(rnd() * 7.0f);
+        b.cx = cluster_x + 30.0f * (rnd() - 0.5f);
+        b.cy = cluster_y + 30.0f * (rnd() - 0.5f);
+        b.w = 10.0f + 60.0f * rnd();
+        b.h = 5.0f + 40.0f * rnd();
+        b.angle_rad = -0.785398f + 3.14159265f * rnd();
+        b.score = 0.25f + 0.75f * rnd();
+        b.class_id = static_cast<int>(rnd() * static_cast<float>(nc)) % nc;
+        v.push_back(b);
+    }
+    return v;
+}
+
+/** The caps change nothing below them: output identical (bitwise) to the reference. */
+static void test_obb_nms_matches_reference() {
+    // prob_iou on the clutter pairs
+    const std::vector<ObbBox> c = clutter(64, 3, 7u);
+    for (size_t i = 0; i < c.size(); ++i) {
+        for (size_t j = 0; j < c.size(); ++j) CHECK(same_bits(prob_iou(c[i], c[j]), ref_prob_iou(c[i], c[j])));
+    }
+    // the test_obb_nms fixture, then clutter of 30..2900 boxes (some with ties of score)
+    std::vector<std::vector<ObbBox>> sets;
+    {
+        ObbBox b1;
+        b1.cx = 200.0f; b1.cy = 200.0f; b1.w = 50.0f; b1.h = 25.0f;
+        b1.angle_rad = 0.1f; b1.score = 0.95f; b1.class_id = 0;
+        ObbBox b2 = b1;
+        b2.cx = 202.0f; b2.cy = 201.0f; b2.score = 0.85f;
+        ObbBox b3 = b1;
+        b3.class_id = 1; b3.score = 0.90f;
+        ObbBox b4;
+        b4.cx = 50.0f; b4.cy = 50.0f; b4.w = 30.0f; b4.h = 30.0f;
+        b4.angle_rad = 0.0f; b4.score = 0.80f; b4.class_id = 0;
+        sets.push_back({b2, b1, b3, b4});
+    }
+    sets.push_back(clutter(30, 1, 1u));
+    sets.push_back(clutter(500, 15, 2u));
+    sets.push_back(clutter(2900, 15, 3u));
+    std::vector<ObbBox> ties = clutter(400, 2, 4u);
+    for (size_t i = 0; i < ties.size(); ++i) ties[i].score = 0.5f + 0.1f * static_cast<float>(i % 3);
+    sets.push_back(ties);
+    for (const auto& set : sets) {
+        for (bool class_aware : {true, false}) {
+            for (float thr : {0.1f, 0.45f, 0.7f}) {
+                std::vector<ObbBox> a = set;
+                std::vector<ObbBox> b = set;
+                const auto got = obb_nms(a, thr, class_aware);
+                const auto want = ref_obb_nms(b, thr, class_aware);
+                if (want.size() <= kObbMaxDet) CHECK(same_boxes(got, want));
+                else CHECK(got.size() == kObbMaxDet && same_boxes(got, {want.begin(), want.begin() + kObbMaxDet}));
+            }
+        }
+    }
+}
+
+/** max_nms keeps the top candidates by score; max_det bounds the output. */
+static void test_obb_nms_caps() {
+    // 4000 disjoint boxes (one per 10 px cell): nothing is suppressed
+    std::vector<ObbBox> grid;
+    for (int i = 0; i < 4000; ++i) {
+        ObbBox b;
+        b.cx = 5.0f + 10.0f * static_cast<float>(i % 64);
+        b.cy = 5.0f + 10.0f * static_cast<float>(i / 64);
+        b.w = 2.0f;
+        b.h = 2.0f;
+        b.score = 0.25f + 0.7f * static_cast<float>((i * 7919) % 4000) / 4000.0f;
+        grid.push_back(b);
+    }
+    std::vector<ObbBox> a = grid;
+    CHECK(obb_nms(a, 0.45f).size() == kObbMaxDet);
+    CHECK(a.size() == kObbMaxNms);  // the input is truncated to the top max_nms
+    a = grid;
+    const auto all = obb_nms(a, 0.45f, true, kObbMaxNms, 100000);
+    CHECK(all.size() == kObbMaxNms);
+    std::vector<float> scores;
+    for (const auto& b : grid) scores.push_back(b.score);
+    std::sort(scores.begin(), scores.end(), [](float x, float y) { return x > y; });
+    bool top = true;
+    for (size_t i = 0; i < all.size(); ++i) top = top && all[i].score == scores[i];
+    CHECK(top);
+    // explicit caps
+    a = grid;
+    CHECK(obb_nms(a, 0.45f, true, 10, 5).size() == 5 && a.size() == 10);
+    a = grid;
+    CHECK(obb_nms(a, 0.45f, true, 10, 50).size() == 10);
+    a = grid;
+    CHECK(obb_nms(a, 0.45f, true, 100, 0).empty());
+    // a suppressed candidate does not count towards max_det
+    std::vector<ObbBox> dup = {grid[0], grid[0], grid[1]};
+    dup[1].score = 0.1f;
+    CHECK(obb_nms(dup, 0.45f, true, 3000, 2).size() == 2);
 }
 
 static void test_obb_to_geom() {
@@ -930,6 +1128,8 @@ static void test_decode_layout_b_nchw_multiclass_and_ties() {
 int main() {
     test_prob_iou();
     test_obb_nms();
+    test_obb_nms_matches_reference();
+    test_obb_nms_caps();
     test_obb_to_geom();
     test_decode_layout_a();
     test_decode_layout_a_edge_cases();

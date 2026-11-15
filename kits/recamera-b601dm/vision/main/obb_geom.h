@@ -109,8 +109,17 @@ ObbGeom obb_to_geom(const ObbBox& box, float img_w, float img_h,
 // Closed-form Gaussian ProbIoU between two rotated bounding boxes
 float prob_iou(const ObbBox& b1, const ObbBox& b2);
 
-// Greedy rotated Non-Maximum Suppression (NMS)
-std::vector<ObbBox> obb_nms(std::vector<ObbBox>& boxes, float iou_threshold, bool class_aware = true);
+// NMS caps: candidates kept (top by score) before the O(n^2) NMS, and boxes returned.
+// Ultralytics uses max_nms 30000 / max_det 300; 3000 is that scaled for the SG2002 CPU
+// (a 640x640 OBB model has 8400 candidates).
+constexpr size_t kObbMaxNms = 3000;
+constexpr size_t kObbMaxDet = 300;
+
+// Greedy rotated Non-Maximum Suppression (NMS). Sorts `boxes` by score (descending) and
+// truncates it to the top `max_nms`; returns at most `max_det` boxes. Below both caps the
+// result is that of plain greedy NMS over all boxes.
+std::vector<ObbBox> obb_nms(std::vector<ObbBox>& boxes, float iou_threshold, bool class_aware = true,
+                            size_t max_nms = kObbMaxNms, size_t max_det = kObbMaxDet);
 
 // Decode Layout A: Ultralytics single-output FP32 [1, 5 + nc, N]
 // Channels per candidate: cx, cy, w, h, cls[0..nc-1], angle_rad

@@ -50,6 +50,13 @@ target_compile_options(model_catalogue_test PRIVATE -Wall -Wextra)
 target_link_libraries(model_catalogue_test PRIVATE rv_json)
 add_test(NAME model_catalogue COMMAND model_catalogue_test)
 
+add_executable(class_names_test ${CMAKE_CURRENT_LIST_DIR}/class_names_test.cpp ${MAIN}/class_names.cpp
+                                ${MAIN}/model_catalogue.cpp)
+target_include_directories(class_names_test PRIVATE ${MAIN})
+target_compile_options(class_names_test PRIVATE -Wall -Wextra)
+target_link_libraries(class_names_test PRIVATE rv_json)
+add_test(NAME class_names COMMAND class_names_test)
+
 add_executable(camera_model_test ${CMAKE_CURRENT_LIST_DIR}/camera_model_test.cpp ${MAIN}/camera_model.cpp)
 target_include_directories(camera_model_test PRIVATE ${MAIN})
 target_compile_options(camera_model_test PRIVATE -Wall -Wextra)

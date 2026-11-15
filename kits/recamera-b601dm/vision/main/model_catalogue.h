@@ -4,6 +4,7 @@
 #ifndef REBOT_VISION_MODEL_CATALOGUE_H_
 #define REBOT_VISION_MODEL_CATALOGUE_H_
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,12 @@ struct ModelEntry {
     std::string path;
     std::string kind;
     double ion_mb = 0;  ///< ION the model takes when loaded (measured for that file)
+    /// Depth models: metric (true) or relative (false) depth; unset = the file name decides
+    /// (see depth_metric_of). vision.json `"metric"`, or --depth-metric for the startup model.
+    std::optional<bool> metric;
+    /// YOLO models: class names by class id (vision.json `"classes"`); empty = the model's
+    /// sidecar `.names` file, else COCO / "class_<id>" (class_names.h resolve_class_names).
+    std::vector<std::string> classes;
 };
 
 /**
@@ -39,13 +46,33 @@ double legacy_ion_mb(const std::string& kind);
 /** Kind of a YOLO slot entry (detect / segment / obb). */
 bool is_yolo_kind(const std::string& kind);
 
+/** File stem: the file name up to its first '.'. */
+std::string file_stem(const std::string& path);
+
+/**
+ * Whether a depth entry is a metric model: the entry's `metric` flag, else "metric" in the file
+ * stem (zipdepth_metric_* metric, zipdepth_base_* relative).
+ */
+bool depth_metric_of(const ModelEntry& m);
+
+/**
+ * Catalogue name of a startup model (`model` / `depth_model`, else a default file): the entry
+ * with this path, else a new legacy entry (file stem, `ion_mb` from the kind table). `metric`
+ * (--depth-metric on|off; unset for auto) applies to this startup depth model only: it is
+ * stored on the entry unless the entry states its own `metric`.
+ */
+std::string register_startup(Catalogue& cat, const std::string& path, const std::string& kind,
+                             std::optional<bool> metric = std::nullopt);
+
 /** Catalogue names: 1..64 of letters, digits, '_', '-', '.'. */
 bool valid_model_name(const std::string& name);
 
 /**
- * vision.json (`config`, a JSON object) `models` ({"<name>": {"path", "kind", "ion_mb"}}) and
- * `ion_base_mb` / `ion_total_mb` / `ion_reserve_mb` into `out`. Invalid entries are skipped with a
- * message in `warnings` (ion_mb must be a finite number >= 0).
+ * vision.json (`config`, a JSON object) `models` ({"<name>": {"path", "kind", "ion_mb", "metric"?,
+ * "classes"?}}) and `ion_base_mb` / `ion_total_mb` / `ion_reserve_mb` into `out`. Invalid entries
+ * are skipped with a message in `warnings` (ion_mb must be a finite number >= 0; `metric`,
+ * optional, a boolean on a depth entry; `classes`, optional, 1..1000 non-empty strings on a
+ * detect / segment / obb entry).
  */
 void parse_catalogue(const std::string& config, Catalogue& out, std::vector<std::string>& warnings);
 

@@ -25,6 +25,35 @@ bool is_yolo_kind(const std::string& kind) {
     return kind == "detect" || kind == "segment" || kind == "obb";
 }
 
+std::string file_stem(const std::string& path) {
+    const std::string b = path.substr(path.find_last_of('/') + 1);
+    return b.substr(0, b.find('.'));
+}
+
+bool depth_metric_of(const ModelEntry& m) {
+    if (m.metric) return *m.metric;
+    return file_stem(m.path).find("metric") != std::string::npos;
+}
+
+std::string register_startup(Catalogue& cat, const std::string& path, const std::string& kind,
+                             std::optional<bool> metric) {
+    for (ModelEntry& m : cat.models) {
+        if (m.path != path) continue;
+        if (kind == "depth" && !m.metric) m.metric = metric;
+        return m.name;
+    }
+    std::string name = file_stem(path);
+    if (cat.find(name) != nullptr) name += "-startup";
+    ModelEntry e;
+    e.name = name;
+    e.path = path;
+    e.kind = kind;
+    e.ion_mb = legacy_ion_mb(kind);
+    if (kind == "depth") e.metric = metric;
+    cat.models.push_back(e);
+    return name;
+}
+
 bool valid_model_name(const std::string& name) {
     if (name.empty() || name.size() > 64) return false;
     for (char c : name) {
@@ -72,7 +101,30 @@ void parse_catalogue(const std::string& text, Catalogue& out, std::vector<std::s
             bad("ion_mb must be a number >= 0 (measured for this model file)");
             continue;
         }
-        out.models.push_back({name, path->get<std::string>(), kind->get<std::string>(), ion->get<double>()});
+        ModelEntry e;
+        e.name = name;
+        e.path = path->get<std::string>();
+        e.kind = kind->get<std::string>();
+        e.ion_mb = ion->get<double>();
+        if (auto metric = v.find("metric"); metric != v.end()) {
+            if (!metric->is_boolean() || e.kind != "depth") {
+                bad("metric must be true or false, on a depth entry");
+                continue;
+            }
+            e.metric = metric->get<bool>();
+        }
+        if (auto classes = v.find("classes"); classes != v.end()) {
+            bool ok = is_yolo_kind(e.kind) && classes->is_array() && !classes->empty() && classes->size() <= 1000;
+            for (const nlohmann::json& c : ok ? *classes : nlohmann::json::array()) {
+                if (!c.is_string() || c.get<std::string>().empty()) ok = false;
+                else e.classes.push_back(c.get<std::string>());
+            }
+            if (!ok) {
+                bad("classes must be an array of 1..1000 non-empty strings, on a detect, segment or obb entry");
+                continue;
+            }
+        }
+        out.models.push_back(e);
     }
 }
 

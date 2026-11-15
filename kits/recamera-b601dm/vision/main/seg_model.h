@@ -34,6 +34,9 @@ public:
         content_h_ = ch;
     }
     void setScale(float sx, float sy) { scale_x_ = sx; scale_y_ = sy; }
+    int numClasses() const { return num_class_; }
+    /** Names for the mask-focus label match (owned by the Detector; null: "class_<id>"). */
+    void setClassNames(const rv::ClassNames* names) { class_names_ = names; }
 
 protected:
     ma_err_t postprocess() override;
@@ -56,6 +59,7 @@ private:
     float scale_x_{1.0f};
     float scale_y_{1.0f};
     float last_mask_ms_{-1.0f};
+    const rv::ClassNames* class_names_{nullptr};
 
     std::vector<uint8_t> mask_buf_;
     std::vector<float> acc_buf_;

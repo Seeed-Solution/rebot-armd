@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <sscma.h>
+#include "class_names.h"
 #include "mask_geom.h"
 
 namespace yolo {
@@ -60,7 +61,11 @@ public:
     int getInputHeight() const { return input_height_; }
     bool isInitialized() const { return initialized_; }
 
-    static const char* getClassName(int class_id);
+    /** Classes of the loaded model (0 = unknown: a detection head whose shapes do not tell). */
+    int numClasses() const { return num_classes_; }
+    /** Names for class ids (resolve_class_names); the segmentation mask focus matches labels with them. */
+    void setClassNames(rv::ClassNames names);
+    std::string className(int class_id) const { return class_names_.name(class_id); }
 
 private:
     std::unique_ptr<ma::engine::EngineCVI> engine_;
@@ -73,10 +78,9 @@ private:
     int input_height_;
     bool initialized_;
     int detection_id_counter_;
+    int num_classes_ = 0;
+    rv::ClassNames class_names_;
 };
-
-// COCO 80 class names
-extern const char* COCO_CLASSES[80];
 
 }  // namespace yolo
 

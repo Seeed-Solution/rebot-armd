@@ -134,7 +134,7 @@ struct ModelSet {
     bool yolo_available = false;
     std::string model_name;  ///< catalogue name of the YOLO slot (empty: slot empty)
     std::string model_path;
-    std::string model_kind = "detect";
+    std::string model_kind;  ///< detect / segment / obb; empty with the slot empty (model.kind null)
     bool mask = false;
     bool depth_available = false;
     std::string depth_model_name;  ///< catalogue name of the depth slot (empty: slot empty)
@@ -181,7 +181,7 @@ public:
         bool yolo_available = true;
         std::string model_name;
         std::string model_path;
-        std::string model_kind = "detect";
+        std::string model_kind = "detect";  ///< ignored without a YOLO model (yolo_available false)
         bool mask = false;
         int mask_max_boxes = 3;
         std::string family = "aruco4x4_50";
