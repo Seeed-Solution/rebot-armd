@@ -377,9 +377,16 @@ the header).
 - **Simple / expert mode**: simple shows the video with the joysticks on top and, on the
   7-DOF arm, always drives in the view frame; expert adds the view / base frame switch, the
   joint / Cartesian mode switch, link status, the joint state table, dataset recording and
-  keyboard shortcuts.
+  keyboard shortcuts. In simple mode the video HUD has two chips: *Detect* opens a popover with
+  the on/off switch, the vision mode (Off / YOLO / ArUco / Both), single shot, the camera rate
+  (standby / working FPS) and grasp setup; the camera chip shows live, stream fps and latency.
+  The header island has no robot-state chip (the Enable switch shows it). On a landscape screen
+  the HUD chips sit between the two thumb controls; on a phone in portrait Enable and E-stop
+  are first in the cockpit and stay pinned under the header while scrolling
+  (`scripts/simple_layout_shots.mjs` checks for overlaps at five viewport sizes).
 - **Pose card** (side panel, both modes, below the safety card; in simple mode on a landscape
-  screen it floats below the view switch): a side view of the arm in its own plane from the URDF
+  screen it floats below the safety capsule with the Video | 3D switch in its header, and is
+  hidden when it would not end above the left joystick): a side view of the arm in its own plane from the URDF
   chain (rotated by −J1), a J1 yaw dial, a J6 roll mark and the gripper opening. The commanded
   pose is dashed when it differs from the measured one (0.005 rad, gripper 0.05 rad); the profile
   `home_positions` pose is a grey outline; a joint named by `observation.motion_limit` (0-based
