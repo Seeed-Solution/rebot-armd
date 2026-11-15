@@ -9271,7 +9271,9 @@ async function initSandbox() {
     if (wantWasm) WASM_SIM.start().catch(() => {});
     return;
   }
-  if (wantWasm || cat.mode === 'wasm') {
+  // Only on request in this page's URL: the server-side mode is shared by every client,
+  // and the WASM view draws a simulated arm while the controls still drive the real one.
+  if (wantWasm) {
     WASM_SIM.start().catch(() => {});
     return;
   }
@@ -9289,7 +9291,7 @@ async function initSandbox() {
           const sr = await fetch('/api/v1/sandbox/state');
           if (!sr.ok) return;
           const s = await sr.json();
-          if (s.mode === 'wasm') { V3.simModeActive = false; WASM_SIM.start(); return; }
+          if (s.mode === 'wasm') { V3.simModeActive = false; return; }
           if (s.mode !== 'sim') return;
           if (s.sim_state) await v3SyncSimScene(bundle, s.sim_state);
         } catch (_) {}

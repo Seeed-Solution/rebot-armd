@@ -280,6 +280,6 @@ For rapid prototyping, custom task layout iteration, and zero-backend ONNX valid
    - `POST /api/v1/sandbox/activate` (`mode: "none" | "wasm" | "sim"`, composing MJCF XML for WASM and forwarding `/sim/scene` to `rebot-sim` in `"sim"` mode)
    - `POST /api/v1/sandbox/reset`, `POST /api/v1/sandbox/io`, `POST /api/v1/sandbox/telemetry`
 3. **Browser WASM + `onnxruntime-web` (`?sim=wasm`)**:
-   - Without adding Cockpit upload dialogs, opening `?sim=wasm` (or activating `mode: "wasm"`) launches the 3D view (`#v3-canvas`), compiles `composed_xml` inside `mujoco_wasm.js`, executes `POS_VEL` motor + suction weld physics + staged evaluation, runs `rebot-onnx-policy/v1` models via `onnxruntime-web`, and reports live telemetry to `/api/v1/sandbox/telemetry`.
+   - Without adding Cockpit upload dialogs, opening `?sim=wasm` launches the 3D view (`#v3-canvas`), compiles `composed_xml` inside `mujoco_wasm.js`, executes `POS_VEL` motor + suction weld physics + staged evaluation, runs `rebot-onnx-policy/v1` models via `onnxruntime-web`, and reports live telemetry to `/api/v1/sandbox/telemetry`.
 4. **Non-realtime training (`rebot_sim.env.SimEnv`) & `pcb_suction`**:
    - Use `rebot_sim.env.SimEnv(scene="pcb_suction", tool="suction")` in Python for unpaced fast RL/IL rollouts with `POS_VEL` actuator tracking and `qfrc_bias` gravity compensation.

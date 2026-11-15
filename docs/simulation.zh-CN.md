@@ -280,6 +280,6 @@ armd 以 50 Hz 运行：每个周期先读电机反馈，再发送下一个位�
    - `POST /api/v1/sandbox/activate`（切换 `mode: "none" | "wasm" | "sim"`，组合生成浏览器可用的完整 MJCF XML；`"sim"` 模式下自动同步到 `rebot-sim` 的 `/sim/scene`）
    - `POST /api/v1/sandbox/reset`、`POST /api/v1/sandbox/io`、`POST /api/v1/sandbox/telemetry`
 3. **浏览器 WASM + `onnxruntime-web`（`?sim=wasm`）**：
-   - 保持现有 Cockpit 界面布局、不增加上传弹窗；访问 `?sim=wasm` 或激活 `mode: "wasm"` 时自动开启 3D 视图（`#v3-canvas`），调用 `mujoco_wasm.js` 运行物理与吸附约束、用 `onnxruntime-web` 推理 ONNX 策略，并将任务阶段进度上报给 `/api/v1/sandbox/telemetry`。
+   - 保持现有 Cockpit 界面布局、不增加上传弹窗；访问 `?sim=wasm` 时开启 3D 视图（`#v3-canvas`），调用 `mujoco_wasm.js` 运行物理与吸附约束、用 `onnxruntime-web` 推理 ONNX 策略，并将任务阶段进度上报给 `/api/v1/sandbox/telemetry`。
 4. **非实时高速训练环境（`rebot_sim.env.SimEnv`）与 `pcb_suction`**：
    - 通过 `rebot_sim.env.SimEnv(scene="pcb_suction", tool="suction")` 取消实时节拍休眠，使用与 `rebot_sim.server.Motors` 一致的 `POS_VEL` 位置伺服与重力偏置补偿，直接运行 RL/BC 训练或快速评估。
