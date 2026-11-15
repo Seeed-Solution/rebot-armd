@@ -113,6 +113,17 @@ void parse_catalogue(const std::string& text, Catalogue& out, std::vector<std::s
             }
             e.metric = metric->get<bool>();
         }
+        if (auto classes = v.find("classes"); classes != v.end()) {
+            bool ok = is_yolo_kind(e.kind) && classes->is_array() && !classes->empty() && classes->size() <= 1000;
+            for (const nlohmann::json& c : ok ? *classes : nlohmann::json::array()) {
+                if (!c.is_string() || c.get<std::string>().empty()) ok = false;
+                else e.classes.push_back(c.get<std::string>());
+            }
+            if (!ok) {
+                bad("classes must be an array of 1..1000 non-empty strings, on a detect, segment or obb entry");
+                continue;
+            }
+        }
         out.models.push_back(e);
     }
 }

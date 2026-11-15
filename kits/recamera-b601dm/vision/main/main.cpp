@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <memory>
@@ -440,10 +441,15 @@ const char* kind_name(yolo::Kind k) {
  * A fresh Detector for `path` with the frame-owned settings applied (threshold, mask, scale);
  * null when it fails (the failed object is destroyed, which frees what its init allocated).
  */
-std::unique_ptr<yolo::Detector> load_detector(const std::string& path, yolo::ModelKindHint hint) {
+std::unique_ptr<yolo::Detector> load_detector(const std::string& path, yolo::ModelKindHint hint,
+                                              const std::vector<std::string>& classes) {
     if (!file_exists(path)) return nullptr;
     auto d = std::make_unique<yolo::Detector>();
     if (!d->init(path, hint)) return nullptr;
+    rv::ClassNames names = rv::resolve_class_names(classes, path, kind_name(d->getKind()), d->numClasses());
+    MA_LOGI(TAG, "Class names of %s: %s (%d classes in the model)", path.c_str(), names.source.c_str(), d->numClasses());
+    if (!names.warning.empty()) MA_LOGW(TAG, "Class names of %s: %s", path.c_str(), names.warning.c_str());
+    d->setClassNames(std::move(names));
     d->setThreshold(g_cfg.conf_threshold);
     d->setMaskEnabled(g_cfg.mask_enabled);
     d->setMaskMaxBoxes(g_cfg.mask_max_boxes);
@@ -455,6 +461,14 @@ std::unique_ptr<rv::DepthStage> load_depth(const std::string& path) {
     if (!file_exists(path)) return nullptr;
     auto d = std::make_unique<rv::DepthStage>();
     return d->init(path) ? std::move(d) : nullptr;
+}
+
+/** `classes` of the catalogue entry with this path (the startup model), else none. */
+std::vector<std::string> startup_classes(const rv::Catalogue& cat, const std::string& path) {
+    for (const rv::ModelEntry& m : cat.models) {
+        if (m.path == path) return m.classes;
+    }
+    return {};
 }
 
 /** --depth-metric on|off: the metric flag of the startup depth model; auto = unset (the file name decides). */
@@ -513,7 +527,7 @@ int main(int argc, char** argv) {
     if (!file_exists(model)) {
         MA_LOGW(TAG, "No YOLO model found (%s); yolo/both unavailable, aruco works",
                 model.empty() ? "default paths" : model.c_str());
-    } else if ((detector = load_detector(model, kind_hint_of(g_cfg.model_kind_str)))) {
+    } else if ((detector = load_detector(model, kind_hint_of(g_cfg.model_kind_str), startup_classes(g_cfg.catalogue, model)))) {
         set_detector(resident, detector.get(), rv::register_startup(g_cfg.catalogue, model, kind_name(detector->getKind())), model);
     } else {
         MA_LOGE(TAG, "YOLO model %s failed to load; yolo/both unavailable", model.c_str());
@@ -629,6 +643,7 @@ int main(int argc, char** argv) {
     std::vector<af::Box> boxes;
     std::vector<rv::DetBox> dets;
     std::vector<rv::MarkerOut> markers;
+    std::deque<std::string> labels;  // class names of `boxes` / `dets` (a deque keeps c_str() valid on push_back)
     ArucoStats aruco_stats;
     std::string extra;
     uint32_t frame_id = 0;
@@ -654,7 +669,7 @@ int main(int argc, char** argv) {
         }
         std::string failed;
         if (const rv::ModelEntry* m = ctl.catalogue().find(s.detector.name)) {
-            detector = load_detector(m->path, kind_hint_of(m->kind));
+            detector = load_detector(m->path, kind_hint_of(m->kind), m->classes);
             set_detector(resident, detector.get(), m->name, m->path);
             if (!detector) failed = "detector";
         }
@@ -699,6 +714,7 @@ int main(int argc, char** argv) {
         vr.model_generation = model_generation;
         boxes.clear();
         dets.clear();
+        labels.clear();
         markers.clear();
 
         if (p.yolo && detector) {  // an empty slot reports ran: false
@@ -707,7 +723,10 @@ int main(int argc, char** argv) {
             for (const auto& d : detector->detect(&img, frame_focus.active ? &frame_focus : nullptr,
                                                  static_cast<float>(crop.x), static_cast<float>(crop.y),
                                                  static_cast<float>(crop.w), static_cast<float>(crop.h))) {
-                rv::DetBox det{d.x, d.y, d.w, d.h, d.confidence, d.class_id, yolo::Detector::getClassName(d.class_id),
+                // DetBox and af::Box hold const char*: the names live in `labels` until the next frame
+                labels.push_back(detector->className(d.class_id));
+                const char* label = labels.back().c_str();
+                rv::DetBox det{d.x, d.y, d.w, d.h, d.confidence, d.class_id, label,
                                d.angle_deg, d.angle_conf, d.grasp_width_px, d.mask_focus};
                 det.length_px = d.length_px;
                 det.has_obb = d.has_obb;
@@ -720,7 +739,7 @@ int main(int argc, char** argv) {
                 b.h = d.h * frame.height;
                 b.score = d.confidence;
                 b.cls = d.class_id;
-                b.label = yolo::Detector::getClassName(d.class_id);
+                b.label = label;
                 boxes.push_back(b);
             }
             vr.ran_yolo = true;

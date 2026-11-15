@@ -19,6 +19,9 @@ struct ModelEntry {
     /// Depth models: metric (true) or relative (false) depth; unset = the file name decides
     /// (see depth_metric_of). vision.json `"metric"`, or --depth-metric for the startup model.
     std::optional<bool> metric;
+    /// YOLO models: class names by class id (vision.json `"classes"`); empty = the model's
+    /// sidecar `.names` file, else COCO / "class_<id>" (class_names.h resolve_class_names).
+    std::vector<std::string> classes;
 };
 
 /**
@@ -65,10 +68,11 @@ std::string register_startup(Catalogue& cat, const std::string& path, const std:
 bool valid_model_name(const std::string& name);
 
 /**
- * vision.json (`config`, a JSON object) `models` ({"<name>": {"path", "kind", "ion_mb", "metric"?}})
- * and `ion_base_mb` / `ion_total_mb` / `ion_reserve_mb` into `out`. Invalid entries are skipped
- * with a message in `warnings` (ion_mb must be a finite number >= 0; `metric`, optional, a
- * boolean on a depth entry).
+ * vision.json (`config`, a JSON object) `models` ({"<name>": {"path", "kind", "ion_mb", "metric"?,
+ * "classes"?}}) and `ion_base_mb` / `ion_total_mb` / `ion_reserve_mb` into `out`. Invalid entries
+ * are skipped with a message in `warnings` (ion_mb must be a finite number >= 0; `metric`,
+ * optional, a boolean on a depth entry; `classes`, optional, 1..1000 non-empty strings on a
+ * detect / segment / obb entry).
  */
 void parse_catalogue(const std::string& config, Catalogue& out, std::vector<std::string>& warnings);
 

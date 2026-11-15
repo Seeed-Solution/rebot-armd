@@ -3,24 +3,11 @@
 #include "obb_model.h"
 
 #include <algorithm>
+#include <utility>
 
 #define TAG "Detector"
 
 namespace yolo {
-
-const char* COCO_CLASSES[80] = {
-    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
-    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
-    "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
-    "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
-    "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
-    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
-    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
-    "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
-    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
-    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
-    "toothbrush"
-};
 
 Detector::Detector()
     : engine_(nullptr),
@@ -72,6 +59,7 @@ bool Detector::init(const std::string& model_path, ModelKindHint hint) {
         if (num_outputs == 2 && ma::model::Yolo11Seg::isValid(engine_.get())) {
             seg_model_ = std::make_unique<SegModel>(engine_.get());
             kind_ = Kind::Segment;
+            num_classes_ = seg_model_->numClasses();
             const ma_img_t* model_input = static_cast<const ma_img_t*>(seg_model_->getInput());
             if (model_input) {
                 input_width_ = model_input->width;
@@ -101,6 +89,7 @@ bool Detector::init(const std::string& model_path, ModelKindHint hint) {
         if (ObbModel::isValid(engine_.get(), allow_1out, model_path.c_str())) {
             obb_model_ = std::make_unique<ObbModel>(engine_.get());
             kind_ = Kind::Obb;
+            num_classes_ = obb_model_->numClasses();
             const ma_img_t* model_input = static_cast<const ma_img_t*>(obb_model_->getInput());
             if (model_input) {
                 input_width_ = model_input->width;
@@ -131,6 +120,12 @@ bool Detector::init(const std::string& model_path, ModelKindHint hint) {
     }
 
     model_ = static_cast<ma::model::Detector*>(m);
+    std::vector<std::vector<int>> shapes;
+    for (size_t i = 0; i < static_cast<size_t>(engine_->getOutputSize()); ++i) {
+        const ma_shape_t s = engine_->getOutputShape(i);
+        shapes.emplace_back(s.dims, s.dims + s.size);
+    }
+    num_classes_ = rv::detect_num_classes(shapes);
 
     // Get input dimensions from model
     const ma_img_t* model_input = static_cast<const ma_img_t*>(model_->getInput());
@@ -260,11 +255,11 @@ void Detector::setScale(float sx, float sy) {
     }
 }
 
-const char* Detector::getClassName(int class_id) {
-    if (class_id >= 0 && class_id < 80) {
-        return COCO_CLASSES[class_id];
+void Detector::setClassNames(rv::ClassNames names) {
+    class_names_ = std::move(names);
+    if (seg_model_) {
+        seg_model_->setClassNames(&class_names_);
     }
-    return "unknown";
 }
 
 }  // namespace yolo

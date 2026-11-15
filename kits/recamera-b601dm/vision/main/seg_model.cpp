@@ -99,7 +99,8 @@ ma_err_t SegModel::postprocess() {
         std::vector<rv::FocusCandidate> candidates;
         candidates.reserve(boxes.size());
         for (const auto& b : boxes) {
-            candidates.push_back({b.x, b.y, b.w, b.h, b.score, b.target, Detector::getClassName(b.target)});
+            candidates.push_back({b.x, b.y, b.w, b.h, b.score, b.target,
+                                  class_names_ ? class_names_->name(b.target) : rv::ClassNames{}.name(b.target)});
         }
         focus_idx = rv::select_focus_box(mask_focus_, candidates, content_x_, content_y_, content_w_, content_h_, iw, ih);
     }

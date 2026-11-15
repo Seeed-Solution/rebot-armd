@@ -39,6 +39,20 @@ ObbModel::ObbModel(Engine* engine)
                 img_.width = in_shape.dims[2];
             }
         }
+        if (is_layout_a_) {
+            const auto out_shape = engine->getOutputShape(0);
+            const rv::ObbTensorSpec in_spec = obb_spec(in_shape, rv::ObbDataType::FP32);
+            const rv::ObbTensorSpec out_spec = obb_spec(out_shape, rv::ObbDataType::FP32);
+            const auto info = rv::resolve_obb_layout_a(in_spec, out_spec, true, nullptr);
+            if (info.valid) num_classes_ = info.num_channels - 5;
+        } else if (engine->getOutputSize() == 9) {
+            std::array<rv::ObbTensorSpec, 9> specs;
+            for (size_t i = 0; i < 9; ++i) {
+                specs[i] = obb_spec(engine->getOutputShape(i), obb_dtype(engine->getOutput(i).type));
+            }
+            const auto info = rv::resolve_obb_layout_b(specs.data(), 9);
+            if (info.valid) num_classes_ = info.num_classes;
+        }
     }
 }
 
