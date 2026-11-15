@@ -245,6 +245,10 @@ Ending a grasp from outside:
 | lease released, preempted or connection closed | `cancelled` / `LEASE_LOST` |
 | E-stop / Fault / lease watchdog | `failed` / `ESTOP_ACTIVE` / `FAULT` / `WATCHDOG` |
 
+Before the ack the grasp is planned and its task checked (with `models`, the model switch can take 7 s or more). On the WebSocket this runs in its own task: `/motion/stop`, E-stop, heartbeats and lease messages on the same connection are handled at once; other messages wait and are answered after the grasp reply, in order. A stop or E-stop in that time answers the grasp `command_reject` 409 `STOPPED` / `ESTOP_ACTIVE` (no action record is created) and every waiting command / preset / servo frame with the same code; the grasp does not begin afterwards.
+
+应答前抓取先规划并检查任务（带 `models` 时模型切换可能需要 7 s 以上）。在 WebSocket 上这一步在独立任务中执行：同一连接上的 `/motion/stop`、急停、心跳和租约消息立即处理；其他消息排队，在抓取应答之后按顺序处理。这期间收到停止或急停时，抓取返回 `command_reject` 409 `STOPPED` / `ESTOP_ACTIVE`（不创建动作记录），排队的 command / preset / servo 帧返回同一代码；之后抓取不会开始。
+
 The record ends in the same tick; a sub-motion still carrying the grasp is stopped, and the orchestrator issues nothing more. Servo frames are rejected with `MOTION_BUSY` for the whole grasp, including the waits between motions.
 
 外部停止（停止、急停、租约丢失、被新指令替代）在同一 tick 内结束动作记录，仍在执行的子运动被停止，编排任务不再下发任何运动。抓取期间（包括两次运动之间的等待）servo 帧一律返回 `MOTION_BUSY`。

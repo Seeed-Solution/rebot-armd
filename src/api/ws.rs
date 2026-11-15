@@ -197,6 +197,45 @@ impl PlannedMacro {
     }
 }
 
+/// A macro action being planned and checked (grasp preflight: model switch, up to ~7 s) in a
+/// task of its own, so the receive loop still reads stop / e-stop on the connection meanwhile.
+struct MacroCheck {
+    request_id: Value,
+    generation: u64,
+    task: tokio::task::JoinHandle<Result<PlannedMacro, ArmError>>,
+}
+
+/// Messages queued while a [`MacroCheck`] runs, at most; then the socket is not read until
+/// the check ends.
+const MACRO_CHECK_BACKLOG: usize = 64;
+
+/// Handled while a [`MacroCheck`] runs; every other message waits for its reply, in order.
+/// None of these can start motion; lease changes are caught by the re-check after the check.
+fn runs_during_macro_check(kind: &str, value: &Value) -> bool {
+    matches!(kind, "estop" | "e_stop" | "heartbeat" | "acquire_lease" | "release_lease")
+        || (kind == "command" && value.get("path").and_then(Value::as_str) == Some("/api/v1/motion/stop"))
+}
+
+/// The reply to a message cancelled by a stop / e-stop before it ran (`code` STOPPED /
+/// ESTOP_ACTIVE). None for messages that are not acknowledged.
+fn cancelled_reply(value: &Value, code: &str, epoch: u64) -> Option<Value> {
+    let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+    let mut reply = json!({"status":409, "code":code, "error":code, "message":"Cancelled by a stop before it began", "epoch_id":epoch});
+    if kind == "command" {
+        reply["type"] = json!("command_reject");
+        reply["request_id"] = value.get("request_id").cloned().unwrap_or(Value::Null);
+    } else if kind == "preset" {
+        reply["type"] = json!("preset_reject");
+        reply["name"] = value.get("name").cloned().unwrap_or(Value::Null);
+    } else if kind == "servo" || value.get("positions").is_some() || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream") {
+        reply["type"] = json!("servo_reject");
+        reply["reason"] = json!("stopped");
+    } else {
+        return None;
+    }
+    Some(reply)
+}
+
 // Under the write lock, after lease / epoch / request_id checks.
 fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: u64, request_id: &Value) -> Result<ActionStart, ApiError> {
     if !body.is_object() { return Err(invalid_command("Command body must be an object")); }
@@ -338,24 +377,53 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         // the current epoch and enqueued by this loop, in order with its other replies
         // (epoch_sync, rejects): the epochs a client receives never go back.
         let (ack_tx, mut ack_rx) = mpsc::channel::<Value>(64);
+        let mut macro_check: Option<MacroCheck> = None;
+        let mut backlog: std::collections::VecDeque<Message> = std::collections::VecDeque::new();
         loop {
-            let message = tokio::select! {
-                biased;
-                Some(mut reply) = ack_rx.recv() => {
-                    {
-                        let inner = recv_supervisor.inner().read().await;
-                        reply["epoch_id"] = json!(inner.safety.epoch_id());
-                        reply["safety_state"] = json!(inner.safety.state());
-                        reply["is_torqued"] = json!(inner.is_torqued);
+            let message = match backlog.pop_front() {
+                Some(queued) if macro_check.is_none() => queued,
+                queued => {
+                    if let Some(queued) = queued { backlog.push_front(queued); }
+                    tokio::select! {
+                        biased;
+                        Some(mut reply) = ack_rx.recv() => {
+                            {
+                                let inner = recv_supervisor.inner().read().await;
+                                reply["epoch_id"] = json!(inner.safety.epoch_id());
+                                reply["safety_state"] = json!(inner.safety.state());
+                                reply["is_torqued"] = json!(inner.is_torqued);
+                            }
+                            test_ack_stamp_delay().await;
+                            if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                            continue;
+                        }
+                        joined = async { (&mut macro_check.as_mut().expect("guarded by the precondition").task).await }, if macro_check.is_some() => {
+                            let MacroCheck { request_id, generation, .. } = macro_check.take().expect("checked above");
+                            let mut inner = recv_supervisor.inner().write().await;
+                            let reply = match joined {
+                                Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
+                                Ok(Err(error)) => command_reject(&inner, &request_id, error.into()),
+                                Ok(Ok(planned)) => {
+                                    if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
+                                        json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
+                                    } else {
+                                        match planned.start(&mut inner, &recv_supervisor, &recv_deps) {
+                                            Ok(started) => command_ack(&inner, &request_id, Some(started)),
+                                            Err(error) => command_reject(&inner, &request_id, error.into()),
+                                        }
+                                    }
+                                }
+                            };
+                            drop(inner);
+                            if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                            continue;
+                        }
+                        message = receiver.next(), if backlog.len() < MACRO_CHECK_BACKLOG => match message {
+                            Some(Ok(message)) => message,
+                            _ => break,
+                        },
                     }
-                    test_ack_stamp_delay().await;
-                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
-                    continue;
                 }
-                message = receiver.next() => match message {
-                    Some(Ok(message)) => message,
-                    _ => break,
-                },
             };
             let Message::Text(text) = message else {
                 if matches!(message, Message::Close(_)) { break; }
@@ -363,6 +431,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             };
             let Ok(value) = serde_json::from_str::<Value>(&text) else { continue; };
             let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+            if macro_check.is_some() && !runs_during_macro_check(kind, &value) {
+                backlog.push_back(Message::Text(text));
+                continue;
+            }
             let mut response: Option<Value>;
             let mut evicted_notify: Option<(String, u64)> = None;
             let mut pending_plan: Option<(PendingPlan, u64)> = None;
@@ -585,27 +657,18 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
 
                 // Macro actions (grasp, place): the first motions are planned without the lock
                 // (feasibility check), then the action begins and the orchestrator task takes over.
+                // The check runs in its own task; its result is taken by the select! above
+                // (lease re-check, then begin), and later messages wait in `backlog`.
                 if let Some((request_id, pending, generation)) = pending_macro.take() {
-                    let mut planned = tokio::task::spawn_blocking(move || pending.plan()).await;
-                    // grasp task requirements: checked without the lock, before the action begins
-                    if let Ok(Ok(PlannedMacro::Grasp(g))) = &mut planned {
-                        if let Err(e) = crate::grasp::preflight(recv_deps.source.as_ref(), g).await { planned = Ok(Err(e)); }
-                    }
-                    let mut inner = recv_supervisor.inner().write().await;
-                    response = Some(match planned {
-                        Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
-                        Ok(Err(error)) => command_reject(&inner, &request_id, error.into()),
-                        Ok(Ok(planned)) => {
-                            if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
-                                json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                            } else {
-                                match planned.start(&mut inner, &recv_supervisor, &recv_deps) {
-                                    Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                    Err(error) => command_reject(&inner, &request_id, error.into()),
-                                }
-                            }
-                        }
+                    let source = recv_deps.source.clone();
+                    let task = tokio::spawn(async move {
+                        let mut planned = tokio::task::spawn_blocking(move || pending.plan()).await
+                            .map_err(|e| ArmError::Internal(format!("planner task failed: {e}")))??;
+                        // grasp task requirements: checked without the lock, before the action begins
+                        if let PlannedMacro::Grasp(g) = &mut planned { crate::grasp::preflight(source.as_ref(), g).await?; }
+                        Ok(planned)
                     });
+                    macro_check = Some(MacroCheck { request_id, generation, task });
                 }
                 // Replay: the episode is read and checked without the lock; install re-checks.
                 if let Some((request_id, input, generation)) = pending_replay.take() {
@@ -666,6 +729,29 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         }
                     }
                 }
+            }
+            // A stop / e-stop during a macro check cancels it and every message queued behind
+            // it: none of them begins after the stop.
+            let stop_code = if kind == "estop" || kind == "e_stop" {
+                Some("ESTOP_ACTIVE")
+            } else if kind == "command" && value.get("path").and_then(Value::as_str) == Some("/api/v1/motion/stop")
+                && response.as_ref().is_some_and(|r| r["type"] == "command_ack") {
+                Some("STOPPED")
+            } else { None };
+            if let (Some(code), Some(check)) = (stop_code, macro_check.as_ref()) {
+                check.task.abort();
+                let epoch = recv_supervisor.inner().read().await.safety.epoch_id();
+                let mut cancelled = vec![json!({"type":"command_reject", "request_id":check.request_id, "status":409, "code":code, "error":code, "message":"Stopped before the action began", "epoch_id":epoch})];
+                macro_check = None;
+                cancelled.extend(backlog.drain(..).filter_map(|queued| match queued {
+                    Message::Text(t) => serde_json::from_str::<Value>(&t).ok().and_then(|v| cancelled_reply(&v, code, epoch)),
+                    _ => None,
+                }));
+                let mut closed = false;
+                for reply in cancelled {
+                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { closed = true; break; }
+                }
+                if closed { break; }
             }
             // Do not silently lose control acknowledgements behind telemetry.
             if let Some(response) = response {
