@@ -19,6 +19,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -126,12 +127,6 @@ bool file_exists(const std::string& p) {
     return !p.empty() && access(p.c_str(), R_OK) == 0;
 }
 
-std::string base_name(const std::string& p) {
-    std::string b = p.substr(p.find_last_of('/') + 1);
-    const size_t dot = b.find('.');
-    return dot == std::string::npos ? b : b.substr(0, dot);
-}
-
 void cam_defaults() {
     g_cfg.aruco.cam.fx = 600.0;
     g_cfg.aruco.cam.fy = 600.0;
@@ -223,7 +218,8 @@ void print_usage(const char* prog) {
     printf("  --mask on|off            Decode instance segmentation masks [default: off]\n");
     printf("  --mask-max-boxes N       Max boxes with decoded segmentation masks, 1..20 [default: 3]\n");
     printf("  --depth-model PATH       ZipDepth .cvimodel (or \"off\" to disable) [default: first existing]\n");
-    printf("  --depth-metric auto|on|off  Metric depth mode (auto detects \"metric\" in filename) [default: auto]\n");
+    printf("  --depth-metric auto|on|off  Metric depth of the startup depth model (auto: \"metric\" in the file\n");
+    printf("                           name; a catalogue entry's \"metric\" wins) [default: auto]\n");
     printf("  --fps N                  Inference rate of the default subscription and cap of every\n");
     printf("                           subscription, 1..15 [default: 5]\n");
     printf("  -m, --model PATH         YOLO .cvimodel [default: first of /userdata/rebot-teleop/models/yolo11n.cvimodel,\n");
@@ -461,22 +457,11 @@ std::unique_ptr<rv::DepthStage> load_depth(const std::string& path) {
     return d->init(path) ? std::move(d) : nullptr;
 }
 
-/** --depth-metric: on, off, or auto ("metric" in the file name). */
-bool depth_metric_of(const std::string& path) {
+/** --depth-metric on|off: the metric flag of the startup depth model; auto = unset (the file name decides). */
+std::optional<bool> startup_depth_metric() {
     if (g_cfg.depth_metric_str == "on") return true;
     if (g_cfg.depth_metric_str == "off") return false;
-    return base_name(path).find("metric") != std::string::npos;
-}
-
-/** Catalogue name of a startup model: the entry with this path, else a legacy entry (file stem, kind table). */
-std::string register_startup(rv::Catalogue& cat, const std::string& path, const std::string& kind) {
-    for (const rv::ModelEntry& m : cat.models) {
-        if (m.path == path) return m.name;
-    }
-    std::string name = base_name(path);
-    if (cat.find(name) != nullptr) name += "-startup";
-    cat.models.push_back({name, path, kind, rv::legacy_ion_mb(kind)});
-    return name;
+    return std::nullopt;
 }
 
 void set_detector(rv::ModelSet& s, const yolo::Detector* d, const std::string& name, const std::string& path) {
@@ -487,11 +472,12 @@ void set_detector(rv::ModelSet& s, const yolo::Detector* d, const std::string& n
     s.mask = d && g_cfg.mask_enabled && d->getKind() == yolo::Kind::Segment;
 }
 
-void set_depth(rv::ModelSet& s, const rv::DepthStage* d, const std::string& name, const std::string& path) {
-    s.depth_available = d != nullptr;
-    s.depth_model_name = d ? name : "";
-    s.depth_model_path = d ? path : "";
-    s.depth_metric = d && depth_metric_of(path);
+/** The depth slot: `m` is the loaded entry (null with `d` null); metric from the entry (depth_metric_of). */
+void set_depth(rv::ModelSet& s, const rv::DepthStage* d, const rv::ModelEntry* m) {
+    s.depth_available = d != nullptr && m != nullptr;
+    s.depth_model_name = s.depth_available ? m->name : "";
+    s.depth_model_path = s.depth_available ? m->path : "";
+    s.depth_metric = s.depth_available && rv::depth_metric_of(*m);
 }
 
 ma::Camera* device_camera() {
@@ -528,7 +514,7 @@ int main(int argc, char** argv) {
         MA_LOGW(TAG, "No YOLO model found (%s); yolo/both unavailable, aruco works",
                 model.empty() ? "default paths" : model.c_str());
     } else if ((detector = load_detector(model, kind_hint_of(g_cfg.model_kind_str)))) {
-        set_detector(resident, detector.get(), register_startup(g_cfg.catalogue, model, kind_name(detector->getKind())), model);
+        set_detector(resident, detector.get(), rv::register_startup(g_cfg.catalogue, model, kind_name(detector->getKind())), model);
     } else {
         MA_LOGE(TAG, "YOLO model %s failed to load; yolo/both unavailable", model.c_str());
     }
@@ -559,13 +545,13 @@ int main(int argc, char** argv) {
     } else {
         // over the ION budget the depth model is not loaded: a load without free ION aborts the
         // process, and a near-full carveout makes the VENC fail
-        const std::string name = register_startup(g_cfg.catalogue, depth_model, "depth");
+        const std::string name = rv::register_startup(g_cfg.catalogue, depth_model, "depth", startup_depth_metric());
         const rv::BudgetCheck b = rv::check_budget(g_cfg.catalogue, resident.model_name, name);
         if (!b.ok) {
             MA_LOGW(TAG, "Depth model %s not loaded: %s + %s need %.1f MB ION, limit %.1f MB; depth unavailable",
                     depth_model.c_str(), resident.model_name.c_str(), name.c_str(), b.need_mb, b.limit_mb);
         } else if ((depth_stage = load_depth(depth_model))) {
-            set_depth(resident, depth_stage.get(), name, depth_model);
+            set_depth(resident, depth_stage.get(), g_cfg.catalogue.find(name));
             MA_LOGI(TAG, "Depth model %s loaded (%s, %dx%d)", depth_model.c_str(),
                     resident.depth_metric ? "metric" : "relative", depth_stage->grid_w(), depth_stage->grid_h());
         } else {
@@ -664,7 +650,7 @@ int main(int argc, char** argv) {
         }
         if (s.depth.change) {
             depth_stage.reset();
-            set_depth(resident, nullptr, "", "");
+            set_depth(resident, nullptr, nullptr);
         }
         std::string failed;
         if (const rv::ModelEntry* m = ctl.catalogue().find(s.detector.name)) {
@@ -674,7 +660,7 @@ int main(int argc, char** argv) {
         }
         if (const rv::ModelEntry* m = ctl.catalogue().find(s.depth.name)) {
             depth_stage = load_depth(m->path);
-            set_depth(resident, depth_stage.get(), m->name, m->path);
+            set_depth(resident, depth_stage.get(), m);
             if (!depth_stage) failed += failed.empty() ? "depth" : ",depth";
         }
         model_generation = ctl.finish_swap(resident, failed.empty() ? "" : "LOAD_FAILED:" + failed);

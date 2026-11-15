@@ -115,10 +115,57 @@ static void test_swap_request() {
     }
 }
 
+/** Metric depth per entry: the entry's flag, then --depth-metric for the startup model only, then the name. */
+static void test_depth_metric() {
+    Catalogue c;
+    std::vector<std::string> w;
+    parse_catalogue(std::string(R"({"models": {
+        "base": {"path": "/m/zipdepth_base_384x224_bf16_rgb.cvimodel", "kind": "depth", "ion_mb": 20.5},
+        "metric": {"path": "/m/zipdepth_metric_384x224_bf16_rgb.cvimodel", "kind": "depth", "ion_mb": 20.5},
+        "flagged": {"path": "/m/my_depth.cvimodel", "kind": "depth", "ion_mb": 20.5, "metric": true},
+        "unflagged": {"path": "/m/zipdepth_metric_v2.cvimodel", "kind": "depth", "ion_mb": 20.5, "metric": false},
+        "str": {"path": "/m/d.cvimodel", "kind": "depth", "ion_mb": 20.5, "metric": "yes"},
+        "det": {"path": "/m/det.cvimodel", "kind": "detect", "ion_mb": 8.5, "metric": true}}})"),
+                     c, w);
+    CHECK(c.models.size() == 4 && w.size() == 2);
+    CHECK(!c.find("base")->metric && !depth_metric_of(*c.find("base")));
+    CHECK(!c.find("metric")->metric && depth_metric_of(*c.find("metric")));
+    CHECK(depth_metric_of(*c.find("flagged")) && !depth_metric_of(*c.find("unflagged")));
+    CHECK(file_stem("/a.b/zipdepth_metric_384x224.bf16.cvimodel") == "zipdepth_metric_384x224");
+
+    // --depth-metric on for a startup model in the catalogue without a flag: stored on that entry
+    // only; a relative model swapped in later still reports metric false
+    Catalogue on = c;
+    CHECK(register_startup(on, "/m/my_depth.cvimodel", "depth", false) == "flagged");
+    CHECK(depth_metric_of(*on.find("flagged")));  // the entry's flag wins over --depth-metric off
+    on = c;
+    CHECK(register_startup(on, "/m/zipdepth_metric_384x224_bf16_rgb.cvimodel", "depth", false) == "metric");
+    CHECK(!depth_metric_of(*on.find("metric")) && !depth_metric_of(*on.find("base")));
+    on = c;
+    CHECK(register_startup(on, "/m/zipdepth_base_384x224_bf16_rgb.cvimodel", "depth", true) == "base");
+    CHECK(depth_metric_of(*on.find("base")) && !on.find("metric")->metric);
+    // auto (unset): the file name
+    on = c;
+    register_startup(on, "/m/zipdepth_base_384x224_bf16_rgb.cvimodel", "depth", std::nullopt);
+    CHECK(!depth_metric_of(*on.find("base")));
+
+    // a startup model outside the catalogue: a legacy entry with the flag, named from the file stem
+    Catalogue legacy;
+    CHECK(register_startup(legacy, "/x/zipdepth_base_384x224_bf16_rgb.cvimodel", "depth", true) ==
+          "zipdepth_base_384x224_bf16_rgb");
+    CHECK(legacy.models.size() == 1 && legacy.models[0].ion_mb == 20.5 && depth_metric_of(legacy.models[0]));
+    CHECK(register_startup(legacy, "/y/zipdepth_base_384x224_bf16_rgb.cvimodel", "depth") ==
+          "zipdepth_base_384x224_bf16_rgb-startup");
+    CHECK(!depth_metric_of(legacy.models[1]));
+    // YOLO startup models carry no metric flag
+    CHECK(register_startup(legacy, "/x/det.cvimodel", "detect", true) == "det" && !legacy.find("det")->metric);
+}
+
 int main() {
     test_budget_table();
     test_catalogue_parsing();
     test_swap_request();
+    test_depth_metric();
     if (g_fail) {
         std::printf("%d check(s) failed\n", g_fail);
         return 1;

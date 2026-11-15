@@ -631,8 +631,10 @@ static void put_models(nlohmann::json& j, const VisionControl& ctl, const ModelS
     const Catalogue& cat = ctl.catalogue();
     nlohmann::json list = nlohmann::json::array();
     for (const ModelEntry& m : cat.models) {
-        list.push_back({{"name", m.name}, {"kind", m.kind}, {"path", m.path}, {"ion_mb", m.ion_mb},
-                        {"resident", m.name == ms.model_name || m.name == ms.depth_model_name}});
+        nlohmann::json e = {{"name", m.name}, {"kind", m.kind}, {"path", m.path}, {"ion_mb", m.ion_mb},
+                            {"resident", m.name == ms.model_name || m.name == ms.depth_model_name}};
+        if (m.kind == "depth") e["metric"] = depth_metric_of(m);
+        list.push_back(e);
     }
     j["models"] = {{"generation", ms.generation}, {"swap", swap},
                    {"resident", {{"detector", name_or_null(ms.model_name)}, {"depth", name_or_null(ms.depth_model_name)}}},

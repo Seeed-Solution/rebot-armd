@@ -1107,6 +1107,8 @@ static void test_model_swap() {
     CHECK(m["models"]["catalogue"].size() == 3 && m["models"]["catalogue"][1] ==
           json({{"name", "det"}, {"kind", "detect"}, {"path", "/m/det.cvimodel"}, {"ion_mb", 8.5}, {"resident", true}}));
     CHECK(m["models"]["catalogue"][0]["resident"] == true && m["models"]["catalogue"][2]["resident"] == false);
+    // depth entries report their metric flag (here from the file name: relative)
+    CHECK(m["models"]["catalogue"][0]["metric"] == false && !m["models"]["catalogue"][1].contains("metric"));
     CHECK(m["ion"]["used_mb"] == 50.5 && m["ion"]["total_mb"] == 62.9 && m["ion"]["reserve_mb"] == 8.0);
 
     // seg next to the resident depth model: over the budget, nothing changes
