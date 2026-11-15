@@ -1629,7 +1629,9 @@ impl SupervisorInner {
         if req > self.applied_estop_count {
             self.applied_estop_count = req;
             self.e_stop_latched.store(true, Ordering::SeqCst);
-            self.apply_stop_policy(StopPolicy::EStopLatch);
+            if !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. })) {
+                self.apply_stop_policy(StopPolicy::EStopLatch);
+            }
             true
         } else {
             false
@@ -3207,7 +3209,10 @@ impl SupervisorInner {
     pub fn tick(&mut self, dt: f64) -> ArmObservation {
         self.consume_pending_estop();
         // Immediate atomic e-stop latch check before any processing
-        if self.e_stop_latched.load(Ordering::SeqCst) && *self.safety.state() != SafetyState::EStop {
+        if self.e_stop_latched.load(Ordering::SeqCst)
+            && *self.safety.state() != SafetyState::EStop
+            && !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }))
+        {
             self.apply_stop_policy(StopPolicy::EStopLatch);
         }
 
