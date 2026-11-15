@@ -492,8 +492,16 @@ impl SupervisorInner {
         schema
     }
 
-    pub fn effective_gripper_policy(&self) -> Option<&crate::model::GripperPolicy> {
-        self.config.gripper_policy.as_ref()
+    fn estop_pending(&self) -> bool {
+        self.e_stop_latched.load(Ordering::SeqCst) || self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count
+    }
+
+    fn reset_gripper_stall(&mut self) {
+        self.gripper_stalled = false;
+        self.gripper_stall_sign = 0.0;
+        self.gripper_prev_hw_overload = false;
+        self.gripper_high_torque_ticks = 0;
+        self.gripper_low_torque_ticks = 0;
     }
 
     pub fn with_driver(mut self, mut driver: Box<dyn ArmDriver>) -> Self {
@@ -1067,11 +1075,6 @@ impl SupervisorInner {
     /// Resting-pose position tolerances and support torque/load limits without requiring
     /// operational state (!is_stopped()) or enabled driver. Used to guard disabling
     /// supporting joints during fault clearing.
-    pub fn resting_pose_support_violation(&self) -> Option<String> {
-        let drv = self.driver.as_ref().and_then(|d| d.lock().ok());
-        self.resting_pose_support_violation_with_driver(drv.as_deref().map(|b| b.as_ref()))
-    }
-
     pub fn resting_pose_support_violation_with_driver(&self, drv: Option<&dyn ArmDriver>) -> Option<String> {
         let dof = self.config.dof;
         if self.measured_positions.len() != dof || self.measured_velocities.len() != dof {
@@ -1199,7 +1202,7 @@ impl SupervisorInner {
             }
             if self.disable_pending { return Err(SafetyError::ClearFaultRejected("Torque disable is still pending".into())); }
             // Atomic e-stop check
-            if self.e_stop_latched.load(Ordering::SeqCst) || self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count {
+            if self.estop_pending() {
                 return Err(SafetyError::EStopActive);
             }
 
@@ -1222,11 +1225,11 @@ impl SupervisorInner {
 
             if let Some(ref d) = self.driver {
                 // Secondary double-check latch right before hardware actuation
-                if self.e_stop_latched.load(Ordering::SeqCst) || self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count {
+                if self.estop_pending() {
                     return Err(SafetyError::EStopActive);
                 }
                 let mut driver = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
-                if self.e_stop_latched.load(Ordering::SeqCst) || self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count {
+                if self.estop_pending() {
                     return Err(SafetyError::EStopActive);
                 }
                 if !driver.is_feedback_valid() {
@@ -1365,11 +1368,7 @@ impl SupervisorInner {
             return Err(error);
         }
         let state = self.safety.set_torque(false)?;
-        self.gripper_stalled = false;
-        self.gripper_stall_sign = 0.0;
-        self.gripper_prev_hw_overload = false;
-        self.gripper_high_torque_ticks = 0;
-        self.gripper_low_torque_ticks = 0;
+        self.reset_gripper_stall();
         if self.driver.is_none() { self.measured_velocities.fill(0.0); }
         Ok(state)
     }
@@ -1508,11 +1507,7 @@ impl SupervisorInner {
                 self.unload_settle = None;
                 self.is_torqued = false;
                 self.active_trajectory = None;
-                self.gripper_stalled = false;
-                self.gripper_stall_sign = 0.0;
-                self.gripper_prev_hw_overload = false;
-                self.gripper_high_torque_ticks = 0;
-                self.gripper_low_torque_ticks = 0;
+                self.reset_gripper_stall();
                 self.commanded_velocities = vec![0.0; self.config.dof];
                 if self.driver.is_none() {
                     self.measured_velocities = vec![0.0; self.config.dof];
@@ -1651,7 +1646,7 @@ impl SupervisorInner {
         }
         if self.disable_pending { return Err(SafetyError::ClearFaultRejected("Torque disable is still unconfirmed".into())); }
         let thermal = matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }));
-        let _confirmed = if let Some(ref d) = self.driver {
+        if let Some(ref d) = self.driver {
             let mut drv = d.lock().map_err(|_| SafetyError::FeedbackUnavailable)?;
             let disabling = drv.clear_fault_disables_joints();
             if (self.is_torqued || drv.has_any_joint_enabled() || drv.enable_state() != EnableState::Disabled)
@@ -1731,15 +1726,9 @@ impl SupervisorInner {
                 loads.as_deref(),
             );
             self.is_torqued = state == EnableState::Enabled || partial || any_enabled;
-            state
-        } else {
-            if thermal && self.temperatures.iter().any(|t| !t.is_finite() || *t > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C) {
-                return Err(SafetyError::ClearFaultRejected("Temperature is above the reset threshold".into()));
-            }
-            let state = if self.is_torqued { EnableState::Enabled } else { EnableState::Disabled };
-            self.is_torqued = state == EnableState::Enabled;
-            state
-        };
+        } else if thermal && self.temperatures.iter().any(|t| !t.is_finite() || *t > self.config.max_temperature - THERMAL_CLEAR_MARGIN_C) {
+            return Err(SafetyError::ClearFaultRejected("Temperature is above the reset threshold".into()));
+        }
         self.pending_rearm = true;
         self.stop_motion();
         // Reset at the measured position; never retain a residual old trajectory target.
@@ -1750,11 +1739,7 @@ impl SupervisorInner {
         self.commanded_accelerations.fill(0.0);
         self.following_error_since = None;
         self.bus_loss_instant = None;
-        self.gripper_stalled = false;
-        self.gripper_stall_sign = 0.0;
-        self.gripper_prev_hw_overload = false;
-        self.gripper_high_torque_ticks = 0;
-        self.gripper_low_torque_ticks = 0;
+        self.reset_gripper_stall();
         Self::check_concurrent_estop(self)?;
         let was_estop = *self.safety.state() == SafetyState::EStop;
         let state = self.safety.clear_fault()?;
@@ -2097,7 +2082,7 @@ impl SupervisorInner {
             return Err(SafetyError::HandoverSettling);
         }
 
-        if self.e_stop_latched.load(Ordering::SeqCst) || self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count {
+        if self.estop_pending() {
             return Err(SafetyError::EStopActive);
         }
 
@@ -3373,7 +3358,7 @@ impl SupervisorInner {
             let desired_g = self.servo_target.as_ref().and_then(|st| st.get(g_idx).copied())
                 .or_else(|| self.target_positions.get(g_idx).copied())
                 .unwrap_or(p_cmd);
-            let close_dir = self.effective_gripper_policy()
+            let close_dir = self.config.gripper_policy.as_ref()
                 .map(|p| if p.closed_rad < p.open_rad { -1.0_f32 } else { 1.0_f32 })
                 .unwrap_or(1.0_f32);
             let pushing_into_stall = self.gripper_stall_sign != 0.0
@@ -3425,7 +3410,7 @@ impl SupervisorInner {
                 let is_stalled = if has_torque_feedback {
                     tau_g.abs() >= GRIPPER_STALL_LATCH_NM && v_g.abs() < 0.10
                 } else {
-                    let stall_load_thresh = self.effective_gripper_policy()
+                    let stall_load_thresh = self.config.gripper_policy.as_ref()
                         .filter(|p| p.holding_mode == crate::model::HoldingMode::LoadAndGap)
                         .and_then(|p| p.holding_load_fraction)
                         .map(|frac| (frac * 1.25).clamp(0.18, 0.35))
@@ -4332,10 +4317,9 @@ impl ArmSupervisor {
         if enable && self.e_stop_latched.load(Ordering::SeqCst) {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
-        let e_stop = self.e_stop_latched.clone();
         let mut inner = self.inner.clone().write_owned().await;
         // Post-lock double-check: verify atomic e-stop latch again after acquiring write lock
-        if enable && (e_stop.load(Ordering::SeqCst) || inner.requested_estop_count.load(Ordering::SeqCst) != inner.applied_estop_count) {
+        if enable && inner.estop_pending() {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
         tokio::task::spawn_blocking(move || inner.set_torque(enable))
@@ -4424,7 +4408,7 @@ impl ArmSupervisor {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
         let mut inner = self.inner.write().await;
-        if self.e_stop_latched.load(Ordering::SeqCst) || inner.requested_estop_count.load(Ordering::SeqCst) != inner.applied_estop_count {
+        if inner.estop_pending() {
             return Err(ArmError::Safety(SafetyError::EStopActive));
         }
         inner.servo(targets, epoch_id)?;
