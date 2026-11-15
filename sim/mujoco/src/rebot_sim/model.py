@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import warnings
 from pathlib import Path
 
 import mujoco
@@ -49,25 +50,46 @@ _UPSTREAM_MESHES = {
 BOX_GROUP = 3
 
 
-def load_model(devarm_dir: str | None = None, objects=None, camera=None, robot: str | None = None) -> mujoco.MjModel:
+def load_model(
+    devarm_dir: str | None = None,
+    objects=None,
+    camera=None,
+    robot: str | None = None,
+    scene_pack=None,
+    tool_pack=None,
+) -> mujoco.MjModel:
     """Compile the scene; with a reBot-DevArm checkout, add its link meshes as visuals.
 
     `objects` (list of `scene.SceneObject`) replaces the XML's cube; `camera` (a
-    `camera.CameraMount`) adds the `wrist` and `scene` cameras.
+    `camera.CameraMount`) adds the `wrist` and `scene` cameras; `scene_pack` and
+    `tool_pack` attach composable world XMLs and custom end-effectors.
     """
+    has_tool = tool_pack is not None and not getattr(tool_pack, "is_default", True)
     target_robot = (robot or os.environ.get("REBOT_SIM_ROBOT") or "b601dm").lower()
     if target_robot in ("so-arm101", "so_arm101"):
         scene_xml = SO101_SCENE_XML
-        if objects is None and camera is None:
+        if objects is None and camera is None and scene_pack is None and not has_tool:
             return mujoco.MjModel.from_xml_path(str(scene_xml))
         spec = mujoco.MjSpec.from_file(str(scene_xml))
-        if objects is not None:
-            from .scene import add_objects
-            add_objects(spec, objects)
-        return spec.compile()
+        if scene_pack is not None:
+            from .pack import compose_spec
+
+            compose_spec(spec, scene_pack=scene_pack, tool_pack=tool_pack, robot=target_robot)
+        else:
+            if objects is not None:
+                from .scene import add_objects
+
+                add_objects(spec, objects)
+            if has_tool:
+                from .pack import compose_spec
+
+                compose_spec(spec, scene_pack=None, tool_pack=tool_pack, robot=target_robot)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*empty prefix.*", category=UserWarning)
+            return spec.compile()
 
     devarm_dir = devarm_dir if devarm_dir is not None else os.environ.get("REBOT_DEVARM_DIR")
-    if not devarm_dir and objects is None and camera is None:
+    if not devarm_dir and objects is None and camera is None and scene_pack is None and not has_tool:
         return mujoco.MjModel.from_xml_path(str(SCENE_XML))
     spec = mujoco.MjSpec.from_file(str(SCENE_XML))
     if devarm_dir:
@@ -86,19 +108,32 @@ def load_model(devarm_dir: str | None = None, objects=None, camera=None, robot: 
         for geom in spec.geoms:
             if geom.contype == 2 or geom.name in ("palm", "motor_housing") or geom.name.split("_")[0] in ("left", "right"):
                 geom.group = BOX_GROUP
-    if objects is not None:
-        from .scene import add_objects
-        add_objects(spec, objects)
-    if camera is not None:
-        from .camera import add_cameras, mount_rotation
-        add_cameras(spec, mount_rotation(spec.compile(), camera), camera.offset)
-    return spec.compile()
+    if scene_pack is not None:
+        from .pack import compose_spec
+
+        compose_spec(spec, scene_pack=scene_pack, tool_pack=tool_pack, robot=target_robot)
+    else:
+        if objects is not None:
+            from .scene import add_objects
+
+            add_objects(spec, objects)
+        if has_tool:
+            from .pack import compose_spec
+
+            compose_spec(spec, scene_pack=None, tool_pack=tool_pack, robot=target_robot)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*empty prefix.*", category=UserWarning)
+        if camera is not None:
+            from .camera import add_cameras, mount_rotation
+
+            add_cameras(spec, mount_rotation(spec.compile(), camera), camera.offset)
+        return spec.compile()
 
 
 class Indexer:
     """qpos / qvel addresses of the arm joints and gripper."""
 
-    def __init__(self, model: mujoco.MjModel):
+    def __init__(self, model: mujoco.MjModel, tool_pack=None):
         joint_names = {model.joint(i).name for i in range(model.njnt)}
         if "shoulder_pan" in joint_names:
             self.robot = "so-arm101"
@@ -107,34 +142,52 @@ class Indexer:
             self.qpos = np.array([model.jnt_qposadr[model.joint(j).id] for j in self.joints])
             self.qvel = np.array([model.jnt_dofadr[model.joint(j).id] for j in self.joints])
             self.right_qpos = None
+            self.tool_scale = 1.0
         else:
             self.robot = "b601dm"
-            self.dof = 7
-            self.joints = ARM_JOINTS + ["finger_left"]
+            driven = getattr(tool_pack, "driven_joint", None) if tool_pack is not None else None
+            coupled = getattr(tool_pack, "coupled_joint", None) if tool_pack is not None else None
+            has_custom_tool = tool_pack is not None and not getattr(tool_pack, "is_default", True)
+            if has_custom_tool:
+                tool_joint = [driven] if driven and driven in joint_names else []
+                self.joints = ARM_JOINTS + tool_joint
+                self.tool_scale = float(getattr(tool_pack, "motor_to_joint_scale", 1.0) or 1.0)
+                coupled_name = coupled
+            elif "finger_left" in joint_names:
+                self.joints = ARM_JOINTS + ["finger_left"]
+                self.tool_scale = -JAW_M_PER_RAD
+                coupled_name = "finger_right"
+            else:
+                inferred = [model.joint(int(model.actuator_trnid[6, 0])).name] if model.nu >= 7 else []
+                self.joints = ARM_JOINTS + inferred
+                self.tool_scale = -JAW_M_PER_RAD
+                coupled_name = None
+            self.dof = len(self.joints)
             self.qpos = np.array([model.jnt_qposadr[model.joint(j).id] for j in self.joints])
             self.qvel = np.array([model.jnt_dofadr[model.joint(j).id] for j in self.joints])
-            self.right_qpos = model.jnt_qposadr[model.joint("finger_right").id] if "finger_right" in joint_names else None
+            self.right_qpos = model.jnt_qposadr[model.joint(coupled_name).id] if coupled_name and coupled_name in joint_names else None
 
     def motor_positions(self, data: mujoco.MjData) -> np.ndarray:
         """armd motor angles (rad)."""
         q = data.qpos[self.qpos].copy()
         if self.robot == "b601dm":
             q[:6] -= MODEL_OFFSETS_RAD
-            q[6] = -q[6] / JAW_M_PER_RAD
+            if len(q) > 6:
+                q[6] = q[6] / self.tool_scale
         return q
 
     def motor_velocities(self, data: mujoco.MjData) -> np.ndarray:
         dq = data.qvel[self.qvel].copy()
-        if self.robot == "b601dm":
-            dq[6] = -dq[6] / JAW_M_PER_RAD
+        if self.robot == "b601dm" and len(dq) > 6:
+            dq[6] = dq[6] / self.tool_scale
         return dq
 
     def set_motor_positions(self, data: mujoco.MjData, q) -> None:
         q = np.asarray(q, dtype=float)
         if self.robot == "b601dm":
             data.qpos[self.qpos[:6]] = q[:6] + MODEL_OFFSETS_RAD
-            if len(q) > 6:
-                jaw = -q[6] * JAW_M_PER_RAD
+            if len(q) > 6 and len(self.qpos) > 6:
+                jaw = q[6] * self.tool_scale
                 data.qpos[self.qpos[6]] = jaw
                 if self.right_qpos is not None:
                     data.qpos[self.right_qpos] = jaw

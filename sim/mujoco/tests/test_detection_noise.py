@@ -7,7 +7,6 @@ import math
 import time
 from types import SimpleNamespace
 
-import mujoco
 import numpy as np
 import pytest
 from test_perception import set_arm

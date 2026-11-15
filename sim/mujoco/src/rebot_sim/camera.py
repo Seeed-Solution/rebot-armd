@@ -106,8 +106,9 @@ def add_cameras(spec: mujoco.MjSpec, r_end_cam: np.ndarray, offset: np.ndarray) 
     up = np.cross(right, fwd)
     sq = np.zeros(4)
     mujoco.mju_mat2Quat(sq, np.column_stack([right, up, -fwd]).flatten())
-    scene = spec.worldbody.add_camera(name="scene", pos=list(eye), quat=list(sq))
-    scene.fovy = 45.0
+    if not any(c.name == "scene" for c in spec.worldbody.cameras):
+        scene = spec.worldbody.add_camera(name="scene", pos=list(eye), quat=list(sq))
+        scene.fovy = 45.0
     spec.visual.map.znear = 0.002  # fraction of the model extent: about 3 mm, the jaws are close
 
 
@@ -320,7 +321,13 @@ def detections(geom_ids: np.ndarray, scene, min_pixels: int = 20) -> list[dict]:
     h, w = geom_ids.shape
     out = []
     for i, (obj, gid) in enumerate(zip(scene.objects, scene.geom_ids)):
-        ys, xs = np.nonzero(geom_ids == gid)
+        body_ids = getattr(scene, "body_ids", None)
+        body_geom_ids = getattr(scene, "body_geom_ids", None)
+        if body_ids is not None and body_geom_ids is not None and i < len(body_ids):
+            gids = body_geom_ids.get(body_ids[i], [gid])
+            ys, xs = np.nonzero(np.isin(geom_ids, gids))
+        else:
+            ys, xs = np.nonzero(geom_ids == gid)
         if len(xs) < min_pixels:
             continue
         n0, n1 = round(int(xs.min()) / w, 4), round((int(xs.max()) + 1) / w, 4)
