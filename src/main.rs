@@ -184,8 +184,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             format!("profiles/{name}"),
             format!("/usr/share/rebot-teleop/profile/{name}"),
         ];
-        if std::path::Path::new(&candidates[0]).exists() && std::path::Path::new(&candidates[1]).exists() {
-            tracing::warn!("User profile {} overrides bundled profile {}", candidates[0], candidates[1]);
+        if std::path::Path::new(&candidates[0]).exists() {
+            if let Some(bundled) = candidates[1..].iter().find(|p| std::path::Path::new(p).exists()) {
+                tracing::warn!("User profile {} overrides bundled profile {}", candidates[0], bundled);
+            }
         }
         let path = candidates.iter().find(|p| std::path::Path::new(p).exists())
             .unwrap_or(&candidates[1]);

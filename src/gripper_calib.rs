@@ -85,11 +85,35 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
         return Err(MotionError::Unsupported("Gripper calibration requires a gripper policy".into()).into());
     }
 
-    let offset = b.offset_rad.or(inner.gripper_calib_offset);
-    inner.apply_gripper_calibration(offset, Some(b.jaw_opening.clone())).map_err(MotionError::InvalidCommand)?;
+    let prev_config = inner.config.clone();
+    let prev_offset = inner.gripper_calib_offset;
+    let prev_jaw = inner.gripper_calib_jaw_opening.clone();
+    let prev_invalid = inner.gripper_calib_invalid;
+    let prev_err = inner.driver_config_error.clone();
 
-    if inner.driver_config_error.is_some() {
-        inner.reapply_driver_limits();
+    let offset = b.offset_rad.or(inner.gripper_calib_offset);
+    if let Err(e) = inner.apply_gripper_calibration(offset, Some(b.jaw_opening.clone())) {
+        inner.config = prev_config;
+        inner.gripper_calib_offset = prev_offset;
+        inner.gripper_calib_jaw_opening = prev_jaw;
+        inner.gripper_calib_invalid = prev_invalid;
+        inner.driver_config_error = prev_err;
+        return Err(MotionError::InvalidCommand(e).into());
+    }
+
+    if inner.driver.is_some() || inner.driver_config_error.is_some() {
+        let ok = inner.reapply_driver_limits();
+        if !ok || inner.gripper_calib_invalid || inner.driver_config_error.is_some() {
+            let reason = inner.driver_config_error.clone().unwrap_or_else(|| {
+                "Gripper calibration rejected by driver hardware limits".to_string()
+            });
+            inner.config = prev_config;
+            inner.gripper_calib_offset = prev_offset;
+            inner.gripper_calib_jaw_opening = prev_jaw;
+            inner.gripper_calib_invalid = prev_invalid;
+            inner.driver_config_error = prev_err;
+            return Err(MotionError::InvalidCommand(reason).into());
+        }
     }
 
     let effective = inner.config.gripper_policy.clone().ok_or_else(|| {

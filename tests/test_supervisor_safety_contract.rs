@@ -83,10 +83,11 @@ async fn thermal_trip_overrides_estop_and_retries_failed_disable_without_epoch_c
     assert_eq!(h.lock().unwrap().disable_calls, 2);
     assert!(supervisor.clear_fault().await.is_err(), "Hot feedback cannot reset thermal latch");
     h.lock().unwrap().states[0].temperature = 64.0;
-    let err = supervisor.clear_fault().await.unwrap_err();
-    assert!(err.to_string().contains("E-stop still latched"), "Expected E-stop still latched rejection, got: {err}");
+    let state = supervisor.clear_fault().await.unwrap();
+    assert_eq!(state, SafetyState::EStop);
     assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::EStop);
-    supervisor.clear_fault().await.unwrap();
+    let state = supervisor.clear_fault().await.unwrap();
+    assert_eq!(state, SafetyState::Idle);
     assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::Idle);
 }
 
@@ -335,9 +336,9 @@ async fn estop_during_thermal_trip_requires_two_stage_clear() {
     // Cool down below reset threshold
     h.lock().unwrap().states[0].temperature = 60.0;
 
-    // First clear_fault clears ThermalTrip but latches EStop because e_stop_latched was true
-    let err1 = supervisor.clear_fault().await.unwrap_err();
-    assert!(err1.to_string().contains("E-stop still latched"), "Expected E-stop still latched rejection, got: {err1}");
+    // First clear_fault clears ThermalTrip and transitions to EStop because e_stop_latched was true
+    let state1 = supervisor.clear_fault().await.unwrap();
+    assert_eq!(state1, SafetyState::EStop);
     assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::EStop);
 
     // Second clear_fault clears EStop to Idle
@@ -454,9 +455,9 @@ async fn test_estop_during_bus_loss_preserves_bus_loss_and_requires_two_stage_cl
     // Restore bus feedback freshness
     h.lock().unwrap().age = Some(Duration::from_millis(10));
 
-    // First clear_fault clears BusLoss, re-latches EStop and returns ClearFaultRejected
-    let err1 = supervisor.clear_fault().await.unwrap_err();
-    assert!(err1.to_string().contains("E-stop still latched"), "Expected E-stop still latched error, got: {err1}");
+    // First clear_fault clears BusLoss, transitions to EStop
+    let state1 = supervisor.clear_fault().await.unwrap();
+    assert_eq!(state1, SafetyState::EStop);
     assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::EStop);
 
     // Second clear_fault clears EStop to Idle
@@ -598,4 +599,94 @@ async fn test_apply_driver_limits_home_positions_conflict_fails_closed_and_recov
     let obs = supervisor.get_observation().await;
     assert_eq!(obs.safety_state, SafetyState::Idle);
     assert!(obs.fault.is_none(), "Fault must be cleared");
+}
+
+#[tokio::test]
+async fn test_thermal_trip_overriding_joint_limit_not_overwritten_by_reapply_limits_on_clear_fault() {
+    let config = ArmConfig::rebot_dm();
+    let supervisor = Arc::new(ArmSupervisor::new(config));
+
+    // DynamicLimitsDriver with conflicting joint limits for joint 0
+    let limits = Arc::new(Mutex::new(vec![Some((10.0, 11.0))])); // conflicts with DM limits
+    let driver = DynamicLimitsDriver { limits };
+    supervisor.set_driver(Box::new(driver)).await;
+
+    // Check that driver_config_error is set and safety state is Fault(JointLimit)
+    let obs = supervisor.get_observation().await;
+    assert!(obs.fault.is_some());
+    assert_eq!(obs.fault.as_ref().unwrap().code, FaultCode::JointLimit);
+
+    // Now trigger ThermalTrip
+    {
+        let mut inner = supervisor.inner().write().await;
+        inner.temperatures[0] = 85.0;
+        inner.safety.trigger_fault_coded(
+            FaultCode::ThermalTrip,
+            FaultReason::ThermalTrip { joint_idx: 0, temperature: 85.0, limit: 80.0 },
+        );
+    }
+    let obs_thermal = supervisor.get_observation().await;
+    assert_eq!(obs_thermal.fault.as_ref().unwrap().code, FaultCode::ThermalTrip);
+    let thermal_epoch = obs_thermal.epoch_id;
+
+    // Call clear_fault(): driver limits still conflict (10.0..11.0).
+    // clear_fault() calls reapply_driver_limits(), but trigger_fault=false must NOT
+    // trigger JointLimit fault or churn epoch_id!
+    let res = supervisor.clear_fault().await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(err.to_string().contains("Driver limit configuration error"));
+
+    let obs_after = supervisor.get_observation().await;
+    assert_eq!(
+        obs_after.fault.as_ref().unwrap().code,
+        FaultCode::ThermalTrip,
+        "ThermalTrip must NOT be overwritten to JointLimit"
+    );
+    assert_eq!(
+        obs_after.epoch_id,
+        thermal_epoch,
+        "epoch_id must NOT churn when reapply_driver_limits finds conflicting limits"
+    );
+}
+
+#[tokio::test]
+async fn test_gripper_calib_update_hardware_driver_limits_violation_rollback() {
+    let config = ArmConfig::rebot_dm();
+    let j7_idx = config.gripper_index().unwrap();
+
+    let supervisor = Arc::new(ArmSupervisor::new(config));
+    let mut pos_limits: Vec<Option<(f32, f32)>> = vec![None; 7];
+    // Hardware driver limits narrow J7 from [-5.75, 0.10] to [-5.75, 0.02]
+    pos_limits[j7_idx] = Some((-5.75, 0.02));
+    let limits = Arc::new(Mutex::new(pos_limits));
+    let driver = DynamicLimitsDriver { limits };
+    supervisor.set_driver(Box::new(driver)).await;
+
+    let mut inner = supervisor.inner().write().await;
+    let initial_config = inner.config.clone();
+    let initial_offset = inner.gripper_calib_offset;
+    let initial_jaw = inner.gripper_calib_jaw_opening.clone();
+    let initial_invalid = inner.gripper_calib_invalid;
+    let initial_err = inner.driver_config_error.clone();
+
+    // Body with offset_rad = 0.05 (passes profile limit 0.10, but violates hardware driver limit 0.02)
+    let body = serde_json::json!({
+        "jaw_opening": {
+            "points": [[0.0, 0.0], [-5.0, 0.08]],
+            "calibrated": true
+        },
+        "offset_rad": 0.05
+    });
+
+    let res = armd::gripper_calib::update(&mut inner, &body);
+    assert!(res.is_err(), "gripper_calib::update must fail when hardware driver limits are violated");
+
+    // Verify complete rollback
+    assert_eq!(inner.config.gripper_policy, initial_config.gripper_policy, "gripper_policy must be fully restored on error");
+    assert_eq!(inner.config.limits, initial_config.limits, "limits must be fully restored on error");
+    assert_eq!(inner.gripper_calib_offset, initial_offset, "offset must be restored");
+    assert_eq!(inner.gripper_calib_jaw_opening, initial_jaw, "jaw_opening must be restored");
+    assert_eq!(inner.gripper_calib_invalid, initial_invalid, "invalid flag must be restored");
+    assert_eq!(inner.driver_config_error, initial_err, "driver_config_error must be restored");
 }

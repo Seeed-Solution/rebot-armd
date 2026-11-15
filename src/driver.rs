@@ -244,17 +244,6 @@ pub struct FeetechArmDriver<T: Transport> {
     warned_missed_echoes: bool,
 }
 
-#[doc(hidden)]
-pub trait FeetechConfigExt {
-    fn joint_calib(&self, joint: usize) -> feetech::FeetechJointCalib;
-}
-
-impl FeetechConfigExt for feetech::FeetechConfig {
-    fn joint_calib(&self, joint: usize) -> feetech::FeetechJointCalib {
-        self.joints.get(joint).cloned().unwrap_or_default()
-    }
-}
-
 impl<T: Transport> FeetechArmDriver<T> {
     pub fn new(transport: T, servo_ids: Vec<u8>) -> Self {
         let dof = servo_ids.len();
@@ -369,8 +358,7 @@ impl<T: Transport> FeetechArmDriver<T> {
                 self.confirmed_enable_state = EnableState::Unknown;
                 self.partial_enable_known = false;
                 self.hw_angle_limits = vec![None; dof];
-                self.incomplete_chunk_idx = None;
-                self.incomplete_frame_started_at = None;
+                self.invalidate_partial_pos_rx();
             } else if self.hw_angle_limits.len() != dof {
                 self.hw_angle_limits.resize(dof, None);
             }
@@ -1562,7 +1550,6 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     }
 
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
-        self.invalidate_partial_pos_rx();
         if targets.len() != self.servo_ids.len() {
             return Err(ArmDriverError::JointCountMismatch {
                 expected: self.servo_ids.len(),
@@ -1586,6 +1573,9 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         self.transport.write_all(&sync_pkt)?;
         self.transport.flush()?;
         self.drain_tx_echo(&sync_pkt)?;
+        if self.incomplete_chunk_idx.is_some() && !self.rx_buffer.is_empty() {
+            self.partial_pos_rx.append(&mut self.rx_buffer);
+        }
         Ok(())
     }
 
@@ -1611,7 +1601,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 self.decode_partial_position_frames(&expected_ids, &mut replied_ids, inc_ts);
 
                 let reassembly_start = Instant::now();
-                const REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(4);
+                const REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(2);
                 let mut drain_buf = [0u8; 32];
 
                 while replied_ids.len() < inc_chunk.len()
@@ -1646,7 +1636,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 let inc_timed_out = inc_ts.elapsed() >= INCOMPLETE_FRAME_TTL;
 
                 if !all_replied && !inc_timed_out {
-                    if let Some(tail) = feetech::trailing_partial_frame(&self.partial_pos_rx) {
+                    if let Some(tail) = feetech::trailing_partial_frame_for_sync_read(&self.partial_pos_rx, &inc_chunk, 10) {
                         self.partial_pos_rx = tail.to_vec();
                         self.incomplete_chunk_idx = Some(inc_idx);
                         self.incomplete_frame_started_at = Some(inc_ts);
@@ -1833,7 +1823,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             }
 
             if replied_ids.len() < chunk.len() {
-                if let Some(tail) = feetech::trailing_partial_frame(&self.rx_buffer) {
+                if let Some(tail) = feetech::trailing_partial_frame_for_sync_read(&self.rx_buffer, chunk, 10) {
                     self.partial_pos_rx = tail.to_vec();
                     self.incomplete_chunk_idx = Some(chunk_idx);
                     self.incomplete_frame_started_at = Some(read_time);

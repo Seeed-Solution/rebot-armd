@@ -557,6 +557,15 @@ impl SupervisorInner {
         vel_limits: &[Option<f32>],
         pos_limits: &[Option<(f32, f32)>],
     ) {
+        self.apply_extracted_driver_limits_inner(vel_limits, pos_limits, true);
+    }
+
+    pub fn apply_extracted_driver_limits_inner(
+        &mut self,
+        vel_limits: &[Option<f32>],
+        pos_limits: &[Option<(f32, f32)>],
+        trigger_fault: bool,
+    ) {
         self.driver_config_error = None;
         let mut candidate = self.config.clone();
 
@@ -573,7 +582,9 @@ impl SupervisorInner {
                         d_min, d_max, limit.name
                     );
                     self.driver_config_error = Some(reason.clone());
-                    self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                    if trigger_fault {
+                        self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                    }
                     return;
                 }
                 let new_min = limit.min_position.max(d_min);
@@ -584,7 +595,9 @@ impl SupervisorInner {
                         d_min, d_max, limit.name, limit.min_position, limit.max_position
                     );
                     self.driver_config_error = Some(reason.clone());
-                    self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                    if trigger_fault {
+                        self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                    }
                     return;
                 }
                 if let Some(pos) = candidate.resting_pose.as_ref().and_then(|r| r.positions.as_ref()).and_then(|p| p.get(i).copied()) {
@@ -594,7 +607,9 @@ impl SupervisorInner {
                             d_min, d_max, limit.name, pos
                         );
                         self.driver_config_error = Some(reason.clone());
-                        self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                        if trigger_fault {
+                            self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                        }
                         return;
                     }
                 }
@@ -628,7 +643,9 @@ impl SupervisorInner {
         if let Err(err) = candidate.validate() {
             let reason = format!("Driver limits violated config invariants: {err}");
             self.driver_config_error = Some(reason.clone());
-            self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+            if trigger_fault {
+                self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+            }
             return;
         }
 
@@ -648,7 +665,7 @@ impl SupervisorInner {
             None
         };
         if let Some((vel_limits, pos_limits)) = limits {
-            self.apply_extracted_driver_limits(&vel_limits, &pos_limits);
+            self.apply_extracted_driver_limits_inner(&vel_limits, &pos_limits, false);
             self.driver_config_error.is_none()
         } else {
             false
@@ -1828,12 +1845,7 @@ impl SupervisorInner {
             self.apply_stop_policy(StopPolicy::EStopLatch);
             self.last_heartbeat = Instant::now();
             self.last_motion_frame = Instant::now();
-            let msg = if thermal {
-                "Thermal fault cleared; E-stop still latched — call clear_fault again to acknowledge E-stop"
-            } else {
-                "Fault cleared; E-stop still latched — call clear_fault again to acknowledge E-stop"
-            };
-            return Err(SafetyError::ClearFaultRejected(msg.into()));
+            return Ok(self.safety.state().clone());
         }
         self.e_stop_latched.store(false, Ordering::SeqCst);
         Self::check_concurrent_estop(self)?;
@@ -2850,7 +2862,7 @@ impl SupervisorInner {
         }
         if (closed_rad - open_rad).abs() < 0.1 {
             return Err(format!(
-                "Calibration offset {offset} results in (closed_rad - open_rad).abs() < 0.1 (closed: {closed_rad}, open: {open_rad})"
+                "Base gripper policy span |closed_rad - open_rad| < 0.1 (closed: {closed_rad}, open: {open_rad})"
             ));
         }
         let lim = self.config.gripper_index().and_then(|idx| self.config.limits.get(idx));
@@ -3441,11 +3453,12 @@ impl SupervisorInner {
             let v_g = self.measured_velocities.get(g_idx).copied().unwrap_or(0.0);
             let gap = p_cmd - p_meas;
 
-            let gripper_hw_overload = self
-                .motor_errors
-                .get(g_idx)
-                .and_then(|e| e.as_ref())
-                .is_some_and(|e| (e.code & 0x20) != 0);
+            let gripper_hw_overload = is_bus_fresh
+                && self
+                    .motor_errors
+                    .get(g_idx)
+                    .and_then(|e| e.as_ref())
+                    .is_some_and(|e| (e.code & 0x20) != 0);
 
             let hw_overload_rising = is_bus_fresh && gripper_hw_overload && !self.gripper_prev_hw_overload;
             if is_bus_fresh {

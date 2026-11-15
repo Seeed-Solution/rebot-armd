@@ -113,7 +113,7 @@ fn test_serial_transport_rs485_config() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_tx_echo_drain() {
-    let mock = MockTransport::new_preserving();
+    let mock = MockTransport::new();
     let servo_ids = vec![1];
     let mut driver = FeetechArmDriver::new(mock, servo_ids)
         .with_calibrated(true)
@@ -126,7 +126,8 @@ fn test_feetech_tx_echo_drain() {
     let mut fb = vec![0xFF, 0xFF, 1, 10, 0x00];
     fb.extend_from_slice(&params);
     fb.push(cs);
-    driver.transport_mut().provide_rx(&fb);
+    let sync_read = feetech::build_sync_read(&[1], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+    driver.transport_mut().stage_reply(&sync_read, &fb);
     driver.read_joint_states().unwrap();
     let _ = driver.transport_mut().take_tx();
 
@@ -139,16 +140,15 @@ fn test_feetech_tx_echo_drain() {
     let cs = calculate_checksum(1, len, 0x00, &params);
     let pkt_read_resp = vec![0xFF, 0xFF, 1, len, 0x00, 1, cs];
 
-    let mut stream = Vec::new();
     // 1. Echo of write command
-    stream.extend_from_slice(&pkt_write);
-    // 2. Read command will be sent by set_torque -> echo of read command
-    let pkt_read_cmd = feetech::build_read(1, REG_TORQUE_ENABLE, 1);
-    stream.extend_from_slice(&pkt_read_cmd);
-    // 3. Real response to read command
-    stream.extend_from_slice(&pkt_read_resp);
+    driver.transport_mut().stage_reply(&pkt_write, &pkt_write);
 
-    driver.transport_mut().provide_rx(&stream);
+    // 2. Read command will be sent by set_torque -> echo of read command + real response
+    let pkt_read_cmd = feetech::build_read(1, REG_TORQUE_ENABLE, 1);
+    let mut echo_and_resp = pkt_read_cmd.clone();
+    echo_and_resp.extend_from_slice(&pkt_read_resp);
+    driver.transport_mut().stage_reply(&pkt_read_cmd, &echo_and_resp);
+
     driver.set_torque(true).unwrap();
     assert_eq!(driver.enable_state(), EnableState::Enabled);
 }
@@ -2968,7 +2968,7 @@ async fn test_gripper_persistent_hw_overload_reverse_escape_and_re_squeeze() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_drain_tx_echo_ff_noise_and_partial_echo_returns_model_777() {
-    let mock = MockTransport::new_preserving();
+    let mock = MockTransport::new();
     let mut driver = FeetechArmDriver::new(mock, vec![1]);
     driver.set_tx_echo_state(None, true);
 
@@ -2983,7 +2983,7 @@ fn test_feetech_drain_tx_echo_ff_noise_and_partial_echo_returns_model_777() {
     rx.extend_from_slice(&req); // full echo
     rx.extend_from_slice(&[0xFF, 0xFF, 1, 4, 0x00, model_bytes[0], model_bytes[1], cs]);
 
-    driver.transport_mut().provide_rx(&rx);
+    driver.transport_mut().stage_reply(&req, &rx);
 
     let val = driver.read_register_u16_direct(1, feetech::REG_MODEL_L).expect("Read model must succeed");
     assert_eq!(val, 777, "Expected model 777, got {}", val);
@@ -2995,9 +2995,9 @@ fn test_feetech_drain_tx_echo_ff_noise_and_partial_echo_returns_model_777() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_6servo_incomplete_chunk_idx_cross_call_reassembly_and_ghost_header() {
-    let mock = MockTransport::new_preserving();
+    let mock = MockTransport::new();
     let servo_ids = vec![1, 2, 3, 4, 5, 6];
-    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+    let mut driver = FeetechArmDriver::new(mock, servo_ids).with_tx_echo(Some(false));
 
     let build_resp = |id: u8| -> Vec<u8> {
         let pos = 2048u16.to_le_bytes();
@@ -3011,25 +3011,31 @@ fn test_feetech_6servo_incomplete_chunk_idx_cross_call_reassembly_and_ghost_head
         pkt
     };
 
+    let sync_c0 = feetech::build_sync_read(&[1, 2, 3], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+    let sync_c1 = feetech::build_sync_read(&[4, 5, 6], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+
     // Call 1: Chunk 0 (servos 1, 2, 3) complete, Chunk 1 (servos 4, 5) complete, servo 6 incomplete (4 bytes)
     let resp6 = build_resp(6);
-    let mut rx1 = Vec::new();
-    for id in 1..=5 {
-        rx1.extend_from_slice(&build_resp(id));
+    let mut rx_c0 = Vec::new();
+    for id in 1..=3 {
+        rx_c0.extend_from_slice(&build_resp(id));
     }
-    rx1.extend_from_slice(&resp6[..4]); // incomplete servo 6!
-    driver.transport_mut().provide_rx(&rx1);
+    let mut rx_c1 = Vec::new();
+    for id in 4..=5 {
+        rx_c1.extend_from_slice(&build_resp(id));
+    }
+    rx_c1.extend_from_slice(&resp6[..4]); // incomplete servo 6!
+
+    driver.transport_mut().stage_reply(&sync_c0, &rx_c0);
+    driver.transport_mut().stage_reply(&sync_c1, &rx_c1);
 
     let _ = driver.read_joint_states();
     assert_eq!(driver.incomplete_chunk_idx(), Some(1), "Chunk 1 must be marked incomplete");
 
-    // Call 2: Supply the rest of servo 6, plus next cycle's Chunk 0 (servos 1, 2, 3)
-    let mut rx2 = Vec::new();
-    rx2.extend_from_slice(&resp6[4..]); // remaining bytes of servo 6
-    for id in 1..=3 {
-        rx2.extend_from_slice(&build_resp(id));
-    }
-    driver.transport_mut().provide_rx(&rx2);
+    // Call 2: Supply the rest of servo 6 during reassembly, plus next cycle's Chunk 0 (servos 1, 2, 3)
+    driver.transport_mut().clear_write_responses();
+    driver.transport_mut().provide_rx(&resp6[4..]); // remaining bytes of servo 6
+    driver.transport_mut().stage_reply(&sync_c0, &rx_c0);
 
     let states = driver.read_joint_states().unwrap();
     assert_eq!(states.len(), 6);
@@ -3054,11 +3060,12 @@ fn test_feetech_6servo_incomplete_chunk_idx_cross_call_reassembly_and_ghost_head
 
     // Next call should discard ghost header after timeout/drained limit and not starve.
     // Encode distinct joint positions (2500, 2600, 2700) different from baseline (2048).
+    driver.transport_mut().clear_write_responses();
     let mut rx3 = Vec::new();
     rx3.extend_from_slice(&build_resp_pos(1, 2500));
     rx3.extend_from_slice(&build_resp_pos(2, 2600));
     rx3.extend_from_slice(&build_resp_pos(3, 2700));
-    driver.transport_mut().provide_rx(&rx3);
+    driver.transport_mut().stage_reply(&sync_c0, &rx3);
 
     let states3 = driver.read_joint_states().expect("Must not starve or fail on ghost header");
     let calib = armd::protocol::feetech::FeetechJointCalib::default();
@@ -3084,7 +3091,7 @@ fn test_feetech_6servo_incomplete_chunk_idx_cross_call_reassembly_and_ghost_head
     for id in 4..=6 {
         rx4.extend_from_slice(&build_resp_pos(id, 2800));
     }
-    driver.transport_mut().provide_rx(&rx4);
+    driver.transport_mut().stage_reply(&sync_c1, &rx4);
     let states4 = driver.read_joint_states().expect("Subsequent poll for Chunk 1 must progress cleanly");
     assert_eq!(states4.len(), 6);
     let exp4 = calib.steps_to_rad(2800);
@@ -3136,7 +3143,7 @@ async fn test_feetech_narrower_effective_ranges_narrows_config_limits() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_next_call() {
-    let mock = MockTransport::new_preserving();
+    let mock = MockTransport::new();
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
     driver.set_confirmed_enable_state(EnableState::Enabled);
     driver.set_read_poll_count(8);
@@ -3155,8 +3162,9 @@ fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_n
     };
 
     let resp1 = build_resp(1);
+    let sync_read = feetech::build_sync_read(&[1], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
     // Call 1 (poll_count -> 9, no enable poll): supply partial frame for servo 1 (first 4 bytes)
-    driver.transport_mut().provide_rx(&resp1[..4]);
+    driver.transport_mut().stage_reply(&sync_read, &resp1[..4]);
 
     let _ = driver.read_joint_states();
     assert_eq!(driver.incomplete_chunk_idx(), Some(0), "Chunk 0 must be marked incomplete");
@@ -3164,6 +3172,7 @@ fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_n
     // Call 2 (poll_count -> 10, enable poll due): supply partial continuation (bytes 4..8, still incomplete).
     // If enable poll had erroneously run while incomplete_chunk_idx was Some,
     // clear_input_buffer() would have been called and wiped the partial frame!
+    driver.transport_mut().clear_write_responses();
     let clears_before_reassembly = driver.transport().clear_input_count();
     driver.last_enable_poll = Some(Instant::now() - Duration::from_millis(500));
     driver.transport_mut().provide_rx(&resp1[4..8]);
@@ -3185,11 +3194,11 @@ fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_n
 }
 
 // -------------------------------------------------------------------------
-// 61b. Partial RX frame survives 50 Hz (20ms) control tick gap (35ms TTL)
+// 61b. Partial RX frame survives 50 Hz (20ms) control tick gap (25ms TTL)
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_partial_rx_frame_survives_50hz_tick_gap() {
-    let mock = MockTransport::new_preserving();
+    let mock = MockTransport::new();
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
     driver.set_confirmed_enable_state(EnableState::Enabled);
     driver.last_enable_poll = Some(Instant::now());
@@ -3207,8 +3216,9 @@ fn test_feetech_partial_rx_frame_survives_50hz_tick_gap() {
     };
 
     let resp1 = build_resp(1);
+    let sync_read = feetech::build_sync_read(&[1], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
     // Supply partial frame (first 4 bytes)
-    driver.transport_mut().provide_rx(&resp1[..4]);
+    driver.transport_mut().stage_reply(&sync_read, &resp1[..4]);
     let _ = driver.read_joint_states();
     assert_eq!(driver.incomplete_chunk_idx(), Some(0));
 
@@ -3216,6 +3226,7 @@ fn test_feetech_partial_rx_frame_survives_50hz_tick_gap() {
     std::thread::sleep(Duration::from_millis(18));
 
     // Provide remaining bytes
+    driver.transport_mut().clear_write_responses();
     driver.transport_mut().provide_rx(&resp1[4..]);
     let states = driver.read_joint_states().expect("Reassembly must survive 18ms tick gap");
     assert_eq!(states.len(), 1);
@@ -3228,11 +3239,12 @@ fn test_feetech_partial_rx_frame_survives_50hz_tick_gap() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_stray_noise_does_not_pause_polling() {
-    let mock = MockTransport::new_preserving();
+    let mock = MockTransport::new();
     let mut driver = FeetechArmDriver::new(mock, vec![1, 2, 3]).with_tx_echo(Some(false));
 
+    let sync_read = feetech::build_sync_read(&[1, 2, 3], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
     // Provide stray noise byte 0x00 (no 0xFF 0xFF header)
-    driver.transport_mut().provide_rx(&[0x00]);
+    driver.transport_mut().stage_reply(&sync_read, &[0x00]);
 
     let _ = driver.read_joint_states();
     assert_eq!(
@@ -3247,9 +3259,9 @@ fn test_feetech_stray_noise_does_not_pause_polling() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_multiservo_chunk_reassembly_split_first_servo_and_following_servos_complete() {
-    let mock = MockTransport::new_preserving();
+    let mock = MockTransport::new();
     let servo_ids = vec![1, 2, 3, 4, 5, 6];
-    let mut driver = FeetechArmDriver::new(mock, servo_ids);
+    let mut driver = FeetechArmDriver::new(mock, servo_ids).with_tx_echo(Some(false));
 
     let build_resp_pos = |id: u8, pos_steps: u16| -> Vec<u8> {
         let pos = pos_steps.to_le_bytes();
@@ -3265,18 +3277,22 @@ fn test_feetech_multiservo_chunk_reassembly_split_first_servo_and_following_serv
 
     // Call 1: Chunk 0 (servos 1, 2, 3) complete, Chunk 1 servo 4 split (first 4 bytes only).
     // Servos 5 and 6 are NOT provided yet.
-    let mut rx1 = Vec::new();
+    let mut rx_c0 = Vec::new();
     for id in 1..=3 {
-        rx1.extend_from_slice(&build_resp_pos(id, 2048));
+        rx_c0.extend_from_slice(&build_resp_pos(id, 2048));
     }
     let resp4 = build_resp_pos(4, 2500);
-    rx1.extend_from_slice(&resp4[..4]); // split servo 4!
-    driver.transport_mut().provide_rx(&rx1);
+
+    let sync_c0 = feetech::build_sync_read(&[1, 2, 3], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+    let sync_c1 = feetech::build_sync_read(&[4, 5, 6], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+    driver.transport_mut().stage_reply(&sync_c0, &rx_c0);
+    driver.transport_mut().stage_reply(&sync_c1, &resp4[..4]); // split servo 4!
 
     let _ = driver.read_joint_states();
     assert_eq!(driver.incomplete_chunk_idx(), Some(1), "Chunk 1 must be marked incomplete");
 
     // Call 2: supply remainder of servo 4 AND complete frames for servos 5 & 6 in that chunk
+    driver.transport_mut().clear_write_responses();
     let mut rx2 = Vec::new();
     rx2.extend_from_slice(&resp4[4..]); // remainder of servo 4
     rx2.extend_from_slice(&build_resp_pos(5, 2600)); // servo 5
@@ -3421,4 +3437,102 @@ async fn test_feetech_driver_backed_arm_joint_0x20_rising_edge_triggers_hardware
     let fault = obs_fault.fault.unwrap();
     assert_eq!(fault.code, FaultCode::HardwareFault);
     assert!(fault.message.contains("0x20"));
+}
+
+// -------------------------------------------------------------------------
+// 65. Cross-tick reassembly with active torque motion and echo drain (Codex M1 + Opus H1)
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_cross_tick_reassembly_with_active_torque_and_echo_drain() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1])
+        .with_calibrated(true)
+        .with_tx_echo(Some(false));
+    driver.set_confirmed_enable_state(EnableState::Enabled);
+
+    let build_resp_pos = |id: u8, pos_steps: u16| -> Vec<u8> {
+        let pos = pos_steps.to_le_bytes();
+        let spd = 0u16.to_le_bytes();
+        let load = 100u16.to_le_bytes();
+        let params = [pos[0], pos[1], spd[0], spd[1], load[0], load[1], 75, 40];
+        let cs = calculate_checksum(id, (params.len() + 2) as u8, 0x00, &params);
+        let mut pkt = vec![0xFF, 0xFF, id, (params.len() + 2) as u8, 0x00];
+        pkt.extend_from_slice(&params);
+        pkt.push(cs);
+        pkt
+    };
+
+    let full_pkt = build_resp_pos(1, 2500);
+
+    // Call 1: Split after first 4 bytes
+    let sync_read = feetech::build_sync_read(&[1], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+    driver.transport_mut().stage_reply(&sync_read, &full_pkt[..4]);
+
+    let _ = driver.read_joint_states();
+    assert_eq!(driver.incomplete_chunk_idx(), Some(0));
+    assert_eq!(driver.partial_pos_rx(), &full_pkt[..4]);
+
+    // Active torque motion: write_joint_targets must NOT wipe partial_pos_rx or incomplete_chunk_idx!
+    let target = JointTarget::position(0.0);
+    driver.write_joint_targets(&[target]).expect("write_joint_targets must succeed");
+    assert_eq!(
+        driver.incomplete_chunk_idx(),
+        Some(0),
+        "write_joint_targets must preserve incomplete_chunk_idx"
+    );
+    assert_eq!(
+        driver.partial_pos_rx(),
+        &full_pkt[..4],
+        "write_joint_targets must preserve partial_pos_rx"
+    );
+
+    // Next tick: supply continuation bytes during reassembly
+    driver.transport_mut().clear_write_responses();
+    driver.transport_mut().provide_rx(&full_pkt[4..]);
+
+    let states = driver.read_joint_states().expect("Reassembly must succeed after write_joint_targets");
+    assert_eq!(states.len(), 1);
+    assert_eq!(driver.incomplete_chunk_idx(), None);
+
+    let calib = driver.config().joints[0].clone();
+    let expected_pos = calib.steps_to_rad(2500);
+    assert!((states[0].position - expected_pos).abs() < 1e-4, "Decoded position must match steps 2500");
+    assert!(driver.feedback_ages()[0].is_some_and(|a| a < Duration::from_millis(50)), "feedback age must be fresh");
+}
+
+// -------------------------------------------------------------------------
+// 66. Negative test: bogus ID and length do NOT set incomplete_chunk_idx (Opus M3)
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_trailing_partial_frame_rejects_bogus_id_and_length() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1, 2, 3]).with_tx_echo(Some(false));
+
+    // Case 1: Wrong ID (0x42 not in [1, 2, 3])
+    let sync_read = feetech::build_sync_read(&[1, 2, 3], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+    driver.transport_mut().stage_reply(&sync_read, &[0xFF, 0xFF, 0x42, 0x0A]);
+    let _ = driver.read_joint_states();
+    assert_eq!(
+        driver.incomplete_chunk_idx(),
+        None,
+        "Bogus ID 0x42 must NOT set incomplete_chunk_idx"
+    );
+
+    // Case 2: Wrong length (0x40 != 10 for 8-byte SyncRead)
+    driver.transport_mut().clear_write_responses();
+    driver.transport_mut().stage_reply(&sync_read, &[0xFF, 0xFF, 0x01, 0x40]);
+    let _ = driver.read_joint_states();
+    assert_eq!(
+        driver.incomplete_chunk_idx(),
+        None,
+        "Bogus length 0x40 must NOT set incomplete_chunk_idx"
+    );
+
+    // Direct unit test of trailing_partial_frame_for_sync_read
+    assert_eq!(feetech::trailing_partial_frame_for_sync_read(&[0xFF, 0xFF, 0x42, 0x0A], &[1, 2, 3], 10), None);
+    assert_eq!(feetech::trailing_partial_frame_for_sync_read(&[0xFF, 0xFF, 0x01, 0x40], &[1, 2, 3], 10), None);
+    assert_eq!(feetech::trailing_partial_frame_for_sync_read(&[0xFF], &[1, 2, 3], 10), Some(&[0xFF][..]));
+    assert_eq!(feetech::trailing_partial_frame_for_sync_read(&[0xFF, 0xFF], &[1, 2, 3], 10), Some(&[0xFF, 0xFF][..]));
+    assert_eq!(feetech::trailing_partial_frame_for_sync_read(&[0xFF, 0xFF, 0x01], &[1, 2, 3], 10), Some(&[0xFF, 0xFF, 0x01][..]));
+    assert_eq!(feetech::trailing_partial_frame_for_sync_read(&[0xFF, 0xFF, 0x01, 0x0A], &[1, 2, 3], 10), Some(&[0xFF, 0xFF, 0x01, 0x0A][..]));
 }
