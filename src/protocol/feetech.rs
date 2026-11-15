@@ -309,15 +309,53 @@ pub fn parse_response(buf: &[u8]) -> Result<(FeetechPacket, usize), FeetechError
     ))
 }
 
-/// Check if the buffer contains a Feetech frame header followed by an incomplete frame.
-/// Returns true only when FEETECH_HEADER ([0xFF, 0xFF]) is present in `buf` and
-/// attempting to parse from that header returns `IncompleteFrame`.
-/// Stray noise bytes (e.g. `[0x00]`) with no header return `false`.
+/// Check if the buffer contains a trailing incomplete Feetech frame header or partial frame.
+/// First scans and consumes any complete valid frames or corrupt frames from the front of `buf`.
+/// Returns true if the trailing unparsed remainder `tail` is `[0xFF]` (reply split right after
+/// first header byte 0xFF, Codex M1) or starts with `[0xFF, 0xFF]` and `parse_response(tail)`
+/// returns `Err(IncompleteFrame { .. })`.
+/// Returns false on empty buffer, complete frames only, or stray noise bytes like `[0x00]`.
 pub fn has_partial_frame_header(buf: &[u8]) -> bool {
-    let Some(pos) = buf.windows(2).rposition(|w| w == FEETECH_HEADER) else {
-        return false;
-    };
-    matches!(parse_response(&buf[pos..]), Err(FeetechError::IncompleteFrame { .. }))
+    trailing_partial_frame(buf).is_some()
+}
+
+/// Extract the trailing unparsed partial frame slice from `buf`, if present.
+pub fn trailing_partial_frame(buf: &[u8]) -> Option<&[u8]> {
+    let mut cursor = 0;
+    while cursor < buf.len() {
+        if buf[cursor] != 0xFF {
+            let next_ff = buf[cursor..]
+                .iter()
+                .position(|&b| b == 0xFF)
+                .map(|p| cursor + p)
+                .unwrap_or(buf.len());
+            cursor = next_ff;
+            if cursor >= buf.len() {
+                break;
+            }
+        }
+        let remaining = &buf[cursor..];
+        if remaining.len() == 1 {
+            // Reply split right after first header byte 0xFF!
+            return Some(remaining);
+        }
+        if remaining[1] != 0xFF {
+            cursor += 1;
+            continue;
+        }
+        match parse_response(remaining) {
+            Ok((_pkt, consumed)) => {
+                cursor += consumed;
+            }
+            Err(FeetechError::IncompleteFrame { .. }) => {
+                return Some(remaining);
+            }
+            Err(_) => {
+                cursor += 1;
+            }
+        }
+    }
+    None
 }
 
 // =========================================================================
@@ -588,6 +626,12 @@ pub struct FeetechConfig {
     pub overload_torque_raw: Option<u8>,
     #[serde(default)]
     pub joints: Vec<FeetechJointCalib>,
+}
+
+impl FeetechConfig {
+    pub fn joint_calib(&self, joint: usize) -> FeetechJointCalib {
+        self.joints.get(joint).cloned().unwrap_or_default()
+    }
 }
 
 impl Default for FeetechConfig {

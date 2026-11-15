@@ -83,8 +83,8 @@ async fn thermal_trip_overrides_estop_and_retries_failed_disable_without_epoch_c
     assert_eq!(h.lock().unwrap().disable_calls, 2);
     assert!(supervisor.clear_fault().await.is_err(), "Hot feedback cannot reset thermal latch");
     h.lock().unwrap().states[0].temperature = 64.0;
-    let res = supervisor.clear_fault().await.unwrap();
-    assert_eq!(res, SafetyState::EStop, "Clearing thermal fault while E-stop was latched transitions to EStop");
+    let err = supervisor.clear_fault().await.unwrap_err();
+    assert!(err.to_string().contains("E-stop still latched"), "Expected E-stop still latched rejection, got: {err}");
     assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::EStop);
     supervisor.clear_fault().await.unwrap();
     assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::Idle);
@@ -336,8 +336,8 @@ async fn estop_during_thermal_trip_requires_two_stage_clear() {
     h.lock().unwrap().states[0].temperature = 60.0;
 
     // First clear_fault clears ThermalTrip but latches EStop because e_stop_latched was true
-    let state1 = supervisor.clear_fault().await.unwrap();
-    assert_eq!(state1, SafetyState::EStop);
+    let err1 = supervisor.clear_fault().await.unwrap_err();
+    assert!(err1.to_string().contains("E-stop still latched"), "Expected E-stop still latched rejection, got: {err1}");
     assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::EStop);
 
     // Second clear_fault clears EStop to Idle
@@ -389,4 +389,78 @@ async fn test_shifted_gripper_calibration_exceeding_joint_limits_rejected() {
     assert!(err.contains("limits") || err.contains("exceeds"));
     assert_eq!(inner.config.gripper_policy, initial_policy);
     assert_eq!(inner.gripper_calib_offset, initial_offset);
+}
+
+#[tokio::test]
+async fn test_zero_check_store_offset_limit_rejection_marks_action_failed() {
+    let config = ArmConfig::rebot_dm();
+    let supervisor = Arc::new(ArmSupervisor::new(config));
+    let mut inner = supervisor.inner().write().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gripper_calib.json");
+    inner.gripper_calib_path = Some(path.clone());
+
+    let initial_policy = inner.config.gripper_policy.clone();
+    let initial_offset = inner.gripper_calib_offset;
+    assert!(!inner.gripper_calib_invalid);
+
+    // Start a dummy zero_check action
+    let action_id = inner.begin_action("gripper_zero_check", None);
+    // Set parameters: threshold_rad=0.5, store_offset=true, base_closed_rad=0.0
+    // Measured offset is 0.4 rad, which when applied shifts jaw outside dm limits
+    inner.zero_check_params = Some(armd::supervisor::ZeroCheckParams {
+        action_id,
+        store_offset: true,
+        threshold_rad: 0.5,
+        base_closed_rad: 0.0,
+    });
+    // Measured position 0.4 rad (offset = 0.4 rad <= threshold 0.5 rad, so mechanical check passes)
+    inner.measured_positions[6] = 0.4;
+
+    // Call finish_action for this zero check action
+    inner.finish_action(action_id, "done", None, None, Some(true), None, None);
+
+    // Verify action state was flipped to "failed" with code INVALID_CALIBRATION
+    let action = inner.last_action.as_ref().expect("last_action must exist");
+    assert_eq!(action.id, action_id);
+    assert_eq!(action.state, "failed");
+    assert_eq!(action.code.as_deref(), Some("INVALID_CALIBRATION"));
+    assert!(action.message.as_ref().unwrap().contains("Gripper calibration rejected"));
+
+    // Verify atomic safety invariants: gripper_calib_invalid stayed false, prior calibration intact, no disk file written
+    assert!(!inner.gripper_calib_invalid, "Atomic failure must not invalidate existing calibration");
+    assert_eq!(inner.config.gripper_policy, initial_policy);
+    assert_eq!(inner.gripper_calib_offset, initial_offset);
+    assert!(!path.exists(), "No calibration file must be written to disk on limit rejection");
+}
+
+#[tokio::test]
+async fn test_estop_during_bus_loss_preserves_bus_loss_and_requires_two_stage_clear() {
+    let (supervisor, h) = setup(full_caps(), None).await;
+    // Latch BusLoss via stale feedback (> 500ms)
+    h.lock().unwrap().age = Some(Duration::from_millis(600));
+    let obs = supervisor.tick(0.02).await;
+    assert!(matches!(obs.safety_state, SafetyState::Fault(FaultReason::BusLoss)));
+    let bus_loss_epoch = obs.epoch_id;
+
+    // Concurrently trigger E-Stop while in BusLoss
+    supervisor.trigger_e_stop().await;
+
+    // Active diagnostic state must remain Fault(BusLoss), epoch must not churn
+    let obs_after_estop = supervisor.get_observation().await;
+    assert!(matches!(obs_after_estop.safety_state, SafetyState::Fault(FaultReason::BusLoss)));
+    assert_eq!(obs_after_estop.epoch_id, bus_loss_epoch);
+
+    // Restore bus feedback freshness
+    h.lock().unwrap().age = Some(Duration::from_millis(10));
+
+    // First clear_fault clears BusLoss, re-latches EStop and returns ClearFaultRejected
+    let err1 = supervisor.clear_fault().await.unwrap_err();
+    assert!(err1.to_string().contains("E-stop still latched"), "Expected E-stop still latched error, got: {err1}");
+    assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::EStop);
+
+    // Second clear_fault clears EStop to Idle
+    let state2 = supervisor.clear_fault().await.unwrap();
+    assert_eq!(state2, SafetyState::Idle);
+    assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::Idle);
 }

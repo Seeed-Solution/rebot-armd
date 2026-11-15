@@ -184,6 +184,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             format!("profiles/{name}"),
             format!("/usr/share/rebot-teleop/profile/{name}"),
         ];
+        if std::path::Path::new(&candidates[0]).exists() && std::path::Path::new(&candidates[1]).exists() {
+            tracing::warn!("User profile {} overrides bundled profile {}", candidates[0], candidates[1]);
+        }
         let path = candidates.iter().find(|p| std::path::Path::new(p).exists())
             .unwrap_or(&candidates[1]);
         tracing::info!("Loaded profile for {follower} from {path}");
@@ -232,7 +235,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     armd::keepout::load_into(&supervisor, &armd::keepout::path_from_env()).await;
     armd::poses::load_into(&supervisor, &armd::poses::path_from_env()).await;
     armd::collision::load_into(&supervisor, &armd::collision::path_from_env()).await;
-    armd::gripper_calib::load_into(&supervisor, &armd::gripper_calib::path_from_env()).await;
     match follower {
         "rebot-rs" | "rebot-dm" => {
             #[cfg(target_os = "linux")]
@@ -301,6 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "mock" => info!("Follower configured as mock simulation"),
         _ => unreachable!(),
     }
+    armd::gripper_calib::load_into(&supervisor, &armd::gripper_calib::path_from_env()).await;
 
     // The control loop runs on its own OS thread at real-time priority. On the
     // single-core SG2002 a tokio task shares one worker with HTTP/WS/video proxies

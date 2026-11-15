@@ -113,9 +113,11 @@ fn test_serial_transport_rs485_config() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_tx_echo_drain() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1];
-    let mut driver = FeetechArmDriver::new(mock, servo_ids).with_calibrated(true);
+    let mut driver = FeetechArmDriver::new(mock, servo_ids)
+        .with_calibrated(true)
+        .with_tx_echo(Some(false));
 
     // Provide feedback for servo 1 first
     let pos = 2048u16.to_le_bytes();
@@ -156,7 +158,7 @@ fn test_feetech_tx_echo_drain() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_torque_enable_rollback() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2];
     let mut driver = FeetechArmDriver::new(mock, servo_ids.clone()).with_calibrated(true);
 
@@ -214,7 +216,7 @@ fn test_feetech_torque_enable_rollback() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_sync_read_chunking_6dof() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2, 3, 4, 5, 6];
     let mut driver = FeetechArmDriver::new(mock, servo_ids);
 
@@ -255,7 +257,7 @@ fn test_feetech_sync_read_chunking_6dof() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_configure_servos() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1];
     let mut driver = FeetechArmDriver::new(mock, servo_ids.clone());
 
@@ -443,9 +445,11 @@ async fn test_supervisor_automatic_unload_with_load_feedback() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_configure_servos_torque_enabled_refuses() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1];
-    let mut driver = FeetechArmDriver::new(mock, servo_ids).with_calibrated(true);
+    let mut driver = FeetechArmDriver::new(mock, servo_ids)
+        .with_calibrated(true)
+        .with_tx_echo(Some(false));
 
     let mut rx = Vec::new();
     let model_bytes = 777u16.to_le_bytes();
@@ -505,9 +509,11 @@ fn test_feetech_configure_servos_torque_enabled_refuses() {
 
 #[test]
 fn test_feetech_configure_servos_already_matching_zero_writes() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1];
-    let mut driver = FeetechArmDriver::new(mock, servo_ids).with_calibrated(true);
+    let mut driver = FeetechArmDriver::new(mock, servo_ids)
+        .with_calibrated(true)
+        .with_tx_echo(Some(false));
 
     let mut rx = Vec::new();
     let model_bytes = 777u16.to_le_bytes();
@@ -564,9 +570,11 @@ fn test_feetech_configure_servos_already_matching_zero_writes() {
 
 #[test]
 fn test_feetech_configure_servos_already_matching_torque_enabled_succeeds() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1];
-    let mut driver = FeetechArmDriver::new(mock, servo_ids).with_calibrated(true);
+    let mut driver = FeetechArmDriver::new(mock, servo_ids)
+        .with_calibrated(true)
+        .with_tx_echo(Some(false));
 
     let mut rx = Vec::new();
     let model_bytes = 777u16.to_le_bytes();
@@ -624,7 +632,7 @@ fn test_feetech_configure_servos_already_matching_torque_enabled_succeeds() {
 
 #[test]
 fn test_feetech_set_torque_already_enabled_no_rollback_on_failure() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2];
     let mut driver = FeetechArmDriver::new(mock, servo_ids.clone()).with_calibrated(true);
 
@@ -798,7 +806,7 @@ fn test_gripper_motion_load_and_gap_holding() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_sync_read_partial_out_of_order_chunking() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2, 3, 4, 5, 6];
     let mut driver = FeetechArmDriver::new(mock, servo_ids);
 
@@ -841,9 +849,11 @@ fn test_feetech_sync_read_partial_out_of_order_chunking() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_split_rx_frame_reassembly() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new(); // default preserve_on_clear == false!
     let servo_ids = vec![1];
-    let mut driver = FeetechArmDriver::new(mock, servo_ids).with_calibrated(true);
+    let mut driver = FeetechArmDriver::new(mock, servo_ids)
+        .with_calibrated(true)
+        .with_tx_echo(Some(false));
 
     let pos = 2048u16.to_le_bytes();
     let spd = 0u16.to_le_bytes();
@@ -854,11 +864,13 @@ fn test_feetech_split_rx_frame_reassembly() {
     full_pkt.extend_from_slice(&params);
     full_pkt.push(cs);
 
-    // Provide fragmented bytes: first 3 bytes, then 2 bytes, then the rest
-    driver.transport_mut().provide_rx(&full_pkt[..3]);
+    // Provide fragmented bytes: first 3 bytes staged on sync_read, then 2 bytes, then the rest
+    let sync_read = feetech::build_sync_read(&[1], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+    driver.transport_mut().stage_reply(&sync_read, &full_pkt[..3]);
     let _ = driver.read_joint_states();
     assert!(driver.feedback_ages()[0].is_none(), "Incomplete header cannot yield state");
 
+    // Destructive clear_input_buffer must NOT wipe continuation bytes on subsequent reads!
     driver.transport_mut().provide_rx(&full_pkt[3..5]);
     let _ = driver.read_joint_states();
     assert!(driver.feedback_ages()[0].is_none(), "Incomplete payload cannot yield state");
@@ -871,12 +883,46 @@ fn test_feetech_split_rx_frame_reassembly() {
     assert!(driver.feedback_ages()[0].is_some());
 }
 
+#[test]
+fn test_feetech_split_after_first_byte_0xff_survives_cross_call_destructive_mock() {
+    let mock = MockTransport::new(); // default preserve_on_clear == false!
+    let servo_ids = vec![1];
+    let mut driver = FeetechArmDriver::new(mock, servo_ids)
+        .with_calibrated(true)
+        .with_tx_echo(Some(false));
+
+    let pos = 2048u16.to_le_bytes();
+    let spd = 0u16.to_le_bytes();
+    let load = 150u16.to_le_bytes();
+    let params = [pos[0], pos[1], spd[0], spd[1], load[0], load[1], 75, 42];
+    let cs = calculate_checksum(1, (params.len() + 2) as u8, 0x00, &params);
+    let mut full_pkt = vec![0xFF, 0xFF, 1, (params.len() + 2) as u8, 0x00];
+    full_pkt.extend_from_slice(&params);
+    full_pkt.push(cs);
+
+    // Call 1: Split right after the first header byte [0xFF]!
+    let sync_read = feetech::build_sync_read(&[1], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+    driver.transport_mut().stage_reply(&sync_read, &[0xFF]);
+    let _ = driver.read_joint_states();
+    assert_eq!(driver.incomplete_chunk_idx(), Some(0), "Single 0xFF byte must be detected as incomplete frame header");
+    assert_eq!(driver.partial_pos_rx(), &[0xFF], "partial_pos_rx must hold the [0xFF] byte");
+
+    // Call 2: clear staged write responses and supply remaining bytes [0xFF, 1, len, ...] via provide_rx with real destructive mock!
+    driver.transport_mut().clear_write_responses();
+    driver.transport_mut().provide_rx(&full_pkt[1..]);
+    let states = driver.read_joint_states().expect("Reassembly from [0xFF] split must succeed");
+    assert_eq!(states.len(), 1);
+    assert!((states[0].position - 0.0).abs() < 1e-4);
+    assert!((states[0].temperature - 42.0).abs() < 1e-4);
+    assert_eq!(driver.incomplete_chunk_idx(), None);
+}
+
 // -------------------------------------------------------------------------
 // 14. with_config updates servo_ids used in bus operations
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_with_config_updates_servo_ids_in_bus_ops() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let default_ids = vec![1, 2, 3];
     let driver = FeetechArmDriver::new(mock, default_ids);
 
@@ -929,7 +975,7 @@ fn test_feetech_with_config_updates_servo_ids_in_bus_ops() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_drive_mode_invert_decodes_velocity_and_load() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let driver = FeetechArmDriver::new(mock, vec![1, 2]);
 
     let cfg = feetech::FeetechConfig {
@@ -992,7 +1038,7 @@ fn test_feetech_drive_mode_invert_decodes_velocity_and_load() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_read_u16_sensor_error_bit_and_echo_filtering() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1]);
 
     // Request is read 2 bytes from ID 1, reg 0x38 (present position)
@@ -1023,7 +1069,7 @@ fn test_feetech_read_u16_sensor_error_bit_and_echo_filtering() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_port_name_auto_echo_downgrade() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     // Default constructor with /dev/ttySC0 auto-detects echo=true, auto=true
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_port_name("/dev/ttySC0");
     assert_eq!(driver.tx_echo(), Some(true));
@@ -1044,7 +1090,7 @@ fn test_feetech_port_name_auto_echo_downgrade() {
     assert!(!driver.tx_echo_auto());
 
     // Explicit override via with_tx_echo clears tx_echo_auto
-    let driver2 = FeetechArmDriver::new(MockTransport::new(), vec![1])
+    let driver2 = FeetechArmDriver::new(MockTransport::new_preserving(), vec![1])
         .with_port_name("/dev/ttySC0")
         .with_tx_echo(Some(true));
     assert_eq!(driver2.tx_echo(), Some(true));
@@ -1056,7 +1102,7 @@ fn test_feetech_port_name_auto_echo_downgrade() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_set_torque_preseeding_goal_position() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1, 2]).with_calibrated(true);
 
     // 1. Initially without feedback: set_torque(true) must be rejected
@@ -1118,7 +1164,7 @@ fn test_feetech_set_torque_preseeding_goal_position() {
 // -------------------------------------------------------------------------
 #[tokio::test]
 async fn test_feetech_overload_status_hardware_fault_and_supervisor_clear_fault() {
-    let mock = Arc::new(Mutex::new(MockTransport::new()));
+    let mock = Arc::new(Mutex::new(MockTransport::new_preserving()));
     let driver = FeetechArmDriver::new(SharedTransport(mock.clone()), vec![1]).with_calibrated(true);
 
     let mut config = ArmConfig::default();
@@ -1214,7 +1260,7 @@ async fn test_feetech_overload_status_hardware_fault_and_supervisor_clear_fault(
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_set_torque_rejects_stale_feedback() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_calibrated(true);
 
     let pos_1 = 2048u16.to_le_bytes();
@@ -1263,9 +1309,11 @@ fn test_feetech_parse_response_rejects_oversized_length() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_omitted_range_steps_preserves_eeprom() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1];
-    let mut driver = FeetechArmDriver::new(mock, servo_ids).with_calibrated(true);
+    let mut driver = FeetechArmDriver::new(mock, servo_ids)
+        .with_calibrated(true)
+        .with_tx_echo(Some(false));
 
     assert!(driver.config().joints[0].range_min_steps.is_none());
     assert!(driver.config().joints[0].range_max_steps.is_none());
@@ -1331,7 +1379,7 @@ fn test_feetech_omitted_range_steps_preserves_eeprom() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_uncalibrated_rejects_set_torque() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_calibrated(false);
 
     let pos = 2048u16.to_le_bytes();
@@ -1356,7 +1404,7 @@ fn test_feetech_uncalibrated_rejects_set_torque() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_out_of_range_feedback_rejects_set_torque() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let driver = FeetechArmDriver::new(mock, vec![1]);
 
     let mut cfg = feetech::FeetechConfig::default();
@@ -1391,7 +1439,7 @@ fn test_feetech_out_of_range_feedback_rejects_set_torque() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_all_none_feedback_rejects_set_torque() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1, 2]).with_calibrated(true);
 
     assert!(!driver.is_feedback_valid());
@@ -1407,7 +1455,7 @@ fn test_feetech_all_none_feedback_rejects_set_torque() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_partial_fault_disables_only_faulted_and_detects_partial_enable() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2];
     let mut driver = FeetechArmDriver::new(mock, servo_ids);
 
@@ -1468,7 +1516,7 @@ fn test_feetech_partial_fault_disables_only_faulted_and_detects_partial_enable()
 // -------------------------------------------------------------------------
 #[tokio::test]
 async fn test_feetech_periodic_enable_poll_detects_torque_loss_and_triggers_fault() {
-    let mock = Arc::new(Mutex::new(MockTransport::new()));
+    let mock = Arc::new(Mutex::new(MockTransport::new_preserving()));
     let driver = FeetechArmDriver::new(SharedTransport(mock.clone()), vec![1]).with_calibrated(true);
 
     let mut config = ArmConfig::default();
@@ -1529,7 +1577,7 @@ async fn test_feetech_periodic_enable_poll_detects_torque_loss_and_triggers_faul
 // -------------------------------------------------------------------------
 #[tokio::test]
 async fn test_supervisor_set_torque_and_clear_fault_sync_loads_enforcing_support_limits() {
-    let mock = Arc::new(Mutex::new(MockTransport::new()));
+    let mock = Arc::new(Mutex::new(MockTransport::new_preserving()));
     let driver = FeetechArmDriver::new(SharedTransport(mock.clone()), vec![1]).with_calibrated(true);
 
     let mut config = ArmConfig::default();
@@ -1681,7 +1729,7 @@ fn test_feetech_default_config_uncalibrated_and_none_overload() {
     let joint_calib = feetech::FeetechJointCalib::default();
     assert_eq!(joint_calib.overload_torque_raw, None);
 
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1]);
     let err = driver.set_torque(true).unwrap_err();
     assert!(
@@ -1695,7 +1743,7 @@ fn test_feetech_default_config_uncalibrated_and_none_overload() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_abort_flag_stops_bus_operations_and_latches() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1, 2]).with_calibrated(true);
     let abort_flag = Arc::new(AtomicBool::new(false));
     driver.set_abort_flag(abort_flag.clone());
@@ -1762,7 +1810,7 @@ fn test_feetech_abort_flag_stops_bus_operations_and_latches() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_partial_enable_holding_preservation() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1, 2]).with_calibrated(true);
 
     // 1. Simulate joint feedback so driver has valid feedback for both servos
@@ -1835,7 +1883,7 @@ fn test_feetech_partial_enable_holding_preservation() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_refresh_enable_state_bus_recovery() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1, 2]);
 
     assert_eq!(driver.enable_state(), EnableState::Unknown);
@@ -1870,7 +1918,7 @@ fn test_feetech_refresh_enable_state_bus_recovery() {
 // -------------------------------------------------------------------------
 #[tokio::test]
 async fn test_supervisor_clear_fault_rejects_stale_or_moving_pose_before_hardware_disable() {
-    let mock = Arc::new(Mutex::new(MockTransport::new()));
+    let mock = Arc::new(Mutex::new(MockTransport::new_preserving()));
     let driver = FeetechArmDriver::new(SharedTransport(mock.clone()), vec![1]).with_calibrated(true);
 
     let mut config = ArmConfig::default();
@@ -1964,7 +2012,7 @@ async fn test_supervisor_clear_fault_rejects_stale_or_moving_pose_before_hardwar
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_with_config_growing_and_shrinking() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let driver = FeetechArmDriver::new(mock, vec![1, 2]);
     assert_eq!(driver.effective_ranges().len(), 2);
 
@@ -1999,7 +2047,7 @@ fn test_feetech_with_config_growing_and_shrinking() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_missing_rollback_readback_leaves_state_unknown() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2];
     let mut driver = FeetechArmDriver::new(mock, servo_ids.clone()).with_calibrated(true);
 
@@ -2085,7 +2133,7 @@ fn test_feetech_eeprom_relock_sent_when_aborted_during_write() {
         }
     }
 
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let abort_flag = Arc::new(AtomicBool::new(false));
     let transport = AbortOnLock0Transport {
         inner: mock,
@@ -2146,7 +2194,7 @@ fn test_feetech_eeprom_relock_sent_when_aborted_during_write() {
 // -------------------------------------------------------------------------
 #[tokio::test]
 async fn test_feetech_supervisor_estop_abort_lifecycle() {
-    let mock = Arc::new(Mutex::new(MockTransport::new()));
+    let mock = Arc::new(Mutex::new(MockTransport::new_preserving()));
     let driver = FeetechArmDriver::new(SharedTransport(mock.clone()), vec![1, 2])
         .with_calibrated(true);
 
@@ -2440,7 +2488,7 @@ fn test_checked_rad_to_steps_in_range_tolerance_and_rejection() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_direct_register_reads_filter_noise_prefixed_echo() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let id = 1u8;
     let mut driver = FeetechArmDriver::new(mock, vec![id]);
 
@@ -2481,7 +2529,7 @@ fn test_feetech_direct_register_reads_filter_noise_prefixed_echo() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_feedback_invalidated_on_calibration_change() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1]);
 
     let pos = 2048u16.to_le_bytes();
@@ -2519,7 +2567,7 @@ fn test_feetech_feedback_invalidated_on_calibration_change() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_enable_poll_unstarves_when_position_chunk_timeouts() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_calibrated(true);
 
     // Provide feedback and enable torque
@@ -2628,7 +2676,7 @@ async fn test_supervisor_pending_estop_count_rejects_clear_fault_set_torque_and_
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_stale_enable_poll_degrades_to_unknown_and_hardware_fault() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_calibrated(true);
 
     let pos = 2048u16.to_le_bytes();
@@ -2684,7 +2732,7 @@ fn test_feetech_stale_enable_poll_degrades_to_unknown_and_hardware_fault() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_gripper_benign_overload_vs_arm_fault() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2, 3, 4, 5, 6];
     let mut driver = FeetechArmDriver::new(mock, servo_ids)
         .with_calibrated(true)
@@ -2717,7 +2765,7 @@ fn test_feetech_gripper_benign_overload_vs_arm_fault() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_late_drained_frames_and_incomplete_chunk_idx() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2, 3];
     let mut driver = FeetechArmDriver::new(mock, servo_ids);
 
@@ -2742,7 +2790,7 @@ fn test_feetech_late_drained_frames_and_incomplete_chunk_idx() {
     driver.transport_mut().provide_rx(&rx);
 
     let _ = driver.read_joint_states();
-    assert_eq!(driver.incomplete_chunk_idx, Some(0));
+    assert_eq!(driver.incomplete_chunk_idx(), Some(0));
 
     // Next call, supply the rest of servo 3
     let mut rx2 = Vec::new();
@@ -2759,7 +2807,7 @@ fn test_feetech_late_drained_frames_and_incomplete_chunk_idx() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_preserve_hw_effective_ranges_in_with_config() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_calibrated(true);
 
     // Simulate configure_servos recording hw angle limits: min=120, max=3950
@@ -2785,7 +2833,7 @@ fn test_feetech_preserve_hw_effective_ranges_in_with_config() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_read_u16_tx_echo_false_matching_bytes_not_skipped() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
 
     // Request: [0xFF, 0xFF, 0x01, 0x04, 0x02, 0x1F, 0x02, 0xD7]
@@ -2920,10 +2968,9 @@ async fn test_gripper_persistent_hw_overload_reverse_escape_and_re_squeeze() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_drain_tx_echo_ff_noise_and_partial_echo_returns_model_777() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1]);
-    driver.tx_echo = None;
-    driver.tx_echo_auto = true;
+    driver.set_tx_echo_state(None, true);
 
     // Read model (id=1, reg=0x03, len=2)
     let req = feetech::build_read(1, feetech::REG_MODEL_L, 2);
@@ -2940,7 +2987,7 @@ fn test_feetech_drain_tx_echo_ff_noise_and_partial_echo_returns_model_777() {
 
     let val = driver.read_register_u16_direct(1, feetech::REG_MODEL_L).expect("Read model must succeed");
     assert_eq!(val, 777, "Expected model 777, got {}", val);
-    assert_eq!(driver.tx_echo, Some(true));
+    assert_eq!(driver.tx_echo(), Some(true));
 }
 
 // -------------------------------------------------------------------------
@@ -2948,7 +2995,7 @@ fn test_feetech_drain_tx_echo_ff_noise_and_partial_echo_returns_model_777() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_6servo_incomplete_chunk_idx_cross_call_reassembly_and_ghost_header() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2, 3, 4, 5, 6];
     let mut driver = FeetechArmDriver::new(mock, servo_ids);
 
@@ -2974,7 +3021,7 @@ fn test_feetech_6servo_incomplete_chunk_idx_cross_call_reassembly_and_ghost_head
     driver.transport_mut().provide_rx(&rx1);
 
     let _ = driver.read_joint_states();
-    assert_eq!(driver.incomplete_chunk_idx, Some(1), "Chunk 1 must be marked incomplete");
+    assert_eq!(driver.incomplete_chunk_idx(), Some(1), "Chunk 1 must be marked incomplete");
 
     // Call 2: Supply the rest of servo 6, plus next cycle's Chunk 0 (servos 1, 2, 3)
     let mut rx2 = Vec::new();
@@ -2991,7 +3038,7 @@ fn test_feetech_6servo_incomplete_chunk_idx_cross_call_reassembly_and_ghost_head
     // Now test ghost header non-starvation: inject incomplete ghost header bytes
     let ghost = vec![0xFF, 0xFF, 0x42]; // non-existent servo 0x42 incomplete header
     driver.transport_mut().provide_rx(&ghost);
-    driver.incomplete_chunk_idx = Some(0); // simulate incomplete flag set
+    driver.set_incomplete_chunk_idx(Some(0)); // simulate incomplete flag set
 
     let build_resp_pos = |id: u8, pos_steps: u16| -> Vec<u8> {
         let pos = pos_steps.to_le_bytes();
@@ -3042,7 +3089,7 @@ fn test_feetech_6servo_incomplete_chunk_idx_cross_call_reassembly_and_ghost_head
     assert_eq!(states4.len(), 6);
     let exp4 = calib.steps_to_rad(2800);
     assert!((states4[3].position - exp4).abs() < 1e-4);
-    assert_eq!(driver.incomplete_chunk_idx, None);
+    assert_eq!(driver.incomplete_chunk_idx(), None);
 }
 
 // -------------------------------------------------------------------------
@@ -3057,7 +3104,7 @@ async fn test_feetech_narrower_effective_ranges_narrows_config_limits() {
 
     let supervisor = Arc::new(ArmSupervisor::new(config));
 
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1]);
     // Steps 1024..3072 is narrower than full 0..4095
     driver.effective_ranges = vec![(1024, 3072)];
@@ -3089,10 +3136,10 @@ async fn test_feetech_narrower_effective_ranges_narrows_config_limits() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_next_call() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
-    driver.confirmed_enable_state = EnableState::Enabled;
-    driver.read_poll_count = 8;
+    driver.set_confirmed_enable_state(EnableState::Enabled);
+    driver.set_read_poll_count(8);
     driver.last_enable_poll = Some(Instant::now());
 
     let build_resp = |id: u8| -> Vec<u8> {
@@ -3112,7 +3159,7 @@ fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_n
     driver.transport_mut().provide_rx(&resp1[..4]);
 
     let _ = driver.read_joint_states();
-    assert_eq!(driver.incomplete_chunk_idx, Some(0), "Chunk 0 must be marked incomplete");
+    assert_eq!(driver.incomplete_chunk_idx(), Some(0), "Chunk 0 must be marked incomplete");
 
     // Call 2 (poll_count -> 10, enable poll due): supply partial continuation (bytes 4..8, still incomplete).
     // If enable poll had erroneously run while incomplete_chunk_idx was Some,
@@ -3122,7 +3169,7 @@ fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_n
     driver.transport_mut().provide_rx(&resp1[4..8]);
 
     let _ = driver.read_joint_states();
-    assert_eq!(driver.incomplete_chunk_idx, Some(0), "Chunk 0 must still be incomplete");
+    assert_eq!(driver.incomplete_chunk_idx(), Some(0), "Chunk 0 must still be incomplete");
     assert_eq!(
         driver.transport().clear_input_count(),
         clears_before_reassembly,
@@ -3133,7 +3180,7 @@ fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_n
     driver.transport_mut().provide_rx(&resp1[8..]);
     let states = driver.read_joint_states().expect("Reassembly must succeed without enable-poll wiping rx_buffer");
     assert_eq!(states.len(), 1);
-    assert_eq!(driver.incomplete_chunk_idx, None);
+    assert_eq!(driver.incomplete_chunk_idx(), None);
     assert!(driver.feedback_ages()[0].is_some_and(|a| a < Duration::from_millis(50)));
 }
 
@@ -3142,9 +3189,9 @@ fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_n
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_partial_rx_frame_survives_50hz_tick_gap() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
-    driver.confirmed_enable_state = EnableState::Enabled;
+    driver.set_confirmed_enable_state(EnableState::Enabled);
     driver.last_enable_poll = Some(Instant::now());
 
     let build_resp = |id: u8| -> Vec<u8> {
@@ -3163,16 +3210,16 @@ fn test_feetech_partial_rx_frame_survives_50hz_tick_gap() {
     // Supply partial frame (first 4 bytes)
     driver.transport_mut().provide_rx(&resp1[..4]);
     let _ = driver.read_joint_states();
-    assert_eq!(driver.incomplete_chunk_idx, Some(0));
+    assert_eq!(driver.incomplete_chunk_idx(), Some(0));
 
-    // Simulate 50 Hz control tick gap (22ms > 20ms, well within 35ms TTL)
-    std::thread::sleep(Duration::from_millis(22));
+    // Simulate 50 Hz control tick gap (18ms..20ms, well within 25ms TTL)
+    std::thread::sleep(Duration::from_millis(18));
 
     // Provide remaining bytes
     driver.transport_mut().provide_rx(&resp1[4..]);
     let states = driver.read_joint_states().expect("Reassembly must survive 22ms tick gap");
     assert_eq!(states.len(), 1);
-    assert_eq!(driver.incomplete_chunk_idx, None);
+    assert_eq!(driver.incomplete_chunk_idx(), None);
     assert!(driver.feedback_ages()[0].is_some_and(|a| a < Duration::from_millis(60)));
 }
 
@@ -3181,7 +3228,7 @@ fn test_feetech_partial_rx_frame_survives_50hz_tick_gap() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_stray_noise_does_not_pause_polling() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1, 2, 3]).with_tx_echo(Some(false));
 
     // Provide stray noise byte 0x00 (no 0xFF 0xFF header)
@@ -3189,7 +3236,7 @@ fn test_feetech_stray_noise_does_not_pause_polling() {
 
     let _ = driver.read_joint_states();
     assert_eq!(
-        driver.incomplete_chunk_idx, None,
+        driver.incomplete_chunk_idx(), None,
         "Stray noise 0x00 must NOT set incomplete_chunk_idx or pause polling"
     );
     assert!(driver.rx_buffer().is_empty(), "rx_buffer must be cleared of noise");
@@ -3200,7 +3247,7 @@ fn test_feetech_stray_noise_does_not_pause_polling() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_feetech_multiservo_chunk_reassembly_split_first_servo_and_following_servos_complete() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2, 3, 4, 5, 6];
     let mut driver = FeetechArmDriver::new(mock, servo_ids);
 
@@ -3227,7 +3274,7 @@ fn test_feetech_multiservo_chunk_reassembly_split_first_servo_and_following_serv
     driver.transport_mut().provide_rx(&rx1);
 
     let _ = driver.read_joint_states();
-    assert_eq!(driver.incomplete_chunk_idx, Some(1), "Chunk 1 must be marked incomplete");
+    assert_eq!(driver.incomplete_chunk_idx(), Some(1), "Chunk 1 must be marked incomplete");
 
     // Call 2: supply remainder of servo 4 AND complete frames for servos 5 & 6 in that chunk
     let mut rx2 = Vec::new();
@@ -3238,7 +3285,7 @@ fn test_feetech_multiservo_chunk_reassembly_split_first_servo_and_following_serv
 
     let states = driver.read_joint_states().expect("Multi-servo chunk reassembly must succeed");
     assert_eq!(states.len(), 6);
-    assert_eq!(driver.incomplete_chunk_idx, None, "Incomplete chunk index must be cleared after reassembly");
+    assert_eq!(driver.incomplete_chunk_idx(), None, "Incomplete chunk index must be cleared after reassembly");
 
     // Verify all 3 servos in Chunk 1 (indices 3, 4, 5) updated
     let calib4 = driver.config().joints[3].clone();
@@ -3277,7 +3324,7 @@ async fn test_apply_driver_limits_rejection_leaves_poses_unchanged_and_latches_u
 
     let supervisor = Arc::new(ArmSupervisor::new(config));
 
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let mut driver = FeetechArmDriver::new(mock, vec![1]);
     // Steps 100..200 corresponds to negative angles far from 0.5 rad (e.g. [-0.8, -0.2])
     driver.effective_ranges = vec![(100, 200)];
@@ -3323,7 +3370,7 @@ async fn test_apply_driver_limits_rejection_leaves_poses_unchanged_and_latches_u
 // -------------------------------------------------------------------------
 #[tokio::test]
 async fn test_feetech_driver_backed_arm_joint_0x20_rising_edge_triggers_hardware_fault() {
-    let mock = Arc::new(Mutex::new(MockTransport::new()));
+    let mock = Arc::new(Mutex::new(MockTransport::new_preserving()));
     let driver = FeetechArmDriver::new(SharedTransport(mock.clone()), vec![1]).with_calibrated(true);
 
     let mut config = ArmConfig::default();

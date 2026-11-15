@@ -81,8 +81,16 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
     let j7_limit = inner.config.gripper_index().and_then(|idx| inner.config.limits.get(idx));
     b.jaw_opening.validate(j7_limit).map_err(MotionError::InvalidCommand)?;
 
+    if inner.config.gripper_policy.is_none() {
+        return Err(MotionError::Unsupported("Gripper calibration requires a gripper policy".into()).into());
+    }
+
     let offset = b.offset_rad.or(inner.gripper_calib_offset);
     inner.apply_gripper_calibration(offset, Some(b.jaw_opening.clone())).map_err(MotionError::InvalidCommand)?;
+
+    if inner.driver_config_error.is_some() {
+        inner.reapply_driver_limits();
+    }
 
     let effective = inner.config.gripper_policy.clone().ok_or_else(|| {
         MotionError::Unsupported("Gripper calibration requires a gripper policy".into())

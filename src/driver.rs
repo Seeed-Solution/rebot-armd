@@ -220,14 +220,14 @@ pub struct FeetechArmDriver<T: Transport> {
     cached_loads: Vec<f32>,
     pub motor_status: Vec<u8>,
     last_feedback_instant: Vec<Option<Instant>>,
-    pub confirmed_enable_state: EnableState,
-    pub tx_echo: Option<bool>,
-    pub tx_echo_auto: bool,
+    confirmed_enable_state: EnableState,
+    tx_echo: Option<bool>,
+    tx_echo_auto: bool,
     poll_cursor: usize,
     rx_buffer: Vec<u8>,
     pub effective_ranges: Vec<(u16, u16)>,
     cached_raw_steps: Vec<i32>,
-    pub read_poll_count: u64,
+    read_poll_count: u64,
     missed_poll_replies: u64,
     partial_enable_known: bool,
     joint_torque_enabled: Vec<Option<bool>>,
@@ -237,12 +237,14 @@ pub struct FeetechArmDriver<T: Transport> {
     pub hw_angle_limits: Vec<Option<(u16, u16)>>,
     pub last_enable_confirmed: Vec<Option<Instant>>,
     pub missed_enable_polls: Vec<u8>,
-    pub incomplete_chunk_idx: Option<usize>,
-    pub incomplete_frame_started_at: Option<Instant>,
+    incomplete_chunk_idx: Option<usize>,
+    incomplete_frame_started_at: Option<Instant>,
+    partial_pos_rx: Vec<u8>,
     consecutive_missed_echoes: u32,
     warned_missed_echoes: bool,
 }
 
+#[doc(hidden)]
 pub trait FeetechConfigExt {
     fn joint_calib(&self, joint: usize) -> feetech::FeetechJointCalib;
 }
@@ -294,6 +296,7 @@ impl<T: Transport> FeetechArmDriver<T> {
             missed_enable_polls: vec![0; dof],
             incomplete_chunk_idx: None,
             incomplete_frame_started_at: None,
+            partial_pos_rx: Vec::with_capacity(64),
             consecutive_missed_echoes: 0,
             warned_missed_echoes: false,
         }
@@ -427,6 +430,68 @@ impl<T: Transport> FeetechArmDriver<T> {
         &self.rx_buffer
     }
 
+    #[doc(hidden)]
+    pub fn confirmed_enable_state(&self) -> EnableState {
+        self.confirmed_enable_state
+    }
+
+    #[doc(hidden)]
+    pub fn set_confirmed_enable_state(&mut self, state: EnableState) {
+        self.confirmed_enable_state = state;
+    }
+
+    #[doc(hidden)]
+    pub fn set_tx_echo_state(&mut self, tx_echo: Option<bool>, auto: bool) {
+        self.tx_echo = tx_echo;
+        self.tx_echo_auto = auto;
+    }
+
+    #[doc(hidden)]
+    pub fn read_poll_count(&self) -> u64 {
+        self.read_poll_count
+    }
+
+    #[doc(hidden)]
+    pub fn set_read_poll_count(&mut self, count: u64) {
+        self.read_poll_count = count;
+    }
+
+    #[doc(hidden)]
+    pub fn incomplete_chunk_idx(&self) -> Option<usize> {
+        self.incomplete_chunk_idx
+    }
+
+    #[doc(hidden)]
+    pub fn set_incomplete_chunk_idx(&mut self, idx: Option<usize>) {
+        self.incomplete_chunk_idx = idx;
+    }
+
+    #[doc(hidden)]
+    pub fn incomplete_frame_started_at(&self) -> Option<Instant> {
+        self.incomplete_frame_started_at
+    }
+
+    #[doc(hidden)]
+    pub fn set_incomplete_frame_started_at(&mut self, instant: Option<Instant>) {
+        self.incomplete_frame_started_at = instant;
+    }
+
+    #[doc(hidden)]
+    pub fn partial_pos_rx(&self) -> &[u8] {
+        &self.partial_pos_rx
+    }
+
+    #[doc(hidden)]
+    pub fn set_partial_pos_rx(&mut self, bytes: &[u8]) {
+        self.partial_pos_rx = bytes.to_vec();
+    }
+
+    pub(crate) fn invalidate_partial_pos_rx(&mut self) {
+        self.partial_pos_rx.clear();
+        self.incomplete_chunk_idx = None;
+        self.incomplete_frame_started_at = None;
+    }
+
     fn is_aborted(&self) -> bool {
         self.abort_flag
             .as_ref()
@@ -552,6 +617,7 @@ impl<T: Transport> FeetechArmDriver<T> {
     }
 
     pub fn read_register_u8_direct(&mut self, id: u8, reg: u8) -> Result<u8, ArmDriverError> {
+        self.invalidate_partial_pos_rx();
         self.transport.clear_input_buffer();
         self.rx_buffer.clear();
         let req = feetech::build_read(id, reg, 1);
@@ -613,6 +679,7 @@ impl<T: Transport> FeetechArmDriver<T> {
     }
 
     pub fn read_register_u16_direct(&mut self, id: u8, reg: u8) -> Result<u16, ArmDriverError> {
+        self.invalidate_partial_pos_rx();
         self.transport.clear_input_buffer();
         self.rx_buffer.clear();
         let req = feetech::build_read(id, reg, 2);
@@ -681,6 +748,7 @@ impl<T: Transport> FeetechArmDriver<T> {
     }
 
     fn write_register_u8_cleanup(&mut self, id: u8, reg: u8, val: u8) -> Result<(), ArmDriverError> {
+        self.invalidate_partial_pos_rx();
         self.transport.clear_input_buffer();
         self.rx_buffer.clear();
         let pkt = feetech::build_write_u8(id, reg, val);
@@ -694,6 +762,7 @@ impl<T: Transport> FeetechArmDriver<T> {
         if self.is_aborted() {
             return Err(ArmDriverError::HardwareFault("Aborted by emergency stop".into()));
         }
+        self.invalidate_partial_pos_rx();
         self.transport.clear_input_buffer();
         self.rx_buffer.clear();
         let pkt = feetech::build_write_u16(id, reg, val);
@@ -705,6 +774,7 @@ impl<T: Transport> FeetechArmDriver<T> {
 
     /// Configure EEPROM and RAM registers for all servos based on `FeetechConfig`.
     pub fn configure_servos(&mut self) -> Result<(), ArmDriverError> {
+        self.invalidate_partial_pos_rx();
         if self.is_aborted() {
             return Err(ArmDriverError::HardwareFault("Aborted by emergency stop".into()));
         }
@@ -953,17 +1023,18 @@ impl<T: Transport> FeetechArmDriver<T> {
         self.gripper_index == Some(joint_idx) && status == 0x20
     }
 
-    fn decode_position_frames(
+    fn decode_position_frames_from(
         &mut self,
+        rx: &mut Vec<u8>,
         expected_ids: &std::collections::HashSet<u8>,
         replied_ids: &mut std::collections::HashSet<u8>,
         read_time: Instant,
     ) {
         let default_calib = feetech::FeetechJointCalib::default();
-        while !self.rx_buffer.is_empty() {
-            match feetech::parse_response(&self.rx_buffer) {
+        while !rx.is_empty() {
+            match feetech::parse_response(rx) {
                 Ok((pkt, consumed)) => {
-                    self.rx_buffer.drain(..consumed);
+                    rx.drain(..consumed);
                     if pkt.id == feetech::BROADCAST_ID {
                         continue;
                     }
@@ -1001,10 +1072,32 @@ impl<T: Transport> FeetechArmDriver<T> {
                     break;
                 }
                 Err(_) => {
-                    self.rx_buffer.remove(0);
+                    rx.remove(0);
                 }
             }
         }
+    }
+
+    fn decode_position_frames(
+        &mut self,
+        expected_ids: &std::collections::HashSet<u8>,
+        replied_ids: &mut std::collections::HashSet<u8>,
+        read_time: Instant,
+    ) {
+        let mut rx = std::mem::take(&mut self.rx_buffer);
+        self.decode_position_frames_from(&mut rx, expected_ids, replied_ids, read_time);
+        self.rx_buffer = rx;
+    }
+
+    fn decode_partial_position_frames(
+        &mut self,
+        expected_ids: &std::collections::HashSet<u8>,
+        replied_ids: &mut std::collections::HashSet<u8>,
+        read_time: Instant,
+    ) {
+        let mut rx = std::mem::take(&mut self.partial_pos_rx);
+        self.decode_position_frames_from(&mut rx, expected_ids, replied_ids, read_time);
+        self.partial_pos_rx = rx;
     }
 }
 
@@ -1235,6 +1328,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     }
 
     fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
+        self.invalidate_partial_pos_rx();
         let ids = self.servo_ids.clone();
         if enabled {
             self.check_hardware_status()?;
@@ -1468,6 +1562,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
     }
 
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+        self.invalidate_partial_pos_rx();
         if targets.len() != self.servo_ids.len() {
             return Err(ArmDriverError::JointCountMismatch {
                 expected: self.servo_ids.len(),
@@ -1505,15 +1600,15 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
         let start_time = Instant::now();
         let mut temp_chunk = [0u8; 1];
 
+        const INCOMPLETE_FRAME_TTL: Duration = Duration::from_millis(25);
         if let Some(inc_idx) = self.incomplete_chunk_idx.take() {
             let inc_ts = self.incomplete_frame_started_at.take().unwrap_or_else(Instant::now);
-            const INCOMPLETE_TTL: Duration = Duration::from_millis(35);
-            let mut all_replied = false;
-
-            if let Some(inc_chunk) = self.servo_ids.chunks(MAX_SYNC_READ_SERVOS).nth(inc_idx).map(|c| c.to_vec()) {
+            if inc_ts.elapsed() >= INCOMPLETE_FRAME_TTL {
+                self.invalidate_partial_pos_rx();
+            } else if let Some(inc_chunk) = self.servo_ids.chunks(MAX_SYNC_READ_SERVOS).nth(inc_idx).map(|c| c.to_vec()) {
                 let expected_ids: std::collections::HashSet<u8> = inc_chunk.iter().copied().collect();
                 let mut replied_ids = std::collections::HashSet::new();
-                self.decode_position_frames(&expected_ids, &mut replied_ids, inc_ts);
+                self.decode_partial_position_frames(&expected_ids, &mut replied_ids, inc_ts);
 
                 let reassembly_start = Instant::now();
                 const REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(4);
@@ -1522,41 +1617,47 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 while replied_ids.len() < inc_chunk.len()
                     && reassembly_start.elapsed() < REASSEMBLY_TIMEOUT
                     && start_time.elapsed() < MAX_READ_DURATION
+                    && inc_ts.elapsed() < INCOMPLETE_FRAME_TTL
                 {
                     match self.transport.read(&mut drain_buf) {
                         Ok(n) if n > 0 => {
-                            self.rx_buffer.extend_from_slice(&drain_buf[..n]);
-                            self.decode_position_frames(&expected_ids, &mut replied_ids, inc_ts);
+                            self.partial_pos_rx.extend_from_slice(&drain_buf[..n]);
+                            self.decode_partial_position_frames(&expected_ids, &mut replied_ids, inc_ts);
                         }
                         _ => {
-                            if inc_ts.elapsed() >= INCOMPLETE_TTL {
+                            if inc_ts.elapsed() >= INCOMPLETE_FRAME_TTL {
                                 break;
                             }
                             std::thread::yield_now();
                         }
                     }
-                    if inc_ts.elapsed() >= INCOMPLETE_TTL && replied_ids.len() < inc_chunk.len() {
+                    if inc_ts.elapsed() >= INCOMPLETE_FRAME_TTL && replied_ids.len() < inc_chunk.len() {
                         if let Ok(n) = self.transport.read(&mut drain_buf) {
                             if n > 0 {
-                                self.rx_buffer.extend_from_slice(&drain_buf[..n]);
-                                self.decode_position_frames(&expected_ids, &mut replied_ids, inc_ts);
+                                self.partial_pos_rx.extend_from_slice(&drain_buf[..n]);
+                                self.decode_partial_position_frames(&expected_ids, &mut replied_ids, inc_ts);
                             }
                         }
                         break;
                     }
                 }
 
-                all_replied = replied_ids.len() == inc_chunk.len();
-            }
+                let all_replied = replied_ids.len() == inc_chunk.len();
+                let inc_timed_out = inc_ts.elapsed() >= INCOMPLETE_FRAME_TTL;
+                let has_incomplete = feetech::has_partial_frame_header(&self.partial_pos_rx);
 
-            let inc_timed_out = inc_ts.elapsed() >= INCOMPLETE_TTL;
-            let has_incomplete = feetech::has_partial_frame_header(&self.rx_buffer);
-
-            if !all_replied && !inc_timed_out && has_incomplete {
-                self.incomplete_chunk_idx = Some(inc_idx);
-                self.incomplete_frame_started_at = Some(inc_ts);
+                if !all_replied && !inc_timed_out && has_incomplete {
+                    if let Some(tail) = feetech::trailing_partial_frame(&self.partial_pos_rx) {
+                        let tail_vec = tail.to_vec();
+                        self.partial_pos_rx = tail_vec;
+                    }
+                    self.incomplete_chunk_idx = Some(inc_idx);
+                    self.incomplete_frame_started_at = Some(inc_ts);
+                } else {
+                    self.invalidate_partial_pos_rx();
+                }
             } else {
-                self.rx_buffer.clear();
+                self.invalidate_partial_pos_rx();
             }
         }
 
@@ -1731,19 +1832,21 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 }
             }
 
-            if replied_ids.len() < chunk.len()
-                && feetech::has_partial_frame_header(&self.rx_buffer)
-            {
-                self.incomplete_chunk_idx = Some(chunk_idx);
-                self.incomplete_frame_started_at = Some(read_time);
-                self.poll_cursor = (chunk_idx + 1) % num_chunks;
-                break 'chunk_loop;
-            } else {
-                self.incomplete_chunk_idx = None;
-                self.incomplete_frame_started_at = None;
-                self.rx_buffer.clear();
-                self.poll_cursor = (chunk_idx + 1) % num_chunks;
+            if replied_ids.len() < chunk.len() {
+                if let Some(tail) = feetech::trailing_partial_frame(&self.rx_buffer) {
+                    self.partial_pos_rx = tail.to_vec();
+                    self.incomplete_chunk_idx = Some(chunk_idx);
+                    self.incomplete_frame_started_at = Some(read_time);
+                    self.rx_buffer.clear();
+                    self.poll_cursor = (chunk_idx + 1) % num_chunks;
+                    break 'chunk_loop;
+                }
             }
+            self.incomplete_chunk_idx = None;
+            self.incomplete_frame_started_at = None;
+            self.partial_pos_rx.clear();
+            self.rx_buffer.clear();
+            self.poll_cursor = (chunk_idx + 1) % num_chunks;
         }
 
         if self.rx_buffer.len() > 512 {

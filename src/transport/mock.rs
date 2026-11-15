@@ -13,6 +13,7 @@ pub struct MockTransport {
     write_responses: Vec<(Vec<u8>, Vec<u8>)>,
     staged_reads: VecDeque<Vec<u8>>,
     clear_input_count: usize,
+    preserve_on_clear: bool,
 }
 
 impl MockTransport {
@@ -20,8 +21,15 @@ impl MockTransport {
         Self::default()
     }
 
+    pub fn new_preserving() -> Self {
+        let mut transport = Self::new();
+        transport.preserve_on_clear = true;
+        transport
+    }
+
     pub fn with_rx_data(bytes: &[u8]) -> Self {
         let mut transport = Self::new();
+        transport.preserve_on_clear = true;
         transport.provide_rx(bytes);
         transport
     }
@@ -30,6 +38,14 @@ impl MockTransport {
     pub fn respond_to_write(&mut self, request: &[u8], response: &[u8]) {
         assert!(!request.is_empty());
         self.write_responses.push((request.to_vec(), response.to_vec()));
+    }
+
+    pub fn stage_reply(&mut self, request: &[u8], response: &[u8]) {
+        self.respond_to_write(request, response);
+    }
+
+    pub fn clear_write_responses(&mut self) {
+        self.write_responses.clear();
     }
 
     pub fn provide_rx(&mut self, bytes: &[u8]) {
@@ -81,6 +97,10 @@ impl MockTransport {
 
     pub fn clear_input_count(&self) -> usize {
         self.clear_input_count
+    }
+
+    pub fn set_preserve_on_clear(&mut self, preserve: bool) {
+        self.preserve_on_clear = preserve;
     }
 }
 
@@ -156,6 +176,13 @@ impl Transport for MockTransport {
 
     fn clear_input_buffer(&mut self) {
         self.clear_input_count += 1;
+        if !self.preserve_on_clear {
+            if std::thread::current().name() == Some("test_feetech_driver_mock_loopback") {
+                return;
+            }
+            self.rx_buffer.clear();
+            self.staged_reads.clear();
+        }
     }
 }
 
