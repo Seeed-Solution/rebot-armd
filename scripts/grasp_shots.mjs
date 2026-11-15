@@ -134,6 +134,13 @@ const videoPoint = (page, u, v) => page.evaluate(([u, v]) => {
   return [r.left + c.x + u * c.w, r.top + c.y + v * c.h];
 }, [u, v]);
 
+// simple mode: Detect, the vision mode selector, single shot and grasp setup live in the recognition popover (#btn-vis)
+const openVis = (page) => page.evaluate(() => {
+  const b = document.getElementById('btn-vis');
+  if (document.body.classList.contains('ui-simple') && !document.body.classList.contains('vis-open') && b && !b.hidden) b.click();
+});
+const closeVis = (page) => page.evaluate(() => { if (document.body.classList.contains('vis-open')) document.getElementById('btn-vis').click(); });
+
 for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (const [vp, viewport] of [['1280x800', { width: 1280, height: 800 }], ['375x812', { width: 375, height: 812 }]]) {
   const tag = `${ui}_${lang}_${vp}`;
   const L = T[lang];
@@ -147,16 +154,18 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
   await page.waitForTimeout(700);
   // overlay on: this page's subscription with the selected (default YOLO) pipelines
   VCALLS.length = 0;
-  await page.click('#btn-det');
+  await openVis(page); await page.click('#btn-det');
   await page.waitForTimeout(300);
   const sub0 = VCALLS.find(([m, u]) => m === 'POST' && u === '/api/v1/vision/subscribe');
   check(`${tag} overlay subscription`, sub0 && JSON.stringify(sub0[2].pipelines) === '["yolo"]' && /^cockpit-overlay-/.test(sub0[2].client)
     && await page.evaluate(() => DET.enabled), JSON.stringify(VCALLS));
 
-  // 1. tap the cup box
+  // 1. tap the cup box (popover closed first: it can cover the video on a phone)
+  await closeVis(page);
   const [cx, cy] = await videoPoint(page, 250 / 640, 200 / 360);
   await page.mouse.click(cx, cy);
   await page.waitForTimeout(200);
+  await openVis(page);
   let info = await page.evaluate(() => {
     const vis = (id) => { const el = document.getElementById(id); if (!el) return false; const r = el.getBoundingClientRect(); return !el.closest('[hidden]') && r.width > 0 && r.height > 0; };
     const bar = document.getElementById('grasp-bar').getBoundingClientRect(), vb = document.getElementById('video-box').getBoundingClientRect();
@@ -164,6 +173,7 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
       label: document.getElementById('grasp-label').textContent, score: document.getElementById('grasp-score').textContent, gset: vis('btn-gset') && document.getElementById('btn-gset').textContent,
       barInside: bar.left >= vb.left - 1 && bar.right <= vb.right + 1 && bar.bottom <= vb.bottom + 1 && bar.top >= vb.top - 1 };
   });
+  await closeVis(page);
   let sc = await noHScroll(page);
   check(`${tag} select`, info.sel === 'cup' && info.bar && info.go === L.go && info.cancel && !info.stop && info.label === 'cup' && info.score === '91%', JSON.stringify(info));
   check(`${tag} bar inside video`, info.barInside, JSON.stringify(info));
@@ -233,7 +243,7 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
   check(`${tag} failure toast`, (await page.evaluate(() => [...document.querySelectorAll('#toasts .toast')].map((e) => e.textContent))).some((x) => x.includes(L.fail)));
 
   // 4. setup drawer
-  await page.click('#btn-gset');
+  await openVis(page); await page.click('#btn-gset');
   await page.waitForTimeout(300);
   info = await page.evaluate(() => {
     const d = document.querySelector('#gset .calib-drawer');

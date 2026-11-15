@@ -249,6 +249,24 @@ body.ui-expert .main {
 .fps-pill.is-work { color: var(--sc-status-normal-fg); background: rgba(239,252,232,0.92); }
 .fps-pill.is-snap { color: var(--sc-status-warning-fg); background: rgba(255,247,230,0.92); }
 .fps-pill.is-snap::before { animation: breathe 0.9s ease-in-out infinite; }
+/* simple mode: one recognition chip in the HUD; Detect, vision mode, single shot, camera rate and grasp setup
+   open from it as a popover (#det-ctl). The camera chip carries the stream rate and latency (no #vstat). */
+.vis-chip { pointer-events: auto; }
+.vis-chip::after { content: ""; width: 0; height: 0; margin-left: 2px; border: 4px solid transparent; border-top-color: currentColor; border-bottom-width: 0; }
+.vis-chip[aria-expanded="true"]::after { border-top-width: 0; border-bottom: 4px solid currentColor; }
+body.ui-simple #det-ctl { display: none; }
+body.ui-simple.vis-open #det-ctl:not([hidden]) {
+  display: flex; position: absolute; z-index: 30; top: calc(100% + 8px); left: 0; width: max-content; max-width: min(300px, calc(100vw - 24px));
+  flex-wrap: wrap; align-items: center; gap: 8px 6px; padding: 8px; border-radius: 16px;
+  background: rgba(255,255,255,0.5); border: 1px solid rgba(255,255,255,0.6); box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+  backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
+}
+body.ui-simple.vis-open #det-ctl .vmode { order: -1; flex: 1 0 100%; display: flex; }
+body.ui-simple.vis-open #det-ctl .vmode[hidden] { display: none; }
+body.ui-simple.vis-open #det-ctl .vmode button { flex: 1 1 auto; }
+body.ui-simple.vis-open .hud { z-index: 9; }
+body.ui-simple.vis-open .move-hint { visibility: hidden; }
+body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 
 /* ---------- hand-eye calibration drawer ---------- */
 .calib-mask { position: fixed; inset: 0; z-index: 1040; display: flex; justify-content: flex-end; background: rgba(15, 23, 42, 0.32); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); animation: cfade .18s ease; }
@@ -855,6 +873,14 @@ kbd { display: inline-block; min-width: 20px; padding: 1px 5px; margin-right: 2p
   .cart-ctl { grid-template-columns: minmax(0, 1fr); }
   .cart-read { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
+@media (max-width: 639px) and (orientation: portrait) {
+  /* simple, phone portrait: Enable + E-stop first in the cockpit and pinned under the header while scrolling */
+  body.ui-simple #ck-safety { display: contents; }
+  body.ui-simple .cockpit .safety { order: -2; position: sticky; top: calc(var(--head-h) + 8px); z-index: 150; padding: 8px; margin: -8px;
+    border-radius: 16px; background: rgba(255,255,255,0.94); box-shadow: 0 6px 18px rgba(31,41,55,0.12); }
+  body.ui-simple .cockpit .pose-card { order: 10; }
+  body.ui-simple .toasts { top: calc(var(--head-h) + 100px); } /* below the view switch and two HUD chip rows */
+}
 @media (max-width: 639px) {
   :root { --head-h: 56px; --disc: 160px; --stick: 112px; }
   #ck-safety { order: 10; }
@@ -1074,26 +1100,33 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   body.ui-simple .head-stats .sc-status-badge { display: inline-flex; height: 24px; border-radius: 12px; background: rgba(255,255,255,0.75); }
   body.ui-simple .speed-pill { height: 24px; border-radius: 12px; border-color: transparent; background: rgba(255,255,255,0.75); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); color: #1f2937; margin: 0; text-align: center; }
 
-  /* video HUD: tiny glass pills, bottom centre */
-  body.ui-simple .hud { top: auto; bottom: 12px; left: 50%; transform: translateX(-50%); }
+  /* video HUD: tiny glass pills at the bottom, in the band between the thumb controls (--band-l / --band-r: measured
+     by the layout script); the recognition popover opens above the joystick row */
+  body.ui-simple .hud { top: auto; bottom: 16px; left: var(--band-l, 176px); right: var(--band-r, 176px); transform: none; justify-content: center; align-items: flex-end; }
+  body.ui-simple.vis-open #det-ctl:not([hidden]) { position: fixed; top: auto; left: var(--pop-l, 50%); bottom: var(--pop-b, 200px); transform: translateX(-50%); max-width: var(--pop-w, 300px); }
+  body.ui-simple .grasp-bar { bottom: calc(16px + var(--hud-h, 28px) + 8px); left: calc((var(--band-l, 176px) + 100vw - var(--band-r, 176px)) / 2); max-width: calc(100vw - var(--band-l, 176px) - var(--band-r, 176px)); }
   body.ui-simple .hud::before { display: none; }
-  /* view switch: below the safety capsule (--safety-h is its measured height) */
+  /* view switch: below the safety capsule (--safety-h is its measured height), in the pose card's header row */
   body.ui-simple .view-switch {
-    position: fixed; z-index: 160; top: calc(8px + var(--safety-h, 50px) + 6px); left: max(12px, env(safe-area-inset-left));
+    position: fixed; z-index: 160; top: calc(8px + var(--safety-h, 50px) + 6px + 3px); left: calc(max(12px, env(safe-area-inset-left)) + 4px);
     background: rgba(255,255,255,0.3); border-color: rgba(255,255,255,0.45); box-shadow: 0 6px 18px rgba(0,0,0,0.18);
   }
   body.ui-simple .view-switch button[aria-checked="false"] { color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.4); }
-  body.ui-simple.v3-open .view-switch button[aria-checked="false"] { color: #1f2937; text-shadow: none; }
-  /* pose card: below the view switch; its canvas shrinks so the card ends above the left joystick */
+  body.ui-simple.v3-open .view-switch button[aria-checked="false"], body.ui-simple:not(.pc-nofit) .view-switch button[aria-checked="false"] { color: #1f2937; text-shadow: none; }
+  /* pose card: below the safety capsule, the view switch sits in its header (title and hint hidden: the switch says
+     Video | 3D). The canvas shrinks so the card ends above the left joystick (and the pose toggle when it is shown);
+     the layout script hides the card (.pc-nofit) when even the smallest canvas does not fit. */
   body.ui-simple .pose-card {
-    --pc-top: calc(8px + var(--safety-h, 50px) + 6px + 32px + 6px);
+    --pc-top: calc(8px + var(--safety-h, 50px) + 6px); --pc-btn: 0px;
     position: fixed; z-index: 155; top: var(--pc-top); left: max(12px, env(safe-area-inset-left)); width: 200px; box-sizing: border-box;
     padding: 2px 8px 6px; border-radius: 16px; background: rgba(255,255,255,0.72); border: 1px solid rgba(255,255,255,0.6);
     box-shadow: 0 6px 18px rgba(0,0,0,0.18); backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
   }
-  body.ui-simple .pose-card .pc-head { min-height: 26px; }
-  body.ui-simple .pose-card canvas { height: clamp(40px, calc(100dvh - var(--pc-top) - 36px - var(--disc) - 16px - 12px), 86px); background: rgba(255,255,255,0.5); }
-  body.ui-simple.v3-open .pose-card { display: none; }
+  body.ui-simple:not(.cart-view) .pose-card { --pc-btn: 54px; }
+  body.ui-simple .pose-card .pc-head { min-height: 32px; margin: 1px 0 3px; justify-content: flex-end; }
+  body.ui-simple .pose-card .pc-title, body.ui-simple .pose-card .pc-hint { display: none; }
+  body.ui-simple .pose-card canvas { height: clamp(32px, calc(100dvh - var(--pc-top) - 44px - var(--pc-btn) - var(--disc) - 16px - 10px), 86px); background: rgba(255,255,255,0.5); }
+  body.ui-simple.v3-open .pose-card, body.ui-simple.pc-nofit .pose-card { display: none; }
   body.ui-simple .hud .sc-status-badge { background: rgba(255,255,255,0.4); border-radius: 12px; box-shadow: none; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.4); }
 
   /* no cards: the cockpit dissolves into floating controls */
@@ -1165,7 +1198,7 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
     position: fixed; z-index: 150; right: max(16px, env(safe-area-inset-right)); bottom: 16px;
     display: flex; flex-direction: column; align-items: center; gap: 8px; width: 54px; height: auto;
   }
-  body.ui-simple .cluster #pad-sgrip { position: relative; }
+  body.ui-simple .cluster #pad-sgrip { position: relative; left: auto; bottom: auto; } /* not the .disc fixed offsets */
   body.ui-simple .grip-jog-readout {
     display: flex; flex-direction: column; align-items: center; gap: 2px; width: 54px;
     background: rgba(255,255,255,0.22); border: 1px solid rgba(255,255,255,0.45); border-radius: 10px;
@@ -1183,7 +1216,9 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   }
   body.ui-simple .move-hint.bad { color: #fde68a; }
   body.ui-simple .move-hint { top: 80px; }
-  body.ui-simple .toasts { top: 108px; }
+  /* between the left column and the presets (same span as the recognition popover) */
+  body.ui-simple .move-hint { left: var(--pop-l, 50%); max-width: var(--pop-w, calc(100vw - 24px)); white-space: normal; text-align: center; }
+  body.ui-simple .toasts { top: 130px; left: var(--pop-l, 50%); max-width: var(--pop-w, calc(100vw - 32px)); }
 }
 
 /* ---------- simple cockpit: pose toggle + XY pad (left), Z slider + gripper (right) ---------- */
@@ -1338,6 +1373,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           <button type="button" role="radio" id="vs-video" aria-checked="true" tabindex="0" data-i18n="vs.video">视频</button><button type="button" role="radio" id="vs-3d" aria-checked="false" tabindex="-1" aria-controls="view3d">3D</button>
         </div>
         <div class="hud">
+          <button class="btn det-btn vis-chip only-simple" id="btn-vis" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="det-ctl" hidden>识别</button>
           <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button><span class="seg seg-sm vmode" id="vmode" role="radiogroup" data-i18n-aria="vm.label" aria-label="视觉模式" hidden><button type="button" role="radio" data-vm="off" data-i18n="vm.off">关</button><button type="button" role="radio" data-vm="yolo" data-i18n="vm.yolo">YOLO</button><button type="button" role="radio" data-vm="aruco" data-i18n="vm.aruco">ArUco</button><button type="button" role="radio" data-vm="both" data-i18n="vm.both">两者</button></span><button class="btn det-btn det-trig" id="btn-trigger" type="button" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span><button class="btn det-btn det-gset" id="btn-gset" type="button" data-i18n="gset.open" hidden>抓取设置</button></span>
           <span class="sc-status-badge" id="cam-chip" data-i18n="v.chip.connecting">连接中</span>
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
@@ -1845,7 +1881,7 @@ const I18N = {
     'v.noservice': '未连接到视频服务', 'v.dropped': '视频流中断，正在重连…', 'v.cant_open': '视频源无法打开',
     'v.retry_sub': '网络抖动或视频暂未就绪 · {sec} 秒后自动重试（亦可点击重试）',
     'det.none': '检测 --', 'det.n': '检测 {n}',
-    'det.on': '识别 · 开', 'det.off': '识别 · 关', 'det.na': '识别 · 不可用',
+    'det.on': '识别 · 开', 'det.off': '识别 · 关', 'det.na': '识别 · 不可用', 'vis.tip': '识别选项：开关、模式、单次识别、抓取设置',
     'det.tip.on': '物体识别已开启，点击关闭', 'det.tip.off': '物体识别已关闭，点击开启',
     'det.tip.na': '识别服务不可用（检测程序未运行或版本过旧）', 'det.fail': '切换识别失败',
     'vm.label': '视觉模式', 'vm.off': '关', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco', 'vm.both': '两者',
@@ -2039,7 +2075,7 @@ const I18N = {
     'v.noservice': 'Video service not reachable', 'v.dropped': 'Video stream lost, reconnecting…', 'v.cant_open': 'Cannot open video source',
     'v.retry_sub': 'Network glitch or video not ready · retrying in {sec} s (or tap Retry)',
     'det.none': 'Det --', 'det.n': 'Det {n}',
-    'det.on': 'Detect · On', 'det.off': 'Detect · Off', 'det.na': 'Detect · N/A',
+    'det.on': 'Detect · On', 'det.off': 'Detect · Off', 'det.na': 'Detect · N/A', 'vis.tip': 'Detection options: on/off, mode, snapshot, grasp setup',
     'det.tip.on': 'Object detection is on. Click to turn it off', 'det.tip.off': 'Object detection is off. Click to turn it on',
     'det.tip.na': 'Detection service unavailable (detector not running or too old)', 'det.fail': 'Could not switch detection',
     'vm.label': 'Vision mode', 'vm.off': 'Off', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco', 'vm.both': 'Both',
@@ -3361,6 +3397,19 @@ function detApply(data) {
   if (DET.avail && !DET.enabled) detClearOverlay();
   renderDetToggle();
 }
+/* simple mode: recognition popover (#det-ctl) opened from the HUD chip; closes on the chip, an outside tap, a mode switch
+   (Escape stays the E-stop key) */
+function visPopOpen(open) {
+  const body = document.body, chip = $('btn-vis');
+  if (open === body.classList.contains('vis-open')) return;
+  body.classList.toggle('vis-open', open);
+  if (chip) chip.setAttribute('aria-expanded', String(open));
+}
+document.addEventListener('pointerdown', (e) => {
+  if (!document.body.classList.contains('vis-open')) return;
+  if (e.target.closest && e.target.closest('#det-ctl, #btn-vis')) return;
+  visPopOpen(false);
+}, true);
 function renderDetToggle() {
   const wrap = $('det-ctl'), btn = $('btn-det');
   if (!wrap || !btn) return;
@@ -3374,6 +3423,16 @@ function renderDetToggle() {
   wrap.title = t('det.tip.' + key);
   btn.setAttribute('aria-label', t('det.tip.' + key));
   btn.disabled = btn.disabled || DET.snap;
+  // simple mode: the HUD chip mirrors the Detect state and opens the recognition popover
+  const vis = $('btn-vis');
+  if (vis) {
+    vis.hidden = wrap.hidden;
+    setText(vis, btn.textContent);
+    vis.classList.toggle('btn-primary', !!(DET.avail && DET.enabled));
+    vis.title = t('vis.tip');
+    vis.setAttribute('aria-label', btn.textContent + ' · ' + t('vis.tip'));
+    if (wrap.hidden) visPopOpen(false);
+  }
 
   const trig = $('btn-trigger');
   if (trig) {
@@ -3541,6 +3600,7 @@ async function toggleDet() {
 }
 function initDetToggle() {
   $('btn-det').addEventListener('click', toggleDet);
+  $('btn-vis').addEventListener('click', () => visPopOpen(!document.body.classList.contains('vis-open')));
   $('btn-trigger').addEventListener('click', () => triggerDet());
   i18nHooks.push(renderDetToggle);
   // Polling picks up a detector that starts later and toggles made by agents over the API.
@@ -6196,6 +6256,7 @@ function setUi(ui) {
   }
   // simple mode always drives the TCP (cartesian); expert restores its own last choice
   // simple: safety lives inside the cockpit; expert: first card of the side column
+  if (ui !== 'simple') visPopOpen(false);
   if (ui === 'simple') $('ck-safety').appendChild($('safety'));
   else $('side').insertBefore($('safety'), $('side').firstChild);
   if (ui === 'simple') $('cockpit').insertBefore($('gc-banner'), $('cockpit').firstChild);
@@ -8212,7 +8273,9 @@ function frame(ts) {
   // video HUD
   const cam = $('cam-chip');
   const simple = S.ui === 'simple';
-  if (V.playing) { setText(cam, simple ? t('v.live') : t('v.live') + ' · ' + (MODE_LABEL[V.mode] || '')); setCls(cam, 'sc-status-badge is-ok'); }
+  // simple mode: one camera chip, live + rate + latency (expert: separate #vstat chip)
+  const camStat = V.mode === 'mjpeg' ? '' : ` · ${V.fps == null ? '--' : V.fps} fps · ${V.lat == null ? '--' : Math.round(V.lat)} ms`;
+  if (V.playing) { setText(cam, simple ? t('v.live') + camStat : t('v.live') + ' · ' + (MODE_LABEL[V.mode] || '')); setCls(cam, 'sc-status-badge is-ok'); }
   else { setText(cam, t('v.chip.connecting')); setCls(cam, 'sc-status-badge is-warn'); }
   const vs = $('vstat');
   vs.hidden = !V.playing || (V.mode === 'mjpeg' && simple);
@@ -9343,10 +9406,40 @@ applyI18n();
   if (!tb || !safety) return;
   const hit = (a, b) => !(a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top);
   let busy = false;
+  const root = document.documentElement, hud = document.querySelector('.hud');
+  const shown = (el) => { if (!el) return null; const r = el.getBoundingClientRect(); return r.width && r.height ? r : null; };
+  /* simple landscape: the HUD band between the thumb controls, the recognition popover above the joystick row,
+     the pose card only when its smallest canvas still ends above the left joystick (or the pose toggle) */
+  function placeThumbs() {
+    body.classList.remove('pc-nofit');
+    const L = ['pad-sxy', 'btn-pose'].map((id) => shown(document.getElementById(id))).filter(Boolean);
+    const R = ['pad-srot', 'pad-sz', 'pad-sgrip', 's-grip-readout'].map((id) => shown(document.getElementById(id))).filter(Boolean);
+    const W = innerWidth, H = innerHeight, gap = 12;
+    const bandL = L.length ? Math.max(...L.map((r) => r.right)) + gap : gap;
+    const bandR = R.length ? W - Math.min(...R.map((r) => r.left)) + gap : gap;
+    root.style.setProperty('--band-l', Math.round(bandL) + 'px');
+    root.style.setProperty('--band-r', Math.round(bandR) + 'px');
+    const hr = shown(hud);
+    root.style.setProperty('--hud-h', Math.round(hr ? hr.height : 28) + 'px');
+    const pc = document.getElementById('pose-card'), pr = shown(pc);
+    const lTop = L.length ? Math.min(...L.map((r) => r.top)) : H;
+    if (pr && pr.bottom + 6 > lTop) body.classList.add('pc-nofit');
+    // popover: centred between the left column and the presets, above every joystick / slider under it
+    const leftCol = [document.querySelector('.safety'), body.classList.contains('pc-nofit') ? null : pc, document.getElementById('view-switch')]
+      .map(shown).filter(Boolean).reduce((m, r) => Math.max(m, r.right), 0);
+    const presets = shown(document.querySelector('.presets'));
+    const lo = leftCol + 8, hi = (presets ? presets.left : W) - 8;
+    const rowTop = Math.min(H, ...[...L, ...R, hr].filter((r) => r && r.right > lo && r.left < hi).map((r) => r.top));
+    root.style.setProperty('--pop-l', Math.round((lo + hi) / 2) + 'px');
+    root.style.setProperty('--pop-w', Math.max(160, Math.round(hi - lo)) + 'px');
+    root.style.setProperty('--pop-b', Math.round(H - rowTop + 8) + 'px');
+  }
   function place() {
     if (busy) return; busy = true;
     try {
       body.classList.remove('tb-compact-1', 'tb-compact-2');
+      if (body.classList.contains('ui-simple') && getComputedStyle(tb).position === 'fixed') placeThumbs();
+      else body.classList.remove('pc-nofit');
       tb.style.left = ''; tb.style.top = ''; tb.style.transform = '';
       if (!body.classList.contains('ui-simple') || getComputedStyle(tb).position !== 'fixed') return;
       const gap = 8;
@@ -9371,8 +9464,8 @@ applyI18n();
     } finally { busy = false; }
   }
   const ro = new ResizeObserver(() => requestAnimationFrame(place));
-  [safety, tb, presets].forEach(el => el && ro.observe(el));
-  const baseClass = () => body.className.replace(/\btb-compact-\d\b/g, '').trim();
+  [safety, tb, presets, hud].forEach(el => el && ro.observe(el));
+  const baseClass = () => body.className.replace(/\b(tb-compact-\d|pc-nofit|vis-open)\b/g, '').replace(/\s+/g, ' ').trim();
   let lastClass = baseClass();
   new MutationObserver(() => { const c = baseClass(); if (c !== lastClass) { lastClass = c; requestAnimationFrame(place); } })
     .observe(body, { attributes: true, attributeFilter: ['class'] });
