@@ -199,6 +199,21 @@ cp -r "${PACKAGING_DIR}/rootfs/usr/share/rebot-teleop/"* "${STAGING_DIR}/usr/sha
 # Arm profile of the kit (loaded by the init script with --config)
 mkdir -p "${STAGING_DIR}/usr/share/rebot-teleop/profile"
 cp -f "${REPO_ROOT}/kits/recamera-b601dm/profile/rebot-b601dm.json" "${STAGING_DIR}/usr/share/rebot-teleop/profile/rebot-b601dm.json"
+if [ -f "${REPO_ROOT}/profiles/so_arm101.json" ]; then
+    cp -f "${REPO_ROOT}/profiles/so_arm101.json" "${STAGING_DIR}/usr/share/rebot-teleop/profile/so_arm101.json"
+fi
+if [ -f "${REPO_ROOT}/profiles/so_arm100.json" ]; then
+    cp -f "${REPO_ROOT}/profiles/so_arm100.json" "${STAGING_DIR}/usr/share/rebot-teleop/profile/so_arm100.json"
+fi
+
+# Visual models and meshes (URDF + rbm1 binary bundle)
+mkdir -p "${STAGING_DIR}/usr/share/rebot-teleop/assets/so101_meshes"
+if [ -f "${REPO_ROOT}/assets/so101_new_calib.urdf" ]; then
+    cp -f "${REPO_ROOT}/assets/so101_new_calib.urdf" "${STAGING_DIR}/usr/share/rebot-teleop/assets/so101_new_calib.urdf"
+fi
+if [ -d "${REPO_ROOT}/assets/so101_meshes" ]; then
+    cp -rf "${REPO_ROOT}/assets/so101_meshes/"* "${STAGING_DIR}/usr/share/rebot-teleop/assets/so101_meshes/"
+fi
 
 # Ensure web UI index.html is present in usr/share/rebot-teleop
 if [ -f "${REPO_ROOT}/src/api/index.html" ]; then

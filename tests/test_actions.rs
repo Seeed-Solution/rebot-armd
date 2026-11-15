@@ -97,7 +97,7 @@ fn unreachable_goal_fails_planning_without_motion() {
 fn path_into_the_floor_is_rejected_by_the_workspace_rule() {
     let inner = sim_at(&INSPECT);
     let input = inner.plan_input().unwrap();
-    let down = |dz: f64| GoalSpec::Relative { frame: RelFrame::Base, d: [0.0, 0.0, dz], dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false };
+    let down = |dz: f64| GoalSpec::Relative { frame: RelFrame::Base, d: [0.0, 0.0, dz], dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false, auto_yaw: None };
     plan_cartesian(&input, resolve_goal(&input, &down(-0.24)), Speed::default()).expect("0.24 m down stays above the floor");
     let err = plan_cartesian(&input, resolve_goal(&input, &down(-0.29)), Speed::default()).unwrap_err();
     assert_eq!(err.code(), "WORKSPACE_VIOLATION", "{err}");
@@ -111,27 +111,27 @@ fn camera_frame_forward_moves_along_the_optical_axis() {
     let start = tcp(&INSPECT);
     let rec = kinematics::cam_mount(false, 0.0, 0.0);
     let z_cam = kinematics::column(&kinematics::cam_rotation(&start, &rec), 2);
-    let spec = GoalSpec::Relative { frame: RelFrame::Camera, d: [0.0, 0.0, 0.05], dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false };
+    let spec = GoalSpec::Relative { frame: RelFrame::Camera, d: [0.0, 0.0, 0.05], dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false, auto_yaw: None };
     let goal = resolve_goal(&input, &spec);
     let d = kinematics::sub(&goal.p, &start.p);
     assert!((kinematics::dot(&d, &z_cam) / kinematics::norm(&d) - 1.0).abs() < 1e-9 && (kinematics::norm(&d) - 0.05).abs() < 1e-9);
     // look down: optical axis drops, position kept
-    let spec = GoalSpec::Relative { frame: RelFrame::Camera, d: [0.0; 3], dyaw: 0.0, dpitch: 0.2, droll: 0.0, level: true };
+    let spec = GoalSpec::Relative { frame: RelFrame::Camera, d: [0.0; 3], dyaw: 0.0, dpitch: 0.2, droll: 0.0, level: true, auto_yaw: None };
     let goal = resolve_goal(&input, &spec);
     let z1 = kinematics::column(&kinematics::cam_rotation(&goal, &rec), 2);
     assert!(z1[2] < z_cam[2] && kinematics::norm(&kinematics::sub(&goal.p, &start.p)) < 1e-12);
     let x1 = kinematics::column(&kinematics::cam_rotation(&goal, &rec), 0);
     assert!(x1[2].abs() < 1e-9, "auto-level keeps x_cam horizontal");
     // look right: heading turns clockwise seen from above
-    let spec = GoalSpec::Relative { frame: RelFrame::Camera, d: [0.0; 3], dyaw: 0.2, dpitch: 0.0, droll: 0.0, level: true };
+    let spec = GoalSpec::Relative { frame: RelFrame::Camera, d: [0.0; 3], dyaw: 0.2, dpitch: 0.0, droll: 0.0, level: true, auto_yaw: None };
     let z2 = kinematics::column(&kinematics::cam_rotation(&resolve_goal(&input, &spec), &rec), 2);
     assert!(z2[1].atan2(z2[0]) < z_cam[1].atan2(z_cam[0]));
     // base frame pitch: positive tips the tool down
-    let spec = GoalSpec::Relative { frame: RelFrame::Base, d: [0.0; 3], dyaw: 0.0, dpitch: 0.1, droll: 0.0, level: false };
+    let spec = GoalSpec::Relative { frame: RelFrame::Base, d: [0.0; 3], dyaw: 0.0, dpitch: 0.1, droll: 0.0, level: false, auto_yaw: None };
     let x_tool = kinematics::column(&resolve_goal(&input, &spec).r, 0);
     assert!(x_tool[2] < kinematics::column(&start.r, 0)[2]);
     // tool frame translation along tool x
-    let spec = GoalSpec::Relative { frame: RelFrame::Tool, d: [0.02, 0.0, 0.0], dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false };
+    let spec = GoalSpec::Relative { frame: RelFrame::Tool, d: [0.02, 0.0, 0.0], dyaw: 0.0, dpitch: 0.0, droll: 0.0, level: false, auto_yaw: None };
     let d = kinematics::sub(&resolve_goal(&input, &spec).p, &start.p);
     assert!((kinematics::dot(&d, &kinematics::column(&start.r, 0)) - 0.02).abs() < 1e-12);
 }
@@ -236,7 +236,7 @@ struct Blocked { q: Vec<f32>, enabled: EnableState }
 struct BlockedDriver(Arc<Mutex<Blocked>>);
 impl ArmDriver for BlockedDriver {
     fn capabilities(&self) -> DriverCapabilities {
-        DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true }
+        DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true, load_feedback: false }
     }
     fn enable_state(&self) -> EnableState { self.0.lock().unwrap().enabled }
     fn is_feedback_valid(&self) -> bool { true }
@@ -286,7 +286,7 @@ fn bench_plan() {
     for (name, spec) in [
         ("0.05 m", GoalSpec::Absolute { p: [p0[0] + 0.05, p0[1], p0[2]], r: None }),
         ("0.20 m", GoalSpec::Absolute { p: [p0[0] + 0.08, p0[1] + 0.15, p0[2] - 0.08], r: None }),
-        ("45 deg look", GoalSpec::Relative { frame: RelFrame::Camera, d: [0.0; 3], dyaw: 0.785, dpitch: 0.0, droll: 0.0, level: true }),
+        ("45 deg look", GoalSpec::Relative { frame: RelFrame::Camera, d: [0.0; 3], dyaw: 0.785, dpitch: 0.0, droll: 0.0, level: true, auto_yaw: None }),
     ] {
         let goal = resolve_goal(&input, &spec);
         let runs = 10;

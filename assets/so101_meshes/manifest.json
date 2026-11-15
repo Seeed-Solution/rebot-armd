@@ -1,0 +1,295 @@
+{
+ "source": "TheRobotStudio/SO-ARM100 / Seeed Studio SO-101",
+ "note": "visual meshes decimated for web cockpit 3D view; layout in scripts/decimate_meshes.py",
+ "format": "rbm1",
+ "file": "arm.bin",
+ "bytes": 521856,
+ "links": {
+  "base_motor_holder_so101_v1": [
+   {
+    "part": "base_motor_holder_so101_v1",
+    "rgb": [
+     1.0,
+     0.82,
+     0.12
+    ],
+    "offset": 0,
+    "verts": 791,
+    "faces": 1608,
+    "index_bytes": 2,
+    "bbox": [
+     -0.02235,
+     0.0381008,
+     -0.0208,
+     0.0252746,
+     0.0694986,
+     0.0593896
+    ]
+   }
+  ],
+  "base_so101_v2": [
+   {
+    "part": "base_so101_v2",
+    "rgb": [
+     1.0,
+     0.82,
+     0.12
+    ],
+    "offset": 14396,
+    "verts": 2620,
+    "faces": 5526,
+    "index_bytes": 2,
+    "bbox": [
+     -0.0554625,
+     0.0,
+     -0.016,
+     0.0554625,
+     0.072,
+     0.071
+    ]
+   }
+  ],
+  "motor_holder_so101_base_v1": [
+   {
+    "part": "motor_holder_so101_base_v1",
+    "rgb": [
+     1.0,
+     0.82,
+     0.12
+    ],
+    "offset": 63272,
+    "verts": 1068,
+    "faces": 2226,
+    "index_bytes": 2,
+    "bbox": [
+     -0.0538499,
+     -0.0550023,
+     -0.0288279,
+     -0.0258499,
+     -0.017,
+     0.0262
+    ]
+   }
+  ],
+  "motor_holder_so101_wrist_v1": [
+   {
+    "part": "motor_holder_so101_wrist_v1",
+    "rgb": [
+     1.0,
+     0.82,
+     0.12
+    ],
+    "offset": 83036,
+    "verts": 1101,
+    "faces": 2294,
+    "index_bytes": 2,
+    "bbox": [
+     -0.0538499,
+     -0.0538656,
+     -0.0301909,
+     -0.0258499,
+     -0.017,
+     0.0262
+    ]
+   }
+  ],
+  "moving_jaw_so101_v1": [
+   {
+    "part": "moving_jaw_so101_v1",
+    "rgb": [
+     1.0,
+     0.82,
+     0.12
+    ],
+    "offset": 103408,
+    "verts": 2089,
+    "faces": 4270,
+    "index_bytes": 2,
+    "bbox": [
+     -0.0123,
+     -0.082,
+     -0.024,
+     0.009998,
+     0.0099947,
+     0.024
+    ]
+   }
+  ],
+  "rotation_pitch_so101_v1": [
+   {
+    "part": "rotation_pitch_so101_v1",
+    "rgb": [
+     1.0,
+     0.82,
+     0.12
+    ],
+    "offset": 141564,
+    "verts": 2808,
+    "faces": 5706,
+    "index_bytes": 2,
+    "bbox": [
+     -0.0598,
+     0.0002,
+     -0.023,
+     0.0,
+     0.0844,
+     0.023
+    ]
+   }
+  ],
+  "sts3215_03a_no_horn_v1": [
+   {
+    "part": "sts3215_03a_no_horn_v1",
+    "rgb": [
+     0.12,
+     0.12,
+     0.14
+    ],
+    "offset": 192648,
+    "verts": 1151,
+    "faces": 2404,
+    "index_bytes": 2,
+    "bbox": [
+     -0.0227,
+     -0.0124,
+     -0.0194,
+     0.0227,
+     0.0124,
+     0.0202
+    ]
+   }
+  ],
+  "sts3215_03a_v1": [
+   {
+    "part": "sts3215_03a_v1",
+    "rgb": [
+     0.12,
+     0.12,
+     0.14
+    ],
+    "offset": 213980,
+    "verts": 1449,
+    "faces": 3016,
+    "index_bytes": 2,
+    "bbox": [
+     -0.0227,
+     -0.0124,
+     -0.0194,
+     0.0227,
+     0.0124,
+     0.0202
+    ]
+   }
+  ],
+  "under_arm_so101_v1": [
+   {
+    "part": "under_arm_so101_v1",
+    "rgb": [
+     1.0,
+     0.82,
+     0.12
+    ],
+    "offset": 240772,
+    "verts": 4319,
+    "faces": 8778,
+    "index_bytes": 2,
+    "bbox": [
+     -0.0538499,
+     -0.044,
+     -0.0342,
+     0.0768499,
+     -0.02,
+     0.0302
+    ]
+   }
+  ],
+  "upper_arm_so101_v1": [
+   {
+    "part": "upper_arm_so101_v1",
+    "rgb": [
+     1.0,
+     0.82,
+     0.12
+    ],
+    "offset": 319356,
+    "verts": 4194,
+    "faces": 8530,
+    "index_bytes": 2,
+    "bbox": [
+     -0.065085,
+     -0.0,
+     -0.0356,
+     0.077085,
+     0.0245,
+     0.0317
+    ]
+   }
+  ],
+  "waveshare_mounting_plate_so101_v2": [
+   {
+    "part": "waveshare_mounting_plate_so101_v2",
+    "rgb": [
+     1.0,
+     0.82,
+     0.12
+    ],
+    "offset": 395700,
+    "verts": 301,
+    "faces": 614,
+    "index_bytes": 2,
+    "bbox": [
+     -0.0255,
+     -0.021,
+     0.0,
+     0.0255,
+     0.021,
+     0.0076
+    ]
+   }
+  ],
+  "wrist_roll_follower_so101_v1": [
+   {
+    "part": "wrist_roll_follower_so101_v1",
+    "rgb": [
+     1.0,
+     0.82,
+     0.12
+    ],
+    "offset": 401192,
+    "verts": 2919,
+    "faces": 5958,
+    "index_bytes": 2,
+    "bbox": [
+     -0.0352,
+     -0.0242182,
+     -5.03e-05,
+     0.03,
+     0.0277818,
+     0.1053616
+    ]
+   }
+  ],
+  "wrist_roll_pitch_so101_v2": [
+   {
+    "part": "wrist_roll_pitch_so101_v2",
+    "rgb": [
+     1.0,
+     0.82,
+     0.12
+    ],
+    "offset": 454456,
+    "verts": 3685,
+    "faces": 7548,
+    "index_bytes": 2,
+    "bbox": [
+     -0.0271,
+     -0.0199948,
+     -0.0378284,
+     0.0352,
+     0.0156598,
+     0.0399969
+    ]
+   }
+  ]
+ }
+}

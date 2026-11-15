@@ -25,9 +25,7 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import meshoptimizer as mo
 import numpy as np
-import trimesh
 
 TOL_MM = 0.5
 BIN = "arm.bin"
@@ -35,7 +33,10 @@ BIN = "arm.bin"
 LINK_MAP = {"finger_left_link": "left_finger", "finger_right_link": "right_finger"}
 
 
-def simplify(m: trimesh.Trimesh) -> trimesh.Trimesh:
+def simplify(m):
+    import meshoptimizer as mo
+    import trimesh
+
     v = np.ascontiguousarray(m.vertices, dtype=np.float32)
     idx = np.ascontiguousarray(m.faces.reshape(-1), dtype=np.uint32)
     out = np.zeros_like(idx)
@@ -51,7 +52,8 @@ def simplify(m: trimesh.Trimesh) -> trimesh.Trimesh:
     return trimesh.Trimesh(m.vertices[used], remap[tri].reshape(-1, 3), process=False)
 
 
-def deviation_mm(a: trimesh.Trimesh, b: trimesh.Trimesh, n: int = 8000) -> tuple[float, float]:
+def deviation_mm(a, b, n: int = 8000) -> tuple[float, float]:
+    import trimesh
     d = []
     for x, y in ((a, b), (b, a)):
         p, _ = trimesh.sample.sample_surface(x, n, seed=0)
@@ -61,6 +63,7 @@ def deviation_mm(a: trimesh.Trimesh, b: trimesh.Trimesh, n: int = 8000) -> tuple
 
 
 def main(src: Path, dst: Path) -> None:
+    import trimesh
     urdf = ET.parse(src / "urdf" / "ReBot_Arm_DM.urdf").getroot()
     colours = {}
     for m in urdf.iter("material"):
@@ -116,5 +119,97 @@ def main(src: Path, dst: Path) -> None:
     print(f"total {faces_in_total} -> {faces_out_total} faces, {BIN} {len(blob)} bytes")
 
 
+def decimate_so101(src_dir: Path, dst_dir: Path, grid_size: float = 0.0008) -> None:
+    """Decimate SO-101 STL meshes into rbm1 arm.bin and manifest.json without non-numpy deps."""
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    stl_files = [
+        "base_motor_holder_so101_v1.stl",
+        "base_so101_v2.stl",
+        "motor_holder_so101_base_v1.stl",
+        "motor_holder_so101_wrist_v1.stl",
+        "moving_jaw_so101_v1.stl",
+        "rotation_pitch_so101_v1.stl",
+        "sts3215_03a_no_horn_v1.stl",
+        "sts3215_03a_v1.stl",
+        "under_arm_so101_v1.stl",
+        "upper_arm_so101_v1.stl",
+        "waveshare_mounting_plate_so101_v2.stl",
+        "wrist_roll_follower_so101_v1.stl",
+        "wrist_roll_pitch_so101_v2.stl",
+    ]
+
+    def load_stl(p: Path) -> np.ndarray:
+        with open(p, "rb") as f:
+            f.seek(80)
+            n = int(np.fromfile(f, dtype="<u4", count=1)[0])
+            data = np.fromfile(
+                f,
+                dtype=np.dtype([("norm", "<f4", 3), ("v", "<f4", (3, 3)), ("attr", "<u2")]),
+                count=n,
+            )
+        return data["v"].reshape(-1, 3)
+
+    links, blob = {}, bytearray()
+    faces_in_total, faces_out_total = 0, 0
+    for name in stl_files:
+        base = name.removesuffix(".stl")
+        pts = load_stl(src_dir / name)
+        faces_in_total += len(pts) // 3
+        grid = np.round(pts / grid_size).astype(np.int64)
+        _, inverse = np.unique(grid, axis=0, return_inverse=True)
+        num_u = inverse.max() + 1
+        sums = np.zeros((num_u, 3), dtype=np.float64)
+        cnt = np.zeros(num_u, dtype=np.int64)
+        np.add.at(sums, inverse, pts)
+        np.add.at(cnt, inverse, 1)
+        uniq_v = (sums / cnt[:, None]).astype(np.float32)
+        faces = inverse.reshape(-1, 3)
+        valid = (faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2]) & (faces[:, 0] != faces[:, 2])
+        faces = faces[valid]
+        used, remap = np.unique(faces, return_inverse=True)
+        v = uniq_v[used]
+        faces = remap.reshape(-1, 3)
+        faces_out_total += len(faces)
+
+        lo, hi = v.min(0), v.max(0)
+        span = np.where(hi > lo, hi - lo, 1.0)
+        q = np.round((v - lo) / span * 65535).astype("<u2")
+        itype = "<u2" if len(q) <= 65536 else "<u4"
+        offset = len(blob)
+        blob += q.tobytes()
+        blob += b"\0" * (-len(blob) % 4)
+        blob += faces.astype(itype).tobytes()
+        blob += b"\0" * (-len(blob) % 4)
+
+        rgb = [0.12, 0.12, 0.14] if "sts3215" in base else [1.0, 0.82, 0.12]
+        links[base] = [{
+            "part": base,
+            "rgb": rgb,
+            "offset": offset,
+            "verts": len(q),
+            "faces": len(faces),
+            "index_bytes": 2 if itype == "<u2" else 4,
+            "bbox": [round(float(x), 7) for x in (*lo, *hi)],
+        }]
+        print(f"{base:36s} {len(pts)//3:6d} -> {len(faces):5d} faces  offset {offset}")
+
+    (dst_dir / BIN).write_bytes(bytes(blob))
+    manifest = {
+        "source": "TheRobotStudio/SO-ARM100 / Seeed Studio SO-101",
+        "note": "visual meshes decimated for web cockpit 3D view; layout in scripts/decimate_meshes.py",
+        "format": "rbm1",
+        "file": BIN,
+        "bytes": len(blob),
+        "links": links,
+    }
+    (dst_dir / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    print(f"total {faces_in_total} -> {faces_out_total} faces, {BIN} {len(blob)} bytes")
+
+
 if __name__ == "__main__":
-    main(Path(sys.argv[1]), Path(sys.argv[2]))
+    if len(sys.argv) > 1 and sys.argv[1] == "--so101":
+        src = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("assets/so101")
+        dst = Path(sys.argv[3]) if len(sys.argv) > 3 else Path("assets/so101_meshes")
+        decimate_so101(src, dst)
+    else:
+        main(Path(sys.argv[1]), Path(sys.argv[2]))

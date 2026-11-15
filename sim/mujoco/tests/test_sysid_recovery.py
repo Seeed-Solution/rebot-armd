@@ -159,7 +159,8 @@ def test_unload_refused_when_home_jog_ends_outside_tolerance(rig, tmp_path):
         def jog(self, positions, duration=None):  # the home jog stops 0.2 rad short on J2
             super().jog(positions, duration)
             if positions[1] == HOME[1]:
-                q = list(self.obs["positions"]); q[1] -= 0.2
+                q = list(self.obs["positions"])
+                q[1] -= 0.2
                 self.obs = {**self.obs, "positions": q}
     link = rig(Short(), SCHEMA)
     with pytest.raises(sysid.SysidError, match="not unloading.*not within the resting tolerances"):

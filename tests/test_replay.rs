@@ -48,7 +48,7 @@ impl LagArm {
 
 impl ArmDriver for LagArm {
     fn capabilities(&self) -> DriverCapabilities {
-        DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true }
+        DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true, load_feedback: false }
     }
     fn enable_state(&self) -> EnableState { if self.0.lock().unwrap().torqued { EnableState::Enabled } else { EnableState::Disabled } }
     fn is_feedback_valid(&self) -> bool { true }

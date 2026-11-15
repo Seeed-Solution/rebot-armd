@@ -157,6 +157,7 @@ struct PendingPlan {
     goal: crate::kinematics::Pose,
     speed: crate::motion::Speed,
     tag: Option<String>,
+    yaw_free: bool,
 }
 
 enum ActionStart { Started(u64, f64), Plan(PendingPlan), Macro(PendingMacro), Replay(crate::replay::ReplayInput), DryRunGrasp(Value) }
@@ -164,6 +165,7 @@ enum ActionStart { Started(u64, f64), Plan(PendingPlan), Macro(PendingMacro), Re
 /// A macro action (crate::macro_action) checked under the lock, planned without it.
 enum PendingMacro { Grasp(crate::grasp::PendingGrasp), Place(crate::place::PendingPlace) }
 
+#[allow(clippy::large_enum_variant)]
 enum PlannedMacro { Grasp(crate::grasp::PlannedGrasp), Place(crate::place::PlannedPlace) }
 
 impl PendingMacro {
@@ -229,8 +231,8 @@ fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: 
     };
     let (spec, speed, tag) = parsed.map_err(ArmError::from)?;
     let input = inner.plan_input()?;
-    let goal = motion::resolve_goal(&input, &spec);
-    Ok(ActionStart::Plan(PendingPlan { request_id: request_id.clone(), kind, input, goal, speed, tag }))
+    let (goal, yaw_free) = motion::resolve_goal_ex(&input, &spec);
+    Ok(ActionStart::Plan(PendingPlan { request_id: request_id.clone(), kind, input, goal, speed, tag, yaw_free }))
 }
 
 fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) -> Value {
@@ -558,9 +560,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 // Cartesian plan: IK runs on a blocking thread without the supervisor lock,
                 // so the control tick is never blocked by it; install re-checks everything.
                 if let Some((plan, generation)) = pending_plan.take() {
-                    let PendingPlan { request_id, kind, input, goal, speed, tag } = plan;
+                    let PendingPlan { request_id, kind, input, goal, speed, tag, yaw_free } = plan;
                     let planned = tokio::task::spawn_blocking(move || {
-                        let result = motion::plan_cartesian(&input, goal, speed);
+                        let result = motion::plan_cartesian_ex(&input, goal, speed, yaw_free);
                         (input, result)
                     }).await;
                     let mut inner = recv_supervisor.inner().write().await;

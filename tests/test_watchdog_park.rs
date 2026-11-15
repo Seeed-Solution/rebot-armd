@@ -10,8 +10,8 @@ use armd::{ArmSupervisor, SafetyState};
 const LEASE_MS: u64 = 50;
 
 fn policy(dof: usize) -> RestingPosePolicy {
-    RestingPosePolicy { position_tolerances: vec![0.08; dof], max_total_deviation: 0.08 * dof as f32,
-        max_velocity: 0.015, joint_max_velocities: vec![], support_torque_limits: vec![(0, 1.0)], feedback_max_age_ms: 100 }
+    RestingPosePolicy { positions: None, position_tolerances: vec![0.08; dof], max_total_deviation: 0.08 * dof as f32,
+        max_velocity: 0.015, joint_max_velocities: vec![], support_torque_limits: vec![(0, 1.0)], support_load_limits: vec![], feedback_max_age_ms: 100 }
 }
 
 fn sim_config(resting_pose: bool) -> ArmConfig {
@@ -147,7 +147,7 @@ struct Driver(Arc<Mutex<Hardware>>);
 impl ArmDriver for Driver {
     fn capabilities(&self) -> DriverCapabilities {
         DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true,
-            torque_feedforward: true, enable_feedback: true }
+            torque_feedforward: true, enable_feedback: true, load_feedback: false }
     }
     fn enable_state(&self) -> EnableState { self.0.lock().unwrap().enabled }
     fn is_feedback_valid(&self) -> bool { self.0.lock().unwrap().age.is_some_and(|a| a <= Duration::from_millis(250)) }

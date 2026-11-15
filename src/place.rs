@@ -39,6 +39,7 @@ pub struct PlaceRequest {
     pub approach_m: f64,
     pub release: bool,
     pub retreat: bool,
+    pub auto_yaw: Option<bool>,
     pub speed_scale: f64,
     pub tag: Option<String>,
 }
@@ -66,7 +67,7 @@ pub fn parse_place(inner: &SupervisorInner, body: &Value) -> Result<PlaceRequest
         let tcp = match (inner.config.arm_model.fk_f32(&stored.positions), &stored.tcp) {
             (Some(pose), _) => pose,
             (None, Some(t)) => Pose::new(kinematics::rpy_to_r(t.rpy[0], t.rpy[1], t.rpy[2]), t.position),
-            (None, None) if stored.positions.len() >= 6 => return Err(invalid(format!("pose '{name}' positions are not a valid joint vector"))),
+            (None, None) if stored.positions.len() >= inner.config.arm_dof() => return Err(invalid(format!("pose '{name}' positions are not a valid joint vector"))),
             (None, None) => return Err(invalid(format!("pose '{name}' has no TCP"))),
         };
         (Some(name.to_string()), tcp.p, Some(requested.unwrap_or(tcp.r)))
@@ -77,11 +78,17 @@ pub fn parse_place(inner: &SupervisorInner, body: &Value) -> Result<PlaceRequest
     if !(APPROACH_RANGE_M.0..=APPROACH_RANGE_M.1).contains(&approach_m) {
         return Err(invalid(format!("approach_height_m must be in [{}, {}]", APPROACH_RANGE_M.0, APPROACH_RANGE_M.1)));
     }
+    let auto_yaw = match body.get("auto_yaw") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => return Err(invalid("auto_yaw must be boolean")),
+    };
     let speed_scale = crate::poses::speed_scale(body)?;
     Ok(PlaceRequest {
         pose, target, orientation, approach_m,
         release: motion::flag(body, "release", true)?,
         retreat: motion::flag(body, "retreat", true)?,
+        auto_yaw,
         speed_scale,
         tag: motion::tag(body)?,
     })
@@ -97,6 +104,7 @@ pub struct PendingPlace {
 }
 
 /// A place whose phases were found feasible from the start state.
+#[derive(Debug)]
 pub struct PlannedPlace {
     pub input: PlanInput,
     pub request: PlaceRequest,
@@ -110,8 +118,8 @@ pub struct PlannedPlace {
 /// Under the lock: parse and check preconditions.
 pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<PendingPlace, ArmError> {
     if !body.is_object() { return Err(invalid("Command body must be an object")); }
-    if !inner.config.six_plus_gripper() || inner.config.kinematics.is_none() {
-        return Err(MotionError::Unsupported("Place needs a 7-DOF profile with kinematics and a gripper policy".into()).into());
+    if !inner.config.has_cartesian_with_gripper() || inner.config.kinematics.is_none() {
+        return Err(MotionError::Unsupported("Place needs an arm with kinematics and a gripper policy".into()).into());
     }
     let Some(policy) = inner.config.gripper_policy.as_ref() else {
         return Err(MotionError::Unsupported("Place needs a gripper policy".into()).into());
@@ -138,6 +146,13 @@ pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
     let speed = request.speed();
     let start = input.arm.fk(&input.q0);
     let mut r_place = request.orientation.unwrap_or(start.r);
+    let is_5dof = input.arm.arm_dof() == 5;
+    let yaw_free = is_5dof && request.auto_yaw.unwrap_or(request.orientation.is_none());
+    if yaw_free && request.orientation.is_none() && request.pose.is_none() {
+        r_place = motion::apply_auto_yaw(&start.p, &request.target, r_place);
+    } else if yaw_free && request.orientation.is_some() {
+        r_place = motion::align_auto_yaw(&request.target, r_place);
+    }
     let mut orientation_levelled = false;
     if held_spill_safe {
         let tool_z = kinematics::column(&r_place, 0)[2];
@@ -149,7 +164,7 @@ pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
     }
     let mut cur = input.clone();
     let step = |cur: &mut PlanInput, goal: Pose| -> Result<f64, ArmError> {
-        let path = motion::plan_cartesian(cur, goal, speed)?;
+        let path = motion::plan_cartesian_ex(cur, goal, speed, yaw_free)?;
         let last = path.last();
         cur.q0 = std::array::from_fn(|i| f64::from(last[i]));
         Ok(path.duration)
@@ -157,7 +172,8 @@ pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
     let z = lift_z(start.p[2], &request);
     let lift = if z - start.p[2] > LIFT_EPS_M { step(&mut cur, Pose::new(start.r, [start.p[0], start.p[1], z]))? } else { 0.0 };
     let approach = step(&mut cur, Pose::new(r_place, above(&request)))?;
-    let descend = step(&mut cur, Pose::new(r_place, request.target))?;
+    let r_descend = if yaw_free && request.orientation.is_none() { cur.arm.fk(&cur.q0).r } else { r_place };
+    let descend = step(&mut cur, Pose::new(r_descend, request.target))?;
     if request.release { cur.j7 = open_rad; }
     // as the runtime phase: straight up by approach_m from where descend ended, same orientation
     let retreat = if request.retreat {
@@ -202,26 +218,29 @@ pub fn spawn(supervisor: Arc<ArmSupervisor>, id: u64, planned: PlannedPlace) {
 async fn phases(ctx: &MacroCtx, planned: &PlannedPlace) -> Result<(), Stop> {
     let req = &planned.request;
     let speed = req.speed();
+    let is_5dof = planned.input.arm.arm_dof() == 5;
+    let yaw_free = is_5dof && req.auto_yaw.unwrap_or(req.orientation.is_none());
 
     ctx.phase("lift", 0.05).await?;
     let p = ctx.pose().await.p;
     let z = lift_z(p[2], req);
     if z - p[2] > LIFT_EPS_M {
-        ctx.move_arm("lift", GoalSpec::Absolute { p: [p[0], p[1], z], r: None }, speed).await?;
+        ctx.move_arm("lift", GoalSpec::AbsoluteEx { p: [p[0], p[1], z], r: None, auto_yaw: yaw_free }, speed).await?;
     }
 
     ctx.phase("approach", 0.2).await?;
-    ctx.move_arm("approach", GoalSpec::Absolute { p: above(req), r: Some(planned.r_place) }, speed).await?;
+    ctx.move_arm("approach", GoalSpec::AbsoluteEx { p: above(req), r: Some(planned.r_place), auto_yaw: yaw_free }, speed).await?;
 
     ctx.phase("descend", 0.55).await?;
-    ctx.move_arm("descend", GoalSpec::Absolute { p: req.target, r: Some(planned.r_place) }, speed).await?;
+    let r_descend = if yaw_free && req.orientation.is_none() { None } else { Some(planned.r_place) };
+    ctx.move_arm("descend", GoalSpec::AbsoluteEx { p: req.target, r: r_descend, auto_yaw: yaw_free }, speed).await?;
 
     if req.release { ctx.gripper_phase("open", 0.75, GripperCommand::Open).await?; }
 
     if req.retreat {
         ctx.phase("retreat", 0.85).await?;
         let p = ctx.pose().await.p;
-        ctx.move_arm("retreat", GoalSpec::Absolute { p: [p[0], p[1], p[2] + req.approach_m], r: None }, speed).await?;
+        ctx.move_arm("retreat", GoalSpec::AbsoluteEx { p: [p[0], p[1], p[2] + req.approach_m], r: None, auto_yaw: yaw_free }, speed).await?;
     }
     Ok(())
 }

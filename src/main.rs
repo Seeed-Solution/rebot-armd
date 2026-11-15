@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use armd::{create_router, ArmConfig, ArmSupervisor, StopPolicy, SupervisorInner};
@@ -120,6 +120,19 @@ fn start_blackbox(supervisor: &ArmSupervisor, cli_dir: Option<&str>, system: &ar
     }
 }
 
+fn resolve_serial_port(requested: Option<&str>) -> String {
+    if let Some(p) = requested {
+        return p.to_string();
+    }
+    let probes = ["/dev/ttySC0", "/dev/ttyACM0", "/dev/ttyUSB0"];
+    for p in probes {
+        if std::path::Path::new(p).exists() {
+            return p.to_string();
+        }
+    }
+    "/dev/ttySC0".to_string()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
@@ -150,9 +163,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let follower = cli.follower.as_deref().unwrap_or("mock");
     let expected_dof = match follower {
-        "rebot-dm" | "sim" => Some(7),
-        "rebot-rs" | "so-arm101" | "fashionstar" | "star-arm102" => Some(6),
-        "mock" => None,
+        "rebot-dm" => Some(7),
+        "rebot-rs" | "so-arm101" | "so-arm100" | "fashionstar" | "star-arm102" => Some(6),
+        "sim" | "mock" => None,
         other => return Err(format!("Unknown follower model: {other}").into()),
     };
     if follower == "mock" && cli.follower_port.is_some() {
@@ -164,6 +177,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::warn!("Profile {path} has no kinematics/workspace: the Cartesian workspace check and Cartesian actions are off");
         }
         config
+    } else if follower == "so-arm101" || follower == "so-arm100" {
+        let name = if follower == "so-arm100" { "so_arm100.json" } else { "so_arm101.json" };
+        let candidates = [
+            format!("profiles/{name}"),
+            format!("/usr/share/rebot-teleop/profile/{name}"),
+        ];
+        let path = candidates.iter().find(|p| std::path::Path::new(p).exists())
+            .unwrap_or(&candidates[0]);
+        ArmConfig::from_profile_file(path)?
     } else if follower == "rebot-dm" || follower == "sim" {
         ArmConfig::rebot_dm()
     } else {
@@ -192,6 +214,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let damiao_limits: Option<Vec<_>> = config.damiao_ranges.as_ref().map(|r| r.iter().map(|r| r.limits()).collect());
+    let config_dof = config.dof;
+    let feetech_config = config.feetech.clone();
+    let gripper_index = config.gripper_index();
     let supervisor = Arc::new(ArmSupervisor::new(config));
     supervisor.set_follower(follower).await;
     start_blackbox(&supervisor, cli.blackbox_dir.as_deref(), &system, started);
@@ -233,36 +258,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(not(target_os = "linux"))]
             return Err(format!("{follower} requires Linux SocketCAN").into());
         }
-        "so-arm101" | "fashionstar" | "star-arm102" => {
-            let port = cli.follower_port.as_deref().unwrap_or("/dev/ttyUSB0");
-            let baud = if follower == "so-arm101" {
-                1_000_000
-            } else {
-                115_200
+        "so-arm101" | "so-arm100" => {
+            let Some(cfg) = feetech_config else {
+                return Err(format!("{follower} requires feetech configuration in profile").into());
             };
-            let transport = armd::transport::SerialTransport::open_default(port, baud)?;
-            if follower == "so-arm101" {
-                supervisor
-                    .set_driver(Box::new(armd::driver::FeetechArmDriver::new(
-                        transport,
-                        (1..=6).collect(),
-                    )))
-                    .await;
-            } else {
-                supervisor
-                    .set_driver(Box::new(armd::driver::FashionStarArmDriver::new(
-                        transport,
-                        (1..=6).collect(),
-                    )))
-                    .await;
-            }
+            let port = resolve_serial_port(cli.follower_port.as_deref());
+            let baud = 1_000_000;
+            let transport = armd::transport::SerialTransport::open_default(&port, baud)?;
+            let mut driver = armd::driver::FeetechArmDriver::new(transport, (1..=6).collect())
+                .with_port_name(&port)
+                .with_config(cfg)
+                .with_gripper_index(gripper_index);
+            driver.configure_servos().map_err(|e| format!("Feetech servo configuration failed on {port}: {e}"))?;
+            supervisor.set_driver(Box::new(driver)).await;
+            info!("Mounted {} on {}", follower, port);
+        }
+        "fashionstar" | "star-arm102" => {
+            let port = cli.follower_port.as_deref().unwrap_or("/dev/ttyUSB0");
+            let transport = armd::transport::SerialTransport::open_default(port, 115_200)?;
+            supervisor
+                .set_driver(Box::new(armd::driver::FashionStarArmDriver::new(
+                    transport,
+                    (1..=6).collect(),
+                )))
+                .await;
             info!("Mounted {} on {}", follower, port);
         }
         "sim" => {
             let addr = cli.follower_port.as_deref().unwrap_or(armd::sim_driver::DEFAULT_SIM_ADDR);
-            let driver = armd::sim_driver::SimArmDriver::connect(addr, 7)?;
+            let is_feetech = feetech_config.is_some();
+            let driver = armd::sim_driver::SimArmDriver::connect(addr, config_dof)?
+                .with_load_only_feedback(is_feetech);
             supervisor.set_driver(Box::new(driver)).await;
-            info!("Mounted sim follower (physics simulator at {addr}, B601-DM semantics)");
+            if is_feetech {
+                info!("Mounted sim follower (physics simulator at {addr}, SO-ARM Feetech load-only feedback semantics)");
+            } else {
+                info!("Mounted sim follower (physics simulator at {addr}, B601-DM semantics)");
+            }
         }
         "mock" => info!("Follower configured as mock simulation"),
         _ => unreachable!(),
@@ -293,7 +325,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_late_log = Some(now);
             }
             // Preserve real elapsed time so the supervisor can detect stalled control ticks.
-            runtime.block_on(control_supervisor.tick(dt));
+            let tick_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(control_supervisor.tick(dt));
+            }));
+            if let Err(e) = tick_res {
+                control_supervisor.e_stop_latched.store(true, Ordering::SeqCst);
+                error!("Control thread panicked during tick: {:?}", e);
+                std::process::exit(1);
+            }
         }
     })?;
 
@@ -354,6 +393,7 @@ mod shutdown_tests {
                 temperature_feedback: true,
                 torque_feedforward: false,
                 enable_feedback: true,
+                load_feedback: false,
             }
         }
         fn enable_state(&self) -> EnableState {

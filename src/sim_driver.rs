@@ -68,6 +68,8 @@ pub struct SimState {
     pub tau: Vec<f32>,
     pub temp: Vec<f32>,
     #[serde(default)]
+    pub loads: Option<Vec<f32>>,
+    #[serde(default)]
     pub t: f64,
 }
 
@@ -75,9 +77,17 @@ pub struct SimState {
 pub fn parse_state(bytes: &[u8], dof: usize) -> Option<SimState> {
     let state: SimState = serde_json::from_slice(bytes).ok()?;
     let arrays = [&state.q, &state.dq, &state.tau, &state.temp];
-    (state.v == PROTOCOL_VERSION && state.kind == "state"
-        && arrays.iter().all(|a| a.len() == dof && a.iter().all(|v| v.is_finite())))
-        .then_some(state)
+    let basic_valid = state.v == PROTOCOL_VERSION && state.kind == "state"
+        && arrays.iter().all(|a| a.len() == dof && a.iter().all(|v| v.is_finite()));
+    if !basic_valid {
+        return None;
+    }
+    if let Some(ref loads) = state.loads {
+        if loads.len() != dof || !loads.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+    }
+    Some(state)
 }
 
 #[derive(Debug, Default)]
@@ -116,6 +126,9 @@ pub struct SimArmDriver {
     enable_seq: u64,
     modes: Vec<JointMode>,
     cached: Vec<JointState>,
+    cached_loads: Vec<f32>,
+    cached_torques: Vec<f32>,
+    load_only_feedback: bool,
 }
 
 impl SimArmDriver {
@@ -141,7 +154,15 @@ impl SimArmDriver {
             seq: 0, enable_requested: false, enable_seq: 0,
             modes: vec![JointMode::Position; dof],
             cached: vec![JointState::default(); dof],
+            cached_loads: vec![0.0; dof],
+            cached_torques: vec![0.0; dof],
+            load_only_feedback: false,
         })
+    }
+
+    pub fn with_load_only_feedback(mut self, enabled: bool) -> Self {
+        self.load_only_feedback = enabled;
+        self
     }
 
     /// Datagrams dropped as malformed, out of order or for the wrong joint count.
@@ -149,6 +170,20 @@ impl SimArmDriver {
 
     /// Commands dropped because the send buffer was full (all sim drivers of the process).
     pub fn dropped_sends() -> u64 { SEND_DROPS.load(Ordering::Relaxed) }
+
+    /// Return measured joint torques for all joints (raw simulator tau).
+    pub fn joint_torques(&self) -> Vec<f32> {
+        self.cached_torques.clone()
+    }
+
+    /// Return normalized load fractions in `[-1.0, 1.0]` when supported (load_only_feedback).
+    pub fn joint_loads(&self) -> Option<Vec<f32>> {
+        if self.load_only_feedback {
+            Some(self.cached_loads.clone())
+        } else {
+            None
+        }
+    }
 
     fn send(&mut self, targets: Option<Vec<SimTarget>>) -> u64 {
         self.seq += 1;
@@ -223,14 +258,26 @@ fn receiver_loop(socket: UdpSocket, dof: usize, shared: Arc<Mutex<Shared>>, stop
 
 impl ArmDriver for SimArmDriver {
     fn capabilities(&self) -> DriverCapabilities {
-        DriverCapabilities {
-            velocity_feedback: true,
-            torque_feedback: true,
-            temperature_feedback: true,
-            // Same as the Damiao driver in its POS_VEL base mode: feed-forward only
-            // through the per-joint MIT switch used by gravity compensation.
-            torque_feedforward: false,
-            enable_feedback: true,
+        if self.load_only_feedback {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: false,
+                temperature_feedback: true,
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: true,
+            }
+        } else {
+            DriverCapabilities {
+                velocity_feedback: true,
+                torque_feedback: true,
+                temperature_feedback: true,
+                // Same as the Damiao driver in its POS_VEL base mode: feed-forward only
+                // through the per-joint MIT switch used by gravity compensation.
+                torque_feedforward: false,
+                enable_feedback: true,
+                load_feedback: false,
+            }
         }
     }
 
@@ -253,11 +300,36 @@ impl ArmDriver for SimArmDriver {
 
     fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
         if let (Some(state), _) = self.snapshot() {
+            self.cached_torques = state.tau.clone();
+            if self.load_only_feedback {
+                if let Some(ref loads) = state.loads {
+                    if loads.len() == self.dof {
+                        self.cached_loads = loads.iter().map(|&l| l.clamp(-1.0, 1.0)).collect();
+                    } else {
+                        self.cached_loads = state.tau.iter().map(|&t| (t.abs() / 2.94).clamp(0.0, 1.0)).collect();
+                    }
+                } else {
+                    self.cached_loads = state.tau.iter().map(|&t| (t.abs() / 2.94).clamp(0.0, 1.0)).collect();
+                }
+            }
             for (i, js) in self.cached.iter_mut().enumerate() {
-                *js = JointState { position: state.q[i], velocity: state.dq[i], torque: state.tau[i], temperature: state.temp[i] };
+                *js = JointState {
+                    position: state.q[i],
+                    velocity: state.dq[i],
+                    torque: if self.load_only_feedback { 0.0 } else { state.tau[i] },
+                    temperature: state.temp[i],
+                };
             }
         }
         Ok(self.cached.clone())
+    }
+
+    fn joint_loads(&self) -> Option<Vec<f32>> {
+        if self.load_only_feedback {
+            Some(self.cached_loads.clone())
+        } else {
+            None
+        }
     }
 
     fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
@@ -352,7 +424,7 @@ mod tests {
         }
         fn send_state(&mut self, session: u64, seq: u64, ack: u64, enabled: bool, q0: f32) {
             let state = SimState { v: 1, kind: "state".into(), session, seq, ack, enabled,
-                q: vec![q0, 0.1, 0.2], dq: vec![0.0; 3], tau: vec![0.5; 3], temp: vec![35.0; 3], t: 0.0 };
+                q: vec![q0, 0.1, 0.2], dq: vec![0.0; 3], tau: vec![0.5; 3], temp: vec![35.0; 3], loads: None, t: 0.0 };
             self.send_raw(&serde_json::to_vec(&state).unwrap());
         }
     }

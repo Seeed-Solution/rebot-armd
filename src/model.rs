@@ -1,7 +1,66 @@
 use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 use crate::safety::SafetyState;
-use crate::driver::{DriverCapabilities, DriverRangeCheck, EnableState};
+/// Hardware enable state confirmed by fresh telemetry, not by a successful write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnableState {
+    Enabled,
+    Disabled,
+    #[default]
+    Unknown,
+}
+
+/// Telemetry and command features implemented by a driver in its active mode.
+/// A false feedback flag means the numeric placeholder is not a measurement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriverCapabilities {
+    pub velocity_feedback: bool,
+    pub torque_feedback: bool,
+    pub temperature_feedback: bool,
+    pub torque_feedforward: bool,
+    pub enable_feedback: bool,
+    #[serde(default)]
+    pub load_feedback: bool,
+}
+
+/// Outcome of a mapping-range check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RangeCheckStatus {
+    /// Every motor answered and its ranges equal the configured ones.
+    Passed,
+    /// At least one motor reports a different range: arming is refused.
+    Mismatch,
+    /// At least one motor did not answer: the configured ranges are used unverified.
+    Unverified,
+}
+
+/// Registers read from one motor by the range check.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JointRangeReading {
+    /// 1-based joint number.
+    pub joint: usize,
+    pub motor_id: u16,
+    pub status: RangeCheckStatus,
+    /// CTRL_MODE register (1 = MIT, 2 = POS_VEL); None without a reply.
+    pub ctrl_mode: Option<u32>,
+    /// PMAX / VMAX / TMAX read from the motor; None without a reply.
+    pub reported: Option<[f32; 3]>,
+    /// PMAX / VMAX / TMAX the driver decodes and encodes this joint with.
+    pub configured: [f32; 3],
+}
+
+/// Startup check of the motors' mapping ranges (published as `driver_range_check`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DriverRangeCheck {
+    pub status: RangeCheckStatus,
+    pub message: String,
+    pub joints: Vec<JointRangeReading>,
+    /// Time the check took (ms).
+    pub duration_ms: u64,
+}
+
+
 
 /// Limits for a single joint
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -54,6 +113,9 @@ impl Default for JointState {
 /// Hardware-specific evidence required before automatic torque release.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestingPosePolicy {
+    /// Optional resting joint target (rad, length `dof`) used by `park` / `NormalUnload` instead of `home_positions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions: Option<Vec<f32>>,
     pub position_tolerances: Vec<f32>,
     pub max_total_deviation: f32,
     /// |velocity| limit (rad/s) for every joint without an entry in `joint_max_velocities`.
@@ -63,6 +125,8 @@ pub struct RestingPosePolicy {
     #[serde(default)]
     pub joint_max_velocities: Vec<f32>,
     pub support_torque_limits: Vec<(usize, f32)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub support_load_limits: Vec<(usize, f32)>,
     pub feedback_max_age_ms: u64,
 }
 
@@ -72,11 +136,13 @@ impl RestingPosePolicy {
     /// physical limits are 0.015 / 3 rad/s on J1-J3 and 1.5 / 4.5 N·m × 28 / 18 on J2 / J3.
     pub fn rebot_dm() -> Self {
         Self {
+            positions: None,
             position_tolerances: vec![0.15, 0.08, 0.08, 0.08, 0.08, 0.08],
             max_total_deviation: 0.22,
             max_velocity: 0.015,
             joint_max_velocities: vec![0.005, 0.005, 0.005, 0.015, 0.015, 0.015, 0.015],
             support_torque_limits: vec![(1, 2.333), (2, 7.0)],
+            support_load_limits: Vec::new(),
             feedback_max_age_ms: 100,
         }
     }
@@ -173,7 +239,7 @@ impl WorkspacePolicy {
         }
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         let finite3 = |v: &[f32; 3]| v.iter().all(|x| x.is_finite());
         if !self.floor_z_m.is_finite() || !finite3(&self.box_min_m) || !finite3(&self.box_max_m)
             || self.box_min_m.iter().zip(&self.box_max_m).any(|(lo, hi)| lo >= hi)
@@ -326,6 +392,29 @@ impl JawOpening {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+fn is_default_holding_mode(m: &HoldingMode) -> bool {
+    matches!(m, HoldingMode::TorqueAndGap)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldingMode {
+    #[default]
+    TorqueAndGap,
+    PositionGap,
+    LoadAndGap,
+}
+
+pub type HoldingDetection = HoldingMode;
+
 /// Gripper action parameters (`/api/v1/action/gripper`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GripperPolicy {
@@ -344,6 +433,12 @@ pub struct GripperPolicy {
     /// Angle-to-opening calibration mapping; absent by default (uses built-in sim model).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jaw_opening: Option<JawOpening>,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub zero_check_supported: bool,
+    #[serde(default, skip_serializing_if = "is_default_holding_mode")]
+    pub holding_mode: HoldingMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holding_load_fraction: Option<f32>,
 }
 
 impl GripperPolicy {
@@ -351,7 +446,18 @@ impl GripperPolicy {
     /// holding_torque_nm 0.0667 is the former 0.12 read with TMAX 18, converted to the
     /// J7 motor's real TMAX 10 (0.12 × 10 / 18).
     pub fn rebot_dm() -> Self {
-        Self { closed_rad: 0.0, open_rad: -5.7, holding_gap_rad: 0.30, holding_torque_nm: 0.0667, squeeze_rad: 0.15, settle_ms: 300, jaw_opening: None }
+        Self {
+            closed_rad: 0.0,
+            open_rad: -5.7,
+            holding_gap_rad: 0.30,
+            holding_torque_nm: 0.0667,
+            squeeze_rad: 0.15,
+            settle_ms: 300,
+            jaw_opening: None,
+            zero_check_supported: true,
+            holding_mode: HoldingMode::TorqueAndGap,
+            holding_load_fraction: None,
+        }
     }
 
     /// Jaw opening model (or the built-in uncalibrated sim default).
@@ -592,6 +698,7 @@ impl DamiaoRange {
     /// B601-DM J4-J7 (J7 = gripper), read from the motors 2026-11-09.
     pub const REBOT_DM_J4_J7: Self = Self { p_max: 12.5, v_max: 30.0, t_max: 10.0 };
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn limits(&self) -> crate::protocol::damiao::DamiaoLimits {
         crate::protocol::damiao::DamiaoLimits::symmetric(self.p_max, self.v_max, self.t_max)
     }
@@ -645,6 +752,9 @@ impl SpeedCap {
 /// Robotic arm hardware/control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArmConfig {
+    /// Optional profile identifier (e.g. "rebot_b601dm", "rebot_b601rs", "so_arm101").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
     /// Arm profile contract version; missing in older profiles, which are version 1.
     #[serde(default = "default_profile_version")]
     pub profile_version: u32,
@@ -693,6 +803,7 @@ pub struct ArmConfig {
     pub gripper_policy: Option<GripperPolicy>,
     /// Tap-to-grasp setup; None disables `/api/v1/action/grasp`.
     #[serde(default)]
+    #[cfg(not(target_arch = "wasm32"))]
     pub grasp: Option<crate::grasp::GraspSetup>,
     /// Gravity compensation (hand-guiding); None means unsupported.
     #[serde(default)]
@@ -738,6 +849,10 @@ pub struct ArmConfig {
     /// joint than the arm model (index 6 for the B601-DM), otherwise none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gripper_joint: Option<usize>,
+    /// Feetech STS3215 bus and joint calibration settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(not(target_arch = "wasm32"))]
+    pub feetech: Option<crate::protocol::feetech::FeetechConfig>,
     /// Arm model built from the fields above (not part of the profile JSON).
     #[serde(skip)]
     pub arm_model: crate::chain::ArmModel,
@@ -779,6 +894,7 @@ impl Default for ArmConfig {
         let home_positions = vec![0.0; dof];
 
         Self {
+            profile_id: None,
             profile_version: ARM_PROFILE_VERSION,
             dof,
             joint_names,
@@ -798,7 +914,7 @@ impl Default for ArmConfig {
             workspace: None,
             camera_mount: CameraMount::default(),
             gripper_policy: None,
-            grasp: None,
+            #[cfg(not(target_arch = "wasm32"))] grasp: None,
             gravity_comp: None,
             damiao_ranges: None,
             speed_cap: None,
@@ -811,6 +927,7 @@ impl Default for ArmConfig {
             chain: None,
             model_offsets_rad: None,
             gripper_joint: None,
+            #[cfg(not(target_arch = "wasm32"))] feetech: None,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -819,6 +936,14 @@ impl Default for ArmConfig {
 impl ArmConfig {
     /// Number of arm joints of the kinematic / gravity model (6 for the built-in model).
     pub fn arm_dof(&self) -> usize { self.arm_model.arm_dof() }
+
+    /// Target joint positions for `NormalUnload` (`park`) and resting-pose checks.
+    pub fn resting_positions(&self) -> &[f32] {
+        self.resting_pose
+            .as_ref()
+            .and_then(|p| p.positions.as_deref())
+            .unwrap_or(&self.home_positions)
+    }
 
     /// Joints the resting-pose position check must cover: every joint before a trailing
     /// gripper (all joints when the gripper is not the last one or there is none).
@@ -840,6 +965,12 @@ impl ArmConfig {
         self.dof == 7 && self.arm_dof() == 6 && self.gripper_index() == Some(6)
     }
 
+    /// Whether the configuration supports Cartesian actions with a trailing gripper
+    /// (5 or 6 arm joints + gripper at index arm_dof).
+    pub fn has_cartesian_with_gripper(&self) -> bool {
+        matches!(self.arm_dof(), 5 | 6) && self.gripper_index() == Some(self.arm_dof()) && self.dof == self.arm_dof() + 1
+    }
+
     /// Profile uses the URDF chain for kinematics or gravity.
     pub fn uses_urdf(&self) -> bool {
         self.kinematics == Some(KinematicsModel::Urdf) || self.gravity_model == Some(GravityModel::Urdf)
@@ -847,6 +978,7 @@ impl ArmConfig {
 
     /// Read a profile JSON file and build its arm model (`urdf` relative to the file).
     /// The result still needs [`Self::validate`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_profile_file(path: impl AsRef<std::path::Path>) -> Result<Self, String> {
         let path = path.as_ref();
         let file = std::fs::File::open(path).map_err(|e| format!("profile {}: {e}", path.display()))?;
@@ -858,6 +990,7 @@ impl ArmConfig {
 
     /// Build [`Self::arm_model`] from `urdf` + `chain` when the profile uses `Urdf`;
     /// `profile_dir` resolves a relative `urdf` path. Call before [`Self::validate`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_arm_model(&mut self, profile_dir: Option<&std::path::Path>) -> Result<(), String> {
         if !self.uses_urdf() {
             if self.urdf.is_some() || self.chain.is_some() {
@@ -888,6 +1021,36 @@ impl ArmConfig {
             .map_err(|e| format!("urdf {}: {e}", path.display()))?;
         if self.gravity_model == Some(GravityModel::Urdf) && chain.moving_mass() <= 0.0 {
             return Err(format!("urdf {}: gravity_model \"Urdf\" but the chain links have no mass", path.display()));
+        }
+        self.arm_model = crate::chain::ArmModel::Chain(std::sync::Arc::new(chain));
+        Ok(())
+    }
+
+    /// Build the arm model without filesystem access. Checks the same model mapping,
+    /// optional URDF checksum and mass requirements as native profile loading.
+    pub fn init_arm_model_in_memory(&mut self, urdf_xml: Option<&str>) -> Result<(), String> {
+        if !self.uses_urdf() {
+            if self.urdf.is_some() || self.chain.is_some() {
+                return Err("urdf / chain are set but neither kinematics nor gravity_model is \"Urdf\"".into());
+            }
+            self.arm_model = crate::chain::ArmModel::RebotDevArm(self.builtin_model_offsets()?);
+            return Ok(());
+        }
+        let text = urdf_xml.ok_or("URDF XML is required for this profile")?;
+        let spec = self.chain.as_ref().ok_or("URDF profile requires chain")?;
+        if self.model_offsets_rad.is_some() {
+            return Err("model_offsets_rad is for the built-in model; a URDF chain sets chain.joints[].offset_rad".into());
+        }
+        if let Some(expected) = &self.urdf_sha256 {
+            let actual = crate::gravity::compute_sha256(text.as_bytes());
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(format!("urdf: sha256 {actual} does not match urdf_sha256 {expected}"));
+            }
+        }
+        let chain = crate::chain::KinematicChain::from_urdf_str(text, spec)
+            .map_err(|e| format!("urdf: {e}"))?;
+        if self.gravity_model == Some(GravityModel::Urdf) && chain.moving_mass() <= 0.0 {
+            return Err("urdf: gravity_model \"Urdf\" but the chain links have no mass".into());
         }
         self.arm_model = crate::chain::ArmModel::Chain(std::sync::Arc::new(chain));
         Ok(())
@@ -990,6 +1153,16 @@ impl ArmConfig {
         if self.uses_urdf() && (self.dof < self.arm_dof() || self.dof > self.arm_dof() + 1) {
             return Err(format!("the URDF chain has {} joints; dof must be {} or {} (with a gripper)", self.arm_dof(), self.arm_dof(), self.arm_dof() + 1));
         }
+        if self.kinematics.is_some() || self.gripper_joint.is_some() {
+            let valid = (self.gripper_index().is_none() && self.dof == self.arm_dof())
+                || (self.gripper_index() == Some(self.arm_dof()) && self.dof == self.arm_dof() + 1);
+            if !valid {
+                return Err(format!(
+                    "Invalid joint layout: arm has {} joints (dof {}), expected either {} arm joints (no gripper) or {} arm joints + gripper at index {}",
+                    self.arm_dof(), self.dof, self.arm_dof(), self.arm_dof(), self.arm_dof()
+                ));
+            }
+        }
         if let Some(ws) = &self.workspace { ws.validate()?; }
         let cam = &self.camera_mount;
         if !cam.rot_deg.is_finite() || !cam.tilt_deg.is_finite()
@@ -997,13 +1170,21 @@ impl ArmConfig {
             return Err("Invalid camera mount".into());
         }
         if let Some(g) = &self.gripper_policy {
-            let lim = if self.dof >= 7 { Some(&self.limits[6]) } else { None };
+            let lim = self.gripper_index().and_then(|idx| self.limits.get(idx));
             let in_lim = |v: f32| lim.is_some_and(|l| v >= l.min_position && v <= l.max_position);
             if ![g.closed_rad, g.open_rad, g.holding_gap_rad, g.holding_torque_nm, g.squeeze_rad].iter().all(|v| v.is_finite())
                 || !in_lim(g.closed_rad) || !in_lim(g.open_rad) || (g.closed_rad - g.open_rad).abs() < 0.1
                 || g.holding_gap_rad < 0.0 || g.holding_torque_nm < 0.0
                 || !(0.0..=0.5).contains(&g.squeeze_rad) || g.settle_ms == 0 || g.settle_ms > 5000 {
-                return Err("Invalid gripper policy (needs dof 7, open/closed inside the J7 limits, 0 <= squeeze_rad <= 0.5)".into());
+                return Err("Invalid gripper policy (open/closed inside the gripper joint limits, 0 <= squeeze_rad <= 0.5)".into());
+            }
+            if let Some(frac) = g.holding_load_fraction {
+                if !frac.is_finite() || !(0.0..=1.0).contains(&frac) {
+                    return Err("Invalid gripper policy: holding_load_fraction must be in 0.0..=1.0".into());
+                }
+            }
+            if g.holding_mode == HoldingMode::LoadAndGap && g.holding_load_fraction.unwrap_or(0.0) <= 0.0 {
+                return Err("Invalid gripper policy: LoadAndGap holding mode requires holding_load_fraction > 0.0".into());
             }
             if let Some(jo) = &g.jaw_opening {
                 jo.validate(lim).map_err(|e| format!("Invalid gripper policy: {e}"))?;
@@ -1026,6 +1207,7 @@ impl ArmConfig {
                 }
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(g) = &self.grasp { g.validate().map_err(|e| format!("Invalid grasp setup: {e}"))?; }
         if let Some(policy) = &self.resting_pose {
             if policy.position_tolerances.len() < self.resting_arm_joints() {
@@ -1039,8 +1221,89 @@ impl ArmConfig {
                 || policy.joint_max_velocities.len() > self.dof
                 || policy.joint_max_velocities.iter().any(|v| !v.is_finite() || *v <= 0.0)
                 || policy.feedback_max_age_ms == 0
-                || policy.support_torque_limits.iter().any(|(i, t)| *i >= self.dof || !t.is_finite() || *t < 0.0) {
+                || policy.support_torque_limits.iter().any(|(i, t)| *i >= self.dof || !t.is_finite() || *t < 0.0)
+                || policy.support_load_limits.iter().any(|(i, l)| *i >= self.dof || !l.is_finite() || *l < 0.0) {
                 return Err("Invalid resting-pose policy".into());
+            }
+            if let Some(pos) = &policy.positions {
+                if pos.len() != self.dof
+                    || !pos.iter().zip(&self.limits).all(|(p, l)| p.is_finite() && *p >= l.min_position && *p <= l.max_position)
+                {
+                    return Err("Invalid resting-pose positions: must match dof, be finite, and stay within joint limits".into());
+                }
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ft) = &self.feetech {
+            if !(1..=1000).contains(&ft.max_torque_raw) {
+                return Err(format!("feetech.max_torque_raw must be 1..=1000, got {}", ft.max_torque_raw));
+            }
+            if !(1..=1000).contains(&ft.protection_current_raw) {
+                return Err(format!("feetech.protection_current_raw must be 1..=1000, got {}", ft.protection_current_raw));
+            }
+            if let Some(ot) = ft.overload_torque_raw {
+                if !(1..=100).contains(&ot) {
+                    return Err(format!("feetech.overload_torque_raw must be 1..=100, got {}", ot));
+                }
+                if ft.joints.is_empty() && self.arm_dof() > 0 && ot < 50 {
+                    return Err(format!("feetech.overload_torque_raw must be >= 50 for arm joints, got {}", ot));
+                }
+            }
+            if !ft.joints.is_empty() {
+                if ft.joints.len() != self.dof {
+                    return Err(format!(
+                        "feetech.joints length {} does not match DOF {}",
+                        ft.joints.len(), self.dof
+                    ));
+                }
+                let mut ids = std::collections::HashSet::new();
+                for (i, j) in ft.joints.iter().enumerate() {
+                    if j.id == 0 || j.id >= 0xFE {
+                        return Err(format!("Feetech servo ID {} must be in 1..=253", j.id));
+                    }
+                    if !ids.insert(j.id) {
+                        return Err(format!(
+                            "Duplicate Feetech servo ID {} at joint index {}",
+                            j.id, i
+                        ));
+                    }
+                    if j.zero_step > 4095 {
+                        return Err(format!("Feetech joint {} zero_step must be <= 4095, got {}", i, j.zero_step));
+                    }
+                    if !(-2047..=2047).contains(&j.homing_offset_steps) {
+                        return Err(format!("Feetech joint {} homing_offset_steps abs must be <= 2047, got {}", i, j.homing_offset_steps));
+                    }
+                    if let Some(exp) = j.expected_homing_offset_steps {
+                        if !(-2047..=2047).contains(&exp) {
+                            return Err(format!("Feetech joint {} expected_homing_offset_steps abs must be <= 2047, got {}", i, exp));
+                        }
+                    }
+                    if let Some(mt) = j.max_torque_raw {
+                        if !(1..=1000).contains(&mt) {
+                            return Err(format!("Feetech joint {} max_torque_raw must be 1..=1000, got {}", i, mt));
+                        }
+                    }
+                    if let Some(pc) = j.protection_current_raw {
+                        if !(1..=1000).contains(&pc) {
+                            return Err(format!("Feetech joint {} protection_current_raw must be 1..=1000, got {}", i, pc));
+                        }
+                    }
+                    if let Some(ot) = j.overload_torque_raw.or(ft.overload_torque_raw) {
+                        if !(1..=100).contains(&ot) {
+                            return Err(format!("Feetech joint {} overload_torque_raw must be 1..=100, got {}", i, ot));
+                        }
+                        if i < self.arm_dof() && ot < 50 {
+                            return Err(format!("Feetech arm joint {} overload_torque_raw must be >= 50, got {}", i, ot));
+                        }
+                    }
+                    let (eff_min, eff_max) = j.effective_range_steps();
+                    if eff_min >= eff_max || eff_max > 4095 {
+                        return Err(format!(
+                            "Invalid Feetech step range [{}, {}] for servo ID {} at joint {}",
+                            eff_min, eff_max, j.id, i
+                        ));
+                    }
+                }
             }
         }
         for (i, lim) in self.limits.iter().enumerate() {
@@ -1100,6 +1363,7 @@ impl ArmConfig {
         let home_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0];
 
         Self {
+            profile_id: None,
             profile_version: ARM_PROFILE_VERSION,
             dof,
             joint_names,
@@ -1120,7 +1384,7 @@ impl ArmConfig {
             workspace: Some(WorkspacePolicy::rebot_dm()),
             camera_mount: CameraMount::default(),
             gripper_policy: Some(GripperPolicy::rebot_dm()),
-            grasp: Some(crate::grasp::GraspSetup::default()),
+            #[cfg(not(target_arch = "wasm32"))] grasp: Some(crate::grasp::GraspSetup::default()),
             gravity_comp: Some(GravityCompPolicy::rebot_dm()),
             damiao_ranges: Some(vec![
                 DamiaoRange::REBOT_DM_J1_J3, DamiaoRange::REBOT_DM_J1_J3, DamiaoRange::REBOT_DM_J1_J3,
@@ -1155,9 +1419,28 @@ impl ArmConfig {
             chain: None,
             model_offsets_rad: Some(crate::kinematics::B601DM_MODEL_OFFSETS_RAD.to_vec()),
             gripper_joint: None,
+            #[cfg(not(target_arch = "wasm32"))] feetech: None,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
+}
+
+/// Cartesian TCP pose and orientation of the end link in the base frame.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TcpState {
+    pub xyz_m: [f32; 3],
+    pub rpy_rad: [f32; 3],
+    pub quat_wxyz: [f32; 4],
+}
+
+/// Gripper state observation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GripperObs {
+    pub joint: usize,
+    pub rad: f32,
+    pub fraction: f32,
+    pub opening_m: Option<f32>,
+    pub stalled: bool,
 }
 
 /// Full arm telemetry / observation
@@ -1232,6 +1515,15 @@ pub struct ArmObservation {
     /// Gripper zero check state (`src/gripper_calib.rs`); null without a gripper policy or < 7 DOF.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gripper_zero: Option<GripperZeroObservation>,
+    /// Cartesian TCP pose and orientation of the end link in the base frame; null when kinematics is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<TcpState>,
+    /// Gripper joint state; null without a gripper joint and policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gripper: Option<GripperObs>,
+    /// Normalized servo load fraction per joint when `driver_capabilities.load_feedback` is true; omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loads: Option<Vec<f32>>,
 }
 
 /// Gripper zero state published in `observation.gripper_zero`.
@@ -1452,6 +1744,8 @@ pub struct Capabilities {
     /// `schema.power_budget`, `GET /api/v1/diagnostics/power`): enabled in the profile and a
     /// driver that reports torque. Present from capabilities version 9.
     pub power_budget: bool,
+    #[serde(default)]
+    pub auto_yaw: bool,
     pub vision: VisionCapabilities,
 }
 
@@ -1459,20 +1753,23 @@ impl Capabilities {
     /// Capabilities that follow from the profile alone. `gravity_comp` also depends on
     /// the driver and the URDF check; this sets it from the profile only.
     pub fn from_config(config: &ArmConfig) -> Self {
-        let seven = config.six_plus_gripper();
+        let arm_with_gripper = config.has_cartesian_with_gripper();
         let kin = config.kinematics.is_some();
         let six_arm = config.arm_dof() == 6 && matches!(config.dof, 6 | 7);
-        let gripper = config.dof >= 7 && config.gripper_policy.is_some();
-        let grasp = seven && kin && config.gripper_policy.is_some() && config.grasp.is_some();
+        let gripper = config.gripper_index().is_some() && config.gripper_policy.is_some();
+        #[cfg(not(target_arch = "wasm32"))]
+        let grasp = arm_with_gripper && kin && config.gripper_policy.is_some() && config.grasp.is_some();
+        #[cfg(target_arch = "wasm32")]
+        let grasp = false;
         Self {
             version: CAPABILITIES_VERSION,
             profile_version: config.profile_version,
-            cartesian: seven && kin,
+            cartesian: arm_with_gripper && kin,
             workspace_check: kin && config.workspace.is_some(),
             gripper,
             grasp,
             grasp_tasks: grasp,
-            gravity_comp: seven && config.gravity_model.is_some() && config.gravity_comp.is_some(),
+            gravity_comp: config.six_plus_gripper() && config.gravity_model.is_some() && config.gravity_comp.is_some(),
             damiao_ranges: config.damiao_ranges.is_some(),
             servo_guard: true,
             diagnostics: true,
@@ -1483,7 +1780,7 @@ impl Capabilities {
             speed_cap: true,
             residual_torques: config.gravity_model.is_some() && six_arm,
             tick_stats: true,
-            place: seven && kin && config.gripper_policy.is_some(),
+            place: arm_with_gripper && kin && config.gripper_policy.is_some(),
             // The driver half is applied by ArmSupervisor::get_schema.
             collision_guard: config.gravity_model.is_some() && six_arm,
             safety_describe: true,
@@ -1492,6 +1789,7 @@ impl Capabilities {
             torque_guard: crate::torque_guard::TorqueGuardInfo::from_config(config).is_some(),
             // The driver half is applied by ArmSupervisor::get_schema.
             power_budget: config.power_budget.as_ref().is_some_and(|p| p.enabled),
+            auto_yaw: false,
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }
@@ -1500,11 +1798,18 @@ impl Capabilities {
 /// Observation schema for clients
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservationSchema {
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub arm_dof: usize,
+    #[serde(default)]
+    pub gripper_joint: Option<usize>,
+    #[serde(default)]
+    pub orientation_dof: usize,
     pub dof: usize,
     pub joint_names: Vec<String>,
     pub fields: Vec<SchemaField>,
     pub limits: Vec<JointLimit>,
-    /// Cartesian safety box enforced by the server (None = not checked).
     #[serde(default)]
     pub workspace: Option<WorkspacePolicy>,
     #[serde(default)]
@@ -1513,6 +1818,8 @@ pub struct ObservationSchema {
     pub kinematics: Option<KinematicsModel>,
     #[serde(default)]
     pub capabilities: Capabilities,
+    #[serde(default)]
+    pub gripper_policy: Option<GripperPolicy>,
     /// Effective servo-streaming speed cap per joint (rad/s): min(`servo_max_velocity`,
     /// joint limit); the joint limit where no cap applies. Empty in older schemas.
     #[serde(default)]
@@ -1541,11 +1848,29 @@ pub struct ObservationSchema {
     /// Supply power budget in force; null when the profile has none (and in older schemas).
     #[serde(default)]
     pub power_budget: Option<crate::power::PowerBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg(not(target_arch = "wasm32"))]
+    pub feetech_joints: Option<Vec<crate::protocol::feetech::FeetechJointCalib>>,
 }
 
 impl ObservationSchema {
     pub fn from_config(config: &ArmConfig) -> Self {
+        let orientation_dof = if config.kinematics.is_some() {
+            if config.arm_dof() >= 6 {
+                3
+            } else if config.arm_dof() == 5 {
+                2
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         Self {
+            profile_id: config.profile_id.clone(),
+            arm_dof: config.arm_dof(),
+            gripper_joint: config.gripper_index(),
+            orientation_dof,
             dof: config.dof,
             joint_names: config.joint_names.clone(),
             fields: vec![
@@ -1606,7 +1931,7 @@ impl ObservationSchema {
                 SchemaField {
                     name: "gravity_torques".to_string(),
                     dtype: "float32".to_string(),
-                    shape: vec![6],
+                    shape: vec![config.arm_dof()],
                     unit: Some("Nm".to_string()),
                 },
             ],
@@ -1615,6 +1940,7 @@ impl ObservationSchema {
             camera_mount: config.camera_mount.clone(),
             kinematics: config.kinematics,
             capabilities: Capabilities::from_config(config),
+            gripper_policy: config.gripper_policy.clone(),
             servo_max_velocity: config.servo_limits().iter().map(|l| l.max_velocity).collect(),
             servo_max_lead_rad: Some(config.servo_max_lead_rad),
             speed_cap: config.speed_cap,
@@ -1623,6 +1949,50 @@ impl ObservationSchema {
             torque_guard: crate::torque_guard::TorqueGuardInfo::from_config(config),
             model_joint_map: config.arm_model.joint_map(),
             power_budget: config.power_budget.clone().filter(|p| p.enabled),
+            #[cfg(not(target_arch = "wasm32"))]
+            feetech_joints: config.feetech.as_ref().map(|f| f.joints.clone()),
+
         }
+    }
+}
+
+#[cfg(test)]
+mod in_memory_model_tests {
+    use super::*;
+
+    #[test]
+    fn built_in_in_memory_model_uses_motor_offsets() {
+        let mut config = ArmConfig::rebot_dm();
+        config.model_offsets_rad = None;
+        config.init_arm_model_in_memory(None).unwrap();
+        let map = config.arm_model.joint_map();
+        assert_eq!(map[5].offset_rad, -std::f64::consts::FRAC_PI_2);
+        let default_pose = ArmConfig::rebot_dm().arm_model.fk(&[0.0; 6]);
+        assert_eq!(config.arm_model.fk(&[0.0; 6]), default_pose);
+    }
+
+    #[test]
+    fn urdf_in_memory_validates_checksum_and_preserves_model_on_failure() {
+        let mut config: ArmConfig = serde_json::from_str(include_str!("../profiles/so_arm101.json")).unwrap();
+        let xml = include_str!("../assets/so101_new_calib.urdf");
+        config.init_arm_model_in_memory(Some(xml)).unwrap();
+        assert_eq!(config.arm_dof(), 5);
+        let before = config.arm_model.fk(&[0.0; 6]);
+        config.urdf_sha256 = Some("0".repeat(64));
+        assert!(config.init_arm_model_in_memory(Some(xml)).unwrap_err().contains("sha256"));
+        assert_eq!(config.arm_model.fk(&[0.0; 6]), before);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_and_in_memory_profile_models_are_identical() {
+        let profile = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("profiles/so_arm101.json");
+        let native = ArmConfig::from_profile_file(profile).unwrap();
+        let mut memory: ArmConfig = serde_json::from_str(include_str!("../profiles/so_arm101.json")).unwrap();
+        memory.init_arm_model_in_memory(Some(include_str!("../assets/so101_new_calib.urdf"))).unwrap();
+        assert_eq!(native.arm_model.joint_map(), memory.arm_model.joint_map());
+        assert_eq!(native.arm_model.chain(), memory.arm_model.chain());
+        assert_eq!(native.arm_model.fk(&[0.2, -0.3, 0.4, 0.1, -0.2, 0.0]),
+            memory.arm_model.fk(&[0.2, -0.3, 0.4, 0.1, -0.2, 0.0]));
     }
 }

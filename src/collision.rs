@@ -14,12 +14,17 @@
 //!
 //! Per tick the guard costs O(6) and allocates nothing; strings are built only on a trip.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::motion::MotionError;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::persist::{self, Loaded, PendingWrite};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::safety::{FaultCode, FaultReason, SafetyError};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
 
 pub const DEFAULT_COLLISION_PATH: &str = "/userdata/rebot-teleop/collision.json";
@@ -27,6 +32,7 @@ pub const DEFAULT_COLLISION_PATH: &str = "/userdata/rebot-teleop/collision.json"
 pub const MAX_TRIP_HISTORY: usize = 16;
 
 /// `ARMD_COLLISION` or [`DEFAULT_COLLISION_PATH`].
+#[cfg(not(target_arch = "wasm32"))]
 pub fn path_from_env() -> PathBuf {
     persist::path_from_env("ARMD_COLLISION", DEFAULT_COLLISION_PATH)
 }
@@ -146,6 +152,7 @@ pub struct CollisionGuard {
     /// True once a runtime setting replaced the profile's.
     pub runtime: bool,
     /// File the runtime setting is written to; None = not persisted.
+    #[cfg(not(target_arch = "wasm32"))]
     pub path: Option<PathBuf>,
     /// The driver reports torque (refreshed every tick).
     pub torque_feedback: bool,
@@ -157,6 +164,13 @@ pub struct CollisionGuard {
     trip_count: usize,
     /// Trips since start (black box / logs).
     pub trips_total: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CollisionStep {
+    pub trip: Option<(usize, f32, f32)>,
+    pub escalated: bool,
+    pub released: bool,
 }
 
 impl CollisionGuard {
@@ -174,6 +188,44 @@ impl CollisionGuard {
     pub fn trips_in_window(&self, now: f64, window: f64) -> u32 {
         let n = self.trip_count.min(MAX_TRIP_HISTORY);
         self.trips[..n].iter().filter(|t| now - **t <= window).count() as u32
+    }
+
+    /// Deterministic collision transition used by simulation and WASM. Returns the
+    /// tripped joint (zero based) when a new hold is entered, or `None` otherwise.
+    pub fn step(&mut self, residuals: Option<&[f32; 6]>, dt_s: f64, now_s: f64,
+        policy: &CollisionPolicy, operational: bool, supported: &[bool; 6]) -> CollisionStep {
+        let mut out = CollisionStep::default();
+        if let Some(mut hold) = self.hold {
+            if !self.enabled || !operational { self.hold = None; self.over = [0; 6]; out.released = true; return out; }
+            let thresholds: [f32; 6] = std::array::from_fn(|j| policy.thresholds_nm[j] * self.sensitivity.factor());
+            let quiet = residuals.is_some_and(|r| (0..6).all(|j| supported[j] || r[j].abs() < policy.clear_ratio * thresholds[j]));
+            hold.quiet_s = if quiet { hold.quiet_s + dt_s } else { 0.0 };
+            if hold.quiet_s >= policy.resume_after_s { self.hold = None; self.over = [0; 6]; out.released = true; }
+            else { self.hold = Some(hold); }
+            return out;
+        }
+        if !self.enabled || !operational { self.over = [0; 6]; return out; }
+        let Some(residuals) = residuals else { self.over = [0; 6]; return out; };
+        let thresholds: [f32; 6] = std::array::from_fn(|j| policy.thresholds_nm[j] * self.sensitivity.factor());
+        let mut worst = None;
+        for j in 0..6 {
+            if !supported[j] && residuals[j].abs() > thresholds[j] {
+                self.over[j] = self.over[j].saturating_add(1);
+                let ratio = residuals[j].abs() / thresholds[j];
+                if self.over[j] >= policy.persist_ticks && worst.is_none_or(|(_, r): (usize, f32)| ratio > r) { worst = Some((j, ratio)); }
+            } else { self.over[j] = 0; }
+        }
+        if let Some((j, _)) = worst {
+            self.record_trip(now_s);
+            self.over = [0; 6];
+            let trips = self.trips_in_window(now_s, policy.escalate_window_s);
+            out.escalated = trips > policy.max_auto_resumes;
+            if !out.escalated {
+                self.hold = Some(CollisionHold { joint: j, residual_nm: residuals[j], threshold_nm: thresholds[j], since_s: now_s, quiet_s: 0.0 });
+            }
+            out.trip = Some((j, residuals[j], thresholds[j]));
+        }
+        out
     }
 }
 
@@ -204,6 +256,7 @@ pub struct CollisionSetting {
     pub sensitivity: Sensitivity,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl SupervisorInner {
     pub fn collision_policy(&self) -> CollisionPolicy {
         self.config.collision.unwrap_or_default()
@@ -273,7 +326,7 @@ impl SupervisorInner {
     pub fn collision_supported_joints(&self) -> [bool; 6] {
         let mut out = [false; 6];
         let Some(policy) = self.config.resting_pose.as_ref() else { return out; };
-        let home = &self.config.home_positions;
+        let home = self.config.resting_positions();
         // Every arm joint needs a tolerance and a reading within it (a short tolerance vector
         // would leave the joints past its end unchecked).
         let n = self.config.resting_arm_joints();
@@ -296,59 +349,26 @@ impl SupervisorInner {
         let p = self.collision_policy();
         let operational = self.is_torqued && self.safety.state().is_operational() && self.gravity_comp.is_none()
             && !self.disable_pending && !self.pending_rearm;
-        if let Some(mut hold) = self.collision.hold {
-            // A stop, torque off, gravity-comp or switching the guard off ends the hold;
-            // each of these has its own way back to motion.
-            if !self.collision.enabled || !operational {
-                tracing::info!("Collision hold on joint {} ended (guard off, stop or torque off)", hold.joint + 1);
-                self.collision.hold = None;
-                self.collision.over = [0; 6];
-                return;
-            }
-            let thr = self.collision_thresholds();
-            let supported = self.collision_supported_joints();
-            let quiet = self.residual_torques.is_some_and(|r| (0..6).all(|j| supported[j] || r[j].abs() < p.clear_ratio * thr[j]));
-            hold.quiet_s = if quiet { hold.quiet_s + dt } else { 0.0 };
-            if hold.quiet_s >= p.resume_after_s {
-                tracing::info!("Collision hold on joint {} ended: residuals below {:.0}% of the thresholds for {:.1} s",
-                    hold.joint + 1, p.clear_ratio * 100.0, p.resume_after_s);
-                self.collision.hold = None;
-                self.collision.over = [0; 6];
-            } else {
-                self.collision.hold = Some(hold);
-            }
-            return;
-        }
         let watching = self.collision.enabled && self.collision_available() && operational && self.unload_settle.is_none();
-        let Some(r) = self.residual_torques.filter(|_| watching) else {
-            self.collision.over = [0; 6];
-            return;
-        };
-        let thr = self.collision_thresholds();
         let supported = self.collision_supported_joints();
-        let mut worst: Option<(usize, f32)> = None;
-        for j in 0..6 {
-            if !supported[j] && r[j].abs() > thr[j] {
-                self.collision.over[j] = self.collision.over[j].saturating_add(1);
-                let ratio = r[j].abs() / thr[j];
-                if self.collision.over[j] >= p.persist_ticks && worst.is_none_or(|(_, w)| ratio > w) {
-                    worst = Some((j, ratio));
-                }
-            } else {
-                self.collision.over[j] = 0;
-            }
+        let now = self.start_time.elapsed().as_secs_f64();
+        let residuals = if self.collision.hold.is_some() {
+            self.residual_torques.as_ref()
+        } else {
+            self.residual_torques.as_ref().filter(|_| watching)
+        };
+        let result = self.collision.step(residuals, dt, now, &p, operational, &supported);
+        if result.released {
+            tracing::info!("Collision hold ended after quiet period");
         }
-        if let Some((j, _)) = worst {
-            self.collision_trip(j, r[j], thr[j], &p);
+        if let Some((j, residual, threshold)) = result.trip {
+            self.collision_trip(j, residual, threshold, &p, now, result.escalated);
         }
     }
 
     /// Trip on joint `j`: cancel the running action, hold the measured pose with torque on,
     /// and latch Fault `COLLISION` when this trip exceeds `max_auto_resumes` in the window.
-    fn collision_trip(&mut self, j: usize, residual: f32, threshold: f32, p: &CollisionPolicy) {
-        let now = self.start_time.elapsed().as_secs_f64();
-        self.collision.record_trip(now);
-        self.collision.over = [0; 6];
+    fn collision_trip(&mut self, j: usize, residual: f32, threshold: f32, p: &CollisionPolicy, now: f64, escalated: bool) {
         let trips = self.collision.trips_in_window(now, p.escalate_window_s);
         let message = format!("Collision on joint {}: residual {residual:.2} N·m above threshold {threshold:.2} N·m", j + 1);
         tracing::warn!("{message} (trip {trips} within {:.0} s); protective stop", p.escalate_window_s);
@@ -373,13 +393,12 @@ impl SupervisorInner {
         self.following_error_since = None;
         self.servo_lead_stall.fill(None);
         self.safety.mark_motion_finished();
-        if trips > p.max_auto_resumes {
+        if escalated {
             tracing::error!("Collision guard: {trips} trips within {:.0} s; latching Fault COLLISION", p.escalate_window_s);
             self.safety.trigger_fault_coded(FaultCode::Collision, FaultReason::Other(format!(
                 "COLLISION: {message}; {trips} trips within {:.0} s", p.escalate_window_s)));
-            return;
         }
-        self.collision.hold = Some(CollisionHold { joint: j, residual_nm: residual, threshold_nm: threshold, since_s: now, quiet_s: 0.0 });
+        // Pure step has already installed the hold state.
     }
 
     /// Apply a runtime setting (WS command / file). Enabling needs the guard to be available
@@ -403,6 +422,7 @@ impl SupervisorInner {
 
 /// WS command `/api/v1/safety/collision` `{"enabled": bool?, "sensitivity": "low"|"medium"|"high"?}`.
 /// Returns the new effective config and the file write to run after the lock is released.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(CollisionConfig, Option<PendingWrite>), ArmError> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -420,6 +440,7 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
 
 /// Load the persisted runtime setting at startup (logs the outcome). An invalid file is
 /// left untouched and the profile setting stays in force.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
     let mut inner = supervisor.inner().write().await;
     inner.collision.path = Some(path.to_path_buf());
@@ -430,5 +451,33 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
         }
         Loaded::Missing => {}
         Loaded::Invalid(e) => tracing::warn!("Ignoring collision guard file: {e}; using the profile setting"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn persistence_resume_and_escalation_use_simulation_time() {
+        let mut p = CollisionPolicy { enabled: true, thresholds_nm: [1.0; 6], persist_ticks: 2, resume_after_s: 0.5, max_auto_resumes: 1, escalate_window_s: 2.0, ..Default::default() };
+        let mut g = CollisionGuard::from_policy(&p); g.enabled = true;
+        let quiet = [0.0; 6]; let hit = [2.0, 0.0, 0.0, 0.0, 0.0, 0.0]; let mask = [false; 6];
+        assert!(g.step(Some(&hit), 0.1, 10.0, &p, true, &mask).trip.is_none());
+        let first = g.step(Some(&hit), 0.1, 10.1, &p, true, &mask); assert!(first.trip.is_some() && !first.escalated);
+        assert!(!g.step(Some(&quiet), 0.25, 10.35, &p, true, &mask).released);
+        assert!(g.step(Some(&quiet), 0.25, 10.6, &p, true, &mask).released);
+        let second = g.step(Some(&hit), 0.1, 10.7, &p, true, &mask);
+        assert!(second.trip.is_none());
+        let third = g.step(Some(&hit), 0.1, 10.8, &p, true, &mask);
+        assert!(third.trip.is_some() && third.escalated);
+        p.escalate_window_s = 0.1;
+        let later_first = g.step(Some(&hit), 0.1, 20.0, &p, true, &mask);
+        let later = g.step(Some(&hit), 0.1, 20.1, &p, true, &mask); assert!(!later.escalated && later_first.trip.is_none());
+        let mut masked = CollisionGuard::from_policy(&p); masked.enabled = true;
+        let supported = [true, false, false, false, false, false];
+        assert!(masked.step(Some(&hit), 0.1, 30.0, &p, true, &supported).trip.is_none());
+        let mut sensitive = CollisionGuard::from_policy(&p); sensitive.enabled = true; sensitive.sensitivity = Sensitivity::Low;
+        let gentle = [1.2, 0.0, 0.0, 0.0, 0.0, 0.0];
+        assert!(sensitive.step(Some(&gentle), 0.1, 40.0, &p, true, &mask).trip.is_none());
     }
 }

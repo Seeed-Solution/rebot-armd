@@ -17,7 +17,7 @@ struct RigDriver(Arc<Mutex<Rig>>);
 const STIFFNESS: f32 = 3.0;
 impl ArmDriver for RigDriver {
     fn capabilities(&self) -> DriverCapabilities {
-        DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true }
+        DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true, load_feedback: false }
     }
     fn enable_state(&self) -> EnableState { self.0.lock().unwrap().enabled }
     fn is_feedback_valid(&self) -> bool { true }

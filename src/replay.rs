@@ -54,8 +54,11 @@ pub fn parse_replay(body: &Value) -> Result<ReplayRequest, MotionError> {
 pub struct ReplayInput {
     pub request: ReplayRequest,
     pub path: std::path::PathBuf,
+    pub profile_id: Option<String>,
     pub dof: usize,
+    pub arm_dof: usize,
     pub gripper_idx: Option<usize>,
+    pub joint_names: Vec<String>,
     /// Joint soft limits (`config.limits`).
     pub limits: Vec<JointLimit>,
     /// Planned-motion limits (`planning_limits()`): the speed bound of the check.
@@ -134,6 +137,53 @@ fn lerp_frames(a: &RecordFrame, b: &RecordFrame, t: f64) -> Vec<f32> {
 
 /// Load, resample and check an episode for replay. Pure (file read, no lock).
 pub fn plan(input: ReplayInput) -> Result<ReplayPlan, ArmError> {
+    let meta = match crate::recording::read_metadata_from_parquet(&input.path) {
+        Ok(m) => m,
+        Err(crate::recording::ParquetRecordingError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(rejected(404, "EPISODE_NOT_FOUND", format!("Episode '{}' not found", input.request.episode)));
+        }
+        Err(e) => {
+            return Err(rejected(422, "REPLAY_INVALID_EPISODE", format!("Failed to read episode metadata for '{}': {e}", input.request.episode)));
+        }
+    };
+    if input.arm_dof == 5 {
+        let has_arm_dof = meta.as_ref().and_then(|m| m.arm_dof).is_some();
+        if !has_arm_dof {
+            return Err(rejected(400, "REPLAY_DOF_MISMATCH", format!(
+                "Episode '{}' missing arm_dof on 5-DOF profile", input.request.episode
+            )));
+        }
+    }
+    if let Some(ref m) = meta {
+        if let (Some(ref stored_pid), Some(ref active_pid)) = (&m.profile_id, &input.profile_id) {
+            if stored_pid != active_pid {
+                return Err(rejected(400, "REPLAY_DOF_MISMATCH", format!(
+                    "Episode '{}' profile_id '{stored_pid}' does not match active profile_id '{active_pid}'", input.request.episode
+                )));
+            }
+        }
+        if let Some(ad) = m.arm_dof {
+            if ad != input.arm_dof {
+                return Err(rejected(400, "REPLAY_DOF_MISMATCH", format!(
+                    "Episode '{}' arm_dof {ad} does not match active config arm_dof {}", input.request.episode, input.arm_dof
+                )));
+            }
+        }
+        if let Some(gj) = m.gripper_joint {
+            if Some(gj) != input.gripper_idx {
+                return Err(rejected(400, "REPLAY_DOF_MISMATCH", format!(
+                    "Episode '{}' gripper_joint {gj} does not match active config gripper_joint {:?}", input.request.episode, input.gripper_idx
+                )));
+            }
+        }
+        if let Some(ref jn) = m.joint_names {
+            if jn != &input.joint_names {
+                return Err(rejected(400, "REPLAY_DOF_MISMATCH", format!(
+                    "Episode '{}' joint_names do not match active config joint_names", input.request.episode
+                )));
+            }
+        }
+    }
     let frames = match crate::recording::read_frames_from_parquet(&input.path) {
         Ok(f) => f,
         Err(crate::recording::ParquetRecordingError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -390,8 +440,11 @@ impl SupervisorInner {
         self.replay_preconditions()?;
         Ok(ReplayInput {
             path,
+            profile_id: self.config.profile_id.clone(),
             dof: self.config.dof,
+            arm_dof: self.config.arm_dof(),
             gripper_idx: self.config.gripper_index(),
+            joint_names: self.config.limits.iter().map(|l| l.name.clone()).collect(),
             limits: self.config.limits.clone(),
             speed_limits: self.planning_limits(),
             ws: self.workspace_policy().map(|(ws, cam)| (ws.clone(), cam.clone())),

@@ -2,15 +2,19 @@ pub mod assets;
 pub mod diagnostics;
 pub mod proxy;
 pub mod rest;
+pub mod sandbox;
 pub mod ws;
 
 use std::sync::Arc;
 use axum::{
-    response::Html,
+    body::Body,
+    extract::DefaultBodyLimit,
+    http::{Request, StatusCode},
+    middleware::{self, Next},
+    response::{Html, Response},
     routing::{get, post},
     Router,
 };
-use axum::{body::Body, http::{Request, StatusCode}, middleware::{self, Next}, response::Response};
 use tower_http::trace::TraceLayer;
 
 use crate::supervisor::ArmSupervisor;
@@ -63,6 +67,38 @@ pub fn create_router_full(
         .route("/assets/jmuxer.min.js", get(serve_jmuxer))
         .route("/assets/three-urdf.min.js", get(assets::serve_three))
         .route("/assets/model/{*path}", get(assets::serve_model))
+        .route("/assets/wasm/{*path}", get(assets::serve_wasm))
+        .route("/api/v1/sandbox/catalog", get(sandbox::get_catalog))
+        .route(
+            "/api/v1/sandbox/scenes",
+            post(sandbox::upload_scene)
+                .layer(DefaultBodyLimit::max(sandbox::MAX_SCENE_UPLOAD_BYTES))
+                .layer(middleware::from_fn(sandbox::upload_concurrency_middleware)),
+        )
+        .route("/api/v1/sandbox/scenes/{id}", get(sandbox::get_scene))
+        .route("/api/v1/sandbox/scenes/{id}/files/{*path}", get(sandbox::serve_scene_file))
+        .route(
+            "/api/v1/sandbox/tools",
+            post(sandbox::upload_tool)
+                .layer(DefaultBodyLimit::max(sandbox::MAX_TOOL_UPLOAD_BYTES))
+                .layer(middleware::from_fn(sandbox::upload_concurrency_middleware)),
+        )
+        .route("/api/v1/sandbox/tools/{id}", get(sandbox::get_tool))
+        .route("/api/v1/sandbox/tools/{id}/files/{*path}", get(sandbox::serve_tool_file))
+        .route(
+            "/api/v1/sandbox/policies",
+            post(sandbox::upload_policy)
+                .layer(DefaultBodyLimit::max(sandbox::MAX_POLICY_UPLOAD_BYTES))
+                .layer(middleware::from_fn(sandbox::upload_concurrency_middleware)),
+        )
+        .route("/api/v1/sandbox/policies/{id}", get(sandbox::get_policy))
+        .route("/api/v1/sandbox/policies/{id}/files/{*path}", get(sandbox::serve_policy_file))
+        .route("/api/v1/sandbox/activate", post(sandbox::activate))
+        .route("/api/v1/sandbox/bundle", get(sandbox::get_bundle))
+        .route("/api/v1/sandbox/state", get(sandbox::get_state))
+        .route("/api/v1/sandbox/reset", post(sandbox::reset))
+        .route("/api/v1/sandbox/io", post(sandbox::set_io))
+        .route("/api/v1/sandbox/telemetry", post(sandbox::post_telemetry))
         .route("/api/v1/observation", get(rest::get_observation))
         .route("/api/v1/observation/schema", get(rest::get_observation_schema))
         .route("/api/v1/torque", post(rest::set_torque))
@@ -121,6 +157,7 @@ pub fn create_router_full(
         .layer(axum::Extension(proxy::VisionCache::default()))
         .layer(axum::Extension(grasp))
         .layer(axum::Extension(diagnostics))
+        .layer(axum::Extension(sandbox::SandboxState::new_shared()))
         .layer(middleware::from_fn(same_origin))
         .layer(TraceLayer::new_for_http())
         .with_state(supervisor)

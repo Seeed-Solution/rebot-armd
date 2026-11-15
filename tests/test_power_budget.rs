@@ -48,7 +48,7 @@ impl SimArm {
 
 impl ArmDriver for SimArm {
     fn capabilities(&self) -> DriverCapabilities {
-        DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true }
+        DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: false, enable_feedback: true, load_feedback: false }
     }
     fn enable_state(&self) -> EnableState { if self.0.lock().unwrap().torqued { EnableState::Enabled } else { EnableState::Disabled } }
     fn is_feedback_valid(&self) -> bool { true }
@@ -693,7 +693,7 @@ fn cartesian_path_fit_and_action_record() {
     let n = 60;
     let q: Vec<[f32; 7]> = (0..=n).map(|k| { let mut q = STRETCHED; q[1] -= k as f32 / n as f32; q }).collect();
     let s: Vec<f64> = (0..=n).map(|k| k as f64 / n as f64).collect();
-    let mut path = armd::motion::JointPath { q, s, duration: 1.0, power_scale: 1.0 };
+    let mut path = armd::motion::JointPath { dof: 7, arm_dof: 6, q, s, duration: 1.0, power_scale: 1.0 };
     let fit = path.fit_power(&b, &arm).unwrap();
     eprintln!("Cartesian-style path, 1 rad on J2 in 1 s: scale {:.3}, duration {:.2} s, peak {:.2} A of {:.2} A at full speed", fit.scale, path.duration, fit.peak_a, fit.peak_full_a);
     assert!(fit.scale < 1.0 && (path.duration - 1.0 / fit.scale).abs() < 1e-9 && path.power_scale == fit.scale);
@@ -724,7 +724,8 @@ fn replay_is_slowed_to_fit() {
     }).collect();
     let input = armd::replay::ReplayInput {
         request: armd::replay::ReplayRequest { episode: "swing".into(), speed: 1.0, gripper: false, tag: None },
-        path: std::path::PathBuf::from("/nonexistent"), dof: 7, gripper_idx: Some(6),
+        path: std::path::PathBuf::from("/nonexistent"), profile_id: inner.config.profile_id.clone(), dof: 7, arm_dof: 6, gripper_idx: Some(6),
+        joint_names: inner.config.limits.iter().map(|l| l.name.clone()).collect(),
         limits: inner.config.limits.clone(), speed_limits: inner.planning_limits(), ws: None,
         arm: inner.config.arm_model.clone(), start: STRETCHED.to_vec(), control_hz: 50, epoch: inner.safety.epoch_id(),
         workspace_revision: 0, power: inner.power_budget().cloned(),

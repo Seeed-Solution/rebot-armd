@@ -165,31 +165,9 @@ fn test_feetech_radian_step_conversions() {
 fn test_feetech_driver_mock_loopback() {
     let mock = MockTransport::new();
     let servo_ids = vec![1, 2, 3];
-    let mut driver = FeetechArmDriver::new(mock, servo_ids.clone());
+    let mut driver = FeetechArmDriver::new(mock, servo_ids.clone()).with_calibrated(true);
 
-    // 1. Test set_torque(true)
-    driver.set_torque(true).unwrap();
-    let tx_bytes = driver.transport_mut().take_tx();
-    // 3 servos * 8 bytes each = 24 bytes
-    assert_eq!(tx_bytes.len(), 24);
-
-    // 2. Test write_joint_targets
-    let targets = vec![
-        JointTarget::position(0.0),
-        JointTarget::position(PI / 4.0),
-        JointTarget::position(-PI / 4.0),
-    ];
-    driver.write_joint_targets(&targets).unwrap();
-    let sync_tx = driver.transport_mut().take_tx();
-    assert!(!sync_tx.is_empty());
-    assert_eq!(sync_tx[4], INST_SYNC_WRITE);
-
-    // Target count mismatch error
-    let invalid_targets = vec![JointTarget::position(0.0)];
-    let err = driver.write_joint_targets(&invalid_targets).unwrap_err();
-    assert!(matches!(err, ArmDriverError::JointCountMismatch { .. }));
-
-    // 3. Test read_joint_states with simulated responses
+    // 1. Test initial feedback invalid, then read_joint_states with simulated responses
     // For each servo, prepare an 8-byte response frame
     // Address 0x38: pos(2), speed(2), load(2), volt(1), temp(1)
     let mut rx_responses = Vec::new();
@@ -222,6 +200,39 @@ fn test_feetech_driver_mock_loopback() {
         assert!((s.temperature - 38.0).abs() < 1e-4);
     }
     assert!(driver.is_feedback_valid());
+    let _ = driver.transport_mut().take_tx();
+
+    // 2. Test set_torque(true) with feedback valid and pre-seeding
+    // Provide readback responses for REG_TORQUE_ENABLE (1 byte, value 1)
+    let mut enable_rx = Vec::new();
+    for &id in &servo_ids {
+        let params = [1u8];
+        let length = (params.len() + 2) as u8;
+        let cs = feetech::calculate_checksum(id, length, 0x00, &params);
+        enable_rx.extend_from_slice(&[0xFF, 0xFF, id, length, 0x00, 1, cs]);
+    }
+    driver.transport_mut().provide_rx(&enable_rx);
+
+    driver.set_torque(true).unwrap();
+    let tx_bytes = driver.transport_mut().take_tx();
+    // Pre-seeding SYNC_WRITE (17 bytes) + 3 servos write (8 bytes each) + 3 servos read (8 bytes each) = 65 bytes
+    assert_eq!(tx_bytes.len(), 65);
+
+    // 3. Test write_joint_targets
+    let targets = vec![
+        JointTarget::position(0.0),
+        JointTarget::position(PI / 4.0),
+        JointTarget::position(-PI / 4.0),
+    ];
+    driver.write_joint_targets(&targets).unwrap();
+    let sync_tx = driver.transport_mut().take_tx();
+    assert!(!sync_tx.is_empty());
+    assert_eq!(sync_tx[4], INST_SYNC_WRITE);
+
+    // Target count mismatch error
+    let invalid_targets = vec![JointTarget::position(0.0)];
+    let err = driver.write_joint_targets(&invalid_targets).unwrap_err();
+    assert!(matches!(err, ArmDriverError::JointCountMismatch { .. }));
 }
 
 // =========================================================================

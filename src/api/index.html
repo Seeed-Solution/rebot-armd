@@ -735,11 +735,12 @@ body.input-stick .cart-sticks { display: flex; }
 .vlab b { font-size: 11px; color: var(--sc-color-text-secondary); font-weight: 600; }
 .cbtn b { font: 600 10px var(--mono); color: var(--sc-color-text-tertiary); }
 .cbtn.pressed b { color: #fff; }
-.cart-side { display: grid; gap: 10px; }
+.cart-side { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; min-width: 0; }
 body.input-stick #step-seg { display: none; }
-.grip-slider { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px; font-size: 12px; color: var(--sc-color-text-secondary); }
+.grip-slider { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; font-size: 12px; color: var(--sc-color-text-secondary); min-width: 0; }
 .grip-slider b { color: var(--sc-color-primary-dark); margin-right: 3px; }
 .grip-slider output { font: 600 12px var(--mono); color: var(--sc-color-text); min-width: 36px; text-align: right; }
+.grip-slider input[type=range] { width: 100%; min-width: 0; }
 input[type=range] { -webkit-appearance: none; appearance: none; height: 6px; border-radius: 3px; touch-action: none;
   background: linear-gradient(to right, var(--sc-color-primary) var(--v, 0%), #e5ecd9 var(--v, 0%)); }
 input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; border-radius: 50%; background: #fff; border: 2px solid var(--sc-color-primary-dark); box-shadow: 0 1px 3px rgba(0,0,0,0.15); }
@@ -1888,7 +1889,7 @@ const I18N = {
     'calib.ok.solve.eih': '标定完成，位置 RMSE {rmse} mm，姿态 RMSE {rot}°', 'calib.rmse.warn.eih': '残差偏大：检查标记是否固定不动、采集时机械臂是否静止，删除标黄的位姿后重新求解',
     'calib.r.frame': '结果', 'calib.r.rmse_pos': '位置残差 RMSE', 'calib.r.rmse_rot': '姿态残差 RMSE',
     'rec.chip0': '录制 00:00', 'rec.chip': '录制 ',
-    'v3.aria': '3D 视图', 'vs.label': '画面', 'vs.video': '视频', 'v3.loading': '正在加载 3D 视图…', 'v3.err': '3D 视图加载失败：{m}', 'v3.stick': '未安装机械臂网格，显示关节骨架', 'v3.offline': '无遥测，显示最后姿态', 'v3.hint': '拖动旋转 · 双指缩放',
+    'v3.aria': '3D 视图', 'vs.label': '画面', 'vs.video': '视频', 'v3.loading': '正在加载 3D 视图…', 'v3.err': '3D 视图加载失败：{m}', 'v3.stick': '未安装机械臂网格，显示关节骨架', 'v3.offline': '无遥测，显示最后姿态', 'v3.hint': '拖动旋转 · 双指缩放', 'v3.wasm': 'WASM 物理沙箱', 'v3.wasm_pol': 'WASM 物理沙箱 · 策略 {p}', 'v3.sim_scene': '后端仿真场景',
     'v3.leg.meas': '实测', 'v3.leg.cmd': '指令', 'v3.leg.ws': '工作空间', 'v3.leg.ko': '禁入区',
     'pc.title': '姿态 · 侧视', 'pc.hint': '点按查看 3D', 'pc.aria': '机械臂姿态侧视图，点按打开 3D 视图', 'pc.collapse': '收起姿态图', 'pc.expand': '展开姿态图', 'pc.cmd': '指令', 'banner.lock': '遥测断开 · 控制已锁定',
     'ctl.mode': '控制方式', 'mode.joint': '关节点动', 'mode.cart': '空间位姿', 'home': '回零',
@@ -2082,7 +2083,7 @@ const I18N = {
     'calib.ok.solve.eih': 'Calibration solved, position RMSE {rmse} mm, rotation RMSE {rot}°', 'calib.rmse.warn.eih': 'High residual: check the marker is fixed and the arm was still; delete the highlighted poses and solve again',
     'calib.r.frame': 'Result', 'calib.r.rmse_pos': 'Position RMSE', 'calib.r.rmse_rot': 'Rotation RMSE',
     'rec.chip0': 'REC 00:00', 'rec.chip': 'REC ',
-    'v3.aria': '3D view', 'vs.label': 'View', 'vs.video': 'Video', 'v3.loading': 'Loading 3D view…', 'v3.err': '3D view failed to load: {m}', 'v3.stick': 'Arm meshes not installed; showing the joint skeleton', 'v3.offline': 'No telemetry; showing the last pose', 'v3.hint': 'Drag to rotate · pinch to zoom',
+    'v3.aria': '3D view', 'vs.label': 'View', 'vs.video': 'Video', 'v3.loading': 'Loading 3D view…', 'v3.err': '3D view failed to load: {m}', 'v3.stick': 'Arm meshes not installed; showing the joint skeleton', 'v3.offline': 'No telemetry; showing the last pose', 'v3.hint': 'Drag to rotate · pinch to zoom', 'v3.wasm': 'WASM physics sandbox', 'v3.wasm_pol': 'WASM sandbox · policy {p}', 'v3.sim_scene': 'Backend sim scene',
     'v3.leg.meas': 'Measured', 'v3.leg.cmd': 'Commanded', 'v3.leg.ws': 'Workspace', 'v3.leg.ko': 'Keep-out',
     'pc.title': 'Pose · side view', 'pc.hint': 'Tap for 3D', 'pc.aria': 'Arm pose side view; tap to open the 3D view', 'pc.collapse': 'Collapse pose view', 'pc.expand': 'Expand pose view', 'pc.cmd': 'Commanded', 'banner.lock': 'Telemetry lost · controls locked',
     'ctl.mode': 'Control mode', 'mode.joint': 'Joint jog', 'mode.cart': 'Cartesian', 'home': 'Home',
@@ -2469,9 +2470,14 @@ const S = {
   detections: [],
   detLastReceivedAt: 0,
   ui: 'simple',               // simple | expert
+  uiUserSet: false,
+  profileId: null,
+  rest: null,
   hb: { n: 0, hz: 0, at: 0 }, // lease heartbeats sent: count this second, rate, last send time
   preset: null,               // { name, until } while a preset motion runs
 };
+const isSoArmProfile = () => !!(S.profileId && S.profileId.startsWith('so_arm'));
+let schemaReady = null;
 const speedScale = () => CFG.speeds[S.speedIdx];
 // 5-DOF cartesian teleop state (model frame, metres / radians)
 const C = {
@@ -2489,6 +2495,7 @@ const C = {
   lastTick: 0, lastInput: 0, tailUntil: 0, stallSince: 0,
   gripJog: 0,                 // -1 (close) .. +1 (open) continuous rate jog
   status: 'idle', msg: '', solveUs: null, inflight: false, sending: false, gripDrag: false,
+  cartHoldActive: false, cartActionId: null, cartActionUntil: 0, stopPending: false, stepInflight: false, stepActionId: null,
 };
 
 /* =================================================================
@@ -4252,10 +4259,15 @@ function calRender() {
     li.append(b, a, x);
     list.appendChild(li);
   });
-  $('calib-solve').disabled = n < calMin() || CAL.busy;
+  const isSoArm = isSoArmProfile() || (S.armDof != null && S.armDof !== 6);
+  $('calib-solve').disabled = n < calMin() || CAL.busy || isSoArm;
   $('calib-export').disabled = n === 0;
-  $('calib-cap').disabled = CAL.busy;
-  setText($('calib-cap'), t(CAL.busy ? 'calib.cap.busy' : 'calib.cap'));
+  $('calib-cap').disabled = CAL.busy || isSoArm;
+  if (isSoArm) {
+    setText($('calib-cap'), 'Hand-Eye FK calibration supports 6-arm-DOF B601 only');
+  } else {
+    setText($('calib-cap'), t(CAL.busy ? 'calib.cap.busy' : 'calib.cap'));
+  }
   const rb = $('calib-reset'), armed = Date.now() < CAL.resetArmedUntil;
   rb.classList.toggle('armed', armed);
   setText(rb, t(armed ? 'calib.reset.confirm' : 'calib.reset'));
@@ -4291,6 +4303,10 @@ function calLive() {
 }
 async function calCapture() {
   if (CAL.busy) return;
+  if (isSoArmProfile() || (S.armDof != null && S.armDof !== 6)) {
+    toast('Hand-Eye FK calibration currently supports 6-arm-DOF B601 only', 'warn');
+    return;
+  }
   if (!isLive() || !S.obs || !Array.isArray(S.obs.positions) || S.obs.positions.length < 4) { toast(t('calib.e.offline'), 'warn'); return; }
   if (Array.isArray(S.obs.velocities) && S.obs.velocities.some((v) => Math.abs(v) > 0.02)) { toast(t('calib.e.moving'), 'warn'); return; }
   const eih = calEih();
@@ -4403,7 +4419,37 @@ function applyJointMap(map) {
 async function loadSchema() {
   try {
     const sc = await api('/api/v1/observation/schema', undefined, { quiet: true, method: 'GET' });
-    if (sc) { S.caps = sc.capabilities || {}; S.powerGov = (sc.power_budget && sc.power_budget.governor) || null; PWR.key = ''; S.wsPolicy = sc.workspace || null; S.home = Array.isArray(sc.home_positions) ? sc.home_positions : null; colOnCaps(); posesOnCaps(); epOnCaps(); V3.sceneAt = 0; }
+    const oldProfile = S.profileId;
+    const oldClosed = CFG.gripClosed;
+    const oldOpen = CFG.gripOpen;
+    if (sc) {
+      S.profileId = sc.profile_id || null;
+      S.armDof = sc.arm_dof || (sc.dof ? (sc.dof === 7 ? 6 : sc.dof - 1) : 6);
+      S.gripperJoint = Number.isInteger(sc.gripper_joint) ? sc.gripper_joint : (sc.dof ? sc.dof - 1 : 6);
+      S.orientationDof = sc.orientation_dof != null ? sc.orientation_dof : (S.armDof >= 6 ? 3 : 2);
+      S.jointNames = sc.joint_names || null;
+      S.caps = sc.capabilities || {};
+      S.zeroCheckSupported = sc.gripper_policy ? !!sc.gripper_policy.zero_check_supported : (sc.capabilities ? !!sc.capabilities.zero_check_supported : false);
+      S.powerGov = (sc.power_budget && sc.power_budget.governor) || null;
+      PWR.key = '';
+      S.wsPolicy = sc.workspace || null;
+      S.home = Array.isArray(sc.home_positions) ? sc.home_positions : null;
+      S.rest = Array.isArray(sc.resting_pose?.positions) ? sc.resting_pose.positions : S.home;
+      if (sc.gripper_policy && Number.isFinite(sc.gripper_policy.closed_rad) && Number.isFinite(sc.gripper_policy.open_rad)) {
+        CFG.gripClosed = sc.gripper_policy.closed_rad;
+        CFG.gripOpen = sc.gripper_policy.open_rad;
+        if (oldClosed !== CFG.gripClosed || oldOpen !== CFG.gripOpen) {
+          S.grip = null;
+          PCARD.key = '';
+        }
+      }
+      if (sc.workspace && Number.isFinite(sc.workspace.max_reach_m)) {
+        CFG.cart.reachMax = sc.workspace.max_reach_m;
+        const rmaxEl = $('c-rmax');
+        if (rmaxEl) rmaxEl.textContent = Math.round(CFG.cart.reachMax * 1000);
+      }
+      colOnCaps(); posesOnCaps(); epOnCaps(); V3.sceneAt = 0;
+    }
     if (sc && Array.isArray(sc.model_joint_map) && sc.model_joint_map.length >= 6) applyJointMap(sc.model_joint_map);
     if (sc && Array.isArray(sc.limits) && sc.limits.length) {
       const oldDof = S.dof;
@@ -4411,16 +4457,26 @@ async function loadSchema() {
       S.dof = sc.dof || sc.limits.length;
       // mirror the server's Cartesian floor so the cockpit stops at the same height
       if (sc.workspace && Number.isFinite(sc.workspace.floor_z_m)) CFG.cart.zMin = sc.workspace.floor_z_m;
-      GRIP = S.dof - 1;
+      GRIP = Number.isInteger(sc.gripper_joint) ? sc.gripper_joint : S.dof - 1;
       S.hold = Array.from({ length: S.dof }, () => [0, 0]);
       // S.dof defaults to 7, so the 7-DOF text variant is set on every schema load, not only on a DOF change.
       const variant = S.dof === 7 ? '@7' : '';
       document.querySelectorAll('.kb-dof7').forEach((el) => { el.hidden = S.dof !== 7; });
-      if (oldDof !== S.dof || variant !== I18N_VARIANT) {
+      if (oldDof !== S.dof || oldProfile !== S.profileId || variant !== I18N_VARIANT) {
         I18N_VARIANT = variant;
         renderJogRows();
         renderGripCol();
+        if (typeof renderJtable === 'function') renderJtable();
         applyI18n();
+      }
+      if (isSoArmProfile() && oldProfile !== S.profileId && !QS.get('ui') && !S.uiUserSet) {
+        setUi('expert');
+      }
+      if (oldProfile !== S.profileId && V3.r) {
+        if (V3.solid) { V3.root.remove(V3.solid.obj); V3.solid = null; }
+        if (V3.ghost) { V3.root.remove(V3.ghost.obj); V3.ghost = null; }
+        V3.init = null;
+        if (V3.open) v3Start();
       }
       applyFrame();
     }
@@ -4515,7 +4571,7 @@ function bindHold(btn, j, s) {
 function jogButton(j, s, label, key) {
   const b = document.createElement('button');
   b.className = 'jbtn ' + (s > 0 ? 'pos' : 'neg');
-  const list = (S.dof === 7) ? JOINTS_7DOF : CFG.joints;
+  const list = activeJoints();
   const name = list[j]?.key ?? ('J' + (j + 1));
   b.setAttribute('aria-label', `${name} ${label}`);
   b.innerHTML = s > 0
@@ -4535,6 +4591,17 @@ const JOINTS_7DOF = [
   { key: 'J7', part: 'jd.grip.part', motion: 'jd.grip.motion', en: 'Gripper', neg: 'jd.grip.neg', pos: 'jd.grip.pos', kn: 'Z', kp: 'X' },
 ];
 
+const JOINTS_SO_ARM = [
+  { key: 'J1', part: 'jd.base.part', motion: 'jd.base.motion', en: 'Shoulder Pan', neg: 'jd.base.neg', pos: 'jd.base.pos', kn: 'A', kp: 'D' },
+  { key: 'J2', part: 'jd.shoulder.part', motion: 'jd.shoulder.motion', en: 'Shoulder Lift', neg: 'jd.shoulder.neg', pos: 'jd.shoulder.pos', kn: 'S', kp: 'W' },
+  { key: 'J3', part: 'jd.elbow.part', motion: 'jd.elbow.motion', en: 'Elbow Flex', neg: 'jd.elbow.neg', pos: 'jd.elbow.pos', kn: '↓', kp: '↑' },
+  { key: 'J4', part: 'jd.wpitch.part', motion: 'jd.wpitch.motion', en: 'Wrist Flex', neg: 'jd.wpitch.neg', pos: 'jd.wpitch.pos', kn: 'Q', kp: 'E' },
+  { key: 'J5', part: 'jd.wroll.part', motion: 'jd.wroll.motion', en: 'Wrist Roll', neg: 'jd.wroll.neg', pos: 'jd.wroll.pos', kn: '←', kp: '→' },
+  { key: 'J6', part: 'jd.grip.part', motion: 'jd.grip.motion', en: 'Gripper', neg: 'jd.grip.neg', pos: 'jd.grip.pos', kn: 'Z', kp: 'X' },
+];
+
+const activeJoints = () => (S.dof === 7) ? JOINTS_7DOF : isSoArmProfile() ? JOINTS_SO_ARM : CFG.joints;
+
 /* ---------- jog rows (dynamically rendered) ---------- */
 let rows = [];
 function renderJogRows() {
@@ -4542,7 +4609,7 @@ function renderJogRows() {
   if (!container) return;
   container.innerHTML = '';
   holdButtons.length = 0;
-  const list = (S.dof === 7) ? JOINTS_7DOF : CFG.joints;
+  const list = activeJoints();
   rows = list.map((jd, i) => {
     const row = document.createElement('div');
     row.className = 'jrow' + (i === GRIP ? ' grip' : '');
@@ -4715,14 +4782,22 @@ function releaseAll() {
   for (const k in C.hold) { C.hold[k][0] = 0; C.hold[k][1] = 0; }
   if (C.cmd) C.goal = { ...C.cmd }; // drop any queued step that has not been executed yet
   if (C.T) C.Tg = C.T;
+  if (C.stepInflight || (C.stepActionId != null && S.obs?.action?.id === C.stepActionId && S.obs?.action?.state === 'running')) {
+    C.cartHoldActive = true;
+  }
   requestMotionStop();
 }
 function requestMotionStop() {
-  if (!S.streamActive || S.presetRunning) return;
+  if ((!S.streamActive && !C.cartHoldActive && !C.inflight) || S.presetRunning) return;
   S.streamActive = false;
   S.servoTarget = null;
   C.tailUntil = 0; C.lastInput = -Infinity;
   S.gripCmdAt = 0;
+  if (C.inflight || C.stepInflight) C.stopPending = true;
+  C.cartHoldActive = false;
+  C.cartActionId = null;
+  C.cartActionUntil = 0;
+  C.stepActionId = null;
   if (S.obs && S.obs.positions.length >= 5) cartSync(S.obs.positions);
   api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e));
 }
@@ -4867,6 +4942,18 @@ const IK_MSG = {
 // Simple mode always uses it; the stored view/base choice applies to expert mode only.
 const viewActive = () => S.dof === 7 && (S.ui === 'simple' || C.frame === 'view');
 function cartSync(pos) {
+  if (isSoArmProfile()) {
+    const tcp = S.obs?.tcp;
+    C.cmd = tcp && Array.isArray(tcp.xyz_m) ? { x: tcp.xyz_m[0], y: tcp.xyz_m[1], z: tcp.xyz_m[2], pitch: tcp.rpy_rad?.[1] ?? 0 } : { x: 0.25, y: 0, z: 0.10, pitch: 0 };
+    C.goal = { ...C.cmd };
+    C.j5 = pos[4] ?? 0;
+    C.branch = 'URDF';
+    C.T = null;
+    C.Tg = null;
+    C.q6 = null;
+    C.wq = [0, 0];
+    return;
+  }
   C.q = toModel(pos);
   C.cmd = IK.fk(C.q);
   C.goal = { ...C.cmd };
@@ -5003,6 +5090,39 @@ function clampJ5(x) {
 }
 function cartKick() { C.lastInput = performance.now(); C.tailUntil = C.lastInput + CFG.cart.tailMs; }
 function cartStep(ax, s) {
+  if (isSoArmProfile()) {
+    const n = CFG.cart.steps[C.stepIdx];
+    if (ax === 'x' || ax === 'y' || ax === 'z') {
+      C.stepInflight = true;
+      commandRPC('/api/v1/action/move_relative', {
+        frame: 'base',
+        d: [
+          ax === 'x' ? s * n / 1000 : 0,
+          ax === 'y' ? s * n / 1000 : 0,
+          ax === 'z' ? s * n / 1000 : 0,
+        ],
+      }).then((ack) => {
+        syncEpoch(ack?.epoch_id);
+        C.stepActionId = ack?.action_id ?? null;
+        if (C.stopPending) {
+          C.stopPending = false;
+          C.stepActionId = null;
+          api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e));
+        }
+      }).catch(toastOnce).finally(() => {
+        C.stepInflight = false;
+      });
+    } else if (ax === 'p' || ax === 'r') {
+      const pos = (S.obs && Array.isArray(S.obs.positions)) ? S.obs.positions : (S.home || []);
+      const jIdx = ax === 'p' ? 3 : 4;
+      const nextPos = pos.slice(0, S.dof);
+      while (nextPos.length < S.dof) nextPos.push(0);
+      nextPos[jIdx] = (nextPos[jIdx] || 0) + s * n / DEG;
+      commandRPC('/api/v1/motion/jog', { target_positions: clampTarget(nextPos) }).catch(toastOnce);
+    }
+    cartKick();
+    return;
+  }
   if (viewActive()) {
     if (!C.Tg) return;
     const n = CFG.cart.steps[C.stepIdx], v = { x: 0, y: 0, z: 0, p: 0, r: 0 };
@@ -5066,6 +5186,87 @@ function cartTick() {
   C.lastTick = now;
   if (!isLive() || !canMove() || S.epoch == null) {
     cartSync(pos); C.tailUntil = 0; C.status = 'idle'; C.msg = '';
+    return;
+  }
+  if (isSoArmProfile()) {
+    const tcp = S.obs.tcp;
+    if (tcp && Array.isArray(tcp.xyz_m)) {
+      C.cmd = { x: tcp.xyz_m[0], y: tcp.xyz_m[1], z: tcp.xyz_m[2], pitch: tcp.rpy_rad?.[1] ?? 0 };
+      C.goal = { ...C.cmd };
+    }
+    const v = cartVelocity();
+    const gv = cartGripVel();
+    const scale = speedScale();
+    const gripErr = pos.length > GRIP ? Math.abs(gripRad() - pos[GRIP]) : 0;
+    const gripStalled = Date.now() - S.gripCmdAt > 1200 && Math.abs(S.obs.velocities?.[GRIP] ?? 0) < 0.05;
+    const gripMoving = (gripErr > 0.015 && !gripStalled) || gv !== 0;
+    const hasInput = v.x || v.y || v.z || v.p || v.r || gripMoving;
+    if (hasInput) cartKick();
+
+    if (pos.length > GRIP && gv) {
+      const cur = S.grip ?? gripFrac(pos[GRIP]);
+      S.grip = gripNoWindup(clamp(cur + gv * CFG.gripRate * scale * dt, 0, 1), pos[GRIP]);
+      S.gripCmdAt = Date.now();
+    }
+
+    const actionRunning = S.obs?.action?.state === 'running';
+    if (C.cartActionId != null && S.obs?.action?.id === C.cartActionId && !actionRunning) {
+      C.cartActionId = null;
+      C.cartActionUntil = 0;
+    }
+    const actionBusy = actionRunning || (C.cartActionId != null && now < C.cartActionUntil);
+
+    if (v.x || v.y || v.z) {
+      C.status = 'ok';
+      C.msg = '';
+      if (!C.inflight && !actionBusy && !S.presetRunning) {
+        C.inflight = true;
+        C.cartHoldActive = true;
+        C.stopPending = false;
+        const stepM = scale * 0.015;
+        const speed = {
+          linear: clamp(0.05 * scale, 0.01, 0.15),
+          angular: clamp(0.5 * scale, 0.05, 1.0),
+        };
+        commandRPC('/api/v1/action/move_relative', {
+          frame: 'base',
+          d: [v.x * stepM, v.y * stepM, v.z * stepM],
+          speed,
+        }).then((ack) => {
+          syncEpoch(ack?.epoch_id);
+          C.cartActionId = ack?.action_id ?? null;
+          C.cartActionUntil = performance.now() + Math.min(400, (ack?.expected_duration_s || 0.2) * 1000);
+          if (C.stopPending) {
+            C.stopPending = false;
+            C.cartHoldActive = false;
+            C.cartActionId = null;
+            C.cartActionUntil = 0;
+            api('/api/v1/motion/stop', {}, { quiet: true }).catch((e) => toastOnce(e));
+          }
+        }).catch((e) => {
+          if (e && e.code === 'MOTION_BUSY') return;
+          C.cartHoldActive = false;
+          toastOnce(e);
+        }).finally(() => {
+          C.inflight = false;
+        });
+      }
+    }
+
+    if (v.p || v.r || gripMoving) {
+      const wl = CFG.cart.wmax * scale;
+      const cmdPos = (Array.isArray(S.obs?.commanded_positions) && S.obs.commanded_positions.length >= S.dof
+        && S.obs.commanded_positions.slice(0, S.dof).every(Number.isFinite))
+        ? S.obs.commanded_positions : pos;
+      let t = cmdPos.slice(0, S.dof);
+      while (t.length < S.dof) t.push(0);
+      if (t.length > 3 && v.p) t[3] = clamp(t[3] + v.p * wl * dt, S.limits[3].min_position, S.limits[3].max_position);
+      if (t.length > 4 && v.r) t[4] = clamp(t[4] + v.r * wl * dt, S.limits[4].min_position, S.limits[4].max_position);
+      if (t.length > GRIP) t[GRIP] = gripRad();
+      t = clampTarget(t);
+      C.sending = true;
+      if (!S.presetRunning && !(v.x || v.y || v.z) && !C.inflight && !actionBusy) cartSend(t);
+    }
     return;
   }
   const v = cartVelocity();
@@ -5824,7 +6025,8 @@ function renderGc() {
   const gc = S.obs?.gravity_comp, on = gcOn(), live = isLive();
   document.body.classList.toggle('gc', on && live);
   const sw = $('btn-gc');
-  sw.hidden = !gc || !gc.supported;
+  const supported = !!(gc && gc.supported) && (S.caps ? S.caps.gravity_comp !== false : true);
+  sw.hidden = !supported;
   const why = on ? null : gcBlockText();
   sw.classList.toggle('on', on);
   sw.classList.toggle('blocked', !on && !!why);
@@ -5920,6 +6122,9 @@ const PRESET_NAME = { home: 'pn.home', inspect: 'pn.inspect', park: 'pn.park' };
 function presetName(n) { return PRESET_NAME[n] ? t(PRESET_NAME[n]) : ''; }
 function presetTarget(name) {
   const pos = (S.obs && Array.isArray(S.obs.positions)) ? S.obs.positions : [];
+  if (isSoArmProfile() && name === 'inspect') {
+    return clampTarget([0.0, -0.45, 0.45, 0.95, 0.0, pos[GRIP] ?? CFG.gripClosed]);
+  }
   let t = pos.slice(0, S.dof);
   while (t.length < S.dof) t.push(0);
   const m = toMotor(CFG.presets[name] || []);
@@ -6003,7 +6208,7 @@ function setUi(ui) {
     setMode(store('rebot.ctl') || 'joint', store('rebot.input') || (legacy === 'stick' ? 'stick' : 'btn'));
   }
 }
-$('ui-seg').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) setUi(b.dataset.ui); });
+$('ui-seg').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { S.uiUserSet = true; setUi(b.dataset.ui); } });
 
 /* =================================================================
    Dataset recording
@@ -6724,6 +6929,20 @@ PCARD.g = PCARD.cv.getContext('2d');
 const PCARD_EPS = 0.00175;
 // planar points [x along the arm's heading, z] for motor angles q: base, J1..J6 origins, end_link; plus the tool axis
 function posePlanar(q) {
+  if (isSoArmProfile() && Array.isArray(q) && q.length >= 5) {
+    const rot = (a, dx, dz) => [dx * Math.cos(a) + dz * Math.sin(a), -dx * Math.sin(a) + dz * Math.cos(a)];
+    const p0 = [0, 0], p1 = [0.03884, 0.0624], p2 = [0.06923, 0.1166];
+    const a1 = Number(q[1]) || 0, a2 = a1 + (Number(q[2]) || 0), a3 = a2 + (Number(q[3]) || 0);
+    const u2 = rot(a1, 0.028, 0.11257), p3 = [p2[0] + u2[0], p2[1] + u2[1]];
+    const u3 = rot(a2, 0.1349, 0.0052), p4 = [p3[0] + u3[0], p3[1] + u3[1]];
+    const u4 = rot(a3, 0.0611, 0.0), p5 = [p4[0] + u4[0], p4[1] + u4[1]];
+    const p6 = p5;
+    const u7 = rot(a3, 0.10352, -0.00573), p7 = [p5[0] + u7[0], p5[1] + u7[1]];
+    return { pts: [p0, p1, p2, p3, p4, p5, p6, p7], ax: [Math.cos(a3), -Math.sin(a3)] };
+  }
+  if (S.armDof !== 6 || (S.profileId && S.profileId.startsWith('so_arm'))) {
+    return { pts: [], ax: [1, 0] };
+  }
   const qq = toModel6(q);
   const f = VIK.frames(qq), c = Math.cos(qq[0]), s = Math.sin(qq[0]);
   const pl = (p) => [p[0] * c + p[1] * s, p[2]];
@@ -6742,7 +6961,7 @@ function poseTick(ts) {
   if (PCARD.collapsed || document.hidden || ts - PCARD.last < 66) return;
   const o = S.obs, live = isLive();
   const q = o && Array.isArray(o.positions) ? o.positions : null;
-  const rest = Array.isArray(S.home) && S.home.length >= 6 ? S.home : CFG.presets.park;
+  const rest = Array.isArray(S.rest) && S.rest.length >= S.dof ? S.rest : (Array.isArray(S.home) && S.home.length >= 6 ? S.home : CFG.presets.park);
   const meas = q || rest;
   const cmd = o && Array.isArray(o.commanded_positions) ? o.commanded_positions : meas;
   const ghost = !!q && cmd.some((v, i) => Math.abs(v - (meas[i] ?? v)) > (i === GRIP ? 0.05 : 0.005));
@@ -6769,6 +6988,7 @@ function poseDraw(meas, cmd, rest, hot, gc, live) {
   g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, w, h);
   const u = dpr, font = (px, wt = 500) => `${wt} ${px * u}px ui-monospace, Menlo, monospace`;
   const M = posePlanar(meas), C = cmd ? posePlanar(cmd) : null, R = posePlanar(rest);
+  if (!M.pts.length) return;
   // view window (m): the drawn poses plus a margin, at least 0.36 m tall; kept while the poses fit and
   // the window is less than 1.6x the needed height, so the scale does not change on every small move
   let x0 = -0.12, x1 = 0.12, z0 = 0, z1 = 0.1;
@@ -6819,10 +7039,11 @@ function poseDraw(meas, cmd, rest, hot, gc, live) {
     g.fillStyle = on ? RED : '#fff'; g.strokeStyle = on ? RED : JOINT; g.lineWidth = 1.6 * u;
     g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); g.stroke();
   }
-  // J6 roll mark: small dial on the gripper body, tick at the roll angle (0 = up)
+  // J5/J6 roll mark: small dial on the gripper body, tick at the roll angle (0 = up)
   {
-    const m = [(M.pts[6][0] + end[0]) / 2, (M.pts[6][1] + end[1]) / 2], [x, y] = X(m), r = 4.5 * u, a = (Number(meas[5]) || 0) - Math.PI / 2;
-    g.fillStyle = '#fff'; g.strokeStyle = hot.includes(5) ? RED : JOINT; g.lineWidth = 1.4 * u;
+    const rollIdx = isSoArmProfile() ? 4 : 5;
+    const m = [(M.pts[6][0] + end[0]) / 2, (M.pts[6][1] + end[1]) / 2], [x, y] = X(m), r = 4.5 * u, a = (Number(meas[rollIdx]) || 0) - Math.PI / 2;
+    g.fillStyle = '#fff'; g.strokeStyle = hot.includes(rollIdx) ? RED : JOINT; g.lineWidth = 1.4 * u;
     g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); g.stroke();
     g.beginPath(); g.moveTo(x, y); g.lineTo(x + Math.cos(a) * r, y + Math.sin(a) * r); g.stroke();
   }
@@ -6865,12 +7086,20 @@ document.addEventListener('visibilitychange', () => { PCARD.key = ''; });
 i18nHooks.push(() => { PCARD.key = ''; $('pose-toggle').setAttribute('aria-label', t(PCARD.collapsed ? 'pc.expand' : 'pc.collapse')); });
 poseSetCollapsed(PCARD.collapsed);
 
-const jtab = CFG.joints.map((jd, i) => {
-  const tr = document.createElement('tr');
-  tr.innerHTML = `<td>${jd.key}</td><td>--</td><td>--</td><td>--</td><td>--</td><td>--</td>`;
-  $('jtable-body').appendChild(tr);
-  return { tr, c: Array.from(tr.children) };
-});
+let jtab = [];
+function renderJtable() {
+  const tbody = $('jtable-body');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+  const list = activeJoints();
+  jtab = list.map((jd, i) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${jd.key}</td><td>--</td><td>--</td><td>--</td><td>--</td><td>--</td>`;
+    tbody.appendChild(tr);
+    return { tr, c: Array.from(tr.children) };
+  });
+}
+renderJtable();
 
 /* =================================================================
    Render loop
@@ -6904,7 +7133,7 @@ function graspRunningAction() {
   const a = S.obs && S.obs.action;
   return a && a.kind === 'grasp' && a.state === 'running' ? a : null;
 }
-const graspDetOn = () => S.dof === 7 && DET.avail && DET.enabled;
+const graspDetOn = () => (S.dof === 7 || isSoArmProfile()) && DET.avail && DET.enabled;
 function graspRPC(path, body) {
   return commandRPC(path, body).then((d) => { syncEpoch(d.epoch_id); return d; }, (e) => {
     toast(e.code && e.code !== 'LEASE_REQUIRED' && e.code !== 'COMMAND_TIMEOUT' ? graspCodeText(e.code, e.message) : e.message, 'err', e.code || '');
@@ -7148,7 +7377,7 @@ graspLoadSetup(true);
    Everything stays hidden on an armd without the guard.
    ================================================================= */
 const COL = { cfg: null, thr: null, barAt: 0, busy: false };
-const colAvail = () => !!(S.caps && S.caps.collision_guard) || !!(S.obs && S.obs.collision);
+const colAvail = () => (S.caps ? !!S.caps.collision_guard : !!(S.obs && S.obs.collision));
 function colThresholds(c) {
   if (!c) return null;
   const e = c.effective || c;
@@ -7342,8 +7571,9 @@ i18nHooks.push(() => { if (!$('pset').hidden) { posesRender(); poseNameCheck(); 
    to the finger travel via the profile gripper_policy (CFG.gripClosed / gripOpen). Renders at most
    ~30 fps and only when the pose, the scene or the camera changed.
    ================================================================= */
-const V3 = { open: false, init: null, T: null, r: null, scene: null, cam: null, ctl: null, root: null, solid: null, ghost: null,
-  extras: null, mode: '', dirty: true, last: 0, raf: 0, key: '', sceneAt: 0, renders: 0, ghostMat: null };
+const V3 = window.V3 = { open: false, init: null, T: null, r: null, scene: null, cam: null, ctl: null, root: null, solid: null, ghost: null,
+  extras: null, sandboxGroup: null, sandboxMeshes: null, simSceneGroup: null, simFreeMap: null, simModeActive: false, simSceneKey: '',
+  mode: '', dirty: true, last: 0, raf: 0, key: '', geomKey: '', sceneAt: 0, renders: 0, ghostMat: null };
 const V3_FINGER_M = 0.0425; // URDF left/right_finger_joint upper limit (m)
 const V3_LINK_OF = { gripper_body: 'end_link', finger_L: 'left_finger', finger_R: 'right_finger' };
 const v3Geo = new Map();
@@ -7367,9 +7597,10 @@ async function v3Start() {
 }
 async function v3Init() {
   setText($('v3-status'), t('v3.loading'));
+  if (schemaReady) await Promise.race([schemaReady, new Promise((r) => setTimeout(r, 1500))]);
   const T = V3.T = await import('/assets/three-urdf.min.js');
   const cv = $('v3-canvas');
-  V3.r = new T.WebGLRenderer({ canvas: cv, antialias: true });
+  V3.r = new T.WebGLRenderer({ canvas: cv, antialias: true, preserveDrawingBuffer: true });
   V3.r.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   const scene = V3.scene = new T.Scene();
   scene.background = new T.Color(0xeef2ea);
@@ -7383,11 +7614,15 @@ async function v3Init() {
   V3.root = new T.Group(); V3.root.rotation.x = -Math.PI / 2; scene.add(V3.root);
   V3.ghostMat = new T.MeshBasicMaterial({ color: 0x3b82f6, transparent: true, opacity: 0.28, depthWrite: false });
   let urdf = null, man = null;
+  const isSoArm = S.profileId && S.profileId.startsWith('so_arm');
+  const urdfFile = isSoArm ? '/assets/model/so101_new_calib.urdf' : '/assets/model/reBot-DevArm_gripper.urdf';
+  const manFile = isSoArm ? '/assets/model/so101_meshes/manifest.json' : '/assets/model/meshes/manifest.json';
+  const binDir = isSoArm ? '/assets/model/so101_meshes/' : '/assets/model/meshes/';
   try {
-    const [u, m] = await Promise.all([fetch('/assets/model/reBot-DevArm_gripper.urdf'), fetch('/assets/model/meshes/manifest.json')]);
+    const [u, m] = await Promise.all([fetch(urdfFile), fetch(manFile)]);
     if (u.ok && m.ok) { urdf = await u.text(); man = await m.json(); }
     if (man && man.format === 'rbm1' && /^[\w.-]+$/.test(man.file || '')) {
-      const b = await fetch('/assets/model/meshes/' + man.file);
+      const b = await fetch(binDir + man.file);
       man.buf = b.ok ? await b.arrayBuffer() : null;
     } else man = null;
   } catch (_) { man = null; /* stick figure */ }
@@ -7460,11 +7695,30 @@ function v3Robot(T, urdf, man, ghost) {
   return Promise.resolve({
     obj: robot,
     set(q) {
-      const m = toModel6(q);
-      for (let i = 0; i < 6; i++) robot.setJointValue('joint' + (i + 1), m[i]);
-      if (q.length > 6) { const d = gripFrac(q[6]) * V3_FINGER_M; robot.setJointValue('left_finger_joint', d); robot.setJointValue('right_finger_joint', d); }
+      const isSoArm = S.profileId && S.profileId.startsWith('so_arm');
+      if (isSoArm) {
+        const jNames = S.jointNames || ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper'];
+        for (let i = 0; i < Math.min(q.length, jNames.length); i++) {
+          robot.setJointValue(jNames[i], q[i]);
+        }
+      } else {
+        const m = toModel6(q);
+        for (let i = 0; i < 6; i++) robot.setJointValue('joint' + (i + 1), m[i]);
+        if (q.length > 6) { const d = gripFrac(q[6]) * V3_FINGER_M; robot.setJointValue('left_finger_joint', d); robot.setJointValue('right_finger_joint', d); }
+      }
     },
-    end() { const v = robot.links.end_link.getWorldPosition(new T.Vector3()); V3.root.worldToLocal(v); return [v.x, v.y, v.z]; },
+    setHideFingers(hide) {
+      for (const k of ['left_finger', 'right_finger', 'left_finger_link', 'right_finger_link', 'finger_left', 'finger_right']) {
+        if (robot.links && robot.links[k]) robot.links[k].visible = !hide;
+      }
+    },
+    end() {
+      const link = robot.links.end_link || robot.links.gripper_frame_link || robot.links.moving_jaw_so101_v1_link || robot.links.gripper_link;
+      if (!link) return [0, 0, 0];
+      const v = link.getWorldPosition(new T.Vector3());
+      V3.root.worldToLocal(v);
+      return [v.x, v.y, v.z];
+    },
   });
 }
 // stick figure through the URDF joint frames: base, J1..J6 origins, end_link
@@ -7479,6 +7733,9 @@ function v3Stick(T, ghost) {
   return {
     obj,
     set(q) {
+      if (S.armDof !== 6 || (S.profileId && S.profileId.startsWith('so_arm'))) {
+        return;
+      }
       const f = VIK.frames(toModel6(q));
       const pts = [[0, 0, 0], ...f.o, f.p];
       pts.forEach((p, i) => balls[i].position.set(p[0], p[1], p[2]));
@@ -7490,6 +7747,7 @@ function v3Stick(T, ghost) {
         m.position.copy(a).addScaledVector(d, 0.5); m.scale.set(1, L, 1); m.quaternion.setFromUnitVectors(up, d.normalize());
       }
     },
+    setHideFingers() {},
     end() { const p = balls[7].position; return [p.x, p.y, p.z]; },
   };
 }
@@ -7529,6 +7787,213 @@ async function v3Extras() {
   V3.root.add(g);
   V3.dirty = true;
 }
+const V3_ARM_BODIES = new Set(['base_link', 'link1', 'link2', 'link3', 'link4', 'link5', 'link6', 'finger_left', 'finger_right',
+  'shoulder_link', 'upper_arm_link', 'lower_arm_link', 'wrist_link', 'gripper_link', 'gripper_frame_link', 'moving_jaw_so101_v1_link']);
+const V3_SKIP_END_GEOMS = new Set(['palm', 'motor_housing', 'ee_mount', 'camera_mount']);
+function _v3Mat3ToQuat(q, m9, mo = 0) {
+  const n = m9[mo], s = m9[mo + 1], r = m9[mo + 2];
+  const a = m9[mo + 3], o = m9[mo + 4], c = m9[mo + 5];
+  const l = m9[mo + 6], u = m9[mo + 7], d = m9[mo + 8];
+  const h = n + o + d;
+  let qx, qy, qz, qw;
+  if (h > 0) {
+    const p = 0.5 / Math.sqrt(h + 1.0);
+    qw = 0.25 / p; qx = (u - c) * p; qy = (r - l) * p; qz = (a - s) * p;
+  } else if (n > o && n > d) {
+    const p = 2.0 * Math.sqrt(1.0 + n - o - d);
+    qw = (u - c) / p; qx = 0.25 * p; qy = (s + a) / p; qz = (r + l) / p;
+  } else if (o > d) {
+    const p = 2.0 * Math.sqrt(1.0 + o - n - d);
+    qw = (r - l) / p; qx = (s + a) / p; qy = 0.25 * p; qz = (c + u) / p;
+  } else {
+    const p = 2.0 * Math.sqrt(1.0 + d - n - o);
+    qw = (a - s) / p; qx = (r + l) / p; qy = (c + u) / p; qz = 0.25 * p;
+  }
+  q.set(qx, qy, qz, qw);
+}
+function _v3MakeMjGeo(T, type, sx, sy, sz) {
+  let geo = null;
+  if (type === 2) geo = new T.SphereGeometry(Math.max(1e-4, sx), 20, 14);
+  else if (type === 3) {
+    geo = typeof T.CapsuleGeometry === 'function'
+      ? new T.CapsuleGeometry(Math.max(1e-4, sx), Math.max(1e-4, sy * 2), 6, 16)
+      : new T.CylinderGeometry(Math.max(1e-4, sx), Math.max(1e-4, sx), Math.max(1e-4, (sy + sx) * 2), 18);
+    geo.rotateX(Math.PI / 2);
+  } else if (type === 4) {
+    geo = new T.SphereGeometry(1, 20, 14);
+    geo.scale(Math.max(1e-4, sx), Math.max(1e-4, sy), Math.max(1e-4, sz));
+  } else if (type === 5) {
+    geo = new T.CylinderGeometry(Math.max(1e-4, sx), Math.max(1e-4, sx), Math.max(1e-4, sy * 2), 20);
+    geo.rotateX(Math.PI / 2);
+  } else if (type === 6) {
+    geo = new T.BoxGeometry(Math.max(1e-4, sx * 2), Math.max(1e-4, sy * 2), Math.max(1e-4, sz * 2));
+  }
+  return geo;
+}
+function v3ClearGroup(grp) {
+  if (!grp) return;
+  if (V3.root) V3.root.remove(grp);
+  grp.traverse((o) => {
+    if (o.geometry) o.geometry.dispose();
+    if (o.material) o.material.dispose();
+  });
+}
+function v3SyncWasmGeoms() {
+  const T = V3.T, sim = window.WASM_SIM;
+  if (!T || !V3.root || !sim || !sim.ready || !sim.model || !sim.data) return false;
+  const m = sim.model, d = sim.data;
+  const customTool = sim.bundle?.active_tool && sim.bundle.active_tool !== 'default';
+  if (V3.solid?.setHideFingers) V3.solid.setHideFingers(Boolean(customTool));
+  if (V3.ghost?.setHideFingers) V3.ghost.setHideFingers(Boolean(customTool));
+  if (!V3.sandboxGroup || V3.sandboxKey !== sim.bundleKey) {
+    v3ClearGroup(V3.sandboxGroup);
+    const grp = V3.sandboxGroup = new T.Group();
+    const list = V3.sandboxMeshes = [];
+    for (let g = 0; g < m.ngeom; g++) {
+      const type = m.geom_type[g];
+      if (type === 0 || type === 1) continue; // skip infinite plane / heightfield
+      const rgba = m.geom_rgba;
+      if (rgba[g * 4 + 3] <= 0.01) continue;
+      const bname = sim.mjName(m.name_bodyadr, m.geom_bodyid[g]);
+      const gname = sim.mjName(m.name_geomadr, g);
+      if (V3_ARM_BODIES.has(bname)) continue;
+      if (bname === 'end_link' && V3_SKIP_END_GEOMS.has(gname)) continue;
+      const sx = m.geom_size[g * 3], sy = m.geom_size[g * 3 + 1], sz = m.geom_size[g * 3 + 2];
+      let geo = _v3MakeMjGeo(T, type, sx, sy, sz);
+      if (!geo) {
+        const rb = Math.max(0.01, m.geom_rbound ? m.geom_rbound[g] : 0.02);
+        geo = new T.BoxGeometry(rb, rb, rb);
+      }
+      const r = rgba[g * 4], gr = rgba[g * 4 + 1], b = rgba[g * 4 + 2], a = rgba[g * 4 + 3];
+      const mat = new T.MeshStandardMaterial({
+        color: new T.Color().setRGB(r, gr, b, T.SRGBColorSpace),
+        metalness: 0.15, roughness: 0.65,
+        transparent: a < 0.99, opacity: a,
+      });
+      const mesh = new T.Mesh(geo, mat);
+      mesh.name = 'wasm:' + (gname || g);
+      grp.add(mesh);
+      list.push({ g, mesh, mat, rgba: [r, gr, b, a] });
+    }
+    V3.root.add(grp);
+    V3.sandboxKey = sim.bundleKey;
+    V3.dirty = true;
+  }
+  const posArr = d.geom_xpos, matArr = d.geom_xmat, rgbaArr = m.geom_rgba;
+  const qNew = V3._qTmp || (V3._qTmp = new T.Quaternion());
+  let changed = false;
+  for (const item of V3.sandboxMeshes) {
+    const g = item.g, po = g * 3, mo = g * 9, ro = g * 4;
+    const x = posArr[po], y = posArr[po + 1], z = posArr[po + 2];
+    const mp = item.mesh.position;
+    if (Math.abs(mp.x - x) > 1e-4 || Math.abs(mp.y - y) > 1e-4 || Math.abs(mp.z - z) > 1e-4) {
+      mp.set(x, y, z); changed = true;
+    }
+    _v3Mat3ToQuat(qNew, matArr, mo);
+    const qOld = item.mesh.quaternion;
+    if (Math.abs(qOld.x - qNew.x) + Math.abs(qOld.y - qNew.y) + Math.abs(qOld.z - qNew.z) + Math.abs(qOld.w - qNew.w) > 5e-4) {
+      qOld.copy(qNew); changed = true;
+    }
+    const r = rgbaArr[ro], gr = rgbaArr[ro + 1], b = rgbaArr[ro + 2], a = rgbaArr[ro + 3];
+    if (Math.abs(item.rgba[0] - r) + Math.abs(item.rgba[1] - gr) + Math.abs(item.rgba[2] - b) + Math.abs(item.rgba[3] - a) > 1e-3) {
+      item.rgba = [r, gr, b, a];
+      item.mat.color.setRGB(r, gr, b, T.SRGBColorSpace);
+      item.mat.opacity = a;
+      item.mat.transparent = a < 0.99;
+      changed = true;
+    }
+  }
+  if (changed) V3.dirty = true;
+  return changed;
+}
+function _v3ParseNums(s, def) {
+  if (!s) return def;
+  const a = s.trim().split(/\s+/).map(Number);
+  return a.every(Number.isFinite) ? a : def;
+}
+function _v3TypeNum(typeStr) {
+  return ({ sphere: 2, capsule: 3, ellipsoid: 4, cylinder: 5, box: 6 })[(typeStr || 'sphere').toLowerCase()] || 0;
+}
+async function v3SyncSimScene(bundle, simState) {
+  const T = V3.T;
+  if (!T || !V3.root || !bundle) return;
+  const key = `${bundle.active_scene}:${bundle.active_tool}`;
+  const customTool = bundle.active_tool && bundle.active_tool !== 'default';
+  if (V3.solid?.setHideFingers) V3.solid.setHideFingers(Boolean(customTool));
+  if (V3.ghost?.setHideFingers) V3.ghost.setHideFingers(Boolean(customTool));
+  if (!V3.simSceneGroup || V3.simSceneKey !== key) {
+    v3ClearGroup(V3.simSceneGroup);
+    const grp = V3.simSceneGroup = new T.Group();
+    const freeMap = V3.simFreeMap = new Map();
+    if (bundle.composed_xml) {
+      const doc = new DOMParser().parseFromString(bundle.composed_xml, 'text/xml');
+      const wb = doc.querySelector('mujoco > worldbody');
+      const degScale = (doc.querySelector('compiler')?.getAttribute('angle') || 'radian') === 'degree' ? Math.PI / 180 : 1;
+      const walk = (el, parentObj, skipSubtree) => {
+        for (const ch of el.children) {
+          const tag = ch.tagName;
+          if (tag === 'body') {
+            const bname = ch.getAttribute('name') || '';
+            const isArm = V3_ARM_BODIES.has(bname);
+            if (isArm && bname !== 'end_link') continue;
+            const bg = new T.Group();
+            bg.name = 'simbody:' + bname;
+            const p = _v3ParseNums(ch.getAttribute('pos'), [0, 0, 0]);
+            bg.position.set(p[0] || 0, p[1] || 0, p[2] || 0);
+            const qt = _v3ParseNums(ch.getAttribute('quat'), null);
+            const eu = _v3ParseNums(ch.getAttribute('euler'), null);
+            if (qt && qt.length === 4) bg.quaternion.set(qt[1], qt[2], qt[3], qt[0]);
+            else if (eu && eu.length === 3) bg.rotation.set(eu[0] * degScale, eu[1] * degScale, eu[2] * degScale, 'XYZ');
+            if (ch.querySelector(':scope > freejoint') || ch.querySelector(':scope > joint[type="free"]')) {
+              freeMap.set(bname, bg);
+            }
+            if (!isArm) parentObj.add(bg);
+            walk(ch, isArm ? parentObj : bg, isArm);
+          } else if (tag === 'geom' && !skipSubtree) {
+            const gname = ch.getAttribute('name') || '';
+            if (V3_SKIP_END_GEOMS.has(gname)) continue;
+            const t = _v3TypeNum(ch.getAttribute('type'));
+            if (!t) continue;
+            const sz = _v3ParseNums(ch.getAttribute('size'), [0.02, 0.02, 0.02]);
+            const geo = _v3MakeMjGeo(T, t, sz[0] || 0.02, sz[1] ?? sz[0] ?? 0.02, sz[2] ?? sz[1] ?? sz[0] ?? 0.02);
+            if (!geo) continue;
+            const rgba = _v3ParseNums(ch.getAttribute('rgba'), [0.6, 0.6, 0.6, 1]);
+            const mat = new T.MeshStandardMaterial({
+              color: new T.Color().setRGB(rgba[0], rgba[1], rgba[2], T.SRGBColorSpace),
+              metalness: 0.15, roughness: 0.65, transparent: rgba[3] < 0.99, opacity: rgba[3],
+            });
+            const mesh = new T.Mesh(geo, mat);
+            const gp = _v3ParseNums(ch.getAttribute('pos'), [0, 0, 0]);
+            mesh.position.set(gp[0] || 0, gp[1] || 0, gp[2] || 0);
+            const geu = _v3ParseNums(ch.getAttribute('euler'), null);
+            if (geu && geu.length === 3) mesh.rotation.set(geu[0] * degScale, geu[1] * degScale, geu[2] * degScale, 'XYZ');
+            parentObj.add(mesh);
+          }
+        }
+      };
+      if (wb) walk(wb, grp, false);
+    }
+    V3.root.add(grp);
+    V3.simSceneKey = key;
+    V3.dirty = true;
+  }
+  const objs = simState?.objects;
+  if (objs && V3.simFreeMap) {
+    for (const [name, info] of Object.entries(objs)) {
+      const grp = V3.simFreeMap.get(name);
+      if (!grp || !Array.isArray(info.pos)) continue;
+      const p = info.pos;
+      if (Math.abs(grp.position.x - p[0]) + Math.abs(grp.position.y - p[1]) + Math.abs(grp.position.z - p[2]) > 1e-4) {
+        grp.position.set(p[0], p[1], p[2]);
+        V3.dirty = true;
+      }
+      if (Array.isArray(info.quat) && info.quat.length === 4) {
+        const [qw, qx, qy, qz] = info.quat;
+        grp.quaternion.set(qx, qy, qz, qw);
+      }
+    }
+  }
+}
 function v3Resize() {
   const el = $('view3d'), w = el.clientWidth, h = el.clientHeight;
   if (!V3.r || !w || !h) return;
@@ -7565,18 +8030,33 @@ function v3Frame() {
 function v3Tick(ts) {
   V3.raf = V3.open ? requestAnimationFrame(v3Tick) : 0;
   if (!V3.open || !V3.solid || ts - V3.last < 33) return;
-  const o = S.obs, live = isLive();
-  if (o && Array.isArray(o.positions)) {
-    const meas = o.positions, cmd = Array.isArray(o.commanded_positions) ? o.commanded_positions : meas;
+  const o = S.obs, live = isLive(), wasm = window.WASM_SIM;
+  let st = '';
+  if (wasm && wasm.ready && Array.isArray(wasm.positions)) {
+    const meas = wasm.positions;
+    const cmd = Array.isArray(wasm.targetPositions) ? wasm.targetPositions : meas;
     const key = meas.map((v) => Math.round(v * 2000)).join() + '|' + cmd.map((v) => Math.round(v * 2000)).join();
     if (key !== V3.key) {
       V3.key = key;
       V3.solid.set(meas); V3.ghost.set(cmd);
-      V3.ghost.obj.visible = cmd.some((v, i) => Math.abs(v - (meas[i] ?? v)) > (i === GRIP ? 0.05 : 0.005));
+      V3.ghost.obj.visible = cmd.some((v, i) => Math.abs(v - (meas[i] ?? v)) > (i === GRIP ? 0.05 : 0.01));
       V3.dirty = true;
     }
+    v3SyncWasmGeoms();
+    st = wasm.policyEnabled && wasm.policyName ? t('v3.wasm_pol', { p: wasm.policyName }) : t('v3.wasm');
+  } else {
+    if (o && Array.isArray(o.positions)) {
+      const meas = o.positions, cmd = Array.isArray(o.commanded_positions) ? o.commanded_positions : meas;
+      const key = meas.map((v) => Math.round(v * 2000)).join() + '|' + cmd.map((v) => Math.round(v * 2000)).join();
+      if (key !== V3.key) {
+        V3.key = key;
+        V3.solid.set(meas); V3.ghost.set(cmd);
+        V3.ghost.obj.visible = cmd.some((v, i) => Math.abs(v - (meas[i] ?? v)) > (i === GRIP ? 0.05 : 0.005));
+        V3.dirty = true;
+      }
+    }
+    st = V3.mode === 'stick' ? t('v3.stick') : !live ? t('v3.offline') : (V3.simModeActive ? t('v3.sim_scene') : '');
   }
-  const st = V3.mode === 'stick' ? t('v3.stick') : !live ? t('v3.offline') : '';
   if ($('v3-status').textContent !== st) setText($('v3-status'), st);
   if (!V3.dirty) return;
   V3.dirty = false; V3.last = ts; V3.renders++;
@@ -7772,7 +8252,15 @@ function frame(ts) {
       setText(r.c[1], ok ? fmtDeg(p) : '--');
       setText(r.c[2], ok ? p.toFixed(3) : '--');
       setText(r.c[3], freshJoint(i) && cap.velocity_feedback && vel[i] != null ? (vel[i] * DEG).toFixed(0) : '--');
-      setText(r.c[4], freshJoint(i) && cap.torque_feedback && tq[i] != null ? tq[i].toFixed(2) : '--');
+      let tqStr = '--';
+      if (freshJoint(i)) {
+        if (cap.torque_feedback && tq[i] != null) tqStr = tq[i].toFixed(2);
+        else if (cap.load_feedback) {
+          const ld = S.obs?.loads?.[i];
+          if (ld != null && Number.isFinite(ld)) tqStr = Math.round(ld * 100) + '%';
+        }
+      }
+      setText(r.c[4], tqStr);
       setText(r.c[5], freshJoint(i) && cap.temperature_feedback && temps[i] != null ? temps[i].toFixed(0) : '--');
       r.tr.classList.toggle('hot', act[i]);
     });
@@ -7836,17 +8324,28 @@ function renderCart(live, op) {
   // readouts from the full FK of the commanded joints: view = solved pose, base = IK J1..J4 + J5 + measured J6
   const view = viewActive();
   const pos6 = S.obs && S.obs.positions;
-  const T = view ? C.T : (C.cmd && C.q ? VIK.fk(toModel6([...toMotor(C.q), C.j5, (pos6 && pos6[5]) || 0])) : null);
-  const p = T ? { x: T[0][3], y: T[1][3], z: T[2][3], pitch: Math.asin(clamp(-T[2][0], -1, 1)), yaw: Math.atan2(T[1][0], T[0][0]) } : null;
+  const isSoArm = S.profileId && S.profileId.startsWith('so_arm');
+  const isCoupledYaw = S.orientationDof === 2 || isSoArm;
+  let p = null;
+  if (isSoArm && S.obs && S.obs.tcp && Array.isArray(S.obs.tcp.xyz_m) && Array.isArray(S.obs.tcp.rpy_rad)) {
+    const tcp = S.obs.tcp;
+    p = { x: tcp.xyz_m[0], y: tcp.xyz_m[1], z: tcp.xyz_m[2], pitch: tcp.rpy_rad[1], yaw: tcp.rpy_rad[2] };
+  } else {
+    const T = view ? C.T : (C.cmd && C.q ? VIK.fk(toModel6([...toMotor(C.q), C.j5, (pos6 && pos6[5]) || 0])) : null);
+    p = T ? { x: T[0][3], y: T[1][3], z: T[2][3], pitch: Math.asin(clamp(-T[2][0], -1, 1)), yaw: Math.atan2(T[1][0], T[0][0]) } : null;
+  }
   const mm = (m) => (m >= 0 ? '+' : '−') + Math.abs(m * 1000).toFixed(1);
   setText($('c-x'), p ? mm(p.x) : '--'); setText($('c-y'), p ? mm(p.y) : '--');
   setText($('c-z'), p ? mm(p.z) : '--'); setText($('c-p'), p ? fmtDeg(p.pitch) + '°' : '--');
-  const R = p ? IK.reach(p) : null, frac = R == null ? 0 : R / CFG.cart.reachMax;
+  const R = p ? Math.hypot(p.x, p.y) : null, frac = R == null ? 0 : R / CFG.cart.reachMax;
   setText($('c-r'), R == null ? '--' : Math.round(R * 1000) + ' mm');
   $('c-rfill').style.width = (clamp(frac, 0, 1) * 100).toFixed(1) + '%';
   setCls($('c-reach'), 'reach' + (frac > 1 ? ' bad' : frac > 0.92 ? ' warn' : ''));
-  setText($('c-r5'), !live ? '--' : view ? (C.q6 ? fmtDeg(toMotor6(C.q6)[5]) + '°' : '--') : fmtDeg(C.j5) + '°');
-  setText($('c-yaw'), p ? fmtDeg(p.yaw) + '°' : '--');
+  setText($('c-r5'), !live ? '--' : isSoArm ? (pos6 && pos6.length > 4 ? fmtDeg(pos6[4]) + '°' : '--') : view ? (C.q6 ? fmtDeg(toMotor6(C.q6)[5]) + '°' : '--') : fmtDeg(C.j5) + '°');
+  setText($('c-yaw'), p ? fmtDeg(p.yaw) + '°' + (isCoupledYaw ? ' (auto)' : '') : '--');
+  if ($('c-yaw')) {
+    $('c-yaw').title = isCoupledYaw ? (LANG === 'zh' ? '5自由度机械臂偏航角跟随径向方位角' : '5-DOF yaw follows radial azimuth') : '';
+  }
   const bad = C.status !== 'ok' && C.status !== 'idle';
   const badge = $('ik-badge');
   setText(badge, !live ? 'IK --' : bad ? t('ik.blocked') : C.sending ? t('ik.stream', { hz: CFG.cart.hz }) : t('ik.ready'));
@@ -7917,6 +8416,889 @@ window.V = V;
 })();
 
 /* =================================================================
+   Browser WASM Physics Sandbox + Unified ONNX Runtime (onnxruntime-web)
+   ================================================================= */
+const WASM_SIM = window.WASM_SIM = (() => {
+  const dec = new TextDecoder();
+  const MODEL_OFFSETS_RAD = [0, 0, 0, 0, 0, -Math.PI / 2];
+  const JAW_M_PER_RAD = 0.0425 / 5.7;
+  const KPOS_DM = [25, 25, 25, 25, 25, 25, 25];
+  const KV_DM = [8, 8, 8, 1.5, 1.5, 1.5, 0.5];
+  const TORQUE_DM = [27, 27, 27, 7, 7, 7, 7];
+  const NO_LOAD_DM = [52, 52, 52, 200, 200, 200, 200].map((rpm) => rpm * 2 * Math.PI / 60);
+
+  let ortLoader = null;
+  let mujocoPromise = null;
+  let imgCanvas = null;
+  let imgCtx = null;
+
+  async function ensureMujoco() {
+    if (mujocoPromise) return mujocoPromise;
+    mujocoPromise = (async () => {
+      const mod = await import('/assets/wasm/mujoco_wasm.js');
+      const mj = await mod.default();
+      try { mj.FS.mkdir('/working'); } catch (_) {}
+      try { mj.FS.mount(mj.MEMFS, { root: '.' }, '/working'); } catch (_) {}
+      return mj;
+    })();
+    return mujocoPromise;
+  }
+
+  async function ensureOrt() {
+    if (window.ort) return window.ort;
+    if (!ortLoader) {
+      ortLoader = new Promise((resolve, reject) => {
+        const sc = document.createElement('script');
+        sc.src = '/assets/wasm/ort.wasm.min.js';
+        sc.onload = () => resolve(window.ort);
+        sc.onerror = () => { ortLoader = null; reject(new Error('Failed to load ort.wasm.min.js')); };
+        document.head.appendChild(sc);
+      });
+    }
+    const ort = await ortLoader;
+    if (ort && ort.env && ort.env.wasm) {
+      ort.env.wasm.wasmPaths = '/assets/wasm/';
+      ort.env.wasm.numThreads = 1;
+    }
+    return ort;
+  }
+
+  function writeMemfsFile(mj, relPath, bytes) {
+    const clean = relPath.replace(/^\/+/, '');
+    const parts = clean.split('/').filter(Boolean);
+    let cur = '/working';
+    for (let i = 0; i < parts.length - 1; i++) {
+      cur += '/' + parts[i];
+      try { mj.FS.mkdir(cur); } catch (_) {}
+    }
+    mj.FS.writeFile('/working/' + clean, bytes);
+  }
+
+  function mulberry32(seed) {
+    let a = (Number(seed) || 0) >>> 0;
+    return () => {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function normVal(v, mean, std, i) {
+    const m = Array.isArray(mean) && mean.length > i ? Number(mean[i]) || 0 : 0;
+    const s = Array.isArray(std) && std.length > i ? Math.max(Math.abs(Number(std[i]) || 1), 1e-6) : 1;
+    return (v - m) / s;
+  }
+
+  const st = {
+    active: false,
+    ready: false,
+    starting: false,
+    mujoco: null,
+    model: null,
+    data: null,
+    bundle: null,
+    bundleKey: '',
+    positions: [0, 0, 0, 0, 0, Math.PI / 2, 0],
+    targetPositions: null,
+    overrideTargets: null,
+    policyTarget: null,
+    policySession: null,
+    policyName: '',
+    policyEnabled: false,
+    policyBusy: false,
+    policySteps: 0,
+    policyEpoch: 0,
+    simGeneration: 0,
+    lastAction: null,
+    lastPolicyAt: 0,
+    io: {},
+    attachedObject: null,
+    suctionWelds: {},
+    toolContactGeoms: new Set(),
+    objects: [],
+    sceneJoints: [],
+    latched: {},
+    savedRgba: {},
+    idx: null,
+    tcpSiteId: -1,
+    attachBid: -1,
+    seq: 0,
+    resetSeq: -1,
+    ioSeq: -1,
+    seed: 0,
+    rafId: 0,
+    lastTs: 0,
+    accDt: 0,
+    lastSyncAt: 0,
+    lastTelAt: 0,
+    syncBusy: false,
+    telBusy: false,
+
+    mjName(adrArr, idx) {
+      const m = this.model;
+      if (!m || !adrArr || idx < 0 || idx >= adrArr.length) return '';
+      const start = adrArr[idx];
+      let end = start;
+      while (end < m.names.length && m.names[end] !== 0) end++;
+      return dec.decode(m.names.subarray(start, end));
+    },
+
+    findId(objTypeNum, name) {
+      if (!this.mujoco || !this.model || !name) return -1;
+      try { return this.mujoco.mj_name2id(this.model, objTypeNum, name); } catch (_) { return -1; }
+    },
+
+    buildIndexer() {
+      const mj = this.mujoco, m = this.model;
+      const obj = mj.mjtObj;
+      const tm = this.bundle?.tool_manifest;
+      const isSoArm = this.findId(obj.mjOBJ_JOINT.value, 'shoulder_pan') >= 0;
+      const joints = [];
+      let offsets = [0, 0, 0, 0, 0, 0];
+      let toolScale = 1.0;
+      let armDof = 5;
+      let coupledName = null;
+
+      if (isSoArm) {
+        for (const n of ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll', 'gripper']) {
+          if (this.findId(obj.mjOBJ_JOINT.value, n) >= 0) joints.push(n);
+        }
+      } else {
+        armDof = 6;
+        offsets = MODEL_OFFSETS_RAD.slice();
+        for (let i = 1; i <= 6; i++) joints.push('joint' + i);
+        const hasCustom = tm && tm.id && tm.id !== 'default';
+        if (hasCustom) {
+          if (tm.driven_joint && this.findId(obj.mjOBJ_JOINT.value, tm.driven_joint) >= 0) joints.push(tm.driven_joint);
+          toolScale = Number(tm.motor_to_joint_scale) || 1.0;
+          coupledName = tm.coupled_joint || null;
+        } else if (this.findId(obj.mjOBJ_JOINT.value, 'finger_left') >= 0) {
+          joints.push('finger_left');
+          toolScale = -JAW_M_PER_RAD;
+          coupledName = 'finger_right';
+        }
+      }
+
+      const jids = joints.map((n) => this.findId(obj.mjOBJ_JOINT.value, n));
+      const qposAdr = jids.map((j) => m.jnt_qposadr[j]);
+      const dofAdr = jids.map((j) => m.jnt_dofadr[j]);
+      const rightJid = coupledName ? this.findId(obj.mjOBJ_JOINT.value, coupledName) : -1;
+      const acts = [];
+      for (let i = 0; i < m.nu; i++) {
+        const trnJ = m.actuator_trnid[i * 2];
+        const jIdx = jids.indexOf(trnJ);
+        const isPos = Math.abs(m.actuator_biasprm[i * 10 + 1]) > 1e-6;
+        acts.push({
+          a: i,
+          jIdx: jIdx >= 0 ? jIdx : i,
+          dof: m.jnt_dofadr[trnJ],
+          gear: m.actuator_gear[i * 6] || 1.0,
+          isPos,
+          limLo: m.actuator_ctrllimited?.[i] ? m.actuator_ctrlrange[i * 2] : -Infinity,
+          limHi: m.actuator_ctrllimited?.[i] ? m.actuator_ctrlrange[i * 2 + 1] : Infinity,
+        });
+      }
+      this.idx = {
+        robot: isSoArm ? 'so-arm101' : 'b601dm',
+        armDof,
+        dof: joints.length,
+        joints,
+        jids,
+        qposAdr,
+        dofAdr,
+        offsets,
+        toolScale,
+        rightQpos: rightJid >= 0 ? m.jnt_qposadr[rightJid] : -1,
+        acts,
+      };
+      this.tcpSiteId = this.findId(obj.mjOBJ_SITE.value, 'tcp');
+      const attachBody = tm?.attach_body || 'end_link';
+      this.attachBid = this.findId(obj.mjOBJ_BODY.value, attachBody);
+    },
+
+    motorPositions() {
+      const d = this.data, ix = this.idx;
+      if (!d || !ix) return [];
+      const out = new Array(ix.dof);
+      for (let i = 0; i < ix.dof; i++) {
+        const v = d.qpos[ix.qposAdr[i]];
+        out[i] = ix.robot === 'b601dm' ? (i < 6 ? v - ix.offsets[i] : v / ix.toolScale) : v;
+      }
+      return out;
+    },
+
+    indexSceneAndWelds() {
+      const mj = this.mujoco, m = this.model;
+      const objType = mj.mjtObj;
+      const sm = this.bundle?.scene_manifest;
+      const tm = this.bundle?.tool_manifest;
+
+      this.objects = [];
+      for (const item of (sm?.objects || [])) {
+        const bid = this.findId(objType.mjOBJ_BODY.value, item.body || item.name);
+        if (bid < 0) continue;
+        const jid = m.body_jntadr[bid];
+        if (jid < 0) continue;
+        const qadr = m.jnt_qposadr[jid];
+        const dadr = m.jnt_dofadr[jid];
+        const geoms = [];
+        for (let g = 0; g < m.ngeom; g++) if (m.geom_bodyid[g] === bid) geoms.push(g);
+        const defQuat = [];
+        for (let k = 0; k < 4; k++) defQuat.push(m.body_quat[bid * 4 + k]);
+        const hasQuat = defQuat.some((v) => Math.abs(v) > 1e-6);
+        this.objects.push({
+          name: String(item.name),
+          body: String(item.body || item.name),
+          bid,
+          qadr,
+          dadr,
+          geoms,
+          defaultPos: Array.isArray(item.default_pos) ? item.default_pos.slice(0, 3) : [0.25, 0, 0.02],
+          defaultQuat: hasQuat ? defQuat : [1, 0, 0, 0],
+          jitterXy: Number(item.jitter_xy ?? 0.02),
+        });
+      }
+
+      this.suctionWelds = {};
+      for (let eq = 0; eq < m.neq; eq++) {
+        const ename = this.mjName(m.name_eqadr, eq);
+        if (ename.startsWith('suction_weld_')) {
+          const b2 = m.eq_obj2id[eq];
+          const b2Name = this.mjName(m.name_bodyadr, b2);
+          if (b2Name) this.suctionWelds[b2Name] = eq;
+        }
+      }
+
+      this.toolContactGeoms = new Set();
+      const drivenPrefix = tm?.driven_joint ? String(tm.driven_joint).split('_')[0] : '';
+      const fGeoms = new Set(tm?.finger_geoms || ['left_front', 'right_front']);
+      for (let g = 0; g < m.ngeom; g++) {
+        const gname = this.mjName(m.name_geomadr, g);
+        const bname = this.mjName(m.name_bodyadr, m.geom_bodyid[g]);
+        if (fGeoms.has(gname) || bname === 'end_link' || (drivenPrefix && bname.includes(drivenPrefix))) {
+          this.toolContactGeoms.add(g);
+        }
+      }
+
+      this.sceneJoints = [];
+      const robotSet = new Set(this.idx.joints);
+      if (this.bundle?.tool_manifest?.coupled_joint) robotSet.add(this.bundle.tool_manifest.coupled_joint);
+      robotSet.add('finger_right');
+      const objBodies = new Set(this.objects.map((o) => o.bid));
+      for (let j = 0; j < m.njnt; j++) {
+        const jname = this.mjName(m.name_jntadr, j);
+        const jbid = m.jnt_bodyid[j];
+        if (!robotSet.has(jname) && !objBodies.has(jbid) && m.jnt_type[j] !== mj.mjtJoint.mjJNT_FREE.value) {
+          this.sceneJoints.push({ qadr: m.jnt_qposadr[j], q0: m.qpos0[m.jnt_qposadr[j]] });
+        }
+      }
+
+      this.savedRgba = {};
+      for (const stage of (sm?.task_stages || [])) {
+        if (!stage.indicator_geom) continue;
+        const gid = this.findId(objType.mjOBJ_GEOM.value, stage.indicator_geom);
+        if (gid >= 0) this.savedRgba[gid] = Array.from(m.geom_rgba.subarray(gid * 4, gid * 4 + 4));
+      }
+      this.ioDefaults = {};
+      for (const src of [...(sm?.io || []), ...(tm?.io || [])]) {
+        if ((src.direction || 'output') === 'output' || 'default' in src) {
+          this.ioDefaults[String(src.name)] = 'default' in src ? src.default : false;
+        }
+      }
+    },
+
+    releaseSuction() {
+      if (!this.data) return;
+      for (const eq of Object.values(this.suctionWelds)) this.data.eq_active[eq] = 0;
+      this.attachedObject = null;
+      if ('vacuum_engaged' in this.io || this.bundle?.tool_manifest?.kind === 'suction') {
+        this.io.vacuum_engaged = false;
+      }
+    },
+
+    tryEngageSuction() {
+      const m = this.model, d = this.data, tm = this.bundle?.tool_manifest;
+      if (!m || !d || this.attachedObject || !Object.keys(this.suctionWelds).length) return;
+      if (this.tcpSiteId < 0 || this.attachBid < 0) return;
+      const tcp = d.site_xpos.subarray(this.tcpSiteId * 3, this.tcpSiteId * 3 + 3);
+      let bestObj = null, bestDist = Infinity;
+      for (const obj of this.objects) {
+        if (!(obj.body in this.suctionWelds)) continue;
+        for (const gid of obj.geoms) {
+          const gp = d.geom_xpos.subarray(gid * 3, gid * 3 + 3);
+          const dist = Math.hypot(tcp[0] - gp[0], tcp[1] - gp[1], tcp[2] - gp[2]) - m.geom_rbound[gid];
+          if (dist < bestDist) { bestDist = dist; bestObj = obj; }
+        }
+      }
+      const rangeM = Number(tm?.suction_range_m ?? 0.030);
+      if (!bestObj || bestDist > rangeM) return;
+
+      const eqId = this.suctionWelds[bestObj.body];
+      const b1 = this.attachBid, b2 = bestObj.bid;
+      const r1 = d.xmat.subarray(b1 * 9, b1 * 9 + 9);
+      const p1 = d.xpos.subarray(b1 * 3, b1 * 3 + 3);
+      const p2 = d.xpos.subarray(b2 * 3, b2 * 3 + 3);
+      const dx = p2[0] - p1[0], dy = p2[1] - p1[1], dz = p2[2] - p1[2];
+      const px = r1[0] * dx + r1[3] * dy + r1[6] * dz;
+      const py = r1[1] * dx + r1[4] * dy + r1[7] * dz;
+      const pz = r1[2] * dx + r1[5] * dy + r1[8] * dz;
+
+      const q1 = d.xquat.subarray(b1 * 4, b1 * 4 + 4);
+      const q2 = d.xquat.subarray(b2 * 4, b2 * 4 + 4);
+      const w1 = q1[0], x1 = -q1[1], y1 = -q1[2], z1 = -q1[3];
+      const w2 = q2[0], x2 = q2[1], y2 = q2[2], z2 = q2[3];
+      const rw = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2;
+      const rx = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2;
+      const ry = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2;
+      const rz = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2;
+
+      const eo = eqId * 11;
+      m.eq_data[eo] = 0; m.eq_data[eo + 1] = 0; m.eq_data[eo + 2] = 0;
+      m.eq_data[eo + 3] = px; m.eq_data[eo + 4] = py; m.eq_data[eo + 5] = pz;
+      m.eq_data[eo + 6] = rw; m.eq_data[eo + 7] = rx; m.eq_data[eo + 8] = ry; m.eq_data[eo + 9] = rz;
+      m.eq_data[eo + 10] = 1.0;
+      d.eq_active[eqId] = 1;
+      this.attachedObject = bestObj.name;
+      this.io.vacuum_engaged = true;
+    },
+
+    stepIo() {
+      const m = this.model, d = this.data;
+      if (!m || !d) return;
+      if (this.bundle?.tool_manifest?.kind === 'suction') {
+        if (this.io.vacuum) this.tryEngageSuction();
+        else if (this.attachedObject || Object.values(this.suctionWelds).some((eq) => d.eq_active[eq])) {
+          this.releaseSuction();
+        }
+      }
+      if ('brew_button_pressed' in this.io) {
+        const jid = this.findId(this.mujoco.mjtObj.mjOBJ_JOINT.value, 'brew_btn_joint');
+        if (jid >= 0) {
+          const pressed = d.qpos[m.jnt_qposadr[jid]] <= -0.005;
+          this.io.brew_button_pressed = pressed;
+          if (pressed) this.io.brew_led = true;
+        }
+      }
+    },
+
+    graspedSet() {
+      const d = this.data;
+      const held = new Set();
+      if (this.attachedObject) held.add(this.attachedObject);
+      const geomObj = new Map();
+      for (const obj of this.objects) for (const gid of obj.geoms) geomObj.set(gid, obj.name);
+      for (let i = 0; i < d.ncon; i++) {
+        const c = d.contact.get(i);
+        const g1 = c.geom1, g2 = c.geom2;
+        if (typeof c.delete === 'function') c.delete();
+        if (geomObj.has(g1) && this.toolContactGeoms.has(g2)) held.add(geomObj.get(g1));
+        else if (geomObj.has(g2) && this.toolContactGeoms.has(g1)) held.add(geomObj.get(g2));
+      }
+      if (this.tcpSiteId >= 0) {
+        const tcp = d.site_xpos.subarray(this.tcpSiteId * 3, this.tcpSiteId * 3 + 3);
+        for (const obj of this.objects) {
+          const p = d.qpos.subarray(obj.qadr, obj.qadr + 3);
+          if (p[2] >= obj.defaultPos[2] + 0.025 && Math.hypot(p[0] - tcp[0], p[1] - tcp[1], p[2] - tcp[2]) <= 0.08) {
+            held.add(obj.name);
+          }
+        }
+      }
+      return held;
+    },
+
+    objectState() {
+      const held = this.graspedSet();
+      const out = {};
+      for (const obj of this.objects) {
+        out[obj.name] = {
+          pos: Array.from(this.data.qpos.subarray(obj.qadr, obj.qadr + 3)).map((v) => Math.round(v * 1e5) / 1e5),
+          quat: Array.from(this.data.qpos.subarray(obj.qadr + 3, obj.qadr + 7)).map((v) => Math.round(v * 1e5) / 1e5),
+          grasped: held.has(obj.name),
+        };
+      }
+      return out;
+    },
+
+    evaluateTask(objSt) {
+      const sm = this.bundle?.scene_manifest;
+      if (!sm || !Array.isArray(sm.task_stages) || !sm.task_stages.length) return null;
+      const m = this.model, d = this.data;
+      const stagesOut = {};
+      for (const stg of sm.task_stages) {
+        const sid = String(stg.id);
+        if (this.latched[sid]) { stagesOut[sid] = true; continue; }
+        if (Array.isArray(stg.requires) && stg.requires.some((r) => !stagesOut[String(r)])) {
+          stagesOut[sid] = false; continue;
+        }
+        let passed = false;
+        if (stg.type === 'object_grasped') {
+          const info = objSt[String(stg.object)];
+          if (info) passed = Boolean(info.grasped) && (stg.min_z == null || info.pos[2] >= Number(stg.min_z));
+        } else if (stg.type === 'object_in_zone') {
+          const oname = String(stg.object);
+          const info = objSt[oname];
+          const z = (sm.zones || {})[String(stg.zone)];
+          if (info && z && Array.isArray(z.center) && Array.isArray(z.half_extents)) {
+            const inZone = [0, 1, 2].every((k) => Math.abs(info.pos[k] - z.center[k]) <= z.half_extents[k]);
+            const isAttached = Boolean(info.grasped) || this.attachedObject === oname || Boolean(this.io?.vacuum_engaged && this.attachedObject === oname);
+            const requireReleased = stg.require_released !== false;
+            passed = inZone && (!requireReleased || !isAttached);
+          }
+        } else if (stg.type === 'joint_threshold') {
+          const jid = this.findId(this.mujoco.mjtObj.mjOBJ_JOINT.value, String(stg.joint));
+          if (jid >= 0) {
+            const val = d.qpos[m.jnt_qposadr[jid]], thr = Number(stg.threshold), op = String(stg.op || '<=');
+            passed = op === '<' ? val < thr : op === '>=' ? val >= thr : op === '>' ? val > thr : val <= thr;
+          }
+        } else if (stg.type === 'io_state') {
+          passed = this.io[String(stg.channel)] === stg.value;
+        }
+        if (passed && stg.latch !== false) this.latched[sid] = true;
+        stagesOut[sid] = passed;
+        if (passed && stg.indicator_geom && Array.isArray(stg.indicator_rgba)) {
+          const gid = this.findId(this.mujoco.mjtObj.mjOBJ_GEOM.value, String(stg.indicator_geom));
+          if (gid >= 0) {
+            for (let k = 0; k < 4; k++) m.geom_rgba[gid * 4 + k] = Number(stg.indicator_rgba[k] ?? 1);
+          }
+        }
+      }
+      const total = sm.task_stages.length;
+      const doneCount = Object.values(stagesOut).filter(Boolean).length;
+      const current = sm.task_stages.find((s) => !stagesOut[String(s.id)]);
+      return {
+        scene: sm.id,
+        completed: total > 0 && doneCount === total,
+        success: total > 0 && doneCount === total,
+        score: total ? Math.round((doneCount / total) * 1e4) / 1e4 : 0,
+        current_stage: current ? String(current.id) : null,
+        stages: stagesOut,
+      };
+    },
+
+    reset(seed) {
+      const m = this.model, d = this.data;
+      if (!m || !d) return;
+      this.simGeneration++;
+      this.policyEpoch = this.simGeneration;
+      this.seed = seed != null ? seed : this.seed;
+      const rng = seed != null ? mulberry32(seed) : null;
+      for (const obj of this.objects) {
+        const px = obj.defaultPos[0] + (rng && obj.jitterXy > 0 ? (rng() * 2 - 1) * obj.jitterXy : 0);
+        const py = obj.defaultPos[1] + (rng && obj.jitterXy > 0 ? (rng() * 2 - 1) * obj.jitterXy : 0);
+        d.qpos[obj.qadr] = px; d.qpos[obj.qadr + 1] = py; d.qpos[obj.qadr + 2] = obj.defaultPos[2];
+        for (let k = 0; k < 4; k++) d.qpos[obj.qadr + 3 + k] = obj.defaultQuat[k];
+        for (let k = 0; k < 6; k++) d.qvel[obj.dadr + k] = 0;
+      }
+      for (const sj of this.sceneJoints) d.qpos[sj.qadr] = sj.q0;
+      this.io = { ...this.ioDefaults };
+      this.releaseSuction();
+      this.attachedObject = null;
+      this.latched = {};
+      for (const [gidStr, rgba] of Object.entries(this.savedRgba)) {
+        const gid = Number(gidStr);
+        for (let k = 0; k < 4; k++) m.geom_rgba[gid * 4 + k] = rgba[k];
+      }
+      this.mujoco.mj_forward(m, d);
+      this.positions = this.motorPositions();
+      this.overrideTargets = null;
+      this.policyTarget = null;
+      this.policySteps = 0;
+      V3.key = ''; V3.dirty = true;
+    },
+
+    applyMotors(targets) {
+      const m = this.model, d = this.data, ix = this.idx;
+      if (!m || !d || !ix) return;
+      const q = this.positions = this.motorPositions();
+      const isSo = ix.robot === 'so-arm101';
+      for (const dof of ix.dofAdr) d.qfrc_applied[dof] = 0;
+      for (const act of ix.acts) {
+        const i = act.jIdx;
+        const qt = i < targets.length && Number.isFinite(targets[i]) ? targets[i] : q[i];
+        if (act.isPos) {
+          let cmd = qt * ix.toolScale;
+          if (act.limHi > act.limLo) cmd = clamp(cmd, act.limLo, act.limHi);
+          d.ctrl[act.a] = cmd;
+        } else {
+          const vmax = isSo ? Math.min(2.5, 50 * 2 * Math.PI / 60) : (NO_LOAD_DM[i] ?? 20.0);
+          const kv = isSo ? 2.0 : (KV_DM[i] ?? 1.5);
+          const kpos = isSo ? 25.0 : (KPOS_DM[i] ?? 25.0);
+          const tlim = isSo ? 2.94 : (TORQUE_DM[i] ?? 7.0);
+          m.actuator_gainprm[act.a * 10] = kv;
+          m.actuator_biasprm[act.a * 10 + 2] = -kv;
+          d.ctrl[act.a] = clamp(kpos * (qt - q[i]), -vmax, vmax);
+          let extra = i < ix.armDof ? clamp(d.qfrc_bias[act.dof], -tlim, tlim) : 0;
+          m.actuator_forcerange[act.a * 2] = -tlim - extra;
+          m.actuator_forcerange[act.a * 2 + 1] = tlim - extra;
+          d.qfrc_applied[act.dof] = act.gear * extra;
+        }
+      }
+    },
+
+    async stepPolicy() {
+      const pm = this.bundle?.policy_manifest;
+      if (!this.policySession || !this.policyEnabled || !pm || this.policyBusy) return;
+      this.policyBusy = true;
+      const currentGen = this.simGeneration;
+      try {
+        const ort = await ensureOrt();
+        const feeds = {};
+        const stateSpec = pm.inputs?.state;
+        const norm = pm.normalization || {};
+        if (stateSpec) {
+          const cur = this.positions;
+          const dim = Number(stateSpec.shape?.[1] || cur.length);
+          const arr = new Float32Array(dim);
+          for (let i = 0; i < dim; i++) arr[i] = normVal(Number(cur[i] ?? 0), norm.state_mean, norm.state_std, i);
+          feeds[stateSpec.name] = new ort.Tensor('float32', arr, [1, dim]);
+        }
+        const imgSpec = pm.inputs?.image;
+        if (imgSpec && $('v3-canvas')) {
+          const [, c, h, w] = imgSpec.shape.map(Number);
+          if (!imgCanvas || imgCanvas.width !== w || imgCanvas.height !== h) {
+            imgCanvas = document.createElement('canvas');
+            imgCanvas.width = w; imgCanvas.height = h;
+            imgCtx = imgCanvas.getContext('2d', { willReadFrequently: true });
+          }
+          if (V3.r && V3.scene && V3.cam) V3.r.render(V3.scene, V3.cam);
+          imgCtx.drawImage($('v3-canvas'), 0, 0, w, h);
+          const pixels = imgCtx.getImageData(0, 0, w, h).data;
+          const scale = Number(imgSpec.scale ?? 1 / 255);
+          const imMean = imgSpec.mean || [0, 0, 0], imStd = imgSpec.std || [1, 1, 1];
+          const buf = new Float32Array(c * h * w);
+          const hw = h * w;
+          for (let p = 0; p < hw; p++) {
+            for (let ch = 0; ch < Math.min(c, 3); ch++) {
+              const v = pixels[p * 4 + ch] * scale;
+              buf[ch * hw + p] = (v - Number(imMean[ch] ?? 0)) / Math.max(Number(imStd[ch] ?? 1), 1e-6);
+            }
+          }
+          feeds[imgSpec.name] = new ort.Tensor('float32', buf, [1, c, h, w]);
+        }
+        const out = await this.policySession.run(feeds);
+        if (!this.policyEnabled || this.simGeneration !== currentGen) return;
+        const actTensor = out[pm.outputs.action.name];
+        const rawAct = Array.from(actTensor.data);
+        const outDim = Number(pm.action_dim || this.idx.dof);
+        const target = new Array(outDim);
+        for (let i = 0; i < outDim; i++) {
+          const am = Array.isArray(norm.action_mean) && norm.action_mean.length > i ? Number(norm.action_mean[i]) || 0 : 0;
+          const as = Array.isArray(norm.action_std) && norm.action_std.length > i ? Number(norm.action_std[i]) || 1 : 1;
+          const v = rawAct[i] * as + am;
+          const cur = this.positions[i] ?? 0;
+          const lead = i === GRIP ? CFG.gripLead : CFG.maxLead;
+          target[i] = clamp(v, cur - lead, cur + lead);
+        }
+        if (!this.policyEnabled || this.simGeneration !== currentGen) return;
+        this.lastAction = target.slice();
+        this.policyTarget = target;
+        this.policySteps++;
+        const ioOut = pm.outputs?.io;
+        if (ioOut?.name && out[ioOut.name]) {
+          const vals = out[ioOut.name].data;
+          (ioOut.channels || []).forEach((ch, i) => {
+            if (i >= vals.length) return;
+            const name = typeof ch === 'string' ? ch : ch?.name;
+            if (!name) return;
+            const isBool = (typeof ch === 'object' && ch.kind === 'bool') || name === 'vacuum';
+            this.io[name] = isBool ? vals[i] > 0.5 : Number(vals[i]);
+          });
+          this.stepIo();
+        }
+      } catch (e) {
+        if (this.simGeneration === currentGen) {
+          console.warn('WASM_SIM policy step error', e);
+        }
+      } finally {
+        this.policyBusy = false;
+      }
+    },
+
+    tick(ts) {
+      if (!this.active || !this.ready) return;
+      this.rafId = requestAnimationFrame((t2) => this.tick(t2));
+      if (!this.lastTs) this.lastTs = ts;
+      const dtReal = clamp((ts - this.lastTs) / 1000, 0, 0.05);
+      this.lastTs = ts;
+      this.accDt += dtReal;
+      const h = this.model.opt?.timestep || 0.002;
+      let targets = this.positions;
+      if (Array.isArray(this.overrideTargets)) targets = this.overrideTargets;
+      else if (this.policyEnabled && Array.isArray(this.policyTarget)) targets = this.policyTarget;
+      else if (isLive() && S.obs && Array.isArray(S.obs.positions)) {
+        targets = Array.isArray(S.obs.commanded_positions) ? S.obs.commanded_positions : S.obs.positions;
+      }
+      this.targetPositions = targets.slice();
+
+      let steps = 0;
+      while (this.accDt >= h && steps < 25) {
+        this.applyMotors(targets);
+        this.stepIo();
+        this.mujoco.mj_step(this.model, this.data);
+        this.accDt -= h;
+        steps++;
+      }
+      this.positions = this.motorPositions();
+
+      const fps = Number(this.bundle?.policy_manifest?.fps || 30);
+      if (this.policyEnabled && this.policySession && ts - this.lastPolicyAt >= 1000 / Math.max(1, fps)) {
+        this.lastPolicyAt = ts;
+        this.stepPolicy();
+      }
+      if (ts - this.lastSyncAt >= 180) {
+        this.lastSyncAt = ts;
+        this.pollBackendState();
+      }
+      if (ts - this.lastTelAt >= 150) {
+        this.lastTelAt = ts;
+        this.pushTelemetry();
+      }
+    },
+
+    getState() {
+      if (!this.ready || !this.data) return null;
+      const objSt = this.objectState();
+      const task = this.evaluateTask(objSt);
+      const tcp = this.tcpSiteId >= 0
+        ? Array.from(this.data.site_xpos.subarray(this.tcpSiteId * 3, this.tcpSiteId * 3 + 3)).map((v) => Math.round(v * 1e5) / 1e5)
+        : [0, 0, 0];
+      return {
+        seq: ++this.seq,
+        sim_time_s: Math.round((this.data.time || 0) * 1e4) / 1e4,
+        positions: this.positions.map((v) => Math.round(v * 1e5) / 1e5),
+        tcp,
+        objects: objSt,
+        task,
+        io: { ...this.io },
+        policy: this.policyName ? { name: this.policyName, enabled: this.policyEnabled, steps: this.policySteps } : null,
+      };
+    },
+
+    async pushTelemetry() {
+      if (this.telBusy || !this.ready) return;
+      this.telBusy = true;
+      try {
+        const stPayload = this.getState();
+        if (!stPayload) return;
+        await fetch('/api/v1/sandbox/telemetry', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(stPayload),
+        });
+      } catch (_) {} finally {
+        this.telBusy = false;
+      }
+    },
+
+    async pollBackendState() {
+      if (this.syncBusy || !this.active) return;
+      this.syncBusy = true;
+      try {
+        const r = await fetch('/api/v1/sandbox/state');
+        if (!r.ok) return;
+        const remote = await r.json();
+        if (remote.mode === 'none') { this.stop(); return; }
+        const rKey = `${remote.mode}:${remote.active_scene}:${remote.active_tool}:${remote.active_policy || ''}`;
+        if (remote.mode === 'wasm' && this.bundleKey && rKey !== this.bundleKey) {
+          await this.loadBundle();
+          return;
+        }
+        if (remote.reset_seq !== this.resetSeq && remote.reset_seq > this.resetSeq) {
+          this.resetSeq = remote.reset_seq;
+          this.reset(remote.seed);
+        }
+        if (remote.io_seq !== this.ioSeq) {
+          this.ioSeq = remote.io_seq;
+          if (remote.desired_io && typeof remote.desired_io === 'object') {
+            Object.assign(this.io, remote.desired_io);
+            this.stepIo();
+          }
+        }
+      } catch (_) {} finally {
+        this.syncBusy = false;
+      }
+    },
+
+    setPolicyEnabled(on) {
+      const prev = this.policyEnabled;
+      this.policyEnabled = Boolean(on);
+      if (prev && !this.policyEnabled) {
+        this.simGeneration++;
+        this.policyEpoch = this.simGeneration;
+        this.policyTarget = null;
+      }
+    },
+    setTargetPositions(q) { this.overrideTargets = Array.isArray(q) ? q.slice() : null; },
+    setIo(updates) {
+      if (updates && typeof updates === 'object') Object.assign(this.io, updates);
+      this.stepIo();
+    },
+
+    moveTcp(x, y, z, pitch = Math.PI / 2) {
+      if (!this.model || !this.idx) return null;
+      const curM = this.motorPositions();
+      const prevRaw = toModel(curM);
+      const prev = (Math.abs(prevRaw[1]) < 0.05 && Math.abs(prevRaw[2]) < 0.05) ? [0, -0.8, -1.5, 1.0] : prevRaw;
+      const res = IK.solve({ x, y, z, pitch }, {
+        prev,
+        inLimits: (q) => {
+          for (let i = 0; i < 4; i++) {
+            const jid = this.idx.jids[i];
+            if (jid >= 0 && this.model.jnt_limited?.[jid]) {
+              const lo = this.model.jnt_range[jid * 2], hi = this.model.jnt_range[jid * 2 + 1];
+              if (q[i] < lo + 1e-3 || q[i] > hi - 1e-3) return false;
+            }
+          }
+          return true;
+        },
+      });
+      if (!res.ok) return null;
+      const full = toMotor(res.q);
+      const q7 = [full[0], full[1], full[2], full[3], 0, curM[5] ?? Math.PI / 2, curM[6] ?? 0];
+      this.setTargetPositions(q7);
+      return q7;
+    },
+
+    async loadBundle() {
+      const r = await fetch('/api/v1/sandbox/bundle');
+      if (!r.ok) throw new Error('sandbox bundle failed: ' + r.status);
+      const bundle = await r.json();
+      const mj = this.mujoco = await ensureMujoco();
+      for (const a of (bundle.scene_manifest?.assets || [])) {
+        if (a?.path) {
+          const ar = await fetch(`/api/v1/sandbox/scenes/${bundle.active_scene}/files/${a.path}`);
+          if (ar.ok) writeMemfsFile(mj, a.path, new Uint8Array(await ar.arrayBuffer()));
+        }
+      }
+      for (const a of (bundle.tool_manifest?.assets || [])) {
+        if (a?.path) {
+          const ar = await fetch(`/api/v1/sandbox/tools/${bundle.active_tool}/files/${a.path}`);
+          if (ar.ok) writeMemfsFile(mj, a.path, new Uint8Array(await ar.arrayBuffer()));
+        }
+      }
+      writeMemfsFile(mj, 'scene.xml', bundle.composed_xml);
+      this.ready = false;
+      const oldData = this.data;
+      const oldModel = this.model;
+      this.data = null;
+      this.model = null;
+      if (oldData) { try { oldData.delete(); } catch (_) {} }
+      if (oldModel) { try { oldModel.delete(); } catch (_) {} }
+      try {
+        this.model = mj.MjModel.loadFromXML('/working/scene.xml');
+        this.data = new mj.MjData(this.model);
+        mj.mj_forward(this.model, this.data);
+
+        this.simGeneration++;
+        this.policyEpoch = this.simGeneration;
+        this.bundle = bundle;
+        this.bundleKey = `${bundle.mode}:${bundle.active_scene}:${bundle.active_tool}:${bundle.active_policy || ''}`;
+        this.resetSeq = bundle.reset_seq ?? 0;
+        this.ioSeq = bundle.io_seq ?? 0;
+        this.seed = bundle.seed ?? 0;
+        this.buildIndexer();
+        this.indexSceneAndWelds();
+        this.releaseSuction();
+        this.attachedObject = null;
+        this.latched = {};
+        this.io = { ...this.ioDefaults, ...(bundle.desired_io || {}) };
+        this.positions = this.motorPositions();
+        this.overrideTargets = null;
+        this.policyTarget = null;
+        this.policySession = null;
+        this.policyName = '';
+        this.policyEnabled = false;
+        this.policySteps = 0;
+
+        if (bundle.policy_model_url && bundle.policy_manifest) {
+          const ort = await ensureOrt();
+          this.policySession = await ort.InferenceSession.create(bundle.policy_model_url, { executionProviders: ['wasm'] });
+          this.policyName = bundle.policy_manifest.name || bundle.active_policy || 'onnx';
+          this.policyEnabled = Boolean(bundle.auto_start_policy);
+        }
+        v3ClearGroup(V3.sandboxGroup);
+        V3.sandboxGroup = null;
+        V3.key = ''; V3.dirty = true;
+        this.ready = true;
+        this.stepIo();
+        this.pushTelemetry();
+      } catch (err) {
+        this.ready = false;
+        if (this.data) { try { this.data.delete(); } catch (_) {} this.data = null; }
+        if (this.model) { try { this.model.delete(); } catch (_) {} this.model = null; }
+        throw err;
+      }
+    },
+
+    async start() {
+      if (this.starting) return;
+      this.starting = true;
+      this.active = true;
+      try {
+        if (!V3.open) v3Toggle(true);
+        await (V3.init ||= v3Init());
+        await this.loadBundle();
+        this.lastTs = 0;
+        if (!this.rafId) this.rafId = requestAnimationFrame((ts) => this.tick(ts));
+      } catch (e) {
+        console.warn('WASM_SIM start error', e);
+      } finally {
+        this.starting = false;
+      }
+    },
+
+    stop() {
+      this.active = false;
+      this.ready = false;
+      if (this.rafId) { cancelAnimationFrame(this.rafId); this.rafId = 0; }
+      v3ClearGroup(V3.sandboxGroup); V3.sandboxGroup = null;
+      if (V3.solid?.setHideFingers) V3.solid.setHideFingers(false);
+      if (V3.ghost?.setHideFingers) V3.ghost.setHideFingers(false);
+    },
+  };
+  return st;
+})();
+
+async function initSandbox() {
+  const wantWasm = QS.get('sim') === 'wasm';
+  let cat = null;
+  try {
+    const r = await fetch('/api/v1/sandbox/catalog');
+    if (r.ok) cat = await r.json();
+  } catch (_) {}
+  if (!cat) {
+    if (wantWasm) WASM_SIM.start().catch(() => {});
+    return;
+  }
+  if (wantWasm || cat.mode === 'wasm') {
+    WASM_SIM.start().catch(() => {});
+    return;
+  }
+  if (cat.mode === 'sim') {
+    V3.simModeActive = true;
+    try {
+      const br = await fetch('/api/v1/sandbox/bundle');
+      const bundle = br.ok ? await br.json() : null;
+      if (!V3.open) v3Toggle(true);
+      await (V3.init ||= v3Init());
+      if (bundle) await v3SyncSimScene(bundle, null);
+      setInterval(async () => {
+        if (!V3.simModeActive || !V3.open) return;
+        try {
+          const sr = await fetch('/api/v1/sandbox/state');
+          if (!sr.ok) return;
+          const s = await sr.json();
+          if (s.mode === 'wasm') { V3.simModeActive = false; WASM_SIM.start(); return; }
+          if (s.mode !== 'sim') return;
+          if (s.sim_state) await v3SyncSimScene(bundle, s.sim_state);
+        } catch (_) {}
+      }, 250);
+    } catch (_) {}
+  }
+}
+
+/* =================================================================
    Boot
    ================================================================= */
 { const sp = store('rebot.speed'); setSpeed(sp != null && /^[0-2]$/.test(sp) ? Number(sp) : 1); }
@@ -7925,7 +9307,8 @@ window.V = V;
   const st = store('rebot.step'); setStep(st != null && /^[0-2]$/.test(st) ? Number(st) : 1);
   $('c-rmax').textContent = Math.round(CFG.cart.reachMax * 1000);
 }
-loadSchema();
+schemaReady = loadSchema();
+initSandbox();
 connectWS();
 connectDetectionWS();
 initDetToggle();

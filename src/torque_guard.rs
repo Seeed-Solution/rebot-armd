@@ -17,7 +17,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ArmConfig, MotionLimitReason};
+use crate::model::ArmConfig;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::model::MotionLimitReason;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::supervisor::SupervisorInner;
 
 /// A torque hold ends once the held joint's measured position is at least this far (rad)
@@ -119,6 +122,43 @@ pub struct TorqueGuard {
     pub trips_total: u64,
 }
 
+impl TorqueGuard {
+    /// Deterministic saturation transition. Returns the joint that newly entered a hold.
+    /// The gripper is excluded by limiting the input to the first six joints.
+    pub fn step(&mut self, torques_nm: &[f32], thresholds_nm: &[Option<f32>], dt_s: f64, now_s: f64,
+        policy: &TorqueGuardPolicy, operational: bool, watching: bool, q_meas: &[f32]) -> Option<usize> {
+        if let Some(h) = self.hold {
+            let q = q_meas.get(h.joint).copied().unwrap_or(h.hold_q);
+            let tau = torques_nm.get(h.joint).copied().unwrap_or(f32::NAN);
+            if !operational || ((q - h.hold_q).abs() >= TORQUE_HOLD_RELEASE_RAD && tau.abs() < h.threshold_nm) {
+                self.hold = None;
+            }
+        }
+        if !operational || !policy.enabled || !watching { self.over_s = [0.0; 6]; return None; }
+        let persist = policy.persist_ms as f64 / 1000.0 - 1e-6;
+        let mut worst = None;
+        for j in 0..6 {
+            let Some(threshold) = thresholds_nm.get(j).copied().flatten() else { self.over_s[j] = 0.0; continue; };
+            let tau = torques_nm.get(j).copied().unwrap_or(f32::NAN);
+            if tau.is_finite() && tau.abs() >= threshold {
+                self.over_s[j] += dt_s;
+                let ratio = tau.abs() / threshold;
+                if self.over_s[j] >= persist && worst.is_none_or(|(_, r): (usize, f32)| ratio > r) { worst = Some((j, ratio)); }
+            } else { self.over_s[j] = 0.0; }
+        }
+        if let Some((j, _)) = worst {
+            let threshold = thresholds_nm[j].unwrap_or(f32::INFINITY);
+            let tau = torques_nm[j];
+            self.over_s = [0.0; 6];
+            self.trips_total += 1;
+            self.hold = Some(TorqueHold { joint: j, hold_q: q_meas.get(j).copied().unwrap_or(0.0), sign: if tau >= 0.0 { 1.0 } else { -1.0 }, torque_nm: tau, threshold_nm: threshold, since_s: now_s });
+            return Some(j);
+        }
+        None
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl SupervisorInner {
     /// Per-joint thresholds (N·m) from the profile; empty / all None when the guard is off.
     pub fn torque_guard_thresholds(&self) -> Vec<Option<f32>> {
@@ -132,61 +172,28 @@ impl SupervisorInner {
         let operational = self.is_torqued && self.safety.state().is_operational() && self.gravity_comp.is_none()
             && !self.disable_pending && !self.pending_rearm;
         let thr = p.thresholds(&self.config);
-        let at = |v: &[f32], j: usize| v.get(j).copied().unwrap_or(f32::NAN);
-        if let Some(h) = self.torque_guard.hold {
-            let q = at(&self.measured_positions, h.joint);
-            let tau = at(&self.torques, h.joint);
-            if !operational {
-                tracing::info!("Torque hold on joint {} ended (stop, torque off or gravity compensation)", h.joint + 1);
-                self.end_torque_hold();
-            } else if (q - h.hold_q).abs() >= TORQUE_HOLD_RELEASE_RAD && tau.abs() < h.threshold_nm {
-                tracing::info!("Torque hold on joint {} ended: moved {:.3} rad from the hold position, torque {tau:.2} N·m",
-                    h.joint + 1, q - h.hold_q);
-                self.end_torque_hold();
-            }
-        }
         let settling = self.pending_normal_unload && self.active_trajectory.is_none();
         let watching = operational && !settling && self.driver.is_some() && self.collision.torque_feedback
             && self.feedback_numeric_valid && self.hardware_feedback_fresh(std::time::Duration::from_millis(100));
-        if !watching {
-            self.torque_guard.over_s = [0.0; 6];
-            return;
-        }
-        let persist = p.persist_ms as f64 / 1000.0 - 1e-6;
-        let mut worst: Option<(usize, f32)> = None;
-        for j in 0..6 {
-            let (Some(t), tau) = (thr.get(j).copied().flatten(), at(&self.torques, j)) else {
-                self.torque_guard.over_s[j] = 0.0;
-                continue;
-            };
-            if tau.is_finite() && tau.abs() >= t {
-                self.torque_guard.over_s[j] += dt;
-                let r = tau.abs() / t;
-                if self.torque_guard.over_s[j] >= persist && worst.is_none_or(|(_, w)| r > w) { worst = Some((j, r)); }
-            } else {
-                self.torque_guard.over_s[j] = 0.0;
-            }
-        }
-        if let Some((j, _)) = worst {
+        let now = self.start_time.elapsed().as_secs_f64();
+        let previous_hold = self.torque_guard.hold;
+        let had_hold = previous_hold.is_some();
+        if let Some(j) = self.torque_guard.step(&self.torques, &thr, dt, now, &p, operational, watching, &self.measured_positions) {
             let threshold = thr[j].unwrap_or(f32::INFINITY);
-            self.torque_trip(j, self.torques[j], threshold, &p);
+            self.torque_trip(j, self.torques[j], threshold, &p, previous_hold.is_some_and(|h| h.joint == j));
         }
-    }
-
-    fn end_torque_hold(&mut self) {
-        self.torque_guard.hold = None;
-        if self.motion_limit.as_ref().is_some_and(|l| l.reason == MotionLimitReason::Torque) { self.motion_limit = None; }
+        if had_hold && self.torque_guard.hold.is_none()
+            && self.motion_limit.as_ref().is_some_and(|l| l.reason == MotionLimitReason::Torque) {
+            self.motion_limit = None;
+        }
     }
 
     /// Trip on joint `j`: fail the running action with `TORQUE_LIMIT`, end every motion and
     /// hold the measured pose with torque on (gripper keeps its command).
-    fn torque_trip(&mut self, j: usize, torque: f32, threshold: f32, p: &TorqueGuardPolicy) {
-        self.torque_guard.over_s = [0.0; 6];
-        self.torque_guard.trips_total += 1;
+    fn torque_trip(&mut self, j: usize, torque: f32, threshold: f32, p: &TorqueGuardPolicy, again: bool) {
         let tmax = threshold / p.ratio;
         let message = format!("Torque limit on joint {}: {torque:.2} N·m at or above {threshold:.2} N·m ({:.0}% of {tmax:.1} N·m) for {} ms",
             j + 1, p.ratio * 100.0, p.persist_ms);
-        let again = self.torque_guard.hold.is_some_and(|h| h.joint == j);
         if again {
             tracing::debug!("{message}; holding the new measured position");
         } else {
@@ -199,14 +206,10 @@ impl SupervisorInner {
         self.macro_run = None;
         self.hold_measured_pose();
         self.note_motion_limit(MotionLimitReason::Torque, Some(j));
-        self.torque_guard.hold = Some(TorqueHold {
-            joint: j,
-            hold_q: self.commanded_positions[j],
-            sign: if torque >= 0.0 { 1.0 } else { -1.0 },
-            torque_nm: torque,
-            threshold_nm: threshold,
-            since_s: self.start_time.elapsed().as_secs_f64(),
-        });
+        if let Some(h) = self.torque_guard.hold.as_mut() {
+            h.hold_q = self.commanded_positions[j];
+        }
+        // Pure transition installed the hold using the measured position and simulation time.
     }
 
     /// While a torque hold is in force: a servo / jog target that moves the held joint
@@ -219,5 +222,23 @@ impl SupervisorInner {
             *t = h.hold_q;
             self.note_motion_limit(MotionLimitReason::Torque, Some(h.joint));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn persistence_and_measured_position_release() {
+        let policy = TorqueGuardPolicy { enabled: true, persist_ms: 100, ..Default::default() };
+        let thresholds = [Some(1.0), None, None, None, None, None];
+        let mut g = TorqueGuard::default();
+        assert!(g.step(&[2.0], &thresholds, 0.05, 1.0, &policy, true, true, &[0.0]).is_none());
+        assert_eq!(g.step(&[2.0], &thresholds, 0.05, 1.05, &policy, true, true, &[0.0]), Some(0));
+        assert!(g.hold.is_some());
+        assert_eq!(g.step(&[], &thresholds, 0.01, 1.055, &policy, true, false, &[0.1]), None);
+        assert!(g.hold.is_some(), "missing torque feedback must not release a hold");
+        assert_eq!(g.step(&[0.1], &thresholds, 0.01, 1.06, &policy, true, true, &[0.1]), None);
+        assert!(g.hold.is_none());
     }
 }

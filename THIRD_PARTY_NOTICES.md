@@ -57,6 +57,15 @@ DEALINGS IN THE SOFTWARE.
   that are not included here. armd does not load meshes; the cockpit 3D view serves this URDF
   from `/assets/model/` and replaces those meshes with the decimated DM meshes listed below.
 
+## TheRobotStudio SO-ARM100 / SO-ARM101 robot description (URDF & STL meshes)
+
+- Files:
+  - `assets/so101_new_calib.urdf`
+  - `assets/so101/*.stl`
+- Upstream: https://github.com/TheRobotStudio/SO-ARM100 and https://github.com/huggingface/lerobot
+- License: Apache License, Version 2.0. Copyright (c) 2024 TheRobotStudio and Hugging Face contributors. Full text: http://www.apache.org/licenses/LICENSE-2.0
+- Modifications: `assets/so101_new_calib.urdf` rewires mesh package URIs to relative paths `so101/<name>.stl`, incorporates calibrated joint limits and links for 5-DOF arm + gripper kinematic chain, and sets `gripper_frame_link` tip frame.
+
 ## three.js and urdf-loader (cockpit 3D view)
 
 - File: `src/api/vendor/three-urdf.min.js.gz` (embedded in the `armd` binary and served at

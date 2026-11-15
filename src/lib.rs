@@ -1,57 +1,61 @@
-pub mod api;
+#[cfg(not(target_arch = "wasm32"))] pub mod api;
 pub mod chain;
 pub mod collision;
-pub mod diagnostics;
-pub mod driver;
+#[cfg(not(target_arch = "wasm32"))] pub mod diagnostics;
+#[cfg(not(target_arch = "wasm32"))] pub mod driver;
 pub mod dynamics;
-pub mod estimate;
-pub mod grasp;
+#[cfg(not(target_arch = "wasm32"))] pub mod estimate;
+#[cfg(not(target_arch = "wasm32"))] pub mod grasp;
 pub mod gravity;
-pub mod gravity_comp;
-pub mod gripper_calib;
-pub mod keepout;
+#[cfg(not(target_arch = "wasm32"))] pub mod gravity_comp;
+#[cfg(not(target_arch = "wasm32"))] pub mod gripper_calib;
+#[cfg(not(target_arch = "wasm32"))] pub mod keepout;
 pub mod kinematics;
-pub mod macro_action;
+#[cfg(not(target_arch = "wasm32"))] pub mod macro_action;
+pub mod mjcf_compose;
 pub mod model;
 pub mod motion;
-pub mod persist;
-pub mod place;
-pub mod poses;
+#[cfg(not(target_arch = "wasm32"))] pub mod persist;
+#[cfg(not(target_arch = "wasm32"))] pub mod place;
+#[cfg(not(target_arch = "wasm32"))] pub mod poses;
 pub mod power;
 pub mod power_plan;
-pub mod protocol;
-pub mod recording;
-pub mod replay;
+#[cfg(not(target_arch = "wasm32"))] pub mod protocol;
+#[cfg(not(target_arch = "wasm32"))] pub mod recording;
+#[cfg(not(target_arch = "wasm32"))] pub mod replay;
 pub mod safety;
-pub mod safety_describe;
-pub mod sim_driver;
-pub mod supervisor;
+#[cfg(not(target_arch = "wasm32"))] pub mod safety_describe;
+#[cfg(not(target_arch = "wasm32"))] pub mod sim_driver;
+#[cfg(not(target_arch = "wasm32"))] pub mod supervisor;
 pub mod torque_guard;
 pub mod trajectory;
 pub mod urdf;
-pub mod transport;
+#[cfg(not(target_arch = "wasm32"))] pub mod transport;
+pub mod wasm_api;
 
-pub use api::create_router;
-pub use driver::{
+#[cfg(not(target_arch = "wasm32"))] pub use api::create_router;
+#[cfg(not(target_arch = "wasm32"))] pub use driver::{
     ArmDriver, ArmDriverError, DamiaoArmDriver, FashionStarArmDriver, FeetechArmDriver,
     JointMode, JointTarget, RobStrideArmDriver,
 };
-pub use gravity::{compute_gravity_torques, verify_urdf_sha256, GravityError};
+pub use gravity::{compute_gravity_torques, GravityError};
+#[cfg(not(target_arch = "wasm32"))]
+pub use gravity::verify_urdf_sha256;
 pub use model::{ArmConfig, ArmObservation, ARM_PROFILE_VERSION, JointLimit, JointState, ObservationSchema};
-pub use recording::{
+#[cfg(not(target_arch = "wasm32"))] pub use recording::{
     lerobot_arrow_schema, read_frames_from_parquet, write_frames_to_parquet, EpisodeRecorder,
     EpisodeState, RecordFrame,
 };
 pub use safety::{FaultCode, FaultInfo, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
-pub use supervisor::{ArmError, ArmSupervisor, PreemptError, SupervisorInner};
+#[cfg(not(target_arch = "wasm32"))] pub use supervisor::{ArmError, ArmSupervisor, PreemptError, SupervisorInner};
 pub use trajectory::{
     MultiJointQuinticTrajectory, QuinticPolynomial, TrajectoryError, TrajectoryPlanner,
     TrajectoryPoint,
 };
-pub use transport::{
+#[cfg(not(target_arch = "wasm32"))] pub use transport::{
     AsyncTransport, CanFrame, CanTransport, MockCanTransport, MockTransport, SerialTransport,
     SerialTransportConfig, SlcanCodec, SlcanTransport, Transport, TransportError,
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "linux"))]
 pub use transport::SocketCanTransport;

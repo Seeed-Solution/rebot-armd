@@ -234,12 +234,18 @@ impl EpisodeStore {
         Ok(EpisodeList { enabled: true, dir: Some(dir.display().to_string()), episodes, total_bytes, max_bytes: MAX_EPISODES_BYTES, max_files: MAX_EPISODE_FILES })
     }
 
-    /// Remove `<dir>/<id>.parquet`.
+    /// Remove `<dir>/<id>.parquet` and any sidecar `<dir>/<id>.meta.json`.
     pub fn delete(&self, id: &str) -> Result<(), StoreError> {
         let path = self.path_of(id)?;
         match std::fs::remove_file(&path) {
             Ok(()) => {
                 self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+                let meta_path = path.with_extension("meta.json");
+                if let Err(e) = std::fs::remove_file(&meta_path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!("Failed to remove episode sidecar {}: {}", meta_path.display(), e);
+                    }
+                }
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(StoreError::NotFound(id.into())),
@@ -367,6 +373,7 @@ mod tests {
         assert!(store.list().unwrap().episodes.is_empty());
         write_frames_to_parquet(&tmp.path().join("one.parquet"), &frames(51)).unwrap();
         write_frames_to_parquet(&tmp.path().join("two.parquet"), &frames(2)).unwrap();
+        std::fs::write(tmp.path().join("two.meta.json"), b"{\"unit_mode\":\"so101_norm\"}").unwrap();
         std::fs::write(tmp.path().join("bad.parquet"), b"not parquet").unwrap();
         std::fs::write(tmp.path().join("notes.txt"), b"x").unwrap();
         std::fs::write(tmp.path().join("a b.parquet"), b"x").unwrap();
@@ -387,7 +394,9 @@ mod tests {
         assert_eq!(full.status_code(), (507, "EPISODES_FULL"));
         assert!(store.check_capacity_with(10, 100).is_err());
 
+        assert!(tmp.path().join("two.meta.json").exists());
         store.delete("two").unwrap();
+        assert!(!tmp.path().join("two.meta.json").exists());
         assert_eq!(store.delete("two").unwrap_err().status_code(), (404, "EPISODE_NOT_FOUND"));
         assert_eq!(store.delete("../one").unwrap_err().status_code().1, "INVALID_EPISODE_ID");
         assert!(tmp.path().join("one.parquet").exists());

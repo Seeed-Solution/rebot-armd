@@ -31,6 +31,7 @@ DEFAULT_OFFSET_M = (-0.0731, 0.0005, 0.0660)  # v8 holder lens centre in end_lin
 # Detections are normalised to the visible 640x360 band, like rebot-vision.
 DETECTION_SIZE = (640, 360)
 PROFILE = Path(__file__).resolve().parents[4] / "kits" / "recamera-b601dm" / "profile" / "rebot-b601dm.json"
+SO101_PROFILE = Path(__file__).resolve().parents[4] / "profiles" / "so_arm101.json"
 
 
 @dataclass(frozen=True)
@@ -64,8 +65,15 @@ def axis_r(k, a: float) -> np.ndarray:
 
 def mount_rotation(model: mujoco.MjModel, mount: CameraMount) -> np.ndarray:
     """R_end_cam (OpenCV camera axes as columns, in end_link), armd `cam_mount`."""
-    from .model import MODEL_OFFSETS_RAD
     data = mujoco.MjData(model)
+    joint_names = {model.joint(i).name for i in range(model.njnt)}
+    if "shoulder_pan" in joint_names:
+        mujoco.mj_forward(model, data)
+        end_r = data.body("gripper").xmat.reshape(3, 3)
+        cam_r = data.cam_xmat[model.camera("wrist").id].reshape(3, 3)
+        r_end_mj = end_r.T @ cam_r
+        return np.column_stack([r_end_mj[:, 0], -r_end_mj[:, 1], -r_end_mj[:, 2]])
+    from .model import MODEL_OFFSETS_RAD
     for j, motor in enumerate((0.0, 0.0, 0.0, 0.0, 0.0, math.pi / 2), start=1):
         data.qpos[model.jnt_qposadr[model.joint(f"joint{j}").id]] = motor + MODEL_OFFSETS_RAD[j - 1]
     mujoco.mj_kinematics(model, data)
@@ -98,8 +106,9 @@ def add_cameras(spec: mujoco.MjSpec, r_end_cam: np.ndarray, offset: np.ndarray) 
     up = np.cross(right, fwd)
     sq = np.zeros(4)
     mujoco.mju_mat2Quat(sq, np.column_stack([right, up, -fwd]).flatten())
-    scene = spec.worldbody.add_camera(name="scene", pos=list(eye), quat=list(sq))
-    scene.fovy = 45.0
+    if not any(c.name == "scene" for c in spec.worldbody.cameras):
+        scene = spec.worldbody.add_camera(name="scene", pos=list(eye), quat=list(sq))
+        scene.fovy = 45.0
     spec.visual.map.znear = 0.002  # fraction of the model extent: about 3 mm, the jaws are close
 
 
@@ -312,7 +321,13 @@ def detections(geom_ids: np.ndarray, scene, min_pixels: int = 20) -> list[dict]:
     h, w = geom_ids.shape
     out = []
     for i, (obj, gid) in enumerate(zip(scene.objects, scene.geom_ids)):
-        ys, xs = np.nonzero(geom_ids == gid)
+        body_ids = getattr(scene, "body_ids", None)
+        body_geom_ids = getattr(scene, "body_geom_ids", None)
+        if body_ids is not None and body_geom_ids is not None and i < len(body_ids):
+            gids = body_geom_ids.get(body_ids[i], [gid])
+            ys, xs = np.nonzero(np.isin(geom_ids, gids))
+        else:
+            ys, xs = np.nonzero(geom_ids == gid)
         if len(xs) < min_pixels:
             continue
         n0, n1 = round(int(xs.min()) / w, 4), round((int(xs.max()) + 1) / w, 4)

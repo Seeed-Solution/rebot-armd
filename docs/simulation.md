@@ -267,3 +267,19 @@ Host spark-6124 (aarch64, Cortex-X925, 20 cores), MuJoCo 4.0.0, Python 3.13:
 - No motor faults (over-temperature, under-voltage); temperature is constant. Damiao register access (mapping-range check, CTRL_MODE writes) is not simulated: `driver_range_check` is null and MIT switching is confirmed locally.
 - With the default `speed` 1.0 rad/s the jaw reaches −5.699 rad from closed after about 5.9 s; the open action is done after 6.2 s (2026-11-11), within the default `timeout_s` of 8.5 s for that stroke (formerly a fixed 6 s, which ended in `GRIPPER_TIMEOUT`). The test opens at 2.0 rad/s. Not verified on the real gripper.
 - The simulator runs on the host only; it is not packaged for the reCamera.
+
+## Optional Browser WASM Sandbox, `SimEnv`, and Sandbox REST API
+
+For rapid prototyping, custom task layout iteration, and zero-backend ONNX validation before running real-time pre-flight against `rebot-sim`:
+
+1. **Fetch browser WASM runtimes (out-of-binary)**:
+   - Run `node scripts/fetch_wasm_runtime.mjs` to download `mujoco-js@0.0.7` and `onnxruntime-web@1.21.0` from `registry.npmmirror.com` into gitignored `assets/wasm/` (`ARMD_WASM_DIR` overrides). `armd` serves them lazily at `GET /assets/wasm/{*path}` without bloating the `armd` binary or Debian packages.
+2. **Sandbox management API on `armd`**:
+   - `GET /api/v1/sandbox/catalog`, `GET /api/v1/sandbox/bundle`, `GET /api/v1/sandbox/state`
+   - `POST /api/v1/sandbox/scenes`, `POST /api/v1/sandbox/tools`, `POST /api/v1/sandbox/policies` (JSON upload of validated `scene.json`+`world.xml`, `tool.json`+`tool.xml`, `rebot-onnx-policy/v1` `policy.json`+`model.onnx`)
+   - `POST /api/v1/sandbox/activate` (`mode: "none" | "wasm" | "sim"`, composing MJCF XML for WASM and forwarding `/sim/scene` to `rebot-sim` in `"sim"` mode)
+   - `POST /api/v1/sandbox/reset`, `POST /api/v1/sandbox/io`, `POST /api/v1/sandbox/telemetry`
+3. **Browser WASM + `onnxruntime-web` (`?sim=wasm`)**:
+   - Without adding Cockpit upload dialogs, opening `?sim=wasm` (or activating `mode: "wasm"`) launches the 3D view (`#v3-canvas`), compiles `composed_xml` inside `mujoco_wasm.js`, executes `POS_VEL` motor + suction weld physics + staged evaluation, runs `rebot-onnx-policy/v1` models via `onnxruntime-web`, and reports live telemetry to `/api/v1/sandbox/telemetry`.
+4. **Non-realtime training (`rebot_sim.env.SimEnv`) & `pcb_suction`**:
+   - Use `rebot_sim.env.SimEnv(scene="pcb_suction", tool="suction")` in Python for unpaced fast RL/IL rollouts with `POS_VEL` actuator tracking and `qfrc_bias` gravity compensation.

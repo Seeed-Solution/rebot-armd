@@ -26,7 +26,7 @@ pub struct PoseTcp {
     pub rpy: [f64; 3],
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct NamedPose {
     pub name: String,
     /// One entry per joint (profile DOF).
@@ -35,11 +35,27 @@ pub struct NamedPose {
     pub tcp: Option<PoseTcp>,
     /// Unix time (ms) of the save.
     pub saved_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm_dof: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gripper_joint: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joint_names: Option<Vec<String>>,
 }
 
 /// File body and `GET /api/v1/poses` body.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct PoseList {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm_dof: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gripper_joint: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joint_names: Option<Vec<String>>,
     pub poses: Vec<NamedPose>,
 }
 
@@ -77,9 +93,54 @@ fn name_of(body: &Value) -> Result<String, ArmError> {
 /// Check a loaded pose list: count, names, DOF and finite positions.
 pub fn validate_list(list: &PoseList, config: &crate::model::ArmConfig) -> Result<(), String> {
     if list.poses.len() > MAX_POSES { return Err(format!("more than {MAX_POSES} poses")); }
+    let cfg_joint_names: Vec<String> = config.limits.iter().map(|l| l.name.clone()).collect();
+    if let (Some(ref list_pid), Some(ref cfg_pid)) = (&list.profile_id, &config.profile_id) {
+        if list_pid != cfg_pid {
+            return Err(format!("POSE_DOF_MISMATCH: pose list profile_id '{list_pid}' does not match config profile_id '{cfg_pid}'"));
+        }
+    }
+    if let Some(ad) = list.arm_dof {
+        if ad != config.arm_dof() {
+            return Err(format!("POSE_DOF_MISMATCH: pose list arm_dof {ad} does not match config arm_dof {}", config.arm_dof()));
+        }
+    }
+    if let Some(gj) = list.gripper_joint {
+        if Some(gj) != config.gripper_index() {
+            return Err(format!("POSE_DOF_MISMATCH: pose list gripper_joint {gj} does not match config gripper_joint {:?}", config.gripper_index()));
+        }
+    }
+    if let Some(ref jn) = list.joint_names {
+        if jn != &cfg_joint_names {
+            return Err(format!("POSE_DOF_MISMATCH: pose list joint_names {:?} do not match config joint_names {:?}", jn, cfg_joint_names));
+        }
+    }
     for (i, p) in list.poses.iter().enumerate() {
         if !valid_name(&p.name) { return Err(format!("invalid pose name '{}'", p.name)); }
         if list.poses[..i].iter().any(|q| q.name == p.name) { return Err(format!("duplicate pose name '{}'", p.name)); }
+        if let (Some(ref p_pid), Some(ref cfg_pid)) = (&p.profile_id, &config.profile_id) {
+            if p_pid != cfg_pid {
+                return Err(format!("POSE_DOF_MISMATCH: pose '{}' profile_id '{p_pid}' does not match config profile_id '{cfg_pid}'", p.name));
+            }
+        }
+        let effective_arm_dof = p.arm_dof.or(list.arm_dof);
+        if config.arm_dof() == 5 && effective_arm_dof.is_none() {
+            return Err(format!("POSE_DOF_MISMATCH: pose '{}' missing arm_dof on 5-DOF profile", p.name));
+        }
+        if let Some(ad) = effective_arm_dof {
+            if ad != config.arm_dof() {
+                return Err(format!("POSE_DOF_MISMATCH: pose '{}' arm_dof {ad} does not match config arm_dof {}", p.name, config.arm_dof()));
+            }
+        }
+        if let Some(gj) = p.gripper_joint {
+            if Some(gj) != config.gripper_index() {
+                return Err(format!("POSE_DOF_MISMATCH: pose '{}' gripper_joint {gj} does not match config gripper_joint {:?}", p.name, config.gripper_index()));
+            }
+        }
+        if let Some(ref jn) = p.joint_names {
+            if jn != &cfg_joint_names {
+                return Err(format!("POSE_DOF_MISMATCH: pose '{}' joint_names {:?} do not match config joint_names {:?}", p.name, jn, cfg_joint_names));
+            }
+        }
         // Joint limits are checked when a pose is used, so a profile change does not drop the file.
         if p.positions.len() != config.dof || !p.positions.iter().all(|v| v.is_finite()) {
             return Err(format!("pose '{}': positions must be {} finite numbers", p.name, config.dof));
@@ -109,10 +170,56 @@ impl SupervisorInner {
         self.poses.path.clone().map(|path| PendingWrite::new(path, serde_json::to_string_pretty(&self.poses.list).unwrap_or_default()))
     }
 
-    /// Joint-space quintic of J1..J6 (and J7 with `include_gripper`) to a stored pose,
+    /// Joint-space quintic of arm joints (and gripper with `include_gripper`) to a stored pose,
     /// recorded as a `move_to_pose` action. Returns (action id, expected duration).
     pub fn move_to_pose(&mut self, name: &str, include_gripper: bool, speed_scale: f64, tag: Option<String>, epoch: u64) -> Result<(u64, f64), ArmError> {
         let pose = self.poses.find(name)?;
+        let cfg_joint_names: Vec<String> = self.config.limits.iter().map(|l| l.name.clone()).collect();
+        let effective_pid = pose.profile_id.as_ref().or(self.poses.list.profile_id.as_ref());
+        if let (Some(pose_pid), Some(ref cfg_pid)) = (effective_pid, &self.config.profile_id) {
+            if pose_pid != cfg_pid {
+                return Err(ArmError::Rejected {
+                    status: 400,
+                    code: "POSE_DOF_MISMATCH".into(),
+                    message: format!("Pose '{name}' profile_id '{pose_pid}' does not match active config profile_id '{cfg_pid}'"),
+                });
+            }
+        }
+        let effective_arm_dof = pose.arm_dof.or(self.poses.list.arm_dof);
+        if self.config.arm_dof() == 5 && effective_arm_dof.is_none() {
+            return Err(ArmError::Rejected {
+                status: 400,
+                code: "POSE_DOF_MISMATCH".into(),
+                message: format!("Pose '{name}' missing arm_dof on 5-DOF profile"),
+            });
+        }
+        if let Some(ad) = effective_arm_dof {
+            if ad != self.config.arm_dof() {
+                return Err(ArmError::Rejected {
+                    status: 400,
+                    code: "POSE_DOF_MISMATCH".into(),
+                    message: format!("Pose '{name}' arm_dof {ad} does not match active config arm_dof {}", self.config.arm_dof()),
+                });
+            }
+        }
+        if let Some(gj) = pose.gripper_joint {
+            if Some(gj) != self.config.gripper_index() {
+                return Err(ArmError::Rejected {
+                    status: 400,
+                    code: "POSE_DOF_MISMATCH".into(),
+                    message: format!("Pose '{name}' gripper_joint {gj} does not match active config gripper_joint {:?}", self.config.gripper_index()),
+                });
+            }
+        }
+        if let Some(ref jn) = pose.joint_names {
+            if jn != &cfg_joint_names {
+                return Err(ArmError::Rejected {
+                    status: 400,
+                    code: "POSE_DOF_MISMATCH".into(),
+                    message: format!("Pose '{name}' joint_names do not match active config joint_names"),
+                });
+            }
+        }
         check_positions(&pose.positions, &self.config).map_err(invalid)?;
         let mut target = self.commanded_positions.clone();
         let gripper_idx = self.config.gripper_index();
@@ -143,7 +250,24 @@ pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Opt
         return Err(invalid(format!("at most {MAX_POSES} poses; delete one first")));
     }
     let saved_at_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
-    let pose = NamedPose { tcp: inner.pose_tcp(&positions), name, positions, saved_at_ms };
+    let profile_id = inner.config.profile_id.clone();
+    let arm_dof = inner.config.arm_dof();
+    let gripper_joint = inner.config.gripper_index();
+    let joint_names: Vec<String> = inner.config.limits.iter().map(|l| l.name.clone()).collect();
+    let pose = NamedPose {
+        tcp: inner.pose_tcp(&positions),
+        name,
+        positions,
+        saved_at_ms,
+        profile_id: profile_id.clone(),
+        arm_dof: Some(arm_dof),
+        gripper_joint,
+        joint_names: Some(joint_names.clone()),
+    };
+    inner.poses.list.profile_id = profile_id;
+    inner.poses.list.arm_dof = Some(arm_dof);
+    inner.poses.list.gripper_joint = gripper_joint;
+    inner.poses.list.joint_names = Some(joint_names);
     let list = &mut inner.poses.list.poses;
     match list.iter_mut().find(|p| p.name == pose.name) {
         Some(p) => *p = pose.clone(),

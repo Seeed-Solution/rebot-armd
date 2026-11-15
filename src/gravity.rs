@@ -1,3 +1,4 @@
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use thiserror::Error;
 
@@ -16,6 +17,7 @@ pub enum GravityError {
 }
 
 /// Verify the SHA256 checksum of the specified URDF file
+#[cfg(not(target_arch = "wasm32"))]
 pub fn verify_urdf_sha256(path: impl AsRef<Path>) -> Result<(), GravityError> {
     let path = path.as_ref();
     let content = std::fs::read(path).map_err(|e| {

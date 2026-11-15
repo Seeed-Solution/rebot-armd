@@ -103,7 +103,18 @@ class Scene:
         self.qpos = [model.jnt_qposadr[model.joint(o.name).id] for o in objects]
         self.qvel = [model.jnt_dofadr[model.joint(o.name).id] for o in objects]
         self.geom_ids = [model.geom(o.name).id for o in objects]
-        self.jaw_ids = {model.geom(g).id: g for g in JAW_GEOMS}
+        so101_jaws = ("wrist_roll_follower_so101_v1", "moving_jaw_so101_v1")
+        self.jaw_ids = {}
+        for g in JAW_GEOMS:
+            try:
+                self.jaw_ids[model.geom(g).id] = g
+            except (ValueError, KeyError):
+                pass
+        for g in so101_jaws:
+            try:
+                self.jaw_ids[model.geom(g).id] = g
+            except (ValueError, KeyError):
+                pass
         self.table_id = model.geom("table").id
         self.seed: int | None = None
 
@@ -126,7 +137,11 @@ class Scene:
                     continue
                 other = (pair - {gid}).pop() if len(pair) == 2 else gid
                 if other in self.jaw_ids:
-                    jaws.add("left" if self.jaw_ids[other].startswith("left") else "right")
+                    name = self.jaw_ids[other]
+                    if name in ("wrist_roll_follower_so101_v1", "moving_jaw_so101_v1"):
+                        jaws.add("fixed" if "wrist_roll" in name else "moving")
+                    else:
+                        jaws.add("left" if name.startswith("left") else "right")
                 elif other == self.table_id:
                     on_table = True
             z = float(data.qpos[qa + 2])

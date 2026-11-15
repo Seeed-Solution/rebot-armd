@@ -32,7 +32,10 @@ async fn wait_action(ws: &mut common::TestSocket, supervisor: &ArmSupervisor, ge
 async fn poses_file_round_trips_and_corrupt_file_is_not_overwritten_on_start() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("poses.json");
-    let list = PoseList { poses: vec![NamedPose { name: "bin_a".into(), positions: READY.to_vec(), tcp: None, saved_at_ms: 42 }] };
+    let list = PoseList {
+        poses: vec![NamedPose { name: "bin_a".into(), positions: READY.to_vec(), tcp: None, saved_at_ms: 42, ..Default::default() }],
+        ..Default::default()
+    };
     armd::persist::write_atomic(&path, &serde_json::to_string(&list).unwrap()).unwrap();
     let supervisor = ArmSupervisor::new(ArmConfig::rebot_dm());
     armd::poses::load_into(&supervisor, &path).await;
