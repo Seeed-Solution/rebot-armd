@@ -83,6 +83,9 @@ async fn thermal_trip_overrides_estop_and_retries_failed_disable_without_epoch_c
     assert_eq!(h.lock().unwrap().disable_calls, 2);
     assert!(supervisor.clear_fault().await.is_err(), "Hot feedback cannot reset thermal latch");
     h.lock().unwrap().states[0].temperature = 64.0;
+    let res = supervisor.clear_fault().await.unwrap();
+    assert_eq!(res, SafetyState::EStop, "Clearing thermal fault while E-stop was latched transitions to EStop");
+    assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::EStop);
     supervisor.clear_fault().await.unwrap();
     assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::Idle);
 }
@@ -294,4 +297,96 @@ async fn short_feedback_gap_holds_but_long_gap_latches_bus_loss() {
     h.lock().unwrap().age = Some(Duration::from_millis(600));
     let obs = supervisor.tick(0.02).await;
     assert!(matches!(obs.safety_state, SafetyState::Fault(FaultReason::BusLoss)), "{:?}", obs.safety_state);
+}
+
+#[tokio::test]
+async fn non_thermal_fault_not_overwritten_by_estop_tick_latch() {
+    let (supervisor, h) = setup(full_caps(), None).await;
+    // Set feedback age stale to latch BusLoss (> 500ms)
+    h.lock().unwrap().age = Some(Duration::from_millis(600));
+    let obs = supervisor.tick(0.02).await;
+    assert!(matches!(obs.safety_state, SafetyState::Fault(FaultReason::BusLoss)), "{:?}", obs.safety_state);
+    let fault_epoch = obs.epoch_id;
+
+    // Set e_stop_latched while in BusLoss (e.g. hardware latch)
+    supervisor.e_stop_latched.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Subsequent tick must NOT overwrite Fault(BusLoss) with EStop or change epoch
+    let next_obs = supervisor.tick(0.02).await;
+    assert!(matches!(next_obs.safety_state, SafetyState::Fault(FaultReason::BusLoss)), "{:?}", next_obs.safety_state);
+    assert_eq!(next_obs.epoch_id, fault_epoch);
+}
+
+#[tokio::test]
+async fn estop_during_thermal_trip_requires_two_stage_clear() {
+    let (supervisor, h) = setup(full_caps(), None).await;
+    // Overheat to trigger ThermalTrip
+    {
+        let mut h = h.lock().unwrap();
+        h.states[0].temperature = 80.0;
+    }
+    let obs = supervisor.tick(0.02).await;
+    assert!(matches!(obs.safety_state, SafetyState::Fault(FaultReason::ThermalTrip { .. })));
+
+    // E-stop occurs while in ThermalTrip; consume_pending_estop preserves ThermalTrip precedence
+    supervisor.trigger_e_stop().await;
+    assert!(matches!(supervisor.get_observation().await.safety_state, SafetyState::Fault(FaultReason::ThermalTrip { .. })));
+
+    // Cool down below reset threshold
+    h.lock().unwrap().states[0].temperature = 60.0;
+
+    // First clear_fault clears ThermalTrip but latches EStop because e_stop_latched was true
+    let state1 = supervisor.clear_fault().await.unwrap();
+    assert_eq!(state1, SafetyState::EStop);
+    assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::EStop);
+
+    // Second clear_fault clears EStop to Idle
+    let state2 = supervisor.clear_fault().await.unwrap();
+    assert_eq!(state2, SafetyState::Idle);
+    assert_eq!(supervisor.get_observation().await.safety_state, SafetyState::Idle);
+}
+
+#[tokio::test]
+async fn test_shifted_gripper_calibration_exceeding_joint_limits_rejected() {
+    let config = ArmConfig::rebot_dm();
+    let j7_idx = config.gripper_index().unwrap();
+    let j7_limit = config.limits[j7_idx].clone();
+
+    let supervisor = Arc::new(ArmSupervisor::new(config));
+    let mut inner = supervisor.inner().write().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gripper_calib.json");
+    inner.gripper_calib_path = Some(path.clone());
+
+    let initial_policy = inner.config.gripper_policy.clone();
+    let initial_offset = inner.gripper_calib_offset;
+
+    // Jaw opening points within limits, but offset_rad = 0.3 will push max > limit.max_position
+    let body = serde_json::json!({
+        "jaw_opening": {
+            "points": [[j7_limit.max_position - 0.05, 0.0], [j7_limit.min_position + 0.05, 0.08]],
+            "calibrated": true
+        },
+        "offset_rad": 0.3
+    });
+
+    let res = armd::gripper_calib::update(&mut inner, &body);
+    assert!(res.is_err(), "Shifted calibration exceeding limits must return Err");
+    match res.unwrap_err() {
+        armd::ArmError::Motion(armd::motion::MotionError::InvalidCommand(msg)) => {
+            assert!(msg.contains("limits") || msg.contains("exceeds") || msg.contains("Invalid"));
+        }
+        other => panic!("Expected MotionError::InvalidCommand, got {:?}", other),
+    }
+
+    // Prior policy and offset must remain untouched
+    assert_eq!(inner.config.gripper_policy, initial_policy, "gripper_policy must remain untouched");
+    assert_eq!(inner.gripper_calib_offset, initial_offset, "gripper_calib_offset must remain untouched");
+    assert!(!path.exists(), "No calib file must be written to disk on rejection");
+
+    // Direct apply_gripper_calibration test
+    let err = inner.apply_gripper_calibration(Some(0.4), None).unwrap_err();
+    assert!(err.contains("limits") || err.contains("exceeds"));
+    assert_eq!(inner.config.gripper_policy, initial_policy);
+    assert_eq!(inner.gripper_calib_offset, initial_offset);
 }

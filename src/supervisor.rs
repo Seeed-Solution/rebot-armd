@@ -1756,8 +1756,15 @@ impl SupervisorInner {
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
         Self::check_concurrent_estop(self)?;
+        let was_estop = *self.safety.state() == SafetyState::EStop;
         let state = self.safety.clear_fault()?;
         self.handover_settling_since = None;
+        if !was_estop && self.e_stop_latched.load(Ordering::SeqCst) {
+            self.apply_stop_policy(StopPolicy::EStopLatch);
+            self.last_heartbeat = Instant::now();
+            self.last_motion_frame = Instant::now();
+            return Ok(self.safety.state().clone());
+        }
         self.e_stop_latched.store(false, Ordering::SeqCst);
         Self::check_concurrent_estop(self)?;
         self.last_heartbeat = Instant::now();
@@ -2330,19 +2337,23 @@ impl SupervisorInner {
             tracing::info!("Action {} ({}) {}{}", id, a.kind, state, code.map(|c| format!(" {c}")).unwrap_or_default());
         }
         if let Some(offset_rad) = store_offset_val {
-            self.apply_gripper_calibration(Some(offset_rad), self.gripper_calib_jaw_opening.clone());
-            let path = self.gripper_calib_path.clone().unwrap_or_else(crate::gripper_calib::path_from_env);
-            let file = crate::gripper_calib::GripperCalibFile {
-                offset_rad: Some(offset_rad),
-                jaw_opening: self.gripper_calib_jaw_opening.clone(),
-                ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())),
-            };
-            let text = serde_json::to_string_pretty(&file).unwrap_or_default();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let write = crate::persist::PendingWrite::new(path, text);
-                handle.spawn(async move { let _ = write.run().await; });
+            if let Err(e) = self.apply_gripper_calibration(Some(offset_rad), self.gripper_calib_jaw_opening.clone()) {
+                tracing::warn!("Failed to apply gripper calibration after zero_check: {e}");
+                self.gripper_calib_invalid = true;
             } else {
-                let _ = crate::persist::write_atomic(&path, &text);
+                let path = self.gripper_calib_path.clone().unwrap_or_else(crate::gripper_calib::path_from_env);
+                let file = crate::gripper_calib::GripperCalibFile {
+                    offset_rad: Some(offset_rad),
+                    jaw_opening: self.gripper_calib_jaw_opening.clone(),
+                    ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())),
+                };
+                let text = serde_json::to_string_pretty(&file).unwrap_or_default();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let write = crate::persist::PendingWrite::new(path, text);
+                    handle.spawn(async move { let _ = write.run().await; });
+                } else {
+                    let _ = crate::persist::write_atomic(&path, &text);
+                }
             }
         }
         if holding == Some(false) { self.held = None; }
@@ -2740,43 +2751,75 @@ impl SupervisorInner {
     }
 
     /// Apply gripper calibration: offset shifts closed_rad, open_rad and jaw points.
-    pub fn apply_gripper_calibration(&mut self, offset_rad: Option<f32>, jaw_opening: Option<crate::model::JawOpening>) {
+    pub fn apply_gripper_calibration(
+        &mut self,
+        offset_rad: Option<f32>,
+        jaw_opening: Option<crate::model::JawOpening>,
+    ) -> Result<(), String> {
         if self.base_gripper_policy.is_none() {
             self.base_gripper_policy = self.config.gripper_policy.clone();
         }
-        let Some(base) = self.base_gripper_policy.clone() else { return; };
+        let Some(base) = self.base_gripper_policy.clone() else {
+            return Err("No base gripper policy available".into());
+        };
         let mut policy = base.clone();
-        self.gripper_calib_offset = offset_rad;
-        if jaw_opening.is_some() {
-            self.gripper_calib_jaw_opening = jaw_opening.clone();
-        }
         let offset = offset_rad.unwrap_or(0.0);
-        policy.closed_rad = base.closed_rad + offset;
-        policy.open_rad = base.open_rad + offset;
+        if !offset.is_finite() {
+            return Err("offset_rad must be finite".into());
+        }
+        let closed_rad = base.closed_rad + offset;
+        let open_rad = base.open_rad + offset;
+        if !closed_rad.is_finite() || !open_rad.is_finite() {
+            return Err("Computed closed_rad or open_rad is not finite".into());
+        }
+        if (closed_rad - open_rad).abs() < 0.1 {
+            return Err(format!(
+                "Calibration offset {offset} results in (closed_rad - open_rad).abs() < 0.1 (closed: {closed_rad}, open: {open_rad})"
+            ));
+        }
         let lim = self.config.gripper_index().and_then(|idx| self.config.limits.get(idx));
-        if let Some(mut jo) = jaw_opening.or_else(|| self.gripper_calib_jaw_opening.clone()).or(base.jaw_opening) {
+        if let Some(lim) = lim {
+            if closed_rad < lim.min_position || closed_rad > lim.max_position {
+                return Err(format!(
+                    "Calibrated closed_rad {closed_rad:.4} exceeds joint limits [{}, {}]",
+                    lim.min_position, lim.max_position
+                ));
+            }
+            if open_rad < lim.min_position || open_rad > lim.max_position {
+                return Err(format!(
+                    "Calibrated open_rad {open_rad:.4} exceeds joint limits [{}, {}]",
+                    lim.min_position, lim.max_position
+                ));
+            }
+        }
+        policy.closed_rad = closed_rad;
+        policy.open_rad = open_rad;
+
+        let candidate_jo = jaw_opening.clone()
+            .or_else(|| self.gripper_calib_jaw_opening.clone())
+            .or_else(|| base.jaw_opening.clone());
+        if let Some(mut jo) = candidate_jo {
             for pt in &mut jo.points {
                 pt[0] += offset;
             }
-            if let Err(e) = jo.validate(lim) {
-                tracing::warn!("Invalid jaw_opening calibration against joint limits: {e}");
-                self.gripper_calib_invalid = true;
-                return;
-            }
+            jo.validate(lim).map_err(|e| format!("Invalid jaw_opening calibration against joint limits: {e}"))?;
             policy.jaw_opening = Some(jo);
         } else {
             let mut jo = crate::model::JawOpening::sim_default();
             for pt in &mut jo.points {
                 pt[0] += offset;
             }
-            if let Err(e) = jo.validate(lim) {
-                tracing::warn!("Invalid default jaw_opening calibration against joint limits: {e}");
-                self.gripper_calib_invalid = true;
-                return;
-            }
+            jo.validate(lim).map_err(|e| format!("Invalid default jaw_opening calibration against joint limits: {e}"))?;
             policy.jaw_opening = Some(jo);
         }
+
         self.config.gripper_policy = Some(policy);
+        self.gripper_calib_offset = offset_rad;
+        if jaw_opening.is_some() {
+            self.gripper_calib_jaw_opening = jaw_opening;
+        }
+        self.gripper_calib_invalid = false;
+        Ok(())
     }
 
     pub fn gripper_zero_observation(&self) -> Option<crate::model::GripperZeroObservation> {
@@ -3218,10 +3261,7 @@ impl SupervisorInner {
     pub fn tick(&mut self, dt: f64) -> ArmObservation {
         self.consume_pending_estop();
         // Immediate atomic e-stop latch check before any processing
-        if self.e_stop_latched.load(Ordering::SeqCst)
-            && *self.safety.state() != SafetyState::EStop
-            && !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. }))
-        {
+        if self.e_stop_latched.load(Ordering::SeqCst) && !self.safety.state().is_stopped() {
             self.apply_stop_policy(StopPolicy::EStopLatch);
         }
 

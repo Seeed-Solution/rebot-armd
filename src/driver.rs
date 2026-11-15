@@ -415,8 +415,16 @@ impl<T: Transport> FeetechArmDriver<T> {
         self.tx_echo_auto
     }
 
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
+    }
+
+    pub fn rx_buffer(&self) -> &[u8] {
+        &self.rx_buffer
     }
 
     fn is_aborted(&self) -> bool {
@@ -435,29 +443,38 @@ impl<T: Transport> FeetechArmDriver<T> {
         const DRAIN_TIMEOUT: Duration = Duration::from_millis(5);
 
         let resync_rx = |rx: &mut Vec<u8>| {
-            loop {
-                while !rx.is_empty() && rx[0] != 0xFF {
-                    rx.remove(0);
+            let mut i = 0;
+            while i < rx.len() {
+                if rx[i] != 0xFF {
+                    let next = rx[i..].iter().position(|&b| b == 0xFF).map(|p| i + p).unwrap_or(rx.len());
+                    i = next;
+                    if i >= rx.len() {
+                        break;
+                    }
                 }
                 if tx.starts_with(&[0xFF, 0xFF])
                     && tx.get(2) != Some(&0xFF)
-                    && rx.len() >= 3
-                    && rx[0..3] == [0xFF, 0xFF, 0xFF]
+                    && rx[i..].len() >= 3
+                    && rx[i..i + 3] == [0xFF, 0xFF, 0xFF]
                 {
-                    rx.remove(0);
+                    i += 1;
                     continue;
                 }
-                let is_echo = rx.windows(tx.len()).any(|w| w == tx) || tx.starts_with(rx);
+                let slice = &rx[i..];
+                let is_echo = slice.windows(tx.len()).any(|w| w == tx) || tx.starts_with(slice);
                 if !is_echo {
-                    match feetech::parse_response(rx) {
+                    match feetech::parse_response(slice) {
                         Err(feetech::FeetechError::IncompleteFrame { .. }) | Ok(_) => break,
                         Err(_) => {
-                            rx.remove(0);
+                            i += 1;
                             continue;
                         }
                     }
                 }
                 break;
+            }
+            if i > 0 {
+                rx.drain(..i.min(rx.len()));
             }
         };
 
@@ -504,7 +521,8 @@ impl<T: Transport> FeetechArmDriver<T> {
                 self.tx_echo_auto = false;
             }
         } else if auto_detecting {
-            let has_partial_echo = (1..tx.len()).any(|k| self.rx_buffer.ends_with(&tx[..k]));
+            let has_partial_echo = (2..tx.len()).any(|k| self.rx_buffer.ends_with(&tx[..k]))
+                || (self.rx_buffer.len() < 2 && tx.starts_with(&self.rx_buffer));
             let has_valid_non_echo = matches!(feetech::parse_response(&self.rx_buffer), Ok((pkt, c)) if &self.rx_buffer[..c] != tx && pkt.id != feetech::BROADCAST_ID);
             if self.tx_echo == Some(true) && self.tx_echo_auto && !has_partial_echo {
                 tracing::warn!("Auto-detected tx_echo=true on /dev/ttySC* but no echo received within timeout; disabling tx_echo");
@@ -1489,7 +1507,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
 
         if let Some(inc_idx) = self.incomplete_chunk_idx.take() {
             let inc_ts = self.incomplete_frame_started_at.take().unwrap_or_else(Instant::now);
-            let mut inc_timed_out = inc_ts.elapsed() >= Duration::from_millis(15);
+            const INCOMPLETE_TTL: Duration = Duration::from_millis(35);
             let mut all_replied = false;
 
             if let Some(inc_chunk) = self.servo_ids.chunks(MAX_SYNC_READ_SERVOS).nth(inc_idx).map(|c| c.to_vec()) {
@@ -1502,22 +1520,28 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 let mut drain_buf = [0u8; 32];
 
                 while replied_ids.len() < inc_chunk.len()
-                    && !inc_timed_out
                     && reassembly_start.elapsed() < REASSEMBLY_TIMEOUT
                     && start_time.elapsed() < MAX_READ_DURATION
                 {
                     match self.transport.read(&mut drain_buf) {
                         Ok(n) if n > 0 => {
-                            let now = Instant::now();
                             self.rx_buffer.extend_from_slice(&drain_buf[..n]);
-                            self.decode_position_frames(&expected_ids, &mut replied_ids, now);
+                            self.decode_position_frames(&expected_ids, &mut replied_ids, inc_ts);
                         }
                         _ => {
+                            if inc_ts.elapsed() >= INCOMPLETE_TTL {
+                                break;
+                            }
                             std::thread::yield_now();
                         }
                     }
-                    if inc_ts.elapsed() >= Duration::from_millis(15) {
-                        inc_timed_out = true;
+                    if inc_ts.elapsed() >= INCOMPLETE_TTL && replied_ids.len() < inc_chunk.len() {
+                        if let Ok(n) = self.transport.read(&mut drain_buf) {
+                            if n > 0 {
+                                self.rx_buffer.extend_from_slice(&drain_buf[..n]);
+                                self.decode_position_frames(&expected_ids, &mut replied_ids, inc_ts);
+                            }
+                        }
                         break;
                     }
                 }
@@ -1525,8 +1549,8 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
                 all_replied = replied_ids.len() == inc_chunk.len();
             }
 
-            let has_incomplete = !self.rx_buffer.is_empty()
-                && matches!(feetech::parse_response(&self.rx_buffer), Err(feetech::FeetechError::IncompleteFrame { .. }));
+            let inc_timed_out = inc_ts.elapsed() >= INCOMPLETE_TTL;
+            let has_incomplete = feetech::has_partial_frame_header(&self.rx_buffer);
 
             if !all_replied && !inc_timed_out && has_incomplete {
                 self.incomplete_chunk_idx = Some(inc_idx);
@@ -1708,8 +1732,7 @@ impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
             }
 
             if replied_ids.len() < chunk.len()
-                && !self.rx_buffer.is_empty()
-                && matches!(feetech::parse_response(&self.rx_buffer), Err(feetech::FeetechError::IncompleteFrame { .. }))
+                && feetech::has_partial_frame_header(&self.rx_buffer)
             {
                 self.incomplete_chunk_idx = Some(chunk_idx);
                 self.incomplete_frame_started_at = Some(read_time);
@@ -1765,8 +1788,16 @@ impl<T: Transport> FashionStarArmDriver<T> {
         self
     }
 
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
+    }
+
+    pub fn rx_buffer(&self) -> &[u8] {
+        &self.rx_buffer
     }
 }
 

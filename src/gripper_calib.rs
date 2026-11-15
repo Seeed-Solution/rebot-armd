@@ -82,8 +82,7 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
     b.jaw_opening.validate(j7_limit).map_err(MotionError::InvalidCommand)?;
 
     let offset = b.offset_rad.or(inner.gripper_calib_offset);
-    inner.apply_gripper_calibration(offset, Some(b.jaw_opening.clone()));
-    inner.gripper_calib_invalid = false;
+    inner.apply_gripper_calibration(offset, Some(b.jaw_opening.clone())).map_err(MotionError::InvalidCommand)?;
 
     let effective = inner.config.gripper_policy.clone().ok_or_else(|| {
         MotionError::Unsupported("Gripper calibration requires a gripper policy".into())
@@ -111,8 +110,10 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
     match persist::load::<GripperCalibFile>(path, |f| f.validate(j7_lim.as_ref())) {
         Loaded::Loaded(calib) => {
             tracing::info!("Gripper calibration loaded from {}", path.display());
-            inner.apply_gripper_calibration(calib.offset_rad, calib.jaw_opening);
-            inner.gripper_calib_invalid = false;
+            if let Err(e) = inner.apply_gripper_calibration(calib.offset_rad, calib.jaw_opening) {
+                tracing::warn!("Ignoring invalid gripper calibration: {e}");
+                inner.gripper_calib_invalid = true;
+            }
         }
         Loaded::Missing => {}
         Loaded::Invalid(e) => {

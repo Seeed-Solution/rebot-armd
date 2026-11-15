@@ -12,6 +12,7 @@ pub struct MockTransport {
     error_on_next_write: Option<String>,
     write_responses: Vec<(Vec<u8>, Vec<u8>)>,
     staged_reads: VecDeque<Vec<u8>>,
+    clear_input_count: usize,
 }
 
 impl MockTransport {
@@ -76,6 +77,10 @@ impl MockTransport {
         self.rx_buffer.clear();
         self.tx_buffer.clear();
         self.staged_reads.clear();
+    }
+
+    pub fn clear_input_count(&self) -> usize {
+        self.clear_input_count
     }
 }
 
@@ -147,6 +152,10 @@ impl Transport for MockTransport {
 
     fn flush(&mut self) -> Result<(), TransportError> {
         Ok(())
+    }
+
+    fn clear_input_buffer(&mut self) {
+        self.clear_input_count += 1;
     }
 }
 

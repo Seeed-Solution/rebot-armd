@@ -309,6 +309,17 @@ pub fn parse_response(buf: &[u8]) -> Result<(FeetechPacket, usize), FeetechError
     ))
 }
 
+/// Check if the buffer contains a Feetech frame header followed by an incomplete frame.
+/// Returns true only when FEETECH_HEADER ([0xFF, 0xFF]) is present in `buf` and
+/// attempting to parse from that header returns `IncompleteFrame`.
+/// Stray noise bytes (e.g. `[0x00]`) with no header return `false`.
+pub fn has_partial_frame_header(buf: &[u8]) -> bool {
+    let Some(pos) = buf.windows(2).rposition(|w| w == FEETECH_HEADER) else {
+        return false;
+    };
+    matches!(parse_response(&buf[pos..]), Err(FeetechError::IncompleteFrame { .. }))
+}
+
 // =========================================================================
 // Physical Unit Conversions (Radians <-> Raw Steps, Temperature, Torque)
 // =========================================================================

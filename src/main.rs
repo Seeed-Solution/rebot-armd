@@ -180,12 +180,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if follower == "so-arm101" || follower == "so-arm100" {
         let name = if follower == "so-arm100" { "so_arm100.json" } else { "so_arm101.json" };
         let candidates = [
-            format!("profiles/{name}"),
             format!("/userdata/rebot-teleop/profile/{name}"),
+            format!("profiles/{name}"),
             format!("/usr/share/rebot-teleop/profile/{name}"),
         ];
         let path = candidates.iter().find(|p| std::path::Path::new(p).exists())
-            .unwrap_or(&candidates[0]);
+            .unwrap_or(&candidates[1]);
+        tracing::info!("Loaded profile for {follower} from {path}");
         ArmConfig::from_profile_file(path)?
     } else if follower == "rebot-dm" || follower == "sim" {
         ArmConfig::rebot_dm()

@@ -2993,15 +2993,35 @@ fn test_feetech_6servo_incomplete_chunk_idx_cross_call_reassembly_and_ghost_head
     driver.transport_mut().provide_rx(&ghost);
     driver.incomplete_chunk_idx = Some(0); // simulate incomplete flag set
 
-    // Next call should discard ghost header after timeout/drained limit and not starve
+    let build_resp_pos = |id: u8, pos_steps: u16| -> Vec<u8> {
+        let pos = pos_steps.to_le_bytes();
+        let spd = 0u16.to_le_bytes();
+        let load = 100u16.to_le_bytes();
+        let params = [pos[0], pos[1], spd[0], spd[1], load[0], load[1], 75, 40];
+        let cs = calculate_checksum(id, (params.len() + 2) as u8, 0x00, &params);
+        let mut pkt = vec![0xFF, 0xFF, id, (params.len() + 2) as u8, 0x00];
+        pkt.extend_from_slice(&params);
+        pkt.push(cs);
+        pkt
+    };
+
+    // Next call should discard ghost header after timeout/drained limit and not starve.
+    // Encode distinct joint positions (2500, 2600, 2700) different from baseline (2048).
     let mut rx3 = Vec::new();
-    for id in 1..=3 {
-        rx3.extend_from_slice(&build_resp(id));
-    }
+    rx3.extend_from_slice(&build_resp_pos(1, 2500));
+    rx3.extend_from_slice(&build_resp_pos(2, 2600));
+    rx3.extend_from_slice(&build_resp_pos(3, 2700));
     driver.transport_mut().provide_rx(&rx3);
 
-    let res3 = driver.read_joint_states();
-    assert!(res3.is_ok(), "Must not starve or fail on ghost header");
+    let states3 = driver.read_joint_states().expect("Must not starve or fail on ghost header");
+    let calib = armd::protocol::feetech::FeetechJointCalib::default();
+    let exp1 = calib.steps_to_rad(2500);
+    let exp2 = calib.steps_to_rad(2600);
+    let exp3 = calib.steps_to_rad(2700);
+    assert!((states3[0].position - exp1).abs() < 1e-4, "Decoded position 1 must equal distinct value");
+    assert!((states3[1].position - exp2).abs() < 1e-4, "Decoded position 2 must equal distinct value");
+    assert!((states3[2].position - exp3).abs() < 1e-4, "Decoded position 3 must equal distinct value");
+
     let ages = driver.feedback_ages();
     for id in 0..3 {
         assert!(
@@ -3011,6 +3031,18 @@ fn test_feetech_6servo_incomplete_chunk_idx_cross_call_reassembly_and_ghost_head
             ages[id]
         );
     }
+
+    // Subsequent poll for Chunk 1 progresses cleanly
+    let mut rx4 = Vec::new();
+    for id in 4..=6 {
+        rx4.extend_from_slice(&build_resp_pos(id, 2800));
+    }
+    driver.transport_mut().provide_rx(&rx4);
+    let states4 = driver.read_joint_states().expect("Subsequent poll for Chunk 1 must progress cleanly");
+    assert_eq!(states4.len(), 6);
+    let exp4 = calib.steps_to_rad(2800);
+    assert!((states4[3].position - exp4).abs() < 1e-4);
+    assert_eq!(driver.incomplete_chunk_idx, None);
 }
 
 // -------------------------------------------------------------------------
@@ -3082,16 +3114,85 @@ fn test_feetech_incomplete_chunk_preserved_across_enable_poll_and_completed_on_n
     let _ = driver.read_joint_states();
     assert_eq!(driver.incomplete_chunk_idx, Some(0), "Chunk 0 must be marked incomplete");
 
-    // Call 2 (poll_count -> 10, enable poll due): supply the remainder of servo 1.
+    // Call 2 (poll_count -> 10, enable poll due): supply partial continuation (bytes 4..8, still incomplete).
     // If enable poll had erroneously run while incomplete_chunk_idx was Some,
-    // clear_input_buffer() and rx_buffer.clear() would have wiped the partial frame!
+    // clear_input_buffer() would have been called and wiped the partial frame!
+    let clears_before_reassembly = driver.transport().clear_input_count();
     driver.last_enable_poll = Some(Instant::now() - Duration::from_millis(500));
-    driver.transport_mut().provide_rx(&resp1[4..]);
+    driver.transport_mut().provide_rx(&resp1[4..8]);
 
+    let _ = driver.read_joint_states();
+    assert_eq!(driver.incomplete_chunk_idx, Some(0), "Chunk 0 must still be incomplete");
+    assert_eq!(
+        driver.transport().clear_input_count(),
+        clears_before_reassembly,
+        "clear_input_count must not increment during incomplete reassembly across ticks"
+    );
+
+    // Call 3: supply remaining bytes
+    driver.transport_mut().provide_rx(&resp1[8..]);
     let states = driver.read_joint_states().expect("Reassembly must succeed without enable-poll wiping rx_buffer");
     assert_eq!(states.len(), 1);
     assert_eq!(driver.incomplete_chunk_idx, None);
     assert!(driver.feedback_ages()[0].is_some_and(|a| a < Duration::from_millis(50)));
+}
+
+// -------------------------------------------------------------------------
+// 61b. Partial RX frame survives 50 Hz (20ms) control tick gap (35ms TTL)
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_partial_rx_frame_survives_50hz_tick_gap() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1]).with_tx_echo(Some(false));
+    driver.confirmed_enable_state = EnableState::Enabled;
+    driver.last_enable_poll = Some(Instant::now());
+
+    let build_resp = |id: u8| -> Vec<u8> {
+        let pos = 2048u16.to_le_bytes();
+        let spd = 0u16.to_le_bytes();
+        let load = 100u16.to_le_bytes();
+        let params = [pos[0], pos[1], spd[0], spd[1], load[0], load[1], 75, 40];
+        let cs = calculate_checksum(id, (params.len() + 2) as u8, 0x00, &params);
+        let mut pkt = vec![0xFF, 0xFF, id, (params.len() + 2) as u8, 0x00];
+        pkt.extend_from_slice(&params);
+        pkt.push(cs);
+        pkt
+    };
+
+    let resp1 = build_resp(1);
+    // Supply partial frame (first 4 bytes)
+    driver.transport_mut().provide_rx(&resp1[..4]);
+    let _ = driver.read_joint_states();
+    assert_eq!(driver.incomplete_chunk_idx, Some(0));
+
+    // Simulate 50 Hz control tick gap (22ms > 20ms, well within 35ms TTL)
+    std::thread::sleep(Duration::from_millis(22));
+
+    // Provide remaining bytes
+    driver.transport_mut().provide_rx(&resp1[4..]);
+    let states = driver.read_joint_states().expect("Reassembly must survive 22ms tick gap");
+    assert_eq!(states.len(), 1);
+    assert_eq!(driver.incomplete_chunk_idx, None);
+    assert!(driver.feedback_ages()[0].is_some_and(|a| a < Duration::from_millis(60)));
+}
+
+// -------------------------------------------------------------------------
+// 61c. Stray noise (0x00) without 0xFF 0xFF header does NOT pause polling
+// -------------------------------------------------------------------------
+#[test]
+fn test_feetech_stray_noise_does_not_pause_polling() {
+    let mock = MockTransport::new();
+    let mut driver = FeetechArmDriver::new(mock, vec![1, 2, 3]).with_tx_echo(Some(false));
+
+    // Provide stray noise byte 0x00 (no 0xFF 0xFF header)
+    driver.transport_mut().provide_rx(&[0x00]);
+
+    let _ = driver.read_joint_states();
+    assert_eq!(
+        driver.incomplete_chunk_idx, None,
+        "Stray noise 0x00 must NOT set incomplete_chunk_idx or pause polling"
+    );
+    assert!(driver.rx_buffer().is_empty(), "rx_buffer must be cleared of noise");
 }
 
 // -------------------------------------------------------------------------
