@@ -2768,16 +2768,13 @@ impl SupervisorInner {
             return Err("offset_rad must be finite".into());
         }
         let closed_rad = base.closed_rad + offset;
-        let open_rad = base.open_rad + offset;
+        let mut open_rad = base.open_rad + offset;
         if !closed_rad.is_finite() || !open_rad.is_finite() {
             return Err("Computed closed_rad or open_rad is not finite".into());
         }
-        if (closed_rad - open_rad).abs() < 0.1 {
-            return Err(format!(
-                "Calibration offset {offset} results in (closed_rad - open_rad).abs() < 0.1 (closed: {closed_rad}, open: {open_rad})"
-            ));
-        }
         let lim = self.config.gripper_index().and_then(|idx| self.config.limits.get(idx));
+        // The measured stop must lie inside the limits; the open end may be shifted past one
+        // (the base open_rad sits close to it), so it is held at the limit.
         if let Some(lim) = lim {
             if closed_rad < lim.min_position || closed_rad > lim.max_position {
                 return Err(format!(
@@ -2785,12 +2782,12 @@ impl SupervisorInner {
                     lim.min_position, lim.max_position
                 ));
             }
-            if open_rad < lim.min_position || open_rad > lim.max_position {
-                return Err(format!(
-                    "Calibrated open_rad {open_rad:.4} exceeds joint limits [{}, {}]",
-                    lim.min_position, lim.max_position
-                ));
-            }
+            open_rad = open_rad.clamp(lim.min_position, lim.max_position);
+        }
+        if (closed_rad - open_rad).abs() < 0.1 {
+            return Err(format!(
+                "Calibration offset {offset} results in (closed_rad - open_rad).abs() < 0.1 (closed: {closed_rad}, open: {open_rad})"
+            ));
         }
         policy.closed_rad = closed_rad;
         policy.open_rad = open_rad;
@@ -2798,20 +2795,15 @@ impl SupervisorInner {
         let candidate_jo = jaw_opening.clone()
             .or_else(|| self.gripper_calib_jaw_opening.clone())
             .or_else(|| base.jaw_opening.clone());
-        if let Some(mut jo) = candidate_jo {
-            for pt in &mut jo.points {
-                pt[0] += offset;
-            }
-            jo.validate(lim).map_err(|e| format!("Invalid jaw_opening calibration against joint limits: {e}"))?;
-            policy.jaw_opening = Some(jo);
-        } else {
-            let mut jo = crate::model::JawOpening::sim_default();
-            for pt in &mut jo.points {
-                pt[0] += offset;
-            }
-            jo.validate(lim).map_err(|e| format!("Invalid default jaw_opening calibration against joint limits: {e}"))?;
-            policy.jaw_opening = Some(jo);
+        // The table is checked against the limits before the offset shift: the shift can move
+        // its open end past a limit, like open_rad, and those points are never reached.
+        let mut jo = candidate_jo.unwrap_or_else(crate::model::JawOpening::sim_default);
+        jo.validate(lim).map_err(|e| format!("Invalid jaw_opening calibration against joint limits: {e}"))?;
+        for pt in &mut jo.points {
+            pt[0] += offset;
         }
+        jo.validate(None).map_err(|e| format!("Invalid jaw_opening calibration: {e}"))?;
+        policy.jaw_opening = Some(jo);
 
         self.config.gripper_policy = Some(policy);
         self.gripper_calib_offset = offset_rad;

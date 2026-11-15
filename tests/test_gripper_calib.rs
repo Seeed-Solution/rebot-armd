@@ -448,3 +448,16 @@ fn test_gripper_moves_after_a_zero_check() {
         assert!((inner.measured_positions[6] - target).abs() < 0.15, "fraction {f}: j7 {} vs {target}", inner.measured_positions[6]);
     }
 }
+
+#[test]
+fn negative_zero_offset_holds_open_end_at_the_limit() {
+    // base open -5.7 sits 0.05 inside the -5.75 limit; a measured zero of -0.08 must still apply
+    let mut inner = sim_at(&[0.0; 7]);
+    let lim = inner.config.limits[6].clone();
+    inner.apply_gripper_calibration(Some(-0.08), None).expect("offset -0.08 applies");
+    let p = inner.config.gripper_policy.clone().unwrap();
+    assert!((p.closed_rad - -0.08).abs() < 1e-6);
+    assert_eq!(p.open_rad, lim.min_position);
+    // the closed end outside the limits is still refused
+    assert!(inner.apply_gripper_calibration(Some(0.4), None).is_err());
+}
