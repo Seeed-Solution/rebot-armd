@@ -72,7 +72,7 @@ pub fn create_router_full(
         .route(
             "/api/v1/sandbox/scenes",
             post(sandbox::upload_scene)
-                .layer(DefaultBodyLimit::max(sandbox::MAX_SCENE_UPLOAD_BYTES))
+                .layer(DefaultBodyLimit::max(sandbox::max_upload_body_bytes()))
                 .layer(middleware::from_fn(sandbox::upload_concurrency_middleware)),
         )
         .route("/api/v1/sandbox/scenes/{id}", get(sandbox::get_scene))
@@ -80,7 +80,7 @@ pub fn create_router_full(
         .route(
             "/api/v1/sandbox/tools",
             post(sandbox::upload_tool)
-                .layer(DefaultBodyLimit::max(sandbox::MAX_TOOL_UPLOAD_BYTES))
+                .layer(DefaultBodyLimit::max(sandbox::max_upload_body_bytes()))
                 .layer(middleware::from_fn(sandbox::upload_concurrency_middleware)),
         )
         .route("/api/v1/sandbox/tools/{id}", get(sandbox::get_tool))
@@ -88,7 +88,7 @@ pub fn create_router_full(
         .route(
             "/api/v1/sandbox/policies",
             post(sandbox::upload_policy)
-                .layer(DefaultBodyLimit::max(sandbox::MAX_POLICY_UPLOAD_BYTES))
+                .layer(DefaultBodyLimit::max(sandbox::max_upload_body_bytes()))
                 .layer(middleware::from_fn(sandbox::upload_concurrency_middleware)),
         )
         .route("/api/v1/sandbox/policies/{id}", get(sandbox::get_policy))

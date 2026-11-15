@@ -29,9 +29,27 @@ static TARGET_REPLACE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub const MAX_PACK_FILE_BYTES: u64 = 16 * 1024 * 1024; // 16 MiB
 pub const MAX_POLICY_MODEL_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 pub const MAX_POLICY_PACK_BYTES: u64 = 96 * 1024 * 1024; // 96 MiB total pack size for policy uploads
-pub const MAX_SCENE_UPLOAD_BYTES: usize = 32 * 1024 * 1024; // 32 MiB HTTP body limit
-pub const MAX_TOOL_UPLOAD_BYTES: usize = 32 * 1024 * 1024; // 32 MiB HTTP body limit
-pub const MAX_POLICY_UPLOAD_BYTES: usize = 128 * 1024 * 1024; // 128 MiB HTTP body limit (~64 MiB model base64 in JSON)
+/// Default HTTP body limit of the scene / tool / policy uploads. Base64 decoding holds the body,
+/// the decoded bytes and the files at once (about 3x the body), so 16 MiB stays far below the
+/// 256 MB of a reCamera. `ARMD_SANDBOX_MAX_BODY_MB` overrides it.
+pub const DEFAULT_MAX_UPLOAD_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// The upload body limit: `ARMD_SANDBOX_MAX_BODY_MB` (MiB, 1..=1024) or
+/// [`DEFAULT_MAX_UPLOAD_BODY_BYTES`].
+pub fn max_upload_body_bytes() -> usize {
+    upload_body_limit_from(std::env::var("ARMD_SANDBOX_MAX_BODY_MB").ok().as_deref())
+}
+
+fn upload_body_limit_from(value: Option<&str>) -> usize {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else { return DEFAULT_MAX_UPLOAD_BODY_BYTES; };
+    match value.parse::<usize>() {
+        Ok(mb @ 1..=1024) => mb * 1024 * 1024,
+        _ => {
+            tracing::warn!("ARMD_SANDBOX_MAX_BODY_MB={value:?} is not a whole number of MiB in 1..=1024; using {} MiB", DEFAULT_MAX_UPLOAD_BODY_BYTES >> 20);
+            DEFAULT_MAX_UPLOAD_BODY_BYTES
+        }
+    }
+}
 pub const MAX_CUSTOM_PACKS_PER_KIND: usize = 64;
 pub const MAX_SANDBOX_STORAGE_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 
@@ -47,7 +65,9 @@ pub struct UploadPermitSlot(pub Arc<std::sync::Mutex<Option<OwnedSemaphorePermit
 /// Axum middleware ensuring only one sandbox upload runs at a time.
 ///
 /// Gating happens BEFORE the request body (`Json(payload)`) is buffered by Axum,
-/// preventing concurrent buffering of up to 128 MiB payloads when an upload is already active.
+/// preventing concurrent buffering of upload payloads when an upload is already active.
+/// A `Content-Length` over [`max_upload_body_bytes`] is answered 413 here, before the permit
+/// and before any of the body is read (`DefaultBodyLimit` only stops reading at the limit).
 ///
 /// The acquired permit is attached to request extensions via [`UploadPermitSlot`].
 /// Upload handlers transfer this permit into `spawn_blocking` so that if the client
@@ -58,6 +78,19 @@ pub async fn upload_concurrency_middleware(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    let limit = max_upload_body_bytes();
+    let declared = req.headers().get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|n| n > limit as u64) {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!("Upload body is larger than the {} MiB limit (ARMD_SANDBOX_MAX_BODY_MB)", limit >> 20),
+                "limit_bytes": limit,
+            })),
+        )
+            .into_response();
+    }
     let permit = match upload_semaphore().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
@@ -465,10 +498,18 @@ impl SandboxState {
     }
 }
 
-pub fn sim_upstream_url() -> String {
-    std::env::var("ARMD_SIM_URL")
-        .or_else(|_| std::env::var("ARMD_DETECTOR_URL"))
-        .unwrap_or_else(|_| proxy::DEFAULT_DETECTOR_URL.to_string())
+/// The rebot-sim server (`ARMD_SIM_URL`). There is no fallback: the detector URL is
+/// rebot-vision on the device, which does not serve `/sim/*`. Unset or empty is a 503.
+pub fn sim_upstream_url() -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    std::env::var("ARMD_SIM_URL").ok().filter(|u| !u.trim().is_empty()).ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "Sim mode needs ARMD_SIM_URL (the rebot-sim server URL); it is not set",
+                "code": "SIM_NOT_CONFIGURED",
+            })),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1370,7 +1411,7 @@ pub async fn activate(
 
     // If mode == "sim", send POST /sim/scene to rebot-sim upstream
     if mode == "sim" {
-        let sim_url = sim_upstream_url();
+        let sim_url = sim_upstream_url()?;
         let upstream = DetectorUpstream::parse(&sim_url)
             .map_err(|e| (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e, "sim_url": sim_url}))))?;
 
@@ -1500,7 +1541,7 @@ pub async fn get_state(
     let current = state.active.read().await.clone();
 
     if current.mode == "sim" {
-        let sim_url = sim_upstream_url();
+        let sim_url = sim_upstream_url().unwrap_or_default();
         if let Ok(upstream) = DetectorUpstream::parse(&sim_url) {
             let req_fut = proxy::upstream_request(&upstream, Method::GET, "/sim/state", None);
             match tokio::time::timeout(std::time::Duration::from_secs(10), req_fut).await {
@@ -1585,7 +1626,7 @@ pub async fn reset(
     };
 
     if mode == "sim" {
-        let sim_url = sim_upstream_url();
+        let sim_url = sim_upstream_url()?;
         let upstream = DetectorUpstream::parse(&sim_url)
             .map_err(|e| (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e, "sim_url": sim_url}))))?;
         let body = serde_json::to_vec(&serde_json::json!({"seed": seed})).unwrap();
@@ -1613,6 +1654,39 @@ pub async fn reset(
     })))
 }
 
+/// Most keys `desired_io` holds (it is persisted to state.json on every IO write).
+pub const MAX_IO_KEYS: usize = 64;
+/// Longest serialized JSON value of one IO key.
+pub const MAX_IO_VALUE_BYTES: usize = 4096;
+
+/// IO keys: `^[A-Za-z0-9_.-]{1,64}$`; values at most [`MAX_IO_VALUE_BYTES`] as JSON.
+fn check_io_updates(updates: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    if updates.len() > MAX_IO_KEYS {
+        return Err(format!("At most {MAX_IO_KEYS} IO keys per request, got {}", updates.len()));
+    }
+    for (key, value) in updates {
+        if key.is_empty() || key.len() > 64 || !key.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')) {
+            return Err(format!("Invalid IO key {key:?}: must match ^[A-Za-z0-9_.-]{{1,64}}$"));
+        }
+        let size = serde_json::to_vec(value).map_or(usize::MAX, |v| v.len());
+        if size > MAX_IO_VALUE_BYTES {
+            return Err(format!("IO value of {key:?} is {size} bytes as JSON, at most {MAX_IO_VALUE_BYTES}"));
+        }
+    }
+    Ok(())
+}
+
+/// `desired_io` after merging `updates` holds at most [`MAX_IO_KEYS`] keys.
+fn check_io_key_count(desired: &serde_json::Value, updates: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let existing = desired.as_object();
+    let added = updates.keys().filter(|k| !existing.is_some_and(|m| m.contains_key(*k))).count();
+    let total = existing.map_or(0, |m| m.len()) + added;
+    if total > MAX_IO_KEYS {
+        return Err(format!("desired_io would hold {total} keys, at most {MAX_IO_KEYS}"));
+    }
+    Ok(())
+}
+
 /// POST /api/v1/sandbox/io
 pub async fn set_io(
     Extension(state): Extension<Arc<SandboxState>>,
@@ -1628,11 +1702,17 @@ pub async fn set_io(
     } else {
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Expected object or {updates: ...}"}))));
     };
+    let bad_request = |error: String| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": error})));
+    check_io_updates(&updates).map_err(bad_request)?;
 
-    let mode = state.active.read().await.mode.clone();
+    let mode = {
+        let current = state.active.read().await;
+        check_io_key_count(&current.desired_io, &updates).map_err(bad_request)?;
+        current.mode.clone()
+    };
 
     if mode == "sim" {
-        let sim_url = sim_upstream_url();
+        let sim_url = sim_upstream_url()?;
         let upstream = DetectorUpstream::parse(&sim_url)
             .map_err(|e| (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error": e, "sim_url": sim_url}))))?;
         let req_body = serde_json::to_vec(&updates).unwrap();
@@ -1644,6 +1724,8 @@ pub async fn set_io(
         if !current.desired_io.is_object() {
             current.desired_io = serde_json::json!({});
         }
+        // re-checked under the write lock: another request may have added keys meanwhile
+        check_io_key_count(&current.desired_io, &updates).map_err(bad_request)?;
         if let Some(map) = current.desired_io.as_object_mut() {
             for (k, v) in updates.iter() {
                 map.insert(k.clone(), v.clone());
@@ -1921,7 +2003,7 @@ mod tests {
             .route(
                 "/api/v1/sandbox/scenes",
                 post(upload_scene)
-                    .layer(DefaultBodyLimit::max(MAX_SCENE_UPLOAD_BYTES))
+                    .layer(DefaultBodyLimit::max(max_upload_body_bytes()))
                     .layer(axum::middleware::from_fn(upload_concurrency_middleware)),
             )
             .route("/api/v1/sandbox/scenes/{id}", get(get_scene))
@@ -1929,7 +2011,7 @@ mod tests {
             .route(
                 "/api/v1/sandbox/tools",
                 post(upload_tool)
-                    .layer(DefaultBodyLimit::max(MAX_TOOL_UPLOAD_BYTES))
+                    .layer(DefaultBodyLimit::max(max_upload_body_bytes()))
                     .layer(axum::middleware::from_fn(upload_concurrency_middleware)),
             )
             .route("/api/v1/sandbox/tools/{id}", get(get_tool))
@@ -1937,7 +2019,7 @@ mod tests {
             .route(
                 "/api/v1/sandbox/policies",
                 post(upload_policy)
-                    .layer(DefaultBodyLimit::max(MAX_POLICY_UPLOAD_BYTES))
+                    .layer(DefaultBodyLimit::max(max_upload_body_bytes()))
                     .layer(axum::middleware::from_fn(upload_concurrency_middleware)),
             )
             .route("/api/v1/sandbox/policies/{id}", get(get_policy))
@@ -2707,5 +2789,99 @@ mod tests {
 
         // Clean up env
         std::env::remove_var("ARMD_SIM_URL");
+
+        // 6. Without ARMD_SIM_URL sim mode is refused (no fallback to the detector URL)
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/sandbox/activate")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"mode":"sim","scene":"pcb_suction","tool":"suction"}"#))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(body["code"], "SIM_NOT_CONFIGURED", "{body}");
+        assert!(body["error"].as_str().unwrap().contains("ARMD_SIM_URL"), "{body}");
+    }
+
+    #[test]
+    fn upload_body_limit_defaults_to_16_mib_and_reads_the_override() {
+        assert_eq!(upload_body_limit_from(None), 16 * 1024 * 1024);
+        assert_eq!(upload_body_limit_from(Some("")), 16 * 1024 * 1024);
+        assert_eq!(upload_body_limit_from(Some("48")), 48 * 1024 * 1024);
+        for bad in ["0", "-3", "1.5", "lots", "4096"] {
+            assert_eq!(upload_body_limit_from(Some(bad)), DEFAULT_MAX_UPLOAD_BODY_BYTES, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_over_the_body_limit_is_413_from_content_length() {
+        let _guard = TEST_UPLOAD_MUTEX.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let app = test_router(Arc::new(SandboxState::new(tmp.path().to_path_buf())));
+        for path in ["/api/v1/sandbox/scenes", "/api/v1/sandbox/tools", "/api/v1/sandbox/policies"] {
+            // declared length over the limit: refused before any of the body is read
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("Content-Type", "application/json")
+                .header("Content-Length", (DEFAULT_MAX_UPLOAD_BODY_BYTES + 1).to_string())
+                .body(Body::from("{}"))
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+            // no Content-Length (chunked): DefaultBodyLimit stops reading at the limit
+            let big = vec![b' '; DEFAULT_MAX_UPLOAD_BODY_BYTES + 1];
+            let stream = futures_util::stream::once(async move { Ok::<_, std::io::Error>(axum::body::Bytes::from(big)) });
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("Content-Type", "application/json")
+                .body(Body::from_stream(stream))
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn set_io_limits_keys_and_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SandboxState::new(tmp.path().to_path_buf()));
+        let app = test_router(state.clone());
+        let post = |body: serde_json::Value| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/v1/sandbox/io")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let long_key = "k".repeat(65);
+        let big_value = "x".repeat(MAX_IO_VALUE_BYTES);
+        for bad in [
+            serde_json::json!({"": 1}),
+            serde_json::json!({long_key: 1}),
+            serde_json::json!({"has space": 1}),
+            serde_json::json!({"slash/key": 1}),
+            serde_json::json!({"ünicode": 1}),
+            serde_json::json!({"big": big_value}),
+        ] {
+            let res = app.clone().oneshot(post(bad.clone())).await.unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        // 4 KiB as JSON (with the quotes) is accepted; a 64-char key too
+        let ok = serde_json::json!({"k".repeat(64): "x".repeat(MAX_IO_VALUE_BYTES - 2), "a.b-c_D9": true});
+        assert_eq!(app.clone().oneshot(post(ok)).await.unwrap().status(), StatusCode::OK);
+        // 64 keys in total: 62 more fit, the 65th is refused, and rewriting a key still works
+        let more: serde_json::Map<String, serde_json::Value> = (0..62).map(|i| (format!("io{i}"), serde_json::json!(i))).collect();
+        assert_eq!(app.clone().oneshot(post(serde_json::Value::Object(more))).await.unwrap().status(), StatusCode::OK);
+        let res = app.clone().oneshot(post(serde_json::json!({"one_too_many": 1}))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(app.clone().oneshot(post(serde_json::json!({"io0": 7}))).await.unwrap().status(), StatusCode::OK);
+        let st = state.active.read().await;
+        assert_eq!(st.desired_io.as_object().unwrap().len(), MAX_IO_KEYS);
+        assert_eq!(st.desired_io["io0"], 7);
+        assert!(st.desired_io.get("one_too_many").is_none());
     }
 }

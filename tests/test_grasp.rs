@@ -3156,6 +3156,68 @@ async fn task_models_refusals_reject_without_motion() {
     assert!(w.rig.sim.trigger_calls.lock().unwrap().is_empty(), "no detection triggered");
 }
 
+/// The control replies (`command_ack` / `command_reject`) received within `within`, keyed by
+/// request id.
+async fn command_replies(ws: &mut common::TestSocket, ids: &[u64], within: Duration) -> std::collections::HashMap<u64, Value> {
+    use futures_util::StreamExt;
+    let mut got = std::collections::HashMap::new();
+    let _ = tokio::time::timeout(within, async {
+        while got.len() < ids.len() {
+            let Some(Ok(msg)) = ws.next().await else { return; };
+            let Ok(v) = serde_json::from_str::<Value>(&msg.into_text().unwrap()) else { continue; };
+            if !matches!(v["type"].as_str(), Some("command_ack" | "command_reject")) { continue; }
+            if let Some(id) = v["request_id"].as_u64().filter(|id| ids.contains(id)) { got.insert(id, v); }
+        }
+    }).await;
+    got
+}
+
+#[tokio::test]
+async fn ws_stop_during_grasp_preflight_cancels_it_at_once() {
+    let mut w = models_rig().await;
+    let q0 = w.rig.sup.get_observation().await.commanded_positions;
+    // the switch is accepted but its generation is never published: the preflight polls 5 s
+    *w.rig.sim.set_models_reply.lock().unwrap() = Some((202, json!({"generation": 99})));
+    let mut body = tap(&w.rig).await;
+    body["task"] = json!("seg");
+    let (grasp_id, queued_id, stop_id) = (1_000_000, 1_000_001, 1_000_002);
+    let command = |id: u64, path: &str, body: Value| json!({"type":"command", "request_id":id, "generation":w.generation, "epoch_id":w.epoch, "path":path, "body":body});
+    common::send(&mut w.ws, command(grasp_id, "/api/v1/action/grasp", body)).await;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while w.rig.sim.set_models_calls.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "preflight did not reach the model switch");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // a motion sent before the stop waits behind the grasp and is cancelled with it
+    common::send(&mut w.ws, command(queued_id, "/api/v1/motion/home", json!({}))).await;
+    let t = Instant::now();
+    common::send(&mut w.ws, command(stop_id, "/api/v1/motion/stop", json!({}))).await;
+    let replies = command_replies(&mut w.ws, &[grasp_id, queued_id, stop_id], Duration::from_millis(300)).await;
+    let elapsed = t.elapsed();
+    assert_eq!(replies.len(), 3, "all three replies within 300 ms: {replies:?}");
+    assert!(elapsed < Duration::from_millis(300), "{elapsed:?}");
+    assert_eq!(replies[&stop_id]["type"], "command_ack", "{}", replies[&stop_id]);
+    for id in [grasp_id, queued_id] {
+        let r = &replies[&id];
+        assert_eq!((r["type"].as_str(), r["code"].as_str(), r["status"].as_u64()), (Some("command_reject"), Some("STOPPED"), Some(409)), "{r}");
+    }
+    // past the end of the preflight poll: the grasp never began and nothing moved
+    let until = Instant::now() + Duration::from_millis(5600);
+    while Instant::now() < until {
+        common::send(&mut w.ws, json!({"type":"heartbeat", "generation":w.generation, "epoch_id":w.epoch})).await;
+        // telemetry never pauses: read for a fixed 200 ms
+        let late = command_replies(&mut w.ws, &[grasp_id, queued_id], Duration::from_millis(200)).await;
+        assert!(late.is_empty(), "a second reply arrived: {late:?}");
+    }
+    let obs = w.rig.sup.get_observation().await;
+    assert!(obs.action.is_none() && obs.previous_action.is_none(), "no action started: {:?}", obs.action);
+    assert_eq!(obs.commanded_positions, q0, "no motion commanded");
+    assert!(w.rig.sim.trigger_calls.lock().unwrap().is_empty(), "no detection triggered");
+    // the connection still serves commands
+    let ack = common::ws_reply(&mut w.ws, command(stop_id + 1, "/api/v1/motion/stop", json!({})), &["command_ack", "command_reject"]).await;
+    assert_eq!((ack["type"].as_str(), ack["request_id"].as_u64()), (Some("command_ack"), Some(stop_id + 1)), "{ack}");
+}
+
 #[tokio::test]
 async fn task_models_switch_unreachable_fails_as_a_provider_error() {
     let mut w = models_rig().await;
