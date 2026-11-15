@@ -32,3 +32,6 @@ Thumbs.db
 
 # Screenshots and logs written by the Playwright test scripts
 /tests/artifacts/
+
+# Optional browser sandbox WASM runtimes fetched by scripts/fetch_wasm_runtime.mjs
+/assets/wasm/

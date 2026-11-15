@@ -17,6 +17,29 @@ pub const ASSET_DIRS: [&str; 2] = ["assets", "/usr/share/rebot-teleop/assets"];
 pub const URDF_NAMES: [&str; 2] = ["reBot-DevArm_gripper.urdf", "so101_new_calib.urdf"];
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
+/// Directories searched for browser WASM runtimes (MuJoCo WASM, ONNX Runtime Web).
+/// `ARMD_WASM_DIR` env var override takes first priority if set.
+pub const WASM_DIRS: [&str; 2] = ["assets/wasm", "/usr/share/rebot-teleop/assets/wasm"];
+pub const MAX_WASM_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The first directory that holds the wasm assets, or `ARMD_WASM_DIR` when set.
+pub fn wasm_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("ARMD_WASM_DIR") {
+        return Some(PathBuf::from(d));
+    }
+    WASM_DIRS
+        .iter()
+        .map(PathBuf::from)
+        .find(|d| d.join("mujoco_wasm.js").is_file())
+        .or_else(|| WASM_DIRS.iter().map(PathBuf::from).find(|d| d.is_dir()))
+}
+
+/// Checks whether `mujoco_wasm.js` and `ort.wasm.min.js` exist in the resolved `wasm_dir()`.
+pub fn wasm_runtime_ready() -> bool {
+    let Some(d) = wasm_dir() else { return false };
+    d.join("mujoco_wasm.js").is_file() && d.join("ort.wasm.min.js").is_file()
+}
+
 /// The first directory that holds a known URDF, or `ARMD_ASSET_DIR` when set.
 pub fn asset_dir() -> Option<PathBuf> {
     if let Some(d) = std::env::var_os("ARMD_ASSET_DIR") {
@@ -61,6 +84,56 @@ pub async fn serve_model(UrlPath(rel): UrlPath<String>) -> Response {
     match asset_dir() {
         Some(dir) => serve_from(&dir, &rel).await,
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+fn wasm_content_type(path: &str) -> Option<&'static str> {
+    let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "wasm" => "application/wasm",
+        "json" => "application/json",
+        "ts" => "text/plain; charset=utf-8",
+        _ => return None,
+    })
+}
+
+/// Resolve a request path under WASM `dir`: safe relative path segments, at most 8 deep,
+/// known WASM file extension, and within root.
+pub fn resolve_wasm(dir: &Path, rel: &str) -> Option<(PathBuf, &'static str)> {
+    let segs: Vec<&str> = rel.split('/').collect();
+    if rel.is_empty() || segs.len() > 8 {
+        return None;
+    }
+    let ok = |s: &str| !s.is_empty() && !s.starts_with('.') && s.len() <= 128
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !segs.iter().all(|s| ok(s)) {
+        return None;
+    }
+    let ct = wasm_content_type(rel)?;
+    let root = dir.canonicalize().ok()?;
+    let file = root.join(rel).canonicalize().ok()?;
+    (file.starts_with(&root) && file.is_file()).then_some((file, ct))
+}
+
+pub async fn serve_wasm(UrlPath(rel): UrlPath<String>) -> Response {
+    let not_found = || (StatusCode::NOT_FOUND, "not found").into_response();
+    let Some(dir) = wasm_dir() else { return not_found() };
+    let Some((file, ct)) = resolve_wasm(&dir, &rel) else { return not_found() };
+    match tokio::fs::metadata(&file).await {
+        Ok(m) if m.len() <= MAX_WASM_FILE_BYTES => {}
+        _ => return not_found(),
+    }
+    match tokio::fs::read(&file).await {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, ct),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            Body::from(bytes),
+        )
+            .into_response(),
+        Err(_) => not_found(),
     }
 }
 
@@ -196,5 +269,67 @@ mod tests {
         assert_eq!(r.headers()[header::CONTENT_ENCODING], "gzip");
         let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..2], &[0x1f, 0x8b]);
+    }
+
+    #[test]
+    fn wasm_resolves_and_rejects() {
+        let t = tempfile::tempdir().unwrap();
+        let wasm_dir = t.path().join("assets/wasm");
+        std::fs::create_dir_all(&wasm_dir).unwrap();
+        std::fs::write(wasm_dir.join("mujoco_wasm.js"), "console.log(1);").unwrap();
+        std::fs::write(wasm_dir.join("ort.wasm.min.js"), "console.log(2);").unwrap();
+        std::fs::write(wasm_dir.join("sim.wasm"), b"\0asm").unwrap();
+        std::fs::write(wasm_dir.join("manifest.json"), "{}").unwrap();
+        std::fs::write(wasm_dir.join("types.ts"), "export type X = 1;").unwrap();
+        std::fs::write(wasm_dir.join("module.mjs"), "export const m = 1;").unwrap();
+        std::fs::write(t.path().join("secret.json"), "{}").unwrap();
+
+        assert_eq!(resolve_wasm(&wasm_dir, "mujoco_wasm.js").unwrap().1, "application/javascript; charset=utf-8");
+        assert_eq!(resolve_wasm(&wasm_dir, "ort.wasm.min.js").unwrap().1, "application/javascript; charset=utf-8");
+        assert_eq!(resolve_wasm(&wasm_dir, "sim.wasm").unwrap().1, "application/wasm");
+        assert_eq!(resolve_wasm(&wasm_dir, "manifest.json").unwrap().1, "application/json");
+        assert_eq!(resolve_wasm(&wasm_dir, "types.ts").unwrap().1, "text/plain; charset=utf-8");
+        assert_eq!(resolve_wasm(&wasm_dir, "module.mjs").unwrap().1, "application/javascript; charset=utf-8");
+
+        for bad in ["../secret.json", "..", "/etc/passwd", ".hidden.js", "none.wasm", "", "bad\\path.wasm", "huge/../../secret.json"] {
+            assert!(resolve_wasm(&wasm_dir, bad).is_none(), "expected {bad} to be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn wasm_route_serves_and_rejects() {
+        use tower::ServiceExt;
+        let t = tempfile::tempdir().unwrap();
+        let wasm_dir = t.path().join("assets/wasm");
+        std::fs::create_dir_all(&wasm_dir).unwrap();
+        std::fs::write(wasm_dir.join("mujoco_wasm.js"), "console.log(1);").unwrap();
+        std::fs::write(t.path().join("secret.json"), "{}").unwrap();
+
+        let d = wasm_dir.clone();
+        let app = axum::Router::new().route("/assets/wasm/{*path}", axum::routing::get(move |UrlPath(rel): UrlPath<String>| {
+            let dir = d.clone();
+            async move {
+                let not_found = || (StatusCode::NOT_FOUND, "not found").into_response();
+                let Some((file, ct)) = resolve_wasm(&dir, &rel) else { return not_found() };
+                match tokio::fs::read(&file).await {
+                    Ok(bytes) => (
+                        [(header::CONTENT_TYPE, ct), (header::CACHE_CONTROL, "no-cache")],
+                        Body::from(bytes),
+                    ).into_response(),
+                    Err(_) => not_found(),
+                }
+            }
+        }));
+
+        let get = |u: &str| axum::http::Request::get(u).body(Body::empty()).unwrap();
+        let r = app.clone().oneshot(get("/assets/wasm/mujoco_wasm.js")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()[header::CONTENT_TYPE], "application/javascript; charset=utf-8");
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-cache");
+
+        for bad in ["/assets/wasm/../secret.json", "/assets/wasm/missing.wasm", "/assets/wasm/.hidden.js"] {
+            let r = app.clone().oneshot(get(bad)).await.unwrap();
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{bad}");
+        }
     }
 }

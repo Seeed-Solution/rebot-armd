@@ -189,10 +189,10 @@ impl DetectorUpstream {
     }
 }
 
-struct UpstreamResponse {
-    status: StatusCode,
-    content_type: Option<HeaderValue>,
-    body: Vec<u8>,
+pub(crate) struct UpstreamResponse {
+    pub(crate) status: StatusCode,
+    pub(crate) content_type: Option<HeaderValue>,
+    pub(crate) body: Vec<u8>,
 }
 
 /// Raw HTTP/1.1 request bytes. A request with a body always carries `Content-Type: application/json`
@@ -218,7 +218,7 @@ fn json_body(body: Bytes) -> Bytes {
     if body.iter().all(|b| b.is_ascii_whitespace()) { Bytes::from_static(b"{}") } else { body }
 }
 
-async fn upstream_request(
+pub(crate) async fn upstream_request(
     up: &DetectorUpstream,
     method: Method,
     path_and_query: &str,

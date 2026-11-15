@@ -11,12 +11,19 @@ keywords = ["robotics", "robot-arm", "lerobot", "recamera", "can"]
 categories = ["science::robotics"]
 publish = false
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-axum = { version = "0.8", features = ["ws", "json", "http1"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
+thiserror = "2"
+roxmltree = "0.21"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws", "json", "http1"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 futures-util = "0.3"
 tower = { version = "0.5", features = ["util"] }
@@ -24,13 +31,10 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 arrow = { version = "60", default-features = false }
 parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
 chrono = { version = "0.4", features = ["serde"] }
-thiserror = "2"
 tempfile = "3"
 serialport = { version = "4", default-features = false }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 libc = "0.2"
-# URDF parsing for profile kinematic chains (src/urdf.rs); no dependencies of its own.
-roxmltree = "0.21"
 
 # Style lints that the code base does not follow; everything else is denied in CI
 # (`cargo clippy --all-targets -- -D warnings`).
@@ -42,7 +46,7 @@ field_reassign_with_default = "allow"
 too_many_arguments = "allow"
 type_complexity = "allow"
 
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio-tungstenite = "0.29"
 reqwest = { version = "0.12", features = ["json"] }
 
