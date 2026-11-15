@@ -11,9 +11,6 @@ keywords = ["robotics", "robot-arm", "lerobot", "recamera", "can"]
 categories = ["science::robotics"]
 publish = false
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
