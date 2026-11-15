@@ -2846,7 +2846,7 @@ async fn test_gripper_persistent_hw_overload_reverse_escape_and_re_squeeze() {
     config.dof = 7;
     config.gripper_joint = Some(6);
     config.limits = (0..7)
-        .map(|i| JointLimit::new(format!("j{}", i + 1), -3.14, 3.14, 1.0, 1.0))
+        .map(|i| JointLimit::new(format!("j{}", i + 1), -PI, PI, 1.0, 1.0))
         .collect();
     config.home_positions = vec![0.0; 7];
     let mut gp = GripperPolicy::rebot_dm();
@@ -3011,7 +3011,7 @@ fn test_feetech_6servo_incomplete_chunk_idx_cross_call_reassembly_and_ghost_head
 async fn test_feetech_narrower_effective_ranges_narrows_config_limits() {
     let mut config = ArmConfig::default();
     config.dof = 1;
-    config.limits = vec![JointLimit::new("j1", -3.14, 3.14, 1.0, 1.0)];
+    config.limits = vec![JointLimit::new("j1", -PI, PI, 1.0, 1.0)];
     config.home_positions = vec![0.0];
 
     let supervisor = Arc::new(ArmSupervisor::new(config));
