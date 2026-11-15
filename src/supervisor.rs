@@ -554,21 +554,45 @@ impl SupervisorInner {
         }
     }
 
-    fn apply_driver_limits(&mut self, driver: &dyn ArmDriver) {
+    pub fn apply_driver_limits(&mut self, driver: &dyn ArmDriver) {
+        let vel: Vec<_> = (0..self.config.dof).map(|i| driver.max_command_velocity(i)).collect();
+        let pos: Vec<_> = (0..self.config.dof).map(|i| driver.position_limits(i)).collect();
+        self.apply_extracted_driver_limits(&vel, &pos);
+    }
+
+    pub fn apply_extracted_driver_limits(
+        &mut self,
+        vel_limits: &[Option<f32>],
+        pos_limits: &[Option<(f32, f32)>],
+    ) {
+        self.apply_extracted_driver_limits_inner(vel_limits, pos_limits, true);
+    }
+
+    pub fn apply_extracted_driver_limits_inner(
+        &mut self,
+        vel_limits: &[Option<f32>],
+        pos_limits: &[Option<(f32, f32)>],
+        trigger_fault: bool,
+    ) {
         self.driver_config_error = None;
         let mut candidate = self.config.clone();
+
         for (i, limit) in candidate.limits.iter_mut().enumerate() {
-            if let Some(max) = driver.max_command_velocity(i) {
-                if max.is_finite() && max > 0.0 { limit.max_velocity = limit.max_velocity.min(max); }
+            if let Some(Some(max)) = vel_limits.get(i) {
+                if max.is_finite() && *max > 0.0 {
+                    limit.max_velocity = limit.max_velocity.min(*max);
+                }
             }
-            if let Some((d_min, d_max)) = driver.position_limits(i) {
+            if let Some(Some((d_min, d_max))) = pos_limits.get(i).copied() {
                 if !d_min.is_finite() || !d_max.is_finite() || d_min >= d_max {
                     let reason = format!(
                         "Driver position limits [{:.4}, {:.4}] for joint '{}' are invalid",
                         d_min, d_max, limit.name
                     );
                     self.driver_config_error = Some(reason.clone());
-                    self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                    if trigger_fault {
+                        self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                    }
                     return;
                 }
                 let new_min = limit.min_position.max(d_min);
@@ -579,8 +603,23 @@ impl SupervisorInner {
                         d_min, d_max, limit.name, limit.min_position, limit.max_position
                     );
                     self.driver_config_error = Some(reason.clone());
-                    self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                    if trigger_fault {
+                        self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                    }
                     return;
+                }
+                if let Some(pos) = candidate.resting_pose.as_ref().and_then(|r| r.positions.as_ref()).and_then(|p| p.get(i).copied()) {
+                    if pos < new_min || pos > new_max {
+                        let reason = format!(
+                            "Driver position limits [{:.4}, {:.4}] for joint '{}' conflict with resting pose position {:.4}",
+                            d_min, d_max, limit.name, pos
+                        );
+                        self.driver_config_error = Some(reason.clone());
+                        if trigger_fault {
+                            self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+                        }
+                        return;
+                    }
                 }
                 if (new_min - limit.min_position).abs() > 1e-4 || (new_max - limit.max_position).abs() > 1e-4 {
                     tracing::info!(
@@ -592,13 +631,53 @@ impl SupervisorInner {
                 limit.max_position = new_max;
             }
         }
+
+        if candidate.validate().is_err()
+            && self.base_gripper_policy.is_some()
+            && (self.gripper_calib_offset.is_some() || self.gripper_calib_jaw_opening.is_some())
+        {
+            let mut base_test = candidate.clone();
+            base_test.gripper_policy = self.base_gripper_policy.clone();
+            if base_test.validate().is_ok() {
+                tracing::warn!("Driver limits invalidated outdated calibrated gripper policy; reverting to base uncalibrated policy");
+                self.gripper_calib_invalid = true;
+                self.gripper_calib_offset = None;
+                self.gripper_calib_jaw_opening = None;
+                self.config.gripper_policy = self.base_gripper_policy.clone();
+                candidate = base_test;
+            }
+        }
+
         if let Err(err) = candidate.validate() {
             let reason = format!("Driver limits violated config invariants: {err}");
             self.driver_config_error = Some(reason.clone());
-            self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+            if trigger_fault {
+                self.safety.trigger_fault_coded(FaultCode::JointLimit, FaultReason::Other(reason));
+            }
             return;
         }
+
         self.config = candidate;
+    }
+
+    pub fn reapply_driver_limits(&mut self) -> bool {
+        let limits = if let Some(ref d) = self.driver {
+            if let Ok(drv) = d.lock() {
+                let vel: Vec<_> = (0..self.config.dof).map(|i| drv.max_command_velocity(i)).collect();
+                let pos: Vec<_> = (0..self.config.dof).map(|i| drv.position_limits(i)).collect();
+                Some((vel, pos))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((vel_limits, pos_limits)) = limits {
+            self.apply_extracted_driver_limits_inner(&vel_limits, &pos_limits, false);
+            self.driver_config_error.is_none()
+        } else {
+            false
+        }
     }
 
     /// Joint limits used for planning and servo stepping: `config.limits` with
@@ -1619,7 +1698,7 @@ impl SupervisorInner {
         if req > self.applied_estop_count {
             self.applied_estop_count = req;
             self.e_stop_latched.store(true, Ordering::SeqCst);
-            if !matches!(self.safety.state(), SafetyState::Fault(FaultReason::ThermalTrip { .. })) {
+            if !matches!(self.safety.state(), SafetyState::Fault(_)) {
                 self.apply_stop_policy(StopPolicy::EStopLatch);
             }
             true
@@ -1637,6 +1716,9 @@ impl SupervisorInner {
 
     pub fn clear_fault(&mut self) -> Result<SafetyState, SafetyError> {
         Self::check_concurrent_estop(self)?;
+        if self.driver_config_error.is_some() {
+            self.reapply_driver_limits();
+        }
         if let Some(ref err) = self.driver_config_error {
             return Err(SafetyError::ClearFaultRejected(format!("Driver limit configuration error: {err}")));
         }
@@ -2285,7 +2367,7 @@ impl SupervisorInner {
         id
     }
 
-    pub(crate) fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
+    pub fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
                      settled: Option<bool>, holding: Option<bool>, gap: Option<f32>) {
         let now = self.now_s();
         let mut store_offset_val = None;
@@ -2324,7 +2406,13 @@ impl SupervisorInner {
         if let Some(offset_rad) = store_offset_val {
             if let Err(e) = self.apply_gripper_calibration(Some(offset_rad), self.gripper_calib_jaw_opening.clone()) {
                 tracing::warn!("Failed to apply gripper calibration after zero_check: {e}");
-                self.gripper_calib_invalid = true;
+                if let Some(a) = self.last_action.as_mut() {
+                    if a.id == id {
+                        a.state = "failed".into();
+                        a.code = Some("INVALID_CALIBRATION".into());
+                        a.message = Some(format!("Gripper calibration rejected: {e}"));
+                    }
+                }
             } else {
                 let path = self.gripper_calib_path.clone().unwrap_or_else(crate::gripper_calib::path_from_env);
                 let file = crate::gripper_calib::GripperCalibFile {
@@ -2771,7 +2859,7 @@ impl SupervisorInner {
         }
         if (closed_rad - open_rad).abs() < 0.1 {
             return Err(format!(
-                "Calibration offset {offset} results in (closed_rad - open_rad).abs() < 0.1 (closed: {closed_rad}, open: {open_rad})"
+                "Base gripper policy span |closed_rad - open_rad| < 0.1 (closed: {closed_rad}, open: {open_rad})"
             ));
         }
         policy.closed_rad = closed_rad;
@@ -3342,14 +3430,17 @@ impl SupervisorInner {
             let v_g = self.measured_velocities.get(g_idx).copied().unwrap_or(0.0);
             let gap = p_cmd - p_meas;
 
-            let gripper_hw_overload = self
-                .motor_errors
-                .get(g_idx)
-                .and_then(|e| e.as_ref())
-                .is_some_and(|e| (e.code & 0x20) != 0);
+            let gripper_hw_overload = is_bus_fresh
+                && self
+                    .motor_errors
+                    .get(g_idx)
+                    .and_then(|e| e.as_ref())
+                    .is_some_and(|e| (e.code & 0x20) != 0);
 
             let hw_overload_rising = is_bus_fresh && gripper_hw_overload && !self.gripper_prev_hw_overload;
-            self.gripper_prev_hw_overload = is_bus_fresh && gripper_hw_overload;
+            if is_bus_fresh {
+                self.gripper_prev_hw_overload = gripper_hw_overload;
+            }
 
             if !gripper_hw_overload && !self.gripper_stalled {
                 self.gripper_stall_sign = 0.0;

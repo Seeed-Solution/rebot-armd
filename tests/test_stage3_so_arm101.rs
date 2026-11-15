@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, FeetechArmDriver, JointTarget};
-use armd::protocol::feetech::calculate_checksum;
+use armd::protocol::feetech::{self, calculate_checksum};
 use armd::kinematics::{self, Pose};
 use armd::model::{ArmConfig, JointState};
 use armd::motion::{self, GoalSpec, MotionError, PlanInput, RelFrame, Speed};
@@ -1453,6 +1453,9 @@ async fn test_so101_feetech_driver_backed_arm_joint_0x20_overload_triggers_estop
         fn flush(&mut self) -> Result<(), armd::transport::TransportError> {
             self.0.lock().unwrap().flush()
         }
+        fn clear_input_buffer(&mut self) {
+            self.0.lock().unwrap().clear_input_buffer();
+        }
     }
 
     let mock = Arc::new(Mutex::new(MockTransport::new()));
@@ -1476,21 +1479,36 @@ async fn test_so101_feetech_driver_backed_arm_joint_0x20_overload_triggers_estop
         pkt
     };
 
-    // Provide initial feedback for all 6 servos with error = 0x00
-    let mut rx_normal = Vec::new();
-    for id in 1..=6 {
-        rx_normal.extend_from_slice(&build_resp(id, 0x00));
+    let sync_read_chunk0 = feetech::build_sync_read(&[1, 2, 3], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+    let sync_read_chunk1 = feetech::build_sync_read(&[4, 5, 6], feetech::REG_PRESENT_POSITION_L, 8).unwrap();
+    let sync_read_en = feetech::build_sync_read(&[1, 2, 3, 4, 5, 6], feetech::REG_TORQUE_ENABLE, 1).unwrap();
+
+    let mut rx_c0_normal = Vec::new();
+    for id in 1..=3 {
+        rx_c0_normal.extend_from_slice(&build_resp(id, 0x00));
     }
-    // Also provide torque enable response
+    let mut rx_c1_normal = Vec::new();
+    for id in 4..=6 {
+        rx_c1_normal.extend_from_slice(&build_resp(id, 0x00));
+    }
     let mut rx_tq = Vec::new();
     for id in 1..=6 {
         let cs = calculate_checksum(id, 3, 0x00, &[1]);
         rx_tq.extend_from_slice(&[0xFF, 0xFF, id, 3, 0x00, 1, cs]);
     }
 
-    mock.lock().unwrap().provide_rx(&rx_normal);
-    mock.lock().unwrap().provide_rx(&rx_tq);
-    mock.lock().unwrap().provide_rx(&rx_normal);
+    {
+        let mut m = mock.lock().unwrap();
+        m.stage_reply(&sync_read_chunk0, &rx_c0_normal);
+        m.stage_reply(&sync_read_chunk1, &rx_c1_normal);
+        m.stage_reply(&sync_read_en, &rx_tq);
+        for id in 1..=6 {
+            let req_en = feetech::build_read(id, feetech::REG_TORQUE_ENABLE, 1);
+            let cs = calculate_checksum(id, 3, 0x00, &[1]);
+            let resp_en = vec![0xFF, 0xFF, id, 3, 0x00, 1, cs];
+            m.stage_reply(&req_en, &resp_en);
+        }
+    }
 
     supervisor.set_torque(true).await.unwrap();
     assert!(supervisor.inner().read().await.is_torqued);
@@ -1504,12 +1522,19 @@ async fn test_so101_feetech_driver_backed_arm_joint_0x20_overload_triggers_estop
     supervisor.tick(0.02).await;
 
     // Rising edge: Arm joint 1 (servo ID 1) reports 0x20 Overload
-    let mut rx_overload = Vec::new();
-    rx_overload.extend_from_slice(&build_resp(1, 0x20));
-    for id in 2..=6 {
-        rx_overload.extend_from_slice(&build_resp(id, 0x00));
+    let mut rx_c0_overload = Vec::new();
+    rx_c0_overload.extend_from_slice(&build_resp(1, 0x20));
+    for id in 2..=3 {
+        rx_c0_overload.extend_from_slice(&build_resp(id, 0x00));
     }
-    mock.lock().unwrap().provide_rx(&rx_overload);
+
+    {
+        let mut m = mock.lock().unwrap();
+        m.clear_write_responses();
+        m.stage_reply(&sync_read_chunk0, &rx_c0_overload);
+        m.stage_reply(&sync_read_chunk1, &rx_c1_normal);
+        m.stage_reply(&sync_read_en, &rx_tq);
+    }
 
     // Tick: Arm joint 0x20 triggers HardwareFault
     let obs_fault = supervisor.tick(0.02).await;

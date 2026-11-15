@@ -163,7 +163,7 @@ fn test_feetech_radian_step_conversions() {
 
 #[test]
 fn test_feetech_driver_mock_loopback() {
-    let mock = MockTransport::new();
+    let mock = MockTransport::new_preserving();
     let servo_ids = vec![1, 2, 3];
     let mut driver = FeetechArmDriver::new(mock, servo_ids.clone()).with_calibrated(true);
 
