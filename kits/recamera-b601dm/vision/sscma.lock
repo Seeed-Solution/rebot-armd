@@ -1,8 +1,9 @@
 # sscma-example-sg200x checkout that rebot-vision builds against (SSCMA_ROOT).
 # CMakeLists.txt compares `git -C $SSCMA_ROOT rev-parse HEAD` with `commit` and stops
 # unless -DREBOT_VISION_ALLOW_UNPINNED=ON.
-# The commit is public on the fork's main branch (also on branch phase3-hw).
+# Branch `rebot-vision` (tag rebot-vision-1.4.0) of the fork: its main at 9af8118 without
+# solutions/microduck-pose-qa; every file rebot-vision uses is the same as at 9af8118.
 repo=https://github.com/suharvest/sscma-example-sg200x
-branch=main
-commit=9af8118e556c01872ed2cd583abd0c1191df9c6c
+branch=rebot-vision
+commit=c19b39f32d8bd5f6aa750562414ae73993548737
 # components/libwebsockets/fetch_and_build.sh must have produced components/libwebsockets/prebuilt

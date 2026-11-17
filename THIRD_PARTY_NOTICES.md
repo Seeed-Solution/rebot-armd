@@ -169,7 +169,8 @@ from the projects below.
 
 - Upstream: https://github.com/Seeed-Studio/sscma-example-sg200x (fork
   https://github.com/suharvest/sscma-example-sg200x, branch `main`), commit
-  `9af8118e556c01872ed2cd583abd0c1191df9c6c`.
+  `9af8118e556c01872ed2cd583abd0c1191df9c6c`. The copied files are unchanged at
+  `c19b39f32d8bd5f6aa750562414ae73993548737` (branch `rebot-vision`), the commit `sscma.lock` pins.
 - License: Apache-2.0, text in `kits/recamera-b601dm/vision/LICENSE-APACHE` (installed as
   `/usr/share/doc/rebot-teleop/LICENSE-APACHE`). Copyright Seeed Technology Co., Ltd.
 - Copied files (path in this repository <- path upstream). "unchanged" = byte-identical at
