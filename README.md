@@ -354,9 +354,9 @@ To build `rebot-vision` from source instead, set `RECAMERA_DOCKER=<container>` (
 (the older names `REC_TOOLCHAIN` / `RISCV_SYSROOT` also work); if you set `RUSTFLAGS`
 yourself it is used as is. `.cargo/config.toml` only holds the target-wide linker settings.
 
-Sizes of the v1.3.4 release assets (release profile: `opt-level = "z"`, fat LTO, stripped):
-`armd` 4,465,760 bytes (4.3 MiB), `rebot-vision` 951,040 bytes (929 KiB), `.deb` 2,702,126
-bytes (2.6 MiB, gzip). Memory use on the device has not been measured for this README.
+Sizes of the v1.4.0 release assets (release profile: `opt-level = "z"`, fat LTO, stripped):
+`armd` 7,297,744 bytes (7.0 MiB), `rebot-vision` 1,291,448 bytes (1.2 MiB), `.deb` 5,115,580
+bytes (4.9 MiB, gzip). Memory use on the device has not been measured for this README.
 
 ---
 

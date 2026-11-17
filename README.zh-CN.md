@@ -242,7 +242,7 @@ REBOT_VISION_BIN=$PWD/rebot-vision-$V-riscv64 \
 
 `build_deb.sh` 需要 `cargo` 和 `dpkg-deb`。它根据 `RECAMERA_TOOLCHAIN` 生成 `RUSTFLAGS`（旧变量名 `REC_TOOLCHAIN` / `RISCV_SYSROOT` 仍可用）；如果自行设置了 `RUSTFLAGS`，则按原样使用。`.cargo/config.toml` 只保存目标级的链接器设置。
 
-v1.3.4 release 产物的大小（release profile：`opt-level = "z"`、fat LTO、strip）：`armd` 4,465,760 字节（4.3 MiB），`rebot-vision` 951,040 字节（929 KiB），`.deb` 2,702,126 字节（2.6 MiB，gzip）。设备上的内存占用未测。
+v1.4.0 release 产物的大小（release profile：`opt-level = "z"`、fat LTO、strip）：`armd` 7,297,744 字节（7.0 MiB），`rebot-vision` 1,291,448 字节（1.2 MiB），`.deb` 5,115,580 字节（4.9 MiB，gzip）。设备上的内存占用未测。
 
 ---
 
