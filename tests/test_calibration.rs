@@ -140,6 +140,12 @@ struct MockVision {
     fail_put: Option<usize>,
     unsupported: bool,
     put_delay_ms: u64,
+    /// The PUT with this 1-based index is applied, then answers 500 (dir fsync after the rename).
+    fail_put_after_apply: Option<usize>,
+    /// The PUT with this 1-based index is applied, then its reply waits this long (ms).
+    slow_reply_after_apply: Option<(usize, u64)>,
+    /// GET answers 500 once this many PUTs arrived.
+    fail_get_after_puts: Option<usize>,
 }
 
 type Mock = Arc<Mutex<MockVision>>;
@@ -155,23 +161,29 @@ fn mock_body(m: &MockVision) -> Value {
 async fn mock_get(State(m): State<Mock>) -> axum::response::Response {
     let m = m.lock().unwrap();
     if m.unsupported { return (StatusCode::NOT_FOUND, axum::Json(json!({"error": "not found"}))).into_response(); }
+    if m.fail_get_after_puts.is_some_and(|n| m.puts >= n) { return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": "busy"}))).into_response(); }
     axum::Json(mock_body(&m)).into_response()
 }
 
 async fn mock_put(State(m): State<Mock>, axum::Json(body): axum::Json<Value>) -> axum::response::Response {
     let delay = { let mut g = m.lock().unwrap(); g.puts += 1; g.put_delay_ms };
     tokio::time::sleep(Duration::from_millis(delay)).await;
-    let mut m = m.lock().unwrap();
-    if m.unsupported { return (StatusCode::NOT_FOUND, axum::Json(json!({"error": "not found"}))).into_response(); }
-    if m.fail_put == Some(m.puts) { return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": "disk full"}))).into_response(); }
-    if body["expected_revision"].as_u64() != Some(m.revision) {
-        return (StatusCode::CONFLICT, axum::Json(json!({"error": "REVISION_MISMATCH", "revision": m.revision}))).into_response();
-    }
-    for k in ["fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3", "width", "height", "marker_size"] {
-        if let Some(v) = body.get(k) { m.values.insert(k.into(), v.clone()); }
-    }
-    m.revision += 1;
-    axum::Json(mock_body(&m)).into_response()
+    let (reply, slow) = {
+        let mut m = m.lock().unwrap();
+        if m.unsupported { return (StatusCode::NOT_FOUND, axum::Json(json!({"error": "not found"}))).into_response(); }
+        if m.fail_put == Some(m.puts) { return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": "disk full"}))).into_response(); }
+        if body["expected_revision"].as_u64() != Some(m.revision) {
+            return (StatusCode::CONFLICT, axum::Json(json!({"error": "REVISION_MISMATCH", "revision": m.revision}))).into_response();
+        }
+        for k in ["fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3", "width", "height", "marker_size"] {
+            if let Some(v) = body.get(k) { m.values.insert(k.into(), v.clone()); }
+        }
+        m.revision += 1;
+        if m.fail_put_after_apply == Some(m.puts) { return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": "fsync failed"}))).into_response(); }
+        (mock_body(&m), m.slow_reply_after_apply.filter(|(n, _)| *n == m.puts).map(|(_, ms)| ms))
+    };
+    if let Some(ms) = slow { tokio::time::sleep(Duration::from_millis(ms)).await; }
+    axum::Json(reply).into_response()
 }
 
 async fn spawn_mock() -> (String, Mock) {
@@ -211,6 +223,7 @@ async fn rig_with(paths: impl FnOnce(&Path) -> (PathBuf, PathBuf)) -> Rig {
     let (cal, setup) = paths(dir.path());
     let mut deps = CalibrationDeps::new(cal, Some(setup.clone()), up.clone());
     deps.backup_dir = dir.path().join("backups");
+    deps.vision_timeout = Duration::from_millis(1500);
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
     let router = armd::api::create_router_calibration(sup.clone(), up.clone(), GraspDeps::http(up, Some(setup)),
         armd::diagnostics::DiagnosticsState::global(), deps.clone());
@@ -471,4 +484,90 @@ async fn apply_rejects_bad_bodies_and_needs_the_lease() {
     let rej = common::ws_reply(&mut other, json!({"type":"command", "request_id":1, "generation":r.generation, "epoch_id":r.epoch,
         "path":"/api/v1/calibration/apply", "body":apply_body(true)}), &["command_reject"]).await;
     assert_eq!(rej["code"], "LEASE_LOST");
+}
+
+// ---- rebot-vision applied the PUT although its reply failed (review M3) ----
+
+/// The vision values equal the ones before the apply (fx 824), at `rev`.
+fn assert_vision_old(r: &Rig, rev: u64) {
+    let m = r.mock.lock().unwrap();
+    assert_eq!((m.values["fx"].as_f64(), m.values["cx"].as_f64(), m.values["k1"].as_f64(), m.revision), (Some(824.0), Some(320.0), Some(0.0), rev));
+}
+
+#[tokio::test]
+async fn vision_put_timeout_after_apply_is_reverted() {
+    let mut r = rig().await;
+    r.mock.lock().unwrap().slow_reply_after_apply = Some((1, 2500)); // > the 1.5 s vision timeout
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    assert_eq!((rej["code"].as_str(), rej["step"].as_str(), rej["reverted"].as_bool()), (Some("VISION_UNREACHABLE"), Some("vision"), Some(true)), "{rej}");
+    assert_vision_old(&r, 2); // applied (rev 1), then reverted with the current revision
+    assert!(!r.deps.path.exists());
+    assert_unchanged(&r).await;
+}
+
+#[tokio::test]
+async fn vision_put_500_after_rename_is_reverted() {
+    let mut r = rig().await;
+    r.mock.lock().unwrap().fail_put_after_apply = Some(1);
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    assert_eq!((rej["code"].as_str(), rej["step"].as_str(), rej["reverted"].as_bool()), (Some("VISION_ERROR"), Some("vision"), Some(true)), "{rej}");
+    assert_vision_old(&r, 2);
+    assert_unchanged(&r).await;
+}
+
+#[tokio::test]
+async fn vision_put_and_read_back_failing_is_inconsistent() {
+    let mut r = rig().await;
+    { let mut m = r.mock.lock().unwrap(); m.fail_put_after_apply = Some(1); m.fail_get_after_puts = Some(1); }
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    assert_eq!((rej["code"].as_str(), rej["step"].as_str()), (Some("CALIBRATION_INCONSISTENT"), Some("vision")), "{rej}");
+    assert_eq!(rej["state"]["vision"], "unknown", "{rej}");
+    assert!(rej["backup"].as_str().is_some_and(|b| std::path::Path::new(b).join("vision_intrinsics.json").is_file()), "{rej}");
+    assert_eq!(r.mock.lock().unwrap().puts, 1, "no blind revert PUT");
+    assert_unchanged(&r).await;
+}
+
+#[tokio::test]
+async fn restore_vision_put_500_after_rename_is_reverted() {
+    let mut r = rig().await;
+    let ok = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    assert_eq!(ok["type"], "command_ack", "{ok}");
+    let name = ok["backup"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    assert_eq!(mock_fx(&r), (831.5, 1));
+    r.mock.lock().unwrap().fail_put_after_apply = Some(2);
+    let rej = cmd(&mut r, "/api/v1/calibration/restore", json!({"backup": name})).await;
+    assert_eq!((rej["code"].as_str(), rej["step"].as_str(), rej["reverted"].as_bool()), (Some("VISION_ERROR"), Some("vision"), Some(true)), "{rej}");
+    assert_eq!(mock_fx(&r), (831.5, 3), "restore PUT applied (rev 2), reverted to the applied values (rev 3)");
+    assert!(r.sup.inner().read().await.camera_calibrated(), "armd keeps the applied calibration");
+    assert!(!r.sup.inner().read().await.calibration_busy);
+}
+
+// ---- busy flag guard (review L3) ----
+
+#[tokio::test]
+async fn busy_guard_clears_the_flag_on_panic_and_on_release() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    // panic while holding the supervisor lock: the guard clears the flag once the lock is free
+    sup.inner().write().await.calibration_busy = true;
+    let s2 = sup.clone();
+    let task = tokio::spawn(async move {
+        let _guard = calibration::BusyGuard::new(s2.clone());
+        let _lock = s2.inner().write().await;
+        panic!("forced panic in the apply task");
+    });
+    assert!(task.await.unwrap_err().is_panic());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while sup.inner().read().await.calibration_busy {
+        assert!(tokio::time::Instant::now() < deadline, "busy flag still set after the panic");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // early return (guard dropped without release), lock free
+    sup.inner().write().await.calibration_busy = true;
+    async fn early(sup: Arc<ArmSupervisor>) -> Result<(), ()> { let _g = calibration::BusyGuard::new(sup); Err(()) }
+    assert!(early(sup.clone()).await.is_err());
+    assert!(!sup.inner().read().await.calibration_busy);
+    // normal release
+    sup.inner().write().await.calibration_busy = true;
+    calibration::BusyGuard::new(sup.clone()).release().await;
+    assert!(!sup.inner().read().await.calibration_busy);
 }

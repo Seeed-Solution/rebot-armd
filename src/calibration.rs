@@ -30,7 +30,8 @@ pub const DEFAULT_PATH: &str = "/userdata/rebot-teleop/calibration.json";
 pub const VISION_INTRINSICS_PATH: &str = "/api/calibration/intrinsics";
 /// The image size every calibrated value refers to (rebot-vision's content image).
 pub const IMAGE_SIZE_PX: [f64; 2] = [640.0, 360.0];
-const VISION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Timeout of one rebot-vision request ([`CalibrationDeps::vision_timeout`] default).
+pub const VISION_TIMEOUT: Duration = Duration::from_secs(5);
 const INTRINSIC_KEYS: [&str; 9] = ["fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3"];
 
 /// `calibration.json`.
@@ -74,6 +75,8 @@ pub struct CalibrationDeps {
     pub setup_path: Option<PathBuf>,
     /// rebot-vision (armd's detector URL).
     pub upstream: DetectorUpstream,
+    /// Timeout of one rebot-vision request (default [`VISION_TIMEOUT`]).
+    pub vision_timeout: Duration,
 }
 
 /// `ARMD_CALIBRATION` or [`DEFAULT_PATH`].
@@ -82,7 +85,7 @@ pub fn path_from_env() -> PathBuf { crate::persist::path_from_env("ARMD_CALIBRAT
 impl CalibrationDeps {
     pub fn new(path: PathBuf, setup_path: Option<PathBuf>, upstream: DetectorUpstream) -> Self {
         let backup_dir = path.parent().unwrap_or(Path::new(".")).join("calibration-backups");
-        Self { path, backup_dir, setup_path, upstream }
+        Self { path, backup_dir, setup_path, upstream, vision_timeout: VISION_TIMEOUT }
     }
 
     /// Paths from `ARMD_CALIBRATION` / `ARMD_CALIBRATION_BACKUPS`.
@@ -307,8 +310,8 @@ fn after_state(inner: &SupervisorInner, req: &ApplyRequest) -> Result<ArmdState,
 // ---- rebot-vision ----
 
 /// `GET /api/calibration/intrinsics`; 404 = VISION_CALIBRATION_UNSUPPORTED.
-async fn vision_get(up: &DetectorUpstream) -> Result<Value, CalibError> {
-    match crate::api::proxy::request_status_json(up, "GET", VISION_INTRINSICS_PATH, None, VISION_TIMEOUT).await {
+async fn vision_get(deps: &CalibrationDeps) -> Result<Value, CalibError> {
+    match crate::api::proxy::request_status_json(&deps.upstream, "GET", VISION_INTRINSICS_PATH, None, deps.vision_timeout).await {
         Ok((StatusCode::NOT_FOUND, _)) => Err(CalibError::new(409, "VISION_CALIBRATION_UNSUPPORTED",
             "rebot-vision has no /api/calibration/intrinsics; update rebot-teleop")),
         Ok((s, v)) if s.is_success() && v.is_object() => Ok(v),
@@ -319,14 +322,14 @@ async fn vision_get(up: &DetectorUpstream) -> Result<Value, CalibError> {
 
 /// `PUT /api/calibration/intrinsics` with `values` (fx..k3, width, height, marker_size?) at
 /// `expected_revision`. Returns the reply body.
-async fn vision_put(up: &DetectorUpstream, values: &Map<String, Value>, expected_revision: u64) -> Result<Value, CalibError> {
+async fn vision_put(deps: &CalibrationDeps, values: &Map<String, Value>, expected_revision: u64) -> Result<Value, CalibError> {
     let mut body = Map::new();
     for k in INTRINSIC_KEYS.iter().chain(&["width", "height", "marker_size"]) {
         if let Some(v) = values.get(*k).filter(|v| !v.is_null()) { body.insert((*k).into(), v.clone()); }
     }
     body.insert("expected_revision".into(), json!(expected_revision));
     let bytes = serde_json::to_vec(&Value::Object(body)).unwrap_or_default();
-    match crate::api::proxy::request_status_json(up, "PUT", VISION_INTRINSICS_PATH, Some(&bytes), VISION_TIMEOUT).await {
+    match crate::api::proxy::request_status_json(&deps.upstream, "PUT", VISION_INTRINSICS_PATH, Some(&bytes), deps.vision_timeout).await {
         Ok((StatusCode::NOT_FOUND, _)) => Err(CalibError::new(409, "VISION_CALIBRATION_UNSUPPORTED", "rebot-vision has no /api/calibration/intrinsics")),
         Ok((s, v)) if s.is_success() => Ok(v),
         Ok((s, v)) => {
@@ -338,6 +341,36 @@ async fn vision_put(up: &DetectorUpstream, values: &Map<String, Value>, expected
 }
 
 fn revision(v: &Value) -> u64 { v.get("revision").and_then(Value::as_u64).unwrap_or(0) }
+
+/// The intrinsics in `values` (fx..k3, width, height; null / missing skipped) equal those in `got`.
+fn intrinsics_match(got: &Value, values: &Map<String, Value>) -> bool {
+    INTRINSIC_KEYS.iter().chain(&["width", "height"]).all(|k| match values.get(*k).filter(|v| !v.is_null()).and_then(Value::as_f64) {
+        None => true,
+        Some(want) => got.get(*k).and_then(Value::as_f64).is_some_and(|v| (v - want).abs() <= 1e-9 * want.abs().max(1.0)),
+    })
+}
+
+/// What rebot-vision holds after a PUT whose reply was an error (timeout, 500 after the rename).
+enum VisionAfterError {
+    /// Our values are in place at this revision (the PUT was applied).
+    Written(u64),
+    /// Still the values before the PUT.
+    Unchanged,
+    /// The read-back failed too.
+    Unknown(String),
+}
+
+/// Read rebot-vision back after a failed PUT of `values` over `before`.
+async fn vision_after_error(deps: &CalibrationDeps, before: &Value, values: &Map<String, Value>) -> VisionAfterError {
+    match vision_get(deps).await {
+        Err(e) => VisionAfterError::Unknown(e.message),
+        Ok(got) => {
+            let moved = revision(&got) > revision(before);
+            let ours = intrinsics_match(&got, values) && !intrinsics_match(before, values);
+            if moved || ours { VisionAfterError::Written(revision(&got)) } else { VisionAfterError::Unchanged }
+        }
+    }
+}
 
 // ---- files ----
 
@@ -429,6 +462,33 @@ pub fn begin_checks(inner: &SupervisorInner) -> Result<(), CalibError> {
     Ok(())
 }
 
+/// Holds `calibration_busy` for a running apply / restore and clears it when released or
+/// dropped, so a panic or an early return in the transaction task does not leave it set.
+pub struct BusyGuard { sup: Option<Arc<ArmSupervisor>> }
+
+impl BusyGuard {
+    /// Takes over a `calibration_busy` set under the lock by the caller.
+    pub fn new(sup: Arc<ArmSupervisor>) -> Self { Self { sup: Some(sup) } }
+
+    /// Clear the flag (normal end of the transaction).
+    pub async fn release(mut self) {
+        if let Some(sup) = self.sup.take() { sup.inner().write().await.calibration_busy = false; }
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        let Some(sup) = self.sup.take() else { return; };
+        if let Ok(mut inner) = sup.inner().try_write() { inner.calibration_busy = false; return; }
+        // the lock is held (for example by the code that panicked): clear it once it is free
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => { h.spawn(async move { sup.inner().write().await.calibration_busy = false; }); }
+            Err(_) => sup.inner().blocking_write().calibration_busy = false,
+        }
+        tracing::warn!("calibration transaction ended without release (panic or early return); busy flag cleared");
+    }
+}
+
 /// What the transaction writes and how far it got (for the revert).
 struct Txn<'a> {
     sup: &'a ArmSupervisor,
@@ -438,6 +498,8 @@ struct Txn<'a> {
     vision_before: Value,
     /// rebot-vision revision after our PUT (None: not written).
     vision_written: Option<u64>,
+    /// Our PUT failed and the read-back failed too: rebot-vision may hold either values.
+    vision_unknown: bool,
     file_written: bool,
     live_written: bool,
     backup: Option<PathBuf>,
@@ -451,9 +513,27 @@ impl Txn<'_> {
 
     async fn write_vision(&mut self, values: &Map<String, Value>) -> Result<(), CalibError> {
         self.recheck("vision").await?;
-        let reply = vision_put(&self.deps.upstream, values, revision(&self.vision_before)).await.map_err(|e| e.at("vision"))?;
-        self.vision_written = Some(reply.get("revision").and_then(Value::as_u64).unwrap_or(revision(&self.vision_before) + 1));
-        Ok(())
+        match vision_put(self.deps, values, revision(&self.vision_before)).await {
+            Ok(reply) => {
+                self.vision_written = Some(reply.get("revision").and_then(Value::as_u64).unwrap_or(revision(&self.vision_before) + 1));
+                Ok(())
+            }
+            Err(e) => {
+                // the PUT may have been applied although its reply failed: read back
+                match vision_after_error(self.deps, &self.vision_before, values).await {
+                    VisionAfterError::Written(rev) => {
+                        tracing::warn!("rebot-vision PUT failed ({}) but the new intrinsics are in place (revision {rev}); reverting", e.message);
+                        self.vision_written = Some(rev);
+                    }
+                    VisionAfterError::Unchanged => {}
+                    VisionAfterError::Unknown(m) => {
+                        tracing::warn!("rebot-vision PUT failed ({}) and the read-back failed ({m}); vision state unknown", e.message);
+                        self.vision_unknown = true;
+                    }
+                }
+                Err(e.at("vision"))
+            }
+        }
     }
 
     /// calibration.json, then the live mount and calibration.
@@ -509,11 +589,19 @@ impl Txn<'_> {
                 Err(e) => { ok = false; state.insert("calibration_file".into(), json!(format!("revert failed: {e}"))); }
             }
         }
-        if let Some(rev) = self.vision_written {
+        if self.vision_unknown {
+            ok = false;
+            state.insert("vision".into(), json!("unknown"));
+        } else if let Some(rev) = self.vision_written {
             let old = self.vision_before.as_object().cloned().unwrap_or_default();
-            match vision_put(&self.deps.upstream, &old, rev).await {
+            match vision_put(self.deps, &old, rev).await {
                 Ok(_) => { state.insert("vision".into(), json!("reverted")); }
-                Err(e) => { ok = false; state.insert("vision".into(), json!(format!("revert failed: {}", e.message))); }
+                // the revert PUT may have been applied although its reply failed: read back
+                Err(e) => match vision_get(self.deps).await {
+                    Ok(got) if intrinsics_match(&got, &old) => { state.insert("vision".into(), json!("reverted")); }
+                    Ok(_) => { ok = false; state.insert("vision".into(), json!(format!("revert failed: {}", e.message))); }
+                    Err(g) => { ok = false; state.insert("vision".into(), json!(format!("unknown (revert failed: {}; read-back failed: {})", e.message, g.message))); }
+                },
             }
         }
         if ok { Ok(()) } else { Err(state) }
@@ -543,7 +631,7 @@ impl Txn<'_> {
         if let Err(e) = self.write_vision(vision_values).await { return Err(self.fail(e).await); }
         if let Err(e) = self.write_calibration(after).await { return Err(self.fail(e).await); }
         if let Err(e) = self.write_grasp(after).await { return Err(self.fail(e).await); }
-        let vision = vision_get(&self.deps.upstream).await.unwrap_or_else(|e| json!({"error": e.message}));
+        let vision = vision_get(self.deps).await.unwrap_or_else(|e| json!({"error": e.message}));
         let inner = self.sup.inner().read().await;
         Ok(json!({"backup": backup.display().to_string(), "vision_intrinsics": vision,
             "camera_mount": mount_summary(&inner.config.camera_mount), "calibration": inner.calibration,
@@ -565,7 +653,7 @@ pub async fn apply(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: ApplyR
         let inner = sup.inner().read().await;
         (armd_state(&inner), after_state(&inner, &req)?)
     };
-    let vision_before = vision_get(&deps.upstream).await.map_err(|e| e.at("vision"))?;
+    let vision_before = vision_get(deps).await.map_err(|e| e.at("vision"))?;
     let mut vision_after = vision_before.as_object().cloned().unwrap_or_default();
     for (k, v) in &req.intrinsics { vision_after.insert(k.clone(), v.clone()); }
     if req.dry_run {
@@ -573,7 +661,7 @@ pub async fn apply(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: ApplyR
         va.remove("revision");
         return Ok(json!({"dry_run": true, "before": diff_view(&vision_before, &before), "after": diff_view(&Value::Object(va), &after)}));
     }
-    let mut txn = Txn { sup, deps, check, before, vision_before, vision_written: None, file_written: false, live_written: false, backup: None };
+    let mut txn = Txn { sup, deps, check, before, vision_before, vision_written: None, vision_unknown: false, file_written: false, live_written: false, backup: None };
     let mut out = txn.run("apply", &req.intrinsics, &after).await?;
     out["grip_pixel_model"] = json!(after.grip_pixel_model);
     tracing::info!("Camera calibration applied (backup {})", out["backup"].as_str().unwrap_or(""));
@@ -598,8 +686,8 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
     if let Some(c) = &target.calibration { c.validate().map_err(CalibError::invalid)?; }
     if let Some(g) = &target.grasp_setup { g.validate().map_err(|e| CalibError::invalid(format!("backup {name}: grasp setup: {e}")))?; }
     let before = armd_state(&*sup.inner().read().await);
-    let vision_before = vision_get(&deps.upstream).await.map_err(|e| e.at("vision"))?;
-    let mut txn = Txn { sup, deps, check, before, vision_before, vision_written: None, file_written: false, live_written: false, backup: None };
+    let vision_before = vision_get(deps).await.map_err(|e| e.at("vision"))?;
+    let mut txn = Txn { sup, deps, check, before, vision_before, vision_written: None, vision_unknown: false, file_written: false, live_written: false, backup: None };
     let mut out = txn.run("restore", &vision_values, &target).await?;
     out["restored"] = json!(name);
     tracing::info!("Camera calibration restored from backup {name}");

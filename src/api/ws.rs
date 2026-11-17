@@ -759,11 +759,20 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             }
                             Ok(())
                         });
-                        let result = match job {
-                            CalibJob::Apply(req) => crate::calibration::apply(&sup, &calib, *req, &check).await,
-                            CalibJob::Restore(body) => crate::calibration::restore(&sup, &calib, &body, &check).await,
-                        };
-                        if busy { sup.inner().write().await.calibration_busy = false; }
+                        // the busy flag is released by the guard, also when the job panics
+                        let guard = busy.then(|| crate::calibration::BusyGuard::new(sup.clone()));
+                        let job_sup = sup.clone();
+                        let job_task = tokio::spawn(async move {
+                            match job {
+                                CalibJob::Apply(req) => crate::calibration::apply(&job_sup, &calib, *req, &check).await,
+                                CalibJob::Restore(body) => crate::calibration::restore(&job_sup, &calib, &body, &check).await,
+                            }
+                        });
+                        let result = job_task.await.unwrap_or_else(|e| {
+                            tracing::error!("calibration task failed: {e}");
+                            Err(crate::calibration::CalibError::new(500, "INTERNAL", format!("calibration task failed: {e}; check GET /api/v1/calibration and the backups")))
+                        });
+                        if let Some(g) = guard { g.release().await; }
                         let reply = match result {
                             Ok(Value::Object(fields)) => {
                                 let mut ack = json!({"type":"command_ack", "request_id":request_id, "status":"accepted"});
