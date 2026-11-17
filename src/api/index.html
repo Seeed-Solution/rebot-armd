@@ -4628,7 +4628,8 @@ function cwAbortReason() {
   const o = S.obs || {};
   return CWZ.CW.runAbortReason({ stopReq: CWZ.stopReq, hidden: document.hidden, live: !!isLive() && !!S.ws && S.ws.readyState === 1,
     lease0: CWZ.lease, lease: S.leaseGeneration, epoch0: CWZ.epoch, epoch: typeof o.epoch_id === 'number' ? o.epoch_id : S.epoch,
-    state: S.state, fault: o.fault || null, hold: colHold(), action: o.action ? o.action.id : null, ownAction: CWZ.ownAction });
+    state: S.state, fault: o.fault || null, hold: colHold(),
+    action: o.action ? o.action.id : null, actionState: o.action ? o.action.state : null, ownAction: CWZ.ownAction });
 }
 const cwSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function cwGuardedWait(cond, timeoutMs) {

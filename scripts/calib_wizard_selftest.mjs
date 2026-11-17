@@ -231,13 +231,13 @@ const solveViews = views;
 // ---- i. capture run loop on a fake arm (observation: epoch, safety state, newest action id)
 {
   const fake = ({ n = 5, failMove = {}, onSettle = null, checkFail = new Set() } = {}) => {
-    const obs = { epoch: 7, state: 'Armed', fault: null, action: 40 }, log = [];
+    const obs = { epoch: 7, state: 'Armed', fault: null, action: 40, actionState: 'done' }, log = [];
     const run = { lease0: 3, epoch0: obs.epoch, own: null };
     const st = { plan: Array.from({ length: n }, (_, i) => ({ T: i, state: 'pending' })), idx: 0 };
     let moves = 0;
     const io = {
       abortReason: () => CW.runAbortReason({ stopReq: false, hidden: false, live: true, lease0: run.lease0, lease: 3, epoch0: run.epoch0,
-        epoch: obs.epoch, state: obs.state, fault: obs.fault, hold: false, action: obs.action, ownAction: run.own }),
+        epoch: obs.epoch, state: obs.state, fault: obs.fault, hold: false, action: obs.action, actionState: obs.actionState, ownAction: run.own }),
       check: (T) => (checkFail.has(T) ? { ok: false, reason: 'clearance' } : { ok: true }),
       move: async (T) => {
         moves++; log.push(`move ${T}`);
@@ -253,7 +253,7 @@ const solveViews = views;
       stop: async () => { log.push('stop'); },
       skipWhy: (k, d) => `${k}:${d}`,
     };
-    return { st, io, log, obs, moves: () => moves };
+    return { st, io, log, obs, run, moves: () => moves };
   };
   const go = async (f) => { try { return { res: await CW.runPoses(f.st, f.io, { runAll: true }) }; } catch (e) { return { err: e }; } };
   // TRACKING_STALL on move 3 (action failed after it started)
@@ -278,12 +278,28 @@ const solveViews = views;
     `${r.err ? r.err.why : 'no abort'}, moves ${f.moves()}, log ${f.log.join(',')}`);
   // safety state leaves Armed / Moving, a fault, a foreign action
   const sv = [];
-  for (const [k, fn] of [['state', (o) => { o.state = 'Idle'; }], ['fault', (o) => { o.fault = { code: 'THERMAL_TRIP' }; }], ['foreign', (o) => { o.action += 5; }]]) {
+  for (const [k, fn] of [['state', (o) => { o.state = 'Idle'; }], ['fault', (o) => { o.fault = { code: 'THERMAL_TRIP' }; }], ['foreign', (o) => { o.action += 5; o.actionState = 'running'; }]]) {
     const g = fake({ onSettle: (o, m) => { if (m === 1) fn(o); } }), q = await go(g);
     sv.push(`${k}:${q.err ? q.err.why : 'ran'}:${g.moves()}`);
     if (!(q.err && q.err.why === k && g.moves() === 1)) fails++;
   }
   check('i. state / fault / foreign action during settle -> abort', sv.every((x) => x.endsWith(':1')), sv.join(' '));
+  // real-arm regression (2026-11-17): the move_to ack arrives before the observation shows the new action, so the
+  // observation still holds the previous FINISHED action (done / cancelled, other id) while the wizard waits -> not foreign
+  {
+    const g = fake();
+    g.io.move = async (T) => {
+      g.log.push(`move ${T}`);
+      const prev = g.obs.action, own = prev + 1;
+      g.run.own = own; // ack received; observation still shows prev (finished)
+      const why = g.io.abortReason(); // what cwGuardedWait checks right after the ack
+      if (why) { g.log.push('abort ' + why); throw CW.runAbort(why); }
+      g.obs.action = own; g.obs.actionState = 'done';
+    };
+    const q = await go(g);
+    check('i. ack before observation: previous finished action is not foreign', q.res === 'done' && !g.log.some((x) => x.startsWith('abort')),
+      `${q.res || q.err.why}, log ${g.log.slice(0, 6).join(',')}`);
+  }
   // settle timeout -> stop sent, then abort
   f = fake(); f.io.settle = async () => { f.log.push('settle'); throw Object.assign(new Error('timeout'), { code: 'TIMEOUT' }); }; r = await go(f);
   check('i. settle timeout -> stop sent, then abort', r.err && r.err.why === 'timeout' && f.moves() === 1 && f.log.join(',') === 'move 0,settle,stop',

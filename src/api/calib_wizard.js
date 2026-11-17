@@ -811,8 +811,10 @@ export const moveFailureSkips = (err) => !!err && err.phase === 'reject' && PLAN
 export const RUN_STATES = Object.freeze(['Armed', 'Moving']);
 /* Why a running wizard must stop now (null: carry on). s: { stopReq, hidden, live (telemetry + WS),
    lease0 / lease (lease generation at Start / now), epoch0 / epoch (observation epoch_id at Start / now),
-   state (safety state name), fault (observation fault or null), hold (collision hold active), action (id of the newest action in the
-   observation), ownAction (id of the wizard's last move_to) }. */
+   state (safety state name), fault (observation fault or null), hold (collision hold active), action / actionState (id and state of
+   the newest action in the observation), ownAction (id of the wizard's last move_to) }. Only a RUNNING action can be foreign: armd
+   keeps the last finished action (done / cancelled) in the observation until the next one starts, and the move_to ack arrives
+   before the observation that shows the new action. */
 export function runAbortReason(s) {
   if (s.stopReq) return 'stop';
   if (s.hidden) return 'hidden';
@@ -821,7 +823,7 @@ export function runAbortReason(s) {
   if (s.state === 'EStop' || s.state === 'Fault' || s.fault || s.hold) return 'fault';
   if (s.epoch0 != null && s.epoch !== s.epoch0) return 'epoch';
   if (!RUN_STATES.includes(s.state)) return 'state';
-  if (s.action != null && s.ownAction != null && s.action !== s.ownAction) return 'foreign';
+  if (s.actionState === 'running' && s.action != null && s.ownAction != null && s.action !== s.ownAction) return 'foreign';
   return null;
 }
 export const runAbort = (why, detail = '') => Object.assign(new Error(detail ? `${why}: ${detail}` : why), { code: 'ABORTED', why, detail });

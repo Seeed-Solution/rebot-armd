@@ -149,7 +149,7 @@ try {
   ownAction = null;
   const res = await CW.runPoses(st, {
     abortReason: () => CW.runAbortReason({ live: true, epoch0, epoch: obs.epoch_id, state: typeof obs.safety_state === 'string' ? obs.safety_state : Object.keys(obs.safety_state || {})[0],
-      fault: obs.fault || null, hold: !!(obs.collision && obs.collision.active), action: obs.action ? obs.action.id : null, ownAction }),
+      fault: obs.fault || null, hold: !!(obs.collision && obs.collision.active), action: obs.action ? obs.action.id : null, actionState: obs.action ? obs.action.state : null, ownAction }),
     check: (T) => { const q = toModel6(obs.positions); return CW.checkTransition(CALM.fk(q), q, T, { ik, X: est.X, plane: CW.boardPlane(est.Tbb), clearance: 0.10, lo, hi }); },
     move: (T) => move(T),
     settle, capture,
