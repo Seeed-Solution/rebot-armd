@@ -70,6 +70,11 @@ pub struct GraspSetup {
     pub image_size_px: [f64; 2],
     pub fx_px: f64,
     pub fy_px: f64,
+    /// Principal point (px at `image_size_px`); absent = the image centre.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cx_px: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cy_px: Option<f64>,
     /// Centring is done when the box centre is within this many pixels of the grip pixel ...
     pub centre_tol_px: f64,
     /// ... for this many consecutive frames.
@@ -391,6 +396,8 @@ impl Default for GraspSetup {
             image_size_px: [640.0, 360.0],
             fx_px: 600.0,
             fy_px: 600.0,
+            cx_px: None,
+            cy_px: None,
             centre_tol_px: 10.0,
             stable_frames: 3,
             median_frames: 3,
@@ -461,6 +468,9 @@ impl GraspSetup {
         check(self.camera_tilt_deg.abs() <= 60.0, "camera_tilt_deg must be in [-60, 60]")?;
         check(self.image_size_px.iter().all(|v| *v >= 16.0 && *v <= 8192.0), "image_size_px must be in [16, 8192]")?;
         check(self.fx_px > 10.0 && self.fy_px > 10.0 && self.fx_px < 1e5 && self.fy_px < 1e5, "fx_px / fy_px must be in (10, 1e5)")?;
+        check(self.cx_px.is_none_or(|c| c.is_finite() && c > 0.0 && c < self.image_size_px[0])
+            && self.cy_px.is_none_or(|c| c.is_finite() && c > 0.0 && c < self.image_size_px[1]),
+            "cx_px / cy_px must be null or inside the image (0, image_size_px)")?;
         check(self.centre_tol_px > 0.0 && self.centre_tol_px <= 100.0, "centre_tol_px must be in (0, 100]")?;
         check((1..=20).contains(&self.stable_frames) && (1..=20).contains(&self.median_frames), "stable_frames / median_frames must be 1..20")?;
         check((1..=30).contains(&self.max_iterations), "max_iterations must be 1..30")?;
@@ -527,7 +537,7 @@ impl GraspSetup {
         let mut base = serde_json::to_value(self).map_err(|e| e.to_string())?;
         let fields = base.as_object_mut().expect("setup serialises to an object");
         for (k, v) in obj {
-            if !fields.contains_key(k) { return Err(format!("unknown grasp setup field: {k}")); }
+            if !fields.contains_key(k) && !OPTIONAL_FIELDS.contains(&k.as_str()) { return Err(format!("unknown grasp setup field: {k}")); }
             fields.insert(k.clone(), v.clone());
         }
         serde_json::from_value(base).map_err(|e| format!("invalid grasp setup: {e}"))
@@ -551,6 +561,9 @@ impl GraspSetup {
         self.patched(patch)
     }
 }
+
+/// Setup fields left out of the JSON while unset (`null` in a patch unsets them).
+const OPTIONAL_FIELDS: [&str; 2] = ["cx_px", "cy_px"];
 
 /// Setup file path: `ARMD_GRASP_SETUP` or [`DEFAULT_SETUP_PATH`].
 pub fn setup_path_from_env() -> PathBuf {
@@ -625,6 +638,7 @@ pub fn update_setup(inner: &mut SupervisorInner, body: &Value) -> Result<GraspSe
         }
         Some(_) => return Err(MotionError::InvalidCommand("table_z_from_tcp must be boolean".into()).into()),
     }
+    if inner.camera_calibrated() { refuse_calibrated_fields(&base, &patch, "")?; }
     let setup = base.patched(&Value::Object(patch)).map_err(MotionError::InvalidCommand)?;
     // the camera tilt is workspace geometry (camera check point): it cannot change under an
     // accepted motion; other setup fields can
@@ -635,6 +649,52 @@ pub fn update_setup(inner: &mut SupervisorInner, body: &Value) -> Result<GraspSe
     }
     inner.set_grasp_setup(setup.clone());
     Ok(setup)
+}
+
+/// Grasp setup fields the camera calibration sets (`/api/v1/calibration/apply`). While the
+/// mount is calibrated, setup writes, task overrides and request overrides that change them
+/// are refused; `grip_pixel_norm` and `table_z_m` stay writable.
+pub const CALIBRATED_FIELDS: [&str; 6] = ["camera_tilt_deg", "fx_px", "fy_px", "cx_px", "cy_px", "image_size_px"];
+
+fn same_json(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => x.as_f64().zip(y.as_f64()).is_some_and(|(x, y)| (x - y).abs() <= 1e-9 * x.abs().max(1.0)),
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(a, b)| same_json(a, b)),
+        _ => a == b,
+    }
+}
+
+/// INVALID_COMMAND naming the first calibrated field `patch` changes against `current`, and
+/// any calibrated field in the `overrides` of a task in `patch.tasks`. `what` prefixes the field.
+pub fn refuse_calibrated_fields(current: &GraspSetup, patch: &serde_json::Map<String, Value>, what: &str) -> Result<(), MotionError> {
+    let cur = serde_json::to_value(current).unwrap_or(Value::Null);
+    let refuse = |f: &str| MotionError::InvalidCommand(format!("{what}{f}: camera mount is calibrated; restore or recalibrate"));
+    for f in CALIBRATED_FIELDS {
+        if let Some(v) = patch.get(f) {
+            if !cur.get(f).is_some_and(|c| same_json(c, v)) { return Err(refuse(f)); }
+        }
+    }
+    if let Some(tasks) = patch.get("tasks").and_then(Value::as_object) {
+        for (name, task) in tasks {
+            if let Some(o) = task.get("overrides").and_then(Value::as_object) {
+                if let Some(f) = CALIBRATED_FIELDS.iter().find(|f| o.contains_key(**f)) {
+                    return Err(MotionError::InvalidCommand(format!("{what}grasp task {name}: {f}: camera mount is calibrated; restore or recalibrate")));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`refuse_calibrated_fields`] for a grasp request: its `overrides` and its task's stored overrides.
+fn refuse_calibrated_request(base: &GraspSetup, body: &Value) -> Result<(), MotionError> {
+    if let Some(name) = body.get("task").and_then(Value::as_str) {
+        if let Some(t) = base.tasks.get(name) {
+            refuse_calibrated_fields(base, &t.overrides, &format!("grasp task {name}: "))?;
+        }
+    }
+    if let Some(o) = body.get("overrides").and_then(Value::as_object) { refuse_calibrated_fields(base, o, "overrides.")?; }
+    Ok(())
 }
 
 // ---- detections ----
@@ -1275,14 +1335,17 @@ pub struct CamModel {
 }
 
 impl CamModel {
-    /// The controller's model: mount flip / rot from the config, tilt and rough intrinsics from
-    /// the setup, optical centre at `camera_mount.offset_m` (end_link origin when unset).
+    /// The controller's model: mount flip / rot from the config and tilt from the setup, or the
+    /// calibrated `q_end_cam`; intrinsics (fx, fy, principal point, default the image centre)
+    /// from the setup; optical centre at `camera_mount.offset_m` (end_link origin when unset).
+    /// Lens distortion is not modelled.
     pub fn assumed(arm: &crate::chain::ArmModel, setup: &GraspSetup, mount: &CameraMount) -> Self {
         Self {
-            rec: arm.cam_mount(mount.flip, f64::from(mount.rot_deg), setup.camera_tilt_deg),
+            rec: arm.r_end_cam(mount, setup.camera_tilt_deg),
             offset: mount.offset_m.map(|o| o.map(f64::from)).unwrap_or([0.0; 3]),
             fx: setup.fx_px, fy: setup.fy_px,
-            cx: setup.image_size_px[0] / 2.0, cy: setup.image_size_px[1] / 2.0,
+            cx: setup.cx_px.unwrap_or(setup.image_size_px[0] / 2.0),
+            cy: setup.cy_px.unwrap_or(setup.image_size_px[1] / 2.0),
             size: setup.image_size_px,
         }
     }
@@ -1935,6 +1998,7 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Pend
     let Some(base) = inner.grasp_setup() else {
         return Err(MotionError::Unsupported("Grasp needs a profile with kinematics, a gripper policy and a grasp setup".into()).into());
     };
+    if inner.camera_calibrated() { refuse_calibrated_request(&base, body)?; }
     let Some(policy) = inner.config.gripper_policy.clone() else {
         return Err(MotionError::Unsupported("Grasp needs a gripper policy".into()).into());
     };

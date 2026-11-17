@@ -1,4 +1,5 @@
 #[cfg(not(target_arch = "wasm32"))] pub mod api;
+#[cfg(not(target_arch = "wasm32"))] pub mod calibration;
 pub mod chain;
 pub mod collision;
 #[cfg(not(target_arch = "wasm32"))] pub mod diagnostics;

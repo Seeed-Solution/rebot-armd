@@ -45,3 +45,38 @@ uses them only to scale pixel errors into steps.
 Field meanings: [docs/agent_action_api.md](../../../docs/agent_action_api.md#grasp--点框抓取).
 Values to check on the device (same document): `grip_pixel_norm`, `table_z_m`,
 `settle_delay_s`, `lost_*`, `centre_tol_px`.
+
+## Calibration wizard (measured values) / 标定向导（实测值）
+
+The cockpit's calibration wizard replaces the placeholders above with measured values. It moves
+the arm over a printed ArUco GridBoard on the table, solves intrinsics, hand-eye mount and table
+height in the browser, and applies them through armd (WS `/api/v1/calibration/apply`; contract in
+[docs/agent_action_api.md](../../../docs/agent_action_api.md#camera-calibration-wizard--相机标定向导)).
+One apply writes:
+
+| Where | What |
+|---|---|
+| rebot-vision `/userdata/rebot-teleop/vision.json` (via `PUT /api/calibration/intrinsics`) | `fx`, `fy`, `cx`, `cy`, `k1`, `k2`, `p1`, `p2`, `k3`, `marker_size` at 640 x 360 |
+| `/userdata/rebot-teleop/calibration.json` (`ARMD_CALIBRATION`) | `camera_mount` with `q_end_cam` (R_end_cam, [w, x, y, z]) and `offset_m`, a copy of the intrinsics, `table_z_m`, `solved_at`, `rms` |
+| `/userdata/rebot-teleop/grasp_setup.json` (`ARMD_GRASP_SETUP`) | `fx_px`, `fy_px`, `cx_px`, `cy_px`, `image_size_px` [640, 360], `table_z_m`, `camera_tilt_deg` (derived from `q_end_cam`), `grip_pixel_norm` (computed by armd; left unchanged when the point under the jaws is outside the image, as with v8) |
+
+Each apply first stores a backup in `/userdata/rebot-teleop/calibration-backups/<UTC time>/`;
+WS `/api/v1/calibration/restore {"backup": "<name>"}` puts one back, `GET /api/v1/calibration`
+lists them. While `calibration.json` holds `q_end_cam`, `camera_tilt_deg`, `fx_px`, `fy_px`,
+`cx_px`, `cy_px` and `image_size_px` cannot be changed in the grasp settings (restore a backup or
+recalibrate); `camera_mounts.json` and the profile's `flip` / `rot_deg` / `tilt_deg` are then
+not used for the camera rotation. Lens distortion is used by rebot-vision's marker poses, not by
+the grasp geometry.
+
+Board (the wizard prints it; the simulator's `--aruco-board` uses the same layout): 3 columns x
+4 rows of aruco4x4_50 markers, ids 0..11 in reading order (id = row * 3 + col, row 0 at the top
+of the page), marker side 50 mm, gap 10 mm (0.2 x side). Board frame: origin at the board
+centre, x right on the page, y down the page, z into the table. Marker corners in rebot-vision's
+order: bottom-left, bottom-right, top-right, top-left of the printed marker (marker frame x right,
+y down).
+
+驾驶舱标定向导用实测值替换上面的占位值：机械臂在桌面上打印的 ArUco GridBoard 上方移动，在浏览器中求解内参、手眼安装与桌面高度，再通过 armd 写入（WS `/api/v1/calibration/apply`，接口见 [docs/agent_action_api.md](../../../docs/agent_action_api.md#camera-calibration-wizard--相机标定向导)）。一次写入包括：rebot-vision 的 `/userdata/rebot-teleop/vision.json`（经 `PUT /api/calibration/intrinsics`，640 x 360 下的 `fx`、`fy`、`cx`、`cy`、`k1`、`k2`、`p1`、`p2`、`k3`、`marker_size`）；`/userdata/rebot-teleop/calibration.json`（`ARMD_CALIBRATION`：含 `q_end_cam`（R_end_cam，[w, x, y, z]）与 `offset_m` 的 `camera_mount`、内参副本、`table_z_m`、`solved_at`、`rms`）；`/userdata/rebot-teleop/grasp_setup.json`（`ARMD_GRASP_SETUP`：`fx_px`、`fy_px`、`cx_px`、`cy_px`、`image_size_px` [640, 360]、`table_z_m`、由 `q_end_cam` 推导的 `camera_tilt_deg`、armd 计算的 `grip_pixel_norm`；夹爪下方的点在画面外时（如 v8）保持不变）。
+
+每次写入前先在 `/userdata/rebot-teleop/calibration-backups/<UTC 时间>/` 保存备份；WS `/api/v1/calibration/restore {"backup": "<名称>"}` 恢复备份，`GET /api/v1/calibration` 列出备份。`calibration.json` 含 `q_end_cam` 期间，抓取设置中的 `camera_tilt_deg`、`fx_px`、`fy_px`、`cx_px`、`cy_px`、`image_size_px` 不能修改（恢复备份或重新标定）；相机旋转不再使用 `camera_mounts.json` 与 profile 的 `flip` / `rot_deg` / `tilt_deg`。镜头畸变用于 rebot-vision 的标记位姿，不用于抓取几何。
+
+标定板（向导生成打印页；仿真器 `--aruco-board` 使用相同布局）：3 列 x 4 行 aruco4x4_50 标记，id 0..11 按阅读顺序（id = 行 * 3 + 列，第 0 行在页面顶部），标记边长 50 mm，间隔 10 mm（0.2 倍边长）。标定板坐标系：原点在板中心，x 沿页面向右，y 沿页面向下，z 指向桌面内。标记角点顺序同 rebot-vision：打印标记的左下、右下、右上、左上（标记坐标系 x 向右、y 向下）。

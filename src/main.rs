@@ -234,6 +234,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     supervisor.set_episodes_dir(episodes.dir().map(std::path::Path::to_path_buf)).await;
     armd::grasp::load_into(&supervisor, &armd::grasp::setup_path_from_env()).await;
+    // after the grasp setup: the calibration wins for camera_mount and camera_tilt_deg
+    armd::calibration::load_into(&supervisor, &armd::calibration::path_from_env()).await;
     armd::keepout::load_into(&supervisor, &armd::keepout::path_from_env()).await;
     armd::poses::load_into(&supervisor, &armd::poses::path_from_env()).await;
     armd::collision::load_into(&supervisor, &armd::collision::path_from_env()).await;

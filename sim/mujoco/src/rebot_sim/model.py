@@ -126,7 +126,7 @@ def load_model(
         if camera is not None:
             from .camera import add_cameras, mount_rotation
 
-            add_cameras(spec, mount_rotation(spec.compile(), camera), camera.offset)
+            add_cameras(spec, mount_rotation(spec.compile(), camera), camera.offset, camera.vfov_deg)
         return spec.compile()
 
 

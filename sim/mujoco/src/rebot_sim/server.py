@@ -693,8 +693,10 @@ class Simulator:
         noise: dict | None = None,
         depth: dict | None = None,
         mask_angle: bool = True,
+        aruco_board: dict | None = None,
     ) -> dict:
-        """Spawn the camera process (perception.camera_main); returns its ready message."""
+        """Spawn the camera process (perception.camera_main); returns its ready message.
+        `aruco_board`: the virtual GridBoard ({x, y, yaw_deg, side_m, noise_px, seed}) or None."""
         import multiprocessing as mp
 
         from .perception import SharedState, camera_main
@@ -713,7 +715,8 @@ class Simulator:
             "perception_port": perception_port,
             "scene_stream": scene_stream,
             "objects": objects,
-            "mount": [m.flip, m.rot_deg, m.tilt_deg, m.offset_m],
+            "mount": m.ipc(),  # flip, rot_deg, tilt_deg, offset_m, q_end_cam, fx_px
+            "aruco_board": aruco_board,
             "has_meshes": self.has_meshes,
             "noise": noise or {},
             "depth": depth or {},
@@ -1072,6 +1075,39 @@ def main(argv: list[str] | None = None) -> None:
         metavar="X,Y,Z",
         help="lens centre in end_link (m); default camera_mount.offset_m, else the v8 holder value",
     )
+    parser.add_argument(
+        "--camera-q",
+        default=None,
+        metavar="W,X,Y,Z",
+        help="camera_mount.q_end_cam (R_end_cam as a unit quaternion); replaces flip / rot / tilt "
+        "(default: the profile's q_end_cam, if any)",
+    )
+    parser.add_argument(
+        "--fx",
+        type=float,
+        default=None,
+        help="true focal length (px at 640x360, square pixels, centred, no distortion) for the render, "
+        "detections, markers, depth and /sim/camera (default 824.4, the OV5647 stream value)",
+    )
+    parser.add_argument(
+        "--aruco-board",
+        default=None,
+        metavar="X,Y[,YAW]",
+        help="virtual 3x4 ArUco GridBoard (aruco4x4_50 ids 0..11, 50 mm markers, 10 mm gap) lying on the "
+        "table, centre at base X,Y (m), turned YAW deg about base z; the aruco pipeline reports its markers",
+    )
+    parser.add_argument(
+        "--aruco-marker-m",
+        type=float,
+        default=0.05,
+        help="marker side of the virtual board (m); the gap is 0.2 x the side",
+    )
+    parser.add_argument(
+        "--marker-noise-px",
+        type=float,
+        default=0.0,
+        help="Gaussian noise (sigma, px) added to each virtual marker corner, seeded by --seed and the frame",
+    )
     det = parser.add_argument_group(
         "detection noise (the perception API's detections; all off by default)"
     )
@@ -1190,18 +1226,42 @@ def main(argv: list[str] | None = None) -> None:
         args.camera_rot_deg is not None
         or args.camera_tilt_deg is not None
         or args.camera_offset
+        or args.camera_q
+        or args.fx is not None
     ):
         off = mount.offset_m
         if args.camera_offset:
             off = tuple(float(v) for v in args.camera_offset.split(","))
             if len(off) != 3:
                 parser.error("--camera-offset needs 3 values")
-        mount = CameraMount(
-            mount.flip,
-            mount.rot_deg if args.camera_rot_deg is None else args.camera_rot_deg,
-            mount.tilt_deg if args.camera_tilt_deg is None else args.camera_tilt_deg,
-            off,
-        )
+        q = mount.q_end_cam
+        if args.camera_q:
+            q = tuple(float(v) for v in args.camera_q.split(","))
+        try:
+            mount = CameraMount(
+                mount.flip,
+                mount.rot_deg if args.camera_rot_deg is None else args.camera_rot_deg,
+                mount.tilt_deg if args.camera_tilt_deg is None else args.camera_tilt_deg,
+                off,
+                q,
+                args.fx,
+            )
+        except ValueError as exc:
+            parser.error(f"camera mount: {exc}")
+    aruco_board = None
+    if args.aruco_board:
+        from .aruco import Board
+
+        if not 0.005 <= args.aruco_marker_m <= 0.2:
+            parser.error("--aruco-marker-m must be in [0.005, 0.2]")
+        if args.marker_noise_px < 0:
+            parser.error("--marker-noise-px must be >= 0")
+        try:
+            b = Board.parse(args.aruco_board, side_m=args.aruco_marker_m)
+        except ValueError as exc:
+            parser.error(str(exc))
+        aruco_board = {"x": b.x, "y": b.y, "yaw_deg": b.yaw_deg, "z": 0.0, "side_m": b.side_m,
+                       "noise_px": args.marker_noise_px, "seed": args.seed or 0}
     for flag, value in (
         ("jitter-px", args.det_jitter_px),
         ("size-jitter", args.det_size_jitter),
@@ -1281,6 +1341,7 @@ def main(argv: list[str] | None = None) -> None:
             noise=noise,
             depth=depth,
             mask_angle=not args.no_mask_angle,
+            aruco_board=aruco_board,
         )
         if "error" in ready:
             print(f"rebot-sim: {ready['error']}", file=sys.stderr, flush=True)
@@ -1288,6 +1349,7 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(1)
         print(
             f"camera: {w}x{h} @ {args.fps} fps ({ready['backend']}, own process), mount rot {mount.rot_deg:g} tilt {mount.tilt_deg:g} "
+            f"q {mount.q_end_cam} fx {mount.focal():.1f} board {aruco_board} "
             f"offset {mount.offset.round(4).tolist()}; video ws://{args.http_host}:{args.video_port}/, "
             f"perception http://{args.http_host}:{args.perception_port}",
             flush=True,

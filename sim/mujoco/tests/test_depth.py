@@ -229,7 +229,8 @@ def test_depth_off_keeps_mode_and_trigger_bodies():
     the yolo / aruco API: no depth keys anywhere, depth rejected as a pipeline."""
     mode_keys = {"api_version", "mode", "modes", "pipelines", "last_active_mode", "enabled", "processing", "fps",
                  "active_fps", "idle_fps", "fps_range", "camera_fps", "measured", "trigger", "per_request_pipelines",
-                 "subscriptions", "max_fps", "continuous", "available", "model", "family", "mask_focus", "models", "ion"}
+                 "subscriptions", "max_fps", "continuous", "available", "model", "family", "mask_focus", "models", "ion",
+                 "intrinsics"}  # /api/calibration/intrinsics body (calibration wizard)
     result_keys = {"api_version", "success", "mode", "frame_id", "ts_ms", "mono", "physics_time", "physics_step",
                    "inference_time_ms", "width", "height", "pipelines", "detections", "count", "family",
                    "undistorted", "rejected", "markers", "model_generation"}

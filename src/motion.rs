@@ -357,7 +357,7 @@ pub fn resolve_goal_ex(input: &PlanInput, spec: &GoalSpec) -> (Pose, bool) {
                     Pose::new(kinematics::mat_mul(&start.r, &local), p)
                 }
                 RelFrame::Camera => {
-                    let rec = input.arm.cam_mount(input.cam.flip, f64::from(input.cam.rot_deg), f64::from(input.cam.tilt_deg));
+                    let rec = input.arm.r_end_cam(&input.cam, f64::from(input.cam.tilt_deg));
                     let rc = kinematics::cam_rotation(&start, &rec);
                     let p = kinematics::add(&start.p, &kinematics::mat_vec(&rc, d));
                     let mut r = start.r;

@@ -258,6 +258,16 @@ pub struct SupervisorInner {
     /// Bumped on every change of the workspace rule inputs (keep-out boxes, camera mount);
     /// a plan made outside the lock must match it at install (else PLAN_STALE).
     pub workspace_revision: u64,
+    /// Camera calibration in effect (`calibration.json`, `crate::calibration`); None = the
+    /// profile's camera mount.
+    pub calibration: Option<crate::calibration::CalibrationFile>,
+    /// A calibration apply / restore transaction is running: motion commands are refused
+    /// (MOTION_BUSY) and other configuration writes too (CONFIG_BUSY).
+    pub calibration_busy: bool,
+    /// The profile's camera mount and grasp setup before any file was loaded (restore of a
+    /// backup without calibration.json / grasp_setup.json).
+    pub profile_camera_mount: crate::model::CameraMount,
+    pub profile_grasp: Option<crate::grasp::GraspSetup>,
     /// Duration of the most recently planned NormalUnload trajectory (s).
     pub unload_planned_duration: Option<f64>,
     pub recorder: EpisodeRecorder,
@@ -377,6 +387,8 @@ impl SupervisorInner {
         }
 
         let base_gripper_policy = config.gripper_policy.clone();
+        let profile_camera_mount = config.camera_mount.clone();
+        let profile_grasp = config.grasp.clone();
         let mock_gripper_stall_offset = std::env::var("ARMD_MOCK_GRIPPER_STALL_OFFSET").ok().and_then(|s| s.parse::<f32>().ok());
 
         Self {
@@ -436,6 +448,10 @@ impl SupervisorInner {
             watchdog_park: None,
             park_rejection: None,
             workspace_revision: 0,
+            calibration: None,
+            calibration_busy: false,
+            profile_camera_mount,
+            profile_grasp,
             unload_planned_duration: None,
             recorder: EpisodeRecorder::new(),
             episodes: crate::recording::EpisodeStore::new(Some(PathBuf::from(crate::recording::store::FALLBACK_EPISODES_DIR))),
@@ -2478,6 +2494,7 @@ impl SupervisorInner {
     }
 
     fn busy_reason(&self) -> Option<String> {
+        if self.calibration_busy { return Some("a calibration apply is running".into()); }
         if self.active_trajectory.is_some() { return Some("a trajectory is running".into()); }
         if self.servo_target.is_some() { return Some("servo streaming is active".into()); }
         if self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) { return Some("the arm is still moving".into()); }
@@ -2560,6 +2577,20 @@ impl SupervisorInner {
         let mut s = self.config.grasp.clone()?;
         s.camera_tilt_deg = f64::from(self.config.camera_mount.tilt_deg);
         Some(s)
+    }
+
+    /// The camera mount is calibrated (`calibration.json` with `q_end_cam` in effect).
+    pub fn camera_calibrated(&self) -> bool {
+        self.calibration.as_ref().is_some_and(|c| c.camera_mount.q_end_cam.is_some())
+    }
+
+    /// Install a camera mount (calibration apply / restore / startup): bumps the workspace
+    /// revision when it changes and keeps the grasp setup's tilt in sync with the mount's.
+    pub fn set_camera_mount(&mut self, mount: crate::model::CameraMount) {
+        if self.config.camera_mount != mount { self.workspace_revision += 1; }
+        self.config.camera_mount = mount;
+        let tilt = f64::from(self.config.camera_mount.tilt_deg);
+        if let Some(g) = self.config.grasp.as_mut() { g.camera_tilt_deg = tilt; }
     }
 
     /// Replace the runtime setup; `camera_tilt_deg` also sets `camera_mount.tilt_deg`.

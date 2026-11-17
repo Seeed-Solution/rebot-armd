@@ -174,5 +174,16 @@ const msTick = med((i) => VIK.solve(...tick[i % 200], { lo, hi }));
 const msPert = med((i) => VIK.solve(...pert[i % 200], { lo, hi }));
 check('f. median solve time < 0.5 ms', msTick < 0.5 && msPert < 0.5, `teleop tick (0.005 rad start error) ${(msTick * 1000).toFixed(1)} us, perturbed start (0.1 rad) ${(msPert * 1000).toFixed(1)} us`);
 
+// g. calibrated mount: camMount(..., qEndCam) is R_end_cam of the quaternion (armd camera_mount.q_end_cam)
+{
+  const R = VIK.camMount(false, 30);
+  const m = [R[0][0], R[0][1], R[0][2], R[1][0], R[1][1], R[1][2], R[2][0], R[2][1], R[2][2]];
+  const w = Math.sqrt(Math.max(0, 1 + m[0] + m[4] + m[8])) / 2; // trace > 0 here
+  const q = [w, (m[7] - m[5]) / (4 * w), (m[2] - m[6]) / (4 * w), (m[3] - m[1]) / (4 * w)];
+  const Rq = VIK.camMount(true, -50, undefined, q); // flip / rot ignored with q
+  let e = 0;
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) e = Math.max(e, Math.abs(Rq[i][j] - R[i][j]));
+  check('g. camMount with q_end_cam equals the mount the quaternion came from', e < 1e-12, `max abs diff ${e.toExponential(2)}`);
+}
 console.log(fails ? `\n${fails} FAILED` : '\nALL PASS');
 process.exit(fails ? 1 : 0);

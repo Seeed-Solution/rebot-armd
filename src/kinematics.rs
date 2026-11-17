@@ -416,6 +416,19 @@ pub fn cam_mount_from(end_r: &Mat3, wrist_axis: &Vec3, flip: bool, rot_deg: f64,
     r
 }
 
+/// Derived tilt (deg) of a calibrated mount R_end_cam `rec` (`camera_mount.q_end_cam`), in
+/// the `tilt_deg` convention: with tilt 0 the optical axis z_cam is end_link x (it looks
+/// straight down when the tool is vertical); `tilt_deg` turns it toward −y0.
+/// tilt = sgn · acos(z_cam · x_end), sgn = sign(−z_cam · y0) (+ when 0), where `legacy0` is
+/// the legacy mount at rot 0 / tilt 0 (`cam_mount(flip, 0, 0)`) and y0 its second column. For a
+/// q built from (flip, rot_deg, tilt_deg) with |rot_deg| < 90 this returns tilt_deg.
+pub fn derived_tilt_deg(rec: &Mat3, legacy0: &Mat3) -> f64 {
+    let z = column(rec, 2);
+    let mag = z[0].clamp(-1.0, 1.0).acos().to_degrees();
+    let side = -dot(&z, &column(legacy0, 1));
+    if side < 0.0 { -mag } else { mag }
+}
+
 /// Camera rotation in the base frame: R_base_cam = R_base_end · R_end_cam.
 pub fn cam_rotation(pose: &Pose, rec: &Mat3) -> Mat3 { mat3_mul(&pose.r, rec) }
 
