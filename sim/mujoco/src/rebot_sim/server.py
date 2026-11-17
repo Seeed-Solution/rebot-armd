@@ -1093,13 +1093,13 @@ def main(argv: list[str] | None = None) -> None:
         "--aruco-board",
         default=None,
         metavar="X,Y[,YAW]",
-        help="virtual 3x4 ArUco GridBoard (aruco4x4_50 ids 0..11, 50 mm markers, 10 mm gap) lying on the "
+        help="virtual 4x3 ArUco GridBoard (4 columns x 3 rows, aruco4x4_50 ids 0..11, 25 mm markers, 5 mm gap) lying on the "
         "table, centre at base X,Y (m), turned YAW deg about base z; the aruco pipeline reports its markers",
     )
     parser.add_argument(
         "--aruco-marker-m",
         type=float,
-        default=0.05,
+        default=0.025,
         help="marker side of the virtual board (m); the gap is 0.2 x the side",
     )
     parser.add_argument(

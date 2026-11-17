@@ -1097,9 +1097,9 @@ class CameraRig:
         # virtual GridBoard (--aruco-board): {"x", "y", "yaw_deg", "side_m", "noise_px", "seed"} or None
         board = cfg.get("aruco_board")
         if board:
-            from .aruco import Board
+            from .aruco import SIDE_M as BOARD_SIDE_M, Board
 
-            self.board = Board(board["x"], board["y"], board.get("yaw_deg", 0.0), board.get("z", 0.0), board.get("side_m", 0.05))
+            self.board = Board(board["x"], board["y"], board.get("yaw_deg", 0.0), board.get("z", 0.0), board.get("side_m", BOARD_SIDE_M))
             self.board_noise = (float(board.get("noise_px", 0.0)), int(board.get("seed", 0)))
         else:
             self.board, self.board_noise = None, (0.0, 0)

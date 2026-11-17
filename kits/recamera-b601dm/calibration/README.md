@@ -68,10 +68,12 @@ recalibrate); `camera_mounts.json` and the profile's `flip` / `rot_deg` / `tilt_
 not used for the camera rotation. Lens distortion is used by rebot-vision's marker poses, not by
 the grasp geometry.
 
-Board (the wizard prints it; the simulator's `--aruco-board` uses the same layout): 3 columns x
-4 rows of aruco4x4_50 markers, ids 0..11 in reading order (id = row * 3 + col, row 0 at the top
-of the page), marker side 50 mm, gap 10 mm (0.2 x side). Board frame: origin at the board
-centre, x right on the page, y down the page, z into the table. Marker corners in rebot-vision's
+Board (the wizard prints it; the simulator's `--aruco-board` uses the same layout): 4 columns x
+3 rows (landscape, as the 16:9 image) of aruco4x4_50 markers, ids 0..11 in reading order
+(id = row * 4 + col, row 0 at the top of the page, col 0 at the left), marker side 25 mm by
+default, gap 5 mm (0.2 x side), board about 115 x 85 mm. Board frame: origin at the board
+centre, x right on the page, y down the page, z into the table; the printed "up" arrow points
+to the page top (board -y). Marker corners in rebot-vision's
 order: bottom-left, bottom-right, top-right, top-left of the printed marker (marker frame x right,
 y down).
 
@@ -79,4 +81,4 @@ y down).
 
 每次写入前先在 `/userdata/rebot-teleop/calibration-backups/<UTC 时间>/` 保存备份；WS `/api/v1/calibration/restore {"backup": "<名称>"}` 恢复备份，`GET /api/v1/calibration` 列出备份。`calibration.json` 含 `q_end_cam` 期间，抓取设置中的 `camera_tilt_deg`、`fx_px`、`fy_px`、`cx_px`、`cy_px`、`image_size_px` 不能修改（恢复备份或重新标定）；相机旋转不再使用 `camera_mounts.json` 与 profile 的 `flip` / `rot_deg` / `tilt_deg`。镜头畸变用于 rebot-vision 的标记位姿，不用于抓取几何。
 
-标定板（向导生成打印页；仿真器 `--aruco-board` 使用相同布局）：3 列 x 4 行 aruco4x4_50 标记，id 0..11 按阅读顺序（id = 行 * 3 + 列，第 0 行在页面顶部），标记边长 50 mm，间隔 10 mm（0.2 倍边长）。标定板坐标系：原点在板中心，x 沿页面向右，y 沿页面向下，z 指向桌面内。标记角点顺序同 rebot-vision：打印标记的左下、右下、右上、左上（标记坐标系 x 向右、y 向下）。
+标定板（向导生成打印页；仿真器 `--aruco-board` 使用相同布局）：4 列 x 3 行（横向，与 16:9 画面一致）aruco4x4_50 标记，id 0..11 按阅读顺序（id = 行 * 4 + 列，第 0 行在页面顶部，第 0 列在左侧），默认标记边长 25 mm，间隔 5 mm（0.2 倍边长），整板约 115 x 85 mm。标定板坐标系：原点在板中心，x 沿页面向右，y 沿页面向下，z 指向桌面内；打印的 "up" 箭头指向页面顶部（板 -y）。标记角点顺序同 rebot-vision：打印标记的左下、右下、右上、左上（标记坐标系 x 向右、y 向下）。

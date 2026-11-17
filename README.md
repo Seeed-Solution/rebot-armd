@@ -487,14 +487,16 @@ on a printed ArUco board and hands the result to armd (needs `capabilities.calib
 older armd builds show an update message; 6-axis B601 only). The manual hand-eye drawer stays
 available under **Advanced**.
 
-1. **Board**: print the 3 x 4 GridBoard (ArUco `aruco4x4_50` ids 0–11, 50 mm markers, gap 1/5 of
-   the marker side, printable SVG with a 100 mm ruler and an arrow) at 100 %, measure the marker
+1. **Board**: print the GridBoard (4 columns x 3 rows, ArUco `aruco4x4_50` ids 0–11 in reading
+   order, 25 mm markers, gap 1/5 of the marker side, about 115 x 85 mm; printable SVG with a 100 mm
+   ruler and an "up" arrow) at 100 %, measure the marker
    side and enter it with the board thickness (default 0.5 mm). Lay it flat, arrow pointing away
    from the arm.
 2. **Place**: jog the camera to about 0.3 m above the board with at least 6 whole markers in view
    and capture the start view. The board pose is estimated with nominal values (fx 824 px at
    640x360, the current `camera_mount`) and about 20 look-at poses are generated: camera
-   0.18–0.35 m from the board, view tilt 0–30° in several azimuths, roll ±15°, at least 6
+   0.18–0.35 m from the board (candidates at 0.18, 0.20, 0.23, 0.26, 0.30, 0.35 m; with the v8 mount
+   the clearance rule removes the 0.18 m ones, the self-test uses 0.20–0.35 m), view tilt 0–30° in several azimuths, roll ±15°, at least 6
    predicted visible markers, tool points at least 0.10 m above the board plane, each transition
    checked with the cockpit IK at points 1 cm / 3° apart (no branch flip, joint limits).
 3. **Capture**: each pose is a `move_to` at 0.03 m/s and 0.3 rad/s, then still for 0.3 s, then one

@@ -45,19 +45,19 @@ const gateStr = (gs) => gs.map((g) => `${g.key}=${g.ok ? 'ok' : 'FAIL'}(${typeof
 
 // ---- truth
 const Ktrue = { fx: 824, fy: 821, cx: 326, cy: 176, k1: -0.1, k2: 0 };
-const board = CW.makeBoard({ markerSide: 0.05 });
+const board = CW.makeBoard(); // default 4 x 3, 25 mm markers, 5 mm gap (115 x 85 mm)
 const thickness = 0.0005, tableZ = 0.0;
-// board on the table, arrow (board y) pointing away from the arm turned 10 deg: board x = long side ~ -Y_base
+// board on the table, "up" arrow (board -y) pointing away from the arm turned 10 deg: board x = long
+// side ~ -Y_base, board z into the table
 const YAW = -80 / D;
-const Tbb = make(CW.rpyR(0, 0, YAW), [0.30, 0.02, tableZ + thickness]);
+const Tbb = make(mul(CW.rpyR(0, 0, YAW), CW.rpyR(Math.PI, 0, 0)), [0.30, 0.02, tableZ + thickness]);
 // v8-like mount: optical axis pitched 38 deg toward the jaws, 1.5 deg roll, lens behind and above the tips
 const Rmount = mul(mul(VIK.camMount(false, 0), rodrigues([-38 / D, 0, 0])), rodrigues([0, 0, 1.5 / D]));
 const Xtrue = make(Rmount, [-0.085, 0.004, 0.052]);
-// start pose: camera 0.33 m above the board looking straight down, image centre between rows 0 and 1
-// (a 3-row board centred in a 640x360 image at 0.3 m shows one row only)
+// start pose: camera 0.30 m above the board centre looking straight down (the whole board in view),
 // image x along the board's long axis (board x)
-const camDown = (h) => { const z = [0, 0, -1], x = [Math.cos(YAW), Math.sin(YAW), 0], y = [z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0]]; return make([[x[0], y[0], z[0]], [x[1], y[1], z[1]], [x[2], y[2], z[2]]], [0.30 - 0.03 * Math.sin(YAW), 0.02 + 0.03 * Math.cos(YAW), h]); };
-const T0 = mul(camDown(0.33), inv(Xtrue));
+const camDown = (h) => { const z = [0, 0, -1], x = [Math.cos(YAW), Math.sin(YAW), 0], y = [z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0]]; return make([[x[0], y[0], z[0]], [x[1], y[1], z[1]], [x[2], y[2], z[2]]], [0.30, 0.02, h]); };
+const T0 = mul(camDown(0.30), inv(Xtrue));
 let q0 = null;
 for (let k = 0; k < 400 && !q0; k++) { // IK from random seeds (deterministic PRNG)
   const s = LIM.map(([a, b]) => a * 0.6 + (b - a) * 0.6 * rnd());
@@ -109,8 +109,9 @@ const poses = gen.poses;
     prevT = p.T; prevQ = p.q;
   }
   const az = new Set(poses.filter((p) => p.tiltDeg > 0).map((p) => p.azDeg));
+  const byDist = {}; for (const p of poses) byDist[p.dist] = (byDist[p.dist] || 0) + 1;
   check('g. generator pose count / limits', poses.length >= 20 && dmin >= 0.18 - 1e-3 && dmax <= 0.35 + 1e-3 && clr >= 0.10 - 1e-3 && flips === 0 && az.size >= 2,
-    `n=${poses.length} cam-board ${dmin.toFixed(3)}..${dmax.toFixed(3)} m, min tool clearance ${clr.toFixed(3)} m, transition re-check failures ${flips}, tilt azimuths ${[...az].join('/')} deg, ${genMs} ms; stats ${JSON.stringify(gen.stats)}`);
+    `n=${poses.length} cam-board ${dmin.toFixed(3)}..${dmax.toFixed(3)} m, min tool clearance ${clr.toFixed(3)} m, transition re-check failures ${flips}, tilt azimuths ${[...az].join('/')} deg, poses per distance ${JSON.stringify(byDist)}, min predicted markers ${Math.min(...poses.map((p) => p.markers))}, ${genMs} ms; stats ${JSON.stringify(gen.stats)}`);
 }
 
 // ---- b. intrinsics from the generated views (the start view + 20)
@@ -135,7 +136,8 @@ const views = qs.map((q) => synth(q));
     const p = CW.solvePnP(obj, img, Ktrue), Ttrue = mul(inv(mul(fk(q), Xtrue)), Tbb), Tp = make(p.R, p.t);
     pe = Math.max(pe, posErr(Tp, Ttrue)); re = Math.max(re, rotErr(Tp, Ttrue));
   }
-  check('c. PnP 10 views, 0.3 px', pe < 0.002 && re < 0.3, `max ${(pe * 1000).toFixed(3)} mm / ${re.toFixed(3)} deg`);
+  // 0.6 deg: a 115 x 85 mm board (25 mm markers) gives twice the rotation noise of the former 230 x 170 mm one
+  check('c. PnP 10 views, 0.3 px', pe < 0.002 && re < 0.6, `max ${(pe * 1000).toFixed(3)} mm / ${re.toFixed(3)} deg`);
 }
 
 // ---- d / e. full solve: hand-eye and table
@@ -208,8 +210,8 @@ const solveViews = views;
 
 // ---- board SVG
 {
-  const svg = CW.boardSvg(CW.makeBoard({ markerSide: 0.05 }));
-  check('board SVG', svg.startsWith('<svg') && (svg.match(/fill="#000"/g) || []).length >= 12 && svg.includes('100 mm'), `${svg.length} bytes, 230 x 170 mm board`);
+  const bd = CW.makeBoard(), svg = CW.boardSvg(bd);
+  check('board SVG', svg.startsWith('<svg') && (svg.match(/fill="#000"/g) || []).length >= 12 && svg.includes('100 mm') && Math.abs(bd.width - 0.115) < 1e-9 && Math.abs(bd.height - 0.085) < 1e-9 && bd.byId.get(3).row === 0 && bd.byId.get(3).col === 3, `${svg.length} bytes, ${bd.cols} x ${bd.rows}, ${(bd.width * 1000).toFixed(0)} x ${(bd.height * 1000).toFixed(0)} mm board, id 3 at row 0 col 3: ${bd.byId.get(3).row},${bd.byId.get(3).col}`);
 }
 console.log(fails ? `${fails} checks failed` : 'all checks passed');
 process.exit(fails ? 1 : 0);

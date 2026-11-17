@@ -1,8 +1,9 @@
 """Virtual ArUco GridBoard on the table and rebot-vision's `aruco` output for it (numpy only).
 
-Board (calibration wizard, W2): 3 columns x 4 rows of aruco4x4_50 markers, ids 0..11 in reading
-order (id = row * 3 + col, row 0 at the top of the printed page, col 0 at the left), marker side
-`side_m` (default 0.05 m), gap 0.2 * side (10 mm). Board frame (= the page): origin at the board
+Board (calibration wizard): 4 columns x 3 rows of aruco4x4_50 markers (landscape, as the 16:9
+image), ids 0..11 in reading order (id = row * 4 + col, row 0 at the top of the printed page,
+col 0 at the left), marker side `side_m` (default 0.025 m), gap 0.2 * side (5 mm); board about
+115 x 85 mm at the default side. Board frame (= the page): origin at the board
 centre, x to the right of the page, y down the page, z into the table (x, y, z right-handed).
 On the table with yaw 0 the page's x is base +x and its y is base -y (the "up" arrow points to
 base +y); `yaw` turns the board about base z.
@@ -23,7 +24,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-COLS, ROWS = 3, 4
+COLS, ROWS = 4, 3
+SIDE_M = 0.025
 IDS = tuple(range(COLS * ROWS))
 CORNER_SIGNS = np.array([(-1.0, 1.0), (1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)])
 SIZE = (640, 360)
@@ -35,14 +37,14 @@ class Board:
     y: float
     yaw_deg: float = 0.0
     z: float = 0.0
-    side_m: float = 0.05
+    side_m: float = SIDE_M
 
     @property
     def gap_m(self) -> float:
         return 0.2 * self.side_m
 
     @classmethod
-    def parse(cls, text: str, z: float = 0.0, side_m: float = 0.05) -> "Board":
+    def parse(cls, text: str, z: float = 0.0, side_m: float = SIDE_M) -> "Board":
         v = [float(t) for t in text.split(",")]
         if len(v) not in (2, 3) or not all(math.isfinite(t) for t in v):
             raise ValueError("--aruco-board needs X,Y[,YAW_DEG]")
@@ -55,7 +57,7 @@ class Board:
         return np.column_stack([x, np.cross(z, x), z]), np.array([self.x, self.y, self.z])
 
 
-def board_object_points(side_m: float = 0.05) -> dict[int, np.ndarray]:
+def board_object_points(side_m: float = SIDE_M) -> dict[int, np.ndarray]:
     """Marker id -> its 4 corners (4 x 3) in the board frame (z = 0)."""
     gap, pitch = 0.2 * side_m, 1.2 * side_m
     w, h = COLS * side_m + (COLS - 1) * gap, ROWS * side_m + (ROWS - 1) * gap

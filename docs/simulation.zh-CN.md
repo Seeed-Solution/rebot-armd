@@ -39,7 +39,7 @@ cockpit 地址 `http://127.0.0.1:8765/`。`--follower-port` 默认 `udp://127.0.
 | `--profile P`、`--camera-rot-deg`、`--camera-tilt-deg`、`--camera-offset X,Y,Z` | 相机安装：取 profile 的 `camera_mount`（默认套件 profile），再按这些参数覆盖 |
 | `--camera-q W,X,Y,Z` | `camera_mount.q_end_cam`（R_end_cam 单位四元数，模长与 1 相差不超过 1e-3）；代替 flip / rot / tilt；默认取 profile 的 `q_end_cam` |
 | `--fx F` | 真实焦距，640x360 下的像素值（100..5000，默认 824.4）：渲染视场、检测、标记、深度与 `/sim/camera` 均按此值 |
-| `--aruco-board X,Y[,YAW]`、`--aruco-marker-m S`、`--marker-noise-px N` | 桌面上的虚拟 ArUco GridBoard（见[标定板与内参接口](#标定板与内参接口)）；标记边长 S m（默认 0.05），角点高斯噪声 N px（默认 0，按 `--seed` 与帧号取种子） |
+| `--aruco-board X,Y[,YAW]`、`--aruco-marker-m S`、`--marker-noise-px N` | 桌面上的虚拟 ArUco GridBoard（见[标定板与内参接口](#标定板与内参接口)）；标记边长 S m（默认 0.025），角点高斯噪声 N px（默认 0，按 `--seed` 与帧号取种子） |
 | `--det-jitter-px`、`--det-size-jitter`、`--det-drop-rate`、`--det-latency-ms`、`--det-false-rate`、`--det-angle-jitter-deg`、`--det-noise-seed` | 检测噪声（默认全部关闭），见“检测噪声与朝向” |
 | `--scene-stream` | 另在 `ws://<host>:<video-port>/scene` 推送固定的全景相机 |
 | `--torque-report instant\|mean` | 状态报文中的力矩：瞬时值（默认），或最近一个指令周期内的平均值（滑动窗口；见「摩擦辨识」） |
@@ -138,7 +138,7 @@ rebot-vision 感知接口版本 2（[detection_api.md](detection_api.md)）：`G
 
 #### 标定板与内参接口
 
-`--aruco-board X,Y[,YAW]` 在桌面（z = 0）上放置虚拟 GridBoard：3 列 x 4 行 aruco4x4_50 标记，id 0..11（id = 行 * 3 + 列，第 0 行在页面顶部），边长 0.05 m（`--aruco-marker-m`），间隔 0.2 倍边长；中心位于基座 (X, Y)，板 x 轴为基座 x 绕基座 z 转 YAW 度，板 y 轴沿页面向下（yaw 0 时为基座 −y），z 指向桌面内（布局见 `kits/recamera-b601dm/calibration/README.md`）。标定板不出现在视频中；每帧将其 48 个角点经真值相机（安装、`q_end_cam`、`--fx`）投影，加上 `--marker-noise-px` 高斯噪声，只报告四个角点都在相机前方且位于 640x360 内的标记（不模拟夹爪遮挡）。`aruco` 流水线按 rebot-vision 的格式返回：`{"id", "margin": 100, "center", "corners": [[u, v] x 4]（640x360 像素；打印标记的左下、右下、右上、左上）, "pose": {"t", "r_deg", "error"}}`，`count` 为标记数。`pose` 由报告的角点与估计内参（见下）及标记边长计算，与 rebot-vision 用其自身内参的计算方式相同：角点去畸变，求到标记正方形的单应，得到 R | t，`r_deg` 为 R = Rz(yaw) Ry(pitch) Rx(roll) 的 roll、pitch、yaw；`error` 为归一化像平面上的均方重投影误差（rebot-vision 报告其求解器的物方误差）。
+`--aruco-board X,Y[,YAW]` 在桌面（z = 0）上放置虚拟 GridBoard：4 列 x 3 行（横向）aruco4x4_50 标记，id 0..11（id = 行 * 4 + 列，第 0 行在页面顶部，第 0 列在左侧），边长 0.025 m（`--aruco-marker-m`），间隔 0.2 倍边长（默认边长下 115 x 85 mm）；中心位于基座 (X, Y)，板 x 轴为基座 x 绕基座 z 转 YAW 度，板 y 轴沿页面向下（yaw 0 时为基座 −y），z 指向桌面内（布局见 `kits/recamera-b601dm/calibration/README.md`）。标定板不出现在视频中；每帧将其 48 个角点经真值相机（安装、`q_end_cam`、`--fx`）投影，加上 `--marker-noise-px` 高斯噪声，只报告四个角点都在相机前方且位于 640x360 内的标记（不模拟夹爪遮挡）。`aruco` 流水线按 rebot-vision 的格式返回：`{"id", "margin": 100, "center", "corners": [[u, v] x 4]（640x360 像素；打印标记的左下、右下、右上、左上）, "pose": {"t", "r_deg", "error"}}`，`count` 为标记数。`pose` 由报告的角点与估计内参（见下）及标记边长计算，与 rebot-vision 用其自身内参的计算方式相同：角点去畸变，求到标记正方形的单应，得到 R | t，`r_deg` 为 R = Rz(yaw) Ry(pitch) Rx(roll) 的 roll、pitch、yaw；`error` 为归一化像平面上的均方重投影误差（rebot-vision 报告其求解器的物方误差）。
 
 `GET /api/calibration/intrinsics` / `PUT /api/calibration/intrinsics` 与 rebot-vision 接口一致（[detection_api.md](detection_api.md)）：请求体 `{fx, fy, cx, cy, k1, k2, p1, p2, k3, width: 640, height: 360, marker_size?, expected_revision}` 经校验（fx、fy ∈ [100, 5000]，0 < cx < 640，0 < cy < 360，|k| ≤ 10，|p| ≤ 1，marker_size ∈ (0, 1]；未知字段返回 400 并带 `field`），`expected_revision` 过期返回 409 `REVISION_MISMATCH`，每次 PUT 使 `revision` 加 1。这些值是估计内参（初值 fx = fy = 824.4，cx 320，cy 180，无畸变，marker_size 0.05），只用于标记位姿；真值仍是相机模型。仿真器不限制回环来源，也不写盘。`/api/mode` 以 `intrinsics` 报告它们。
 

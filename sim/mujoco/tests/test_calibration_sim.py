@@ -22,15 +22,17 @@ DOWN = np.column_stack([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])  #
 
 
 def test_board_geometry_and_ids():
-    pts = aruco.board_object_points(0.05)
+    assert aruco.Board(0.0, 0.0).side_m == 0.025 and aruco.board_object_points().keys() == aruco.board_object_points(0.025).keys()
+    pts = aruco.board_object_points(0.025)
     assert sorted(pts) == list(range(12))
     allp = np.concatenate(list(pts.values()))
     assert allp.shape == (48, 3)
-    w, h = 3 * 0.05 + 2 * 0.01, 4 * 0.05 + 3 * 0.01
+    w, h = 4 * 0.025 + 3 * 0.005, 3 * 0.025 + 2 * 0.005  # 115 x 85 mm, landscape
     assert np.allclose(allp[:, 0].min(), -w / 2) and np.allclose(allp[:, 1].max(), h / 2)
-    # id 0 top-left of the page, id 2 top-right, id 9 bottom-left; corner 3 = top-left of the marker
-    assert np.allclose(pts[0][3][:2], [-w / 2, -h / 2]) and np.allclose(pts[2][2][:2], [w / 2, -h / 2])
-    assert np.allclose(pts[9][0][:2], [-w / 2, h / 2])
+    assert np.allclose(np.ptp(allp[:, 0]), w) and np.allclose(np.ptp(allp[:, 1]), h)
+    # id = row * 4 + col: id 0 top-left of the page, id 3 top-right, id 8 bottom-left; corner 3 = top-left
+    assert np.allclose(pts[0][3][:2], [-w / 2, -h / 2]) and np.allclose(pts[3][2][:2], [w / 2, -h / 2])
+    assert np.allclose(pts[8][0][:2], [-w / 2, h / 2]) and np.allclose(pts[11][1][:2], [w / 2, h / 2])
     # yaw 0 on the table: page x = base +x, page y = base -y, z down
     r, o = aruco.Board(0.25, 0.0).pose()
     assert np.allclose(r, DOWN) and np.allclose(o, [0.25, 0.0, 0.0])
@@ -71,22 +73,22 @@ def test_marker_pose_with_true_and_estimated_intrinsics():
     origin = np.array([0.20, 0.0, 0.5])
     m = next(x for x in aruco.visible_markers(board, DOWN, origin, F) if x["id"] == 4)
     truth = {"fx": F, "fy": F, "cx": 320.0, "cy": 180.0}
-    p = aruco.marker_pose(m["corners"], truth, 0.05)
+    p = aruco.marker_pose(m["corners"], truth, 0.025)
     centre = aruco.board_world_points(board)[4].mean(axis=0)
     want_t = (centre - origin) @ DOWN
     assert np.allclose(p["t"], want_t, atol=2e-4), (p, want_t)
     assert np.allclose(p["r_deg"], [0.0, 0.0, 0.0], atol=0.05) and p["error"] < 1e-10
     # estimated fx 5 % low: same direction, distance scaled by fx_est / fx_true
-    est = aruco.marker_pose(m["corners"], {**truth, "fx": 0.95 * F, "fy": 0.95 * F}, 0.05)
+    est = aruco.marker_pose(m["corners"], {**truth, "fx": 0.95 * F, "fy": 0.95 * F}, 0.025)
     assert est["t"][2] == pytest.approx(0.95 * want_t[2], abs=2e-3)
     # tilted view: the rotation comes back
     tilt = cam.axis_r((1.0, 0.0, 0.0), math.radians(20.0))
     r = DOWN @ tilt
     m = aruco.visible_markers(board, r, np.array([0.25, -0.15, 0.45]), F)[0]
-    q = aruco.marker_pose(m["corners"], truth, 0.05)
+    q = aruco.marker_pose(m["corners"], truth, 0.025)
     assert abs(abs(q["r_deg"][0]) - 20.0) < 0.1, q
     # JSON entry as rebot-vision writes it
-    j = aruco.marker_json(m, truth, 0.05)
+    j = aruco.marker_json(m, truth, 0.025)
     assert set(j) == {"id", "margin", "center", "corners", "pose"} and len(j["corners"]) == 4
     assert set(j["pose"]) == {"t", "r_deg", "error"}
 
@@ -163,7 +165,7 @@ def test_intrinsics_get_put_revision():
     res = p.result(frame, ["aruco"])
     assert res["pipelines"]["aruco"]["ran"] and res["count"] == 12 and len(res["markers"]) == 12
     m0 = res["markers"][0]
-    assert m0["pose"]["t"][2] == pytest.approx(0.6 * 801.0 / F * 0.049 / 0.05, abs=2e-3)
+    assert m0["pose"]["t"][2] == pytest.approx(0.6 * 801.0 / F * 0.049 / 0.025, abs=2e-3)
     assert p.result(frame, ["yolo"])["markers"] == [], "aruco did not run"
 
 

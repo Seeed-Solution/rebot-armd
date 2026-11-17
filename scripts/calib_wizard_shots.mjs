@@ -54,9 +54,9 @@ function setupSim() {
     W.K = { fx: 824, fy: 821, cx: 326, cy: 176, k1: -0.1, k2: 0 };
     W.X = CW.make(CW.mul(CW.mul(VIK.camMount(false, 0), CW.rodrigues([-38 / D, 0, 0])), CW.rodrigues([0, 0, 1.5 / D])), [-0.085, 0.004, 0.052]);
     const yaw = -80 / D;
-    W.Tbb = CW.make(CW.rpyR(0, 0, yaw), [0.30, 0.02, 0.0005]);
+    W.Tbb = CW.make(CW.mul(CW.rpyR(0, 0, yaw), CW.rpyR(Math.PI, 0, 0)), [0.30, 0.02, 0.0005]); // board z into the table
     const x = [Math.cos(yaw), Math.sin(yaw), 0], z = [0, 0, -1], y = [z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0]];
-    const Tc = CW.make([[x[0], y[0], z[0]], [x[1], y[1], z[1]], [x[2], y[2], z[2]]], [0.30 - 0.03 * Math.sin(yaw), 0.02 + 0.03 * Math.cos(yaw), 0.33]);
+    const Tc = CW.make([[x[0], y[0], z[0]], [x[1], y[1], z[1]], [x[2], y[2], z[2]]], [0.30, 0.02, 0.30]);
     const T0 = CW.mul(Tc, CW.inv(W.X));
     let q0 = null;
     for (let k = 0; k < 400 && !q0; k++) { const s = [0, 1, 2, 3, 4, 5].map(() => (rnd() - 0.5) * 3); const r = VIK.solve(T0, s, { iters: 300 }); if (r.ok) q0 = r.q; }
@@ -96,7 +96,7 @@ function setupSim() {
     window.detTriggerReq = async () => {
       await new Promise((r) => setTimeout(r, 30));
       const G = calGripper(S.obs.positions), Tcb = CW.mul(CW.inv(CW.mul(G, W.X)), W.Tbb), R = CW.rotOf(Tcb), t = CW.posOf(Tcb), markers = [];
-      const board = CW.makeBoard({ markerSide: 0.05 });
+      const board = CW.makeBoard({ markerSide: 0.025 });
       for (const m of board.markers) {
         const px = m.corners.map((c) => CW.project(W.K, R, t, c));
         if (px.every(([u, v, zz]) => zz > 0 && u >= 4 && u <= 636 && v >= 4 && v <= 356)) markers.push({ id: m.id, corners: px.map(([u, v]) => [u + 0.3 * gauss(), v + 0.3 * gauss()]) });
@@ -149,7 +149,7 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     const hasSvg = await page.evaluate(() => !!document.querySelector('#cwiz-body .cwiz-board svg') && !!$('cwiz-next'));
     if (!hasSvg) fail('board svg / next');
     await shot('1_board');
-    await page.fill('#cwiz-side', '49.6');
+    await page.fill('#cwiz-side', '24.8');
     await page.click('#cwiz-next');
     // 2 place
     await shot('2_place');
@@ -185,7 +185,7 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     await page.click('#cwiz-apply');
     await waitW(page, () => CWZ.step === 'applied' && !CWZ.busy, 10000, "() => CWZ.step === 'applied' && !CWZ.busy");
     const body = await page.evaluate(() => { const b = __SIM.calls.filter(([p, x]) => p === '/api/v1/calibration/apply' && x.dry_run === false)[0][1]; return { keys: Object.keys(b).sort(), intr: Object.keys(b.intrinsics).sort(), mount: Object.keys(b.camera_mount).sort(), w: b.intrinsics.width, h: b.intrinsics.height, ms: b.intrinsics.marker_size }; });
-    if (body.w !== 640 || body.h !== 360 || Math.abs(body.ms - 0.0496) > 1e-9 || body.mount.join() !== 'offset_m,q_end_cam') fail('apply body ' + JSON.stringify(body));
+    if (body.w !== 640 || body.h !== 360 || Math.abs(body.ms - 0.0248) > 1e-9 || body.mount.join() !== 'offset_m,q_end_cam') fail('apply body ' + JSON.stringify(body));
     await shot('6_applied', `armed label "${armed}", apply body keys ${body.keys} intrinsics ${body.intr}`);
     await page.click('#cwiz-restore'); await page.click('#cwiz-restore');
     await waitW(page, () => CWZ.applied && CWZ.applied.restoredFrom, 10000, '() => CWZ.applied && CWZ.applied.restoredFrom');

@@ -4604,7 +4604,7 @@ function initCalib() {
    ================================================================= */
 const CW_STEPS = ['board', 'place', 'capture', 'solve', 'review', 'applied'];
 const CW_SPEED = { linear: 0.03, angular: 0.3 };
-const CWZ = { open: false, step: 'board', CW: null, markerMm: 50, thickMm: 0.5, board: null, views: [], plan: [], idx: 0, target: 20,
+const CWZ = { open: false, step: 'board', CW: null, markerMm: 25, thickMm: 0.5, board: null, views: [], plan: [], idx: 0, target: 20,
   runAll: false, running: false, stopReq: false, lease: null, est: null, refined: false, solve: null, dry: null, applied: null,
   status: '', statusKind: '', armedUntil: 0, previewQ: null, busy: false, live: null };
 const cwSupported = () => !!(S.caps && S.caps.calibration_apply);

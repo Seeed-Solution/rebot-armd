@@ -154,44 +154,49 @@ export function undistort(K, u, v) {
 // ArUco DICT_4X4_50 ids 0..11, 4x4 inner bits row-major from the top-left, MSB first, 1 = white
 // (from OpenCV 4.x cv2.aruco.getPredefinedDictionary(DICT_4X4_50).generateImageMarker).
 export const DICT_4X4_50 = [46386, 3994, 13101, 39238, 21662, 31181, 40494, 50418, 65242, 53078, 63889, 4519];
-/* GridBoard, 3 rows x 4 columns, printed landscape. Board frame: origin at the board centre, x to the
-   right along the columns, y toward the top row (the "up" arrow), z out of the paper (up on the
-   table). id = row * 4 + column, row 0 at the top. Marker corners in rebot-vision's (apriltag) order
-   k0 bottom-left, k1 bottom-right, k2 top-right, k3 top-left of the printed marker; the solver also
+/* GridBoard, 4 columns x 3 rows, printed landscape (as the 16:9 image); the simulator's virtual board
+   (sim/mujoco/src/rebot_sim/aruco.py) has the same layout. id = row * 4 + column, row 0 at the top of
+   the page, column 0 at the left. Default marker side 25 mm, gap 0.2 x side (5 mm): about 115 x 85 mm.
+   Board frame: origin at the board centre, x to the right of the page, y down the page, z into the
+   table (the "up" arrow points to -y). Marker corners in rebot-vision's (AprilTag) order k0
+   bottom-left, k1 bottom-right, k2 top-right, k3 top-left of the printed marker; the solver also
    detects other cyclic orders (detectCornerOrder). The gap scales with the measured marker side. */
-export function makeBoard({ markerSide = 0.05, gapRatio = 0.2, cols = 4, rows = 3 } = {}) {
+export const BOARD_DEFAULT = Object.freeze({ cols: 4, rows: 3, markerSide: 0.025, gapRatio: 0.2 });
+export function makeBoard({ markerSide = BOARD_DEFAULT.markerSide, gapRatio = BOARD_DEFAULT.gapRatio, cols = BOARD_DEFAULT.cols, rows = BOARD_DEFAULT.rows } = {}) {
   const L = markerSide, gap = L * gapRatio, pitch = L + gap, h = L / 2;
   const markers = [];
   for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
-    const id = r * cols + c, cx = (c - (cols - 1) / 2) * pitch, cy = ((rows - 1) / 2 - r) * pitch;
-    markers.push({ id, row: r, col: c, center: [cx, cy, 0], corners: [[cx - h, cy - h, 0], [cx + h, cy - h, 0], [cx + h, cy + h, 0], [cx - h, cy + h, 0]] });
+    const id = r * cols + c, cx = (c - (cols - 1) / 2) * pitch, cy = (r - (rows - 1) / 2) * pitch;
+    markers.push({ id, row: r, col: c, center: [cx, cy, 0], corners: [[cx - h, cy + h, 0], [cx + h, cy + h, 0], [cx + h, cy - h, 0], [cx - h, cy - h, 0]] });
   }
   return { cols, rows, markerSide: L, gap, pitch, width: cols * L + (cols - 1) * gap, height: rows * L + (rows - 1) * gap, markers, byId: new Map(markers.map((m) => [m.id, m])) };
 }
-// printable SVG at 1:1 scale (mm units): markers, ids, a 100 mm ruler and an "up" arrow
+// printable SVG at 1:1 scale (mm units): title, an "up" arrow (page top = board -y), the markers with
+// their ids, a 100 mm ruler under the board
 export function boardSvg(board, { title = 'reBot calibration board' } = {}) {
   const mmL = board.markerSide * 1000, mmG = board.gap * 1000, W = board.width * 1000, H = board.height * 1000;
-  const margin = 15, pageW = W + 2 * margin, pageH = H + 2 * margin + 40, cell = mmL / 6;
+  const margin = 10, pageW = Math.max(W, 110) + 2 * margin, bx = (pageW - W) / 2, by = margin + 28, cell = mmL / 6;
+  const ry = by + H + 12, pageH = ry + 12, fs = Math.max(2, Math.min(mmG, 8) * 0.6);
   let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${pageW}mm" height="${pageH}mm" viewBox="0 0 ${pageW} ${pageH}">`;
   s += `<rect width="${pageW}" height="${pageH}" fill="#fff"/>`;
+  s += `<text x="${margin}" y="${margin + 4}" font-size="4.5" font-family="sans-serif">${title}</text>`;
+  s += `<text x="${margin}" y="${margin + 9.5}" font-size="3" font-family="sans-serif">ArUco 4x4_50 ids 0-${board.markers.length - 1}, ${board.cols} x ${board.rows}, marker ${mmL.toFixed(1)} mm, gap ${mmG.toFixed(1)} mm</text>`;
+  const ax = pageW / 2;
+  s += `<path d="M ${ax} ${margin + 12} l -5 8 h 3.5 v 6 h 3 v -6 h 3.5 z" fill="#000"/>`;
+  s += `<text x="${ax + 7}" y="${margin + 19}" font-size="3" font-family="sans-serif">up</text>`;
   for (const m of board.markers) {
-    const x0 = margin + m.col * (mmL + mmG), y0 = margin + 22 + m.row * (mmL + mmG), code = DICT_4X4_50[m.id];
+    const x0 = bx + m.col * (mmL + mmG), y0 = by + m.row * (mmL + mmG), code = DICT_4X4_50[m.id];
     s += `<rect x="${x0}" y="${y0}" width="${mmL}" height="${mmL}" fill="#000"/>`;
     for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) {
       if ((code >> (15 - (r * 4 + c))) & 1) s += `<rect x="${(x0 + (c + 1) * cell).toFixed(3)}" y="${(y0 + (r + 1) * cell).toFixed(3)}" width="${cell.toFixed(3)}" height="${cell.toFixed(3)}" fill="#fff"/>`;
     }
-    s += `<text x="${x0 + mmL / 2}" y="${y0 + mmL + Math.min(mmG, 8) * 0.75}" font-size="${Math.min(mmG, 8) * 0.6}" text-anchor="middle" font-family="sans-serif" fill="#666">${m.id}</text>`;
+    s += `<text x="${x0 + mmL / 2}" y="${y0 + mmL + fs * 1.1}" font-size="${fs}" text-anchor="middle" font-family="sans-serif" fill="#666">${m.id}</text>`;
   }
-  // up arrow (board +y) and title
-  const ax = pageW / 2;
-  s += `<path d="M ${ax} ${margin} l -5 8 h 3.5 v 8 h 3 v -8 h 3.5 z" fill="#000"/>`;
-  s += `<text x="${margin}" y="${margin + 6}" font-size="5" font-family="sans-serif">${title}</text>`;
-  s += `<text x="${pageW - margin}" y="${margin + 6}" font-size="4" text-anchor="end" font-family="sans-serif">ArUco 4x4_50 ids 0-${board.markers.length - 1}, marker ${mmL.toFixed(1)} mm, gap ${mmG.toFixed(1)} mm</text>`;
   // 100 mm ruler
-  const ry = pageH - 14;
-  s += `<path d="M ${margin} ${ry} h 100" stroke="#000" stroke-width="0.4"/>`;
-  for (let k = 0; k <= 10; k++) s += `<path d="M ${margin + 10 * k} ${ry} v ${k % 5 ? -2.5 : -4}" stroke="#000" stroke-width="0.3"/>`;
-  s += `<text x="${margin + 104}" y="${ry}" font-size="4" font-family="sans-serif">100 mm: measure after printing (no page scaling)</text>`;
+  const rx = (pageW - 100) / 2;
+  s += `<path d="M ${rx} ${ry} h 100" stroke="#000" stroke-width="0.4"/>`;
+  for (let k = 0; k <= 10; k++) s += `<path d="M ${rx + 10 * k} ${ry} v ${k % 5 ? -2.5 : -4}" stroke="#000" stroke-width="0.3"/>`;
+  s += `<text x="${rx}" y="${ry + 5}" font-size="3" font-family="sans-serif">100 mm: measure after printing (no page scaling)</text>`;
   return s + '</svg>';
 }
 
@@ -604,7 +609,7 @@ export function checkTransition(A, qA, B, { ik, X, plane, clearance, lo, hi, ste
    ordered as a nearest-neighbour tour in joint space from q0.
    Returns { poses: [{ T, q, camPos, dist, tiltDeg, azDeg, rollDeg, aim, markers }], stats }. */
 export function generatePoses({ Tbb, board, K = NOMINAL, X, q0, fk, ik, lo = null, hi = null, n = 20, size = IMAGE,
-  dists = [0.24, 0.28, 0.32, 0.35], tilts = [0, 10, 20, 30], azimuths = 8, rolls = [0, 15, -15],
+  dists = [0.18, 0.20, 0.23, 0.26, 0.30, 0.35], tilts = [0, 10, 20, 30], azimuths = 8, rolls = [0, 15, -15],
   aims = [[0.5, 0.5], [0.3, 0.35], [0.7, 0.35], [0.3, 0.65], [0.7, 0.65]], minMarkers = GATES.minMarkers,
   clearance = 0.10, distRange = [0.18, 0.35], exclude = [] }) {
   const Rb = rotOf(Tbb), c = posOf(Tbb);
@@ -640,7 +645,7 @@ export function generatePoses({ Tbb, board, K = NOMINAL, X, q0, fk, ik, lo = nul
     if (!s || !s.ok || (lo && s.q.some((v, i) => v < lo[i] - 1e-6 || v > hi[i] + 1e-6))) { stats.reach++; continue; }
     if (exclude.some((E) => norm3(sub3(posOf(E), pend)) < 0.01 && rotDist(rotOf(E), Rend) < 3)) continue;
     cand.push({ T, q: s.q, camPos: pc, dist: d, tiltDeg: th, azDeg: az, rollDeg: roll, aim: [au, av], markers: vis.length,
-      f: [th / 30 * Math.cos(azr), th / 30 * Math.sin(azr), (d - 0.27) / 0.08, roll / 15, (au - 0.5) * 2.5, (av - 0.5) * 2.5] });
+      f: [th / 30 * Math.cos(azr), th / 30 * Math.sin(azr), (d - 0.265) / 0.085, roll / 15, (au - 0.5) * 2.5, (av - 0.5) * 2.5] });
   }
   // farthest-point selection, seeded with the candidate nearest to the start pose
   const fd = (a, b) => Math.hypot(...a.f.map((v, k) => v - b.f[k]));
