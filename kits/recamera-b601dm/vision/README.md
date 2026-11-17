@@ -353,6 +353,15 @@ YOLO model: not in the repository or the deb. The first existing file of `vision
 `/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel` is loaded. Without a model `yolo` and `both`
 answer 409 and ArUco works.
 
+Model downloads: the official `yolo11n` detect and segment models ship with reCamera OS in
+`/usr/share/supervisor/models`. The other models rebot-vision uses are listed in
+[`models/models.tsv`](models/models.tsv) (file name, download URL, md5, license).
+`scripts/fetch_models.sh [dir] [kind ...]` downloads them and checks the md5; the default directory
+`/userdata/local/models` is one rebot-vision searches. On a PC: `scripts/fetch_models.sh ./models`, then copy
+the files to `/userdata/local/models/` on the device. The ZipDepth metric model is distilled from
+Depth-Anything-V2-Metric-Indoor-Large, whose weights are licensed CC-BY-NC-4.0; check that license before
+commercial use.
+
 Model options: command-line `--model PATH`, `--model-kind auto|detect|segment|obb` (default: auto), `--mask on|off` (default: off; decode instance segmentation masks when using a segmentation model), `--mask-max-boxes N` (1..20, default 3; max boxes for mask decoding), and `vision.json` keys `"model"`, `"model_kind": "auto"|"detect"|"segment"|"obb"`, `"mask": true|false`, and `"mask_max_boxes": 1..20`.
 When a 2-output YOLO11-seg model is loaded (e.g. `yolo11n_segment_cv181x_int8.cvimodel`), `rebot-vision` auto-detects `model.kind: "segment"`. When `--mask on` (or `vision.json` `"mask": true`), it decodes cropped instance masks for up to `mask_max_boxes` detections within a 160x160 cell budget and computes mask orientation, confidence, and grasp width.
 When an oriented bounding box (OBB) model is loaded, `rebot-vision` auto-detects (or forces via `--model-kind obb`) `model.kind: "obb"`. It supports both Layout A (Ultralytics 1-output FP32 `[1, 5 + nc, N]`) and Layout B (decoupled 9-output INT8/FP32 across 3 scale strides, interleaved or grouped, NHWC or NCHW). OBB models decode rotated boxes directly via ProbIoU NMS (the top 3000 candidates by score enter the NMS and at most 300 boxes are returned: `kObbMaxNms` / `kObbMaxDet` in `main/obb_geom.h`, Ultralytics `max_nms` 30000 / `max_det` 300 scaled for the SG2002 CPU) and provide `angle_deg`, `angle_conf`, `grasp_width_px`, `length_px`, and 4 normalised quad corners in `"obb_corners"`. Class names per model: `vision.json` catalogue `"classes"`, else a `<model stem>.names` file next to the `.cvimodel` (one name per line, as sscma's `labels.txt`), else COCO for 80-class detect / segment models, else `class_<id>`; OBB models never use COCO names (see [detection_api.md](../../../docs/detection_api.md#model-switching--模型切换)).

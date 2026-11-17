@@ -1,0 +1,5 @@
+# Models rebot-vision loads that are not part of reCamera OS. Columns (tab separated):
+# kind	file name on the device (a name rebot-vision searches, README "YOLO model")	url	md5	license	source
+obb	yolo11n_obb_cv181x_int8_fuse_qout.cvimodel	https://sensecraft-statics.seeed.cc/solution-app/rebot/models/yolo11n_obb_cv181x_int8_fuse-d9607b70.cvimodel	d9607b7039dda5981fb62b957f678bdf	AGPL-3.0 (Ultralytics YOLO11n-obb, DOTAv1 classes)	converted with TPU-MLIR, INT8, fused decoupled head
+depth	zipdepth_metric_384x224_bf16_rgb.cvimodel	https://sensecraft-statics.seeed.cc/solution-app/rebot/models/zipdepth_metric_384x224_bf16_rgb-33478718.cvimodel	3347871853ddda346e7a96d2cec50a98	MIT (ZipDepth); distilled from Depth-Anything-V2-Metric-Indoor-Large (CC-BY-NC-4.0)	BF16, RGB_PACKED uint8 input 384x224
+segment	yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel	https://sensecraft-statics.seeed.cc/solution-app/rebot/models/yolo11n_seg_384x640_cv181x_int8_fuse-5ad01b51.cvimodel	5ad01b51727c5259abc1448f2bd0cec6	AGPL-3.0 (Ultralytics YOLO11n-seg, COCO classes)	converted with TPU-MLIR, INT8, cut before the head decode (10 outputs), input 384x640
