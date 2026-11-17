@@ -2329,9 +2329,9 @@ Object.assign(I18N.zh, {
   'cw.cap.start': '开始连续运行', 'cw.cap.stop': '停止', 'cw.cap.preview': '在 3D 视图中预览位姿', 'cw.cap.solve': '求解', 'cw.cap.more': '补充位姿',
   'cw.cap.moving': '移动到位姿 {i} …', 'cw.cap.capturing': '采集位姿 {i} …', 'cw.cap.refined': '已用前 {n} 个视图重新估计，剩余位姿已更新',
   'cw.cap.aborted': '已中止：{why}', 'cw.cap.done': '位姿已全部执行',
-  'cw.abort.stop': '已按停止', 'cw.abort.hidden': '页面切到了后台', 'cw.abort.heartbeat': '遥测或心跳中断', 'cw.abort.lease': '控制权已丢失', 'cw.abort.fault': '急停或故障',
+  'cw.abort.stop': '已按停止', 'cw.abort.hidden': '页面切到了后台', 'cw.abort.heartbeat': '遥测或心跳中断', 'cw.abort.lease': '控制权已丢失', 'cw.abort.fault': '急停或故障', 'cw.abort.epoch': '控制状态已变化（停止、急停或其他客户端）', 'cw.abort.state': '机械臂不在使能状态', 'cw.abort.foreign': '有其他动作在运行', 'cw.abort.move': '移动失败，已停止', 'cw.abort.nopose': '剩余位姿都无法安全到达', 'cw.abort.timeout': '超时，已停止', 'cw.abort.error': '出错，已停止',
   'cw.pose.pending': '待执行', 'cw.pose.ok': '{m} 个标记', 'cw.pose.skip': '跳过：{why}',
-  'cw.skip.markers': '标记不足（{m} 个）', 'cw.skip.move': '移动失败（{code}）', 'cw.skip.moved': '采集时机械臂在动', 'cw.skip.det': '识别失败',
+  'cw.skip.markers': '标记不足（{m} 个）', 'cw.skip.move': '移动失败（{code}）', 'cw.skip.transition': '从当前位置过去不安全（{r}）', 'cw.skip.moved': '采集时机械臂在动', 'cw.skip.det': '识别失败',
   'cw.solve.hint': '每项检查都通过后才能应用。', 'cw.solve.run': '重新求解', 'cw.solve.review': '查看将要修改的内容', 'cw.solve.export': '下载数据',
   'cw.solve.fail': '有检查未通过：补充位姿后重新求解，或检查标定板是否平整、打印比例是否正确。',
   'cw.g.views': '有效视图数', 'cw.g.markers': '每个视图的标记数（最少）', 'cw.g.coverage': '画面 3×3 区域覆盖', 'cw.g.rms': '重投影 RMS', 'cw.g.view_rms': '单视图 RMS（最大）',
@@ -2361,9 +2361,9 @@ Object.assign(I18N.en, {
   'cw.cap.start': 'Start run', 'cw.cap.stop': 'Stop', 'cw.cap.preview': 'Preview poses in 3D', 'cw.cap.solve': 'Solve', 'cw.cap.more': 'Add poses',
   'cw.cap.moving': 'Moving to pose {i}…', 'cw.cap.capturing': 'Capturing pose {i}…', 'cw.cap.refined': 'Re-estimated from {n} views; remaining poses updated',
   'cw.cap.aborted': 'Aborted: {why}', 'cw.cap.done': 'All poses visited',
-  'cw.abort.stop': 'Stop pressed', 'cw.abort.hidden': 'page hidden', 'cw.abort.heartbeat': 'telemetry or heartbeat lost', 'cw.abort.lease': 'control lease lost', 'cw.abort.fault': 'E-stop or fault',
+  'cw.abort.stop': 'Stop pressed', 'cw.abort.hidden': 'page hidden', 'cw.abort.heartbeat': 'telemetry or heartbeat lost', 'cw.abort.lease': 'control lease lost', 'cw.abort.fault': 'E-stop or fault', 'cw.abort.epoch': 'control state changed (stop, e-stop or another client)', 'cw.abort.state': 'arm not enabled', 'cw.abort.foreign': 'another action is running', 'cw.abort.move': 'move failed, stopped', 'cw.abort.nopose': 'no remaining pose is safely reachable', 'cw.abort.timeout': 'timed out, stopped', 'cw.abort.error': 'error, stopped',
   'cw.pose.pending': 'pending', 'cw.pose.ok': '{m} markers', 'cw.pose.skip': 'skipped: {why}',
-  'cw.skip.markers': 'too few markers ({m})', 'cw.skip.move': 'move failed ({code})', 'cw.skip.moved': 'arm moved during capture', 'cw.skip.det': 'detection failed',
+  'cw.skip.markers': 'too few markers ({m})', 'cw.skip.move': 'move failed ({code})', 'cw.skip.transition': 'path from the current pose refused ({r})', 'cw.skip.moved': 'arm moved during capture', 'cw.skip.det': 'detection failed',
   'cw.solve.hint': 'Every check must pass before Apply.', 'cw.solve.run': 'Solve again', 'cw.solve.review': 'Review changes', 'cw.solve.export': 'Download data',
   'cw.solve.fail': 'Some checks failed: add poses and solve again, or check that the board is flat and printed at 100 %.',
   'cw.g.views': 'Accepted views', 'cw.g.markers': 'Markers per view (min)', 'cw.g.coverage': 'Image 3×3 cell coverage', 'cw.g.rms': 'Reprojection RMS', 'cw.g.view_rms': 'Per-view RMS (max)',
@@ -4606,7 +4606,7 @@ function initCalib() {
 const CW_STEPS = ['board', 'place', 'capture', 'solve', 'review', 'applied'];
 const CW_SPEED = { linear: 0.03, angular: 0.3 };
 const CWZ = { open: false, step: 'board', CW: null, markerMm: 25, thickMm: 0.5, board: null, views: [], plan: [], idx: 0, target: 20,
-  runAll: false, running: false, stopReq: false, lease: null, est: null, refined: false, solve: null, dry: null, applied: null,
+  runAll: false, running: false, stopReq: false, lease: null, epoch: null, ownAction: null, est: null, refined: false, solve: null, dry: null, applied: null,
   status: '', statusKind: '', armedUntil: 0, previewQ: null, busy: false, live: null };
 const cwSupported = () => !!(S.caps && S.caps.calibration_apply);
 const cwDofOk = () => !(isSoArmProfile() || (S.armDof != null && S.armDof !== 6));
@@ -4623,39 +4623,43 @@ function cwLiveCount() {
   for (const d of S.detections || []) if (d.aruco && Number(d.aruco.id) >= 0 && Number(d.aruco.id) < 12) ids.add(Number(d.aruco.id));
   return ids.size;
 }
-// why a running wizard must stop now (null: carry on)
+// why a running wizard must stop now (null: carry on); CW.runAbortReason has the rules
 function cwAbortReason() {
-  if (CWZ.stopReq) return 'stop';
-  if (document.hidden) return 'hidden';
-  if (!isLive() || !S.ws || S.ws.readyState !== 1) return 'heartbeat';
-  if (CWZ.lease != null && S.leaseGeneration !== CWZ.lease) return 'lease';
-  if (S.state === 'EStop' || S.state === 'Fault') return 'fault';
-  return null;
+  const o = S.obs || {};
+  return CWZ.CW.runAbortReason({ stopReq: CWZ.stopReq, hidden: document.hidden, live: !!isLive() && !!S.ws && S.ws.readyState === 1,
+    lease0: CWZ.lease, lease: S.leaseGeneration, epoch0: CWZ.epoch, epoch: typeof o.epoch_id === 'number' ? o.epoch_id : S.epoch,
+    state: S.state, fault: o.fault || null, hold: colHold(), action: o.action ? o.action.id : null, ownAction: CWZ.ownAction });
 }
-const cwAbortErr = (why) => Object.assign(new Error(t('cw.abort.' + why)), { code: 'ABORTED', why });
 const cwSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function cwGuardedWait(cond, timeoutMs) {
   const t0 = Date.now();
   for (;;) {
     const why = cwAbortReason();
-    if (why) throw cwAbortErr(why);
+    if (why) throw CWZ.CW.runAbort(why);
     const v = cond();
     if (v) return v;
     if (Date.now() - t0 > timeoutMs) throw Object.assign(new Error('timeout'), { code: 'TIMEOUT' });
     await cwSleep(50);
   }
 }
-// move_to the end pose T (4x4) and wait for the action record; throws { code } on failure
+// move_to the end pose T (4x4) and wait for the action record; throws { code, phase } on failure:
+// phase 'reject' (command_reject / no ack, nothing started) or 'action' (the started action failed)
 async function cwMove(T) {
-  const CW = CWZ.CW, ack = await commandRPC('/api/v1/action/move_to', {
-    position: CW.posOf(T), orientation: { quat: CW.quatOf(CW.rotOf(T)) }, speed: CW_SPEED, tag: 'calib-wizard' });
+  const CW = CWZ.CW;
+  let ack;
+  try {
+    ack = await commandRPC('/api/v1/action/move_to', {
+      position: CW.posOf(T), orientation: { quat: CW.quatOf(CW.rotOf(T)) }, speed: CW_SPEED, tag: 'calib-wizard' });
+  } catch (e) { throw Object.assign(e, { phase: 'reject' }); }
   const id = ack && ack.action_id;
+  if (id == null) throw Object.assign(new Error('move_to ack without action_id'), { code: 'NO_ACTION_ID', phase: 'reject' });
+  CWZ.ownAction = id;
   const rec = await cwGuardedWait(() => {
     const o = S.obs || {};
     for (const a of [o.action, o.previous_action]) if (a && a.id === id && a.state !== 'running') return a;
     return null;
   }, 90000);
-  if (rec.state !== 'done') throw Object.assign(new Error(rec.message || rec.code || rec.state), { code: rec.code || rec.state });
+  if (rec.state !== 'done') throw Object.assign(new Error(rec.message || rec.code || rec.state), { code: rec.code || rec.state, phase: 'action' });
 }
 // stationary (all joint speeds < 0.02 rad/s) for 0.3 s
 async function cwSettle() {
@@ -4733,7 +4737,12 @@ function cwRefine() {
   return true;
 }
 const cwAccepted = () => CWZ.views.filter((v) => !v.err && CWZ.CW.boardMarkers(v, CWZ.board).length >= CWZ.CW.GATES.minMarkers).length;
-// visit poses from CWZ.idx: one (confirm mode) or all (run all)
+// clearance / IK continuity from the arm's current pose to T (same check as the pose generator)
+function cwCheckFromHere(T) {
+  const { lo, hi } = modelLimits6(), q = cwModelQ(S.obs.positions);
+  return CWZ.CW.checkTransition(CALM.fk(q), q, T, { ik: cwIk, X: CWZ.est.X, plane: CWZ.CW.boardPlane(CWZ.est.Tbb), clearance: 0.10, lo, hi });
+}
+// visit poses from CWZ.idx: one (confirm mode) or all (run all); CW.runPoses decides skip / abort
 async function cwRun() {
   if (CWZ.running || CWZ.idx >= CWZ.plan.length) return;
   if (!canMove()) { cwSetStatus(lockReason(), 'warn'); return; }
@@ -4741,36 +4750,34 @@ async function cwRun() {
   try {
     await ensureLease();
     CWZ.lease = S.leaseGeneration;
-    do {
-      const i = CWZ.idx, p = CWZ.plan[i];
-      cwSetStatus(t('cw.cap.moving', { i: i + 1 }));
-      try { await cwMove(p.T); }
-      catch (e) {
-        if (e.code === 'ABORTED') throw e;
-        p.state = 'skip'; p.why = t('cw.skip.move', { code: e.code || e.message }); CWZ.idx++;
-        if (['ESTOP_ACTIVE', 'LEASE_LOST', 'COLLISION', 'STOPPED', 'FOLLOWING_ERROR'].includes(e.code)) throw cwAbortErr(e.code === 'LEASE_LOST' ? 'lease' : e.code === 'STOPPED' ? 'stop' : 'fault');
-        continue;
-      }
-      await cwSettle();
-      cwSetStatus(t('cw.cap.capturing', { i: i + 1 }));
-      let v = await cwCapture();
-      if (v.err === 'moved') { await cwSettle(); v = await cwCapture(); }
-      const why = cwAbortReason();
-      if (why) throw cwAbortErr(why);
-      const m = v.err ? 0 : CWZ.CW.boardMarkers(v, CWZ.board).length;
-      if (v.err || m < CWZ.CW.GATES.minMarkers) { p.state = 'skip'; p.why = v.err ? t('cw.skip.' + (v.err === 'moved' ? 'moved' : 'det')) : t('cw.skip.markers', { m }); }
-      else { p.state = 'ok'; p.markers = m; CWZ.views.push({ ...v, pose: i }); }
-      CWZ.idx++;
-      if (!CWZ.refined && cwAccepted() >= 8) {
-        CWZ.refined = true;
-        if (cwRefine()) { toast(t('cw.cap.refined', { n: cwAccepted() })); cwV3Sync(); }
-      }
-      cwRender();
-    } while (CWZ.runAll && CWZ.idx < CWZ.plan.length && !CWZ.stopReq);
-    cwSetStatus(CWZ.idx >= CWZ.plan.length ? t('cw.cap.done') : '', CWZ.idx >= CWZ.plan.length ? 'ok' : '');
+    CWZ.epoch = S.obs && typeof S.obs.epoch_id === 'number' ? S.obs.epoch_id : S.epoch;
+    CWZ.ownAction = null;
+    const CW = CWZ.CW;
+    const res = await CW.runPoses(CWZ, {
+      abortReason: cwAbortReason,
+      check: cwCheckFromHere,
+      move: (T) => { cwSetStatus(t('cw.cap.moving', { i: CWZ.idx + 1 })); return cwMove(T); },
+      settle: cwSettle,
+      capture: (i) => { cwSetStatus(t('cw.cap.capturing', { i: i + 1 })); return cwCapture(); },
+      accept: (v, i, p) => {
+        const m = v.err ? 0 : CW.boardMarkers(v, CWZ.board).length;
+        if (v.err || m < CW.GATES.minMarkers) { p.state = 'skip'; p.why = v.err ? t('cw.skip.' + (v.err === 'moved' ? 'moved' : 'det')) : t('cw.skip.markers', { m }); }
+        else { p.state = 'ok'; p.markers = m; CWZ.views.push({ ...v, pose: i }); }
+      },
+      after: () => {
+        if (!CWZ.refined && cwAccepted() >= 8) {
+          CWZ.refined = true;
+          if (cwRefine()) { toast(t('cw.cap.refined', { n: cwAccepted() })); cwV3Sync(); }
+        }
+        cwRender();
+      },
+      stop: () => api('/api/v1/motion/stop', {}, { quiet: true }),
+      skipWhy: (kind, d) => (kind === 'move' ? t('cw.skip.move', { code: d }) : t('cw.skip.transition', { r: d })),
+    }, { runAll: CWZ.runAll });
+    cwSetStatus(res === 'done' ? t('cw.cap.done') : '', res === 'done' ? 'ok' : '');
   } catch (e) {
-    if (e.code === 'ABORTED' && e.why !== 'lease') api('/api/v1/motion/stop', {}, { quiet: true }).catch(() => {});
-    cwSetStatus(e.code === 'ABORTED' ? t('cw.cap.aborted', { why: e.message }) : t('cw.err', { m: e.message }), 'warn');
+    const why = e.code === 'ABORTED' ? t('cw.abort.' + e.why) + (e.detail ? ' (' + e.detail + ')' : '') : e.message;
+    cwSetStatus(t('cw.cap.aborted', { why }), 'warn');
   } finally { CWZ.running = false; CWZ.stopReq = false; cwRender(); cwV3Sync(); }
 }
 function cwStop() {

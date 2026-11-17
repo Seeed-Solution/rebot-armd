@@ -704,11 +704,8 @@ export function generatePoses({ Tbb, board, K = NOMINAL, X, q0, fk, ik, lo = nul
   dists = [0.18, 0.20, 0.23, 0.26, 0.30, 0.35], tilts = [0, 10, 20, 30], azimuths = 8, rolls = [0, 15, -15],
   aims = [[0.5, 0.5], [0.3, 0.35], [0.7, 0.35], [0.3, 0.65], [0.7, 0.65]], minMarkers = GATES.minMarkers,
   clearance = 0.10, distRange = [0.18, 0.35], exclude = [] }) {
-  const Rb = rotOf(Tbb), c = posOf(Tbb);
-  let nz = [Rb[0][2], Rb[1][2], Rb[2][2]];
-  if (nz[2] < 0) nz = scl3(nz, -1);
+  const Rb = rotOf(Tbb), plane = boardPlane(Tbb), c = plane.p, nz = plane.n;
   const ex = unit(sub3([Rb[0][0], Rb[1][0], Rb[2][0]], scl3(nz, dot3([Rb[0][0], Rb[1][0], Rb[2][0]], nz)))), ey = cross(nz, ex);
-  const plane = { p: c, n: nz };
   const T0 = fk(q0), Rc0 = mm(rotOf(T0), rotOf(X)), xc0 = [Rc0[0][0], Rc0[1][0], Rc0[2][0]];
   const Rec = rotOf(X), tec = posOf(X);
   const stats = { candidates: 0, markers: 0, clearance: 0, reach: 0, transition: 0, distance: 0 };
@@ -788,4 +785,89 @@ export function mountRotation(VIK, mount, qRef) {
   const R = VIK.camMount(!!(mount && mount.flip), (mount && Number(mount.rot_deg)) || 0, qRef);
   const tl = ((mount && Number(mount.tilt_deg)) || 0) / D;
   return tl ? mm(R, rodrigues([tl, 0, 0])) : R;
+}
+
+// ---- capture run loop (cockpit wiring in index.html, tested in scripts/calib_wizard_selftest.mjs)
+
+// board plane (point, unit normal pointing up) from T_base_board, as used by generatePoses
+export function boardPlane(Tbb) {
+  const Rb = rotOf(Tbb);
+  const nz = [Rb[0][2], Rb[1][2], Rb[2][2]];
+  return { p: posOf(Tbb), n: nz[2] < 0 ? scl3(nz, -1) : nz };
+}
+/* move_to refusals that armd returns as a command_reject before any motion starts (planning in
+   src/motion.rs plan_cartesian_ex, MotionError::code):
+     IK_UNREACHABLE       no IK solution along the straight-line path
+     IK_BRANCH_FLIP       a joint jumps > 0.10 rad between path samples
+     WORKSPACE_VIOLATION  a check point leaves the workspace box / floor or enters a keep-out box
+   Only these skip a pose. Everything else aborts the run: INVALID_COMMAND / UNSUPPORTED / POWER_BUDGET /
+   PLAN_STALE / MOTION_BUSY / NOT_ARMED / lease and epoch rejects, a command timeout (no code), and every
+   failure of a started action (TRACKING_STALL, COLLISION, STOPPED, SUPERSEDED, FOLLOWING_ERROR,
+   TORQUE_LIMIT, POWER_LIMIT, WATCHDOG_TIMEOUT, faults, MOTION_TIMEOUT, ...). */
+export const PLAN_REFUSAL_CODES = Object.freeze(['IK_UNREACHABLE', 'IK_BRANCH_FLIP', 'WORKSPACE_VIOLATION']);
+// err: { code, phase } with phase 'reject' (command_reject, nothing moved) or 'action' (action record)
+export const moveFailureSkips = (err) => !!err && err.phase === 'reject' && PLAN_REFUSAL_CODES.includes(err.code);
+// safety states a normal run passes through
+export const RUN_STATES = Object.freeze(['Armed', 'Moving']);
+/* Why a running wizard must stop now (null: carry on). s: { stopReq, hidden, live (telemetry + WS),
+   lease0 / lease (lease generation at Start / now), epoch0 / epoch (observation epoch_id at Start / now),
+   state (safety state name), fault (observation fault or null), hold (collision hold active), action (id of the newest action in the
+   observation), ownAction (id of the wizard's last move_to) }. */
+export function runAbortReason(s) {
+  if (s.stopReq) return 'stop';
+  if (s.hidden) return 'hidden';
+  if (!s.live) return 'heartbeat';
+  if (s.lease0 != null && s.lease !== s.lease0) return 'lease';
+  if (s.state === 'EStop' || s.state === 'Fault' || s.fault || s.hold) return 'fault';
+  if (s.epoch0 != null && s.epoch !== s.epoch0) return 'epoch';
+  if (!RUN_STATES.includes(s.state)) return 'state';
+  if (s.action != null && s.ownAction != null && s.action !== s.ownAction) return 'foreign';
+  return null;
+}
+export const runAbort = (why, detail = '') => Object.assign(new Error(detail ? `${why}: ${detail}` : why), { code: 'ABORTED', why, detail });
+/* Visit poses from st.idx (st: { plan: [{ T, state, why }], idx }), one pose or all (runAll). io:
+     abortReason() -> why | null       checked before each step and after settle / capture
+     check(T) -> { ok, reason }        clearance / IK continuity from the arm's current pose to T
+     move(T)                           resolves when the action is done; throws { code, phase }
+     settle(), capture() -> view       settle throws { code: 'TIMEOUT' } after its timeout
+     accept(view, i, pose) -> bool     stores an accepted view, sets pose.state / why
+     after(i)                          per-pose hook (refinement, render)
+     stop()                            motion stop; sent on every abort except a lost lease
+     skipWhy(kind, detail) -> string   label of a skipped pose
+   Returns 'done' (plan finished) or 'paused' (one pose in confirm mode); throws an ABORTED error. */
+export async function runPoses(st, io, { runAll = true } = {}) {
+  const guard = () => { const why = io.abortReason(); if (why) throw runAbort(why); };
+  try {
+    do {
+      guard();
+      const i = st.idx, p = st.plan[i];
+      const c = io.check(p.T);
+      if (!c.ok) { // planning refusal on the actual transition: skip, try the next pose from here
+        p.state = 'skip'; p.why = io.skipWhy('transition', c.reason); st.idx++;
+        if (st.idx >= st.plan.length) throw runAbort('nopose', c.reason);
+        continue;
+      }
+      try { await io.move(p.T, i); }
+      catch (e) {
+        if (e && e.code === 'ABORTED') throw e;
+        if (!moveFailureSkips(e)) throw runAbort('move', (e && (e.code || e.message)) || 'unknown');
+        p.state = 'skip'; p.why = io.skipWhy('move', e.code); st.idx++;
+        continue;
+      }
+      guard();
+      await io.settle();
+      guard();
+      let v = await io.capture(i);
+      if (v.err === 'moved') { guard(); await io.settle(); v = await io.capture(i); }
+      guard();
+      io.accept(v, i, p);
+      st.idx++;
+      io.after(i);
+    } while (runAll && st.idx < st.plan.length);
+    return st.idx >= st.plan.length ? 'done' : 'paused';
+  } catch (e) {
+    const err = e && e.code === 'ABORTED' ? e : runAbort(e && e.code === 'TIMEOUT' ? 'timeout' : 'error', (e && (e.message || e.code)) || '');
+    if (err.why !== 'lease') { try { await io.stop(); } catch (_) {} }
+    throw err;
+  }
 }

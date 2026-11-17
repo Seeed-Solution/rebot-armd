@@ -63,7 +63,7 @@ function setupSim() {
     // simulated arm state
     S.dof = 7; S.armDof = 6; S.profileId = null; S.state = 'Armed'; S.caps = { ...(S.caps || {}), calibration_apply: true };
     S.leaseGeneration = 1; S.epoch = 1;
-    S.obs = { positions: [...toMotor6(q0), 0], velocities: [0, 0, 0, 0, 0, 0, 0], is_torqued: true, action: null, previous_action: null };
+    S.obs = { positions: [...toMotor6(q0), 0], velocities: [0, 0, 0, 0, 0, 0, 0], is_torqued: true, safety_state: 'Armed', epoch_id: 1, fault: null, action: null, previous_action: null };
     clearInterval(W.tick); W.tick = setInterval(() => { S.obsAt = Date.now(); }, 50);
     let aid = 0;
     window.commandRPC = async (p, body) => {
@@ -71,10 +71,12 @@ function setupSim() {
       if (p === '/api/v1/action/move_to') {
         const id = ++aid, T = CW.make(CW.quatR(body.orientation.quat), body.position);
         const s = cwIk(T, cwModelQ(S.obs.positions));
+        // as armd: an IK failure is a planning refusal (command_reject), nothing moves
+        if (!s.ok) throw Object.assign(new Error('IK unreachable'), { code: 'IK_UNREACHABLE' });
         S.obs.action = { id, kind: 'move_to', state: 'running' };
         setTimeout(() => {
-          if (s.ok) S.obs.positions = [...toMotor6(s.q), 0];
-          S.obs.action = { id, kind: 'move_to', state: s.ok ? 'done' : 'failed', code: s.ok ? null : 'IK_UNREACHABLE' };
+          S.obs.positions = [...toMotor6(s.q), 0];
+          S.obs.action = { id, kind: 'move_to', state: 'done', code: null };
         }, 60);
         return { action_id: id };
       }
