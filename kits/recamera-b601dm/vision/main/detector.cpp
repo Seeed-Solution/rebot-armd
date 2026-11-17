@@ -1,5 +1,6 @@
 #include "detector.h"
 #include "seg_model.h"
+#include "seg_heads_model.h"
 #include "obb_model.h"
 
 #include <algorithm>
@@ -13,6 +14,7 @@ Detector::Detector()
     : engine_(nullptr),
       model_(nullptr),
       seg_model_(nullptr),
+      seg_heads_model_(nullptr),
       obb_model_(nullptr),
       kind_(Kind::Detect),
       threshold_(0.25f),
@@ -29,6 +31,7 @@ Detector::~Detector() {
         model_ = nullptr;
     }
     obb_model_.reset();
+    seg_heads_model_.reset();
     seg_model_.reset();
     engine_.reset();
 }
@@ -53,6 +56,23 @@ bool Detector::init(const std::string& model_path, ModelKindHint hint) {
     int num_inputs = engine_->getInputSize();
     int num_outputs = engine_->getOutputSize();
     MA_LOGI(TAG, "Model loaded: %d inputs, %d outputs", num_inputs, num_outputs);
+
+    // YOLO11-seg cut before the head decode: 10 outputs (3 x box / class / mask coefficients + prototypes)
+    if ((hint == ModelKindHint::Segment || hint == ModelKindHint::Auto) && num_outputs == rv::kSegHeadsOutputs &&
+        SegHeadsModel::isValid(engine_.get())) {
+        seg_heads_model_ = std::make_unique<SegHeadsModel>(engine_.get());
+        kind_ = Kind::Segment;
+        num_classes_ = seg_heads_model_->numClasses();
+        const ma_img_t* model_input = static_cast<const ma_img_t*>(seg_heads_model_->getInput());
+        if (model_input) {
+            input_width_ = model_input->width;
+            input_height_ = model_input->height;
+        }
+        MA_LOGI(TAG, "Segmentor initialized (type: %s, 10 outputs, input: %dx%d)", seg_heads_model_->getName(),
+                input_width_, input_height_);
+        initialized_ = true;
+        return true;
+    }
 
     if (hint == ModelKindHint::Segment ||
         (hint == ModelKindHint::Auto && num_outputs == 2 && ma::model::Yolo11Seg::isValid(engine_.get()))) {
@@ -148,6 +168,9 @@ void Detector::setThreshold(float threshold) {
     if (seg_model_) {
         seg_model_->setConfig(MA_MODEL_CFG_OPT_THRESHOLD, static_cast<double>(threshold_));
     }
+    if (seg_heads_model_) {
+        seg_heads_model_->setConfig(MA_MODEL_CFG_OPT_THRESHOLD, static_cast<double>(threshold_));
+    }
     if (obb_model_) {
         obb_model_->setConfig(MA_MODEL_CFG_OPT_THRESHOLD, static_cast<double>(threshold_));
     }
@@ -159,6 +182,20 @@ std::vector<Detection> Detector::detect(ma_img_t* img, const rv::MaskFocus* focu
     std::vector<Detection> results;
 
     if (!initialized_ || img == nullptr) {
+        return results;
+    }
+
+    if (kind_ == Kind::Segment && seg_heads_model_) {
+        seg_heads_model_->setFrame(focus, content_x, content_y, content_w, content_h);
+        ma_err_t ret = seg_heads_model_->run(img);
+        if (ret != MA_OK) {
+            MA_LOGE(TAG, "Segmentation run failed: %d", ret);
+            return results;
+        }
+        results = seg_heads_model_->getDetections();
+        for (auto& det : results) {
+            det.id = detection_id_counter_++;
+        }
         return results;
     }
 
@@ -227,12 +264,35 @@ float Detector::mask_ms() const {
     if (kind_ == Kind::Segment && seg_model_) {
         return seg_model_->last_mask_ms();
     }
+    if (kind_ == Kind::Segment && seg_heads_model_) {
+        return seg_heads_model_->last_mask_ms();
+    }
     return -1.0f;
+}
+
+void Detector::stage_ms(float& pre, float& infer, float& post) const {
+    pre = infer = post = -1.0f;
+    const ma::Model* m = seg_heads_model_ ? static_cast<const ma::Model*>(seg_heads_model_.get())
+                         : seg_model_     ? static_cast<const ma::Model*>(seg_model_.get())
+                         : obb_model_     ? static_cast<const ma::Model*>(obb_model_.get())
+                                          : static_cast<const ma::Model*>(model_);
+    if (m == nullptr) return;
+    const ma_perf_t p = m->getPerf();
+    pre = static_cast<float>(p.preprocess);
+    infer = static_cast<float>(p.inference);
+    post = static_cast<float>(p.postprocess);
+    if (seg_heads_model_) {
+        pre = seg_heads_model_->last_pre_ms();
+        post = seg_heads_model_->last_post_ms();
+    }
 }
 
 void Detector::setMaskEnabled(bool enabled) {
     if (seg_model_) {
         seg_model_->setMaskEnabled(enabled);
+    }
+    if (seg_heads_model_) {
+        seg_heads_model_->setMaskEnabled(enabled);
     }
 }
 
@@ -240,12 +300,18 @@ void Detector::setMaskMaxBoxes(int max_boxes) {
     if (seg_model_) {
         seg_model_->setMaskMaxBoxes(max_boxes);
     }
+    if (seg_heads_model_) {
+        seg_heads_model_->setMaskMaxBoxes(max_boxes);
+    }
 }
 
 void Detector::setMaskFocus(const rv::MaskFocus* focus, float content_x, float content_y,
                             float content_w, float content_h) {
     if (seg_model_) {
         seg_model_->setMaskFocus(focus, content_x, content_y, content_w, content_h);
+    }
+    if (seg_heads_model_) {
+        seg_heads_model_->setFrame(focus, content_x, content_y, content_w, content_h);
     }
 }
 
@@ -259,6 +325,9 @@ void Detector::setClassNames(rv::ClassNames names) {
     class_names_ = std::move(names);
     if (seg_model_) {
         seg_model_->setClassNames(&class_names_);
+    }
+    if (seg_heads_model_) {
+        seg_heads_model_->setClassNames(&class_names_);
     }
 }
 

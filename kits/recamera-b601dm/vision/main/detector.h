@@ -34,6 +34,7 @@ struct Detection {
 };
 
 class SegModel;
+class SegHeadsModel;
 class ObbModel;
 
 class Detector {
@@ -50,6 +51,9 @@ public:
 
     Kind getKind() const { return kind_; }
     float mask_ms() const;
+    /** Last run: preprocess / inference / postprocess ms (sscma perf, whole ms; the 10-output seg model times
+     *  pre- and postprocess to the microsecond). For the verbose frame log. */
+    void stage_ms(float& pre, float& infer, float& post) const;
 
     void setMaskEnabled(bool enabled);
     void setMaskMaxBoxes(int max_boxes);
@@ -71,6 +75,7 @@ private:
     std::unique_ptr<ma::engine::EngineCVI> engine_;
     ma::model::Detector* model_;
     std::unique_ptr<SegModel> seg_model_;
+    std::unique_ptr<SegHeadsModel> seg_heads_model_;  ///< 10-output seg (seg_heads.h); kind Segment too
     std::unique_ptr<ObbModel> obb_model_;
     Kind kind_;
     float threshold_;
