@@ -34,23 +34,80 @@ PROFILE = Path(__file__).resolve().parents[4] / "kits" / "recamera-b601dm" / "pr
 SO101_PROFILE = Path(__file__).resolve().parents[4] / "profiles" / "so_arm101.json"
 
 
+def unit_quaternion(q) -> tuple[float, float, float, float]:
+    """`q` [w, x, y, z] normalised; ValueError unless |q| = 1 within 1e-3 (armd's rule)."""
+    q = tuple(float(v) for v in q)
+    n = math.sqrt(sum(v * v for v in q))
+    if len(q) != 4 or not all(math.isfinite(v) for v in q) or abs(n - 1.0) > 1e-3:
+        raise ValueError("q_end_cam must be a unit quaternion [w, x, y, z] (|q| = 1 within 1e-3)")
+    return q if abs(n - 1.0) < 1e-12 else tuple(v / n for v in q)  # idempotent (IPC round trip)
+
+
+def quat_to_r(q) -> np.ndarray:
+    """Rotation matrix of a unit quaternion [w, x, y, z] (armd `kinematics::quat_to_r`)."""
+    w, x, y, z = unit_quaternion(q)
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                     [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                     [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+
+
+def r_to_quat(r: np.ndarray) -> tuple[float, float, float, float]:
+    """Unit quaternion [w, x, y, z] (w >= 0) of a rotation matrix."""
+    q = np.empty(4)
+    mujoco.mju_mat2Quat(q, np.asarray(r, float).flatten())
+    if q[0] < 0:
+        q = -q
+    return tuple(float(v) for v in q)
+
+
 @dataclass(frozen=True)
 class CameraMount:
+    """The simulator's one camera model (truth): mount and intrinsics, used by the render,
+    the synthetic detections and markers, the depth and /sim/camera. `q_end_cam` (armd
+    `camera_mount.q_end_cam`, R_end_cam as [w, x, y, z]) replaces flip / rot_deg / tilt_deg when
+    set; `fx_px` is the focal length at 640 x 360 (square pixels, principal point at the image
+    centre, no distortion), default the OV5647 stream value (`focal_px`)."""
     flip: bool = False
     rot_deg: float = 0.0
     tilt_deg: float = 0.0
     offset_m: tuple[float, float, float] | None = None
+    q_end_cam: tuple[float, float, float, float] | None = None
+    fx_px: float | None = None
+
+    def __post_init__(self):
+        if self.q_end_cam is not None:
+            object.__setattr__(self, "q_end_cam", unit_quaternion(self.q_end_cam))
+        if self.fx_px is not None and not (math.isfinite(self.fx_px) and 100 <= self.fx_px <= 5000):
+            raise ValueError("fx_px must be in [100, 5000]")
 
     @classmethod
     def from_profile(cls, path: Path | str = PROFILE) -> "CameraMount":
         m = json.loads(Path(path).read_text())["camera_mount"]
         off = m.get("offset_m")
+        q = m.get("q_end_cam")
         return cls(bool(m.get("flip", False)), float(m.get("rot_deg", 0.0)), float(m.get("tilt_deg", 0.0)),
-                   tuple(float(v) for v in off) if off else None)
+                   tuple(float(v) for v in off) if off else None, tuple(q) if q else None)
 
     @property
     def offset(self) -> np.ndarray:
         return np.array(self.offset_m if self.offset_m is not None else DEFAULT_OFFSET_M, dtype=float)
+
+    def focal(self, height: int = DETECTION_SIZE[1]) -> float:
+        """Focal length (px) at an image `height` (the stream or the 640 x 360 detection image)."""
+        f360 = self.fx_px if self.fx_px is not None else focal_px(DETECTION_SIZE[1])
+        return f360 * height / DETECTION_SIZE[1]
+
+    @property
+    def vfov_deg(self) -> float:
+        return 2 * math.degrees(math.atan(DETECTION_SIZE[1] / 2 / self.focal()))
+
+    @property
+    def hfov_deg(self) -> float:
+        return 2 * math.degrees(math.atan(DETECTION_SIZE[0] / 2 / self.focal()))
+
+    def ipc(self) -> list:
+        """The camera process's `mount` config entry (CameraMount(*entry) rebuilds it)."""
+        return [self.flip, self.rot_deg, self.tilt_deg, self.offset_m, self.q_end_cam, self.fx_px]
 
 
 def axis_r(k, a: float) -> np.ndarray:
@@ -64,7 +121,10 @@ def axis_r(k, a: float) -> np.ndarray:
 
 
 def mount_rotation(model: mujoco.MjModel, mount: CameraMount) -> np.ndarray:
-    """R_end_cam (OpenCV camera axes as columns, in end_link), armd `cam_mount`."""
+    """R_end_cam (OpenCV camera axes as columns, in end_link), armd `cam_mount`; the
+    calibrated `q_end_cam` when set."""
+    if mount.q_end_cam is not None:
+        return quat_to_r(mount.q_end_cam)
     data = mujoco.MjData(model)
     joint_names = {model.joint(i).name for i in range(model.njnt)}
     if "shoulder_pan" in joint_names:
@@ -92,13 +152,14 @@ def mount_rotation(model: mujoco.MjModel, mount: CameraMount) -> np.ndarray:
     return r
 
 
-def add_cameras(spec: mujoco.MjSpec, r_end_cam: np.ndarray, offset: np.ndarray) -> None:
-    """`wrist` on end_link (MuJoCo camera: x right, y up, looks along -z) and a fixed `scene`."""
+def add_cameras(spec: mujoco.MjSpec, r_end_cam: np.ndarray, offset: np.ndarray, fovy_deg: float | None = None) -> None:
+    """`wrist` on end_link (MuJoCo camera: x right, y up, looks along -z; vertical field of view
+    `fovy_deg`, default VFOV_DEG) and a fixed `scene`."""
     r_mj = np.column_stack([r_end_cam[:, 0], -r_end_cam[:, 1], -r_end_cam[:, 2]])
     quat = np.zeros(4)
     mujoco.mju_mat2Quat(quat, r_mj.flatten())
     cam = spec.body("end_link").add_camera(name="wrist", pos=list(offset), quat=list(quat))
-    cam.fovy = VFOV_DEG
+    cam.fovy = VFOV_DEG if fovy_deg is None else fovy_deg
     eye, target = np.array([0.85, -0.65, 0.55]), np.array([0.22, 0.0, 0.05])
     fwd = (target - eye) / np.linalg.norm(target - eye)
     right = np.cross(fwd, [0, 0, 1.0])
@@ -116,23 +177,27 @@ def focal_px(height: int) -> float:
     return height / 2 / math.tan(math.radians(VFOV_DEG) / 2)
 
 
-def project_points(data: mujoco.MjData, cam_id: int, pts: np.ndarray, size=DETECTION_SIZE) -> tuple[np.ndarray, np.ndarray]:
-    """Pixels (N x 2) at `size` and depths of world points in MuJoCo camera `cam_id`."""
+def project_points(data: mujoco.MjData, cam_id: int, pts: np.ndarray, size=DETECTION_SIZE,
+                   mount: CameraMount | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Pixels (N x 2) at `size` and depths of world points in MuJoCo camera `cam_id` (focal
+    length of `mount`, default the stream value)."""
     pos, r = data.cam_xpos[cam_id], data.cam_xmat[cam_id].reshape(3, 3)
     pc = (np.asarray(pts, float) - pos) @ r  # camera-frame coordinates (rows)
     depth = -pc[:, 2]
-    f = focal_px(size[1])
+    f = (mount or CameraMount()).focal(size[1])
     with np.errstate(divide="ignore", invalid="ignore"):
         u = size[0] / 2 + f * pc[:, 0] / depth
         v = size[1] / 2 - f * pc[:, 1] / depth
     return np.column_stack([u, v]), depth
 
 
-def grip_pixel_norm(r_end_cam: np.ndarray, offset: np.ndarray, height_m: float) -> list[float]:
+def grip_pixel_norm(r_end_cam: np.ndarray, offset: np.ndarray, height_m: float, f: float | None = None) -> list[float]:
     """Where the table point `height_m` below the jaw tips (along the tool axis, end_link x)
-    appears in the image, normalised: armd's `grasp.grip_pixel_norm` for this mount."""
+    appears in the image, normalised: armd's `grasp.grip_pixel_norm` for this mount (focal
+    length `f` at 640 x 360, default the stream value). armd's calibration apply uses the
+    grasp plane: height_m = approach_height_m - grasp_height_m."""
     pc = r_end_cam.T @ (np.array([height_m, 0.0, 0.0]) - offset)
-    f = focal_px(DETECTION_SIZE[1])
+    f = focal_px(DETECTION_SIZE[1]) if f is None else f
     return [round(float((DETECTION_SIZE[0] / 2 + f * pc[0] / pc[2]) / DETECTION_SIZE[0]), 4),
             round(float((DETECTION_SIZE[1] / 2 + f * pc[1] / pc[2]) / DETECTION_SIZE[1]), 4)]
 
@@ -433,7 +498,7 @@ def _mad(x: np.ndarray) -> float:
 
 
 def depth_result(geom_ids: np.ndarray, z: np.ndarray, scene, model: DepthModel, frame_id: int = 0,
-                 min_pixels: int = 20) -> dict:
+                 min_pixels: int = 20, fx_per_w: float | None = None) -> dict:
     """Depth fields of a frame: {"table_samples": [[u, v, disp], ...], "objects": {name: fields},
     "finite": bool}. `geom_ids` / `z` at DETECTION_SIZE; fields per object as rebot-vision
     reports them (disp_fg, disp_bg, depth_conf, length_px, jaw_clear, depth_angle_deg,
@@ -457,7 +522,7 @@ def depth_result(geom_ids: np.ndarray, z: np.ndarray, scene, model: DepthModel, 
     ids_g = geom_ids[np.ix_(iy, ix)]
     z_g = z[np.ix_(iy, ix)].astype(np.float64)
     finite = bool(np.isfinite(z_g).all() and (z_g > 0).all())
-    disp = model.disparity(z_g, frame_id)
+    disp = model.disparity(z_g, frame_id, fx_per_w)  # fx_per_w: the camera's focal length / 640
     uu, vv = np.meshgrid(u, v)
     table = (ids_g == scene.table_id) & np.isfinite(disp)
 

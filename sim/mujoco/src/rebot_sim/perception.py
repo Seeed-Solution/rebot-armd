@@ -181,8 +181,13 @@ def serve_video(host: str, port: int, streams: dict[str, VideoStream]):
 class Perception:
     """Perception API v2 state: default subscription (mode), subscriptions, frames, triggers."""
 
-    def __init__(self, max_fps: int, depth=None, model_kind: str = "segment"):
+    def __init__(self, max_fps: int, depth=None, model_kind: str = "segment", nominal_fx: float = 824.0):
         self.max_fps = max_fps
+        # X8: the ESTIMATED intrinsics (rebot-vision's /api/calibration/intrinsics); the truth is
+        # the camera model in camera.py. Starts at the nominal stream values, like rebot-vision.
+        self.intrinsics = {"fx": nominal_fx, "fy": nominal_fx, "cx": 320.0, "cy": 180.0,
+                           "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0, "marker_size": 0.05}
+        self.intrinsics_revision = 0
         self._depth = depth if depth is not None and depth.enabled else None  # what `depth` loads
         # resident models: "seg" (mask angle and width) or "det" (--no-mask-angle), and "depth"
         self.detector: str | None = "seg" if model_kind == "segment" else "det"
@@ -329,6 +334,7 @@ class Perception:
         physics_time: float = 0.0,
         physics_step: int = 0,
         depth: dict | None = None,
+        markers: list[dict] | None = None,
     ) -> None:
         """A rendered wrist frame (called by the render thread); `captured` = time.monotonic()
         when the simulator state (physics step `physics_step` at `physics_time` s) was copied.
@@ -345,6 +351,7 @@ class Perception:
                 "physics_time": round(physics_time, 6),
                 "physics_step": physics_step,
                 "depth": depth,
+                "markers": markers or [],
             }
             self.frames_in = [t for t in self.frames_in if now - t < 2.0] + [now]
             # One plan per frame, as rebot-vision's frame_plan: the continuous pipelines when the
@@ -401,6 +408,11 @@ class Perception:
                 else d
                 for d in detections
             ]
+        markers = []
+        if ran.get("aruco"):  # pose with the estimated intrinsics, as rebot-vision
+            from .aruco import marker_json
+
+            markers = [marker_json(m, self.intrinsics, self.intrinsics["marker_size"]) for m in frame.get("markers", [])]
         body = {
             "api_version": API_VERSION,
             "success": True,
@@ -418,11 +430,11 @@ class Perception:
                 for p in self.pipelines
             },
             "detections": detections,
-            "count": 0,
+            "count": len(markers),
             "family": "aruco4x4_50",
-            "undistorted": False,
+            "undistorted": any(self.intrinsics[k] != 0.0 for k in ("k1", "k2", "p1", "p2", "k3")),
             "rejected": 0,
-            "markers": [],
+            "markers": markers,
             "model_generation": self.generation,
         }
         if ran.get("depth"):
@@ -432,6 +444,11 @@ class Perception:
             body["depth"] = {"metric_model": self.depth_model.metric, "grid_w": gw, "grid_h": gh,
                              "table_samples": [list(t) for t in depth["table_samples"]]}
         return body
+
+    def intrinsics_body(self) -> dict:
+        """GET /api/calibration/intrinsics (rebot-vision W7 shape)."""
+        return {"api_version": API_VERSION, **self.intrinsics, "width": 640, "height": 360,
+                "revision": self.intrinsics_revision, "overridden_by_cli": False, "config_path": None}
 
     @staticmethod
     def public(body: dict) -> dict:
@@ -477,6 +494,7 @@ class Perception:
                 "mask_max_boxes": 3,
             },
             "family": "aruco4x4_50",
+            "intrinsics": self.intrinsics_body(),
             "mask_focus": self.mask_focus_body(),
             "models": self.models_body(),
             "ion": {**ION, "used_mb": round(self._budget(self.detector, self._resident_depth())[1] - ION["reserve_mb"], 3)},
@@ -555,6 +573,9 @@ class _Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         self._route("DELETE")
 
+    def do_PUT(self):
+        self._route("PUT")
+
     def _route(self, method: str) -> None:
         if method != "GET":
             if not _is_same_origin(
@@ -563,7 +584,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send(
                     403, {"error": "Cross-origin control requests are not allowed"}
                 )
-        if method == "POST":
+        if method in ("POST", "PUT"):
             ct = self.headers.get("Content-Type", "")
             media_type = ct.split(";")[0].strip().lower()
             if media_type != "application/json":
@@ -572,7 +593,7 @@ class _Handler(BaseHTTPRequestHandler):
                 )
         url = urlparse(self.path)
         qs = {k: v[-1] for k, v in parse_qs(url.query).items()}
-        body = self._body() if method == "POST" else {}
+        body = self._body() if method in ("POST", "PUT") else {}
         if body is None:
             return self._send(400, {"error": "body must be a JSON object"})
         try:
@@ -647,6 +668,25 @@ class PerceptionServer:
                 if "fps" in body:
                     p.max_fps = body["fps"]
                 return 200, p.mode_body()
+        if path == "/api/calibration/intrinsics":
+            from .aruco import IntrinsicsError, check_intrinsics_put
+
+            with p.cond:
+                if method == "GET":
+                    return 200, p.intrinsics_body()
+                if method == "PUT":
+                    try:
+                        new = check_intrinsics_put(body, p.intrinsics, p.intrinsics_revision)
+                    except IntrinsicsError as e:
+                        out = {"api_version": API_VERSION, "error": e.code, "code": e.code, "message": str(e)}
+                        if e.field:
+                            out["field"] = e.field
+                        if e.code == "REVISION_MISMATCH":
+                            out["revision"] = p.intrinsics_revision
+                        return e.status, out
+                    p.intrinsics = new
+                    p.intrinsics_revision += 1
+                    return 200, p.intrinsics_body()
         if path == "/api/models" and method == "POST":
             with p.cond:
                 return p.request_swap(body)
@@ -1052,7 +1092,17 @@ class CameraRig:
         # False: a plain detection model (no mask, model "det"): detections carry no angle_deg /
         # angle_conf / grasp_width_px (the depth pipeline still reports its depth_* fields)
         self.perception = Perception(max_fps=min(15, self.fps), depth=self.depth_model,
-                                     model_kind="segment" if cfg.get("mask_angle", True) else "detect")
+                                     model_kind="segment" if cfg.get("mask_angle", True) else "detect",
+                                     nominal_fx=round(cam.focal_px(cam.DETECTION_SIZE[1]), 2))
+        # virtual GridBoard (--aruco-board): {"x", "y", "yaw_deg", "side_m", "noise_px", "seed"} or None
+        board = cfg.get("aruco_board")
+        if board:
+            from .aruco import Board
+
+            self.board = Board(board["x"], board["y"], board.get("yaw_deg", 0.0), board.get("z", 0.0), board.get("side_m", 0.05))
+            self.board_noise = (float(board.get("noise_px", 0.0)), int(board.get("seed", 0)))
+        else:
+            self.board, self.board_noise = None, (0.0, 0)
         self.noise = cam.DetNoise(**cfg.get("noise", {}))
         self.delayed: list[
             tuple
@@ -1287,21 +1337,33 @@ class CameraRig:
     def camera_info(self) -> dict:
         cam, m = self._cam, self.mount
         r = cam.mount_rotation(self.model, m)
+        out_board = None
+        if self.board is not None:
+            rb, ob = self.board.pose()
+            out_board = {"x": self.board.x, "y": self.board.y, "yaw_deg": self.board.yaw_deg, "z": self.board.z,
+                         "side_m": self.board.side_m, "gap_m": self.board.gap_m, "noise_px": self.board_noise[0],
+                         "R_base_board": rb.round(9).tolist(), "origin": ob.tolist()}
         return {
             "camera_mount": {
                 "flip": m.flip,
                 "rot_deg": m.rot_deg,
                 "tilt_deg": m.tilt_deg,
                 "offset_m": [round(float(v), 5) for v in m.offset],
+                "q_end_cam": list(m.q_end_cam) if m.q_end_cam is not None else list(cam.r_to_quat(r)),
+                "q_end_cam_set": m.q_end_cam is not None,
             },
-            "hfov_deg": round(cam.HFOV_DEG, 3),
-            "vfov_deg": round(cam.VFOV_DEG, 3),
+            "R_end_cam": r.round(9).tolist(),
+            "intrinsics": {"fx": round(m.focal(), 4), "fy": round(m.focal(), 4), "cx": 320.0, "cy": 180.0,
+                           "k1": 0.0, "k2": 0.0, "p1": 0.0, "p2": 0.0, "k3": 0.0, "width": 640, "height": 360},
+            "aruco_board": out_board,
+            "hfov_deg": round(m.hfov_deg, 3),
+            "vfov_deg": round(m.vfov_deg, 3),
             "stream_size": list(self.size),
             "fps": self.fps,
             "detection_size": list(cam.DETECTION_SIZE),
-            "fx_px": round(cam.focal_px(cam.DETECTION_SIZE[1]), 2),
+            "fx_px": round(m.focal(), 2),
             "grip_pixel_norm_at": {
-                f"{h:.2f}": cam.grip_pixel_norm(r, m.offset, h)
+                f"{h:.2f}": cam.grip_pixel_norm(r, m.offset, h, m.focal())
                 for h in (0.10, 0.12, 0.15, 0.18, 0.20, 0.25, 0.30)
             },
             "render_backend": self.backend,
@@ -1387,7 +1449,8 @@ class CameraRig:
         if want_depth and self.depth_model.enabled:
             t0 = time.perf_counter()
             z = self._cam.render_depth(r)  # same mjvScene as the segmentation: same physics state
-            d = self._cam.depth_result(ids, z, self.scene, self.depth_model, self.frame_id + 1)
+            d = self._cam.depth_result(ids, z, self.scene, self.depth_model, self.frame_id + 1,
+                                       fx_per_w=self.mount.focal() / self._cam.DETECTION_SIZE[0])
             if d["finite"]:
                 self.frame_depth = {**d, "physics_step": physics_step}
             else:
@@ -1395,6 +1458,19 @@ class CameraRig:
                 print(f"rebot-sim camera: depth render not finite on frame {self.frame_id + 1}", file=sys.stderr, flush=True)
             self.depth_ms = (self.depth_ms + [(time.perf_counter() - t0) * 1000])[-100:]
         return self._cam.detections(ids, self.scene)
+
+    def board_markers(self, frame_id: int) -> list[dict]:
+        """Markers of the virtual board seen by the wrist camera of self.data (truth model)."""
+        if self.board is None:
+            return []
+        from .aruco import visible_markers
+
+        cid = self.model.camera("wrist").id
+        r_mj = self.data.cam_xmat[cid].reshape(3, 3)
+        r_cv = np.column_stack([r_mj[:, 0], -r_mj[:, 1], -r_mj[:, 2]])
+        noise, seed = self.board_noise
+        return visible_markers(self.board, r_cv, self.data.cam_xpos[cid].copy(), self.mount.focal(),
+                               noise, seed, frame_id)
 
     def publish_frame(self, frame: tuple) -> None:
         """Hand a frame (on_frame's arguments) to perception, noise.latency_ms after its capture:
@@ -1450,7 +1526,8 @@ class CameraRig:
                         dets, self.noise, self.frame_id, self.labels
                     )
                     self.publish_frame(
-                        (self.frame_id, ts_ms, captured, dets, self.data.time, step, self.frame_depth)
+                        (self.frame_id, ts_ms, captured, dets, self.data.time, step, self.frame_depth,
+                         self.board_markers(self.frame_id))
                     )
                 for path, stream in self.streams.items():
                     if not stream.active:
