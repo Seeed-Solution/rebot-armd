@@ -105,8 +105,13 @@ fn calibrated_mount(inner: &SupervisorInner, offset: [f32; 3], q: [f64; 4]) -> C
 }
 
 /// Read `calibration.json` at startup (after the grasp setup) and install its camera mount.
-/// A malformed or invalid file is moved aside and the profile mount stays.
-pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
+/// A malformed or invalid file is moved aside and the profile mount stays; the grasp setup's
+/// camera model (fx_px, fy_px, cx_px, cy_px, image_size_px, camera_tilt_deg, grip_pixel_norm),
+/// which an apply wrote for the calibrated mount, is reset to the profile values (live and in
+/// `setup_path`, the old file kept as `<name>.pre-reset-<ts>`) so no grasp mixes a calibrated
+/// camera model with the profile mount. The error is reported in `GET /api/v1/calibration`
+/// (`load_error`) until an apply or restore succeeds.
+pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Option<&Path>) {
     let loaded = crate::persist::load::<CalibrationFile>(path, CalibrationFile::validate);
     let mut inner = supervisor.inner().write().await;
     match loaded {
@@ -120,8 +125,38 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
             inner.calibration = Some(file);
         }
         crate::persist::Loaded::Missing => tracing::info!("No camera calibration at {}; using the profile camera mount", path.display()),
-        crate::persist::Loaded::Invalid(e) => tracing::warn!("Ignoring camera calibration file: {e}; using the profile camera mount"),
+        crate::persist::Loaded::Invalid(e) => {
+            tracing::warn!("Ignoring camera calibration file: {e}; using the profile camera mount");
+            let mut msg = e;
+            if let Some(setup) = reset_camera_model(&mut inner) {
+                msg.push_str("; grasp setup camera model reset to the profile values");
+                if let Some(p) = setup_path { if let Err(e) = persist_reset_setup(p, &setup) { msg.push_str(&format!(" (not saved: {e})")); } }
+                tracing::warn!("Grasp setup camera model reset to the profile values (calibration.json rejected)");
+            }
+            inner.calibration_load_error = Some(msg);
+        }
     }
+}
+
+/// The live grasp setup with the camera-model fields of the profile; None when nothing changes
+/// (or the profile has no grasp setup).
+fn reset_camera_model(inner: &mut SupervisorInner) -> Option<GraspSetup> {
+    let (cur, prof) = (inner.grasp_setup()?, inner.profile_grasp.clone()?);
+    let setup = GraspSetup { fx_px: prof.fx_px, fy_px: prof.fy_px, cx_px: prof.cx_px, cy_px: prof.cy_px, image_size_px: prof.image_size_px,
+        grip_pixel_norm: prof.grip_pixel_norm, camera_tilt_deg: f64::from(inner.profile_camera_mount.tilt_deg), ..cur.clone() };
+    if setup == cur { return None; }
+    inner.set_camera_mount(inner.profile_camera_mount.clone());
+    inner.set_grasp_setup(setup.clone());
+    Some(setup)
+}
+
+/// Keep a copy of `grasp_setup.json`, then write the reset setup.
+fn persist_reset_setup(path: &Path, setup: &GraspSetup) -> std::io::Result<()> {
+    if path.is_file() {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        std::fs::copy(path, path.with_file_name(format!("{name}.pre-reset-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"))))?;
+    }
+    crate::persist::write_atomic(path, &serde_json::to_string_pretty(setup).unwrap_or_default())
 }
 
 // ---- errors ----
@@ -632,7 +667,8 @@ impl Txn<'_> {
         if let Err(e) = self.write_calibration(after).await { return Err(self.fail(e).await); }
         if let Err(e) = self.write_grasp(after).await { return Err(self.fail(e).await); }
         let vision = vision_get(self.deps).await.unwrap_or_else(|e| json!({"error": e.message}));
-        let inner = self.sup.inner().read().await;
+        let mut inner = self.sup.inner().write().await;
+        inner.calibration_load_error = None;
         Ok(json!({"backup": backup.display().to_string(), "vision_intrinsics": vision,
             "camera_mount": mount_summary(&inner.config.camera_mount), "calibration": inner.calibration,
             "grasp": inner.grasp_setup().map(|s| grasp_fields(&s))}))
@@ -697,7 +733,7 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
 /// `GET /api/v1/calibration`.
 pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
     let inner = sup.inner().read().await;
-    json!({"calibrated": inner.camera_calibrated(), "busy": inner.calibration_busy,
+    json!({"calibrated": inner.camera_calibrated(), "busy": inner.calibration_busy, "load_error": inner.calibration_load_error,
         "path": deps.path.display().to_string(), "backup_dir": deps.backup_dir.display().to_string(),
         "calibration": inner.calibration, "camera_mount": mount_summary(&inner.config.camera_mount),
         "grasp": inner.grasp_setup().map(|s| grasp_fields(&s)), "backups": list_backups(deps)})

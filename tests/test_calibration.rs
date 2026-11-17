@@ -77,7 +77,7 @@ async fn calibrated_supervisor(dir: &Path) -> ArmSupervisor {
     std::fs::write(&cal, serde_json::to_string(&calib_file(v8_q())).unwrap()).unwrap();
     let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
     grasp::load_into(&sup, &setup).await;
-    calibration::load_into(&sup, &cal).await;
+    calibration::load_into(&sup, &cal, Some(&setup)).await;
     sup
 }
 
@@ -98,7 +98,7 @@ async fn startup_calibration_wins_for_the_mount_and_tilt() {
     let bad = dir.path().join("bad.json");
     std::fs::write(&bad, r#"{"camera_mount": {"q_end_cam": [2, 0, 0, 0], "offset_m": [0, 0, 0]}}"#).unwrap();
     let fresh = ArmSupervisor::new(ArmConfig::rebot_dm());
-    calibration::load_into(&fresh, &bad).await;
+    calibration::load_into(&fresh, &bad, None).await;
     assert!(!fresh.inner().read().await.camera_calibrated());
     assert!(!bad.exists(), "quarantined");
 }
@@ -570,4 +570,59 @@ async fn busy_guard_clears_the_flag_on_panic_and_on_release() {
     sup.inner().write().await.calibration_busy = true;
     calibration::BusyGuard::new(sup.clone()).release().await;
     assert!(!sup.inner().read().await.calibration_busy);
+}
+
+// ---- calibration.json rejected at startup (review L4) ----
+
+#[tokio::test]
+async fn rejected_calibration_resets_the_grasp_camera_model() {
+    let dir = tempfile::tempdir().unwrap();
+    // grasp_setup.json as an apply wrote it (calibrated camera model), calibration.json corrupt
+    let setup = dir.path().join("grasp_setup.json");
+    std::fs::write(&setup, r#"{"camera_tilt_deg": -30.0, "fx_px": 831.5, "fy_px": 829.0, "cx_px": 318.2, "cy_px": 183.4,
+        "image_size_px": [640, 360], "table_z_m": 0.012, "grip_pixel_norm": [0.41, 0.77]}"#).unwrap();
+    let cal = dir.path().join("calibration.json");
+    std::fs::write(&cal, r#"{"camera_mount": {"q_end_cam": [1, 0, 0"#).unwrap();
+    let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+    let (prof, prof_mount) = { let i = sup.inner().read().await; (i.grasp_setup().unwrap(), i.config.camera_mount.clone()) };
+    grasp::load_into(&sup, &setup).await;
+    assert_eq!(sup.inner().read().await.grasp_setup().unwrap().cx_px, Some(318.2));
+    calibration::load_into(&sup, &cal, Some(&setup)).await;
+    let inner = sup.inner().read().await;
+    assert!(!inner.camera_calibrated() && inner.config.camera_mount == prof_mount, "profile mount");
+    let g = inner.grasp_setup().unwrap();
+    assert_eq!((g.fx_px, g.fy_px, g.cx_px, g.cy_px, g.image_size_px, g.grip_pixel_norm), (prof.fx_px, prof.fy_px, prof.cx_px, prof.cy_px, prof.image_size_px, prof.grip_pixel_norm));
+    assert!((g.camera_tilt_deg - prof.camera_tilt_deg).abs() < 1e-6, "tilt {} vs profile {}", g.camera_tilt_deg, prof.camera_tilt_deg);
+    assert_eq!(g.table_z_m, 0.012, "the table height is kept");
+    let err = inner.calibration_load_error.clone().unwrap();
+    assert!(err.contains("calibration.json") && err.contains("reset"), "{err}");
+    drop(inner);
+    // persisted: the next start sees the same setup; the old file is kept
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&setup).unwrap()).unwrap();
+    assert_eq!(saved["fx_px"].as_f64(), Some(prof.fx_px));
+    assert!(saved["cx_px"].is_null() == prof.cx_px.is_none());
+    let kept: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(kept.iter().any(|n| n.starts_with("grasp_setup.json.pre-reset-")), "{kept:?}");
+    assert!(kept.iter().any(|n| n.starts_with("calibration.json.bad-")), "{kept:?}");
+    // reported in GET /api/v1/calibration
+    let deps = CalibrationDeps::new(cal.clone(), Some(setup.clone()), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap());
+    let st = calibration::status(&sup, &deps).await;
+    assert!(st["load_error"].as_str().is_some_and(|e| e.contains("reset")), "{st}");
+    assert_eq!(st["calibrated"], false);
+    // a fresh start with the saved setup and no calibration.json is consistent and has no error
+    let again = ArmSupervisor::new(ArmConfig::rebot_dm());
+    grasp::load_into(&again, &setup).await;
+    calibration::load_into(&again, &cal, Some(&setup)).await;
+    let i2 = again.inner().read().await;
+    assert!(i2.calibration_load_error.is_none());
+    assert_eq!(i2.grasp_setup().unwrap().fx_px, prof.fx_px);
+}
+
+#[tokio::test]
+async fn successful_apply_clears_the_load_error() {
+    let mut r = rig().await;
+    r.sup.inner().write().await.calibration_load_error = Some("parse calibration.json: bad".into());
+    let ok = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    assert_eq!(ok["type"], "command_ack", "{ok}");
+    assert!(r.sup.inner().read().await.calibration_load_error.is_none());
 }
