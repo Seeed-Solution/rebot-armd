@@ -10,6 +10,8 @@
 #include <thread>
 #include <vector>
 
+#include <sys/socket.h>
+
 #include "vision_control.h"
 
 namespace rv {
@@ -18,12 +20,15 @@ namespace rv {
 bool is_json_content_type(const std::string& value);
 
 /**
- * Pre-routing guard. Returns 0 to continue, 415 for a POST without
- * Content-Type: application/json, 405 for any method other than GET/POST/DELETE
+ * Pre-routing guard. Returns 0 to continue, 415 for a POST or PUT without
+ * Content-Type: application/json, 405 for any method other than GET/POST/PUT/DELETE
  * (including OPTIONS: preflights are never approved, no CORS headers are sent).
- * A cross-origin page cannot send DELETE without a preflight either.
+ * A cross-origin page cannot send DELETE or PUT without a preflight either.
  */
 int precheck_request(const std::string& method, const std::string& content_type);
+
+/** True for a loopback peer: 127.0.0.0/8, ::1, or IPv4-mapped ::ffff:127.0.0.0/104. */
+bool is_loopback_address(const sockaddr* addr, socklen_t len);
 
 enum class ReadStatus { Ok, Timeout, Closed };
 
@@ -55,7 +60,7 @@ private:
     };
 
     void accept_loop();
-    void handle_client(int fd, uint64_t accept_ms);
+    void handle_client(int fd, uint64_t accept_ms, bool loopback);
     void clean_finished_clients();
 
     VisionControl& ctl_;

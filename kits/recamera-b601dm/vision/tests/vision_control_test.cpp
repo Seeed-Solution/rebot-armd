@@ -736,7 +736,10 @@ static void test_http_server() {
     const std::string id = json::parse(resp.substr(resp.find("\r\n\r\n") + 4))["id"];
     resp = http_roundtrip(port, "DELETE /api/subscribe/" + id + " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     CHECK(resp.find("200 OK") != std::string::npos && !c.processing());
+    // PUT needs JSON like POST (415); other methods are 405
     resp = http_roundtrip(port, "PUT /api/mode HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    CHECK(resp.find("415") != std::string::npos);
+    resp = http_roundtrip(port, "PATCH /api/mode HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     CHECK(resp.find("405") != std::string::npos);
     server.stop();
 }

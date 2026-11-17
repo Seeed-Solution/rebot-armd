@@ -195,6 +195,44 @@ Catalogue in `vision.json` (optional) / `vision.json` 中的目录（可选）:
 
 The MuJoCo simulator's perception server has the same route and budget numbers (catalogue `seg`, `det`, `depth`; [simulation](simulation.md)). MuJoCo 仿真的感知服务提供同样的路由与预算数值（目录 `seg`、`det`、`depth`）。
 
+## Camera intrinsics / 相机内参
+
+rebot-vision serves the ArUco stage's intrinsics on `:8090` (`GET` / `PUT /api/calibration/intrinsics`). The cockpit calibration wizard writes them through armd's calibration apply, which calls the provider on loopback; armd does not proxy this route.
+
+rebot-vision 在 `:8090` 提供 ArUco 阶段使用的内参（`GET` / `PUT /api/calibration/intrinsics`）。驾驶舱标定向导经 armd 的标定应用写入，armd 通过回环地址调用提供端；armd 不代理此路由。
+
+`GET /api/calibration/intrinsics` (also the `intrinsics` object of `GET /api/mode`, there without `api_version`) / `GET /api/calibration/intrinsics`（同 `GET /api/mode` 的 `intrinsics` 对象，该处不含 `api_version`）:
+
+```json
+{"api_version":2,"fx":824.0,"fy":824.0,"cx":320.0,"cy":180.0,"k1":0.0,"k2":0.0,"p1":0.0,"p2":0.0,"k3":0.0,
+ "width":640,"height":360,"marker_size":0.05,"revision":1,"overridden_by_cli":false,
+ "config_path":"/userdata/rebot-teleop/vision.json"}
+```
+
+- Values are pixels at 640x360, the content image the ArUco corners refer to; `marker_size` in metres. `revision` is 1 at process start and +1 per accepted `PUT`; it is not persisted, so a restart starts at 1 again. `config_path` is the active configuration file (`--config`, else `/userdata/rebot-teleop/vision.json`). 数值为 640x360 内容图像（ArUco 角点所在坐标系）下的像素值；`marker_size` 单位为米。`revision` 在进程启动时为 1，每次接受的 `PUT` 加 1；不持久化，重启后重新从 1 开始。`config_path` 为当前配置文件（`--config`，否则 `/userdata/rebot-teleop/vision.json`）。
+- `overridden_by_cli: true` when any of `--fx`, `--fy`, `--cx`, `--cy`, `--k1`, `--k2`, `--p1`, `--p2`, `--k3`, `-s/--marker-size` is on the command line: those options win over the file at every start, so a `PUT` is refused. The packaged init script passes only `--config`. 命令行给出 `--fx`、`--fy`、`--cx`、`--cy`、`--k1`、`--k2`、`--p1`、`--p2`、`--k3`、`-s/--marker-size` 中任一项时 `overridden_by_cli` 为 true：这些选项每次启动都覆盖配置文件，因此拒绝 `PUT`。安装包的启动脚本只传 `--config`。
+
+`PUT /api/calibration/intrinsics` (`Content-Type: application/json`, else 415) / `PUT /api/calibration/intrinsics`（须 `Content-Type: application/json`，否则 415）:
+
+```json
+{"fx":830.5,"fy":829.25,"cx":321.0,"cy":182.5,"k1":-0.12,"k2":0.05,"p1":0.001,"p2":-0.002,"k3":0.0,
+ "width":640,"height":360,"marker_size":0.05,"expected_revision":1}
+```
+
+| Condition / 条件 | Reply / 回复 |
+|---|---|
+| peer address not loopback (127.0.0.0/8, `::1`, `::ffff:127.x.y.z`) / 对端不是回环地址 | 403 `{"error":"FORBIDDEN","message":...}` |
+| body not a JSON object, a missing or invalid field, an unknown key / 请求体不是 JSON 对象、字段缺失或无效、未知键 | 400 `{"error":"INVALID_FIELD","field":"cy"\|null,"message":"\"cy\" must be in (0, 360)"}` |
+| command-line intrinsics / 命令行内参 | 409 `{"error":"CLI_OVERRIDE","revision":n,"message":...}` |
+| `expected_revision` is not the current `revision` / `expected_revision` 不是当前 `revision` | 409 `{"error":"REVISION_MISMATCH","revision":n,"expected_revision":m}` |
+| the configuration file cannot be read, is not a JSON object, or the write fails / 配置文件无法读取、不是 JSON 对象或写入失败 | 500 `{"error":"PERSIST_FAILED","message":...}`; nothing changes / 不做任何更改 |
+| stored and applied within 2 s / 2 秒内已保存并生效 | 200, the new `GET` body (`revision` + 1) / 新的 `GET` 响应体（`revision` + 1） |
+| stored, not applied within 2 s / 已保存，2 秒内未生效 | 202 `{"api_version":2,"revision":n}` |
+
+- Validation: every field required except `marker_size` (absent: unchanged); finite numbers; `fx`, `fy` in [100, 5000]; 0 < `cx` < 640, 0 < `cy` < 360; \|`k1`\|, \|`k2`\|, \|`k3`\| <= 10; \|`p1`\|, \|`p2`\| <= 1; `width` 640 and `height` 360 (other sizes are refused, no rescaling); `marker_size` in (0, 1] m; `expected_revision` an unsigned integer. The read-only keys of the `GET` body (`revision`, `overridden_by_cli`, `config_path`, `api_version`) are ignored, so a `GET` body with `expected_revision` added is a valid `PUT`. 校验：除 `marker_size`（缺省时不变）外所有字段必填；数值有限；`fx`、`fy` 在 [100, 5000]；0 < `cx` < 640，0 < `cy` < 360；\|`k1`\|、\|`k2`\|、\|`k3`\| <= 10；\|`p1`\|、\|`p2`\| <= 1；`width` 为 640、`height` 为 360（其他尺寸被拒绝，不做缩放）；`marker_size` 在 (0, 1] 米；`expected_revision` 为无符号整数。`GET` 响应体中的只读键（`revision`、`overridden_by_cli`、`config_path`、`api_version`）被忽略，因此在 `GET` 响应体上加 `expected_revision` 即为合法的 `PUT`。
+- Persistence: the active configuration file is read, `fx`..`k3` and `marker_size` (the keys the loader reads) are set, every other key keeps its value and position, and the result is written to `<path>.tmp.<pid>` in the same directory, fsynced, renamed over the file, and the directory is fsynced. A missing file is created. Formatting and whitespace of the old file are not kept (2-space indent). PUTs are serialised. 持久化：读取当前配置文件，设置 `fx`..`k3` 与 `marker_size`（加载器读取的键），其他键保持原值和位置；结果写入同目录下的 `<path>.tmp.<pid>`，fsync 后重命名覆盖原文件，再 fsync 目录。文件不存在时新建。原文件的格式与空白不保留（2 空格缩进）。多个 PUT 串行执行。
+- Apply: after the write the new values are accepted (`revision` + 1) and the frame thread applies them to the ArUco stage at the start of its next frame, before that frame's pipelines (the same frame boundary as a model swap). In standby the camera gate passes 1 frame per second, so a reply normally comes within 1 s. Marker poses from then on use the new intrinsics; with any nonzero distortion coefficient corners are undistorted for the pose (`undistorted: true`), the reported corners stay raw. After a 202 the values are already stored and are applied before the next frame that runs a pipeline; `GET` already reports them. 生效：写入后新数值被接受（`revision` + 1），帧线程在下一帧开始、该帧流水线运行之前把它们应用到 ArUco 阶段（与模型切换相同的帧边界）。待机时取帧闸门每秒放行 1 帧，因此通常 1 秒内回复。此后标记位姿使用新内参；任一畸变系数非零时位姿计算前对角点去畸变（`undistorted: true`），返回的角点仍为原始值。收到 202 时数值已保存，并会在下一个运行流水线的帧之前生效；`GET` 已报告新值。
+
 ## Agent loop example / Agent 调用示例
 
 ```sh

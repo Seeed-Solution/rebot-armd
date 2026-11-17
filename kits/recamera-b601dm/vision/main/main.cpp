@@ -72,6 +72,7 @@ struct Config {
     std::string depth_metric_str = "auto";  // "auto", "on", "off"
     std::string model_kind_str = "auto";    // "auto", "detect", "segment", "obb"
     rv::Catalogue catalogue;  // vision.json "models" and "ion_*_mb", plus the startup models
+    bool intrinsics_cli = false;  // --fx..--k3 or --marker-size given: PUT /api/calibration/intrinsics refused
     bool verbose = false;
 } g_cfg;
 
@@ -300,6 +301,7 @@ bool parse_args(int argc, char** argv) {
     int opt;
     double d = 0;
     while ((opt = getopt_long(argc, argv, "m:c:f:s:vh", long_opts, nullptr)) != -1) {
+        if (opt == 's' || (opt >= kFx && opt <= kK3)) g_cfg.intrinsics_cli = true;
         switch (opt) {
             case kConfig: break;
             case kMode:
@@ -608,6 +610,13 @@ int main(int argc, char** argv) {
     vo.depth_model_path = resident.depth_model_path;
     vo.depth_metric = resident.depth_metric;
     vo.catalogue = g_cfg.catalogue;
+    vo.intrinsics.cam = g_cfg.aruco.cam;
+    vo.intrinsics.marker_size = g_cfg.aruco.marker_size;
+    vo.intrinsics_cli_override = g_cfg.intrinsics_cli;
+    vo.config_path = g_cfg.config_path;
+    if (g_cfg.intrinsics_cli) {
+        MA_LOGW(TAG, "Intrinsics set on the command line: PUT /api/calibration/intrinsics is refused (CLI_OVERRIDE)");
+    }
     ma::Camera* camera = device_camera();
     rv::VisionControl ctl(vo, [&app, camera](bool on, int gate_fps) {
         // set_camera_fps() is applied by the frame thread at its next loop, but that thread
@@ -693,6 +702,16 @@ int main(int argc, char** argv) {
         last_grab_ms = grab_ms;
         rv::SwapRequest swap;
         if (ctl.take_swap(swap)) apply_swap(swap);
+        // PUT /api/calibration/intrinsics: applied before this frame's pipelines run
+        rv::Intrinsics intr;
+        uint64_t intr_rev = 0;
+        if (ctl.take_intrinsics(intr, intr_rev)) {
+            aruco_stage.set_camera(intr.cam, intr.marker_size);
+            ctl.finish_intrinsics(intr_rev);
+            MA_LOGI(TAG, "Intrinsics revision %llu applied: fx=%.2f fy=%.2f cx=%.2f cy=%.2f k=%g,%g,%g p=%g,%g marker %.4f m",
+                    static_cast<unsigned long long>(intr_rev), intr.cam.fx, intr.cam.fy, intr.cam.cx, intr.cam.cy,
+                    intr.cam.k1, intr.cam.k2, intr.cam.k3, intr.cam.p1, intr.cam.p2, intr.marker_size);
+        }
         rv::Pipelines triggered;
         rv::MaskFocus frame_focus;
         const rv::Pipelines p = ctl.frame_plan(frame_ms, &triggered, &frame_focus);

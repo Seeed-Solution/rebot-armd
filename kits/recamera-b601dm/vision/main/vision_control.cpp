@@ -105,7 +105,10 @@ VisionControl::VisionControl(const Options& opt, OnChange on_change)
       catalogue_(opt.catalogue),
       on_change_(std::move(on_change)),
       fps_(clamp_fps(opt.fps)),
-      models_(model_set_of(opt)) {
+      models_(model_set_of(opt)),
+      intrinsics_cli_(opt.intrinsics_cli_override),
+      config_path_(opt.config_path),
+      intrinsics_(opt.intrinsics) {
     Mode m = opt.mode;
     // Without a model, YOLO modes fall back to what still works.
     if (!opt.yolo_available) m = (m == Mode::Both || m == Mode::Aruco) ? Mode::Aruco : Mode::Off;
@@ -540,6 +543,57 @@ SwapState VisionControl::swap_state(std::string* error, uint64_t* generation) co
     return swap_;
 }
 
+IntrinsicsState VisionControl::intrinsics() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    IntrinsicsState s;
+    s.in = intrinsics_;
+    s.revision = intrinsics_rev_;
+    s.overridden_by_cli = intrinsics_cli_;
+    s.config_path = config_path_;
+    return s;
+}
+
+VisionControl::IntrinsicsStatus VisionControl::put_intrinsics(const Intrinsics& in, uint64_t expected_revision,
+                                                              uint64_t& revision, std::string& error) {
+    std::lock_guard<std::mutex> write_lock(intrinsics_write_mu_);  // only PUTs change the revision
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        revision = intrinsics_rev_;
+    }
+    if (intrinsics_cli_) return IntrinsicsStatus::CliOverride;
+    if (expected_revision != revision) return IntrinsicsStatus::RevisionMismatch;
+    if (!persist_intrinsics(config_path_, in, error)) return IntrinsicsStatus::PersistFailed;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        intrinsics_ = in;
+        revision = ++intrinsics_rev_;
+    }
+    return IntrinsicsStatus::Ok;
+}
+
+bool VisionControl::take_intrinsics(Intrinsics& out, uint64_t& revision) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (intrinsics_applied_ >= intrinsics_rev_) return false;
+    out = intrinsics_;
+    revision = intrinsics_rev_;
+    return true;
+}
+
+void VisionControl::finish_intrinsics(uint64_t revision) {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (revision > intrinsics_applied_) intrinsics_applied_ = revision;
+    }
+    cv_.notify_all();
+}
+
+bool VisionControl::wait_intrinsics_applied(uint64_t revision, int wait_ms) {
+    std::unique_lock<std::mutex> lk(mu_);
+    cv_.wait_for(lk, std::chrono::milliseconds(wait_ms),
+                 [&] { return stopping_ || intrinsics_applied_ >= revision; });
+    return intrinsics_applied_ >= revision;
+}
+
 void VisionControl::shutdown() {
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -644,6 +698,58 @@ static void put_models(nlohmann::json& j, const VisionControl& ctl, const ModelS
                 {"total_mb", cat.ion.total_mb}, {"reserve_mb", cat.ion.reserve_mb}};
 }
 
+/** GET /api/calibration/intrinsics body without api_version (also /api/mode "intrinsics"). */
+static nlohmann::json intrinsics_json(const IntrinsicsState& s) {
+    const aruco::CameraModel& c = s.in.cam;
+    return {{"fx", c.fx}, {"fy", c.fy}, {"cx", c.cx}, {"cy", c.cy}, {"k1", c.k1}, {"k2", c.k2},
+            {"p1", c.p1}, {"p2", c.p2}, {"k3", c.k3}, {"width", kIntrinsicsWidth}, {"height", kIntrinsicsHeight},
+            {"marker_size", s.in.marker_size}, {"revision", s.revision},
+            {"overridden_by_cli", s.overridden_by_cli}, {"config_path", s.config_path}};
+}
+
+static std::string intrinsics_body(const VisionControl& ctl) {
+    nlohmann::json j = intrinsics_json(ctl.intrinsics());
+    j["api_version"] = kApiVersion;
+    return j.dump();
+}
+
+static HttpReply put_intrinsics(VisionControl& ctl, const std::string& body, RequestPeer peer) {
+    if (!peer.loopback) {
+        return {403, nlohmann::json{{"api_version", kApiVersion}, {"error", "FORBIDDEN"},
+                                    {"message", "PUT /api/calibration/intrinsics is accepted from a loopback peer only"}}
+                         .dump()};
+    }
+    Intrinsics in;
+    uint64_t expected = 0;
+    std::string field, message;
+    if (!parse_intrinsics_put(body, ctl.intrinsics().in, in, expected, field, message)) {
+        nlohmann::json e = {{"api_version", kApiVersion}, {"error", "INVALID_FIELD"}, {"message", message}};
+        e["field"] = field.empty() ? nlohmann::json(nullptr) : nlohmann::json(field);
+        return {400, e.dump()};
+    }
+    uint64_t revision = 0;
+    std::string error;
+    switch (ctl.put_intrinsics(in, expected, revision, error)) {
+        case VisionControl::IntrinsicsStatus::CliOverride:
+            return {409, nlohmann::json{{"api_version", kApiVersion}, {"error", "CLI_OVERRIDE"}, {"revision", revision},
+                                        {"message", "intrinsics are set on the command line; a restart would drop a "
+                                                    "stored calibration"}}
+                             .dump()};
+        case VisionControl::IntrinsicsStatus::RevisionMismatch:
+            return {409, nlohmann::json{{"api_version", kApiVersion}, {"error", "REVISION_MISMATCH"},
+                                        {"revision", revision}, {"expected_revision", expected}}
+                             .dump()};
+        case VisionControl::IntrinsicsStatus::PersistFailed:
+            return {500, nlohmann::json{{"api_version", kApiVersion}, {"error", "PERSIST_FAILED"}, {"message", error}}
+                             .dump()};
+        case VisionControl::IntrinsicsStatus::Ok: break;
+    }
+    if (!ctl.wait_intrinsics_applied(revision, VisionControl::kIntrinsicsApplyWaitMs)) {
+        return {202, nlohmann::json{{"api_version", kApiVersion}, {"revision", revision}}.dump()};
+    }
+    return {200, intrinsics_body(ctl)};
+}
+
 static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0) {
     const uint64_t now = now_ms ? now_ms : mono_ms();
     const Mode m = ctl.mode();
@@ -676,6 +782,7 @@ static std::string status_json(const VisionControl& ctl, uint64_t now_ms = 0) {
         {"mask_focus", ctl.get_mask_focus(now, mf) ? mask_focus_json(mf, now) : nullptr},
     };
     put_models(j, ctl, ms);
+    j["intrinsics"] = intrinsics_json(ctl.intrinsics());
     return j.dump();
 }
 
@@ -1034,7 +1141,8 @@ static std::string subscriptions_body(VisionControl& ctl, uint64_t mono) {
 }
 
 HttpReply handle_control_request(VisionControl& ctl, const std::string& method, const std::string& target,
-                                 const std::string& body, uint64_t now_ms, const RequestTimes* times) {
+                                 const std::string& body, uint64_t now_ms, const RequestTimes* times,
+                                 RequestPeer peer) {
     const size_t q = target.find('?');
     const std::string path = target.substr(0, q);
     const std::string query = q == std::string::npos ? "" : target.substr(q + 1);
@@ -1067,6 +1175,9 @@ HttpReply handle_control_request(VisionControl& ctl, const std::string& method, 
         return trigger_reply(ctl, query, body, now_ms, times);
     } else if (path == "/api/models" && method == "POST") {
         return post_models(ctl, body);
+    } else if (path == "/api/calibration/intrinsics") {
+        if (method == "GET") return {200, intrinsics_body(ctl)};
+        if (method == "PUT") return put_intrinsics(ctl, body, peer);
     } else if (path == "/api/subscriptions" && method == "GET") {
         return {200, subscriptions_body(ctl, mono_ms())};
     } else if (path == "/api/subscribe" && method == "POST") {

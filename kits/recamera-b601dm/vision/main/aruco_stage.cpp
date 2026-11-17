@@ -81,6 +81,12 @@ ArucoStage::~ArucoStage() {
     destroy_family(cfg_.family, tf_);
 }
 
+void ArucoStage::set_camera(const aruco::CameraModel& cam, double marker_size) noexcept {
+    cfg_.cam = cam;
+    cfg_.marker_size = marker_size;
+    undistort_ = cam.has_distortion();
+}
+
 bool ArucoStage::init(const ArucoConfig& cfg) {
     cfg_ = cfg;
     undistort_ = cfg.cam.has_distortion();

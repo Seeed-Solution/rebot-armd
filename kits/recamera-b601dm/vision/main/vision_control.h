@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "intrinsics.h"
 #include "mask_geom.h"
 #include "model_catalogue.h"
 
@@ -143,6 +144,14 @@ struct ModelSet {
     uint64_t generation = 0;  ///< +1 per executed swap
 };
 
+/** GET /api/calibration/intrinsics: the accepted intrinsics and where they are stored. */
+struct IntrinsicsState {
+    Intrinsics in;
+    uint64_t revision = 1;           ///< 1 at process start, +1 per accepted PUT (not persisted)
+    bool overridden_by_cli = false;  ///< --fx..--k3 or --marker-size given: PUT refused (CLI_OVERRIDE)
+    std::string config_path;         ///< the file a PUT writes (the active --config)
+};
+
 /** State of the model swap (POST /api/models). */
 enum class SwapState { Idle, Pending, Running, Failed };
 
@@ -190,7 +199,13 @@ public:
         std::string depth_model_path;
         bool depth_metric = false;
         Catalogue catalogue;  ///< models POST /api/models can load, and the ION budget
+        Intrinsics intrinsics;           ///< what the ArUco stage started with
+        bool intrinsics_cli_override = false;
+        std::string config_path;         ///< active vision.json (PUT /api/calibration/intrinsics writes it)
     };
+
+    enum class IntrinsicsStatus { Ok, CliOverride, RevisionMismatch, PersistFailed };
+    static constexpr int kIntrinsicsApplyWaitMs = 2000;
 
     enum class Status { Ok, BadFps, YoloUnavailable, DepthUnavailable, Full, NotFound, SwapBusy, IonBudget };
 
@@ -251,6 +266,25 @@ public:
     uint64_t finish_swap(ModelSet now, const std::string& error);
     /** Swap state, its error and the generation it publishes (pending / running) or published. */
     SwapState swap_state(std::string* error = nullptr, uint64_t* generation = nullptr) const;
+
+    /** The accepted intrinsics (copy). */
+    IntrinsicsState intrinsics() const;
+    /**
+     * PUT /api/calibration/intrinsics after validation. Serialised with other PUTs: refuses
+     * (CliOverride) when command-line intrinsics are in force, (RevisionMismatch) when
+     * `expected_revision` is not the current revision; else writes the config file
+     * (persist_intrinsics; PersistFailed with `error`, nothing changes) and then accepts `in`
+     * as the new state with revision + 1, pending for the frame thread. `revision` = the
+     * current revision (mismatch) or the new one (Ok).
+     */
+    IntrinsicsStatus put_intrinsics(const Intrinsics& in, uint64_t expected_revision, uint64_t& revision,
+                                    std::string& error);
+    /** Frame thread: the accepted intrinsics when they are not applied yet (false otherwise). */
+    bool take_intrinsics(Intrinsics& out, uint64_t& revision);
+    /** Frame thread: the ArUco stage now runs with `revision`. */
+    void finish_intrinsics(uint64_t revision);
+    /** Wait until the frame thread applied `revision` or later; false on timeout or shutdown. */
+    bool wait_intrinsics_applied(uint64_t revision, int wait_ms);
 
     /** Camera gate rate requested last (camera_gate_fps for the current state). */
     int camera_fps() const;
@@ -363,6 +397,13 @@ private:
     SwapState swap_ = SwapState::Idle;
     SwapRequest swap_req_;
     std::string swap_error_;
+    // intrinsics: the write lock serialises PUTs (file write outside mu_); the rest under mu_
+    std::mutex intrinsics_write_mu_;
+    const bool intrinsics_cli_;
+    const std::string config_path_;
+    Intrinsics intrinsics_;
+    uint64_t intrinsics_rev_ = 1;
+    uint64_t intrinsics_applied_ = 1;
 };
 
 /** When the HTTP server accepted the connection and finished reading the request (mono_ms()). */
@@ -376,6 +417,11 @@ struct HttpReply {
     std::string body;
 };
 
+/** Who sent the request. Loopback = 127.0.0.0/8, ::1 or ::ffff:127.0.0.0/104. */
+struct RequestPeer {
+    bool loopback = false;
+};
+
 /**
  * Route one request:
  *   GET  /api/inference                 POST /api/inference {"enabled": bool}
@@ -385,9 +431,15 @@ struct HttpReply {
  *   POST /api/subscribe {"client", "pipelines", "fps"?, "ttl_ms"?, "id"?}
  *   POST /api/subscribe/<id>/keepalive  DELETE /api/subscribe/<id>  GET /api/subscriptions
  *   POST /api/models {"detector"?: name|null, "depth"?: name|null}  (202 {"generation"})
+ *   GET  /api/calibration/intrinsics    PUT /api/calibration/intrinsics (loopback peer only)
+ *        {fx, fy, cx, cy, k1, k2, p1, p2, k3, width, height, marker_size?, expected_revision}
+ *        200 the GET body once applied, 202 {"revision"} when not applied within 2 s,
+ *        400 {"error":"INVALID_FIELD","field"}, 403, 409 REVISION_MISMATCH / CLI_OVERRIDE,
+ *        500 PERSIST_FAILED
  */
 HttpReply handle_control_request(VisionControl& ctl, const std::string& method, const std::string& target,
-                                 const std::string& body, uint64_t now_ms = 0, const RequestTimes* times = nullptr);
+                                 const std::string& body, uint64_t now_ms = 0, const RequestTimes* times = nullptr,
+                                 RequestPeer peer = {});
 
 }  // namespace rv
 

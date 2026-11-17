@@ -35,6 +35,7 @@ enable_testing()
 add_executable(vision_control_test
     ${CMAKE_CURRENT_LIST_DIR}/vision_control_test.cpp
     ${MAIN}/vision_control.cpp
+    ${MAIN}/intrinsics.cpp
     ${MAIN}/model_catalogue.cpp
     ${MAIN}/result_json.cpp
     ${MAIN}/depth_geom.cpp
@@ -43,6 +44,19 @@ target_include_directories(vision_control_test PRIVATE ${MAIN})
 target_compile_options(vision_control_test PRIVATE -Wall -Wextra)
 target_link_libraries(vision_control_test PRIVATE rv_json Threads::Threads)
 add_test(NAME vision_control COMMAND vision_control_test)
+
+add_executable(intrinsics_test
+    ${CMAKE_CURRENT_LIST_DIR}/intrinsics_test.cpp
+    ${MAIN}/intrinsics.cpp
+    ${MAIN}/vision_control.cpp
+    ${MAIN}/model_catalogue.cpp
+    ${MAIN}/result_json.cpp
+    ${MAIN}/depth_geom.cpp
+    ${MAIN}/http_control.cpp)
+target_include_directories(intrinsics_test PRIVATE ${MAIN})
+target_compile_options(intrinsics_test PRIVATE -Wall -Wextra)
+target_link_libraries(intrinsics_test PRIVATE rv_json Threads::Threads)
+add_test(NAME intrinsics COMMAND intrinsics_test)
 
 add_executable(model_catalogue_test ${CMAKE_CURRENT_LIST_DIR}/model_catalogue_test.cpp ${MAIN}/model_catalogue.cpp)
 target_include_directories(model_catalogue_test PRIVATE ${MAIN})

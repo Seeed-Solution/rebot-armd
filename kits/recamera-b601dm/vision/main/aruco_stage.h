@@ -104,6 +104,9 @@ public:
 
     bool init(const ArucoConfig& cfg);
     bool undistorted() const noexcept { return undistort_; }
+    /** New intrinsics and marker side for the next run() (frame thread, between frames). */
+    void set_camera(const aruco::CameraModel& cam, double marker_size) noexcept;
+    const aruco::CameraModel& camera() const noexcept { return cfg_.cam; }
 
     /**
      * Detect markers on a packed RGB888 image (stride in bytes, e.g. a sub_frame of CH0).

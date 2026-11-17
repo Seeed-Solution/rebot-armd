@@ -12,6 +12,7 @@ component_register(
 set(srcs
     ${CMAKE_CURRENT_LIST_DIR}/main.cpp
     ${CMAKE_CURRENT_LIST_DIR}/vision_control.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/intrinsics.cpp
     ${CMAKE_CURRENT_LIST_DIR}/model_catalogue.cpp
     ${CMAKE_CURRENT_LIST_DIR}/class_names.cpp
     ${CMAKE_CURRENT_LIST_DIR}/result_json.cpp

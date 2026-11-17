@@ -42,11 +42,13 @@ static const char* status_text(int code) {
         case 200: return "OK";
         case 202: return "Accepted";
         case 400: return "Bad Request";
+        case 403: return "Forbidden";
         case 404: return "Not Found";
         case 408: return "Request Timeout";
         case 405: return "Method Not Allowed";
         case 409: return "Conflict";
         case 415: return "Unsupported Media Type";
+        case 500: return "Internal Server Error";
         case 503: return "Service Unavailable";
         default: return "Error";
     }
@@ -64,8 +66,22 @@ bool is_json_content_type(const std::string& value) {
 
 int precheck_request(const std::string& method, const std::string& content_type) {
     if (method == "GET" || method == "DELETE") return 0;
-    if (method == "POST") return is_json_content_type(content_type) ? 0 : 415;
+    if (method == "POST" || method == "PUT") return is_json_content_type(content_type) ? 0 : 415;
     return 405;  // OPTIONS and everything else: no CORS preflight is approved
+}
+
+bool is_loopback_address(const sockaddr* addr, socklen_t len) {
+    if (addr == nullptr) return false;
+    if (addr->sa_family == AF_INET && len >= static_cast<socklen_t>(sizeof(sockaddr_in))) {
+        const uint32_t a = ntohl(reinterpret_cast<const sockaddr_in*>(addr)->sin_addr.s_addr);
+        return (a >> 24) == 127;
+    }
+    if (addr->sa_family == AF_INET6 && len >= static_cast<socklen_t>(sizeof(sockaddr_in6))) {
+        const in6_addr& a = reinterpret_cast<const sockaddr_in6*>(addr)->sin6_addr;
+        if (IN6_IS_ADDR_LOOPBACK(&a)) return true;
+        return IN6_IS_ADDR_V4MAPPED(&a) && a.s6_addr[12] == 127;
+    }
+    return false;
 }
 
 static void send_reply(int fd, const HttpReply& r) {
@@ -190,11 +206,12 @@ void HttpControlServer::accept_loop() {
         const int pr = ::poll(&pfd, 1, 200);
         if (pr <= 0 || !running_.load()) continue;
 
-        sockaddr_in caddr;
+        sockaddr_storage caddr;
         socklen_t clen = sizeof(caddr);
         const int cfd = ::accept(sfd, reinterpret_cast<sockaddr*>(&caddr), &clen);
         if (cfd < 0) continue;
         const uint64_t accept_ms = mono_ms();
+        const bool loopback = is_loopback_address(reinterpret_cast<const sockaddr*>(&caddr), clen);
 
         std::shared_ptr<ClientContext> ctx = std::make_shared<ClientContext>();
         ctx->fd = cfd;
@@ -209,8 +226,8 @@ void HttpControlServer::accept_loop() {
                 ::close(cfd);
                 continue;
             }
-            ctx->thread = std::thread([this, ctx, accept_ms]() {
-                handle_client(ctx->fd, accept_ms);
+            ctx->thread = std::thread([this, ctx, accept_ms, loopback]() {
+                handle_client(ctx->fd, accept_ms, loopback);
                 {
                     std::lock_guard<std::mutex> lk(clients_mu_);
                     if (ctx->fd >= 0) {
@@ -289,7 +306,7 @@ ReadStatus read_http_request(int fd, int deadline_ms, std::string& buf, size_t& 
     return ReadStatus::Ok;
 }
 
-void HttpControlServer::handle_client(int fd, uint64_t accept_ms) {
+void HttpControlServer::handle_client(int fd, uint64_t accept_ms, bool loopback) {
     RequestTimes times;
     times.accept_ms = accept_ms;
     std::string buf;
@@ -328,7 +345,9 @@ void HttpControlServer::handle_client(int fd, uint64_t accept_ms) {
 
     const std::string body = buf.substr(header_end + 4, has_content_length ? content_length : std::string::npos);
     times.read_ms = mono_ms();
-    const HttpReply r = handle_control_request(ctl_, method, target, body, 0, &times);
+    RequestPeer peer;
+    peer.loopback = loopback;
+    const HttpReply r = handle_control_request(ctl_, method, target, body, 0, &times, peer);
     send_reply(fd, r);
 }
 

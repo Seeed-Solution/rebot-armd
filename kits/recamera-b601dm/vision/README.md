@@ -333,6 +333,13 @@ File-only ArUco keys (see "ArUco cost"): `lazy_clusters`, `reuse_buffers`, `size
 true), `adaptive_decimate` (default 0 = off), `adaptive_min_side` (40), `roi_tracking` (false),
 `aruco_stats_every` (200, 0 = off).
 
+Intrinsics (`fx`..`k3`, `marker_size`) can also be written at runtime with
+`PUT /api/calibration/intrinsics` from a loopback peer (armd's calibration apply): the active
+config file is rewritten atomically with the other keys kept, and the ArUco stage switches at the
+next frame. `GET /api/calibration/intrinsics` and `/api/mode` `intrinsics` report the values and a
+`revision` (1 at process start, not persisted). Intrinsics given on the command line refuse the PUT
+(409 `CLI_OVERRIDE`). See [detection_api.md](../../../docs/detection_api.md#camera-intrinsics--相机内参).
+
 YOLO model: not in the repository or the deb. The first existing file of `vision.json` `model`,
 `/userdata/rebot-teleop/models/yolo11n.cvimodel`,
 `/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel`,
