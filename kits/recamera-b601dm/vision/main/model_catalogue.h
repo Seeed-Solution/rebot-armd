@@ -4,6 +4,7 @@
 #ifndef REBOT_VISION_MODEL_CATALOGUE_H_
 #define REBOT_VISION_MODEL_CATALOGUE_H_
 
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -37,6 +38,8 @@ struct IonBudget {
 struct Catalogue {
     std::vector<ModelEntry> models;
     IonBudget ion;
+    /// vision.json has a `models` key (even an invalid one): the built-in list is not added.
+    bool configured = false;
     const ModelEntry* find(const std::string& name) const;
 };
 
@@ -75,6 +78,14 @@ bool valid_model_name(const std::string& name);
  * detect / segment / obb entry).
  */
 void parse_catalogue(const std::string& config, Catalogue& out, std::vector<std::string>& warnings);
+
+/**
+ * The built-in catalogue, used when vision.json has no `models` key: the reCamera OS detect and
+ * segment models and the models of models/models.tsv, each at the first of its paths that
+ * `exists`, named by file stem (the name a startup model without a catalogue gets). Measured
+ * ion_mb (docs/detection_api.md "Model switching"); the OBB entry carries the DOTAv1 class names.
+ */
+void add_default_models(Catalogue& cat, const std::function<bool(const std::string&)>& exists);
 
 struct BudgetCheck {
     bool ok = true;

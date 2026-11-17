@@ -64,6 +64,44 @@ bool valid_model_name(const std::string& name) {
     return true;
 }
 
+void add_default_models(Catalogue& cat, const std::function<bool(const std::string&)>& exists) {
+    struct Default {
+        const char* kind;
+        double ion_mb;
+        std::vector<const char*> paths;
+    };
+    static const std::vector<Default> kDefaults = {
+        {"detect", 8.5, {"/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel",
+                         "/userdata/local/models/yolo11n_detection_cv181x_int8.cvimodel"}},
+        {"segment", 19.5, {"/usr/share/supervisor/models/yolo11n_segment_cv181x_int8.cvimodel",
+                           "/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel"}},
+        {"segment", 13.1, {"/userdata/local/models/yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel",
+                           "/userdata/rebot-teleop/models/yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel"}},
+        {"obb", 8.0, {"/userdata/local/models/yolo11n_obb_cv181x_int8_fuse_qout.cvimodel",
+                      "/userdata/rebot-teleop/models/yolo11n_obb_cv181x_int8_fuse_qout.cvimodel"}},
+        {"depth", 20.0, {"/userdata/local/models/zipdepth_metric_384x224_bf16_rgb.cvimodel",
+                         "/userdata/rebot-teleop/models/zipdepth_metric_384x224_bf16_rgb.cvimodel"}},
+    };
+    static const std::vector<std::string> kDota = {
+        "plane", "ship", "storage tank", "baseball diamond", "tennis court", "basketball court",
+        "ground track field", "harbor", "bridge", "large vehicle", "small vehicle", "helicopter",
+        "roundabout", "soccer ball field", "swimming pool"};
+    for (const Default& d : kDefaults) {
+        for (const char* p : d.paths) {
+            if (!exists(p)) continue;
+            ModelEntry e;
+            e.name = file_stem(p);
+            e.path = p;
+            e.kind = d.kind;
+            e.ion_mb = d.ion_mb;
+            if (e.kind == "depth") e.metric = true;
+            if (e.kind == "obb") e.classes = kDota;
+            if (cat.find(e.name) == nullptr) cat.models.push_back(e);
+            break;
+        }
+    }
+}
+
 void parse_catalogue(const std::string& text, Catalogue& out, std::vector<std::string>& warnings) {
     const nlohmann::json config = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
     if (!config.is_object()) return;
@@ -78,6 +116,7 @@ void parse_catalogue(const std::string& text, Catalogue& out, std::vector<std::s
     mb("ion_reserve_mb", out.ion.reserve_mb);
     auto models = config.find("models");
     if (models == config.end()) return;
+    out.configured = true;
     if (!models->is_object()) {
         warnings.push_back("models must be an object of name -> {path, kind, ion_mb}");
         return;

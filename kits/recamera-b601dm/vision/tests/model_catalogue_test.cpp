@@ -161,7 +161,44 @@ static void test_depth_metric() {
     CHECK(register_startup(legacy, "/x/det.cvimodel", "detect", true) == "det" && !legacy.find("det")->metric);
 }
 
+static void test_default_models() {
+    // only files that exist; the first existing path of a model; names are file stems
+    const std::vector<std::string> present = {
+        "/usr/share/supervisor/models/yolo11n_detection_cv181x_int8.cvimodel",
+        "/userdata/rebot-teleop/models/yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel",
+        "/userdata/local/models/yolo11n_obb_cv181x_int8_fuse_qout.cvimodel",
+        "/userdata/local/models/zipdepth_metric_384x224_bf16_rgb.cvimodel",
+        "/userdata/rebot-teleop/models/zipdepth_metric_384x224_bf16_rgb.cvimodel"};
+    auto exists = [&](const std::string& p) {
+        for (const std::string& q : present) if (q == p) return true;
+        return false;
+    };
+    Catalogue c;
+    add_default_models(c, exists);
+    CHECK(c.models.size() == 4);
+    CHECK(c.find("yolo11n_segment_cv181x_int8") == nullptr);
+    const ModelEntry* det = c.find("yolo11n_detection_cv181x_int8");
+    CHECK(det && det->kind == "detect" && det->ion_mb == 8.5 && det->classes.empty());
+    const ModelEntry* s384 = c.find("yolo11n_seg_384x640_cv181x_int8_fuse");
+    CHECK(s384 && s384->kind == "segment" && s384->ion_mb == 13.1 && s384->path == present[1]);
+    const ModelEntry* obb = c.find("yolo11n_obb_cv181x_int8_fuse_qout");
+    CHECK(obb && obb->kind == "obb" && obb->classes.size() == 15 && obb->classes[0] == "plane");
+    const ModelEntry* depth = c.find("zipdepth_metric_384x224_bf16_rgb");
+    CHECK(depth && depth->path == present[3] && depth->metric && *depth->metric && depth->ion_mb == 20.0);
+    // seg384 + depth fits the default budget (21.5 + 13.1 + 20.0 + 8 = 62.6 <= 62.9)
+    CHECK(check_budget(c, s384->name, depth->name).ok);
+    // a startup model at a catalogued path keeps the entry's name
+    CHECK(register_startup(c, present[0], "detect") == det->name && c.models.size() == 4);
+    // vision.json `models` (even an empty object) turns the built-in list off; no key keeps it on
+    Catalogue a, b;
+    std::vector<std::string> w;
+    parse_catalogue(R"({"models": {}})", a, w);
+    parse_catalogue(R"({"fps": 5})", b, w);
+    CHECK(a.configured && !b.configured);
+}
+
 int main() {
+    test_default_models();
     test_budget_table();
     test_catalogue_parsing();
     test_swap_request();
