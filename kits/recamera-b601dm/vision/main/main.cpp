@@ -87,6 +87,7 @@ const char* kDefaultModels[] = {
     "/userdata/local/models/yolo26n_obb_cv181x_int8.cvimodel",
     "/usr/share/supervisor/models/yolo11n_segment_cv181x_int8.cvimodel",
     "/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel",
+    "/userdata/local/models/yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel",
 };
 
 const char* kDefaultDepthModels[] = {
@@ -297,6 +298,11 @@ bool parse_args(int argc, char** argv) {
         if (std::strcmp(argv[i], "--config") == 0) g_cfg.config_path = argv[i + 1];
     }
     load_config_file(g_cfg.config_path);
+    // no `models` in vision.json: the built-in catalogue of the model files on this unit
+    if (!g_cfg.catalogue.configured) {
+        rv::add_default_models(g_cfg.catalogue, [](const std::string& p) { return file_exists(p); });
+        for (const rv::ModelEntry& e : g_cfg.catalogue.models) MA_LOGI(TAG, "Model catalogue: %s (%s) %s", e.name.c_str(), e.kind.c_str(), e.path.c_str());
+    }
 
     int opt;
     double d = 0;

@@ -350,7 +350,8 @@ YOLO model: not in the repository or the deb. The first existing file of `vision
 `/userdata/local/models/yolo11n_obb_cv181x_int8.cvimodel`,
 `/userdata/local/models/yolo26n_obb_cv181x_int8.cvimodel`,
 `/usr/share/supervisor/models/yolo11n_segment_cv181x_int8.cvimodel`,
-`/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel` is loaded. Without a model `yolo` and `both`
+`/userdata/local/models/yolo11n_segment_cv181x_int8.cvimodel`,
+`/userdata/local/models/yolo11n_seg_384x640_cv181x_int8_fuse.cvimodel` is loaded. Without a model `yolo` and `both`
 answer 409 and ArUco works.
 
 Model downloads: the official `yolo11n` detect and segment models ship with reCamera OS in
@@ -358,7 +359,18 @@ Model downloads: the official `yolo11n` detect and segment models ship with reCa
 [`models/models.tsv`](models/models.tsv) (file name, download URL, md5, license).
 `scripts/fetch_models.sh [dir] [kind ...]` downloads them and checks the md5; the default directory
 `/userdata/local/models` is one rebot-vision searches. On a PC: `scripts/fetch_models.sh ./models`, then copy
-the files to `/userdata/local/models/` on the device. The ZipDepth metric model is distilled from
+the files to `/userdata/local/models/` on the device.
+
+Switching between the models: with no `models` key in `vision.json` (the default file has none), rebot-vision builds
+its model catalogue at startup from the model files present on the unit: the reCamera OS detect and segment models,
+and the `models.tsv` models in `/userdata/local/models/` (or `/userdata/rebot-teleop/models/`). Each entry is named
+by its file stem, for example `yolo11n_obb_cv181x_int8_fuse_qout`, carries the measured `ion_mb`, and the OBB entry
+carries the DOTAv1 class names. After downloading models, restart rebot-teleop with the arm idle and torque off
+(`/etc/init.d/K92rebot-teleop restart`, which also restarts armd) so the catalogue picks them up. The startup YOLO model is still the first existing default path above (the OS detect
+model on a stock unit). Switch with `POST /api/models` on `:8090`, for example
+`{"detector": "yolo11n_seg_384x640_cv181x_int8_fuse", "depth": "zipdepth_metric_384x224_bf16_rgb"}`, or a grasp
+task's `models`, or set `vision.json` `"model"` to the file path. A `models` object in `vision.json` replaces the
+built-in list ([detection_api.md](../../../docs/detection_api.md#model-switching--模型切换)). The ZipDepth metric model is distilled from
 Depth-Anything-V2-Metric-Indoor-Large, whose weights are licensed CC-BY-NC-4.0; check that license before
 commercial use.
 
