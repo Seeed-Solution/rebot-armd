@@ -2463,6 +2463,7 @@ CFG.view = {
   wmax: 0.8,                  // rad/s look-around / pitch rate at 100 % speed
   camFlip: QS.get('camflip') === '1',
   camRotDeg: Number(QS.get('camrot')) || 0,
+  qEndCam: null, // camera_mount.q_end_cam from the schema (calibrated mount)
   levelCos: Math.cos(15 * Math.PI / 180), // no auto-level while the optical axis is within 15 deg of vertical
   wPos: 0.2,                  // m/rad, orientation weight in the IK error
   maxRot: 30 * Math.PI / 180, // anti-windup: goal orientation at most this far from the solved pose
@@ -4207,7 +4208,14 @@ const VIK = (() => {
   // camera mount R_end_cam (nested 3x3): z_cam = end_link x; y_cam = flip * J5 axis seen in end_link at
   // the model angles qRef (default: the B601-DM rest angle of J6, motor pi/2 = model 0; x part removed);
   // x_cam = y_cam x z_cam; then rotDeg about the optical axis. armd kinematics::cam_mount_with.
-  function camMount(flip, rotDeg, qRef = [0, 0, 0, 0, 0, 0]) {
+  // qEndCam [w, x, y, z] (armd camera_mount.q_end_cam, calibrated): R_end_cam itself, replacing flip / rotDeg.
+  function camMount(flip, rotDeg, qRef = [0, 0, 0, 0, 0, 0], qEndCam = null) {
+    if (Array.isArray(qEndCam) && qEndCam.length === 4 && qEndCam.every(Number.isFinite)) {
+      const n = Math.hypot(...qEndCam) || 1, [w, x, y, z] = qEndCam.map((v) => v / n);
+      return nest([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
+        2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+        2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]);
+    }
     const f = frames(qRef);
     const aEnd = mv([f.R[0], f.R[3], f.R[6], f.R[1], f.R[4], f.R[7], f.R[2], f.R[5], f.R[8]], f.a[4]); // R^T a
     const y = unit([0, aEnd[1] * (flip ? -1 : 1), aEnd[2] * (flip ? -1 : 1)]), z = [1, 0, 0], x = cross(y, z);
@@ -4493,6 +4501,9 @@ async function loadSchema() {
       S.powerGov = (sc.power_budget && sc.power_budget.governor) || null;
       PWR.key = '';
       S.wsPolicy = sc.workspace || null;
+      // calibrated mount (camera calibration wizard): q_end_cam replaces camFlip / camRotDeg
+      const qEnd = sc.camera_mount && Array.isArray(sc.camera_mount.q_end_cam) ? sc.camera_mount.q_end_cam : null;
+      if (JSON.stringify(qEnd) !== JSON.stringify(CFG.view.qEndCam || null)) { CFG.view.qEndCam = qEnd; camMountNow(); V3.key = ''; }
       S.home = Array.isArray(sc.home_positions) ? sc.home_positions : null;
       S.rest = Array.isArray(sc.resting_pose?.positions) ? sc.resting_pose.positions : S.home;
       if (sc.gripper_policy && Number.isFinite(sc.gripper_policy.closed_rad) && Number.isFinite(sc.gripper_policy.open_rad)) {
@@ -5422,7 +5433,7 @@ function cartTick() {
   if (now <= C.tailUntil || (settling && converging)) { C.sending = true; if (!S.presetRunning) cartSend(t); }
 }
 // camera mount at the J6 rest angle (motor pi/2), recomputed when the schema brings the joint map
-const camMountNow = () => { CFG.view.Rec = VIK.camMount(CFG.view.camFlip, CFG.view.camRotDeg, toModel6([0, 0, 0, 0, 0, Math.PI / 2])); };
+const camMountNow = () => { CFG.view.Rec = VIK.camMount(CFG.view.camFlip, CFG.view.camRotDeg, toModel6([0, 0, 0, 0, 0, Math.PI / 2]), CFG.view.qEndCam); };
 camMountNow();
 // model-space limits for J1..J6: motor soft limits minus the margin, through sign / offset
 function modelLimits6() {

@@ -62,7 +62,20 @@ pub fn create_router_full(
     grasp: crate::grasp::GraspDeps,
     diagnostics: crate::diagnostics::DiagnosticsState,
 ) -> Router {
+    let calibration = crate::calibration::CalibrationDeps::from_env(grasp.setup_path.clone(), detector.clone());
+    create_router_calibration(supervisor, detector, grasp, diagnostics, calibration)
+}
+
+/// [`create_router_full`] with explicit calibration files (`/api/v1/calibration*`).
+pub fn create_router_calibration(
+    supervisor: Arc<ArmSupervisor>,
+    detector: proxy::DetectorUpstream,
+    grasp: crate::grasp::GraspDeps,
+    diagnostics: crate::diagnostics::DiagnosticsState,
+    calibration: crate::calibration::CalibrationDeps,
+) -> Router {
     Router::new()
+        .route("/api/v1/calibration", get(rest::get_calibration))
         .route("/", get(serve_index))
         .route("/assets/jmuxer.min.js", get(serve_jmuxer))
         .route("/assets/three-urdf.min.js", get(assets::serve_three))
@@ -156,6 +169,7 @@ pub fn create_router_full(
         .layer(axum::Extension(detector))
         .layer(axum::Extension(proxy::VisionCache::default()))
         .layer(axum::Extension(grasp))
+        .layer(axum::Extension(calibration))
         .layer(axum::Extension(diagnostics))
         .layer(axum::Extension(sandbox::SandboxState::new_shared()))
         .layer(middleware::from_fn(same_origin))

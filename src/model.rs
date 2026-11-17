@@ -269,6 +269,24 @@ pub struct CameraMount {
     /// above the table on every grasp sub-motion; None = [`CAMERA_BODY_DEFAULT_M`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_size_m: Option<[f32; 3]>,
+    /// Calibrated R_end_cam as a unit quaternion [w, x, y, z] (camera calibration wizard).
+    /// When set it replaces `flip` / `rot_deg` / `tilt_deg` for every consumer;
+    /// `tilt_deg` is then kept as the derived tilt ([`crate::kinematics::derived_tilt_deg`]).
+    /// Must be unit within [`Q_UNIT_TOL`]; it is normalised when loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q_end_cam: Option<[f64; 4]>,
+}
+
+/// Tolerance on |q| - 1 of `camera_mount.q_end_cam`.
+pub const Q_UNIT_TOL: f64 = 1e-3;
+
+/// `q` normalised, or why it is not a unit quaternion within [`Q_UNIT_TOL`].
+pub fn unit_quaternion(q: &[f64; 4]) -> Result<[f64; 4], String> {
+    let n = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if !q.iter().all(|v| v.is_finite()) || (n - 1.0).abs() > Q_UNIT_TOL {
+        return Err(format!("camera_mount.q_end_cam must be a unit quaternion [w, x, y, z] (|q| = 1 within {Q_UNIT_TOL})"));
+    }
+    Ok(q.map(|v| v / n))
 }
 
 /// reCamera housing 40 x 40 x 36.5 mm in the v8 holder (reBot-DevArm
@@ -280,6 +298,12 @@ pub const CAMERA_BODY_DEFAULT_M: [f32; 3] = [0.055, 0.047, 0.040];
 impl CameraMount {
     /// The body box size in use.
     pub fn body_size(&self) -> [f32; 3] { self.body_size_m.unwrap_or(CAMERA_BODY_DEFAULT_M) }
+
+    /// Check `q_end_cam` and normalise it in place.
+    pub fn normalise_q(&mut self) -> Result<(), String> {
+        if let Some(q) = &self.q_end_cam { self.q_end_cam = Some(unit_quaternion(q)?); }
+        Ok(())
+    }
 }
 
 /// Mapping between J7 angle (rad) and jaw opening (m).
@@ -1169,6 +1193,7 @@ impl ArmConfig {
             || cam.offset_m.is_some_and(|o| o.iter().any(|v| !v.is_finite())) {
             return Err("Invalid camera mount".into());
         }
+        if let Some(q) = &cam.q_end_cam { unit_quaternion(q)?; }
         if let Some(g) = &self.gripper_policy {
             let lim = self.gripper_index().and_then(|idx| self.limits.get(idx));
             let in_lim = |v: f32| lim.is_some_and(|l| v >= l.min_position && v <= l.max_position);
@@ -1746,6 +1771,10 @@ pub struct Capabilities {
     pub power_budget: bool,
     #[serde(default)]
     pub auto_yaw: bool,
+    /// Camera calibration wizard: `GET /api/v1/calibration`, WS `/api/v1/calibration/apply`
+    /// and `/api/v1/calibration/restore`, `camera_mount.q_end_cam`; same value as `grasp`.
+    #[serde(default)]
+    pub calibration_apply: bool,
     pub vision: VisionCapabilities,
 }
 
@@ -1790,6 +1819,7 @@ impl Capabilities {
             // The driver half is applied by ArmSupervisor::get_schema.
             power_budget: config.power_budget.as_ref().is_some_and(|p| p.enabled),
             auto_yaw: false,
+            calibration_apply: grasp,
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }

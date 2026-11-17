@@ -610,6 +610,24 @@ impl ArmModel {
         }
     }
 
+    /// R_end_cam of `mount`: the calibrated `q_end_cam` when set, else
+    /// [`Self::cam_mount`] from flip / rot_deg and `tilt_deg` (the grasp setup's tilt for grasps).
+    pub fn r_end_cam(&self, mount: &crate::model::CameraMount, tilt_deg: f64) -> Mat3 {
+        match &mount.q_end_cam {
+            Some(q) => k::quat_to_r(q),
+            None => self.cam_mount(mount.flip, f64::from(mount.rot_deg), tilt_deg),
+        }
+    }
+
+    /// The tilt (deg) `mount` stands for: `tilt_deg`, or the tilt derived from `q_end_cam`
+    /// ([`k::derived_tilt_deg`]).
+    pub fn mount_tilt_deg(&self, mount: &crate::model::CameraMount) -> f64 {
+        match &mount.q_end_cam {
+            Some(q) => k::derived_tilt_deg(&k::quat_to_r(q), &self.cam_mount(mount.flip, 0.0, 0.0)),
+            None => f64::from(mount.tilt_deg),
+        }
+    }
+
     /// Workspace excess for armd joint positions `q` (`kinematics::workspace_violation`).
     pub fn workspace_violation(&self, q: &[f32], ws: &crate::model::WorkspacePolicy, cam: &crate::model::CameraMount) -> k::Violation {
         match self.fk_f32(q) {

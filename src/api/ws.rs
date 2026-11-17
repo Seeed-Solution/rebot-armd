@@ -35,7 +35,8 @@ async fn test_ack_stamp_delay() {
 /// 1..control_frequency_hz). Absent: every tick. Control replies are never decimated.
 pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSupervisor>>,
                         axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
-                        axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>) -> axum::response::Response {
+                        axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>,
+                        axum::Extension(calib): axum::Extension<crate::calibration::CalibrationDeps>) -> axum::response::Response {
     let control_hz = supervisor.inner().read().await.config.control_frequency_hz.max(1);
     let obs_rate = match query.get("obs_hz") {
         None => None,
@@ -44,7 +45,7 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSu
             Err(_) => return (StatusCode::BAD_REQUEST, "obs_hz must be an integer >= 0 (0 and 1 mean 1 Hz; values above control_frequency_hz are clamped)").into_response(),
         },
     };
-    ws.on_upgrade(move |socket| handle_socket(socket, supervisor, deps, obs_rate)).into_response()
+    ws.on_upgrade(move |socket| handle_socket(socket, supervisor, deps, calib, obs_rate)).into_response()
 }
 
 /// Per-connection observation rate limit.
@@ -312,13 +313,47 @@ fn state_command(inner: &mut SupervisorInner, path: &str, body: &Value, setup_pa
     })
 }
 
+/// A calibration command checked under the lock.
+enum CalibJob { Apply(Box<crate::calibration::ApplyRequest>), Restore(Value) }
+
+/// Paths refused while a calibration transaction runs: motion (MOTION_BUSY) and configuration
+/// writes (CONFIG_BUSY). Stop, torque, clear_fault and everything else go through.
+fn calibration_busy_code(inner: &SupervisorInner, path: &str) -> Option<&'static str> {
+    if !inner.calibration_busy || path == "/api/v1/motion/stop" { return None; }
+    if path.starts_with("/api/v1/action/") || path.starts_with("/api/v1/motion/") || path.starts_with("/api/v1/mode/") { return Some("MOTION_BUSY"); }
+    if path.starts_with("/api/v1/calibration/") || matches!(path, "/api/v1/grasp/setup" | "/api/v1/poses/save" | "/api/v1/poses/delete"
+        | "/api/v1/safety/collision" | "/api/v1/workspace/keepout" | "/api/v1/gripper/calibration") { return Some("CONFIG_BUSY"); }
+    None
+}
+
+/// Under the lock: parse and check a calibration command; a real apply / restore marks the
+/// transaction running (`calibration_busy`, cleared by its task). Returns (job, busy set).
+fn calibration_job(inner: &mut SupervisorInner, path: &str, body: &Value) -> Result<(CalibJob, bool), crate::calibration::CalibError> {
+    crate::calibration::begin_checks(inner)?;
+    let job = if path == "/api/v1/calibration/apply" {
+        CalibJob::Apply(Box::new(crate::calibration::parse_apply(body)?))
+    } else {
+        if !body.is_object() { return Err(crate::calibration::CalibError::new(400, "INVALID_COMMAND", "Command body must be an object")); }
+        CalibJob::Restore(body.clone())
+    };
+    let busy = !matches!(&job, CalibJob::Apply(r) if r.dry_run);
+    if busy { inner.calibration_busy = true; }
+    Ok((job, busy))
+}
+
+fn calibration_reject(request_id: &Value, e: &crate::calibration::CalibError) -> Value {
+    let mut reply = json!({"type":"command_reject", "request_id":request_id});
+    for (k, v) in e.reply_fields() { reply[k] = v; }
+    reply
+}
+
 fn command_reject(inner: &SupervisorInner, request_id: &Value, error: ApiError) -> Value {
     let mut reply = rejection(error, "command_reject", inner.safety.epoch_id());
     reply["request_id"] = request_id.clone();
     reply
 }
 
-async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: crate::grasp::GraspDeps, obs_rate: Option<ObsRate>) {
+async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: crate::grasp::GraspDeps, calib: crate::calibration::CalibrationDeps, obs_rate: Option<ObsRate>) {
     let (mut sender, mut receiver) = socket.split();
     let mut telemetry = supervisor.subscribe_telemetry();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(64);
@@ -369,6 +404,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let recv_connection = connection.clone();
     let recv_generation = connection_generation.clone();
     let recv_deps = deps;
+    let recv_calib = calib;
     let mut recv_task = tokio::spawn(async move {
         let mut client_label: Option<String> = None;
         let mut last_sequence: Option<u64> = None;
@@ -442,6 +478,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let mut pending_replay: Option<(Value, crate::replay::ReplayInput, u64)> = None;
             let mut pending_dry_run_grasp: Option<(Value, Value)> = None;
             let mut pending_write: Option<crate::persist::PendingWrite> = None;
+            let mut pending_calibration: Option<(Value, CalibJob, u64, u64, bool)> = None;
             if kind == "estop" || kind == "e_stop" {
                 let (state, epoch) = recv_supervisor.trigger_e_stop().await;
                 response = Some(json!({"type":"epoch_sync", "epoch_id":epoch, "safety_state":state}));
@@ -564,7 +601,15 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 } else {
                                     last_request = request_id;
                                     let path = value.get("path").and_then(Value::as_str).unwrap_or("");
-                                    if path.starts_with("/api/v1/action/") {
+                                    if let Some(code) = calibration_busy_code(&inner, path) {
+                                        response = Some(command_reject(&inner, &value["request_id"],
+                                            ApiError(StatusCode::CONFLICT, "a camera calibration apply or restore is running".into(), code.into())));
+                                    } else if path == "/api/v1/calibration/apply" || path == "/api/v1/calibration/restore" {
+                                        response = match calibration_job(&mut inner, path, &value["body"]) {
+                                            Ok((job, busy)) => { pending_calibration = Some((value["request_id"].clone(), job, local_generation, epoch, busy)); None }
+                                            Err(e) => Some(calibration_reject(&value["request_id"], &e)),
+                                        };
+                                    } else if path.starts_with("/api/v1/action/") {
                                         response = match prepare_action(&mut inner, path, &value["body"], epoch, &value["request_id"]) {
                                             Ok(ActionStart::Started(id, duration)) => Some(command_ack(&inner, &value["request_id"], Some((id, duration)))),
                                             Ok(ActionStart::Plan(plan)) => { pending_plan = Some((plan, local_generation)); None }
@@ -591,6 +636,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                         });
                                     }
                                 }
+                            } else if kind == "preset" && inner.calibration_busy {
+                                response = Some(json!({"type":"preset_reject", "name":value.get("name"), "status":409, "code":"MOTION_BUSY", "error":"MOTION_BUSY",
+                                    "message":"a camera calibration apply or restore is running", "epoch_id":epoch}));
                             } else if kind == "preset" {
                                 let name = value.get("name").and_then(Value::as_str).unwrap_or("");
                                 let (path, body) = match name {
@@ -612,6 +660,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 });
                             } else if kind == "servo" || value.get("mode").and_then(Value::as_str) == Some("cartesian_joint_stream") || value.get("positions").is_some() {
                                 match value.get("sequence_id").and_then(Value::as_u64) {
+                                    _ if inner.calibration_busy => response = Some(json!({"type":"servo_reject", "reason":"calibration_busy"})),
                                     None => response = Some(json!({"type":"servo_reject", "reason":"missing_sequence_id"})),
                                     Some(sequence) if last_sequence.is_some_and(|last| { let delta = sequence.wrapping_sub(last); delta == 0 || delta > 1000 }) => {
                                         response = Some(json!({"type":"servo_reject", "reason":"invalid_sequence_id"}));
@@ -695,6 +744,37 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     let mut ack = command_ack(&inner, &request_id, None);
                     for (k, v) in dry.fields() { ack[k.as_str()] = v; }
                     response = Some(ack);
+                }
+                // Calibration apply / restore: its own task (HTTP to rebot-vision, file writes);
+                // this loop goes on (heartbeats, stop) and the reply comes back through ack_tx.
+                if let Some((request_id, job, generation, epoch, busy)) = pending_calibration.take() {
+                    let (sup, calib, conn, gen_now, tx) = (recv_supervisor.clone(), recv_calib.clone(), recv_connection.clone(), recv_generation.clone(), ack_tx.clone());
+                    tokio::spawn(async move {
+                        let check: crate::calibration::LeaseCheck = Box::new(move |inner: &mut SupervisorInner| {
+                            if gen_now.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&conn, generation) {
+                                return Err(crate::calibration::CalibError::new(409, "LEASE_LOST", "This connection lost the lease during the calibration"));
+                            }
+                            if inner.safety.epoch_id() != epoch {
+                                return Err(crate::calibration::CalibError::new(409, "EPOCH_MISMATCH", "The epoch changed during the calibration (stop or e-stop)"));
+                            }
+                            Ok(())
+                        });
+                        let result = match job {
+                            CalibJob::Apply(req) => crate::calibration::apply(&sup, &calib, *req, &check).await,
+                            CalibJob::Restore(body) => crate::calibration::restore(&sup, &calib, &body, &check).await,
+                        };
+                        if busy { sup.inner().write().await.calibration_busy = false; }
+                        let reply = match result {
+                            Ok(Value::Object(fields)) => {
+                                let mut ack = json!({"type":"command_ack", "request_id":request_id, "status":"accepted"});
+                                for (k, v) in fields { ack[k] = v; }
+                                ack
+                            }
+                            Ok(other) => json!({"type":"command_ack", "request_id":request_id, "status":"accepted", "result":other}),
+                            Err(e) => calibration_reject(&request_id, &e),
+                        };
+                        let _ = tx.send(reply).await;
+                    });
                 }
                 // State files are written by the single persist writer; this loop does not wait
                 // for the disk: the ack (with `persisted`) is sent when the write finished.

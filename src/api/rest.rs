@@ -460,6 +460,15 @@ pub async fn get_grasp_setup(
     }
 }
 
+/// `GET /api/v1/calibration`: the camera calibration in effect, the live mount and grasp
+/// fields, and the backups (`crate::calibration`).
+pub async fn get_calibration(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::Extension(deps): axum::Extension<crate::calibration::CalibrationDeps>,
+) -> Response {
+    Json(crate::calibration::status(&supervisor, &deps).await).into_response()
+}
+
 /// `GET /api/v1/workspace/keepout`: effective keep-out boxes and their source.
 pub async fn get_keepout(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
     Json(supervisor.inner().read().await.keepout_state()).into_response()
