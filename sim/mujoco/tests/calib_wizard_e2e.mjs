@@ -79,10 +79,15 @@ async function waitAction(id, ms = 120000) {
   throw new Error(`action ${id} still running`);
 }
 // wizard cwMove: move_to the end pose T with the speed caps
+// (phase 'reject': refused before any motion, 'action': the started action failed)
+let ownAction = null;
 async function move(T, speed = SPEED) {
-  const ack = await command('/api/v1/action/move_to', { position: CW.posOf(T), orientation: { quat: CW.quatOf(CW.rotOf(T)) }, speed, tag: 'calib-wizard' });
+  let ack;
+  try { ack = await command('/api/v1/action/move_to', { position: CW.posOf(T), orientation: { quat: CW.quatOf(CW.rotOf(T)) }, speed, tag: 'calib-wizard' }); }
+  catch (e) { throw Object.assign(e, { phase: 'reject' }); }
+  ownAction = ack.action_id;
   const rec = await waitAction(ack.action_id);
-  if (rec.state !== 'done') throw Object.assign(new Error(rec.message || rec.code), { code: rec.code || rec.state });
+  if (rec.state !== 'done') throw Object.assign(new Error(rec.message || rec.code), { code: rec.code || rec.state, phase: 'action' });
 }
 // wizard cwSettle: all joint speeds <= 0.02 rad/s for 0.3 s
 async function settle() {
@@ -139,28 +144,37 @@ try {
   out.timings.bootstrap_s = (Date.now() - t0) / 1000;
   log(`plan: ${plan.length} poses (generator ${JSON.stringify(genStats)}), cam-board ${Math.min(...plan.map((p) => p.dist))}..${Math.max(...plan.map((p) => p.dist))} m`);
   const accepted = () => views.filter((v) => CW.boardMarkers(v, board).length >= CW.GATES.minMarkers).length;
-  for (let i = 0; i < plan.length; i++) {
-    const p = plan[i];
-    try { await move(p.T); } catch (e) { out.skipped.push({ i, why: 'move ' + e.code }); log(`#${i + 1} skipped: move ${e.code}`); continue; }
-    await settle();
-    let v = await capture();
-    if (v.err === 'moved') { await settle(); v = await capture(); }
-    const m = v.err ? 0 : CW.boardMarkers(v, board).length;
-    if (v.err || m < CW.GATES.minMarkers) { out.skipped.push({ i, why: v.err || `markers ${m}` }); log(`#${i + 1} skipped: ${v.err || m + ' markers'}`); continue; }
-    views.push(v);
-    log(`#${i + 1} ${p.dist} m tilt ${p.tiltDeg}/${p.azDeg} deg: ${m} markers`);
-    if (!refined && accepted() >= 8) { // cwRefine
+  // the cockpit's run loop (CW.runPoses): skip only planning refusals, abort on anything else
+  const st = { plan, idx: 0 }, epoch0 = obs.epoch_id;
+  ownAction = null;
+  const res = await CW.runPoses(st, {
+    abortReason: () => CW.runAbortReason({ live: true, epoch0, epoch: obs.epoch_id, state: typeof obs.safety_state === 'string' ? obs.safety_state : Object.keys(obs.safety_state || {})[0],
+      fault: obs.fault || null, hold: !!(obs.collision && obs.collision.active), action: obs.action ? obs.action.id : null, ownAction }),
+    check: (T) => { const q = toModel6(obs.positions); return CW.checkTransition(CALM.fk(q), q, T, { ik, X: est.X, plane: CW.boardPlane(est.Tbb), clearance: 0.10, lo, hi }); },
+    move: (T) => move(T),
+    settle, capture,
+    accept: (v, i, p) => {
+      const m = v.err ? 0 : CW.boardMarkers(v, board).length;
+      if (v.err || m < CW.GATES.minMarkers) { p.state = 'skip'; out.skipped.push({ i, why: v.err || `markers ${m}` }); log(`#${i + 1} skipped: ${v.err || m + ' markers'}`); return; }
+      p.state = 'ok'; views.push(v);
+      log(`#${i + 1} ${p.dist} m tilt ${p.tiltDeg}/${p.azDeg} deg: ${m} markers`);
+    },
+    after: (i) => {
+      if (refined || accepted() < 8) return; // cwRefine
       refined = true;
       const r = CW.solveAll({ views, board, CALM, thickness: THICK });
-      if (r.final) {
-        est = { Tbb: r.final.Tbb, K: r.final.K, X: r.final.X };
-        const left = Math.max(0, target + 1 - views.length);
-        const tail = gen(v.q, left, plan.slice(0, i + 1).map((d) => d.T));
-        log(`re-solve after ${views.length} views: fx ${r.final.K.fx.toFixed(1)}, offset ${CW.posOf(r.final.X).map((t) => (t * 1000).toFixed(1))} mm; ${tail.length} new poses (generator ${JSON.stringify(genStats)})`);
-        if (tail.length) plan = [...plan.slice(0, i + 1), ...tail];
-      }
-    }
-  }
+      if (!r.final) return;
+      est = { Tbb: r.final.Tbb, K: r.final.K, X: r.final.X };
+      const left = Math.max(0, target + 1 - views.length);
+      const tail = gen(toModel6(obs.positions), left, st.plan.slice(0, i + 1).map((d) => d.T));
+      log(`re-solve after ${views.length} views: fx ${r.final.K.fx.toFixed(1)}, offset ${CW.posOf(r.final.X).map((t) => (t * 1000).toFixed(1))} mm; ${tail.length} new poses (generator ${JSON.stringify(genStats)})`);
+      if (tail.length) st.plan = [...st.plan.slice(0, i + 1), ...tail];
+    },
+    stop: () => command('/api/v1/motion/stop', {}),
+    skipWhy: (kind, d) => { log(`skipped: ${kind} ${d}`); return `${kind} ${d}`; },
+  }, { runAll: true });
+  for (const [i, p] of st.plan.entries()) if (p.state === 'skip' && p.why && !out.skipped.some((x) => x.i === i)) out.skipped.push({ i, why: p.why });
+  out.run = { result: res, poses: st.plan.length };
   out.timings.capture_s = (Date.now() - t0) / 1000;
   const solve = CW.solveAll({ views, board, CALM, thickness: THICK, solvedAt: new Date().toISOString() });
   out.views = views.map((v) => ({ markers: v.markers.length, joints: v.joints }));

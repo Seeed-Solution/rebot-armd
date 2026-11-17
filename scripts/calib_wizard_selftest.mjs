@@ -10,6 +10,10 @@
 //   f. gates reject an all fronto-parallel set and a 1.5 px noise set
 //   h. joint refinement (intrinsics + X + board pose, FK fixed): a set whose separate hand-eye error
 //      is > 2 mm comes back < 1 mm / 0.2 deg
+//   i. capture run loop (CW.runPoses / runAbortReason / moveFailureSkips) on a fake arm: a started
+//      action failing (TRACKING_STALL) aborts with no further move_to; a planning refusal
+//      (IK_UNREACHABLE reject) skips the pose; an epoch change during settle aborts; a settle timeout
+//      sends stop, then aborts; a refused transition from the current pose skips without moving
 //   g. pose generator: >= 20 poses, camera 0.18..0.35 m from the board, tool points >= 0.10 m above the
 //      plane, transitions without IK failure / branch flip, two or more tilt azimuths; bootstrap from
 //      nominal values; re-solve after 8 views
@@ -222,6 +226,74 @@ const solveViews = views;
   }
   check('g. re-solve after 8 views + regenerate', !!X8 && g2 && g2.poses.length >= 10,
     X8 ? `8-view fx ${r8.intr.K.fx.toFixed(1)} cx ${r8.intr.K.cx.toFixed(1)} k1 ${r8.intr.K.k1.toFixed(3)}; X err ${(posErr(X8, Xtrue) * 1000).toFixed(2)} mm / ${rotErr(X8, Xtrue).toFixed(2)} deg; regenerated ${g2 ? g2.poses.length : 0}` : `hand-eye failed: ${r8.handEye && r8.handEye.err}`);
+}
+
+// ---- i. capture run loop on a fake arm (observation: epoch, safety state, newest action id)
+{
+  const fake = ({ n = 5, failMove = {}, onSettle = null, checkFail = new Set() } = {}) => {
+    const obs = { epoch: 7, state: 'Armed', fault: null, action: 40 }, log = [];
+    const run = { lease0: 3, epoch0: obs.epoch, own: null };
+    const st = { plan: Array.from({ length: n }, (_, i) => ({ T: i, state: 'pending' })), idx: 0 };
+    let moves = 0;
+    const io = {
+      abortReason: () => CW.runAbortReason({ stopReq: false, hidden: false, live: true, lease0: run.lease0, lease: 3, epoch0: run.epoch0,
+        epoch: obs.epoch, state: obs.state, fault: obs.fault, hold: false, action: obs.action, ownAction: run.own }),
+      check: (T) => (checkFail.has(T) ? { ok: false, reason: 'clearance' } : { ok: true }),
+      move: async (T) => {
+        moves++; log.push(`move ${T}`);
+        const f = failMove[moves];
+        if (f && f.phase === 'reject') throw Object.assign(new Error(f.code), f);
+        obs.action++; run.own = obs.action;
+        if (f) throw Object.assign(new Error(f.code), f);
+      },
+      settle: async () => { log.push('settle'); if (onSettle) onSettle(obs, moves); },
+      capture: async () => ({ markers: [] }),
+      accept: (v, i, p) => { p.state = 'ok'; },
+      after: () => {},
+      stop: async () => { log.push('stop'); },
+      skipWhy: (k, d) => `${k}:${d}`,
+    };
+    return { st, io, log, obs, moves: () => moves };
+  };
+  const go = async (f) => { try { return { res: await CW.runPoses(f.st, f.io, { runAll: true }) }; } catch (e) { return { err: e }; } };
+  // TRACKING_STALL on move 3 (action failed after it started)
+  let f = fake({ failMove: { 3: { code: 'TRACKING_STALL', phase: 'action' } } }), r = await go(f);
+  check('i. TRACKING_STALL on move 3 -> abort, no further move_to', r.err && r.err.why === 'move' && r.err.detail === 'TRACKING_STALL' && f.moves() === 3 && f.log.at(-1) === 'stop',
+    `${r.err ? r.err.why + '/' + r.err.detail : 'no abort'}, moves ${f.moves()}, log ${f.log.join(',')}`);
+  // other started-action failures and non-planning rejects abort too
+  const ab = [];
+  for (const [code, phase] of [['TORQUE_LIMIT', 'action'], ['SUPERSEDED', 'action'], ['IK_UNREACHABLE', 'action'], ['PLAN_STALE', 'reject'], ['MOTION_BUSY', 'reject'], [undefined, 'reject']]) {
+    const g = fake({ failMove: { 2: { code, phase } } }), q = await go(g);
+    ab.push(`${code}/${phase}:${q.err ? q.err.why : 'ran'}:${g.moves()}`);
+    if (!(q.err && q.err.why === 'move' && g.moves() === 2)) fails++;
+  }
+  check('i. other move failures abort', ab.every((x) => x.endsWith(':move:2')), ab.join(' '));
+  // IK_UNREACHABLE refusal (command_reject before motion) on move 2 -> skip, the run continues
+  f = fake({ failMove: { 2: { code: 'IK_UNREACHABLE', phase: 'reject' } } }); r = await go(f);
+  check('i. IK_UNREACHABLE refusal -> pose skipped, run continues', r.res === 'done' && f.moves() === 5 && f.st.plan[1].state === 'skip' && f.st.plan.filter((p) => p.state === 'ok').length === 4 && !f.log.includes('stop'),
+    `${r.res || r.err.why}, moves ${f.moves()}, states ${f.st.plan.map((p) => p.state).join(',')}`);
+  // epoch change (stop / e-stop from elsewhere) during settle after move 2
+  f = fake({ onSettle: (o, m) => { if (m === 2) o.epoch++; } }); r = await go(f);
+  check('i. epoch change during settle -> abort, no further move_to', r.err && r.err.why === 'epoch' && f.moves() === 2 && f.log.at(-1) === 'stop',
+    `${r.err ? r.err.why : 'no abort'}, moves ${f.moves()}, log ${f.log.join(',')}`);
+  // safety state leaves Armed / Moving, a fault, a foreign action
+  const sv = [];
+  for (const [k, fn] of [['state', (o) => { o.state = 'Idle'; }], ['fault', (o) => { o.fault = { code: 'THERMAL_TRIP' }; }], ['foreign', (o) => { o.action += 5; }]]) {
+    const g = fake({ onSettle: (o, m) => { if (m === 1) fn(o); } }), q = await go(g);
+    sv.push(`${k}:${q.err ? q.err.why : 'ran'}:${g.moves()}`);
+    if (!(q.err && q.err.why === k && g.moves() === 1)) fails++;
+  }
+  check('i. state / fault / foreign action during settle -> abort', sv.every((x) => x.endsWith(':1')), sv.join(' '));
+  // settle timeout -> stop sent, then abort
+  f = fake(); f.io.settle = async () => { f.log.push('settle'); throw Object.assign(new Error('timeout'), { code: 'TIMEOUT' }); }; r = await go(f);
+  check('i. settle timeout -> stop sent, then abort', r.err && r.err.why === 'timeout' && f.moves() === 1 && f.log.join(',') === 'move 0,settle,stop',
+    `${r.err ? r.err.why : 'no abort'}, log ${f.log.join(',')}`);
+  // after a skipped pose the next transition is re-checked from the current pose: refused -> skipped without a move
+  f = fake({ failMove: { 2: { code: 'IK_UNREACHABLE', phase: 'reject' } }, checkFail: new Set([2]) }); r = await go(f);
+  check('i. refused transition after a skip -> skipped, not sent', r.res === 'done' && !f.log.includes('move 2') && f.st.plan[2].why === 'transition:clearance' && f.moves() === 4,
+    `${r.res || r.err.why}, log ${f.log.join(',')}`);
+  f = fake({ n: 2, checkFail: new Set([1]) }); r = await go(f);
+  check('i. refused transition with no pose left -> abort', r.err && r.err.why === 'nopose' && f.moves() === 1 && f.log.at(-1) === 'stop', `${r.err ? r.err.why : r.res}, log ${f.log.join(',')}`);
 }
 
 // ---- board SVG

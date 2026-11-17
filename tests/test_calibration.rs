@@ -77,7 +77,7 @@ async fn calibrated_supervisor(dir: &Path) -> ArmSupervisor {
     std::fs::write(&cal, serde_json::to_string(&calib_file(v8_q())).unwrap()).unwrap();
     let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
     grasp::load_into(&sup, &setup).await;
-    calibration::load_into(&sup, &cal).await;
+    calibration::load_into(&sup, &cal, Some(&setup)).await;
     sup
 }
 
@@ -98,7 +98,7 @@ async fn startup_calibration_wins_for_the_mount_and_tilt() {
     let bad = dir.path().join("bad.json");
     std::fs::write(&bad, r#"{"camera_mount": {"q_end_cam": [2, 0, 0, 0], "offset_m": [0, 0, 0]}}"#).unwrap();
     let fresh = ArmSupervisor::new(ArmConfig::rebot_dm());
-    calibration::load_into(&fresh, &bad).await;
+    calibration::load_into(&fresh, &bad, None).await;
     assert!(!fresh.inner().read().await.camera_calibrated());
     assert!(!bad.exists(), "quarantined");
 }
@@ -140,6 +140,12 @@ struct MockVision {
     fail_put: Option<usize>,
     unsupported: bool,
     put_delay_ms: u64,
+    /// The PUT with this 1-based index is applied, then answers 500 (dir fsync after the rename).
+    fail_put_after_apply: Option<usize>,
+    /// The PUT with this 1-based index is applied, then its reply waits this long (ms).
+    slow_reply_after_apply: Option<(usize, u64)>,
+    /// GET answers 500 once this many PUTs arrived.
+    fail_get_after_puts: Option<usize>,
 }
 
 type Mock = Arc<Mutex<MockVision>>;
@@ -155,23 +161,29 @@ fn mock_body(m: &MockVision) -> Value {
 async fn mock_get(State(m): State<Mock>) -> axum::response::Response {
     let m = m.lock().unwrap();
     if m.unsupported { return (StatusCode::NOT_FOUND, axum::Json(json!({"error": "not found"}))).into_response(); }
+    if m.fail_get_after_puts.is_some_and(|n| m.puts >= n) { return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": "busy"}))).into_response(); }
     axum::Json(mock_body(&m)).into_response()
 }
 
 async fn mock_put(State(m): State<Mock>, axum::Json(body): axum::Json<Value>) -> axum::response::Response {
     let delay = { let mut g = m.lock().unwrap(); g.puts += 1; g.put_delay_ms };
     tokio::time::sleep(Duration::from_millis(delay)).await;
-    let mut m = m.lock().unwrap();
-    if m.unsupported { return (StatusCode::NOT_FOUND, axum::Json(json!({"error": "not found"}))).into_response(); }
-    if m.fail_put == Some(m.puts) { return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": "disk full"}))).into_response(); }
-    if body["expected_revision"].as_u64() != Some(m.revision) {
-        return (StatusCode::CONFLICT, axum::Json(json!({"error": "REVISION_MISMATCH", "revision": m.revision}))).into_response();
-    }
-    for k in ["fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3", "width", "height", "marker_size"] {
-        if let Some(v) = body.get(k) { m.values.insert(k.into(), v.clone()); }
-    }
-    m.revision += 1;
-    axum::Json(mock_body(&m)).into_response()
+    let (reply, slow) = {
+        let mut m = m.lock().unwrap();
+        if m.unsupported { return (StatusCode::NOT_FOUND, axum::Json(json!({"error": "not found"}))).into_response(); }
+        if m.fail_put == Some(m.puts) { return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": "disk full"}))).into_response(); }
+        if body["expected_revision"].as_u64() != Some(m.revision) {
+            return (StatusCode::CONFLICT, axum::Json(json!({"error": "REVISION_MISMATCH", "revision": m.revision}))).into_response();
+        }
+        for k in ["fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3", "width", "height", "marker_size"] {
+            if let Some(v) = body.get(k) { m.values.insert(k.into(), v.clone()); }
+        }
+        m.revision += 1;
+        if m.fail_put_after_apply == Some(m.puts) { return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": "fsync failed"}))).into_response(); }
+        (mock_body(&m), m.slow_reply_after_apply.filter(|(n, _)| *n == m.puts).map(|(_, ms)| ms))
+    };
+    if let Some(ms) = slow { tokio::time::sleep(Duration::from_millis(ms)).await; }
+    axum::Json(reply).into_response()
 }
 
 async fn spawn_mock() -> (String, Mock) {
@@ -211,6 +223,7 @@ async fn rig_with(paths: impl FnOnce(&Path) -> (PathBuf, PathBuf)) -> Rig {
     let (cal, setup) = paths(dir.path());
     let mut deps = CalibrationDeps::new(cal, Some(setup.clone()), up.clone());
     deps.backup_dir = dir.path().join("backups");
+    deps.vision_timeout = Duration::from_millis(1500);
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
     let router = armd::api::create_router_calibration(sup.clone(), up.clone(), GraspDeps::http(up, Some(setup)),
         armd::diagnostics::DiagnosticsState::global(), deps.clone());
@@ -471,4 +484,145 @@ async fn apply_rejects_bad_bodies_and_needs_the_lease() {
     let rej = common::ws_reply(&mut other, json!({"type":"command", "request_id":1, "generation":r.generation, "epoch_id":r.epoch,
         "path":"/api/v1/calibration/apply", "body":apply_body(true)}), &["command_reject"]).await;
     assert_eq!(rej["code"], "LEASE_LOST");
+}
+
+// ---- rebot-vision applied the PUT although its reply failed (review M3) ----
+
+/// The vision values equal the ones before the apply (fx 824), at `rev`.
+fn assert_vision_old(r: &Rig, rev: u64) {
+    let m = r.mock.lock().unwrap();
+    assert_eq!((m.values["fx"].as_f64(), m.values["cx"].as_f64(), m.values["k1"].as_f64(), m.revision), (Some(824.0), Some(320.0), Some(0.0), rev));
+}
+
+#[tokio::test]
+async fn vision_put_timeout_after_apply_is_reverted() {
+    let mut r = rig().await;
+    r.mock.lock().unwrap().slow_reply_after_apply = Some((1, 2500)); // > the 1.5 s vision timeout
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    assert_eq!((rej["code"].as_str(), rej["step"].as_str(), rej["reverted"].as_bool()), (Some("VISION_UNREACHABLE"), Some("vision"), Some(true)), "{rej}");
+    assert_vision_old(&r, 2); // applied (rev 1), then reverted with the current revision
+    assert!(!r.deps.path.exists());
+    assert_unchanged(&r).await;
+}
+
+#[tokio::test]
+async fn vision_put_500_after_rename_is_reverted() {
+    let mut r = rig().await;
+    r.mock.lock().unwrap().fail_put_after_apply = Some(1);
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    assert_eq!((rej["code"].as_str(), rej["step"].as_str(), rej["reverted"].as_bool()), (Some("VISION_ERROR"), Some("vision"), Some(true)), "{rej}");
+    assert_vision_old(&r, 2);
+    assert_unchanged(&r).await;
+}
+
+#[tokio::test]
+async fn vision_put_and_read_back_failing_is_inconsistent() {
+    let mut r = rig().await;
+    { let mut m = r.mock.lock().unwrap(); m.fail_put_after_apply = Some(1); m.fail_get_after_puts = Some(1); }
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    assert_eq!((rej["code"].as_str(), rej["step"].as_str()), (Some("CALIBRATION_INCONSISTENT"), Some("vision")), "{rej}");
+    assert_eq!(rej["state"]["vision"], "unknown", "{rej}");
+    assert!(rej["backup"].as_str().is_some_and(|b| std::path::Path::new(b).join("vision_intrinsics.json").is_file()), "{rej}");
+    assert_eq!(r.mock.lock().unwrap().puts, 1, "no blind revert PUT");
+    assert_unchanged(&r).await;
+}
+
+#[tokio::test]
+async fn restore_vision_put_500_after_rename_is_reverted() {
+    let mut r = rig().await;
+    let ok = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    assert_eq!(ok["type"], "command_ack", "{ok}");
+    let name = ok["backup"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    assert_eq!(mock_fx(&r), (831.5, 1));
+    r.mock.lock().unwrap().fail_put_after_apply = Some(2);
+    let rej = cmd(&mut r, "/api/v1/calibration/restore", json!({"backup": name})).await;
+    assert_eq!((rej["code"].as_str(), rej["step"].as_str(), rej["reverted"].as_bool()), (Some("VISION_ERROR"), Some("vision"), Some(true)), "{rej}");
+    assert_eq!(mock_fx(&r), (831.5, 3), "restore PUT applied (rev 2), reverted to the applied values (rev 3)");
+    assert!(r.sup.inner().read().await.camera_calibrated(), "armd keeps the applied calibration");
+    assert!(!r.sup.inner().read().await.calibration_busy);
+}
+
+// ---- busy flag guard (review L3) ----
+
+#[tokio::test]
+async fn busy_guard_clears_the_flag_on_panic_and_on_release() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    // panic while holding the supervisor lock: the guard clears the flag once the lock is free
+    sup.inner().write().await.calibration_busy = true;
+    let s2 = sup.clone();
+    let task = tokio::spawn(async move {
+        let _guard = calibration::BusyGuard::new(s2.clone());
+        let _lock = s2.inner().write().await;
+        panic!("forced panic in the apply task");
+    });
+    assert!(task.await.unwrap_err().is_panic());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while sup.inner().read().await.calibration_busy {
+        assert!(tokio::time::Instant::now() < deadline, "busy flag still set after the panic");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // early return (guard dropped without release), lock free
+    sup.inner().write().await.calibration_busy = true;
+    async fn early(sup: Arc<ArmSupervisor>) -> Result<(), ()> { let _g = calibration::BusyGuard::new(sup); Err(()) }
+    assert!(early(sup.clone()).await.is_err());
+    assert!(!sup.inner().read().await.calibration_busy);
+    // normal release
+    sup.inner().write().await.calibration_busy = true;
+    calibration::BusyGuard::new(sup.clone()).release().await;
+    assert!(!sup.inner().read().await.calibration_busy);
+}
+
+// ---- calibration.json rejected at startup (review L4) ----
+
+#[tokio::test]
+async fn rejected_calibration_resets_the_grasp_camera_model() {
+    let dir = tempfile::tempdir().unwrap();
+    // grasp_setup.json as an apply wrote it (calibrated camera model), calibration.json corrupt
+    let setup = dir.path().join("grasp_setup.json");
+    std::fs::write(&setup, r#"{"camera_tilt_deg": -30.0, "fx_px": 831.5, "fy_px": 829.0, "cx_px": 318.2, "cy_px": 183.4,
+        "image_size_px": [640, 360], "table_z_m": 0.012, "grip_pixel_norm": [0.41, 0.77]}"#).unwrap();
+    let cal = dir.path().join("calibration.json");
+    std::fs::write(&cal, r#"{"camera_mount": {"q_end_cam": [1, 0, 0"#).unwrap();
+    let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+    let (prof, prof_mount) = { let i = sup.inner().read().await; (i.grasp_setup().unwrap(), i.config.camera_mount.clone()) };
+    grasp::load_into(&sup, &setup).await;
+    assert_eq!(sup.inner().read().await.grasp_setup().unwrap().cx_px, Some(318.2));
+    calibration::load_into(&sup, &cal, Some(&setup)).await;
+    let inner = sup.inner().read().await;
+    assert!(!inner.camera_calibrated() && inner.config.camera_mount == prof_mount, "profile mount");
+    let g = inner.grasp_setup().unwrap();
+    assert_eq!((g.fx_px, g.fy_px, g.cx_px, g.cy_px, g.image_size_px, g.grip_pixel_norm), (prof.fx_px, prof.fy_px, prof.cx_px, prof.cy_px, prof.image_size_px, prof.grip_pixel_norm));
+    assert!((g.camera_tilt_deg - prof.camera_tilt_deg).abs() < 1e-6, "tilt {} vs profile {}", g.camera_tilt_deg, prof.camera_tilt_deg);
+    assert_eq!(g.table_z_m, 0.012, "the table height is kept");
+    let err = inner.calibration_load_error.clone().unwrap();
+    assert!(err.contains("calibration.json") && err.contains("reset"), "{err}");
+    drop(inner);
+    // persisted: the next start sees the same setup; the old file is kept
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&setup).unwrap()).unwrap();
+    assert_eq!(saved["fx_px"].as_f64(), Some(prof.fx_px));
+    assert!(saved["cx_px"].is_null() == prof.cx_px.is_none());
+    let kept: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert!(kept.iter().any(|n| n.starts_with("grasp_setup.json.pre-reset-")), "{kept:?}");
+    assert!(kept.iter().any(|n| n.starts_with("calibration.json.bad-")), "{kept:?}");
+    // reported in GET /api/v1/calibration
+    let deps = CalibrationDeps::new(cal.clone(), Some(setup.clone()), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap());
+    let st = calibration::status(&sup, &deps).await;
+    assert!(st["load_error"].as_str().is_some_and(|e| e.contains("reset")), "{st}");
+    assert_eq!(st["calibrated"], false);
+    // a fresh start with the saved setup and no calibration.json is consistent and has no error
+    let again = ArmSupervisor::new(ArmConfig::rebot_dm());
+    grasp::load_into(&again, &setup).await;
+    calibration::load_into(&again, &cal, Some(&setup)).await;
+    let i2 = again.inner().read().await;
+    assert!(i2.calibration_load_error.is_none());
+    assert_eq!(i2.grasp_setup().unwrap().fx_px, prof.fx_px);
+}
+
+#[tokio::test]
+async fn successful_apply_clears_the_load_error() {
+    let mut r = rig().await;
+    r.sup.inner().write().await.calibration_load_error = Some("parse calibration.json: bad".into());
+    let ok = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    assert_eq!(ok["type"], "command_ack", "{ok}");
+    assert!(r.sup.inner().read().await.calibration_load_error.is_none());
 }
