@@ -52,7 +52,7 @@ Open the cockpit at `http://127.0.0.1:8765/`. `--follower-port` defaults to `udp
 cargo test --lib sim_driver            # driver against a fake UDP peer
 cargo test --test test_sim_fk          # armd FK vs MuJoCo end_link poses
 cd sim/mujoco && uv run pytest -s      # simulator + armd end to end, FK fixture current, sysid recovery
-cd sim/mujoco && uv run pytest -s -m "not slow"   # without the 3.5 min sysid recovery test and the grasp e2e
+cd sim/mujoco && uv run pytest -s -m "not slow"   # without the 3.5 min sysid recovery test and the grasp / calibration e2e
 ```
 
 `tests/test_camera.py` checks the stream framing and decodes it with PyAV and with rebot-companion's `snapshot` decoder (a checkout in `REBOT_COMPANION_DIR` or next to the repository; skipped otherwise), detection boxes against the objects' projected centres, the perception API routes and seeded resets. `tests/test_camera_grasp.py` (marker `slow`) runs the tap-to-grasp end to end (below).
@@ -190,6 +190,23 @@ The v8 cases (`v8_default`, `v8_seed3_cube_cup`) start `rebot-sim` with `--camer
 | v8, `--objects cube,cup --seed 3`, cube at (0.232, −0.074) | x 0.453, y 0.432, w 0.091, h 0.075 | 3 | 5.5 px | 35.8 s (37.4 s) | `grasped`, lifted 0.105 m, cup untouched |
 
 `final_offset_px` is absent in both: at the 0.15 m approach the target under the jaws is outside the image after the transition, so no re-check frame is taken. Simulation only; not tried on the arm.
+
+### Calibration wizard in the simulator
+
+`tests/test_calibration_e2e.py` (marker `slow`, needs `node`) starts `rebot-sim --camera` with the v8 holder (`--camera-rot-deg 0 --camera-tilt-deg -38`, the simulator's lens centre), `--fx 800` (the wizard's nominal is 824), `--aruco-board 0.30,0.02,-80` (4 x 3, 25 mm markers) and `--marker-noise-px 0.3`, and `armd --follower sim` with a profile whose `camera_mount` differs from that truth (offset +10 mm along end_link x, `tilt_deg` −35) and no calibration file (temporary `ARMD_CALIBRATION` and `ARMD_GRASP_SETUP`). `tests/calib_wizard_e2e.mjs` runs the cockpit wizard's steps in node with `src/api/calib_wizard.js` and the cockpit IK from `src/api/index.html` (no browser): `move_to` a start pose with the camera 0.28 m above the board, one `["aruco"]` capture, bootstrap with fx 824 and armd's mount, 20 generated poses visited with WS `move_to` at 0.03 m/s and 0.3 rad/s, stationary 0.3 s, `/api/v1/detection/trigger` `["aruco"]`, re-solve and regenerate after 8 views, solve with the joint refinement and the gates, WS `/api/v1/calibration/apply` dry run, then apply. Pass: all gates, fx within 1 % of 800, offset within 3 mm, mount rotation within 1°, `table_z_m` within 3 mm of the truth, the apply ack reads back the solved values (the mount within 1 µm: armd keeps it in f32), `GET /api/v1/calibration` reports `calibrated` with one backup. Then the `v8_default` grasp runs against the same armd with only `approach_height_m` 0.15 in the request (no `fx_px` / `fy_px` / `grip_pixel_norm` / camera overrides) and must end `done` with `holding: true` and the cube lifted more than 5 cm.
+
+Result (spark, 2026-11-17, `__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json uv run pytest -s -m slow tests/test_calibration_e2e.py`, 1 passed in 205 s; the wizard part 131 s, 21 views, none skipped):
+
+| quantity | truth | armd before | separate solve | after the joint refinement (applied) |
+|---|---|---|---|---|
+| fx, fy (px) | 800, 800 | 824 (nominal) | 800.29 | 800.02, 800.11 |
+| cx, cy (px) | 320, 180 | — | — | 319.90, 180.03 |
+| offset (mm) | −73.1, 0.5, 66.0 | −63.1, 0.5, 66.0 | 0.53 mm off | −73.03, 0.48, 65.98 (0.07 mm off) |
+| mount rotation | tilt −38 | tilt −35 | 0.090° off | 0.012° off (derived tilt −38.01°) |
+| table_z_m (mm) | 0 | — | — | −0.01 |
+| reprojection RMS (px) | | | 0.668 (joint model at the separate values) | 0.423 |
+
+`grip_pixel_model` [0.503, −0.327]: outside the image, so `grip_pixel_norm` stayed and the grasp acquired camera-down. Grasp: `done`, holding, 3 centring corrections, cube lifted 0.100 m. Corner noise is drawn per frame, so the numbers differ between runs (two other runs: fx 800.33 / 800.64, offset 0.07 / 0.13 mm, rotation 0.038° / 0.028°). Simulation only; not run on the arm.
 
 ## Friction identification (`rebot-sysid`)
 

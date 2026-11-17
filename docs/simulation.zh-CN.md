@@ -52,7 +52,7 @@ cockpit 地址 `http://127.0.0.1:8765/`。`--follower-port` 默认 `udp://127.0.
 cargo test --lib sim_driver            # 驱动 + 假 UDP 对端
 cargo test --test test_sim_fk          # armd 正运动学 vs MuJoCo end_link 位姿
 cd sim/mujoco && uv run pytest -s      # 仿真器 + armd 端到端，FK fixture 是否最新，sysid 回收
-cd sim/mujoco && uv run pytest -s -m "not slow"   # 跳过约 3.5 分钟的 sysid 回收测试和抓取端到端测试
+cd sim/mujoco && uv run pytest -s -m "not slow"   # 跳过约 3.5 分钟的 sysid 回收测试和抓取 / 标定端到端测试
 ```
 
 `tests/test_camera.py` 检查视频流封装，并分别用 PyAV 和 rebot-companion 的 `snapshot` 解码器解码（需要 `REBOT_COMPANION_DIR` 或仓库旁的 checkout，否则跳过），检查检测框与物体投影中心、感知接口各路由和按种子复位。`tests/test_camera_grasp.py`（标记 `slow`）跑点框抓取端到端（见下）。
@@ -190,6 +190,23 @@ v8 用例（`v8_default`、`v8_seed3_cube_cup`）以 `--camera-rot-deg 0 --camer
 | v8，`--objects cube,cup --seed 3`，方块 (0.232, −0.074) | x 0.453, y 0.432, w 0.091, h 0.075 | 3 | 5.5 px | 35.8 s（37.4 s） | `grasped`，抬起 0.105 m，杯子未被碰到 |
 
 两个用例都没有 `final_offset_px`：0.15 m 接近高度下，转换后夹爪下方的目标不在画面内，不取复查帧。仅在仿真中验证，未在真机上运行。
+
+### 仿真中的标定向导
+
+`tests/test_calibration_e2e.py`（标记 `slow`，需要 `node`）以 v8 支架（`--camera-rot-deg 0 --camera-tilt-deg -38`，仿真器的镜头中心）、`--fx 800`（向导的名义值为 824）、`--aruco-board 0.30,0.02,-80`（4 x 3，25 mm 标记）和 `--marker-noise-px 0.3` 启动 `rebot-sim --camera`；`armd --follower sim` 使用一个 `camera_mount` 与真值不同的 profile（偏移沿 end_link x 加 10 mm，`tilt_deg` −35），且没有标定文件（临时的 `ARMD_CALIBRATION` 与 `ARMD_GRASP_SETUP`）。`tests/calib_wizard_e2e.mjs` 在 node 中用 `src/api/calib_wizard.js` 和 `src/api/index.html` 中的驾驶舱 IK 执行向导的各步（不用浏览器）：`move_to` 到相机位于标定板上方 0.28 m 的起始位姿，一次 `["aruco"]` 采集，用 fx 824 和 armd 当前安装做初始估计，以 WS `move_to`（0.03 m/s、0.3 rad/s）依次到达 20 个生成的位姿，静止 0.3 s，`/api/v1/detection/trigger` `["aruco"]`，8 个视图后重新求解并重新生成位姿，求解（含联合优化）与检查项，WS `/api/v1/calibration/apply` 预演，再正式写入。通过条件：全部检查项通过；fx 与 800 相差在 1 % 内，偏移在 3 mm 内，安装旋转在 1° 内，`table_z_m` 在 3 mm 内；写入回复读回的值等于求解值（安装在 1 µm 内：armd 以 f32 保存）；`GET /api/v1/calibration` 显示 `calibrated` 且有一个备份。之后对同一个 armd 运行 `v8_default` 抓取，请求只带 `approach_height_m` 0.15（不覆盖 `fx_px` / `fy_px` / `grip_pixel_norm` / 相机参数），须以 `done`、`holding: true` 结束，方块抬起超过 5 cm。
+
+结果（spark，2026-11-17，`__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json uv run pytest -s -m slow tests/test_calibration_e2e.py`，205 s 内 1 项通过；向导部分 131 s，21 个视图，无跳过）：
+
+| 量 | 真值 | armd 标定前 | 分步求解 | 联合优化后（写入值） |
+|---|---|---|---|---|
+| fx、fy（px） | 800、800 | 824（名义值） | 800.29 | 800.02、800.11 |
+| cx、cy（px） | 320、180 | — | — | 319.90、180.03 |
+| 偏移（mm） | −73.1、0.5、66.0 | −63.1、0.5、66.0 | 误差 0.53 mm | −73.03、0.48、65.98（误差 0.07 mm） |
+| 安装旋转 | tilt −38 | tilt −35 | 误差 0.090° | 误差 0.012°（推导 tilt −38.01°） |
+| table_z_m（mm） | 0 | — | — | −0.01 |
+| 重投影 RMS（px） | | | 0.668（联合模型在分步值处） | 0.423 |
+
+`grip_pixel_model` [0.503, −0.327] 在画面外，因此 `grip_pixel_norm` 保持不变，抓取以相机朝下方式采集。抓取：`done`，夹持，3 次对中修正，方块抬起 0.100 m。角点噪声按帧抽取，各次运行数值不同（另两次：fx 800.33 / 800.64，偏移 0.07 / 0.13 mm，旋转 0.038° / 0.028°）。仅为仿真结果，未在真机上运行。
 
 ## 摩擦辨识（`rebot-sysid`）
 
