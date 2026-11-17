@@ -38,6 +38,19 @@ async fn serve_jmuxer() -> impl axum::response::IntoResponse {
     )
 }
 
+// Calibration wizard solvers (ES module, imported by index.html on demand; scripts/calib_wizard_selftest.mjs).
+static CALIB_WIZARD_JS: &str = include_str!("calib_wizard.js");
+
+async fn serve_calib_wizard() -> impl axum::response::IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        CALIB_WIZARD_JS,
+    )
+}
+
 /// Build the Axum router for the arm daemon. The detector control API upstream is
 /// `ARMD_DETECTOR_URL` (default `http://127.0.0.1:8090`).
 pub fn create_router(supervisor: Arc<ArmSupervisor>) -> Router {
@@ -65,6 +78,7 @@ pub fn create_router_full(
     Router::new()
         .route("/", get(serve_index))
         .route("/assets/jmuxer.min.js", get(serve_jmuxer))
+        .route("/assets/calib_wizard.js", get(serve_calib_wizard))
         .route("/assets/three-urdf.min.js", get(assets::serve_three))
         .route("/assets/model/{*path}", get(assets::serve_model))
         .route("/assets/wasm/{*path}", get(assets::serve_wasm))

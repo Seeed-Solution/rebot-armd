@@ -1307,3 +1307,14 @@ async fn test_jmuxer_asset_served_as_javascript() {
     assert!(body.contains("JMuxer 2.1.0"));
     assert!(body.contains("global.JMuxer = factory"));
 }
+
+#[tokio::test]
+async fn test_calib_wizard_module_served_as_javascript() {
+    let (addr, _) = spawn_test_server().await;
+    let res = reqwest::get(format!("http://{}/assets/calib_wizard.js", addr)).await.unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let ct = res.headers().get(reqwest::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+    assert!(ct.starts_with("application/javascript"), "content-type: {ct}");
+    let body = res.text().await.unwrap();
+    assert!(body.contains("export function solveAll"));
+}

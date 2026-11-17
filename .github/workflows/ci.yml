@@ -37,6 +37,8 @@ jobs:
       - name: Hand-eye calibration self-test
         # part c (rebot-companion round-trip) is skipped when ../rebot-companion is absent
         run: node scripts/calib_selftest.mjs
+      - name: Calibration wizard self-test
+        run: node scripts/calib_wizard_selftest.mjs
       - name: RPC error contract
         run: node tests/test_rpc_error_contract.js
 

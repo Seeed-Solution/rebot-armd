@@ -304,6 +304,45 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
   .calib-drawer { width: 100%; height: auto; max-height: 92dvh; border-left: 0; border-top: 1px solid var(--sc-color-border); border-radius: 16px 16px 0 0; animation-name: cup; }
   @keyframes cup { from { transform: translateY(32px); opacity: 0; } }
 }
+.cwiz-mask { background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none; pointer-events: none; }
+.cwiz-mask .calib-drawer { pointer-events: auto; box-shadow: -8px 0 28px rgba(15, 23, 42, 0.14); overflow: hidden; }
+.cwiz-head-acts { display: flex; gap: 8px; }
+.cwiz-steps { display: flex; gap: 4px; list-style: none; font-size: 11px; }
+.cwiz-steps li { flex: 1 1 0; text-align: center; padding: 5px 2px; border-radius: var(--sc-radius-base); background: var(--sc-color-bg-sunken); color: var(--sc-color-text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cwiz-steps li.on { background: var(--sc-color-primary-soft); color: var(--sc-color-text); font-weight: 600; outline: 1px solid var(--sc-color-primary); }
+.cwiz-steps li.done { color: var(--sc-status-normal-fg); background: var(--sc-status-normal-bg); }
+.cwiz-body { display: grid; align-content: start; gap: 12px; font-size: 13px; line-height: 1.55; flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.cwiz-body p { color: var(--sc-color-text-secondary); }
+.cwiz-board { border: 1px solid var(--sc-color-border); border-radius: var(--sc-radius-md); background: #fff; padding: 6px; }
+.cwiz-board svg { display: block; width: 100%; height: auto; }
+.cwiz-field { display: grid; grid-template-columns: 1fr 120px; align-items: center; gap: 8px; }
+.cwiz-field input { min-height: 40px; padding: 0 10px; font: inherit; border: 1px solid var(--sc-color-border); border-radius: var(--sc-radius-base); background: var(--sc-color-bg); color: var(--sc-color-text); }
+.cwiz-acts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.cwiz-acts .btn { min-height: 48px; font-size: 14px; touch-action: manipulation; }
+.cwiz-acts .wide { grid-column: 1 / -1; }
+.cwiz-stop { color: #fff !important; background: var(--sc-estop) !important; border-color: var(--sc-estop) !important; }
+.cwiz-toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.cwiz-toggle input { width: 20px; height: 20px; }
+.cwiz-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.cwiz-table th, .cwiz-table td { padding: 5px 6px; border-bottom: 1px solid var(--sc-color-border); text-align: left; vertical-align: top; }
+.cwiz-table th { color: var(--sc-color-text-secondary); font-weight: 500; }
+.cwiz-table td.ok { color: var(--sc-status-normal-fg); }
+.cwiz-table td.bad { color: var(--sc-status-danger-fg); font-weight: 600; }
+.cwiz-table tr.chg td { background: var(--sc-color-primary-soft); }
+.cwiz-poses { max-height: 220px; }
+.cwiz-poses li.cur { outline: 1px solid var(--sc-color-primary); }
+.cwiz-poses li.ok b { color: var(--sc-status-normal-fg); }
+.cwiz-poses li.skip { opacity: 0.6; }
+.cwiz-msg { padding: 10px 12px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 13px; }
+.cwiz-msg.ok { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); }
+.cwiz-foot { display: flex; gap: 8px; flex-shrink: 0; }
+.cwiz-foot .btn[hidden] { display: none; }
+.cwiz-foot .btn { flex: 1 1 0; min-height: 44px; font-size: 13px; }
+.cwiz.min .cwiz-steps, .cwiz.min .cwiz-body, .cwiz.min #cwiz-adv { display: none; }
+@media (max-width: 640px) {
+  .cwiz-mask .calib-drawer { max-height: 66dvh; }
+  .cwiz.min { max-height: none; }
+}
 /* ---------- tap-to-grasp: confirm / progress bar on the video, setup drawer ---------- */
 .grasp-bar { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 5; display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px 10px;
   width: max-content; max-width: calc(100% - 24px); padding: 8px 10px; border-radius: 16px; background: rgba(255,255,255,0.9); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
@@ -1422,7 +1461,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
         <span class="grow"></span>
         <button class="btn" id="btn-calib" type="button">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><path d="M14 4h6v6"/><path d="M20 4l-6 6"/><circle cx="17" cy="17" r="3.5"/><path d="M6.5 14v6M3.5 17h6"/></svg>
-          <span data-i18n="calib.open">手眼标定</span>
+          <span data-i18n="calib.open">相机标定</span>
         </button>
         <button class="btn" id="btn-home">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11l8-7 8 7"/><path d="M6 10v10h12V10"/></svg>
@@ -1793,6 +1832,23 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     </div>
   </aside>
 </div>
+<div class="calib-mask cwiz-mask" id="cwiz" hidden>
+  <aside class="calib-drawer cwiz" id="cwiz-panel" role="dialog" aria-modal="false" aria-labelledby="cwiz-title">
+    <div class="calib-head">
+      <h3 id="cwiz-title" data-i18n="cw.title">相机标定向导</h3>
+      <div class="cwiz-head-acts">
+        <button class="btn calib-x" id="cwiz-min" type="button" data-i18n-aria="cw.min" aria-label="收起">–</button>
+        <button class="btn calib-x" id="cwiz-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+      </div>
+    </div>
+    <ol class="cwiz-steps" id="cwiz-steps"></ol>
+    <div class="cwiz-body" id="cwiz-body"></div>
+    <div class="cwiz-foot">
+      <button class="btn cwiz-stop" id="cwiz-stop" type="button" data-i18n="cw.cap.stop" hidden>停止</button>
+      <button class="btn" id="cwiz-adv" type="button" data-i18n="cw.adv">高级：手动手眼标定</button>
+    </div>
+  </aside>
+</div>
 <div class="calib-mask" id="gset" hidden>
   <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="gset-title">
     <div class="calib-head">
@@ -1903,7 +1959,7 @@ const I18N = {
     'gset.grip': '夹爪位置（画面）', 'gset.grip.pick': '在画面上点选', 'gset.grip.hint': '夹爪朝下停在接近高度，张开，把物体放在桌面上两指正中间，然后点画面上物体的中心。', 'gset.grip.tap': '点击画面中夹爪之间物体的中心',
     'gset.approach': '接近高度 mm', 'gset.grasp': '抓取高度 mm', 'gset.tilt': '相机俯角 °', 'gset.save': '保存高度', 'gset.reload': '重新读取',
     'gset.saved': '抓取设置已保存', 'gset.unsaved': '已生效，但未能写入文件：{e}', 'gset.loading': '读取中…', 'gset.na': '当前配置不支持抓取', 'gset.err': '读取失败：{e}', 'gset.path': '保存位置：{p}', 'gset.bad': '请输入有效数字',
-    'calib.open': '手眼标定', 'calib.title': '手眼标定', 'calib.close': '关闭',
+    'calib.open': '相机标定', 'calib.title': '手眼标定', 'calib.close': '关闭',
     'calib.hint': '眼在手外：相机固定，ArUco 标记贴在夹爪末端（标记中心与 TCP 重合）。每次把机械臂移到不同位置并静止后采集一次，点位尽量分散在工作空间。',
     'calib.count': '已采集位姿: {n} / {total}', 'calib.cap': '采集当前点位', 'calib.cap.busy': '采集中…', 'calib.solve': '求解标定', 'calib.export': '导出配置',
     'calib.reset': '重置', 'calib.reset.confirm': '再点一次确认重置',
@@ -2097,7 +2153,7 @@ const I18N = {
     'gset.grip': 'Grip point (image)', 'gset.grip.pick': 'Tap on the image', 'gset.grip.hint': 'With the gripper pointing down at approach height and open, put an object on the table centred between the jaws, then tap its centre in the video.', 'gset.grip.tap': 'Tap the centre of the object between the jaws',
     'gset.approach': 'Approach mm', 'gset.grasp': 'Grasp mm', 'gset.tilt': 'Camera tilt °', 'gset.save': 'Save heights', 'gset.reload': 'Reload',
     'gset.saved': 'Grasp setup saved', 'gset.unsaved': 'Applied but not written to file: {e}', 'gset.loading': 'Loading…', 'gset.na': 'This profile cannot grasp', 'gset.err': 'Read failed: {e}', 'gset.path': 'Stored at: {p}', 'gset.bad': 'Enter valid numbers',
-    'calib.open': 'Hand-Eye Cal', 'calib.title': 'Hand-Eye Calibration', 'calib.close': 'Close',
+    'calib.open': 'Camera Cal', 'calib.title': 'Hand-Eye Calibration', 'calib.close': 'Close',
     'calib.hint': 'Eye-to-hand: the camera is fixed and an ArUco marker is mounted on the gripper tip (marker centre at the TCP). Move the arm to a new pose, wait until it stops, then capture. Spread the poses across the workspace.',
     'calib.count': 'Poses captured: {n} / {total}', 'calib.cap': 'Capture pose', 'calib.cap.busy': 'Capturing…', 'calib.solve': 'Solve', 'calib.export': 'Export JSON',
     'calib.reset': 'Reset', 'calib.reset.confirm': 'Tap again to reset',
@@ -2254,6 +2310,71 @@ const I18N = {
     'toast.enable_fail': 'Enable failed: ', 'toast.enable_fail_def': 'motors not ready / communication timeout', 'toast.preset_fail': 'Preset failed: ', 'toast.rec_start': 'Recording started ',
   },
 };
+// calibration wizard (cwiz*)
+Object.assign(I18N.zh, {
+  'cw.title': '相机标定向导', 'cw.min': '收起', 'cw.adv': '高级：手动手眼标定',
+  'cw.step.board': '标定板', 'cw.step.place': '摆放', 'cw.step.capture': '采集', 'cw.step.solve': '求解', 'cw.step.review': '确认', 'cw.step.applied': '完成',
+  'cw.unsupported': '当前 armd 不支持标定向导（缺少能力 calibration_apply），请更新 rebot-armd。下方的手动手眼标定仍可使用。',
+  'cw.dof': '标定向导目前只支持 6 轴 B601 机械臂。',
+  'cw.board.hint': '1. 打印标定板，打印比例 100%（不缩放）。2. 用尺子检查刻度尺是否为 100 mm，再量一个黑色方块的边长。3. 把标定板平放在桌面上，箭头指向远离机械臂的方向，不要弯折。',
+  'cw.board.print': '打印标定板', 'cw.board.side': '实测标记边长（mm）', 'cw.board.thick': '标定板厚度（mm）', 'cw.board.bad': '标记边长须在 20–100 mm，厚度在 0–10 mm',
+  'cw.next': '下一步', 'cw.back': '上一步',
+  'cw.place.hint': '用摇杆把相机移到标定板上方约 30 cm，画面里至少能看到 6 个完整标记。然后点「采集起始视图」：向导用这一帧估计标定板位置，并生成后续位姿。',
+  'cw.place.live': '画面中的标定板标记：{n} 个', 'cw.place.cap': '采集起始视图', 'cw.place.few': '只识别到 {n} 个标定板标记（至少 {min} 个），请调整位置',
+  'cw.place.nogen': '从当前位置生成不出可达的位姿（{why}），请换一个起始位置', 'cw.place.ok': '已生成 {n} 个位姿',
+  'cw.mount.guess': '没有测量过的相机镜头位置，起始估计使用 {o} mm，求解后会被替换',
+  'cw.cap.hint': '机械臂以 0.03 m/s、0.3 rad/s 依次移到每个位姿，静止 0.3 s 后采集。默认每个位姿都要确认；勾选「连续运行」后自动执行全部位姿。停止按钮随时可用；页面切到后台、心跳或控制权丢失都会中止运行，不会自动继续。',
+  'cw.cap.count': '已采集 {n} / {target} 个视图 · 跳过 {s} 个', 'cw.cap.next': '移到下一个位姿并采集', 'cw.cap.runall': '连续运行（不再逐个确认）',
+  'cw.cap.start': '开始连续运行', 'cw.cap.stop': '停止', 'cw.cap.preview': '在 3D 视图中预览位姿', 'cw.cap.solve': '求解', 'cw.cap.more': '补充位姿',
+  'cw.cap.moving': '移动到位姿 {i} …', 'cw.cap.capturing': '采集位姿 {i} …', 'cw.cap.refined': '已用前 {n} 个视图重新估计，剩余位姿已更新',
+  'cw.cap.aborted': '已中止：{why}', 'cw.cap.done': '位姿已全部执行',
+  'cw.abort.stop': '已按停止', 'cw.abort.hidden': '页面切到了后台', 'cw.abort.heartbeat': '遥测或心跳中断', 'cw.abort.lease': '控制权已丢失', 'cw.abort.fault': '急停或故障',
+  'cw.pose.pending': '待执行', 'cw.pose.ok': '{m} 个标记', 'cw.pose.skip': '跳过：{why}',
+  'cw.skip.markers': '标记不足（{m} 个）', 'cw.skip.move': '移动失败（{code}）', 'cw.skip.moved': '采集时机械臂在动', 'cw.skip.det': '识别失败',
+  'cw.solve.hint': '每项检查都通过后才能应用。', 'cw.solve.run': '重新求解', 'cw.solve.review': '查看将要修改的内容', 'cw.solve.export': '下载数据',
+  'cw.solve.fail': '有检查未通过：补充位姿后重新求解，或检查标定板是否平整、打印比例是否正确。',
+  'cw.g.views': '有效视图数', 'cw.g.markers': '每个视图的标记数（最少）', 'cw.g.coverage': '画面 3×3 区域覆盖', 'cw.g.rms': '重投影 RMS', 'cw.g.view_rms': '单视图 RMS（最大）',
+  'cw.g.held_out': '留出视图 RMS', 'cw.g.sigma': '内参 1σ（相对值，最大）', 'cw.g.rot_diversity': '转动轴多样性', 'cw.g.he_pos': '手眼位置 RMS', 'cw.g.he_rot': '手眼角度 RMS',
+  'cw.g.plane_tilt': '标定板法向偏离竖直', 'cw.g.plane_spread': '标定板高度极差',
+  'cw.th.check': '检查', 'cw.th.value': '数值', 'cw.th.limit': '限值', 'cw.th.field': '字段', 'cw.th.before': '修改前', 'cw.th.after': '修改后',
+  'cw.r.intr': '内参（640×360）', 'cw.r.mount': '相机安装（end_link 坐标系）', 'cw.r.table': '桌面高度', 'cw.r.dropped': '剔除的视图：{list}',
+  'cw.rev.hint': '下面是 armd 预演（dry_run）给出的修改前后对比。确认后 armd 先备份，再依次写入 rebot-vision 内参、相机安装和抓取设置；任一步失败会回滚已完成的步骤。',
+  'cw.rev.apply': '确认应用', 'cw.rev.confirm': '再点一次确认应用', 'cw.rev.loading': '正在向 armd 请求预演…',
+  'cw.app.ok': '已应用。以下是两项服务读回的数值：', 'cw.app.backup': '备份：{b}', 'cw.app.restore': '恢复到应用前（最近备份）', 'cw.app.restore.confirm': '再点一次确认恢复',
+  'cw.app.restored': '已从备份 {b} 恢复', 'cw.app.done': '完成', 'cw.err': '失败：{m}', 'cw.busy': '运行中，请先停止',
+});
+Object.assign(I18N.en, {
+  'cw.title': 'Camera calibration wizard', 'cw.min': 'Collapse', 'cw.adv': 'Advanced: manual hand-eye',
+  'cw.step.board': 'Board', 'cw.step.place': 'Place', 'cw.step.capture': 'Capture', 'cw.step.solve': 'Solve', 'cw.step.review': 'Review', 'cw.step.applied': 'Applied',
+  'cw.unsupported': 'This armd has no calibration wizard (capability calibration_apply missing); update rebot-armd. The manual hand-eye drawer below still works.',
+  'cw.dof': 'The wizard supports the 6-axis B601 arm only.',
+  'cw.board.hint': '1. Print the board at 100 % (no page scaling). 2. Check that the ruler measures 100 mm, then measure the side of one black square. 3. Lay the board flat on the table, arrow pointing away from the arm, without bends.',
+  'cw.board.print': 'Print board', 'cw.board.side': 'Measured marker side (mm)', 'cw.board.thick': 'Board thickness (mm)', 'cw.board.bad': 'Marker side must be 20–100 mm, thickness 0–10 mm',
+  'cw.next': 'Next', 'cw.back': 'Back',
+  'cw.place.hint': 'Jog the camera to about 30 cm above the board so that at least 6 whole markers are in view, then tap "Capture start view": the wizard estimates the board position from this frame and generates the poses.',
+  'cw.place.live': 'Board markers in view: {n}', 'cw.place.cap': 'Capture start view', 'cw.place.few': 'Only {n} board markers detected (need {min}); adjust the view',
+  'cw.place.nogen': 'No reachable poses from here ({why}); start from another pose', 'cw.place.ok': '{n} poses generated',
+  'cw.mount.guess': 'No measured lens position; the start estimate uses {o} mm, the solve replaces it',
+  'cw.cap.hint': 'The arm moves to each pose at 0.03 m/s and 0.3 rad/s, waits until still plus 0.3 s, then captures. By default every pose needs a tap; with "Run all" the poses run one after another. Stop is always available; a hidden page, lost heartbeat or lost control lease aborts the run, which does not resume by itself.',
+  'cw.cap.count': 'Views {n} / {target} · skipped {s}', 'cw.cap.next': 'Move to the next pose and capture', 'cw.cap.runall': 'Run all (no tap per pose)',
+  'cw.cap.start': 'Start run', 'cw.cap.stop': 'Stop', 'cw.cap.preview': 'Preview poses in 3D', 'cw.cap.solve': 'Solve', 'cw.cap.more': 'Add poses',
+  'cw.cap.moving': 'Moving to pose {i}…', 'cw.cap.capturing': 'Capturing pose {i}…', 'cw.cap.refined': 'Re-estimated from {n} views; remaining poses updated',
+  'cw.cap.aborted': 'Aborted: {why}', 'cw.cap.done': 'All poses visited',
+  'cw.abort.stop': 'Stop pressed', 'cw.abort.hidden': 'page hidden', 'cw.abort.heartbeat': 'telemetry or heartbeat lost', 'cw.abort.lease': 'control lease lost', 'cw.abort.fault': 'E-stop or fault',
+  'cw.pose.pending': 'pending', 'cw.pose.ok': '{m} markers', 'cw.pose.skip': 'skipped: {why}',
+  'cw.skip.markers': 'too few markers ({m})', 'cw.skip.move': 'move failed ({code})', 'cw.skip.moved': 'arm moved during capture', 'cw.skip.det': 'detection failed',
+  'cw.solve.hint': 'Every check must pass before Apply.', 'cw.solve.run': 'Solve again', 'cw.solve.review': 'Review changes', 'cw.solve.export': 'Download data',
+  'cw.solve.fail': 'Some checks failed: add poses and solve again, or check that the board is flat and printed at 100 %.',
+  'cw.g.views': 'Accepted views', 'cw.g.markers': 'Markers per view (min)', 'cw.g.coverage': 'Image 3×3 cell coverage', 'cw.g.rms': 'Reprojection RMS', 'cw.g.view_rms': 'Per-view RMS (max)',
+  'cw.g.held_out': 'Held-out RMS', 'cw.g.sigma': 'Intrinsics 1σ (relative, max)', 'cw.g.rot_diversity': 'Rotation axis diversity', 'cw.g.he_pos': 'Hand-eye position RMS', 'cw.g.he_rot': 'Hand-eye rotation RMS',
+  'cw.g.plane_tilt': 'Board normal from vertical', 'cw.g.plane_spread': 'Board height spread',
+  'cw.th.check': 'Check', 'cw.th.value': 'Value', 'cw.th.limit': 'Limit', 'cw.th.field': 'Field', 'cw.th.before': 'Before', 'cw.th.after': 'After',
+  'cw.r.intr': 'Intrinsics (640×360)', 'cw.r.mount': 'Camera mount (end_link frame)', 'cw.r.table': 'Table height', 'cw.r.dropped': 'Dropped views: {list}',
+  'cw.rev.hint': 'Before / after from an armd dry run. On Apply armd writes a backup, then the rebot-vision intrinsics, the camera mount and the grasp setup; a failing step reverts the earlier ones.',
+  'cw.rev.apply': 'Apply', 'cw.rev.confirm': 'Tap again to apply', 'cw.rev.loading': 'Asking armd for a dry run…',
+  'cw.app.ok': 'Applied. Values read back from both services:', 'cw.app.backup': 'Backup: {b}', 'cw.app.restore': 'Restore last backup', 'cw.app.restore.confirm': 'Tap again to restore',
+  'cw.app.restored': 'Restored from backup {b}', 'cw.app.done': 'Done', 'cw.err': 'Failed: {m}', 'cw.busy': 'A run is in progress; stop it first',
+});
 let LANG = (() => {
   const saved = store('lang');
   if (saved === 'zh' || saved === 'en') return saved;
@@ -2574,11 +2695,11 @@ function rpcError(response) {
   }
   return Object.assign(new Error(message), { code: response.code, status: response.status });
 }
-function commandRPC(path, body, acquire = true) {
+function commandRPC(path, body, acquire = true, timeoutMs = 2000) {
   // First control input: acquire the lease, then send. A stop needs no lease of ours:
   // without one this page has nothing running to stop.
   if (acquire && S.leaseGeneration == null && path !== '/api/v1/motion/stop' && S.ws && S.ws.readyState === 1) {
-    return ensureLease().then(() => commandRPC(path, body, false));
+    return ensureLease().then(() => commandRPC(path, body, false, timeoutMs));
   }
   if (!S.ws || S.ws.readyState !== 1 || S.leaseGeneration == null || S.epoch == null) {
     return Promise.reject(Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' }));
@@ -2589,7 +2710,7 @@ function commandRPC(path, body, acquire = true) {
     const timer = setTimeout(() => {
       pendingCommands.delete(request_id);
       reject(Object.assign(new Error(t('err.cmdtimeout')), { code: 'COMMAND_TIMEOUT' }));
-    }, 2000);
+    }, timeoutMs);
     pendingCommands.set(request_id, { resolve, reject, timer, ws });
     try { ws.send(JSON.stringify({ type: 'command', request_id, path, body: body || {}, generation: S.leaseGeneration, epoch_id: S.epoch, client_id: CLIENT_ID })); }
     catch (error) { clearTimeout(timer); pendingCommands.delete(request_id); reject(error); }
@@ -4454,7 +4575,7 @@ function calOpen(open) {
   if (open !== calOpen.was) { calOpen.was = open; calVisionMode(open); }
 }
 function initCalib() {
-  $('btn-calib').addEventListener('click', () => calOpen(true));
+  $('btn-calib').addEventListener('click', () => cwOpen(true)); // the wizard; its "advanced" button opens this drawer
   $('calib-close').addEventListener('click', () => calOpen(false));
   $('calib').addEventListener('click', (e) => { if (e.target === e.currentTarget) calOpen(false); });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('calib').hidden) calOpen(false); });
@@ -4464,6 +4585,429 @@ function initCalib() {
   $('calib-reset').addEventListener('click', calReset);
   $('calib-mode').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) calSetMode(b.dataset.mode); });
   i18nHooks.push(() => { if (!$('calib').hidden) calRender(); });
+}
+
+/* =================================================================
+   Camera calibration wizard (capability calibration_apply): one automatic capture run on a printed
+   ArUco GridBoard gives intrinsics, hand-eye mount and table height; armd applies them with a backup.
+   Solvers: /assets/calib_wizard.js (CW, imported on first open). Steps: board -> place -> capture ->
+   solve -> review (armd dry run) -> applied. Motion: action move_to at 0.03 m/s / 0.3 rad/s; a run
+   aborts on Stop, a hidden page, stale telemetry, lease loss or a fault and never resumes by itself.
+   ================================================================= */
+const CW_STEPS = ['board', 'place', 'capture', 'solve', 'review', 'applied'];
+const CW_SPEED = { linear: 0.03, angular: 0.3 };
+const CWZ = { open: false, step: 'board', CW: null, markerMm: 50, thickMm: 0.5, board: null, views: [], plan: [], idx: 0, target: 20,
+  runAll: false, running: false, stopReq: false, lease: null, est: null, refined: false, solve: null, dry: null, applied: null,
+  status: '', statusKind: '', armedUntil: 0, previewQ: null, busy: false, live: null };
+const cwSupported = () => !!(S.caps && S.caps.calibration_apply);
+const cwDofOk = () => !(isSoArmProfile() || (S.armDof != null && S.armDof !== 6));
+const cwModelQ = (pos) => { const q = toModel6(pos); if (S.dof !== 7) q[5] = 0; return q; };
+const cwIk = (T, seed) => { const { lo, hi } = modelLimits6(); return VIK.solve(T, seed, { lo, hi, iters: 60 }); };
+function cwSetStatus(msg, kind = '') { CWZ.status = msg; CWZ.statusKind = kind; cwRender(); }
+async function cwLoad() { return (CWZ.CW ||= await import('/assets/calib_wizard.js')); }
+function cwBoard() { return CWZ.CW.makeBoard({ markerSide: CWZ.markerMm / 1000 }); }
+// board markers in the live overlay (ids 0..11 with corners)
+function cwLiveCount() {
+  const { age } = calMarker();
+  if (!(age < 1500)) return 0;
+  const ids = new Set();
+  for (const d of S.detections || []) if (d.aruco && Number(d.aruco.id) >= 0 && Number(d.aruco.id) < 12) ids.add(Number(d.aruco.id));
+  return ids.size;
+}
+// why a running wizard must stop now (null: carry on)
+function cwAbortReason() {
+  if (CWZ.stopReq) return 'stop';
+  if (document.hidden) return 'hidden';
+  if (!isLive() || !S.ws || S.ws.readyState !== 1) return 'heartbeat';
+  if (CWZ.lease != null && S.leaseGeneration !== CWZ.lease) return 'lease';
+  if (S.state === 'EStop' || S.state === 'Fault') return 'fault';
+  return null;
+}
+const cwAbortErr = (why) => Object.assign(new Error(t('cw.abort.' + why)), { code: 'ABORTED', why });
+const cwSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function cwGuardedWait(cond, timeoutMs) {
+  const t0 = Date.now();
+  for (;;) {
+    const why = cwAbortReason();
+    if (why) throw cwAbortErr(why);
+    const v = cond();
+    if (v) return v;
+    if (Date.now() - t0 > timeoutMs) throw Object.assign(new Error('timeout'), { code: 'TIMEOUT' });
+    await cwSleep(50);
+  }
+}
+// move_to the end pose T (4x4) and wait for the action record; throws { code } on failure
+async function cwMove(T) {
+  const CW = CWZ.CW, ack = await commandRPC('/api/v1/action/move_to', {
+    position: CW.posOf(T), orientation: { quat: CW.quatOf(CW.rotOf(T)) }, speed: CW_SPEED, tag: 'calib-wizard' });
+  const id = ack && ack.action_id;
+  const rec = await cwGuardedWait(() => {
+    const o = S.obs || {};
+    for (const a of [o.action, o.previous_action]) if (a && a.id === id && a.state !== 'running') return a;
+    return null;
+  }, 90000);
+  if (rec.state !== 'done') throw Object.assign(new Error(rec.message || rec.code || rec.state), { code: rec.code || rec.state });
+}
+// stationary (all joint speeds < 0.02 rad/s) for 0.3 s
+async function cwSettle() {
+  let since = 0;
+  await cwGuardedWait(() => {
+    const v = S.obs && S.obs.velocities;
+    const still = Array.isArray(v) && v.every((x) => Math.abs(x) <= 0.02);
+    if (!still) { since = 0; return false; }
+    if (!since) since = Date.now();
+    return Date.now() - since >= 300;
+  }, 10000);
+}
+// one ["aruco"] trigger at the current (stationary) pose -> view { markers, G, q, joints } or { err }
+async function cwCapture() {
+  const pos = S.obs.positions.slice();
+  let data;
+  try { data = await detTriggerReq(TRIG_WAIT_MS, ['aruco']); } catch (e) { return { err: 'det', detail: e.message }; }
+  if (!data || data.success === false || data.timeout) return { err: 'det' };
+  if ((data.width && data.width !== 640) || (data.height && data.height !== 360)) return { err: 'det', detail: `image ${data.width}x${data.height}` };
+  const now = S.obs && S.obs.positions;
+  if (!Array.isArray(now) || pos.slice(0, 6).some((v, i) => Math.abs(now[i] - v) > 0.003)) return { err: 'moved' };
+  const markers = (data.markers || []).filter((m) => Number(m.id) >= 0 && Number(m.id) < 12 && Array.isArray(m.corners) && m.corners.length === 4)
+    .map((m) => ({ id: Number(m.id), corners: m.corners.map((c) => [Number(c[0]), Number(c[1])]) }));
+  return { markers, G: calGripper(pos), q: cwModelQ(pos), joints: pos, frame_id: data.frame_id, ts: new Date().toISOString() };
+}
+// current mount (armd GET /api/v1/calibration, else the grasp setup tilt) -> nominal T_end_cam
+async function cwNominalMount() {
+  let mount = null;
+  try { const r = await fetch('/api/v1/calibration', { cache: 'no-store' }); if (r.ok) mount = (await r.json()).camera_mount || null; } catch (_) {}
+  if (!mount) { try { const r = await fetch('/api/v1/grasp/setup', { cache: 'no-store' }); if (r.ok) { const g = await r.json(); mount = { tilt_deg: (g.setup || g).camera_tilt_deg }; } } catch (_) {} }
+  const R = CWZ.CW.mountRotation(VIK, mount || {}, toModel6([0, 0, 0, 0, 0, Math.PI / 2]));
+  const off = mount && Array.isArray(mount.offset_m) ? mount.offset_m.map(Number) : null;
+  return { X: CWZ.CW.make(R, off || [-0.08, 0, 0.05]), guessed: !off };
+}
+function cwPlan(est, q0, n, exclude = []) {
+  const { lo, hi } = modelLimits6();
+  return CWZ.CW.generatePoses({ Tbb: est.Tbb, board: CWZ.board, K: est.K, X: est.X, q0, fk: CALM.fk, ik: cwIk, lo, hi, n, exclude })
+    .poses.map((p) => ({ ...p, state: 'pending' }));
+}
+async function cwBootstrap() {
+  if (CWZ.busy || CWZ.running) return;
+  if (!isLive() || !S.obs || !Array.isArray(S.obs.positions)) { cwSetStatus(t('calib.e.offline'), 'warn'); return; }
+  if (Array.isArray(S.obs.velocities) && S.obs.velocities.some((v) => Math.abs(v) > 0.02)) { cwSetStatus(t('calib.e.moving'), 'warn'); return; }
+  CWZ.busy = true; cwSetStatus(t('calib.cap.busy'));
+  try {
+    const CW = await cwLoad();
+    CWZ.board = cwBoard();
+    const v = await cwCapture();
+    if (v.err) { cwSetStatus(t('cw.skip.' + (v.err === 'moved' ? 'moved' : 'det')) + (v.detail ? ' · ' + v.detail : ''), 'warn'); return; }
+    const n = CW.boardMarkers(v, CWZ.board).length;
+    if (n < CW.GATES.minMarkers) { cwSetStatus(t('cw.place.few', { n, min: CW.GATES.minMarkers }), 'warn'); return; }
+    const { X, guessed } = await cwNominalMount();
+    const bs = CW.bootstrapBoard(v, CWZ.board, { K: CW.NOMINAL, X, G: v.G });
+    if (!bs) { cwSetStatus(t('cw.place.few', { n, min: CW.GATES.minMarkers }), 'warn'); return; }
+    CWZ.est = { Tbb: bs.Tbb, K: { ...CW.NOMINAL }, X };
+    const plan = cwPlan(CWZ.est, v.q, CWZ.target);
+    if (!plan.length) { cwSetStatus(t('cw.place.nogen', { why: 'IK / clearance / markers' }), 'warn'); return; }
+    CWZ.views = [{ ...v, pose: -1 }]; CWZ.plan = plan; CWZ.idx = 0; CWZ.refined = false; CWZ.solve = null; CWZ.dry = null;
+    CWZ.step = 'capture';
+    cwSetStatus(t('cw.place.ok', { n: plan.length }) + (guessed ? ' · ' + t('cw.mount.guess', { o: CW.posOf(X).map((x) => Math.round(x * 1000)).join(', ') }) : ''), 'ok');
+    cwV3Sync();
+  } finally { CWZ.busy = false; cwRender(); }
+}
+// after 8 accepted views: re-solve with what is there and regenerate the remaining poses
+function cwRefine() {
+  const CW = CWZ.CW, ok = CWZ.views.filter((v) => !v.err);
+  const r = CW.solveAll({ views: ok, board: CWZ.board, CALM, thickness: CWZ.thickMm / 1000 });
+  if (!r.intr.K || !r.handEye || !r.handEye.X) return false;
+  const v0 = ok[0], { obj, img } = CW.correspondences({ markers: CW.boardMarkers(v0, CWZ.board) }, CWZ.board, r.intr.order);
+  const p = CW.solvePnP(obj, img, r.intr.K);
+  if (!p) return false;
+  CWZ.est = { Tbb: CW.mul(CW.mul(v0.G, r.handEye.X), CW.make(p.R, p.t)), K: r.intr.K, X: r.handEye.X };
+  const done = CWZ.plan.slice(0, CWZ.idx), left = Math.max(0, CWZ.target + 1 - ok.length);
+  const q = cwModelQ(S.obs.positions);
+  const tail = cwPlan(CWZ.est, q, left, done.map((d) => d.T));
+  if (!tail.length) return false;
+  CWZ.plan = [...done, ...tail];
+  return true;
+}
+const cwAccepted = () => CWZ.views.filter((v) => !v.err && CWZ.CW.boardMarkers(v, CWZ.board).length >= CWZ.CW.GATES.minMarkers).length;
+// visit poses from CWZ.idx: one (confirm mode) or all (run all)
+async function cwRun() {
+  if (CWZ.running || CWZ.idx >= CWZ.plan.length) return;
+  if (!canMove()) { cwSetStatus(lockReason(), 'warn'); return; }
+  CWZ.running = true; CWZ.stopReq = false;
+  try {
+    await ensureLease();
+    CWZ.lease = S.leaseGeneration;
+    do {
+      const i = CWZ.idx, p = CWZ.plan[i];
+      cwSetStatus(t('cw.cap.moving', { i: i + 1 }));
+      try { await cwMove(p.T); }
+      catch (e) {
+        if (e.code === 'ABORTED') throw e;
+        p.state = 'skip'; p.why = t('cw.skip.move', { code: e.code || e.message }); CWZ.idx++;
+        if (['ESTOP_ACTIVE', 'LEASE_LOST', 'COLLISION', 'STOPPED', 'FOLLOWING_ERROR'].includes(e.code)) throw cwAbortErr(e.code === 'LEASE_LOST' ? 'lease' : e.code === 'STOPPED' ? 'stop' : 'fault');
+        continue;
+      }
+      await cwSettle();
+      cwSetStatus(t('cw.cap.capturing', { i: i + 1 }));
+      let v = await cwCapture();
+      if (v.err === 'moved') { await cwSettle(); v = await cwCapture(); }
+      const why = cwAbortReason();
+      if (why) throw cwAbortErr(why);
+      const m = v.err ? 0 : CWZ.CW.boardMarkers(v, CWZ.board).length;
+      if (v.err || m < CWZ.CW.GATES.minMarkers) { p.state = 'skip'; p.why = v.err ? t('cw.skip.' + (v.err === 'moved' ? 'moved' : 'det')) : t('cw.skip.markers', { m }); }
+      else { p.state = 'ok'; p.markers = m; CWZ.views.push({ ...v, pose: i }); }
+      CWZ.idx++;
+      if (!CWZ.refined && cwAccepted() >= 8) {
+        CWZ.refined = true;
+        if (cwRefine()) { toast(t('cw.cap.refined', { n: cwAccepted() })); cwV3Sync(); }
+      }
+      cwRender();
+    } while (CWZ.runAll && CWZ.idx < CWZ.plan.length && !CWZ.stopReq);
+    cwSetStatus(CWZ.idx >= CWZ.plan.length ? t('cw.cap.done') : '', CWZ.idx >= CWZ.plan.length ? 'ok' : '');
+  } catch (e) {
+    if (e.code === 'ABORTED' && e.why !== 'lease') api('/api/v1/motion/stop', {}, { quiet: true }).catch(() => {});
+    cwSetStatus(e.code === 'ABORTED' ? t('cw.cap.aborted', { why: e.message }) : t('cw.err', { m: e.message }), 'warn');
+  } finally { CWZ.running = false; CWZ.stopReq = false; cwRender(); cwV3Sync(); }
+}
+function cwStop() {
+  CWZ.stopReq = true;
+  api('/api/v1/motion/stop', {}, { quiet: true }).catch(() => {});
+  cwRender();
+}
+function cwSolve() {
+  const CW = CWZ.CW;
+  CWZ.solve = CW.solveAll({ views: CWZ.views.filter((v) => !v.err), board: CWZ.board, CALM, thickness: CWZ.thickMm / 1000, solvedAt: new Date().toISOString() });
+  CWZ.step = 'solve'; CWZ.dry = null; CWZ.status = ''; cwRender();
+}
+async function cwReview() {
+  if (!CWZ.solve || !CWZ.solve.ok || CWZ.busy) return;
+  CWZ.busy = true; CWZ.step = 'review'; CWZ.dry = null; cwSetStatus(t('cw.rev.loading'));
+  try {
+    CWZ.dry = await commandRPC('/api/v1/calibration/apply', { ...CWZ.solve.apply, dry_run: true }, true, 15000);
+    cwSetStatus('');
+  } catch (e) { cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
+  finally { CWZ.busy = false; cwRender(); }
+}
+async function cwApply() {
+  if (!CWZ.dry || CWZ.busy) return;
+  if (Date.now() >= CWZ.armedUntil) { CWZ.armedUntil = Date.now() + 4000; cwRender(); setTimeout(cwRender, 4050); return; }
+  CWZ.armedUntil = 0; CWZ.busy = true; cwSetStatus(t('calib.cap.busy'));
+  try {
+    CWZ.applied = await commandRPC('/api/v1/calibration/apply', { ...CWZ.solve.apply, dry_run: false }, true, 30000);
+    CWZ.step = 'applied'; cwSetStatus(t('cw.app.ok'), 'ok');
+  } catch (e) { cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message + (e.step ? ' (' + e.step + ')' : '') }), 'warn'); }
+  finally { CWZ.busy = false; cwRender(); }
+}
+const cwBackupName = (b) => (typeof b === 'string' ? b.split('/').filter(Boolean).pop() : '');
+async function cwRestore() {
+  const name = cwBackupName(CWZ.applied && CWZ.applied.backup);
+  if (!name || CWZ.busy) return;
+  if (Date.now() >= CWZ.armedUntil) { CWZ.armedUntil = Date.now() + 4000; cwRender(); setTimeout(cwRender, 4050); return; }
+  CWZ.armedUntil = 0; CWZ.busy = true;
+  try {
+    const r = await commandRPC('/api/v1/calibration/restore', { backup: name }, true, 30000);
+    CWZ.applied = { ...r, restoredFrom: name };
+    cwSetStatus(t('cw.app.restored', { b: name }), 'ok');
+  } catch (e) { cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
+  finally { CWZ.busy = false; cwRender(); }
+}
+function cwExport() {
+  const out = { kind: 'rebot_calibration_wizard', version: 1, created: new Date().toISOString(), board: { cols: 4, rows: 3, marker_side_m: CWZ.markerMm / 1000, gap_ratio: 0.2, thickness_m: CWZ.thickMm / 1000 },
+    views: CWZ.views.map(({ G, ...v }) => ({ ...v, T_base_end: G })), plan: CWZ.plan.map((p) => ({ T: p.T, q: p.q, dist: p.dist, tiltDeg: p.tiltDeg, azDeg: p.azDeg, rollDeg: p.rollDeg, state: p.state, why: p.why })),
+    result: CWZ.solve ? { ok: CWZ.solve.ok, gates: CWZ.solve.gates, apply: CWZ.solve.apply } : null };
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(out, null, 1)], { type: 'application/json' }));
+  a.download = 'rebot_calib_wizard_' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '.json';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+function cwPrint() {
+  const svg = CWZ.CW.boardSvg(cwBoard());
+  const w = window.open('', '_blank');
+  if (!w) { toast('popup blocked', 'warn'); return; }
+  w.document.write('<!doctype html><title>reBot calibration board</title><style>@page{margin:0}body{margin:0}</style>' + svg);
+  w.document.close(); w.focus(); setTimeout(() => w.print(), 300);
+}
+// 3D view: board, planned camera positions (pending / captured / skipped) and the previewed pose as the ghost
+function cwV3Sync() {
+  const T = V3.T;
+  if (!T || !V3.root) return;
+  if (V3.cwiz) { V3.root.remove(V3.cwiz); V3.cwiz.traverse((o) => { if (o.geometry) o.geometry.dispose(); }); V3.cwiz = null; }
+  if (!CWZ.open || !CWZ.est || !CWZ.plan.length) { V3.dirty = true; return; }
+  const CW = CWZ.CW, g = V3.cwiz = new T.Group(), b = CWZ.board, Tb = CWZ.est.Tbb;
+  const corners = [[-b.width / 2, -b.height / 2, 0], [b.width / 2, -b.height / 2, 0], [b.width / 2, b.height / 2, 0], [-b.width / 2, b.height / 2, 0]]
+    .map((c) => { const p = CW.mul(Tb, [[c[0]], [c[1]], [0], [1]]); return new T.Vector3(p[0][0], p[1][0], p[2][0]); });
+  g.add(new T.LineLoop(new T.BufferGeometry().setFromPoints(corners), new T.LineBasicMaterial({ color: 0x111827 })));
+  const dot = new T.SphereGeometry(0.008, 10, 6), col = { pending: 0x3b82f6, ok: 0x16a34a, skip: 0x9ca3af };
+  const c0 = CW.posOf(Tb);
+  CWZ.plan.forEach((p, i) => {
+    const m = new T.Mesh(dot, new T.MeshBasicMaterial({ color: i === CWZ.idx && p.state === 'pending' ? 0xf59e0b : col[p.state] || col.pending }));
+    m.position.set(p.camPos[0], p.camPos[1], p.camPos[2]); g.add(m);
+    g.add(new T.Line(new T.BufferGeometry().setFromPoints([m.position.clone(), new T.Vector3(c0[0], c0[1], c0[2])]), new T.LineBasicMaterial({ color: 0x93c5fd, transparent: true, opacity: 0.5 })));
+  });
+  V3.root.add(g);
+  const nxt = CWZ.plan[Math.min(CWZ.idx, CWZ.plan.length - 1)];
+  CWZ.previewQ = nxt && nxt.state === 'pending' && !CWZ.running ? [...toMotor6(nxt.q), (S.obs && S.obs.positions && S.obs.positions[6]) || 0] : null;
+  V3.key = ''; V3.dirty = true;
+}
+// rendering
+function cwEl(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function cwBtn(label, fn, { cls = '', disabled = false, id = '' } = {}) { const b = cwEl('button', 'btn ' + cls, label); b.type = 'button'; if (id) b.id = id; b.disabled = disabled; b.addEventListener('click', fn); return b; }
+const cwFmt = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '--');
+function cwGateRow(g) {
+  const tr = document.createElement('tr');
+  const unit = { px: ' px', m: ' mm', deg: '°', rel: ' %', cells: '' }[g.unit] ?? '';
+  const sc = (v) => (g.unit === 'm' ? v * 1000 : g.unit === 'rel' ? v * 100 : v);
+  const val = typeof g.value === 'number' ? (Number.isInteger(g.value) ? String(g.value) : cwFmt(sc(g.value), g.unit === 'rel' ? 2 : 3)) + unit : String(g.value);
+  const lim = (g.key === 'views' || g.key === 'markers' ? '≥ ' : g.key === 'coverage' ? '= ' : g.key === 'rot_diversity' ? '≥ ' : '≤ ') + (typeof g.limit === 'number' ? +sc(g.limit).toPrecision(3) : g.limit) + unit;
+  tr.append(cwEl('td', '', t('cw.g.' + g.key)), cwEl('td', g.ok ? 'ok' : 'bad', (g.ok ? '✓ ' : '✗ ') + val), cwEl('td', '', lim));
+  return tr;
+}
+function cwTable(head, rows) {
+  const tb = cwEl('table', 'cwiz-table mono'), h = document.createElement('tr');
+  for (const x of head) h.appendChild(cwEl('th', '', x));
+  tb.appendChild(h);
+  for (const r of rows) tb.appendChild(r);
+  return tb;
+}
+// before / after rows from the dry-run reply: vision intrinsics, camera mount, grasp fields
+function cwDiffRows(before, after) {
+  const rows = [];
+  const get = (o, p) => p.reduce((a, k) => (a == null ? a : a[k]), o);
+  const fmt = (v, k) => (v == null ? '--' : Array.isArray(v) ? v.map((x) => (typeof x === 'number' ? (k === 'mm' ? (x * 1000).toFixed(1) : x.toFixed(4)) : String(x))).join(', ')
+    : typeof v === 'number' ? (k === 'mm' ? (v * 1000).toFixed(1) + ' mm' : k === 'deg' ? v.toFixed(2) + '°' : Math.abs(v) < 10 ? v.toFixed(4) : v.toFixed(2)) : String(v));
+  const add = (label, path, k) => {
+    const a = get(before, path), b = get(after, path), tr = document.createElement('tr');
+    if (JSON.stringify(a) !== JSON.stringify(b)) tr.className = 'chg';
+    tr.append(cwEl('td', '', label), cwEl('td', '', fmt(a, k)), cwEl('td', '', fmt(b, k)));
+    rows.push(tr);
+  };
+  for (const k of ['fx', 'fy', 'cx', 'cy', 'k1', 'k2']) add('vision ' + k, ['vision_intrinsics', k]);
+  add('camera_mount.offset_m', ['camera_mount', 'offset_m'], 'mm');
+  add('camera_mount.q_end_cam', ['camera_mount', 'q_end_cam']);
+  add('camera_mount.tilt_deg', ['camera_mount', 'tilt_deg'], 'deg');
+  for (const [k, u] of [['fx_px'], ['fy_px'], ['cx_px'], ['cy_px'], ['table_z_m', 'mm'], ['camera_tilt_deg', 'deg'], ['grip_pixel_norm']]) add('grasp.' + k, ['grasp', k], u);
+  return rows;
+}
+function cwRender() {
+  if (!CWZ.open) return;
+  const steps = $('cwiz-steps'), body = $('cwiz-body');
+  steps.textContent = '';
+  $('cwiz-stop').hidden = CWZ.step !== 'capture'; // Stop stays in the footer (visible also when collapsed)
+  const si = CW_STEPS.indexOf(CWZ.step);
+  CW_STEPS.forEach((k, i) => steps.appendChild(cwEl('li', i === si ? 'on' : i < si ? 'done' : '', t('cw.step.' + k))));
+  body.textContent = '';
+  const p = (txt, cls = '') => body.appendChild(cwEl('p', cls, txt));
+  const acts = (...bs) => { const d = cwEl('div', 'cwiz-acts'); for (const b of bs) if (b) d.appendChild(b); body.appendChild(d); return d; };
+  if (!cwSupported() || !cwDofOk()) { body.appendChild(cwEl('div', 'cwiz-msg', t(cwSupported() ? 'cw.dof' : 'cw.unsupported'))); return; }
+  if (!CWZ.CW) { p('…'); cwLoad().then(cwRender).catch((e) => { body.textContent = ''; body.appendChild(cwEl('div', 'cwiz-msg', t('cw.err', { m: e.message }))); }); return; }
+  const CW = CWZ.CW;
+  if (CWZ.step === 'board') {
+    p(t('cw.board.hint'));
+    const box = cwEl('div', 'cwiz-board'); box.innerHTML = CW.boardSvg(cwBoard()); body.appendChild(box);
+    const field = (label, id, val, step) => {
+      const d = cwEl('label', 'cwiz-field'); d.appendChild(cwEl('span', '', label));
+      const i = document.createElement('input'); i.type = 'number'; i.id = id; i.step = step; i.value = String(val); i.inputMode = 'decimal'; d.appendChild(i); body.appendChild(d); return i;
+    };
+    const iSide = field(t('cw.board.side'), 'cwiz-side', CWZ.markerMm, '0.1'), iTh = field(t('cw.board.thick'), 'cwiz-thick', CWZ.thickMm, '0.1');
+    acts(cwBtn(t('cw.board.print'), cwPrint), cwBtn(t('cw.next'), () => {
+      const a = Number(iSide.value), b = Number(iTh.value);
+      if (!(a >= 20 && a <= 100 && b >= 0 && b <= 10)) { cwSetStatus(t('cw.board.bad'), 'warn'); return; }
+      CWZ.markerMm = a; CWZ.thickMm = b; CWZ.board = cwBoard(); CWZ.step = 'place'; CWZ.status = ''; cwRender();
+    }, { cls: 'btn-primary', id: 'cwiz-next' }));
+  } else if (CWZ.step === 'place') {
+    p(t('cw.place.hint'));
+    const n = cwLiveCount();
+    body.appendChild(cwEl('div', 'calib-live mono' + (n >= CW.GATES.minMarkers ? ' ok' : ''), t('cw.place.live', { n })));
+    acts(cwBtn(t('cw.back'), () => { CWZ.step = 'board'; CWZ.status = ''; cwRender(); }), cwBtn(CWZ.busy ? t('calib.cap.busy') : t('cw.place.cap'), cwBootstrap, { cls: 'btn-primary', disabled: CWZ.busy, id: 'cwiz-boot' }));
+  } else if (CWZ.step === 'capture') {
+    p(t('cw.cap.hint'));
+    const acc = cwAccepted(), skipped = CWZ.plan.filter((x) => x.state === 'skip').length;
+    const pr = cwEl('div', 'calib-prog');
+    pr.appendChild(cwEl('div', 'calib-count mono', t('cw.cap.count', { n: acc, target: CW.GATES.minViews, s: skipped })));
+    const bar = cwEl('div', 'calib-bar'), bi = document.createElement('i'); bi.style.width = Math.min(100, CWZ.idx / Math.max(1, CWZ.plan.length) * 100) + '%'; bar.appendChild(bi); pr.appendChild(bar);
+    body.appendChild(pr);
+    const ol = cwEl('ol', 'calib-list mono cwiz-poses');
+    CWZ.plan.forEach((x, i) => {
+      const li = cwEl('li', (x.state === 'ok' ? 'ok' : x.state === 'skip' ? 'skip' : '') + (i === CWZ.idx ? ' cur' : ''));
+      li.append(cwEl('b', '', '#' + (i + 1)), cwEl('span', '', `${Math.round(x.dist * 1000)} mm · ${x.tiltDeg}°/${Math.round(x.azDeg)}° · ` + (x.state === 'ok' ? t('cw.pose.ok', { m: x.markers }) : x.state === 'skip' ? t('cw.pose.skip', { why: x.why }) : t('cw.pose.pending'))));
+      ol.appendChild(li);
+    });
+    body.appendChild(ol);
+    const tg = cwEl('label', 'cwiz-toggle'), cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.id = 'cwiz-runall'; cb.checked = CWZ.runAll; cb.disabled = CWZ.running;
+    cb.addEventListener('change', () => { CWZ.runAll = cb.checked; cwRender(); });
+    tg.append(cb, cwEl('span', '', t('cw.cap.runall'))); body.appendChild(tg);
+    const left = CWZ.idx < CWZ.plan.length;
+    acts(
+      left ? cwBtn(t(CWZ.runAll ? 'cw.cap.start' : 'cw.cap.next'), cwRun, { cls: 'btn-primary wide', disabled: CWZ.running, id: 'cwiz-go' }) : null,
+      cwBtn(t('cw.cap.preview'), () => { if (!V3.open) v3Toggle(true); setTimeout(cwV3Sync, 300); }, { id: 'cwiz-prev' }),
+      cwBtn(t('cw.cap.solve'), cwSolve, { disabled: CWZ.running || acc < 5, id: 'cwiz-solve' }),
+    );
+  } else if (CWZ.step === 'solve') {
+    const r = CWZ.solve;
+    p(t('cw.solve.hint'));
+    body.appendChild(cwTable([t('cw.th.check'), t('cw.th.value'), t('cw.th.limit')], r.gates.map(cwGateRow)));
+    if (r.intr && r.intr.K) {
+      const K = r.intr.K, box = cwEl('div', 'calib-result mono' + (r.ok ? '' : ' warn'));
+      const row = (k, v) => { const d = cwEl('div', 'row'); d.append(cwEl('span', '', k), cwEl('span', '', v)); box.appendChild(d); };
+      row(t('cw.r.intr'), `fx ${cwFmt(K.fx)} fy ${cwFmt(K.fy)}`);
+      row('', `cx ${cwFmt(K.cx)} cy ${cwFmt(K.cy)} k1 ${cwFmt(K.k1, 4)} k2 ${cwFmt(K.k2, 4)}`);
+      const sg = r.intr.sigma || {};
+      row('1σ', `fx ${cwFmt(sg.fx)} fy ${cwFmt(sg.fy)} cx ${cwFmt(sg.cx)} cy ${cwFmt(sg.cy)} px · cond ${cwFmt(r.intr.cond, 0)}`);
+      if (r.apply) {
+        row(t('cw.r.mount'), r.apply.camera_mount.offset_m.map((v) => (v * 1000).toFixed(1)).join(', ') + ' mm');
+        row('rpy', CW.rpyDeg(CW.quatR(r.apply.camera_mount.q_end_cam)).map((v) => v.toFixed(2)).join(', ') + '°');
+        row(t('cw.r.table'), (r.apply.table_z_m * 1000).toFixed(1) + ' mm');
+      }
+      if (r.intr.dropped && r.intr.dropped.length) row(t('cw.r.dropped', { list: r.intr.dropped.map((d) => '#' + (d.i + 1) + ' ' + d.rms.toFixed(2) + ' px').join(', ') }), '');
+      body.appendChild(box);
+    }
+    if (!r.ok) body.appendChild(cwEl('div', 'cwiz-msg', t('cw.solve.fail')));
+    acts(cwBtn(t('cw.cap.more'), () => {
+      const q = S.obs && S.obs.positions ? cwModelQ(S.obs.positions) : CWZ.plan[CWZ.plan.length - 1].q;
+      CWZ.plan.push(...cwPlan(CWZ.est, q, 8, CWZ.plan.map((x) => x.T))); CWZ.step = 'capture'; cwRender(); cwV3Sync();
+    }), cwBtn(t('cw.solve.export'), cwExport),
+    cwBtn(t('cw.solve.review'), cwReview, { cls: 'btn-primary wide', disabled: !r.ok || CWZ.busy, id: 'cwiz-review' }));
+  } else if (CWZ.step === 'review') {
+    p(t('cw.rev.hint'));
+    if (CWZ.dry) body.appendChild(cwTable([t('cw.th.field'), t('cw.th.before'), t('cw.th.after')], cwDiffRows(CWZ.dry.before, CWZ.dry.after)));
+    const armed = Date.now() < CWZ.armedUntil;
+    acts(cwBtn(t('cw.back'), () => { CWZ.step = 'solve'; CWZ.status = ''; cwRender(); }),
+      cwBtn(t(armed ? 'cw.rev.confirm' : 'cw.rev.apply'), cwApply, { cls: 'btn-primary', disabled: !CWZ.dry || CWZ.busy, id: 'cwiz-apply' }));
+  } else if (CWZ.step === 'applied') {
+    const a = CWZ.applied || {};
+    if (a.backup) p(t('cw.app.backup', { b: cwBackupName(a.backup) }));
+    body.appendChild(cwTable([t('cw.th.field'), t('cw.th.after'), ''], cwDiffRows(a, a).map((tr) => { tr.className = ''; tr.lastChild.textContent = ''; return tr; })));
+    const vi = a.vision_intrinsics;
+    if (vi && vi.revision != null) p('rebot-vision revision ' + vi.revision);
+    const armed = Date.now() < CWZ.armedUntil;
+    acts(cwBtn(t(armed ? 'cw.app.restore.confirm' : 'cw.app.restore'), cwRestore, { disabled: CWZ.busy || !a.backup || !!a.restoredFrom, id: 'cwiz-restore' }),
+      cwBtn(t('cw.app.done'), () => cwOpen(false), { cls: 'btn-primary' }));
+  }
+  if (CWZ.status) body.appendChild(cwEl('div', 'cwiz-msg' + (CWZ.statusKind === 'ok' ? ' ok' : ''), CWZ.status));
+}
+function cwOpen(open) {
+  if (!open && CWZ.running) { cwStop(); }
+  CWZ.open = open;
+  $('cwiz').hidden = !open;
+  clearInterval(CWZ.live); CWZ.live = null;
+  if (open) {
+    $('cwiz-panel').classList.remove('min');
+    cwRender();
+    // live marker count on the place step
+    CWZ.live = setInterval(() => { if (CWZ.step === 'place' && !CWZ.busy) cwRender(); }, 700);
+  } else { CWZ.previewQ = null; $('btn-calib').focus({ preventScroll: true }); }
+  cwV3Sync();
+  if (open !== cwOpen.was) { cwOpen.was = open; calVisionMode(open); }
+}
+function initCwiz() {
+  $('cwiz-close').addEventListener('click', () => cwOpen(false));
+  $('cwiz-min').addEventListener('click', () => $('cwiz-panel').classList.toggle('min'));
+  $('cwiz-adv').addEventListener('click', () => { if (CWZ.running) { toast(t('cw.busy'), 'warn'); return; } cwOpen(false); calOpen(true); });
+  $('cwiz-stop').addEventListener('click', cwStop);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && CWZ.open && !CWZ.running) cwOpen(false); });
+  // a hidden page aborts a run at once (the run loop also checks it)
+  document.addEventListener('visibilitychange', () => { if (document.hidden && CWZ.running) api('/api/v1/motion/stop', {}, { quiet: true }).catch(() => {}); });
+  i18nHooks.push(cwRender);
 }
 
 // schema model_joint_map (armd: model = sign * motor + offset_rad) -> CFG.cart (motor = sign * model + off);
@@ -7652,6 +8196,7 @@ async function v3Start() {
   try { await (V3.init ||= v3Init()); } catch (e) { V3.init = null; setText($('v3-status'), t('v3.err', { m: e.message || String(e) })); return; }
   if (!V3.open) return;
   if (Date.now() - V3.sceneAt > 5000) v3Extras();
+  cwV3Sync();
   v3Resize();
   v3Frame();
   if (!V3.raf) V3.raf = requestAnimationFrame(v3Tick);
@@ -8108,11 +8653,12 @@ function v3Tick(ts) {
   } else {
     if (o && Array.isArray(o.positions)) {
       const meas = o.positions, cmd = Array.isArray(o.commanded_positions) ? o.commanded_positions : meas;
-      const key = meas.map((v) => Math.round(v * 2000)).join() + '|' + cmd.map((v) => Math.round(v * 2000)).join();
+      const pv = CWZ.previewQ; // calibration wizard: the next planned pose as the ghost
+      const key = meas.map((v) => Math.round(v * 2000)).join() + '|' + cmd.map((v) => Math.round(v * 2000)).join() + (pv ? '|' + pv.join() : '');
       if (key !== V3.key) {
         V3.key = key;
-        V3.solid.set(meas); V3.ghost.set(cmd);
-        V3.ghost.obj.visible = cmd.some((v, i) => Math.abs(v - (meas[i] ?? v)) > (i === GRIP ? 0.05 : 0.005));
+        V3.solid.set(meas); V3.ghost.set(pv || cmd);
+        V3.ghost.obj.visible = !!pv || cmd.some((v, i) => Math.abs(v - (meas[i] ?? v)) > (i === GRIP ? 0.05 : 0.005));
         V3.dirty = true;
       }
     }
@@ -9379,6 +9925,7 @@ connectDetectionWS();
 initDetToggle();
 initVisionMode();
 initCalib();
+initCwiz();
 videoStart();
 requestAnimationFrame(frame);
 

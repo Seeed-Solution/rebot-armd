@@ -405,7 +405,7 @@ the header).
 - **Detection overlay**: YOLO boxes and ArUco markers drawn on the video. Choose YOLO, ArUco
   or both; the page holds a vision subscription only while the overlay is on and the page is
   visible. Single-shot snapshot.
-- **Hand-eye calibration drawer**: eye-in-hand (camera on the gripper) or eye-to-hand (fixed
+- **Hand-eye calibration drawer** (Advanced in the calibration wizard, below): eye-in-hand (camera on the gripper) or eye-to-hand (fixed
   camera) with an ArUco marker; capture poses, solve, export JSON that rebot-companion's
   `HandEyeCalibration.load_result` reads.
 - **Tap-to-grasp**: with detection on, tap a box and confirm; armd runs the `grasp` action
@@ -479,6 +479,47 @@ released. An agent can therefore take the lease while a cockpit page is open. Wh
 client holds the lease, the cockpit switches to observer mode, names the holder from the
 observation's `lease_holder` (another cockpit page, the AI agent `rebot-mcp`, or the client's
 label) and offers a takeover with confirmation. E-stop works without the lease.
+
+### Calibration wizard
+
+The toolbar button **Camera Cal** opens a wizard that calibrates the wrist camera in one run
+on a printed ArUco board and hands the result to armd (needs `capabilities.calibration_apply`;
+older armd builds show an update message; 6-axis B601 only). The manual hand-eye drawer stays
+available under **Advanced**.
+
+1. **Board**: print the 3 x 4 GridBoard (ArUco `aruco4x4_50` ids 0–11, 50 mm markers, gap 1/5 of
+   the marker side, printable SVG with a 100 mm ruler and an arrow) at 100 %, measure the marker
+   side and enter it with the board thickness (default 0.5 mm). Lay it flat, arrow pointing away
+   from the arm.
+2. **Place**: jog the camera to about 0.3 m above the board with at least 6 whole markers in view
+   and capture the start view. The board pose is estimated with nominal values (fx 824 px at
+   640x360, the current `camera_mount`) and about 20 look-at poses are generated: camera
+   0.18–0.35 m from the board, view tilt 0–30° in several azimuths, roll ±15°, at least 6
+   predicted visible markers, tool points at least 0.10 m above the board plane, each transition
+   checked with the cockpit IK at points 1 cm / 3° apart (no branch flip, joint limits).
+3. **Capture**: each pose is a `move_to` at 0.03 m/s and 0.3 rad/s, then still for 0.3 s, then one
+   `["aruco"]` trigger. Every move needs a tap unless **Run all** is ticked. **Stop** stays in the
+   footer; a hidden page, stale telemetry, lease loss, E-stop or fault aborts the run, which does
+   not resume by itself. Poses with fewer than 6 markers are skipped and counted. After 8 accepted
+   views the wizard solves once and regenerates the remaining poses from that estimate.
+4. **Solve** (in the browser, `/assets/calib_wizard.js`): intrinsics fx, fy, cx, cy, k1, k2 at
+   640x360 (Zhang closed form from per-view homographies, then Levenberg-Marquardt with the board
+   poses), board pose per view by planar PnP with those intrinsics, hand-eye AX = XB with the
+   drawer's solver, table height = median board z minus the thickness. Gates, all shown and all
+   required: at least 15 views, at least 6 markers per view, corners in all 3 x 3 image cells,
+   reprojection RMS ≤ 0.5 px (per corner), per-view RMS ≤ 1.0 px (worse views are dropped once),
+   held-out RMS ≤ 1.0 px (every 5th view left out), 1-sigma of fx, fy, cx, cy ≤ 2 %, hand-eye
+   RMS ≤ 3 mm and ≤ 1°, rotation axes not all parallel, board normal ≤ 5° from vertical, board
+   height spread ≤ 4 mm.
+5. **Review**: armd's dry run (`/api/v1/calibration/apply` with `dry_run: true`) lists the
+   rebot-vision intrinsics, `camera_mount` and grasp fields before and after.
+6. **Applied**: after a second tap armd backs up, writes and reads back (see
+   [docs/agent_action_api.md](docs/agent_action_api.md)); **Restore last backup** puts the
+   previous values back.
+
+Measured so far: synthetic data only (`node scripts/calib_wizard_selftest.mjs`: 0.3 px corner
+noise, 20 generated views; `scripts/calib_wizard_shots.mjs`: the full flow in a browser against
+a simulated arm and camera). Not yet run on the arm.
 
 ## Vision (reCamera kit)
 
@@ -732,6 +773,7 @@ cargo test                                 # 316 tests (2 ignored), mock arm, no
 cargo clippy --all-targets -- -D warnings
 node scripts/view_ik_selftest.mjs          # cockpit view-frame IK
 node scripts/calib_selftest.mjs            # cockpit hand-eye calibration (part c needs ../rebot-companion and uv)
+node scripts/calib_wizard_selftest.mjs     # calibration wizard solvers and pose generator (synthetic data)
 node tests/test_rpc_error_contract.js      # cockpit RPC error handling
 ```
 
