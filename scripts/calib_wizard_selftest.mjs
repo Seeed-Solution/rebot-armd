@@ -8,6 +8,8 @@
 //   d. hand-eye on synthetic FK (CALM.fk) + mount through the full solve: < 2 mm / 0.3 deg
 //   e. table plane: table_z within 1 mm; a tilted board is refused
 //   f. gates reject an all fronto-parallel set and a 1.5 px noise set
+//   h. joint refinement (intrinsics + X + board pose, FK fixed): a set whose separate hand-eye error
+//      is > 2 mm comes back < 1 mm / 0.2 deg
 //   g. pose generator: >= 20 poses, camera 0.18..0.35 m from the board, tool points >= 0.10 m above the
 //      plane, transitions without IK failure / branch flip, two or more tilt azimuths; bootstrap from
 //      nominal values; re-solve after 8 views
@@ -156,6 +158,20 @@ const solveViews = views;
   const Tt = mul(Tbb, make(rodrigues([8 / D, 0, 0]), [0, 0, 0]));
   const tilted = CW.fitTable(qs.map((q) => mul(mul(fk(q), Xtrue), mul(inv(mul(fk(q), Xtrue)), Tt))), board, thickness);
   check('e. tilted board refused', !tilted.ok && tilted.gates.some((g) => g.key === 'plane_tilt' && !g.ok), `tilt ${tilted.tiltDeg.toFixed(2)} deg -> ${gateStr(tilted.gates)}`);
+}
+
+// ---- h. joint refinement: a set where the separate solve's hand-eye is > 2 mm off
+{
+  // 0.3 px corner noise (new draws) on the start view and the first 15 generated ones
+  const hv = qs.slice(0, 16).map((q) => synth(q, { noise: 0.3 }));
+  const th = Date.now();
+  const sep = CW.solveAll({ views: hv, board, CALM, thickness, joint: false });
+  const jnt = CW.solveAll({ views: hv, board, CALM, thickness });
+  const jMs = Date.now() - th;
+  const eS = posErr(sep.handEye.X, Xtrue), rS = rotErr(sep.handEye.X, Xtrue), eJ = posErr(jnt.final.X, Xtrue), rJ = rotErr(jnt.final.X, Xtrue);
+  const Kf = jnt.final.K;
+  check('h. joint refinement (separate hand-eye > 2 mm -> refined < 1 mm / 0.2 deg)', eS > 0.002 && eJ < 0.001 && rJ < 0.2 && jnt.ok,
+    `separate X err ${(eS * 1000).toFixed(3)} mm / ${rS.toFixed(3)} deg, fx ${sep.intr.K.fx.toFixed(2)}; refined X err ${(eJ * 1000).toFixed(3)} mm / ${rJ.toFixed(3)} deg, fx ${Kf.fx.toFixed(2)} fy ${Kf.fy.toFixed(2)} cx ${Kf.cx.toFixed(2)} cy ${Kf.cy.toFixed(2)} k1 ${Kf.k1.toFixed(4)} (true 824/821/326/176/-0.1); joint RMS ${jnt.joint.rmsBefore.toFixed(3)} -> ${jnt.joint.rmsAfter.toFixed(3)} px in ${jnt.joint.iterations} it (both solves ${jMs} ms); board err ${(posErr(jnt.final.Tbb, Tbb) * 1000).toFixed(3)} mm, table_z ${(jnt.apply.table_z_m * 1000).toFixed(3)} mm; gates ${jnt.ok ? 'pass' : gateStr(jnt.gates)}`);
 }
 
 // ---- f. degenerate and noisy sets

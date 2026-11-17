@@ -7,7 +7,9 @@
 //               and per-view board poses (p1 p2 k3 fixed 0)
 //   board pose  planar PnP with the new intrinsics (homography init + LM)
 //   hand-eye    AX = XB with the cockpit's CALM.solveEyeInHand (passed in) on (FK pose, board pose)
-//   table       plane through the board poses in base, table_z_m = median board z - board thickness
+//   table       plane through the board poses in base (flatness gates)
+//   joint       one LM over all corners: intrinsics, X = T_end_cam, T_base_board (FK fixed); its values
+//               are applied, table_z_m = refined board z - board thickness
 // Conventions: 4x4 transforms are row-major nested arrays (as CALM); T_a_b maps frame-b coordinates
 // into frame a. Camera frame OpenCV (x right, y down, z optical axis). Pixels at 640x360.
 
@@ -430,6 +432,71 @@ export function solvePnP(obj, img, K) {
   return { R: r.poses[0].R, t: r.poses[0].t, rms: r.rms };
 }
 
+// ---------------------------------------------------------------- joint refinement
+// dense Levenberg-Marquardt with a central-difference Jacobian: res(x) -> Float64Array, x0, steps h
+function denseLM(res, x0, h, iters = 50) {
+  const P = x0.length;
+  let x = x0.slice(), r = res(x), cost = r.reduce((s, e) => s + e * e, 0), lam = 1e-3, it = 0;
+  for (; it < iters; it++) {
+    const m = r.length, J = [];
+    for (let k = 0; k < P; k++) {
+      const xp = x.slice(), xm = x.slice(); xp[k] += h[k]; xm[k] -= h[k];
+      const rp = res(xp), rm = res(xm), c = new Float64Array(m);
+      for (let i = 0; i < m; i++) c[i] = (rp[i] - rm[i]) / (2 * h[k]);
+      J.push(c);
+    }
+    const N = new Float64Array(P * P), g = new Float64Array(P);
+    for (let a = 0; a < P; a++) {
+      let gs = 0; for (let i = 0; i < m; i++) gs += J[a][i] * r[i]; g[a] = gs;
+      for (let b = a; b < P; b++) { let v = 0; for (let i = 0; i < m; i++) v += J[a][i] * J[b][i]; N[a * P + b] = v; N[b * P + a] = v; }
+    }
+    let improved = false;
+    for (let tries = 0; tries < 10 && !improved; tries++) {
+      const A = N.slice();
+      for (let i = 0; i < P; i++) A[i * P + i] += lam * (N[i * P + i] || 1e-12);
+      const L = chol(A, P);
+      if (!L) { lam *= 10; continue; }
+      const dx = cholSolve(L, P, g.map((v) => -v)), x2 = x.map((v, k) => v + dx[k]), r2 = res(x2);
+      const c2 = r2.reduce((s, e) => s + e * e, 0);
+      if (Number.isFinite(c2) && c2 < cost) {
+        const rel = (cost - c2) / Math.max(cost, 1e-300);
+        x = x2; r = r2; cost = c2; lam = Math.max(lam / 10, 1e-9); improved = true;
+        if (rel < 1e-10) it = iters;
+      } else lam *= 10;
+    }
+    if (!improved) break;
+  }
+  return { x, cost, r, iterations: it };
+}
+/* One LM over all corner observations after the separate solves: intrinsics (fx fy cx cy k1 k2),
+   X = T_end_cam (6) and the board pose in base T_base_board (6); the FK poses G are fixed.
+   views: [{ obj, img, G }] (board points, pixels, T_base_end). Returns { K, X, Tbb, rmsBefore,
+   rmsAfter, perView, iterations } (RMS per corner, px). */
+export function refineJoint(views, K0, X0, Tbb0, { iters = 100 } = {}) {
+  const RX0 = rotOf(X0), RB0 = rotOf(Tbb0);
+  const unpack = (x) => ({ K: { fx: x[0], fy: x[1], cx: x[2], cy: x[3], k1: x[4], k2: x[5] },
+    X: make(mm(RX0, rodrigues([x[6], x[7], x[8]])), [x[9], x[10], x[11]]),
+    B: make(mm(RB0, rodrigues([x[12], x[13], x[14]])), [x[15], x[16], x[17]]) });
+  const nPts = views.reduce((s, V) => s + V.obj.length, 0);
+  const res = (x) => {
+    const { K, X, B } = unpack(x), out = new Float64Array(2 * nPts);
+    let o = 0;
+    for (const V of views) {
+      const T = mm(inv(mm(V.G, X)), B), R = rotOf(T), t = posOf(T);
+      for (let j = 0; j < V.obj.length; j++) { const p = project(K, R, t, V.obj[j]); out[o++] = p[0] - V.img[j][0]; out[o++] = p[1] - V.img[j][1]; }
+    }
+    return out;
+  };
+  const x0 = [K0.fx, K0.fy, K0.cx, K0.cy, K0.k1 || 0, K0.k2 || 0, 0, 0, 0, ...posOf(X0), 0, 0, 0, ...posOf(Tbb0)];
+  const h = [1e-3, 1e-3, 1e-3, 1e-3, 1e-6, 1e-6, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7];
+  const r0 = res(x0), c0 = r0.reduce((s, e) => s + e * e, 0);
+  const lm = denseLM(res, x0, h, iters);
+  const { K, X, B } = unpack(lm.x);
+  let o = 0;
+  const perView = views.map((V) => { let s = 0; for (let j = 0; j < 2 * V.obj.length; j++) s += lm.r[o + j] ** 2; o += 2 * V.obj.length; return Math.sqrt(s / V.obj.length); });
+  return { K, X, Tbb: B, rmsBefore: Math.sqrt(c0 / nPts), rmsAfter: Math.sqrt(lm.cost / nPts), perView, iterations: lm.iterations, nPts };
+}
+
 // ---------------------------------------------------------------- intrinsics with gates
 // image 3x3 cells covered by the corners of the views
 export function coverage(views, size = IMAGE) {
@@ -531,32 +598,57 @@ export function fitTable(Tbb, board, thickness = 0.0005, gates = GATES) {
 }
 
 /* Full solve of a capture run. views: [{ markers, G (T_base_end) }]; CALM; board; thickness (m).
-   Returns { ok, intr, handEye, table, gates, apply (body for /api/v1/calibration/apply), summary }. */
-export function solveAll({ views, board, CALM, thickness = 0.0005, gates = GATES, size = IMAGE, init = NOMINAL, solvedAt = null }) {
+   Separate solves (intrinsics, PnP per view, hand-eye, board plane), then one joint LM (refineJoint)
+   over all corners: the refined intrinsics, X and board pose are the result (`final`); the hand-eye and
+   table gates are evaluated with them (per-view PnP with the refined K, T_base_board_i = G_i X M_i
+   against the refined board pose), table_z_m = refined board origin z - thickness.
+   Returns { ok, intr, handEye, joint, final: { K, X, Tbb }, table, gates, apply (body for
+   /api/v1/calibration/apply) }. */
+export function solveAll({ views, board, CALM, thickness = 0.0005, gates = GATES, size = IMAGE, init = NOMINAL, solvedAt = null, joint = true }) {
   const intr = calibrateIntrinsics(views, board, { size, gates, init });
   const res = { ok: false, intr, gates: [...intr.gates] };
   if (!intr.K) return res;
-  const G = [], M = [], vi = [];
+  const G = [], M = [], vi = [], obs = [];
   for (const i of intr.used) {
     const V = views[i];
     if (!V.G) continue;
     const { obj, img } = correspondences({ markers: boardMarkers(V, board) }, board, intr.order);
     const p = solvePnP(obj, img, intr.K);
-    if (p) { G.push(V.G); M.push(make(p.R, p.t)); vi.push(i); }
+    if (p) { G.push(V.G); M.push(make(p.R, p.t)); vi.push(i); obs.push({ obj, img, G: V.G }); }
   }
-  const he = solveHandEye(CALM, G, M, gates);
-  res.handEye = he; res.gates.push(...he.gates); res.poseViews = vi;
-  if (!he.X) return res;
-  const Tbb = G.map((Gi, k) => mm(mm(Gi, he.X), M[k]));
-  const table = fitTable(Tbb, board, thickness, gates);
+  const he = CALM.solveEyeInHand(G, M);
+  res.poseViews = vi;
+  if (he.err || !he.X) { const h0 = solveHandEye(CALM, G, M, gates); res.handEye = h0; res.gates.push(...h0.gates); return res; }
+  // joint refinement from the separate solve (board pose: CALM's mean T_base_board)
+  let K = intr.K, X = he.X, Tbb = he.Y;
+  if (joint) {
+    const j = refineJoint(obs, intr.K, he.X, he.Y);
+    res.joint = { rmsBefore: j.rmsBefore, rmsAfter: j.rmsAfter, perView: j.perView, iterations: j.iterations, separate: { K: intr.K, X: he.X, Tbb: he.Y } };
+    if ([j.K.fx, j.K.fy, j.K.cx, j.K.cy, j.rmsAfter].every(Number.isFinite) && j.rmsAfter <= j.rmsBefore) { K = j.K; X = j.X; Tbb = j.Tbb; }
+  }
+  res.final = { K, X, Tbb };
+  // hand-eye residuals with the final values: per-view board pose in base vs the refined one
+  const Tbi = obs.map((o) => { const p = solvePnP(o.obj, o.img, K); return p ? mm(mm(o.G, X), make(p.R, p.t)) : null; }).filter(Boolean);
+  const RBt = tr(rotOf(Tbb)), rms = (a) => Math.sqrt(a.reduce((s2, e) => s2 + e * e, 0) / Math.max(1, a.length));
+  const residuals = Tbi.map((T) => norm3(sub3(posOf(T), posOf(Tbb)))), rotResiduals = Tbi.map((T) => angDeg(mm(RBt, rotOf(T))));
+  const hg = [
+    gate('rot_diversity', he.div.ok, he.div.ratio, 0.1),
+    gate('he_pos', rms(residuals) <= gates.handEyeRmsM, rms(residuals), gates.handEyeRmsM, 'm'),
+    gate('he_rot', rms(rotResiduals) <= gates.handEyeRotDeg, rms(rotResiduals), gates.handEyeRotDeg, 'deg'),
+  ];
+  res.handEye = { ok: hg.every((x) => x.ok), X, Y: Tbb, rmse: rms(residuals), rotRmse: rms(rotResiduals), residuals, rotResiduals, div: he.div, gates: hg,
+    separate: { X: he.X, rmse: he.rmse, rotRmse: he.rotRmse } };
+  res.gates.push(...hg);
+  const table = fitTable(Tbi, board, thickness, gates);
+  table.board_z_m = Tbb[2][3]; table.table_z_m = Tbb[2][3] - thickness;
   res.table = table; res.gates.push(...table.gates);
   res.ok = res.gates.every((g) => g.ok);
-  const K = intr.K;
   res.apply = {
     intrinsics: { fx: K.fx, fy: K.fy, cx: K.cx, cy: K.cy, k1: K.k1, k2: K.k2, p1: 0, p2: 0, k3: 0, width: size.width, height: size.height, marker_size: board.markerSide },
-    camera_mount: { offset_m: posOf(he.X), q_end_cam: quatOf(rotOf(he.X)) },
+    camera_mount: { offset_m: posOf(X), q_end_cam: quatOf(rotOf(X)) },
     table_z_m: table.table_z_m,
-    rms: { reproj_px: intr.rms, held_out_px: intr.heldOut.rms, hand_eye_m: he.rmse, hand_eye_deg: he.rotRmse, views: intr.used.length,
+    rms: { reproj_px: intr.rms, held_out_px: intr.heldOut.rms, joint_before_px: res.joint ? res.joint.rmsBefore : null, joint_px: res.joint ? res.joint.rmsAfter : null,
+      hand_eye_m: res.handEye.rmse, hand_eye_deg: res.handEye.rotRmse, views: intr.used.length,
       sigma: intr.sigma, cond: intr.cond, plane_tilt_deg: table.tiltDeg, plane_spread_m: table.spread_m },
     ...(solvedAt ? { solved_at: solvedAt } : {}),
   };

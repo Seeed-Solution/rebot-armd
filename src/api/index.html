@@ -2337,7 +2337,7 @@ Object.assign(I18N.zh, {
   'cw.g.held_out': '留出视图 RMS', 'cw.g.sigma': '内参 1σ（相对值，最大）', 'cw.g.rot_diversity': '转动轴多样性', 'cw.g.he_pos': '手眼位置 RMS', 'cw.g.he_rot': '手眼角度 RMS',
   'cw.g.plane_tilt': '标定板法向偏离竖直', 'cw.g.plane_spread': '标定板高度极差',
   'cw.th.check': '检查', 'cw.th.value': '数值', 'cw.th.limit': '限值', 'cw.th.field': '字段', 'cw.th.before': '修改前', 'cw.th.after': '修改后',
-  'cw.r.intr': '内参（640×360）', 'cw.r.mount': '相机安装（end_link 坐标系）', 'cw.r.table': '桌面高度', 'cw.r.dropped': '剔除的视图：{list}',
+  'cw.r.intr': '内参（640×360）', 'cw.r.mount': '相机安装（end_link 坐标系）', 'cw.r.table': '桌面高度', 'cw.r.dropped': '剔除的视图：{list}', 'cw.r.joint': '联合优化重投影 RMS',
   'cw.rev.hint': '下面是 armd 预演（dry_run）给出的修改前后对比。确认后 armd 先备份，再依次写入 rebot-vision 内参、相机安装和抓取设置；任一步失败会回滚已完成的步骤。',
   'cw.rev.apply': '确认应用', 'cw.rev.confirm': '再点一次确认应用', 'cw.rev.loading': '正在向 armd 请求预演…',
   'cw.app.ok': '已应用。以下是两项服务读回的数值：', 'cw.app.backup': '备份：{b}', 'cw.app.restore': '恢复到应用前（最近备份）', 'cw.app.restore.confirm': '再点一次确认恢复',
@@ -2369,7 +2369,7 @@ Object.assign(I18N.en, {
   'cw.g.held_out': 'Held-out RMS', 'cw.g.sigma': 'Intrinsics 1σ (relative, max)', 'cw.g.rot_diversity': 'Rotation axis diversity', 'cw.g.he_pos': 'Hand-eye position RMS', 'cw.g.he_rot': 'Hand-eye rotation RMS',
   'cw.g.plane_tilt': 'Board normal from vertical', 'cw.g.plane_spread': 'Board height spread',
   'cw.th.check': 'Check', 'cw.th.value': 'Value', 'cw.th.limit': 'Limit', 'cw.th.field': 'Field', 'cw.th.before': 'Before', 'cw.th.after': 'After',
-  'cw.r.intr': 'Intrinsics (640×360)', 'cw.r.mount': 'Camera mount (end_link frame)', 'cw.r.table': 'Table height', 'cw.r.dropped': 'Dropped views: {list}',
+  'cw.r.intr': 'Intrinsics (640×360)', 'cw.r.mount': 'Camera mount (end_link frame)', 'cw.r.table': 'Table height', 'cw.r.dropped': 'Dropped views: {list}', 'cw.r.joint': 'Joint refinement reprojection RMS',
   'cw.rev.hint': 'Before / after from an armd dry run. On Apply armd writes a backup, then the rebot-vision intrinsics, the camera mount and the grasp setup; a failing step reverts the earlier ones.',
   'cw.rev.apply': 'Apply', 'cw.rev.confirm': 'Tap again to apply', 'cw.rev.loading': 'Asking armd for a dry run…',
   'cw.app.ok': 'Applied. Values read back from both services:', 'cw.app.backup': 'Backup: {b}', 'cw.app.restore': 'Restore last backup', 'cw.app.restore.confirm': 'Tap again to restore',
@@ -4722,11 +4722,8 @@ async function cwBootstrap() {
 function cwRefine() {
   const CW = CWZ.CW, ok = CWZ.views.filter((v) => !v.err);
   const r = CW.solveAll({ views: ok, board: CWZ.board, CALM, thickness: CWZ.thickMm / 1000 });
-  if (!r.intr.K || !r.handEye || !r.handEye.X) return false;
-  const v0 = ok[0], { obj, img } = CW.correspondences({ markers: CW.boardMarkers(v0, CWZ.board) }, CWZ.board, r.intr.order);
-  const p = CW.solvePnP(obj, img, r.intr.K);
-  if (!p) return false;
-  CWZ.est = { Tbb: CW.mul(CW.mul(v0.G, r.handEye.X), CW.make(p.R, p.t)), K: r.intr.K, X: r.handEye.X };
+  if (!r.final) return false;
+  CWZ.est = { Tbb: r.final.Tbb, K: r.final.K, X: r.final.X }; // after the joint refinement
   const done = CWZ.plan.slice(0, CWZ.idx), left = Math.max(0, CWZ.target + 1 - ok.length);
   const q = cwModelQ(S.obs.positions);
   const tail = cwPlan(CWZ.est, q, left, done.map((d) => d.T));
@@ -4955,7 +4952,7 @@ function cwRender() {
     p(t('cw.solve.hint'));
     body.appendChild(cwTable([t('cw.th.check'), t('cw.th.value'), t('cw.th.limit')], r.gates.map(cwGateRow)));
     if (r.intr && r.intr.K) {
-      const K = r.intr.K, box = cwEl('div', 'calib-result mono' + (r.ok ? '' : ' warn'));
+      const K = (r.final && r.final.K) || r.intr.K, box = cwEl('div', 'calib-result mono' + (r.ok ? '' : ' warn'));
       const row = (k, v) => { const d = cwEl('div', 'row'); d.append(cwEl('span', '', k), cwEl('span', '', v)); box.appendChild(d); };
       row(t('cw.r.intr'), `fx ${cwFmt(K.fx)} fy ${cwFmt(K.fy)}`);
       row('', `cx ${cwFmt(K.cx)} cy ${cwFmt(K.cy)} k1 ${cwFmt(K.k1, 4)} k2 ${cwFmt(K.k2, 4)}`);
@@ -4966,6 +4963,7 @@ function cwRender() {
         row('rpy', CW.rpyDeg(CW.quatR(r.apply.camera_mount.q_end_cam)).map((v) => v.toFixed(2)).join(', ') + '°');
         row(t('cw.r.table'), (r.apply.table_z_m * 1000).toFixed(1) + ' mm');
       }
+      if (r.joint) row(t('cw.r.joint'), `${cwFmt(r.joint.rmsBefore, 3)} → ${cwFmt(r.joint.rmsAfter, 3)} px`);
       if (r.intr.dropped && r.intr.dropped.length) row(t('cw.r.dropped', { list: r.intr.dropped.map((d) => '#' + (d.i + 1) + ' ' + d.rms.toFixed(2) + ' px').join(', ') }), '');
       body.appendChild(box);
     }

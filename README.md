@@ -507,11 +507,15 @@ available under **Advanced**.
 4. **Solve** (in the browser, `/assets/calib_wizard.js`): intrinsics fx, fy, cx, cy, k1, k2 at
    640x360 (Zhang closed form from per-view homographies, then Levenberg-Marquardt with the board
    poses), board pose per view by planar PnP with those intrinsics, hand-eye AX = XB with the
-   drawer's solver, table height = median board z minus the thickness. Gates, all shown and all
+   drawer's solver, board plane. Then one Levenberg-Marquardt over all corner observations refines
+   the intrinsics (fx, fy, cx, cy, k1, k2), the mount X = T_end_cam and one board pose in base
+   together, with the FK poses fixed; the solve page shows the reprojection RMS before and after.
+   The refined values are applied and the hand-eye and table gates use them; table height = refined
+   board z minus the thickness. Gates, all shown and all
    required: at least 15 views, at least 6 markers per view, corners in all 3 x 3 image cells,
-   reprojection RMS ≤ 0.5 px (per corner), per-view RMS ≤ 1.0 px (worse views are dropped once),
-   held-out RMS ≤ 1.0 px (every 5th view left out), 1-sigma of fx, fy, cx, cy ≤ 2 %, hand-eye
-   RMS ≤ 3 mm and ≤ 1°, rotation axes not all parallel, board normal ≤ 5° from vertical, board
+   reprojection RMS ≤ 0.5 px (per corner, intrinsics solve), per-view RMS ≤ 1.0 px (worse views
+   are dropped once), held-out RMS ≤ 1.0 px (every 5th view left out), 1-sigma of fx, fy, cx,
+   cy ≤ 2 %, hand-eye RMS ≤ 3 mm and ≤ 1° (per-view board pose in base against the refined one), rotation axes not all parallel, board normal ≤ 5° from vertical, board
    height spread ≤ 4 mm.
 5. **Review**: armd's dry run (`/api/v1/calibration/apply` with `dry_run: true`) lists the
    rebot-vision intrinsics, `camera_mount` and grasp fields before and after.
