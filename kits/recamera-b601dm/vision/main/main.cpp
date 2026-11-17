@@ -838,6 +838,12 @@ int main(int argc, char** argv) {
             MA_LOGI(TAG, "Frame %u %s: %zu detections (%.0f ms), %zu markers (%.0f ms), depth %s (%.0f ms)",
                     vr.frame_id, rv::mode_name(vr.mode), dets.size(), vr.yolo_ms, markers.size(), vr.aruco_ms,
                     vr.ran_depth ? "on" : "off", vr.depth_ms);
+            if (vr.ran_yolo && detector) {
+                float pre = 0, infer = 0, post = 0;
+                detector->stage_ms(pre, infer, post);
+                MA_LOGI(TAG, "Frame %u yolo stages: pre %.2f ms, inference %.0f ms, post %.2f ms, mask %.2f ms",
+                        vr.frame_id, pre, infer, post, vr.mask_ms);
+            }
         }
     });
 

@@ -84,6 +84,18 @@ target_include_directories(seg_decode_test PRIVATE ${MAIN})
 target_compile_options(seg_decode_test PRIVATE -Wall -Wextra)
 add_test(NAME seg_decode COMMAND seg_decode_test)
 
+# 10-output YOLO11-seg decoder. The real-tensor checks read the device outputs of
+# yolo11n_seg_384x640 on real_0 from SEG384_TENSOR_DIR (-D or env; 5.5 MB, not in git);
+# without it they are skipped.
+if(NOT SEG384_TENSOR_DIR AND DEFINED ENV{SEG384_TENSOR_DIR})
+    set(SEG384_TENSOR_DIR $ENV{SEG384_TENSOR_DIR} CACHE PATH "real_0_dev_*.bin of the 384x640 seg model")
+endif()
+add_executable(seg_heads_test ${CMAKE_CURRENT_LIST_DIR}/seg_heads_test.cpp ${MAIN}/seg_heads.cpp
+                              ${MAIN}/obb_geom.cpp ${MAIN}/mask_geom.cpp)
+target_include_directories(seg_heads_test PRIVATE ${MAIN})
+target_compile_options(seg_heads_test PRIVATE -O2 -Wall -Wextra)
+add_test(NAME seg_heads COMMAND seg_heads_test "${SEG384_TENSOR_DIR}")
+
 add_executable(depth_geom_test ${CMAKE_CURRENT_LIST_DIR}/depth_geom_test.cpp ${MAIN}/depth_geom.cpp)
 target_include_directories(depth_geom_test PRIVATE ${MAIN})
 target_compile_options(depth_geom_test PRIVATE -Wall -Wextra)
