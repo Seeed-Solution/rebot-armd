@@ -238,8 +238,8 @@ copy it to the camera and install it. `192.168.42.1` is the reCamera's address o
 when connected to the access point that this package starts, the camera is `192.168.16.1`.
 
 ```bash
-scp dist/rebot-teleop_1.3.8_riscv64.deb root@192.168.42.1:/tmp/
-ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.3.8_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
+scp dist/rebot-teleop_1.4.0_riscv64.deb root@192.168.42.1:/tmp/
+ssh root@192.168.42.1 "dpkg -i /tmp/rebot-teleop_1.4.0_riscv64.deb && /etc/init.d/K92rebot-teleop restart"
 ```
 
 The package installs:
@@ -326,17 +326,17 @@ export RECAMERA_TOOLCHAIN=$PWD/host-tools/gcc/riscv64-linux-musl-x86_64
 
 `--flavor recamera` (the deb) also needs `rebot-vision`, a C++ program built against the
 SG2002 SDK. The simplest way is the prebuilt binary from the
-[GitHub release](https://github.com/Seeed-Solution/rebot-armd/releases/tag/v1.3.4):
+[GitHub release](https://github.com/Seeed-Solution/rebot-armd/releases/tag/v1.4.0):
 
 ```bash
-V=1.3.4
+V=1.4.0
 curl -LO https://github.com/Seeed-Solution/rebot-armd/releases/download/v$V/rebot-vision-$V-riscv64
 curl -LO https://github.com/Seeed-Solution/rebot-armd/releases/download/v$V/SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
 
 REBOT_VISION_BIN=$PWD/rebot-vision-$V-riscv64 \
-./scripts/build_deb.sh 1.3.8          # version argument optional (default: debian/control)
-# -> dist/rebot-teleop_1.3.8_riscv64.deb
+./scripts/build_deb.sh 1.4.0          # version argument optional (default: debian/control)
+# -> dist/rebot-teleop_1.4.0_riscv64.deb
 ```
 
 To build `rebot-vision` from source instead, set `RECAMERA_DOCKER=<container>` (a running
