@@ -86,8 +86,9 @@ function setupSim() {
         const i = body.intrinsics, m = body.camera_mount;
         const tilt = CW.rpyDeg(CW.quatR(m.q_end_cam))[0];
         const after = { vision_intrinsics: { ...before.vision_intrinsics, ...i }, camera_mount: { ...before.camera_mount, offset_m: m.offset_m, q_end_cam: m.q_end_cam, tilt_deg: tilt },
-          grasp: { ...before.grasp, fx_px: i.fx, fy_px: i.fy, cx_px: i.cx, cy_px: i.cy, table_z_m: body.table_z_m, camera_tilt_deg: tilt, grip_pixel_norm: [0.512, 0.795] } };
-        if (body.dry_run) return { dry_run: true, before, after };
+          grasp: { ...before.grasp, fx_px: i.fx, fy_px: i.fy, cx_px: i.cx, cy_px: i.cy, table_z_m: body.table_z_m, camera_tilt_deg: tilt } };
+        // v8-like: the grip pixel of the new model is below the image, grip_pixel_norm stays
+        if (body.dry_run) return { dry_run: true, before, after: { ...after, grip_pixel_model: [0.507, 1.184] } };
         return { backup: '/userdata/rebot-teleop/calibration-backups/20261117T101500Z', ...after, vision_intrinsics: { ...after.vision_intrinsics, revision: 4 } };
       }
       if (p === '/api/v1/calibration/restore') return { backup: '/userdata/rebot-teleop/calibration-backups/20261117T101620Z', restored: body.backup, vision_intrinsics: { fx: 824, fy: 824, cx: 320, cy: 180, k1: 0, k2: 0, revision: 5 } };
@@ -167,7 +168,9 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
       moves: __SIM.calls.filter(([p]) => p === '/api/v1/action/move_to').map(([, b]) => b.speed), status: CWZ.status }));
     const speedsOk = run.moves.length > 0 && run.moves.every((s) => s.linear === 0.03 && s.angular === 0.3);
     if (run.idx !== run.n || run.acc < 15 || !run.refined || !speedsOk) fail('run ' + JSON.stringify({ ...run, moves: run.moves.length }));
-    await shot('3_capture', `poses ${run.n}, accepted ${run.acc} (incl. start view), skipped ${run.skip}, refined ${run.refined}, move_to speed caps ok ${speedsOk}`);
+    const lbl = await page.evaluate(() => document.querySelector('#cwiz-body .calib-count').textContent);
+    if (!/^\d+ (views \(min 15\)|个视图（至少 15 个）)/.test(lbl)) fail('progress label ' + lbl);
+    await shot('3_capture', `label "${lbl}", poses ${run.n}, accepted ${run.acc} (incl. start view), skipped ${run.skip}, refined ${run.refined}, move_to speed caps ok ${speedsOk}`);
     // 4 solve
     await page.click('#cwiz-solve');
     const sol = await page.evaluate(() => { const r = CWZ.solve, K = r.intr.K; return { ok: r.ok, fails: r.gates.filter((g) => !g.ok).map((g) => g.key), K: [K.fx, K.fy, K.cx, K.cy, K.k1].map((v) => +v.toFixed(3)), off: r.apply && r.apply.camera_mount.offset_m.map((v) => +(v * 1000).toFixed(2)), z: r.apply && +(r.apply.table_z_m * 1000).toFixed(2), rows: document.querySelectorAll('#cwiz-body .cwiz-table tr').length }; });
@@ -176,9 +179,9 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     // 5 review (dry run)
     await page.click('#cwiz-review');
     await waitW(page, () => !!CWZ.dry && !CWZ.busy, 10000, '() => !!CWZ.dry && !CWZ.busy');
-    const rv = await page.evaluate(() => ({ rows: document.querySelectorAll('#cwiz-body .cwiz-table tr').length, chg: document.querySelectorAll('#cwiz-body .cwiz-table tr.chg').length, dry: __SIM.calls.filter(([p, b]) => p === '/api/v1/calibration/apply' && b.dry_run === true).length }));
-    if (rv.rows < 10 || rv.chg < 5 || rv.dry !== 1) fail('review ' + JSON.stringify(rv));
-    await shot('5_review', `diff rows ${rv.rows - 1}, changed ${rv.chg}`);
+    const rv = await page.evaluate(() => ({ grip: [...document.querySelectorAll('#cwiz-body .cwiz-table td.note')].map((x) => x.textContent).join(), rows: document.querySelectorAll('#cwiz-body .cwiz-table tr').length, chg: document.querySelectorAll('#cwiz-body .cwiz-table tr.chg').length, dry: __SIM.calls.filter(([p, b]) => p === '/api/v1/calibration/apply' && b.dry_run === true).length }));
+    if (rv.rows < 10 || rv.chg < 5 || rv.dry !== 1 || !/camera-down|相机朝下/.test(rv.grip)) fail('review ' + JSON.stringify(rv));
+    await shot('5_review', `diff rows ${rv.rows - 1}, changed ${rv.chg}, grip row "${rv.grip}"`);
     // 6 apply (two taps), applied, restore (two taps)
     await page.click('#cwiz-apply');
     const armed = await page.evaluate(() => $('cwiz-apply').textContent);

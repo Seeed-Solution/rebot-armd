@@ -329,6 +329,7 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .cwiz-table td.ok { color: var(--sc-status-normal-fg); }
 .cwiz-table td.bad { color: var(--sc-status-danger-fg); font-weight: 600; }
 .cwiz-table tr.chg td { background: var(--sc-color-primary-soft); }
+.cwiz-table td.note { font-family: var(--sc-font-sans, sans-serif); color: var(--sc-status-warning-fg, inherit); }
 .cwiz-poses { max-height: 220px; }
 .cwiz-poses li.cur { outline: 1px solid var(--sc-color-primary); }
 .cwiz-poses li.ok b { color: var(--sc-status-normal-fg); }
@@ -2324,7 +2325,7 @@ Object.assign(I18N.zh, {
   'cw.place.nogen': '从当前位置生成不出可达的位姿（{why}），请换一个起始位置', 'cw.place.ok': '已生成 {n} 个位姿',
   'cw.mount.guess': '没有测量过的相机镜头位置，起始估计使用 {o} mm，求解后会被替换',
   'cw.cap.hint': '机械臂以 0.03 m/s、0.3 rad/s 依次移到每个位姿，静止 0.3 s 后采集。默认每个位姿都要确认；勾选「连续运行」后自动执行全部位姿。停止按钮随时可用；页面切到后台、心跳或控制权丢失都会中止运行，不会自动继续。',
-  'cw.cap.count': '已采集 {n} / {target} 个视图 · 跳过 {s} 个', 'cw.cap.next': '移到下一个位姿并采集', 'cw.cap.runall': '连续运行（不再逐个确认）',
+  'cw.cap.count': '{n} 个视图（至少 {target} 个）· 跳过 {s} 个', 'cw.cap.next': '移到下一个位姿并采集', 'cw.cap.runall': '连续运行（不再逐个确认）',
   'cw.cap.start': '开始连续运行', 'cw.cap.stop': '停止', 'cw.cap.preview': '在 3D 视图中预览位姿', 'cw.cap.solve': '求解', 'cw.cap.more': '补充位姿',
   'cw.cap.moving': '移动到位姿 {i} …', 'cw.cap.capturing': '采集位姿 {i} …', 'cw.cap.refined': '已用前 {n} 个视图重新估计，剩余位姿已更新',
   'cw.cap.aborted': '已中止：{why}', 'cw.cap.done': '位姿已全部执行',
@@ -2337,7 +2338,7 @@ Object.assign(I18N.zh, {
   'cw.g.held_out': '留出视图 RMS', 'cw.g.sigma': '内参 1σ（相对值，最大）', 'cw.g.rot_diversity': '转动轴多样性', 'cw.g.he_pos': '手眼位置 RMS', 'cw.g.he_rot': '手眼角度 RMS',
   'cw.g.plane_tilt': '标定板法向偏离竖直', 'cw.g.plane_spread': '标定板高度极差',
   'cw.th.check': '检查', 'cw.th.value': '数值', 'cw.th.limit': '限值', 'cw.th.field': '字段', 'cw.th.before': '修改前', 'cw.th.after': '修改后',
-  'cw.r.intr': '内参（640×360）', 'cw.r.mount': '相机安装（end_link 坐标系）', 'cw.r.table': '桌面高度', 'cw.r.dropped': '剔除的视图：{list}', 'cw.r.joint': '联合优化重投影 RMS',
+  'cw.r.intr': '内参（640×360）', 'cw.r.mount': '相机安装（end_link 坐标系）', 'cw.r.table': '桌面高度', 'cw.r.dropped': '剔除的视图：{list}', 'cw.r.joint': '联合优化重投影 RMS', 'cw.rev.gripOut': '在该接近高度下夹爪抓取点不在画面内：使用相机朝下采集',
   'cw.rev.hint': '下面是 armd 预演（dry_run）给出的修改前后对比。确认后 armd 先备份，再依次写入 rebot-vision 内参、相机安装和抓取设置；任一步失败会回滚已完成的步骤。',
   'cw.rev.apply': '确认应用', 'cw.rev.confirm': '再点一次确认应用', 'cw.rev.loading': '正在向 armd 请求预演…',
   'cw.app.ok': '已应用。以下是两项服务读回的数值：', 'cw.app.backup': '备份：{b}', 'cw.app.restore': '恢复到应用前（最近备份）', 'cw.app.restore.confirm': '再点一次确认恢复',
@@ -2356,7 +2357,7 @@ Object.assign(I18N.en, {
   'cw.place.nogen': 'No reachable poses from here ({why}); start from another pose', 'cw.place.ok': '{n} poses generated',
   'cw.mount.guess': 'No measured lens position; the start estimate uses {o} mm, the solve replaces it',
   'cw.cap.hint': 'The arm moves to each pose at 0.03 m/s and 0.3 rad/s, waits until still plus 0.3 s, then captures. By default every pose needs a tap; with "Run all" the poses run one after another. Stop is always available; a hidden page, lost heartbeat or lost control lease aborts the run, which does not resume by itself.',
-  'cw.cap.count': 'Views {n} / {target} · skipped {s}', 'cw.cap.next': 'Move to the next pose and capture', 'cw.cap.runall': 'Run all (no tap per pose)',
+  'cw.cap.count': '{n} views (min {target}) · skipped {s}', 'cw.cap.next': 'Move to the next pose and capture', 'cw.cap.runall': 'Run all (no tap per pose)',
   'cw.cap.start': 'Start run', 'cw.cap.stop': 'Stop', 'cw.cap.preview': 'Preview poses in 3D', 'cw.cap.solve': 'Solve', 'cw.cap.more': 'Add poses',
   'cw.cap.moving': 'Moving to pose {i}…', 'cw.cap.capturing': 'Capturing pose {i}…', 'cw.cap.refined': 'Re-estimated from {n} views; remaining poses updated',
   'cw.cap.aborted': 'Aborted: {why}', 'cw.cap.done': 'All poses visited',
@@ -2369,7 +2370,7 @@ Object.assign(I18N.en, {
   'cw.g.held_out': 'Held-out RMS', 'cw.g.sigma': 'Intrinsics 1σ (relative, max)', 'cw.g.rot_diversity': 'Rotation axis diversity', 'cw.g.he_pos': 'Hand-eye position RMS', 'cw.g.he_rot': 'Hand-eye rotation RMS',
   'cw.g.plane_tilt': 'Board normal from vertical', 'cw.g.plane_spread': 'Board height spread',
   'cw.th.check': 'Check', 'cw.th.value': 'Value', 'cw.th.limit': 'Limit', 'cw.th.field': 'Field', 'cw.th.before': 'Before', 'cw.th.after': 'After',
-  'cw.r.intr': 'Intrinsics (640×360)', 'cw.r.mount': 'Camera mount (end_link frame)', 'cw.r.table': 'Table height', 'cw.r.dropped': 'Dropped views: {list}', 'cw.r.joint': 'Joint refinement reprojection RMS',
+  'cw.r.intr': 'Intrinsics (640×360)', 'cw.r.mount': 'Camera mount (end_link frame)', 'cw.r.table': 'Table height', 'cw.r.dropped': 'Dropped views: {list}', 'cw.r.joint': 'Joint refinement reprojection RMS', 'cw.rev.gripOut': 'grip pixel outside the image at this approach height: camera-down acquisition is used',
   'cw.rev.hint': 'Before / after from an armd dry run. On Apply armd writes a backup, then the rebot-vision intrinsics, the camera mount and the grasp setup; a failing step reverts the earlier ones.',
   'cw.rev.apply': 'Apply', 'cw.rev.confirm': 'Tap again to apply', 'cw.rev.loading': 'Asking armd for a dry run…',
   'cw.app.ok': 'Applied. Values read back from both services:', 'cw.app.backup': 'Backup: {b}', 'cw.app.restore': 'Restore last backup', 'cw.app.restore.confirm': 'Tap again to restore',
@@ -4889,7 +4890,15 @@ function cwDiffRows(before, after) {
   add('camera_mount.offset_m', ['camera_mount', 'offset_m'], 'mm');
   add('camera_mount.q_end_cam', ['camera_mount', 'q_end_cam']);
   add('camera_mount.tilt_deg', ['camera_mount', 'tilt_deg'], 'deg');
-  for (const [k, u] of [['fx_px'], ['fy_px'], ['cx_px'], ['cy_px'], ['table_z_m', 'mm'], ['camera_tilt_deg', 'deg'], ['grip_pixel_norm']]) add('grasp.' + k, ['grasp', k], u);
+  for (const [k, u] of [['fx_px'], ['fy_px'], ['cx_px'], ['cy_px'], ['table_z_m', 'mm'], ['camera_tilt_deg', 'deg']]) add('grasp.' + k, ['grasp', k], u);
+  // armd's grip pixel of the new camera model; outside [0, 1] it keeps grip_pixel_norm (camera-down acquisition)
+  const gm = after && after.grip_pixel_model;
+  if (Array.isArray(gm) && gm.some((v) => !(v >= 0 && v <= 1))) {
+    const tr = document.createElement('tr'), td = cwEl('td', 'note', t('cw.rev.gripOut'));
+    tr.append(cwEl('td', '', 'grasp.grip_pixel_norm'), cwEl('td', '', fmt(get(before, ['grasp', 'grip_pixel_norm']))), td);
+    td.title = 'grip_pixel_model ' + gm.map((v) => v.toFixed(3)).join(', ');
+    rows.push(tr);
+  } else add('grasp.grip_pixel_norm', ['grasp', 'grip_pixel_norm']);
   return rows;
 }
 function cwRender() {
