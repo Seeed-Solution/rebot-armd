@@ -807,10 +807,35 @@ status() {
     return 1
 }
 
+# start, stop and restart run one at a time. postinst starts in the background, and a start
+# writes the pidfile only after Wi-Fi and CAN setup, so a second start in that window passed
+# the pidfile check, launched a second armd (AddrInUse) and its cleanup removed the first
+# armd's pidfile. A lock left by a process that is gone is taken over.
+LOCKDIR=/var/run/$NAME.lock
+lock() {
+    i=0
+    while ! mkdir "$LOCKDIR" 2>/dev/null; do
+        OWNER=$(cat "$LOCKDIR/pid" 2>/dev/null)
+        if [ -n "$OWNER" ] && [ ! -d "/proc/$OWNER" ]; then
+            rm -rf "$LOCKDIR"
+            continue
+        fi
+        i=$((i + 1))
+        if [ $i -ge 120 ]; then
+            echo "Another $NAME start/stop is still running (PID: ${OWNER:-unknown}, lock $LOCKDIR)"
+            return 1
+        fi
+        sleep 0.5
+    done
+    echo $$ > "$LOCKDIR/pid"
+    trap 'rm -rf "$LOCKDIR"' EXIT
+    trap 'exit 1' INT TERM HUP
+}
+
 case "$1" in
-    start) start; exit $? ;;
-    stop) stop; exit $? ;;
-    restart) stop || exit $?; sleep 2; start; exit $? ;;
+    start) lock || exit 1; start; exit $? ;;
+    stop) lock || exit 1; stop; exit $? ;;
+    restart) lock || exit 1; stop || exit $?; sleep 2; start; exit $? ;;
     status) status; exit $? ;;
     register) register_active_app; exit $? ;;
     stop-vision) stop_vision; exit $? ;;
