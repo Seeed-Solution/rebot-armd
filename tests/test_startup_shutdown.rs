@@ -184,7 +184,7 @@ async fn mock_shutdown_does_not_wait_for_an_open_websocket() {
 #[test]
 fn init_stop_refuses_unknown_or_uncooperative_processes_without_killing() {
     let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
-    assert!(source.contains("restart) stop || exit $?;"));
+    assert!(source.contains("restart) lock || exit 1; stop || exit $?;"));
     let start = source.find("stop_video() {").unwrap();
     let end = source.find("\nstatus() {").unwrap();
     for mode in ["missing", "wrong_identity", "timeout"] {
@@ -971,4 +971,37 @@ fn manifest_version_matches_the_debian_package_version() {
     let staged: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     assert_eq!(staged["version"], "9.8.7-test");
     assert_eq!(staged["id"], "rebot-teleop");
+}
+
+/// Concurrent `start`/`stop` runs (postinst's background start and a manual start) run one
+/// at a time; a lock whose owner is gone is taken over.
+#[cfg(unix)]
+#[test]
+fn init_start_stop_hold_one_lock() {
+    let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
+    for arm in ["start) lock || exit 1;", "stop) lock || exit 1;", "restart) lock || exit 1;"] {
+        assert!(source.contains(arm), "{arm}");
+    }
+    let begin = source.find("lock() {").unwrap();
+    let end = begin + source[begin..].find("\n}\n").unwrap() + 3;
+    let temp = tempfile::tempdir().unwrap();
+    let t = temp.path().display().to_string();
+    let script = format!(
+        "LOCKDIR={t}/lock\nNAME=t\n{}\nlock || exit 1\n[ -e {t}/busy ] && echo OVERLAP >> {t}/log\ntouch {t}/busy; sleep 0.3; rm -f {t}/busy\necho done >> {t}/log\n",
+        &source[begin..end]
+    );
+    let path = temp.path().join("s.sh");
+    std::fs::write(&path, script).unwrap();
+    let runs: Vec<_> = (0..3).map(|_| Command::new("sh").arg(&path).spawn().unwrap()).collect();
+    for mut run in runs {
+        assert!(run.wait().unwrap().success());
+    }
+    assert_eq!(std::fs::read_to_string(temp.path().join("log")).unwrap(), "done\ndone\ndone\n");
+    assert!(!temp.path().join("lock").exists());
+
+    // Left by a process that no longer exists.
+    std::fs::create_dir(temp.path().join("lock")).unwrap();
+    std::fs::write(temp.path().join("lock/pid"), "999999999\n").unwrap();
+    assert!(Command::new("sh").arg(&path).status().unwrap().success());
+    assert!(!temp.path().join("lock").exists());
 }
