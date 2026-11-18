@@ -8,7 +8,11 @@
 // The run goes board -> place (bootstrap with nominal values) -> capture (run all) -> solve (gates) ->
 // review (dry-run reply) -> applied -> restore, in zh / en at desktop 1400x900 and phone 390x844, and writes
 // PNGs to .cache/calib-wizard-shots/. Also: Stop aborts a run, and armd without calibration_apply shows the
-// update message. Exits non-zero if a check fails.
+// update message. Fine calibration mode (camera + arm geometry), same viewports and languages: the simulated arm's
+// geometry differs from the URDF (zero offsets, a joint-axis tilt, an origin shift); joint-space capture of
+// placement A with an abort and Continue, the board move, placement B, the solve in a Web Worker (gates, held-out,
+// per-joint parameters, the J5 zero warning), review with park / torque off, one apply carrying kinematics.
+// FINE_ONLY=1 runs only the fine calibration walk-through. Exits non-zero if a check fails.
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -112,7 +116,7 @@ function setupSim() {
   });
 }
 
-for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['phone', { width: 390, height: 844 }]]) {
+for (const [vpName, viewport] of (process.env.FINE_ONLY ? [] : [['desktop', { width: 1400, height: 900 }], ['phone', { width: 390, height: 844 }]])) {
   for (const lang of ['zh', 'en']) {
     const ctx = await browser.newContext({ viewport, deviceScaleFactor: vpName === 'phone' ? 2 : 1 });
     await ctx.addInitScript(([l]) => {
@@ -247,6 +251,201 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     const adv = await page.evaluate(() => !$('calib').hidden && $('cwiz').hidden);
     if (!adv) fail('advanced drawer');
     if (errs.length) { fail(`page errors (${lang}/${vpName}): ${[...new Set(errs)].join(' | ').slice(0, 300)}`); }
+    await ctx.close();
+  }
+}
+// ---- fine calibration mode
+function setupFine() {
+  const W = __SIM, CW = CWZ.CW, D = 180 / Math.PI;
+  CWF.n = 18; CWF.dwellMs = 60; CWF.settleMs = 150; // shorter waits for the walk-through
+  // the simulated arm: real geometry = URDF + this correction (J5 zero -6 deg: the review shows the warning)
+  W.kc = CALM.normCorrection([{}, { offset_rad: 0.8 / D, tilt_rad: [0, 0.6 / D] }, { offset_rad: -0.5 / D, tilt_rad: [1.0 / D, 0] }, { origin_m: [0.008, 0, 0] }, { offset_rad: -6 / D }, {}]);
+  W.TbbB = CW.make(CW.mul(CW.rpyR(0, 0, -105 / D), CW.rpyR(Math.PI, 0, 0)), [0.27, -0.12, 0.0005]);
+  W.armedOnce = true;
+  const camAbove = (Tbb) => {
+    const c = CW.posOf(Tbb), Rb = CW.rotOf(Tbb), x = [Rb[0][0], Rb[1][0], 0], z = [0, 0, -1], y = [z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0]];
+    const T0 = CW.mul(CW.make([[x[0], y[0], z[0]], [x[1], y[1], z[1]], [x[2], y[2], z[2]]], [c[0], c[1], 0.30]), CW.inv(W.X));
+    // seeded from the arm's current pose first (same IK branch, as a user jogging there)
+    const q0 = cwModelQ(S.obs.positions);
+    for (let k = 0; k < 400; k++) { const s = k ? q0.map((v, i) => v + Math.sin(k * 7.3 + i * 1.7) * 0.4 * Math.min(1, k / 50)) : q0; const r = VIK.solve(T0, s, { iters: 300 }); if (r.ok) return r.q; }
+    return null;
+  };
+  // the user moves the board and jogs the camera above it
+  W.moveBoard = () => { W.Tbb = W.TbbB; const q = camAbove(W.TbbB); if (q) S.obs.positions = [...toMotor6(q), 0]; return !!q; };
+  window.detTriggerReq = async () => {
+    await new Promise((r) => setTimeout(r, 20));
+    const G = CALM.fk(cwModelQ(S.obs.positions), W.kc), Tcb = CW.mul(CW.inv(CW.mul(G, W.X)), W.Tbb), R = CW.rotOf(Tcb), t = CW.posOf(Tcb), markers = [];
+    const rnd = () => { W.seed = (W.seed * 1103515245 + 12345) % 2147483648; return W.seed / 2147483648; };
+    const gauss = () => Math.sqrt(-2 * Math.log(1 - rnd())) * Math.cos(2 * Math.PI * rnd());
+    for (const m of CW.makeBoard({ markerSide: 0.025 }).markers) {
+      const px = m.corners.map((c) => CW.project(W.K, R, t, c));
+      if (px.every(([u, v, zz]) => zz > 0 && u >= 4 && u <= 636 && v >= 4 && v <= 356)) markers.push({ id: m.id, corners: px.map(([u, v]) => [u + 0.3 * gauss(), v + 0.3 * gauss()]) });
+    }
+    return { api_version: 2, success: true, frame_id: Date.now(), width: 640, height: 360, markers, detections: [] };
+  };
+  const base = window.commandRPC;
+  let aid = 1000;
+  window.commandRPC = async (p, body) => {
+    if (p === '/api/v1/motion/jog' || p === '/api/v1/motion/unload') {
+      W.calls.push([p, body]);
+      const id = ++aid;
+      S.obs.action = { id, kind: p.endsWith('jog') ? 'jog' : 'unload', state: 'running' };
+      setTimeout(() => {
+        if (p.endsWith('jog')) S.obs.positions = body.target_positions.slice();
+        else { S.obs.is_torqued = false; S.state = 'Disabled'; }
+        S.obs.action = { id, kind: 'jog', state: 'done', code: null };
+      }, 60);
+      return { action_id: id };
+    }
+    if (p === '/api/v1/calibration/apply' && !body.dry_run && W.armedOnce) { W.calls.push([p, body]); W.armedOnce = false; throw Object.assign(new Error('torque on'), { code: 'KINEMATICS_ARMED' }); }
+    const r = await base(p, body);
+    if (p === '/api/v1/calibration/apply') {
+      if (body.dry_run) return { ...r, before: { ...r.before, kinematics: null }, after: { ...r.after, kinematics: body.kinematics } };
+      return { ...r, kinematics: body.kinematics };
+    }
+    return r;
+  };
+  return true;
+}
+for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['phone', { width: 390, height: 844 }]]) {
+  for (const lang of ['zh', 'en']) {
+    const ctx = await browser.newContext({ viewport, deviceScaleFactor: vpName === 'phone' ? 2 : 1 });
+    await ctx.addInitScript(([l]) => {
+      try { localStorage.clear(); localStorage.setItem('lang', l); } catch (_) {}
+      const RealWS = window.WebSocket;
+      window.WebSocket = function (u, p) { if (!String(u).includes('/api/v1/ws')) return new RealWS(u, p); return { readyState: 1, url: u, send() {}, close() {}, addEventListener() {} }; };
+      window.WebSocket.OPEN = 1;
+    }, [lang]);
+    const page = await ctx.newPage();
+    const errs = [];
+    page.on('pageerror', (e) => errs.push(e.message));
+    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(500);
+    if (!(await page.evaluate(setupSim)) || !(await page.evaluate(setupFine))) fail('fine sim start');
+    // main-thread blocking during plan and solve (max gap of a 10 ms timer); the phone runs
+    // use the no-worker fallback (sliced on the main thread)
+    const noWorker = vpName === 'phone';
+    await page.evaluate((nw) => {
+      // probe: a 10 ms timer on the main thread (as the lease heartbeat timer); a gap between two ticks is the
+      // time the thread was blocked (longest task + timer slack). PerformanceObserver('longtask') reported nothing
+      // in headless Chromium here, not even for a synchronous control block.
+      __SIM.long = []; __SIM.phase = null;
+      let last = performance.now();
+      setInterval(() => { const n = performance.now(); if (__SIM.phase) __SIM.long.push([__SIM.phase, n - last]); last = n; }, 10);
+      if (nw) window.Worker = undefined;
+    }, noWorker);
+    const phase = (ph) => page.evaluate((x) => { __SIM.phase = x; }, ph);
+    const longest = async (ph) => page.evaluate((x) => Math.max(0, ...__SIM.long.filter(([p]) => p === x).map(([, d]) => d)), ph);
+    const longs = {};
+    const shot = async (step, extra = '') => {
+      await page.waitForTimeout(250);
+      const info = await page.evaluate(() => ({ open: !$('cwiz').hidden, on: [...document.querySelectorAll('#cwiz-steps li.on')].map((x) => x.textContent).join(),
+        raw: /\bcw\.[a-z]/.test($('cwiz-panel').innerText), hscroll: $('cwiz-panel').scrollWidth > $('cwiz-panel').clientWidth + 1 }));
+      if (!info.open || info.raw || info.hscroll) fail(`fine ${step} ${lang}/${vpName}: ${JSON.stringify(info)}`);
+      const file = path.join(out, `cwiz_fine_${step}_${lang}_${vpName}.png`);
+      await page.screenshot({ path: file });
+      shots.push(file);
+      console.log(`${path.relative(root, file)}  step="${info.on}" ${extra}`);
+    };
+    const jogs = () => page.evaluate(() => __SIM.calls.filter(([p]) => p === '/api/v1/motion/jog').map(([, b]) => b));
+    // board: pick the mode
+    await page.evaluate(() => cwOpen(true));
+    await page.waitForTimeout(500);
+    await page.click('#cwiz-mode-fine');
+    const md = await page.evaluate(() => ({ mode: CWZ.mode, steps: document.querySelectorAll('#cwiz-steps li').length, pressed: $('cwiz-mode-fine').getAttribute('aria-pressed') }));
+    if (md.mode !== 'fine' || md.steps !== 8 || md.pressed !== 'true') fail('fine mode select ' + JSON.stringify(md));
+    await shot('1_board', `mode ${md.mode}, ${md.steps} steps`);
+    await page.click('#cwiz-next');
+    await shot('2_placeA');
+    await phase('planA');
+    await page.click('#cwiz-boot');
+    await waitW(page, () => CWZ.step === 'capture' || (!CWZ.busy && CWZ.status), 60000, 'fine boot A');
+    await page.waitForTimeout(100); await phase(null); longs.planA = await longest('planA');
+    const pa = await page.evaluate(() => ({ step: CWZ.step, n: CWZ.plan.length, dmax: Math.max(...CWZ.plan.map((p) => p.dist)) }));
+    if (pa.step !== 'capture' || pa.n < 15) fail('fine plan A ' + JSON.stringify(pa));
+    // capture A: run all, Stop after 3 poses, Continue
+    await page.check('#cwiz-runall');
+    await page.evaluate(() => { __SIM.calls.length = 0; });
+    await page.click('#cwiz-go');
+    await waitW(page, () => CWZ.idx >= 3, 60000, 'fine 3 poses');
+    await page.evaluate(() => cwStop());
+    await waitW(page, () => !CWZ.running, 20000, 'fine stop');
+    const ab = await page.evaluate(() => ({ idx: CWZ.idx, plan: CWZ.plan.length, views: CWZ.views.length, status: CWZ.status, go: $('cwiz-go') && $('cwiz-go').textContent, moveTo: __SIM.calls.filter(([p]) => p === '/api/v1/action/move_to').length }));
+    if (!/中止|Aborted/.test(ab.status) || !/继续|Continue/.test(ab.go) || ab.views < 5 || ab.moveTo) fail('fine abort ' + JSON.stringify(ab));
+    await shot('3_captureA_abort', `idx ${ab.idx}, views kept ${ab.views}, button "${ab.go}", move_to calls ${ab.moveTo}`);
+    const planBefore = await page.evaluate(() => JSON.stringify(CWZ.plan.map((p) => p.q)));
+    const nBefore = (await jogs()).length;
+    await page.click('#cwiz-go');
+    await waitW(page, () => !CWZ.running, 120000, 'fine capture A');
+    const ra = await page.evaluate((i0) => ({ idx: CWZ.idx, n: CWZ.plan.length, ok: CWZ.plan.filter((p) => p.state === 'ok').length, views: CWZ.views.filter((v) => v.ds === 0).length, plan: JSON.stringify(CWZ.plan.map((p) => p.q)), firstQ: toMotor6(cwFinePre(CWZ.plan[i0].q)) }), ab.idx);
+    const js = await jogs();
+    // every pose: pre-pose 2 deg below the target on every joint (or above near the lower limit), then the target
+    // (a run stopped during a pre-pose leaves one unpaired jog: pair every jog to a plan target with the one before it)
+    const targets = await page.evaluate(() => CWZ.plan.map((p) => toMotor6(p.q)));
+    let pairOk = true, durOk = true, nTarget = 0;
+    for (let k = 1; k < js.length; k++) {
+      const b = js[k].target_positions;
+      if (!targets.some((t) => t.every((v, i) => Math.abs(v - b[i]) < 1e-9))) continue;
+      nTarget++;
+      const a = js[k - 1].target_positions;
+      if (!a.slice(0, 6).every((v, i) => Math.abs(Math.abs(v - b[i]) - 2 / 180 * Math.PI) < 1e-6)) pairOk = false;
+    }
+    if (nTarget < ra.ok) pairOk = false;
+    for (const b of js) { const d = b.duration_secs; if (!(d >= 1.5) || b.target_positions.length !== 7) durOk = false; }
+    const resumeOk = js[nBefore] && js[nBefore].target_positions.slice(0, 6).every((v, i) => Math.abs(v - ra.firstQ[i]) < 1e-9);
+    if (ra.idx !== ra.n || ra.plan !== planBefore || !pairOk || !durOk || !resumeOk || ra.ok < 10) fail('fine capture A ' + JSON.stringify({ ...ra, plan: ra.plan === planBefore, pairOk, durOk, resumeOk, jogs: js.length }));
+    await shot('4_captureA_done', `poses ${ra.ok}/${ra.n}, views ${ra.views}, jog pairs (pre 2 deg, target) ${pairOk}, duration >= 1.5 s ${durOk}, resumed at pose ${ab.idx + 1} with the same plan ${resumeOk && ra.plan === planBefore}`);
+    // move the board
+    await page.click('#cwiz-tob');
+    if (!(await page.evaluate(() => __SIM.moveBoard()))) fail('fine move board ik');
+    await shot('5_move');
+    await phase('planB');
+    await page.click('#cwiz-boot');
+    await waitW(page, () => CWZ.step === 'captureb' || (!CWZ.busy && CWZ.status), 60000, 'fine boot B');
+    await page.waitForTimeout(100); await phase(null); longs.planB = await longest('planB');
+    if (!(await page.evaluate(() => CWZ.step === 'captureb' && CWZ.place === 1 && CWZ.views.some((v) => v.ds === 0)))) fail('fine boot B ' + JSON.stringify(await page.evaluate(() => ({ step: CWZ.step, status: CWZ.status, place: CWZ.place }))));
+    await page.check('#cwiz-runall');
+    await page.click('#cwiz-go');
+    await waitW(page, () => !CWZ.running, 120000, 'fine capture B');
+    const rb = await page.evaluate(() => ({ idx: CWZ.idx, n: CWZ.plan.length, A: CWZ.views.filter((v) => v.ds === 0).length, B: CWZ.views.filter((v) => v.ds === 1).length }));
+    if (rb.idx !== rb.n || rb.B < 20) fail('fine capture B ' + JSON.stringify(rb));
+    await shot('6_captureB_done', `views A ${rb.A}, B ${rb.B}`);
+    // solve in the worker
+    await phase('solve');
+    await page.click('#cwiz-solve');
+    await waitW(page, () => !CWZ.solving && CWZ.step === 'solve', 300000, 'fine solve');
+    await page.waitForTimeout(100); await phase(null); longs.solve = await longest('solve');
+    // control: the same plan run synchronously on the main thread (what the page did before) must show up as a long task
+    await phase('control');
+    await page.evaluate(() => { cwPlan(CWZ.est, cwModelQ(S.obs.positions), CWF.n); });
+    await page.waitForTimeout(200); await phase(null); longs.control = await longest('control');
+    if (!(longs.control > 50)) fail('fine blocking probe control ' + longs.control);
+    const pw = await page.evaluate(() => ({ plan: CWZ.planWorker, solve: CWZ.solve && CWZ.solve.worker }));
+    const lmax = Math.max(longs.planA, longs.planB, longs.solve);
+    if (lmax >= 300 || pw.plan !== !noWorker || pw.solve !== !noWorker) fail('fine main-thread long task ' + JSON.stringify({ longs, pw }));
+    console.log(`  main-thread longest block (${lang}/${vpName}, ${noWorker ? 'no Worker: sliced on the main thread' : 'Web Worker'}): plan A ${longs.planA.toFixed(0)} ms, plan B ${longs.planB.toFixed(0)} ms, solve ${longs.solve.toFixed(0)} ms (max gap of a 10 ms timer); control: the same plan synchronously ${longs.control.toFixed(0)} ms; plan in worker ${pw.plan}, solve in worker ${pw.solve}`);
+    const so = await page.evaluate(() => { const r = CWZ.solve; return r ? { ok: r.ok, worker: r.worker, secs: +r.secs.toFixed(1), fails: r.gates.filter((g) => !g.ok).map((g) => g.key), ho: [r.kin.heldOut.ab0.mm, r.kin.heldOut.ab.mm, r.kin.heldOut.ba0.mm, r.kin.heldOut.ba.mm].map((v) => +v.toFixed(2)), j5: +(r.kin.joints[4].offset_rad * 180 / Math.PI).toFixed(2), warn: document.querySelectorAll('#cwiz-body .cwiz-zero').length, tables: document.querySelectorAll('#cwiz-body .cwiz-table').length, flat: [...document.querySelectorAll('#cwiz-body .cwiz-table')].filter((d) => d.getBoundingClientRect().height < 40).length } : { status: CWZ.status }; });
+    if (!so.ok || so.worker !== !noWorker || so.warn !== 1 || so.tables !== 3 || so.flat) fail('fine solve ' + JSON.stringify(so));
+    await shot('7_solve', `gates ok ${so.ok}, Web Worker ${so.worker}, ${so.secs} s, held-out A->B ${so.ho[0]} -> ${so.ho[1]} mm, B->A ${so.ho[2]} -> ${so.ho[3]} mm, J5 zero ${so.j5} deg, warnings ${so.warn}`);
+    await page.evaluate(() => { const b = $('cwiz-body'); b.scrollTop = b.scrollHeight; });
+    await shot('7b_solve_params');
+    // review: torque on -> park first
+    await page.click('#cwiz-review');
+    await waitW(page, () => !!CWZ.dry && !CWZ.busy, 10000, 'fine dry run');
+    const rv = await page.evaluate(() => ({ kin: [...document.querySelectorAll('#cwiz-body .cwiz-table tr')].filter((tr) => /kinematics J/.test(tr.textContent)).length, applyDis: $('cwiz-apply').disabled, park: !!$('cwiz-park'), dryKin: !!__SIM.calls.find(([p, b]) => p === '/api/v1/calibration/apply' && b.dry_run && b.kinematics) }));
+    if (rv.kin !== 6 || !rv.applyDis || !rv.park || !rv.dryKin) fail('fine review ' + JSON.stringify(rv));
+    await shot('8_review_torque', `kinematics rows ${rv.kin}, apply disabled while torqued ${rv.applyDis}`);
+    await page.click('#cwiz-park');
+    await waitW(page, () => !CWZ.busy && !S.obs.is_torqued, 10000, 'fine park');
+    // first apply: armd answers KINEMATICS_ARMED (simulated), the second goes through
+    await page.click('#cwiz-apply'); await page.click('#cwiz-apply');
+    await waitW(page, () => !CWZ.busy && /KINEMATICS_ARMED/.test(CWZ.status), 10000, 'fine armed refusal');
+    await page.click('#cwiz-apply'); await page.click('#cwiz-apply');
+    await waitW(page, () => CWZ.step === 'applied' && !CWZ.busy, 10000, 'fine apply');
+    const body = await page.evaluate(() => { const b = __SIM.calls.filter(([p, x]) => p === '/api/v1/calibration/apply' && x.dry_run === false).map(([, x]) => x); const k = b[b.length - 1].kinematics; return { n: b.length, keys: Object.keys(b[b.length - 1]).sort().join(','), joints: k.joints.length, fit: Object.keys(k.fit).sort().join(','), j1: JSON.stringify(k.joints[0]) }; });
+    if (body.n !== 2 || body.joints !== 6 || !/heldout_mm/.test(body.fit) || !/kinematics/.test(body.keys) || !/"offset_rad":0,"scale":0/.test(body.j1)) fail('fine apply body ' + JSON.stringify(body));
+    await shot('9_applied', `apply body keys ${body.keys}; kinematics.fit ${body.fit}`);
+    if (errs.length) fail(`fine page errors (${lang}/${vpName}): ${[...new Set(errs)].join(' | ').slice(0, 300)}`);
     await ctx.close();
   }
 }

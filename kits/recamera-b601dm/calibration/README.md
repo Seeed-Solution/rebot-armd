@@ -133,6 +133,21 @@ to the page top (board -y). Marker corners in rebot-vision's
 order: bottom-left, bottom-right, top-right, top-left of the printed marker (marker frame x right,
 y down).
 
+Fine calibration mode (camera + arm geometry): the wizard captures two board placements (about 35
+poses each, joint-space moves approached from the same side; about 5 minutes per placement on the
+real arm with these motion rules) and, besides the values above, solves a correction of the arm's
+geometry for J2..J5 (zero offset, angle scale, joint-axis tilt, joint-origin shift; J1 and J6
+zero). Between the two captures the user moves the board to another spot (at least 10 cm away)
+and captures a new start view. The correction is applied only when the held-out error (fit on one
+placement, predict the other) is ≤ 3 mm both ways, the mean held-out error is ≥ 30 % below the
+uncorrected model, and every parameter is inside armd's bounds (|offset| ≤ 10°, |scale| ≤ 0.08,
+|tilt| ≤ 3°, |origin| ≤ 30 mm). The same apply then also writes `kinematics` (per joint
+`offset_rad`, `scale`, `tilt_rad`, `origin_m`, plus the fit's held-out numbers) into
+`calibration.json`; armd requires torque off for it. A J5 zero offset above 5° is reported with a
+hint to re-zero that motor (J2..J4 offsets are not separately identifiable and get no hint) (reBotArm_control_py `example/2_zero_and_read.py` / MotorBridge). On data
+recorded on this kit's arm (2026-11-18) the held-out error went from 2.76 / 3.64 mm to
+2.01 / 2.24 mm.
+
 驾驶舱标定向导用实测值替换上面的占位值：机械臂在桌面上打印的 ArUco GridBoard 上方移动，在浏览器中求解内参、手眼安装与桌面高度，再通过 armd 写入（WS `/api/v1/calibration/apply`，接口见 [docs/agent_action_api.md](../../../docs/agent_action_api.md#camera-calibration-wizard--相机标定向导)）。一次写入包括：rebot-vision 的 `/userdata/rebot-teleop/vision.json`（经 `PUT /api/calibration/intrinsics`，640 x 360 下的 `fx`、`fy`、`cx`、`cy`、`k1`、`k2`、`p1`、`p2`、`k3`、`marker_size`）；`/userdata/rebot-teleop/calibration.json`（`ARMD_CALIBRATION`：含 `q_end_cam`（R_end_cam，[w, x, y, z]）与 `offset_m` 的 `camera_mount`、内参副本、`table_z_m`、`solved_at`、`rms`）；`/userdata/rebot-teleop/grasp_setup.json`（`ARMD_GRASP_SETUP`：`fx_px`、`fy_px`、`cx_px`、`cy_px`、`image_size_px` [640, 360]、`table_z_m`、由 `q_end_cam` 推导的 `camera_tilt_deg`、armd 计算的 `grip_pixel_norm`；夹爪下方的点在画面外时（如 v8）保持不变）。
 
 每次写入前先在 `/userdata/rebot-teleop/calibration-backups/<UTC 时间>/` 保存备份；WS `/api/v1/calibration/restore {"backup": "<名称>"}` 恢复备份，`GET /api/v1/calibration` 列出备份。`calibration.json` 含 `q_end_cam` 期间，抓取设置中的 `camera_tilt_deg`、`fx_px`、`fy_px`、`cx_px`、`cy_px`、`image_size_px` 不能修改（恢复备份或重新标定）；相机旋转不再使用 `camera_mounts.json` 与 profile 的 `flip` / `rot_deg` / `tilt_deg`。镜头畸变用于 rebot-vision 的标记位姿，不用于抓取几何。
@@ -140,3 +155,5 @@ y down).
 启动时 `calibration.json` 无法解析或校验不通过：armd 将其改名为 `calibration.json.bad-<UTC 时间>`，使用 profile 的相机安装，并把抓取设置的相机模型（`fx_px`、`fy_px`、`cx_px`、`cy_px`、`image_size_px`、`camera_tilt_deg`、`grip_pixel_norm`）重置为 profile 值（运行时及 `grasp_setup.json`；原文件保留为 `grasp_setup.json.pre-reset-<UTC 时间>`；`table_z_m` 不变）。之后抓取使用未标定的模型。`GET /api/v1/calibration` 的 `load_error` 给出原因，直到一次 apply 或 restore 成功；恢复最近的备份或重新运行向导。
 
 标定板（向导生成打印页；仿真器 `--aruco-board` 使用相同布局）：4 列 x 3 行（横向，与 16:9 画面一致）aruco4x4_50 标记，id 0..11 按阅读顺序（id = 行 * 4 + 列，第 0 行在页面顶部，第 0 列在左侧），默认标记边长 25 mm，间隔 5 mm（0.2 倍边长），整板约 115 x 85 mm。标定板坐标系：原点在板中心，x 沿页面向右，y 沿页面向下，z 指向桌面内；打印的 "up" 箭头指向页面顶部（板 -y）。标记角点顺序同 rebot-vision：打印标记的左下、右下、右上、左上（标记坐标系 x 向右、y 向下）。
+
+精校模式（相机 + 机械臂几何）：向导采集两个标定板位置（各约 35 个位姿，关节空间移动、从同一方向接近；按这套运动规则在真机上每个位置约 5 分钟），除上述数值外还求解 J2..J5 的几何修正（零位、角度比例、关节轴倾斜、关节原点偏移；J1、J6 为 0）。两次采集之间用户把标定板移到另一个位置（距原位置至少 10 cm）并采集新的起始视图。只有满足以下条件才写入修正：两个方向的留出误差（在一个位置拟合、预测另一个位置）都 ≤ 3 mm，留出误差平均值比未修正模型低 ≥ 30 %，所有参数在 armd 的范围内（|零位| ≤ 10°、|比例| ≤ 0.08、|倾斜| ≤ 3°、|原点| ≤ 30 mm）。同一次写入还把 `kinematics`（每个关节的 `offset_rad`、`scale`、`tilt_rad`、`origin_m`，以及拟合的留出误差）写进 `calibration.json`；armd 要求此时电机断电。J5 零位偏差超过 5° 时给出提示，建议重新校准该电机零位（J2..J4 的零位不能单独确定，不提示）（reBotArm_control_py `example/2_zero_and_read.py` / MotorBridge）。在本套件机械臂上录制的数据（2026-11-18）中，留出误差从 2.76 / 3.64 mm 降到 2.01 / 2.24 mm。
