@@ -907,7 +907,10 @@ export async function runPoses(st, io, { runAll = true } = {}) {
    uncorrected model (L0: X and boards only) by >= 30 %, and every parameter of the final fit on A + B must be inside
    the bounds armd accepts. The final fit is what is applied. Ported from real2/kincal2.mjs. */
 export const KIN_BOUNDS = Object.freeze({ offset_rad: 10 / D, scale: 0.08, tilt_rad: 3 / D, origin_m: 0.03 });
-export const KIN_GATES = Object.freeze({ heldOutMm: 3.0, improvement: 0.30, zeroWarnDeg: 5, minViewsPerPlacement: 10, pnpMaxPx: 2 });
+// zeroWarnJoints: joints (1..6) whose zero offset is identifiable, the only ones a "re-zero the motor" warning is
+// given for. J5: recovered within 0.01 deg in the synthetic test. J2..J4 (parallel axes) are not: their offsets trade
+// against the next joint's origin shift (synthetic J2 error -0.52 deg with the prior, above the 0.5 deg needed).
+export const KIN_GATES = Object.freeze({ heldOutMm: 3.0, improvement: 0.30, zeroWarnDeg: 5, zeroWarnJoints: Object.freeze([5]), minViewsPerPlacement: 10, pnpMaxPx: 2 });
 export const KIN_PARAM_NAMES = Object.freeze(['offset', 'scale', 'tilt_x', 'tilt_y', 'dx', 'dy', 'dz']);
 /* Weak L2 prior on the kinematic parameters (extra residual rows, px): weight * k / sigma, sigma per parameter type
    (offset, scale, tilt x / y, origin dx / dy / dz). L3 is not minimal: zero offsets of the parallel joints J2..J4
@@ -1138,7 +1141,7 @@ export function solveKinematics({ views, board, K, chain, X0, order = null, kIdx
     gate('kin_improve', impAll >= gates.improvement, impAll, gates.improvement, 'frac'),
     gate('kin_bounds', oob.length === 0, oob.length, 0, 'count'),
   );
-  for (let j = 0; j < 6; j++) if (Math.abs(k[7 * j]) * D > gates.zeroWarnDeg) res.warnings.push({ key: 'zero', joint: j + 1, deg: k[7 * j] * D });
+  for (let j = 0; j < 6; j++) if ((gates.zeroWarnJoints || [5]).includes(j + 1) && Math.abs(k[7 * j]) * D > gates.zeroWarnDeg) res.warnings.push({ key: 'zero', joint: j + 1, deg: k[7 * j] * D });
   Object.assign(res, {
     ok: res.gates.every((g) => g.ok), k, joints: kinJoints(k), outOfBounds: oob, X: fin.l3.X, boards: fin.l3.B,
     heldOut: { ab, ba, ab0, ba0, improve: { ab: imp(ab0.mm, ab.mm), ba: imp(ba0.mm, ba.mm), mean: impAll } }, train: fin.l3.err, final0: { X: fin.l0.X, boards: fin.l0.B, err: fin.l0.err },

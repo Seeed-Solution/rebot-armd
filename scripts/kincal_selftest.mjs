@@ -113,7 +113,7 @@ function poseAgreement(views, r, kTrue) {
   // axes J2..J4), so the parameters are compared through the poses they produce. J5's offset and the J3 tilt
   // have no such partner and are compared directly.
   check('a. J5 zero offset and the J3 tilt recovered (non-redundant parameters)', Math.abs(offErr[3]) < 0.1 && Math.abs((kin.k[7 * 2 + 2] - kInj[7 * 2 + 2]) * D) < 0.1,
-    `J2 offset error ${offErr[0].toFixed(3)} deg, J5 offset error ${offErr[3].toFixed(3)} deg, J3 tilt_x error ${((kin.k[16] - kInj[16]) * D).toFixed(3)} deg; J2..J4 offset errors ${offErr.slice(0, 3).map((e) => e.toFixed(2)).join(', ')} deg (absorbed by origin shifts)`);
+    `J2 offset error ${offErr[0].toFixed(3)} deg (warning kept for J2 only if < 0.5), J5 offset error ${offErr[3].toFixed(3)} deg, J3 tilt_x error ${((kin.k[16] - kInj[16]) * D).toFixed(3)} deg; J2..J4 offset errors ${offErr.slice(0, 3).map((e) => e.toFixed(2)).join(', ')} deg (absorbed by origin shifts)`);
   // generalisation: joint sets not in the capture (planned poses +-0.15 rad on J2..J5)
   const extra = [];
   for (const v of views) if (rnd() < 0.5) extra.push({ ...v, q: v.q.map((x, i) => (i >= 1 && i <= 4 ? x + 0.3 * (rnd() - 0.5) : x)) });
@@ -126,6 +126,9 @@ function poseAgreement(views, r, kTrue) {
     const k = kInj.slice(); k[7 * 4] = -6 / D;
     const r6 = solveKinematics({ views: render(k), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
     check('a. J5 zero offset > 5 deg warns (J5 -6 deg injected)', r6.ok && r6.warnings.length === 1 && r6.warnings[0].joint === 5, `warnings ${r6.warnings.map((w) => `J${w.joint} ${w.deg.toFixed(2)}°`).join(',')}, gates ${r6.ok ? 'pass' : 'refuse'}`);
+    const k2 = kInj.slice(); k2[7 * 1] = -6 / D;
+    const r2 = solveKinematics({ views: render(k2), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
+    check('a. J2 zero offset (not identifiable) gives no warning (J2 -6 deg injected)', r2.warnings.length === 0, `J2 offset found ${(r2.k[7] * D).toFixed(2)} deg, warnings ${r2.warnings.length}; warning joints ${CW.KIN_GATES.zeroWarnJoints.join(',')}`);
   }
 }
 {
