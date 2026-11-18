@@ -331,7 +331,9 @@ fn calibration_busy_code(inner: &SupervisorInner, path: &str) -> Option<&'static
 fn calibration_job(inner: &mut SupervisorInner, path: &str, body: &Value) -> Result<(CalibJob, bool), crate::calibration::CalibError> {
     crate::calibration::begin_checks(inner)?;
     let job = if path == "/api/v1/calibration/apply" {
-        CalibJob::Apply(Box::new(crate::calibration::parse_apply(body)?))
+        let req = crate::calibration::parse_apply(body)?;
+        if !req.dry_run && req.kinematics.is_some() { crate::calibration::kinematics_armed(inner)?; }
+        CalibJob::Apply(Box::new(req))
     } else {
         if !body.is_object() { return Err(crate::calibration::CalibError::new(400, "INVALID_COMMAND", "Command body must be an object")); }
         CalibJob::Restore(body.clone())

@@ -2596,6 +2596,20 @@ impl SupervisorInner {
         if let Some(g) = self.config.grasp.as_mut() { g.camera_tilt_deg = tilt; }
     }
 
+    /// Install the kinematic correction of the built-in model (calibration apply / restore /
+    /// startup; None = uncorrected): the live swap of `config.arm_model`, which every FK / IK /
+    /// workspace / keep-out / grasp path reads under this lock. Bumps the workspace revision when
+    /// it changes (plans made with the old model fail PLAN_STALE) and recomputes the stored
+    /// poses' TCPs. Err (nothing changed): a URDF chain profile or values outside the bounds.
+    pub fn set_kinematics_correction(&mut self, corr: Option<&crate::kinematics::Correction>) -> Result<(), String> {
+        let model = self.config.arm_model.with_correction(corr)?;
+        if model.correction() == self.config.arm_model.correction() { return Ok(()); }
+        self.config.arm_model = model;
+        self.workspace_revision += 1;
+        self.refresh_pose_tcps();
+        Ok(())
+    }
+
     /// Replace the runtime setup; `camera_tilt_deg` also sets `camera_mount.tilt_deg`.
     pub fn set_grasp_setup(&mut self, setup: crate::grasp::GraspSetup) {
         if self.config.camera_mount.tilt_deg != setup.camera_tilt_deg as f32 { self.workspace_revision += 1; }

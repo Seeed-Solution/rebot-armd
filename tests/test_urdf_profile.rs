@@ -40,8 +40,11 @@ fn dm_urdf_profile_matches_builtin_profile() {
     assert_eq!((urdf.arm_dof(), urdf.gripper_index()), (6, Some(6)));
     assert_eq!((builtin.arm_dof(), builtin.gripper_index()), (6, Some(6)));
     assert!(urdf.six_plus_gripper());
-    // Same capabilities apart from the model names.
-    assert_eq!(armd::model::Capabilities::from_config(&urdf), armd::model::Capabilities::from_config(&builtin));
+    // Same capabilities apart from the model names; the kinematic correction is for the
+    // built-in model only.
+    let (cu, cb) = (armd::model::Capabilities::from_config(&urdf), armd::model::Capabilities::from_config(&builtin));
+    assert!(!cu.calibration_kinematics && cb.calibration_kinematics);
+    assert_eq!(armd::model::Capabilities { calibration_kinematics: true, ..cu }, cb);
     // Same workspace check results over a sweep (reach origin differs by 1.6e-7 m).
     let ws = builtin.workspace.clone().unwrap();
     let mut x = 0.123f64;

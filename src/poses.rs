@@ -166,6 +166,13 @@ impl SupervisorInner {
         Some(PoseTcp { position: pose.p, rpy: crate::kinematics::r_to_rpy(&pose.r) })
     }
 
+    /// Recompute the TCP of every stored pose that has one (in memory) after the arm model
+    /// changed (kinematic correction).
+    pub(crate) fn refresh_pose_tcps(&mut self) {
+        let tcps: Vec<_> = self.poses.list.poses.iter().map(|p| p.tcp.as_ref().and(self.pose_tcp(&p.positions))).collect();
+        for (p, tcp) in self.poses.list.poses.iter_mut().zip(tcps) { if tcp.is_some() { p.tcp = tcp; } }
+    }
+
     fn poses_write(&self) -> Option<PendingWrite> {
         self.poses.path.clone().map(|path| PendingWrite::new(path, serde_json::to_string_pretty(&self.poses.list).unwrap_or_default()))
     }

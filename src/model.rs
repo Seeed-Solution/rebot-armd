@@ -1777,6 +1777,10 @@ pub struct Capabilities {
     /// and `/api/v1/calibration/restore`, `camera_mount.q_end_cam`; same value as `grasp`.
     #[serde(default)]
     pub calibration_apply: bool,
+    /// `/api/v1/calibration/apply` accepts `kinematics` (the built-in model with a grasp
+    /// setup; URDF chains: false), `schema.kinematics_correction`.
+    #[serde(default)]
+    pub calibration_kinematics: bool,
     pub vision: VisionCapabilities,
 }
 
@@ -1822,6 +1826,7 @@ impl Capabilities {
             power_budget: config.power_budget.as_ref().is_some_and(|p| p.enabled),
             auto_yaw: false,
             calibration_apply: grasp,
+            calibration_kinematics: grasp && config.arm_model.chain().is_none(),
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }
@@ -1877,6 +1882,10 @@ pub struct ObservationSchema {
     /// Empty in older schemas (those assumed model = motor for J1..J6).
     #[serde(default)]
     pub model_joint_map: Vec<crate::chain::JointMap>,
+    /// Kinematic correction of the built-in chain in effect (calibration.json `kinematics.joints`,
+    /// J1..J6, applied after `model_joint_map`); null = the URDF chain. Absent in older schemas.
+    #[serde(default)]
+    pub kinematics_correction: Option<crate::kinematics::Correction>,
     /// Supply power budget in force; null when the profile has none (and in older schemas).
     #[serde(default)]
     pub power_budget: Option<crate::power::PowerBudget>,
@@ -1980,6 +1989,7 @@ impl ObservationSchema {
             resting_pose: config.resting_pose.clone(),
             torque_guard: crate::torque_guard::TorqueGuardInfo::from_config(config),
             model_joint_map: config.arm_model.joint_map(),
+            kinematics_correction: config.arm_model.correction().copied(),
             power_budget: config.power_budget.clone().filter(|p| p.enabled),
             #[cfg(not(target_arch = "wasm32"))]
             feetech_joints: config.feetech.as_ref().map(|f| f.joints.clone()),
