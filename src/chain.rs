@@ -460,10 +460,12 @@ pub struct JointMap {
 
 /// The arm model the profile selects: the built-in B601-DM code with its motor -> model
 /// offsets (model angle = motor angle + offset, profile `model_offsets_rad`, default
-/// [`k::B601DM_MODEL_OFFSETS_RAD`]) or a URDF chain (sign / offset per joint in the chain spec).
+/// [`k::B601DM_MODEL_OFFSETS_RAD`]) and an optional kinematic correction (calibration.json
+/// `kinematics`, [`k::frames_corrected`]), or a URDF chain (sign / offset per joint in the
+/// chain spec; no correction).
 #[derive(Debug, Clone)]
 pub enum ArmModel {
-    RebotDevArm([f64; 6]),
+    RebotDevArm([f64; 6], Option<Arc<k::Correction>>),
     Chain(Arc<KinematicChain>),
 }
 
@@ -473,12 +475,35 @@ impl Default for ArmModel {
 
 impl ArmModel {
     /// The built-in model with the measured B601-DM offsets.
-    pub const REBOT_DEV_ARM: Self = Self::RebotDevArm(k::B601DM_MODEL_OFFSETS_RAD);
+    pub const REBOT_DEV_ARM: Self = Self::RebotDevArm(k::B601DM_MODEL_OFFSETS_RAD, None);
+
+    /// The built-in model with the motor -> model offsets `off`, uncorrected.
+    pub fn rebot_dev_arm(off: [f64; 6]) -> Self { Self::RebotDevArm(off, None) }
+
+    /// The kinematic correction in effect (built-in model only).
+    pub fn correction(&self) -> Option<&k::Correction> {
+        match self { Self::RebotDevArm(_, c) => c.as_deref(), Self::Chain(_) => None }
+    }
+
+    /// This model with the kinematic correction `corr` (None or all zero = uncorrected).
+    /// Err for a URDF chain (v1 corrects the built-in model only) and for values outside the
+    /// bounds ([`k::validate_correction`]).
+    pub fn with_correction(&self, corr: Option<&k::Correction>) -> Result<Self, String> {
+        let corr = corr.filter(|c| c.iter().any(|j| !j.is_zero()));
+        match self {
+            Self::RebotDevArm(off, _) => {
+                if let Some(c) = corr { k::validate_correction(c)?; }
+                Ok(Self::RebotDevArm(*off, corr.map(|c| Arc::new(*c))))
+            }
+            Self::Chain(_) if corr.is_none() => Ok(self.clone()),
+            Self::Chain(_) => Err("a kinematic correction needs the built-in RebotDevArm model; this profile uses a URDF chain".into()),
+        }
+    }
 
     /// armd -> model mapping of each arm joint.
     pub fn joint_map(&self) -> Vec<JointMap> {
         match self {
-            Self::RebotDevArm(off) => off.iter().map(|o| JointMap { sign: 1.0, offset_rad: *o }).collect(),
+            Self::RebotDevArm(off, _) => off.iter().map(|o| JointMap { sign: 1.0, offset_rad: *o }).collect(),
             Self::Chain(c) => c.sign.iter().zip(&c.offset).map(|(s, o)| JointMap { sign: *s, offset_rad: *o }).collect(),
         }
     }
@@ -488,17 +513,17 @@ impl ArmModel {
 
     /// Number of arm joints (armd joints `0..arm_dof`).
     pub fn arm_dof(&self) -> usize {
-        match self { Self::RebotDevArm(_) => 6, Self::Chain(c) => c.dof() }
+        match self { Self::RebotDevArm(..) => 6, Self::Chain(c) => c.dof() }
     }
 
     pub fn chain(&self) -> Option<&KinematicChain> {
-        match self { Self::RebotDevArm(_) => None, Self::Chain(c) => Some(c) }
+        match self { Self::RebotDevArm(..) => None, Self::Chain(c) => Some(c) }
     }
 
     /// Tip pose for armd angles `q` (at least `arm_dof` entries).
     pub fn fk(&self, q: &[f64]) -> Pose {
         match self {
-            Self::RebotDevArm(off) => k::fk(&Self::builtin_q(off, q)),
+            Self::RebotDevArm(off, c) => k::fk_corrected(&Self::builtin_q(off, q), c.as_deref()),
             Self::Chain(c) => c.fk(q),
         }
     }
@@ -520,9 +545,9 @@ impl ArmModel {
     /// DLS IK with optional `yaw_free` for 5-DOF chains.
     pub fn solve_dls_ex(&self, goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], w: f64, yaw_free: bool) -> IkResult {
         match self {
-            Self::RebotDevArm(off) => {
+            Self::RebotDevArm(off, c) => {
                 let m = |q: &[f64; 6]| Self::builtin_q(off, q);
-                let r = k::solve_dls(goal, &m(q0), &m(lo), &m(hi), w);
+                let r = k::solve_dls_corrected(goal, &m(q0), &m(lo), &m(hi), w, PAR.iters, c.as_deref());
                 IkResult { q: std::array::from_fn(|i| r.q[i] - off[i]), ..r }
             }
             Self::Chain(c) if c.dof() == 6 => {
@@ -551,7 +576,8 @@ impl ArmModel {
         }
         let mut out = [0.0f32; MAX_CHAIN_JOINTS];
         match self {
-            Self::RebotDevArm(off) => {
+            // the correction is geometric (mm, < 1 deg); the gravity model stays the URDF's
+            Self::RebotDevArm(off, _) => {
                 // offsets are f64; the model angle in f32 loses < 1e-7 rad
                 let tau = crate::gravity::compute_gravity_torques(&std::array::from_fn(|i| (f64::from(q[i]) + off[i]) as f32))?;
                 out[..6].copy_from_slice(&tau);
@@ -572,7 +598,7 @@ impl ArmModel {
     pub fn joint_reach(&self, max_offset: f64) -> [f64; MAX_CHAIN_JOINTS] {
         let n = self.arm_dof();
         let (origins, end): (Vec<Vec3>, Vec3) = match self {
-            Self::RebotDevArm(off) => { let f = k::frames(off); (f.origins.to_vec(), f.end.p) }
+            Self::RebotDevArm(off, c) => { let f = k::frames_corrected(off, c.as_deref()); (f.origins.to_vec(), f.end.p) }
             Self::Chain(c) => { let f = c.frames(&[0.0; MAX_CHAIN_JOINTS]); (f.origins[..n].to_vec(), f.end.p) }
         };
         let mut reach = [0.0; MAX_CHAIN_JOINTS];
@@ -585,15 +611,18 @@ impl ArmModel {
     }
 
     pub fn shoulder_rz(&self) -> [f64; 2] {
-        match self { Self::RebotDevArm(_) => k::SHOULDER_RZ, Self::Chain(c) => c.shoulder_rz() }
+        // the reach origin is a policy constant; the correction does not move it
+        match self { Self::RebotDevArm(..) => k::SHOULDER_RZ, Self::Chain(c) => c.shoulder_rz() }
     }
 
     /// Camera mount R_tip_cam (`kinematics::cam_mount`): the wrist axis (second-to-last joint)
     /// seen in the tip frame with the last joint at armd angle pi/2 (the B601-DM rest angle of
     /// J6), the other joints at armd 0. For a canonical end frame, computes R_end_cam directly.
+    /// The nominal (uncorrected) chain defines this mount: the kinematic correction does not
+    /// change the legacy mount or the tilt derived from `q_end_cam`.
     pub fn cam_mount(&self, flip: bool, rot_deg: f64, tilt_deg: f64) -> Mat3 {
         match self {
-            Self::RebotDevArm(off) => k::cam_mount_with(off, flip, rot_deg, tilt_deg),
+            Self::RebotDevArm(off, _) => k::cam_mount_with(off, flip, rot_deg, tilt_deg),
             Self::Chain(c) if c.canonical_end_frame => {
                 let end_r = k::IDENTITY;
                 let wrist_axis = [0.0, 0.0, -1.0];

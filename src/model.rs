@@ -1020,7 +1020,7 @@ impl ArmConfig {
             if self.urdf.is_some() || self.chain.is_some() {
                 return Err("urdf / chain are set but neither kinematics nor gravity_model is \"Urdf\"".into());
             }
-            self.arm_model = crate::chain::ArmModel::RebotDevArm(self.builtin_model_offsets()?);
+            self.arm_model = crate::chain::ArmModel::rebot_dev_arm(self.builtin_model_offsets()?);
             return Ok(());
         }
         let (Some(rel), Some(spec)) = (&self.urdf, &self.chain) else {
@@ -1057,7 +1057,7 @@ impl ArmConfig {
             if self.urdf.is_some() || self.chain.is_some() {
                 return Err("urdf / chain are set but neither kinematics nor gravity_model is \"Urdf\"".into());
             }
-            self.arm_model = crate::chain::ArmModel::RebotDevArm(self.builtin_model_offsets()?);
+            self.arm_model = crate::chain::ArmModel::rebot_dev_arm(self.builtin_model_offsets()?);
             return Ok(());
         }
         let text = urdf_xml.ok_or("URDF XML is required for this profile")?;
@@ -1160,8 +1160,10 @@ impl ArmConfig {
                 return Err("model_offsets_rad is for the built-in model; a URDF chain sets chain.joints[].offset_rad".into());
             }
         } else {
-            // the built-in model needs no file; keep it in step with the profile offsets
-            self.arm_model = crate::chain::ArmModel::RebotDevArm(self.builtin_model_offsets()?);
+            // the built-in model needs no file; keep it in step with the profile offsets (and
+            // keep a kinematic correction installed by the calibration)
+            let corr = self.arm_model.correction().copied();
+            self.arm_model = crate::chain::ArmModel::rebot_dev_arm(self.builtin_model_offsets()?).with_correction(corr.as_ref())?;
         }
         if self.uses_urdf() != self.arm_model.chain().is_some() {
             return Err("kinematics / gravity_model \"Urdf\" needs a loaded URDF chain (ArmConfig::load_arm_model)".into());

@@ -236,8 +236,72 @@ pub fn angle_between(a: &Mat3, b: &Mat3) -> f64 { norm(&log_v(&mul_t(b, a))) }
 
 // ---- chain ----
 
+/// Kinematic fine calibration of one joint of the built-in chain (calibration.json
+/// `kinematics.joints[i]`, design "Correction model"). Walking the chain, joint `i` becomes
+/// `F_i · [Rx(tilt_rad[0]) · Ry(tilt_rad[1]), origin_m] · Rot(axis_i, q_i · (1 + scale) + offset_rad)`
+/// where `F_i` is the URDF origin of the joint. All zero = the URDF chain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JointCorrection {
+    /// Added to the joint angle (rad).
+    #[serde(default)]
+    pub offset_rad: f64,
+    /// Angle scale minus one (dimensionless): the joint turns by q · (1 + scale).
+    #[serde(default)]
+    pub scale: f64,
+    /// Tilt of the joint origin frame about its x, then its y axis (rad).
+    #[serde(default)]
+    pub tilt_rad: [f64; 2],
+    /// Translation of the joint origin frame, in the frame after `F_i` (m).
+    #[serde(default)]
+    pub origin_m: [f64; 3],
+}
+
+impl JointCorrection {
+    fn moves_origin(&self) -> bool { self.tilt_rad.iter().chain(&self.origin_m).any(|v| *v != 0.0) }
+    fn moves_angle(&self) -> bool { self.offset_rad != 0.0 || self.scale != 0.0 }
+    pub fn is_zero(&self) -> bool { !self.moves_origin() && !self.moves_angle() }
+}
+
+/// Correction of J1..J6 of the built-in chain.
+pub type Correction = [JointCorrection; 6];
+
+/// Bounds of a [`JointCorrection`] (armd refuses values outside).
+pub const CORRECTION_MAX_OFFSET_DEG: f64 = 10.0;
+pub const CORRECTION_MAX_SCALE: f64 = 0.08;
+pub const CORRECTION_MAX_TILT_DEG: f64 = 3.0;
+pub const CORRECTION_MAX_ORIGIN_M: f64 = 0.03;
+
+/// Every value finite and inside the bounds; the message names the joint and field.
+pub fn validate_correction(c: &Correction) -> Result<(), String> {
+    // a value written as exactly the bound passes despite the degree -> radian rounding
+    let within = |v: f64, max: f64| v.is_finite() && v.abs() <= max * (1.0 + 1e-12);
+    for (i, j) in c.iter().enumerate() {
+        let n = i + 1;
+        if !within(j.offset_rad, CORRECTION_MAX_OFFSET_DEG.to_radians()) {
+            return Err(format!("kinematics.joints[{i}] (J{n}) offset_rad must be within {CORRECTION_MAX_OFFSET_DEG} deg"));
+        }
+        if !within(j.scale, CORRECTION_MAX_SCALE) {
+            return Err(format!("kinematics.joints[{i}] (J{n}) scale must be within {CORRECTION_MAX_SCALE}"));
+        }
+        if !j.tilt_rad.iter().all(|v| within(*v, CORRECTION_MAX_TILT_DEG.to_radians())) {
+            return Err(format!("kinematics.joints[{i}] (J{n}) tilt_rad must be within {CORRECTION_MAX_TILT_DEG} deg per axis"));
+        }
+        if !j.origin_m.iter().all(|v| within(*v, CORRECTION_MAX_ORIGIN_M)) {
+            return Err(format!("kinematics.joints[{i}] (J{n}) origin_m must be within {CORRECTION_MAX_ORIGIN_M} m per component"));
+        }
+    }
+    Ok(())
+}
+
 /// End pose and world joint axes / origins for q (model J1..J6), `VIK.frames`.
-pub fn frames(q: &[f64; 6]) -> Frames {
+pub fn frames(q: &[f64; 6]) -> Frames { frames_corrected(q, None) }
+
+/// [`frames`] of the chain with the kinematic correction `corr` (design "Correction model",
+/// kincal2.mjs `fkP`). `axes[j]` is d(pose)/d(q_j): the world axis times the URDF axis sign
+/// and `1 + scale`, so the DLS Jacobian stays exact. Joints with an all-zero correction (and
+/// `corr` None) take the same arithmetic as the URDF chain, bit for bit.
+pub fn frames_corrected(q: &[f64; 6], corr: Option<&Correction>) -> Frames {
     let mut r = IDENTITY;
     let mut p = [0.0; 3];
     let mut axes = [[0.0; 3]; 6];
@@ -247,9 +311,20 @@ pub fn frames(q: &[f64; 6]) -> Frames {
         let d = mat3_vec3_mul(&r, link_p);
         p = add(&p, &d);
         r = mat3_mul(&r, link_r);
-        axes[j] = [r[0][2] * s, r[1][2] * s, r[2][2] * s];
+        let mut th = s * q[j];
+        let mut gain = s;
+        if let Some(c) = corr.map(|c| &c[j]) {
+            if c.moves_origin() {
+                p = add(&p, &mat3_vec3_mul(&r, &c.origin_m));
+                r = mat3_mul(&r, &mat3_mul(&axis_r(&[1.0, 0.0, 0.0], c.tilt_rad[0]), &axis_r(&[0.0, 1.0, 0.0], c.tilt_rad[1])));
+            }
+            if c.moves_angle() {
+                th = s * (q[j] * (1.0 + c.scale) + c.offset_rad);
+                gain = s * (1.0 + c.scale);
+            }
+        }
+        axes[j] = [r[0][2] * gain, r[1][2] * gain, r[2][2] * gain];
         origins[j] = p;
-        let th = s * q[j];
         let (c, sn) = (th.cos(), th.sin());
         r = [
             [r[0][0] * c + r[0][1] * sn, -r[0][0] * sn + r[0][1] * c, r[0][2]],
@@ -264,6 +339,9 @@ pub fn frames(q: &[f64; 6]) -> Frames {
 }
 
 pub fn fk(q: &[f64; 6]) -> Pose { frames(q).end }
+
+/// [`fk`] with the kinematic correction `corr`.
+pub fn fk_corrected(q: &[f64; 6], corr: Option<&Correction>) -> Pose { frames_corrected(q, corr).end }
 
 /// f32 joint vector (at least 6 entries) -> model angles.
 pub fn q6(q: &[f32]) -> [f64; 6] {
@@ -321,6 +399,17 @@ pub fn solve_dls(goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], w: f6
 }
 
 pub fn solve_dls_with(goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], w: f64, iters: usize) -> IkResult {
+    solve_dls_corrected(goal, q0, lo, hi, w, iters, None)
+}
+
+/// [`solve_dls_with`] on the chain with the kinematic correction `corr`.
+pub fn solve_dls_corrected(goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], w: f64, iters: usize, corr: Option<&Correction>) -> IkResult {
+    solve_dls_par(goal, q0, lo, hi, w, &IkParams { iters, ..PAR }, corr)
+}
+
+/// The DLS solve with explicit parameters `par` (armd uses [`PAR`]; `par.w` is ignored, `w` wins).
+pub fn solve_dls_par(goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], w: f64, par: &IkParams, corr: Option<&Correction>) -> IkResult {
+    let iters = par.iters;
     let mut lo_w = [0.0; 6];
     let mut hi_w = [0.0; 6];
     for i in 0..6 {
@@ -329,14 +418,14 @@ pub fn solve_dls_with(goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], 
     }
     let (rg, pg) = (&goal.r, &goal.p);
     let mut q = *q0;
-    let mut f = frames(&q);
+    let mut f = frames_corrected(&q, corr);
     let mut e = pose_err(&f, rg, pg, w);
-    let mut lam = PAR.lam_min;
+    let mut lam = par.lam_min;
     let mut it = 0;
     if !(e.ep < f64::INFINITY && e.er < f64::INFINITY) {
         return IkResult { ok: false, q: *q0, ep: f64::INFINITY, er: f64::INFINITY, iterations: it };
     }
-    while it < iters && !(e.ep <= PAR.tol_pos / 10.0 && e.er <= PAR.tol_rot / 10.0) {
+    while it < iters && !(e.ep <= par.tol_pos / 10.0 && e.er <= par.tol_rot / 10.0) {
         it += 1;
         // geometric Jacobian, angular rows scaled by w (column per joint)
         let mut jac = [[0.0f64; 6]; 6];
@@ -363,20 +452,20 @@ pub fn solve_dls_with(goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], 
             dq[j] = s;
         }
         let big = dq.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-        let k = if big > PAR.max_step { PAR.max_step / big } else { 1.0 };
+        let k = if big > par.max_step { par.max_step / big } else { 1.0 };
         let mut qn = [0.0; 6];
         for i in 0..6 { qn[i] = hi_w[i].min(lo_w[i].max(q[i] + k * dq[i])); }
-        let fn_ = frames(&qn);
+        let fn_ = frames_corrected(&qn, corr);
         let en = pose_err(&fn_, rg, pg, w);
         if en.ep + w * en.er < e.ep + w * e.er {
-            q = qn; f = fn_; e = en; lam = PAR.lam_min;
-        } else if lam < PAR.lam_max {
-            lam = PAR.lam_max; // adaptive damping: retry the step with heavier damping
+            q = qn; f = fn_; e = en; lam = par.lam_min;
+        } else if lam < par.lam_max {
+            lam = par.lam_max; // adaptive damping: retry the step with heavier damping
         } else {
             q = qn; f = fn_; e = en; // still worse with lam_max: take it (clamped) and continue
         }
     }
-    IkResult { ok: e.ep <= PAR.tol_pos && e.er <= PAR.tol_rot, q, ep: e.ep, er: e.er, iterations: it }
+    IkResult { ok: e.ep <= par.tol_pos && e.er <= par.tol_rot, q, ep: e.ep, er: e.er, iterations: it }
 }
 
 // ---- camera ----
