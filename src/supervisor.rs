@@ -508,7 +508,53 @@ impl SupervisorInner {
         if schema.feetech_joints.is_none() {
             schema.feetech_joints = self.config.feetech.as_ref().map(|f| f.joints.clone());
         }
+        schema.capabilities.calibration_tools = Some(self.calibration_tools_with(&schema.capabilities));
         schema
+    }
+
+    /// `capabilities.calibration_tools`: the profile's camera / kinematics / gripper support
+    /// and the driver's motor zero support.
+    pub fn calibration_tools(&self) -> crate::model::CalibrationTools {
+        self.calibration_tools_with(&crate::model::Capabilities::from_config(&self.config))
+    }
+
+    fn calibration_tools_with(&self, caps: &crate::model::Capabilities) -> crate::model::CalibrationTools {
+        use crate::model::{CalibrationToolInfo, GripperCalibrationTool, MotorZeroTool};
+        let no_grasp = "this profile has no grasp setup (the camera calibration needs one)";
+        let kin_reason = if self.config.arm_model.chain().is_some() {
+            "this profile uses a URDF chain; the kinematic correction applies to the built-in model only"
+        } else { no_grasp };
+        let support = self.motor_zero_support();
+        let motor_zero = MotorZeroTool {
+            joints: if support.supported { (1..=self.config.dof).collect() } else { Vec::new() },
+            requires: if support.supported { ["lease", "torque_off", "no_action", "no_fault"].map(String::from).to_vec() } else { Vec::new() },
+            max_offset_deg: crate::model::MOTOR_ZERO_MAX_OFFSET_DEG,
+            verify_mrad: crate::model::MOTOR_ZERO_VERIFY_MRAD,
+            invalidates: if support.supported { vec!["kinematics".into(), "camera".into()] } else { Vec::new() },
+            zero_pose: self.config.zero_pose.clone(),
+            support,
+        };
+        let policy = self.config.gripper_policy.as_ref().filter(|_| self.config.gripper_index().is_some());
+        let gripper = GripperCalibrationTool {
+            supported: policy.is_some(),
+            zero_check: policy.is_some_and(|p| p.zero_check_supported),
+            calibration: policy.is_some(),
+            reason: policy.is_none().then(|| "this profile has no gripper joint with a gripper policy".to_string()),
+        };
+        crate::model::CalibrationTools {
+            camera: CalibrationToolInfo::new(caps.calibration_apply, Vec::new(), no_grasp),
+            kinematics: CalibrationToolInfo::new(caps.calibration_kinematics, vec![2, 3, 4, 5], kin_reason),
+            motor_zero,
+            gripper,
+        }
+    }
+
+    /// The driver's motor zero support; the mock follower (no driver) has none yet.
+    pub fn motor_zero_support(&self) -> crate::model::MotorZeroSupport {
+        match self.driver.as_ref() {
+            Some(d) => d.lock().map_or_else(|_| crate::model::MotorZeroSupport::unsupported("driver unavailable"), |drv| drv.motor_zero_support()),
+            None => crate::model::MotorZeroSupport::unsupported("the mock follower has no motor zero"),
+        }
     }
 
     fn estop_pending(&self) -> bool {

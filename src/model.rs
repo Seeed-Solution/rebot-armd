@@ -877,6 +877,10 @@ pub struct ArmConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg(not(target_arch = "wasm32"))]
     pub feetech: Option<crate::protocol::feetech::FeetechConfig>,
+    /// Documentation of the zero pose (every motor at 0) for the motor zero tool; None = no
+    /// description (the 3D view still renders the pose).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_pose: Option<ZeroPoseDoc>,
     /// Arm model built from the fields above (not part of the profile JSON).
     #[serde(skip)]
     pub arm_model: crate::chain::ArmModel,
@@ -952,6 +956,7 @@ impl Default for ArmConfig {
             model_offsets_rad: None,
             gripper_joint: None,
             #[cfg(not(target_arch = "wasm32"))] feetech: None,
+            zero_pose: None,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -1447,6 +1452,7 @@ impl ArmConfig {
             model_offsets_rad: Some(crate::kinematics::B601DM_MODEL_OFFSETS_RAD.to_vec()),
             gripper_joint: None,
             #[cfg(not(target_arch = "wasm32"))] feetech: None,
+            zero_pose: Some(ZeroPoseDoc::rebot_b601()),
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -1669,7 +1675,7 @@ pub struct SchemaField {
 }
 
 /// Version of the capability summary in the observation schema (`capabilities`).
-pub const CAPABILITIES_VERSION: u32 = 9;
+pub const CAPABILITIES_VERSION: u32 = 10;
 
 /// Vision features armd offers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1781,7 +1787,152 @@ pub struct Capabilities {
     /// setup; URDF chains: false), `schema.kinematics_correction`.
     #[serde(default)]
     pub calibration_kinematics: bool,
+    /// Calibration tools of this arm (driver + profile): which ones it supports, their joints and
+    /// requirements. Filled in by the supervisor's schema (it depends on the driver); None in a
+    /// schema built from the profile alone. Present from capabilities version 10.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_tools: Option<CalibrationTools>,
     pub vision: VisionCapabilities,
+}
+
+/// `capabilities.calibration_tools` (also in `GET /api/v1/calibration`). A client renders only
+/// the tools with `supported: true`; an unsupported tool carries `reason`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CalibrationTools {
+    /// Camera calibration (intrinsics, hand-eye mount, table height): WS `/api/v1/calibration/apply`.
+    pub camera: CalibrationToolInfo,
+    /// Kinematic fine calibration (`kinematics` in the apply); `joints` = the joints the
+    /// wizard identifies (1-based).
+    pub kinematics: CalibrationToolInfo,
+    /// Motor zero: WS `/api/v1/calibration/motor_zero`.
+    pub motor_zero: MotorZeroTool,
+    /// Gripper zero check (`/api/v1/action/gripper_zero_check`) and opening table
+    /// (`/api/v1/gripper/calibration`).
+    pub gripper: GripperCalibrationTool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CalibrationToolInfo {
+    pub supported: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub joints: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl CalibrationToolInfo {
+    pub fn new(supported: bool, joints: Vec<usize>, reason: &str) -> Self {
+        Self { supported, joints: if supported { joints } else { Vec::new() }, reason: (!supported).then(|| reason.to_string()) }
+    }
+}
+
+/// What a driver can do for the motor zero tool ([`crate::driver::ArmDriver::motor_zero_support`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MotorZeroSupport {
+    pub supported: bool,
+    /// `set_current`: the current position of each joint becomes its zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Where the new zero is kept: `motor_flash` (in the motor), `simulator` (the simulated
+    /// encoder, until armd restarts), `process` (the mock follower).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persist: Option<String>,
+    /// The persistence above was checked on hardware (power cycle).
+    pub persist_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+impl MotorZeroSupport {
+    pub fn unsupported(reason: impl Into<String>) -> Self { Self { reason: Some(reason.into()), ..Default::default() } }
+
+    pub fn set_current(persist: &str, persist_verified: bool, notes: Vec<String>) -> Self {
+        Self { supported: true, method: Some("set_current".into()), persist: Some(persist.into()), persist_verified, reason: None, notes }
+    }
+}
+
+/// Largest |reading| (deg) a joint may have for a motor zero without `force`.
+pub const MOTOR_ZERO_MAX_OFFSET_DEG: u32 = 45;
+/// |reading| (mrad) every zeroed joint must reach within 1 s after the set-zero command.
+pub const MOTOR_ZERO_VERIFY_MRAD: u32 = 10;
+
+/// `calibration_tools.motor_zero`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MotorZeroTool {
+    #[serde(flatten)]
+    pub support: MotorZeroSupport,
+    /// Joints that can be zeroed (1-based).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub joints: Vec<usize>,
+    /// Conditions of a real run: `lease`, `torque_off`, `no_action`, `no_fault`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
+    /// [`MOTOR_ZERO_MAX_OFFSET_DEG`]: a joint farther from 0 needs `force`.
+    pub max_offset_deg: u32,
+    /// [`MOTOR_ZERO_VERIFY_MRAD`].
+    pub verify_mrad: u32,
+    /// Calibrations a motor zero invalidates: `kinematics` (removed), `camera` (marked stale).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub invalidates: Vec<String>,
+    /// The profile's description of the zero pose (all motors at 0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zero_pose: Option<ZeroPoseDoc>,
+}
+
+/// `calibration_tools.gripper`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GripperCalibrationTool {
+    pub supported: bool,
+    /// `/api/v1/action/gripper_zero_check` is available (gripper policy `zero_check_supported`).
+    pub zero_check: bool,
+    /// `/api/v1/gripper/calibration` (opening table, offset) is available.
+    pub calibration: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Profile field `zero_pose`: what the arm looks like with every motor at 0 (documentation for
+/// the motor zero tool; the 3D view renders the pose itself).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ZeroPoseDoc {
+    /// The whole pose in one sentence.
+    pub description: String,
+    /// One entry per joint (J1.. in order; may be shorter than `dof`).
+    pub joints: Vec<String>,
+    /// How to hold the gripper while its zero is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gripper: Option<String>,
+    /// Where the description comes from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl ZeroPoseDoc {
+    /// The B601-DM zero pose: the home pose (`home_positions`) with J6 at 0. Positions from the
+    /// built-in FK at model angles J1..J5 = 0, J6 = -90 deg (motor 0).
+    pub fn rebot_b601() -> Self {
+        Self {
+            description: "Folded like the home pose: upper arm level pointing back from the shoulder, forearm folded back over it, gripper level pointing straight forward (tool about 0.26 m in front of the base, 0.19 m high).".into(),
+            joints: vec![
+                "J1 base: arm plane facing forward (+x)".into(),
+                "J2 shoulder: upper arm level, pointing back".into(),
+                "J3 elbow: forearm folded back over the upper arm".into(),
+                "J4 wrist pitch: gripper level".into(),
+                "J5 wrist yaw: gripper pointing straight forward".into(),
+                "J6 wrist roll: motor 0, jaws open up/down (the home pose has J6 at +90 deg, jaws open sideways)".into(),
+            ],
+            gripper: Some("Gripper fully closed".into()),
+            source: Some("built-in FK of assets/reBot-DevArm_gripper.urdf; gripper: wiki.seeedstudio.com/rebot_arm_b601_dm_lerobot (zero position = gripper fully closed)".into()),
+        }
+    }
 }
 
 impl Capabilities {
@@ -1827,6 +1978,7 @@ impl Capabilities {
             auto_yaw: false,
             calibration_apply: grasp,
             calibration_kinematics: grasp && config.arm_model.chain().is_none(),
+            calibration_tools: None,
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }

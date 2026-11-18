@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::model::JointState;
-pub use crate::model::{DriverCapabilities, DriverRangeCheck, EnableState, JointRangeReading, RangeCheckStatus};
+pub use crate::model::{DriverCapabilities, DriverRangeCheck, EnableState, JointRangeReading, MotorZeroSupport, RangeCheckStatus};
 use crate::protocol::damiao::{self, DamiaoLimits};
 pub use crate::protocol::damiao::{build_pos_force_frame, DAMIAO_GRIPPER_POSFORCE_VEL_RAW};
 use crate::protocol::fashionstar::{self, FashionStarPacket};
@@ -197,6 +197,11 @@ pub trait ArmDriver: Send {
     /// Result of the startup check of the motors' mapping ranges against the
     /// configured ones; None when the driver has no such check or it has not run.
     fn range_check(&self) -> Option<DriverRangeCheck> { None }
+
+    /// What the motor zero tool can do with this driver (`calibration_tools.motor_zero`).
+    fn motor_zero_support(&self) -> MotorZeroSupport {
+        MotorZeroSupport::unsupported("this driver has no motor zero command")
+    }
 }
 
 /// Output mode of one joint on drivers that can switch at runtime.

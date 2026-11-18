@@ -837,6 +837,7 @@ pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
         "path": deps.path.display().to_string(), "backup_dir": deps.backup_dir.display().to_string(),
         "calibration": inner.calibration, "camera_mount": mount_summary(&inner.config.camera_mount),
         "kinematics_correction": inner.config.arm_model.correction(),
+        "calibration_tools": inner.calibration_tools(),
         "grasp": inner.grasp_setup().map(|s| grasp_fields(&s)), "backups": list_backups(deps)})
 }
 
