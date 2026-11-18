@@ -57,7 +57,7 @@ One apply writes:
 | Where | What |
 |---|---|
 | rebot-vision `/userdata/rebot-teleop/vision.json` (via `PUT /api/calibration/intrinsics`) | `fx`, `fy`, `cx`, `cy`, `k1`, `k2`, `p1`, `p2`, `k3`, `marker_size` at 640 x 360 |
-| `/userdata/rebot-teleop/calibration.json` (`ARMD_CALIBRATION`) | `camera_mount` with `q_end_cam` (R_end_cam, [w, x, y, z]) and `offset_m`, a copy of the intrinsics, `table_z_m`, `solved_at`, `rms` |
+| `/userdata/rebot-teleop/calibration.json` (`ARMD_CALIBRATION`) | `camera_mount` with `q_end_cam` (R_end_cam, [w, x, y, z]) and `offset_m`, a copy of the intrinsics, `table_z_m`, `solved_at`, `rms`; optional `kinematics` (see "Kinematic fine calibration" below) |
 | `/userdata/rebot-teleop/grasp_setup.json` (`ARMD_GRASP_SETUP`) | `fx_px`, `fy_px`, `cx_px`, `cy_px`, `image_size_px` [640, 360], `table_z_m`, `camera_tilt_deg` (derived from `q_end_cam`), `grip_pixel_norm` (computed by armd; left unchanged when the point under the jaws is outside the image, as with v8) |
 
 Each apply first stores a backup in `/userdata/rebot-teleop/calibration-backups/<UTC time>/`;
@@ -75,6 +75,54 @@ camera model (`fx_px`, `fy_px`, `cx_px`, `cy_px`, `image_size_px`, `camera_tilt_
 kept as `grasp_setup.json.pre-reset-<UTC time>`; `table_z_m` stays). Grasps then use the
 uncalibrated model. `GET /api/v1/calibration` reports the cause in `load_error` until an apply or
 a restore succeeds; restore the last backup or run the wizard again.
+
+### Kinematic fine calibration / 运动学精校
+
+The real arm's geometry differs from the URDF (measured on a B601-DM: J5 zero about −4°, J1 / J2
+axes at 87.5° instead of 90°, link offsets of a few mm). The wizard's fine-calibration mode fits a
+correction of the built-in chain from two board placements; `calibration.json` then holds:
+
+```json
+"kinematics": {
+  "joints": [
+    {"offset_rad": 0, "scale": 0, "tilt_rad": [0, 0], "origin_m": [0, 0, 0]},
+    ... 6 entries, J1..J6 ...
+  ],
+  "fit": {"heldout_mm": [a, b], "train_mm": x, "views": n, "solved_at": "..."}
+}
+```
+
+Per joint, walking the chain: the URDF joint origin, then the origin correction (tilt about x,
+then y, by `tilt_rad`; translation `origin_m`), then the joint rotation by
+`q * (1 + scale) + offset_rad` (q = model angle as in the schema's `model_joint_map`). J1 and J6
+are written as zeros. Limits (armd refuses values outside): |`offset_rad`| ≤ 10°, |`scale`| ≤ 0.08,
+|`tilt_rad`| ≤ 3° per axis, |`origin_m`| ≤ 0.03 m per component. Measured on the B601-DM (fit on
+one board placement, checked on the other): 4.4 / 5.9 mm uncorrected, 2.0 / 2.2 mm with the full
+correction.
+
+- Applying or removing it (`"kinematics": null`) needs torque off and no action running, else
+  `KINEMATICS_ARMED`; park the arm or turn torque off first. An apply without `kinematics` keeps
+  the stored correction.
+- armd uses it at once for FK, IK, workspace and keep-out checks, grasp and place, and publishes
+  it as `kinematics_correction` in `/api/v1/observation/schema` and `GET /api/v1/calibration`.
+  Gravity compensation and the power-budget dynamics stay on the URDF model.
+- To undo: WS `/api/v1/calibration/restore` with the backup taken before the apply (it also puts
+  the camera values of that time back), or an apply with `"kinematics": null`.
+- A correction outside the limits or malformed in `calibration.json` at startup: the whole file
+  is rejected as described above (`load_error`, uncorrected model, profile camera mount).
+- A zero offset above 5° on a joint usually means the motor zero is off: re-zero the motor with
+  the official tool (reBotArm_control_py `example/2_zero_and_read.py` / MotorBridge) and calibrate
+  again.
+
+真机几何与 URDF 存在差异（在一台 B601-DM 上实测：J5 零位约 −4°，J1 / J2 轴夹角 87.5° 而非 90°，连杆偏移数毫米）。向导的精校模式用两个标定板位置拟合内置运动链的修正，`calibration.json` 中保存为上面的 `kinematics` 结构（`joints` 为 J1..J6 共 6 项，`fit` 为拟合报告）。
+
+沿运动链对每个关节依次为：URDF 关节原点，原点修正（先绕 x、再绕 y 旋转 `tilt_rad`，平移 `origin_m`），关节转角 `q * (1 + scale) + offset_rad`（q 为模型角，同 schema 的 `model_joint_map`）。J1 与 J6 写 0。范围（超出时 armd 拒绝）：|`offset_rad`| ≤ 10°，|`scale`| ≤ 0.08，|`tilt_rad`| 每轴 ≤ 3°，|`origin_m`| 每分量 ≤ 0.03 m。在 B601-DM 上实测（用一个标定板位置拟合、在另一个位置检验）：未修正 4.4 / 5.9 mm，完整修正 2.0 / 2.2 mm。
+
+- 写入或删除修正（`"kinematics": null`）要求扭矩关闭且没有动作在执行，否则返回 `KINEMATICS_ARMED`；先收臂（park）或关闭扭矩。不带 `kinematics` 的 apply 保留已存的修正。
+- armd 立即将其用于 FK、IK、工作空间与禁入盒检查、抓取与放置，并在 `/api/v1/observation/schema` 与 `GET /api/v1/calibration` 中以 `kinematics_correction` 发布。重力补偿与功率预算动力学仍使用 URDF 模型。
+- 撤销：用 apply 之前的备份执行 WS `/api/v1/calibration/restore`（同时恢复当时的相机参数），或 apply `"kinematics": null`。
+- 启动时 `calibration.json` 中的修正超出范围或格式错误：按上文处理整个文件（`load_error`、未修正模型、profile 相机安装）。
+- 某个关节的零位偏移超过 5° 时，通常是电机零位有偏差：用官方工具（reBotArm_control_py `example/2_zero_and_read.py` / MotorBridge）重新标定电机零位后再做标定。
 
 Board (the wizard prints it; the simulator's `--aruco-board` uses the same layout): 4 columns x
 3 rows (landscape, as the 16:9 image) of aruco4x4_50 markers, ids 0..11 in reading order
