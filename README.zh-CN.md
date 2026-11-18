@@ -301,6 +301,17 @@ v1.4.0 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 
 耗时：按同样运动规则的真机采集（`real2/collect.mjs`，70 个位姿）用时约 600 s，每个位姿约 8.5 s，每个位置约 5 分钟。用录制的真机数据测得（B601-DM，2026-11-18，位置 A 134 个视图，位置 B 65 个；`node scripts/kincal_selftest.mjs`）：留出误差 A → B 2.76 → 2.01 mm，B → A 3.64 → 2.24 mm（未修正 → 修正后；模型角度已含 armd 关节映射中 J5 的 −4° 零位），检查项通过，在 spark 工作站的 Node 中求解 0.43 s（未在手机上测量）。向导流程本身只在仿真机械臂上运行过（`scripts/calib_wizard_shots.mjs`）。
 
+#### 标定工具
+
+**设置**（顶栏齿轮，两种模式都有）中有一组 **工具**，按 `capabilities.calibration_tools` 生成；只列出本机支持的工具，每项一句话说明用途，推荐顺序为 **零位标定 → 精校 → 夹爪标定**（不做精校时单独使用相机标定）：
+
+- **零位标定**（`/api/v1/calibration/motor_zero`；支持 B601-DM、sim 与 mock 跟随器，不支持 RobStride / 飞特 / FashionStar）：关闭使能，把机械臂扶到零位姿态（3D 视图用半透明模型显示零位姿态，与当前姿态对照），选择关节（偏离 0 超过 45° 需要 **强制设置**），点两次确认。armd 失能电机、设置零点、检查读数，然后删除运动学修正并把相机标定标为过期。电机零位无法恢复，只能在某个姿态重新设置。置零流程及其掉电后是否保留尚未在真机上验证。
+- **相机标定**、**精校**：以对应模式打开标定向导。
+- **夹爪标定**：显示当前偏差与开度表，执行零位检查（可选择保存偏差，`/api/v1/action/gripper_zero_check`）。
+- **释放控制权**：发送 `release_lease`；使能开启或机械臂在动时不可用。
+
+相机标定过期（`GET /api/v1/calibration` 的 `stale`，由零位标定设置）时，工具组和驾驶舱顶部（可关闭的横幅）都会提示。截图：`scripts/calib_tools_shots.mjs`。
+
 ## 视觉（reCamera 套件）
 
 `rebot-vision`（[kits/recamera-b601dm/vision](kits/recamera-b601dm/vision/)）是 `rebot-teleop` 包中的 C++ 进程，独占摄像头，提供：

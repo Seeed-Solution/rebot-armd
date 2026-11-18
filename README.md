@@ -580,6 +580,27 @@ J5 −4° zero offset already in armd's joint map), gates pass, solve 0.43 s in 
 workstation (not measured on a phone). The wizard flow itself ran against a simulated arm only
 (`scripts/calib_wizard_shots.mjs`).
 
+#### Calibration tools
+
+**Settings** (header gear, both modes) has a **Tools** group built from
+`capabilities.calibration_tools`; only the tools this arm supports are listed, each with one line on
+what it is for, in the recommended order **Motor zero → Fine calibration → Gripper calibration**
+(camera calibration is the alternative to fine calibration):
+
+- **Motor zero** (`/api/v1/calibration/motor_zero`; B601-DM, sim and mock followers; not RobStride /
+  Feetech / FashionStar): torque off, hold the arm at the zero pose (the 3D view shows it as the ghost
+  next to the current pose), select joints (more than 45° from 0 needs **force**), two taps. armd
+  disables the motors, sets the zeros, checks the readings, removes the kinematic correction and marks
+  the camera calibration stale. A motor zero cannot be restored, only set again at a pose. The
+  set-zero sequence and its persistence over a power cycle are not verified on the arm yet.
+- **Camera calibration**, **Fine calibration**: open the wizard in that mode.
+- **Gripper calibration**: current offset and opening table, zero check with or without storing the
+  offset (`/api/v1/action/gripper_zero_check`).
+- **Release control**: sends `release_lease`; disabled while torque is on or the arm moves.
+
+A stale camera calibration (`GET /api/v1/calibration` `stale`, set by a motor zero) shows in the
+Tools group and as a dismissible banner in the cockpit. Screenshots: `scripts/calib_tools_shots.mjs`.
+
 ## Vision (reCamera kit)
 
 `rebot-vision` ([kits/recamera-b601dm/vision](kits/recamera-b601dm/vision/)) is a C++ process
