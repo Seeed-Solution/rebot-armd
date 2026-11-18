@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 // Headless screenshots of the calibration tools (no armd needed): the Tools group of the settings
 // drawer (entries from capabilities.calibration_tools, stale camera calibration warning, release
-// control), the stale chip on the video and the gripper tool.
+// control), the stale banner in the cockpit, the gripper tool and the motor zero tool (park while
+// torqued, the 3D view with the zero pose as the ghost, joint table with a joint > 45 deg and the force
+// box, two-tap confirm against stubbed dry-run / run replies, result with the invalidated calibrations).
+// The 3D view loads src/api/vendor/three-urdf.min.js.gz and /assets/model/* from MODEL_DIR (default the
+// recamera-b601dm rootfs assets; missing files give the stick figure).
 //   PLAYWRIGHT=/path/to/playwright/index.mjs CHROME=/path/to/chrome node scripts/calib_tools_shots.mjs
 // A local server serves src/api/index.html, /assets/calib_wizard.js and mocks of GET /api/v1/calibration
 // (with `stale`) and GET /api/v1/gripper/calibration; the control WebSocket is a stub and the page state
@@ -18,6 +22,8 @@ const out = path.join(root, '.cache/calib-tools-shots');
 fs.mkdirSync(out, { recursive: true });
 const html = fs.readFileSync(path.join(root, 'src/api/index.html'));
 const js = fs.readFileSync(path.join(root, 'src/api/calib_wizard.js'));
+const bundle = fs.readFileSync(path.join(root, 'src/api/vendor/three-urdf.min.js.gz'));
+const modelDir = process.env.MODEL_DIR || path.join(root, 'kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/assets');
 
 // capabilities.calibration_tools as armd reports it for the B601-DM (mock follower)
 const TOOLS = {
@@ -45,6 +51,12 @@ const srv = http.createServer((req, res) => {
   if (u === '/assets/calib_wizard.js') { res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8' }); res.end(js); return; }
   if (u === '/api/v1/calibration') return send(res, 200, { calibrated: true, busy: false, stale: STALE, calibration_tools: TOOLS, backups: [] });
   if (u === '/api/v1/gripper/calibration') return send(res, 200, { offset_rad: 0.012, calibrated: false });
+  if (u === '/assets/three-urdf.min.js') { res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8', 'content-encoding': 'gzip' }); res.end(bundle); return; }
+  if (u.startsWith('/assets/model/')) {
+    const rel = u.slice('/assets/model/'.length), f = path.join(modelDir, rel);
+    if (rel.includes('..') || !fs.existsSync(f) || !fs.statSync(f).isFile()) { res.writeHead(404); res.end(); return; }
+    res.writeHead(200); res.end(fs.readFileSync(f)); return;
+  }
   res.writeHead(404); res.end();
 }).listen(0, '127.0.0.1');
 await new Promise((r) => srv.once('listening', r));
@@ -134,6 +146,56 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     await page.evaluate(() => { S.obs.is_torqued = true; GT.res = { stop_rad: 0.031, offset_rad: 0.019, pass: true }; gtRender(); });
     await shot('4_gripper_result', 'gtool');
     await page.evaluate(() => gtOpen(false));
+    // 5 motor zero tool, torqued: park button, the table is shown
+    await page.evaluate(() => { S.obs.is_torqued = true; S.obs.positions = [0.02, -0.05, 0.08, 0.01, -0.03, 0.9, 0.02]; ssetOpen(true); $('tool-motor_zero').click(); });
+    await page.waitForTimeout(1500);
+    const m1 = await page.evaluate(() => ({ park: !!$('mz-park'), rows: document.querySelectorAll('#mzero-body .mz-table tr').length, go: $('mz-go')?.disabled,
+      v3: V3.open, ghost: !!(MZ.previewQ && MZ.previewQ.every((v) => v === 0)) }));
+    if (!m1.park || m1.rows !== 8 || !m1.go || !m1.v3 || !m1.ghost) fail(`motor zero torqued ${lang}/${vpName}: ${JSON.stringify(m1)}`);
+    await shot('5_mz_torqued', 'mzero-panel');
+    // 6 torque off, J2 / J3 / J6 selected; J6 reads 51.6 deg: force box, Set disabled until ticked
+    await page.evaluate(() => { S.obs.is_torqued = false; mzRender(); for (const j of [2, 3, 6]) $('mz-c-' + j).click(); });
+    await page.waitForTimeout(400);
+    const m2 = await page.evaluate(() => ({ far: !$('mz-farbox').hidden, go: $('mz-go').disabled, farCell: $('mz-r-6').classList.contains('far') }));
+    if (!m2.far || !m2.go || !m2.farCell) fail(`motor zero far ${lang}/${vpName}: ${JSON.stringify(m2)}`);
+    await page.evaluate(() => { $('mz-force').click(); });
+    if (await page.evaluate(() => $('mz-go').disabled)) fail(`motor zero force ${lang}/${vpName}`);
+    await page.evaluate(() => { $('mzero-body').scrollTop = 1e4; });
+    await shot('6_mz_select', 'mzero-panel');
+    // 7 first tap: dry run (stub), button armed; second tap: the run
+    await page.evaluate(() => {
+      window.__mz = [];
+      window.commandRPC = async (p, body) => {
+        window.__mz.push([p, body]);
+        if (p !== '/api/v1/calibration/motor_zero') throw Object.assign(new Error('unexpected ' + p), { code: 'X' });
+        if (body.dry_run) return { dry_run: true, joints: body.joints.map((j) => ({ joint: j, reading_rad: S.obs.positions[j - 1] })), needs_force: true };
+        const before = body.joints.map((j) => S.obs.positions[j - 1]);
+        body.joints.forEach((j) => { S.obs.positions[j - 1] = 0.0004; });
+        return { joints: body.joints.map((j, k) => ({ joint: j, before_rad: before[k], after_rad: 0.0004, sent: true, fresh: true, verified: true })),
+          invalidated: { kinematics_removed: true, camera_stale: true }, persist: 'motor_flash', persist_verified: false, torque: 'off' };
+      };
+      $('mz-go').click();
+    });
+    await page.waitForTimeout(400);
+    const m3 = await page.evaluate(() => ({ armed: Date.now() < MZ.armedUntil, label: $('mz-go').textContent, calls: window.__mz.map((c) => c[1]) }));
+    if (!m3.armed || !m3.calls.length || m3.calls[0].dry_run !== true || m3.calls[0].force !== true) fail(`motor zero first tap ${lang}/${vpName}: ${JSON.stringify(m3)}`);
+    await page.evaluate(() => { $('mzero-body').scrollTop = 1e4; });
+    await shot('7_mz_confirm', 'mzero-panel');
+    await page.evaluate(() => $('mz-go').click());
+    await page.waitForTimeout(500);
+    await page.evaluate(() => { $('mzero-body').scrollTop = 0; });
+    const m4 = await page.evaluate(() => ({ res: !!MZ.res, calls: window.__mz.map((c) => c[1]), kin: !!$('mz-open-kin'), cam: !!$('mz-open-cam'),
+      rows: document.querySelectorAll('#mzero-body .cwiz-table tr').length }));
+    if (!m4.res || m4.calls.length !== 2 || m4.calls[1].dry_run !== undefined || JSON.stringify(m4.calls[1].joints) !== '[2,3,6]' || !m4.kin || !m4.cam || m4.rows !== 4)
+      fail(`motor zero run ${lang}/${vpName}: ${JSON.stringify(m4)}`);
+    await shot('8_mz_result', 'mzero-panel');
+    await page.evaluate(() => { $('mzero-body').scrollTop = 1e4; });
+    await shot('9_mz_result_end', 'mzero-panel');
+    // the kinematics button opens the wizard in fine mode
+    await page.evaluate(() => $('mz-open-kin').click());
+    const w = await page.evaluate(() => ({ cw: CWZ.open, mode: CWZ.mode, mz: MZ.open, ghost: MZ.previewQ }));
+    if (!w.cw || w.mode !== 'fine' || w.mz || w.ghost) fail(`motor zero -> fine ${lang}/${vpName}: ${JSON.stringify(w)}`);
+    await page.evaluate(() => cwOpen(false));
     if (errs.length) fail(`page errors ${lang}/${vpName}: ${errs.join(' | ')}`);
     await ctx.close();
   }

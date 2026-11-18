@@ -396,6 +396,19 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .cal-stale { position: fixed; z-index: 390; top: calc(var(--head-h) + 8px); left: 50%; transform: translateX(-50%); width: min(94vw, 520px); display: flex; align-items: center; gap: 6px;
   padding: 4px 4px 4px 12px; border-radius: 16px; color: var(--sc-status-warning-fg); background: rgba(255,247,230,0.97); border: 1px solid #ffd591; box-shadow: 0 4px 14px rgba(0,0,0,0.12); }
 .cal-stale[hidden] { display: none; }
+/* motor zero tool (non-modal drawer next to the 3D view) */
+.mz-pose { display: grid; gap: 4px; padding: 10px 12px; border-radius: var(--sc-radius-md); background: var(--sc-color-bg-sunken); border: 1px solid var(--sc-color-border); font-size: 12px; }
+.mz-pose ul { margin: 0; padding-left: 18px; color: var(--sc-color-text-secondary); }
+.mz-pose b { font-size: 13px; }
+.mz-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--sc-color-text-secondary); }
+.mz-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.mz-table td, .mz-table th { vertical-align: middle; }
+.mz-table input[type=checkbox] { width: 22px; height: 22px; margin: 0; accent-color: var(--sc-color-primary); }
+.mz-table label { display: flex; align-items: center; gap: 8px; min-height: 36px; cursor: pointer; }
+.mz-table td.far { color: var(--sc-status-danger-fg); font-weight: 600; }
+.mz-force { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; padding: 10px 12px; border-radius: var(--sc-radius-md); background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); }
+.mz-force input { width: 22px; height: 22px; flex-shrink: 0; margin: 0; }
+.mz-force[hidden] { display: none; }
 .cal-stale-txt { flex: 1 1 auto; min-height: 40px; padding: 0; border: 0; background: none; color: inherit; font: inherit; font-size: 13px; font-weight: 500; text-align: left; cursor: pointer; }
 .cal-stale .calib-x { width: 40px; min-height: 40px; font-size: 18px; flex-shrink: 0; }
 .gset-grid .field input { width: 100%; min-width: 0; }
@@ -1928,6 +1941,18 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
   <b id="col-title"></b><span id="col-sub"></span>
   <button class="btn" id="col-clear" type="button" data-i18n="en.clear_fault" hidden>⚠️ 点击清除故障</button>
 </div>
+<div class="calib-mask cwiz-mask" id="mzero" hidden>
+  <aside class="calib-drawer cwiz" id="mzero-panel" role="dialog" aria-modal="false" aria-labelledby="mzero-h">
+    <div class="calib-head">
+      <h3 id="mzero-h" data-i18n="mz.title">零位标定</h3>
+      <div class="cwiz-head-acts">
+        <button class="btn calib-x" id="mzero-min" type="button" data-i18n-aria="cw.min" aria-label="收起">–</button>
+        <button class="btn calib-x" id="mzero-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+      </div>
+    </div>
+    <div class="cwiz-body" id="mzero-body"></div>
+  </aside>
+</div>
 <div class="calib-mask" id="gtool" hidden>
   <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="gtool-h">
     <div class="calib-head">
@@ -2385,6 +2410,43 @@ Object.assign(I18N.en, {
   'gt.cur': 'Current offset', 'gt.calibrated': 'Opening table', 'gt.yes': 'calibrated', 'gt.no': 'not calibrated', 'gt.state': 'Boot check',
   'gt.check': 'Check zero (do not store)', 'gt.store': 'Check and store offset', 'gt.store.confirm': 'Tap again: check and store', 'gt.torque': 'The zero check needs the arm enabled and nothing between the jaws.',
   'gt.running': 'Checking…', 'gt.res': 'Stop angle {s} rad · offset {o} rad · {p}', 'gt.pass': 'pass', 'gt.fail': 'outside the threshold', 'gt.err': 'Failed: {m}', 'gt.noz': 'This gripper has no zero check.',
+});
+// motor zero tool (mz*)
+Object.assign(I18N.zh, {
+  'mz.title': '零位标定', 'mz.lead': '把机械臂摆到零位姿态，再把当前角度设为所选电机的零点。只在更换电机、拆装后或零位明显偏了时使用；机械臂不会动。',
+  'mz.pose': '零位姿态（所有电机为 0）', 'mz.legend.cur': '实体：当前姿态', 'mz.legend.zero': '蓝色半透明：零位姿态', 'mz.show3d': '在 3D 视图里对照',
+  'mz.torque': '需要先关闭使能：点下面的按钮收纳（收纳结束后使能关闭），然后用手把机械臂扶到零位姿态。', 'mz.park': '收纳并关闭使能', 'mz.parking': '正在收纳…',
+  'mz.off': '使能已关闭：用手把机械臂扶到零位姿态并保持住（关闭使能后机械臂会因重力下垂）。',
+  'mz.th.joint': '关节', 'mz.th.now': '当前读数', 'mz.th.change': '变化', 'mz.grip': '夹爪', 'mz.all': '全选', 'mz.none': '全不选',
+  'mz.far': '所选关节里有读数偏离 0 超过 {d}°：{list}。先确认机械臂确实在零位姿态。',
+  'mz.force': '我确认这些关节的零位已丢失，按当前姿态强制设置。',
+  'mz.set': '设置零位', 'mz.confirm': '再点一次确认：设置 {list} 的零位', 'mz.running': '正在设置零位…', 'mz.pick': '至少选择一个关节',
+  'mz.th.before': '设置前', 'mz.th.after': '设置后', 'mz.th.ok': '校验',
+  'mz.done': '零位已设置，使能保持关闭。', 'mz.unverified': '零位命令已发出，但部分关节在 1 s 内没有读回 0，请检查读数后重做。',
+  'mz.inv.kin': '运动学精校已清除（它是按旧零位测的）。', 'mz.inv.cam': '相机标定已标为过期，请重新做相机标定或精校。', 'mz.inv.err': '标定文件没有更新：{m}',
+  'mz.persist': '新零位保存在：{p}{v}。零位无法“恢复”，只能在某个姿态重新设置。', 'mz.persist.unv': '（掉电后是否保留未在实机验证）',
+  'mz.p.motor_flash': '电机内部（flash）', 'mz.p.simulator': '仿真编码器（armd 重启后丢失）', 'mz.p.process': 'mock 跟随器（armd 重启后丢失）',
+  'mz.open.kin': '打开精校', 'mz.open.cam': '打开相机标定', 'mz.again': '重新设置', 'mz.err': '失败：{m}', 'mz.close': '完成',
+  'mz.code.MOTOR_ZERO_ARMED': '需要先关闭使能，且没有动作在执行', 'mz.code.MOTOR_ZERO_FAULT': '机械臂处于故障或急停，先清除', 'mz.code.MOTOR_ZERO_FAR': '有关节离 0 太远，需要勾选强制设置',
+  'mz.code.MOTOR_ZERO_NOT_DISABLED': '电机没有确认处于失能状态，未做任何修改', 'mz.code.MOTOR_ZERO_NO_FEEDBACK': '没有新鲜的电机反馈，检查总线和电机供电',
+});
+Object.assign(I18N.en, {
+  'mz.title': 'Motor zero', 'mz.lead': 'Hold the arm at the zero pose, then make the current angle the zero of the selected motors. Use it after a motor swap, reassembly or when the zero is visibly off; the arm does not move.',
+  'mz.pose': 'Zero pose (every motor at 0)', 'mz.legend.cur': 'Solid: current pose', 'mz.legend.zero': 'Translucent blue: zero pose', 'mz.show3d': 'Compare in the 3D view',
+  'mz.torque': 'Torque must be off: park with the button below (torque goes off at the end), then hold the arm at the zero pose by hand.', 'mz.park': 'Park and disable torque', 'mz.parking': 'Parking…',
+  'mz.off': 'Torque is off: hold the arm at the zero pose by hand (without torque the arm sags under gravity).',
+  'mz.th.joint': 'Joint', 'mz.th.now': 'Reading', 'mz.th.change': 'Change', 'mz.grip': 'Gripper', 'mz.all': 'All', 'mz.none': 'None',
+  'mz.far': 'Selected joints read more than {d}° from 0: {list}. Check that the arm really is at the zero pose.',
+  'mz.force': 'The zero of these joints is lost; set it at the current pose anyway.',
+  'mz.set': 'Set zero', 'mz.confirm': 'Tap again to set the zero of {list}', 'mz.running': 'Setting the zero…', 'mz.pick': 'Select at least one joint',
+  'mz.th.before': 'Before', 'mz.th.after': 'After', 'mz.th.ok': 'Check',
+  'mz.done': 'Zero set; torque stays off.', 'mz.unverified': 'The zero commands were sent but some joints did not read 0 within 1 s; check the readings and run it again.',
+  'mz.inv.kin': 'The kinematic fine calibration was removed (it was measured with the old zero).', 'mz.inv.cam': 'The camera calibration is marked stale; redo the camera or fine calibration.', 'mz.inv.err': 'The calibration file was not updated: {m}',
+  'mz.persist': 'The new zero is kept in: {p}{v}. A motor zero cannot be restored, only set again at a pose.', 'mz.persist.unv': ' (whether it survives a power cycle is not verified on hardware)',
+  'mz.p.motor_flash': 'the motors (flash)', 'mz.p.simulator': 'the simulated encoder (lost when armd restarts)', 'mz.p.process': 'the mock follower (lost when armd restarts)',
+  'mz.open.kin': 'Open fine calibration', 'mz.open.cam': 'Open camera calibration', 'mz.again': 'Set again', 'mz.err': 'Failed: {m}', 'mz.close': 'Done',
+  'mz.code.MOTOR_ZERO_ARMED': 'Torque must be off and no action running', 'mz.code.MOTOR_ZERO_FAULT': 'The arm is in a fault or E-stop; clear it first', 'mz.code.MOTOR_ZERO_FAR': 'A joint is far from 0; tick the force box',
+  'mz.code.MOTOR_ZERO_NOT_DISABLED': 'The motors did not confirm torque off; nothing was changed', 'mz.code.MOTOR_ZERO_NO_FEEDBACK': 'No fresh motor feedback; check the bus and the motor power',
 });
 // calibration wizard (cwiz*)
 Object.assign(I18N.zh, {
@@ -8661,12 +8723,12 @@ const TL = { st: null, live: null, dismissed: null };
 const toolsCaps = () => (S.caps && S.caps.calibration_tools) || null;
 // [descriptor key, title key, description key, recommended step (0 = none), open]
 const TOOL_ENTRIES = [
-  ['motor_zero', 'tools.mz', 'tools.mz.desc', 1, () => { if (typeof mzOpen === 'function') { ssetOpen(false); mzOpen(true); } }],
+  ['motor_zero', 'tools.mz', 'tools.mz.desc', 1, () => { ssetOpen(false); mzOpen(true); }],
   ['camera', 'tools.cam', 'tools.cam.desc', 0, () => toolsWizard('camera')],
   ['kinematics', 'tools.kin', 'tools.kin.desc', 2, () => toolsWizard('fine')],
   ['gripper', 'tools.grip', 'tools.grip.desc', 3, () => { ssetOpen(false); gtOpen(true); }],
 ];
-const toolShown = (key) => { const c = toolsCaps(); return !!(c && c[key] && c[key].supported) && (key !== 'motor_zero' || typeof mzOpen === 'function'); };
+const toolShown = (key) => { const c = toolsCaps(); return !!(c && c[key] && c[key].supported); };
 function toolsAvail() { return TOOL_ENTRIES.some(([k]) => toolShown(k)); }
 function toolsOnCaps() {
   $('tools-set').hidden = !toolsAvail();
@@ -8789,6 +8851,167 @@ async function gtRun(store) {
   } catch (e) { GT.status = t('gt.err', { m: (e.code ? e.code + ': ' : '') + e.message }); }
   finally { GT.busy = false; gtRender(); }
 }
+/* ---------- motor zero tool: WS /api/v1/calibration/motor_zero (src/motor_zero.rs) ----------
+   Torque off (park button), the 3D view shows the zero pose (all motors 0) as the ghost next to the
+   current pose, one checkbox per joint with the live reading, force for joints > max_offset_deg, two
+   taps (the first is armd's dry run), then the before / after table and the invalidated calibrations. */
+const MZ = { open: false, sel: new Set(), force: false, armedUntil: 0, busy: false, res: null, err: null, status: '', previewQ: null, live: null, key: '' };
+const mzTool = () => toolsCaps()?.motor_zero || null;
+const mzName = (j) => (j === GRIP + 1 && S.dof === 7 ? t('mz.grip') + ' (J' + j + ')' : 'J' + j);
+const mzDeg = (r) => (Number.isFinite(r) ? (r * 180 / Math.PI).toFixed(1) + '°' : '--');
+function mzReading(j) { const p = S.obs && S.obs.positions; return Array.isArray(p) ? p[j - 1] : NaN; }
+function mzFar(j) { const tl = mzTool(); return Math.abs(mzReading(j)) > ((tl?.max_offset_deg ?? 45) * Math.PI / 180); }
+function mzOpen(open) {
+  MZ.open = open;
+  $('mzero').hidden = !open;
+  clearInterval(MZ.live); MZ.live = null;
+  if (open) {
+    $('mzero-panel').classList.remove('min');
+    MZ.res = null; MZ.err = null; MZ.status = ''; MZ.armedUntil = 0; MZ.force = false;
+    MZ.previewQ = Array.from({ length: S.dof || 7 }, () => 0);
+    if (!V3.open) v3Toggle(true);
+    mzRender();
+    MZ.live = setInterval(mzLive, 300);
+  } else { MZ.previewQ = null; }
+  V3.key = '';
+}
+// live readings without rebuilding the table (checkbox focus stays); a state change re-renders
+function mzLive() {
+  const o = S.obs || {}, key = [!!o.is_torqued, MZ.busy, Date.now() < MZ.armedUntil].join();
+  if (key !== MZ.key) { mzRender(); return; }
+  for (const j of mzTool()?.joints || []) {
+    const c = document.getElementById('mz-r-' + j);
+    if (c) { setText(c, mzDeg(mzReading(j))); c.classList.toggle('far', mzFar(j)); }
+  }
+  mzRenderFar();
+}
+function mzSelFar() { return [...MZ.sel].filter(mzFar); }
+function mzRenderFar() {
+  const box = document.getElementById('mz-farbox');
+  if (!box) return;
+  const far = mzSelFar();
+  box.hidden = !far.length;
+  if (far.length) setText(box.querySelector('span'), t('mz.far', { d: mzTool()?.max_offset_deg ?? 45, list: far.map(mzName).join(', ') }) + ' ' + t('mz.force'));
+  const go = $('mz-go');
+  if (go) go.disabled = MZ.busy || !!(S.obs && S.obs.is_torqued) || !MZ.sel.size || (far.length > 0 && !MZ.force);
+}
+function mzRender() {
+  const body = $('mzero-body'), tl = mzTool(), o = S.obs || {};
+  MZ.key = [!!o.is_torqued, MZ.busy, Date.now() < MZ.armedUntil].join();
+  body.textContent = '';
+  if (!tl || !tl.supported) { body.appendChild(cwEl('div', 'cwiz-msg', tl?.reason || '--')); return; }
+  const p = (txt, cls = '') => body.appendChild(cwEl('p', cls, txt));
+  const acts = (...b) => { const d = cwEl('div', 'cwiz-acts'); b.filter(Boolean).forEach((x) => d.appendChild(x)); body.appendChild(d); };
+  if (MZ.res) { mzRenderResult(body, p, acts); return; }
+  p(t('mz.lead'));
+  const zp = tl.zero_pose, box = cwEl('div', 'mz-pose');
+  box.appendChild(cwEl('b', '', t('mz.pose')));
+  if (zp && zp.description) box.appendChild(cwEl('span', '', zp.description));
+  if (zp && (zp.joints?.length || zp.gripper)) {
+    const ul = cwEl('ul');
+    for (const x of [...(zp.joints || []), ...(zp.gripper ? [zp.gripper] : [])]) ul.appendChild(cwEl('li', '', x));
+    box.appendChild(ul);
+  }
+  const lg = cwEl('div', 'mz-legend');
+  for (const [k, c] of [['mz.legend.cur', '#3a3f3b'], ['mz.legend.zero', 'rgba(59,130,246,0.45)']]) { const s1 = cwEl('span', '', t(k)); const i = cwEl('i'); i.style.background = c; s1.prepend(i); lg.appendChild(s1); }
+  box.appendChild(lg);
+  body.appendChild(box);
+  if (o.is_torqued) {
+    body.appendChild(cwEl('div', 'cwiz-msg', t('mz.torque')));
+    acts(cwBtn(t(MZ.busy ? 'mz.parking' : 'mz.park'), mzPark, { cls: 'btn-primary wide', disabled: MZ.busy, id: 'mz-park' }));
+  } else body.appendChild(cwEl('div', 'cwiz-msg ok', t('mz.off')));
+  // joints
+  const rows = tl.joints.map((j) => {
+    const tr = document.createElement('tr'), td = cwEl('td'), lab = cwEl('label'), cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.id = 'mz-c-' + j; cb.checked = MZ.sel.has(j); cb.disabled = MZ.busy;
+    cb.addEventListener('change', () => { if (cb.checked) MZ.sel.add(j); else MZ.sel.delete(j); MZ.armedUntil = 0; mzRenderFar(); });
+    lab.append(cb, cwEl('span', '', mzName(j))); td.appendChild(lab);
+    const r = cwEl('td', mzFar(j) ? 'far' : '', mzDeg(mzReading(j))); r.id = 'mz-r-' + j;
+    tr.append(td, r);
+    return tr;
+  });
+  body.appendChild(cwTable([t('mz.th.joint'), t('mz.th.now')], rows)).classList.add('mz-table');
+  acts(cwBtn(t('mz.all'), () => { tl.joints.forEach((j) => MZ.sel.add(j)); MZ.armedUntil = 0; mzRender(); }, { disabled: MZ.busy }),
+    cwBtn(t('mz.none'), () => { MZ.sel.clear(); MZ.armedUntil = 0; mzRender(); }, { disabled: MZ.busy }));
+  const fb = cwEl('label', 'mz-force'); fb.id = 'mz-farbox';
+  const fc = document.createElement('input'); fc.type = 'checkbox'; fc.id = 'mz-force'; fc.checked = MZ.force; fc.disabled = MZ.busy;
+  fc.addEventListener('change', () => { MZ.force = fc.checked; MZ.armedUntil = 0; mzRenderFar(); });
+  fb.append(fc, cwEl('span'));
+  body.appendChild(fb);
+  const armed = Date.now() < MZ.armedUntil;
+  const list = [...MZ.sel].sort((a, b) => a - b).map(mzName).join(', ');
+  acts(cwBtn(armed ? t('mz.confirm', { list }) : t(MZ.busy ? 'mz.running' : 'mz.set'), mzGo, { cls: 'btn-primary wide' + (armed ? ' armed' : ''), id: 'mz-go' }));
+  mzRenderFar();
+  if (MZ.status) body.appendChild(cwEl('div', 'cwiz-msg', MZ.status));
+}
+function mzRenderResult(body, p, acts) {
+  const r = MZ.res, tl = mzTool() || {}, inv = r.invalidated || {};
+  body.appendChild(cwEl('div', 'cwiz-msg' + (r.ok ? ' ok' : ''), t(r.ok ? 'mz.done' : 'mz.unverified')));
+  const rows = (r.joints || []).map((x) => {
+    const tr = document.createElement('tr');
+    tr.append(cwEl('td', '', mzName(x.joint)), cwEl('td', '', mzDeg(x.before_rad)), cwEl('td', '', mzDeg(x.after_rad)), cwEl('td', x.verified ? 'ok' : 'bad', x.verified ? '✓' : '✗'));
+    return tr;
+  });
+  body.appendChild(cwTable([t('mz.th.joint'), t('mz.th.before'), t('mz.th.after'), t('mz.th.ok')], rows));
+  if (inv.kinematics_removed) body.appendChild(cwEl('div', 'cwiz-msg', t('mz.inv.kin')));
+  if (inv.camera_stale) body.appendChild(cwEl('div', 'cwiz-msg', t('mz.inv.cam')));
+  if (inv.error) body.appendChild(cwEl('div', 'cwiz-msg', t('mz.inv.err', { m: inv.error })));
+  const pk = r.persist || tl.persist || '';
+  p(t('mz.persist', { p: I18N.zh['mz.p.' + pk] !== undefined ? t('mz.p.' + pk) : (pk || '--'), v: (r.persist_verified ?? tl.persist_verified) === false ? t('mz.persist.unv') : '' }));
+  const caps = toolsCaps() || {};
+  acts(caps.kinematics?.supported ? cwBtn(t('mz.open.kin'), () => { mzOpen(false); toolsWizard('fine'); }, { cls: 'btn-primary', id: 'mz-open-kin' }) : null,
+    caps.camera?.supported ? cwBtn(t('mz.open.cam'), () => { mzOpen(false); toolsWizard('camera'); }, { id: 'mz-open-cam' }) : null,
+    cwBtn(t('mz.again'), () => { MZ.res = null; MZ.sel.clear(); mzRender(); }, { id: 'mz-again' }),
+    cwBtn(t('mz.close'), () => mzOpen(false), { id: 'mz-close' }));
+}
+const mzErrText = (e) => { const k = 'mz.code.' + e.code; return t('mz.err', { m: (I18N.zh[k] !== undefined ? t(k) : e.message) + (e.code ? ' (' + e.code + ')' : '') }); };
+async function mzPark() {
+  if (MZ.busy) return;
+  MZ.busy = true; MZ.status = ''; mzRender();
+  try {
+    const ack = await commandRPC('/api/v1/motion/unload', {}, true, 5000);
+    const id = ack && ack.action_id;
+    await cwGuardedWaitPlain(() => {
+      const o = S.obs || {};
+      if (id != null) for (const a of [o.action, o.previous_action]) if (a && a.id === id && a.state !== 'running') return true;
+      return !o.is_torqued;
+    }, 60000);
+  } catch (e) { MZ.status = mzErrText(e); }
+  finally { MZ.busy = false; mzRender(); }
+}
+// first tap: armd's dry run (checks, readings); second tap within 5 s: the zero
+async function mzGo() {
+  if (MZ.busy) return;
+  const joints = [...MZ.sel].sort((a, b) => a - b);
+  if (!joints.length) { MZ.status = t('mz.pick'); mzRender(); return; }
+  const armed = Date.now() < MZ.armedUntil;
+  MZ.busy = true; MZ.status = armed ? t('mz.running') : ''; mzRender();
+  try {
+    if (!armed) {
+      await commandRPC('/api/v1/calibration/motor_zero', { joints, dry_run: true, force: MZ.force }, true, 3000);
+      MZ.armedUntil = Date.now() + 5000;
+      setTimeout(() => { if (MZ.open && !MZ.busy) mzRender(); }, 5100);
+    } else {
+      MZ.armedUntil = 0;
+      const r = await commandRPC('/api/v1/calibration/motor_zero', { joints, force: MZ.force }, true, 10000);
+      MZ.res = { ...r, ok: true };
+      MZ.status = '';
+      $('mzero-body').scrollTop = 0;
+      mzAfter();
+    }
+  } catch (e) {
+    MZ.armedUntil = 0;
+    const rep = e.reply || {};
+    if (e.code === 'MOTOR_ZERO_UNVERIFIED' || (rep.joints && rep.invalidated)) { MZ.res = { ...rep, ok: false }; mzAfter(); }
+    MZ.status = mzErrText(e);
+  } finally { MZ.busy = false; mzRender(); }
+}
+// the zero changed: the schema (kinematics_correction removed) and the stale camera calibration
+function mzAfter() { loadSchema(); toolsLoadStatus(); }
+$('mzero-close').addEventListener('click', () => { if (!MZ.busy) mzOpen(false); });
+$('mzero-min').addEventListener('click', () => $('mzero-panel').classList.toggle('min'));
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && MZ.open && !MZ.busy) mzOpen(false); });
+i18nHooks.push(() => { if (MZ.open) mzRender(); });
 $('gtool-close').addEventListener('click', () => gtOpen(false));
 $('gtool').addEventListener('click', (e) => { if (e.target === e.currentTarget) gtOpen(false); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('gtool').hidden && !GT.busy) gtOpen(false); });
@@ -9385,7 +9608,7 @@ function v3Tick(ts) {
   } else {
     if (o && Array.isArray(o.positions)) {
       const meas = o.positions, cmd = Array.isArray(o.commanded_positions) ? o.commanded_positions : meas;
-      const pv = CWZ.previewQ; // calibration wizard: the next planned pose as the ghost
+      const pv = CWZ.previewQ || MZ.previewQ; // calibration wizard: the next planned pose; motor zero tool: the zero pose
       const key = meas.map((v) => Math.round(v * 2000)).join() + '|' + cmd.map((v) => Math.round(v * 2000)).join() + (pv ? '|' + pv.join() : '');
       if (key !== V3.key) {
         V3.key = key;
