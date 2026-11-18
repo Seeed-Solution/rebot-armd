@@ -381,6 +381,23 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .gset-row small { font-size: 12px; line-height: 1.5; color: var(--sc-color-text-secondary); }
 .gset-row .btn { min-height: 44px; touch-action: manipulation; }
 .gset-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+/* calibration tools (settings drawer): one entry per supported tool, release control */
+.tools-list { display: grid; gap: 8px; }
+.tool-item { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 10px; align-items: center; text-align: left; width: 100%; min-height: 56px; padding: 10px 12px;
+  border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border); background: var(--sc-color-bg); color: var(--sc-color-text); font: inherit; cursor: pointer; touch-action: manipulation; }
+.tool-item:hover, .tool-item:focus-visible { border-color: var(--sc-color-primary); outline: none; }
+.tool-item .tool-n { grid-row: 1 / span 2; width: 24px; height: 24px; border-radius: 12px; display: grid; place-items: center; font-size: 12px; font-weight: 600;
+  background: var(--sc-color-primary-soft); color: var(--sc-color-text); }
+.tool-item .tool-n.none { background: var(--sc-color-bg-sunken); color: var(--sc-color-text-secondary); }
+.tool-item b { font-size: 14px; font-weight: 600; }
+.tool-item small { grid-column: 2; font-size: 12px; line-height: 1.45; color: var(--sc-color-text-secondary); }
+.tools-warn { font-size: 12px; line-height: 1.5; padding: 8px 10px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); border: 1px solid #ffd591; }
+.tools-warn[hidden] { display: none; }
+.cal-stale { position: fixed; z-index: 390; top: calc(var(--head-h) + 8px); left: 50%; transform: translateX(-50%); width: min(94vw, 520px); display: flex; align-items: center; gap: 6px;
+  padding: 4px 4px 4px 12px; border-radius: 16px; color: var(--sc-status-warning-fg); background: rgba(255,247,230,0.97); border: 1px solid #ffd591; box-shadow: 0 4px 14px rgba(0,0,0,0.12); }
+.cal-stale[hidden] { display: none; }
+.cal-stale-txt { flex: 1 1 auto; min-height: 40px; padding: 0; border: 0; background: none; color: inherit; font: inherit; font-size: 13px; font-weight: 500; text-align: left; cursor: pointer; }
+.cal-stale .calib-x { width: 40px; min-height: 40px; font-size: 18px; flex-shrink: 0; }
 .gset-grid .field input { width: 100%; min-width: 0; }
 /* header icon buttons (settings, poses); same look as the full-screen button */
 .hd-btn { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; padding: 0; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral); background: #fff; color: var(--sc-color-text-secondary); cursor: pointer; touch-action: manipulation; }
@@ -1903,15 +1920,36 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <div class="calib-live mono" id="pose-status">--</div>
   </aside>
 </div>
+<div class="cal-stale" id="cal-stale" role="status" hidden>
+  <button class="cal-stale-txt" id="cal-stale-open" type="button"></button>
+  <button class="btn calib-x" id="cal-stale-x" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+</div>
 <div class="col-banner" id="col-banner" role="alert" aria-live="assertive" hidden>
   <b id="col-title"></b><span id="col-sub"></span>
   <button class="btn" id="col-clear" type="button" data-i18n="en.clear_fault" hidden>⚠️ 点击清除故障</button>
+</div>
+<div class="calib-mask" id="gtool" hidden>
+  <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="gtool-h">
+    <div class="calib-head">
+      <h3 id="gtool-h" data-i18n="gt.title">夹爪标定</h3>
+      <button class="btn calib-x" id="gtool-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+    </div>
+    <div class="cwiz-body" id="gtool-body"></div>
+  </aside>
 </div>
 <div class="calib-mask" id="sset" hidden>
   <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="sset-h">
     <div class="calib-head">
       <h3 id="sset-h" data-i18n="sset.title">设置</h3>
       <button class="btn calib-x" id="sset-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+    </div>
+    <div class="gset-row" id="tools-set" hidden>
+      <div class="gset-k"><span data-i18n="tools.title">工具</span></div>
+      <small data-i18n="tools.order">推荐顺序：零位标定 → 精校 → 夹爪标定。相机标定在不做精校时单独使用。</small>
+      <div class="tools-warn" id="tools-stale" role="status" hidden></div>
+      <div class="tools-list" id="tools-list"></div>
+      <button class="btn" id="tools-release" type="button" data-i18n="tools.release">释放控制权</button>
+      <small id="tools-release-hint"></small>
     </div>
     <div class="gset-row" id="col-set">
       <div class="gset-k"><span data-i18n="col.set.title">碰撞保护</span><label class="tgl"><input type="checkbox" id="col-en" role="switch" data-i18n-aria="col.set.title" aria-label="碰撞保护"><i></i></label></div>
@@ -2319,6 +2357,35 @@ const I18N = {
     'toast.enable_fail': 'Enable failed: ', 'toast.enable_fail_def': 'motors not ready / communication timeout', 'toast.preset_fail': 'Preset failed: ', 'toast.rec_start': 'Recording started ',
   },
 };
+// calibration tools (settings drawer, gripper tool)
+Object.assign(I18N.zh, {
+  'tools.title': '工具', 'tools.order': '推荐顺序：零位标定 → 精校 → 夹爪标定。相机标定在不做精校时单独使用。',
+  'tools.mz': '零位标定', 'tools.mz.desc': '把机械臂摆到零位姿态，设为各电机的零点；更换电机、拆装后或零位明显偏了时使用。',
+  'tools.cam': '相机标定', 'tools.cam.desc': '用标定板求解相机内参、相机安装和桌面高度（约 20 个位姿）。',
+  'tools.kin': '精校（相机 + 机械臂几何）', 'tools.kin.desc': '标定板两个位置，同时求解相机和 J2–J5 的几何修正（约 12 分钟）。',
+  'tools.grip': '夹爪标定', 'tools.grip.desc': '检查夹爪闭合时的机械零位，可保存偏差。',
+  'tools.release': '释放控制权', 'tools.rel.none': '本页没有控制权。', 'tools.rel.torqued': '先停稳并关闭使能，再释放控制权。',
+  'tools.rel.moving': '机械臂在动或有动作在执行，停下后再释放。', 'tools.rel.ok': '释放后其他设备（如 MCP、脚本）可以取得控制权。',
+  'tools.stale': '相机标定已过期：{at} 改过电机零位。抓取仍按旧标定运行，请重新做相机标定或精校。', 'tools.stale.chip': '⚠ 相机标定需重做（电机零位已改）',
+  'gt.title': '夹爪标定', 'gt.lead': '夹爪零位 = 完全闭合。零位检查让夹爪慢慢闭合到机械限位，测出与配置的闭合角之差。',
+  'gt.cur': '当前偏差', 'gt.calibrated': '开度表', 'gt.yes': '已标定', 'gt.no': '未标定', 'gt.state': '开机检查',
+  'gt.check': '检查零位（不保存）', 'gt.store': '检查并保存偏差', 'gt.store.confirm': '再点一次：检查并保存', 'gt.torque': '零位检查需要先使能机械臂，并确保夹爪之间没有物体。',
+  'gt.running': '正在检查…', 'gt.res': '停止角 {s} rad · 偏差 {o} rad · {p}', 'gt.pass': '通过', 'gt.fail': '超出阈值', 'gt.err': '失败：{m}', 'gt.noz': '此夹爪不支持零位检查。',
+});
+Object.assign(I18N.en, {
+  'tools.title': 'Tools', 'tools.order': 'Recommended order: motor zero → fine calibration → gripper. Camera calibration is the alternative to fine calibration.',
+  'tools.mz': 'Motor zero', 'tools.mz.desc': 'Hold the arm at the zero pose and make it every motor\'s zero; after a motor swap, reassembly, or when the zero is visibly off.',
+  'tools.cam': 'Camera calibration', 'tools.cam.desc': 'Camera intrinsics, camera mount and table height from a printed board (about 20 poses).',
+  'tools.kin': 'Fine calibration (camera + arm geometry)', 'tools.kin.desc': 'Two board placements: the camera plus a geometric correction of J2–J5 (about 12 minutes).',
+  'tools.grip': 'Gripper calibration', 'tools.grip.desc': 'Checks the gripper\'s mechanical zero when closed; can store the offset.',
+  'tools.release': 'Release control', 'tools.rel.none': 'This page does not hold control.', 'tools.rel.torqued': 'Stop the arm and disable torque before releasing control.',
+  'tools.rel.moving': 'The arm is moving or an action runs; release once it stops.', 'tools.rel.ok': 'After the release another client (MCP, a script) can take control.',
+  'tools.stale': 'The camera calibration is stale: the motor zero changed at {at}. Grasp still uses the old calibration; redo the camera or fine calibration.', 'tools.stale.chip': '⚠ Redo the camera calibration (motor zero changed)',
+  'gt.title': 'Gripper calibration', 'gt.lead': 'Gripper zero = fully closed. The zero check closes the gripper slowly onto its mechanical stop and measures the difference to the configured closed angle.',
+  'gt.cur': 'Current offset', 'gt.calibrated': 'Opening table', 'gt.yes': 'calibrated', 'gt.no': 'not calibrated', 'gt.state': 'Boot check',
+  'gt.check': 'Check zero (do not store)', 'gt.store': 'Check and store offset', 'gt.store.confirm': 'Tap again: check and store', 'gt.torque': 'The zero check needs the arm enabled and nothing between the jaws.',
+  'gt.running': 'Checking…', 'gt.res': 'Stop angle {s} rad · offset {o} rad · {p}', 'gt.pass': 'pass', 'gt.fail': 'outside the threshold', 'gt.err': 'Failed: {m}', 'gt.noz': 'This gripper has no zero check.',
+});
 // calibration wizard (cwiz*)
 Object.assign(I18N.zh, {
   'cw.title': '相机标定向导', 'cw.min': '收起', 'cw.adv': '高级：手动手眼标定',
@@ -2754,7 +2821,7 @@ function rpcError(response) {
   } else {
     message = response.message || response.error || t('err.rejected');
   }
-  return Object.assign(new Error(message), { code: response.code, status: response.status });
+  return Object.assign(new Error(message), { code: response.code, status: response.status, reply: response });
 }
 function commandRPC(path, body, acquire = true, timeoutMs = 2000) {
   // First control input: acquire the lease, then send. A stop needs no lease of ours:
@@ -5145,6 +5212,7 @@ async function cwApply() {
     CWZ.applied = await commandRPC('/api/v1/calibration/apply', { ...CWZ.solve.apply, dry_run: false }, true, 30000);
     CWZ.step = 'applied'; cwSetStatus(t('cw.app.ok'), 'ok');
     if (cwFine()) loadSchema(); // the corrected model (kinematics_correction) for CALM / VIK
+    toolsLoadStatus(); // a new calibration clears `stale`
   } catch (e) {
     if (e.code === 'KINEMATICS_ARMED') cwSetStatus(t('cw.f.armed'), 'warn');
     else cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message + (e.step ? ' (' + e.step + ')' : '') }), 'warn');
@@ -5160,6 +5228,7 @@ async function cwRestore() {
   try {
     const r = await commandRPC('/api/v1/calibration/restore', { backup: name }, true, 30000);
     CWZ.applied = { ...r, restoredFrom: name };
+    toolsLoadStatus();
     cwSetStatus(t('cw.app.restored', { b: name }), 'ok');
     if (cwFine()) loadSchema();
   } catch (e) { cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
@@ -8507,8 +8576,10 @@ function colThresholds(c) {
   return null;
 }
 function colOnCaps() {
-  $('btn-sset').hidden = !colAvail();
+  $('btn-sset').hidden = !colAvail() && !toolsAvail();
+  $('col-set').hidden = !colAvail();
   if (colAvail() && !COL.cfg) colLoad(true);
+  toolsOnCaps();
 }
 async function colLoad(quiet) {
   if (!quiet) colRenderSet(t('col.st.loading'));
@@ -8560,8 +8631,13 @@ async function colWrite(patch) {
 }
 function ssetOpen(open) {
   $('sset').hidden = !open;
-  if (open) { colRenderSet(); colLoad(false); $('sset-close').focus({ preventScroll: true }); }
-  else $('btn-sset').focus({ preventScroll: true });
+  clearInterval(TL.live); TL.live = null;
+  if (open) {
+    if (colAvail()) { colRenderSet(); colLoad(false); }
+    toolsRender(); toolsLoadStatus();
+    TL.live = setInterval(toolsRenderRelease, 400);
+    $('sset-close').focus({ preventScroll: true });
+  } else $('btn-sset').focus({ preventScroll: true });
 }
 $('btn-sset').addEventListener('click', () => ssetOpen(true));
 $('sset-close').addEventListener('click', () => ssetOpen(false));
@@ -8573,7 +8649,149 @@ $('col-sens').addEventListener('click', (e) => {
   if (b && !b.disabled && !b.classList.contains('on')) colWrite({ sensitivity: b.dataset.v });
 });
 $('col-clear').addEventListener('click', () => clearFault());
-i18nHooks.push(() => { if (!$('sset').hidden) colRenderSet(); COL.barAt = 0; });
+i18nHooks.push(() => { if (!$('sset').hidden) { colRenderSet(); toolsRender(); } COL.barAt = 0; renderCalStale(); if (!$('gtool').hidden) gtRender(); });
+
+/* =================================================================
+   Calibration tools (capabilities.calibration_tools, armd capabilities version 10): the Tools
+   group of the settings drawer lists the supported tools in the recommended order (motor zero ->
+   fine calibration -> gripper), shows a stale camera calibration (GET /api/v1/calibration
+   `stale`, set by a motor zero) here and as a chip on the video, and releases this page's lease.
+   ================================================================= */
+const TL = { st: null, live: null, dismissed: null };
+const toolsCaps = () => (S.caps && S.caps.calibration_tools) || null;
+// [descriptor key, title key, description key, recommended step (0 = none), open]
+const TOOL_ENTRIES = [
+  ['motor_zero', 'tools.mz', 'tools.mz.desc', 1, () => { if (typeof mzOpen === 'function') { ssetOpen(false); mzOpen(true); } }],
+  ['camera', 'tools.cam', 'tools.cam.desc', 0, () => toolsWizard('camera')],
+  ['kinematics', 'tools.kin', 'tools.kin.desc', 2, () => toolsWizard('fine')],
+  ['gripper', 'tools.grip', 'tools.grip.desc', 3, () => { ssetOpen(false); gtOpen(true); }],
+];
+const toolShown = (key) => { const c = toolsCaps(); return !!(c && c[key] && c[key].supported) && (key !== 'motor_zero' || typeof mzOpen === 'function'); };
+function toolsAvail() { return TOOL_ENTRIES.some(([k]) => toolShown(k)); }
+function toolsOnCaps() {
+  $('tools-set').hidden = !toolsAvail();
+  if (toolsAvail()) toolsLoadStatus();
+  else { TL.st = null; renderCalStale(); }
+}
+async function toolsLoadStatus() {
+  if (!toolsCaps()) return;
+  try { TL.st = await api('/api/v1/calibration', undefined, { quiet: true, method: 'GET' }); } catch (_) { return; }
+  renderCalStale();
+  if (!$('sset').hidden) toolsRender();
+}
+const calStale = () => (TL.st && TL.st.stale) || null;
+function staleText(st) { return t('tools.stale', { at: (st.at || '').replace('T', ' ').replace(/(:\d\d)Z$/, '$1 UTC') }); }
+// cockpit banner; closing it hides it until the stale time changes
+function renderCalStale() {
+  const st = calStale(), el = $('cal-stale');
+  el.hidden = !st || TL.dismissed === st.at;
+  if (st) { setText($('cal-stale-open'), t('tools.stale.chip')); $('cal-stale-open').title = staleText(st) + (st.reason ? ' — ' + st.reason : ''); }
+}
+function toolsRender() {
+  const list = $('tools-list'), c = toolsCaps();
+  list.textContent = '';
+  for (const [key, title, desc, n, open] of TOOL_ENTRIES) {
+    if (!toolShown(key)) continue;
+    const b = cwEl('button', 'tool-item'); b.type = 'button'; b.id = 'tool-' + key;
+    b.append(cwEl('span', 'tool-n' + (n ? '' : ' none'), n ? String(n) : '–'), cwEl('b', '', t(title)), cwEl('small', '', t(desc)));
+    b.addEventListener('click', open);
+    list.appendChild(b);
+  }
+  const st = calStale(), w = $('tools-stale');
+  w.hidden = !st || !(c && c.camera && c.camera.supported);
+  if (st) setText(w, staleText(st));
+  toolsRenderRelease();
+}
+// release_lease: only with torque off and nothing moving (armd parks a torqued arm on release)
+function toolsReleaseState() {
+  const o = S.obs || {};
+  if (S.leaseGeneration == null || !S.ws || S.ws.readyState !== 1) return 'none';
+  if (o.is_torqued || o.disable_pending || o.enable_state === 'Enabled') return 'torqued';
+  if (o.action?.state === 'running' || S.state === 'Moving' || S.presetRunning || S.streamActive || unloading || pendingCommands.size
+    || (Array.isArray(o.velocities) && o.velocities.some((v) => !(Math.abs(v) < 0.05)))) return 'moving';
+  return 'ok';
+}
+function toolsRenderRelease() {
+  const st = toolsReleaseState();
+  $('tools-release').disabled = st !== 'ok';
+  setText($('tools-release-hint'), t('tools.rel.' + st));
+}
+function toolsRelease() {
+  if (toolsReleaseState() !== 'ok') { toolsRenderRelease(); return; }
+  try { S.ws.send(JSON.stringify({ type: 'release_lease', client_id: CLIENT_ID, generation: S.leaseGeneration })); } catch (_) { return; }
+  resetLease();
+  toast(t('toast.lease_released'), 'info');
+  toolsRenderRelease();
+}
+// the calibration wizard in a mode (camera / fine); the mode stays when views were captured
+function toolsWizard(mode) {
+  ssetOpen(false);
+  if (CWZ.running) { toast(t('cw.busy'), 'warn'); return; }
+  if (!CWZ.views.length) CWZ.mode = mode;
+  cwOpen(true);
+}
+$('tools-release').addEventListener('click', toolsRelease);
+$('cal-stale-open').addEventListener('click', () => ssetOpen(true));
+$('cal-stale-x').addEventListener('click', () => { TL.dismissed = calStale()?.at; renderCalStale(); });
+
+/* ---------- gripper tool: GET /api/v1/gripper/calibration, action gripper_zero_check ---------- */
+const GT = { cal: null, busy: false, armedUntil: 0, res: null, status: '' };
+async function gtLoad() {
+  try { GT.cal = await api('/api/v1/gripper/calibration', undefined, { quiet: true, method: 'GET' }); } catch (_) { GT.cal = null; }
+  gtRender();
+}
+function gtOpen(open) {
+  $('gtool').hidden = !open;
+  if (open) { GT.status = ''; GT.res = null; gtRender(); gtLoad(); $('gtool-close').focus({ preventScroll: true }); }
+}
+function gtRender() {
+  const body = $('gtool-body'), c = toolsCaps()?.gripper || {}, o = S.obs || {};
+  body.textContent = '';
+  body.appendChild(cwEl('p', '', t('gt.lead')));
+  const box = cwEl('div', 'calib-result mono');
+  const row = (k, v) => { const d = cwEl('div', 'row'); d.append(cwEl('span', '', k), cwEl('span', '', v)); box.appendChild(d); };
+  const off = GT.cal && Number.isFinite(GT.cal.offset_rad) ? GT.cal.offset_rad : o.gripper_zero?.offset_rad;
+  row(t('gt.cur'), Number.isFinite(off) ? off.toFixed(4) + ' rad' : '--');
+  row(t('gt.calibrated'), GT.cal ? t(GT.cal.calibrated ? 'gt.yes' : 'gt.no') : '--');
+  if (o.gripper_zero?.state) row(t('gt.state'), o.gripper_zero.state);
+  body.appendChild(box);
+  if (!c.zero_check) { body.appendChild(cwEl('div', 'cwiz-msg', t('gt.noz'))); return; }
+  const torqued = !!o.is_torqued;
+  if (!torqued) body.appendChild(cwEl('div', 'cwiz-msg', t('gt.torque')));
+  const acts = cwEl('div', 'cwiz-acts');
+  const armed = Date.now() < GT.armedUntil;
+  acts.append(cwBtn(t('gt.check'), () => gtRun(false), { disabled: GT.busy || !torqued, id: 'gt-check' }),
+    cwBtn(t(armed ? 'gt.store.confirm' : 'gt.store'), () => gtRun(true), { cls: armed ? 'btn-primary' : '', disabled: GT.busy || !torqued, id: 'gt-store' }));
+  body.appendChild(acts);
+  if (GT.res) body.appendChild(cwEl('div', 'cwiz-msg' + (GT.res.pass ? ' ok' : ''), t('gt.res', { s: cwFmt(GT.res.stop_rad, 4), o: cwFmt(GT.res.offset_rad, 4), p: t(GT.res.pass ? 'gt.pass' : 'gt.fail') })));
+  if (GT.status) body.appendChild(cwEl('div', 'cwiz-msg', GT.status));
+}
+async function gtRun(store) {
+  if (GT.busy) return;
+  if (store && Date.now() >= GT.armedUntil) { GT.armedUntil = Date.now() + 4000; gtRender(); setTimeout(gtRender, 4100); return; }
+  GT.armedUntil = 0; GT.busy = true; GT.res = null; GT.status = t('gt.running'); gtRender();
+  try {
+    const ack = await commandRPC('/api/v1/action/gripper_zero_check', { store_offset: store }, true, 5000);
+    const id = ack && ack.action_id;
+    const t0 = Date.now();
+    let a = null;
+    while (Date.now() - t0 < 15000) {
+      const o = S.obs || {};
+      a = [o.action, o.previous_action].find((x) => x && x.id === id && x.state !== 'running') || null;
+      if (a) break;
+      await cwSleep(150);
+    }
+    if (!a) throw Object.assign(new Error('timeout'), { code: 'TIMEOUT' });
+    if (a.state !== 'done') throw Object.assign(new Error(a.message || a.state), { code: a.code || '' });
+    GT.res = { stop_rad: a.stop_rad, offset_rad: a.offset_rad, pass: !!a.pass };
+    GT.status = '';
+    gtLoad();
+  } catch (e) { GT.status = t('gt.err', { m: (e.code ? e.code + ': ' : '') + e.message }); }
+  finally { GT.busy = false; gtRender(); }
+}
+$('gtool-close').addEventListener('click', () => gtOpen(false));
+$('gtool').addEventListener('click', (e) => { if (e.target === e.currentTarget) gtOpen(false); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('gtool').hidden && !GT.busy) gtOpen(false); });
 
 /* =================================================================
    Named poses (capability poses): GET /api/v1/poses, WS /api/v1/poses/save|delete,
