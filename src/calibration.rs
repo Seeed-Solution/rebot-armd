@@ -56,6 +56,18 @@ pub struct CalibrationFile {
     /// Kinematic fine calibration of the built-in chain; None = the URDF chain.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kinematics: Option<KinematicsCalibration>,
+    /// Set by a motor zero: the camera calibration was measured with the old zero. Grasp keeps
+    /// using it; clients warn. A new apply clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<CalibrationStale>,
+}
+
+/// `calibration.json` `stale`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibrationStale {
+    pub reason: String,
+    /// UTC time (RFC 3339).
+    pub at: String,
 }
 
 /// `calibration.json` `kinematics` (and the apply field of the same name).
@@ -405,6 +417,7 @@ fn after_state(inner: &SupervisorInner, req: &ApplyRequest) -> Result<ArmdState,
         solved_at: Some(req.solved_at.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true))),
         rms: req.rms.clone(),
         kinematics,
+        stale: None,
     };
     Ok(ArmdState { camera_mount: mount, calibration: Some(file), grasp_setup: Some(setup), grip_pixel_model })
 }
@@ -586,21 +599,59 @@ impl BusyGuard {
 
     /// Clear the flag (normal end of the transaction).
     pub async fn release(mut self) {
-        if let Some(sup) = self.sup.take() { sup.inner().write().await.calibration_busy = false; }
+        if let Some(sup) = self.sup.take() { clear_busy(&mut *sup.inner().write().await); }
     }
 }
 
 impl Drop for BusyGuard {
     fn drop(&mut self) {
         let Some(sup) = self.sup.take() else { return; };
-        if let Ok(mut inner) = sup.inner().try_write() { inner.calibration_busy = false; return; }
+        if let Ok(mut inner) = sup.inner().try_write() { clear_busy(&mut inner); return; }
         // the lock is held (for example by the code that panicked): clear it once it is free
         match tokio::runtime::Handle::try_current() {
-            Ok(h) => { h.spawn(async move { sup.inner().write().await.calibration_busy = false; }); }
-            Err(_) => sup.inner().blocking_write().calibration_busy = false,
+            Ok(h) => { h.spawn(async move { clear_busy(&mut *sup.inner().write().await); }); }
+            Err(_) => clear_busy(&mut sup.inner().blocking_write()),
         }
         tracing::warn!("calibration transaction ended without release (panic or early return); busy flag cleared");
     }
+}
+
+fn clear_busy(inner: &mut SupervisorInner) {
+    inner.calibration_busy = false;
+    inner.motor_zero_busy = false;
+}
+
+/// After a motor zero of `joints` (1-based): remove the kinematic correction (live, and from
+/// `calibration.json`) and mark the camera calibration stale (`calibration.json` `stale`). The
+/// caller holds `calibration_busy` and torque is off. Returns `{kinematics_removed,
+/// camera_stale, removed_kinematics, error?}`; a failed file write leaves the live state
+/// changed and reports `error` (the file still holds the old correction until the next apply).
+pub async fn invalidate_after_motor_zero(sup: &ArmSupervisor, deps: &CalibrationDeps, joints: &[usize]) -> Value {
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let (file, removed, had_live) = {
+        let inner = sup.inner().read().await;
+        let mut file = inner.calibration.clone();
+        let removed = file.as_mut().and_then(|c| c.kinematics.take());
+        if let Some(c) = file.as_mut() {
+            c.stale = Some(CalibrationStale { reason: format!("motor zero of joints {joints:?}; the camera calibration was measured with the old zero"), at: at.clone() });
+        }
+        (file, removed, inner.config.arm_model.correction().is_some())
+    };
+    let mut error = None;
+    if let Some(c) = &file {
+        if let Err(e) = put_file(deps.path.clone(), Some(serde_json::to_string_pretty(c).unwrap_or_default())).await {
+            error = Some(format!("calibration file {}: {e}", deps.path.display()));
+        }
+    }
+    let mut inner = sup.inner().write().await;
+    if let Err(e) = inner.set_kinematics_correction(None) { error.get_or_insert(format!("kinematic correction not removed: {e}")); }
+    let camera_stale = file.is_some();
+    if file.is_some() { inner.calibration = file; }
+    if let Some(e) = &error { tracing::error!("motor zero invalidation: {e}"); }
+    tracing::warn!("Motor zero of joints {joints:?}: kinematic correction {}, camera calibration {}",
+        if removed.is_some() || had_live { "removed" } else { "none" }, if camera_stale { "marked stale" } else { "none" });
+    json!({"kinematics_removed": removed.is_some() || had_live, "camera_stale": camera_stale,
+        "removed_kinematics": removed, "at": at, "error": error})
 }
 
 /// What the transaction writes and how far it got (for the revert).
@@ -837,6 +888,7 @@ pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
         "path": deps.path.display().to_string(), "backup_dir": deps.backup_dir.display().to_string(),
         "calibration": inner.calibration, "camera_mount": mount_summary(&inner.config.camera_mount),
         "kinematics_correction": inner.config.arm_model.correction(),
+        "stale": inner.calibration.as_ref().and_then(|c| c.stale.as_ref()),
         "calibration_tools": inner.calibration_tools(),
         "grasp": inner.grasp_setup().map(|s| grasp_fields(&s)), "backups": list_backups(deps)})
 }

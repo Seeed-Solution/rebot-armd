@@ -264,6 +264,9 @@ pub struct SupervisorInner {
     /// A calibration apply / restore transaction is running: motion commands are refused
     /// (MOTION_BUSY) and other configuration writes too (CONFIG_BUSY).
     pub calibration_busy: bool,
+    /// A motor zero runs (`crate::motor_zero`, with `calibration_busy`): torque on and
+    /// clear_fault are refused too.
+    pub motor_zero_busy: bool,
     /// `calibration.json` was rejected at startup (message; cleared by a successful apply / restore).
     pub calibration_load_error: Option<String>,
     /// The profile's camera mount and grasp setup before any file was loaded (restore of a
@@ -452,6 +455,7 @@ impl SupervisorInner {
             workspace_revision: 0,
             calibration: None,
             calibration_busy: false,
+            motor_zero_busy: false,
             calibration_load_error: None,
             profile_camera_mount,
             profile_grasp,

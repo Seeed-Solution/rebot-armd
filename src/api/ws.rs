@@ -314,12 +314,17 @@ fn state_command(inner: &mut SupervisorInner, path: &str, body: &Value, setup_pa
 }
 
 /// A calibration command checked under the lock.
-enum CalibJob { Apply(Box<crate::calibration::ApplyRequest>), Restore(Value) }
+enum CalibJob { Apply(Box<crate::calibration::ApplyRequest>), Restore(Value), MotorZero(crate::motor_zero::MotorZeroRequest) }
+
+/// What a checked calibration command does: a task (job, busy flag set) or a reply under the
+/// lock (motor zero dry run).
+enum CalibStart { Job(CalibJob, bool), Reply(Value) }
 
 /// Paths refused while a calibration transaction runs: motion (MOTION_BUSY) and configuration
 /// writes (CONFIG_BUSY). Stop, torque, clear_fault and everything else go through.
 fn calibration_busy_code(inner: &SupervisorInner, path: &str) -> Option<&'static str> {
     if !inner.calibration_busy || path == "/api/v1/motion/stop" { return None; }
+    if inner.motor_zero_busy && matches!(path, "/api/v1/torque" | "/api/v1/arm" | "/api/v1/safety/clear_fault") { return Some("MOTION_BUSY"); }
     if path.starts_with("/api/v1/action/") || path.starts_with("/api/v1/motion/") || path.starts_with("/api/v1/mode/") { return Some("MOTION_BUSY"); }
     if path.starts_with("/api/v1/calibration/") || matches!(path, "/api/v1/grasp/setup" | "/api/v1/poses/save" | "/api/v1/poses/delete"
         | "/api/v1/safety/collision" | "/api/v1/workspace/keepout" | "/api/v1/gripper/calibration") { return Some("CONFIG_BUSY"); }
@@ -328,7 +333,14 @@ fn calibration_busy_code(inner: &SupervisorInner, path: &str) -> Option<&'static
 
 /// Under the lock: parse and check a calibration command; a real apply / restore marks the
 /// transaction running (`calibration_busy`, cleared by its task). Returns (job, busy set).
-fn calibration_job(inner: &mut SupervisorInner, path: &str, body: &Value) -> Result<(CalibJob, bool), crate::calibration::CalibError> {
+fn calibration_job(inner: &mut SupervisorInner, path: &str, body: &Value) -> Result<CalibStart, crate::calibration::CalibError> {
+    if path == crate::motor_zero::PATH {
+        let (req, dry) = crate::motor_zero::check(inner, body)?;
+        if let Some(reply) = dry { return Ok(CalibStart::Reply(reply)); }
+        inner.calibration_busy = true;
+        inner.motor_zero_busy = true;
+        return Ok(CalibStart::Job(CalibJob::MotorZero(req), true));
+    }
     crate::calibration::begin_checks(inner)?;
     let job = if path == "/api/v1/calibration/apply" {
         let req = crate::calibration::parse_apply(body)?;
@@ -340,7 +352,17 @@ fn calibration_job(inner: &mut SupervisorInner, path: &str, body: &Value) -> Res
     };
     let busy = !matches!(&job, CalibJob::Apply(r) if r.dry_run);
     if busy { inner.calibration_busy = true; }
-    Ok((job, busy))
+    Ok(CalibStart::Job(job, busy))
+}
+
+/// `command_ack` carrying the fields of `reply`.
+fn fields_ack(request_id: &Value, reply: Value) -> Value {
+    let mut ack = json!({"type":"command_ack", "request_id":request_id, "status":"accepted"});
+    match reply {
+        Value::Object(fields) => for (k, v) in fields { ack[k] = v; },
+        other => ack["result"] = other,
+    }
+    ack
 }
 
 fn calibration_reject(request_id: &Value, e: &crate::calibration::CalibError) -> Value {
@@ -605,10 +627,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     let path = value.get("path").and_then(Value::as_str).unwrap_or("");
                                     if let Some(code) = calibration_busy_code(&inner, path) {
                                         response = Some(command_reject(&inner, &value["request_id"],
-                                            ApiError(StatusCode::CONFLICT, "a camera calibration apply or restore is running".into(), code.into())));
-                                    } else if path == "/api/v1/calibration/apply" || path == "/api/v1/calibration/restore" {
+                                            ApiError(StatusCode::CONFLICT, "a calibration apply, restore or motor zero is running".into(), code.into())));
+                                    } else if path == "/api/v1/calibration/apply" || path == "/api/v1/calibration/restore" || path == crate::motor_zero::PATH {
                                         response = match calibration_job(&mut inner, path, &value["body"]) {
-                                            Ok((job, busy)) => { pending_calibration = Some((value["request_id"].clone(), job, local_generation, epoch, busy)); None }
+                                            Ok(CalibStart::Job(job, busy)) => { pending_calibration = Some((value["request_id"].clone(), job, local_generation, epoch, busy)); None }
+                                            Ok(CalibStart::Reply(reply)) => Some(fields_ack(&value["request_id"], reply)),
                                             Err(e) => Some(calibration_reject(&value["request_id"], &e)),
                                         };
                                     } else if path.starts_with("/api/v1/action/") {
@@ -768,6 +791,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             match job {
                                 CalibJob::Apply(req) => crate::calibration::apply(&job_sup, &calib, *req, &check).await,
                                 CalibJob::Restore(body) => crate::calibration::restore(&job_sup, &calib, &body, &check).await,
+                                CalibJob::MotorZero(req) => crate::motor_zero::run(&job_sup, &calib, req, &check).await,
                             }
                         });
                         let result = job_task.await.unwrap_or_else(|e| {
@@ -776,12 +800,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         });
                         if let Some(g) = guard { g.release().await; }
                         let reply = match result {
-                            Ok(Value::Object(fields)) => {
-                                let mut ack = json!({"type":"command_ack", "request_id":request_id, "status":"accepted"});
-                                for (k, v) in fields { ack[k] = v; }
-                                ack
-                            }
-                            Ok(other) => json!({"type":"command_ack", "request_id":request_id, "status":"accepted", "result":other}),
+                            Ok(v) => fields_ack(&request_id, v),
                             Err(e) => calibration_reject(&request_id, &e),
                         };
                         let _ = tx.send(reply).await;

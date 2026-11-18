@@ -13,6 +13,7 @@ pub mod gravity;
 #[cfg(not(target_arch = "wasm32"))] pub mod keepout;
 pub mod kinematics;
 #[cfg(not(target_arch = "wasm32"))] pub mod macro_action;
+#[cfg(not(target_arch = "wasm32"))] pub mod motor_zero;
 pub mod mjcf_compose;
 pub mod model;
 pub mod motion;
