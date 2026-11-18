@@ -893,3 +893,276 @@ export async function runPoses(st, io, { runAll = true } = {}) {
     throw err;
   }
 }
+
+// ---------------------------------------------------------------- kinematic fine calibration
+/* Fine calibration ("精校"): the camera views of two board placements A and B also identify the arm's geometry.
+   Correction model (armd schema kinematics_correction, index.html CALM.fk, src/kinematics.rs): per joint i
+   (0..5), walking the URDF chain, M = M F_i [Rx(tilt_x) Ry(tilt_y), origin_m] Rot(axis_i, q_i (1 + scale) +
+   offset_rad). Parameter vector k (42): per joint 7 i + [offset, scale, tilt_x, tilt_y, dx, dy, dz].
+   Level L3 identifies offset, scale, tilt x / y and origin dx / dy / dz of joints J2..J5 (28 parameters); J1's
+   offset is absorbed by the board pose, J6's by the camera mount, both stay zero. Unknowns of one fit: X =
+   T_end_cam (6), one board pose per placement (6 each), the kinematic parameters; intrinsics fixed.
+   Validation: fit on A, predict B (kinematics and X frozen, only B's board pose refit) and B -> A; the held-out
+   reprojection error in mm (px * depth / fx) must stay <= 3 mm both ways, the mean of both must improve on the
+   uncorrected model (L0: X and boards only) by >= 30 %, and every parameter of the final fit on A + B must be inside
+   the bounds armd accepts. The final fit is what is applied. Ported from real2/kincal2.mjs. */
+export const KIN_BOUNDS = Object.freeze({ offset_rad: 10 / D, scale: 0.08, tilt_rad: 3 / D, origin_m: 0.03 });
+export const KIN_GATES = Object.freeze({ heldOutMm: 3.0, improvement: 0.30, zeroWarnDeg: 5, minViewsPerPlacement: 10, pnpMaxPx: 2 });
+export const KIN_PARAM_NAMES = Object.freeze(['offset', 'scale', 'tilt_x', 'tilt_y', 'dx', 'dy', 'dz']);
+export const KIN_L3 = Object.freeze([...[1, 2, 3, 4].map((j) => 7 * j), ...[1, 2, 3, 4].flatMap((j) => [1, 2, 3, 4, 5, 6].map((p) => 7 * j + p))]);
+const NK = 42;
+// flat 3x3 helpers (row-major)
+const f3 = (R) => [R[0][0], R[0][1], R[0][2], R[1][0], R[1][1], R[1][2], R[2][0], R[2][1], R[2][2]];
+const mf = (A, B) => [
+  A[0] * B[0] + A[1] * B[3] + A[2] * B[6], A[0] * B[1] + A[1] * B[4] + A[2] * B[7], A[0] * B[2] + A[1] * B[5] + A[2] * B[8],
+  A[3] * B[0] + A[4] * B[3] + A[5] * B[6], A[3] * B[1] + A[4] * B[4] + A[5] * B[7], A[3] * B[2] + A[4] * B[5] + A[5] * B[8],
+  A[6] * B[0] + A[7] * B[3] + A[8] * B[6], A[6] * B[1] + A[7] * B[4] + A[8] * B[7], A[6] * B[2] + A[7] * B[5] + A[8] * B[8]];
+const mvf = (R, v) => [R[0] * v[0] + R[1] * v[1] + R[2] * v[2], R[3] * v[0] + R[4] * v[1] + R[5] * v[2], R[6] * v[0] + R[7] * v[1] + R[8] * v[2]];
+const mtvf = (R, v) => [R[0] * v[0] + R[3] * v[1] + R[6] * v[2], R[1] * v[0] + R[4] * v[1] + R[7] * v[2], R[2] * v[0] + R[5] * v[1] + R[8] * v[2]];
+const axisF = (k, a) => { const c = Math.cos(a), s = Math.sin(a), C = 1 - c, [x, y, z] = k; return [c + x * x * C, x * y * C - z * s, x * z * C + y * s, y * x * C + z * s, c + y * y * C, y * z * C - x * s, z * x * C - y * s, z * y * C + x * s, c + z * z * C]; };
+// chain: CALM.CHAIN ([[F (4x4), axis or null]]) -> flat links
+export const kinChain = (chain) => chain.map(([F, axis]) => ({ R: f3(rotOf(F)), p: posOf(F), axis }));
+// T_base_end of model angles q under parameter vector k (42) -> { R (flat), p }
+export function kinFk(ch, q, k) {
+  let R = [1, 0, 0, 0, 1, 0, 0, 0, 1], p = [0, 0, 0], i = 0;
+  for (const L of ch) {
+    const d = mvf(R, L.p);
+    p = [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
+    R = mf(R, L.R);
+    if (!L.axis) continue;
+    const b = 7 * i;
+    if (k[b + 2] || k[b + 3] || k[b + 4] || k[b + 5] || k[b + 6]) {
+      const e = mvf(R, [k[b + 4], k[b + 5], k[b + 6]]);
+      p = [p[0] + e[0], p[1] + e[1], p[2] + e[2]];
+      R = mf(R, mf(axisF([1, 0, 0], k[b + 2]), axisF([0, 1, 0], k[b + 3])));
+    }
+    R = mf(R, axisF(L.axis, (Number(q[i]) || 0) * (1 + k[b + 1]) + k[b]));
+    i++;
+  }
+  return { R, p };
+}
+// parameter vector <-> schema joints [{ offset_rad, scale, tilt_rad: [x, y], origin_m: [dx, dy, dz] }] x 6
+export const kinJoints = (k) => [0, 1, 2, 3, 4, 5].map((j) => ({ offset_rad: k[7 * j] || 0, scale: k[7 * j + 1] || 0, tilt_rad: [k[7 * j + 2] || 0, k[7 * j + 3] || 0], origin_m: [k[7 * j + 4] || 0, k[7 * j + 5] || 0, k[7 * j + 6] || 0] }));
+export function kinVector(joints) {
+  const k = new Array(NK).fill(0);
+  (joints || []).slice(0, 6).forEach((j, i) => {
+    if (!j) return;
+    k[7 * i] = Number(j.offset_rad) || 0; k[7 * i + 1] = Number(j.scale) || 0;
+    (j.tilt_rad || []).slice(0, 2).forEach((v, a) => { k[7 * i + 2 + a] = Number(v) || 0; });
+    (j.origin_m || []).slice(0, 3).forEach((v, a) => { k[7 * i + 4 + a] = Number(v) || 0; });
+  });
+  return k;
+}
+// parameters outside KIN_BOUNDS: [{ joint (1..6), param, value, limit }]
+export function kinOutOfBounds(k, bounds = KIN_BOUNDS) {
+  const lim = [bounds.offset_rad, bounds.scale, bounds.tilt_rad, bounds.tilt_rad, bounds.origin_m, bounds.origin_m, bounds.origin_m], out = [];
+  for (let i = 0; i < NK; i++) if (!(Math.abs(k[i]) <= lim[i % 7] + 1e-12)) out.push({ joint: Math.floor(i / 7) + 1, param: KIN_PARAM_NAMES[i % 7], value: k[i], limit: lim[i % 7] });
+  return out;
+}
+
+/* One residual problem: obs [{ obj, img, q, ds }], nds board poses. x = [X rotation vector (relative to RX0), X
+   position (both left out when Xfix is given), per board: rotation vector (relative to RB0[d]), position,
+   kinematic parameters kIdx of kFull]. col(c): what column c moves ('x', 'b' with its placement, 'k'). */
+function kinProblem(obs, nds, ch, K, RX0, RB0, kFull, kIdx, Xfix = null) {
+  const nx = Xfix ? 0 : 6, np = nx + 6 * nds + kIdx.length, off = [];
+  let m = 0;
+  for (const o of obs) { off.push(m); m += 2 * o.obj.length; }
+  const kOf = (x) => { const k = kFull.slice(); kIdx.forEach((ki, i) => { k[ki] = x[nx + 6 * nds + i]; }); return k; };
+  const fks = (k) => obs.map((o) => kinFk(ch, o.q, k));
+  const col = (c) => (c < nx ? { kind: 'x' } : c < nx + 6 * nds ? { kind: 'b', d: Math.floor((c - nx) / 6) } : { kind: 'k' });
+  const RX0f = f3(RX0), RB0f = RB0.map(f3);
+  const Xof = (x) => (Xfix ? { R: f3(rotOf(Xfix)), t: posOf(Xfix) } : { R: mf(RX0f, f3(rodrigues([x[0], x[1], x[2]]))), t: [x[3], x[4], x[5]] });
+  // residuals into out (rows of the views of placement `only`, or all when only < 0)
+  function fill(out, x, F, only = -1) {
+    const { R: RX, t: tX } = Xof(x), B = [];
+    for (let d = 0; d < nds; d++) { const b = nx + 6 * d; B.push({ R: mf(RB0f[d], f3(rodrigues([x[b], x[b + 1], x[b + 2]]))), t: [x[b + 3], x[b + 4], x[b + 5]] }); }
+    for (let n = 0; n < obs.length; n++) {
+      const o = obs[n];
+      if (only >= 0 && o.ds !== only) continue;
+      const E = F[n], Rc = mf(E.R, RX), e = mvf(E.R, tX), pc = [E.p[0] + e[0], E.p[1] + e[1], E.p[2] + e[2]];
+      const Bd = B[o.ds];
+      // T_cam_board = (T_base_end X)^-1 B
+      const Rt = [Rc[0], Rc[3], Rc[6], Rc[1], Rc[4], Rc[7], Rc[2], Rc[5], Rc[8]];
+      const R = mf(Rt, Bd.R), t = mtvf(Rc, [Bd.t[0] - pc[0], Bd.t[1] - pc[1], Bd.t[2] - pc[2]]);
+      let w = off[n];
+      for (let j = 0; j < o.obj.length; j++) {
+        const P = o.obj[j], I = o.img[j];
+        const xc = R[0] * P[0] + R[1] * P[1] + R[2] * P[2] + t[0], yc = R[3] * P[0] + R[4] * P[1] + R[5] * P[2] + t[1], zc = R[6] * P[0] + R[7] * P[1] + R[8] * P[2] + t[2];
+        const u = xc / zc, v = yc / zc, r2 = u * u + v * v, dd = 1 + (K.k1 || 0) * r2 + (K.k2 || 0) * r2 * r2;
+        out[w++] = K.fx * u * dd + K.cx - I[0]; out[w++] = K.fy * v * dd + K.cy - I[1];
+      }
+    }
+    return out;
+  }
+  const unpack = (x) => ({
+    X: Xfix || make(mm(RX0, rodrigues([x[0], x[1], x[2]])), [x[3], x[4], x[5]]),
+    B: RB0.map((R, d) => { const b = nx + 6 * d; return make(mm(R, rodrigues([x[b], x[b + 1], x[b + 2]])), [x[b + 3], x[b + 4], x[b + 5]]); }),
+    k: kOf(x),
+  });
+  return { np, m, nds, kIdx, kOf, fks, fill, unpack, col };
+}
+// Levenberg-Marquardt with a central-difference Jacobian (step 1e-6); FK is reused for the X / board columns and
+// a board column only touches its own placement's rows. Stops when a step improves the cost by < 1e-9 (relative).
+function kinLM(P, x0, iters = 60) {
+  const h = 1e-6, np = P.np, m = P.m;
+  let x = x0.slice(), F = P.fks(P.kOf(x)), r = P.fill(new Float64Array(m), x, F);
+  let cost = r.reduce((s, e) => s + e * e, 0), lam = 1e-3, it = 0;
+  for (; it < iters; it++) {
+    const J = [];
+    for (let c = 0; c < np; c++) {
+      const xp = x.slice(), xm = x.slice(); xp[c] += h; xm[c] -= h;
+      const cc = P.col(c);
+      let rp, rm;
+      if (cc.kind === 'k') { rp = P.fill(new Float64Array(m), xp, P.fks(P.kOf(xp))); rm = P.fill(new Float64Array(m), xm, P.fks(P.kOf(xm))); }
+      else { const d = cc.kind === 'b' ? cc.d : -1; rp = P.fill(new Float64Array(m), xp, F, d); rm = P.fill(new Float64Array(m), xm, F, d); }
+      for (let i = 0; i < m; i++) rp[i] = (rp[i] - rm[i]) / (2 * h);
+      J.push(rp);
+    }
+    const N = new Float64Array(np * np), g = new Float64Array(np);
+    for (let a = 0; a < np; a++) {
+      const Ja = J[a];
+      let gs = 0; for (let i = 0; i < m; i++) gs += Ja[i] * r[i]; g[a] = gs;
+      for (let b = a; b < np; b++) { const Jb = J[b]; let v = 0; for (let i = 0; i < m; i++) v += Ja[i] * Jb[i]; N[a * np + b] = v; N[b * np + a] = v; }
+    }
+    let improved = false;
+    for (let tries = 0; tries < 10 && !improved; tries++) {
+      const A = N.slice();
+      for (let i = 0; i < np; i++) A[i * np + i] += lam * (N[i * np + i] + 1e-9);
+      const L = chol(A, np);
+      if (!L) { lam *= 10; continue; }
+      const dx = cholSolve(L, np, g.map((v) => -v)), x2 = x.map((v, k) => v + dx[k]);
+      const F2 = P.kIdx.length ? P.fks(P.kOf(x2)) : F, r2 = P.fill(new Float64Array(m), x2, F2), c2 = r2.reduce((s, e) => s + e * e, 0);
+      if (Number.isFinite(c2) && c2 < cost) {
+        const rel = (cost - c2) / cost;
+        x = x2; F = F2; r = r2; cost = c2; lam = Math.max(lam / 10, 1e-12);
+        improved = rel > 1e-9;
+        if (!improved) tries = 10;
+      } else lam *= 10;
+    }
+    if (!improved) break;
+  }
+  return { x, r, cost, iterations: it };
+}
+// metrics of a residual vector: RMS px, RMS mm at each view's depth (px * depth / fx)
+function kinErr(obs, r, K) {
+  let o = 0, s = 0, sm = 0, n = 0;
+  for (const v of obs) { const k = 2 * v.obj.length; for (let i = 0; i < k; i++) { const e = r[o + i]; s += e * e; sm += (e * v.depth / K.fx * 1000) ** 2; n++; } o += k; }
+  return { px: Math.sqrt(s / Math.max(1, n)), mm: Math.sqrt(sm / Math.max(1, n)) };
+}
+// mean board pose per placement through FK, X and the per-view PnP pose
+function kinBoards(obs, nds, ch, k, X) {
+  const RX = f3(rotOf(X)), tX = posOf(X);
+  return [...Array(nds)].map((_, d) => {
+    const S = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], p = [0, 0, 0];
+    let n = 0;
+    for (const o of obs) {
+      if (o.ds !== d) continue;
+      const E = kinFk(ch, o.q, k), Rc = mf(E.R, RX), e = mvf(E.R, tX), pc = [E.p[0] + e[0], E.p[1] + e[1], E.p[2] + e[2]];
+      const Rb = mf(Rc, f3(rotOf(o.M))), tb = mvf(Rc, posOf(o.M));
+      for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) S[i][j] += Rb[3 * i + j]; p[i] += pc[i] + tb[i]; }
+      n++;
+    }
+    return make(nearestRot(S), p.map((v) => v / Math.max(1, n)));
+  });
+}
+// fit X, boards and kinematic parameters kIdx on obs (ds 0..nds-1) from X0 / boards B0 / parameters k0
+function kinFit(obs, nds, ch, K, X0, B0, k0, kIdx, iters) {
+  const P = kinProblem(obs, nds, ch, K, rotOf(X0), B0.map(rotOf), k0, kIdx);
+  const x0 = [0, 0, 0, ...posOf(X0), ...B0.flatMap((B) => [0, 0, 0, ...posOf(B)]), ...kIdx.map((ki) => k0[ki])];
+  const f = kinLM(P, x0, iters), u = P.unpack(f.x);
+  return { ...u, r: f.r, iterations: f.iterations, err: kinErr(obs, f.r, K) };
+}
+// held out: kinematics k and X frozen, only the board pose of `obs` (one placement) refit
+function kinHeldOut(obs, ch, K, X, k) {
+  const o1 = obs.map((o) => ({ ...o, ds: 0 })), B0 = kinBoards(o1, 1, ch, k, X);
+  const P = kinProblem(o1, 1, ch, K, rotOf(X), B0.map(rotOf), k, [], X);
+  const f = kinLM(P, [0, 0, 0, ...posOf(B0[0])], 60);
+  return { ...kinErr(o1, f.r, K), views: obs.length };
+}
+
+/* Kinematic fine calibration from board views of two placements.
+   views: [{ markers, q (model J1..J6, rad), ds (0 = placement A, 1 = B) }]; board (makeBoard); K: intrinsics
+   (fixed, from the image-only solve); chain: CALM.CHAIN; X0: T_end_cam start value (nominal or measured mount).
+   Returns { ok, gates, joints (schema, J1..J6), k, X, boards: [T_base_board A, B], heldOut: { ab, ba, ab0, ba0 },
+   train: { px, mm }, final0 (uncorrected fit on A + B), views: { used, A, B, dropped }, warnings, ms }. */
+export function solveKinematics({ views, board, K, chain, X0, order = null, kIdx = KIN_L3, gates = KIN_GATES, bounds = KIN_BOUNDS, iters = 80, minMarkers = GATES.minMarkers, onProgress = null }) {
+  const t0 = Date.now(), ch = kinChain(chain), say = (s) => { if (onProgress) onProgress(s); };
+  const ord = order || detectCornerOrder(views, board).order;
+  const obs = [], dropped = [];
+  views.forEach((v, i) => {
+    const bm = boardMarkers(v, board);
+    if (bm.length < minMarkers || !Array.isArray(v.q) || !(v.ds === 0 || v.ds === 1)) { dropped.push({ i, why: 'markers' }); return; }
+    const { obj, img } = correspondences({ markers: bm }, board, ord);
+    const p = solvePnP(obj, img, K);
+    if (!p || !(p.rms <= gates.pnpMaxPx)) { dropped.push({ i, why: 'pnp', rms: p ? p.rms : null }); return; }
+    obs.push({ obj, img, q: v.q.slice(0, 6).map(Number), ds: v.ds, M: make(p.R, p.t), depth: norm3(p.t), i });
+  });
+  const A = obs.filter((o) => o.ds === 0), B = obs.filter((o) => o.ds === 1).map((o) => ({ ...o, ds: 0 }));
+  const res = { ok: false, gates: [], views: { used: obs.length, A: A.length, B: B.length, dropped }, warnings: [] };
+  const enough = A.length >= gates.minViewsPerPlacement && B.length >= gates.minViewsPerPlacement;
+  res.gates.push(gate('kin_views', enough, Math.min(A.length, B.length), gates.minViewsPerPlacement));
+  if (!enough) { res.ms = Date.now() - t0; return res; }
+  const k0 = new Array(NK).fill(0);
+  // L0 (X, boards) then L3 (+ kinematics) from the L0 result
+  const fitBoth = (o, nds, label) => {
+    say(label + ' L0');
+    const l0 = kinFit(o, nds, ch, K, X0, kinBoards(o, nds, ch, k0, X0), k0, [], 60);
+    say(label + ' L3');
+    const l3 = kinFit(o, nds, ch, K, l0.X, l0.B, k0, kIdx, iters);
+    return { l0, l3 };
+  };
+  const fa = fitBoth(A, 1, 'A'), fb = fitBoth(B, 1, 'B');
+  say('held-out');
+  const ab0 = kinHeldOut(B, ch, K, fa.l0.X, fa.l0.k), ab = kinHeldOut(B, ch, K, fa.l3.X, fa.l3.k);
+  const ba0 = kinHeldOut(A, ch, K, fb.l0.X, fb.l0.k), ba = kinHeldOut(A, ch, K, fb.l3.X, fb.l3.k);
+  const fin = fitBoth(obs, 2, 'A+B');
+  const k = fin.l3.k, oob = kinOutOfBounds(k, bounds);
+  // improvement of the mean held-out error of both directions over the uncorrected model (per direction in
+  // heldOut.improve). The uncorrected model is the URDF with armd's model_joint_map, so a zero offset already set
+  // there (the B601-DM J5 -4 deg) is part of the baseline.
+  const imp = (a, b) => (a > 0 ? 1 - b / a : 0), impAll = imp(ab0.mm + ba0.mm, ab.mm + ba.mm);
+  res.gates.push(
+    gate('kin_heldout_ab', ab.mm <= gates.heldOutMm, ab.mm, gates.heldOutMm, 'mm'),
+    gate('kin_heldout_ba', ba.mm <= gates.heldOutMm, ba.mm, gates.heldOutMm, 'mm'),
+    gate('kin_improve', impAll >= gates.improvement, impAll, gates.improvement, 'frac'),
+    gate('kin_bounds', oob.length === 0, oob.length, 0, 'count'),
+  );
+  for (let j = 0; j < 6; j++) if (Math.abs(k[7 * j]) * D > gates.zeroWarnDeg) res.warnings.push({ key: 'zero', joint: j + 1, deg: k[7 * j] * D });
+  Object.assign(res, {
+    ok: res.gates.every((g) => g.ok), k, joints: kinJoints(k), outOfBounds: oob, X: fin.l3.X, boards: fin.l3.B,
+    heldOut: { ab, ba, ab0, ba0, improve: { ab: imp(ab0.mm, ab.mm), ba: imp(ba0.mm, ba.mm), mean: impAll } }, train: fin.l3.err, final0: { X: fin.l0.X, boards: fin.l0.B, err: fin.l0.err },
+    fits: { A: { l0: fa.l0.err, l3: fa.l3.err, k: fa.l3.k }, B: { l0: fb.l0.err, l3: fb.l3.err, k: fb.l3.k } },
+    iterations: fin.l3.iterations, order: ord, ms: Date.now() - t0,
+  });
+  return res;
+}
+
+/* Fine calibration solve of the wizard (runs in a Web Worker in the cockpit). views: [{ markers, q, ds }] of both
+   placements; markerSide (m); chain (CALM.CHAIN); X0 (T_end_cam start value); thickness (m). Intrinsics from the
+   image-only solve over A + B (calibrateIntrinsics, its gates apply), then solveKinematics with them; X and the
+   table height (mean board z of A and B - thickness) from the final kinematic fit.
+   Returns { ok, gates, intr, kin, final: { K, X, boards }, table, apply (body for /api/v1/calibration/apply) }. */
+export function solveFine({ views, markerSide = BOARD_DEFAULT.markerSide, chain, X0, thickness = 0.0005, gates = GATES, kinGates = KIN_GATES, size = IMAGE, init = NOMINAL, solvedAt = null, onProgress = null }) {
+  const board = makeBoard({ markerSide });
+  if (onProgress) onProgress('intrinsics');
+  const intr = calibrateIntrinsics(views, board, { size, gates, init });
+  const res = { ok: false, intr, gates: [...intr.gates] };
+  if (!intr.K) return res;
+  const kin = solveKinematics({ views, board, K: intr.K, chain, X0, order: intr.order, gates: kinGates, onProgress });
+  res.kin = kin; res.gates.push(...kin.gates);
+  if (!kin.joints) return res;
+  const zA = kin.boards[0][2][3], zB = kin.boards[1][2][3], X = kin.X, K = intr.K;
+  res.final = { K, X, boards: kin.boards };
+  res.table = { board_z_m: [zA, zB], table_z_m: (zA + zB) / 2 - thickness, dz_m: zB - zA };
+  res.ok = res.gates.every((g) => g.ok);
+  const fit = { heldout_mm: [kin.heldOut.ab.mm, kin.heldOut.ba.mm], heldout_uncorrected_mm: [kin.heldOut.ab0.mm, kin.heldOut.ba0.mm], train_mm: kin.train.mm, views: kin.views.used, ...(solvedAt ? { solved_at: solvedAt } : {}) };
+  res.apply = {
+    intrinsics: { fx: K.fx, fy: K.fy, cx: K.cx, cy: K.cy, k1: K.k1, k2: K.k2, p1: 0, p2: 0, k3: 0, width: size.width, height: size.height, marker_size: board.markerSide },
+    camera_mount: { offset_m: posOf(X), q_end_cam: quatOf(rotOf(X)) },
+    table_z_m: res.table.table_z_m,
+    kinematics: { joints: kin.joints, fit },
+    rms: { reproj_px: intr.rms, held_out_px: intr.heldOut.rms, kin_train_px: kin.train.px, kin_train_mm: kin.train.mm, kin_heldout_mm: fit.heldout_mm, views: intr.used.length, sigma: intr.sigma, cond: intr.cond },
+    ...(solvedAt ? { solved_at: solvedAt } : {}),
+  };
+  return res;
+}
