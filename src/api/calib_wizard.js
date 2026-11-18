@@ -472,11 +472,14 @@ function denseLM(res, x0, h, iters = 50) {
    X = T_end_cam (6) and the board pose in base T_base_board (6); the FK poses G are fixed.
    views: [{ obj, img, G }] (board points, pixels, T_base_end). Returns { K, X, Tbb, rmsBefore,
    rmsAfter, perView, iterations } (RMS per corner, px). */
-export function refineJoint(views, K0, X0, Tbb0, { iters = 100 } = {}) {
+export function refineJoint(views, K0, X0, Tbb0, { iters = 100, fixK = false } = {}) {
   const RX0 = rotOf(X0), RB0 = rotOf(Tbb0);
-  const unpack = (x) => ({ K: { fx: x[0], fy: x[1], cx: x[2], cy: x[3], k1: x[4], k2: x[5] },
+  const K0v = [K0.fx, K0.fy, K0.cx, K0.cy, K0.k1 || 0, K0.k2 || 0];
+  // fixK: only X and the board pose move (the intrinsics stay at K0)
+  const full = (x) => (fixK ? [...K0v, ...x] : x);
+  const unpack = (xs) => { const x = full(xs); return { K: { fx: x[0], fy: x[1], cx: x[2], cy: x[3], k1: x[4], k2: x[5] },
     X: make(mm(RX0, rodrigues([x[6], x[7], x[8]])), [x[9], x[10], x[11]]),
-    B: make(mm(RB0, rodrigues([x[12], x[13], x[14]])), [x[15], x[16], x[17]]) });
+    B: make(mm(RB0, rodrigues([x[12], x[13], x[14]])), [x[15], x[16], x[17]]) }; };
   const nPts = views.reduce((s, V) => s + V.obj.length, 0);
   const res = (x) => {
     const { K, X, B } = unpack(x), out = new Float64Array(2 * nPts);
@@ -487,14 +490,15 @@ export function refineJoint(views, K0, X0, Tbb0, { iters = 100 } = {}) {
     }
     return out;
   };
-  const x0 = [K0.fx, K0.fy, K0.cx, K0.cy, K0.k1 || 0, K0.k2 || 0, 0, 0, 0, ...posOf(X0), 0, 0, 0, ...posOf(Tbb0)];
-  const h = [1e-3, 1e-3, 1e-3, 1e-3, 1e-6, 1e-6, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7];
+  const x0a = [...K0v, 0, 0, 0, ...posOf(X0), 0, 0, 0, ...posOf(Tbb0)];
+  const ha = [1e-3, 1e-3, 1e-3, 1e-3, 1e-6, 1e-6, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7, 1e-7];
+  const x0 = fixK ? x0a.slice(6) : x0a, h = fixK ? ha.slice(6) : ha;
   const r0 = res(x0), c0 = r0.reduce((s, e) => s + e * e, 0);
   const lm = denseLM(res, x0, h, iters);
   const { K, X, B } = unpack(lm.x);
   let o = 0;
   const perView = views.map((V) => { let s = 0; for (let j = 0; j < 2 * V.obj.length; j++) s += lm.r[o + j] ** 2; o += 2 * V.obj.length; return Math.sqrt(s / V.obj.length); });
-  return { K, X, Tbb: B, rmsBefore: Math.sqrt(c0 / nPts), rmsAfter: Math.sqrt(lm.cost / nPts), perView, iterations: lm.iterations, nPts };
+  return { K, X, Tbb: B, rmsBefore: Math.sqrt(c0 / nPts), rmsAfter: Math.sqrt(lm.cost / nPts), perView, iterations: lm.iterations, nPts, fixK };
 }
 
 // ---------------------------------------------------------------- intrinsics with gates
@@ -616,14 +620,30 @@ export function solveAll({ views, board, CALM, thickness = 0.0005, gates = GATES
     const p = solvePnP(obj, img, intr.K);
     if (p) { G.push(V.G); M.push(make(p.R, p.t)); vi.push(i); obs.push({ obj, img, G: V.G }); }
   }
-  const he = CALM.solveEyeInHand(G, M);
+  // one outlier pass: a view whose board pose in base is far from the others (arm positioning error
+  // at that pose, e.g. the start view right after torque-on) is left out of the hand-eye once
+  let he = CALM.solveEyeInHand(G, M);
+  res.droppedHandEye = [];
+  if (!he.err && he.X && G.length > 6) {
+    const r = he.residuals, med = [...r].sort((a, b) => a - b)[Math.floor(r.length / 2)], w = r.indexOf(Math.max(...r));
+    if (r[w] > 3 * med && r[w] > gates.handEyeRmsM) {
+      res.droppedHandEye.push({ i: vi[w], m: r[w] });
+      for (const a of [G, M, vi, obs]) a.splice(w, 1);
+      he = CALM.solveEyeInHand(G, M);
+    }
+  }
   res.poseViews = vi;
   if (he.err || !he.X) { const h0 = solveHandEye(CALM, G, M, gates); res.handEye = h0; res.gates.push(...h0.gates); return res; }
   // joint refinement from the separate solve (board pose: CALM's mean T_base_board)
   let K = intr.K, X = he.X, Tbb = he.Y;
   if (joint) {
-    const j = refineJoint(obs, intr.K, he.X, he.Y);
-    res.joint = { rmsBefore: j.rmsBefore, rmsAfter: j.rmsAfter, perView: j.perView, iterations: j.iterations, separate: { K: intr.K, X: he.X, Tbb: he.Y } };
+    // The intrinsics come from the images alone. When the joint LM moves them by more than 3 sigma it
+    // is absorbing the arm's positioning error into the camera model (seen on a real arm: cy 185 -> 62);
+    // then only X and the board pose are refined.
+    let j = refineJoint(obs, intr.K, he.X, he.Y);
+    const sg = intr.sigma || {}, moved = ['fx', 'fy', 'cx', 'cy'].filter((k) => !(Math.abs(j.K[k] - intr.K[k]) <= 3 * Math.max(sg[k] || 0, 1e-3 * Math.abs(intr.K[k]))));
+    if (moved.length) j = { ...refineJoint(obs, intr.K, he.X, he.Y, { fixK: true }), kMoved: moved };
+    res.joint = { rmsBefore: j.rmsBefore, rmsAfter: j.rmsAfter, perView: j.perView, iterations: j.iterations, fixK: !!j.fixK, kMoved: j.kMoved || [], separate: { K: intr.K, X: he.X, Tbb: he.Y } };
     if ([j.K.fx, j.K.fy, j.K.cx, j.K.cy, j.rmsAfter].every(Number.isFinite) && j.rmsAfter <= j.rmsBefore) { K = j.K; X = j.X; Tbb = j.Tbb; }
   }
   res.final = { K, X, Tbb };
