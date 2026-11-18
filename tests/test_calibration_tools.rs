@@ -48,3 +48,27 @@ async fn get_calibration_carries_the_tools() {
     let schema = serde_json::to_value(sup.get_schema().await).unwrap();
     assert_eq!(status["calibration_tools"], schema["capabilities"]["calibration_tools"]);
 }
+
+#[tokio::test]
+async fn motor_zero_support_comes_from_the_driver() {
+    // mock follower (no driver): supported, readings reset in the process
+    let t = tools(ArmConfig::rebot_dm()).await;
+    assert_eq!(t["motor_zero"]["supported"], json!(true), "{t}");
+    assert_eq!(t["motor_zero"]["joints"], json!([1, 2, 3, 4, 5, 6, 7]));
+    assert_eq!(t["motor_zero"]["method"], json!("set_current"));
+    assert_eq!(t["motor_zero"]["requires"], json!(["lease", "torque_off", "no_action", "no_fault"]));
+    assert_eq!(t["motor_zero"]["invalidates"], json!(["kinematics", "camera"]));
+    // Damiao: supported, persistence not verified on hardware
+    let dm = armd::driver::DamiaoArmDriver::new(armd::transport::MockCanTransport::new(), (1..=7).collect());
+    let sup = ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(dm));
+    let t = serde_json::to_value(sup.get_schema().await).unwrap()["capabilities"]["calibration_tools"].clone();
+    assert_eq!(t["motor_zero"]["persist"], json!("motor_flash"), "{t}");
+    assert_eq!(t["motor_zero"]["persist_verified"], json!(false), "{t}");
+    // RobStride: unsupported with the reason
+    let rs = armd::driver::RobStrideArmDriver::new(armd::transport::MockCanTransport::new(), (1..=6).collect());
+    let sup = ArmSupervisor::new(ArmConfig { dof: 6, ..ArmConfig::default() }).with_driver(Box::new(rs));
+    let t = serde_json::to_value(sup.get_schema().await).unwrap()["capabilities"]["calibration_tools"].clone();
+    assert_eq!(t["motor_zero"]["supported"], json!(false), "{t}");
+    assert!(t["motor_zero"]["reason"].as_str().unwrap().contains("RobStride"), "{t}");
+    assert!(t["motor_zero"].get("joints").is_none(), "{t}");
+}

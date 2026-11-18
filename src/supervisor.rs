@@ -549,11 +549,29 @@ impl SupervisorInner {
         }
     }
 
-    /// The driver's motor zero support; the mock follower (no driver) has none yet.
+    /// The driver's motor zero support; the mock follower (no driver) zeroes its readings.
     pub fn motor_zero_support(&self) -> crate::model::MotorZeroSupport {
         match self.driver.as_ref() {
             Some(d) => d.lock().map_or_else(|_| crate::model::MotorZeroSupport::unsupported("driver unavailable"), |drv| drv.motor_zero_support()),
-            None => crate::model::MotorZeroSupport::unsupported("the mock follower has no motor zero"),
+            None => crate::model::MotorZeroSupport::set_current("process", true,
+                vec!["mock follower: the readings of the zeroed joints become 0 (the simulated arm has no encoder offset)".into()]),
+        }
+    }
+
+    /// Make the current position of `joint` (0-based) its zero: the driver's
+    /// [`ArmDriver::set_zero_position`], or for the mock follower the joint's reading (and
+    /// commanded / target value) becomes 0. Needs torque off; the caller checks the rest.
+    pub fn set_motor_zero(&mut self, joint: usize) -> Result<(), String> {
+        if self.is_torqued || self.disable_pending { return Err("torque is on".into()); }
+        if joint >= self.config.dof { return Err(format!("joint {} does not exist", joint + 1)); }
+        match self.driver.as_ref() {
+            Some(d) => d.lock().map_err(|_| "driver unavailable".to_string())?.set_zero_position(joint).map_err(|e| e.to_string()),
+            None => {
+                for v in [&mut self.measured_positions, &mut self.commanded_positions, &mut self.target_positions] {
+                    if let Some(p) = v.get_mut(joint) { *p = 0.0; }
+                }
+                Ok(())
+            }
         }
     }
 

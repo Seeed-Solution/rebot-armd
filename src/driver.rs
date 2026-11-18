@@ -202,7 +202,18 @@ pub trait ArmDriver: Send {
     fn motor_zero_support(&self) -> MotorZeroSupport {
         MotorZeroSupport::unsupported("this driver has no motor zero command")
     }
+
+    /// Make the current position of joint `joint` (0-based) its zero. Never moves the arm and
+    /// never enables torque. Needs torque off; a driver with enable feedback also needs fresh
+    /// feedback that confirms the joint disabled. Called from the motor zero command
+    /// (`/api/v1/calibration/motor_zero`), never from the control tick.
+    fn set_zero_position(&mut self, _joint: usize) -> Result<(), ArmDriverError> {
+        Err(ArmDriverError::Protocol("motor zero is not supported by this driver".into()))
+    }
 }
+
+/// Feedback no older than this confirms a motor disabled for a set-zero command.
+pub const ZERO_FEEDBACK_MAX_AGE: Duration = Duration::from_millis(250);
 
 /// Output mode of one joint on drivers that can switch at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1068,6 +1079,11 @@ impl<T: Transport> FeetechArmDriver<T> {
 }
 
 impl<T: Transport> ArmDriver for FeetechArmDriver<T> {
+    fn motor_zero_support(&self) -> MotorZeroSupport {
+        MotorZeroSupport::unsupported("Feetech: the zero is the profile's feetech.joints calibration (zero_step, \
+            homing_offset_steps), written by the SO-ARM calibration, not a motor command in armd")
+    }
+
     fn position_limits(&self, joint: usize) -> Option<(f32, f32)> {
         self.effective_ranges.get(joint).map(|&(min_s, max_s)| {
             let calib = self.config.joint_calib(joint);
@@ -1807,6 +1823,10 @@ impl<T: Transport> FashionStarArmDriver<T> {
 }
 
 impl<T: Transport> ArmDriver for FashionStarArmDriver<T> {
+    fn motor_zero_support(&self) -> MotorZeroSupport {
+        MotorZeroSupport::unsupported("FashionStar: armd implements no zero command for these servos")
+    }
+
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
 
     fn feedback_ages(&self) -> Vec<Option<Duration>> {
@@ -2430,6 +2450,37 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
 
     fn range_check(&self) -> Option<DriverRangeCheck> { self.range_check.clone() }
 
+    fn motor_zero_support(&self) -> MotorZeroSupport {
+        MotorZeroSupport::set_current("motor_flash", false, vec![
+            "Damiao set-zero frame FF FF FF FF FF FF FF FE on the motor's CAN ID, sent with every motor disabled \
+             and confirmed disabled from fresh feedback, one motor at a time (reBotArm_control_py RebotArm.set_zero)".into(),
+            "Not verified on hardware whether the zero survives a power cycle: the official wiki says the B601-DM is \
+             calibrated once after assembly; motorbridge's Damiao notes say the zero is lost at power-off for the \
+             gripper (multi-turn travel)".into(),
+        ])
+    }
+
+    fn set_zero_position(&mut self, joint: usize) -> Result<(), ArmDriverError> {
+        let n = self.motor_ids.len();
+        if joint >= n { return Err(ArmDriverError::JointCountMismatch { expected: n, actual: joint + 1 }); }
+        let id = self.motor_ids[joint];
+        if self.is_enabled || self.is_enabling {
+            return Err(ArmDriverError::Protocol(format!("joint {} (CAN ID 0x{id:X}): set-zero needs torque off", joint + 1)));
+        }
+        // fresh feedback after the last enable / disable command, reporting state 0 (disabled)
+        let fresh = self.last_feedback_instant[joint].is_some_and(|t| t.elapsed() <= ZERO_FEEDBACK_MAX_AGE
+            && self.last_enable_command.is_none_or(|c| t >= c));
+        if self.awaiting_rx_boundary || !fresh || self.motor_status[joint] != 0 {
+            return Err(ArmDriverError::HardwareFault(format!(
+                "joint {} (CAN ID 0x{id:X}) is not confirmed disabled (state {}, feedback age {:?})",
+                joint + 1, self.motor_status[joint], self.last_feedback_instant[joint].map(|t| t.elapsed()))));
+        }
+        self.transmit_with_retry(&damiao::build_set_zero_frame(id))?;
+        self.can.flush()?;
+        tracing::warn!("Damiao joint {} (CAN ID 0x{id:X}): set-zero sent at reading {:.4} rad", joint + 1, self.cached_states[joint].position);
+        Ok(())
+    }
+
     fn is_feedback_valid(&self) -> bool {
         if self.last_feedback_instant.is_empty() {
             return false;
@@ -2927,6 +2978,13 @@ impl<C: CanTransport> RobStrideArmDriver<C> {
 }
 
 impl<C: CanTransport> ArmDriver for RobStrideArmDriver<C> {
+    fn motor_zero_support(&self) -> MotorZeroSupport {
+        MotorZeroSupport::unsupported("RobStride: src/protocol/robstride.rs has TYPE_SET_ZERO (communication type 6) but no \
+            verified zero sequence: motorbridge, the SDK of the official reBotArm_control_py, lists RobStride zero calibration \
+            as unresolved (device-side zero_sta / mechPos verification can fail), and whether type 6 persists without \
+            type 22 (save parameters) is not checked")
+    }
+
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities { velocity_feedback: true, torque_feedback: true, temperature_feedback: true, torque_feedforward: true, enable_feedback: false, load_feedback: false } }
 
     fn feedback_ages(&self) -> Vec<Option<Duration>> {

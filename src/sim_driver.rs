@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointMode, JointTarget};
+use crate::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointMode, JointTarget, MotorZeroSupport};
 use crate::model::JointState;
 
 /// Default simulator address for `--follower sim` without `--follower-port`.
@@ -129,6 +129,9 @@ pub struct SimArmDriver {
     cached_loads: Vec<f32>,
     cached_torques: Vec<f32>,
     load_only_feedback: bool,
+    /// Simulated encoder zero (raw simulator angle of each joint's zero); None = the
+    /// simulator's own zero. Set by `set_zero_position`, lost when armd restarts.
+    zero_offsets: Option<Vec<f32>>,
 }
 
 impl SimArmDriver {
@@ -157,6 +160,7 @@ impl SimArmDriver {
             cached_loads: vec![0.0; dof],
             cached_torques: vec![0.0; dof],
             load_only_feedback: false,
+            zero_offsets: None,
         })
     }
 
@@ -312,9 +316,10 @@ impl ArmDriver for SimArmDriver {
                     self.cached_loads = state.tau.iter().map(|&t| (t.abs() / 2.94).clamp(0.0, 1.0)).collect();
                 }
             }
+            let off = self.zero_offsets.as_deref();
             for (i, js) in self.cached.iter_mut().enumerate() {
                 *js = JointState {
-                    position: state.q[i],
+                    position: off.map_or(state.q[i], |o| state.q[i] - o[i]),
                     velocity: state.dq[i],
                     torque: if self.load_only_feedback { 0.0 } else { state.tau[i] },
                     temperature: state.temp[i],
@@ -336,10 +341,11 @@ impl ArmDriver for SimArmDriver {
         if targets.len() != self.dof {
             return Err(ArmDriverError::JointCountMismatch { expected: self.dof, actual: targets.len() });
         }
-        let wire = targets.iter().zip(&self.modes).map(|(t, mode)| match mode {
-            JointMode::Position => SimTarget::PosVel { q: t.position, vlim: POS_VEL_VLIM },
+        let off = self.zero_offsets.as_deref();
+        let wire = targets.iter().zip(&self.modes).enumerate().map(|(i, (t, mode))| match mode {
+            JointMode::Position => SimTarget::PosVel { q: off.map_or(t.position, |o| t.position + o[i]), vlim: POS_VEL_VLIM },
             JointMode::Mit => SimTarget::Mit {
-                q: t.position,
+                q: off.map_or(t.position, |o| t.position + o[i]),
                 dq: t.velocity.unwrap_or(0.0),
                 kp: t.kp.unwrap_or(0.0),
                 kd: t.kd.unwrap_or(0.0),
@@ -391,6 +397,25 @@ impl ArmDriver for SimArmDriver {
         }
         self.modes.copy_from_slice(modes);
         self.write_joint_targets(hold)
+    }
+
+    fn motor_zero_support(&self) -> MotorZeroSupport {
+        MotorZeroSupport::set_current("simulator", true, vec!["the new zero is an offset in armd's simulated encoder; it is lost when armd restarts".into()])
+    }
+
+    fn set_zero_position(&mut self, joint: usize) -> Result<(), ArmDriverError> {
+        if joint >= self.dof { return Err(ArmDriverError::JointCountMismatch { expected: self.dof, actual: joint + 1 }); }
+        if self.enable_requested || self.enable_state() != EnableState::Disabled {
+            return Err(ArmDriverError::Protocol(format!("joint {}: set-zero needs torque off, confirmed by the simulator", joint + 1)));
+        }
+        let (Some(state), Some(age)) = self.snapshot() else {
+            return Err(ArmDriverError::HardwareFault("no simulator state".into()));
+        };
+        if age > crate::driver::ZERO_FEEDBACK_MAX_AGE { return Err(ArmDriverError::HardwareFault(format!("simulator state is {age:?} old"))); }
+        let off = self.zero_offsets.get_or_insert_with(|| vec![0.0; self.dof]);
+        off[joint] = state.q[joint];
+        self.cached[joint].position = 0.0;
+        Ok(())
     }
 }
 
@@ -526,6 +551,30 @@ mod tests {
         assert_eq!(drv.max_command_velocity(1), None);
         assert_eq!(drv.max_command_velocity(0), Some(POS_VEL_VLIM));
         assert!(drv.write_joint_targets(&[JointTarget::position(0.0)]).is_err());
+    }
+
+    #[test]
+    fn set_zero_offsets_the_simulated_encoder() {
+        let mut peer = Peer::new();
+        let mut drv = SimArmDriver::connect(&peer.addr(), 3).unwrap();
+        peer.send_state(1, 1, 0, false, 0.3);
+        settle();
+        assert_eq!(drv.read_joint_states().unwrap()[0].position, 0.3);
+        assert!(drv.motor_zero_support().supported);
+        drv.set_zero_position(0).unwrap();
+        // the simulator still reports 0.3 (the arm did not move); armd reads 0
+        peer.send_state(1, 2, 0, false, 0.3);
+        settle();
+        let s = drv.read_joint_states().unwrap();
+        assert!(s[0].position.abs() < 1e-6 && s[1].position == 0.1, "{s:?}");
+        // targets go out in simulator angles
+        drv.write_joint_targets(&[JointTarget::position(0.1), JointTarget::position(0.2), JointTarget::position(0.3)]).unwrap();
+        let cmd = peer.recv_kind("cmd");
+        assert_eq!(cmd.targets.unwrap()[0], SimTarget::PosVel { q: 0.1 + 0.3, vlim: POS_VEL_VLIM });
+        assert!(drv.set_zero_position(3).is_err());
+        // refused while torque is requested on
+        drv.set_torque_flag(true);
+        assert!(drv.set_zero_position(1).is_err());
     }
 
     #[test]
