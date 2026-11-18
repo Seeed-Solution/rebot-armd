@@ -311,6 +311,8 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .cwiz-steps li { flex: 1 1 0; text-align: center; padding: 5px 2px; border-radius: var(--sc-radius-base); background: var(--sc-color-bg-sunken); color: var(--sc-color-text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cwiz-steps li.on { background: var(--sc-color-primary-soft); color: var(--sc-color-text); font-weight: 600; outline: 1px solid var(--sc-color-primary); }
 .cwiz-steps li.done { color: var(--sc-status-normal-fg); background: var(--sc-status-normal-bg); }
+.cwiz-steps li.nav { cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.cwiz-steps li.nav:hover, .cwiz-steps li.nav:focus-visible { outline: 1px solid var(--sc-status-normal-fg); }
 .cwiz-body { display: grid; align-content: start; gap: 12px; font-size: 13px; line-height: 1.55; flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .cwiz-body p { color: var(--sc-color-text-secondary); }
 .cwiz-board { border: 1px solid var(--sc-color-border); border-radius: var(--sc-radius-md); background: #fff; padding: 6px; }
@@ -2319,7 +2321,7 @@ Object.assign(I18N.zh, {
   'cw.dof': '标定向导目前只支持 6 轴 B601 机械臂。',
   'cw.board.hint': '1. 打印标定板，打印比例 100%（不缩放）。2. 用尺子检查刻度尺是否为 100 mm，再量一个黑色方块的边长。3. 把标定板平放在桌面上，箭头指向远离机械臂的方向，不要弯折。',
   'cw.board.print': '打印标定板', 'cw.board.side': '实测标记边长（mm）', 'cw.board.thick': '标定板厚度（mm）', 'cw.board.bad': '标记边长须在 20–100 mm，厚度在 0–10 mm',
-  'cw.next': '下一步', 'cw.back': '上一步',
+  'cw.next': '下一步', 'cw.back': '上一步', 'cw.restart': '重新采集', 'cw.restart.confirm': '再点一次确认', 'cw.restart.warn': '回到「{s}」会清除已采集的 {n} 个视角和求解结果。再点一次确认。',
   'cw.place.hint': '用摇杆把相机移到标定板上方约 30 cm，画面里至少能看到 6 个完整标记。然后点「采集起始视图」：向导用这一帧估计标定板位置，并生成后续位姿。',
   'cw.place.live': '画面中的标定板标记：{n} 个', 'cw.place.cap': '采集起始视图', 'cw.place.few': '只识别到 {n} 个标定板标记（至少 {min} 个），请调整位置',
   'cw.place.nogen': '从当前位置生成不出可达的位姿（{why}），请换一个起始位置', 'cw.place.ok': '已生成 {n} 个位姿',
@@ -2351,7 +2353,7 @@ Object.assign(I18N.en, {
   'cw.dof': 'The wizard supports the 6-axis B601 arm only.',
   'cw.board.hint': '1. Print the board at 100 % (no page scaling). 2. Check that the ruler measures 100 mm, then measure the side of one black square. 3. Lay the board flat on the table, arrow pointing away from the arm, without bends.',
   'cw.board.print': 'Print board', 'cw.board.side': 'Measured marker side (mm)', 'cw.board.thick': 'Board thickness (mm)', 'cw.board.bad': 'Marker side must be 20–100 mm, thickness 0–10 mm',
-  'cw.next': 'Next', 'cw.back': 'Back',
+  'cw.next': 'Next', 'cw.back': 'Back', 'cw.restart': 'Start over', 'cw.restart.confirm': 'Tap again to confirm', 'cw.restart.warn': 'Going back to "{s}" discards the {n} captured views and the solve. Tap again to confirm.',
   'cw.place.hint': 'Jog the camera to about 30 cm above the board so that at least 6 whole markers are in view, then tap "Capture start view": the wizard estimates the board position from this frame and generates the poses.',
   'cw.place.live': 'Board markers in view: {n}', 'cw.place.cap': 'Capture start view', 'cw.place.few': 'Only {n} board markers detected (need {min}); adjust the view',
   'cw.place.nogen': 'No reachable poses from here ({why}); start from another pose', 'cw.place.ok': '{n} poses generated',
@@ -4607,7 +4609,7 @@ const CW_STEPS = ['board', 'place', 'capture', 'solve', 'review', 'applied'];
 const CW_SPEED = { linear: 0.03, angular: 0.3 };
 const CWZ = { open: false, step: 'board', CW: null, markerMm: 25, thickMm: 0.5, board: null, views: [], plan: [], idx: 0, target: 20,
   runAll: false, running: false, stopReq: false, lease: null, epoch: null, ownAction: null, est: null, refined: false, solve: null, dry: null, applied: null,
-  status: '', statusKind: '', armedUntil: 0, previewQ: null, busy: false, live: null };
+  status: '', statusKind: '', armedUntil: 0, resetArm: null, previewQ: null, busy: false, live: null };
 const cwSupported = () => !!(S.caps && S.caps.calibration_apply);
 const cwDofOk = () => !(isSoArmProfile() || (S.armDof != null && S.armDof !== 6));
 const cwModelQ = (pos) => { const q = toModel6(pos); if (S.dof !== 7) q[5] = 0; return q; };
@@ -4909,13 +4911,48 @@ function cwDiffRows(before, after) {
   } else add('grasp.grip_pixel_norm', ['grasp', 'grip_pixel_norm']);
   return rows;
 }
+// steps a click on the step bar may jump back to; going back before 'capture' discards the views (two clicks)
+function cwCanGoto(k) {
+  if (CWZ.running || CWZ.busy) return false;
+  const ti = CW_STEPS.indexOf(k), si = CW_STEPS.indexOf(CWZ.step);
+  if (ti < 0 || ti >= si) return false;
+  if (k === 'capture') return CWZ.plan.length > 0;
+  if (k === 'solve') return !!CWZ.solve;
+  return k === 'board' || k === 'place';
+}
+function cwGoto(k) {
+  if (!cwCanGoto(k)) { if (CWZ.running) toast(t('cw.busy'), 'warn'); return; }
+  const n = CWZ.views.length;
+  if ((k === 'board' || k === 'place') && n > 0) {
+    if (!(CWZ.resetArm && CWZ.resetArm.k === k && Date.now() < CWZ.resetArm.until)) {
+      CWZ.resetArm = { k, until: Date.now() + 4000 };
+      cwSetStatus(t('cw.restart.warn', { s: t('cw.step.' + k), n }), 'warn');
+      setTimeout(() => { if (CWZ.resetArm && Date.now() >= CWZ.resetArm.until) { CWZ.resetArm = null; cwRender(); } }, 4050);
+      return;
+    }
+    CWZ.views = []; CWZ.plan = []; CWZ.idx = 0; CWZ.est = null; CWZ.refined = false; CWZ.solve = null; CWZ.dry = null; CWZ.applied = null; CWZ.ownAction = null;
+  }
+  CWZ.resetArm = null; CWZ.armedUntil = 0; CWZ.step = k; CWZ.status = ''; cwRender(); cwV3Sync();
+}
+function cwRestartBtn() {
+  const armed = CWZ.resetArm && CWZ.resetArm.k === 'place' && Date.now() < CWZ.resetArm.until;
+  return cwBtn(t(armed ? 'cw.restart.confirm' : 'cw.restart'), () => cwGoto('place'), { disabled: CWZ.running || CWZ.busy, id: 'cwiz-restart' });
+}
 function cwRender() {
   if (!CWZ.open) return;
   const steps = $('cwiz-steps'), body = $('cwiz-body');
   steps.textContent = '';
   $('cwiz-stop').hidden = CWZ.step !== 'capture'; // Stop stays in the footer (visible also when collapsed)
   const si = CW_STEPS.indexOf(CWZ.step);
-  CW_STEPS.forEach((k, i) => steps.appendChild(cwEl('li', i === si ? 'on' : i < si ? 'done' : '', t('cw.step.' + k))));
+  CW_STEPS.forEach((k, i) => {
+    const li = cwEl('li', i === si ? 'on' : i < si ? 'done' : '', t('cw.step.' + k));
+    if (cwCanGoto(k)) {
+      li.classList.add('nav'); li.tabIndex = 0; li.setAttribute('role', 'button'); li.dataset.step = k;
+      li.addEventListener('click', () => cwGoto(k));
+      li.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); cwGoto(k); } });
+    }
+    steps.appendChild(li);
+  });
   body.textContent = '';
   const p = (txt, cls = '') => body.appendChild(cwEl('p', cls, txt));
   const acts = (...bs) => { const d = cwEl('div', 'cwiz-acts'); for (const b of bs) if (b) d.appendChild(b); body.appendChild(d); return d; };
@@ -4963,6 +5000,7 @@ function cwRender() {
       left ? cwBtn(t(CWZ.runAll ? 'cw.cap.start' : 'cw.cap.next'), cwRun, { cls: 'btn-primary wide', disabled: CWZ.running, id: 'cwiz-go' }) : null,
       cwBtn(t('cw.cap.preview'), () => { if (!V3.open) v3Toggle(true); setTimeout(cwV3Sync, 300); }, { id: 'cwiz-prev' }),
       cwBtn(t('cw.cap.solve'), cwSolve, { disabled: CWZ.running || acc < 5, id: 'cwiz-solve' }),
+      cwRestartBtn(),
     );
   } else if (CWZ.step === 'solve') {
     const r = CWZ.solve;
@@ -4988,7 +5026,7 @@ function cwRender() {
     acts(cwBtn(t('cw.cap.more'), () => {
       const q = S.obs && S.obs.positions ? cwModelQ(S.obs.positions) : CWZ.plan[CWZ.plan.length - 1].q;
       CWZ.plan.push(...cwPlan(CWZ.est, q, 8, CWZ.plan.map((x) => x.T))); CWZ.step = 'capture'; cwRender(); cwV3Sync();
-    }), cwBtn(t('cw.solve.export'), cwExport),
+    }), cwBtn(t('cw.solve.export'), cwExport), cwRestartBtn(),
     cwBtn(t('cw.solve.review'), cwReview, { cls: 'btn-primary wide', disabled: !r.ok || CWZ.busy, id: 'cwiz-review' }));
   } else if (CWZ.step === 'review') {
     p(t('cw.rev.hint'));
@@ -5003,7 +5041,7 @@ function cwRender() {
     const vi = a.vision_intrinsics;
     if (vi && vi.revision != null) p('rebot-vision revision ' + vi.revision);
     const armed = Date.now() < CWZ.armedUntil;
-    acts(cwBtn(t(armed ? 'cw.app.restore.confirm' : 'cw.app.restore'), cwRestore, { disabled: CWZ.busy || !a.backup || !!a.restoredFrom, id: 'cwiz-restore' }),
+    acts(cwBtn(t(armed ? 'cw.app.restore.confirm' : 'cw.app.restore'), cwRestore, { disabled: CWZ.busy || !a.backup || !!a.restoredFrom, id: 'cwiz-restore' }), cwRestartBtn(),
       cwBtn(t('cw.app.done'), () => cwOpen(false), { cls: 'btn-primary' }));
   }
   if (CWZ.status) body.appendChild(cwEl('div', 'cwiz-msg' + (CWZ.statusKind === 'ok' ? ' ok' : ''), CWZ.status));

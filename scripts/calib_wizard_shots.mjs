@@ -221,6 +221,21 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     });
     if (ll.running || !/控制权|lease/.test(ll.status)) fail('lease ' + JSON.stringify(ll));
     console.log(`  lease loss (${lang}/${vpName}): ${JSON.stringify(ll)}`);
+    // step bar: jump back to an earlier step; going back to Place discards the views only after a second click
+    await page.evaluate(() => { CWZ.step = 'solve'; CWZ.status = ''; cwRender(); });
+    const navs = await page.evaluate(() => [...document.querySelectorAll('#cwiz-steps li.nav')].map((x) => x.dataset.step).join());
+    if (navs !== 'board,place,capture') fail('step bar nav from solve: ' + navs);
+    await page.click('#cwiz-steps li[data-step="capture"]');
+    const back = await page.evaluate(() => ({ step: CWZ.step, views: CWZ.views.length }));
+    if (back.step !== 'capture' || !back.views) fail('step bar -> capture ' + JSON.stringify(back));
+    await page.click('#cwiz-restart');
+    const r1 = await page.evaluate(() => ({ step: CWZ.step, views: CWZ.views.length, label: $('cwiz-restart').textContent, status: CWZ.status }));
+    if (r1.step !== 'capture' || !r1.views || !/再点|again/.test(r1.status)) fail('restart first click ' + JSON.stringify(r1));
+    await shot('8_restart_confirm', `first click: "${r1.label}" · ${r1.status}`);
+    await page.click('#cwiz-restart');
+    const r2 = await page.evaluate(() => ({ step: CWZ.step, views: CWZ.views.length, plan: CWZ.plan.length, solve: !!CWZ.solve, navs: [...document.querySelectorAll('#cwiz-steps li.nav')].map((x) => x.dataset.step).join() }));
+    if (r2.step !== 'place' || r2.views || r2.plan || r2.solve || r2.navs !== 'board') fail('restart second click ' + JSON.stringify(r2));
+    console.log(`  restart (${lang}/${vpName}): ${JSON.stringify(r1.label)} -> ${JSON.stringify(r2)}`);
     // capability missing: update message
     await page.evaluate(() => { S.caps = {}; CWZ.step = 'board'; cwRender(); });
     const un = await page.evaluate(() => $('cwiz-body').innerText);
