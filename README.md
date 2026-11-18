@@ -550,17 +550,24 @@ publishes it as `kinematics_correction` in `/api/v1/observation/schema`; the coc
 3. **Move board**: move the board to another spot (at least 10 cm away, turning it is fine), jog
    until it is in view and capture the start view of placement B.
 4. **Capture B**: as capture A.
-5. **Solve** (Web Worker in the page, `solveFine` in `/assets/calib_wizard.js`): intrinsics from the
-   image-only solve over A + B (camera-mode intrinsics gates); then the kinematic fit (correction,
-   X = T_end_cam, one board pose per placement, intrinsics fixed). Fitted on A and checked on B
+5. **Solve** (Web Worker in the page, `solveFine` in `/assets/calib_wizard.js`; the pose plans of
+   steps 1 and 3 are generated in the same worker; without a worker both run on the page's thread
+   in slices of at most 40 ms): intrinsics from the image-only solve over A + B (camera-mode
+   intrinsics gates); then the kinematic fit (correction, X = T_end_cam, one board pose per
+   placement, intrinsics fixed). The zero offsets of the parallel joints J2..J4 trade against the
+   next joint's origin shift; a weak L2 prior on the 28 parameters (weight 1, scales 1° for offsets
+   and tilts, 0.01 for scales, 5 mm for origins) picks the minimum-norm solution along these
+   directions (real-arm held-out 2.01 / 2.24 mm without, 2.01 / 2.23 mm with it). Fitted on A and checked on B
    (kinematics and X frozen, only B's board pose refitted) and the other way. Gates: held-out
    error ≤ 3 mm both ways (mm = px x depth / fx), the mean held-out error ≥ 30 % below the
    uncorrected model (URDF with armd's `model_joint_map`, X and board poses fitted), every
    parameter inside the bounds armd accepts (|offset| ≤ 10°, |scale| ≤ 0.08, |tilt| ≤ 3° per axis,
    |origin| ≤ 30 mm per component). The fit on A + B is applied. The solve page shows the
-   held-out errors before / after, the per-joint parameters and, for a zero offset > 5°, a note to
+   held-out errors before / after, the per-joint parameters and, for a J5 zero offset > 5°, a note to
    re-zero that motor with the official tool (reBotArm_control_py `example/2_zero_and_read.py` /
-   MotorBridge); Apply stays possible when the gates pass.
+   MotorBridge); Apply stays possible when the gates pass. The note is given for J5 only: its offset
+   is recovered within 0.01° in the synthetic test, J2..J4 offsets are not identifiable separately
+   (J2 off by 0.52°, J3 / J4 more).
 6. **Review**, **Applied**: one apply with `intrinsics`, `camera_mount`, `table_z_m` and
    `kinematics`; armd needs torque off and no running action for it (`KINEMATICS_ARMED`
    otherwise), the review page offers **Park and torque off**.

@@ -95,8 +95,8 @@ placement, predict the other) is ≤ 3 mm both ways, the mean held-out error is 
 uncorrected model, and every parameter is inside armd's bounds (|offset| ≤ 10°, |scale| ≤ 0.08,
 |tilt| ≤ 3°, |origin| ≤ 30 mm). The same apply then also writes `kinematics` (per joint
 `offset_rad`, `scale`, `tilt_rad`, `origin_m`, plus the fit's held-out numbers) into
-`calibration.json`; armd requires torque off for it. A zero offset above 5° is reported with a hint
-to re-zero that motor (reBotArm_control_py `example/2_zero_and_read.py` / MotorBridge). On data
+`calibration.json`; armd requires torque off for it. A J5 zero offset above 5° is reported with a
+hint to re-zero that motor (J2..J4 offsets are not separately identifiable and get no hint) (reBotArm_control_py `example/2_zero_and_read.py` / MotorBridge). On data
 recorded on this kit's arm (2026-11-18) the held-out error went from 2.76 / 3.64 mm to
 2.01 / 2.24 mm.
 
@@ -108,4 +108,4 @@ recorded on this kit's arm (2026-11-18) the held-out error went from 2.76 / 3.64
 
 标定板（向导生成打印页；仿真器 `--aruco-board` 使用相同布局）：4 列 x 3 行（横向，与 16:9 画面一致）aruco4x4_50 标记，id 0..11 按阅读顺序（id = 行 * 4 + 列，第 0 行在页面顶部，第 0 列在左侧），默认标记边长 25 mm，间隔 5 mm（0.2 倍边长），整板约 115 x 85 mm。标定板坐标系：原点在板中心，x 沿页面向右，y 沿页面向下，z 指向桌面内；打印的 "up" 箭头指向页面顶部（板 -y）。标记角点顺序同 rebot-vision：打印标记的左下、右下、右上、左上（标记坐标系 x 向右、y 向下）。
 
-精校模式（相机 + 机械臂几何）：向导采集两个标定板位置（各约 35 个位姿，关节空间移动、从同一方向接近；按这套运动规则在真机上每个位置约 5 分钟），除上述数值外还求解 J2..J5 的几何修正（零位、角度比例、关节轴倾斜、关节原点偏移；J1、J6 为 0）。两次采集之间用户把标定板移到另一个位置（距原位置至少 10 cm）并采集新的起始视图。只有满足以下条件才写入修正：两个方向的留出误差（在一个位置拟合、预测另一个位置）都 ≤ 3 mm，留出误差平均值比未修正模型低 ≥ 30 %，所有参数在 armd 的范围内（|零位| ≤ 10°、|比例| ≤ 0.08、|倾斜| ≤ 3°、|原点| ≤ 30 mm）。同一次写入还把 `kinematics`（每个关节的 `offset_rad`、`scale`、`tilt_rad`、`origin_m`，以及拟合的留出误差）写进 `calibration.json`；armd 要求此时电机断电。零位偏差超过 5° 时给出提示，建议重新校准该电机零位（reBotArm_control_py `example/2_zero_and_read.py` / MotorBridge）。在本套件机械臂上录制的数据（2026-11-18）中，留出误差从 2.76 / 3.64 mm 降到 2.01 / 2.24 mm。
+精校模式（相机 + 机械臂几何）：向导采集两个标定板位置（各约 35 个位姿，关节空间移动、从同一方向接近；按这套运动规则在真机上每个位置约 5 分钟），除上述数值外还求解 J2..J5 的几何修正（零位、角度比例、关节轴倾斜、关节原点偏移；J1、J6 为 0）。两次采集之间用户把标定板移到另一个位置（距原位置至少 10 cm）并采集新的起始视图。只有满足以下条件才写入修正：两个方向的留出误差（在一个位置拟合、预测另一个位置）都 ≤ 3 mm，留出误差平均值比未修正模型低 ≥ 30 %，所有参数在 armd 的范围内（|零位| ≤ 10°、|比例| ≤ 0.08、|倾斜| ≤ 3°、|原点| ≤ 30 mm）。同一次写入还把 `kinematics`（每个关节的 `offset_rad`、`scale`、`tilt_rad`、`origin_m`，以及拟合的留出误差）写进 `calibration.json`；armd 要求此时电机断电。J5 零位偏差超过 5° 时给出提示，建议重新校准该电机零位（J2..J4 的零位不能单独确定，不提示）（reBotArm_control_py `example/2_zero_and_read.py` / MotorBridge）。在本套件机械臂上录制的数据（2026-11-18）中，留出误差从 2.76 / 3.64 mm 降到 2.01 / 2.24 mm。
