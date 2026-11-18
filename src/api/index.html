@@ -4082,12 +4082,48 @@ const CALM = (() => {
     [[0.028008, 0.0, 0.04], [0.0, 1.5708, 0.0], [0, 0, 1]],
     [[0.0, 0.0, 0.15539], [0.0, -1.5708, 3.1415], null],
   ].map(([xyz, rpy, axis]) => [make(rpyR(...rpy), xyz), axis]);
-  // URDF model angles [q1..q6] (rad; missing = 0) -> T_base_gripper (end_link in base_link, x = tool axis)
-  function fk(q) {
+  /* Kinematic correction (armd schema `kinematics_correction`, written by the fine calibration wizard): per
+     joint i (0..5) { offset_rad, scale, tilt_rad: [x, y], origin_m: [dx, dy, dz] }. Walking the chain:
+       M = M * F_i;  M = M * [Rx(tilt_x) Ry(tilt_y), origin_m];  M = M * Rot(axis_i, q_i (1 + scale) + offset_rad)
+     (armd src/kinematics.rs and rebot_companion.kinematics use the same model). Null or all zero: the plain URDF
+     chain, computed by the same code as without a correction. */
+  const KC_BOUNDS = { offset_rad: 10 / D, scale: 0.08, tilt_rad: 3 / D, origin_m: 0.03 };
+  // schema value -> [{ off, sc, R (tilt, nested 3x3) or null, d: [3] }] x 6, or null (none / all zero / malformed)
+  function normCorrection(joints) {
+    if (!Array.isArray(joints) || joints.length < 6) return null;
+    const out = [];
+    let any = false;
+    for (let i = 0; i < 6; i++) {
+      const j = joints[i] || {};
+      const off = Number(j.offset_rad) || 0, sc = Number(j.scale) || 0;
+      const tl = Array.isArray(j.tilt_rad) ? j.tilt_rad.map((v) => Number(v) || 0) : [0, 0];
+      const d = Array.isArray(j.origin_m) ? j.origin_m.map((v) => Number(v) || 0) : [0, 0, 0];
+      if (![off, sc, tl[0], tl[1], d[0], d[1], d[2]].every(Number.isFinite)) return null;
+      const frame = !!(tl[0] || tl[1] || d[0] || d[1] || d[2]);
+      if (off || sc || frame) any = true;
+      out.push({ off, sc, R: frame ? mul(axisR([1, 0, 0], tl[0]), axisR([0, 1, 0], tl[1])) : null, d: [d[0], d[1], d[2]] });
+    }
+    return any ? out : null;
+  }
+  let KC = null;
+  // set the correction in use (schema value or null); returns true when it changed the model
+  function setCorrection(joints) {
+    const k = normCorrection(joints), was = JSON.stringify(KC);
+    KC = k;
+    return JSON.stringify(KC) !== was;
+  }
+  const correction = () => KC;
+  // URDF model angles [q1..q6] (rad; missing = 0) -> T_base_gripper (end_link in base_link, x = tool axis);
+  // kc: normalised correction (default: the one set by setCorrection), null = plain URDF chain
+  function fk(q, kc = KC) {
     let M = make([[1, 0, 0], [0, 1, 0], [0, 0, 1]], [0, 0, 0]), i = 0;
     for (const [F, axis] of CHAIN) {
       M = mul(M, F);
-      if (axis) M = make(mul(rotOf(M), axisR(axis, Number(q[i++]) || 0)), posOf(M));
+      if (!axis) continue;
+      const c = kc && kc[i];
+      if (!c) { M = make(mul(rotOf(M), axisR(axis, Number(q[i++]) || 0)), posOf(M)); continue; }
+      if (c.R) M = mul(M, make(c.R, c.d));
+      M = make(mul(rotOf(M), axisR(axis, (Number(q[i++]) || 0) * (1 + c.sc) + c.off)), posOf(M));
     }
     return M;
   }
@@ -4203,7 +4239,8 @@ const CALM = (() => {
       result, samples,
     };
   }
-  return { mul, inv, make, rotOf, posOf, rpyR, rpyDeg, axisR, expR, logR, angDeg, fk, rotDiversity, solveEyeInHand, buildExport, CHAIN };
+  return { mul, inv, make, rotOf, posOf, rpyR, rpyDeg, axisR, expR, logR, angDeg, fk, rotDiversity, solveEyeInHand, buildExport, CHAIN,
+    KC_BOUNDS, normCorrection, setCorrection, correction };
 })();
 /* CALIB-MATH-END */
 
@@ -4247,21 +4284,33 @@ const VIK = (() => {
     A[3] * B[0] + A[4] * B[1] + A[5] * B[2], A[3] * B[3] + A[4] * B[4] + A[5] * B[5], A[3] * B[6] + A[4] * B[7] + A[5] * B[8],
     A[6] * B[0] + A[7] * B[1] + A[8] * B[2], A[6] * B[3] + A[7] * B[4] + A[8] * B[5], A[6] * B[6] + A[7] * B[7] + A[8] * B[8]];
 
-  // end pose + world joint axes / origins for q (model J1..J6)
-  function frames(q) {
+  // end pose + world joint axes / origins for q (model J1..J6); kc: kinematic correction (CALM.normCorrection
+  // shape, default CALM's current one). g[j] = d(joint angle)/d(q_j) = 1 + scale_j (Jacobian column factor).
+  function frames(q, kc = CALM.correction()) {
     let R = [1, 0, 0, 0, 1, 0, 0, 0, 1], p = [0, 0, 0], i = 0;
-    const a = [], o = [];
+    const a = [], o = [], g = [];
     for (const L of CH) {
       const d = mv(R, L.p);
       p = [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
       R = m3(R, L.R);
       if (L.s) {
+        const k = kc && kc[i];
+        let qi = Number(q[i++]) || 0;
+        if (k) {
+          if (k.R) {
+            const e = mv(R, k.d);
+            p = [p[0] + e[0], p[1] + e[1], p[2] + e[2]];
+            R = m3(R, k.R.flat());
+          }
+          qi = qi * (1 + k.sc) + k.off;
+        }
+        g.push(k ? 1 + k.sc : 1);
         a.push([R[2] * L.s, R[5] * L.s, R[8] * L.s]); o.push(p);
-        const th = L.s * (Number(q[i++]) || 0), c = Math.cos(th), s = Math.sin(th);
+        const th = L.s * qi, c = Math.cos(th), s = Math.sin(th);
         R = [R[0] * c + R[1] * s, -R[0] * s + R[1] * c, R[2], R[3] * c + R[4] * s, -R[3] * s + R[4] * c, R[5], R[6] * c + R[7] * s, -R[6] * s + R[7] * c, R[8]];
       }
     }
-    return { R, p, a, o };
+    return { R, p, a, o, g };
   }
   const fk = (q) => { const f = frames(q); return T4(f.R, f.p); };
 
@@ -4304,8 +4353,8 @@ const VIK = (() => {
       // geometric Jacobian, angular rows scaled by w (6 x 6, column per joint)
       const J = [];
       for (let j = 0; j < 6; j++) {
-        const a = f.a[j], v = cross(a, [f.p[0] - f.o[j][0], f.p[1] - f.o[j][1], f.p[2] - f.o[j][2]]);
-        J.push([v[0], v[1], v[2], w * a[0], w * a[1], w * a[2]]);
+        const a = f.a[j], v = cross(a, [f.p[0] - f.o[j][0], f.p[1] - f.o[j][1], f.p[2] - f.o[j][2]]), gj = f.g[j];
+        J.push(gj === 1 ? [v[0], v[1], v[2], w * a[0], w * a[1], w * a[2]] : [gj * v[0], gj * v[1], gj * v[2], gj * w * a[0], gj * w * a[1], gj * w * a[2]]);
       }
       const A = new Float64Array(36);
       for (let r = 0; r < 6; r++) for (let c = r; c < 6; c++) {
@@ -5101,6 +5150,8 @@ async function loadSchema() {
       // calibrated mount (camera calibration wizard): q_end_cam replaces camFlip / camRotDeg
       const qEnd = sc.camera_mount && Array.isArray(sc.camera_mount.q_end_cam) ? sc.camera_mount.q_end_cam : null;
       if (JSON.stringify(qEnd) !== JSON.stringify(CFG.view.qEndCam || null)) { CFG.view.qEndCam = qEnd; camMountNow(); V3.key = ''; }
+      // kinematic correction (fine calibration): CALM.fk / VIK.frames use the same model as armd
+      if (CALM.setCorrection(sc.kinematics_correction || null)) { camMountNow(); V3.key = ''; PCARD.key = ''; }
       S.home = Array.isArray(sc.home_positions) ? sc.home_positions : null;
       S.rest = Array.isArray(sc.resting_pose?.positions) ? sc.resting_pose.positions : S.home;
       if (sc.gripper_policy && Number.isFinite(sc.gripper_policy.closed_rad) && Number.isFinite(sc.gripper_policy.open_rad)) {

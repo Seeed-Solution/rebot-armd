@@ -8,6 +8,9 @@
 //      rotation, none after a pure translation
 //   e. unreachable / invalid targets return ok:false without throwing
 //   f. timing: median per-solve time (target < 0.5 ms)
+//   h. kinematic correction (schema kinematics_correction): an all-zero correction is no correction (CALM.fk and
+//      VIK.fk bit for bit equal to the plain URDF chain); a non-zero one matches an independent 4x4 evaluation of
+//      the model, VIK.fk == CALM.fk, and the FK -> IK round trip passes with it
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
@@ -184,6 +187,59 @@ check('f. median solve time < 0.5 ms', msTick < 0.5 && msPert < 0.5, `teleop tic
   let e = 0;
   for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) e = Math.max(e, Math.abs(Rq[i][j] - R[i][j]));
   check('g. camMount with q_end_cam equals the mount the quaternion came from', e < 1e-12, `max abs diff ${e.toExponential(2)}`);
+}
+// h. kinematic correction
+{
+  const { make, mul, rotOf, posOf, axisR } = CALM;
+  // plain URDF chain, written out as before the correction existed
+  const plain = (q) => { let M = make([[1, 0, 0], [0, 1, 0], [0, 0, 1]], [0, 0, 0]), i = 0; for (const [F, axis] of CALM.CHAIN) { M = mul(M, F); if (axis) M = make(mul(rotOf(M), axisR(axis, Number(q[i++]) || 0)), posOf(M)); } return M; };
+  const zero = Array.from({ length: 6 }, () => ({ offset_rad: 0, scale: 0, tilt_rad: [0, 0], origin_m: [0, 0, 0] }));
+  const same = (A, B) => A.flat().every((v, k) => Object.is(v, B.flat()[k]) || v === B.flat()[k]);
+  let bitOk = CALM.normCorrection(zero) === null && CALM.normCorrection(null) === null;
+  CALM.setCorrection(zero);
+  for (const q of samples.slice(0, 100)) {
+    if (!same(CALM.fk(q), plain(q)) || !same(VIK.fk(q), VIK.fk(q, null)) || !same(CALM.fk(q), CALM.fk(q, null))) bitOk = false;
+  }
+  let vikPlain = 0;
+  for (const q of samples.slice(0, 100)) { const A = plain(q), B = VIK.fk(q); vikPlain = Math.max(vikPlain, ...A.flat().map((v, i) => Math.abs(v - B.flat()[i]))); }
+  check('h. zero correction == plain URDF chain (bit for bit), VIK unchanged', bitOk && CALM.correction() === null && vikPlain < 1e-12, `CALM bit-identical ${bitOk}, VIK vs plain ${vikPlain.toExponential(2)}`);
+  // non-zero: offsets J2..J5, scales, a 1.5 deg tilt and a 10 mm origin shift
+  const kc = zero.map((j) => ({ ...j, tilt_rad: [0, 0], origin_m: [0, 0, 0] }));
+  kc[1] = { offset_rad: 1.0 / D, scale: 0.02, tilt_rad: [1.5 / D, -0.5 / D], origin_m: [0.010, -0.004, 0.002] };
+  kc[2] = { offset_rad: -0.6 / D, scale: -0.01, tilt_rad: [0, 0.4 / D], origin_m: [0.003, 0.002, 0] };
+  kc[3] = { offset_rad: 0.8 / D, scale: 0, tilt_rad: [0, 0], origin_m: [0, 0, 0] };
+  kc[4] = { offset_rad: -4.0 / D, scale: 0.005, tilt_rad: [-0.8 / D, 0], origin_m: [-0.004, 0.003, -0.006] };
+  const ref = (q) => { // independent evaluation: M F_i [Rx Ry, d] Rot(axis, q (1 + s) + o)
+    let M = make([[1, 0, 0], [0, 1, 0], [0, 0, 1]], [0, 0, 0]), i = 0;
+    for (const [F, axis] of CALM.CHAIN) {
+      M = mul(M, F);
+      if (!axis) continue;
+      const c = kc[i];
+      M = mul(M, make(mul(axisR([1, 0, 0], c.tilt_rad[0]), axisR([0, 1, 0], c.tilt_rad[1])), c.origin_m));
+      M = mul(M, make(axisR(axis, q[i] * (1 + c.scale) + c.offset_rad), [0, 0, 0]));
+      i++;
+    }
+    return M;
+  };
+  const changed = CALM.setCorrection(kc);
+  let eRef = 0, eVik = 0, moved = 0;
+  for (const q of samples.slice(0, 100)) {
+    const A = CALM.fk(q), B = ref(q), C = VIK.fk(q);
+    eRef = Math.max(eRef, ...A.flat().map((v, i) => Math.abs(v - B.flat()[i])));
+    eVik = Math.max(eVik, ...A.flat().map((v, i) => Math.abs(v - C.flat()[i])));
+    moved = Math.max(moved, dist(posOf(A), posOf(plain(q))));
+  }
+  check('h. corrected CALM.fk == independent model, VIK.fk == CALM.fk', changed && eRef < 1e-12 && eVik < 1e-12 && moved > 0.01,
+    `vs reference ${eRef.toExponential(2)}, VIK vs CALM ${eVik.toExponential(2)}, end moved up to ${(moved * 1000).toFixed(1)} mm by the correction`);
+  let bad2 = 0, w2 = 0, wd2 = 0;
+  for (const q of samples) {
+    const T = VIK.fk(q), r = VIK.solve(T, q.map((x) => x + uni(-0.1, 0.1)), { lo, hi }), e = errOf(T, r.q);
+    if (!r.ok || e.mm > 1 || e.deg > 0.5) bad2++;
+    w2 = Math.max(w2, e.mm); wd2 = Math.max(wd2, e.deg);
+  }
+  check('h. FK->IK round trip with the correction (200, start +-0.1 rad)', bad2 === 0, `fail ${bad2}, worst ${w2.toFixed(4)} mm / ${wd2.toFixed(4)} deg`);
+  CALM.setCorrection(null);
+  check('h. correction cleared', CALM.correction() === null && same(CALM.fk(samples[0]), plain(samples[0])), 'setCorrection(null)');
 }
 console.log(fails ? `\n${fails} FAILED` : '\nALL PASS');
 process.exit(fails ? 1 : 0);
