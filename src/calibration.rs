@@ -11,6 +11,11 @@
 //! is taken first; a failing step reverts the earlier ones. WS `/api/v1/calibration/restore`
 //! puts a backup back in the same order. While a transaction runs, motion commands
 //! (MOTION_BUSY) and other configuration writes (CONFIG_BUSY) are refused; heartbeats go on.
+//!
+//! `calibration.json` may also hold `kinematics`, the kinematic fine calibration of the
+//! built-in chain ([`crate::kinematics::JointCorrection`] per joint). It is written in the same
+//! transaction and installed live in `config.arm_model` ([`SupervisorInner::set_kinematics_correction`]);
+//! changing it needs torque off and no action running (KINEMATICS_ARMED).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,6 +27,7 @@ use serde_json::{json, Map, Value};
 
 use crate::api::proxy::DetectorUpstream;
 use crate::grasp::{CamModel, GraspSetup};
+use crate::kinematics::Correction;
 use crate::model::CameraMount;
 use crate::supervisor::{ArmSupervisor, SupervisorInner};
 
@@ -47,7 +53,32 @@ pub struct CalibrationFile {
     pub solved_at: Option<String>,
     /// Residuals reported by the solver (passed through).
     pub rms: Option<Value>,
+    /// Kinematic fine calibration of the built-in chain; None = the URDF chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kinematics: Option<KinematicsCalibration>,
 }
+
+/// `calibration.json` `kinematics` (and the apply field of the same name).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KinematicsCalibration {
+    /// J1..J6 (design "Correction model"); joints the solver does not identify are zeros.
+    pub joints: Correction,
+    /// Fit report of the solver (`heldout_mm`, `train_mm`, `views`, `solved_at`), passed through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit: Option<Value>,
+}
+
+impl KinematicsCalibration {
+    pub fn validate(&self) -> Result<(), String> {
+        crate::kinematics::validate_correction(&self.joints)?;
+        if self.fit.as_ref().is_some_and(|f| !f.is_object()) { return Err("kinematics.fit must be an object".into()); }
+        Ok(())
+    }
+}
+
+/// The correction a calibration installs (None without one).
+fn correction_of(c: Option<&CalibrationFile>) -> Option<&Correction> { c.and_then(|c| c.kinematics.as_ref()).map(|k| &k.joints) }
 
 impl CalibrationFile {
     pub fn validate(&self) -> Result<(), String> {
@@ -60,6 +91,7 @@ impl CalibrationFile {
         if self.table_z_m.is_some_and(|z| !z.is_finite() || z.abs() > 0.5) {
             return Err("calibration.json: table_z_m must be in [-0.5, 0.5] m".into());
         }
+        if let Some(k) = &self.kinematics { k.validate().map_err(|e| format!("calibration.json: {e}"))?; }
         Ok(())
     }
 }
@@ -122,6 +154,19 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
             tracing::info!("Camera calibration loaded from {}: q_end_cam {:?}, offset_m {:?}, derived tilt {:.2} deg (overrides the profile mount and the grasp setup's camera_tilt_deg)",
                 path.display(), mount.q_end_cam, mount.offset_m, mount.tilt_deg);
             inner.set_camera_mount(mount);
+            if let Some(k) = &file.kinematics {
+                match inner.set_kinematics_correction(Some(&k.joints)) {
+                    Ok(()) => {
+                        let fit = k.fit.as_ref().map_or_else(|| "none".to_string(), |f| f.to_string());
+                        tracing::info!("Kinematic correction loaded from {} (fit {fit})", path.display());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Ignoring the kinematic correction in {}: {e}; using the uncorrected model", path.display());
+                        inner.calibration_load_error = Some(format!("calibration.json: kinematics: {e}; the uncorrected model is used"));
+                        file.kinematics = None;
+                    }
+                }
+            }
             inner.calibration = Some(file);
         }
         crate::persist::Loaded::Missing => tracing::info!("No camera calibration at {}; using the profile camera mount", path.display()),
@@ -233,12 +278,15 @@ pub struct ApplyRequest {
     pub rms: Option<Value>,
     pub solved_at: Option<String>,
     pub dry_run: bool,
+    /// `kinematics`: None = absent (a stored correction stays), Some(None) = null (removes it),
+    /// Some(Some(k)) = install `k`.
+    pub kinematics: Option<Option<KinematicsCalibration>>,
 }
 
 pub fn parse_apply(body: &Value) -> Result<ApplyRequest, CalibError> {
     let o = body.as_object().ok_or_else(|| CalibError::invalid("Command body must be an object"))?;
     for k in o.keys() {
-        if !["intrinsics", "camera_mount", "table_z_m", "rms", "solved_at", "dry_run"].contains(&k.as_str()) {
+        if !["intrinsics", "camera_mount", "table_z_m", "rms", "solved_at", "dry_run", "kinematics"].contains(&k.as_str()) {
             return Err(CalibError::invalid(format!("unknown field: {k}")));
         }
     }
@@ -265,6 +313,16 @@ pub fn parse_apply(body: &Value) -> Result<ApplyRequest, CalibError> {
         Some(Value::String(s)) if s.len() <= 64 => Some(s.clone()),
         Some(_) => return Err(CalibError::invalid("solved_at must be a string of at most 64 bytes")),
     };
+    let kinematics = match o.get("kinematics") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(v) => {
+            let k: KinematicsCalibration = serde_json::from_value(v.clone())
+                .map_err(|e| CalibError::invalid(format!("kinematics must be {{joints: [6 x {{offset_rad, scale, tilt_rad, origin_m}}], fit?}}: {e}")))?;
+            k.validate().map_err(CalibError::invalid)?;
+            Some(Some(k))
+        }
+    };
     Ok(ApplyRequest {
         intrinsics,
         offset_m: [off[0] as f32, off[1] as f32, off[2] as f32],
@@ -273,6 +331,7 @@ pub fn parse_apply(body: &Value) -> Result<ApplyRequest, CalibError> {
         rms: o.get("rms").filter(|v| !v.is_null()).cloned(),
         solved_at,
         dry_run,
+        kinematics,
     })
 }
 
@@ -320,6 +379,13 @@ fn after_state(inner: &SupervisorInner, req: &ApplyRequest) -> Result<ArmdState,
     let Some(base) = inner.config.grasp.clone() else {
         return Err(CalibError::new(400, "UNSUPPORTED", "This profile has no grasp setup"));
     };
+    let kinematics = match &req.kinematics {
+        None => inner.calibration.as_ref().and_then(|c| c.kinematics.clone()),
+        Some(k) => k.clone(),
+    };
+    if let Some(k) = &kinematics {
+        inner.config.arm_model.with_correction(Some(&k.joints)).map_err(|e| CalibError::new(400, "UNSUPPORTED", e))?;
+    }
     let mount = calibrated_mount(inner, req.offset_m, req.q_end_cam);
     let g = |k: &str| req.intrinsics[k].as_f64().unwrap_or(f64::NAN);
     let mut setup = GraspSetup {
@@ -338,6 +404,7 @@ fn after_state(inner: &SupervisorInner, req: &ApplyRequest) -> Result<ArmdState,
         table_z_m: Some(req.table_z_m),
         solved_at: Some(req.solved_at.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true))),
         rms: req.rms.clone(),
+        kinematics,
     };
     Ok(ArmdState { camera_mount: mount, calibration: Some(file), grasp_setup: Some(setup), grip_pixel_model })
 }
@@ -485,6 +552,18 @@ pub fn list_backups(deps: &CalibrationDeps) -> Vec<Value> {
 /// Re-checks the caller's lease and epoch before each write.
 pub type LeaseCheck = Box<dyn Fn(&mut SupervisorInner) -> Result<(), CalibError> + Send + Sync>;
 
+/// A change of the kinematic correction needs torque off and no action running (the arm model
+/// of a running action or of a held pose would change under it).
+pub fn kinematics_armed(inner: &SupervisorInner) -> Result<(), CalibError> {
+    let running = inner.last_action.as_ref().is_some_and(|a| a.is_running()) || inner.macro_run.is_some();
+    if inner.is_torqued || running {
+        let why = if running { "an action is running" } else { "torque is on" };
+        return Err(CalibError::new(409, "KINEMATICS_ARMED",
+            format!("the kinematic correction can change only with torque off and no action running ({why}); park or disable torque first")));
+    }
+    Ok(())
+}
+
 /// Under the lock, before a transaction: no other transaction, the arm idle.
 pub fn begin_checks(inner: &SupervisorInner) -> Result<(), CalibError> {
     if inner.calibration_busy { return Err(CalibError::new(409, "CONFIG_BUSY", "a calibration apply or restore is running")); }
@@ -574,11 +653,20 @@ impl Txn<'_> {
     /// calibration.json, then the live mount and calibration.
     async fn write_calibration(&mut self, after: &ArmdState) -> Result<(), CalibError> {
         self.recheck("calibration_file").await?;
+        let kin = correction_of(after.calibration.as_ref()).copied();
+        let kin_changes = kin.as_ref() != correction_of(self.before.calibration.as_ref());
+        if kin_changes { kinematics_armed(&*self.sup.inner().read().await).map_err(|e| e.at("calibration_file"))?; }
         let text = after.calibration.as_ref().map(|c| serde_json::to_string_pretty(c).unwrap_or_default());
         put_file(self.deps.path.clone(), text).await
             .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("calibration file {}: {e}", self.deps.path.display())).at("calibration_file"))?;
         self.file_written = true;
         let mut inner = self.sup.inner().write().await;
+        if kin_changes {
+            // checked again under the write lock: torque may have come on during the file write
+            kinematics_armed(&inner).map_err(|e| e.at("calibration_file"))?;
+        }
+        inner.set_kinematics_correction(kin.as_ref())
+            .map_err(|e| CalibError::new(400, "UNSUPPORTED", e).at("calibration_file"))?;
         inner.set_camera_mount(after.camera_mount.clone());
         inner.calibration = after.calibration.clone();
         self.live_written = true;
@@ -615,6 +703,9 @@ impl Txn<'_> {
             let mut inner = self.sup.inner().write().await;
             inner.set_camera_mount(self.before.camera_mount.clone());
             inner.calibration = self.before.calibration.clone();
+            if let Err(e) = inner.set_kinematics_correction(correction_of(self.before.calibration.as_ref())) {
+                tracing::warn!("revert: kinematic correction not put back: {e}");
+            }
             state.insert("armd_live".into(), json!("reverted"));
         }
         if self.file_written {
@@ -671,12 +762,14 @@ impl Txn<'_> {
         inner.calibration_load_error = None;
         Ok(json!({"backup": backup.display().to_string(), "vision_intrinsics": vision,
             "camera_mount": mount_summary(&inner.config.camera_mount), "calibration": inner.calibration,
+            "kinematics_correction": inner.config.arm_model.correction(),
             "grasp": inner.grasp_setup().map(|s| grasp_fields(&s))}))
     }
 }
 
 fn diff_view(vision: &Value, state: &ArmdState) -> Value {
     let mut v = json!({"vision_intrinsics": vision, "camera_mount": mount_summary(&state.camera_mount),
+        "kinematics": state.calibration.as_ref().and_then(|c| c.kinematics.as_ref()),
         "grasp": state.grasp_setup.as_ref().map(grasp_fields)});
     if let Some(p) = state.grip_pixel_model { v["grip_pixel_model"] = json!(p); }
     v
@@ -721,7 +814,14 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
     let vision_values = validate_intrinsics(&vision_target).map_err(|e| CalibError::invalid(format!("backup {name}: vision_intrinsics.json: {e}")))?;
     if let Some(c) = &target.calibration { c.validate().map_err(CalibError::invalid)?; }
     if let Some(g) = &target.grasp_setup { g.validate().map_err(|e| CalibError::invalid(format!("backup {name}: grasp setup: {e}")))?; }
-    let before = armd_state(&*sup.inner().read().await);
+    let before = {
+        let inner = sup.inner().read().await;
+        if let Some(k) = target.calibration.as_ref().and_then(|c| c.kinematics.as_ref()) {
+            inner.config.arm_model.with_correction(Some(&k.joints)).map_err(|e| CalibError::new(400, "UNSUPPORTED", format!("backup {name}: {e}")))?;
+        }
+        if correction_of(target.calibration.as_ref()) != correction_of(inner.calibration.as_ref()) { kinematics_armed(&inner)?; }
+        armd_state(&inner)
+    };
     let vision_before = vision_get(deps).await.map_err(|e| e.at("vision"))?;
     let mut txn = Txn { sup, deps, check, before, vision_before, vision_written: None, vision_unknown: false, file_written: false, live_written: false, backup: None };
     let mut out = txn.run("restore", &vision_values, &target).await?;
@@ -736,6 +836,7 @@ pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
     json!({"calibrated": inner.camera_calibrated(), "busy": inner.calibration_busy, "load_error": inner.calibration_load_error,
         "path": deps.path.display().to_string(), "backup_dir": deps.backup_dir.display().to_string(),
         "calibration": inner.calibration, "camera_mount": mount_summary(&inner.config.camera_mount),
+        "kinematics_correction": inner.config.arm_model.correction(),
         "grasp": inner.grasp_setup().map(|s| grasp_fields(&s)), "backups": list_backups(deps)})
 }
 

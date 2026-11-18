@@ -67,6 +67,7 @@ fn calib_file(q: [f64; 4]) -> CalibrationFile {
     CalibrationFile {
         camera_mount: CameraMount { offset_m: Some([-0.0731, 0.0005, 0.066]), q_end_cam: Some(q), ..Default::default() },
         intrinsics: Some(json!({"fx": 830.0})), table_z_m: Some(0.01), solved_at: Some("2026-11-17T00:00:00Z".into()), rms: None,
+        kinematics: None,
     }
 }
 
@@ -216,7 +217,9 @@ struct Rig {
 
 /// armd with a lease holder, a mock rebot-vision and calibration files in a temp dir;
 /// `paths` may replace the calibration / grasp setup paths.
-async fn rig_with(paths: impl FnOnce(&Path) -> (PathBuf, PathBuf)) -> Rig {
+async fn rig_with(paths: impl FnOnce(&Path) -> (PathBuf, PathBuf)) -> Rig { rig_cfg(ArmConfig::rebot_dm(), paths).await }
+
+async fn rig_cfg(config: ArmConfig, paths: impl FnOnce(&Path) -> (PathBuf, PathBuf)) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let (url, mock) = spawn_mock().await;
     let up = armd::api::proxy::DetectorUpstream::parse(&url).unwrap();
@@ -224,7 +227,7 @@ async fn rig_with(paths: impl FnOnce(&Path) -> (PathBuf, PathBuf)) -> Rig {
     let mut deps = CalibrationDeps::new(cal, Some(setup.clone()), up.clone());
     deps.backup_dir = dir.path().join("backups");
     deps.vision_timeout = Duration::from_millis(1500);
-    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let sup = Arc::new(ArmSupervisor::new(config));
     let router = armd::api::create_router_calibration(sup.clone(), up.clone(), GraspDeps::http(up, Some(setup)),
         armd::diagnostics::DiagnosticsState::global(), deps.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -625,4 +628,248 @@ async fn successful_apply_clears_the_load_error() {
     let ok = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
     assert_eq!(ok["type"], "command_ack", "{ok}");
     assert!(r.sup.inner().read().await.calibration_load_error.is_none());
+}
+
+// ---- kinematic fine calibration (calibration.json `kinematics`) ----
+
+/// A correction inside the bounds on J2..J5 (J1 / J6 zeros, as the wizard writes it).
+fn kin_joints() -> Value {
+    let z = json!({"offset_rad": 0.0, "scale": 0.0, "tilt_rad": [0.0, 0.0], "origin_m": [0.0, 0.0, 0.0]});
+    json!([z,
+        {"offset_rad": 0.021, "scale": 0.012, "tilt_rad": [0.044, -0.014], "origin_m": [0.004, -0.006, 0.002]},
+        {"offset_rad": -0.035, "scale": -0.02, "tilt_rad": [0.009, 0.019], "origin_m": [-0.012, 0.003, 0.008]},
+        {"offset_rad": 0.054, "scale": 0.03, "tilt_rad": [-0.026, 0.012], "origin_m": [0.009, 0.011, -0.004]},
+        {"offset_rad": -0.0698, "scale": -0.05, "tilt_rad": [0.05, -0.05], "origin_m": [-0.02, 0.015, 0.025]},
+        z])
+}
+
+fn kin_value() -> Value { json!({"joints": kin_joints(), "fit": {"heldout_mm": [2.0, 2.2], "train_mm": 1.7, "views": 140, "solved_at": "2026-11-18T10:00:00Z"}}) }
+
+fn kin_correction() -> k::Correction { serde_json::from_value(kin_joints()).unwrap() }
+
+fn with_kin(mut body: Value, kin: Value) -> Value { body["kinematics"] = kin; body }
+
+const Q_TEST: [f64; 6] = [0.3, -0.9, 1.2, 0.4, -0.5, 1.6];
+
+/// The live arm model is the corrected one (`Some`) or the URDF chain (`None`).
+async fn assert_model(r: &Rig, want: Option<k::Correction>) {
+    let inner = r.sup.inner().read().await;
+    assert_eq!(inner.config.arm_model.correction().copied(), want);
+    let off = k::B601DM_MODEL_OFFSETS_RAD;
+    let qm: [f64; 6] = std::array::from_fn(|i| Q_TEST[i] + off[i]);
+    assert_eq!(inner.config.arm_model.fk(&Q_TEST), k::fk_corrected(&qm, want.as_ref()), "FK of the live model");
+    drop(inner);
+    assert_eq!(r.sup.get_schema().await.kinematics_correction, want, "schema");
+}
+
+#[tokio::test]
+async fn apply_with_kinematics_swaps_the_model_live_and_restore_puts_it_back() {
+    let mut r = rig().await;
+    assert_model(&r, None).await;
+    let rev0 = r.sup.inner().read().await.workspace_revision;
+    // the corrected FK differs from the URDF chain by millimetres
+    let moved = k::norm(&k::sub(&ArmModel::REBOT_DEV_ARM.with_correction(Some(&kin_correction())).unwrap().fk(&Q_TEST).p, &ArmModel::REBOT_DEV_ARM.fk(&Q_TEST).p));
+    assert!(moved > 0.005, "{moved}");
+    // 1. apply with kinematics
+    let a = cmd(&mut r, "/api/v1/calibration/apply", with_kin(apply_body(false), kin_value())).await;
+    assert_eq!(a["type"], "command_ack", "{a}");
+    assert_eq!(a["kinematics_correction"], kin_joints(), "{a}");
+    assert_eq!(a["calibration"]["kinematics"]["fit"]["views"], json!(140));
+    assert_model(&r, Some(kin_correction())).await;
+    assert!(r.sup.inner().read().await.workspace_revision > rev0, "plans made with the old model go stale");
+    let file: CalibrationFile = serde_json::from_str(&std::fs::read_to_string(&r.deps.path).unwrap()).unwrap();
+    assert_eq!(file.kinematics.as_ref().unwrap().joints, kin_correction());
+    let v: Value = reqwest::get(format!("http://{}/api/v1/calibration", r.addr)).await.unwrap().json().await.unwrap();
+    assert_eq!(v["kinematics_correction"], kin_joints(), "{v}");
+    assert_eq!(v["calibration"]["kinematics"]["joints"], kin_joints());
+    let schema: Value = reqwest::get(format!("http://{}/api/v1/observation/schema", r.addr)).await.unwrap().json().await.unwrap();
+    assert_eq!(schema["kinematics_correction"], kin_joints(), "{schema}");
+    assert_eq!(schema["capabilities"]["calibration_kinematics"], json!(true));
+    let backup0 = a["backup"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    // 2. an apply without kinematics keeps the stored correction
+    let b = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    assert_eq!(b["type"], "command_ack", "{b}");
+    assert_model(&r, Some(kin_correction())).await;
+    let file: CalibrationFile = serde_json::from_str(&std::fs::read_to_string(&r.deps.path).unwrap()).unwrap();
+    assert!(file.kinematics.is_some(), "kept in calibration.json");
+    let backup1 = b["backup"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    // 3. kinematics null removes it
+    let c = cmd(&mut r, "/api/v1/calibration/apply", with_kin(apply_body(false), Value::Null)).await;
+    assert_eq!(c["type"], "command_ack", "{c}");
+    assert_model(&r, None).await;
+    assert_eq!(c["kinematics_correction"], Value::Null);
+    let file: CalibrationFile = serde_json::from_str(&std::fs::read_to_string(&r.deps.path).unwrap()).unwrap();
+    assert!(file.kinematics.is_none());
+    assert!(!std::fs::read_to_string(&r.deps.path).unwrap().contains("kinematics"));
+    // 4. backup1 holds the state before apply 2 (after apply 1): the correction comes back
+    let back = cmd(&mut r, "/api/v1/calibration/restore", json!({"backup": backup1})).await;
+    assert_eq!(back["type"], "command_ack", "{back}");
+    assert_model(&r, Some(kin_correction())).await;
+    // 5. restore the state before any calibration: no correction
+    let back = cmd(&mut r, "/api/v1/calibration/restore", json!({"backup": backup0})).await;
+    assert_eq!(back["type"], "command_ack", "{back}");
+    assert_model(&r, None).await;
+    assert!(!r.deps.path.exists());
+}
+
+#[tokio::test]
+async fn apply_kinematics_dry_run_reports_before_and_after() {
+    let mut r = rig().await;
+    r.sup.inner().write().await.is_torqued = true; // a dry run writes nothing: allowed with torque on
+    let d = cmd(&mut r, "/api/v1/calibration/apply", with_kin(apply_body(true), kin_value())).await;
+    assert_eq!(d["type"], "command_ack", "{d}");
+    assert_eq!(d["before"]["kinematics"], Value::Null, "{d}");
+    assert_eq!(d["after"]["kinematics"]["joints"], kin_joints(), "{d}");
+    assert_eq!(d["after"]["kinematics"]["fit"]["heldout_mm"], json!([2.0, 2.2]));
+    assert_model(&r, None).await;
+    assert!(!r.deps.path.exists() && backups(&r) == 0);
+}
+
+#[tokio::test]
+async fn kinematics_apply_and_restore_are_refused_while_torqued_or_acting() {
+    let mut r = rig().await;
+    r.sup.inner().write().await.is_torqued = true;
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", with_kin(apply_body(false), kin_value())).await;
+    assert_eq!((rej["type"].as_str(), rej["code"].as_str()), (Some("command_reject"), Some("KINEMATICS_ARMED")), "{rej}");
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", with_kin(apply_body(false), Value::Null)).await;
+    assert_eq!(rej["code"], "KINEMATICS_ARMED", "null removes a correction: also a change: {rej}");
+    assert_eq!(backups(&r), 0);
+    assert_unchanged(&r).await;
+    assert_model(&r, None).await;
+    // without kinematics the camera calibration still applies with torque on
+    let ok = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    assert_eq!(ok["type"], "command_ack", "{ok}");
+    let backup = ok["backup"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    // a running action
+    r.sup.inner().write().await.is_torqued = false;
+    let id = r.sup.inner().write().await.begin_action("joint_move", None);
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", with_kin(apply_body(false), kin_value())).await;
+    assert_eq!(rej["code"], "KINEMATICS_ARMED", "{rej}");
+    assert!(rej["message"].as_str().unwrap().contains("action"), "{rej}");
+    r.sup.inner().write().await.finish_action(id, "done", None, None, None, None, None);
+    let ok = cmd(&mut r, "/api/v1/calibration/apply", with_kin(apply_body(false), kin_value())).await;
+    assert_eq!(ok["type"], "command_ack", "{ok}");
+    assert_model(&r, Some(kin_correction())).await;
+    // restoring a backup with another correction is a change too
+    r.sup.inner().write().await.is_torqued = true;
+    let rej = cmd(&mut r, "/api/v1/calibration/restore", json!({"backup": backup})).await;
+    assert_eq!(rej["code"], "KINEMATICS_ARMED", "{rej}");
+    assert_model(&r, Some(kin_correction())).await;
+    r.sup.inner().write().await.is_torqued = false;
+    let back = cmd(&mut r, "/api/v1/calibration/restore", json!({"backup": backup})).await;
+    assert_eq!(back["type"], "command_ack", "{back}");
+    assert_model(&r, None).await;
+}
+
+#[tokio::test]
+async fn kinematics_turned_on_during_the_transaction_is_reverted() {
+    // torque comes on while rebot-vision is written: the calibration_file step refuses and reverts
+    let mut r = rig().await;
+    r.mock.lock().unwrap().put_delay_ms = 500;
+    let id = send_cmd(&mut r, "/api/v1/calibration/apply", with_kin(apply_body(false), kin_value())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    r.sup.inner().write().await.is_torqued = true;
+    let rej = reply_for(&mut r, id).await;
+    assert_eq!((rej["code"].as_str(), rej["step"].as_str(), rej["reverted"].as_bool()), (Some("KINEMATICS_ARMED"), Some("calibration_file"), Some(true)), "{rej}");
+    assert_eq!(mock_fx(&r), (824.0, 2), "vision PUT reverted");
+    assert!(!r.deps.path.exists());
+    assert_unchanged(&r).await;
+    assert_model(&r, None).await;
+}
+
+#[tokio::test]
+async fn kinematics_bounds_and_shape_are_checked() {
+    let mut r = rig().await;
+    let joints = |j: usize, patch: Value| { let mut a = kin_joints(); for (k, v) in patch.as_object().unwrap() { a[j][k] = v.clone(); } json!({"joints": a}) };
+    for (kin, what) in [
+        (joints(4, json!({"offset_rad": 0.1746})), "offset_rad"),   // 10.004 deg
+        (joints(2, json!({"scale": 0.0801})), "scale"),
+        (joints(3, json!({"tilt_rad": [0.0, -0.0524]})), "tilt_rad"), // 3.002 deg
+        (joints(1, json!({"origin_m": [0.0, 0.031, 0.0]})), "origin_m"),
+        (joints(1, json!({"origin_m": [0.0, 0.0]})), "kinematics"),
+        (joints(1, json!({"offset": 0.01})), "kinematics"),
+        (json!({"joints": [{}, {}, {}, {}, {}]}), "kinematics"),
+        (json!({"joints": kin_joints(), "fit": 3}), "fit"),
+        (json!({"joints": kin_joints(), "extra": 1}), "kinematics"),
+        (json!([1, 2]), "kinematics"),
+    ] {
+        let rej = cmd(&mut r, "/api/v1/calibration/apply", with_kin(apply_body(true), kin.clone())).await;
+        assert_eq!(rej["code"], "INVALID_COMMAND", "{kin}: {rej}");
+        assert!(rej["message"].as_str().unwrap().contains(what), "{what}: {rej}");
+    }
+    // the bounds themselves pass
+    let edge = joints(4, json!({"offset_rad": 10f64.to_radians(), "scale": -0.08, "tilt_rad": [3f64.to_radians(), -3f64.to_radians()], "origin_m": [0.03, -0.03, 0.03]}));
+    let ok = cmd(&mut r, "/api/v1/calibration/apply", with_kin(apply_body(true), edge)).await;
+    assert_eq!(ok["type"], "command_ack", "{ok}");
+}
+
+#[tokio::test]
+async fn startup_loads_the_correction_and_rejects_a_bad_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let cal = dir.path().join("calibration.json");
+    let mut file = calib_file(v8_q());
+    file.kinematics = Some(serde_json::from_value(kin_value()).unwrap());
+    std::fs::write(&cal, serde_json::to_string(&file).unwrap()).unwrap();
+    let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+    calibration::load_into(&sup, &cal, None).await;
+    {
+        let inner = sup.inner().read().await;
+        assert_eq!(inner.config.arm_model.correction().copied(), Some(kin_correction()));
+        assert!(inner.calibration_load_error.is_none() && inner.camera_calibrated());
+    }
+    assert_eq!(sup.get_schema().await.kinematics_correction, Some(kin_correction()));
+    // outside the bounds: calibration load_error (L4 path), the uncorrected model is used
+    let mut bad: Value = serde_json::to_value(&file).unwrap();
+    bad["kinematics"]["joints"][4]["offset_rad"] = json!(0.5);
+    std::fs::write(&cal, bad.to_string()).unwrap();
+    let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+    calibration::load_into(&sup, &cal, None).await;
+    let inner = sup.inner().read().await;
+    assert!(inner.config.arm_model.correction().is_none());
+    let err = inner.calibration_load_error.clone().unwrap();
+    assert!(err.contains("kinematics") && err.contains("offset_rad"), "{err}");
+    assert!(!cal.exists(), "quarantined");
+    drop(inner);
+    // malformed (5 joints)
+    let mut bad: Value = serde_json::to_value(&file).unwrap();
+    bad["kinematics"]["joints"].as_array_mut().unwrap().pop();
+    std::fs::write(&cal, bad.to_string()).unwrap();
+    let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+    calibration::load_into(&sup, &cal, None).await;
+    let inner = sup.inner().read().await;
+    assert!(inner.config.arm_model.correction().is_none() && inner.calibration_load_error.is_some());
+    // the default schema publishes null
+    drop(inner);
+    let v = serde_json::to_value(sup.get_schema().await).unwrap();
+    assert_eq!(v.get("kinematics_correction"), Some(&Value::Null));
+}
+
+fn so101() -> ArmConfig {
+    let mut cfg: ArmConfig = serde_json::from_str(include_str!("../profiles/so_arm101.json")).unwrap();
+    cfg.init_arm_model_in_memory(Some(include_str!("../assets/so101_new_calib.urdf"))).unwrap();
+    cfg
+}
+
+#[tokio::test]
+async fn urdf_chain_profiles_refuse_kinematics() {
+    let mut r = rig_cfg(so101(), |d| (d.join("calibration.json"), d.join("grasp_setup.json"))).await;
+    assert!(!r.sup.get_schema().await.capabilities.calibration_kinematics);
+    for dry in [true, false] {
+        let rej = cmd(&mut r, "/api/v1/calibration/apply", with_kin(apply_body(dry), kin_value())).await;
+        assert_eq!(rej["code"], "UNSUPPORTED", "{rej}");
+        assert!(rej["message"].as_str().unwrap().contains("URDF"), "{rej}");
+    }
+    assert!(r.sup.inner().read().await.config.arm_model.correction().is_none());
+    // startup: the camera calibration loads, the correction is ignored with a load_error
+    let dir = tempfile::tempdir().unwrap();
+    let cal = dir.path().join("calibration.json");
+    let mut file = calib_file(k::r_to_quat(&so101().arm_model.cam_mount(false, 0.0, -20.0)));
+    file.kinematics = Some(serde_json::from_value(kin_value()).unwrap());
+    std::fs::write(&cal, serde_json::to_string(&file).unwrap()).unwrap();
+    let sup = ArmSupervisor::new(so101());
+    calibration::load_into(&sup, &cal, None).await;
+    let inner = sup.inner().read().await;
+    assert!(inner.camera_calibrated() && inner.config.arm_model.correction().is_none());
+    assert!(inner.calibration.as_ref().unwrap().kinematics.is_none());
+    assert!(inner.calibration_load_error.as_ref().is_some_and(|e| e.contains("URDF")), "{:?}", inner.calibration_load_error);
 }

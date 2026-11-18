@@ -108,9 +108,10 @@ pub fn rebot_dm_chain(offsets: &[f64; 6]) -> &'static KinematicChain {
 }
 
 impl ArmModel {
-    /// The chain the dynamics use (the built-in model's chain from the embedded URDF).
+    /// The chain the dynamics use (the built-in model's chain from the embedded URDF; the
+    /// kinematic correction is not applied to the power-budget dynamics).
     pub fn dynamics_chain(&self) -> &KinematicChain {
-        match self { Self::RebotDevArm(off) => rebot_dm_chain(off), Self::Chain(c) => c }
+        match self { Self::RebotDevArm(off, _) => rebot_dm_chain(off), Self::Chain(c) => c }
     }
 
     /// [`rnea`] for this model.
