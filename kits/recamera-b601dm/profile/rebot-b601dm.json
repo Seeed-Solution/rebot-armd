@@ -495,5 +495,18 @@
     0.0,
     0.0,
     -1.5707963267948966
-  ]
+  ],
+  "zero_pose": {
+    "description": "Folded like the home pose: upper arm level pointing back from the shoulder, forearm folded back over it, gripper level pointing straight forward (tool about 0.26 m in front of the base, 0.19 m high).",
+    "joints": [
+      "J1 base: arm plane facing forward (+x)",
+      "J2 shoulder: upper arm level, pointing back",
+      "J3 elbow: forearm folded back over the upper arm",
+      "J4 wrist pitch: gripper level",
+      "J5 wrist yaw: gripper pointing straight forward",
+      "J6 wrist roll: motor 0, jaws open up/down (the home pose has J6 at +90 deg, jaws open sideways)"
+    ],
+    "gripper": "Gripper fully closed",
+    "source": "built-in FK of assets/reBot-DevArm_gripper.urdf; gripper: wiki.seeedstudio.com/rebot_arm_b601_dm_lerobot (zero position = gripper fully closed)"
+  }
 }
