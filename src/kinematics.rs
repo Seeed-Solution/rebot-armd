@@ -294,35 +294,89 @@ pub fn validate_correction(c: &Correction) -> Result<(), String> {
     Ok(())
 }
 
+/// One joint of the built-in chain as FK walks it: the joint origin (URDF origin, then the
+/// correction's tilt and translation, combined once), the URDF axis sign and the angle map.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Link {
+    p: Vec3,
+    r: Mat3,
+    /// URDF axis sign (z axis, +-1).
+    s: f64,
+    /// `1 + scale` and `offset_rad`; used only when `moves_angle`.
+    gain: f64,
+    offset: f64,
+    moves_angle: bool,
+}
+
+impl Link {
+    fn nominal(j: usize) -> Self {
+        Self { p: TRANS[j + 1], r: ROT[j + 1], s: AXES[j + 1][2], gain: 1.0, offset: 0.0, moves_angle: false }
+    }
+
+    fn corrected(j: usize, c: &JointCorrection) -> Self {
+        let mut l = Self::nominal(j);
+        if c.moves_origin() {
+            // F_i · [Rx Ry, origin]: p = TRANS + ROT·origin, R = ROT·Rx·Ry (computed once)
+            l.p = add(&l.p, &mat3_vec3_mul(&l.r, &c.origin_m));
+            l.r = mat3_mul(&l.r, &mat3_mul(&axis_r(&[1.0, 0.0, 0.0], c.tilt_rad[0]), &axis_r(&[0.0, 1.0, 0.0], c.tilt_rad[1])));
+        }
+        if c.moves_angle() {
+            l.gain = 1.0 + c.scale;
+            l.offset = c.offset_rad;
+            l.moves_angle = true;
+        }
+        l
+    }
+}
+
+static NOMINAL_LINKS: LazyLock<[Link; 6]> = LazyLock::new(|| std::array::from_fn(Link::nominal));
+
+/// A kinematic correction with the corrected joint origins precomputed. Built once when the
+/// correction is set ([`crate::chain::ArmModel::with_correction`]), so FK / IK with a
+/// correction do the same arithmetic per call as the URDF chain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedCorrection {
+    pub joints: Correction,
+    links: [Link; 6],
+}
+
+impl PreparedCorrection {
+    pub fn new(c: &Correction) -> Self {
+        Self { joints: *c, links: std::array::from_fn(|j| Link::corrected(j, &c[j])) }
+    }
+}
+
+fn links_of(prep: Option<&PreparedCorrection>) -> &[Link; 6] {
+    match prep { Some(p) => &p.links, None => &NOMINAL_LINKS }
+}
+
 /// End pose and world joint axes / origins for q (model J1..J6), `VIK.frames`.
-pub fn frames(q: &[f64; 6]) -> Frames { frames_corrected(q, None) }
+pub fn frames(q: &[f64; 6]) -> Frames { frames_prepared(q, None) }
 
 /// [`frames`] of the chain with the kinematic correction `corr` (design "Correction model",
 /// kincal2.mjs `fkP`). `axes[j]` is d(pose)/d(q_j): the world axis times the URDF axis sign
 /// and `1 + scale`, so the DLS Jacobian stays exact. Joints with an all-zero correction (and
-/// `corr` None) take the same arithmetic as the URDF chain, bit for bit.
+/// `corr` None) take the same arithmetic as the URDF chain, bit for bit. Prepares `corr` on
+/// every call; repeated callers hold a [`PreparedCorrection`] and use [`frames_prepared`].
 pub fn frames_corrected(q: &[f64; 6], corr: Option<&Correction>) -> Frames {
+    match corr {
+        Some(c) => frames_prepared(q, Some(&PreparedCorrection::new(c))),
+        None => frames_prepared(q, None),
+    }
+}
+
+/// [`frames_corrected`] with a precomputed correction (None = the URDF chain).
+pub fn frames_prepared(q: &[f64; 6], prep: Option<&PreparedCorrection>) -> Frames {
+    let links = links_of(prep);
     let mut r = IDENTITY;
     let mut p = [0.0; 3];
     let mut axes = [[0.0; 3]; 6];
     let mut origins = [[0.0; 3]; 6];
-    for j in 0..6 {
-        let (link_p, link_r, s) = (&TRANS[j + 1], &ROT[j + 1], AXES[j + 1][2]);
-        let d = mat3_vec3_mul(&r, link_p);
+    for (j, l) in links.iter().enumerate() {
+        let d = mat3_vec3_mul(&r, &l.p);
         p = add(&p, &d);
-        r = mat3_mul(&r, link_r);
-        let mut th = s * q[j];
-        let mut gain = s;
-        if let Some(c) = corr.map(|c| &c[j]) {
-            if c.moves_origin() {
-                p = add(&p, &mat3_vec3_mul(&r, &c.origin_m));
-                r = mat3_mul(&r, &mat3_mul(&axis_r(&[1.0, 0.0, 0.0], c.tilt_rad[0]), &axis_r(&[0.0, 1.0, 0.0], c.tilt_rad[1])));
-            }
-            if c.moves_angle() {
-                th = s * (q[j] * (1.0 + c.scale) + c.offset_rad);
-                gain = s * (1.0 + c.scale);
-            }
-        }
+        r = mat3_mul(&r, &l.r);
+        let (th, gain) = if l.moves_angle { (l.s * (q[j] * l.gain + l.offset), l.s * l.gain) } else { (l.s * q[j], l.s) };
         axes[j] = [r[0][2] * gain, r[1][2] * gain, r[2][2] * gain];
         origins[j] = p;
         let (c, sn) = (th.cos(), th.sin());
@@ -342,6 +396,9 @@ pub fn fk(q: &[f64; 6]) -> Pose { frames(q).end }
 
 /// [`fk`] with the kinematic correction `corr`.
 pub fn fk_corrected(q: &[f64; 6], corr: Option<&Correction>) -> Pose { frames_corrected(q, corr).end }
+
+/// [`fk`] with a precomputed correction.
+pub fn fk_prepared(q: &[f64; 6], prep: Option<&PreparedCorrection>) -> Pose { frames_prepared(q, prep).end }
 
 /// f32 joint vector (at least 6 entries) -> model angles.
 pub fn q6(q: &[f32]) -> [f64; 6] {
@@ -409,6 +466,14 @@ pub fn solve_dls_corrected(goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64;
 
 /// The DLS solve with explicit parameters `par` (armd uses [`PAR`]; `par.w` is ignored, `w` wins).
 pub fn solve_dls_par(goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], w: f64, par: &IkParams, corr: Option<&Correction>) -> IkResult {
+    match corr {
+        Some(c) => solve_dls_prepared(goal, q0, lo, hi, w, par, Some(&PreparedCorrection::new(c))),
+        None => solve_dls_prepared(goal, q0, lo, hi, w, par, None),
+    }
+}
+
+/// [`solve_dls_par`] with a precomputed correction (None = the URDF chain).
+pub fn solve_dls_prepared(goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], w: f64, par: &IkParams, prep: Option<&PreparedCorrection>) -> IkResult {
     let iters = par.iters;
     let mut lo_w = [0.0; 6];
     let mut hi_w = [0.0; 6];
@@ -418,7 +483,7 @@ pub fn solve_dls_par(goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], w
     }
     let (rg, pg) = (&goal.r, &goal.p);
     let mut q = *q0;
-    let mut f = frames_corrected(&q, corr);
+    let mut f = frames_prepared(&q, prep);
     let mut e = pose_err(&f, rg, pg, w);
     let mut lam = par.lam_min;
     let mut it = 0;
@@ -455,7 +520,7 @@ pub fn solve_dls_par(goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], w
         let k = if big > par.max_step { par.max_step / big } else { 1.0 };
         let mut qn = [0.0; 6];
         for i in 0..6 { qn[i] = hi_w[i].min(lo_w[i].max(q[i] + k * dq[i])); }
-        let fn_ = frames_corrected(&qn, corr);
+        let fn_ = frames_prepared(&qn, prep);
         let en = pose_err(&fn_, rg, pg, w);
         if en.ep + w * en.er < e.ep + w * e.er {
             q = qn; f = fn_; e = en; lam = par.lam_min;

@@ -465,7 +465,7 @@ pub struct JointMap {
 /// chain spec; no correction).
 #[derive(Debug, Clone)]
 pub enum ArmModel {
-    RebotDevArm([f64; 6], Option<Arc<k::Correction>>),
+    RebotDevArm([f64; 6], Option<Arc<k::PreparedCorrection>>),
     Chain(Arc<KinematicChain>),
 }
 
@@ -482,7 +482,7 @@ impl ArmModel {
 
     /// The kinematic correction in effect (built-in model only).
     pub fn correction(&self) -> Option<&k::Correction> {
-        match self { Self::RebotDevArm(_, c) => c.as_deref(), Self::Chain(_) => None }
+        match self { Self::RebotDevArm(_, c) => c.as_deref().map(|p| &p.joints), Self::Chain(_) => None }
     }
 
     /// This model with the kinematic correction `corr` (None or all zero = uncorrected).
@@ -493,7 +493,7 @@ impl ArmModel {
         match self {
             Self::RebotDevArm(off, _) => {
                 if let Some(c) = corr { k::validate_correction(c)?; }
-                Ok(Self::RebotDevArm(*off, corr.map(|c| Arc::new(*c))))
+                Ok(Self::RebotDevArm(*off, corr.map(|c| Arc::new(k::PreparedCorrection::new(c)))))
             }
             Self::Chain(_) if corr.is_none() => Ok(self.clone()),
             Self::Chain(_) => Err("a kinematic correction needs the built-in RebotDevArm model; this profile uses a URDF chain".into()),
@@ -523,7 +523,7 @@ impl ArmModel {
     /// Tip pose for armd angles `q` (at least `arm_dof` entries).
     pub fn fk(&self, q: &[f64]) -> Pose {
         match self {
-            Self::RebotDevArm(off, c) => k::fk_corrected(&Self::builtin_q(off, q), c.as_deref()),
+            Self::RebotDevArm(off, c) => k::fk_prepared(&Self::builtin_q(off, q), c.as_deref()),
             Self::Chain(c) => c.fk(q),
         }
     }
@@ -547,7 +547,7 @@ impl ArmModel {
         match self {
             Self::RebotDevArm(off, c) => {
                 let m = |q: &[f64; 6]| Self::builtin_q(off, q);
-                let r = k::solve_dls_corrected(goal, &m(q0), &m(lo), &m(hi), w, PAR.iters, c.as_deref());
+                let r = k::solve_dls_prepared(goal, &m(q0), &m(lo), &m(hi), w, &PAR, c.as_deref());
                 IkResult { q: std::array::from_fn(|i| r.q[i] - off[i]), ..r }
             }
             Self::Chain(c) if c.dof() == 6 => {
@@ -598,7 +598,7 @@ impl ArmModel {
     pub fn joint_reach(&self, max_offset: f64) -> [f64; MAX_CHAIN_JOINTS] {
         let n = self.arm_dof();
         let (origins, end): (Vec<Vec3>, Vec3) = match self {
-            Self::RebotDevArm(off, c) => { let f = k::frames_corrected(off, c.as_deref()); (f.origins.to_vec(), f.end.p) }
+            Self::RebotDevArm(off, c) => { let f = k::frames_prepared(off, c.as_deref()); (f.origins.to_vec(), f.end.p) }
             Self::Chain(c) => { let f = c.frames(&[0.0; MAX_CHAIN_JOINTS]); (f.origins[..n].to_vec(), f.end.p) }
         };
         let mut reach = [0.0; MAX_CHAIN_JOINTS];
