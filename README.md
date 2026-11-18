@@ -527,6 +527,52 @@ Measured so far: synthetic data only (`node scripts/calib_wizard_selftest.mjs`: 
 noise, 20 generated views; `scripts/calib_wizard_shots.mjs`: the full flow in a browser against
 a simulated arm and camera). Not yet run on the arm.
 
+#### Fine calibration (camera + arm geometry)
+
+The wizard's first step offers a second mode, **Fine calibration (camera + arm geometry)**, next to
+**Camera calibration** (unchanged). Besides intrinsics, mount and table height it solves a
+geometric correction of the arm: for J2..J5 the zero offset, an angle scale, a tilt of the joint
+axis (x / y) and a shift of the joint origin (28 parameters); J1 and J6 stay zero (absorbed by the
+board pose and the camera mount). armd stores it as `kinematics` in `calibration.json` and
+publishes it as `kinematics_correction` in `/api/v1/observation/schema`; the cockpit's FK / IK
+(3D view, pose card, camera-view IK, the wizard) read it from there.
+
+1. **Board**, **Place A**: as above; the plan has about 35 poses (camera 0.20–0.40 m from the
+   board, view tilt 0–36°, roll 0 / ±20°, at least 8 predicted markers).
+2. **Capture A**: joint-space moves with `/api/v1/motion/jog` (`target_positions`,
+   `duration_secs`, largest joint ≤ 0.25 rad/s). Every pose is approached from the same side: first
+   a pre-pose 2° below the target on every joint (above it where the lower limit is near), then the
+   target. Each segment is checked at 20 points (joint limits, tool points ≥ 0.08 m above the board
+   plane and ≥ 0.02 m above the base plane). Still = every joint moved < 0.003 rad within 0.5 s
+   (at most 15 s; a sample that does not settle is kept and marked), then 1.5 s, then 2 frames.
+   The abort rules of the camera mode apply; after an abort the views are kept and **Continue**
+   resumes at the next pose of the same plan.
+3. **Move board**: move the board to another spot (at least 10 cm away, turning it is fine), jog
+   until it is in view and capture the start view of placement B.
+4. **Capture B**: as capture A.
+5. **Solve** (Web Worker in the page, `solveFine` in `/assets/calib_wizard.js`): intrinsics from the
+   image-only solve over A + B (camera-mode intrinsics gates); then the kinematic fit (correction,
+   X = T_end_cam, one board pose per placement, intrinsics fixed). Fitted on A and checked on B
+   (kinematics and X frozen, only B's board pose refitted) and the other way. Gates: held-out
+   error ≤ 3 mm both ways (mm = px x depth / fx), the mean held-out error ≥ 30 % below the
+   uncorrected model (URDF with armd's `model_joint_map`, X and board poses fitted), every
+   parameter inside the bounds armd accepts (|offset| ≤ 10°, |scale| ≤ 0.08, |tilt| ≤ 3° per axis,
+   |origin| ≤ 30 mm per component). The fit on A + B is applied. The solve page shows the
+   held-out errors before / after, the per-joint parameters and, for a zero offset > 5°, a note to
+   re-zero that motor with the official tool (reBotArm_control_py `example/2_zero_and_read.py` /
+   MotorBridge); Apply stays possible when the gates pass.
+6. **Review**, **Applied**: one apply with `intrinsics`, `camera_mount`, `table_z_m` and
+   `kinematics`; armd needs torque off and no running action for it (`KINEMATICS_ARMED`
+   otherwise), the review page offers **Park and torque off**.
+
+Duration: the real-arm capture with the same motion rules (`real2/collect.mjs`, 70 poses) took
+about 600 s, about 8.5 s per pose, so about 5 minutes per placement. Measured on recorded real-arm
+data (B601-DM, 2026-11-18, 134 views of placement A, 65 of B; `node scripts/kincal_selftest.mjs`):
+held-out A → B 2.76 → 2.01 mm, B → A 3.64 → 2.24 mm (uncorrected → corrected, model angles with the
+J5 −4° zero offset already in armd's joint map), gates pass, solve 0.43 s in Node on the spark
+workstation (not measured on a phone). The wizard flow itself ran against a simulated arm only
+(`scripts/calib_wizard_shots.mjs`).
+
 ## Vision (reCamera kit)
 
 `rebot-vision` ([kits/recamera-b601dm/vision](kits/recamera-b601dm/vision/)) is a C++ process
@@ -780,6 +826,7 @@ cargo clippy --all-targets -- -D warnings
 node scripts/view_ik_selftest.mjs          # cockpit view-frame IK
 node scripts/calib_selftest.mjs            # cockpit hand-eye calibration (part c needs ../rebot-companion and uv)
 node scripts/calib_wizard_selftest.mjs     # calibration wizard solvers and pose generator (synthetic data)
+node scripts/kincal_selftest.mjs           # fine calibration solver (synthetic data, real-arm replay when the data is present)
 node tests/test_rpc_error_contract.js      # cockpit RPC error handling
 ```
 

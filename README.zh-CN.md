@@ -288,6 +288,19 @@ v1.4.0 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 
 目前的测试只用了合成数据（`node scripts/calib_wizard_selftest.mjs`：角点噪声 0.3 px，20 个生成的视图；`scripts/calib_wizard_shots.mjs`：在浏览器中对仿真机械臂和相机走完整个流程），尚未在真机上运行。
 
+#### 精校（相机 + 机械臂几何）
+
+向导第一步在 **相机标定**（不变）旁边提供第二种模式 **精校（相机 + 机械臂几何）**。除内参、安装和桌面高度外，还求解机械臂的几何修正：J2..J5 各自的零位、角度比例、关节轴倾斜（x / y）和关节原点偏移（共 28 个参数）；J1、J6 保持为 0（分别被标定板位姿和相机安装吸收）。armd 把它存为 `calibration.json` 中的 `kinematics`，并在 `/api/v1/observation/schema` 中发布为 `kinematics_correction`；驾驶舱的 FK / IK（3D 视图、姿态卡片、相机视角 IK、向导）从这里读取。
+
+1. **标定板**、**摆放 A**：同上；计划约 35 个位姿（相机距标定板 0.20–0.40 m，视线倾角 0–36°，绕光轴转动 0 / ±20°，预测可见标记不少于 8 个）。
+2. **采集 A**：用 `/api/v1/motion/jog`（`target_positions`、`duration_secs`，最大关节速度 ≤ 0.25 rad/s）在关节空间移动。每个位姿都从同一方向接近：先到各关节比目标低 2° 的预位姿（下限附近改为高 2°），再到目标。每段移动按 20 个点检查（关节限位、工具各点高于标定板平面 ≥ 0.08 m、高于基座平面 ≥ 0.02 m）。0.5 s 内各关节变化都 < 0.003 rad 视为静止（最多等 15 s，未静止的样本保留并标记），再等 1.5 s，采集 2 帧。相机标定模式的中止规则同样适用；中止后已采集的视图保留，**继续** 从同一计划的下一个位姿接着采集。
+3. **移板**：把标定板移到另一个位置（距原位置至少 10 cm，可以转一个角度），用摇杆让相机看到它，采集位置 B 的起始视图。
+4. **采集 B**：同采集 A。
+5. **求解**（页面内的 Web Worker，`/assets/calib_wizard.js` 的 `solveFine`）：内参来自 A + B 全部图像的单独求解（沿用相机标定的内参检查项）；之后做运动学拟合（几何修正、X = T_end_cam、每个位置一个标定板位姿，内参固定）。在 A 上拟合、在 B 上检验（几何修正和 X 固定，只重新拟合 B 的标定板位姿），反过来再做一次。检查项：两个方向的留出误差都 ≤ 3 mm（mm = px × 深度 / fx）；两个方向留出误差的平均值比未修正模型（URDF 加 armd 的 `model_joint_map`，只拟合 X 和标定板位姿）低 ≥ 30 %；所有参数在 armd 接受的范围内（|零位| ≤ 10°、|比例| ≤ 0.08、每轴 |倾斜| ≤ 3°、每个分量 |原点| ≤ 30 mm）。写入的是 A + B 一起拟合的结果。求解页显示修正前后的留出误差和各关节参数；零位偏差 > 5° 时提示用官方工具（reBotArm_control_py `example/2_zero_and_read.py` / MotorBridge）重新校准该电机零位，检查都通过时仍可应用。
+6. **确认**、**完成**：一次写入 `intrinsics`、`camera_mount`、`table_z_m` 和 `kinematics`；armd 要求电机断电且没有动作在运行（否则返回 `KINEMATICS_ARMED`），确认页提供 **停靠并断电**。
+
+耗时：按同样运动规则的真机采集（`real2/collect.mjs`，70 个位姿）用时约 600 s，每个位姿约 8.5 s，每个位置约 5 分钟。用录制的真机数据测得（B601-DM，2026-11-18，位置 A 134 个视图，位置 B 65 个；`node scripts/kincal_selftest.mjs`）：留出误差 A → B 2.76 → 2.01 mm，B → A 3.64 → 2.24 mm（未修正 → 修正后；模型角度已含 armd 关节映射中 J5 的 −4° 零位），检查项通过，在 spark 工作站的 Node 中求解 0.43 s（未在手机上测量）。向导流程本身只在仿真机械臂上运行过（`scripts/calib_wizard_shots.mjs`）。
+
 ## 视觉（reCamera 套件）
 
 `rebot-vision`（[kits/recamera-b601dm/vision](kits/recamera-b601dm/vision/)）是 `rebot-teleop` 包中的 C++ 进程，独占摄像头，提供：
@@ -459,6 +472,7 @@ cargo clippy --all-targets -- -D warnings
 node scripts/view_ik_selftest.mjs          # 驾驶舱视角坐标系 IK
 node scripts/calib_selftest.mjs            # 驾驶舱手眼标定（c 部分需要 ../rebot-companion 和 uv）
 node scripts/calib_wizard_selftest.mjs     # 相机标定向导的求解器与位姿生成（合成数据）
+node scripts/kincal_selftest.mjs           # 精校求解器（合成数据；有真机数据时回放）
 node tests/test_rpc_error_contract.js      # 驾驶舱 RPC 错误处理
 ```
 
