@@ -187,5 +187,24 @@ function poseAgreement(views, r, kTrue) {
   const r = solveKinematics({ views: render(kInj).filter((v) => v.ds === 0), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
   check('c. one placement only -> refused before solving', !r.ok && !r.joints && r.gates[0].key === 'kin_views' && !r.gates[0].ok, gateStr(r.gates));
 }
+// ---- d. step generators (the cockpit runs them in a Web Worker, or on the main thread in slices): the longest
+// synchronous stretch between two yields, real-arm views through solveFine (intrinsics + kinematics) and a
+// fine-mode plan. Measured on this machine; a phone / Pi is slower by a factor to be measured there.
+{
+  const longest = (gen) => { let t = performance.now(), worst = 0, steps = 0; for (;;) { const r = gen.next(); const n = performance.now(); worst = Math.max(worst, n - t); t = n; steps++; if (r.done) return { worst, steps, value: r.value }; } };
+  const dir = process.env.REAL2 || '/home/harvest/project/_scratch/calib-wizard/real2';
+  let views = render(kInj);
+  if (fs.existsSync(path.join(dir, 'collect_b2.json'))) {
+    views = [];
+    ['collect_b1.json', 'collect_b2.json'].forEach((f, ds) => { const d = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')), jm = d.joint_map; for (const sm of d.samples) for (const fr of sm.frames) if (fr.markers.length >= 6) views.push({ markers: fr.markers, q: fr.pos.slice(0, 6).map((v, i) => jm.sign[i] * v + jm.offset_rad[i]), ds }); });
+  }
+  const t0 = performance.now();
+  const a = longest(CW.solveFineSteps({ views, markerSide: 0.025, chain: CALM.CHAIN, X0: make(mul(CALM.axisR([0, 0, 1], -Math.PI / 2), CALM.axisR([1, 0, 0], -128 / D)), [-0.07, 0, 0.07]), prior: PRIOR }));
+  const total = performance.now() - t0;
+  const q0 = plans[0][0];
+  const b = longest(CW.generatePosesSteps({ ...FINE, Tbb: PLACE[0], board, K: CW.NOMINAL, X: Xnom, q0, fk, ik, lo, hi }));
+  check('d. longest synchronous step < 50 ms (solveFine on the real views, fine-mode plan)', a.worst < 50 && b.worst < 50,
+    `solveFine ${views.length} views: ${a.steps} steps, longest ${a.worst.toFixed(1)} ms, total ${(total / 1000).toFixed(1)} s (intrinsics included), gates ${a.value.ok ? 'pass' : 'refuse'}; generatePoses: ${b.steps} steps, longest ${b.worst.toFixed(1)} ms, ${b.value.poses.length} poses`);
+}
 console.log(fails ? `${fails} checks failed` : 'all checks passed');
 process.exit(fails ? 1 : 0);

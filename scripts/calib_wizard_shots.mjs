@@ -322,6 +322,21 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(500);
     if (!(await page.evaluate(setupSim)) || !(await page.evaluate(setupFine))) fail('fine sim start');
+    // main-thread blocking during plan and solve (max gap of a 10 ms timer); the phone runs
+    // use the no-worker fallback (sliced on the main thread)
+    const noWorker = vpName === 'phone';
+    await page.evaluate((nw) => {
+      // probe: a 10 ms timer on the main thread (as the lease heartbeat timer); a gap between two ticks is the
+      // time the thread was blocked (longest task + timer slack). PerformanceObserver('longtask') reported nothing
+      // in headless Chromium here, not even for a synchronous control block.
+      __SIM.long = []; __SIM.phase = null;
+      let last = performance.now();
+      setInterval(() => { const n = performance.now(); if (__SIM.phase) __SIM.long.push([__SIM.phase, n - last]); last = n; }, 10);
+      if (nw) window.Worker = undefined;
+    }, noWorker);
+    const phase = (ph) => page.evaluate((x) => { __SIM.phase = x; }, ph);
+    const longest = async (ph) => page.evaluate((x) => Math.max(0, ...__SIM.long.filter(([p]) => p === x).map(([, d]) => d)), ph);
+    const longs = {};
     const shot = async (step, extra = '') => {
       await page.waitForTimeout(250);
       const info = await page.evaluate(() => ({ open: !$('cwiz').hidden, on: [...document.querySelectorAll('#cwiz-steps li.on')].map((x) => x.textContent).join(),
@@ -342,8 +357,10 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     await shot('1_board', `mode ${md.mode}, ${md.steps} steps`);
     await page.click('#cwiz-next');
     await shot('2_placeA');
+    await phase('planA');
     await page.click('#cwiz-boot');
-    await waitW(page, () => CWZ.step === 'capture' || (!CWZ.busy && CWZ.status), 20000, 'fine boot A');
+    await waitW(page, () => CWZ.step === 'capture' || (!CWZ.busy && CWZ.status), 60000, 'fine boot A');
+    await page.waitForTimeout(100); await phase(null); longs.planA = await longest('planA');
     const pa = await page.evaluate(() => ({ step: CWZ.step, n: CWZ.plan.length, dmax: Math.max(...CWZ.plan.map((p) => p.dist)) }));
     if (pa.step !== 'capture' || pa.n < 15) fail('fine plan A ' + JSON.stringify(pa));
     // capture A: run all, Stop after 3 poses, Continue
@@ -382,8 +399,10 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     await page.click('#cwiz-tob');
     if (!(await page.evaluate(() => __SIM.moveBoard()))) fail('fine move board ik');
     await shot('5_move');
+    await phase('planB');
     await page.click('#cwiz-boot');
-    await waitW(page, () => CWZ.step === 'captureb' || (!CWZ.busy && CWZ.status), 20000, 'fine boot B');
+    await waitW(page, () => CWZ.step === 'captureb' || (!CWZ.busy && CWZ.status), 60000, 'fine boot B');
+    await page.waitForTimeout(100); await phase(null); longs.planB = await longest('planB');
     if (!(await page.evaluate(() => CWZ.step === 'captureb' && CWZ.place === 1 && CWZ.views.some((v) => v.ds === 0)))) fail('fine boot B ' + JSON.stringify(await page.evaluate(() => ({ step: CWZ.step, status: CWZ.status, place: CWZ.place }))));
     await page.check('#cwiz-runall');
     await page.click('#cwiz-go');
@@ -392,10 +411,21 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     if (rb.idx !== rb.n || rb.B < 20) fail('fine capture B ' + JSON.stringify(rb));
     await shot('6_captureB_done', `views A ${rb.A}, B ${rb.B}`);
     // solve in the worker
+    await phase('solve');
     await page.click('#cwiz-solve');
-    await waitW(page, () => !CWZ.solving && CWZ.step === 'solve', 180000, 'fine solve');
+    await waitW(page, () => !CWZ.solving && CWZ.step === 'solve', 300000, 'fine solve');
+    await page.waitForTimeout(100); await phase(null); longs.solve = await longest('solve');
+    // control: the same plan run synchronously on the main thread (what the page did before) must show up as a long task
+    await phase('control');
+    await page.evaluate(() => { cwPlan(CWZ.est, cwModelQ(S.obs.positions), CWF.n); });
+    await page.waitForTimeout(200); await phase(null); longs.control = await longest('control');
+    if (!(longs.control > 50)) fail('fine blocking probe control ' + longs.control);
+    const pw = await page.evaluate(() => ({ plan: CWZ.planWorker, solve: CWZ.solve && CWZ.solve.worker }));
+    const lmax = Math.max(longs.planA, longs.planB, longs.solve);
+    if (lmax >= 300 || pw.plan !== !noWorker || pw.solve !== !noWorker) fail('fine main-thread long task ' + JSON.stringify({ longs, pw }));
+    console.log(`  main-thread longest block (${lang}/${vpName}, ${noWorker ? 'no Worker: sliced on the main thread' : 'Web Worker'}): plan A ${longs.planA.toFixed(0)} ms, plan B ${longs.planB.toFixed(0)} ms, solve ${longs.solve.toFixed(0)} ms (max gap of a 10 ms timer); control: the same plan synchronously ${longs.control.toFixed(0)} ms; plan in worker ${pw.plan}, solve in worker ${pw.solve}`);
     const so = await page.evaluate(() => { const r = CWZ.solve; return r ? { ok: r.ok, worker: r.worker, secs: +r.secs.toFixed(1), fails: r.gates.filter((g) => !g.ok).map((g) => g.key), ho: [r.kin.heldOut.ab0.mm, r.kin.heldOut.ab.mm, r.kin.heldOut.ba0.mm, r.kin.heldOut.ba.mm].map((v) => +v.toFixed(2)), j5: +(r.kin.joints[4].offset_rad * 180 / Math.PI).toFixed(2), warn: document.querySelectorAll('#cwiz-body .cwiz-zero').length, tables: document.querySelectorAll('#cwiz-body .cwiz-table').length, flat: [...document.querySelectorAll('#cwiz-body .cwiz-table')].filter((d) => d.getBoundingClientRect().height < 40).length } : { status: CWZ.status }; });
-    if (!so.ok || !so.worker || so.warn !== 1 || so.tables !== 3 || so.flat) fail('fine solve ' + JSON.stringify(so));
+    if (!so.ok || so.worker !== !noWorker || so.warn !== 1 || so.tables !== 3 || so.flat) fail('fine solve ' + JSON.stringify(so));
     await shot('7_solve', `gates ok ${so.ok}, Web Worker ${so.worker}, ${so.secs} s, held-out A->B ${so.ho[0]} -> ${so.ho[1]} mm, B->A ${so.ho[2]} -> ${so.ho[3]} mm, J5 zero ${so.j5} deg, warnings ${so.warn}`);
     await page.evaluate(() => { const b = $('cwiz-body'); b.scrollTop = b.scrollHeight; });
     await shot('7b_solve_params');

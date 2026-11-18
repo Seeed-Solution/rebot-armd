@@ -73,10 +73,24 @@ export function symEig(A) {
 const minEigVec = (A) => { const { vals, vecs } = symEig(A); let k = 0; for (let i = 1; i < vals.length; i++) if (vals[i] < vals[k]) k = i; return vecs.map((r) => r[k]); };
 const maxEigVec = (A) => { const { vals, vecs } = symEig(A); let k = 0; for (let i = 1; i < vals.length; i++) if (vals[i] > vals[k]) k = i; return vecs.map((r) => r[k]); };
 
+/* Step generators: the long solvers are written as generators that yield at points a few ms apart, so the same
+   code runs synchronously (runSync), in a Web Worker, or on the page's main thread in slices (runSliced, awaits a
+   macrotask whenever a slice exceeds sliceMs) without blocking lease heartbeats. */
+export function runSync(gen) { for (;;) { const r = gen.next(); if (r.done) return r.value; } }
+export async function runSliced(gen, { sliceMs = 40, now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now()), pause = () => new Promise((r) => setTimeout(r, 0)) } = {}) {
+  let t0 = now();
+  for (;;) {
+    const r = gen.next();
+    if (r.done) return r.value;
+    if (now() - t0 > sliceMs) { await pause(); t0 = now(); }
+  }
+}
 // Cholesky of a flat n x n SPD matrix; null when not positive definite
-function chol(A, n) {
+const chol = (A, n) => runSync(cholSteps(A, n));
+function* cholSteps(A, n) {
   const L = new Float64Array(n * n);
   for (let i = 0; i < n; i++) for (let j = 0; j <= i; j++) {
+    if (j === 0 && n > 100) yield;
     let s = A[i * n + j];
     for (let k = 0; k < j; k++) s -= L[i * n + k] * L[j * n + k];
     if (i === j) { if (!(s > 0)) return null; L[i * n + i] = Math.sqrt(s); } else L[i * n + j] = s / L[j * n + j];
@@ -328,7 +342,8 @@ const INTR = ['fx', 'fy', 'cx', 'cy', 'k1', 'k2'];
 // views: [{ obj: [[X, Y, 0]], img: [[u, v]] }], K0 intrinsics, poses0: [{ R, t }]
 // opt.fixIntr: true (all fixed) or array of 6 booleans. Numeric (central difference) Jacobian, block
 // sparse normal equations (each pose block couples only to its own view and the intrinsics).
-export function lmRefine(views, K0, poses0, opt = {}) {
+export const lmRefine = (views, K0, poses0, opt = {}) => runSync(lmRefineSteps(views, K0, poses0, opt));
+export function* lmRefineSteps(views, K0, poses0, opt = {}) {
   const nv = views.length;
   const fixI = opt.fixIntr === true ? [1, 1, 1, 1, 1, 1] : (opt.fixIntr || [0, 0, 0, 0, 0, 0]);
   const iIdx = INTR.map((_, k) => k).filter((k) => !fixI[k]), ni = iIdx.length, P = ni + 6 * nv;
@@ -342,9 +357,10 @@ export function lmRefine(views, K0, poses0, opt = {}) {
   const sse = (a, pzs) => { let s = 0; for (let v = 0; v < nv; v++) for (const e of resView(a, pzs[v], v)) s += e * e; return s; };
   const hI = [1e-4, 1e-4, 1e-4, 1e-4, 1e-6, 1e-6], hP = [1e-6, 1e-6, 1e-6, 1e-7, 1e-7, 1e-7];
   // normal matrix and gradient at (intr, pose)
-  function normals() {
+  function* normals() {
     const N = new Float64Array(P * P), g = new Float64Array(P);
     for (let v = 0; v < nv; v++) {
+      if (nv > 8) yield;
       const r0 = resView(intr, pose[v], v), m = r0.length, JI = [], JP = [];
       for (const k of iIdx) {
         const ap = intr.slice(), am = intr.slice(); ap[k] += hI[k]; am[k] -= hI[k];
@@ -375,13 +391,13 @@ export function lmRefine(views, K0, poses0, opt = {}) {
   let cost = sse(intr, pose), lam = 1e-3, it = 0, Nlast = null;
   const maxIt = opt.iters ?? 60;
   for (; it < maxIt; it++) {
-    const { N, g } = normals();
+    const { N, g } = yield* normals();
     Nlast = N;
     let improved = false;
     for (let tries = 0; tries < 10 && !improved; tries++) {
       const A = N.slice();
       for (let i = 0; i < P; i++) A[i * P + i] += lam * (N[i * P + i] || 1e-12);
-      const L = chol(A, P);
+      const L = yield* cholSteps(A, P);
       if (!L) { lam *= 10; continue; }
       const dx = cholSolve(L, P, g.map((v) => -v));
       const a2 = intr.slice(); iIdx.forEach((k, j) => { a2[k] += dx[j]; });
@@ -398,14 +414,15 @@ export function lmRefine(views, K0, poses0, opt = {}) {
   // per-view RMS (per-corner distance), covariance of the free intrinsics
   const nPts = views.reduce((s, V) => s + V.obj.length, 0);
   const perView = views.map((V, v) => { const r = resView(intr, pose[v], v); let s = 0; for (const e of r) s += e * e; return Math.sqrt(s / V.obj.length); });
-  const { N } = normals();
+  const { N } = yield* normals();
   Nlast = N;
   const dof = Math.max(1, 2 * nPts - P), s2 = cost / dof;
   let sigma = null, cond = Infinity, singular = false;
-  const L = chol(N, P);
+  const L = yield* cholSteps(N, P);
   if (!L) singular = true;
   else if (ni) {
-    const C = iIdx.map((_, j) => { const e = new Float64Array(P); e[j] = 1; return cholSolve(L, P, e); });
+    const C = [];
+    for (let j = 0; j < iIdx.length; j++) { const e = new Float64Array(P); e[j] = 1; C.push(cholSolve(L, P, e)); yield; }
     const Cii = iIdx.map((_, j) => C[j][j]);
     sigma = {};
     iIdx.forEach((k, j) => { sigma[INTR[k]] = Math.sqrt(Math.max(0, s2 * Cii[j])); });
@@ -511,7 +528,7 @@ export function coverage(views, size = IMAGE) {
   }
   return cells;
 }
-function calibrateRaw(cv, size, init) {
+function* calibrateRawSteps(cv, size, init) {
   const Hs = cv.map((V) => homography(V.obj, V.img));
   if (Hs.some((H) => !H)) return { err: 'homography' };
   let K0 = zhang(Hs, size), method = 'zhang';
@@ -519,38 +536,39 @@ function calibrateRaw(cv, size, init) {
   if (!plausible(K0, size)) { K0 = { ...(init || NOMINAL) }; method = 'nominal'; }
   K0 = { ...K0, k1: 0, k2: 0 };
   const poses0 = cv.map((V, i) => poseFromH(K0, Hs[i]));
-  const r = lmRefine(cv, K0, poses0, { iters: 80 });
+  const r = yield* lmRefineSteps(cv, K0, poses0, { iters: 80 });
   return { ...r, init: K0, method };
 }
 const gate = (key, ok, value, limit, unit = '') => ({ key, ok: !!ok, value, limit, unit });
 /* Intrinsics from board views with the W3 / X1 gates.
    views: [{ markers }] (raw), board. Returns { ok, K, rms, perView, sigma, cond, gates, used: [view
    index], dropped: [{ i, rms }], skipped: [{ i, markers }], heldOut: { rms, n }, order }. */
-export function calibrateIntrinsics(views, board, { size = IMAGE, gates = GATES, init = NOMINAL, order = null } = {}) {
+export const calibrateIntrinsics = (views, board, opt = {}) => runSync(calibrateIntrinsicsSteps(views, board, opt));
+export function* calibrateIntrinsicsSteps(views, board, { size = IMAGE, gates = GATES, init = NOMINAL, order = null } = {}) {
   const ord = order || detectCornerOrder(views, board).order;
   const skipped = [], idx = [];
   views.forEach((V, i) => { const n = boardMarkers(V, board).length; if (n < gates.minMarkers) skipped.push({ i, markers: n }); else idx.push(i); });
   const cvOf = (ids) => ids.map((i) => correspondences({ markers: boardMarkers(views[i], board) }, board, ord));
   const out = { ok: false, order: ord, skipped, dropped: [], gates: [] };
   if (idx.length < 4) { out.gates.push(gate('views', false, idx.length, gates.minViews)); out.err = 'few_views'; return out; }
-  let used = idx, r = calibrateRaw(cvOf(used), size, init);
+  let used = idx, r = yield* calibrateRawSteps(cvOf(used), size, init);
   if (r.err) { out.err = r.err; out.gates.push(gate('views', false, idx.length, gates.minViews)); return out; }
   // drop views above the per-view limit once, then solve again
   const bad = used.filter((_, k) => !(r.perView[k] <= gates.viewRmsPx));
   if (bad.length && used.length - bad.length >= 4) {
     out.dropped = bad.map((i) => ({ i, rms: r.perView[used.indexOf(i)] }));
     used = used.filter((i) => !bad.includes(i));
-    r = calibrateRaw(cvOf(used), size, init);
+    r = yield* calibrateRawSteps(cvOf(used), size, init);
     if (r.err) { out.err = r.err; return out; }
   }
   // held out: solve without every 5th used view, predict its corners (pose by PnP with those intrinsics)
   let held = { rms: NaN, n: 0 };
   const hold = used.filter((_, k) => k % 5 === 4), keep = used.filter((_, k) => k % 5 !== 4);
   if (hold.length && keep.length >= 4) {
-    const rk = calibrateRaw(cvOf(keep), size, init);
+    const rk = yield* calibrateRawSteps(cvOf(keep), size, init);
     if (!rk.err) {
       let s = 0, n = 0;
-      for (const V of cvOf(hold)) { const p = solvePnP(V.obj, V.img, rk.K); if (p) { s += p.rms * p.rms * V.obj.length; n += V.obj.length; } else { s = Infinity; } }
+      for (const V of cvOf(hold)) { yield; const p = solvePnP(V.obj, V.img, rk.K); if (p) { s += p.rms * p.rms * V.obj.length; n += V.obj.length; } else { s = Infinity; } }
       held = { rms: n ? Math.sqrt(s / n) : NaN, n: hold.length };
     }
   }
@@ -720,7 +738,8 @@ export function checkTransition(A, qA, B, { ik, X, plane, clearance, lo, hi, ste
    without branch flip. Farthest-point selection over (tilt direction, distance, roll, aim) for n poses,
    ordered as a nearest-neighbour tour in joint space from q0.
    Returns { poses: [{ T, q, camPos, dist, tiltDeg, azDeg, rollDeg, aim, markers }], stats }. */
-export function generatePoses({ Tbb, board, K = NOMINAL, X, q0, fk, ik, lo = null, hi = null, n = 20, size = IMAGE,
+export const generatePoses = (args) => runSync(generatePosesSteps(args));
+export function* generatePosesSteps({ Tbb, board, K = NOMINAL, X, q0, fk, ik, lo = null, hi = null, n = 20, size = IMAGE,
   dists = [0.18, 0.20, 0.23, 0.26, 0.30, 0.35], tilts = [0, 10, 20, 30], azimuths = 8, rolls = [0, 15, -15],
   aims = [[0.5, 0.5], [0.3, 0.35], [0.7, 0.35], [0.3, 0.65], [0.7, 0.65]], minMarkers = GATES.minMarkers,
   clearance = 0.10, distRange = [0.18, 0.35], exclude = [] }) {
@@ -731,6 +750,7 @@ export function generatePoses({ Tbb, board, K = NOMINAL, X, q0, fk, ik, lo = nul
   const stats = { candidates: 0, markers: 0, clearance: 0, reach: 0, transition: 0, distance: 0 };
   const cand = [];
   for (const d of dists) for (const th of tilts) for (let ai = 0; ai < (th ? azimuths : 1); ai++) for (const [au, av] of aims) for (const roll of rolls) {
+    yield;
     stats.candidates++;
     if (d < distRange[0] || d > distRange[1]) { stats.distance++; continue; }
     const az = (360 / azimuths) * ai, thr = th / D, azr = az / D;
@@ -780,6 +800,7 @@ export function generatePoses({ Tbb, board, K = NOMINAL, X, q0, fk, ik, lo = nul
     left.sort((a, b) => qd(a.q, curQ) - qd(b.q, curQ));
     let took = -1;
     for (let i = 0; i < left.length && took < 0; i++) {
+      yield;
       const tr2 = checkTransition(curT, curQ, left[i].T, { ik, X, plane, clearance, lo, hi });
       if (tr2.ok) { took = i; left[i].q = tr2.q; } else stats.transition++;
     }
@@ -1016,13 +1037,14 @@ function kinProblem(obs, nds, ch, K, RX0, RB0, kFull, kIdx, Xfix = null, priorW 
 }
 // Levenberg-Marquardt with a central-difference Jacobian (step 1e-6); FK is reused for the X / board columns and
 // a board column only touches its own placement's rows. Stops when a step improves the cost by < 1e-9 (relative).
-function kinLM(P, x0, iters = 60) {
+function* kinLM(P, x0, iters = 60) {
   const h = 1e-6, np = P.np, m = P.m;
   let x = x0.slice(), F = P.fks(P.kOf(x)), r = P.fill(new Float64Array(m), x, F);
   let cost = r.reduce((s, e) => s + e * e, 0), lam = 1e-3, it = 0;
   for (; it < iters; it++) {
     const J = [];
     for (let c = 0; c < np; c++) {
+      yield;
       const xp = x.slice(), xm = x.slice(); xp[c] += h; xm[c] -= h;
       const cc = P.col(c);
       let rp, rm;
@@ -1033,6 +1055,7 @@ function kinLM(P, x0, iters = 60) {
     }
     const N = new Float64Array(np * np), g = new Float64Array(np);
     for (let a = 0; a < np; a++) {
+      if (a % 4 === 0) yield;
       const Ja = J[a];
       let gs = 0; for (let i = 0; i < m; i++) gs += Ja[i] * r[i]; g[a] = gs;
       for (let b = a; b < np; b++) { const Jb = J[b]; let v = 0; for (let i = 0; i < m; i++) v += Ja[i] * Jb[i]; N[a * np + b] = v; N[b * np + a] = v; }
@@ -1041,8 +1064,9 @@ function kinLM(P, x0, iters = 60) {
     for (let tries = 0; tries < 10 && !improved; tries++) {
       const A = N.slice();
       for (let i = 0; i < np; i++) A[i * np + i] += lam * (N[i * np + i] + 1e-9);
-      const L = chol(A, np);
+      const L = yield* cholSteps(A, np);
       if (!L) { lam *= 10; continue; }
+      yield;
       const dx = cholSolve(L, np, g.map((v) => -v)), x2 = x.map((v, k) => v + dx[k]);
       const F2 = P.kIdx.length ? P.fks(P.kOf(x2)) : F, r2 = P.fill(new Float64Array(m), x2, F2), c2 = r2.reduce((s, e) => s + e * e, 0);
       if (Number.isFinite(c2) && c2 < cost) {
@@ -1079,17 +1103,17 @@ function kinBoards(obs, nds, ch, k, X) {
   });
 }
 // fit X, boards and kinematic parameters kIdx on obs (ds 0..nds-1) from X0 / boards B0 / parameters k0
-function kinFit(obs, nds, ch, K, X0, B0, k0, kIdx, iters, priorW = null) {
+function* kinFit(obs, nds, ch, K, X0, B0, k0, kIdx, iters, priorW = null) {
   const P = kinProblem(obs, nds, ch, K, rotOf(X0), B0.map(rotOf), k0, kIdx, null, priorW && kIdx.length ? priorW : null);
   const x0 = [0, 0, 0, ...posOf(X0), ...B0.flatMap((B) => [0, 0, 0, ...posOf(B)]), ...kIdx.map((ki) => k0[ki])];
-  const f = kinLM(P, x0, iters), u = P.unpack(f.x);
+  const f = yield* kinLM(P, x0, iters), u = P.unpack(f.x);
   return { ...u, r: f.r, iterations: f.iterations, err: kinErr(obs, f.r, K) };
 }
 // held out: kinematics k and X frozen, only the board pose of `obs` (one placement) refit
-function kinHeldOut(obs, ch, K, X, k) {
+function* kinHeldOut(obs, ch, K, X, k) {
   const o1 = obs.map((o) => ({ ...o, ds: 0 })), B0 = kinBoards(o1, 1, ch, k, X);
   const P = kinProblem(o1, 1, ch, K, rotOf(X), B0.map(rotOf), k, [], X);
-  const f = kinLM(P, [0, 0, 0, ...posOf(B0[0])], 60);
+  const f = yield* kinLM(P, [0, 0, 0, ...posOf(B0[0])], 60);
   return { ...kinErr(o1, f.r, K), views: obs.length };
 }
 
@@ -1098,19 +1122,21 @@ function kinHeldOut(obs, ch, K, X, k) {
    (fixed, from the image-only solve); chain: CALM.CHAIN; X0: T_end_cam start value (nominal or measured mount).
    Returns { ok, gates, joints (schema, J1..J6), k, X, boards: [T_base_board A, B], heldOut: { ab, ba, ab0, ba0 },
    train: { px, mm }, final0 (uncorrected fit on A + B), views: { used, A, B, dropped }, warnings, ms }. */
-export function solveKinematics({ views, board, K, chain, X0, order = null, kIdx = KIN_L3, gates = KIN_GATES, bounds = KIN_BOUNDS, iters = 80, minMarkers = GATES.minMarkers, prior = KIN_PRIOR, onProgress = null }) {
+export const solveKinematics = (args) => runSync(solveKinematicsSteps(args));
+export function* solveKinematicsSteps({ views, board, K, chain, X0, order = null, kIdx = KIN_L3, gates = KIN_GATES, bounds = KIN_BOUNDS, iters = 80, minMarkers = GATES.minMarkers, prior = KIN_PRIOR, onProgress = null }) {
   const priorW = prior && prior.weight > 0 ? kIdx.map((ki) => prior.weight / prior.sigma[ki % 7]) : null;
   const t0 = Date.now(), ch = kinChain(chain), say = (s) => { if (onProgress) onProgress(s); };
   const ord = order || detectCornerOrder(views, board).order;
   const obs = [], dropped = [];
-  views.forEach((v, i) => {
-    const bm = boardMarkers(v, board);
-    if (bm.length < minMarkers || !Array.isArray(v.q) || !(v.ds === 0 || v.ds === 1)) { dropped.push({ i, why: 'markers' }); return; }
+  for (let i = 0; i < views.length; i++) {
+    const v = views[i], bm = boardMarkers(v, board);
+    if (i % 8 === 0) yield;
+    if (bm.length < minMarkers || !Array.isArray(v.q) || !(v.ds === 0 || v.ds === 1)) { dropped.push({ i, why: 'markers' }); continue; }
     const { obj, img } = correspondences({ markers: bm }, board, ord);
     const p = solvePnP(obj, img, K);
-    if (!p || !(p.rms <= gates.pnpMaxPx)) { dropped.push({ i, why: 'pnp', rms: p ? p.rms : null }); return; }
+    if (!p || !(p.rms <= gates.pnpMaxPx)) { dropped.push({ i, why: 'pnp', rms: p ? p.rms : null }); continue; }
     obs.push({ obj, img, q: v.q.slice(0, 6).map(Number), ds: v.ds, M: make(p.R, p.t), depth: norm3(p.t), i });
-  });
+  }
   const A = obs.filter((o) => o.ds === 0), B = obs.filter((o) => o.ds === 1).map((o) => ({ ...o, ds: 0 }));
   const res = { ok: false, gates: [], views: { used: obs.length, A: A.length, B: B.length, dropped }, warnings: [] };
   const enough = A.length >= gates.minViewsPerPlacement && B.length >= gates.minViewsPerPlacement;
@@ -1118,18 +1144,18 @@ export function solveKinematics({ views, board, K, chain, X0, order = null, kIdx
   if (!enough) { res.ms = Date.now() - t0; return res; }
   const k0 = new Array(NK).fill(0);
   // L0 (X, boards) then L3 (+ kinematics) from the L0 result
-  const fitBoth = (o, nds, label) => {
+  function* fitBoth(o, nds, label) {
     say(label + ' L0');
-    const l0 = kinFit(o, nds, ch, K, X0, kinBoards(o, nds, ch, k0, X0), k0, [], 60);
+    const l0 = yield* kinFit(o, nds, ch, K, X0, kinBoards(o, nds, ch, k0, X0), k0, [], 60);
     say(label + ' L3');
-    const l3 = kinFit(o, nds, ch, K, l0.X, l0.B, k0, kIdx, iters, priorW);
+    const l3 = yield* kinFit(o, nds, ch, K, l0.X, l0.B, k0, kIdx, iters, priorW);
     return { l0, l3 };
-  };
-  const fa = fitBoth(A, 1, 'A'), fb = fitBoth(B, 1, 'B');
+  }
+  const fa = yield* fitBoth(A, 1, 'A'), fb = yield* fitBoth(B, 1, 'B');
   say('held-out');
-  const ab0 = kinHeldOut(B, ch, K, fa.l0.X, fa.l0.k), ab = kinHeldOut(B, ch, K, fa.l3.X, fa.l3.k);
-  const ba0 = kinHeldOut(A, ch, K, fb.l0.X, fb.l0.k), ba = kinHeldOut(A, ch, K, fb.l3.X, fb.l3.k);
-  const fin = fitBoth(obs, 2, 'A+B');
+  const ab0 = yield* kinHeldOut(B, ch, K, fa.l0.X, fa.l0.k), ab = yield* kinHeldOut(B, ch, K, fa.l3.X, fa.l3.k);
+  const ba0 = yield* kinHeldOut(A, ch, K, fb.l0.X, fb.l0.k), ba = yield* kinHeldOut(A, ch, K, fb.l3.X, fb.l3.k);
+  const fin = yield* fitBoth(obs, 2, 'A+B');
   const k = fin.l3.k, oob = kinOutOfBounds(k, bounds);
   // improvement of the mean held-out error of both directions over the uncorrected model (per direction in
   // heldOut.improve). The uncorrected model is the URDF with armd's model_joint_map, so a zero offset already set
@@ -1156,13 +1182,14 @@ export function solveKinematics({ views, board, K, chain, X0, order = null, kIdx
    image-only solve over A + B (calibrateIntrinsics, its gates apply), then solveKinematics with them; X and the
    table height (mean board z of A and B - thickness) from the final kinematic fit.
    Returns { ok, gates, intr, kin, final: { K, X, boards }, table, apply (body for /api/v1/calibration/apply) }. */
-export function solveFine({ views, markerSide = BOARD_DEFAULT.markerSide, chain, X0, thickness = 0.0005, gates = GATES, kinGates = KIN_GATES, prior = KIN_PRIOR, size = IMAGE, init = NOMINAL, solvedAt = null, onProgress = null }) {
+export const solveFine = (args) => runSync(solveFineSteps(args));
+export function* solveFineSteps({ views, markerSide = BOARD_DEFAULT.markerSide, chain, X0, thickness = 0.0005, gates = GATES, kinGates = KIN_GATES, prior = KIN_PRIOR, size = IMAGE, init = NOMINAL, solvedAt = null, onProgress = null }) {
   const board = makeBoard({ markerSide });
   if (onProgress) onProgress('intrinsics');
-  const intr = calibrateIntrinsics(views, board, { size, gates, init });
+  const intr = yield* calibrateIntrinsicsSteps(views, board, { size, gates, init });
   const res = { ok: false, intr, gates: [...intr.gates] };
   if (!intr.K) return res;
-  const kin = solveKinematics({ views, board, K: intr.K, chain, X0, order: intr.order, gates: kinGates, prior, onProgress });
+  const kin = yield* solveKinematicsSteps({ views, board, K: intr.K, chain, X0, order: intr.order, gates: kinGates, prior, onProgress });
   res.kin = kin; res.gates.push(...kin.gates);
   if (!kin.joints) return res;
   const zA = kin.boards[0][2][3], zB = kin.boards[1][2][3], X = kin.X, K = intr.K;

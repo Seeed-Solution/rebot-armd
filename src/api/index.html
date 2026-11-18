@@ -4162,14 +4162,15 @@ const CALM = (() => {
     }
     return any ? out : null;
   }
-  let KC = null;
+  let KC = null, KCJ = null;
   // set the correction in use (schema value or null); returns true when it changed the model
   function setCorrection(joints) {
     const k = normCorrection(joints), was = JSON.stringify(KC);
-    KC = k;
+    KC = k; KCJ = k ? joints : null;
     return JSON.stringify(KC) !== was;
   }
   const correction = () => KC;
+  const correctionJoints = () => KCJ; // as set (schema shape), for a worker's copy of this block
   // URDF model angles [q1..q6] (rad; missing = 0) -> T_base_gripper (end_link in base_link, x = tool axis);
   // kc: normalised correction (default: the one set by setCorrection), null = plain URDF chain
   function fk(q, kc = KC) {
@@ -4297,7 +4298,7 @@ const CALM = (() => {
     };
   }
   return { mul, inv, make, rotOf, posOf, rpyR, rpyDeg, axisR, expR, logR, angDeg, fk, rotDiversity, solveEyeInHand, buildExport, CHAIN,
-    KC_BOUNDS, normCorrection, setCorrection, correction };
+    KC_BOUNDS, normCorrection, setCorrection, correction, correctionJoints };
 })();
 /* CALIB-MATH-END */
 
@@ -4840,7 +4841,7 @@ async function cwBootstrap() {
     const bs = CW.bootstrapBoard(v, CWZ.board, { K: CW.NOMINAL, X, G: v.G });
     if (!bs) { cwSetStatus(t('cw.place.few', { n, min: CW.GATES.minMarkers }), 'warn'); return; }
     const est = { Tbb: bs.Tbb, K: { ...CW.NOMINAL }, X };
-    const plan = cwPlan(est, v.q, cwFine() ? CWF.n : CWZ.target);
+    const plan = cwFine() ? await cwPlanFine(est, v.q, CWF.n) : cwPlan(est, v.q, CWZ.target);
     if (!plan.length) { cwSetStatus(t('cw.place.nogen', { why: 'IK / clearance / markers' }), 'warn'); return; }
     CWZ.est = est;
     if (cwFine()) {
@@ -4924,7 +4925,69 @@ function cwSolve() {
   CWZ.solve = CW.solveAll({ views: CWZ.views.filter((v) => !v.err), board: CWZ.board, CALM, thickness: CWZ.thickMm / 1000, solvedAt: new Date().toISOString() });
   CWZ.step = 'solve'; CWZ.dry = null; CWZ.status = ''; cwRender();
 }
-// ---- fine calibration: joint-space capture, worker solve
+// ---- fine calibration: worker (plan, solve), joint-space capture
+/* One Blob module worker per call imports /assets/calib_wizard.js; for 'plan' it also evaluates this page's
+   CALIB-MATH and VIEW-IK blocks (same FK / IK, the current kinematic correction). Without a worker the same step
+   generators run here in slices of <= 40 ms (CW.runSliced), so lease heartbeats keep going. */
+function cwMathSource() {
+  if (cwMathSource.src) return cwMathSource.src;
+  for (const sc of document.scripts) {
+    const x = sc.textContent || '', a = x.indexOf('/* CALIB-MATH-BEGIN */'), b = x.indexOf('/* CALIB-MATH-END */'), c = x.indexOf('/* VIEW-IK-BEGIN */'), d = x.indexOf('/* VIEW-IK-END */');
+    if (a >= 0 && b > a && c >= 0 && d > c) return (cwMathSource.src = x.slice(a, b) + '\n' + x.slice(c, d));
+  }
+  return null;
+}
+function cwWorkerCall(op, data, onProgress = () => {}) {
+  let w = null;
+  try {
+    if (typeof Worker !== 'function') throw new Error('no Worker');
+    const src = `import * as CW from ${JSON.stringify(new URL('/assets/calib_wizard.js', location.href).href)};
+let M = null;
+self.onmessage = (e) => {
+  const { op, data, math } = e.data;
+  try {
+    let r;
+    if (op === 'solveFine') r = CW.solveFine({ ...data, onProgress: (s) => self.postMessage({ progress: s }) });
+    else if (op === 'plan') {
+      if (!M) M = new Function(math + '\\nreturn { CALM, VIK };')();
+      M.CALM.setCorrection(data.correction);
+      const lo = data.lo, hi = data.hi;
+      const g = CW.generatePoses({ ...data.opts, Tbb: data.Tbb, board: CW.makeBoard({ markerSide: data.markerSide }), K: data.K, X: data.X, q0: data.q0, lo, hi, n: data.n, exclude: data.exclude,
+        fk: M.CALM.fk, ik: (T, seed) => M.VIK.solve(T, seed, { lo, hi, iters: 60 }) });
+      r = { poses: g.poses, stats: g.stats };
+    } else throw new Error('op ' + op);
+    self.postMessage({ done: r });
+  } catch (err) { self.postMessage({ error: String((err && err.message) || err) }); }
+};`;
+    w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })), { type: 'module' });
+  } catch (_) { w = null; }
+  if (!w) return null;
+  const math = op === 'plan' ? cwMathSource() : null;
+  if (op === 'plan' && !math) { w.terminate(); return null; }
+  return new Promise((resolve, reject) => {
+    w.onmessage = (e) => {
+      const m = e.data || {};
+      if (m.progress) { onProgress(m.progress); return; }
+      w.terminate();
+      if (m.error) reject(new Error(m.error)); else resolve(m.done);
+    };
+    w.onerror = (e) => { w.terminate(); reject(new Error(e.message || 'worker error')); };
+    w.postMessage({ op, data, math });
+  });
+}
+// fine-mode plan (CWF.gen options): worker, else sliced on this thread
+async function cwPlanFine(est, q0, n, exclude = []) {
+  const CW = CWZ.CW, { lo, hi } = modelLimits6();
+  const data = { opts: CWF.gen, Tbb: est.Tbb, markerSide: CWZ.board.markerSide, K: est.K, X: est.X, q0, lo, hi, n, exclude, correction: CALM.correctionJoints() };
+  let g = null, worker = true;
+  try { const p = cwWorkerCall('plan', data); if (p) g = await p; } catch (e) { g = null; }
+  if (!g) {
+    worker = false;
+    g = await CW.runSliced(CW.generatePosesSteps({ ...CWF.gen, Tbb: est.Tbb, board: CWZ.board, K: est.K, X: est.X, q0, fk: CALM.fk, ik: cwIk, lo, hi, n, exclude }));
+  }
+  CWZ.planWorker = worker;
+  return g.poses.map((p) => ({ ...p, state: 'pending' }));
+}
 const cwFineAccepted = (ds) => CWZ.views.filter((v) => v.ds === ds && !v.err && CWZ.CW.boardMarkers(v, CWZ.board).length >= CWZ.CW.GATES.minMarkers).length;
 const cwFinePoses = (ds) => new Set(CWZ.views.filter((v) => v.ds === ds && v.pose >= 0).map((v) => v.pose)).size;
 // pre-pose: CWF.preRad below the target on every joint, above it where the lower limit is too close
@@ -5023,32 +5086,18 @@ function cwFineToB() {
   CWZ.place = 1; CWZ.plan = []; CWZ.idx = 0; CWZ.step = 'move'; CWZ.status = '';
   cwRender(); cwV3Sync();
 }
-// solve in a Web Worker (module worker importing /assets/calib_wizard.js); main thread when no worker can start
-function cwFineSolveRun(data, onProgress) {
-  return new Promise((resolve, reject) => {
-    let w = null;
-    try {
-      const src = `import * as CW from ${JSON.stringify(new URL('/assets/calib_wizard.js', location.href).href)};
-self.onmessage = (e) => { try { self.postMessage({ done: CW.solveFine({ ...e.data, onProgress: (s) => self.postMessage({ progress: s }) }) }); } catch (err) { self.postMessage({ error: String((err && err.message) || err) }); } };`;
-      w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })), { type: 'module' });
-    } catch (_) { w = null; }
-    if (!w) { setTimeout(() => { try { resolve({ r: CWZ.CW.solveFine({ ...data, onProgress }), worker: false }); } catch (e) { reject(e); } }, 50); return; }
-    CWZ.solving.worker = w;
-    w.onmessage = (e) => {
-      const m = e.data || {};
-      if (m.progress) onProgress(m.progress);
-      else { w.terminate(); if (m.error) reject(new Error(m.error)); else resolve({ r: m.done, worker: true }); }
-    };
-    w.onerror = (e) => { w.terminate(); reject(new Error(e.message || 'worker error')); };
-    w.postMessage(data);
-  });
+// solve: worker, else sliced on this thread
+async function cwFineSolveRun(data, onProgress) {
+  try { const p = cwWorkerCall('solveFine', data, onProgress); if (p) return { r: await p, worker: true }; } catch (_) { /* worker failed to load: solve here */ }
+  const CW = CWZ.CW;
+  return { r: await CW.runSliced(CW.solveFineSteps({ ...data, onProgress })), worker: false };
 }
 async function cwFineSolve() {
   if (CWZ.solving || CWZ.running) return;
   const views = CWZ.views.filter((v) => !v.err && (v.ds === 0 || v.ds === 1)).map((v) => ({ markers: v.markers, q: v.q, ds: v.ds }));
   const X0 = (CWZ.saved[0] && CWZ.saved[0].est.X) || CWZ.est.X;
   CWZ.solve = null; CWZ.dry = null; CWZ.step = 'solve'; CWZ.status = '';
-  CWZ.solving = { t0: Date.now(), stage: '', worker: null, timer: setInterval(cwRender, 1000) };
+  CWZ.solving = { t0: Date.now(), stage: '', timer: setInterval(cwRender, 1000) };
   cwRender();
   try {
     const { r, worker } = await cwFineSolveRun({ views, markerSide: CWZ.markerMm / 1000, chain: CALM.CHAIN, X0, thickness: CWZ.thickMm / 1000, solvedAt: new Date().toISOString() },
