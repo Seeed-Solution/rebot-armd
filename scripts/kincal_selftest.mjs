@@ -24,9 +24,13 @@ const html = fs.readFileSync(path.join(root, 'src/api/index.html'), 'utf8');
 const block = (name) => html.slice(html.indexOf(`/* ${name}-BEGIN */`), html.indexOf(`/* ${name}-END */`));
 const { CALM, VIK } = vm.runInContext(block('CALIB-MATH') + '\n' + block('VIEW-IK') + '\n({ CALM, VIK });', vm.createContext({}));
 
+const D = 180 / Math.PI;
+// KIN_PRIOR_W=<weight> overrides the prior weight of every solve (weight sweep)
+const PRIOR = process.env.KIN_PRIOR_W != null ? { ...CW.KIN_PRIOR, weight: Number(process.env.KIN_PRIOR_W) } : CW.KIN_PRIOR;
+const solveKinematics = (o) => CW.solveKinematics({ prior: PRIOR, ...o }), solveFine = (o) => CW.solveFine({ prior: PRIOR, ...o });
+console.log(`prior weight ${PRIOR.weight}, sigma offset ${(PRIOR.sigma[0] * D).toFixed(2)} deg, scale ${PRIOR.sigma[1]}, tilt ${(PRIOR.sigma[2] * D).toFixed(2)} deg, origin ${PRIOR.sigma[4] * 1000} mm`);
 let fails = 0;
 const check = (name, ok, detail) => { console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}  ${detail}`); if (!ok) fails++; };
-const D = 180 / Math.PI;
 let seed = 0x6b1ca1;
 const rnd = () => { seed |= 0; seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
 const gauss = () => Math.sqrt(-2 * Math.log(1 - rnd())) * Math.cos(2 * Math.PI * rnd());
@@ -94,7 +98,7 @@ function poseAgreement(views, r, kTrue) {
 {
   const views = render(kInj);
   const t0 = Date.now();
-  const r = CW.solveFine({ views, markerSide: board.markerSide, chain: CALM.CHAIN, X0: Xnom, thickness, solvedAt: '2026-11-18T00:00:00Z' });
+  const r = solveFine({ views, markerSide: board.markerSide, chain: CALM.CHAIN, X0: Xnom, thickness, solvedAt: '2026-11-18T00:00:00Z' });
   const ms = Date.now() - t0, kin = r.kin;
   const ag = poseAgreement(views, kin, kInj);
   const offErr = [1, 2, 3, 4].map((j) => (kin.k[7 * j] - kInj[7 * j]) * D);
@@ -109,7 +113,7 @@ function poseAgreement(views, r, kTrue) {
   // axes J2..J4), so the parameters are compared through the poses they produce. J5's offset and the J3 tilt
   // have no such partner and are compared directly.
   check('a. J5 zero offset and the J3 tilt recovered (non-redundant parameters)', Math.abs(offErr[3]) < 0.1 && Math.abs((kin.k[7 * 2 + 2] - kInj[7 * 2 + 2]) * D) < 0.1,
-    `J5 offset error ${offErr[3].toFixed(3)} deg, J3 tilt_x error ${((kin.k[16] - kInj[16]) * D).toFixed(3)} deg; J2..J4 offset errors ${offErr.slice(0, 3).map((e) => e.toFixed(2)).join(', ')} deg (absorbed by origin shifts)`);
+    `J2 offset error ${offErr[0].toFixed(3)} deg, J5 offset error ${offErr[3].toFixed(3)} deg, J3 tilt_x error ${((kin.k[16] - kInj[16]) * D).toFixed(3)} deg; J2..J4 offset errors ${offErr.slice(0, 3).map((e) => e.toFixed(2)).join(', ')} deg (absorbed by origin shifts)`);
   // generalisation: joint sets not in the capture (planned poses +-0.15 rad on J2..J5)
   const extra = [];
   for (const v of views) if (rnd() < 0.5) extra.push({ ...v, q: v.q.map((x, i) => (i >= 1 && i <= 4 ? x + 0.3 * (rnd() - 0.5) : x)) });
@@ -118,11 +122,15 @@ function poseAgreement(views, r, kTrue) {
   check('a. all gates pass, apply body with kinematics', r.ok && r.apply && r.apply.kinematics.joints.length === 6 && r.apply.kinematics.fit.heldout_mm.length === 2
     && ['offset_rad', 'scale'].every((f) => r.apply.kinematics.joints[0][f] === 0 && r.apply.kinematics.joints[5][f] === 0) && Number.isFinite(r.apply.table_z_m),
     `ok ${r.ok}, keys ${Object.keys(r.apply || {}).join(',')}, table_z ${(r.apply.table_z_m * 1000).toFixed(2)} mm (truth 0.00), J5 zero warning ${kin.warnings.map((w) => `J${w.joint} ${w.deg.toFixed(1)}°`).join(',') || 'none'}`);
-  check('a. zero offset > 5 deg warns (J5 -6 deg injected)', (() => { const k = kInj.slice(); k[7 * 4] = -6 / D; const r6 = CW.solveKinematics({ views: render(k), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom }); return r6.ok && r6.warnings.length === 1 && r6.warnings[0].joint === 5; })(), 'warning only, gates still pass');
+  {
+    const k = kInj.slice(); k[7 * 4] = -6 / D;
+    const r6 = solveKinematics({ views: render(k), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
+    check('a. J5 zero offset > 5 deg warns (J5 -6 deg injected)', r6.ok && r6.warnings.length === 1 && r6.warnings[0].joint === 5, `warnings ${r6.warnings.map((w) => `J${w.joint} ${w.deg.toFixed(2)}°`).join(',')}, gates ${r6.ok ? 'pass' : 'refuse'}`);
+  }
 }
 {
   const views = render(new Array(42).fill(0));
-  const r = CW.solveKinematics({ views, board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
+  const r = solveKinematics({ views, board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
   const k = r.k, J = [1, 2, 3, 4];
   const mx = (p, s) => Math.max(...J.map((j) => Math.abs(k[7 * j + p]))) * s;
   const off = mx(0, D), sc = mx(1, 100), tl = Math.max(mx(2, D), mx(3, D)), org = Math.max(mx(4, 1000), mx(5, 1000), mx(6, 1000));
@@ -144,7 +152,7 @@ function poseAgreement(views, r, kTrue) {
     });
     // start value of the mount: the nominal v8 holder (as real2/kincal2.mjs)
     const X0 = make(mul(CALM.axisR([0, 0, 1], -Math.PI / 2), CALM.axisR([1, 0, 0], -128 / D)), [-0.07, 0, 0.07]);
-    const r = CW.solveKinematics({ views, board: CW.makeBoard({ markerSide: 0.025 }), K, chain: CALM.CHAIN, X0 });
+    const r = solveKinematics({ views, board: CW.makeBoard({ markerSide: 0.025 }), K, chain: CALM.CHAIN, X0 });
     const h = r.heldOut;
     console.log(`      final fit on A + B: ${fmtK(r.k)}`);
     console.log(`      gates ${gateStr(r.gates)}; warnings ${r.warnings.map((w) => `J${w.joint} ${w.deg.toFixed(2)}°`).join(',') || 'none'}`);
@@ -152,7 +160,7 @@ function poseAgreement(views, r, kTrue) {
       `model angles with the recorded joint map (J5 -4.0 deg set in armd): A->B ${h.ab0.mm.toFixed(2)} -> ${h.ab.mm.toFixed(2)} mm, B->A ${h.ba0.mm.toFixed(2)} -> ${h.ba.mm.toFixed(2)} mm, mean improvement ${(h.improve.mean * 100).toFixed(1)} % (per direction ${(h.improve.ab * 100).toFixed(1)} / ${(h.improve.ba * 100).toFixed(1)} %); train ${r.train.mm.toFixed(2)} mm; views ${r.views.used} (A ${r.views.A}, B ${r.views.B}, dropped ${r.views.dropped.length}); gates ${r.ok ? 'pass' : 'refuse'}; solve ${r.ms} ms`);
     // kincal2.mjs convention: motor angles without the J5 map offset (the solver finds the -4 deg itself)
     const raw = views.map((v) => ({ ...v, q: v.q.map((x, i) => (i === 4 ? x + 0.0698 : x)) }));
-    const r2 = CW.solveKinematics({ views: raw, board: CW.makeBoard({ markerSide: 0.025 }), K, chain: CALM.CHAIN, X0 }), h2 = r2.heldOut;
+    const r2 = solveKinematics({ views: raw, board: CW.makeBoard({ markerSide: 0.025 }), K, chain: CALM.CHAIN, X0 }), h2 = r2.heldOut;
     check('b. real replay without the J5 map offset (kincal2.mjs convention)', r2.ok && Math.abs(h2.ab.mm - h.ab.mm) < 0.05 && Math.abs(h2.ba.mm - h.ba.mm) < 0.05,
       `A->B ${h2.ab0.mm.toFixed(2)} -> ${h2.ab.mm.toFixed(2)} mm, B->A ${h2.ba0.mm.toFixed(2)} -> ${h2.ba.mm.toFixed(2)} mm (kincal2.mjs: 4.43 -> 2.01, 5.91 -> 2.24), J5 offset ${(r2.k[28] * D).toFixed(2)} deg, warnings ${r2.warnings.map((w) => `J${w.joint} ${w.deg.toFixed(2)}°`).join(',') || 'none'}; gates ${r2.ok ? 'pass' : 'refuse'}; solve ${r2.ms} ms`);
   }
@@ -161,19 +169,19 @@ function poseAgreement(views, r, kTrue) {
 // ---- c. gate cases
 {
   const k = kInj.slice(); k[7 * 4] = 12 / D;
-  const r = CW.solveKinematics({ views: render(k), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
+  const r = solveKinematics({ views: render(k), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
   const g = r.gates.find((x) => x.key === 'kin_bounds');
   check('c. J5 zero offset 12 deg (bound 10) -> refused', !r.ok && g && !g.ok && r.outOfBounds.some((o) => o.joint === 5 && o.param === 'offset'),
     `J5 offset ${(r.k[28] * D).toFixed(2)} deg, out of bounds ${r.outOfBounds.map((o) => `J${o.joint}.${o.param}`).join(',')}; gates ${gateStr(r.gates)}`);
 }
 {
-  const r = CW.solveKinematics({ views: render(kInj, { jointErr: 1.2 / D }), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
+  const r = solveKinematics({ views: render(kInj, { jointErr: 1.2 / D }), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
   const bad = r.gates.filter((x) => !x.ok).map((x) => x.key);
   check('c. unmodelled joint errors, held-out > 3 mm -> refused', !r.ok && (bad.includes('kin_heldout_ab') || bad.includes('kin_heldout_ba')),
     `held-out ${r.heldOut.ab.mm.toFixed(2)} / ${r.heldOut.ba.mm.toFixed(2)} mm; failed ${bad.join(',')}`);
 }
 {
-  const r = CW.solveKinematics({ views: render(kInj).filter((v) => v.ds === 0), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
+  const r = solveKinematics({ views: render(kInj).filter((v) => v.ds === 0), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
   check('c. one placement only -> refused before solving', !r.ok && !r.joints && r.gates[0].key === 'kin_views' && !r.gates[0].ok, gateStr(r.gates));
 }
 console.log(fails ? `${fails} checks failed` : 'all checks passed');

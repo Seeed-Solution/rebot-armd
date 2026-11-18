@@ -909,6 +909,12 @@ export async function runPoses(st, io, { runAll = true } = {}) {
 export const KIN_BOUNDS = Object.freeze({ offset_rad: 10 / D, scale: 0.08, tilt_rad: 3 / D, origin_m: 0.03 });
 export const KIN_GATES = Object.freeze({ heldOutMm: 3.0, improvement: 0.30, zeroWarnDeg: 5, minViewsPerPlacement: 10, pnpMaxPx: 2 });
 export const KIN_PARAM_NAMES = Object.freeze(['offset', 'scale', 'tilt_x', 'tilt_y', 'dx', 'dy', 'dz']);
+/* Weak L2 prior on the kinematic parameters (extra residual rows, px): weight * k / sigma, sigma per parameter type
+   (offset, scale, tilt x / y, origin dx / dy / dz). L3 is not minimal: zero offsets of the parallel joints J2..J4
+   trade against the next joint's origin shift; the prior picks the minimum-norm solution along such directions.
+   weight 0 = no prior. Weight 1 (sweep on the real-arm replay, scripts/kincal_selftest.mjs b): held-out 2.01 / 2.23 mm
+   against 2.01 / 2.24 mm without prior; synthetic held-out 0.135 / 0.129 mm against 0.133 / 0.127 mm. */
+export const KIN_PRIOR = Object.freeze({ weight: 1, sigma: [1 / D, 0.01, 1 / D, 1 / D, 0.005, 0.005, 0.005] });
 export const KIN_L3 = Object.freeze([...[1, 2, 3, 4].map((j) => 7 * j), ...[1, 2, 3, 4].flatMap((j) => [1, 2, 3, 4, 5, 6].map((p) => 7 * j + p))]);
 const NK = 42;
 // flat 3x3 helpers (row-major)
@@ -963,10 +969,13 @@ export function kinOutOfBounds(k, bounds = KIN_BOUNDS) {
 /* One residual problem: obs [{ obj, img, q, ds }], nds board poses. x = [X rotation vector (relative to RX0), X
    position (both left out when Xfix is given), per board: rotation vector (relative to RB0[d]), position,
    kinematic parameters kIdx of kFull]. col(c): what column c moves ('x', 'b' with its placement, 'k'). */
-function kinProblem(obs, nds, ch, K, RX0, RB0, kFull, kIdx, Xfix = null) {
+function kinProblem(obs, nds, ch, K, RX0, RB0, kFull, kIdx, Xfix = null, priorW = null) {
   const nx = Xfix ? 0 : 6, np = nx + 6 * nds + kIdx.length, off = [];
   let m = 0;
   for (const o of obs) { off.push(m); m += 2 * o.obj.length; }
+  // prior rows (one per kinematic parameter, after the corner rows): priorW[i] * k[kIdx[i]]
+  const mObs = m;
+  if (priorW) m += kIdx.length;
   const kOf = (x) => { const k = kFull.slice(); kIdx.forEach((ki, i) => { k[ki] = x[nx + 6 * nds + i]; }); return k; };
   const fks = (k) => obs.map((o) => kinFk(ch, o.q, k));
   const col = (c) => (c < nx ? { kind: 'x' } : c < nx + 6 * nds ? { kind: 'b', d: Math.floor((c - nx) / 6) } : { kind: 'k' });
@@ -992,6 +1001,7 @@ function kinProblem(obs, nds, ch, K, RX0, RB0, kFull, kIdx, Xfix = null) {
         out[w++] = K.fx * u * dd + K.cx - I[0]; out[w++] = K.fy * v * dd + K.cy - I[1];
       }
     }
+    if (priorW && only < 0) for (let i = 0; i < kIdx.length; i++) out[mObs + i] = priorW[i] * x[nx + 6 * nds + i];
     return out;
   }
   const unpack = (x) => ({
@@ -1066,8 +1076,8 @@ function kinBoards(obs, nds, ch, k, X) {
   });
 }
 // fit X, boards and kinematic parameters kIdx on obs (ds 0..nds-1) from X0 / boards B0 / parameters k0
-function kinFit(obs, nds, ch, K, X0, B0, k0, kIdx, iters) {
-  const P = kinProblem(obs, nds, ch, K, rotOf(X0), B0.map(rotOf), k0, kIdx);
+function kinFit(obs, nds, ch, K, X0, B0, k0, kIdx, iters, priorW = null) {
+  const P = kinProblem(obs, nds, ch, K, rotOf(X0), B0.map(rotOf), k0, kIdx, null, priorW && kIdx.length ? priorW : null);
   const x0 = [0, 0, 0, ...posOf(X0), ...B0.flatMap((B) => [0, 0, 0, ...posOf(B)]), ...kIdx.map((ki) => k0[ki])];
   const f = kinLM(P, x0, iters), u = P.unpack(f.x);
   return { ...u, r: f.r, iterations: f.iterations, err: kinErr(obs, f.r, K) };
@@ -1085,7 +1095,8 @@ function kinHeldOut(obs, ch, K, X, k) {
    (fixed, from the image-only solve); chain: CALM.CHAIN; X0: T_end_cam start value (nominal or measured mount).
    Returns { ok, gates, joints (schema, J1..J6), k, X, boards: [T_base_board A, B], heldOut: { ab, ba, ab0, ba0 },
    train: { px, mm }, final0 (uncorrected fit on A + B), views: { used, A, B, dropped }, warnings, ms }. */
-export function solveKinematics({ views, board, K, chain, X0, order = null, kIdx = KIN_L3, gates = KIN_GATES, bounds = KIN_BOUNDS, iters = 80, minMarkers = GATES.minMarkers, onProgress = null }) {
+export function solveKinematics({ views, board, K, chain, X0, order = null, kIdx = KIN_L3, gates = KIN_GATES, bounds = KIN_BOUNDS, iters = 80, minMarkers = GATES.minMarkers, prior = KIN_PRIOR, onProgress = null }) {
+  const priorW = prior && prior.weight > 0 ? kIdx.map((ki) => prior.weight / prior.sigma[ki % 7]) : null;
   const t0 = Date.now(), ch = kinChain(chain), say = (s) => { if (onProgress) onProgress(s); };
   const ord = order || detectCornerOrder(views, board).order;
   const obs = [], dropped = [];
@@ -1108,7 +1119,7 @@ export function solveKinematics({ views, board, K, chain, X0, order = null, kIdx
     say(label + ' L0');
     const l0 = kinFit(o, nds, ch, K, X0, kinBoards(o, nds, ch, k0, X0), k0, [], 60);
     say(label + ' L3');
-    const l3 = kinFit(o, nds, ch, K, l0.X, l0.B, k0, kIdx, iters);
+    const l3 = kinFit(o, nds, ch, K, l0.X, l0.B, k0, kIdx, iters, priorW);
     return { l0, l3 };
   };
   const fa = fitBoth(A, 1, 'A'), fb = fitBoth(B, 1, 'B');
@@ -1142,13 +1153,13 @@ export function solveKinematics({ views, board, K, chain, X0, order = null, kIdx
    image-only solve over A + B (calibrateIntrinsics, its gates apply), then solveKinematics with them; X and the
    table height (mean board z of A and B - thickness) from the final kinematic fit.
    Returns { ok, gates, intr, kin, final: { K, X, boards }, table, apply (body for /api/v1/calibration/apply) }. */
-export function solveFine({ views, markerSide = BOARD_DEFAULT.markerSide, chain, X0, thickness = 0.0005, gates = GATES, kinGates = KIN_GATES, size = IMAGE, init = NOMINAL, solvedAt = null, onProgress = null }) {
+export function solveFine({ views, markerSide = BOARD_DEFAULT.markerSide, chain, X0, thickness = 0.0005, gates = GATES, kinGates = KIN_GATES, prior = KIN_PRIOR, size = IMAGE, init = NOMINAL, solvedAt = null, onProgress = null }) {
   const board = makeBoard({ markerSide });
   if (onProgress) onProgress('intrinsics');
   const intr = calibrateIntrinsics(views, board, { size, gates, init });
   const res = { ok: false, intr, gates: [...intr.gates] };
   if (!intr.K) return res;
-  const kin = solveKinematics({ views, board, K: intr.K, chain, X0, order: intr.order, gates: kinGates, onProgress });
+  const kin = solveKinematics({ views, board, K: intr.K, chain, X0, order: intr.order, gates: kinGates, prior, onProgress });
   res.kin = kin; res.gates.push(...kin.gates);
   if (!kin.joints) return res;
   const zA = kin.boards[0][2][3], zB = kin.boards[1][2][3], X = kin.X, K = intr.K;
