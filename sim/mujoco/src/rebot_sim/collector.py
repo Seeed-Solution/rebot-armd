@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import math
+import os
+import re
 import shutil
 import struct
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Self
+from typing import IO, Any, Self
 
 import numpy as np
 
-from .env import SimEnv
+from .env import SimEnv, validate_real_vector
 
 CODEBASE_VERSION = "v3.0"
 CHUNKS_SIZE = 1000
@@ -24,6 +27,7 @@ EPISODES_PATH = "meta/episodes/chunk-000/file-000.parquet"
 QUANTILES = (0.01, 0.10, 0.50, 0.90, 0.99)
 VALID_UNIT_MODES = ("rad", "so101_norm", "deg")
 STATS_IMAGE_EVERY_S = 0.5
+CAMERA_ROLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 DEFAULT_FEATURES = {
     "timestamp": {"dtype": "float32", "shape": [1], "names": None},
     "frame_index": {"dtype": "int64", "shape": [1], "names": None},
@@ -41,38 +45,24 @@ def _is_bool(val: Any) -> bool:
     return isinstance(val, (bool, np.bool_))
 
 
+def _validate_camera_role(role: Any) -> str:
+    if not isinstance(role, str) or not CAMERA_ROLE_RE.match(role) or ".." in role:
+        raise CollectorError(
+            f"Invalid camera role {role!r}: must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,63}}$ without '..'"
+        )
+    return role
+
+
 def _validate_finite_1d(
     values: Any,
     expected_len: int,
     label: str,
 ) -> list[float]:
-    if values is None or _is_bool(values) or isinstance(values, (str, bytes, dict)):
-        raise CollectorError(f"{label} must be a 1D numeric sequence of length {expected_len}")
-
-    if isinstance(values, Sequence) and not isinstance(values, np.ndarray):
-        for idx, item in enumerate(values):
-            if _is_bool(item) or isinstance(item, (Sequence, np.ndarray)) and not isinstance(item, (str, bytes)):
-                raise CollectorError(f"{label}[{idx}] must be a numeric scalar, got {item!r}")
-
-    raw = np.asarray(values)
-    if np.issubdtype(raw.dtype, np.bool_):
-        raise CollectorError(f"{label} must be numeric, not boolean")
-    if raw.ndim == 2 and raw.shape[0] == 1:
-        raw = raw[0]
-    elif raw.ndim != 1:
-        raise CollectorError(
-            f"{label} must be 1D of length {expected_len} or shape (1, {expected_len}), got shape {raw.shape}"
-        )
-    if raw.shape[0] != expected_len:
-        raise CollectorError(f"{label} length mismatch: expected {expected_len}, got {raw.shape[0]}")
-
-    try:
-        arr = np.asarray(raw, dtype=np.float64)
-    except (TypeError, ValueError) as exc:
-        raise CollectorError(f"{label} must be numeric: {exc}") from exc
-
-    if not np.all(np.isfinite(arr)):
-        raise CollectorError(f"{label} contains non-finite values (NaN or Inf)")
+    arr = validate_real_vector(values, expected_len, label=label, exc_type=CollectorError)
+    with np.errstate(over="ignore"):
+        arr32 = arr.astype(np.float32)
+    if not np.all(np.isfinite(arr32)):
+        raise CollectorError(f"{label} overflows float32 to non-finite values")
     return [float(x) for x in arr]
 
 
@@ -81,12 +71,18 @@ def _validate_image(
     role: str,
     expected_shape: tuple[int, int, int] | None,
 ) -> np.ndarray:
-    if image is None or _is_bool(image) or isinstance(image, (str, bytes, dict)):
+    if image is None or _is_bool(image) or isinstance(image, (str, bytes, bytearray, dict)):
         raise CollectorError(f"Missing or invalid camera frame for required role {role!r}")
 
-    arr = np.asarray(image)
-    if np.issubdtype(arr.dtype, np.bool_):
-        raise CollectorError(f"Camera frame for {role!r} must not be boolean")
+    try:
+        arr = np.asarray(image)
+    except (TypeError, ValueError) as exc:
+        raise CollectorError(f"Invalid camera frame for {role!r}: {exc}") from exc
+
+    if np.iscomplexobj(arr) or arr.dtype.kind not in ("i", "u", "f"):
+        raise CollectorError(
+            f"Camera frame for {role!r} must have real numeric dtype, got {arr.dtype!r}"
+        )
     if arr.ndim != 3 or arr.shape[2] != 3 or arr.shape[0] <= 0 or arr.shape[1] <= 0:
         raise CollectorError(
             f"Camera frame for {role!r} must have shape (H, W, 3) with H,W > 0, got {arr.shape}"
@@ -100,14 +96,14 @@ def _validate_image(
         raise CollectorError(f"Camera frame for {role!r} contains non-finite values (NaN or Inf)")
 
     if arr.dtype == np.uint8:
-        return np.ascontiguousarray(arr)
+        return np.array(arr, dtype=np.uint8, copy=True, order="C")
     if np.issubdtype(arr.dtype, np.integer):
         vmin, vmax = int(arr.min()), int(arr.max())
         if vmin < 0 or vmax > 255:
             raise CollectorError(
                 f"Integer camera frame for {role!r} out of [0, 255] range: [{vmin}, {vmax}]"
             )
-        return np.ascontiguousarray(arr.astype(np.uint8))
+        return np.array(arr, dtype=np.uint8, copy=True, order="C")
     if np.issubdtype(arr.dtype, np.floating):
         vmin, vmax = float(arr.min()), float(arr.max())
         if vmin < 0.0 or vmax > 255.0:
@@ -115,8 +111,8 @@ def _validate_image(
                 f"Float camera frame for {role!r} out of valid range: [{vmin}, {vmax}]"
             )
         if vmax <= 1.0:
-            return np.ascontiguousarray(np.round(arr * 255.0).astype(np.uint8))
-        return np.ascontiguousarray(np.round(arr).astype(np.uint8))
+            return np.array(np.round(arr * 255.0), dtype=np.uint8, copy=True, order="C")
+        return np.array(np.round(arr), dtype=np.uint8, copy=True, order="C")
     raise CollectorError(f"Unsupported camera frame dtype {arr.dtype!r} for role {role!r}")
 
 
@@ -203,6 +199,10 @@ def probe_video(path: Path) -> dict[str, Any]:
     with av.open(str(path)) as container:
         s = container.streams.video[0]
         rate = s.average_rate or s.base_rate
+        frames = int(s.frames or 0)
+        if frames == 0:
+            container.seek(0)
+            frames = sum(1 for _ in container.decode(video=0))
         return {
             "video.height": s.height,
             "video.width": s.width,
@@ -211,7 +211,7 @@ def probe_video(path: Path) -> dict[str, Any]:
             "video.fps": round(rate.numerator / rate.denominator),
             "video.channels": 3,
             "has_audio": len(container.streams.audio) > 0,
-            "frames": s.frames,
+            "frames": frames,
         }
 
 
@@ -224,7 +224,7 @@ def _stats_image(image: np.ndarray) -> np.ndarray:
     if max(h, w) >= 300:
         step = max(1, int((w if w > h else h) / 150))
         arr = arr[::step, ::step]
-    return np.ascontiguousarray(arr[..., :3])
+    return np.array(arr[..., :3], dtype=np.uint8, copy=True, order="C")
 
 
 def feature_stats(data: np.ndarray) -> dict[str, np.ndarray]:
@@ -364,25 +364,26 @@ class _CompactWriter:
         self.buf.extend(raw)
 
 
-def _rle_bitpack_1bit(bits: Sequence[int]) -> bytes:
-    """Encode a 0/1 sequence using Parquet RLE/bit-packing hybrid (bit_width=1)."""
-    n = len(bits)
+def _rle_bitpack(values: Sequence[int], bit_width: int) -> bytes:
+    """Encode a non-negative integer sequence using Parquet RLE/bit-packing hybrid."""
+    n = len(values)
     if n == 0:
         return b""
     n_groups = (n + 7) // 8
     out = bytearray(_uvarint((n_groups << 1) | 1))
+    mask = (1 << bit_width) - 1
     for g in range(n_groups):
-        byte = 0
+        acc = 0
         base = g * 8
-        for bit_idx in range(8):
-            if base + bit_idx < n and bits[base + bit_idx]:
-                byte |= 1 << bit_idx
-        out.append(byte)
+        for idx in range(8):
+            if base + idx < n:
+                acc |= (int(values[base + idx]) & mask) << (idx * bit_width)
+        out.extend(acc.to_bytes(bit_width, "little"))
     return bytes(out)
 
 
 def _rle_constant(value: int, count: int) -> bytes:
-    """Encode ``count`` copies of a constant level (bit_width=1)."""
+    """Encode ``count`` copies of a constant level (bit_width <= 8)."""
     if count == 0:
         return b""
     return _uvarint(count << 1) + bytes([value])
@@ -392,7 +393,7 @@ def _rle_constant(value: int, count: int) -> bytes:
 class _ParquetColumnSpec:
     name: str
     phys_type: int  # 2=INT64, 4=FLOAT, 5=DOUBLE, 6=BYTE_ARRAY
-    is_list: bool
+    list_depth: int  # 0=scalar, 1=list<T>, 3=list<list<list<T>>>
     is_utf8: bool
     num_values: int
     rep_levels: bytes
@@ -401,9 +402,9 @@ class _ParquetColumnSpec:
 
     @property
     def path_in_schema(self) -> list[str]:
-        if self.is_list:
-            return [self.name, "list", "element"]
-        return [self.name]
+        if self.list_depth == 0:
+            return [self.name]
+        return [self.name] + ["list", "element"] * self.list_depth
 
 
 def _encode_plain_values(values: Any, phys_type: int) -> bytes:
@@ -423,33 +424,58 @@ def _encode_plain_values(values: Any, phys_type: int) -> bytes:
     raise CollectorError(f"Unsupported Parquet physical type {phys_type}")
 
 
+def _flatten_nested_list(row: Any, depth: int, col_name: str) -> tuple[list[Any], list[int]]:
+    """Flatten a non-empty ``depth``-nested list row into ``(values, rep_levels)``."""
+    flat_vals: list[Any] = []
+    rep_levels: list[int] = []
+
+    def _walk(node: Any, level: int, current_rep: int) -> int:
+        if level == depth:
+            flat_vals.append(node)
+            rep_levels.append(current_rep)
+            return level
+        items = list(node)
+        if not items:
+            raise CollectorError(f"Empty list element not supported for column {col_name!r}")
+        for idx, child in enumerate(items):
+            rep = current_rep if idx == 0 else level + 1
+            _walk(child, level + 1, rep)
+        return level
+
+    _walk(row, 0, 0)
+    return flat_vals, rep_levels
+
+
 def _build_parquet_column(name: str, kind: str, data: Any) -> _ParquetColumnSpec:
-    # kind: "float32", "int64", "float64", "string", "list_float32", "list_float64", "list_int64", "list_string"
-    if kind.startswith("list_"):
+    phys_map = {"float32": (4, False), "float64": (5, False), "int64": (2, False), "string": (6, True)}
+    list_depth = 0
+    elem_kind = kind
+    if kind.startswith("list3_"):
+        list_depth = 3
+        elem_kind = kind[len("list3_") :]
+    elif kind.startswith("list_"):
+        list_depth = 1
         elem_kind = kind[len("list_") :]
-        phys_map = {"float32": (4, False), "float64": (5, False), "int64": (2, False), "string": (6, True)}
-        phys_type, is_utf8 = phys_map[elem_kind]
+
+    phys_type, is_utf8 = phys_map[elem_kind]
+    if list_depth > 0:
         flat_vals: list[Any] = []
-        rep_bits: list[int] = []
-        def_bits: list[int] = []
+        rep_levels: list[int] = []
         for row in data:
-            row_list = list(row)
-            if not row_list:
-                raise CollectorError(f"Empty list element not supported for column {name!r}")
-            for j, item in enumerate(row_list):
-                flat_vals.append(item)
-                rep_bits.append(0 if j == 0 else 1)
-                def_bits.append(1)
+            rvals, rreps = _flatten_nested_list(row, list_depth, name)
+            flat_vals.extend(rvals)
+            rep_levels.extend(rreps)
         num_values = len(flat_vals)
-        rep_raw = _rle_bitpack_1bit(rep_bits)
-        def_raw = _rle_constant(1, num_values)
+        bit_width = list_depth.bit_length()
+        rep_raw = _rle_bitpack(rep_levels, bit_width)
+        def_raw = _rle_constant(list_depth, num_values)
         rep_bytes = struct.pack("<I", len(rep_raw)) + rep_raw
         def_bytes = struct.pack("<I", len(def_raw)) + def_raw
         plain = _encode_plain_values(flat_vals, phys_type)
         return _ParquetColumnSpec(
             name=name,
             phys_type=phys_type,
-            is_list=True,
+            list_depth=list_depth,
             is_utf8=is_utf8,
             num_values=num_values,
             rep_levels=rep_bytes,
@@ -457,13 +483,11 @@ def _build_parquet_column(name: str, kind: str, data: Any) -> _ParquetColumnSpec
             plain_data=plain,
         )
 
-    phys_map = {"float32": (4, False), "float64": (5, False), "int64": (2, False), "string": (6, True)}
-    phys_type, is_utf8 = phys_map[kind]
-    vals = list(data) if kind == "string" else data
+    vals = list(data) if elem_kind == "string" else data
     return _ParquetColumnSpec(
         name=name,
         phys_type=phys_type,
-        is_list=False,
+        list_depth=0,
         is_utf8=is_utf8,
         num_values=len(vals),
         rep_levels=b"",
@@ -482,145 +506,148 @@ def _write_parquet_pure_python(
     specs = [_build_parquet_column(name, kind, values) for name, kind, values in columns]
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".parquet.tmp")
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     chunk_metas: list[tuple[_ParquetColumnSpec, int, int]] = []  # (spec, offset, total_size)
 
-    with open(tmp, "wb") as f:
-        f.write(b"PAR1")
-        for spec in specs:
-            payload = spec.rep_levels + spec.def_levels + spec.plain_data
-            pw = _CompactWriter()
-            pw.write_i32(1, 0)  # PageType.DATA_PAGE
-            pw.write_i32(2, len(payload))  # uncompressed_page_size
-            pw.write_i32(3, len(payload))  # compressed_page_size
-            pw.begin_struct(5)  # data_page_header
-            pw.write_i32(1, spec.num_values)
-            pw.write_i32(2, 0)  # Encoding.PLAIN
-            pw.write_i32(3, 3)  # Encoding.RLE
-            pw.write_i32(4, 3)  # Encoding.RLE
-            pw.end_struct()
-            pw.end_struct()
-            page_bytes = bytes(pw.buf) + payload
-            offset = f.tell()
-            f.write(page_bytes)
-            chunk_metas.append((spec, offset, len(page_bytes)))
+    try:
+        with open(tmp, "wb") as f:
+            f.write(b"PAR1")
+            for spec in specs:
+                payload = spec.rep_levels + spec.def_levels + spec.plain_data
+                pw = _CompactWriter()
+                pw.write_i32(1, 0)  # PageType.DATA_PAGE
+                pw.write_i32(2, len(payload))
+                pw.write_i32(3, len(payload))
+                pw.begin_struct(5)  # data_page_header
+                pw.write_i32(1, spec.num_values)
+                pw.write_i32(2, 0)  # Encoding.PLAIN
+                pw.write_i32(3, 3)  # Encoding.RLE
+                pw.write_i32(4, 3)  # Encoding.RLE
+                pw.end_struct()
+                pw.end_struct()
+                page_bytes = bytes(pw.buf) + payload
+                offset = f.tell()
+                f.write(page_bytes)
+                chunk_metas.append((spec, offset, len(page_bytes)))
 
-        # Build SchemaElements (root + each column)
-        schema_elements: list[dict[str, Any]] = [
-            {"name": "schema", "num_children": len(specs)},
-        ]
-        for spec in specs:
-            if spec.is_list:
-                schema_elements.append(
-                    {
-                        "name": spec.name,
+            schema_elements: list[dict[str, Any]] = [
+                {"name": "schema", "num_children": len(specs)},
+            ]
+            for spec in specs:
+                if spec.list_depth > 0:
+                    for lvl in range(spec.list_depth):
+                        schema_elements.append(
+                            {
+                                "name": spec.name if lvl == 0 else "element",
+                                "repetition_type": 0,  # REQUIRED
+                                "num_children": 1,
+                                "converted_type": 3,  # LIST
+                                "logical_list": True,
+                            }
+                        )
+                        schema_elements.append(
+                            {
+                                "name": "list",
+                                "repetition_type": 2,  # REPEATED
+                                "num_children": 1,
+                            }
+                        )
+                    elem: dict[str, Any] = {
+                        "name": "element",
+                        "type": spec.phys_type,
                         "repetition_type": 0,  # REQUIRED
-                        "num_children": 1,
-                        "converted_type": 3,  # LIST
-                        "logical_list": True,
                     }
-                )
-                schema_elements.append(
-                    {
-                        "name": "list",
-                        "repetition_type": 2,  # REPEATED
-                        "num_children": 1,
+                    if spec.is_utf8:
+                        elem["converted_type"] = 0
+                        elem["logical_str"] = True
+                    schema_elements.append(elem)
+                else:
+                    elem = {
+                        "name": spec.name,
+                        "type": spec.phys_type,
+                        "repetition_type": 0,
                     }
-                )
-                elem: dict[str, Any] = {
-                    "name": "element",
-                    "type": spec.phys_type,
-                    "repetition_type": 0,  # REQUIRED
-                }
-                if spec.is_utf8:
-                    elem["converted_type"] = 0  # UTF8
-                    elem["logical_str"] = True
-                schema_elements.append(elem)
-            else:
-                elem = {
-                    "name": spec.name,
-                    "type": spec.phys_type,
-                    "repetition_type": 0,  # REQUIRED
-                }
-                if spec.is_utf8:
-                    elem["converted_type"] = 0  # UTF8
-                    elem["logical_str"] = True
-                schema_elements.append(elem)
+                    if spec.is_utf8:
+                        elem["converted_type"] = 0
+                        elem["logical_str"] = True
+                    schema_elements.append(elem)
 
-        mw = _CompactWriter()
-        mw.write_i32(1, 1)  # version
-        mw.write_list_hdr(2, _CompactWriter.STRUCT, len(schema_elements))
-        for se in schema_elements:
-            mw.begin_struct()
-            if "type" in se:
-                mw.write_i32(1, se["type"])
-            if "repetition_type" in se:
-                mw.write_i32(3, se["repetition_type"])
-            mw.write_str(4, se["name"])
-            if "num_children" in se:
-                mw.write_i32(5, se["num_children"])
-            if "converted_type" in se:
-                mw.write_i32(6, se["converted_type"])
-            if se.get("logical_str"):
-                mw.begin_struct(10)  # LogicalType
-                mw.begin_struct(1)  # StringType
+            mw = _CompactWriter()
+            mw.write_i32(1, 1)  # version
+            mw.write_list_hdr(2, _CompactWriter.STRUCT, len(schema_elements))
+            for se in schema_elements:
+                mw.begin_struct()
+                if "type" in se:
+                    mw.write_i32(1, se["type"])
+                if "repetition_type" in se:
+                    mw.write_i32(3, se["repetition_type"])
+                mw.write_str(4, se["name"])
+                if "num_children" in se:
+                    mw.write_i32(5, se["num_children"])
+                if "converted_type" in se:
+                    mw.write_i32(6, se["converted_type"])
+                if se.get("logical_str"):
+                    mw.begin_struct(10)
+                    mw.begin_struct(1)
+                    mw.end_struct()
+                    mw.end_struct()
+                elif se.get("logical_list"):
+                    mw.begin_struct(10)
+                    mw.begin_struct(3)
+                    mw.end_struct()
+                    mw.end_struct()
+                mw.end_struct()
+
+            mw.write_i64(3, num_rows)
+
+            total_byte_size = sum(total_sz for _, _, total_sz in chunk_metas)
+            mw.write_list_hdr(4, _CompactWriter.STRUCT, 1)
+            mw.begin_struct()  # RowGroup
+            mw.write_list_hdr(1, _CompactWriter.STRUCT, len(chunk_metas))
+            for spec, offset, total_sz in chunk_metas:
+                mw.begin_struct()  # ColumnChunk
+                mw.write_i64(2, offset)
+                mw.begin_struct(3)  # ColumnMetaData
+                mw.write_i32(1, spec.phys_type)
+                encs = [3, 0] if spec.list_depth > 0 else [0]
+                mw.write_list_hdr(2, _CompactWriter.I32, len(encs))
+                for enc in encs:
+                    mw.raw_i32(enc)
+                p_schema = spec.path_in_schema
+                mw.write_list_hdr(3, _CompactWriter.BINARY, len(p_schema))
+                for part in p_schema:
+                    mw.raw_str(part)
+                mw.write_i32(4, 0)  # UNCOMPRESSED
+                mw.write_i64(5, spec.num_values)
+                mw.write_i64(6, total_sz)
+                mw.write_i64(7, total_sz)
+                mw.write_i64(9, offset)
                 mw.end_struct()
                 mw.end_struct()
-            elif se.get("logical_list"):
-                mw.begin_struct(10)  # LogicalType
-                mw.begin_struct(3)  # ListType
-                mw.end_struct()
-                mw.end_struct()
+            mw.write_i64(2, total_byte_size)
+            mw.write_i64(3, num_rows)
             mw.end_struct()
 
-        mw.write_i64(3, num_rows)
+            if kv_metadata:
+                mw.write_list_hdr(5, _CompactWriter.STRUCT, len(kv_metadata))
+                for k, v in kv_metadata.items():
+                    mw.begin_struct()
+                    mw.write_str(1, k)
+                    mw.write_str(2, v)
+                    mw.end_struct()
 
-        # RowGroups (1 row group)
-        total_byte_size = sum(total_sz for _, _, total_sz in chunk_metas)
-        mw.write_list_hdr(4, _CompactWriter.STRUCT, 1)
-        mw.begin_struct()  # RowGroup
-        mw.write_list_hdr(1, _CompactWriter.STRUCT, len(chunk_metas))
-        for spec, offset, total_sz in chunk_metas:
-            mw.begin_struct()  # ColumnChunk
-            mw.write_i64(2, offset)  # file_offset
-            mw.begin_struct(3)  # ColumnMetaData
-            mw.write_i32(1, spec.phys_type)
-            encs = [3, 0] if spec.is_list else [0]
-            mw.write_list_hdr(2, _CompactWriter.I32, len(encs))
-            for enc in encs:
-                mw.raw_i32(enc)
-            p_schema = spec.path_in_schema
-            mw.write_list_hdr(3, _CompactWriter.BINARY, len(p_schema))
-            for part in p_schema:
-                mw.raw_str(part)
-            mw.write_i32(4, 0)  # CompressionCodec.UNCOMPRESSED
-            mw.write_i64(5, spec.num_values)
-            mw.write_i64(6, total_sz)
-            mw.write_i64(7, total_sz)
-            mw.write_i64(9, offset)  # data_page_offset
-            mw.end_struct()  # ColumnMetaData
-            mw.end_struct()  # ColumnChunk
-        mw.write_i64(2, total_byte_size)
-        mw.write_i64(3, num_rows)
-        mw.end_struct()  # RowGroup
+            mw.write_str(6, "rebot-sim-collector")
+            mw.end_struct()
 
-        if kv_metadata:
-            mw.write_list_hdr(5, _CompactWriter.STRUCT, len(kv_metadata))
-            for k, v in kv_metadata.items():
-                mw.begin_struct()
-                mw.write_str(1, k)
-                mw.write_str(2, v)
-                mw.end_struct()
+            meta_bytes = bytes(mw.buf)
+            f.write(meta_bytes)
+            f.write(struct.pack("<I", len(meta_bytes)))
+            f.write(b"PAR1")
 
-        mw.write_str(6, "rebot-sim-collector")
-        mw.end_struct()
-
-        meta_bytes = bytes(mw.buf)
-        f.write(meta_bytes)
-        f.write(struct.pack("<I", len(meta_bytes)))
-        f.write(b"PAR1")
-
-    tmp.replace(path)
+        tmp.replace(path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _has_pyarrow() -> bool:
@@ -653,11 +680,15 @@ def _write_data_parquet(
                 arr = pa.array(values)
             arrays.append(arr)
             fields.append(pa.field(key, arr.type))
-        schema = pa.schema(fields, metadata={"huggingface": json.dumps(hf_metadata)})
+        schema = pa.schema(fields, metadata={"huggingface": json.dumps(hf_metadata, allow_nan=False)})
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".parquet.tmp")
-        pq.write_table(pa.Table.from_arrays(arrays, schema=schema), tmp)
-        tmp.replace(path)
+        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        try:
+            pq.write_table(pa.Table.from_arrays(arrays, schema=schema), tmp)
+            tmp.replace(path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
         return
 
     cols_spec: list[tuple[str, str, Any]] = []
@@ -676,7 +707,7 @@ def _write_data_parquet(
         path,
         cols_spec,
         num_rows=num_rows,
-        kv_metadata={"huggingface": json.dumps(hf_metadata)},
+        kv_metadata={"huggingface": json.dumps(hf_metadata, allow_nan=False)},
     )
 
 
@@ -723,13 +754,17 @@ def _write_tasks_parquet(path: Path, tasks: dict[str, int]) -> None:
         pandas_meta = _pandas_tasks_metadata(pa.__version__)
         schema = pa.schema(
             [pa.field("task_index", pa.int64()), pa.field("task", pa.string())],
-            metadata={"pandas": json.dumps(pandas_meta)},
+            metadata={"pandas": json.dumps(pandas_meta, allow_nan=False)},
         )
         table = pa.table([[i for _, i in items], [t for t, _ in items]], schema=schema)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".parquet.tmp")
-        pq.write_table(table, tmp)
-        tmp.replace(path)
+        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        try:
+            pq.write_table(table, tmp)
+            tmp.replace(path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
         return
 
     pandas_meta = _pandas_tasks_metadata()
@@ -741,7 +776,7 @@ def _write_tasks_parquet(path: Path, tasks: dict[str, int]) -> None:
         path,
         cols,
         num_rows=len(items),
-        kv_metadata={"pandas": json.dumps(pandas_meta)},
+        kv_metadata={"pandas": json.dumps(pandas_meta, allow_nan=False)},
     )
 
 
@@ -751,9 +786,13 @@ def _write_episodes_parquet(path: Path, episodes: list[dict[str, Any]]) -> None:
         import pyarrow.parquet as pq
 
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".parquet.tmp")
-        pq.write_table(pa.Table.from_pylist(episodes), tmp)
-        tmp.replace(path)
+        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        try:
+            pq.write_table(pa.Table.from_pylist(episodes), tmp)
+            tmp.replace(path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
         return
 
     keys = list(episodes[0].keys())
@@ -766,8 +805,10 @@ def _write_episodes_parquet(path: Path, episodes: list[dict[str, Any]]) -> None:
                 cols.append((k, "list_string", vals))
             elif k.endswith("/count"):
                 cols.append((k, "list_int64", vals))
+            elif sample and isinstance(sample[0], list):
+                cols.append((k, "list3_float64", vals))
             else:
-                cols.append((k, "list_float64", [np.asarray(v, dtype=np.float64).ravel().tolist() for v in vals]))
+                cols.append((k, "list_float64", vals))
         elif isinstance(sample, int) and not isinstance(sample, bool):
             cols.append((k, "int64", np.array(vals, dtype=np.int64)))
         elif isinstance(sample, float):
@@ -777,17 +818,21 @@ def _write_episodes_parquet(path: Path, episodes: list[dict[str, Any]]) -> None:
     _write_parquet_pure_python(path, cols, num_rows=len(episodes))
 
 
-def _hf_feature(ft: dict[str, Any]) -> dict[str, Any]:
-    if ft["shape"] == [1]:
+def _hf_feature(ft: dict[str, Any], *, is_list: bool = False) -> dict[str, Any]:
+    if not is_list and ft["shape"] == [1]:
         return {"dtype": ft["dtype"], "_type": "Value"}
     return {"feature": {"dtype": ft["dtype"], "_type": "Value"}, "length": ft["shape"][0], "_type": "List"}
 
 
 def _write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=4), encoding="utf-8")
-    tmp.replace(path)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(data, indent=4, allow_nan=False), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 # --------------------------------------------------------------------------- collector
@@ -817,6 +862,8 @@ class LeRobotSimCollector:
     Failed episodes are poisoned and never committed to disk.
     """
 
+    _LOCK_NAME = ".collector.lock"
+
     def __init__(
         self,
         root: str | Path,
@@ -833,10 +880,9 @@ class LeRobotSimCollector:
         task: str = "",
         video: VideoSettings | None = None,
         env: SimEnv | None = None,
+        timestamp_rtol: float = 0.05,
     ) -> None:
         self.root = Path(root)
-        if self.root.exists() and any(self.root.iterdir()):
-            raise CollectorError(f"Dataset root {self.root} exists and is not empty")
 
         if not isinstance(profile_id, str) or not profile_id.strip():
             raise CollectorError("profile_id is required and must be a non-empty string")
@@ -851,6 +897,8 @@ class LeRobotSimCollector:
             fps = max(1, round(1.0 / env.control_dt))
         if _is_bool(fps) or not isinstance(fps, int) or fps <= 0:
             raise CollectorError(f"fps must be a positive integer, got {fps!r}")
+        if _is_bool(timestamp_rtol) or not isinstance(timestamp_rtol, (int, float)) or timestamp_rtol < 0.0:
+            raise CollectorError(f"timestamp_rtol must be a non-negative float, got {timestamp_rtol!r}")
 
         if joint_names is None:
             if env is not None:
@@ -865,27 +913,59 @@ class LeRobotSimCollector:
 
         roles: list[str] = []
         for role in required_camera_roles:
-            if not isinstance(role, str) or not role.strip():
-                raise CollectorError(f"Camera role must be a non-empty string, got {role!r}")
-            if role in roles:
-                raise CollectorError(f"Duplicate camera role {role!r}")
-            roles.append(role)
+            clean_role = _validate_camera_role(role)
+            if clean_role in roles:
+                raise CollectorError(f"Duplicate camera role {clean_role!r}")
+            roles.append(clean_role)
 
         validated_shapes: dict[str, tuple[int, int, int]] = {}
         if camera_shapes is not None:
             for role, shp in camera_shapes.items():
-                if not isinstance(role, str) or not role.strip():
-                    raise CollectorError(f"Invalid camera role {role!r} in camera_shapes")
+                clean_role = _validate_camera_role(role)
                 if not isinstance(shp, (tuple, list)) or len(shp) != 3:
-                    raise CollectorError(f"camera_shapes[{role!r}] must be (H, W, 3), got {shp!r}")
+                    raise CollectorError(f"camera_shapes[{clean_role!r}] must be (H, W, 3), got {shp!r}")
                 h, w, c = int(shp[0]), int(shp[1]), int(shp[2])
                 if h <= 0 or w <= 0 or c != 3:
-                    raise CollectorError(f"camera_shapes[{role!r}] must have H,W > 0 and C == 3, got {shp!r}")
-                validated_shapes[role] = (h, w, c)
+                    raise CollectorError(f"camera_shapes[{clean_role!r}] must have H,W > 0 and C == 3, got {shp!r}")
+                validated_shapes[clean_role] = (h, w, c)
         elif env is not None and env.render_camera in roles and env.renderer is not None:
             validated_shapes[env.render_camera] = (env.render_height, env.render_width, 3)
 
+        self.video = video or VideoSettings()
+        if roles:
+            self.video.vcodec = pick_vcodec(self.video.vcodec)
+
+        # Acquire exclusive dataset root lock before any episode can be staged or written.
+        self._lock_fd: IO[str] | None = None
+        self._lock_path: Path | None = None
+        self._root_existed = self.root.exists()
+        if self._root_existed and any(p.name != self._LOCK_NAME for p in self.root.iterdir()):
+            raise CollectorError(f"Dataset root {self.root} exists and is not empty")
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        lock_path = self.root / self._LOCK_NAME
+        lock_fd = open(lock_path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if any(p.name != self._LOCK_NAME for p in self.root.iterdir()):
+                raise CollectorError(f"Dataset root {self.root} exists and is not empty")
+        except OSError as exc:
+            lock_fd.close()
+            raise CollectorError(
+                f"Dataset root {self.root} is locked by another LeRobotSimCollector"
+            ) from exc
+        except Exception:
+            try:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_fd.close()
+            raise
+
+        self._lock_fd = lock_fd
+        self._lock_path = lock_path
+
         self.fps = fps
+        self.timestamp_rtol = float(timestamp_rtol)
         self.profile_id = profile_id.strip()
         self.unit_mode = unit_mode
         self.robot_type = robot_type.strip()
@@ -897,22 +977,21 @@ class LeRobotSimCollector:
         self.arm_dof = arm_dof
         self.gripper_joint = gripper_joint
 
-        self.video = video or VideoSettings()
-        if self.required_camera_roles:
-            self.video.vcodec = pick_vcodec(self.video.vcodec)
-
         self._episodes: list[dict[str, Any]] = []
         self._stats: list[dict[str, dict[str, np.ndarray]]] = []
         self._tasks: dict[str, int] = {}
         self._video_info: dict[str, dict[str, Any]] = {}
         self._ep: _ActiveEpisode | None = None
+        self._closed = False
 
     @staticmethod
     def camera_key(role: str) -> str:
-        return f"observation.images.{role}"
+        return f"observation.images.{_validate_camera_role(role)}"
 
     def start_episode(self, task: str | None = None) -> None:
         """Begin a new episode staging buffer."""
+        if self._closed:
+            raise CollectorError("Collector is closed")
         if self._ep is not None:
             raise CollectorError("An episode is already active; call save_episode() or discard_episode() first")
         ep_task = self.default_task if task is None else str(task)
@@ -932,6 +1011,8 @@ class LeRobotSimCollector:
         cameras: Mapping[str, np.ndarray] | None = None,
     ) -> int:
         """Validate and append one step to the active episode. Returns 0-based frame index."""
+        if self._closed:
+            raise CollectorError("Collector is closed")
         ep = self._ep
         if ep is None:
             raise CollectorError("No active episode; call start_episode() first")
@@ -942,14 +1023,35 @@ class LeRobotSimCollector:
 
         try:
             if _is_bool(timestamp) or not isinstance(timestamp, (int, float, np.integer, np.floating)):
-                raise CollectorError(f"timestamp must be a finite number, got {timestamp!r}")
+                raise CollectorError(f"timestamp must be a real finite number, got {timestamp!r}")
             ts = float(timestamp)
-            if not math.isfinite(ts):
-                raise CollectorError(f"timestamp must be finite, got {timestamp!r}")
-            if ep.prev_ts is not None and ts <= ep.prev_ts:
-                raise CollectorError(
-                    f"Non-monotonic timestamp: {ts} <= previous {ep.prev_ts}"
-                )
+            with np.errstate(over="ignore"):
+                ts32 = np.float32(ts)
+            if not math.isfinite(ts) or not bool(np.isfinite(ts32)):
+                raise CollectorError(f"timestamp must be finite in float32, got {timestamp!r}")
+            if ts < 0.0:
+                raise CollectorError(f"timestamp must be non-negative, got {ts}")
+            if ep.prev_ts is None:
+                if self.required_camera_roles and abs(ts) > 1e-6:
+                    raise CollectorError(
+                        f"Initial frame timestamp must be 0.0 when recording cameras (aligns with video PTS=0), got {ts}"
+                    )
+            else:
+                if ts <= ep.prev_ts:
+                    raise CollectorError(
+                        f"Non-monotonic timestamp: {ts} <= previous {ep.prev_ts}"
+                    )
+                if ts32 <= np.float32(ep.prev_ts):
+                    raise CollectorError(
+                        f"Timestamp loses monotonicity in float32: {ts} vs previous {ep.prev_ts}"
+                    )
+                expected_dt = 1.0 / self.fps
+                dt = ts - ep.prev_ts
+                tol = max(1e-6, self.timestamp_rtol * expected_dt)
+                if abs(dt - expected_dt) > tol:
+                    raise CollectorError(
+                        f"Timestamp step dt={dt:.6g}s deviates from expected 1/fps={expected_dt:.6g}s (tol={tol:.6g}s)"
+                    )
 
             state_vec = _validate_finite_1d(state, self.dof, "observation.state")
             action_vec = _validate_finite_1d(action, self.dof, "action")
@@ -962,13 +1064,14 @@ class LeRobotSimCollector:
                         f"cameras mapping required for roles {self.required_camera_roles}"
                     )
                 for role in self.required_camera_roles:
-                    if role not in cameras:
-                        raise CollectorError(f"Missing required camera role {role!r}")
-                    expected = ep.camera_shapes.get(role)
-                    img = _validate_image(cameras[role], role, expected)
-                    validated_cams[role] = img
+                    clean_role = _validate_camera_role(role)
+                    if clean_role not in cameras:
+                        raise CollectorError(f"Missing required camera role {clean_role!r}")
+                    expected = ep.camera_shapes.get(clean_role)
+                    img = _validate_image(cameras[clean_role], clean_role, expected)
+                    validated_cams[clean_role] = img
                     if expected is None:
-                        new_shapes[role] = img.shape
+                        new_shapes[clean_role] = img.shape
 
             # All validation passed before mutating active episode or opening encoders.
             for role, shp in new_shapes.items():
@@ -978,7 +1081,7 @@ class LeRobotSimCollector:
                 writer = ep.video_writers.get(role)
                 if writer is None:
                     h, w, _ = ep.camera_shapes[role]
-                    vid_path = ep.tmp_dir / f"{role}.mp4"
+                    vid_path = ep.tmp_dir / f"{_validate_camera_role(role)}.mp4"
                     writer = _VideoWriter(vid_path, self.fps, self.video, (w, h))
                     ep.video_writers[role] = writer
                 writer.put(img)
@@ -1011,7 +1114,9 @@ class LeRobotSimCollector:
         self._ep = None
 
     def save_episode(self) -> int:
-        """Commit the active valid episode to ``root`` in LeRobot v3.0 format."""
+        """Atomically commit the active valid episode to ``root`` in LeRobot v3.0 format."""
+        if self._closed:
+            raise CollectorError("Collector is closed")
         ep = self._ep
         if ep is None:
             raise CollectorError("No active episode to save")
@@ -1023,13 +1128,19 @@ class LeRobotSimCollector:
         if n == 0:
             raise CollectorError("Cannot save empty episode; record at least one step or discard_episode()")
 
-        for role, writer in ep.video_writers.items():
-            writer.close()
-            info = probe_video(writer.path)
-            if info["frames"] and info["frames"] != n:
-                raise CollectorError(f"Camera {role!r} video has {info['frames']} frames for {n} steps")
-            ep.video_info[role] = info
+        # Phase 1: Finalize all video writers and verify decoded frame counts before touching root.
+        try:
+            for role, writer in ep.video_writers.items():
+                writer.close()
+                vinfo = probe_video(writer.path)
+                if vinfo["frames"] != n:
+                    raise CollectorError(f"Camera {role!r} video has {vinfo['frames']} frames for {n} steps")
+                ep.video_info[role] = vinfo
+        except Exception as exc:
+            ep.poisoned_error = str(exc)
+            raise
 
+        # Phase 2: Compute all candidate tables, stats, and metadata in memory.
         idx = len(self._episodes)
         chunk, file_idx = divmod(idx, CHUNKS_SIZE)
         start = self._episodes[-1]["dataset_to_index"] if self._episodes else 0
@@ -1057,17 +1168,16 @@ class LeRobotSimCollector:
         features = self._build_features(next_camera_shapes, next_video_info)
         hf_meta = {
             "info": {
-                "features": {k: _hf_feature(features[k]) for k in columns},
+                "features": {
+                    k: _hf_feature(features[k], is_list=(columns[k].ndim == 2))
+                    for k in columns
+                },
                 "unit_mode": self.unit_mode,
                 "profile_id": self.profile_id,
                 "arm_dof": self.arm_dof,
                 "gripper_joint": self.gripper_joint,
             }
         }
-
-        self.root.mkdir(parents=True, exist_ok=True)
-        data_path = self.root / DATA_PATH.format(chunk_index=chunk, file_index=file_idx)
-        _write_data_parquet(data_path, columns, hf_meta)
 
         stats: dict[str, dict[str, np.ndarray]] = {k: feature_stats(v) for k, v in columns.items()}
         ep_row: dict[str, Any] = {
@@ -1080,6 +1190,7 @@ class LeRobotSimCollector:
             "dataset_to_index": start + n,
         }
 
+        video_targets: list[tuple[Path, Path]] = []
         for role, writer in ep.video_writers.items():
             cam_key = self.camera_key(role)
             video_path = self.root / VIDEO_PATH.format(
@@ -1087,8 +1198,7 @@ class LeRobotSimCollector:
                 chunk_index=chunk,
                 file_index=file_idx,
             )
-            video_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(writer.path), video_path)
+            video_targets.append((writer.path, video_path))
             stats[cam_key] = image_stats(ep.stat_images[role])
             ep_row[f"videos/{cam_key}/chunk_index"] = chunk
             ep_row[f"videos/{cam_key}/file_index"] = file_idx
@@ -1104,13 +1214,117 @@ class LeRobotSimCollector:
         ep_row["meta/episodes/chunk_index"] = 0
         ep_row["meta/episodes/file_index"] = 0
 
+        next_episodes = [*self._episodes, ep_row]
+        next_stats = [*self._stats, stats]
+        info_payload = self._build_info_payload(features, next_episodes, next_tasks)
+        stats_payload = _jsonable(aggregate_stats(next_stats))
+
+        # Phase 3: Write all artifacts to staging paths alongside their destinations before swapping.
+        data_path = self.root / DATA_PATH.format(chunk_index=chunk, file_index=file_idx)
+        meta_dir = self.root / "meta"
+        info_path = meta_dir / "info.json"
+        stats_path = meta_dir / "stats.json"
+        episodes_path = self.root / EPISODES_PATH
+        tasks_path = meta_dir / "tasks.parquet"
+
+        staging_pairs: list[tuple[Path, Path]] = []  # (staged_in_dest_parent, final_dest)
+        backup_candidates: list[tuple[Path, Path]] = []  # (backup_in_dest_parent, final_dest)
+        created_dirs: list[Path] = []
+        pid = os.getpid()
+
+        def _ensure_parent(dest: Path) -> None:
+            missing: list[Path] = []
+            cur = dest.parent
+            while cur != self.root and not cur.exists():
+                missing.append(cur)
+                cur = cur.parent
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            created_dirs.extend(reversed(missing))
+
+        try:
+            # Stage data parquet (register path before write so partial files are always cleaned)
+            _ensure_parent(data_path)
+            data_staged = data_path.with_name(f"{data_path.name}.staged.{pid}")
+            staging_pairs.append((data_staged, data_path))
+            _write_data_parquet(data_staged, columns, hf_meta)
+
+            # Stage all videos (register before copyfile so half-copied videos are always cleaned)
+            for src_vid, dest_vid in video_targets:
+                _ensure_parent(dest_vid)
+                vid_staged = dest_vid.with_name(f"{dest_vid.name}.staged.{pid}")
+                staging_pairs.append((vid_staged, dest_vid))
+                shutil.copyfile(src_vid, vid_staged)
+
+            # Stage all metadata files
+            for p in (info_path, stats_path, episodes_path, tasks_path):
+                _ensure_parent(p)
+
+            info_staged = info_path.with_name(f"{info_path.name}.staged.{pid}")
+            staging_pairs.append((info_staged, info_path))
+            _write_json(info_staged, info_payload)
+
+            stats_staged = stats_path.with_name(f"{stats_path.name}.staged.{pid}")
+            staging_pairs.append((stats_staged, stats_path))
+            _write_json(stats_staged, stats_payload)
+
+            episodes_staged = episodes_path.with_name(f"{episodes_path.name}.staged.{pid}")
+            staging_pairs.append((episodes_staged, episodes_path))
+            _write_episodes_parquet(episodes_staged, next_episodes)
+
+            tasks_staged = tasks_path.with_name(f"{tasks_path.name}.staged.{pid}")
+            staging_pairs.append((tasks_staged, tasks_path))
+            _write_tasks_parquet(tasks_staged, next_tasks)
+
+            # Phase 4: Stage same-filesystem backups for existing targets, then replace atomically.
+            backup_for_dest: dict[Path, Path] = {}
+            for _, dest in staging_pairs:
+                if dest.exists():
+                    b_path = dest.with_name(f"{dest.name}.bak.{pid}")
+                    backup_candidates.append((b_path, dest))
+                    shutil.copy2(dest, b_path)
+                    backup_for_dest[dest] = b_path
+
+            replaced_new: list[Path] = []
+            replaced_existing: list[tuple[Path, Path]] = []
+            try:
+                for staged, dest in staging_pairs:
+                    b_path = backup_for_dest.get(dest)
+                    os.replace(staged, dest)
+                    if b_path is None:
+                        replaced_new.append(dest)
+                    else:
+                        replaced_existing.append((b_path, dest))
+            except Exception:
+                # Roll back newly created files and atomically restore ONLY targets actually replaced.
+                for created in replaced_new:
+                    created.unlink(missing_ok=True)
+                for b_path, dest in replaced_existing:
+                    os.replace(b_path, dest)
+                raise
+        except Exception as exc:
+            for staged, _ in staging_pairs:
+                staged.unlink(missing_ok=True)
+            for b_path, _ in backup_candidates:
+                b_path.unlink(missing_ok=True)
+            for d in reversed(created_dirs):
+                try:
+                    if d.exists() and not any(d.iterdir()):
+                        d.rmdir()
+                except OSError:
+                    pass
+            ep.poisoned_error = str(exc)
+            raise
+
+        for b_path, _ in backup_candidates:
+            b_path.unlink(missing_ok=True)
+
+        # Phase 5: Commit in-memory state only after all disk writes succeed.
         self._camera_shapes = next_camera_shapes
         self._video_info = next_video_info
         self._tasks = next_tasks
-        self._episodes.append(ep_row)
-        self._stats.append(stats)
+        self._episodes = next_episodes
+        self._stats = next_stats
 
-        self._write_meta(features)
         shutil.rmtree(ep.tmp_dir, ignore_errors=True)
         self._ep = None
         return idx
@@ -1126,30 +1340,75 @@ class LeRobotSimCollector:
         seed: int | None = None,
         camera_role: str | None = None,
         stop_on_done: bool = True,
+        unit_converter: Callable[[np.ndarray, Any], tuple[Any, Any]] | None = None,
     ) -> int:
         """Reset ``env``, run ``policy`` for up to ``max_steps``, and save the episode."""
-        if max_steps <= 0:
+        if self._closed:
+            raise CollectorError("Collector is closed")
+        if _is_bool(max_steps) or not isinstance(max_steps, int) or max_steps <= 0:
             raise CollectorError(f"max_steps must be positive, got {max_steps}")
 
-        obs, _info = env.reset(seed=seed)
-        role = camera_role or (self.required_camera_roles[0] if len(self.required_camera_roles) == 1 else env.render_camera)
+        if self.unit_mode != "rad" and unit_converter is None:
+            raise CollectorError(
+                f"collect_episode() requires unit_mode='rad' or an explicit unit_converter for SimEnv, "
+                f"got unit_mode={self.unit_mode!r}"
+            )
+
+        target_role: str | None = None
+        if self.required_camera_roles:
+            if len(self.required_camera_roles) != 1:
+                raise CollectorError(
+                    f"collect_episode() only supports a single SimEnv render_camera, "
+                    f"got required_camera_roles={self.required_camera_roles}"
+                )
+            target_role = self.required_camera_roles[0]
+            if camera_role is not None and _validate_camera_role(camera_role) != target_role:
+                raise CollectorError(
+                    f"camera_role={camera_role!r} does not match required_camera_roles={self.required_camera_roles}"
+                )
+            if env.render_camera != target_role:
+                raise CollectorError(
+                    f"SimEnv render_camera {env.render_camera!r} does not match required camera role {target_role!r}"
+                )
+            if env.renderer is None:
+                raise CollectorError(
+                    f"SimEnv has no active renderer for required camera role {target_role!r}"
+                )
+
+        obs, info = env.reset(seed=seed)
         self.start_episode(task=task)
         try:
             for step_idx in range(max_steps):
-                act = policy(obs, step_idx) if callable(policy) else policy[step_idx]
-                next_obs, _reward, done, next_info = env.step(act)
+                step_ts = float(info["sim_time_s"])
+                raw_act = policy(obs, step_idx) if callable(policy) else policy[step_idx]
+                act_rad = validate_real_vector(
+                    raw_act,
+                    env.action_dim,
+                    label="action",
+                    exc_type=CollectorError,
+                )
+                next_obs, _reward, done, next_info = env.step(act_rad)
+
+                if unit_converter is not None:
+                    rec_state, rec_action = unit_converter(obs["state"], act_rad)
+                else:
+                    rec_state, rec_action = obs["state"], act_rad
+
                 cams = None
-                if self.required_camera_roles:
-                    cams = {}
-                    if role is not None and "image" in obs:
-                        cams[role] = obs["image"]
+                if target_role is not None:
+                    if "image" not in obs:
+                        raise CollectorError(
+                            f"SimEnv observation missing 'image' for required camera role {target_role!r}"
+                        )
+                    cams = {target_role: obs["image"]}
+
                 self.record_step(
-                    timestamp=next_info["sim_time_s"],
-                    state=obs["state"],
-                    action=act,
+                    timestamp=step_ts,
+                    state=rec_state,
+                    action=rec_action,
                     cameras=cams,
                 )
-                obs = next_obs
+                obs, info = next_obs, next_info
                 if stop_on_done and done:
                     break
             return self.save_episode()
@@ -1196,37 +1455,51 @@ class LeRobotSimCollector:
         feats.update(json.loads(json.dumps(DEFAULT_FEATURES)))
         return feats
 
-    def _write_meta(self, features: dict[str, dict[str, Any]]) -> None:
-        meta = self.root / "meta"
-        (meta / "episodes" / "chunk-000").mkdir(parents=True, exist_ok=True)
-        total_frames = int(self._episodes[-1]["dataset_to_index"])
-        info: dict[str, Any] = {
+    def _build_info_payload(
+        self,
+        features: dict[str, dict[str, Any]],
+        episodes: list[dict[str, Any]],
+        tasks: dict[str, int],
+    ) -> dict[str, Any]:
+        total_frames = int(episodes[-1]["dataset_to_index"])
+        return {
             "codebase_version": CODEBASE_VERSION,
             "fps": self.fps,
             "features": features,
-            "total_episodes": len(self._episodes),
+            "total_episodes": len(episodes),
             "total_frames": total_frames,
-            "total_tasks": len(self._tasks),
+            "total_tasks": len(tasks),
             "chunks_size": CHUNKS_SIZE,
             "data_files_size_in_mb": 100,
             "video_files_size_in_mb": 200,
             "data_path": DATA_PATH,
             "video_path": VIDEO_PATH if self.required_camera_roles else None,
             "robot_type": self.robot_type,
-            "splits": {"train": f"0:{len(self._episodes)}"},
+            "splits": {"train": f"0:{len(episodes)}"},
             "unit_mode": self.unit_mode,
             "rebot_unit_mode": self.unit_mode,
             "profile_id": self.profile_id,
             "arm_dof": self.arm_dof,
             "gripper_joint": self.gripper_joint,
         }
-        _write_json(meta / "info.json", info)
-        _write_json(meta / "stats.json", _jsonable(aggregate_stats(self._stats)))
-        _write_episodes_parquet(self.root / EPISODES_PATH, self._episodes)
-        _write_tasks_parquet(meta / "tasks.parquet", self._tasks)
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         self.discard_episode()
+        if self._lock_fd is not None:
+            try:
+                fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                self._lock_fd.close()
+            except OSError:
+                pass
+            self._lock_fd = None
+        # Keep .collector.lock inode intact on disk so flock remains bound to a single stable inode.
+        self._lock_path = None
 
     def __enter__(self) -> Self:
         return self

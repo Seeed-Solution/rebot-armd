@@ -15,6 +15,80 @@ from .pack import PackScene, load_scene_pack, load_tool_pack
 from .server import Motors
 
 
+def _is_real_scalar(val: Any) -> bool:
+    return isinstance(val, (int, float, np.integer, np.floating)) and not isinstance(
+        val, (bool, np.bool_)
+    )
+
+
+def validate_real_vector(
+    values: Any,
+    expected_len: int,
+    label: str = "action",
+    exc_type: type[ValueError] = ValueError,
+) -> np.ndarray:
+    """Validate a 1D (or batch-1 ``(1, N)``) real-numeric vector of exact length ``expected_len``."""
+    if values is None or isinstance(
+        values, (bool, np.bool_, str, bytes, bytearray, dict, set, complex, np.complexfloating)
+    ):
+        raise exc_type(
+            f"{label} must be a real-numeric 1D sequence/array of length {expected_len}, "
+            f"got {type(values).__name__}"
+        )
+
+    if not isinstance(values, np.ndarray):
+        if not isinstance(values, Sequence):
+            raise exc_type(
+                f"{label} must be a real-numeric 1D sequence/array of length {expected_len}, "
+                f"got {type(values).__name__}"
+            )
+        if len(values) == 1 and isinstance(values[0], (Sequence, np.ndarray)) and not isinstance(
+            values[0], (str, bytes, bytearray)
+        ):
+            inner = values[0]
+            if not isinstance(inner, np.ndarray):
+                for idx, item in enumerate(inner):
+                    if not _is_real_scalar(item):
+                        raise exc_type(
+                            f"{label}[0][{idx}] must be a real number, got {type(item).__name__}"
+                        )
+        else:
+            for idx, item in enumerate(values):
+                if not _is_real_scalar(item):
+                    raise exc_type(
+                        f"{label}[{idx}] must be a real number, got {type(item).__name__}"
+                    )
+
+    try:
+        raw = np.asarray(values)
+    except (TypeError, ValueError) as exc:
+        raise exc_type(f"{label} could not be converted to a numeric array: {exc}") from exc
+    if np.iscomplexobj(raw) or raw.dtype.kind not in ("i", "u", "f"):
+        raise exc_type(
+            f"{label} must contain real numeric values (int/float), got dtype {raw.dtype!r}"
+        )
+
+    if raw.ndim == 2 and raw.shape[0] == 1:
+        arr = raw[0]
+    elif raw.ndim == 1:
+        arr = raw
+    else:
+        raise exc_type(
+            f"Expected 1D {label} of length {expected_len} or shape (1, {expected_len}), "
+            f"got shape {raw.shape}"
+        )
+
+    if arr.shape[0] != expected_len:
+        raise exc_type(
+            f"{label} length mismatch: expected {expected_len}, got {arr.shape[0]}"
+        )
+
+    out = np.asarray(arr, dtype=np.float64)
+    if not np.all(np.isfinite(out)):
+        raise exc_type(f"{label} contains non-finite values (NaN or Inf)")
+    return out
+
+
 class SimEnv:
     """Non-realtime fast training environment for policy learning and fast evaluation.
 
@@ -109,44 +183,12 @@ class SimEnv:
 
     def _validate_action(self, action: Sequence[float] | np.ndarray) -> np.ndarray:
         """Validate action dimensionality, length, numeric type, and finiteness."""
-        if action is None or isinstance(action, (bool, np.bool_, str, bytes, dict)):
-            raise ValueError(f"Action must be a numeric 1D sequence/array, got {type(action).__name__}")
-
-        if isinstance(action, Sequence) and not isinstance(action, np.ndarray):
-            def _has_bool(obj: Any) -> bool:
-                if isinstance(obj, (bool, np.bool_)):
-                    return True
-                if isinstance(obj, Sequence) and not isinstance(obj, (str, bytes)):
-                    return any(_has_bool(item) for item in obj)
-                return False
-
-            if _has_bool(action):
-                raise ValueError("Action must not contain boolean values")
-
-        raw = np.asarray(action)
-        if np.issubdtype(raw.dtype, np.bool_):
-            raise ValueError("Action must be numeric, not boolean")
-
-        try:
-            arr = np.asarray(raw, dtype=np.float64)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Action must be numeric: {exc}") from exc
-
-        expected = self.action_dim
-        if arr.ndim == 2 and arr.shape[0] == 1:
-            arr = arr[0]
-        elif arr.ndim != 1:
-            raise ValueError(
-                f"Expected 1D action of length {expected} or shape (1, {expected}), got shape {raw.shape}"
-            )
-
-        if arr.shape[0] != expected:
-            raise ValueError(
-                f"Action length mismatch: expected {expected} ({self.control_mode} mode), got {arr.shape[0]}"
-            )
-        if not np.all(np.isfinite(arr)):
-            raise ValueError("Action contains non-finite values (NaN or Inf)")
-        return arr
+        return validate_real_vector(
+            action,
+            self.action_dim,
+            label=f"action ({self.control_mode} mode)",
+            exc_type=ValueError,
+        )
 
     def _get_obs(self) -> dict[str, Any]:
         obs: dict[str, Any] = {
