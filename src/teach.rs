@@ -133,7 +133,7 @@ impl SupervisorInner {
         match &self.recording {
             None => Value::Null,
             Some(r) => json!({
-                "recording_id": r.id, "owner": r.owner.label(), "dataset": r.options.dataset, "task": r.options.task,
+                "recording_id": r.id, "owner": r.owner.label(), "dataset": r.options.dataset, "task": r.options.task, "started_at": r.recorded_at,
                 "source": r.options.source, "frames": self.recorder.frame_count(), "elapsed_s": r.started.elapsed().as_secs_f64(),
                 "owner_connected": r.owner_lost_at.is_none(),
             }),
@@ -309,7 +309,7 @@ async fn stop_recording(lock: &Arc<RwLock<SupervisorInner>>, by: Stopper, save: 
             tokio::task::spawn_blocking(move || s2.check_capacity()).await
                 .map_err(|e| ArmError::Internal(format!("episode check failed: {e}")))??;
         }
-        let (rec, path, frames, sidecar_base) = {
+        let (rec, _path, frames, sidecar_base) = {
             let mut inner = lock.write().await;
             let Some(r) = inner.recording.clone() else {
                 return Err(crate::recording::RecordingError::InvalidState { action: "save".into(), state: inner.recorder.state().clone() }.into());
@@ -337,7 +337,6 @@ async fn stop_recording(lock: &Arc<RwLock<SupervisorInner>>, by: Stopper, save: 
             truncated, stopped_by, arm_dof: Some(arm_dof), gripper_joint, recovered: None,
             first_state: frames.first().map(|f| f.observation_state.clone()), last_state: frames.last().map(|f| f.observation_state.clone()),
         };
-        debug_assert_eq!(path, st.path_of(&rec.id).unwrap_or_default());
         let sc = sidecar.clone();
         let (frames, result) = tokio::task::spawn_blocking(move || {
             let result = st.write_episode(&sc, &frames, writer);

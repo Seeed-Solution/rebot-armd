@@ -227,7 +227,8 @@ async fn save_validates_and_steps_run_in_order() {
     }).await;
     let took = t0.elapsed().as_secs_f64();
     println!("sequence: {took:.2} s, expected bound {expected:.2} s, steps {seen:?}");
-    assert_eq!((a_done.state.as_str(), a_done.kind.as_str(), a_done.tag.as_deref()), ("done", "sequence", Some("t1")), "{a_done:?}");
+    assert_eq!((a_done.state.as_str(), a_done.kind.as_str(), a_done.tag.as_deref(), a_done.failed_step), ("done", "sequence", Some("t1"), None), "{a_done:?}");
+    assert_eq!(a_done.sequence_id.as_deref(), Some(sid.as_str()));
     assert_eq!(seen, vec![(0, 0), (0, 1), (0, 2), (0, 3), (0, 4)]);
     assert_eq!(kinds, vec!["pose", "gripper", "wait", "pose", "gripper"]);
     assert!(took <= expected, "{took} > {expected}");
@@ -261,6 +262,7 @@ async fn stop_lease_loss_calibration_change_and_planning_refusal_end_the_run() {
     // the orchestrator releases the pins when it sees the end (next poll)
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(rig.sup.inner().read().await.sequences.pins.is_none(), "pins released");
+    assert_eq!(rig.sup.inner().read().await.last_action.as_ref().unwrap().failed_step, Some(0));
     // a joint zero / kinematics change during the wait: the next motion step is refused
     rig.epoch = rig.sup.get_observation().await.epoch_id;
     let sid2 = rig.save("short wait", json!([{"type": "wait", "s": 0.4}, {"type": "pose", "pose_id": a}])).await;
@@ -268,13 +270,13 @@ async fn stop_lease_loss_calibration_change_and_planning_refusal_end_the_run() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     rig.sup.inner().write().await.calibration_revision += 1;
     let (done, _) = rig.wait(id, 3.0, |_| {}).await;
-    assert_eq!((done.state.as_str(), done.code.as_deref(), done.step_index), ("failed", Some("CALIBRATION_CHANGED"), Some(1)), "{done:?}");
+    assert_eq!((done.state.as_str(), done.code.as_deref(), done.step_index, done.failed_step), ("failed", Some("CALIBRATION_CHANGED"), Some(1), Some(1)), "{done:?}");
     // planning refusal (a replay step too fast to play) ends the run at that step
     let fast = rig.episode(1.0, 0.1).await;
     let sid3 = rig.save("too fast", json!([{"type": "pose", "pose_id": a}, {"type": "replay", "episode_id": fast, "speed": 1.0}, {"type": "wait", "s": 0.1}])).await;
     let (id, _) = rig.run(json!({"id": sid3})).await;
     let (done, seen) = rig.wait(id, 20.0, |_| {}).await;
-    assert_eq!((done.state.as_str(), done.code.as_deref()), ("failed", Some("REPLAY_TOO_FAST")), "{done:?}");
+    assert_eq!((done.state.as_str(), done.code.as_deref(), done.failed_step), ("failed", Some("REPLAY_TOO_FAST"), Some(1)), "{done:?}");
     assert_eq!(seen, vec![(0, 0), (0, 1)]);
     assert!(close(&rig.commanded().await, &A, 6));
     // lease loss during the wait
@@ -283,6 +285,8 @@ async fn stop_lease_loss_calibration_change_and_planning_refusal_end_the_run() {
     common::send(&mut rig.ws, json!({"type": "release_lease", "generation": rig.generation, "epoch_id": rig.epoch})).await;
     let (done, _) = rig.wait(id, 2.0, |_| {}).await;
     assert_eq!((done.state.as_str(), done.code.as_deref()), ("cancelled", Some("LEASE_LOST")), "{done:?}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(rig.sup.inner().read().await.last_action.as_ref().unwrap().failed_step, Some(0), "set by the orchestrator once it sees the end");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -949,6 +949,9 @@ pub struct ActionStatus {
     pub repeat_index: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeats: Option<u32>,
+    /// Sequence that ended before finishing: index of the step that was running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_step: Option<usize>,
     /// Sequence with `record`: the episodes saved so far (one per finished repeat).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub episodes: Vec<String>,

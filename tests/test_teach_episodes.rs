@@ -289,6 +289,11 @@ async fn recorder_ownership_other_clients_cannot_stop_and_disconnect_discards() 
     assert_eq!((r["type"].as_str(), r["owner"].as_str()), (Some("command_ack"), Some("page-a")), "{r}");
     let rid = r["recording_id"].as_str().unwrap().to_string();
     assert!(armd::recording::is_ulid(&rid));
+    let (_, list) = get(addr, "/api/v1/episodes").await;
+    let rec = &list["recording"];
+    assert_eq!((rec["recording_id"].as_str(), rec["owner"].as_str(), rec["dataset"].as_str(), rec["task"].as_str()),
+        (Some(rid.as_str()), Some("page-a"), Some("default"), Some("wipe")), "{rec}");
+    assert!(rec["started_at"].as_str().is_some_and(|t| t.ends_with('Z')), "{rec}");
     // a second recording: RECORDER_BUSY with the owner
     let r = common::ws_reply(&mut b, start("page-b"), &["command_ack", "command_reject"]).await;
     assert_eq!((r["code"].as_str(), r["owner"].as_str()), (Some("RECORDER_BUSY"), Some("page-a")), "{r}");

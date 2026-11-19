@@ -588,22 +588,24 @@ async fn run(sup: Arc<ArmSupervisor>, id: u64, plan: RunPlan) {
     };
     let total = (plan.steps.len() as f32 * plan.repeats as f32).max(1.0);
     let owner = crate::teach::RecorderOwner::Sequence { action_id: id };
+    // the step that ran last (failed_step when the run ends between steps)
+    let mut current: Option<usize> = None;
     for r in 0..plan.repeats {
         if let Some((dataset, task)) = &plan.request.record {
             let options = crate::teach::RecordOptions {
                 dataset: dataset.clone(), task: task.clone().unwrap_or_else(|| plan.sequence.name.clone()), source: "sequence".into(),
                 sequence_id: Some(plan.sequence.id.clone()), repeat_index: Some(r),
             };
-            if !ctx.alive().await { return; }
+            if !ctx.alive().await { return end(&ctx, Err(Stop::Cancelled), current).await; }
             if let Err(e) = sup.start_recording_as(owner.clone(), options, None, None).await {
-                return end(&ctx, Err(arm_fail(e))).await;
+                return end(&ctx, Err(arm_fail(e)), plan.steps.first().map(|s| s.0)).await;
             }
         }
         for (k, (index, step)) in plan.steps.iter().enumerate() {
             let progress = (r as f32 * plan.steps.len() as f32 + k as f32) / total;
             {
                 let mut inner = sup.inner().write().await;
-                if !inner.macro_alive(id) { return; }
+                if !inner.macro_alive(id) { drop(inner); return end(&ctx, Err(Stop::Cancelled), current).await; }
                 inner.update_action(id, |a| {
                     a.step_index = Some(*index);
                     a.step_type = Some(step.kind().into());
@@ -611,27 +613,31 @@ async fn run(sup: Arc<ArmSupervisor>, id: u64, plan: RunPlan) {
                 });
                 inner.set_action_phase(id, step.kind(), progress, None, None);
             }
-            if let Err(stop) = run_step(&ctx, &plan, step).await { return end(&ctx, Err(stop)).await; }
+            current = Some(*index);
+            if let Err(stop) = run_step(&ctx, &plan, step).await { return end(&ctx, Err(stop), current).await; }
         }
         if plan.request.record.is_some() {
-            if !ctx.alive().await { return; }
+            if !ctx.alive().await { return end(&ctx, Err(Stop::Cancelled), current).await; }
             match sup.stop_recording_as(crate::teach::Stopper::Owner(owner.clone()), true, Some("ok"), None).await {
                 Ok(crate::teach::Stopped::Saved { sidecar, .. }) => sup.inner().write().await.update_action(id, |a| a.episodes.push(sidecar.id.clone())),
                 Ok(_) => {}
-                Err(e) => return end(&ctx, Err(arm_fail(e))).await,
+                Err(e) => return end(&ctx, Err(arm_fail(e)), current).await,
             }
         }
     }
-    end(&ctx, Ok(())).await
+    end(&ctx, Ok(()), None).await
 }
 
-async fn end(ctx: &MacroCtx, result: Result<(), Stop>) {
+/// End the run; a run that did not finish records `failed_step` (also when a stop, lease loss
+/// or fault ended it while the step ran).
+async fn end(ctx: &MacroCtx, result: Result<(), Stop>, step: Option<usize>) {
     let mut inner = ctx.sup.inner().write().await;
     match result {
-        Ok(()) => inner.finish_macro(ctx.id, "done", None, None, None, None),
+        Ok(()) => return inner.finish_macro(ctx.id, "done", None, None, None, None),
         Err(Stop::Fail(code, message)) => inner.finish_macro(ctx.id, "failed", Some(&code), Some(message), None, None),
         Err(Stop::Cancelled) => {}
     }
+    if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == ctx.id && !a.is_running()) { a.failed_step = step; }
 }
 
 /// Before a motion step: the run is alive and nothing it was checked against changed.
