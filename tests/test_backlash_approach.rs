@@ -43,6 +43,21 @@ fn run(inner: &mut SupervisorInner, id: u64, max_s: f64) -> (motion::ActionStatu
 }
 
 #[test]
+fn kit_profile_enables_the_approach_and_publishes_it() {
+    let c = ArmConfig::rebot_dm();
+    let b = c.backlash_approach.as_ref().expect("rebot_dm has backlash_approach");
+    assert!(b.enabled && (b.delta_deg - 0.5).abs() < 1e-12);
+    assert_eq!(b.applies_to, ["move_to_pose", "grasp_final", "place_final", "move_to_precise"]);
+    let schema = armd::model::ObservationSchema::from_config(&c);
+    assert_eq!(schema.backlash_approach.as_ref(), Some(b));
+    assert!(schema.capabilities.backlash_approach);
+    // a bad section is refused at load
+    let mut bad = c.clone();
+    bad.backlash_approach = Some(BacklashApproach { joints: Some(vec!["gripper".into()]), ..Default::default() });
+    assert!(bad.validate().is_err());
+}
+
+#[test]
 fn move_to_pose_ends_from_the_same_side_with_an_approach_phase() {
     let mut inner = common::sim_at(on(), &INSPECT);
     // J1 near its lower soft limit: that joint approaches from above (sign -1)

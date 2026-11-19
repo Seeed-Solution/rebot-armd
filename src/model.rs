@@ -1472,7 +1472,9 @@ impl ArmConfig {
                 DamiaoRange::REBOT_DM_J4_J7,
             ]),
             speed_cap: None,
-            backlash_approach: None,
+            // J1 backlash 0.28-0.30 deg (camera, real arm 2026-11-18): every saved-pose move and the
+            // final grasp / place descent end from the same side (src/backlash.rs)
+            backlash_approach: Some(crate::backlash::BacklashApproach::default()),
             // rebot-sysid on the real arm (B601-DM, 2026-11-11, ±0.08 rad, one session at two
             // poses): off until validated at more poses (kits/recamera-b601dm/README.md)
             collision: Some(crate::collision::CollisionPolicy {

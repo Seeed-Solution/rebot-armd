@@ -373,6 +373,17 @@
       "t_max": 10.0
     }
   ],
+  "backlash_approach": {
+    "enabled": true,
+    "delta_deg": 0.5,
+    "applies_to": [
+      "move_to_pose",
+      "grasp_final",
+      "place_final",
+      "move_to_precise"
+    ],
+    "speed_rad_s": 0.05
+  },
   "collision": {
     "enabled": false,
     "thresholds_nm": [
