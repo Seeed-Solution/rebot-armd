@@ -101,9 +101,10 @@ run_suite() {
     check "always: state stopped" state_is always stopped
 
     # 5. environment and working directory of the program
-    new_app envapp 'import os, sys; print("HOST=" + os.environ["REBOT_HOST"]); print("PP=" + os.environ["PYTHONPATH"]); print("CWD=" + os.getcwd())'
+    new_app envapp 'import os, sys; print("HOST=" + os.environ["REBOT_HOST"]); print("APP=" + os.environ["REBOT_APP_NAME"]); print("PP=" + os.environ["PYTHONPATH"]); print("CWD=" + os.getcwd())'
     run_fg envapp
     check "env: REBOT_HOST=127.0.0.1" log_has envapp "HOST=127.0.0.1$"
+    check "env: REBOT_APP_NAME is the app name" log_has envapp "APP=envapp$"
     check "env: PYTHONPATH has the SDK dir and the app dir" log_has envapp "PP=/usr/share/rebot-teleop/python:$T/apps/envapp$"
     check "env: cwd is the app directory" log_has envapp "CWD=.*apps/envapp$"
 
