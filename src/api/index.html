@@ -406,7 +406,11 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .tch-acts .btn.armed, .tch-del.armed { background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); border-color: #ffccc7; }
 .tch-acts a.btn { display: inline-flex; align-items: center; text-decoration: none; }
 .tch-box { display: grid; gap: 8px; padding: 10px; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border); }
-.tch-prog { font-size: 13px; font-weight: 600; color: var(--sc-status-normal-fg); }
+.tch label.tch-pk { min-height: 32px; flex-shrink: 0; cursor: pointer; }
+.tch-n.off { display: none; }
+.tch-pick { border-style: dashed; }
+.tch-pick.on { border-style: solid; background: var(--sc-color-primary-soft); border-color: var(--sc-color-primary); }
+.tch-prog { min-height: 1.5em; font-size: 13px; font-weight: 600; color: var(--sc-status-normal-fg); }
 .tch-stop { color: #fff !important; background: var(--sc-estop) !important; border-color: var(--sc-estop) !important; }
 .tch-ask { flex-shrink: 0; display: grid; gap: 8px; padding: 10px 12px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); border: 1px solid #ffd591; font-size: 13px; }
 .tch-ask[hidden] { display: none; }
@@ -1520,9 +1524,9 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <section class="stage">
       <!-- teach strip: shown while teaching (panel open or closed); in the flow above the video, on the phone simple layout docked in free space -->
       <div class="tch-bar" id="teach-bar" role="group" data-i18n-aria="tch.bar" aria-label="示教工具条" hidden>
-        <button class="btn btn-primary" id="tb-pose" type="button" data-i18n="tch.b.pose" data-i18n-title="tch.b.pose.t" title="记下当前位置（各关节和夹爪开度）；打开了序列时加一步">记点</button>
+        <button class="btn btn-primary" id="tb-pose" type="button" data-i18n="tch.b.pose" data-i18n-title="tch.b.pose.t" title="记下当前位置（各关节和夹爪开度），加到点位列表；打开了动作时也加一步">记点</button>
         <button class="btn tb-rec" id="tb-rec" type="button" data-i18n="tch.b.rec">● 录轨迹</button>
-        <button class="btn tb-seq" id="tb-edit" type="button" data-i18n-title="tch.b.edit" title="打开示教面板编辑"><span id="tb-seq"></span></button>
+        <button class="btn tb-seq" id="tb-edit" type="button" data-i18n-title="tch.b.edit" title="打开点位与动作"><span id="tb-seq"></span></button>
         <button class="btn tb-x" id="tb-x" type="button" data-i18n-aria="tch.b.end" aria-label="结束示教">×</button>
       </div>
       <div class="video" id="video-box">
@@ -1986,17 +1990,17 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
   <button class="btn" id="cwiz-jog-back" type="button"></button>
   <button class="btn btn-primary" id="cwiz-jog-cap" type="button"></button>
 </div>
-<!-- teach panel (capabilities.teach v1): non-modal like the calibration wizard; tabs sequences / poses / trajectories -->
+<!-- positions & motions (capabilities.teach v1; opened from the 点位 button): non-modal like the calibration wizard; tabs poses / motions (sequences) / trajectories -->
 <div class="calib-mask cwiz-mask" id="teach" hidden>
   <aside class="calib-drawer cwiz tch" id="teach-panel" role="dialog" aria-modal="false" aria-labelledby="teach-h">
     <div class="calib-head">
-      <h3 id="teach-h" data-i18n="tch.title">示教</h3>
+      <h3 id="teach-h" data-i18n="tch.title">点位与动作</h3>
       <div class="cwiz-head-acts">
         <button class="btn calib-x" id="teach-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
       </div>
     </div>
-    <div class="seg tch-tabs" id="teach-tabs" role="tablist" data-i18n-aria="tch.title" aria-label="示教">
-      <button type="button" role="tab" id="teach-tab-seq" data-tab="seq" data-i18n="tch.tab.seq">序列</button><button type="button" role="tab" id="teach-tab-pose" data-tab="pose" data-i18n="tch.tab.pose">点位</button><button type="button" role="tab" id="teach-tab-ep" data-tab="ep" data-i18n="tch.tab.ep">轨迹</button>
+    <div class="seg tch-tabs" id="teach-tabs" role="tablist" data-i18n-aria="tch.title" aria-label="点位与动作">
+      <button type="button" role="tab" id="teach-tab-pose" data-tab="pose" data-i18n="tch.tab.pose">点位</button><button type="button" role="tab" id="teach-tab-seq" data-tab="seq" data-i18n="tch.tab.seq">动作</button><button type="button" role="tab" id="teach-tab-ep" data-tab="ep" data-i18n="tch.tab.ep">轨迹</button>
     </div>
     <div class="tch-ask" id="teach-ask" role="alertdialog" aria-labelledby="teach-ask-t" hidden>
       <b id="teach-ask-t"></b>
@@ -2085,11 +2089,6 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <div class="calib-head">
       <h3 id="sset-h" data-i18n="sset.title">设置</h3>
       <button class="btn calib-x" id="sset-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
-    </div>
-    <div class="gset-row" id="teach-set" hidden>
-      <div class="gset-k"><span data-i18n="tch.title">示教</span></div>
-      <small data-i18n="tch.set.desc">记点位、录轨迹，把它们排成序列运行；运行时可以同时录制。</small>
-      <button class="btn btn-primary" id="teach-open" type="button" data-i18n="tch.set.open">打开示教</button>
     </div>
     <div class="gset-row" id="tools-set" hidden>
       <div class="gset-k"><span data-i18n="tools.title">工具</span></div>
@@ -2737,13 +2736,13 @@ Object.assign(I18N.en, {
 });
 // teach panel (tch.*)
 Object.assign(I18N.zh, {
-  'tch.title': '示教', 'tch.bar': '示教工具条', 'tch.set.desc': '记点位、录轨迹，把它们排成序列运行；运行时可以同时录制。', 'tch.set.open': '打开示教',
-  'tch.tab.seq': '序列', 'tch.tab.pose': '点位', 'tch.tab.ep': '轨迹',
-  'tch.b.pose': '记点', 'tch.b.rec': '● 录轨迹', 'tch.b.recon': '■ 停止 {t}', 'tch.b.pose.t': '记下当前位置（各关节和夹爪开度）；打开了序列时加一步', 'tch.b.edit': '打开示教面板编辑', 'tch.b.end': '结束示教', 'tch.b.seq': '{n} · {c} 步', 'tch.b.seq.dirty': '{n} · {c} 步 · 未保存', 'tch.b.noseq': '未打开序列 · 编辑',
-  'tch.loading': '加载中…', 'tch.counts': '{s} 个序列 · {p} 个点位 · {e} 条轨迹', 'tch.e.load': '加载失败：{e}',
-  'tch.seq.name': '序列名称', 'tch.seq.new': '新建序列', 'tch.seq.new.ph': '新序列名称', 'tch.seq.empty': '还没有序列',
-  'tch.seq.hint': '序列按顺序执行点位、夹爪、等待和轨迹回放。打开一个序列后，「记点」「录轨迹」和夹爪按钮会把步骤加到选中步骤之后。',
-  'tch.seq.steps': '{n} 步', 'tch.seq.edit': '编辑', 'tch.run': '运行', 'tch.back': '← 序列', 'tch.save': '保存', 'tch.saved': '已保存',
+  'tch.title': '点位与动作', 'tch.bar': '示教工具条',
+  'tch.tab.seq': '动作', 'tch.tab.pose': '点位', 'tch.tab.ep': '轨迹',
+  'tch.b.pose': '记点', 'tch.b.rec': '● 录轨迹', 'tch.b.recon': '■ 停止 {t}', 'tch.b.pose.t': '记下当前位置（各关节和夹爪开度），加到点位列表；打开了动作时也加一步', 'tch.b.edit': '打开点位与动作', 'tch.b.end': '结束示教', 'tch.b.seq': '{n} · {c} 步', 'tch.b.seq.dirty': '{n} · {c} 步 · 未保存', 'tch.b.noseq': '点位与动作',
+  'tch.loading': '加载中…', 'tch.counts': '{p} 个点位 · {s} 个动作 · {e} 条轨迹', 'tch.e.load': '加载失败：{e}',
+  'tch.seq.name': '动作名称', 'tch.seq.new': '新建动作', 'tch.seq.new.ph': '新动作名称', 'tch.seq.empty': '还没有动作。在「点位」里勾选几个点位点「播放」，会自动存成一个动作。',
+  'tch.seq.hint': '动作按顺序执行点位、夹爪、等待和轨迹回放。打开一个动作后，示教工具条上的「记点」「录轨迹」会把步骤加到选中步骤之后。',
+  'tch.seq.steps': '{n} 步', 'tch.seq.edit': '编辑', 'tch.run': '运行', 'tch.back': '← 动作', 'tch.save': '保存', 'tch.saved': '已保存',
   'tch.del': '删除', 'tch.del.confirm': '确认删除', 'tch.cancel': '取消',
   'tch.st.empty': '还没有步骤：用下方按钮或示教工具条添加。', 'tch.st.pose': '点位 {n}', 'tch.st.replay': '轨迹 {n}', 'tch.st.grip.open': '夹爪张开',
   'tch.st.grip.close': '夹爪闭合', 'tch.st.grip.move': '夹爪到 {p}%', 'tch.st.wait': '等待', 'tch.st.del': '删除这一步', 'tch.st.added': '已加入第 {n} 步：{s}',
@@ -2754,31 +2753,33 @@ Object.assign(I18N.zh, {
   'tch.runbox': '运行', 'tch.repeat': '重复次数', 'tch.runrec': '运行时录制', 'tch.ds': '数据集', 'tch.task': '任务', 'tch.task.ph': '默认：{n}', 'tch.task.ph0': '例如：把方块放进左边的盒子',
   'tch.single.sel': '单步（选中的一步）', 'tch.stop': '停止',
   'tch.prog': '运行中 · 第 {i}/{n} 步 · 第 {r}/{m} 遍 {s}', 'tch.ph.approach': '· 移动到起点', 'tch.ph.move': '· 移动', 'tch.ph.wait': '· 等待', 'tch.ph.gripper': '· 夹爪', 'tch.ph.replay': '· 回放', 'tch.ph.settle': '· 到位确认',
-  'tch.run.started': '开始运行「{n}」（{r} 遍）', 'tch.run.single': '单步运行第 {n} 步', 'tch.run.done': '序列运行完成', 'tch.run.ended': '序列结束（{code}）：{m}',
-  'tch.enable_first': '先使能机械臂，再运行', 'tch.unsaved': '有未保存的修改：再点一次「← 序列」放弃修改',
+  'tch.run.started': '开始运行「{n}」（{r} 遍）', 'tch.run.single': '单步运行第 {n} 步', 'tch.run.done': '动作运行完成', 'tch.run.ended': '动作结束（{code}）：{m}',
+  'tch.enable_first': '先使能机械臂，再运行', 'tch.unsaved': '有未保存的修改：再点一次「← 动作」放弃修改',
   'tch.seq.created': '已新建「{n}」，保存后才能运行', 'tch.seq.saved': '已保存「{n}」', 'tch.seq.deleted': '已删除「{n}」',
-  'tch.e.name': '名称只能用中文、英文字母、数字、空格、下划线或短横线，最多 64 个字符', 'tch.e.dup': '已有同名序列', 'tch.e.max': '一个序列最多 200 步',
-  'tch.e.IN_USE': '正在被序列使用：{s}。先从这些序列里删掉相关步骤。', 'tch.e.SEQUENCE_REF_MISSING': '第 {n} 步引用的点位或轨迹已不存在',
-  'tch.e.SEQUENCE_CONFLICT': '这个序列在别处被修改过：返回列表重新打开后再改', 'tch.e.DATA_STALE': '引用的点位或轨迹是按旧零位记录的：{m}',
+  'tch.e.name': '名称只能用中文、英文字母、数字、空格、下划线或短横线，最多 64 个字符', 'tch.e.dup': '已有同名动作', 'tch.e.max': '一个动作最多 200 步',
+  'tch.e.IN_USE': '正在被动作使用：{s}。先从这些动作里删掉相关步骤。', 'tch.e.SEQUENCE_REF_MISSING': '第 {n} 步引用的点位或轨迹已不存在',
+  'tch.e.SEQUENCE_CONFLICT': '这个动作在别处被修改过：返回列表重新打开后再改', 'tch.e.DATA_STALE': '引用的点位或轨迹是按旧零位记录的：{m}',
   'tch.e.PLAN_STALE': '运行前检查时状态已变化，请重试：{m}', 'tch.e.CALIBRATION_CHANGED': '运行期间标定或零位被修改，已停止：{m}',
   'tch.e.RECORDER_BUSY': '录制器正被 {o} 使用', 'tch.e.RECORDER_NOT_OWNER': '这段录制不是本页开始的', 'tch.e.RECORD_NO_SPACE': '存储空间不足（少于 200 MB），无法录制',
   'tch.e.rename_na': '当前 armd 不支持重命名点位', 'tch.e.UNSUPPORTED': '当前 armd 不支持这个操作：{m}',
-  'tch.ask.seq': '序列里有按旧零位记录的点位或轨迹，机械臂实际到达的位置会不同。确认工作区安全后才继续。', 'tch.ask.ep': '这条轨迹是按旧零位录制的，回放时机械臂实际位置会不同。确认工作区安全后才继续。',
+  'tch.ask.seq': '动作里有按旧零位记录的点位或轨迹，机械臂实际到达的位置会不同。确认工作区安全后才继续。', 'tch.ask.ep': '这条轨迹是按旧零位录制的，回放时机械臂实际位置会不同。确认工作区安全后才继续。',
   'tch.ask.yes': '仍然运行',
-  'tch.pose.hint': '点位按关节角度保存。删除或重命名前先看「被使用」。', 'tch.usedby': '被使用：{s}', 'tch.unused': '未被序列使用', 'tch.rename': '重命名', 'tch.renamed': '已把 {a} 改名为 {b}',
+  'tch.pose.hint': '把机械臂移到想要的位置（拖动或摇杆），起个名字记录下来。勾选几个点位后点「播放」，机械臂按勾选顺序依次前往。', 'tch.usedby': '被使用：{s}', 'tch.unused': '未被动作使用', 'tch.rename': '重命名', 'tch.renamed': '已把 {a} 改名为 {b}',
   'tch.rec.to': '录到', 'tch.ds.new': '新数据集名称', 'tch.ds.create': '新建', 'tch.ds.created': '已新建数据集 {n}', 'tch.ds.head': '{n} · {c} 条 · {d}',
   'tch.ep.none': '这个数据集还没有轨迹', 'tch.ep.edit': '编辑', 'tch.ep.dl': '下载', 'tch.ep.aborted': '中断', 'tch.ep.updated': '已更新', 'tch.frames': '{n} 帧',
   'tch.rec.started': '开始录制 → {d}', 'tch.rec.saved': '已保存轨迹 {n}（{d}）',
-  'tch.src.hand_guide': '拖动', 'tch.src.jog': '摇杆', 'tch.src.servo': '遥操作', 'tch.src.replay': '回放', 'tch.src.sequence': '序列', 'tch.src.import': '导入', 'tch.src.sdk': 'SDK',
+  'tch.pick.play': '▶ 播放（{n}）', 'tch.pick.edit': '编成动作', 'tch.pick.clear': '清除', 'tch.pick.none': '勾选点位（按勾选顺序编号），再点播放', 'tch.pick.aria': '勾选 {n}',
+  'tch.pick.auto': '动作 {n}', 'tch.pick.reuse': '播放「{n}」（与勾选的点位相同）',
+  'tch.src.hand_guide': '拖动', 'tch.src.jog': '摇杆', 'tch.src.servo': '遥操作', 'tch.src.replay': '回放', 'tch.src.sequence': '动作', 'tch.src.import': '导入', 'tch.src.sdk': 'SDK',
 });
 Object.assign(I18N.en, {
-  'tch.title': 'Teach', 'tch.bar': 'Teach toolbar', 'tch.set.desc': 'Save poses, record trajectories and run them as sequences; a run can record itself.', 'tch.set.open': 'Open Teach',
-  'tch.tab.seq': 'Sequences', 'tch.tab.pose': 'Poses', 'tch.tab.ep': 'Trajectories',
-  'tch.b.pose': 'Save pose', 'tch.b.rec': '● Record', 'tch.b.recon': '■ Stop {t}', 'tch.b.pose.t': 'Save the current position (joints and gripper opening); adds a step when a sequence is open', 'tch.b.edit': 'Open the Teach panel to edit', 'tch.b.end': 'End teaching', 'tch.b.seq': '{n} · {c} steps', 'tch.b.seq.dirty': '{n} · {c} steps · unsaved', 'tch.b.noseq': 'No sequence open · Edit',
-  'tch.loading': 'Loading…', 'tch.counts': '{s} sequences · {p} poses · {e} trajectories', 'tch.e.load': 'Loading failed: {e}',
-  'tch.seq.name': 'Sequence name', 'tch.seq.new': 'New sequence', 'tch.seq.new.ph': 'New sequence name', 'tch.seq.empty': 'No sequences yet',
-  'tch.seq.hint': 'A sequence runs poses, gripper actions, waits and trajectory replays in order. With a sequence open, "Save pose", "Record" and the gripper buttons add a step after the selected one.',
-  'tch.seq.steps': '{n} steps', 'tch.seq.edit': 'Edit', 'tch.run': 'Run', 'tch.back': '← Sequences', 'tch.save': 'Save', 'tch.saved': 'Saved',
+  'tch.title': 'Positions & motions', 'tch.bar': 'Teach toolbar',
+  'tch.tab.seq': 'Motions', 'tch.tab.pose': 'Poses', 'tch.tab.ep': 'Trajectories',
+  'tch.b.pose': 'Save pose', 'tch.b.rec': '● Record', 'tch.b.recon': '■ Stop {t}', 'tch.b.pose.t': 'Save the current position (joints and gripper opening) to the poses; adds a step when a motion is open', 'tch.b.edit': 'Open positions & motions', 'tch.b.end': 'End teaching', 'tch.b.seq': '{n} · {c} steps', 'tch.b.seq.dirty': '{n} · {c} steps · unsaved', 'tch.b.noseq': 'Positions & motions',
+  'tch.loading': 'Loading…', 'tch.counts': '{p} poses · {s} motions · {e} trajectories', 'tch.e.load': 'Loading failed: {e}',
+  'tch.seq.name': 'Motion name', 'tch.seq.new': 'New motion', 'tch.seq.new.ph': 'New motion name', 'tch.seq.empty': 'No motions yet. Tick a few poses under "Poses" and tap "Play": they are saved as a motion.',
+  'tch.seq.hint': 'A motion runs poses, gripper actions, waits and trajectory replays in order. With a motion open, "Save pose" and "Record" on the teach toolbar add a step after the selected one.',
+  'tch.seq.steps': '{n} steps', 'tch.seq.edit': 'Edit', 'tch.run': 'Run', 'tch.back': '← Motions', 'tch.save': 'Save', 'tch.saved': 'Saved',
   'tch.del': 'Delete', 'tch.del.confirm': 'Confirm delete', 'tch.cancel': 'Cancel',
   'tch.st.empty': 'No steps yet: add them below or with the teach toolbar.', 'tch.st.pose': 'Pose {n}', 'tch.st.replay': 'Trajectory {n}', 'tch.st.grip.open': 'Open gripper',
   'tch.st.grip.close': 'Close gripper', 'tch.st.grip.move': 'Gripper to {p}%', 'tch.st.wait': 'Wait', 'tch.st.del': 'Delete this step', 'tch.st.added': 'Added step {n}: {s}',
@@ -2789,22 +2790,24 @@ Object.assign(I18N.en, {
   'tch.runbox': 'Run', 'tch.repeat': 'Repeat', 'tch.runrec': 'Record while running', 'tch.ds': 'Dataset', 'tch.task': 'Task', 'tch.task.ph': 'Default: {n}', 'tch.task.ph0': 'e.g. put the cube into the left bin',
   'tch.single.sel': 'Single step (selected)', 'tch.stop': 'Stop',
   'tch.prog': 'Running · step {i}/{n} · repeat {r}/{m} {s}', 'tch.ph.approach': '· to the start', 'tch.ph.move': '· moving', 'tch.ph.wait': '· waiting', 'tch.ph.gripper': '· gripper', 'tch.ph.replay': '· replaying', 'tch.ph.settle': '· settling',
-  'tch.run.started': 'Running "{n}" ({r}×)', 'tch.run.single': 'Single step {n}', 'tch.run.done': 'Sequence done', 'tch.run.ended': 'Sequence ended ({code}): {m}',
-  'tch.enable_first': 'Enable the arm first, then run', 'tch.unsaved': 'Unsaved changes: tap "← Sequences" again to discard them',
+  'tch.run.started': 'Running "{n}" ({r}×)', 'tch.run.single': 'Single step {n}', 'tch.run.done': 'Motion done', 'tch.run.ended': 'Motion ended ({code}): {m}',
+  'tch.enable_first': 'Enable the arm first, then run', 'tch.unsaved': 'Unsaved changes: tap "← Motions" again to discard them',
   'tch.seq.created': 'Created "{n}"; save it before running', 'tch.seq.saved': 'Saved "{n}"', 'tch.seq.deleted': 'Deleted "{n}"',
-  'tch.e.name': 'Names use letters (incl. Chinese), digits, spaces, _ or -, up to 64 characters', 'tch.e.dup': 'A sequence with this name exists', 'tch.e.max': 'A sequence has at most 200 steps',
-  'tch.e.IN_USE': 'Used by the sequences {s}. Remove those steps first.', 'tch.e.SEQUENCE_REF_MISSING': 'Step {n} references a pose or trajectory that no longer exists',
-  'tch.e.SEQUENCE_CONFLICT': 'This sequence was changed elsewhere: go back to the list and open it again', 'tch.e.DATA_STALE': 'A referenced pose or trajectory was taught with the old zero: {m}',
+  'tch.e.name': 'Names use letters (incl. Chinese), digits, spaces, _ or -, up to 64 characters', 'tch.e.dup': 'A motion with this name exists', 'tch.e.max': 'A motion has at most 200 steps',
+  'tch.e.IN_USE': 'Used by the motions {s}. Remove those steps first.', 'tch.e.SEQUENCE_REF_MISSING': 'Step {n} references a pose or trajectory that no longer exists',
+  'tch.e.SEQUENCE_CONFLICT': 'This motion was changed elsewhere: go back to the list and open it again', 'tch.e.DATA_STALE': 'A referenced pose or trajectory was taught with the old zero: {m}',
   'tch.e.PLAN_STALE': 'The state changed during the checks; try again: {m}', 'tch.e.CALIBRATION_CHANGED': 'Calibration or zero changed during the run; stopped: {m}',
   'tch.e.RECORDER_BUSY': 'The recorder is in use by {o}', 'tch.e.RECORDER_NOT_OWNER': 'This recording was not started by this page', 'tch.e.RECORD_NO_SPACE': 'Not enough storage (less than 200 MB) to record',
   'tch.e.rename_na': 'This armd cannot rename poses', 'tch.e.UNSUPPORTED': 'This armd does not support this: {m}',
-  'tch.ask.seq': 'The sequence uses poses or trajectories taught with the old zero; the arm reaches different positions. Continue only when the workspace is clear.', 'tch.ask.ep': 'This trajectory was recorded with the old zero; the replay reaches different positions. Continue only when the workspace is clear.',
+  'tch.ask.seq': 'The motion uses poses or trajectories taught with the old zero; the arm reaches different positions. Continue only when the workspace is clear.', 'tch.ask.ep': 'This trajectory was recorded with the old zero; the replay reaches different positions. Continue only when the workspace is clear.',
   'tch.ask.yes': 'Run anyway',
-  'tch.pose.hint': 'Poses are stored as joint angles. Check "Used by" before deleting or renaming.', 'tch.usedby': 'Used by: {s}', 'tch.unused': 'Not used by a sequence', 'tch.rename': 'Rename', 'tch.renamed': 'Renamed {a} to {b}',
+  'tch.pose.hint': 'Move the arm where you want it (by hand or with the sticks) and record the position under a name. Tick a few poses and tap "Play": the arm goes to them in the ticked order.', 'tch.usedby': 'Used by: {s}', 'tch.unused': 'Not used by a motion', 'tch.rename': 'Rename', 'tch.renamed': 'Renamed {a} to {b}',
   'tch.rec.to': 'Record to', 'tch.ds.new': 'New dataset name', 'tch.ds.create': 'Create', 'tch.ds.created': 'Created dataset {n}', 'tch.ds.head': '{n} · {c} episodes · {d}',
   'tch.ep.none': 'No trajectories in this dataset yet', 'tch.ep.edit': 'Edit', 'tch.ep.dl': 'Download', 'tch.ep.aborted': 'aborted', 'tch.ep.updated': 'Updated', 'tch.frames': '{n} frames',
   'tch.rec.started': 'Recording → {d}', 'tch.rec.saved': 'Saved trajectory {n} ({d})',
-  'tch.src.hand_guide': 'hand-guide', 'tch.src.jog': 'jog', 'tch.src.servo': 'teleop', 'tch.src.replay': 'replay', 'tch.src.sequence': 'sequence', 'tch.src.import': 'import', 'tch.src.sdk': 'SDK',
+  'tch.pick.play': '▶ Play ({n})', 'tch.pick.edit': 'Make a motion', 'tch.pick.clear': 'Clear', 'tch.pick.none': 'Tick poses (numbered in the order you tick them), then play', 'tch.pick.aria': 'Tick {n}',
+  'tch.pick.auto': 'Motion {n}', 'tch.pick.reuse': 'Playing "{n}" (same poses as ticked)',
+  'tch.src.hand_guide': 'hand-guide', 'tch.src.jog': 'jog', 'tch.src.servo': 'teleop', 'tch.src.replay': 'replay', 'tch.src.sequence': 'motion', 'tch.src.import': 'import', 'tch.src.sdk': 'SDK',
 });
 let LANG = (() => {
   const saved = store('lang');
@@ -9774,7 +9777,7 @@ function psetOpen(open) {
   if (open) { PS.delArmed = null; posesRender(); posesLoad(false); $('pset-close').focus({ preventScroll: true }); }
   else $('btn-pset').focus({ preventScroll: true });
 }
-$('btn-pset').addEventListener('click', () => psetOpen(true));
+$('btn-pset').addEventListener('click', () => { if (!teachOn()) psetOpen(true); else if (TCH.open) teachOpen(false); else teachOpen(true, { tab: TCH.cur ? undefined : 'pose' }); });
 $('pset-close').addEventListener('click', () => psetOpen(false));
 $('pset').addEventListener('click', (e) => { if (e.target === e.currentTarget) psetOpen(false); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('pset').hidden) psetOpen(false); });
@@ -9796,7 +9799,8 @@ i18nHooks.push(() => { if (!$('pset').hidden) { posesRender(); poseNameCheck(); 
    episodes/update|delete, datasets/create. Server strings only through textContent (cwEl / setText).
    ================================================================= */
 const TCH = {
-  open: false, teach: false, tab: 'seq', loaded: false, // open: the panel; teach: the strip (teaching goes on with the panel closed)
+  open: false, teach: false, tab: 'pose', loaded: false, // open: the panel; teach: the strip (teaching goes on with the panel closed)
+  pick: [],             // pose ids ticked in the poses tab, in tick order ("play in ticked order")
   seqs: [], poses: [], eps: [], dsets: [], cur: null, dirty: false, sel: -1,
   ds: store('rebot.teach.ds') || 'default', task: store('rebot.teach.task') || '',
   repeat: 1, runRec: false, runDs: null, runTask: '',
@@ -9873,10 +9877,14 @@ async function teachLoad(quiet) {
   } catch (e) { teachStatus(t('tch.e.load', { e: teachErr(e) }), true); }
   teachRender();
 }
+// the 点位 button opens the poses drawer (#pset) on an armd without teach, else this panel on the poses tab
 function teachOnCaps() {
-  const on = teachOn();
-  $('teach-set').hidden = !on;
-  if (!on) { TCH.teach = false; if (TCH.open) teachOpen(false); }
+  const on = teachOn(), b = $('btn-pset');
+  if (on) b.hidden = false;
+  b.dataset.i18nAria = b.dataset.i18nTitle = on ? 'tch.title' : 'pose.title';
+  b.setAttribute('aria-label', t(b.dataset.i18nAria)); b.title = t(b.dataset.i18nTitle);
+  b.setAttribute('aria-expanded', String(on && TCH.open));
+  if (!on) { TCH.teach = false; TCH.pick = []; if (TCH.open) teachOpen(false); }
   teachBarRender();
 }
 // the panel (editing); opening it also starts teaching (the strip), closing it keeps the strip
@@ -9885,6 +9893,7 @@ function teachOpen(open, { tab } = {}) {
   if (tab) TCH.tab = tab;
   $('teach').hidden = !TCH.open;
   if (TCH.open) { TCH.teach = true; teachRender(); teachLoad(true); $('teach-close').focus({ preventScroll: true }); }
+  $('btn-pset').setAttribute('aria-expanded', String(TCH.open));
   teachBarRender();
 }
 // the strip alone (teaching with the panel closed); off ends teaching (not while this page records)
@@ -10100,18 +10109,39 @@ function teachRenderPoses(body) {
   body.appendChild(cwEl('p', 'tch-k', t('tch.pose.hint')));
   const nw = cwEl('div', 'tch-row');
   const nm = tchInput('', () => {}, { aria: t('pose.name'), ph: 'bin_a', cls: 'grow' }); nm.maxLength = 64; nm.id = 'tch-pose-name';
+  nm.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); teachSavePose(nm.value.trim()); } });
   nw.append(nm, tchBtn(t('pose.save'), () => teachSavePose(nm.value.trim()), 'btn-primary'));
   body.appendChild(nw);
+  // ticked poses -> play them in tick order (saved as a motion, an identical one is reused) or open them as a new motion
+  TCH.pick = TCH.pick.filter((id) => teachPose(id));
+  const n = TCH.pick.length, running = teachRunning();
+  const pb = cwEl('div', 'tch-box tch-pick' + (n ? ' on' : '')); pb.id = 'tch-pick';
+  if (!n) pb.appendChild(cwEl('div', 'tch-k', t('tch.pick.none')));
+  else {
+    const r = cwEl('div', 'tch-row');
+    const play = tchBtn(t('tch.pick.play', { n }), teachPlayPicked, 'btn-primary grow', running || TCH.busy); play.id = 'tch-pick-play';
+    const ed = tchBtn(t('tch.pick.edit'), () => teachPickToMotion(), '', running); ed.id = 'tch-pick-edit';
+    r.append(play, ed, tchBtn(t('tch.pick.clear'), () => { TCH.pick = []; teachRender(); }));
+    pb.appendChild(r);
+  }
+  body.appendChild(pb);
   const ol = cwEl('ol', 'tch-list'); ol.id = 'tch-poses';
   if (!TCH.poses.length) ol.appendChild(cwEl('li', 'empty', TCH.loaded ? t('pose.empty') : '--'));
   for (const p of TCH.poses) {
     const li = cwEl('li'); li.dataset.id = p.id || p.name;
     const h = cwEl('div', 'tch-li-h');
-    h.append(cwEl('b', '', p.name), cwEl('span', 'sp'));
+    const pi = TCH.pick.indexOf(p.id);
+    li.classList.toggle('sel', pi >= 0);
+    const ck = cwEl('label', 'tch-chk tch-pk'); const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = pi >= 0;
+    cb.setAttribute('aria-label', t('tch.pick.aria', { n: p.name }));
+    cb.addEventListener('change', () => { const j = TCH.pick.indexOf(p.id); if (cb.checked && j < 0) TCH.pick.push(p.id); else if (!cb.checked && j >= 0) TCH.pick.splice(j, 1); teachRender(); });
+    ck.append(cb, cwEl('span', 'tch-n' + (pi >= 0 ? '' : ' off'), pi >= 0 ? String(pi + 1) : ''));
+    h.append(ck, cwEl('b', '', p.name), cwEl('span', 'sp'));
     if (p.stale) { const b = tchBadge(t('tch.stale'), 'stale'); b.title = (p.stale.reason || '') + (p.stale.at ? ' (' + p.stale.at + ')' : ''); h.appendChild(b); }
     li.appendChild(h);
     const used = teachUsedBy('pose', p.id);
-    li.appendChild(cwEl('div', 'tch-sub', used.length ? t('tch.usedby', { s: used.join(', ') }) : t('tch.unused')));
+    const tcp = p.tcp && Array.isArray(p.tcp.position) ? p.tcp.position.map((v) => Math.round(v * 1000)).join(', ') + ' mm' : '';
+    li.appendChild(cwEl('div', 'tch-sub', [used.length ? t('tch.usedby', { s: used.join(', ') }) : t('tch.unused'), tcp].filter(Boolean).join(' · ')));
     if (TCH.edit === 'pose:' + p.id) {
       const r = cwEl('div', 'tch-row');
       const inp = tchInput(p.name, () => {}, { aria: t('tch.rename'), cls: 'grow' }); inp.maxLength = 64; inp.id = 'tch-rename';
@@ -10344,7 +10374,11 @@ async function teachSavePose(name, append = false) {
     const p = (r && r.pose && r.pose.id) ? r.pose : TCH.poses.find((x) => x.name === name);
     toast(t('pose.saved', { name }), 'ok');
     if (append && TCH.cur && p && p.id) { teachAddStep({ type: 'pose', pose_id: p.id, speed_scale: 0.5, gripper: 'pose' }); await teachStripSave(); }
-    else teachStatus(t('pose.saved', { name }));
+    else {
+      // from the strip without an open motion the new pose is ticked: record a few, then "play in ticked order"
+      if (append && p && p.id && !TCH.pick.includes(p.id)) TCH.pick.push(p.id);
+      teachStatus(t('pose.saved', { name }));
+    }
     teachRender(); teachBarRender();
   } catch (e) { const m = teachErr(e); toast(m, 'err', e.code || ''); teachStatus(m, true); }
 }
@@ -10364,6 +10398,36 @@ async function teachDelPose(p) {
     teachStatus(t('pose.deleted', { name: p.name }));
     await teachLoad(true);
   } catch (e) { teachStatus(teachErr(e), true); teachRender(); }
+}
+
+// the ticked poses as steps of a motion (each restores the gripper opening saved with the pose)
+const teachPickSteps = () => TCH.pick.filter((id) => teachPose(id)).map((id) => ({ type: 'pose', pose_id: id, speed_scale: 0.5, gripper: 'pose' }));
+function teachAutoSeqName() {
+  const used = new Set(TCH.seqs.map((s) => s.name));
+  for (let k = 1; k < 1000; k++) { const n = t('tch.pick.auto', { n: k }); if (!used.has(n)) return n; }
+  return 'motion ' + Date.now();
+}
+// "play in ticked order": reuse a saved motion made of exactly these pose steps, else save a new one; then run it once
+async function teachPlayPicked() {
+  const steps = teachPickSteps();
+  if (!steps.length || TCH.busy || teachRunning()) return;
+  if (teachMoveBlock()) return;
+  if (TCH.cur && TCH.dirty) { TCH.tab = 'seq'; teachStatus(t('tch.unsaved'), true); teachRender(); return; }
+  const same = TCH.seqs.find((s) => (s.steps || []).length === steps.length && s.steps.every((st, i) => st.type === 'pose' && st.pose_id === steps[i].pose_id));
+  TCH.repeat = 1; TCH.runRec = false; TCH.pick = [];
+  if (same) { teachEdit(same.id); teachStatus(t('tch.pick.reuse', { n: same.name })); }
+  else { TCH.cur = { name: teachAutoSeqName(), description: '', steps }; TCH.dirty = true; TCH.sel = -1; TCH.tab = 'seq'; teachRender(); }
+  await teachRun({});
+  // the progress and Stop sit in the run box below the steps: bring them into view
+  const pg = $('tch-prog'); if (pg && TCH.open) pg.parentElement.scrollIntoView({ block: 'nearest' });
+}
+// "make a motion": a new unsaved motion with the ticked poses, opened in the editor (name it, add gripper / wait steps)
+function teachPickToMotion() {
+  const steps = teachPickSteps(); if (!steps.length) return;
+  if (TCH.cur && TCH.dirty) { TCH.tab = 'seq'; teachStatus(t('tch.unsaved'), true); teachRender(); return; }
+  TCH.cur = { name: teachAutoSeqName(), description: '', steps }; TCH.dirty = true; TCH.sel = -1; TCH.tab = 'seq'; TCH.pick = [];
+  teachStatus(t('tch.seq.created', { n: TCH.cur.name }));
+  teachRender();
 }
 
 /* ---- episodes / datasets ---- */
@@ -10487,19 +10551,18 @@ function teachBarRender() {
 }
 (() => {
   $('teach-close').addEventListener('click', () => teachOpen(false));
-  $('tb-edit').addEventListener('click', () => { if (TCH.open) teachOpen(false); else teachOpen(true, { tab: 'seq' }); });
+  $('tb-edit').addEventListener('click', () => { if (TCH.open) teachOpen(false); else teachOpen(true, { tab: TCH.cur ? 'seq' : 'pose' }); });
   $('tb-x').addEventListener('click', () => { if (TCH.rec) return; teachOpen(false); teachStrip(false); });
   $('teach-tabs').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { TCH.tab = b.dataset.tab; TCH.edit = null; teachDisarm(); teachRender(); } });
   $('teach-tabs').addEventListener('keydown', (e) => {
     if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-    const tabs = ['seq', 'pose', 'ep'], k = (tabs.indexOf(TCH.tab) + (e.key === 'ArrowRight' ? 1 : 2)) % 3;
+    const tabs = ['pose', 'seq', 'ep'], k = (tabs.indexOf(TCH.tab) + (e.key === 'ArrowRight' ? 1 : 2)) % 3;
     TCH.tab = tabs[k]; teachRender(); $('teach-tab-' + TCH.tab).focus();
   });
   $('teach-ask-yes').addEventListener('click', () => { const a = TCH.ask; TCH.ask = null; if (!a) return; if (a.kind === 'ep') teachReplay(a.id, true); else teachRun({ from: a.from, single: a.single, allowStale: true }); });
   $('teach-ask-no').addEventListener('click', () => { TCH.ask = null; teachStatus('--'); teachRender(); });
   $('tb-pose').addEventListener('click', () => teachSavePose(teachAutoPoseName(), true));
   $('tb-rec').addEventListener('click', teachRecToggle);
-  $('teach-open').addEventListener('click', () => { ssetOpen(false); teachOpen(true); });
   for (const ev of ['resize', 'scroll']) window.addEventListener(ev, () => { TCH.dockAt = 0; teachBarRender(); }, { passive: true });
   setInterval(() => { if (TCH.rec) teachBarRender(); }, 500);
   i18nHooks.push(() => { if (TCH.open) teachRender(); teachBarRender(); });
