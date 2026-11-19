@@ -421,7 +421,7 @@ fn armd_state(inner: &SupervisorInner) -> ArmdState {
     ArmdState { camera_mount: inner.config.camera_mount.clone(), calibration: inner.calibration.clone(), grasp_setup: inner.config.grasp.clone(), grip_pixel_model: None }
 }
 
-fn mount_summary(m: &CameraMount) -> Value {
+pub(crate) fn mount_summary(m: &CameraMount) -> Value {
     json!({"flip": m.flip, "rot_deg": m.rot_deg, "tilt_deg": m.tilt_deg, "offset_m": m.offset_m, "q_end_cam": m.q_end_cam})
 }
 

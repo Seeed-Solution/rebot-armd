@@ -1817,6 +1817,11 @@ pub struct Capabilities {
     pub power_budget: bool,
     #[serde(default)]
     pub auto_yaw: bool,
+    /// `POST /api/v1/grasp/measure` and the WS command of that path (no lease): one depth
+    /// measurement at the current pose with the frame's table fit; same value as `grasp`.
+    /// Absent (false) from older armd.
+    #[serde(default)]
+    pub grasp_measure: bool,
     /// Camera calibration wizard: `GET /api/v1/calibration`, WS `/api/v1/calibration/apply`
     /// and `/api/v1/calibration/restore`, `camera_mount.q_end_cam`; same value as `grasp`.
     #[serde(default)]
@@ -2062,6 +2067,7 @@ impl Capabilities {
             // The driver half is applied by ArmSupervisor::get_schema.
             power_budget: config.power_budget.as_ref().is_some_and(|p| p.enabled),
             auto_yaw: false,
+            grasp_measure: grasp,
             calibration_apply: grasp,
             calibration_kinematics: grasp && config.arm_model.chain().is_none(),
             calibration_tools: None,
