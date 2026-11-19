@@ -868,11 +868,48 @@ pub enum Reference {
 pub struct ActiveTrajectory {
     pub action_id: Option<u64>,
     pub reference: Reference,
+    /// Same-side approach (`src/backlash.rs`): the short joint-space segment that replaces
+    /// `reference` when it reaches its end (a quintic or a path, before its settle).
+    pub then: Option<MultiJointQuinticTrajectory>,
+    /// Progress mapping while a two-leg motion runs: (seconds before this leg, total seconds).
+    pub span: Option<(f64, f64)>,
 }
 
 impl ActiveTrajectory {
+    pub fn new(action_id: Option<u64>, reference: Reference) -> Self {
+        Self { action_id, reference, then: None, span: None }
+    }
     pub fn quintic(traj: MultiJointQuinticTrajectory, action_id: Option<u64>) -> Self {
-        Self { action_id, reference: Reference::Quintic(traj) }
+        Self::new(action_id, Reference::Quintic(traj))
+    }
+    /// `reference` followed by the short segment `then` (same-side approach).
+    pub fn with_approach(action_id: Option<u64>, reference: Reference, then: MultiJointQuinticTrajectory) -> Self {
+        let mut a = Self::new(action_id, reference);
+        let total = a.duration() + then.duration;
+        a.span = Some((0.0, total));
+        a.then = Some(then);
+        a
+    }
+    /// Action progress of this leg's `progress` (0..1) over the whole motion.
+    pub fn overall_progress(&self, progress: f32) -> f32 {
+        match self.span {
+            Some((before, total)) if total > 0.0 => ((before + f64::from(progress) * self.duration()) / total).clamp(0.0, 1.0) as f32,
+            _ => progress,
+        }
+    }
+    /// Replace an ended first leg by the short segment; true when it did.
+    pub fn start_then(&mut self) -> bool {
+        let Some(then) = self.then.take() else { return false };
+        let before = self.duration();
+        let total = self.span.map_or(before + then.duration, |(_, t)| t);
+        self.reference = Reference::Quintic(then);
+        self.span = Some((before, total));
+        true
+    }
+    /// The first leg of a two-leg motion reached its end.
+    pub fn first_leg_ended(&self) -> bool {
+        self.then.is_some() && (matches!(&self.reference, Reference::Quintic(t) if t.is_finished())
+            || matches!(&self.reference, Reference::Path(p) if p.settle.is_some()))
     }
     /// Planned duration (s); for a gripper motion the expected duration.
     pub fn duration(&self) -> f64 {
@@ -1066,6 +1103,22 @@ pub struct ActionStatus {
     /// Gripper zero check: true when |offset_rad| <= threshold_rad.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pass: Option<bool>,
+    /// Final approach of move_to_pose / grasp / place / precise move_to (`src/backlash.rs`):
+    /// `same_side` or `direct`; absent when the profile has the approach off for this motion
+    /// and the request did not ask for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approach: Option<String>,
+    /// Why the motion approached directly (`request`, `contact`, a failed check of the
+    /// pre-target or the short segment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approach_reason: Option<String>,
+    /// same_side: direction of each arm joint on the short segment (+1 = moving in +, -1 = in -,
+    /// 0 = not listed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approach_signs: Option<Vec<i8>>,
+    /// same_side, grasp / place: joints whose sign the from-above rule flipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approach_flipped: Option<Vec<String>>,
     /// Accumulated runtime per macro phase (ms).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub phase_ms: BTreeMap<String, u32>,

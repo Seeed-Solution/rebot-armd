@@ -67,6 +67,16 @@ pub struct MacroRun {
     pub phase_start: Option<Instant>,
 }
 
+/// Same-side final approach of a macro sub-motion ([`MacroCtx::move_arm_with`]).
+#[derive(Debug, Clone)]
+pub struct FinalApproach {
+    /// `grasp_final` | `place_final`
+    pub use_: &'static str,
+    pub request: crate::backlash::Request,
+    /// From-above and table rules of the descent.
+    pub rules: crate::backlash::DescentRules,
+}
+
 /// Orchestrator handle of one macro action: alive checks, phase reports, sub-motions.
 pub struct MacroCtx {
     pub sup: Arc<ArmSupervisor>,
@@ -134,22 +144,38 @@ impl MacroCtx {
     /// Plan (outside the lock) a Cartesian path from the current commanded state, install it
     /// as a sub-motion and wait for it.
     pub async fn move_arm(&self, phase: &str, spec: GoalSpec, speed: Speed) -> Result<SubDone, Stop> {
-        let input = {
+        self.move_arm_with(phase, spec, speed, None).await
+    }
+
+    /// [`move_arm`](Self::move_arm) ending with the same-side approach of `approach`
+    /// (src/backlash.rs): the path goes to the pre-target, the short segment (phase
+    /// `final_approach`) to the goal; the outcome is in the action record.
+    pub async fn move_arm_with(&self, phase: &str, spec: GoalSpec, speed: Speed, approach: Option<FinalApproach>) -> Result<SubDone, Stop> {
+        let (input, plan) = {
             let inner = self.sup.inner().read().await;
             if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
-            inner.plan_input().map_err(arm_fail)?
+            let plan = approach.as_ref().map(|a| inner.approach_plan(a.use_, a.request));
+            (inner.plan_input().map_err(arm_fail)?, plan)
         };
         let (goal, yaw_free) = motion::resolve_goal_ex(&input, &spec);
         let (input, planned) = tokio::task::spawn_blocking(move || {
-            let p = motion::plan_cartesian_ex(&input, goal, speed, yaw_free);
+            let p = motion::plan_cartesian_ex(&input, goal, speed, yaw_free).map(|direct| {
+                let pre = match &plan {
+                    Some(Ok(plan)) => crate::backlash::plan_cartesian_pre(&input, &direct, plan,
+                        approach.as_ref().map(|a| &a.rules), speed, yaw_free),
+                    Some(Err(Some(r))) => crate::backlash::Pre::Direct((*r).to_string()),
+                    _ => crate::backlash::Pre::Off,
+                };
+                (direct, pre, plan.and_then(Result::ok))
+            });
             (input, p)
         }).await
             .map_err(|e| fail("INTERNAL", format!("planner task failed: {e}")))?;
-        let path = planned.map_err(|e| arm_fail(e.into()))?;
+        let (path, pre, plan) = planned.map_err(|e| arm_fail(e.into()))?;
         let limit = {
             let mut inner = self.sup.inner().write().await;
             if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
-            inner.install_macro_path(self.id, &input, path).map_err(arm_fail)?
+            inner.install_macro_path_same_side(self.id, &input, path, pre, plan.as_ref()).map_err(arm_fail)?
         };
         let t0 = Instant::now();
         let sub_res = self.wait_sub(phase, limit * 2.0 + 5.0).await;

@@ -498,7 +498,7 @@ impl SupervisorInner {
             a.t_s = Some(0.0);
         }
         tracing::info!("Replay of '{}' started (action {id}, {}x, gripper {}, {:.1} s recorded)", episode, motion.speed, motion.gripper, motion.duration);
-        self.active_trajectory = Some(crate::motion::ActiveTrajectory { action_id: Some(id), reference: crate::motion::Reference::Replay(Box::new(motion)) });
+        self.active_trajectory = Some(crate::motion::ActiveTrajectory::new(Some(id), crate::motion::Reference::Replay(Box::new(motion))));
         Ok((id, expected))
     }
 
@@ -512,7 +512,7 @@ impl SupervisorInner {
         for s in scales.into_iter().flatten() { self.note_action_power_scale(id, s); }
         self.update_action(id, |a| { a.episode = Some(motion.episode.clone()); a.t_s = Some(0.0); });
         self.quintic_settle = None;
-        self.active_trajectory = Some(crate::motion::ActiveTrajectory { action_id: Some(id), reference: crate::motion::Reference::Replay(Box::new(motion)) });
+        self.active_trajectory = Some(crate::motion::ActiveTrajectory::new(Some(id), crate::motion::Reference::Replay(Box::new(motion))));
         self.set_macro_sub_running(id);
         Ok(expected)
     }

@@ -91,6 +91,7 @@ init 脚本把 `can0` 设为 1 Mbit/s，与机械臂一致。
 | Camera image upright with the v5 mount | observed on the arm | `hardware/v7_tilt/README.txt` |
 | Gravity compensation (hand-guiding) | verified on hardware: exit paths held within 1.5 mrad, 30 s recording gave 1509 frames | README, docs/control_safety_contract.md checklist |
 | Collision thresholds in the profile (`collision.thresholds_nm` 2.0, 1.19, 2.82, 1.43, 0.87, 0.28 N·m, `enabled: false`) | `rebot-sysid` on the arm 2026-11-11, one session, ±0.08 rad at two poses; needs validation at more poses before enabling | `profile/rebot-b601dm.json`, docs/simulation.md |
+| Same-side final approach (`backlash_approach`, delta 0.5°, on for `move_to_pose`, grasp / place descent, precise `move_to`) | J1 backlash 0.28-0.30° measured with the calibration board 2026-11-18; effect of the approach on the real arm needs verification (`_scratch/teach/backlash_check.mjs`) | `profile/rebot-b601dm.json`, docs/agent_action_api.md |
 | Tap-to-grasp | simulation and screenshot tests only | README, docs/plan_tap_to_grasp.md |
 | `camera_mount` (`tilt_deg`, `offset_m`) for camera-frame moves | needs verification | docs/agent_action_api.md |
 | Planning time on the SG2002 | needs verification | docs/agent_action_api.md |
@@ -117,6 +118,7 @@ Object detection and ArUco come from `rebot-vision`, which is part of this kit's
 | v5 支架下画面方向为正 | 实机观察 | `hardware/v7_tilt/README.txt` |
 | 重力补偿（拖动示教） | 实机验证：各退出路径位置偏差不超过 1.5 mrad，30 s 录制 1509 帧 | README、docs/control_safety_contract.md 清单 |
 | profile 中的碰撞阈值（`collision.thresholds_nm` 2.0、1.19、2.82、1.43、0.87、0.28 N·m，`enabled: false`） | 2026-11-11 在实机上用 `rebot-sysid` 测得：一次测试、两个姿态、±0.08 rad；启用前须在更多姿态下验证 | `profile/rebot-b601dm.json`、docs/simulation.md |
+| 同侧接近（`backlash_approach`，delta 0.5°，用于 `move_to_pose`、抓取 / 放置下降、precise `move_to`） | 2026-11-18 用标定板测得 J1 回差 0.28-0.30°；该功能在真机上的效果需核实（`_scratch/teach/backlash_check.mjs`） | `profile/rebot-b601dm.json`、docs/agent_action_api.md |
 | 点框抓取 | 仅仿真与截图测试 | README、docs/plan_tap_to_grasp.md |
 | 相机坐标系运动用的 `camera_mount`（`tilt_deg`、`offset_m`） | 需实机核实 | docs/agent_action_api.md |
 | SG2002 上的规划耗时 | 需实机核实 | docs/agent_action_api.md |

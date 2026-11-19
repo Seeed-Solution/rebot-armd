@@ -281,6 +281,7 @@ fn test_5dof_place_explicit_auto_yaw() {
         release: true,
         retreat: true,
         tag: None,
+        approach: armd::backlash::Request::Profile,
     };
     let pending_true = PendingPlace {
         input: input.clone(),
@@ -303,6 +304,7 @@ fn test_5dof_place_explicit_auto_yaw() {
         release: true,
         retreat: true,
         tag: None,
+        approach: armd::backlash::Request::Profile,
     };
     let pending_false = PendingPlace {
         input: input.clone(),
@@ -401,6 +403,7 @@ fn test_5dof_place_planning_lateral() {
         release: true,
         retreat: true,
         tag: None,
+        approach: armd::backlash::Request::Profile,
     };
 
     let pending = PendingPlace {
@@ -432,6 +435,7 @@ fn test_5dof_place_planning() {
         release: true,
         retreat: true,
         tag: None,
+        approach: armd::backlash::Request::Profile,
     };
 
     let pending = PendingPlace {
@@ -984,6 +988,7 @@ fn test_5dof_place_plan_slightly_past_vertical_pose_succeeds_cleanly() {
         release: true,
         retreat: true,
         tag: None,
+        approach: armd::backlash::Request::Profile,
     };
     let pending = PendingPlace {
         input,
@@ -1184,6 +1189,7 @@ fn test_vertical_pose_translation_preserves_roll_for_move_to_relative_and_place(
         release: true,
         retreat: true,
         tag: None,
+        approach: armd::backlash::Request::Profile,
     };
     let pending = PendingPlace {
         input,
@@ -1356,6 +1362,7 @@ fn test_place_plan_orientation_none_preserves_start_pitch_roll_and_updates_yaw()
         release: true,
         retreat: true,
         tag: None,
+        approach: armd::backlash::Request::Profile,
     };
     let pending = PendingPlace {
         input,

@@ -205,6 +205,14 @@ impl SupervisorInner {
     /// Joint-space quintic of arm joints (and gripper with `include_gripper`) to a stored pose,
     /// recorded as a `move_to_pose` action. Returns (action id, expected duration).
     pub fn move_to_pose(&mut self, name: &str, include_gripper: bool, speed_scale: f64, tag: Option<String>, epoch: u64) -> Result<(u64, f64), ArmError> {
+        self.move_to_pose_ex(name, include_gripper, speed_scale, tag, epoch, crate::backlash::Request::Profile)
+    }
+
+    /// [`move_to_pose`](Self::move_to_pose) with the request field `approach`: with the
+    /// same-side approach (`src/backlash.rs`) the quintic ends at the pre-target and a short
+    /// segment (phase `approach`) reaches the pose.
+    pub fn move_to_pose_ex(&mut self, name: &str, include_gripper: bool, speed_scale: f64, tag: Option<String>, epoch: u64,
+        approach: crate::backlash::Request) -> Result<(u64, f64), ArmError> {
         let pose = self.poses.find(name)?;
         let cfg_joint_names: Vec<String> = self.config.limits.iter().map(|l| l.name.clone()).collect();
         let effective_pid = pose.profile_id.as_ref().or(self.poses.list.profile_id.as_ref());
@@ -262,7 +270,7 @@ impl SupervisorInner {
         for (i, l) in limits.iter_mut().enumerate() {
             if Some(i) != gripper_idx { l.max_velocity *= speed_scale as f32; }
         }
-        let (_, id, duration) = self.start_quintic(target, None, Some(epoch), "move_to_pose", tag, &limits)?;
+        let (_, id, duration) = self.start_quintic_same_side(target, Some(epoch), "move_to_pose", tag, &limits, "move_to_pose", approach)?;
         Ok((id, duration))
     }
 }
@@ -370,13 +378,14 @@ pub(crate) fn speed_scale(body: &Value) -> Result<f64, ArmError> {
     Ok(speed_scale)
 }
 
-/// Action `/api/v1/action/move_to_pose` `{name, include_gripper?, speed_scale?, tag?}`.
+/// Action `/api/v1/action/move_to_pose` `{name, include_gripper?, speed_scale?, tag?, approach?}`.
 pub fn start_action(inner: &mut SupervisorInner, body: &Value, epoch: u64) -> Result<(u64, f64), ArmError> {
     let name = name_of(body)?;
     let include_gripper = motion::flag(body, "include_gripper", false)?;
     let speed_scale = speed_scale(body)?;
     let tag = motion::tag(body)?;
-    inner.move_to_pose(&name, include_gripper, speed_scale, tag, epoch)
+    let approach = crate::backlash::parse_request(body)?;
+    inner.move_to_pose_ex(&name, include_gripper, speed_scale, tag, epoch, approach)
 }
 
 /// Load the persisted poses at startup (logs the outcome). An invalid file is left untouched
