@@ -2682,7 +2682,7 @@ Object.assign(I18N.zh, {
   'cw.f.solving': '正在求解：{s} s，阶段 {stage}', 'cw.f.solving.hint': '求解在浏览器的后台线程（Web Worker）中运行，期间页面可以继续使用。',
   'cw.f.solve.hint': '在位置 A 拟合、预测位置 B（以及反过来）得到留出误差；应用的是 A + B 一起拟合的结果。每项检查都通过后才能应用。',
   'cw.f.fail': '有检查未通过，不能应用。留出误差偏大：检查标定板是否平整、采集中是否被碰动；参数超出范围：先用官方工具重新校准电机零位。',
-  'cw.f.zero': '关节 J{j} 的零位看起来偏了 {d}°：建议用官方工具（reBotArm_control_py example/2_zero_and_read.py / MotorBridge）重新校准该电机零位，再重新运行标定。检查都通过时仍可应用。',
+  'cw.f.acc': '预计定位精度约 {mm} mm（超过 {lim} mm）：可以应用，但视觉抓取可能偏差这么多。常见原因：减速器间隙、支架松动、零点没在收起姿态设置。', 'cw.f.zero': '关节 J{j} 的零位看起来偏了 {d}°：建议用官方工具（reBotArm_control_py example/2_zero_and_read.py / MotorBridge）重新校准该电机零位，再重新运行标定。检查都通过时仍可应用。',
   'cw.f.ho.title': '留出检验', 'cw.f.ho.dir': '方向', 'cw.f.ho.before': '未修正', 'cw.f.ho.after': '修正后', 'cw.f.ho.imp': '降低',
   'cw.f.lv.title': '修正模型级别（留出误差）', 'cw.f.lv.level': '级别', 'cw.f.lv.mean': '平均', 'cw.f.lv.pick': '选择',
   'cw.f.lv.L0': 'L0 不修正', 'cw.f.lv.L1': 'L1 零位 J2–J5', 'cw.f.lv.L2': 'L2 + J2 比例 / 倾斜', 'cw.f.lv.L3': 'L3 完整（28 个参数）',
@@ -2716,7 +2716,7 @@ Object.assign(I18N.en, {
   'cw.f.solving': 'Solving: {s} s, stage {stage}', 'cw.f.solving.hint': 'The solve runs in a background thread of the browser (Web Worker); the page stays usable.',
   'cw.f.solve.hint': 'Held-out errors: fitted on placement A, predicting B (and the other way). The fit on A + B together is what gets applied. Every check must pass before Apply.',
   'cw.f.fail': 'Some checks failed; Apply is not possible. High held-out error: check that the board is flat and was not bumped during capture. Parameter out of range: re-zero the motors with the official tool first.',
-  'cw.f.zero': 'Joint J{j} zero looks off by {d}°: re-zero the motor with the official tool (reBotArm_control_py example/2_zero_and_read.py / MotorBridge) and run the calibration again. Apply stays possible when the checks pass.',
+  'cw.f.acc': 'Expected positioning accuracy about {mm} mm (more than {lim} mm): the calibration can be applied, but camera-guided grasps may be off by this much. Usual causes: gear backlash, a loose mount, or a joint zero set off the rest pose.', 'cw.f.zero': 'Joint J{j} zero looks off by {d}°: re-zero the motor with the official tool (reBotArm_control_py example/2_zero_and_read.py / MotorBridge) and run the calibration again. Apply stays possible when the checks pass.',
   'cw.f.ho.title': 'Held-out check', 'cw.f.ho.dir': 'Direction', 'cw.f.ho.before': 'Uncorrected', 'cw.f.ho.after': 'Corrected', 'cw.f.ho.imp': 'Reduction',
   'cw.f.lv.title': 'Correction model level (held-out error)', 'cw.f.lv.level': 'Level', 'cw.f.lv.mean': 'Mean', 'cw.f.lv.pick': 'Choice',
   'cw.f.lv.L0': 'L0 none', 'cw.f.lv.L1': 'L1 zero J2–J5', 'cw.f.lv.L2': 'L2 + J2 scale / tilt', 'cw.f.lv.L3': 'L3 full (28 parameters)',
@@ -6037,7 +6037,7 @@ function cwRenderFineSolve(body, p, acts) {
     tb.classList.add('cwiz-par');
     body.appendChild(tb);
   }
-  for (const wn of kin.warnings || []) body.appendChild(cwEl('div', 'cwiz-msg cwiz-zero', t('cw.f.zero', { j: wn.joint, d: wn.deg.toFixed(1) })));
+  for (const wn of kin.warnings || []) body.appendChild(cwEl('div', 'cwiz-msg cwiz-zero', wn.key === 'accuracy' ? t('cw.f.acc', { mm: wn.mm.toFixed(1), lim: wn.limit.toFixed(0) }) : t('cw.f.zero', { j: wn.joint, d: wn.deg.toFixed(1) })));
   if (!r.ok) body.appendChild(cwEl('div', 'cwiz-msg', t('cw.f.fail')));
   acts(cwBtn(t('cw.solve.run'), cwFineSolve, { id: 'cwiz-solve-again' }), cwBtn(t('cw.solve.export'), cwExport), cwRestartBtn(),
     cwBtn(t('cw.solve.review'), cwReview, { cls: 'btn-primary wide', disabled: !r.ok || CWZ.busy, id: 'cwiz-review' }));

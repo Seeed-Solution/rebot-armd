@@ -935,7 +935,10 @@ export const KIN_BOUNDS = Object.freeze({ offset_rad: 10 / D, scale: 0.08, tilt_
 // zeroWarnJoints: joints (1..6) whose zero offset is identifiable, the only ones a "re-zero the motor" warning is
 // given for. J5: recovered within 0.01 deg in the synthetic test. J2..J4 (parallel axes) are not: their offsets trade
 // against the next joint's origin shift (synthetic J2 error -0.52 deg with the prior, above the 0.5 deg needed).
-export const KIN_GATES = Object.freeze({ heldOutMm: 3.0, zeroWarnDeg: 5, zeroWarnJoints: Object.freeze([5]), minViewsPerPlacement: 10, pnpMaxPx: 2 });
+// heldOutMm: hard limit on the chosen level's held-out error. On the office B601-DM the uncorrected
+// held-out after a correct motor zero was 2.9 / 3.3 mm (backlash, J4 hunting): a 3 mm hard gate refused
+// a good camera calibration, so 3 mm is a warning (accuracyWarnMm) and 5 mm the refusal.
+export const KIN_GATES = Object.freeze({ heldOutMm: 5.0, accuracyWarnMm: 3.0, zeroWarnDeg: 5, zeroWarnJoints: Object.freeze([5]), minViewsPerPlacement: 10, pnpMaxPx: 2 });
 export const KIN_PARAM_NAMES = Object.freeze(['offset', 'scale', 'tilt_x', 'tilt_y', 'dx', 'dy', 'dz']);
 /* Weak L2 prior on the kinematic parameters (extra residual rows, px): weight * k / sigma, sigma per parameter type
    (offset, scale, tilt x / y, origin dx / dy / dz). L3 is not minimal: zero offsets of the parallel joints J2..J4
@@ -1203,6 +1206,7 @@ export function* solveKinematicsSteps({ views, board, K, chain, X0, order = null
     gate('kin_heldout_ba', ba.mm <= gates.heldOutMm, ba.mm, gates.heldOutMm, 'mm'),
     gate('kin_bounds', oob.length === 0, oob.length, 0, 'count'),
   );
+  if (Math.max(ab.mm, ba.mm) > (gates.accuracyWarnMm ?? Infinity)) res.warnings.push({ key: 'accuracy', mm: Math.max(ab.mm, ba.mm), limit: gates.accuracyWarnMm });
   for (let j = 0; j < 6; j++) if ((gates.zeroWarnJoints || [5]).includes(j + 1) && Math.abs(k[7 * j]) * D > gates.zeroWarnDeg) res.warnings.push({ key: 'zero', joint: j + 1, deg: k[7 * j] * D });
   Object.assign(res, {
     ok: res.gates.every((g) => g.ok), level: lv.name, k, joints: kinJoints(k), outOfBounds: oob, X: fin.X, boards: fin.B,
