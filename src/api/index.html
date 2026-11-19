@@ -7690,7 +7690,7 @@ function gcInput(v) {
       releaseAll();
       toast(t('gc.entering'), 'info');
       api('/api/v1/mode/gravity_comp', { enable: true }, { quiet: true })
-        .then(() => toast(t('gc.entered'), 'ok'))
+        .then(() => { toast(t('gc.entered'), 'ok'); if (teachOn() && !TCH.open) teachOpen(true, { min: true }); })
         .catch((err) => {
           const k = 'gc.b.' + err.code;
           toast(t('gc.enter_fail') + (t(k) !== k ? t(k) : err.message), 'err', err.code);
@@ -7701,7 +7701,12 @@ function gcInput(v) {
   for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) btn.addEventListener(ev, cancel);
   btn.addEventListener('contextmenu', (e) => e.preventDefault());
   $('btn-gc-exit').addEventListener('click', gcExit);
-  $('btn-gc-rec').addEventListener('click', () => $('btn-rec').click());
+  // teach v1: the record button records into the teach store (and opens the panel collapsed); else the legacy recording
+  $('btn-gc-rec').addEventListener('click', () => {
+    if (!teachOn()) { $('btn-rec').click(); return; }
+    if (!TCH.open) teachOpen(true, { min: true });
+    teachRecToggle();
+  });
 })();
 // Exit reason toast: once per new `last_exit` (not for an exit that predates this page).
 function gcOnObs(o) {
@@ -7927,6 +7932,7 @@ function setRecording(on) {
   $('rec-state').className = 'sc-status-badge' + (on ? ' is-danger' : '');
 }
 $('btn-rec').addEventListener('click', async () => {
+  if (teachOn()) { if (!TCH.open) teachOpen(true, { tab: 'ep' }); teachRecToggle(); return; }
   if (!S.rec.active) {
     const id = $('rec-id').value.trim() || defaultEpisodeId();
     try { await api('/api/v1/dataset/record/start', { episode_id: id }); setRecording(true); toast(t('toast.rec_start') + id, 'ok'); } catch (_) {}
@@ -7942,6 +7948,7 @@ $('btn-rec').addEventListener('click', async () => {
   }
 });
 $('btn-discard').addEventListener('click', async () => {
+  if (teachOn()) { teachRecDiscard(); return; }
   try { await api('/api/v1/dataset/record/discard'); setRecording(false); S.recLast = 'discarded'; renderRecLast(); } catch (_) {}
 });
 
