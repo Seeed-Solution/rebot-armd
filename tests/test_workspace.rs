@@ -10,9 +10,9 @@ use armd::{ArmError, SupervisorInner};
 const HOME: [f32; 7] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, 0.0];
 // Both ends are above the floor; the joint-space midpoint puts a gripper corner ~27 mm below it.
-// J6 motor = pi (URDF J6 = pi/2): the jaw axis is in the plane where the 92.5 mm corners dip.
-const DIP_A: [f32; 7] = [0.0, -1.871, -0.64, 1.817, 0.464, std::f32::consts::PI, 0.0];
-const DIP_B: [f32; 7] = [0.0, -1.856, -1.434, 0.482, -0.61, std::f32::consts::PI, 0.0];
+// J6 = pi/2 (URDF J6 = joint J6): the jaw axis is in the plane where the 92.5 mm corners dip.
+const DIP_A: [f32; 7] = [0.0, -1.871, -0.64, 1.817, 0.464, std::f32::consts::FRAC_PI_2, 0.0];
+const DIP_B: [f32; 7] = [0.0, -1.856, -1.434, 0.482, -0.61, std::f32::consts::FRAC_PI_2, 0.0];
 
 /// Workspace excess at motor angles `q` (the profile's arm model).
 fn workspace_violation(q: &[f32], ws: &WorkspacePolicy, cam: &armd::model::CameraMount) -> Violation {
