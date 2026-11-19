@@ -2,7 +2,8 @@
 // Cockpit episode list and replay against a running armd (mock follower works):
 //   armd --follower mock --config kits/recamera-b601dm/profile/rebot-b601dm.json --port 18950 --episodes-dir /tmp/eps
 //   ARMD=http://127.0.0.1:18950 PLAYWRIGHT=/path/to/playwright/index.mjs CHROME=/path/to/chrome OUT=/dir node scripts/replay_shots.mjs
-// Expert mode at 1440x900: enable, record a joint move, save, the list shows it, replay at
+// Expert mode at 1440x900: enable, record a joint move (with capabilities.teach through the teach recorder, the
+// episode id is armd's ULID), save, the list shows it, replay at
 // 0.5x with progress, stop mid-replay, replay while recording (MOTION_BUSY toast), replay at 1x to the end,
 // delete with the in-page confirm. Then the card layout at phone landscape 844x390 and portrait 390x844,
 // in zh and en. Writes PNGs (default .cache/replay-shots/) and exits non-zero on a failed check.
@@ -44,6 +45,9 @@ const shot = async (page, name) => {
 const action = (page) => page.evaluate(() => S.obs && S.obs.action);
 const toasts = (page) => page.evaluate(() => [...document.querySelectorAll('#toasts .toast')].map((t) => t.textContent));
 async function enable(page) {
+  // the page closed before this one lost its lease: armd parks the arm after the grace period (Armed, then Moving);
+  // a hold on the button while the arm is still operational would stow it instead of enabling
+  await page.waitForFunction(() => !isOperational() && !(S.obs.action && S.obs.action.state === 'running'), null, { timeout: 30000 });
   const b = await page.locator('#btn-enable').boundingBox();
   await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
   await page.mouse.down();
@@ -58,11 +62,15 @@ const waitAction = (page, pred, ms = 20000) => page.waitForFunction(pred, null, 
   const { ctx, page } = await open({ width: 1440, height: 900 }, 'zh');
   await enable(page);
   await page.waitForTimeout(500);
-  const before = await page.evaluate(() => EP.list.length);
+  const before = await page.evaluate(() => EP.list.length), beforeIds = await page.evaluate(() => EP.list.map((e) => e.id));
+  // teach v1 (capabilities.teach): the record button records into the teach store and armd names the episode (ULID);
+  // without teach the page names it (#rec-id)
+  const teach = await page.evaluate(() => teachOn());
+  console.log('  teach v1 ' + teach);
 
   // record: start, move to the inspect preset, save
-  const id = 'ui_' + Date.now();
-  await page.fill('#rec-id', id);
+  let id = 'ui_' + Date.now();
+  if (!teach) await page.fill('#rec-id', id);
   await page.click('#btn-rec');
   await page.waitForFunction(() => S.rec.active, null, { timeout: 3000 });
   // the arm moves by a joint jog through the page's lease (the move itself is not under test)
@@ -70,17 +78,19 @@ const waitAction = (page, pred, ms = 20000) => page.waitForFunction(pred, null, 
   await page.waitForTimeout(400);
   await waitAction(page, () => S.obs.action && S.obs.action.state !== 'running', 20000);
   await page.waitForTimeout(500);
-  // replay while recording: armd refuses (MOTION_BUSY)
-  if (before > 0) {
-    await page.click('#ep-list li .ep-go');
+  // replay while recording: armd refuses (MOTION_BUSY; only a sequence run replays into its own recording)
+  async function replayWhileRecording(go) {
+    await go.click();
     await page.waitForTimeout(500);
     const t = await toasts(page);
     ok(t.some((x) => x.includes('MOTION_BUSY')), 'replay while recording refused with MOTION_BUSY: ' + JSON.stringify(t));
     await shot(page, '1_reject_while_recording');
   }
+  if (before > 0) await replayWhileRecording(page.locator('#ep-list li .ep-go').first());
   await page.click('#btn-rec');
   await page.waitForFunction(() => !S.rec.active, null, { timeout: 5000 });
   await page.waitForFunction((n) => EP.list.length === n + 1, before, { timeout: 5000 });
+  if (teach) id = await page.evaluate((b) => EP.list.find((e) => !b.includes(e.id)).id, beforeIds);
   const row = page.locator(`#ep-list li[data-id="${id}"]`);
   ok(await row.count() === 1, 'saved episode listed after save');
   const small = await row.locator('small').textContent();
@@ -90,11 +100,7 @@ const waitAction = (page, pred, ms = 20000) => page.waitForFunction(pred, null, 
     await page.click('#btn-rec');
     await page.waitForFunction(() => S.rec.active, null, { timeout: 3000 });
     await page.waitForTimeout(300);
-    await row.locator('.ep-go').click();
-    await page.waitForTimeout(500);
-    const t = await toasts(page);
-    ok(t.some((x) => x.includes('MOTION_BUSY')), 'replay while recording refused with MOTION_BUSY: ' + JSON.stringify(t));
-    await shot(page, '1_reject_while_recording');
+    await replayWhileRecording(row.locator('.ep-go'));
     await page.click('#btn-discard');
     await page.waitForFunction(() => !S.rec.active, null, { timeout: 3000 });
   }
@@ -152,11 +158,12 @@ const waitAction = (page, pred, ms = 20000) => page.waitForFunction(pred, null, 
   // a saved episode to show
   const { ctx, page } = await open({ width: 1440, height: 900 }, 'zh');
   await enable(page);
-  await page.fill('#rec-id', 'layout_check');
+  const teach = await page.evaluate(() => teachOn()), n0 = await page.evaluate(() => EP.list.length);
+  if (!teach) await page.fill('#rec-id', 'layout_check');
   await page.click('#btn-rec');
   await page.waitForTimeout(800);
   await page.click('#btn-rec');
-  await page.waitForFunction(() => EP.list.some((e) => e.id === 'layout_check'), null, { timeout: 5000 });
+  await page.waitForFunction(([tv, n]) => (tv ? EP.list.length > n : EP.list.some((e) => e.id === 'layout_check')), [teach, n0], { timeout: 5000 });
   await ctx.close();
 }
 for (const [name, vp] of [['desktop', { width: 1440, height: 900 }], ['land', { width: 844, height: 390 }], ['port', { width: 390, height: 844 }]]) {
