@@ -516,6 +516,22 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 backlog.push_back(Message::Text(text));
                 continue;
             }
+            // depth measurement: read-only, no motion, no lease
+            if kind == "command" && value.get("path").and_then(Value::as_str) == Some(crate::depth_measure::PATH) {
+                let request_id = value.get("request_id").and_then(Value::as_u64);
+                if request_id.is_none() || last_request.is_some_and(|last| request_id.unwrap() <= last) {
+                    let reply = json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"});
+                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                    continue;
+                }
+                last_request = request_id;
+                let (sup, source, tx) = (recv_supervisor.clone(), recv_deps.source.clone(), ack_tx.clone());
+                tokio::spawn(async move {
+                    let result = crate::depth_measure::measure(&sup, source.as_ref(), &value["body"]).await;
+                    let _ = tx.send(crate::teach::reply(&value["request_id"], result)).await;
+                });
+                continue;
+            }
             // teach commands without a motion lease (episode store; recorder ownership)
             if kind == "command" && crate::teach::is_lease_free(value.get("path").and_then(Value::as_str).unwrap_or("")) {
                 let request_id = value.get("request_id").and_then(Value::as_u64);

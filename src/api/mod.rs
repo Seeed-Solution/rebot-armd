@@ -159,6 +159,7 @@ pub fn create_router_calibration(
         .route("/api/v1/mode/gravity_comp", post(rest::action_requires_lease))
         .route("/api/v1/gripper/calibration", get(rest::get_gripper_calibration))
         .route("/api/v1/grasp/setup", get(rest::get_grasp_setup))
+        .route(crate::depth_measure::PATH, post(rest::post_grasp_measure))
         .route("/api/v1/workspace/keepout", get(rest::get_keepout))
         .route("/api/v1/safety/collision", get(rest::get_collision))
         .route("/api/v1/safety/describe", get(rest::get_safety_describe))

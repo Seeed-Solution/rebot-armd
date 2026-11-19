@@ -3301,3 +3301,151 @@ async fn dry_run_task_models_precedence() {
     assert!(w.rig.sim.set_models_calls.lock().unwrap().is_empty(), "dry runs never switch");
     assert!(w.rig.sup.get_observation().await.action.is_none());
 }
+
+// ---- depth measurement without motion (`/api/v1/grasp/measure`) ----
+
+fn relative_depth() -> DepthSim {
+    DepthSim { metric_model: false, a0: 2.7, b0: 0.45, occluded_table: false, occluded_above_z: None, depth_conf: Some(0.95),
+               jaw_clear: Some(true), length_px: Some(60.0), drift_per_frame: false }
+}
+
+/// A rig 20 deg off vertical (an oblique table view: the relative fit needs inverse-depth spread),
+/// per-request triggers and depth, the server, and a lease held by another connection.
+async fn measure_rig(depth: DepthSim) -> WsRig {
+    let setup = GraspSetup { camera_tilt_deg: 0.0, ..GraspSetup::default() };
+    let r = rig(setup, Truth::same(), 20.0, [0.0, 0.0], true).await;
+    r.sim.per_request.store(true, Ordering::SeqCst);
+    r.sim.depth_available.store(true, Ordering::SeqCst);
+    *r.sim.width_px.lock().unwrap() = Some(40.0);
+    *r.sim.depth_sim.lock().unwrap() = Some(depth);
+    ws_rig_on(r, None).await
+}
+
+async fn post_measure(w: &WsRig, body: Value) -> (u16, Value) {
+    let r = reqwest::Client::new().post(format!("http://{}/api/v1/grasp/measure", w.addr)).json(&body).send().await.unwrap();
+    (r.status().as_u16(), r.json().await.unwrap())
+}
+
+fn cup(v: &Value) -> &Value {
+    v["detections"].as_array().unwrap().iter().find(|d| d["label"] == "cup").unwrap_or_else(|| panic!("no cup: {v}"))
+}
+
+#[tokio::test]
+async fn measure_reports_known_heights_and_the_table_fit_without_moving() {
+    let w = measure_rig(relative_depth()).await;
+    let q0 = w.rig.sup.inner().read().await.commanded_positions.clone();
+    // the whole 0.05 m box, then boxes of a 0.03 m top face
+    for (top, height) in [(None, 0.05), (Some(0.03), 0.03)] {
+        *w.rig.sim.top.lock().unwrap() = top;
+        let (status, v) = post_measure(&w, json!({"label": "CUP"})).await;
+        assert_eq!(status, 200, "{v}");
+        let fit = &v["table_fit"];
+        assert_eq!((fit["ok"].as_bool(), fit["source"].as_str(), fit["metric_model"].as_bool()), (Some(true), Some("oblique_ransac"), Some(false)), "{fit}");
+        // the sim's disparity is exactly 1/z = 2.7 disp + 0.45
+        assert!((fit["a"].as_f64().unwrap() - 2.7).abs() < 1e-3 && (fit["b"].as_f64().unwrap() - 0.45).abs() < 1e-3, "{fit}");
+        assert!(fit["residual"]["rms_mm"].as_f64().unwrap() < 0.1, "{fit}");
+        assert_eq!(fit["residual"]["inliers"], fit["n_valid"]);
+        assert!(fit["n_valid"].as_u64().unwrap() >= 8 && fit["least_squares"]["r2_inv_z"].as_f64().unwrap() > 0.9999, "{fit}");
+        let d = cup(&v);
+        assert_eq!(v["detections"].as_array().unwrap().len(), 1, "label filter: {v}");
+        let m = &d["measurement"];
+        assert!((m["height_m"].as_f64().unwrap() - height).abs() < 0.003, "height {height}: {m}");
+        assert_eq!((m["source"].as_str(), m["jaw_clear"].as_bool(), d["why"].is_null()), (Some("oblique_ransac"), Some(true), true), "{d}");
+        assert!(m["depth_m"].as_f64().unwrap() > 0.1 && m["width_m"].as_f64().is_some() && m["length_m"].as_f64().is_some(), "{m}");
+        assert!(d["disp_fg"].as_f64().unwrap() > d["disp_bg"].as_f64().unwrap());
+        // camera pose and calibration identity
+        assert_eq!(v["camera"]["pose_source"], "commanded");
+        assert_eq!(v["camera"]["commanded_rad"].as_array().unwrap().len(), 6);
+        assert_eq!(v["camera"]["lens_known"], true);
+        let cal = &v["calibration"];
+        assert_eq!((cal["calibrated"].as_bool(), cal["kinematics_corrected"].as_bool(), cal["distortion_modelled"].as_bool()), (Some(false), Some(false), Some(false)), "{cal}");
+        assert_eq!(cal["table_z_m"].as_f64(), Some(0.0));
+    }
+    assert_eq!(w.rig.sim.trigger_calls.lock().unwrap().last().unwrap(), &vec!["yolo".to_string(), "depth".to_string()]);
+    let inner = w.rig.sup.inner().read().await;
+    assert_eq!(inner.commanded_positions, q0, "nothing moved");
+    assert!(inner.active_trajectory.is_none());
+}
+
+#[tokio::test]
+async fn measure_over_ws_needs_no_lease() {
+    let w = measure_rig(relative_depth()).await;
+    // a second connection: the lease is held by the rig's controller
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/api/v1/ws", w.addr)).await.unwrap();
+    let ack = common::ws_reply(&mut ws, json!({"type":"command", "request_id": 1, "path":"/api/v1/grasp/measure", "body":{"pipelines":["depth"]}}), &["command_ack", "command_reject"]).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    assert_eq!(ack["table_fit"]["source"], "oblique_ransac");
+    assert!((cup(&ack)["measurement"]["height_m"].as_f64().unwrap() - 0.05).abs() < 0.003, "{ack}");
+    assert_eq!(w.rig.sim.trigger_calls.lock().unwrap().last().unwrap(), &vec!["depth".to_string()]);
+    // request ids still increase
+    let rej = common::ws_reply(&mut ws, json!({"type":"command", "request_id": 1, "path":"/api/v1/grasp/measure", "body":{}}), &["command_ack", "command_reject"]).await;
+    assert_eq!(rej["code"], "INVALID_COMMAND", "{rej}");
+    let rej = common::ws_reply(&mut ws, json!({"type":"command", "request_id": 2, "path":"/api/v1/grasp/measure", "body":{"pipelines":["yolo"]}}), &["command_ack", "command_reject"]).await;
+    assert_eq!((rej["status"].as_u64(), rej["code"].as_str()), (Some(400), Some("INVALID_COMMAND")), "{rej}");
+}
+
+#[tokio::test]
+async fn measure_metric_model_and_failures_say_why() {
+    let w = measure_rig(DepthSim { metric_model: true, a0: 1.0, b0: 0.0, ..relative_depth() }).await;
+    let (_, v) = post_measure(&w, json!({})).await;
+    assert_eq!((v["table_fit"]["source"].as_str(), v["table_fit"]["b"].as_f64()), (Some("metric_table"), Some(0.0)), "{v}");
+    assert!((cup(&v)["measurement"]["height_m"].as_f64().unwrap() - 0.05).abs() < 0.003, "{v}");
+    // the person box (score 0.5) is under min_score 0.6
+    let (_, v) = post_measure(&w, json!({"min_score": 0.6})).await;
+    assert!(v["detections"].as_array().unwrap().iter().all(|d| d["label"] == "cup"), "{v}");
+    // table hidden: no fit, the detection says why
+    w.rig.sim.depth_sim.lock().unwrap().as_mut().unwrap().occluded_table = true;
+    let (status, v) = post_measure(&w, json!({"label": "cup"})).await;
+    assert_eq!(status, 200);
+    assert_eq!((v["table_fit"]["ok"].as_bool(), v["table_fit"]["why"].as_str(), v["table_fit"]["n_samples"].as_u64()), (Some(false), Some("too_few_samples"), Some(0)), "{v}");
+    assert_eq!((cup(&v)["measurement"].is_null(), cup(&v)["why"].as_str()), (true, Some("too_few_samples")));
+    // no depth in the frame
+    *w.rig.sim.depth_sim.lock().unwrap() = None;
+    let (_, v) = post_measure(&w, json!({})).await;
+    assert_eq!(v["table_fit"]["why"], "no_depth_frame", "{v}");
+    // a provider without per-request pipelines
+    w.rig.sim.per_request.store(false, Ordering::SeqCst);
+    let (status, v) = post_measure(&w, json!({})).await;
+    assert_eq!((status, v["code"].as_str()), (422, Some("UNSUPPORTED")), "{v}");
+}
+
+/// The simulated camera, with the commanded positions stepped while the frame is captured.
+struct MovingDuringCapture(Arc<SimCamera>);
+
+impl DetectionSource for MovingDuringCapture {
+    fn inference_enabled(&self) -> BoxFuture<'_, Result<bool, String>> { self.0.inference_enabled() }
+    fn set_inference(&self, enabled: bool) -> BoxFuture<'_, Result<(), String>> { self.0.set_inference(enabled) }
+    fn next_frame(&self, after: Option<u64>, wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> { self.0.next_frame(after, wait_ms) }
+    fn per_request_pipelines(&self) -> BoxFuture<'_, Result<bool, String>> { Box::pin(async { Ok(true) }) }
+    fn trigger(&self, pipelines: &'static [&'static str], wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
+        Box::pin(async move {
+            {
+                let mut inner = self.0.sup.inner().write().await;
+                inner.commanded_positions[0] += 0.01;
+                inner.target_positions[0] += 0.01;
+            }
+            self.0.trigger(pipelines, wait_ms).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn measure_refuses_a_moving_arm() {
+    let w = measure_rig(relative_depth()).await;
+    let moving = MovingDuringCapture(w.rig.sim.clone());
+    let e = armd::api::rest::ApiError::from(armd::depth_measure::measure(&w.rig.sup, &moving, &json!({})).await.unwrap_err());
+    assert_eq!((e.status.as_u16(), e.code.as_deref()), (409, Some("ARM_MOVING")), "{}", e.message);
+    // a servo stream running: refused before the trigger
+    let calls = w.rig.sim.trigger_calls.lock().unwrap().len();
+    { let mut inner = w.rig.sup.inner().write().await; let q = inner.commanded_positions.clone(); inner.servo_target = Some(q); }
+    let (status, v) = post_measure(&w, json!({})).await;
+    assert_eq!((status, v["code"].as_str()), (409, Some("ARM_MOVING")), "{v}");
+    assert_eq!(w.rig.sim.trigger_calls.lock().unwrap().len(), calls, "no trigger");
+}
+
+#[tokio::test]
+async fn capabilities_advertise_grasp_measure() {
+    let w = ws_rig(None).await;
+    let v: Value = reqwest::get(format!("http://{}/api/v1/observation/schema", w.addr)).await.unwrap().json().await.unwrap();
+    assert_eq!(v["capabilities"]["grasp_measure"].as_bool(), Some(true), "{}", v["capabilities"]);
+}

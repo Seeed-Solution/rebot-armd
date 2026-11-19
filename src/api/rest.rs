@@ -617,6 +617,19 @@ pub async fn get_grasp_setup(
     }
 }
 
+/// `POST /api/v1/grasp/measure`: one depth measurement at the current pose, no lease and no
+/// motion (`crate::depth_measure`).
+pub async fn post_grasp_measure(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let body: serde_json::Value = if body.is_empty() { serde_json::Value::Null } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("Body is not JSON: {e}"), "INVALID_COMMAND".into()))?
+    };
+    Ok(Json(crate::depth_measure::measure(&supervisor, deps.source.as_ref(), &body).await?))
+}
+
 /// `GET /api/v1/calibration`: the camera calibration in effect, the live mount and grasp
 /// fields, and the backups (`crate::calibration`).
 pub async fn get_calibration(
