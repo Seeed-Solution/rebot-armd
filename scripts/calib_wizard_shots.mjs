@@ -6,7 +6,8 @@
 // the arm at the IK solution of the target, the ArUco trigger (detTriggerReq) projects the board through
 // a camera with fx 824 / fy 821 / cx 326 / cy 176 / k1 -0.1, 0.3 px noise, mounted 38 deg toward the jaws.
 // The run goes board -> place (bootstrap with nominal values) -> capture (run all) -> solve (gates) ->
-// review (dry-run reply) -> applied -> restore, in zh / en at desktop 1400x900 and phone 390x844, and writes
+// review (dry-run reply) -> applied -> restore, in zh / en at desktop 1400x900, phone 390x844 and the WeChat-like 360x640 /
+// 375x667 (CW_VIEWS=desktop,phone,wx360,wx375 picks some), checks every action row (act_rows_check.mjs), and writes
 // PNGs to .cache/calib-wizard-shots/. Also: Stop aborts a run, and armd without calibration_apply shows the
 // update message. Fine calibration mode (camera + arm geometry), same viewports and languages: the simulated arm's
 // geometry differs from the URDF (zero offsets, a joint-axis tilt, an origin shift); joint-space capture of
@@ -23,6 +24,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { actRowsCheck } from './act_rows_check.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
@@ -142,9 +144,12 @@ function setupSim() {
   });
 }
 
-for (const [vpName, viewport] of (process.env.FINE_ONLY ? [] : [['desktop', { width: 1400, height: 900 }], ['phone', { width: 390, height: 844 }]])) {
+// viewports: desktop, phone 390x844 and the WeChat-like 360x640 / 375x667; CW_VIEWS=desktop,phone picks a subset
+const ALL_VIEWS = [['desktop', { width: 1400, height: 900 }], ['phone', { width: 390, height: 844 }], ['wx360', { width: 360, height: 640 }], ['wx375', { width: 375, height: 667 }]];
+const VIEWS = process.env.CW_VIEWS ? ALL_VIEWS.filter(([n]) => process.env.CW_VIEWS.split(',').includes(n)) : ALL_VIEWS;
+for (const [vpName, viewport] of (process.env.FINE_ONLY ? [] : VIEWS)) {
   for (const lang of ['zh', 'en']) {
-    const ctx = await browser.newContext({ viewport, deviceScaleFactor: vpName === 'phone' ? 2 : 1 });
+    const ctx = await browser.newContext({ viewport, deviceScaleFactor: vpName === 'desktop' ? 1 : 2 });
     await ctx.addInitScript(([l]) => {
       try { localStorage.clear(); localStorage.setItem('lang', l); } catch (_) {}
       // control WebSocket stub: stays open, never answers
@@ -171,6 +176,8 @@ for (const [vpName, viewport] of (process.env.FINE_ONLY ? [] : [['desktop', { wi
         status: CWZ.status,
       }));
       if (!info.open || info.raw || info.hscroll) fail(`${step} ${lang}/${vpName}: ${JSON.stringify(info)}`);
+      const rows = await page.evaluate(actRowsCheck, '#cwiz-panel, #cwiz-jogbar');
+      if (rows.length) fail(`action rows ${step} ${lang}/${vpName}: ${rows.join(' | ')}`);
       const file = path.join(out, `cwiz_${step}_${lang}_${vpName}.png`);
       await page.screenshot({ path: file });
       shots.push(file);
@@ -355,9 +362,9 @@ function setupFine() {
   };
   return true;
 }
-for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['phone', { width: 390, height: 844 }]]) {
+for (const [vpName, viewport] of VIEWS) {
   for (const lang of ['zh', 'en']) {
-    const ctx = await browser.newContext({ viewport, deviceScaleFactor: vpName === 'phone' ? 2 : 1 });
+    const ctx = await browser.newContext({ viewport, deviceScaleFactor: vpName === 'desktop' ? 1 : 2 });
     await ctx.addInitScript(([l]) => {
       try { localStorage.clear(); localStorage.setItem('lang', l); } catch (_) {}
       const RealWS = window.WebSocket;
@@ -390,6 +397,8 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
       const info = await page.evaluate(() => ({ open: !$('cwiz').hidden, on: [...document.querySelectorAll('#cwiz-steps li.on')].map((x) => x.textContent).join(),
         raw: /\bcw\.[a-z]/.test($('cwiz-panel').innerText), hscroll: $('cwiz-panel').scrollWidth > $('cwiz-panel').clientWidth + 1 }));
       if (!info.open || info.raw || info.hscroll) fail(`fine ${step} ${lang}/${vpName}: ${JSON.stringify(info)}`);
+      const rows = await page.evaluate(actRowsCheck, '#cwiz-panel, #cwiz-jogbar');
+      if (rows.length) fail(`action rows ${step} ${lang}/${vpName}: ${rows.join(' | ')}`);
       const file = path.join(out, `cwiz_fine_${step}_${lang}_${vpName}.png`);
       await page.screenshot({ path: file });
       shots.push(file);
@@ -578,11 +587,11 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
 }
 // ---- load from device: re-solve a stored session, verify view, the L0 case
 const l0Ids = new Set(); // sessions rendered here through the URDF arm (not the walk-through's simulated arm)
-for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['phone', { width: 390, height: 844 }]]) {
+for (const [vpName, viewport] of VIEWS) {
   for (const lang of ['zh', 'en']) {
     const fineIds = [...sessions.values()].filter((x) => x.kind === 'fine' && x.solve && x.levels && !l0Ids.has(x.id)).sort((a, b) => b.seq - a.seq).map((x) => x.id);
     if (!fineIds.length) { fail('load: no stored fine session'); break; }
-    const ctx = await browser.newContext({ viewport, deviceScaleFactor: vpName === 'phone' ? 2 : 1 });
+    const ctx = await browser.newContext({ viewport, deviceScaleFactor: vpName === 'desktop' ? 1 : 2 });
     await ctx.addInitScript(([l]) => {
       try { localStorage.clear(); localStorage.setItem('lang', l); } catch (_) {}
       const RealWS = window.WebSocket;
@@ -600,6 +609,8 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
       const info = await page.evaluate(() => ({ open: !$('cwiz').hidden, on: [...document.querySelectorAll('#cwiz-steps li.on')].map((x) => x.textContent).join(),
         raw: /\bcw\.[a-z]/.test($('cwiz-panel').innerText), hscroll: $('cwiz-panel').scrollWidth > $('cwiz-panel').clientWidth + 1 }));
       if (!info.open || info.raw || info.hscroll) fail(`load ${step} ${lang}/${vpName}: ${JSON.stringify(info)}`);
+      const rows = await page.evaluate(actRowsCheck, '#cwiz-panel, #cwiz-jogbar');
+      if (rows.length) fail(`action rows ${step} ${lang}/${vpName}: ${rows.join(' | ')}`);
       const file = path.join(out, `cwiz_load_${step}_${lang}_${vpName}.png`);
       await page.screenshot({ path: file });
       shots.push(file);

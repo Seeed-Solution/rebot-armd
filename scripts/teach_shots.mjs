@@ -19,6 +19,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { actRowsCheck } from './act_rows_check.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
@@ -103,9 +104,11 @@ function setup(teach) {
   teachOnCaps(); renderGc();
 }
 
-for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['phone', { width: 390, height: 844 }]]) {
+// viewports: desktop, phone 390x844 and the WeChat-like 360x640 / 375x667; VIEWS=desktop,phone picks a subset
+const ALL_VIEWS = [['desktop', { width: 1400, height: 900 }], ['phone', { width: 390, height: 844 }], ['wx360', { width: 360, height: 640 }], ['wx375', { width: 375, height: 667 }]];
+for (const [vpName, viewport] of (process.env.VIEWS ? ALL_VIEWS.filter(([n]) => process.env.VIEWS.split(',').includes(n)) : ALL_VIEWS)) {
   for (const lang of ['zh', 'en']) {
-    const ctx = await browser.newContext({ viewport, deviceScaleFactor: vpName === 'phone' ? 2 : 1 });
+    const ctx = await browser.newContext({ viewport, deviceScaleFactor: vpName === 'desktop' ? 1 : 2 });
     await ctx.addInitScript(([l]) => {
       try { localStorage.clear(); localStorage.setItem('lang', l); } catch (_) {}
       const RealWS = window.WebSocket;
@@ -128,6 +131,8 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
           http: /HTTP \d{3}/.test(($('toasts') || {}).textContent || '') };
       }, panel);
       if (!info.open || info.raw || info.hscroll || info.page || info.http) fail(`${name} ${tag}: ${JSON.stringify(info)}`);
+      const rows = await page.evaluate(actRowsCheck, '#teach-panel');
+      if (rows.length) fail(`action rows ${name} ${tag}: ${rows.join(' | ')}`);
       const file = path.join(out, `teach_${name}_${lang}_${vpName}.png`);
       await page.screenshot({ path: file });
       shots.push(file);
@@ -268,7 +273,7 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     await ev(() => teachEdit('S1'));
     const e1 = await ev(() => ({ steps: document.querySelectorAll('#tch-steps > li').length, stale: [...document.querySelectorAll('#tch-steps > li')].map((li) => !!li.querySelector('.tch-bd.stale')) }));
     if (e1.steps !== 6 || JSON.stringify(e1.stale) !== '[false,false,false,true,false,false]') fail(`editor ${tag}: ${JSON.stringify(e1)}`);
-    await ev(() => { document.querySelector('#tch-steps > li[data-i="2"] .tch-acts button').click(); }); // wait step up
+    await ev(() => { [...document.querySelectorAll('#tch-steps > li[data-i="2"] .tch-acts button')].find((b) => b.textContent === '↑').click(); }); // wait step up
     await ev(() => { const s = document.querySelector('#tch-steps > li[data-i="0"] select'); s.value = '0.3'; s.dispatchEvent(new Event('change')); });
     const e2 = await ev(() => ({ order: TCH.cur.steps.map((s) => s.type).join(','), speed: TCH.cur.steps[0].speed_scale, dirty: TCH.dirty, save: $('tch-save').textContent }));
     if (e2.order !== 'pose,wait,gripper,pose,gripper,replay' || e2.speed !== 0.3 || !e2.dirty) fail(`edit ${tag}: ${JSON.stringify(e2)}`);

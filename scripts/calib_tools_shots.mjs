@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { actRowsCheck } from './act_rows_check.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
@@ -83,9 +84,11 @@ function setup(tools) {
   colOnCaps();
 }
 
-for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['phone', { width: 390, height: 844 }]]) {
+// viewports: desktop, phone 390x844 and the WeChat-like 360x640 / 375x667; VIEWS=desktop,phone picks a subset
+const ALL_VIEWS = [['desktop', { width: 1400, height: 900 }], ['phone', { width: 390, height: 844 }], ['wx360', { width: 360, height: 640 }], ['wx375', { width: 375, height: 667 }]];
+for (const [vpName, viewport] of (process.env.VIEWS ? ALL_VIEWS.filter(([n]) => process.env.VIEWS.split(',').includes(n)) : ALL_VIEWS)) {
   for (const lang of ['zh', 'en']) {
-    const ctx = await browser.newContext({ viewport, deviceScaleFactor: vpName === 'phone' ? 2 : 1 });
+    const ctx = await browser.newContext({ viewport, deviceScaleFactor: vpName === 'desktop' ? 1 : 2 });
     await ctx.addInitScript(([l]) => {
       try { localStorage.clear(); localStorage.setItem('lang', l); } catch (_) {}
       const RealWS = window.WebSocket;
@@ -107,6 +110,8 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
           hscroll: el ? el.scrollWidth > el.clientWidth + 1 : true, page: document.documentElement.scrollWidth > window.innerWidth + 1 };
       }, panel);
       if (!info.open || info.raw || info.hscroll || info.page) fail(`${name} ${lang}/${vpName}: ${JSON.stringify(info)}`);
+      const rows = await page.evaluate(actRowsCheck, '#mzero-panel, #gtool, #sset');
+      if (rows.length) fail(`action rows ${name} ${lang}/${vpName}: ${rows.join(' | ')}`);
       const file = path.join(out, `tools_${name}_${lang}_${vpName}.png`);
       await page.screenshot({ path: file });
       shots.push(file);
