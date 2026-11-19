@@ -273,6 +273,7 @@ async fn software_zero_refuses_a_moving_arm() {
 async fn motor_zero_marks_poses_and_gripper_calibration_stale() {
     let mut r = rig(|_| {}).await;
     set_q(&r, LEGACY_REST).await;
+    wait_status(&r, "legacy_j6").await;
     assert_eq!(cmd(&mut r, "/api/v1/poses/save", json!({"name": "scan"})).await["type"], "command_ack");
     {
         let mut inner = r.sup.inner().write().await;
@@ -290,6 +291,8 @@ async fn motor_zero_marks_poses_and_gripper_calibration_stale() {
     assert!(r.sup.gripper_calibration_response().await.stale.is_some());
     // offsets 0 (the motor reads 0 at the reference): no joint_zero is written
     assert!(!r.deps.path.exists());
+    // the motor zero of J6 ended the legacy verdict; the arm reads the rest pose now
+    wait_status(&r, "ok").await;
     // a zero of a joint already at its reference (< 0.5 deg) marks nothing more stale
     {
         let mut inner = r.sup.inner().write().await;

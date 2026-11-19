@@ -651,6 +651,9 @@ impl SupervisorInner {
     pub fn set_motor_zero(&mut self, joint: usize) -> Result<(), String> {
         if self.is_torqued || self.disable_pending { return Err("torque is on".into()); }
         if joint >= self.config.dof { return Err(format!("joint {} does not exist", joint + 1)); }
+        // a new J6 zero ends a legacy_j6 verdict; the next check decides again
+        if joint == 5 { self.zero_convention = Default::default(); }
+        self.zero_check_pending = true;
         match self.driver.as_ref() {
             Some(d) => d.lock().map_err(|_| "driver unavailable".to_string())?.set_zero_position(joint).map_err(|e| e.to_string()),
             None => {
