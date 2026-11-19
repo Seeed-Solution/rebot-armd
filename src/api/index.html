@@ -353,16 +353,14 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .cwiz-find .btn { min-height: 48px; font-size: 13px; white-space: normal; line-height: 1.25; padding: 4px 6px; touch-action: manipulation; }
 .cwiz-find .btn.on { background: var(--sc-color-primary-soft); outline: 1px solid var(--sc-color-primary); font-weight: 600; }
 .cwiz-body p.cwiz-why, .cwiz-jog-why { color: var(--sc-status-warning-fg); font-size: 12px; }
-/* jog bar: bottom centre (safe area), lifted by --jog-lift above sticks it would cover (cwJogPlace); .top when no room */
-.cwiz-jogbar { position: fixed; z-index: 1041; left: 50%; transform: translateX(-50%); bottom: calc(16px + env(safe-area-inset-bottom, 0px) + var(--jog-lift, 0px));
-  display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px 12px; box-sizing: border-box; width: max-content; max-width: min(560px, calc(100% - 32px));
-  padding: 10px 12px; border-radius: 16px; background: var(--sc-color-bg-container); color: var(--sc-color-text); border: 1px solid var(--sc-color-border); box-shadow: 0 8px 24px rgba(15, 23, 42, 0.22); }
-.cwiz-jogbar.top { bottom: auto; top: calc(8px + env(safe-area-inset-top, 0px)); }
-.cwiz-jog-info { display: grid; gap: 2px; min-width: 0; font-size: 13px; }
-.cwiz-jog-info .calib-live { padding: 3px 8px; }
+/* jog bar: one compact row (<= 48 px) docked at the top edge of the video area (dockOnVideo), below the view switch, never over
+   the E-stop / Enable / sticks; the board below stays visible */
+.cwiz-jogbar { position: fixed; z-index: 1041; left: 50%; top: calc(8px + env(safe-area-inset-top, 0px)); transform: translateX(-50%);
+  display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; box-sizing: border-box; width: max-content; max-width: calc(100% - 16px); height: 48px;
+  padding: 4px 4px 4px 6px; border-radius: 14px; background: var(--sc-color-bg-container); color: var(--sc-color-text); border: 1px solid var(--sc-color-border); box-shadow: 0 6px 18px rgba(15, 23, 42, 0.22); }
+.cwiz-jogbar .calib-live { padding: 4px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
+.cwiz-jogbar .btn { min-height: 38px; height: 38px; padding: 0 12px; font-size: 13px; white-space: nowrap; flex: 0 0 auto; touch-action: manipulation; }
 .cwiz-jog-why[hidden] { display: none; }
-.cwiz-jog-acts { display: flex; gap: 8px; }
-.cwiz-jog-acts .btn { min-height: 44px; font-size: 14px; touch-action: manipulation; }
 @media (max-width: 640px) {
   .cwiz-mask .calib-drawer { max-height: 66dvh; }
   .cwiz.min { max-height: none; }
@@ -1907,13 +1905,11 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     </div>
   </aside>
 </div>
-<!-- calibration wizard, place / move step, "Jog": the panel hides and this bar floats above the sticks -->
-<div class="cwiz-jogbar" id="cwiz-jogbar" role="region" aria-labelledby="cwiz-jog-ttl" hidden>
-  <div class="cwiz-jog-info"><b id="cwiz-jog-ttl"></b><span class="calib-live mono" id="cwiz-jog-live"></span><span class="cwiz-jog-why" id="cwiz-jog-why"></span></div>
-  <div class="cwiz-jog-acts">
-    <button class="btn" id="cwiz-jog-back" type="button"></button>
-    <button class="btn btn-primary" id="cwiz-jog-cap" type="button"></button>
-  </div>
+<!-- calibration wizard, place / move step, "Jog": the panel hides and this one-row bar docks at the top edge of the video -->
+<div class="cwiz-jogbar" id="cwiz-jogbar" role="region" hidden>
+  <span class="calib-live mono" id="cwiz-jog-live" aria-describedby="cwiz-jog-why"></span><span class="cwiz-jog-why" id="cwiz-jog-why" hidden></span>
+  <button class="btn" id="cwiz-jog-back" type="button"></button>
+  <button class="btn btn-primary" id="cwiz-jog-cap" type="button"></button>
 </div>
 <div class="calib-mask" id="gset" hidden>
   <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="gset-title">
@@ -2501,7 +2497,7 @@ Object.assign(I18N.zh, {
   'cw.place.hint': '把相机移到标定板上方约 30 cm，画面里至少能看到 6 个完整标记（用摇杆、拖动示教或自动寻找，见下方三个按钮）。然后点「采集起始视图」：向导用这一帧估计标定板位置，并生成后续位姿。',
   'cw.place.live': '画面中的标定板标记：{n} 个', 'cw.place.cap': '采集起始视图', 'cw.place.few': '只识别到 {n} 个标定板标记（至少 {min} 个），请调整位置',
   'cw.find.title': '让相机看到标定板', 'cw.find.jog': '用摇杆移动', 'cw.find.hand': '拖动示教', 'cw.find.search': '自动寻找', 'cw.find.back': '返回向导',
-  'cw.find.jog.ttl': '用摇杆把相机移到标定板上方', 'cw.find.jog.ttl.b': '用摇杆把相机移到标定板（位置 B）上方',
+  'cw.jog.live': '标记 {n} / {min}', 'cw.find.jog.ttl': '用摇杆把相机移到标定板上方', 'cw.find.jog.ttl.b': '用摇杆把相机移到标定板（位置 B）上方',
   'cw.find.why.few': '画面中只有 {n} 个标定板标记，至少需要 {min} 个', 'cw.find.why.gc': '拖动示教中：先点「退出并锁定位置」，等机械臂锁定', 'cw.find.why.search': '正在自动寻找',
   'cw.find.gc.on': '已进入拖动示教：扶稳机械臂，补偿建立后用手把相机移到标定板上方，然后点「退出并锁定位置」', 'cw.find.gc.hint': '用手把相机移到标定板上方约 30 cm，再点「退出并锁定位置」',
   'cw.find.gc.exiting': '正在退出拖动示教并锁定位置…', 'cw.find.hand.na': '这台机械臂不支持拖动示教（重力补偿）',
@@ -2541,7 +2537,7 @@ Object.assign(I18N.en, {
   'cw.place.hint': 'Bring the camera to about 30 cm above the board so that at least 6 whole markers are in view (jog, move by hand or search: the three buttons below), then tap "Capture start view": the wizard estimates the board position from this frame and generates the poses.',
   'cw.place.live': 'Board markers in view: {n}', 'cw.place.cap': 'Capture start view', 'cw.place.few': 'Only {n} board markers detected (need {min}); adjust the view',
   'cw.find.title': 'Bring the camera onto the board', 'cw.find.jog': 'Jog', 'cw.find.hand': 'Move by hand', 'cw.find.search': 'Search', 'cw.find.back': 'Back to wizard',
-  'cw.find.jog.ttl': 'Jog the camera above the board', 'cw.find.jog.ttl.b': 'Jog the camera above the board (placement B)',
+  'cw.jog.live': 'Markers {n} / {min}', 'cw.find.jog.ttl': 'Jog the camera above the board', 'cw.find.jog.ttl.b': 'Jog the camera above the board (placement B)',
   'cw.find.why.few': 'Only {n} board markers in view, need {min}', 'cw.find.why.gc': 'Hand-guiding: tap "Exit and hold pose" first and wait until the arm is locked', 'cw.find.why.search': 'Search running',
   'cw.find.gc.on': 'Hand-guiding on: keep a hand on the arm, move the camera above the board once the ramp completes, then tap "Exit and hold pose"', 'cw.find.gc.hint': 'Move the camera by hand to about 30 cm above the board, then tap "Exit and hold pose"',
   'cw.find.gc.exiting': 'Leaving hand-guiding and locking the pose…', 'cw.find.hand.na': 'This arm has no hand-guiding (gravity compensation)',
@@ -5275,8 +5271,9 @@ function cwFineToB() {
   cwRender(); cwV3Sync();
 }
 /* ---- place / move steps: three ways to bring the camera onto the board
-   Jog: the panel hides (.min .jog) and a floating bar (#cwiz-jogbar) shows the live marker count and "Capture start
-   view"; the bar sits above the visible sticks / pads, E-stop and Enable (CWJ_AVOID), else at the top of the screen.
+   Jog: the panel hides (.min .jog) and a one-row bar (#cwiz-jogbar) shows the live marker count, "Back" and "Capture
+   start view"; it docks at the top edge of the video (dockOnVideo) so the board stays visible, never over the sticks /
+   pads, E-stop and Enable (CWJ_AVOID).
    Hand-guide: the cockpit's gravity compensation (gcBlockText checks, POST /api/v1/mode/gravity_comp); the start view
    is captured only after the exit has locked the arm (control_mode position, no phase) and the arm is still.
    Search: move_to over a grid of board centres on the table (CW_SEARCH), camera CW_SEARCH.h above the table looking
@@ -5312,36 +5309,43 @@ function cwJogRender() {
   if (bar.hidden) return;
   const n = cwLiveCount(), why = cwBootWhy(n), min = CWZ.CW ? CWZ.CW.GATES.minMarkers : 6;
   const live = $('cwiz-jog-live');
-  setText(live, t('cw.place.live', { n }));
+  setText(live, t('cw.jog.live', { n, min }));
   live.classList.toggle('ok', n >= min);
   const w = $('cwiz-jog-why');
   setText(w, why || '');
-  w.hidden = !why;
   const cap = $('cwiz-jog-cap');
   cap.disabled = !!why || CWZ.busy;
+  cap.title = why || '';
+  live.title = why || '';
   setText(cap, CWZ.busy ? t('calib.cap.busy') : t('cw.place.cap'));
   setText($('cwiz-jog-back'), t('cw.find.back'));
-  setText($('cwiz-jog-ttl'), t(CWZ.step === 'move' ? 'cw.find.jog.ttl.b' : 'cw.find.jog.ttl'));
+  bar.setAttribute('aria-label', t(CWZ.step === 'move' ? 'cw.find.jog.ttl.b' : 'cw.find.jog.ttl'));
   cwJogPlace();
 }
-// floating bar position: bottom (safe area), lifted above every visible stick / pad it would cover; top if no room
-function cwJogPlace() {
-  const bar = $('cwiz-jogbar');
-  if (bar.hidden) return;
-  bar.classList.remove('top');
-  bar.style.setProperty('--jog-lift', '0px');
-  const H = window.innerHeight, vs = $('vs-video') && $('vs-video').parentElement;
-  const avoid = [...document.querySelectorAll(CWJ_AVOID), vs].filter(Boolean).map((e) => e.getBoundingClientRect())
+function cwJogPlace() { dockOnVideo($('cwiz-jogbar')); }
+// A floating bar (position: fixed) docked at the top edge of the video area: centred on the video, pushed below the
+// view switch / header and anything of DOCK_AVOID it would cover; at the top of the screen when the video is
+// scrolled out of view.
+const DOCK_AVOID = CWJ_AVOID + ', .topbar';
+function dockOnVideo(bar) {
+  if (!bar || bar.hidden) return;
+  const W = window.innerWidth, H = window.innerHeight, v = $('video-box').getBoundingClientRect();
+  const onVideo = v.width > 0 && v.bottom > 120 && v.top < H - 120;
+  const cx = onVideo ? Math.min(W - 8, Math.max(8, v.left + v.width / 2)) : W / 2;
+  bar.style.left = cx + 'px';
+  bar.style.maxWidth = Math.max(160, (onVideo ? Math.min(v.width, W) : W) - 16) + 'px';
+  let top = onVideo ? Math.max(0, v.top) + 8 : 8;
+  bar.style.top = top + 'px';
+  const vs = $('vs-video') && $('vs-video').parentElement;
+  const avoid = [...document.querySelectorAll(DOCK_AVOID), vs].filter(Boolean).map((e) => e.getBoundingClientRect())
     .filter((r) => r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < H);
-  let lift = 0;
   for (let k = 0; k < 6; k++) {
     const b = bar.getBoundingClientRect();
     const hit = avoid.filter((r) => r.left < b.right && r.right > b.left && r.top < b.bottom && r.bottom > b.top);
     if (!hit.length) break;
-    lift += b.bottom - Math.min(...hit.map((r) => r.top)) + 8;
-    bar.style.setProperty('--jog-lift', lift + 'px');
+    top = Math.max(...hit.map((r) => r.bottom)) + 6;
+    bar.style.top = top + 'px';
   }
-  if (bar.getBoundingClientRect().top < 8) { bar.style.setProperty('--jog-lift', '0px'); bar.classList.add('top'); }
 }
 async function cwJogCapture() { cwJogMode(false); await cwBootstrap(); }
 // hand-guide: enter with the cockpit switch's checks; exit locks the pose

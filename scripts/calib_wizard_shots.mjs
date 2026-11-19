@@ -10,8 +10,8 @@
 // PNGs to .cache/calib-wizard-shots/. Also: Stop aborts a run, and armd without calibration_apply shows the
 // update message. Fine calibration mode (camera + arm geometry), same viewports and languages: the simulated arm's
 // geometry differs from the URDF (zero offsets, a joint-axis tilt, an origin shift); joint-space capture of
-// placement A with an abort and Continue, the board move (the camera loses the board; jog bar on the sticks' free
-// side, hand-guide enter / exit-and-lock, a search stopped by Stop and one that finds the board), placement B, the solve in a Web Worker (gates, held-out,
+// placement A with an abort and Continue, the board move (the camera loses the board; jog bar: one row docked on the video top, off the sticks;
+// hand-guide enter / exit-and-lock, a search stopped by Stop and one that finds the board), placement B, the solve in a Web Worker (gates, held-out,
 // per-joint parameters, the J5 zero warning), review with park / torque off, one apply carrying kinematics.
 // FINE_ONLY=1 runs only the fine calibration walk-through. Exits non-zero if a check fails.
 import fs from 'node:fs';
@@ -432,17 +432,20 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
       const cover = pads.filter(([, r]) => r.left < b.right && r.right > b.left && r.top < b.bottom && r.bottom > b.top).map(([n]) => n);
       // the centre of every visible stick is still the topmost element there (nothing of the wizard on it)
       const blocked = pads.filter(([, r]) => { const x = (r.left + r.right) / 2, y = (Math.max(0, r.top) + Math.min(H, r.bottom)) / 2, e = document.elementFromPoint(x, y); return e && (e.closest('#cwiz-jogbar') || e.closest('#cwiz-panel')); }).map(([n]) => n);
-      return { bar: !bar.hidden, panel: $('cwiz-panel').getBoundingClientRect().height, inView: b.left >= 0 && b.right <= W && b.top >= 0 && b.bottom <= H, top: bar.classList.contains('top'), y: Math.round(b.top), h: Math.round(b.height), sticks: pads.length, cover, blocked,
-        cap: $('cwiz-jog-cap').disabled, live: $('cwiz-jog-live').textContent, why: $('cwiz-jog-why').hidden ? '' : $('cwiz-jog-why').textContent };
+      // one row (<= 48 px) docked at the top edge of the video area: the lower part of the video (the board) stays free
+      const v = $('video-box').getBoundingClientRect();
+      const docked = b.height <= 48 && b.top >= v.top - 1 && b.bottom <= v.top + Math.max(140, v.height * 0.45);
+      return { bar: !bar.hidden, panel: $('cwiz-panel').getBoundingClientRect().height, inView: b.left >= 0 && b.right <= W && b.top >= 0 && b.bottom <= H, docked, y: Math.round(b.top), h: Math.round(b.height), sticks: pads.length, cover, blocked,
+        cap: $('cwiz-jog-cap').disabled, live: $('cwiz-jog-live').textContent, why: $('cwiz-jog-cap').title };
     });
     const jg = await jogGeo();
-    if (!jg.bar || jg.panel || !jg.inView || jg.cover.length || jg.blocked.length || !jg.cap || !jg.why || !jg.sticks) fail('fine jog bar ' + JSON.stringify(jg));
-    await shot('5a_jog', `bar at y ${jg.y} (h ${jg.h}${jg.top ? ', top' : ''}), panel hidden, ${jg.sticks} sticks / toggles visible, covered ${jg.cover.length}, sticks blocked ${jg.blocked.length}, capture disabled ${jg.cap}: "${jg.why}"`);
+    if (!jg.bar || jg.panel || !jg.inView || !jg.docked || jg.cover.length || jg.blocked.length || !jg.cap || !jg.why || !jg.sticks) fail('fine jog bar ' + JSON.stringify(jg));
+    await shot('5a_jog', `bar at y ${jg.y} (h ${jg.h}${jg.docked ? ', docked on the video top' : ''}), panel hidden, ${jg.sticks} sticks / toggles visible, covered ${jg.cover.length}, sticks blocked ${jg.blocked.length}, capture disabled ${jg.cap}: "${jg.why}"`);
     const qAway = await page.evaluate(() => S.obs.positions.slice());
     await page.evaluate(() => __SIM.moveBoard()); // the user jogs until the camera sees the board
     await waitW(page, () => !$('cwiz-jog-cap').disabled, 5000, 'fine jog ready');
     const jr = await jogGeo();
-    if (jr.cap || jr.cover.length || jr.blocked.length) fail('fine jog ready ' + JSON.stringify(jr));
+    if (jr.cap || !jr.docked || jr.cover.length || jr.blocked.length) fail('fine jog ready ' + JSON.stringify(jr));
     await shot('5b_jog_ready', `"${jr.live}", capture enabled ${!jr.cap}`);
     await page.click('#cwiz-jog-back');
     await page.waitForTimeout(300);
