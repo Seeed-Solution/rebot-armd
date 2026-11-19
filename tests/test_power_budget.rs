@@ -723,12 +723,14 @@ fn replay_is_slowed_to_fit() {
         armd::RecordFrame { timestamp: t, observation_state: q.clone(), action: q }
     }).collect();
     let input = armd::replay::ReplayInput {
-        request: armd::replay::ReplayRequest { episode: "swing".into(), speed: 1.0, gripper: false, tag: None },
+        request: armd::replay::ReplayRequest { episode: "swing".into(), speed: 1.0, gripper: false, tag: None, allow_stale: false },
         path: std::path::PathBuf::from("/nonexistent"), profile_id: inner.config.profile_id.clone(), dof: 7, arm_dof: 6, gripper_idx: Some(6),
         joint_names: inner.config.limits.iter().map(|l| l.name.clone()).collect(),
         limits: inner.config.limits.clone(), speed_limits: inner.planning_limits(), ws: None,
         arm: inner.config.arm_model.clone(), start: STRETCHED.to_vec(), control_hz: 50, epoch: inner.safety.epoch_id(),
         workspace_revision: 0, power: inner.power_budget().cloned(),
+        store: armd::recording::EpisodeStore::new(None),
+        zero_offsets: vec![0.0; 6],
     };
     let t0 = std::time::Instant::now();
     let plan = armd::replay::plan_frames(input, &frames).unwrap();

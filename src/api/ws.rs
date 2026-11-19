@@ -65,8 +65,10 @@ fn invalid_command(message: &str) -> ApiError {
 }
 
 fn rejection(error: ApiError, kind: &str, epoch: u64) -> Value {
-    json!({"type":kind, "status":error.status.as_u16(), "code":error.code,
-        "error":error.error, "message":error.message, "safety_state":error.safety_state, "epoch_id":epoch})
+    let mut reply = json!({"type":kind, "status":error.status.as_u16(), "code":error.code,
+        "error":error.error, "message":error.message, "safety_state":error.safety_state, "epoch_id":epoch});
+    if let Some(Value::Object(m)) = error.details.map(|d| *d) { for (k, v) in m { reply[k] = v; } }
+    reply
 }
 
 fn positions(value: Option<&Value>) -> Result<Vec<f32>, ApiError> {
@@ -499,6 +501,27 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
             if macro_check.is_some() && !runs_during_macro_check(kind, &value) {
                 backlog.push_back(Message::Text(text));
+                continue;
+            }
+            // teach commands without a motion lease (episode store; recorder ownership)
+            if kind == "command" && crate::teach::is_lease_free(value.get("path").and_then(Value::as_str).unwrap_or("")) {
+                let request_id = value.get("request_id").and_then(Value::as_u64);
+                if request_id.is_none() || last_request.is_some_and(|last| request_id.unwrap() <= last) {
+                    let reply = json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"});
+                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                    continue;
+                }
+                last_request = request_id;
+                let caller = crate::teach::Caller {
+                    connection: recv_connection.clone(),
+                    client_id: value.get("client_id").and_then(Value::as_str).map(str::to_string).or_else(|| client_label.clone()),
+                };
+                let (sup, tx) = (recv_supervisor.clone(), ack_tx.clone());
+                tokio::spawn(async move {
+                    let path = value["path"].as_str().unwrap_or("").to_string();
+                    let result = crate::teach::lease_free(&sup, &caller, &path, &value["body"]).await;
+                    let _ = tx.send(crate::teach::reply(&value["request_id"], result)).await;
+                });
                 continue;
             }
             let mut response: Option<Value>;

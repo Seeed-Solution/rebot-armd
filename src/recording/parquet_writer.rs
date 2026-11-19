@@ -40,8 +40,8 @@ pub enum ParquetRecordingError {
     Corrupted(String),
 }
 
-/// Create the canonical LeRobot parquet Arrow schema with optional metadata
-pub fn lerobot_arrow_schema_with_meta(meta: Option<&EpisodeMetadata>) -> Arc<Schema> {
+/// Parquet key-value metadata of an [`EpisodeMetadata`].
+fn metadata_kv(meta: Option<&EpisodeMetadata>) -> std::collections::HashMap<String, String> {
     let mut metadata = std::collections::HashMap::new();
     if let Some(m) = meta {
         if let Some(ref pid) = m.profile_id {
@@ -59,6 +59,15 @@ pub fn lerobot_arrow_schema_with_meta(meta: Option<&EpisodeMetadata>) -> Arc<Sch
             }
         }
     }
+    metadata
+}
+
+/// Create the canonical LeRobot parquet Arrow schema with optional metadata
+pub fn lerobot_arrow_schema_with_meta(meta: Option<&EpisodeMetadata>) -> Arc<Schema> {
+    schema_with_kv(metadata_kv(meta))
+}
+
+fn schema_with_kv(metadata: std::collections::HashMap<String, String>) -> Arc<Schema> {
     Arc::new(Schema::new_with_metadata(
         vec![
             Field::new("timestamp", DataType::Float64, false),
@@ -88,6 +97,39 @@ pub fn write_frames_to_parquet_with_meta(
     frames: &[RecordFrame],
     meta: Option<&EpisodeMetadata>,
 ) -> Result<(), ParquetRecordingError> {
+    write_parquet_kv(path, frames, metadata_kv(meta))?;
+
+    if let Some(m) = meta {
+        let meta_path = path.with_extension("meta.json");
+        let tmp_meta_path = path.with_extension("meta.json.tmp");
+        if let Ok(text) = serde_json::to_string_pretty(m) {
+            if let Err(e) = std::fs::write(&tmp_meta_path, text) {
+                tracing::warn!("Failed to write temporary metadata file {}: {e}", tmp_meta_path.display());
+            } else if let Err(e) = std::fs::rename(&tmp_meta_path, &meta_path) {
+                tracing::warn!("Failed to rename {} to {}: {e}", tmp_meta_path.display(), meta_path.display());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Episode file of the episode store: the LeRobot columns with `meta` and `extra` as
+/// key-value metadata, written to `<path>.tmp` and renamed (no `.meta.json` file).
+pub fn write_episode_parquet(path: &Path, frames: &[RecordFrame], meta: Option<&EpisodeMetadata>, extra: &[(&str, String)]) -> Result<(), ParquetRecordingError> {
+    let mut kv = metadata_kv(meta);
+    for (k, v) in extra { kv.insert((*k).to_string(), v.clone()); }
+    write_parquet_kv(path, frames, kv)
+}
+
+/// Key-value metadata of a parquet file (footer only; the rows are not read).
+pub fn read_parquet_kv(path: &Path) -> Result<std::collections::HashMap<String, String>, ParquetRecordingError> {
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    Ok(builder.schema().metadata().iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+}
+
+fn write_parquet_kv(path: &Path, frames: &[RecordFrame], kv: std::collections::HashMap<String, String>) -> Result<(), ParquetRecordingError> {
     if frames.is_empty() {
         return Err(ParquetRecordingError::EmptyFrames);
     }
@@ -96,7 +138,7 @@ pub fn write_frames_to_parquet_with_meta(
         std::fs::create_dir_all(parent)?;
     }
 
-    let schema = lerobot_arrow_schema_with_meta(meta);
+    let schema = schema_with_kv(kv);
     let num_rows = frames.len();
 
     // 1. Timestamps
@@ -143,21 +185,12 @@ pub fn write_frames_to_parquet_with_meta(
     let file = File::create(&tmp_path)?;
     let mut writer = ArrowWriter::try_new(file, schema, None)?;
     writer.write(&batch)?;
-    writer.close()?;
-    std::fs::rename(&tmp_path, path)?;
-
-    if let Some(m) = meta {
-        let meta_path = path.with_extension("meta.json");
-        let tmp_meta_path = path.with_extension("meta.json.tmp");
-        if let Ok(text) = serde_json::to_string_pretty(m) {
-            if let Err(e) = std::fs::write(&tmp_meta_path, text) {
-                tracing::warn!("Failed to write temporary metadata file {}: {e}", tmp_meta_path.display());
-            } else if let Err(e) = std::fs::rename(&tmp_meta_path, &meta_path) {
-                tracing::warn!("Failed to rename {} to {}: {e}", tmp_meta_path.display(), meta_path.display());
-            }
-        }
+    // flushed to the disk before the rename, so a power loss leaves the old name or a whole file
+    writer.into_inner()?.sync_all()?;
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
     }
-
     Ok(())
 }
 

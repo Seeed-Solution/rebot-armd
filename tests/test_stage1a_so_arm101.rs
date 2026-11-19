@@ -255,7 +255,7 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
     write_frames_to_parquet_with_meta(&ep_path, &frames, Some(&meta_51)).unwrap();
 
     let replay_input_60 = ReplayInput {
-        request: ReplayRequest { episode: "ep51".into(), speed: 1.0, gripper: false, tag: None },
+        request: ReplayRequest { episode: "ep51".into(), speed: 1.0, gripper: false, tag: None, allow_stale: false },
         path: ep_path.clone(),
         profile_id: c60.profile_id.clone(),
         dof: 6,
@@ -271,6 +271,8 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
+        zero_offsets: vec![0.0; 6],
     };
 
     let replay_err = plan(replay_input_60).unwrap_err();
@@ -286,7 +288,7 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
     let legacy_path = dir.path().join("legacy.parquet");
     write_frames_to_parquet(&legacy_path, &frames).unwrap();
     let replay_input_legacy = ReplayInput {
-        request: ReplayRequest { episode: "legacy".into(), speed: 1.0, gripper: false, tag: None },
+        request: ReplayRequest { episode: "legacy".into(), speed: 1.0, gripper: false, tag: None, allow_stale: false },
         path: legacy_path,
         profile_id: c60.profile_id.clone(),
         dof: 6,
@@ -302,6 +304,8 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
+        zero_offsets: vec![0.0; 6],
     };
     let plan_res = plan(replay_input_legacy);
     assert!(plan_res.is_ok(), "expected legacy replay to succeed, got: {plan_res:?}");
@@ -363,7 +367,7 @@ fn test_profile_id_pose_and_replay_rejection() {
     write_frames_to_parquet_with_meta(&ep_path, &frames, Some(&meta_100)).unwrap();
 
     let replay_input = ReplayInput {
-        request: ReplayRequest { episode: "ep100".into(), speed: 1.0, gripper: false, tag: None },
+        request: ReplayRequest { episode: "ep100".into(), speed: 1.0, gripper: false, tag: None, allow_stale: false },
         path: ep_path,
         profile_id: c_so101.profile_id.clone(),
         dof: 6,
@@ -379,6 +383,8 @@ fn test_profile_id_pose_and_replay_rejection() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
+        zero_offsets: vec![0.0; 6],
     };
     let replay_err = plan(replay_input).unwrap_err();
     match replay_err {
@@ -460,7 +466,7 @@ fn test_legacy_metadata_guard_5dof_vs_6dof_7dof() {
     write_frames_to_parquet(&legacy_ep, &frames6).unwrap();
 
     let replay_5d = ReplayInput {
-        request: ReplayRequest { episode: "legacy_bare".into(), speed: 1.0, gripper: false, tag: None },
+        request: ReplayRequest { episode: "legacy_bare".into(), speed: 1.0, gripper: false, tag: None, allow_stale: false },
         path: legacy_ep.clone(),
         profile_id: c_so101.profile_id.clone(),
         dof: 6,
@@ -476,6 +482,8 @@ fn test_legacy_metadata_guard_5dof_vs_6dof_7dof() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
+        zero_offsets: vec![0.0; 6],
     };
     let rep_err_5d = plan(replay_5d).unwrap_err();
     match rep_err_5d {
@@ -488,7 +496,7 @@ fn test_legacy_metadata_guard_5dof_vs_6dof_7dof() {
 
     // 6-DOF accepts legacy bare replay
     let replay_60 = ReplayInput {
-        request: ReplayRequest { episode: "legacy_bare".into(), speed: 1.0, gripper: false, tag: None },
+        request: ReplayRequest { episode: "legacy_bare".into(), speed: 1.0, gripper: false, tag: None, allow_stale: false },
         path: legacy_ep,
         profile_id: c_60.profile_id.clone(),
         dof: 6,
@@ -504,6 +512,8 @@ fn test_legacy_metadata_guard_5dof_vs_6dof_7dof() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
+        zero_offsets: vec![0.0; 6],
     };
     assert!(plan(replay_60).is_ok());
 }
@@ -514,7 +524,7 @@ fn test_parquet_metadata_error_propagation() {
 
     // 1) Nonexistent file -> 404 EPISODE_NOT_FOUND
     let input_nonexistent = ReplayInput {
-        request: ReplayRequest { episode: "nonexistent".into(), speed: 1.0, gripper: false, tag: None },
+        request: ReplayRequest { episode: "nonexistent".into(), speed: 1.0, gripper: false, tag: None, allow_stale: false },
         path: dir.path().join("nonexistent.parquet"),
         profile_id: None,
         dof: 6,
@@ -530,6 +540,8 @@ fn test_parquet_metadata_error_propagation() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
+        zero_offsets: vec![0.0; 6],
     };
     let err = plan(input_nonexistent).unwrap_err();
     match err {
@@ -547,7 +559,7 @@ fn test_parquet_metadata_error_propagation() {
     std::fs::write(&sidecar_json, b"{not valid json").unwrap();
 
     let input_corrupt_json = ReplayInput {
-        request: ReplayRequest { episode: "corrupt_sidecar".into(), speed: 1.0, gripper: false, tag: None },
+        request: ReplayRequest { episode: "corrupt_sidecar".into(), speed: 1.0, gripper: false, tag: None, allow_stale: false },
         path: ep_corrupt_json,
         profile_id: None,
         dof: 6,
@@ -563,6 +575,8 @@ fn test_parquet_metadata_error_propagation() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
+        zero_offsets: vec![0.0; 6],
     };
     let err = plan(input_corrupt_json).unwrap_err();
     match err {
@@ -577,7 +591,7 @@ fn test_parquet_metadata_error_propagation() {
     let ep_corrupt_parquet = dir.path().join("corrupt_bin.parquet");
     std::fs::write(&ep_corrupt_parquet, b"PAR1garbage").unwrap();
     let input_corrupt_bin = ReplayInput {
-        request: ReplayRequest { episode: "corrupt_bin".into(), speed: 1.0, gripper: false, tag: None },
+        request: ReplayRequest { episode: "corrupt_bin".into(), speed: 1.0, gripper: false, tag: None, allow_stale: false },
         path: ep_corrupt_parquet,
         profile_id: None,
         dof: 6,
@@ -593,6 +607,8 @@ fn test_parquet_metadata_error_propagation() {
         epoch: 0,
         workspace_revision: 0,
         power: None,
+        store: armd::recording::EpisodeStore::new(Some(dir.path().to_path_buf())),
+        zero_offsets: vec![0.0; 6],
     };
     let err = plan(input_corrupt_bin).unwrap_err();
     match err {

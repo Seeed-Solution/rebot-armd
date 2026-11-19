@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,10 +8,7 @@ use thiserror::Error;
 
 use crate::driver::{ArmDriver, JointTarget, EnableState, DriverCapabilities};
 use crate::model::{ArmConfig, ArmObservation, MotionLimit, MotionLimitReason, ObservationSchema, RestingPosePolicy};
-use crate::recording::{
-    EpisodeRecorder, EpisodeState, ParquetRecordingError, RecordFrame,
-    RecordingError,
-};
+use crate::recording::{EpisodeRecorder, RecordFrame, RecordingError};
 use crate::safety::{FaultCode, FaultReason, SafetyError, SafetyManager, SafetyState, StopPolicy};
 use crate::trajectory::{MultiJointQuinticTrajectory, TrajectoryError, TrajectoryPlanner};
 use crate::macro_action::{MacroRun, SubDone, SubState};
@@ -43,6 +40,16 @@ pub enum ArmError {
     /// Request refused with a specific code (gravity compensation mode changes).
     #[error("{code}: {message}")]
     Rejected { status: u16, code: String, message: String },
+
+    /// [`Rejected`](Self::Rejected) with extra reply fields (`owner`, `sequences`, `step`, `reason`).
+    #[error("{code}: {message}")]
+    Detailed { status: u16, code: String, message: String, details: Box<serde_json::Value> },
+}
+
+impl ArmError {
+    pub fn detailed(status: u16, code: &str, message: impl Into<String>, details: serde_json::Value) -> Self {
+        Self::Detailed { status, code: code.into(), message: message.into(), details: Box::new(details) }
+    }
 }
 
 impl From<crate::recording::StoreError> for ArmError {
@@ -285,7 +292,11 @@ pub struct SupervisorInner {
     /// Duration of the most recently planned NormalUnload trajectory (s).
     pub unload_planned_duration: Option<f64>,
     pub recorder: EpisodeRecorder,
-    /// Episode directory (`--episodes-dir`, `src/recording/store.rs`).
+    /// The running recording and its owner (`crate::teach`).
+    pub recording: Option<crate::teach::ActiveRecording>,
+    /// Length cap of a recording (s); [`crate::recording::store::MAX_EPISODE_S`] (tests lower it).
+    pub max_episode_s: f64,
+    /// Episode store (`--episodes-dir`, `src/recording/store.rs`).
     pub episodes: crate::recording::EpisodeStore,
     pub start_time: Instant,
     pub driver: Option<std::sync::Mutex<Box<dyn ArmDriver>>>,
@@ -477,6 +488,8 @@ impl SupervisorInner {
             profile_grasp,
             unload_planned_duration: None,
             recorder: EpisodeRecorder::new(),
+            recording: None,
+            max_episode_s: crate::recording::store::MAX_EPISODE_S,
             episodes: crate::recording::EpisodeStore::new(Some(PathBuf::from(crate::recording::store::FALLBACK_EPISODES_DIR))),
             start_time: now,
             driver: None,
@@ -4400,7 +4413,7 @@ impl SupervisorInner {
         let obs = self.current_observation();
 
         // 5. Record frame if episode recording is active
-        if self.recorder.state() == &EpisodeState::Recording {
+        if self.recording_frame_room() {
             self.recorder.append_frame(RecordFrame {
                 timestamp: obs.timestamp,
                 observation_state: self.measured_positions.clone(),
@@ -4804,89 +4817,6 @@ impl ArmSupervisor {
     pub async fn has_active_trajectory(&self) -> bool {
         let inner = self.inner.read().await;
         inner.active_trajectory.is_some()
-    }
-
-    pub async fn start_recording(
-        &self,
-        episode_id: Option<String>,
-        output_path: Option<PathBuf>,
-    ) -> Result<(), ArmError> {
-        let store = self.inner.read().await.episodes.clone();
-        // file system checks without the lock (the control tick needs it)
-        let (id, path) = tokio::task::spawn_blocking(move || {
-            let episode = store.new_episode(episode_id.as_deref(), output_path.as_deref())?;
-            store.check_capacity()?;
-            Ok::<_, crate::recording::StoreError>(episode)
-        }).await.map_err(|e| ArmError::Internal(format!("episode check failed: {e}")))??;
-        let mut inner = self.inner.write().await;
-        inner.recorder.start(Some(id), Some(path))?;
-        Ok(())
-    }
-
-    /// Set the episode directory (`None`: storage off).
-    pub async fn set_episodes_dir(&self, dir: Option<PathBuf>) {
-        self.inner.write().await.episodes = crate::recording::EpisodeStore::new(dir);
-    }
-
-    pub async fn episode_store(&self) -> crate::recording::EpisodeStore {
-        self.inner.read().await.episodes.clone()
-    }
-
-    pub async fn save_recording(&self) -> Result<PathBuf, ArmError> {
-        let meta = {
-            let inner = self.inner.read().await;
-            crate::recording::EpisodeMetadata {
-                profile_id: inner.config.profile_id.clone(),
-                arm_dof: Some(inner.config.arm_dof()),
-                gripper_joint: inner.config.gripper_index(),
-                joint_names: Some(inner.config.limits.iter().map(|l| l.name.clone()).collect()),
-            }
-        };
-        self.save_recording_with(move |p, f| crate::recording::write_frames_to_parquet_with_meta(p, f, Some(&meta))).await
-    }
-
-    /// Save with a caller-supplied writer. The lock is held only to move the
-    /// frames out and to record the outcome; the write itself runs on a blocking
-    /// thread so a slow disk cannot stall the control tick, which needs the same lock.
-    #[doc(hidden)]
-    pub async fn save_recording_with<W>(&self, write: W) -> Result<PathBuf, ArmError>
-    where
-        W: FnOnce(&Path, &[RecordFrame]) -> Result<(), ParquetRecordingError> + Send + 'static,
-    {
-        let (recording, store) = {
-            let inner = self.inner.read().await;
-            (inner.recorder.state() == &EpisodeState::Recording, inner.episodes.clone())
-        };
-        if recording {
-            // refused before the frames leave the recorder, so the recording can still be
-            // saved after episodes were deleted, or discarded
-            tokio::task::spawn_blocking(move || store.check_capacity()).await
-                .map_err(|e| ArmError::Internal(format!("episode check failed: {e}")))??;
-        }
-        let (path, frames) = self.inner.write().await.recorder.begin_save()?;
-        let (frames, result) = tokio::task::spawn_blocking(move || {
-            let result = write(&path, &frames);
-            (frames, result)
-        })
-        .await
-        .unwrap_or_else(|e| {
-            // Frames are lost with the panicked task; leave Finalizing so a new
-            // recording can start.
-            let err = std::io::Error::other(format!("recording writer panicked: {e}"));
-            (Vec::new(), Err(ParquetRecordingError::Io(err)))
-        });
-        Ok(self.inner.write().await.recorder.finish_save(frames, result)?)
-    }
-
-    pub async fn discard_recording(&self) -> Result<(), ArmError> {
-        let mut inner = self.inner.write().await;
-        inner.recorder.discard()?;
-        Ok(())
-    }
-
-    pub async fn get_recording_state(&self) -> (EpisodeState, usize) {
-        let inner = self.inner.read().await;
-        (inner.recorder.state().clone(), inner.recorder.frame_count())
     }
 
     /// Execute a control cycle step

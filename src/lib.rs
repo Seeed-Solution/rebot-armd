@@ -30,6 +30,7 @@ pub mod safety;
 #[cfg(not(target_arch = "wasm32"))] pub mod safety_describe;
 #[cfg(not(target_arch = "wasm32"))] pub mod sim_driver;
 #[cfg(not(target_arch = "wasm32"))] pub mod supervisor;
+#[cfg(not(target_arch = "wasm32"))] pub mod teach;
 pub mod torque_guard;
 pub mod trajectory;
 pub mod urdf;

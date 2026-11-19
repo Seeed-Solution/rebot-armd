@@ -33,9 +33,11 @@ pub struct ReplayRequest {
     /// Replay the gripper joint; false holds it where it is.
     pub gripper: bool,
     pub tag: Option<String>,
+    /// Replay an episode recorded with another joint zero (otherwise DATA_STALE).
+    pub allow_stale: bool,
 }
 
-/// `{episode, speed: 0.5 | 1.0 (default 0.5), gripper: bool (default true), tag?}`.
+/// `{episode, speed: 0.5 | 1.0 (default 0.5), gripper: bool (default true), allow_stale?: false, tag?}`.
 pub fn parse_replay(body: &Value) -> Result<ReplayRequest, MotionError> {
     let episode = body.get("episode").and_then(Value::as_str)
         .ok_or_else(|| MotionError::InvalidCommand("episode must be an episode id string".into()))?;
@@ -46,7 +48,8 @@ pub fn parse_replay(body: &Value) -> Result<ReplayRequest, MotionError> {
     if !REPLAY_SPEEDS.iter().any(|s| (s - speed).abs() < 1e-9) {
         return Err(MotionError::InvalidCommand(format!("speed must be one of {REPLAY_SPEEDS:?}")));
     }
-    Ok(ReplayRequest { episode: episode.into(), speed, gripper: motion::flag(body, "gripper", true)?, tag: motion::tag(body)? })
+    Ok(ReplayRequest { episode: episode.into(), speed, gripper: motion::flag(body, "gripper", true)?, tag: motion::tag(body)?,
+        allow_stale: motion::flag(body, "allow_stale", false)? })
 }
 
 /// Supervisor state a replay is checked against (taken under the lock).
@@ -72,6 +75,9 @@ pub struct ReplayInput {
     pub workspace_revision: u64,
     /// Power budget whose `planning` section time-scales the playback; None = none.
     pub power: Option<crate::power::PowerBudget>,
+    /// Episode store the episode is read from, and the joint zero in effect (stale check).
+    pub store: crate::recording::EpisodeStore,
+    pub zero_offsets: Vec<f32>,
 }
 
 /// A checked replay ready to install.
@@ -137,15 +143,21 @@ fn lerp_frames(a: &RecordFrame, b: &RecordFrame, t: f64) -> Vec<f32> {
 
 /// Load, resample and check an episode for replay. Pure (file read, no lock).
 pub fn plan(input: ReplayInput) -> Result<ReplayPlan, ArmError> {
-    let meta = match crate::recording::read_metadata_from_parquet(&input.path) {
-        Ok(m) => m,
-        Err(crate::recording::ParquetRecordingError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(rejected(404, "EPISODE_NOT_FOUND", format!("Episode '{}' not found", input.request.episode)));
-        }
-        Err(e) => {
-            return Err(rejected(422, "REPLAY_INVALID_EPISODE", format!("Failed to read episode metadata for '{}': {e}", input.request.episode)));
-        }
+    let id = &input.request.episode;
+    let sidecar = match input.store.get_or_adopt(id, &input.zero_offsets, &input.joint_names, input.profile_id.as_deref(), f64::from(input.control_hz)) {
+        Ok(s) => s,
+        Err(crate::recording::StoreError::NotFound(_)) => return Err(rejected(404, "EPISODE_NOT_FOUND", format!("Episode '{id}' not found"))),
+        Err(e) => return Err(rejected(422, "REPLAY_INVALID_EPISODE", format!("Failed to read episode '{id}': {e}"))),
     };
+    if sidecar.units != "rad" {
+        return Err(rejected(422, "REPLAY_INVALID_EPISODE", format!("Episode '{id}' is stored in '{}', not rad", sidecar.units)));
+    }
+    if !input.request.allow_stale && sidecar.joint_zero.stale_against(&input.zero_offsets) {
+        return Err(ArmError::detailed(409, "DATA_STALE", format!(
+            "Episode '{id}' was recorded with another joint zero (rev {}); replay it with allow_stale: true only after checking it", sidecar.joint_zero.rev),
+            serde_json::json!({"episode_id": id})));
+    }
+    let meta = Some(sidecar.metadata());
     if input.arm_dof == 5 {
         let has_arm_dof = meta.as_ref().and_then(|m| m.arm_dof).is_some();
         if !has_arm_dof {
@@ -454,6 +466,8 @@ impl SupervisorInner {
             epoch,
             workspace_revision: self.workspace_revision,
             power: self.power_budget().cloned(),
+            store: self.episodes.clone(),
+            zero_offsets: self.joint_zero_offsets.clone(),
             request,
         })
     }
@@ -529,8 +543,8 @@ mod tests {
     fn parse_rules() {
         let r = parse_replay(&serde_json::json!({"episode": "ep_1"})).unwrap();
         assert_eq!((r.speed, r.gripper), (0.5, true));
-        let r = parse_replay(&serde_json::json!({"episode": "ep_1", "speed": 1.0, "gripper": false, "tag": "x"})).unwrap();
-        assert_eq!((r.speed, r.gripper, r.tag.as_deref()), (1.0, false, Some("x")));
+        let r = parse_replay(&serde_json::json!({"episode": "ep_1", "speed": 1.0, "gripper": false, "tag": "x", "allow_stale": true})).unwrap();
+        assert_eq!((r.speed, r.gripper, r.tag.as_deref(), r.allow_stale), (1.0, false, Some("x"), true));
         for bad in [serde_json::json!({}), serde_json::json!({"episode": "../a"}), serde_json::json!({"episode": "a", "speed": 2.0}),
                     serde_json::json!({"episode": "a", "speed": 0.7}), serde_json::json!({"episode": "a", "gripper": 1})] {
             assert_eq!(parse_replay(&bad).unwrap_err().code(), "INVALID_COMMAND", "{bad}");
