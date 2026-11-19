@@ -361,6 +361,65 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .cwiz-jogbar .calib-live { padding: 4px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
 .cwiz-jogbar .btn { min-height: 38px; height: 38px; padding: 0 12px; font-size: 13px; white-space: nowrap; flex: 0 0 auto; touch-action: manipulation; }
 .cwiz-jog-why[hidden] { display: none; }
+/* ---------- teach panel (capabilities.teach v1) ---------- */
+.tch .calib-head { flex-shrink: 0; }
+.tch-tabs { display: flex; flex-shrink: 0; }
+.tch-tabs button { flex: 1 1 0; min-height: 40px; }
+.tch-body { gap: 10px; grid-template-columns: minmax(0, 1fr); }
+.tch-body > * { min-width: 0; }
+.tch-status { flex-shrink: 0; }
+.tch-status.bad { background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); }
+.tch.min .tch-tabs, .tch.min .tch-body, .tch.min .tch-status, .tch.min .tch-ask, .tch.min .tch-slot { display: none; }
+.tch.min { display: none; }
+.tch-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.tch-row .btn { min-height: 40px; padding: 0 12px; font-size: 13px; touch-action: manipulation; }
+.tch-row .grow { flex: 1 1 140px; min-width: 0; }
+.tch input[type=text], .tch input[type=number], .tch select { min-height: 40px; padding: 0 8px; font: inherit; font-size: 13px; border: 1px solid var(--sc-color-border); border-radius: var(--sc-radius-base);
+  background: var(--sc-color-bg); color: var(--sc-color-text); min-width: 0; max-width: 100%; }
+.tch input[type=number] { width: 72px; }
+.tch label.tch-chk { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+.tch label.tch-chk input { width: 20px; height: 20px; }
+.tch-k { font-size: 12px; color: var(--sc-color-text-secondary); }
+.tch-sec { font-size: 13px; font-weight: 600; color: var(--sc-color-text); margin-top: 4px; }
+.tch-list { list-style: none; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; margin: 0; padding: 0; }
+.tch-list > li { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; padding: 8px 10px; border-radius: var(--sc-radius-md); background: var(--sc-color-bg-sunken); border: 1px solid transparent; font-size: 13px; min-width: 0; }
+.tch-list > li.sel { border-color: var(--sc-color-primary); }
+.tch-list > li.run { border-color: var(--sc-status-normal-fg); background: var(--sc-status-normal-bg); box-shadow: 0 0 0 2px var(--sc-status-normal-bg); }
+.tch-list > li.empty { color: var(--sc-color-text-secondary); }
+.tch-li-h { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.tch-li-h b { font-weight: 600; color: var(--sc-color-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.tch-li-h .sp { flex: 1 1 auto; }
+.tch-n { flex-shrink: 0; min-width: 22px; height: 22px; padding: 0 5px; border-radius: 11px; display: inline-grid; place-items: center; font-size: 11px; font-weight: 600;
+  background: var(--sc-color-bg-container); color: var(--sc-color-text-secondary); border: 1px solid var(--sc-color-border); }
+.tch-bd { flex-shrink: 0; font-size: 11px; line-height: 1; padding: 4px 6px; border-radius: 8px; background: var(--sc-color-bg-container); color: var(--sc-color-text-secondary); border: 1px solid var(--sc-color-border); white-space: nowrap; }
+.tch-bd.stale, .tch-bd.miss { background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); border-color: #ffd591; }
+.tch-bd.ab { background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); border-color: #ffccc7; }
+.tch-sub { font-size: 12px; color: var(--sc-color-text-secondary); overflow-wrap: anywhere; }
+.tch-acts { display: flex; flex-wrap: wrap; gap: 6px; }
+.tch-acts .btn { min-height: 36px; padding: 0 10px; font-size: 12px; touch-action: manipulation; }
+.tch-acts .btn.armed, .tch-del.armed { background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); border-color: #ffccc7; }
+.tch-acts a.btn { display: inline-flex; align-items: center; text-decoration: none; }
+.tch-box { display: grid; gap: 8px; padding: 10px; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border); }
+.tch-prog { font-size: 13px; font-weight: 600; color: var(--sc-status-normal-fg); }
+.tch-stop { color: #fff !important; background: var(--sc-estop) !important; border-color: var(--sc-estop) !important; }
+.tch-ask { flex-shrink: 0; display: grid; gap: 8px; padding: 10px 12px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); border: 1px solid #ffd591; font-size: 13px; }
+.tch-ask[hidden] { display: none; }
+.tch-warn-btn { color: var(--sc-status-warning-fg); border-color: #ffd591; }
+.tch-bar { display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; min-width: 0; }
+.tch-bar[hidden] { display: none; }
+.tch-bar .btn { min-height: 40px; height: 40px; padding: 0 10px; font-size: 13px; white-space: nowrap; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; touch-action: manipulation; }
+.tch-bar .tb-rec.on { color: #fff; background: var(--sc-status-danger-fg); border-color: var(--sc-status-danger-fg); }
+.tch-bar .tb-x { display: none; flex: 0 0 auto; width: 40px; padding: 0; }
+.tch-slot .tch-bar { flex-wrap: wrap; }
+.tch-slot .tch-bar .btn { flex: 1 1 auto; }
+/* collapsed panel: the bar floats on the video top edge (dockOnVideo) */
+.tch-bar.float { position: fixed; z-index: 1041; top: 8px; left: 50%; transform: translateX(-50%); box-sizing: border-box; width: max-content; max-width: calc(100% - 16px); height: 48px;
+  padding: 4px; border-radius: 14px; background: var(--sc-color-bg-container); border: 1px solid var(--sc-color-border); box-shadow: 0 6px 18px rgba(15, 23, 42, 0.22); }
+.tch-bar.float .tb-x { display: inline-block; }
+@media (max-width: 640px) {
+  .tch.calib-drawer { max-height: 62dvh; }
+  .tch-bar.float .btn { padding: 0 8px; font-size: 12px; }
+}
 @media (max-width: 640px) {
   .cwiz-mask .calib-drawer { max-height: 66dvh; }
   .cwiz.min { max-height: none; }
@@ -1911,6 +1970,36 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
   <button class="btn" id="cwiz-jog-back" type="button"></button>
   <button class="btn btn-primary" id="cwiz-jog-cap" type="button"></button>
 </div>
+<!-- teach panel (capabilities.teach v1): non-modal like the calibration wizard; tabs sequences / poses / trajectories -->
+<div class="calib-mask cwiz-mask" id="teach" hidden>
+  <aside class="calib-drawer cwiz tch" id="teach-panel" role="dialog" aria-modal="false" aria-labelledby="teach-h">
+    <div class="calib-head">
+      <h3 id="teach-h" data-i18n="tch.title">示教</h3>
+      <div class="cwiz-head-acts">
+        <button class="btn calib-x" id="teach-min" type="button" data-i18n-aria="cw.min" aria-label="收起">–</button>
+        <button class="btn calib-x" id="teach-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+      </div>
+    </div>
+    <div class="tch-slot" id="teach-bar-slot"></div>
+    <div class="seg tch-tabs" id="teach-tabs" role="tablist" data-i18n-aria="tch.title" aria-label="示教">
+      <button type="button" role="tab" id="teach-tab-seq" data-tab="seq" data-i18n="tch.tab.seq">序列</button><button type="button" role="tab" id="teach-tab-pose" data-tab="pose" data-i18n="tch.tab.pose">点位</button><button type="button" role="tab" id="teach-tab-ep" data-tab="ep" data-i18n="tch.tab.ep">轨迹</button>
+    </div>
+    <div class="tch-ask" id="teach-ask" role="alertdialog" aria-labelledby="teach-ask-t" hidden>
+      <b id="teach-ask-t"></b>
+      <div class="tch-row"><button class="btn tch-warn-btn" id="teach-ask-yes" type="button"></button><button class="btn" id="teach-ask-no" type="button"></button></div>
+    </div>
+    <div class="cwiz-body tch-body" id="teach-body" role="tabpanel"></div>
+    <div class="calib-live tch-status" id="teach-status" role="status" aria-live="polite">--</div>
+  </aside>
+</div>
+<!-- teach bar: in the panel while hand-guiding / jogging; when the panel is collapsed it docks at the top edge of the video -->
+<div class="tch-bar" id="teach-bar" role="group" data-i18n-aria="tch.bar" aria-label="示教工具条" hidden>
+  <button class="btn btn-primary" id="tb-pose" type="button" data-i18n="tch.b.pose">记点</button>
+  <button class="btn tb-rec" id="tb-rec" type="button" data-i18n="tch.b.rec">● 录轨迹</button>
+  <button class="btn" id="tb-open" type="button" data-i18n="tch.b.open" data-i18n-title="tch.b.open.t" title="张开夹爪（序列打开时加一步）">夹爪开</button>
+  <button class="btn" id="tb-close" type="button" data-i18n="tch.b.close" data-i18n-title="tch.b.close.t" title="闭合夹爪（序列打开时加一步）">夹爪闭</button>
+  <button class="btn tb-x" id="tb-expand" type="button" data-i18n-aria="tch.b.expand" aria-label="展开示教面板">▴</button>
+</div>
 <div class="calib-mask" id="gset" hidden>
   <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="gset-title">
     <div class="calib-head">
@@ -1990,6 +2079,11 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <div class="calib-head">
       <h3 id="sset-h" data-i18n="sset.title">设置</h3>
       <button class="btn calib-x" id="sset-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+    </div>
+    <div class="gset-row" id="teach-set" hidden>
+      <div class="gset-k"><span data-i18n="tch.title">示教</span></div>
+      <small data-i18n="tch.set.desc">记点位、录轨迹，把它们排成序列运行；运行时可以同时录制。</small>
+      <button class="btn btn-primary" id="teach-open" type="button" data-i18n="tch.set.open">打开示教</button>
     </div>
     <div class="gset-row" id="tools-set" hidden>
       <div class="gset-k"><span data-i18n="tools.title">工具</span></div>
@@ -2617,6 +2711,77 @@ Object.assign(I18N.en, {
   'cw.f.fitrow': 'held-out {ab} / {ba} mm, {n} views',
   'cw.g.kin_views': 'Views per placement (smaller)', 'cw.g.kin_heldout_ab': 'Held-out error A → B', 'cw.g.kin_heldout_ba': 'Held-out error B → A', 'cw.g.kin_improve': 'Reduction vs uncorrected (mean of both)', 'cw.g.kin_bounds': 'Parameters out of range',
 });
+// teach panel (tch.*)
+Object.assign(I18N.zh, {
+  'tch.title': '示教', 'tch.bar': '示教工具条', 'tch.set.desc': '记点位、录轨迹，把它们排成序列运行；运行时可以同时录制。', 'tch.set.open': '打开示教',
+  'tch.tab.seq': '序列', 'tch.tab.pose': '点位', 'tch.tab.ep': '轨迹',
+  'tch.b.pose': '记点', 'tch.b.rec': '● 录轨迹', 'tch.b.recon': '■ 停止 {t}', 'tch.b.open': '夹爪开', 'tch.b.close': '夹爪闭', 'tch.b.open.t': '张开夹爪（序列打开时加一步）', 'tch.b.close.t': '闭合夹爪（序列打开时加一步）', 'tch.b.expand': '展开示教面板',
+  'tch.loading': '加载中…', 'tch.counts': '{s} 个序列 · {p} 个点位 · {e} 条轨迹', 'tch.e.load': '加载失败：{e}',
+  'tch.seq.name': '序列名称', 'tch.seq.new': '新建序列', 'tch.seq.new.ph': '新序列名称', 'tch.seq.empty': '还没有序列',
+  'tch.seq.hint': '序列按顺序执行点位、夹爪、等待和轨迹回放。打开一个序列后，「记点」「录轨迹」和夹爪按钮会把步骤加到选中步骤之后。',
+  'tch.seq.steps': '{n} 步', 'tch.seq.edit': '编辑', 'tch.run': '运行', 'tch.back': '← 序列', 'tch.save': '保存', 'tch.saved': '已保存',
+  'tch.del': '删除', 'tch.del.confirm': '确认删除', 'tch.cancel': '取消',
+  'tch.st.empty': '还没有步骤：用下方按钮或示教工具条添加。', 'tch.st.pose': '点位 {n}', 'tch.st.replay': '轨迹 {n}', 'tch.st.grip.open': '夹爪张开',
+  'tch.st.grip.close': '夹爪闭合', 'tch.st.grip.move': '夹爪到 {p}%', 'tch.st.wait': '等待', 'tch.st.del': '删除这一步', 'tch.st.added': '已加入第 {n} 步：{s}',
+  'tch.missing': '已不存在', 'tch.stale': '⚠ 旧零位', 'tch.speed': '速度', 'tch.grip': '夹爪', 'tch.grip.keep': '保持', 'tch.grip.pose': '按点位',
+  'tch.wait.s': '秒', 'tch.up': '上移', 'tch.down': '下移', 'tch.from': '从这里运行', 'tch.single': '单步',
+  'tch.add': '添加步骤', 'tch.add.pose': '+ 点位', 'tch.add.ep': '+ 轨迹', 'tch.add.open': '+ 夹爪开', 'tch.add.close': '+ 夹爪闭', 'tch.add.wait': '+ 等待 1 s',
+  'tch.pose.empty': '没有点位', 'tch.ep.empty': '没有轨迹',
+  'tch.runbox': '运行', 'tch.repeat': '重复次数', 'tch.runrec': '运行时录制', 'tch.ds': '数据集', 'tch.task': '任务', 'tch.task.ph': '默认：{n}', 'tch.task.ph0': '例如：把方块放进左边的盒子',
+  'tch.single.sel': '单步（选中的一步）', 'tch.stop': '停止',
+  'tch.prog': '运行中 · 第 {i}/{n} 步 · 第 {r}/{m} 遍 {s}', 'tch.ph.approach': '· 移动到起点', 'tch.ph.move': '· 移动', 'tch.ph.wait': '· 等待', 'tch.ph.gripper': '· 夹爪', 'tch.ph.replay': '· 回放', 'tch.ph.settle': '· 到位确认',
+  'tch.run.started': '开始运行「{n}」（{r} 遍）', 'tch.run.single': '单步运行第 {n} 步', 'tch.run.done': '序列运行完成', 'tch.run.ended': '序列结束（{code}）：{m}',
+  'tch.enable_first': '先使能机械臂，再运行', 'tch.unsaved': '有未保存的修改：再点一次「← 序列」放弃修改',
+  'tch.seq.created': '已新建「{n}」，保存后才能运行', 'tch.seq.saved': '已保存「{n}」', 'tch.seq.deleted': '已删除「{n}」',
+  'tch.e.name': '名称只能用中文、英文字母、数字、空格、下划线或短横线，最多 64 个字符', 'tch.e.dup': '已有同名序列', 'tch.e.max': '一个序列最多 200 步',
+  'tch.e.IN_USE': '正在被序列使用：{s}。先从这些序列里删掉相关步骤。', 'tch.e.SEQUENCE_REF_MISSING': '第 {n} 步引用的点位或轨迹已不存在',
+  'tch.e.SEQUENCE_CONFLICT': '这个序列在别处被修改过：返回列表重新打开后再改', 'tch.e.DATA_STALE': '引用的点位或轨迹是按旧零位记录的：{m}',
+  'tch.e.PLAN_STALE': '运行前检查时状态已变化，请重试：{m}', 'tch.e.CALIBRATION_CHANGED': '运行期间标定或零位被修改，已停止：{m}',
+  'tch.e.RECORDER_BUSY': '录制器正被 {o} 使用', 'tch.e.RECORDER_NOT_OWNER': '这段录制不是本页开始的', 'tch.e.RECORD_NO_SPACE': '存储空间不足（少于 200 MB），无法录制',
+  'tch.e.rename_na': '当前 armd 不支持重命名点位', 'tch.e.UNSUPPORTED': '当前 armd 不支持这个操作：{m}',
+  'tch.ask.seq': '序列里有按旧零位记录的点位或轨迹，机械臂实际到达的位置会不同。确认工作区安全后才继续。', 'tch.ask.ep': '这条轨迹是按旧零位录制的，回放时机械臂实际位置会不同。确认工作区安全后才继续。',
+  'tch.ask.yes': '仍然运行',
+  'tch.pose.hint': '点位按关节角度保存。删除或重命名前先看「被使用」。', 'tch.usedby': '被使用：{s}', 'tch.unused': '未被序列使用', 'tch.rename': '重命名', 'tch.renamed': '已把 {a} 改名为 {b}',
+  'tch.rec.to': '录到', 'tch.ds.new': '新数据集名称', 'tch.ds.create': '新建', 'tch.ds.created': '已新建数据集 {n}', 'tch.ds.head': '{n} · {c} 条 · {d}',
+  'tch.ep.none': '这个数据集还没有轨迹', 'tch.ep.edit': '编辑', 'tch.ep.dl': '下载', 'tch.ep.aborted': '中断', 'tch.ep.updated': '已更新', 'tch.frames': '{n} 帧',
+  'tch.rec.started': '开始录制 → {d}', 'tch.rec.saved': '已保存轨迹 {n}（{d}）',
+  'tch.src.hand_guide': '拖动', 'tch.src.jog': '摇杆', 'tch.src.servo': '遥操作', 'tch.src.replay': '回放', 'tch.src.sequence': '序列', 'tch.src.import': '导入', 'tch.src.sdk': 'SDK',
+});
+Object.assign(I18N.en, {
+  'tch.title': 'Teach', 'tch.bar': 'Teach toolbar', 'tch.set.desc': 'Save poses, record trajectories and run them as sequences; a run can record itself.', 'tch.set.open': 'Open Teach',
+  'tch.tab.seq': 'Sequences', 'tch.tab.pose': 'Poses', 'tch.tab.ep': 'Trajectories',
+  'tch.b.pose': 'Save pose', 'tch.b.rec': '● Record', 'tch.b.recon': '■ Stop {t}', 'tch.b.open': 'Open', 'tch.b.close': 'Close', 'tch.b.open.t': 'Open the gripper (adds a step when a sequence is open)', 'tch.b.close.t': 'Close the gripper (adds a step when a sequence is open)', 'tch.b.expand': 'Expand the Teach panel',
+  'tch.loading': 'Loading…', 'tch.counts': '{s} sequences · {p} poses · {e} trajectories', 'tch.e.load': 'Loading failed: {e}',
+  'tch.seq.name': 'Sequence name', 'tch.seq.new': 'New sequence', 'tch.seq.new.ph': 'New sequence name', 'tch.seq.empty': 'No sequences yet',
+  'tch.seq.hint': 'A sequence runs poses, gripper actions, waits and trajectory replays in order. With a sequence open, "Save pose", "Record" and the gripper buttons add a step after the selected one.',
+  'tch.seq.steps': '{n} steps', 'tch.seq.edit': 'Edit', 'tch.run': 'Run', 'tch.back': '← Sequences', 'tch.save': 'Save', 'tch.saved': 'Saved',
+  'tch.del': 'Delete', 'tch.del.confirm': 'Confirm delete', 'tch.cancel': 'Cancel',
+  'tch.st.empty': 'No steps yet: add them below or with the teach toolbar.', 'tch.st.pose': 'Pose {n}', 'tch.st.replay': 'Trajectory {n}', 'tch.st.grip.open': 'Open gripper',
+  'tch.st.grip.close': 'Close gripper', 'tch.st.grip.move': 'Gripper to {p}%', 'tch.st.wait': 'Wait', 'tch.st.del': 'Delete this step', 'tch.st.added': 'Added step {n}: {s}',
+  'tch.missing': 'missing', 'tch.stale': '⚠ old zero', 'tch.speed': 'Speed', 'tch.grip': 'Gripper', 'tch.grip.keep': 'keep', 'tch.grip.pose': 'from pose',
+  'tch.wait.s': 's', 'tch.up': 'Move up', 'tch.down': 'Move down', 'tch.from': 'Run from here', 'tch.single': 'Step',
+  'tch.add': 'Add a step', 'tch.add.pose': '+ Pose', 'tch.add.ep': '+ Trajectory', 'tch.add.open': '+ Open', 'tch.add.close': '+ Close', 'tch.add.wait': '+ Wait 1 s',
+  'tch.pose.empty': 'No poses', 'tch.ep.empty': 'No trajectories',
+  'tch.runbox': 'Run', 'tch.repeat': 'Repeat', 'tch.runrec': 'Record while running', 'tch.ds': 'Dataset', 'tch.task': 'Task', 'tch.task.ph': 'Default: {n}', 'tch.task.ph0': 'e.g. put the cube into the left bin',
+  'tch.single.sel': 'Single step (selected)', 'tch.stop': 'Stop',
+  'tch.prog': 'Running · step {i}/{n} · repeat {r}/{m} {s}', 'tch.ph.approach': '· to the start', 'tch.ph.move': '· moving', 'tch.ph.wait': '· waiting', 'tch.ph.gripper': '· gripper', 'tch.ph.replay': '· replaying', 'tch.ph.settle': '· settling',
+  'tch.run.started': 'Running "{n}" ({r}×)', 'tch.run.single': 'Single step {n}', 'tch.run.done': 'Sequence done', 'tch.run.ended': 'Sequence ended ({code}): {m}',
+  'tch.enable_first': 'Enable the arm first, then run', 'tch.unsaved': 'Unsaved changes: tap "← Sequences" again to discard them',
+  'tch.seq.created': 'Created "{n}"; save it before running', 'tch.seq.saved': 'Saved "{n}"', 'tch.seq.deleted': 'Deleted "{n}"',
+  'tch.e.name': 'Names use letters (incl. Chinese), digits, spaces, _ or -, up to 64 characters', 'tch.e.dup': 'A sequence with this name exists', 'tch.e.max': 'A sequence has at most 200 steps',
+  'tch.e.IN_USE': 'Used by the sequences {s}. Remove those steps first.', 'tch.e.SEQUENCE_REF_MISSING': 'Step {n} references a pose or trajectory that no longer exists',
+  'tch.e.SEQUENCE_CONFLICT': 'This sequence was changed elsewhere: go back to the list and open it again', 'tch.e.DATA_STALE': 'A referenced pose or trajectory was taught with the old zero: {m}',
+  'tch.e.PLAN_STALE': 'The state changed during the checks; try again: {m}', 'tch.e.CALIBRATION_CHANGED': 'Calibration or zero changed during the run; stopped: {m}',
+  'tch.e.RECORDER_BUSY': 'The recorder is in use by {o}', 'tch.e.RECORDER_NOT_OWNER': 'This recording was not started by this page', 'tch.e.RECORD_NO_SPACE': 'Not enough storage (less than 200 MB) to record',
+  'tch.e.rename_na': 'This armd cannot rename poses', 'tch.e.UNSUPPORTED': 'This armd does not support this: {m}',
+  'tch.ask.seq': 'The sequence uses poses or trajectories taught with the old zero; the arm reaches different positions. Continue only when the workspace is clear.', 'tch.ask.ep': 'This trajectory was recorded with the old zero; the replay reaches different positions. Continue only when the workspace is clear.',
+  'tch.ask.yes': 'Run anyway',
+  'tch.pose.hint': 'Poses are stored as joint angles. Check "Used by" before deleting or renaming.', 'tch.usedby': 'Used by: {s}', 'tch.unused': 'Not used by a sequence', 'tch.rename': 'Rename', 'tch.renamed': 'Renamed {a} to {b}',
+  'tch.rec.to': 'Record to', 'tch.ds.new': 'New dataset name', 'tch.ds.create': 'Create', 'tch.ds.created': 'Created dataset {n}', 'tch.ds.head': '{n} · {c} episodes · {d}',
+  'tch.ep.none': 'No trajectories in this dataset yet', 'tch.ep.edit': 'Edit', 'tch.ep.dl': 'Download', 'tch.ep.aborted': 'aborted', 'tch.ep.updated': 'Updated', 'tch.frames': '{n} frames',
+  'tch.rec.started': 'Recording → {d}', 'tch.rec.saved': 'Saved trajectory {n} ({d})',
+  'tch.src.hand_guide': 'hand-guide', 'tch.src.jog': 'jog', 'tch.src.servo': 'teleop', 'tch.src.replay': 'replay', 'tch.src.sequence': 'sequence', 'tch.src.import': 'import', 'tch.src.sdk': 'SDK',
+});
 let LANG = (() => {
   const saved = store('lang');
   if (saved === 'zh' || saved === 'en') return saved;
@@ -3107,6 +3272,7 @@ function connectWS() {
     renderPower(o);
     graspOnObs(o);
     epOnObs(o);
+    teachOnObs(o);
     syncEpoch(o.epoch_id);
     const st = parseState(o.safety_state);
     const wasStopped = isStopped();
@@ -5971,7 +6137,7 @@ async function loadSchema() {
         const rmaxEl = $('c-rmax');
         if (rmaxEl) rmaxEl.textContent = Math.round(CFG.cart.reachMax * 1000);
       }
-      colOnCaps(); posesOnCaps(); epOnCaps(); V3.sceneAt = 0;
+      colOnCaps(); posesOnCaps(); epOnCaps(); teachOnCaps(); V3.sceneAt = 0;
     }
     if (sc && Array.isArray(sc.model_joint_map) && sc.model_joint_map.length >= 6) applyJointMap(sc.model_joint_map);
     if (sc && Array.isArray(sc.limits) && sc.limits.length) {
@@ -9449,6 +9615,703 @@ $('pose-list').addEventListener('click', (e) => {
   else if (b.classList.contains('pose-del')) poseDelete(li.dataset.name);
 });
 i18nHooks.push(() => { if (!$('pset').hidden) { posesRender(); poseNameCheck(); } });
+
+/* =================================================================
+   Teach panel (capabilities.teach.version >= 1): sequences / poses / trajectories (episodes).
+   GET /api/v1/sequences, /api/v1/poses, /api/v1/episodes, /api/v1/datasets; WS (lease): sequences/save|delete,
+   poses/save|delete, action run_sequence / replay / gripper; WS without a lease (recorder ownership): record/start|stop,
+   episodes/update|delete, datasets/create. Server strings only through textContent (cwEl / setText).
+   ================================================================= */
+const TCH = {
+  open: false, min: false, tab: 'seq', loaded: false,
+  seqs: [], poses: [], eps: [], dsets: [], cur: null, dirty: false, sel: -1,
+  ds: store('rebot.teach.ds') || 'default', task: store('rebot.teach.task') || '',
+  repeat: 1, runRec: false, runDs: null, runTask: '',
+  rec: null,            // { startedAt, dataset } while this page owns the recorder
+  run: null,            // { actionId, seqId, n } of the sequence started here
+  play: null,           // action id of a replay started here
+  toasted: null, armed: null, armTimer: 0, edit: null, ask: null, busy: false,
+  epSpeed: 0.5, epGrip: true, barKey: '',
+};
+const teachOn = () => !!(S.caps && S.caps.teach && Number(S.caps.teach.version) >= 1);
+const TCH_SEQ_NAME = /^[A-Za-z0-9_\- \p{Script=Han}]{1,64}$/u;
+const TCH_SPEEDS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+// commands that need no motion lease: sent on the control WebSocket without a generation (armd teach::is_lease_free)
+function teachCmd(path, body, timeoutMs = 5000) {
+  if (!S.ws || S.ws.readyState !== 1) return Promise.reject(Object.assign(new Error(t('gc.b.offline')), { code: 'CONNECTION' }));
+  const request_id = ++nextRequestId, ws = S.ws;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { pendingCommands.delete(request_id); reject(Object.assign(new Error(t('err.cmdtimeout')), { code: 'COMMAND_TIMEOUT' })); }, timeoutMs);
+    pendingCommands.set(request_id, { resolve, reject, timer, ws });
+    try { ws.send(JSON.stringify({ type: 'command', request_id, path, body: body || {}, client_id: CLIENT_ID })); }
+    catch (error) { clearTimeout(timer); pendingCommands.delete(request_id); reject(error); }
+  });
+}
+async function teachGet(path) {
+  const res = await fetch(path, { cache: 'no-store' });
+  let d = null; try { d = await res.json(); } catch (_) {}
+  if (!res.ok) throw Object.assign(new Error((d && (d.message || d.error)) || 'HTTP ' + res.status), { code: (d && d.code) || String(res.status) });
+  return d || {};
+}
+// error text: teach code, then the replay / pose texts, then armd's message
+function teachErr(e) {
+  const c = (e && e.code) || '', m = (e && e.message) || '';
+  if (c === 'IN_USE') {
+    const ids = (e.reply && Array.isArray(e.reply.sequences)) ? e.reply.sequences : [];
+    return t('tch.e.IN_USE', { s: ids.map((id) => teachSeqName(id)).join(', ') || '?' });
+  }
+  if (c === 'SEQUENCE_REF_MISSING') { const st = e.reply && e.reply.step; return t('tch.e.SEQUENCE_REF_MISSING', { n: Number.isInteger(st) ? st + 1 : '?' }); }
+  for (const k of ['tch.e.' + c, 'ep.code.' + c, 'pose.code.' + c]) if (I18N.zh[k] !== undefined) return t(k, { m });
+  if (c === 'LEASE_ACTIVE' || c === 'LEASE_REQUIRED') return m;
+  return m || c || t('err.rejected');
+}
+function teachStatus(msg, bad) { const el = $('teach-status'); setText(el, msg || '--'); el.classList.toggle('bad', !!bad); }
+const teachSeqName = (id) => { const s = TCH.seqs.find((x) => x.id === id); return s ? s.name : id; };
+const teachPose = (id) => TCH.poses.find((p) => p.id === id) || null;
+const teachEp = (id) => TCH.eps.find((e) => e.id === id) || null;
+const teachEpName = (e) => (e.task ? e.task : '#' + String(e.id).slice(-6));
+function teachWhen(s) {
+  const d = new Date(s); if (!(d.getTime() > 0)) return '';
+  return d.toLocaleString(LANG === 'zh' ? 'zh-CN' : 'en-GB', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+async function teachLoad(quiet) {
+  if (!quiet) teachStatus(t('tch.loading'));
+  try {
+    const [sq, ps, ep, ds] = await Promise.all([teachGet('/api/v1/sequences'), teachGet('/api/v1/poses'), teachGet('/api/v1/episodes?limit=500'), teachGet('/api/v1/datasets')]);
+    TCH.seqs = Array.isArray(sq.sequences) ? sq.sequences : [];
+    TCH.poses = Array.isArray(ps.poses) ? ps.poses : [];
+    TCH.eps = Array.isArray(ep.episodes) ? ep.episodes : [];
+    TCH.dsets = Array.isArray(ds.datasets) ? ds.datasets : [];
+    // the recorder this page owns (after a reload the owner is a new connection: armd discards it)
+    const r = ep.recording;
+    if (TCH.rec && !(r && r.owner === CLIENT_ID)) teachRecSet(null);
+    TCH.loaded = true;
+    if (TCH.cur && TCH.cur.id && !TCH.dirty) { const s = TCH.seqs.find((x) => x.id === TCH.cur.id); if (s) TCH.cur = JSON.parse(JSON.stringify(s)); }
+    if (!quiet) teachStatus(t('tch.counts', { s: TCH.seqs.length, p: TCH.poses.length, e: TCH.eps.length }));
+  } catch (e) { teachStatus(t('tch.e.load', { e: teachErr(e) }), true); }
+  teachRender();
+}
+function teachOnCaps() {
+  const on = teachOn();
+  $('teach-set').hidden = !on;
+  if (!on && TCH.open) teachOpen(false);
+  teachBarRender();
+}
+function teachOpen(open, { min = false, tab } = {}) {
+  TCH.open = !!open && teachOn();
+  if (tab) TCH.tab = tab;
+  $('teach').hidden = !TCH.open;
+  TCH.min = TCH.open && min;
+  $('teach-panel').classList.toggle('min', TCH.min);
+  if (TCH.open) { teachRender(); teachLoad(true); if (!TCH.min) $('teach-close').focus({ preventScroll: true }); }
+  teachBarRender();
+}
+function teachMin(min) { TCH.min = !!min; $('teach-panel').classList.toggle('min', TCH.min); teachBarRender(); if (!TCH.min) teachRender(); }
+const teachDisarm = () => { TCH.armed = null; clearTimeout(TCH.armTimer); };
+// two taps: the first arms the button for 3 s
+function teachArm(key) {
+  if (TCH.armed === key) { teachDisarm(); return true; }
+  TCH.armed = key; clearTimeout(TCH.armTimer);
+  TCH.armTimer = setTimeout(() => { TCH.armed = null; teachRender(); }, 3000);
+  teachRender(); return false;
+}
+function tchBtn(label, fn, cls = '', disabled = false) { return cwBtn(label, fn, { cls, disabled }); }
+function tchSelect(opts, value, onChange, aria) {
+  const s = document.createElement('select');
+  for (const [v, txt] of opts) { const o = document.createElement('option'); o.value = String(v); o.textContent = txt; s.appendChild(o); }
+  s.value = String(value);
+  if (aria) s.setAttribute('aria-label', aria);
+  s.addEventListener('change', () => onChange(s.value));
+  return s;
+}
+function tchInput(value, onInput, { type = 'text', aria = '', ph = '', min, max, step, cls = '' } = {}) {
+  const i = document.createElement('input'); i.type = type; i.value = value == null ? '' : String(value);
+  i.spellcheck = false; i.autocomplete = 'off'; if (cls) i.className = cls;
+  if (aria) i.setAttribute('aria-label', aria); if (ph) i.placeholder = ph;
+  if (min != null) i.min = String(min); if (max != null) i.max = String(max); if (step != null) i.step = String(step);
+  i.addEventListener(type === 'number' ? 'change' : 'input', () => onInput(i.value, i));
+  return i;
+}
+function tchBadge(text, cls = '') { return cwEl('span', 'tch-bd ' + cls, text); }
+const tchSrc = (s) => (I18N.zh['tch.src.' + s] !== undefined ? t('tch.src.' + s) : s || '?');
+function teachDsNames() {
+  const n = new Set(['default', ...TCH.dsets.map((d) => d.name), ...TCH.eps.map((e) => e.dataset).filter(Boolean)]);
+  if (TCH.ds) n.add(TCH.ds);
+  return [...n];
+}
+// a sequence step references stale data (joint zero changed since taught / recorded)
+function teachStepStale(st) {
+  if (st.type === 'pose') { const p = teachPose(st.pose_id); return !!(p && p.stale); }
+  if (st.type === 'replay') { const e = teachEp(st.episode_id); return !!(e && e.stale); }
+  return false;
+}
+function teachStepMissing(st) {
+  if (st.type === 'pose') return !teachPose(st.pose_id);
+  if (st.type === 'replay') return !teachEp(st.episode_id);
+  return false;
+}
+const teachSeqStale = (s) => (s.steps || []).some(teachStepStale);
+function teachUsedBy(kind, id) {
+  return TCH.seqs.filter((s) => (s.steps || []).some((st) => (kind === 'pose' ? st.type === 'pose' && st.pose_id === id : st.type === 'replay' && st.episode_id === id))).map((s) => s.name);
+}
+
+/* ---- render ---- */
+function teachRender() {
+  if (!TCH.open) return;
+  for (const b of $('teach-tabs').children) {
+    const on = b.dataset.tab === TCH.tab;
+    b.classList.toggle('on', on); b.setAttribute('aria-selected', String(on)); b.tabIndex = on ? 0 : -1;
+  }
+  $('teach-body').setAttribute('aria-labelledby', 'teach-tab-' + TCH.tab);
+  teachAskRender();
+  const body = $('teach-body');
+  const keep = body.scrollTop;
+  body.textContent = '';
+  if (TCH.tab === 'seq') { if (TCH.cur) teachRenderEditor(body); else teachRenderSeqs(body); }
+  else if (TCH.tab === 'pose') teachRenderPoses(body);
+  else teachRenderEps(body);
+  body.scrollTop = keep;
+  teachLive();
+  teachBarRender();
+}
+function teachRenderSeqs(body) {
+  const nw = cwEl('div', 'tch-row');
+  const name = tchInput('', () => {}, { aria: t('tch.seq.name'), ph: t('tch.seq.new.ph'), cls: 'grow' });
+  name.maxLength = 64; name.id = 'tch-new-name';
+  name.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); teachNewSeq(name.value); } });
+  nw.append(name, tchBtn(t('tch.seq.new'), () => teachNewSeq(name.value), 'btn-primary'));
+  body.appendChild(nw);
+  body.appendChild(cwEl('p', 'tch-k', t('tch.seq.hint')));
+  const ol = cwEl('ol', 'tch-list'); ol.id = 'tch-seqs';
+  if (!TCH.seqs.length) ol.appendChild(cwEl('li', 'empty', TCH.loaded ? t('tch.seq.empty') : '--'));
+  for (const s of TCH.seqs) {
+    const li = cwEl('li'); li.dataset.id = s.id;
+    const h = cwEl('div', 'tch-li-h');
+    h.append(cwEl('b', '', s.name), cwEl('span', 'sp'));
+    if (teachSeqStale(s)) h.appendChild(tchBadge(t('tch.stale'), 'stale'));
+    h.appendChild(tchBadge(t('tch.seq.steps', { n: (s.steps || []).length })));
+    li.appendChild(h);
+    if (s.description) li.appendChild(cwEl('div', 'tch-sub', s.description));
+    const a = cwEl('div', 'tch-acts');
+    a.append(tchBtn(t('tch.seq.edit'), () => teachEdit(s.id)), tchBtn(t('tch.run'), () => { teachEdit(s.id); teachRun({}); }, 'btn-primary'));
+    li.appendChild(a);
+    ol.appendChild(li);
+  }
+  body.appendChild(ol);
+}
+function teachStepTitle(st) {
+  if (st.type === 'pose') { const p = teachPose(st.pose_id); return t('tch.st.pose', { n: p ? p.name : t('tch.missing') }); }
+  if (st.type === 'replay') { const e = teachEp(st.episode_id); return t('tch.st.replay', { n: e ? teachEpName(e) : t('tch.missing') }); }
+  if (st.type === 'gripper') return st.action === 'move' ? t('tch.st.grip.move', { p: Math.round((st.fraction ?? 0) * 100) }) : t('tch.st.grip.' + (st.action === 'close' ? 'close' : 'open'));
+  if (st.type === 'wait') return t('tch.st.wait');
+  return st.type;
+}
+function teachRenderEditor(body) {
+  const c = TCH.cur, running = teachRunning();
+  const head = cwEl('div', 'tch-row');
+  head.appendChild(tchBtn(t('tch.back'), teachBackToList));
+  const nm = tchInput(c.name, (v) => { c.name = v; teachDirty(); }, { aria: t('tch.seq.name'), cls: 'grow' }); nm.maxLength = 64; nm.id = 'tch-seq-name';
+  head.appendChild(nm);
+  body.appendChild(head);
+  const acts = cwEl('div', 'tch-row');
+  const save = tchBtn(TCH.dirty || !c.id ? t('tch.save') : t('tch.saved'), () => teachSave(), TCH.dirty || !c.id ? 'btn-primary' : '', TCH.busy || running);
+  save.id = 'tch-save';
+  acts.appendChild(save);
+  if (c.id) { const d = tchBtn(TCH.armed === 'seqdel' ? t('tch.del.confirm') : t('tch.del'), () => teachDelSeq(), 'tch-del' + (TCH.armed === 'seqdel' ? ' armed' : ''), running); d.id = 'tch-seq-del'; acts.appendChild(d); }
+  body.appendChild(acts);
+  // steps
+  const ol = cwEl('ol', 'tch-list'); ol.id = 'tch-steps';
+  if (!c.steps.length) ol.appendChild(cwEl('li', 'empty', t('tch.st.empty')));
+  c.steps.forEach((st, i) => {
+    const li = cwEl('li'); li.dataset.i = String(i);
+    li.classList.toggle('sel', TCH.sel === i);
+    li.addEventListener('click', (e) => { if (e.target.closest('button, input, select')) return; TCH.sel = i; for (const x of ol.children) x.classList.toggle('sel', x === li); });
+    const h = cwEl('div', 'tch-li-h');
+    h.append(cwEl('span', 'tch-n', String(i + 1)), cwEl('b', '', teachStepTitle(st)), cwEl('span', 'sp'));
+    if (teachStepMissing(st)) h.appendChild(tchBadge(t('tch.missing'), 'miss'));
+    else if (teachStepStale(st)) h.appendChild(tchBadge(t('tch.stale'), 'stale'));
+    li.appendChild(h);
+    const p = cwEl('div', 'tch-row');
+    const dirty = () => teachDirty();
+    if (st.type === 'pose') {
+      p.append(cwEl('span', 'tch-k', t('tch.speed')), tchSelect(TCH_SPEEDS.map((v) => [v, Math.round(v * 100) + '%']), TCH_SPEEDS.reduce((a, v) => (Math.abs(v - st.speed_scale) < Math.abs(a - st.speed_scale) ? v : a), 0.5), (v) => { st.speed_scale = Number(v); dirty(); }, t('tch.speed')));
+      p.append(cwEl('span', 'tch-k', t('tch.grip')), tchSelect([['keep', t('tch.grip.keep')], ['pose', t('tch.grip.pose')]], st.gripper === 'pose' ? 'pose' : 'keep', (v) => { st.gripper = v; dirty(); }, t('tch.grip')));
+    } else if (st.type === 'wait') {
+      p.append(cwEl('span', 'tch-k', t('tch.wait.s')), tchInput(st.s, (v, el) => { const x = clamp(Number(v) || 0, 0, 60); st.s = x; el.value = String(x); dirty(); }, { type: 'number', min: 0, max: 60, step: 0.5, aria: t('tch.wait.s') }));
+    } else if (st.type === 'gripper') {
+      p.append(tchSelect([['open', t('tch.st.grip.open')], ['close', t('tch.st.grip.close')]].concat(st.action === 'move' ? [['move', t('tch.st.grip.move', { p: Math.round((st.fraction ?? 0) * 100) })]] : []), st.action, (v) => { st.action = v; if (v !== 'move') delete st.fraction; dirty(); teachRender(); }, t('tch.grip')));
+    } else if (st.type === 'replay') {
+      p.append(cwEl('span', 'tch-k', t('tch.speed')), tchSelect([[0.5, '0.5×'], [1, '1×']], st.speed === 1 ? 1 : 0.5, (v) => { st.speed = Number(v); dirty(); }, t('tch.speed')));
+      const ck = cwEl('label', 'tch-chk'); const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = st.gripper !== false;
+      cb.addEventListener('change', () => { st.gripper = cb.checked; dirty(); });
+      ck.append(cb, cwEl('span', '', t('tch.grip')));
+      p.appendChild(ck);
+    }
+    li.appendChild(p);
+    const a = cwEl('div', 'tch-acts');
+    const up = tchBtn('↑', () => teachMove(i, -1), '', i === 0 || running); up.setAttribute('aria-label', t('tch.up'));
+    const dn = tchBtn('↓', () => teachMove(i, 1), '', i === c.steps.length - 1 || running); dn.setAttribute('aria-label', t('tch.down'));
+    const from = tchBtn(t('tch.from'), () => teachRun({ from: i }), '', running || TCH.busy);
+    const one = tchBtn(t('tch.single'), () => teachRun({ from: i, single: true }), '', running || TCH.busy);
+    const del = tchBtn('✕', () => { c.steps.splice(i, 1); TCH.sel = -1; teachDirty(); teachRender(); }, '', running); del.setAttribute('aria-label', t('tch.st.del'));
+    a.append(up, dn, from, one, del);
+    li.appendChild(a);
+    ol.appendChild(li);
+  });
+  body.appendChild(ol);
+  // add steps
+  body.appendChild(cwEl('div', 'tch-sec', t('tch.add')));
+  const add = cwEl('div', 'tch-box');
+  const pr = cwEl('div', 'tch-row');
+  const psel = tchSelect(TCH.poses.length ? TCH.poses.map((p) => [p.id, p.name + (p.stale ? ' ⚠' : '')]) : [['', t('tch.pose.empty')]], TCH.poses[0] ? TCH.poses[0].id : '', () => {}, t('tch.add.pose'));
+  psel.classList.add('grow');
+  pr.append(psel, tchBtn(t('tch.add.pose'), () => { if (psel.value) teachAddStep({ type: 'pose', pose_id: psel.value, speed_scale: 0.5, gripper: 'keep' }); }, '', !TCH.poses.length || running));
+  const er = cwEl('div', 'tch-row');
+  const esel = tchSelect(TCH.eps.length ? TCH.eps.map((e) => [e.id, teachEpName(e) + ' · ' + (e.dataset || 'default') + (e.stale ? ' ⚠' : '')]) : [['', t('tch.ep.empty')]], TCH.eps[0] ? TCH.eps[0].id : '', () => {}, t('tch.add.ep'));
+  esel.classList.add('grow');
+  er.append(esel, tchBtn(t('tch.add.ep'), () => { if (esel.value) teachAddStep({ type: 'replay', episode_id: esel.value, speed: 1, gripper: true }); }, '', !TCH.eps.length || running));
+  const gr = cwEl('div', 'tch-row');
+  gr.append(tchBtn(t('tch.add.open'), () => teachAddStep({ type: 'gripper', action: 'open' }), '', running),
+    tchBtn(t('tch.add.close'), () => teachAddStep({ type: 'gripper', action: 'close' }), '', running),
+    tchBtn(t('tch.add.wait'), () => teachAddStep({ type: 'wait', s: 1 }), '', running));
+  add.append(pr, er, gr);
+  body.appendChild(add);
+  // run
+  body.appendChild(cwEl('div', 'tch-sec', t('tch.runbox')));
+  const rb = cwEl('div', 'tch-box');
+  const r1 = cwEl('div', 'tch-row');
+  const rep = tchInput(TCH.repeat, (v, el) => { TCH.repeat = clamp(Math.round(Number(v) || 1), 1, 100); el.value = String(TCH.repeat); }, { type: 'number', min: 1, max: 100, step: 1, aria: t('tch.repeat') });
+  rep.id = 'tch-repeat';
+  const rc = cwEl('label', 'tch-chk'); const rcb = document.createElement('input'); rcb.type = 'checkbox'; rcb.id = 'tch-runrec'; rcb.checked = TCH.runRec;
+  rcb.addEventListener('change', () => { TCH.runRec = rcb.checked; teachRender(); });
+  rc.append(rcb, cwEl('span', '', t('tch.runrec')));
+  r1.append(cwEl('span', 'tch-k', t('tch.repeat')), rep, rc);
+  rb.appendChild(r1);
+  if (TCH.runRec) {
+    const r2 = cwEl('div', 'tch-row');
+    const ds = TCH.runDs || TCH.ds;
+    r2.append(cwEl('span', 'tch-k', t('tch.ds')), tchSelect(teachDsNames().map((n) => [n, n]), ds, (v) => { TCH.runDs = v; }, t('tch.ds')),
+      tchInput(TCH.runTask, (v) => { TCH.runTask = v; }, { aria: t('tch.task'), ph: t('tch.task.ph', { n: c.name || '' }), cls: 'grow' }));
+    rb.appendChild(r2);
+  }
+  const r3 = cwEl('div', 'tch-row');
+  const go = tchBtn(t('tch.run'), () => teachRun({}), 'btn-primary', running || TCH.busy || !c.steps.length); go.id = 'tch-run';
+  const one = tchBtn(t('tch.single.sel'), () => teachRun({ from: Math.max(0, TCH.sel), single: true }), '', running || TCH.busy || !c.steps.length); one.id = 'tch-step';
+  const stop = tchBtn(t('tch.stop'), teachStop, 'tch-stop'); stop.id = 'tch-stop'; stop.hidden = !running;
+  r3.append(go, one, stop);
+  rb.appendChild(r3);
+  const pg = cwEl('div', 'tch-prog'); pg.id = 'tch-prog'; pg.setAttribute('role', 'status');
+  rb.appendChild(pg);
+  body.appendChild(rb);
+}
+function teachRenderPoses(body) {
+  body.appendChild(cwEl('p', 'tch-k', t('tch.pose.hint')));
+  const nw = cwEl('div', 'tch-row');
+  const nm = tchInput('', () => {}, { aria: t('pose.name'), ph: 'bin_a', cls: 'grow' }); nm.maxLength = 64; nm.id = 'tch-pose-name';
+  nw.append(nm, tchBtn(t('pose.save'), () => teachSavePose(nm.value.trim()), 'btn-primary'));
+  body.appendChild(nw);
+  const ol = cwEl('ol', 'tch-list'); ol.id = 'tch-poses';
+  if (!TCH.poses.length) ol.appendChild(cwEl('li', 'empty', TCH.loaded ? t('pose.empty') : '--'));
+  for (const p of TCH.poses) {
+    const li = cwEl('li'); li.dataset.id = p.id || p.name;
+    const h = cwEl('div', 'tch-li-h');
+    h.append(cwEl('b', '', p.name), cwEl('span', 'sp'));
+    if (p.stale) { const b = tchBadge(t('tch.stale'), 'stale'); b.title = (p.stale.reason || '') + (p.stale.at ? ' (' + p.stale.at + ')' : ''); h.appendChild(b); }
+    li.appendChild(h);
+    const used = teachUsedBy('pose', p.id);
+    li.appendChild(cwEl('div', 'tch-sub', used.length ? t('tch.usedby', { s: used.join(', ') }) : t('tch.unused')));
+    if (TCH.edit === 'pose:' + p.id) {
+      const r = cwEl('div', 'tch-row');
+      const inp = tchInput(p.name, () => {}, { aria: t('tch.rename'), cls: 'grow' }); inp.maxLength = 64; inp.id = 'tch-rename';
+      r.append(inp, tchBtn(t('tch.save'), () => teachRenamePose(p, inp.value.trim()), 'btn-primary'), tchBtn(t('tch.cancel'), () => { TCH.edit = null; teachRender(); }));
+      li.appendChild(r);
+    }
+    const a = cwEl('div', 'tch-acts');
+    const k = 'pose:' + p.name;
+    a.append(tchBtn(t('pose.go'), () => poseGo(p.name)), tchBtn(t('tch.rename'), () => { TCH.edit = 'pose:' + p.id; teachRender(); }),
+      tchBtn(TCH.armed === k ? t('tch.del.confirm') : t('tch.del'), () => teachDelPose(p), 'tch-del' + (TCH.armed === k ? ' armed' : '')));
+    li.appendChild(a);
+    ol.appendChild(li);
+  }
+  body.appendChild(ol);
+}
+function teachRenderEps(body) {
+  // recording target for "● Record"
+  const tgt = cwEl('div', 'tch-box');
+  const r1 = cwEl('div', 'tch-row');
+  r1.append(cwEl('span', 'tch-k', t('tch.rec.to')), tchSelect(teachDsNames().map((n) => [n, n]), TCH.ds, (v) => { TCH.ds = v; store('rebot.teach.ds', v); }, t('tch.ds')));
+  const nds = tchInput('', () => {}, { aria: t('tch.ds.new'), ph: t('tch.ds.new'), cls: 'grow' }); nds.maxLength = 64; nds.id = 'tch-ds-new';
+  r1.append(nds, tchBtn(t('tch.ds.create'), () => teachCreateDs(nds.value.trim())));
+  const r2 = cwEl('div', 'tch-row');
+  const task = tchInput(TCH.task, (v) => { TCH.task = v; store('rebot.teach.task', v); }, { aria: t('tch.task'), ph: t('tch.task.ph0'), cls: 'grow' }); task.id = 'tch-task';
+  r2.append(cwEl('span', 'tch-k', t('tch.task')), task);
+  const r3 = cwEl('div', 'tch-row');
+  r3.append(cwEl('span', 'tch-k', t('tch.speed')), tchSelect([[0.5, '0.5×'], [1, '1×']], TCH.epSpeed, (v) => { TCH.epSpeed = Number(v); }, t('tch.speed')));
+  const ck = cwEl('label', 'tch-chk'); const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = TCH.epGrip;
+  cb.addEventListener('change', () => { TCH.epGrip = cb.checked; });
+  ck.append(cb, cwEl('span', '', t('tch.grip')));
+  r3.appendChild(ck);
+  tgt.append(r1, r2, r3);
+  body.appendChild(tgt);
+  const playing = teachPlaying();
+  const groups = new Map();
+  for (const n of teachDsNames()) groups.set(n, []);
+  for (const e of TCH.eps) { const n = e.dataset || 'default'; if (!groups.has(n)) groups.set(n, []); groups.get(n).push(e); }
+  for (const [name, eps] of groups) {
+    const info = TCH.dsets.find((d) => d.name === name);
+    if (!eps.length && name !== TCH.ds && !info) continue;
+    const h = cwEl('div', 'tch-sec');
+    const dur = eps.reduce((a, e) => a + (Number(e.duration_s) || 0), 0);
+    h.textContent = t('tch.ds.head', { n: name, c: eps.length, d: epFmtDur(dur) }) + (info && info.bytes > 0 ? ' · ' + epFmtSize(info.bytes) : '');
+    body.appendChild(h);
+    const ol = cwEl('ol', 'tch-list'); ol.dataset.ds = name;
+    if (!eps.length) ol.appendChild(cwEl('li', 'empty', t('tch.ep.none')));
+    for (const e of eps) {
+      const li = cwEl('li'); li.dataset.id = e.id;
+      li.classList.toggle('run', playing === e.id);
+      const hh = cwEl('div', 'tch-li-h');
+      hh.append(cwEl('b', '', teachEpName(e)), cwEl('span', 'sp'), tchBadge(tchSrc(e.source)));
+      if (e.outcome === 'aborted') hh.appendChild(tchBadge(t('tch.ep.aborted'), 'ab'));
+      if (e.stale) hh.appendChild(tchBadge(t('tch.stale'), 'stale'));
+      li.appendChild(hh);
+      const used = teachUsedBy('ep', e.id);
+      li.appendChild(cwEl('div', 'tch-sub', [epFmtDur(Number(e.duration_s)), teachWhen(e.recorded_at), e.frames ? t('tch.frames', { n: e.frames }) : '', used.length ? t('tch.usedby', { s: used.join(', ') }) : ''].filter(Boolean).join(' · ')));
+      if (TCH.edit === 'ep:' + e.id) {
+        const r = cwEl('div', 'tch-row');
+        const ti = tchInput(e.task || '', () => {}, { aria: t('tch.task'), ph: t('tch.task'), cls: 'grow' }); ti.id = 'tch-ep-task';
+        const dsel = tchSelect(teachDsNames().map((n) => [n, n]), e.dataset || 'default', () => {}, t('tch.ds')); dsel.id = 'tch-ep-ds';
+        r.append(ti, dsel, tchBtn(t('tch.save'), () => teachUpdateEp(e, ti.value.trim(), dsel.value), 'btn-primary'), tchBtn(t('tch.cancel'), () => { TCH.edit = null; teachRender(); }));
+        li.appendChild(r);
+      }
+      const a = cwEl('div', 'tch-acts');
+      const k = 'ep:' + e.id;
+      a.append(tchBtn(t('ep.play'), () => teachReplay(e.id, false), 'btn-primary', !!playing || teachRunning()), tchBtn(t('tch.ep.edit'), () => { TCH.edit = 'ep:' + e.id; teachRender(); }));
+      const dl = cwEl('a', 'btn', t('tch.ep.dl')); dl.href = '/api/v1/episodes/' + encodeURIComponent(e.id) + '/data'; dl.download = e.id + '.parquet';
+      a.append(dl, tchBtn(TCH.armed === k ? t('tch.del.confirm') : t('tch.del'), () => teachDelEp(e), 'tch-del' + (TCH.armed === k ? ' armed' : '')));
+      li.appendChild(a);
+      ol.appendChild(li);
+    }
+    body.appendChild(ol);
+  }
+}
+function teachAskRender() {
+  const a = TCH.ask, el = $('teach-ask');
+  el.hidden = !a;
+  if (!a) return;
+  setText($('teach-ask-t'), a.kind === 'ep' ? t('tch.ask.ep') : t('tch.ask.seq'));
+  setText($('teach-ask-yes'), t('tch.ask.yes'));
+  setText($('teach-ask-no'), t('tch.cancel'));
+}
+
+/* ---- sequences ---- */
+function teachDirty() { TCH.dirty = true; const b = $('tch-save'); if (b) { setText(b, t('tch.save')); b.classList.add('btn-primary'); } }
+function teachNewSeq(name) {
+  name = (name || '').trim();
+  if (!TCH_SEQ_NAME.test(name)) { teachStatus(t('tch.e.name'), true); $('tch-new-name') && $('tch-new-name').focus(); return; }
+  if (TCH.seqs.some((s) => s.name === name)) { teachStatus(t('tch.e.dup'), true); return; }
+  TCH.cur = { name, description: '', steps: [] }; TCH.dirty = true; TCH.sel = -1;
+  teachStatus(t('tch.seq.created', { n: name }));
+  teachRender();
+}
+function teachEdit(id) {
+  const s = TCH.seqs.find((x) => x.id === id); if (!s) return;
+  TCH.cur = JSON.parse(JSON.stringify(s)); TCH.cur.steps = TCH.cur.steps || []; TCH.dirty = false; TCH.sel = -1; TCH.tab = 'seq';
+  teachRender();
+}
+function teachBackToList() {
+  if (TCH.dirty && TCH.armed !== 'leave') { teachArm('leave'); teachStatus(t('tch.unsaved'), true); return; }
+  teachDisarm(); TCH.cur = null; TCH.dirty = false; teachStatus('--'); teachRender();
+}
+function teachMove(i, d) {
+  const s = TCH.cur.steps, j = i + d; if (j < 0 || j >= s.length) return;
+  [s[i], s[j]] = [s[j], s[i]]; TCH.sel = j; teachDirty(); teachRender();
+}
+function teachAddStep(st) {
+  if (!TCH.cur) return false;
+  if (TCH.cur.steps.length >= 200) { teachStatus(t('tch.e.max'), true); return false; }
+  const at = TCH.sel >= 0 && TCH.sel < TCH.cur.steps.length ? TCH.sel + 1 : TCH.cur.steps.length;
+  TCH.cur.steps.splice(at, 0, st); TCH.sel = at; teachDirty();
+  teachStatus(t('tch.st.added', { n: at + 1, s: teachStepTitle(st) }));
+  teachRender();
+  const li = document.querySelector('#tch-steps > li.sel');
+  if (li && !TCH.min) li.scrollIntoView({ block: 'nearest' });
+  return true;
+}
+async function teachSave() {
+  const c = TCH.cur; if (!c) return false;
+  c.name = (c.name || '').trim();
+  if (!TCH_SEQ_NAME.test(c.name)) { teachStatus(t('tch.e.name'), true); return false; }
+  if (TCH.seqs.some((s) => s.name === c.name && s.id !== c.id)) { teachStatus(t('tch.e.dup'), true); return false; }
+  const body = { name: c.name, description: c.description || '', steps: c.steps };
+  if (c.id) { body.id = c.id; if (c.rev != null) body.rev = c.rev; }
+  TCH.busy = true;
+  try {
+    const r = await commandRPC('/api/v1/sequences/save', body);
+    const s = r && r.sequence ? r.sequence : { ...c };
+    TCH.cur = JSON.parse(JSON.stringify(s)); TCH.cur.steps = TCH.cur.steps || []; TCH.dirty = false;
+    const k = TCH.seqs.findIndex((x) => x.id === s.id);
+    if (k >= 0) TCH.seqs[k] = s; else TCH.seqs.push(s);
+    teachStatus(t('tch.seq.saved', { n: s.name }));
+    return true;
+  } catch (e) {
+    teachStatus(e.code === 'SEQUENCE_CONFLICT' ? t('tch.e.SEQUENCE_CONFLICT') : teachErr(e), true);
+    if (e.code === 'SEQUENCE_REF_MISSING' && e.reply && Number.isInteger(e.reply.step)) TCH.sel = e.reply.step;
+    return false;
+  } finally { TCH.busy = false; teachRender(); }
+}
+async function teachDelSeq() {
+  const c = TCH.cur; if (!c || !c.id) return;
+  if (!teachArm('seqdel')) return;
+  try {
+    await commandRPC('/api/v1/sequences/delete', { id: c.id });
+    TCH.seqs = TCH.seqs.filter((s) => s.id !== c.id); TCH.cur = null; TCH.dirty = false;
+    teachStatus(t('tch.seq.deleted', { n: c.name }));
+  } catch (e) { teachStatus(teachErr(e), true); }
+  teachRender();
+}
+const teachRunning = () => { const a = S.obs && S.obs.action; return !!(a && a.kind === 'sequence' && a.state === 'running'); };
+const teachPlaying = () => { const a = S.obs && S.obs.action; return a && a.kind === 'replay' && a.state === 'running' ? a.episode : null; };
+function teachMoveBlock() {
+  if (!isLive() || !canMove()) { toast(isLive() && !isStopped() && !colHold() && leaseOther() == null ? t('tch.enable_first') : lockReason(), 'err'); flashLock(); return true; }
+  return false;
+}
+async function teachRun({ from = 0, single = false, allowStale = false }) {
+  const c = TCH.cur; if (!c || TCH.busy) return;
+  if (!c.steps.length) { teachStatus(t('tch.st.empty'), true); return; }
+  if (teachMoveBlock()) return;
+  if ((TCH.dirty || !c.id) && !(await teachSave())) return;
+  const body = { id: TCH.cur.id, from_step: clamp(from, 0, TCH.cur.steps.length - 1), single_step: !!single, repeat: single ? 1 : TCH.repeat, allow_stale: !!allowStale, tag: 'cockpit' };
+  if (TCH.runRec && !single) body.record = { dataset: TCH.runDs || TCH.ds, task: TCH.runTask.trim() || TCH.cur.name };
+  TCH.busy = true;
+  try {
+    const r = await commandRPC('/api/v1/action/run_sequence', body);
+    syncEpoch(r.epoch_id);
+    TCH.run = { actionId: r.action_id, seqId: TCH.cur.id, n: TCH.cur.steps.length, record: !!body.record };
+    TCH.ask = null;
+    teachStatus(single ? t('tch.run.single', { n: body.from_step + 1 }) : t('tch.run.started', { n: TCH.cur.name, r: body.repeat }));
+  } catch (e) {
+    if (e.code === 'DATA_STALE') { TCH.ask = { kind: 'seq', from, single }; teachStatus(teachErr(e), true); }
+    else { teachStatus(teachErr(e), true); toast(teachErr(e), 'err', e.code || ''); }
+  } finally { TCH.busy = false; teachRender(); }
+}
+function teachStop() { api('/api/v1/motion/stop', {}).catch(() => {}); }
+// live step highlight and progress from the parent action (kind "sequence")
+function teachLive() {
+  const o = S.obs; if (!o || !TCH.open) return;
+  const a = o.action, run = a && a.kind === 'sequence' && a.state === 'running' ? a : null;
+  const mine = run && TCH.cur && ((TCH.run && run.id === TCH.run.actionId) || (run.sequence_id && run.sequence_id === TCH.cur.id));
+  const ol = $('tch-steps');
+  if (ol) for (const li of ol.children) li.classList.toggle('run', !!mine && Number(li.dataset.i) === run.step_index);
+  const pg = $('tch-prog');
+  if (pg) {
+    setText(pg, mine ? t('tch.prog', { i: (run.step_index ?? 0) + 1, n: TCH.cur.steps.length, r: (run.repeat_index ?? 0) + 1, m: run.repeats ?? 1,
+      s: run.phase ? (I18N.zh['tch.ph.' + run.phase] !== undefined ? t('tch.ph.' + run.phase) : run.phase) : '' }) : '');
+    const st = $('tch-stop'); if (st) st.hidden = !run;
+  }
+  const pl = teachPlaying();
+  for (const li of document.querySelectorAll('#teach-body ol[data-ds] > li')) li.classList.toggle('run', !!pl && li.dataset.id === pl);
+}
+function teachOnObs(o) {
+  if (!teachOn()) return;
+  // result of a sequence / replay started here, once
+  for (const r of [o.action, o.previous_action]) {
+    if (!r || r.state === 'running' || TCH.toasted === r.id) continue;
+    if (r.kind === 'sequence' && TCH.run && r.id === TCH.run.actionId) {
+      TCH.toasted = r.id; TCH.run = null;
+      if (r.state === 'done') { toast(t('tch.run.done'), 'ok'); teachStatus(t('tch.run.done')); }
+      else { const m = t('tch.run.ended', { code: r.code || r.state, m: teachErr({ code: r.code, message: r.message }) }); toast(m, r.state === 'failed' ? 'err' : 'warn', r.code || ''); teachStatus(m, true); }
+      if (TCH.open) { teachLoad(true); }
+    } else if (r.kind === 'replay' && TCH.play && r.id === TCH.play) {
+      TCH.toasted = r.id; TCH.play = null;
+      if (r.state === 'done') teachStatus(t('ep.done', { id: r.episode }));
+      else teachStatus(t('ep.ended', { code: r.code || r.state, m: teachErr({ code: r.code, message: r.message }) }), true);
+      if (TCH.open) teachRender();
+    }
+  }
+  const running = teachRunning(), playing = teachPlaying();
+  const key = (running ? 1 : 0) + ':' + (playing || '');
+  if (TCH.open && key !== TCH.runKey) { TCH.runKey = key; teachRender(); }
+  else if (TCH.open) teachLive();
+  teachBarRender();
+}
+
+/* ---- poses ---- */
+function teachAutoPoseName() {
+  const used = new Set(TCH.poses.map((p) => p.name));
+  for (let k = 1; k < 1000; k++) { const n = 'p' + String(k).padStart(2, '0'); if (!used.has(n)) return n; }
+  return 'p' + Date.now();
+}
+// save the current position as a pose; with a sequence open, append it as a step
+async function teachSavePose(name, append = false) {
+  if (!POSE_NAME_RE.test(name || '')) { teachStatus(t('pose.bad'), true); return; }
+  try {
+    const r = await commandRPC('/api/v1/poses/save', { name });
+    const ps = await teachGet('/api/v1/poses').catch(() => null);
+    if (ps && Array.isArray(ps.poses)) TCH.poses = ps.poses;
+    const p = (r && r.pose && r.pose.id) ? r.pose : TCH.poses.find((x) => x.name === name);
+    toast(t('pose.saved', { name }), 'ok');
+    if (append && TCH.cur && p && p.id) teachAddStep({ type: 'pose', pose_id: p.id, speed_scale: 0.5, gripper: 'keep' });
+    else teachStatus(t('pose.saved', { name }));
+    teachRender();
+  } catch (e) { const m = teachErr(e); toast(m, 'err', e.code || ''); teachStatus(m, true); }
+}
+async function teachRenamePose(p, name) {
+  if (!POSE_NAME_RE.test(name)) { teachStatus(t('pose.bad'), true); return; }
+  if (name === p.name) { TCH.edit = null; teachRender(); return; }
+  try {
+    await commandRPC('/api/v1/poses/rename', { id: p.id, name });
+    TCH.edit = null; teachStatus(t('tch.renamed', { a: p.name, b: name }));
+    await teachLoad(true);
+  } catch (e) { teachStatus(e.code === 'UNKNOWN_COMMAND' || e.code === 'NOT_FOUND' || e.code === '404' || e.code === 'UNSUPPORTED' ? t('tch.e.rename_na') : teachErr(e), true); }
+}
+async function teachDelPose(p) {
+  if (!teachArm('pose:' + p.name)) return;
+  try {
+    await commandRPC('/api/v1/poses/delete', { name: p.name });
+    teachStatus(t('pose.deleted', { name: p.name }));
+    await teachLoad(true);
+  } catch (e) { teachStatus(teachErr(e), true); teachRender(); }
+}
+
+/* ---- episodes / datasets ---- */
+async function teachReplay(id, allowStale) {
+  if (teachMoveBlock()) return;
+  try {
+    const d = await commandRPC('/api/v1/action/replay', { episode: id, speed: TCH.epSpeed, gripper: TCH.epGrip, allow_stale: !!allowStale, tag: 'cockpit' });
+    syncEpoch(d.epoch_id);
+    TCH.play = d.action_id; TCH.ask = null;
+    const e = teachEp(id);
+    teachStatus(t('ep.started', { id: e ? teachEpName(e) : id, x: TCH.epSpeed }));
+  } catch (e) {
+    if (e.code === 'DATA_STALE') TCH.ask = { kind: 'ep', id };
+    teachStatus(teachErr(e), true);
+  }
+  teachRender();
+}
+async function teachUpdateEp(e, task, dataset) {
+  const body = { id: e.id };
+  if (task !== (e.task || '')) body.task = task;
+  if (dataset && dataset !== (e.dataset || 'default')) body.dataset = dataset;
+  if (Object.keys(body).length === 1) { TCH.edit = null; teachRender(); return; }
+  try {
+    await teachCmd('/api/v1/episodes/update', body);
+    TCH.edit = null; teachStatus(t('tch.ep.updated'));
+    await teachLoad(true);
+  } catch (err) { teachStatus(teachErr(err), true); }
+}
+async function teachDelEp(e) {
+  if (!teachArm('ep:' + e.id)) return;
+  try {
+    await teachCmd('/api/v1/episodes/delete', { id: e.id });
+    teachStatus(t('ep.deleted', { id: teachEpName(e) }));
+    await teachLoad(true);
+  } catch (err) { teachStatus(teachErr(err), true); teachRender(); }
+}
+async function teachCreateDs(name) {
+  if (!TCH_SEQ_NAME.test(name || '')) { teachStatus(t('tch.e.name'), true); return; }
+  try {
+    await teachCmd('/api/v1/datasets/create', { name });
+    TCH.ds = name; store('rebot.teach.ds', name);
+    teachStatus(t('tch.ds.created', { n: name }));
+    await teachLoad(true);
+  } catch (e) { teachStatus(teachErr(e), true); }
+}
+
+/* ---- recording (this page owns the recorder; no lease needed) ---- */
+function teachRecSet(r) {
+  TCH.rec = r;
+  setRecording(!!r);
+  if (r) S.rec.startedAt = r.startedAt;
+  teachBarRender();
+}
+async function teachRecToggle() {
+  if (!TCH.rec) {
+    const body = { dataset: TCH.ds || 'default', source: gcOn() ? 'hand_guide' : 'jog' };
+    if (TCH.task.trim()) body.task = TCH.task.trim();
+    try {
+      await teachCmd('/api/v1/record/start', body);
+      teachRecSet({ startedAt: Date.now(), dataset: body.dataset });
+      toast(t('tch.rec.started', { d: body.dataset }), 'ok');
+      teachStatus(t('tch.rec.started', { d: body.dataset }));
+    } catch (e) {
+      const m = e.code === 'RECORDER_BUSY' ? t('tch.e.RECORDER_BUSY', { o: (e.reply && e.reply.owner) ? leaseHolderText(e.reply.owner) : '?' }) : teachErr(e);
+      toast(m, 'err', e.code || ''); teachStatus(m, true);
+    }
+    return;
+  }
+  try {
+    const r = await teachCmd('/api/v1/record/stop', { save: true }, 15000);
+    teachRecSet(null);
+    const ep = r && r.episode;
+    if (ep && ep.id) {
+      if (!TCH.eps.some((x) => x.id === ep.id)) TCH.eps.unshift(ep);
+      const msg = t('tch.rec.saved', { n: teachEpName(ep), d: epFmtDur(Number(ep.duration_s)) });
+      toast(msg, 'ok');
+      if (TCH.cur) teachAddStep({ type: 'replay', episode_id: ep.id, speed: 1, gripper: true });
+      else teachStatus(msg);
+    } else teachStatus(t('rec.discarded'));
+    if (TCH.open) teachLoad(true);
+  } catch (e) {
+    if (e.code === 'RECORDER_NOT_OWNER' || e.code === 'NOT_RECORDING') teachRecSet(null);
+    const m = teachErr(e); toast(m, 'err', e.code || ''); teachStatus(m, true);
+  }
+}
+async function teachRecDiscard() {
+  if (!TCH.rec) return;
+  try { await teachCmd('/api/v1/record/stop', { save: false }); teachRecSet(null); teachStatus(t('rec.discarded')); }
+  catch (e) { teachStatus(teachErr(e), true); }
+}
+
+/* ---- teach bar: shown while hand-guiding or jogging; floats on the video when the panel is collapsed ---- */
+const teachActive = () => gcOn() || (isLive() && canMove() && leaseOther() == null);
+function teachGrip(cmd) {
+  if (gcOn()) { gcGripDir = 0; gcGrip(cmd === 'close' ? 1 : -1); gcGripDir = 0; }
+  else { S.grip = cmd === 'close' ? 0 : 1; S.gripCmdAt = Date.now(); commandRPC('/api/v1/action/gripper', { command: cmd }).then((r) => syncEpoch(r.epoch_id)).catch((e) => { if (e.code !== 'MOTION_BUSY') toast(e.message, 'err', e.code); }); }
+  if (TCH.cur) teachAddStep({ type: 'gripper', action: cmd });
+}
+function teachBarRender() {
+  const bar = $('teach-bar');
+  const active = teachOn() && TCH.open && (teachActive() || !!TCH.rec);
+  const float = teachOn() && TCH.open && TCH.min;
+  const show = float || active;
+  if (bar.hidden !== !show) bar.hidden = !show;
+  if (!show) return;
+  const slot = $('teach-bar-slot');
+  if (float) { if (bar.parentElement !== document.body) document.body.appendChild(bar); }
+  else if (bar.parentElement !== slot) { slot.appendChild(bar); bar.style.top = ''; bar.style.left = ''; bar.style.maxWidth = ''; }
+  bar.classList.toggle('float', float);
+  const can = teachActive() && !teachRunning();
+  $('tb-pose').disabled = !can;
+  $('tb-open').disabled = !can;
+  $('tb-close').disabled = !can;
+  const rec = $('tb-rec');
+  rec.disabled = !TCH.rec && !can;
+  rec.classList.toggle('on', !!TCH.rec);
+  setText(rec, TCH.rec ? t('tch.b.recon', { t: fmtTime(Date.now() - TCH.rec.startedAt) }) : t('tch.b.rec'));
+  // docking reads layout: on show and at most every 500 ms from the observation stream (resize / scroll dock at once)
+  if (float && (Date.now() - (TCH.dockAt || 0) > 500 || bar.style.top === '')) { TCH.dockAt = Date.now(); dockOnVideo(bar); }
+}
+(() => {
+  $('teach-close').addEventListener('click', () => teachOpen(false));
+  $('teach-min').addEventListener('click', () => teachMin(true));
+  $('tb-expand').addEventListener('click', () => teachMin(false));
+  $('teach-tabs').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { TCH.tab = b.dataset.tab; TCH.edit = null; teachDisarm(); teachRender(); } });
+  $('teach-tabs').addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    const tabs = ['seq', 'pose', 'ep'], k = (tabs.indexOf(TCH.tab) + (e.key === 'ArrowRight' ? 1 : 2)) % 3;
+    TCH.tab = tabs[k]; teachRender(); $('teach-tab-' + TCH.tab).focus();
+  });
+  $('teach-ask-yes').addEventListener('click', () => { const a = TCH.ask; TCH.ask = null; if (!a) return; if (a.kind === 'ep') teachReplay(a.id, true); else teachRun({ from: a.from, single: a.single, allowStale: true }); });
+  $('teach-ask-no').addEventListener('click', () => { TCH.ask = null; teachStatus('--'); teachRender(); });
+  $('tb-pose').addEventListener('click', () => teachSavePose(teachAutoPoseName(), true));
+  $('tb-rec').addEventListener('click', teachRecToggle);
+  $('tb-open').addEventListener('click', () => teachGrip('open'));
+  $('tb-close').addEventListener('click', () => teachGrip('close'));
+  $('teach-open').addEventListener('click', () => { ssetOpen(false); teachOpen(true); });
+  for (const ev of ['resize', 'scroll']) window.addEventListener(ev, () => { if (TCH.open && TCH.min) dockOnVideo($('teach-bar')); }, { passive: true });
+  setInterval(() => { if (TCH.rec) teachBarRender(); }, 500);
+  i18nHooks.push(() => { if (TCH.open) teachRender(); teachBarRender(); });
+})();
 
 /* =================================================================
    3D arm view, loaded on first open: three.js + urdf-loader (/assets/three-urdf.min.js, embedded),
