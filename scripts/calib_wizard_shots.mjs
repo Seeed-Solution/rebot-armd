@@ -13,7 +13,12 @@
 // placement A with an abort and Continue, the board move (the camera loses the board; jog bar: one row docked on the video top, off the sticks;
 // hand-guide enter / exit-and-lock, a search stopped by Stop and one that finds the board), placement B, the solve in a Web Worker (gates, held-out,
 // per-joint parameters, the J5 zero warning), review with park / torque off, one apply carrying kinematics.
-// FINE_ONLY=1 runs only the fine calibration walk-through. Exits non-zero if a check fails.
+// Calibration sessions (mock of /api/v1/calibration/sessions in this server): both modes upload after a placement's
+// capture and after the solve under one id. Load from device (desktop + phone, zh + en): the list on the board step,
+// the stored fine session re-solved without capturing (level table), Apply disabled until a verify view passes (a
+// moved board fails it), and a session of an arm without geometry error that chooses level L0 (review message,
+// apply body with kinematics null).
+// FINE_ONLY=1 runs only the fine calibration walk-through (and the load section). Exits non-zero if a check fails.
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -26,8 +31,28 @@ fs.mkdirSync(out, { recursive: true });
 const html = fs.readFileSync(path.join(root, 'src/api/index.html'));
 const js = fs.readFileSync(path.join(root, 'src/api/calib_wizard.js'));
 const send = (res, code, o) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
+// calibration sessions as armd stores them (newest first, overwrite by id)
+const sessions = new Map(), sessPosts = [];
+let sessSeq = 0;
+const sessMeta = (b) => ({ id: b.id, kind: b.kind, created_at: b.created_at, views: b.views.length, size: JSON.stringify(b).length, summary: b.summary || null });
 const srv = http.createServer((req, res) => {
   const u = req.url.split('?')[0];
+  if (u === '/api/v1/calibration/sessions' && req.method === 'POST') {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const b = JSON.parse(raw);
+      if (!['camera', 'fine'].includes(b.kind) || !Array.isArray(b.views)) return send(res, 400, { code: 'INVALID', message: 'kind / views' });
+      b.id = b.id || 'S' + String(sessSeq + 1).padStart(4, '0');
+      b.seq = ++sessSeq;
+      sessions.set(b.id, b);
+      sessPosts.push({ id: b.id, kind: b.kind, views: b.views.length, solved: !!b.solve, level: b.summary && b.summary.level });
+      send(res, 200, sessMeta(b));
+    });
+    return;
+  }
+  if (u === '/api/v1/calibration/sessions') return send(res, 200, { sessions: [...sessions.values()].sort((a, b) => b.seq - a.seq).map(sessMeta), keep: 10 });
+  if (u.startsWith('/api/v1/calibration/sessions/')) { const b = sessions.get(decodeURIComponent(u.split('/').pop())); return b ? send(res, 200, b) : send(res, 404, { code: 'NOT_FOUND', message: 'no session' }); }
   if (u === '/' || u === '/index.html') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(html); return; }
   if (u === '/assets/calib_wizard.js') { res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8' }); res.end(js); return; }
   if (u === '/api/v1/calibration') return send(res, 200, { calibrated: false, busy: false, camera_mount: { flip: false, rot_deg: 0, tilt_deg: -38, offset_m: null, q_end_cam: null }, backups: [] });
@@ -182,7 +207,10 @@ for (const [vpName, viewport] of (process.env.FINE_ONLY ? [] : [['desktop', { wi
     await page.click('#cwiz-solve');
     const sol = await page.evaluate(() => { const r = CWZ.solve, K = r.intr.K; return { ok: r.ok, fails: r.gates.filter((g) => !g.ok).map((g) => g.key), K: [K.fx, K.fy, K.cx, K.cy, K.k1].map((v) => +v.toFixed(3)), off: r.apply && r.apply.camera_mount.offset_m.map((v) => +(v * 1000).toFixed(2)), z: r.apply && +(r.apply.table_z_m * 1000).toFixed(2), rows: document.querySelectorAll('#cwiz-body .cwiz-table tr').length }; });
     if (!sol.ok || sol.rows < 13) fail('solve ' + JSON.stringify(sol));
-    await shot('4_solve', `gates ok ${sol.ok} K ${sol.K} offset ${sol.off} mm table ${sol.z} mm`);
+    await page.waitForTimeout(300);
+    const cid = await page.evaluate(() => CWZ.sessionId), cposts = sessPosts.filter((x) => x.id === cid);
+    if (!cid || cposts.length < 2 || !cposts[0].views || cposts[0].solved || !cposts[cposts.length - 1].solved || cposts.some((x) => x.kind !== 'camera')) fail('camera session uploads ' + JSON.stringify({ cid, cposts }));
+    await shot('4_solve', `gates ok ${sol.ok} K ${sol.K} offset ${sol.off} mm table ${sol.z} mm; session ${cid}: ${cposts.length} uploads (${cposts.map((x) => x.views + (x.solved ? ' solved' : '')).join(', ')})`);
     // 5 review (dry run)
     await page.click('#cwiz-review');
     await waitW(page, () => !!CWZ.dry && !CWZ.busy, 10000, '() => !!CWZ.dry && !CWZ.busy');
@@ -516,9 +544,13 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     const lmax = Math.max(longs.planA, longs.planB, longs.solve);
     if (lmax >= 300 || pw.plan !== !noWorker || pw.solve !== !noWorker) fail('fine main-thread long task ' + JSON.stringify({ longs, pw }));
     console.log(`  main-thread longest block (${lang}/${vpName}, ${noWorker ? 'no Worker: sliced on the main thread' : 'Web Worker'}): plan A ${longs.planA.toFixed(0)} ms, plan B ${longs.planB.toFixed(0)} ms, solve ${longs.solve.toFixed(0)} ms (max gap of a 10 ms timer); control: the same plan synchronously ${longs.control.toFixed(0)} ms; plan in worker ${pw.plan}, solve in worker ${pw.solve}`);
-    const so = await page.evaluate(() => { const r = CWZ.solve; return r ? { ok: r.ok, worker: r.worker, secs: +r.secs.toFixed(1), fails: r.gates.filter((g) => !g.ok).map((g) => g.key), ho: [r.kin.heldOut.ab0.mm, r.kin.heldOut.ab.mm, r.kin.heldOut.ba0.mm, r.kin.heldOut.ba.mm].map((v) => +v.toFixed(2)), j5: +(r.kin.joints[4].offset_rad * 180 / Math.PI).toFixed(2), warn: document.querySelectorAll('#cwiz-body .cwiz-zero').length, tables: document.querySelectorAll('#cwiz-body .cwiz-table').length, flat: [...document.querySelectorAll('#cwiz-body .cwiz-table')].filter((d) => d.getBoundingClientRect().height < 40).length } : { status: CWZ.status }; });
-    if (!so.ok || so.worker !== !noWorker || so.warn !== 1 || so.tables !== 3 || so.flat) fail('fine solve ' + JSON.stringify(so));
-    await shot('7_solve', `gates ok ${so.ok}, Web Worker ${so.worker}, ${so.secs} s, held-out A->B ${so.ho[0]} -> ${so.ho[1]} mm, B->A ${so.ho[2]} -> ${so.ho[3]} mm, J5 zero ${so.j5} deg, warnings ${so.warn}`);
+    const so = await page.evaluate(() => { const r = CWZ.solve; return r ? { ok: r.ok, worker: r.worker, secs: +r.secs.toFixed(1), fails: r.gates.filter((g) => !g.ok).map((g) => g.key), ho: [r.kin.heldOut.ab0.mm, r.kin.heldOut.ab.mm, r.kin.heldOut.ba0.mm, r.kin.heldOut.ba.mm].map((v) => +v.toFixed(2)), j5: +(r.kin.joints[4].offset_rad * 180 / Math.PI).toFixed(2), warn: document.querySelectorAll('#cwiz-body .cwiz-zero').length, tables: document.querySelectorAll('#cwiz-body .cwiz-table').length, flat: [...document.querySelectorAll('#cwiz-body .cwiz-table')].filter((d) => d.getBoundingClientRect().height < 40).length,
+      level: r.kin.level, lvRows: document.querySelectorAll('#cwiz-body .cwiz-levels tr').length, lvChosen: document.querySelectorAll('#cwiz-body .cwiz-levels tr.chg').length, lvText: r.kin.levels.map((l) => `${l.chosen ? '*' : ''}${l.name} ${l.ab.toFixed(2)}/${l.ba.toFixed(2)}`).join(' ') } : { status: CWZ.status }; });
+    if (!so.ok || so.worker !== !noWorker || so.warn !== 1 || so.tables !== 4 || so.flat || so.lvRows !== 5 || so.lvChosen !== 1 || so.level === 'L0') fail('fine solve ' + JSON.stringify(so));
+    await shot('7_solve', `gates ok ${so.ok}, Web Worker ${so.worker}, ${so.secs} s, held-out A->B ${so.ho[0]} -> ${so.ho[1]} mm, B->A ${so.ho[2]} -> ${so.ho[3]} mm, J5 zero ${so.j5} deg, warnings ${so.warn}; levels ${so.lvText}`);
+    const lvBox = await page.evaluate(() => { const e = document.querySelector('#cwiz-body .cwiz-levels'); e.scrollIntoView({ block: 'center' }); const b = e.getBoundingClientRect(), pb = $('cwiz-panel').getBoundingClientRect(); return { w: b.width, pw: pb.width, inside: b.left >= pb.left - 1 && b.right <= pb.right + 1 }; });
+    if (!lvBox.inside) fail('fine levels table width ' + JSON.stringify(lvBox));
+    await shot('7a_levels', `levels table ${Math.round(lvBox.w)} px in a ${Math.round(lvBox.pw)} px panel`);
     await page.evaluate(() => { const b = $('cwiz-body'); b.scrollTop = b.scrollHeight; });
     await shot('7b_solve_params');
     // review: torque on -> park first
@@ -536,8 +568,123 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     await waitW(page, () => CWZ.step === 'applied' && !CWZ.busy, 10000, 'fine apply');
     const body = await page.evaluate(() => { const b = __SIM.calls.filter(([p, x]) => p === '/api/v1/calibration/apply' && x.dry_run === false).map(([, x]) => x); const k = b[b.length - 1].kinematics; return { n: b.length, keys: Object.keys(b[b.length - 1]).sort().join(','), joints: k.joints.length, fit: Object.keys(k.fit).sort().join(','), j1: JSON.stringify(k.joints[0]) }; });
     if (body.n !== 2 || body.joints !== 6 || !/heldout_mm/.test(body.fit) || !/kinematics/.test(body.keys) || !/"offset_rad":0,"scale":0/.test(body.j1)) fail('fine apply body ' + JSON.stringify(body));
-    await shot('9_applied', `apply body keys ${body.keys}; kinematics.fit ${body.fit}`);
+    const fid = await page.evaluate(() => CWZ.sessionId), fposts = sessPosts.filter((x) => x.id === fid);
+    // capture A done, capture B done (the B run ends the capture), the solve
+    if (!fid || fposts.length < 3 || fposts.some((x) => x.kind !== 'fine') || !fposts[fposts.length - 1].solved || fposts[fposts.length - 1].level !== so.level) fail('fine session uploads ' + JSON.stringify({ fid, fposts }));
+    await shot('9_applied', `apply body keys ${body.keys}; kinematics.fit ${body.fit}; session ${fid}: ${fposts.length} uploads (${fposts.map((x) => x.views + (x.solved ? ' solved ' + x.level : '')).join(', ')})`);
     if (errs.length) fail(`fine page errors (${lang}/${vpName}): ${[...new Set(errs)].join(' | ').slice(0, 300)}`);
+    await ctx.close();
+  }
+}
+// ---- load from device: re-solve a stored session, verify view, the L0 case
+const l0Ids = new Set(); // sessions rendered here through the URDF arm (not the walk-through's simulated arm)
+for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['phone', { width: 390, height: 844 }]]) {
+  for (const lang of ['zh', 'en']) {
+    const fineIds = [...sessions.values()].filter((x) => x.kind === 'fine' && x.solve && x.levels && !l0Ids.has(x.id)).sort((a, b) => b.seq - a.seq).map((x) => x.id);
+    if (!fineIds.length) { fail('load: no stored fine session'); break; }
+    const ctx = await browser.newContext({ viewport, deviceScaleFactor: vpName === 'phone' ? 2 : 1 });
+    await ctx.addInitScript(([l]) => {
+      try { localStorage.clear(); localStorage.setItem('lang', l); } catch (_) {}
+      const RealWS = window.WebSocket;
+      window.WebSocket = function (u, p) { if (!String(u).includes('/api/v1/ws')) return new RealWS(u, p); return { readyState: 1, url: u, send() {}, close() {}, addEventListener() {} }; };
+      window.WebSocket.OPEN = 1;
+    }, [lang]);
+    const page = await ctx.newPage();
+    const errs = [];
+    page.on('pageerror', (e) => errs.push(e.message));
+    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(500);
+    if (!(await page.evaluate(setupSim)) || !(await page.evaluate(setupFine))) fail('load sim start');
+    const shot = async (step, extra = '') => {
+      await page.waitForTimeout(250);
+      const info = await page.evaluate(() => ({ open: !$('cwiz').hidden, on: [...document.querySelectorAll('#cwiz-steps li.on')].map((x) => x.textContent).join(),
+        raw: /\bcw\.[a-z]/.test($('cwiz-panel').innerText), hscroll: $('cwiz-panel').scrollWidth > $('cwiz-panel').clientWidth + 1 }));
+      if (!info.open || info.raw || info.hscroll) fail(`load ${step} ${lang}/${vpName}: ${JSON.stringify(info)}`);
+      const file = path.join(out, `cwiz_load_${step}_${lang}_${vpName}.png`);
+      await page.screenshot({ path: file });
+      shots.push(file);
+      console.log(`${path.relative(root, file)}  step="${info.on}" ${extra}`);
+    };
+    const posts0 = sessPosts.length;
+    await page.evaluate(() => cwOpen(true));
+    await page.waitForTimeout(500);
+    await page.click('#cwiz-load');
+    await waitW(page, () => CWZ.sessions && !CWZ.sessions.busy, 5000, 'load list');
+    const li = await page.evaluate((id) => ({ n: CWZ.sessions.list.length, idx: CWZ.sessions.list.findIndex((x) => x.id === id), items: [...document.querySelectorAll('#cwiz-sess .cwiz-sess-item')].map((b) => b.textContent) }), fineIds[0]);
+    if (li.n < 2 || li.idx < 0 || li.items.length !== li.n) fail('load list ' + JSON.stringify(li));
+    await shot('1_list', `${li.n} sessions: ${li.items.slice(0, 3).map((x) => JSON.stringify(x)).join(', ')}`);
+    // the stored fine session (corrected sim arm): re-solved without capturing
+    await page.click('#cwiz-sess-' + li.idx);
+    await waitW(page, () => CWZ.step === 'solve' && !CWZ.solving && !!CWZ.solve, 300000, 'load solve');
+    const ls = await page.evaluate(() => ({ mode: CWZ.mode, loaded: !!CWZ.loaded, ok: CWZ.solve.ok, level: CWZ.solve.kin.level, lv: document.querySelectorAll('#cwiz-body .cwiz-levels tr').length, status: CWZ.status,
+      jogs: __SIM.calls.filter(([p]) => p === '/api/v1/motion/jog' || p === '/api/v1/action/move_to').length, navs: [...document.querySelectorAll('#cwiz-steps li.nav')].map((x) => x.dataset.step).join() }));
+    if (ls.mode !== 'fine' || !ls.loaded || !ls.ok || ls.lv !== 5 || ls.jogs || !/加载|Loaded/.test(ls.status) || /capture/.test(ls.navs)) fail('load solve ' + JSON.stringify(ls));
+    await shot('2_solved', `mode ${ls.mode}, level ${ls.level}, gates ok ${ls.ok}, arm moves ${ls.jogs}, "${ls.status}"`);
+    await page.evaluate(() => { const e = document.querySelector('#cwiz-body .cwiz-levels'); if (e) e.scrollIntoView({ block: 'center' }); });
+    await shot('3_levels');
+    // review: Apply waits for a verify view; the board moved -> fails; back in place -> passes
+    await page.click('#cwiz-review');
+    await waitW(page, () => !!CWZ.dry && !CWZ.busy, 10000, 'load dry run');
+    const r0 = await page.evaluate(() => ({ apply: $('cwiz-apply').disabled, verify: !!$('cwiz-verify'), hint: $('cwiz-body').innerText.includes(t('cw.sess.verify')) }));
+    if (!r0.apply || !r0.verify || !r0.hint) fail('load review before verify ' + JSON.stringify(r0));
+    await shot('4_review_verify', `apply disabled ${r0.apply}, verify button ${r0.verify}`);
+    await page.evaluate(() => { __SIM.Tbb0 = __SIM.Tbb; __SIM.Tbb = CWZ.CW.mul(CWZ.CW.make([[1, 0, 0], [0, 1, 0], [0, 0, 1]], [0.03, 0.01, 0]), __SIM.Tbb); });
+    await page.click('#cwiz-verify');
+    await waitW(page, () => !CWZ.busy && !!CWZ.verify, 10000, 'load verify moved');
+    const r1 = await page.evaluate(() => ({ v: CWZ.verify, apply: $('cwiz-apply').disabled }));
+    if (r1.v.ok || !r1.apply) fail('load verify with a moved board ' + JSON.stringify(r1));
+    await shot('5_verify_moved', `board moved 30 / 10 mm: ${r1.v.mm != null ? r1.v.mm.toFixed(2) + ' mm' : r1.v.why}, apply disabled ${r1.apply}`);
+    await page.evaluate(() => { __SIM.Tbb = __SIM.Tbb0; });
+    await page.click('#cwiz-verify');
+    await waitW(page, () => !CWZ.busy && !!CWZ.verify, 10000, 'load verify');
+    const r2 = await page.evaluate(() => ({ v: CWZ.verify, park: !!$('cwiz-park') }));
+    if (!r2.v.ok || !r2.park) fail('load verify ' + JSON.stringify(r2));
+    await shot('6_verified', `${r2.v.mm.toFixed(3)} mm (${r2.v.px.toFixed(2)} px, placement ${r2.v.board}), park offered ${r2.park}`);
+    await page.click('#cwiz-park');
+    await waitW(page, () => !CWZ.busy && !S.obs.is_torqued, 10000, 'load park');
+    await page.click('#cwiz-apply'); await page.click('#cwiz-apply');
+    await waitW(page, () => !CWZ.busy && (CWZ.step === 'applied' || /KINEMATICS_ARMED/.test(CWZ.status)), 10000, 'load apply');
+    if (await page.evaluate(() => CWZ.step !== 'applied')) { await page.click('#cwiz-apply'); await page.click('#cwiz-apply'); await waitW(page, () => CWZ.step === 'applied' && !CWZ.busy, 10000, 'load apply 2'); }
+    const ap = await page.evaluate(() => { const b = __SIM.calls.filter(([p, x]) => p === '/api/v1/calibration/apply' && x.dry_run === false).pop()[1]; return { kin: !!b.kinematics, level: b.rms.kin_level }; });
+    if (!ap.kin || ap.level !== ls.level) fail('load apply body ' + JSON.stringify(ap));
+    // re-solved session uploaded under the same id
+    const same = sessPosts.slice(posts0).filter((x) => x.id === fineIds[0]).length;
+    if (same < 1 || sessPosts.slice(posts0).some((x) => x.id !== fineIds[0])) fail('load re-solve upload ' + JSON.stringify(sessPosts.slice(posts0)));
+    // L0: the same views rendered through an arm without geometry error (URDF), stored as a new session
+    const l0id = await page.evaluate(async (id) => {
+      const W = __SIM, CW = CWZ.CW, s = await (await fetch('/api/v1/calibration/sessions/' + id)).json();
+      const boards = [W.Tbb0 || W.Tbb, W.TbbB], board = CW.makeBoard({ markerSide: 0.025 });
+      const rnd = () => { W.seed = (W.seed * 1103515245 + 12345) % 2147483648; return W.seed / 2147483648; };
+      const gauss = () => Math.sqrt(-2 * Math.log(1 - rnd())) * Math.cos(2 * Math.PI * rnd());
+      const views = s.views.map((v) => {
+        const G = CALM.fk(v.q, null), Tcb = CW.mul(CW.inv(CW.mul(G, W.X)), boards[v.ds]), R = CW.rotOf(Tcb), t = CW.posOf(Tcb), markers = [];
+        for (const m of board.markers) { const px = m.corners.map((c) => CW.project(W.K, R, t, c)); if (px.every(([u, vv, zz]) => zz > 0 && u >= 4 && u <= 636 && vv >= 4 && vv <= 356)) markers.push({ id: m.id, corners: px.map(([u, vv]) => [u + 0.3 * gauss(), vv + 0.3 * gauss()]) }); }
+        return { ...v, markers, T_base_end: G };
+      });
+      const { id: _, solve, levels, gates, ...rest } = s;
+      const r = await fetch('/api/v1/calibration/sessions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...rest, created_at: new Date().toISOString(), views, summary: { views: views.length } }) });
+      return (await r.json()).id;
+    }, fineIds[0]);
+    l0Ids.add(l0id);
+    await page.evaluate(() => { CWZ.step = 'board'; CWZ.views = []; CWZ.loaded = null; CWZ.solve = null; CWZ.sessionId = null; CWZ.dry = null; CWZ.applied = null; cwRender(); });
+    await page.click('#cwiz-load');
+    await waitW(page, () => CWZ.sessions && !CWZ.sessions.busy, 5000, 'load list 2');
+    const i0 = await page.evaluate((id) => CWZ.sessions.list.findIndex((x) => x.id === id), l0id);
+    await page.click('#cwiz-sess-' + i0);
+    await waitW(page, () => CWZ.step === 'solve' && !CWZ.solving && !!CWZ.solve, 300000, 'load L0 solve');
+    const l0 = await page.evaluate(() => ({ level: CWZ.solve.kin.level, ok: CWZ.solve.ok, kin: CWZ.solve.apply && CWZ.solve.apply.kinematics, msg: !!document.querySelector('#cwiz-body .cwiz-l0'), lv: CWZ.solve.kin.levels.map((l) => `${l.chosen ? '*' : ''}${l.name} ${l.ab.toFixed(3)}/${l.ba.toFixed(3)}`).join(' ') }));
+    if (l0.level !== 'L0' || !l0.ok || l0.kin !== null || !l0.msg) fail('load L0 ' + JSON.stringify(l0));
+    await page.evaluate(() => { const e = document.querySelector('#cwiz-body .cwiz-levels'); if (e) e.scrollIntoView({ block: 'center' }); });
+    await shot('7_L0_solve', `levels ${l0.lv}; apply kinematics ${JSON.stringify(l0.kin)}`);
+    // the L0 review: the message, the dry run with kinematics null (removes a stored correction)
+    await page.evaluate(() => { S.obs.is_torqued = true; S.state = 'Armed'; });
+    await page.click('#cwiz-review');
+    await waitW(page, () => !!CWZ.dry && !CWZ.busy, 10000, 'load L0 dry run');
+    const l0r = await page.evaluate(() => ({ msg: !!document.querySelector('#cwiz-body .cwiz-l0'), dry: __SIM.calls.filter(([p, b]) => p === '/api/v1/calibration/apply' && b.dry_run).pop()[1] }));
+    if (!l0r.msg || l0r.dry.kinematics !== null || !('kinematics' in l0r.dry)) fail('load L0 review ' + JSON.stringify({ msg: l0r.msg, kin: l0r.dry.kinematics }));
+    await page.evaluate(() => { const e = document.querySelector('#cwiz-body .cwiz-l0'); if (e) e.scrollIntoView({ block: 'center' }); });
+    await shot('8_L0_review', `L0 message ${l0r.msg}, dry-run kinematics ${JSON.stringify(l0r.dry.kinematics)}`);
+    if (errs.length) fail(`load page errors (${lang}/${vpName}): ${[...new Set(errs)].join(' | ').slice(0, 300)}`);
     await ctx.close();
   }
 }
