@@ -2559,6 +2559,7 @@ impl SupervisorInner {
             descend_contact: None, descend_contact_height_m: None, post_lift: None,
             pre_open: None, pre_open_m: None, held_width_m: None,
             stop_rad: None, offset_rad: None, pass: None,
+            approach: None, approach_reason: None, approach_signs: None, approach_flipped: None,
             phase_ms: std::collections::BTreeMap::new(), motions: Vec::new(),
         });
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
@@ -2715,7 +2716,7 @@ impl SupervisorInner {
         let duration = self.start_path_motion(input, &path)?;
         let id = self.begin_action(kind, tag);
         if input.power.is_some() { self.note_action_power_scale(id, path.power_scale); }
-        self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Path(PathTrajectory::new(path)) });
+        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
         Ok((id, duration + 0.5))
     }
 
@@ -2927,7 +2928,7 @@ impl SupervisorInner {
         self.check_plan_fresh(input)?;
         let duration = self.start_path_motion(input, &path)?;
         if input.power.is_some() { self.note_action_power_scale(id, path.power_scale); }
-        self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Path(PathTrajectory::new(path)) });
+        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Path(PathTrajectory::new(path))));
         if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
         Ok(duration + 0.5)
     }
@@ -2953,7 +2954,7 @@ impl SupervisorInner {
         self.target_positions = target;
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
-        self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Gripper(motion) });
+        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(motion)));
         if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
         Ok(duration)
     }
@@ -3044,7 +3045,7 @@ impl SupervisorInner {
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
         let id = self.begin_action("gripper", tag);
-        self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Gripper(motion) });
+        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(motion)));
         Ok((id, duration))
     }
 
@@ -3098,7 +3099,7 @@ impl SupervisorInner {
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
         let id = self.begin_action("gripper_zero_check", None);
-        self.active_trajectory = Some(ActiveTrajectory { action_id: Some(id), reference: Reference::Gripper(motion) });
+        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(motion)));
         let base_closed_rad = self.base_gripper_policy.as_ref().map_or(0.0, |p| p.closed_rad);
         self.gripper_stalled = false;
         self.gripper_high_torque_ticks = 0;
@@ -3551,7 +3552,7 @@ impl SupervisorInner {
             gripper_idx + 1, self.commanded_positions[gripper_idx], motion.target);
         if let Some(park) = self.watchdog_park.as_mut() { park.budget_s += motion.timeout_s.max(duration); }
         self.target_positions[gripper_idx] = motion.target;
-        self.active_trajectory = Some(ActiveTrajectory { action_id: None, reference: Reference::Gripper(motion) });
+        self.active_trajectory = Some(ActiveTrajectory::new(None, Reference::Gripper(motion)));
         self.park_release = Some(next);
         true
     }
@@ -4061,6 +4062,7 @@ impl SupervisorInner {
         } else {
             true
         };
+        let mut approach_started: Option<u64> = None;
         let stepped = if let Some(active) = self.active_trajectory.as_mut() {
             let ctx = StepCtx {
                 dt: servo_dt,
@@ -4091,8 +4093,25 @@ impl SupervisorInner {
                     Stepped::Replay(out, replay.phase_name(), replay.t_s())
                 }
             };
+            // same-side approach: progress over both legs; the first leg's end starts the short
+            // segment (src/backlash.rs)
+            let out = match (active.span.is_some(), out) {
+                (true, Stepped::Quintic(p, f, g)) => Stepped::Quintic(p, f, active.overall_progress(g)),
+                (true, Stepped::Arm(mut o)) => { o.progress = active.overall_progress(o.progress); Stepped::Arm(o) }
+                (_, o) => o,
+            };
+            if active.first_leg_ended() && active.start_then() { approach_started = active.action_id; }
             Some((active.action_id, out))
         } else { None };
+        if let Some(id) = approach_started {
+            // macro actions (grasp, place) already have a phase `approach`: theirs is `final_approach`
+            if self.macro_run.as_ref().is_some_and(|m| m.id == id) {
+                let progress = self.last_action.as_ref().map_or(0.0, |a| a.progress);
+                self.set_action_phase(id, "final_approach", progress, None, None);
+            } else if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
+                a.phase = Some("approach".into());
+            }
+        }
         match stepped {
             None => {}
             Some((action_id, Stepped::Action(out))) => {
@@ -4124,7 +4143,7 @@ impl SupervisorInner {
                 if let (Some(id), Some(a)) = (action_id, self.last_action.as_mut()) {
                     if a.id == id && a.is_running() && !macro_sub { a.progress = progress; }
                 }
-                if finished {
+                if finished && approach_started.is_none() {
                     self.active_trajectory = None;
                     self.commanded_velocities = vec![0.0; self.config.dof];
                     if !self.pending_normal_unload {

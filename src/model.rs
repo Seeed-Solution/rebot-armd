@@ -842,6 +842,9 @@ pub struct ArmConfig {
     /// Speed cap for every planned motion (actions, jog, home, park); None = no cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed_cap: Option<SpeedCap>,
+    /// Same-side (backlash-free) final approach (`src/backlash.rs`); None = direct motions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backlash_approach: Option<crate::backlash::BacklashApproach>,
     /// Collision guard (`src/collision.rs`); None = defaults, guard off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collision: Option<crate::collision::CollisionPolicy>,
@@ -954,6 +957,7 @@ impl Default for ArmConfig {
             gravity_comp: None,
             damiao_ranges: None,
             speed_cap: None,
+            backlash_approach: None,
             collision: None,
             torque_guard: None,
             power_budget: None,
@@ -995,6 +999,12 @@ impl ArmConfig {
     /// Index of the gripper joint, if the profile has one.
     pub fn gripper_index(&self) -> Option<usize> {
         self.gripper_joint.or_else(|| (self.dof > self.arm_dof()).then_some(self.arm_dof()))
+    }
+
+    /// Arm joints (armd indices below `dof`, not the gripper, at most `arm_dof` of them).
+    pub fn arm_joint_indices(&self) -> Vec<usize> {
+        let g = self.gripper_index();
+        (0..self.dof).filter(|i| Some(*i) != g).take(self.arm_dof()).collect()
     }
 
     /// The joint layout the Cartesian action planner, gravity compensation and the gripper
@@ -1172,6 +1182,7 @@ impl ArmConfig {
             }
         }
         if let Some(cap) = &self.speed_cap { cap.validate()?; }
+        if let Some(b) = &self.backlash_approach { b.validate(&self.joint_names, &self.arm_joint_indices())?; }
         if let Some(c) = &self.collision { c.validate()?; }
         if let Some(t) = &self.torque_guard {
             t.validate()?;
@@ -1461,6 +1472,7 @@ impl ArmConfig {
                 DamiaoRange::REBOT_DM_J4_J7,
             ]),
             speed_cap: None,
+            backlash_approach: None,
             // rebot-sysid on the real arm (B601-DM, 2026-11-11, ±0.08 rad, one session at two
             // poses): off until validated at more poses (kits/recamera-b601dm/README.md)
             collision: Some(crate::collision::CollisionPolicy {
@@ -1815,6 +1827,10 @@ pub struct Capabilities {
     /// `schema.power_budget`, `GET /api/v1/diagnostics/power`): enabled in the profile and a
     /// driver that reports torque. Present from capabilities version 9.
     pub power_budget: bool,
+    /// Actions accept `approach: "same_side" | "direct"` (and `move_to` / `move_relative`
+    /// `precise`); the profile settings are `schema.backlash_approach` (`src/backlash.rs`).
+    #[serde(default)]
+    pub backlash_approach: bool,
     #[serde(default)]
     pub auto_yaw: bool,
     /// Camera calibration wizard: `GET /api/v1/calibration`, WS `/api/v1/calibration/apply`
@@ -2061,6 +2077,7 @@ impl Capabilities {
             torque_guard: crate::torque_guard::TorqueGuardInfo::from_config(config).is_some(),
             // The driver half is applied by ArmSupervisor::get_schema.
             power_budget: config.power_budget.as_ref().is_some_and(|p| p.enabled),
+            backlash_approach: true,
             auto_yaw: false,
             calibration_apply: grasp,
             calibration_kinematics: grasp && config.arm_model.chain().is_none(),
@@ -2109,6 +2126,10 @@ pub struct ObservationSchema {
     /// Profile speed cap on planned motion; null when the profile sets none.
     #[serde(default)]
     pub speed_cap: Option<SpeedCap>,
+    /// Same-side final approach settings (`src/backlash.rs`); null = every motion approaches
+    /// directly. The cockpit's fine calibration pre-pose follows `delta_deg` and the sign rule.
+    #[serde(default)]
+    pub backlash_approach: Option<crate::backlash::BacklashApproach>,
     /// Profile home pose (rad, one value per joint); null in older schemas.
     #[serde(default)]
     pub home_positions: Option<Vec<f32>>,
@@ -2236,6 +2257,7 @@ impl ObservationSchema {
             servo_max_velocity: config.servo_limits().iter().map(|l| l.max_velocity).collect(),
             servo_max_lead_rad: Some(config.servo_max_lead_rad),
             speed_cap: config.speed_cap,
+            backlash_approach: config.backlash_approach.clone(),
             home_positions: Some(config.home_positions.clone()),
             resting_pose: config.resting_pose.clone(),
             torque_guard: crate::torque_guard::TorqueGuardInfo::from_config(config),

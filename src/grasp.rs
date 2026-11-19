@@ -1921,6 +1921,8 @@ pub struct GraspRequest {
     pub requires: TaskRequires,
     /// The task's model switch (None without a task or when it names no models).
     pub models: Option<TaskModels>,
+    /// Request field `approach` for the final descent (src/backlash.rs, `grasp_final`).
+    pub approach: crate::backlash::Request,
 }
 
 /// Body of `/api/v1/action/grasp`: `{label, box_norm, frame_id?, ts_ms?, task?, overrides?, tag?}`.
@@ -1965,7 +1967,8 @@ pub fn parse_grasp(body: &Value, base: &GraspSetup) -> Result<GraspRequest, Moti
         Some(Value::String(s)) if s.len() <= 64 => Some(s.clone()),
         _ => return Err(bad("tag must be a string of at most 64 bytes")),
     };
-    Ok(GraspRequest { label, box_norm, frame_id, setup, tag, task, requires, models })
+    let approach = crate::backlash::parse_request(body)?;
+    Ok(GraspRequest { label, box_norm, frame_id, setup, tag, task, requires, models, approach })
 }
 
 /// A request checked under the lock, ready to be planned outside it.
@@ -2268,7 +2271,7 @@ pub fn begin(inner: &mut SupervisorInner, supervisor: &Arc<ArmSupervisor>, sourc
     if let Some(task) = &planned.request.task {
         inner.update_action(id, |a| a.task = Some(task.clone()));
     }
-    let duration = expected_duration(&planned);
+    let duration = expected_duration(&planned) + inner.approach_estimate_s("grasp_final", planned.request.approach);
     spawn(supervisor.clone(), source, id, planned);
     Ok((id, duration))
 }
@@ -2324,6 +2327,11 @@ impl Orchestrator {
     /// Every grasp sub-motion: WORKSPACE_VIOLATION before anything is installed when its
     /// straight path from the commanded pose takes the envelope below the table clearance.
     async fn move_arm(&self, phase: &str, spec: GoalSpec, linear: f64) -> Result<SubDone, Stop> {
+        self.move_arm_final(phase, spec, linear, None).await
+    }
+
+    /// [`move_arm`](Self::move_arm) with an optional same-side final approach.
+    async fn move_arm_final(&self, phase: &str, spec: GoalSpec, linear: f64, approach: Option<crate::macro_action::FinalApproach>) -> Result<SubDone, Stop> {
         let input = {
             let inner = self.sup.inner().read().await;
             if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
@@ -2341,7 +2349,7 @@ impl Orchestrator {
         if let Some(e) = table_violation(&input.arm.fk(&input.q0), &goal, &self.envelope, self.setup.table_z_m) {
             return Err(crate::macro_action::arm_fail(e.into()));
         }
-        self.ctx.move_arm(phase, spec, Speed { linear, angular: motion::DEFAULT_ANGULAR_RPS }).await
+        self.ctx.move_arm_with(phase, spec, Speed { linear, angular: motion::DEFAULT_ANGULAR_RPS }, approach).await
     }
 
     /// The frame ran with the model set the grasp started with (or either side does not report it).
@@ -2705,7 +2713,7 @@ impl Orchestrator {
             self.sup.inner().write().await.update_action(self.id, |a| { a.recentre = Some(recentre); a.recentre_iterations = iterations; });
             self.phase("descend", 0.75).await?;
         }
-        self.descend(close_h).await?;
+        self.descend(close_h, planned.request.approach).await?;
         let closed = self.gripper_phase("close", 0.8, GripperCommand::Close).await?;
         let held_width = {
             let inner = self.sup.inner().read().await;
@@ -3320,10 +3328,15 @@ impl Orchestrator {
     /// Straight down to `close_h` above the table. Each poll while it runs records the peak
     /// |residual| of J2 / J3 and the peak J1..J6 tracking error; with `descend_contact_stop_nm`
     /// set, a J2 or J3 residual above it ends the descent at the measured position.
-    async fn descend(&self, close_h: f64) -> Result<(), Stop> {
+    /// The final descent to the close height; with the same-side approach (`grasp_final`) it
+    /// ends with the short segment, never rising towards the target from below.
+    async fn descend(&self, close_h: f64, approach: crate::backlash::Request) -> Result<(), Stop> {
         let s = &self.setup;
         let p = self.pose().await.p;
-        let mv = self.move_arm("descend", GoalSpec::Absolute { p: [p[0], p[1], s.table_z_m + close_h], r: None }, s.descend_speed_mps);
+        // the TCP never rises to the object from below; the envelope keeps the table clearance
+        let rules = crate::backlash::DescentRules { table: Some((self.envelope.clone(), s.table_z_m + TABLE_CLEARANCE_M)), ..crate::backlash::DescentRules::tcp() };
+        let final_approach = crate::macro_action::FinalApproach { use_: "grasp_final", request: approach, rules };
+        let mv = self.move_arm_final("descend", GoalSpec::Absolute { p: [p[0], p[1], s.table_z_m + close_h], r: None }, s.descend_speed_mps, Some(final_approach));
         tokio::pin!(mv);
         let (mut peak_res, mut peak_trk, mut contact): (Option<[f32; 2]>, Option<f32>, Option<f64>) = (None, None, None);
         let result = loop {
@@ -3353,11 +3366,16 @@ impl Orchestrator {
                 }
             }
         };
-        self.sup.inner().write().await.update_action(self.id, |a| {
-            a.descend_peak_residual_nm = peak_res;
-            a.descend_peak_tracking_rad = peak_trk;
-            if let Some(h) = contact { a.descend_contact = Some(true); a.descend_contact_height_m = Some(h as f32); }
-        });
+        {
+            let mut inner = self.sup.inner().write().await;
+            inner.update_action(self.id, |a| {
+                a.descend_peak_residual_nm = peak_res;
+                a.descend_peak_tracking_rad = peak_trk;
+                if let Some(h) = contact { a.descend_contact = Some(true); a.descend_contact_height_m = Some(h as f32); }
+            });
+            // a contact stop ends the descent before the short segment
+            if contact.is_some() { inner.approach_interrupted(self.id, "contact"); }
+        }
         result.map(|_| ())
     }
 

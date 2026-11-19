@@ -42,6 +42,8 @@ pub struct PlaceRequest {
     pub auto_yaw: Option<bool>,
     pub speed_scale: f64,
     pub tag: Option<String>,
+    /// Request field `approach` for the descent (src/backlash.rs, `place_final`).
+    pub approach: crate::backlash::Request,
 }
 
 impl PlaceRequest {
@@ -91,6 +93,7 @@ pub fn parse_place(inner: &SupervisorInner, body: &Value) -> Result<PlaceRequest
         auto_yaw,
         speed_scale,
         tag: motion::tag(body)?,
+        approach: crate::backlash::parse_request(body)?,
     })
 }
 
@@ -205,7 +208,7 @@ pub async fn start(supervisor: &Arc<ArmSupervisor>, body: &Value) -> Result<(u64
             a.orientation = Some("levelled".into());
         });
     }
-    let duration = expected_duration(&planned);
+    let duration = expected_duration(&planned) + supervisor.inner().read().await.approach_estimate_s("place_final", planned.request.approach);
     spawn(supervisor.clone(), id, planned);
     Ok((id, duration))
 }
@@ -233,7 +236,10 @@ async fn phases(ctx: &MacroCtx, planned: &PlannedPlace) -> Result<(), Stop> {
 
     ctx.phase("descend", 0.55).await?;
     let r_descend = if yaw_free && req.orientation.is_none() { None } else { Some(planned.r_place) };
-    ctx.move_arm("descend", GoalSpec::AbsoluteEx { p: req.target, r: r_descend, auto_yaw: yaw_free }, speed).await?;
+    // same-side approach (`place_final`, src/backlash.rs): the descent ends at the pre-target, the
+    // short segment (phase final_approach) reaches the target, never rising to it from below
+    let final_approach = crate::macro_action::FinalApproach { use_: "place_final", request: req.approach, rules: crate::backlash::DescentRules::tcp() };
+    ctx.move_arm_with("descend", GoalSpec::AbsoluteEx { p: req.target, r: r_descend, auto_yaw: yaw_free }, speed, Some(final_approach)).await?;
 
     if req.release { ctx.gripper_phase("open", 0.75, GripperCommand::Open).await?; }
 
