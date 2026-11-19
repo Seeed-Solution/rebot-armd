@@ -169,6 +169,15 @@ async fn cmd(r: &mut Rig, path: &str, body: Value) -> Value {
     }
 }
 
+/// Without a driver every tick mirrors commanded_positions into measured_positions, so a test
+/// moves the simulated arm through all three (writing only measured_positions is undone by the
+/// next 20 ms tick and races the code under test).
+fn put_joint(inner: &mut armd::SupervisorInner, j: usize, v: f32) {
+    inner.measured_positions[j] = v;
+    inner.commanded_positions[j] = v;
+    inner.target_positions[j] = v;
+}
+
 async fn set_q(r: &Rig, q: [f32; 7]) {
     let mut inner = r.sup.inner().write().await;
     inner.measured_positions = q.to_vec();
@@ -259,7 +268,7 @@ async fn software_zero_refuses_a_moving_arm() {
     let sup = r.sup.clone();
     let mover = tokio::spawn(async move {
         for i in 0..40 {
-            sup.inner().write().await.measured_positions[1] = 0.01 + 0.002 * i as f32;
+            put_joint(&mut *sup.inner().write().await, 1, 0.01 + 0.002 * i as f32);
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
     });
@@ -297,7 +306,7 @@ async fn motor_zero_marks_poses_and_gripper_calibration_stale() {
     {
         let mut inner = r.sup.inner().write().await;
         for p in inner.poses.list.poses.iter_mut() { p.stale = None; }
-        inner.measured_positions[0] = 0.004; // 0.23 deg
+        put_joint(&mut inner, 0, 0.004); // 0.23 deg
     }
     let ok = cmd(&mut r, PATH, json!({"joints": [1], "method": "motor"})).await;
     assert_eq!(ok["type"], "command_ack", "{ok}");
