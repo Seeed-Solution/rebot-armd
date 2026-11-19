@@ -891,7 +891,7 @@ pub fn grasp_mode(current: &str) -> &'static str {
 /// Pipelines a grasp triggers per centring step. A marker target would add `"aruco"`.
 pub const GRASP_PIPELINES: &[&str] = &["yolo"];
 /// How long one centring trigger waits for a fresh frame.
-const TRIGGER_WAIT_MS: u64 = 1000;
+pub(crate) const TRIGGER_WAIT_MS: u64 = 1000;
 
 /// Where the orchestrator gets detections; tests inject a simulated camera.
 pub trait DetectionSource: Send + Sync {
@@ -1431,6 +1431,16 @@ pub struct DepthMeasurement {
     pub jaw_clear: Option<bool>,
 }
 
+/// Table samples of a depth frame that calibrate the disparity: `(1 / z_fk, disp, z_fk)` per
+/// sample with a positive finite disparity whose ray meets the table (`table_z_m`) at an
+/// optical depth z_fk in [0.08, 2.5] m (FK pose + camera model).
+pub fn table_fk_samples(cam: &CamModel, pose: &Pose, depth: &DepthFrameInfo, table_z_m: f64) -> Vec<(f64, f64, f64)> {
+    depth.table_samples.iter().filter_map(|&[u, v, disp]| {
+        if disp <= 1e-3 || !disp.is_finite() { return None; }
+        cam.table_optical_depth(pose, [u, v], table_z_m).map(|z_fk| (1.0 / z_fk, disp, z_fk))
+    }).collect()
+}
+
 pub fn extract_table_obs(
     cam: &CamModel,
     pose: &Pose,
@@ -1593,15 +1603,7 @@ pub fn calibrate_depth_why(
 ) -> Result<DepthCalibration, &'static str> {
     let depth = depth.ok_or("no_depth_frame")?;
 
-    let mut valid_samples: Vec<(f64, f64, f64)> = Vec::new();
-    for sample in &depth.table_samples {
-        let [u, v, disp] = *sample;
-        if disp > 1e-3 && disp.is_finite() {
-            if let Some(z_fk) = cam.table_optical_depth(pose, [u, v], table_z_m) {
-                valid_samples.push((1.0 / z_fk, disp, z_fk));
-            }
-        }
-    }
+    let valid_samples = table_fk_samples(cam, pose, depth, table_z_m);
 
     if depth.metric_model {
         let a_prior = (600.0 / 640.0) / (cam.fx / cam.size[0].max(1.0));
