@@ -37,6 +37,7 @@ fn so_arm101_config() -> ArmConfig {
     o.remove("model_offsets_rad");
     let mut c: ArmConfig = serde_json::from_value(v).unwrap();
     c.dof = 6;
+    c.zero_reference = None;
     c.joint_names = vec!["j1".into(), "j2".into(), "j3".into(), "j4".into(), "j5".into(), "gripper".into()];
     c.limits = (0..6).map(|i| JointLimit {
         name: if i < 5 { format!("j{}", i + 1) } else { "gripper".into() },
@@ -91,6 +92,7 @@ fn config_6_plus_0() -> ArmConfig {
     o.remove("model_offsets_rad");
     let mut c: ArmConfig = serde_json::from_value(v).unwrap();
     c.dof = 6;
+    c.zero_reference = None;
     c.joint_names.truncate(6);
     c.limits.truncate(6);
     c.home_positions.truncate(6);
@@ -210,6 +212,7 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
         arm_dof: Some(5),
         gripper_joint: Some(5),
         joint_names: Some(vec!["j1".into(), "j2".into(), "j3".into(), "j4".into(), "j5".into(), "gripper".into()]),
+        stale: None,
     };
 
     let list_51 = PoseList {
@@ -319,6 +322,7 @@ fn test_profile_id_pose_and_replay_rejection() {
         arm_dof: Some(5),
         gripper_joint: Some(5),
         joint_names: Some(vec!["j1".into(), "j2".into(), "j3".into(), "j4".into(), "j5".into(), "gripper".into()]),
+        stale: None,
     };
     let list_100 = PoseList {
         profile_id: Some("so_arm100".into()),
@@ -406,6 +410,7 @@ fn test_legacy_metadata_guard_5dof_vs_6dof_7dof() {
         arm_dof: None,
         gripper_joint: None,
         joint_names: None,
+        stale: None,
     };
     let legacy_list_6 = PoseList {
         profile_id: None,

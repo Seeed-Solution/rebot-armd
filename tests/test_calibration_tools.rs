@@ -57,7 +57,9 @@ async fn motor_zero_support_comes_from_the_driver() {
     assert_eq!(t["motor_zero"]["joints"], json!([1, 2, 3, 4, 5, 6, 7]));
     assert_eq!(t["motor_zero"]["method"], json!("set_current"));
     assert_eq!(t["motor_zero"]["requires"], json!(["lease", "torque_off", "no_action", "no_fault"]));
-    assert_eq!(t["motor_zero"]["invalidates"], json!(["kinematics", "camera"]));
+    assert_eq!(t["motor_zero"]["invalidates"], json!(["kinematics", "camera", "poses", "gripper_calibration"]));
+    assert_eq!(t["motor_zero"]["methods"], json!(["software", "motor"]), "the profile has a zero_reference");
+    assert_eq!((t["motor_zero"]["motor"].clone(), t["motor_zero"]["software"].clone()), (json!(true), json!(true)));
     // Damiao: supported, persistence not verified on hardware
     let dm = armd::driver::DamiaoArmDriver::new(armd::transport::MockCanTransport::new(), (1..=7).collect());
     let sup = ArmSupervisor::new(ArmConfig::rebot_dm()).with_driver(Box::new(dm));
@@ -71,4 +73,13 @@ async fn motor_zero_support_comes_from_the_driver() {
     assert_eq!(t["motor_zero"]["supported"], json!(false), "{t}");
     assert!(t["motor_zero"]["reason"].as_str().unwrap().contains("RobStride"), "{t}");
     assert!(t["motor_zero"].get("joints").is_none(), "{t}");
+    // RobStride with a zero_reference: the software zero only
+    let rs = armd::driver::RobStrideArmDriver::new(armd::transport::MockCanTransport::new(), (1..=6).collect());
+    let cfg = ArmConfig { dof: 6, zero_reference: Some(armd::model::ZeroReference { positions: vec![0.0; 6], name: "rest".into() }), ..ArmConfig::default() };
+    let sup = ArmSupervisor::new(cfg).with_driver(Box::new(rs));
+    let t = serde_json::to_value(sup.get_schema().await).unwrap()["capabilities"]["calibration_tools"].clone();
+    assert_eq!(t["motor_zero"]["supported"], json!(true), "{t}");
+    assert_eq!(t["motor_zero"]["methods"], json!(["software"]), "{t}");
+    assert_eq!(t["motor_zero"]["motor"], json!(false), "{t}");
+    assert!(t["motor_zero"]["notes"][0].as_str().unwrap().contains("RobStride"), "{t}");
 }

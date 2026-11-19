@@ -1,23 +1,34 @@
-//! Motor zero calibration: WS `/api/v1/calibration/motor_zero {joints, dry_run, force}` makes
-//! the current position of the given joints (1-based) their zero.
+//! Zero calibration: WS `/api/v1/calibration/motor_zero {joints, dry_run, force, method}` makes
+//! the current position of the given joints (1-based) the profile's `zero_reference` (the folded
+//! rest pose; 0 on the B601-DM). `method`: `motor` (the driver's set-zero command, Damiao flash;
+//! afterwards the joint zero offsets of those joints are -reference) or `software`
+//! (calibration.json `joint_zero`, every driver, reversible with WS
+//! `/api/v1/calibration/joint_zero/restore {backup}`; src/joint_zero.rs). Absent: `motor` when the
+//! driver supports it, else `software`.
 //!
 //! Checked under the lock: the driver supports it (`calibration_tools.motor_zero`), every joint
 //! is in `calibration_tools.motor_zero.joints`, the caller holds the lease (WS command), torque
 //! is off, no action or motion runs (MOTOR_ZERO_ARMED), the arm is not in Fault / EStop
 //! (MOTOR_ZERO_FAULT), the feedback is fresh (MOTOR_ZERO_NO_FEEDBACK) and, without
-//! `force`, no joint reads more than [`MOTOR_ZERO_MAX_OFFSET_DEG`] from 0 (MOTOR_ZERO_FAR).
+//! `force`, no joint reads more than [`MOTOR_ZERO_MAX_OFFSET_DEG`] from its reference (MOTOR_ZERO_FAR).
 //! `dry_run` returns the readings and the predicted change and changes nothing.
 //!
 //! A real run (its own task, `calibration_busy` and `motor_zero_busy` set: motion, torque,
 //! clear_fault and configuration writes are refused meanwhile) follows the official sequence
 //! (reBotArm_control_py `RebotArm.set_zero`): disable every motor, wait for fresh feedback
 //! confirming each requested motor disabled, send the set-zero command per joint 0.1 s apart,
-//! then wait up to 1 s until every zeroed joint reads within [`MOTOR_ZERO_VERIFY_MRAD`] of 0 in
+//! then wait up to 1 s until every zeroed joint reads within [`MOTOR_ZERO_VERIFY_MRAD`] of its reference in
 //! feedback newer than its command (MOTOR_ZERO_UNVERIFIED otherwise, with the readings). It
 //! never moves the arm; torque stays off. Each run is appended to `motor_zero.jsonl` in the
 //! calibration backup directory, and the calibrations measured with the old zero are
-//! invalidated ([`crate::calibration::invalidate_after_motor_zero`]): the kinematic correction is
-//! removed (live and in `calibration.json`) and the camera calibration is marked stale.
+//! invalidated ([`crate::calibration::invalidate_after_zero`]): the kinematic correction is
+//! removed (live and in `calibration.json`), the camera calibration is marked stale and, for
+//! joints whose reading moved by more than 0.5 deg, the saved poses and (gripper joint) the gripper
+//! calibration are marked stale.
+//!
+//! The software zero averages the readings over [`crate::joint_zero::SOFTWARE_CAPTURE`] (the arm
+//! must stay still), backs up `calibration.json`, installs offset = motor reading - reference and
+//! verifies the readings like the motor zero.
 //!
 //! A motor zero cannot be restored: the motors hold the new zero; a different zero is set again
 //! by putting the arm at that pose and running the tool.
@@ -50,14 +61,21 @@ pub struct MotorZeroRequest {
     pub joints: Vec<usize>,
     pub dry_run: bool,
     pub force: bool,
+    /// `motor` / `software`; None = the default ([`check`] resolves it).
+    pub method: Option<String>,
 }
+
+/// Largest motion (rad) of a joint during the software capture.
+pub const CAPTURE_MAX_SPREAD_RAD: f32 = 0.01;
+/// WS path of the joint zero restore.
+pub const RESTORE_PATH: &str = "/api/v1/calibration/joint_zero/restore";
 
 fn invalid(m: impl Into<String>) -> CalibError { CalibError::new(400, "INVALID_COMMAND", m) }
 
 pub fn parse(body: &Value) -> Result<MotorZeroRequest, CalibError> {
     let o = body.as_object().ok_or_else(|| invalid("Command body must be an object"))?;
     for k in o.keys() {
-        if !["joints", "dry_run", "force"].contains(&k.as_str()) { return Err(invalid(format!("unknown field: {k}"))); }
+        if !["joints", "dry_run", "force", "method"].contains(&k.as_str()) { return Err(invalid(format!("unknown field: {k}"))); }
     }
     let arr = o.get("joints").and_then(Value::as_array).filter(|a| !a.is_empty())
         .ok_or_else(|| invalid("joints must be a non-empty array of joint numbers (1-based)"))?;
@@ -72,7 +90,12 @@ pub fn parse(body: &Value) -> Result<MotorZeroRequest, CalibError> {
         Some(Value::Bool(b)) => Ok(*b),
         Some(_) => Err(invalid(format!("{k} must be boolean"))),
     };
-    Ok(MotorZeroRequest { joints, dry_run: flag("dry_run")?, force: flag("force")? })
+    let method = match o.get("method") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(m)) if m == "motor" || m == "software" => Some(m.clone()),
+        Some(_) => return Err(invalid("method must be \"motor\" or \"software\"")),
+    };
+    Ok(MotorZeroRequest { joints, dry_run: flag("dry_run")?, force: flag("force")?, method })
 }
 
 fn max_offset_rad() -> f32 { (MOTOR_ZERO_MAX_OFFSET_DEG as f32).to_radians() }
@@ -113,23 +136,53 @@ fn readings(inner: &SupervisorInner) -> Result<Vec<f32>, CalibError> {
     Ok(q)
 }
 
-fn joint_rows(req: &MotorZeroRequest, q: &[f32]) -> Vec<Value> {
-    req.joints.iter().map(|&j| json!({"joint": j + 1, "name": format!("J{}", j + 1), "reading_rad": q[j],
-        "reading_deg": f64::from(q[j]).to_degrees(), "after_rad": 0.0, "change_rad": -q[j], "far": q[j].abs() > max_offset_rad()})).collect()
+/// The reference (joint angles) of the zero: the profile's `zero_reference`, else 0.
+fn reference(inner: &SupervisorInner) -> Vec<f32> {
+    inner.zero_reference_joints().unwrap_or_else(|| vec![0.0; inner.config.dof])
 }
 
-/// What a run would invalidate now.
-fn invalidates(inner: &SupervisorInner) -> Value {
-    json!({"kinematics": inner.config.arm_model.correction().is_some(), "camera": inner.camera_calibrated()})
+fn far(q: &[f32], r: &[f32], j: usize) -> bool { (q[j] - r[j]).abs() > max_offset_rad() }
+
+fn joint_rows(req: &MotorZeroRequest, q: &[f32], r: &[f32]) -> Vec<Value> {
+    req.joints.iter().map(|&j| json!({"joint": j + 1, "name": format!("J{}", j + 1), "reading_rad": q[j],
+        "reading_deg": f64::from(q[j]).to_degrees(), "reference_rad": r[j], "after_rad": r[j], "change_rad": r[j] - q[j], "far": far(q, r, j)})).collect()
+}
+
+/// What a run would invalidate now (poses / gripper calibration only for joints moving > 0.5 deg).
+fn invalidates(inner: &SupervisorInner, req: &MotorZeroRequest, q: &[f32], r: &[f32]) -> Value {
+    let moved: Vec<usize> = req.joints.iter().copied().filter(|&j| f64::from((q[j] - r[j]).abs()) > crate::joint_zero::STALE_THRESHOLD_RAD).collect();
+    let grip = inner.config.gripper_index();
+    json!({"kinematics": inner.config.arm_model.correction().is_some(), "camera": inner.camera_calibrated(),
+        "poses": if moved.is_empty() { Vec::new() } else { inner.poses.list.poses.iter().map(|p| p.name.clone()).collect() },
+        "gripper_calibration": grip.is_some_and(|g| moved.contains(&g)) && (inner.gripper_calib_offset.is_some() || inner.gripper_calib_jaw_opening.is_some())})
+}
+
+/// The method of a request: given, else `motor` when the driver supports it, else `software`.
+fn method_of(req: &MotorZeroRequest, tool: &crate::model::MotorZeroTool) -> &'static str {
+    match req.method.as_deref() {
+        Some("software") => "software",
+        Some(_) => "motor",
+        None if tool.motor => "motor",
+        None => "software",
+    }
 }
 
 /// Under the lock: parse and check. Ok(None) = dry run reply; Ok(Some) = a real run to start
 /// (the caller sets the busy flags).
 pub fn check(inner: &SupervisorInner, body: &Value) -> Result<(MotorZeroRequest, Option<Value>), CalibError> {
-    let req = parse(body)?;
+    let mut req = parse(body)?;
     let tool = inner.calibration_tools().motor_zero;
     if !tool.support.supported {
         return Err(CalibError::new(400, "UNSUPPORTED", format!("motor zero is not supported: {}", tool.support.reason.unwrap_or_default())));
+    }
+    let method = method_of(&req, &tool);
+    req.method = Some(method.into());
+    if method == "motor" && !tool.motor {
+        return Err(CalibError::new(400, "UNSUPPORTED", format!("motor zero is not supported by this driver; use method \"software\" ({})",
+            tool.support.notes.join("; "))));
+    }
+    if method == "software" && !tool.software {
+        return Err(CalibError::new(400, "UNSUPPORTED", "the software zero needs a profile zero_reference"));
     }
     if let Some(j) = req.joints.iter().find(|j| !tool.joints.contains(&(*j + 1))) {
         return Err(CalibError::new(400, "JOINT_UNSUPPORTED", format!("joint {} is not in calibration_tools.motor_zero.joints {:?}", j + 1, tool.joints)));
@@ -137,18 +190,21 @@ pub fn check(inner: &SupervisorInner, body: &Value) -> Result<(MotorZeroRequest,
     if inner.calibration_busy { return Err(CalibError::new(409, "CONFIG_BUSY", "a calibration apply, restore or motor zero is running")); }
     state_checks(inner)?;
     let q = readings(inner)?;
-    let rows = joint_rows(&req, &q);
+    let r = reference(inner);
+    let rows = joint_rows(&req, &q, &r);
+    let persist = if method == "software" { Some("calibration_file".to_string()) } else { tool.support.persist.clone() };
     if req.dry_run {
-        let far: Vec<usize> = req.joints.iter().filter(|&&j| q[j].abs() > max_offset_rad()).map(|j| j + 1).collect();
-        return Ok((req, Some(json!({"dry_run": true, "joints": rows, "needs_force": !far.is_empty(), "far_joints": far,
-            "invalidates": invalidates(inner), "method": tool.support.method, "persist": tool.support.persist,
-            "persist_verified": tool.support.persist_verified, "max_offset_deg": MOTOR_ZERO_MAX_OFFSET_DEG}))));
+        let far_j: Vec<usize> = req.joints.iter().filter(|&&j| far(&q, &r, j)).map(|j| j + 1).collect();
+        return Ok((req.clone(), Some(json!({"dry_run": true, "joints": rows, "needs_force": !far_j.is_empty(), "far_joints": far_j,
+            "invalidates": invalidates(inner, &req, &q, &r), "zero_method": method, "method": tool.support.method, "persist": persist,
+            "persist_verified": method == "software" || tool.support.persist_verified, "max_offset_deg": MOTOR_ZERO_MAX_OFFSET_DEG}))));
     }
-    let far: Vec<String> = req.joints.iter().filter(|&&j| q[j].abs() > max_offset_rad())
-        .map(|&j| format!("J{} reads {:.1} deg", j + 1, f64::from(q[j]).to_degrees())).collect();
-    if !far.is_empty() && !req.force {
-        let mut e = CalibError::new(409, "MOTOR_ZERO_FAR", format!("{} (more than {MOTOR_ZERO_MAX_OFFSET_DEG} deg from 0); \
-            check the arm is at the zero pose, or send force: true for a lost zero", far.join(", ")));
+    let far_s: Vec<String> = req.joints.iter().filter(|&&j| far(&q, &r, j))
+        .map(|&j| format!("J{} reads {:.1} deg (reference {:.1} deg)", j + 1, f64::from(q[j]).to_degrees(), f64::from(r[j]).to_degrees())).collect();
+    if !far_s.is_empty() && !req.force {
+        let far = far_s;
+        let mut e = CalibError::new(409, "MOTOR_ZERO_FAR", format!("{} (more than {MOTOR_ZERO_MAX_OFFSET_DEG} deg from the reference); \
+            check the arm is in the rest pose, or send force: true for a lost zero", far.join(", ")));
         e.extra.insert("joints".into(), json!(rows));
         return Err(e);
     }
@@ -181,17 +237,29 @@ async fn locked_step<T>(sup: &ArmSupervisor, check: &LeaseCheck, step: &'static 
     f(&mut inner).map_err(at)
 }
 
+/// The joint zero after zeroing `joints` (0-based) with offsets `new` (None = unchanged in the
+/// file: offsets all 0 and no `joint_zero` stored).
+fn zero_entry(inner: &SupervisorInner, new: &[f32], method: &str) -> Option<Option<crate::joint_zero::JointZero>> {
+    let name = inner.config.zero_reference.as_ref().map_or("rest", |r| r.name.as_str()).to_string();
+    let stored = inner.calibration.as_ref().and_then(|c| c.joint_zero.as_ref()).is_some();
+    if new.iter().all(|o| *o == 0.0) {
+        return stored.then_some(None);
+    }
+    Some(Some(crate::joint_zero::JointZero::new(new, method, &name)))
+}
+
 /// The real run (after [`check`]; the caller holds the busy flags and clears them afterwards).
 pub async fn run(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZeroRequest, check: &LeaseCheck) -> Result<Value, CalibError> {
+    if req.method.as_deref() == Some("software") { return run_software(sup, deps, req, check).await; }
     let started = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     // 1. readings, then disable every motor (official sequence), torque stays off
-    let (before, t_disable) = locked_step(sup, check, "disable", |inner| {
+    let (before, r, t_disable) = locked_step(sup, check, "disable", |inner| {
         let q = readings(inner)?;
         if let Some(d) = inner.driver.as_ref() {
             let mut drv = d.lock().map_err(|_| CalibError::new(500, "INTERNAL", "driver unavailable"))?;
             drv.set_torque(false).map_err(|e| CalibError::new(500, "MOTOR_ZERO_NOT_DISABLED", format!("disable failed: {e}")))?;
         }
-        Ok((q, Instant::now()))
+        Ok((q, reference(inner), Instant::now()))
     }).await?;
     // 2. fresh feedback confirming each requested motor disabled (state 0)
     let deadline = t_disable + DISABLE_CONFIRM_TIMEOUT;
@@ -211,55 +279,180 @@ pub async fn run(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZer
         }
         tokio::time::sleep(POLL).await;
     }
-    // 3. one set-zero command per joint, spaced
+    // 3. one set-zero command per joint, spaced; the joint zero offset of each zeroed joint
+    // becomes -reference (the motor reads 0 at the reference)
     let mut sent: Vec<(usize, Instant)> = Vec::new();
+    let mut failure = None;
     for (k, &j) in req.joints.iter().enumerate() {
         if k > 0 { tokio::time::sleep(COMMAND_SPACING).await; }
-        let r = locked_step(sup, check, "set_zero", |inner| {
-            inner.set_motor_zero(j).map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", format!("J{}: {e}", j + 1)))
+        let rj = r[j];
+        let res = locked_step(sup, check, "set_zero", |inner| {
+            inner.set_motor_zero(j).map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", format!("J{}: {e}", j + 1)))?;
+            let mut off = inner.joint_zero_offsets.clone();
+            off[j] = -rj;
+            inner.set_joint_zero_offsets(&off).map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", format!("J{} offset: {e}", j + 1)))
         }).await;
-        match r {
+        match res {
             Ok(()) => sent.push((j, Instant::now())),
             Err(mut e) if sent.is_empty() => { e.message.push_str("; no zero was changed"); return Err(e); }
-            Err(e) => {
-                // some zeros changed: log and invalidate before reporting the failure
-                let rows = verify(sup, &req, &before, &sent).await;
-                let inv = crate::calibration::invalidate_after_motor_zero(sup, deps, &sent.iter().map(|(j, _)| j + 1).collect::<Vec<_>>()).await;
-                let log = write_log(deps, &started, &req, &before, &rows, "partial", &inv).await;
-                let mut e = e;
-                e.message.push_str(&format!("; joints {:?} were zeroed before the failure", sent.iter().map(|(j, _)| j + 1).collect::<Vec<_>>()));
-                e.extra.insert("joints".into(), json!(rows));
-                e.extra.insert("invalidated".into(), inv);
-                e.extra.insert("log".into(), json!(log));
-                return Err(e);
-            }
+            Err(e) => { failure = Some(e); break; }
         }
     }
     // 4. verification from feedback newer than each command
-    let rows = verify(sup, &req, &before, &sent).await;
+    let rows = verify(sup, &req, &before, &r, &sent).await;
     let verified = rows.iter().all(|r| r["verified"] == json!(true));
-    // 5. invalidate what was measured with the old zero, log
+    // 5. invalidate what was measured with the old zero, store the joint zero, log
     let zeroed: Vec<usize> = sent.iter().map(|(j, _)| j + 1).collect();
-    let inv = crate::calibration::invalidate_after_motor_zero(sup, deps, &zeroed).await;
-    let log = write_log(deps, &started, &req, &before, &rows, if verified { "verified" } else { "unverified" }, &inv).await;
+    let changes: Vec<f32> = sent.iter().map(|(j, _)| r[*j] - before[*j]).collect();
+    let entry = { let inner = sup.inner().read().await; zero_entry(&inner, &inner.joint_zero_offsets, "motor") };
+    let inv = crate::calibration::invalidate_after_zero(sup, deps, &zeroed, &changes, "motor", entry).await;
+    let result = if failure.is_some() { "partial" } else if verified { "verified" } else { "unverified" };
+    let log = write_log(deps, &started, &req, &before, &rows, result, &inv).await;
+    if let Some(mut e) = failure {
+        e.message.push_str(&format!("; joints {zeroed:?} were zeroed before the failure"));
+        e.extra.insert("joints".into(), json!(rows));
+        e.extra.insert("invalidated".into(), inv);
+        e.extra.insert("log".into(), json!(log));
+        return Err(e);
+    }
     let tool = sup.inner().read().await.calibration_tools().motor_zero;
     tracing::warn!("Motor zero of joints {zeroed:?} (readings before {:?}): {}", req.joints.iter().map(|&j| before[j]).collect::<Vec<_>>(),
         if verified { "verified" } else { "NOT verified" });
     if !verified {
-        let mut e = CalibError::new(500, "MOTOR_ZERO_UNVERIFIED", format!("the set-zero commands were sent but not every joint read within {MOTOR_ZERO_VERIFY_MRAD} mrad of 0 \
+        let mut e = CalibError::new(500, "MOTOR_ZERO_UNVERIFIED", format!("the set-zero commands were sent but not every joint read within {MOTOR_ZERO_VERIFY_MRAD} mrad of its reference \
             within {} ms; check the readings and run the tool again", VERIFY_TIMEOUT.as_millis()));
         e.extra.insert("joints".into(), json!(rows));
         e.extra.insert("invalidated".into(), inv);
         e.extra.insert("log".into(), json!(log));
         return Err(e);
     }
-    Ok(json!({"joints": rows, "invalidated": inv, "log": log, "method": tool.support.method, "persist": tool.support.persist,
+    Ok(json!({"joints": rows, "invalidated": inv, "log": log, "zero_method": "motor", "method": tool.support.method, "persist": tool.support.persist,
         "persist_verified": tool.support.persist_verified, "torque": "off"}))
 }
 
-/// Wait up to [`VERIFY_TIMEOUT`] for every zeroed joint to read within the tolerance in
-/// feedback newer than its command; one row per requested joint.
-async fn verify(sup: &ArmSupervisor, req: &MotorZeroRequest, before: &[f32], sent: &[(usize, Instant)]) -> Vec<Value> {
+/// Software zero: average the readings, back up calibration.json, install the offsets, verify.
+async fn run_software(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: MotorZeroRequest, check: &LeaseCheck) -> Result<Value, CalibError> {
+    let started = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    // 1. capture: mean of fresh readings over SOFTWARE_CAPTURE; the arm must stay still
+    let (r, n) = locked_step(sup, check, "capture", |inner| { readings(inner)?; Ok((reference(inner), inner.config.dof)) }).await?;
+    let t0 = Instant::now();
+    let (mut sum, mut lo, mut hi, mut count) = (vec![0.0f64; n], vec![f32::INFINITY; n], vec![f32::NEG_INFINITY; n], 0u32);
+    while t0.elapsed() < crate::joint_zero::SOFTWARE_CAPTURE || count == 0 {
+        let q = locked_step(sup, check, "capture", |inner| readings(inner)).await?;
+        for j in 0..n { sum[j] += f64::from(q[j]); lo[j] = lo[j].min(q[j]); hi[j] = hi[j].max(q[j]); }
+        count += 1;
+        tokio::time::sleep(POLL).await;
+    }
+    let before: Vec<f32> = sum.iter().map(|v| (*v / f64::from(count)) as f32).collect();
+    let moving: Vec<String> = req.joints.iter().filter(|&&j| hi[j] - lo[j] > CAPTURE_MAX_SPREAD_RAD)
+        .map(|&j| format!("J{} moved {:.2} deg", j + 1, f64::from(hi[j] - lo[j]).to_degrees())).collect();
+    if !moving.is_empty() {
+        return Err(CalibError::new(409, "ZERO_MOVING", format!("{} during the {} ms capture; hold the arm still in the rest pose and run again; nothing was changed",
+            moving.join(", "), crate::joint_zero::SOFTWARE_CAPTURE.as_millis())));
+    }
+    // 2. new offsets: offset += mean reading - reference
+    let (old, new) = {
+        let inner = sup.inner().read().await;
+        let old = inner.joint_zero_offsets.clone();
+        let mut new = old.clone();
+        for &j in &req.joints { new[j] = old[j] + (before[j] - r[j]); }
+        (old, new)
+    };
+    if let Some(j) = req.joints.iter().find(|&&j| f64::from(new[j].abs()) > crate::joint_zero::MAX_OFFSET_RAD) {
+        return Err(CalibError::new(409, "MOTOR_ZERO_FAR", format!("J{} would need a joint zero offset of {:.1} deg; nothing was changed", j + 1, f64::from(new[*j]).to_degrees())));
+    }
+    // 3. backup, 4. install, 5. verify, 6. store + invalidate, log
+    let backup = write_zero_backup(deps, "software_zero", &old).await.map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("backup: {e}")))?;
+    let t_apply = locked_step(sup, check, "apply", |inner| {
+        inner.set_joint_zero_offsets(&new).map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", e))?;
+        Ok(Instant::now())
+    }).await?;
+    let sent: Vec<(usize, Instant)> = req.joints.iter().map(|&j| (j, t_apply)).collect();
+    let rows = verify(sup, &req, &before, &r, &sent).await;
+    let verified = rows.iter().all(|r| r["verified"] == json!(true));
+    let zeroed: Vec<usize> = req.joints.iter().map(|j| j + 1).collect();
+    let changes: Vec<f32> = req.joints.iter().map(|&j| r[j] - before[j]).collect();
+    let entry = { let inner = sup.inner().read().await; zero_entry(&inner, &new, "software") };
+    let inv = crate::calibration::invalidate_after_zero(sup, deps, &zeroed, &changes, "software", entry).await;
+    let log = write_log(deps, &started, &req, &before, &rows, if verified { "verified" } else { "unverified" }, &inv).await;
+    tracing::warn!("Software zero of joints {zeroed:?}: offsets {old:?} -> {new:?} rad (backup {})", backup.display());
+    let mut out = json!({"joints": rows, "invalidated": inv, "log": log, "zero_method": "software", "persist": "calibration_file", "persist_verified": true,
+        "torque": "off", "backup": backup.display().to_string(), "offsets_before": old, "offsets_after": new});
+    if !verified {
+        let mut e = CalibError::new(500, "MOTOR_ZERO_UNVERIFIED", format!("the joint zero was installed but not every joint read within {MOTOR_ZERO_VERIFY_MRAD} mrad of its reference; \
+            restore backup {} or run the tool again", backup.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+        if let Value::Object(m) = out.take() { e.extra = m; }
+        return Err(e);
+    }
+    out["restore"] = json!({"path": RESTORE_PATH, "backup": backup.file_name().map(|n| n.to_string_lossy().into_owned())});
+    Ok(out)
+}
+
+/// A backup of `calibration.json` before a joint zero change: `<backup_dir>/<time>/` with
+/// `calibration.json` (when it exists) and `manifest.json` (`reason`, `joint_zero_offsets`).
+async fn write_zero_backup(deps: &CalibrationDeps, reason: &str, offsets: &[f32]) -> Result<std::path::PathBuf, String> {
+    let (root, calib) = (deps.backup_dir.clone(), deps.path.clone());
+    let manifest = json!({"created_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true), "reason": reason, "joint_zero_offsets": offsets});
+    crate::calibration::blocking(move || {
+        std::fs::create_dir_all(&root)?;
+        let dir = root.join(crate::calibration::backup_name(&root));
+        std::fs::create_dir(&dir)?;
+        let mut files = vec!["manifest.json"];
+        if let Some(t) = crate::calibration::read_if_file(&calib)? { crate::persist::write_atomic(&dir.join("calibration.json"), &t)?; files.push("calibration.json"); }
+        let mut manifest = manifest;
+        manifest["files"] = json!(files);
+        crate::persist::write_atomic(&dir.join("manifest.json"), &serde_json::to_string_pretty(&manifest).unwrap_or_default())?;
+        Ok(dir)
+    }).await
+}
+
+/// Under the lock: check a joint zero restore `{backup}` (torque off, no action, lease).
+pub fn check_restore(inner: &SupervisorInner, body: &Value) -> Result<String, CalibError> {
+    let name = body.get("backup").and_then(Value::as_str)
+        .filter(|n| !n.is_empty() && n.len() <= 64 && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .ok_or_else(|| invalid("backup must be the name of a software zero backup (GET /api/v1/calibration backups)"))?.to_string();
+    if body.as_object().is_some_and(|o| o.keys().any(|k| k != "backup")) { return Err(invalid("only the field backup is allowed")); }
+    if inner.config.zero_reference.is_none() { return Err(CalibError::new(400, "UNSUPPORTED", "the joint zero needs a profile zero_reference")); }
+    if inner.calibration_busy { return Err(CalibError::new(409, "CONFIG_BUSY", "a calibration apply, restore or zero is running")); }
+    state_checks(inner)?;
+    Ok(name)
+}
+
+/// WS `/api/v1/calibration/joint_zero/restore {backup}`: put back the joint zero a software zero
+/// backup holds (its `calibration.json` `joint_zero`, none = offsets 0), with a new backup first;
+/// invalidates like a zero.
+pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, name: String, check: &LeaseCheck) -> Result<Value, CalibError> {
+    let dir = deps.backup_dir.join(&name);
+    let manifest: Value = std::fs::read_to_string(dir.join("manifest.json")).ok().and_then(|t| serde_json::from_str(&t).ok())
+        .ok_or_else(|| CalibError::new(404, "BACKUP_NOT_FOUND", format!("backup {name}: no manifest.json")))?;
+    if manifest.get("reason").and_then(Value::as_str) != Some("software_zero") {
+        return Err(invalid(format!("backup {name} is not a software zero backup")));
+    }
+    let target: Option<crate::joint_zero::JointZero> = match crate::calibration::read_if_file(&dir.join("calibration.json")) {
+        Ok(None) => None,
+        Ok(Some(t)) => serde_json::from_str::<crate::calibration::CalibrationFile>(&t).map_err(|e| invalid(format!("backup {name}: calibration.json: {e}")))?.joint_zero,
+        Err(e) => return Err(CalibError::new(500, "PERSIST_FAILED", format!("backup {name}: {e}"))),
+    };
+    let (old, new, r) = locked_step(sup, check, "restore", |inner| {
+        let n = inner.config.dof;
+        let new = target.as_ref().map_or_else(|| vec![0.0; n], |z| z.offsets());
+        if let Some(z) = &target { z.validate(Some(n)).map_err(|e| invalid(format!("backup {name}: {e}")))?; }
+        Ok((inner.joint_zero_offsets.clone(), new, reference(inner)))
+    }).await?;
+    let backup = write_zero_backup(deps, "joint_zero_restore", &old).await.map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("backup: {e}")))?;
+    locked_step(sup, check, "apply", |inner| inner.set_joint_zero_offsets(&new).map_err(|e| CalibError::new(500, "MOTOR_ZERO_FAILED", e))).await?;
+    let joints: Vec<usize> = (0..new.len()).filter(|&j| old[j] != new[j]).collect();
+    let changes: Vec<f32> = joints.iter().map(|&j| old[j] - new[j]).collect();
+    let entry = Some(target.filter(|z| !z.is_zero()));
+    let inv = crate::calibration::invalidate_after_zero(sup, deps, &joints.iter().map(|j| j + 1).collect::<Vec<_>>(), &changes, "restored", entry).await;
+    let _ = r;
+    tracing::warn!("Joint zero restored from backup {name}: offsets {old:?} -> {new:?} rad");
+    Ok(json!({"restored": name, "backup": backup.display().to_string(), "offsets_before": old, "offsets_after": new, "invalidated": inv}))
+}
+
+/// Wait up to [`VERIFY_TIMEOUT`] for every zeroed joint to read within the tolerance of its
+/// reference `r` in feedback newer than its command; one row per requested joint.
+async fn verify(sup: &ArmSupervisor, req: &MotorZeroRequest, before: &[f32], r: &[f32], sent: &[(usize, Instant)]) -> Vec<Value> {
     let deadline = Instant::now() + VERIFY_TIMEOUT;
     loop {
         let (rows, all) = {
@@ -270,9 +463,9 @@ async fn verify(sup: &ArmSupervisor, req: &MotorZeroRequest, before: &[f32], sen
                 let cmd = sent.iter().find(|(s, _)| *s == j).map(|(_, t)| *t);
                 let after = inner.measured_positions.get(j).copied().unwrap_or(f32::NAN);
                 let fresh = cmd.is_some_and(|t| fresh_since(&fb, j, t));
-                let ok = cmd.is_some() && fresh && after.abs() < verify_rad();
+                let ok = cmd.is_some() && fresh && (after - r[j]).abs() < verify_rad();
                 all &= ok || cmd.is_none();
-                json!({"joint": j + 1, "before_rad": before[j], "after_rad": after, "sent": cmd.is_some(), "fresh": fresh, "verified": ok})
+                json!({"joint": j + 1, "before_rad": before[j], "after_rad": after, "reference_rad": r[j], "sent": cmd.is_some(), "fresh": fresh, "verified": ok})
             }).collect();
             (rows, all)
         };

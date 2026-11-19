@@ -98,6 +98,7 @@ fn urdf_profile_without_gripper() {
     // actions (6 arm joints + gripper at joint 7) do not.
     let mut c = dm_as_urdf();
     c.dof = 6;
+    c.zero_reference = None;
     c.joint_names.truncate(6);
     c.limits.truncate(6);
     c.home_positions.truncate(6);

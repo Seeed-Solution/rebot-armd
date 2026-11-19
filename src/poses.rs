@@ -43,6 +43,10 @@ pub struct NamedPose {
     pub gripper_joint: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub joint_names: Option<Vec<String>>,
+    /// Set by a joint zero change: the pose was taught with the old zero, so the arm reaches a
+    /// different physical pose. Saving the pose again clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<crate::calibration::CalibrationStale>,
 }
 
 /// File body and `GET /api/v1/poses` body.
@@ -173,7 +177,7 @@ impl SupervisorInner {
         for (p, tcp) in self.poses.list.poses.iter_mut().zip(tcps) { if tcp.is_some() { p.tcp = tcp; } }
     }
 
-    fn poses_write(&self) -> Option<PendingWrite> {
+    pub(crate) fn poses_write(&self) -> Option<PendingWrite> {
         self.poses.path.clone().map(|path| PendingWrite::new(path, serde_json::to_string_pretty(&self.poses.list).unwrap_or_default()))
     }
 
@@ -270,6 +274,7 @@ pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Opt
         arm_dof: Some(arm_dof),
         gripper_joint,
         joint_names: Some(joint_names.clone()),
+        stale: None,
     };
     inner.poses.list.profile_id = profile_id;
     inner.poses.list.arm_dof = Some(arm_dof);

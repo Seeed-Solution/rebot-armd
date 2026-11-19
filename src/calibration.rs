@@ -60,6 +60,10 @@ pub struct CalibrationFile {
     /// using it; clients warn. A new apply clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale: Option<CalibrationStale>,
+    /// Joint zero offsets against the profile's `zero_reference` (src/joint_zero.rs); None =
+    /// offsets 0. A file may hold only this (no camera calibration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joint_zero: Option<crate::joint_zero::JointZero>,
 }
 
 /// `calibration.json` `stale`.
@@ -93,8 +97,17 @@ impl KinematicsCalibration {
 fn correction_of(c: Option<&CalibrationFile>) -> Option<&Correction> { c.and_then(|c| c.kinematics.as_ref()).map(|k| &k.joints) }
 
 impl CalibrationFile {
+    /// The file holds a camera calibration (`camera_mount.q_end_cam`).
+    pub fn has_camera(&self) -> bool { self.camera_mount.q_end_cam.is_some() }
+
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(z) = &self.joint_zero { z.validate(None).map_err(|e| format!("calibration.json: {e}"))?; }
         let m = &self.camera_mount;
+        if m.q_end_cam.is_none() && m.offset_m.is_none() && self.intrinsics.is_none() && self.joint_zero.is_some() {
+            // joint zero only
+            if let Some(k) = &self.kinematics { k.validate().map_err(|e| format!("calibration.json: {e}"))?; }
+            return Ok(());
+        }
         let Some(q) = &m.q_end_cam else { return Err("calibration.json: camera_mount.q_end_cam is required".into()); };
         crate::model::unit_quaternion(q)?;
         if !m.offset_m.is_some_and(|o| o.iter().all(|v| v.is_finite() && v.abs() <= 0.3)) {
@@ -160,6 +173,27 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
     let mut inner = supervisor.inner().write().await;
     match loaded {
         crate::persist::Loaded::Loaded(mut file) => {
+            if let Some(z) = &file.joint_zero {
+                match z.validate(Some(inner.config.dof)).and_then(|()| inner.set_joint_zero_offsets(&z.offsets())) {
+                    Ok(()) => tracing::info!("Joint zero loaded from {} (method {}, set {}): offsets {:?} rad", path.display(), z.method,
+                        z.set_at.as_deref().unwrap_or("?"), z.offsets()),
+                    Err(e) => {
+                        tracing::warn!("Ignoring the joint zero in {}: {e}; offsets 0", path.display());
+                        inner.calibration_load_error = Some(format!("calibration.json: joint_zero: {e}; offsets 0 are used"));
+                        file.joint_zero = None;
+                    }
+                }
+            }
+            if !file.has_camera() {
+                if let Some(k) = &file.kinematics {
+                    if let Err(e) = inner.set_kinematics_correction(Some(&k.joints)) {
+                        tracing::warn!("Ignoring the kinematic correction in {}: {e}", path.display());
+                        file.kinematics = None;
+                    }
+                }
+                inner.calibration = Some(file);
+                return;
+            }
             let q = crate::model::unit_quaternion(&file.camera_mount.q_end_cam.unwrap_or([1.0, 0.0, 0.0, 0.0])).unwrap_or([1.0, 0.0, 0.0, 0.0]);
             let mount = calibrated_mount(&inner, file.camera_mount.offset_m.unwrap_or([0.0; 3]), q);
             file.camera_mount = mount.clone();
@@ -418,6 +452,7 @@ fn after_state(inner: &SupervisorInner, req: &ApplyRequest) -> Result<ArmdState,
         rms: req.rms.clone(),
         kinematics,
         stale: None,
+        joint_zero: inner.calibration.as_ref().and_then(|c| c.joint_zero.clone()),
     };
     Ok(ArmdState { camera_mount: mount, calibration: Some(file), grasp_setup: Some(setup), grip_pixel_model })
 }
@@ -489,7 +524,7 @@ async fn vision_after_error(deps: &CalibrationDeps, before: &Value, values: &Map
 
 // ---- files ----
 
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> std::io::Result<T> + Send + 'static) -> Result<T, String> {
+pub(crate) async fn blocking<T: Send + 'static>(f: impl FnOnce() -> std::io::Result<T> + Send + 'static) -> Result<T, String> {
     match tokio::task::spawn_blocking(f).await {
         Ok(r) => r.map_err(|e| e.to_string()),
         Err(e) => Err(format!("task failed: {e}")),
@@ -497,7 +532,7 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> std::io::Result<T> + Se
 }
 
 /// Write (or with None remove) a file durably.
-async fn put_file(path: PathBuf, text: Option<String>) -> Result<(), String> {
+pub(crate) async fn put_file(path: PathBuf, text: Option<String>) -> Result<(), String> {
     blocking(move || match text {
         Some(t) => crate::persist::write_atomic(&path, &t),
         None => match std::fs::remove_file(&path) {
@@ -507,13 +542,13 @@ async fn put_file(path: PathBuf, text: Option<String>) -> Result<(), String> {
     }).await
 }
 
-fn read_if_file(path: &Path) -> std::io::Result<Option<String>> {
+pub(crate) fn read_if_file(path: &Path) -> std::io::Result<Option<String>> {
     if !path.is_file() { return Ok(None); }
     std::fs::read_to_string(path).map(Some)
 }
 
 /// Backup directory name: UTC time, unique within `root`.
-fn backup_name(root: &Path) -> String {
+pub(crate) fn backup_name(root: &Path) -> String {
     let base = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let mut name = base.clone();
     let mut k = 1;
@@ -621,37 +656,98 @@ fn clear_busy(inner: &mut SupervisorInner) {
     inner.motor_zero_busy = false;
 }
 
-/// After a motor zero of `joints` (1-based): remove the kinematic correction (live, and from
-/// `calibration.json`) and mark the camera calibration stale (`calibration.json` `stale`). The
-/// caller holds `calibration_busy` and torque is off. Returns `{kinematics_removed,
-/// camera_stale, removed_kinematics, error?}`; a failed file write leaves the live state
-/// changed and reports `error` (the file still holds the old correction until the next apply).
-pub async fn invalidate_after_motor_zero(sup: &ArmSupervisor, deps: &CalibrationDeps, joints: &[usize]) -> Value {
+/// After a zero (motor or software) of `joints` (1-based) whose readings moved by `changes`
+/// (rad, same order): remove the kinematic correction (live, and from `calibration.json`), mark
+/// the camera calibration stale, write `joint_zero` (`new_zero`: None = unchanged, Some(None) =
+/// removed), and, for joints that moved by more than [`crate::joint_zero::STALE_THRESHOLD_RAD`],
+/// mark the saved poses stale and, for the gripper joint, the gripper calibration (nothing is
+/// deleted). The caller holds `calibration_busy` and torque is off. Returns `{kinematics_removed,
+/// camera_stale, poses_stale, gripper_calibration_stale, removed_kinematics, at, error?}`; a
+/// failed file write leaves the live state changed and reports `error`.
+pub async fn invalidate_after_zero(sup: &ArmSupervisor, deps: &CalibrationDeps, joints: &[usize], changes: &[f32],
+    method: &str, new_zero: Option<Option<crate::joint_zero::JointZero>>) -> Value {
     let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let (file, removed, had_live) = {
+    let moved: Vec<usize> = joints.iter().zip(changes).filter(|(_, d)| f64::from(d.abs()) > crate::joint_zero::STALE_THRESHOLD_RAD)
+        .map(|(j, _)| *j).collect();
+    let (file, removed, had_live, camera_stale, file_changes) = {
         let inner = sup.inner().read().await;
         let mut file = inner.calibration.clone();
         let removed = file.as_mut().and_then(|c| c.kinematics.take());
-        if let Some(c) = file.as_mut() {
-            c.stale = Some(CalibrationStale { reason: format!("motor zero of joints {joints:?}; the camera calibration was measured with the old zero"), at: at.clone() });
+        let camera_stale = file.as_ref().is_some_and(CalibrationFile::has_camera);
+        if let Some(c) = file.as_mut().filter(|c| c.has_camera()) {
+            c.stale = Some(CalibrationStale { reason: format!("{method} zero of joints {joints:?}; the camera calibration was measured with the old zero"), at: at.clone() });
         }
-        (file, removed, inner.config.arm_model.correction().is_some())
+        let mut file_changes = removed.is_some() || camera_stale;
+        if let Some(z) = new_zero {
+            if file.as_ref().and_then(|c| c.joint_zero.as_ref()) != z.as_ref() { file_changes = true; }
+            match file.as_mut() {
+                Some(c) => c.joint_zero = z,
+                None if z.is_some() => file = Some(CalibrationFile { joint_zero: z, ..Default::default() }),
+                None => {}
+            }
+        }
+        // nothing left in the file (no camera, no joint zero): remove it
+        if file.as_ref().is_some_and(|c| !c.has_camera() && c.joint_zero.is_none() && c.kinematics.is_none()) { file = None; }
+        (file, removed, inner.config.arm_model.correction().is_some(), camera_stale, file_changes)
     };
     let mut error = None;
-    if let Some(c) = &file {
-        if let Err(e) = put_file(deps.path.clone(), Some(serde_json::to_string_pretty(c).unwrap_or_default())).await {
+    if file_changes {
+        if let Err(e) = put_file(deps.path.clone(), file.as_ref().map(|c| serde_json::to_string_pretty(c).unwrap_or_default())).await {
             error = Some(format!("calibration file {}: {e}", deps.path.display()));
         }
     }
-    let mut inner = sup.inner().write().await;
-    if let Err(e) = inner.set_kinematics_correction(None) { error.get_or_insert(format!("kinematic correction not removed: {e}")); }
-    let camera_stale = file.is_some();
-    if file.is_some() { inner.calibration = file; }
-    if let Some(e) = &error { tracing::error!("motor zero invalidation: {e}"); }
-    tracing::warn!("Motor zero of joints {joints:?}: kinematic correction {}, camera calibration {}",
-        if removed.is_some() || had_live { "removed" } else { "none" }, if camera_stale { "marked stale" } else { "none" });
-    json!({"kinematics_removed": removed.is_some() || had_live, "camera_stale": camera_stale,
-        "removed_kinematics": removed, "at": at, "error": error})
+    let (poses_write, gripper_write, poses_stale, gripper_stale) = {
+        let mut inner = sup.inner().write().await;
+        if let Err(e) = inner.set_kinematics_correction(None) { error.get_or_insert(format!("kinematic correction not removed: {e}")); }
+        if file_changes { inner.calibration = file; }
+        let reason = format!("{method} zero of joints {moved:?}; taught with the old zero");
+        let mut poses_stale = Vec::new();
+        if !moved.is_empty() {
+            for p in inner.poses.list.poses.iter_mut() {
+                p.stale = Some(CalibrationStale { reason: reason.clone(), at: at.clone() });
+                poses_stale.push(p.name.clone());
+            }
+        }
+        let poses_write = (!poses_stale.is_empty()).then(|| inner.poses_write()).flatten();
+        let grip = inner.config.gripper_index().map(|g| g + 1);
+        let has_grip_calib = inner.gripper_calib_offset.is_some() || inner.gripper_calib_jaw_opening.is_some();
+        let gripper_stale = grip.is_some_and(|g| moved.contains(&g)) && has_grip_calib;
+        let gripper_write = gripper_stale.then(|| {
+            inner.gripper_calib_stale = Some(CalibrationStale { reason: reason.clone(), at: at.clone() });
+            let f = crate::gripper_calib::GripperCalibFile { offset_rad: inner.gripper_calib_offset, jaw_opening: inner.gripper_calib_jaw_opening.clone(),
+                ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())), stale: inner.gripper_calib_stale.clone() };
+            let path = inner.gripper_calib_path.clone().unwrap_or_else(crate::gripper_calib::path_from_env);
+            crate::persist::PendingWrite::new(path, serde_json::to_string_pretty(&f).unwrap_or_default())
+        });
+        (poses_write, gripper_write, poses_stale, gripper_stale)
+    };
+    for (what, w) in [("poses file", poses_write), ("gripper calibration file", gripper_write)] {
+        if let Some(w) = w {
+            if let Err(e) = w.run().await { error.get_or_insert(format!("{what}: {e}")); }
+        }
+    }
+    if let Some(e) = &error { tracing::error!("zero invalidation: {e}"); }
+    tracing::warn!("{method} zero of joints {joints:?}: kinematic correction {}, camera calibration {}, {} poses and gripper calibration {} marked stale",
+        if removed.is_some() || had_live { "removed" } else { "none" }, if camera_stale { "marked stale" } else { "none" },
+        poses_stale.len(), if gripper_stale { "" } else { "not" });
+    json!({"kinematics_removed": removed.is_some() || had_live, "camera_stale": camera_stale, "poses_stale": poses_stale,
+        "gripper_calibration_stale": gripper_stale, "removed_kinematics": removed, "at": at, "error": error})
+}
+
+/// Everything marked stale by a zero: `[{item: camera | poses | gripper_calibration, reason, at, names?}]`.
+pub fn stale_list(inner: &SupervisorInner) -> Vec<Value> {
+    let mut out = Vec::new();
+    if let Some(st) = inner.calibration.as_ref().filter(|c| c.has_camera()).and_then(|c| c.stale.as_ref()) {
+        out.push(json!({"item": "camera", "reason": st.reason, "at": st.at}));
+    }
+    let stale: Vec<_> = inner.poses.list.poses.iter().filter(|p| p.stale.is_some()).collect();
+    if let Some(first) = stale.first().and_then(|p| p.stale.as_ref()) {
+        out.push(json!({"item": "poses", "reason": first.reason, "at": first.at, "names": stale.iter().map(|p| &p.name).collect::<Vec<_>>()}));
+    }
+    if let Some(st) = &inner.gripper_calib_stale {
+        out.push(json!({"item": "gripper_calibration", "reason": st.reason, "at": st.at}));
+    }
+    out
 }
 
 /// What the transaction writes and how far it got (for the revert).
@@ -861,7 +957,7 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
     };
     let manifest = read("manifest.json")?;
     let vision_target = read("vision_intrinsics.json")?;
-    let target: ArmdState = serde_json::from_value(manifest.clone()).map_err(|e| CalibError::invalid(format!("backup {name}: manifest.json: {e}")))?;
+    let mut target: ArmdState = serde_json::from_value(manifest.clone()).map_err(|e| CalibError::invalid(format!("backup {name}: manifest.json: {e}")))?;
     let vision_values = validate_intrinsics(&vision_target).map_err(|e| CalibError::invalid(format!("backup {name}: vision_intrinsics.json: {e}")))?;
     if let Some(c) = &target.calibration { c.validate().map_err(CalibError::invalid)?; }
     if let Some(g) = &target.grasp_setup { g.validate().map_err(|e| CalibError::invalid(format!("backup {name}: grasp setup: {e}")))?; }
@@ -873,6 +969,14 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
         if correction_of(target.calibration.as_ref()) != correction_of(inner.calibration.as_ref()) { kinematics_armed(&inner)?; }
         armd_state(&inner)
     };
+    // the joint zero is not part of a camera restore: the live one stays (it has its own restore,
+    // `/api/v1/calibration/joint_zero/restore`)
+    let live_zero = before.calibration.as_ref().and_then(|c| c.joint_zero.clone());
+    match target.calibration.as_mut() {
+        Some(c) => c.joint_zero = live_zero,
+        None if live_zero.is_some() => target.calibration = Some(CalibrationFile { joint_zero: live_zero, ..Default::default() }),
+        None => {}
+    }
     let vision_before = vision_get(deps).await.map_err(|e| e.at("vision"))?;
     let mut txn = Txn { sup, deps, check, before, vision_before, vision_written: None, vision_unknown: false, file_written: false, live_written: false, backup: None };
     let mut out = txn.run("restore", &vision_values, &target).await?;
@@ -889,6 +993,11 @@ pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
         "calibration": inner.calibration, "camera_mount": mount_summary(&inner.config.camera_mount),
         "kinematics_correction": inner.config.arm_model.correction(),
         "stale": inner.calibration.as_ref().and_then(|c| c.stale.as_ref()),
+        "stale_list": stale_list(&inner),
+        "joint_zero": inner.calibration.as_ref().and_then(|c| c.joint_zero.as_ref()),
+        "joint_zero_offsets": inner.joint_zero_offsets,
+        "zero_reference": inner.config.zero_reference,
+        "zero_convention": inner.zero_convention,
         "calibration_tools": inner.calibration_tools(),
         "grasp": inner.grasp_setup().map(|s| grasp_fields(&s)), "backups": list_backups(deps)})
 }

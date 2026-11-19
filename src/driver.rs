@@ -218,6 +218,13 @@ pub trait ArmDriver: Send {
     fn set_zero_position(&mut self, _joint: usize) -> Result<(), ArmDriverError> {
         Err(ArmDriverError::Protocol("motor zero is not supported by this driver".into()))
     }
+
+    /// Joint zero offsets (motor - joint, rad) applied at the driver boundary
+    /// ([`crate::joint_zero::ZeroOffsetDriver`]); a driver without the boundary ignores them.
+    fn set_joint_zero_offsets(&mut self, _offsets: &[f32]) {}
+
+    /// The offsets in effect at the boundary; None for a driver without it.
+    fn joint_zero_offsets(&self) -> Option<Vec<f32>> { None }
 }
 
 /// Feedback no older than this confirms a motor disabled for a set-zero command.

@@ -161,7 +161,7 @@ fn calibrated(dir: &Path) {
     let file = CalibrationFile {
         camera_mount: CameraMount { offset_m: Some([-0.0731, 0.0005, 0.066]), q_end_cam: Some(q), ..Default::default() },
         intrinsics: Some(json!({"fx": 830.0})), table_z_m: Some(0.01), solved_at: Some("2026-11-17T00:00:00Z".into()), rms: None,
-        kinematics: Some(kin()), stale: None,
+        kinematics: Some(kin()), stale: None, joint_zero: None,
     };
     std::fs::write(dir.join("calibration.json"), serde_json::to_string(&file).unwrap()).unwrap();
 }
@@ -175,7 +175,7 @@ async fn zero_removes_the_kinematic_correction_and_marks_the_camera_stale() {
     }
     set_q(&r, Q).await;
     let dry = cmd(&mut r, PATH, json!({"joints": [2], "dry_run": true})).await;
-    assert_eq!(dry["invalidates"], json!({"kinematics": true, "camera": true}), "{dry}");
+    assert_eq!(dry["invalidates"], json!({"kinematics": true, "camera": true, "poses": [], "gripper_calibration": false}), "{dry}");
     let ok = cmd(&mut r, PATH, json!({"joints": [2, 3]})).await;
     assert_eq!(ok["type"], "command_ack", "{ok}");
     assert_eq!(ok["invalidated"]["kinematics_removed"], json!(true), "{ok}");
@@ -293,7 +293,11 @@ async fn sim_follower_sets_the_zero_and_reads_it_back() {
 async fn unsupported_driver_is_refused_with_the_reason() {
     let rs = armd::driver::RobStrideArmDriver::new(armd::transport::MockCanTransport::new(), (1..=7).collect());
     let mut r = rig(Some(Box::new(rs)), |_| {}).await;
-    let rej = cmd(&mut r, PATH, json!({"joints": [1], "dry_run": true})).await;
+    let rej = cmd(&mut r, PATH, json!({"joints": [1], "dry_run": true, "method": "motor"})).await;
     assert_eq!(rej["code"], "UNSUPPORTED", "{rej}");
     assert!(rej["message"].as_str().unwrap().contains("RobStride"), "{rej}");
+    // without a method the software zero is used (the profile has a zero_reference); the mock CAN
+    // bus gives no feedback
+    let rej = cmd(&mut r, PATH, json!({"joints": [1], "dry_run": true})).await;
+    assert_eq!(rej["code"], "MOTOR_ZERO_NO_FEEDBACK", "{rej}");
 }

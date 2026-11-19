@@ -269,6 +269,15 @@ pub struct SupervisorInner {
     pub motor_zero_busy: bool,
     /// `calibration.json` was rejected at startup (message; cleared by a successful apply / restore).
     pub calibration_load_error: Option<String>,
+    /// Joint zero offsets in effect (motor - joint, rad, one per joint; calibration.json
+    /// `joint_zero`), applied by the driver boundary ([`crate::joint_zero::ZeroOffsetDriver`]).
+    pub joint_zero_offsets: Vec<f32>,
+    /// Zero check against the profile's `zero_reference` (`zero_convention`).
+    pub zero_convention: crate::joint_zero::ZeroConvention,
+    /// Run the zero check on the next tick with fresh feedback and torque off (startup, after
+    /// torque went off, after a zero).
+    pub zero_check_pending: bool,
+    zero_check_prev_torqued: bool,
     /// The profile's camera mount and grasp setup before any file was loaded (restore of a
     /// backup without calibration.json / grasp_setup.json).
     pub profile_camera_mount: crate::model::CameraMount,
@@ -322,6 +331,9 @@ pub struct SupervisorInner {
     pub gripper_zero_checked: bool,
     /// Set to true if startup loading encountered an invalid calibration file.
     pub gripper_calib_invalid: bool,
+    /// The gripper calibration was taught with an older gripper zero (set by a zero of the
+    /// gripper joint, persisted in `gripper_calib.json`; a new calibration clears it).
+    pub gripper_calib_stale: Option<crate::calibration::CalibrationStale>,
     /// Last measured zero check offset (rad).
     pub last_zero_check_offset: Option<f32>,
     /// Mock follower stall offset (rad); None = stall at closed_rad.
@@ -457,6 +469,10 @@ impl SupervisorInner {
             calibration_busy: false,
             motor_zero_busy: false,
             calibration_load_error: None,
+            joint_zero_offsets: vec![0.0; dof],
+            zero_convention: Default::default(),
+            zero_check_pending: true,
+            zero_check_prev_torqued: false,
             profile_camera_mount,
             profile_grasp,
             unload_planned_duration: None,
@@ -491,6 +507,7 @@ impl SupervisorInner {
             gripper_calib_path: None,
             gripper_zero_checked: false,
             gripper_calib_invalid: false,
+            gripper_calib_stale: None,
             last_zero_check_offset: None,
             mock_gripper_stall_offset,
             mock_gripper_stall_torque: false,
@@ -513,6 +530,8 @@ impl SupervisorInner {
             schema.feetech_joints = self.config.feetech.as_ref().map(|f| f.joints.clone());
         }
         schema.capabilities.calibration_tools = Some(self.calibration_tools_with(&schema.capabilities));
+        schema.joint_zero = self.calibration.as_ref().and_then(|c| c.joint_zero.as_ref()).and_then(|z| serde_json::to_value(z).ok());
+        schema.zero_convention = self.config.zero_reference.as_ref().and_then(|_| serde_json::to_value(&self.zero_convention).ok());
         schema
     }
 
@@ -528,14 +547,21 @@ impl SupervisorInner {
         let kin_reason = if self.config.arm_model.chain().is_some() {
             "this profile uses a URDF chain; the kinematic correction applies to the built-in model only"
         } else { no_grasp };
-        let support = self.motor_zero_support();
+        let mut support = self.motor_zero_support();
+        let (motor, software) = (support.supported, self.config.zero_reference.is_some());
+        let methods: Vec<String> = [(software, "software"), (motor, "motor")].into_iter().filter(|(ok, _)| *ok).map(|(_, m)| m.to_string()).collect();
+        if software && !motor {
+            support = crate::model::MotorZeroSupport { supported: true, notes: support.reason.take().map(|r| vec![format!("motor zero: {r}")]).unwrap_or_default(), ..Default::default() };
+        }
+        let any = motor || software;
         let motor_zero = MotorZeroTool {
-            joints: if support.supported { (1..=self.config.dof).collect() } else { Vec::new() },
-            requires: if support.supported { ["lease", "torque_off", "no_action", "no_fault"].map(String::from).to_vec() } else { Vec::new() },
+            joints: if any { (1..=self.config.dof).collect() } else { Vec::new() },
+            requires: if any { ["lease", "torque_off", "no_action", "no_fault"].map(String::from).to_vec() } else { Vec::new() },
             max_offset_deg: crate::model::MOTOR_ZERO_MAX_OFFSET_DEG,
             verify_mrad: crate::model::MOTOR_ZERO_VERIFY_MRAD,
-            invalidates: if support.supported { vec!["kinematics".into(), "camera".into()] } else { Vec::new() },
+            invalidates: if any { ["kinematics", "camera", "poses", "gripper_calibration"].map(String::from).to_vec() } else { Vec::new() },
             zero_pose: self.config.zero_pose.clone(),
+            motor, software, methods,
             support,
         };
         let policy = self.config.gripper_policy.as_ref().filter(|_| self.config.gripper_index().is_some());
@@ -562,6 +588,63 @@ impl SupervisorInner {
         }
     }
 
+    /// Install joint zero offsets (motor - joint, rad, one per joint) at the driver boundary.
+    /// The current readings, commanded and target positions move by old - new, so nothing jumps;
+    /// the mock follower (no driver) moves its simulated readings the same way. Needs torque
+    /// off; the caller checks the rest.
+    pub fn set_joint_zero_offsets(&mut self, offsets: &[f32]) -> Result<(), String> {
+        if self.is_torqued || self.disable_pending { return Err("torque is on".into()); }
+        if offsets.len() != self.config.dof || !offsets.iter().all(|o| o.is_finite()) {
+            return Err(format!("joint zero needs {} finite offsets", self.config.dof));
+        }
+        let old = std::mem::replace(&mut self.joint_zero_offsets, offsets.to_vec());
+        if let Some(d) = self.driver.as_ref() {
+            let mut drv = d.lock().map_err(|_| "driver unavailable".to_string())?;
+            drv.set_joint_zero_offsets(offsets);
+            let pos: Vec<_> = (0..self.config.dof).map(|i| drv.position_limits(i)).collect();
+            drop(drv);
+            if pos.iter().any(Option::is_some) { self.reapply_driver_limits(); }
+        }
+        for (i, (o, n)) in old.iter().zip(offsets).enumerate() {
+            let d = o - n;
+            if d == 0.0 { continue; }
+            for v in [&mut self.measured_positions, &mut self.commanded_positions, &mut self.target_positions] {
+                if let Some(p) = v.get_mut(i) { *p += d; }
+            }
+        }
+        if old.len() > 5 && offsets.len() > 5 && old[5] != offsets[5] {
+            self.zero_convention = Default::default();
+        }
+        self.zero_check_pending = true;
+        Ok(())
+    }
+
+    /// The reference pose in joint angles (`home_positions` derived from `zero_reference`).
+    pub fn zero_reference_joints(&self) -> Option<Vec<f32>> {
+        self.config.zero_reference.as_ref().map(|_| self.config.home_positions.clone())
+    }
+
+    /// The zero check (`zero_convention`) at startup and each time torque goes off: with torque
+    /// off and fresh feedback, an arm in the rest pose with J6 about +-90 deg from the reference is
+    /// reported as `legacy_j6`. Never moves the arm. A `legacy_j6` verdict stays until a zero of J6.
+    fn step_zero_convention(&mut self) {
+        if self.zero_check_prev_torqued && !self.is_torqued { self.zero_check_pending = true; }
+        self.zero_check_prev_torqued = self.is_torqued;
+        if !self.zero_check_pending || self.is_torqued || self.calibration_busy { return; }
+        let Some(rest) = self.zero_reference_joints() else { self.zero_check_pending = false; return; };
+        if let Some(d) = self.driver.as_ref() {
+            if !d.lock().is_ok_and(|drv| drv.is_feedback_valid()) { return; }
+        }
+        let tol = self.resting_policy().map(|p| p.position_tolerances).unwrap_or_else(|| vec![0.08; 6]);
+        self.zero_check_pending = false;
+        let Some(v) = crate::joint_zero::check_convention(&self.measured_positions, &rest, &tol) else { return; };
+        if self.zero_convention.status == "legacy_j6" && v.status != "legacy_j6" { return; }
+        if v.status == "legacy_j6" && self.zero_convention.status != "legacy_j6" {
+            tracing::warn!("Joint zero check: {}", v.message.as_deref().unwrap_or(""));
+        }
+        self.zero_convention = v;
+    }
+
     /// Make the current position of `joint` (0-based) its zero: the driver's
     /// [`ArmDriver::set_zero_position`], or for the mock follower the joint's reading (and
     /// commanded / target value) becomes 0. Needs torque off; the caller checks the rest.
@@ -571,8 +654,10 @@ impl SupervisorInner {
         match self.driver.as_ref() {
             Some(d) => d.lock().map_err(|_| "driver unavailable".to_string())?.set_zero_position(joint).map_err(|e| e.to_string()),
             None => {
+                // the simulated motor reads 0: the joint reads 0 - its joint zero offset
+                let r = -self.joint_zero_offsets.get(joint).copied().unwrap_or(0.0);
                 for v in [&mut self.measured_positions, &mut self.commanded_positions, &mut self.target_positions] {
-                    if let Some(p) = v.get_mut(joint) { *p = 0.0; }
+                    if let Some(p) = v.get_mut(joint) { *p = r; }
                 }
                 Ok(())
             }
@@ -596,6 +681,7 @@ impl SupervisorInner {
         if driver.capabilities().load_feedback {
             self.loads = vec![f32::NAN; self.config.dof];
         }
+        let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &self.joint_zero_offsets));
         self.apply_driver_limits(driver.as_ref());
         self.driver = Some(std::sync::Mutex::new(driver));
         self
@@ -2506,6 +2592,7 @@ impl SupervisorInner {
                     offset_rad: Some(offset_rad),
                     jaw_opening: self.gripper_calib_jaw_opening.clone(),
                     ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())),
+                    stale: self.gripper_calib_stale.clone(),
                 };
                 let text = serde_json::to_string_pretty(&file).unwrap_or_default();
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -3039,6 +3126,7 @@ impl SupervisorInner {
             calibrated,
             policy,
             ts: None,
+            stale: self.gripper_calib_stale.clone(),
         }
     }
 
@@ -3522,6 +3610,7 @@ impl SupervisorInner {
             self.commanded_accelerations.fill(0.0);
             self.safety.trigger_fault_coded(FaultCode::ControlDeadline, FaultReason::Other("Control loop deadline exceeded".into()));
         }
+        self.step_zero_convention();
         let dt = if dt.is_finite() && dt > 0.0 { dt.min(0.080) } else { 0.020 };
         let before_velocities = self.commanded_velocities.clone();
 
@@ -4486,7 +4575,7 @@ impl ArmSupervisor {
         driver.set_abort_flag(self.e_stop_latched.clone());
         let mut inner = self.inner.write().await;
         driver.set_gripper_index(inner.config.gripper_index());
-        let mut drv = driver;
+        let mut drv: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
         let caps = drv.capabilities();
         if caps.load_feedback {
             inner.loads = vec![f32::NAN; inner.config.dof];
@@ -4514,6 +4603,7 @@ impl ArmSupervisor {
             if driver.capabilities().load_feedback {
                 inner.loads = vec![f32::NAN; inner.config.dof];
             }
+            let driver: Box<dyn ArmDriver> = Box::new(crate::joint_zero::ZeroOffsetDriver::new(driver, &inner.joint_zero_offsets));
             inner.apply_driver_limits(driver.as_ref());
             inner.driver = Some(std::sync::Mutex::new(driver));
         }

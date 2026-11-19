@@ -1915,9 +1915,19 @@ pub struct MotorZeroTool {
     pub max_offset_deg: u32,
     /// [`MOTOR_ZERO_VERIFY_MRAD`].
     pub verify_mrad: u32,
-    /// Calibrations a motor zero invalidates: `kinematics` (removed), `camera` (marked stale).
+    /// Calibrations a zero invalidates: `kinematics` (removed), `camera`, `poses`,
+    /// `gripper_calibration` (marked stale).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub invalidates: Vec<String>,
+    /// `method: "motor"` is available (the driver's set-zero command, `supported` above refers to
+    /// the tool as a whole).
+    pub motor: bool,
+    /// `method: "software"` is available (the profile has a `zero_reference`): calibration.json
+    /// `joint_zero`, every driver, reversible.
+    pub software: bool,
+    /// Available methods, the default first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
     /// The profile's description of the zero pose (all motors at 0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zero_pose: Option<ZeroPoseDoc>,

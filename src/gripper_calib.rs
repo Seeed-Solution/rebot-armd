@@ -24,6 +24,9 @@ pub struct GripperCalibFile {
     pub jaw_opening: Option<JawOpening>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts: Option<u64>,
+    /// Set by a zero of the gripper joint: the calibration was taught with the old zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<crate::calibration::CalibrationStale>,
 }
 
 impl GripperCalibFile {
@@ -49,6 +52,9 @@ pub struct GripperCalibrationResponse {
     pub policy: Option<GripperPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts: Option<u64>,
+    /// The calibration was taught with an older gripper zero (null when current).
+    #[serde(default)]
+    pub stale: Option<crate::calibration::CalibrationStale>,
 }
 
 /// Body for WS `/api/v1/gripper/calibration`.
@@ -124,7 +130,9 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
         offset_rad: inner.gripper_calib_offset,
         jaw_opening: Some(b.jaw_opening),
         ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())),
+        stale: None,
     };
+    inner.gripper_calib_stale = None;
 
     let write = inner.gripper_calib_path.clone().or_else(|| Some(path_from_env())).map(|path| {
         PendingWrite::new(path, serde_json::to_string_pretty(&file).unwrap_or_default())
@@ -145,6 +153,9 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
             if let Err(e) = inner.apply_gripper_calibration(calib.offset_rad, calib.jaw_opening) {
                 tracing::warn!("Ignoring invalid gripper calibration: {e}");
                 inner.gripper_calib_invalid = true;
+            } else if let Some(st) = calib.stale {
+                tracing::warn!("Gripper calibration is stale: {}", st.reason);
+                inner.gripper_calib_stale = Some(st);
             }
         }
         Loaded::Missing => {}

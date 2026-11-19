@@ -314,7 +314,7 @@ fn state_command(inner: &mut SupervisorInner, path: &str, body: &Value, setup_pa
 }
 
 /// A calibration command checked under the lock.
-enum CalibJob { Apply(Box<crate::calibration::ApplyRequest>), Restore(Value), MotorZero(crate::motor_zero::MotorZeroRequest) }
+enum CalibJob { Apply(Box<crate::calibration::ApplyRequest>), Restore(Value), MotorZero(crate::motor_zero::MotorZeroRequest), JointZeroRestore(String) }
 
 /// What a checked calibration command does: a task (job, busy flag set) or a reply under the
 /// lock (motor zero dry run).
@@ -340,6 +340,12 @@ fn calibration_job(inner: &mut SupervisorInner, path: &str, body: &Value) -> Res
         inner.calibration_busy = true;
         inner.motor_zero_busy = true;
         return Ok(CalibStart::Job(CalibJob::MotorZero(req), true));
+    }
+    if path == crate::motor_zero::RESTORE_PATH {
+        let name = crate::motor_zero::check_restore(inner, body)?;
+        inner.calibration_busy = true;
+        inner.motor_zero_busy = true;
+        return Ok(CalibStart::Job(CalibJob::JointZeroRestore(name), true));
     }
     crate::calibration::begin_checks(inner)?;
     let job = if path == "/api/v1/calibration/apply" {
@@ -628,7 +634,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     if let Some(code) = calibration_busy_code(&inner, path) {
                                         response = Some(command_reject(&inner, &value["request_id"],
                                             ApiError(StatusCode::CONFLICT, "a calibration apply, restore or motor zero is running".into(), code.into())));
-                                    } else if path == "/api/v1/calibration/apply" || path == "/api/v1/calibration/restore" || path == crate::motor_zero::PATH {
+                                    } else if path == "/api/v1/calibration/apply" || path == "/api/v1/calibration/restore" || path == crate::motor_zero::PATH
+                                        || path == crate::motor_zero::RESTORE_PATH {
                                         response = match calibration_job(&mut inner, path, &value["body"]) {
                                             Ok(CalibStart::Job(job, busy)) => { pending_calibration = Some((value["request_id"].clone(), job, local_generation, epoch, busy)); None }
                                             Ok(CalibStart::Reply(reply)) => Some(fields_ack(&value["request_id"], reply)),
@@ -792,6 +799,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 CalibJob::Apply(req) => crate::calibration::apply(&job_sup, &calib, *req, &check).await,
                                 CalibJob::Restore(body) => crate::calibration::restore(&job_sup, &calib, &body, &check).await,
                                 CalibJob::MotorZero(req) => crate::motor_zero::run(&job_sup, &calib, req, &check).await,
+                                CalibJob::JointZeroRestore(name) => crate::motor_zero::restore(&job_sup, &calib, name, &check).await,
                             }
                         });
                         let result = job_task.await.unwrap_or_else(|e| {

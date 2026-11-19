@@ -11,6 +11,7 @@ pub mod gravity;
 #[cfg(not(target_arch = "wasm32"))] pub mod gravity_comp;
 #[cfg(not(target_arch = "wasm32"))] pub mod gripper_calib;
 #[cfg(not(target_arch = "wasm32"))] pub mod keepout;
+#[cfg(not(target_arch = "wasm32"))] pub mod joint_zero;
 pub mod kinematics;
 #[cfg(not(target_arch = "wasm32"))] pub mod macro_action;
 #[cfg(not(target_arch = "wasm32"))] pub mod motor_zero;

@@ -67,7 +67,7 @@ fn calib_file(q: [f64; 4]) -> CalibrationFile {
     CalibrationFile {
         camera_mount: CameraMount { offset_m: Some([-0.0731, 0.0005, 0.066]), q_end_cam: Some(q), ..Default::default() },
         intrinsics: Some(json!({"fx": 830.0})), table_z_m: Some(0.01), solved_at: Some("2026-11-17T00:00:00Z".into()), rms: None,
-        kinematics: None, stale: None,
+        kinematics: None, stale: None, joint_zero: None,
     }
 }
 
