@@ -9,28 +9,22 @@ Licence Version 2 - Weakly Reciprocal (SPDX: `CERN-OHL-W-2.0`, full text in
 
 | Directory | Camera pitch | Status |
 |---|---|---|
-| [`v5/`](v5/) | 0 deg (optical axis forward) | in use on the reference arm |
-| [`v7_tilt/`](v7_tilt/) | 30 deg down | recommended v7 tilt when the camera has to see the jaw tips (see below); not printed or fitted |
-| [`v8/`](v8/) | 38 deg down | recommended v8 tilt for the real 1080p-crop FOV (`v8/README.txt`); not printed or fitted |
+| [`v5/`](v5/) | 0 deg (optical axis forward), 5 files | in use on the reference arm |
+| [`v8/`](v8/) | 38 deg down, 5 files | recommended v8 tilt for the real 1080p-crop FOV; not printed or fitted |
 
-Earlier drafts (v1-v4, v6_tilt) are not included: v6_tilt was based on v4 and is obsolete
-(`v7_tilt/README.txt`). Only the recommended tilt per version (v7 30 deg, v8 38 deg) is kept
-here; other angle variants (v7 20/25 deg, v8 42 deg), `*_cradle_flat.stl`, generation/validation
-scripts, and raw output logs are stored in the upstream source repository
-`Seeed-Projects/reBot-DevArm` (`hardware/camera-mounts/recamera-mounts/`).
+Earlier drafts (`v1`–`v4`, `v6_tilt`), transitional `v7_tilt` drafts (20/25/30 deg), the
+original-orientation `v8` body STL (`reCamera_B601_Mount_v8_tilt38_body.stl`), alternative angle
+variants (v8 42 deg), `*_cradle_flat.stl`, generation/validation scripts, and full design notes
+(`README.txt` / `ASSEMBLY.txt` and raw output logs) are all preserved in the upstream source
+repository `Seeed-Projects/reBot-DevArm` (`hardware/camera-mounts/recamera-mounts/`).
 
-Why 30 deg (v7): in the pinhole check summarised in `v7_tilt/README.txt` (section 2.3), the
-jaw tip falls inside the image for an assumed half vertical FOV of 17 deg only at 25 and
-30 deg, and 30 deg has the most margin (tip at 0.670 of the half image height; 20 deg: 1.235,
-outside). The FOV values in v7 are assumptions, not measurements of the reCamera.
-
-Why 38 deg (v8): the OV5647 sensor (2592x1944, f = 3.46 mm) streams 1920x1080p30 as a
-1:1 centre crop (`74 % x 56 %` of the array, scaled down to 1280x720 and 640x360), giving a
-derived FOV of 42.47 deg H x 24.65 deg V (half VFOV 12.33 deg, half HFOV 21.23 deg; `v8/README.txt`
-section 1.1) instead of the 65 deg full-sensor spec or v7's assumed 17 deg half VFOV. With the
+Why 30 deg (upstream v7) vs 38 deg (`v8/`): the OV5647 sensor (2592x1944, f = 3.46 mm) streams
+1920x1080p30 as a 1:1 centre crop (`74 % x 56 %` of the array, scaled down to 1280x720 and
+640x360), giving a derived FOV of 42.47 deg H x 24.65 deg V (half VFOV 12.33 deg, half HFOV
+21.23 deg) instead of the 65 deg full-sensor spec or v7's assumed 17 deg half VFOV. With the
 12.33 deg half VFOV, v7 30 deg puts the jaw tip at `v = +0.938` (0.3 % gripper coverage, rows
 692-720 of 720), which drops out of frame with ~0.5 deg pitch error or 1-2 mm higher lens
-position. In `v8/` (`v8/README.txt` sections 2-3):
+position. In `v8/`:
 - **38 deg (included)**: jaw tip at `v = +0.326` (row 477 of 720), 10.8 % closed gripper
   coverage (upper 65 % free), and stays within `v = -0.07 .. +0.72` (inside 80 % half-height)
   across +-5 mm lens height and +-2 deg pitch error.
@@ -39,29 +33,41 @@ position. In `v8/` (`v8/README.txt` sections 2-3):
   29.7 deg below the gripper axis (vs 25.7 deg at 38 deg).
 - **Print orientation (`v8_tilt38_body_side_flat.stl`)**: places the largest flat side wall
   on the bed (3537 mm2 contact area, oriented for strength along the arm bending axis); the
-  alternative `*_cradle_flat.stl` (3167 mm2 contact area) is kept upstream.
+  original-orientation `v8_tilt38_body.stl` and `*_cradle_flat.stl` (3167 mm2 contact area) are
+  kept upstream.
 
-Each variant has two parts, printed separately: `*_body` and `*_top_bar`, as STEP and STL.
-Assembly: `v5/ASSEMBLY.txt`; v7 print and assembly notes: `v7_tilt/README.txt` section 3;
-v8 print and assembly notes follow v7 (`v8/README.txt` section 5).
+Each variant has two parts, printed separately: `*_body` and `*_top_bar`, provided as STEP and
+STL (with `v8/` shipping the print-ready `*_body_side_flat.stl` plus `*_body.step`).
 
 | File | Contents |
 |---|---|
-| `v5/reCamera_B601_Mount_v5_{body,top_bar}.{step,stl}` | v5 parts (0 deg) |
+| `v5/reCamera_B601_Mount_v5_{body,top_bar}.{step,stl}` | v5 parts (0 deg, STEP and STL) |
 | `v5/assembly_preview.png` | v5 preview on the gripper |
-| `v5/ASSEMBLY.txt` | v5 print and assembly notes |
-| `v7_tilt/reCamera_B601_Mount_v7_tilt30_{body,top_bar}.{step,stl}` | v7 30 deg parts |
-| `v7_tilt/assembly_preview_tilt30.png` | v7 30 deg preview |
-| `v7_tilt/README.txt` | v7 design, print, and assembly notes |
-| `v8/reCamera_B601_Mount_v8_tilt38_{body,top_bar}.{step,stl}` | v8 38 deg parts |
 | `v8/reCamera_B601_Mount_v8_tilt38_body_side_flat.stl` | v8 38 deg body oriented with the flat side wall on the print bed |
+| `v8/reCamera_B601_Mount_v8_tilt38_body.step` | v8 38 deg body CAD (STEP) |
+| `v8/reCamera_B601_Mount_v8_tilt38_top_bar.{step,stl}` | v8 38 deg top bar (STEP and STL) |
 | `v8/assembly_preview_v8_tilt38.png` | v8 38 deg assembly preview (with FOV cone) |
-| `v8/README.txt` | v8 design, print, and assembly notes |
 
-Other angle variants (v7 20/25 deg, v8 42 deg), `*_cradle_flat.stl`, comparison and simulated
-camera previews, generation/validation scripts, and raw output logs (`validation_output.txt`,
-`generate_output.txt`, `visibility_output.txt`, `camera_view_output.txt`, `md5sums.txt`) are
-stored in `Seeed-Projects/reBot-DevArm` (`hardware/camera-mounts/recamera-mounts/`).
+## Assembly
+
+Both `v5/` and `v8/` share the same two-part retention geometry and fasteners:
+
+- **Print separately**: print `*_body` and `*_top_bar` separately (`*_top_bar` is a flat 3 mm
+  plate with ears, printed flat on its large face; for v8, `v8_tilt38_body_side_flat.stl` places
+  the largest flat side wall on the bed). The four reCamera internal assembly holes are not used
+  and are not reproduced in the holder.
+- **Retention & orientation**: camera is held by the rear stop, front lower lip, front side
+  guards, and removable top bar. Orient the camera with the CAN rear cover `-X` side facing up
+  and `+/-Y` sides facing left/right (the rear-depth region remains open on those three faces; do
+  not install in the old v4 roll orientation). Image orientation may require software rotation.
+- **Assembly steps**: remove the top bar, lower the camera into the holder, insert square nuts
+  from the outer side-open pockets (`5.8 mm` along depth, `2.6 mm` high), then attach the top bar
+  using two fasteners in the **printed ears only** (`3.2 mm` clearance holes).
+- **Fastener & fit precautions**: verify actual square nut and screw fit/length before
+  tightening; **do not drive screws into the camera**. Thin non-slip pads may take up the
+  nominal `0.3 mm` clearance; do not force an interference fit against the enclosure.
+- **Clamp interface**: the clamp interface (`y <= 0`) and its fasteners are identical across v5
+  and v8.
 
 ## Origin of the clamp geometry
 
@@ -85,8 +91,8 @@ reference files that are **not** in this repository:
 | `rebotarm_b601_stl.xml` (MJCF) and its meshes | `v8/optics.py` (used by `v8/validate_v8.py`, `v8/render_preview.py`, `v8/visibility.py`, `v8/camera_view.py`) | `<script dir>/../../../Rebot_Arm_description/DM/mjcf/rebotarm_b601_stl.xml`, `.../DM/meshes/` | reBot-DevArm, `Rebot_Arm_description/DM/` |
 
 From a `reBot-DevArm` checkout under `hardware/camera-mounts/recamera-mounts/<version>/`, add
-`recamera-mounts/reference/B3_CAN.step` and run from the version directory (command from
-`v7_tilt/README.txt`; for `v8/`, run `validate_v8.py 38 42` in the same environment):
+`recamera-mounts/reference/B3_CAN.step` and run from the version directory (for `v8/`, run
+`validate_v8.py 38 42` in the same environment; for upstream `v7_tilt`, run `validate_tilt.py`):
 
 ```bash
 timeout 600 uv run --python 3.11 --with build123d --with trimesh \
@@ -98,9 +104,9 @@ timeout 600 uv run --python 3.11 --with build123d --with trimesh \
 
 ## Not validated
 
-From `v5/ASSEMBLY.txt` and `v7_tilt/README.txt` section 4:
+From the upstream v5 and v7/v8 design notes:
 
-- Physical fit on the arm and seating of the clamp (v7 has not been printed).
+- Physical fit on the arm and seating of the clamp (v8 has not been printed or fitted).
 - Print tolerance, print orientation and supports; real fastener and nut fit.
 - Real reCamera FOV, lens position inside the housing and distortion (the FOV values are inputs).
 - Cable routing and connector access (keep-out boxes are checked; real overmolds and bend radii are not).

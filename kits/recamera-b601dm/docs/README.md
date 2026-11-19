@@ -60,24 +60,24 @@ init 脚本把 `can0` 设为 1 Mbit/s，与机械臂一致。
 
 ## Assembly
 
-1. Print the camera holder: v5 (in use) or a v7_tilt variant, body and top bar separately;
-   files and the list of what is not validated in [../hardware/](../hardware/README.md).
-2. Mount the reCamera in the holder as described in `hardware/v5/ASSEMBLY.txt` (remove the
-   top bar, lower the camera in, insert the square nuts, attach the top bar; do not drive
-   screws into the camera) and clamp the holder to the gripper. The camera sits after J6
+1. Print the camera holder: v5 (in use) or v8 (38° down, not printed or fitted), body and top bar
+   separately; files and the list of what is not validated in [../hardware/](../hardware/README.md).
+2. Mount the reCamera in the holder as described in [../hardware/](../hardware/README.md#assembly)
+   (remove the top bar, lower the camera in, insert the square nuts, attach the top bar; do not
+   drive screws into the camera) and clamp the holder to the gripper. The camera sits after J6
    (eye-in-hand).
 3. Wire the arm's CAN pair and power to J2 of the B4 board (above).
 4. Install the `rebot-teleop` deb (`./scripts/build_deb.sh`, repository README section
    "Install on reCamera") and open `http://<camera-address>:8765/`.
-5. With a v7_tilt mount, set the camera tilt (see [../calibration/](../calibration/README.md)).
+5. With a tilted mount (such as v8 at 38°), set the camera tilt (see [../calibration/](../calibration/README.md)).
 
 ### 组装
 
-1. 打印相机支架：v5（当前使用）或 v7_tilt 某一角度，主体与顶条分开打印；文件与未验证项见 [../hardware/](../hardware/README.md)。
-2. 按 `hardware/v5/ASSEMBLY.txt` 把 reCamera 装进支架（取下顶条、放入相机、从两侧塞入方螺母、装回顶条；螺丝不要拧进相机），再把支架夹到夹爪上。相机装在 J6 之后（眼在手上）。
+1. 打印相机支架：v5（当前使用）或 v8（38° 下倾，未打印、未试装），主体与顶条分开打印；文件与未验证项见 [../hardware/](../hardware/README.md)。
+2. 按 [../hardware/](../hardware/README.md#assembly) 把 reCamera 装进支架（取下顶条、放入相机、从两侧塞入方螺母、装回顶条；螺丝不要拧进相机），再把支架夹到夹爪上。相机装在 J6 之后（眼在手上）。
 3. 机械臂的 CAN 线与电源接到 B4 底板 J2（见上）。
 4. 安装 `rebot-teleop` deb（`./scripts/build_deb.sh`，见仓库 README「在 reCamera 上安装」），打开 `http://<相机地址>:8765/`。
-5. 使用 v7_tilt 支架时设置相机俯角（见 [../calibration/](../calibration/README.md)）。
+5. 使用倾斜支架（如 v8 38°）时设置相机俯角（见 [../calibration/](../calibration/README.md)）。
 
 ## Verified capabilities
 
@@ -88,13 +88,13 @@ init 脚本把 `can0` 设为 1 Mbit/s，与机械臂一致。
 | Damiao mapping ranges per joint (J1-J3 ±12.5 / ±10 / ±28, J4-J7 ±12.5 / ±30 / ±10) | read from the motors 2026-11-09 | `src/model.rs`, docs/control_safety_contract.md |
 | Gripper range (closed +0.03 rad, mechanical full open -5.87 rad) | measured 2026-11-06 | `src/model.rs` |
 | POS_VEL lag gain 1.5 (basis of the 0.45 rad/s planned-speed cap) | measured 2026-11-09; listed under "needs verification" | docs/agent_action_api.md |
-| Camera image upright with the v5 mount | observed on the arm | `hardware/v7_tilt/README.txt` |
+| Camera image upright with the v5 mount | observed on the arm | upstream `Seeed-Projects/reBot-DevArm` (`hardware/camera-mounts/recamera-mounts/`) |
 | Gravity compensation (hand-guiding) | verified on hardware: exit paths held within 1.5 mrad, 30 s recording gave 1509 frames | README, docs/control_safety_contract.md checklist |
 | Collision thresholds in the profile (`collision.thresholds_nm` 2.0, 1.19, 2.82, 1.43, 0.87, 0.28 N·m, `enabled: false`) | `rebot-sysid` on the arm 2026-11-11, one session, ±0.08 rad at two poses; needs validation at more poses before enabling | `profile/rebot-b601dm.json`, docs/simulation.md |
 | Tap-to-grasp | simulation and screenshot tests only | README, docs/plan_tap_to_grasp.md |
 | `camera_mount` (`tilt_deg`, `offset_m`) for camera-frame moves | needs verification | docs/agent_action_api.md |
 | Planning time on the SG2002 | needs verification | docs/agent_action_api.md |
-| v7_tilt mounts | not printed or fitted | `hardware/v7_tilt/README.txt` |
+| Tilted mounts (v8 38°, upstream v7) | not printed or fitted | [../hardware/](../hardware/README.md) |
 
 The collision guard stays off in the profile (`collision.enabled: false`). The thresholds come
 from one `rebot-sysid` session on one arm at two poses (B601-DM, 2026-11-11, sweeps ±0.08 rad);
@@ -114,13 +114,13 @@ Object detection and ArUco come from `rebot-vision`, which is part of this kit's
 | 各关节达妙映射范围（J1-J3 ±12.5 / ±10 / ±28，J4-J7 ±12.5 / ±30 / ±10） | 2026-11-09 从电机读取 | `src/model.rs`、docs/control_safety_contract.md |
 | 夹爪范围（闭合 +0.03 rad，机械全开 -5.87 rad） | 2026-11-06 实测 | `src/model.rs` |
 | POS_VEL 滞后增益 1.5（0.45 rad/s 规划限速的依据） | 2026-11-09 实测，列在「需实机核实」 | docs/agent_action_api.md |
-| v5 支架下画面方向为正 | 实机观察 | `hardware/v7_tilt/README.txt` |
+| v5 支架下画面方向为正 | 实机观察 | 上游 `Seeed-Projects/reBot-DevArm`（`hardware/camera-mounts/recamera-mounts/`） |
 | 重力补偿（拖动示教） | 实机验证：各退出路径位置偏差不超过 1.5 mrad，30 s 录制 1509 帧 | README、docs/control_safety_contract.md 清单 |
 | profile 中的碰撞阈值（`collision.thresholds_nm` 2.0、1.19、2.82、1.43、0.87、0.28 N·m，`enabled: false`） | 2026-11-11 在实机上用 `rebot-sysid` 测得：一次测试、两个姿态、±0.08 rad；启用前须在更多姿态下验证 | `profile/rebot-b601dm.json`、docs/simulation.md |
 | 点框抓取 | 仅仿真与截图测试 | README、docs/plan_tap_to_grasp.md |
 | 相机坐标系运动用的 `camera_mount`（`tilt_deg`、`offset_m`） | 需实机核实 | docs/agent_action_api.md |
 | SG2002 上的规划耗时 | 需实机核实 | docs/agent_action_api.md |
-| v7_tilt 支架 | 未打印、未试装 | `hardware/v7_tilt/README.txt` |
+| 倾斜支架（v8 38°、上游 v7） | 未打印、未试装 | [../hardware/](../hardware/README.md) |
 
 profile 中碰撞检测保持关闭（`collision.enabled: false`）。阈值来自一台机械臂上的一次 `rebot-sysid`
 测试、两个姿态（B601-DM，2026-11-11，扫动 ±0.08 rad）；残差随姿态、负载和电机温度变化，因此在 profile
