@@ -134,6 +134,9 @@ pub struct CalibrationDeps {
     pub upstream: DetectorUpstream,
     /// Timeout of one rebot-vision request (default [`VISION_TIMEOUT`]).
     pub vision_timeout: Duration,
+    /// Stored calibration sessions (`ARMD_CALIBRATION_SESSIONS`, default `calibration-sessions/`
+    /// next to `path`; [`crate::calibration_sessions`]).
+    pub sessions_dir: PathBuf,
 }
 
 /// `ARMD_CALIBRATION` or [`DEFAULT_PATH`].
@@ -141,14 +144,16 @@ pub fn path_from_env() -> PathBuf { crate::persist::path_from_env("ARMD_CALIBRAT
 
 impl CalibrationDeps {
     pub fn new(path: PathBuf, setup_path: Option<PathBuf>, upstream: DetectorUpstream) -> Self {
-        let backup_dir = path.parent().unwrap_or(Path::new(".")).join("calibration-backups");
-        Self { path, backup_dir, setup_path, upstream, vision_timeout: VISION_TIMEOUT }
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let (backup_dir, sessions_dir) = (parent.join("calibration-backups"), parent.join("calibration-sessions"));
+        Self { path, backup_dir, setup_path, upstream, vision_timeout: VISION_TIMEOUT, sessions_dir }
     }
 
-    /// Paths from `ARMD_CALIBRATION` / `ARMD_CALIBRATION_BACKUPS`.
+    /// Paths from `ARMD_CALIBRATION` / `ARMD_CALIBRATION_BACKUPS` / `ARMD_CALIBRATION_SESSIONS`.
     pub fn from_env(setup_path: Option<PathBuf>, upstream: DetectorUpstream) -> Self {
         let mut d = Self::new(path_from_env(), setup_path, upstream);
         if let Some(b) = std::env::var_os("ARMD_CALIBRATION_BACKUPS") { d.backup_dir = PathBuf::from(b); }
+        if let Some(b) = std::env::var_os("ARMD_CALIBRATION_SESSIONS") { d.sessions_dir = PathBuf::from(b); }
         d
     }
 }

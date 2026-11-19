@@ -92,6 +92,16 @@ pub fn create_router_calibration(
 ) -> Router {
     Router::new()
         .route("/api/v1/calibration", get(rest::get_calibration))
+        .route(
+            "/api/v1/calibration/sessions",
+            get(crate::calibration_sessions::get_sessions)
+                .post(crate::calibration_sessions::post_session)
+                .layer(DefaultBodyLimit::max(crate::calibration_sessions::MAX_BODY_BYTES)),
+        )
+        .route(
+            "/api/v1/calibration/sessions/{id}",
+            get(crate::calibration_sessions::get_session).delete(crate::calibration_sessions::delete_session),
+        )
         .route("/", get(serve_index))
         .route("/assets/jmuxer.min.js", get(serve_jmuxer))
         .route("/assets/calib_wizard.js", get(serve_calib_wizard))
