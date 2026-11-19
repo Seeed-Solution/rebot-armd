@@ -451,10 +451,10 @@ the header).
   stored poses as orange dots. On opening, the camera aims at the robot's bounding box in the
   current pose so that it fills about 75 % of the narrower side. Drag to rotate, pinch or scroll
   to zoom. The joysticks, sliders and buttons stay on top of the 3D view and keep
-  controlling the arm; dragging outside them rotates the view. J1–J5 use the motor angle
-  as the URDF angle, J6 the motor angle − π/2 (schema `model_joint_map`; at the rest pose the
-  jaws open left-right and end_link +z, the camera side, points up, as on the arm in photos of
-  2026-11-12); J7 is mapped to the finger travel (0–42.5 mm) between `gripper_policy`
+  controlling the arm; dragging outside them rotates the view. J1–J6 use the joint angle
+  as the URDF angle (official convention, schema `model_joint_map` offsets 0; at the rest pose,
+  which reads 0, the jaws open left-right and end_link +z, the camera side, points up, as on the
+  arm in photos of 2026-11-12, taken while the profile still mapped URDF J6 = motor J6 − π/2); J7 is mapped to the finger travel (0–42.5 mm) between `gripper_policy`
   `closed_rad` and `open_rad`. armd serves the URDF and meshes read-only from the asset directory
   (`assets/`, else `/usr/share/rebot-teleop/assets/`, or `ARMD_ASSET_DIR`) at `/assets/model/`;
   the kit `.deb` installs the 34 B601-DM visual parts, simplified to 0.5 mm and packed into one
