@@ -2784,7 +2784,8 @@ Object.assign(I18N.zh, {
   'tch.ep.none': '这个数据集还没有轨迹', 'tch.ep.edit': '编辑', 'tch.ep.dl': '下载', 'tch.ep.aborted': '中断', 'tch.ep.updated': '已更新', 'tch.frames': '{n} 帧',
   'tch.rec.started': '开始录制 → {d}', 'tch.rec.saved': '已保存轨迹 {n}（{d}）',
   'tch.pick.play': '▶ 播放（{n}）', 'tch.pick.edit': '编成动作', 'tch.pick.clear': '清除', 'tch.pick.none': '勾选点位（按勾选顺序编号），再点播放', 'tch.pick.aria': '勾选 {n}',
-  'tch.pick.auto': '动作 {n}', 'tch.pick.reuse': '播放「{n}」（与勾选的点位相同）',
+  'tch.pick.auto': '动作 {n}', 'tch.pick.desc': '驾驶舱「播放」勾选的点位（每次播放覆盖）', 'tch.pick.started': '按勾选顺序播放 {n} 个点位', 'tch.pick.done': '播放完成',
+  'tch.pick.prog': '播放中 · 第 {i}/{n} 个点位', 'tch.start': '开始示教', 'tch.start.hint': '显示「记点 / 录轨迹」工具条，配合摇杆或拖动使用；拖动示教时会自动显示。',
   'tch.src.hand_guide': '拖动', 'tch.src.jog': '摇杆', 'tch.src.servo': '遥操作', 'tch.src.replay': '回放', 'tch.src.sequence': '动作', 'tch.src.import': '导入', 'tch.src.sdk': 'SDK',
 });
 Object.assign(I18N.en, {
@@ -2821,7 +2822,8 @@ Object.assign(I18N.en, {
   'tch.ep.none': 'No trajectories in this dataset yet', 'tch.ep.edit': 'Edit', 'tch.ep.dl': 'Download', 'tch.ep.aborted': 'aborted', 'tch.ep.updated': 'Updated', 'tch.frames': '{n} frames',
   'tch.rec.started': 'Recording → {d}', 'tch.rec.saved': 'Saved trajectory {n} ({d})',
   'tch.pick.play': '▶ Play ({n})', 'tch.pick.edit': 'Make a motion', 'tch.pick.clear': 'Clear', 'tch.pick.none': 'Tick poses (numbered in the order you tick them), then play', 'tch.pick.aria': 'Tick {n}',
-  'tch.pick.auto': 'Motion {n}', 'tch.pick.reuse': 'Playing "{n}" (same poses as ticked)',
+  'tch.pick.auto': 'Motion {n}', 'tch.pick.desc': 'cockpit "Play" of ticked poses (overwritten by each play)', 'tch.pick.started': 'Playing {n} poses in ticked order', 'tch.pick.done': 'Played',
+  'tch.pick.prog': 'Playing · pose {i}/{n}', 'tch.start': 'Start teaching', 'tch.start.hint': 'Shows the "Save pose / Record" toolbar for the sticks or hand-guiding; it shows by itself while hand-guiding.',
   'tch.src.hand_guide': 'hand-guide', 'tch.src.jog': 'jog', 'tch.src.servo': 'teleop', 'tch.src.replay': 'replay', 'tch.src.sequence': 'motion', 'tch.src.import': 'import', 'tch.src.sdk': 'SDK',
 });
 let LANG = (() => {
@@ -9860,6 +9862,11 @@ const TCH = {
 };
 const teachOn = () => !!(S.caps && S.caps.teach && Number(S.caps.teach.version) >= 1);
 const TCH_SEQ_NAME = /^[A-Za-z0-9_\- \p{Script=Han}]{1,64}$/u;
+// "play ticked poses": one sequence slot under this name, overwritten by every play and listed nowhere in the panel
+// (armd's run_sequence takes the id of a saved sequence only)
+const TCH_QUICK = '_quick';
+const teachQuick = (s) => !!s && s.name === TCH_QUICK;
+const teachSaved = () => TCH.seqs.filter((s) => !teachQuick(s));
 const TCH_SPEEDS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
 // commands that need no motion lease: sent on the control WebSocket without a generation (armd teach::is_lease_free)
 function teachCmd(path, body, timeoutMs = 5000) {
@@ -9883,7 +9890,7 @@ function teachErr(e) {
   const c = (e && e.code) || '', m = (e && e.message) || '';
   if (c === 'IN_USE') {
     const ids = (e.reply && Array.isArray(e.reply.sequences)) ? e.reply.sequences : [];
-    return t('tch.e.IN_USE', { s: ids.map((id) => teachSeqName(id)).join(', ') || '?' });
+    return t('tch.e.IN_USE', { s: ids.map((id) => teachSeqName(id)).filter((n) => n !== TCH_QUICK).join(', ') || '?' });
   }
   if (c === 'SEQUENCE_REF_MISSING') { const st = e.reply && e.reply.step; return t('tch.e.SEQUENCE_REF_MISSING', { n: Number.isInteger(st) ? st + 1 : '?' }); }
   for (const k of ['tch.e.' + c, 'ep.code.' + c, 'pose.code.' + c]) if (I18N.zh[k] !== undefined) return t(k, { m });
@@ -9920,7 +9927,7 @@ async function teachLoad(quiet) {
     if (TCH.rec && TCH.rec.startedAt < t0 && !(r && r.owner === CLIENT_ID)) teachRecSet(null);
     TCH.loaded = true;
     if (TCH.cur && TCH.cur.id && !TCH.dirty) { const s = TCH.seqs.find((x) => x.id === TCH.cur.id); if (s) TCH.cur = JSON.parse(JSON.stringify(s)); }
-    if (!quiet) teachStatus(t('tch.counts', { s: TCH.seqs.length, p: TCH.poses.length, e: TCH.eps.length }));
+    if (!quiet) teachStatus(t('tch.counts', { s: teachSaved().length, p: TCH.poses.length, e: TCH.eps.length }));
   } catch (e) { teachStatus(t('tch.e.load', { e: teachErr(e) }), true); }
   teachRender();
 }
@@ -9997,7 +10004,7 @@ function teachStepMissing(st) {
 }
 const teachSeqStale = (s) => (s.steps || []).some(teachStepStale);
 function teachUsedBy(kind, id) {
-  return TCH.seqs.filter((s) => (s.steps || []).some((st) => (kind === 'pose' ? st.type === 'pose' && st.pose_id === id : st.type === 'replay' && st.episode_id === id))).map((s) => s.name);
+  return teachSaved().filter((s) => (s.steps || []).some((st) => (kind === 'pose' ? st.type === 'pose' && st.pose_id === id : st.type === 'replay' && st.episode_id === id))).map((s) => s.name);
 }
 
 /* ---- render ---- */
@@ -10028,8 +10035,8 @@ function teachRenderSeqs(body) {
   body.appendChild(nw);
   body.appendChild(cwEl('p', 'tch-k', t('tch.seq.hint')));
   const ol = cwEl('ol', 'tch-list'); ol.id = 'tch-seqs';
-  if (!TCH.seqs.length) ol.appendChild(cwEl('li', 'empty', TCH.loaded ? t('tch.seq.empty') : '--'));
-  for (const s of TCH.seqs) {
+  if (!teachSaved().length) ol.appendChild(cwEl('li', 'empty', TCH.loaded ? t('tch.seq.empty') : '--'));
+  for (const s of teachSaved()) {
     const li = cwEl('li'); li.dataset.id = s.id;
     const h = cwEl('div', 'tch-li-h');
     h.append(cwEl('b', '', s.name), cwEl('span', 'sp'));
@@ -10162,14 +10169,21 @@ function teachRenderPoses(body) {
   body.appendChild(nw);
   // ticked poses -> play them in tick order (saved as a motion, an identical one is reused) or open them as a new motion
   TCH.pick = TCH.pick.filter((id) => teachPose(id));
-  const n = TCH.pick.length, running = teachRunning();
-  const pb = cwEl('div', 'tch-box tch-pick' + (n ? ' on' : '')); pb.id = 'tch-pick';
-  if (!n) pb.appendChild(cwEl('div', 'tch-k', t('tch.pick.none')));
+  const n = TCH.pick.length, running = teachRunning(), quick = running && TCH.run && TCH.run.quick;
+  const pb = cwEl('div', 'tch-box tch-pick' + (n || quick ? ' on' : '')); pb.id = 'tch-pick';
+  if (!n && !quick) pb.appendChild(cwEl('div', 'tch-k', t('tch.pick.none')));
   else {
     const r = cwEl('div', 'tch-row');
-    const play = tchBtn(t('tch.pick.play', { n }), teachPlayPicked, 'btn-primary grow', running || TCH.busy); play.id = 'tch-pick-play';
-    const ed = tchBtn(t('tch.pick.edit'), () => teachPickToMotion(), '', running); ed.id = 'tch-pick-edit';
-    r.append(play, ed, tchBtn(t('tch.pick.clear'), () => { TCH.pick = []; teachRender(); }));
+    const play = tchBtn(t('tch.pick.play', { n }), () => teachPlayPicked(false), 'btn-primary grow', !n || running || TCH.busy); play.id = 'tch-pick-play';
+    const ed = tchBtn(t('tch.pick.edit'), teachPickToMotion, '', !n || running); ed.id = 'tch-pick-edit';
+    r.append(play, ed, tchBtn(t('tch.pick.clear'), () => { TCH.pick = []; teachRender(); }, '', !n));
+    pb.appendChild(r);
+  }
+  if (quick) {
+    const r = cwEl('div', 'tch-row');
+    const pg = cwEl('span', 'tch-prog grow'); pg.id = 'tch-pick-prog'; pg.setAttribute('role', 'status');
+    const stop = tchBtn(t('tch.stop'), teachStop, 'tch-stop'); stop.id = 'tch-pick-stop';
+    r.append(pg, stop);
     pb.appendChild(r);
   }
   body.appendChild(pb);
@@ -10378,6 +10392,10 @@ function teachLive() {
       s: run.phase ? (I18N.zh['tch.ph.' + run.phase] !== undefined ? t('tch.ph.' + run.phase) : run.phase) : '' }) : '');
     const st = $('tch-stop'); if (st) st.hidden = !run;
   }
+  const qp = $('tch-pick-prog'), quick = run && TCH.run && TCH.run.quick && run.id === TCH.run.actionId ? run : null;
+  if (qp) setText(qp, quick ? t('tch.pick.prog', { i: (quick.step_index ?? 0) + 1, n: TCH.run.n }) : '');
+  const qid = quick && TCH.run.poses[quick.step_index ?? 0];
+  for (const li of document.querySelectorAll('#tch-poses > li')) li.classList.toggle('run', !!qid && li.dataset.id === qid);
   const pl = teachPlaying();
   for (const li of document.querySelectorAll('#teach-body ol[data-ds] > li')) li.classList.toggle('run', !!pl && li.dataset.id === pl);
 }
@@ -10387,9 +10405,11 @@ function teachOnObs(o) {
   for (const r of [o.action, o.previous_action]) {
     if (!r || r.state === 'running' || TCH.toasted === r.id) continue;
     if (r.kind === 'sequence' && TCH.run && r.id === TCH.run.actionId) {
-      TCH.toasted = r.id; TCH.run = null;
-      if (r.state === 'done') { toast(t('tch.run.done'), 'ok'); teachStatus(t('tch.run.done')); }
+      TCH.toasted = r.id;
+      const done = TCH.run.quick ? t('tch.pick.done') : t('tch.run.done');
+      if (r.state === 'done') { toast(done, 'ok'); teachStatus(done); }
       else { const m = t('tch.run.ended', { code: r.code || r.state, m: teachErr({ code: r.code, message: r.message }) }); toast(m, r.state === 'failed' ? 'err' : 'warn', r.code || ''); teachStatus(m, true); }
+      TCH.run = null;
       if (TCH.open) { teachLoad(true); }
     } else if (r.kind === 'replay' && TCH.play && r.id === TCH.play) {
       TCH.toasted = r.id; TCH.play = null;
@@ -10442,7 +10462,15 @@ async function teachRenamePose(p, name) {
 async function teachDelPose(p) {
   if (!teachArm('pose:' + p.name)) return;
   try {
-    await commandRPC('/api/v1/poses/delete', { name: p.name });
+    try { await commandRPC('/api/v1/poses/delete', { name: p.name }); }
+    catch (e) {
+      // only the quick-play slot uses it: drop the slot (it is rebuilt by the next play), then delete again
+      const ids = e.code === 'IN_USE' && e.reply && Array.isArray(e.reply.sequences) ? e.reply.sequences : [];
+      if (!ids.length || !ids.every((id) => teachQuick(TCH.seqs.find((x) => x.id === id)))) throw e;
+      for (const id of ids) await commandRPC('/api/v1/sequences/delete', { id });
+      TCH.seqs = TCH.seqs.filter((x) => !ids.includes(x.id));
+      await commandRPC('/api/v1/poses/delete', { name: p.name });
+    }
     teachStatus(t('pose.deleted', { name: p.name }));
     await teachLoad(true);
   } catch (e) { teachStatus(teachErr(e), true); teachRender(); }
@@ -10455,19 +10483,33 @@ function teachAutoSeqName() {
   for (let k = 1; k < 1000; k++) { const n = t('tch.pick.auto', { n: k }); if (!used.has(n)) return n; }
   return 'motion ' + Date.now();
 }
-// "play in ticked order": reuse a saved motion made of exactly these pose steps, else save a new one; then run it once
-async function teachPlayPicked() {
+// "play in ticked order": the steps go into the quick-play slot (created once, then overwritten; no rev, the last play
+// wins) and run once; the panel stays on the poses tab with the progress and Stop; the ticks stay for another play
+async function teachPlayPicked(allowStale) {
   const steps = teachPickSteps();
   if (!steps.length || TCH.busy || teachRunning()) return;
   if (teachMoveBlock()) return;
-  if (TCH.cur && TCH.dirty) { TCH.tab = 'seq'; teachStatus(t('tch.unsaved'), true); teachRender(); return; }
-  const same = TCH.seqs.find((s) => (s.steps || []).length === steps.length && s.steps.every((st, i) => st.type === 'pose' && st.pose_id === steps[i].pose_id));
-  TCH.repeat = 1; TCH.runRec = false; TCH.pick = [];
-  if (same) { teachEdit(same.id); teachStatus(t('tch.pick.reuse', { n: same.name })); }
-  else { TCH.cur = { name: teachAutoSeqName(), description: '', steps }; TCH.dirty = true; TCH.sel = -1; TCH.tab = 'seq'; teachRender(); }
-  await teachRun({});
-  // the progress and Stop sit in the run box below the steps: bring them into view
-  const pg = $('tch-prog'); if (pg && TCH.open) pg.parentElement.scrollIntoView({ block: 'nearest' });
+  TCH.busy = true; teachRender();
+  try {
+    const sq = await teachGet('/api/v1/sequences').catch(() => null);
+    if (sq && Array.isArray(sq.sequences)) TCH.seqs = sq.sequences;
+    const slot = TCH.seqs.find(teachQuick);
+    const body = { name: TCH_QUICK, description: t('tch.pick.desc'), steps };
+    if (slot) body.id = slot.id;
+    const r = await commandRPC('/api/v1/sequences/save', body);
+    const q = r && r.sequence && r.sequence.id ? r.sequence : { ...body, id: slot && slot.id };
+    if (!q.id) throw Object.assign(new Error(t('err.rejected')), { code: 'SEQUENCE_NOT_FOUND' });
+    const k = TCH.seqs.findIndex((x) => x.id === q.id);
+    if (k >= 0) TCH.seqs[k] = q; else TCH.seqs.push(q);
+    const d = await commandRPC('/api/v1/action/run_sequence', { id: q.id, from_step: 0, single_step: false, repeat: 1, allow_stale: !!allowStale, tag: 'cockpit' });
+    syncEpoch(d.epoch_id);
+    TCH.run = { actionId: d.action_id, seqId: q.id, n: steps.length, record: false, quick: true, poses: steps.map((x) => x.pose_id) };
+    TCH.ask = null;
+    teachStatus(t('tch.pick.started', { n: steps.length }));
+  } catch (e) {
+    if (e.code === 'DATA_STALE') { TCH.ask = { kind: 'quick' }; teachStatus(teachErr(e), true); }
+    else { teachStatus(teachErr(e), true); toast(teachErr(e), 'err', e.code || ''); }
+  } finally { TCH.busy = false; teachRender(); }
 }
 // "make a motion": a new unsaved motion with the ticked poses, opened in the editor (name it, add gripper / wait steps)
 function teachPickToMotion() {
@@ -10607,7 +10649,7 @@ function teachBarRender() {
     const tabs = ['pose', 'seq', 'ep'], k = (tabs.indexOf(TCH.tab) + (e.key === 'ArrowRight' ? 1 : 2)) % 3;
     TCH.tab = tabs[k]; teachRender(); $('teach-tab-' + TCH.tab).focus();
   });
-  $('teach-ask-yes').addEventListener('click', () => { const a = TCH.ask; TCH.ask = null; if (!a) return; if (a.kind === 'ep') teachReplay(a.id, true); else teachRun({ from: a.from, single: a.single, allowStale: true }); });
+  $('teach-ask-yes').addEventListener('click', () => { const a = TCH.ask; TCH.ask = null; if (!a) return; if (a.kind === 'ep') teachReplay(a.id, true); else if (a.kind === 'quick') teachPlayPicked(true); else teachRun({ from: a.from, single: a.single, allowStale: true }); });
   $('teach-ask-no').addEventListener('click', () => { TCH.ask = null; teachStatus('--'); teachRender(); });
   $('tb-pose').addEventListener('click', () => teachSavePose(teachAutoPoseName(), true));
   $('tb-rec').addEventListener('click', teachRecToggle);
