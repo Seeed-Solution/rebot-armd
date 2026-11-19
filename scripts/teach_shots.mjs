@@ -56,6 +56,9 @@ const srv = http.createServer((req, res) => {
   if (u === '/api/v1/poses') return send(res, 200, { poses: POSES });
   if (u === '/api/v1/episodes') return send(res, 200, { episodes: EPS, recording: null });
   if (u === '/api/v1/datasets') return send(res, 200, { datasets: DSETS });
+  // the legacy recording (no capabilities.teach): POST /api/v1/dataset/record/start|save|discard (armd answers 200)
+  if (u.startsWith('/api/v1/dataset/record/')) return send(res, 200, { ok: true });
+  if (process.env.LOG404) console.log('404 ' + req.method + ' ' + req.url);
   res.writeHead(404); res.end();
 }).listen(0, '127.0.0.1');
 await new Promise((r) => srv.once('listening', r));
@@ -121,9 +124,10 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
       const info = await ev((id) => {
         const el = document.getElementById(id);
         return { open: !!el && !el.closest('[hidden]'), raw: el ? /\btch\.[a-z]/.test(el.innerText) : true,
-          hscroll: el ? el.scrollWidth > el.clientWidth + 1 : true, page: document.documentElement.scrollWidth > window.innerWidth + 1 };
+          hscroll: el ? el.scrollWidth > el.clientWidth + 1 : true, page: document.documentElement.scrollWidth > window.innerWidth + 1,
+          http: /HTTP \d{3}/.test(($('toasts') || {}).textContent || '') };
       }, panel);
-      if (!info.open || info.raw || info.hscroll || info.page) fail(`${name} ${tag}: ${JSON.stringify(info)}`);
+      if (!info.open || info.raw || info.hscroll || info.page || info.http) fail(`${name} ${tag}: ${JSON.stringify(info)}`);
       const file = path.join(out, `teach_${name}_${lang}_${vpName}.png`);
       await page.screenshot({ path: file });
       shots.push(file);
@@ -141,7 +145,7 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     await ev(() => { psetOpen(false); $('btn-gc-rec').click(); });
     const g0b = await ev(() => ({ legacy: window.__legacy, tc: window.__tc.length, panel: !$('teach').hidden }));
     if (g0.set || g0.panel || g0b.legacy !== 1 || g0b.tc || g0b.panel) fail(`gating without teach ${tag}: ${JSON.stringify({ ...g0, ...g0b })}`);
-    await ev(() => { S.obs.control_mode = 'position'; S.obs.gravity_comp.phase = null; renderGc(); });
+    await ev(() => { S.obs.control_mode = 'position'; S.obs.gravity_comp.phase = null; setRecording(false); renderGc(); });
 
     // 1 teach v1: the entry next to the Tools group
     await ev(setup, true);
@@ -180,10 +184,27 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     await page.waitForTimeout(400);
     const pe = await ev(() => ({ open: TCH.open, tab: TCH.tab, pset: !$('pset').hidden, tabs: [...$('teach-tabs').children].map((b) => b.textContent), title: $('teach-h').textContent }));
     if (!pe.open || pe.tab !== 'pose' || pe.pset || pe.tabs.length !== 3 || pe.tabs[0] !== (lang === 'zh' ? '点位' : 'Poses')) fail(`entry opens poses tab ${tag}: ${JSON.stringify(pe)}`);
-    // tick bin_b then scan (tick order, not list order), play: a new motion "动作 1" / "Motion 1" is saved and run once
+    // opening the panel (to use 前往) does not start the teach strip; "开始示教" does
+    const st0 = await ev(() => ({ bar: !$('teach-bar').hidden, teach: TCH.teach, start: !$('teach-start-row').hidden }));
+    await ev(() => { window.__cmd = []; document.querySelector('#tch-poses > li[data-id$="POSE01"] .tch-acts .btn').click(); });
+    await page.waitForTimeout(200);
+    const st1 = await ev(() => ({ bar: !$('teach-bar').hidden, go: window.__cmd.map(([p, b]) => p + ':' + b.name) }));
+    if (st0.bar || st0.teach || !st0.start || st1.bar || JSON.stringify(st1.go) !== '["/api/v1/action/move_to_pose:scan"]') fail(`no strip on open / 前往 ${tag}: ${JSON.stringify({ st0, st1 })}`);
+    await shot('0_poses_open_no_strip', 'teach-panel', `strip ${st1.bar}, 前往 ${st1.go}`);
+    await ev(() => $('teach-start').click());
+    const st2 = await ev(() => ({ bar: !$('teach-bar').hidden, start: !$('teach-start-row').hidden }));
+    if (!st2.bar || st2.start) fail(`开始示教 shows the strip ${tag}: ${JSON.stringify(st2)}`);
+    await ev(() => $('tb-x').click());
+    await ev(() => teachOpen(true, { tab: 'pose' }));
+    await page.waitForTimeout(300);
+    // tick bin_b then scan (tick order, not list order), play: the steps go into the one quick-play slot "_quick" (created
+    // by the first play, overwritten by the next), run once; the panel stays on the poses tab with progress and Stop
     await ev(() => {
-      window.__cmd = [];
-      window.__reply['/api/v1/sequences/save'] = (b) => ({ sequence: { ...b, id: 'S9', rev: 1 }, epoch_id: 1 });
+      window.__cmd = []; window.__quick = null;
+      window.__getReal = window.__getReal || window.teachGet;
+      window.teachGet = async (p) => { const d = await window.__getReal(p); if (p === '/api/v1/sequences' && window.__quick) d.sequences = d.sequences.concat([window.__quick]);
+        if (p === '/api/v1/poses' && window.__p07) d.poses = d.poses.concat([{ id: '01JD0000000000000000POSE07', name: 'p01', positions: [] }]); return d; };
+      window.__reply['/api/v1/sequences/save'] = (b) => { window.__quick = { ...b, id: b.id || 'Q1', rev: (window.__quick ? window.__quick.rev : 0) + 1 }; return { sequence: window.__quick, epoch_id: 1 }; };
       window.__reply['/api/v1/action/run_sequence'] = { action_id: 'A9', epoch_id: 1 };
       const cb = (id) => document.querySelector(`#tch-poses > li[data-id="${id}"] input[type=checkbox]`);
       cb('01JD0000000000000000POSE03').click(); cb('01JD0000000000000000POSE01').click();
@@ -191,37 +212,52 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     const pk = await ev(() => ({ pick: TCH.pick.map((x) => x.slice(-6)), nums: [...document.querySelectorAll('#tch-poses > li')].map((li) => li.querySelector('.tch-n').textContent), play: $('tch-pick-play') && $('tch-pick-play').textContent }));
     if (JSON.stringify(pk.pick) !== '["POSE03","POSE01"]' || JSON.stringify(pk.nums) !== '["2","","1"]' || !pk.play || !pk.play.includes('2')) fail(`tick order ${tag}: ${JSON.stringify(pk)}`);
     await shot('0_poses_ticked', 'teach-panel', `ticked ${pk.pick.join(' -> ')}`);
+    const quickCmds = () => ev(() => window.__cmd.map(([p, b]) => [p, p.endsWith('save') ? { id: b.id || null, name: b.name, rev: b.rev ?? null, steps: b.steps.map((s) => s.pose_id.slice(-6) + ':' + s.gripper + ':' + s.speed_scale) } : { id: b.id, repeat: b.repeat, record: !!b.record }]));
     await ev(() => $('tch-pick-play').click());
     await page.waitForTimeout(400);
-    const pp = await ev(() => ({ cmd: window.__cmd.map(([p, b]) => [p, p.endsWith('save') ? { name: b.name, steps: b.steps.map((s) => s.pose_id.slice(-6) + ':' + s.gripper + ':' + s.speed_scale) } : { id: b.id, repeat: b.repeat, record: !!b.record }]), tab: TCH.tab, cur: TCH.cur && TCH.cur.id, pick: TCH.pick.length }));
-    const autoName = lang === 'zh' ? '动作 1' : 'Motion 1';
-    if (JSON.stringify(pp.cmd) !== JSON.stringify([['/api/v1/sequences/save', { name: autoName, steps: ['POSE03:pose:0.5', 'POSE01:pose:0.5'] }], ['/api/v1/action/run_sequence', { id: 'S9', repeat: 1, record: false }]]) || pp.tab !== 'seq' || pp.cur !== 'S9' || pp.pick)
+    const pp = { cmd: await quickCmds(), ...(await ev(() => ({ tab: TCH.tab, cur: TCH.cur && TCH.cur.id, pick: TCH.pick.length }))) };
+    const steps2 = ['POSE03:pose:0.5', 'POSE01:pose:0.5'];
+    if (JSON.stringify(pp.cmd) !== JSON.stringify([['/api/v1/sequences/save', { id: null, name: '_quick', rev: null, steps: steps2 }], ['/api/v1/action/run_sequence', { id: 'Q1', repeat: 1, record: false }]]) || pp.tab !== 'pose' || pp.cur || pp.pick !== 2)
       fail(`play ticked ${tag}: ${JSON.stringify(pp)}`);
-    await ev(() => { S.obs.action = { id: 'A9', kind: 'sequence', state: 'running', step_index: 0, step_type: 'pose', repeat_index: 0, repeats: 1, phase: 'move' }; obsTick(); });
-    await shot('0_play_ticked_running', 'teach-panel', `saved "${autoName}" and running`);
-    await ev(() => { S.obs.action = null; obsTick(); });
-    // the same ticks again reuse the saved motion (no second save)
+    await ev(() => { S.obs.action = { id: 'A9', kind: 'sequence', state: 'running', sequence_id: 'Q1', step_index: 1, step_type: 'pose', repeat_index: 0, repeats: 1, phase: 'move' }; obsTick(); });
+    const pr1 = await ev(() => ({ prog: $('tch-pick-prog') && $('tch-pick-prog').textContent, stop: !!$('tch-pick-stop'), run: [...document.querySelectorAll('#tch-poses > li.run')].map((li) => li.dataset.id.slice(-6)) }));
+    if (!pr1.prog || !pr1.prog.includes('2/2') || !pr1.stop || JSON.stringify(pr1.run) !== '["POSE01"]') fail(`quick play progress ${tag}: ${JSON.stringify(pr1)}`);
+    await shot('0_play_ticked_running', 'teach-panel', `"${pr1.prog}", running row ${pr1.run}`);
+    await ev(() => { S.obs.previous_action = { ...S.obs.action, state: 'done' }; S.obs.action = null; obsTick(); });
+    await page.waitForTimeout(300);
+    // the slot is listed nowhere: not in the Motions tab, not in "used by"
+    const hid = await ev(() => { TCH.tab = 'seq'; teachRender(); const r = { seqs: [...document.querySelectorAll('#tch-seqs > li')].map((li) => li.dataset.id) }; TCH.tab = 'pose'; teachRender();
+      r.used = [...document.querySelectorAll('#tch-poses .tch-sub')].map((x) => x.textContent).join('|'); return r; });
+    if (JSON.stringify(hid.seqs) !== '["S1","S2"]' || hid.used.includes('_quick')) fail(`quick slot hidden ${tag}: ${JSON.stringify(hid)}`);
+    // another tick combination overwrites the slot (same id, no rev): still one slot
+    await ev(() => { window.__cmd = []; TCH.pick = ['01JD0000000000000000POSE01']; teachRender(); $('tch-pick-play').click(); });
+    await page.waitForTimeout(400);
+    const pq = await quickCmds();
+    if (JSON.stringify(pq) !== JSON.stringify([['/api/v1/sequences/save', { id: 'Q1', name: '_quick', rev: null, steps: ['POSE01:pose:0.5'] }], ['/api/v1/action/run_sequence', { id: 'Q1', repeat: 1, record: false }]])) fail(`quick slot overwrite ${tag}: ${JSON.stringify(pq)}`);
+    await ev(() => { S.obs.previous_action = { id: 'A9', kind: 'sequence', state: 'done' }; S.obs.action = null; obsTick(); });
+    // deleting a pose used only by the slot: the slot is dropped, the pose deleted
     await ev(() => {
-      window.__cmd = []; TCH.cur = null; TCH.dirty = false; TCH.tab = 'pose'; teachRender();
-      const cb = (id) => document.querySelector(`#tch-poses > li[data-id="${id}"] input[type=checkbox]`);
-      cb('01JD0000000000000000POSE03').click(); cb('01JD0000000000000000POSE01').click(); $('tch-pick-play').click();
+      window.__cmd = []; let n = 0;
+      window.__reply['/api/v1/poses/delete'] = () => { if (n++ === 0) throw Object.assign(new Error('pose is referenced'), { code: 'IN_USE', reply: { code: 'IN_USE', sequences: ['Q1'] } }); return { epoch_id: 1 }; };
+      window.__reply['/api/v1/sequences/delete'] = () => { window.__quick = null; return { epoch_id: 1 }; };
+      const del = () => document.querySelector('#tch-poses > li[data-id$="POSE01"] .tch-del');
+      del().click(); del().click();
     });
     await page.waitForTimeout(400);
-    const pr = await ev(() => window.__cmd.map(([p, b]) => p + ':' + (b.id || b.name)));
-    if (JSON.stringify(pr) !== '["/api/v1/action/run_sequence:S9"]') fail(`reuse motion ${tag}: ${JSON.stringify(pr)}`);
+    const pdq = await ev(() => window.__cmd.map(([p, b]) => p + ':' + (b.name || b.id)));
+    if (JSON.stringify(pdq) !== '["/api/v1/poses/delete:scan","/api/v1/sequences/delete:Q1","/api/v1/poses/delete:scan"]') fail(`delete pose used by the slot ${tag}: ${JSON.stringify(pdq)}`);
+    await ev(() => { delete window.__reply['/api/v1/poses/delete']; delete window.__reply['/api/v1/sequences/delete']; });
     // 记点 on the strip with no motion open: the new pose joins the poses list ticked (record a few, then play)
     await ev(() => {
-      S.obs.action = null; TCH.cur = null; TCH.dirty = false; TCH.tab = 'pose'; TCH.pick = []; window.__cmd = [];
-      window.__getReal = window.__getReal || window.teachGet;
-      window.teachGet = async (p) => { const d = await window.__getReal(p); if (p === '/api/v1/poses') d.poses = d.poses.concat([{ id: '01JD0000000000000000POSE07', name: 'p01', positions: [] }]); return d; };
+      S.obs.action = null; TCH.cur = null; TCH.dirty = false; TCH.tab = 'pose'; TCH.pick = []; window.__cmd = []; window.__p07 = true;
       window.__reply['/api/v1/poses/save'] = (b) => ({ pose: { id: '01JD0000000000000000POSE07', name: b.name }, epoch_id: 1 });
-      teachRender(); $('tb-pose').click();
+      teachStrip(true); teachRender(); $('tb-pose').click();
     });
     await page.waitForTimeout(400);
     const sp = await ev(() => ({ pick: TCH.pick.map((x) => x.slice(-6)), cmd: window.__cmd.map(([p, b]) => p + ':' + b.name), row: !!document.querySelector('#tch-poses > li[data-id$="POSE07"].sel'), play: !!$('tch-pick-play') }));
     if (JSON.stringify(sp.pick) !== '["POSE07"]' || JSON.stringify(sp.cmd) !== '["/api/v1/poses/save:p01"]' || !sp.row || !sp.play) fail(`strip pose ticked ${tag}: ${JSON.stringify(sp)}`);
-    await ev(() => { window.teachGet = window.__getReal; TCH.pick = []; return teachLoad(true); });
-    await ev(() => { S.obs.previous_action = { id: 'A9', kind: 'sequence', state: 'done' }; obsTick(); TCH.seqs = TCH.seqs.filter((s) => s.id !== 'S9'); TCH.cur = null; TCH.dirty = false; TCH.tab = 'seq'; window.__cmd = []; teachRender(); });
+    await ev(() => { window.teachGet = window.__getReal; window.__p07 = false; TCH.pick = []; teachStrip(false); return teachLoad(true); });
+    await ev(() => { TCH.seqs = TCH.seqs.filter((s) => !teachQuick(s)); TCH.cur = null; TCH.dirty = false; TCH.tab = 'seq'; window.__cmd = []; teachRender(); });
     await page.waitForTimeout(300);
     const l1 = await ev(() => ({ open: !$('teach').hidden, sset: $('sset').hidden, items: [...document.querySelectorAll('#tch-seqs > li')].map((li) => li.dataset.id),
       stale: !!document.querySelector('#tch-seqs > li[data-id="S1"] .tch-bd.stale') }));
