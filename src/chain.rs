@@ -94,6 +94,9 @@ pub struct KinematicChain {
     seg_inertia: Vec<Mat3>,
     /// URDF `<limit>` of each arm joint (URDF angles), when given.
     pub urdf_limits: Vec<Option<(f64, f64)>>,
+    /// Every link reachable from `base_link`: `(link_name, segment_idx, rel_tf_in_segment)`.
+    /// `segment_idx == 0` is `base_link`, `segment_idx == j + 1` moves with joint `j`.
+    pub(crate) link_frames: Vec<(String, usize, Tf)>,
 }
 
 /// World frames of a chain for one joint vector.
@@ -186,10 +189,12 @@ impl KinematicChain {
         // second moments about the segment origin
         let mut j_sum = vec![[[0.0f64; 3]; 3]; n + 1];
         let mut stack: Vec<(&str, usize, Tf)> = vec![(spec.base_link.as_str(), 0, (IDENTITY, [0.0; 3]))];
+        let mut link_frames: Vec<(String, usize, Tf)> = Vec::new();
         let mut visited = 0usize;
         while let Some((link, seg, t)) = stack.pop() {
             visited += 1;
             if visited > urdf.links.len() { return Err("URDF link graph has a cycle".into()); }
+            link_frames.push((link.to_string(), seg, t));
             if let Some(i) = urdf.link(link).and_then(|l| l.inertial.as_ref()) {
                 let c = k::add(&t.1, &k::mat_vec(&t.0, &i.com));
                 m_sum[seg] += i.mass;
@@ -232,6 +237,7 @@ impl KinematicChain {
             seg_com,
             seg_inertia,
             urdf_limits: movable.iter().map(|j| j.limit).collect(),
+            link_frames,
         })
     }
 
@@ -512,6 +518,28 @@ impl ArmModel {
         Some(self.fk(&q64))
     }
 
+    /// All link frames for an f32 joint vector in a single FK pass.
+    pub fn frames_f32(&self, q: &[f32]) -> Option<ChainFrames> {
+        let n = self.arm_dof();
+        if q.len() < n || !q[..n].iter().all(|v| v.is_finite()) { return None; }
+        let mut q64 = [0.0; MAX_CHAIN_JOINTS];
+        for (o, v) in q64.iter_mut().zip(&q[..n]) { *o = f64::from(*v); }
+        Some(match self {
+            Self::RebotDevArm(off) => {
+                let mq = Self::builtin_q(off, &q64);
+                let f = k::frames(&mq);
+                let mut axes = [[0.0; 3]; MAX_CHAIN_JOINTS];
+                let mut origins = [[0.0; 3]; MAX_CHAIN_JOINTS];
+                let mut seg_r = [k::IDENTITY; MAX_CHAIN_JOINTS];
+                axes[..6].copy_from_slice(&f.axes);
+                origins[..6].copy_from_slice(&f.origins);
+                seg_r[..6].copy_from_slice(&f.seg_r);
+                ChainFrames { n: 6, end: f.end, axes, origins, seg_r }
+            }
+            Self::Chain(c) => c.frames(&q64),
+        })
+    }
+
     /// DLS IK (the Cartesian actions).
     pub fn solve_dls(&self, goal: &Pose, q0: &[f64; 6], lo: &[f64; 6], hi: &[f64; 6], w: f64) -> IkResult {
         self.solve_dls_ex(goal, q0, lo, hi, w, false)
@@ -630,9 +658,680 @@ impl ArmModel {
 
     /// Workspace excess for armd joint positions `q` (`kinematics::workspace_violation`).
     pub fn workspace_violation(&self, q: &[f32], ws: &crate::model::WorkspacePolicy, cam: &crate::model::CameraMount) -> k::Violation {
-        match self.fk_f32(q) {
-            Some(pose) => k::workspace_violation_pose_at(&pose, ws, cam, self.shoulder_rz()),
-            None => k::Violation::invalid(),
+        let Some(f) = self.frames_f32(q) else { return k::Violation::invalid(); };
+        let mut v = k::workspace_violation_pose_at(&f.end, ws, cam, self.shoulder_rz());
+        if !ws.link_capsules.is_empty() {
+            let floor = f64::from(ws.floor_z_m);
+            let lo = ws.box_min_m.map(f64::from);
+            let hi = ws.box_max_m.map(f64::from);
+            let base_pt = 1 + ws.check_points_end_m.len() + usize::from(cam.offset_m.is_some());
+            let mut note = |excess: f64, point: usize, limit: &'static str, value: f64, bound: f64, keepout: Option<usize>| {
+                if excess > 0.0 {
+                    v.total += excess;
+                    if v.worst.is_none_or(|w| excess > (w.value - w.bound).abs()) {
+                        v.worst = Some(k::ViolationDetail { point, limit, value, bound, keepout });
+                    }
+                }
+            };
+            for (ci, cap) in ws.link_capsules.iter().enumerate() {
+                let Some(fr) = self.resolve_frame(&cap.frame) else { return k::Violation::invalid(); };
+                let pose = fr.pose(&f);
+                let a = pose.transform_point(&cap.a_m.map(f64::from));
+                let b = pose.transform_point(&cap.b_m.map(f64::from));
+                let r = f64::from(cap.radius_m);
+                let pt = base_pt + ci;
+                let z_min = a[2].min(b[2]) - r;
+                note(floor - z_min, pt, "floor", z_min, floor, None);
+                for axis in 0..3 {
+                    let c_min = a[axis].min(b[axis]) - r;
+                    let c_max = a[axis].max(b[axis]) + r;
+                    note(lo[axis] - c_min, pt, k::BOX_LIMITS[axis][0], c_min, lo[axis], None);
+                    note(c_max - hi[axis], pt, k::BOX_LIMITS[axis][1], c_max, hi[axis], None);
+                }
+                for (bi, kb) in ws.keepout_boxes.iter().enumerate() {
+                    let clr = k::capsule_aabb_clearance(&a, &b, r, &kb.min_m.map(f64::from), &kb.max_m.map(f64::from));
+                    note(-clr, pt, "keepout", -clr, 0.0, Some(bi));
+                }
+            }
         }
+        v
+    }
+}
+
+/// Resolved kinematic frame for a `LinkCapsule`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FrameRef {
+    BaseRel(Mat3, Vec3),
+    /// `seg` is 0-based joint index (`0..arm_dof`), with relative transform in that segment's frame.
+    SegRel(usize, Mat3, Vec3),
+    End,
+}
+
+impl FrameRef {
+    pub fn pose(&self, f: &ChainFrames) -> Pose {
+        match *self {
+            Self::BaseRel(r, p) => Pose::new(r, p),
+            Self::SegRel(j, r, p) => Pose::new(
+                k::mat_mul(&f.seg_r[j], &r),
+                k::add(&f.origins[j], &k::mat_vec(&f.seg_r[j], &p)),
+            ),
+            Self::End => f.end,
+        }
+    }
+}
+
+impl ArmModel {
+    /// Resolve a link / kinematic frame / joint name to a `FrameRef`.
+    pub fn resolve_frame(&self, name: &str) -> Option<FrameRef> {
+        let n = self.arm_dof();
+        if name == "end_link" {
+            return Some(FrameRef::End);
+        }
+        if name == "base_link" {
+            return Some(FrameRef::BaseRel(k::IDENTITY, [0.0; 3]));
+        }
+        // Built-in semantic frame names
+        let semantic = match name {
+            "upper_arm" if n >= 2 => Some(1),
+            "elbow" if n >= 3 => Some(2),
+            "forearm" if n >= 6 => Some(3),
+            "forearm" if n >= 3 => Some(2),
+            "wrist" if n >= 5 => Some(4),
+            _ => None,
+        };
+        if let Some(j) = semantic {
+            return Some(FrameRef::SegRel(j, k::IDENTITY, [0.0; 3]));
+        }
+        // 1-based joint index aliases: joint_1..joint_N, joint1..jointN, j1..jN
+        let j_suffix = name
+            .strip_prefix("joint_")
+            .or_else(|| name.strip_prefix("joint"))
+            .or_else(|| name.strip_prefix('j'));
+        if let Some(s) = j_suffix {
+            if let Ok(idx) = s.parse::<usize>() {
+                if (1..=n).contains(&idx) {
+                    return Some(FrameRef::SegRel(idx - 1, k::IDENTITY, [0.0; 3]));
+                }
+            }
+        }
+        match self {
+            Self::RebotDevArm(_) => {
+                if let Some(s) = name.strip_prefix("link") {
+                    if let Ok(idx) = s.parse::<usize>() {
+                        if (1..=6).contains(&idx) {
+                            return Some(FrameRef::SegRel(idx - 1, k::IDENTITY, [0.0; 3]));
+                        }
+                    }
+                }
+                None
+            }
+            Self::Chain(c) => {
+                if let Some((_, seg, tf)) = c.link_frames.iter().find(|(ln, _, _)| ln == name) {
+                    return Some(if *seg == 0 {
+                        FrameRef::BaseRel(tf.0, tf.1)
+                    } else {
+                        FrameRef::SegRel(*seg - 1, tf.0, tf.1)
+                    });
+                }
+                if let Some(idx) = c.joint_names.iter().position(|jn| jn == name) {
+                    return Some(FrameRef::SegRel(idx, k::IDENTITY, [0.0; 3]));
+                }
+                None
+            }
+        }
+    }
+
+    /// Upper bound on Cartesian motion per joint for a point at local distance `max_offset`
+    /// inside `frame`.
+    pub fn joint_reach_for_frame(&self, frame: FrameRef, max_offset: f64) -> [f64; MAX_CHAIN_JOINTS] {
+        let n = self.arm_dof();
+        match frame {
+            FrameRef::BaseRel(_, _) => [0.0; MAX_CHAIN_JOINTS],
+            FrameRef::End => self.joint_reach(max_offset),
+            FrameRef::SegRel(s, _, rel_p) => {
+                let s = s.min(n.saturating_sub(1));
+                let origins: [Vec3; MAX_CHAIN_JOINTS] = match self {
+                    Self::RebotDevArm(off) => {
+                        let f = k::frames(off);
+                        let mut arr = [[0.0; 3]; MAX_CHAIN_JOINTS];
+                        arr[..6].copy_from_slice(&f.origins);
+                        arr
+                    }
+                    Self::Chain(c) => c.frames(&[0.0; MAX_CHAIN_JOINTS]).origins,
+                };
+                let mut reach = [0.0; MAX_CHAIN_JOINTS];
+                let mut acc = max_offset + k::norm(&rel_p);
+                for j in (0..=s).rev() {
+                    reach[j] = acc;
+                    if j > 0 {
+                        acc += k::norm(&k::sub(&origins[j], &origins[j - 1]));
+                    }
+                }
+                reach
+            }
+        }
+    }
+}
+
+/// Failure produced by [`WorkspaceChecker`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceFailure {
+    pub point: usize,
+    pub limit: String,
+    pub value: f64,
+    pub bound: f64,
+    pub detail: k::WorkspaceViolationDetail,
+}
+
+impl WorkspaceFailure {
+    pub fn invalid(phase: &str, reason: impl Into<String>) -> Self {
+        Self {
+            point: 0,
+            limit: "invalid".into(),
+            value: f64::NAN,
+            bound: 0.0,
+            detail: k::WorkspaceViolationDetail {
+                constraint_id: Some("invalid".into()),
+                geometry_id: Some("end_origin".into()),
+                violation_phase: Some(phase.into()),
+                reason: Some(reason.into()),
+            },
+        }
+    }
+
+    pub fn with_phase(mut self, phase: &str) -> Self {
+        self.detail.violation_phase = Some(phase.into());
+        self
+    }
+}
+
+/// Precomputed per-constraint workspace evaluator (points + optional link capsules).
+#[derive(Debug, Clone)]
+pub struct WorkspaceEvaluator<'a> {
+    pub model: &'a ArmModel,
+    pub ws: &'a crate::model::WorkspacePolicy,
+    pub cam: &'a crate::model::CameraMount,
+    shoulder: [f64; 2],
+    floor: f64,
+    box_lo: [f64; 3],
+    box_hi: [f64; 3],
+    keepouts: Vec<([f64; 3], [f64; 3])>,
+    end_locals: Vec<[f64; 3]>,
+    has_cam: bool,
+    capsules: Vec<(Option<FrameRef>, [f64; 3], [f64; 3], f64)>,
+    pub end_reach: [f64; MAX_CHAIN_JOINTS],
+    pub cap_reaches: Vec<[f64; MAX_CHAIN_JOINTS]>,
+    pub slots_per_geom: usize,
+    pub num_end_pts: usize,
+    pub num_geoms: usize,
+    pub has_reach: bool,
+    pub total_slots: usize,
+}
+
+impl<'a> WorkspaceEvaluator<'a> {
+    pub fn new(
+        model: &'a ArmModel,
+        ws: &'a crate::model::WorkspacePolicy,
+        cam: &'a crate::model::CameraMount,
+    ) -> Self {
+        let mut end_locals = Vec::with_capacity(1 + ws.check_points_end_m.len() + 1);
+        end_locals.push([0.0; 3]);
+        for p in &ws.check_points_end_m {
+            end_locals.push(p.map(f64::from));
+        }
+        let has_cam = cam.offset_m.is_some();
+        if let Some(o) = cam.offset_m {
+            end_locals.push(o.map(f64::from));
+        }
+        let max_end_off = end_locals.iter().map(k::norm).fold(0.0, f64::max);
+        let end_reach = model.joint_reach(max_end_off);
+
+        let mut capsules = Vec::with_capacity(ws.link_capsules.len());
+        let mut cap_reaches = Vec::with_capacity(ws.link_capsules.len());
+        for c in &ws.link_capsules {
+            let fr = model.resolve_frame(&c.frame);
+            let a = c.a_m.map(f64::from);
+            let b = c.b_m.map(f64::from);
+            let max_off = k::norm(&a).max(k::norm(&b));
+            let reach = match fr {
+                Some(fr) => model.joint_reach_for_frame(fr, max_off),
+                None => [f64::INFINITY; MAX_CHAIN_JOINTS],
+            };
+            capsules.push((fr, a, b, f64::from(c.radius_m)));
+            cap_reaches.push(reach);
+        }
+
+        let keepouts: Vec<([f64; 3], [f64; 3])> = ws
+            .keepout_boxes
+            .iter()
+            .map(|b| (b.min_m.map(f64::from), b.max_m.map(f64::from)))
+            .collect();
+
+        let num_end_pts = end_locals.len();
+        let num_geoms = num_end_pts + capsules.len();
+        let slots_per_geom = 7 + keepouts.len();
+        let has_reach = ws.max_reach_m.is_some();
+        let total_slots = num_geoms * slots_per_geom + usize::from(has_reach);
+
+        Self {
+            model,
+            ws,
+            cam,
+            shoulder: model.shoulder_rz(),
+            floor: f64::from(ws.floor_z_m),
+            box_lo: ws.box_min_m.map(f64::from),
+            box_hi: ws.box_max_m.map(f64::from),
+            keepouts,
+            end_locals,
+            has_cam,
+            capsules,
+            end_reach,
+            cap_reaches,
+            slots_per_geom,
+            num_end_pts,
+            num_geoms,
+            has_reach,
+            total_slots,
+        }
+    }
+
+    pub fn alloc_buf(&self) -> k::SlotBuf {
+        k::SlotBuf::zeros(self.total_slots)
+    }
+
+    /// Geometry index for slot `slot`.
+    #[inline]
+    pub fn slot_geom(&self, slot: usize) -> usize {
+        if slot < self.num_geoms * self.slots_per_geom {
+            slot / self.slots_per_geom
+        } else {
+            0 // max_reach belongs to end_origin (geometry 0)
+        }
+    }
+
+    /// Motion bound of geometry `g` for joint travel `tr`.
+    #[inline]
+    pub fn geom_bound(&self, g: usize, tr: &[f64], arm_dof: usize) -> f64 {
+        let reach = if g < self.num_end_pts {
+            &self.end_reach
+        } else {
+            &self.cap_reaches[g - self.num_end_pts]
+        };
+        tr.iter().take(arm_dof).zip(reach).map(|(d, r)| d * r).sum()
+    }
+
+    /// Evaluate clearances of all `(geometry, constraint)` slots at `q` into `out`.
+    /// Returns `Err` if FK fails or a capsule references an unknown frame.
+    pub fn eval_into(&self, q: &[f32], out: &mut k::SlotBuf, phase: &str) -> Result<(), WorkspaceFailure> {
+        let Some(f) = self.model.frames_f32(q) else {
+            return Err(WorkspaceFailure::invalid(phase, "non-finite or incomplete joint positions"));
+        };
+        let buf = out.as_mut_slice();
+        for (gi, local) in self.end_locals.iter().enumerate() {
+            let p = f.end.transform_point(local);
+            let base = gi * self.slots_per_geom;
+            buf[base] = p[2] - self.floor;
+            for axis in 0..3 {
+                buf[base + 1 + axis] = p[axis] - self.box_lo[axis];
+                buf[base + 4 + axis] = self.box_hi[axis] - p[axis];
+            }
+            for (bi, (kb_lo, kb_hi)) in self.keepouts.iter().enumerate() {
+                let depth = (0..3)
+                    .map(|axis| (p[axis] - kb_lo[axis]).min(kb_hi[axis] - p[axis]))
+                    .fold(f64::INFINITY, f64::min);
+                buf[base + 7 + bi] = -depth;
+            }
+        }
+        for (ci, (fr_opt, a_local, b_local, radius)) in self.capsules.iter().enumerate() {
+            let Some(fr) = fr_opt else {
+                let cap = &self.ws.link_capsules[ci];
+                return Err(WorkspaceFailure {
+                    point: self.num_end_pts + ci,
+                    limit: "invalid".into(),
+                    value: f64::NAN,
+                    bound: 0.0,
+                    detail: k::WorkspaceViolationDetail {
+                        constraint_id: Some("invalid".into()),
+                        geometry_id: Some(format!("capsule:{}", cap.id)),
+                        violation_phase: Some(phase.into()),
+                        reason: Some(format!("unknown frame '{}' for capsule '{}'", cap.frame, cap.id)),
+                    },
+                });
+            };
+            let pose = fr.pose(&f);
+            let a = pose.transform_point(a_local);
+            let b = pose.transform_point(b_local);
+            let base = (self.num_end_pts + ci) * self.slots_per_geom;
+            buf[base] = a[2].min(b[2]) - *radius - self.floor;
+            for axis in 0..3 {
+                buf[base + 1 + axis] = (a[axis].min(b[axis]) - *radius) - self.box_lo[axis];
+                buf[base + 4 + axis] = self.box_hi[axis] - (a[axis].max(b[axis]) + *radius);
+            }
+            for (bi, (kb_lo, kb_hi)) in self.keepouts.iter().enumerate() {
+                buf[base + 7 + bi] = k::capsule_aabb_clearance(&a, &b, *radius, kb_lo, kb_hi);
+            }
+        }
+        if let Some(reach) = self.ws.max_reach_m {
+            let p0 = f.end.p;
+            let d = k::shoulder_reach_from(&p0, &self.shoulder);
+            buf[self.num_geoms * self.slots_per_geom] = f64::from(reach) - d;
+        }
+        Ok(())
+    }
+
+    pub fn describe_failure(
+        &self,
+        slot: usize,
+        clr: f64,
+        depth: f64,
+        min_d: f64,
+        phase: &str,
+    ) -> WorkspaceFailure {
+        let reason_for = |cid: &str, gid: &str| -> String {
+            if !depth.is_finite() {
+                format!("invalid workspace check for {cid} ({gid})")
+            } else if min_d <= k::WORKSPACE_EPS {
+                format!("new intrusion into {cid} by {depth:.3}m (geometry {gid})")
+            } else {
+                format!("deepened {cid} intrusion from {min_d:.3}m to {depth:.3}m (geometry {gid})")
+            }
+        };
+        if self.has_reach && slot == self.num_geoms * self.slots_per_geom {
+            let bound = f64::from(self.ws.max_reach_m.unwrap_or(0.0));
+            let cid = "max_reach".to_string();
+            let gid = "end_origin".to_string();
+            return WorkspaceFailure {
+                point: 0,
+                limit: "reach".into(),
+                value: bound - clr,
+                bound,
+                detail: k::WorkspaceViolationDetail {
+                    reason: Some(reason_for(&cid, &gid)),
+                    constraint_id: Some(cid),
+                    geometry_id: Some(gid),
+                    violation_phase: Some(phase.into()),
+                },
+            };
+        }
+        let gi = slot / self.slots_per_geom;
+        let ci = slot % self.slots_per_geom;
+        let gid = if gi == 0 {
+            "end_origin".to_string()
+        } else if gi < self.num_end_pts {
+            if self.has_cam && gi + 1 == self.num_end_pts {
+                "camera_mount".to_string()
+            } else {
+                format!("end_point:{gi}")
+            }
+        } else {
+            format!("capsule:{}", self.ws.link_capsules[gi - self.num_end_pts].id)
+        };
+        let (limit, cid, value, bound) = if ci == 0 {
+            ("floor".to_string(), "floor_z".to_string(), self.floor + clr, self.floor)
+        } else if ci <= 3 {
+            let ax = ci - 1;
+            (
+                k::BOX_LIMITS[ax][0].to_string(),
+                k::BOX_CONSTRAINT_IDS[ax][0].to_string(),
+                self.box_lo[ax] + clr,
+                self.box_lo[ax],
+            )
+        } else if ci <= 6 {
+            let ax = ci - 4;
+            (
+                k::BOX_LIMITS[ax][1].to_string(),
+                k::BOX_CONSTRAINT_IDS[ax][1].to_string(),
+                self.box_hi[ax] - clr,
+                self.box_hi[ax],
+            )
+        } else {
+            let bi = ci - 7;
+            let name = self.ws.keepout_boxes.get(bi).map_or("?", |b| b.name.as_str());
+            (
+                format!("keepout '{name}'"),
+                format!("keepout:{name}"),
+                depth,
+                0.0,
+            )
+        };
+        let reason = reason_for(&cid, &gid);
+        WorkspaceFailure {
+            point: gi,
+            limit,
+            value,
+            bound,
+            detail: k::WorkspaceViolationDetail {
+                constraint_id: Some(cid),
+                geometry_id: Some(gid),
+                violation_phase: Some(phase.into()),
+                reason: Some(reason),
+            },
+        }
+    }
+
+    /// Initialize `min_depths` from `start` clearances.
+    pub fn init_min_depths(&self, clr: &k::SlotBuf) -> k::SlotBuf {
+        let mut min_depths = self.alloc_buf();
+        for (dst, &c) in min_depths.as_mut_slice().iter_mut().zip(clr.as_slice()) {
+            *dst = if c.is_nan() { f64::NAN } else { (-c).max(0.0) };
+        }
+        min_depths
+    }
+
+    /// Check `clr` against `min_depths`, returning the first failing constraint or updating `min_depths`.
+    pub fn check_and_advance(
+        &self,
+        clr: &k::SlotBuf,
+        min_depths: &mut k::SlotBuf,
+        phase: &str,
+    ) -> Result<(), WorkspaceFailure> {
+        let cs = clr.as_slice();
+        if let Some((slot, depth, min_d, _allowed)) = k::first_workspace_rejection(cs, min_depths.as_slice()) {
+            return Err(self.describe_failure(slot, cs[slot], depth, min_d, phase));
+        }
+        k::advance_min_depths(cs, min_depths.as_mut_slice());
+        Ok(())
+    }
+
+    /// Check `clr` against `min_depths` without mutating `min_depths`.
+    pub fn check_readonly(
+        &self,
+        clr: &k::SlotBuf,
+        min_depths: &k::SlotBuf,
+        phase: &str,
+    ) -> Result<(), WorkspaceFailure> {
+        let cs = clr.as_slice();
+        if let Some((slot, depth, min_d, _allowed)) = k::first_workspace_rejection(cs, min_depths.as_slice()) {
+            return Err(self.describe_failure(slot, cs[slot], depth, min_d, phase));
+        }
+        Ok(())
+    }
+
+    /// Conservative check of whether interval `[0, 1]` with endpoint clearances `c0, c1` and
+    /// per-joint travel `tr` can exceed `min_depths` on any slot.
+    fn interval_needs_split(
+        &self,
+        c0: &k::SlotBuf,
+        c1: &k::SlotBuf,
+        min_depths: &k::SlotBuf,
+        tr: &[f64],
+        arm_dof: usize,
+    ) -> Result<bool, WorkspaceFailure> {
+        let mut geom_bounds = [0.0f64; 34];
+        let mut heap_bounds = Vec::new();
+        let bounds: &mut [f64] = if self.num_geoms <= geom_bounds.len() {
+            &mut geom_bounds[..self.num_geoms]
+        } else {
+            heap_bounds.resize(self.num_geoms, 0.0);
+            &mut heap_bounds
+        };
+        for (g, b) in bounds.iter_mut().enumerate() {
+            let v = self.geom_bound(g, tr, arm_dof);
+            if !v.is_finite() {
+                return Err(WorkspaceFailure::invalid("sweep", "non-finite joint travel bound"));
+            }
+            *b = v;
+        }
+        let s0 = c0.as_slice();
+        let s1 = c1.as_slice();
+        let md = min_depths.as_slice();
+        for slot in 0..self.total_slots {
+            let l_g = bounds[self.slot_geom(slot)];
+            if l_g <= k::WORKSPACE_EPS {
+                continue;
+            }
+            let min_d = md[slot];
+            let allowed = if min_d <= k::WORKSPACE_EPS {
+                k::WORKSPACE_EPS
+            } else {
+                min_d + k::WORKSPACE_EPS
+            };
+            let d_max = 0.5 * (l_g - s0[slot] - s1[slot]);
+            if d_max > allowed {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn budget_failure(&self, max_budget: usize, phase: &str) -> WorkspaceFailure {
+        WorkspaceFailure {
+            point: 0,
+            limit: format!("keepout check: the path needs more than {max_budget} FK evaluations to clear the workspace; bound"),
+            value: 0.0,
+            bound: k::WORKSPACE_EPS,
+            detail: k::WorkspaceViolationDetail {
+                constraint_id: Some("sweep_budget".into()),
+                geometry_id: Some("end_origin".into()),
+                violation_phase: Some(phase.into()),
+                reason: Some(format!("workspace sweep exceeded {max_budget} FK evaluations")),
+            },
+        }
+    }
+
+    /// Verify a linear joint-space step `a -> b`, given `a`'s clearances `c_a` and running
+    /// `min_depths`. Zero heap allocations when no subdivision is needed.
+    /// Returns `(c_b)` on success and advances `min_depths` through `b`.
+    pub fn sweep_linear_step(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        c_a: &k::SlotBuf,
+        min_depths: &mut k::SlotBuf,
+        remaining_budget: &mut usize,
+        max_budget: usize,
+        endpoint_phase: &str,
+        sweep_phase: &str,
+    ) -> Result<k::SlotBuf, (f64, WorkspaceFailure)> {
+        let mut c_b = self.alloc_buf();
+        self.eval_into(b, &mut c_b, endpoint_phase).map_err(|e| (1.0, e))?;
+        self.check_readonly(&c_b, min_depths, endpoint_phase).map_err(|e| (1.0, e))?;
+
+        let dof = a.len().min(b.len()).min(MAX_CHAIN_JOINTS);
+        let arm_dof = self.model.arm_dof().min(dof);
+        let mut full_tr = [0.0f64; MAX_CHAIN_JOINTS];
+        for j in 0..arm_dof {
+            full_tr[j] = f64::from((b[j] - a[j]).abs());
+        }
+        if !self
+            .interval_needs_split(c_a, &c_b, min_depths, &full_tr[..arm_dof], arm_dof)
+            .map_err(|e| (1.0, e.with_phase(sweep_phase)))?
+        {
+            self.check_and_advance(&c_b, min_depths, endpoint_phase).map_err(|e| (1.0, e))?;
+            return Ok(c_b);
+        }
+
+        let mut stack: Vec<(f64, k::SlotBuf, f64, k::SlotBuf)> = Vec::new();
+        stack.push((0.0, c_a.clone(), 1.0, c_b.clone()));
+        let mut qm_buf = [0.0f32; MAX_CHAIN_JOINTS];
+        let mut tr_buf = [0.0f64; MAX_CHAIN_JOINTS];
+        while let Some((t0, c0, t1, c1)) = stack.pop() {
+            let dt = t1 - t0;
+            for j in 0..arm_dof {
+                tr_buf[j] = full_tr[j] * dt;
+            }
+            let split = self
+                .interval_needs_split(&c0, &c1, min_depths, &tr_buf[..arm_dof], arm_dof)
+                .map_err(|e| (t0, e.with_phase(sweep_phase)))?;
+            if !split {
+                let ph = if (t1 - 1.0).abs() < 1e-12 { endpoint_phase } else { sweep_phase };
+                self.check_and_advance(&c1, min_depths, ph).map_err(|e| (t1, e))?;
+                continue;
+            }
+            if *remaining_budget == 0 {
+                return Err((t0, self.budget_failure(max_budget, sweep_phase)));
+            }
+            *remaining_budget -= 1;
+            let tm = 0.5 * (t0 + t1);
+            let tm32 = tm as f32;
+            for j in 0..dof {
+                qm_buf[j] = a[j] + tm32 * (b[j] - a[j]);
+            }
+            let mut cm = self.alloc_buf();
+            self.eval_into(&qm_buf[..dof], &mut cm, sweep_phase).map_err(|e| (tm, e))?;
+            self.check_readonly(&cm, min_depths, sweep_phase).map_err(|e| (tm, e))?;
+            stack.push((tm, cm.clone(), t1, c1));
+            stack.push((t0, c0, tm, cm));
+        }
+        Ok(c_b)
+    }
+
+    /// Chronological adaptive sweep over `knots` with path sampler `at(t)` and joint travel
+    /// bound `travel(t0, t1)`. Returns all evaluated samples in ascending time order.
+    pub fn sweep_knots(
+        &self,
+        at: &dyn Fn(f64) -> Vec<f32>,
+        travel: &dyn Fn(f64, f64) -> Vec<f64>,
+        knots: &[f64],
+        budget: usize,
+        phase: &str,
+    ) -> Result<Vec<Vec<f32>>, WorkspaceFailure> {
+        let Some(&t_start) = knots.first() else {
+            return Err(WorkspaceFailure::invalid(phase, "empty knot list"));
+        };
+        let arm_dof = self.model.arm_dof();
+        let first = at(t_start);
+        let mut c_prev = self.alloc_buf();
+        self.eval_into(&first, &mut c_prev, phase)?;
+        let mut min_depths = self.init_min_depths(&c_prev);
+        let mut samples = vec![first];
+        let mut t_prev = t_start;
+        let mut evals = 0usize;
+        let mut stack: Vec<(f64, k::SlotBuf, f64, k::SlotBuf, Option<Vec<f32>>)> = Vec::new();
+
+        for &t_next in &knots[1..] {
+            let q_next = at(t_next);
+            let mut c_next = self.alloc_buf();
+            self.eval_into(&q_next, &mut c_next, phase)?;
+            self.check_readonly(&c_next, &min_depths, phase)?;
+            stack.push((t_prev, c_prev, t_next, c_next.clone(), Some(q_next)));
+            while let Some((t0, c0, t1, c1, q1_opt)) = stack.pop() {
+                let tr = travel(t0, t1);
+                if tr.len() < arm_dof {
+                    return Err(WorkspaceFailure::invalid(phase, "short travel bound"));
+                }
+                if !self.interval_needs_split(&c0, &c1, &min_depths, &tr, arm_dof)? {
+                    self.check_and_advance(&c1, &mut min_depths, phase)?;
+                    if let Some(q1) = q1_opt {
+                        samples.push(q1);
+                    }
+                    continue;
+                }
+                if evals >= budget {
+                    return Err(self.budget_failure(budget, phase));
+                }
+                evals += 1;
+                let tm = 0.5 * (t0 + t1);
+                let qm = at(tm);
+                let mut cm = self.alloc_buf();
+                self.eval_into(&qm, &mut cm, phase)?;
+                self.check_readonly(&cm, &min_depths, phase)?;
+                stack.push((tm, cm.clone(), t1, c1, q1_opt));
+                stack.push((t0, c0, tm, cm, Some(qm)));
+            }
+            t_prev = t_next;
+            c_prev = c_next;
+        }
+        Ok(samples)
     }
 }

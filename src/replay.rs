@@ -253,30 +253,28 @@ pub fn plan_frames(input: ReplayInput, frames: &[RecordFrame]) -> Result<ReplayP
         let path: Vec<Vec<f32>> = samples.iter().map(|q| held(q)).collect();
         crate::supervisor::check_path_with(&input.arm, ws, cam, &input.start, path.iter().map(Vec::as_slice))
             .map_err(workspace_reject)?;
-        if !ws.keepout_boxes.is_empty() {
-            let at = |t: f64| -> Vec<f32> {
-                let k = (t.floor() as usize).min(path.len() - 1);
-                let b = (k + 1).min(path.len() - 1);
-                let f = (t - k as f64).clamp(0.0, 1.0) as f32;
-                path[k].iter().zip(&path[b]).map(|(x, y)| x + (y - x) * f).collect()
-            };
-            let travel = |t0: f64, t1: f64| -> Vec<f64> {
-                // linear segments: per-joint travel is the sum over the segments crossed
-                let (a, b) = (t0.min(t1).max(0.0), t0.max(t1).min((path.len() - 1) as f64));
-                let mut tr = vec![0.0f64; input.dof];
-                let mut k = a.floor() as usize;
-                while (k as f64) < b && k + 1 < path.len() {
-                    let lo = a.max(k as f64);
-                    let hi = b.min(k as f64 + 1.0);
-                    for (j, t) in tr.iter_mut().enumerate() { *t += f64::from((path[k + 1][j] - path[k][j]).abs()) * (hi - lo); }
-                    k += 1;
-                }
-                tr
-            };
-            let knots: Vec<f64> = (0..path.len()).map(|k| k as f64).collect();
-            crate::supervisor::keepout_sweep_with(&input.arm, ws, cam, &at, &travel, &knots, MAX_KEEPOUT_EVALS_PER_PLAN)
-                .map_err(workspace_reject)?;
-        }
+        let at = |t: f64| -> Vec<f32> {
+            let k = (t.floor() as usize).min(path.len() - 1);
+            let b = (k + 1).min(path.len() - 1);
+            let f = (t - k as f64).clamp(0.0, 1.0) as f32;
+            path[k].iter().zip(&path[b]).map(|(x, y)| x + (y - x) * f).collect()
+        };
+        let travel = |t0: f64, t1: f64| -> Vec<f64> {
+            // linear segments: per-joint travel is the sum over the segments crossed
+            let (a, b) = (t0.min(t1).max(0.0), t0.max(t1).min((path.len() - 1) as f64));
+            let mut tr = vec![0.0f64; input.dof];
+            let mut k = a.floor() as usize;
+            while (k as f64) < b && k + 1 < path.len() {
+                let lo = a.max(k as f64);
+                let hi = b.min(k as f64 + 1.0);
+                for (j, t) in tr.iter_mut().enumerate() { *t += f64::from((path[k + 1][j] - path[k][j]).abs()) * (hi - lo); }
+                k += 1;
+            }
+            tr
+        };
+        let knots: Vec<f64> = (0..path.len()).map(|k| k as f64).collect();
+        crate::supervisor::keepout_sweep_with(&input.arm, ws, cam, &at, &travel, &knots, MAX_KEEPOUT_EVALS_PER_PLAN)
+            .map_err(workspace_reject)?;
     }
     // power budget: the playback (at the chosen speed) is slowed to fit, or refused
     let power_scale = match input.power.as_ref().filter(|b| b.enabled && b.planning.enabled) {
@@ -304,7 +302,11 @@ pub fn plan_frames(input: ReplayInput, frames: &[RecordFrame]) -> Result<ReplayP
 }
 
 fn workspace_reject(e: SafetyError) -> ArmError {
-    rejected(422, "WORKSPACE_VIOLATION", format!("episode leaves the allowed workspace: {e}"))
+    let detail = e.workspace_detail().map(|d| d.with_phase("replay")).unwrap_or_default();
+    ArmError::WorkspaceRejected {
+        message: format!("episode leaves the allowed workspace: {e}"),
+        detail,
+    }
 }
 
 #[derive(Debug, Clone)]

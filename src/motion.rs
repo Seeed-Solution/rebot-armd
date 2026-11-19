@@ -23,7 +23,14 @@ pub enum MotionError {
     #[error("IK branch flip at s={s:.3}: joint {joint} jumps {dq:.3} rad between samples (limit 0.10)")]
     IkBranchFlip { s: f64, joint: usize, dq: f64 },
     #[error("Path leaves the safe workspace at s={s:.3}: check point {point} {limit} {value:.3} m beyond bound {bound:.3} m")]
-    WorkspaceViolation { s: f64, point: usize, limit: String, value: f64, bound: f64 },
+    WorkspaceViolation {
+        s: f64,
+        point: usize,
+        limit: String,
+        value: f64,
+        bound: f64,
+        detail: kinematics::WorkspaceViolationDetail,
+    },
     #[error("Motion busy: {0}")]
     MotionBusy(String),
     #[error("Plan is stale: {0}")]
@@ -65,6 +72,8 @@ pub const MAX_SAMPLE_JUMP_RAD: f64 = 0.10;
 pub const SAMPLE_SPACING_M: f64 = 0.005;
 pub const SAMPLE_SPACING_RAD: f64 = 2.0 * std::f64::consts::PI / 180.0;
 pub const MAX_SAMPLES: usize = 400;
+/// Maximum added FK evaluations during Cartesian path workspace sweep.
+pub const MAX_CARTESIAN_SWEEP_EVALS: usize = 4000;
 /// IK search limits are the joint limits shrunk by this margin (cockpit `CFG.limitMargin`).
 pub const IK_LIMIT_MARGIN: f64 = 0.02;
 /// Auto-level threshold (cockpit `CFG.view.levelCos`).
@@ -200,13 +209,30 @@ pub fn plan_cartesian_ex(input: &PlanInput, goal: Pose, speed: Speed, yaw_free: 
         }
     });
     let start_q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { input.q0[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });
-    let v_start = input.ws.as_ref().map(|ws| input.arm.workspace_violation(&start_q32, ws, &input.cam));
+    let ws_eval = input.ws.as_ref().map(|ws| crate::chain::WorkspaceEvaluator::new(&input.arm, ws, &input.cam));
+    let mut ws_state = match &ws_eval {
+        Some(ev) => {
+            let mut c0 = ev.alloc_buf();
+            ev.eval_into(&start_q32, &mut c0, "plan").map_err(|f| MotionError::WorkspaceViolation {
+                s: 0.0,
+                point: f.point,
+                limit: f.limit,
+                value: f.value,
+                bound: f.bound,
+                detail: f.detail,
+            })?;
+            let min_d = ev.init_min_depths(&c0);
+            Some((c0, min_d, MAX_CARTESIAN_SWEEP_EVALS))
+        }
+        None => None,
+    };
 
     let mut q_samples = Vec::with_capacity(n + 1);
     let mut s_samples = Vec::with_capacity(n + 1);
     q_samples.push(start_q32);
     s_samples.push(0.0);
     let mut prev = input.q0;
+    let mut prev_q32 = start_q32;
     for k in 1..=n {
         let s = k as f64 / n as f64;
         let p = [start.p[0] + dp[0] * s, start.p[1] + dp[1] * s, start.p[2] + dp[2] * s];
@@ -223,16 +249,35 @@ pub fn plan_cartesian_ex(input: &PlanInput, goal: Pose, speed: Speed, yaw_free: 
             }
         }
         let q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { sol.q[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });
-        if let (Some(ws), Some(v0)) = (input.ws.as_ref(), v_start.as_ref()) {
-            let v = input.arm.workspace_violation(&q32, ws, &input.cam);
-            if kinematics::workspace_rejects(&v, v0) {
-                let w = v.worst.expect("violation has a worst point");
-                return Err(MotionError::WorkspaceViolation { s, point: w.point, limit: w.label(ws), value: w.value, bound: w.bound });
+        if let (Some(ev), Some((c_prev, min_d, rem))) = (&ws_eval, &mut ws_state) {
+            match ev.sweep_linear_step(
+                &prev_q32,
+                &q32,
+                c_prev,
+                min_d,
+                rem,
+                MAX_CARTESIAN_SWEEP_EVALS,
+                "plan",
+                "sweep",
+            ) {
+                Ok(c_next) => *c_prev = c_next,
+                Err((t_seg, f)) => {
+                    let s_fail = ((k - 1) as f64 + t_seg) / n as f64;
+                    return Err(MotionError::WorkspaceViolation {
+                        s: s_fail,
+                        point: f.point,
+                        limit: f.limit,
+                        value: f.value,
+                        bound: f.bound,
+                        detail: f.detail,
+                    });
+                }
             }
         }
         q_samples.push(q32);
         s_samples.push(s);
         prev = sol.q;
+        prev_q32 = q32;
     }
 
     // Single quintic s(t): peak s' = 1.875 / T, peak s'' = 5.7735 / T².
@@ -1054,6 +1099,15 @@ pub struct ActionStatus {
     /// Execution diagnostics for each arm sub-motion of the macro action.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub motions: Vec<MacroMotionDiag>,
+    /// Structured workspace violation details when failed with `WORKSPACE_VIOLATION`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub violation_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Execution diagnostics for one sub-motion in a macro action (grasp, place).

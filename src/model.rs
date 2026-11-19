@@ -188,10 +188,26 @@ pub struct WorkspacePolicy {
     /// (`/api/v1/workspace/keepout`) replaces this one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keepout_boxes: Vec<KeepoutBox>,
+    /// Optional collision capsules attached to arm links / kinematic frames.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub link_capsules: Vec<LinkCapsule>,
 }
 
 /// Most keep-out boxes a profile or the runtime list may hold.
 pub const MAX_KEEPOUT_BOXES: usize = 16;
+
+/// Most link capsules a workspace policy may define.
+pub const MAX_LINK_CAPSULES: usize = 16;
+
+/// Capsule attached to a link/kinematic frame for workspace and keep-out checks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinkCapsule {
+    pub id: String,
+    pub frame: String,
+    pub a_m: [f32; 3],
+    pub b_m: [f32; 3],
+    pub radius_m: f32,
+}
 
 /// Axis-aligned keep-out box in the base frame (m).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -236,6 +252,21 @@ impl WorkspacePolicy {
             max_reach_m: Some(0.52),
             check_points_end_m: corners,
             keepout_boxes: Vec::new(),
+            link_capsules: Vec::new(),
+        }
+    }
+
+    /// Copy with `floor_z`, outer `box`, and `max_reach` disabled (used by `park` so it
+    /// can escape outer workspace violations while still enforcing `keepout_boxes`).
+    pub fn keepout_only(&self) -> Self {
+        Self {
+            floor_z_m: f32::NEG_INFINITY,
+            box_min_m: [f32::NEG_INFINITY; 3],
+            box_max_m: [f32::INFINITY; 3],
+            max_reach_m: None,
+            check_points_end_m: self.check_points_end_m.clone(),
+            keepout_boxes: self.keepout_boxes.clone(),
+            link_capsules: self.link_capsules.clone(),
         }
     }
 
@@ -247,6 +278,24 @@ impl WorkspacePolicy {
             || self.check_points_end_m.is_empty() || self.check_points_end_m.len() > 16
             || !self.check_points_end_m.iter().all(finite3) {
             return Err("Invalid workspace policy: finite values, box_min < box_max, 1..16 check points".into());
+        }
+        if self.link_capsules.len() > MAX_LINK_CAPSULES {
+            return Err(format!("Invalid workspace policy: at most {MAX_LINK_CAPSULES} link_capsules"));
+        }
+        let mut ids = std::collections::HashSet::with_capacity(self.link_capsules.len());
+        for (i, c) in self.link_capsules.iter().enumerate() {
+            if c.id.is_empty() || c.id.len() > 64 {
+                return Err(format!("Invalid workspace policy: link_capsules[{i}] id must be 1..64 bytes"));
+            }
+            if !ids.insert(c.id.as_str()) {
+                return Err(format!("Invalid workspace policy: duplicate link_capsule id '{}'", c.id));
+            }
+            if c.frame.is_empty() {
+                return Err(format!("Invalid workspace policy: link_capsules[{i}] ('{}') frame must not be empty", c.id));
+            }
+            if !finite3(&c.a_m) || !finite3(&c.b_m) || !c.radius_m.is_finite() || c.radius_m < 0.0 {
+                return Err(format!("Invalid workspace policy: link_capsules[{i}] ('{}') requires finite endpoints and radius_m >= 0", c.id));
+            }
         }
         KeepoutBox::validate_list(&self.keepout_boxes)
     }
@@ -1187,7 +1236,17 @@ impl ArmConfig {
                 ));
             }
         }
-        if let Some(ws) = &self.workspace { ws.validate()?; }
+        if let Some(ws) = &self.workspace {
+            ws.validate()?;
+            for (i, c) in ws.link_capsules.iter().enumerate() {
+                if self.arm_model.resolve_frame(&c.frame).is_none() {
+                    return Err(format!(
+                        "Invalid workspace policy: link_capsules[{i}] ('{}') unknown frame '{}'",
+                        c.id, c.frame
+                    ));
+                }
+            }
+        }
         let cam = &self.camera_mount;
         if !cam.rot_deg.is_finite() || !cam.tilt_deg.is_finite()
             || cam.offset_m.is_some_and(|o| o.iter().any(|v| !v.is_finite())) {
@@ -1519,6 +1578,9 @@ pub struct ArmObservation {
     /// workspace, blocked hold); null when none applies. See docs/control_safety_contract.md.
     #[serde(default)]
     pub motion_limit: Option<MotionLimit>,
+    /// Structured workspace violation details when `motion_limit.reason == Workspace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_violation: Option<crate::kinematics::WorkspaceViolationDetail>,
     /// Per joint: the motor's reported fault code, or null. Empty when the driver
     /// reports no motor state (Damiao state codes 8-14).
     #[serde(default)]

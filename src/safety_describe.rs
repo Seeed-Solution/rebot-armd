@@ -238,10 +238,15 @@ impl SupervisorInner {
         let cap = c.speed_cap;
         let kinematics_configured = c.kinematics.is_some();
         let workspace_configured = c.workspace.is_some();
-        let workspace_active = self.workspace_policy().is_some();
-        let geometry_coverage = if workspace_active { "end_only" } else { "none" };
+        let workspace_policy = self.workspace_policy();
+        let workspace_active = workspace_policy.is_some();
+        let geometry_coverage = match workspace_policy {
+            Some((ws, _)) if !ws.link_capsules.is_empty() => "end_and_links",
+            Some(_) => "end_only",
+            None => "none",
+        };
         let camera_mount_covered = workspace_active && c.camera_mount.offset_m.is_some();
-        let workspace = self.workspace_policy().map(|(ws, cam)| json!({
+        let workspace = workspace_policy.map(|(ws, cam)| json!({
             "floor_z_m": ws.floor_z_m,
             "box_min_m": ws.box_min_m,
             "box_max_m": ws.box_max_m,

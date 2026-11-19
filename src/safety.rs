@@ -185,7 +185,40 @@ pub enum SafetyError {
     CollisionHold(String),
 
     #[error("Target outside the safe workspace: check point {point} {limit} {value:.3} m beyond bound {bound:.3} m")]
-    WorkspaceViolation { point: usize, limit: String, value: f32, bound: f32 },
+    WorkspaceViolation {
+        point: usize,
+        limit: String,
+        value: f32,
+        bound: f32,
+        #[serde(default)]
+        detail: crate::kinematics::WorkspaceViolationDetail,
+    },
+}
+
+impl SafetyError {
+    pub fn from_workspace(f: crate::chain::WorkspaceFailure) -> Self {
+        Self::WorkspaceViolation {
+            point: f.point,
+            limit: f.limit,
+            value: f.value as f32,
+            bound: f.bound as f32,
+            detail: f.detail,
+        }
+    }
+
+    pub fn with_workspace_phase(mut self, phase: &str) -> Self {
+        if let Self::WorkspaceViolation { ref mut detail, .. } = self {
+            detail.violation_phase = Some(phase.into());
+        }
+        self
+    }
+
+    pub fn workspace_detail(&self) -> Option<crate::kinematics::WorkspaceViolationDetail> {
+        match self {
+            Self::WorkspaceViolation { detail, .. } => Some(detail.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// Safety Manager tracking safety state machine and command generation ID

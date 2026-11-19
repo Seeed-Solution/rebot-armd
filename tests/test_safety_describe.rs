@@ -248,6 +248,18 @@ async fn geometry_coverage_reports_configured_unconfigured_and_camera_mount() {
     assert_eq!(d_cam["limits"]["camera_mount_covered"], true);
     assert_eq!(d_cam["limits"]["workspace"]["camera_mount_covered"], true);
 
+    let mut with_caps = ArmConfig::rebot_dm();
+    with_caps.workspace.as_mut().unwrap().link_capsules.push(armd::model::LinkCapsule {
+        id: "upper".into(),
+        frame: "upper_arm".into(),
+        a_m: [0.0, 0.0, 0.0],
+        b_m: [-0.26, 0.0, 0.0],
+        radius_m: 0.03,
+    });
+    let d_caps = describe(&ArmSupervisor::new(with_caps)).await;
+    assert_eq!(d_caps["limits"]["geometry_coverage"], "end_and_links");
+    assert_eq!(d_caps["limits"]["workspace"]["geometry_coverage"], "end_and_links");
+
     let unconfigured = describe(&ArmSupervisor::new(ArmConfig::default())).await;
     let mut keys: Vec<&str> = unconfigured.as_object().unwrap().keys().map(String::as_str).collect();
     keys.sort_unstable();

@@ -65,8 +65,15 @@ fn invalid_command(message: &str) -> ApiError {
 }
 
 fn rejection(error: ApiError, kind: &str, epoch: u64) -> Value {
-    json!({"type":kind, "status":error.status.as_u16(), "code":error.code,
-        "error":error.error, "message":error.message, "safety_state":error.safety_state, "epoch_id":epoch})
+    let mut v = json!({"type":kind, "status":error.status.as_u16(), "code":error.code,
+        "error":error.error, "message":error.message, "safety_state":error.safety_state, "epoch_id":epoch});
+    if let Some(d) = error.workspace_violation {
+        if let Some(c) = d.constraint_id { v["constraint_id"] = json!(c); }
+        if let Some(g) = d.geometry_id { v["geometry_id"] = json!(g); }
+        if let Some(p) = d.violation_phase { v["violation_phase"] = json!(p); }
+        if let Some(r) = d.reason { v["reason"] = json!(r); }
+    }
+    v
 }
 
 fn positions(value: Option<&Value>) -> Result<Vec<f32>, ApiError> {

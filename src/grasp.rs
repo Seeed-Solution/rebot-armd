@@ -1865,7 +1865,19 @@ pub fn table_violation(from: &Pose, to: &Pose, pts: &[Vec3], table_z: f64) -> Op
             .map(|(i, (p, f))| (i, pose.transform_point(p)[2], *f))
             .filter(|&(_, z, f)| z < f - 1e-6)
             .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(point, z, _)| MotionError::WorkspaceViolation { s, point, limit: "table_z_m + 0.005".into(), value: z, bound })
+            .map(|(point, z, _)| MotionError::WorkspaceViolation {
+                s,
+                point,
+                limit: "table_z_m + 0.005".into(),
+                value: z,
+                bound,
+                detail: kinematics::WorkspaceViolationDetail {
+                    constraint_id: Some("table_z".into()),
+                    geometry_id: Some(if point == 0 { "end_origin".into() } else { format!("end_point:{point}") }),
+                    violation_phase: Some("plan".into()),
+                    reason: Some(format!("new intrusion below table clearance {bound:.3}m at z={z:.3}m")),
+                },
+            })
     })
 }
 
@@ -2339,6 +2351,9 @@ impl Orchestrator {
         };
         let (goal, _yaw_free) = motion::resolve_goal_ex(&input, &spec);
         if let Some(e) = table_violation(&input.arm.fk(&input.q0), &goal, &self.envelope, self.setup.table_z_m) {
+            if let MotionError::WorkspaceViolation { ref detail, .. } = e {
+                self.sup.inner().write().await.set_action_workspace_violation(self.id, detail.clone());
+            }
             return Err(crate::macro_action::arm_fail(e.into()));
         }
         self.ctx.move_arm(phase, spec, Speed { linear, angular: motion::DEFAULT_ANGULAR_RPS }).await

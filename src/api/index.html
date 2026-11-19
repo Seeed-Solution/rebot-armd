@@ -2982,9 +2982,20 @@ function connectWS() {
     if (o.type === 'servo_reject') {
       syncEpoch(o.epoch_id);
       if (o.code === 'WORKSPACE_VIOLATION') {
-        // server-side Cartesian safety box (floor / boundary incl. the gripper envelope)
-        if (S.mode === 'cart') cartReject('floor');
-        else toastOnce({ message: t('err.workspace'), code: o.code });
+        const cid = o.constraint_id;
+        const gid = o.geometry_id;
+        const nonFloor = (cid && cid !== 'floor_z')
+          || (gid && gid.startsWith('capsule:'))
+          || (!cid && typeof o.message === 'string' && /keepout|box_|reach|capsule:/i.test(o.message));
+        const detail = o.reason || o.message;
+        if (nonFloor && detail) {
+          if (S.mode === 'cart') cartReject(detail);
+          else toastOnce({ message: detail, code: o.code });
+        } else {
+          // server-side Cartesian safety box (floor / boundary incl. the gripper envelope)
+          if (S.mode === 'cart') cartReject('floor');
+          else toastOnce({ message: t('err.workspace'), code: o.code });
+        }
         return;
       }
       const msg = o.code === 'HANDOVER_SETTLING'
@@ -3003,10 +3014,14 @@ function connectWS() {
       syncEpoch(o.epoch_id);
       S.presetRunning = false;
       S.preset = null;
+      const nonFloor = (o.constraint_id && o.constraint_id !== 'floor_z')
+        || (o.geometry_id && o.geometry_id.startsWith('capsule:'))
+        || (!o.constraint_id && typeof o.message === 'string' && /keepout|box_|reach|capsule:/i.test(o.message));
+      const wsMsg = nonFloor ? (o.reason || o.message || t('err.workspace')) : t('err.workspace');
       const msg = o.code === 'HANDOVER_SETTLING'
         ? t('err.settling3')
         : o.code === 'COLLISION_HOLD' ? t('err.collision_hold')
-        : o.code === 'WORKSPACE_VIOLATION' ? t('err.workspace')
+        : o.code === 'WORKSPACE_VIOLATION' ? wsMsg
         : (o.code === 'UNSUPPORTED' ? t('err.preset_unsupported') : t('err.preset_reject') + (o.message || o.error || o.reason || t('err.state_limit')));
       toast(msg, 'err');
       return;

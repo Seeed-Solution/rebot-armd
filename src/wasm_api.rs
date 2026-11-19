@@ -226,6 +226,17 @@ fn error_json(code: &str, message: impl std::fmt::Display) -> Value {
     json!({"ok": false, "code": code, "message": message.to_string()})
 }
 
+fn motion_error_json(error: &MotionError) -> Value {
+    let mut v = error_json(error.code(), error);
+    if let MotionError::WorkspaceViolation { detail, .. } = error {
+        if let Some(c) = &detail.constraint_id { v["constraint_id"] = json!(c); }
+        if let Some(g) = &detail.geometry_id { v["geometry_id"] = json!(g); }
+        if let Some(p) = &detail.violation_phase { v["violation_phase"] = json!(p); }
+        if let Some(r) = &detail.reason { v["reason"] = json!(r); }
+    }
+    v
+}
+
 /// Dispatch one request using thread-local simulation state. No filesystem or network I/O.
 pub fn dispatch_json(req_json: &str) -> String {
     std::panic::catch_unwind(|| {
@@ -235,7 +246,7 @@ pub fn dispatch_json(req_json: &str) -> String {
         };
         ENGINE.with(|engine| match engine.borrow_mut().dispatch(request) {
             Ok(value) => value,
-            Err(error) => error_json(error.code(), error),
+            Err(error) => motion_error_json(&error),
         })
     })
     .unwrap_or_else(|_| error_json("INTERNAL", "core request panicked"))

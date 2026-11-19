@@ -93,6 +93,14 @@ pub struct ApiErrorResponse {
     pub safety_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub violation_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug)]
@@ -102,6 +110,7 @@ pub struct ApiError {
     pub message: String,
     pub code: Option<String>,
     pub safety_state: Option<String>,
+    pub workspace_violation: Option<crate::kinematics::WorkspaceViolationDetail>,
 }
 
 #[allow(non_snake_case)]
@@ -112,16 +121,25 @@ pub fn ApiError(status: StatusCode, message: String, code: String) -> ApiError {
         message,
         code: Some(code),
         safety_state: None,
+        workspace_violation: None,
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let (constraint_id, geometry_id, violation_phase, reason) = match self.workspace_violation {
+            Some(d) => (d.constraint_id, d.geometry_id, d.violation_phase, d.reason),
+            None => (None, None, None, None),
+        };
         let body = Json(ApiErrorResponse {
             error: self.error,
             message: self.message,
             safety_state: self.safety_state,
             code: self.code,
+            constraint_id,
+            geometry_id,
+            violation_phase,
+            reason,
         });
         (self.status, body).into_response()
     }
@@ -137,6 +155,7 @@ impl From<ArmError> for ApiError {
                     message: safety_err.to_string(),
                     code: Some("HANDOVER_SETTLING".to_string()),
                     safety_state: None,
+                    workspace_violation: None,
                 },
                 crate::safety::SafetyError::ArmNotAtRestingPose { .. } => ApiError {
                     status: StatusCode::CONFLICT,
@@ -144,6 +163,7 @@ impl From<ArmError> for ApiError {
                     message: safety_err.to_string(),
                     code: Some("ARM_NOT_AT_RESTING_POSE".to_string()),
                     safety_state: Some("Armed".to_string()),
+                    workspace_violation: None,
                 },
                 crate::safety::SafetyError::MotionForbiddenInFaultState(msg) => ApiError {
                     status: StatusCode::CONFLICT,
@@ -151,6 +171,7 @@ impl From<ArmError> for ApiError {
                     message: msg,
                     code: Some("MOTION_FORBIDDEN_IN_FAULT_STATE".to_string()),
                     safety_state: Some("Fault".to_string()),
+                    workspace_violation: None,
                 },
                 crate::safety::SafetyError::ClearFaultRejected(msg) => ApiError {
                     status: StatusCode::CONFLICT,
@@ -158,6 +179,7 @@ impl From<ArmError> for ApiError {
                     message: msg,
                     code: Some("CLEAR_FAULT_REJECTED".to_string()),
                     safety_state: Some("Fault".to_string()),
+                    workspace_violation: None,
                 },
                 crate::safety::SafetyError::EStopActive => ApiError {
                     status: StatusCode::CONFLICT,
@@ -165,6 +187,7 @@ impl From<ArmError> for ApiError {
                     message: safety_err.to_string(),
                     code: Some("ESTOP_ACTIVE".to_string()),
                     safety_state: Some("EStop".to_string()),
+                    workspace_violation: None,
                 },
                 crate::safety::SafetyError::CollisionHold(_) => {
                     ApiError(StatusCode::CONFLICT, safety_err.to_string(), "COLLISION_HOLD".to_string())
@@ -172,8 +195,10 @@ impl From<ArmError> for ApiError {
                 crate::safety::SafetyError::MotionBusy => {
                     ApiError(StatusCode::CONFLICT, safety_err.to_string(), "MOTION_BUSY".to_string())
                 }
-                crate::safety::SafetyError::WorkspaceViolation { .. } => {
-                    ApiError(StatusCode::UNPROCESSABLE_ENTITY, safety_err.to_string(), "WORKSPACE_VIOLATION".to_string())
+                crate::safety::SafetyError::WorkspaceViolation { ref detail, .. } => {
+                    let mut api = ApiError(StatusCode::UNPROCESSABLE_ENTITY, safety_err.to_string(), "WORKSPACE_VIOLATION".to_string());
+                    api.workspace_violation = Some(detail.clone());
+                    api
                 }
                 crate::safety::SafetyError::EpochMismatch { .. } => {
                     ApiError(StatusCode::CONFLICT, safety_err.to_string(), "EPOCH_MISMATCH".to_string())
@@ -187,6 +212,7 @@ impl From<ArmError> for ApiError {
                     message: safety_err.to_string(),
                     code: Some("FAULT_ACTIVE".to_string()),
                     safety_state: Some("Fault".to_string()),
+                    workspace_violation: None,
                 },
                 crate::safety::SafetyError::NotArmed(_) => {
                     ApiError(StatusCode::PRECONDITION_FAILED, safety_err.to_string(), "NOT_ARMED".to_string())
@@ -206,13 +232,22 @@ impl From<ArmError> for ApiError {
                     M::InvalidCommand(_) => StatusCode::BAD_REQUEST,
                     _ => StatusCode::UNPROCESSABLE_ENTITY,
                 };
-                ApiError(status, motion_err.to_string(), motion_err.code().to_string())
+                let mut api = ApiError(status, motion_err.to_string(), motion_err.code().to_string());
+                if let M::WorkspaceViolation { detail, .. } = motion_err {
+                    api.workspace_violation = Some(detail);
+                }
+                api
             }
             ArmError::Unsupported(msg) => {
                 ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg, "UNSUPPORTED".to_string())
             }
             ArmError::Rejected { status, code, message } => {
                 ApiError(StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT), message, code)
+            }
+            ArmError::WorkspaceRejected { message, detail } => {
+                let mut api = ApiError(StatusCode::UNPROCESSABLE_ENTITY, message, "WORKSPACE_VIOLATION".to_string());
+                api.workspace_violation = Some(detail);
+                api
             }
             ArmError::Internal(msg) => {
                 ApiError(StatusCode::INTERNAL_SERVER_ERROR, msg, "INTERNAL_ERROR".to_string())

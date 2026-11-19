@@ -15,6 +15,8 @@
 //! - Camera frame is OpenCV (x right, y down, z optical axis = end_link x at zero tilt).
 use std::sync::LazyLock;
 
+use serde::{Deserialize, Serialize};
+
 use crate::gravity::{mat3_mul, mat3_vec3_mul, AXES, ROT, TRANS};
 
 pub type Mat3 = [[f64; 3]; 3];
@@ -76,12 +78,13 @@ impl Pose {
     pub fn transform_point(&self, v: &Vec3) -> Vec3 { add(&self.p, &mat3_vec3_mul(&self.r, v)) }
 }
 
-/// End pose plus world joint axes and origins of J1..J6 (`VIK.frames`).
+/// End pose plus world joint axes, origins, and post-joint segment rotations of J1..J6 (`VIK.frames`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Frames {
     pub end: Pose,
     pub axes: [Vec3; 6],
     pub origins: [Vec3; 6],
+    pub seg_r: [Mat3; 6],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -242,6 +245,7 @@ pub fn frames(q: &[f64; 6]) -> Frames {
     let mut p = [0.0; 3];
     let mut axes = [[0.0; 3]; 6];
     let mut origins = [[0.0; 3]; 6];
+    let mut seg_r = [IDENTITY; 6];
     for j in 0..6 {
         let (link_p, link_r, s) = (&TRANS[j + 1], &ROT[j + 1], AXES[j + 1][2]);
         let d = mat3_vec3_mul(&r, link_p);
@@ -256,11 +260,12 @@ pub fn frames(q: &[f64; 6]) -> Frames {
             [r[1][0] * c + r[1][1] * sn, -r[1][0] * sn + r[1][1] * c, r[1][2]],
             [r[2][0] * c + r[2][1] * sn, -r[2][0] * sn + r[2][1] * c, r[2][2]],
         ];
+        seg_r[j] = r;
     }
     let d = mat3_vec3_mul(&r, &END_TRANS);
     p = add(&p, &d);
     r = mat3_mul(&r, &END_ROT);
-    Frames { end: Pose { r, p }, axes, origins }
+    Frames { end: Pose { r, p }, axes, origins, seg_r }
 }
 
 pub fn fk(q: &[f64; 6]) -> Pose { frames(q).end }
@@ -457,6 +462,33 @@ pub fn shoulder_reach_from(p: &Vec3, s: &[f64; 2]) -> f64 {
 
 // ---- Cartesian workspace check ----
 
+/// Structured details attached to `WORKSPACE_VIOLATION` errors and observations.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WorkspaceViolationDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub violation_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl WorkspaceViolationDetail {
+    pub fn with_phase(mut self, phase: &str) -> Self {
+        self.violation_phase = Some(phase.into());
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.constraint_id.is_none()
+            && self.geometry_id.is_none()
+            && self.violation_phase.is_none()
+            && self.reason.is_none()
+    }
+}
+
 /// The largest single excess of a workspace check.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ViolationDetail {
@@ -492,7 +524,146 @@ pub struct Violation {
 /// Tolerance used by the workspace rule (m).
 pub const WORKSPACE_EPS: f64 = 1e-4;
 
-const BOX_LIMITS: [[&str; 2]; 3] = [["box_x_min", "box_x_max"], ["box_y_min", "box_y_max"], ["box_z_min", "box_z_max"]];
+pub const BOX_LIMITS: [[&str; 2]; 3] = [["box_x_min", "box_x_max"], ["box_y_min", "box_y_max"], ["box_z_min", "box_z_max"]];
+pub const BOX_CONSTRAINT_IDS: [[&str; 2]; 3] = [["box_min_x", "box_max_x"], ["box_min_y", "box_max_y"], ["box_min_z", "box_max_z"]];
+
+pub const MAX_STACK_WORKSPACE_SLOTS: usize = 256;
+
+/// Stack-backed clearance/depth buffer for zero-allocation servo workspace checks.
+#[derive(Debug, Clone)]
+pub enum SlotBuf {
+    Stack { data: [f64; MAX_STACK_WORKSPACE_SLOTS], len: usize },
+    Heap(Vec<f64>),
+}
+
+impl SlotBuf {
+    pub fn zeros(len: usize) -> Self {
+        if len <= MAX_STACK_WORKSPACE_SLOTS {
+            Self::Stack { data: [0.0; MAX_STACK_WORKSPACE_SLOTS], len }
+        } else {
+            Self::Heap(vec![0.0; len])
+        }
+    }
+
+    pub fn as_slice(&self) -> &[f64] {
+        match self {
+            Self::Stack { data, len } => &data[..*len],
+            Self::Heap(v) => v.as_slice(),
+        }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [f64] {
+        match self {
+            Self::Stack { data, len } => &mut data[..*len],
+            Self::Heap(v) => v.as_mut_slice(),
+        }
+    }
+}
+
+/// Signed clearance of a capsule `(a, b, radius)` against an axis-aligned box `[lo, hi]`:
+/// positive when strictly outside (`dist(AB, AABB) - radius`), zero on contact, negative
+/// when intruding (continuously reaching `-(centerline_penetration + radius)` inside).
+pub fn capsule_aabb_clearance(a: &Vec3, b: &Vec3, radius: f64, lo: &Vec3, hi: &Vec3) -> f64 {
+    let d = sub(b, a);
+    // 1. Centerline penetration f(t) = min_{i=0..5} g_i(t) (concave piecewise linear on [0, 1]).
+    let mut slopes = [0.0f64; 6];
+    let mut intercepts = [0.0f64; 6];
+    for k in 0..3 {
+        slopes[2 * k] = d[k];
+        intercepts[2 * k] = a[k] - lo[k];
+        slopes[2 * k + 1] = -d[k];
+        intercepts[2 * k + 1] = hi[k] - a[k];
+    }
+    let f_at = |t: f64| -> f64 {
+        let mut m = f64::INFINITY;
+        for i in 0..6 {
+            m = m.min(intercepts[i] + slopes[i] * t);
+        }
+        m
+    };
+    let mut max_f = f_at(0.0).max(f_at(1.0));
+    for i in 0..6 {
+        for j in (i + 1)..6 {
+            let ds = slopes[i] - slopes[j];
+            if ds.abs() > 1e-12 {
+                let t = (intercepts[j] - intercepts[i]) / ds;
+                if t > 0.0 && t < 1.0 {
+                    max_f = max_f.max(f_at(t));
+                }
+            }
+        }
+    }
+    if max_f >= 0.0 {
+        return -(max_f + radius);
+    }
+
+    // 2. Centerline is strictly outside [lo, hi]: compute exact min_{t in [0,1]} dist(p(t), AABB).
+    let sq_dist_at = |t: f64| -> f64 {
+        let mut s = 0.0;
+        for k in 0..3 {
+            let pk = a[k] + d[k] * t;
+            let ex = (lo[k] - pk).max(pk - hi[k]).max(0.0);
+            s += ex * ex;
+        }
+        s
+    };
+    let mut ts = [0.0f64; 8];
+    let mut len = 2usize;
+    ts[0] = 0.0;
+    ts[1] = 1.0;
+    for k in 0..3 {
+        if d[k].abs() > 1e-12 {
+            for bound in [lo[k], hi[k]] {
+                let t = (bound - a[k]) / d[k];
+                if t > 1e-12 && t < 1.0 - 1e-12 {
+                    ts[len] = t;
+                    len += 1;
+                }
+            }
+        }
+    }
+    for i in 1..len {
+        let key = ts[i];
+        let mut j = i;
+        while j > 0 && ts[j - 1] > key {
+            ts[j] = ts[j - 1];
+            j -= 1;
+        }
+        ts[j] = key;
+    }
+    let mut min_sq = sq_dist_at(0.0).min(sq_dist_at(1.0));
+    for w in ts[..len].windows(2) {
+        let (t0, t1) = (w[0], w[1]);
+        if t1 - t0 <= 1e-12 {
+            continue;
+        }
+        min_sq = min_sq.min(sq_dist_at(t1));
+        let tm = 0.5 * (t0 + t1);
+        let mut num = 0.0;
+        let mut den = 0.0;
+        for k in 0..3 {
+            let pm = a[k] + d[k] * tm;
+            let face = if pm < lo[k] {
+                Some(lo[k])
+            } else if pm > hi[k] {
+                Some(hi[k])
+            } else {
+                None
+            };
+            if let Some(f) = face {
+                num += (f - a[k]) * d[k];
+                den += d[k] * d[k];
+            }
+        }
+        if den > 1e-18 {
+            let t_opt = num / den;
+            if t_opt > t0 && t_opt < t1 {
+                min_sq = min_sq.min(sq_dist_at(t_opt));
+            }
+        }
+    }
+    min_sq.sqrt() - radius
+}
 
 /// Workspace excess for model angles `q` (at least J1..J6). For armd (motor) angles use
 /// [`crate::chain::ArmModel::workspace_violation`].
@@ -556,8 +727,60 @@ pub fn workspace_violation_pose_at(pose: &Pose, ws: &crate::model::WorkspacePoli
     v
 }
 
-/// The workspace rule: a target is rejected when it violates and is worse than the start.
-/// A move from an already-violating pose that does not make the violation worse is allowed.
-pub fn workspace_rejects(target: &Violation, start: &Violation) -> bool {
-    target.total > WORKSPACE_EPS && target.total > start.total + WORKSPACE_EPS
+/// Per-constraint monotonic escape rule: returns `Some((slot, depth, min_depth, allowed))` for
+/// the first slot where `depth > allowed` (where `allowed = WORKSPACE_EPS` when `min_depth <=
+/// WORKSPACE_EPS`, else `min_depth + WORKSPACE_EPS`).
+pub fn first_workspace_rejection(clearances: &[f64], min_depths: &[f64]) -> Option<(usize, f64, f64, f64)> {
+    for (idx, (&clr, &min_d)) in clearances.iter().zip(min_depths).enumerate() {
+        if clr.is_nan() || !min_d.is_finite() {
+            return Some((idx, f64::NAN, min_d, WORKSPACE_EPS));
+        }
+        let depth = (-clr).max(0.0);
+        if !depth.is_finite() {
+            return Some((idx, f64::INFINITY, min_d, WORKSPACE_EPS));
+        }
+        let allowed = if min_d <= WORKSPACE_EPS { WORKSPACE_EPS } else { min_d + WORKSPACE_EPS };
+        if depth > allowed {
+            return Some((idx, depth, min_d, allowed));
+        }
+    }
+    None
+}
+
+/// Update `min_depths` after a compliant/non-worsening sample.
+pub fn advance_min_depths(clearances: &[f64], min_depths: &mut [f64]) {
+    for (&clr, min_d) in clearances.iter().zip(min_depths.iter_mut()) {
+        if clr.is_nan() {
+            *min_d = f64::NAN;
+            continue;
+        }
+        let depth = (-clr).max(0.0);
+        if depth < *min_d {
+            *min_d = depth;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capsule_aabb_clearance_handles_outside_face_and_penetrating_centerline() {
+        let lo = [0.0, 0.0, 0.0];
+        let hi = [0.10, 0.10, 0.10];
+        let r = 0.02;
+        // Strictly outside by 0.05 m -> clearance = +0.03
+        let c_out = capsule_aabb_clearance(&[-0.05, 0.05, -0.05], &[-0.05, 0.05, 0.15], r, &lo, &hi);
+        assert!((c_out - 0.03).abs() < 1e-12, "c_out={c_out}");
+        // Outside by 0.01 m (< r) -> clearance = -0.01
+        let c_touch = capsule_aabb_clearance(&[-0.01, 0.05, 0.05], &[-0.01, 0.05, 0.08], r, &lo, &hi);
+        assert!((c_touch + 0.01).abs() < 1e-12, "c_touch={c_touch}");
+        // Centerline passes straight through box center (0.05, 0.05, 0.05), both ends outside -> pen = 0.05 + r
+        let c_thru = capsule_aabb_clearance(&[-0.10, 0.05, 0.05], &[0.20, 0.05, 0.05], r, &lo, &hi);
+        assert!((c_thru + (0.05 + r)).abs() < 1e-12, "c_thru={c_thru}");
+        // Deeper penetration (0.05 vs 0.02) is strictly more negative so monotonic escape works
+        let c_shallow = capsule_aabb_clearance(&[-0.10, 0.02, 0.05], &[0.20, 0.02, 0.05], r, &lo, &hi);
+        assert!(c_thru < c_shallow && (c_shallow + (0.02 + r)).abs() < 1e-12, "c_shallow={c_shallow}");
+    }
 }
