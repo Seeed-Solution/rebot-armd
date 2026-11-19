@@ -944,9 +944,10 @@ export const KIN_PARAM_NAMES = Object.freeze(['offset', 'scale', 'tilt_x', 'tilt
    L3 weight sweep (scripts/kincal_selftest.mjs, KIN_PRIOR_W), L3 held-out A->B / B->A mm:
      weight            0              1              3              10             30
      synthetic (a)     0.133 / 0.127  0.135 / 0.129  0.167 / 0.154  0.717 / 0.685  2.46 / 3.05
-     noise only (e)    4.48 / 6.66    4.48 / 6.62    4.46 / 6.47    4.34 / 6.06    3.96 / 4.88
+     noise only (e)    3.30 / 6.65    3.31 / 6.65    3.31 / 6.65    3.35 / 5.94    3.28 / 4.44
      real2 replay (b)  2.007 / 2.237  2.006 / 2.232  1.999 / 2.196  1.981 / 1.999  1.95 / 1.88
-   Weight 3: the largest of these with the synthetic recovery check (< 0.5 mm) passing. */
+   Weight 3: the largest of these with the synthetic recovery check (< 0.5 mm) passing; L0 is chosen in (e) at every
+   weight (its uncorrected held-out: 2.52 / 2.99 mm). */
 export const KIN_PRIOR = Object.freeze({ weight: 3, minimalWeight: 1, sigma: [1 / D, 0.01, 1 / D, 1 / D, 0.005, 0.005, 0.005] });
 export const KIN_L3 = Object.freeze([...[1, 2, 3, 4].map((j) => 7 * j), ...[1, 2, 3, 4].flatMap((j) => [1, 2, 3, 4, 5, 6].map((p) => 7 * j + p))]);
 export const KIN_L1 = Object.freeze([1, 2, 3, 4].map((j) => 7 * j));
@@ -1211,6 +1212,28 @@ export function* solveKinematicsSteps({ views, board, K, chain, X0, order = null
     iterations: fin.iterations, order: ord, ms: Date.now() - t0,
   });
   return res;
+}
+
+/* Verify view of a loaded calibration session: one capture at the current pose, reprojected with the solved values.
+   view { markers }, board, order (corner order of the solve), K, Tend (T_base_end of the view's joints under the solved
+   model), X (T_end_cam), boards: [T_base_board] (one per placement; the closest counts). Error: RMS per image
+   coordinate (as the held-out error) in px and in mm at the board depth (px * depth / fx). ok: mm <= gate (the held-out
+   gate, KIN_GATES.heldOutMm) with >= minMarkers board markers. Returns { ok, px, mm, board, depth, markers, gate }. */
+export function verifyView({ view, board, order = ORDERS[0], K, Tend, X, boards, gate = KIN_GATES.heldOutMm, minMarkers = GATES.minMarkers }) {
+  const bm = boardMarkers(view, board);
+  if (bm.length < minMarkers || !boards || !boards.length) return { ok: false, why: 'markers', markers: bm.length, gate };
+  const { obj, img } = correspondences({ markers: bm }, board, order);
+  const Ci = inv(mm(Tend, X));
+  let best = null;
+  boards.forEach((Tbb, d) => {
+    const Tcb = mm(Ci, Tbb), R = rotOf(Tcb), t = posOf(Tcb);
+    let s = 0;
+    for (let j = 0; j < obj.length; j++) { const [u, v] = project(K, R, t, obj[j]); s += (u - img[j][0]) ** 2 + (v - img[j][1]) ** 2; }
+    const px = Math.sqrt(s / (2 * obj.length)), depth = norm3(t), e = px * depth / K.fx * 1000;
+    if (Number.isFinite(e) && (!best || e < best.mm)) best = { px, mm: e, board: d, depth };
+  });
+  if (!best) return { ok: false, why: 'projection', markers: bm.length, gate };
+  return { ...best, ok: best.mm <= gate, markers: bm.length, gate };
 }
 
 /* Fine calibration solve of the wizard (runs in a Web Worker in the cockpit). views: [{ markers, q, ds }] of both

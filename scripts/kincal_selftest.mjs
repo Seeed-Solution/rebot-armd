@@ -16,7 +16,9 @@
 //      chooses L3, zero correction L0, the real replay of b. a level above L0; a synthetic copy of the 2026-11-19 real
 //      case (no systematic error, random per-pose joint errors KIN_NOISE_DEG (default 0.37 deg) on J2..J5, 56 views
 //      per placement, uncorrected held-out ~3 mm) chooses L0 and its apply body carries kinematics null; the
-//      chooseKinLevel rules on fixed held-out tables. Every solve prints its level table.
+//      chooseKinLevel rules on fixed held-out tables. Every solve prints its level table. KIN_E_SEEDS=n adds n noise
+//      draws of the e. case and prints the chosen-level distribution.
+//   a. also: verifyView (verify view of a loaded session) passes for the same board, refuses a board moved 20 mm.
 // CALM comes from src/api/index.html (block CALIB-MATH), as in the browser.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -127,6 +129,14 @@ function poseAgreement(views, r, kTrue) {
   // have no such partner and are compared directly.
   check('a. J5 zero offset and the J3 tilt recovered (non-redundant parameters)', Math.abs(offErr[3]) < 0.1 && Math.abs((kin.k[7 * 2 + 2] - kInj[7 * 2 + 2]) * D) < 0.1,
     `J2 offset error ${offErr[0].toFixed(3)} deg (warning kept for J2 only if < 0.5), J5 offset error ${offErr[3].toFixed(3)} deg, J3 tilt_x error ${((kin.k[16] - kInj[16]) * D).toFixed(3)} deg; J2..J4 offset errors ${offErr.slice(0, 3).map((e) => e.toFixed(2)).join(', ')} deg (absorbed by origin shifts)`);
+  // verify view of a loaded session: a fresh capture reprojects within the gate; the board moved by 20 mm does not
+  {
+    const v = render(kInj, { poses: 1 })[0], Tend = T4(CW.kinFk(ch, v.q, kin.k)), args = { view: v, board, order: kin.order, K: r.final.K, Tend, X: kin.X };
+    const good = CW.verifyView({ ...args, boards: r.final.boards });
+    const moved = CW.verifyView({ ...args, boards: r.final.boards.map((B) => mul(make([[1, 0, 0], [0, 1, 0], [0, 0, 1]], [0.02, 0, 0]), B)) });
+    check('a. verify view: same board within the gate, board moved 20 mm refused', good.ok && !moved.ok && good.board === v.ds,
+      `same board ${good.mm.toFixed(3)} mm (${good.px.toFixed(2)} px, placement ${good.board}, ${good.markers} markers); moved ${moved.mm.toFixed(2)} mm; gate ${good.gate} mm`);
+  }
   // generalisation: joint sets not in the capture (planned poses +-0.15 rad on J2..J5)
   const extra = [];
   for (const v of views) if (rnd() < 0.5) extra.push({ ...v, q: v.q.map((x, i) => (i >= 1 && i <= 4 ? x + 0.3 * (rnd() - 0.5) : x)) });
@@ -158,8 +168,19 @@ function poseAgreement(views, r, kTrue) {
 // ---- e. new real case (B601-DM 2026-11-19, motors zeroed at rest): no systematic error, only random per-pose joint
 // errors (uncorrected held-out ~3 mm), ~55 views per placement. Every correction overfits: L0 must be chosen, and the
 // apply body carries kinematics null (the camera calibration is applied, a stored correction removed).
+// KIN_E_SEEDS=n: also solve n further noise draws and print the chosen-level distribution (no check)
+const eViews = (sd) => { seed = sd; return render(new Array(42).fill(0), { jointErr: Number(process.env.KIN_NOISE_DEG || 0.37) / D, perPose: true, poses: 28 }); };
+if (process.env.KIN_E_SEEDS) {
+  const count = {}, rows = [];
+  for (let i = 1; i <= Number(process.env.KIN_E_SEEDS); i++) {
+    const r = solveKinematics({ views: eViews(0xe0 + i), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
+    count[r.level] = (count[r.level] || 0) + 1;
+    rows.push(`${r.level} ${r.levels.map((l) => l.mean.toFixed(2)).join('/')}`);
+  }
+  console.log(`      e. seeds ${process.env.KIN_E_SEEDS}: chosen ${JSON.stringify(count)}; mean held-out L0/L1/L2/L3 per draw: ${rows.join(' | ')}`);
+}
 {
-  const views = render(new Array(42).fill(0), { jointErr: Number(process.env.KIN_NOISE_DEG || 0.37) / D, perPose: true, poses: 28 });
+  const views = eViews(0xe0);
   const r = solveFine({ views, markerSide: board.markerSide, chain: CALM.CHAIN, X0: Xnom, thickness, solvedAt: '2026-11-19T00:00:00Z' });
   const kin = r.kin, h = kin.heldOut;
   console.log(`      views ${kin.views.used} (A ${kin.views.A}, B ${kin.views.B}); per-pose joint error ${process.env.KIN_NOISE_DEG || 0.37} deg std on J2..J5`);
