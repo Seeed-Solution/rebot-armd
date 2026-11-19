@@ -227,13 +227,13 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     if (!b0.bar || b0.inPanel !== 'teach-bar-slot') fail(`bar in panel ${tag}: ${JSON.stringify(b0)}`);
     await ev(() => {
       window.__reply['/api/v1/record/start'] = { recording_id: 'R1', owner: CLIENT_ID };
-      window.__reply['/api/v1/record/stop'] = { episode: { id: '01JD0000000000000000EPIS09', dataset: 'default', task: '', source: 'hand_guide', duration_s: 6.2, frames: 1860, recorded_at: '2026-11-19T10:00:00Z' } };
+      window.__reply['/api/v1/record/stop'] = { episode: { id: '01JD0000000000000000EPIS09', dataset: 'default', task: 'wave', source: 'hand_guide', duration_s: 6.2, frames: 1860, recorded_at: '2026-11-19T10:00:00Z' } };
     });
     // poses/save: the next GET /api/v1/poses is served by the page mock below
     await ev(() => {
-      window.POSESX = [];
+      window.POSESX = []; window.EPSX = []; window.__epsLag = true;
       const realGet = window.teachGet;
-      window.teachGet = async (p) => { const d = await realGet(p); if (p === '/api/v1/poses') d.poses = d.poses.concat(window.POSESX); return d; };
+      window.teachGet = async (p) => { const d = await realGet(p); if (p === '/api/v1/poses') d.poses = d.poses.concat(window.POSESX); if (p.startsWith('/api/v1/episodes') && !window.__epsLag) d.episodes = d.episodes.concat(window.EPSX); return d; };
       window.__reply['/api/v1/poses/save'] = (b) => { window.POSESX.push({ id: '01JD0000000000000000POSE09', name: b.name, positions: [] }); return { epoch_id: 1 }; };
       $('tb-pose').click();
     });
@@ -243,7 +243,16 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     const b1 = await ev(() => ({ rec: $('tb-rec').classList.contains('on'), chip: document.body.classList.contains('recording'), gcrec: $('btn-gc-rec').textContent }));
     await shot('5_bar_handguide_recording', 'teach-panel', `rec ${b1.rec}`);
     await ev(() => $('tb-rec').click());
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(400);
+    // the appended replay step shows the episode (task, duration) although the list reply right after the save lags
+    const rp = await ev(() => { const li = [...document.querySelectorAll('#tch-steps > li')].find((x) => TCH.cur.steps[+x.dataset.i].episode_id === '01JD0000000000000000EPIS09');
+      return li ? { title: li.querySelector('b').textContent, miss: !!li.querySelector('.tch-bd.miss') } : null; });
+    if (!rp || !rp.title.includes('wave') || !rp.title.includes('6.2 s') || rp.miss) fail(`new replay step ${tag}: ${JSON.stringify(rp)}`);
+    console.log(`  appended replay step: "${rp && rp.title}", missing badge ${rp && rp.miss}`);
+    // a list requested after the save that does list it keeps it; the store then serves it normally
+    await ev(() => { window.EPSX = [{ id: '01JD0000000000000000EPIS09', dataset: 'default', task: 'wave', source: 'hand_guide', duration_s: 6.2, frames: 1860, recorded_at: '2026-11-19T10:00:00Z' }]; window.__epsLag = false; return teachLoad(true); });
+    const rp2 = await ev(() => ({ acked: TCH.acked.size, miss: !!document.querySelector('#tch-steps .tch-bd.miss') }));
+    if (rp2.acked || rp2.miss) fail(`replay step after the list ${tag}: ${JSON.stringify(rp2)}`);
     await ev(() => $('tb-close').click());
     await page.waitForTimeout(200);
     const b2 = await ev(() => ({ steps: TCH.cur.steps.map((s) => s.type + (s.pose_id ? ':' + s.pose_id.slice(-6) : '') + (s.episode_id ? ':' + s.episode_id.slice(-6) : '') + (s.action ? ':' + s.action : '')),
@@ -296,7 +305,7 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     const x1 = await ev(() => ({ groups: [...document.querySelectorAll('#teach-body ol[data-ds]')].map((o) => o.dataset.ds + ':' + o.querySelectorAll('li[data-id]').length),
       xss: window.__xss === 1 || !!document.querySelector('#teach-body img'), txt: document.querySelector('#teach-body li[data-id$="EPIS02"] b').textContent,
       badges: [...document.querySelectorAll('#teach-body li[data-id] .tch-li-h')].map((h) => [...h.querySelectorAll('.tch-bd')].map((b) => b.className.replace('tch-bd', '').trim() || 'src').join('+')) }));
-    if (JSON.stringify(x1.groups) !== '["default:1","cube_bin:2"]' || x1.xss || !x1.txt.startsWith('<img') || JSON.stringify(x1.badges) !== '["src","src+stale","src+ab"]')
+    if (JSON.stringify(x1.groups) !== '["default:2","cube_bin:2"]' || x1.xss || !x1.txt.startsWith('<img') || JSON.stringify(x1.badges) !== '["src","src","src+stale","src+ab"]')
       fail(`episodes ${tag}: ${JSON.stringify(x1)}`);
     await shot('9_episodes', 'teach-panel', `groups ${x1.groups.join(', ')}`);
     await ev(() => { document.querySelector('#teach-body li[data-id$="EPIS03"] .tch-acts .btn:nth-child(2)').click(); });

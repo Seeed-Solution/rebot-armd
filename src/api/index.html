@@ -9639,6 +9639,7 @@ const TCH = {
   play: null,           // action id of a replay started here
   toasted: null, armed: null, armTimer: 0, edit: null, ask: null, busy: false,
   epSpeed: 0.5, epGrip: true, barKey: '',
+  acked: new Map(),     // episode id -> { ep, at }: saved (record/stop ack) but not yet seen in a list fetched after the ack
 };
 const teachOn = () => !!(S.caps && S.caps.teach && Number(S.caps.teach.version) >= 1);
 const TCH_SEQ_NAME = /^[A-Za-z0-9_\- \p{Script=Han}]{1,64}$/u;
@@ -9689,6 +9690,12 @@ async function teachLoad(quiet) {
     TCH.seqs = Array.isArray(sq.sequences) ? sq.sequences : [];
     TCH.poses = Array.isArray(ps.poses) ? ps.poses : [];
     TCH.eps = Array.isArray(ep.episodes) ? ep.episodes : [];
+    // a just-saved episode stays listed until a list confirms it, or until a list requested more than 5 s after
+    // its ack still lacks it (deleted elsewhere)
+    for (const [id, k] of TCH.acked) {
+      if (TCH.eps.some((x) => x.id === id) || t0 - k.at > 5000) TCH.acked.delete(id);
+      else TCH.eps.unshift(k.ep);
+    }
     TCH.dsets = Array.isArray(ds.datasets) ? ds.datasets : [];
     // the recorder this page owns is gone (owner lost, saved at the disk / length limit): only for a recording
     // started before this request, a newer one is not in the reply yet
@@ -9810,7 +9817,7 @@ function teachRenderSeqs(body) {
 }
 function teachStepTitle(st) {
   if (st.type === 'pose') { const p = teachPose(st.pose_id); return t('tch.st.pose', { n: p ? p.name : t('tch.missing') }); }
-  if (st.type === 'replay') { const e = teachEp(st.episode_id); return t('tch.st.replay', { n: e ? teachEpName(e) : t('tch.missing') }); }
+  if (st.type === 'replay') { const e = teachEp(st.episode_id); return t('tch.st.replay', { n: e ? teachEpName(e) + (Number.isFinite(Number(e.duration_s)) && e.duration_s != null ? ' · ' + epFmtDur(Number(e.duration_s)) : '') : t('tch.missing') }); }
   if (st.type === 'gripper') return st.action === 'move' ? t('tch.st.grip.move', { p: Math.round((st.fraction ?? 0) * 100) }) : t('tch.st.grip.' + (st.action === 'close' ? 'close' : 'open'));
   if (st.type === 'wait') return t('tch.st.wait');
   return st.type;
@@ -10253,6 +10260,7 @@ async function teachRecToggle() {
     teachRecSet(null);
     const ep = r && r.episode;
     if (ep && ep.id) {
+      TCH.acked.set(ep.id, { ep, at: Date.now() });
       if (!TCH.eps.some((x) => x.id === ep.id)) TCH.eps.unshift(ep);
       const msg = t('tch.rec.saved', { n: teachEpName(ep), d: epFmtDur(Number(ep.duration_s)) });
       toast(msg, 'ok');
