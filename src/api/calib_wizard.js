@@ -923,23 +923,54 @@ export async function runPoses(st, io, { runAll = true } = {}) {
    Level L3 identifies offset, scale, tilt x / y and origin dx / dy / dz of joints J2..J5 (28 parameters); J1's
    offset is absorbed by the board pose, J6's by the camera mount, both stay zero. Unknowns of one fit: X =
    T_end_cam (6), one board pose per placement (6 each), the kinematic parameters; intrinsics fixed.
-   Validation: fit on A, predict B (kinematics and X frozen, only B's board pose refit) and B -> A; the held-out
-   reprojection error in mm (px * depth / fx) must stay <= 3 mm both ways, the mean of both must improve on the
-   uncorrected model (L0: X and boards only) by >= 30 %, and every parameter of the final fit on A + B must be inside
-   the bounds armd accepts. The final fit is what is applied. Ported from real2/kincal2.mjs. */
+   Model levels (KIN_LEVELS): L0 none (X and boards only), L1 zero offsets J2..J5, L2 L1 + J2 scale + J2 tilt x / y,
+   L3 the full set above. Validation per level: fit on A, predict B (kinematics and X frozen, only B's board pose
+   refit) and B -> A; the held-out reprojection error in mm (px * depth / fx). Level choice (chooseKinLevel): the
+   smallest mean held-out of both directions among the levels where neither direction is worse than L0 by more than
+   KIN_SELECT.maxWorseMm; a level within KIN_SELECT.tieMm of that mean -> the simplest of them. Gates: the chosen
+   level's held-out <= 3 mm both ways (L0 chosen: L0's own held-out) and every parameter of the final fit on A + B at
+   the chosen level inside the bounds armd accepts. The final fit is what is applied; L0 applies the camera only and
+   removes a stored correction (kinematics null). Ported from real2/kincal2.mjs. */
 export const KIN_BOUNDS = Object.freeze({ offset_rad: 10 / D, scale: 0.08, tilt_rad: 3 / D, origin_m: 0.03 });
 // zeroWarnJoints: joints (1..6) whose zero offset is identifiable, the only ones a "re-zero the motor" warning is
 // given for. J5: recovered within 0.01 deg in the synthetic test. J2..J4 (parallel axes) are not: their offsets trade
 // against the next joint's origin shift (synthetic J2 error -0.52 deg with the prior, above the 0.5 deg needed).
-export const KIN_GATES = Object.freeze({ heldOutMm: 3.0, improvement: 0.30, zeroWarnDeg: 5, zeroWarnJoints: Object.freeze([5]), minViewsPerPlacement: 10, pnpMaxPx: 2 });
+export const KIN_GATES = Object.freeze({ heldOutMm: 3.0, zeroWarnDeg: 5, zeroWarnJoints: Object.freeze([5]), minViewsPerPlacement: 10, pnpMaxPx: 2 });
 export const KIN_PARAM_NAMES = Object.freeze(['offset', 'scale', 'tilt_x', 'tilt_y', 'dx', 'dy', 'dz']);
 /* Weak L2 prior on the kinematic parameters (extra residual rows, px): weight * k / sigma, sigma per parameter type
    (offset, scale, tilt x / y, origin dx / dy / dz). L3 is not minimal: zero offsets of the parallel joints J2..J4
    trade against the next joint's origin shift; the prior picks the minimum-norm solution along such directions.
-   weight 0 = no prior. Weight 1 (sweep on the real-arm replay, scripts/kincal_selftest.mjs b): held-out 2.01 / 2.23 mm
-   against 2.01 / 2.24 mm without prior; synthetic held-out 0.135 / 0.129 mm against 0.133 / 0.127 mm. */
-export const KIN_PRIOR = Object.freeze({ weight: 1, sigma: [1 / D, 0.01, 1 / D, 1 / D, 0.005, 0.005, 0.005] });
+   weight 0 = no prior. `weight` applies to L3, `minimalWeight` to L1 / L2 (minimal sets, the prior only damps).
+   L3 weight sweep (scripts/kincal_selftest.mjs, KIN_PRIOR_W), L3 held-out A->B / B->A mm:
+     weight            0              1              3              10             30
+     synthetic (a)     0.133 / 0.127  0.135 / 0.129  0.167 / 0.154  0.717 / 0.685  2.46 / 3.05
+     noise only (e)    4.48 / 6.66    4.48 / 6.62    4.46 / 6.47    4.34 / 6.06    3.96 / 4.88
+     real2 replay (b)  2.007 / 2.237  2.006 / 2.232  1.999 / 2.196  1.981 / 1.999  1.95 / 1.88
+   Weight 3: the largest of these with the synthetic recovery check (< 0.5 mm) passing. */
+export const KIN_PRIOR = Object.freeze({ weight: 3, minimalWeight: 1, sigma: [1 / D, 0.01, 1 / D, 1 / D, 0.005, 0.005, 0.005] });
 export const KIN_L3 = Object.freeze([...[1, 2, 3, 4].map((j) => 7 * j), ...[1, 2, 3, 4].flatMap((j) => [1, 2, 3, 4, 5, 6].map((p) => 7 * j + p))]);
+export const KIN_L1 = Object.freeze([1, 2, 3, 4].map((j) => 7 * j));
+export const KIN_L2 = Object.freeze([...KIN_L1, 7 + 1, 7 + 2, 7 + 3]);
+// prior: L3 uses KIN_PRIOR.weight, the minimal levels L1 / L2 KIN_PRIOR.minimalWeight
+export const KIN_LEVELS = Object.freeze([
+  Object.freeze({ name: 'L0', kIdx: Object.freeze([]), prior: null }),
+  Object.freeze({ name: 'L1', kIdx: KIN_L1, prior: 'minimal' }),
+  Object.freeze({ name: 'L2', kIdx: KIN_L2, prior: 'minimal' }),
+  Object.freeze({ name: 'L3', kIdx: KIN_L3, prior: 'full' }),
+]);
+export const KIN_SELECT = Object.freeze({ maxWorseMm: 0.1, tieMm: 0.1 });
+/* Level choice. rows: [{ ab, ba }] (held-out mm per direction), rows[0] = L0. A level is eligible when neither
+   direction is worse than L0 by more than maxWorseMm; among eligible levels the smallest mean (ab + ba) / 2 wins,
+   and the simplest eligible level within tieMm of that mean is chosen. Returns { index, eligible, mean }. */
+export function chooseKinLevel(rows, { maxWorseMm = KIN_SELECT.maxWorseMm, tieMm = KIN_SELECT.tieMm } = {}) {
+  const l0 = rows[0], mean = rows.map((r) => (r.ab + r.ba) / 2);
+  const eligible = rows.map((r, i) => i === 0 || (Number.isFinite(mean[i]) && r.ab <= l0.ab + maxWorseMm && r.ba <= l0.ba + maxWorseMm));
+  let best = 0;
+  for (let i = 1; i < rows.length; i++) if (eligible[i] && mean[i] < mean[best]) best = i;
+  let index = best;
+  for (let i = 0; i < best; i++) if (eligible[i] && mean[i] < mean[best] + tieMm) { index = i; break; }
+  return { index, eligible, mean };
+}
 const NK = 42;
 // flat 3x3 helpers (row-major)
 const f3 = (R) => [R[0][0], R[0][1], R[0][2], R[1][0], R[1][1], R[1][2], R[2][0], R[2][1], R[2][2]];
@@ -1120,11 +1151,16 @@ function* kinHeldOut(obs, ch, K, X, k) {
 /* Kinematic fine calibration from board views of two placements.
    views: [{ markers, q (model J1..J6, rad), ds (0 = placement A, 1 = B) }]; board (makeBoard); K: intrinsics
    (fixed, from the image-only solve); chain: CALM.CHAIN; X0: T_end_cam start value (nominal or measured mount).
-   Returns { ok, gates, joints (schema, J1..J6), k, X, boards: [T_base_board A, B], heldOut: { ab, ba, ab0, ba0 },
-   train: { px, mm }, final0 (uncorrected fit on A + B), views: { used, A, B, dropped }, warnings, ms }. */
+   levels: KIN_LEVELS (or a subset starting with L0). Returns { ok, gates, level (chosen name), levels: [{ name,
+   params, ab, ba, mean (mm), eligible, chosen }], joints (schema, J1..J6), k, X, boards: [T_base_board A, B],
+   heldOut: { ab, ba (chosen level), ab0, ba0 (L0), improve }, train: { px, mm }, final0 (uncorrected fit on A + B),
+   views: { used, A, B, dropped }, warnings, ms }. */
 export const solveKinematics = (args) => runSync(solveKinematicsSteps(args));
-export function* solveKinematicsSteps({ views, board, K, chain, X0, order = null, kIdx = KIN_L3, gates = KIN_GATES, bounds = KIN_BOUNDS, iters = 80, minMarkers = GATES.minMarkers, prior = KIN_PRIOR, onProgress = null }) {
-  const priorW = prior && prior.weight > 0 ? kIdx.map((ki) => prior.weight / prior.sigma[ki % 7]) : null;
+export function* solveKinematicsSteps({ views, board, K, chain, X0, order = null, levels = KIN_LEVELS, select = KIN_SELECT, gates = KIN_GATES, bounds = KIN_BOUNDS, iters = 80, minMarkers = GATES.minMarkers, prior = KIN_PRIOR, onProgress = null }) {
+  const priorOf = (lv) => {
+    const w = !prior || !lv.prior ? 0 : lv.prior === 'full' ? prior.weight : (prior.minimalWeight ?? prior.weight);
+    return w > 0 ? lv.kIdx.map((ki) => w / prior.sigma[ki % 7]) : null;
+  };
   const t0 = Date.now(), ch = kinChain(chain), say = (s) => { if (onProgress) onProgress(s); };
   const ord = order || detectCornerOrder(views, board).order;
   const obs = [], dropped = [];
@@ -1143,36 +1179,36 @@ export function* solveKinematicsSteps({ views, board, K, chain, X0, order = null
   res.gates.push(gate('kin_views', enough, Math.min(A.length, B.length), gates.minViewsPerPlacement));
   if (!enough) { res.ms = Date.now() - t0; return res; }
   const k0 = new Array(NK).fill(0);
-  // L0 (X, boards) then L3 (+ kinematics) from the L0 result
-  function* fitBoth(o, nds, label) {
-    say(label + ' L0');
-    const l0 = yield* kinFit(o, nds, ch, K, X0, kinBoards(o, nds, ch, k0, X0), k0, [], 60);
-    say(label + ' L3');
-    const l3 = yield* kinFit(o, nds, ch, K, l0.X, l0.B, k0, kIdx, iters, priorW);
-    return { l0, l3 };
+  // L0 (X, boards), then every level from the L0 result
+  function* fitL0(o, nds, label) { say(label + ' L0'); return yield* kinFit(o, nds, ch, K, X0, kinBoards(o, nds, ch, k0, X0), k0, [], 60); }
+  function* fitLevel(o, nds, label, l0, lv) {
+    if (!lv.kIdx.length) return l0;
+    say(label + ' ' + lv.name);
+    return yield* kinFit(o, nds, ch, K, l0.X, l0.B, k0, lv.kIdx, iters, priorOf(lv));
   }
-  const fa = yield* fitBoth(A, 1, 'A'), fb = yield* fitBoth(B, 1, 'B');
+  const fa0 = yield* fitL0(A, 1, 'A'), fb0 = yield* fitL0(B, 1, 'B'), fa = [], fb = [];
+  for (const lv of levels) { fa.push(yield* fitLevel(A, 1, 'A', fa0, lv)); fb.push(yield* fitLevel(B, 1, 'B', fb0, lv)); }
   say('held-out');
-  const ab0 = yield* kinHeldOut(B, ch, K, fa.l0.X, fa.l0.k), ab = yield* kinHeldOut(B, ch, K, fa.l3.X, fa.l3.k);
-  const ba0 = yield* kinHeldOut(A, ch, K, fb.l0.X, fb.l0.k), ba = yield* kinHeldOut(A, ch, K, fb.l3.X, fb.l3.k);
-  const fin = yield* fitBoth(obs, 2, 'A+B');
-  const k = fin.l3.k, oob = kinOutOfBounds(k, bounds);
-  // improvement of the mean held-out error of both directions over the uncorrected model (per direction in
-  // heldOut.improve). The uncorrected model is the URDF with armd's model_joint_map, so a zero offset already set
-  // there (the B601-DM J5 -4 deg) is part of the baseline.
+  const ho = [];
+  for (let i = 0; i < levels.length; i++) ho.push({ ab: yield* kinHeldOut(B, ch, K, fa[i].X, fa[i].k), ba: yield* kinHeldOut(A, ch, K, fb[i].X, fb[i].k) });
+  const pick = chooseKinLevel(ho.map((h) => ({ ab: h.ab.mm, ba: h.ba.mm })), select), c = pick.index, lv = levels[c];
+  const fin0 = yield* fitL0(obs, 2, 'A+B'), fin = yield* fitLevel(obs, 2, 'A+B', fin0, lv);
+  const k = fin.k, oob = kinOutOfBounds(k, bounds), { ab, ba } = ho[c], { ab: ab0, ba: ba0 } = ho[0];
+  // improvement of the chosen level over the uncorrected model (information; the level choice is the rule). The
+  // uncorrected model is the URDF with armd's model_joint_map, so a zero offset already set there is the baseline.
   const imp = (a, b) => (a > 0 ? 1 - b / a : 0), impAll = imp(ab0.mm + ba0.mm, ab.mm + ba.mm);
   res.gates.push(
     gate('kin_heldout_ab', ab.mm <= gates.heldOutMm, ab.mm, gates.heldOutMm, 'mm'),
     gate('kin_heldout_ba', ba.mm <= gates.heldOutMm, ba.mm, gates.heldOutMm, 'mm'),
-    gate('kin_improve', impAll >= gates.improvement, impAll, gates.improvement, 'frac'),
     gate('kin_bounds', oob.length === 0, oob.length, 0, 'count'),
   );
   for (let j = 0; j < 6; j++) if ((gates.zeroWarnJoints || [5]).includes(j + 1) && Math.abs(k[7 * j]) * D > gates.zeroWarnDeg) res.warnings.push({ key: 'zero', joint: j + 1, deg: k[7 * j] * D });
   Object.assign(res, {
-    ok: res.gates.every((g) => g.ok), k, joints: kinJoints(k), outOfBounds: oob, X: fin.l3.X, boards: fin.l3.B,
-    heldOut: { ab, ba, ab0, ba0, improve: { ab: imp(ab0.mm, ab.mm), ba: imp(ba0.mm, ba.mm), mean: impAll } }, train: fin.l3.err, final0: { X: fin.l0.X, boards: fin.l0.B, err: fin.l0.err },
-    fits: { A: { l0: fa.l0.err, l3: fa.l3.err, k: fa.l3.k }, B: { l0: fb.l0.err, l3: fb.l3.err, k: fb.l3.k } },
-    iterations: fin.l3.iterations, order: ord, ms: Date.now() - t0,
+    ok: res.gates.every((g) => g.ok), level: lv.name, k, joints: kinJoints(k), outOfBounds: oob, X: fin.X, boards: fin.B,
+    levels: levels.map((l, i) => ({ name: l.name, params: l.kIdx.length, ab: ho[i].ab.mm, ba: ho[i].ba.mm, mean: pick.mean[i], eligible: pick.eligible[i], chosen: i === c })),
+    heldOut: { ab, ba, ab0, ba0, improve: { ab: imp(ab0.mm, ab.mm), ba: imp(ba0.mm, ba.mm), mean: impAll } }, train: fin.err, final0: { X: fin0.X, boards: fin0.B, err: fin0.err },
+    fits: { A: levels.map((l, i) => ({ level: l.name, err: fa[i].err, k: fa[i].k })), B: levels.map((l, i) => ({ level: l.name, err: fb[i].err, k: fb[i].k })) },
+    iterations: fin.iterations, order: ord, ms: Date.now() - t0,
   });
   return res;
 }
@@ -1180,7 +1216,8 @@ export function* solveKinematicsSteps({ views, board, K, chain, X0, order = null
 /* Fine calibration solve of the wizard (runs in a Web Worker in the cockpit). views: [{ markers, q, ds }] of both
    placements; markerSide (m); chain (CALM.CHAIN); X0 (T_end_cam start value); thickness (m). Intrinsics from the
    image-only solve over A + B (calibrateIntrinsics, its gates apply), then solveKinematics with them; X and the
-   table height (mean board z of A and B - thickness) from the final kinematic fit.
+   table height (mean board z of A and B - thickness) from the final kinematic fit. With level L0 chosen the apply
+   body carries `kinematics: null` (camera only; armd removes a stored correction).
    Returns { ok, gates, intr, kin, final: { K, X, boards }, table, apply (body for /api/v1/calibration/apply) }. */
 export const solveFine = (args) => runSync(solveFineSteps(args));
 export function* solveFineSteps({ views, markerSide = BOARD_DEFAULT.markerSide, chain, X0, thickness = 0.0005, gates = GATES, kinGates = KIN_GATES, prior = KIN_PRIOR, size = IMAGE, init = NOMINAL, solvedAt = null, onProgress = null }) {
@@ -1196,13 +1233,14 @@ export function* solveFineSteps({ views, markerSide = BOARD_DEFAULT.markerSide, 
   res.final = { K, X, boards: kin.boards };
   res.table = { board_z_m: [zA, zB], table_z_m: (zA + zB) / 2 - thickness, dz_m: zB - zA };
   res.ok = res.gates.every((g) => g.ok);
-  const fit = { heldout_mm: [kin.heldOut.ab.mm, kin.heldOut.ba.mm], heldout_uncorrected_mm: [kin.heldOut.ab0.mm, kin.heldOut.ba0.mm], train_mm: kin.train.mm, views: kin.views.used, ...(solvedAt ? { solved_at: solvedAt } : {}) };
+  const levels = kin.levels.map((l) => ({ level: l.name, heldout_mm: [l.ab, l.ba], chosen: l.chosen }));
+  const fit = { level: kin.level, heldout_mm: [kin.heldOut.ab.mm, kin.heldOut.ba.mm], heldout_uncorrected_mm: [kin.heldOut.ab0.mm, kin.heldOut.ba0.mm], train_mm: kin.train.mm, views: kin.views.used, levels, ...(solvedAt ? { solved_at: solvedAt } : {}) };
   res.apply = {
     intrinsics: { fx: K.fx, fy: K.fy, cx: K.cx, cy: K.cy, k1: K.k1, k2: K.k2, p1: 0, p2: 0, k3: 0, width: size.width, height: size.height, marker_size: board.markerSide },
     camera_mount: { offset_m: posOf(X), q_end_cam: quatOf(rotOf(X)) },
     table_z_m: res.table.table_z_m,
-    kinematics: { joints: kin.joints, fit },
-    rms: { reproj_px: intr.rms, held_out_px: intr.heldOut.rms, kin_train_px: kin.train.px, kin_train_mm: kin.train.mm, kin_heldout_mm: fit.heldout_mm, views: intr.used.length, sigma: intr.sigma, cond: intr.cond },
+    kinematics: kin.level === 'L0' ? null : { joints: kin.joints, fit },
+    rms: { reproj_px: intr.rms, held_out_px: intr.heldOut.rms, kin_level: kin.level, kin_train_px: kin.train.px, kin_train_mm: kin.train.mm, kin_heldout_mm: fit.heldout_mm, kin_levels: levels, views: intr.used.length, sigma: intr.sigma, cond: intr.cond },
     ...(solvedAt ? { solved_at: solvedAt } : {}),
   };
   return res;

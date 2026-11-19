@@ -12,6 +12,11 @@
 //      files are missing (REAL2 = directory).
 //   c. gates: a J5 zero offset of 12 deg (bound 10) is refused; unmodelled per-view joint errors that leave the
 //      held-out above 3 mm are refused.
+//   e. model level choice (L0 none, L1 zero offsets, L2 + J2 scale / tilt, L3 full): the injected correction of a.
+//      chooses L3, zero correction L0, the real replay of b. a level above L0; a synthetic copy of the 2026-11-19 real
+//      case (no systematic error, random per-pose joint errors KIN_NOISE_DEG (default 0.37 deg) on J2..J5, 56 views
+//      per placement, uncorrected held-out ~3 mm) chooses L0 and its apply body carries kinematics null; the
+//      chooseKinLevel rules on fixed held-out tables. Every solve prints its level table.
 // CALM comes from src/api/index.html (block CALIB-MATH), as in the browser.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -63,22 +68,28 @@ function startPose(Tbb) {
 }
 const plans = PLACE.map((Tbb) => { const q0 = startPose(Tbb); return CW.generatePoses({ ...FINE, Tbb, board, K: CW.NOMINAL, X: Xnom, q0, fk, ik, lo, hi }).poses.map((p) => p.q); });
 check('setup. fine-mode plans for both placements', plans.every((p) => p.length >= 30), `poses ${plans.map((p) => p.length).join(' / ')}`);
-// views of the real (corrected) arm: kTrue geometry, jointErr (rad std, per view) unmodelled
-function render(kTrue, { noise = 0.3, jointErr = 0 } = {}) {
+// views of the real (corrected) arm: kTrue geometry, jointErr (rad std, per view, or per pose with perPose: both
+// frames of a pose share it) unmodelled; poses: the first n poses of each plan
+function render(kTrue, { noise = 0.3, jointErr = 0, perPose = false, poses = Infinity } = {}) {
   const views = [];
   plans.forEach((qs, ds) => {
-    for (const q of qs) for (let f = 0; f < 2; f++) {
-      const qa = q.map((v, i) => v + (jointErr && i >= 1 && i <= 4 ? jointErr * gauss() : 0));
+    for (const q of qs.slice(0, poses)) {
+      const e = q.map((_, i) => (jointErr && i >= 1 && i <= 4 ? jointErr * gauss() : 0));
+      for (let f = 0; f < 2; f++) {
+      const qa = q.map((v, i) => v + (perPose ? e[i] : jointErr && i >= 1 && i <= 4 ? jointErr * gauss() : 0));
       const G = T4(CW.kinFk(ch, qa, kTrue)), Tcb = mul(inv(mul(G, Xtrue)), PLACE[ds]), R = rotOf(Tcb), t = posOf(Tcb), markers = [];
       for (const m of board.markers) {
         const px = m.corners.map((c) => CW.project(Ktrue, R, t, c));
         if (px.every(([u, v, z]) => z > 0 && u >= 4 && u <= 636 && v >= 4 && v <= 356)) markers.push({ id: m.id, corners: px.map(([u, v]) => [u + noise * gauss(), v + noise * gauss()]) });
       }
       views.push({ markers, q, ds });
+      }
     }
   });
   return views;
 }
+// level table of a solveKinematics result
+const levelTable = (r) => r.levels.map((l) => `${l.chosen ? '*' : ' '}${l.name} (${l.params} par) A->B ${l.ab.toFixed(3)} B->A ${l.ba.toFixed(3)} mean ${l.mean.toFixed(3)} mm${l.eligible ? '' : ' (worse than L0)'}`).join(' | ');
 const kInj = new Array(42).fill(0);
 kInj[7 * 1] = 1.2 / D; kInj[7 * 2] = -0.8 / D; kInj[7 * 3] = 1.5 / D; kInj[7 * 4] = -4.0 / D; // zero offsets J2..J5
 kInj[7 * 2 + 2] = 1.5 / D;                                                                     // J3 origin tilt about x
@@ -108,6 +119,8 @@ function poseAgreement(views, r, kTrue) {
   console.log(`      gates ${gateStr(r.gates)}`);
   check('a. held-out < 0.5 mm both ways (injected correction)', kin.heldOut.ab.mm < 0.5 && kin.heldOut.ba.mm < 0.5,
     `A->B ${kin.heldOut.ab0.mm.toFixed(2)} -> ${kin.heldOut.ab.mm.toFixed(3)} mm, B->A ${kin.heldOut.ba0.mm.toFixed(2)} -> ${kin.heldOut.ba.mm.toFixed(3)} mm (uncorrected -> corrected), train ${kin.train.mm.toFixed(3)} mm / ${kin.train.px.toFixed(3)} px`);
+  console.log(`      levels ${levelTable(kin)}`);
+  check('a. injected correction -> level L3 chosen', kin.level === 'L3' && r.apply.kinematics && r.apply.kinematics.fit.level === 'L3' && r.apply.rms.kin_level === 'L3', `level ${kin.level}`);
   check('a. camera-to-board pose predicted within 1 mm / 0.1 deg', ag.mmMax < 1 && ag.degMax < 0.1, `max ${ag.mmMax.toFixed(3)} mm, ${ag.degMax.toFixed(4)} deg over ${views.length} views`);
   // the L3 model is not minimal: a zero offset of J3 / J4 trades against the next joint's origin shift (parallel
   // axes J2..J4), so the parameters are compared through the poses they produce. J5's offset and the J3 tilt
@@ -137,8 +150,40 @@ function poseAgreement(views, r, kTrue) {
   const k = r.k, J = [1, 2, 3, 4];
   const mx = (p, s) => Math.max(...J.map((j) => Math.abs(k[7 * j + p]))) * s;
   const off = mx(0, D), sc = mx(1, 100), tl = Math.max(mx(2, D), mx(3, D)), org = Math.max(mx(4, 1000), mx(5, 1000), mx(6, 1000));
-  check('a. zero correction -> parameters ~0', off < 0.3 && sc < 0.5 && tl < 0.3 && org < 3 && r.heldOut.ab.mm < 0.5 && r.heldOut.ba.mm < 0.5,
-    `max |offset| ${off.toFixed(3)} deg, |scale| ${sc.toFixed(3)} %, |tilt| ${tl.toFixed(3)} deg, |origin| ${org.toFixed(2)} mm; held-out ${r.heldOut.ab.mm.toFixed(3)} / ${r.heldOut.ba.mm.toFixed(3)} mm; ${r.ms} ms`);
+  console.log(`      levels ${levelTable(r)}`);
+  check('a. zero correction -> parameters ~0', r.level === 'L0' && off < 0.3 && sc < 0.5 && tl < 0.3 && org < 3 && r.heldOut.ab.mm < 0.5 && r.heldOut.ba.mm < 0.5,
+    `level ${r.level}, max |offset| ${off.toFixed(3)} deg, |scale| ${sc.toFixed(3)} %, |tilt| ${tl.toFixed(3)} deg, |origin| ${org.toFixed(2)} mm; held-out ${r.heldOut.ab.mm.toFixed(3)} / ${r.heldOut.ba.mm.toFixed(3)} mm; ${r.ms} ms`);
+}
+
+// ---- e. new real case (B601-DM 2026-11-19, motors zeroed at rest): no systematic error, only random per-pose joint
+// errors (uncorrected held-out ~3 mm), ~55 views per placement. Every correction overfits: L0 must be chosen, and the
+// apply body carries kinematics null (the camera calibration is applied, a stored correction removed).
+{
+  const views = render(new Array(42).fill(0), { jointErr: Number(process.env.KIN_NOISE_DEG || 0.37) / D, perPose: true, poses: 28 });
+  const r = solveFine({ views, markerSide: board.markerSide, chain: CALM.CHAIN, X0: Xnom, thickness, solvedAt: '2026-11-19T00:00:00Z' });
+  const kin = r.kin, h = kin.heldOut;
+  console.log(`      views ${kin.views.used} (A ${kin.views.A}, B ${kin.views.B}); per-pose joint error ${process.env.KIN_NOISE_DEG || 0.37} deg std on J2..J5`);
+  console.log(`      levels ${levelTable(kin)}`);
+  console.log(`      gates ${gateStr(r.gates)}`);
+  check('e. random per-pose errors only -> L0 chosen', kin.level === 'L0' && kin.levels[0].chosen && h.ab0.mm > 1.5 && h.ab0.mm < 4.5,
+    `level ${kin.level}; uncorrected held-out A->B ${h.ab0.mm.toFixed(2)} B->A ${h.ba0.mm.toFixed(2)} mm (target ~3); gates ${r.ok ? 'pass' : 'refuse'}`);
+  check('e. L0 apply body: camera calibration with kinematics null', r.apply && r.apply.kinematics === null && Object.prototype.hasOwnProperty.call(r.apply, 'kinematics')
+    && r.apply.intrinsics && r.apply.camera_mount && Number.isFinite(r.apply.table_z_m) && r.apply.rms.kin_level === 'L0' && kin.joints.every((j) => j.offset_rad === 0 && j.scale === 0)
+    && kin.warnings.length === 0,
+    `kinematics ${JSON.stringify(r.apply && r.apply.kinematics)}, keys ${Object.keys(r.apply || {}).join(',')}, fx ${r.final.K.fx.toFixed(1)}, table_z ${(r.apply.table_z_m * 1000).toFixed(2)} mm, held-out gate ${h.ab.mm.toFixed(2)} / ${h.ba.mm.toFixed(2)} mm`);
+}
+// chooseKinLevel rules (held-out mm per direction)
+{
+  const c = (rows) => CW.chooseKinLevel(rows).index;
+  const cases = [
+    [[{ ab: 2.85, ba: 3.33 }, { ab: 2.8, ba: 3.4 }, { ab: 2.8, ba: 3.3 }, { ab: 2.61, ba: 7.74 }], 0, 'real 2026-11-19 shape: L3 B->A worse by 4.4 mm, L2 mean within the 0.1 mm tie of L0'],
+    [[{ ab: 2.76, ba: 3.64 }, { ab: 2.3, ba: 2.9 }, { ab: 2.2, ba: 2.6 }, { ab: 2.01, ba: 2.23 }], 3, 'real2: L3 best'],
+    [[{ ab: 3, ba: 3 }, { ab: 1.98, ba: 1.98 }, { ab: 1.95, ba: 1.98 }, { ab: 1.9, ba: 1.9 }], 1, 'L1 within 0.1 mm of the best (L3) -> L1'],
+    [[{ ab: 3, ba: 3 }, { ab: 2.0, ba: 3.2 }, { ab: 1.0, ba: 3.05 }, { ab: 0.5, ba: 5 }], 2, 'L1 B->A +0.2 -> not eligible; L2 +0.05 eligible'],
+    [[{ ab: 3, ba: 3 }, { ab: NaN, ba: NaN }, { ab: 3.2, ba: 2 }, { ab: 2, ba: 2 }], 3, 'NaN level ignored, L2 A->B +0.2 not eligible'],
+  ];
+  const bad = cases.filter(([rows, want]) => c(rows) !== want);
+  check('e. chooseKinLevel rules', bad.length === 0, cases.map(([rows, want, why]) => `${why}: L${c(rows)} (want L${want})`).join('; '));
 }
 
 // ---- b. real data replay
@@ -157,15 +202,17 @@ function poseAgreement(views, r, kTrue) {
     const X0 = make(mul(CALM.axisR([0, 0, 1], -Math.PI / 2), CALM.axisR([1, 0, 0], -128 / D)), [-0.07, 0, 0.07]);
     const r = solveKinematics({ views, board: CW.makeBoard({ markerSide: 0.025 }), K, chain: CALM.CHAIN, X0 });
     const h = r.heldOut;
-    console.log(`      final fit on A + B: ${fmtK(r.k)}`);
+    console.log(`      levels ${levelTable(r)}`);
+    console.log(`      final fit on A + B (level ${r.level}): ${fmtK(r.k)}`);
     console.log(`      gates ${gateStr(r.gates)}; warnings ${r.warnings.map((w) => `J${w.joint} ${w.deg.toFixed(2)}°`).join(',') || 'none'}`);
-    check('b. real replay: held-out uncorrected -> corrected both ways, gates', r.ok && h.ab.mm < h.ab0.mm && h.ba.mm < h.ba0.mm,
-      `model angles with the recorded joint map (J5 -4.0 deg set in armd): A->B ${h.ab0.mm.toFixed(2)} -> ${h.ab.mm.toFixed(2)} mm, B->A ${h.ba0.mm.toFixed(2)} -> ${h.ba.mm.toFixed(2)} mm, mean improvement ${(h.improve.mean * 100).toFixed(1)} % (per direction ${(h.improve.ab * 100).toFixed(1)} / ${(h.improve.ba * 100).toFixed(1)} %); train ${r.train.mm.toFixed(2)} mm; views ${r.views.used} (A ${r.views.A}, B ${r.views.B}, dropped ${r.views.dropped.length}); gates ${r.ok ? 'pass' : 'refuse'}; solve ${r.ms} ms`);
+    check('b. real replay: a correction level beats L0, held-out both ways, gates', r.ok && r.level !== 'L0' && h.ab.mm < h.ab0.mm && h.ba.mm < h.ba0.mm,
+      `level ${r.level}; model angles with the recorded joint map (J5 -4.0 deg set in armd): A->B ${h.ab0.mm.toFixed(2)} -> ${h.ab.mm.toFixed(2)} mm, B->A ${h.ba0.mm.toFixed(2)} -> ${h.ba.mm.toFixed(2)} mm, mean improvement ${(h.improve.mean * 100).toFixed(1)} % (per direction ${(h.improve.ab * 100).toFixed(1)} / ${(h.improve.ba * 100).toFixed(1)} %); train ${r.train.mm.toFixed(2)} mm; views ${r.views.used} (A ${r.views.A}, B ${r.views.B}, dropped ${r.views.dropped.length}); gates ${r.ok ? 'pass' : 'refuse'}; solve ${r.ms} ms`);
     // kincal2.mjs convention: motor angles without the J5 map offset (the solver finds the -4 deg itself)
     const raw = views.map((v) => ({ ...v, q: v.q.map((x, i) => (i === 4 ? x + 0.0698 : x)) }));
     const r2 = solveKinematics({ views: raw, board: CW.makeBoard({ markerSide: 0.025 }), K, chain: CALM.CHAIN, X0 }), h2 = r2.heldOut;
-    check('b. real replay without the J5 map offset (kincal2.mjs convention)', r2.ok && Math.abs(h2.ab.mm - h.ab.mm) < 0.05 && Math.abs(h2.ba.mm - h.ba.mm) < 0.05,
-      `A->B ${h2.ab0.mm.toFixed(2)} -> ${h2.ab.mm.toFixed(2)} mm, B->A ${h2.ba0.mm.toFixed(2)} -> ${h2.ba.mm.toFixed(2)} mm (kincal2.mjs: 4.43 -> 2.01, 5.91 -> 2.24), J5 offset ${(r2.k[28] * D).toFixed(2)} deg, warnings ${r2.warnings.map((w) => `J${w.joint} ${w.deg.toFixed(2)}°`).join(',') || 'none'}; gates ${r2.ok ? 'pass' : 'refuse'}; solve ${r2.ms} ms`);
+    console.log(`      levels (no J5 map offset) ${levelTable(r2)}`);
+    check('b. real replay without the J5 map offset (kincal2.mjs convention)', r2.ok && r2.level !== 'L0',
+      `level ${r2.level}; A->B ${h2.ab0.mm.toFixed(2)} -> ${h2.ab.mm.toFixed(2)} mm, B->A ${h2.ba0.mm.toFixed(2)} -> ${h2.ba.mm.toFixed(2)} mm (kincal2.mjs: 4.43 -> 2.01, 5.91 -> 2.24), J5 offset ${(r2.k[28] * D).toFixed(2)} deg, warnings ${r2.warnings.map((w) => `J${w.joint} ${w.deg.toFixed(2)}°`).join(',') || 'none'}; gates ${r2.ok ? 'pass' : 'refuse'}; solve ${r2.ms} ms`);
   }
 }
 
@@ -180,6 +227,7 @@ function poseAgreement(views, r, kTrue) {
 {
   const r = solveKinematics({ views: render(kInj, { jointErr: 1.2 / D }), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
   const bad = r.gates.filter((x) => !x.ok).map((x) => x.key);
+  console.log(`      levels ${levelTable(r)}`);
   check('c. unmodelled joint errors, held-out > 3 mm -> refused', !r.ok && (bad.includes('kin_heldout_ab') || bad.includes('kin_heldout_ba')),
     `held-out ${r.heldOut.ab.mm.toFixed(2)} / ${r.heldOut.ba.mm.toFixed(2)} mm; failed ${bad.join(',')}`);
 }
