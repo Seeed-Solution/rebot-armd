@@ -10279,6 +10279,8 @@ async function teachRecToggle() {
       else teachStatus(msg);
     } else teachStatus(t('rec.discarded'));
     if (TCH.open) teachLoad(true);
+    // the saved-episodes card lists the same store (GET /api/v1/dataset/episodes)
+    if (EP.loaded) epLoad(true);
   } catch (e) {
     if (e.code === 'RECORDER_NOT_OWNER' || e.code === 'NOT_RECORDING') teachRecSet(null);
     const m = teachErr(e); toast(m, 'err', e.code || ''); teachStatus(m, true);
