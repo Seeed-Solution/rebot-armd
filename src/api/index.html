@@ -405,20 +405,23 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .tch-ask { flex-shrink: 0; display: grid; gap: 8px; padding: 10px 12px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); border: 1px solid #ffd591; font-size: 13px; }
 .tch-ask[hidden] { display: none; }
 .tch-warn-btn { color: var(--sc-status-warning-fg); border-color: #ffd591; }
-.tch-bar { display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; min-width: 0; }
+/* teach strip: a row of the stage above the video (layout flow: it moves the video down, it covers nothing) */
+.stage { flex-direction: column; gap: 8px; }
+.tch-bar { display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; min-width: 0; flex: none; box-sizing: border-box; height: 48px; padding: 4px;
+  border-radius: 14px; background: var(--sc-color-bg-container); border: 1px solid var(--sc-color-border); }
 .tch-bar[hidden] { display: none; }
-.tch-bar .btn { min-height: 40px; height: 40px; padding: 0 10px; font-size: 13px; white-space: nowrap; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; touch-action: manipulation; }
+.tch-bar .btn { min-height: 38px; height: 38px; padding: 0 10px; font-size: 13px; white-space: nowrap; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; touch-action: manipulation; }
 .tch-bar .tb-rec.on { color: #fff; background: var(--sc-status-danger-fg); border-color: var(--sc-status-danger-fg); }
-.tch-bar .tb-x { display: none; flex: 0 0 auto; width: 40px; padding: 0; }
-.tch-slot .tch-bar { flex-wrap: wrap; }
-.tch-slot .tch-bar .btn { flex: 1 1 auto; }
-/* collapsed panel: the bar floats on the video top edge (dockOnVideo) */
-.tch-bar.float { position: fixed; z-index: 1041; top: 8px; left: 50%; transform: translateX(-50%); box-sizing: border-box; width: max-content; max-width: calc(100% - 16px); height: 48px;
-  padding: 4px; border-radius: 14px; background: var(--sc-color-bg-container); border: 1px solid var(--sc-color-border); box-shadow: 0 6px 18px rgba(15, 23, 42, 0.22); }
-.tch-bar.float .tb-x { display: inline-block; }
+.tch-bar .tb-seq { flex: 1 1 auto; justify-content: flex-start; font-weight: 500; }
+.tch-bar .tb-seq span { overflow: hidden; text-overflow: ellipsis; }
+.tch-bar .tb-x { flex: 0 0 auto; width: 38px; padding: 0; }
+.tch-bar .tb-x:disabled { visibility: hidden; }
+/* simple layout: the video fills the screen under the controls; the strip docks in free space (dockOnVideo) */
+body.ui-simple .tch-bar { position: fixed; z-index: 190; top: 8px; left: 50%; transform: translateX(-50%); width: max-content; max-width: calc(100% - 16px);
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.22); }
 @media (max-width: 640px) {
   .tch.calib-drawer { max-height: 62dvh; }
-  .tch-bar.float .btn { padding: 0 8px; font-size: 12px; }
+  .tch-bar .btn { padding: 0 8px; font-size: 12px; }
 }
 @media (max-width: 640px) {
   .cwiz-mask .calib-drawer { max-height: 66dvh; }
@@ -1509,6 +1512,13 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
   <main class="main">
     <!-- ===== stage: live camera ===== -->
     <section class="stage">
+      <!-- teach strip: shown while teaching (panel open or closed); in the flow above the video, on the phone simple layout docked in free space -->
+      <div class="tch-bar" id="teach-bar" role="group" data-i18n-aria="tch.bar" aria-label="示教工具条" hidden>
+        <button class="btn btn-primary" id="tb-pose" type="button" data-i18n="tch.b.pose" data-i18n-title="tch.b.pose.t" title="记下当前位置（各关节和夹爪开度）；打开了序列时加一步">记点</button>
+        <button class="btn tb-rec" id="tb-rec" type="button" data-i18n="tch.b.rec">● 录轨迹</button>
+        <button class="btn tb-seq" id="tb-edit" type="button" data-i18n-title="tch.b.edit" title="打开示教面板编辑"><span id="tb-seq"></span></button>
+        <button class="btn tb-x" id="tb-x" type="button" data-i18n-aria="tch.b.end" aria-label="结束示教">×</button>
+      </div>
       <div class="video" id="video-box">
         <video id="video-stream" autoplay playsinline muted disablepictureinpicture></video>
         <img class="mjpeg" id="video-mjpeg" alt="">
@@ -1976,11 +1986,9 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <div class="calib-head">
       <h3 id="teach-h" data-i18n="tch.title">示教</h3>
       <div class="cwiz-head-acts">
-        <button class="btn calib-x" id="teach-min" type="button" data-i18n-aria="cw.min" aria-label="收起">–</button>
         <button class="btn calib-x" id="teach-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
       </div>
     </div>
-    <div class="tch-slot" id="teach-bar-slot"></div>
     <div class="seg tch-tabs" id="teach-tabs" role="tablist" data-i18n-aria="tch.title" aria-label="示教">
       <button type="button" role="tab" id="teach-tab-seq" data-tab="seq" data-i18n="tch.tab.seq">序列</button><button type="button" role="tab" id="teach-tab-pose" data-tab="pose" data-i18n="tch.tab.pose">点位</button><button type="button" role="tab" id="teach-tab-ep" data-tab="ep" data-i18n="tch.tab.ep">轨迹</button>
     </div>
@@ -1991,14 +1999,6 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <div class="cwiz-body tch-body" id="teach-body" role="tabpanel"></div>
     <div class="calib-live tch-status" id="teach-status" role="status" aria-live="polite">--</div>
   </aside>
-</div>
-<!-- teach bar: in the panel while hand-guiding / jogging; when the panel is collapsed it docks at the top edge of the video -->
-<div class="tch-bar" id="teach-bar" role="group" data-i18n-aria="tch.bar" aria-label="示教工具条" hidden>
-  <button class="btn btn-primary" id="tb-pose" type="button" data-i18n="tch.b.pose">记点</button>
-  <button class="btn tb-rec" id="tb-rec" type="button" data-i18n="tch.b.rec">● 录轨迹</button>
-  <button class="btn" id="tb-open" type="button" data-i18n="tch.b.open" data-i18n-title="tch.b.open.t" title="张开夹爪（序列打开时加一步）">夹爪开</button>
-  <button class="btn" id="tb-close" type="button" data-i18n="tch.b.close" data-i18n-title="tch.b.close.t" title="闭合夹爪（序列打开时加一步）">夹爪闭</button>
-  <button class="btn tb-x" id="tb-expand" type="button" data-i18n-aria="tch.b.expand" aria-label="展开示教面板">▴</button>
 </div>
 <div class="calib-mask" id="gset" hidden>
   <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="gset-title">
@@ -2715,7 +2715,7 @@ Object.assign(I18N.en, {
 Object.assign(I18N.zh, {
   'tch.title': '示教', 'tch.bar': '示教工具条', 'tch.set.desc': '记点位、录轨迹，把它们排成序列运行；运行时可以同时录制。', 'tch.set.open': '打开示教',
   'tch.tab.seq': '序列', 'tch.tab.pose': '点位', 'tch.tab.ep': '轨迹',
-  'tch.b.pose': '记点', 'tch.b.rec': '● 录轨迹', 'tch.b.recon': '■ 停止 {t}', 'tch.b.open': '夹爪开', 'tch.b.close': '夹爪闭', 'tch.b.open.t': '张开夹爪（序列打开时加一步）', 'tch.b.close.t': '闭合夹爪（序列打开时加一步）', 'tch.b.expand': '展开示教面板',
+  'tch.b.pose': '记点', 'tch.b.rec': '● 录轨迹', 'tch.b.recon': '■ 停止 {t}', 'tch.b.pose.t': '记下当前位置（各关节和夹爪开度）；打开了序列时加一步', 'tch.b.edit': '打开示教面板编辑', 'tch.b.end': '结束示教', 'tch.b.seq': '{n} · {c} 步', 'tch.b.seq.dirty': '{n} · {c} 步 · 未保存', 'tch.b.noseq': '未打开序列 · 编辑',
   'tch.loading': '加载中…', 'tch.counts': '{s} 个序列 · {p} 个点位 · {e} 条轨迹', 'tch.e.load': '加载失败：{e}',
   'tch.seq.name': '序列名称', 'tch.seq.new': '新建序列', 'tch.seq.new.ph': '新序列名称', 'tch.seq.empty': '还没有序列',
   'tch.seq.hint': '序列按顺序执行点位、夹爪、等待和轨迹回放。打开一个序列后，「记点」「录轨迹」和夹爪按钮会把步骤加到选中步骤之后。',
@@ -2725,7 +2725,7 @@ Object.assign(I18N.zh, {
   'tch.st.grip.close': '夹爪闭合', 'tch.st.grip.move': '夹爪到 {p}%', 'tch.st.wait': '等待', 'tch.st.del': '删除这一步', 'tch.st.added': '已加入第 {n} 步：{s}',
   'tch.missing': '已不存在', 'tch.stale': '⚠ 旧零位', 'tch.speed': '速度', 'tch.grip': '夹爪', 'tch.grip.keep': '保持', 'tch.grip.pose': '按点位',
   'tch.wait.s': '秒', 'tch.up': '上移', 'tch.down': '下移', 'tch.from': '从这里运行', 'tch.single': '单步',
-  'tch.add': '添加步骤', 'tch.add.pose': '+ 点位', 'tch.add.ep': '+ 轨迹', 'tch.add.open': '+ 夹爪开', 'tch.add.close': '+ 夹爪闭', 'tch.add.wait': '+ 等待 1 s',
+  'tch.add': '添加步骤', 'tch.add.pose': '+ 点位', 'tch.add.ep': '+ 轨迹', 'tch.add.grip': '+ 夹爪开度', 'tch.grip.frac': '开度', 'tch.add.wait': '+ 等待 1 s',
   'tch.pose.empty': '没有点位', 'tch.ep.empty': '没有轨迹',
   'tch.runbox': '运行', 'tch.repeat': '重复次数', 'tch.runrec': '运行时录制', 'tch.ds': '数据集', 'tch.task': '任务', 'tch.task.ph': '默认：{n}', 'tch.task.ph0': '例如：把方块放进左边的盒子',
   'tch.single.sel': '单步（选中的一步）', 'tch.stop': '停止',
@@ -2750,7 +2750,7 @@ Object.assign(I18N.zh, {
 Object.assign(I18N.en, {
   'tch.title': 'Teach', 'tch.bar': 'Teach toolbar', 'tch.set.desc': 'Save poses, record trajectories and run them as sequences; a run can record itself.', 'tch.set.open': 'Open Teach',
   'tch.tab.seq': 'Sequences', 'tch.tab.pose': 'Poses', 'tch.tab.ep': 'Trajectories',
-  'tch.b.pose': 'Save pose', 'tch.b.rec': '● Record', 'tch.b.recon': '■ Stop {t}', 'tch.b.open': 'Open', 'tch.b.close': 'Close', 'tch.b.open.t': 'Open the gripper (adds a step when a sequence is open)', 'tch.b.close.t': 'Close the gripper (adds a step when a sequence is open)', 'tch.b.expand': 'Expand the Teach panel',
+  'tch.b.pose': 'Save pose', 'tch.b.rec': '● Record', 'tch.b.recon': '■ Stop {t}', 'tch.b.pose.t': 'Save the current position (joints and gripper opening); adds a step when a sequence is open', 'tch.b.edit': 'Open the Teach panel to edit', 'tch.b.end': 'End teaching', 'tch.b.seq': '{n} · {c} steps', 'tch.b.seq.dirty': '{n} · {c} steps · unsaved', 'tch.b.noseq': 'No sequence open · Edit',
   'tch.loading': 'Loading…', 'tch.counts': '{s} sequences · {p} poses · {e} trajectories', 'tch.e.load': 'Loading failed: {e}',
   'tch.seq.name': 'Sequence name', 'tch.seq.new': 'New sequence', 'tch.seq.new.ph': 'New sequence name', 'tch.seq.empty': 'No sequences yet',
   'tch.seq.hint': 'A sequence runs poses, gripper actions, waits and trajectory replays in order. With a sequence open, "Save pose", "Record" and the gripper buttons add a step after the selected one.',
@@ -2760,7 +2760,7 @@ Object.assign(I18N.en, {
   'tch.st.grip.close': 'Close gripper', 'tch.st.grip.move': 'Gripper to {p}%', 'tch.st.wait': 'Wait', 'tch.st.del': 'Delete this step', 'tch.st.added': 'Added step {n}: {s}',
   'tch.missing': 'missing', 'tch.stale': '⚠ old zero', 'tch.speed': 'Speed', 'tch.grip': 'Gripper', 'tch.grip.keep': 'keep', 'tch.grip.pose': 'from pose',
   'tch.wait.s': 's', 'tch.up': 'Move up', 'tch.down': 'Move down', 'tch.from': 'Run from here', 'tch.single': 'Step',
-  'tch.add': 'Add a step', 'tch.add.pose': '+ Pose', 'tch.add.ep': '+ Trajectory', 'tch.add.open': '+ Open', 'tch.add.close': '+ Close', 'tch.add.wait': '+ Wait 1 s',
+  'tch.add': 'Add a step', 'tch.add.pose': '+ Pose', 'tch.add.ep': '+ Trajectory', 'tch.add.grip': '+ Gripper opening', 'tch.grip.frac': 'Opening', 'tch.add.wait': '+ Wait 1 s',
   'tch.pose.empty': 'No poses', 'tch.ep.empty': 'No trajectories',
   'tch.runbox': 'Run', 'tch.repeat': 'Repeat', 'tch.runrec': 'Record while running', 'tch.ds': 'Dataset', 'tch.task': 'Task', 'tch.task.ph': 'Default: {n}', 'tch.task.ph0': 'e.g. put the cube into the left bin',
   'tch.single.sel': 'Single step (selected)', 'tch.stop': 'Stop',
@@ -5493,7 +5493,7 @@ function cwJogPlace() { dockOnVideo($('cwiz-jogbar')); }
 // view switch / header and anything of DOCK_AVOID it would cover; at the top of the screen when the video is
 // scrolled out of view.
 const DOCK_AVOID = CWJ_AVOID + ', .topbar';
-function dockOnVideo(bar) {
+function dockOnVideo(bar, avoidSel = DOCK_AVOID) {
   if (!bar || bar.hidden) return;
   const W = window.innerWidth, H = window.innerHeight, v = $('video-box').getBoundingClientRect();
   const onVideo = v.width > 0 && v.bottom > 120 && v.top < H - 120;
@@ -5503,7 +5503,7 @@ function dockOnVideo(bar) {
   let top = onVideo ? Math.max(0, v.top) + 8 : 8;
   bar.style.top = top + 'px';
   const vs = $('vs-video') && $('vs-video').parentElement;
-  const avoid = [...document.querySelectorAll(DOCK_AVOID), vs].filter(Boolean).map((e) => e.getBoundingClientRect())
+  const avoid = [...document.querySelectorAll(avoidSel), vs].filter(Boolean).map((e) => e.getBoundingClientRect())
     .filter((r) => r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < H);
   for (let k = 0; k < 6; k++) {
     const b = bar.getBoundingClientRect();
@@ -7690,7 +7690,7 @@ function gcInput(v) {
       releaseAll();
       toast(t('gc.entering'), 'info');
       api('/api/v1/mode/gravity_comp', { enable: true }, { quiet: true })
-        .then(() => { toast(t('gc.entered'), 'ok'); if (teachOn() && !TCH.open) teachOpen(true, { min: true }); })
+        .then(() => { toast(t('gc.entered'), 'ok'); if (teachOn()) teachStrip(true); })
         .catch((err) => {
           const k = 'gc.b.' + err.code;
           toast(t('gc.enter_fail') + (t(k) !== k ? t(k) : err.message), 'err', err.code);
@@ -7704,7 +7704,7 @@ function gcInput(v) {
   // teach v1: the record button records into the teach store (and opens the panel collapsed); else the legacy recording
   $('btn-gc-rec').addEventListener('click', () => {
     if (!teachOn()) { $('btn-rec').click(); return; }
-    if (!TCH.open) teachOpen(true, { min: true });
+    teachStrip(true);
     teachRecToggle();
   });
 })();
@@ -7932,7 +7932,7 @@ function setRecording(on) {
   $('rec-state').className = 'sc-status-badge' + (on ? ' is-danger' : '');
 }
 $('btn-rec').addEventListener('click', async () => {
-  if (teachOn()) { if (!TCH.open) teachOpen(true, { tab: 'ep' }); teachRecToggle(); return; }
+  if (teachOn()) { teachStrip(true); teachRecToggle(); return; }
   if (!S.rec.active) {
     const id = $('rec-id').value.trim() || defaultEpisodeId();
     try { await api('/api/v1/dataset/record/start', { episode_id: id }); setRecording(true); toast(t('toast.rec_start') + id, 'ok'); } catch (_) {}
@@ -9630,7 +9630,7 @@ i18nHooks.push(() => { if (!$('pset').hidden) { posesRender(); poseNameCheck(); 
    episodes/update|delete, datasets/create. Server strings only through textContent (cwEl / setText).
    ================================================================= */
 const TCH = {
-  open: false, min: false, tab: 'seq', loaded: false,
+  open: false, teach: false, tab: 'seq', loaded: false, // open: the panel; teach: the strip (teaching goes on with the panel closed)
   seqs: [], poses: [], eps: [], dsets: [], cur: null, dirty: false, sel: -1,
   ds: store('rebot.teach.ds') || 'default', task: store('rebot.teach.task') || '',
   repeat: 1, runRec: false, runDs: null, runTask: '',
@@ -9710,19 +9710,25 @@ async function teachLoad(quiet) {
 function teachOnCaps() {
   const on = teachOn();
   $('teach-set').hidden = !on;
-  if (!on && TCH.open) teachOpen(false);
+  if (!on) { TCH.teach = false; if (TCH.open) teachOpen(false); }
   teachBarRender();
 }
-function teachOpen(open, { min = false, tab } = {}) {
+// the panel (editing); opening it also starts teaching (the strip), closing it keeps the strip
+function teachOpen(open, { tab } = {}) {
   TCH.open = !!open && teachOn();
   if (tab) TCH.tab = tab;
   $('teach').hidden = !TCH.open;
-  TCH.min = TCH.open && min;
-  $('teach-panel').classList.toggle('min', TCH.min);
-  if (TCH.open) { teachRender(); teachLoad(true); if (!TCH.min) $('teach-close').focus({ preventScroll: true }); }
+  if (TCH.open) { TCH.teach = true; teachRender(); teachLoad(true); $('teach-close').focus({ preventScroll: true }); }
   teachBarRender();
 }
-function teachMin(min) { TCH.min = !!min; $('teach-panel').classList.toggle('min', TCH.min); teachBarRender(); if (!TCH.min) teachRender(); }
+// the strip alone (teaching with the panel closed); off ends teaching (not while this page records)
+function teachStrip(on) {
+  TCH.teach = !!on && teachOn();
+  if (TCH.teach && !TCH.loaded) teachLoad(true);
+  teachBarRender();
+}
+// the gripper opening now (0 closed .. 1 open), from the measured joint
+function teachGripFrac() { const q = S.obs && Array.isArray(S.obs.positions) ? Number(S.obs.positions[GRIP]) : NaN; return Number.isFinite(q) ? Math.round(gripFrac(q) * 100) / 100 : 0.5; }
 const teachDisarm = () => { TCH.armed = null; clearTimeout(TCH.armTimer); };
 // two taps: the first arms the button for 3 s
 function teachArm(key) {
@@ -9855,7 +9861,12 @@ function teachRenderEditor(body) {
     } else if (st.type === 'wait') {
       p.append(cwEl('span', 'tch-k', t('tch.wait.s')), tchInput(st.s, (v, el) => { const x = clamp(Number(v) || 0, 0, 60); st.s = x; el.value = String(x); dirty(); }, { type: 'number', min: 0, max: 60, step: 0.5, aria: t('tch.wait.s') }));
     } else if (st.type === 'gripper') {
-      p.append(tchSelect([['open', t('tch.st.grip.open')], ['close', t('tch.st.grip.close')]].concat(st.action === 'move' ? [['move', t('tch.st.grip.move', { p: Math.round((st.fraction ?? 0) * 100) })]] : []), st.action, (v) => { st.action = v; if (v !== 'move') delete st.fraction; dirty(); teachRender(); }, t('tch.grip')));
+      // a continuous opening (0 closed .. 1 open); an open / close step shows as 100 % / 0 % and becomes a move once changed
+      const f = st.action === 'move' ? clamp(Number(st.fraction) || 0, 0, 1) : st.action === 'open' ? 1 : 0;
+      const out = cwEl('output', 'tch-k', Math.round(f * 100) + '%');
+      const rg = tchInput(f, (v) => { st.action = 'move'; st.fraction = Math.round(clamp(Number(v) || 0, 0, 1) * 100) / 100; setText(out, Math.round(st.fraction * 100) + '%'); setText(h.querySelector('b'), teachStepTitle(st)); dirty(); },
+        { type: 'range', min: 0, max: 1, step: 0.05, aria: t('tch.grip.frac'), cls: 'grow' });
+      p.append(cwEl('span', 'tch-k', t('tch.grip.frac')), rg, out);
     } else if (st.type === 'replay') {
       p.append(cwEl('span', 'tch-k', t('tch.speed')), tchSelect([[0.5, '0.5×'], [1, '1×']], st.speed === 1 ? 1 : 0.5, (v) => { st.speed = Number(v); dirty(); }, t('tch.speed')));
       const ck = cwEl('label', 'tch-chk'); const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = st.gripper !== false;
@@ -9887,8 +9898,7 @@ function teachRenderEditor(body) {
   esel.classList.add('grow');
   er.append(esel, tchBtn(t('tch.add.ep'), () => { if (esel.value) teachAddStep({ type: 'replay', episode_id: esel.value, speed: 1, gripper: true }); }, '', !TCH.eps.length || running));
   const gr = cwEl('div', 'tch-row');
-  gr.append(tchBtn(t('tch.add.open'), () => teachAddStep({ type: 'gripper', action: 'open' }), '', running),
-    tchBtn(t('tch.add.close'), () => teachAddStep({ type: 'gripper', action: 'close' }), '', running),
+  gr.append(tchBtn(t('tch.add.grip'), () => teachAddStep({ type: 'gripper', action: 'move', fraction: teachGripFrac() }), '', running),
     tchBtn(t('tch.add.wait'), () => teachAddStep({ type: 'wait', s: 1 }), '', running));
   add.append(pr, er, gr);
   body.appendChild(add);
@@ -10050,7 +10060,7 @@ function teachAddStep(st) {
   teachStatus(t('tch.st.added', { n: at + 1, s: teachStepTitle(st) }));
   teachRender();
   const li = document.querySelector('#tch-steps > li.sel');
-  if (li && !TCH.min) li.scrollIntoView({ block: 'nearest' });
+  if (li && TCH.open) li.scrollIntoView({ block: 'nearest' });
   return true;
 }
 async function teachSave() {
@@ -10157,7 +10167,8 @@ function teachAutoPoseName() {
   for (let k = 1; k < 1000; k++) { const n = 'p' + String(k).padStart(2, '0'); if (!used.has(n)) return n; }
   return 'p' + Date.now();
 }
-// save the current position as a pose; with a sequence open, append it as a step
+// save the current position (all joints, the gripper opening included: armd stores the measured angles) as a pose;
+// from the strip with a sequence open, append it as a pose step that also restores the opening (gripper "pose")
 async function teachSavePose(name, append = false) {
   if (!POSE_NAME_RE.test(name || '')) { teachStatus(t('pose.bad'), true); return; }
   try {
@@ -10166,9 +10177,9 @@ async function teachSavePose(name, append = false) {
     if (ps && Array.isArray(ps.poses)) TCH.poses = ps.poses;
     const p = (r && r.pose && r.pose.id) ? r.pose : TCH.poses.find((x) => x.name === name);
     toast(t('pose.saved', { name }), 'ok');
-    if (append && TCH.cur && p && p.id) teachAddStep({ type: 'pose', pose_id: p.id, speed_scale: 0.5, gripper: 'keep' });
+    if (append && TCH.cur && p && p.id) { teachAddStep({ type: 'pose', pose_id: p.id, speed_scale: 0.5, gripper: 'pose' }); await teachStripSave(); }
     else teachStatus(t('pose.saved', { name }));
-    teachRender();
+    teachRender(); teachBarRender();
   } catch (e) { const m = teachErr(e); toast(m, 'err', e.code || ''); teachStatus(m, true); }
 }
 async function teachRenamePose(p, name) {
@@ -10264,7 +10275,7 @@ async function teachRecToggle() {
       if (!TCH.eps.some((x) => x.id === ep.id)) TCH.eps.unshift(ep);
       const msg = t('tch.rec.saved', { n: teachEpName(ep), d: epFmtDur(Number(ep.duration_s)) });
       toast(msg, 'ok');
-      if (TCH.cur) teachAddStep({ type: 'replay', episode_id: ep.id, speed: 1, gripper: true });
+      if (TCH.cur) { teachAddStep({ type: 'replay', episode_id: ep.id, speed: 1, gripper: true }); await teachStripSave(); }
       else teachStatus(msg);
     } else teachStatus(t('rec.discarded'));
     if (TCH.open) teachLoad(true);
@@ -10279,39 +10290,37 @@ async function teachRecDiscard() {
   catch (e) { teachStatus(teachErr(e), true); }
 }
 
-/* ---- teach bar: shown while hand-guiding or jogging; floats on the video when the panel is collapsed ---- */
+/* ---- teach strip: 记点 / ● 录轨迹 / the open sequence; shown while teaching, with the panel open or closed. The arm and
+   the gripper are moved with the normal controls (sticks, gripper slider) or by hand while hand-guiding; the strip
+   only snapshots and records, so every control works as without it. ---- */
 const teachActive = () => gcOn() || (isLive() && canMove() && leaseOther() == null);
-function teachGrip(cmd) {
-  if (gcOn()) { gcGripDir = 0; gcGrip(cmd === 'close' ? 1 : -1); gcGripDir = 0; }
-  else { S.grip = cmd === 'close' ? 0 : 1; S.gripCmdAt = Date.now(); commandRPC('/api/v1/action/gripper', { command: cmd }).then((r) => syncEpoch(r.epoch_id)).catch((e) => { if (e.code !== 'MOTION_BUSY') toast(e.message, 'err', e.code); }); }
-  if (TCH.cur) teachAddStep({ type: 'gripper', action: cmd });
-}
+// a step added from the strip is saved at once (the panel may be closed); a failure stays visible as "unsaved"
+async function teachStripSave() { if (TCH.cur && TCH.dirty && !TCH.busy) await teachSave(); teachBarRender(); }
+// simple layout: the video fills the screen, so the strip floats (position: fixed) and docks clear of every control
+const TCH_STRIP_AVOID = DOCK_AVOID + ', #btn-gc, #grip-range, #grip-col, #view-switch, #safety, #gc-banner, #pose-card, .presets, .hud, #btn-preempt';
 function teachBarRender() {
   const bar = $('teach-bar');
-  const active = teachOn() && TCH.open && (teachActive() || !!TCH.rec);
-  const float = teachOn() && TCH.open && TCH.min;
-  const show = float || active;
-  if (bar.hidden !== !show) bar.hidden = !show;
+  const show = teachOn() && (TCH.teach || !!TCH.rec);
+  if (bar.hidden !== !show) { bar.hidden = !show; TCH.dockAt = 0; }
   if (!show) return;
-  const slot = $('teach-bar-slot');
-  if (float) { if (bar.parentElement !== document.body) document.body.appendChild(bar); }
-  else if (bar.parentElement !== slot) { slot.appendChild(bar); bar.style.top = ''; bar.style.left = ''; bar.style.maxWidth = ''; }
-  bar.classList.toggle('float', float);
   const can = teachActive() && !teachRunning();
   $('tb-pose').disabled = !can;
-  $('tb-open').disabled = !can;
-  $('tb-close').disabled = !can;
   const rec = $('tb-rec');
   rec.disabled = !TCH.rec && !can;
   rec.classList.toggle('on', !!TCH.rec);
   setText(rec, TCH.rec ? t('tch.b.recon', { t: fmtTime(Date.now() - TCH.rec.startedAt) }) : t('tch.b.rec'));
+  const c = TCH.cur;
+  setText($('tb-seq'), c ? t(TCH.dirty ? 'tch.b.seq.dirty' : 'tch.b.seq', { n: c.name || '?', c: c.steps.length }) : t('tch.b.noseq'));
+  $('tb-x').disabled = !!TCH.rec;
   // docking reads layout: on show and at most every 500 ms from the observation stream (resize / scroll dock at once)
-  if (float && (Date.now() - (TCH.dockAt || 0) > 500 || bar.style.top === '')) { TCH.dockAt = Date.now(); dockOnVideo(bar); }
+  if (getComputedStyle(bar).position === 'fixed') {
+    if (Date.now() - (TCH.dockAt || 0) > 500) { TCH.dockAt = Date.now(); dockOnVideo(bar, TCH_STRIP_AVOID); }
+  } else if (bar.style.top) { bar.style.top = ''; bar.style.left = ''; bar.style.maxWidth = ''; }
 }
 (() => {
   $('teach-close').addEventListener('click', () => teachOpen(false));
-  $('teach-min').addEventListener('click', () => teachMin(true));
-  $('tb-expand').addEventListener('click', () => teachMin(false));
+  $('tb-edit').addEventListener('click', () => { if (TCH.open) teachOpen(false); else teachOpen(true, { tab: 'seq' }); });
+  $('tb-x').addEventListener('click', () => { if (TCH.rec) return; teachOpen(false); teachStrip(false); });
   $('teach-tabs').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { TCH.tab = b.dataset.tab; TCH.edit = null; teachDisarm(); teachRender(); } });
   $('teach-tabs').addEventListener('keydown', (e) => {
     if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
@@ -10322,10 +10331,8 @@ function teachBarRender() {
   $('teach-ask-no').addEventListener('click', () => { TCH.ask = null; teachStatus('--'); teachRender(); });
   $('tb-pose').addEventListener('click', () => teachSavePose(teachAutoPoseName(), true));
   $('tb-rec').addEventListener('click', teachRecToggle);
-  $('tb-open').addEventListener('click', () => teachGrip('open'));
-  $('tb-close').addEventListener('click', () => teachGrip('close'));
   $('teach-open').addEventListener('click', () => { ssetOpen(false); teachOpen(true); });
-  for (const ev of ['resize', 'scroll']) window.addEventListener(ev, () => { if (TCH.open && TCH.min) dockOnVideo($('teach-bar')); }, { passive: true });
+  for (const ev of ['resize', 'scroll']) window.addEventListener(ev, () => { TCH.dockAt = 0; teachBarRender(); }, { passive: true });
   setInterval(() => { if (TCH.rec) teachBarRender(); }, 500);
   i18nHooks.push(() => { if (TCH.open) teachRender(); teachBarRender(); });
 })();

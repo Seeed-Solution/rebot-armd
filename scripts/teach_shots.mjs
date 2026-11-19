@@ -145,14 +145,14 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
       S.obs.control_mode = 'gravity_comp'; S.obs.gravity_comp.phase = 'active'; renderGc(); window.__legacy = 0; $('btn-gc-rec').click();
     });
     await page.waitForTimeout(200);
-    const g1 = await ev(() => ({ open: TCH.open, min: TCH.min, rec: !!TCH.rec, gcrec: $('btn-gc-rec').classList.contains('rec-on'), bar: !$('teach-bar').hidden && $('teach-bar').classList.contains('float') }));
+    const g1 = await ev(() => ({ open: TCH.open, teach: TCH.teach, rec: !!TCH.rec, gcrec: $('btn-gc-rec').classList.contains('rec-on'), bar: !$('teach-bar').hidden }));
     await shot('0_handguide_record_shortcut', 'teach-bar');
     await ev(() => $('btn-gc-rec').click());
     await page.waitForTimeout(200);
     const g2 = await ev(() => ({ tc: window.__tc.map(([p, b]) => p + ':' + (b.source || b.save)), legacy: window.__legacy, rec: !!TCH.rec }));
-    if (!g1.open || !g1.min || !g1.rec || !g1.gcrec || !g1.bar || g2.legacy || g2.rec || JSON.stringify(g2.tc) !== '["/api/v1/record/start:hand_guide","/api/v1/record/stop:true"]')
+    if (g1.open || !g1.teach || !g1.rec || !g1.gcrec || !g1.bar || g2.legacy || g2.rec || JSON.stringify(g2.tc) !== '["/api/v1/record/start:hand_guide","/api/v1/record/stop:true"]')
       fail(`hand-guide record shortcut ${tag}: ${JSON.stringify({ g1, g2 })}`);
-    await ev(() => { teachOpen(false); S.obs.control_mode = 'position'; S.obs.gravity_comp.phase = null; renderGc(); window.__tc = []; });
+    await ev(() => { teachOpen(false); teachStrip(false); S.obs.control_mode = 'position'; S.obs.gravity_comp.phase = null; renderGc(); window.__tc = []; });
     await ev(() => ssetOpen(true));
     if (!(await ev(() => !$('teach-set').hidden && $('teach-set').nextElementSibling.id === 'tools-set'))) fail(`entry ${tag}`);
     await shot('0_settings_entry', 'sset');
@@ -171,11 +171,21 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     await ev(() => { const s = document.querySelector('#tch-steps > li[data-i="0"] select'); s.value = '0.3'; s.dispatchEvent(new Event('change')); });
     const e2 = await ev(() => ({ order: TCH.cur.steps.map((s) => s.type).join(','), speed: TCH.cur.steps[0].speed_scale, dirty: TCH.dirty, save: $('tch-save').textContent }));
     if (e2.order !== 'pose,wait,gripper,pose,gripper,replay' || e2.speed !== 0.3 || !e2.dirty) fail(`edit ${tag}: ${JSON.stringify(e2)}`);
-    await shot('2_editor', 'teach-panel', `order ${e2.order}`);
+    // gripper steps: an opening slider (open = 100 %, close = 0 %); moving it makes a move step; "+ Gripper opening" adds the measured opening
+    const gs = await ev(() => {
+      const li = [...document.querySelectorAll('#tch-steps > li')].filter((x) => TCH.cur.steps[+x.dataset.i].type === 'gripper');
+      const vals = li.map((x) => x.querySelector('input[type=range]') && x.querySelector('input[type=range]').value);
+      const sel = li.some((x) => x.querySelector('select'));
+      const rg = li[1].querySelector('input[type=range]'); rg.value = '0.4'; rg.dispatchEvent(new Event('input'));
+      const st = TCH.cur.steps[+li[1].dataset.i];
+      return { vals, sel, st: { action: st.action, fraction: st.fraction }, title: li[1].querySelector('b').textContent, out: li[1].querySelector('output').textContent };
+    });
+    if (JSON.stringify(gs.vals) !== '["1","0"]' || gs.sel || gs.st.action !== 'move' || gs.st.fraction !== 0.4 || !gs.title.includes('40%') || gs.out !== '40%') fail(`gripper slider ${tag}: ${JSON.stringify(gs)}`);
+    await shot('2_editor', 'teach-panel', `order ${e2.order}, gripper ${gs.vals.join('/')} -> ${gs.st.action} ${gs.st.fraction}`);
 
     // 3 run with repeat 3 and recording: saves first (rev), then run_sequence; live step highlight; Stop
     await ev(() => {
-      window.__reply['/api/v1/sequences/save'] = (b) => ({ sequence: { ...b, id: 'S1', rev: 4 }, epoch_id: 1 });
+      window.__reply['/api/v1/sequences/save'] = (b) => { window.__seqSaved = JSON.parse(JSON.stringify({ ...b, id: 'S1', rev: 4 })); return { sequence: { ...b, id: 'S1', rev: 4 }, epoch_id: 1 }; };
       window.__reply['/api/v1/action/run_sequence'] = { action_id: 'A1', expected_duration_s: 40, epoch_id: 1 };
       const rep = $('tch-repeat'); rep.value = '3'; rep.dispatchEvent(new Event('change'));
       $('tch-runrec').click();
@@ -216,15 +226,15 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     if (JSON.stringify(s2.calls) !== '[false,true]' || !s2.ask || s2.run !== 'A2') fail(`allow_stale ${tag}: ${JSON.stringify(s2)}`);
     await ev(() => { S.obs.previous_action = { id: 'A2', kind: 'sequence', state: 'done' }; obsTick(); });
 
-    // 5 teach bar while hand-guiding: Save pose / Record / gripper append steps after the selected one
+    // 5 teach strip while hand-guiding: Save pose / Record append steps after the selected one and save the sequence
     await ev(() => {
       window.__cmd = []; window.__tc = [];
       S.obs.control_mode = 'gravity_comp'; S.obs.gravity_comp.phase = 'active';
       document.querySelector('#tch-steps > li[data-i="5"]').click(); // select the last step
     });
     await ev(() => obsTick());
-    const b0 = await ev(() => ({ bar: !$('teach-bar').hidden, inPanel: $('teach-bar').parentElement.id }));
-    if (!b0.bar || b0.inPanel !== 'teach-bar-slot') fail(`bar in panel ${tag}: ${JSON.stringify(b0)}`);
+    const b0 = await ev(() => ({ bar: !$('teach-bar').hidden, inStage: $('teach-bar').parentElement.classList.contains('stage'), gripBtns: !!document.querySelector('#teach-bar #tb-open, #teach-bar #tb-close') }));
+    if (!b0.bar || !b0.inStage || b0.gripBtns) fail(`strip ${tag}: ${JSON.stringify(b0)}`);
     await ev(() => {
       window.__reply['/api/v1/record/start'] = { recording_id: 'R1', owner: CLIENT_ID };
       window.__reply['/api/v1/record/stop'] = { episode: { id: '01JD0000000000000000EPIS09', dataset: 'default', task: 'wave', source: 'hand_guide', duration_s: 6.2, frames: 1860, recorded_at: '2026-11-19T10:00:00Z' } };
@@ -233,7 +243,7 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     await ev(() => {
       window.POSESX = []; window.EPSX = []; window.__epsLag = true;
       const realGet = window.teachGet;
-      window.teachGet = async (p) => { const d = await realGet(p); if (p === '/api/v1/poses') d.poses = d.poses.concat(window.POSESX); if (p.startsWith('/api/v1/episodes') && !window.__epsLag) d.episodes = d.episodes.concat(window.EPSX); return d; };
+      window.teachGet = async (p) => { const d = await realGet(p); if (p === '/api/v1/sequences' && window.__seqSaved) d.sequences = d.sequences.map((x) => (x.id === window.__seqSaved.id ? window.__seqSaved : x)); if (p === '/api/v1/poses') d.poses = d.poses.concat(window.POSESX); if (p.startsWith('/api/v1/episodes') && !window.__epsLag) d.episodes = d.episodes.concat(window.EPSX); return d; };
       window.__reply['/api/v1/poses/save'] = (b) => { window.POSESX.push({ id: '01JD0000000000000000POSE09', name: b.name, positions: [] }); return { epoch_id: 1 }; };
       $('tb-pose').click();
     });
@@ -253,30 +263,45 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     await ev(() => { window.EPSX = [{ id: '01JD0000000000000000EPIS09', dataset: 'default', task: 'wave', source: 'hand_guide', duration_s: 6.2, frames: 1860, recorded_at: '2026-11-19T10:00:00Z' }]; window.__epsLag = false; return teachLoad(true); });
     const rp2 = await ev(() => ({ acked: TCH.acked.size, miss: !!document.querySelector('#tch-steps .tch-bd.miss') }));
     if (rp2.acked || rp2.miss) fail(`replay step after the list ${tag}: ${JSON.stringify(rp2)}`);
-    await ev(() => $('tb-close').click());
     await page.waitForTimeout(200);
     const b2 = await ev(() => ({ steps: TCH.cur.steps.map((s) => s.type + (s.pose_id ? ':' + s.pose_id.slice(-6) : '') + (s.episode_id ? ':' + s.episode_id.slice(-6) : '') + (s.action ? ':' + s.action : '')),
-      cmd: window.__cmd.map(([p, b]) => p + (b.name ? ':' + b.name : '') + (b.command ? ':' + b.command : '')), tc: window.__tc.map(([p, b]) => p + ':' + JSON.stringify(b)), rec: TCH.rec, chip: document.body.classList.contains('recording') }));
-    const tail = b2.steps.slice(-4).join(',');
-    if (!b1.rec || !b1.chip || tail !== 'replay:EPIS01,pose:POSE09,replay:EPIS09,gripper:close' || b2.rec || b2.chip
-      || !b2.cmd.includes('/api/v1/poses/save:p01') || !b2.cmd.includes('/api/v1/action/gripper:close')
+      grip: (TCH.cur.steps.find((s) => s.pose_id === '01JD0000000000000000POSE09') || {}).gripper,
+      cmd: window.__cmd.map(([p, b]) => p + (b.name ? ':' + b.name : '') + (b.command ? ':' + b.command : '')), tc: window.__tc.map(([p, b]) => p + ':' + JSON.stringify(b)), rec: TCH.rec, chip: document.body.classList.contains('recording'),
+      dirty: TCH.dirty, seq: $('tb-seq').textContent }));
+    const tail = b2.steps.slice(-3).join(',');
+    // 记点 snapshots the opening too (gripper "pose"); each strip step is saved at once (2 x sequences/save); the strip sends no gripper command
+    if (!b1.rec || !b1.chip || tail !== 'replay:EPIS01,pose:POSE09,replay:EPIS09' || b2.grip !== 'pose' || b2.rec || b2.chip || b2.dirty
+      || !b2.cmd.includes('/api/v1/poses/save:p01') || b2.cmd.some((c) => c.startsWith('/api/v1/action/gripper')) || b2.cmd.filter((c) => c.startsWith('/api/v1/sequences/save')).length !== 2
       || !b2.tc.some((x) => x.startsWith('/api/v1/record/start:') && x.includes('"source":"hand_guide"') && x.includes('"dataset":"default"'))
       || !b2.tc.some((x) => x === '/api/v1/record/stop:{"save":true}')) fail(`teach bar ${tag}: ${JSON.stringify({ b1, b2 })}`);
     await shot('6_bar_steps_added', 'teach-panel', `steps ${b2.steps.length}: ...${tail}`);
 
-    // 6 collapsed: the bar docks at the top edge of the video, <= 48 px, off the E-stop / Enable / sticks
-    await ev(() => $('teach-min').click());
+    // 6 panel closed, teaching goes on: the strip (<= 48 px) overlaps no control (sticks, gripper slider, E-stop, Enable,
+    // hand-guide switch, view switch, HUD, safety card, top bar) and, where the video has its own box, not the video;
+    // in the simple and the expert layout. "Edit" opens the panel again.
+    await ev(() => $('teach-close').click());
     await page.waitForTimeout(300);
-    const geo = await ev(() => {
+    const geoOf = (ui) => ev(async (ui) => {
+      if (S.ui !== ui) setUi(ui);
+      await new Promise((r) => setTimeout(r, 250)); TCH.dockAt = 0; teachBarRender(); await new Promise((r) => setTimeout(r, 50));
       const bar = $('teach-bar'), b = bar.getBoundingClientRect(), v = $('video-box').getBoundingClientRect(), H = innerHeight, W = innerWidth;
-      const pads = [...document.querySelectorAll(CWJ_AVOID)].map((e) => [e.id || e.className, e.getBoundingClientRect()]).filter(([, r]) => r.width > 0 && r.bottom > 0 && r.top < H);
-      const cover = pads.filter(([, r]) => r.left < b.right && r.right > b.left && r.top < b.bottom && r.bottom > b.top).map(([n]) => n);
-      return { float: bar.classList.contains('float'), panel: $('teach-panel').getBoundingClientRect().height, h: Math.round(b.height), y: Math.round(b.top), inView: b.left >= 0 && b.right <= W && b.top >= 0,
-        onVideo: b.top >= v.top - 1 && b.bottom <= v.bottom, cover, expand: !!$('tb-expand').offsetWidth };
-    });
-    if (!geo.float || geo.panel || geo.h > 48 || !geo.inView || !geo.onVideo || geo.cover.length || !geo.expand) fail(`collapsed bar ${tag}: ${JSON.stringify(geo)}`);
-    await shot('7_bar_collapsed', 'teach-bar', `bar y ${geo.y} h ${geo.h}, covers ${geo.cover.length}`);
-    await ev(() => $('tb-expand').click());
+      const fixed = getComputedStyle(bar).position === 'fixed';
+      const sel = TCH_STRIP_AVOID + (fixed ? '' : ', #video-box');
+      const els = [...document.querySelectorAll(sel)].filter((e) => !bar.contains(e) && !e.contains(bar));
+      const rects = els.map((e) => [e.id || e.className, e.getBoundingClientRect()]).filter(([, r]) => r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < H);
+      const cover = rects.filter(([, r]) => r.left < b.right - 0.5 && r.right > b.left + 0.5 && r.top < b.bottom - 0.5 && r.bottom > b.top + 0.5).map(([n]) => n);
+      return { ui, fixed, shown: !bar.hidden, panel: !$('teach').hidden, h: Math.round(b.height), y: Math.round(b.top), inView: b.left >= 0 && b.right <= W + 0.5 && b.top >= 0, checked: rects.length, cover,
+        seq: $('tb-seq').textContent, pose: !!$('tb-pose').offsetWidth, rec: !!$('tb-rec').offsetWidth };
+    }, ui);
+    for (const ui of ['simple', 'expert']) {
+      const geo = await geoOf(ui);
+      if (!geo.shown || geo.panel || geo.h > 48 || !geo.inView || geo.cover.length || geo.checked < 4 || !geo.pose || !geo.rec || !geo.seq.includes('pick_place')) fail(`strip geometry ${tag}: ${JSON.stringify(geo)}`);
+      await shot('7_strip_' + ui, 'teach-bar', `strip y ${geo.y} h ${geo.h} ${geo.fixed ? 'docked' : 'in flow'}, ${geo.checked} controls checked, covers ${geo.cover.length} "${geo.seq}"`);
+    }
+    await ev(() => setUi('simple'));
+    await page.waitForTimeout(200);
+    await ev(() => $('tb-edit').click());
+    if (!(await ev(() => TCH.open && !$('teach').hidden))) fail(`edit from the strip ${tag}`);
     await ev(() => { S.obs.control_mode = 'position'; S.obs.gravity_comp.phase = null; obsTick(); });
 
     // 7 poses: used by, rename, delete refused with IN_USE
