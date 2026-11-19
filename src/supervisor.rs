@@ -292,6 +292,8 @@ pub struct SupervisorInner {
     /// Duration of the most recently planned NormalUnload trajectory (s).
     pub unload_planned_duration: Option<f64>,
     pub recorder: EpisodeRecorder,
+    /// Stored sequences (`crate::sequences`).
+    pub sequences: crate::sequences::SequenceStore,
     /// The running recording and its owner (`crate::teach`).
     pub recording: Option<crate::teach::ActiveRecording>,
     /// Length cap of a recording (s); [`crate::recording::store::MAX_EPISODE_S`] (tests lower it).
@@ -488,6 +490,7 @@ impl SupervisorInner {
             profile_grasp,
             unload_planned_duration: None,
             recorder: EpisodeRecorder::new(),
+            sequences: Default::default(),
             recording: None,
             max_episode_s: crate::recording::store::MAX_EPISODE_S,
             episodes: crate::recording::EpisodeStore::new(Some(PathBuf::from(crate::recording::store::FALLBACK_EPISODES_DIR))),

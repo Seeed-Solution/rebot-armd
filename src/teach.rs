@@ -512,8 +512,13 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, StoreError> +
 }
 
 impl SupervisorInner {
-    /// Whether the episode `id` may be deleted now (IN_USE when a sequence references it).
-    pub fn episode_delete_allowed(&self, _id: &str) -> Result<(), ArmError> { Ok(()) }
+    /// Whether the episode `id` may be deleted now: IN_USE `{sequences}` when a sequence
+    /// references it or the running sequence pinned it.
+    pub fn episode_delete_allowed(&self, id: &str) -> Result<(), ArmError> {
+        let users = self.sequences_using_episode(id);
+        if users.is_empty() { return Ok(()); }
+        Err(ArmError::detailed(409, "IN_USE", format!("Episode '{id}' is used by {} sequence(s)", users.len()), json!({"sequences": users})))
+    }
 }
 
 /// `command_ack` / `command_reject` of a lease-free command.

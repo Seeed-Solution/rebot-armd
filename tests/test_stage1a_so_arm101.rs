@@ -204,6 +204,7 @@ fn test_6_plus_0_vs_5_plus_1_cross_load_rejections() {
 
     // 1) Pose cross-load rejection
     let pose_51 = NamedPose {
+        id: String::new(),
         name: "test_51".into(),
         positions: vec![0.0; 6],
         tcp: None,
@@ -318,6 +319,7 @@ fn test_profile_id_pose_and_replay_rejection() {
 
     // 1) Pose with profile_id = "so_arm100" tested against active profile "so_arm101"
     let pose_100 = NamedPose {
+        id: String::new(),
         name: "pose_100".into(),
         positions: vec![0.0; 6],
         tcp: None,
@@ -408,6 +410,7 @@ fn test_legacy_metadata_guard_5dof_vs_6dof_7dof() {
 
     // Non-empty pose missing arm_dof:
     let legacy_pose_6 = NamedPose {
+        id: String::new(),
         name: "legacy".into(),
         positions: vec![0.0; 6],
         tcp: None,
@@ -446,6 +449,7 @@ fn test_legacy_metadata_guard_5dof_vs_6dof_7dof() {
 
     // 3) 7-DOF accepts metadata-less legacy pose (dof=7)
     let legacy_pose_7 = NamedPose {
+        id: String::new(),
         name: "legacy7".into(),
         positions: vec![0.0; 7],
         ..Default::default()
