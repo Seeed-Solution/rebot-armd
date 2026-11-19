@@ -228,13 +228,13 @@ async fn geometry_coverage_reports_configured_unconfigured_and_camera_mount() {
     let dm = describe(&ArmSupervisor::new(ArmConfig::rebot_dm())).await;
     assert_eq!(dm["limits"]["kinematics_configured"], true);
     assert_eq!(dm["limits"]["workspace_configured"], true);
-    assert_eq!(dm["limits"]["geometry_coverage"], "end_only");
+    assert_eq!(dm["limits"]["geometry_coverage"], "end_and_links");
     assert_eq!(dm["limits"]["camera_mount_covered"], false);
     let ws = &dm["limits"]["workspace"];
     assert!(ws.is_object());
     assert_eq!(ws["kinematics_configured"], true);
     assert_eq!(ws["workspace_configured"], true);
-    assert_eq!(ws["geometry_coverage"], "end_only");
+    assert_eq!(ws["geometry_coverage"], "end_and_links");
     assert_eq!(ws["camera_mount_covered"], false);
     assert!(ws["floor_z_m"].is_f64());
     assert!(ws["box_min_m"].is_array());
@@ -242,20 +242,19 @@ async fn geometry_coverage_reports_configured_unconfigured_and_camera_mount() {
     assert!(ws["max_reach_m"].is_f64());
     assert!(ws["check_points_end_m"].is_array());
 
+    let mut end_only_cfg = ArmConfig::rebot_dm();
+    end_only_cfg.workspace.as_mut().unwrap().link_capsules.clear();
+    let d_end_only = describe(&ArmSupervisor::new(end_only_cfg)).await;
+    assert_eq!(d_end_only["limits"]["geometry_coverage"], "end_only");
+    assert_eq!(d_end_only["limits"]["workspace"]["geometry_coverage"], "end_only");
+
     let mut with_cam = ArmConfig::rebot_dm();
     with_cam.camera_mount.offset_m = Some([-0.07, 0.0, 0.06]);
     let d_cam = describe(&ArmSupervisor::new(with_cam)).await;
     assert_eq!(d_cam["limits"]["camera_mount_covered"], true);
     assert_eq!(d_cam["limits"]["workspace"]["camera_mount_covered"], true);
 
-    let mut with_caps = ArmConfig::rebot_dm();
-    with_caps.workspace.as_mut().unwrap().link_capsules.push(armd::model::LinkCapsule {
-        id: "upper".into(),
-        frame: "upper_arm".into(),
-        a_m: [0.0, 0.0, 0.0],
-        b_m: [-0.26, 0.0, 0.0],
-        radius_m: 0.03,
-    });
+    let with_caps = ArmConfig::rebot_dm();
     let d_caps = describe(&ArmSupervisor::new(with_caps)).await;
     assert_eq!(d_caps["limits"]["geometry_coverage"], "end_and_links");
     assert_eq!(d_caps["limits"]["workspace"]["geometry_coverage"], "end_and_links");

@@ -430,13 +430,13 @@ fn stream_braking_crossing_outer_boundary_is_caught_and_held() {
 fn link_capsules_reject_upper_arm_intrusion_and_validate_frames() {
     // 6. link_capsules[]: end_effector safe while upper_arm capsule enters keepout box
     let mut cfg = ArmConfig::rebot_dm();
-    cfg.workspace.as_mut().unwrap().link_capsules.push(armd::model::LinkCapsule {
+    cfg.workspace.as_mut().unwrap().link_capsules = vec![armd::model::LinkCapsule {
         id: "upper_arm".into(),
         frame: "upper_arm".into(),
         a_m: [0.0, 0.0, 0.0],
         b_m: [-0.264, 0.0, 0.0],
         radius_m: 0.035,
-    });
+    }];
     cfg.validate().unwrap();
 
     // Unknown frame fails validation
@@ -601,4 +601,586 @@ async fn wire_contract_attaches_structured_fields_to_ws_rejects_and_action_statu
         assert!(ok_json.get("constraint_id").is_none());
         assert!(ok_json.get("violation_phase").is_none());
     }
+}
+
+#[test]
+fn servo_stream_persists_monotonic_escape_baseline_across_tiny_steps() {
+    // BLOCKER-2: multiple consecutive tiny servo steps (< WORKSPACE_EPS each) from an
+    // already-violating pose must NOT accumulate WORKSPACE_EPS across ticks.
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.servo_max_velocity = None;
+    for l in &mut cfg.limits {
+        l.max_velocity = 25.0;
+        l.max_acceleration = 1500.0;
+    }
+    let mut q_start = INSPECT;
+    q_start[6] = -0.5;
+    let p_start = ArmModel::REBOT_DEV_ARM.fk_f32(&q_start).unwrap();
+    let start_min_z = cfg
+        .workspace
+        .as_ref()
+        .unwrap()
+        .check_points_end_m
+        .iter()
+        .map(|c| p_start.transform_point(&c.map(f64::from))[2])
+        .fold(p_start.p[2], f64::min);
+    // Start 1 cm below floor_z (start_depth = 0.01 m)
+    let floor_z = start_min_z + 0.01;
+    cfg.workspace.as_mut().unwrap().floor_z_m = floor_z as f32;
+
+    // Find direction on J2 that lowers min_z monotonically.
+    let check_pts = cfg.workspace.as_ref().unwrap().check_points_end_m.clone();
+    let min_z_at = |q: &[f32]| -> f64 {
+        let p = ArmModel::REBOT_DEV_ARM.fk_f32(q).unwrap();
+        check_pts
+            .iter()
+            .map(|c| p.transform_point(&c.map(f64::from))[2])
+            .fold(p.p[2], f64::min)
+    };
+    let mut q_probe = q_start;
+    q_probe[1] += 0.002;
+    let sign = if min_z_at(&q_probe) < start_min_z { 1.0f32 } else { -1.0f32 };
+    // Calibrate a tiny J2 increment yielding ~0.4 * WORKSPACE_EPS (0.04 mm) deeper intrusion per step.
+    let dz_per_mrad = (start_min_z - {
+        let mut q = q_start;
+        q[1] += 0.001 * sign;
+        min_z_at(&q)
+    }) / 0.001;
+    assert!(dz_per_mrad > 0.01, "expected J2 motion to change min_z: {dz_per_mrad}");
+    let dq_step = ((0.4 * kinematics::WORKSPACE_EPS) / dz_per_mrad) as f32 * sign;
+
+    let mut inner = armed(cfg, &q_start);
+    let epoch = inner.safety.epoch_id();
+    let start_depth = floor_z - min_z_at(&inner.commanded_positions);
+
+    let mut held = false;
+    for k in 1..=10 {
+        let mut q_next = q_start;
+        q_next[1] += (k as f32) * dq_step;
+        let _ = inner.servo(q_next.to_vec(), epoch);
+        inner.tick(0.02);
+        let depth_now = floor_z - min_z_at(&inner.commanded_positions);
+        assert!(
+            depth_now <= start_depth + kinematics::WORKSPACE_EPS + 1e-6,
+            "step {k}: cumulative intrusion {depth_now} exceeded start_depth ({start_depth}) + WORKSPACE_EPS"
+        );
+        if inner.servo_blocked_hold {
+            held = true;
+            break;
+        }
+    }
+    assert!(held, "later tiny servo steps must be rejected and enter workspace hold");
+    assert_eq!(
+        inner.motion_limit.as_ref().map(|l| l.reason),
+        Some(armd::model::MotionLimitReason::Workspace)
+    );
+}
+
+#[test]
+fn so101_urdf_rejects_link_capsule_on_moving_jaw_and_accepts_fixed_gripper_link() {
+    // MAJOR-1: moving_jaw_so101_v1_link is behind unmodeled revolute joint "gripper".
+    let mut cfg: ArmConfig = serde_json::from_str(include_str!("../profiles/so_arm101.json")).unwrap();
+    cfg.init_arm_model_in_memory(Some(include_str!("../assets/so101_new_calib.urdf"))).unwrap();
+
+    // Static link on the chain (gripper_link) is valid
+    let mut good_cfg = cfg.clone();
+    good_cfg.workspace.get_or_insert_with(WorkspacePolicy::rebot_dm).link_capsules.push(
+        armd::model::LinkCapsule {
+            id: "gripper_body".into(),
+            frame: "gripper_link".into(),
+            a_m: [0.0, 0.0, 0.0],
+            b_m: [0.0, 0.0, 0.05],
+            radius_m: 0.02,
+        },
+    );
+    good_cfg.validate().unwrap();
+
+    // Link across unmodeled revolute joint "gripper" must be rejected
+    let mut bad_cfg = cfg;
+    bad_cfg.workspace.get_or_insert_with(WorkspacePolicy::rebot_dm).link_capsules.push(
+        armd::model::LinkCapsule {
+            id: "moving_jaw".into(),
+            frame: "moving_jaw_so101_v1_link".into(),
+            a_m: [0.0, 0.0, 0.0],
+            b_m: [0.0, -0.04, 0.0],
+            radius_m: 0.015,
+        },
+    );
+    let err = bad_cfg.validate().unwrap_err();
+    assert!(err.contains("moving_jaw_so101_v1_link"), "unexpected error: {err}");
+}
+
+#[test]
+fn tiny_displacement_below_eps_near_tight_boundary_catches_midpoint_dip() {
+    // MAJOR-2: even when l_g < WORKSPACE_EPS, a step near a tight boundary whose midpoint dips
+    // beyond allowed must still split and reject instead of being skipped.
+    let mut cfg = ArmConfig::rebot_dm();
+    cfg.workspace.as_mut().unwrap().check_points_end_m = vec![[0.0, 0.0, 0.0]];
+    cfg.workspace.as_mut().unwrap().floor_z_m = 0.0;
+
+    // Scan J4 over [0, 2*PI] for a true interior local minimum of end_link z, then tune J2 so
+    // that local minimum sits just 2e-9 m below -WORKSPACE_EPS (exact floor_z_m = 0.0).
+    let z_of = |q: &[f32; 7]| ArmModel::REBOT_DEV_ARM.fk_f32(q).unwrap().p[2];
+    let find_min_j4 = |j2: f32| -> (f32, f64) {
+        let mut q = [0.0f32, j2, -0.8, 0.0, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
+        let mut best_j4 = 0.0f32;
+        let mut best_z = f64::INFINITY;
+        for k in 0..628 {
+            let j4 = k as f32 * 0.01;
+            q[3] = j4;
+            let z = z_of(&q);
+            if z < best_z {
+                best_z = z;
+                best_j4 = j4;
+            }
+        }
+        // Refine around best_j4
+        let mut lo = best_j4 - 0.02;
+        let mut hi = best_j4 + 0.02;
+        for _ in 0..40 {
+            let m1 = lo + (hi - lo) / 3.0;
+            let m2 = hi - (hi - lo) / 3.0;
+            q[3] = m1;
+            let z1 = z_of(&q);
+            q[3] = m2;
+            let z2 = z_of(&q);
+            if z1 < z2 { hi = m2; } else { lo = m1; }
+        }
+        let j4 = 0.5 * (lo + hi);
+        q[3] = j4;
+        (j4, z_of(&q))
+    };
+
+    // Binary search J2 in [-2.5, -0.5] so min_z(J2) == -WORKSPACE_EPS - 2e-9
+    let target_z = -kinematics::WORKSPACE_EPS - 2e-9;
+    let mut j2_lo = -2.5f32;
+    let mut j2_hi = -0.5f32;
+    for _ in 0..40 {
+        let j2_mid = 0.5 * (j2_lo + j2_hi);
+        let (_, z) = find_min_j4(j2_mid);
+        if z < target_z { j2_lo = j2_mid; } else { j2_hi = j2_mid; }
+    }
+    let j2 = 0.5 * (j2_lo + j2_hi);
+    let (best_j4, _) = find_min_j4(j2);
+    let q_base = [0.0f32, j2, -0.8, best_j4, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
+
+    let eval_probe = armd::chain::WorkspaceEvaluator::new(
+        &ArmModel::REBOT_DEV_ARM,
+        cfg.workspace.as_ref().unwrap(),
+        &cfg.camera_mount,
+    );
+    let reach4 = eval_probe.end_reach[3];
+    let dq = ((0.40 * kinematics::WORKSPACE_EPS) / reach4) as f32;
+    let mut q_a = q_base;
+    let mut q_b = q_base;
+    q_a[3] -= dq;
+    q_b[3] += dq;
+    let q_m: Vec<f32> = q_a.iter().zip(&q_b).map(|(a, b)| 0.5 * (a + b)).collect();
+    let (za, zb, zm) = (z_of(&q_a), z_of(&q_b), ArmModel::REBOT_DEV_ARM.fk_f32(&q_m).unwrap().p[2]);
+
+    let tr = [0.0, 0.0, 0.0, f64::from((q_b[3] - q_a[3]).abs()), 0.0, 0.0];
+    let l_g = eval_probe.geom_bound(0, &tr, 6);
+    assert!(l_g > 0.0 && l_g < kinematics::WORKSPACE_EPS, "need 0 < l_g < WORKSPACE_EPS, got {l_g}");
+    assert!(zm < za.min(zb), "expected midpoint dip in z: za={za}, zm={zm}, zb={zb}");
+
+    let mid_bound = 0.5 * (za.min(zb) + zm) + kinematics::WORKSPACE_EPS;
+    cfg.workspace.as_mut().unwrap().floor_z_m = mid_bound as f32;
+    let ws = cfg.workspace.as_ref().unwrap();
+    let eval = armd::chain::WorkspaceEvaluator::new(&ArmModel::REBOT_DEV_ARM, ws, &cfg.camera_mount);
+    let mut c_a = eval.alloc_buf();
+    let mut c_b = eval.alloc_buf();
+    let mut c_m = eval.alloc_buf();
+    eval.eval_into(&q_a, &mut c_a, "plan").unwrap();
+    eval.eval_into(&q_b, &mut c_b, "plan").unwrap();
+    eval.eval_into(&q_m, &mut c_m, "plan").unwrap();
+    let min_d = eval.init_min_depths(&c_a);
+    assert!(eval.check_readonly(&c_a, &min_d, "plan").is_ok(), "start endpoint should pass");
+    assert!(eval.check_readonly(&c_b, &min_d, "plan").is_ok(), "end endpoint should pass: za={za}, zm={zm}, zb={zb}");
+    assert!(eval.check_readonly(&c_m, &min_d, "sweep").is_err(), "midpoint must exceed allowed: za={za}, zm={zm}, zb={zb}");
+
+    let mut min_d_sweep = min_d;
+    let mut budget = 64;
+    let err = eval
+        .sweep_linear_step(&q_a, &q_b, &c_a, &mut min_d_sweep, &mut budget, 64, "plan", "sweep")
+        .unwrap_err()
+        .1;
+    assert_eq!(err.detail.constraint_id.as_deref(), Some("floor_z"), "{err:?}");
+    assert_eq!(err.detail.violation_phase.as_deref(), Some("sweep"), "{err:?}");
+}
+
+fn pt_seg_dist(p: [f64; 3], a: [f32; 3], b: [f32; 3]) -> f64 {
+    let ab = [f64::from(b[0] - a[0]), f64::from(b[1] - a[1]), f64::from(b[2] - a[2])];
+    let ap = [p[0] - f64::from(a[0]), p[1] - f64::from(a[1]), p[2] - f64::from(a[2])];
+    let den = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+    let t = if den == 0.0 {
+        0.0
+    } else {
+        ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / den).clamp(0.0, 1.0)
+    };
+    let dx = ap[0] - t * ab[0];
+    let dy = ap[1] - t * ab[1];
+    let dz = ap[2] - t * ab[2];
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn assert_eval_clear(arm: &ArmModel, ws: &WorkspacePolicy, cam: &armd::model::CameraMount, q: &[f32], label: &str) {
+    let eval = armd::chain::WorkspaceEvaluator::new(arm, ws, cam);
+    let mut buf = eval.alloc_buf();
+    eval.eval_into(q, &mut buf, "test")
+        .unwrap_or_else(|e| panic!("{label}: unexpected workspace/capsule error: {e:?}"));
+    for (slot, &clr) in buf.as_slice().iter().enumerate() {
+        assert!(
+            clr.is_finite() && clr >= 0.0,
+            "{label}: workspace/capsule clearance violation at slot {slot}: {clr} ({:?})",
+            eval.describe_failure(slot, clr, -clr, 0.0, "test")
+        );
+    }
+}
+
+#[test]
+fn b601dm_builtin_and_kit_profile_link_capsules_positive_and_negative() {
+    let builtin = ArmConfig::rebot_dm();
+    let kit: ArmConfig = serde_json::from_str(include_str!(
+        "../kits/recamera-b601dm/profile/rebot-b601dm.json"
+    ))
+    .unwrap();
+    assert_eq!(builtin.profile_id.as_deref(), Some("rebot_b601dm"));
+    assert_eq!(kit.profile_id.as_deref(), Some("rebot_b601dm"));
+    assert_eq!(
+        builtin.workspace.as_ref().unwrap().link_capsules,
+        kit.workspace.as_ref().unwrap().link_capsules
+    );
+    let capsules = &builtin.workspace.as_ref().unwrap().link_capsules;
+    assert!(capsules.len() >= 4);
+
+    // Enclosure verification against sim/mujoco/models/rebot_b601dm_scene.xml collision boxes
+    let dm_boxes: &[(&str, [f64; 3], [f64; 3])] = &[
+        ("link2", [-0.132, 0.0, -0.0316], [0.1605, 0.0285, 0.0337]),
+        ("link3", [0.1222, -0.03, -0.0311], [0.1489, 0.0525, 0.0401]),
+        ("link4", [0.0449, -0.03, -0.03], [0.0729, 0.058, 0.0334]),
+        ("link5", [-0.0028, 0.0, 0.0355], [0.035, 0.0385, 0.0425]),
+    ];
+    for (id, c, half) in dm_boxes {
+        let cap = capsules.iter().find(|k| k.id == *id).unwrap_or_else(|| panic!("missing capsule {id}"));
+        for sx in [-1.0, 1.0] {
+            for sy in [-1.0, 1.0] {
+                for sz in [-1.0, 1.0] {
+                    let corner = [c[0] + sx * half[0], c[1] + sy * half[1], c[2] + sz * half[2]];
+                    let d = pt_seg_dist(corner, cap.a_m, cap.b_m);
+                    assert!(
+                        d <= f64::from(cap.radius_m),
+                        "B601-DM capsule '{id}' misses box corner {corner:?}: dist={d:.5}m > r={:.5}m",
+                        cap.radius_m
+                    );
+                }
+            }
+        }
+    }
+
+    // safety_describe reports end_and_links
+    let desc = SupervisorInner::new(kit.clone()).safety_describe();
+    assert_eq!(desc["limits"]["geometry_coverage"], "end_and_links");
+
+    // Positive 1: full workspace/capsule check on home, park (resting_positions == home), INSPECT, and home <-> inspect motions
+    let (ws, cam) = (kit.workspace.as_ref().unwrap(), &kit.camera_mount);
+    assert_eval_clear(&ArmModel::REBOT_DEV_ARM, ws, cam, &kit.home_positions, "B601-DM home");
+    assert_eval_clear(&ArmModel::REBOT_DEV_ARM, ws, cam, kit.resting_positions(), "B601-DM park");
+    assert_eval_clear(&ArmModel::REBOT_DEV_ARM, ws, cam, &INSPECT, "B601-DM INSPECT");
+
+    let mut inner = armed(kit.clone(), &INSPECT);
+    let park_id = inner.unload_action().expect("park from INSPECT succeeds");
+    assert!(park_id.is_some());
+
+    let mut inner = armed(kit.clone(), &HOME);
+    inner.jog(INSPECT.to_vec(), None, None).expect("HOME -> INSPECT jog passes");
+
+    // Positive 2: typical grasp approach -> descend -> lift -> retreat Cartesian moves pass without proximal capsule false trigger
+    let mut inner = armed(kit.clone(), &INSPECT);
+    let r_down = armd::grasp::look_down(&kinematics::IDENTITY);
+    let waypoints = [
+        [0.32, 0.0, 0.14], // approach
+        [0.32, 0.0, 0.05], // descend to grasp height
+        [0.32, 0.0, 0.16], // lift / retreat
+    ];
+    for wp in waypoints {
+        let input = inner.plan_input().unwrap();
+        let goal = armd::kinematics::Pose::new(r_down, wp);
+        let path = armd::motion::plan_cartesian_ex(&input, goal, armd::motion::Speed::default(), false)
+            .unwrap_or_else(|e| panic!("B601-DM grasp waypoint {wp:?} failed: {e:?}"));
+        let q_end = path.last_slice().to_vec();
+        inner.install_path(&input, path, "move_to", None).expect("install_path succeeds");
+        inner.stop_motion();
+        inner.commanded_positions = q_end.clone();
+        inner.measured_positions = q_end;
+    }
+
+    // Negative 1: link3 mid-segment hits a fixture keepout box while end_link remains clear
+    let q_l3_target: [f32; 7] = [0.0, -0.4, -0.8, 0.8, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
+    let f_l3_target = ArmModel::REBOT_DEV_ARM.frames_f32(&q_l3_target).unwrap();
+    let l3_pose = ArmModel::REBOT_DEV_ARM.resolve_frame("link3").unwrap().pose(&f_l3_target);
+    let l3_mid_target = l3_pose.transform_point(&[0.121, -0.030, -0.0311]);
+    let end_dist = kinematics::norm(&kinematics::sub(&l3_mid_target, &f_l3_target.end.p));
+    assert!(end_dist > 0.12, "end_link must be far from link3 mid-segment box (dist={end_dist})");
+    let mut cfg_mid_keepout = kit.clone();
+    cfg_mid_keepout.workspace.as_mut().unwrap().keepout_boxes.push(armd::model::KeepoutBox {
+        name: "table_fixture".into(),
+        min_m: l3_mid_target.map(|v| (v - 0.015) as f32),
+        max_m: l3_mid_target.map(|v| (v + 0.015) as f32),
+    });
+    let mut q_side = q_l3_target;
+    q_side[0] = -1.2;
+    assert_eval_clear(
+        &ArmModel::REBOT_DEV_ARM,
+        cfg_mid_keepout.workspace.as_ref().unwrap(),
+        &cfg_mid_keepout.camera_mount,
+        &q_side,
+        "B601-DM side start",
+    );
+    let mut inner = armed(cfg_mid_keepout, &q_side);
+    let err = inner.jog(q_l3_target.to_vec(), None, None).unwrap_err();
+    let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
+        panic!("expected WorkspaceViolation on link3 keepout hit, got {err:?}");
+    };
+    assert_eq!(detail.constraint_id.as_deref(), Some("keepout:table_fixture"), "{detail:?}");
+    assert_eq!(detail.geometry_id.as_deref(), Some("capsule:link3"), "{detail:?}");
+
+    // Negative 2: swept path across a keepout box hits link3 capsule at midpoint while BOTH endpoints & all capsules clear
+    let mut q_left = q_l3_target;
+    q_left[0] = -1.2;
+    let mut q_right = q_l3_target;
+    q_right[0] = 1.2;
+    let q_mid: Vec<f32> = q_left.iter().zip(&q_right).map(|(a, b)| 0.5 * (a + b)).collect();
+    let f_mid = ArmModel::REBOT_DEV_ARM.frames_f32(&q_mid).unwrap();
+    let link3_pose = ArmModel::REBOT_DEV_ARM.resolve_frame("link3").unwrap().pose(&f_mid);
+    let l3_mid = link3_pose.transform_point(&[0.121, -0.030, -0.0311]);
+    // Confirm end_link is far from this mid-link keepout box across endpoints and midpoint
+    for q in [&q_left[..], &q_mid[..], &q_right[..]] {
+        let p_end = ArmModel::REBOT_DEV_ARM.fk_f32(q).unwrap().p;
+        assert!(kinematics::norm(&kinematics::sub(&l3_mid, &p_end)) > 0.10, "end_link must stay clear of mid-link box");
+    }
+    let mut cfg_sweep = kit;
+    cfg_sweep.workspace.as_mut().unwrap().keepout_boxes.push(armd::model::KeepoutBox {
+        name: "swept_link3_obstacle".into(),
+        min_m: l3_mid.map(|v| (v - 0.015) as f32),
+        max_m: l3_mid.map(|v| (v + 0.015) as f32),
+    });
+    assert_eval_clear(
+        &ArmModel::REBOT_DEV_ARM,
+        cfg_sweep.workspace.as_ref().unwrap(),
+        &cfg_sweep.camera_mount,
+        &q_left,
+        "B601-DM sweep start",
+    );
+    assert_eval_clear(
+        &ArmModel::REBOT_DEV_ARM,
+        cfg_sweep.workspace.as_ref().unwrap(),
+        &cfg_sweep.camera_mount,
+        &q_right,
+        "B601-DM sweep end",
+    );
+    let mut inner = armed(cfg_sweep, &q_left);
+    let err = inner.jog(q_right.to_vec(), None, None).unwrap_err();
+    let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
+        panic!("expected WorkspaceViolation on link sweep, got {err:?}");
+    };
+    assert_eq!(detail.geometry_id.as_deref(), Some("capsule:link3"), "{detail:?}");
+    assert_eq!(detail.constraint_id.as_deref(), Some("keepout:swept_link3_obstacle"), "{detail:?}");
+    assert_eq!(detail.violation_phase.as_deref(), Some("sweep"), "{detail:?}");
+}
+
+#[test]
+fn so101_profile_link_capsules_positive_and_negative() {
+    let mut config = ArmConfig::from_profile_file("profiles/so_arm101.json").expect("so_arm101.json loads");
+    config.validate().expect("so_arm101.json validates");
+    assert_eq!(config.profile_id.as_deref(), Some("so_arm101"));
+    let capsules = &config.workspace.as_ref().unwrap().link_capsules;
+    assert_eq!(capsules.len(), 4);
+
+    // Enclosure verification against actual transformed URDF collision STL meshes in assets/so101/*.stl
+    let urdf_text = include_str!("../assets/so101_new_calib.urdf");
+    let link_meshes: &[(&str, &[(&str, [f64; 3], [f64; 3])])] = &[
+        (
+            "upper_arm_link",
+            &[
+                ("so101/sts3215_03a_v1.stl", [-0.11257, -0.0155, 0.0187], [-3.14159, 0.0, -1.5708]),
+                ("so101/upper_arm_so101_v1.stl", [-0.065085, 0.012, 0.0182], [3.14159, 0.0, 0.0]),
+            ],
+        ),
+        (
+            "lower_arm_link",
+            &[
+                ("so101/under_arm_so101_v1.stl", [-0.0648499, -0.032, 0.0182], [3.14159, 0.0, 0.0]),
+                ("so101/motor_holder_so101_wrist_v1.stl", [-0.0648499, -0.032, 0.018], [-3.14159, 0.0, 0.0]),
+                ("so101/sts3215_03a_v1.stl", [-0.1224, 0.0052, 0.0187], [-3.14159, 0.0, -3.14159]),
+            ],
+        ),
+        (
+            "wrist_link",
+            &[
+                ("so101/sts3215_03a_no_horn_v1.stl", [0.0, -0.0424, 0.0306], [1.5708, 1.5708, 0.0]),
+                ("so101/wrist_roll_pitch_so101_v2.stl", [0.0, -0.028, 0.0181], [-1.5708, -1.5708, 0.0]),
+            ],
+        ),
+        (
+            "gripper_link",
+            &[
+                ("so101/sts3215_03a_v1.stl", [0.0077, 0.0001, -0.0234], [-1.5708, 0.0, 0.0]),
+                ("so101/wrist_roll_follower_so101_v1.stl", [0.0, -0.000218214, 0.000949706], [-3.14159, 0.0, 0.0]),
+            ],
+        ),
+    ];
+    let assets_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    for (link_name, meshes) in link_meshes {
+        assert!(urdf_text.contains(link_name));
+        let cap = capsules.iter().find(|c| c.id == *link_name).unwrap_or_else(|| panic!("missing capsule {link_name}"));
+        for (rel, xyz, rpy) in *meshes {
+            let bytes = std::fs::read(assets_dir.join(rel)).unwrap();
+            let tri_count = u32::from_le_bytes(bytes[80..84].try_into().unwrap()) as usize;
+            let r = kinematics::rpy_to_r(rpy[0], rpy[1], rpy[2]);
+            let mut max_d = 0.0f64;
+            for i in 0..tri_count {
+                let off = 84 + i * 50;
+                for v_off in [12usize, 24, 36] {
+                    let vx = f64::from(f32::from_le_bytes(bytes[off + v_off..off + v_off + 4].try_into().unwrap()));
+                    let vy = f64::from(f32::from_le_bytes(bytes[off + v_off + 4..off + v_off + 8].try_into().unwrap()));
+                    let vz = f64::from(f32::from_le_bytes(bytes[off + v_off + 8..off + v_off + 12].try_into().unwrap()));
+                    let rp = kinematics::mat_vec(&r, &[vx, vy, vz]);
+                    let p = [xyz[0] + rp[0], xyz[1] + rp[1], xyz[2] + rp[2]];
+                    max_d = max_d.max(pt_seg_dist(p, cap.a_m, cap.b_m));
+                }
+            }
+            assert!(
+                max_d <= f64::from(cap.radius_m),
+                "SO-101 capsule '{link_name}' misses mesh {rel}: max_dist={max_d:.5}m > r={:.5}m",
+                cap.radius_m
+            );
+        }
+    }
+
+    // Uncalibrated B601-RS profile remains end_only (explicitly untouched)
+    let mut rs = ArmConfig::from_profile_file("profiles/rebot_b601_rs.json").expect("b601_rs loads");
+    rs.validate().expect("b601_rs validates");
+    let rs_desc = SupervisorInner::new(rs).safety_describe();
+    assert_eq!(rs_desc["limits"]["geometry_coverage"], "end_only");
+
+    // SO-ARM101 safety_describe reports end_and_links
+    let desc = SupervisorInner::new(config.clone()).safety_describe();
+    assert_eq!(desc["limits"]["geometry_coverage"], "end_and_links");
+
+    // Positive 1: full workspace/capsule check on home & park, plus home -> park and park -> home transitions
+    let q_home = config.home_positions.clone();
+    let q_park = config.resting_positions().to_vec();
+    assert_eval_clear(
+        &config.arm_model,
+        config.workspace.as_ref().unwrap(),
+        &config.camera_mount,
+        &q_home,
+        "SO-101 home",
+    );
+    assert_eval_clear(
+        &config.arm_model,
+        config.workspace.as_ref().unwrap(),
+        &config.camera_mount,
+        &q_park,
+        "SO-101 park",
+    );
+    let mut inner = armed(config.clone(), &q_home);
+    assert!(inner.unload_action().expect("home -> park passes").is_some());
+    let mut inner = armed(config.clone(), &q_park);
+    inner.jog(q_home.clone(), None, None).expect("park -> home passes");
+
+    // Positive 2: start from actual home pose -> jog to approach -> descend -> lift -> retreat
+    let setup = config.grasp.as_ref().unwrap().clone();
+    let r_down = armd::grasp::look_down(&kinematics::IDENTITY);
+    let approach = armd::kinematics::Pose::new(r_down, [0.22, 0.0, setup.table_z_m + setup.approach_height_m]);
+    let lo = std::array::from_fn(|i| f64::from(config.limits[i].min_position));
+    let hi = std::array::from_fn(|i| f64::from(config.limits[i].max_position));
+    let q_home6: [f64; 6] = std::array::from_fn(|i| f64::from(q_home[i]));
+    let sol = config.arm_model.solve_dls_ex(&approach, &q_home6, &lo, &hi, kinematics::PAR.w, true);
+    assert!(sol.ok, "approach IK succeeds");
+    let q_app: Vec<f32> = sol.q.iter().map(|v| *v as f32).collect();
+    let mut inner = armed(config.clone(), &q_home);
+    inner.jog(q_app.clone(), None, None).expect("SO-101 home -> approach passes");
+    inner.stop_motion();
+    inner.commanded_positions = q_app.clone();
+    inner.measured_positions = q_app;
+    for z in [setup.table_z_m + setup.grasp_height_m, setup.table_z_m + setup.lift_height_m, setup.table_z_m + setup.approach_height_m] {
+        let input = inner.plan_input().unwrap();
+        let goal = armd::kinematics::Pose::new(r_down, [0.22, 0.0, z]);
+        let path = armd::motion::plan_cartesian_ex(&input, goal, armd::motion::Speed::default(), true)
+            .unwrap_or_else(|e| panic!("SO-101 grasp z={z} failed: {e:?}"));
+        let q_end = path.last_slice().to_vec();
+        inner.install_path(&input, path, "move_to", None).expect("SO-101 install_path succeeds");
+        inner.stop_motion();
+        inner.commanded_positions = q_end.clone();
+        inner.measured_positions = q_end;
+    }
+
+    // Negative 1: mid-segment link capsule hits a tabletop fixture keepout box while TCP check_points stay clear
+    let mut q_low = q_home.clone();
+    q_low[1] = 0.7;
+    q_low[2] = -0.3;
+    q_low[3] = -0.9;
+    let f_low = config.arm_model.frames_f32(&q_low).unwrap();
+    let lower_pose = config.arm_model.resolve_frame("lower_arm_link").unwrap().pose(&f_low);
+    let lower_mid_pt = lower_pose.transform_point(&[-0.067, 0.0026, 0.018]);
+    assert!(
+        kinematics::norm(&kinematics::sub(&lower_mid_pt, &f_low.end.p)) > 0.08,
+        "end_link must stay clear of lower_arm_link mid-segment obstacle"
+    );
+    let mut cfg_mid_box = config.clone();
+    cfg_mid_box.workspace.as_mut().unwrap().keepout_boxes.push(armd::model::KeepoutBox {
+        name: "so101_table_fixture".into(),
+        min_m: [lower_mid_pt[0] as f32 - 0.012, lower_mid_pt[1] as f32 - 0.012, 0.0],
+        max_m: [lower_mid_pt[0] as f32 + 0.012, lower_mid_pt[1] as f32 + 0.012, lower_mid_pt[2] as f32 + 0.012],
+    });
+    let mut inner = armed(cfg_mid_box, &q_home);
+    let err = inner.jog(q_low, None, None).unwrap_err();
+    let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
+        panic!("expected WorkspaceViolation on SO-101 link keepout hit, got {err:?}");
+    };
+    assert_eq!(detail.constraint_id.as_deref(), Some("keepout:so101_table_fixture"), "{detail:?}");
+    assert_eq!(detail.geometry_id.as_deref(), Some("capsule:lower_arm_link"), "{detail:?}");
+
+    // Negative 2: swept path crosses a keepout box with lower_arm_link capsule while BOTH endpoints & all capsules clear
+    let mut q_left = q_home.clone();
+    q_left[0] = -0.7;
+    let mut q_right = q_home.clone();
+    q_right[0] = 0.7;
+    let q_mid: Vec<f32> = q_left.iter().zip(&q_right).map(|(a, b)| 0.5 * (a + b)).collect();
+    let f_mid = config.arm_model.frames_f32(&q_mid).unwrap();
+    let lower_pose = config.arm_model.resolve_frame("lower_arm_link").unwrap().pose(&f_mid);
+    let lower_mid = lower_pose.transform_point(&[-0.065, 0.0035, 0.020]);
+    for q in [&q_left[..], &q_mid[..], &q_right[..]] {
+        let p_end = config.arm_model.fk_f32(q).unwrap().p;
+        assert!(kinematics::norm(&kinematics::sub(&lower_mid, &p_end)) > 0.08, "end_link must clear obstacle");
+    }
+    let mut cfg_sweep = config;
+    cfg_sweep.workspace.as_mut().unwrap().keepout_boxes.push(armd::model::KeepoutBox {
+        name: "so101_mid_link_wall".into(),
+        min_m: lower_mid.map(|v| (v - 0.012) as f32),
+        max_m: lower_mid.map(|v| (v + 0.012) as f32),
+    });
+    assert_eval_clear(
+        &cfg_sweep.arm_model,
+        cfg_sweep.workspace.as_ref().unwrap(),
+        &cfg_sweep.camera_mount,
+        &q_left,
+        "SO-101 sweep start",
+    );
+    assert_eval_clear(
+        &cfg_sweep.arm_model,
+        cfg_sweep.workspace.as_ref().unwrap(),
+        &cfg_sweep.camera_mount,
+        &q_right,
+        "SO-101 sweep end",
+    );
+    let mut inner = armed(cfg_sweep, &q_left);
+    let err = inner.jog(q_right, None, None).unwrap_err();
+    let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
+        panic!("expected WorkspaceViolation on SO-101 link sweep, got {err:?}");
+    };
+    assert_eq!(detail.geometry_id.as_deref(), Some("capsule:lower_arm_link"), "{detail:?}");
+    assert_eq!(detail.constraint_id.as_deref(), Some("keepout:so101_mid_link_wall"), "{detail:?}");
+    assert_eq!(detail.violation_phase.as_deref(), Some("sweep"), "{detail:?}");
 }

@@ -252,7 +252,41 @@ impl WorkspacePolicy {
             max_reach_m: Some(0.52),
             check_points_end_m: corners,
             keepout_boxes: Vec::new(),
-            link_capsules: Vec::new(),
+            // Link capsules enclosing sim/mujoco/models/rebot_b601dm_scene.xml collision boxes + ~4-5 mm margin:
+            // - link2: box pos [-0.132, 0, -0.0316], size [0.1605, 0.0285, 0.0337] (half-diag 44.1 mm) -> r=0.050
+            // - link3: box pos [0.1222, -0.03, -0.0311], size [0.1489, 0.0525, 0.0401] (half-diag 66.1 mm) -> r=0.071
+            // - link4: box pos [0.0449, -0.03, -0.03], size [0.0729, 0.058, 0.0334] (half-diag 66.9 mm) -> r=0.072
+            // - link5: box pos [-0.0028, 0, 0.0355], size [0.035, 0.0385, 0.0425] (half-diag 52.0 mm) -> r=0.057
+            link_capsules: vec![
+                LinkCapsule {
+                    id: "link2".into(),
+                    frame: "link2".into(),
+                    a_m: [0.020, 0.0, -0.0316],
+                    b_m: [-0.284, 0.0, -0.0316],
+                    radius_m: 0.050,
+                },
+                LinkCapsule {
+                    id: "link3".into(),
+                    frame: "link3".into(),
+                    a_m: [-0.015, -0.030, -0.0311],
+                    b_m: [0.260, -0.030, -0.0311],
+                    radius_m: 0.071,
+                },
+                LinkCapsule {
+                    id: "link4".into(),
+                    frame: "link4".into(),
+                    a_m: [-0.015, -0.030, -0.030],
+                    b_m: [0.105, -0.030, -0.030],
+                    radius_m: 0.072,
+                },
+                LinkCapsule {
+                    id: "link5".into(),
+                    frame: "link5".into(),
+                    a_m: [-0.0028, 0.0, 0.005],
+                    b_m: [-0.0028, 0.0, 0.066],
+                    radius_m: 0.057,
+                },
+            ],
         }
     }
 
@@ -1447,7 +1481,7 @@ impl ArmConfig {
         let home_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0];
 
         Self {
-            profile_id: None,
+            profile_id: Some("rebot_b601dm".to_string()),
             profile_version: ARM_PROFILE_VERSION,
             dof,
             joint_names,

@@ -745,7 +745,7 @@ async fn ws_rig(setup_path: Option<std::path::PathBuf>) -> WsRig {
 
 async fn ws_rig_on(rig: Rig, setup_path: Option<std::path::PathBuf>) -> WsRig {
     let deps = GraspDeps { source: rig.sim.clone(), setup_path };
-    let router = armd::api::create_router_with(rig.sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps);
+    let router = armd::api::create_router_with(rig.sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
@@ -1584,7 +1584,12 @@ async fn height_probe_falls_back_to_a_shorter_raise() {
         let s0 = GraspSetup::default();
         let rig = rig_mounted(s0.clone(), centred_lens(), 0.0, look_down_start(0.0, 0.18), [0.01, 0.01], false).await;
         *rig.sim.top.lock().unwrap() = Some(0.08);
-        rig.sup.inner().write().await.config.workspace.as_mut().unwrap().box_max_m[2] = ceiling as f32;
+        let mut ws = rig.sup.inner().write().await;
+        let ws_mut = ws.config.workspace.as_mut().unwrap();
+        ws_mut.box_max_m[2] = ceiling as f32;
+        // Synthetic ceiling tests end_effector height headroom without tripping on the physical elbow (0.444 m).
+        ws_mut.link_capsules.clear();
+        drop(ws);
         let start_r = start_pose(&rig).await.r;
         let mut s = s0.clone();
         s.grip_pixel_norm = calibrate_grip(&rig, &s0, &start_r);
@@ -1689,8 +1694,12 @@ async fn lateral_probe_falls_back_to_up_when_a_pose_is_unreachable() {
     let (p0, p1) = ([c[0] + 0.012 * dir[0], c[1] + 0.012 * dir[1]], [c[0] + 0.04 * dir[0], c[1] + 0.04 * dir[1]]);
     let lo = [p0[0].min(p1[0]) - 0.008, p0[1].min(p1[1]) - 0.008, z - 0.005].map(|v| v as f32);
     let hi = [p0[0].max(p1[0]) + 0.008, p0[1].max(p1[1]) + 0.008, z + 0.005].map(|v| v as f32);
-    rig.sup.inner().write().await.config.workspace.as_mut().unwrap().keepout_boxes =
-        vec![armd::model::KeepoutBox { name: "probe".into(), min_m: lo, max_m: hi }];
+    let mut inner = rig.sup.inner().write().await;
+    let ws_mut = inner.config.workspace.as_mut().unwrap();
+    ws_mut.keepout_boxes = vec![armd::model::KeepoutBox { name: "probe".into(), min_m: lo, max_m: hi }];
+    // Place obstacle 4 mm off the descent axis to block only the lateral TCP probe without intersecting wrist link5 during descent.
+    ws_mut.link_capsules.clear();
+    drop(inner);
     let (a, _) = run_grasp_close_z(&rig).await;
     println!("lateral unreachable: {} {:?} {:?}, height {:?} ({:?} {:?} {:?})", a.state, a.code, a.message, a.object_height_m, a.height_source, a.height_reason, a.probe_mode);
     assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");

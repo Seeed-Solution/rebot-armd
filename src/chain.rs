@@ -188,13 +188,15 @@ impl KinematicChain {
         let mut mc_sum = vec![[0.0f64; 3]; n + 1];
         // second moments about the segment origin
         let mut j_sum = vec![[[0.0f64; 3]; 3]; n + 1];
-        let mut stack: Vec<(&str, usize, Tf)> = vec![(spec.base_link.as_str(), 0, (IDENTITY, [0.0; 3]))];
+        let mut stack: Vec<(&str, usize, Tf, bool)> = vec![(spec.base_link.as_str(), 0, (IDENTITY, [0.0; 3]), false)];
         let mut link_frames: Vec<(String, usize, Tf)> = Vec::new();
         let mut visited = 0usize;
-        while let Some((link, seg, t)) = stack.pop() {
+        while let Some((link, seg, t, crossed_movable)) = stack.pop() {
             visited += 1;
             if visited > urdf.links.len() { return Err("URDF link graph has a cycle".into()); }
-            link_frames.push((link.to_string(), seg, t));
+            if !crossed_movable {
+                link_frames.push((link.to_string(), seg, t));
+            }
             if let Some(i) = urdf.link(link).and_then(|l| l.inertial.as_ref()) {
                 let c = k::add(&t.1, &k::mat_vec(&t.0, &i.com));
                 m_sum[seg] += i.mass;
@@ -207,8 +209,11 @@ impl KinematicChain {
             }
             for jt in urdf.child_joints(link) {
                 match names.iter().position(|nm| *nm == jt.name) {
-                    Some(idx) => stack.push((&jt.child, idx + 1, (IDENTITY, [0.0; 3]))),
-                    None => stack.push((&jt.child, seg, tf_mul(&t, &origin_tf(jt)))),
+                    Some(idx) => stack.push((&jt.child, idx + 1, (IDENTITY, [0.0; 3]), crossed_movable)),
+                    None => {
+                        let child_crossed = crossed_movable || jt.kind != JointType::Fixed;
+                        stack.push((&jt.child, seg, tf_mul(&t, &origin_tf(jt)), child_crossed));
+                    }
                 }
             }
         }
@@ -1149,6 +1154,7 @@ impl<'a> WorkspaceEvaluator<'a> {
 
     /// Conservative check of whether interval `[0, 1]` with endpoint clearances `c0, c1` and
     /// per-joint travel `tr` can exceed `min_depths` on any slot.
+    /// Returns `Ok(Some((slot, d_max, min_d)))` for the first slot that cannot be proven safe.
     fn interval_needs_split(
         &self,
         c0: &k::SlotBuf,
@@ -1156,7 +1162,7 @@ impl<'a> WorkspaceEvaluator<'a> {
         min_depths: &k::SlotBuf,
         tr: &[f64],
         arm_dof: usize,
-    ) -> Result<bool, WorkspaceFailure> {
+    ) -> Result<Option<(usize, f64, f64)>, WorkspaceFailure> {
         let mut geom_bounds = [0.0f64; 34];
         let mut heap_bounds = Vec::new();
         let bounds: &mut [f64] = if self.num_geoms <= geom_bounds.len() {
@@ -1177,7 +1183,7 @@ impl<'a> WorkspaceEvaluator<'a> {
         let md = min_depths.as_slice();
         for slot in 0..self.total_slots {
             let l_g = bounds[self.slot_geom(slot)];
-            if l_g <= k::WORKSPACE_EPS {
+            if l_g <= 0.0 {
                 continue;
             }
             let min_d = md[slot];
@@ -1188,10 +1194,10 @@ impl<'a> WorkspaceEvaluator<'a> {
             };
             let d_max = 0.5 * (l_g - s0[slot] - s1[slot]);
             if d_max > allowed {
-                return Ok(true);
+                return Ok(Some((slot, d_max, min_d)));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     fn budget_failure(&self, max_budget: usize, phase: &str) -> WorkspaceFailure {
@@ -1233,9 +1239,10 @@ impl<'a> WorkspaceEvaluator<'a> {
         for j in 0..arm_dof {
             full_tr[j] = f64::from((b[j] - a[j]).abs());
         }
-        if !self
+        if self
             .interval_needs_split(c_a, &c_b, min_depths, &full_tr[..arm_dof], arm_dof)
             .map_err(|e| (1.0, e.with_phase(sweep_phase)))?
+            .is_none()
         {
             self.check_and_advance(&c_b, min_depths, endpoint_phase).map_err(|e| (1.0, e))?;
             return Ok(c_b);
@@ -1250,13 +1257,16 @@ impl<'a> WorkspaceEvaluator<'a> {
             for j in 0..arm_dof {
                 tr_buf[j] = full_tr[j] * dt;
             }
-            let split = self
+            let failing = self
                 .interval_needs_split(&c0, &c1, min_depths, &tr_buf[..arm_dof], arm_dof)
                 .map_err(|e| (t0, e.with_phase(sweep_phase)))?;
-            if !split {
+            let Some((slot, d_max, min_d)) = failing else {
                 let ph = if (t1 - 1.0).abs() < 1e-12 { endpoint_phase } else { sweep_phase };
                 self.check_and_advance(&c1, min_depths, ph).map_err(|e| (t1, e))?;
                 continue;
+            };
+            if dt <= 1e-9 {
+                return Err((t0, self.describe_failure(slot, -d_max, d_max, min_d, sweep_phase)));
             }
             if *remaining_budget == 0 {
                 return Err((t0, self.budget_failure(max_budget, sweep_phase)));
@@ -1310,12 +1320,15 @@ impl<'a> WorkspaceEvaluator<'a> {
                 if tr.len() < arm_dof {
                     return Err(WorkspaceFailure::invalid(phase, "short travel bound"));
                 }
-                if !self.interval_needs_split(&c0, &c1, &min_depths, &tr, arm_dof)? {
+                let Some((slot, d_max, min_d)) = self.interval_needs_split(&c0, &c1, &min_depths, &tr, arm_dof)? else {
                     self.check_and_advance(&c1, &mut min_depths, phase)?;
                     if let Some(q1) = q1_opt {
                         samples.push(q1);
                     }
                     continue;
+                };
+                if t1 - t0 <= 1e-9 {
+                    return Err(self.describe_failure(slot, -d_max, d_max, min_d, phase));
                 }
                 if evals >= budget {
                     return Err(self.budget_failure(budget, phase));
