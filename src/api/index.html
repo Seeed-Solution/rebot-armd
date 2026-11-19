@@ -9676,15 +9676,17 @@ function teachWhen(s) {
 }
 async function teachLoad(quiet) {
   if (!quiet) teachStatus(t('tch.loading'));
+  const t0 = Date.now();
   try {
     const [sq, ps, ep, ds] = await Promise.all([teachGet('/api/v1/sequences'), teachGet('/api/v1/poses'), teachGet('/api/v1/episodes?limit=500'), teachGet('/api/v1/datasets')]);
     TCH.seqs = Array.isArray(sq.sequences) ? sq.sequences : [];
     TCH.poses = Array.isArray(ps.poses) ? ps.poses : [];
     TCH.eps = Array.isArray(ep.episodes) ? ep.episodes : [];
     TCH.dsets = Array.isArray(ds.datasets) ? ds.datasets : [];
-    // the recorder this page owns (after a reload the owner is a new connection: armd discards it)
+    // the recorder this page owns is gone (owner lost, saved at the disk / length limit): only for a recording
+    // started before this request, a newer one is not in the reply yet
     const r = ep.recording;
-    if (TCH.rec && !(r && r.owner === CLIENT_ID)) teachRecSet(null);
+    if (TCH.rec && TCH.rec.startedAt < t0 && !(r && r.owner === CLIENT_ID)) teachRecSet(null);
     TCH.loaded = true;
     if (TCH.cur && TCH.cur.id && !TCH.dirty) { const s = TCH.seqs.find((x) => x.id === TCH.cur.id); if (s) TCH.cur = JSON.parse(JSON.stringify(s)); }
     if (!quiet) teachStatus(t('tch.counts', { s: TCH.seqs.length, p: TCH.poses.length, e: TCH.eps.length }));
