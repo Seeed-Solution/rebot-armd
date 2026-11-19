@@ -584,21 +584,28 @@ workstation (not measured on a phone). The wizard flow itself ran against a simu
 
 **Settings** (header gear, both modes) has a **Tools** group built from
 `capabilities.calibration_tools`; only the tools this arm supports are listed, each with one line on
-what it is for, in the recommended order **Motor zero → Fine calibration → Gripper calibration**
+what it is for, in the recommended order **Zero → Fine calibration → Gripper calibration**
 (camera calibration is the alternative to fine calibration):
 
-- **Motor zero** (`/api/v1/calibration/motor_zero`; B601-DM, sim and mock followers; not RobStride /
-  Feetech / FashionStar): torque off, hold the arm at the zero pose (the 3D view shows it as the ghost
-  next to the current pose), select joints (more than 45° from 0 needs **force**), two taps. armd
-  disables the motors, sets the zeros, checks the readings, removes the kinematic correction and marks
-  the camera calibration stale. A motor zero cannot be restored, only set again at a pose. The
-  set-zero sequence and its persistence over a power cycle are not verified on the arm yet.
+- **Zero** (`/api/v1/calibration/motor_zero`): joint zero convention of the B601-DM = the official
+  one (URDF angle = joint angle, every joint 0 in the folded rest pose, gripper closed; the profile's
+  `zero_reference`, from which `home_positions` and the park target follow). Torque off, fold the arm
+  into the rest pose (the 3D view shows it as the ghost next to the current pose), choose **software
+  zero** (`calibration.json` `joint_zero`, applied by armd at the driver boundary; every follower with a
+  `zero_reference`; can be undone) or **motor zero** (Damiao flash; B601-DM, sim and mock followers),
+  select joints (more than 45° from the rest pose needs **force**), two taps. armd sets the zero,
+  checks the readings, removes the kinematic correction, marks the camera calibration stale and, for
+  joints that moved by more than 0.5°, marks the saved poses and (gripper joint) the gripper
+  calibration stale (`GET /api/v1/calibration` `stale_list`; nothing is deleted). Recorded episodes are
+  joint-space data and do not follow a zero change. A unit whose J6 reads ±90° in the rest pose (zeroed
+  the old way) is reported as `zero_convention: legacy_j6` with a warning and a button to the tool; armd
+  never moves the arm for it. Whether the Damiao zero survives a power cycle is not verified on the arm.
 - **Camera calibration**, **Fine calibration**: open the wizard in that mode.
 - **Gripper calibration**: current offset and opening table, zero check with or without storing the
   offset (`/api/v1/action/gripper_zero_check`).
 - **Release control**: sends `release_lease`; disabled while torque is on or the arm moves.
 
-A stale camera calibration (`GET /api/v1/calibration` `stale`, set by a motor zero) shows in the
+A stale camera calibration (`GET /api/v1/calibration` `stale`, set by a zero change) shows in the
 Tools group and as a dismissible banner in the cockpit. Screenshots: `scripts/calib_tools_shots.mjs`.
 
 ## Vision (reCamera kit)

@@ -305,12 +305,12 @@ v1.4.0 release 产物的大小（release profile：`opt-level = "z"`、fat LTO�
 
 **设置**（顶栏齿轮，两种模式都有）中有一组 **工具**，按 `capabilities.calibration_tools` 生成；只列出本机支持的工具，每项一句话说明用途，推荐顺序为 **零位标定 → 精校 → 夹爪标定**（不做精校时单独使用相机标定）：
 
-- **零位标定**（`/api/v1/calibration/motor_zero`；支持 B601-DM、sim 与 mock 跟随器，不支持 RobStride / 飞特 / FashionStar）：关闭使能，把机械臂扶到零位姿态（3D 视图用半透明模型显示零位姿态，与当前姿态对照），选择关节（偏离 0 超过 45° 需要 **强制设置**），点两次确认。armd 失能电机、设置零点、检查读数，然后删除运动学修正并把相机标定标为过期。电机零位无法恢复，只能在某个姿态重新设置。置零流程及其掉电后是否保留尚未在真机上验证。
+- **零位标定**（`/api/v1/calibration/motor_zero`）：B601-DM 的关节零位约定与官方一致（URDF 角 = 关节角，折叠收纳姿态下每个关节为 0，夹爪闭合；即 profile 的 `zero_reference`，`home_positions` 与收纳目标由它推出）。关闭使能，把机械臂折叠到收纳姿态（3D 视图用半透明模型显示收纳姿态，与当前姿态对照），选择 **软件零位**（写入 `calibration.json` 的 `joint_zero`，由 armd 在驱动边界应用；有 `zero_reference` 的任何跟随器都可用；可以撤销）或 **电机零位**（写入达妙电机 flash；支持 B601-DM、sim 与 mock 跟随器），选择关节（偏离收纳姿态超过 45° 需要 **强制设置**），点两次确认。armd 设置零位、检查读数，删除运动学修正，把相机标定标为过期；对读数变化超过 0.5° 的关节，把已存点位以及（夹爪关节）夹爪标定标为过期（`GET /api/v1/calibration` 的 `stale_list`；不删除任何数据）。已录制的 episode 是关节空间数据，不随零位改动变化。收纳姿态下 J6 读 ±90° 的机械臂（旧方式置零）报告为 `zero_convention: legacy_j6`，显示提示和打开工具的按钮；armd 不会因此移动机械臂。达妙零点掉电后是否保留尚未在真机上验证。
 - **相机标定**、**精校**：以对应模式打开标定向导。
 - **夹爪标定**：显示当前偏差与开度表，执行零位检查（可选择保存偏差，`/api/v1/action/gripper_zero_check`）。
 - **释放控制权**：发送 `release_lease`；使能开启或机械臂在动时不可用。
 
-相机标定过期（`GET /api/v1/calibration` 的 `stale`，由零位标定设置）时，工具组和驾驶舱顶部（可关闭的横幅）都会提示。截图：`scripts/calib_tools_shots.mjs`。
+相机标定过期（`GET /api/v1/calibration` 的 `stale`，由零位改动设置）时，工具组和驾驶舱顶部（可关闭的横幅）都会提示。截图：`scripts/calib_tools_shots.mjs`。
 
 ## 视觉（reCamera 套件）
 

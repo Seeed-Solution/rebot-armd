@@ -112,7 +112,7 @@ correction.
   is rejected as described above (`load_error`, uncorrected model, profile camera mount).
 - A zero offset above 5° on a joint usually means the motor zero is off: re-zero the motor with
   the official tool (reBotArm_control_py `example/2_zero_and_read.py` / MotorBridge) or the
-  cockpit's motor zero tool (below) and calibrate again.
+  cockpit's zero tool (below) and calibrate again.
 
 真机几何与 URDF 存在差异（在一台 B601-DM 上实测：J5 零位约 −4°，J1 / J2 轴夹角 87.5° 而非 90°，连杆偏移数毫米）。向导的精校模式用两个标定板位置拟合内置运动链的修正，`calibration.json` 中保存为上面的 `kinematics` 结构（`joints` 为 J1..J6 共 6 项，`fit` 为拟合报告）。
 
@@ -124,48 +124,84 @@ correction.
 - 启动时 `calibration.json` 中的修正超出范围或格式错误：按上文处理整个文件（`load_error`、未修正模型、profile 相机安装）。
 - 某个关节的零位偏移超过 5° 时，通常是电机零位有偏差：用官方工具（reBotArm_control_py `example/2_zero_and_read.py` / MotorBridge）或驾驶舱的零位标定工具（见下文）重新标定电机零位后再做标定。
 
-### Motor zero / 电机零位
+### Joint zero / 关节零位
 
-The kinematic correction and the camera calibration are measured against the motors' zero. The
-cockpit's **Settings > Tools > Motor zero** (WS `/api/v1/calibration/motor_zero`, contract in
-[docs/agent_action_api.md](../../../docs/agent_action_api.md#calibration-tools-and-motor-zero--标定工具与电机零位))
-sets the current position of selected joints as their zero:
+**Convention.** The B601-DM follows the official stack (Seeed-Projects/reBotArm_control_py:
+URDF angle = motor angle): the zero is the folded rest pose with every joint as folded and the
+gripper fully closed, so the arm reads 0 on every joint in the rest pose, and home = zero pose =
+rest pose. The profile states this pose once as `zero_reference` (URDF angles); `home_positions`
+and the park target follow from it, and `model_offsets_rad` is 0 on every joint. The kinematic
+correction and the camera calibration are measured in these joint angles.
 
-1. Torque off (the tool offers **Park and disable torque**); hold the arm at the zero pose by hand.
-   B601-DM zero pose: the home pose with J6 at 0 (upper arm level pointing back, forearm folded back
-   over it, gripper level pointing forward, jaws opening up/down), gripper fully closed (official
-   wiki, reBot-DM with LeRobot). The 3D view shows the zero pose as the ghost next to the current pose.
-2. Select the joints. A joint reading more than 45° from 0 needs **force** (a lost zero).
-3. Two taps: armd's dry run, then the run. armd disables every motor, waits for fresh feedback
-   confirming them disabled, sends the Damiao set-zero frame per motor 0.1 s apart (the sequence of
-   reBotArm_control_py `RebotArm.set_zero`) and checks that each joint reads within 10 mrad of 0
-   within 1 s. Torque stays off; the arm does not move.
-4. armd then removes the kinematic correction from `calibration.json` (live too) and marks the
-   camera calibration stale (`"stale": {"reason", "at"}`); grasp keeps working with it, the
-   cockpit shows a warning until the next camera or fine calibration. Each run is appended to
-   `calibration-backups/motor_zero.jsonl` (time, joints, readings before, result, removed
-   correction).
+`calibration.json` `joint_zero` maps an arm to this convention without touching the motors:
+one offset per joint (motor - joint), applied by armd at the driver boundary, so park, limits,
+poses, FK / IK, the cockpit and the SDK see calibrated joint angles. Without it the offsets are 0.
 
-A motor zero cannot be restored like a calibration backup: the motors hold the new zero; a
-different zero is set by running the tool again at that pose. Recommended order: motor zero →
-fine calibration → gripper calibration.
+**Legacy units.** A unit zeroed with the wrist rolled 90° reads J6 = ±90° in the rest pose.
+armd checks this at startup and each time torque goes off and reports it as
+`zero_convention: legacy_j6` (`GET /api/v1/calibration`, schema); the cockpit shows a warning
+in **Settings > Tools** with a button to the zero tool. Until J6 is zeroed in the rest pose, park
+rolls the wrist 90° and the 3D view / camera orientation is off by 90°. armd does not move the
+arm because of the check.
 
-Not verified on the arm: the set-zero sequence on the B601-DM and whether the Damiao zero
-survives a power cycle (`persist_verified: false` in `capabilities.calibration_tools`). The
-official wiki says the B601-DM is calibrated once after assembly; motorbridge's Damiao notes say
-the zero is lost at power-off for the gripper motor (multi-turn travel). Tested against a mock CAN
-bus, the sim follower and the mock follower.
+**The zero tool.** **Settings > Tools > Zero** (WS `/api/v1/calibration/motor_zero`, contract in
+[docs/agent_action_api.md](../../../docs/agent_action_api.md#calibration-tools-and-motor-zero--标定工具与电机零位)):
 
-运动学修正和相机标定都以电机零点为基准测得。驾驶舱 **设置 > 工具 > 零位标定**（WS `/api/v1/calibration/motor_zero`，接口说明见 [docs/agent_action_api.md](../../../docs/agent_action_api.md#calibration-tools-and-motor-zero--标定工具与电机零位)）把所选关节的当前位置设为零点：
+1. Torque off (the tool offers **Park and disable torque**); fold the arm into the rest pose by
+   hand and hold it there, gripper fully closed: upper arm level pointing back, forearm folded
+   back over it, gripper level pointing forward, jaws opening sideways, camera holder on top.
+   The 3D view shows the rest pose as the ghost next to the current pose.
+2. Choose the method:
+   - **Software zero** (recommended): armd averages the readings over 0.5 s (the arm must stay
+     still) and stores offset = reading - reference in `calibration.json` `joint_zero`. No flash
+     write, works with every driver, can be undone (**Undo** in the result, or WS
+     `/api/v1/calibration/joint_zero/restore {backup}`; a backup of `calibration.json` is taken
+     first).
+   - **Motor zero** (Damiao): armd disables every motor, waits for fresh feedback confirming them
+     disabled, sends the Damiao set-zero frame per motor 0.1 s apart (the sequence of
+     reBotArm_control_py `RebotArm.set_zero`) and sets the joint zero offsets of those joints to 0.
+     The motors hold the new zero; it cannot be undone, only set again in the rest pose.
+3. Select the joints (for a legacy unit: J6). A joint reading more than 45° from the rest pose
+   needs **force** (a lost or legacy zero). After the zero each selected joint reads its reference
+   (0 on the B601-DM); armd checks it within 10 mrad within 1 s. Torque stays off.
+4. What becomes stale. The kinematic correction is removed (it was measured with the old zero)
+   and the camera calibration is marked stale (`"stale": {"reason", "at"}`; grasp keeps working
+   with it until the next camera or fine calibration). For joints whose reading moved by more
+   than 0.5°: the saved poses (`poses.json`) are marked stale (the arm would reach a different
+   physical pose; saving a pose again clears the mark) and, for the gripper joint, the gripper
+   calibration (opening table / offset). Nothing is deleted. `GET /api/v1/calibration`
+   `stale_list` lists them; the cockpit marks stale poses in the poses list. Recorded episodes
+   and datasets are joint-space data and do not follow a zero change. Each run is appended to
+   `calibration-backups/motor_zero.jsonl`.
 
-1. 关闭使能（工具里有 **收纳并关闭使能**），用手把机械臂扶到零位姿态。B601-DM 的零位姿态：回零姿态但 J6 为 0（大臂水平朝后、小臂折回压在大臂上、夹爪水平朝前、夹爪上下张合），夹爪完全闭合（官方 wiki「reBot-DM with LeRobot」）。3D 视图用半透明模型显示零位姿态，与当前姿态对照。
-2. 选择关节。读数偏离 0 超过 45° 的关节需要勾选 **强制设置**（零位已丢失的情况）。
-3. 点两次：第一次是 armd 预演，第二次正式执行。armd 先失能所有电机，等到新鲜反馈确认已失能，逐个电机发送达妙置零帧，间隔 0.1 s（与 reBotArm_control_py `RebotArm.set_zero` 的顺序相同），再检查各关节在 1 s 内读数回到 0 的 10 mrad 以内。使能保持关闭，机械臂不运动。
-4. 之后 armd 从 `calibration.json` 删除运动学修正（运行时同时生效），并把相机标定标为过期（`"stale": {"reason", "at"}`）；抓取仍使用它，驾驶舱显示提示，直到下一次相机标定或精校。每次执行追加到 `calibration-backups/motor_zero.jsonl`（时间、关节、置零前读数、结果、被删除的修正）。
+Recommended order: zero → fine calibration → gripper calibration.
 
-电机零位不能像标定备份那样恢复：电机保存的是新零点；要换零点只能在那个姿态重新执行。推荐顺序：零位标定 → 精校 → 夹爪标定。
+Measured on the arm: on 2026-11-19 the motor zero was run on all 7 joints of the office
+B601-DM in the rest pose (readings before: J1..J5 about 0, J6 1.574 rad, gripper about 0; J6
+needed force); with this convention its `joint_zero` is all 0. Not verified: whether the Damiao
+zero survives a power cycle (`persist_verified: false` in `capabilities.calibration_tools`); the
+official wiki says the B601-DM is calibrated once after assembly, motorbridge's Damiao notes say
+the zero is lost at power-off for the gripper motor (multi-turn travel). The software zero is
+tested against the mock and sim followers.
 
-尚未在真机上验证：B601-DM 上的置零流程，以及达妙电机零点掉电后是否保留（`capabilities.calibration_tools` 中 `persist_verified: false`）。官方 wiki 写 B601-DM 装配后只需标定一次；motorbridge 的达妙说明写夹爪电机（多圈行程）掉电后零点丢失。目前只在模拟 CAN 总线、sim 跟随器和 mock 跟随器上测试过。
+**约定。** B601-DM 采用官方约定（Seeed-Projects/reBotArm_control_py：URDF 角 = 电机角）：零位是折叠收纳姿态，各关节按收纳时折好，夹爪完全闭合；机械臂在收纳姿态每个关节读 0，回零姿态 = 零位姿态 = 收纳姿态。profile 用 `zero_reference`（URDF 角）给出这个姿态一次；`home_positions` 和收纳目标由它推出，`model_offsets_rad` 各关节为 0。运动学修正与相机标定都按这套关节角测得。
+
+`calibration.json` 的 `joint_zero` 在不改电机的情况下把机械臂映射到这套约定：每个关节一个偏移（电机角 - 关节角），由 armd 在驱动边界应用，收纳、限位、点位、FK / IK、驾驶舱和 SDK 看到的都是标定后的关节角。没有这个字段时偏移为 0。
+
+**旧零位的机械臂。** 在手腕转了 90° 的位置置零的机械臂，在收纳姿态 J6 读 ±90°。armd 在启动时和每次关闭使能后检查，在 `GET /api/v1/calibration` 与 schema 中报告为 `zero_convention: legacy_j6`；驾驶舱在 **设置 > 工具** 中显示提示，并提供打开零位标定的按钮。在收纳姿态重新设置 J6 零位之前，收纳会把手腕转 90°，3D 视图与相机方向差 90°。armd 不会因为这项检查移动机械臂。
+
+**零位标定工具。** **设置 > 工具 > 零位标定**（WS `/api/v1/calibration/motor_zero`，接口说明见 [docs/agent_action_api.md](../../../docs/agent_action_api.md#calibration-tools-and-motor-zero--标定工具与电机零位)）：
+
+1. 关闭使能（工具里有 **收纳并关闭使能**），用手把机械臂折叠到收纳姿态并保持住，夹爪完全闭合：大臂水平朝后、小臂折回压在大臂上、夹爪水平朝前、夹爪左右张合、相机支架在上。3D 视图用半透明模型显示收纳姿态，与当前姿态对照。
+2. 选择方法：
+   - **软件零位**（推荐）：armd 在 0.5 s 内取读数平均（机械臂须保持不动），把 偏移 = 读数 - 参考值 写入 `calibration.json` 的 `joint_zero`。不写电机 flash，任何驱动都可用，可以撤销（结果页的 **撤销**，或 WS `/api/v1/calibration/joint_zero/restore {backup}`；执行前先备份 `calibration.json`）。
+   - **电机零位**（达妙）：armd 先失能所有电机，等到新鲜反馈确认已失能，逐个电机发送达妙置零帧，间隔 0.1 s（与 reBotArm_control_py `RebotArm.set_zero` 的顺序相同），并把这些关节的零位偏移设为 0。电机保存新零点，无法撤销，只能在收纳姿态重新设置。
+3. 选择关节（旧零位的机械臂：J6）。读数偏离收纳姿态超过 45° 的关节需要勾选 **强制设置**（零位丢失或旧零位）。设置后所选关节读出参考值（B601-DM 为 0）；armd 在 1 s 内检查到 10 mrad 以内。使能保持关闭。
+4. 哪些内容会过期。删除运动学修正（它按旧零位测得），相机标定标为过期（`"stale": {"reason", "at"}`；抓取继续使用，直到下一次相机标定或精校）。对读数变化超过 0.5° 的关节：已存点位（`poses.json`）标为过期（前往时实际到达的物理姿态不同；重新记录该点位即清除），夹爪关节则把夹爪标定（开口表 / 偏差）标为过期。不删除任何数据。`GET /api/v1/calibration` 的 `stale_list` 列出这些内容；驾驶舱在点位列表中标出过期点位。已录制的 episode 与数据集是关节空间数据，不随零位改动变化。每次执行追加到 `calibration-backups/motor_zero.jsonl`。
+
+推荐顺序：零位标定 → 精校 → 夹爪标定。
+
+实机记录：2026-11-19 在办公室的 B601-DM 上于收纳姿态对全部 7 个关节执行了电机置零（置零前读数：J1..J5 约 0，J6 1.574 rad，夹爪约 0；J6 需要强制设置）；按本约定其 `joint_zero` 全为 0。尚未验证：达妙电机零点掉电后是否保留（`capabilities.calibration_tools` 中 `persist_verified: false`）；官方 wiki 写 B601-DM 装配后只需标定一次，motorbridge 的达妙说明写夹爪电机（多圈行程）掉电后零点丢失。软件零位在 mock 与 sim 跟随器上测试。
 
 Board (the wizard prints it; the simulator's `--aruco-board` uses the same layout): 4 columns x
 3 rows (landscape, as the 16:9 image) of aruco4x4_50 markers, ids 0..11 in reading order
