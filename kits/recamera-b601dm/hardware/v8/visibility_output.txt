@@ -1,0 +1,64 @@
+FOV (derived, 1080p crop): half H 21.23 deg, half V 12.33 deg
+== v7 prediction vs real FOV (tip = jaw tip point, v = fraction of half-height below centre) ==
+  tilt  0: tip  38.11 deg below axis; v@17=2.565 v@25=1.682 v@12.3253=3.590
+  tilt 20: tip  20.68 deg below axis; v@17=1.235 v@25=0.809 v@12.3253=1.728
+  tilt 25: tip  16.17 deg below axis; v@17=0.948 v@25=0.622 v@12.3253=1.327
+  tilt 30: tip  11.58 deg below axis; v@17=0.670 v@25=0.439 v@12.3253=0.938
+== candidates ==
+v5 (tilt 0)                  tilt= 0.0 pitch= -0.0 lens=( -88.1, 0.5, 69.1) tip v=+3.590 u=+0.013 topEdge=-12.3deg
+    open0: tipzone v[+3.56,+3.95] u[-0.19,+0.22] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+    open42.5: tipzone v[+3.56,+3.95] u[-1.50,+1.53] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+v7 tilt30                    tilt=30.0 pitch= 30.0 lens=( -76.0, 0.5, 67.5) tip v=+0.938 u=+0.012 topEdge=+17.7deg
+    open0: tipzone v[+0.92,+1.19] u[-0.17,+0.19] in-image  41.5% visible  19.6% cover  0.3% highest-gripper-row v=+0.93
+    open42.5: tipzone v[+0.92,+1.19] u[-1.32,+1.34] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+tilt34                       tilt=34.0 pitch= 34.0 lens=( -74.6, 0.5, 66.8) tip v=+0.631 u=+0.012 topEdge=+21.7deg
+    open0: tipzone v[+0.61,+0.88] u[-0.16,+0.18] in-image 100.0% visible  23.5% cover  4.9% highest-gripper-row v=+0.62
+    open42.5: tipzone v[+0.61,+0.88] u[-1.33,+1.34] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+tilt36                       tilt=36.0 pitch= 36.0 lens=( -73.8, 0.5, 66.4) tip v=+0.479 u=+0.012 topEdge=+23.7deg
+    open0: tipzone v[+0.46,+0.73] u[-0.17,+0.19] in-image 100.0% visible  22.4% cover  7.7% highest-gripper-row v=+0.49
+    open42.5: tipzone v[+0.46,+0.73] u[-1.32,+1.36] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+tilt38                       tilt=38.0 pitch= 38.0 lens=( -73.1, 0.5, 66.0) tip v=+0.326 u=+0.012 topEdge=+25.7deg
+    open0: tipzone v[+0.31,+0.58] u[-0.16,+0.19] in-image 100.0% visible  25.0% cover 10.8% highest-gripper-row v=+0.32
+    open42.5: tipzone v[+0.31,+0.58] u[-1.34,+1.36] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+tilt40                       tilt=40.0 pitch= 40.0 lens=( -72.4, 0.5, 65.6) tip v=+0.173 u=+0.012 topEdge=+27.7deg
+    open0: tipzone v[+0.16,+0.42] u[-0.17,+0.19] in-image 100.0% visible  22.6% cover 14.1% highest-gripper-row v=+0.18
+    open42.5: tipzone v[+0.16,+0.43] u[-1.33,+1.37] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+tilt42                       tilt=42.0 pitch= 42.0 lens=( -71.7, 0.5, 65.1) tip v=+0.018 u=+0.012 topEdge=+29.7deg
+    open0: tipzone v[+0.00,+0.27] u[-0.17,+0.19] in-image 100.0% visible  26.7% cover 17.7% highest-gripper-row v=+0.01
+    open42.5: tipzone v[+0.00,+0.27] u[-1.36,+1.38] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+tilt45                       tilt=45.0 pitch= 45.0 lens=( -70.7, 0.5, 64.4) tip v=-0.215 u=+0.012 topEdge=+32.7deg
+    open0: tipzone v[-0.23,+0.04] u[-0.17,+0.19] in-image 100.0% visible  21.4% cover 23.4% highest-gripper-row v=-0.21
+    open42.5: tipzone v[-0.23,+0.04] u[-1.37,+1.40] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+tilt50                       tilt=50.0 pitch= 50.0 lens=( -69.2, 0.5, 63.1) tip v=-0.614 u=+0.013 topEdge=+37.7deg
+    open0: tipzone v[-0.63,-0.35] u[-0.17,+0.20] in-image 100.0% visible  23.4% cover 34.2% highest-gripper-row v=-0.62
+    open42.5: tipzone v[-0.63,-0.35] u[-1.42,+1.44] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+roll90 tilt20                tilt=20.0 pitch= 20.0 lens=( -79.9, 0.5, 68.7) tip v=+0.972 u=+0.021 topEdge= -1.2deg
+    open0: tipzone v[+0.96,+1.12] u[-0.30,+0.34] in-image  35.9% visible  18.2% cover  0.2% highest-gripper-row v=+0.99
+    open42.5: tipzone v[+0.96,+1.12] u[-2.37,+2.41] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+roll90 tilt25                tilt=25.0 pitch= 25.0 lens=( -78.0, 0.5, 68.2) tip v=+0.746 u=+0.021 topEdge= +3.8deg
+    open0: tipzone v[+0.74,+0.89] u[-0.29,+0.33] in-image 100.0% visible  22.3% cover  6.4% highest-gripper-row v=+0.76
+    open42.5: tipzone v[+0.74,+0.89] u[-2.35,+2.38] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+roll90 tilt30                tilt=30.0 pitch= 30.0 lens=( -76.0, 0.5, 67.5) tip v=+0.528 u=+0.021 topEdge= +8.8deg
+    open0: tipzone v[+0.52,+0.67] u[-0.29,+0.34] in-image 100.0% visible  22.8% cover 14.3% highest-gripper-row v=+0.54
+    open42.5: tipzone v[+0.52,+0.67] u[-2.34,+2.38] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+tilt30 back20                tilt=30.0 pitch= 30.0 lens=( -96.0, 0.5, 67.5) tip v=+0.408 u=+0.010 topEdge=+17.7deg
+    open0: tipzone v[+0.39,+0.61] u[-0.14,+0.16] in-image 100.0% visible  18.3% cover  8.7% highest-gripper-row v=+0.40
+    open42.5: tipzone v[+0.39,+0.61] u[-1.11,+1.14] in-image  54.0% visible  39.2% cover  0.9% highest-gripper-row v=+0.40
+    camera-envelope clearance to gripper (opening 0) mm: 16.2
+tilt30 down10                tilt=30.0 pitch= 30.0 lens=( -76.0, 0.5, 57.5) tip v=+0.569 u=+0.012 topEdge=+17.7deg
+    open0: tipzone v[+0.54,+0.82] u[-0.17,+0.20] in-image 100.0% visible  20.4% cover  6.9% highest-gripper-row v=+0.57
+    open42.5: tipzone v[+0.54,+0.82] u[-1.39,+1.42] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+    camera-envelope clearance to gripper (opening 0) mm: 6.1
+tilt30 fwd15                 tilt=30.0 pitch= 30.0 lens=( -61.0, 0.5, 67.5) tip v=+1.475 u=+0.014 topEdge=+17.7deg
+    open0: tipzone v[+1.46,+1.79] u[-0.19,+0.22] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+    open42.5: tipzone v[+1.46,+1.79] u[-1.52,+1.56] in-image   0.0% visible   0.0% cover  0.0% highest-gripper-row v=+nan
+    camera-envelope clearance to gripper (opening 0) mm: 20.0
+tilt35 back20 down5          tilt=35.0 pitch= 35.0 lens=( -94.2, 0.5, 61.6) tip v=-0.145 u=+0.010 topEdge=+22.7deg
+    open0: tipzone v[-0.17,+0.06] u[-0.15,+0.16] in-image 100.0% visible  19.0% cover 24.0% highest-gripper-row v=-0.15
+    open42.5: tipzone v[-0.17,+0.06] u[-1.15,+1.18] in-image  30.7% visible  27.2% cover  0.2% highest-gripper-row v=-0.15
+    camera-envelope clearance to gripper (opening 0) mm: 11.3
+== sensitivity of tip v (no occlusion/cover) ==
+  tilt 30: lens-5/pitch-2:+0.87 lens-5/pitch+0:+0.71 lens-5/pitch+2:+0.55 lens+0/pitch-2:+1.11 lens+0/pitch+0:+0.94 lens+0/pitch+2:+0.77 lens+5/pitch-2:+1.34 lens+5/pitch+0:+1.17 lens+5/pitch+2:+1.00
+  tilt 36: lens-5/pitch-2:+0.41 lens-5/pitch+0:+0.25 lens-5/pitch+2:+0.09 lens+0/pitch-2:+0.64 lens+0/pitch+0:+0.48 lens+0/pitch+2:+0.32 lens+5/pitch-2:+0.87 lens+5/pitch+0:+0.71 lens+5/pitch+2:+0.55
+  tilt 38: lens-5/pitch-2:+0.25 lens-5/pitch+0:+0.09 lens-5/pitch+2:-0.07 lens+0/pitch-2:+0.49 lens+0/pitch+0:+0.33 lens+0/pitch+2:+0.17 lens+5/pitch-2:+0.72 lens+5/pitch+0:+0.56 lens+5/pitch+2:+0.40
+  tilt 40: lens-5/pitch-2:+0.10 lens-5/pitch+0:-0.06 lens-5/pitch+2:-0.22 lens+0/pitch-2:+0.33 lens+0/pitch+0:+0.17 lens+0/pitch+2:+0.01 lens+5/pitch-2:+0.57 lens+5/pitch+0:+0.41 lens+5/pitch+2:+0.25
