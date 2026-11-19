@@ -21,6 +21,11 @@ pub const DEFAULT_REPLAY_SPEED: f64 = 0.5;
 pub const MAX_REPLAY_DURATION_S: f64 = 600.0;
 /// Tolerance on the per-joint speed check (rad/s), above float rounding.
 pub const SPEED_CHECK_EPS: f32 = 1e-3;
+/// Relative tolerance on the per-joint speed check. Recorded timestamps jitter against the
+/// control tick that produced the positions (15..25 ms on a 20 ms period in a mock-follower
+/// run), so a recording made at the planned-motion limit (a jog) shows single samples up to
+/// ~0.3 % above it; without this margin such an episode is refused at 1x.
+pub const SPEED_CHECK_REL: f32 = 0.02;
 /// Playback rate (fraction of the chosen speed) at or below which the replay counts as
 /// stalled; [`STALL_TIMEOUT_S`] of that fails it with TRACKING_STALL.
 pub const STALL_RATE: f64 = 0.1;
@@ -241,7 +246,7 @@ pub fn plan_frames(input: ReplayInput, frames: &[RecordFrame]) -> Result<ReplayP
         for j in (0..input.dof).filter(|&j| replayed(j)) {
             let v = (w[1][j] - w[0][j]).abs() / h as f32 * speed;
             let limit = input.speed_limits[j].max_velocity;
-            if v > limit + SPEED_CHECK_EPS {
+            if v > limit * (1.0 + SPEED_CHECK_REL) + SPEED_CHECK_EPS {
                 let ratio = v / limit;
                 if worst.is_none_or(|(_, r, _)| ratio > r) { worst = Some((j, ratio, k)); }
             }

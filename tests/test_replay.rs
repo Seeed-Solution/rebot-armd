@@ -202,6 +202,18 @@ fn validation_rejects_with_codes_and_moves_nothing() {
     assert_eq!(code, "REPLAY_TOO_FAST");
     assert!(msg.contains("joint 5") && msg.contains("at most 0.75x"), "{msg}");
     assert!(try_frames(&inner, &medium, 0.5, true).is_ok());
+    // a recording at the J5 planned limit (0.45 rad/s) whose timestamps jitter against the control tick (as
+    // recorded from a jog): single samples ~0.5 % above the limit replay at 1x; 5 % above is refused
+    let at_limit = |over: f32| -> Vec<RecordFrame> {
+        (0..=100).map(|k| {
+            let jit = if k % 7 == 3 { -0.0001 } else { 0.0 };
+            let mut q = INSPECT.to_vec();
+            q[4] += 0.45 * over * (k as f32 * DT as f32);
+            RecordFrame { timestamp: 100.0 + k as f64 * DT + jit, observation_state: q.clone(), action: q }
+        }).collect()
+    };
+    assert!(try_frames(&inner, &at_limit(1.0), 1.0, true).is_ok(), "jittered recording at the limit");
+    assert_eq!(try_frames(&inner, &at_limit(1.05), 1.0, true).unwrap_err().1, "REPLAY_TOO_FAST");
 
     // keep-out box on the path (around the TCP at the wave's far point)
     let far = &ok[ok.len() / 2].observation_state;
