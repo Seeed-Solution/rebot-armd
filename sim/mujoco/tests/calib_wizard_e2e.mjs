@@ -32,7 +32,7 @@ const postJ = async (p, b) => { const r = await fetch(BASE + p, { method: 'POST'
 
 // ---- joint map and limits from the schema (as the cockpit's applyJointMap / modelLimits6)
 const schema = await getJ('/api/v1/observation/schema');
-const sign = [1, 1, 1, 1, 1, 1], off = [0, 0, 0, 0, 0, Math.PI / 2];
+const sign = [1, 1, 1, 1, 1, 1], off = [0, 0, 0, 0, 0, 0]; // official convention: URDF angle = joint angle
 if (Array.isArray(schema.model_joint_map)) schema.model_joint_map.slice(0, 6).forEach((m, i) => { sign[i] = m.sign; off[i] = -m.sign * m.offset_rad; });
 const toModel6 = (pos) => [0, 1, 2, 3, 4, 5].map((i) => ((Number(pos[i]) || 0) - off[i]) / sign[i]);
 const lo = [], hi = [];
@@ -120,7 +120,9 @@ try {
   // nominal mount (cwNominalMount): armd's current camera_mount
   const cal = await getJ('/api/v1/calibration');
   out.before = { calibrated: cal.calibrated, camera_mount: cal.camera_mount, grasp: cal.grasp };
-  const Rn = CW.mountRotation(VIK, cal.camera_mount || {}, toModel6([0, 0, 0, 0, 0, Math.PI / 2]));
+  // the cockpit's cwNominalMount: the mount at the rest pose (schema home_positions, all 0 in the official J6 convention)
+  const rest = Array.isArray(schema.home_positions) && schema.home_positions.length >= 6 ? schema.home_positions : [0, 0, 0, 0, 0, 0];
+  const Rn = CW.mountRotation(VIK, cal.camera_mount || {}, toModel6(rest));
   const Xn = CW.make(Rn, cal.camera_mount.offset_m);
   // the operator's jog: camera 0.28 m above the board centre looking down, image x along the board's long side
   const [bx, by, byaw] = BOARD_AT, yaw = byaw / D, x = [Math.cos(yaw), Math.sin(yaw), 0], z = [0, 0, -1];
