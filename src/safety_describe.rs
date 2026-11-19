@@ -170,6 +170,7 @@ impl SupervisorInner {
                 "enabled": self.collision.enabled,
                 "sensitivity": self.collision.sensitivity,
                 "source": if self.collision.runtime { "runtime" } else { "profile" },
+                "calibrated": false,
                 "thresholds_nm": self.collision_thresholds(),
                 "persist_ticks": p.persist_ticks,
                 "lease_required": false,
@@ -235,12 +236,21 @@ impl SupervisorInner {
         }
 
         let cap = c.speed_cap;
-        let workspace = self.workspace_policy().map(|(ws, _)| json!({
+        let kinematics_configured = c.kinematics.is_some();
+        let workspace_configured = c.workspace.is_some();
+        let workspace_active = self.workspace_policy().is_some();
+        let geometry_coverage = if workspace_active { "end_only" } else { "none" };
+        let camera_mount_covered = workspace_active && c.camera_mount.offset_m.is_some();
+        let workspace = self.workspace_policy().map(|(ws, cam)| json!({
             "floor_z_m": ws.floor_z_m,
             "box_min_m": ws.box_min_m,
             "box_max_m": ws.box_max_m,
             "max_reach_m": ws.max_reach_m,
             "check_points_end_m": ws.check_points_end_m,
+            "kinematics_configured": kinematics_configured,
+            "workspace_configured": workspace_configured,
+            "geometry_coverage": geometry_coverage,
+            "camera_mount_covered": cam.offset_m.is_some(),
         }));
         let keepout = self.keepout_state();
         let hw = c.hardware.clone().unwrap_or_default();
@@ -286,6 +296,10 @@ impl SupervisorInner {
                 "planned_max_velocity": c.planned_max_velocity,
                 "servo_max_velocity": c.servo_max_velocity,
                 "workspace": workspace,
+                "kinematics_configured": kinematics_configured,
+                "workspace_configured": workspace_configured,
+                "geometry_coverage": geometry_coverage,
+                "camera_mount_covered": camera_mount_covered,
                 "keepout_boxes": keepout.boxes,
                 "keepout_source": keepout.source,
                 "keepout_rule": "boxes in force = profile boxes + runtime boxes (each tagged with its source); the runtime list cannot remove a profile box",

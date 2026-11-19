@@ -187,6 +187,7 @@ async fn collision_stop_only_with_the_capability_and_follows_the_runtime_setting
     let c = stop(&d, "collision_protective_stop").unwrap();
     let p = ArmConfig::rebot_dm().collision.unwrap_or_default();
     assert_eq!(c["enabled"], p.enabled);
+    assert_eq!(c["calibrated"], false);
     assert_eq!(c["sensitivity"], "medium");
     assert_eq!(c["thresholds_nm"], json!(p.thresholds_nm));
     assert_eq!(c["auto_resume_s"], p.resume_after_s);
@@ -220,4 +221,48 @@ async fn hardware_section_follows_the_profile() {
     config.hardware = Some(armd::model::HardwareInfo { physical_estop: true, notes: Some(vec!["mushroom button on the base cuts motor power".into()]) });
     let d = describe(&ArmSupervisor::new(config)).await;
     assert_eq!(d["hardware"]["notes"], json!(["mushroom button on the base cuts motor power"]));
+}
+
+#[tokio::test]
+async fn geometry_coverage_reports_configured_unconfigured_and_camera_mount() {
+    let dm = describe(&ArmSupervisor::new(ArmConfig::rebot_dm())).await;
+    assert_eq!(dm["limits"]["kinematics_configured"], true);
+    assert_eq!(dm["limits"]["workspace_configured"], true);
+    assert_eq!(dm["limits"]["geometry_coverage"], "end_only");
+    assert_eq!(dm["limits"]["camera_mount_covered"], false);
+    let ws = &dm["limits"]["workspace"];
+    assert!(ws.is_object());
+    assert_eq!(ws["kinematics_configured"], true);
+    assert_eq!(ws["workspace_configured"], true);
+    assert_eq!(ws["geometry_coverage"], "end_only");
+    assert_eq!(ws["camera_mount_covered"], false);
+    assert!(ws["floor_z_m"].is_f64());
+    assert!(ws["box_min_m"].is_array());
+    assert!(ws["box_max_m"].is_array());
+    assert!(ws["max_reach_m"].is_f64());
+    assert!(ws["check_points_end_m"].is_array());
+
+    let mut with_cam = ArmConfig::rebot_dm();
+    with_cam.camera_mount.offset_m = Some([-0.07, 0.0, 0.06]);
+    let d_cam = describe(&ArmSupervisor::new(with_cam)).await;
+    assert_eq!(d_cam["limits"]["camera_mount_covered"], true);
+    assert_eq!(d_cam["limits"]["workspace"]["camera_mount_covered"], true);
+
+    let unconfigured = describe(&ArmSupervisor::new(ArmConfig::default())).await;
+    let mut keys: Vec<&str> = unconfigured.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["describe_version", "device", "faults", "hardware", "limits", "not_a_safety_function", "stops", "timing"]);
+    assert!(unconfigured["limits"]["workspace"].is_null());
+    assert_eq!(unconfigured["limits"]["kinematics_configured"], false);
+    assert_eq!(unconfigured["limits"]["workspace_configured"], false);
+    assert_eq!(unconfigured["limits"]["geometry_coverage"], "none");
+    assert_eq!(unconfigured["limits"]["camera_mount_covered"], false);
+
+    let no_kin = ArmConfig { kinematics: None, ..ArmConfig::rebot_dm() };
+    let d_no_kin = describe(&ArmSupervisor::new(no_kin)).await;
+    assert!(d_no_kin["limits"]["workspace"].is_null());
+    assert_eq!(d_no_kin["limits"]["kinematics_configured"], false);
+    assert_eq!(d_no_kin["limits"]["workspace_configured"], true);
+    assert_eq!(d_no_kin["limits"]["geometry_coverage"], "none");
+    assert_eq!(d_no_kin["limits"]["camera_mount_covered"], false);
 }

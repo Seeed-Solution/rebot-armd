@@ -133,6 +133,56 @@ fn resolve_serial_port(requested: Option<&str>) -> String {
     "/dev/ttySC0".to_string()
 }
 
+fn resolve_follower_config(follower: &str, config_path: Option<&str>) -> Result<ArmConfig, String> {
+    let expected_dof = match follower {
+        "rebot-dm" => Some(7),
+        "rebot-rs" | "so-arm101" | "so-arm100" | "fashionstar" | "star-arm102" => Some(6),
+        "sim" | "mock" => None,
+        other => return Err(format!("Unknown follower model: {other}")),
+    };
+    let mut config = if let Some(path) = config_path {
+        let config = ArmConfig::from_profile_file(path)?;
+        if config.kinematics.is_none() || config.workspace.is_none() {
+            tracing::warn!("Profile {path} has no kinematics/workspace: the Cartesian workspace check and Cartesian actions are off");
+        }
+        config
+    } else if follower == "rebot-rs" {
+        return Err(
+            "Follower 'rebot-rs' requires --config <path> (e.g. profiles/rebot_b601_rs.json); refusing to fall back to unconfigured defaults"
+                .into(),
+        );
+    } else if follower == "so-arm101" || follower == "so-arm100" {
+        let name = if follower == "so-arm100" { "so_arm100.json" } else { "so_arm101.json" };
+        let candidates = [
+            format!("/userdata/rebot-teleop/profile/{name}"),
+            format!("profiles/{name}"),
+            format!("/usr/share/rebot-teleop/profile/{name}"),
+        ];
+        if std::path::Path::new(&candidates[0]).exists() {
+            if let Some(bundled) = candidates[1..].iter().find(|p| std::path::Path::new(p).exists()) {
+                tracing::warn!("User profile {} overrides bundled profile {}", candidates[0], bundled);
+            }
+        }
+        let path = candidates.iter().find(|p| std::path::Path::new(p).exists())
+            .unwrap_or(&candidates[1]);
+        tracing::info!("Loaded profile for {follower} from {path}");
+        ArmConfig::from_profile_file(path)?
+    } else if follower == "rebot-dm" || follower == "sim" {
+        ArmConfig::rebot_dm()
+    } else {
+        ArmConfig::default()
+    };
+    config.validate()?;
+    if expected_dof.is_some_and(|dof| config.dof != dof) {
+        return Err(format!(
+            "Profile DOF {} does not match {follower} hardware DOF {}",
+            config.dof,
+            expected_dof.unwrap()
+        ));
+    }
+    Ok(config)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
@@ -162,50 +212,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("{warning}");
     }
     let follower = cli.follower.as_deref().unwrap_or("mock");
-    let expected_dof = match follower {
-        "rebot-dm" => Some(7),
-        "rebot-rs" | "so-arm101" | "so-arm100" | "fashionstar" | "star-arm102" => Some(6),
-        "sim" | "mock" => None,
-        other => return Err(format!("Unknown follower model: {other}").into()),
-    };
+    let config = resolve_follower_config(follower, cli.config.as_deref())?;
     if follower == "mock" && cli.follower_port.is_some() {
         return Err("--follower-port requires a hardware follower".into());
-    }
-    let mut config = if let Some(path) = cli.config {
-        let config = ArmConfig::from_profile_file(&path)?;
-        if config.kinematics.is_none() || config.workspace.is_none() {
-            tracing::warn!("Profile {path} has no kinematics/workspace: the Cartesian workspace check and Cartesian actions are off");
-        }
-        config
-    } else if follower == "so-arm101" || follower == "so-arm100" {
-        let name = if follower == "so-arm100" { "so_arm100.json" } else { "so_arm101.json" };
-        let candidates = [
-            format!("/userdata/rebot-teleop/profile/{name}"),
-            format!("profiles/{name}"),
-            format!("/usr/share/rebot-teleop/profile/{name}"),
-        ];
-        if std::path::Path::new(&candidates[0]).exists() {
-            if let Some(bundled) = candidates[1..].iter().find(|p| std::path::Path::new(p).exists()) {
-                tracing::warn!("User profile {} overrides bundled profile {}", candidates[0], bundled);
-            }
-        }
-        let path = candidates.iter().find(|p| std::path::Path::new(p).exists())
-            .unwrap_or(&candidates[1]);
-        tracing::info!("Loaded profile for {follower} from {path}");
-        ArmConfig::from_profile_file(path)?
-    } else if follower == "rebot-dm" || follower == "sim" {
-        ArmConfig::rebot_dm()
-    } else {
-        ArmConfig::default()
-    };
-    config.validate()?;
-    if expected_dof.is_some_and(|dof| config.dof != dof) {
-        return Err(format!(
-            "Profile DOF {} does not match {follower} hardware DOF {}",
-            config.dof,
-            expected_dof.unwrap()
-        )
-        .into());
     }
     let period = Duration::from_secs_f64(1.0 / f64::from(config.control_frequency_hz));
     let port = match cli.port {
@@ -485,5 +494,24 @@ mod shutdown_tests {
         assert!(inner.set_torque(true).is_err());
         let mut unknown = physical(EnableState::Unknown);
         assert!(!request_shutdown(&mut unknown));
+    }
+
+    #[test]
+    fn rebot_rs_requires_config_while_mock_defaults() {
+        let err = resolve_follower_config("rebot-rs", None).unwrap_err();
+        assert!(err.contains("rebot-rs"), "error should name follower: {err}");
+        assert!(err.contains("--config"), "error should mention --config: {err}");
+        assert!(
+            err.contains("profiles/rebot_b601_rs.json"),
+            "error should include example profile path: {err}"
+        );
+
+        let mock = resolve_follower_config("mock", None).unwrap();
+        assert_eq!(mock.dof, 6);
+
+        let profile = concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/rebot_b601_rs.json");
+        let rs = resolve_follower_config("rebot-rs", Some(profile)).unwrap();
+        assert_eq!(rs.dof, 6);
+        assert!(rs.kinematics.is_some() && rs.workspace.is_some());
     }
 }

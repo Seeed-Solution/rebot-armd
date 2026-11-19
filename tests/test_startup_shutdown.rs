@@ -42,6 +42,8 @@ fn malformed_or_unimplemented_cli_modes_fail_closed() {
     assert!(rejected(&["--unexpected"]).contains("Unknown argument"));
     assert!(rejected(&["--follower", "mock", "--follower-port", "can0"])
         .contains("requires a hardware follower"));
+    let rs_err = rejected(&["--follower", "rebot-rs", "--port", "0"]);
+    assert!(rs_err.contains("rebot-rs") && rs_err.contains("--config") && rs_err.contains("profiles/rebot_b601_rs.json"), "{rs_err}");
 }
 
 #[test]
@@ -65,15 +67,23 @@ fn hardware_open_errors_never_fall_back_to_mock() {
     }
     #[cfg(target_os = "linux")]
     for model in ["rebot-dm", "rebot-rs"] {
-        let output = rejected(&[
+        let mut args = vec![
             "--follower",
             model,
             "--follower-port",
             "no_such_can",
             "--port",
             "0",
-        ]);
-        assert!(!output.contains("mock simulation"));
+        ];
+        if model == "rebot-rs" {
+            args.extend([
+                "--config",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/profiles/rebot_b601_rs.json"),
+            ]);
+        }
+        let output = rejected(&args);
+        assert!(!output.contains("mock simulation"), "{model}: {output}");
+        assert!(!output.contains("requires --config"), "{model}: {output}");
     }
 }
 
