@@ -507,6 +507,17 @@ body.ui-simple .tch-bar { position: fixed; z-index: 190; top: 8px; left: 50%; tr
 /* header icon buttons (settings, poses); same look as the full-screen button */
 .hd-btn { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; padding: 0; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral); background: #fff; color: var(--sc-color-text-secondary); cursor: pointer; touch-action: manipulation; }
 .hd-btn[hidden] { display: none; }
+/* the 点位 button carries its name where the header has room (tablet, desktop); icon only on phones */
+.hd-lbl, .hd-lbl-s { display: none; }
+@media (min-width: 800px) {
+  #btn-pset { width: auto; gap: 6px; padding: 0 10px 0 8px; }
+  #btn-pset .hd-lbl-s { display: inline; font-size: 13px; font-weight: 500; white-space: nowrap; }
+}
+/* the full name ("点位与动作" / "Positions & motions") where the header has room for it */
+@media (min-width: 1000px) {
+  #btn-pset .hd-lbl { display: inline; font-size: 13px; font-weight: 500; white-space: nowrap; }
+  #btn-pset .hd-lbl-s { display: none; }
+}
 .hd-btn svg { width: 18px; height: 18px; }
 .hd-btn:hover { color: var(--sc-color-text-primary); border-color: var(--sc-color-primary); }
 .hd-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
@@ -1515,6 +1526,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     </button>
     <button class="hd-btn" id="btn-pset" type="button" aria-label="点位" title="点位" data-i18n-aria="pose.title" data-i18n-title="pose.title" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 19 9.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/></svg>
+      <span class="hd-lbl" id="btn-pset-lbl" data-i18n="pose.title">点位</span><span class="hd-lbl-s" data-i18n="pose.title">点位</span>
     </button>
     <button class="hd-btn" id="btn-sset" type="button" aria-label="设置" title="设置" data-i18n-aria="sset.title" data-i18n-title="sset.title" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2l2.4 2.6 3.5-.4.4 3.5L21 10l-1.7 3 1 3.4-3.3 1.3-1.3 3.3-3.4-1-3 1.7-2.3-2.7-3.5.4-.4-3.5L1 14.5l1.7-3-1-3.4L5 6.8 6.3 3.5l3.4 1z" transform="scale(.9) translate(1.3 1.3)"/><circle cx="12" cy="12" r="3.2"/></svg>
@@ -9918,6 +9930,7 @@ function teachOnCaps() {
   if (on) b.hidden = false;
   b.dataset.i18nAria = b.dataset.i18nTitle = on ? 'tch.title' : 'pose.title';
   b.setAttribute('aria-label', t(b.dataset.i18nAria)); b.title = t(b.dataset.i18nTitle);
+  const lb = $('btn-pset-lbl'); lb.dataset.i18n = b.dataset.i18nAria; lb.textContent = t(lb.dataset.i18n);
   b.setAttribute('aria-expanded', String(on && TCH.open));
   if (!on) { TCH.teach = false; TCH.pick = []; if (TCH.open) teachOpen(false); }
   teachBarRender();
