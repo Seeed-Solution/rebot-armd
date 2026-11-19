@@ -481,8 +481,9 @@ impl EpisodeStore {
         };
         report.episodes = episodes.len();
         let mut cat = self.cat();
-        cat.episodes = episodes;
-        cat.datasets = datasets;
+        // entries written while the directory was scanned (a concurrent first use) are kept
+        for (id, e) in episodes { cat.episodes.entry(id).or_insert(e); }
+        if !cat.loaded { cat.datasets = datasets; }
         cat.loaded = true;
         Ok(report)
     }
