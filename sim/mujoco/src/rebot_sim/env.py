@@ -10,6 +10,7 @@ import mujoco
 import numpy as np
 
 from .camera import CameraMount
+from .domain_rand import ActionDelayBuffer, DomainRandomizationConfig, DomainRandomizer
 from .model import load_model
 from .pack import PackScene, load_scene_pack, load_tool_pack
 from .server import Motors
@@ -109,10 +110,15 @@ class SimEnv:
         render_width: int = 160,
         render_height: int = 120,
         headless: bool = True,
+        dr_config: DomainRandomizationConfig | None = None,
     ) -> None:
         if control_mode not in ("position", "velocity"):
             raise ValueError(
                 f"Unsupported control_mode {control_mode!r}: expected 'position' or 'velocity'"
+            )
+        if dr_config is not None and not isinstance(dr_config, DomainRandomizationConfig):
+            raise TypeError(
+                f"dr_config must be DomainRandomizationConfig or None, got {type(dr_config).__name__}"
             )
         self.scene_ref = scene
         self.robot = robot.lower()
@@ -124,6 +130,7 @@ class SimEnv:
         self.render_width = int(render_width)
         self.render_height = int(render_height)
         self.headless = headless
+        self.dr_config = dr_config
 
         self.scene_pack = load_scene_pack(scene) if scene is not None else None
         if tool is None and self.scene_pack is not None:
@@ -165,6 +172,19 @@ class SimEnv:
                 self.renderer = None
 
         self._prev_score = 0.0
+        self._randomizer: DomainRandomizer | None = None
+        self._action_delay_buffer: ActionDelayBuffer | None = None
+        self._obs_rng: np.random.Generator | None = None
+        if self.dr_config is not None:
+            self._randomizer = DomainRandomizer(self.model, self.dr_config)
+            self._action_delay_buffer = ActionDelayBuffer(0)
+            if self.dr_config.enabled:
+                self._obs_rng = np.random.default_rng()
+
+    @property
+    def domain_randomizer(self) -> DomainRandomizer | None:
+        """Active ``DomainRandomizer`` instance when ``dr_config`` is provided."""
+        return self._randomizer
 
     @property
     def n_joints(self) -> int:
@@ -204,10 +224,32 @@ class SimEnv:
         if self.render_camera is not None and self.renderer is not None:
             self.renderer.update_scene(self.data, camera=self.render_camera)
             obs["image"] = self.renderer.render()
+        if self._randomizer is not None and self.dr_config is not None and self.dr_config.enabled:
+            rng = self._obs_rng if self._obs_rng is not None else np.random.default_rng()
+            obs = self._randomizer.apply_obs_noise(obs, rng)
+            if "image" in obs:
+                obs["image"] = self._randomizer.apply_image_noise(obs["image"], rng)
         return obs
 
     def reset(self, seed: int | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
         """Reset arm joints to home neutral pose, reset scene objects, IO, and return (obs, info)."""
+        dr_params: dict[str, Any] | None = None
+        if self._randomizer is not None and self.dr_config is not None:
+            if self.dr_config.enabled:
+                dr_params = self._randomizer.apply(self.model, seed=seed, data=self.data)
+                self._obs_rng = (
+                    np.random.default_rng(np.random.SeedSequence(seed).spawn(1)[0])
+                    if seed is not None
+                    else np.random.default_rng()
+                )
+                if self._action_delay_buffer is not None:
+                    self._action_delay_buffer.reset(delay_steps=dr_params["action_delay_steps"])
+            else:
+                self._randomizer.restore_baseline(self.model, data=self.data)
+                self._obs_rng = None
+                if self._action_delay_buffer is not None:
+                    self._action_delay_buffer.reset(delay_steps=0)
+
         self.data.time = 0.0
         self.data.qpos[:] = self.model.qpos0
         self.data.qvel[:] = 0.0
@@ -227,10 +269,12 @@ class SimEnv:
         self._prev_score = float(task.get("score", 0.0)) if task else 0.0
 
         obs = self._get_obs()
-        info = {
+        info: dict[str, Any] = {
             "task": task,
             "sim_time_s": float(self.data.time),
         }
+        if dr_params is not None:
+            info["dr_params"] = dr_params
         return obs, info
 
     def step(
@@ -240,6 +284,12 @@ class SimEnv:
     ) -> tuple[dict[str, Any], float, bool, dict[str, Any]]:
         """Execute one control step (n_substeps physics steps) without real-time delays."""
         act = self._validate_action(action)
+        if (
+            self._action_delay_buffer is not None
+            and self.dr_config is not None
+            and self.dr_config.enabled
+        ):
+            act = self._action_delay_buffer.push(act)
         if io_updates:
             self.pack_scene.set_io(io_updates, self.data)
 
