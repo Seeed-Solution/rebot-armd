@@ -3,13 +3,15 @@
 //   armd --follower mock --config kits/recamera-b601dm/profile/rebot-b601dm.json --port 18930 --episodes-dir <dir>
 //     (ARMD_POSES, ARMD_SEQUENCES, ARMD_CALIBRATION, ARMD_GRIPPER_CALIB pointing into a scratch dir; a fresh dir is best)
 //   ARMD=http://127.0.0.1:18930 PLAYWRIGHT=/path/to/playwright/index.mjs CHROME=/path/to/chrome node scripts/teach_live.mjs
-// Expert mode, English, 1400x900. Steps: enable; open the Teach panel from the settings drawer; record a trajectory
+// Expert mode, English, 1400x900. Steps: enable; open "Positions & motions" from the header 点位 button (poses tab;
+// the settings drawer has no teach entry); record a trajectory
 // with the teach strip while the arm jogs (source "jog"); new sequence; close the panel (the strip stays, covers no
 // control and not the video); two poses via "Save pose" on the strip after setting the gripper with the normal
 // gripper slider (each adds a pose step with gripper "pose" and saves the sequence; the poses hold the opening);
 // from the strip back to the editor: a gripper step (opening slider), a wait, the recorded trajectory; save; run with
 // "record this run" for 2 repeats (2 new episodes, source "sequence", sequence_id, repeat_index 0 / 1); run again and
-// Stop during the wait (parent action ends, the status shows it); delete a used pose -> IN_USE with the sequence
+// Stop during the wait (parent action ends, the status shows it); tick the two poses in reverse order and Play (saved as
+// "Motion 1" with that order, runs to the end at the last ticked pose; the same ticks again reuse it); delete a used pose -> IN_USE with the sequence
 // name; rename a pose (id kept, the step title follows); software zero of a joint from Tools > Zero (torque off in
 // place, so the reading is off the reference) -> the poses show the old-zero badge, Run -> DATA_STALE confirm ->
 // continue -> the run starts with allow_stale. Screenshots go to .cache/teach-live/. Exits non-zero on a failed check.
@@ -62,10 +64,14 @@ ok(await page.evaluate(() => teachOn() && S.caps.teach.episodes === true && S.ca
 await enable();
 await page.evaluate(() => commandRPC('/api/v1/motion/home', {})).catch(() => {});
 await page.waitForTimeout(300); await idle();
+// the header 点位 button opens "Positions & motions" on the poses tab; the settings drawer has no teach entry
 await page.evaluate(() => ssetOpen(true));
-await page.waitForSelector('#teach-open', { state: 'visible' });
-await page.click('#teach-open');
+ok(await page.locator('#sset #teach-open, #sset #teach-set').count() === 0, 'settings drawer: no teach entry');
+await page.evaluate(() => ssetOpen(false));
+ok((await page.getAttribute('#btn-pset', 'aria-label')) === 'Positions & motions', 'header button: "Positions & motions"');
+await page.click('#btn-pset');
 await page.waitForFunction(() => TCH.open && TCH.loaded, null, { timeout: 5000 });
+ok(await page.evaluate(() => TCH.tab === 'pose' && document.getElementById('pset').hidden), 'opens on the poses tab (not the old poses drawer)');
 ok(await page.locator('#teach-bar').isVisible() && !(await page.locator('#tb-pose').isDisabled()), 'teach strip shown with 记点 enabled while the arm is enabled and this page can move it');
 
 // ------------------------------------------------------------------ record a trajectory (jog)
@@ -96,7 +102,7 @@ step('new sequence; close the panel; teach with the strip and the normal control
 await page.click('#teach-tab-seq');
 const seqName = 'live ' + tag;
 await page.fill('#tch-new-name', seqName);
-await bodyClick('New sequence');
+await bodyClick('New motion');
 await page.waitForFunction(() => !!TCH.cur, null, { timeout: 2000 });
 await page.click('#teach-close');
 await page.waitForTimeout(300);
@@ -177,13 +183,13 @@ await shot('running_repeat2');
 await idle(90000);
 await page.waitForTimeout(800);
 const st1 = await status();
-ok(/Sequence done/.test(st1), 'status after the run: ' + st1);
+ok(/Motion done/.test(st1), 'status after the run: ' + st1);
 const eps2 = (await get('/api/v1/episodes?limit=500')).episodes.filter((e) => e.sequence_id === seqId);
 ok(eps2.length === 2 && eps2.every((e) => e.source === 'sequence') && eps2.map((e) => e.repeat_index).sort().join() === '0,1',
   'two recorded repeats: ' + JSON.stringify(eps2.map((e) => ({ src: e.source, r: e.repeat_index, task: e.task, ds: e.dataset }))));
 await page.click('#teach-tab-ep');
 await page.waitForTimeout(300);
-ok(await page.locator('#teach-body li .tch-bd', { hasText: 'sequence' }).count() >= 2, 'run episodes shown with the source badge "sequence"');
+ok(await page.locator('#teach-body li .tch-bd', { hasText: 'motion' }).count() >= 2, 'run episodes shown with the source badge "sequence"');
 await shot('episodes_after_run');
 await page.click('#teach-tab-seq');
 
@@ -202,8 +208,41 @@ await page.waitForTimeout(500);
 const ended = await page.evaluate((id) => [S.obs.action, S.obs.previous_action].find((a) => a && a.id === id), waitAct.id);
 ok(ended && ended.state !== 'done' && ended.state !== 'running', 'stopped in the wait: ' + JSON.stringify(ended && { state: ended.state, code: ended.code, step: ended.step_index, failed_step: ended.failed_step }));
 const st2 = await status();
-ok(/Sequence ended/.test(st2), 'status after stop: ' + st2);
+ok(/Motion ended/.test(st2), 'status after stop: ' + st2);
 await shot('stopped');
+
+// ------------------------------------------------------------------ tick poses, play in ticked order
+step('poses tab: tick the second pose, then the first, Play -> a new motion with them in tick order, run to the end');
+await page.click('#teach-tab-pose');
+await page.waitForTimeout(300);
+const seqsBefore = (await get('/api/v1/sequences')).sequences.map((x) => x.id);
+for (const id of [stepPoseIds[1], stepPoseIds[0]]) await page.locator(`#tch-poses > li[data-id="${id}"] input[type=checkbox]`).check();
+ok((await page.locator('#tch-poses .tch-n:not(.off)').allTextContents()).join() === '2,1', 'tick numbers follow the tick order');
+await shot('poses_ticked');
+await page.click('#tch-pick-play');
+await page.waitForFunction(() => S.obs.action && S.obs.action.kind === 'sequence' && S.obs.action.state === 'running', null, { timeout: 5000 });
+const newSeqs = (await get('/api/v1/sequences')).sequences.filter((x) => !seqsBefore.includes(x.id));
+ok(newSeqs.length === 1 && newSeqs[0].name === 'Motion 1' && JSON.stringify(newSeqs[0].steps.map((x) => x.pose_id)) === JSON.stringify([stepPoseIds[1], stepPoseIds[0]]),
+  'saved as one new motion with the poses in tick order: ' + JSON.stringify(newSeqs.map((x) => ({ name: x.name, steps: x.steps.length }))));
+ok(await page.evaluate(() => TCH.tab === 'seq' && !document.getElementById('tch-stop').hidden), 'Motions tab shows the running motion with Stop');
+await shot('play_ticked_running');
+await idle(60000);
+await page.waitForTimeout(600);
+ok(/Motion done/.test(await status()), 'played to the end: ' + await status());
+const qA = await page.evaluate(() => S.obs.positions.slice(0, 6));
+const pLast = (await get('/api/v1/poses')).poses.find((p) => p.id === stepPoseIds[0]).positions;
+ok(qA.every((v, i) => Math.abs(v - pLast[i]) < 0.03), 'arm ends at the last ticked pose: ' + qA.map((v) => v.toFixed(2)) + ' vs ' + pLast.slice(0, 6).map((v) => v.toFixed(2)));
+// the same ticks again: the saved motion is reused
+await page.click('#teach-tab-pose');
+await page.waitForTimeout(300);
+for (const id of [stepPoseIds[1], stepPoseIds[0]]) await page.locator(`#tch-poses > li[data-id="${id}"] input[type=checkbox]`).check();
+await page.click('#tch-pick-play');
+await page.waitForFunction(() => S.obs.action && S.obs.action.kind === 'sequence' && S.obs.action.state === 'running', null, { timeout: 5000 });
+ok((await get('/api/v1/sequences')).sequences.length === seqsBefore.length + 1, 'same ticks again: no second motion saved');
+await idle(60000);
+await page.waitForTimeout(400);
+// back to the taught motion (the checks below use its steps)
+await page.evaluate((id) => teachEdit(id), seqId);
 
 // ------------------------------------------------------------------ IN_USE, rename
 step('delete a used pose (IN_USE), rename a pose');
@@ -216,7 +255,7 @@ await row.locator('button.tch-del').click();
 await row.locator('button.tch-del').click();
 await page.waitForTimeout(500);
 const st3 = await status();
-ok(st3.includes('Used by the sequences') && st3.includes(seqName), 'IN_USE text with the sequence name: ' + st3);
+ok(st3.includes('Used by the motions') && st3.includes(seqName), 'IN_USE text with the sequence name: ' + st3);
 ok((await get('/api/v1/poses')).poses.some((p) => p.id === p0.id), 'pose still in armd');
 await row.locator('button', { hasText: 'Rename' }).click();
 const newName = 'renamed_' + tag;
@@ -291,7 +330,7 @@ if (ask) {
   ok(true, 'run started after the confirm (allow_stale)');
   await idle(60000);
   await page.waitForTimeout(600);
-  ok(/Sequence done/.test(await status()), 'stale run finished: ' + await status());
+  ok(/Motion done/.test(await status()), 'stale run finished: ' + await status());
 }
 await shot('stale_run_done');
 

@@ -3,8 +3,10 @@
 //   PLAYWRIGHT=/path/to/playwright/index.mjs CHROME=/path/to/chrome node scripts/teach_shots.mjs
 // A local server serves src/api/index.html, /assets/calib_wizard.js and mocks of GET /api/v1/sequences, /poses,
 // /episodes, /datasets; the control WebSocket is a stub, commandRPC (lease commands) and teachCmd (lease-free
-// commands) are replaced in the page by mocks that record the calls. Checked: the entry is hidden without
-// capabilities.teach and shown with it; the hand-guide record button keeps the legacy dataset recording without
+// commands) are replaced in the page by mocks that record the calls. Checked: without capabilities.teach the 点位
+// button opens the plain poses drawer; with it the 点位 button (simple + expert header, no settings entry) opens
+// "Positions & motions" on the poses tab; ticking poses numbers them in tick order, "play" saves them as a motion
+// (an identical motion is reused) and runs it once; the hand-guide record button keeps the legacy dataset recording without
 // it, and with it records into the teach store (record/start|stop) and opens the panel collapsed; sequence list with a stale badge, editor (reorder, speed, delete), run with repeat + record body, live step
 // highlight from the parent action progress, Stop, DATA_STALE confirm -> allow_stale, the run result; teach bar
 // while hand-guiding ("Save pose" -> poses/save + a pose step, "Record" -> record/start / stop + a replay step,
@@ -130,9 +132,13 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
 
     // 0 without capabilities.teach: no entry; the hand-guide record button keeps the legacy dataset recording
     await ev(setup, false);
-    await ev(() => { S.obs.control_mode = 'gravity_comp'; S.obs.gravity_comp.phase = 'active'; renderGc(); window.__legacy = 0; $('btn-rec').addEventListener('click', () => { window.__legacy++; }); ssetOpen(true); });
-    const g0 = await ev(() => ({ set: !$('teach-set').hidden, panel: !$('teach').hidden }));
-    await ev(() => { ssetOpen(false); $('btn-gc-rec').click(); });
+    // the 点位 button opens the plain poses drawer (#pset), the settings drawer has no teach entry
+    await ev(() => { S.obs.control_mode = 'gravity_comp'; S.obs.gravity_comp.phase = 'active'; renderGc(); window.__legacy = 0; $('btn-rec').addEventListener('click', () => { window.__legacy++; }); $('btn-pset').click(); });
+    await page.waitForTimeout(200);
+    const g0 = await ev(() => ({ set: !!document.querySelector('#sset #teach-set, #sset #teach-open'), panel: !$('teach').hidden, pset: !$('pset').hidden, aria: $('btn-pset').getAttribute('aria-label') }));
+    if (!g0.pset || g0.aria !== (lang === 'zh' ? '点位' : 'Poses')) fail(`old armd poses drawer ${tag}: ${JSON.stringify(g0)}`);
+    await shot('0_old_armd_poses', 'pset');
+    await ev(() => { psetOpen(false); $('btn-gc-rec').click(); });
     const g0b = await ev(() => ({ legacy: window.__legacy, tc: window.__tc.length, panel: !$('teach').hidden }));
     if (g0.set || g0.panel || g0b.legacy !== 1 || g0b.tc || g0b.panel) fail(`gating without teach ${tag}: ${JSON.stringify({ ...g0, ...g0b })}`);
     await ev(() => { S.obs.control_mode = 'position'; S.obs.gravity_comp.phase = null; renderGc(); });
@@ -153,11 +159,70 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     if (g1.open || !g1.teach || !g1.rec || !g1.gcrec || !g1.bar || g2.legacy || g2.rec || JSON.stringify(g2.tc) !== '["/api/v1/record/start:hand_guide","/api/v1/record/stop:true"]')
       fail(`hand-guide record shortcut ${tag}: ${JSON.stringify({ g1, g2 })}`);
     await ev(() => { teachOpen(false); teachStrip(false); S.obs.control_mode = 'position'; S.obs.gravity_comp.phase = null; renderGc(); window.__tc = []; });
+    // settings hold no teach entry; the 点位 button (header, both layouts) opens "Positions & motions" on the poses tab
     await ev(() => ssetOpen(true));
-    if (!(await ev(() => !$('teach-set').hidden && $('teach-set').nextElementSibling.id === 'tools-set'))) fail(`entry ${tag}`);
-    await shot('0_settings_entry', 'sset');
-    await ev(() => $('teach-open').click());
+    if (await ev(() => !!document.querySelector('#sset #teach-set, #sset #teach-open') || [...$('sset').querySelectorAll('.gset-k span')].some((x) => /示教|Teach/.test(x.textContent)))) fail(`settings still list teach ${tag}`);
+    await ev(() => ssetOpen(false));
+    for (const ui of ['simple', 'expert']) {
+      await ev((ui) => setUi(ui), ui);
+      await page.waitForTimeout(250);
+      const en = await ev(() => { const b = $('btn-pset'), r = b.getBoundingClientRect(); return { vis: !!b.offsetWidth && r.top >= 0 && r.right <= innerWidth + 0.5, aria: b.getAttribute('aria-label'), page: document.documentElement.scrollWidth > innerWidth + 1 }; });
+      if (!en.vis || en.aria !== (lang === 'zh' ? '点位与动作' : 'Positions & motions') || en.page) fail(`entry ${ui} ${tag}: ${JSON.stringify(en)}`);
+      await ev(() => { const b = $('btn-pset'); b.style.outline = '3px solid #e5484d'; b.style.outlineOffset = '2px'; });
+      await page.waitForTimeout(100);
+      const file = path.join(out, `teach_0_entry_${ui}_${lang}_${vpName}.png`);
+      await page.screenshot({ path: file }); shots.push(file); console.log(path.relative(root, file) + `  entry ${en.aria}`);
+      await ev(() => { $('btn-pset').style.outline = ''; $('btn-pset').style.outlineOffset = ''; });
+    }
+    await ev(() => setUi('simple'));
+    await page.waitForTimeout(200);
+    await page.click('#btn-pset');
     await page.waitForTimeout(400);
+    const pe = await ev(() => ({ open: TCH.open, tab: TCH.tab, pset: !$('pset').hidden, tabs: [...$('teach-tabs').children].map((b) => b.textContent), title: $('teach-h').textContent }));
+    if (!pe.open || pe.tab !== 'pose' || pe.pset || pe.tabs.length !== 3 || pe.tabs[0] !== (lang === 'zh' ? '点位' : 'Poses')) fail(`entry opens poses tab ${tag}: ${JSON.stringify(pe)}`);
+    // tick bin_b then scan (tick order, not list order), play: a new motion "动作 1" / "Motion 1" is saved and run once
+    await ev(() => {
+      window.__cmd = [];
+      window.__reply['/api/v1/sequences/save'] = (b) => ({ sequence: { ...b, id: 'S9', rev: 1 }, epoch_id: 1 });
+      window.__reply['/api/v1/action/run_sequence'] = { action_id: 'A9', epoch_id: 1 };
+      const cb = (id) => document.querySelector(`#tch-poses > li[data-id="${id}"] input[type=checkbox]`);
+      cb('01JD0000000000000000POSE03').click(); cb('01JD0000000000000000POSE01').click();
+    });
+    const pk = await ev(() => ({ pick: TCH.pick.map((x) => x.slice(-6)), nums: [...document.querySelectorAll('#tch-poses > li')].map((li) => li.querySelector('.tch-n').textContent), play: $('tch-pick-play') && $('tch-pick-play').textContent }));
+    if (JSON.stringify(pk.pick) !== '["POSE03","POSE01"]' || JSON.stringify(pk.nums) !== '["2","","1"]' || !pk.play || !pk.play.includes('2')) fail(`tick order ${tag}: ${JSON.stringify(pk)}`);
+    await shot('0_poses_ticked', 'teach-panel', `ticked ${pk.pick.join(' -> ')}`);
+    await ev(() => $('tch-pick-play').click());
+    await page.waitForTimeout(400);
+    const pp = await ev(() => ({ cmd: window.__cmd.map(([p, b]) => [p, p.endsWith('save') ? { name: b.name, steps: b.steps.map((s) => s.pose_id.slice(-6) + ':' + s.gripper + ':' + s.speed_scale) } : { id: b.id, repeat: b.repeat, record: !!b.record }]), tab: TCH.tab, cur: TCH.cur && TCH.cur.id, pick: TCH.pick.length }));
+    const autoName = lang === 'zh' ? '动作 1' : 'Motion 1';
+    if (JSON.stringify(pp.cmd) !== JSON.stringify([['/api/v1/sequences/save', { name: autoName, steps: ['POSE03:pose:0.5', 'POSE01:pose:0.5'] }], ['/api/v1/action/run_sequence', { id: 'S9', repeat: 1, record: false }]]) || pp.tab !== 'seq' || pp.cur !== 'S9' || pp.pick)
+      fail(`play ticked ${tag}: ${JSON.stringify(pp)}`);
+    await ev(() => { S.obs.action = { id: 'A9', kind: 'sequence', state: 'running', step_index: 0, step_type: 'pose', repeat_index: 0, repeats: 1, phase: 'move' }; obsTick(); });
+    await shot('0_play_ticked_running', 'teach-panel', `saved "${autoName}" and running`);
+    await ev(() => { S.obs.action = null; obsTick(); });
+    // the same ticks again reuse the saved motion (no second save)
+    await ev(() => {
+      window.__cmd = []; TCH.cur = null; TCH.dirty = false; TCH.tab = 'pose'; teachRender();
+      const cb = (id) => document.querySelector(`#tch-poses > li[data-id="${id}"] input[type=checkbox]`);
+      cb('01JD0000000000000000POSE03').click(); cb('01JD0000000000000000POSE01').click(); $('tch-pick-play').click();
+    });
+    await page.waitForTimeout(400);
+    const pr = await ev(() => window.__cmd.map(([p, b]) => p + ':' + (b.id || b.name)));
+    if (JSON.stringify(pr) !== '["/api/v1/action/run_sequence:S9"]') fail(`reuse motion ${tag}: ${JSON.stringify(pr)}`);
+    // 记点 on the strip with no motion open: the new pose joins the poses list ticked (record a few, then play)
+    await ev(() => {
+      S.obs.action = null; TCH.cur = null; TCH.dirty = false; TCH.tab = 'pose'; TCH.pick = []; window.__cmd = [];
+      window.__getReal = window.__getReal || window.teachGet;
+      window.teachGet = async (p) => { const d = await window.__getReal(p); if (p === '/api/v1/poses') d.poses = d.poses.concat([{ id: '01JD0000000000000000POSE07', name: 'p01', positions: [] }]); return d; };
+      window.__reply['/api/v1/poses/save'] = (b) => ({ pose: { id: '01JD0000000000000000POSE07', name: b.name }, epoch_id: 1 });
+      teachRender(); $('tb-pose').click();
+    });
+    await page.waitForTimeout(400);
+    const sp = await ev(() => ({ pick: TCH.pick.map((x) => x.slice(-6)), cmd: window.__cmd.map(([p, b]) => p + ':' + b.name), row: !!document.querySelector('#tch-poses > li[data-id$="POSE07"].sel'), play: !!$('tch-pick-play') }));
+    if (JSON.stringify(sp.pick) !== '["POSE07"]' || JSON.stringify(sp.cmd) !== '["/api/v1/poses/save:p01"]' || !sp.row || !sp.play) fail(`strip pose ticked ${tag}: ${JSON.stringify(sp)}`);
+    await ev(() => { window.teachGet = window.__getReal; TCH.pick = []; return teachLoad(true); });
+    await ev(() => { S.obs.previous_action = { id: 'A9', kind: 'sequence', state: 'done' }; obsTick(); TCH.seqs = TCH.seqs.filter((s) => s.id !== 'S9'); TCH.cur = null; TCH.dirty = false; TCH.tab = 'seq'; window.__cmd = []; teachRender(); });
+    await page.waitForTimeout(300);
     const l1 = await ev(() => ({ open: !$('teach').hidden, sset: $('sset').hidden, items: [...document.querySelectorAll('#tch-seqs > li')].map((li) => li.dataset.id),
       stale: !!document.querySelector('#tch-seqs > li[data-id="S1"] .tch-bd.stale') }));
     if (!l1.open || !l1.sset || JSON.stringify(l1.items) !== '["S1","S2"]' || !l1.stale) fail(`sequence list ${tag}: ${JSON.stringify(l1)}`);
