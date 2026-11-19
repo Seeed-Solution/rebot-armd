@@ -132,7 +132,7 @@ def _block_angle(rig, yaw_deg: float) -> dict:
     qa = rig.scene.qpos[0]
     y = math.radians(yaw_deg)
     rig.data.qpos[qa + 3:qa + 7] = [math.cos(y / 2), 0, 0, math.sin(y / 2)]
-    set_arm(rig.model, rig.data, [0.46, -0.63, -1.05, 1.48, 0.43, -0.66])
+    set_arm(rig.model, rig.data, [0.46, -0.63, -1.05, 1.48, 0.43, -2.2307963])  # J6 -0.66 - pi/2 (official J6 convention)
     dets = rig.detect()
     assert dets, "block not in view"
     return dets[0]

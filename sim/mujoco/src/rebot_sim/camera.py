@@ -2,7 +2,7 @@
 
 Mount convention = armd `kinematics::cam_mount` (OpenCV camera frame: x right, y down,
 z = optical axis): R_end_cam = [x0 y0 z0] · Rz(rot_deg) · Rx(tilt_deg) with z0 = end_link x,
-y0 = flip · (J5 axis in end_link at the J6 rest angle, motor pi/2 = URDF pi/2 + offset; x part
+y0 = flip · (J5 axis in end_link at the rest pose, URDF angles 0; x part
 removed), x0 = y0 × z0. The optical
 centre sits at `offset_m` in end_link. armd's profile leaves `offset_m` null (not measured);
 the simulator then uses the v8 holder's assumed lens centre (reBot-DevArm

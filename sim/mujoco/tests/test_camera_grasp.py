@@ -76,7 +76,7 @@ NOISE = ["--det-jitter-px", "3", "--det-size-jitter", "0.05", "--det-drop-rate",
 # stays inside the image at the approach height and armd's height probe runs. With the 66 mm
 # lens centre the box reaches the image border (u about 0.04) and the probe falls back with
 # height_reason "border"; a lens on the tool axis sees only the gripper.
-# The J6 rest angle (motor pi/2 = URDF 0) turned the mount reference by 90 deg: rot -90 keeps
+# The mount reference at the rest pose (URDF J6 = 0) is 90 deg from the one before the J6 offset fix: rot -90 keeps
 # the lens offset along the image's wide (u) axis, as before the J6 offset fix (grip pixel u 0.24
 # at 0.15 m); with rot 0 it lies along the 24.7 deg tall axis and the box reaches the border.
 AXIS_LENS = ["--camera-offset=-0.0731,0.0005,0.045", "--camera-rot-deg=-90"]

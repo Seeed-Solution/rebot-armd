@@ -97,8 +97,9 @@ def test_detections_contain_the_projected_object_centre_and_match_the_render():
     data = mujoco.MjData(model)
     scene = Scene(model, objects)
     scene.reset(data, seed=None)
-    # a pose (found by sampling, motor angles) with the cube whole in view and the block cut by the image edge
-    set_arm(model, data, [0.58, -0.96, -1.04, 1.29, 0.56, -0.64])
+    # a pose (found by sampling, joint angles; J6 -0.64 - pi/2 since the official J6 convention) with the
+    # cube whole in view and the block cut by the image edge
+    set_arm(model, data, [0.58, -0.96, -1.04, 1.29, 0.56, -2.2107963])
     cam = model.camera("wrist").id
     renderer = mujoco.Renderer(model, 360, 640)
     renderer.enable_segmentation_rendering()
@@ -176,7 +177,7 @@ def test_view_past_the_table_shows_a_neutral_background():
     model = load_model(devarm_dir="", objects=objects, camera=CameraMount.from_profile())
     data = mujoco.MjData(model)
     Scene(model, objects).reset(data, seed=None)
-    set_arm(model, data, [0.089, -1.034, -1.185, 0.933, -0.386, 1.37])
+    set_arm(model, data, [0.089, -1.034, -1.185, 0.933, -0.386, -0.2007963])  # J6 1.37 - pi/2 (official J6 convention)
     model.vis.global_.offwidth, model.vis.global_.offheight = 1280, 720
     renderer = mujoco.Renderer(model, 720, 1280)
     renderer.update_scene(data, camera="wrist")
