@@ -242,8 +242,11 @@ if (process.env.KIN_E_SEEDS) {
   const k = kInj.slice(); k[7 * 4] = 12 / D;
   const r = solveKinematics({ views: render(k), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
   const g = r.gates.find((x) => x.key === 'kin_bounds');
-  check('c. J5 zero offset 12 deg (bound 10) -> refused', !r.ok && g && !g.ok && r.outOfBounds.some((o) => o.joint === 5 && o.param === 'offset'),
-    `J5 offset ${(r.k[28] * D).toFixed(2)} deg, out of bounds ${r.outOfBounds.map((o) => `J${o.joint}.${o.param}`).join(',')}; gates ${gateStr(r.gates)}`);
+  // a level whose fit leaves the bounds is not eligible: the J5 12 deg level is skipped, the remaining levels cannot
+  // explain the error (held-out > 5 mm), so the solve is refused and no out-of-bounds correction is ever applied
+  const oobLevels = r.levels.filter((l) => l.outOfBounds).map((l) => l.name);
+  check('c. J5 zero offset 12 deg (bound 10) -> refused, out-of-bounds levels not chosen', !r.ok && oobLevels.length > 0 && !r.levels.find((l) => l.chosen).outOfBounds && r.outOfBounds.length === 0,
+    `out-of-bounds levels ${oobLevels.join(',')}, chosen ${r.level}, J5 offset ${(r.k[28] * D).toFixed(2)} deg; gates ${gateStr(r.gates)}`);
 }
 {
   const r = solveKinematics({ views: render(kInj, { jointErr: 1.2 / D }), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
