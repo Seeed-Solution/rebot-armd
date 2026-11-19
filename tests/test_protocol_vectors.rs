@@ -596,12 +596,12 @@ fn test_damiao_driver_mock_loopback() {
     driver.can_mut().provide_rx_frame(CanFrame::new_standard(0x99, &d1).unwrap());
     let _ = driver.read_joint_states().unwrap();
 
-    // 5. Test best-effort disable
+    // 5. Test best-effort disable: no motor confirms, the frame is resent at 25 and 75 ms
     driver.set_torque(false).unwrap();
     let disable_tx = driver.can_mut().take_tx_frames();
-    assert_eq!(disable_tx.len(), 2);
     assert_eq!(disable_tx[0].data, CMD_DISABLE);
     assert_eq!(disable_tx[1].data, CMD_DISABLE);
+    assert_eq!(disable_tx.iter().filter(|f| f.data == CMD_DISABLE).count(), 6, "{disable_tx:?}");
 }
 
 // =========================================================================
