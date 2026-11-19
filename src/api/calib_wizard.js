@@ -251,6 +251,34 @@ export function detectCornerOrder(views, board) {
   return best;
 }
 
+
+/* Screen raw views before any solve. A view is dropped when the same marker id appears twice (a second board or a
+   look-alike in the image; seen on a real capture: ids 0,0 and 8,8, which made the intrinsics drop 82 of 122
+   views and pulled fx from 811 to 824), or when one homography cannot explain its board corners (> maxPx; a
+   mis-identified marker: 170 px on the same capture). Returns { views (kept, original objects), rejected:
+   [{ i, why: 'duplicate_ids'|'inconsistent', ids?, px? }] }. */
+export function screenViews(views, board, { order = null, maxPx = 3 } = {}) {
+  const ord = order || detectCornerOrder(views, board).order;
+  const kept = [], rejected = [];
+  views.forEach((V, i) => {
+    const ids = (V.markers || []).map((m) => Number(m.id)).filter((id) => board.byId.has(id));
+    const dup = ids.filter((id, k) => ids.indexOf(id) !== k);
+    if (dup.length) { rejected.push({ i, why: 'duplicate_ids', ids: [...new Set(dup)] }); return; }
+    const { obj, img } = correspondences({ markers: boardMarkers(V, board) }, board, ord);
+    if (obj.length >= 8) {
+      const H = homography(obj, img);
+      if (H) {
+        let s = 0;
+        obj.forEach((X, k) => { const p = hApply(H, X); s += (p[0] - img[k][0]) ** 2 + (p[1] - img[k][1]) ** 2; });
+        const px = Math.sqrt(s / obj.length);
+        if (!(px <= maxPx)) { rejected.push({ i, why: 'inconsistent', px }); return; }
+      }
+    }
+    kept.push(V);
+  });
+  return { views: kept, rejected };
+}
+
 // ---------------------------------------------------------------- homography (normalised DLT)
 const hApply = (H, X) => { const w = H[2][0] * X[0] + H[2][1] * X[1] + H[2][2]; return [(H[0][0] * X[0] + H[0][1] * X[1] + H[0][2]) / w, (H[1][0] * X[0] + H[1][1] * X[1] + H[1][2]) / w]; };
 function normT(P) {
@@ -627,7 +655,10 @@ export function fitTable(Tbb, board, thickness = 0.0005, gates = GATES) {
    Returns { ok, intr, handEye, joint, final: { K, X, Tbb }, table, gates, apply (body for
    /api/v1/calibration/apply) }. */
 export function solveAll({ views, board, CALM, thickness = 0.0005, gates = GATES, size = IMAGE, init = NOMINAL, solvedAt = null, joint = true }) {
+  const screened = screenViews(views, board);
+  views = screened.views;
   const intr = calibrateIntrinsics(views, board, { size, gates, init });
+  intr.rejected = screened.rejected;
   const res = { ok: false, intr, gates: [...intr.gates] };
   if (!intr.K) return res;
   const G = [], M = [], vi = [], obs = [];
@@ -954,7 +985,7 @@ export const KIN_PARAM_NAMES = Object.freeze(['offset', 'scale', 'tilt_x', 'tilt
 export const KIN_PRIOR = Object.freeze({ weight: 3, minimalWeight: 1, sigma: [1 / D, 0.01, 1 / D, 1 / D, 0.005, 0.005, 0.005] });
 export const KIN_L3 = Object.freeze([...[1, 2, 3, 4].map((j) => 7 * j), ...[1, 2, 3, 4].flatMap((j) => [1, 2, 3, 4, 5, 6].map((p) => 7 * j + p))]);
 export const KIN_L1 = Object.freeze([1, 2, 3, 4].map((j) => 7 * j));
-export const KIN_L2 = Object.freeze([...KIN_L1, 7 + 1, 7 + 2, 7 + 3]);
+export const KIN_L2 = Object.freeze([...KIN_L1, 7 + 1, 7 + 2]);
 // prior: L3 uses KIN_PRIOR.weight, the minimal levels L1 / L2 KIN_PRIOR.minimalWeight
 export const KIN_LEVELS = Object.freeze([
   Object.freeze({ name: 'L0', kIdx: Object.freeze([]), prior: null }),
@@ -968,7 +999,8 @@ export const KIN_SELECT = Object.freeze({ maxWorseMm: 0.1, tieMm: 0.1 });
    and the simplest eligible level within tieMm of that mean is chosen. Returns { index, eligible, mean }. */
 export function chooseKinLevel(rows, { maxWorseMm = KIN_SELECT.maxWorseMm, tieMm = KIN_SELECT.tieMm } = {}) {
   const l0 = rows[0], mean = rows.map((r) => (r.ab + r.ba) / 2);
-  const eligible = rows.map((r, i) => i === 0 || (Number.isFinite(mean[i]) && r.ab <= l0.ab + maxWorseMm && r.ba <= l0.ba + maxWorseMm));
+  // rows[i].oob: the level's fit left the parameter bounds (on A, B or A + B) -> not eligible
+  const eligible = rows.map((r, i) => i === 0 || (!r.oob && Number.isFinite(mean[i]) && r.ab <= l0.ab + maxWorseMm && r.ba <= l0.ba + maxWorseMm));
   let best = 0;
   for (let i = 1; i < rows.length; i++) if (eligible[i] && mean[i] < mean[best]) best = i;
   let index = best;
@@ -1195,8 +1227,18 @@ export function* solveKinematicsSteps({ views, board, K, chain, X0, order = null
   say('held-out');
   const ho = [];
   for (let i = 0; i < levels.length; i++) ho.push({ ab: yield* kinHeldOut(B, ch, K, fa[i].X, fa[i].k), ba: yield* kinHeldOut(A, ch, K, fb[i].X, fb[i].k) });
-  const pick = chooseKinLevel(ho.map((h) => ({ ab: h.ab.mm, ba: h.ba.mm })), select), c = pick.index, lv = levels[c];
-  const fin0 = yield* fitL0(obs, 2, 'A+B'), fin = yield* fitLevel(obs, 2, 'A+B', fin0, lv);
+  // a level whose fit on A or on B leaves the bounds is not eligible; when the chosen level's final fit on A + B
+  // leaves them, it is marked and the choice repeated (real 2026-11-19: L2 had the best held-out with a J2 tilt of
+  // 15 deg, far outside the 3 deg bound, and the whole solve was refused instead of falling back to L1)
+  const rows = ho.map((h, i) => ({ ab: h.ab.mm, ba: h.ba.mm, oob: kinOutOfBounds(fa[i].k, bounds).length + kinOutOfBounds(fb[i].k, bounds).length > 0 }));
+  const fin0 = yield* fitL0(obs, 2, 'A+B');
+  let pick, c, lv, fin;
+  for (;;) {
+    pick = chooseKinLevel(rows, select); c = pick.index; lv = levels[c];
+    fin = yield* fitLevel(obs, 2, 'A+B', fin0, lv);
+    if (c === 0 || kinOutOfBounds(fin.k, bounds).length === 0) break;
+    rows[c].oob = true;
+  }
   const k = fin.k, oob = kinOutOfBounds(k, bounds), { ab, ba } = ho[c], { ab: ab0, ba: ba0 } = ho[0];
   // improvement of the chosen level over the uncorrected model (information; the level choice is the rule). The
   // uncorrected model is the URDF with armd's model_joint_map, so a zero offset already set there is the baseline.
@@ -1210,7 +1252,7 @@ export function* solveKinematicsSteps({ views, board, K, chain, X0, order = null
   for (let j = 0; j < 6; j++) if ((gates.zeroWarnJoints || [5]).includes(j + 1) && Math.abs(k[7 * j]) * D > gates.zeroWarnDeg) res.warnings.push({ key: 'zero', joint: j + 1, deg: k[7 * j] * D });
   Object.assign(res, {
     ok: res.gates.every((g) => g.ok), level: lv.name, k, joints: kinJoints(k), outOfBounds: oob, X: fin.X, boards: fin.B,
-    levels: levels.map((l, i) => ({ name: l.name, params: l.kIdx.length, ab: ho[i].ab.mm, ba: ho[i].ba.mm, mean: pick.mean[i], eligible: pick.eligible[i], chosen: i === c })),
+    levels: levels.map((l, i) => ({ name: l.name, params: l.kIdx.length, ab: ho[i].ab.mm, ba: ho[i].ba.mm, mean: pick.mean[i], eligible: pick.eligible[i], outOfBounds: !!rows[i].oob, chosen: i === c })),
     heldOut: { ab, ba, ab0, ba0, improve: { ab: imp(ab0.mm, ab.mm), ba: imp(ba0.mm, ba.mm), mean: impAll } }, train: fin.err, final0: { X: fin0.X, boards: fin0.B, err: fin0.err },
     fits: { A: levels.map((l, i) => ({ level: l.name, err: fa[i].err, k: fa[i].k })), B: levels.map((l, i) => ({ level: l.name, err: fb[i].err, k: fb[i].k })) },
     iterations: fin.iterations, order: ord, ms: Date.now() - t0,
@@ -1249,8 +1291,11 @@ export function verifyView({ view, board, order = ORDERS[0], K, Tend, X, boards,
 export const solveFine = (args) => runSync(solveFineSteps(args));
 export function* solveFineSteps({ views, markerSide = BOARD_DEFAULT.markerSide, chain, X0, thickness = 0.0005, gates = GATES, kinGates = KIN_GATES, prior = KIN_PRIOR, size = IMAGE, init = NOMINAL, solvedAt = null, onProgress = null }) {
   const board = makeBoard({ markerSide });
+  const screened = screenViews(views, board);
+  views = screened.views;
   if (onProgress) onProgress('intrinsics');
   const intr = yield* calibrateIntrinsicsSteps(views, board, { size, gates, init });
+  intr.rejected = screened.rejected;
   const res = { ok: false, intr, gates: [...intr.gates] };
   if (!intr.K) return res;
   const kin = yield* solveKinematicsSteps({ views, board, K: intr.K, chain, X0, order: intr.order, gates: kinGates, prior, onProgress });

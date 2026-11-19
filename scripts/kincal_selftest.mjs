@@ -242,8 +242,11 @@ if (process.env.KIN_E_SEEDS) {
   const k = kInj.slice(); k[7 * 4] = 12 / D;
   const r = solveKinematics({ views: render(k), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
   const g = r.gates.find((x) => x.key === 'kin_bounds');
-  check('c. J5 zero offset 12 deg (bound 10) -> refused', !r.ok && g && !g.ok && r.outOfBounds.some((o) => o.joint === 5 && o.param === 'offset'),
-    `J5 offset ${(r.k[28] * D).toFixed(2)} deg, out of bounds ${r.outOfBounds.map((o) => `J${o.joint}.${o.param}`).join(',')}; gates ${gateStr(r.gates)}`);
+  // a level whose fit leaves the bounds is not eligible: the J5 12 deg level is skipped, the remaining levels cannot
+  // explain the error (held-out > 5 mm), so the solve is refused and no out-of-bounds correction is ever applied
+  const oobLevels = r.levels.filter((l) => l.outOfBounds).map((l) => l.name);
+  check('c. J5 zero offset 12 deg (bound 10) -> refused, out-of-bounds levels not chosen', !r.ok && oobLevels.length > 0 && !r.levels.find((l) => l.chosen).outOfBounds && r.outOfBounds.length === 0,
+    `out-of-bounds levels ${oobLevels.join(',')}, chosen ${r.level}, J5 offset ${(r.k[28] * D).toFixed(2)} deg; gates ${gateStr(r.gates)}`);
 }
 {
   const r = solveKinematics({ views: render(kInj, { jointErr: 1.2 / D }), board, K: Ktrue, chain: CALM.CHAIN, X0: Xnom });
@@ -274,6 +277,20 @@ if (process.env.KIN_E_SEEDS) {
   const b = longest(CW.generatePosesSteps({ ...FINE, Tbb: PLACE[0], board, K: CW.NOMINAL, X: Xnom, q0, fk, ik, lo, hi }));
   check('d. longest synchronous step < 50 ms (solveFine on the real views, fine-mode plan)', a.worst < 50 && b.worst < 50,
     `solveFine ${views.length} views: ${a.steps} steps, longest ${a.worst.toFixed(1)} ms, total ${(total / 1000).toFixed(1)} s (intrinsics included), gates ${a.value.ok ? 'pass' : 'refuse'}; generatePoses: ${b.steps} steps, longest ${b.worst.toFixed(1)} ms, ${b.value.poses.length} poses`);
+}
+// ---- screenViews: duplicate marker ids and a view no single homography explains are dropped before solving
+{
+  const sv = CW;
+  const b = sv.makeBoard({ markerSide: 0.025 });
+  const K = { fx: 810, fy: 808, cx: 320, cy: 185, k1: 0, k2: 0 };
+  const R = [[1, 0, 0], [0, 1, 0], [0, 0, 1]], t = [0, 0, 0.3];
+  const good = { markers: b.markers.map((m) => ({ id: m.id, corners: m.corners.map((c) => sv.project(K, R, t, c).slice(0, 2)) })) };
+  const dup = { markers: [...good.markers, { ...good.markers[0], corners: good.markers[0].corners.map(([u, v]) => [u + 150, v + 40]) }] };
+  const wrong = { markers: good.markers.map((m, k) => (k === 3 ? { ...m, id: 9 } : k === 9 ? { ...m, id: 3 } : m)) };
+  const r = sv.screenViews([good, dup, wrong, good], b);
+  const why = r.rejected.map((x) => `${x.i}:${x.why}`).join(',');
+  if (r.views.length !== 2 || why !== '1:duplicate_ids,2:inconsistent') { console.log('FAIL  screenViews', why, r.views.length); fails++; }
+  else console.log('PASS  screenViews drops duplicate ids and inconsistent views', why);
 }
 console.log(fails ? `${fails} checks failed` : 'all checks passed');
 process.exit(fails ? 1 : 0);
