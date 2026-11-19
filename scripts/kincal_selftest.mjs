@@ -275,5 +275,19 @@ if (process.env.KIN_E_SEEDS) {
   check('d. longest synchronous step < 50 ms (solveFine on the real views, fine-mode plan)', a.worst < 50 && b.worst < 50,
     `solveFine ${views.length} views: ${a.steps} steps, longest ${a.worst.toFixed(1)} ms, total ${(total / 1000).toFixed(1)} s (intrinsics included), gates ${a.value.ok ? 'pass' : 'refuse'}; generatePoses: ${b.steps} steps, longest ${b.worst.toFixed(1)} ms, ${b.value.poses.length} poses`);
 }
+// ---- screenViews: duplicate marker ids and a view no single homography explains are dropped before solving
+{
+  const sv = CW;
+  const b = sv.makeBoard({ markerSide: 0.025 });
+  const K = { fx: 810, fy: 808, cx: 320, cy: 185, k1: 0, k2: 0 };
+  const R = [[1, 0, 0], [0, 1, 0], [0, 0, 1]], t = [0, 0, 0.3];
+  const good = { markers: b.markers.map((m) => ({ id: m.id, corners: m.corners.map((c) => sv.project(K, R, t, c).slice(0, 2)) })) };
+  const dup = { markers: [...good.markers, { ...good.markers[0], corners: good.markers[0].corners.map(([u, v]) => [u + 150, v + 40]) }] };
+  const wrong = { markers: good.markers.map((m, k) => (k === 3 ? { ...m, id: 9 } : k === 9 ? { ...m, id: 3 } : m)) };
+  const r = sv.screenViews([good, dup, wrong, good], b);
+  const why = r.rejected.map((x) => `${x.i}:${x.why}`).join(',');
+  if (r.views.length !== 2 || why !== '1:duplicate_ids,2:inconsistent') { console.log('FAIL  screenViews', why, r.views.length); fails++; }
+  else console.log('PASS  screenViews drops duplicate ids and inconsistent views', why);
+}
 console.log(fails ? `${fails} checks failed` : 'all checks passed');
 process.exit(fails ? 1 : 0);
