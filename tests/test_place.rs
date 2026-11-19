@@ -100,7 +100,7 @@ async fn place_at_a_named_pose_lifts_approaches_descends_opens_and_retreats() {
     let (phases, at_open, a) = r.run(id).await;
     println!("place record: {}", serde_json::to_string(&a).unwrap());
     assert_eq!((a.kind.as_str(), a.state.as_str(), a.tag.as_deref()), ("place", "done", Some("p1")), "{a:?}");
-    assert_eq!(phases, ["lift", "approach", "descend", "open", "retreat", "done"]);
+    assert_eq!(phases, ["lift", "approach", "descend", "final_approach", "open", "retreat", "done"]); // final_approach: same-side backlash approach (kit profile backlash_approach)
     assert_eq!((a.progress, a.holding), (1.0, Some(false)));
     let at_open = at_open.expect("open phase seen");
     assert!(dist(&at_open, &target) < 2e-3, "placed at the pose TCP: {:.2} mm", dist(&at_open, &target) * 1000.0);
@@ -126,7 +126,7 @@ async fn place_at_a_position_without_retreat() {
     assert_eq!((a.kind.as_str(), a.state.as_str()), ("place", "done"), "{a:?}");
     // lift to target z + 0.05 = start z: no lift motion (the phase is reported but brief)
     let phases: Vec<&str> = phases.iter().map(String::as_str).filter(|p| *p != "lift").collect();
-    assert_eq!(phases, ["approach", "descend", "open", "done"]);
+    assert_eq!(phases, ["approach", "descend", "final_approach", "open", "done"]);
     assert!(dist(&at_open.unwrap(), &target) < 2e-3);
     let q = r.q().await;
     assert!(dist(&tcp(&q), &target) < 2e-3, "stays at the target without retreat");
