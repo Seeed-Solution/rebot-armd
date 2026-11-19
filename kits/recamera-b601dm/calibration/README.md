@@ -88,7 +88,8 @@ correction of the built-in chain from two board placements; `calibration.json` t
     {"offset_rad": 0, "scale": 0, "tilt_rad": [0, 0], "origin_m": [0, 0, 0]},
     ... 6 entries, J1..J6 ...
   ],
-  "fit": {"heldout_mm": [a, b], "train_mm": x, "views": n, "solved_at": "..."}
+  "fit": {"level": "L3", "heldout_mm": [a, b], "heldout_uncorrected_mm": [a0, b0], "train_mm": x, "views": n,
+          "levels": [{"level": "L0", "heldout_mm": [a0, b0], "chosen": false}, ...], "solved_at": "..."}
 }
 ```
 
@@ -217,15 +218,47 @@ poses each, joint-space moves approached from the same side; about 5 minutes per
 real arm with these motion rules) and, besides the values above, solves a correction of the arm's
 geometry for J2..J5 (zero offset, angle scale, joint-axis tilt, joint-origin shift; J1 and J6
 zero). Between the two captures the user moves the board to another spot (at least 10 cm away)
-and captures a new start view. The correction is applied only when the held-out error (fit on one
-placement, predict the other) is ≤ 3 mm both ways, the mean held-out error is ≥ 30 % below the
-uncorrected model, and every parameter is inside armd's bounds (|offset| ≤ 10°, |scale| ≤ 0.08,
-|tilt| ≤ 3°, |origin| ≤ 30 mm). The same apply then also writes `kinematics` (per joint
-`offset_rad`, `scale`, `tilt_rad`, `origin_m`, plus the fit's held-out numbers) into
-`calibration.json`; armd requires torque off for it. A J5 zero offset above 5° is reported with a
+and captures a new start view.
+
+The solver fits four model levels and chooses one from the held-out error (fit on one placement,
+predict the other, both directions):
+
+| Level | Parameters |
+|---|---|
+| L0 | none (camera mount and board poses only) |
+| L1 | zero offsets J2..J5 (4) |
+| L2 | L1 + J2 angle scale + J2 axis tilt x / y (7) |
+| L3 | zero offset, scale, tilt x / y, origin dx / dy / dz of J2..J5 (28) |
+
+The level with the smallest mean held-out error of both directions is chosen among the levels where
+neither direction is more than 0.1 mm worse than L0; levels within 0.1 mm of that mean count as a
+tie and the simpler one is chosen. The solve and review pages show the four levels (A → B, B → A,
+mean, the chosen one). Gates: the chosen level's held-out error ≤ 3 mm both ways (with L0 chosen,
+L0's own held-out error) and every parameter inside armd's bounds (|offset| ≤ 10°, |scale| ≤ 0.08,
+|tilt| ≤ 3°, |origin| ≤ 30 mm). The apply then also writes `kinematics` (per joint `offset_rad`,
+`scale`, `tilt_rad`, `origin_m`, plus the fit with the level table) into `calibration.json`; armd
+requires torque off for it. With L0 chosen the apply carries `"kinematics": null`: the camera
+calibration (intrinsics, mount, table height) is applied and a stored correction is removed; the
+review page says so. L3 has a weak prior (weight 3, sweep in `src/api/calib_wizard.js`
+`KIN_PRIOR`). A J5 zero offset above 5° is reported with a
 hint to re-zero that motor (J2..J4 offsets are not separately identifiable and get no hint) (reBotArm_control_py `example/2_zero_and_read.py` / MotorBridge). On data
-recorded on this kit's arm (2026-11-18) the held-out error went from 2.76 / 3.64 mm to
-2.01 / 2.24 mm.
+recorded on this kit's arm (2026-11-18, `scripts/kincal_selftest.mjs` b) the levels gave A → B /
+B → A: L0 2.76 / 3.64 mm, L1 2.61 / 3.62 mm, L2 2.22 / 2.85 mm, L3 2.00 / 2.20 mm; L3 is chosen.
+On the 2026-11-19 capture (motors zeroed at the rest pose, 111 views) L0 gave 2.85 / 3.33 mm and the
+full model 2.61 / 7.74 mm; that data was not stored, so the level choice was not run on it. A
+synthetic copy (no systematic error, random per-pose joint errors of 0.37° on J2..J5, 56 views per
+placement) chooses L0 (L0 2.52 / 2.99 mm, L3 3.31 / 6.65 mm).
+
+Calibration sessions: the wizard stores the raw data of every calibration on the device (armd
+`POST /api/v1/calibration/sessions`, files in `/userdata/rebot-teleop/calibration-sessions/`
+(`ARMD_CALIBRATION_SESSIONS`), the newest 10 kept, at most 8 MB each): board, views with markers,
+armd joint positions and model angles, the plan, the solved intrinsics, gates and the level table.
+It uploads after each placement's capture finishes and after each solve, under one id; a failed
+upload shows a warning line and the wizard carries on. "Load from device" on the board step lists
+the stored sessions and solves a chosen one again without capturing (camera mode: intrinsics and
+hand-eye; fine mode: everything), then opens the solve and review steps. Apply of a loaded session
+needs a fresh "Verify view" first: one capture at the current pose, reprojected with the solved
+values onto the stored board placements, within 3 mm (the board may have moved since).
 
 Start view (the place step, and in fine calibration mode also the move step after placement A): the
 camera has to see at least 6 whole board markers; "Capture start view" stays disabled until the live
@@ -250,7 +283,11 @@ the real arm.
 
 标定板（向导生成打印页；仿真器 `--aruco-board` 使用相同布局）：4 列 x 3 行（横向，与 16:9 画面一致）aruco4x4_50 标记，id 0..11 按阅读顺序（id = 行 * 4 + 列，第 0 行在页面顶部，第 0 列在左侧），默认标记边长 25 mm，间隔 5 mm（0.2 倍边长），整板约 115 x 85 mm。标定板坐标系：原点在板中心，x 沿页面向右，y 沿页面向下，z 指向桌面内；打印的 "up" 箭头指向页面顶部（板 -y）。标记角点顺序同 rebot-vision：打印标记的左下、右下、右上、左上（标记坐标系 x 向右、y 向下）。
 
-精校模式（相机 + 机械臂几何）：向导采集两个标定板位置（各约 35 个位姿，关节空间移动、从同一方向接近；按这套运动规则在真机上每个位置约 5 分钟），除上述数值外还求解 J2..J5 的几何修正（零位、角度比例、关节轴倾斜、关节原点偏移；J1、J6 为 0）。两次采集之间用户把标定板移到另一个位置（距原位置至少 10 cm）并采集新的起始视图。只有满足以下条件才写入修正：两个方向的留出误差（在一个位置拟合、预测另一个位置）都 ≤ 3 mm，留出误差平均值比未修正模型低 ≥ 30 %，所有参数在 armd 的范围内（|零位| ≤ 10°、|比例| ≤ 0.08、|倾斜| ≤ 3°、|原点| ≤ 30 mm）。同一次写入还把 `kinematics`（每个关节的 `offset_rad`、`scale`、`tilt_rad`、`origin_m`，以及拟合的留出误差）写进 `calibration.json`；armd 要求此时电机断电。J5 零位偏差超过 5° 时给出提示，建议重新校准该电机零位（J2..J4 的零位不能单独确定，不提示）（reBotArm_control_py `example/2_zero_and_read.py` / MotorBridge）。在本套件机械臂上录制的数据（2026-11-18）中，留出误差从 2.76 / 3.64 mm 降到 2.01 / 2.24 mm。
+精校模式（相机 + 机械臂几何）：向导采集两个标定板位置（各约 35 个位姿，关节空间移动、从同一方向接近；按这套运动规则在真机上每个位置约 5 分钟），除上述数值外还求解 J2..J5 的几何修正（零位、角度比例、关节轴倾斜、关节原点偏移；J1、J6 为 0）。两次采集之间用户把标定板移到另一个位置（距原位置至少 10 cm）并采集新的起始视图。
+
+求解器拟合四个模型级别，按留出误差（在一个位置拟合、预测另一个位置，两个方向）选择其一：L0 不修正（只有相机安装与标定板位姿）；L1 J2..J5 零位（4 个参数）；L2 L1 + J2 角度比例 + J2 轴倾斜 x / y（7 个）；L3 J2..J5 的零位、比例、倾斜 x / y、原点 dx / dy / dz（28 个）。在两个方向都不比 L0 差 0.1 mm 以上的级别中，取两个方向平均留出误差最小的级别；与该平均值相差不到 0.1 mm 的级别视为相同，取更简单的。求解页与确认页列出四个级别（A → B、B → A、平均、采用的级别）。门限：所选级别两个方向的留出误差都 ≤ 3 mm（选 L0 时即 L0 自身的留出误差），所有参数在 armd 的范围内（|零位| ≤ 10°、|比例| ≤ 0.08、|倾斜| ≤ 3°、|原点| ≤ 30 mm）。同一次写入还把 `kinematics`（每个关节的 `offset_rad`、`scale`、`tilt_rad`、`origin_m`，以及含级别表的拟合报告）写进 `calibration.json`；armd 要求此时电机断电。选 L0 时 apply 带 `"kinematics": null`：写入相机标定（内参、安装、桌面高度），并删除设备上已有的几何修正；确认页会说明这一点。L3 带一个弱先验（权重 3，扫描结果见 `src/api/calib_wizard.js` 的 `KIN_PRIOR`）。J5 零位偏差超过 5° 时给出提示，建议重新校准该电机零位（J2..J4 的零位不能单独确定，不提示）（reBotArm_control_py `example/2_zero_and_read.py` / MotorBridge）。在本套件机械臂上录制的数据（2026-11-18，`scripts/kincal_selftest.mjs` b）中各级别 A → B / B → A：L0 2.76 / 3.64 mm，L1 2.61 / 3.62 mm，L2 2.22 / 2.85 mm，L3 2.00 / 2.20 mm，选 L3。2026-11-19 的采集（电机在收纳姿态置零，111 个视图）中 L0 为 2.85 / 3.33 mm，完整模型为 2.61 / 7.74 mm；这批数据没有保存，级别选择没有在它上面运行。一个合成副本（无系统误差，J2..J5 每个位姿随机关节误差 0.37°，每个位置 56 个视图）选 L0（L0 2.52 / 2.99 mm，L3 3.31 / 6.65 mm）。
+
+标定数据（session）：向导把每次标定的原始数据保存在设备上（armd `POST /api/v1/calibration/sessions`，文件在 `/userdata/rebot-teleop/calibration-sessions/`（`ARMD_CALIBRATION_SESSIONS`），保留最新 10 个，每个最大 8 MB）：标定板、带标记的视图、armd 关节读数与模型角、采集计划、求解的内参、门限与级别表。每个位置采集完成后和每次求解后上传，使用同一个 id；上传失败时显示一行警告，向导继续。标定板步骤的「从设备加载」列出已保存的数据，选中后不重新采集、直接重新求解（相机模式：内参与手眼；精校模式：全部），进入求解与确认步骤。加载的数据在应用前必须先做一次「验证视图」：在当前位置采一张图，用求解结果重投影到已保存的标定板位置，误差 ≤ 3 mm（标定板可能已经移动过）。
 
 起始视图（摆放步骤；精校模式下位置 A 之后的移板步骤也一样）：相机需要看到至少 6 个完整的标定板标记；实时标记数达到 6 之前「采集起始视图」不可用，并显示原因（标记不足、拖动示教中、机械臂在动、正在自动寻找）。三个按钮用来让相机看到标定板：
 

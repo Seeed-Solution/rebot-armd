@@ -475,7 +475,7 @@ Capability `calibration_kinematics` (`calibration_apply` and the built-in RebotD
 
 - Model (one definition for armd, the cockpit and the Python SDK): model angles q as in `model_joint_map`; walking the built-in chain, joint i (J1..J6) is `F_i · [Rx(tilt_x) · Ry(tilt_y), (dx, dy, dz)] · Rot(axis_i, q_i · (1 + scale) + offset_rad)`, `F_i` the URDF origin of the joint, then the fixed `end_joint`. All zero = the URDF chain bit for bit.
 - Per joint `{"offset_rad", "scale", "tilt_rad": [x, y], "origin_m": [dx, dy, dz]}` (missing fields are 0, unknown fields are refused). Bounds: |offset_rad| ≤ 10°, |scale| ≤ 0.08, |tilt_rad| ≤ 3° per axis, |origin_m| ≤ 0.03 m per component. Joints the solver does not identify are zeros (J1: absorbed by the board pose, J6: by the camera mount).
-- `calibration.json` `"kinematics": {"joints": [6 × joint], "fit"?: {"heldout_mm": [a, b], "train_mm", "views", "solved_at"}}` (`fit` passed through). Apply body field `kinematics`: the same object (validated as above, else `INVALID_COMMAND` naming the joint and field); absent = a stored correction stays; `null` = removes it. `dry_run` shows `kinematics` in `before` / `after`.
+- `calibration.json` `"kinematics": {"joints": [6 × joint], "fit"?: {"level", "heldout_mm": [a, b], "heldout_uncorrected_mm", "train_mm", "views", "levels": [{"level", "heldout_mm", "chosen"}], "solved_at"}}` (`fit` passed through; the cockpit writes the chosen model level L1..L3 and the table of all four levels). Apply body field `kinematics`: the same object (validated as above, else `INVALID_COMMAND` naming the joint and field); absent = a stored correction stays; `null` = removes it. `dry_run` shows `kinematics` in `before` / `after`.
 - A real apply with `kinematics` (also `null`), and a restore whose backup has another correction, need torque off and no action running; otherwise `KINEMATICS_ARMED` (409) before any write. Checked again when `calibration.json` is written; torque switched on during the transaction fails that step and reverts the earlier ones. Dry runs are allowed with torque on.
 - Live: after the write, `config.arm_model` carries the correction for every FK / IK / workspace / keep-out / grasp / place path (workspace revision bump: plans made before fail `PLAN_STALE`; stored poses' TCPs are recomputed). Not corrected: gravity and power-budget dynamics, the legacy camera mount and the derived `tilt_deg`, the reach origin `max_reach_m` is measured from.
 - `/api/v1/observation/schema` `kinematics_correction`: the joints array in effect, or null (absent in older armd). `GET /api/v1/calibration` and the apply / restore ack: `kinematics_correction`, and `calibration.kinematics`.
@@ -486,12 +486,30 @@ Capability `calibration_kinematics` (`calibration_apply` and the built-in RebotD
 
 - 模型（armd、驾驶舱与 Python SDK 共用同一定义）：模型角 q 同 `model_joint_map`；沿内置运动链，关节 i（J1..J6）为 `F_i · [Rx(tilt_x) · Ry(tilt_y), (dx, dy, dz)] · Rot(axis_i, q_i · (1 + scale) + offset_rad)`，`F_i` 为该关节的 URDF 原点，之后是固定的 `end_joint`。全为 0 时与 URDF 链逐位一致。
 - 每个关节 `{"offset_rad", "scale", "tilt_rad": [x, y], "origin_m": [dx, dy, dz]}`（缺省字段为 0，未知字段被拒绝）。范围：|offset_rad| ≤ 10°，|scale| ≤ 0.08，|tilt_rad| 每轴 ≤ 3°，|origin_m| 每分量 ≤ 0.03 m。求解器不辨识的关节写 0（J1 由标定板位姿吸收，J6 由相机安装吸收）。
-- `calibration.json` 的 `"kinematics": {"joints": [6 个关节], "fit"?: {"heldout_mm": [a, b], "train_mm", "views", "solved_at"}}`（`fit` 原样保存）。apply 请求体字段 `kinematics`：同一结构（按上述规则校验，否则 `INVALID_COMMAND` 并指明关节与字段）；缺省时保留已存的修正；`null` 删除修正。`dry_run` 的 `before` / `after` 含 `kinematics`。
+- `calibration.json` 的 `"kinematics": {"joints": [6 个关节], "fit"?: {"level", "heldout_mm": [a, b], "heldout_uncorrected_mm", "train_mm", "views", "levels": [{"level", "heldout_mm", "chosen"}], "solved_at"}}`（`fit` 原样保存；驾驶舱写入所选模型级别 L1..L3 与四个级别的表）。apply 请求体字段 `kinematics`：同一结构（按上述规则校验，否则 `INVALID_COMMAND` 并指明关节与字段）；缺省时保留已存的修正；`null` 删除修正。`dry_run` 的 `before` / `after` 含 `kinematics`。
 - 带 `kinematics`（含 `null`）的正式 apply，以及备份中的修正与当前不同的 restore，要求扭矩关闭且没有动作在执行，否则在任何写入之前返回 `KINEMATICS_ARMED`（409）。写 `calibration.json` 时再次检查；事务期间打开扭矩会使该步骤失败并回滚之前的步骤。`dry_run` 在扭矩打开时也可执行。
 - 即时生效：写入后 `config.arm_model` 带上修正，所有 FK / IK / 工作空间 / 禁入盒 / 抓取 / 放置路径使用它（工作空间修订号递增：之前做出的规划以 `PLAN_STALE` 失败；已存命名姿态的 TCP 重新计算）。不修正的部分：重力与功率预算动力学、旧式相机安装与推导的 `tilt_deg`、`max_reach_m` 的测量原点。
 - `/api/v1/observation/schema` 的 `kinematics_correction`：当前生效的关节数组，或 null（旧版 armd 无此字段）。`GET /api/v1/calibration` 及 apply / restore 应答含 `kinematics_correction` 与 `calibration.kinematics`。
 - restore 恢复备份中的修正（备份中没有修正则恢复为未修正）。
 - 启动：超出范围或格式错误的修正按无效文件处理 `calibration.json`（改名移开、`load_error`、使用未修正模型与 profile 相机安装）。使用 URDF 链的 profile（`kinematics: "Urdf"`）：带 `kinematics` 的 apply 返回 `UNSUPPORTED`；启动时忽略已存的修正并给出 `load_error`（相机标定照常加载）。
+
+#### Calibration sessions / 标定数据
+
+The raw data of a calibration, kept on the device so a solve can be repeated without capturing (the cockpit wizard
+uploads after each placement's capture and after each solve, and loads them back with "Load from device"). No lease;
+nothing is applied. Cross-origin writes are refused like on every non-GET route.
+
+- `POST /api/v1/calibration/sessions` body (JSON object, at most 8 MB, else 413): `{"id"?, "kind": "camera"|"fine", "created_at"?, "views": [...], ...}`; the wizard also sends `board`, `frame`, `intrinsics_K`, `X0`, `plan`, `solve`, `gates`, `levels`, `summary`. `id` (`^[A-Za-z0-9_-]{1,64}$`) overwrites that session; without it armd assigns a ULID. Reply: the list entry `{"id", "kind", "created_at", "stored_at", "views" (count), "size" (bytes), "summary"}`. `400 INVALID` for a bad `kind`, `views` not an array, a bad `id` or `created_at`.
+- `GET /api/v1/calibration/sessions`: `{"sessions": [entries, newest store first], "keep": 10, "max_bytes"}`. `GET /api/v1/calibration/sessions/<id>`: the stored body with `id`, `created_at`, `stored_at` (404 `NOT_FOUND`). `DELETE /api/v1/calibration/sessions/<id>`: `{"deleted": id}` (404 when absent).
+- Files: `<dir>/<id>.json` and `<dir>/<id>.meta.json` (the list entry), written with temp file + rename; after a store only the newest 10 are kept (an overwrite counts as new). `dir`: `ARMD_CALIBRATION_SESSIONS`, default `calibration-sessions/` next to `calibration.json` (`/userdata/rebot-teleop/calibration-sessions/`).
+- Wizard views: `markers`, `q` (model angles, the solver input), `joints` (armd positions as captured), `T_base_end` (FK at capture), `ds` (placement 0 / 1, fine mode), `pose`, `frame`, `frame_id`, `ts`, `settled`. A loaded session needs a verify view before Apply (one capture at the current pose reprojected with the solved values onto the stored board placements, ≤ 3 mm).
+
+标定的原始数据保存在设备上，以便不重新采集就能再次求解（驾驶舱向导在每个位置采集完成后和每次求解后上传，用「从设备加载」读回）。不需要租约，不写入任何标定。与其他非 GET 路由一样拒绝跨源写入。
+
+- `POST /api/v1/calibration/sessions` 请求体（JSON 对象，最大 8 MB，超出返回 413）：`{"id"?, "kind": "camera"|"fine", "created_at"?, "views": [...], ...}`；向导另外发送 `board`、`frame`、`intrinsics_K`、`X0`、`plan`、`solve`、`gates`、`levels`、`summary`。带 `id`（`^[A-Za-z0-9_-]{1,64}$`）时覆盖该条；不带时 armd 分配 ULID。回复为列表项 `{"id", "kind", "created_at", "stored_at", "views"（数量）, "size"（字节）, "summary"}`。`kind` 不合法、`views` 不是数组、`id` 或 `created_at` 不合法时返回 `400 INVALID`。
+- `GET /api/v1/calibration/sessions`：`{"sessions": [列表项，最近存入的在前], "keep": 10, "max_bytes"}`。`GET /api/v1/calibration/sessions/<id>`：保存的请求体，含 `id`、`created_at`、`stored_at`（不存在时 404 `NOT_FOUND`）。`DELETE /api/v1/calibration/sessions/<id>`：`{"deleted": id}`（不存在时 404）。
+- 文件：`<dir>/<id>.json` 与 `<dir>/<id>.meta.json`（列表项），先写临时文件再改名；每次存入后只保留最新 10 条（覆盖也算新存入）。`dir`：`ARMD_CALIBRATION_SESSIONS`，默认在 `calibration.json` 同目录下的 `calibration-sessions/`（`/userdata/rebot-teleop/calibration-sessions/`）。
+- 向导的视图字段：`markers`、`q`（模型角，求解输入）、`joints`（采集时 armd 的关节读数）、`T_base_end`（采集时的 FK）、`ds`（位置 0 / 1，精校模式）、`pose`、`frame`、`frame_id`、`ts`、`settled`。加载的数据在应用前需要一次验证视图（在当前位置采一张图，用求解结果重投影到已保存的标定板位置，≤ 3 mm）。
 
 #### Calibration tools and motor zero / 标定工具与电机零位
 
