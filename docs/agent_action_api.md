@@ -36,7 +36,7 @@ The existing `/api/v1/motion/jog`, `/motion/home`, `/motion/unload` commands and
 | `/api/v1/calibration/motor_zero` | `{"joints":[1-based], "dry_run":bool?, "force":bool?, "method":"software"\|"motor"?}`; `/api/v1/calibration/joint_zero/restore` `{"backup":str}` — see [Calibration tools and motor zero](#calibration-tools-and-motor-zero--标定工具与电机零位) (acknowledged without `action_id` when it has finished) |
 | `/api/v1/action/move_to_pose` | `{"name":str, "include_gripper":bool? (default false), "speed_scale":0.1..1.0? (default 1.0), "tag"?}` — see [Named poses](#named-poses--命名姿态) |
 | `/api/v1/action/place` | `{"pose":str? \| "position":[x,y,z]?, "orientation"?, "approach_height_m":0.02..0.30? (default 0.08), "release":bool? (default true), "retreat":bool? (default true), "speed_scale":0.1..1.0? (default 1.0), "tag"?}` — see [Place](#place--放置) |
-| `/api/v1/poses/save`, `/api/v1/poses/delete` | `{"name":str, "positions":[dof]?}` / `{"name":str}` (not actions: acknowledged without `action_id`) |
+| `/api/v1/poses/save`, `/api/v1/poses/rename`, `/api/v1/poses/delete` | `{"name":str, "positions":[dof]?, "id":str?}` / `{"id":str, "name":str}` / `{"name":str}` (not actions: acknowledged without `action_id`) |
 | `/api/v1/workspace/keepout` | `{"boxes":[{"name":str, "min_m":[x,y,z], "max_m":[x,y,z]}]}` — see [Keep-out boxes](#keep-out-boxes--禁入盒) (not an action) |
 | `/api/v1/action/replay` | `{"episode":str, "speed":0.5\|1.0? (default 0.5), "gripper":bool? (default true), "tag"?}` — see [Replay](#replay--回放) |
 
@@ -114,11 +114,13 @@ Servo frames while an action runs are rejected with `MOTION_BUSY`. Jog, preset, 
 `GET /api/v1/poses` (no lease) returns `{"poses":[{"name", "positions":[dof], "tcp":{"position":[x,y,z], "rpy":[r,p,y]} | null, "saved_at_ms"}]}`. `tcp` is the end_link pose at save time (null without `kinematics`); `saved_at_ms` is Unix time.
 
 - `/api/v1/poses/save` (lease): `name` matches `^[A-Za-z0-9_-]{1,64}$`; `positions` defaults to the measured positions and must be within the joint limits. Saving an existing name replaces it. At most 64 poses. The ack carries `pose`.
-- `/api/v1/poses/delete` (lease): an unknown name is `404 POSE_NOT_FOUND`.
+- `/api/v1/poses/rename` (lease) `{id, name}`: the pose keeps its id, positions and stale mark, so sequences that reference it keep working; another pose with the name is `409 POSE_EXISTS`, an unknown id `404 POSE_NOT_FOUND`. The ack carries `pose`.
+- `/api/v1/poses/delete` (lease): an unknown name is `404 POSE_NOT_FOUND`; a pose referenced by a sequence is `409 IN_USE {sequences}`.
+- Every pose carries `id` (ULID, see [Teach v1](#sequences--序列)) and `stale` (null, or `{reason, at}` after a joint zero change).
 - Both acks carry `persisted` (true / false with `persist_error`). The store is written atomically to `ARMD_POSES` (default `/userdata/rebot-teleop/poses.json`) after the supervisor lock is released. At start a valid file is loaded; an unreadable or invalid file is logged and the store starts empty; a malformed or invalid file is renamed to `poses.json.bad-<unix seconds>` so the next save cannot overwrite it.
 - `/api/v1/action/move_to_pose`: joint-space quintic of J1..J6 (and J7 with `include_gripper`) to the stored positions, planned with the joint speed cap × `speed_scale`. Action kind `move_to_pose`; same preconditions as the other actions (`MOTION_BUSY` while a trajectory or servo stream runs) and the same cancellation causes. The path's verification samples (21, more with keep-out boxes: see [Keep-out boxes](#keep-out-boxes--禁入盒)) pass the joint limits and, with `kinematics` and `workspace`, the workspace rule including keep-out boxes. Errors: `POSE_NOT_FOUND` (404), `WORKSPACE_VIOLATION` (422), `INVALID_COMMAND` (400).
 
-`GET /api/v1/poses`（无需租约）返回已保存的姿态。`/api/v1/poses/save`、`/api/v1/poses/delete` 需要租约：名称须匹配 `^[A-Za-z0-9_-]{1,64}$`，`positions` 默认取实测位置并须在关节限位内，同名覆盖，最多 64 个；删除不存在的名称返回 `404 POSE_NOT_FOUND`。文件在释放锁后原子写入 `ARMD_POSES`（默认 `/userdata/rebot-teleop/poses.json`）；启动时文件无效则记录日志、以空列表启动；格式错误或无效的文件重命名为 `poses.json.bad-<unix 秒>`，之后的保存不会覆盖它。`move_to_pose` 以关节空间五次多项式移动 J1..J6（`include_gripper` 时含 J7），速度为关节限速 × `speed_scale`，动作类型 `move_to_pose`，前置条件与取消规则同其他动作，路径的校验采样点（21 个，有禁入盒时更多，见“禁入盒”）须满足关节限位和工作空间规则（含禁入盒）。
+`GET /api/v1/poses`（无需租约）返回已保存的姿态，每个姿态带 `id`（ULID）与 `stale`（null，或零位变更后的 `{reason, at}`）。`/api/v1/poses/rename {id, name}`（需租约）改名时保留 id、位置与过期标记，引用它的序列不受影响；重名返回 `409 POSE_EXISTS`。被序列引用的姿态删除返回 `409 IN_USE {sequences}`。`/api/v1/poses/save`、`/api/v1/poses/delete` 需要租约：名称须匹配 `^[A-Za-z0-9_-]{1,64}$`，`positions` 默认取实测位置并须在关节限位内，同名覆盖，最多 64 个；删除不存在的名称返回 `404 POSE_NOT_FOUND`。文件在释放锁后原子写入 `ARMD_POSES`（默认 `/userdata/rebot-teleop/poses.json`）；启动时文件无效则记录日志、以空列表启动；格式错误或无效的文件重命名为 `poses.json.bad-<unix 秒>`，之后的保存不会覆盖它。`move_to_pose` 以关节空间五次多项式移动 J1..J6（`include_gripper` 时含 J7），速度为关节限速 × `speed_scale`，动作类型 `move_to_pose`，前置条件与取消规则同其他动作，路径的校验采样点（21 个，有禁入盒时更多，见“禁入盒”）须满足关节限位和工作空间规则（含禁入盒）。
 
 ## Keep-out boxes / 禁入盒
 

@@ -48,8 +48,9 @@ pub struct NamedPose {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub joint_names: Option<Vec<String>>,
     /// Set by a joint zero change: the pose was taught with the old zero, so the arm reaches a
-    /// different physical pose. Saving the pose again clears it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// different physical pose. Saving the pose again clears it. Always present (null when not
+    /// stale).
+    #[serde(default)]
     pub stale: Option<crate::calibration::CalibrationStale>,
 }
 
@@ -327,6 +328,22 @@ pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Opt
         Some(p) => *p = pose.clone(),
         None => list.push(pose.clone()),
     }
+    Ok((pose, inner.poses_write()))
+}
+
+/// WS command `/api/v1/poses/rename` `{id, name}`: the pose keeps its id, positions and
+/// stale mark; sequences reference the id and keep working. POSE_EXISTS when another pose has
+/// the name.
+pub fn rename(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Option<PendingWrite>), ArmError> {
+    let name = name_of(body)?;
+    let id = body.get("id").and_then(Value::as_str).ok_or_else(|| invalid("id must be a string"))?;
+    if inner.poses.list.poses.iter().any(|p| p.name == name && p.id != id) {
+        return Err(ArmError::Rejected { status: 409, code: "POSE_EXISTS".into(), message: format!("Another pose is named '{name}'") });
+    }
+    let pose = inner.poses.list.poses.iter_mut().find(|p| p.id == id)
+        .ok_or_else(|| ArmError::Rejected { status: 404, code: "POSE_NOT_FOUND".into(), message: format!("No pose with id '{id}'") })?;
+    pose.name = name;
+    let pose = pose.clone();
     Ok((pose, inner.poses_write()))
 }
 

@@ -40,7 +40,19 @@ async fn pose_ids_are_stable_and_referenced_items_are_in_use() {
     let renamed = common::rpc(&mut ws, generation, epoch, "/api/v1/poses/save", json!({"name": "a2", "id": id})).await;
     assert_eq!((renamed["pose"]["id"].as_str(), renamed["pose"]["name"].as_str()), (Some(id.as_str()), Some("a2")), "{renamed}");
     assert_eq!(sup.inner().read().await.poses.list.poses.len(), 1);
+    // poses/rename keeps the id
+    let r = common::rpc(&mut ws, generation, epoch, "/api/v1/poses/rename", json!({"id": id, "name": "a3"})).await;
+    assert_eq!((r["pose"]["id"].as_str(), r["pose"]["name"].as_str()), (Some(id.as_str()), Some("a3")), "{r}");
+    let r = common::rpc(&mut ws, generation, epoch, "/api/v1/poses/rename", json!({"id": id, "name": "a2"})).await;
+    assert_eq!(r["pose"]["name"], "a2", "{r}");
+    let r = common::rpc(&mut ws, generation, epoch, "/api/v1/poses/rename", json!({"id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "name": "z"})).await;
+    assert_eq!(r["code"], "POSE_NOT_FOUND", "{r}");
+    let listed: Value = reqwest::get(format!("http://{addr}/api/v1/poses")).await.unwrap().json().await.unwrap();
+    assert_eq!(listed["poses"][0]["id"], id.as_str());
+    assert!(listed["poses"][0].get("stale").is_some_and(Value::is_null), "{listed}");
     let b = common::rpc(&mut ws, generation, epoch, "/api/v1/poses/save", json!({"name": "b"})).await;
+    let r = common::rpc(&mut ws, generation, epoch, "/api/v1/poses/rename", json!({"id": id, "name": "b"})).await;
+    assert_eq!(r["code"], "POSE_EXISTS", "{r}");
     let r = common::rpc(&mut ws, generation, epoch, "/api/v1/poses/save", json!({"name": "b", "id": id})).await;
     assert_eq!(r["code"], "POSE_EXISTS", "{r}");
     let r = common::rpc(&mut ws, generation, epoch, "/api/v1/poses/save", json!({"name": "c", "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"})).await;

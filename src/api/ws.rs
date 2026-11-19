@@ -300,6 +300,7 @@ fn state_command(inner: &mut SupervisorInner, path: &str, body: &Value, setup_pa
             (vec![("setup", json!(setup))], write)
         }),
         "/api/v1/poses/save" => crate::poses::save(inner, body).map(|(pose, write)| (vec![("pose", json!(pose))], write)),
+        "/api/v1/poses/rename" => crate::poses::rename(inner, body).map(|(pose, write)| (vec![("pose", json!(pose))], write)),
         "/api/v1/poses/delete" => crate::poses::delete(inner, body).map(|write| (vec![], write)),
         "/api/v1/sequences/save" => crate::sequences::save(inner, body).map(|(seq, write)| (vec![("sequence", json!(seq))], write)),
         "/api/v1/sequences/delete" => crate::sequences::delete(inner, body).map(|write| (vec![], write)),
@@ -331,7 +332,7 @@ fn calibration_busy_code(inner: &SupervisorInner, path: &str) -> Option<&'static
     if !inner.calibration_busy || path == "/api/v1/motion/stop" { return None; }
     if inner.motor_zero_busy && matches!(path, "/api/v1/torque" | "/api/v1/arm" | "/api/v1/safety/clear_fault") { return Some("MOTION_BUSY"); }
     if path.starts_with("/api/v1/action/") || path.starts_with("/api/v1/motion/") || path.starts_with("/api/v1/mode/") { return Some("MOTION_BUSY"); }
-    if path.starts_with("/api/v1/calibration/") || matches!(path, "/api/v1/grasp/setup" | "/api/v1/poses/save" | "/api/v1/poses/delete"
+    if path.starts_with("/api/v1/calibration/") || matches!(path, "/api/v1/grasp/setup" | "/api/v1/poses/save" | "/api/v1/poses/rename" | "/api/v1/poses/delete"
         | "/api/v1/sequences/save" | "/api/v1/sequences/delete"
         | "/api/v1/safety/collision" | "/api/v1/workspace/keepout" | "/api/v1/gripper/calibration") { return Some("CONFIG_BUSY"); }
     None
