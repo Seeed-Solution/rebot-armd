@@ -163,7 +163,7 @@ struct PendingPlan {
     yaw_free: bool,
 }
 
-enum ActionStart { Started(u64, f64), Plan(PendingPlan), Macro(PendingMacro), Replay(crate::replay::ReplayInput), DryRunGrasp(Value) }
+enum ActionStart { Started(u64, f64), Plan(PendingPlan), Macro(PendingMacro), Replay(crate::replay::ReplayInput), DryRunGrasp(Value), Sequence(Box<crate::sequences::RunPlan>) }
 
 /// A macro action (crate::macro_action) checked under the lock, planned without it.
 enum PendingMacro { Grasp(crate::grasp::PendingGrasp), Place(crate::place::PendingPlace) }
@@ -269,6 +269,7 @@ fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: 
             let (id, duration) = crate::poses::start_action(inner, body, epoch)?;
             return Ok(ActionStart::Started(id, duration));
         }
+        "/api/v1/action/run_sequence" => return Ok(ActionStart::Sequence(Box::new(crate::sequences::prepare_run(inner, body, epoch)?))),
         _ => return Err(invalid_command("Unknown action")),
     };
     let (spec, speed, tag) = parsed.map_err(ArmError::from)?;
@@ -300,6 +301,8 @@ fn state_command(inner: &mut SupervisorInner, path: &str, body: &Value, setup_pa
         }),
         "/api/v1/poses/save" => crate::poses::save(inner, body).map(|(pose, write)| (vec![("pose", json!(pose))], write)),
         "/api/v1/poses/delete" => crate::poses::delete(inner, body).map(|write| (vec![], write)),
+        "/api/v1/sequences/save" => crate::sequences::save(inner, body).map(|(seq, write)| (vec![("sequence", json!(seq))], write)),
+        "/api/v1/sequences/delete" => crate::sequences::delete(inner, body).map(|write| (vec![], write)),
         "/api/v1/safety/collision" => crate::collision::update(inner, body).map(|(config, write)| (vec![("collision", json!(config))], write)),
         "/api/v1/workspace/keepout" => crate::keepout::update(inner, body)
             .map(|(state, write)| (vec![("boxes", json!(state.boxes)), ("source", json!(state.source))], write)),
@@ -329,6 +332,7 @@ fn calibration_busy_code(inner: &SupervisorInner, path: &str) -> Option<&'static
     if inner.motor_zero_busy && matches!(path, "/api/v1/torque" | "/api/v1/arm" | "/api/v1/safety/clear_fault") { return Some("MOTION_BUSY"); }
     if path.starts_with("/api/v1/action/") || path.starts_with("/api/v1/motion/") || path.starts_with("/api/v1/mode/") { return Some("MOTION_BUSY"); }
     if path.starts_with("/api/v1/calibration/") || matches!(path, "/api/v1/grasp/setup" | "/api/v1/poses/save" | "/api/v1/poses/delete"
+        | "/api/v1/sequences/save" | "/api/v1/sequences/delete"
         | "/api/v1/safety/collision" | "/api/v1/workspace/keepout" | "/api/v1/gripper/calibration") { return Some("CONFIG_BUSY"); }
     None
 }
@@ -671,6 +675,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             Ok(ActionStart::Macro(m)) => { pending_macro = Some((value["request_id"].clone(), m, local_generation)); None }
                                             Ok(ActionStart::Replay(input)) => { pending_replay = Some((value["request_id"].clone(), input, local_generation)); None }
                                             Ok(ActionStart::DryRunGrasp(body)) => { pending_dry_run_grasp = Some((value["request_id"].clone(), body)); None }
+                                            Ok(ActionStart::Sequence(plan)) => Some(match crate::sequences::begin(&mut inner, &recv_supervisor, *plan) {
+                                                Ok(started) => command_ack(&inner, &value["request_id"], Some(started)),
+                                                Err(error) => command_reject(&inner, &value["request_id"], error.into()),
+                                            }),
                                             Err(error) => Some(command_reject(&inner, &value["request_id"], error)),
                                         };
                                     } else if let Some(result) = state_command(&mut inner, path, &value["body"], recv_deps.setup_path.as_ref()) {

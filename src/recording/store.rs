@@ -162,6 +162,12 @@ pub struct EpisodeSidecar {
     /// recorded before the store, adopted with the joint zero of the boot).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovered: Option<String>,
+    /// First and last `observation.state` (rad): the approach of a replay step and where it
+    /// ends, without reading the parquet (sequence duration bound).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_state: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_state: Option<Vec<f32>>,
 }
 
 impl EpisodeSidecar {
@@ -833,6 +839,7 @@ fn adopt_legacy(path: &Path, id: &str, offsets: &[f32], joint_names: &[String], 
         profile_id: meta.profile_id.clone().or_else(|| profile_id.map(str::to_string)),
         armd_version: "legacy".into(), fps_nominal: fps, truncated: false, stopped_by: None,
         arm_dof: meta.arm_dof, gripper_joint: meta.gripper_joint, recovered: Some("legacy".into()),
+        first_state: Some(first.observation_state.clone()), last_state: Some(last.observation_state.clone()),
     })
 }
 
@@ -901,6 +908,7 @@ mod tests {
             outcome: "ok".into(), recorded_at: now_rfc3339(), duration_s: 1.0, frames: 51, joint_names: vec!["a".into(), "b".into()],
             units: "rad".into(), joint_zero: JointZeroStamp::of(&[0.0, 0.0]), profile_id: None, armd_version: "x".into(),
             fps_nominal: 50.0, truncated: false, stopped_by: None, arm_dof: None, gripper_joint: None, recovered: None,
+            first_state: None, last_state: None,
         }
     }
 

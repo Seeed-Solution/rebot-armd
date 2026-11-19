@@ -576,6 +576,26 @@ pub async fn episodes_import(
     Ok(Json(serde_json::json!({"id": sc.id, "stale": stale, "episode": sc})))
 }
 
+/// `GET /api/v1/sequences`: `{sequences: [sequence + stale_steps + missing_steps + running]}`.
+pub async fn get_sequences(State(supervisor): State<Arc<ArmSupervisor>>) -> Result<Json<serde_json::Value>, ApiError> {
+    supervisor.ensure_episodes_loaded().await?;
+    let inner = supervisor.inner().read().await;
+    let list: Vec<_> = inner.sequences.file.sequences.iter().map(|s| crate::sequences::view(&inner, s)).collect();
+    Ok(Json(serde_json::json!({"sequences": list})))
+}
+
+/// `GET /api/v1/sequences/{id}`.
+pub async fn get_sequence(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    supervisor.ensure_episodes_loaded().await?;
+    let inner = supervisor.inner().read().await;
+    let s = inner.sequences.get(&id)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("No sequence with id '{id}'"), "SEQUENCE_NOT_FOUND".into()))?;
+    Ok(Json(crate::sequences::view(&inner, s)))
+}
+
 /// `GET /api/v1/datasets`: `{datasets: [{name, episodes, duration_s, bytes, created_at, description}]}`.
 pub async fn get_datasets(State(supervisor): State<Arc<ArmSupervisor>>) -> Result<Json<serde_json::Value>, ApiError> {
     supervisor.ensure_episodes_loaded().await?;

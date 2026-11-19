@@ -120,6 +120,7 @@ pub fn check(ctx: &ImportContext, sidecar: &Value, frames: &[RecordFrame]) -> Re
         profile_id: ctx.profile_id.clone(), armd_version: env!("CARGO_PKG_VERSION").into(),
         fps_nominal: sidecar.get("fps_nominal").and_then(Value::as_f64).filter(|f| f.is_finite() && *f > 0.0).unwrap_or(ctx.fps),
         truncated: false, stopped_by: None, arm_dof: Some(ctx.arm_dof), gripper_joint: ctx.gripper_joint, recovered: None,
+        first_state: Some(frames[0].observation_state.clone()), last_state: Some(frames[frames.len() - 1].observation_state.clone()),
     };
     Ok(CheckedImport { sidecar: sc, stale })
 }

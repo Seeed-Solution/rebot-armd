@@ -335,6 +335,7 @@ async fn stop_recording(lock: &Arc<RwLock<SupervisorInner>>, by: Stopper, save: 
             recorded_at: rec.recorded_at.clone(), duration_s: duration, frames: frames.len(), joint_names, units: "rad".into(),
             joint_zero: rec.joint_zero.clone(), profile_id, armd_version: env!("CARGO_PKG_VERSION").into(), fps_nominal: fps,
             truncated, stopped_by, arm_dof: Some(arm_dof), gripper_joint, recovered: None,
+            first_state: frames.first().map(|f| f.observation_state.clone()), last_state: frames.last().map(|f| f.observation_state.clone()),
         };
         debug_assert_eq!(path, st.path_of(&rec.id).unwrap_or_default());
         let sc = sidecar.clone();

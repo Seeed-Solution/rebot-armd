@@ -338,6 +338,8 @@ pub struct ReplayMotion {
     pub duration: f64,
     /// Gripper command held when `gripper` is false.
     hold_gripper: Option<f32>,
+    /// Request tag (standalone replay action).
+    pub tag: Option<String>,
     approach_duration: f64,
     phase: Phase,
 }
@@ -435,8 +437,11 @@ impl ReplayMotion {
 impl SupervisorInner {
     /// Busy rules of a replay, in addition to [`action_preconditions`](Self::action_preconditions).
     fn replay_preconditions(&self) -> Result<(), ArmError> {
-        if self.recorder.state() == &crate::recording::EpisodeState::Recording
-            || self.recorder.state() == &crate::recording::EpisodeState::Finalizing {
+        // a sequence run that records itself replays its episode steps into its own recording
+        let own_recording = self.recording.as_ref().is_some_and(|r| matches!(r.owner, crate::teach::RecorderOwner::Sequence { action_id }
+            if self.macro_run.as_ref().is_some_and(|m| m.id == action_id)));
+        if !own_recording && (self.recorder.state() == &crate::recording::EpisodeState::Recording
+            || self.recorder.state() == &crate::recording::EpisodeState::Finalizing) {
             return Err(MotionError::MotionBusy("an episode recording is running; save or discard it first".into()).into());
         }
         self.gravity_comp_motion_busy()?;
@@ -475,6 +480,49 @@ impl SupervisorInner {
     /// Install a checked replay: plan the approach to the first frame at the planned-motion
     /// limits, then start the action. Returns (action id, expected duration).
     pub fn install_replay(&mut self, plan: ReplayPlan) -> Result<(u64, f64), ArmError> {
+        let (motion, first, scales) = self.replay_motion(plan)?;
+        let episode = motion.episode.clone();
+        let expected = motion.expected_duration();
+        let tag = motion.tag.clone();
+        self.start_replay_motion(first)?;
+        let id = self.begin_action("replay", tag);
+        for s in scales.into_iter().flatten() { self.note_action_power_scale(id, s); }
+        if let Some(a) = self.last_action.as_mut() {
+            a.episode = Some(episode.clone());
+            a.phase = Some("approach".into());
+            a.t_s = Some(0.0);
+        }
+        tracing::info!("Replay of '{}' started (action {id}, {}x, gripper {}, {:.1} s recorded)", episode, motion.speed, motion.gripper, motion.duration);
+        self.active_trajectory = Some(crate::motion::ActiveTrajectory { action_id: Some(id), reference: crate::motion::Reference::Replay(Box::new(motion)) });
+        Ok((id, expected))
+    }
+
+    /// Install a checked replay as a sub-motion of macro action `id` (sequence replay step).
+    /// Returns its expected duration.
+    pub fn install_macro_replay(&mut self, id: u64, plan: ReplayPlan) -> Result<f64, ArmError> {
+        self.macro_sub_ready_pub(id)?;
+        let (motion, first, scales) = self.replay_motion(plan)?;
+        let expected = motion.expected_duration();
+        self.start_replay_motion(first)?;
+        for s in scales.into_iter().flatten() { self.note_action_power_scale(id, s); }
+        self.update_action(id, |a| { a.episode = Some(motion.episode.clone()); a.t_s = Some(0.0); });
+        self.quintic_settle = None;
+        self.active_trajectory = Some(crate::motion::ActiveTrajectory { action_id: Some(id), reference: crate::motion::Reference::Replay(Box::new(motion)) });
+        self.set_macro_sub_running(id);
+        Ok(expected)
+    }
+
+    fn start_replay_motion(&mut self, first: Vec<f32>) -> Result<(), ArmError> {
+        self.servo_target = None;
+        self.servo_settled_ticks.fill(0);
+        self.target_positions = first;
+        self.safety.mark_motion_started()?;
+        self.last_heartbeat = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// Checks of an install and the motion: (motion, first frame, power scales).
+    fn replay_motion(&mut self, plan: ReplayPlan) -> Result<(ReplayMotion, Vec<f32>, [Option<f64>; 2]), ArmError> {
         let input = &plan.input;
         if self.safety.epoch_id() != input.epoch {
             return Err(MotionError::PlanStale("epoch changed while loading the episode".into()).into());
@@ -501,27 +549,10 @@ impl SupervisorInner {
         let ReplayPlan { input, samples, sample_dt, duration, power_scale } = plan;
         let motion = ReplayMotion {
             episode: input.request.episode.clone(), speed: input.request.speed * power_scale.unwrap_or(1.0), gripper: input.request.gripper,
-            gripper_idx, samples, sample_dt, duration, hold_gripper,
+            gripper_idx, samples, sample_dt, duration, hold_gripper, tag: input.request.tag.clone(),
             approach_duration: traj.duration, phase: Phase::Approach(traj),
         };
-        let expected = motion.expected_duration();
-        self.servo_target = None;
-        self.servo_settled_ticks.fill(0);
-        self.target_positions = first;
-        self.safety.mark_motion_started()?;
-        self.last_heartbeat = std::time::Instant::now();
-        let id = self.begin_action("replay", input.request.tag.clone());
-        if let Some(s) = power_scale { self.note_action_power_scale(id, s); }
-        if let Some(s) = approach_scale { self.note_action_power_scale(id, s); }
-        if let Some(a) = self.last_action.as_mut() {
-            a.episode = Some(input.request.episode.clone());
-            a.phase = Some("approach".into());
-            a.t_s = Some(0.0);
-        }
-        self.active_trajectory = Some(crate::motion::ActiveTrajectory { action_id: Some(id), reference: crate::motion::Reference::Replay(Box::new(motion)) });
-        tracing::info!("Replay of '{}' started (action {id}, {}x, gripper {}, {:.1} s recorded)",
-            input.request.episode, input.request.speed, input.request.gripper, duration);
-        Ok((id, expected))
+        Ok((motion, first, [power_scale, approach_scale]))
     }
 
     /// Check and start a replay under the caller's lock (tests, in-process callers). The WS
