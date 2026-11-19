@@ -269,6 +269,7 @@ impl SupervisorInner {
         let hardware = json!({
             "physical_estop": hw.physical_estop,
             "torque_off_on_fault": false,
+            "operator_auth_enforced": self.operator_auth_enforced,
             "notes": notes,
         });
 

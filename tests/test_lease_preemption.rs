@@ -39,7 +39,7 @@ fn test_config() -> ArmConfig {
 async fn spawn_test_server() -> (SocketAddr, Arc<ArmSupervisor>) {
     let config = test_config();
     let supervisor = Arc::new(ArmSupervisor::new(config));
-    let router = create_router(supervisor.clone());
+    let router = create_router(supervisor.clone(), armd::OperatorAuth::disabled());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

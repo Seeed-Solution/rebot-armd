@@ -7,8 +7,14 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame as TungCloseFrame;
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 
-/// Generic bidirectional WebSocket proxy between Axum client and upstream server
-async fn bridge_websocket(client_ws: WebSocketUpgrade, upstream_url: String) -> Response {
+/// Optional upstream override for the detection WebSocket proxy (tests).
+#[derive(Clone, Debug)]
+pub struct DetectionWsUpstream(pub String);
+
+/// Read-only WebSocket subscription proxy between Axum client and upstream server.
+/// Upstream frames and Ping/Pong/Close are forwarded; client Text/Binary write frames are
+/// dropped so unauthenticated WS subscribers cannot inject upstream commands.
+async fn bridge_readonly_websocket(client_ws: WebSocketUpgrade, upstream_url: String) -> Response {
     client_ws.on_upgrade(move |mut client_socket: WebSocket| async move {
         let connect_timeout = std::time::Duration::from_secs(3);
         let connect_res = tokio::time::timeout(connect_timeout, connect_async(&upstream_url)).await;
@@ -20,15 +26,8 @@ async fn bridge_websocket(client_ws: WebSocketUpgrade, upstream_url: String) -> 
                 let client_to_upstream = async {
                     while let Some(msg_res) = client_rx.next().await {
                         match msg_res {
-                            Ok(WsMessage::Text(t)) => {
-                                if upstream_tx.send(TungMessage::Text(t.as_str().into())).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Ok(WsMessage::Binary(b)) => {
-                                if upstream_tx.send(TungMessage::Binary(b)).await.is_err() {
-                                    break;
-                                }
+                            Ok(WsMessage::Text(_)) | Ok(WsMessage::Binary(_)) => {
+                                tracing::debug!("Dropped client write frame on read-only detection WS");
                             }
                             Ok(WsMessage::Ping(p)) => {
                                 if upstream_tx.send(TungMessage::Ping(p)).await.is_err() {
@@ -120,9 +119,15 @@ async fn bridge_websocket(client_ws: WebSocketUpgrade, upstream_url: String) -> 
     })
 }
 
-/// GET /api/v1/detection/ws and /results (YOLO detection WebSocket stream on Port 8001)
-pub async fn proxy_detection_ws(ws: WebSocketUpgrade) -> Response {
-    bridge_websocket(ws, "ws://127.0.0.1:8001/results".to_string()).await
+/// GET /api/v1/detection/ws and /results (YOLO detection WebSocket stream on Port 8001, read-only subscription)
+pub async fn proxy_detection_ws(
+    ws: WebSocketUpgrade,
+    ws_up: Option<axum::Extension<DetectionWsUpstream>>,
+) -> Response {
+    let url = ws_up
+        .map(|axum::Extension(u)| u.0)
+        .unwrap_or_else(|| "ws://127.0.0.1:8001/results".to_string());
+    bridge_readonly_websocket(ws, url).await
 }
 
 // ---------------------------------------------------------------------------

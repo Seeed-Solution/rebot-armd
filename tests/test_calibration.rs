@@ -77,7 +77,7 @@ async fn calibrated_supervisor(dir: &Path) -> ArmSupervisor {
     std::fs::write(&cal, serde_json::to_string(&calib_file(v8_q())).unwrap()).unwrap();
     let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
     grasp::load_into(&sup, &setup).await;
-    calibration::load_into(&sup, &cal, Some(&setup)).await;
+    calibration::load_into(&sup, &cal, Some(&setup)).await.unwrap();
     sup
 }
 
@@ -98,7 +98,7 @@ async fn startup_calibration_wins_for_the_mount_and_tilt() {
     let bad = dir.path().join("bad.json");
     std::fs::write(&bad, r#"{"camera_mount": {"q_end_cam": [2, 0, 0, 0], "offset_m": [0, 0, 0]}}"#).unwrap();
     let fresh = ArmSupervisor::new(ArmConfig::rebot_dm());
-    calibration::load_into(&fresh, &bad, None).await;
+    calibration::load_into(&fresh, &bad, None).await.unwrap();
     assert!(!fresh.inner().read().await.camera_calibrated());
     assert!(!bad.exists(), "quarantined");
 }
@@ -226,7 +226,7 @@ async fn rig_with(paths: impl FnOnce(&Path) -> (PathBuf, PathBuf)) -> Rig {
     deps.vision_timeout = Duration::from_millis(1500);
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
     let router = armd::api::create_router_calibration(sup.clone(), up.clone(), GraspDeps::http(up, Some(setup)),
-        armd::diagnostics::DiagnosticsState::global(), deps.clone());
+        armd::diagnostics::DiagnosticsState::global(), deps.clone(), armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
@@ -587,7 +587,7 @@ async fn rejected_calibration_resets_the_grasp_camera_model() {
     let (prof, prof_mount) = { let i = sup.inner().read().await; (i.grasp_setup().unwrap(), i.config.camera_mount.clone()) };
     grasp::load_into(&sup, &setup).await;
     assert_eq!(sup.inner().read().await.grasp_setup().unwrap().cx_px, Some(318.2));
-    calibration::load_into(&sup, &cal, Some(&setup)).await;
+    calibration::load_into(&sup, &cal, Some(&setup)).await.unwrap();
     let inner = sup.inner().read().await;
     assert!(!inner.camera_calibrated() && inner.config.camera_mount == prof_mount, "profile mount");
     let g = inner.grasp_setup().unwrap();
@@ -612,7 +612,7 @@ async fn rejected_calibration_resets_the_grasp_camera_model() {
     // a fresh start with the saved setup and no calibration.json is consistent and has no error
     let again = ArmSupervisor::new(ArmConfig::rebot_dm());
     grasp::load_into(&again, &setup).await;
-    calibration::load_into(&again, &cal, Some(&setup)).await;
+    calibration::load_into(&again, &cal, Some(&setup)).await.unwrap();
     let i2 = again.inner().read().await;
     assert!(i2.calibration_load_error.is_none());
     assert_eq!(i2.grasp_setup().unwrap().fx_px, prof.fx_px);
@@ -625,4 +625,75 @@ async fn successful_apply_clears_the_load_error() {
     let ok = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
     assert_eq!(ok["type"], "command_ack", "{ok}");
     assert!(r.sup.inner().read().await.calibration_load_error.is_none());
+}
+
+#[tokio::test]
+async fn rejected_calibration_unwritable_setup_aborts_reset_without_mutating_memory_or_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let valid_setup = dir.path().join("grasp_setup.json");
+    std::fs::write(&valid_setup, r#"{"camera_tilt_deg": -30.0, "fx_px": 831.5, "fy_px": 829.0, "cx_px": 318.2, "cy_px": 183.4,
+        "image_size_px": [640, 360], "table_z_m": 0.012, "grip_pixel_norm": [0.41, 0.77]}"#).unwrap();
+    let cal = dir.path().join("calibration.json");
+    std::fs::write(&cal, r#"{"camera_mount": {"q_end_cam": [1, 0, 0"#).unwrap();
+    let blocker = dir.path().join("blocker_file");
+    std::fs::write(&blocker, b"x").unwrap();
+    let unwritable_setup = blocker.join("grasp_setup.json");
+
+    let sup = ArmSupervisor::new(ArmConfig::rebot_dm());
+    grasp::load_into(&sup, &valid_setup).await;
+    assert_eq!(sup.inner().read().await.grasp_setup_revision, 1);
+    assert_eq!(sup.inner().read().await.grasp_setup().unwrap().cx_px, Some(318.2));
+
+    // Startup calibration load sees corrupt calibration.json and fails to persist reset to unwritable_setup:
+    // it MUST fail closed (return Err) and abort the reset without mutating in-memory grasp_setup or bumping grasp_setup_revision.
+    let err = calibration::load_into(&sup, &cal, Some(&unwritable_setup)).await.unwrap_err();
+    assert!(err.contains("aborted"), "{err}");
+    let inner = sup.inner().read().await;
+    assert_eq!(inner.grasp_setup_revision, 1);
+    assert_eq!(inner.grasp_setup().unwrap().cx_px, Some(318.2));
+    assert!(inner.calibration_load_error.as_deref().is_some_and(|e| e.contains("aborted")));
+}
+
+#[tokio::test]
+async fn revert_preserves_calibration_file_when_backup_read_fails() {
+    let mut r = rig_with(|d| {
+        let cal = d.join("calibration.json");
+        std::fs::write(&cal, serde_json::to_string(&calib_file(v8_q())).unwrap()).unwrap();
+        let setup_dir = d.join("grasp_setup_dir");
+        std::fs::create_dir_all(&setup_dir).unwrap();
+        (cal, setup_dir)
+    })
+    .await;
+    // Let write_backup create the backup directory, then slow vision PUT enough for the test to
+    // replace <backup>/calibration.json with a directory (triggering EISDIR != NotFound on revert).
+    r.mock.lock().unwrap().slow_reply_after_apply = Some((1, 250));
+    let id = send_cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "backup calibration.json never appeared");
+        if let Ok(rd) = std::fs::read_dir(&r.deps.backup_dir) {
+            if let Some(bak_cal) = rd
+                .flatten()
+                .map(|e| e.path().join("calibration.json"))
+                .find(|p| p.is_file())
+            {
+                std::fs::remove_file(&bak_cal).unwrap();
+                std::fs::create_dir(&bak_cal).unwrap();
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let rej = reply_for(&mut r, id).await;
+    assert_eq!(rej["code"], "CALIBRATION_INCONSISTENT", "{rej}");
+    assert!(
+        rej["state"]["calibration_file"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("revert failed:")),
+        "{rej}"
+    );
+    assert!(
+        r.deps.path.is_file(),
+        "official calibration.json must NOT be deleted when backup read fails with a non-NotFound error"
+    );
 }

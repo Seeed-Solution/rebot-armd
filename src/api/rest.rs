@@ -101,6 +101,10 @@ pub struct ApiErrorResponse {
     pub violation_phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_s: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -111,6 +115,8 @@ pub struct ApiError {
     pub code: Option<String>,
     pub safety_state: Option<String>,
     pub workspace_violation: Option<crate::kinematics::WorkspaceViolationDetail>,
+    pub current_revision: Option<u64>,
+    pub retry_after_s: Option<u64>,
 }
 
 #[allow(non_snake_case)]
@@ -122,6 +128,75 @@ pub fn ApiError(status: StatusCode, message: String, code: String) -> ApiError {
         code: Some(code),
         safety_state: None,
         workspace_violation: None,
+        current_revision: None,
+        retry_after_s: None,
+    }
+}
+
+impl ApiError {
+    pub fn detailed(status: StatusCode, error: impl Into<String>, code: impl Into<String>, message: impl Into<String>, current_revision: Option<u64>) -> Self {
+        Self {
+            status,
+            error: error.into(),
+            message: message.into(),
+            code: Some(code.into()),
+            safety_state: None,
+            workspace_violation: None,
+            current_revision,
+            retry_after_s: None,
+        }
+    }
+
+    pub fn operator_required(op: &str) -> Self {
+        Self::detailed(
+            StatusCode::FORBIDDEN,
+            "operator_required",
+            "OPERATOR_REQUIRED",
+            format!("Operator unlock is required for {op}"),
+            None,
+        )
+    }
+
+    pub fn invalid_pin() -> Self {
+        Self::detailed(
+            StatusCode::FORBIDDEN,
+            "invalid_pin",
+            "INVALID_PIN",
+            "Invalid operator PIN",
+            None,
+        )
+    }
+
+    pub fn rate_limited(retry_after_s: u64) -> Self {
+        let mut err = Self::detailed(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "RATE_LIMITED",
+            format!("Too many failed unlock attempts; retry after {retry_after_s}s"),
+            None,
+        );
+        err.retry_after_s = Some(retry_after_s);
+        err
+    }
+
+    pub fn policy_revision_mismatch(expected: u64, current: u64) -> Self {
+        Self::detailed(
+            StatusCode::CONFLICT,
+            "policy_revision_mismatch",
+            "POLICY_REVISION_MISMATCH",
+            format!("Policy revision mismatch: expected {expected}, current {current}"),
+            Some(current),
+        )
+    }
+
+    pub fn persist_failed(message: impl Into<String>) -> Self {
+        Self::detailed(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "persist_failed",
+            "PERSIST_FAILED",
+            message,
+            None,
+        )
     }
 }
 
@@ -131,6 +206,7 @@ impl IntoResponse for ApiError {
             Some(d) => (d.constraint_id, d.geometry_id, d.violation_phase, d.reason),
             None => (None, None, None, None),
         };
+        let retry_after_s = self.retry_after_s;
         let body = Json(ApiErrorResponse {
             error: self.error,
             message: self.message,
@@ -140,8 +216,16 @@ impl IntoResponse for ApiError {
             geometry_id,
             violation_phase,
             reason,
+            current_revision: self.current_revision,
+            retry_after_s,
         });
-        (self.status, body).into_response()
+        let mut resp = (self.status, body).into_response();
+        if let Some(s) = retry_after_s {
+            if let Ok(hv) = axum::http::HeaderValue::from_str(&s.to_string()) {
+                resp.headers_mut().insert(axum::http::header::RETRY_AFTER, hv);
+            }
+        }
+        resp
     }
 }
 
@@ -156,6 +240,8 @@ impl From<ArmError> for ApiError {
                     code: Some("HANDOVER_SETTLING".to_string()),
                     safety_state: None,
                     workspace_violation: None,
+                    current_revision: None,
+                    retry_after_s: None,
                 },
                 crate::safety::SafetyError::ArmNotAtRestingPose { .. } => ApiError {
                     status: StatusCode::CONFLICT,
@@ -164,6 +250,8 @@ impl From<ArmError> for ApiError {
                     code: Some("ARM_NOT_AT_RESTING_POSE".to_string()),
                     safety_state: Some("Armed".to_string()),
                     workspace_violation: None,
+                    current_revision: None,
+                    retry_after_s: None,
                 },
                 crate::safety::SafetyError::MotionForbiddenInFaultState(msg) => ApiError {
                     status: StatusCode::CONFLICT,
@@ -172,6 +260,8 @@ impl From<ArmError> for ApiError {
                     code: Some("MOTION_FORBIDDEN_IN_FAULT_STATE".to_string()),
                     safety_state: Some("Fault".to_string()),
                     workspace_violation: None,
+                    current_revision: None,
+                    retry_after_s: None,
                 },
                 crate::safety::SafetyError::ClearFaultRejected(msg) => ApiError {
                     status: StatusCode::CONFLICT,
@@ -180,6 +270,8 @@ impl From<ArmError> for ApiError {
                     code: Some("CLEAR_FAULT_REJECTED".to_string()),
                     safety_state: Some("Fault".to_string()),
                     workspace_violation: None,
+                    current_revision: None,
+                    retry_after_s: None,
                 },
                 crate::safety::SafetyError::EStopActive => ApiError {
                     status: StatusCode::CONFLICT,
@@ -188,6 +280,8 @@ impl From<ArmError> for ApiError {
                     code: Some("ESTOP_ACTIVE".to_string()),
                     safety_state: Some("EStop".to_string()),
                     workspace_violation: None,
+                    current_revision: None,
+                    retry_after_s: None,
                 },
                 crate::safety::SafetyError::CollisionHold(_) => {
                     ApiError(StatusCode::CONFLICT, safety_err.to_string(), "COLLISION_HOLD".to_string())
@@ -213,6 +307,8 @@ impl From<ArmError> for ApiError {
                     code: Some("FAULT_ACTIVE".to_string()),
                     safety_state: Some("Fault".to_string()),
                     workspace_violation: None,
+                    current_revision: None,
+                    retry_after_s: None,
                 },
                 crate::safety::SafetyError::NotArmed(_) => {
                     ApiError(StatusCode::PRECONDITION_FAILED, safety_err.to_string(), "NOT_ARMED".to_string())
@@ -248,6 +344,9 @@ impl From<ArmError> for ApiError {
                 let mut api = ApiError(StatusCode::UNPROCESSABLE_ENTITY, message, "WORKSPACE_VIOLATION".to_string());
                 api.workspace_violation = Some(detail);
                 api
+            }
+            ArmError::PolicyRevisionMismatch { expected, current } => {
+                ApiError::policy_revision_mismatch(expected, current)
             }
             ArmError::Internal(msg) => {
                 ApiError(StatusCode::INTERNAL_SERVER_ERROR, msg, "INTERNAL_ERROR".to_string())
@@ -376,9 +475,24 @@ pub async fn motion_unload(
 pub async fn action_requires_lease(
     State(supervisor): State<Arc<ArmSupervisor>>,
     axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>,
+    axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>,
+    headers: axum::http::HeaderMap,
     uri: axum::http::Uri,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let token = crate::auth::OperatorAuth::extract_token(&headers);
+    if auth.is_enforced() && !auth.is_operator(token.as_deref()) {
+        if uri.path() == "/api/v1/mode/gravity_comp" {
+            return Err(ApiError::operator_required("/api/v1/mode/gravity_comp"));
+        }
+        if uri.path() == "/api/v1/action/gripper_zero_check" {
+            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&body) {
+                if val.get("store_offset").and_then(serde_json::Value::as_bool) == Some(true) {
+                    return Err(ApiError::operator_required("gripper_zero_check (store_offset=true)"));
+                }
+            }
+        }
+    }
     if uri.path() == "/api/v1/action/grasp" {
         if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&body) {
             if val.get("dry_run").and_then(serde_json::Value::as_bool) == Some(true) {
@@ -487,11 +601,14 @@ pub async fn get_grasp_setup(
     State(supervisor): State<Arc<ArmSupervisor>>,
     axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>,
 ) -> Response {
-    let setup = supervisor.inner().read().await.grasp_setup();
+    let (setup, revision) = {
+        let inner = supervisor.inner().read().await;
+        (inner.grasp_setup(), inner.grasp_setup_revision)
+    };
     let path = deps.setup_path.as_ref().map(|p| p.display().to_string());
     match setup {
-        Some(s) => Json(serde_json::json!({"supported": true, "setup": s, "path": path})).into_response(),
-        None => Json(serde_json::json!({"supported": false, "setup": null, "path": path})).into_response(),
+        Some(s) => Json(serde_json::json!({"supported": true, "setup": s, "path": path, "revision": revision})).into_response(),
+        None => Json(serde_json::json!({"supported": false, "setup": null, "path": path, "revision": revision})).into_response(),
     }
 }
 
@@ -511,7 +628,11 @@ pub async fn get_keepout(State(supervisor): State<Arc<ArmSupervisor>>) -> Respon
 
 /// `GET /api/v1/poses`: stored named poses (no lease).
 pub async fn get_poses(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
-    Json(supervisor.inner().read().await.poses.list.clone()).into_response()
+    let inner = supervisor.inner().read().await;
+    Json(crate::poses::PoseListResponse {
+        list: inner.poses.list.clone(),
+        revision: inner.poses.revision,
+    }).into_response()
 }
 
 /// `GET /api/v1/safety/collision`: effective collision guard config (scaled thresholds).
@@ -520,11 +641,118 @@ pub async fn get_collision(State(supervisor): State<Arc<ArmSupervisor>>) -> Resp
 }
 
 /// `GET /api/v1/safety/describe`: limits, stops and faults of this armd (no lease).
-pub async fn get_safety_describe(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
-    Json(supervisor.inner().read().await.safety_describe()).into_response()
+pub async fn get_safety_describe(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>,
+) -> Response {
+    let mut val = supervisor.inner().read().await.safety_describe();
+    if let Some(hw) = val.get_mut("hardware").and_then(serde_json::Value::as_object_mut) {
+        hw.insert("operator_auth_enforced".into(), serde_json::json!(auth.is_enforced()));
+    }
+    Json(val).into_response()
 }
 
 /// `GET /api/v1/gripper/calibration`: current gripper calibration and effective policy (no lease).
 pub async fn get_gripper_calibration(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
     Json(supervisor.inner().read().await.gripper_calibration_response()).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UnlockRequest {
+    pub pin: String,
+}
+
+/// `GET /api/v1/auth/status`: current operator auth status (no lease).
+pub async fn auth_status(
+    axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>,
+    headers: axum::http::HeaderMap,
+) -> Json<crate::auth::AuthStatus> {
+    let token = crate::auth::OperatorAuth::extract_token(&headers);
+    Json(auth.status(token.as_deref()))
+}
+
+fn is_https_forwarded(headers: &axum::http::HeaderMap) -> bool {
+    for val in headers.get_all("x-forwarded-proto") {
+        if let Ok(s) = val.to_str() {
+            if s.split(',').next().is_some_and(|p| p.trim().eq_ignore_ascii_case("https")) {
+                return true;
+            }
+        }
+    }
+    for val in headers.get_all(axum::http::header::FORWARDED) {
+        if let Ok(s) = val.to_str() {
+            for elem in s.split(',') {
+                for dir in elem.split(';') {
+                    let dir = dir.trim();
+                    if let Some((k, v)) = dir.split_once('=') {
+                        if k.trim().eq_ignore_ascii_case("proto") {
+                            let v = v.trim().trim_matches('"');
+                            if v.eq_ignore_ascii_case("https") {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `POST /api/v1/auth/unlock`: validate operator PIN, issue session token + HttpOnly cookie.
+pub async fn auth_unlock(
+    axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>,
+    headers: axum::http::HeaderMap,
+    payload: Result<Json<UnlockRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(req) = payload.map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("Invalid unlock request: {e}"), "INVALID_COMMAND".into()))?;
+    if !auth.is_enforced() {
+        return Ok(Json(serde_json::json!({
+            "role": "operator",
+            "token": null,
+            "expires_in_s": null,
+        })).into_response());
+    }
+    let (token, expires_in_s) = auth.unlock(&req.pin).map_err(|e| match e {
+        crate::auth::UnlockError::InvalidPin => ApiError::invalid_pin(),
+        crate::auth::UnlockError::RateLimited { retry_after_s } => ApiError::rate_limited(retry_after_s),
+        crate::auth::UnlockError::RngFailed => ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to generate session token".into(),
+            "INTERNAL_ERROR".into(),
+        ),
+    })?;
+    let secure = if is_https_forwarded(&headers) { "; Secure" } else { "" };
+    let cookie = format!(
+        "{}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={expires_in_s}{secure}",
+        crate::auth::SESSION_COOKIE_NAME
+    );
+    let mut resp = Json(serde_json::json!({
+        "role": "operator",
+        "token": token,
+        "expires_in_s": expires_in_s,
+    })).into_response();
+    if let Ok(val) = axum::http::HeaderValue::from_str(&cookie) {
+        resp.headers_mut().insert(axum::http::header::SET_COOKIE, val);
+    }
+    Ok(resp)
+}
+
+/// `POST /api/v1/auth/lock`: revoke token from Bearer header or Cookie and clear cookie.
+pub async fn auth_lock(
+    axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let token = crate::auth::OperatorAuth::extract_token(&headers);
+    auth.lock(token.as_deref());
+    let secure = if is_https_forwarded(&headers) { "; Secure" } else { "" };
+    let clear_cookie = format!(
+        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}",
+        crate::auth::SESSION_COOKIE_NAME
+    );
+    let mut resp = Json(serde_json::json!({"role": "program"})).into_response();
+    if let Ok(val) = axum::http::HeaderValue::from_str(&clear_cookie) {
+        resp.headers_mut().insert(axum::http::header::SET_COOKIE, val);
+    }
+    resp
 }

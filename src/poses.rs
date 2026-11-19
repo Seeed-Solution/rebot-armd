@@ -59,12 +59,32 @@ pub struct PoseList {
     pub poses: Vec<NamedPose>,
 }
 
+/// `GET /api/v1/poses` body (adds `revision` to [`PoseList`]).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PoseListResponse {
+    #[serde(flatten)]
+    pub list: PoseList,
+    pub revision: u64,
+}
+
 /// Poses held by the supervisor.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PoseStore {
     pub list: PoseList,
     /// File the store is written to; None = not persisted.
     pub path: Option<PathBuf>,
+    /// Monotonic revision (starts at 1).
+    pub revision: u64,
+}
+
+impl Default for PoseStore {
+    fn default() -> Self {
+        Self {
+            list: PoseList::default(),
+            path: None,
+            revision: 1,
+        }
+    }
 }
 
 impl PoseStore {
@@ -166,10 +186,6 @@ impl SupervisorInner {
         Some(PoseTcp { position: pose.p, rpy: crate::kinematics::r_to_rpy(&pose.r) })
     }
 
-    fn poses_write(&self) -> Option<PendingWrite> {
-        self.poses.path.clone().map(|path| PendingWrite::new(path, serde_json::to_string_pretty(&self.poses.list).unwrap_or_default()))
-    }
-
     /// Joint-space quintic of arm joints (and gripper with `include_gripper`) to a stored pose,
     /// recorded as a `move_to_pose` action. Returns (action id, expected duration).
     pub fn move_to_pose(&mut self, name: &str, include_gripper: bool, speed_scale: f64, tag: Option<String>, epoch: u64) -> Result<(u64, f64), ArmError> {
@@ -235,8 +251,42 @@ impl SupervisorInner {
     }
 }
 
-/// WS command `/api/v1/poses/save` `{name, positions?}`. Returns the pose and the file write.
-pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Option<PendingWrite>), ArmError> {
+/// Validated pose save prepared without mutating `SupervisorInner`.
+#[derive(Debug, Clone)]
+pub struct PreparedPosesSave {
+    pub base_revision: u64,
+    pub pose: NamedPose,
+    pub next_list: PoseList,
+    pub write: Option<PendingWrite>,
+}
+
+/// Validated pose delete prepared without mutating `SupervisorInner`.
+#[derive(Debug, Clone)]
+pub struct PreparedPosesDelete {
+    pub base_revision: u64,
+    pub next_list: PoseList,
+    pub write: Option<PendingWrite>,
+}
+
+fn check_pose_revision(inner: &SupervisorInner, body: &Value, require_expected_revision: bool) -> Result<u64, ArmError> {
+    if !body.is_object() {
+        return Err(invalid("Command body must be an object"));
+    }
+    if let Some(exp) = persist::parse_expected_revision(body, require_expected_revision).map_err(invalid)? {
+        if exp != inner.poses.revision {
+            return Err(ArmError::PolicyRevisionMismatch { expected: exp, current: inner.poses.revision });
+        }
+    }
+    Ok(inner.poses.revision)
+}
+
+/// Step 1 of atomic persist-before-commit for `/api/v1/poses/save`.
+pub fn prepare_save_with(
+    inner: &SupervisorInner,
+    body: &Value,
+    require_expected_revision: bool,
+) -> Result<PreparedPosesSave, ArmError> {
+    let base_revision = check_pose_revision(inner, body, require_expected_revision)?;
     let name = name_of(body)?;
     let positions = match body.get("positions") {
         None | Some(Value::Null) => inner.measured_positions.clone(),
@@ -264,25 +314,90 @@ pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Opt
         gripper_joint,
         joint_names: Some(joint_names.clone()),
     };
-    inner.poses.list.profile_id = profile_id;
-    inner.poses.list.arm_dof = Some(arm_dof);
-    inner.poses.list.gripper_joint = gripper_joint;
-    inner.poses.list.joint_names = Some(joint_names);
-    let list = &mut inner.poses.list.poses;
-    match list.iter_mut().find(|p| p.name == pose.name) {
+    let mut next_list = inner.poses.list.clone();
+    next_list.profile_id = profile_id;
+    next_list.arm_dof = Some(arm_dof);
+    next_list.gripper_joint = gripper_joint;
+    next_list.joint_names = Some(joint_names);
+    match next_list.poses.iter_mut().find(|p| p.name == pose.name) {
         Some(p) => *p = pose.clone(),
-        None => list.push(pose.clone()),
+        None => next_list.poses.push(pose.clone()),
     }
-    Ok((pose, inner.poses_write()))
+    let write = inner.poses.path.clone().map(|path| {
+        PendingWrite::new(path, serde_json::to_string_pretty(&next_list).unwrap_or_default())
+    });
+    Ok(PreparedPosesSave { base_revision, pose, next_list, write })
+}
+
+pub fn precheck_save(inner: &SupervisorInner, prepared: &PreparedPosesSave) -> Result<(), ArmError> {
+    if inner.poses.revision != prepared.base_revision {
+        return Err(ArmError::PolicyRevisionMismatch { expected: prepared.base_revision, current: inner.poses.revision });
+    }
+    if inner.calibration_busy {
+        return Err(ArmError::Rejected { status: 409, code: "CONFIG_BUSY".into(), message: "a camera calibration apply or restore is running".into() });
+    }
+    Ok(())
+}
+
+pub fn commit_save(inner: &mut SupervisorInner, prepared: PreparedPosesSave) -> Result<(NamedPose, u64), ArmError> {
+    if inner.poses.revision != prepared.base_revision {
+        return Err(ArmError::PolicyRevisionMismatch { expected: prepared.base_revision, current: inner.poses.revision });
+    }
+    inner.poses.list = prepared.next_list;
+    inner.poses.revision += 1;
+    Ok((prepared.pose, inner.poses.revision))
+}
+
+/// Step 1 of atomic persist-before-commit for `/api/v1/poses/delete`.
+pub fn prepare_delete_with(
+    inner: &SupervisorInner,
+    body: &Value,
+    require_expected_revision: bool,
+) -> Result<PreparedPosesDelete, ArmError> {
+    let base_revision = check_pose_revision(inner, body, require_expected_revision)?;
+    let name = name_of(body)?;
+    let mut next_list = inner.poses.list.clone();
+    let i = next_list.poses.iter().position(|p| p.name == name).ok_or_else(|| not_found(&name))?;
+    next_list.poses.remove(i);
+    let write = inner.poses.path.clone().map(|path| {
+        PendingWrite::new(path, serde_json::to_string_pretty(&next_list).unwrap_or_default())
+    });
+    Ok(PreparedPosesDelete { base_revision, next_list, write })
+}
+
+pub fn precheck_delete(inner: &SupervisorInner, prepared: &PreparedPosesDelete) -> Result<(), ArmError> {
+    if inner.poses.revision != prepared.base_revision {
+        return Err(ArmError::PolicyRevisionMismatch { expected: prepared.base_revision, current: inner.poses.revision });
+    }
+    if inner.calibration_busy {
+        return Err(ArmError::Rejected { status: 409, code: "CONFIG_BUSY".into(), message: "a camera calibration apply or restore is running".into() });
+    }
+    Ok(())
+}
+
+pub fn commit_delete(inner: &mut SupervisorInner, prepared: PreparedPosesDelete) -> Result<u64, ArmError> {
+    if inner.poses.revision != prepared.base_revision {
+        return Err(ArmError::PolicyRevisionMismatch { expected: prepared.base_revision, current: inner.poses.revision });
+    }
+    inner.poses.list = prepared.next_list;
+    inner.poses.revision += 1;
+    Ok(inner.poses.revision)
+}
+
+/// WS command `/api/v1/poses/save` `{name, positions?}`. Returns the pose and the file write.
+pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Option<PendingWrite>), ArmError> {
+    let mut prepared = prepare_save_with(inner, body, false)?;
+    let write = prepared.write.take();
+    let (pose, _) = commit_save(inner, prepared)?;
+    Ok((pose, write))
 }
 
 /// WS command `/api/v1/poses/delete` `{name}`.
 pub fn delete(inner: &mut SupervisorInner, body: &Value) -> Result<Option<PendingWrite>, ArmError> {
-    let name = name_of(body)?;
-    let list = &mut inner.poses.list.poses;
-    let i = list.iter().position(|p| p.name == name).ok_or_else(|| not_found(&name))?;
-    list.remove(i);
-    Ok(inner.poses_write())
+    let mut prepared = prepare_delete_with(inner, body, false)?;
+    let write = prepared.write.take();
+    let _ = commit_delete(inner, prepared)?;
+    Ok(write)
 }
 
 /// Optional `speed_scale` in [MIN_SPEED_SCALE, 1.0], default 1.0.

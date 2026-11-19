@@ -111,7 +111,7 @@ fn calibrated_mount(inner: &SupervisorInner, offset: [f32; 3], q: [f64; 4]) -> C
 /// `setup_path`, the old file kept as `<name>.pre-reset-<ts>`) so no grasp mixes a calibrated
 /// camera model with the profile mount. The error is reported in `GET /api/v1/calibration`
 /// (`load_error`) until an apply or restore succeeds.
-pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Option<&Path>) {
+pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Option<&Path>) -> Result<(), String> {
     let loaded = crate::persist::load::<CalibrationFile>(path, CalibrationFile::validate);
     let mut inner = supervisor.inner().write().await;
     match loaded {
@@ -123,40 +123,81 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
                 path.display(), mount.q_end_cam, mount.offset_m, mount.tilt_deg);
             inner.set_camera_mount(mount);
             inner.calibration = Some(file);
+            Ok(())
         }
-        crate::persist::Loaded::Missing => tracing::info!("No camera calibration at {}; using the profile camera mount", path.display()),
+        crate::persist::Loaded::Missing => {
+            tracing::info!("No camera calibration at {}; using the profile camera mount", path.display());
+            Ok(())
+        }
         crate::persist::Loaded::Invalid(e) => {
             tracing::warn!("Ignoring camera calibration file: {e}; using the profile camera mount");
             let mut msg = e;
-            if let Some(setup) = reset_camera_model(&mut inner) {
-                msg.push_str("; grasp setup camera model reset to the profile values");
-                if let Some(p) = setup_path { if let Err(e) = persist_reset_setup(p, &setup) { msg.push_str(&format!(" (not saved: {e})")); } }
-                tracing::warn!("Grasp setup camera model reset to the profile values (calibration.json rejected)");
+            let candidate = compute_reset_camera_model(&inner);
+            if let Some(setup) = candidate {
+                if let Some(p) = setup_path {
+                    match persist_reset_setup_rename(p, &setup) {
+                        Ok(dir_sync) => {
+                            let prof_mount = inner.profile_camera_mount.clone();
+                            inner.set_camera_mount(prof_mount);
+                            inner.set_grasp_setup(setup);
+                            inner.grasp_setup_revision += 1;
+                            msg.push_str("; grasp setup camera model reset to the profile values");
+                            inner.calibration_load_error = Some(msg);
+                            tracing::warn!("Grasp setup camera model reset to the profile values (calibration.json rejected)");
+                            drop(inner);
+                            if let crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) = dir_sync.sync_parent_dir() {
+                                let mut inner = supervisor.inner().write().await;
+                                if let Some(ref mut cur_err) = inner.calibration_load_error {
+                                    cur_err.push_str(&format!(" (durability unconfirmed: {w})"));
+                                }
+                            }
+                            return Ok(());
+                        }
+                        Err(persist_err) => {
+                            tracing::error!("Aborting startup grasp setup reset (persist failed: {persist_err})");
+                            msg.push_str(&format!("; grasp setup reset aborted (not saved: {persist_err})"));
+                            inner.calibration_load_error = Some(msg.clone());
+                            return Err(msg);
+                        }
+                    }
+                } else {
+                    let prof_mount = inner.profile_camera_mount.clone();
+                    inner.set_camera_mount(prof_mount);
+                    inner.set_grasp_setup(setup);
+                    inner.grasp_setup_revision += 1;
+                    msg.push_str("; grasp setup camera model reset to the profile values");
+                    tracing::warn!("Grasp setup camera model reset to the profile values (calibration.json rejected)");
+                }
             }
             inner.calibration_load_error = Some(msg);
+            Ok(())
         }
     }
 }
 
-/// The live grasp setup with the camera-model fields of the profile; None when nothing changes
-/// (or the profile has no grasp setup).
-fn reset_camera_model(inner: &mut SupervisorInner) -> Option<GraspSetup> {
+/// Compute the grasp setup with the camera-model fields of the profile without mutating `inner`;
+/// None when nothing changes (or the profile has no grasp setup).
+fn compute_reset_camera_model(inner: &SupervisorInner) -> Option<GraspSetup> {
     let (cur, prof) = (inner.grasp_setup()?, inner.profile_grasp.clone()?);
     let setup = GraspSetup { fx_px: prof.fx_px, fy_px: prof.fy_px, cx_px: prof.cx_px, cy_px: prof.cy_px, image_size_px: prof.image_size_px,
         grip_pixel_norm: prof.grip_pixel_norm, camera_tilt_deg: f64::from(inner.profile_camera_mount.tilt_deg), ..cur.clone() };
     if setup == cur { return None; }
-    inner.set_camera_mount(inner.profile_camera_mount.clone());
-    inner.set_grasp_setup(setup.clone());
     Some(setup)
 }
 
-/// Keep a copy of `grasp_setup.json`, then write the reset setup.
-fn persist_reset_setup(path: &Path, setup: &GraspSetup) -> std::io::Result<()> {
+/// Keep a copy of `grasp_setup.json`, then stage and atomically rename the reset setup
+/// returning `PendingDirSync` so directory `sync_all()` runs outside the supervisor lock.
+fn persist_reset_setup_rename(path: &Path, setup: &GraspSetup) -> Result<crate::persist::PendingDirSync, String> {
     if path.is_file() {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        std::fs::copy(path, path.with_file_name(format!("{name}.pre-reset-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"))))?;
+        std::fs::copy(path, path.with_file_name(format!("{name}.pre-reset-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ"))))
+            .map_err(|e| e.to_string())?;
     }
-    crate::persist::write_atomic(path, &serde_json::to_string_pretty(setup).unwrap_or_default())
+    let staged = crate::persist::StagedWrite::stage(
+        path.to_path_buf(),
+        serde_json::to_string_pretty(setup).unwrap_or_default(),
+    )?;
+    staged.rename_only()
 }
 
 // ---- errors ----
@@ -432,6 +473,14 @@ fn read_if_file(path: &Path) -> std::io::Result<Option<String>> {
     std::fs::read_to_string(path).map(Some)
 }
 
+fn read_backup_file(path: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Backup directory name: UTC time, unique within `root`.
 fn backup_name(root: &Path) -> String {
     let base = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -538,6 +587,7 @@ struct Txn<'a> {
     file_written: bool,
     live_written: bool,
     backup: Option<PathBuf>,
+    durability_warnings: Vec<String>,
 }
 
 impl Txn<'_> {
@@ -572,37 +622,126 @@ impl Txn<'_> {
     }
 
     /// calibration.json, then the live mount and calibration.
+    /// Stages outside the supervisor lock, re-checks auth/lease/epoch + renames inside the lock,
+    /// and syncs the parent directory outside the lock (recording `file_written = true` as soon
+    /// as rename/remove succeeds so revert remains consistent even if dir sync fails).
     async fn write_calibration(&mut self, after: &ArmdState) -> Result<(), CalibError> {
         self.recheck("calibration_file").await?;
         let text = after.calibration.as_ref().map(|c| serde_json::to_string_pretty(c).unwrap_or_default());
-        put_file(self.deps.path.clone(), text).await
-            .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("calibration file {}: {e}", self.deps.path.display())).at("calibration_file"))?;
-        self.file_written = true;
-        let mut inner = self.sup.inner().write().await;
-        inner.set_camera_mount(after.camera_mount.clone());
-        inner.calibration = after.calibration.clone();
-        self.live_written = true;
+        let dir_sync_opt = match text {
+            Some(t) => {
+                let path = self.deps.path.clone();
+                let staged = tokio::task::spawn_blocking(move || crate::persist::StagedWrite::stage(path, t))
+                    .await
+                    .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("calibration stage task: {e}")).at("calibration_file"))?
+                    .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("calibration file {}: {e}", self.deps.path.display())).at("calibration_file"))?;
+                let mut inner = self.sup.inner().write().await;
+                if let Err(e) = (self.check)(&mut inner) {
+                    staged.abort();
+                    return Err(e.at("calibration_file"));
+                }
+                let dir_sync = staged.rename_only()
+                    .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("calibration file {}: {e}", self.deps.path.display())).at("calibration_file"))?;
+                self.file_written = true;
+                inner.set_camera_mount(after.camera_mount.clone());
+                inner.calibration = after.calibration.clone();
+                self.live_written = true;
+                Some(dir_sync)
+            }
+            None => {
+                let mut inner = self.sup.inner().write().await;
+                (self.check)(&mut inner).map_err(|e| e.at("calibration_file"))?;
+                let mut removed = false;
+                match std::fs::remove_file(&self.deps.path) {
+                    Ok(()) => { removed = true; }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(CalibError::new(500, "PERSIST_FAILED", format!("calibration file {}: {e}", self.deps.path.display())).at("calibration_file"));
+                    }
+                }
+                self.file_written = true;
+                inner.set_camera_mount(after.camera_mount.clone());
+                inner.calibration = after.calibration.clone();
+                self.live_written = true;
+                if removed {
+                    Some(crate::persist::PendingDirSync::for_path(&self.deps.path))
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(dir_sync) = dir_sync_opt {
+            let outcome = tokio::task::spawn_blocking(move || dir_sync.sync_parent_dir())
+                .await
+                .unwrap_or_else(|e| crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(e.to_string()));
+            if let crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) = outcome {
+                self.durability_warnings.push(format!("calibration_file: {w}"));
+            }
+        }
         Ok(())
     }
 
-    /// The grasp setup, live and persisted (through the persist writer, as the setup API).
+    /// The grasp setup, persisted via two-phase atomic write (`StagedWrite`) and committed with
+    /// monotonic `grasp_setup_revision` increment. Parent-dir fsync runs outside supervisor lock.
     async fn write_grasp(&mut self, after: &ArmdState) -> Result<(), CalibError> {
         self.recheck("grasp_setup").await?;
         let Some(setup) = after.grasp_setup.clone() else { return Ok(()); };
-        let write = {
-            let mut inner = self.sup.inner().write().await;
+        let cw_lock = self.sup.config_write_lock();
+        let _cw = cw_lock.lock().await;
+        let (setup, base_rev) = {
+            let inner = self.sup.inner().read().await;
             let mut setup = setup;
             setup.camera_tilt_deg = f64::from(inner.config.camera_mount.tilt_deg);
-            inner.set_grasp_setup(setup.clone());
-            self.deps.setup_path.clone().map(|p| crate::persist::PendingWrite::new(p, serde_json::to_string_pretty(&setup).unwrap_or_default()))
+            (setup, inner.grasp_setup_revision)
         };
-        if let Some(w) = write {
-            if let Err(e) = w.run().await {
-                // the file is unchanged (atomic write): put the live setup back
+        if let Some(path) = self.deps.setup_path.clone() {
+            let text = serde_json::to_string_pretty(&setup).unwrap_or_default();
+            let staged = tokio::task::spawn_blocking(move || crate::persist::StagedWrite::stage(path, text))
+                .await
+                .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("grasp setup stage task: {e}")).at("grasp_setup"))?
+                .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("grasp setup file: {e}")).at("grasp_setup"))?;
+            let dir_sync = {
                 let mut inner = self.sup.inner().write().await;
-                if let Some(g) = self.before.grasp_setup.clone() { inner.set_grasp_setup(g); }
-                return Err(CalibError::new(500, "PERSIST_FAILED", format!("grasp setup file: {e}")).at("grasp_setup"));
+                if let Err(e) = (self.check)(&mut inner) {
+                    staged.abort();
+                    return Err(e.at("grasp_setup"));
+                }
+                if inner.grasp_setup_revision != base_rev {
+                    staged.abort();
+                    let mut err = CalibError::new(
+                        409,
+                        "POLICY_REVISION_MISMATCH",
+                        format!("Policy revision mismatch: expected {base_rev}, current {}", inner.grasp_setup_revision),
+                    ).at("grasp_setup");
+                    err.extra.insert("current_revision".into(), json!(inner.grasp_setup_revision));
+                    return Err(err);
+                }
+                let dir_sync = staged.rename_only()
+                    .map_err(|e| CalibError::new(500, "PERSIST_FAILED", format!("grasp setup file: {e}")).at("grasp_setup"))?;
+                inner.set_grasp_setup(setup);
+                inner.grasp_setup_revision += 1;
+                dir_sync
+            };
+            let outcome = tokio::task::spawn_blocking(move || dir_sync.sync_parent_dir())
+                .await
+                .unwrap_or_else(|e| crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(e.to_string()));
+            if let crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) = outcome {
+                self.durability_warnings.push(format!("grasp_setup: {w}"));
             }
+        } else {
+            let mut inner = self.sup.inner().write().await;
+            (self.check)(&mut inner).map_err(|e| e.at("grasp_setup"))?;
+            if inner.grasp_setup_revision != base_rev {
+                let mut err = CalibError::new(
+                    409,
+                    "POLICY_REVISION_MISMATCH",
+                    format!("Policy revision mismatch: expected {base_rev}, current {}", inner.grasp_setup_revision),
+                ).at("grasp_setup");
+                err.extra.insert("current_revision".into(), json!(inner.grasp_setup_revision));
+                return Err(err);
+            }
+            inner.set_grasp_setup(setup);
+            inner.grasp_setup_revision += 1;
         }
         Ok(())
     }
@@ -618,10 +757,20 @@ impl Txn<'_> {
             state.insert("armd_live".into(), json!("reverted"));
         }
         if self.file_written {
-            let backup_text = self.backup.as_ref().and_then(|b| read_if_file(&b.join("calibration.json")).ok().flatten());
-            match put_file(self.deps.path.clone(), backup_text).await {
-                Ok(()) => { state.insert("calibration_file".into(), json!("reverted")); }
-                Err(e) => { ok = false; state.insert("calibration_file".into(), json!(format!("revert failed: {e}"))); }
+            let backup_res = match self.backup.as_ref() {
+                Some(b) => read_backup_file(&b.join("calibration.json"))
+                    .map_err(|e| format!("read backup calibration.json: {e}")),
+                None => Err("no backup directory recorded".into()),
+            };
+            match backup_res {
+                Ok(backup_text) => match put_file(self.deps.path.clone(), backup_text).await {
+                    Ok(()) => { state.insert("calibration_file".into(), json!("reverted")); }
+                    Err(e) => { ok = false; state.insert("calibration_file".into(), json!(format!("revert failed: {e}"))); }
+                },
+                Err(e) => {
+                    ok = false;
+                    state.insert("calibration_file".into(), json!(format!("revert failed: {e}")));
+                }
             }
         }
         if self.vision_unknown {
@@ -669,9 +818,14 @@ impl Txn<'_> {
         let vision = vision_get(self.deps).await.unwrap_or_else(|e| json!({"error": e.message}));
         let mut inner = self.sup.inner().write().await;
         inner.calibration_load_error = None;
-        Ok(json!({"backup": backup.display().to_string(), "vision_intrinsics": vision,
+        let mut out = json!({"backup": backup.display().to_string(), "vision_intrinsics": vision,
             "camera_mount": mount_summary(&inner.config.camera_mount), "calibration": inner.calibration,
-            "grasp": inner.grasp_setup().map(|s| grasp_fields(&s))}))
+            "grasp": inner.grasp_setup().map(|s| grasp_fields(&s)), "grasp_revision": inner.grasp_setup_revision,
+            "durability_confirmed": self.durability_warnings.is_empty()});
+        if !self.durability_warnings.is_empty() {
+            out["durability_warning"] = json!(self.durability_warnings.join("; "));
+        }
+        Ok(out)
     }
 }
 
@@ -697,7 +851,7 @@ pub async fn apply(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: ApplyR
         va.remove("revision");
         return Ok(json!({"dry_run": true, "before": diff_view(&vision_before, &before), "after": diff_view(&Value::Object(va), &after)}));
     }
-    let mut txn = Txn { sup, deps, check, before, vision_before, vision_written: None, vision_unknown: false, file_written: false, live_written: false, backup: None };
+    let mut txn = Txn { sup, deps, check, before, vision_before, vision_written: None, vision_unknown: false, file_written: false, live_written: false, backup: None, durability_warnings: Vec::new() };
     let mut out = txn.run("apply", &req.intrinsics, &after).await?;
     out["grip_pixel_model"] = json!(after.grip_pixel_model);
     tracing::info!("Camera calibration applied (backup {})", out["backup"].as_str().unwrap_or(""));
@@ -723,7 +877,7 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
     if let Some(g) = &target.grasp_setup { g.validate().map_err(|e| CalibError::invalid(format!("backup {name}: grasp setup: {e}")))?; }
     let before = armd_state(&*sup.inner().read().await);
     let vision_before = vision_get(deps).await.map_err(|e| e.at("vision"))?;
-    let mut txn = Txn { sup, deps, check, before, vision_before, vision_written: None, vision_unknown: false, file_written: false, live_written: false, backup: None };
+    let mut txn = Txn { sup, deps, check, before, vision_before, vision_written: None, vision_unknown: false, file_written: false, live_written: false, backup: None, durability_warnings: Vec::new() };
     let mut out = txn.run("restore", &vision_values, &target).await?;
     out["restored"] = json!(name);
     tracing::info!("Camera calibration restored from backup {name}");
@@ -736,7 +890,8 @@ pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
     json!({"calibrated": inner.camera_calibrated(), "busy": inner.calibration_busy, "load_error": inner.calibration_load_error,
         "path": deps.path.display().to_string(), "backup_dir": deps.backup_dir.display().to_string(),
         "calibration": inner.calibration, "camera_mount": mount_summary(&inner.config.camera_mount),
-        "grasp": inner.grasp_setup().map(|s| grasp_fields(&s)), "backups": list_backups(deps)})
+        "grasp": inner.grasp_setup().map(|s| grasp_fields(&s)), "grasp_revision": inner.grasp_setup_revision,
+        "backups": list_backups(deps)})
 }
 
 #[cfg(test)]

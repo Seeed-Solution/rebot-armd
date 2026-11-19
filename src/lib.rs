@@ -1,4 +1,5 @@
 #[cfg(not(target_arch = "wasm32"))] pub mod api;
+#[cfg(not(target_arch = "wasm32"))] pub mod auth;
 #[cfg(not(target_arch = "wasm32"))] pub mod calibration;
 pub mod chain;
 pub mod collision;
@@ -34,7 +35,8 @@ pub mod urdf;
 #[cfg(not(target_arch = "wasm32"))] pub mod transport;
 pub mod wasm_api;
 
-#[cfg(not(target_arch = "wasm32"))] pub use api::create_router;
+#[cfg(not(target_arch = "wasm32"))] pub use api::{create_router, create_router_with_auth};
+#[cfg(not(target_arch = "wasm32"))] pub use auth::OperatorAuth;
 #[cfg(not(target_arch = "wasm32"))] pub use driver::{
     ArmDriver, ArmDriverError, DamiaoArmDriver, FashionStarArmDriver, FeetechArmDriver,
     JointMode, JointTarget, RobStrideArmDriver,

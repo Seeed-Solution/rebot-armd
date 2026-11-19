@@ -170,6 +170,11 @@ body.locked .pose-go { opacity: .45; filter: saturate(0); cursor: not-allowed; }
 .lang-btn { flex: none; display: inline-flex; align-items: center; justify-content: center; height: 36px; min-width: 36px; padding: 0 10px; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral); background: #fff; color: var(--sc-color-text-secondary); font: 600 12px/1 inherit; font-family: inherit; white-space: nowrap; cursor: pointer; touch-action: manipulation; transition: background .15s, color .15s, border-color .15s; }
 .lang-btn:hover { color: var(--sc-color-text-primary); border-color: var(--sc-color-primary); }
 .lang-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+.op-btn { flex: none; display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 10px; border-radius: 14px; border: 1px solid var(--sc-color-border-neutral); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; touch-action: manipulation; transition: background .15s, color .15s, border-color .15s; }
+.op-btn[hidden] { display: none; }
+.op-btn.is-unlocked { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); border-color: var(--sc-color-border); }
+.op-btn:hover { border-color: var(--sc-color-primary); }
+.op-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
 .fs-btn svg { width: 18px; height: 18px; }
 .fs-btn .ic-exit, .fs-btn.on .ic-enter { display: none; }
 .fs-btn.on .ic-exit { display: block; }
@@ -1462,6 +1467,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <button class="hd-btn" id="btn-sset" type="button" aria-label="设置" title="设置" data-i18n-aria="sset.title" data-i18n-title="sset.title" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2l2.4 2.6 3.5-.4.4 3.5L21 10l-1.7 3 1 3.4-3.3 1.3-1.3 3.3-3.4-1-3 1.7-2.3-2.7-3.5.4-.4-3.5L1 14.5l1.7-3-1-3.4L5 6.8 6.3 3.5l3.4 1z" transform="scale(.9) translate(1.3 1.3)"/><circle cx="12" cy="12" r="3.2"/></svg>
     </button>
+    <button class="op-btn" id="btn-op" type="button" aria-label="操作员权限" title="操作员权限" data-i18n-aria="op.title" data-i18n-title="op.title" hidden></button>
     <button class="lang-btn" id="btn-lang" type="button" aria-label="Switch language">EN</button>
   </header>
 
@@ -2038,6 +2044,23 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     </div>
   </aside>
 </div>
+<div class="calib-mask" id="op-modal" hidden>
+  <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="op-h">
+    <div class="calib-head">
+      <h3 id="op-h" data-i18n="op.title">操作员解锁</h3>
+      <button class="btn calib-x" id="op-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+    </div>
+    <p class="calib-hint" id="op-hint" data-i18n="op.hint">修改安全配置、清除非可恢复故障或强制抢占控制权需要操作员 PIN。</p>
+    <form class="gset-row" id="op-form">
+      <label class="field"><span data-i18n="op.pin">操作员 PIN</span><input id="op-pin" type="password" inputmode="numeric" autocomplete="off"></label>
+      <div class="calib-live mono" id="op-status">--</div>
+      <div class="calib-actions">
+        <button class="btn btn-primary" id="op-unlock" type="submit" data-i18n="op.unlock">解锁</button>
+        <button class="btn" id="op-lock" type="button" data-i18n="op.lock" hidden>锁定</button>
+      </div>
+    </form>
+  </aside>
+</div>
 <script>
 'use strict';
 /* =================================================================
@@ -2237,6 +2260,7 @@ const I18N = {
     'toast.in_air': '机械臂悬空中，为防下坠已阻止直接断电。正在执行受控收纳...', 'toast.not_at_rest': '机械臂仍未到达收纳位，力矩保持开启', 'toast.torque_off_fail': '关闭力矩失败',
     'toast.torque_off_unconfirmed': '关闭力矩请求未确认，请检查连接和机械臂状态', 'toast.stowing': '正在平稳回零收起...', 'toast.enabled': '控制已开启，请确认机械臂反馈状态',
     'toast.enable_fail': '使能失败：', 'toast.enable_fail_def': '电机未就绪/通讯超时', 'toast.preset_fail': '预设指令执行失败: ', 'toast.rec_start': '开始录制 ',
+    'op.title': '操作员权限', 'op.locked': '🔒 已锁定', 'op.unlocked': '🔓 操作员', 'op.hint': '修改安全配置、清除不可自动恢复的故障或强制接管控制权需要操作员 PIN。', 'op.pin': '操作员 PIN', 'op.unlock': '解锁', 'op.lock': '锁定会话', 'op.unlocked_msg': '操作员权限已解锁', 'op.locked_msg': '操作员权限已锁定', 'op.lock_fail': '锁定未确认，请重试', 'op.bad_pin': 'PIN 错误', 'op.need_pin': '请输入操作员 PIN', 'err.operator_required': '需要操作员解锁后才能执行此操作',
   },
   en: {
     'doc.title': 'reBot Teleop',
@@ -2428,6 +2452,7 @@ const I18N = {
     'toast.in_air': 'Arm is in the air; direct power-off blocked to prevent a drop. Running controlled park...', 'toast.not_at_rest': 'Arm has not reached the park pose, torque stays on', 'toast.torque_off_fail': 'Failed to turn torque off',
     'toast.torque_off_unconfirmed': 'Torque-off request not confirmed, check the connection and the arm', 'toast.stowing': 'Smoothly homing and stowing...', 'toast.enabled': 'Control enabled, verify arm feedback',
     'toast.enable_fail': 'Enable failed: ', 'toast.enable_fail_def': 'motors not ready / communication timeout', 'toast.preset_fail': 'Preset failed: ', 'toast.rec_start': 'Recording started ',
+    'op.title': 'Operator access', 'op.locked': '🔒 Locked', 'op.unlocked': '🔓 Operator', 'op.hint': 'Changing safety config, clearing non-recoverable faults, or force-preempting control requires the operator PIN.', 'op.pin': 'Operator PIN', 'op.unlock': 'Unlock', 'op.lock': 'Lock session', 'op.unlocked_msg': 'Operator access unlocked', 'op.locked_msg': 'Operator access locked', 'op.lock_fail': 'Lock not confirmed; please retry', 'op.bad_pin': 'Invalid PIN', 'op.need_pin': 'Enter the operator PIN', 'err.operator_required': 'Operator unlock is required for this operation',
   },
 };
 // calibration wizard (cwiz*)
@@ -2788,6 +2813,7 @@ const S = {
   rest: null,
   hb: { n: 0, hz: 0, at: 0 }, // lease heartbeats sent: count this second, rate, last send time
   preset: null,               // { name, until } while a preset motion runs
+  auth: { enforced: false, role: 'program', expiresIn: null },
 };
 const isSoArmProfile = () => !!(S.profileId && S.profileId.startsWith('so_arm'));
 let schemaReady = null;
@@ -2846,6 +2872,11 @@ function rpcError(response) {
     message = t('err.park_unsupported');
   } else if (response.code === 'COLLISION_HOLD') {
     message = t('err.collision_hold');
+  } else if (response.code === 'OPERATOR_REQUIRED') {
+    message = t('err.operator_required');
+    if (typeof S === 'object' && S.auth) { S.auth.role = 'program'; S.auth.expiresIn = null; }
+    if (typeof renderOpBadge === 'function') renderOpBadge();
+    if (typeof openOperatorModal === 'function') openOperatorModal();
   } else {
     message = response.message || response.error || t('err.rejected');
   }
@@ -2943,6 +2974,7 @@ const gripNoWindup = (frac, measuredRad) => {
 /* =================================================================
    Telemetry WebSocket (50 Hz) + heartbeat
    ================================================================= */
+let wsOpenedOnce = false;
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${proto}//${location.host}/api/v1/ws`);
@@ -2950,6 +2982,11 @@ function connectWS() {
   clearActiveAcquire();
   resetLease();
   S.sequenceId = 0;
+  ws.onopen = () => {
+    if (S.ws !== ws) return;
+    if (wsOpenedOnce) loadAuthStatus();
+    wsOpenedOnce = true;
+  };
   // No acquire on open: the lease is taken on the first control input (ensureLease).
   ws.onmessage = (ev) => {
     let o; try { o = JSON.parse(ev.data); } catch (_) { return; }
@@ -3225,6 +3262,10 @@ function onAcquireResponse(ws, msg) {
     return;
   }
   if (req.force) { closePreemptModal(); toast(t('toast.take_rejected') + (msg.message || msg.error || t('unknown_reason')), 'err'); }
+  if (msg.code === 'OPERATOR_REQUIRED') {
+    S.auth.role = 'program'; S.auth.expiresIn = null; renderOpBadge();
+    if (typeof openOperatorModal === 'function') openOperatorModal();
+  }
   settleLeaseWaiters(Object.assign(new Error(t('err.rejected') + ': ' + (msg.message || msg.error || t('unknown_reason'))), { code: 'LEASE_REJECTED' }));
   renderPreemptModal();
 }
@@ -5615,6 +5656,7 @@ document.addEventListener('visibilitychange', () => {
     releaseAll();
     resetPoseMode();
   } else {
+    loadAuthStatus();
     // Returning from background/sleep: refresh telemetry & reconnect if half-open
     if (!S.ws || S.ws.readyState !== WebSocket.OPEN || Date.now() - S.obsAt > 1500) {
       if (S.ws) {
@@ -6944,7 +6986,7 @@ async function runPreset(name) {
         name: name,
         positions: (name === 'home' || name === 'park') ? undefined : presetTarget(name),
         epoch_id: S.epoch,
-        client_id: S.clientId,
+        client_id: CLIENT_ID,
         generation: S.leaseGeneration,
       }));
     } else {
@@ -7908,7 +7950,7 @@ const GR = {
   toasted: 0,       // last grasp id whose result was shown
   gripSynced: 0,    // last gripper / grasp action id S.grip was synced from
   pickGrip: false,  // next video tap records the grip pixel
-  setup: null, path: null, supported: null,
+  setup: null, path: null, supported: null, rev: null,
 };
 const graspCodeKey = (code) => (/^IK_/.test(code || '') ? 'IK' : code);
 function graspCodeText(code, message) {
@@ -8118,6 +8160,7 @@ async function graspLoadSetup(quiet) {
     const d = await res.json();
     if (!res.ok) throw new Error(d && (d.message || d.error) || 'HTTP ' + res.status);
     GR.supported = !!d.supported; GR.setup = d.setup || null; GR.path = d.path || null;
+    if (typeof d.revision === 'number') GR.rev = d.revision;
     if (!quiet) gsetRender(!GR.supported ? t('gset.na') : GR.path ? t('gset.path', { p: GR.path }) : '--');
   } catch (e) {
     if (!quiet) gsetRender(t('gset.err', { e: e.message }));
@@ -8125,13 +8168,19 @@ async function graspLoadSetup(quiet) {
 }
 async function gsetWrite(patch) {
   try {
-    const ack = await graspRPC('/api/v1/grasp/setup', patch);
+    const body = GR.rev != null ? { ...patch, expected_revision: GR.rev } : patch;
+    const ack = await graspRPC('/api/v1/grasp/setup', body);
     if (ack.setup) GR.setup = ack.setup;
+    if (typeof ack.revision === 'number') GR.rev = ack.revision;
     const msg = ack.persisted === false ? t('gset.unsaved', { e: ack.persist_error || '' }) : t('gset.saved');
     gsetRender(msg);
     toast(msg, ack.persisted === false ? 'warn' : 'ok');
     return true;
-  } catch (e) { gsetRender(e.message); return false; }
+  } catch (e) {
+    if (e.code === 'POLICY_REVISION_MISMATCH') graspLoadSetup(true);
+    gsetRender(e.message);
+    return false;
+  }
 }
 function gsetOpen(open) {
   $('gset').hidden = !open;
@@ -8163,7 +8212,7 @@ graspLoadSetup(true);
    protective-stop banner, settings drawer section, residual torque bars (J1..J6).
    Everything stays hidden on an armd without the guard.
    ================================================================= */
-const COL = { cfg: null, thr: null, barAt: 0, busy: false };
+const COL = { cfg: null, thr: null, rev: null, barAt: 0, busy: false };
 const colAvail = () => (S.caps ? !!S.caps.collision_guard : !!(S.obs && S.obs.collision));
 function colThresholds(c) {
   if (!c) return null;
@@ -8185,6 +8234,7 @@ async function colLoad(quiet) {
     const d = await res.json();
     if (!res.ok) throw new Error(d && (d.message || d.error) || 'HTTP ' + res.status);
     COL.cfg = d; COL.thr = colThresholds(d);
+    if (typeof d.revision === 'number') COL.rev = d.revision;
     colRenderSet(quiet ? undefined : '');
   } catch (e) { if (!quiet) colRenderSet(t('col.st.err', { e: e.message })); }
 }
@@ -8211,11 +8261,14 @@ function colRenderSet(status) {
 async function colWrite(patch) {
   COL.busy = true; colRenderSet();
   try {
-    const ack = await commandRPC('/api/v1/safety/collision', patch);
+    const body = COL.rev != null ? { ...patch, expected_revision: COL.rev } : patch;
+    const ack = await commandRPC('/api/v1/safety/collision', body);
     syncEpoch(ack.epoch_id);
     const cfg = ack.collision || ack.config || (('enabled' in ack) ? ack : null);
     if (cfg) { COL.cfg = { ...(COL.cfg || {}), ...cfg }; COL.thr = colThresholds(COL.cfg) || COL.thr; }
     else if (COL.cfg) Object.assign(COL.cfg, patch);
+    const rev = ack.revision ?? (cfg && cfg.revision);
+    if (typeof rev === 'number') COL.rev = rev;
     COL.busy = false;
     toast(t('col.st.saved'), 'ok');
     colRenderSet();
@@ -8224,6 +8277,7 @@ async function colWrite(patch) {
     COL.busy = false;
     toast(e.message, 'err', e.code || '');
     colRenderSet(e.message);
+    if (e.code === 'POLICY_REVISION_MISMATCH') colLoad(true);
   }
 }
 function ssetOpen(open) {
@@ -8248,7 +8302,7 @@ i18nHooks.push(() => { if (!$('sset').hidden) colRenderSet(); COL.barAt = 0; });
    action /api/v1/action/move_to_pose.
    ================================================================= */
 const POSE_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const PS = { list: [], loaded: false, delArmed: null, delTimer: 0 };
+const PS = { list: [], loaded: false, rev: null, delArmed: null, delTimer: 0 };
 function posesOnCaps() { $('btn-pset').hidden = !(S.caps && S.caps.poses); }
 function poseErr(e) {
   const k = 'pose.code.' + (e.code || '');
@@ -8261,6 +8315,7 @@ async function posesLoad(quiet) {
     const d = await res.json();
     if (!res.ok) throw new Error(d && (d.message || d.error) || 'HTTP ' + res.status);
     PS.list = Array.isArray(d.poses) ? d.poses : [];
+    if (typeof d.revision === 'number') PS.rev = d.revision;
     PS.loaded = true;
     posesRender(PS.list.length ? t('pose.count', { n: PS.list.length }) : '--');
   } catch (e) { posesRender(t('pose.err', { e: e.message })); }
@@ -8301,12 +8356,17 @@ async function poseSave() {
   if (!name) { $('pose-name').focus(); setText($('pose-rule'), t('pose.bad')); $('pose-rule').classList.add('bad'); return; }
   $('pose-save').disabled = true;
   try {
-    await commandRPC('/api/v1/poses/save', { name });
+    const body = PS.rev != null ? { name, expected_revision: PS.rev } : { name };
+    const ack = await commandRPC('/api/v1/poses/save', body);
+    if (typeof ack.revision === 'number') PS.rev = ack.revision;
     toast(t('pose.saved', { name }), 'ok');
     $('pose-name').value = '';
     await posesLoad(true);
     posesRender(t('pose.saved', { name }));
-  } catch (e) { const m = poseErr(e); toast(m, 'err', e.code || ''); posesRender(m); }
+  } catch (e) {
+    if (e.code === 'POLICY_REVISION_MISMATCH') posesLoad(true);
+    const m = poseErr(e); toast(m, 'err', e.code || ''); posesRender(m);
+  }
   finally { $('pose-save').disabled = false; }
 }
 async function poseDelete(name) {
@@ -8317,11 +8377,16 @@ async function poseDelete(name) {
   }
   PS.delArmed = null; clearTimeout(PS.delTimer);
   try {
-    await commandRPC('/api/v1/poses/delete', { name });
+    const body = PS.rev != null ? { name, expected_revision: PS.rev } : { name };
+    const ack = await commandRPC('/api/v1/poses/delete', body);
+    if (typeof ack.revision === 'number') PS.rev = ack.revision;
     toast(t('pose.deleted', { name }), 'ok');
     await posesLoad(true);
     posesRender(t('pose.deleted', { name }));
-  } catch (e) { const m = poseErr(e); toast(m, 'err', e.code || ''); posesRender(m); }
+  } catch (e) {
+    if (e.code === 'POLICY_REVISION_MISMATCH') posesLoad(true);
+    const m = poseErr(e); toast(m, 'err', e.code || ''); posesRender(m);
+  }
 }
 async function poseGo(name) {
   if (!isLive() || !canMove()) { toast(isLive() && !isStopped() && !colHold() && leaseOther() == null ? t('pose.enable_first') : lockReason(), 'err'); flashLock(); return; }
@@ -10272,16 +10337,26 @@ const WASM_SIM = window.WASM_SIM = (() => {
     },
 
     async pushTelemetry() {
-      if (this.telBusy || !this.ready) return;
+      if (this.telBusy || this.telBlocked || !this.ready) return;
       this.telBusy = true;
       try {
         const stPayload = this.getState();
         if (!stPayload) return;
-        await fetch('/api/v1/sandbox/telemetry', {
+        const r = await fetch('/api/v1/sandbox/telemetry', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(stPayload),
         });
+        if (!r.ok) {
+          if (r.status === 401 || r.status === 403) {
+            this.telBlocked = true;
+          } else if (!this.telErrLogged) {
+            this.telErrLogged = true;
+            console.warn('WASM_SIM telemetry post failed:', r.status);
+          }
+          return;
+        }
+        this.telErrLogged = false;
       } catch (_) {} finally {
         this.telBusy = false;
       }
@@ -10497,6 +10572,118 @@ async function initSandbox() {
 }
 
 /* =================================================================
+   Operator Auth Badge & Modal
+   ================================================================= */
+function reconnectWS() {
+  const old = S.ws;
+  connectWS();
+  if (old) { try { old.close(); } catch (_) {} }
+}
+function renderOpBadge() {
+  const b = $('btn-op');
+  if (!b) return;
+  b.hidden = !S.auth.enforced;
+  if (!S.auth.enforced) return;
+  const unlocked = S.auth.role === 'operator';
+  b.classList.toggle('is-unlocked', unlocked);
+  b.textContent = unlocked ? t('op.unlocked') : t('op.locked');
+  const lockBtn = $('op-lock');
+  if (lockBtn) lockBtn.hidden = !unlocked;
+}
+let authRefreshTimer = null;
+function scheduleAuthExpiryRefresh() {
+  if (authRefreshTimer) {
+    clearTimeout(authRefreshTimer);
+    authRefreshTimer = null;
+  }
+  if (S.auth.enforced && S.auth.role === 'operator' && typeof S.auth.expiresIn === 'number' && S.auth.expiresIn > 0) {
+    const delayMs = Math.min(S.auth.expiresIn * 1000 + 250, 2147483647);
+    authRefreshTimer = setTimeout(() => {
+      authRefreshTimer = null;
+      loadAuthStatus();
+    }, delayMs);
+  }
+}
+async function loadAuthStatus() {
+  try {
+    const res = await fetch('/api/v1/auth/status', { cache: 'no-store' });
+    if (!res.ok) return;
+    const d = await res.json();
+    S.auth.enforced = !!d.auth_enforced;
+    S.auth.role = d.role || 'program';
+    S.auth.expiresIn = d.expires_in_s ?? null;
+    scheduleAuthExpiryRefresh();
+    renderOpBadge();
+  } catch (_) {}
+}
+function openOperatorModal() {
+  if (!$('op-modal')) return;
+  $('op-modal').hidden = false;
+  $('op-pin').value = '';
+  setText($('op-status'), S.auth.role === 'operator' ? t('op.unlocked_msg') : '--');
+  $('op-lock').hidden = S.auth.role !== 'operator';
+  $('op-pin').focus({ preventScroll: true });
+}
+function closeOperatorModal() {
+  if ($('op-modal')) $('op-modal').hidden = true;
+}
+async function submitOperatorPin(ev) {
+  if (ev) ev.preventDefault();
+  const pin = $('op-pin').value || '';
+  if (!pin) { setText($('op-status'), t('op.need_pin')); return; }
+  $('op-unlock').disabled = true;
+  try {
+    const res = await fetch('/api/v1/auth/unlock', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setText($('op-status'), d.code === 'INVALID_PIN' ? t('op.bad_pin') : (d.message || t('op.bad_pin')));
+      return;
+    }
+    S.auth.role = d.role || 'operator';
+    S.auth.expiresIn = d.expires_in_s ?? null;
+    if (window.WASM_SIM) { window.WASM_SIM.telBlocked = false; window.WASM_SIM.telErrLogged = false; }
+    scheduleAuthExpiryRefresh();
+    renderOpBadge();
+    closeOperatorModal();
+    reconnectWS();
+    toast(t('op.unlocked_msg'), 'ok');
+  } catch (e) {
+    setText($('op-status'), e.message || t('err.reqfail'));
+  } finally {
+    $('op-unlock').disabled = false;
+  }
+}
+async function lockOperator() {
+  try {
+    const res = await fetch('/api/v1/auth/lock', { method: 'POST' });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d.role !== 'program') {
+      toast(t('op.lock_fail'), 'err');
+      return;
+    }
+    S.auth.role = 'program';
+    S.auth.expiresIn = null;
+    scheduleAuthExpiryRefresh();
+    renderOpBadge();
+    closeOperatorModal();
+    reconnectWS();
+    toast(t('op.locked_msg'), 'warn');
+  } catch (_) {
+    toast(t('op.lock_fail'), 'err');
+  }
+}
+$('btn-op')?.addEventListener('click', openOperatorModal);
+$('op-close')?.addEventListener('click', closeOperatorModal);
+$('op-modal')?.addEventListener('click', (e) => { if (e.target === e.currentTarget) closeOperatorModal(); });
+$('op-form')?.addEventListener('submit', submitOperatorPin);
+$('op-lock')?.addEventListener('click', lockOperator);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && $('op-modal') && !$('op-modal').hidden) closeOperatorModal(); });
+
+/* =================================================================
    Boot
    ================================================================= */
 { const sp = store('rebot.speed'); setSpeed(sp != null && /^[0-2]$/.test(sp) ? Number(sp) : 1); }
@@ -10506,6 +10693,7 @@ async function initSandbox() {
   $('c-rmax').textContent = Math.round(CFG.cart.reachMax * 1000);
 }
 schemaReady = loadSchema();
+loadAuthStatus();
 initSandbox();
 connectWS();
 connectDetectionWS();
@@ -10518,7 +10706,7 @@ requestAnimationFrame(frame);
 
 /* i18n: re-render dynamic UI on language change */
 i18nHooks.push(
-  renderJogRows, renderGripCol, renderPoseUi,
+  renderJogRows, renderGripCol, renderPoseUi, renderOpBadge,
   () => setMode(S.ctl, S.input),
   () => { if (lastHint) videoHint(...lastHint); },
   () => {

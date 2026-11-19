@@ -209,7 +209,7 @@ async fn park_that_cannot_reach_rest_falls_back_to_fault_without_cutting_torque(
 
 /// Serve `supervisor` over the real router (no control loop: the test ticks it).
 async fn serve(supervisor: Arc<ArmSupervisor>) -> std::net::SocketAddr {
-    let router = armd::api::create_router(supervisor);
+    let router = armd::api::create_router(supervisor, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });

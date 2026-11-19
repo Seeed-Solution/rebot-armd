@@ -9,7 +9,7 @@ use armd::{ArmConfig, ArmSupervisor};
 
 async fn serve(supervisor: Arc<ArmSupervisor>, state: DiagnosticsState) -> std::net::SocketAddr {
     let grasp = armd::grasp::GraspDeps::http(DetectorUpstream::from_env(), None);
-    let router = create_router_full(supervisor, DetectorUpstream::from_env(), grasp, state);
+    let router = create_router_full(supervisor, DetectorUpstream::from_env(), grasp, state, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });

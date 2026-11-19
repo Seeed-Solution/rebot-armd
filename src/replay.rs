@@ -495,6 +495,7 @@ impl SupervisorInner {
         let expected = motion.expected_duration();
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
+        self.servo_ws_min_depths = None;
         self.target_positions = first;
         self.safety.mark_motion_started()?;
         self.last_heartbeat = std::time::Instant::now();

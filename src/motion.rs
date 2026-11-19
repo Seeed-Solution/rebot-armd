@@ -1108,6 +1108,11 @@ pub struct ActionStatus {
     pub violation_phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Persistence durability status when an action updates persisted state (`gripper_zero_check`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durability_confirmed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durability_warning: Option<String>,
 }
 
 /// Execution diagnostics for one sub-motion in a macro action (grasp, place).

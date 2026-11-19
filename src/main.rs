@@ -5,7 +5,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use armd::{create_router, ArmConfig, ArmSupervisor, StopPolicy, SupervisorInner};
+use armd::{create_router_with_auth, ArmConfig, ArmSupervisor, OperatorAuth, StopPolicy, SupervisorInner};
 
 #[derive(Debug, Default)]
 struct CliArgs {
@@ -16,6 +16,9 @@ struct CliArgs {
     log_dir: Option<String>,
     blackbox_dir: Option<String>,
     episodes_dir: Option<String>,
+    operator_pin: Option<String>,
+    operator_pin_file: Option<String>,
+    no_operator_auth: bool,
 }
 
 fn parse_cli_args() -> Result<CliArgs, String> {
@@ -24,14 +27,17 @@ fn parse_cli_args() -> Result<CliArgs, String> {
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
             println!("armd - Robotic arm daemon\n\nUSAGE: armd [OPTIONS]\n\n\
-                --follower <MODEL>       rebot-rs, rebot-dm, so-arm101, fashionstar, star-arm102, sim, mock (default)\n\
-                --follower-port <PORT>   CAN interface, serial device, or udp://HOST:PORT for sim (default udp://127.0.0.1:47600)\n\
-                --config <JSON>          ArmConfig profile (must match follower joint count)\n\
-                --port <PORT>            HTTP / WebSocket port (default 8765)\n\
-                --log-dir <DIR>          rotating log armd.log (default /userdata/rebot-teleop/logs when /userdata exists; off disables)\n\
-                --blackbox-dir <DIR>     black box and boot record (default /userdata/rebot-teleop/blackbox when /userdata exists; off disables)\n\
-                --episodes-dir <DIR>     recorded episodes (default /userdata/rebot-teleop/episodes when /userdata exists, else ./data/episodes; off disables recording and replay)\n\
-                --help                   Print help\n\n\
+                --follower <MODEL>           rebot-rs, rebot-dm, so-arm101, fashionstar, star-arm102, sim, mock (default)\n\
+                --follower-port <PORT>       CAN interface, serial device, or udp://HOST:PORT for sim (default udp://127.0.0.1:47600)\n\
+                --config <JSON>              ArmConfig profile (must match follower joint count)\n\
+                --port <PORT>                HTTP / WebSocket port (default 8765)\n\
+                --log-dir <DIR>              rotating log armd.log (default /userdata/rebot-teleop/logs when /userdata exists; off disables)\n\
+                --blackbox-dir <DIR>         black box and boot record (default /userdata/rebot-teleop/blackbox when /userdata exists; off disables)\n\
+                --episodes-dir <DIR>         recorded episodes (default /userdata/rebot-teleop/episodes when /userdata exists, else ./data/episodes; off disables recording and replay)\n\
+                --operator-pin <PIN>         operator unlock PIN (or ARMD_OPERATOR_PIN; enforces operator auth)\n\
+                --operator-pin-file <PATH>   path to write generated PIN with 0600 permissions (or ARMD_OPERATOR_PIN_FILE; default /userdata/rebot-teleop/operator.pin)\n\
+                --no-operator-auth           disable operator auth (unsafe on real hardware; mock/sim default is disabled)\n\
+                --help                       Print help\n\n\
                 Leader-following is not implemented. Hardware failures never fall back to mock.");
             std::process::exit(0);
         }
@@ -40,9 +46,21 @@ fn parse_cli_args() -> Result<CliArgs, String> {
                 "Leader-following is not implemented; refusing to start a simulated leader".into(),
             );
         }
+        if arg == "--no-operator-auth" {
+            cli.no_operator_auth = true;
+            continue;
+        }
         if !matches!(
             arg.as_str(),
-            "--follower" | "--follower-port" | "--port" | "--config" | "--log-dir" | "--blackbox-dir" | "--episodes-dir"
+            "--follower"
+                | "--follower-port"
+                | "--port"
+                | "--config"
+                | "--log-dir"
+                | "--blackbox-dir"
+                | "--episodes-dir"
+                | "--operator-pin"
+                | "--operator-pin-file"
         ) {
             return Err(format!("Unknown argument: {arg}"));
         }
@@ -57,6 +75,13 @@ fn parse_cli_args() -> Result<CliArgs, String> {
             "--log-dir" => cli.log_dir = Some(value),
             "--blackbox-dir" => cli.blackbox_dir = Some(value),
             "--episodes-dir" => cli.episodes_dir = Some(value),
+            "--operator-pin" => {
+                if value.is_empty() {
+                    return Err("--operator-pin must not be empty".into());
+                }
+                cli.operator_pin = Some(value);
+            }
+            "--operator-pin-file" => cli.operator_pin_file = Some(value),
             "--port" => {
                 cli.port = Some(
                     value
@@ -68,6 +93,37 @@ fn parse_cli_args() -> Result<CliArgs, String> {
         }
     }
     Ok(cli)
+}
+
+fn resolve_operator_auth(follower: &str, cli: &CliArgs) -> Result<OperatorAuth, String> {
+    let is_mock_or_sim = matches!(follower, "mock" | "sim");
+    if let Some(pin) = cli.operator_pin.as_deref() {
+        if pin.is_empty() {
+            return Err("--operator-pin must not be empty".into());
+        }
+    }
+    if cli.no_operator_auth {
+        if !is_mock_or_sim {
+            warn!("Operator authentication disabled by --no-operator-auth");
+        }
+        return Ok(OperatorAuth::disabled());
+    }
+    let env_pin = std::env::var("ARMD_OPERATOR_PIN").ok().filter(|s| !s.is_empty());
+    let configured_pin = cli.operator_pin.as_deref().or(env_pin.as_deref());
+    if let Some(pin) = configured_pin {
+        info!("Operator authentication enforced (configured PIN)");
+        return Ok(OperatorAuth::enforced(pin, armd::auth::DEFAULT_TTL_S));
+    }
+    if is_mock_or_sim {
+        return Ok(OperatorAuth::disabled());
+    }
+    let pin = armd::auth::generate_pin_6_digits()
+        .map_err(|e| format!("Failed to generate operator PIN: {e}"))?;
+    let pin_path = armd::auth::resolve_pin_file_path(cli.operator_pin_file.as_deref());
+    armd::auth::write_pin_file_atomic(&pin_path, &pin)
+        .map_err(|e| format!("Failed to write operator PIN file {}: {e}", pin_path.display()))?;
+    info!("Operator authentication enforced; PIN written to {}", pin_path.display());
+    Ok(OperatorAuth::enforced(pin, armd::auth::DEFAULT_TTL_S))
 }
 
 /// Called while holding the supervisor write lock so stop authority cannot race motion.
@@ -245,8 +301,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let grasp_setup_path = armd::grasp::setup_path_from_env();
     armd::grasp::load_into(&supervisor, &grasp_setup_path).await;
     // after the grasp setup: the calibration wins for camera_mount and camera_tilt_deg
-    armd::calibration::load_into(&supervisor, &armd::calibration::path_from_env(), Some(&grasp_setup_path)).await;
-    armd::keepout::load_into(&supervisor, &armd::keepout::path_from_env()).await;
+    if let Err(e) = armd::calibration::load_into(&supervisor, &armd::calibration::path_from_env(), Some(&grasp_setup_path)).await {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e).into());
+    }
+    if let Err(e) = armd::keepout::load_into(&supervisor, &armd::keepout::path_from_env()).await {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e).into());
+    }
     armd::poses::load_into(&supervisor, &armd::poses::path_from_env()).await;
     armd::collision::load_into(&supervisor, &armd::collision::path_from_env()).await;
     match follower {
@@ -355,11 +415,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
 
+    let operator_auth = resolve_operator_auth(follower, &cli)?;
+    supervisor.set_operator_auth_enforced(operator_auth.is_enforced()).await;
     info!(
         "armd API server listening on http://{}",
         listener.local_addr()?
     );
-    let router = create_router(supervisor.clone());
+    let router = create_router_with_auth(supervisor.clone(), operator_auth);
     let mut server_handle = tokio::spawn(async move { axum::serve(listener, router).await });
     let mut server_finished = false;
     #[cfg(unix)]
