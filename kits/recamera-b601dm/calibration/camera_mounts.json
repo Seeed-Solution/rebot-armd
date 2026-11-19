@@ -9,33 +9,13 @@
       "offset_m": null
     }
   },
-  "v7_tilt20": {
-    "mount_dir": "hardware/v7_tilt",
-    "pitch_down_deg": 20,
+  "v8_tilt38": {
+    "mount_dir": "hardware/v8",
+    "pitch_down_deg": 38,
     "camera_mount": {
       "flip": false,
       "rot_deg": 0.0,
-      "tilt_deg": -20.0,
-      "offset_m": null
-    }
-  },
-  "v7_tilt25": {
-    "mount_dir": "hardware/v7_tilt",
-    "pitch_down_deg": 25,
-    "camera_mount": {
-      "flip": false,
-      "rot_deg": 0.0,
-      "tilt_deg": -25.0,
-      "offset_m": null
-    }
-  },
-  "v7_tilt30": {
-    "mount_dir": "hardware/v7_tilt",
-    "pitch_down_deg": 30,
-    "camera_mount": {
-      "flip": false,
-      "rot_deg": 0.0,
-      "tilt_deg": -30.0,
+      "tilt_deg": -38.0,
       "offset_m": null
     }
   }
