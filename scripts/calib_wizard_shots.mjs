@@ -427,22 +427,25 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     await waitW(page, () => !CWZ.running, 120000, 'fine capture A');
     const ra = await page.evaluate((i0) => ({ idx: CWZ.idx, n: CWZ.plan.length, ok: CWZ.plan.filter((p) => p.state === 'ok').length, views: CWZ.views.filter((v) => v.ds === 0).length, plan: JSON.stringify(CWZ.plan.map((p) => p.q)), firstQ: toMotor6(cwFinePre(CWZ.plan[i0].q)) }), ab.idx);
     const js = await jogs();
-    // every pose: pre-pose 2 deg below the target on every joint (or above near the lower limit), then the target
-    // (a run stopped during a pre-pose leaves one unpaired jog: pair every jog to a plan target with the one before it)
+    // every pose: pre-pose cwPreDeg() (armd backlash_approach.delta_deg, 0.5 by default) below the target on every
+    // joint in motor angles (above it where target - delta is below the soft limit), then the target: armd's
+    // same-side approach rule (a run stopped during a pre-pose leaves one unpaired jog: pair every jog to a plan
+    // target with the one before it)
     const targets = await page.evaluate(() => CWZ.plan.map((p) => toMotor6(p.q)));
+    const pre = await page.evaluate(() => ({ d: cwPreDeg() * Math.PI / 180, lo: S.limits.slice(0, 6).map((L) => L.min_position) }));
     let pairOk = true, durOk = true, nTarget = 0;
     for (let k = 1; k < js.length; k++) {
       const b = js[k].target_positions;
       if (!targets.some((t) => t.every((v, i) => Math.abs(v - b[i]) < 1e-9))) continue;
       nTarget++;
       const a = js[k - 1].target_positions;
-      if (!a.slice(0, 6).every((v, i) => Math.abs(Math.abs(v - b[i]) - 2 / 180 * Math.PI) < 1e-6)) pairOk = false;
+      if (!a.slice(0, 6).every((v, i) => Math.abs(v - (b[i] - pre.d >= pre.lo[i] ? b[i] - pre.d : b[i] + pre.d)) < 1e-6)) pairOk = false;
     }
     if (nTarget < ra.ok) pairOk = false;
     for (const b of js) { const d = b.duration_secs; if (!(d >= 1.5) || b.target_positions.length !== 7) durOk = false; }
     const resumeOk = js[nBefore] && js[nBefore].target_positions.slice(0, 6).every((v, i) => Math.abs(v - ra.firstQ[i]) < 1e-9);
     if (ra.idx !== ra.n || ra.plan !== planBefore || !pairOk || !durOk || !resumeOk || ra.ok < 10) fail('fine capture A ' + JSON.stringify({ ...ra, plan: ra.plan === planBefore, pairOk, durOk, resumeOk, jogs: js.length }));
-    await shot('4_captureA_done', `poses ${ra.ok}/${ra.n}, views ${ra.views}, jog pairs (pre 2 deg, target) ${pairOk}, duration >= 1.5 s ${durOk}, resumed at pose ${ab.idx + 1} with the same plan ${resumeOk && ra.plan === planBefore}`);
+    await shot('4_captureA_done', `poses ${ra.ok}/${ra.n}, views ${ra.views}, jog pairs (pre ${(pre.d * 180 / Math.PI).toFixed(2)} deg, target) ${pairOk}, duration >= 1.5 s ${durOk}, resumed at pose ${ab.idx + 1} with the same plan ${resumeOk && ra.plan === planBefore}`);
     // move the board: the camera no longer sees it; three ways to bring it back
     await page.click('#cwiz-tob');
     const st = (extra) => page.evaluate((x) => ({ live: cwLiveCount(), boot: $('cwiz-boot') && $('cwiz-boot').disabled, why: [...document.querySelectorAll('#cwiz-body .cwiz-why')].map((e) => e.textContent).join(' | '), status: CWZ.status, ...(x ? eval(x) : {}) }), extra || null);

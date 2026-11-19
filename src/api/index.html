@@ -2674,7 +2674,7 @@ Object.assign(I18N.zh, {
   'cw.f.place.hint': '把相机移到标定板（位置 A）上方约 30 cm，画面里至少能看到 6 个完整标记（用摇杆、拖动示教或自动寻找，见下方三个按钮），然后点「采集起始视图」：向导用这一帧估计标定板位置，并生成约 35 个位姿。',
   'cw.f.move.hint': '位置 A 已完成：{n} 个位姿，{v} 个视图。',
   'cw.f.move.do': '先把标定板移到桌面上另一个位置（离原位置至少 10 cm，可以转一个角度），保持平放、不要弯折。再用下方三种方法之一让相机看到它（至少 6 个完整标记）：用摇杆移动、拖动示教或自动寻找。然后点「采集起始视图」。',
-  'cw.f.cap.hint': '机械臂在关节空间移动（最大 0.25 rad/s）：每个位姿先到各关节比目标低 2° 的预位姿，再到目标，所有位姿都从同一方向接近。0.5 s 内各关节变化都 < 0.003 rad 视为静止（最多等 15 s，超时的样本保留并标记），再等 1.5 s，采集 2 帧。停止按钮随时可用；中止后已采集的视图保留，点「继续」从下一个位姿接着采集。',
+  'cw.f.cap.hint': '机械臂在关节空间移动（最大 0.25 rad/s）：每个位姿先到各关节比目标低 {d}° 的预位姿（电机方向；靠近下限的关节改为高 {d}°，与 armd 运行时的同侧接近规则一致），再到目标，所有位姿都从同一方向接近。0.5 s 内各关节变化都 < 0.003 rad 视为静止（最多等 15 s，超时的样本保留并标记），再等 1.5 s，采集 2 帧。停止按钮随时可用；中止后已采集的视图保留，点「继续」从下一个位姿接着采集。',
   'cw.f.count': '位置 {p}：{n}/{total} 个位姿 · {v} 个视图 · 跳过 {s} 个',
   'cw.f.continue': '继续（从位姿 {i} 开始）', 'cw.f.toB': '下一步：移动标定板', 'cw.f.few': '有效视图 {v} 个，至少需要 {need} 个才能继续。',
   'cw.f.kept': '已保留 {n} 个视图，点「继续」接着采集', 'cw.f.moving': '关节空间移动到位姿 {i}（预位姿 → 目标）…', 'cw.f.unsettled': '未静止',
@@ -2708,7 +2708,7 @@ Object.assign(I18N.en, {
   'cw.f.place.hint': 'Bring the camera to about 30 cm above the board (placement A) so that at least 6 whole markers are in view (jog, move by hand or search: the three buttons below), then tap "Capture start view": the wizard estimates the board position from this frame and generates about 35 poses.',
   'cw.f.move.hint': 'Placement A done: {n} poses, {v} views.',
   'cw.f.move.do': 'First move the board to another spot on the table (at least 10 cm from the first, a turn is fine), flat and without bends. Then bring the camera onto it (at least 6 whole markers) with one of the three buttons below: jog, move by hand or search. Then tap "Capture start view".',
-  'cw.f.cap.hint': 'The arm moves in joint space (at most 0.25 rad/s): to a pre-pose 2° below the target on every joint, then to the target, so every pose is approached from the same side. Still = every joint moved < 0.003 rad within 0.5 s (at most 15 s; a sample that never settles is kept and marked), then 1.5 s wait and 2 frames. Stop is always available; after an abort the views are kept and Continue resumes at the next pose.',
+  'cw.f.cap.hint': 'The arm moves in joint space (at most 0.25 rad/s): to a pre-pose {d}° below the target on every joint (motor direction; {d}° above where the lower limit is near, the rule armd uses for its same-side approach at run time), then to the target, so every pose is approached from the same side. Still = every joint moved < 0.003 rad within 0.5 s (at most 15 s; a sample that never settles is kept and marked), then 1.5 s wait and 2 frames. Stop is always available; after an abort the views are kept and Continue resumes at the next pose.',
   'cw.f.count': 'Placement {p}: {n}/{total} poses · {v} views · skipped {s}',
   'cw.f.continue': 'Continue (from pose {i})', 'cw.f.toB': 'Next: move the board', 'cw.f.few': '{v} valid views; {need} are needed to continue.',
   'cw.f.kept': '{n} views kept; tap Continue to resume', 'cw.f.moving': 'Joint-space move to pose {i} (pre-pose, then target)…', 'cw.f.unsettled': 'not settled',
@@ -5091,15 +5091,15 @@ function initCalib() {
 const CW_STEPS = ['board', 'place', 'capture', 'solve', 'review', 'applied'];
 /* Fine calibration mode ("精校", camera + arm geometry): board -> place A -> capture A -> move the board ->
    capture B -> solve (Web Worker, CW.solveFine) -> review -> applied. Joint-space capture: each pose is
-   approached from the same side (pre-pose CWF.preRad below the target on every joint, above it when the lower
-   limit is near) with /api/v1/motion/jog target_positions + duration_secs (largest joint <= CWF.maxRate);
+   approached from the same side (pre-pose cwPreDeg() below the target on every joint in motor angles, above it
+   when the lower soft limit is near: armd's same-side approach rule, schema backlash_approach, src/backlash.rs) with /api/v1/motion/jog target_positions + duration_secs (largest joint <= CWF.maxRate);
    settled = every joint moved < CWF.settleRad over CWF.settleMs (CWF.settleMaxMs max, the sample is kept and
    marked), dwell CWF.dwellMs, CWF.frames frames per pose. Segments are checked at 20 steps (limits, tool points
    >= CWF.clear above the board plane, >= 0.02 m above the base plane). An aborted run keeps its views;
    Continue resumes at the next pose of the same plan. One apply carries intrinsics, camera_mount, table_z_m
    and kinematics (armd requires torque off: KINEMATICS_ARMED otherwise). */
 const CW_STEPS_FINE = ['board', 'place', 'capture', 'move', 'captureb', 'solve', 'review', 'applied'];
-const CWF = { n: 35, preRad: 2 * Math.PI / 180, maxRate: 0.25, settleRad: 0.003, settleMs: 500, settleMaxMs: 15000, dwellMs: 1500, frames: 2, clear: 0.08,
+const CWF = { n: 35, preDeg: 0.5, maxRate: 0.25, settleRad: 0.003, settleMs: 500, settleMaxMs: 15000, dwellMs: 1500, frames: 2, clear: 0.08,
   gen: { dists: [0.20, 0.24, 0.28, 0.32, 0.36, 0.40], tilts: [0, 12, 24, 36], azimuths: 8, rolls: [0, 20, -20], minMarkers: 8, clearance: 0.10, distRange: [0.2, 0.4] } };
 const CW_SPEED = { linear: 0.03, angular: 0.3 };
 const CWZ = { open: false, step: 'board', CW: null, markerMm: 25, thickMm: 0.5, board: null, views: [], plan: [], idx: 0, target: 20,
@@ -5370,8 +5370,20 @@ async function cwPlanFine(est, q0, n, exclude = []) {
 }
 const cwFineAccepted = (ds) => CWZ.views.filter((v) => v.ds === ds && !v.err && CWZ.CW.boardMarkers(v, CWZ.board).length >= CWZ.CW.GATES.minMarkers).length;
 const cwFinePoses = (ds) => new Set(CWZ.views.filter((v) => v.ds === ds && v.pose >= 0).map((v) => v.pose)).size;
-// pre-pose: CWF.preRad below the target on every joint, above it where the lower limit is too close
-function cwFinePre(q) { const { lo } = modelLimits6(); return q.map((v, i) => (v - CWF.preRad < lo[i] ? v + CWF.preRad : v - CWF.preRad)); }
+// pre-pose (model angles q in and out): armd's same-side approach rule (schema backlash_approach, src/backlash.rs)
+// in motor angles, so calibration and run time see the same backlash side: delta_deg below the target on every
+// listed joint, above it where target - delta is below the joint's soft limit. Without the schema section the
+// armd default (CWF.preDeg, every arm joint).
+const cwPreDeg = () => { const b = S.backlash; return b && Number.isFinite(b.delta_deg) ? b.delta_deg : CWF.preDeg; };
+function cwFinePre(q) {
+  const d = cwPreDeg() * Math.PI / 180, b = S.backlash, names = b && Array.isArray(b.joints) ? b.joints : null;
+  const m = toMotor6(q).map((v, i) => {
+    if (names && S.jointNames && !names.includes(S.jointNames[i])) return v;
+    const L = S.limits && S.limits[i];
+    return !L || v - d >= L.min_position ? v - d : v + d;
+  });
+  return toModel6(m);
+}
 // joint-space segment qa -> qb at 20 steps: limits, tool points above the board plane and the base plane
 function cwFineSegment(qa, qb) {
   const CW = CWZ.CW, { lo, hi } = modelLimits6(), plane = CW.boardPlane(CWZ.est.Tbb), X = CWZ.est.X;
@@ -6136,7 +6148,7 @@ function cwRender() {
     if (why) body.appendChild(cwEl('p', 'cwiz-why', why));
     acts(CWZ.step === 'move' ? null : cwBtn(t('cw.back'), () => { CWZ.step = 'board'; CWZ.status = ''; cwRender(); }, { disabled: searching }), cwBtn(CWZ.busy ? t('calib.cap.busy') : t('cw.place.cap'), cwBootstrap, { cls: 'btn-primary' + (CWZ.step === 'move' ? ' wide' : ''), disabled: CWZ.busy || !!why, id: 'cwiz-boot' }));
   } else if (cwCapStep()) {
-    p(t(cwFine() ? 'cw.f.cap.hint' : 'cw.cap.hint'));
+    p(t(cwFine() ? 'cw.f.cap.hint' : 'cw.cap.hint', { d: cwPreDeg() }));
     const acc = cwAccepted(), skipped = CWZ.plan.filter((x) => x.state === 'skip').length;
     const pr = cwEl('div', 'calib-prog');
     pr.appendChild(cwEl('div', 'calib-count mono', cwFine()
@@ -6280,6 +6292,7 @@ async function loadSchema() {
       S.orientationDof = sc.orientation_dof != null ? sc.orientation_dof : (S.armDof >= 6 ? 3 : 2);
       S.jointNames = sc.joint_names || null;
       S.caps = sc.capabilities || {};
+      S.backlash = sc.backlash_approach || null; // same-side approach (fine calibration pre-pose, cwFinePre)
       S.zeroCheckSupported = sc.gripper_policy ? !!sc.gripper_policy.zero_check_supported : (sc.capabilities ? !!sc.capabilities.zero_check_supported : false);
       S.powerGov = (sc.power_budget && sc.power_budget.governor) || null;
       PWR.key = '';
