@@ -273,7 +273,10 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .calib-drawer { width: min(440px, 100%); height: 100%; display: flex; flex-direction: column; gap: 14px; padding: max(18px, env(safe-area-inset-top)) max(18px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom)) 18px;
   background: var(--sc-color-bg-container); border-left: 1px solid var(--sc-color-border); box-shadow: -12px 0 40px rgba(31,41,55,0.16); overflow-y: auto; overscroll-behavior: contain; animation: cslide .22s cubic-bezier(.2,.8,.2,1); }
 .calib-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.calib-head h3 { font-size: 17px; font-weight: 600; color: var(--sc-color-text); }
+.calib-head h3 { font-size: 17px; font-weight: 600; color: var(--sc-color-text); flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.btn.head-estop { flex: none; min-height: 40px; padding: 0 14px; font-size: 14px; font-weight: 700; color: #fff; background: var(--sc-estop); border-color: var(--sc-estop); touch-action: none; }
+.head-estop[hidden] { display: none; }
+.btn.head-estop:hover { color: #fff; background: var(--sc-estop); filter: brightness(1.06); }
 .calib-x { width: 48px; min-height: 48px; padding: 0; font-size: 22px; line-height: 1; }
 .calib-mode { display: flex; }
 .calib-mode button { flex: 1 1 0; white-space: normal; line-height: 1.3; padding-block: 5px; }
@@ -7590,6 +7593,38 @@ function eStop() {
 }
 $('btn-estop').addEventListener('pointerdown', (e) => { e.preventDefault(); eStop(); });
 $('btn-home').addEventListener('click', home);
+/* a compact E-stop in the head of every drawer / sheet, shown while an open drawer covers the cockpit E-stop or it is off
+   screen (phones: the bottom sheet; tablets and desktop: the side drawer over the right column). A touch screen has no
+   Space / Escape key, so the E-stop stays one tap away whatever is open. */
+function estopReachable() {
+  const real = $('btn-estop'), r = real.getBoundingClientRect();
+  const x = r.left + r.width / 2, y = r.top + r.height / 2;
+  if (!(r.width > 0 && r.height > 0) || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return false;
+  const el = document.elementFromPoint(x, y);
+  return !!el && real.contains(el);
+}
+function estopPinSync() {
+  const pins = document.querySelectorAll('.head-estop');
+  for (const b of pins) b.hidden = true; // measure the cockpit E-stop without the pins
+  const reach = estopReachable();
+  for (const b of pins) b.hidden = reach || !!b.parentElement.closest('[hidden]');
+}
+(() => {
+  for (const h of document.querySelectorAll('.calib-drawer > .calib-head')) {
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'btn head-estop'; b.hidden = true;
+    b.dataset.i18n = 'estop'; b.dataset.i18nAria = 'estop.aria'; b.textContent = t('estop'); b.setAttribute('aria-label', t('estop.aria'));
+    b.addEventListener('pointerdown', (e) => { e.preventDefault(); eStop(); });
+    const acts = h.querySelector('.cwiz-head-acts');
+    if (acts) acts.prepend(b); else h.insertBefore(b, h.lastElementChild);
+  }
+  let timer = 0;
+  const sync = () => { estopPinSync(); clearTimeout(timer); timer = setTimeout(estopPinSync, 260); }; // again after the sheet animation
+  const mo = new MutationObserver(sync);
+  for (const m of document.querySelectorAll('.calib-mask, .calib-drawer')) mo.observe(m, { attributes: true, attributeFilter: ['hidden', 'class'] });
+  for (const ev of ['resize', 'scroll', 'orientationchange']) window.addEventListener(ev, sync, { passive: true });
+  i18nHooks.push(sync);
+})();
 
 /* fullscreen toggle (+ landscape lock on mobile) */
 (() => {
