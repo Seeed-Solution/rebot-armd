@@ -10,7 +10,8 @@
 // PNGs to .cache/calib-wizard-shots/. Also: Stop aborts a run, and armd without calibration_apply shows the
 // update message. Fine calibration mode (camera + arm geometry), same viewports and languages: the simulated arm's
 // geometry differs from the URDF (zero offsets, a joint-axis tilt, an origin shift); joint-space capture of
-// placement A with an abort and Continue, the board move, placement B, the solve in a Web Worker (gates, held-out,
+// placement A with an abort and Continue, the board move (the camera loses the board; jog bar on the sticks' free
+// side, hand-guide enter / exit-and-lock, a search stopped by Stop and one that finds the board), placement B, the solve in a Web Worker (gates, held-out,
 // per-joint parameters, the J5 zero warning), review with park / torque off, one apply carrying kinematics.
 // FINE_ONLY=1 runs only the fine calibration walk-through. Exits non-zero if a check fails.
 import fs from 'node:fs';
@@ -272,6 +273,18 @@ function setupFine() {
   };
   // the user moves the board and jogs the camera above it
   W.moveBoard = () => { W.Tbb = W.TbbB; const q = camAbove(W.TbbB); if (q) S.obs.positions = [...toMotor6(q), 0]; return !!q; };
+  // the camera above a table point where the board is not (jog / hand-guide / search start)
+  W.camAt = (x, y) => { const q = camAbove(CW.make(CW.rotOf(W.TbbB), [x, y, 0.0005])); if (q) S.obs.positions = [...toMotor6(q), 0]; return !!q; };
+  // board markers in the live overlay: the markers the camera sees at the arm's current pose (as rebot-vision's stream)
+  const seen = () => {
+    const G = CALM.fk(cwModelQ(S.obs.positions), W.kc), Tcb = CW.mul(CW.inv(CW.mul(G, W.X)), W.Tbb), R = CW.rotOf(Tcb), t = CW.posOf(Tcb);
+    return CW.makeBoard({ markerSide: 0.025 }).markers.filter((m) => m.corners.map((c) => CW.project(W.K, R, t, c)).every(([u, v, zz]) => zz > 0 && u >= 4 && u <= 636 && v >= 4 && v <= 356)).map((m) => m.id);
+  };
+  clearInterval(W.liveTick);
+  W.liveTick = setInterval(() => { S.detections = seen().map((id) => ({ aruco: { id, t: [0, 0, 0.3] } })); S.detLastReceivedAt = performance.now(); }, 150);
+  // gravity compensation (hand-guiding) as armd: enter -> ramp_in -> active; exit -> position, pose locked
+  S.obs.gravity_comp = { supported: true, blocker: null, phase: null, ramp: 0, last_exit: null };
+  S.obs.control_mode = 'position';
   window.detTriggerReq = async () => {
     await new Promise((r) => setTimeout(r, 20));
     const G = CALM.fk(cwModelQ(S.obs.positions), W.kc), Tcb = CW.mul(CW.inv(CW.mul(G, W.X)), W.Tbb), R = CW.rotOf(Tcb), t = CW.posOf(Tcb), markers = [];
@@ -296,6 +309,13 @@ function setupFine() {
         S.obs.action = { id, kind: 'jog', state: 'done', code: null };
       }, 60);
       return { action_id: id };
+    }
+    if (p === '/api/v1/mode/gravity_comp') {
+      W.calls.push([p, body]);
+      const g = S.obs.gravity_comp;
+      if (body.enable) { S.obs.control_mode = 'gravity_comp'; Object.assign(g, { phase: 'ramp_in', ramp: 0.4 }); setTimeout(() => Object.assign(g, { phase: 'active', ramp: 1 }), 300); }
+      else { Object.assign(g, { phase: 'exiting' }); setTimeout(() => { S.obs.control_mode = 'position'; Object.assign(g, { phase: null, ramp: 0, last_exit: { code: 'REQUESTED', message: '', at: Date.now() } }); }, 200); }
+      return {};
     }
     if (p === '/api/v1/calibration/apply' && !body.dry_run && W.armedOnce) { W.calls.push([p, body]); W.armedOnce = false; throw Object.assign(new Error('torque on'), { code: 'KINEMATICS_ARMED' }); }
     const r = await base(p, body);
@@ -395,10 +415,79 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     const resumeOk = js[nBefore] && js[nBefore].target_positions.slice(0, 6).every((v, i) => Math.abs(v - ra.firstQ[i]) < 1e-9);
     if (ra.idx !== ra.n || ra.plan !== planBefore || !pairOk || !durOk || !resumeOk || ra.ok < 10) fail('fine capture A ' + JSON.stringify({ ...ra, plan: ra.plan === planBefore, pairOk, durOk, resumeOk, jogs: js.length }));
     await shot('4_captureA_done', `poses ${ra.ok}/${ra.n}, views ${ra.views}, jog pairs (pre 2 deg, target) ${pairOk}, duration >= 1.5 s ${durOk}, resumed at pose ${ab.idx + 1} with the same plan ${resumeOk && ra.plan === planBefore}`);
-    // move the board
+    // move the board: the camera no longer sees it; three ways to bring it back
     await page.click('#cwiz-tob');
-    if (!(await page.evaluate(() => __SIM.moveBoard()))) fail('fine move board ik');
-    await shot('5_move');
+    const st = (extra) => page.evaluate((x) => ({ live: cwLiveCount(), boot: $('cwiz-boot') && $('cwiz-boot').disabled, why: [...document.querySelectorAll('#cwiz-body .cwiz-why')].map((e) => e.textContent).join(' | '), status: CWZ.status, ...(x ? eval(x) : {}) }), extra || null);
+    await page.evaluate(() => { __SIM.Tbb = __SIM.TbbB; });
+    await page.waitForTimeout(900);
+    const mv = await st("({ btns: ['jog', 'hand', 'search'].map((k) => !!$('cwiz-find-' + k)).join(), hint: $('cwiz-body').innerText.includes(t('cw.f.move.do')) })");
+    if (mv.btns !== 'true,true,true' || !mv.boot || mv.live >= 6 || !mv.why || !mv.hint) fail('fine move step ' + JSON.stringify(mv));
+    await shot('5_move', `three buttons ${mv.btns}, live ${mv.live}, capture disabled ${mv.boot}: "${mv.why}"`);
+    // a) jog: panel hidden, floating bar above the sticks; the joystick stays reachable
+    await page.click('#cwiz-find-jog');
+    await page.waitForTimeout(400);
+    const jogGeo = () => page.evaluate(() => {
+      const bar = $('cwiz-jogbar'), b = bar.getBoundingClientRect(), H = innerHeight, W = innerWidth;
+      const pads = [...document.querySelectorAll(CWJ_AVOID), $('vs-video').parentElement].map((e) => [e.id || e.className, e.getBoundingClientRect()]).filter(([, r]) => r.width > 0 && r.bottom > 0 && r.top < H);
+      const cover = pads.filter(([, r]) => r.left < b.right && r.right > b.left && r.top < b.bottom && r.bottom > b.top).map(([n]) => n);
+      // the centre of every visible stick is still the topmost element there (nothing of the wizard on it)
+      const blocked = pads.filter(([, r]) => { const x = (r.left + r.right) / 2, y = (Math.max(0, r.top) + Math.min(H, r.bottom)) / 2, e = document.elementFromPoint(x, y); return e && (e.closest('#cwiz-jogbar') || e.closest('#cwiz-panel')); }).map(([n]) => n);
+      return { bar: !bar.hidden, panel: $('cwiz-panel').getBoundingClientRect().height, inView: b.left >= 0 && b.right <= W && b.top >= 0 && b.bottom <= H, top: bar.classList.contains('top'), y: Math.round(b.top), h: Math.round(b.height), sticks: pads.length, cover, blocked,
+        cap: $('cwiz-jog-cap').disabled, live: $('cwiz-jog-live').textContent, why: $('cwiz-jog-why').hidden ? '' : $('cwiz-jog-why').textContent };
+    });
+    const jg = await jogGeo();
+    if (!jg.bar || jg.panel || !jg.inView || jg.cover.length || jg.blocked.length || !jg.cap || !jg.why || !jg.sticks) fail('fine jog bar ' + JSON.stringify(jg));
+    await shot('5a_jog', `bar at y ${jg.y} (h ${jg.h}${jg.top ? ', top' : ''}), panel hidden, ${jg.sticks} sticks / toggles visible, covered ${jg.cover.length}, sticks blocked ${jg.blocked.length}, capture disabled ${jg.cap}: "${jg.why}"`);
+    const qAway = await page.evaluate(() => S.obs.positions.slice());
+    await page.evaluate(() => __SIM.moveBoard()); // the user jogs until the camera sees the board
+    await waitW(page, () => !$('cwiz-jog-cap').disabled, 5000, 'fine jog ready');
+    const jr = await jogGeo();
+    if (jr.cap || jr.cover.length || jr.blocked.length) fail('fine jog ready ' + JSON.stringify(jr));
+    await shot('5b_jog_ready', `"${jr.live}", capture enabled ${!jr.cap}`);
+    await page.click('#cwiz-jog-back');
+    await page.waitForTimeout(300);
+    const back = await page.evaluate(() => ({ panel: $('cwiz-panel').getBoundingClientRect().height > 100, bar: $('cwiz-jogbar').hidden, boot: $('cwiz-boot').disabled }));
+    if (!back.panel || !back.bar || back.boot) fail('fine jog back ' + JSON.stringify(back));
+    // b) hand-guide: enter, move by hand, exit and lock; capture only after the exit
+    await page.evaluate((q) => { S.obs.positions = q.slice(); }, qAway);
+    await page.waitForTimeout(400);
+    await page.click('#cwiz-find-hand');
+    await waitW(page, () => S.obs.gravity_comp.phase === 'active', 5000, 'fine gc active');
+    await page.evaluate(() => __SIM.moveBoard()); // moved by hand
+    await page.waitForTimeout(900);
+    const hg = await st("({ hand: $('cwiz-find-hand').textContent, gc: __SIM.calls.filter(([p]) => p === '/api/v1/mode/gravity_comp').map(([, b]) => b.enable).join() })");
+    if (!hg.boot || hg.live < 6 || !/退出并锁定|Exit and hold/.test(hg.hand) || hg.gc !== 'true') fail('fine hand-guide ' + JSON.stringify(hg));
+    await shot('5c_handguide', `live ${hg.live}, capture disabled while hand-guiding ${hg.boot}: "${hg.why}"`);
+    await page.click('#cwiz-find-hand');
+    await waitW(page, () => S.obs.control_mode === 'position' && !S.obs.gravity_comp.phase && !$('cwiz-boot').disabled, 5000, 'fine gc exit');
+    const hx = await st("({ gc: __SIM.calls.filter(([p]) => p === '/api/v1/mode/gravity_comp').map(([, b]) => b.enable).join() })");
+    if (hx.boot || hx.gc !== 'true,false') fail('fine hand-guide exit ' + JSON.stringify(hx));
+    await shot('5c2_handguide_locked', `after exit: capture enabled ${!hx.boot}, gravity_comp calls ${hx.gc}`);
+    // c) search: Stop during a search, then a search that finds the board
+    const search = async (stop) => {
+      await page.evaluate(() => { __SIM.camAt(0.24, 0.24); __SIM.calls.length = 0; });
+      await page.waitForTimeout(400);
+      await page.click('#cwiz-find-search');
+      if (stop) {
+        await waitW(page, () => CWZ.search && CWZ.search.k >= 2, 30000, 'fine search progress');
+        await page.waitForTimeout(250);
+        await shot('5e_search_running', await page.evaluate(() => `"${document.querySelector('#cwiz-find-prog').innerText.split('\n')[0]}", Stop ${!!$('cwiz-find-stop')} / footer ${!$('cwiz-stop').hidden}`));
+        await page.click('#cwiz-find-stop');
+      }
+      await waitW(page, () => CWZ.search && !CWZ.search.running, 60000, 'fine search end');
+      await page.waitForTimeout(900);
+      // found: the live overlay (150 ms mock stream) and the render tick (700 ms) catch up
+      if (!stop) await page.waitForFunction(() => cwLiveCount() >= 6 && !$('cwiz-boot').disabled, null, { timeout: 5000 }).catch(() => {});
+      return page.evaluate(() => ({ k: CWZ.search.k, n: CWZ.search.n, found: CWZ.search.found, status: CWZ.status, live: cwLiveCount(), boot: $('cwiz-boot').disabled,
+        moves: __SIM.calls.filter(([p]) => p === '/api/v1/action/move_to').length, speeds: __SIM.calls.filter(([p]) => p === '/api/v1/action/move_to').every(([, b]) => b.speed.linear === 0.03 && b.speed.angular === 0.3 && b.tag === 'calib-wizard'),
+        stops: __SIM.calls.filter(([p]) => p === '/api/v1/motion/stop').length, running: CWZ.running }));
+    };
+    const ss = await search(true);
+    if (ss.running || ss.found || !ss.stops || !/中止|aborted/i.test(ss.status) || !/停止|Stop/.test(ss.status) || ss.k >= ss.n) fail('fine search stop ' + JSON.stringify(ss));
+    await shot('5e_search_stopped', `stopped at candidate ${ss.k}/${ss.n}, move_to ${ss.moves}, motion/stop ${ss.stops}: "${ss.status}"`);
+    const sf = await search(false);
+    if (!sf.found || sf.found.k < 2 || sf.found.m < 6 || sf.live < 6 || sf.boot || !sf.speeds || sf.moves > sf.found.k + 1 || sf.running) fail('fine search found ' + JSON.stringify(sf));
+    await shot('5d_search_found', `found after ${sf.found.k}/${sf.n} candidates, re-aim ${!!sf.found.aimed}, ${sf.found.m} markers, move_to ${sf.moves} (speed caps ${sf.speeds}), live ${sf.live}, capture enabled ${!sf.boot}`);
     await phase('planB');
     await page.click('#cwiz-boot');
     await waitW(page, () => CWZ.step === 'captureb' || (!CWZ.busy && CWZ.status), 60000, 'fine boot B');
