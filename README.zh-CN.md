@@ -66,6 +66,7 @@
 - [API 概览](#api-概览)
 - [Agent 与 MCP 集成](#agent-与-mcp-集成)
 - [示教片段录制（Parquet）](#示教片段录制parquet)
+- [示教：片段、录制归属、序列](#示教片段录制归属序列)
 - [配置与命令行](#配置与命令行)
 - [接线（reCamera B4 CAN 底板）](#接线recamera-b4-can-底板)
 - [安全](#安全)
@@ -398,9 +399,33 @@ curl -X DELETE http://192.168.42.1:8765/api/v1/dataset/episodes/episode_001
 
 重力补偿模式下 J1–J6 的指令位置跟随实测位置，因此拖动示教片段中这些关节的 `action` 等于 `observation.state`。
 
-片段保存为片段目录下的 `<episode_id>.parquet`：目录由 `--episodes-dir`（或 `$ARMD_EPISODES_DIR`）指定，`/userdata` 存在时默认 `/userdata/rebot-teleop/episodes`，否则为工作目录下的 `./data/episodes`；`off` 关闭录制与回放。片段 id 须匹配 `^[A-Za-z0-9_-]{1,64}$`（默认 `episode_<UTC 日期>_<时间>`），已存在的 id 返回 `409 EPISODE_EXISTS`。`output_path` 必须指向该目录下的 `<id>.parquet`，否则返回 `400 INVALID_OUTPUT_PATH`。目录达到 500 个文件或 200 MB 时，开始和保存录制返回 `507 EPISODES_FULL`；保存被拒绝时录制保留，删除片段后可再保存。列名沿用 LeRobot 的命名，但 armd 每个片段写一个普通 Parquet 文件，不是 LeRobot 数据集（没有 `meta/` 文件、片段与帧索引，也没有相机画面）。本仓库不提供转换为 LeRobot 数据集的工具，也未测试用它训练。
+片段保存为片段目录下的 `<episode_id>.parquet` 与 sidecar `<episode_id>.json`（见[示教](#示教片段录制归属序列)）：目录由 `--episodes-dir`（或 `$ARMD_EPISODES_DIR`）指定，`/userdata` 存在时默认 `/userdata/rebot-teleop/episodes`，否则为工作目录下的 `./data/episodes`；`off` 关闭录制与回放。片段 id 须匹配 `^[A-Za-z0-9_-]{1,64}$`（默认为新的 ULID），已存在的 id 返回 `409 EPISODE_EXISTS`。`output_path` 必须指向该目录下的 `<id>.parquet`，否则返回 `400 INVALID_OUTPUT_PATH`。目录达到 500 个文件或 200 MB 时，开始和保存录制返回 `507 EPISODES_FULL`，磁盘空闲空间少于 200 MB 时开始录制返回 `507 RECORD_NO_SPACE`；保存被拒绝时录制保留，删除片段后可再保存。列名沿用 LeRobot 的命名，但 armd 每个片段写一个普通 Parquet 文件，不是 LeRobot 数据集（没有 `meta/` 文件、片段与帧索引，也没有相机画面）。本仓库不提供转换为 LeRobot 数据集的工具，也未测试用它训练。
 
-**回放。** WS 动作 `/api/v1/action/replay` `{"episode", "speed": 0.5 | 1.0, "gripper": true}`（需租约）先以规划关节运动移动到录制的第一帧，再跟随按控制频率重采样的实测角度（`observation.state`）。运动前 armd 检查每一帧的关节限位、工作空间与禁入盒，以及所选回放速度下各关节速度是否超过规划运动限速（B601-DM 为 0.45 rad/s）；不通过时以错误码拒绝（`REPLAY_TOO_FAST` 给出关节和可通过的最高回放速度）。录制中、重力补偿中、碰撞保护中或其他运动进行中拒绝回放；停止、急停和租约丢失会结束回放。规则见 [动作接口](docs/agent_action_api.md#replay--回放) 与 [安全契约](docs/control_safety_contract.md#episode-replay--片段回放)。已在仿真中测试（`tests/test_replay.rs`），尚未在机械臂上运行。
+**回放。** WS 动作 `/api/v1/action/replay` `{"episode", "speed": 0.5 | 1.0, "gripper": true}`（需租约）先以规划关节运动移动到录制的第一帧，再跟随按控制频率重采样的实测角度（`observation.state`）。运动前 armd 检查每一帧的关节限位、工作空间与禁入盒，以及所选回放速度下各关节速度是否超过规划运动限速（B601-DM 为 0.45 rad/s）；不通过时以错误码拒绝（`REPLAY_TOO_FAST` 给出关节和可通过的最高回放速度）。录制中、重力补偿中、碰撞保护中或其他运动进行中拒绝回放；停止、急停和租约丢失会结束回放。用其他关节零位录制的片段返回 `DATA_STALE`，除非传 `allow_stale: true`。规则见 [动作接口](docs/agent_action_api.md#replay--回放) 与 [安全契约](docs/control_safety_contract.md#episode-replay--片段回放)。已在仿真中测试（`tests/test_replay.rs`），尚未在机械臂上运行。
+
+## 示教：片段、录制归属、序列
+
+`capabilities.teach` = `{"version": 1, "episodes": true, "sequences": true}`（capabilities 版本 11）。完整规则见 [动作接口「示教 v1」](docs/agent_action_api.md#teach-v1-episodes-recording-sequences--示教-v1片段录制序列)。已用 mock follower 测试（`tests/test_teach_episodes.rs`、`tests/test_teach_sequences.rs`），尚未在机械臂上运行。
+
+**片段。** 每个片段不可修改：`<id>.parquet`（带 armd 单调时钟时间戳的实测采样，不重采样）与 `<id>.json`（数据集、任务、来源、结果、关节名、`units: "rad"`、录制时的关节零位、profile 与 armd 版本）。数据集（`datasets.json`，默认 `default`）用于分组。录制后某关节零位变化超过 0.5° 时片段标记为 `stale`。启动时 armd 删除未写完的临时文件，用 parquet 尾部元数据恢复崩溃时丢失的 sidecar，并收编 teach v1 之前录制的片段。
+
+| 路由 | |
+|---|---|
+| `GET /api/v1/episodes?dataset=&limit=&before=`、`GET /api/v1/episodes/{id}`、`GET /api/v1/episodes/{id}/data` | 列表、sidecar、parquet 文件 |
+| `GET /api/v1/datasets` | 数据集及片段数、时长、字节数 |
+| `POST /api/v1/episodes/import` | multipart `parquet` + `sidecar`；检查关节名与顺序、`units` 为 rad、有限值、软限位、时长 ≤ 600 s；`IMPORT_INVALID {reason}` |
+| WS `/api/v1/episodes/update`、`/episodes/delete`、`/datasets/create`、`/datasets/delete` | 无需租约 |
+
+**录制归属。** WS `/api/v1/record/start {dataset?, task?, source?}` 与 `/api/v1/record/stop {save, outcome?}` 无需租约。录制归属于连接的 `client_id`，其他客户端停止返回 `RECORDER_NOT_OWNER`，第二个录制返回 `RECORDER_BUSY`。归属者连接断开 5 s 后丢弃录制，除非同一 `client_id` 从新连接停止它。到 600 s（`truncated`）或磁盘空闲空间低于 100 MB 时停止并保存。旧的 `/api/v1/dataset/*` 路由继续可用，归属者为 `legacy-rest`。
+
+**序列。** 步骤 `pose {pose_id, speed_scale, gripper: keep | pose}`、`gripper {open | close | move, fraction}`、`wait {s}`、`replay {episode_id, speed, gripper}`，保存在 `/userdata/rebot-teleop/sequences.json`（`ARMD_SEQUENCES`），最多 200 步。姿态现在带稳定的 `id`。`GET /api/v1/sequences`；WS `/api/v1/sequences/save|delete`（需租约）。被序列使用的姿态或片段不能删除（`IN_USE`）。
+
+```json
+{"type":"command", "request_id":12, "generation":1, "epoch_id":3, "path":"/api/v1/action/run_sequence",
+ "body":{"id":"01JD3XK8Q7…", "repeat":3, "record":{"dataset":"pick", "task":"pick the cube"}}}
+```
+
+`run_sequence` 是一个动作（类型 `sequence`，带 `step_index`、`step_type`、`repeat_index`、`repeats`），`expected_duration_s` 为上界。开始时复制姿态，过期的姿态与片段返回 `DATA_STALE`（`allow_stale` 时放行），每个运动步骤前检查 epoch、工作空间、标定与租约。停止、租约丢失、故障与任一步骤失败（包括规划拒绝）都会结束它，等待期间同样生效。带 `record` 时每次重复保存一个片段（`source: "sequence"`），中止的那次重复的片段被丢弃。
 
 ---
 

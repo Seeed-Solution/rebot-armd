@@ -11,7 +11,11 @@ async fn rebot_dm_schema_declares_its_features() {
     assert_eq!(caps.version, CAPABILITIES_VERSION);
     assert_eq!(caps.profile_version, ARM_PROFILE_VERSION);
     assert!(caps.cartesian && caps.workspace_check && caps.gripper && caps.grasp && caps.damiao_ranges);
-    assert_eq!(caps.version, 10);
+    assert_eq!(caps.version, 11);
+    let teach = caps.teach.clone().expect("teach v1");
+    assert_eq!((teach.version, teach.episodes, teach.sequences), (1, true, true));
+    supervisor.set_episodes_dir(None).await;
+    assert!(!supervisor.get_schema().await.capabilities.teach.unwrap().episodes, "storage off");
     assert!(caps.calibration_tools.as_ref().is_some_and(|t| t.camera.supported && t.motor_zero.support.supported));
     assert!(caps.obs_rate && caps.fault_codes && caps.poses && caps.keepout && caps.speed_cap
         && caps.residual_torques && caps.tick_stats && caps.place && caps.safety_describe && caps.replay);

@@ -550,6 +550,7 @@ impl SupervisorInner {
             schema.feetech_joints = self.config.feetech.as_ref().map(|f| f.joints.clone());
         }
         schema.capabilities.calibration_tools = Some(self.calibration_tools_with(&schema.capabilities));
+        if let Some(t) = schema.capabilities.teach.as_mut() { t.episodes = self.episodes.enabled(); }
         schema.joint_zero = self.calibration.as_ref().and_then(|c| c.joint_zero.as_ref()).and_then(|z| serde_json::to_value(z).ok());
         schema.zero_convention = self.config.zero_reference.as_ref().and_then(|_| serde_json::to_value(&self.zero_convention).ok());
         schema
