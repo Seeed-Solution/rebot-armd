@@ -227,6 +227,21 @@ hint to re-zero that motor (J2..J4 offsets are not separately identifiable and g
 recorded on this kit's arm (2026-11-18) the held-out error went from 2.76 / 3.64 mm to
 2.01 / 2.24 mm.
 
+Start view (the place step, and in fine calibration mode also the move step after placement A): the
+camera has to see at least 6 whole board markers; "Capture start view" stays disabled until the live
+marker count reaches 6 and says why (too few markers, hand-guiding active, arm moving, search
+running). Three buttons bring the camera onto the board:
+
+| Button | What it does |
+|---|---|
+| Jog | Hides the wizard panel and shows a small bar with the live marker count, "Capture start view" and "Back to wizard". The bar sits above the sticks, E-stop and Enable (bottom of the screen, or higher when they are in the way), so the cockpit sticks and Cartesian jog stay usable, also on a phone (390 x 844). |
+| Move by hand | Enters gravity compensation with the same checks as the cockpit's hand-guide switch (no hold-to-enter). The button then reads "Exit and hold pose"; the start view can be captured only after the exit has locked the pose and the arm is still. |
+| Search | Moves the camera over up to 24 candidate board centres on the table (radius 0.20-0.45 m, azimuth -70..+70°, camera 0.31 m above the table looking down), nearest to the camera's current view first; in the move step, candidates within 8 cm of placement A come last. Same move_to speed caps (0.03 m/s, 0.3 rad/s), path checks, skip rules (IK_UNREACHABLE, IK_BRANCH_FLIP, WORKSPACE_VIOLATION) and abort rules as a capture run; one ArUco trigger per candidate. At the first view with ≥ 6 board markers it re-aims once at the marker centroid and stops there. Stop aborts at once. |
+
+The search was tested against the in-page simulation of `scripts/calib_wizard_shots.mjs` (board
+found after 17 of 24 candidates, camera starting 0.36 m from the board; Stop during a search); not yet on
+the real arm.
+
 驾驶舱标定向导用实测值替换上面的占位值：机械臂在桌面上打印的 ArUco GridBoard 上方移动，在浏览器中求解内参、手眼安装与桌面高度，再通过 armd 写入（WS `/api/v1/calibration/apply`，接口见 [docs/agent_action_api.md](../../../docs/agent_action_api.md#camera-calibration-wizard--相机标定向导)）。一次写入包括：rebot-vision 的 `/userdata/rebot-teleop/vision.json`（经 `PUT /api/calibration/intrinsics`，640 x 360 下的 `fx`、`fy`、`cx`、`cy`、`k1`、`k2`、`p1`、`p2`、`k3`、`marker_size`）；`/userdata/rebot-teleop/calibration.json`（`ARMD_CALIBRATION`：含 `q_end_cam`（R_end_cam，[w, x, y, z]）与 `offset_m` 的 `camera_mount`、内参副本、`table_z_m`、`solved_at`、`rms`）；`/userdata/rebot-teleop/grasp_setup.json`（`ARMD_GRASP_SETUP`：`fx_px`、`fy_px`、`cx_px`、`cy_px`、`image_size_px` [640, 360]、`table_z_m`、由 `q_end_cam` 推导的 `camera_tilt_deg`、armd 计算的 `grip_pixel_norm`；夹爪下方的点在画面外时（如 v8）保持不变）。
 
 每次写入前先在 `/userdata/rebot-teleop/calibration-backups/<UTC 时间>/` 保存备份；WS `/api/v1/calibration/restore {"backup": "<名称>"}` 恢复备份，`GET /api/v1/calibration` 列出备份。`calibration.json` 含 `q_end_cam` 期间，抓取设置中的 `camera_tilt_deg`、`fx_px`、`fy_px`、`cx_px`、`cy_px`、`image_size_px` 不能修改（恢复备份或重新标定）；相机旋转不再使用 `camera_mounts.json` 与 profile 的 `flip` / `rot_deg` / `tilt_deg`。镜头畸变用于 rebot-vision 的标记位姿，不用于抓取几何。
@@ -236,3 +251,13 @@ recorded on this kit's arm (2026-11-18) the held-out error went from 2.76 / 3.64
 标定板（向导生成打印页；仿真器 `--aruco-board` 使用相同布局）：4 列 x 3 行（横向，与 16:9 画面一致）aruco4x4_50 标记，id 0..11 按阅读顺序（id = 行 * 4 + 列，第 0 行在页面顶部，第 0 列在左侧），默认标记边长 25 mm，间隔 5 mm（0.2 倍边长），整板约 115 x 85 mm。标定板坐标系：原点在板中心，x 沿页面向右，y 沿页面向下，z 指向桌面内；打印的 "up" 箭头指向页面顶部（板 -y）。标记角点顺序同 rebot-vision：打印标记的左下、右下、右上、左上（标记坐标系 x 向右、y 向下）。
 
 精校模式（相机 + 机械臂几何）：向导采集两个标定板位置（各约 35 个位姿，关节空间移动、从同一方向接近；按这套运动规则在真机上每个位置约 5 分钟），除上述数值外还求解 J2..J5 的几何修正（零位、角度比例、关节轴倾斜、关节原点偏移；J1、J6 为 0）。两次采集之间用户把标定板移到另一个位置（距原位置至少 10 cm）并采集新的起始视图。只有满足以下条件才写入修正：两个方向的留出误差（在一个位置拟合、预测另一个位置）都 ≤ 3 mm，留出误差平均值比未修正模型低 ≥ 30 %，所有参数在 armd 的范围内（|零位| ≤ 10°、|比例| ≤ 0.08、|倾斜| ≤ 3°、|原点| ≤ 30 mm）。同一次写入还把 `kinematics`（每个关节的 `offset_rad`、`scale`、`tilt_rad`、`origin_m`，以及拟合的留出误差）写进 `calibration.json`；armd 要求此时电机断电。J5 零位偏差超过 5° 时给出提示，建议重新校准该电机零位（J2..J4 的零位不能单独确定，不提示）（reBotArm_control_py `example/2_zero_and_read.py` / MotorBridge）。在本套件机械臂上录制的数据（2026-11-18）中，留出误差从 2.76 / 3.64 mm 降到 2.01 / 2.24 mm。
+
+起始视图（摆放步骤；精校模式下位置 A 之后的移板步骤也一样）：相机需要看到至少 6 个完整的标定板标记；实时标记数达到 6 之前「采集起始视图」不可用，并显示原因（标记不足、拖动示教中、机械臂在动、正在自动寻找）。三个按钮用来让相机看到标定板：
+
+| 按钮 | 作用 |
+|---|---|
+| 用摇杆移动 | 隐藏向导面板，显示一个小条：实时标记数、「采集起始视图」、「返回向导」。小条放在摇杆、急停和使能按钮上方（屏幕底部；被挡住时上移），驾驶舱摇杆与笛卡尔点动照常可用，手机（390 x 844）上也一样。 |
+| 拖动示教 | 进入重力补偿，检查条件与驾驶舱的拖动示教开关相同（不需要按住进入）。按钮随后变为「退出并锁定位置」；退出、位置锁定且机械臂静止后才能采集起始视图。 |
+| 自动寻找 | 让相机依次移到桌面上最多 24 个候选板中心上方（半径 0.20–0.45 m，方位 −70..+70°，相机在桌面上方 0.31 m、朝下），从离相机当前视野最近的开始；移板步骤中距位置 A 8 cm 以内的候选放在最后。速度上限（0.03 m/s、0.3 rad/s）、路径检查、跳过规则（IK_UNREACHABLE、IK_BRANCH_FLIP、WORKSPACE_VIOLATION）和中止规则与采集运行相同；每个候选触发一次 ArUco 识别。第一个看到 ≥ 6 个标记的视图处，按标记中心再对准一次后停下。停止按钮立即中止。 |
+
+自动寻找在 `scripts/calib_wizard_shots.mjs` 的页面内仿真中测试（相机起始位置离标定板 0.36 m，第 17 / 24 个候选找到；寻找中按停止）；尚未在真机上测试。
