@@ -88,6 +88,11 @@ pub fn damiao_fault_name(code: u8) -> Option<&'static str> {
     })
 }
 
+/// Damiao enable handshake: how long to wait for every motor to report state 1, and when to resend the
+/// enable frame to motors not yet confirmed.
+pub const DAMIAO_ENABLE_CONFIRM: Duration = Duration::from_millis(150);
+const DAMIAO_ENABLE_RETRY_AT: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(75)];
+
 pub trait ArmDriver: Send {
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
 
@@ -2654,13 +2659,13 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 return Err(e.into());
             }
 
-            // Wait and poll for responses up to 80ms, max 30 checks
+            // Wait and poll for responses for DAMIAO_ENABLE_CONFIRM. The window is bounded by time only: a
+            // check-count cap (30 checks at ~0.5 ms) used to end it after ~28 ms, and a motor answering
+            // ~30 ms late (seen on a B601-DM J3 after a set-zero) failed the enable every time.
             let poll_start = Instant::now();
-            let mut retried = false;
+            let mut retries = 0u32;
             let mut all_enabled = false;
-            let mut check_count = 0;
-            while poll_start.elapsed() < Duration::from_millis(80) && check_count < 30 {
-                check_count += 1;
+            while poll_start.elapsed() < DAMIAO_ENABLE_CONFIRM {
                 let _ = self.read_joint_states();
                 let all_fresh = !self.last_feedback_instant.is_empty()
                     && self.last_feedback_instant.iter().all(|opt| {
@@ -2683,8 +2688,9 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     }
                 }
 
-                // If not all enabled after 25ms or 10 checks, retry once for motors that have not responded or are not enabled
-                if !retried && (poll_start.elapsed() >= Duration::from_millis(25) || check_count >= 10) {
+                // Resend the enable frame to motors not yet confirmed at 25 ms and at 75 ms
+                let due = DAMIAO_ENABLE_RETRY_AT.get(retries as usize).is_some_and(|t| poll_start.elapsed() >= *t);
+                if due {
                     for (i, &id) in self.motor_ids.iter().enumerate() {
                         let motor_fresh_and_enabled = self.last_feedback_instant.get(i).copied().flatten().is_some_and(|t| t >= handshake_start)
                             && self.motor_status.get(i).copied() == Some(1);
@@ -2699,7 +2705,7 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                     if let Err(e) = self.can.flush() {
                         tracing::warn!("Retry flush failed: {:?}", e);
                     }
-                    retried = true;
+                    retries += 1;
                 }
 
                 std::thread::sleep(Duration::from_micros(500));
@@ -2711,8 +2717,8 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
                 self.is_enabled = false;
                 self.pending_rearm = true;
                 return Err(ArmDriverError::HardwareFault(format!(
-                    "Not all Damiao motors entered enabled state within 80ms: feedback_valid={}, status={:?}",
-                    self.is_feedback_valid(), self.motor_status
+                    "Not all Damiao motors entered enabled state within {} ms: feedback_valid={}, status={:?}",
+                    DAMIAO_ENABLE_CONFIRM.as_millis(), self.is_feedback_valid(), self.motor_status
                 )));
             }
             self.is_enabled = true;
