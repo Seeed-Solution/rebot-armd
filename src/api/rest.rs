@@ -526,6 +526,56 @@ pub async fn get_episode_data(
     ).into_response())
 }
 
+fn import_invalid(reason: &str, message: impl Into<String>) -> ApiError {
+    ArmError::detailed(422, "IMPORT_INVALID", message, serde_json::json!({"reason": reason})).into()
+}
+
+/// `POST /api/v1/episodes/import` (multipart: `parquet` = the episode file, `sidecar` = its
+/// JSON): checked against this arm (`crate::recording::import`), stored as a new episode
+/// (`source: import`). -> `{id, stale, episode}` | IMPORT_INVALID `{reason}`. No lease.
+pub async fn episodes_import(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    supervisor.ensure_episodes_loaded().await?;
+    let (mut parquet, mut sidecar) = (None, None);
+    while let Some(field) = multipart.next_field().await.map_err(|e| import_invalid("multipart", e.to_string()))? {
+        let name = field.name().unwrap_or("").to_string();
+        let data = field.bytes().await.map_err(|e| import_invalid("multipart", e.to_string()))?;
+        match name.as_str() {
+            "parquet" => parquet = Some(data),
+            "sidecar" => sidecar = Some(data),
+            _ => {}
+        }
+    }
+    let parquet = parquet.ok_or_else(|| import_invalid("multipart", "part 'parquet' is missing"))?;
+    let sidecar: serde_json::Value = serde_json::from_slice(&sidecar.ok_or_else(|| import_invalid("multipart", "part 'sidecar' is missing"))?)
+        .map_err(|e| import_invalid("sidecar", format!("sidecar is not JSON: {e}")))?;
+    let (ctx, store) = {
+        let inner = supervisor.inner().read().await;
+        (crate::recording::import::ImportContext {
+            joint_names: inner.joint_names(), limits: inner.config.limits.clone(), profile_id: inner.config.profile_id.clone(),
+            arm_dof: inner.config.arm_dof(), gripper_joint: inner.config.gripper_index(),
+            zero_offsets: inner.joint_zero_offsets.clone(), fps: f64::from(inner.config.control_frequency_hz),
+        }, inner.episodes.clone())
+    };
+    if !store.enabled() { return Err(ArmError::from(crate::recording::StoreError::Disabled).into()); }
+    let result = tokio::task::spawn_blocking(move || -> Result<(crate::recording::EpisodeSidecar, bool), ApiError> {
+        let frames = crate::recording::read_frames_from_bytes(parquet).map_err(|e| import_invalid("schema", format!("parquet: {e}")))?;
+        let checked = crate::recording::import::check(&ctx, &sidecar, &frames).map_err(|e| import_invalid(e.reason, e.message))?;
+        let mut sc = checked.sidecar;
+        sc.id = crate::recording::new_ulid();
+        store.check_capacity().map_err(ArmError::from)?;
+        store.check_free_for_start().map_err(ArmError::from)?;
+        if !store.has_dataset(&sc.dataset) { store.create_dataset(&sc.dataset, "").map_err(ArmError::from)?; }
+        store.write_episode(&sc, &frames, None).map_err(ArmError::from)?;
+        Ok((sc, checked.stale))
+    }).await.map_err(|e| ArmError::Internal(format!("import failed: {e}")))?;
+    let (sc, stale) = result?;
+    tracing::info!("Episode {} imported ({} frames, dataset '{}'{})", sc.id, sc.frames, sc.dataset, if stale { ", stale" } else { "" });
+    Ok(Json(serde_json::json!({"id": sc.id, "stale": stale, "episode": sc})))
+}
+
 /// `GET /api/v1/datasets`: `{datasets: [{name, episodes, duration_s, bytes, created_at, description}]}`.
 pub async fn get_datasets(State(supervisor): State<Arc<ArmSupervisor>>) -> Result<Json<serde_json::Value>, ApiError> {
     supervisor.ensure_episodes_loaded().await?;

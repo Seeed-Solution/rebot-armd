@@ -332,3 +332,82 @@ async fn recorder_ownership_other_clients_cannot_stop_and_disconnect_discards() 
     let r = common::ws_reply(&mut c2, stop("page-c", true), &["command_ack", "command_reject"]).await;
     assert_eq!(r["episode"]["id"].as_str(), Some(rid3.as_str()), "{r}");
 }
+
+// ---- import ----
+
+/// multipart/form-data body with a `parquet` and a `sidecar` part.
+fn multipart(parquet: &[u8], sidecar: &Value) -> (String, Vec<u8>) {
+    let boundary = "teachboundary7MA4YWxkTrZu0gW";
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"sidecar\"; filename=\"e.json\"\r\nContent-Type: application/json\r\n\r\n").as_bytes());
+    body.extend_from_slice(sidecar.to_string().as_bytes());
+    body.extend_from_slice(format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"parquet\"; filename=\"e.parquet\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
+    body.extend_from_slice(parquet);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+async fn import(addr: std::net::SocketAddr, parquet: &[u8], sidecar: &Value) -> (u16, Value) {
+    let (ct, body) = multipart(parquet, sidecar);
+    let r = reqwest::Client::new().post(format!("http://{addr}/api/v1/episodes/import")).header("content-type", ct).body(body).send().await.unwrap();
+    let status = r.status().as_u16();
+    (status, r.json().await.unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn import_validates_units_joint_order_limits_and_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (addr, sup) = common::spawn_server(profile()).await;
+    sup.set_episodes_dir(Some(tmp.path().to_path_buf())).await;
+    let names: Vec<String> = sup.inner().read().await.joint_names();
+    let file = tmp.path().join("src.bin");
+    let write = |q: &[f32]| {
+        let frames: Vec<armd::RecordFrame> = (0..50).map(|k| {
+            let mut s = q.to_vec();
+            s[0] += k as f32 * 0.002;
+            armd::RecordFrame { timestamp: 100.0 + k as f64 * 0.02, observation_state: s.clone(), action: s }
+        }).collect();
+        armd::write_frames_to_parquet(&file, &frames).unwrap();
+        std::fs::read(&file).unwrap()
+    };
+    let rad = write(&common::INSPECT);
+    let good = json!({"units": "rad", "joint_names": names, "dataset": "pc", "task": "pour",
+        "joint_zero": {"offsets_rad": vec![0.0; 7], "rev": "abc"}, "recorded_at": "2026-11-18T10:00:00Z"});
+
+    // degrees: refused by the units field, and by the limits when labelled rad
+    let mut deg = good.clone();
+    deg["units"] = json!("deg");
+    let (s, r) = import(addr, &rad, &deg).await;
+    assert_eq!((s, r["code"].as_str(), r["reason"].as_str()), (422, Some("IMPORT_INVALID"), Some("units")), "{r}");
+    let deg_data = write(&common::INSPECT.map(f32::to_degrees));
+    let (_, r) = import(addr, &deg_data, &good).await;
+    assert_eq!(r["reason"], "soft_limit", "{r}");
+    // wrong joint order
+    let mut order = good.clone();
+    let mut swapped = names.clone();
+    swapped.swap(1, 2);
+    order["joint_names"] = json!(swapped);
+    let (_, r) = import(addr, &rad, &order).await;
+    assert_eq!(r["reason"], "joint_order", "{r}");
+    // not a parquet / not JSON
+    let (_, r) = import(addr, b"PAR1 nope", &good).await;
+    assert_eq!(r["reason"], "schema", "{r}");
+    assert!(sup.episode_store().await.list_episodes(None, None, None, &[]).is_empty(), "nothing stored");
+
+    // accepted: new id, source import, dataset created, not stale
+    let (s, r) = import(addr, &rad, &good).await;
+    assert_eq!(s, 200, "{r}");
+    let id = r["id"].as_str().unwrap().to_string();
+    assert!(armd::recording::is_ulid(&id) && r["stale"] == false);
+    let (_, one) = get(addr, &format!("/api/v1/episodes/{id}")).await;
+    assert_eq!((one["source"].as_str(), one["dataset"].as_str(), one["task"].as_str(), one["frames"].as_u64(), one["stale"].as_bool()),
+        (Some("import"), Some("pc"), Some("pour"), Some(50), Some(false)));
+    assert!(sup.episode_store().await.has_dataset("pc"));
+    // another joint zero: stored, stale
+    let mut z = good.clone();
+    z["joint_zero"] = json!({"offsets_rad": [0.0, 0.05, 0.0, 0.0, 0.0, 0.0, 0.0], "rev": "old"});
+    let (s, r) = import(addr, &rad, &z).await;
+    assert_eq!((s, r["stale"].as_bool()), (200, Some(true)), "{r}");
+    let (_, one) = get(addr, &format!("/api/v1/episodes/{}", r["id"].as_str().unwrap())).await;
+    assert_eq!(one["stale"], true);
+}

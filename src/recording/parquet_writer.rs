@@ -276,59 +276,51 @@ pub fn read_metadata_from_parquet(path: &Path) -> Result<Option<EpisodeMetadata>
 }
 
 /// Read back frames from a LeRobot Parquet file for verification
-pub fn read_frames_from_parquet(
-    path: &Path,
-) -> Result<Vec<RecordFrame>, ParquetRecordingError> {
-    let file = File::open(path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+pub fn read_frames_from_parquet(path: &Path) -> Result<Vec<RecordFrame>, ParquetRecordingError> {
+    read_frames_from(File::open(path)?)
+}
+
+/// Frames of an episode parquet held in memory (import).
+pub fn read_frames_from_bytes(bytes: axum::body::Bytes) -> Result<Vec<RecordFrame>, ParquetRecordingError> {
+    read_frames_from(bytes)
+}
+
+/// Columns `timestamp` (float64), `observation.state` and `action` (list<float32>), by name
+/// (else positions 0, 1, 2). Any other type is [`ParquetRecordingError::Corrupted`].
+fn read_frames_from<R: parquet::file::reader::ChunkReader + 'static>(input: R) -> Result<Vec<RecordFrame>, ParquetRecordingError> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(input)?;
     let reader = builder.build()?;
-
     let mut frames = Vec::new();
-
     for batch_res in reader {
         let batch = batch_res?;
-        let num_rows = batch.num_rows();
-
-        let ts_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or_else(|| ParquetRecordingError::Corrupted("timestamp column is not Float64Array".into()))?;
-
-        let obs_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| ParquetRecordingError::Corrupted("observation.state is not ListArray".into()))?;
-
-        let act_col = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| ParquetRecordingError::Corrupted("action is not ListArray".into()))?;
-
-        for i in 0..num_rows {
-            let timestamp = ts_col.value(i);
-
-            let obs_sub = obs_col.value(i);
-            let obs_f32 = obs_sub
-                .as_primitive::<arrow::datatypes::Float32Type>()
-                .values()
-                .to_vec();
-
-            let act_sub = act_col.value(i);
-            let act_f32 = act_sub
-                .as_primitive::<arrow::datatypes::Float32Type>()
-                .values()
-                .to_vec();
-
+        let schema = batch.schema();
+        let col = |name: &str, fallback: usize| -> Result<&ArrayRef, ParquetRecordingError> {
+            let i = schema.index_of(name).unwrap_or(fallback);
+            if i >= batch.num_columns() { return Err(ParquetRecordingError::Corrupted(format!("column {name} is missing"))); }
+            Ok(batch.column(i))
+        };
+        let ts_col = col("timestamp", 0)?.as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| ParquetRecordingError::Corrupted("timestamp column is not float64".into()))?;
+        let list = |name: &str, fallback: usize| -> Result<&ListArray, ParquetRecordingError> {
+            let a = col(name, fallback)?.as_any().downcast_ref::<ListArray>()
+                .ok_or_else(|| ParquetRecordingError::Corrupted(format!("{name} is not a list")))?;
+            if a.value_type() != DataType::Float32 {
+                return Err(ParquetRecordingError::Corrupted(format!("{name} items are {}, not float32", a.value_type())));
+            }
+            Ok(a)
+        };
+        let obs_col = list("observation.state", 1)?;
+        let act_col = list("action", 2)?;
+        for i in 0..batch.num_rows() {
+            if ts_col.is_null(i) || obs_col.is_null(i) || act_col.is_null(i) {
+                return Err(ParquetRecordingError::Corrupted(format!("row {i} has a null value")));
+            }
             frames.push(RecordFrame {
-                timestamp,
-                observation_state: obs_f32,
-                action: act_f32,
+                timestamp: ts_col.value(i),
+                observation_state: obs_col.value(i).as_primitive::<arrow::datatypes::Float32Type>().values().to_vec(),
+                action: act_col.value(i).as_primitive::<arrow::datatypes::Float32Type>().values().to_vec(),
             });
         }
     }
-
     Ok(frames)
 }
