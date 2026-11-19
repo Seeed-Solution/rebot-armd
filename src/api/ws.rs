@@ -904,6 +904,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         _ = &mut send_task => recv_task.abort(),
         _ = &mut recv_task => send_task.abort(),
     }
+    supervisor.recorder_connection_closed(&connection).await;
     let generation = connection_generation.load(Ordering::SeqCst);
     let mut inner = supervisor.inner().write().await;
     if generation != 0 && inner.release_lease(&connection, generation) {

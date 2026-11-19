@@ -211,6 +211,24 @@ impl ArmSupervisor {
     pub async fn stop_recording_as(&self, by: Stopper, save: bool, outcome: Option<&str>, writer: Option<ParquetWriter>) -> Result<Stopped, ArmError> {
         stop_recording(self.inner(), by, save, outcome, writer).await
     }
+    /// The owner `caller` stands for: its own connection's, or (taking the recording back) that
+    /// of a lost owner with the same client id. Anything else is not the owner.
+    pub async fn claim_recording(&self, caller: &Caller) -> RecorderOwner {
+        let me = RecorderOwner::Client { connection: caller.connection.clone(), client_id: caller.client_id.clone().unwrap_or_default() };
+        let mut inner = self.inner().write().await;
+        let Some(r) = inner.recording.as_mut() else { return me; };
+        if let RecorderOwner::Client { connection, client_id } = &mut r.owner {
+            if *connection == caller.connection { return r.owner.clone(); }
+            if r.owner_lost_at.is_some() && caller.client_id.as_deref() == Some(client_id.as_str()) {
+                *connection = caller.connection.clone();
+                r.owner_lost_at = None;
+                tracing::info!("Recording {} taken back by '{client_id}' on a new connection", r.id);
+                return r.owner.clone();
+            }
+        }
+        me
+    }
+
     /// A WS connection closed: a recording it owns is discarded after [`OWNER_LOST_DISCARD`]
     /// unless a connection with the same client id takes it back.
     pub async fn recorder_connection_closed(&self, connection: &str) {
@@ -371,7 +389,8 @@ async fn monitor(lock: Arc<RwLock<SupervisorInner>>, id: String) {
 
 /// Teach commands that need no motion lease (recorder ownership or nothing).
 pub fn is_lease_free(path: &str) -> bool {
-    matches!(path, "/api/v1/episodes/update" | "/api/v1/episodes/delete" | "/api/v1/datasets/create" | "/api/v1/datasets/delete")
+    matches!(path, "/api/v1/record/start" | "/api/v1/record/stop" | "/api/v1/episodes/update" | "/api/v1/episodes/delete"
+        | "/api/v1/datasets/create" | "/api/v1/datasets/delete")
 }
 
 fn str_field<'a>(body: &'a Value, key: &str) -> Result<Option<&'a str>, ArmError> {
@@ -398,11 +417,38 @@ pub struct Caller {
 /// Run a lease-free command; Ok = fields of the ack.
 pub async fn lease_free(sup: &Arc<ArmSupervisor>, caller: &Caller, path: &str, body: &Value) -> Result<Value, ArmError> {
     if !body.is_object() { return Err(rejected(400, "INVALID_COMMAND", "Command body must be an object")); }
-    let _ = caller;
     sup.ensure_episodes_loaded().await?;
     let st = sup.episode_store().await;
     if !st.enabled() { return Err(StoreError::Disabled.into()); }
     match path {
+        "/api/v1/record/start" => {
+            let client_id = caller.client_id.clone().filter(|c| !c.is_empty() && c.len() <= 128)
+                .ok_or_else(|| rejected(400, "INVALID_COMMAND", "client_id (1-128 characters) is required: in the message, or from acquire_lease on this connection"))?;
+            let options = RecordOptions {
+                dataset: str_field(body, "dataset")?.unwrap_or(store::DEFAULT_DATASET).to_string(),
+                task: str_field(body, "task")?.unwrap_or("").to_string(),
+                source: str_field(body, "source")?.unwrap_or("sdk").to_string(),
+                sequence_id: None, repeat_index: None,
+            };
+            let owner = RecorderOwner::Client { connection: caller.connection.clone(), client_id };
+            let (id, owner) = sup.start_recording_as(owner, options, None, None).await?;
+            Ok(json!({"recording_id": id, "owner": owner}))
+        }
+        "/api/v1/record/stop" => {
+            let save = match body.get("save") {
+                Some(Value::Bool(b)) => *b,
+                _ => return Err(rejected(400, "INVALID_COMMAND", "save must be a boolean")),
+            };
+            let outcome = str_field(body, "outcome")?.map(str::to_string);
+            let owner = sup.claim_recording(caller).await;
+            match sup.stop_recording_as(Stopper::Owner(owner), save, outcome.as_deref(), None).await? {
+                Stopped::Discarded => Ok(json!({"discarded": true})),
+                Stopped::Saved { sidecar, .. } => {
+                    let inner = sup.inner().read().await;
+                    Ok(json!({"episode": inner.episodes.view(&sidecar.id, &inner.joint_zero_offsets)}))
+                }
+            }
+        }
         "/api/v1/episodes/update" => {
             let id = required(body, "id")?.to_string();
             let task = str_field(body, "task")?.map(str::to_string);

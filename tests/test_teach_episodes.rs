@@ -262,3 +262,73 @@ async fn tick_timing_while_recording_and_saving() {
         saving.tick_us.p50, saving.tick_us.p99, saving.tick_us.max, saving.lock_us.p50, saving.lock_us.p99, saving.lock_us.max);
     assert!(rec.lock_us.p99 < 2000 && saving.lock_us.p99 < 5000, "{rec:?} {saving:?}");
 }
+
+// ---- recorder ownership (separate from the motion lease) ----
+
+async fn connect(addr: std::net::SocketAddr) -> common::TestSocket {
+    connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap().0
+}
+
+#[tokio::test]
+async fn recorder_ownership_other_clients_cannot_stop_and_disconnect_discards() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (addr, sup) = common::spawn_server(profile()).await;
+    sup.set_episodes_dir(Some(tmp.path().to_path_buf())).await;
+    // a lease holder (teleop) and two passive recorders without lease
+    let (mut lease_ws, _generation) = common::controller(addr).await;
+    let mut a = connect(addr).await;
+    let mut b = connect(addr).await;
+    // no client_id (none in the message, no lease on this connection): refused
+    let r = free_cmd(&mut a, "/api/v1/record/start", json!({"dataset": "default", "task": "wipe", "source": "hand_guide"})).await;
+    assert_eq!(r["code"], "INVALID_COMMAND", "{r}");
+    let r = free_cmd(&mut b, "/api/v1/record/start", json!({"dataset": "missing"})).await;
+    assert_eq!(r["code"], "INVALID_COMMAND", "{r}");
+    let start = |ws: &'static str| json!({"type":"command", "request_id": REQ.fetch_add(1, Ordering::Relaxed), "client_id": ws,
+        "path": "/api/v1/record/start", "body": {"task": "wipe", "source": "hand_guide"}});
+    let r = common::ws_reply(&mut a, start("page-a"), &["command_ack", "command_reject"]).await;
+    assert_eq!((r["type"].as_str(), r["owner"].as_str()), (Some("command_ack"), Some("page-a")), "{r}");
+    let rid = r["recording_id"].as_str().unwrap().to_string();
+    assert!(armd::recording::is_ulid(&rid));
+    // a second recording: RECORDER_BUSY with the owner
+    let r = common::ws_reply(&mut b, start("page-b"), &["command_ack", "command_reject"]).await;
+    assert_eq!((r["code"].as_str(), r["owner"].as_str()), (Some("RECORDER_BUSY"), Some("page-a")), "{r}");
+    // the legacy REST routes and another client cannot stop it
+    let res = reqwest::Client::new().post(format!("http://{addr}/api/v1/dataset/record/save")).send().await.unwrap();
+    assert_eq!(res.status().as_u16(), 409);
+    assert_eq!(res.json::<Value>().await.unwrap()["code"], "RECORDER_NOT_OWNER");
+    let stop = |client: &'static str, save: bool| json!({"type":"command", "request_id": REQ.fetch_add(1, Ordering::Relaxed), "client_id": client,
+        "path": "/api/v1/record/stop", "body": {"save": save}});
+    let r = common::ws_reply(&mut b, stop("page-b", true), &["command_ack", "command_reject"]).await;
+    assert_eq!((r["code"].as_str(), r["owner"].as_str()), (Some("RECORDER_NOT_OWNER"), Some("page-a")), "{r}");
+    // the lease holder neither (ownership is not the lease)
+    let r = common::ws_reply(&mut lease_ws, stop("test_controller", true), &["command_ack", "command_reject"]).await;
+    assert_eq!(r["code"], "RECORDER_NOT_OWNER", "{r}");
+    for _ in 0..10 { sup.tick(0.02).await; }
+    let r = common::ws_reply(&mut a, stop("page-a", true), &["command_ack", "command_reject"]).await;
+    assert_eq!((r["type"].as_str(), r["episode"]["id"].as_str(), r["episode"]["source"].as_str(), r["episode"]["task"].as_str()),
+        (Some("command_ack"), Some(rid.as_str()), Some("hand_guide"), Some("wipe")), "{r}");
+    assert_eq!(r["episode"]["frames"], 10);
+
+    // owner disconnect: discarded after 5 s
+    let r = common::ws_reply(&mut a, start("page-a"), &["command_ack", "command_reject"]).await;
+    let rid2 = r["recording_id"].as_str().unwrap().to_string();
+    for _ in 0..5 { sup.tick(0.02).await; }
+    drop(a);
+    tokio::time::sleep(Duration::from_millis(4000)).await;
+    assert!(sup.inner().read().await.recording.as_ref().is_some_and(|r| r.id == rid2 && r.owner_lost_at.is_some()), "kept for 5 s");
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    assert!(sup.inner().read().await.recording.is_none(), "discarded 5 s after the owner left");
+    assert!(!tmp.path().join(format!("{rid2}.parquet")).exists());
+    assert_eq!(sup.get_recording_state().await.0, armd::EpisodeState::Discarded);
+
+    // a reconnect with the same client id within 5 s takes the recording back
+    let mut c = connect(addr).await;
+    let r = common::ws_reply(&mut c, start("page-c"), &["command_ack", "command_reject"]).await;
+    let rid3 = r["recording_id"].as_str().unwrap().to_string();
+    for _ in 0..5 { sup.tick(0.02).await; }
+    drop(c);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut c2 = connect(addr).await;
+    let r = common::ws_reply(&mut c2, stop("page-c", true), &["command_ack", "command_reject"]).await;
+    assert_eq!(r["episode"]["id"].as_str(), Some(rid3.as_str()), "{r}");
+}
