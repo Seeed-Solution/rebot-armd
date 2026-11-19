@@ -377,6 +377,10 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .tch-body { gap: 10px; grid-template-columns: minmax(0, 1fr); }
 .tch-body > * { min-width: 0; }
 .tch-status { flex-shrink: 0; }
+.tch-start { flex-shrink: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.tch-start[hidden] { display: none; }
+.tch-start .btn { min-height: 40px; padding: 0 14px; font-size: 13px; }
+.tch-start small { flex: 1 1 160px; font-size: 12px; color: var(--sc-color-text-secondary); }
 .tch-status.bad { background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); }
 .tch.min .tch-tabs, .tch.min .tch-body, .tch.min .tch-status, .tch.min .tch-ask, .tch.min .tch-slot { display: none; }
 .tch.min { display: none; }
@@ -2016,6 +2020,10 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     </div>
     <div class="seg tch-tabs" id="teach-tabs" role="tablist" data-i18n-aria="tch.title" aria-label="点位与动作">
       <button type="button" role="tab" id="teach-tab-pose" data-tab="pose" data-i18n="tch.tab.pose">点位</button><button type="button" role="tab" id="teach-tab-seq" data-tab="seq" data-i18n="tch.tab.seq">动作</button><button type="button" role="tab" id="teach-tab-ep" data-tab="ep" data-i18n="tch.tab.ep">轨迹</button>
+    </div>
+    <div class="tch-start" id="teach-start-row">
+      <button class="btn" id="teach-start" type="button" data-i18n="tch.start">开始示教</button>
+      <small data-i18n="tch.start.hint">显示「记点 / 录轨迹」工具条，配合摇杆或拖动使用；拖动示教时会自动显示。</small>
     </div>
     <div class="tch-ask" id="teach-ask" role="alertdialog" aria-labelledby="teach-ask-t" hidden>
       <b id="teach-ask-t"></b>
@@ -9942,18 +9950,20 @@ function teachOnCaps() {
   if (!on) { TCH.teach = false; TCH.pick = []; if (TCH.open) teachOpen(false); }
   teachBarRender();
 }
-// the panel (editing); opening it also starts teaching (the strip), closing it keeps the strip
+// the panel (poses, motions, trajectories); opening it does not start the strip (前往 alone is not teaching)
 function teachOpen(open, { tab } = {}) {
   TCH.open = !!open && teachOn();
   if (tab) TCH.tab = tab;
   $('teach').hidden = !TCH.open;
-  if (TCH.open) { TCH.teach = true; teachRender(); teachLoad(true); $('teach-close').focus({ preventScroll: true }); }
+  if (TCH.open) { teachRender(); teachLoad(true); $('teach-close').focus({ preventScroll: true }); }
   $('btn-pset').setAttribute('aria-expanded', String(TCH.open));
   teachBarRender();
 }
-// the strip alone (teaching with the panel closed); off ends teaching (not while this page records)
+// the strip: started by hand-guiding, the hand-guide record button or 开始示教; stays with the panel closed; off ends
+// teaching (not while this page records)
 function teachStrip(on) {
   TCH.teach = !!on && teachOn();
+  if (TCH.teach) TCH.gcHide = false;
   if (TCH.teach && !TCH.loaded) teachLoad(true);
   teachBarRender();
 }
@@ -10622,9 +10632,13 @@ async function teachStripSave() { if (TCH.cur && TCH.dirty && !TCH.busy) await t
 const TCH_STRIP_AVOID = DOCK_AVOID + ', #btn-gc, #grip-range, #grip-col, #view-switch, #safety, #gc-banner, #pose-card, .presets, .hud, #btn-preempt';
 function teachBarRender() {
   const bar = $('teach-bar');
-  const show = teachOn() && (TCH.teach || !!TCH.rec);
+  // while hand-guiding the strip shows by itself (also when hand-guiding started elsewhere) until its × hides it
+  if (!gcOn()) TCH.gcHide = false;
+  const show = teachOn() && (TCH.teach || !!TCH.rec || (gcOn() && !TCH.gcHide));
   if (bar.hidden !== !show) { bar.hidden = !show; TCH.dockAt = 0; }
+  $('teach-start-row').hidden = show;
   if (!show) return;
+  if (!TCH.loaded && !TCH.loadReq) { TCH.loadReq = true; teachLoad(true); }
   const can = teachActive() && !teachRunning();
   $('tb-pose').disabled = !can;
   const rec = $('tb-rec');
@@ -10642,7 +10656,8 @@ function teachBarRender() {
 (() => {
   $('teach-close').addEventListener('click', () => teachOpen(false));
   $('tb-edit').addEventListener('click', () => { if (TCH.open) teachOpen(false); else teachOpen(true, { tab: TCH.cur ? 'seq' : 'pose' }); });
-  $('tb-x').addEventListener('click', () => { if (TCH.rec) return; teachOpen(false); teachStrip(false); });
+  $('tb-x').addEventListener('click', () => { if (TCH.rec) return; teachOpen(false); teachStrip(false); if (gcOn()) { TCH.gcHide = true; teachBarRender(); } });
+  $('teach-start').addEventListener('click', () => teachStrip(true));
   $('teach-tabs').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { TCH.tab = b.dataset.tab; TCH.edit = null; teachDisarm(); teachRender(); } });
   $('teach-tabs').addEventListener('keydown', (e) => {
     if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
