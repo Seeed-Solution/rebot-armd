@@ -997,7 +997,7 @@ pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
         "joint_zero": inner.calibration.as_ref().and_then(|c| c.joint_zero.as_ref()),
         "joint_zero_offsets": inner.joint_zero_offsets,
         "zero_reference": inner.config.zero_reference,
-        "zero_convention": inner.zero_convention,
+        "zero_convention": inner.config.zero_reference.as_ref().map(|_| &inner.zero_convention),
         "calibration_tools": inner.calibration_tools(),
         "grasp": inner.grasp_setup().map(|s| grasp_fields(&s)), "backups": list_backups(deps)})
 }
