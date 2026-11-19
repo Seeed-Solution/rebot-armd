@@ -176,7 +176,7 @@
     }
   },
   "workspace": {
-    "_link_capsules_note": "Derived from transformed collision STL meshes in assets/so101_new_calib.urdf: encloses 100% of collision vertices for upper_arm_link (max_dist 40.3mm <= r 45mm), lower_arm_link (34.0mm <= r 40mm), wrist_link (36.6mm <= r 42mm), and gripper_link (42.9mm <= r 44mm).",
+    "_link_capsules_note": "Derived from transformed collision STL meshes in assets/so101_new_calib.urdf: encloses 100% of collision vertices for upper_arm_link (max_dist 40.3mm <= r 41mm), lower_arm_link (34.0mm <= r 40mm), wrist_link (36.6mm <= r 42mm), and gripper_link (42.9mm <= r 43.5mm).",
     "floor_z_m": 0.0,
     "box_min_m": [
       -0.45,
@@ -202,7 +202,7 @@
         "frame": "upper_arm_link",
         "a_m": [-0.004, -0.008, 0.020],
         "b_m": [-0.112, -0.016, 0.020],
-        "radius_m": 0.045
+        "radius_m": 0.041
       },
       {
         "id": "lower_arm_link",
@@ -223,8 +223,12 @@
         "frame": "gripper_link",
         "a_m": [-0.002, -0.002, -0.018],
         "b_m": [-0.005, -0.002, -0.062],
-        "radius_m": 0.044
+        "radius_m": 0.0435
       }
+    ],
+    "self_collision_enabled": true,
+    "self_collision_pairs": [
+      ["upper_arm_link", "gripper_link"]
     ]
   },
   "grasp": {

@@ -246,6 +246,7 @@ impl SupervisorInner {
             None => "none",
         };
         let camera_mount_covered = workspace_active && c.camera_mount.offset_m.is_some();
+        let self_collision_covered = workspace_policy.is_some_and(|(ws, _)| ws.self_collision_covered());
         let workspace = workspace_policy.map(|(ws, cam)| json!({
             "floor_z_m": ws.floor_z_m,
             "box_min_m": ws.box_min_m,
@@ -256,6 +257,7 @@ impl SupervisorInner {
             "workspace_configured": workspace_configured,
             "geometry_coverage": geometry_coverage,
             "camera_mount_covered": cam.offset_m.is_some(),
+            "self_collision_covered": ws.self_collision_covered(),
         }));
         let keepout = self.keepout_state();
         let hw = c.hardware.clone().unwrap_or_default();
@@ -306,6 +308,7 @@ impl SupervisorInner {
                 "workspace_configured": workspace_configured,
                 "geometry_coverage": geometry_coverage,
                 "camera_mount_covered": camera_mount_covered,
+                "self_collision_covered": self_collision_covered,
                 "keepout_boxes": keepout.boxes,
                 "keepout_source": keepout.source,
                 "keepout_rule": "boxes in force = profile boxes + runtime boxes (each tagged with its source); the runtime list cannot remove a profile box",

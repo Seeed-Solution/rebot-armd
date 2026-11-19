@@ -181,6 +181,21 @@
     ],
     "link_capsules": [
       {
+        "id": "base_link",
+        "frame": "base_link",
+        "a_m": [
+          0.0,
+          0.0,
+          0.045
+        ],
+        "b_m": [
+          0.0,
+          0.0,
+          0.08
+        ],
+        "radius_m": 0.04
+      },
+      {
         "id": "link2",
         "frame": "link2",
         "a_m": [
@@ -239,7 +254,37 @@
           0.066
         ],
         "radius_m": 0.057
+      },
+      {
+        "id": "link6",
+        "frame": "link6",
+        "a_m": [
+          0.0,
+          0.0,
+          0.008
+        ],
+        "b_m": [
+          0.0,
+          0.0,
+          0.04
+        ],
+        "radius_m": 0.052
       }
+    ],
+    "self_collision_enabled": true,
+    "self_collision_pairs": [
+      [
+        "base_link",
+        "link4"
+      ],
+      [
+        "base_link",
+        "link5"
+      ],
+      [
+        "base_link",
+        "link6"
+      ]
     ]
   },
   "camera_mount": {

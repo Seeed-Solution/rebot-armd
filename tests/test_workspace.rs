@@ -430,7 +430,10 @@ fn stream_braking_crossing_outer_boundary_is_caught_and_held() {
 fn link_capsules_reject_upper_arm_intrusion_and_validate_frames() {
     // 6. link_capsules[]: end_effector safe while upper_arm capsule enters keepout box
     let mut cfg = ArmConfig::rebot_dm();
-    cfg.workspace.as_mut().unwrap().link_capsules = vec![armd::model::LinkCapsule {
+    let ws_mut = cfg.workspace.as_mut().unwrap();
+    ws_mut.self_collision_enabled = false;
+    ws_mut.self_collision_pairs.clear();
+    ws_mut.link_capsules = vec![armd::model::LinkCapsule {
         id: "upper_arm".into(),
         frame: "upper_arm".into(),
         a_m: [0.0, 0.0, 0.0],
@@ -1183,4 +1186,162 @@ fn so101_profile_link_capsules_positive_and_negative() {
     assert_eq!(detail.geometry_id.as_deref(), Some("capsule:lower_arm_link"), "{detail:?}");
     assert_eq!(detail.constraint_id.as_deref(), Some("keepout:so101_mid_link_wall"), "{detail:?}");
     assert_eq!(detail.violation_phase.as_deref(), Some("sweep"), "{detail:?}");
+}
+
+#[test]
+fn seg_seg_dist_covers_skew_parallel_crossing_and_degenerate_segments() {
+    use armd::chain::seg_seg_dist;
+    // Crossing orthogonal segments at (0.5, 0.5, 0)
+    assert!(seg_seg_dist(&[0.0, 0.5, 0.0], &[1.0, 0.5, 0.0], &[0.5, 0.0, 0.0], &[0.5, 1.0, 0.0]) < 1e-12);
+    // Skew orthogonal segments separated along Z by 0.25 m
+    let d_skew = seg_seg_dist(&[0.0, 0.0, 0.0], &[1.0, 0.0, 0.0], &[0.5, -1.0, 0.25], &[0.5, 1.0, 0.25]);
+    assert!((d_skew - 0.25).abs() < 1e-12, "d_skew={d_skew}");
+    // Parallel overlapping segments separated by 0.3 m
+    let d_par = seg_seg_dist(&[0.0, 0.0, 0.0], &[1.0, 0.0, 0.0], &[0.4, 0.3, 0.0], &[1.4, 0.3, 0.0]);
+    assert!((d_par - 0.3).abs() < 1e-12, "d_par={d_par}");
+    // Parallel disjoint segments: closest between (1,0,0) and (2,0.3,0)
+    let d_disjoint = seg_seg_dist(&[0.0, 0.0, 0.0], &[1.0, 0.0, 0.0], &[2.0, 0.3, 0.0], &[3.0, 0.3, 0.0]);
+    assert!((d_disjoint - (1.0f64 + 0.09).sqrt()).abs() < 1e-12, "d_disjoint={d_disjoint}");
+    // Degenerate point-to-segment and point-to-point
+    let d_pt_seg = seg_seg_dist(&[0.5, 0.4, 0.0], &[0.5, 0.4, 0.0], &[0.0, 0.0, 0.0], &[1.0, 0.0, 0.0]);
+    assert!((d_pt_seg - 0.4).abs() < 1e-12, "d_pt_seg={d_pt_seg}");
+    let d_pt_pt = seg_seg_dist(&[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0], &[0.0, 3.0, 4.0], &[0.0, 3.0, 4.0]);
+    assert!((d_pt_pt - 5.0).abs() < 1e-12, "d_pt_pt={d_pt_pt}");
+}
+
+#[test]
+fn self_collision_validation_positive_negative_sweep_and_servo() {
+    // 1. Config validation (fail-closed)
+    let mut bad_unknown = ArmConfig::rebot_dm();
+    bad_unknown.workspace.as_mut().unwrap().self_collision_enabled = false; // even when disabled!
+    bad_unknown.workspace.as_mut().unwrap().self_collision_pairs = vec![["base_link".into(), "nonexistent".into()]];
+    assert!(bad_unknown.validate().unwrap_err().contains("nonexistent"));
+
+    let mut bad_self_pair = ArmConfig::rebot_dm();
+    bad_self_pair.workspace.as_mut().unwrap().self_collision_pairs = vec![["link4".into(), "link4".into()]];
+    assert!(bad_self_pair.validate().is_err());
+
+    let mut bad_dup_pair = ArmConfig::rebot_dm();
+    bad_dup_pair.workspace.as_mut().unwrap().self_collision_pairs = vec![
+        ["base_link".into(), "link4".into()],
+        ["link4".into(), "base_link".into()],
+    ];
+    assert!(bad_dup_pair.validate().is_err());
+
+    let mut bad_clr = ArmConfig::rebot_dm();
+    bad_clr.workspace.as_mut().unwrap().self_collision_min_clearance_m = -0.001;
+    assert!(bad_clr.validate().is_err());
+    bad_clr.workspace.as_mut().unwrap().self_collision_min_clearance_m = f32::NAN;
+    assert!(bad_clr.validate().is_err());
+
+    // 2. Positive: B601-DM home, park, inspect, and grasp have >= 0 clearance on all self-collision slots
+    let dm = ArmConfig::rebot_dm();
+    let ws_dm = dm.workspace.as_ref().unwrap();
+    assert!(ws_dm.self_collision_enabled && !ws_dm.self_collision_pairs.is_empty());
+    let eval_dm = armd::chain::WorkspaceEvaluator::new(&ArmModel::REBOT_DEV_ARM, ws_dm, &dm.camera_mount);
+    assert_eq!(
+        eval_dm.total_slots,
+        eval_dm.self_collision_slot_start + ws_dm.self_collision_pairs.len()
+    );
+    let check_sc_nonneg = |eval: &armd::chain::WorkspaceEvaluator, q: &[f32], label: &str| {
+        let mut buf = eval.alloc_buf();
+        eval.eval_into(q, &mut buf, "test").unwrap();
+        for slot in eval.self_collision_slot_start..eval.total_slots {
+            let clr = buf.as_slice()[slot];
+            assert!(clr >= 0.0, "{label}: negative self-collision clearance {clr} at slot {slot}");
+        }
+    };
+    check_sc_nonneg(&eval_dm, &HOME, "B601-DM HOME");
+    check_sc_nonneg(&eval_dm, dm.resting_positions(), "B601-DM PARK");
+    check_sc_nonneg(&eval_dm, &INSPECT, "B601-DM INSPECT");
+
+    // 3. Negative (B601-DM): folded self-collision pose triggers WORKSPACE_VIOLATION with self_collision:*
+    // (keep end-effector well above floor_z=0 so self_collision is the only violated constraint)
+    let q_fold_dm: [f32; 7] = [0.0, -0.1, -0.1, 1.5, 1.5, std::f32::consts::FRAC_PI_2, 0.0];
+    let mut c_home = eval_dm.alloc_buf();
+    let mut c_fold = eval_dm.alloc_buf();
+    eval_dm.eval_into(&HOME, &mut c_home, "plan").unwrap();
+    eval_dm.eval_into(&q_fold_dm, &mut c_fold, "plan").unwrap();
+    let mut md = eval_dm.init_min_depths(&c_home);
+    let fail = eval_dm.check_and_advance(&c_fold, &mut md, "plan").unwrap_err();
+    let cid = fail.detail.constraint_id.as_deref().unwrap();
+    assert!(cid.starts_with("self_collision:"), "expected self_collision:*, got {fail:?}");
+    assert_eq!(fail.detail.geometry_id.as_deref(), Some("capsule:base_link"));
+
+    let mut inner = armed(dm.clone(), &HOME);
+    let err = inner.jog(q_fold_dm.to_vec(), None, None).unwrap_err();
+    let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
+        panic!("expected WorkspaceViolation on B601-DM self-fold, got {err:?}");
+    };
+    assert!(detail.constraint_id.as_deref().is_some_and(|s| s.starts_with("self_collision:")), "{detail:?}");
+
+    // 4. Swept self-collision (violation_phase == "sweep"): both endpoints clear, midpoint collides
+    // Keep J2=-0.3, J3=-0.2, J5=1.5, and sweep J4 from 0.0 to 3.14 so midpoint J4=1.57 swings into base_link.
+    let q_sw_a: [f32; 7] = [0.0, -0.3, -0.2, 0.0, 1.5, std::f32::consts::FRAC_PI_2, 0.0];
+    let q_sw_b: [f32; 7] = [0.0, -0.3, -0.2, 3.14, 1.5, std::f32::consts::FRAC_PI_2, 0.0];
+    assert_eval_clear(&ArmModel::REBOT_DEV_ARM, ws_dm, &dm.camera_mount, &q_sw_a, "DM sweep start");
+    assert_eval_clear(&ArmModel::REBOT_DEV_ARM, ws_dm, &dm.camera_mount, &q_sw_b, "DM sweep end");
+    let mut inner_sw = armed(dm.clone(), &q_sw_a);
+    let err = inner_sw.jog(q_sw_b.to_vec(), None, None).unwrap_err();
+    let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
+        panic!("expected WorkspaceViolation on swept self-collision, got {err:?}");
+    };
+    assert!(detail.constraint_id.as_deref().is_some_and(|s| s.starts_with("self_collision:")), "{detail:?}");
+    assert_eq!(detail.violation_phase.as_deref(), Some("sweep"), "{detail:?}");
+
+    // 5. Servo target rejection & monotonic escape from self-collision
+    let q_edge_ok = lerp(&HOME, &q_fold_dm, 0.25);
+    let mut prev_ok = q_edge_ok.clone();
+    let mut first_bad = q_fold_dm.to_vec();
+    for k in 1..=200 {
+        let q = lerp(&HOME, &q_fold_dm, k as f32 / 200.0);
+        let mut buf = eval_dm.alloc_buf();
+        eval_dm.eval_into(&q, &mut buf, "test").unwrap();
+        if buf.as_slice()[eval_dm.self_collision_slot_start..].iter().any(|&c| c < -kinematics::WORKSPACE_EPS) {
+            first_bad = q;
+            break;
+        }
+        prev_ok = q;
+    }
+    let mut inner_sv = armed(dm.clone(), &prev_ok);
+    let epoch = inner_sv.safety.epoch_id();
+    let err = inner_sv.servo(first_bad, epoch).unwrap_err();
+    let SafetyError::WorkspaceViolation { detail, .. } = &err else { panic!("{err:?}") };
+    assert!(detail.constraint_id.as_deref().is_some_and(|s| s.starts_with("self_collision:")), "{detail:?}");
+    assert_eq!(detail.violation_phase.as_deref(), Some("servo_target"), "{detail:?}");
+    // Monotonic escape: lifting J3 away from base_link strictly reduces all self-collision intrusions
+    let mut q_retreat = q_fold_dm;
+    q_retreat[2] -= 0.15;
+    let mut inner_esc = armed(dm.clone(), &q_fold_dm);
+    let epoch_esc = inner_esc.safety.epoch_id();
+    inner_esc.servo(q_retreat.to_vec(), epoch_esc).expect("retreating out of self-collision must be allowed");
+
+    // 6. self_collision_min_clearance_m margin shifts clearance and triggers when gap < min_clearance_m
+    let mut dm_margin = dm;
+    dm_margin.workspace.as_mut().unwrap().self_collision_min_clearance_m = 0.08;
+    dm_margin.validate().unwrap();
+    let mut inner_margin = armed(dm_margin, &INSPECT);
+    let err = inner_margin.jog(HOME.to_vec(), None, None).unwrap_err();
+    let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
+        panic!("expected WorkspaceViolation when min_clearance_m=0.08 > HOME clearance, got {err:?}");
+    };
+    assert!(detail.constraint_id.as_deref().is_some_and(|s| s.starts_with("self_collision:")), "{detail:?}");
+
+    // 7. SO-ARM101 positive (home, park) and negative (self-fold)
+    let mut so = ArmConfig::from_profile_file("profiles/so_arm101.json").unwrap();
+    so.validate().unwrap();
+    let ws_so = so.workspace.as_ref().unwrap();
+    assert!(ws_so.self_collision_enabled && !ws_so.self_collision_pairs.is_empty());
+    let eval_so = armd::chain::WorkspaceEvaluator::new(&so.arm_model, ws_so, &so.camera_mount);
+    check_sc_nonneg(&eval_so, &so.home_positions, "SO-101 HOME");
+    check_sc_nonneg(&eval_so, so.resting_positions(), "SO-101 PARK");
+
+    let q_fold_so = vec![0.0f32, -1.65, 1.55, 1.60, 0.0, 0.0];
+    let mut inner_so = armed(so.clone(), so.resting_positions());
+    let err = inner_so.jog(q_fold_so, None, None).unwrap_err();
+    let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
+        panic!("expected WorkspaceViolation on SO-101 self-fold, got {err:?}");
+    };
+    assert_eq!(detail.constraint_id.as_deref(), Some("self_collision:upper_arm_link:gripper_link"), "{detail:?}");
+    assert_eq!(detail.geometry_id.as_deref(), Some("capsule:upper_arm_link"), "{detail:?}");
 }

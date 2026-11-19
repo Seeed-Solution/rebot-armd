@@ -678,12 +678,14 @@ impl ArmModel {
                     }
                 }
             };
+            let mut world_caps = Vec::with_capacity(ws.link_capsules.len());
             for (ci, cap) in ws.link_capsules.iter().enumerate() {
                 let Some(fr) = self.resolve_frame(&cap.frame) else { return k::Violation::invalid(); };
                 let pose = fr.pose(&f);
                 let a = pose.transform_point(&cap.a_m.map(f64::from));
                 let b = pose.transform_point(&cap.b_m.map(f64::from));
                 let r = f64::from(cap.radius_m);
+                world_caps.push((a, b, r));
                 let pt = base_pt + ci;
                 let z_min = a[2].min(b[2]) - r;
                 note(floor - z_min, pt, "floor", z_min, floor, None);
@@ -698,9 +700,75 @@ impl ArmModel {
                     note(-clr, pt, "keepout", -clr, 0.0, Some(bi));
                 }
             }
+            if ws.self_collision_enabled {
+                let min_clr = f64::from(ws.self_collision_min_clearance_m);
+                if !min_clr.is_finite() || min_clr < 0.0 {
+                    return k::Violation::invalid();
+                }
+                for [id_a, id_b] in &ws.self_collision_pairs {
+                    let Some(ia) = ws.link_capsules.iter().position(|c| c.id == *id_a) else {
+                        return k::Violation::invalid();
+                    };
+                    let Some(ib) = ws.link_capsules.iter().position(|c| c.id == *id_b) else {
+                        return k::Violation::invalid();
+                    };
+                    if ia == ib {
+                        return k::Violation::invalid();
+                    }
+                    let (a0, a1, ra) = world_caps[ia];
+                    let (b0, b1, rb) = world_caps[ib];
+                    let dist = seg_seg_dist(&a0, &a1, &b0, &b1);
+                    let clr = dist - (ra + rb) - min_clr;
+                    note(-clr, base_pt + ia, "self_collision", min_clr + clr, min_clr, None);
+                }
+            }
         }
         v
     }
+}
+
+/// Shortest Euclidean distance between 3D line segments `[p1, q1]` and `[p2, q2]`.
+pub fn seg_seg_dist(p1: &Vec3, q1: &Vec3, p2: &Vec3, q2: &Vec3) -> f64 {
+    const LEN2_EPS: f64 = 1e-18;
+    const PARALLEL_EPS: f64 = 1e-14;
+    let d1 = k::sub(q1, p1);
+    let d2 = k::sub(q2, p2);
+    let r = k::sub(p1, p2);
+    let a = k::dot(&d1, &d1);
+    let e = k::dot(&d2, &d2);
+    let f = k::dot(&d2, &r);
+
+    let (s, t) = if a <= LEN2_EPS && e <= LEN2_EPS {
+        (0.0, 0.0)
+    } else if a <= LEN2_EPS {
+        (0.0, (f / e).clamp(0.0, 1.0))
+    } else {
+        let c = k::dot(&d1, &r);
+        if e <= LEN2_EPS {
+            ((-c / a).clamp(0.0, 1.0), 0.0)
+        } else {
+            let b = k::dot(&d1, &d2);
+            let denom = a * e - b * b;
+            let mut s = if denom > PARALLEL_EPS * a * e {
+                ((b * f - c * e) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let mut t = (b * s + f) / e;
+            if t < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t > 1.0 {
+                t = 1.0;
+                s = ((b - c) / a).clamp(0.0, 1.0);
+            }
+            (s, t)
+        }
+    };
+
+    let c1 = k::add(p1, &[d1[0] * s, d1[1] * s, d1[2] * s]);
+    let c2 = k::add(p2, &[d2[0] * t, d2[1] * t, d2[2] * t]);
+    k::norm(&k::sub(&c1, &c2))
 }
 
 /// Resolved kinematic frame for a `LinkCapsule`.
@@ -723,6 +791,40 @@ impl FrameRef {
             Self::End => f.end,
         }
     }
+
+    /// Number of proximal arm joints (`0..=arm_dof`) that move this frame.
+    fn active_joints(&self, arm_dof: usize) -> usize {
+        match *self {
+            Self::BaseRel(_, _) => 0,
+            Self::SegRel(j, _, _) => (j + 1).min(arm_dof),
+            Self::End => arm_dof,
+        }
+    }
+}
+
+fn pair_relative_reach(
+    arm_dof: usize,
+    fr_a: Option<FrameRef>,
+    reach_a: &[f64; MAX_CHAIN_JOINTS],
+    fr_b: Option<FrameRef>,
+    reach_b: &[f64; MAX_CHAIN_JOINTS],
+) -> [f64; MAX_CHAIN_JOINTS] {
+    let (Some(fa), Some(fb)) = (fr_a, fr_b) else {
+        return [f64::INFINITY; MAX_CHAIN_JOINTS];
+    };
+    let sa = fa.active_joints(arm_dof);
+    let sb = fb.active_joints(arm_dof);
+    let mut out = [0.0; MAX_CHAIN_JOINTS];
+    match sa.cmp(&sb) {
+        std::cmp::Ordering::Less => {
+            out[sa..sb].copy_from_slice(&reach_b[sa..sb]);
+        }
+        std::cmp::Ordering::Greater => {
+            out[sb..sa].copy_from_slice(&reach_a[sb..sa]);
+        }
+        std::cmp::Ordering::Equal => {}
+    }
+    out
 }
 
 impl ArmModel {
@@ -850,7 +952,7 @@ impl WorkspaceFailure {
     }
 }
 
-/// Precomputed per-constraint workspace evaluator (points + optional link capsules).
+/// Precomputed per-constraint workspace evaluator (points + optional link capsules + optional self-collision pairs).
 #[derive(Debug, Clone)]
 pub struct WorkspaceEvaluator<'a> {
     pub model: &'a ArmModel,
@@ -864,12 +966,15 @@ pub struct WorkspaceEvaluator<'a> {
     end_locals: Vec<[f64; 3]>,
     has_cam: bool,
     capsules: Vec<(Option<FrameRef>, [f64; 3], [f64; 3], f64)>,
+    self_pairs: Vec<Option<(usize, usize, [f64; MAX_CHAIN_JOINTS])>>,
+    self_collision_min_clearance: f64,
     pub end_reach: [f64; MAX_CHAIN_JOINTS],
     pub cap_reaches: Vec<[f64; MAX_CHAIN_JOINTS]>,
     pub slots_per_geom: usize,
     pub num_end_pts: usize,
     pub num_geoms: usize,
     pub has_reach: bool,
+    pub self_collision_slot_start: usize,
     pub total_slots: usize,
 }
 
@@ -906,6 +1011,30 @@ impl<'a> WorkspaceEvaluator<'a> {
             cap_reaches.push(reach);
         }
 
+        let arm_dof = model.arm_dof();
+        let mut self_pairs = Vec::new();
+        if ws.self_collision_enabled && !ws.link_capsules.is_empty() {
+            self_pairs.reserve(ws.self_collision_pairs.len());
+            for [id_a, id_b] in &ws.self_collision_pairs {
+                let ia = ws.link_capsules.iter().position(|c| c.id == *id_a);
+                let ib = ws.link_capsules.iter().position(|c| c.id == *id_b);
+                let resolved = match (ia, ib) {
+                    (Some(a), Some(b)) if a != b => {
+                        let reach = pair_relative_reach(
+                            arm_dof,
+                            capsules[a].0,
+                            &cap_reaches[a],
+                            capsules[b].0,
+                            &cap_reaches[b],
+                        );
+                        Some((a, b, reach))
+                    }
+                    _ => None,
+                };
+                self_pairs.push(resolved);
+            }
+        }
+
         let keepouts: Vec<([f64; 3], [f64; 3])> = ws
             .keepout_boxes
             .iter()
@@ -916,7 +1045,8 @@ impl<'a> WorkspaceEvaluator<'a> {
         let num_geoms = num_end_pts + capsules.len();
         let slots_per_geom = 7 + keepouts.len();
         let has_reach = ws.max_reach_m.is_some();
-        let total_slots = num_geoms * slots_per_geom + usize::from(has_reach);
+        let self_collision_slot_start = num_geoms * slots_per_geom + usize::from(has_reach);
+        let total_slots = self_collision_slot_start + self_pairs.len();
 
         Self {
             model,
@@ -930,12 +1060,15 @@ impl<'a> WorkspaceEvaluator<'a> {
             end_locals,
             has_cam,
             capsules,
+            self_pairs,
+            self_collision_min_clearance: f64::from(ws.self_collision_min_clearance_m),
             end_reach,
             cap_reaches,
             slots_per_geom,
             num_end_pts,
             num_geoms,
             has_reach,
+            self_collision_slot_start,
             total_slots,
         }
     }
@@ -987,6 +1120,14 @@ impl<'a> WorkspaceEvaluator<'a> {
                 buf[base + 7 + bi] = -depth;
             }
         }
+        let mut stack_caps = [([0.0f64; 3], [0.0f64; 3], 0.0f64); crate::model::MAX_LINK_CAPSULES];
+        let mut heap_caps = Vec::new();
+        let world_caps: &mut [([f64; 3], [f64; 3], f64)] = if self.capsules.len() <= stack_caps.len() {
+            &mut stack_caps[..self.capsules.len()]
+        } else {
+            heap_caps.resize(self.capsules.len(), ([0.0; 3], [0.0; 3], 0.0));
+            &mut heap_caps
+        };
         for (ci, (fr_opt, a_local, b_local, radius)) in self.capsules.iter().enumerate() {
             let Some(fr) = fr_opt else {
                 let cap = &self.ws.link_capsules[ci];
@@ -1006,6 +1147,7 @@ impl<'a> WorkspaceEvaluator<'a> {
             let pose = fr.pose(&f);
             let a = pose.transform_point(a_local);
             let b = pose.transform_point(b_local);
+            world_caps[ci] = (a, b, *radius);
             let base = (self.num_end_pts + ci) * self.slots_per_geom;
             buf[base] = a[2].min(b[2]) - *radius - self.floor;
             for axis in 0..3 {
@@ -1020,6 +1162,24 @@ impl<'a> WorkspaceEvaluator<'a> {
             let p0 = f.end.p;
             let d = k::shoulder_reach_from(&p0, &self.shoulder);
             buf[self.num_geoms * self.slots_per_geom] = f64::from(reach) - d;
+        }
+        if !self.self_pairs.is_empty() {
+            if !self.self_collision_min_clearance.is_finite() || self.self_collision_min_clearance < 0.0 {
+                return Err(WorkspaceFailure::invalid(phase, "invalid self_collision_min_clearance_m"));
+            }
+            for (pi, pair) in self.self_pairs.iter().enumerate() {
+                let Some(&(ia, ib, _)) = pair.as_ref() else {
+                    let msg = self.ws.self_collision_pairs.get(pi).map_or_else(
+                        || "invalid self-collision pair".to_string(),
+                        |[a, b]| format!("unknown or invalid self_collision pair ['{a}', '{b}']"),
+                    );
+                    return Err(WorkspaceFailure::invalid(phase, msg));
+                };
+                let (a0, a1, ra) = world_caps[ia];
+                let (b0, b1, rb) = world_caps[ib];
+                let dist = seg_seg_dist(&a0, &a1, &b0, &b1);
+                buf[self.self_collision_slot_start + pi] = dist - (ra + rb) - self.self_collision_min_clearance;
+            }
         }
         Ok(())
     }
@@ -1041,6 +1201,34 @@ impl<'a> WorkspaceEvaluator<'a> {
                 format!("deepened {cid} intrusion from {min_d:.3}m to {depth:.3}m (geometry {gid})")
             }
         };
+        if slot >= self.self_collision_slot_start {
+            let pi = slot - self.self_collision_slot_start;
+            let (id_a, id_b) = self
+                .ws
+                .self_collision_pairs
+                .get(pi)
+                .map_or(("?", "?"), |[a, b]| (a.as_str(), b.as_str()));
+            let cid = format!("self_collision:{id_a}:{id_b}");
+            let gid = format!("capsule:{id_a}");
+            let point = self
+                .self_pairs
+                .get(pi)
+                .and_then(|p| p.as_ref())
+                .map_or(0, |(ia, _, _)| self.num_end_pts + ia);
+            let reason = reason_for(&cid, &gid);
+            return WorkspaceFailure {
+                point,
+                limit: format!("self_collision '{id_a}' vs '{id_b}'"),
+                value: self.self_collision_min_clearance + clr,
+                bound: self.self_collision_min_clearance,
+                detail: k::WorkspaceViolationDetail {
+                    constraint_id: Some(cid),
+                    geometry_id: Some(gid),
+                    violation_phase: Some(phase.into()),
+                    reason: Some(reason),
+                },
+            };
+        }
         if self.has_reach && slot == self.num_geoms * self.slots_per_geom {
             let bound = f64::from(self.ws.max_reach_m.unwrap_or(0.0));
             let cid = "max_reach".to_string();
@@ -1182,7 +1370,19 @@ impl<'a> WorkspaceEvaluator<'a> {
         let s1 = c1.as_slice();
         let md = min_depths.as_slice();
         for slot in 0..self.total_slots {
-            let l_g = bounds[self.slot_geom(slot)];
+            let l_g = if slot >= self.self_collision_slot_start {
+                let pi = slot - self.self_collision_slot_start;
+                let Some((_, _, reach)) = &self.self_pairs[pi] else {
+                    return Err(WorkspaceFailure::invalid("sweep", "invalid self-collision pair"));
+                };
+                let v: f64 = tr.iter().take(arm_dof).zip(reach).map(|(d, r)| d * r).sum();
+                if !v.is_finite() {
+                    return Err(WorkspaceFailure::invalid("sweep", "non-finite joint travel bound"));
+                }
+                v
+            } else {
+                bounds[self.slot_geom(slot)]
+            };
             if l_g <= 0.0 {
                 continue;
             }

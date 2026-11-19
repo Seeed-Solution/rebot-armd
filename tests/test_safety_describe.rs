@@ -243,7 +243,10 @@ async fn geometry_coverage_reports_configured_unconfigured_and_camera_mount() {
     assert!(ws["check_points_end_m"].is_array());
 
     let mut end_only_cfg = ArmConfig::rebot_dm();
-    end_only_cfg.workspace.as_mut().unwrap().link_capsules.clear();
+    let end_only_ws = end_only_cfg.workspace.as_mut().unwrap();
+    end_only_ws.link_capsules.clear();
+    end_only_ws.self_collision_enabled = false;
+    end_only_ws.self_collision_pairs.clear();
     let d_end_only = describe(&ArmSupervisor::new(end_only_cfg)).await;
     assert_eq!(d_end_only["limits"]["geometry_coverage"], "end_only");
     assert_eq!(d_end_only["limits"]["workspace"]["geometry_coverage"], "end_only");
@@ -276,4 +279,55 @@ async fn geometry_coverage_reports_configured_unconfigured_and_camera_mount() {
     assert_eq!(d_no_kin["limits"]["workspace_configured"], true);
     assert_eq!(d_no_kin["limits"]["geometry_coverage"], "none");
     assert_eq!(d_no_kin["limits"]["camera_mount_covered"], false);
+    assert_eq!(d_no_kin["limits"]["self_collision_covered"], false);
+}
+
+#[tokio::test]
+async fn self_collision_covered_is_independent_of_geometry_coverage() {
+    let dm = describe(&ArmSupervisor::new(ArmConfig::rebot_dm())).await;
+    assert_eq!(dm["limits"]["geometry_coverage"], "end_and_links");
+    assert_eq!(dm["limits"]["self_collision_covered"], true);
+    assert_eq!(dm["limits"]["workspace"]["self_collision_covered"], true);
+
+    let mut so = ArmConfig::from_profile_file("profiles/so_arm101.json").unwrap();
+    so.validate().unwrap();
+    let d_so = describe(&ArmSupervisor::new(so)).await;
+    assert_eq!(d_so["limits"]["geometry_coverage"], "end_and_links");
+    assert_eq!(d_so["limits"]["self_collision_covered"], true);
+    assert_eq!(d_so["limits"]["workspace"]["self_collision_covered"], true);
+
+    let d_default = describe(&ArmSupervisor::new(ArmConfig::default())).await;
+    assert_eq!(d_default["limits"]["self_collision_covered"], false);
+
+    let mut rs = ArmConfig::from_profile_file("profiles/rebot_b601_rs.json").unwrap();
+    rs.validate().unwrap();
+    let d_rs = describe(&ArmSupervisor::new(rs)).await;
+    assert_eq!(d_rs["limits"]["geometry_coverage"], "end_only");
+    assert_eq!(d_rs["limits"]["self_collision_covered"], false);
+    assert_eq!(d_rs["limits"]["workspace"]["self_collision_covered"], false);
+
+    // Disabled self-collision while link_capsules remain present -> geometry_coverage still "end_and_links", self_collision_covered false
+    let mut disabled = ArmConfig::rebot_dm();
+    disabled.workspace.as_mut().unwrap().self_collision_enabled = false;
+    let d_dis = describe(&ArmSupervisor::new(disabled)).await;
+    assert_eq!(d_dis["limits"]["geometry_coverage"], "end_and_links");
+    assert_eq!(d_dis["limits"]["self_collision_covered"], false);
+    assert_eq!(d_dis["limits"]["workspace"]["self_collision_covered"], false);
+
+    // Enabled with empty pairs -> false
+    let mut empty_pairs = ArmConfig::rebot_dm();
+    empty_pairs.workspace.as_mut().unwrap().self_collision_pairs.clear();
+    let d_empty = describe(&ArmSupervisor::new(empty_pairs)).await;
+    assert_eq!(d_empty["limits"]["self_collision_covered"], false);
+
+    // Enabled with invalid pair id -> validate fails closed, and self_collision_covered is false
+    let mut bad_pair = ArmConfig::rebot_dm();
+    bad_pair.workspace.as_mut().unwrap().self_collision_pairs.push(["base_link".into(), "missing".into()]);
+    assert!(bad_pair.validate().is_err());
+    assert!(!bad_pair.workspace.as_ref().unwrap().self_collision_covered());
+    let sup_mut = ArmSupervisor::new(ArmConfig::rebot_dm());
+    sup_mut.inner().write().await.config.workspace.as_mut().unwrap()
+        .self_collision_pairs.push(["base_link".into(), "missing".into()]);
+    let d_bad = describe(&sup_mut).await;
+    assert_eq!(d_bad["limits"]["self_collision_covered"], false);
 }
