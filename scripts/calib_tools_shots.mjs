@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // Headless screenshots of the calibration tools (no armd needed): the Tools group of the settings
-// drawer (entries from capabilities.calibration_tools, stale camera calibration warning, release
-// control), the stale banner in the cockpit, the gripper tool and the motor zero tool (park while
-// torqued, the 3D view with the zero pose as the ghost, joint table with a joint > 45 deg and the force
-// box, two-tap confirm against stubbed dry-run / run replies, result with the invalidated calibrations).
+// drawer (entries from capabilities.calibration_tools, stale camera calibration warning, legacy J6 zero
+// warning with its button, stale poses warning, release control), the stale banner in the cockpit, the
+// gripper tool and the zero tool (park while torqued, the 3D view with the rest pose as the ghost, the
+// method choice, joint table with a joint > 45 deg from the rest pose and the force box, two-tap confirm
+// against stubbed dry-run / run replies, result with the invalidated calibrations and the undo).
 // The 3D view loads src/api/vendor/three-urdf.min.js.gz and /assets/model/* from MODEL_DIR (default the
 // recamera-b601dm rootfs assets; missing files give the stick figure).
 //   PLAYWRIGHT=/path/to/playwright/index.mjs CHROME=/path/to/chrome node scripts/calib_tools_shots.mjs
@@ -33,11 +34,11 @@ const TOOLS = {
     supported: true, method: 'set_current', persist: 'motor_flash', persist_verified: false,
     notes: ['Damiao set-zero frame', 'Not verified on hardware whether the zero survives a power cycle'],
     joints: [1, 2, 3, 4, 5, 6, 7], requires: ['lease', 'torque_off', 'no_action', 'no_fault'], max_offset_deg: 45, verify_mrad: 10,
-    invalidates: ['kinematics', 'camera'],
+    invalidates: ['kinematics', 'camera', 'poses', 'gripper_calibration'], motor: true, software: true, methods: ['software', 'motor'],
     zero_pose: {
-      description: 'Folded like the home pose: upper arm level pointing back from the shoulder, forearm folded back over it, gripper level pointing straight forward (tool about 0.26 m in front of the base, 0.19 m high).',
+      description: 'The folded rest pose (the home and park pose): upper arm level pointing back from the shoulder, forearm folded back over it, gripper level pointing straight forward, jaws opening sideways, gripper fully closed (tool about 0.26 m in front of the base, 0.19 m high). Every joint reads 0 here after the zero.',
       joints: ['J1 base: arm plane facing forward (+x)', 'J2 shoulder: upper arm level, pointing back', 'J3 elbow: forearm folded back over the upper arm',
-        'J4 wrist pitch: gripper level', 'J5 wrist yaw: gripper pointing straight forward', 'J6 wrist roll: motor 0, jaws open up/down (the home pose has J6 at +90 deg, jaws open sideways)'],
+        'J4 wrist pitch: gripper level', 'J5 wrist yaw: gripper pointing straight forward', 'J6 wrist roll: as folded in the rest pose, jaws opening sideways, camera holder on top'],
       gripper: 'Gripper fully closed',
     },
   },
@@ -49,7 +50,9 @@ const srv = http.createServer((req, res) => {
   const u = req.url.split('?')[0];
   if (u === '/' || u === '/index.html') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(html); return; }
   if (u === '/assets/calib_wizard.js') { res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8' }); res.end(js); return; }
-  if (u === '/api/v1/calibration') return send(res, 200, { calibrated: true, busy: false, stale: STALE, calibration_tools: TOOLS, backups: [] });
+  if (u === '/api/v1/calibration') return send(res, 200, { calibrated: true, busy: false, stale: STALE, calibration_tools: TOOLS, backups: [],
+    zero_convention: { status: 'legacy_j6', j6_rad: 1.574, message: 'J6 reads 90.2 deg in the rest pose' },
+    stale_list: [{ item: 'camera', ...STALE }, { item: 'poses', reason: 'motor zero of joints [2, 3]; taught with the old zero', at: STALE.at, names: ['scan', 'bin_a'] }] });
   if (u === '/api/v1/gripper/calibration') return send(res, 200, { offset_rad: 0.012, calibrated: false });
   if (u === '/assets/three-urdf.min.js') { res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8', 'content-encoding': 'gzip' }); res.end(bundle); return; }
   if (u.startsWith('/assets/model/')) {
@@ -118,7 +121,10 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     const g = await page.evaluate(() => ({
       entries: [...document.querySelectorAll('#tools-list .tool-item')].map((b) => b.id),
       stale: !$('tools-stale').hidden, rel: !$('tools-release').disabled, btn: !$('btn-sset').hidden,
+      legacy: !$('tools-zero').hidden && $('tools-zero').textContent.includes('90.2') && !!$('tools-zero-open'),
+      poses: !$('tools-stale2').hidden && $('tools-stale2').textContent.includes('scan, bin_a'),
     }));
+    if (!g.legacy || !g.poses) fail(`legacy J6 / stale poses warnings ${lang}/${vpName}: ${JSON.stringify(g)}`);
     const want = ['tool-camera', 'tool-kinematics', 'tool-gripper'];
     if (await page.evaluate(() => typeof mzOpen === 'function')) want.unshift('tool-motor_zero');
     if (JSON.stringify(g.entries) !== JSON.stringify(want) || !g.stale || !g.rel || !g.btn) fail(`tools group ${lang}/${vpName}: ${JSON.stringify(g)}`);
@@ -150,8 +156,10 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     await page.evaluate(() => { S.obs.is_torqued = true; S.obs.positions = [0.02, -0.05, 0.08, 0.01, -0.03, 0.9, 0.02]; ssetOpen(true); $('tool-motor_zero').click(); });
     await page.waitForTimeout(1500);
     const m1 = await page.evaluate(() => ({ park: !!$('mz-park'), rows: document.querySelectorAll('#mzero-body .mz-table tr').length, go: $('mz-go')?.disabled,
-      v3: V3.open, ghost: !!(MZ.previewQ && MZ.previewQ.every((v) => v === 0)) }));
-    if (!m1.park || m1.rows !== 8 || !m1.go || !m1.v3 || !m1.ghost) fail(`motor zero torqued ${lang}/${vpName}: ${JSON.stringify(m1)}`);
+      v3: V3.open, ghost: !!(MZ.previewQ && MZ.previewQ.every((v) => v === 0)),
+      methods: [...document.querySelectorAll('#mzero-body input[name=mz-method]')].map((r) => r.id + (r.checked ? '*' : '')) }));
+    if (!m1.park || m1.rows !== 8 || !m1.go || !m1.v3 || !m1.ghost || JSON.stringify(m1.methods) !== '["mz-m-software*","mz-m-motor"]')
+      fail(`motor zero torqued ${lang}/${vpName}: ${JSON.stringify(m1)}`);
     await shot('5_mz_torqued', 'mzero-panel');
     // 6 torque off, J2 / J3 / J6 selected; J6 reads 51.6 deg: force box, Set disabled until ticked
     await page.evaluate(() => { S.obs.is_torqued = false; mzRender(); for (const j of [2, 3, 6]) $('mz-c-' + j).click(); });
@@ -167,26 +175,30 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
       window.__mz = [];
       window.commandRPC = async (p, body) => {
         window.__mz.push([p, body]);
+        if (p === '/api/v1/calibration/joint_zero/restore') return { restored: body.backup, offsets_after: [0, 0, 0, 0, 0, 0, 0] };
         if (p !== '/api/v1/calibration/motor_zero') throw Object.assign(new Error('unexpected ' + p), { code: 'X' });
         if (body.dry_run) return { dry_run: true, joints: body.joints.map((j) => ({ joint: j, reading_rad: S.obs.positions[j - 1] })), needs_force: true };
         const before = body.joints.map((j) => S.obs.positions[j - 1]);
         body.joints.forEach((j) => { S.obs.positions[j - 1] = 0.0004; });
         return { joints: body.joints.map((j, k) => ({ joint: j, before_rad: before[k], after_rad: 0.0004, sent: true, fresh: true, verified: true })),
-          invalidated: { kinematics_removed: true, camera_stale: true }, persist: 'motor_flash', persist_verified: false, torque: 'off' };
+          invalidated: { kinematics_removed: true, camera_stale: true, poses_stale: ['scan', 'bin_a'], gripper_calibration_stale: false },
+          zero_method: body.method, persist: 'calibration_file', persist_verified: true, torque: 'off',
+          restore: { path: '/api/v1/calibration/joint_zero/restore', backup: '20261119T101500Z' } };
       };
       $('mz-go').click();
     });
     await page.waitForTimeout(400);
     const m3 = await page.evaluate(() => ({ armed: Date.now() < MZ.armedUntil, label: $('mz-go').textContent, calls: window.__mz.map((c) => c[1]) }));
-    if (!m3.armed || !m3.calls.length || m3.calls[0].dry_run !== true || m3.calls[0].force !== true) fail(`motor zero first tap ${lang}/${vpName}: ${JSON.stringify(m3)}`);
+    if (!m3.armed || !m3.calls.length || m3.calls[0].dry_run !== true || m3.calls[0].force !== true || m3.calls[0].method !== 'software')
+      fail(`motor zero first tap ${lang}/${vpName}: ${JSON.stringify(m3)}`);
     await page.evaluate(() => { $('mzero-body').scrollTop = 1e4; });
     await shot('7_mz_confirm', 'mzero-panel');
     await page.evaluate(() => $('mz-go').click());
     await page.waitForTimeout(500);
     await page.evaluate(() => { $('mzero-body').scrollTop = 0; });
     const m4 = await page.evaluate(() => ({ res: !!MZ.res, calls: window.__mz.map((c) => c[1]), kin: !!$('mz-open-kin'), cam: !!$('mz-open-cam'),
-      rows: document.querySelectorAll('#mzero-body .cwiz-table tr').length }));
-    if (!m4.res || m4.calls.length !== 2 || m4.calls[1].dry_run !== undefined || JSON.stringify(m4.calls[1].joints) !== '[2,3,6]' || !m4.kin || !m4.cam || m4.rows !== 4)
+      rows: document.querySelectorAll('#mzero-body .cwiz-table tr').length, undo: !!$('mz-undo') }));
+    if (!m4.res || m4.calls.length !== 2 || m4.calls[1].dry_run !== undefined || JSON.stringify(m4.calls[1].joints) !== '[2,3,6]' || !m4.kin || !m4.cam || m4.rows !== 4 || !m4.undo)
       fail(`motor zero run ${lang}/${vpName}: ${JSON.stringify(m4)}`);
     await shot('8_mz_result', 'mzero-panel');
     await page.evaluate(() => { $('mzero-body').scrollTop = 1e4; });
@@ -196,6 +208,13 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     const w = await page.evaluate(() => ({ cw: CWZ.open, mode: CWZ.mode, mz: MZ.open, ghost: MZ.previewQ }));
     if (!w.cw || w.mode !== 'fine' || w.mz || w.ghost) fail(`motor zero -> fine ${lang}/${vpName}: ${JSON.stringify(w)}`);
     await page.evaluate(() => cwOpen(false));
+    // undo of a software zero: WS /api/v1/calibration/joint_zero/restore with the backup name
+    await page.evaluate(() => { mzOpen(true); MZ.res = { ok: true, joints: [], invalidated: {}, restore: { backup: '20261119T101500Z' } }; mzRender(); $('mz-undo').click(); });
+    await page.waitForTimeout(300);
+    const u = await page.evaluate(() => ({ last: window.__mz[window.__mz.length - 1], res: MZ.res, msg: $('mzero-body').textContent }));
+    if (u.last[0] !== '/api/v1/calibration/joint_zero/restore' || u.last[1].backup !== '20261119T101500Z' || u.res) fail(`zero undo ${lang}/${vpName}: ${JSON.stringify(u.last)}`);
+    await shot('10_mz_undone', 'mzero-panel');
+    await page.evaluate(() => mzOpen(false));
     if (errs.length) fail(`page errors ${lang}/${vpName}: ${errs.join(' | ')}`);
     await ctx.close();
   }

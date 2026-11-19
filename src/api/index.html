@@ -393,6 +393,10 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .tool-item small { grid-column: 2; font-size: 12px; line-height: 1.45; color: var(--sc-color-text-secondary); }
 .tools-warn { font-size: 12px; line-height: 1.5; padding: 8px 10px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); border: 1px solid #ffd591; }
 .tools-warn[hidden] { display: none; }
+.tools-warn .btn { margin-top: 6px; min-height: 32px; font-size: 12px; }
+.pose-list li .pn small.stale { color: var(--sc-status-warning-fg); }
+.mz-methods { display: grid; gap: 6px; margin: 8px 0; }
+.mz-methods label { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; line-height: 1.45; }
 .cal-stale { position: fixed; z-index: 390; top: calc(var(--head-h) + 8px); left: 50%; transform: translateX(-50%); width: min(94vw, 520px); display: flex; align-items: center; gap: 6px;
   padding: 4px 4px 4px 12px; border-radius: 16px; color: var(--sc-status-warning-fg); background: rgba(255,247,230,0.97); border: 1px solid #ffd591; box-shadow: 0 4px 14px rgba(0,0,0,0.12); }
 .cal-stale[hidden] { display: none; }
@@ -1971,7 +1975,9 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <div class="gset-row" id="tools-set" hidden>
       <div class="gset-k"><span data-i18n="tools.title">工具</span></div>
       <small data-i18n="tools.order">推荐顺序：零位标定 → 精校 → 夹爪标定。相机标定在不做精校时单独使用。</small>
+      <div class="tools-warn" id="tools-zero" role="status" hidden><span></span> <button class="btn" id="tools-zero-open" type="button" data-i18n="tools.zero.open">打开零位标定</button></div>
       <div class="tools-warn" id="tools-stale" role="status" hidden></div>
+      <div class="tools-warn" id="tools-stale2" role="status" hidden></div>
       <div class="tools-list" id="tools-list"></div>
       <button class="btn" id="tools-release" type="button" data-i18n="tools.release">释放控制权</button>
       <small id="tools-release-hint"></small>
@@ -2172,6 +2178,7 @@ const I18N = {
     'pose.name': '名称', 'pose.save': '记录当前位置', 'pose.rule': '只能用英文字母、数字、下划线 _ 或短横线 -，最多 64 个字符；同名会覆盖。',
     'pose.bad': '名称不符合规则：只能用英文字母、数字、_ 或 -，1 到 64 个字符', 'pose.go': '前往', 'pose.del': '删除', 'pose.del.confirm': '确认删除',
     'pose.empty': '还没有记录的点位', 'pose.count': '共 {n} 个点位', 'pose.loading': '读取中…', 'pose.err': '读取失败：{e}',
+    'pose.stale': '⚠ 按旧零位记录：零位已改，前往的实际位置会不同；确认后重新记录即可清除', 'pose.stale.count': '共 {n} 个点位，{m} 个按旧零位记录（⚠）',
     'pose.saved': '已记录点位 {name}', 'pose.deleted': '已删除点位 {name}', 'pose.moving': '正在前往点位 {name}', 'pose.enable_first': '请先使能机械臂，再前往点位',
     'pose.code.POSE_NOT_FOUND': '点位不存在（可能已被删除）', 'pose.code.WORKSPACE_VIOLATION': '目标位置超出工作范围', 'pose.code.INVALID_COMMAND': '参数无效：{m}',
     'err.epoch': '控制状态已变化，请检查状态后重新操作', 'err.settling': '机械臂正在交接停稳中，请稍候片刻再操作', 'err.settling2': '机械臂正在交接停稳中，请稍候...', 'err.settling3': '机械臂正在交接停稳中，请稍候再试',
@@ -2363,6 +2370,7 @@ const I18N = {
     'pose.name': 'Name', 'pose.save': 'Record current position', 'pose.rule': 'Letters, digits, _ or - only, up to 64 characters; an existing name is overwritten.',
     'pose.bad': 'Invalid name: use letters, digits, _ or -, 1 to 64 characters', 'pose.go': 'Go', 'pose.del': 'Delete', 'pose.del.confirm': 'Confirm',
     'pose.empty': 'No poses recorded yet', 'pose.count': '{n} poses', 'pose.loading': 'Loading…', 'pose.err': 'Read failed: {e}',
+    'pose.stale': '⚠ Taught with the old zero: the zero changed, so the arm reaches a different pose; check it and save it again to clear this', 'pose.stale.count': '{n} poses, {m} taught with the old zero (⚠)',
     'pose.saved': 'Recorded pose {name}', 'pose.deleted': 'Deleted pose {name}', 'pose.moving': 'Moving to pose {name}', 'pose.enable_first': 'Enable the arm first, then go to a pose',
     'pose.code.POSE_NOT_FOUND': 'Pose not found (maybe deleted)', 'pose.code.WORKSPACE_VIOLATION': 'Target is outside the workspace', 'pose.code.INVALID_COMMAND': 'Invalid parameters: {m}',
     'err.epoch': 'Control state changed, check the state and retry', 'err.settling': 'Arm is settling after handover, wait a moment and retry', 'err.settling2': 'Arm is settling after handover, please wait...', 'err.settling3': 'Arm is settling after handover, retry shortly',
@@ -2385,27 +2393,31 @@ const I18N = {
 // calibration tools (settings drawer, gripper tool)
 Object.assign(I18N.zh, {
   'tools.title': '工具', 'tools.order': '推荐顺序：零位标定 → 精校 → 夹爪标定。相机标定在不做精校时单独使用。',
-  'tools.mz': '零位标定', 'tools.mz.desc': '把机械臂摆到零位姿态，设为各电机的零点；更换电机、拆装后或零位明显偏了时使用。',
+  'tools.mz': '零位标定', 'tools.mz.desc': '把机械臂折叠到收纳姿态（零位参考姿态），让各关节在这里读 0；更换电机、拆装后或零位明显偏了时使用。',
+  'tools.zero.open': '打开零位标定', 'tools.stale.poses': '已记录的点位 {names} 是按旧零位记录的（{at} 改过零位），前往时实际位置会不同；确认后重新记录。',
+  'tools.stale.grip': '夹爪标定（开口表 / 偏差）是按旧的夹爪零位测的（{at}），请重新做夹爪标定。',
   'tools.cam': '相机标定', 'tools.cam.desc': '用标定板求解相机内参、相机安装和桌面高度（约 20 个位姿）。',
   'tools.kin': '精校（相机 + 机械臂几何）', 'tools.kin.desc': '标定板两个位置，同时求解相机和 J2–J5 的几何修正（约 12 分钟）。',
   'tools.grip': '夹爪标定', 'tools.grip.desc': '检查夹爪闭合时的机械零位，可保存偏差。',
   'tools.release': '释放控制权', 'tools.rel.none': '本页没有控制权。', 'tools.rel.torqued': '先停稳并关闭使能，再释放控制权。',
   'tools.rel.moving': '机械臂在动或有动作在执行，停下后再释放。', 'tools.rel.ok': '释放后其他设备（如 MCP、脚本）可以取得控制权。',
-  'tools.stale': '相机标定已过期：{at} 改过电机零位。抓取仍按旧标定运行，请重新做相机标定或精校。', 'tools.stale.chip': '⚠ 相机标定需重做（电机零位已改）',
+  'tools.stale': '相机标定已过期：{at} 改过零位。抓取仍按旧标定运行，请重新做相机标定或精校。', 'tools.stale.chip': '⚠ 相机标定需重做（零位已改）',
   'gt.title': '夹爪标定', 'gt.lead': '夹爪零位 = 完全闭合。零位检查让夹爪慢慢闭合到机械限位，测出与配置的闭合角之差。',
   'gt.cur': '当前偏差', 'gt.calibrated': '开度表', 'gt.yes': '已标定', 'gt.no': '未标定', 'gt.state': '开机检查',
   'gt.check': '检查零位（不保存）', 'gt.store': '检查并保存偏差', 'gt.store.confirm': '再点一次：检查并保存', 'gt.torque': '零位检查需要先使能机械臂，并确保夹爪之间没有物体。',
   'gt.running': '正在检查…', 'gt.res': '停止角 {s} rad · 偏差 {o} rad · {p}', 'gt.pass': '通过', 'gt.fail': '超出阈值', 'gt.err': '失败：{m}', 'gt.noz': '此夹爪不支持零位检查。',
 });
 Object.assign(I18N.en, {
-  'tools.title': 'Tools', 'tools.order': 'Recommended order: motor zero → fine calibration → gripper. Camera calibration is the alternative to fine calibration.',
-  'tools.mz': 'Motor zero', 'tools.mz.desc': 'Hold the arm at the zero pose and make it every motor\'s zero; after a motor swap, reassembly, or when the zero is visibly off.',
+  'tools.title': 'Tools', 'tools.order': 'Recommended order: zero → fine calibration → gripper. Camera calibration is the alternative to fine calibration.',
+  'tools.mz': 'Zero', 'tools.mz.desc': 'Fold the arm into the rest pose (the zero reference) so that every joint reads 0 there; after a motor swap, reassembly, or when the zero is visibly off.',
+  'tools.zero.open': 'Open the zero tool', 'tools.stale.poses': 'The saved poses {names} were taught with the old zero (zero changed at {at}); the arm reaches a different pose. Check them and save them again.',
+  'tools.stale.grip': 'The gripper calibration (opening table / offset) was measured with the old gripper zero ({at}); redo the gripper calibration.',
   'tools.cam': 'Camera calibration', 'tools.cam.desc': 'Camera intrinsics, camera mount and table height from a printed board (about 20 poses).',
   'tools.kin': 'Fine calibration (camera + arm geometry)', 'tools.kin.desc': 'Two board placements: the camera plus a geometric correction of J2–J5 (about 12 minutes).',
   'tools.grip': 'Gripper calibration', 'tools.grip.desc': 'Checks the gripper\'s mechanical zero when closed; can store the offset.',
   'tools.release': 'Release control', 'tools.rel.none': 'This page does not hold control.', 'tools.rel.torqued': 'Stop the arm and disable torque before releasing control.',
   'tools.rel.moving': 'The arm is moving or an action runs; release once it stops.', 'tools.rel.ok': 'After the release another client (MCP, a script) can take control.',
-  'tools.stale': 'The camera calibration is stale: the motor zero changed at {at}. Grasp still uses the old calibration; redo the camera or fine calibration.', 'tools.stale.chip': '⚠ Redo the camera calibration (motor zero changed)',
+  'tools.stale': 'The camera calibration is stale: the joint zero changed at {at}. Grasp still uses the old calibration; redo the camera or fine calibration.', 'tools.stale.chip': '⚠ Redo the camera calibration (zero changed)',
   'gt.title': 'Gripper calibration', 'gt.lead': 'Gripper zero = fully closed. The zero check closes the gripper slowly onto its mechanical stop and measures the difference to the configured closed angle.',
   'gt.cur': 'Current offset', 'gt.calibrated': 'Opening table', 'gt.yes': 'calibrated', 'gt.no': 'not calibrated', 'gt.state': 'Boot check',
   'gt.check': 'Check zero (do not store)', 'gt.store': 'Check and store offset', 'gt.store.confirm': 'Tap again: check and store', 'gt.torque': 'The zero check needs the arm enabled and nothing between the jaws.',
@@ -2413,39 +2425,45 @@ Object.assign(I18N.en, {
 });
 // motor zero tool (mz*)
 Object.assign(I18N.zh, {
-  'mz.title': '零位标定', 'mz.lead': '把机械臂摆到零位姿态，再把当前角度设为所选电机的零点。只在更换电机、拆装后或零位明显偏了时使用；机械臂不会动。',
-  'mz.pose': '零位姿态（所有电机为 0）', 'mz.legend.cur': '实体：当前姿态', 'mz.legend.zero': '蓝色半透明：零位姿态', 'mz.show3d': '在 3D 视图里对照',
-  'mz.torque': '需要先关闭使能：点下面的按钮收纳（收纳结束后使能关闭），然后用手把机械臂扶到零位姿态。', 'mz.park': '收纳并关闭使能', 'mz.parking': '正在收纳…',
-  'mz.off': '使能已关闭：用手把机械臂扶到零位姿态并保持住（关闭使能后机械臂会因重力下垂）。',
+  'mz.title': '零位标定', 'mz.lead': '把机械臂折叠到收纳姿态，夹爪完全闭合，再把当前角度设为所选关节的零位：设置后这些关节在收纳姿态读 0。只在更换电机、拆装后或零位明显偏了时使用；机械臂不会动。',
+  'mz.pose': '零位参考姿态 = 收纳姿态（设置后每个关节读 0）', 'mz.legend.cur': '实体：当前姿态', 'mz.legend.zero': '蓝色半透明：收纳姿态', 'mz.show3d': '在 3D 视图里对照',
+  'mz.torque': '需要先关闭使能：点下面的按钮收纳（收纳结束后使能关闭），然后用手把机械臂扶到收纳姿态。', 'mz.park': '收纳并关闭使能', 'mz.parking': '正在收纳…',
+  'mz.off': '使能已关闭：用手把机械臂折叠到收纳姿态并保持住，夹爪完全闭合（关闭使能后机械臂会因重力下垂）。',
+  'mz.m.software': '软件零位（推荐）：保存在 armd 的标定文件里，任何电机都可用，可以撤销。', 'mz.m.motor': '电机零位：写入电机 flash（达妙），无法撤销，只能重新设置。',
+  'mz.undo': '撤销这次软件零位', 'mz.undone': '已恢复到这次设置之前的零位。', 'mz.inv.poses': '{n} 个已记录的点位标为按旧零位记录（不删除，确认后重新记录）。', 'mz.inv.grip': '夹爪标定标为过期，请重新做夹爪标定。',
+  'mz.p.calibration_file': 'armd 的标定文件（calibration.json，可撤销）', 'mz.legacy': '检测到旧零位：J6 在收纳姿态读 {d}°。请在收纳姿态重新设置 J6 的零位（推荐软件零位）。',
   'mz.th.joint': '关节', 'mz.th.now': '当前读数', 'mz.th.change': '变化', 'mz.grip': '夹爪', 'mz.all': '全选', 'mz.none': '全不选',
-  'mz.far': '所选关节里有读数偏离 0 超过 {d}°：{list}。先确认机械臂确实在零位姿态。',
+  'mz.far': '所选关节里有读数偏离收纳姿态超过 {d}°：{list}。先确认机械臂确实在收纳姿态。',
   'mz.force': '我确认这些关节的零位已丢失，按当前姿态强制设置。',
   'mz.set': '设置零位', 'mz.confirm': '再点一次确认：设置 {list} 的零位', 'mz.running': '正在设置零位…', 'mz.pick': '至少选择一个关节',
   'mz.th.before': '设置前', 'mz.th.after': '设置后', 'mz.th.ok': '校验',
-  'mz.done': '零位已设置，使能保持关闭。', 'mz.unverified': '零位命令已发出，但部分关节在 1 s 内没有读回 0，请检查读数后重做。',
+  'mz.done': '零位已设置，使能保持关闭。', 'mz.unverified': '零位已设置，但部分关节在 1 s 内没有读回参考值，请检查读数后重做。',
   'mz.inv.kin': '运动学精校已清除（它是按旧零位测的）。', 'mz.inv.cam': '相机标定已标为过期，请重新做相机标定或精校。', 'mz.inv.err': '标定文件没有更新：{m}',
-  'mz.persist': '新零位保存在：{p}{v}。零位无法“恢复”，只能在某个姿态重新设置。', 'mz.persist.unv': '（掉电后是否保留未在实机验证）',
+  'mz.persist': '新零位保存在：{p}{v}。电机零位无法“恢复”，只能在收纳姿态重新设置。', 'mz.persist.unv': '（掉电后是否保留未在实机验证）',
   'mz.p.motor_flash': '电机内部（flash）', 'mz.p.simulator': '仿真编码器（armd 重启后丢失）', 'mz.p.process': 'mock 跟随器（armd 重启后丢失）',
   'mz.open.kin': '打开精校', 'mz.open.cam': '打开相机标定', 'mz.again': '重新设置', 'mz.err': '失败：{m}', 'mz.close': '完成',
-  'mz.code.MOTOR_ZERO_ARMED': '需要先关闭使能，且没有动作在执行', 'mz.code.MOTOR_ZERO_FAULT': '机械臂处于故障或急停，先清除', 'mz.code.MOTOR_ZERO_FAR': '有关节离 0 太远，需要勾选强制设置',
+  'mz.code.MOTOR_ZERO_ARMED': '需要先关闭使能，且没有动作在执行', 'mz.code.MOTOR_ZERO_FAULT': '机械臂处于故障或急停，先清除', 'mz.code.MOTOR_ZERO_FAR': '有关节离收纳姿态太远，需要勾选强制设置', 'mz.code.ZERO_MOVING': '采样期间机械臂在动，扶稳后重做，未做任何修改',
   'mz.code.MOTOR_ZERO_NOT_DISABLED': '电机没有确认处于失能状态，未做任何修改', 'mz.code.MOTOR_ZERO_NO_FEEDBACK': '没有新鲜的电机反馈，检查总线和电机供电',
 });
 Object.assign(I18N.en, {
-  'mz.title': 'Motor zero', 'mz.lead': 'Hold the arm at the zero pose, then make the current angle the zero of the selected motors. Use it after a motor swap, reassembly or when the zero is visibly off; the arm does not move.',
-  'mz.pose': 'Zero pose (every motor at 0)', 'mz.legend.cur': 'Solid: current pose', 'mz.legend.zero': 'Translucent blue: zero pose', 'mz.show3d': 'Compare in the 3D view',
-  'mz.torque': 'Torque must be off: park with the button below (torque goes off at the end), then hold the arm at the zero pose by hand.', 'mz.park': 'Park and disable torque', 'mz.parking': 'Parking…',
-  'mz.off': 'Torque is off: hold the arm at the zero pose by hand (without torque the arm sags under gravity).',
+  'mz.title': 'Zero', 'mz.lead': 'Fold the arm into the rest pose with the gripper fully closed, then make the current angle the zero of the selected joints: afterwards they read 0 in the rest pose. Use it after a motor swap, reassembly or when the zero is visibly off; the arm does not move.',
+  'mz.pose': 'Zero reference = the rest pose (every joint reads 0 after the zero)', 'mz.legend.cur': 'Solid: current pose', 'mz.legend.zero': 'Translucent blue: rest pose', 'mz.show3d': 'Compare in the 3D view',
+  'mz.torque': 'Torque must be off: park with the button below (torque goes off at the end), then hold the arm in the rest pose by hand.', 'mz.park': 'Park and disable torque', 'mz.parking': 'Parking…',
+  'mz.off': 'Torque is off: fold the arm into the rest pose by hand and hold it there, gripper fully closed (without torque the arm sags under gravity).',
+  'mz.m.software': 'Software zero (recommended): stored in armd\'s calibration file, works with every motor, can be undone.', 'mz.m.motor': 'Motor zero: written into the motors\' flash (Damiao); cannot be undone, only set again.',
+  'mz.undo': 'Undo this software zero', 'mz.undone': 'The zero from before this change is back.', 'mz.inv.poses': '{n} saved poses are marked as taught with the old zero (not deleted; check and save them again).', 'mz.inv.grip': 'The gripper calibration is marked stale; redo the gripper calibration.',
+  'mz.p.calibration_file': 'armd\'s calibration file (calibration.json, can be undone)', 'mz.legacy': 'Old zero detected: J6 reads {d}° in the rest pose. Set the zero of J6 again in the rest pose (software zero recommended).',
   'mz.th.joint': 'Joint', 'mz.th.now': 'Reading', 'mz.th.change': 'Change', 'mz.grip': 'Gripper', 'mz.all': 'All', 'mz.none': 'None',
-  'mz.far': 'Selected joints read more than {d}° from 0: {list}. Check that the arm really is at the zero pose.',
+  'mz.far': 'Selected joints read more than {d}° from the rest pose: {list}. Check that the arm really is in the rest pose.',
   'mz.force': 'The zero of these joints is lost; set it at the current pose anyway.',
   'mz.set': 'Set zero', 'mz.confirm': 'Tap again to set the zero of {list}', 'mz.running': 'Setting the zero…', 'mz.pick': 'Select at least one joint',
   'mz.th.before': 'Before', 'mz.th.after': 'After', 'mz.th.ok': 'Check',
-  'mz.done': 'Zero set; torque stays off.', 'mz.unverified': 'The zero commands were sent but some joints did not read 0 within 1 s; check the readings and run it again.',
+  'mz.done': 'Zero set; torque stays off.', 'mz.unverified': 'The zero was set but some joints did not read their reference within 1 s; check the readings and run it again.',
   'mz.inv.kin': 'The kinematic fine calibration was removed (it was measured with the old zero).', 'mz.inv.cam': 'The camera calibration is marked stale; redo the camera or fine calibration.', 'mz.inv.err': 'The calibration file was not updated: {m}',
-  'mz.persist': 'The new zero is kept in: {p}{v}. A motor zero cannot be restored, only set again at a pose.', 'mz.persist.unv': ' (whether it survives a power cycle is not verified on hardware)',
+  'mz.persist': 'The new zero is kept in: {p}{v}. A motor zero cannot be restored, only set again in the rest pose.', 'mz.persist.unv': ' (whether it survives a power cycle is not verified on hardware)',
   'mz.p.motor_flash': 'the motors (flash)', 'mz.p.simulator': 'the simulated encoder (lost when armd restarts)', 'mz.p.process': 'the mock follower (lost when armd restarts)',
   'mz.open.kin': 'Open fine calibration', 'mz.open.cam': 'Open camera calibration', 'mz.again': 'Set again', 'mz.err': 'Failed: {m}', 'mz.close': 'Done',
-  'mz.code.MOTOR_ZERO_ARMED': 'Torque must be off and no action running', 'mz.code.MOTOR_ZERO_FAULT': 'The arm is in a fault or E-stop; clear it first', 'mz.code.MOTOR_ZERO_FAR': 'A joint is far from 0; tick the force box',
+  'mz.code.MOTOR_ZERO_ARMED': 'Torque must be off and no action running', 'mz.code.MOTOR_ZERO_FAULT': 'The arm is in a fault or E-stop; clear it first', 'mz.code.MOTOR_ZERO_FAR': 'A joint is far from the rest pose; tick the force box', 'mz.code.ZERO_MOVING': 'The arm moved during the capture; hold it still and run again (nothing was changed)',
   'mz.code.MOTOR_ZERO_NOT_DISABLED': 'The motors did not confirm torque off; nothing was changed', 'mz.code.MOTOR_ZERO_NO_FEEDBACK': 'No fresh motor feedback; check the bus and the motor power',
 });
 // calibration wizard (cwiz*)
@@ -2640,11 +2658,12 @@ const CFG = {
   simpleSpeed: 0.3,           // simple mode: one fixed speed fraction (expert mode uses the 1-4 selector)
   // Quick presets, URDF model radians J1..J4 (mapped through CFG.cart.sign/off), J5 = 0.
   // inspect: TCP x 250 mm, z 300 mm, tool 60 deg below horizontal (IK solution).
-  // park: folded resting pose (J1~J5=0, J6=1.5707963, gripper=0), torque released once the arm arrives
-  //       (same sequence armd runs on shutdown). Override with ?inspect=deg,deg,deg,deg / ?park=...
+  // park: the folded rest pose = the schema's home_positions (from the profile's zero_reference; joint
+  //       angles, all 0 on the B601-DM), torque released once the arm arrives (same sequence armd runs
+  //       on shutdown). Override with ?inspect=deg,deg,deg,deg / ?park=...
   presets: {
     inspect: [0, -1.167, -1.565, 1.435],
-    park: [0, 0, 0, 0, 0, 1.5707963, 0],
+    park: null,
   },
 };
 for (const k of ['inspect', 'park']) {
@@ -2753,12 +2772,12 @@ CFG.cart = {
   tailMs: 300,                // keep streaming this long after the last change
   settleMs: 2000,             // ... and while the arm is still converging, up to this long
   tx: QS.get('tx') === 'rest' ? 'rest' : 'ws', // ws = cartesian_joint_stream frames, rest = /motion/servo
-  // motor rad = sign * model rad + offset, J1..J6. Model = URDF joint angles. Set from the schema's
-  // model_joint_map (armd: model = s * motor + o, so sign = s, off = -s * o); the defaults are the
-  // B601-DM values (J6: URDF angle = motor angle - pi/2). J1..J4 can be overridden with
+  // joint rad = sign * model rad + offset, J1..J6. Model = URDF joint angles. Set from the schema's
+  // model_joint_map (armd: model = s * joint + o, so sign = s, off = -s * o); the defaults are the
+  // B601-DM values (official convention: URDF angle = joint angle). J1..J4 can be overridden with
   // ?iksign=1,1,1,1&ikoff=0,0,0,0 (offset in degrees).
   sign: [1, 1, 1, 1, 1, 1],
-  off: [0, 0, 0, 0, 0, Math.PI / 2],
+  off: [0, 0, 0, 0, 0, 0],
 };
 function cartUrlMap() {
   const sg = (QS.get('iksign') || '').split(',').map(Number);
@@ -4945,7 +4964,7 @@ async function cwNominalMount() {
   let mount = null;
   try { const r = await fetch('/api/v1/calibration', { cache: 'no-store' }); if (r.ok) mount = (await r.json()).camera_mount || null; } catch (_) {}
   if (!mount) { try { const r = await fetch('/api/v1/grasp/setup', { cache: 'no-store' }); if (r.ok) { const g = await r.json(); mount = { tilt_deg: (g.setup || g).camera_tilt_deg }; } } catch (_) {} }
-  const R = CWZ.CW.mountRotation(VIK, mount || {}, toModel6([0, 0, 0, 0, 0, Math.PI / 2]));
+  const R = CWZ.CW.mountRotation(VIK, mount || {}, toModel6(restJoints()));
   const off = mount && Array.isArray(mount.offset_m) ? mount.offset_m.map(Number) : null;
   return { X: CWZ.CW.make(R, off || [-0.08, 0, 0.05]), guessed: !off };
 }
@@ -5682,7 +5701,9 @@ async function loadSchema() {
       if (JSON.stringify(qEnd) !== JSON.stringify(CFG.view.qEndCam || null)) { CFG.view.qEndCam = qEnd; camMountNow(); V3.key = ''; }
       // kinematic correction (fine calibration): CALM.fk / VIK.frames use the same model as armd
       if (CALM.setCorrection(sc.kinematics_correction || null)) { camMountNow(); V3.key = ''; PCARD.key = ''; }
+      const homeKey = JSON.stringify(S.home);
       S.home = Array.isArray(sc.home_positions) ? sc.home_positions : null;
+      if (JSON.stringify(S.home) !== homeKey) { camMountNow(); V3.key = ''; }
       S.rest = Array.isArray(sc.resting_pose?.positions) ? sc.resting_pose.positions : S.home;
       if (sc.gripper_policy && Number.isFinite(sc.gripper_policy.closed_rad) && Number.isFinite(sc.gripper_policy.open_rad)) {
         CFG.gripClosed = sc.gripper_policy.closed_rad;
@@ -6610,8 +6631,11 @@ function cartTick() {
   t = t.map((x, i) => clamp(x, pos[i] - (i === GRIP ? CFG.gripLead : CFG.maxLead), pos[i] + (i === GRIP ? CFG.gripLead : CFG.maxLead)));
   if (now <= C.tailUntil || (settling && converging)) { C.sending = true; if (!S.presetRunning) cartSend(t); }
 }
-// camera mount at the J6 rest angle (motor pi/2), recomputed when the schema brings the joint map
-const camMountNow = () => { CFG.view.Rec = VIK.camMount(CFG.view.camFlip, CFG.view.camRotDeg, toModel6([0, 0, 0, 0, 0, Math.PI / 2]), CFG.view.qEndCam); };
+// the rest pose (joint angles): the schema's home_positions (armd derives them from the profile's
+// zero_reference), all 0 before the schema arrives (B601-DM official convention)
+function restJoints() { return Array.isArray(S.home) && S.home.length >= 6 ? S.home : [0, 0, 0, 0, 0, 0, 0]; }
+// camera mount at the rest pose, recomputed when the schema brings the joint map and home
+const camMountNow = () => { CFG.view.Rec = VIK.camMount(CFG.view.camFlip, CFG.view.camRotDeg, toModel6(restJoints()), CFG.view.qEndCam); };
 camMountNow();
 // model-space limits for J1..J6: motor soft limits minus the margin, through sign / offset
 function modelLimits6() {
@@ -7376,12 +7400,14 @@ function presetTarget(name) {
   }
   let t = pos.slice(0, S.dof);
   while (t.length < S.dof) t.push(0);
-  const m = toMotor(CFG.presets[name] || []);
-  for (let i = 0; i < m.length && i < t.length; i++) t[i] = m[i];
-  if (name === 'park') {
-    if (t.length > 5) t[5] = 1.5707963;
-    if (t.length > GRIP) { t[GRIP] = CFG.gripClosed; S.grip = 0; S.gripCmdAt = Date.now(); }
+  if (name === 'park' && !CFG.presets.park) {
+    const r = restJoints();
+    for (let i = 0; i < t.length && i < GRIP && i < r.length; i++) t[i] = r[i];
+  } else {
+    const m = toMotor(CFG.presets[name] || []);
+    for (let i = 0; i < m.length && i < t.length; i++) t[i] = m[i];
   }
+  if (name === 'park' && t.length > GRIP) { t[GRIP] = CFG.gripClosed; S.grip = 0; S.gripCmdAt = Date.now(); }
   return clampTarget(t);
 }
 async function runPreset(name) {
@@ -8211,7 +8237,7 @@ function poseTick(ts) {
   if (PCARD.collapsed || document.hidden || ts - PCARD.last < 66) return;
   const o = S.obs, live = isLive();
   const q = o && Array.isArray(o.positions) ? o.positions : null;
-  const rest = Array.isArray(S.rest) && S.rest.length >= S.dof ? S.rest : (Array.isArray(S.home) && S.home.length >= 6 ? S.home : CFG.presets.park);
+  const rest = Array.isArray(S.rest) && S.rest.length >= S.dof ? S.rest : (Array.isArray(S.home) && S.home.length >= 6 ? S.home : (CFG.presets.park || restJoints()));
   const meas = q || rest;
   const cmd = o && Array.isArray(o.commanded_positions) ? o.commanded_positions : meas;
   const ghost = !!q && cmd.some((v, i) => Math.abs(v - (meas[i] ?? v)) > (i === GRIP ? 0.05 : 0.005));
@@ -8728,6 +8754,7 @@ const TOOL_ENTRIES = [
   ['kinematics', 'tools.kin', 'tools.kin.desc', 2, () => toolsWizard('fine')],
   ['gripper', 'tools.grip', 'tools.grip.desc', 3, () => { ssetOpen(false); gtOpen(true); }],
 ];
+$('tools-zero-open').addEventListener('click', () => { ssetOpen(false); MZ.sel = new Set([6]); MZ.method = 'software'; mzOpen(true); });
 const toolShown = (key) => { const c = toolsCaps(); return !!(c && c[key] && c[key].supported); };
 function toolsAvail() { return TOOL_ENTRIES.some(([k]) => toolShown(k)); }
 function toolsOnCaps() {
@@ -8762,6 +8789,17 @@ function toolsRender() {
   const st = calStale(), w = $('tools-stale');
   w.hidden = !st || !(c && c.camera && c.camera.supported);
   if (st) setText(w, staleText(st));
+  // legacy J6 zero (armd's zero check against the profile's zero_reference); never moves the arm
+  const zc = TL.st && TL.st.zero_convention, zw = $('tools-zero');
+  zw.hidden = !(zc && zc.status === 'legacy_j6') || !toolShown('motor_zero');
+  if (!zw.hidden) setText(zw.querySelector('span'), t('mz.legacy', { d: mzDeg(zc.j6_rad).replace('°', '') }));
+  // poses / gripper calibration taught with the old zero
+  const at = (x) => (x.at || '').replace('T', ' ').replace(/(:\d\d)Z$/, '$1 UTC');
+  const lines = ((TL.st && TL.st.stale_list) || []).filter((x) => x.item !== 'camera').map((x) => x.item === 'poses'
+    ? t('tools.stale.poses', { names: (x.names || []).join(', '), at: at(x) }) : t('tools.stale.grip', { at: at(x) }));
+  const w2 = $('tools-stale2');
+  w2.hidden = !lines.length;
+  setText(w2, lines.join(' '));
   toolsRenderRelease();
 }
 // release_lease: only with torque off and nothing moving (armd parks a torqued arm on release)
@@ -8851,16 +8889,21 @@ async function gtRun(store) {
   } catch (e) { GT.status = t('gt.err', { m: (e.code ? e.code + ': ' : '') + e.message }); }
   finally { GT.busy = false; gtRender(); }
 }
-/* ---------- motor zero tool: WS /api/v1/calibration/motor_zero (src/motor_zero.rs) ----------
-   Torque off (park button), the 3D view shows the zero pose (all motors 0) as the ghost next to the
-   current pose, one checkbox per joint with the live reading, force for joints > max_offset_deg, two
-   taps (the first is armd's dry run), then the before / after table and the invalidated calibrations. */
-const MZ = { open: false, sel: new Set(), force: false, armedUntil: 0, busy: false, res: null, err: null, status: '', previewQ: null, live: null, key: '' };
+/* ---------- zero tool: WS /api/v1/calibration/motor_zero (src/motor_zero.rs, src/joint_zero.rs) ----------
+   Torque off (park button), the 3D view shows the zero reference (the rest pose = the schema's
+   home_positions, mapped by the model) as the ghost next to the current pose, the method (software
+   zero in calibration.json, reversible / motor zero in the motor flash), one checkbox per joint with
+   the live reading, force for joints > max_offset_deg from the reference, two taps (the first is
+   armd's dry run), then the before / after table, the invalidated calibrations and, for a software
+   zero, the undo (WS /api/v1/calibration/joint_zero/restore). */
+const MZ = { open: false, sel: new Set(), force: false, armedUntil: 0, busy: false, res: null, err: null, status: '', previewQ: null, live: null, key: '', method: null };
+const mzMethod = () => { const m = mzTool()?.methods || []; return m.includes(MZ.method) ? MZ.method : (m[0] || 'motor'); };
+const mzRef = (j) => Number(restJoints()[j - 1]) || 0;
 const mzTool = () => toolsCaps()?.motor_zero || null;
 const mzName = (j) => (j === GRIP + 1 && S.dof === 7 ? t('mz.grip') + ' (J' + j + ')' : 'J' + j);
 const mzDeg = (r) => (Number.isFinite(r) ? (r * 180 / Math.PI).toFixed(1) + '°' : '--');
 function mzReading(j) { const p = S.obs && S.obs.positions; return Array.isArray(p) ? p[j - 1] : NaN; }
-function mzFar(j) { const tl = mzTool(); return Math.abs(mzReading(j)) > ((tl?.max_offset_deg ?? 45) * Math.PI / 180); }
+function mzFar(j) { const tl = mzTool(); return Math.abs(mzReading(j) - mzRef(j)) > ((tl?.max_offset_deg ?? 45) * Math.PI / 180); }
 function mzOpen(open) {
   MZ.open = open;
   $('mzero').hidden = !open;
@@ -8868,7 +8911,7 @@ function mzOpen(open) {
   if (open) {
     $('mzero-panel').classList.remove('min');
     MZ.res = null; MZ.err = null; MZ.status = ''; MZ.armedUntil = 0; MZ.force = false;
-    MZ.previewQ = Array.from({ length: S.dof || 7 }, () => 0);
+    MZ.previewQ = Array.from({ length: S.dof || 7 }, (_, i) => Number(restJoints()[i]) || 0);
     if (!V3.open) v3Toggle(true);
     mzRender();
     MZ.live = setInterval(mzLive, 300);
@@ -8904,6 +8947,19 @@ function mzRender() {
   const acts = (...b) => { const d = cwEl('div', 'cwiz-acts'); b.filter(Boolean).forEach((x) => d.appendChild(x)); body.appendChild(d); };
   if (MZ.res) { mzRenderResult(body, p, acts); return; }
   p(t('mz.lead'));
+  const zc = TL.st && TL.st.zero_convention;
+  if (zc && zc.status === 'legacy_j6') body.appendChild(cwEl('div', 'cwiz-msg', t('mz.legacy', { d: mzDeg(zc.j6_rad).replace('°', '') })));
+  if ((tl.methods || []).length > 1) {
+    const box2 = cwEl('div', 'mz-methods');
+    for (const m of tl.methods) {
+      const lab = cwEl('label'), rb = document.createElement('input');
+      rb.type = 'radio'; rb.name = 'mz-method'; rb.id = 'mz-m-' + m; rb.checked = mzMethod() === m; rb.disabled = MZ.busy;
+      rb.addEventListener('change', () => { MZ.method = m; MZ.armedUntil = 0; mzRender(); });
+      lab.append(rb, cwEl('span', '', t('mz.m.' + m)));
+      box2.appendChild(lab);
+    }
+    body.appendChild(box2);
+  }
   const zp = tl.zero_pose, box = cwEl('div', 'mz-pose');
   box.appendChild(cwEl('b', '', t('mz.pose')));
   if (zp && zp.description) box.appendChild(cwEl('span', '', zp.description));
@@ -8955,12 +9011,15 @@ function mzRenderResult(body, p, acts) {
   body.appendChild(cwTable([t('mz.th.joint'), t('mz.th.before'), t('mz.th.after'), t('mz.th.ok')], rows));
   if (inv.kinematics_removed) body.appendChild(cwEl('div', 'cwiz-msg', t('mz.inv.kin')));
   if (inv.camera_stale) body.appendChild(cwEl('div', 'cwiz-msg', t('mz.inv.cam')));
+  if (inv.poses_stale && inv.poses_stale.length) body.appendChild(cwEl('div', 'cwiz-msg', t('mz.inv.poses', { n: inv.poses_stale.length })));
+  if (inv.gripper_calibration_stale) body.appendChild(cwEl('div', 'cwiz-msg', t('mz.inv.grip')));
   if (inv.error) body.appendChild(cwEl('div', 'cwiz-msg', t('mz.inv.err', { m: inv.error })));
   const pk = r.persist || tl.persist || '';
   p(t('mz.persist', { p: I18N.zh['mz.p.' + pk] !== undefined ? t('mz.p.' + pk) : (pk || '--'), v: (r.persist_verified ?? tl.persist_verified) === false ? t('mz.persist.unv') : '' }));
   const caps = toolsCaps() || {};
   acts(caps.kinematics?.supported ? cwBtn(t('mz.open.kin'), () => { mzOpen(false); toolsWizard('fine'); }, { cls: 'btn-primary', id: 'mz-open-kin' }) : null,
     caps.camera?.supported ? cwBtn(t('mz.open.cam'), () => { mzOpen(false); toolsWizard('camera'); }, { id: 'mz-open-cam' }) : null,
+    r.restore && r.restore.backup ? cwBtn(t('mz.undo'), () => mzUndo(r.restore.backup), { id: 'mz-undo', disabled: MZ.busy }) : null,
     cwBtn(t('mz.again'), () => { MZ.res = null; MZ.sel.clear(); mzRender(); }, { id: 'mz-again' }),
     cwBtn(t('mz.close'), () => mzOpen(false), { id: 'mz-close' }));
 }
@@ -8988,12 +9047,12 @@ async function mzGo() {
   MZ.busy = true; MZ.status = armed ? t('mz.running') : ''; mzRender();
   try {
     if (!armed) {
-      await commandRPC('/api/v1/calibration/motor_zero', { joints, dry_run: true, force: MZ.force }, true, 3000);
+      await commandRPC('/api/v1/calibration/motor_zero', { joints, dry_run: true, force: MZ.force, method: mzMethod() }, true, 3000);
       MZ.armedUntil = Date.now() + 5000;
       setTimeout(() => { if (MZ.open && !MZ.busy) mzRender(); }, 5100);
     } else {
       MZ.armedUntil = 0;
-      const r = await commandRPC('/api/v1/calibration/motor_zero', { joints, force: MZ.force }, true, 10000);
+      const r = await commandRPC('/api/v1/calibration/motor_zero', { joints, force: MZ.force, method: mzMethod() }, true, 10000);
       MZ.res = { ...r, ok: true };
       MZ.status = '';
       $('mzero-body').scrollTop = 0;
@@ -9006,8 +9065,18 @@ async function mzGo() {
     MZ.status = mzErrText(e);
   } finally { MZ.busy = false; mzRender(); }
 }
-// the zero changed: the schema (kinematics_correction removed) and the stale camera calibration
-function mzAfter() { loadSchema(); toolsLoadStatus(); }
+// the zero changed: the schema (kinematics_correction removed, joint_zero), the stale calibrations and poses
+function mzAfter() { loadSchema(); toolsLoadStatus(); posesLoad(true); }
+async function mzUndo(backup) {
+  if (MZ.busy) return;
+  MZ.busy = true; MZ.status = ''; mzRender();
+  try {
+    await commandRPC('/api/v1/calibration/joint_zero/restore', { backup }, true, 10000);
+    MZ.res = null; MZ.status = t('mz.undone');
+    mzAfter();
+  } catch (e) { MZ.status = mzErrText(e); }
+  finally { MZ.busy = false; mzRender(); }
+}
 $('mzero-close').addEventListener('click', () => { if (!MZ.busy) mzOpen(false); });
 $('mzero-min').addEventListener('click', () => $('mzero-panel').classList.toggle('min'));
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && MZ.open && !MZ.busy) mzOpen(false); });
@@ -9035,7 +9104,8 @@ async function posesLoad(quiet) {
     if (!res.ok) throw new Error(d && (d.message || d.error) || 'HTTP ' + res.status);
     PS.list = Array.isArray(d.poses) ? d.poses : [];
     PS.loaded = true;
-    posesRender(PS.list.length ? t('pose.count', { n: PS.list.length }) : '--');
+    const nStale = PS.list.filter((p) => p.stale).length;
+    posesRender(PS.list.length ? (nStale ? t('pose.stale.count', { n: PS.list.length, m: nStale }) : t('pose.count', { n: PS.list.length })) : '--');
   } catch (e) { posesRender(t('pose.err', { e: e.message })); }
 }
 function posesRender(status) {
@@ -9051,7 +9121,10 @@ function posesRender(status) {
     const when = Number.isFinite(p.saved_at_ms) && p.saved_at_ms > 0 ? new Date(p.saved_at_ms).toLocaleString(LANG === 'zh' ? 'zh-CN' : 'en-GB', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
     li.innerHTML = '<span class="pn"><b></b><small></small></span><span class="pa"><button class="btn pose-go" type="button"></button><button class="btn pose-del" type="button"></button></span>';
     li.querySelector('b').textContent = p.name;
-    li.querySelector('small').textContent = [tcp, when].filter(Boolean).join(' · ');
+    const sm = li.querySelector('small');
+    sm.textContent = p.stale ? t('pose.stale') : [tcp, when].filter(Boolean).join(' · ');
+    sm.classList.toggle('stale', !!p.stale);
+    if (p.stale) sm.title = p.stale.reason + ' (' + p.stale.at + ')';
     li.querySelector('.pose-go').textContent = t('pose.go');
     const del = li.querySelector('.pose-del');
     const armed = PS.delArmed === p.name;
@@ -9984,7 +10057,7 @@ window.V = V;
    ================================================================= */
 const WASM_SIM = window.WASM_SIM = (() => {
   const dec = new TextDecoder();
-  const MODEL_OFFSETS_RAD = [0, 0, 0, 0, 0, -Math.PI / 2];
+  const MODEL_OFFSETS_RAD = [0, 0, 0, 0, 0, 0]; // B601-DM official convention (URDF = joint angle)
   const JAW_M_PER_RAD = 0.0425 / 5.7;
   const KPOS_DM = [25, 25, 25, 25, 25, 25, 25];
   const KV_DM = [8, 8, 8, 1.5, 1.5, 1.5, 0.5];
@@ -10063,7 +10136,7 @@ const WASM_SIM = window.WASM_SIM = (() => {
     data: null,
     bundle: null,
     bundleKey: '',
-    positions: [0, 0, 0, 0, 0, Math.PI / 2, 0],
+    positions: [0, 0, 0, 0, 0, 0, 0], // the folded rest pose
     targetPositions: null,
     overrideTargets: null,
     policyTarget: null,
@@ -10719,7 +10792,7 @@ const WASM_SIM = window.WASM_SIM = (() => {
       });
       if (!res.ok) return null;
       const full = toMotor(res.q);
-      const q7 = [full[0], full[1], full[2], full[3], 0, curM[5] ?? Math.PI / 2, curM[6] ?? 0];
+      const q7 = [full[0], full[1], full[2], full[3], 0, curM[5] ?? restJoints()[5], curM[6] ?? 0];
       this.setTargetPositions(q7);
       return q7;
     },
