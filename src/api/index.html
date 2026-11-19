@@ -1491,6 +1491,17 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
 .gc-sw .gc-short { display: none; }
+/* action rows (calibration wizard, zero / gripper calibration, Positions & motions): one primary full width, the other
+   buttons in an even two-column grid of equal-height cells (an odd last one spans both), labels on at most two lines;
+   back / destructive actions last and quieter. Above 480 px a row stays on one line when every label fits (tidyActs). */
+.act-row { display: grid !important; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-rows: 1fr; gap: 8px; align-items: stretch; }
+.act-row > .btn { width: auto; min-width: 0; min-height: 44px; height: auto; margin: 0; padding: 6px 10px; white-space: normal; line-height: 1.25;
+  overflow-wrap: normal; word-break: normal; hyphens: none; text-align: center; justify-content: center; display: inline-flex; align-items: center; }
+.act-row > .wide:not(.act-full) { grid-column: auto; }
+.act-row > .act-full { grid-column: 1 / -1; }
+.act-row.one { grid-template-columns: repeat(var(--n, 2), minmax(0, 1fr)); }
+.act-row.one > .act-full { grid-column: auto; }
+.act-row > .act-back:not(.armed):not(:disabled), .act-row > .tch-del:not(.armed) { background: transparent; box-shadow: none; color: var(--sc-color-text-secondary); }
 </style>
 </head>
 <body class="ui-simple offline locked">
@@ -2630,7 +2641,7 @@ Object.assign(I18N.zh, {
   'cw.mount.guess': '没有测量过的相机镜头位置，起始估计使用 {o} mm，求解后会被替换',
   'cw.cap.hint': '机械臂以 0.03 m/s、0.3 rad/s 依次移到每个位姿，静止 0.3 s 后采集。默认每个位姿都要确认；勾选「连续运行」后自动执行全部位姿。停止按钮随时可用；页面切到后台、心跳或控制权丢失都会中止运行，不会自动继续。',
   'cw.cap.count': '{n} 个视图（至少 {target} 个）· 跳过 {s} 个', 'cw.cap.next': '移到下一个位姿并采集', 'cw.cap.runall': '连续运行（不再逐个确认）',
-  'cw.cap.start': '开始连续运行', 'cw.cap.stop': '停止', 'cw.cap.preview': '在 3D 视图中预览位姿', 'cw.cap.solve': '求解', 'cw.cap.more': '补充位姿',
+  'cw.cap.start': '开始连续运行', 'cw.cap.stop': '停止', 'cw.cap.preview': '3D 预览位姿', 'cw.cap.solve': '求解', 'cw.cap.more': '补充位姿',
   'cw.cap.moving': '移动到位姿 {i} …', 'cw.cap.capturing': '采集位姿 {i} …', 'cw.cap.refined': '已用前 {n} 个视图重新估计，剩余位姿已更新',
   'cw.cap.aborted': '已中止：{why}', 'cw.cap.done': '位姿已全部执行',
   'cw.abort.stop': '已按停止', 'cw.abort.hidden': '页面切到了后台', 'cw.abort.heartbeat': '遥测或心跳中断', 'cw.abort.lease': '控制权已丢失', 'cw.abort.fault': '急停或故障', 'cw.abort.epoch': '控制状态已变化（停止、急停或其他客户端）', 'cw.abort.state': '机械臂不在使能状态', 'cw.abort.foreign': '有其他动作在运行', 'cw.abort.move': '移动失败，已停止', 'cw.abort.nopose': '剩余位姿都无法安全到达', 'cw.abort.timeout': '超时，已停止', 'cw.abort.error': '出错，已停止',
@@ -2645,7 +2656,7 @@ Object.assign(I18N.zh, {
   'cw.r.intr': '内参（640×360）', 'cw.r.mount': '相机安装（end_link 坐标系）', 'cw.r.table': '桌面高度', 'cw.r.dropped': '剔除的视图：{list}', 'cw.r.joint': '联合优化重投影 RMS', 'cw.rev.gripOut': '在该接近高度下夹爪抓取点不在画面内：使用相机朝下采集',
   'cw.rev.hint': '下面是 armd 预演（dry_run）给出的修改前后对比。确认后 armd 先备份，再依次写入 rebot-vision 内参、相机安装和抓取设置；任一步失败会回滚已完成的步骤。',
   'cw.rev.apply': '确认应用', 'cw.rev.confirm': '再点一次确认应用', 'cw.rev.loading': '正在向 armd 请求预演…',
-  'cw.app.ok': '已应用。以下是两项服务读回的数值：', 'cw.app.backup': '备份：{b}', 'cw.app.restore': '恢复到应用前（最近备份）', 'cw.app.restore.confirm': '再点一次确认恢复',
+  'cw.app.ok': '已应用。以下是两项服务读回的数值：', 'cw.app.backup': '备份：{b}', 'cw.app.restore': '恢复上次备份', 'cw.app.restore.confirm': '再点一次确认恢复',
   'cw.app.restored': '已从备份 {b} 恢复', 'cw.app.done': '完成', 'cw.err': '失败：{m}', 'cw.busy': '运行中，请先停止',
 });
 Object.assign(I18N.en, {
@@ -5993,7 +6004,7 @@ function cwGoto(k) {
 }
 function cwRestartBtn() {
   const armed = CWZ.resetArm && CWZ.resetArm.k === 'place' && Date.now() < CWZ.resetArm.until;
-  return cwBtn(t(armed ? 'cw.restart.confirm' : 'cw.restart'), () => cwGoto('place'), { disabled: CWZ.running || CWZ.busy, id: 'cwiz-restart' });
+  return cwBtn(t(armed ? 'cw.restart.confirm' : 'cw.restart'), () => cwGoto('place'), { disabled: CWZ.running || CWZ.busy, id: 'cwiz-restart', cls: armed ? 'armed' : 'act-back' });
 }
 // fine calibration: per-joint correction rows (dry-run before / after, applied read-back)
 function cwKinRows(before, after) {
@@ -6070,6 +6081,37 @@ function cwRenderFineSolve(body, p, acts) {
   acts(cwBtn(t('cw.solve.run'), cwFineSolve, { id: 'cwiz-solve-again' }), cwBtn(t('cw.solve.export'), cwExport), cwRestartBtn(),
     cwBtn(t('cw.solve.review'), cwReview, { cls: 'btn-primary wide', disabled: !r.ok || CWZ.busy, id: 'cwiz-review' }));
 }
+/* action rows: see the .act-row CSS. A row is the buttons of one container; rows that also hold inputs, selects or text
+   stay as they are. Runs on every change of the drawer bodies (MutationObserver) and on resize. */
+const ACT_ROWS = '.cwiz-acts, .cwiz-find, .tch-acts, .tch-row';
+const ACT_LAST = '.act-back, .tch-del, .calib-reset';
+function tidyActs(row) {
+  const kids = [...row.children].filter((e) => !e.hidden);
+  const bs = kids.filter((e) => e.classList.contains('btn'));
+  if (bs.length < 2 || bs.length !== kids.length) { row.classList.remove('act-row', 'one'); return; }
+  row.classList.add('act-row');
+  const prim = bs.find((b) => b.classList.contains('btn-primary') && !b.disabled) || bs.find((b) => b.classList.contains('btn-primary'));
+  const sec = bs.filter((b) => b !== prim);
+  const order = [...(prim ? [prim] : []), ...sec.filter((b) => !b.matches(ACT_LAST)), ...sec.filter((b) => b.matches(ACT_LAST))];
+  order.forEach((b, i) => { if (row.children[i] !== b) row.insertBefore(b, row.children[i] || null); });
+  for (const b of bs) b.classList.remove('act-full');
+  if (prim) prim.classList.add('act-full');
+  const rest = order.slice(prim ? 1 : 0);
+  if (rest.length % 2) rest[rest.length - 1].classList.add('act-full');
+  row.classList.remove('one');
+  if (window.innerWidth > 480 && bs.length <= 4 && row.offsetWidth) {
+    row.style.setProperty('--n', String(bs.length)); row.classList.add('one');
+    const lh = (b) => parseFloat(getComputedStyle(b).lineHeight) || 18;
+    if (bs.some((b) => b.scrollWidth > b.clientWidth + 1 || actLines(b) > 1 || b.clientWidth < lh(b) * 3)) row.classList.remove('one');
+  }
+}
+// rendered text lines of a button
+function actLines(b) {
+  const r = document.createRange(); r.selectNodeContents(b);
+  const tops = new Set([...r.getClientRects()].filter((x) => x.width > 0.5).map((x) => Math.round(x.top)));
+  return tops.size;
+}
+function tidyAll(root = document) { for (const r of root.querySelectorAll(ACT_ROWS)) tidyActs(r); }
 function cwRender() {
   if (!CWZ.open) return;
   const steps = $('cwiz-steps'), body = $('cwiz-body');
@@ -6159,7 +6201,7 @@ function cwRender() {
       body.appendChild(pr);
     }
     if (why) body.appendChild(cwEl('p', 'cwiz-why', why));
-    acts(CWZ.step === 'move' ? null : cwBtn(t('cw.back'), () => { CWZ.step = 'board'; CWZ.status = ''; cwRender(); }, { disabled: searching }), cwBtn(CWZ.busy ? t('calib.cap.busy') : t('cw.place.cap'), cwBootstrap, { cls: 'btn-primary' + (CWZ.step === 'move' ? ' wide' : ''), disabled: CWZ.busy || !!why, id: 'cwiz-boot' }));
+    acts(CWZ.step === 'move' ? null : cwBtn(t('cw.back'), () => { CWZ.step = 'board'; CWZ.status = ''; cwRender(); }, { disabled: searching, cls: 'act-back' }), cwBtn(CWZ.busy ? t('calib.cap.busy') : t('cw.place.cap'), cwBootstrap, { cls: 'btn-primary' + (CWZ.step === 'move' ? ' wide' : ''), disabled: CWZ.busy || !!why, id: 'cwiz-boot' }));
   } else if (cwCapStep()) {
     p(t(cwFine() ? 'cw.f.cap.hint' : 'cw.cap.hint'));
     const acc = cwAccepted(), skipped = CWZ.plan.filter((x) => x.state === 'skip').length;
@@ -6235,7 +6277,7 @@ function cwRender() {
     const armed = Date.now() < CWZ.armedUntil;
     const torqued = cwFine() && !!(S.obs && S.obs.is_torqued);
     if (torqued) body.appendChild(cwEl('div', 'cwiz-msg', t('cw.f.torque')));
-    acts(cwBtn(t('cw.back'), () => { CWZ.step = 'solve'; CWZ.status = ''; cwRender(); }),
+    acts(cwBtn(t('cw.back'), () => { CWZ.step = 'solve'; CWZ.status = ''; cwRender(); }, { cls: 'act-back' }),
       CWZ.loaded ? cwBtn(t('cw.sess.verify'), cwVerify, { cls: cwNeedsVerify() ? 'btn-primary' : '', disabled: CWZ.busy, id: 'cwiz-verify' }) : null,
       torqued ? cwBtn(t('cw.f.park'), cwFinePark, { disabled: CWZ.busy, id: 'cwiz-park' }) : null,
       cwBtn(t(armed ? 'cw.rev.confirm' : 'cw.rev.apply'), cwApply, { cls: 'btn-primary' + (torqued ? ' wide' : ''), disabled: !CWZ.dry || CWZ.busy || torqued || cwNeedsVerify(), id: 'cwiz-apply' }));
@@ -6246,7 +6288,7 @@ function cwRender() {
     const vi = a.vision_intrinsics;
     if (vi && vi.revision != null) p('rebot-vision revision ' + vi.revision);
     const armed = Date.now() < CWZ.armedUntil;
-    acts(cwBtn(t(armed ? 'cw.app.restore.confirm' : 'cw.app.restore'), cwRestore, { disabled: CWZ.busy || !a.backup || !!a.restoredFrom, id: 'cwiz-restore' }), cwRestartBtn(),
+    acts(cwBtn(t(armed ? 'cw.app.restore.confirm' : 'cw.app.restore'), cwRestore, { disabled: CWZ.busy || !a.backup || !!a.restoredFrom, id: 'cwiz-restore', cls: armed ? 'armed' : 'act-back' }), cwRestartBtn(),
       cwBtn(t('cw.app.done'), () => cwOpen(false), { cls: 'btn-primary' }));
   }
   if (CWZ.status) body.appendChild(cwEl('div', 'cwiz-msg' + (CWZ.statusKind === 'ok' ? ' ok' : ''), CWZ.status));
@@ -7646,6 +7688,12 @@ function estopPinSync() {
   for (const m of document.querySelectorAll('.calib-mask, .calib-drawer')) mo.observe(m, { attributes: true, attributeFilter: ['hidden', 'class'] });
   for (const ev of ['resize', 'scroll', 'orientationchange']) window.addEventListener(ev, sync, { passive: true });
   i18nHooks.push(sync);
+})();
+(() => {
+  const roots = ['cwiz-body', 'mzero-body', 'gtool-body', 'teach-panel'].map((id) => $(id)).filter(Boolean);
+  const mo = new MutationObserver((recs) => { for (const r of new Set(recs.map((x) => x.target.closest('.calib-drawer')))) if (r) tidyAll(r); });
+  for (const r of roots) mo.observe(r, { childList: true, subtree: true, attributes: true, attributeFilter: ['hidden'] });
+  window.addEventListener('resize', () => { for (const r of roots) tidyAll(r.closest('.calib-drawer') || r); }, { passive: true });
 })();
 
 /* fullscreen toggle (+ landscape lock on mobile) */
@@ -10120,8 +10168,8 @@ function teachRenderEditor(body) {
     const dn = tchBtn('↓', () => teachMove(i, 1), '', i === c.steps.length - 1 || running); dn.setAttribute('aria-label', t('tch.down'));
     const from = tchBtn(t('tch.from'), () => teachRun({ from: i }), '', running || TCH.busy);
     const one = tchBtn(t('tch.single'), () => teachRun({ from: i, single: true }), '', running || TCH.busy);
-    const del = tchBtn('✕', () => { c.steps.splice(i, 1); TCH.sel = -1; teachDirty(); teachRender(); }, '', running); del.setAttribute('aria-label', t('tch.st.del'));
-    a.append(up, dn, from, one, del);
+    const del = tchBtn('✕', () => { c.steps.splice(i, 1); TCH.sel = -1; teachDirty(); teachRender(); }, 'tch-del', running); del.setAttribute('aria-label', t('tch.st.del'));
+    a.append(from, one, up, dn, del);
     li.appendChild(a);
     ol.appendChild(li);
   });
