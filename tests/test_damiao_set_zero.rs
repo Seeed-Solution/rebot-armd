@@ -50,3 +50,27 @@ fn set_zero_is_refused_while_enabled_or_when_a_motor_reports_enabled() {
     assert!(d.set_zero_position(0).unwrap_err().to_string().contains("not confirmed disabled"));
     assert!(!d.can_mut().take_tx_frames().iter().any(|f| f.data == damiao::CMD_SET_ZERO));
 }
+
+/// The disable confirmation waits its full window by time (not a check count) and resends the
+/// disable frame to a motor that has not confirmed (seen on the real arm: a disable right after
+/// an enable was not confirmed in time, DRIVER_WRITE_FAILED).
+#[test]
+fn disable_confirmation_is_time_bounded_and_resends_to_unconfirmed_motors() {
+    let ids = [1u16, 2, 3];
+    let mut d = DamiaoArmDriver::new(MockCanTransport::new(), ids.to_vec());
+    for &id in &ids[..2] { d.can_mut().respond_to_transmit(damiao::build_disable_frame(id), feedback_frame(id as u8, 0, 0.1)); }
+    let t0 = std::time::Instant::now();
+    d.set_torque(false).unwrap();
+    let waited = t0.elapsed();
+    let tx = d.can_mut().take_tx_frames();
+    let sent = |id: u16| tx.iter().filter(|f| **f == damiao::build_disable_frame(id)).count();
+    assert!(waited >= armd::driver::DAMIAO_DISABLE_CONFIRM, "waited {waited:?}");
+    assert_eq!((sent(1), sent(2), sent(3)), (1, 1, 3), "resent twice only to the silent motor");
+    // all motors answer: confirmed on the first frame, no resend, no full wait
+    let mut d = DamiaoArmDriver::new(MockCanTransport::new(), ids.to_vec());
+    for &id in &ids { d.can_mut().respond_to_transmit(damiao::build_disable_frame(id), feedback_frame(id as u8, 0, 0.1)); }
+    let t0 = std::time::Instant::now();
+    d.set_torque(false).unwrap();
+    assert!(t0.elapsed() < std::time::Duration::from_millis(25));
+    assert_eq!(d.can_mut().take_tx_frames().len(), 3);
+}

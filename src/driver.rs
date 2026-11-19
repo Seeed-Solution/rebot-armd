@@ -91,7 +91,10 @@ pub fn damiao_fault_name(code: u8) -> Option<&'static str> {
 /// Damiao enable handshake: how long to wait for every motor to report state 1, and when to resend the
 /// enable frame to motors not yet confirmed.
 pub const DAMIAO_ENABLE_CONFIRM: Duration = Duration::from_millis(150);
+/// Resend times of the enable and disable frames to motors not yet confirmed.
 const DAMIAO_ENABLE_RETRY_AT: [Duration; 2] = [Duration::from_millis(25), Duration::from_millis(75)];
+/// Damiao disable handshake: how long to wait for every motor to report state 0.
+pub const DAMIAO_DISABLE_CONFIRM: Duration = Duration::from_millis(150);
 
 pub trait ArmDriver: Send {
     fn capabilities(&self) -> DriverCapabilities { DriverCapabilities::default() }
@@ -2573,21 +2576,33 @@ impl<C: CanTransport> ArmDriver for DamiaoArmDriver<C> {
             self.pending_rearm = true;
             self.last_target_frames.fill(None);
             self.last_query_instant = Some(Instant::now());
-            // Poll for responses confirming disable up to 25ms
+            // Poll for responses confirming disable for DAMIAO_DISABLE_CONFIRM, bounded by time only
+            // (a cap of 10 checks with 2 ms sleeps ended it after ~20 ms, before a late motor
+            // answered), and resend the disable frame to unconfirmed motors like the enable does.
             let poll_start = Instant::now();
-            let mut check_count = 0;
-            while poll_start.elapsed() < Duration::from_millis(25) && check_count < 10 {
-                check_count += 1;
+            let mut retries = 0usize;
+            let confirmed = |d: &Self, i: usize| d.last_feedback_instant.get(i).copied().flatten().is_some_and(|t| t >= cmd_start)
+                && d.motor_status.get(i).copied() == Some(0);
+            while poll_start.elapsed() < DAMIAO_DISABLE_CONFIRM {
                 let _ = self.read_joint_states();
-                let all_fresh = !self.last_feedback_instant.is_empty()
-                    && self.last_feedback_instant.iter().all(|opt| {
-                        opt.is_some_and(|t| t >= cmd_start)
-                    });
-                if all_fresh && self.motor_status.iter().all(|&st| st == 0) {
+                if !self.motor_ids.is_empty() && (0..self.motor_ids.len()).all(|i| confirmed(self, i)) {
                     tracing::info!("All Damiao motors confirmed disabled (state=0) in {:?}", poll_start.elapsed());
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(2));
+                if DAMIAO_ENABLE_RETRY_AT.get(retries).is_some_and(|t| poll_start.elapsed() >= *t) {
+                    for i in 0..self.motor_ids.len() {
+                        if !confirmed(self, i) {
+                            let id = self.motor_ids[i];
+                            tracing::debug!("Retrying disable for motor {} (CAN ID 0x{:X})", i, id);
+                            if let Err(e) = self.can.transmit(&damiao::build_disable_frame(id)) {
+                                tracing::warn!("Retry transmit disable frame failed for motor {}: {:?}", id, e);
+                            }
+                        }
+                    }
+                    if let Err(e) = self.can.flush() { tracing::warn!("Retry flush failed: {:?}", e); }
+                    retries += 1;
+                }
+                std::thread::sleep(Duration::from_micros(500));
             }
             Ok(())
         } else {
