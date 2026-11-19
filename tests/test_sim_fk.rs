@@ -1,8 +1,8 @@
 //! The MuJoCo scene used by `--follower sim` (sim/mujoco/models/rebot_b601dm_scene.xml)
 //! must have the same forward kinematics as armd. The fixture is produced by
 //! `uv run rebot-sim-fk` in sim/mujoco; sim/mujoco/tests/test_fk_fixture.py checks it
-//! is current. The samples are armd motor angles: both sides apply the B601-DM motor -> URDF
-//! offsets (`model_offsets_rad`).
+//! is current. The samples are armd joint angles: both sides apply the B601-DM joint -> URDF
+//! offsets (`model_offsets_rad`, all 0 in the official convention).
 use armd::chain::ArmModel;
 use armd::kinematics::angle_between;
 

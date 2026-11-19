@@ -16,7 +16,7 @@ use armd::transport::{CanFrame, MockCanTransport};
 use armd::{ArmSupervisor, SafetyState};
 
 const DT: f64 = 0.02;
-const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
+const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, 0.0];
 
 struct Rng(u64);
 impl Rng {

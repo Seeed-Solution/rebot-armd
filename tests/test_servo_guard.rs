@@ -15,7 +15,7 @@ const SCALED_PERSISTENCE_MS: u64 = 125;
 const LEAD: f32 = 0.2;
 /// Tolerance on the lead invariant: one tick of stepper motion at the lead boundary.
 const EPS: f32 = 0.03;
-const HOME: [f32; 7] = [0.0, 0.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
+const HOME: [f32; 7] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
 struct Arm {
     q: [f32; 7],

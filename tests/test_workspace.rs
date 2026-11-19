@@ -7,8 +7,8 @@ use armd::model::{ArmConfig, ObservationSchema, WorkspacePolicy};
 use armd::safety::SafetyError;
 use armd::{ArmError, SupervisorInner};
 
-const HOME: [f32; 7] = [0.0, 0.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
-const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
+const HOME: [f32; 7] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, 0.0];
 // Both ends are above the floor; the joint-space midpoint puts a gripper corner ~27 mm below it.
 // J6 motor = pi (URDF J6 = pi/2): the jaw axis is in the plane where the 92.5 mm corners dip.
 const DIP_A: [f32; 7] = [0.0, -1.871, -0.64, 1.817, 0.464, std::f32::consts::PI, 0.0];

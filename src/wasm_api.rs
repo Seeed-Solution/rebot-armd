@@ -772,7 +772,7 @@ pub unsafe extern "C" fn armd_free_result(ptr: *mut u8, len: usize) {
 mod tests {
     use super::*;
 
-    const INSPECT: [f64; 6] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f64::consts::FRAC_PI_2];
+    const INSPECT: [f64; 6] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0];
 
     fn call(request: Value) -> Value {
         serde_json::from_str(&dispatch_json(&request.to_string())).unwrap()
@@ -820,7 +820,7 @@ mod tests {
         assert_eq!(result["profile"]["arm_dof"], 6);
         assert_eq!(result["profile"]["action_speed_max"]["linear_mps"], 0.15);
         let offset = result["profile"]["model_offsets_rad"][5].as_f64().unwrap();
-        assert!((offset + std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+        assert_eq!(offset, 0.0, "official convention: URDF J6 = joint J6");
         let result = ok(json!({"op":"init_profile","robot":null}));
         assert_eq!(result["profile"]["model_offsets_rad"][5], offset);
     }

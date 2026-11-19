@@ -247,13 +247,14 @@ async fn test_is_at_safe_resting_pose_criteria() {
 
     // 5. 7-DOF reBot-DM configuration & J7 gripper exemption
     let rebot_cfg = ArmConfig::rebot_dm();
-    assert_eq!(rebot_cfg.home_positions, vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0]);
+    assert_eq!(rebot_cfg.home_positions, vec![0.0; 7]);
     let supervisor_rebot = ArmSupervisor::new(rebot_cfg);
     supervisor_rebot.set_torque(true).await.unwrap();
     {
         let mut inner = supervisor_rebot.inner().write().await;
-        // Exact hardware readings from docs: [0.049, 0.011, 0.027, 0.024, 0.001, 1.574, 0.052]
-        inner.measured_positions = vec![0.049, 0.011, 0.027, 0.024, 0.001, 1.574, 0.052];
+        // Hardware readings from docs ([0.049, 0.011, 0.027, 0.024, 0.001, 1.574, 0.052], legacy
+        // J6 zero) in the official convention (J6 reads 0.004 at rest)
+        inner.measured_positions = vec![0.049, 0.011, 0.027, 0.024, 0.001, 0.004, 0.052];
         inner.measured_velocities = vec![0.003; 7];
         inner.torques = vec![0.02; 7];
     }
@@ -730,7 +731,7 @@ async fn test_gripper_far_target_is_rate_limited_not_dropped() {
     let supervisor = ArmSupervisor::new(ArmConfig::rebot_dm());
     supervisor.set_torque(true).await.unwrap();
     let epoch = supervisor.inner().read().await.safety.epoch_id();
-    let mut target = vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0];
+    let mut target = vec![0.0; 7];
     target[6] = -0.8;
     supervisor.servo(target.clone(), epoch).await.unwrap();
     let obs = supervisor.tick(0.02).await;

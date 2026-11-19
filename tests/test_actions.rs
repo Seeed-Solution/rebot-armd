@@ -10,7 +10,7 @@ use armd::motion::{self, plan_cartesian, resolve_goal, GoalSpec, MotionError, Re
 use armd::{ArmError, StopPolicy, SupervisorInner};
 
 const DT: f64 = 0.02;
-const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
+const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, 0.0];
 
 fn sim_at(q: &[f32; 7]) -> SupervisorInner {
     let mut inner = SupervisorInner::new(ArmConfig::rebot_dm());

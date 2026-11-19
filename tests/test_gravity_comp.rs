@@ -39,7 +39,7 @@ struct Sim {
 
 impl Sim {
     fn new(model_error: f32) -> Self {
-        let q = [0.0, 0.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
+        let q = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         Self {
             q, v: [0.0; 7], modes: [JointMode::Position; 7], cmd: q.iter().map(|&p| JointTarget::position(p)).collect(),
             torqued: false, model_error, user_torque: [0.0; 6], feedback_dead_since: None, commands_dead: false,
@@ -303,7 +303,7 @@ async fn ramp_in_fades_stiffness_out_and_model_in_then_exit_holds() {
         (run.kp, run.tau_ff)
     };
     assert!(kp0[2] > 25.0, "stiff at the start of the ramp: {kp0:?}");
-    let model = armd::compute_gravity_torques(&[0.0, 0.0, 0.0, 0.0, 0.0, std::f32::consts::FRAC_PI_2]).unwrap();
+    let model = armd::compute_gravity_torques(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).unwrap();
     assert!((tau0[2] - model[2]).abs() < 0.2, "starts from the held torque: {tau0:?} vs {model:?}");
 
     let obs = r.ticks(25).await; // 0.52 s
@@ -711,7 +711,7 @@ const TORQUE_LIFT_NM: f32 = 2.0;
 fn real_lift_off_the_folded_pose_is_a_lift() {
     let config = ArmConfig::rebot_dm();
     let gc = config.gravity_comp.as_ref().unwrap();
-    let q = [-0.0f32, -0.32, -0.37, -0.07, 0.0, 1.57];
+    let q = [-0.0f32, -0.32, -0.37, -0.07, 0.0, 0.0]; // J6 read 1.57 with the legacy zero
     let v = [-0.0f32, -1.07, -1.46, -0.11, -0.15, -0.01];
     let g = config.arm_model.gravity_torques(&q).unwrap();
     println!("REAL lift pose: model gravity torque {:?}", &g[..6]);

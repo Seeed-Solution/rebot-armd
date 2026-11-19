@@ -133,9 +133,9 @@ def mount_rotation(model: mujoco.MjModel, mount: CameraMount) -> np.ndarray:
         cam_r = data.cam_xmat[model.camera("wrist").id].reshape(3, 3)
         r_end_mj = end_r.T @ cam_r
         return np.column_stack([r_end_mj[:, 0], -r_end_mj[:, 1], -r_end_mj[:, 2]])
-    from .model import MODEL_OFFSETS_RAD
-    for j, motor in enumerate((0.0, 0.0, 0.0, 0.0, 0.0, math.pi / 2), start=1):
-        data.qpos[model.jnt_qposadr[model.joint(f"joint{j}").id]] = motor + MODEL_OFFSETS_RAD[j - 1]
+    # the rest pose (URDF angles 0, armd kinematics::cam_mount): independent of the joint offsets
+    for j in range(1, 7):
+        data.qpos[model.jnt_qposadr[model.joint(f"joint{j}").id]] = 0.0
     mujoco.mj_kinematics(model, data)
     end_r = data.body("end_link").xmat.reshape(3, 3)
     a_end = end_r.T @ data.xaxis[model.joint("joint5").id]

@@ -4314,8 +4314,8 @@ mod tests {
         (setup, mount, cam)
     }
 
-    /// End rotation at the inspect preset (motor angles, J6 at its rest angle).
-    fn inspect_r() -> Mat3 { crate::chain::ArmModel::REBOT_DEV_ARM.fk(&[0.0, -1.167, -1.565, 1.435, 0.0, std::f64::consts::FRAC_PI_2]).r }
+    /// End rotation at the inspect preset (joint angles, J6 at its rest angle 0).
+    fn inspect_r() -> Mat3 { crate::chain::ArmModel::REBOT_DEV_ARM.fk(&[0.0, -1.167, -1.565, 1.435, 0.0, 0.0]).r }
 
     fn close(a: &Vec3, b: &Vec3, tol: f64) -> bool { kinematics::norm(&kinematics::sub(a, b)) < tol }
 

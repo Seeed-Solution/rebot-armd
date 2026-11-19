@@ -230,3 +230,21 @@ fn correction_bounds_and_profiles() {
     so.validate().unwrap();
     assert_eq!(so.arm_model.correction(), Some(&real_like()));
 }
+
+/// Official B601-DM convention (J6 offset 0): FK of the built-in model with a zero correction, at
+/// joint (motor) angles, equals the URDF chain FK at the same angles, also J6 at +-pi/2.
+#[test]
+fn zero_correction_with_official_j6_offset_equals_urdf_fk_at_motor_angles() {
+    use armd::chain::ArmModel;
+    assert_eq!(k::B601DM_MODEL_OFFSETS_RAD, [0.0; 6]);
+    let zero = ArmModel::REBOT_DEV_ARM.with_correction(Some(&[JointCorrection::default(); 6])).unwrap();
+    let h = std::f64::consts::FRAC_PI_2;
+    for q in [[0.0; 6], [0.0, 0.0, 0.0, 0.0, 0.0, h], [0.0, 0.0, 0.0, 0.0, 0.0, -h], [0.3, -1.0, -1.4, 1.3, 0.2, 0.7], [-1.2, -0.5, -2.2, 0.4, 0.8, -2.5]] {
+        let urdf = k::fk(&q);
+        for m in [&ArmModel::REBOT_DEV_ARM, &zero] {
+            let p = m.fk(&q);
+            assert_eq!(p.p, urdf.p, "{q:?}");
+            assert_eq!(p.r, urdf.r, "{q:?}");
+        }
+    }
+}

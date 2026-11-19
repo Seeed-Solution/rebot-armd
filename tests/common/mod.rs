@@ -14,7 +14,7 @@ use armd::model::JointState;
 use armd::{create_router, ArmConfig, ArmSupervisor, SupervisorInner};
 
 /// Inspection pose used across the motion tests (J7 closed).
-pub const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
+pub const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, 0.0];
 
 /// Torqued, lease-free supervisor holding `q` (commanded = measured = target).
 pub fn sim_at(config: ArmConfig, q: &[f32; 7]) -> SupervisorInner {

@@ -123,8 +123,7 @@ fn dm_motor_chain() -> KinematicChain {
 
 #[test]
 fn dm_chain_shoulder_and_camera_match_builtin() {
-    // the camera mount is taken at the J6 rest angle in armd (motor) angles, so the chain needs
-    // the same offsets as the built-in model
+    // the camera mount is taken at the rest pose (URDF 0 = armd 0 with the official offsets)
     let model = ArmModel::Chain(dm_motor_chain().into());
     let s = model.shoulder_rz();
     // SHOULDER_RZ is the rounded URDF value (0.020084 - 0.00008416 = 0.01999984 m).
@@ -146,7 +145,7 @@ fn builtin_motor_angles_match_the_offset_chain() {
     let chain = ArmModel::Chain(dm_motor_chain().into());
     let builtin = ArmModel::REBOT_DEV_ARM;
     assert_eq!(chain.joint_map(), builtin.joint_map());
-    assert_eq!(builtin.joint_map()[5].offset_rad, -std::f64::consts::FRAC_PI_2);
+    assert_eq!(builtin.joint_map()[5].offset_rad, 0.0);
     let mut rng = Lcg(11);
     let lo = [-3.1, -2.05, -2.6, -3.1, -2.05, -6.2];
     let hi = [3.1, 2.05, 2.6, 3.1, 2.05, 6.2];

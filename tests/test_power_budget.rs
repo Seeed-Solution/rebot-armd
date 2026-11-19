@@ -600,7 +600,7 @@ fn bisection_finds_the_largest_scale_that_fits() {
     faster.planning.min_scale = (fit.scale * 1.01).min(1.0);
     assert!(plan_scale(&faster, &arm, &s).is_err(), "scale x 1.01 must exceed the limit");
     // a slow move fits as planned
-    let slow = swing([0.0, -1.167, -1.565, 1.435, 0.0, 1.57, 0.0], 0.3);
+    let slow = swing([0.0, -1.167, -1.565, 1.435, 0.0, 0.0, 0.0], 0.3);
     let fit = plan_scale(&b, &arm, &quintic_samples(&b.planning, &slow, 6)).unwrap();
     assert_eq!(fit.scale, 1.0);
 }

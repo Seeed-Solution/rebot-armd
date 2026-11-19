@@ -7,7 +7,7 @@ use armd::motion::{GripperCommand, GripperRequest};
 use armd::SupervisorInner;
 
 const DT: f64 = 0.02;
-const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FRAC_PI_2, -5.0];
+const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, -5.0];
 
 /// First-order lag arm; J7 is blocked by an object (or the closed stop) at `block`,
 /// producing torque `stiffness * (cmd - q)` while pressed.

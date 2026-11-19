@@ -125,17 +125,18 @@ fn cam_mount_level_and_rotation_helpers_match_js() {
 fn home_pose_matches_spec_numbers() {
     // motor angles of the profile home and the cockpit inspect preset
     let arm = armd::chain::ArmModel::REBOT_DEV_ARM;
-    let home = arm.fk(&[0.0, 0.0, 0.0, 0.0, 0.0, std::f64::consts::FRAC_PI_2]);
+    let home = arm.fk(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
     assert!(max_diff_v(&home.p, &[0.260, 0.0, 0.192]) < 1.5e-3, "{:?}", home.p);
     assert!(home.r[0][0] > 0.999, "tool x forward");
-    let inspect = arm.fk(&[0.0, -1.167, -1.565, 1.435, 0.0, std::f64::consts::FRAC_PI_2]);
+    let inspect = arm.fk(&[0.0, -1.167, -1.565, 1.435, 0.0, 0.0]);
     assert!(max_diff_v(&inspect.p, &[0.250, 0.0, 0.300]) < 1.5e-3, "{:?}", inspect.p);
     assert!(max_diff_v(&kinematics::column(&inspect.r, 0), &[0.509, 0.0, -0.861]) < 2e-3);
 }
 
-/// At the profile home (motor J6 = pi/2) the real B601-DM's jaws open left-right and the
-/// camera holder (end_link +z) is on top (photos of the arm, 2026-11-12): end_link y is
-/// world-horizontal, end_link +z world-up. The URDF angle of J6 there is 0.
+/// At the profile home (the folded rest pose, every joint 0, official convention) the real
+/// B601-DM's jaws open left-right and the camera holder (end_link +z) is on top (photos of the
+/// arm, 2026-11-12): end_link y is world-horizontal, end_link +z world-up. The URDF angle of J6
+/// there is 0.
 #[test]
 fn home_pose_jaws_horizontal_and_camera_side_up() {
     let config = armd::ArmConfig::rebot_dm();
@@ -147,13 +148,14 @@ fn home_pose_jaws_horizontal_and_camera_side_up() {
     // the camera holder's lens centre (v8, end_link [-0.0731, 0.0005, 0.066]) sits 66 mm above the TCP
     let lens = home.transform_point(&[-0.0731, 0.0005, 0.066]);
     assert!((lens[2] - home.p[2] - 0.066).abs() < 1e-6, "{lens:?} vs {:?}", home.p);
-    // model angle of J6 at home = motor - pi/2
+    // official convention: URDF angle = joint angle on every joint, home J6 = 0
     let map = config.arm_model.joint_map();
-    assert!((map[5].sign * f64::from(config.home_positions[5]) + map[5].offset_rad).abs() < 1e-6);
-    assert!(map[..5].iter().all(|m| m.sign == 1.0 && m.offset_rad == 0.0));
-    // the previous mapping (URDF J6 = motor J6) put the jaw axis vertical
-    let old = kinematics::fk(&kinematics::q6(&config.home_positions));
-    assert!(kinematics::column(&old.r, 1)[2].abs() > 0.9999);
+    assert!(map.iter().all(|m| m.sign == 1.0 && m.offset_rad == 0.0));
+    assert_eq!(config.home_positions, vec![0.0; 7]);
+    // the legacy zero (J6 reading +pi/2 at rest) seen through the official mapping rolls the
+    // jaw axis vertical
+    let legacy = kinematics::fk(&[0.0, 0.0, 0.0, 0.0, 0.0, std::f64::consts::FRAC_PI_2]);
+    assert!(kinematics::column(&legacy.r, 1)[2].abs() > 0.9999);
 }
 
 /// FK / IK round trip in motor angles through the B601-DM offsets: IK returns motor angles
@@ -249,7 +251,7 @@ fn dls_round_trip_200_random_configurations() {
 #[test]
 fn unreachable_and_invalid_goals_return_not_ok() {
     let (lo, hi) = limits(0.02);
-    let q0 = [0.0, 0.0, 0.0, 0.0, 0.0, std::f64::consts::FRAC_PI_2];
+    let q0 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     let mut far = kinematics::fk(&q0);
     far.p[0] += 1.0;
     let r = kinematics::solve_dls(&far, &q0, &lo, &hi, 0.2);

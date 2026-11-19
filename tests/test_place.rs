@@ -14,7 +14,7 @@ use armd::{ArmConfig, ArmSupervisor};
 
 const PROFILE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/kits/recamera-b601dm/profile/rebot-b601dm.json");
 /// Start pose; J7 = -1.5 (jaws around an object, closed = 0, open = -5.7).
-const START: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FRAC_PI_2, -1.5];
+const START: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, -1.5];
 
 fn profile() -> ArmConfig {
     let mut config: ArmConfig = serde_json::from_reader(std::fs::File::open(PROFILE_PATH).unwrap()).unwrap();

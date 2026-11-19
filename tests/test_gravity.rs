@@ -81,13 +81,12 @@ async fn test_supervisor_gravity_compensation_integration() {
     // Assets exist in repo, so gravity_compensated must be true
     assert!(supervisor.is_gravity_compensated().await, "Supervisor must initialize with gravity_compensated=true");
 
-    // Tick at motor zero (URDF J6 = -pi/2 with the B601-DM offsets; J1..J4 as at URDF zero,
-    // J6 0.000311 -> 0.000050 N·m because the gripper's centre of mass turns with J6)
+    // Tick at joint zero = URDF zero (official B601-DM convention)
     let obs = supervisor.tick(0.02).await;
     assert!(obs.gravity_compensated);
     assert_eq!(obs.gravity_torques.len(), 6);
 
-    let expected_zero = [0.0, -1.135664, -7.615891, -2.151496, 0.000006, 0.000050];
+    let expected_zero = [0.0, -1.135664, -7.615891, -2.151496, 0.000006, 0.000311];
     for i in 0..6 {
         assert!(
             (obs.gravity_torques[i] - expected_zero[i]).abs() <= 1e-4,

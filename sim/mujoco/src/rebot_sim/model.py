@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import warnings
 from pathlib import Path
@@ -19,9 +18,10 @@ SO101_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wr
 DOF = 7
 KIT_PROFILE = Path(__file__).resolve().parents[4] / "kits" / "recamera-b601dm" / "profile" / "rebot-b601dm.json"
 SO101_PROFILE = Path(__file__).resolve().parents[4] / "profiles" / "so_arm101.json"
-# armd motor -> URDF (MuJoCo) joint angle offsets J1..J6: URDF = motor + offset. B601-DM: J6 =
-# motor - pi/2 (armd kinematics::B601DM_MODEL_OFFSETS_RAD, profile field model_offsets_rad).
-B601DM_MODEL_OFFSETS_RAD = (0.0, 0.0, 0.0, 0.0, 0.0, -math.pi / 2)
+# armd joint -> URDF (MuJoCo) joint angle offsets J1..J6: URDF = joint + offset. B601-DM: all 0,
+# the official convention (armd kinematics::B601DM_MODEL_OFFSETS_RAD, profile field
+# model_offsets_rad): the simulated arm at URDF 0 is the folded rest pose and reads 0 on every joint.
+B601DM_MODEL_OFFSETS_RAD = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
 
 def model_offsets(profile: Path | str = KIT_PROFILE) -> np.ndarray:

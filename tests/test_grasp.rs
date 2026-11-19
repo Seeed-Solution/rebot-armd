@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 const DT: f64 = 0.02;
 /// Motor angles of the cockpit inspect preset, J6 at its rest angle.
-const INSPECT: [f64; 6] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f64::consts::FRAC_PI_2];
+const INSPECT: [f64; 6] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0];
 /// The profile's arm model: motor angles -> FK / IK (B601-DM offsets).
 const ARM: ArmModel = ArmModel::REBOT_DEV_ARM;
 /// J7 where the jaws touch the test object (closed = 0, open = -5.7).

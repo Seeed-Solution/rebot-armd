@@ -8,7 +8,7 @@ use armd::safety::FaultReason;
 use armd::supervisor::{UNLOAD_SETTLE_HOLD, WATCHDOG_PARK_MARGIN, WATCHDOG_PARK_TIMEOUT};
 use armd::{ArmSupervisor, SafetyState};
 
-const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
+const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, 0.0];
 const DT: f64 = 0.02;
 /// Wall-clock time per simulated 20 ms tick. The tracking-fault persistence is
 /// wall-clock, so it is scaled by the same factor (500 ms -> 125 ms).

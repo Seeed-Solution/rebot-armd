@@ -616,13 +616,13 @@ impl ArmModel {
     }
 
     /// Camera mount R_tip_cam (`kinematics::cam_mount`): the wrist axis (second-to-last joint)
-    /// seen in the tip frame with the last joint at armd angle pi/2 (the B601-DM rest angle of
-    /// J6), the other joints at armd 0. For a canonical end frame, computes R_end_cam directly.
+    /// seen in the tip frame at the rest pose (built-in model: URDF angles 0; URDF chain: armd
+    /// angles 0, the official B601 convention where the rest pose reads 0). For a canonical end frame, computes R_end_cam directly.
     /// The nominal (uncorrected) chain defines this mount: the kinematic correction does not
     /// change the legacy mount or the tilt derived from `q_end_cam`.
     pub fn cam_mount(&self, flip: bool, rot_deg: f64, tilt_deg: f64) -> Mat3 {
         match self {
-            Self::RebotDevArm(off, _) => k::cam_mount_with(off, flip, rot_deg, tilt_deg),
+            Self::RebotDevArm(..) => k::cam_mount(flip, rot_deg, tilt_deg),
             Self::Chain(c) if c.canonical_end_frame => {
                 let end_r = k::IDENTITY;
                 let wrist_axis = [0.0, 0.0, -1.0];
@@ -630,9 +630,7 @@ impl ArmModel {
             }
             Self::Chain(c) => {
                 let n = c.dof();
-                let mut q = [0.0; MAX_CHAIN_JOINTS];
-                q[n - 1] = std::f64::consts::PI / 2.0;
-                let f = c.frames(&q);
+                let f = c.frames(&[0.0; MAX_CHAIN_JOINTS]);
                 let a = f.axes[n.saturating_sub(2)];
                 k::cam_mount_from(&f.end.r, &a, flip, rot_deg, tilt_deg)
             }

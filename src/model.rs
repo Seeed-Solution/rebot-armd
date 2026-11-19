@@ -785,6 +785,9 @@ pub struct ArmConfig {
     pub dof: usize,
     pub joint_names: Vec<String>,
     pub limits: Vec<JointLimit>,
+    /// Home / park target (joint angles, rad). Derived from `zero_reference` when the profile
+    /// has one (then it may be omitted; a conflicting value is rejected).
+    #[serde(default)]
     pub home_positions: Vec<f32>,
     pub lease_timeout_ms: u64,
     pub max_temperature: f32,
@@ -881,6 +884,11 @@ pub struct ArmConfig {
     /// description (the 3D view still renders the pose).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zero_pose: Option<ZeroPoseDoc>,
+    /// The physical reference pose of the joint zero (the folded rest pose) in URDF angles;
+    /// `home_positions` (and so the park target) follow from it, and the zero tools set the
+    /// joint zero so that the arm reads it in this pose (src/joint_zero.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_reference: Option<ZeroReference>,
     /// Arm model built from the fields above (not part of the profile JSON).
     #[serde(skip)]
     pub arm_model: crate::chain::ArmModel,
@@ -957,6 +965,7 @@ impl Default for ArmConfig {
             gripper_joint: None,
             #[cfg(not(target_arch = "wasm32"))] feetech: None,
             zero_pose: None,
+            zero_reference: None,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -1085,6 +1094,24 @@ impl ArmConfig {
         Ok(())
     }
 
+    /// Joint angles of `zero_reference` (None without one): URDF angle -> joint angle through the
+    /// model map (joint = (urdf - offset) / sign) for the arm joints, other joints as given.
+    pub fn zero_reference_home(&self) -> Result<Option<Vec<f32>>, String> {
+        let Some(r) = &self.zero_reference else { return Ok(None); };
+        if r.positions.len() != self.dof || !r.positions.iter().all(|v| v.is_finite()) {
+            return Err(format!("zero_reference.positions needs {} finite values", self.dof));
+        }
+        let map: Vec<crate::chain::JointMap> = if self.uses_urdf() {
+            self.arm_model.joint_map()
+        } else {
+            self.builtin_model_offsets()?.iter().map(|o| crate::chain::JointMap { sign: 1.0, offset_rad: *o }).collect()
+        };
+        Ok(Some(r.positions.iter().enumerate().map(|(i, u)| match map.get(i) {
+            Some(m) if m.sign != 0.0 => ((u - m.offset_rad) / m.sign) as f32,
+            _ => *u as f32,
+        }).collect()))
+    }
+
     /// `model_offsets_rad`, or the B601-DM default when absent.
     fn builtin_model_offsets(&self) -> Result<[f64; 6], String> {
         match &self.model_offsets_rad {
@@ -1112,6 +1139,14 @@ impl ArmConfig {
         }
         if self.limits.len() != self.dof {
             return Err(format!("Limits length {} does not match DOF {}", self.limits.len(), self.dof));
+        }
+        if let Some(home) = self.zero_reference_home()? {
+            let conflict = self.home_positions.len() == self.dof
+                && self.home_positions.iter().zip(&home).any(|(a, b)| (a - b).abs() > 1e-6);
+            if conflict {
+                return Err(format!("home_positions {:?} conflict with zero_reference (joint angles {home:?}); omit home_positions", self.home_positions));
+            }
+            self.home_positions = home;
         }
         if self.home_positions.len() != self.dof {
             return Err(format!("Home positions length {} does not match DOF {}", self.home_positions.len(), self.dof));
@@ -1392,7 +1427,9 @@ impl ArmConfig {
             JointLimit::new("gripper", -5.75, 0.10, 2.0, 5.0),
         ];
 
-        let home_positions = vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.5707963, 0.0];
+        // the official convention: the folded rest pose is URDF 0 on every joint, gripper closed
+        let zero_reference = ZeroReference::rebot_b601();
+        let home_positions = zero_reference.positions.iter().map(|v| *v as f32).collect();
 
         Self {
             profile_id: None,
@@ -1453,6 +1490,7 @@ impl ArmConfig {
             gripper_joint: None,
             #[cfg(not(target_arch = "wasm32"))] feetech: None,
             zero_pose: Some(ZeroPoseDoc::rebot_b601()),
+            zero_reference: Some(zero_reference),
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -1916,23 +1954,41 @@ pub struct ZeroPoseDoc {
 }
 
 impl ZeroPoseDoc {
-    /// The B601-DM zero pose: the home pose (`home_positions`) with J6 at 0. Positions from the
-    /// built-in FK at model angles J1..J5 = 0, J6 = -90 deg (motor 0).
+    /// The B601-DM zero pose = its rest / home pose (official convention, every joint 0).
     pub fn rebot_b601() -> Self {
         Self {
-            description: "Folded like the home pose: upper arm level pointing back from the shoulder, forearm folded back over it, gripper level pointing straight forward (tool about 0.26 m in front of the base, 0.19 m high).".into(),
+            description: "The folded rest pose (the home and park pose): upper arm level pointing back from the shoulder, forearm folded back over it, gripper level pointing straight forward, jaws opening sideways, gripper fully closed (tool about 0.26 m in front of the base, 0.19 m high). Every joint reads 0 here after the zero.".into(),
             joints: vec![
                 "J1 base: arm plane facing forward (+x)".into(),
                 "J2 shoulder: upper arm level, pointing back".into(),
                 "J3 elbow: forearm folded back over the upper arm".into(),
                 "J4 wrist pitch: gripper level".into(),
                 "J5 wrist yaw: gripper pointing straight forward".into(),
-                "J6 wrist roll: motor 0, jaws open up/down (the home pose has J6 at +90 deg, jaws open sideways)".into(),
+                "J6 wrist roll: as folded in the rest pose, jaws opening sideways, camera holder on top".into(),
             ],
             gripper: Some("Gripper fully closed".into()),
-            source: Some("built-in FK of assets/reBot-DevArm_gripper.urdf; gripper: wiki.seeedstudio.com/rebot_arm_b601_dm_lerobot (zero position = gripper fully closed)".into()),
+            source: Some("official convention (Seeed-Projects/reBotArm_control_py: URDF angle = motor angle, zero at the folded rest pose); built-in FK of assets/reBot-DevArm_gripper.urdf; gripper: wiki.seeedstudio.com/rebot_arm_b601_dm_lerobot (zero position = gripper fully closed)".into()),
         }
     }
+}
+
+/// Profile field `zero_reference`: the pose the joint zero refers to.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ZeroReference {
+    /// One value per joint: URDF angles (rad) for the arm joints, the joint value for others
+    /// (gripper closed = 0 on the B601-DM).
+    pub positions: Vec<f64>,
+    /// Pose name (`rest`).
+    #[serde(default = "default_zero_reference_name")]
+    pub name: String,
+}
+
+fn default_zero_reference_name() -> String { "rest".into() }
+
+impl ZeroReference {
+    /// B601-DM: the folded rest pose, URDF 0 on J1..J6, gripper closed (0).
+    pub fn rebot_b601() -> Self { Self { positions: vec![0.0; 7], name: "rest".into() } }
 }
 
 impl Capabilities {
@@ -2044,6 +2100,15 @@ pub struct ObservationSchema {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg(not(target_arch = "wasm32"))]
     pub feetech_joints: Option<Vec<crate::protocol::feetech::FeetechJointCalib>>,
+    /// The profile's `zero_reference` (the pose the joint zero refers to); absent without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_reference: Option<ZeroReference>,
+    /// calibration.json `joint_zero` in effect (src/joint_zero.rs); null = none (offsets 0).
+    #[serde(default)]
+    pub joint_zero: Option<serde_json::Value>,
+    /// Joint zero check against `zero_reference` (`{status: "ok" | "legacy_j6" | "unchecked", message}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_convention: Option<serde_json::Value>,
 }
 
 impl ObservationSchema {
@@ -2145,7 +2210,9 @@ impl ObservationSchema {
             power_budget: config.power_budget.clone().filter(|p| p.enabled),
             #[cfg(not(target_arch = "wasm32"))]
             feetech_joints: config.feetech.as_ref().map(|f| f.joints.clone()),
-
+            zero_reference: config.zero_reference.clone(),
+            joint_zero: None,
+            zero_convention: None,
         }
     }
 }
@@ -2160,7 +2227,7 @@ mod in_memory_model_tests {
         config.model_offsets_rad = None;
         config.init_arm_model_in_memory(None).unwrap();
         let map = config.arm_model.joint_map();
-        assert_eq!(map[5].offset_rad, -std::f64::consts::FRAC_PI_2);
+        assert_eq!(map[5].offset_rad, 0.0);
         let default_pose = ArmConfig::rebot_dm().arm_model.fk(&[0.0; 6]);
         assert_eq!(config.arm_model.fk(&[0.0; 6]), default_pose);
     }
