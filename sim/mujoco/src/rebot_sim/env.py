@@ -92,6 +92,62 @@ class SimEnv:
 
         self._prev_score = 0.0
 
+    @property
+    def n_joints(self) -> int:
+        """Number of controlled robot/tool joints exposed by the indexer."""
+        return self.indexer.dof
+
+    @property
+    def action_dim(self) -> int:
+        """Exact action vector length expected by ``step()``."""
+        return self.motors.dof if self.control_mode == "position" else self.model.nu
+
+    @property
+    def joint_names(self) -> list[str]:
+        """Ordered joint names matching ``obs['state']`` and ``action``."""
+        return list(self.indexer.joints)
+
+    def _validate_action(self, action: Sequence[float] | np.ndarray) -> np.ndarray:
+        """Validate action dimensionality, length, numeric type, and finiteness."""
+        if action is None or isinstance(action, (bool, np.bool_, str, bytes, dict)):
+            raise ValueError(f"Action must be a numeric 1D sequence/array, got {type(action).__name__}")
+
+        if isinstance(action, Sequence) and not isinstance(action, np.ndarray):
+            def _has_bool(obj: Any) -> bool:
+                if isinstance(obj, (bool, np.bool_)):
+                    return True
+                if isinstance(obj, Sequence) and not isinstance(obj, (str, bytes)):
+                    return any(_has_bool(item) for item in obj)
+                return False
+
+            if _has_bool(action):
+                raise ValueError("Action must not contain boolean values")
+
+        raw = np.asarray(action)
+        if np.issubdtype(raw.dtype, np.bool_):
+            raise ValueError("Action must be numeric, not boolean")
+
+        try:
+            arr = np.asarray(raw, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Action must be numeric: {exc}") from exc
+
+        expected = self.action_dim
+        if arr.ndim == 2 and arr.shape[0] == 1:
+            arr = arr[0]
+        elif arr.ndim != 1:
+            raise ValueError(
+                f"Expected 1D action of length {expected} or shape (1, {expected}), got shape {raw.shape}"
+            )
+
+        if arr.shape[0] != expected:
+            raise ValueError(
+                f"Action length mismatch: expected {expected} ({self.control_mode} mode), got {arr.shape[0]}"
+            )
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("Action contains non-finite values (NaN or Inf)")
+        return arr
+
     def _get_obs(self) -> dict[str, Any]:
         obs: dict[str, Any] = {
             "state": np.asarray(
@@ -141,33 +197,29 @@ class SimEnv:
         io_updates: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], float, bool, dict[str, Any]]:
         """Execute one control step (n_substeps physics steps) without real-time delays."""
-        act = np.asarray(action, dtype=float).ravel()
+        act = self._validate_action(action)
         if io_updates:
             self.pack_scene.set_io(io_updates, self.data)
 
         if self.control_mode == "position":
-            q_t = self.motors.q_t.copy()
-            n = min(len(act), len(q_t))
-            q_t[:n] = act[:n]
-            self.motors.q_t = q_t
+            self.motors.q_t = act.copy()
             self.motors.mode = ["pos_vel"] * self.motors.dof
             for _ in range(self.n_substeps):
                 self.motors.apply()
                 mujoco.mj_step(self.model, self.data)
                 self.pack_scene.step_io(self.data)
         else:
-            n_act = min(len(act), self.model.nu)
-            for i in range(n_act):
-                val = act[i]
+            for i in range(self.model.nu):
+                val = float(act[i])
                 if self.model.actuator_ctrllimited[i]:
-                    val = np.clip(
-                        val,
-                        self.model.actuator_ctrlrange[i, 0],
-                        self.model.actuator_ctrlrange[i, 1],
+                    val = float(
+                        np.clip(
+                            val,
+                            self.model.actuator_ctrlrange[i, 0],
+                            self.model.actuator_ctrlrange[i, 1],
+                        )
                     )
                 self.data.ctrl[i] = val
-            if n_act < self.model.nu:
-                self.data.ctrl[n_act:] = 0.0
 
             for _ in range(self.n_substeps):
                 self.data.qfrc_applied[:] = 0.0
