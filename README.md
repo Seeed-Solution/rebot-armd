@@ -80,6 +80,7 @@ the Debian package that installs it on the reCamera is `rebot-teleop` (init scri
 - [API overview](#api-overview)
 - [Agent and MCP integration](#agent-and-mcp-integration)
 - [Episode recording (Parquet)](#episode-recording-parquet)
+- [Teach: episodes, recording ownership, sequences](#teach-episodes-recording-ownership-sequences)
 - [Configuration and CLI](#configuration-and-cli)
 - [Wiring (reCamera B4 CAN board)](#wiring-recamera-b4-can-board)
 - [Safety](#safety)
@@ -714,13 +715,15 @@ curl -X DELETE http://192.168.42.1:8765/api/v1/dataset/episodes/episode_001
 In gravity-compensation mode the commanded position of J1–J6 follows the measured position,
 so a hand-guided episode has `action` equal to `observation.state` for those joints.
 
-Episodes are stored as `<dir>/<episode_id>.parquet` in the episode directory: `--episodes-dir`
+Episodes are stored as `<dir>/<episode_id>.parquet` plus a `<episode_id>.json` sidecar (see
+[Teach](#teach-episodes-recording-ownership-sequences)) in the episode directory: `--episodes-dir`
 (or `$ARMD_EPISODES_DIR`), default `/userdata/rebot-teleop/episodes` when `/userdata` exists, else
 `./data/episodes` relative to the working directory; `off` disables recording and replay. The
-episode id matches `^[A-Za-z0-9_-]{1,64}$` (default `episode_<UTC date>_<time>`); an existing id
+episode id matches `^[A-Za-z0-9_-]{1,64}$` (default: a new ULID); an existing id
 is `409 EPISODE_EXISTS`. An `output_path` must name `<id>.parquet` directly inside the
 directory (else `400 INVALID_OUTPUT_PATH`). Starting or saving is refused with
-`507 EPISODES_FULL` while the directory holds 500 files or 200 MB; a refused save keeps the
+`507 EPISODES_FULL` while the directory holds 500 files or 200 MB, and starting with
+`507 RECORD_NO_SPACE` below 200 MB free disk space; a refused save keeps the
 recording, so it can be saved after deleting episodes. The column names follow LeRobot's naming, but armd writes one plain
 Parquet file per episode, not a LeRobot dataset (no `meta/` files, episode or frame indices,
 or camera frames). Converting it to a LeRobot dataset is not provided here and training on it
@@ -734,9 +737,56 @@ per-joint speed at the chosen playback speed against the planned-motion limit (0
 the B601-DM); an episode that fails is refused with a code (`REPLAY_TOO_FAST` names the joint
 and the highest playback speed that passes). Replay is refused while recording, in gravity
 compensation, in a collision hold and while another motion runs. Stop, E-stop and lease loss
-end it. Rules: [agent API](docs/agent_action_api.md#replay--回放),
+end it. An episode recorded with another joint zero is refused (`DATA_STALE`) unless
+`allow_stale: true`. Rules: [agent API](docs/agent_action_api.md#replay--回放),
 [safety contract](docs/control_safety_contract.md#episode-replay--片段回放). Tested in
 simulation (`tests/test_replay.rs`); not yet run on the arm.
+
+## Teach: episodes, recording ownership, sequences
+
+`capabilities.teach` = `{"version": 1, "episodes": true, "sequences": true}` (capabilities
+version 11). Full rules: [agent API, Teach v1](docs/agent_action_api.md#teach-v1-episodes-recording-sequences--示教-v1片段录制序列).
+Tested against the mock follower (`tests/test_teach_episodes.rs`, `tests/test_teach_sequences.rs`);
+not yet run on the arm.
+
+**Episodes.** Each episode is immutable: `<id>.parquet` (measured samples with armd monotonic
+timestamps, not resampled) and `<id>.json` with dataset, task, source, outcome, joint names,
+`units: "rad"`, the joint zero at capture, profile and armd version. Datasets group episodes
+(`datasets.json`, default `default`). An episode is `stale` when a joint zero moved by more than
+0.5 deg since capture. At boot armd removes unfinished temp files, rebuilds a sidecar lost in a
+crash from the parquet footer and adopts episodes recorded before teach v1.
+
+| Route | |
+|---|---|
+| `GET /api/v1/episodes?dataset=&limit=&before=`, `GET /api/v1/episodes/{id}`, `GET /api/v1/episodes/{id}/data` | list, sidecar, parquet file |
+| `GET /api/v1/datasets` | datasets with episode count, duration, bytes |
+| `POST /api/v1/episodes/import` | multipart `parquet` + `sidecar`; checks joint names and order, `units` rad, finite values, soft limits, length <= 600 s; `IMPORT_INVALID {reason}` |
+| WS `/api/v1/episodes/update`, `/episodes/delete`, `/datasets/create`, `/datasets/delete` | no lease |
+
+**Recording ownership.** WS `/api/v1/record/start {dataset?, task?, source?}` and
+`/api/v1/record/stop {save, outcome?}` need no lease. The recording belongs to the connection's
+`client_id`; others get `RECORDER_NOT_OWNER`, a second recording `RECORDER_BUSY`. When the
+owner's connection closes, the recording is discarded after 5 s unless the same `client_id`
+stops it from a new connection. Recording stops (saved) at 600 s (`truncated`) and below 100 MB
+free disk space. The legacy `/api/v1/dataset/*` routes keep working with owner `legacy-rest`.
+
+**Sequences.** Steps `pose {pose_id, speed_scale, gripper: keep | pose}`,
+`gripper {open | close | move, fraction}`, `wait {s}` and `replay {episode_id, speed, gripper}`,
+stored in `/userdata/rebot-teleop/sequences.json` (`ARMD_SEQUENCES`), at most 200 steps.
+Poses now carry a stable `id`. `GET /api/v1/sequences`; WS `/api/v1/sequences/save|delete`
+(lease). A pose or episode used by a sequence cannot be deleted (`IN_USE`).
+
+```json
+{"type":"command", "request_id":12, "generation":1, "epoch_id":3, "path":"/api/v1/action/run_sequence",
+ "body":{"id":"01JD3XK8Q7…", "repeat":3, "record":{"dataset":"pick", "task":"pick the cube"}}}
+```
+
+`run_sequence` is one action (kind `sequence`, `step_index`, `step_type`, `repeat_index`,
+`repeats`) with `expected_duration_s` as an upper bound. It copies the poses at the start, refuses
+stale poses and episodes (`DATA_STALE`) unless `allow_stale`, and checks epoch, workspace,
+calibration and lease before every motion step. Stop, lease loss, faults and any failed step
+(planning refusals included) end it, also during a wait. With `record`, each repeat is one
+episode (`source: "sequence"`); the episode of an aborted repeat is discarded.
 
 ---
 

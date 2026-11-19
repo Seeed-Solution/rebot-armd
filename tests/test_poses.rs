@@ -39,7 +39,17 @@ async fn poses_file_round_trips_and_corrupt_file_is_not_overwritten_on_start() {
     armd::persist::write_atomic(&path, &serde_json::to_string(&list).unwrap()).unwrap();
     let supervisor = ArmSupervisor::new(ArmConfig::rebot_dm());
     armd::poses::load_into(&supervisor, &path).await;
-    assert_eq!(supervisor.inner().read().await.poses.list, list);
+    let loaded = supervisor.inner().read().await.poses.list.clone();
+    // a pose saved before ids gets one on load, written back to the file
+    assert!(armd::recording::is_ulid(&loaded.poses[0].id));
+    let mut no_ids = loaded.clone();
+    no_ids.poses[0].id.clear();
+    assert_eq!(no_ids, list);
+    let on_disk: PoseList = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(on_disk, loaded);
+    let again = ArmSupervisor::new(ArmConfig::rebot_dm());
+    armd::poses::load_into(&again, &path).await;
+    assert_eq!(again.inner().read().await.poses.list.poses[0].id, loaded.poses[0].id, "ids are stable across restarts");
 
     for corrupt in ["{\"poses\": [", "{\"poses\": [{\"name\": \"bad name\", \"positions\": [0,0,0,0,0,0,0], \"tcp\": null, \"saved_at_ms\": 0}]}",
                     "{\"poses\": [{\"name\": \"short\", \"positions\": [0,0], \"tcp\": null, \"saved_at_ms\": 0}]}"] {

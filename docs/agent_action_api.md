@@ -36,7 +36,7 @@ The existing `/api/v1/motion/jog`, `/motion/home`, `/motion/unload` commands and
 | `/api/v1/calibration/motor_zero` | `{"joints":[1-based], "dry_run":bool?, "force":bool?, "method":"software"\|"motor"?}`; `/api/v1/calibration/joint_zero/restore` `{"backup":str}` — see [Calibration tools and motor zero](#calibration-tools-and-motor-zero--标定工具与电机零位) (acknowledged without `action_id` when it has finished) |
 | `/api/v1/action/move_to_pose` | `{"name":str, "include_gripper":bool? (default false), "speed_scale":0.1..1.0? (default 1.0), "tag"?}` — see [Named poses](#named-poses--命名姿态) |
 | `/api/v1/action/place` | `{"pose":str? \| "position":[x,y,z]?, "orientation"?, "approach_height_m":0.02..0.30? (default 0.08), "release":bool? (default true), "retreat":bool? (default true), "speed_scale":0.1..1.0? (default 1.0), "tag"?}` — see [Place](#place--放置) |
-| `/api/v1/poses/save`, `/api/v1/poses/delete` | `{"name":str, "positions":[dof]?}` / `{"name":str}` (not actions: acknowledged without `action_id`) |
+| `/api/v1/poses/save`, `/api/v1/poses/rename`, `/api/v1/poses/delete` | `{"name":str, "positions":[dof]?, "id":str?}` / `{"id":str, "name":str}` / `{"name":str}` (not actions: acknowledged without `action_id`) |
 | `/api/v1/workspace/keepout` | `{"boxes":[{"name":str, "min_m":[x,y,z], "max_m":[x,y,z]}]}` — see [Keep-out boxes](#keep-out-boxes--禁入盒) (not an action) |
 | `/api/v1/action/replay` | `{"episode":str, "speed":0.5\|1.0? (default 0.5), "gripper":bool? (default true), "tag"?}` — see [Replay](#replay--回放) |
 
@@ -114,11 +114,13 @@ Servo frames while an action runs are rejected with `MOTION_BUSY`. Jog, preset, 
 `GET /api/v1/poses` (no lease) returns `{"poses":[{"name", "positions":[dof], "tcp":{"position":[x,y,z], "rpy":[r,p,y]} | null, "saved_at_ms"}]}`. `tcp` is the end_link pose at save time (null without `kinematics`); `saved_at_ms` is Unix time.
 
 - `/api/v1/poses/save` (lease): `name` matches `^[A-Za-z0-9_-]{1,64}$`; `positions` defaults to the measured positions and must be within the joint limits. Saving an existing name replaces it. At most 64 poses. The ack carries `pose`.
-- `/api/v1/poses/delete` (lease): an unknown name is `404 POSE_NOT_FOUND`.
+- `/api/v1/poses/rename` (lease) `{id, name}`: the pose keeps its id, positions and stale mark, so sequences that reference it keep working; another pose with the name is `409 POSE_EXISTS`, an unknown id `404 POSE_NOT_FOUND`. The ack carries `pose`.
+- `/api/v1/poses/delete` (lease): an unknown name is `404 POSE_NOT_FOUND`; a pose referenced by a sequence is `409 IN_USE {sequences}`.
+- Every pose carries `id` (ULID, see [Teach v1](#sequences--序列)) and `stale` (null, or `{reason, at}` after a joint zero change).
 - Both acks carry `persisted` (true / false with `persist_error`). The store is written atomically to `ARMD_POSES` (default `/userdata/rebot-teleop/poses.json`) after the supervisor lock is released. At start a valid file is loaded; an unreadable or invalid file is logged and the store starts empty; a malformed or invalid file is renamed to `poses.json.bad-<unix seconds>` so the next save cannot overwrite it.
 - `/api/v1/action/move_to_pose`: joint-space quintic of J1..J6 (and J7 with `include_gripper`) to the stored positions, planned with the joint speed cap × `speed_scale`. Action kind `move_to_pose`; same preconditions as the other actions (`MOTION_BUSY` while a trajectory or servo stream runs) and the same cancellation causes. The path's verification samples (21, more with keep-out boxes: see [Keep-out boxes](#keep-out-boxes--禁入盒)) pass the joint limits and, with `kinematics` and `workspace`, the workspace rule including keep-out boxes. Errors: `POSE_NOT_FOUND` (404), `WORKSPACE_VIOLATION` (422), `INVALID_COMMAND` (400).
 
-`GET /api/v1/poses`（无需租约）返回已保存的姿态。`/api/v1/poses/save`、`/api/v1/poses/delete` 需要租约：名称须匹配 `^[A-Za-z0-9_-]{1,64}$`，`positions` 默认取实测位置并须在关节限位内，同名覆盖，最多 64 个；删除不存在的名称返回 `404 POSE_NOT_FOUND`。文件在释放锁后原子写入 `ARMD_POSES`（默认 `/userdata/rebot-teleop/poses.json`）；启动时文件无效则记录日志、以空列表启动；格式错误或无效的文件重命名为 `poses.json.bad-<unix 秒>`，之后的保存不会覆盖它。`move_to_pose` 以关节空间五次多项式移动 J1..J6（`include_gripper` 时含 J7），速度为关节限速 × `speed_scale`，动作类型 `move_to_pose`，前置条件与取消规则同其他动作，路径的校验采样点（21 个，有禁入盒时更多，见“禁入盒”）须满足关节限位和工作空间规则（含禁入盒）。
+`GET /api/v1/poses`（无需租约）返回已保存的姿态，每个姿态带 `id`（ULID）与 `stale`（null，或零位变更后的 `{reason, at}`）。`/api/v1/poses/rename {id, name}`（需租约）改名时保留 id、位置与过期标记，引用它的序列不受影响；重名返回 `409 POSE_EXISTS`。被序列引用的姿态删除返回 `409 IN_USE {sequences}`。`/api/v1/poses/save`、`/api/v1/poses/delete` 需要租约：名称须匹配 `^[A-Za-z0-9_-]{1,64}$`，`positions` 默认取实测位置并须在关节限位内，同名覆盖，最多 64 个；删除不存在的名称返回 `404 POSE_NOT_FOUND`。文件在释放锁后原子写入 `ARMD_POSES`（默认 `/userdata/rebot-teleop/poses.json`）；启动时文件无效则记录日志、以空列表启动；格式错误或无效的文件重命名为 `poses.json.bad-<unix 秒>`，之后的保存不会覆盖它。`move_to_pose` 以关节空间五次多项式移动 J1..J6（`include_gripper` 时含 J7），速度为关节限速 × `speed_scale`，动作类型 `move_to_pose`，前置条件与取消规则同其他动作，路径的校验采样点（21 个，有禁入盒时更多，见“禁入盒”）须满足关节限位和工作空间规则（含禁入盒）。
 
 ## Keep-out boxes / 禁入盒
 
@@ -602,8 +604,8 @@ Replays a saved episode (see the README, "Episode recording"). Episode files are
 
 | Route | Returns |
 |---|---|
-| `GET /api/v1/dataset/episodes` | `{"enabled", "dir", "episodes":[{"id", "frames", "duration_s", "size_bytes", "created_ms", "dof", "joint_min":[dof], "joint_max":[dof], "error"?}], "total_bytes", "max_bytes", "max_files"}`, newest first. `created_ms` is the file modification time (Unix ms). `error` is set for a file that cannot be read. |
-| `DELETE /api/v1/dataset/episodes/{id}` | `{"status":"deleted", "episode_id"}`; `404 EPISODE_NOT_FOUND`, `400 INVALID_EPISODE_ID` |
+| `GET /api/v1/dataset/episodes` | `{"enabled", "dir", "episodes":[{"id", "frames", "duration_s", "size_bytes", "created_ms", "dof", "joint_min":[dof], "joint_max":[dof], "error"?, "dataset", "task", "source", "stale"}], "total_bytes", "max_bytes", "max_files"}`, newest first: the episodes of the store. `created_ms` is the start of the recording (Unix ms). `error` is set for a file that cannot be read. |
+| `DELETE /api/v1/dataset/episodes/{id}` | `{"status":"deleted", "episode_id"}`; `404 EPISODE_NOT_FOUND`, `400 INVALID_EPISODE_ID`, `409 IN_USE` (referenced by a sequence) |
 
 WS command (lease, epoch, `request_id` as for every action):
 
@@ -612,7 +614,7 @@ WS command (lease, epoch, `request_id` as for every action):
  "path":"/api/v1/action/replay", "body":{"episode":"teleop_20261112_101500", "speed":0.5, "gripper":true, "tag":"demo"}}
 ```
 
-- `episode` (required): episode id, `^[A-Za-z0-9_-]{1,64}$`. `speed`: `0.5` (default) or `1.0`, a fraction of the recorded speed. `gripper` (default true): replay J7; false holds J7 at its current command. `tag` as for other actions.
+- `episode` (required): episode id, `^[A-Za-z0-9_-]{1,64}$` (an id of the [episode store](#teach-v1-episodes-recording-sequences--示教-v1片段录制序列)). `speed`: `0.5` (default) or `1.0`, a fraction of the recorded speed. `gripper` (default true): replay J7; false holds J7 at its current command. `allow_stale` (default false): replay an episode recorded with another joint zero (else `409 DATA_STALE`). `tag` as for other actions.
 - The ack carries `action_id` and `expected_duration_s` (approach + recorded duration / speed + 0.5 s).
 - The episode file is read and checked on a blocking thread without the supervisor lock. Then, under the lock, epoch, workspace revision, busy rules and the commanded positions (< 1e-4 rad) are checked again (`PLAN_STALE` / the busy codes), the approach is planned and the action starts.
 
@@ -628,6 +630,7 @@ Checks before any motion (rejection, no motion):
 | per-joint speed of the resampled recording × `speed` above the planned-motion limit (`planning_limits()`: `planned_max_velocity` × `speed_cap.joint_velocity_scale`, 0.45 rad/s on rebot-dm; the J7 joint limit for the gripper). The message names the joint, the speed, the time and the highest playback speed that passes. The recording is not clipped. | `REPLAY_TOO_FAST` (422) |
 | any resampled frame against the workspace rule of planned motions (baseline = the commanded pose at the request), and the keep-out sweep over the frames (at most 4000 added FK evaluations) | `WORKSPACE_VIOLATION` (422) |
 | file missing; storage off | `EPISODE_NOT_FOUND` (404); `EPISODES_DISABLED` (409) |
+| recorded with another joint zero (sidecar `joint_zero`), without `allow_stale` | `DATA_STALE` (409) |
 | a recording is running or saving; gravity compensation; another trajectory, servo stream or motion | `MOTION_BUSY` (409) |
 | collision hold; E-stop; fault; not armed | `COLLISION_HOLD` (409); `ESTOP_ACTIVE`; `FAULT_ACTIVE`; `NOT_ARMED` |
 
@@ -644,11 +647,92 @@ Action record: `kind` `replay`, `episode`, `phase` (`approach` → `replay` → 
 
 保存的录制片段可回放（录制见 README「示教片段录制」）。片段文件通过 REST 管理，与其他 `/api/v1/dataset/*` 路由一样无需租约（不产生运动）；浏览器请求（含 `DELETE`）须同源。`GET /api/v1/dataset/episodes` 按时间倒序返回片段（帧数、时长、大小、保存时间、各关节范围；无法读取的文件带 `error`）；`DELETE /api/v1/dataset/episodes/{id}` 删除片段，不存在返回 `404 EPISODE_NOT_FOUND`，id 不合法返回 `400 INVALID_EPISODE_ID`。
 
-WS 指令 `/api/v1/action/replay`（需租约与 epoch）：`episode` 必填（`^[A-Za-z0-9_-]{1,64}$`）；`speed` 为 `0.5`（默认）或 `1.0`，相对录制速度；`gripper`（默认 true）回放 J7，false 时 J7 保持当前指令。ack 带 `action_id` 与 `expected_duration_s`。片段在阻塞线程中读取与检查，不持有监督器锁；安装前在锁内再次检查 epoch、工作空间版本、忙碌条件和指令位置（`PLAN_STALE` 或对应忙碌码）。
+WS 指令 `/api/v1/action/replay`（需租约与 epoch）：`episode` 必填（`^[A-Za-z0-9_-]{1,64}$`，片段存储中的 id）；用其他关节零位录制的片段返回 `409 DATA_STALE`，除非 `allow_stale: true`；`speed` 为 `0.5`（默认）或 `1.0`，相对录制速度；`gripper`（默认 true）回放 J7，false 时 J7 保持当前指令。ack 带 `action_id` 与 `expected_duration_s`。片段在阻塞线程中读取与检查，不持有监督器锁；安装前在锁内再次检查 epoch、工作空间版本、忙碌条件和指令位置（`PLAN_STALE` 或对应忙碌码）。
 
 运动前的检查（不通过则拒绝，不运动）：帧数少于 2 或没有时长 `REPLAY_EMPTY`；关节数与 profile 不符 `REPLAY_JOINT_COUNT`；非有限值、时间戳非有限或递减、文件无法读取 `REPLAY_INVALID_EPISODE`；时长超过 600 s `REPLAY_TOO_LONG`；任一帧超出关节软限位（J7 仅在 `gripper` 时检查）`SOFT_LIMIT_EXCEEDED`；重采样后各关节速度 × `speed` 超过规划运动限速（`planning_limits()`，rebot-dm 为 0.45 rad/s；夹爪用 J7 关节限位）`REPLAY_TOO_FAST`，消息给出关节、速度、时刻与可通过的最高回放速度，不对录制做削峰；每个重采样帧按规划运动的工作空间规则检查（基准为请求时的指令位姿），并对禁入盒做扫掠检查（最多追加 4000 次 FK）`WORKSPACE_VIOLATION`；文件不存在 `EPISODE_NOT_FOUND`；存储关闭 `EPISODES_DISABLED`；录制进行或保存中、重力补偿中、其他轨迹 / servo 流 / 运动进行中 `MOTION_BUSY`；碰撞保护中 `COLLISION_HOLD`；急停、故障、未使能为对应错误码。
 
 执行：按时间戳把 `observation.state` 线性重采样到控制频率；先以规划运动限速用关节空间五次多项式移动到第 0 帧（与 jog 相同的检查）；之后每个周期按 dt × `speed` × rate 推进录制时间，rate 与规划路径相同（J1–J6 滞后低于 0.38 rad 全速，0.45 rad 停止），rate ≤ 0.1 持续 1 s 结束为 `failed` / `TRACKING_STALL`，指令设为实测位置，不进入 Fault；最后在末帧做到位确认。`gripper: true` 时 J7 跟随录制；夹爪卡滞锁存期间，继续向卡滞方向的指令保持不动，反向指令解除锁存（与 servo / jog 规则相同）。动作记录：`kind` 为 `replay`，带 `episode`、`phase`（`approach` → `replay` → `settle`）、`t_s`（已回放到的录制时间，接近阶段为 0）与 `progress`。停止、急停、碰撞、故障、看门狗和租约丢失按“动作状态”一节的错误码结束；租约丢失（释放、被接管、连接关闭）时 armd 同时停止回放参考轨迹，机械臂制动并保持。
+
+## Teach v1: episodes, recording, sequences / 示教 v1：片段、录制、序列
+
+`capabilities.teach` = `{"version": 1, "episodes": true, "sequences": true}` (capabilities version 11; absent on older armd). `GET` routes need no lease; WS commands use the [message](#message--消息) format with `request_id`. Tests: `tests/test_teach_episodes.rs`, `tests/test_teach_sequences.rs` (mock follower); not yet run on the arm.
+
+### Episode store / 片段存储
+
+- One immutable episode = `<dir>/<id>.parquet` + `<dir>/<id>.json` (sidecar) in the episode directory (`--episodes-dir`, default `/userdata/rebot-teleop/episodes`). New ids are ULIDs (26 characters, Crockford base32); episodes recorded before teach v1 keep their id.
+- Parquet columns: `timestamp` (float64, armd monotonic s), `observation.state` (list<float32>, measured joint angles, rad), `action` (list<float32>, commanded, rad). The frames are the measured control-tick samples, not resampled. The footer also carries the sidecar (key `rebot.episode`).
+- Sidecar: `{id, dataset, task, source, sequence_id?, repeat_index?, outcome, recorded_at, duration_s, frames, joint_names, units: "rad", joint_zero: {offsets_rad, rev}, profile_id, armd_version, fps_nominal}` plus `truncated` (stopped at 600 s), `stopped_by` (`max_duration` | `low_space`), `arm_dof`, `gripper_joint`, `first_state`, `last_state`, `recovered`. `source` is one of `hand_guide`, `jog`, `servo`, `replay`, `sequence`, `import`, `sdk`; `outcome` `ok` | `aborted`. `joint_zero.rev` is a fingerprint of the offsets (FNV-1a 64 over the f32 bits, 16 hex digits).
+- `stale` (in listings): a joint zero offset differs by more than 0.5 deg from the one at capture. Replay and sequence steps refuse stale episodes with `DATA_STALE` unless `allow_stale: true`.
+- Write order: `<id>.parquet.tmp`, fsync, rename; then the sidecar (temp + rename); the control tick only appends frames to memory and the files are written on a blocking thread.
+- Boot recovery (rule per file): a name containing `.tmp` is deleted; `<id>.parquet` with a readable sidecar is listed; without a sidecar, a parquet whose footer carries one gets it back (`recovered: "sidecar"`); otherwise a readable parquet with a legacy id is adopted (`recovered: "legacy"`, dataset `default`, joint zero of the boot); an unreadable ULID file is deleted when older than 1 h and kept (not listed) otherwise; any other unreadable file is kept and not listed; a sidecar without its parquet is deleted.
+- `datasets.json` = `{"datasets": {<name>: {created_at, description}}}`; each episode belongs to one dataset (sidecar `dataset`), default `default`. Dataset names: `^[A-Za-z0-9_\- \p{Han}]{1,64}$`.
+
+| Route | Returns |
+|---|---|
+| `GET /api/v1/episodes?dataset=&limit=&before=` | `{"enabled", "episodes": [sidecar + "stale" + "bytes"], "recording": {recording_id, owner, dataset, task, started_at, source, frames, elapsed_s, owner_connected} \| null}`, newest first; `before` = an episode id (the page after it) |
+| `GET /api/v1/episodes/{id}` | sidecar + `stale` + `bytes`; `404 EPISODE_NOT_FOUND` |
+| `GET /api/v1/episodes/{id}/data` | the parquet file (`application/vnd.apache.parquet`) |
+| `GET /api/v1/datasets` | `{"enabled", "datasets": [{name, episodes, duration_s, bytes, created_at, description}]}` |
+| `POST /api/v1/episodes/import` | multipart `parquet` + `sidecar` -> `{id, stale, episode}` \| `422 IMPORT_INVALID {reason}` |
+
+WS commands without a lease (`request_id` required, no `generation` / `epoch_id`):
+
+| Path | Body | Ack fields / errors |
+|---|---|---|
+| `/api/v1/episodes/update` | `{id, task?, dataset?}` | `episode`; `EPISODE_NOT_FOUND`, `DATASET_NOT_FOUND` |
+| `/api/v1/episodes/delete` | `{id}` | `deleted`; `IN_USE {sequences}` when a sequence references it |
+| `/api/v1/datasets/create` | `{name, description?}` | `dataset`; `DATASET_EXISTS` |
+| `/api/v1/datasets/delete` | `{name, force?}` | `deleted_episodes`; `DATASET_NOT_EMPTY` without `force`; `IN_USE` when one of its episodes is referenced |
+
+Import checks (`reason`): `multipart`, `sidecar`, `schema` (columns / types), `units` (only `rad`; convert `deg` / `so101_norm` first), `joint_names` / `joint_order` (must equal the profile's joints in order), `profile`, `dof`, `empty`, `timestamps`, `too_long` (> 600 s), `non_finite`, `soft_limit` (every `observation.state` and `action` value within the joint soft limits). A different joint zero is not refused: the episode is stored with `stale: true`; a sidecar without `joint_zero` counts as stale. The stored copy gets a new id and `source: "import"`; an unknown dataset is created. Body limit 64 MB.
+
+### Recording ownership / 录制归属
+
+Recording has an owner that is separate from the motion lease, so a page can record next to a teleop lease holder.
+
+- WS `/api/v1/record/start {dataset?, task?, source?}` (no lease) -> `{recording_id, owner}`. `owner` = the connection's `client_id` (message field `client_id`, else the label of the lease this connection holds; `INVALID_COMMAND` without one). One recording at a time: `RECORDER_BUSY {owner}`.
+- WS `/api/v1/record/stop {save: bool, outcome?}` -> `{episode}` | `{discarded: true}`; only the owner (`RECORDER_NOT_OWNER {owner}`).
+- The owner's connection closes: the recording is discarded after 5 s, unless a connection with the same `client_id` sends `record/stop` within those 5 s (it takes the recording back).
+- Legacy REST `POST /api/v1/dataset/record/start|save|discard`, `GET /api/v1/dataset/episodes`, `DELETE /api/v1/dataset/episodes/{id}` use the same store with owner `legacy-rest`; `episode_id` / `output_path` still set a legacy id, without them the id is a ULID.
+- Disk guard: `507 RECORD_NO_SPACE` when the episode file system has less than 200 MB free at the start; a running recording is stopped and saved (`stopped_by: "low_space"`) below 100 MB. Length cap 600 s: the tick stops appending at the cap and the recording is saved with `truncated: true`. Both checks run in a monitor task (every 200 ms, free space every 1 s), not in the control loop.
+
+### Sequences / 序列
+
+`sequences.json` (`ARMD_SEQUENCES`, default `/userdata/rebot-teleop/sequences.json`) holds `{"sequences": [{id (ULID), name, description, steps, created_at, updated_at, rev}]}`. Steps (at most 200):
+
+| Step | Fields |
+|---|---|
+| `pose` | `pose_id`, `speed_scale` 0.1..1.0 (default 1.0), `gripper` `keep` (default) \| `pose` |
+| `gripper` | `action` `open` \| `close` \| `move`, `fraction` 0..1 (move only) |
+| `wait` | `s` 0..60 |
+| `replay` | `episode_id`, `speed` 0.5 (default) \| 1.0, `gripper` (default true) |
+
+Poses carry an `id` (ULID; assigned on load to poses saved before ids and written back; stable across a rename with `poses/save {id, name}`). Deleting a pose or an episode that a sequence references is `409 IN_USE {sequences}`.
+
+- `GET /api/v1/sequences`, `GET /api/v1/sequences/{id}`: the stored fields plus `stale_steps`, `missing_steps` (indices) and `running`.
+- WS `/api/v1/sequences/save {id?, name, description?, steps, rev?}` (lease, like `poses/save`) -> `{sequence}`. Without `id` a new sequence; with `id` an update, `rev` (if given) must equal the stored one (`SEQUENCE_CONFLICT {rev}`). Names `^[A-Za-z0-9_\- \p{Han}]{1,64}$`, unique (`SEQUENCE_EXISTS`). A missing pose / episode: `422 SEQUENCE_REF_MISSING {step}`; other step errors `INVALID_COMMAND {step}`.
+- WS `/api/v1/sequences/delete {id}` (lease); `SEQUENCE_RUNNING` while it runs.
+
+Action `/api/v1/action/run_sequence {id, from_step?: 0, single_step?: false, repeat?: 1 (1..100), record?: {dataset, task?}, allow_stale?: false, tag?}` -> ack `{action_id, expected_duration_s}`. One parent action of kind `sequence` with `sequence_id`, `step_index` (0-based index in the sequence), `step_type`, `repeat_index` (0-based), `repeats`, `phase` (the step type; replay steps show `approach` / `replay` / `settle`), `progress` (steps done / steps × repeats), with `record` `episodes` (ids saved so far), and `failed_step` (the step that was running) when the run ended without finishing. The action's `id` is the action id; the sequence id is `sequence_id`.
+
+- At the start the poses are copied and the episodes pinned: a pose saved during the run does not change it; pinned items cannot be deleted. Refused at the start: `SEQUENCE_NOT_FOUND`, `SEQUENCE_REF_MISSING {step}`, `DATA_STALE {steps}` (a pose marked stale by a joint zero change, an episode recorded with another joint zero) unless `allow_stale`, `RECORDER_BUSY` with `record`, and the usual action preconditions.
+- Before every motion step (pose, gripper, replay): epoch, workspace revision, calibration revision (joint zero, kinematic correction) and lease are compared with the start: `PLAN_STALE`, `CALIBRATION_CHANGED`, `LEASE_LOST`.
+- Stop, lease loss, collision, fault, e-stop and any step failure, planning refusals included (`IK_*`, `WORKSPACE_VIOLATION`, `REPLAY_TOO_FAST`, ...), end the parent with that code, also during a wait (checked every 20 ms). No step is skipped.
+- Pose step: joint-space quintic at the planned-motion limits × `speed_scale` (gripper kept unless `gripper: pose`), done once settled. Gripper steps as the gripper action (`close` detects holding). Replay steps as `/api/v1/action/replay`, checked without the lock.
+- `record`: the run owns the recorder; one episode per repeat (`source: "sequence"`, `sequence_id`, `repeat_index`, task = `record.task` or the sequence name), started before the repeat's first step and saved after its last step. The episode of an aborted repeat is discarded; finished repeats are kept.
+- `expected_duration_s` is an upper bound without power-budget slowdowns: per pose step the quintic from the previous target plus the 2 s settle limit, gripper steps their expected duration + 1 s, waits, replays the approach to the first recorded frame + recorded duration / speed + 0.5 s, 1 s per recorded repeat, + 1 s. The run fails `SEQUENCE_TIMEOUT` after twice the bound + 30 s.
+
+`capabilities.teach` = `{"version": 1, "episodes": true, "sequences": true}`（capabilities 版本 11；旧版 armd 没有该字段）。`GET` 路由无需租约；WS 指令沿用[消息](#message--消息)格式并带 `request_id`。测试见 `tests/test_teach_episodes.rs`、`tests/test_teach_sequences.rs`（mock follower），尚未在机械臂上运行。
+
+**片段存储。** 每个片段不可修改，由片段目录下的 `<id>.parquet` 与 `<id>.json`（sidecar）组成；新片段 id 为 ULID（26 个 Crockford base32 字符），teach v1 之前录制的片段保留原 id。Parquet 列：`timestamp`（float64，armd 单调时钟秒）、`observation.state`（list<float32>，实测关节角，rad）、`action`（list<float32>，指令，rad），保存的是控制周期的实测采样，不重采样；文件尾部的元数据也带一份 sidecar（键 `rebot.episode`）。sidecar 字段：`id, dataset, task, source, sequence_id?, repeat_index?, outcome, recorded_at, duration_s, frames, joint_names, units: "rad", joint_zero: {offsets_rad, rev}, profile_id, armd_version, fps_nominal`，另有 `truncated`、`stopped_by`、`arm_dof`、`gripper_joint`、`first_state`、`last_state`、`recovered`。`source` 取 `hand_guide`、`jog`、`servo`、`replay`、`sequence`、`import`、`sdk`；`joint_zero.rev` 为零位偏置的指纹（f32 位模式的 FNV-1a 64，16 位十六进制）。列表中的 `stale` 表示某关节零位偏置与录制时相差超过 0.5°；回放与序列步骤遇到过期片段返回 `DATA_STALE`，除非传 `allow_stale: true`。写入顺序：`<id>.parquet.tmp` → fsync → 重命名，再写 sidecar（临时文件 + 重命名）；控制周期只把帧追加到内存，文件在阻塞线程中写。启动恢复规则（逐个文件）：名称含 `.tmp` 的删除；有可读 sidecar 的 `<id>.parquet` 列出；没有 sidecar 时，尾部带 sidecar 的 parquet 恢复 sidecar（`recovered: "sidecar"`）；否则可读的旧 id 片段被收编（`recovered: "legacy"`，数据集 `default`，零位取启动时的值）；无法读取的 ULID 文件超过 1 小时删除，否则保留且不列出；其他无法读取的文件保留且不列出；没有 parquet 的 sidecar 删除。`datasets.json` 为 `{"datasets": {<名称>: {created_at, description}}}`，每个片段属于一个数据集，默认 `default`；数据集名称须匹配 `^[A-Za-z0-9_\- \p{Han}]{1,64}$`。REST：`GET /api/v1/episodes?dataset=&limit=&before=`（倒序，含 `stale`、`bytes` 与当前录制 `recording`）、`GET /api/v1/episodes/{id}`、`GET /api/v1/episodes/{id}/data`（parquet 文件）、`GET /api/v1/datasets`、`POST /api/v1/episodes/import`。无需租约的 WS 指令：`/api/v1/episodes/update {id, task?, dataset?}`、`/api/v1/episodes/delete {id}`（被序列引用时 `IN_USE {sequences}`）、`/api/v1/datasets/create {name, description?}`、`/api/v1/datasets/delete {name, force?}`（非空且无 `force` 时 `DATASET_NOT_EMPTY`）。
+
+**导入检查**（`IMPORT_INVALID` 的 `reason`）：`multipart`、`sidecar`、`schema`（列与类型）、`units`（只接受 `rad`，`deg` / `so101_norm` 须先转换）、`joint_names` / `joint_order`（须与 profile 关节及顺序一致）、`profile`、`dof`、`empty`、`timestamps`、`too_long`（超过 600 s）、`non_finite`、`soft_limit`（每个 `observation.state` 与 `action` 值都须在关节软限位内）。零位不同不拒绝，片段以 `stale: true` 保存；sidecar 没有 `joint_zero` 时视为过期。保存的副本使用新 id 与 `source: "import"`，未知数据集自动创建；请求体上限 64 MB。
+
+**录制归属。** 录制的归属与运动租约分开，网页可以在遥操作持有租约时录制。WS `/api/v1/record/start {dataset?, task?, source?}`（无需租约）返回 `{recording_id, owner}`（`GET /api/v1/episodes` 的 `recording` 另带 `dataset`、`task`、`started_at`），`owner` 为该连接的 `client_id`（消息中的 `client_id`，否则为该连接所持租约的标签；都没有时 `INVALID_COMMAND`）；同一时间只有一个录制，`RECORDER_BUSY {owner}`。`/api/v1/record/stop {save, outcome?}` 返回 `{episode}` 或 `{discarded: true}`，只有归属者可以停止（`RECORDER_NOT_OWNER {owner}`）。归属者的连接断开 5 s 后丢弃录制，除非 5 s 内同一 `client_id` 的连接发出 `record/stop`（取回录制）。旧 REST 路由 `/api/v1/dataset/record/start|save|discard`、`GET/DELETE /api/v1/dataset/episodes` 使用同一存储，归属者为 `legacy-rest`；给出 `episode_id` / `output_path` 时仍使用旧 id，否则为 ULID。磁盘保护：开始时空闲空间少于 200 MB 返回 `507 RECORD_NO_SPACE`；录制中低于 100 MB 时停止并保存（`stopped_by: "low_space"`）。长度上限 600 s：到达上限时控制周期停止追加，录制以 `truncated: true` 保存。这两项检查在监控任务中运行（每 200 ms，空闲空间每 1 s），不在控制循环中。
+
+**序列。** `sequences.json`（`ARMD_SEQUENCES`，默认 `/userdata/rebot-teleop/sequences.json`）保存 `{"sequences": [{id, name, description, steps, created_at, updated_at, rev}]}`，最多 200 步：`pose {pose_id, speed_scale 0.1..1.0, gripper keep|pose}`、`gripper {action open|close|move, fraction}`、`wait {s 0..60}`、`replay {episode_id, speed 0.5|1.0, gripper}`。姿态带 `id`（ULID，旧文件加载时分配并写回，用 `poses/save {id, name}` 改名时不变）；删除被序列引用的姿态或片段返回 `409 IN_USE {sequences}`。`GET /api/v1/sequences`、`GET /api/v1/sequences/{id}` 另带 `stale_steps`、`missing_steps` 与 `running`。WS `/api/v1/sequences/save {id?, name, description?, steps, rev?}`（需租约）：带 `id` 时为更新，给出的 `rev` 与存储不一致返回 `SEQUENCE_CONFLICT {rev}`；名称唯一（`SEQUENCE_EXISTS`）；引用不存在 `422 SEQUENCE_REF_MISSING {step}`。`/api/v1/sequences/delete {id}` 运行中返回 `SEQUENCE_RUNNING`。
+
+动作 `/api/v1/action/run_sequence {id, from_step?, single_step?, repeat? 1..100, record?: {dataset, task?}, allow_stale?, tag?}` 的 ack 带 `action_id` 与 `expected_duration_s`。一个类型为 `sequence` 的父动作，带 `sequence_id`、`step_index`（序列中从 0 开始的下标）、`step_type`、`repeat_index`（从 0 开始）、`repeats`、`phase`、`progress`、（录制时）`episodes`，未完成结束时带 `failed_step`（当时运行的步骤）；动作的 `id` 是动作 id，序列 id 在 `sequence_id`。开始时复制姿态并固定片段：运行中保存的姿态不影响本次运行，固定的条目不能删除。开始时拒绝：`SEQUENCE_NOT_FOUND`、`SEQUENCE_REF_MISSING`、`DATA_STALE {steps}`（零位变更后标记过期的姿态、用其他零位录制的片段；`allow_stale` 时放行）、录制时的 `RECORDER_BUSY` 以及常规动作前置条件。每个运动步骤（pose、gripper、replay）前比较 epoch、工作空间版本、标定版本（关节零位、运动学修正）与租约：`PLAN_STALE`、`CALIBRATION_CHANGED`、`LEASE_LOST`。停止、租约丢失、碰撞、故障、急停以及任一步骤失败（包括规划拒绝，如 `IK_*`、`WORKSPACE_VIOLATION`、`REPLAY_TOO_FAST`）都以对应错误码结束父动作，等待期间同样生效（每 20 ms 检查）；不跳过步骤。带 `record` 时序列独占录制器，每次重复一个片段（`source: "sequence"`、`sequence_id`、`repeat_index`，task 为 `record.task` 或序列名），在该次重复第一步前开始、最后一步后保存；中止的那次重复的片段被丢弃，已完成的保留。`expected_duration_s` 为上界（不含功率预算降速）：pose 步骤为自上一目标的五次多项式时长 + 2 s 到位上限，gripper 步骤为预计时长 + 1 s，等待时间，replay 为到首帧的接近 + 录制时长 / 速度 + 0.5 s，每次录制的重复 + 1 s，最后 + 1 s；超过两倍上界 + 30 s 以 `SEQUENCE_TIMEOUT` 结束。
 
 ## Gripper zero check and calibration / 夹爪零位检查与标定
 
@@ -779,7 +863,10 @@ SG2002 上电原因 `reset_reason`）；`blackbox?seconds=N` 返回本次启动�
 | `SOFT_LIMIT_EXCEEDED`, `INVALID_EPISODE_ID`, `INVALID_OUTPUT_PATH` | 400 |
 | `EPISODE_NOT_FOUND` | 404 |
 | `EPISODES_DISABLED`, `EPISODE_EXISTS` | 409 |
-| `EPISODES_FULL` (recording start / save) | 507 |
+| `EPISODES_FULL` (recording start / save), `RECORD_NO_SPACE` (recording start, import) | 507 |
+| `IMPORT_INVALID {reason}`, `SEQUENCE_REF_MISSING {step}` | 422 |
+| `DATASET_NOT_FOUND`, `SEQUENCE_NOT_FOUND` | 404 |
+| `RECORDER_BUSY {owner}`, `RECORDER_NOT_OWNER {owner}`, `IN_USE {sequences}`, `DATA_STALE`, `DATASET_EXISTS`, `DATASET_NOT_EMPTY`, `SEQUENCE_CONFLICT {rev}`, `SEQUENCE_EXISTS`, `SEQUENCE_RUNNING`, `POSE_EXISTS` (teach v1) | 409 |
 | `MOTION_BUSY`, `PLAN_STALE`, `COLLISION_HOLD` | 409 |
 | `CONFIG_BUSY`, `VISION_CALIBRATION_UNSUPPORTED`, `KINEMATICS_ARMED` (camera calibration; see [Camera calibration](#camera-calibration-wizard--相机标定向导)) | 409 |
 | `CALIBRATION_INCONSISTENT`, `PERSIST_FAILED` (calibration apply / restore) | 500 |
@@ -794,7 +881,7 @@ SG2002 上电原因 `reset_reason`）；`blackbox?seconds=N` 返回本次启动�
 | `POSE_NOT_FOUND` | 404 |
 | `GRAVITY_COMP_NOT_STATIONARY`, `GRAVITY_COMP_JOINT_LIMIT`, `GRAVITY_COMP_SWITCH_FAILED`, `FEEDBACK_STALE`, `LEASE_REQUIRED` (gravity compensation entry) | 409 |
 
-Codes that only appear in `action.code`: `COLLISION`, `TORQUE_LIMIT`, `POWER_LIMIT`, `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `ESTOP_ACTIVE`, `FAULT`, `WATCHDOG`, `LEASE_LOST`, `STOPPED`, `SUPERSEDED`, `UNLOAD_FAILED`; for `grasp` also `TARGET_LOST`, `TARGET_DISPLACED`, `CENTRING_FAILED`, `TOO_WIDE`, `NOT_HOLDING`, `DROPPED` (object lost after the lift), `OBJECT_TOO_TALL` (height probe), `GRASP_TIMEOUT`, `DETECTION_UNAVAILABLE`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a later phase; for `place` also `PLACE_TIMEOUT`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a re-planned phase.
+Codes that only appear in `action.code`: `COLLISION`, `TORQUE_LIMIT`, `POWER_LIMIT`, `TRACKING_STALL`, `GRIPPER_TIMEOUT`, `ESTOP_ACTIVE`, `FAULT`, `WATCHDOG`, `LEASE_LOST`, `STOPPED`, `SUPERSEDED`, `UNLOAD_FAILED`; for `grasp` also `TARGET_LOST`, `TARGET_DISPLACED`, `CENTRING_FAILED`, `TOO_WIDE`, `NOT_HOLDING`, `DROPPED` (object lost after the lift), `OBJECT_TOO_TALL` (height probe), `GRASP_TIMEOUT`, `DETECTION_UNAVAILABLE`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a later phase; for `place` also `PLACE_TIMEOUT`, `INTERNAL`, and `IK_*` / `WORKSPACE_VIOLATION` / `PLAN_STALE` from a re-planned phase; for `sequence` also `CALIBRATION_CHANGED`, `SEQUENCE_TIMEOUT`, `PLAN_STALE`, `RECORD_NO_SPACE` and the code of the failed step.
 
 ## Needs verification on the device / 需实机核实
 

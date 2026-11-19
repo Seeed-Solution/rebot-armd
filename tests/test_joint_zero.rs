@@ -249,7 +249,7 @@ async fn software_zero_captures_marks_poses_stale_and_restores() {
     assert!(!r.deps.path.exists(), "nothing left in calibration.json: removed");
     // re-saving a pose clears its stale mark
     let saved = cmd(&mut r, "/api/v1/poses/save", json!({"name": "bin_a"})).await;
-    assert!(saved["pose"].get("stale").is_none(), "{saved}");
+    assert!(saved["pose"]["stale"].is_null(), "{saved}");
 }
 
 #[tokio::test]

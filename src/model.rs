@@ -1713,7 +1713,7 @@ pub struct SchemaField {
 }
 
 /// Version of the capability summary in the observation schema (`capabilities`).
-pub const CAPABILITIES_VERSION: u32 = 10;
+pub const CAPABILITIES_VERSION: u32 = 11;
 
 /// Vision features armd offers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1830,8 +1830,28 @@ pub struct Capabilities {
     /// schema built from the profile alone. Present from capabilities version 10.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibration_tools: Option<CalibrationTools>,
+    /// Teach v1 (episode store, recorder ownership, sequences): `{version: 1, episodes,
+    /// sequences}`; `episodes` is false while episode storage is off. Present from
+    /// capabilities version 11; absent (null) from older armd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teach: Option<TeachCapabilities>,
     pub vision: VisionCapabilities,
 }
+
+/// `capabilities.teach`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TeachCapabilities {
+    pub version: u32,
+    /// `GET /api/v1/episodes`, `/api/v1/datasets`, WS `/api/v1/record/*`, `/api/v1/episodes/*`,
+    /// `/api/v1/datasets/*`, `POST /api/v1/episodes/import`.
+    pub episodes: bool,
+    /// `GET /api/v1/sequences`, WS `/api/v1/sequences/save|delete`, action `run_sequence`.
+    pub sequences: bool,
+}
+
+/// Version of `capabilities.teach`.
+pub const TEACH_VERSION: u32 = 1;
 
 /// `capabilities.calibration_tools` (also in `GET /api/v1/calibration`). A client renders only
 /// the tools with `supported: true`; an unsupported tool carries `reason`.
@@ -2045,6 +2065,10 @@ impl Capabilities {
             calibration_apply: grasp,
             calibration_kinematics: grasp && config.arm_model.chain().is_none(),
             calibration_tools: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            teach: Some(TeachCapabilities { version: TEACH_VERSION, episodes: true, sequences: true }),
+            #[cfg(target_arch = "wasm32")]
+            teach: None,
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
         }
     }

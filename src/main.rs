@@ -30,7 +30,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
                 --port <PORT>            HTTP / WebSocket port (default 8765)\n\
                 --log-dir <DIR>          rotating log armd.log (default /userdata/rebot-teleop/logs when /userdata exists; off disables)\n\
                 --blackbox-dir <DIR>     black box and boot record (default /userdata/rebot-teleop/blackbox when /userdata exists; off disables)\n\
-                --episodes-dir <DIR>     recorded episodes (default /userdata/rebot-teleop/episodes when /userdata exists, else ./data/episodes; off disables recording and replay)\n\
+                --episodes-dir <DIR>     episode store (teach v1) (default /userdata/rebot-teleop/episodes when /userdata exists, else ./data/episodes; off disables recording and replay)\n\
                 --help                   Print help\n\n\
                 Leader-following is not implemented. Hardware failures never fall back to mock.");
             std::process::exit(0);
@@ -237,8 +237,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     armd::grasp::load_into(&supervisor, &grasp_setup_path).await;
     // after the grasp setup: the calibration wins for camera_mount and camera_tilt_deg
     armd::calibration::load_into(&supervisor, &armd::calibration::path_from_env(), Some(&grasp_setup_path)).await;
+    // after the calibration: legacy episodes are adopted with the joint zero in effect
+    supervisor.load_episodes().await;
     armd::keepout::load_into(&supervisor, &armd::keepout::path_from_env()).await;
     armd::poses::load_into(&supervisor, &armd::poses::path_from_env()).await;
+    armd::sequences::load_into(&supervisor, &armd::sequences::path_from_env()).await;
     armd::collision::load_into(&supervisor, &armd::collision::path_from_env()).await;
     match follower {
         "rebot-rs" | "rebot-dm" => {

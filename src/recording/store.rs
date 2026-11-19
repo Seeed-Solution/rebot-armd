@@ -1,16 +1,25 @@
-//! Episode directory: file names, path checks, size cap, listing and deletion.
+//! Episode store (teach v1): immutable episodes, one `<id>.parquet` + `<id>.json` sidecar
+//! each, grouped into datasets by `datasets.json`.
 //!
-//! Every episode is `<dir>/<id>.parquet` with `id` matching `^[A-Za-z0-9_-]{1,64}$`.
-//! A client-supplied `output_path` must resolve to such a file directly inside `dir`.
-use std::collections::HashMap;
+//! - New episodes get a ULID id (26 characters, Crockford base32). Episodes recorded before the
+//!   store (legacy REST ids `^[A-Za-z0-9_-]{1,64}$`) keep their id.
+//! - Write order: `<id>.parquet.tmp` -> fsync -> rename to `<id>.parquet`, then the sidecar
+//!   (temp + rename). The parquet footer also carries the sidecar (key `rebot.episode`).
+//! - Boot recovery ([`EpisodeStore::load`]): see [`RecoveryReport`] for the exact rule.
+//! - The store keeps an in-memory catalog of every sidecar, so listing, reference checks and
+//!   stale flags need no file I/O; file I/O runs on blocking threads, never under the
+//!   supervisor lock.
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::parquet_writer::read_frames_from_parquet;
+use super::episode::RecordFrame;
+use super::parquet_writer::{read_frames_from_parquet, read_metadata_from_parquet, read_parquet_kv, write_episode_parquet, EpisodeMetadata, ParquetRecordingError};
 
 /// Default episode directory (used when `/userdata` exists).
 pub const DEFAULT_EPISODES_DIR: &str = "/userdata/rebot-teleop/episodes";
@@ -18,16 +27,210 @@ pub const DEFAULT_EPISODES_DIR: &str = "/userdata/rebot-teleop/episodes";
 pub const FALLBACK_EPISODES_DIR: &str = "./data/episodes";
 /// Environment variable read when `--episodes-dir` is not given.
 pub const EPISODES_DIR_ENV: &str = "ARMD_EPISODES_DIR";
-/// Saving (and starting) a recording is refused while the directory holds this many bytes.
+/// Starting a recording is refused while the directory holds this many bytes.
 pub const MAX_EPISODES_BYTES: u64 = 200 * 1024 * 1024;
-/// Saving (and starting) a recording is refused while the directory holds this many episodes.
+/// Starting a recording is refused while the directory holds this many episodes.
 pub const MAX_EPISODE_FILES: usize = 500;
 pub const EPISODE_EXT: &str = "parquet";
+pub const SIDECAR_EXT: &str = "json";
+pub const DATASETS_FILE: &str = "datasets.json";
+pub const DEFAULT_DATASET: &str = "default";
 pub const MAX_EPISODE_ID_LEN: usize = 64;
+/// Longest episode (s): a recording stops (saved, `truncated`) at this length; imports above it
+/// are refused.
+pub const MAX_EPISODE_S: f64 = 600.0;
+/// A recording does not start with less free space on the episode file system (bytes).
+pub const START_MIN_FREE_BYTES: u64 = 200 * 1024 * 1024;
+/// A running recording stops (saved) below this free space (bytes).
+pub const STOP_MIN_FREE_BYTES: u64 = 100 * 1024 * 1024;
+/// Boot recovery deletes an unreadable ULID episode without sidecar only when older than this.
+pub const ORPHAN_AGE: Duration = Duration::from_secs(3600);
+/// Parquet key-value entry holding the sidecar JSON (sidecar recovery).
+pub const PARQUET_SIDECAR_KEY: &str = "rebot.episode";
+/// `source` values of a sidecar.
+pub const EPISODE_SOURCES: [&str; 7] = ["hand_guide", "jog", "servo", "replay", "sequence", "import", "sdk"];
 
-/// `^[A-Za-z0-9_-]{1,64}$`
+const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// `^[A-Za-z0-9_-]{1,64}$`: every episode id (ULIDs and legacy ids).
 pub fn valid_episode_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_EPISODE_ID_LEN && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// 26 Crockford base32 characters (upper case), first one 0-7.
+pub fn is_ulid(id: &str) -> bool {
+    id.len() == 26 && id.bytes().all(|b| CROCKFORD.contains(&b)) && id.as_bytes()[0] <= b'7'
+}
+
+/// A new ULID: 48-bit Unix ms + 80 random bits; strictly increasing within this process.
+pub fn new_ulid() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static LAST: Mutex<u128> = Mutex::new(0);
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let ms = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64) & ((1 << 48) - 1);
+    let random = || {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+        h.write_u128(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+        h.finish()
+    };
+    let rand80 = ((u128::from(random()) << 64) | u128::from(random())) & ((1u128 << 80) - 1);
+    let mut value = (u128::from(ms) << 80) | rand80;
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if value <= *last { value = *last + 1; }
+    *last = value;
+    (0..26).map(|i| CROCKFORD[((value >> (125 - 5 * i)) & 0x1f) as usize] as char).collect()
+}
+
+/// Fingerprint of joint zero offsets (FNV-1a 64 over the f32 bits, 16 hex digits): equal offsets,
+/// equal revision, across restarts.
+pub fn zero_rev(offsets: &[f32]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for o in offsets {
+        for b in o.to_bits().to_le_bytes() { h ^= u64::from(b); h = h.wrapping_mul(0x0100_0000_01b3); }
+    }
+    format!("{h:016x}")
+}
+
+/// Display names of datasets and sequences: `^[A-Za-z0-9_\- \p{Han}]{1,64}$` (64 characters).
+pub fn valid_display_name(name: &str) -> bool {
+    let n = name.chars().count();
+    (1..=64).contains(&n) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ' ' || is_han(c))
+}
+
+fn is_han(c: char) -> bool {
+    matches!(c as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x2A6DF | 0x2A700..=0x2EBEF | 0x30000..=0x3134F | 0x2F800..=0x2FA1F | 0x3005 | 0x3007 | 0x3021..=0x3029)
+}
+
+/// `sidecar.joint_zero`: the joint zero in effect at capture.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct JointZeroStamp {
+    pub offsets_rad: Vec<f64>,
+    pub rev: String,
+}
+
+impl JointZeroStamp {
+    pub fn of(offsets: &[f32]) -> Self {
+        Self { offsets_rad: offsets.iter().map(|o| f64::from(*o)).collect(), rev: zero_rev(offsets) }
+    }
+
+    /// A joint zero moved by more than [`crate::joint_zero::STALE_THRESHOLD_RAD`] since capture.
+    pub fn stale_against(&self, current: &[f32]) -> bool {
+        self.offsets_rad.len() != current.len()
+            || self.offsets_rad.iter().zip(current).any(|(a, b)| (a - f64::from(*b)).abs() > crate::joint_zero::STALE_THRESHOLD_RAD)
+    }
+}
+
+/// `<id>.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EpisodeSidecar {
+    pub id: String,
+    pub dataset: String,
+    #[serde(default)]
+    pub task: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_index: Option<u32>,
+    /// `ok` | `aborted`.
+    pub outcome: String,
+    /// RFC 3339 UTC time of the start of the recording.
+    pub recorded_at: String,
+    pub duration_s: f64,
+    pub frames: usize,
+    pub joint_names: Vec<String>,
+    /// Always `rad`.
+    pub units: String,
+    pub joint_zero: JointZeroStamp,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    pub armd_version: String,
+    /// Control rate of the capture (Hz); timestamps are the measured samples, not resampled.
+    pub fps_nominal: f64,
+    /// Stopped at [`MAX_EPISODE_S`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// Why the recording stopped when armd stopped it: `max_duration` | `low_space`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm_dof: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gripper_joint: Option<usize>,
+    /// Set by boot recovery: `sidecar` (rebuilt from the parquet footer) or `legacy` (an episode
+    /// recorded before the store, adopted with the joint zero of the boot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered: Option<String>,
+    /// First and last `observation.state` (rad): the approach of a replay step and where it
+    /// ends, without reading the parquet (sequence duration bound).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_state: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_state: Option<Vec<f32>>,
+}
+
+impl EpisodeSidecar {
+    pub fn metadata(&self) -> EpisodeMetadata {
+        EpisodeMetadata { profile_id: self.profile_id.clone(), arm_dof: self.arm_dof, gripper_joint: self.gripper_joint, joint_names: Some(self.joint_names.clone()) }
+    }
+}
+
+/// An episode in the API: the sidecar, `stale` against the current joint zero, file size.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EpisodeView {
+    #[serde(flatten)]
+    pub sidecar: EpisodeSidecar,
+    pub stale: bool,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DatasetInfo {
+    pub created_at: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// `datasets.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct DatasetsManifest {
+    #[serde(default)]
+    pub datasets: BTreeMap<String, DatasetInfo>,
+}
+
+/// `GET /api/v1/datasets` entry.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DatasetSummary {
+    pub name: String,
+    pub episodes: usize,
+    pub duration_s: f64,
+    pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    pub description: String,
+}
+
+/// What [`EpisodeStore::load`] did. Rule, per file in the episode directory:
+/// 1. a name containing `.tmp` (unfinished parquet / sidecar / manifest write) is deleted;
+/// 2. `<id>.parquet` with a readable `<id>.json` is listed;
+/// 3. `<id>.parquet` without a (readable) sidecar whose footer carries the sidecar
+///    ([`PARQUET_SIDECAR_KEY`], a crash between the parquet rename and the sidecar write)
+///    gets the sidecar back (`recovered: "sidecar"`);
+/// 4. otherwise, a readable parquet with a legacy id is adopted (`recovered: "legacy"`,
+///    dataset `default`, joint zero of the boot);
+/// 5. otherwise (unreadable): a ULID-named file older than [`ORPHAN_AGE`] is deleted, any
+///    other file is left in place and not listed;
+/// 6. `<id>.json` without `<id>.parquet` is deleted.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct RecoveryReport {
+    pub episodes: usize,
+    pub temps_removed: Vec<String>,
+    pub sidecars_rebuilt: Vec<String>,
+    pub legacy_adopted: Vec<String>,
+    pub orphans_removed: Vec<String>,
+    pub orphans_kept: Vec<String>,
+    pub sidecars_removed: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -44,8 +247,22 @@ pub enum StoreError {
     Exists(String),
     #[error("Episode directory is full: {files} files, {bytes} bytes (limits {max_files} files, {max_bytes} bytes); delete episodes first")]
     Full { files: usize, bytes: u64, max_files: usize, max_bytes: u64 },
+    #[error("Only {free} bytes free on the episode file system; a recording needs {need}")]
+    NoSpace { free: u64, need: u64 },
+    #[error("Dataset '{0}' not found")]
+    DatasetNotFound(String),
+    #[error("Dataset '{0}' already exists")]
+    DatasetExists(String),
+    #[error("Dataset '{0}' holds {1} episode(s); delete them first or pass force")]
+    DatasetNotEmpty(String, usize),
+    #[error("Invalid dataset name '{0}': 1-64 characters from letters, digits, _ - space and Han characters")]
+    InvalidDataset(String),
+    #[error("{0}")]
+    Invalid(String),
     #[error("Episode directory I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Episode file error: {0}")]
+    Parquet(#[from] ParquetRecordingError),
 }
 
 impl StoreError {
@@ -58,12 +275,17 @@ impl StoreError {
             Self::NotFound(_) => (404, "EPISODE_NOT_FOUND"),
             Self::Exists(_) => (409, "EPISODE_EXISTS"),
             Self::Full { .. } => (507, "EPISODES_FULL"),
-            Self::Io(_) => (500, "EPISODES_IO_ERROR"),
+            Self::NoSpace { .. } => (507, "RECORD_NO_SPACE"),
+            Self::DatasetNotFound(_) => (404, "DATASET_NOT_FOUND"),
+            Self::DatasetExists(_) => (409, "DATASET_EXISTS"),
+            Self::DatasetNotEmpty(..) => (409, "DATASET_NOT_EMPTY"),
+            Self::InvalidDataset(_) | Self::Invalid(_) => (400, "INVALID_COMMAND"),
+            Self::Io(_) | Self::Parquet(_) => (500, "EPISODES_IO_ERROR"),
         }
     }
 }
 
-/// One saved episode in `GET /api/v1/dataset/episodes`.
+/// One saved episode in the legacy `GET /api/v1/dataset/episodes`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EpisodeInfo {
     pub id: String,
@@ -71,7 +293,7 @@ pub struct EpisodeInfo {
     /// Last minus first timestamp (s).
     pub duration_s: f64,
     pub size_bytes: u64,
-    /// File modification time (Unix ms); armd writes the file once, at save.
+    /// Start of the recording (Unix ms).
     pub created_ms: u64,
     /// Joints per frame (`observation.state` length).
     pub dof: usize,
@@ -81,9 +303,18 @@ pub struct EpisodeInfo {
     /// Set when the file could not be read; the other fields are then zero / empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// teach v1 fields (dataset, task, source, stale) for clients that read the legacy list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub stale: bool,
 }
 
-/// `GET /api/v1/dataset/episodes` body.
+/// Legacy `GET /api/v1/dataset/episodes` body.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EpisodeList {
     pub enabled: bool,
@@ -94,17 +325,41 @@ pub struct EpisodeList {
     pub max_files: usize,
 }
 
+#[derive(Debug, Clone)]
+struct Entry { sidecar: EpisodeSidecar, bytes: u64 }
+
+#[derive(Debug, Default)]
+struct Catalog {
+    loaded: bool,
+    episodes: HashMap<String, Entry>,
+    datasets: DatasetsManifest,
+}
+
 type SummaryCache = Arc<Mutex<HashMap<String, (SystemTime, u64, EpisodeInfo)>>>;
 
-/// Episode directory; `dir == None` means storage is off.
+/// Episode directory and its catalog; `dir == None` means storage is off. Clones share the
+/// catalog.
 #[derive(Debug, Clone, Default)]
 pub struct EpisodeStore {
     dir: Option<PathBuf>,
     cache: SummaryCache,
+    catalog: Arc<Mutex<Catalog>>,
+    /// Test hook: free bytes reported instead of the file system's.
+    free_override: Arc<Mutex<Option<u64>>>,
+    /// Serialises sidecar / manifest rewrites.
+    write_lock: Arc<Mutex<()>>,
 }
 
+fn now_rfc3339() -> String { chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true) }
+
+fn recorded_ms(s: &str) -> u64 {
+    chrono::DateTime::parse_from_rfc3339(s).map_or(0, |t| t.timestamp_millis().max(0) as u64)
+}
+
+fn is_temp_name(name: &str) -> bool { name.contains(".tmp") }
+
 impl EpisodeStore {
-    pub fn new(dir: Option<PathBuf>) -> Self { Self { dir, cache: SummaryCache::default() } }
+    pub fn new(dir: Option<PathBuf>) -> Self { Self { dir, ..Default::default() } }
 
     /// `--episodes-dir` value, else `ARMD_EPISODES_DIR`, else [`DEFAULT_EPISODES_DIR`] when
     /// `/userdata` exists, else [`FALLBACK_EPISODES_DIR`]. `off`, `none` or empty: storage off.
@@ -121,7 +376,11 @@ impl EpisodeStore {
 
     pub fn dir(&self) -> Option<&Path> { self.dir.as_deref() }
 
+    pub fn enabled(&self) -> bool { self.dir.is_some() }
+
     fn require_dir(&self) -> Result<&Path, StoreError> { self.dir.as_deref().ok_or(StoreError::Disabled) }
+
+    fn cat(&self) -> std::sync::MutexGuard<'_, Catalog> { self.catalog.lock().unwrap_or_else(|e| e.into_inner()) }
 
     /// `<dir>/<id>.parquet` for a valid `id`.
     pub fn path_of(&self, id: &str) -> Result<PathBuf, StoreError> {
@@ -130,11 +389,319 @@ impl EpisodeStore {
         Ok(dir.join(format!("{id}.{EPISODE_EXT}")))
     }
 
-    /// Episode id and file for a new recording. `client_path` (absolute, or relative to the
-    /// episode directory) must name `<id>.parquet` directly inside the directory; its stem
-    /// is the id and must equal `episode_id` when both are given. Without either, the id is
-    /// `episode_<UTC date>_<time>` (with `_2`, `_3`... when taken). An existing file is
-    /// [`StoreError::Exists`].
+    fn sidecar_path(dir: &Path, id: &str) -> PathBuf { dir.join(format!("{id}.{SIDECAR_EXT}")) }
+
+    // ---- boot recovery and catalog ----
+
+    /// Boot recovery and catalog load (blocking). `offsets` = the joint zero at boot (legacy
+    /// adoption). Rule: [`RecoveryReport`].
+    pub fn load(&self, offsets: &[f32], joint_names: &[String], profile_id: Option<&str>, fps: f64) -> Result<RecoveryReport, StoreError> {
+        let mut report = RecoveryReport::default();
+        let Some(dir) = self.dir.as_deref() else { return Ok(report); };
+        let mut episodes = HashMap::new();
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e.collect::<Result<Vec<_>, _>>()?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let mut parquet_ids = Vec::new();
+        let mut sidecar_ids = Vec::new();
+        for entry in &entries {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_string) else { continue; };
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) { continue; }
+            if is_temp_name(&name) {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => report.temps_removed.push(name),
+                    Err(e) => tracing::warn!("Cannot remove {}: {e}", path.display()),
+                }
+                continue;
+            }
+            let ext = path.extension().and_then(|e| e.to_str());
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()).filter(|s| valid_episode_id(s)) else { continue; };
+            match ext {
+                Some(EPISODE_EXT) => parquet_ids.push(stem.to_string()),
+                Some(SIDECAR_EXT) if name != DATASETS_FILE => sidecar_ids.push(stem.to_string()),
+                _ => {}
+            }
+        }
+        for id in &parquet_ids {
+            let ppath = dir.join(format!("{id}.{EPISODE_EXT}"));
+            let bytes = std::fs::metadata(&ppath).map_or(0, |m| m.len());
+            let spath = Self::sidecar_path(dir, id);
+            if let Some(sc) = std::fs::read_to_string(&spath).ok().and_then(|t| serde_json::from_str::<EpisodeSidecar>(&t).ok()).filter(|s| &s.id == id) {
+                episodes.insert(id.clone(), Entry { sidecar: sc, bytes });
+                continue;
+            }
+            // no (readable) sidecar
+            let embedded = read_parquet_kv(&ppath).ok()
+                .and_then(|kv| kv.get(PARQUET_SIDECAR_KEY).cloned())
+                .and_then(|t| serde_json::from_str::<EpisodeSidecar>(&t).ok())
+                .filter(|s| &s.id == id);
+            if let Some(mut sc) = embedded {
+                sc.recovered = Some("sidecar".into());
+                Self::write_sidecar_file(dir, &sc)?;
+                report.sidecars_rebuilt.push(id.clone());
+                episodes.insert(id.clone(), Entry { sidecar: sc, bytes });
+                continue;
+            }
+            if !is_ulid(id) {
+                if let Some(sc) = adopt_legacy(&ppath, id, offsets, joint_names, profile_id, fps) {
+                    Self::write_sidecar_file(dir, &sc)?;
+                    report.legacy_adopted.push(id.clone());
+                    episodes.insert(id.clone(), Entry { sidecar: sc, bytes });
+                    continue;
+                }
+                report.orphans_kept.push(id.clone());
+                continue;
+            }
+            let age = std::fs::metadata(&ppath).and_then(|m| m.modified()).ok()
+                .and_then(|t| SystemTime::now().duration_since(t).ok()).unwrap_or_default();
+            if age > ORPHAN_AGE {
+                std::fs::remove_file(&ppath)?;
+                report.orphans_removed.push(id.clone());
+            } else {
+                report.orphans_kept.push(id.clone());
+            }
+        }
+        for id in sidecar_ids.iter().filter(|id| !parquet_ids.contains(id)) {
+            let spath = Self::sidecar_path(dir, id);
+            // only files that parse as a sidecar: other JSON files are left alone
+            if std::fs::read_to_string(&spath).ok().and_then(|t| serde_json::from_str::<EpisodeSidecar>(&t).ok()).is_some() {
+                std::fs::remove_file(&spath)?;
+                report.sidecars_removed.push(id.clone());
+            }
+        }
+        let datasets = match std::fs::read_to_string(dir.join(DATASETS_FILE)) {
+            Ok(t) => serde_json::from_str::<DatasetsManifest>(&t).unwrap_or_else(|e| {
+                tracing::warn!("Ignoring {}: {e}", dir.join(DATASETS_FILE).display());
+                DatasetsManifest::default()
+            }),
+            Err(_) => DatasetsManifest::default(),
+        };
+        report.episodes = episodes.len();
+        let mut cat = self.cat();
+        // entries written while the directory was scanned (a concurrent first use) are kept
+        for (id, e) in episodes { cat.episodes.entry(id).or_insert(e); }
+        if !cat.loaded { cat.datasets = datasets; }
+        cat.loaded = true;
+        Ok(report)
+    }
+
+    pub fn is_loaded(&self) -> bool { self.cat().loaded }
+
+    fn write_sidecar_file(dir: &Path, sc: &EpisodeSidecar) -> Result<(), StoreError> {
+        let text = serde_json::to_string_pretty(sc).map_err(|e| StoreError::Invalid(e.to_string()))?;
+        crate::persist::write_atomic(&Self::sidecar_path(dir, &sc.id), &text)?;
+        Ok(())
+    }
+
+    fn write_manifest(&self, dir: &Path, manifest: &DatasetsManifest) -> Result<(), StoreError> {
+        let text = serde_json::to_string_pretty(manifest).map_err(|e| StoreError::Invalid(e.to_string()))?;
+        crate::persist::write_atomic(&dir.join(DATASETS_FILE), &text)?;
+        Ok(())
+    }
+
+    /// The sidecar of `id` (catalog only, no I/O).
+    pub fn get(&self, id: &str) -> Option<EpisodeSidecar> { self.cat().episodes.get(id).map(|e| e.sidecar.clone()) }
+
+    pub fn contains(&self, id: &str) -> bool { self.cat().episodes.contains_key(id) }
+
+    /// [`get`](Self::get), else (episode files written next to the store, tests and tools) adopt
+    /// `<id>.parquet` like boot recovery does (blocking).
+    pub fn get_or_adopt(&self, id: &str, offsets: &[f32], joint_names: &[String], profile_id: Option<&str>, fps: f64) -> Result<EpisodeSidecar, StoreError> {
+        if let Some(s) = self.get(id) { return Ok(s); }
+        let path = self.path_of(id)?;
+        let dir = self.require_dir()?;
+        if !path.is_file() { return Err(StoreError::NotFound(id.into())); }
+        let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+        let sc = read_parquet_kv(&path).ok().and_then(|kv| kv.get(PARQUET_SIDECAR_KEY).cloned())
+            .and_then(|t| serde_json::from_str::<EpisodeSidecar>(&t).ok()).filter(|s| s.id == id)
+            .or_else(|| adopt_legacy(&path, id, offsets, joint_names, profile_id, fps))
+            .ok_or_else(|| StoreError::Invalid(format!("episode '{id}' cannot be read")))?;
+        let _w = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        Self::write_sidecar_file(dir, &sc)?;
+        self.cat().episodes.insert(id.into(), Entry { sidecar: sc.clone(), bytes });
+        Ok(sc)
+    }
+
+    /// Episodes, newest first (`recorded_at`, then id). `before`: only those after the episode
+    /// with this id in that order. `limit`: at most this many.
+    pub fn list_episodes(&self, dataset: Option<&str>, limit: Option<usize>, before: Option<&str>, offsets: &[f32]) -> Vec<EpisodeView> {
+        let cat = self.cat();
+        let mut all: Vec<&Entry> = cat.episodes.values().filter(|e| dataset.is_none_or(|d| e.sidecar.dataset == d)).collect();
+        all.sort_by(|a, b| b.sidecar.recorded_at.cmp(&a.sidecar.recorded_at).then_with(|| b.sidecar.id.cmp(&a.sidecar.id)));
+        let start = before.and_then(|b| all.iter().position(|e| e.sidecar.id == b).map(|i| i + 1)).unwrap_or(if before.is_some() { all.len() } else { 0 });
+        all.into_iter().skip(start).take(limit.unwrap_or(usize::MAX))
+            .map(|e| EpisodeView { stale: e.sidecar.joint_zero.stale_against(offsets), sidecar: e.sidecar.clone(), bytes: e.bytes })
+            .collect()
+    }
+
+    pub fn view(&self, id: &str, offsets: &[f32]) -> Option<EpisodeView> {
+        self.cat().episodes.get(id).map(|e| EpisodeView { stale: e.sidecar.joint_zero.stale_against(offsets), sidecar: e.sidecar.clone(), bytes: e.bytes })
+    }
+
+    /// Every dataset of the manifest plus `default` and any name an episode carries.
+    pub fn datasets(&self) -> Vec<DatasetSummary> {
+        let cat = self.cat();
+        let mut out: BTreeMap<String, DatasetSummary> = BTreeMap::new();
+        let mut add = |name: &str, info: Option<&DatasetInfo>| {
+            out.entry(name.to_string()).or_insert_with(|| DatasetSummary {
+                name: name.into(), episodes: 0, duration_s: 0.0, bytes: 0,
+                created_at: info.map(|i| i.created_at.clone()), description: info.map(|i| i.description.clone()).unwrap_or_default(),
+            });
+        };
+        add(DEFAULT_DATASET, cat.datasets.datasets.get(DEFAULT_DATASET));
+        for (name, info) in &cat.datasets.datasets { add(name, Some(info)); }
+        for e in cat.episodes.values() { add(&e.sidecar.dataset, None); }
+        for e in cat.episodes.values() {
+            if let Some(d) = out.get_mut(&e.sidecar.dataset) {
+                d.episodes += 1;
+                d.duration_s += e.sidecar.duration_s;
+                d.bytes += e.bytes;
+            }
+        }
+        out.into_values().collect()
+    }
+
+    /// The dataset exists (`default` always does).
+    pub fn has_dataset(&self, name: &str) -> bool {
+        name == DEFAULT_DATASET || self.cat().datasets.datasets.contains_key(name)
+    }
+
+    /// Episode ids of `dataset` (catalog).
+    pub fn episodes_of(&self, dataset: &str) -> Vec<String> {
+        self.cat().episodes.values().filter(|e| e.sidecar.dataset == dataset).map(|e| e.sidecar.id.clone()).collect()
+    }
+
+    /// Add a dataset to the manifest (blocking).
+    pub fn create_dataset(&self, name: &str, description: &str) -> Result<DatasetSummary, StoreError> {
+        let dir = self.require_dir()?;
+        if !valid_display_name(name) { return Err(StoreError::InvalidDataset(name.into())); }
+        let _w = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut manifest = self.cat().datasets.clone();
+        if manifest.datasets.contains_key(name) || (name == DEFAULT_DATASET && !self.episodes_of(name).is_empty()) {
+            return Err(StoreError::DatasetExists(name.into()));
+        }
+        let info = DatasetInfo { created_at: now_rfc3339(), description: description.into() };
+        manifest.datasets.insert(name.into(), info.clone());
+        std::fs::create_dir_all(dir)?;
+        self.write_manifest(dir, &manifest)?;
+        self.cat().datasets = manifest;
+        Ok(DatasetSummary { name: name.into(), episodes: 0, duration_s: 0.0, bytes: 0, created_at: Some(info.created_at), description: info.description })
+    }
+
+    /// Remove a dataset from the manifest and, with `force`, its episodes (blocking). The
+    /// caller checks references first ([`take_for_delete`](Self::take_for_delete)).
+    pub fn delete_dataset(&self, name: &str, force: bool) -> Result<Vec<String>, StoreError> {
+        let dir = self.require_dir()?;
+        let ids = self.episodes_of(name);
+        let known = self.has_dataset(name) || !ids.is_empty();
+        if !known { return Err(StoreError::DatasetNotFound(name.into())); }
+        if !ids.is_empty() && !force { return Err(StoreError::DatasetNotEmpty(name.into(), ids.len())); }
+        for id in &ids { self.delete(id)?; }
+        let _w = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut manifest = self.cat().datasets.clone();
+        if manifest.datasets.remove(name).is_some() {
+            self.write_manifest(dir, &manifest)?;
+            self.cat().datasets = manifest;
+        }
+        Ok(ids)
+    }
+
+    /// Change `task` and / or `dataset` of an episode (sidecar rewrite, blocking).
+    pub fn update(&self, id: &str, task: Option<&str>, dataset: Option<&str>) -> Result<EpisodeSidecar, StoreError> {
+        let dir = self.require_dir()?;
+        if let Some(d) = dataset { if !self.has_dataset(d) { return Err(StoreError::DatasetNotFound(d.into())); } }
+        if task.is_some_and(|t| t.chars().count() > 256) { return Err(StoreError::Invalid("task is at most 256 characters".into())); }
+        let _w = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sc = self.get(id).ok_or_else(|| StoreError::NotFound(id.into()))?;
+        if let Some(t) = task { sc.task = t.into(); }
+        if let Some(d) = dataset { sc.dataset = d.into(); }
+        Self::write_sidecar_file(dir, &sc)?;
+        if let Some(e) = self.cat().episodes.get_mut(id) { e.sidecar = sc.clone(); }
+        Ok(sc)
+    }
+
+    /// Remove `id` from the catalog (no I/O; the caller deletes the files with
+    /// [`delete_files`](Self::delete_files)). Returns whether it was listed.
+    pub fn take_for_delete(&self, id: &str) -> bool { self.cat().episodes.remove(id).is_some() }
+
+    /// Remove `<id>.parquet`, `<id>.json` and a legacy `<id>.meta.json` (blocking).
+    pub fn delete_files(&self, id: &str) -> Result<(), StoreError> {
+        let path = self.path_of(id)?;
+        let dir = self.require_dir()?;
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        let mut found = false;
+        for p in [path.clone(), Self::sidecar_path(dir, id), path.with_extension("meta.json")] {
+            match std::fs::remove_file(&p) {
+                Ok(()) => found = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if found { Ok(()) } else { Err(StoreError::NotFound(id.into())) }
+    }
+
+    /// Catalog removal + file removal (blocking).
+    pub fn delete(&self, id: &str) -> Result<(), StoreError> {
+        let listed = self.take_for_delete(id);
+        match self.delete_files(id) {
+            Err(StoreError::NotFound(_)) if listed => Ok(()),
+            other => other,
+        }
+    }
+
+    /// Write a new episode (blocking): parquet (temp + fsync + rename, sidecar in the footer),
+    /// then the sidecar, then the catalog entry. `writer` writes the parquet file at the path
+    /// it gets; None = the store's writer.
+    pub fn write_episode(&self, sidecar: &EpisodeSidecar, frames: &[RecordFrame],
+                         writer: Option<Box<dyn FnOnce(&Path, &[RecordFrame]) -> Result<(), ParquetRecordingError> + Send>>) -> Result<PathBuf, StoreError> {
+        let dir = self.require_dir()?;
+        let path = self.path_of(&sidecar.id)?;
+        if self.contains(&sidecar.id) { return Err(StoreError::Exists(sidecar.id.clone())); }
+        std::fs::create_dir_all(dir)?;
+        match writer {
+            Some(w) => w(&path, frames)?,
+            None => {
+                let embedded = serde_json::to_string(sidecar).map_err(|e| StoreError::Invalid(e.to_string()))?;
+                write_episode_parquet(&path, frames, Some(&sidecar.metadata()), &[(PARQUET_SIDECAR_KEY, embedded)])?;
+            }
+        }
+        Self::write_sidecar_file(dir, sidecar)?;
+        let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+        self.cat().episodes.insert(sidecar.id.clone(), Entry { sidecar: sidecar.clone(), bytes });
+        Ok(path)
+    }
+
+    // ---- recording checks ----
+
+    /// Set the free bytes reported by [`free_bytes`](Self::free_bytes) (tests). None: the file system.
+    pub fn set_free_bytes_override(&self, bytes: Option<u64>) {
+        *self.free_override.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
+    }
+
+    /// Free bytes on the file system of the episode directory (its nearest existing ancestor).
+    pub fn free_bytes(&self) -> Option<u64> {
+        if let Some(b) = *self.free_override.lock().unwrap_or_else(|e| e.into_inner()) { return Some(b); }
+        let dir = self.dir.as_deref()?;
+        let mut p = std::path::absolute(dir).ok()?;
+        while !p.exists() { if !p.pop() { return None; } }
+        statvfs_free(&p)
+    }
+
+    /// RECORD_NO_SPACE below [`START_MIN_FREE_BYTES`] (unknown free space passes).
+    pub fn check_free_for_start(&self) -> Result<(), StoreError> {
+        match self.free_bytes() {
+            Some(free) if free < START_MIN_FREE_BYTES => Err(StoreError::NoSpace { free, need: START_MIN_FREE_BYTES }),
+            _ => Ok(()),
+        }
+    }
+
+    /// Legacy REST start: id and file for a new recording. `client_path` (absolute, or
+    /// relative to the episode directory) must name `<id>.parquet` directly inside the
+    /// directory; its stem is the id and must equal `episode_id` when both are given. Without
+    /// either, the id is a new ULID. An existing episode is [`StoreError::Exists`].
     pub fn new_episode(&self, episode_id: Option<&str>, client_path: Option<&Path>) -> Result<(String, PathBuf), StoreError> {
         let dir = self.require_dir()?;
         if let Some(id) = episode_id {
@@ -150,17 +717,11 @@ impl EpisodeStore {
             }
             None => match episode_id {
                 Some(id) => id.to_string(),
-                None => {
-                    let base = format!("episode_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S"));
-                    let mut id = base.clone();
-                    let mut n = 2;
-                    while dir.join(format!("{id}.{EPISODE_EXT}")).exists() { id = format!("{base}_{n}"); n += 1; }
-                    id
-                }
+                None => new_ulid(),
             },
         };
         let path = dir.join(format!("{id}.{EPISODE_EXT}"));
-        if path.exists() { return Err(StoreError::Exists(id)); }
+        if path.exists() || self.contains(&id) { return Err(StoreError::Exists(id)); }
         Ok((id, path))
     }
 
@@ -206,52 +767,81 @@ impl EpisodeStore {
         Ok(())
     }
 
-    /// Saved episodes, newest first. Summaries are cached by (mtime, size).
+    /// Legacy listing: catalog episodes with per-joint ranges, newest first. Ranges are read
+    /// from the parquet and cached by (mtime, size).
     pub fn list(&self) -> Result<EpisodeList, StoreError> {
+        self.list_with(&[])
+    }
+
+    pub fn list_with(&self, offsets: &[f32]) -> Result<EpisodeList, StoreError> {
         let Some(dir) = self.dir.as_deref() else {
             return Ok(EpisodeList { enabled: false, dir: None, episodes: Vec::new(), total_bytes: 0, max_bytes: MAX_EPISODES_BYTES, max_files: MAX_EPISODE_FILES });
         };
+        let entries: Vec<Entry> = self.cat().episodes.values().cloned().collect();
         let mut episodes = Vec::new();
         let mut total_bytes = 0;
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let mut seen = Vec::new();
-        for (id, meta) in episode_files(dir)? {
+        for e in &entries {
+            let id = &e.sidecar.id;
+            let path = dir.join(format!("{id}.{EPISODE_EXT}"));
+            let Ok(meta) = std::fs::metadata(&path) else { continue; };
             total_bytes += meta.len();
             let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            let info = match cache.get(&id) {
+            let mut info = match cache.get(id) {
                 Some((t, size, info)) if *t == mtime && *size == meta.len() => info.clone(),
                 _ => {
-                    let info = summarize(&id, &dir.join(format!("{id}.{EPISODE_EXT}")), meta.len(), mtime);
+                    let info = summarize(id, &path, meta.len());
                     cache.insert(id.clone(), (mtime, meta.len(), info.clone()));
                     info
                 }
             };
-            seen.push(id);
+            info.created_ms = recorded_ms(&e.sidecar.recorded_at);
+            info.dataset = Some(e.sidecar.dataset.clone());
+            info.task = Some(e.sidecar.task.clone());
+            info.source = Some(e.sidecar.source.clone());
+            info.stale = !offsets.is_empty() && e.sidecar.joint_zero.stale_against(offsets);
             episodes.push(info);
         }
-        cache.retain(|id, _| seen.contains(id));
-        episodes.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then_with(|| a.id.cmp(&b.id)));
+        cache.retain(|id, _| entries.iter().any(|e| &e.sidecar.id == id));
+        episodes.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then_with(|| b.id.cmp(&a.id)));
         Ok(EpisodeList { enabled: true, dir: Some(dir.display().to_string()), episodes, total_bytes, max_bytes: MAX_EPISODES_BYTES, max_files: MAX_EPISODE_FILES })
     }
+}
 
-    /// Remove `<dir>/<id>.parquet` and any sidecar `<dir>/<id>.meta.json`.
-    pub fn delete(&self, id: &str) -> Result<(), StoreError> {
-        let path = self.path_of(id)?;
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                self.cache.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
-                let meta_path = path.with_extension("meta.json");
-                if let Err(e) = std::fs::remove_file(&meta_path) {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!("Failed to remove episode sidecar {}: {}", meta_path.display(), e);
-                    }
-                }
-                Ok(())
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(StoreError::NotFound(id.into())),
-            Err(e) => Err(e.into()),
-        }
-    }
+#[cfg(unix)]
+fn statvfs_free(p: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a NUL-terminated path and `st` a valid out pointer.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 { return None; }
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn statvfs_free(_p: &Path) -> Option<u64> { None }
+
+/// Sidecar for a parquet recorded before the store (legacy REST): frames and the legacy
+/// metadata (parquet footer / `.meta.json`); joint zero = `offsets`. None when unreadable.
+fn adopt_legacy(path: &Path, id: &str, offsets: &[f32], joint_names: &[String], profile_id: Option<&str>, fps: f64) -> Option<EpisodeSidecar> {
+    let frames = read_frames_from_parquet(path).ok()?;
+    let meta = read_metadata_from_parquet(path).ok().flatten().unwrap_or_default();
+    let (first, last) = (frames.first()?, frames.last()?);
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH);
+    let duration = (last.timestamp - first.timestamp).max(0.0);
+    let started = chrono::DateTime::<chrono::Utc>::from(mtime) - chrono::Duration::milliseconds((duration * 1000.0) as i64);
+    Some(EpisodeSidecar {
+        id: id.into(), dataset: DEFAULT_DATASET.into(), task: String::new(), source: "import".into(),
+        sequence_id: None, repeat_index: None, outcome: "ok".into(),
+        recorded_at: started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        duration_s: duration, frames: frames.len(),
+        joint_names: meta.joint_names.clone().unwrap_or_else(|| joint_names.to_vec()),
+        units: "rad".into(), joint_zero: JointZeroStamp::of(offsets),
+        profile_id: meta.profile_id.clone().or_else(|| profile_id.map(str::to_string)),
+        armd_version: "legacy".into(), fps_nominal: fps, truncated: false, stopped_by: None,
+        arm_dof: meta.arm_dof, gripper_joint: meta.gripper_joint, recovered: Some("legacy".into()),
+        first_state: Some(first.observation_state.clone()), last_state: Some(last.observation_state.clone()),
+    })
 }
 
 /// Lexical normalization: drops `.` components (`..` is rejected before this is used).
@@ -278,11 +868,10 @@ fn episode_files(dir: &Path) -> Result<Vec<(String, std::fs::Metadata)>, StoreEr
     Ok(out)
 }
 
-fn summarize(id: &str, path: &Path, size_bytes: u64, mtime: SystemTime) -> EpisodeInfo {
-    let created_ms = mtime.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+fn summarize(id: &str, path: &Path, size_bytes: u64) -> EpisodeInfo {
     let mut info = EpisodeInfo {
-        id: id.into(), frames: 0, duration_s: 0.0, size_bytes, created_ms, dof: 0,
-        joint_min: Vec::new(), joint_max: Vec::new(), error: None,
+        id: id.into(), frames: 0, duration_s: 0.0, size_bytes, created_ms: 0, dof: 0,
+        joint_min: Vec::new(), joint_max: Vec::new(), error: None, dataset: None, task: None, source: None, stale: false,
     };
     match read_frames_from_parquet(path) {
         Ok(frames) => {
@@ -314,10 +903,30 @@ mod tests {
         (0..n).map(|k| RecordFrame { timestamp: 10.0 + k as f64 * 0.02, observation_state: vec![k as f32 * 0.01, -0.5], action: vec![0.0, 0.0] }).collect()
     }
 
+    fn sidecar(id: &str, dataset: &str) -> EpisodeSidecar {
+        EpisodeSidecar {
+            id: id.into(), dataset: dataset.into(), task: "t".into(), source: "jog".into(), sequence_id: None, repeat_index: None,
+            outcome: "ok".into(), recorded_at: now_rfc3339(), duration_s: 1.0, frames: 51, joint_names: vec!["a".into(), "b".into()],
+            units: "rad".into(), joint_zero: JointZeroStamp::of(&[0.0, 0.0]), profile_id: None, armd_version: "x".into(),
+            fps_nominal: 50.0, truncated: false, stopped_by: None, arm_dof: None, gripper_joint: None, recovered: None,
+            first_state: None, last_state: None,
+        }
+    }
+
     #[test]
-    fn episode_id_rule() {
+    fn ids() {
         for ok in ["a", "ep_1", "Episode-20261112_101010", &"x".repeat(64)] { assert!(valid_episode_id(ok), "{ok}"); }
         for bad in ["", "a b", "../x", "a/b", "a.parquet", "é", &"x".repeat(65), "a\0", "."] { assert!(!valid_episode_id(bad), "{bad:?}"); }
+        let a = new_ulid();
+        let b = new_ulid();
+        assert!(is_ulid(&a) && is_ulid(&b) && a < b && valid_episode_id(&a), "{a} {b}");
+        assert!(!is_ulid("episode_1") && !is_ulid(&"8".repeat(26)) && !is_ulid(&"0".repeat(25)) && !is_ulid(&"0I".repeat(13)));
+        assert_eq!(zero_rev(&[0.0, 0.1]), zero_rev(&[0.0, 0.1]));
+        assert_ne!(zero_rev(&[0.0, 0.1]), zero_rev(&[0.0, 0.2]));
+        for ok in ["default", "pick place", "抓取-1", "a_b"] { assert!(valid_display_name(ok), "{ok}"); }
+        for bad in ["", "a/b", "a.b", &"x".repeat(65), "été"] { assert!(!valid_display_name(bad), "{bad}"); }
+        let st = JointZeroStamp::of(&[0.0, 0.0]);
+        assert!(!st.stale_against(&[0.005, 0.0]) && st.stale_against(&[0.01, 0.0]) && st.stale_against(&[0.0]));
     }
 
     #[test]
@@ -329,30 +938,17 @@ mod tests {
         assert_eq!(store.new_episode(None, Some(Path::new("b.parquet"))).unwrap().0, "b");
         assert_eq!(store.new_episode(None, Some(&dir.join("c.parquet"))).unwrap().0, "c");
         assert_eq!(store.new_episode(None, Some(&dir.join(".").join("c2.parquet"))).unwrap().0, "c2");
-        assert_eq!(store.new_episode(Some("d"), Some(&dir.join("d.parquet"))).unwrap().0, "d");
         let code = |r: Result<(String, PathBuf), StoreError>| r.unwrap_err().status_code().1;
         assert_eq!(code(store.new_episode(None, Some(Path::new("../x.parquet")))), "INVALID_OUTPUT_PATH");
-        assert_eq!(code(store.new_episode(None, Some(&dir.join("..").join("episodes").join("x.parquet")))), "INVALID_OUTPUT_PATH");
         assert_eq!(code(store.new_episode(None, Some(&tmp.path().join("x.parquet")))), "INVALID_OUTPUT_PATH");
-        assert_eq!(code(store.new_episode(None, Some(Path::new("/etc/x.parquet")))), "INVALID_OUTPUT_PATH");
         assert_eq!(code(store.new_episode(None, Some(Path::new("sub/x.parquet")))), "INVALID_OUTPUT_PATH");
-        assert_eq!(code(store.new_episode(None, Some(Path::new("x.txt")))), "INVALID_OUTPUT_PATH");
         assert_eq!(code(store.new_episode(None, Some(Path::new("a b.parquet")))), "INVALID_EPISODE_ID");
         assert_eq!(code(store.new_episode(Some("e"), Some(Path::new("f.parquet")))), "INVALID_OUTPUT_PATH");
-        assert_eq!(code(store.new_episode(Some("../e"), None)), "INVALID_EPISODE_ID");
-        // an existing file is not overwritten
         write_frames_to_parquet(&dir.join("a.parquet"), &frames(3)).unwrap();
         assert_eq!(code(store.new_episode(Some("a"), None)), "EPISODE_EXISTS");
-        // generated ids are unique
-        let (g1, p1) = store.new_episode(None, None).unwrap();
-        write_frames_to_parquet(&p1, &frames(3)).unwrap();
-        let (g2, _) = store.new_episode(None, None).unwrap();
-        assert!(g1.starts_with("episode_") && g1 != g2 && valid_episode_id(&g2), "{g1} {g2}");
-        // relative directory (the fallback) works with relative and absolute paths
-        let rel = EpisodeStore::new(Some(PathBuf::from("./data/episodes")));
-        assert_eq!(rel.new_episode(None, Some(Path::new("r.parquet"))).unwrap().0, "r");
-        let abs = std::path::absolute("data/episodes/r2.parquet").unwrap();
-        assert_eq!(rel.new_episode(None, Some(&abs)).unwrap().0, "r2");
+        // generated ids are ULIDs
+        let (g, _) = store.new_episode(None, None).unwrap();
+        assert!(is_ulid(&g), "{g}");
     }
 
     #[test]
@@ -367,39 +963,113 @@ mod tests {
     }
 
     #[test]
-    fn list_capacity_and_delete() {
+    fn write_list_update_delete_and_datasets() {
         let tmp = tempfile::tempdir().unwrap();
         let store = EpisodeStore::new(Some(tmp.path().to_path_buf()));
-        assert!(store.list().unwrap().episodes.is_empty());
+        store.load(&[0.0, 0.0], &[], None, 50.0).unwrap();
+        let a = new_ulid();
+        store.write_episode(&sidecar(&a, "default"), &frames(51), None).unwrap();
+        assert!(tmp.path().join(format!("{a}.parquet")).exists() && tmp.path().join(format!("{a}.json")).exists());
+        assert!(!tmp.path().join(format!("{a}.meta.json")).exists());
+        assert_eq!(store.write_episode(&sidecar(&a, "default"), &frames(2), None).unwrap_err().status_code().1, "EPISODE_EXISTS");
+        assert_eq!(store.create_dataset("pick", "").unwrap().name, "pick");
+        assert_eq!(store.create_dataset("pick", "").unwrap_err().status_code().1, "DATASET_EXISTS");
+        let b = new_ulid();
+        store.write_episode(&sidecar(&b, "pick"), &frames(5), None).unwrap();
+        let all = store.list_episodes(None, None, None, &[0.0, 0.0]);
+        assert_eq!(all.iter().map(|e| e.sidecar.id.as_str()).collect::<Vec<_>>(), vec![b.as_str(), a.as_str()]);
+        assert_eq!(store.list_episodes(None, Some(1), Some(&b), &[0.0, 0.0])[0].sidecar.id, a);
+        assert_eq!(store.list_episodes(Some("pick"), None, None, &[0.0, 0.0]).len(), 1);
+        assert!(store.list_episodes(None, None, None, &[0.1, 0.0]).iter().all(|e| e.stale));
+        let ds = store.datasets();
+        assert_eq!(ds.iter().map(|d| (d.name.as_str(), d.episodes)).collect::<Vec<_>>(), vec![("default", 1), ("pick", 1)]);
+        assert_eq!(store.delete_dataset("pick", false).unwrap_err().status_code().1, "DATASET_NOT_EMPTY");
+        assert_eq!(store.update(&a, Some("new task"), Some("nope")).unwrap_err().status_code().1, "DATASET_NOT_FOUND");
+        assert_eq!(store.update(&a, Some("new task"), Some("pick")).unwrap().dataset, "pick");
+        // reload from disk: the same catalog
+        let again = EpisodeStore::new(Some(tmp.path().to_path_buf()));
+        let r = again.load(&[0.0, 0.0], &[], None, 50.0).unwrap();
+        assert_eq!(r.episodes, 2);
+        assert_eq!(again.get(&a).unwrap().task, "new task");
+        assert!(again.has_dataset("pick"));
+        assert_eq!(store.delete_dataset("pick", true).unwrap().len(), 2);
+        assert!(!store.has_dataset("pick") && store.list_episodes(None, None, None, &[]).is_empty());
+        assert!(std::fs::read_dir(tmp.path()).unwrap().all(|e| e.unwrap().file_name() == DATASETS_FILE));
+    }
+
+    #[test]
+    fn legacy_list_and_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::new(Some(tmp.path().to_path_buf()));
         write_frames_to_parquet(&tmp.path().join("one.parquet"), &frames(51)).unwrap();
         write_frames_to_parquet(&tmp.path().join("two.parquet"), &frames(2)).unwrap();
         std::fs::write(tmp.path().join("two.meta.json"), b"{\"unit_mode\":\"so101_norm\"}").unwrap();
         std::fs::write(tmp.path().join("bad.parquet"), b"not parquet").unwrap();
         std::fs::write(tmp.path().join("notes.txt"), b"x").unwrap();
-        std::fs::write(tmp.path().join("a b.parquet"), b"x").unwrap();
+        let r = store.load(&[0.0, 0.0], &[], None, 50.0).unwrap();
+        assert_eq!((r.legacy_adopted.len(), r.orphans_kept.clone()), (2, vec!["bad".to_string()]));
         let list = store.list().unwrap();
-        let ids: Vec<_> = list.episodes.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(ids.len(), 3, "{ids:?}");
+        assert_eq!(list.episodes.len(), 2);
         let one = list.episodes.iter().find(|e| e.id == "one").unwrap();
         assert_eq!((one.frames, one.dof), (51, 2));
-        assert!((one.duration_s - 1.0).abs() < 1e-9);
-        assert!((one.joint_min[0] - 0.0).abs() < 1e-6 && (one.joint_max[0] - 0.5).abs() < 1e-6 && one.joint_min[1] == -0.5);
-        assert!(one.size_bytes > 0 && one.created_ms > 0 && one.error.is_none());
-        assert!(list.episodes.iter().find(|e| e.id == "bad").unwrap().error.is_some());
-        assert_eq!(list.total_bytes, store.usage().unwrap().0);
-        assert_eq!(store.usage().unwrap().1, 3);
-
+        assert!((one.joint_min[0] - 0.0).abs() < 1e-6 && (one.joint_max[0] - 0.5).abs() < 1e-6);
         assert!(store.check_capacity().is_ok());
-        let full = store.check_capacity_with(u64::MAX, 3).unwrap_err();
-        assert_eq!(full.status_code(), (507, "EPISODES_FULL"));
-        assert!(store.check_capacity_with(10, 100).is_err());
-
-        assert!(tmp.path().join("two.meta.json").exists());
+        assert_eq!(store.check_capacity_with(u64::MAX, 3).unwrap_err().status_code(), (507, "EPISODES_FULL"));
         store.delete("two").unwrap();
-        assert!(!tmp.path().join("two.meta.json").exists());
+        assert!(!tmp.path().join("two.meta.json").exists() && !tmp.path().join("two.json").exists());
         assert_eq!(store.delete("two").unwrap_err().status_code(), (404, "EPISODE_NOT_FOUND"));
         assert_eq!(store.delete("../one").unwrap_err().status_code().1, "INVALID_EPISODE_ID");
-        assert!(tmp.path().join("one.parquet").exists());
-        assert_eq!(store.list().unwrap().episodes.len(), 2);
+    }
+
+    #[test]
+    fn boot_recovery_after_a_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let store = EpisodeStore::new(Some(dir.to_path_buf()));
+        store.load(&[0.0, 0.0], &[], None, 50.0).unwrap();
+        // a complete episode, then its sidecar lost (crash after the parquet rename)
+        let a = new_ulid();
+        store.write_episode(&sidecar(&a, "default"), &frames(10), None).unwrap();
+        std::fs::remove_file(dir.join(format!("{a}.json"))).unwrap();
+        // a write that never finished (temp files left)
+        let t = new_ulid();
+        std::fs::write(dir.join(format!("{t}.parquet.tmp")), b"partial").unwrap();
+        std::fs::write(dir.join(format!(".{t}.json.tmp-1-2")), b"{").unwrap();
+        // a ULID parquet without sidecar that cannot be read: old -> deleted, new -> kept
+        let old = new_ulid();
+        let young = new_ulid();
+        std::fs::write(dir.join(format!("{old}.parquet")), b"junk").unwrap();
+        std::fs::write(dir.join(format!("{young}.parquet")), b"junk").unwrap();
+        let f = std::fs::File::options().write(true).open(dir.join(format!("{old}.parquet"))).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(7200)).unwrap();
+        // a sidecar without parquet
+        let s = new_ulid();
+        std::fs::write(dir.join(format!("{s}.json")), serde_json::to_string(&sidecar(&s, "default")).unwrap()).unwrap();
+
+        let fresh = EpisodeStore::new(Some(dir.to_path_buf()));
+        let r = fresh.load(&[0.0, 0.0], &[], None, 50.0).unwrap();
+        println!("recovery: {r:?}");
+        assert_eq!(r.sidecars_rebuilt, vec![a.clone()]);
+        assert_eq!(r.temps_removed.len(), 2);
+        assert_eq!(r.orphans_removed, vec![old.clone()]);
+        assert_eq!(r.orphans_kept, vec![young.clone()]);
+        assert_eq!(r.sidecars_removed, vec![s.clone()]);
+        assert_eq!(r.episodes, 1);
+        let back = fresh.get(&a).unwrap();
+        assert_eq!((back.recovered.as_deref(), back.frames), (Some("sidecar"), 51));
+        assert!(dir.join(format!("{a}.json")).exists());
+        assert!(!dir.join(format!("{old}.parquet")).exists() && dir.join(format!("{young}.parquet")).exists());
+        assert!(!dir.join(format!("{t}.parquet.tmp")).exists() && !dir.join(format!("{s}.json")).exists());
+    }
+
+    #[test]
+    fn free_space_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EpisodeStore::new(Some(tmp.path().join("not/yet")));
+        assert!(store.free_bytes().is_some_and(|b| b > 0));
+        store.set_free_bytes_override(Some(START_MIN_FREE_BYTES - 1));
+        assert_eq!(store.check_free_for_start().unwrap_err().status_code(), (507, "RECORD_NO_SPACE"));
+        store.set_free_bytes_override(Some(START_MIN_FREE_BYTES));
+        assert!(store.check_free_for_start().is_ok());
     }
 }

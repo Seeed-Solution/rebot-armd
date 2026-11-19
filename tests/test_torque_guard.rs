@@ -306,7 +306,7 @@ fn running_action_and_replay_fail_with_torque_limit() {
     let (mut inner, arm) = rig();
     inner.episodes = armd::recording::EpisodeStore::new(Some(tmp.path().to_path_buf()));
     let epoch = inner.safety.epoch_id();
-    let (id, _) = inner.start_replay(ReplayRequest { episode: "j4".into(), speed: 1.0, gripper: true, tag: None }, epoch).unwrap();
+    let (id, _) = inner.start_replay(ReplayRequest { episode: "j4".into(), speed: 1.0, gripper: true, tag: None, allow_stale: false }, epoch).unwrap();
     arm.with(|s| s.stop_hi[J4] = Some(INSPECT[J4] + 0.2));
     let mut obs = ticks(&mut inner, 1);
     for _ in 0..1000 {

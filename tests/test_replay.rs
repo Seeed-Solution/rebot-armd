@@ -139,7 +139,7 @@ fn save(dir: &std::path::Path, id: &str, frames: &[RecordFrame]) {
 }
 
 fn req(episode: &str, speed: f64, gripper: bool) -> ReplayRequest {
-    ReplayRequest { episode: episode.into(), speed, gripper, tag: None }
+    ReplayRequest { episode: episode.into(), speed, gripper, tag: None, allow_stale: false }
 }
 
 fn code_of(e: ArmError) -> (u16, String, String) {

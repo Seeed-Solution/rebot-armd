@@ -93,6 +93,9 @@ pub struct ApiErrorResponse {
     pub safety_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    /// Extra fields of a detailed rejection (`owner`, `sequences`, `step`, `reason`).
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug)]
@@ -102,6 +105,8 @@ pub struct ApiError {
     pub message: String,
     pub code: Option<String>,
     pub safety_state: Option<String>,
+    /// Extra reply fields (an object) of [`ArmError::Detailed`].
+    pub details: Option<Box<serde_json::Value>>,
 }
 
 #[allow(non_snake_case)]
@@ -112,6 +117,7 @@ pub fn ApiError(status: StatusCode, message: String, code: String) -> ApiError {
         message,
         code: Some(code),
         safety_state: None,
+        details: None,
     }
 }
 
@@ -122,6 +128,7 @@ impl IntoResponse for ApiError {
             message: self.message,
             safety_state: self.safety_state,
             code: self.code,
+            details: match self.details.map(|d| *d) { Some(serde_json::Value::Object(m)) => Some(m), _ => None },
         });
         (self.status, body).into_response()
     }
@@ -137,6 +144,7 @@ impl From<ArmError> for ApiError {
                     message: safety_err.to_string(),
                     code: Some("HANDOVER_SETTLING".to_string()),
                     safety_state: None,
+                    details: None,
                 },
                 crate::safety::SafetyError::ArmNotAtRestingPose { .. } => ApiError {
                     status: StatusCode::CONFLICT,
@@ -144,6 +152,7 @@ impl From<ArmError> for ApiError {
                     message: safety_err.to_string(),
                     code: Some("ARM_NOT_AT_RESTING_POSE".to_string()),
                     safety_state: Some("Armed".to_string()),
+                    details: None,
                 },
                 crate::safety::SafetyError::MotionForbiddenInFaultState(msg) => ApiError {
                     status: StatusCode::CONFLICT,
@@ -151,6 +160,7 @@ impl From<ArmError> for ApiError {
                     message: msg,
                     code: Some("MOTION_FORBIDDEN_IN_FAULT_STATE".to_string()),
                     safety_state: Some("Fault".to_string()),
+                    details: None,
                 },
                 crate::safety::SafetyError::ClearFaultRejected(msg) => ApiError {
                     status: StatusCode::CONFLICT,
@@ -158,6 +168,7 @@ impl From<ArmError> for ApiError {
                     message: msg,
                     code: Some("CLEAR_FAULT_REJECTED".to_string()),
                     safety_state: Some("Fault".to_string()),
+                    details: None,
                 },
                 crate::safety::SafetyError::EStopActive => ApiError {
                     status: StatusCode::CONFLICT,
@@ -165,6 +176,7 @@ impl From<ArmError> for ApiError {
                     message: safety_err.to_string(),
                     code: Some("ESTOP_ACTIVE".to_string()),
                     safety_state: Some("EStop".to_string()),
+                    details: None,
                 },
                 crate::safety::SafetyError::CollisionHold(_) => {
                     ApiError(StatusCode::CONFLICT, safety_err.to_string(), "COLLISION_HOLD".to_string())
@@ -187,6 +199,7 @@ impl From<ArmError> for ApiError {
                     message: safety_err.to_string(),
                     code: Some("FAULT_ACTIVE".to_string()),
                     safety_state: Some("Fault".to_string()),
+                    details: None,
                 },
                 crate::safety::SafetyError::NotArmed(_) => {
                     ApiError(StatusCode::PRECONDITION_FAILED, safety_err.to_string(), "NOT_ARMED".to_string())
@@ -213,6 +226,11 @@ impl From<ArmError> for ApiError {
             }
             ArmError::Rejected { status, code, message } => {
                 ApiError(StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT), message, code)
+            }
+            ArmError::Detailed { status, code, message, details } => {
+                let mut e = ApiError(StatusCode::from_u16(status).unwrap_or(StatusCode::CONFLICT), message, code);
+                e.details = Some(details);
+                e
             }
             ArmError::Internal(msg) => {
                 ApiError(StatusCode::INTERNAL_SERVER_ERROR, msg, "INTERNAL_ERROR".to_string())
@@ -420,12 +438,17 @@ pub async fn dataset_record_discard(
     }))
 }
 
-/// `GET /api/v1/dataset/episodes`: saved episodes, newest first (no lease).
+/// `GET /api/v1/dataset/episodes`: saved episodes, newest first (no lease; legacy listing of
+/// the episode store).
 pub async fn dataset_episodes(
     State(supervisor): State<Arc<ArmSupervisor>>,
 ) -> Result<Json<crate::recording::EpisodeList>, ApiError> {
-    let store = supervisor.episode_store().await;
-    let list = tokio::task::spawn_blocking(move || store.list()).await
+    supervisor.ensure_episodes_loaded().await?;
+    let (store, offsets) = {
+        let inner = supervisor.inner().read().await;
+        (inner.episodes.clone(), inner.joint_zero_offsets.clone())
+    };
+    let list = tokio::task::spawn_blocking(move || store.list_with(&offsets)).await
         .map_err(|e| ArmError::Internal(format!("episode listing failed: {e}")))?
         .map_err(ArmError::from)?;
     Ok(Json(list))
@@ -433,17 +456,151 @@ pub async fn dataset_episodes(
 
 /// `DELETE /api/v1/dataset/episodes/{id}`: remove a saved episode. Like the other
 /// `/api/v1/dataset/*` routes it needs no lease (it moves nothing); the same-origin rule
-/// for browser requests applies.
+/// for browser requests applies. IN_USE when a sequence references it.
 pub async fn dataset_episode_delete(
     State(supervisor): State<Arc<ArmSupervisor>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let store = supervisor.episode_store().await;
+    supervisor.ensure_episodes_loaded().await?;
+    let store = {
+        let inner = supervisor.inner().read().await;
+        inner.episodes.path_of(&id).map_err(ArmError::from)?;
+        inner.episode_delete_allowed(&id)?;
+        inner.episodes.take_for_delete(&id);
+        inner.episodes.clone()
+    };
     let id2 = id.clone();
-    tokio::task::spawn_blocking(move || store.delete(&id2)).await
+    tokio::task::spawn_blocking(move || store.delete_files(&id2)).await
         .map_err(|e| ArmError::Internal(format!("episode delete failed: {e}")))?
         .map_err(ArmError::from)?;
     Ok(Json(serde_json::json!({"status": "deleted", "episode_id": id})))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct EpisodesQuery {
+    pub dataset: Option<String>,
+    pub limit: Option<usize>,
+    pub before: Option<String>,
+}
+
+/// `GET /api/v1/episodes?dataset=&limit=&before=`: `{enabled, episodes: [sidecar + stale + bytes], recording}`, newest first.
+pub async fn get_episodes(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::extract::Query(q): axum::extract::Query<EpisodesQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    supervisor.ensure_episodes_loaded().await?;
+    let inner = supervisor.inner().read().await;
+    let episodes = inner.episodes.list_episodes(q.dataset.as_deref(), q.limit, q.before.as_deref(), &inner.joint_zero_offsets);
+    Ok(Json(serde_json::json!({"enabled": inner.episodes.enabled(), "episodes": episodes, "recording": inner.recording_status()})))
+}
+
+/// `GET /api/v1/episodes/{id}`: the sidecar + `stale` + `bytes`.
+pub async fn get_episode(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<crate::recording::EpisodeView>, ApiError> {
+    supervisor.ensure_episodes_loaded().await?;
+    let inner = supervisor.inner().read().await;
+    inner.episodes.view(&id, &inner.joint_zero_offsets).map(Json)
+        .ok_or_else(|| ArmError::from(crate::recording::StoreError::NotFound(id)).into())
+}
+
+/// `GET /api/v1/episodes/{id}/data`: the episode's parquet file.
+pub async fn get_episode_data(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Response, ApiError> {
+    supervisor.ensure_episodes_loaded().await?;
+    let store = supervisor.episode_store().await;
+    if !store.contains(&id) { return Err(ArmError::from(crate::recording::StoreError::NotFound(id)).into()); }
+    let path = store.path_of(&id).map_err(ArmError::from)?;
+    let bytes = tokio::task::spawn_blocking(move || std::fs::read(path)).await
+        .map_err(|e| ArmError::Internal(format!("episode read failed: {e}")))?
+        .map_err(|e| ArmError::from(crate::recording::StoreError::Io(e)))?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/vnd.apache.parquet".to_string()),
+            (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{id}.parquet\"")),
+        ],
+        bytes,
+    ).into_response())
+}
+
+fn import_invalid(reason: &str, message: impl Into<String>) -> ApiError {
+    ArmError::detailed(422, "IMPORT_INVALID", message, serde_json::json!({"reason": reason})).into()
+}
+
+/// `POST /api/v1/episodes/import` (multipart: `parquet` = the episode file, `sidecar` = its
+/// JSON): checked against this arm (`crate::recording::import`), stored as a new episode
+/// (`source: import`). -> `{id, stale, episode}` | IMPORT_INVALID `{reason}`. No lease.
+pub async fn episodes_import(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    supervisor.ensure_episodes_loaded().await?;
+    let (mut parquet, mut sidecar) = (None, None);
+    while let Some(field) = multipart.next_field().await.map_err(|e| import_invalid("multipart", e.to_string()))? {
+        let name = field.name().unwrap_or("").to_string();
+        let data = field.bytes().await.map_err(|e| import_invalid("multipart", e.to_string()))?;
+        match name.as_str() {
+            "parquet" => parquet = Some(data),
+            "sidecar" => sidecar = Some(data),
+            _ => {}
+        }
+    }
+    let parquet = parquet.ok_or_else(|| import_invalid("multipart", "part 'parquet' is missing"))?;
+    let sidecar: serde_json::Value = serde_json::from_slice(&sidecar.ok_or_else(|| import_invalid("multipart", "part 'sidecar' is missing"))?)
+        .map_err(|e| import_invalid("sidecar", format!("sidecar is not JSON: {e}")))?;
+    let (ctx, store) = {
+        let inner = supervisor.inner().read().await;
+        (crate::recording::import::ImportContext {
+            joint_names: inner.joint_names(), limits: inner.config.limits.clone(), profile_id: inner.config.profile_id.clone(),
+            arm_dof: inner.config.arm_dof(), gripper_joint: inner.config.gripper_index(),
+            zero_offsets: inner.joint_zero_offsets.clone(), fps: f64::from(inner.config.control_frequency_hz),
+        }, inner.episodes.clone())
+    };
+    if !store.enabled() { return Err(ArmError::from(crate::recording::StoreError::Disabled).into()); }
+    let result = tokio::task::spawn_blocking(move || -> Result<(crate::recording::EpisodeSidecar, bool), ApiError> {
+        let frames = crate::recording::read_frames_from_bytes(parquet).map_err(|e| import_invalid("schema", format!("parquet: {e}")))?;
+        let checked = crate::recording::import::check(&ctx, &sidecar, &frames).map_err(|e| import_invalid(e.reason, e.message))?;
+        let mut sc = checked.sidecar;
+        sc.id = crate::recording::new_ulid();
+        store.check_capacity().map_err(ArmError::from)?;
+        store.check_free_for_start().map_err(ArmError::from)?;
+        if !store.has_dataset(&sc.dataset) { store.create_dataset(&sc.dataset, "").map_err(ArmError::from)?; }
+        store.write_episode(&sc, &frames, None).map_err(ArmError::from)?;
+        Ok((sc, checked.stale))
+    }).await.map_err(|e| ArmError::Internal(format!("import failed: {e}")))?;
+    let (sc, stale) = result?;
+    tracing::info!("Episode {} imported ({} frames, dataset '{}'{})", sc.id, sc.frames, sc.dataset, if stale { ", stale" } else { "" });
+    Ok(Json(serde_json::json!({"id": sc.id, "stale": stale, "episode": sc})))
+}
+
+/// `GET /api/v1/sequences`: `{sequences: [sequence + stale_steps + missing_steps + running]}`.
+pub async fn get_sequences(State(supervisor): State<Arc<ArmSupervisor>>) -> Result<Json<serde_json::Value>, ApiError> {
+    supervisor.ensure_episodes_loaded().await?;
+    let inner = supervisor.inner().read().await;
+    let list: Vec<_> = inner.sequences.file.sequences.iter().map(|s| crate::sequences::view(&inner, s)).collect();
+    Ok(Json(serde_json::json!({"sequences": list})))
+}
+
+/// `GET /api/v1/sequences/{id}`.
+pub async fn get_sequence(
+    State(supervisor): State<Arc<ArmSupervisor>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    supervisor.ensure_episodes_loaded().await?;
+    let inner = supervisor.inner().read().await;
+    let s = inner.sequences.get(&id)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("No sequence with id '{id}'"), "SEQUENCE_NOT_FOUND".into()))?;
+    Ok(Json(crate::sequences::view(&inner, s)))
+}
+
+/// `GET /api/v1/datasets`: `{datasets: [{name, episodes, duration_s, bytes, created_at, description}]}`.
+pub async fn get_datasets(State(supervisor): State<Arc<ArmSupervisor>>) -> Result<Json<serde_json::Value>, ApiError> {
+    supervisor.ensure_episodes_loaded().await?;
+    let store = supervisor.episode_store().await;
+    Ok(Json(serde_json::json!({"enabled": store.enabled(), "datasets": store.datasets()})))
 }
 
 /// GET /api/v1/grasp/setup: the runtime grasp setup (change it with the WS command

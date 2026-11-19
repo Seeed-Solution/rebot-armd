@@ -40,8 +40,8 @@ pub enum ParquetRecordingError {
     Corrupted(String),
 }
 
-/// Create the canonical LeRobot parquet Arrow schema with optional metadata
-pub fn lerobot_arrow_schema_with_meta(meta: Option<&EpisodeMetadata>) -> Arc<Schema> {
+/// Parquet key-value metadata of an [`EpisodeMetadata`].
+fn metadata_kv(meta: Option<&EpisodeMetadata>) -> std::collections::HashMap<String, String> {
     let mut metadata = std::collections::HashMap::new();
     if let Some(m) = meta {
         if let Some(ref pid) = m.profile_id {
@@ -59,6 +59,15 @@ pub fn lerobot_arrow_schema_with_meta(meta: Option<&EpisodeMetadata>) -> Arc<Sch
             }
         }
     }
+    metadata
+}
+
+/// Create the canonical LeRobot parquet Arrow schema with optional metadata
+pub fn lerobot_arrow_schema_with_meta(meta: Option<&EpisodeMetadata>) -> Arc<Schema> {
+    schema_with_kv(metadata_kv(meta))
+}
+
+fn schema_with_kv(metadata: std::collections::HashMap<String, String>) -> Arc<Schema> {
     Arc::new(Schema::new_with_metadata(
         vec![
             Field::new("timestamp", DataType::Float64, false),
@@ -88,6 +97,39 @@ pub fn write_frames_to_parquet_with_meta(
     frames: &[RecordFrame],
     meta: Option<&EpisodeMetadata>,
 ) -> Result<(), ParquetRecordingError> {
+    write_parquet_kv(path, frames, metadata_kv(meta))?;
+
+    if let Some(m) = meta {
+        let meta_path = path.with_extension("meta.json");
+        let tmp_meta_path = path.with_extension("meta.json.tmp");
+        if let Ok(text) = serde_json::to_string_pretty(m) {
+            if let Err(e) = std::fs::write(&tmp_meta_path, text) {
+                tracing::warn!("Failed to write temporary metadata file {}: {e}", tmp_meta_path.display());
+            } else if let Err(e) = std::fs::rename(&tmp_meta_path, &meta_path) {
+                tracing::warn!("Failed to rename {} to {}: {e}", tmp_meta_path.display(), meta_path.display());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Episode file of the episode store: the LeRobot columns with `meta` and `extra` as
+/// key-value metadata, written to `<path>.tmp` and renamed (no `.meta.json` file).
+pub fn write_episode_parquet(path: &Path, frames: &[RecordFrame], meta: Option<&EpisodeMetadata>, extra: &[(&str, String)]) -> Result<(), ParquetRecordingError> {
+    let mut kv = metadata_kv(meta);
+    for (k, v) in extra { kv.insert((*k).to_string(), v.clone()); }
+    write_parquet_kv(path, frames, kv)
+}
+
+/// Key-value metadata of a parquet file (footer only; the rows are not read).
+pub fn read_parquet_kv(path: &Path) -> Result<std::collections::HashMap<String, String>, ParquetRecordingError> {
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+    Ok(builder.schema().metadata().iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+}
+
+fn write_parquet_kv(path: &Path, frames: &[RecordFrame], kv: std::collections::HashMap<String, String>) -> Result<(), ParquetRecordingError> {
     if frames.is_empty() {
         return Err(ParquetRecordingError::EmptyFrames);
     }
@@ -96,7 +138,7 @@ pub fn write_frames_to_parquet_with_meta(
         std::fs::create_dir_all(parent)?;
     }
 
-    let schema = lerobot_arrow_schema_with_meta(meta);
+    let schema = schema_with_kv(kv);
     let num_rows = frames.len();
 
     // 1. Timestamps
@@ -143,21 +185,12 @@ pub fn write_frames_to_parquet_with_meta(
     let file = File::create(&tmp_path)?;
     let mut writer = ArrowWriter::try_new(file, schema, None)?;
     writer.write(&batch)?;
-    writer.close()?;
-    std::fs::rename(&tmp_path, path)?;
-
-    if let Some(m) = meta {
-        let meta_path = path.with_extension("meta.json");
-        let tmp_meta_path = path.with_extension("meta.json.tmp");
-        if let Ok(text) = serde_json::to_string_pretty(m) {
-            if let Err(e) = std::fs::write(&tmp_meta_path, text) {
-                tracing::warn!("Failed to write temporary metadata file {}: {e}", tmp_meta_path.display());
-            } else if let Err(e) = std::fs::rename(&tmp_meta_path, &meta_path) {
-                tracing::warn!("Failed to rename {} to {}: {e}", tmp_meta_path.display(), meta_path.display());
-            }
-        }
+    // flushed to the disk before the rename, so a power loss leaves the old name or a whole file
+    writer.into_inner()?.sync_all()?;
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
     }
-
     Ok(())
 }
 
@@ -243,59 +276,51 @@ pub fn read_metadata_from_parquet(path: &Path) -> Result<Option<EpisodeMetadata>
 }
 
 /// Read back frames from a LeRobot Parquet file for verification
-pub fn read_frames_from_parquet(
-    path: &Path,
-) -> Result<Vec<RecordFrame>, ParquetRecordingError> {
-    let file = File::open(path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+pub fn read_frames_from_parquet(path: &Path) -> Result<Vec<RecordFrame>, ParquetRecordingError> {
+    read_frames_from(File::open(path)?)
+}
+
+/// Frames of an episode parquet held in memory (import).
+pub fn read_frames_from_bytes(bytes: axum::body::Bytes) -> Result<Vec<RecordFrame>, ParquetRecordingError> {
+    read_frames_from(bytes)
+}
+
+/// Columns `timestamp` (float64), `observation.state` and `action` (list<float32>), by name
+/// (else positions 0, 1, 2). Any other type is [`ParquetRecordingError::Corrupted`].
+fn read_frames_from<R: parquet::file::reader::ChunkReader + 'static>(input: R) -> Result<Vec<RecordFrame>, ParquetRecordingError> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(input)?;
     let reader = builder.build()?;
-
     let mut frames = Vec::new();
-
     for batch_res in reader {
         let batch = batch_res?;
-        let num_rows = batch.num_rows();
-
-        let ts_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or_else(|| ParquetRecordingError::Corrupted("timestamp column is not Float64Array".into()))?;
-
-        let obs_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| ParquetRecordingError::Corrupted("observation.state is not ListArray".into()))?;
-
-        let act_col = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| ParquetRecordingError::Corrupted("action is not ListArray".into()))?;
-
-        for i in 0..num_rows {
-            let timestamp = ts_col.value(i);
-
-            let obs_sub = obs_col.value(i);
-            let obs_f32 = obs_sub
-                .as_primitive::<arrow::datatypes::Float32Type>()
-                .values()
-                .to_vec();
-
-            let act_sub = act_col.value(i);
-            let act_f32 = act_sub
-                .as_primitive::<arrow::datatypes::Float32Type>()
-                .values()
-                .to_vec();
-
+        let schema = batch.schema();
+        let col = |name: &str, fallback: usize| -> Result<&ArrayRef, ParquetRecordingError> {
+            let i = schema.index_of(name).unwrap_or(fallback);
+            if i >= batch.num_columns() { return Err(ParquetRecordingError::Corrupted(format!("column {name} is missing"))); }
+            Ok(batch.column(i))
+        };
+        let ts_col = col("timestamp", 0)?.as_any().downcast_ref::<Float64Array>()
+            .ok_or_else(|| ParquetRecordingError::Corrupted("timestamp column is not float64".into()))?;
+        let list = |name: &str, fallback: usize| -> Result<&ListArray, ParquetRecordingError> {
+            let a = col(name, fallback)?.as_any().downcast_ref::<ListArray>()
+                .ok_or_else(|| ParquetRecordingError::Corrupted(format!("{name} is not a list")))?;
+            if a.value_type() != DataType::Float32 {
+                return Err(ParquetRecordingError::Corrupted(format!("{name} items are {}, not float32", a.value_type())));
+            }
+            Ok(a)
+        };
+        let obs_col = list("observation.state", 1)?;
+        let act_col = list("action", 2)?;
+        for i in 0..batch.num_rows() {
+            if ts_col.is_null(i) || obs_col.is_null(i) || act_col.is_null(i) {
+                return Err(ParquetRecordingError::Corrupted(format!("row {i} has a null value")));
+            }
             frames.push(RecordFrame {
-                timestamp,
-                observation_state: obs_f32,
-                action: act_f32,
+                timestamp: ts_col.value(i),
+                observation_state: obs_col.value(i).as_primitive::<arrow::datatypes::Float32Type>().values().to_vec(),
+                action: act_col.value(i).as_primitive::<arrow::datatypes::Float32Type>().values().to_vec(),
             });
         }
     }
-
     Ok(frames)
 }

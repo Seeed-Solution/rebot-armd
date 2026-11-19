@@ -894,7 +894,7 @@ impl ActiveTrajectory {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActionStatus {
     pub id: u64,
-    /// move_to | move_relative | gripper | grasp | place | joint_move | home | park | move_to_pose | replay
+    /// move_to | move_relative | gripper | grasp | place | joint_move | home | park | move_to_pose | replay | sequence
     pub kind: String,
     pub tag: Option<String>,
     /// running | done | failed | cancelled
@@ -937,6 +937,24 @@ pub struct ActionStatus {
     /// replay | settle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub t_s: Option<f32>,
+    /// Sequence only (`run_sequence`): the sequence, the running step (index in the sequence)
+    /// and its type, the repeat (0-based) and the number of repeats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeats: Option<u32>,
+    /// Sequence that ended before finishing: index of the step that was running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_step: Option<usize>,
+    /// Sequence with `record`: the episodes saved so far (one per finished repeat).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub episodes: Vec<String>,
     /// Grasp J6 alignment: `turned:box` / `turned:angle` (roll in `align_turn_rad`),
     /// `kept:box` / `kept:angle` (no turn needed), `skipped:<reason>` or `off`; absent before the phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]

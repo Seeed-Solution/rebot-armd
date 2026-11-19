@@ -28,6 +28,10 @@ pub struct PoseTcp {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct NamedPose {
+    /// Stable id (ULID): assigned at the first save, or on load for poses saved before ids;
+    /// kept across a rename. Sequences reference poses by it.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     /// One entry per joint (profile DOF).
     pub positions: Vec<f32>,
@@ -44,8 +48,9 @@ pub struct NamedPose {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub joint_names: Option<Vec<String>>,
     /// Set by a joint zero change: the pose was taught with the old zero, so the arm reaches a
-    /// different physical pose. Saving the pose again clears it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// different physical pose. Saving the pose again clears it. Always present (null when not
+    /// stale).
+    #[serde(default)]
     pub stale: Option<crate::calibration::CalibrationStale>,
 }
 
@@ -75,6 +80,19 @@ impl PoseStore {
     /// The stored pose `name`, or `POSE_NOT_FOUND`.
     pub(crate) fn find(&self, name: &str) -> Result<&NamedPose, ArmError> {
         self.list.poses.iter().find(|p| p.name == name).ok_or_else(|| not_found(name))
+    }
+
+    /// The stored pose with id `id`.
+    pub fn by_id(&self, id: &str) -> Option<&NamedPose> { self.list.poses.iter().find(|p| p.id == id) }
+
+    /// Give every pose without an id a new one. Returns whether any changed.
+    pub fn assign_ids(&mut self) -> bool {
+        let mut changed = false;
+        for p in self.list.poses.iter_mut().filter(|p| p.id.is_empty()) {
+            p.id = crate::recording::new_ulid();
+            changed = true;
+        }
+        changed
     }
 }
 
@@ -121,6 +139,9 @@ pub fn validate_list(list: &PoseList, config: &crate::model::ArmConfig) -> Resul
     for (i, p) in list.poses.iter().enumerate() {
         if !valid_name(&p.name) { return Err(format!("invalid pose name '{}'", p.name)); }
         if list.poses[..i].iter().any(|q| q.name == p.name) { return Err(format!("duplicate pose name '{}'", p.name)); }
+        if !p.id.is_empty() && (!crate::recording::valid_episode_id(&p.id) || list.poses[..i].iter().any(|q| q.id == p.id)) {
+            return Err(format!("pose '{}': invalid or duplicate id '{}'", p.name, p.id));
+        }
         if let (Some(ref p_pid), Some(ref cfg_pid)) = (&p.profile_id, &config.profile_id) {
             if p_pid != cfg_pid {
                 return Err(format!("POSE_DOF_MISMATCH: pose '{}' profile_id '{p_pid}' does not match config profile_id '{cfg_pid}'", p.name));
@@ -246,9 +267,25 @@ impl SupervisorInner {
     }
 }
 
-/// WS command `/api/v1/poses/save` `{name, positions?}`. Returns the pose and the file write.
+/// WS command `/api/v1/poses/save` `{name, positions?, id?}`: replaces the pose `name`, or with
+/// `id` the pose with that id (rename: the id stays). Returns the pose and the file write.
 pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Option<PendingWrite>), ArmError> {
     let name = name_of(body)?;
+    let by_id = match body.get("id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) => {
+            if inner.poses.by_id(id).is_none() {
+                return Err(ArmError::Rejected { status: 404, code: "POSE_NOT_FOUND".into(), message: format!("No pose with id '{id}'") });
+            }
+            Some(id.clone())
+        }
+        Some(_) => return Err(invalid("id must be a string")),
+    };
+    if let Some(id) = &by_id {
+        if inner.poses.list.poses.iter().any(|p| p.name == name && &p.id != id) {
+            return Err(ArmError::Rejected { status: 409, code: "POSE_EXISTS".into(), message: format!("Another pose is named '{name}'") });
+        }
+    }
     let positions = match body.get("positions") {
         None | Some(Value::Null) => inner.measured_positions.clone(),
         Some(v) => v.as_array().ok_or_else(|| invalid("positions must be an array"))?.iter()
@@ -265,8 +302,14 @@ pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Opt
     let arm_dof = inner.config.arm_dof();
     let gripper_joint = inner.config.gripper_index();
     let joint_names: Vec<String> = inner.config.limits.iter().map(|l| l.name.clone()).collect();
+    let id = match &by_id {
+        Some(id) => id.clone(),
+        None => inner.poses.list.poses.iter().find(|p| p.name == name).map(|p| p.id.clone()).filter(|id| !id.is_empty())
+            .unwrap_or_else(crate::recording::new_ulid),
+    };
     let pose = NamedPose {
         tcp: inner.pose_tcp(&positions),
+        id,
         name,
         positions,
         saved_at_ms,
@@ -281,19 +324,40 @@ pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Opt
     inner.poses.list.gripper_joint = gripper_joint;
     inner.poses.list.joint_names = Some(joint_names);
     let list = &mut inner.poses.list.poses;
-    match list.iter_mut().find(|p| p.name == pose.name) {
+    match list.iter_mut().find(|p| p.id == pose.id) {
         Some(p) => *p = pose.clone(),
         None => list.push(pose.clone()),
     }
     Ok((pose, inner.poses_write()))
 }
 
-/// WS command `/api/v1/poses/delete` `{name}`.
+/// WS command `/api/v1/poses/rename` `{id, name}`: the pose keeps its id, positions and
+/// stale mark; sequences reference the id and keep working. POSE_EXISTS when another pose has
+/// the name.
+pub fn rename(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Option<PendingWrite>), ArmError> {
+    let name = name_of(body)?;
+    let id = body.get("id").and_then(Value::as_str).ok_or_else(|| invalid("id must be a string"))?;
+    if inner.poses.list.poses.iter().any(|p| p.name == name && p.id != id) {
+        return Err(ArmError::Rejected { status: 409, code: "POSE_EXISTS".into(), message: format!("Another pose is named '{name}'") });
+    }
+    let pose = inner.poses.list.poses.iter_mut().find(|p| p.id == id)
+        .ok_or_else(|| ArmError::Rejected { status: 404, code: "POSE_NOT_FOUND".into(), message: format!("No pose with id '{id}'") })?;
+    pose.name = name;
+    let pose = pose.clone();
+    Ok((pose, inner.poses_write()))
+}
+
+/// WS command `/api/v1/poses/delete` `{name}`. IN_USE `{sequences}` while a sequence
+/// references the pose (or a running sequence pinned it).
 pub fn delete(inner: &mut SupervisorInner, body: &Value) -> Result<Option<PendingWrite>, ArmError> {
     let name = name_of(body)?;
-    let list = &mut inner.poses.list.poses;
-    let i = list.iter().position(|p| p.name == name).ok_or_else(|| not_found(&name))?;
-    list.remove(i);
+    let i = inner.poses.list.poses.iter().position(|p| p.name == name).ok_or_else(|| not_found(&name))?;
+    let id = inner.poses.list.poses[i].id.clone();
+    let users = inner.sequences_using_pose(&id);
+    if !users.is_empty() {
+        return Err(ArmError::detailed(409, "IN_USE", format!("Pose '{name}' is used by {} sequence(s)", users.len()), serde_json::json!({"sequences": users})));
+    }
+    inner.poses.list.poses.remove(i);
     Ok(inner.poses_write())
 }
 
@@ -318,6 +382,14 @@ pub fn start_action(inner: &mut SupervisorInner, body: &Value, epoch: u64) -> Re
 /// Load the persisted poses at startup (logs the outcome). An invalid file is left untouched
 /// and the store starts empty; the next successful save replaces the file.
 pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
+    let write = load_locked(supervisor, path).await;
+    // poses saved before ids got theirs: written back so the ids stay stable
+    if let Some(w) = write {
+        if let Err(e) = w.run().await { tracing::warn!("Poses file not updated with ids: {e}"); }
+    }
+}
+
+async fn load_locked(supervisor: &ArmSupervisor, path: &Path) -> Option<PendingWrite> {
     let mut inner = supervisor.inner().write().await;
     inner.poses.path = Some(path.to_path_buf());
     let config = inner.config.clone();
@@ -329,8 +401,10 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
             // (before the J6 offset, 2026-11-12) carry a stale one
             let tcps: Vec<_> = inner.poses.list.poses.iter().map(|p| p.tcp.as_ref().and(inner.pose_tcp(&p.positions))).collect();
             for (p, tcp) in inner.poses.list.poses.iter_mut().zip(tcps) { if tcp.is_some() { p.tcp = tcp; } }
+            if inner.poses.assign_ids() { return inner.poses_write(); }
         }
         Loaded::Missing => {}
         Loaded::Invalid(e) => tracing::warn!("Ignoring poses file: {e}; starting with no poses"),
     }
+    None
 }

@@ -113,7 +113,7 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 
 `GET /api/v1/observation/schema` 带有 `capabilities`（`src/model.rs` 中的 `Capabilities`），驾驶舱与 MCP 客户端可据此调整，无需探测路由。旧版 armd 的 schema 没有 `capabilities`，解析结果为全 false、`version` 为 0。
 
-- 版本：`capabilities.version`，当前为 **8**（`CAPABILITIES_VERSION`）。版本 2 在 `detection_proxy` 之后加入了 `vision.*` 字段；版本 3 加入了 `vision.per_request_pipelines` 和 `vision.subscriptions`；版本 4 加入了 `servo_guard`（以及 schema 字段 `servo_max_velocity`、`servo_max_lead_rad` 和 `observation.motion_limit`）；版本 5 加入了 `diagnostics`；版本 6 加入了 `obs_rate`、`fault_codes`、`poses`、`keepout`、`speed_cap`、`residual_torques`、`tick_stats`（以及 schema 字段 `speed_cap` 和观测字段 `fault`、`residual_torques`）、`place`、`collision_guard`（以及观测字段 `collision`）以及 `safety_describe`；版本 7 加入了 `replay`；版本 8 加入了 `torque_guard`（含 schema 字段 `torque_guard` 与 `motion_limit.reason` 取值 `torque`）。客户端逐项检查，字段为 false 或缺失时降级处理。
+- 版本：`capabilities.version`，当前为 **11**（`CAPABILITIES_VERSION`）。版本 2 在 `detection_proxy` 之后加入了 `vision.*` 字段；版本 3 加入了 `vision.per_request_pipelines` 和 `vision.subscriptions`；版本 4 加入了 `servo_guard`（以及 schema 字段 `servo_max_velocity`、`servo_max_lead_rad` 和 `observation.motion_limit`）；版本 5 加入了 `diagnostics`；版本 6 加入了 `obs_rate`、`fault_codes`、`poses`、`keepout`、`speed_cap`、`residual_torques`、`tick_stats`（以及 schema 字段 `speed_cap` 和观测字段 `fault`、`residual_torques`）、`place`、`collision_guard`（以及观测字段 `collision`）以及 `safety_describe`；版本 7 加入了 `replay`；版本 8 加入了 `torque_guard`（含 schema 字段 `torque_guard` 与 `motion_limit.reason` 取值 `torque`）；版本 9 加入了 `power_budget`；版本 10 加入了 `calibration_tools`；版本 11 加入了 `teach`（`{version, episodes, sequences}`：片段存储、录制归属、序列）。客户端逐项检查，字段为 false 或缺失时降级处理。
 
 | 字段 | 为 true 的条件 |
 |---|---|

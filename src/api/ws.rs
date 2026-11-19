@@ -65,8 +65,10 @@ fn invalid_command(message: &str) -> ApiError {
 }
 
 fn rejection(error: ApiError, kind: &str, epoch: u64) -> Value {
-    json!({"type":kind, "status":error.status.as_u16(), "code":error.code,
-        "error":error.error, "message":error.message, "safety_state":error.safety_state, "epoch_id":epoch})
+    let mut reply = json!({"type":kind, "status":error.status.as_u16(), "code":error.code,
+        "error":error.error, "message":error.message, "safety_state":error.safety_state, "epoch_id":epoch});
+    if let Some(Value::Object(m)) = error.details.map(|d| *d) { for (k, v) in m { reply[k] = v; } }
+    reply
 }
 
 fn positions(value: Option<&Value>) -> Result<Vec<f32>, ApiError> {
@@ -161,7 +163,7 @@ struct PendingPlan {
     yaw_free: bool,
 }
 
-enum ActionStart { Started(u64, f64), Plan(PendingPlan), Macro(PendingMacro), Replay(crate::replay::ReplayInput), DryRunGrasp(Value) }
+enum ActionStart { Started(u64, f64), Plan(PendingPlan), Macro(PendingMacro), Replay(crate::replay::ReplayInput), DryRunGrasp(Value), Sequence(Box<crate::sequences::RunPlan>) }
 
 /// A macro action (crate::macro_action) checked under the lock, planned without it.
 enum PendingMacro { Grasp(crate::grasp::PendingGrasp), Place(crate::place::PendingPlace) }
@@ -267,6 +269,7 @@ fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: 
             let (id, duration) = crate::poses::start_action(inner, body, epoch)?;
             return Ok(ActionStart::Started(id, duration));
         }
+        "/api/v1/action/run_sequence" => return Ok(ActionStart::Sequence(Box::new(crate::sequences::prepare_run(inner, body, epoch)?))),
         _ => return Err(invalid_command("Unknown action")),
     };
     let (spec, speed, tag) = parsed.map_err(ArmError::from)?;
@@ -297,7 +300,10 @@ fn state_command(inner: &mut SupervisorInner, path: &str, body: &Value, setup_pa
             (vec![("setup", json!(setup))], write)
         }),
         "/api/v1/poses/save" => crate::poses::save(inner, body).map(|(pose, write)| (vec![("pose", json!(pose))], write)),
+        "/api/v1/poses/rename" => crate::poses::rename(inner, body).map(|(pose, write)| (vec![("pose", json!(pose))], write)),
         "/api/v1/poses/delete" => crate::poses::delete(inner, body).map(|write| (vec![], write)),
+        "/api/v1/sequences/save" => crate::sequences::save(inner, body).map(|(seq, write)| (vec![("sequence", json!(seq))], write)),
+        "/api/v1/sequences/delete" => crate::sequences::delete(inner, body).map(|write| (vec![], write)),
         "/api/v1/safety/collision" => crate::collision::update(inner, body).map(|(config, write)| (vec![("collision", json!(config))], write)),
         "/api/v1/workspace/keepout" => crate::keepout::update(inner, body)
             .map(|(state, write)| (vec![("boxes", json!(state.boxes)), ("source", json!(state.source))], write)),
@@ -326,7 +332,8 @@ fn calibration_busy_code(inner: &SupervisorInner, path: &str) -> Option<&'static
     if !inner.calibration_busy || path == "/api/v1/motion/stop" { return None; }
     if inner.motor_zero_busy && matches!(path, "/api/v1/torque" | "/api/v1/arm" | "/api/v1/safety/clear_fault") { return Some("MOTION_BUSY"); }
     if path.starts_with("/api/v1/action/") || path.starts_with("/api/v1/motion/") || path.starts_with("/api/v1/mode/") { return Some("MOTION_BUSY"); }
-    if path.starts_with("/api/v1/calibration/") || matches!(path, "/api/v1/grasp/setup" | "/api/v1/poses/save" | "/api/v1/poses/delete"
+    if path.starts_with("/api/v1/calibration/") || matches!(path, "/api/v1/grasp/setup" | "/api/v1/poses/save" | "/api/v1/poses/rename" | "/api/v1/poses/delete"
+        | "/api/v1/sequences/save" | "/api/v1/sequences/delete"
         | "/api/v1/safety/collision" | "/api/v1/workspace/keepout" | "/api/v1/gripper/calibration") { return Some("CONFIG_BUSY"); }
     None
 }
@@ -501,6 +508,27 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 backlog.push_back(Message::Text(text));
                 continue;
             }
+            // teach commands without a motion lease (episode store; recorder ownership)
+            if kind == "command" && crate::teach::is_lease_free(value.get("path").and_then(Value::as_str).unwrap_or("")) {
+                let request_id = value.get("request_id").and_then(Value::as_u64);
+                if request_id.is_none() || last_request.is_some_and(|last| request_id.unwrap() <= last) {
+                    let reply = json!({"type":"command_reject", "request_id":value.get("request_id"), "status":400, "code":"INVALID_COMMAND", "message":"request_id must be present and strictly increase", "error":"INVALID_COMMAND"});
+                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                    continue;
+                }
+                last_request = request_id;
+                let caller = crate::teach::Caller {
+                    connection: recv_connection.clone(),
+                    client_id: value.get("client_id").and_then(Value::as_str).map(str::to_string).or_else(|| client_label.clone()),
+                };
+                let (sup, tx) = (recv_supervisor.clone(), ack_tx.clone());
+                tokio::spawn(async move {
+                    let path = value["path"].as_str().unwrap_or("").to_string();
+                    let result = crate::teach::lease_free(&sup, &caller, &path, &value["body"]).await;
+                    let _ = tx.send(crate::teach::reply(&value["request_id"], result)).await;
+                });
+                continue;
+            }
             let mut response: Option<Value>;
             let mut evicted_notify: Option<(String, u64)> = None;
             let mut pending_plan: Option<(PendingPlan, u64)> = None;
@@ -648,6 +676,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             Ok(ActionStart::Macro(m)) => { pending_macro = Some((value["request_id"].clone(), m, local_generation)); None }
                                             Ok(ActionStart::Replay(input)) => { pending_replay = Some((value["request_id"].clone(), input, local_generation)); None }
                                             Ok(ActionStart::DryRunGrasp(body)) => { pending_dry_run_grasp = Some((value["request_id"].clone(), body)); None }
+                                            Ok(ActionStart::Sequence(plan)) => Some(match crate::sequences::begin(&mut inner, &recv_supervisor, *plan) {
+                                                Ok(started) => command_ack(&inner, &value["request_id"], Some(started)),
+                                                Err(error) => command_reject(&inner, &value["request_id"], error.into()),
+                                            }),
                                             Err(error) => Some(command_reject(&inner, &value["request_id"], error)),
                                         };
                                     } else if let Some(result) = state_command(&mut inner, path, &value["body"], recv_deps.setup_path.as_ref()) {
@@ -881,6 +913,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         _ = &mut send_task => recv_task.abort(),
         _ = &mut recv_task => send_task.abort(),
     }
+    supervisor.recorder_connection_closed(&connection).await;
     let generation = connection_generation.load(Ordering::SeqCst);
     let mut inner = supervisor.inner().write().await;
     if generation != 0 && inner.release_lease(&connection, generation) {

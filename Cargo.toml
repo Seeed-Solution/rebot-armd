@@ -22,7 +22,7 @@ roxmltree = "0.21"
 #   cargo rustc --lib --release --target wasm32-unknown-unknown --crate-type cdylib
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.8", features = ["ws", "json", "http1"] }
+axum = { version = "0.8", features = ["ws", "json", "http1", "multipart"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 futures-util = "0.3"
 tower = { version = "0.5", features = ["util"] }

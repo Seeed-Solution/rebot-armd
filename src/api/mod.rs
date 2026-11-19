@@ -19,6 +19,9 @@ use tower_http::trace::TraceLayer;
 
 use crate::supervisor::ArmSupervisor;
 
+/// Largest `POST /api/v1/episodes/import` body (a 600 s episode at the control rate is a few MB).
+pub const IMPORT_BODY_LIMIT: usize = 64 * 1024 * 1024;
+
 static INDEX_HTML: &str = include_str!("index.html");
 
 async fn serve_index() -> Html<&'static str> {
@@ -157,6 +160,14 @@ pub fn create_router_calibration(
         .route("/api/v1/dataset/record/discard", post(rest::dataset_record_discard))
         .route("/api/v1/dataset/episodes", get(rest::dataset_episodes))
         .route("/api/v1/dataset/episodes/{id}", axum::routing::delete(rest::dataset_episode_delete))
+        .route("/api/v1/episodes", get(rest::get_episodes))
+        .route("/api/v1/episodes/import", post(rest::episodes_import).layer(DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
+        .route("/api/v1/episodes/{id}", get(rest::get_episode))
+        .route("/api/v1/episodes/{id}/data", get(rest::get_episode_data))
+        .route("/api/v1/datasets", get(rest::get_datasets))
+        .route("/api/v1/sequences", get(rest::get_sequences))
+        .route("/api/v1/sequences/{id}", get(rest::get_sequence))
+        .route("/api/v1/action/run_sequence", post(rest::action_requires_lease))
         .route("/api/v1/diagnostics/boots", get(diagnostics::get_boots))
         .route("/api/v1/diagnostics/blackbox", get(diagnostics::get_blackbox))
         .route("/api/v1/diagnostics/tick", get(diagnostics::get_tick))
