@@ -630,6 +630,8 @@ pub struct StepCtx<'a> {
     pub load_feedback: bool,
     pub gripper_stalled: bool,
     pub gripper_stall_sign: f32,
+    /// The stall latch was set by the gripper torque cap (`gripper_policy.max_close_torque_nm`).
+    pub gripper_force_capped: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -659,6 +661,11 @@ pub const SETTLE_VEL: f64 = 0.05;
 /// An open / move gripper action that stops within this distance of its target counts as done.
 pub const GRIPPER_STOP_SHORT_RAD: f32 = 0.25;
 pub const SETTLE_HOLD_S: f64 = 0.2;
+/// A grasp squeeze above the gripper torque cap is reduced to aim at this fraction of the cap.
+pub const SQUEEZE_CAP_FRACTION: f32 = 0.8;
+/// Squeeze after a torque cap trip: press in from the measured position, reaching squeeze_rad
+/// in half the squeeze window (settle_ms), until |τ| reaches this fraction of the cap (or squeeze_rad past the measured position).
+pub const SQUEEZE_RAMP_FRACTION: f32 = 0.6;
 pub const SETTLE_MAX_S: f64 = 2.0;
 
 /// Settle rule shared by every arm action: max_{i<6}|cmd−meas| < 0.05 and |v| < 0.05 for 200 ms.
@@ -748,7 +755,9 @@ impl PathTrajectory {
 enum GripPhase {
     Moving,
     /// Squeezing an object: hold target, samples of |τ_gripper| and |load_gripper|.
-    Squeeze { hold: f32, elapsed: f64, taus: Vec<f32>, loads: Vec<f32> },
+    /// `ramp`: the squeeze started at the measured position after a torque cap trip and
+    /// presses in (squeeze_rad over half the window) until the torque reaches SQUEEZE_RAMP_FRACTION of the cap.
+    Squeeze { hold: f32, elapsed: f64, taus: Vec<f32>, loads: Vec<f32>, ramp: bool },
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -813,10 +822,25 @@ impl GripperMotion {
         };
         let done = |holding: Option<bool>, gap: Option<f32>| StepStatus::Done { settled: None, holding, gripper_gap_rad: gap };
 
-        if let GripPhase::Squeeze { hold, elapsed, taus, loads } = &mut self.phase {
+        let dir = self.close_dir();
+        let force_cap = self.policy.max_close_torque_nm.filter(|_| ctx.torque_feedback && ctx.feedback_fresh);
+        let squeeze_rad = self.policy.squeeze_rad;
+        let ramp_rate = 2.0 * f64::from(squeeze_rad) / (self.policy.settle_ms as f64 / 1000.0);
+        if let GripPhase::Squeeze { hold, elapsed, taus, loads, ramp } = &mut self.phase {
             *elapsed += ctx.dt;
             taus.push(tau_g.abs());
             loads.push(ctx.loads.get(idx).copied().unwrap_or(0.0).abs());
+            // torque cap: back the squeeze off toward the measured position so the grip
+            // torque settles near SQUEEZE_CAP_FRACTION of the cap (position-proportional grip)
+            if let Some(cap) = force_cap {
+                let press = (*hold - m_g) * dir;
+                if tau_g.abs() > cap {
+                    if press > 0.0 { *hold = m_g + dir * press * (SQUEEZE_CAP_FRACTION * cap / tau_g.abs()); }
+                    *ramp = false;
+                } else if *ramp && tau_g.abs() < SQUEEZE_RAMP_FRACTION * cap && press < squeeze_rad {
+                    *hold += dir * ((ramp_rate * ctx.dt) as f32).min(squeeze_rad - press);
+                }
+            }
             if idx < positions.len() { positions[idx] = *hold; }
             let status = if *elapsed * 1000.0 >= self.policy.settle_ms as f64 - 1e-6 {
                 let mut sorted = taus.clone();
@@ -874,13 +898,17 @@ impl GripperMotion {
         let grasping = self.request.command == GripperCommand::Close && self.request.grasp;
         let status = if grasping {
             if stalled || still {
-                let dir = self.close_dir();
-                let squeezed = m_g + dir * self.policy.squeeze_rad;
+                // after a torque cap trip the jaw already presses harder than the cap: hold the
+                // measured position (the latch's hold), no squeeze past it
+                let capped = stalled && ctx.gripper_force_capped;
+                let squeeze = if capped { 0.0 } else { self.policy.squeeze_rad };
+                let squeezed = m_g + dir * squeeze;
                 let hold = if dir > 0.0 { squeezed.min(self.policy.closed_rad) } else { squeezed.max(self.policy.closed_rad) }
                     .clamp(self.limit.min_position, self.limit.max_position);
                 if idx < positions.len() { positions[idx] = hold; }
                 if idx < velocities.len() { velocities[idx] = 0.0; }
-                self.phase = GripPhase::Squeeze { hold, elapsed: 0.0, taus: Vec::new(), loads: Vec::new() };
+                let ramp = capped && self.policy.max_close_torque_nm.is_some();
+                self.phase = GripPhase::Squeeze { hold, elapsed: 0.0, taus: Vec::new(), loads: Vec::new(), ramp };
                 StepStatus::Running
             } else { StepStatus::Running }
         } else if stalled {

@@ -631,6 +631,11 @@ pub struct GripperPolicy {
     pub holding_mode: HoldingMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holding_load_fraction: Option<f32>,
+    /// Absolute gripper torque cap while closing (N·m): |τ| above it on fresh feedback for
+    /// [`crate::supervisor::GRIPPER_FORCE_CAP_TICKS`] ticks latches the stall whatever the jaw
+    /// speed and holds the measured position. Absent: no cap (drivers without torque feedback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_close_torque_nm: Option<f32>,
 }
 
 impl GripperPolicy {
@@ -649,6 +654,11 @@ impl GripperPolicy {
             zero_check_supported: true,
             holding_mode: HoldingMode::TorqueAndGap,
             holding_load_fraction: None,
+            // Office B601-DM 2026-11-20 (rc10, toy banana, black box 5 Hz): free close at
+            // ~1 rad/s reads 0.30-0.45 N·m, the first contact sample 0.85 N·m; the torque then
+            // rose to 5.0 N·m while the jaw kept moving at ~1 rad/s and a finger broke.
+            // Cap 1.0 N·m: 2.2x the free-close peak, a fifth of the torque at the break.
+            max_close_torque_nm: Some(1.0),
         }
     }
 
@@ -1439,6 +1449,10 @@ impl ArmConfig {
                     return Err("Invalid gripper policy: holding_load_fraction must be in 0.0..=1.0".into());
                 }
             }
+            let positive = |v: Option<f32>| v.is_none_or(|v| v.is_finite() && v > 0.0);
+            if !positive(g.max_close_torque_nm) {
+                return Err("Invalid gripper policy: max_close_torque_nm must be positive".into());
+            }
             if g.holding_mode == HoldingMode::LoadAndGap && g.holding_load_fraction.unwrap_or(0.0) <= 0.0 {
                 return Err("Invalid gripper policy: LoadAndGap holding mode requires holding_load_fraction > 0.0".into());
             }
@@ -1704,6 +1718,12 @@ pub struct GripperObs {
     pub fraction: f32,
     pub opening_m: Option<f32>,
     pub stalled: bool,
+    /// The stall latch was set by the torque cap (`gripper_policy.max_close_torque_nm`) and holds.
+    #[serde(default)]
+    pub force_limited: bool,
+    /// Torque cap trips since start.
+    #[serde(default)]
+    pub force_limit_trips: u64,
 }
 
 /// Full arm telemetry / observation
@@ -1829,6 +1849,9 @@ pub enum MotionLimitReason {
     /// Power governor (`src/power.rs`): the estimated supply current is above the soft
     /// fraction (motion slowed) or a power hold is in force (`observation.power.hold`).
     Power,
+    /// Gripper torque cap (`gripper_policy.max_close_torque_nm`): the jaw stopped closing and
+    /// holds its measured position. Targets closing further are held.
+    GripperForce,
 }
 
 impl MotionLimitReason {
@@ -1839,7 +1862,7 @@ impl MotionLimitReason {
             Self::Lead => 1,
             Self::Workspace => 2,
             Self::JointLimit => 3,
-            Self::Blocked => 4,
+            Self::Blocked | Self::GripperForce => 4,
             Self::Power => 5,
             Self::Torque => 6,
         }
