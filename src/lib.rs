@@ -25,6 +25,7 @@ pub mod model;
 pub mod motion;
 #[cfg(not(target_arch = "wasm32"))] pub mod persist;
 #[cfg(not(target_arch = "wasm32"))] pub mod place;
+#[cfg(all(feature = "policy-runtime", not(target_arch = "wasm32")))] pub mod policy_runtime;
 #[cfg(not(target_arch = "wasm32"))] pub mod poses;
 pub mod power;
 pub mod power_plan;

@@ -926,6 +926,7 @@ async fn test_5dof_orchestrator_probe_lateral_returns_fallback() {
     let dummy_det = grasp::Detection {
         label: "cup".into(),
         score: 0.9,
+        raw_score_valid: true,
         box_norm: [0.4, 0.4, 0.6, 0.6],
         angle_deg: None,
         angle_conf: None,

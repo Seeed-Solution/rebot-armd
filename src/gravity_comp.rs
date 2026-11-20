@@ -162,6 +162,14 @@ impl SupervisorInner {
             || !self.safety.state().is_operational() {
             return Some(reason("NOT_ARMED", "Enable the arm first"));
         }
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_loading {
+            return Some(reason("MOTION_BUSY", "a policy is loading"));
+        }
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_run.is_some() {
+            return Some(reason("MOTION_BUSY", "a policy run is active"));
+        }
         if self.pending_normal_unload || self.active_trajectory.is_some() || self.servo_target.is_some()
             || self.macro_run.is_some() || self.safety.state() != &SafetyState::Armed
             || self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) {

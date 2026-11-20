@@ -120,6 +120,19 @@ pub fn create_router_calibration(
     )
 }
 
+/// [`create_router`] with explicit [`crate::auth::OperatorAuth`] and [`sandbox::SandboxState`].
+pub fn create_router_with_sandbox(
+    supervisor: Arc<ArmSupervisor>,
+    auth: crate::auth::OperatorAuth,
+    sandbox: Arc<sandbox::SandboxState>,
+) -> Router {
+    let detector = proxy::DetectorUpstream::from_env();
+    let grasp = crate::grasp::GraspDeps::http(detector.clone(), Some(crate::grasp::setup_path_from_env()));
+    let diagnostics = crate::diagnostics::DiagnosticsState::global();
+    let calibration = crate::calibration::CalibrationDeps::from_env(grasp.setup_path.clone(), detector.clone());
+    create_router_full_with_sandbox(supervisor, detector, grasp, diagnostics, calibration, auth, sandbox)
+}
+
 /// [`create_router_calibration`] with explicit [`crate::auth::OperatorAuth`].
 pub fn create_router_calibration_with_auth(
     supervisor: Arc<ArmSupervisor>,
@@ -129,7 +142,27 @@ pub fn create_router_calibration_with_auth(
     calibration: crate::calibration::CalibrationDeps,
     auth: crate::auth::OperatorAuth,
 ) -> Router {
-    Router::new()
+    create_router_full_with_sandbox(
+        supervisor,
+        detector,
+        grasp,
+        diagnostics,
+        calibration,
+        auth,
+        sandbox::SandboxState::new_shared(),
+    )
+}
+
+pub fn create_router_full_with_sandbox(
+    supervisor: Arc<ArmSupervisor>,
+    detector: proxy::DetectorUpstream,
+    grasp: crate::grasp::GraspDeps,
+    diagnostics: crate::diagnostics::DiagnosticsState,
+    calibration: crate::calibration::CalibrationDeps,
+    auth: crate::auth::OperatorAuth,
+    sandbox: Arc<sandbox::SandboxState>,
+) -> Router {
+    let router = Router::new()
         .route("/api/v1/auth/status", get(rest::auth_status))
         .route("/api/v1/auth/unlock", post(rest::auth_unlock))
         .route("/api/v1/auth/lock", post(rest::auth_lock))
@@ -206,7 +239,12 @@ pub fn create_router_calibration_with_auth(
         .route("/api/v1/action/move_to_pose", post(rest::action_requires_lease))
         .route("/api/v1/action/place", post(rest::action_requires_lease))
         .route("/api/v1/action/replay", post(rest::action_requires_lease))
-        .route("/api/v1/mode/gravity_comp", post(rest::action_requires_lease))
+        .route("/api/v1/mode/gravity_comp", post(rest::action_requires_lease));
+    #[cfg(feature = "policy-runtime")]
+    let router = router
+        .route("/api/v1/action/policy/start", post(rest::action_requires_lease))
+        .route("/api/v1/action/policy/stop", post(rest::action_requires_lease));
+    router
         .route("/api/v1/gripper/calibration", get(rest::get_gripper_calibration))
         .route("/api/v1/grasp/setup", get(rest::get_grasp_setup))
         .route(crate::depth_measure::PATH, post(rest::post_grasp_measure).layer(middleware::from_fn(require_operator)))
@@ -272,7 +310,7 @@ pub fn create_router_calibration_with_auth(
         .layer(axum::Extension(grasp))
         .layer(axum::Extension(calibration))
         .layer(axum::Extension(diagnostics))
-        .layer(axum::Extension(sandbox::SandboxState::new_shared()))
+        .layer(axum::Extension(sandbox))
         .layer(axum::Extension(auth))
         .layer(middleware::from_fn(same_origin))
         .layer(TraceLayer::new_for_http())

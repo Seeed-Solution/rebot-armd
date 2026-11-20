@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "policy-runtime")]
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, LazyLock, Mutex};
 use axum::{extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State}, response::IntoResponse};
 use futures_util::{SinkExt, StreamExt};
@@ -38,6 +40,7 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSu
                         headers: axum::http::HeaderMap,
                         axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>,
                         axum::Extension(calib): axum::Extension<crate::calibration::CalibrationDeps>,
+                        axum::Extension(sandbox): axum::Extension<Arc<crate::api::sandbox::SandboxState>>,
                         axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>) -> axum::response::Response {
     let control_hz = supervisor.inner().read().await.config.control_frequency_hz.max(1);
     let obs_rate = match query.get("obs_hz") {
@@ -48,7 +51,7 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSu
         },
     };
     let ws_token = crate::auth::OperatorAuth::extract_token(&headers);
-    ws.on_upgrade(move |socket| handle_socket(socket, supervisor, deps, calib, obs_rate, auth, ws_token)).into_response()
+    ws.on_upgrade(move |socket| handle_socket(socket, supervisor, deps, calib, sandbox, obs_rate, auth, ws_token)).into_response()
 }
 
 /// Per-connection observation rate limit.
@@ -178,7 +181,65 @@ struct PendingPlan {
     approach: Result<crate::backlash::Plan, Option<&'static str>>,
 }
 
-enum ActionStart { Started(u64, f64), Plan(PendingPlan), Macro(PendingMacro), Replay(crate::replay::ReplayInput), DryRunGrasp(Value), Sequence(Box<crate::sequences::RunPlan>), CalibHover(Box<crate::calib_hover::HoverPlan>) }
+#[cfg(feature = "policy-runtime")]
+struct PendingPolicyStart {
+    request: crate::policy_runtime::PolicyStartRequest,
+    config: crate::model::ArmConfig,
+    epoch: u64,
+    policy_live_allowed: bool,
+}
+
+#[cfg(feature = "policy-runtime")]
+struct PolicyLoadingGuard(Option<Arc<ArmSupervisor>>);
+
+#[cfg(feature = "policy-runtime")]
+impl PolicyLoadingGuard {
+    fn new(sup: Arc<ArmSupervisor>) -> Self {
+        Self(Some(sup))
+    }
+
+    fn clear(&mut self, inner: &mut SupervisorInner) {
+        if self.0.take().is_some() {
+            inner.policy_loading = false;
+        }
+    }
+}
+
+#[cfg(feature = "policy-runtime")]
+impl Drop for PolicyLoadingGuard {
+    fn drop(&mut self) {
+        let Some(sup) = self.0.take() else {
+            return;
+        };
+        if let Ok(mut inner) = sup.inner().try_write() {
+            inner.policy_loading = false;
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(h) => {
+                h.spawn(async move {
+                    sup.inner().write().await.policy_loading = false;
+                });
+            }
+            Err(_) => sup.inner().blocking_write().policy_loading = false,
+        }
+        tracing::warn!("policy loading ended without explicit clear; cleared policy_loading");
+    }
+}
+
+enum ActionStart {
+    Started(u64, f64),
+    Plan(PendingPlan),
+    Macro(PendingMacro),
+    Replay(crate::replay::ReplayInput),
+    DryRunGrasp(Value),
+    Sequence(Box<crate::sequences::RunPlan>),
+    CalibHover(Box<crate::calib_hover::HoverPlan>),
+    #[cfg(feature = "policy-runtime")]
+    Policy(PendingPolicyStart),
+    #[cfg(feature = "policy-runtime")]
+    PolicyStopped(bool),
+}
 
 /// A macro action (crate::macro_action) checked under the lock, planned without it.
 enum PendingMacro { Grasp(crate::grasp::PendingGrasp), Place(crate::place::PendingPlace) }
@@ -298,6 +359,28 @@ fn prepare_action(
         }
         "/api/v1/action/run_sequence" => return Ok(ActionStart::Sequence(Box::new(crate::sequences::prepare_run(inner, body, epoch)?))),
         crate::calib_hover::PATH => return Ok(ActionStart::CalibHover(Box::new(crate::calib_hover::prepare(inner, body, epoch)?))),
+        #[cfg(feature = "policy-runtime")]
+        "/api/v1/action/policy/start" => {
+            let request = crate::policy_runtime::parse_policy_start_request(body).map_err(ArmError::from)?;
+            let _ = crate::policy_runtime::compute_policy_deadline(request.max_seconds).map_err(ArmError::from)?;
+            inner.check_policy_start_preconditions_with(
+                request.mode,
+                request.sim_only,
+                request.i_am_at_the_arm,
+                epoch,
+            )?;
+            return Ok(ActionStart::Policy(PendingPolicyStart {
+                request,
+                config: inner.config.clone(),
+                epoch,
+                policy_live_allowed: inner.policy_live_allowed(),
+            }));
+        }
+        #[cfg(feature = "policy-runtime")]
+        "/api/v1/action/policy/stop" => {
+            let stopped = inner.stop_policy_run(None, "STOPPED");
+            return Ok(ActionStart::PolicyStopped(stopped));
+        }
         _ => return Err(invalid_command("Unknown action")),
     };
     let (spec, speed, tag) = parsed.map_err(ArmError::from)?;
@@ -643,7 +726,9 @@ fn command_reject(inner: &SupervisorInner, request_id: &Value, error: ApiError) 
     reply
 }
 
-async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: crate::grasp::GraspDeps, calib: crate::calibration::CalibrationDeps, obs_rate: Option<ObsRate>, auth: crate::auth::OperatorAuth, ws_token: Option<String>) {
+async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: crate::grasp::GraspDeps, calib: crate::calibration::CalibrationDeps, sandbox: Arc<crate::api::sandbox::SandboxState>, obs_rate: Option<ObsRate>, auth: crate::auth::OperatorAuth, ws_token: Option<String>) {
+    #[cfg(not(feature = "policy-runtime"))]
+    let _ = &sandbox;
     let (mut sender, mut receiver) = socket.split();
     let mut telemetry = supervisor.subscribe_telemetry();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(64);
@@ -695,6 +780,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let recv_generation = connection_generation.clone();
     let recv_deps = deps;
     let recv_calib = calib;
+    #[cfg(feature = "policy-runtime")]
+    let recv_sandbox = sandbox;
     let mut recv_task = tokio::spawn(async move {
         // the operator session of this connection: from the upgrade request, replaced by `auth` messages
         let mut ws_token = ws_token;
@@ -705,6 +792,22 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
         // the current epoch and enqueued by this loop, in order with its other replies
         // (epoch_sync, rejects): the epochs a client receives never go back.
         let (ack_tx, mut ack_rx) = mpsc::channel::<Value>(64);
+        #[cfg(feature = "policy-runtime")]
+        let ws_closed = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "policy-runtime")]
+        struct WsClosedGuard(Arc<AtomicBool>);
+        #[cfg(feature = "policy-runtime")]
+        impl Drop for WsClosedGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        #[cfg(feature = "policy-runtime")]
+        let _ws_closed_guard = WsClosedGuard(ws_closed.clone());
+        #[cfg(feature = "policy-runtime")]
+        let policy_stop_gen = Arc::new(AtomicU64::new(0));
+        #[cfg(feature = "policy-runtime")]
+        let pending_policy_loads = Arc::new(AtomicUsize::new(0));
         let mut macro_check: Option<MacroCheck> = None;
         let mut backlog: std::collections::VecDeque<Message> = std::collections::VecDeque::new();
         loop {
@@ -828,6 +931,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let mut pending_plan: Option<(PendingPlan, u64)> = None;
             let mut pending_macro: Option<(Value, PendingMacro, u64)> = None;
             let mut pending_replay: Option<(Value, crate::replay::ReplayInput, u64)> = None;
+            #[cfg(feature = "policy-runtime")]
+            let mut pending_policy: Option<(Value, PendingPolicyStart, u64, PolicyLoadingGuard)> = None;
             let mut pending_dry_run_grasp: Option<(Value, Value)> = None;
             let mut pending_config_write: Option<(Value, PreparedConfigWrite, u64, u64)> = None;
             let mut pending_calibration: Option<(Value, CalibJob, u64, u64, bool)> = None;
@@ -997,6 +1102,21 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                                 }
                                                 Err(error) => command_reject(&inner, &value["request_id"], error.into()),
                                             }),
+                                            #[cfg(feature = "policy-runtime")]
+                                            Ok(ActionStart::Policy(p)) => {
+                                                inner.policy_loading = true;
+                                                let loading_guard = PolicyLoadingGuard::new(recv_supervisor.clone());
+                                                pending_policy = Some((value["request_id"].clone(), p, local_generation, loading_guard));
+                                                None
+                                            }
+                                            #[cfg(feature = "policy-runtime")]
+                                            Ok(ActionStart::PolicyStopped(stopped)) => {
+                                                policy_stop_gen.fetch_add(1, Ordering::SeqCst);
+                                                let had_pending = pending_policy_loads.load(Ordering::SeqCst) > 0;
+                                                let mut ack = command_ack(&inner, &value["request_id"], None);
+                                                ack["stopped"] = json!(stopped || had_pending);
+                                                Some(ack)
+                                            }
                                             Err(error) => Some(command_reject(&inner, &value["request_id"], error)),
                                         };
                                     } else if let Some(result) = PreparedConfigWrite::prepare(
@@ -1027,6 +1147,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                         }
                                     } else {
                                         let result = execute_command(&mut inner, path, &value["body"], epoch);
+                                        #[cfg(feature = "policy-runtime")]
+                                        if path == "/api/v1/motion/stop" && result.is_ok() {
+                                            policy_stop_gen.fetch_add(1, Ordering::SeqCst);
+                                        }
                                         response = Some(match result {
                                             Ok(started) => command_ack(&inner, &value["request_id"], started),
                                             Err(error) => command_reject(&inner, &value["request_id"], error),
@@ -1138,6 +1262,201 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 }
                             }
                         }
+                    });
+                }
+                #[cfg(feature = "policy-runtime")]
+                if let Some((request_id, pending, generation, loading_guard)) = pending_policy.take() {
+                    let sup = recv_supervisor.clone();
+                    let sandbox_c = recv_sandbox.clone();
+                    let vision_src = recv_deps.source.clone();
+                    let conn = recv_connection.clone();
+                    let gen_now = recv_generation.clone();
+                    let tx = ack_tx.clone();
+                    let ws_closed_c = ws_closed.clone();
+                    let stop_gen_c = policy_stop_gen.clone();
+                    let my_stop_gen = stop_gen_c.load(Ordering::SeqCst);
+                    let pending_loads_c = pending_policy_loads.clone();
+                    pending_loads_c.fetch_add(1, Ordering::SeqCst);
+                    struct PendingLoadGuard(Arc<AtomicUsize>);
+                    impl Drop for PendingLoadGuard {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::SeqCst);
+                        }
+                    }
+                    let load_guard = PendingLoadGuard(pending_loads_c);
+                    let epoch_id = pending.epoch;
+                    let policy_id = pending.request.policy_id.clone();
+                    let config = pending.config;
+                    let request_mode = pending.request.mode;
+                    let request_sim_only = pending.request.sim_only;
+                    let request_fps = pending.request.fps;
+                    let inline_release_gate = pending.request.release_gate;
+                    let policy_live_allowed = pending.policy_live_allowed;
+                    let i_am_at_the_arm = pending.request.i_am_at_the_arm;
+                    tokio::spawn(async move {
+                        let _load_guard = load_guard;
+                        let mut loading_guard = loading_guard;
+                        let policy_id_load = policy_id.clone();
+                        let deployment = if request_mode == crate::policy_runtime::PolicyMode::Live && !policy_live_allowed {
+                            let (scene_id, tool_id) = sandbox_c.active_scene_and_tool().await;
+                            let calibration_digest = {
+                                let inner = sup.inner().read().await;
+                                inner.active_calibration_digest()
+                            };
+                            Some(crate::policy_runtime::ActiveDeploymentContext {
+                                scene_id,
+                                tool_id,
+                                calibration_digest,
+                            })
+                        } else {
+                            None
+                        };
+                        let sandbox_load = sandbox_c.clone();
+                        let prepared = tokio::task::spawn_blocking(move || {
+                            let delay_ms = sandbox_load.policy_load_delay_ms();
+                            if delay_ms > 0 {
+                                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                            }
+                            let dir = sandbox_load.policy_dir(&policy_id_load).ok_or_else(|| ArmError::Rejected {
+                                status: 404,
+                                code: "POLICY_NOT_FOUND".into(),
+                                message: format!("Policy pack '{policy_id_load}' not found"),
+                            })?;
+                            let prepared_policy = crate::policy_runtime::prepare_policy(&dir, &config).map_err(ArmError::from)?;
+                            let effective_fps = request_fps
+                                .or(prepared_policy.contract().fps)
+                                .unwrap_or(crate::policy_runtime::DEFAULT_POLICY_FPS);
+                            let effective_fps = crate::policy_runtime::validate_policy_fps(request_mode, effective_fps)
+                                .map_err(ArmError::from)?;
+                            let verified_release_gate = if let Some(ref deployment_ctx) = deployment {
+                                let raw_gate = match inline_release_gate {
+                                    Some(v) => Some(v),
+                                    None => crate::policy_runtime::load_release_gate_json(&dir).map_err(ArmError::from)?,
+                                };
+                                match raw_gate {
+                                    Some(raw) => Some(
+                                        crate::policy_runtime::ReleaseGate::parse_and_verify(
+                                            &raw,
+                                            prepared_policy.artifact_digest(),
+                                            &config,
+                                            prepared_policy.contract(),
+                                            effective_fps,
+                                            deployment_ctx,
+                                        )
+                                        .map_err(ArmError::from)?,
+                                    ),
+                                    None => None,
+                                }
+                            } else {
+                                None
+                            };
+                            Ok::<_, ArmError>((prepared_policy, effective_fps, verified_release_gate))
+                        }).await;
+
+                        if ws_closed_c.load(Ordering::SeqCst) {
+                            let mut inner = sup.inner().write().await;
+                            loading_guard.clear(&mut inner);
+                            return;
+                        }
+
+                        let reply = match prepared {
+                            Err(e) => {
+                                let mut inner = sup.inner().write().await;
+                                loading_guard.clear(&mut inner);
+                                command_reject(&inner, &request_id, ArmError::Internal(format!("policy load task failed: {e}")).into())
+                            }
+                            Ok(Err(error)) => {
+                                let mut inner = sup.inner().write().await;
+                                loading_guard.clear(&mut inner);
+                                command_reject(&inner, &request_id, error.into())
+                            }
+                            Ok(Ok((prepared_policy, fps, verified_release_gate))) => {
+                                let deadline_res = crate::policy_runtime::compute_policy_deadline(pending.request.max_seconds)
+                                    .map_err(ArmError::from);
+
+                                let mut inner = sup.inner().write().await;
+                                loading_guard.clear(&mut inner);
+                                if ws_closed_c.load(Ordering::SeqCst) {
+                                    return;
+                                }
+                                if gen_now.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&conn, generation) {
+                                    json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while loading policy", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
+                                } else if inner.safety.epoch_id() != epoch_id {
+                                    json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"EPOCH_MISMATCH", "message":"Epoch changed while loading policy", "error":"EPOCH_MISMATCH", "epoch_id":inner.safety.epoch_id()})
+                                } else if stop_gen_c.load(Ordering::SeqCst) != my_stop_gen {
+                                    json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"STOPPED", "message":"Stopped while loading policy", "error":"STOPPED", "epoch_id":inner.safety.epoch_id()})
+                                } else {
+                                    match deadline_res {
+                                        Err(err) => command_reject(&inner, &request_id, err.into()),
+                                        Ok(deadline) => {
+                                            let deployment_check = if let Some(ref gate) = verified_release_gate {
+                                                let (cur_scene, cur_tool) = sandbox_c.active_scene_and_tool().await;
+                                                let cur_ctx = crate::policy_runtime::ActiveDeploymentContext {
+                                                    scene_id: cur_scene,
+                                                    tool_id: cur_tool,
+                                                    calibration_digest: inner.active_calibration_digest(),
+                                                };
+                                                gate.verify_deployment(&cur_ctx).map_err(ArmError::from)
+                                            } else {
+                                                Ok(())
+                                            };
+                                            if let Err(err) = deployment_check {
+                                                command_reject(&inner, &request_id, err.into())
+                                            } else {
+                                                let start_req = crate::policy_runtime::PolicyRunStart {
+                                                    epoch_id,
+                                                    connection_id: conn,
+                                                    lease_generation: generation,
+                                                    policy_id: policy_id.clone(),
+                                                    artifact_digest: prepared_policy.artifact_digest().to_string(),
+                                                    backend: prepared_policy.backend_name().to_string(),
+                                                    mode: request_mode,
+                                                    sim_only: request_sim_only,
+                                                    max_first_step_rad: prepared_policy.contract().max_first_step_rad,
+                                                    max_step_rad: prepared_policy.contract().max_step_rad,
+                                                    tag: pending.request.tag,
+                                                    i_am_at_the_arm,
+                                                    verified_release_gate,
+                                                };
+                                                match inner.begin_policy_run(start_req) {
+                                                Ok(action_id) => {
+                                                    let digest = prepared_policy.artifact_digest().to_string();
+                                                    let backend = prepared_policy.backend_name().to_string();
+                                                    let mode_str = pending.request.mode.as_str().to_string();
+                                                    let vision_source = prepared_policy
+                                                        .contract()
+                                                        .vision
+                                                        .as_ref()
+                                                        .map(|_| {
+                                                            Arc::new(crate::policy_runtime::DetectionSourceAdapter(
+                                                                vision_src.clone(),
+                                                            ))
+                                                                as Arc<dyn crate::policy_runtime::PolicyVisionSource>
+                                                        });
+                                                    crate::policy_runtime::spawn_policy_runner(
+                                                        sup.clone(),
+                                                        action_id,
+                                                        prepared_policy,
+                                                        fps,
+                                                        deadline,
+                                                        vision_source,
+                                                    );
+                                                    let mut ack = command_ack(&inner, &request_id, Some((action_id, pending.request.max_seconds.unwrap_or(0.0))));
+                                                    ack["policy_id"] = json!(policy_id);
+                                                    ack["artifact_digest"] = json!(digest);
+                                                    ack["backend"] = json!(backend);
+                                                    ack["mode"] = json!(mode_str);
+                                                    ack
+                                                }
+                                                Err(error) => command_reject(&inner, &request_id, error.into()),
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        let _ = tx.send(reply).await;
                     });
                 }
                 if let Some((request_id, body)) = pending_dry_run_grasp.take() {

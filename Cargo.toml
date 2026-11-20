@@ -11,6 +11,10 @@ keywords = ["robotics", "robot-arm", "lerobot", "recamera", "can"]
 categories = ["science::robotics"]
 publish = false
 
+[features]
+policy-runtime = []
+policy-tract = ["policy-runtime", "dep:tract-onnx"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -34,6 +38,7 @@ tempfile = "3"
 serialport = { version = "4", default-features = false }
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 libc = "0.2"
+tract-onnx = { version = "0.21", default-features = false, optional = true }
 
 # Style lints that the code base does not follow; everything else is denied in CI
 # (`cargo clippy --all-targets -- -D warnings`).
