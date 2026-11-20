@@ -267,8 +267,9 @@ impl WorkspacePolicy {
             check_points_end_m: corners,
             keepout_boxes: Vec::new(),
             // Link capsules enclosing sim/mujoco/models/rebot_b601dm_scene.xml collision boxes + ~4-5 mm margin,
-            // plus base_link pedestal and link6 wrist housing for non-adjacent self-collision checks:
-            // - base_link: pedestal/J1 housing z=[0.005, 0.120], r=0.040 (clears floor_z=0.0 and folded home)
+            // plus base_link pedestal + base_plate and link6 wrist housing for non-adjacent self-collision checks:
+            // - base_link: pedestal z>=0.014 (max_d 53.0 mm <= r=0.054), z_min=-0.002 (fixed base skips floor check)
+            // - base_plate: mounting flange [-0.07,0.07]x[-0.10,0.10]x[0,0.014] (max_d 83.2 mm <= r=0.084)
             // - link2: box pos [-0.132, 0, -0.0316], size [0.1605, 0.0285, 0.0337] (half-diag 44.1 mm) -> r=0.050
             // - link3: box pos [0.1222, -0.03, -0.0311], size [0.1489, 0.0525, 0.0401] (half-diag 66.1 mm) -> r=0.071
             // - link4: box pos [0.0449, -0.03, -0.03], size [0.0729, 0.058, 0.0334] (half-diag 66.9 mm) -> r=0.072
@@ -278,9 +279,16 @@ impl WorkspacePolicy {
                 LinkCapsule {
                     id: "base_link".into(),
                     frame: "base_link".into(),
-                    a_m: [0.0, 0.0, 0.045],
+                    a_m: [0.0, 0.0, 0.052],
                     b_m: [0.0, 0.0, 0.08],
-                    radius_m: 0.04,
+                    radius_m: 0.054,
+                },
+                LinkCapsule {
+                    id: "base_plate".into(),
+                    frame: "base_link".into(),
+                    a_m: [0.0, -0.05, 0.007],
+                    b_m: [0.0, 0.05, 0.007],
+                    radius_m: 0.084,
                 },
                 LinkCapsule {
                     id: "link2".into(),
@@ -324,6 +332,9 @@ impl WorkspacePolicy {
                 ["base_link".into(), "link4".into()],
                 ["base_link".into(), "link5".into()],
                 ["base_link".into(), "link6".into()],
+                ["base_plate".into(), "link4".into()],
+                ["base_plate".into(), "link5".into()],
+                ["base_plate".into(), "link6".into()],
             ],
         }
     }

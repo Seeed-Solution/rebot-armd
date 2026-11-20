@@ -186,14 +186,29 @@
         "a_m": [
           0.0,
           0.0,
-          0.045
+          0.052
         ],
         "b_m": [
           0.0,
           0.0,
           0.08
         ],
-        "radius_m": 0.04
+        "radius_m": 0.054
+      },
+      {
+        "id": "base_plate",
+        "frame": "base_link",
+        "a_m": [
+          0.0,
+          -0.05,
+          0.007
+        ],
+        "b_m": [
+          0.0,
+          0.05,
+          0.007
+        ],
+        "radius_m": 0.084
       },
       {
         "id": "link2",
@@ -283,6 +298,18 @@
       ],
       [
         "base_link",
+        "link6"
+      ],
+      [
+        "base_plate",
+        "link4"
+      ],
+      [
+        "base_plate",
+        "link5"
+      ],
+      [
+        "base_plate",
         "link6"
       ]
     ]

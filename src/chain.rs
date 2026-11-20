@@ -686,18 +686,20 @@ impl ArmModel {
                 let b = pose.transform_point(&cap.b_m.map(f64::from));
                 let r = f64::from(cap.radius_m);
                 world_caps.push((a, b, r));
-                let pt = base_pt + ci;
-                let z_min = a[2].min(b[2]) - r;
-                note(floor - z_min, pt, "floor", z_min, floor, None);
-                for axis in 0..3 {
-                    let c_min = a[axis].min(b[axis]) - r;
-                    let c_max = a[axis].max(b[axis]) + r;
-                    note(lo[axis] - c_min, pt, k::BOX_LIMITS[axis][0], c_min, lo[axis], None);
-                    note(c_max - hi[axis], pt, k::BOX_LIMITS[axis][1], c_max, hi[axis], None);
-                }
-                for (bi, kb) in ws.keepout_boxes.iter().enumerate() {
-                    let clr = k::capsule_aabb_clearance(&a, &b, r, &kb.min_m.map(f64::from), &kb.max_m.map(f64::from));
-                    note(-clr, pt, "keepout", -clr, 0.0, Some(bi));
+                if !matches!(fr, FrameRef::BaseRel(_, _)) {
+                    let pt = base_pt + ci;
+                    let z_min = a[2].min(b[2]) - r;
+                    note(floor - z_min, pt, "floor", z_min, floor, None);
+                    for axis in 0..3 {
+                        let c_min = a[axis].min(b[axis]) - r;
+                        let c_max = a[axis].max(b[axis]) + r;
+                        note(lo[axis] - c_min, pt, k::BOX_LIMITS[axis][0], c_min, lo[axis], None);
+                        note(c_max - hi[axis], pt, k::BOX_LIMITS[axis][1], c_max, hi[axis], None);
+                    }
+                    for (bi, kb) in ws.keepout_boxes.iter().enumerate() {
+                        let clr = k::capsule_aabb_clearance(&a, &b, r, &kb.min_m.map(f64::from), &kb.max_m.map(f64::from));
+                        note(-clr, pt, "keepout", -clr, 0.0, Some(bi));
+                    }
                 }
             }
             if ws.self_collision_enabled {
@@ -730,42 +732,45 @@ impl ArmModel {
 /// Shortest Euclidean distance between 3D line segments `[p1, q1]` and `[p2, q2]`.
 pub fn seg_seg_dist(p1: &Vec3, q1: &Vec3, p2: &Vec3, q2: &Vec3) -> f64 {
     const LEN2_EPS: f64 = 1e-18;
-    const PARALLEL_EPS: f64 = 1e-14;
+    const PARALLEL_EPS: f64 = 1e-12;
     let d1 = k::sub(q1, p1);
     let d2 = k::sub(q2, p2);
     let r = k::sub(p1, p2);
     let a = k::dot(&d1, &d1);
     let e = k::dot(&d2, &d2);
-    let f = k::dot(&d2, &r);
-
-    let (s, t) = if a <= LEN2_EPS && e <= LEN2_EPS {
-        (0.0, 0.0)
-    } else if a <= LEN2_EPS {
-        (0.0, (f / e).clamp(0.0, 1.0))
-    } else {
-        let c = k::dot(&d1, &r);
-        if e <= LEN2_EPS {
-            ((-c / a).clamp(0.0, 1.0), 0.0)
-        } else {
-            let b = k::dot(&d1, &d2);
-            let denom = a * e - b * b;
-            let mut s = if denom > PARALLEL_EPS * a * e {
-                ((b * f - c * e) / denom).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let mut t = (b * s + f) / e;
-            if t < 0.0 {
-                t = 0.0;
-                s = (-c / a).clamp(0.0, 1.0);
-            } else if t > 1.0 {
-                t = 1.0;
-                s = ((b - c) / a).clamp(0.0, 1.0);
-            }
-            (s, t)
-        }
+    let pt_seg_dist = |pt: &Vec3, seg_a: &Vec3, seg_d: &Vec3, seg_len2: f64| -> f64 {
+        let ap = k::sub(pt, seg_a);
+        let proj = (k::dot(&ap, seg_d) / seg_len2).clamp(0.0, 1.0);
+        k::norm(&[ap[0] - seg_d[0] * proj, ap[1] - seg_d[1] * proj, ap[2] - seg_d[2] * proj])
     };
-
+    if a <= LEN2_EPS && e <= LEN2_EPS {
+        return k::norm(&r);
+    }
+    if a <= LEN2_EPS {
+        return pt_seg_dist(p1, p2, &d2, e);
+    }
+    if e <= LEN2_EPS {
+        return pt_seg_dist(p2, p1, &d1, a);
+    }
+    let b = k::dot(&d1, &d2);
+    let denom = a * e - b * b;
+    if denom <= PARALLEL_EPS * a * e {
+        return pt_seg_dist(p1, p2, &d2, e)
+            .min(pt_seg_dist(q1, p2, &d2, e))
+            .min(pt_seg_dist(p2, p1, &d1, a))
+            .min(pt_seg_dist(q2, p1, &d1, a));
+    }
+    let c = k::dot(&d1, &r);
+    let f = k::dot(&d2, &r);
+    let mut s = ((b * f - c * e) / denom).clamp(0.0, 1.0);
+    let mut t = (b * s + f) / e;
+    if t < 0.0 {
+        t = 0.0;
+        s = (-c / a).clamp(0.0, 1.0);
+    } else if t > 1.0 {
+        t = 1.0;
+        s = ((b - c) / a).clamp(0.0, 1.0);
+    }
     let c1 = k::add(p1, &[d1[0] * s, d1[1] * s, d1[2] * s]);
     let c2 = k::add(p2, &[d2[0] * t, d2[1] * t, d2[2] * t]);
     k::norm(&k::sub(&c1, &c2))
@@ -1149,13 +1154,17 @@ impl<'a> WorkspaceEvaluator<'a> {
             let b = pose.transform_point(b_local);
             world_caps[ci] = (a, b, *radius);
             let base = (self.num_end_pts + ci) * self.slots_per_geom;
-            buf[base] = a[2].min(b[2]) - *radius - self.floor;
-            for axis in 0..3 {
-                buf[base + 1 + axis] = (a[axis].min(b[axis]) - *radius) - self.box_lo[axis];
-                buf[base + 4 + axis] = self.box_hi[axis] - (a[axis].max(b[axis]) + *radius);
-            }
-            for (bi, (kb_lo, kb_hi)) in self.keepouts.iter().enumerate() {
-                buf[base + 7 + bi] = k::capsule_aabb_clearance(&a, &b, *radius, kb_lo, kb_hi);
+            if matches!(fr, FrameRef::BaseRel(_, _)) {
+                buf[base..base + self.slots_per_geom].fill(0.0);
+            } else {
+                buf[base] = a[2].min(b[2]) - *radius - self.floor;
+                for axis in 0..3 {
+                    buf[base + 1 + axis] = (a[axis].min(b[axis]) - *radius) - self.box_lo[axis];
+                    buf[base + 4 + axis] = self.box_hi[axis] - (a[axis].max(b[axis]) + *radius);
+                }
+                for (bi, (kb_lo, kb_hi)) in self.keepouts.iter().enumerate() {
+                    buf[base + 7 + bi] = k::capsule_aabb_clearance(&a, &b, *radius, kb_lo, kb_hi);
+                }
             }
         }
         if let Some(reach) = self.ws.max_reach_m {

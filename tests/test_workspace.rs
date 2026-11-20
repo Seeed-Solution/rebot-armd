@@ -854,7 +854,7 @@ fn b601dm_builtin_and_kit_profile_link_capsules_positive_and_negative() {
         kit.workspace.as_ref().unwrap().link_capsules
     );
     let capsules = &builtin.workspace.as_ref().unwrap().link_capsules;
-    assert!(capsules.len() >= 4);
+    assert!(capsules.len() >= 6);
 
     // Enclosure verification against sim/mujoco/models/rebot_b601dm_scene.xml collision boxes
     let dm_boxes: &[(&str, [f64; 3], [f64; 3])] = &[
@@ -862,6 +862,7 @@ fn b601dm_builtin_and_kit_profile_link_capsules_positive_and_negative() {
         ("link3", [0.1222, -0.03, -0.0311], [0.1489, 0.0525, 0.0401]),
         ("link4", [0.0449, -0.03, -0.03], [0.0729, 0.058, 0.0334]),
         ("link5", [-0.0028, 0.0, 0.0355], [0.035, 0.0385, 0.0425]),
+        ("link6", [0.0, 0.0, 0.0242], [0.0385, 0.0318, 0.029]),
     ];
     for (id, c, half) in dm_boxes {
         let cap = capsules.iter().find(|k| k.id == *id).unwrap_or_else(|| panic!("missing capsule {id}"));
@@ -878,6 +879,59 @@ fn b601dm_builtin_and_kit_profile_link_capsules_positive_and_negative() {
                 }
             }
         }
+    }
+
+    // Enclosure verification of base_link and link6 against kits/.../assets/meshes/{manifest.json, arm.bin}
+    let mesh_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/assets/meshes");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(mesh_dir.join("manifest.json")).unwrap()).unwrap();
+    let arm_bin = std::fs::read(mesh_dir.join("arm.bin")).unwrap();
+    let load_mesh_verts = |link: &str| -> Vec<[f64; 3]> {
+        let mut out = Vec::new();
+        for part in manifest["links"][link].as_array().unwrap() {
+            let off = part["offset"].as_u64().unwrap() as usize;
+            let n = part["verts"].as_u64().unwrap() as usize;
+            let bb: Vec<f64> = part["bbox"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+            for i in 0..n {
+                let b = off + i * 6;
+                let qx = f64::from(u16::from_le_bytes([arm_bin[b], arm_bin[b + 1]]));
+                let qy = f64::from(u16::from_le_bytes([arm_bin[b + 2], arm_bin[b + 3]]));
+                let qz = f64::from(u16::from_le_bytes([arm_bin[b + 4], arm_bin[b + 5]]));
+                out.push([
+                    bb[0] + (qx / 65535.0) * (bb[3] - bb[0]),
+                    bb[1] + (qy / 65535.0) * (bb[4] - bb[1]),
+                    bb[2] + (qz / 65535.0) * (bb[5] - bb[2]),
+                ]);
+            }
+        }
+        out
+    };
+    let base_caps: Vec<_> = capsules
+        .iter()
+        .filter(|k| k.frame == "base_link")
+        .collect();
+    assert_eq!(base_caps.len(), 2, "expected base_link + base_plate capsules");
+    let base_verts = load_mesh_verts("base_link");
+    assert_eq!(base_verts.len(), 3527);
+    for v in base_verts {
+        let min_signed = base_caps
+            .iter()
+            .map(|c| pt_seg_dist(v, c.a_m, c.b_m) - f64::from(c.radius_m))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            min_signed <= 0.0,
+            "base_link capsules miss mesh vertex {v:?}: min_signed={min_signed:.5}m > 0"
+        );
+    }
+    let link6_cap = capsules.iter().find(|k| k.id == "link6").expect("missing link6 capsule");
+    for v in load_mesh_verts("link6") {
+        let d = pt_seg_dist(v, link6_cap.a_m, link6_cap.b_m);
+        assert!(
+            d <= f64::from(link6_cap.radius_m),
+            "link6 capsule misses mesh vertex {v:?}: dist={d:.5}m > r={:.5}m",
+            link6_cap.radius_m
+        );
     }
 
     // safety_describe reports end_and_links
@@ -1199,6 +1253,14 @@ fn seg_seg_dist_covers_skew_parallel_crossing_and_degenerate_segments() {
     // Parallel overlapping segments separated by 0.3 m
     let d_par = seg_seg_dist(&[0.0, 0.0, 0.0], &[1.0, 0.0, 0.0], &[0.4, 0.3, 0.0], &[1.4, 0.3, 0.0]);
     assert!((d_par - 0.3).abs() < 1e-12, "d_par={d_par}");
+    // Near-parallel crossing segments (denom < 1e-12 * a * e): midpoint intersection -> ~0 distance
+    let d_near_par_cross = seg_seg_dist(&[0.0, 0.0, 0.0], &[1.0, 0.0, 0.0], &[0.2, -1e-8, 0.0], &[0.8, 1e-8, 0.0]);
+    assert!(d_near_par_cross < 2e-8, "d_near_par_cross={d_near_par_cross}");
+    // Near-parallel skew segments where right end is closer than left end (s=0 would overestimate)
+    let d_near_par_skew = seg_seg_dist(&[0.0, 0.0, 0.0], &[1.0, 0.0, 0.0], &[0.0, 0.20, 0.0], &[1.0, 0.05, 0.0]);
+    assert!((d_near_par_skew - 0.05).abs() < 1e-3 || d_near_par_skew < 0.06, "d_near_par_skew={d_near_par_skew}");
+    let d_near_par_tiny = seg_seg_dist(&[0.0, 0.0, 0.0], &[1.0, 0.0, 0.0], &[0.2, 0.10, 0.0], &[0.8, 0.10 - 1e-8, 0.0]);
+    assert!((d_near_par_tiny - (0.10 - 1e-8)).abs() < 1e-11, "d_near_par_tiny={d_near_par_tiny}");
     // Parallel disjoint segments: closest between (1,0,0) and (2,0.3,0)
     let d_disjoint = seg_seg_dist(&[0.0, 0.0, 0.0], &[1.0, 0.0, 0.0], &[2.0, 0.3, 0.0], &[3.0, 0.3, 0.0]);
     assert!((d_disjoint - (1.0f64 + 0.09).sqrt()).abs() < 1e-12, "d_disjoint={d_disjoint}");
