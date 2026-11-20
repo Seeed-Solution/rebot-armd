@@ -184,6 +184,7 @@ async fn shadow_mode_runs_and_never_mutates_servo_target() {
         prepared,
         25.0,
         compute_policy_deadline(Some(0.25)).unwrap(),
+        None,
     );
     for _ in 0..8 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -266,6 +267,7 @@ async fn live_mode_moves_mock_arm_and_enforces_first_step_jump_limit() {
         prepared_ok,
         25.0,
         compute_policy_deadline(Some(0.35)).unwrap(),
+        None,
     );
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -327,6 +329,7 @@ async fn live_mode_moves_mock_arm_and_enforces_first_step_jump_limit() {
         prepared_jump,
         25.0,
         compute_policy_deadline(Some(0.5)).unwrap(),
+        None,
     );
     let _ = runner2.await;
 
@@ -607,7 +610,13 @@ async fn real_driver_rejects_live_mode_but_allows_shadow() {
     let schema = sup.get_schema().await;
     let pr = schema.capabilities.policy_runtime.expect("policy_runtime capability present");
     assert!(pr.backends.contains(&"mlp".to_string()));
-    assert_eq!(pr.inputs, vec!["proprioception".to_string()]);
+    assert_eq!(
+        pr.inputs,
+        vec![
+            "proprioception".to_string(),
+            "detector_top1_box_norm_v1".to_string()
+        ]
+    );
     assert_eq!(pr.modes, vec!["shadow".to_string()], "real driver must only advertise shadow");
 
     let gen = sup.acquire_lease("conn-real").await.unwrap();
@@ -782,7 +791,10 @@ async fn ws_policy_start_and_stop_end_to_end() {
         .json()
         .await
         .unwrap();
-    assert_eq!(schema["capabilities"]["policy_runtime"]["inputs"], serde_json::json!(["proprioception"]));
+    assert_eq!(
+        schema["capabilities"]["policy_runtime"]["inputs"],
+        serde_json::json!(["proprioception", "detector_top1_box_norm_v1"])
+    );
     assert!(schema["capabilities"]["policy_runtime"]["modes"]
         .as_array()
         .unwrap()
@@ -1323,7 +1335,7 @@ async fn inference_error_terminates_action_as_failed_with_code_and_message() {
             })
             .unwrap()
     };
-    let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None);
+    let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, None);
     let _ = runner.await;
 
     {
@@ -1374,7 +1386,7 @@ async fn inference_error_terminates_action_as_failed_with_code_and_message() {
             })
             .unwrap()
     };
-    let runner2 = spawn_policy_runner(sup2.clone(), action_id2, prepared_fail, 25.0, None);
+    let runner2 = spawn_policy_runner(sup2.clone(), action_id2, prepared_fail, 25.0, None, None);
     let _ = runner2.await;
 
     let inner2 = sup2.inner().read().await;
@@ -1432,7 +1444,7 @@ async fn expired_deadline_before_submission_finishes_done_and_applies_no_target(
             .unwrap()
     };
     let expired = Some(Instant::now() - Duration::from_millis(10));
-    let runner_a = spawn_policy_runner(sup_a.clone(), id_a, prepared_a, 25.0, expired);
+    let runner_a = spawn_policy_runner(sup_a.clone(), id_a, prepared_a, 25.0, expired, None);
     let _ = runner_a.await;
     {
         let inner = sup_a.inner().read().await;
@@ -1494,7 +1506,7 @@ async fn expired_deadline_before_submission_finishes_done_and_applies_no_target(
     };
     // Deadline is in the future at first check (~0ms), then expires while infer() sleeps 60ms.
     let tight_deadline = Some(Instant::now() + Duration::from_millis(20));
-    let runner_b = spawn_policy_runner(sup_b.clone(), id_b, prepared_b, 25.0, tight_deadline);
+    let runner_b = spawn_policy_runner(sup_b.clone(), id_b, prepared_b, 25.0, tight_deadline, None);
     let _ = runner_b.await;
 
     assert_eq!(calls.load(Ordering::SeqCst), 1, "infer() must have run once before post-inference deadline check");
@@ -1555,6 +1567,7 @@ async fn deadline_races_tick_wait_and_slow_inference_wait() {
         prepared_a,
         1.0,
         compute_policy_deadline(Some(0.05)).unwrap(),
+        None,
     );
     let _ = runner_a.await;
     let elapsed_a = t0_a.elapsed();
@@ -1615,6 +1628,7 @@ async fn deadline_races_tick_wait_and_slow_inference_wait() {
         prepared_b,
         25.0,
         compute_policy_deadline(Some(0.04)).unwrap(),
+        None,
     );
     let _ = runner_b.await;
     let elapsed_b = t0_b.elapsed();
@@ -2349,6 +2363,7 @@ async fn slow_inference_updates_input_age_ms_and_does_not_block_current_thread_r
         prepared,
         20.0,
         compute_policy_deadline(Some(0.25)).unwrap(),
+        None,
     );
 
     // Wait on the single-threaded Tokio executor until infer() is active, prove the event loop
@@ -2435,6 +2450,7 @@ async fn slow_inference_updates_input_age_ms_and_does_not_block_current_thread_r
         prepared_none,
         20.0,
         compute_policy_deadline(Some(0.15)).unwrap(),
+        None,
     );
     let _ = runner_none.await;
     let pol_none = sup_none.get_observation().await.policy.unwrap();
@@ -2626,6 +2642,7 @@ mod tract_e2e {
             prepared,
             25.0,
             compute_policy_deadline(Some(0.15)).unwrap(),
+            None,
         );
         let _ = runner.await;
 
@@ -2644,3 +2661,1808 @@ mod tract_e2e {
         }
     }
 }
+
+mod phase2_vision {
+    use super::*;
+    use armd::api::create_router_full_with_sandbox;
+    use armd::api::proxy::DetectorUpstream;
+    use armd::calibration::CalibrationDeps;
+    use armd::diagnostics::DiagnosticsState;
+    use armd::grasp::{BoxFuture, Detection, DetectionFrame, DetectionSource, GraspDeps};
+    use armd::policy_runtime::{
+        load_backend, PolicyVisionFrame, PolicyVisionSource, VisionLayout, VisionSourceKind,
+        VisionStalePolicy, VisionTargetLostPolicy, MAX_VISION_STALENESS_MS,
+    };
+
+    fn make_detection(label: &str, score: f64, box_norm: [f64; 4]) -> Detection {
+        Detection {
+            label: label.to_string(),
+            score,
+            raw_score_valid: true,
+            box_norm,
+            angle_deg: None,
+            angle_conf: None,
+            grasp_width_px: None,
+            mask_focus: false,
+            disp_fg: None,
+            disp_bg: None,
+            depth_conf: None,
+            length_px: None,
+            jaw_clear: None,
+            depth_angle_deg: None,
+            depth_angle_conf: None,
+            depth_width_px: None,
+        }
+    }
+
+    struct MockVisionSource {
+        handler: Arc<
+            dyn Fn(u64, u64) -> BoxFuture<'static, Result<Option<PolicyVisionFrame>, String>>
+                + Send
+                + Sync,
+        >,
+    }
+
+    impl MockVisionSource {
+        fn new<F>(f: F) -> Arc<Self>
+        where
+            F: Fn(u64, u64) -> Result<Option<PolicyVisionFrame>, String> + Send + Sync + 'static,
+        {
+            Arc::new(Self {
+                handler: Arc::new(move |after, wait| {
+                    let res = f(after, wait);
+                    Box::pin(async move { res })
+                }),
+            })
+        }
+
+        fn new_async<F>(f: F) -> Arc<Self>
+        where
+            F: Fn(u64, u64) -> BoxFuture<'static, Result<Option<PolicyVisionFrame>, String>>
+                + Send
+                + Sync
+                + 'static,
+        {
+            Arc::new(Self {
+                handler: Arc::new(f),
+            })
+        }
+    }
+
+    impl PolicyVisionSource for MockVisionSource {
+        fn next_frame<'a>(
+            &'a self,
+            after_frame_id: u64,
+            wait_ms: u64,
+        ) -> BoxFuture<'a, Result<Option<PolicyVisionFrame>, String>> {
+            (self.handler)(after_frame_id, wait_ms)
+        }
+    }
+
+    /// Weights matrix [6 x 12]: output[i] = proprio[i] + 0.1 * vision[i]
+    fn make_12_to_6_layers() -> Vec<MlpLayerSpec> {
+        let mut weights = vec![0.0f32; 6 * 12];
+        for r in 0..6 {
+            weights[r * 12 + r] = 1.0;
+            weights[r * 12 + (6 + r)] = 0.1;
+        }
+        vec![MlpLayerSpec::new(
+            12,
+            6,
+            Activation::None,
+            weights,
+            vec![0.0; 6],
+        )]
+    }
+
+    #[test]
+    fn vision_manifest_strict_validation() {
+        let base_vision = serde_json::json!({
+            "format": "rebot-onnx-policy/v1",
+            "name": "vis_policy",
+            "unit_mode": "rad",
+            "action_dim": 6,
+            "action_space": "joint_positions",
+            "joint_names": ["j1", "j2", "j3", "j4", "j5", "j6"],
+            "model_file": "model.rmlp",
+            "vision": {
+                "source": "detector",
+                "layout": "top1_box_norm_v1",
+                "max_staleness_ms": 200
+            }
+        });
+
+        let c = StrictPolicyContract::parse(&serde_json::to_vec(&base_vision).unwrap()).unwrap();
+        let vis = c.vision.as_ref().expect("vision spec parsed");
+        assert_eq!(vis.source, VisionSourceKind::Detector);
+        assert_eq!(vis.layout, VisionLayout::Top1BoxNormV1);
+        assert_eq!(vis.target_label, None);
+        assert!((vis.min_score - 0.3).abs() < 1e-6);
+        assert_eq!(vis.max_staleness_ms, 200);
+        assert_eq!(vis.max_sync_skew_ms, 200);
+        assert_eq!(vis.on_target_lost, VisionTargetLostPolicy::Hold);
+        assert_eq!(vis.on_stale, VisionStalePolicy::Stop);
+        assert!(vis.require_model_generation);
+        assert_eq!(c.vision_feature_dim(), 6);
+        assert_eq!(c.expected_input_dim(), 12);
+
+        // Explicit null vision keeps Phase 1 compatibility.
+        let mut null_v = base_vision.clone();
+        null_v["vision"] = serde_json::Value::Null;
+        let c_null = StrictPolicyContract::parse(&serde_json::to_vec(&null_v).unwrap()).unwrap();
+        assert!(c_null.vision.is_none());
+        assert_eq!(c_null.vision_feature_dim(), 0);
+        assert_eq!(c_null.expected_input_dim(), 6);
+
+        // Full explicit overrides
+        let mut full = base_vision.clone();
+        full["vision"] = serde_json::json!({
+            "source": "detector",
+            "layout": "top1_box_norm_v1",
+            "target_label": "cube",
+            "min_score": 0.65,
+            "max_staleness_ms": 500,
+            "max_sync_skew_ms": 120,
+            "on_target_lost": "zero_features",
+            "on_stale": "hold",
+            "require_model_generation": false
+        });
+        let c_full = StrictPolicyContract::parse(&serde_json::to_vec(&full).unwrap()).unwrap();
+        let v_full = c_full.vision.unwrap();
+        assert_eq!(v_full.target_label.as_deref(), Some("cube"));
+        assert!((v_full.min_score - 0.65).abs() < 1e-6);
+        assert_eq!(v_full.max_staleness_ms, MAX_VISION_STALENESS_MS);
+        assert_eq!(v_full.max_sync_skew_ms, 120);
+        assert_eq!(v_full.on_target_lost, VisionTargetLostPolicy::ZeroFeatures);
+        assert_eq!(v_full.on_stale, VisionStalePolicy::Hold);
+        assert!(!v_full.require_model_generation);
+
+        // Reject invalid variants
+        let cases: Vec<serde_json::Value> = vec![
+            serde_json::json!("not_an_object"),
+            serde_json::json!({"source": "camera", "layout": "top1_box_norm_v1", "max_staleness_ms": 200}),
+            serde_json::json!({"source": "detector", "layout": "rgb_chw_v1", "max_staleness_ms": 200}),
+            serde_json::json!({"source": "detector", "layout": "top1_box_norm_v1"}),
+            serde_json::json!({"source": "detector", "layout": "top1_box_norm_v1", "max_staleness_ms": 0}),
+            serde_json::json!({"source": "detector", "layout": "top1_box_norm_v1", "max_staleness_ms": 501}),
+            serde_json::json!({"source": "detector", "layout": "top1_box_norm_v1", "max_staleness_ms": 200, "max_sync_skew_ms": 0}),
+            serde_json::json!({"source": "detector", "layout": "top1_box_norm_v1", "max_staleness_ms": 200, "max_sync_skew_ms": 501}),
+            serde_json::json!({"source": "detector", "layout": "top1_box_norm_v1", "max_staleness_ms": 200, "min_score": -0.01}),
+            serde_json::json!({"source": "detector", "layout": "top1_box_norm_v1", "max_staleness_ms": 200, "min_score": 1.01}),
+            serde_json::json!({"source": "detector", "layout": "top1_box_norm_v1", "max_staleness_ms": 200, "target_label": "   "}),
+            serde_json::json!({"source": "detector", "layout": "top1_box_norm_v1", "max_staleness_ms": 200, "on_target_lost": "ignore"}),
+            serde_json::json!({"source": "detector", "layout": "top1_box_norm_v1", "max_staleness_ms": 200, "on_stale": "zero_features"}),
+            serde_json::json!({"source": "detector", "layout": "top1_box_norm_v1", "max_staleness_ms": 200, "require_model_generation": "yes"}),
+        ];
+        for bad_vis in cases {
+            let mut m = base_vision.clone();
+            m["vision"] = bad_vis.clone();
+            assert!(
+                StrictPolicyContract::parse(&serde_json::to_vec(&m).unwrap()).is_err(),
+                "expected manifest rejection for vision={bad_vis}"
+            );
+        }
+
+        // Verify backend input_dim validation against expected_input_dim() (12 vs 6).
+        let dir_bad = tempdir().unwrap();
+        let layers_6 = vec![MlpLayerSpec::new(6, 6, Activation::None, vec![0.0; 36], vec![0.0; 6])];
+        write_rmlp_pack(
+            dir_bad.path(),
+            &["j1", "j2", "j3", "j4", "j5", "j6"],
+            "rad",
+            &layers_6,
+            serde_json::json!({
+                "vision": {
+                    "source": "detector",
+                    "layout": "top1_box_norm_v1",
+                    "max_staleness_ms": 200
+                }
+            }),
+        );
+        let snap_bad = PolicySnapshot::load_from_dir(dir_bad.path()).unwrap();
+        let contract_bad = StrictPolicyContract::parse(&snap_bad.policy_json_bytes).unwrap();
+        let err = load_backend(&snap_bad, &contract_bad).err().unwrap();
+        assert!(
+            matches!(err, PolicyError::DimensionMismatch { expected: 12, actual: 6 }),
+            "expected DimensionMismatch(12, 6), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_policy_e2e_concatenates_proprio_and_top1_box_features() {
+        let dir = tempdir().unwrap();
+        let layers = make_12_to_6_layers();
+        write_rmlp_pack(
+            dir.path(),
+            &["j1", "j2", "j3", "j4", "j5", "j6"],
+            "rad",
+            &layers,
+            serde_json::json!({
+                "vision": {
+                    "source": "detector",
+                    "layout": "top1_box_norm_v1",
+                    "target_label": "cube",
+                    "min_score": 0.4,
+                    "max_staleness_ms": 300,
+                    "on_target_lost": "hold",
+                    "on_stale": "stop",
+                    "require_model_generation": true
+                }
+            }),
+        );
+
+        let mut cfg = make_6dof_config();
+        cfg.home_positions = vec![0.1, -0.2, 0.3, -0.4, 0.5, -0.6];
+        let mut prepared = prepare_policy(dir.path(), &cfg).unwrap();
+
+        // Direct unit check: step_infer without vision must fail on vision policy.
+        assert!(matches!(
+            prepared.step_infer(&[0.0; 6]),
+            Err(PolicyError::DimensionMismatch { expected: 6, actual: 0 })
+        ));
+
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+        let gen = sup.acquire_lease("conn-vis-e2e").await.unwrap();
+        let epoch = sup.get_observation().await.epoch_id;
+        let action_id = {
+            let mut inner = sup.inner().write().await;
+            inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-vis-e2e".into(),
+                    lease_generation: gen,
+                    policy_id: "vis_e2e".into(),
+                    artifact_digest: prepared.artifact_digest().to_string(),
+                    backend: prepared.backend_name().to_string(),
+                    mode: PolicyMode::Shadow,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                })
+                .unwrap()
+        };
+
+        let next_fid = Arc::new(AtomicUsize::new(41));
+        let src = MockVisionSource::new(move |after_id, _wait_ms| {
+            let cur = next_fid.load(Ordering::SeqCst) as u64;
+            if after_id >= cur {
+                return Ok(None);
+            }
+            Ok(Some(PolicyVisionFrame {
+                frame_id: cur,
+                captured_at: Some(Instant::now()),
+                detections: vec![
+                    make_detection("other", 0.99, [0.0, 0.0, 0.1, 0.1]),
+                    make_detection("cube", 0.50, [0.1, 0.1, 0.2, 0.2]),
+                    make_detection("cube", 0.90, [0.2, 0.3, 0.6, 0.5]),
+                ],
+                model_generation: Some(7),
+            }))
+        });
+
+        let runner = spawn_policy_runner(
+            sup.clone(),
+            action_id,
+            prepared,
+            25.0,
+            compute_policy_deadline(Some(0.20)).unwrap(),
+            Some(src),
+        );
+        let _ = runner.await;
+
+        let obs = sup.get_observation().await;
+        let pol = obs.policy.expect("policy observation present");
+        assert_eq!(pol.stop_reason.as_deref(), Some("MAX_SECONDS"));
+        assert!(pol.steps > 0);
+        assert!(pol.last_vision_age_ms.is_some());
+        assert_eq!(pol.vision_frame_id, Some(41));
+
+        // Expected vision features for [0.2, 0.3, 0.6, 0.5] score 0.9:
+        // [present=1.0, cx=0.4, cy=0.4, w=0.4, h=0.2, score=0.9]
+        // Expected output[i] = home_positions[i] + 0.1 * vision[i]
+        let expected_vis = [1.0f32, 0.4, 0.4, 0.4, 0.2, 0.9];
+        let got = pol.last_shadow_target.expect("last_shadow_target present");
+        for i in 0..6 {
+            let exp = cfg.home_positions[i] + 0.1 * expected_vis[i];
+            assert!(
+                (got[i] - exp).abs() < 1e-5,
+                "target[{i}] got={} expected={exp}",
+                got[i]
+            );
+        }
+
+        // Also test missing vision_source -> immediate VISION_UNAVAILABLE
+        let prepared2 = prepare_policy(dir.path(), &cfg).unwrap();
+        let sup2 = Arc::new(ArmSupervisor::new(cfg.clone()));
+        let gen2 = sup2.acquire_lease("conn-vis-unavail").await.unwrap();
+        let epoch2 = sup2.get_observation().await.epoch_id;
+        let action_id2 = {
+            let mut inner = sup2.inner().write().await;
+            inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch2,
+                    connection_id: "conn-vis-unavail".into(),
+                    lease_generation: gen2,
+                    policy_id: "vis_unavail".into(),
+                    artifact_digest: prepared2.artifact_digest().to_string(),
+                    backend: prepared2.backend_name().to_string(),
+                    mode: PolicyMode::Shadow,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                })
+                .unwrap()
+        };
+        let runner2 = spawn_policy_runner(sup2.clone(), action_id2, prepared2, 25.0, None, None);
+        let _ = runner2.await;
+        let inner2 = sup2.inner().read().await;
+        assert_eq!(inner2.last_action.as_ref().unwrap().state, "failed");
+        assert_eq!(
+            inner2.policy_observation().unwrap().stop_reason.as_deref(),
+            Some("VISION_UNAVAILABLE")
+        );
+
+        // Also verify WS wiring via DetectionSourceAdapter & GraspDeps
+        struct TestDetSource;
+        impl DetectionSource for TestDetSource {
+            fn inference_enabled(&self) -> BoxFuture<'_, Result<bool, String>> {
+                Box::pin(async { Ok(true) })
+            }
+            fn set_inference(&self, _enabled: bool) -> BoxFuture<'_, Result<(), String>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn next_frame(
+                &self,
+                after: Option<u64>,
+                _wait_ms: u64,
+            ) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
+                Box::pin(async move {
+                    if after.is_some_and(|a| a >= 100) {
+                        return Ok(None);
+                    }
+                    let now = Instant::now();
+                    Ok(Some(DetectionFrame {
+                        frame_id: 100,
+                        captured_at: now,
+                        policy_captured_at: Some(now),
+                        image_size_px: [640.0, 360.0],
+                        detections: vec![make_detection("cube", 0.9, [0.2, 0.3, 0.6, 0.5])],
+                        depth: None,
+                        model_generation: Some(1),
+                    }))
+                })
+            }
+        }
+
+        let sandbox_dir = tempdir().unwrap();
+        let pack_dir = sandbox_dir.path().join("policies").join("ws_vis");
+        fs::create_dir_all(&pack_dir).unwrap();
+        write_rmlp_pack(
+            &pack_dir,
+            &["j1", "j2", "j3", "j4", "j5", "j6"],
+            "rad",
+            &layers,
+            serde_json::json!({
+                "vision": {
+                    "source": "detector",
+                    "layout": "top1_box_norm_v1",
+                    "target_label": "cube",
+                    "min_score": 0.4,
+                    "max_staleness_ms": 300,
+                    "require_model_generation": true
+                }
+            }),
+        );
+        let sandbox = Arc::new(SandboxState::new(sandbox_dir.path().to_path_buf()));
+        let sup_ws = Arc::new(ArmSupervisor::new(cfg.clone()));
+        let upstream = DetectorUpstream::parse("http://127.0.0.1:1").unwrap();
+        let deps = GraspDeps {
+            source: Arc::new(TestDetSource),
+            setup_path: None,
+        };
+        let app = create_router_full_with_sandbox(
+            sup_ws.clone(),
+            upstream.clone(),
+            deps,
+            DiagnosticsState::global(),
+            CalibrationDeps::from_env(None, upstream),
+            OperatorAuth::disabled(),
+            sandbox,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (mut ws, _) = connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+        ws.send(Message::Text(
+            serde_json::json!({"type": "acquire_lease", "client_id": "ws_vis_test"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let gen_ws = loop {
+            let msg: serde_json::Value =
+                serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+            if msg["type"] == "lease_granted" {
+                break msg["generation"].as_u64().unwrap();
+            }
+        };
+        let epoch_ws = sup_ws.get_observation().await.epoch_id;
+        ws.send(Message::Text(
+            serde_json::json!({
+                "type": "command",
+                "request_id": 1,
+                "generation": gen_ws,
+                "epoch_id": epoch_ws,
+                "path": "/api/v1/action/policy/start",
+                "body": {
+                    "policy_id": "ws_vis",
+                    "mode": "shadow",
+                    "fps": 25.0,
+                    "max_seconds": 0.2
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let msg: serde_json::Value =
+                serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+            if msg["request_id"] == 1 {
+                assert_eq!(msg["type"], "command_ack", "unexpected WS reply: {msg}");
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(260)).await;
+        let pol_ws = sup_ws.get_observation().await.policy.unwrap();
+        assert_eq!(pol_ws.vision_frame_id, Some(100));
+        assert_eq!(pol_ws.stop_reason.as_deref(), Some("MAX_SECONDS"));
+        let ws_got = pol_ws.last_shadow_target.unwrap();
+        for i in 0..6 {
+            let exp = cfg.home_positions[i] + 0.1 * expected_vis[i];
+            assert!((ws_got[i] - exp).abs() < 1e-5);
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_policy_stops_on_stale_frame_and_missing_timestamp() {
+        let dir = tempdir().unwrap();
+        let layers = make_12_to_6_layers();
+        write_rmlp_pack(
+            dir.path(),
+            &["j1", "j2", "j3", "j4", "j5", "j6"],
+            "rad",
+            &layers,
+            serde_json::json!({
+                "vision": {
+                    "source": "detector",
+                    "layout": "top1_box_norm_v1",
+                    "max_staleness_ms": 100,
+                    "max_sync_skew_ms": 80,
+                    "on_stale": "stop",
+                    "require_model_generation": true
+                }
+            }),
+        );
+        let cfg = make_6dof_config();
+
+        // Case A: Stale frame (captured 250 ms ago > max_staleness_ms 100)
+        {
+            let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+            let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+            let gen = sup.acquire_lease("conn-stale").await.unwrap();
+            sup.set_torque(true).await.unwrap();
+            sup.tick(0.02).await;
+            let epoch = sup.get_observation().await.epoch_id;
+            let action_id = {
+                let mut inner = sup.inner().write().await;
+                inner
+                    .begin_policy_run(PolicyRunStart {
+                        epoch_id: epoch,
+                        connection_id: "conn-stale".into(),
+                        lease_generation: gen,
+                        policy_id: "vis_stale".into(),
+                        artifact_digest: prepared.artifact_digest().to_string(),
+                        backend: prepared.backend_name().to_string(),
+                        mode: PolicyMode::Live,
+                        max_first_step_rad: None,
+                        max_step_rad: None,
+                        tag: None,
+                    })
+                    .unwrap()
+            };
+            let src = MockVisionSource::new(|after, _| {
+                if after >= 1 {
+                    return Ok(None);
+                }
+                Ok(Some(PolicyVisionFrame {
+                    frame_id: 1,
+                    captured_at: Some(Instant::now() - Duration::from_millis(250)),
+                    detections: vec![make_detection("cube", 0.9, [0.2, 0.2, 0.4, 0.4])],
+                    model_generation: Some(1),
+                }))
+            });
+            let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(src));
+            let _ = runner.await;
+
+            let inner = sup.inner().read().await;
+            assert!(inner.servo_target.is_none(), "stale frame must not apply target");
+            assert_eq!(inner.last_action.as_ref().unwrap().state, "failed");
+            let pol = inner.policy_observation().unwrap();
+            assert_eq!(pol.stop_reason.as_deref(), Some("VISION_STALE"));
+            assert_eq!(pol.steps, 0);
+        }
+
+        // Case B: Missing timestamp (captured_at = None)
+        {
+            let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+            let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+            let gen = sup.acquire_lease("conn-missing-ts").await.unwrap();
+            sup.set_torque(true).await.unwrap();
+            sup.tick(0.02).await;
+            let epoch = sup.get_observation().await.epoch_id;
+            let action_id = {
+                let mut inner = sup.inner().write().await;
+                inner
+                    .begin_policy_run(PolicyRunStart {
+                        epoch_id: epoch,
+                        connection_id: "conn-missing-ts".into(),
+                        lease_generation: gen,
+                        policy_id: "vis_missing_ts".into(),
+                        artifact_digest: prepared.artifact_digest().to_string(),
+                        backend: prepared.backend_name().to_string(),
+                        mode: PolicyMode::Live,
+                        max_first_step_rad: None,
+                        max_step_rad: None,
+                        tag: None,
+                    })
+                    .unwrap()
+            };
+            let src = MockVisionSource::new(|after, _| {
+                if after >= 2 {
+                    return Ok(None);
+                }
+                Ok(Some(PolicyVisionFrame {
+                    frame_id: 2,
+                    captured_at: None,
+                    detections: vec![make_detection("cube", 0.9, [0.2, 0.2, 0.4, 0.4])],
+                    model_generation: Some(1),
+                }))
+            });
+            let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(src));
+            let _ = runner.await;
+
+            let inner = sup.inner().read().await;
+            assert!(inner.servo_target.is_none(), "missing timestamp must not apply target");
+            assert_eq!(inner.last_action.as_ref().unwrap().state, "failed");
+            let pol = inner.policy_observation().unwrap();
+            assert_eq!(pol.stop_reason.as_deref(), Some("VISION_TIMESTAMP_MISSING"));
+            assert_eq!(pol.steps, 0);
+        }
+
+        // Case C: Sync skew (> max_sync_skew_ms 80) while within max_staleness_ms (100)
+        {
+            let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+            let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+            let gen = sup.acquire_lease("conn-skew").await.unwrap();
+            let epoch = sup.get_observation().await.epoch_id;
+            let action_id = {
+                let mut inner = sup.inner().write().await;
+                inner
+                    .begin_policy_run(PolicyRunStart {
+                        epoch_id: epoch,
+                        connection_id: "conn-skew".into(),
+                        lease_generation: gen,
+                        policy_id: "vis_skew".into(),
+                        artifact_digest: prepared.artifact_digest().to_string(),
+                        backend: prepared.backend_name().to_string(),
+                        mode: PolicyMode::Shadow,
+                        max_first_step_rad: None,
+                        max_step_rad: None,
+                        tag: None,
+                    })
+                    .unwrap()
+            };
+            // Mock driver base_input_age_ms = 0, vision age = 90 ms -> skew 90 > 80.
+            let src = MockVisionSource::new(|after, _| {
+                if after >= 3 {
+                    return Ok(None);
+                }
+                Ok(Some(PolicyVisionFrame {
+                    frame_id: 3,
+                    captured_at: Some(Instant::now() - Duration::from_millis(90)),
+                    detections: vec![make_detection("cube", 0.9, [0.2, 0.2, 0.4, 0.4])],
+                    model_generation: Some(1),
+                }))
+            });
+            let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(src));
+            let _ = runner.await;
+
+            let inner = sup.inner().read().await;
+            assert_eq!(inner.last_action.as_ref().unwrap().state, "failed");
+            let pol = inner.policy_observation().unwrap();
+            assert_eq!(pol.stop_reason.as_deref(), Some("VISION_SYNC_SKEW"));
+            assert_eq!(pol.steps, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_policy_stops_on_model_generation_change() {
+        let dir = tempdir().unwrap();
+        let layers = make_12_to_6_layers();
+        write_rmlp_pack(
+            dir.path(),
+            &["j1", "j2", "j3", "j4", "j5", "j6"],
+            "rad",
+            &layers,
+            serde_json::json!({
+                "vision": {
+                    "source": "detector",
+                    "layout": "top1_box_norm_v1",
+                    "max_staleness_ms": 300,
+                    "on_stale": "hold",
+                    "require_model_generation": true
+                }
+            }),
+        );
+        let cfg = make_6dof_config();
+        let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+        let gen = sup.acquire_lease("conn-gen").await.unwrap();
+        let epoch = sup.get_observation().await.epoch_id;
+        let action_id = {
+            let mut inner = sup.inner().write().await;
+            inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-gen".into(),
+                    lease_generation: gen,
+                    policy_id: "vis_gen".into(),
+                    artifact_digest: prepared.artifact_digest().to_string(),
+                    backend: prepared.backend_name().to_string(),
+                    mode: PolicyMode::Shadow,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                })
+                .unwrap()
+        };
+
+        let gen_counter = Arc::new(AtomicUsize::new(1));
+        let gen_c = gen_counter.clone();
+        let src = MockVisionSource::new_async(move |after, _| {
+            let gen_c = gen_c.clone();
+            Box::pin(async move {
+                let cur_gen = gen_c.load(Ordering::SeqCst) as u64;
+                let fid = after + 1;
+                if fid > 1 && cur_gen == 1 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok(Some(PolicyVisionFrame {
+                    frame_id: fid,
+                    captured_at: Some(Instant::now()),
+                    detections: vec![make_detection("cube", 0.9, [0.2, 0.2, 0.4, 0.4])],
+                    model_generation: Some(gen_c.load(Ordering::SeqCst) as u64),
+                }))
+            })
+        });
+
+        let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 30.0, None, Some(src));
+        for _ in 0..50 {
+            if sup
+                .get_observation()
+                .await
+                .policy
+                .is_some_and(|p| p.steps >= 1)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        gen_counter.store(2, Ordering::SeqCst);
+        let _ = runner.await;
+
+        let inner = sup.inner().read().await;
+        assert_eq!(inner.last_action.as_ref().unwrap().state, "failed");
+        let pol = inner.policy_observation().unwrap();
+        assert!(pol.steps >= 1);
+        assert_eq!(pol.stop_reason.as_deref(), Some("VISION_GENERATION_CHANGED"));
+
+        // Also test missing generation when required -> VISION_GENERATION_MISSING
+        let prepared_missing = prepare_policy(dir.path(), &cfg).unwrap();
+        let sup_m = Arc::new(ArmSupervisor::new(cfg));
+        let gen_m = sup_m.acquire_lease("conn-gen-miss").await.unwrap();
+        let epoch_m = sup_m.get_observation().await.epoch_id;
+        let id_m = {
+            let mut inner = sup_m.inner().write().await;
+            inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch_m,
+                    connection_id: "conn-gen-miss".into(),
+                    lease_generation: gen_m,
+                    policy_id: "vis_gen_miss".into(),
+                    artifact_digest: prepared_missing.artifact_digest().to_string(),
+                    backend: prepared_missing.backend_name().to_string(),
+                    mode: PolicyMode::Shadow,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                })
+                .unwrap()
+        };
+        let src_m = MockVisionSource::new(|after, _| {
+            if after >= 1 {
+                return Ok(None);
+            }
+            Ok(Some(PolicyVisionFrame {
+                frame_id: 1,
+                captured_at: Some(Instant::now()),
+                detections: vec![make_detection("cube", 0.9, [0.2, 0.2, 0.4, 0.4])],
+                model_generation: None,
+            }))
+        });
+        let runner_m = spawn_policy_runner(sup_m.clone(), id_m, prepared_missing, 25.0, None, Some(src_m));
+        let _ = runner_m.await;
+        let inner_m = sup_m.inner().read().await;
+        assert_eq!(inner_m.last_action.as_ref().unwrap().state, "failed");
+        assert_eq!(
+            inner_m.policy_observation().unwrap().stop_reason.as_deref(),
+            Some("VISION_GENERATION_MISSING")
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_policy_target_lost_modes_zero_hold_and_stop() {
+        let mut cfg = make_6dof_config();
+        cfg.home_positions = vec![0.1, -0.1, 0.0, 0.0, 0.0, 0.0];
+        let layers = make_12_to_6_layers();
+
+        let empty_src = || {
+            MockVisionSource::new_async(|after, _| {
+                Box::pin(async move {
+                    if after > 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Ok(Some(PolicyVisionFrame {
+                        frame_id: after + 1,
+                        captured_at: Some(Instant::now()),
+                        detections: vec![make_detection("wrong_label", 0.95, [0.2, 0.2, 0.4, 0.4])],
+                        model_generation: Some(1),
+                    }))
+                })
+            })
+        };
+
+        // 1. zero_features -> emits output with [0.0; 6] vision features
+        {
+            let dir = tempdir().unwrap();
+            write_rmlp_pack(
+                dir.path(),
+                &["j1", "j2", "j3", "j4", "j5", "j6"],
+                "rad",
+                &layers,
+                serde_json::json!({
+                    "vision": {
+                        "source": "detector",
+                        "layout": "top1_box_norm_v1",
+                        "target_label": "cube",
+                        "max_staleness_ms": 300,
+                        "on_target_lost": "zero_features"
+                    }
+                }),
+            );
+            let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+            let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+            let gen = sup.acquire_lease("conn-zero").await.unwrap();
+            let epoch = sup.get_observation().await.epoch_id;
+            let id = {
+                let mut inner = sup.inner().write().await;
+                inner
+                    .begin_policy_run(PolicyRunStart {
+                        epoch_id: epoch,
+                        connection_id: "conn-zero".into(),
+                        lease_generation: gen,
+                        policy_id: "vis_zero".into(),
+                        artifact_digest: prepared.artifact_digest().to_string(),
+                        backend: prepared.backend_name().to_string(),
+                        mode: PolicyMode::Shadow,
+                        max_first_step_rad: None,
+                        max_step_rad: None,
+                        tag: None,
+                    })
+                    .unwrap()
+            };
+            let runner = spawn_policy_runner(
+                sup.clone(),
+                id,
+                prepared,
+                25.0,
+                compute_policy_deadline(Some(0.18)).unwrap(),
+                Some(empty_src()),
+            );
+            let _ = runner.await;
+            let pol = sup.get_observation().await.policy.unwrap();
+            assert!(pol.steps > 0);
+            assert_eq!(pol.stop_reason.as_deref(), Some("MAX_SECONDS"));
+            let got = pol.last_shadow_target.unwrap();
+            for i in 0..6 {
+                assert!((got[i] - cfg.home_positions[i]).abs() < 1e-6);
+            }
+        }
+
+        // 2. hold -> skips steps without failing or mutating servo_target
+        {
+            let dir = tempdir().unwrap();
+            write_rmlp_pack(
+                dir.path(),
+                &["j1", "j2", "j3", "j4", "j5", "j6"],
+                "rad",
+                &layers,
+                serde_json::json!({
+                    "vision": {
+                        "source": "detector",
+                        "layout": "top1_box_norm_v1",
+                        "target_label": "cube",
+                        "max_staleness_ms": 300,
+                        "on_target_lost": "hold"
+                    }
+                }),
+            );
+            let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+            let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+            let gen = sup.acquire_lease("conn-hold").await.unwrap();
+            sup.set_torque(true).await.unwrap();
+            sup.tick(0.02).await;
+            let epoch = sup.get_observation().await.epoch_id;
+            let id = {
+                let mut inner = sup.inner().write().await;
+                inner
+                    .begin_policy_run(PolicyRunStart {
+                        epoch_id: epoch,
+                        connection_id: "conn-hold".into(),
+                        lease_generation: gen,
+                        policy_id: "vis_hold".into(),
+                        artifact_digest: prepared.artifact_digest().to_string(),
+                        backend: prepared.backend_name().to_string(),
+                        mode: PolicyMode::Live,
+                        max_first_step_rad: None,
+                        max_step_rad: None,
+                        tag: None,
+                    })
+                    .unwrap()
+            };
+            let runner = spawn_policy_runner(
+                sup.clone(),
+                id,
+                prepared,
+                25.0,
+                compute_policy_deadline(Some(0.18)).unwrap(),
+                Some(empty_src()),
+            );
+            let _ = runner.await;
+            let inner = sup.inner().read().await;
+            assert!(inner.servo_target.is_none());
+            assert_eq!(inner.last_action.as_ref().unwrap().state, "done");
+            let pol = inner.policy_observation().unwrap();
+            assert_eq!(pol.steps, 0);
+            assert_eq!(pol.stop_reason.as_deref(), Some("MAX_SECONDS"));
+        }
+
+        // 3. stop -> terminates immediately with TARGET_LOST
+        {
+            let dir = tempdir().unwrap();
+            write_rmlp_pack(
+                dir.path(),
+                &["j1", "j2", "j3", "j4", "j5", "j6"],
+                "rad",
+                &layers,
+                serde_json::json!({
+                    "vision": {
+                        "source": "detector",
+                        "layout": "top1_box_norm_v1",
+                        "target_label": "cube",
+                        "max_staleness_ms": 300,
+                        "on_target_lost": "stop"
+                    }
+                }),
+            );
+            let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+            let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+            let gen = sup.acquire_lease("conn-stop").await.unwrap();
+            let epoch = sup.get_observation().await.epoch_id;
+            let id = {
+                let mut inner = sup.inner().write().await;
+                inner
+                    .begin_policy_run(PolicyRunStart {
+                        epoch_id: epoch,
+                        connection_id: "conn-stop".into(),
+                        lease_generation: gen,
+                        policy_id: "vis_stop".into(),
+                        artifact_digest: prepared.artifact_digest().to_string(),
+                        backend: prepared.backend_name().to_string(),
+                        mode: PolicyMode::Shadow,
+                        max_first_step_rad: None,
+                        max_step_rad: None,
+                        tag: None,
+                    })
+                    .unwrap()
+            };
+            let runner = spawn_policy_runner(sup.clone(), id, prepared, 25.0, None, Some(empty_src()));
+            let _ = runner.await;
+            let inner = sup.inner().read().await;
+            assert_eq!(inner.last_action.as_ref().unwrap().state, "failed");
+            let pol = inner.policy_observation().unwrap();
+            assert_eq!(pol.steps, 0);
+            assert_eq!(pol.stop_reason.as_deref(), Some("TARGET_LOST"));
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_policy_allows_repeated_frame_within_staleness_window() {
+        let dir = tempdir().unwrap();
+        let layers = make_12_to_6_layers();
+        write_rmlp_pack(
+            dir.path(),
+            &["j1", "j2", "j3", "j4", "j5", "j6"],
+            "rad",
+            &layers,
+            serde_json::json!({
+                "vision": {
+                    "source": "detector",
+                    "layout": "top1_box_norm_v1",
+                    "max_staleness_ms": 200,
+                    "on_stale": "stop",
+                    "require_model_generation": true
+                }
+            }),
+        );
+        let cfg = make_6dof_config();
+        let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let gen = sup.acquire_lease("conn-repeat").await.unwrap();
+        let epoch = sup.get_observation().await.epoch_id;
+        let id = {
+            let mut inner = sup.inner().write().await;
+            inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-repeat".into(),
+                    lease_generation: gen,
+                    policy_id: "vis_repeat".into(),
+                    artifact_digest: prepared.artifact_digest().to_string(),
+                    backend: prepared.backend_name().to_string(),
+                    mode: PolicyMode::Shadow,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                })
+                .unwrap()
+        };
+
+        // 15 Hz vision (~67 ms between frames) feeding 30 Hz policy (~33 ms) with 200 ms staleness window.
+        let src = MockVisionSource::new_async(|after, _| {
+            Box::pin(async move {
+                if after > 0 {
+                    tokio::time::sleep(Duration::from_millis(67)).await;
+                }
+                Ok(Some(PolicyVisionFrame {
+                    frame_id: after + 1,
+                    captured_at: Some(Instant::now()),
+                    detections: vec![make_detection("cube", 0.85, [0.25, 0.25, 0.55, 0.55])],
+                    model_generation: Some(1),
+                }))
+            })
+        });
+
+        let runner = spawn_policy_runner(
+            sup.clone(),
+            id,
+            prepared,
+            30.0,
+            compute_policy_deadline(Some(0.35)).unwrap(),
+            Some(src),
+        );
+        let _ = runner.await;
+
+        let inner = sup.inner().read().await;
+        assert_eq!(inner.last_action.as_ref().unwrap().state, "done");
+        let pol = inner.policy_observation().unwrap();
+        assert_eq!(pol.stop_reason.as_deref(), Some("MAX_SECONDS"));
+        assert!(
+            pol.steps >= 6,
+            "expected >= 6 steps at 30 Hz over 350ms reusing 15 Hz vision frames, got {}",
+            pol.steps
+        );
+        assert!(pol.vision_frame_id.is_some());
+        assert!(pol.last_vision_age_ms.is_some_and(|a| a <= 200));
+    }
+
+    #[tokio::test]
+    async fn http_detector_missing_or_negative_age_ms_stops_with_vision_timestamp_missing() {
+        use armd::grasp::HttpDetectionSource;
+        use armd::policy_runtime::DetectionSourceAdapter;
+        use axum::{routing::get, Json, Router};
+
+        let dir = tempdir().unwrap();
+        let layers = make_12_to_6_layers();
+        write_rmlp_pack(
+            dir.path(),
+            &["j1", "j2", "j3", "j4", "j5", "j6"],
+            "rad",
+            &layers,
+            serde_json::json!({
+                "vision": {
+                    "source": "detector",
+                    "layout": "top1_box_norm_v1",
+                    "max_staleness_ms": 200,
+                    "on_stale": "stop",
+                    "require_model_generation": true
+                }
+            }),
+        );
+        let cfg = make_6dof_config();
+
+        for (case_name, payload) in [
+            (
+                "missing_age_ms",
+                serde_json::json!({
+                    "frame_id": 10,
+                    "width": 640,
+                    "height": 360,
+                    "model_generation": 1,
+                    "detections": [
+                        {"label": "cube", "score": 0.9, "box_norm": [0.2, 0.3, 0.6, 0.5]}
+                    ]
+                }),
+            ),
+            (
+                "negative_age_ms",
+                serde_json::json!({
+                    "frame_id": 11,
+                    "age_ms": -5.0,
+                    "width": 640,
+                    "height": 360,
+                    "model_generation": 1,
+                    "detections": [
+                        {"label": "cube", "score": 0.9, "box_norm": [0.2, 0.3, 0.6, 0.5]}
+                    ]
+                }),
+            ),
+        ] {
+            let body = payload.clone();
+            let app = Router::new().route(
+                "/api/results/latest",
+                get(move || {
+                    let body = body.clone();
+                    async move { Json(body) }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr: SocketAddr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let http_src = Arc::new(HttpDetectionSource {
+                upstream: DetectorUpstream::parse(&format!("http://{addr}")).unwrap(),
+                image_size_px: [640.0, 360.0],
+            });
+            let adapter: Arc<dyn PolicyVisionSource> = Arc::new(DetectionSourceAdapter(http_src));
+
+            let direct = adapter
+                .next_frame(0, 200)
+                .await
+                .unwrap()
+                .expect("expected frame from local HTTP detector");
+            assert!(
+                direct.captured_at.is_none(),
+                "{case_name}: expected captured_at == None"
+            );
+
+            let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+            let sup = Arc::new(ArmSupervisor::new(cfg.clone()));
+            let conn_id = format!("conn-{case_name}");
+            let gen = sup.acquire_lease(&conn_id).await.unwrap();
+            sup.set_torque(true).await.unwrap();
+            sup.tick(0.02).await;
+            let epoch = sup.get_observation().await.epoch_id;
+            let action_id = {
+                let mut inner = sup.inner().write().await;
+                inner
+                    .begin_policy_run(PolicyRunStart {
+                        epoch_id: epoch,
+                        connection_id: format!("conn-{case_name}"),
+                        lease_generation: gen,
+                        policy_id: format!("http_{case_name}"),
+                        artifact_digest: prepared.artifact_digest().to_string(),
+                        backend: prepared.backend_name().to_string(),
+                        mode: PolicyMode::Live,
+                        max_first_step_rad: None,
+                        max_step_rad: None,
+                        tag: None,
+                    })
+                    .unwrap()
+            };
+
+            let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(adapter));
+            let _ = runner.await;
+            server.abort();
+
+            let inner = sup.inner().read().await;
+            assert!(
+                inner.servo_target.is_none(),
+                "{case_name}: missing/invalid age_ms must not apply target"
+            );
+            assert_eq!(inner.last_action.as_ref().unwrap().state, "failed");
+            let pol = inner.policy_observation().unwrap();
+            assert_eq!(
+                pol.stop_reason.as_deref(),
+                Some("VISION_TIMESTAMP_MISSING"),
+                "{case_name}: unexpected stop_reason"
+            );
+            assert_eq!(pol.steps, 0, "{case_name}: expected 0 steps");
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_vision_under_lock_contention_stops_without_applying_target() {
+        use std::sync::mpsc;
+
+        struct BlockingSignalBackend {
+            entered_tx: Mutex<Option<mpsc::Sender<()>>>,
+            proceed_rx: Mutex<Option<mpsc::Receiver<()>>>,
+        }
+
+        impl PolicyBackend for BlockingSignalBackend {
+            fn backend_name(&self) -> &'static str {
+                "blocking_signal"
+            }
+            fn input_dim(&self) -> usize {
+                12
+            }
+            fn output_dim(&self) -> usize {
+                6
+            }
+            fn infer(&mut self, _input: &[f32], output: &mut [f32]) -> Result<(), PolicyError> {
+                if let Some(tx) = self.entered_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = self.proceed_rx.lock().unwrap().take() {
+                    let _ = rx.recv_timeout(Duration::from_secs(2));
+                }
+                output.copy_from_slice(&[0.05, 0.0, 0.0, 0.0, 0.0, 0.0]);
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let layers = make_12_to_6_layers();
+        write_rmlp_pack(
+            dir.path(),
+            &["j1", "j2", "j3", "j4", "j5", "j6"],
+            "rad",
+            &layers,
+            serde_json::json!({
+                "vision": {
+                    "source": "detector",
+                    "layout": "top1_box_norm_v1",
+                    "max_staleness_ms": 120,
+                    "on_stale": "stop",
+                    "require_model_generation": true
+                }
+            }),
+        );
+        let snap = PolicySnapshot::load_from_dir(dir.path()).unwrap();
+        let contract = StrictPolicyContract::parse(&snap.policy_json_bytes).unwrap();
+        let cfg = make_6dof_config();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let backend = Box::new(BlockingSignalBackend {
+            entered_tx: Mutex::new(Some(entered_tx)),
+            proceed_rx: Mutex::new(Some(proceed_rx)),
+        });
+        let prepared = PreparedPolicy::from_backend(snap, contract, backend, &cfg).unwrap();
+
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let gen = sup.acquire_lease("conn-lock-stale").await.unwrap();
+        sup.set_torque(true).await.unwrap();
+        sup.tick(0.02).await;
+        let epoch = sup.get_observation().await.epoch_id;
+        let action_id = {
+            let mut inner = sup.inner().write().await;
+            inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-lock-stale".into(),
+                    lease_generation: gen,
+                    policy_id: "vis_lock_stale".into(),
+                    artifact_digest: prepared.artifact_digest().to_string(),
+                    backend: prepared.backend_name().to_string(),
+                    mode: PolicyMode::Live,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                })
+                .unwrap()
+        };
+
+        let src = MockVisionSource::new(|after, _| {
+            if after >= 1 {
+                return Ok(None);
+            }
+            Ok(Some(PolicyVisionFrame {
+                frame_id: 1,
+                captured_at: Some(Instant::now()),
+                detections: vec![make_detection("cube", 0.9, [0.2, 0.2, 0.4, 0.4])],
+                model_generation: Some(1),
+            }))
+        });
+
+        let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(src));
+
+        // Wait until inference has started (after initial evaluate_vision_frame succeeded),
+        // then hold the supervisor write lock past max_staleness_ms before allowing infer to return.
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("inference did not start in time");
+        })
+        .await
+        .unwrap();
+
+        let lock_guard = sup.inner().write().await;
+        let _ = proceed_tx.send(());
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        drop(lock_guard);
+
+        let _ = runner.await;
+
+        let inner = sup.inner().read().await;
+        assert!(
+            inner.servo_target.is_none(),
+            "stale vision under lock contention must not apply target"
+        );
+        assert_eq!(inner.last_action.as_ref().unwrap().state, "failed");
+        let pol = inner.policy_observation().unwrap();
+        assert_eq!(pol.stop_reason.as_deref(), Some("VISION_STALE"));
+        assert_eq!(pol.steps, 0);
+    }
+
+    #[test]
+    fn evaluate_vision_frame_enforces_min_max_prop_age_range_and_fail_closed_none() {
+        use armd::policy_runtime::{evaluate_vision_frame, VisionFeatureSpec, VisionStepDecision};
+
+        let spec = VisionFeatureSpec {
+            source: VisionSourceKind::Detector,
+            layout: VisionLayout::Top1BoxNormV1,
+            target_label: Some("cube".into()),
+            min_score: 0.3,
+            max_staleness_ms: 200,
+            max_sync_skew_ms: 20,
+            on_target_lost: VisionTargetLostPolicy::Stop,
+            on_stale: VisionStalePolicy::Stop,
+            require_model_generation: true,
+        };
+        let now = Instant::now();
+        let run_started_at = now - Duration::from_millis(50);
+        let frame = PolicyVisionFrame {
+            frame_id: 7,
+            captured_at: Some(now - Duration::from_millis(90)),
+            detections: vec![make_detection("cube", 0.9, [0.2, 0.3, 0.6, 0.5])],
+            model_generation: Some(1),
+        };
+
+        // 1. max_prop matches vision_age (90 ms), but min_prop (5 ms) skews by 85 ms > 20 ms -> Stop(VISION_SYNC_SKEW)
+        let mut locked_gen = None;
+        let d_range_skew = evaluate_vision_frame(
+            Some(&frame),
+            &spec,
+            run_started_at,
+            now,
+            Some((5, 90)),
+            &mut locked_gen,
+        );
+        assert!(
+            matches!(
+                d_range_skew,
+                VisionStepDecision::Stop {
+                    reason: "VISION_SYNC_SKEW",
+                    ..
+                }
+            ),
+            "expected VISION_SYNC_SKEW when min_prop skews, got {d_range_skew:?}"
+        );
+
+        // 2. Missing proprioception age (None) must fail-closed with VISION_SYNC_SKEW
+        let mut locked_gen_none = None;
+        let d_missing_age = evaluate_vision_frame(
+            Some(&frame),
+            &spec,
+            run_started_at,
+            now,
+            None,
+            &mut locked_gen_none,
+        );
+        assert!(
+            matches!(
+                d_missing_age,
+                VisionStepDecision::Stop {
+                    reason: "VISION_SYNC_SKEW",
+                    ..
+                }
+            ),
+            "expected fail-closed VISION_SYNC_SKEW for None prop_age_range_ms, got {d_missing_age:?}"
+        );
+
+        // 3. When both min_prop and max_prop are within 20 ms of 90 ms -> Ready
+        let mut locked_gen_ok = None;
+        let d_ok = evaluate_vision_frame(
+            Some(&frame),
+            &spec,
+            run_started_at,
+            now,
+            Some((80, 100)),
+            &mut locked_gen_ok,
+        );
+        assert!(
+            matches!(d_ok, VisionStepDecision::Ready { frame_id: 7, .. }),
+            "expected Ready when range is within skew, got {d_ok:?}"
+        );
+    }
+
+    #[test]
+    fn supervisor_policy_input_age_range_reports_min_max_and_none_on_missing() {
+        struct SkewedAgeDriver {
+            ages: Vec<Option<Duration>>,
+        }
+        impl ArmDriver for SkewedAgeDriver {
+            fn capabilities(&self) -> DriverCapabilities {
+                DriverCapabilities::default()
+            }
+            fn enable_state(&self) -> EnableState {
+                EnableState::Enabled
+            }
+            fn is_feedback_valid(&self) -> bool {
+                true
+            }
+            fn feedback_ages(&self) -> Vec<Option<Duration>> {
+                self.ages.clone()
+            }
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+                Ok(vec![JointState::default(); self.ages.len()])
+            }
+            fn write_joint_targets(&mut self, _targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+                Ok(())
+            }
+            fn set_torque(&mut self, _enabled: bool) -> Result<(), ArmDriverError> {
+                Ok(())
+            }
+        }
+
+        let cfg = make_6dof_config();
+        let sup_skew = ArmSupervisor::new(cfg.clone()).with_driver(Box::new(SkewedAgeDriver {
+            ages: vec![
+                Some(Duration::from_millis(5)),
+                Some(Duration::from_millis(20)),
+                Some(Duration::from_millis(90)),
+                Some(Duration::from_millis(12)),
+                Some(Duration::from_millis(40)),
+                Some(Duration::from_millis(15)),
+            ],
+        }));
+        let range = sup_skew
+            .inner()
+            .try_read()
+            .unwrap()
+            .policy_input_age_range_ms();
+        assert_eq!(range, Some((5, 90)));
+
+        let sup_missing = ArmSupervisor::new(cfg).with_driver(Box::new(SkewedAgeDriver {
+            ages: vec![
+                Some(Duration::from_millis(5)),
+                None,
+                Some(Duration::from_millis(90)),
+                Some(Duration::from_millis(12)),
+                Some(Duration::from_millis(40)),
+                Some(Duration::from_millis(15)),
+            ],
+        }));
+        let range_missing = sup_missing
+            .inner()
+            .try_read()
+            .unwrap()
+            .policy_input_age_range_ms();
+        assert_eq!(range_missing, None);
+    }
+
+    #[test]
+    fn extract_top1_box_norm_v1_rejects_inverted_and_zero_area_boxes_before_ranking() {
+        use armd::policy_runtime::{extract_top1_box_norm_v1, VisionFeatureSpec};
+
+        let spec = VisionFeatureSpec {
+            source: VisionSourceKind::Detector,
+            layout: VisionLayout::Top1BoxNormV1,
+            target_label: Some("cube".into()),
+            min_score: 0.3,
+            max_staleness_ms: 200,
+            max_sync_skew_ms: 200,
+            on_target_lost: VisionTargetLostPolicy::Stop,
+            on_stale: VisionStalePolicy::Stop,
+            require_model_generation: false,
+        };
+
+        let frame = PolicyVisionFrame {
+            frame_id: 1,
+            captured_at: Some(Instant::now()),
+            detections: vec![
+                make_detection("cube", 0.99, [0.6, 0.5, 0.2, 0.3]),
+                make_detection("cube", 0.97, [0.2, 0.5, 0.6, 0.3]),
+                make_detection("cube", 0.96, [0.6, 0.3, 0.2, 0.5]),
+                make_detection("cube", 0.95, [0.5, 0.5, 0.5, 0.5]),
+                make_detection("cube", 0.94, [0.2, 0.5, 0.6, 0.5]),
+                make_detection("cube", 0.80, [0.2, 0.3, 0.6, 0.5]),
+            ],
+            model_generation: None,
+        };
+
+        let feats = extract_top1_box_norm_v1(&frame, &spec).expect("valid box should be selected");
+        let expected = [1.0f32, 0.4, 0.4, 0.4, 0.2, 0.80];
+        for i in 0..6 {
+            assert!(
+                (feats[i] - expected[i]).abs() < 1e-6,
+                "feats[{i}]={} vs expected={}",
+                feats[i],
+                expected[i]
+            );
+        }
+
+        let only_degenerate = PolicyVisionFrame {
+            frame_id: 2,
+            captured_at: Some(Instant::now()),
+            detections: vec![
+                make_detection("cube", 0.99, [0.6, 0.5, 0.2, 0.3]),
+                make_detection("cube", 0.95, [0.5, 0.5, 0.5, 0.5]),
+            ],
+            model_generation: None,
+        };
+        assert_eq!(extract_top1_box_norm_v1(&only_degenerate, &spec), None);
+    }
+
+    #[tokio::test]
+    async fn http_detector_delayed_response_penalizes_capture_time_and_stops_with_vision_stale() {
+        use armd::grasp::HttpDetectionSource;
+        use armd::policy_runtime::{
+            evaluate_vision_frame, DetectionSourceAdapter, VisionFeatureSpec, VisionStepDecision,
+        };
+        use axum::{routing::get, Json, Router};
+
+        let dir = tempdir().unwrap();
+        let layers = make_12_to_6_layers();
+        write_rmlp_pack(
+            dir.path(),
+            &["j1", "j2", "j3", "j4", "j5", "j6"],
+            "rad",
+            &layers,
+            serde_json::json!({
+                "vision": {
+                    "source": "detector",
+                    "layout": "top1_box_norm_v1",
+                    "max_staleness_ms": 100,
+                    "on_stale": "stop",
+                    "require_model_generation": true
+                }
+            }),
+        );
+        let cfg = make_6dof_config();
+
+        let app = Router::new().route(
+            "/api/results/latest",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Json(serde_json::json!({
+                    "frame_id": 10,
+                    "age_ms": 5.0,
+                    "width": 640,
+                    "height": 360,
+                    "model_generation": 1,
+                    "detections": [
+                        {"label": "cube", "score": 0.9, "box_norm": [0.2, 0.3, 0.6, 0.5]}
+                    ]
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let http_src = Arc::new(HttpDetectionSource {
+            upstream: DetectorUpstream::parse(&format!("http://{addr}")).unwrap(),
+            image_size_px: [640.0, 360.0],
+        });
+        let adapter: Arc<dyn PolicyVisionSource> = Arc::new(DetectionSourceAdapter(http_src));
+
+        // Direct adapter check: both initial poll (after=0) and long-poll (after=5, wait_ms=25)
+        // penalize the 150 ms HTTP response latency so captured_at exceeds max_staleness_ms (100 ms).
+        let spec = VisionFeatureSpec {
+            source: VisionSourceKind::Detector,
+            layout: VisionLayout::Top1BoxNormV1,
+            target_label: None,
+            min_score: 0.3,
+            max_staleness_ms: 100,
+            max_sync_skew_ms: 200,
+            on_target_lost: VisionTargetLostPolicy::Hold,
+            on_stale: VisionStalePolicy::Stop,
+            require_model_generation: true,
+        };
+        let direct_after = adapter
+            .next_frame(5, 25)
+            .await
+            .unwrap()
+            .expect("expected delayed frame");
+        let age_after_ms = direct_after
+            .captured_at
+            .expect("valid age_ms produces policy_captured_at")
+            .elapsed()
+            .as_millis() as u64;
+        assert!(
+            age_after_ms >= 120,
+            "expected conservative age >= 120 ms for 150 ms sleep - 25 ms wait + 5 ms age, got {age_after_ms} ms"
+        );
+        let now = Instant::now();
+        let mut locked_gen = None;
+        let decision = evaluate_vision_frame(
+            Some(&direct_after),
+            &spec,
+            now,
+            now,
+            Some((0, 0)),
+            &mut locked_gen,
+        );
+        assert!(
+            matches!(
+                decision,
+                VisionStepDecision::Stop {
+                    reason: "VISION_STALE",
+                    ..
+                }
+            ),
+            "expected VISION_STALE for delayed HTTP response, got {decision:?}"
+        );
+
+        let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let gen = sup.acquire_lease("conn-http-delay").await.unwrap();
+        sup.set_torque(true).await.unwrap();
+        sup.tick(0.02).await;
+        let epoch = sup.get_observation().await.epoch_id;
+        let action_id = {
+            let mut inner = sup.inner().write().await;
+            inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-http-delay".into(),
+                    lease_generation: gen,
+                    policy_id: "http_delay".into(),
+                    artifact_digest: prepared.artifact_digest().to_string(),
+                    backend: prepared.backend_name().to_string(),
+                    mode: PolicyMode::Live,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                })
+                .unwrap()
+        };
+
+        let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 12.0, None, Some(adapter));
+        let _ = runner.await;
+        server.abort();
+
+        let inner = sup.inner().read().await;
+        assert!(
+            inner.servo_target.is_none(),
+            "delayed HTTP response must not apply servo target"
+        );
+        assert_eq!(inner.last_action.as_ref().unwrap().state, "failed");
+        let pol = inner.policy_observation().unwrap();
+        assert_eq!(pol.stop_reason.as_deref(), Some("VISION_STALE"));
+        assert_eq!(pol.steps, 0);
+    }
+
+    #[tokio::test]
+    async fn vision_generation_change_during_slow_inference_aborts_without_committing_target() {
+        use tokio::sync::Notify;
+
+        struct SlowGenBackend {
+            infer_entered: Arc<Notify>,
+        }
+
+        impl PolicyBackend for SlowGenBackend {
+            fn backend_name(&self) -> &'static str {
+                "slow_gen_backend"
+            }
+            fn input_dim(&self) -> usize {
+                12
+            }
+            fn output_dim(&self) -> usize {
+                6
+            }
+            fn infer(&mut self, _input: &[f32], output: &mut [f32]) -> Result<(), PolicyError> {
+                self.infer_entered.notify_one();
+                std::thread::sleep(Duration::from_millis(60));
+                output.copy_from_slice(&[0.05, 0.0, 0.0, 0.0, 0.0, 0.0]);
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let layers = make_12_to_6_layers();
+        write_rmlp_pack(
+            dir.path(),
+            &["j1", "j2", "j3", "j4", "j5", "j6"],
+            "rad",
+            &layers,
+            serde_json::json!({
+                "vision": {
+                    "source": "detector",
+                    "layout": "top1_box_norm_v1",
+                    "max_staleness_ms": 400,
+                    "on_stale": "stop",
+                    "require_model_generation": true
+                }
+            }),
+        );
+        let snap = PolicySnapshot::load_from_dir(dir.path()).unwrap();
+        let contract = StrictPolicyContract::parse(&snap.policy_json_bytes).unwrap();
+        let cfg = make_6dof_config();
+
+        let infer_entered = Arc::new(Notify::new());
+        let backend = Box::new(SlowGenBackend {
+            infer_entered: infer_entered.clone(),
+        });
+        let prepared = PreparedPolicy::from_backend(snap, contract, backend, &cfg).unwrap();
+
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let gen = sup.acquire_lease("conn-slow-gen").await.unwrap();
+        sup.set_torque(true).await.unwrap();
+        sup.tick(0.02).await;
+        let epoch = sup.get_observation().await.epoch_id;
+        let action_id = {
+            let mut inner = sup.inner().write().await;
+            inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-slow-gen".into(),
+                    lease_generation: gen,
+                    policy_id: "vis_slow_gen".into(),
+                    artifact_digest: prepared.artifact_digest().to_string(),
+                    backend: prepared.backend_name().to_string(),
+                    mode: PolicyMode::Live,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                })
+                .unwrap()
+        };
+
+        let infer_entered_src = infer_entered.clone();
+        let src = MockVisionSource::new_async(move |after, _| {
+            let infer_entered_src = infer_entered_src.clone();
+            Box::pin(async move {
+                if after == 0 {
+                    return Ok(Some(PolicyVisionFrame {
+                        frame_id: 1,
+                        captured_at: Some(Instant::now()),
+                        detections: vec![make_detection("cube", 0.9, [0.2, 0.2, 0.4, 0.4])],
+                        model_generation: Some(1),
+                    }));
+                }
+                if after == 1 {
+                    infer_entered_src.notified().await;
+                    return Ok(Some(PolicyVisionFrame {
+                        frame_id: 2,
+                        captured_at: Some(Instant::now()),
+                        detections: vec![make_detection("cube", 0.9, [0.2, 0.2, 0.4, 0.4])],
+                        model_generation: Some(2),
+                    }));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok(None)
+            })
+        });
+
+        let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(src));
+        let _ = runner.await;
+
+        let inner = sup.inner().read().await;
+        assert!(
+            inner.servo_target.is_none(),
+            "target computed on old generation must not be committed after generation switch"
+        );
+        assert_eq!(inner.last_action.as_ref().unwrap().state, "failed");
+        let pol = inner.policy_observation().unwrap();
+        assert_eq!(pol.stop_reason.as_deref(), Some("VISION_GENERATION_CHANGED"));
+        assert_eq!(pol.steps, 0);
+    }
+
+    #[tokio::test]
+    async fn http_detector_invalid_out_of_range_score_rejected_before_ranking() {
+        use armd::grasp::HttpDetectionSource;
+        use armd::policy_runtime::{
+            extract_top1_box_norm_v1, DetectionSourceAdapter, VisionFeatureSpec,
+        };
+        use axum::{routing::get, Json, Router};
+
+        let app = Router::new().route(
+            "/api/results/latest",
+            get(|| async {
+                Json(serde_json::json!({
+                    "frame_id": 1,
+                    "age_ms": 5.0,
+                    "width": 640,
+                    "height": 360,
+                    "model_generation": 1,
+                    "detections": [
+                        {"label": "cube", "score": 2.0, "box_norm": [0.0, 0.0, 0.1, 0.1]},
+                        {"label": "cube", "score": 0.7, "box_norm": [0.2, 0.3, 0.6, 0.5]}
+                    ]
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let http_src = Arc::new(HttpDetectionSource {
+            upstream: DetectorUpstream::parse(&format!("http://{addr}")).unwrap(),
+            image_size_px: [640.0, 360.0],
+        });
+        let adapter = DetectionSourceAdapter(http_src);
+        let frame = adapter
+            .next_frame(0, 200)
+            .await
+            .unwrap()
+            .expect("expected frame from local HTTP detector");
+        server.abort();
+
+        assert_eq!(frame.detections.len(), 2);
+        // grasp.rs compatibility keeps clamped score=1.0, while raw_score_valid preserves rejection.
+        assert!((frame.detections[0].score - 1.0).abs() < 1e-9);
+        assert!(!frame.detections[0].raw_score_valid);
+        assert!((frame.detections[1].score - 0.7).abs() < 1e-9);
+        assert!(frame.detections[1].raw_score_valid);
+
+        let spec = VisionFeatureSpec {
+            source: VisionSourceKind::Detector,
+            layout: VisionLayout::Top1BoxNormV1,
+            target_label: Some("cube".into()),
+            min_score: 0.3,
+            max_staleness_ms: 200,
+            max_sync_skew_ms: 200,
+            on_target_lost: VisionTargetLostPolicy::Stop,
+            on_stale: VisionStalePolicy::Stop,
+            require_model_generation: false,
+        };
+        let feats = extract_top1_box_norm_v1(&frame, &spec)
+            .expect("valid detection B should be selected after skipping out-of-range A");
+        let expected = [1.0f32, 0.4, 0.4, 0.4, 0.2, 0.7];
+        for i in 0..6 {
+            assert!(
+                (feats[i] - expected[i]).abs() < 1e-6,
+                "feats[{i}]={} vs expected={}",
+                feats[i],
+                expected[i]
+            );
+        }
+    }
+}
+
