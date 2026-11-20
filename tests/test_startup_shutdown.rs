@@ -1015,3 +1015,51 @@ fn init_start_stop_hold_one_lock() {
     assert!(Command::new("sh").arg(&path).status().unwrap().success());
     assert!(!temp.path().join("lock").exists());
 }
+
+/// The console's operator PIN setting (`security.operator_pin`) reaches armd only as
+/// ARMD_OPERATOR_PIN in its environment: not on its command line, not in the init shell's
+/// environment (vision and the user program start from there). An empty or invalid setting
+/// leaves armd on its random PIN file.
+#[cfg(unix)]
+#[test]
+fn init_passes_the_operator_pin_to_armd_in_the_environment_only() {
+    let source = include_str!("../kits/recamera-b601dm/packaging/rootfs/etc/init.d/K92rebot-teleop");
+    let parse = init_section(source, "config_shell_vars() {", "\n# 读取 supervisor");
+    let launch = init_section(source, "launch_armd() {", "\nstart() {");
+    assert!(source.contains("    launch_armd\n    if [ $? -ne 0 ]; then"), "start() launches armd through launch_armd");
+    let temp = tempfile::tempdir().unwrap();
+    // start-stop-daemon stub on PATH (dash takes no '-' in function names): logs its environment and arguments
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let (env_log, args_log) = (temp.path().join("env"), temp.path().join("args"));
+    let stub = bin.join("start-stop-daemon");
+    std::fs::write(&stub, format!("#!/bin/sh\necho \"ARMD_OPERATOR_PIN=${{ARMD_OPERATOR_PIN-unset}}\" > '{}'\necho \"$*\" > '{}'\n", env_log.display(), args_log.display())).unwrap();
+    std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    for (setting, pin) in [(Some("246810"), Some("246810")), (Some(""), None), (Some("12ab"), None), (Some("123"), None), (None, None)] {
+        let cfg = temp.path().join("config.json");
+        let sec = setting.map_or(String::new(), |p| format!(", \"security\": {{\"operator_pin\": \"{p}\"}}"));
+        std::fs::write(&cfg, format!("{{\"arm\": {{\"follower_model\": \"mock\"}}{sec}}}")).unwrap();
+        let _ = std::fs::remove_file(&env_log);
+        let script = format!(
+            "{parse}\n{launch}\n\
+             PATH='{b}':$PATH\n\
+             ARMD_OPERATOR_PIN=999999; export ARMD_OPERATOR_PIN\n\
+             OPERATOR_PIN=''; OPERATOR_PIN_INVALID=''\n\
+             eval \"$(config_shell_vars '{c}')\"\n\
+             PIDFILE=/tmp/x.pid DAEMON=/usr/local/bin/armd DAEMON_OPTS='--follower mock' LOGFILE=/dev/null\n\
+             launch_armd || exit 9\n\
+             echo \"after=$ARMD_OPERATOR_PIN invalid=$OPERATOR_PIN_INVALID\"\n",
+            b = bin.display(), c = cfg.display()
+        );
+        let out = Command::new("sh").args(["-c", &script]).output().unwrap();
+        assert!(out.status.success(), "{setting:?}: {}", String::from_utf8_lossy(&out.stderr));
+        let env = std::fs::read_to_string(&env_log).unwrap();
+        assert_eq!(env.trim(), format!("ARMD_OPERATOR_PIN={}", pin.unwrap_or("unset")), "{setting:?}");
+        let args = std::fs::read_to_string(&args_log).unwrap();
+        assert!(!args.contains("246810") && !args.contains("999999"), "PIN on the command line: {args}");
+        let invalid = matches!(setting, Some(p) if !p.is_empty() && pin.is_none());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // the init shell's own environment is unchanged; an unusable setting is flagged for the log line
+        assert_eq!(stdout.trim(), format!("after=999999 invalid={}", if invalid { "1" } else { "" }), "{setting:?}");
+    }
+}

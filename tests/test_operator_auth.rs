@@ -1792,3 +1792,38 @@ async fn delayed_zero_check_and_calibration_recheck_operator_session_and_lease_e
     assert_eq!(sup_exp.gripper_calibration_response().await.revision, 1);
 }
 
+
+/// `{"type":"auth"}` hands an unlock token to an open socket: the lease stays, operator commands
+/// pass; `token: null` drops back to program; an unknown token gives role program.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_auth_message_switches_the_operator_session_without_reconnecting() {
+    let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
+    let auth = OperatorAuth::enforced("123456", 1800);
+    let addr = spawn_auth_server(sup.clone(), auth).await;
+    let mut ws = connect_ws_with_header(addr, "Authorization", None).await;
+    let granted = acquire(&mut ws, "cockpit", false).await;
+    let gen = granted["generation"].as_u64().unwrap();
+    let epoch = sup.get_observation().await.epoch_id;
+    let rej = common::rpc(&mut ws, gen, epoch, "/api/v1/workspace/keepout", json!({"boxes": []})).await;
+    assert_eq!(rej["code"], "OPERATOR_REQUIRED", "{rej}");
+
+    let unlock: Value = reqwest::Client::new().post(format!("http://{addr}/api/v1/auth/unlock"))
+        .json(&json!({"pin": "123456"})).send().await.unwrap().json().await.unwrap();
+    let tok = unlock["token"].as_str().unwrap();
+    let ack = common::ws_reply(&mut ws, json!({"type": "auth", "seq": 7, "token": tok}), &["auth_ack"]).await;
+    assert_eq!(ack["role"], "operator", "{ack}");
+    assert_eq!(ack["seq"], 7);
+    assert_eq!(ack["auth_enforced"], true);
+    // past the operator check (the write itself then wants expected_revision, nothing is stored)
+    let ok = common::rpc(&mut ws, gen, epoch, "/api/v1/workspace/keepout", json!({"boxes": []})).await;
+    assert_eq!(ok["code"], "INVALID_COMMAND", "same socket, same lease: {ok}");
+    assert!(ok["message"].as_str().unwrap().contains("expected_revision"), "{ok}");
+    assert_eq!(sup.inner().read().await.active_lease.as_ref().unwrap().generation, gen);
+
+    let ack = common::ws_reply(&mut ws, json!({"type": "auth", "token": null}), &["auth_ack"]).await;
+    assert_eq!(ack["role"], "program", "{ack}");
+    let rej = common::rpc(&mut ws, gen, epoch, "/api/v1/workspace/keepout", json!({"boxes": []})).await;
+    assert_eq!(rej["code"], "OPERATOR_REQUIRED", "{rej}");
+    let ack = common::ws_reply(&mut ws, json!({"type": "auth", "token": "00".repeat(32)}), &["auth_ack"]).await;
+    assert_eq!(ack["role"], "program", "{ack}");
+}

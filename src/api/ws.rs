@@ -123,7 +123,7 @@ fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch:
             if !inner.supports_automatic_unload() {
                 return Err(ArmError::Unsupported("Automatic unload requires a resting-pose profile and velocity, torque and enable-state feedback; no motion was started".into()).into());
             }
-            if !inner.safety.state().is_operational() {
+            if !inner.safety.state().is_operational() && !inner.holding_after_clear() {
                 return Err(ArmError::Safety(SafetyError::NotArmed(inner.safety.state().clone())).into());
             }
             let id = inner.unload_action()?;
@@ -230,7 +230,7 @@ const MACRO_CHECK_BACKLOG: usize = 64;
 /// Handled while a [`MacroCheck`] runs; every other message waits for its reply, in order.
 /// None of these can start motion; lease changes are caught by the re-check after the check.
 fn runs_during_macro_check(kind: &str, value: &Value) -> bool {
-    matches!(kind, "estop" | "e_stop" | "heartbeat" | "acquire_lease" | "release_lease")
+    matches!(kind, "estop" | "e_stop" | "heartbeat" | "acquire_lease" | "release_lease" | "auth")
         || (kind == "command" && value.get("path").and_then(Value::as_str) == Some("/api/v1/motion/stop"))
 }
 
@@ -696,6 +696,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let recv_deps = deps;
     let recv_calib = calib;
     let mut recv_task = tokio::spawn(async move {
+        // the operator session of this connection: from the upgrade request, replaced by `auth` messages
+        let mut ws_token = ws_token;
         let mut client_label: Option<String> = None;
         let mut last_sequence: Option<u64> = None;
         let mut last_request: Option<u64> = None;
@@ -759,6 +761,17 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
             if macro_check.is_some() && !runs_during_macro_check(kind, &value) {
                 backlog.push_back(Message::Text(text));
+                continue;
+            }
+            // `{"type":"auth","token":<unlock token|null>}`: use this operator session on the open socket
+            // (a browser unlocks over REST; reconnecting would drop the lease and park a torqued arm).
+            // The token is checked on every privileged use, as from the upgrade request.
+            if kind == "auth" {
+                ws_token = value.get("token").and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string);
+                let status = auth.status(ws_token.as_deref());
+                let reply = json!({"type":"auth_ack", "seq":value.get("seq"), "auth_enforced":status.auth_enforced,
+                    "role":status.role, "expires_in_s":status.expires_in_s});
+                if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
                 continue;
             }
             // depth measurement: read-only, no motion, no lease

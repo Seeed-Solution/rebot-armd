@@ -857,11 +857,11 @@ fn b601dm_builtin_and_kit_profile_link_capsules_positive_and_negative() {
     assert!(capsules.len() >= 6);
 
     // Enclosure verification against sim/mujoco/models/rebot_b601dm_scene.xml collision boxes
+    // (link5 is fitted to its URDF mesh below: the MuJoCo box overstates the part by 8 mm)
     let dm_boxes: &[(&str, [f64; 3], [f64; 3])] = &[
         ("link2", [-0.132, 0.0, -0.0316], [0.1605, 0.0285, 0.0337]),
         ("link3", [0.1222, -0.03, -0.0311], [0.1489, 0.0525, 0.0401]),
         ("link4", [0.0449, -0.03, -0.03], [0.0729, 0.058, 0.0334]),
-        ("link5", [-0.0028, 0.0, 0.0355], [0.035, 0.0385, 0.0425]),
         ("link6", [0.0, 0.0, 0.0242], [0.0385, 0.0318, 0.029]),
     ];
     for (id, c, half) in dm_boxes {
@@ -922,6 +922,16 @@ fn b601dm_builtin_and_kit_profile_link_capsules_positive_and_negative() {
         assert!(
             min_signed <= 0.0,
             "base_link capsules miss mesh vertex {v:?}: min_signed={min_signed:.5}m > 0"
+        );
+    }
+    // link5: the URDF mesh with at least 5 mm to spare
+    let link5_cap = capsules.iter().find(|k| k.id == "link5").expect("missing link5 capsule");
+    for v in load_mesh_verts("link5") {
+        let d = pt_seg_dist(v, link5_cap.a_m, link5_cap.b_m);
+        assert!(
+            d + 0.005 <= f64::from(link5_cap.radius_m),
+            "link5 capsule misses mesh vertex {v:?} (5 mm margin): dist={d:.5}m, r={:.5}m",
+            link5_cap.radius_m
         );
     }
     let link6_cap = capsules.iter().find(|k| k.id == "link6").expect("missing link6 capsule");
@@ -1437,4 +1447,110 @@ fn link_frames_of_the_geometry_checks_follow_the_kinematic_correction() {
     let mut buf = eval.alloc_buf();
     eval.eval_into(&HOME, &mut buf, "plan").unwrap();
     assert!(buf.as_slice().iter().all(|&c| c >= -kinematics::WORKSPACE_EPS), "HOME clearances {:?}", buf.as_slice());
+}
+
+/// Vertices of a link's cockpit mesh (kits/.../assets/meshes, the URDF visual meshes decimated to 0.5 mm).
+fn b601dm_mesh_verts(link: &str) -> Vec<[f64; 3]> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("kits/recamera-b601dm/packaging/rootfs/usr/share/rebot-teleop/assets/meshes");
+    let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
+    let bin = std::fs::read(dir.join("arm.bin")).unwrap();
+    let mut out = Vec::new();
+    for part in manifest["links"][link].as_array().unwrap() {
+        let off = part["offset"].as_u64().unwrap() as usize;
+        let bb: Vec<f64> = part["bbox"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        for i in 0..part["verts"].as_u64().unwrap() as usize {
+            let q = |k: usize| f64::from(u16::from_le_bytes([bin[off + i * 6 + 2 * k], bin[off + i * 6 + 2 * k + 1]])) / 65535.0;
+            out.push([0, 1, 2].map(|k| bb[k] + q(k) * (bb[k + 3] - bb[k])));
+        }
+    }
+    out
+}
+
+/// The office B601-DM kinematic correction of 2026-11-20 (L2 fit): J2 offset/scale/tilt_x, J3-J5 offsets.
+fn office_l2_correction() -> kinematics::Correction {
+    let z = serde_json::json!({"offset_rad": 0.0, "scale": 0.0, "tilt_rad": [0.0, 0.0], "origin_m": [0.0, 0.0, 0.0]});
+    let off = |o: f64| serde_json::json!({"offset_rad": o, "scale": 0.0, "tilt_rad": [0.0, 0.0], "origin_m": [0.0, 0.0, 0.0]});
+    serde_json::from_value(serde_json::json!([
+        z,
+        {"offset_rad": 0.0226, "scale": 0.0189, "tilt_rad": [-0.01325, 0.0], "origin_m": [0.0, 0.0, 0.0]},
+        off(0.010), off(0.0247), off(-0.0458), z,
+    ]))
+    .unwrap()
+}
+
+#[test]
+fn rest_pose_neighbourhood_clears_self_collision_nominal_and_corrected() {
+    // T21: with the live correction the folded rest pose (HOME = park = resting pose, every joint 0) sat
+    // 1 mm inside the base_link-link5 bound, so every park and servo near rest was refused.
+    let dm = ArmConfig::rebot_dm();
+    assert_eq!(dm.home_positions, HOME.to_vec(), "home is the folded rest pose");
+    let ws = dm.workspace.as_ref().unwrap();
+    let corr = office_l2_correction();
+    let corrected = ArmModel::REBOT_DEV_ARM.with_correction(Some(&corr)).unwrap();
+    let step = 2.0f32.to_radians();
+    for (label, model) in [("nominal", ArmModel::REBOT_DEV_ARM), ("office L2", corrected)] {
+        let eval = armd::chain::WorkspaceEvaluator::new(&model, ws, &dm.camera_mount);
+        let mut buf = eval.alloc_buf();
+        let s = eval.self_collision_slot_start;
+        eval.eval_into(&HOME, &mut buf, "plan").unwrap();
+        let rest = buf.as_slice()[s..].iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(rest >= 0.015, "{label}: rest pose self-collision clearance {rest:.4} m");
+        // every corner of the +-2 deg box around rest on J1..J6
+        let mut worst = f64::INFINITY;
+        for i in 0..3usize.pow(6) {
+            let mut q = HOME;
+            let mut k = i;
+            for qj in q.iter_mut().take(6) {
+                *qj = (k % 3) as f32 * step - step;
+                k /= 3;
+            }
+            eval.eval_into(&q, &mut buf, "plan").unwrap();
+            let all = buf.as_slice().iter().copied().fold(f64::INFINITY, f64::min);
+            assert!(all >= -kinematics::WORKSPACE_EPS, "{label}: {q:?} violates the workspace ({all:.4} m)");
+            worst = worst.min(buf.as_slice()[s..].iter().copied().fold(f64::INFINITY, f64::min));
+        }
+        assert!(worst >= 0.004, "{label}: +-2 deg self-collision clearance {worst:.4} m");
+    }
+    // the supervisor with the correction installed parks / jogs at rest
+    let mut inner = armed(dm.clone(), &HOME);
+    inner.set_kinematics_correction(Some(&corr)).unwrap();
+    let near: Vec<f32> = HOME.iter().enumerate().map(|(j, _)| if j < 5 { step } else { 0.0 }).collect();
+    inner.jog(near, None, None).expect("jog within 2 deg of rest");
+}
+
+#[test]
+fn base_link_link5_contact_is_still_refused() {
+    // J4 = 1.6 rad from rest pitches the wrist down onto the pedestal: the meshes touch (vertex gap < 3 mm)
+    let dm = ArmConfig::rebot_dm();
+    let ws = dm.workspace.as_ref().unwrap();
+    let q: [f32; 7] = [0.0, 0.0, 0.0, 1.6, 0.0, 0.0, 0.0];
+    let base = b601dm_mesh_verts("base_link");
+    let l5 = b601dm_mesh_verts("link5");
+    let pair = ws.self_collision_pairs.iter().position(|[a, b]| a == "base_link" && b == "link5").unwrap();
+    let corr = office_l2_correction();
+    for (label, model) in [("nominal", ArmModel::REBOT_DEV_ARM), ("office L2", ArmModel::REBOT_DEV_ARM.with_correction(Some(&corr)).unwrap())] {
+        let pose = model.resolve_frame("link5").unwrap().pose(&model.frames_f32(&q).unwrap());
+        let gap = l5
+            .iter()
+            .map(|p| pose.transform_point(p))
+            .flat_map(|w| base.iter().map(move |b| kinematics::norm(&kinematics::sub(&w, b))))
+            .fold(f64::INFINITY, f64::min);
+        assert!(gap < 0.003, "{label}: meshes {gap:.4} m apart");
+        let eval = armd::chain::WorkspaceEvaluator::new(&model, ws, &dm.camera_mount);
+        let mut buf = eval.alloc_buf();
+        eval.eval_into(&q, &mut buf, "plan").unwrap();
+        let clr = buf.as_slice()[eval.self_collision_slot_start + pair];
+        assert!(clr < -0.05, "{label}: base_link-link5 clearance {clr:.4} m");
+    }
+    // 10 mm mesh gap (J4 = 1.0) is refused too: the capsules keep their margin
+    let mut inner = armed(dm.clone(), &HOME);
+    inner.set_kinematics_correction(Some(&corr)).unwrap();
+    for j4 in [1.0f32, 1.6] {
+        let err = inner.jog(vec![0.0, 0.0, 0.0, j4, 0.0, 0.0, 0.0], None, None).unwrap_err();
+        let ArmError::Safety(SafetyError::WorkspaceViolation { detail, .. }) = &err else {
+            panic!("J4 {j4}: expected WorkspaceViolation, got {err:?}");
+        };
+        assert!(detail.constraint_id.as_deref().is_some_and(|s| s.starts_with("self_collision:base_")), "J4 {j4}: {detail:?}");
+    }
 }

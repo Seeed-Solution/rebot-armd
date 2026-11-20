@@ -9,3 +9,4 @@ reBot Teleoperation transforms Seeed reCamera SG2002 into an integrated Embodied
 - **reBot B601-DM arm driver**: Damiao motors on the B4 board CAN bus.
 - **Mobile Touch Teleoperation**: Multi-touch dual virtual joysticks, 2D kinematic pose visualizer, and keyboard hotkeys.
 - **Gravity-compensation hand-guiding and recording**: records synchronized joint observations and actions at 50 Hz to Parquet files (one plain Parquet file per episode, not a LeRobot dataset).
+- **Operator PIN**: gravity mode, calibration, detection, saving poses and resetting an E-stop need operator access in the cockpit. Set the PIN (4-12 digits) in this app's settings, group "Operator Access"; when it is empty, armd writes a new random PIN to `/userdata/rebot-teleop/operator.pin` (readable by root only) at every start.

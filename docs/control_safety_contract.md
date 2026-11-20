@@ -13,6 +13,7 @@ This document describes the software contract visible in the current source tree
 - A successful command returns `command_ack`; lease loss, stale epoch, missing generation, or safety rejection returns `command_reject`. `estop` is accepted without a lease and advances the safety epoch.
 - REST actuator routes (`torque`, `heartbeat`, `motion/*`, and `clear_fault`) return a structured lease error and do not execute the action. This is intentional: a caller-supplied client ID cannot prove WebSocket connection ownership.
 - Every observation carries `lease_holder`: the `client_id` label the current holder sent with `acquire_lease` (empty string when it sent none), or `null` when no valid lease is held. It is informational; authority stays with the connection.
+- Operator session of a socket: the `Authorization: Bearer` header or `rebot_op` cookie of the upgrade request, replaced at any time by `{"type":"auth","token":<token from POST /api/v1/auth/unlock, or null>}`, answered with `auth_ack` (`role`, `auth_enforced`, `expires_in_s`). The token is checked on every privileged command, so expiry and `auth/lock` take effect on open sockets. The cockpit uses it after unlock and lock instead of reconnecting, which would drop the lease (`tests/test_operator_auth.rs` `ws_auth_message_switches_the_operator_session_without_reconnecting`).
 - A voluntary `release_lease` (or closing the socket) while torqued stops motion, and then the lease watchdog runs as for an expired lease: after `lease_timeout_ms` without an owner's heartbeat the arm parks at the resting pose and cuts torque, or holds and latches `Fault(WatchdogTimeout)` (`tests/test_watchdog_park.rs` `released_lease_while_torqued_parks_the_same_way`). The cockpit therefore releases an idle lease only when torque is off (see "Cockpit lease" in the README).
 
 - 观测通过 `GET /api/v1/observation` 及 schema 接口提供。
@@ -20,6 +21,7 @@ This document describes the software contract visible in the current source tree
 - 成功返回 `command_ack`；租约丢失、epoch 过期、缺少 generation 或安全策略拒绝时返回 `command_reject`。`estop` 不需要租约，执行后会推进安全 epoch。
 - REST 执行器路由（`torque`、`heartbeat`、`motion/*`、`clear_fault`）返回结构化租约错误，不执行动作。
 - 每帧观测带 `lease_holder`：当前持有者在 `acquire_lease` 中发送的 `client_id` 标签（未发送时为空字符串），无有效租约时为 `null`。仅供显示，权限仍属于持有连接。
+- 连接的操作员会话：取自升级请求的 `Authorization: Bearer` 头或 `rebot_op` cookie，可随时用 `{"type":"auth","token":<POST /api/v1/auth/unlock 返回的 token，或 null>}` 替换，回复 `auth_ack`（`role`、`auth_enforced`、`expires_in_s`）。每条特权命令都会重新校验 token，过期和 `auth/lock` 对已打开的连接同样生效。驾驶舱解锁和锁定后用它代替重连（重连会丢失租约）。
 - 力矩开启时主动 `release_lease`（或关闭连接）会先停止运动，之后按租约过期处理：`lease_timeout_ms` 内没有持有者心跳时，机械臂回到停靠位并断力矩，或保持位置并锁存 `Fault(WatchdogTimeout)`。因此驾驶舱只在力矩关闭时释放空闲租约。
 
 ## Driver capability boundary / 驱动能力边界
