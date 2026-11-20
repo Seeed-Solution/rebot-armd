@@ -268,20 +268,23 @@ impl WorkspacePolicy {
             keepout_boxes: Vec::new(),
             // Link capsules enclosing sim/mujoco/models/rebot_b601dm_scene.xml collision boxes + ~4-5 mm margin,
             // plus base_link pedestal + base_plate and link6 wrist housing for non-adjacent self-collision checks:
-            // - base_link: pedestal z>=0.014 (max_d 53.0 mm <= r=0.054), z_min=-0.002 (fixed base skips floor check)
+            // - base_link: pedestal z>=0.014 of the URDF base_link mesh (max_d 53.2 mm <= r=0.055; z 0.040..0.070 keeps
+            //   the dome 0.125 m high: the real pedestal ends at z 0.0877, a segment top at 0.080 put the dome 46 mm above it)
             // - base_plate: mounting flange [-0.07,0.07]x[-0.10,0.10]x[0,0.014] (max_d 83.2 mm <= r=0.084)
             // - link2: box pos [-0.132, 0, -0.0316], size [0.1605, 0.0285, 0.0337] (half-diag 44.1 mm) -> r=0.050
             // - link3: box pos [0.1222, -0.03, -0.0311], size [0.1489, 0.0525, 0.0401] (half-diag 66.1 mm) -> r=0.071
             // - link4: box pos [0.0449, -0.03, -0.03], size [0.0729, 0.058, 0.0334] (half-diag 66.9 mm) -> r=0.072
-            // - link5: box pos [-0.0028, 0, 0.0355], size [0.035, 0.0385, 0.0425] (half-diag 52.0 mm) -> r=0.057
+            // - link5: fitted to the URDF link5 mesh (max_d 44.3 mm <= r=0.050, 5.7 mm margin); the MuJoCo box (half-diag
+            //   52.0 mm) overstates the part. With r=0.057 / base top 0.080 the folded rest pose (HOME, J 0) sat on the
+            //   base_link-link5 bound under the live kinematic correction (T21); now >= 17 mm at rest, >= 5 mm within +-2 deg.
             // - link6: box pos [0, 0, 0.0242], size [0.0385, 0.0318, 0.029] (max corner dist 51.6 mm) -> r=0.052
             link_capsules: vec![
                 LinkCapsule {
                     id: "base_link".into(),
                     frame: "base_link".into(),
-                    a_m: [0.0, 0.0, 0.052],
-                    b_m: [0.0, 0.0, 0.08],
-                    radius_m: 0.054,
+                    a_m: [0.0, 0.0, 0.040],
+                    b_m: [0.0, 0.0, 0.070],
+                    radius_m: 0.055,
                 },
                 LinkCapsule {
                     id: "base_plate".into(),
@@ -314,9 +317,9 @@ impl WorkspacePolicy {
                 LinkCapsule {
                     id: "link5".into(),
                     frame: "link5".into(),
-                    a_m: [-0.0028, 0.0, 0.005],
-                    b_m: [-0.0028, 0.0, 0.066],
-                    radius_m: 0.057,
+                    a_m: [-0.0028, 0.0, 0.010],
+                    b_m: [-0.0028, 0.0, 0.060],
+                    radius_m: 0.050,
                 },
                 LinkCapsule {
                     id: "link6".into(),
