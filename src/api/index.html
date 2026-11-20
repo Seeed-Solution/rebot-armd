@@ -325,6 +325,10 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .cwiz-body p { color: var(--sc-color-text-secondary); }
 .cwiz-board { border: 1px solid var(--sc-color-border); border-radius: var(--sc-radius-md); background: #fff; padding: 6px; }
 .cwiz-board svg { display: block; width: 100%; height: auto; }
+.cwiz-illu { display: flex; justify-content: center; border: 1px solid var(--sc-color-border); border-radius: var(--sc-radius-md); background: #fff; padding: 4px; }
+.cwiz-illu svg { max-width: 100%; height: auto; }
+.cwiz-roi { display: block; width: 100%; max-width: 430px; height: auto; image-rendering: pixelated; border: 1px solid var(--sc-color-border); border-radius: var(--sc-radius-md); margin: 6px 0; }
+.cwiz-table td.note { color: var(--sc-color-text-secondary, #64748b); }
 .cwiz-field { display: grid; grid-template-columns: 1fr 120px; align-items: center; gap: 8px; }
 .cwiz-field input { min-height: 40px; padding: 0 10px; font: inherit; border: 1px solid var(--sc-color-border); border-radius: var(--sc-radius-base); background: var(--sc-color-bg); color: var(--sc-color-text); }
 .cwiz-acts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -2260,7 +2264,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
       <div class="tools-warn" id="tools-stale" role="status" hidden></div>
       <div class="tools-warn" id="tools-stale2" role="status" hidden></div>
       <div class="tools-list" id="tools-list"></div>
-      <button class="btn" id="tools-release" type="button" data-i18n="tools.release">释放控制权</button>
+      <button class="btn" id="tools-release" type="button" data-i18n="tools.release">释放控制权（交给其他程序）</button>
       <small id="tools-release-hint"></small>
     </div>
     <div class="gset-row" id="col-set">
@@ -2699,8 +2703,8 @@ Object.assign(I18N.zh, {
   'tools.cam': '相机标定', 'tools.cam.desc': '用标定板求解相机内参、相机安装和桌面高度（约 20 个位姿）。',
   'tools.kin': '精校（相机 + 机械臂几何）', 'tools.kin.desc': '标定板两个位置，同时求解相机和 J2–J5 的几何修正（约 12 分钟）。',
   'tools.grip': '夹爪标定', 'tools.grip.desc': '检查夹爪闭合时的机械零位，可保存偏差。',
-  'tools.release': '释放控制权', 'tools.rel.none': '本页没有控制权。', 'tools.rel.torqued': '先停稳并关闭使能，再释放控制权。',
-  'tools.rel.moving': '机械臂在动或有动作在执行，停下后再释放。', 'tools.rel.ok': '释放后其他设备（如 MCP、脚本）可以取得控制权。',
+  'tools.release': '释放控制权（交给其他程序）', 'tools.rel.none': '本页没有控制权。', 'tools.rel.torqued': '先停稳并关闭使能，再释放控制权。',
+  'tools.rel.moving': '机械臂在动或有动作在执行，停下后再释放。', 'tools.rel.ok': '释放后其他设备（如 MCP、脚本）可以取得控制权。释放控制权不改变电机使能；要卸力，用「停靠并卸力」。',
   'tools.stale': '相机标定已过期：{at} 改过零位。抓取仍按旧标定运行，请重新做相机标定或精校。', 'tools.stale.chip': '⚠ 相机标定需重做（零位已改）',
   'gt.title': '夹爪标定', 'gt.lead': '夹爪零位 = 完全闭合。零位检查让夹爪慢慢闭合到机械限位，测出与配置的闭合角之差。',
   'gt.cur': '当前偏差', 'gt.calibrated': '开度表', 'gt.yes': '已标定', 'gt.no': '未标定', 'gt.state': '开机检查',
@@ -2715,8 +2719,8 @@ Object.assign(I18N.en, {
   'tools.cam': 'Camera calibration', 'tools.cam.desc': 'Camera intrinsics, camera mount and table height from a printed board (about 20 poses).',
   'tools.kin': 'Fine calibration (camera + arm geometry)', 'tools.kin.desc': 'Two board placements: the camera plus a geometric correction of J2–J5 (about 12 minutes).',
   'tools.grip': 'Gripper calibration', 'tools.grip.desc': 'Checks the gripper\'s mechanical zero when closed; can store the offset.',
-  'tools.release': 'Release control', 'tools.rel.none': 'This page does not hold control.', 'tools.rel.torqued': 'Stop the arm and disable torque before releasing control.',
-  'tools.rel.moving': 'The arm is moving or an action runs; release once it stops.', 'tools.rel.ok': 'After the release another client (MCP, a script) can take control.',
+  'tools.release': 'Release control (hand over to another client)', 'tools.rel.none': 'This page does not hold control.', 'tools.rel.torqued': 'Stop the arm and disable torque before releasing control.',
+  'tools.rel.moving': 'The arm is moving or an action runs; release once it stops.', 'tools.rel.ok': 'After the release another client (MCP, a script) can take control. Releasing control does not change torque; to turn torque off use "Park and turn torque off".',
   'tools.stale': 'The camera calibration is stale: the joint zero changed at {at}. Grasp still uses the old calibration; redo the camera or fine calibration.', 'tools.stale.chip': '⚠ Redo the camera calibration (zero changed)',
   'gt.title': 'Gripper calibration', 'gt.lead': 'Gripper zero = fully closed. The zero check closes the gripper slowly onto its mechanical stop and measures the difference to the configured closed angle.',
   'gt.cur': 'Current offset', 'gt.calibrated': 'Opening table', 'gt.yes': 'calibrated', 'gt.no': 'not calibrated', 'gt.state': 'Boot check',
@@ -2850,6 +2854,32 @@ Object.assign(I18N.en, {
 // calibration wizard, fine calibration mode (cw.f.*)
 Object.assign(I18N.zh, {
   'cw.fstep.board': '标定板', 'cw.fstep.place': '摆放 A', 'cw.fstep.capture': '采集 A', 'cw.fstep.move': '移板', 'cw.fstep.captureb': '采集 B', 'cw.fstep.solve': '求解', 'cw.fstep.review': '确认', 'cw.fstep.applied': '完成',
+  'cw.fstep.tip': '指尖', 'cw.fstep.hover': '自动验收', 'cw.board.sticker': '打印指尖贴纸', 'cw.f.toTip': '下一步：测指尖',
+  'cw.tip.lead': '指尖：相机测量贴在手指上的 4 点贴纸，得到指尖相对相机的位置。',
+  'cw.tip.hint': '把打印的贴纸贴在朝向相机的那根手指上：粗边与指尖平齐，圆点朝手腕，整张贴纸平贴。机械臂保持在当前位置（电机使能），夹爪开合不要变。然后点「测量指尖」。',
+  'cw.tip.measure': '测量指尖', 'cw.tip.again': '重新测量', 'cw.tip.next': '下一步：自动验收', 'cw.tip.busy': '正在读取相机画面…', 'cw.tip.count': '已用画面：{n} / 16',
+  'cw.tip.torque': '电机未使能：先使能，再测量（断电时手腕下垂，画面不可用）。', 'cw.tip.moved': '测量时机械臂在动',
+  'cw.tip.notfound': '标记区域内没有找到 4 个圆点（找到 {b} 个）。', 'cw.tip.few': '只有 {n} 张可用画面，需要至少 8 张。', 'cw.tip.gates': '指尖测量未通过检查，见下表。',
+  'cw.tip.align': '将贴纸底边与指尖对齐（Align the sticker edge with the fingertip）。下图是相机里的标记区域，橙色圈是找到的圆点。',
+  'cw.tip.ok': '指尖（相机坐标）：{mm} mm', 'cw.tip.r.cam': '指尖（相机）', 'cw.tip.r.end': '指尖（末端，X · tip）', 'cw.tip.r.tool': '工具',
+  'cw.tip.r.edge': '贴纸边比最低点高 {mm} mm', 'cw.tip.r.noedge': '未知工具：只报告贴纸边的高度，不设置桌面高度',
+  'cw.g.tip_frames': '可用画面数', 'cw.g.tip_front': '贴纸在相机前方', 'cw.g.tip_reproj': '重投影误差', 'cw.g.tip_ambiguity': '两个解的差距', 'cw.g.tip_std': '画面间指尖抖动',
+  'cw.hov.lead': '自动验收：机械臂让指尖朝下，悬停在标定板 4–6 个角点上方 12 mm，相机测量指尖离纸面的实际高度。',
+  'cw.hov.hint': '标定板不要动，人守在停止按钮旁。先点「规划」：相机重新看一次标定板并选出够得着的角点；再点「开始悬停」。动作由 armd 执行，页面断线时机械臂会自动停靠。',
+  'cw.hov.noedge': '未知工具：验收照常进行，但只报告贴纸边的高度，不会设置桌面高度。',
+  'cw.hov.plan': '规划', 'cw.hov.planning': '正在看标定板并规划…', 'cw.hov.planned': '已选 {n} 个角点', 'cw.hov.start': '开始悬停', 'cw.hov.resume': '继续悬停',
+  'cw.hov.confirm': '复核：按新桌面高度再悬停', 'cw.hov.board': '标定板标记不足（{n} 个，需要 4 个）：把相机移到能看到标定板的位置。',
+  'cw.hov.why.reach': '指尖朝下时够得着的角点不足 4 个：把标定板移到离底座 20–35 cm 处。', 'cw.hov.why.spread': '够得着的角点没有覆盖标定板的两个方向：把标定板移近一些或转一下。',
+  'cw.hov.moved': '标定板和规划时相比移动了 {mm} mm：重新规划。', 'cw.hov.fpchanged': '标定结果在规划后变了：回到「指尖」重新测量。',
+  'cw.hov.running': '悬停中：{ph}', 'cw.hov.measured': '已测量', 'cw.hov.pt': '离纸面 {h} mm · 水平偏差 {xy} mm',
+  'cw.hov.pass': '自动验收通过。', 'cw.hov.fail': '自动验收未通过，见下表。', 'cw.hov.ended': '悬停中断：{s} {c}。可以继续悬停（先确认机械臂状态）。',
+  'cw.hov.armstate': '机械臂：{tq}，故障 {f}', 'cw.hov.tq.on': '电机使能', 'cw.hov.tq.off': '已卸力',
+  'cw.hov.conf.ok': '复核通过：最大偏差 {mm} mm。', 'cw.hov.conf.bad': '复核未通过：最大偏差 {mm} mm（限 3 mm）。',
+  'cw.hov.r.table': '桌面高度（悬停测得）', 'cw.hov.r.notable': '未设置（未知工具）', 'cw.hov.r.camera': '桌面高度（相机求解）', 'cw.hov.r.optical': '纸面（光学）', 'cw.hov.r.floor': '新的地板限位', 'cw.hov.r.confirm': '复核',
+  'cw.g.hov_points': '测到的角点', 'cw.g.hov_spread': '高度差（最大 − 最小）', 'cw.g.hov_xy': '水平偏差（最大）', 'cw.g.hov_clearance': '离纸面最低高度', 'cw.g.hov_tool': '工具',
+  'cw.g.hov_tool.unknown': '未知', 'cw.g.hov_tool.lim': '已知贴纸边高度',
+  'cw.app.readback': '读回的标定和应用的不一致：在下面恢复备份。', 'cw.app.floor': '地板限位：{f} mm（{s}）',
+  'cw.app.floor.profile': '配置文件', 'cw.app.floor.calibration_camera': '相机求解的桌面 − 3 mm', 'cw.app.floor.calibration_hover': '悬停测得的桌面 − 3 mm',
   'cw.mode.camera': '相机标定', 'cw.mode.fine': '精校（相机 + 机械臂几何）',
   'cw.mode.camera.hint': '一个标定板位置，约 20 个位姿：求解相机内参、相机安装和桌面高度。',
   'cw.mode.fine.hint': '标定板先后放两个位置，各约 35 个位姿（每个约 8 s，合计约 12 分钟），同时求解相机参数和 J2–J5 的几何修正（零位、角度比例、关节轴倾斜、原点偏移）。在一个位置拟合、用另一个位置检验：两个方向的留出误差都 ≤ 3 mm、平均比未修正降低 ≥ 30 %、所有参数在 armd 允许范围内，才能应用。',
@@ -2877,13 +2907,39 @@ Object.assign(I18N.zh, {
   'cw.f.par.title': '几何修正参数（J1、J6 固定为 0）', 'cw.f.par.joint': '关节', 'cw.f.par.off': '零位 °', 'cw.f.par.scale': '比例 %', 'cw.f.par.tilt': '轴倾斜 x / y °', 'cw.f.par.origin': '原点 dx / dy / dz mm', 'cw.f.par.fixed': '（固定）',
   'cw.f.r.tableAB': '板面 A {a} / B {b} mm', 'cw.f.r.time': '求解', 'cw.f.r.main': '主线程', 'cw.f.r.views': '个视图',
   'cw.f.rev.hint': '下面是 armd 预演（dry_run）给出的修改前后对比。确认后 armd 先备份，再写入 rebot-vision 内参、相机安装、抓取设置和机械臂几何修正；任一步失败会回滚已完成的步骤。写入几何修正需要电机断电。',
-  'cw.f.torque': 'armd 只在电机断电、没有动作运行时写入几何修正：先点「停靠并断电」。', 'cw.f.park': '停靠并断电', 'cw.f.parking': '正在停靠…', 'cw.f.parked': '已停靠，电机已断电',
-  'cw.f.armed': 'armd 拒绝写入：电机仍在使能或有动作在运行（KINEMATICS_ARMED）。先停靠并断电，再应用。',
+  'cw.f.torque': 'armd 只在电机卸力、没有动作运行时写入几何修正：先点「停靠并卸力」。', 'cw.f.park': '停靠并卸力', 'cw.f.parking': '正在停靠…', 'cw.f.parked': '已停靠，电机已卸力',
+  'cw.f.armed': 'armd 拒绝写入：电机仍在使能或有动作在运行（KINEMATICS_ARMED）。先停靠并卸力，再应用。',
   'cw.f.fitrow': '留出 {ab} / {ba} mm，{n} 个视图',
   'cw.g.kin_views': '每个位置的视图数（较少的一个）', 'cw.g.kin_heldout_ab': '留出误差 A → B', 'cw.g.kin_heldout_ba': '留出误差 B → A', 'cw.g.kin_improve': '比未修正降低（两个方向平均）', 'cw.g.kin_bounds': '超出范围的参数',
 });
 Object.assign(I18N.en, {
   'cw.fstep.board': 'Board', 'cw.fstep.place': 'Place A', 'cw.fstep.capture': 'Capture A', 'cw.fstep.move': 'Move board', 'cw.fstep.captureb': 'Capture B', 'cw.fstep.solve': 'Solve', 'cw.fstep.review': 'Review', 'cw.fstep.applied': 'Applied',
+  'cw.fstep.tip': 'Fingertip', 'cw.fstep.hover': 'Auto check', 'cw.board.sticker': 'Print fingertip sticker', 'cw.f.toTip': 'Next: fingertip',
+  'cw.tip.lead': 'Fingertip: the camera measures the 4-dot sticker on the finger and gets the fingertip relative to the camera.',
+  'cw.tip.hint': 'Stick the printed sticker on the finger that faces the camera: heavy edge flush with the fingertip, dots toward the wrist, the whole sticker flat. The arm stays where it is (torque on); do not change the gripper opening. Then tap "Measure fingertip".',
+  'cw.tip.measure': 'Measure fingertip', 'cw.tip.again': 'Measure again', 'cw.tip.next': 'Next: auto check', 'cw.tip.busy': 'Reading camera frames…', 'cw.tip.count': 'Frames used: {n} / 16',
+  'cw.tip.torque': 'Torque is off: turn it on, then measure (with torque off the wrist droops and the frames are not usable).', 'cw.tip.moved': 'The arm moved during the measurement',
+  'cw.tip.notfound': 'No 4 dots in the marked area ({b} found).', 'cw.tip.few': 'Only {n} usable frames, at least 8 needed.', 'cw.tip.gates': 'The fingertip measurement failed a check, see the table.',
+  'cw.tip.align': 'Align the sticker edge with the fingertip (将贴纸底边与指尖对齐). Below: the marked area of the camera image, orange circles = dots found.',
+  'cw.tip.ok': 'Fingertip (camera frame): {mm} mm', 'cw.tip.r.cam': 'Fingertip (camera)', 'cw.tip.r.end': 'Fingertip (end_link, X · tip)', 'cw.tip.r.tool': 'Tool',
+  'cw.tip.r.edge': 'sticker edge {mm} mm above the lowest point', 'cw.tip.r.noedge': 'unknown tool: sticker-edge heights only, no table height is set',
+  'cw.g.tip_frames': 'Usable frames', 'cw.g.tip_front': 'Sticker in front of the camera', 'cw.g.tip_reproj': 'Reprojection error', 'cw.g.tip_ambiguity': 'Gap to the second solution', 'cw.g.tip_std': 'Fingertip spread over frames',
+  'cw.hov.lead': 'Auto check: the arm points the fingertip down and hovers 12 mm above 4–6 corners of the board; the camera measures the real height of the fingertip above the paper.',
+  'cw.hov.hint': 'Leave the board where it is and stay at the Stop button. Tap "Plan": the camera looks at the board again and picks reachable corners; then "Start hovers". armd runs the motion; if this page loses the connection the arm parks by itself.',
+  'cw.hov.noedge': 'Unknown tool: the check runs, but reports sticker-edge heights only and sets no table height.',
+  'cw.hov.plan': 'Plan', 'cw.hov.planning': 'Looking at the board and planning…', 'cw.hov.planned': '{n} corners chosen', 'cw.hov.start': 'Start hovers', 'cw.hov.resume': 'Resume hovers',
+  'cw.hov.confirm': 'Confirm: hover again at the new table height', 'cw.hov.board': 'Too few board markers ({n}, need 4): bring the camera to where it sees the board.',
+  'cw.hov.why.reach': 'Fewer than 4 corners reachable with the fingertip down: put the board 20–35 cm in front of the base.', 'cw.hov.why.spread': 'The reachable corners do not cover both board directions: move the board closer or turn it.',
+  'cw.hov.moved': 'The board moved {mm} mm since the plan: plan again.', 'cw.hov.fpchanged': 'The calibration changed since the plan: measure the fingertip again.',
+  'cw.hov.running': 'Hovering: {ph}', 'cw.hov.measured': 'measured', 'cw.hov.pt': '{h} mm above the paper · {xy} mm off',
+  'cw.hov.pass': 'Auto check passed.', 'cw.hov.fail': 'Auto check failed, see the table.', 'cw.hov.ended': 'Hovers interrupted: {s} {c}. You can resume (check the arm first).',
+  'cw.hov.armstate': 'Arm: {tq}, fault {f}', 'cw.hov.tq.on': 'torque on', 'cw.hov.tq.off': 'torque off',
+  'cw.hov.conf.ok': 'Confirmed: largest deviation {mm} mm.', 'cw.hov.conf.bad': 'Confirmation failed: largest deviation {mm} mm (limit 3 mm).',
+  'cw.hov.r.table': 'Table height (hovers)', 'cw.hov.r.notable': 'not set (unknown tool)', 'cw.hov.r.camera': 'Table height (camera solve)', 'cw.hov.r.optical': 'Paper (optical)', 'cw.hov.r.floor': 'New floor limit', 'cw.hov.r.confirm': 'Confirmation',
+  'cw.g.hov_points': 'Corners measured', 'cw.g.hov_spread': 'Height spread (max − min)', 'cw.g.hov_xy': 'Horizontal error (max)', 'cw.g.hov_clearance': 'Lowest height above the paper', 'cw.g.hov_tool': 'Tool',
+  'cw.g.hov_tool.unknown': 'unknown', 'cw.g.hov_tool.lim': 'known sticker edge',
+  'cw.app.readback': 'The calibration read back differs from what was applied: restore the backup below.', 'cw.app.floor': 'Floor limit: {f} mm ({s})',
+  'cw.app.floor.profile': 'profile', 'cw.app.floor.calibration_camera': 'camera-solved table − 3 mm', 'cw.app.floor.calibration_hover': 'hover-measured table − 3 mm',
   'cw.mode.camera': 'Camera calibration', 'cw.mode.fine': 'Fine calibration (camera + arm geometry)',
   'cw.mode.camera.hint': 'One board placement, about 20 poses: camera intrinsics, camera mount and table height.',
   'cw.mode.fine.hint': 'Two board placements, about 35 poses each (about 8 s per pose, about 12 minutes in total). Solves the camera and a geometric correction of J2–J5 (zero offset, angle scale, joint axis tilt, origin shift). Fitted on one placement and checked on the other: Apply needs a held-out error ≤ 3 mm both ways, a mean reduction ≥ 30 % against the uncorrected model, and every parameter inside the range armd accepts.',
@@ -2911,7 +2967,7 @@ Object.assign(I18N.en, {
   'cw.f.par.title': 'Geometric correction (J1, J6 fixed at 0)', 'cw.f.par.joint': 'Joint', 'cw.f.par.off': 'Zero °', 'cw.f.par.scale': 'Scale %', 'cw.f.par.tilt': 'Axis tilt x / y °', 'cw.f.par.origin': 'Origin dx / dy / dz mm', 'cw.f.par.fixed': '(fixed)',
   'cw.f.r.tableAB': 'board A {a} / B {b} mm', 'cw.f.r.time': 'Solve', 'cw.f.r.main': 'main thread', 'cw.f.r.views': 'views',
   'cw.f.rev.hint': 'Before / after from an armd dry run. On Apply armd writes a backup, then the rebot-vision intrinsics, the camera mount, the grasp setup and the arm geometry correction; a failing step reverts the earlier ones. Writing the geometry correction needs torque off.',
-  'cw.f.torque': 'armd writes the geometry correction only with torque off and no action running: tap "Park and torque off" first.', 'cw.f.park': 'Park and torque off', 'cw.f.parking': 'Parking…', 'cw.f.parked': 'Parked, torque off',
+  'cw.f.torque': 'armd writes the geometry correction only with torque off and no action running: tap "Park and turn torque off" first.', 'cw.f.park': 'Park and turn torque off', 'cw.f.parking': 'Parking…', 'cw.f.parked': 'Parked, torque off',
   'cw.f.armed': 'armd refused: torque is on or an action is running (KINEMATICS_ARMED). Park with torque off, then apply.',
   'cw.f.fitrow': 'held-out {ab} / {ba} mm, {n} views',
   'cw.g.kin_views': 'Views per placement (smaller)', 'cw.g.kin_heldout_ab': 'Held-out error A → B', 'cw.g.kin_heldout_ba': 'Held-out error B → A', 'cw.g.kin_improve': 'Reduction vs uncorrected (mean of both)', 'cw.g.kin_bounds': 'Parameters out of range',
@@ -5352,6 +5408,8 @@ const CW_STEPS = ['board', 'place', 'capture', 'solve', 'review', 'applied'];
    Continue resumes at the next pose of the same plan. One apply carries intrinsics, camera_mount, table_z_m
    and kinematics (armd requires torque off: KINEMATICS_ARMED otherwise). */
 const CW_STEPS_FINE = ['board', 'place', 'capture', 'move', 'captureb', 'solve', 'review', 'applied'];
+// armd with calibration_verify: fingertip sticker and hover acceptance before the review (T20)
+const CW_STEPS_VERIFY = ['board', 'place', 'capture', 'move', 'captureb', 'solve', 'tip', 'hover', 'review', 'applied'];
 const CWF = { n: 35, preDeg: 0.5, maxRate: 0.25, settleRad: 0.003, settleMs: 500, settleMaxMs: 15000, dwellMs: 1500, frames: 2, clear: 0.08,
   gen: { dists: [0.20, 0.24, 0.28, 0.32, 0.36, 0.40], tilts: [0, 12, 24, 36], azimuths: 8, rolls: [0, 20, -20], minMarkers: 8, clearance: 0.10, distRange: [0.2, 0.4] } };
 const CW_SPEED = { linear: 0.03, angular: 0.3 };
@@ -5361,7 +5419,7 @@ const CWZ = { open: false, step: 'board', CW: null, markerMm: 25, thickMm: 0.5, 
   mode: 'camera', place: 0, saved: [], solving: null, settled: true,
   sessionId: null, sessionAt: null, sessionWarn: '', sessions: null, loaded: null, verify: null, X0: null };
 const cwFine = () => CWZ.mode === 'fine';
-const cwSteps = () => (cwFine() ? CW_STEPS_FINE : CW_STEPS);
+const cwSteps = () => (cwFine() ? (cwVerifyOn() ? CW_STEPS_VERIFY : CW_STEPS_FINE) : CW_STEPS);
 const cwCapStep = (k = CWZ.step) => k === 'capture' || k === 'captureb';
 const cwSupported = () => !!(S.caps && S.caps.calibration_apply);
 const cwDofOk = () => !(isSoArmProfile() || (S.armDof != null && S.armDof !== 6));
@@ -5929,7 +5987,7 @@ async function cwFineSolve() {
   if (CWZ.solving || CWZ.running) return;
   const views = CWZ.views.filter((v) => !v.err && (v.ds === 0 || v.ds === 1)).map((v) => ({ markers: v.markers, q: v.q, ds: v.ds }));
   const X0 = (CWZ.saved[0] && CWZ.saved[0].est.X) || (CWZ.est && CWZ.est.X) || CWZ.X0;
-  CWZ.solve = null; CWZ.dry = null; CWZ.verify = null; CWZ.step = 'solve'; CWZ.status = '';
+  CWZ.solve = null; CWZ.dry = null; CWZ.verify = null; CWZ.step = 'solve'; CWZ.status = ''; cwvReset();
   CWZ.solving = { t0: Date.now(), stage: '', timer: setInterval(cwRender, 1000) };
   cwRender();
   try {
@@ -6079,7 +6137,7 @@ async function cwReview() {
   if (!CWZ.solve || !CWZ.solve.ok || CWZ.busy) return;
   CWZ.busy = true; CWZ.step = 'review'; CWZ.dry = null; cwSetStatus(t('cw.rev.loading'));
   try {
-    CWZ.dry = await commandRPC('/api/v1/calibration/apply', { ...CWZ.solve.apply, dry_run: true }, true, 15000);
+    CWZ.dry = await commandRPC('/api/v1/calibration/apply', { ...cwApplyBody(), dry_run: true }, true, 15000);
     cwSetStatus('');
   } catch (e) { cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
   finally { CWZ.busy = false; cwRender(); }
@@ -6090,8 +6148,18 @@ async function cwApply() {
   if (cwFine() && S.obs && S.obs.is_torqued) { CWZ.armedUntil = 0; cwSetStatus(t('cw.f.torque'), 'warn'); return; }
   CWZ.armedUntil = 0; CWZ.busy = true; cwSetStatus(t('calib.cap.busy'));
   try {
-    CWZ.applied = await commandRPC('/api/v1/calibration/apply', { ...CWZ.solve.apply, dry_run: false }, true, 30000);
+    const body = cwApplyBody();
+    CWZ.applied = await commandRPC('/api/v1/calibration/apply', { ...body, dry_run: false }, true, 30000);
     CWZ.step = 'applied'; cwSetStatus(t('cw.app.ok'), 'ok');
+    // read back: what armd holds now must be what was applied (else restore the backup in the next step)
+    if (cwVerifyOn() && body.acceptance) {
+      try {
+        const st = await (await fetch('/api/v1/calibration', { cache: 'no-store' })).json(), c = st.calibration || {};
+        const ok = c.table_z_source === body.table_z_source && Math.abs((c.table_z_m ?? NaN) - body.table_z_m) < 1e-9 && c.acceptance && c.acceptance.fingerprint === body.acceptance.fingerprint;
+        CWZ.readback = { ok, floor: st.floor || null, verification: st.verification || null };
+        if (!ok) cwSetStatus(t('cw.app.readback'), 'warn');
+      } catch (e) { CWZ.readback = { ok: false }; cwSetStatus(t('cw.app.readback'), 'warn'); }
+    }
     if (cwFine()) loadSchema(); // the corrected model (kinematics_correction) for CALM / VIK
     toolsLoadStatus(); // a new calibration clears `stale`
   } catch (e) {
@@ -6100,6 +6168,8 @@ async function cwApply() {
   }
   finally { CWZ.busy = false; cwRender(); }
 }
+// the apply body: the candidate, with the fingertip / acceptance / hover table height once the hovers ran
+const cwApplyBody = () => (cwVerifyOn() && CWV.eval ? cwvApplyBody() : CWZ.solve.apply);
 const cwBackupName = (b) => (typeof b === 'string' ? b.split('/').filter(Boolean).pop() : '');
 async function cwRestore() {
   const name = cwBackupName(CWZ.applied && CWZ.applied.backup);
@@ -6115,6 +6185,295 @@ async function cwRestore() {
   } catch (e) { cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
   finally { CWZ.busy = false; cwRender(); }
 }
+// ---- self-service verification (T20): fingertip sticker and hover acceptance (fine mode, armd calibration_verify)
+/* After the fine solve: 'tip' measures the fingertip sticker in camera JPEGs (same-origin /api/v1/camera/snapshot,
+   decoded into a canvas of its own) with the candidate intrinsics; 'hover' plans tool-down hovers over board corners
+   with the candidate model, armd runs them (action calib_hover, a job on the device that survives a dropped page),
+   the page evaluates the recorded marker corners. Review then applies the candidate with the fingertip, the acceptance
+   and, when it passed with a known tool, the hover table height. */
+const cwVerifyOn = () => cwFine() && !!(S.caps && S.caps.calibration_verify);
+const cwExpert = () => !document.body.classList.contains('ui-simple');
+const CWV = { tip: null, tipBusy: false, roi: null, frames: 0, hover: null, plan: null, job: null, poll: null, eval: null, confirm: null, confirmJob: null, phase: '', fp: null, xfp: null, edge: null, toolId: null, base: null };
+function cwvReset() { Object.assign(CWV, { tip: null, tipBusy: false, roi: null, frames: 0, plan: null, job: null, eval: null, confirm: null, confirmJob: null, phase: '', fp: null, xfp: null, edge: null, toolId: null, base: null }); clearInterval(CWV.poll); CWV.poll = null; }
+// the candidate: intrinsics, X, kinematic parameter vectors (candidate and the model armd runs now)
+function cwvCand() {
+  const CW = CWZ.CW, r = CWZ.solve, ap = r.apply;
+  const K = r.final.K, X = r.final.X;
+  const kCand = ap.kinematics && ap.kinematics.joints ? CW.kinVector(ap.kinematics.joints) : new Array(42).fill(0);
+  const lj = CALM.correctionJoints();
+  const kLive = lj ? CW.kinVector(lj) : new Array(42).fill(0);
+  return { K, X, kCand, kLive, ch: CW.kinChain(CALM.CHAIN) };
+}
+function cwPrintSticker() {
+  const svg = CWZ.CW.stickerSvg();
+  const w = window.open('', '_blank');
+  if (!w) { toast('popup blocked', 'warn'); return; }
+  w.document.write('<!doctype html><title>reBot fingertip sticker</title><style>@page{margin:0}body{margin:0}</style>' + svg);
+  w.document.close(); w.focus(); setTimeout(() => w.print(), 300);
+}
+// FNV-1a of the JPEG bytes (repeated snapshots are dropped)
+function cwvKey(buf) { let h = 0x811c9dc5; const b = new Uint8Array(buf); for (let i = 0; i < b.length; i += 7) { h ^= b[i]; h = Math.imul(h, 0x01000193); } return (h >>> 0).toString(16) + ':' + b.length; }
+async function cwvSnapshot() {
+  const r = await fetch('/api/v1/camera/snapshot', { cache: 'no-store' });
+  if (!r.ok) throw Object.assign(new Error('snapshot ' + r.status), { code: 'SNAPSHOT' });
+  const buf = await r.arrayBuffer();
+  const bmp = await createImageBitmap(new Blob([buf], { type: 'image/jpeg' }));
+  const c = (CWV.canvas ||= document.createElement('canvas'));
+  c.width = bmp.width; c.height = bmp.height;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(bmp, 0, 0);
+  const img = ctx.getImageData(0, 0, c.width, c.height);
+  return { key: cwvKey(buf), gray: CWZ.CW.grayContent(img.data, c.width, c.height), w: c.width, h: c.height };
+}
+// ROI crop of the last frame (sticker-not-found guidance): data URL with the blobs found
+function cwvRoiImage(gray, det) {
+  const R = CWZ.CW.STICKER_ROI, w = R.x1 - R.x0, h = R.y1 - R.y0, c = document.createElement('canvas');
+  c.width = w * 2; c.height = h * 2;
+  const ctx = c.getContext('2d'), id = ctx.createImageData(w, h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const v = gray[(R.y0 + y) * 640 + R.x0 + x], i = (y * w + x) * 4; id.data[i] = id.data[i + 1] = id.data[i + 2] = v; id.data[i + 3] = 255; }
+  const t = document.createElement('canvas'); t.width = w; t.height = h; t.getContext('2d').putImageData(id, 0, 0);
+  ctx.imageSmoothingEnabled = false; ctx.drawImage(t, 0, 0, w * 2, h * 2);
+  ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2;
+  for (const b of (det && det.blobs) || []) { ctx.beginPath(); ctx.arc((b.u - R.x0) * 2, (b.v - R.y0) * 2, 8, 0, 2 * Math.PI); ctx.stroke(); }
+  return c.toDataURL('image/png');
+}
+async function cwvTipMeasure() {
+  if (CWV.tipBusy || CWZ.busy) return;
+  const CW = CWZ.CW, o = S.obs || {};
+  if (!o.is_torqued) { cwSetStatus(t('cw.tip.torque'), 'warn'); return; }
+  CWV.tipBusy = true; CWV.tip = null; CWV.roi = null; CWV.frames = 0; cwSetStatus(t('cw.tip.busy'));
+  const want = 16, frames = [];
+  let last = null, lastDet = null, tries = 0;
+  try {
+    const pos0 = o.positions.slice();
+    while (frames.length < want && tries++ < 60) {
+      const f = await cwvSnapshot();
+      const now = S.obs && S.obs.positions;
+      if (!now || pos0.slice(0, 6).some((v, i) => Math.abs(now[i] - v) > 0.003) || !(S.obs.is_torqued)) throw Object.assign(new Error(t('cw.tip.moved')), { code: 'MOVED' });
+      last = f;
+      if (CW.dedupeFrames([...frames, { key: f.key }]).length === frames.length) continue;
+      const d = CW.detectStickerDots(f.gray);
+      lastDet = d;
+      if (!d.ok) break;
+      frames.push({ key: f.key, points: d.points });
+      CWV.frames = frames.length; cwRender();
+    }
+    if (frames.length < 8) {
+      CWV.roi = last ? cwvRoiImage(last.gray, lastDet) : null;
+      CWV.tip = { ok: false, why: lastDet && !lastDet.ok ? 'dots' : 'frames', blobs: lastDet ? lastDet.blobs.length : 0 };
+      cwSetStatus(t(CWV.tip.why === 'dots' ? 'cw.tip.notfound' : 'cw.tip.few', { n: frames.length, b: CWV.tip.blobs }), 'warn');
+      return;
+    }
+    const { K } = cwvCand();
+    const res = CW.measureTip(frames.map((f) => f.points), K, { gates: { ...CW.STICKER_GATES, minFrames: 8 } });
+    res.opening = o.gripper && Number.isFinite(o.gripper.fraction) ? +o.gripper.fraction.toFixed(3) : null;
+    CWV.tip = res;
+    if (!res.ok) { CWV.roi = cwvRoiImage(last.gray, lastDet); cwSetStatus(t('cw.tip.gates'), 'warn'); return; }
+    // the candidate's fingerprints from armd (dry runs): x_fingerprint binds the tip, fingerprint the hovers
+    const base = { ...CWZ.solve.apply, dry_run: true };
+    const d1 = await commandRPC('/api/v1/calibration/apply', base, true, 15000);
+    CWV.xfp = d1.after && d1.after.x_fingerprint;
+    let toolId = 'unknown_tool';
+    try { const st = await (await fetch('/api/v1/calibration', { cache: 'no-store' })).json(); if (st.calibration_tool && st.calibration_tool.tool_id) toolId = st.calibration_tool.tool_id; } catch (_) {}
+    const tool = { tool_id: toolId, tip_cam_m: res.tip_cam_m.map((v) => +v.toFixed(6)), gripper_opening: res.opening, x_fingerprint: CWV.xfp,
+      fit: { frames: res.frames, reproj_px: +res.reprojPx.toFixed(3), gap_px: +res.gapPx.toFixed(3), std_mm: +res.stdMm.toFixed(3) } };
+    const d2 = await commandRPC('/api/v1/calibration/apply', { ...base, tool }, true, 15000);
+    CWV.fp = d2.after && d2.after.fingerprint;
+    CWV.edge = d2.after && d2.after.tool ? d2.after.tool.edge_to_low_m : null;
+    CWV.tool = tool; CWV.toolId = toolId;
+    cwSetStatus(t('cw.tip.ok', { mm: (res.tip_cam_m.map((v) => (v * 1000).toFixed(1))).join(', ') }), 'ok');
+  } catch (e) { cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
+  finally { CWV.tipBusy = false; cwRender(); }
+}
+// re-observe the stationary board at the current pose with the candidate camera -> T_base_board
+async function cwvBoardNow() {
+  const CW = CWZ.CW, v = await cwCapture();
+  if (v.err) throw Object.assign(new Error(t('cw.skip.' + (v.err === 'moved' ? 'moved' : 'det'))), { code: 'BOARD' });
+  const { K, X, kCand, ch } = cwvCand();
+  const fit = CW.fitBoardPose(v.markers, cwBoard(), K);
+  if (!fit || v.markers.length < 4) throw Object.assign(new Error(t('cw.hov.board', { n: v.markers.length })), { code: 'BOARD' });
+  return { Tbb: CW.mul(CW.mul(CW.kinPose(ch, cwModelQ(v.joints), kCand), X), fit.T), markers: v.markers.length, q: cwModelQ(v.joints) };
+}
+async function cwvPlan() {
+  if (CWZ.busy) return;
+  const CW = CWZ.CW;
+  CWZ.busy = true; cwSetStatus(t('cw.hov.planning'));
+  try {
+    const b = await cwvBoardNow();
+    const { K, X, kCand, kLive, ch } = cwvCand();
+    const { lo, hi } = modelLimits6();
+    const plan = CW.planHover({ Tbb: b.Tbb, X, tipCam: CWV.tool.tip_cam_m, edgeToLow: CWV.edge, ch, kCand, kLive, q0: b.q, K, board: cwBoard(), lo, hi });
+    CWV.plan = { ...plan, Tbb: b.Tbb, at: Date.now() };
+    CWV.base = b;
+    cwSetStatus(plan.ok ? t('cw.hov.planned', { n: plan.points.length }) : t('cw.hov.why.' + plan.why), plan.ok ? 'ok' : 'warn');
+  } catch (e) { cwSetStatus(t('cw.err', { m: e.message }), 'warn'); }
+  finally { CWZ.busy = false; cwRender(); }
+}
+function cwvBody(points) {
+  return { candidate_fingerprint: CWV.fp, rpy_rad: points[0].rpy_rad, approach_speed_mps: 0.04, descent_speed_mps: 0.01, settle_s: 2.5, frames: 3, discard: 2,
+    points: points.map((p) => ({ id: p.id, approach_m: p.approach_m.map((v) => +v.toFixed(5)), hover_m: p.hover_m.map((v) => +v.toFixed(5)), rpy_rad: p.rpy_rad })) };
+}
+async function cwvStart(confirm = false, resume = null) {
+  if (CWZ.busy) return;
+  CWZ.busy = true; CWV.phase = confirm ? 'confirm' : 'hover';
+  try {
+    let body;
+    if (resume) {
+      // resume: back to the pose the plan looked at the board from (torque on first, e.g. after the watchdog park),
+      // the board must still be where the plan saw it and the candidate unchanged
+      if (!(S.obs && S.obs.is_torqued)) { await commandRPC('/api/v1/torque', { enable: true }, true, 5000); await cwSleep(800); }
+      const { kLive, ch } = cwvCand();
+      CWV.phase = 'view';
+      await cwMove(CWZ.CW.kinPose(ch, CWV.base.q, kLive));
+      await cwSettle();
+      CWV.phase = 'hover';
+      const b = await cwvBoardNow();
+      const d = Math.hypot(...[0, 1, 2].map((k) => b.Tbb[k][3] - CWV.plan.Tbb[k][3]));
+      if (d > 0.003) throw Object.assign(new Error(t('cw.hov.moved', { mm: (d * 1000).toFixed(1) })), { code: 'BOARD_MOVED' });
+      const dr = await commandRPC('/api/v1/calibration/apply', { ...CWZ.solve.apply, tool: CWV.tool, dry_run: true }, true, 15000);
+      if (!dr.after || dr.after.fingerprint !== CWV.fp) throw Object.assign(new Error(t('cw.hov.fpchanged')), { code: 'FINGERPRINT' });
+      body = { resume };
+    } else if (confirm) {
+      const { K, X, kCand, kLive, ch } = cwvCand(), { lo, hi } = modelLimits6();
+      const cp = CWZ.CW.planHover({ Tbb: CWV.plan.Tbb, X, tipCam: CWV.tool.tip_cam_m, edgeToLow: CWV.edge, ch, kCand, kLive, q0: CWV.base.q, K, board: cwBoard(), lo, hi, tableZ: CWV.eval.table_z_m, plan: { ...CWZ.CW.HOVER_PLAN, count: 2, minCount: 1 } });
+      if (!cp.points.length) throw Object.assign(new Error(t('cw.hov.why.reach')), { code: 'PLAN' });
+      CWV.confirmPlan = cp;
+      body = cwvBody(cp.points);
+    } else body = cwvBody(CWV.plan.points);
+    const ack = await commandRPC(CALIB_HOVER_PATH, body, true, 8000);
+    const id = ack.job_id;
+    if (confirm) { CWV.confirmJob = { id, state: 'running' }; CWV.confirm = null; } else { CWV.job = { id, state: 'running' }; CWV.eval = null; CWV.confirm = null; }
+    cwvPoll();
+  } catch (e) { CWV.phase = ''; cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
+  finally { CWZ.busy = false; cwRender(); }
+}
+const CALIB_HOVER_PATH = '/api/v1/action/calib_hover';
+// the job lives on the device: poll it (a lost WebSocket only pauses the page; armd ends or parks on its own)
+function cwvPoll() {
+  clearInterval(CWV.poll);
+  CWV.poll = setInterval(async () => {
+    const which = CWV.phase === 'confirm' ? 'confirmJob' : 'job';
+    const j = CWV[which];
+    if (!j || !j.id) { clearInterval(CWV.poll); CWV.poll = null; return; }
+    try {
+      const r = await fetch('/api/v1/calibration/hover/' + encodeURIComponent(j.id), { cache: 'no-store' });
+      if (!r.ok) return;
+      const job = await r.json();
+      CWV[which] = job;
+      if (job.state !== 'running') { clearInterval(CWV.poll); CWV.poll = null; CWV.phase = ''; cwvEvaluate(which); }
+      if (CWZ.step === 'hover') cwRender();
+    } catch (_) { /* offline: keep polling */ }
+  }, 600);
+}
+function cwvEvaluate(which) {
+  const CW = CWZ.CW, job = CWV[which];
+  const { K, X, kCand, ch } = cwvCand(), board = cwBoard();
+  const plan = which === 'confirmJob' ? CWV.confirmPlan : CWV.plan;
+  const pts = job.points.map((p) => {
+    const pl = plan.points.find((x) => x.id === p.id);
+    if (p.state !== 'done') return { id: p.id, ok: false, skipped: p.state, code: p.code };
+    const q = cwModelQ(p.settled_joints || p.observations[p.observations.length - 1].joints);
+    const r = CW.hoverPoint({ observations: p.observations, board, K, tipCam: CWV.tool.tip_cam_m, edgeToLow: CWV.edge, target: pl && pl.corner, Tend: CW.kinPose(ch, q, kCand), X });
+    return { id: p.id, ...r };
+  });
+  if (which === 'confirmJob') { CWV.confirm = { ...CW.confirmHovers(pts, CW.HOVER_PLAN.clearanceM), pts }; cwSetStatus(t(CWV.confirm.ok ? 'cw.hov.conf.ok' : 'cw.hov.conf.bad', { mm: cwFmt(CWV.confirm.worst_m * 1000, 1) }), CWV.confirm.ok ? 'ok' : 'warn'); return; }
+  CWV.pts = pts;
+  CWV.eval = CW.evaluateHovers(pts, { edgeToLow: CWV.edge });
+  const ended = job.state === 'done' ? '' : t('cw.hov.ended', { s: job.state, c: job.code || '' });
+  cwSetStatus(ended || t(CWV.eval.ok ? 'cw.hov.pass' : 'cw.hov.fail'), !ended && CWV.eval.ok ? 'ok' : 'warn');
+}
+function cwvApplyBody() {
+  if (!CWV.eval || !CWV.tool) return CWZ.solve.apply;
+  return CWZ.CW.verifiedApplyBody(CWZ.solve.apply, { tool: CWV.tool, fingerprint: CWV.fp, evaluation: CWV.eval, points: CWV.pts, board: cwBoard(),
+    jobId: CWV.job && CWV.job.id, confirm: CWV.confirm, measuredAt: new Date().toISOString() });
+}
+// sticker placement illustration: finger side view, sticker flush with the tip
+const CWV_ILLU = '<svg viewBox="0 0 220 90" width="220" height="90" role="img" aria-label="sticker"><path d="M10 20 L150 30 L205 70 L200 78 L140 55 L10 60 Z" fill="#cbd5e1" stroke="#475569"/>'
+  + '<path d="M150 30 L205 70 L200 78 L148 42 Z" fill="#fff" stroke="#111" stroke-width="1"/><path d="M205 70 L200 78" stroke="#111" stroke-width="3"/>'
+  + '<circle cx="176" cy="52" r="2.5"/><circle cx="168" cy="46" r="2.5"/><text x="120" y="88" font-size="10" fill="#475569">▲ tip / 指尖</text></svg>';
+// gate row of the fingertip / hover gates (non-blocking gates are shown as a note)
+function cwvGateRow(key, g, unit, scale, pre) {
+  const tr = document.createElement('tr');
+  const v = typeof g.value === 'number' ? (Number.isInteger(g.value) ? String(g.value) : cwFmt(g.value * scale, scale === 1000 ? 1 : 3)) + unit : t('cw.g.' + key + '.' + g.value) || String(g.value);
+  const lim = typeof g.limit === 'number' ? pre + (+(g.limit * scale).toPrecision(3)) + unit : t('cw.g.' + key + '.lim');
+  tr.append(cwEl('td', '', t('cw.g.' + key)), cwEl('td', g.ok ? 'ok' : g.blocking === false ? 'note' : 'bad', (g.ok ? '✓ ' : g.blocking === false ? '· ' : '✗ ') + v), cwEl('td', '', lim));
+  return tr;
+}
+function cwRenderTip(body, p, acts) {
+  const CW = CWZ.CW, tip = CWV.tip;
+  p(t('cw.tip.lead'), 'cwiz-lead');
+  p(t('cw.tip.hint'));
+  const ill = cwEl('div', 'cwiz-illu'); ill.innerHTML = CWV_ILLU; body.appendChild(ill);
+  if (CWV.tipBusy) body.appendChild(cwEl('div', 'calib-count mono', t('cw.tip.count', { n: CWV.frames })));
+  if (tip && !tip.ok) {
+    body.appendChild(cwEl('div', 'cwiz-msg', t('cw.tip.align')));
+    if (CWV.roi) { const im = document.createElement('img'); im.src = CWV.roi; im.alt = 'ROI'; im.className = 'cwiz-roi'; im.id = 'cwiz-tip-roi'; body.appendChild(im); }
+  }
+  if (tip && tip.gates) body.appendChild(cwTable([t('cw.th.check'), t('cw.th.value'), t('cw.th.limit')], tip.gates.map((g) => cwvGateRow('tip_' + g.key, g,
+    g.key === 'std' ? ' mm' : g.key === 'frames' || g.key === 'front' ? '' : ' px', 1, g.key === 'frames' || g.key === 'ambiguity' ? '≥ ' : g.key === 'front' ? '= ' : '≤ '))));
+  if (tip && tip.ok) {
+    const box = cwEl('div', 'calib-result mono');
+    const row = (k, v) => { const d = cwEl('div', 'row'); d.append(cwEl('span', '', k), cwEl('span', '', v)); box.appendChild(d); };
+    row(t('cw.tip.r.cam'), tip.tip_cam_m.map((v) => (v * 1000).toFixed(2)).join(', ') + ' mm');
+    const te = CW.posOf(CW.mul(cwvCand().X, CW.make([[1, 0, 0], [0, 1, 0], [0, 0, 1]], tip.tip_cam_m)));
+    row(t('cw.tip.r.end'), te.map((v) => (v * 1000).toFixed(1)).join(', ') + ' mm');
+    row(t('cw.tip.r.tool'), (CWV.toolId || '--') + ' · ' + (CWV.edge != null ? t('cw.tip.r.edge', { mm: (CWV.edge * 1000).toFixed(1) }) : t('cw.tip.r.noedge')));
+    if (cwExpert()) row('fingerprint', (CWV.xfp || '--') + ' / ' + (CWV.fp || '--'));
+    body.appendChild(box);
+  }
+  acts(cwBtn(t('cw.back'), () => { CWZ.step = 'solve'; CWZ.status = ''; cwRender(); }, { cls: 'act-back', disabled: CWV.tipBusy }),
+    cwBtn(t('cw.board.sticker'), cwPrintSticker, { id: 'cwiz-sticker' }),
+    cwBtn(t(tip ? 'cw.tip.again' : 'cw.tip.measure'), cwvTipMeasure, { cls: tip && tip.ok ? '' : 'btn-primary', disabled: CWV.tipBusy || CWZ.busy, id: 'cwiz-tip-measure' }),
+    tip && tip.ok && CWV.fp ? cwBtn(t('cw.tip.next'), () => { CWZ.step = 'hover'; CWZ.status = ''; cwRender(); }, { cls: 'btn-primary', id: 'cwiz-tip-next' }) : null);
+}
+function cwRenderHover(body, p, acts) {
+  const CW = CWZ.CW, job = CWV.job, running = !!(job && job.state === 'running') || !!(CWV.confirmJob && CWV.confirmJob.state === 'running');
+  p(t('cw.hov.lead'), 'cwiz-lead');
+  p(t('cw.hov.hint'));
+  if (CWV.edge == null) body.appendChild(cwEl('div', 'cwiz-msg', t('cw.hov.noedge')));
+  if (CWV.plan && CWV.plan.points.length) {
+    const ol = cwEl('ol', 'calib-list mono cwiz-poses');
+    CWV.plan.points.forEach((pt, i) => {
+      const jp = job && job.points ? job.points.find((x) => x.id === pt.id) : null;
+      const ev = CWV.pts && CWV.pts.find((x) => x.id === pt.id);
+      const st = jp ? jp.state : 'pending';
+      const li = cwEl('li', st === 'done' ? 'ok' : st === 'skipped' || st === 'failed' ? 'skip' : '');
+      let txt = `${(pt.corner[0] * 1000).toFixed(0)}, ${(pt.corner[1] * 1000).toFixed(0)} mm · `;
+      if (ev && ev.ok) txt += t('cw.hov.pt', { h: cwFmt(((ev.height_m ?? ev.edge_height_m)) * 1000, 1), xy: cwFmt(Math.hypot(...ev.xy_err_m) * 1000, 1) }) + (cwExpert() ? ` · edge ${cwFmt(ev.edge_height_m * 1000, 1)} mm · ${ev.frames} fr · ${cwFmt(ev.reproj_px, 2)} px` : '');
+      else if (st === 'skipped' || st === 'failed') txt += t('cw.pose.skip', { why: jp.code || st }) + (cwExpert() && jp.message ? ' · ' + jp.message : '');
+      else txt += t(st === 'done' ? 'cw.hov.measured' : 'cw.pose.pending');
+      li.append(cwEl('b', '', '#' + (i + 1)), cwEl('span', '', txt));
+      ol.appendChild(li);
+    });
+    body.appendChild(ol);
+  }
+  if (running) body.appendChild(cwEl('div', 'calib-count mono', t('cw.hov.running', { ph: (S.obs && S.obs.action && S.obs.action.phase) || '…' })));
+  const ev = CWV.eval;
+  if (ev) {
+    body.appendChild(cwTable([t('cw.th.check'), t('cw.th.value'), t('cw.th.limit')], ev.gates.map((g) => cwvGateRow('hov_' + g.key, g,
+      g.key === 'points' ? '' : ' mm', g.key === 'points' ? 1 : 1000, g.key === 'points' ? '≥ ' : g.key === 'clearance' ? '> ' : g.key === 'tool' ? '' : '≤ '))));
+    const box = cwEl('div', 'calib-result mono' + (ev.ok ? '' : ' warn'));
+    const row = (k, v) => { const d = cwEl('div', 'row'); d.append(cwEl('span', '', k), cwEl('span', '', v)); box.appendChild(d); };
+    row(t('cw.hov.r.table'), ev.table_z_m != null ? (ev.table_z_m * 1000).toFixed(1) + ' mm' : t('cw.hov.r.notable'));
+    row(t('cw.hov.r.camera'), (CWZ.solve.apply.table_z_m * 1000).toFixed(1) + ' mm');
+    if (ev.optical_table_z_m != null) row(t('cw.hov.r.optical'), (ev.optical_table_z_m * 1000).toFixed(1) + ' mm');
+    row(t('cw.hov.r.floor'), ev.table_z_m != null ? ((ev.table_z_m - 0.003) * 1000).toFixed(1) + ' mm' : '--');
+    if (CWV.confirm) row(t('cw.hov.r.confirm'), (CWV.confirm.ok ? '✓ ' : '✗ ') + cwFmt(CWV.confirm.worst_m * 1000, 1) + ' mm');
+    body.appendChild(box);
+  }
+  const ended = job && job.state && job.state !== 'running' && job.state !== 'done';
+  if (ended && job.arm) body.appendChild(cwEl('div', 'cwiz-msg', t('cw.hov.armstate', { tq: t(job.arm.is_torqued ? 'cw.hov.tq.on' : 'cw.hov.tq.off'), f: job.arm.fault ? (job.arm.fault.code || 'fault') : '--' })));
+  const canConfirm = ev && ev.ok && ev.table_z_m != null && !CWV.confirm && !running;
+  acts(cwBtn(t('cw.back'), () => { CWZ.step = 'tip'; CWZ.status = ''; cwRender(); }, { cls: 'act-back', disabled: running || CWZ.busy }),
+    cwBtn(t('cw.hov.plan'), cwvPlan, { disabled: running || CWZ.busy, id: 'cwiz-hov-plan', cls: CWV.plan ? '' : 'btn-primary' }),
+    CWV.plan && CWV.plan.ok && !ev && !ended ? cwBtn(t('cw.hov.start'), () => cwvStart(false), { cls: 'btn-primary', disabled: running || CWZ.busy, id: 'cwiz-hov-start' }) : null,
+    ended ? cwBtn(t('cw.hov.resume'), () => cwvStart(false, job.id), { cls: 'btn-primary', disabled: CWZ.busy, id: 'cwiz-hov-resume' }) : null,
+    canConfirm ? cwBtn(t('cw.hov.confirm'), () => cwvStart(true), { cls: 'btn-primary', disabled: CWZ.busy, id: 'cwiz-hov-confirm' }) : null,
+    // review after a finished run; primary only when the check passed (and was confirmed when it gives a table height)
+    ev && job && job.state === 'done' && (!canConfirm || CWV.confirm)
+      ? cwBtn(t('cw.solve.review'), cwReview, { cls: ev.ok && (!CWV.confirm || CWV.confirm.ok) ? 'btn-primary wide' : '', disabled: running || CWZ.busy, id: 'cwiz-review' }) : null);
+}
+
 function cwExport() {
   const out = { kind: 'rebot_calibration_wizard', version: 1, created: new Date().toISOString(), mode: CWZ.mode, board: { cols: 4, rows: 3, marker_side_m: CWZ.markerMm / 1000, gap_ratio: 0.2, thickness_m: CWZ.thickMm / 1000 },
     views: CWZ.views.map(({ G, ...v }) => ({ ...v, T_base_end: G })), plan: CWZ.plan.map((p) => ({ T: p.T, q: p.q, dist: p.dist, tiltDeg: p.tiltDeg, azDeg: p.azDeg, rollDeg: p.rollDeg, state: p.state, why: p.why })),
@@ -6192,6 +6551,13 @@ function cwDiffRows(before, after) {
   add('camera_mount.q_end_cam', ['camera_mount', 'q_end_cam']);
   add('camera_mount.tilt_deg', ['camera_mount', 'tilt_deg'], 'deg');
   for (const [k, u] of [['fx_px'], ['fy_px'], ['cx_px'], ['cy_px'], ['table_z_m', 'mm'], ['camera_tilt_deg', 'deg']]) add('grasp.' + k, ['grasp', k], u);
+  // self-service verification (armd dry runs with calibration_verify): table height source, fingertip, acceptance, floor
+  if (after && after.x_fingerprint) {
+    add('table_z_source', ['table_z_source']);
+    add('tool.tip_cam_m', ['tool', 'tip_cam_m'], 'mm');
+    add('acceptance.passed', ['acceptance', 'passed']);
+    add('floor.effective_floor_z_m', ['floor', 'effective_floor_z_m'], 'mm');
+  }
   // armd's grip pixel of the new camera model; outside [0, 1] it keeps grip_pixel_norm (camera-down acquisition)
   const gm = after && after.grip_pixel_model;
   if (Array.isArray(gm) && gm.some((v) => !(v >= 0 && v <= 1))) {
@@ -6212,6 +6578,8 @@ function cwCanGoto(k) {
   if (cwFine() && k === 'move') return false;
   if (k === 'capture') return CWZ.plan.length > 0;
   if (k === 'solve') return !!CWZ.solve;
+  if (k === 'tip') return !!CWZ.solve && !(CWV.job && CWV.job.state === 'running');
+  if (k === 'hover') return !!(CWV.tip && CWV.tip.ok && CWV.fp);
   return k === 'board' || k === 'place';
 }
 function cwGoto(k) {
@@ -6227,6 +6595,7 @@ function cwGoto(k) {
     CWZ.views = []; CWZ.plan = []; CWZ.idx = 0; CWZ.est = null; CWZ.refined = false; CWZ.solve = null; CWZ.dry = null; CWZ.applied = null; CWZ.ownAction = null;
     CWZ.place = 0; CWZ.saved = [];
     CWZ.sessionId = null; CWZ.sessionAt = null; CWZ.sessionWarn = ''; CWZ.loaded = null; CWZ.verify = null; CWZ.X0 = null;
+    cwvReset();
   }
   if (!CWZ.running) CWZ.search = null;
   CWZ.resetArm = null; CWZ.armedUntil = 0; CWZ.step = k; CWZ.status = ''; cwRender(); cwV3Sync();
@@ -6308,7 +6677,8 @@ function cwRenderFineSolve(body, p, acts) {
   for (const wn of kin.warnings || []) body.appendChild(cwEl('div', 'cwiz-msg cwiz-zero', wn.key === 'accuracy' ? t('cw.f.acc', { mm: wn.mm.toFixed(1), lim: wn.limit.toFixed(0) }) : t('cw.f.zero', { j: wn.joint, d: wn.deg.toFixed(1) })));
   if (!r.ok) body.appendChild(cwEl('div', 'cwiz-msg', t('cw.f.fail')));
   acts(cwBtn(t('cw.solve.run'), cwFineSolve, { id: 'cwiz-solve-again' }), cwBtn(t('cw.solve.export'), cwExport), cwRestartBtn(),
-    cwBtn(t('cw.solve.review'), cwReview, { cls: 'btn-primary wide', disabled: !r.ok || CWZ.busy, id: 'cwiz-review' }));
+    cwVerifyOn() ? cwBtn(t('cw.f.toTip'), () => { CWZ.step = 'tip'; CWZ.status = ''; cwRender(); }, { cls: 'btn-primary wide', disabled: !r.ok || CWZ.busy, id: 'cwiz-totip' })
+      : cwBtn(t('cw.solve.review'), cwReview, { cls: 'btn-primary wide', disabled: !r.ok || CWZ.busy, id: 'cwiz-review' }));
 }
 /* action rows: see the .act-row CSS. A row is the buttons of one container; rows that also hold inputs, selects or text
    stay as they are. Runs on every change of the drawer bodies (MutationObserver) and on resize. */
@@ -6345,7 +6715,7 @@ function cwRender() {
   if (!CWZ.open) return;
   const steps = $('cwiz-steps'), body = $('cwiz-body');
   steps.textContent = '';
-  $('cwiz-stop').hidden = !cwCapStep() && !(CWZ.search && CWZ.search.running); // Stop stays in the footer (visible also when collapsed)
+  $('cwiz-stop').hidden = !cwCapStep() && !(CWZ.search && CWZ.search.running) && CWZ.step !== 'hover' && CWZ.step !== 'tip'; // Stop stays in the footer (visible also when collapsed)
   const stepList = cwSteps(), si = stepList.indexOf(CWZ.step);
   stepList.forEach((k, i) => {
     const li = cwEl('li', i === si ? 'on' : i < si ? 'done' : '', t((cwFine() ? 'cw.fstep.' : 'cw.step.') + k));
@@ -6366,7 +6736,7 @@ function cwRender() {
     // mode: camera only (as before) or fine calibration (camera + arm geometry); fixed once views exist
     const md = cwEl('div', 'cwiz-mode'); md.setAttribute('role', 'group');
     for (const m of ['camera', 'fine']) {
-      const b = cwBtn(t('cw.mode.' + m), () => { if (CWZ.views.length) return; CWZ.mode = m; CWZ.status = ''; cwRender(); }, { id: 'cwiz-mode-' + m, disabled: CWZ.views.length > 0 && CWZ.mode !== m });
+      const b = cwBtn(t('cw.mode.' + m), () => { if (CWZ.views.length) return; CWZ.mode = m; CWZ.modeChosen = true; CWZ.status = ''; cwRender(); }, { id: 'cwiz-mode-' + m, disabled: CWZ.views.length > 0 && CWZ.mode !== m });
       b.setAttribute('aria-pressed', String(CWZ.mode === m)); if (CWZ.mode === m) b.classList.add('on');
       md.appendChild(b);
     }
@@ -6379,7 +6749,7 @@ function cwRender() {
       const i = document.createElement('input'); i.type = 'number'; i.id = id; i.step = step; i.value = String(val); i.inputMode = 'decimal'; d.appendChild(i); body.appendChild(d); return i;
     };
     const iSide = field(t('cw.board.side'), 'cwiz-side', CWZ.markerMm, '0.1'), iTh = field(t('cw.board.thick'), 'cwiz-thick', CWZ.thickMm, '0.1');
-    acts(cwBtn(t('cw.board.print'), cwPrint), cwBtn(t('cw.sess.load'), cwSessionList, { id: 'cwiz-load', disabled: CWZ.views.length > 0 || !!(CWZ.sessions && CWZ.sessions.busy) }), cwBtn(t('cw.next'), () => {
+    acts(cwBtn(t('cw.board.print'), cwPrint), cwVerifyOn() ? cwBtn(t('cw.board.sticker'), cwPrintSticker, { id: 'cwiz-sticker-b' }) : null, cwBtn(t('cw.sess.load'), cwSessionList, { id: 'cwiz-load', disabled: CWZ.views.length > 0 || !!(CWZ.sessions && CWZ.sessions.busy) }), cwBtn(t('cw.next'), () => {
       const a = Number(iSide.value), b = Number(iTh.value);
       if (!(a >= 20 && a <= 100 && b >= 0 && b <= 10)) { cwSetStatus(t('cw.board.bad'), 'warn'); return; }
       CWZ.markerMm = a; CWZ.thickMm = b; CWZ.board = cwBoard(); CWZ.step = 'place'; CWZ.status = ''; cwRender();
@@ -6472,6 +6842,10 @@ function cwRender() {
     );
   } else if (CWZ.step === 'solve' && cwFine()) {
     cwRenderFineSolve(body, p, acts);
+  } else if (CWZ.step === 'tip') {
+    cwRenderTip(body, p, acts);
+  } else if (CWZ.step === 'hover') {
+    cwRenderHover(body, p, acts);
   } else if (CWZ.step === 'solve') {
     const r = CWZ.solve;
     p(t('cw.solve.hint'));
@@ -6516,6 +6890,8 @@ function cwRender() {
     body.appendChild(cwTable([t('cw.th.field'), t('cw.th.after'), ''], [...cwDiffRows(a, a), ...(cwFine() ? cwKinRows(a, a) : [])].map((tr) => { tr.className = ''; tr.lastChild.textContent = ''; return tr; })));
     const vi = a.vision_intrinsics;
     if (vi && vi.revision != null) p('rebot-vision revision ' + vi.revision);
+    const rb = CWZ.readback;
+    if (rb && rb.floor) p(t('cw.app.floor', { f: cwFmt(rb.floor.effective_floor_z_m * 1000, 1), s: t('cw.app.floor.' + rb.floor.source) }));
     const armed = Date.now() < CWZ.armedUntil;
     acts(cwBtn(t(armed ? 'cw.app.restore.confirm' : 'cw.app.restore'), cwRestore, { disabled: CWZ.busy || !a.backup || !!a.restoredFrom, id: 'cwiz-restore', cls: armed ? 'armed' : 'act-back' }), cwRestartBtn(),
       cwBtn(t('cw.app.done'), () => cwOpen(false), { cls: 'btn-primary' }));
@@ -6531,6 +6907,8 @@ function cwOpen(open) {
   clearInterval(CWZ.live); CWZ.live = null;
   CWZ.jog = false; $('cwiz-panel').classList.remove('jog'); $('cwiz-jogbar').hidden = true;
   if (open) {
+    // armd with the self-service verification: the fine calibration (with fingertip and auto check) is the default
+    if (S.caps && S.caps.calibration_verify && !CWZ.views.length && !CWZ.modeChosen && CWZ.step === 'board') CWZ.mode = 'fine';
     $('cwiz-panel').classList.remove('min');
     cwRender();
     // live marker count on the place step (and in the jog bar)
