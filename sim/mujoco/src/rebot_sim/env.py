@@ -10,10 +10,18 @@ import mujoco
 import numpy as np
 
 from .camera import CameraMount
-from .domain_rand import ActionDelayBuffer, DomainRandomizationConfig, DomainRandomizer
+from .domain_rand import (
+    ActionDelayBuffer,
+    DomainRandomizationConfig,
+    DomainRandomizer,
+    validate_seed,
+)
 from .model import load_model
 from .pack import PackScene, load_scene_pack, load_tool_pack
 from .server import Motors
+
+_OBS_SEED_SALT = 0x44525F4F4253  # "DR_OBS"
+_IMG_SEED_SALT = 0x44525F494D47  # "DR_IMG"
 
 
 def _is_real_scalar(val: Any) -> bool:
@@ -175,11 +183,13 @@ class SimEnv:
         self._randomizer: DomainRandomizer | None = None
         self._action_delay_buffer: ActionDelayBuffer | None = None
         self._obs_rng: np.random.Generator | None = None
+        self._img_rng: np.random.Generator | None = None
         if self.dr_config is not None:
             self._randomizer = DomainRandomizer(self.model, self.dr_config)
             self._action_delay_buffer = ActionDelayBuffer(0)
             if self.dr_config.enabled:
                 self._obs_rng = np.random.default_rng()
+                self._img_rng = np.random.default_rng()
 
     @property
     def domain_randomizer(self) -> DomainRandomizer | None:
@@ -225,28 +235,36 @@ class SimEnv:
             self.renderer.update_scene(self.data, camera=self.render_camera)
             obs["image"] = self.renderer.render()
         if self._randomizer is not None and self.dr_config is not None and self.dr_config.enabled:
-            rng = self._obs_rng if self._obs_rng is not None else np.random.default_rng()
-            obs = self._randomizer.apply_obs_noise(obs, rng)
+            obs_rng = self._obs_rng if self._obs_rng is not None else np.random.default_rng()
+            obs = self._randomizer.apply_obs_noise(obs, obs_rng)
             if "image" in obs:
-                obs["image"] = self._randomizer.apply_image_noise(obs["image"], rng)
+                img_rng = self._img_rng if self._img_rng is not None else np.random.default_rng()
+                obs["image"] = self._randomizer.apply_image_noise(obs["image"], img_rng)
         return obs
 
     def reset(self, seed: int | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
         """Reset arm joints to home neutral pose, reset scene objects, IO, and return (obs, info)."""
+        seed = validate_seed(seed)
         dr_params: dict[str, Any] | None = None
         if self._randomizer is not None and self.dr_config is not None:
             if self.dr_config.enabled:
-                dr_params = self._randomizer.apply(self.model, seed=seed, data=self.data)
-                self._obs_rng = (
-                    np.random.default_rng(np.random.SeedSequence(seed).spawn(1)[0])
-                    if seed is not None
-                    else np.random.default_rng()
-                )
+                dr_params = self._randomizer.apply(self.model, seed=seed)
+                if seed is not None:
+                    self._obs_rng = np.random.default_rng(
+                        np.random.SeedSequence([seed, _OBS_SEED_SALT])
+                    )
+                    self._img_rng = np.random.default_rng(
+                        np.random.SeedSequence([seed, _IMG_SEED_SALT])
+                    )
+                else:
+                    self._obs_rng = np.random.default_rng()
+                    self._img_rng = np.random.default_rng()
                 if self._action_delay_buffer is not None:
                     self._action_delay_buffer.reset(delay_steps=dr_params["action_delay_steps"])
             else:
-                self._randomizer.restore_baseline(self.model, data=self.data)
+                self._randomizer.restore_baseline(self.model)
                 self._obs_rng = None
+                self._img_rng = None
                 if self._action_delay_buffer is not None:
                     self._action_delay_buffer.reset(delay_steps=0)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import FrozenInstanceError
 
 import numpy as np
 import pytest
@@ -128,7 +129,7 @@ def test_twenty_resets_and_restore_baseline_zero_drift() -> None:
             dr_env.step(action)
 
         # Direct restore_baseline
-        dr_env.domain_randomizer.restore_baseline(dr_env.model, data=dr_env.data)
+        dr_env.domain_randomizer.restore_baseline(dr_env.model)
         restored = _snapshot_model(dr_env.model)
         for field in _BASELINE_FIELDS:
             assert np.array_equal(restored[field], baseline[field]), f"drift in {field}"
@@ -310,26 +311,35 @@ def test_obs_and_image_noise_bounds_and_non_mutation() -> None:
         {"friction_scale_range": (-0.1, 1.0)},
         {"friction_scale_range": (1.0,)},
         {"friction_scale_range": (math.nan, 1.0)},
+        {"friction_scale_range": (1e308, 1e308)},
         {"mass_scale_range": (0.0, 1.2)},
         {"mass_scale_range": (-0.5, 1.2)},
         {"mass_scale_range": (1.2, 0.8)},
+        {"mass_scale_range": (1e308, 1e308)},
         {"damping_scale_range": (-0.1, 1.0)},
         {"damping_scale_range": (1.2, 0.8)},
+        {"damping_scale_range": (1e308, 1e308)},
         {"action_delay_steps_range": (2, 0)},
         {"action_delay_steps_range": (-1, 2)},
+        {"action_delay_steps_range": (0, 1001)},
+        {"action_delay_steps_range": (2**63, 2**63)},
         {"action_delay_steps_range": (0.5, 2.0)},
         {"action_delay_steps_range": (False, True)},
         {"obs_pos_noise_std": -0.001},
+        {"obs_pos_noise_std": 1e40},
         {"obs_pos_noise_std": math.inf},
         {"obs_pos_noise_std": True},
         {"obs_vel_noise_std": -0.1},
+        {"obs_vel_noise_std": 1e40},
         {"cam_pos_jitter_m": -0.01},
         {"cam_rot_jitter_deg": -1.0},
         {"light_intensity_scale_range": (-0.1, 1.0)},
         {"light_intensity_scale_range": (1.5, 0.5)},
+        {"light_intensity_scale_range": (1e308, 1e308)},
         {"image_brightness_delta": -5.0},
         {"image_contrast_scale_range": (-0.2, 1.2)},
         {"image_contrast_scale_range": (1.2, 0.8)},
+        {"image_contrast_scale_range": (1e308, 1e308)},
         {"image_noise_std": -1.0},
     ],
 )
@@ -348,3 +358,172 @@ def test_invalid_delay_buffer_and_env_args_fail_closed() -> None:
 
     with pytest.raises(TypeError):
         SimEnv(scene="pcb_suction", tool="suction", dr_config={"enabled": True})  # type: ignore[arg-type]
+
+
+def test_config_is_frozen_immutable() -> None:
+    cfg = DomainRandomizationConfig()
+    with pytest.raises(FrozenInstanceError):
+        cfg.mass_scale_range = (-1.0, 1.0)  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        cfg.enabled = False  # type: ignore[misc]
+
+
+def test_restore_baseline_and_invalid_seed_do_not_mutate_caller_data_or_model() -> None:
+    cfg = DomainRandomizationConfig()
+    with SimEnv(scene="pcb_suction", tool="suction", dr_config=cfg) as env:
+        assert env.domain_randomizer is not None
+        _, info = env.reset(seed=11)
+        assert info["dr_params"]["seed"] == 11
+        model_before = _snapshot_model(env.model)
+
+        env.data.qpos[0] = 0.7
+        env.data.qvel[0] = 0.8
+        qpos_before = env.data.qpos.copy()
+        qvel_before = env.data.qvel.copy()
+
+        # Invalid seed must fail closed before touching model or caller data
+        with pytest.raises(ValueError):
+            env.reset(seed=-1)
+        with pytest.raises(ValueError):
+            env.domain_randomizer.apply(env.model, seed=True)  # type: ignore[arg-type]
+
+        assert np.array_equal(env.data.qpos, qpos_before)
+        assert np.array_equal(env.data.qvel, qvel_before)
+        for field in _BASELINE_FIELDS:
+            assert np.array_equal(getattr(env.model, field), model_before[field])
+
+        # restore_baseline must not mutate caller data.qpos/qvel via mj_setConst
+        env.domain_randomizer.restore_baseline(env.model)
+        assert np.array_equal(env.data.qpos, qpos_before)
+        assert np.array_equal(env.data.qvel, qvel_before)
+
+        # apply(model, seed) must also leave caller data untouched
+        env.domain_randomizer.apply(env.model, seed=22)
+        assert np.array_equal(env.data.qpos, qpos_before)
+        assert np.array_equal(env.data.qvel, qvel_before)
+
+
+def test_dr_rng_is_decoupled_from_scene_default_rng() -> None:
+    cfg = DomainRandomizationConfig()
+    with SimEnv(scene="pcb_suction", tool="suction", dr_config=cfg) as env:
+        _, info = env.reset(seed=42)
+        raw_rng = np.random.default_rng(42)
+        raw_first_draws = raw_rng.uniform(*cfg.friction_scale_range, size=env.model.ngeom)
+        assert not np.allclose(info["dr_params"]["friction_scales"], raw_first_draws)
+
+
+def test_obs_and_image_noise_rng_streams_are_independent() -> None:
+    cfg = DomainRandomizationConfig()
+    action = np.array([0.1, -0.2, 0.15, 0.0, 0.05, -0.05, 0.0], dtype=np.float64)
+    with (
+        SimEnv(
+            scene="pcb_suction",
+            tool="suction",
+            render_camera=None,
+            dr_config=cfg,
+        ) as env_headless,
+        SimEnv(
+            scene="pcb_suction",
+            tool="suction",
+            render_camera="policy_cam",
+            render_width=160,
+            render_height=120,
+            dr_config=cfg,
+        ) as env_cam,
+    ):
+        obs_h, info_h = env_headless.reset(seed=55)
+        obs_c, info_c = env_cam.reset(seed=55)
+        assert "image" not in obs_h and "image" in obs_c
+        assert info_h["dr_params"]["friction_scales"] == info_c["dr_params"]["friction_scales"]
+        assert np.array_equal(obs_h["state"], obs_c["state"])
+        assert np.array_equal(obs_h["velocity"], obs_c["velocity"])
+
+        for _ in range(4):
+            sh, _, _, _ = env_headless.step(action)
+            sc, _, _, _ = env_cam.step(action)
+            assert np.array_equal(sh["state"], sc["state"])
+            assert np.array_equal(sh["velocity"], sc["velocity"])
+
+
+def test_obs_noise_nonfinite_overflow_and_delay_buffer_atomic_errors() -> None:
+    cfg = DomainRandomizationConfig(obs_pos_noise_std=0.1, obs_vel_noise_std=0.1)
+    with SimEnv(scene="pcb_suction", tool="suction") as env:
+        rand = DomainRandomizer(env.model, cfg)
+        rng = np.random.default_rng(0)
+        with pytest.raises(ValueError, match="non-finite"):
+            rand.apply_obs_noise({"state": np.array([1e40], dtype=np.float64)}, rng)
+        with pytest.raises(ValueError, match="non-finite"):
+            rand.apply_obs_noise({"velocity": np.array([np.nan], dtype=np.float32)}, rng)
+
+    # ActionDelayBuffer must not mutate or clear queue on invalid reset/push
+    buf = ActionDelayBuffer(delay_steps=2)
+    a0 = np.array([1.0, 2.0])
+    a1 = np.array([3.0, 4.0])
+    assert np.array_equal(buf.push(a0), np.zeros(2))
+    assert np.array_equal(buf.push(a1), np.zeros(2))
+    assert len(buf) == 2
+
+    with pytest.raises(ValueError):
+        buf.reset(delay_steps=-1)
+    assert len(buf) == 2 and buf.delay_steps == 2
+
+    with pytest.raises(ValueError):
+        buf.push(np.array([5.0, 6.0]), default_action=np.array([0.0]))
+    assert len(buf) == 2
+
+    with pytest.raises(ValueError):
+        buf.push(np.array([5.0, 6.0, 7.0]))
+    assert len(buf) == 2
+
+    with pytest.raises(ValueError):
+        buf.push(np.array([np.nan, 6.0]))
+    assert len(buf) == 2
+
+    # Valid next push still yields a0 untouched
+    assert np.array_equal(buf.push(np.array([5.0, 6.0])), a0)
+
+
+def test_apply_rejects_mass_overflow_without_mutating_model() -> None:
+    cfg = DomainRandomizationConfig(mass_scale_range=(2.0, 2.0))
+    with SimEnv(scene="pcb_suction", tool="suction") as env:
+        rand = DomainRandomizer(env.model, cfg)
+        rand._baseline["body_mass"][1] = 1e308
+        env.model.body_mass[1] = 1e308
+        before = _snapshot_model(env.model)
+        with pytest.raises(ValueError, match="non-finite"):
+            rand.apply(env.model, seed=1)
+        after = _snapshot_model(env.model)
+        for field in _BASELINE_FIELDS:
+            assert np.array_equal(after[field], before[field]), f"mutated {field} on overflow"
+
+
+def test_reset_validates_seed_without_dr_and_normalizes_np_int() -> None:
+    with SimEnv(scene="pcb_suction", tool="suction", dr_config=None) as env:
+        obs_py, info_py = env.reset(seed=42)
+        env.data.qpos[0] = 0.7
+        env.data.qvel[0] = 0.8
+        qpos_before = env.data.qpos.copy()
+        qvel_before = env.data.qvel.copy()
+
+        for bad_seed in (-1, True, False, 1.5, "42"):
+            with pytest.raises(ValueError):
+                env.reset(seed=bad_seed)  # type: ignore[arg-type]
+            assert np.array_equal(env.data.qpos, qpos_before)
+            assert np.array_equal(env.data.qvel, qvel_before)
+
+        obs_np, info_np = env.reset(seed=np.int64(42))  # type: ignore[arg-type]
+        assert info_np == info_py
+        assert np.array_equal(obs_np["state"], obs_py["state"])
+        assert np.array_equal(obs_np["velocity"], obs_py["velocity"])
+
+    with SimEnv(
+        scene="pcb_suction",
+        tool="suction",
+        dr_config=DomainRandomizationConfig(),
+    ) as dr_env:
+        obs_py, info_py = dr_env.reset(seed=42)
+        obs_np, info_np = dr_env.reset(seed=np.int64(42))  # type: ignore[arg-type]
+        assert type(info_np["dr_params"]["seed"]) is int
+        assert info_np == info_py
+        assert np.array_equal(obs_np["state"], obs_py["state"])
+        assert np.array_equal(obs_np["velocity"], obs_py["velocity"])
