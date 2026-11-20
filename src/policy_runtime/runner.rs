@@ -636,7 +636,10 @@ pub fn spawn_policy_runner(
                             frame.as_ref().and_then(|f| f.captured_at),
                             Some(frame_id),
                         ),
-                        VisionStepDecision::Hold => continue,
+                        VisionStepDecision::Hold => {
+                            supervisor.inner().write().await.hold_policy_run(action_id);
+                            continue;
+                        }
                         VisionStepDecision::Stop { reason, message } => {
                             let mut inner = supervisor.inner().write().await;
                             inner.fail_policy_run(action_id, reason, message);
@@ -724,7 +727,10 @@ pub fn spawn_policy_runner(
                             );
                             break;
                         }
-                        VisionStalePolicy::Hold => continue,
+                        VisionStalePolicy::Hold => {
+                            inner.hold_policy_run(action_id);
+                            continue;
+                        }
                     }
                 }
                 Some(age_ms)

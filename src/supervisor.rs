@@ -5667,6 +5667,17 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// Vision hold of a live run: drop its servo target so the control loop brakes now
+    /// (instead of tracking the last target until the motion-frame timeout). The next target
+    /// is checked against the measured pose with the first-step limit.
+    pub fn hold_policy_run(&mut self, action_id: u64) {
+        let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id && r.mode == crate::policy_runtime::PolicyMode::Live) else { return; };
+        run.last_live_target = None;
+        self.servo_target = None;
+        self.servo_settled_ticks.fill(0);
+        self.target_positions = self.commanded_positions.clone();
+    }
+
     /// Set the run's [`crate::policy_runtime::max_policy_input_age_ms`] bound.
     pub fn set_policy_max_input_age(&mut self, action_id: u64, max_ms: u64) {
         if let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) {

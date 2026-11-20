@@ -2765,7 +2765,7 @@ mod phase2_vision {
         VisionStalePolicy, VisionTargetLostPolicy, MAX_VISION_STALENESS_MS,
     };
 
-    fn make_detection(label: &str, score: f64, box_norm: [f64; 4]) -> Detection {
+    pub(super) fn make_detection(label: &str, score: f64, box_norm: [f64; 4]) -> Detection {
         Detection {
             label: label.to_string(),
             score,
@@ -2786,7 +2786,7 @@ mod phase2_vision {
         }
     }
 
-    struct MockVisionSource {
+    pub(super) struct MockVisionSource {
         handler: Arc<
             dyn Fn(u64, u64) -> BoxFuture<'static, Result<Option<PolicyVisionFrame>, String>>
                 + Send
@@ -2807,7 +2807,7 @@ mod phase2_vision {
             })
         }
 
-        fn new_async<F>(f: F) -> Arc<Self>
+        pub(super) fn new_async<F>(f: F) -> Arc<Self>
         where
             F: Fn(u64, u64) -> BoxFuture<'static, Result<Option<PolicyVisionFrame>, String>>
                 + Send
@@ -2831,7 +2831,7 @@ mod phase2_vision {
     }
 
     /// Weights matrix [6 x 12]: output[i] = proprio[i] + 0.1 * vision[i]
-    fn make_12_to_6_layers() -> Vec<MlpLayerSpec> {
+    pub(super) fn make_12_to_6_layers() -> Vec<MlpLayerSpec> {
         let mut weights = vec![0.0f32; 6 * 12];
         for r in 0..6 {
             weights[r * 12 + r] = 1.0;
@@ -6246,4 +6246,80 @@ mod review_fix_tests {
         assert_eq!(obs.positions, start, "the arm moved on a stale target");
         assert_eq!(obs.action.as_ref().and_then(|a| a.code.as_deref()), Some("STALE_INPUT"));
     }
+
+    /// Item 3: when the runner holds on stale vision, the live target is dropped at once and
+    /// the arm brakes; it does not keep tracking the last target.
+    #[tokio::test]
+    async fn stale_vision_hold_brakes_immediately() {
+        use super::phase2_vision::{make_12_to_6_layers, make_detection, MockVisionSource};
+        use armd::grasp::BoxFuture;
+        use armd::policy_runtime::PolicyVisionFrame;
+        use std::sync::atomic::AtomicBool;
+        let dir = tempdir().unwrap();
+        write_rmlp_pack(dir.path(), &["j1", "j2", "j3", "j4", "j5", "j6"], "rad", &make_12_to_6_layers(),
+            serde_json::json!({"vision": {"source": "detector", "layout": "top1_box_norm_v1", "max_staleness_ms": 150, "on_stale": "hold"}}));
+        let mut cfg = make_6dof_config();
+        // slow joints: the arm cannot catch up with the target, so it is still tracking one
+        // when the frames go stale
+        for l in &mut cfg.limits { l.max_velocity = 0.3; }
+        let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let (id, epoch) = begin_live(&sup, "conn-vhold", &prepared).await;
+        let stale = Arc::new(AtomicBool::new(false));
+        let stale_c = stale.clone();
+        let src = MockVisionSource::new_async(move |after, _| {
+            let stale = stale_c.load(Ordering::SeqCst);
+            let fut: BoxFuture<'static, Result<Option<PolicyVisionFrame>, String>> = Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(Some(PolicyVisionFrame {
+                    frame_id: after + 1,
+                    captured_at: Some(if stale { Instant::now() - Duration::from_secs(1) } else { Instant::now() }),
+                    detections: vec![make_detection("cube", 0.9, [0.6, 0.4, 0.9, 0.6])],
+                    model_generation: Some(1),
+                }))
+            });
+            fut
+        });
+        let runner = spawn_policy_runner(sup.clone(), id, prepared, 20.0, compute_policy_deadline(Some(3.0)).unwrap(), Some(src));
+        // move for a while
+        for _ in 0..25 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = sup.heartbeat("conn-vhold", epoch).await;
+            sup.tick(0.02).await;
+        }
+        let moving = sup.inner().read().await.commanded_velocities[0];
+        assert!(moving.abs() > 0.05, "arm should be moving before the hold, v={moving} {:?} {:?}", sup.get_observation().await.policy, sup.get_observation().await.action);
+        stale.store(true, Ordering::SeqCst);
+        // the runner sees the stale frame within a period or two (well before the 200 ms
+        // motion-frame timeout that would otherwise drop the target)
+        let t_stale = Instant::now();
+        let mut held = false;
+        while t_stale.elapsed() < Duration::from_millis(130) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = sup.heartbeat("conn-vhold", epoch).await;
+            if sup.inner().read().await.servo_target.is_none() { held = true; break; }
+            sup.tick(0.02).await;
+        }
+        assert!(held, "stale-vision hold left the servo target in place");
+        // from here on, every tick brakes: |v| never grows and reaches zero
+        let mut prev = sup.inner().read().await.commanded_velocities[0].abs();
+        let mut speeds = vec![prev];
+        for _ in 0..30 {
+            let _ = sup.heartbeat("conn-vhold", epoch).await;
+            sup.tick(0.02).await;
+            let inner = sup.inner().read().await;
+            assert!(inner.servo_target.is_none(), "a target came back during the hold");
+            let v = inner.commanded_velocities[0].abs();
+            speeds.push(v);
+            assert!(v <= prev + 1e-4, "speed grew during the hold: {speeds:?}");
+            prev = v;
+            drop(inner);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(prev < 1e-3, "arm did not stop during the hold: {speeds:?}");
+        assert!(sup.get_observation().await.policy.unwrap().active, "hold keeps the run active");
+        sup.inner().write().await.stop_policy_run(Some(id), "STOPPED");
+        let _ = runner.await;
+    }
 }
+
