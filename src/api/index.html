@@ -1100,6 +1100,10 @@ kbd { display: inline-block; min-width: 20px; padding: 1px 5px; margin-right: 2p
 .toast.warn::before { background: #faad14; }
 
 /* ---------- lease preemption ---------- */
+.btn.btn-park-off { width: 100%; flex-direction: column; gap: 2px; justify-content: center; margin-top: 8px; min-height: 48px; font-weight: 600; }
+.btn.btn-park-off small { font-size: 11px; font-weight: 500; color: var(--sc-color-text-secondary); }
+.btn.btn-park-off.holding { border-color: var(--sc-color-primary); background: var(--sc-status-normal-bg); }
+.btn.btn-park-off[hidden] { display: none; }
 .btn.btn-preempt { width: 100%; justify-content: center; margin-top: 8px; color: var(--sc-status-warning-fg); border-color: #ffd591; background: var(--sc-status-warning-bg); font-weight: 600; }
 .btn.btn-preempt:hover { color: var(--sc-status-warning-fg); border-color: #faad14; }
 .btn-preempt .preempt-lbl { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.2; }
@@ -1850,6 +1854,10 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
             <span><span data-i18n="estop">急停</span><small>E-STOP</small></span>
           </button>
         </div>
+        <!-- after a fault / E-stop clear with the motors still holding: park and torque off (the enable switch resumes) -->
+        <button class="btn btn-park-off" id="btn-park-off" type="button" hidden>
+          <span data-i18n="en.park_off">停靠并卸力</span><small data-i18n="en.park_off.sub">按住 0.6 秒：回到收纳位后关闭力矩</small>
+        </button>
         <!-- estimated supply load (observation.power): both modes -->
         <div class="pwr" id="pwr" role="meter" aria-valuemin="0" aria-valuemax="120" aria-valuenow="0" data-i18n-aria="pwr.aria" aria-label="电源负载（估算）" hidden>
           <span class="pwr-lbl" data-i18n="pwr.label">电源负载</span>
@@ -2396,6 +2404,7 @@ const I18N = {
     'gc.x.GRAVITY_COMP_JOINT_LIMIT': '关节接近限位：已锁定位置', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': '重力模型不可用：已锁定位置', 'gc.x.other': '已退出拖动示教：{m}',
     'en.enable': '使能', 'en.holding': '保持中 · 按住恢复', 'en.hold': '按住 0.6 秒', 'en.reset_estop': '⚠️ 点击复位急停', 'en.clear_fault': '⚠️ 点击清除故障', 'en.on_unconfirmed': '控制已开启 · 未确认',
     'en.sub_reset': '复位后再长按使能', 'en.sub_off': '按住 0.6 秒失能',
+    'en.park_off': '停靠并卸力', 'en.park_off.sub': '按住 0.6 秒：回到收纳位后关闭力矩', 'toast.reset_holding': '已复位，电机仍在保持机械臂：长按「使能」恢复控制，或长按「停靠并卸力」',
     'estop': '急停', 'estop.aria': '紧急停止',
     'lock.offline': '遥测断开，控制已锁定', 'lock.observer': '当前为观察模式，其他页面可能正在控制', 'lock.observer_who': '观察模式：{who}正在控制机械臂',
     'preempt.who': '控制方：{who}', 'who.cockpit': '另一个驾驶舱页面', 'who.agent': 'AI 智能体（{id}）', 'who.other': '其他客户端', 'who.named': '客户端 {id}',
@@ -2590,6 +2599,7 @@ const I18N = {
     'gc.x.GRAVITY_COMP_JOINT_LIMIT': 'Joint near its limit: pose held', 'gc.x.GRAVITY_MODEL_UNAVAILABLE': 'Gravity model unavailable: pose held', 'gc.x.other': 'Hand-guiding ended: {m}',
     'en.enable': 'Enable', 'en.holding': 'Holding · hold to resume', 'en.hold': 'Hold 0.6 s', 'en.reset_estop': '⚠️ Tap to reset E-Stop', 'en.clear_fault': '⚠️ Tap to clear fault', 'en.on_unconfirmed': 'On · unconfirmed',
     'en.sub_reset': 'Then hold to enable', 'en.sub_off': 'Hold 0.6 s to disable',
+    'en.park_off': 'Park and turn torque off', 'en.park_off.sub': 'Hold 0.6 s: move to the rest pose, then torque off', 'toast.reset_holding': 'Reset done; the motors still hold the arm. Hold Enable to resume, or hold "Park and turn torque off"',
     'estop': 'E-Stop', 'estop.aria': 'Emergency stop',
     'lock.offline': 'Telemetry lost, controls locked', 'lock.observer': 'Observer mode: another page may be in control', 'lock.observer_who': 'Observer mode: {who} is controlling the arm',
     'preempt.who': 'Held by {who}', 'who.cockpit': 'another cockpit page', 'who.agent': 'an AI agent ({id})', 'who.other': 'another client', 'who.named': 'client {id}',
@@ -8028,7 +8038,7 @@ $('input-seg').addEventListener('click', (e) => { const b = e.target.closest('bu
 /* clear E-stop / fault (shared by the enable button and the status bar) */
 function clearFault() {
   return api('/api/v1/safety/clear_fault')
-    .then(() => toast(t('toast.reset_ok'), 'ok'))
+    .then((d) => toast(t(d && d.is_torqued ? 'toast.reset_holding' : 'toast.reset_ok'), 'ok'))
     .catch(() => {}); // api() already toasted
 }
 
@@ -8123,6 +8133,22 @@ async function disableTorque({ fallback = true } = {}) {
       }
       setTimeout(() => { inflight = false; }, 300);
     }, 600);
+  });
+  for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) btn.addEventListener(ev, cancel);
+  btn.addEventListener('contextmenu', (e) => e.preventDefault());
+})();
+// Park and turn torque off from the hold after a clear (safety Idle, torque on): hold 600 ms. armd re-arms
+// through its verified enable path, parks at the resting pose and turns torque off.
+(() => {
+  const btn = $('btn-park-off');
+  let timer = null;
+  const cancel = () => { clearTimeout(timer); timer = null; btn.classList.remove('holding'); };
+  btn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    if (unloading) return;
+    if (!isLive()) return toast(lockReason(), 'err');
+    btn.classList.add('holding');
+    timer = setTimeout(() => { cancel(); buzz(20); releaseAll(); toast(t('toast.stowing'), 'info'); controlledUnload(); }, 600);
   });
   for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) btn.addEventListener(ev, cancel);
   btn.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -11979,6 +12005,7 @@ function frame(ts) {
   eb.setAttribute('aria-checked', String(en));
   // After a fault is cleared the motors may still hold the arm (safety Idle, torque on): say so.
   const holdingIdle = live && !stopped && !en && S.state === 'Idle' && torqued;
+  $('btn-park-off').hidden = !holdingIdle || leaseOther() != null;
   setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop') : t('en.clear_fault')) : en ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
   setText($('enable-sub'), stopped ? t('en.sub_reset') : en ? t('en.sub_off') : t('en.hold'));
   eb.disabled = !live || leaseOther() != null;

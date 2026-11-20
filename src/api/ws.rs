@@ -123,7 +123,7 @@ fn execute_command(inner: &mut SupervisorInner, path: &str, body: &Value, epoch:
             if !inner.supports_automatic_unload() {
                 return Err(ArmError::Unsupported("Automatic unload requires a resting-pose profile and velocity, torque and enable-state feedback; no motion was started".into()).into());
             }
-            if !inner.safety.state().is_operational() {
+            if !inner.safety.state().is_operational() && !inner.holding_after_clear() {
                 return Err(ArmError::Safety(SafetyError::NotArmed(inner.safety.state().clone())).into());
             }
             let id = inner.unload_action()?;

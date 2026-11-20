@@ -2820,8 +2820,21 @@ impl SupervisorInner {
     /// Start a park (NormalUnload) and record it as a `park` action. Returns its id when
     /// the park started.
     /// A park whose path enters a keep-out box is `WORKSPACE_VIOLATION`.
+    /// After a fault or E-stop clear the motors may still hold the arm: safety Idle, torque on,
+    /// re-arm pending (clear_fault keeps the hold rather than drop an arm that is not at rest).
+    pub fn holding_after_clear(&self) -> bool {
+        self.is_torqued && self.pending_rearm && !self.disable_pending
+            && matches!(self.safety.state(), SafetyState::Idle)
+            && !self.e_stop_latched.load(Ordering::SeqCst)
+    }
+
     pub fn unload_action(&mut self) -> Result<Option<u64>, ArmError> {
         self.park_rejection = None;
+        // A park from the hold after a clear re-arms through the verified enable path first (fresh
+        // feedback, commanded = measured); without it NormalUnload keeps holding and parks nothing.
+        if self.holding_after_clear() {
+            self.set_torque(true)?;
+        }
         self.execute_stop(StopPolicy::NormalUnload);
         if let Some(e) = self.park_rejection.take() { return Err(e.into()); }
         if !self.pending_normal_unload { return Ok(None); }
