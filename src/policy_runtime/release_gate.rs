@@ -593,7 +593,7 @@ mod tests {
         cfg.dof = 6;
         cfg.joint_names = (1..=6).map(|i| format!("j{i}")).collect();
         cfg.limits = (1..=6)
-            .map(|i| JointLimit::new(&format!("j{i}"), -2.0, 2.0, 2.0, 10.0))
+            .map(|i| JointLimit::new(format!("j{i}"), -2.0, 2.0, 2.0, 10.0))
             .collect();
         cfg
     }

@@ -544,6 +544,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // golden vectors were generated with limits ±3.14
     fn so101_norm_7dof_with_reversed_gripper_matches_python_golden_vectors() {
         let limits = vec![
             lim("j1", -2.6, 2.6),

@@ -214,7 +214,7 @@ mod tests {
     }
 
     fn pb_int(field: u64, v: u64, out: &mut Vec<u8>) {
-        pb_varint((field << 3) | 0, out);
+        pb_varint(field << 3, out);
         pb_varint(v, out);
     }
 

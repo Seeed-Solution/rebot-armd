@@ -32,7 +32,7 @@ fn make_6dof_config() -> ArmConfig {
     cfg.dof = 6;
     cfg.joint_names = (1..=6).map(|i| format!("j{i}")).collect();
     cfg.limits = (1..=6)
-        .map(|i| JointLimit::new(&format!("j{i}"), -2.0, 2.0, 2.0, 10.0))
+        .map(|i| JointLimit::new(format!("j{i}"), -2.0, 2.0, 2.0, 10.0))
         .collect();
     cfg.home_positions = vec![0.0; 6];
     cfg.lease_timeout_ms = 5_000;
@@ -2563,7 +2563,7 @@ mod tract_e2e {
         }
     }
     fn pb_int(field: u64, v: u64, out: &mut Vec<u8>) {
-        pb_varint((field << 3) | 0, out);
+        pb_varint(field << 3, out);
         pb_varint(v, out);
     }
     fn pb_bytes(field: u64, data: &[u8], out: &mut Vec<u8>) {

@@ -236,7 +236,7 @@ enum ActionStart {
     Sequence(Box<crate::sequences::RunPlan>),
     CalibHover(Box<crate::calib_hover::HoverPlan>),
     #[cfg(feature = "policy-runtime")]
-    Policy(PendingPolicyStart),
+    Policy(Box<PendingPolicyStart>),
     #[cfg(feature = "policy-runtime")]
     PolicyStopped(bool),
 }
@@ -369,12 +369,12 @@ fn prepare_action(
                 request.i_am_at_the_arm,
                 epoch,
             )?;
-            return Ok(ActionStart::Policy(PendingPolicyStart {
+            return Ok(ActionStart::Policy(Box::new(PendingPolicyStart {
                 request,
                 config: inner.config.clone(),
                 epoch,
                 policy_live_allowed: inner.policy_live_allowed(),
-            }));
+            })));
         }
         #[cfg(feature = "policy-runtime")]
         "/api/v1/action/policy/stop" => {
@@ -1112,7 +1112,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             Ok(ActionStart::Policy(p)) => {
                                                 inner.policy_loading = true;
                                                 let loading_guard = PolicyLoadingGuard::new(recv_supervisor.clone());
-                                                pending_policy = Some((value["request_id"].clone(), p, local_generation, loading_guard));
+                                                pending_policy = Some((value["request_id"].clone(), *p, local_generation, loading_guard));
                                                 None
                                             }
                                             #[cfg(feature = "policy-runtime")]

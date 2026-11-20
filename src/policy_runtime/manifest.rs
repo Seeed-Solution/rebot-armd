@@ -1410,7 +1410,7 @@ mod tests {
         }
         let mut tensor = Vec::new();
         encode_ld(8, b"ext_w", &mut tensor);
-        encode_varint((14 << 3) | 0, &mut tensor); // data_location = field 14, wire 0
+        encode_varint(14 << 3, &mut tensor); // data_location = field 14, wire 0
         encode_varint(1, &mut tensor); // EXTERNAL = 1
         let mut graph = Vec::new();
         encode_ld(5, &tensor, &mut graph); // initializer = field 5
