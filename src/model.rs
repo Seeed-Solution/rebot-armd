@@ -641,6 +641,11 @@ pub struct GripperPolicy {
     /// never further. Absent: contact from the following error only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact_torque_nm: Option<f32>,
+    /// Bound on how far the gripper command may run ahead of the measured jaw in the closing
+    /// direction (rad), torque on and fresh feedback, so a blocked jaw cannot build a large
+    /// position error. Absent: no bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lead_rad: Option<f32>,
 }
 
 impl GripperPolicy {
@@ -666,6 +671,8 @@ impl GripperPolicy {
             max_close_torque_nm: Some(1.0),
             // same log: 1.3x the free-close peak, below the first contact sample (0.85)
             contact_torque_nm: Some(0.6),
+            // free close at 1 rad/s lags 0.21-0.23 rad behind the command (same log)
+            max_lead_rad: Some(0.35),
         }
     }
 
@@ -1457,8 +1464,8 @@ impl ArmConfig {
                 }
             }
             let positive = |v: Option<f32>| v.is_none_or(|v| v.is_finite() && v > 0.0);
-            if !positive(g.max_close_torque_nm) || !positive(g.contact_torque_nm) {
-                return Err("Invalid gripper policy: max_close_torque_nm and contact_torque_nm must be positive".into());
+            if !positive(g.max_close_torque_nm) || !positive(g.contact_torque_nm) || !positive(g.max_lead_rad) {
+                return Err("Invalid gripper policy: max_close_torque_nm, contact_torque_nm and max_lead_rad must be positive".into());
             }
             if let (Some(cap), Some(contact)) = (g.max_close_torque_nm, g.contact_torque_nm) {
                 if contact >= cap {

@@ -339,6 +339,42 @@ fn free_close_detects_no_contact() {
     assert!(inner.measured_positions[6] > -0.1);
 }
 
+fn max_lead() -> f32 { GripperPolicy::rebot_dm().max_lead_rad.unwrap() }
+
+/// Item 3: a servo stream to closed against a rigid block: the command stays within
+/// max_lead_rad of the measured jaw (it ran to the end of the stroke before).
+#[test]
+fn blocked_servo_stream_lead_is_capped() {
+    let mut config = ArmConfig::rebot_dm();
+    // without the cap and the stall latch tripping first the lead cap alone bounds the error
+    if let Some(p) = config.gripper_policy.as_mut() { p.max_close_torque_nm = None; }
+    let (mut inner, rig) = rig_with(config, Load::Rigid(-2.0, 0.2));
+    let epoch = inner.safety.epoch_id();
+    let mut target = INSPECT.to_vec();
+    target[6] = 0.0;
+    reset_stats(&rig);
+    for _ in 0..(6.0 / DT) as usize {
+        inner.servo(target.clone(), epoch).unwrap();
+        inner.tick(DT);
+    }
+    let r = rig.lock().unwrap();
+    eprintln!("blocked servo: max lead {:.3} rad, J7 {:.3}", r.max_lead, r.q[6]);
+    assert!(r.max_lead <= max_lead() + 1e-4, "lead {}", r.max_lead);
+    assert!((r.q[6] + 2.0).abs() < 1e-3);
+}
+
+/// The lead cap does not stop a free open / close at 1 rad/s (lag 0.23 rad on the rig).
+#[test]
+fn lead_cap_leaves_free_motion_alone() {
+    let (mut inner, rig) = rig(Load::Free);
+    let epoch = inner.safety.epoch_id();
+    let (id, _) = inner.start_gripper(close(false), epoch).unwrap();
+    let a = run(&mut inner, id, 12.0);
+    assert_eq!(a.state, "done", "{a:?}");
+    assert!(inner.measured_positions[6] > -0.06);
+    assert!(rig.lock().unwrap().max_lead < max_lead());
+}
+
 /// The contact stop only takes a grasp command back: an open ramps its command (no jump to open).
 #[test]
 fn open_command_ramps() {

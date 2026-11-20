@@ -3776,6 +3776,25 @@ impl SupervisorInner {
         self.safety.trigger_fault_coded(FaultCode::ServoNoBrake, reason);
     }
 
+    /// Gripper lead cap (`gripper_policy.max_lead_rad`): with torque on and fresh feedback the
+    /// gripper command stays within the bound ahead of the measured position in the closing
+    /// direction, whatever wrote it (macro
+    /// gripper moves, servo streams, whole-arm references, gravity compensation), so a blocked
+    /// jaw cannot build a large position error.
+    fn gripper_lead_cap(&mut self) {
+        let (Some(g), Some(lead)) = (self.config.gripper_index(), self.config.gripper_policy.as_ref().and_then(|p| p.max_lead_rad)) else { return; };
+        if self.driver.is_none() || !self.is_torqued || !self.hardware_feedback_fresh(Duration::from_millis(100)) { return; }
+        let (Some(&meas), Some(&cmd)) = (self.measured_positions.get(g), self.commanded_positions.get(g)) else { return; };
+        if !meas.is_finite() || !cmd.is_finite() { return; }
+        // closing direction only: an open ends on the open stop, nothing to crush there
+        let dir = self.config.gripper_policy.as_ref().map_or(1.0, |p| if p.closed_rad >= p.open_rad { 1.0 } else { -1.0 });
+        if (cmd - meas) * dir > lead {
+            let capped = meas + dir * lead;
+            let l = &self.config.limits[g];
+            self.commanded_positions[g] = capped.clamp(l.min_position, l.max_position);
+        }
+    }
+
     /// J7 stall freeze for whole-arm references. A joint quintic (park, home, presets), path or
     /// replay writes all seven joints each tick; without this a J7 target past an object in the
     /// jaw is driven at full motor torque (the stall latch alone is overwritten next tick, and
@@ -4709,6 +4728,7 @@ impl SupervisorInner {
             }
         }
 
+        self.gripper_lead_cap();
         for i in 0..self.config.dof {
             self.commanded_accelerations[i] = if self.safety.state().is_stopped() { 0.0 }
                 else { (self.commanded_velocities[i] - before_velocities[i]) / servo_dt as f32 };
