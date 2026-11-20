@@ -24,7 +24,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { actRowsCheck } from './act_rows_check.mjs';
+import { actRowsCheck, stepBarCheck } from './act_rows_check.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
@@ -177,6 +177,7 @@ for (const [vpName, viewport] of (process.env.FINE_ONLY ? [] : VIEWS)) {
       }));
       if (!info.open || info.raw || info.hscroll) fail(`${step} ${lang}/${vpName}: ${JSON.stringify(info)}`);
       const rows = await page.evaluate(actRowsCheck, '#cwiz-panel, #cwiz-jogbar');
+      rows.push(...(await page.evaluate(stepBarCheck)));
       if (rows.length) fail(`action rows ${step} ${lang}/${vpName}: ${rows.join(' | ')}`);
       const file = path.join(out, `cwiz_${step}_${lang}_${vpName}.png`);
       await page.screenshot({ path: file });
@@ -398,6 +399,7 @@ for (const [vpName, viewport] of VIEWS) {
         raw: /\bcw\.[a-z]/.test($('cwiz-panel').innerText), hscroll: $('cwiz-panel').scrollWidth > $('cwiz-panel').clientWidth + 1 }));
       if (!info.open || info.raw || info.hscroll) fail(`fine ${step} ${lang}/${vpName}: ${JSON.stringify(info)}`);
       const rows = await page.evaluate(actRowsCheck, '#cwiz-panel, #cwiz-jogbar');
+      rows.push(...(await page.evaluate(stepBarCheck)));
       if (rows.length) fail(`action rows ${step} ${lang}/${vpName}: ${rows.join(' | ')}`);
       const file = path.join(out, `cwiz_fine_${step}_${lang}_${vpName}.png`);
       await page.screenshot({ path: file });
@@ -613,6 +615,7 @@ for (const [vpName, viewport] of VIEWS) {
         raw: /\bcw\.[a-z]/.test($('cwiz-panel').innerText), hscroll: $('cwiz-panel').scrollWidth > $('cwiz-panel').clientWidth + 1 }));
       if (!info.open || info.raw || info.hscroll) fail(`load ${step} ${lang}/${vpName}: ${JSON.stringify(info)}`);
       const rows = await page.evaluate(actRowsCheck, '#cwiz-panel, #cwiz-jogbar');
+      rows.push(...(await page.evaluate(stepBarCheck)));
       if (rows.length) fail(`action rows ${step} ${lang}/${vpName}: ${rows.join(' | ')}`);
       const file = path.join(out, `cwiz_load_${step}_${lang}_${vpName}.png`);
       await page.screenshot({ path: file });

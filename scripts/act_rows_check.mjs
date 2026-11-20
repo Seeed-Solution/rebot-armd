@@ -31,3 +31,14 @@ export function actRowsCheck(sel) {
   }
   return out;
 }
+// Step bar of the calibration wizard (#cwiz-steps, cwFitSteps in src/api/index.html), evaluated in the page: when it
+// is visible, either every step name fits, or it is compact and the current step's name fits. Returns a list of problems.
+export function stepBarCheck() {
+  const ol = document.getElementById('cwiz-steps');
+  if (!ol || ol.getBoundingClientRect().width === 0) return [];
+  const cut = (li) => li.scrollWidth > li.clientWidth + 1;
+  const on = ol.querySelector('li.on');
+  if (ol.classList.contains('compact')) return on && cut(on) ? [`step bar: current step cut "${on.textContent}"`] : [];
+  const bad = [...ol.children].filter(cut).map((li) => li.textContent);
+  return bad.length ? [`step bar: names cut ${bad.join(', ')}`] : [];
+}

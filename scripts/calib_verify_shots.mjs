@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { actRowsCheck } from './act_rows_check.mjs';
+import { actRowsCheck, stepBarCheck } from './act_rows_check.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
@@ -194,6 +194,7 @@ for (const [vpName, viewport, ui] of VIEWS) {
       }));
       if (!info.open || info.raw || info.hscroll) fail(`${name} ${tag}: ${JSON.stringify(info)}`);
       const rows = await page.evaluate(actRowsCheck, '#cwiz-panel');
+      rows.push(...(await page.evaluate(stepBarCheck)));
       if (rows.length) fail(`action rows ${name} ${tag}: ${rows.join(' | ')}`);
       const file = path.join(out, `cwv_${name}_${lang}_${vpName}.png`);
       await page.screenshot({ path: file });

@@ -354,6 +354,15 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .cwiz-steps li.done { color: var(--sc-status-normal-fg); background: var(--sc-status-normal-bg); }
 .cwiz-steps li.nav { cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 .cwiz-steps li.nav:hover, .cwiz-steps li.nav:focus-visible { outline: 1px solid var(--sc-status-normal-fg); }
+/* compact step bar (cwFitSteps: some name would be cut, e.g. 10 steps on a phone): the current step's full name
+   and "3/10", the other steps as dots (green = done; tappable ones stay tappable) */
+.cwiz-steps.compact { align-items: center; }
+.cwiz-steps.compact li:not(.on) { flex: 0 0 22px; height: 24px; padding: 0; font-size: 0; background: transparent; display: grid; place-items: center; text-decoration: none; }
+.cwiz-steps.compact li:not(.on)::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--sc-color-border-neutral, #cbd5e1); }
+.cwiz-steps.compact li.done::before { background: var(--sc-status-normal-fg); }
+.cwiz-steps.compact li.nav::before { box-shadow: 0 0 0 2px var(--sc-status-normal-bg); }
+.cwiz-steps.compact li.on { flex: 1 1 auto; min-width: 0; font-size: 12px; padding: 4px 8px; }
+.cwiz-steps.compact li.on::after { content: ' · ' attr(data-pos); font-weight: 400; color: var(--sc-color-text-secondary); }
 .cwiz-body { display: grid; align-content: start; gap: 12px; font-size: 13px; line-height: 1.55; flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 .cwiz-body p { color: var(--sc-color-text-secondary); }
 .cwiz-board { border: 1px solid var(--sc-color-border); border-radius: var(--sc-radius-md); background: #fff; padding: 6px; }
@@ -6849,6 +6858,14 @@ function actLines(b) {
   return tops.size;
 }
 function tidyAll(root = document) { for (const r of root.querySelectorAll(ACT_ROWS)) tidyActs(r); }
+// step bar: full names when they all fit, else the compact form (current name + "3/10", dots)
+function cwFitSteps() {
+  const ol = $('cwiz-steps');
+  if (!ol || !ol.children.length) return;
+  ol.classList.remove('compact');
+  ol.classList.toggle('compact', [...ol.children].some((li) => li.scrollWidth > li.clientWidth + 1));
+}
+addEventListener('resize', () => { if (CWZ.open) cwFitSteps(); }, { passive: true });
 function cwRender() {
   if (!CWZ.open) return;
   const steps = $('cwiz-steps'), body = $('cwiz-body');
@@ -6862,8 +6879,10 @@ function cwRender() {
       li.addEventListener('click', () => cwGoto(k));
       li.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); cwGoto(k); } });
     }
+    li.dataset.pos = `${i + 1}/${stepList.length}`; li.title = li.textContent;
     steps.appendChild(li);
   });
+  cwFitSteps();
   body.textContent = '';
   const p = (txt, cls = '') => body.appendChild(cwEl('p', cls, txt));
   const acts = (...bs) => { const d = cwEl('div', 'cwiz-acts'); for (const b of bs) if (b) d.appendChild(b); body.appendChild(d); return d; };
@@ -7057,7 +7076,7 @@ function cwOpen(open) {
 }
 function initCwiz() {
   $('cwiz-close').addEventListener('click', () => cwOpen(false));
-  $('cwiz-min').addEventListener('click', () => { if (CWZ.jog) { cwJogMode(false); return; } $('cwiz-panel').classList.toggle('min'); });
+  $('cwiz-min').addEventListener('click', () => { if (CWZ.jog) { cwJogMode(false); return; } $('cwiz-panel').classList.toggle('min'); cwFitSteps(); });
   $('cwiz-adv').addEventListener('click', () => { if (CWZ.running) { toast(t('cw.busy'), 'warn'); return; } cwOpen(false); calOpen(true); });
   $('cwiz-stop').addEventListener('click', cwStop);
   $('cwiz-jog-cap').addEventListener('click', cwJogCapture);
