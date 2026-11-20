@@ -2,7 +2,8 @@
 //!
 //! When enforced, privileged operations (force lease preemption, non-recoverable
 //! fault/E-stop clear, workspace keepout, collision guard, gravity comp, calibration,
-//! grasp setup) require an active operator session unlocked via `POST /api/v1/auth/unlock`
+//! grasp setup, sandbox uploads / activation, `/api/v1/action/policy/start` on a real or
+//! unknown driver in any mode) require an active operator session unlocked via `POST /api/v1/auth/unlock`
 //! with the configured or generated PIN.
 
 use std::collections::HashMap;

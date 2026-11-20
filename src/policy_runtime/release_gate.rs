@@ -352,59 +352,10 @@ impl ReleaseGate {
             ));
         }
 
-        // supervised_real_run_record
-        match (
-            authorization_tier,
-            obj.get("supervised_real_run_record").filter(|v| !v.is_null()),
-        ) {
-            (AuthorizationTier::ProductionRelease, None) => {
-                return Err(PolicyError::ReleaseGate(
-                    "authorization_tier 'production_release' requires a non-empty 'supervised_real_run_record' object".into(),
-                ));
-            }
-            (AuthorizationTier::ProductionRelease, Some(rec)) => {
-                let rec_obj = rec.as_object().ok_or_else(|| {
-                    PolicyError::ReleaseGate(
-                        "supervised_real_run_record must be a JSON object".into(),
-                    )
-                })?;
-                if rec_obj.is_empty() {
-                    return Err(PolicyError::ReleaseGate(
-                        "supervised_real_run_record must not be empty".into(),
-                    ));
-                }
-                if !require_bool(
-                    rec_obj.get("passed"),
-                    "supervised_real_run_record.passed",
-                )? {
-                    return Err(PolicyError::ReleaseGate(
-                        "production_release supervised_real_run_record.passed must be true".into(),
-                    ));
-                }
-                let rec_sha = require_sha256_hex_opt(
-                    rec_obj.get("policy_sha256"),
-                    "supervised_real_run_record.policy_sha256",
-                )?;
-                if rec_sha != expected_sha {
-                    return Err(PolicyError::ReleaseGate(format!(
-                        "supervised_real_run_record.policy_sha256 ({rec_sha}) does not match expected policy_sha256 ({expected_sha})"
-                    )));
-                }
-            }
-            (AuthorizationTier::SupervisedFirstRun, Some(rec)) => {
-                let rec_obj = rec.as_object().ok_or_else(|| {
-                    PolicyError::ReleaseGate(
-                        "supervised_real_run_record must be a JSON object when provided".into(),
-                    )
-                })?;
-                if rec_obj.is_empty() {
-                    return Err(PolicyError::ReleaseGate(
-                        "supervised_real_run_record must not be empty when provided".into(),
-                    ));
-                }
-            }
-            (AuthorizationTier::SupervisedFirstRun, None) => {}
-        }
+        // `supervised_real_run_record` is a caller claim and is ignored: a production release
+        // is authorized by the device ledger (`qualification.rs`) in `begin_policy_run`.
+        // `sim_eval` and `prerequisites` above are publisher declarations; they can only
+        // reject a gate, never authorize a run on real hardware.
 
         Ok(VerifiedReleaseGate {
             schema_version,

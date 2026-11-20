@@ -270,6 +270,10 @@ pub struct SupervisorInner {
     /// Most recent policy observation telemetry (retained after policy run ends).
     #[cfg(feature = "policy-runtime")]
     pub last_policy_obs: Option<crate::model::PolicyObservation>,
+    /// Device qualification ledger (`src/policy_runtime/qualification.rs`); None = no records
+    /// are written and production releases are refused.
+    #[cfg(feature = "policy-runtime")]
+    pub policy_ledger_path: Option<std::path::PathBuf>,
     /// Test hook run once by the WS action handler between planning and install.
     #[doc(hidden)]
     pub before_install_hook: Option<Box<dyn FnOnce(&mut SupervisorInner) + Send + Sync>>,
@@ -556,6 +560,8 @@ impl SupervisorInner {
             policy_loading: false,
             #[cfg(feature = "policy-runtime")]
             last_policy_obs: None,
+            #[cfg(feature = "policy-runtime")]
+            policy_ledger_path: crate::policy_runtime::qualification::ledger_path_from_env(),
             quintic_settle: None,
             before_install_hook: None,
             last_heartbeat: now,
@@ -5317,6 +5323,22 @@ impl SupervisorInner {
                     message: "Real-arm live policy execution requires confirmed, valid hardware feedback".into(),
                 });
             }
+            if gate.authorization_tier() == crate::policy_runtime::AuthorizationTier::ProductionRelease {
+                use crate::policy_runtime::qualification;
+                let Some(path) = self.policy_ledger_path.as_deref() else {
+                    return Err(ArmError::Rejected {
+                        status: 403,
+                        code: "QUALIFICATION_REQUIRED".into(),
+                        message: "production_release needs the device qualification ledger, and none is configured".into(),
+                    });
+                };
+                let records = qualification::load_records(path)?;
+                qualification::check_production_qualified(&records, gate).map_err(|e| ArmError::Rejected {
+                    status: 403,
+                    code: "QUALIFICATION_REQUIRED".into(),
+                    message: e.to_string(),
+                })?;
+            }
         }
         if !self.validate_servo_lease(&req.connection_id, req.lease_generation) {
             return Err(ArmError::Rejected {
@@ -5669,6 +5691,23 @@ impl SupervisorInner {
         true
     }
 
+    /// Append the outcome of a supervised_first_run live run on real hardware to the device
+    /// qualification ledger. Passed = ran to its deadline (`MAX_SECONDS`, action done).
+    fn record_policy_qualification(&self, run: &crate::policy_runtime::PolicyRun, stop_reason: &str, action_state: &str) {
+        use crate::policy_runtime::{qualification, AuthorizationTier, PolicyMode};
+        if run.mode != PolicyMode::Live || self.policy_live_allowed() { return; }
+        let Some(gate) = run.verified_release_gate.as_ref().filter(|g| g.authorization_tier() == AuthorizationTier::SupervisedFirstRun) else { return; };
+        let Some(path) = self.policy_ledger_path.as_deref() else {
+            tracing::warn!("No policy qualification ledger configured; supervised run {} not recorded", run.action_id);
+            return;
+        };
+        let passed = stop_reason == "MAX_SECONDS" && action_state == "done";
+        let record = qualification::QualificationRecord::for_run(gate, run.action_id, run.steps, stop_reason, passed);
+        if let Err(e) = qualification::append_record(path, &record) {
+            tracing::warn!("Cannot append policy qualification record to {}: {e}", path.display());
+        }
+    }
+
     fn terminate_policy_run(
         &mut self,
         stop_reason: &str,
@@ -5680,6 +5719,7 @@ impl SupervisorInner {
             return;
         };
         run.stop_reason = Some(stop_reason.to_string());
+        self.record_policy_qualification(&run, stop_reason, action_state);
         if run.mode == crate::policy_runtime::PolicyMode::Live {
             self.servo_target = None;
             self.servo_settled_ticks.fill(0);

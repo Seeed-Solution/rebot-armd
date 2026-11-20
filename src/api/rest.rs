@@ -504,6 +504,10 @@ pub async fn action_requires_lease(
         if uri.path() == "/api/v1/mode/gravity_comp" {
             return Err(ApiError::operator_required("/api/v1/mode/gravity_comp"));
         }
+        #[cfg(feature = "policy-runtime")]
+        if uri.path() == "/api/v1/action/policy/start" && !supervisor.inner().read().await.policy_live_allowed() {
+            return Err(ApiError::operator_required("policy/start (real arm)"));
+        }
         if uri.path() == "/api/v1/action/gripper_zero_check" {
             if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&body) {
                 if val.get("store_offset").and_then(serde_json::Value::as_bool) == Some(true) {

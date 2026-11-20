@@ -4,6 +4,7 @@
 
 pub mod manifest;
 pub mod mlp;
+pub mod qualification;
 pub mod release_gate;
 pub mod runner;
 #[cfg(feature = "policy-tract")]

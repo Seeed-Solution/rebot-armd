@@ -4626,7 +4626,7 @@ mod phase3_release_gate_tests {
         StrictPolicyContract::parse(&serde_json::to_vec(&pj).unwrap()).unwrap()
     }
 
-    fn make_valid_gate(
+    pub(super) fn make_valid_gate(
         policy_sha256: &str,
         tier: &str,
         profile_id: &str,
@@ -4800,19 +4800,20 @@ mod phase3_release_gate_tests {
             );
         }
 
-        // 9. Rejected production_release missing or mismatched supervised_real_run_record
+        // 9. A caller-supplied supervised_real_run_record is ignored (missing, mismatched or
+        // failed all parse the same): production is authorized by the device ledger only.
         let mut missing_rec = gate_prod.clone();
         missing_rec.as_object_mut().unwrap().remove("supervised_real_run_record");
-        assert!(ReleaseGate::parse_and_verify(&missing_rec, &sha, &cfg, &contract, 25.0, &deployment).is_err());
+        assert!(ReleaseGate::parse_and_verify(&missing_rec, &sha, &cfg, &contract, 25.0, &deployment).is_ok());
 
         let mut mismatch_rec = gate_prod.clone();
         mismatch_rec["supervised_real_run_record"]["policy_sha256"] =
             serde_json::json!("0".repeat(64));
-        assert!(ReleaseGate::parse_and_verify(&mismatch_rec, &sha, &cfg, &contract, 25.0, &deployment).is_err());
+        assert!(ReleaseGate::parse_and_verify(&mismatch_rec, &sha, &cfg, &contract, 25.0, &deployment).is_ok());
 
         let mut failed_rec = gate_prod.clone();
         failed_rec["supervised_real_run_record"]["passed"] = serde_json::json!(false);
-        assert!(ReleaseGate::parse_and_verify(&failed_rec, &sha, &cfg, &contract, 25.0, &deployment).is_err());
+        assert!(ReleaseGate::parse_and_verify(&failed_rec, &sha, &cfg, &contract, 25.0, &deployment).is_ok());
 
         // 10. Rejected fps mismatch, non-integer fps, unit_mode mismatch, action_space mismatch
         assert!(ReleaseGate::parse_and_verify(&gate_sup, &sha, &cfg, &contract, 25.0, &deployment).is_err());
@@ -5387,9 +5388,53 @@ mod phase3_release_gate_tests {
         )
         .unwrap();
 
+        // Production release without device-recorded supervised passes -> refused.
+        let ledger_dir = tempdir().unwrap();
+        let ledger = ledger_dir.path().join("policy_qualification.jsonl");
+        sup.inner().write().await.policy_ledger_path = Some(ledger.clone());
+        let rej_unqualified = send_cmd(
+            &mut ws,
+            70,
+            gen,
+            1,
+            "/api/v1/action/policy/start",
+            serde_json::json!({
+                "policy_id": pack2_id,
+                "mode": "live",
+                "fps": 25.0,
+                "max_seconds": 3.0,
+                "i_am_at_the_arm": true
+            }),
+        )
+        .await;
+        assert_eq!(rej_unqualified["code"], "QUALIFICATION_REQUIRED", "{rej_unqualified}");
+        // Records as armd writes them after supervised runs of this artifact and deployment.
+        for i in 0..armd::policy_runtime::qualification::MIN_SUPERVISED_PASSES {
+            armd::policy_runtime::qualification::append_record(
+                &ledger,
+                &armd::policy_runtime::qualification::QualificationRecord {
+                    schema: armd::policy_runtime::qualification::QUALIFICATION_SCHEMA.into(),
+                    recorded_unix_s: 0,
+                    action_id: i as u64,
+                    policy_sha256: digest2.to_ascii_lowercase(),
+                    scene_id: "default".into(),
+                    tool_id: "default".into(),
+                    calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+                    profile_id: "b601dm".into(),
+                    fps: 25,
+                    tier: "supervised_first_run".into(),
+                    max_speed_scale: 0.3,
+                    steps: 10,
+                    stop_reason: "MAX_SECONDS".into(),
+                    passed: true,
+                },
+            )
+            .unwrap();
+        }
+
         let ack_pack = send_cmd(
             &mut ws,
-            7,
+            71,
             gen,
             1,
             "/api/v1/action/policy/start",
@@ -5419,7 +5464,7 @@ mod phase3_release_gate_tests {
 
         let ack_stop2 = send_cmd(
             &mut ws,
-            8,
+            72,
             gen,
             1,
             "/api/v1/action/policy/stop",
@@ -5907,3 +5952,197 @@ mod phase3_release_gate_tests {
 }
 
 
+
+/// Review item 1: real-hardware policy start needs an operator session, and a production
+/// release is authorized only by supervised runs that armd recorded itself.
+mod device_qualification_tests {
+    use super::phase3_release_gate_tests::make_valid_gate;
+    use super::*;
+    use armd::policy_runtime::qualification::{load_records, MIN_SUPERVISED_PASSES};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    fn start(epoch: u64, gen: u64, digest: &str, gate: &armd::policy_runtime::VerifiedReleaseGate) -> PolicyRunStart {
+        PolicyRunStart {
+            epoch_id: epoch,
+            connection_id: "conn-q".into(),
+            lease_generation: gen,
+            policy_id: "p_q".into(),
+            artifact_digest: digest.into(),
+            backend: "mlp".into(),
+            mode: PolicyMode::Live,
+            sim_only: false,
+            max_first_step_rad: None,
+            max_step_rad: None,
+            tag: None,
+            i_am_at_the_arm: true,
+            verified_release_gate: Some(gate.clone()),
+        }
+    }
+
+    fn code(e: &ArmError) -> String {
+        match e {
+            ArmError::Rejected { code, .. } => code.clone(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn production_release_needs_device_recorded_supervised_passes() {
+        let dir = tempdir().unwrap();
+        let layers = vec![MlpLayerSpec::new(6, 6, Activation::None, vec![0.0; 36], vec![0.0; 6])];
+        let digest = write_rmlp_pack(dir.path(), &["j1", "j2", "j3", "j4", "j5", "j6"], "rad", &layers, serde_json::json!({}));
+        let mut cfg = make_6dof_config();
+        cfg.profile_id = Some("so-arm101".into());
+        let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+        let deployment = ActiveDeploymentContext {
+            scene_id: "pcb_suction".into(),
+            tool_id: "suction".into(),
+            calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+        };
+        let verify = |tier: &str, speed: f64| {
+            let mut raw = make_valid_gate(&digest, tier, "so101", 25, speed, "rad");
+            raw["calibration_digest"] = serde_json::json!(EMPTY_CALIBRATION_DIGEST);
+            ReleaseGate::parse_and_verify(&raw, &digest, &cfg, prepared.contract(), 25.0, &deployment).unwrap()
+        };
+        let supervised = verify("supervised_first_run", 0.3);
+        // make_valid_gate adds a caller-supplied `supervised_real_run_record` {passed: true}
+        let production = verify("production_release", 0.7);
+
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(DummyRealDriver::new(6))));
+        sup.set_follower("so-arm101").await;
+        let gen = sup.acquire_lease("conn-q").await.unwrap();
+        sup.set_torque(true).await.unwrap();
+        sup.tick(0.02).await;
+        let epoch = sup.get_observation().await.epoch_id;
+        let ledger_dir = tempdir().unwrap();
+        let ledger = ledger_dir.path().join("policy_qualification.jsonl");
+
+        let mut inner = sup.inner().write().await;
+        // no ledger configured: refused
+        inner.policy_ledger_path = None;
+        let e = inner.begin_policy_run(start(epoch, gen, &digest, &production)).unwrap_err();
+        assert_eq!(code(&e), "QUALIFICATION_REQUIRED", "{e:?}");
+
+        // empty ledger: the caller's own run record does not count
+        inner.policy_ledger_path = Some(ledger.clone());
+        let e = inner.begin_policy_run(start(epoch, gen, &digest, &production)).unwrap_err();
+        assert_eq!(code(&e), "QUALIFICATION_REQUIRED", "{e:?}");
+
+        // supervised runs that end at their deadline are recorded as passes
+        for i in 0..MIN_SUPERVISED_PASSES {
+            let id = inner.begin_policy_run(start(epoch, gen, &digest, &supervised)).unwrap();
+            assert!(inner.finish_policy_run(id, "MAX_SECONDS"));
+            if i + 1 < MIN_SUPERVISED_PASSES {
+                let e = inner.begin_policy_run(start(epoch, gen, &digest, &production)).unwrap_err();
+                assert_eq!(code(&e), "QUALIFICATION_REQUIRED", "after {} passes: {e:?}", i + 1);
+            }
+        }
+        let id = inner.begin_policy_run(start(epoch, gen, &digest, &production)).expect("qualified");
+        assert!(inner.stop_policy_run(Some(id), "STOPPED"));
+
+        // a supervised run that is stopped is recorded as a failure and revokes the release
+        let id = inner.begin_policy_run(start(epoch, gen, &digest, &supervised)).unwrap();
+        assert!(inner.stop_policy_run(Some(id), "STOPPED"));
+        let e = inner.begin_policy_run(start(epoch, gen, &digest, &production)).unwrap_err();
+        assert_eq!(code(&e), "QUALIFICATION_REQUIRED", "{e:?}");
+
+        let records = load_records(&ledger).unwrap();
+        assert_eq!(records.len(), MIN_SUPERVISED_PASSES + 1, "production runs are not recorded");
+        assert!(records[..MIN_SUPERVISED_PASSES].iter().all(|r| r.passed && r.stop_reason == "MAX_SECONDS"));
+        let last = records.last().unwrap();
+        assert!(!last.passed);
+        assert_eq!(last.stop_reason, "STOPPED");
+        assert_eq!(last.policy_sha256, digest.to_ascii_lowercase());
+        assert_eq!(last.tier, "supervised_first_run");
+        assert!((last.max_speed_scale - 0.3).abs() < 1e-12);
+        assert_eq!((last.scene_id.as_str(), last.tool_id.as_str(), last.fps), ("pcb_suction", "suction", 25));
+    }
+
+    async fn send_cmd(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+                      req_id: u64, gen: u64, epoch: u64, path: &str, body: serde_json::Value) -> serde_json::Value {
+        ws.send(Message::Text(serde_json::json!({"type": "command", "request_id": req_id, "generation": gen,
+            "epoch_id": epoch, "path": path, "body": body}).to_string().into())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let v: serde_json::Value = serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+                if v["type"] == "command_ack" || v["type"] == "command_reject" { return v; }
+            }
+        }).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn real_arm_policy_start_needs_operator_session_and_stop_does_not() {
+        let sandbox_dir = tempdir().unwrap();
+        let sandbox = Arc::new(SandboxState::new(sandbox_dir.path().to_path_buf()));
+        let pack = sandbox_dir.path().join("policies").join("auth_pack");
+        fs::create_dir_all(&pack).unwrap();
+        let layers = vec![MlpLayerSpec::new(6, 6, Activation::None, vec![0.0; 36], vec![0.0; 6])];
+        write_rmlp_pack(&pack, &["j1", "j2", "j3", "j4", "j5", "j6"], "rad", &layers, serde_json::json!({}));
+        let sup = Arc::new(ArmSupervisor::new(make_6dof_config()).with_driver(Box::new(DummyRealDriver::new(6))));
+        sup.set_follower("rebot-dm").await;
+        let auth = OperatorAuth::enforced("123456", 1800);
+        let router = create_router_with_sandbox(sup.clone(), auth.clone(), sandbox.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+
+        async fn ws_with(addr: SocketAddr, token: Option<&str>) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+            let mut req = format!("ws://{addr}/api/v1/ws").into_client_request().unwrap();
+            if let Some(t) = token {
+                req.headers_mut().insert("authorization", format!("Bearer {t}").parse().unwrap());
+            }
+            connect_async(req).await.unwrap().0
+        }
+        async fn lease(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) -> u64 {
+            ws.send(Message::Text(serde_json::json!({"type": "acquire_lease", "client_id": "auth_q"}).to_string().into())).await.unwrap();
+            loop {
+                let v: serde_json::Value = serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+                if v["type"] == "lease_granted" { return v["generation"].as_u64().unwrap(); }
+            }
+        }
+        let epoch = sup.get_observation().await.epoch_id;
+        let shadow = serde_json::json!({"policy_id": "auth_pack", "mode": "shadow", "fps": 10.0});
+
+        // program session (no token): start refused in every mode, stop allowed
+        let mut ws = ws_with(addr, None).await;
+        let gen = lease(&mut ws).await;
+        let r = send_cmd(&mut ws, 1, gen, epoch, "/api/v1/action/policy/start", shadow.clone()).await;
+        assert_eq!((r["type"].as_str(), r["code"].as_str()), (Some("command_reject"), Some("OPERATOR_REQUIRED")), "{r}");
+        let r = send_cmd(&mut ws, 2, gen, epoch, "/api/v1/action/policy/start",
+            serde_json::json!({"policy_id": "auth_pack", "mode": "live", "fps": 25.0, "i_am_at_the_arm": true})).await;
+        assert_eq!(r["code"], "OPERATOR_REQUIRED", "{r}");
+        let r = send_cmd(&mut ws, 3, gen, epoch, "/api/v1/action/policy/stop", serde_json::json!({})).await;
+        assert_eq!(r["type"], "command_ack", "{r}");
+        // REST stub classifies the same way
+        let rest = reqwest::Client::new().post(format!("http://{addr}/api/v1/action/policy/start")).json(&shadow).send().await.unwrap();
+        assert_eq!(rest.status(), 403);
+        drop(ws);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // operator session: shadow start accepted
+        let unlock: serde_json::Value = reqwest::Client::new().post(format!("http://{addr}/api/v1/auth/unlock"))
+            .json(&serde_json::json!({"pin": "123456"})).send().await.unwrap().json().await.unwrap();
+        let token = unlock["token"].as_str().unwrap().to_string();
+        let mut op = ws_with(addr, Some(&token)).await;
+        let gen = lease(&mut op).await;
+        let r = send_cmd(&mut op, 1, gen, epoch, "/api/v1/action/policy/start", shadow.clone()).await;
+        assert_eq!(r["type"], "command_ack", "{r}");
+        let r = send_cmd(&mut op, 2, gen, epoch, "/api/v1/action/policy/stop", serde_json::json!({})).await;
+        assert_eq!(r["type"], "command_ack", "{r}");
+
+        // session locked while the pack loads: the recheck after loading refuses the start
+        sandbox.set_policy_load_delay_ms(300);
+        op.send(Message::Text(serde_json::json!({"type": "command", "request_id": 3, "generation": gen, "epoch_id": epoch,
+            "path": "/api/v1/action/policy/start", "body": shadow}).to_string().into())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        auth.lock(Some(&token));
+        let r = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let v: serde_json::Value = serde_json::from_str(&op.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+                if v["type"] == "command_ack" || v["type"] == "command_reject" { return v; }
+            }
+        }).await.unwrap();
+        assert_eq!((r["type"].as_str(), r["code"].as_str()), (Some("command_reject"), Some("OPERATOR_REQUIRED")), "{r}");
+        assert!(sup.inner().read().await.policy_run.is_none());
+    }
+}

@@ -623,6 +623,12 @@ fn check_operator_privilege(
         {
             Some(ApiError::operator_required("gripper_zero_check (store_offset=true)"))
         }
+        // a policy run on a real (or unknown) driver, in any mode; mock / sim drivers stay open.
+        // policy/stop needs no session, like /api/v1/motion/stop. Rechecked after loading.
+        #[cfg(feature = "policy-runtime")]
+        "/api/v1/action/policy/start" if !inner.policy_live_allowed() => {
+            Some(ApiError::operator_required("policy/start (real arm)"))
+        }
         "/api/v1/safety/clear_fault" => {
             if inner.consume_pending_estop() && inner.safety.epoch_id() != epoch {
                 return Some(ArmError::Safety(SafetyError::EpochMismatch {
@@ -1293,6 +1299,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     let inline_release_gate = pending.request.release_gate;
                     let policy_live_allowed = pending.policy_live_allowed;
                     let i_am_at_the_arm = pending.request.i_am_at_the_arm;
+                    let auth_c = auth.clone();
+                    let ws_token_c = ws_token.clone();
                     tokio::spawn(async move {
                         let _load_guard = load_guard;
                         let mut loading_guard = loading_guard;
@@ -1385,6 +1393,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"EPOCH_MISMATCH", "message":"Epoch changed while loading policy", "error":"EPOCH_MISMATCH", "epoch_id":inner.safety.epoch_id()})
                                 } else if stop_gen_c.load(Ordering::SeqCst) != my_stop_gen {
                                     json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"STOPPED", "message":"Stopped while loading policy", "error":"STOPPED", "epoch_id":inner.safety.epoch_id()})
+                                } else if auth_c.is_enforced() && !inner.policy_live_allowed() && !auth_c.is_operator(ws_token_c.as_deref()) {
+                                    // the operator session may have expired or been locked while loading
+                                    command_reject(&inner, &request_id, ApiError::operator_required("policy/start (real arm)"))
                                 } else {
                                     match deadline_res {
                                         Err(err) => command_reject(&inner, &request_id, err.into()),
