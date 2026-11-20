@@ -161,8 +161,11 @@ for (const lang of ['zh', 'en']) {
       await page.mouse.click(4, Math.round(view.height - 6));
       ok(await waitFor(page, () => $('op-modal').hidden), name + ' backdrop cancels');
       ok((await st(page)).state !== 'EStop', name + ' cancel is no E-stop');
-      await holdOn(page, '#btn-gc');
-      await waitFor(page, () => !$('op-modal').hidden);
+      // the switch ignores presses for 300 ms after a refused request (inflight guard in the btn-gc handler; longer
+      // under load): press again until the prompt opens
+      let again = false;
+      for (let k = 0; k < 3 && !again; k++) { await page.waitForTimeout(500); await holdOn(page, '#btn-gc'); again = await waitFor(page, () => !$('op-modal').hidden, null, 3000); }
+      ok(again, name + ' gravity mode prompts again after a cancel');
       await page.fill('#op-pin', PIN); await page.press('#op-pin', 'Enter');
       ok(await waitFor(page, () => S.obs && S.obs.control_mode === 'gravity_comp', null, 8000), name + ' gravity mode on after unlock (retried)');
       await page.evaluate(() => api('/api/v1/mode/gravity_comp', { enable: false }, { quiet: true }).catch(() => {}));
