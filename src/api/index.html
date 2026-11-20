@@ -175,6 +175,39 @@ body.locked .pose-go { opacity: .45; filter: saturate(0); cursor: not-allowed; }
 .op-btn.is-unlocked { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); border-color: var(--sc-color-border); }
 .op-btn:hover { border-color: var(--sc-color-primary); }
 .op-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+/* operator unlock: small centred dialog, kept inside the visual viewport (on-screen keyboard) by opFit() */
+.op-modal { position: fixed; left: 0; right: 0; top: 0; height: 100dvh; z-index: 1060; display: flex; align-items: center; justify-content: center; padding: 12px 16px; overflow-y: auto;
+  background: rgba(15, 23, 42, 0.42); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); animation: tin .15s ease; overscroll-behavior: contain; }
+.op-modal[hidden] { display: none; }
+.op-dialog { width: min(380px, 100%); margin: auto; display: grid; gap: 10px; padding: 18px 18px 14px; border-radius: 16px; background: #fff; border: 1px solid var(--sc-color-border-neutral); box-shadow: 0 20px 48px rgba(0, 0, 0, 0.2); }
+.op-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.op-head h3 { margin: 0; font-size: 17px; font-weight: 600; color: var(--sc-color-text); }
+.btn.op-estop { flex: none; min-height: 36px; padding: 0 12px; font-size: 13px; font-weight: 700; color: #fff; background: var(--sc-estop); border-color: var(--sc-estop); touch-action: none; }
+.btn.op-estop:hover { color: #fff; background: var(--sc-estop); filter: brightness(1.06); }
+.op-why { margin: 0; font-size: 14px; font-weight: 600; line-height: 1.45; color: var(--sc-status-warning-fg); }
+.op-why:empty, .op-err:empty, .op-retry:empty { display: none; }
+.op-retry { margin: -4px 0 0; font-size: 12px; color: var(--sc-color-text-secondary); }
+/* short visual viewport (on-screen keyboard): keep the reason, the PIN field and the buttons */
+.op-modal.op-short { align-items: flex-start; padding-block: 8px; }
+.op-modal.op-short .op-dialog { gap: 6px; padding: 12px 14px 10px; }
+.op-modal.op-short .op-hint, .op-modal.op-short .op-retry { display: none; }
+.op-modal.op-short .op-dialog .field input { height: 40px; }
+.op-dialog form { display: grid; gap: 8px; }
+.op-dialog .field { font-size: 13px; }
+.op-dialog .field input { height: 44px; font-size: 20px; letter-spacing: .2em; text-align: center; }
+.op-dialog .field[hidden] { display: none; }
+.op-err { margin: 0; font-size: 13px; font-weight: 600; color: var(--sc-status-danger-fg); }
+.op-ok { margin: 0; font-size: 13px; color: var(--sc-status-normal-fg); }
+.op-ok:empty { display: none; }
+.op-hint { margin: 0; font-size: 12px; line-height: 1.5; color: var(--sc-color-text-secondary); }
+.op-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 2px; }
+.op-actions .btn { min-width: 88px; min-height: 40px; justify-content: center; }
+.op-actions .btn[hidden] { display: none; }
+body.op-open { overflow: hidden; }
+body.op-open .toasts { z-index: 1055; } /* under the dialog: a toast must not cover the PIN field or the buttons */
+/* in the safety card while a stop needs operator access to reset */
+.btn.op-inline { width: 100%; justify-content: center; margin-top: 8px; min-height: 40px; font-weight: 600; color: var(--sc-status-warning-fg); border-color: #ffd591; background: var(--sc-status-warning-bg); }
+.btn.op-inline[hidden] { display: none; }
 .fs-btn svg { width: 18px; height: 18px; }
 .fs-btn .ic-exit, .fs-btn.on .ic-enter { display: none; }
 .fs-btn.on .ic-exit { display: block; }
@@ -530,17 +563,23 @@ body.ui-simple .tch-bar { position: fixed; z-index: 190; top: 8px; left: 50%; tr
 .hd-btn svg { width: 18px; height: 18px; }
 .hd-btn:hover { color: var(--sc-color-text-primary); border-color: var(--sc-color-primary); }
 .hd-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
-/* narrow phones: short UI-mode labels make room for the header icon buttons */
-@media (max-width: 479px) {
+/* narrow phones: short UI-mode labels make room for the header icon buttons and the operator badge */
+@media (max-width: 559px) {
   .topbar:has(.hd-btn:not([hidden])) .ui-switch .full { display: none; }
   .topbar:has(.hd-btn:not([hidden])) .ui-switch .short { display: inline; }
   .topbar:has(.hd-btn:not([hidden])) .ui-switch button { padding: 0 10px; }
   .hd-btn { width: 32px; }
 }
-@media (max-width: 389px) {
+@media (max-width: 419px) {
   .topbar:has(.hd-btn:not([hidden])) { gap: 4px; }
   .hd-btn { width: 28px; }
+  .op-btn { padding: 0 7px; gap: 3px; }
+  .lang-btn { padding: 0 6px; }
   .topbar:has(.hd-btn:not([hidden])) .ui-switch button { padding: 0 8px; }
+}
+@media (max-width: 369px) {
+  .topbar:has(.hd-btn:not([hidden])) { gap: 3px; padding-left: 8px; padding-right: 8px; }
+  .op-btn { padding: 0 6px; font-size: 11px; }
 }
 /* collision guard: protective-stop banner, settings, residual torque bars */
 .col-banner { position: fixed; z-index: 400; top: calc(var(--head-h) + 8px); left: 50%; transform: translateX(-50%); width: min(94vw, 560px);
@@ -1855,6 +1894,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           </button>
         </div>
         <!-- after a fault / E-stop clear with the motors still holding: park and torque off (the enable switch resumes) -->
+        <button class="btn op-inline" id="op-inline" type="button" data-i18n="op.inline" hidden>🔒 复位需要操作员权限 · 解锁并复位</button>
         <button class="btn btn-park-off" id="btn-park-off" type="button" hidden>
           <span data-i18n="en.park_off">停靠并卸力</span><small data-i18n="en.park_off.sub">按住 0.6 秒：回到收纳位后关闭力矩</small>
         </button>
@@ -2285,22 +2325,26 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     </div>
   </aside>
 </div>
-<div class="calib-mask" id="op-modal" hidden>
-  <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="op-h">
-    <div class="calib-head">
-      <h3 id="op-h" data-i18n="op.title">操作员解锁</h3>
-      <button class="btn calib-x" id="op-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+<div class="op-modal" id="op-modal" hidden>
+  <div class="op-dialog" role="dialog" aria-modal="true" aria-labelledby="op-h" aria-describedby="op-why">
+    <div class="op-head">
+      <h3 id="op-h" data-i18n="op.title">操作员权限</h3>
+      <button class="btn op-estop" id="op-estop" type="button" data-i18n="estop" data-i18n-aria="estop.aria" aria-label="紧急停止">急停</button>
     </div>
-    <p class="calib-hint" id="op-hint" data-i18n="op.hint">修改安全配置、清除非可恢复故障或强制抢占控制权需要操作员 PIN。</p>
-    <form class="gset-row" id="op-form">
-      <label class="field"><span data-i18n="op.pin">操作员 PIN</span><input id="op-pin" type="password" inputmode="numeric" autocomplete="off"></label>
-      <div class="calib-live mono" id="op-status">--</div>
-      <div class="calib-actions">
+    <p class="op-why" id="op-why"></p>
+    <p class="op-retry" id="op-retry"></p>
+    <form id="op-form" autocomplete="off" novalidate>
+      <label class="field" id="op-pin-field"><span data-i18n="op.pin">操作员 PIN</span><input id="op-pin" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="32" autocomplete="off" enterkeyhint="done" aria-describedby="op-status"></label>
+      <p class="op-err" id="op-status" role="alert"></p>
+      <p class="op-ok" id="op-state"></p>
+      <p class="op-hint" id="op-hint" data-i18n="op.hint">PIN 在 reCamera 控制台本应用的设置里（「操作员权限」分组）设置。未设置时，armd 每次启动生成新的随机 PIN，存放在设备的 /userdata/rebot-teleop/operator.pin（root 登录后查看）。</p>
+      <div class="op-actions">
+        <button class="btn" id="op-lock" type="button" data-i18n="op.lock" hidden>锁定会话</button>
+        <button class="btn" id="op-cancel" type="button" data-i18n="cancel">取消</button>
         <button class="btn btn-primary" id="op-unlock" type="submit" data-i18n="op.unlock">解锁</button>
-        <button class="btn" id="op-lock" type="button" data-i18n="op.lock" hidden>锁定</button>
       </div>
     </form>
-  </aside>
+  </div>
 </div>
 <script>
 'use strict';
@@ -2503,7 +2547,14 @@ const I18N = {
     'toast.in_air': '机械臂悬空中，为防下坠已阻止直接断电。正在执行受控收纳...', 'toast.not_at_rest': '机械臂仍未到达收纳位，力矩保持开启', 'toast.torque_off_fail': '关闭力矩失败',
     'toast.torque_off_unconfirmed': '关闭力矩请求未确认，请检查连接和机械臂状态', 'toast.stowing': '正在平稳回零收起...', 'toast.enabled': '控制已开启，请确认机械臂反馈状态',
     'toast.enable_fail': '使能失败：', 'toast.enable_fail_def': '电机未就绪/通讯超时', 'toast.preset_fail': '预设指令执行失败: ', 'toast.rec_start': '开始录制 ',
-    'op.title': '操作员权限', 'op.locked': '🔒 已锁定', 'op.unlocked': '🔓 操作员', 'op.hint': '修改安全配置、清除不可自动恢复的故障或强制接管控制权需要操作员 PIN。', 'op.pin': '操作员 PIN', 'op.unlock': '解锁', 'op.lock': '锁定会话', 'op.unlocked_msg': '操作员权限已解锁', 'op.locked_msg': '操作员权限已锁定', 'op.lock_fail': '锁定未确认，请重试', 'op.bad_pin': 'PIN 错误', 'op.need_pin': '请输入操作员 PIN', 'err.operator_required': '需要操作员解锁后才能执行此操作',
+    'op.title': '操作员权限', 'op.locked': '🔒 操作员', 'op.unlocked': '🔓 操作员', 'op.badge.locked': '操作员权限：未解锁，点按输入 PIN', 'op.badge.unlocked': '操作员权限：已解锁，点按查看或锁定',
+    'op.hint': 'PIN 在 reCamera 控制台本应用的设置里（「操作员权限」分组）设置。未设置时，armd 每次启动生成新的随机 PIN，存放在设备的 /userdata/rebot-teleop/operator.pin（root 登录后查看）。',
+    'op.pin': '操作员 PIN', 'op.unlock': '解锁', 'op.lock': '锁定会话', 'op.unlocked_msg': '操作员权限已解锁', 'op.locked_msg': '操作员权限已锁定', 'op.lock_fail': '锁定未确认，请重试', 'op.bad_pin': 'PIN 错误', 'op.need_pin': '请输入操作员 PIN', 'err.operator_required': '需要操作员解锁后才能执行此操作',
+    'op.rate': '尝试次数过多，请 {s} 秒后再试', 'op.state_on': '已解锁，{m} 分钟后自动锁定', 'op.state_on0': '已解锁', 'op.expired': '操作员会话已过期，已自动锁定', 'op.close': '关闭',
+    'op.inline': '🔒 复位需要操作员权限 · 解锁并复位', 'op.inline_fault': '🔒 清除故障需要操作员权限 · 解锁并清除',
+    'op.why.gc': '重力补偿需要操作员权限', 'op.why.det': '识别需要操作员权限', 'op.why.estop': '复位急停需要操作员权限', 'op.why.fault': '清除这个故障需要操作员权限',
+    'op.why.calib': '标定需要操作员权限', 'op.why.poses': '保存或修改点位、动作需要操作员权限', 'op.why.rec': '录制和管理录制片段需要操作员权限', 'op.why.safety': '修改安全设置（禁入区、碰撞保护）需要操作员权限',
+    'op.why.sandbox': '仿真沙盒需要操作员权限', 'op.why.take': '强制接管控制权需要操作员权限', 'op.why.default': '这个操作需要操作员权限', 'op.retry': '解锁后自动继续这个操作。',
   },
   en: {
     'doc.title': 'reBot Teleop',
@@ -2697,7 +2748,14 @@ const I18N = {
     'toast.in_air': 'Arm is in the air; direct power-off blocked to prevent a drop. Running controlled park...', 'toast.not_at_rest': 'Arm has not reached the park pose, torque stays on', 'toast.torque_off_fail': 'Failed to turn torque off',
     'toast.torque_off_unconfirmed': 'Torque-off request not confirmed, check the connection and the arm', 'toast.stowing': 'Smoothly homing and stowing...', 'toast.enabled': 'Control enabled, verify arm feedback',
     'toast.enable_fail': 'Enable failed: ', 'toast.enable_fail_def': 'motors not ready / communication timeout', 'toast.preset_fail': 'Preset failed: ', 'toast.rec_start': 'Recording started ',
-    'op.title': 'Operator access', 'op.locked': '🔒 Locked', 'op.unlocked': '🔓 Operator', 'op.hint': 'Changing safety config, clearing non-recoverable faults, or force-preempting control requires the operator PIN.', 'op.pin': 'Operator PIN', 'op.unlock': 'Unlock', 'op.lock': 'Lock session', 'op.unlocked_msg': 'Operator access unlocked', 'op.locked_msg': 'Operator access locked', 'op.lock_fail': 'Lock not confirmed; please retry', 'op.bad_pin': 'Invalid PIN', 'op.need_pin': 'Enter the operator PIN', 'err.operator_required': 'Operator unlock is required for this operation',
+    'op.title': 'Operator access', 'op.locked': '🔒 Operator', 'op.unlocked': '🔓 Operator', 'op.badge.locked': 'Operator access: locked, tap to enter the PIN', 'op.badge.unlocked': 'Operator access: unlocked, tap to view or lock',
+    'op.hint': 'The PIN is set in the reCamera console, this app\'s settings, group "Operator Access". When it is not set, armd makes a new random PIN at every start and keeps it on the device in /userdata/rebot-teleop/operator.pin (log in as root to read it).',
+    'op.pin': 'Operator PIN', 'op.unlock': 'Unlock', 'op.lock': 'Lock session', 'op.unlocked_msg': 'Operator access unlocked', 'op.locked_msg': 'Operator access locked', 'op.lock_fail': 'Lock not confirmed; please retry', 'op.bad_pin': 'Wrong PIN', 'op.need_pin': 'Enter the operator PIN', 'err.operator_required': 'Operator unlock is required for this operation',
+    'op.rate': 'Too many attempts; try again in {s} s', 'op.state_on': 'Unlocked; locks again in {m} min', 'op.state_on0': 'Unlocked', 'op.expired': 'Operator session expired; locked again', 'op.close': 'Close',
+    'op.inline': '🔒 Reset needs operator access · Unlock and reset', 'op.inline_fault': '🔒 Clearing this fault needs operator access · Unlock and clear',
+    'op.why.gc': 'Gravity mode needs operator access', 'op.why.det': 'Detection needs operator access', 'op.why.estop': 'Resetting the E-stop needs operator access', 'op.why.fault': 'Clearing this fault needs operator access',
+    'op.why.calib': 'Calibration needs operator access', 'op.why.poses': 'Saving or changing poses and motions needs operator access', 'op.why.rec': 'Recording and managing episodes needs operator access', 'op.why.safety': 'Changing safety settings (keep-out boxes, collision guard) needs operator access',
+    'op.why.sandbox': 'The simulation sandbox needs operator access', 'op.why.take': 'Forcing a takeover of control needs operator access', 'op.why.default': 'This action needs operator access', 'op.retry': 'The action continues after the unlock.',
   },
 };
 // calibration tools (settings drawer, gripper tool)
@@ -3358,19 +3416,30 @@ function rpcError(response) {
     message = t('err.collision_hold');
   } else if (response.code === 'OPERATOR_REQUIRED') {
     message = t('err.operator_required');
-    if (typeof S === 'object' && S.auth) { S.auth.role = 'program'; S.auth.expiresIn = null; }
-    if (typeof renderOpBadge === 'function') renderOpBadge();
-    if (typeof openOperatorModal === 'function') openOperatorModal();
   } else {
     message = response.message || response.error || t('err.rejected');
   }
   return Object.assign(new Error(message), { code: response.code, status: response.status, reply: response });
 }
+/* A command refused with OPERATOR_REQUIRED opens the operator dialog with the reason for `path`. The few
+   user-initiated, repeatable ones (opCanRetry) run once more after the unlock; every other one fails as before. */
 function commandRPC(path, body, acquire = true, timeoutMs = 2000) {
+  return commandRPCOnce(path, body, acquire, timeoutMs).catch((e) => {
+    if (e.code !== 'OPERATOR_REQUIRED') throw e;
+    const unlocked = opRequire(path, body);
+    if (!opCanRetry(path, body)) throw e;
+    return unlocked.then(async (ok) => {
+      if (!ok) throw e;
+      await wsOpen(5000);
+      return commandRPCOnce(path, body, acquire, timeoutMs);
+    });
+  });
+}
+function commandRPCOnce(path, body, acquire = true, timeoutMs = 2000) {
   // First control input: acquire the lease, then send. A stop needs no lease of ours:
   // without one this page has nothing running to stop.
   if (acquire && S.leaseGeneration == null && path !== '/api/v1/motion/stop' && S.ws && S.ws.readyState === 1) {
-    return ensureLease().then(() => commandRPC(path, body, false, timeoutMs));
+    return ensureLease().then(() => commandRPCOnce(path, body, false, timeoutMs));
   }
   if (!S.ws || S.ws.readyState !== 1 || S.leaseGeneration == null || S.epoch == null) {
     return Promise.reject(Object.assign(new Error(t('err.nolease')), { code: 'LEASE_REQUIRED' }));
@@ -3416,7 +3485,8 @@ async function api(path, body, { quiet = false, method = 'POST' } = {}) {
     const err = new Error((data && (data.message || data.error)) || ('HTTP ' + res.status));
     err.code = (data && data.code) || String(res.status);
     err.status = res.status;
-    if (!quiet) toast(err.message, 'err', err.code);
+    if (err.code === 'OPERATOR_REQUIRED') { err.message = t('err.operator_required'); opRequire(path, body); }
+    else if (!quiet) toast(err.message, 'err', err.code);
     throw err;
   }
   if (data) syncEpoch(data.epoch_id);
@@ -3486,6 +3556,10 @@ function connectWS() {
     }
     if (o.type === 'lease_granted' || o.type === 'lease_rejected') {
       onAcquireResponse(ws, o);
+      return;
+    }
+    if (o.type === 'auth_ack') {
+      if (OP.ack && OP.ack.ws === ws && OP.ack.seq === o.seq) OP.ack.done(o);
       return;
     }
     if (o.type === 'lease_lost') {
@@ -3747,10 +3821,7 @@ function onAcquireResponse(ws, msg) {
     return;
   }
   if (req.force) { closePreemptModal(); toast(t('toast.take_rejected') + (msg.message || msg.error || t('unknown_reason')), 'err'); }
-  if (msg.code === 'OPERATOR_REQUIRED') {
-    S.auth.role = 'program'; S.auth.expiresIn = null; renderOpBadge();
-    if (typeof openOperatorModal === 'function') openOperatorModal();
-  }
+  if (msg.code === 'OPERATOR_REQUIRED') opRequire('lease.force'); // never auto-resend force
   settleLeaseWaiters(Object.assign(new Error(t('err.rejected') + ': ' + (msg.message || msg.error || t('unknown_reason'))), { code: 'LEASE_REJECTED' }));
   renderPreemptModal();
 }
@@ -4197,7 +4268,7 @@ async function detRequest(method, body) {
     let data = null;
     try { data = await res.json(); } catch (_) {}
     if (!res.ok || !data || typeof data.enabled !== 'boolean') {
-      const e = new Error((data && data.error) || 'HTTP ' + res.status); e.status = res.status; throw e;
+      const e = new Error((data && data.error) || 'HTTP ' + res.status); e.status = res.status; e.code = data && data.code; throw e;
     }
     return data;
   } finally { clearTimeout(tm); }
@@ -4296,7 +4367,7 @@ async function detLatest(query) {
     return data;
   } finally { clearTimeout(tm); }
 }
-async function detTriggerReq(waitMs, pipelines) {
+async function detTriggerReq(waitMs, pipelines, retried = false) {
   const ctl = new AbortController();
   // armd waits wait_ms + 2 s for the detector; allow a little more for the browser round trip.
   const tm = setTimeout(() => ctl.abort(), waitMs + 3500);
@@ -4308,7 +4379,11 @@ async function detTriggerReq(waitMs, pipelines) {
     });
     let data = null;
     try { data = await res.json(); } catch (_) {}
-    if (!res.ok || data == null) { const e = new Error((data && data.error) || 'HTTP ' + res.status); e.status = res.status; throw e; }
+    if (res.status === 403 && data && data.code === 'OPERATOR_REQUIRED' && !retried) {
+      clearTimeout(tm);
+      if (await opRequire('/api/v1/detection/trigger')) return detTriggerReq(waitMs, pipelines, true);
+    }
+    if (!res.ok || data == null) { const e = new Error((data && data.error) || 'HTTP ' + res.status); e.status = res.status; e.code = data && data.code; throw e; }
     return data;
   } finally { clearTimeout(tm); }
 }
@@ -4415,6 +4490,7 @@ async function toggleDet() {
   }
   catch (e) {
     DET.busy = false;
+    if (e.code === 'OPERATOR_REQUIRED') { opRequire('/api/v1/detection/inference'); renderDetToggle(); return; }
     toast(t('det.fail'), 'err', e.status ? String(e.status) : '');
     if (e.status === 502 || e.status === 404) detApply(null); else renderDetToggle();
   }
@@ -4464,7 +4540,7 @@ async function subRequest(method, path, body, keepalive = false) {
     });
     let data = null;
     try { data = await res.json(); } catch (_) {}
-    if (!res.ok || !data) { const e = new Error((data && data.error) || 'HTTP ' + res.status); e.status = res.status; throw e; }
+    if (!res.ok || !data) { const e = new Error((data && data.error) || 'HTTP ' + res.status); e.status = res.status; e.code = data && data.code; throw e; }
     return data;
   } finally { clearTimeout(tm); }
 }
@@ -4504,12 +4580,13 @@ function subDropNow(sub) {
   if (sub.id) { subRequest('DELETE', 'subscribe/' + encodeURIComponent(sub.id), undefined, true).catch(() => {}); sub.id = null; }
 }
 /* Bring OVSUB in line with the overlay preference and the page's visibility. */
-async function ovSync() {
+async function ovSync(byUser = false) {
   const want = VM.subs && OV.on && !document.hidden;
   const err = await subHold(OVSUB, want ? vmPipelines(OV.pipes) : null);
   if (err && OV.on) {
     OV.on = false;
-    toast(t(err.status === 409 ? 'vm.noyolo' : 'vm.fail'), 'err', err.status ? String(err.status) : '');
+    if (err.code === 'OPERATOR_REQUIRED') { if (byUser) opRequire('/api/v1/vision/subscribe'); }
+    else toast(t(err.status === 409 ? 'vm.noyolo' : 'vm.fail'), 'err', err.status ? String(err.status) : '');
     await subHold(OVSUB, null);
   }
   DET.enabled = !!(DET.avail && OV.on);
@@ -4519,7 +4596,7 @@ async function ovSync() {
 function ovSet(on, pipes) {
   if (pipes) { OV.pipes = pipes; store('rebot.vision.pipes', pipes); }
   OV.on = on; S.detHoldUntil = 0;
-  return ovSync();
+  return ovSync(true);
 }
 async function vmRequest(method, body, keepalive = false) {
   const ctl = new AbortController();
@@ -4533,7 +4610,7 @@ async function vmRequest(method, body, keepalive = false) {
     let data = null;
     try { data = await res.json(); } catch (_) {}
     if (!res.ok || !data || typeof data.mode !== 'string') {
-      const e = new Error((data && data.error) || 'HTTP ' + res.status); e.status = res.status; throw e;
+      const e = new Error((data && data.error) || 'HTTP ' + res.status); e.status = res.status; e.code = data && data.code; throw e;
     }
     return data;
   } finally { clearTimeout(tm); }
@@ -4582,6 +4659,7 @@ async function setVisionMode(mode) {
     VM.busy = false; S.detHoldUntil = 0; vmApply(data);
   } catch (e) {
     VM.busy = false;
+    if (e.code === 'OPERATOR_REQUIRED') { opRequire('/api/v1/vision/mode'); renderVisionMode(); return; }
     toast(t(e.status === 409 ? 'vm.noyolo' : 'vm.fail'), 'err', e.status ? String(e.status) : '');
     if (e.status === 502 || e.status === 404) vmFailed(e); else renderVisionMode();
   }
@@ -6907,6 +6985,9 @@ function getCodeMap() {
   return cm;
 }
 window.addEventListener('keydown', (e) => {
+  // The operator dialog owns Escape (cancel; it has its own E-stop button): an Escape meant to dismiss
+  // an automatically opened PIN prompt must not latch an E-stop that then needs the PIN to reset.
+  if (e.key === 'Escape' && opIsOpen()) return;
   const isTyping = e.target && (e.target.tagName === 'TEXTAREA' || (e.target.tagName === 'INPUT' && (e.target.type === 'text' || e.target.type === 'password' || e.target.type === 'number')));
   if (isTyping) {
     if (e.key === 'Escape') { e.preventDefault(); eStop(); }
@@ -11929,6 +12010,7 @@ function renderCollision(live, ts) {
     setText($('col-sub'), t('col.sub'));
   }
   $('col-clear').hidden = !escalated;
+  if (escalated) setText($('col-clear'), t(opLocked() ? 'op.inline_fault' : 'en.clear_fault'));
   // residual torque bars at ~10 Hz (the observation arrives at up to 50 Hz)
   if (ts - COL.barAt < 100) return;
   COL.barAt = ts;
@@ -12006,6 +12088,9 @@ function frame(ts) {
   // After a fault is cleared the motors may still hold the arm (safety Idle, torque on): say so.
   const holdingIdle = live && !stopped && !en && S.state === 'Idle' && torqued;
   $('btn-park-off').hidden = !holdingIdle || leaseOther() != null;
+  const opClear = live && stopped && opLocked() && clearNeedsOperator();
+  $('op-inline').hidden = !opClear;
+  if (opClear) setText($('op-inline'), t(S.state === 'EStop' ? 'op.inline' : 'op.inline_fault'));
   setText($('enable-txt'), stopped ? (S.state === 'EStop' ? t('en.reset_estop') : t('en.clear_fault')) : en ? (enableUnknown ? t('en.on_unconfirmed') : t('st.Armed')) : holdingIdle ? t('en.holding') : t('en.enable'));
   setText($('enable-sub'), stopped ? t('en.sub_reset') : en ? t('en.sub_off') : t('en.hold'));
   eb.disabled = !live || leaseOther() != null;
@@ -13159,6 +13244,71 @@ function reconnectWS() {
   connectWS();
   if (old) { try { old.close(); } catch (_) {} }
 }
+/* Operator access. The badge in the header opens the dialog; a privileged request refused with OPERATOR_REQUIRED
+   opens it with the reason (opRequire). After an unlock the token goes to the open telemetry socket ({type:"auth"}),
+   so the lease (and a torqued arm) stays; an armd without that message gets a reconnect, as before. */
+const OP = { waiters: [], why: null, retry: false, ack: null, seq: 0, lastFocus: null };
+const opLocked = () => S.auth.enforced && S.auth.role !== 'operator';
+const opIsOpen = () => !!$('op-modal') && !$('op-modal').hidden;
+// Resetting needs the operator: a latched E-stop, a non-recoverable fault, an escalated collision (armd ws.rs)
+function clearNeedsOperator() {
+  if (S.state === 'EStop') return true;
+  const f = S.obs && S.obs.fault;
+  return S.state === 'Fault' && (!f || f.recoverable === false || S.faultCode === 'COLLISION');
+}
+function opReasonKey(path, body) {
+  const p = String(path || '');
+  if (p === 'lease.force') return 'op.why.take';
+  if (p === '/api/v1/mode/gravity_comp') return 'op.why.gc';
+  if (p === '/api/v1/safety/clear_fault') return S.state === 'EStop' ? 'op.why.estop' : 'op.why.fault';
+  if (/^\/api\/v1\/(detection|vision)\//.test(p) || p === '/api/v1/grasp/measure') return 'op.why.det';
+  if (/^\/api\/v1\/(calibration|gripper\/calibration|grasp\/setup)/.test(p) || p === '/api/v1/action/gripper_zero_check') return 'op.why.calib';
+  if (/^\/api\/v1\/(poses|sequences)\//.test(p)) return 'op.why.poses';
+  if (p === '/api/v1/action/run_sequence' && body && body.record) return 'op.why.rec';
+  if (/^\/api\/v1\/(record|dataset|episodes|datasets)\//.test(p)) return 'op.why.rec';
+  if (p === '/api/v1/workspace/keepout' || p === '/api/v1/safety/collision') return 'op.why.safety';
+  if (/^\/api\/v1\/sandbox\//.test(p)) return 'op.why.sandbox';
+  return 'op.why.default';
+}
+// Run again after the unlock: only these user-initiated, repeatable requests; never a motion.
+function opCanRetry(path, body) {
+  return (path === '/api/v1/mode/gravity_comp' && !!body && body.enable === true)
+    || path === '/api/v1/detection/trigger' || path === '/api/v1/safety/clear_fault' || path === '/api/v1/calibration/apply';
+}
+/* Ask for the operator PIN because `path` was refused. Resolves true after an unlock, false on cancel. */
+function opRequire(path, body) {
+  if (S.auth.role === 'operator') { S.auth.role = 'program'; S.auth.expiresIn = null; scheduleAuthExpiryRefresh(); }
+  S.auth.enforced = true;
+  renderOpBadge();
+  return new Promise((resolve) => {
+    OP.waiters.push(resolve);
+    openOperatorModal(opReasonKey(path, body), opCanRetry(path, body));
+  });
+}
+function opSettle(ok) {
+  const w = OP.waiters; OP.waiters = [];
+  for (const r of w) r(ok);
+}
+// Resolves once the telemetry socket is open (a reconnect after an unlock on an older armd), or after `ms`.
+function wsOpen(ms) {
+  const end = Date.now() + ms;
+  return new Promise((resolve) => {
+    const poll = () => { if ((S.ws && S.ws.readyState === 1 && S.epoch != null) || Date.now() > end) resolve(); else setTimeout(poll, 50); };
+    poll();
+  });
+}
+/* Hand `token` (null: none) to the open telemetry socket; fall back to a reconnect when armd does not answer. */
+function opSyncSocket(token) {
+  const ws = S.ws;
+  if (!ws || ws.readyState !== 1) return Promise.resolve(); // the next socket carries the cookie
+  return new Promise((resolve) => {
+    const seq = ++OP.seq;
+    const fallback = () => { OP.ack = null; reconnectWS(); resolve(); };
+    const timer = setTimeout(fallback, 1500);
+    OP.ack = { ws, seq, done: () => { clearTimeout(timer); OP.ack = null; resolve(); } };
+    try { ws.send(JSON.stringify({ type: 'auth', seq, token })); } catch (_) { clearTimeout(timer); fallback(); }
+  });
+}
 function renderOpBadge() {
   const b = $('btn-op');
   if (!b) return;
@@ -13167,8 +13317,9 @@ function renderOpBadge() {
   const unlocked = S.auth.role === 'operator';
   b.classList.toggle('is-unlocked', unlocked);
   b.textContent = unlocked ? t('op.unlocked') : t('op.locked');
-  const lockBtn = $('op-lock');
-  if (lockBtn) lockBtn.hidden = !unlocked;
+  const tip = t(unlocked ? 'op.badge.unlocked' : 'op.badge.locked');
+  b.title = tip; b.setAttribute('aria-label', tip);
+  if (opIsOpen()) renderOperatorModal();
 }
 let authRefreshTimer = null;
 function scheduleAuthExpiryRefresh() {
@@ -13177,6 +13328,7 @@ function scheduleAuthExpiryRefresh() {
     authRefreshTimer = null;
   }
   if (S.auth.enforced && S.auth.role === 'operator' && typeof S.auth.expiresIn === 'number' && S.auth.expiresIn > 0) {
+    S.auth.expiresAt = Date.now() + S.auth.expiresIn * 1000;
     const delayMs = Math.min(S.auth.expiresIn * 1000 + 250, 2147483647);
     authRefreshTimer = setTimeout(() => {
       authRefreshTimer = null;
@@ -13189,28 +13341,69 @@ async function loadAuthStatus() {
     const res = await fetch('/api/v1/auth/status', { cache: 'no-store' });
     if (!res.ok) return;
     const d = await res.json();
+    const was = S.auth.role;
     S.auth.enforced = !!d.auth_enforced;
     S.auth.role = d.role || 'program';
     S.auth.expiresIn = d.expires_in_s ?? null;
+    if (was === 'operator' && S.auth.role !== 'operator' && S.auth.enforced) toast(t('op.expired'), 'warn');
     scheduleAuthExpiryRefresh();
     renderOpBadge();
   } catch (_) {}
 }
-function openOperatorModal() {
-  if (!$('op-modal')) return;
-  $('op-modal').hidden = false;
-  $('op-pin').value = '';
-  setText($('op-status'), S.auth.role === 'operator' ? t('op.unlocked_msg') : '--');
-  $('op-lock').hidden = S.auth.role !== 'operator';
-  $('op-pin').focus({ preventScroll: true });
+// Fit the dialog's box to the visual viewport: an on-screen keyboard shrinks it, the dialog stays above it.
+function opFit() {
+  const m = $('op-modal'), vv = window.visualViewport;
+  if (!m || m.hidden) return;
+  const h = vv ? vv.height : innerHeight;
+  if (vv) { m.style.top = Math.max(0, vv.offsetTop) + 'px'; m.style.height = h + 'px'; }
+  m.classList.toggle('op-short', h < 520);
 }
-function closeOperatorModal() {
-  if ($('op-modal')) $('op-modal').hidden = true;
+function renderOperatorModal() {
+  const unlocked = S.auth.role === 'operator';
+  setText($('op-why'), OP.why ? t(OP.why) : '');
+  setText($('op-retry'), OP.why && OP.retry && !unlocked ? t('op.retry') : '');
+  $('op-pin-field').hidden = unlocked;
+  $('op-unlock').hidden = unlocked;
+  $('op-lock').hidden = !unlocked;
+  $('op-hint').hidden = unlocked;
+  setText($('op-cancel'), t(unlocked ? 'op.close' : 'cancel'));
+  const left = unlocked && S.auth.expiresAt ? Math.max(0, Math.round((S.auth.expiresAt - Date.now()) / 60000)) : null;
+  setText($('op-state'), unlocked ? (left ? t('op.state_on', { m: left }) : t('op.state_on0')) : '');
+}
+function openOperatorModal(why = null, retry = false) {
+  const m = $('op-modal');
+  if (!m) return;
+  const wasOpen = !m.hidden;
+  if (why || !wasOpen) { OP.why = why; OP.retry = retry; }
+  if (!wasOpen) {
+    OP.lastFocus = document.activeElement;
+    $('op-pin').value = '';
+    setText($('op-status'), '');
+  }
+  m.hidden = false;
+  document.body.classList.add('op-open');
+  renderOperatorModal();
+  opFit();
+  if (S.auth.role !== 'operator') $('op-pin').focus({ preventScroll: true });
+  else $('op-cancel').focus({ preventScroll: true });
+}
+function closeOperatorModal(ok = false) {
+  const m = $('op-modal');
+  if (!m || m.hidden) { opSettle(ok); return; }
+  m.hidden = true;
+  m.style.top = ''; m.style.height = '';
+  document.body.classList.remove('op-open');
+  $('op-pin').value = '';
+  OP.why = null; OP.retry = false;
+  const f = OP.lastFocus; OP.lastFocus = null;
+  if (f && typeof f.focus === 'function' && document.contains(f)) { try { f.focus({ preventScroll: true }); } catch (_) {} }
+  opSettle(ok);
 }
 async function submitOperatorPin(ev) {
   if (ev) ev.preventDefault();
-  const pin = $('op-pin').value || '';
-  if (!pin) { setText($('op-status'), t('op.need_pin')); return; }
+  if (S.auth.role === 'operator') { closeOperatorModal(true); return; }
+  const pin = ($('op-pin').value || '').trim();
+  if (!pin) { setText($('op-status'), t('op.need_pin')); $('op-pin').focus({ preventScroll: true }); return; }
   $('op-unlock').disabled = true;
   try {
     const res = await fetch('/api/v1/auth/unlock', {
@@ -13220,7 +13413,8 @@ async function submitOperatorPin(ev) {
     });
     const d = await res.json().catch(() => ({}));
     if (!res.ok) {
-      setText($('op-status'), d.code === 'INVALID_PIN' ? t('op.bad_pin') : (d.message || t('op.bad_pin')));
+      setText($('op-status'), d.code === 'INVALID_PIN' ? t('op.bad_pin') : d.code === 'RATE_LIMITED' ? t('op.rate', { s: d.retry_after_s ?? '?' }) : (d.message || t('op.bad_pin')));
+      $('op-pin').select();
       return;
     }
     S.auth.role = d.role || 'operator';
@@ -13228,8 +13422,8 @@ async function submitOperatorPin(ev) {
     if (window.WASM_SIM) { window.WASM_SIM.telBlocked = false; window.WASM_SIM.telErrLogged = false; }
     scheduleAuthExpiryRefresh();
     renderOpBadge();
-    closeOperatorModal();
-    reconnectWS();
+    await opSyncSocket(d.token || null);
+    closeOperatorModal(true);
     toast(t('op.unlocked_msg'), 'ok');
   } catch (e) {
     setText($('op-status'), e.message || t('err.reqfail'));
@@ -13247,21 +13441,37 @@ async function lockOperator() {
     }
     S.auth.role = 'program';
     S.auth.expiresIn = null;
+    S.auth.expiresAt = null;
     scheduleAuthExpiryRefresh();
     renderOpBadge();
-    closeOperatorModal();
-    reconnectWS();
+    await opSyncSocket(null);
+    closeOperatorModal(false);
     toast(t('op.locked_msg'), 'warn');
   } catch (_) {
     toast(t('op.lock_fail'), 'err');
   }
 }
-$('btn-op')?.addEventListener('click', openOperatorModal);
-$('op-close')?.addEventListener('click', closeOperatorModal);
-$('op-modal')?.addEventListener('click', (e) => { if (e.target === e.currentTarget) closeOperatorModal(); });
+$('btn-op')?.addEventListener('click', () => openOperatorModal());
+$('op-cancel')?.addEventListener('click', () => closeOperatorModal(false));
+$('op-modal')?.addEventListener('pointerdown', (e) => { if (e.target === e.currentTarget) closeOperatorModal(false); });
 $('op-form')?.addEventListener('submit', submitOperatorPin);
 $('op-lock')?.addEventListener('click', lockOperator);
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && $('op-modal') && !$('op-modal').hidden) closeOperatorModal(); });
+$('op-estop')?.addEventListener('pointerdown', (e) => { e.preventDefault(); eStop(); });
+$('op-inline')?.addEventListener('click', () => { opRequire('/api/v1/safety/clear_fault').then((ok) => { if (ok && isStopped()) clearFault(); }); });
+document.addEventListener('keydown', (e) => {
+  if (!opIsOpen()) return;
+  // stopPropagation: the window handler below would take this Escape as an E-stop once the dialog is closed
+  if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeOperatorModal(false); return; }
+  if (e.key === 'Tab') { // keep focus inside the dialog
+    const f = [...$('op-modal').querySelectorAll('button:not([hidden]):not([disabled]), input:not([hidden])')].filter((x) => x.offsetParent !== null);
+    if (!f.length) return;
+    const i = f.indexOf(document.activeElement);
+    if (e.shiftKey && i <= 0) { e.preventDefault(); f[f.length - 1].focus(); }
+    else if (!e.shiftKey && i === f.length - 1) { e.preventDefault(); f[0].focus(); }
+  }
+});
+if (window.visualViewport) for (const ev of ['resize', 'scroll']) window.visualViewport.addEventListener(ev, opFit);
+i18nHooks.push(() => { if (opIsOpen()) renderOperatorModal(); });
 
 /* =================================================================
    Boot
