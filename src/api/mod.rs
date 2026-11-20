@@ -138,11 +138,14 @@ pub fn create_router_calibration_with_auth(
             "/api/v1/calibration/sessions",
             get(crate::calibration_sessions::get_sessions)
                 .post(crate::calibration_sessions::post_session)
-                .layer(DefaultBodyLimit::max(crate::calibration_sessions::MAX_BODY_BYTES)),
+                .layer(DefaultBodyLimit::max(crate::calibration_sessions::MAX_BODY_BYTES))
+                .layer(middleware::from_fn(require_operator_for_writes)),
         )
         .route(
             "/api/v1/calibration/sessions/{id}",
-            get(crate::calibration_sessions::get_session).delete(crate::calibration_sessions::delete_session),
+            get(crate::calibration_sessions::get_session)
+                .delete(crate::calibration_sessions::delete_session)
+                .layer(middleware::from_fn(require_operator_for_writes)),
         )
         .route("/", get(serve_index))
         .route("/assets/jmuxer.min.js", get(serve_jmuxer))
@@ -204,7 +207,7 @@ pub fn create_router_calibration_with_auth(
         .route("/api/v1/mode/gravity_comp", post(rest::action_requires_lease))
         .route("/api/v1/gripper/calibration", get(rest::get_gripper_calibration))
         .route("/api/v1/grasp/setup", get(rest::get_grasp_setup))
-        .route(crate::depth_measure::PATH, post(rest::post_grasp_measure))
+        .route(crate::depth_measure::PATH, post(rest::post_grasp_measure).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/workspace/keepout", get(rest::get_keepout))
         .route("/api/v1/safety/collision", get(rest::get_collision))
         .route("/api/v1/safety/describe", get(rest::get_safety_describe))
@@ -217,7 +220,12 @@ pub fn create_router_calibration_with_auth(
         .route("/api/v1/dataset/episodes", get(rest::dataset_episodes))
         .route("/api/v1/dataset/episodes/{id}", axum::routing::delete(rest::dataset_episode_delete).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/episodes", get(rest::get_episodes))
-        .route("/api/v1/episodes/import", post(rest::episodes_import).layer(DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
+        .route(
+            "/api/v1/episodes/import",
+            post(rest::episodes_import)
+                .layer(DefaultBodyLimit::max(IMPORT_BODY_LIMIT))
+                .layer(middleware::from_fn(require_operator)),
+        )
         .route("/api/v1/episodes/{id}", get(rest::get_episode))
         .route("/api/v1/episodes/{id}/data", get(rest::get_episode_data))
         .route("/api/v1/datasets", get(rest::get_datasets))

@@ -520,9 +520,20 @@ fn check_operator_privilege(
         | "/api/v1/gripper/calibration"
         | "/api/v1/calibration/apply"
         | "/api/v1/calibration/restore"
+        | "/api/v1/calibration/motor_zero"
+        | "/api/v1/calibration/joint_zero/restore"
         | "/api/v1/poses/save"
+        | "/api/v1/poses/rename"
         | "/api/v1/poses/delete"
+        | "/api/v1/sequences/save"
+        | "/api/v1/sequences/delete"
         | "/api/v1/grasp/setup" => Some(ApiError::operator_required(path)),
+        // a sequence run that records writes episodes (like /api/v1/dataset/record/*)
+        "/api/v1/action/run_sequence"
+            if body.get("record").is_some_and(|r| !r.is_null()) =>
+        {
+            Some(ApiError::operator_required("run_sequence (record)"))
+        }
         "/api/v1/action/gripper_zero_check"
             if body.get("store_offset").and_then(Value::as_bool) == Some(true) =>
         {
@@ -547,6 +558,17 @@ fn check_operator_privilege(
         }
         _ => None,
     }
+}
+
+/// OperatorAuth for the WS commands handled without a lease (teach v1 episode store and
+/// recorder, depth measurement). Every one of them writes the episode store or triggers the
+/// camera, so it needs an operator session when auth is enforced, like
+/// `/api/v1/dataset/record/*` and `/api/v1/detection/trigger`; the owner can always end a
+/// recording without saving it (`record/stop {save: false}`).
+fn lease_free_operator_check(auth: &crate::auth::OperatorAuth, ws_token: Option<&str>, path: &str, body: &Value) -> Option<ApiError> {
+    if !auth.is_enforced() || auth.is_operator(ws_token) { return None; }
+    if path == "/api/v1/record/stop" && body.get("save").and_then(Value::as_bool) == Some(false) { return None; }
+    Some(ApiError::operator_required(path))
 }
 
 /// A calibration command checked under the lock.
@@ -747,6 +769,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     continue;
                 }
                 last_request = request_id;
+                if let Some(e) = lease_free_operator_check(&auth, ws_token.as_deref(), crate::depth_measure::PATH, &value["body"]) {
+                    let mut reply = rejection(e, "command_reject", recv_supervisor.inner().read().await.safety.epoch_id());
+                    reply["request_id"] = value["request_id"].clone();
+                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                    continue;
+                }
                 let (sup, source, tx) = (recv_supervisor.clone(), recv_deps.source.clone(), ack_tx.clone());
                 tokio::spawn(async move {
                     let result = crate::depth_measure::measure(&sup, source.as_ref(), &value["body"]).await;
@@ -763,6 +791,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     continue;
                 }
                 last_request = request_id;
+                if let Some(e) = lease_free_operator_check(&auth, ws_token.as_deref(), value["path"].as_str().unwrap_or(""), &value["body"]) {
+                    let mut reply = rejection(e, "command_reject", recv_supervisor.inner().read().await.safety.epoch_id());
+                    reply["request_id"] = value["request_id"].clone();
+                    if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
+                    continue;
+                }
                 let caller = crate::teach::Caller {
                     connection: recv_connection.clone(),
                     client_id: value.get("client_id").and_then(Value::as_str).map(str::to_string).or_else(|| client_label.clone()),
