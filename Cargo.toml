@@ -12,6 +12,9 @@ categories = ["science::robotics"]
 publish = false
 
 [features]
+# The device build carries the policy runtime with both backends (RMLP and tract ONNX);
+# the package manifest picks the backend. `--no-default-features` builds armd without it.
+default = ["policy-tract"]
 policy-runtime = []
 policy-tract = ["policy-runtime", "dep:tract-onnx"]
 

@@ -2751,6 +2751,174 @@ mod tract_e2e {
             );
         }
     }
+
+    /// ONNX MatMul/Add(/Relu) chain for `dims` = [in, h1, ..., out]; `fill` sets every weight.
+    pub(super) fn mlp_onnx(dims: &[usize], fill: f32) -> Vec<u8> {
+        let mut graph = Vec::new();
+        let mut inits = Vec::new();
+        let mut prev = "obs".to_string();
+        for (k, w) in dims.windows(2).enumerate() {
+            let (i, o) = (w[0], w[1]);
+            let (wn, bn, mm, ad) = (format!("W{k}"), format!("B{k}"), format!("mm{k}"), format!("a{k}"));
+            inits.push(make_f32_tensor(&wn, &[i as i64, o as i64], &vec![fill; i * o]));
+            inits.push(make_f32_tensor(&bn, &[o as i64], &vec![0.0; o]));
+            pb_bytes(1, &make_node("MatMul", &[&prev, &wn], &[&mm], &mm), &mut graph);
+            let last = k + 2 == dims.len();
+            let out = if last { "act".to_string() } else { format!("h{k}") };
+            if last {
+                pb_bytes(1, &make_node("Add", &[&mm, &bn], &[&out], &ad), &mut graph);
+            } else {
+                pb_bytes(1, &make_node("Add", &[&mm, &bn], &[&ad], &ad), &mut graph);
+                pb_bytes(1, &make_node("Relu", &[&ad], &[&out], &format!("r{k}")), &mut graph);
+            }
+            prev = out;
+        }
+        pb_str(2, "mlp", &mut graph);
+        for t in inits {
+            pb_bytes(5, &t, &mut graph);
+        }
+        pb_bytes(11, &make_value_info("obs", &[make_dim(1), make_dim(dims[0] as i64)]), &mut graph);
+        pb_bytes(12, &make_value_info("act", &[make_dim(1), make_dim(*dims.last().unwrap() as i64)]), &mut graph);
+        let mut opset = Vec::new();
+        pb_str(1, "", &mut opset);
+        pb_int(2, 13, &mut opset);
+        let mut onnx = Vec::new();
+        pb_int(1, 8, &mut onnx);
+        pb_bytes(7, &graph, &mut onnx);
+        pb_bytes(8, &opset, &mut onnx);
+        onnx
+    }
+
+    fn budget_err(bytes: &[u8]) -> String {
+        match armd::policy_runtime::TractBackend::from_onnx_bytes(bytes) {
+            Err(PolicyError::ResourceBudget(m)) => m,
+            Err(e) => panic!("expected ResourceBudget, got {e:?}"),
+            Ok(_) => panic!("expected ResourceBudget, model loaded"),
+        }
+    }
+
+    /// Item 5: tract budgets are enforced before tract parses / optimizes the model.
+    #[test]
+    fn tract_budgets_refuse_large_models_before_loading() {
+        use armd::policy_runtime::manifest::{onnx_resource_budget, MAX_ONNX_NODES};
+        // within budget: loads
+        let ok = mlp_onnx(&[6, 32, 6], 0.01);
+        let b = onnx_resource_budget(&ok).unwrap();
+        assert_eq!(b.nodes, 5);
+        assert_eq!(b.param_elements, 6 * 32 + 32 + 32 * 6 + 6);
+        armd::policy_runtime::TractBackend::from_onnx_bytes(&ok).unwrap();
+
+        // node count
+        let deep: Vec<usize> = std::iter::once(6).chain(std::iter::repeat_n(6, MAX_ONNX_NODES / 3 + 2)).collect();
+        assert!(budget_err(&mlp_onnx(&deep, 0.0)).contains("nodes"));
+
+        // parameter elements: a tensor that declares 2001 x 1000 (data never read)
+        let mut t = Vec::new();
+        pb_int(1, 2001, &mut t);
+        pb_int(1, 1000, &mut t);
+        pb_int(2, 1, &mut t);
+        pb_str(8, "W", &mut t);
+        let mut graph = Vec::new();
+        pb_bytes(1, &make_node("MatMul", &["obs", "W"], &["act"], "mm"), &mut graph);
+        pb_bytes(5, &t, &mut graph);
+        let mut onnx = Vec::new();
+        pb_int(1, 8, &mut onnx);
+        pb_bytes(7, &graph, &mut onnx);
+        assert!(budget_err(&onnx).contains("initializers"));
+
+        // subgraph attribute (If/Loop body)
+        let mut attr = Vec::new();
+        pb_str(1, "then_branch", &mut attr);
+        pb_bytes(6, &[], &mut attr);
+        let mut node = make_node("If", &["c"], &["act"], "if");
+        pb_bytes(5, &attr, &mut node);
+        let mut graph = Vec::new();
+        pb_bytes(1, &node, &mut graph);
+        let mut onnx = Vec::new();
+        pb_int(1, 8, &mut onnx);
+        pb_bytes(7, &graph, &mut onnx);
+        assert!(budget_err(&onnx).contains("subgraphs"));
+
+        // intermediate tensors: Expand [1, 6] -> [200000, 6] (1.2 M elements) with tiny params
+        let mut shape_t = Vec::new();
+        pb_int(1, 2, &mut shape_t);
+        pb_int(2, 7, &mut shape_t); // INT64
+        pb_str(8, "shape", &mut shape_t);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&200_000i64.to_le_bytes());
+        raw.extend_from_slice(&6i64.to_le_bytes());
+        pb_bytes(9, &raw, &mut shape_t);
+        let mut axes = Vec::new();
+        pb_str(1, "axes", &mut axes);
+        pb_int(8, 0, &mut axes);
+        pb_int(20, 7, &mut axes); // INTS
+        let mut reduce = make_node("ReduceMean", &["big"], &["act"], "rm");
+        pb_bytes(5, &axes, &mut reduce);
+        let mut graph = Vec::new();
+        pb_bytes(1, &make_node("Expand", &["obs", "shape"], &["big"], "ex"), &mut graph);
+        pb_bytes(1, &reduce, &mut graph);
+        pb_str(2, "wide", &mut graph);
+        pb_bytes(5, &shape_t, &mut graph);
+        pb_bytes(11, &make_value_info("obs", &[make_dim(1), make_dim(6)]), &mut graph);
+        pb_bytes(12, &make_value_info("act", &[make_dim(1), make_dim(6)]), &mut graph);
+        let mut opset = Vec::new();
+        pb_str(1, "", &mut opset);
+        pb_int(2, 13, &mut opset);
+        let mut wide = Vec::new();
+        pb_int(1, 8, &mut wide);
+        pb_bytes(7, &graph, &mut wide);
+        pb_bytes(8, &opset, &mut wide);
+        assert!(budget_err(&wide).contains("intermediate"), "{}", budget_err(&wide));
+    }
+
+    /// Largest RMLP the device accepts: 1.98 M parameters, 7.9 MB.
+    pub(super) const MAX_DIMS: [usize; 5] = [6, 1024, 1024, 900, 6];
+
+    /// Host measurement of load + per-step time for the largest allowed model of each
+    /// backend (run with --ignored under /usr/bin/time -v for peak RSS).
+    #[test]
+    #[ignore]
+    fn bench_largest_model_tract() {
+        let onnx = mlp_onnx(&MAX_DIMS, 0.001);
+        println!("onnx bytes {}", onnx.len());
+        assert!(onnx.len() <= armd::policy_runtime::MAX_MODEL_BYTES);
+        let t0 = Instant::now();
+        let mut be = armd::policy_runtime::TractBackend::from_onnx_bytes(&onnx).unwrap();
+        println!("tract load {:?}", t0.elapsed());
+        drop(onnx);
+        let (inp, mut out) = ([0.1f32; 6], [0.0f32; 6]);
+        be.infer(&inp, &mut out).unwrap();
+        let t0 = Instant::now();
+        for _ in 0..200 { be.infer(&inp, &mut out).unwrap(); }
+        println!("tract step {:?}", t0.elapsed() / 200);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_largest_model_rmlp() {
+        let layers: Vec<MlpLayerSpec> = MAX_DIMS.windows(2).enumerate().map(|(k, w)| {
+            MlpLayerSpec::new(w[0], w[1], if k + 2 == MAX_DIMS.len() { Activation::None } else { Activation::Relu }, vec![0.001; w[0] * w[1]], vec![0.0; w[1]])
+        }).collect();
+        let bytes = encode_rmlp_bytes(&layers).unwrap();
+        drop(layers);
+        println!("rmlp bytes {}", bytes.len());
+        assert!(bytes.len() <= armd::policy_runtime::MAX_MODEL_BYTES);
+        let t0 = Instant::now();
+        let mut be = MlpBackend::from_rmlp_bytes(&bytes).unwrap();
+        println!("rmlp load {:?}", t0.elapsed());
+        drop(bytes);
+        let (inp, mut out) = ([0.1f32; 6], [0.0f32; 6]);
+        be.infer(&inp, &mut out).unwrap();
+        let t0 = Instant::now();
+        for _ in 0..200 { be.infer(&inp, &mut out).unwrap(); }
+        println!("rmlp step {:?}", t0.elapsed() / 200);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_baseline_harness() {
+        println!("baseline");
+    }
 }
 
 mod phase2_vision {
@@ -6382,6 +6550,24 @@ mod review_fix_tests {
         let a = obs.action.unwrap();
         assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("TARGET_TIMEOUT")), "{:?}", obs.policy);
         drop(prepared);
+    }
+
+    /// Item 5: budgets checked before parsing: model file size and the JSON MLP size.
+    #[test]
+    fn model_and_json_size_budgets_are_checked_before_parsing() {
+        use armd::policy_runtime::{MlpBackend, MAX_MLP_JSON_BYTES, MAX_MODEL_BYTES};
+        // 4 MiB + 1 of whitespace is not parsed at all
+        let big = vec![b' '; MAX_MLP_JSON_BYTES + 1];
+        assert!(matches!(MlpBackend::from_json_bytes(&big), Err(PolicyError::ResourceBudget(_))));
+        // a model file over the package limit is refused before it is read
+        let dir = tempdir().unwrap();
+        let layers = vec![MlpLayerSpec::new(6, 6, Activation::None, vec![0.0; 36], vec![0.0; 6])];
+        write_rmlp_pack(dir.path(), &["j1", "j2", "j3", "j4", "j5", "j6"], "rad", &layers, serde_json::json!({}));
+        fs::write(dir.path().join("model.rmlp"), vec![0u8; MAX_MODEL_BYTES + 1]).unwrap();
+        let err = PolicySnapshot::load_from_dir(dir.path()).err().unwrap();
+        assert!(matches!(err, PolicyError::ResourceBudget(_)), "{err:?}");
+        let arm: ArmError = err.into();
+        assert!(matches!(arm, ArmError::Rejected { status: 413, ref code, .. } if code == "POLICY_TOO_LARGE"));
     }
 }
 

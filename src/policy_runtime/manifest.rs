@@ -15,7 +15,12 @@ use super::PolicyError;
 
 pub const POLICY_FORMAT_V1: &str = "rebot-onnx-policy/v1";
 pub const MAX_POLICY_JSON_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_MODEL_BYTES: usize = 64 * 1024 * 1024;
+/// Largest model file in a policy package. The largest RMLP the MLP backend accepts
+/// (MAX_PARAMS = 2M f32 = 8.0 MB) fits; loading needs about twice the file in memory (file
+/// bytes + weights), well inside the ~130 MB the SG2002 has free next to armd and
+/// rebot-vision. ONNX models share the limit and the node / parameter budget in
+/// `onnx_resource_budget`.
+pub const MAX_MODEL_BYTES: usize = 8 * 1024 * 1024 + 4096;
 pub const MAX_VISION_STALENESS_MS: u64 = 500;
 pub const DEFAULT_VISION_MIN_SCORE: f32 = 0.3;
 const MAX_ONNX_PROTO_DEPTH: usize = 32;
@@ -225,7 +230,7 @@ fn read_bounded_file(path: &Path, max_bytes: usize, label: &str) -> Result<Vec<u
         return Err(PolicyError::InvalidArtifact(format!("{label} is empty")));
     }
     if meta.len() > max_bytes as u64 {
-        return Err(PolicyError::InvalidArtifact(format!(
+        return Err(PolicyError::ResourceBudget(format!(
             "{label} size ({} bytes) exceeds maximum allowed ({max_bytes} bytes)",
             meta.len()
         )));
@@ -241,7 +246,7 @@ fn read_bounded_file(path: &Path, max_bytes: usize, label: &str) -> Result<Vec<u
         return Err(PolicyError::InvalidArtifact(format!("{label} is empty")));
     }
     if buf.len() > max_bytes {
-        return Err(PolicyError::InvalidArtifact(format!(
+        return Err(PolicyError::ResourceBudget(format!(
             "{label} exceeds maximum allowed size ({max_bytes} bytes)"
         )));
     }
@@ -1251,6 +1256,121 @@ pub fn reject_external_onnx_data(model_bytes: &[u8]) -> Result<(), PolicyError> 
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ONNX resource budget (checked before tract parses or optimizes the model)
+// ---------------------------------------------------------------------------
+
+/// Most nodes in an ONNX graph accepted for the tract backend.
+pub const MAX_ONNX_NODES: usize = 512;
+/// Most initializer / constant elements (all tensors together) for the tract backend; the
+/// same parameter budget as the MLP backend ([`super::mlp::MAX_PARAMS`]).
+pub const MAX_ONNX_PARAM_ELEMENTS: u64 = super::mlp::MAX_PARAMS as u64;
+/// Most elements in all intermediate tensors of the typed graph (one inference).
+pub const MAX_ONNX_ACTIVATION_ELEMENTS: u64 = 1_000_000;
+const MAX_ONNX_TENSOR_RANK: usize = 8;
+
+/// Counts from [`onnx_resource_budget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OnnxBudget {
+    pub nodes: usize,
+    pub param_elements: u64,
+}
+
+fn budget_err(msg: String) -> PolicyError {
+    PolicyError::ResourceBudget(msg)
+}
+
+/// Element count of one `TensorProto` from its `dims` (field 1, packed or not).
+fn tensor_elements(buf: &[u8]) -> Result<u64, PolicyError> {
+    let mut dims: Vec<u64> = Vec::new();
+    let mut pos = 0;
+    while let Some((field_num, wire_type, val)) = next_pb_field(buf, &mut pos)? {
+        match (field_num, wire_type, val) {
+            (1, 0, PbValue::Varint(d)) => dims.push(d),
+            (1, 2, PbValue::LenDelimited(packed)) => {
+                let mut p = 0;
+                while p < packed.len() {
+                    dims.push(read_varint(packed, &mut p)?);
+                }
+            }
+            _ => {}
+        }
+        if dims.len() > MAX_ONNX_TENSOR_RANK {
+            return Err(budget_err(format!("ONNX tensor rank exceeds {MAX_ONNX_TENSOR_RANK}")));
+        }
+    }
+    dims.iter().try_fold(1u64, |acc, &d| acc.checked_mul(d)).ok_or_else(|| budget_err("ONNX tensor element count overflows".into()))
+}
+
+fn budget_attribute(buf: &[u8], b: &mut OnnxBudget) -> Result<(), PolicyError> {
+    let mut pos = 0;
+    while let Some((field_num, wire_type, val)) = next_pb_field(buf, &mut pos)? {
+        if let (2, PbValue::LenDelimited(sub)) = (wire_type, val) {
+            match field_num {
+                5 | 10 => add_params(b, tensor_elements(sub)?)?,
+                6 | 11 => return Err(budget_err("ONNX subgraphs (If / Loop / Scan bodies) are not supported by the device backend".into())),
+                22 | 23 => return Err(budget_err("ONNX sparse tensors are not supported by the device backend".into())),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_params(b: &mut OnnxBudget, n: u64) -> Result<(), PolicyError> {
+    b.param_elements = b.param_elements.checked_add(n).ok_or_else(|| budget_err("ONNX parameter count overflows".into()))?;
+    if b.param_elements > MAX_ONNX_PARAM_ELEMENTS {
+        return Err(budget_err(format!(
+            "ONNX initializers hold more than {MAX_ONNX_PARAM_ELEMENTS} elements"
+        )));
+    }
+    Ok(())
+}
+
+/// Count nodes and parameter elements of an ONNX `ModelProto` without building it, and
+/// refuse models over [`MAX_ONNX_NODES`] / [`MAX_ONNX_PARAM_ELEMENTS`], with subgraphs,
+/// sparse tensors or model-local functions.
+pub fn onnx_resource_budget(model_bytes: &[u8]) -> Result<OnnxBudget, PolicyError> {
+    let mut b = OnnxBudget::default();
+    let mut graphs = 0;
+    let mut pos = 0;
+    while let Some((field_num, wire_type, val)) = next_pb_field(model_bytes, &mut pos)? {
+        let (2, PbValue::LenDelimited(sub)) = (wire_type, val) else { continue };
+        match field_num {
+            7 => {
+                graphs += 1;
+                let mut gpos = 0;
+                while let Some((gf, gw, gv)) = next_pb_field(sub, &mut gpos)? {
+                    let (2, PbValue::LenDelimited(gsub)) = (gw, gv) else { continue };
+                    match gf {
+                        1 => {
+                            b.nodes += 1;
+                            if b.nodes > MAX_ONNX_NODES {
+                                return Err(budget_err(format!("ONNX graph has more than {MAX_ONNX_NODES} nodes")));
+                            }
+                            let mut npos = 0;
+                            while let Some((nf, nw, nv)) = next_pb_field(gsub, &mut npos)? {
+                                if let (5, 2, PbValue::LenDelimited(attr)) = (nf, nw, nv) {
+                                    budget_attribute(attr, &mut b)?;
+                                }
+                            }
+                        }
+                        5 => add_params(&mut b, tensor_elements(gsub)?)?,
+                        15 => return Err(budget_err("ONNX sparse initializers are not supported by the device backend".into())),
+                        _ => {}
+                    }
+                }
+            }
+            25 => return Err(budget_err("ONNX model-local functions are not supported by the device backend".into())),
+            _ => {}
+        }
+    }
+    if graphs != 1 {
+        return Err(PolicyError::InvalidArtifact(format!("ONNX model must contain exactly one graph, found {graphs}")));
+    }
+    Ok(b)
 }
 
 #[cfg(test)]

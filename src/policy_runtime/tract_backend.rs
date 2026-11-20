@@ -5,7 +5,7 @@ use std::io::Cursor;
 use tract_onnx::prelude::*;
 use tract_onnx::tract_hir::infer::Factoid;
 
-use super::manifest::reject_external_onnx_data;
+use super::manifest::{onnx_resource_budget, reject_external_onnx_data, MAX_ONNX_ACTIVATION_ELEMENTS};
 use super::{PolicyBackend, PolicyError};
 
 pub struct TractBackend {
@@ -18,6 +18,8 @@ impl TractBackend {
     /// Load ONNX model bytes into a static-shape `[1, input_dim] -> [1, output_dim]` runnable plan.
     pub fn from_onnx_bytes(model_bytes: &[u8]) -> Result<Self, PolicyError> {
         reject_external_onnx_data(model_bytes)?;
+        // node / parameter budget before tract builds anything
+        onnx_resource_budget(model_bytes)?;
 
         let mut cursor = Cursor::new(model_bytes);
         let model = tract_onnx::onnx()
@@ -56,6 +58,29 @@ impl TractBackend {
         let input_dim = validate_static_2d_shape(&inf_in_shape, "ONNX input")?;
 
         let typed = model
+            .into_typed()
+            .map_err(|e| PolicyError::BackendLoad(format!("failed to type ONNX model: {e}")))?;
+        // intermediate tensor budget before the (more expensive) optimization pass
+        let mut activation_elements: u64 = 0;
+        for node in typed.nodes() {
+            // constants are the parameters, already budgeted by onnx_resource_budget
+            if node.op_is::<tract_onnx::tract_core::ops::konst::Const>() {
+                continue;
+            }
+            for out in &node.outputs {
+                let shape = out.fact.shape.as_concrete().ok_or_else(|| {
+                    PolicyError::ResourceBudget(format!("ONNX node '{}' has a symbolic output shape", node.name))
+                })?;
+                let n = shape.iter().try_fold(1u64, |acc, &d| acc.checked_mul(d as u64));
+                activation_elements = n
+                    .and_then(|n| activation_elements.checked_add(n))
+                    .filter(|&t| t <= MAX_ONNX_ACTIVATION_ELEMENTS)
+                    .ok_or_else(|| PolicyError::ResourceBudget(format!(
+                        "ONNX intermediate tensors exceed {MAX_ONNX_ACTIVATION_ELEMENTS} elements"
+                    )))?;
+            }
+        }
+        let typed = typed
             .into_optimized()
             .map_err(|e| PolicyError::BackendLoad(format!("failed to optimize ONNX model: {e}")))?;
 

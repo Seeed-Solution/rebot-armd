@@ -6,8 +6,6 @@
 
 use std::f64::consts::FRAC_1_SQRT_2;
 
-use serde_json::Value;
-
 use super::{PolicyBackend, PolicyError};
 
 pub const RMLP_MAGIC: &[u8; 5] = b"RMLP\x01";
@@ -15,6 +13,9 @@ pub const MAX_LAYERS: usize = 16;
 pub const MAX_DIM: usize = 1024;
 pub const MAX_PARAMS: usize = 2_000_000;
 pub const MAX_MACS: usize = 4_000_000;
+/// Largest `.mlp.json` accepted (checked before parsing). About 400k parameters as text;
+/// larger models use the binary `.rmlp` format.
+pub const MAX_MLP_JSON_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Activation {
@@ -328,26 +329,40 @@ impl MlpBackend {
         Self::from_layers(layers)
     }
 
-    /// Decode JSON MLP format (`{"layers": [...]}`), enforcing hard limits before allocating weight buffers.
+    /// Decode JSON MLP format (`{"layers": [...]}`). The file size is checked against
+    /// [`MAX_MLP_JSON_BYTES`] before parsing, and the document is deserialized straight into
+    /// typed vectors (no `serde_json::Value` tree), so parsing allocates O(file size).
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, PolicyError> {
-        let root: Value = serde_json::from_slice(bytes)
+        #[derive(serde::Deserialize)]
+        struct JsonLayer {
+            in_dim: Option<u64>,
+            out_dim: Option<u64>,
+            activation: Option<String>,
+            weights: Option<Vec<f64>>,
+            bias: Option<Vec<f64>>,
+        }
+        #[derive(serde::Deserialize)]
+        struct JsonMlp {
+            format: Option<String>,
+            layers: Option<Vec<JsonLayer>>,
+        }
+        if bytes.len() > MAX_MLP_JSON_BYTES {
+            return Err(PolicyError::ResourceBudget(format!(
+                "MLP JSON is {} bytes; the limit is {MAX_MLP_JSON_BYTES} bytes (use the binary .rmlp format for larger models)",
+                bytes.len()
+            )));
+        }
+        let root: JsonMlp = serde_json::from_slice(bytes)
             .map_err(|e| PolicyError::InvalidArtifact(format!("invalid MLP JSON: {e}")))?;
-        let obj = root
-            .as_object()
-            .ok_or_else(|| PolicyError::InvalidArtifact("MLP JSON must be an object".into()))?;
-        if let Some(fmt) = obj.get("format") {
-            let s = fmt.as_str().ok_or_else(|| {
-                PolicyError::InvalidArtifact("MLP JSON format must be a string".into())
-            })?;
+        if let Some(s) = root.format.as_deref() {
             if s != "rebot-mlp/v1" {
                 return Err(PolicyError::InvalidArtifact(format!(
                     "unsupported MLP JSON format {s:?}"
                 )));
             }
         }
-        let layers_arr = obj
-            .get("layers")
-            .and_then(|v| v.as_array())
+        let layers_arr = root
+            .layers
             .ok_or_else(|| PolicyError::InvalidArtifact("MLP JSON must contain 'layers' array".into()))?;
         if layers_arr.is_empty() || layers_arr.len() > MAX_LAYERS {
             return Err(PolicyError::InvalidArtifact(format!(
@@ -361,18 +376,13 @@ impl MlpBackend {
         let mut prev_out_dim: Option<usize> = None;
         let mut layers = Vec::with_capacity(layers_arr.len());
 
-        for (idx, item) in layers_arr.iter().enumerate() {
-            let lobj = item.as_object().ok_or_else(|| {
-                PolicyError::InvalidArtifact(format!("MLP layer {idx} must be an object"))
-            })?;
-            let in_dim = lobj
-                .get("in_dim")
-                .and_then(|v| v.as_u64())
+        for (idx, item) in layers_arr.into_iter().enumerate() {
+            let in_dim = item
+                .in_dim
                 .ok_or_else(|| PolicyError::InvalidArtifact(format!("layer {idx} missing in_dim")))?
                 as usize;
-            let out_dim = lobj
-                .get("out_dim")
-                .and_then(|v| v.as_u64())
+            let out_dim = item
+                .out_dim
                 .ok_or_else(|| PolicyError::InvalidArtifact(format!("layer {idx} missing out_dim")))?
                 as usize;
 
@@ -412,59 +422,34 @@ impl MlpBackend {
                 )));
             }
 
-            let act_str = lobj
-                .get("activation")
-                .and_then(|v| v.as_str())
-                .unwrap_or("none");
-            let activation = Activation::from_str_name(act_str)?;
+            let activation = Activation::from_str_name(item.activation.as_deref().unwrap_or("none"))?;
 
-            let w_arr = lobj
-                .get("weights")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| PolicyError::InvalidArtifact(format!("layer {idx} missing weights")))?;
-            if w_arr.len() != w_count {
-                return Err(PolicyError::DimensionMismatch {
-                    expected: w_count,
-                    actual: w_arr.len(),
-                });
-            }
-            let mut weights = Vec::with_capacity(w_count);
-            for (wi, wv) in w_arr.iter().enumerate() {
-                let f64_v = wv.as_f64().ok_or_else(|| {
-                    PolicyError::InvalidArtifact(format!("layer {idx} weight[{wi}] must be numeric"))
-                })?;
-                let f32_v = f64_v as f32;
-                if !f64_v.is_finite() || !f32_v.is_finite() {
-                    return Err(PolicyError::NonFinite(format!(
-                        "layer {idx} weight[{wi}] is non-finite"
-                    )));
+            let to_f32 = |vals: Vec<f64>, expected: usize, what: &str| -> Result<Vec<f32>, PolicyError> {
+                if vals.len() != expected {
+                    return Err(PolicyError::DimensionMismatch { expected, actual: vals.len() });
                 }
-                weights.push(f32_v);
-            }
-
-            let b_arr = lobj
-                .get("bias")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| PolicyError::InvalidArtifact(format!("layer {idx} missing bias")))?;
-            if b_arr.len() != out_dim {
-                return Err(PolicyError::DimensionMismatch {
-                    expected: out_dim,
-                    actual: b_arr.len(),
-                });
-            }
-            let mut bias = Vec::with_capacity(out_dim);
-            for (bi, bv) in b_arr.iter().enumerate() {
-                let f64_v = bv.as_f64().ok_or_else(|| {
-                    PolicyError::InvalidArtifact(format!("layer {idx} bias[{bi}] must be numeric"))
-                })?;
-                let f32_v = f64_v as f32;
-                if !f64_v.is_finite() || !f32_v.is_finite() {
-                    return Err(PolicyError::NonFinite(format!(
-                        "layer {idx} bias[{bi}] is non-finite"
-                    )));
-                }
-                bias.push(f32_v);
-            }
+                vals.into_iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let f = v as f32;
+                        if v.is_finite() && f.is_finite() {
+                            Ok(f)
+                        } else {
+                            Err(PolicyError::NonFinite(format!("layer {idx} {what}[{i}] is non-finite")))
+                        }
+                    })
+                    .collect()
+            };
+            let weights = to_f32(
+                item.weights.ok_or_else(|| PolicyError::InvalidArtifact(format!("layer {idx} missing weights")))?,
+                w_count,
+                "weight",
+            )?;
+            let bias = to_f32(
+                item.bias.ok_or_else(|| PolicyError::InvalidArtifact(format!("layer {idx} missing bias")))?,
+                out_dim,
+                "bias",
+            )?;
 
             layers.push(MlpLayerSpec::new(in_dim, out_dim, activation, weights, bias));
         }

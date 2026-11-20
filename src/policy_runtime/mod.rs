@@ -22,7 +22,7 @@ pub use manifest::{
 };
 pub use mlp::{
     encode_rmlp_bytes, Activation, MlpBackend, MlpLayerSpec, RMLP_MAGIC, MAX_DIM, MAX_LAYERS,
-    MAX_MACS, MAX_PARAMS,
+    MAX_MACS, MAX_MLP_JSON_BYTES, MAX_PARAMS,
 };
 pub use release_gate::{
     canonical_robot_id, load_release_gate_json, ActiveDeploymentContext, AuthorizationTier,
@@ -72,6 +72,8 @@ pub enum PolicyError {
     InferenceFailed(String),
     #[error("release gate verification failed: {0}")]
     ReleaseGate(String),
+    #[error("policy exceeds the device resource budget: {0}")]
+    ResourceBudget(String),
 }
 
 /// Synchronous, single-vector inference backend for state-to-action policies.

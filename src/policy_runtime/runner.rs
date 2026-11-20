@@ -277,6 +277,7 @@ impl From<PolicyError> for ArmError {
                 (422, "POLICY_LOAD_FAILED")
             }
             PolicyError::ReleaseGate(_) => (403, "RELEASE_GATE_INVALID"),
+            PolicyError::ResourceBudget(_) => (413, "POLICY_TOO_LARGE"),
             PolicyError::InvalidPath(_)
             | PolicyError::InvalidManifest(_)
             | PolicyError::ExternalOnnxData(_)
