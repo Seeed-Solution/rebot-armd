@@ -216,6 +216,38 @@ export function boardSvg(board, { title = 'reBot calibration board' } = {}) {
   return s + '</svg>';
 }
 
+// fingertip sticker (T20; constants and measurement in the "fingertip sticker" section below)
+// printable SVG at 1:1 scale (mm units): four stickers (solid outline to cut along, heavy bottom edge = tip edge),
+// a 50 mm ruler, the instructions in both languages
+export function stickerSvg(st = STICKER, { count = 4, title = 'reBot fingertip sticker / 指尖贴纸' } = {}) {
+  const W = st.widthMm, H = st.heightMm, r = st.dotMm / 2, gapX = 14, margin = 10, topY = margin + 30;
+  const pageW = Math.max(2 * margin + count * W + (count - 1) * gapX, 120), pageH = topY + H + 26;
+  const lines = [
+    'Print at 100 % (no fit-to-page). Check the 50 mm ruler. 打印比例 100%（不要缩放），用 50 mm 标尺核对。',
+    'Cut along the thin outline. Heavy edge flush with the fingertip, dots toward the wrist. 沿细线剪下，粗边与指尖平齐，圆点朝手腕。',
+    'The sticker must lie flat on the camera-facing finger face. 贴纸要平贴在朝向相机的手指面上。',
+  ];
+  let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${pageW}mm" height="${pageH}mm" viewBox="0 0 ${pageW} ${pageH}">`;
+  s += `<rect width="${pageW}" height="${pageH}" fill="#fff"/>`;
+  s += `<text x="${margin}" y="${margin + 4}" font-size="4.5" font-family="sans-serif">${title}</text>`;
+  lines.forEach((t, i) => { s += `<text x="${margin}" y="${margin + 10 + i * 4.2}" font-size="2.6" font-family="sans-serif">${t}</text>`; });
+  for (let k = 0; k < count; k++) {
+    const x0 = margin + k * (W + gapX), y1 = topY + H; // y1 = bottom edge (tip)
+    s += `<rect x="${x0}" y="${topY}" width="${W}" height="${H}" fill="none" stroke="#888" stroke-width="0.2"/>`;
+    for (const L of st.rowsMm) for (const dx of [-st.columnsMm / 2, st.columnsMm / 2]) {
+      s += `<circle cx="${(x0 + W / 2 + dx).toFixed(3)}" cy="${(y1 - L).toFixed(3)}" r="${r}" fill="#000"/>`;
+    }
+    s += `<path d="M ${x0} ${y1} h ${W}" stroke="#000" stroke-width="0.5"/>`;
+    s += `<text x="${x0}" y="${y1 + 4}" font-size="2.4" font-family="sans-serif">▲ tip / 指尖</text>`;
+  }
+  const rx = margin, ry = pageH - 8;
+  s += `<path d="M ${rx} ${ry} h 50" stroke="#000" stroke-width="0.4"/>`;
+  for (let k = 0; k <= 10; k++) s += `<path d="M ${rx + 5 * k} ${ry} v ${k % 2 ? -2.5 : -4}" stroke="#000" stroke-width="0.3"/>`;
+  s += `<text x="${rx + 53}" y="${ry}" font-size="3" font-family="sans-serif">50 mm · dots d ${st.dotMm} mm, rows ${st.rowsMm.join(' / ')} mm, columns ${st.columnsMm} mm</text>`;
+  return s + '</svg>';
+}
+
+
 // ---------------------------------------------------------------- correspondences
 // A view: { markers: [{ id, corners: [[u, v] x 4] }], q?: model angles, G?: T_base_end }
 // the 8 corner orders (4 cyclic shifts x 2 directions) of the detector relative to the board model
@@ -1316,4 +1348,226 @@ export function* solveFineSteps({ views, markerSide = BOARD_DEFAULT.markerSide, 
     ...(solvedAt ? { solved_at: solvedAt } : {}),
   };
   return res;
+}
+
+// ---------------------------------------------------------------- fingertip sticker (T20)
+/* A 2 x 2 dot sticker on the camera-facing finger face, its bottom edge flush with the fingertip, dots toward
+   the wrist. The camera is ~9 cm from it and heavily defocused, so the dots are measured as darkness-weighted
+   centroids (no edges): Otsu threshold in a bottom-centre ROI, connected components, the four largest blobs,
+   weights (white - gray) inside each blob dilated by 5 px. The camera looks forward-down: the TOP image row of
+   dots is the tip-side row (rows[0] mm from the edge). Planar PnP by IPPE gives two poses; the one with the
+   lower reprojection wins and the runner-up must be clearly worse (ambiguity gap). Sticker frame: origin = the
+   centre of the bottom edge (the fingertip), x = image left -> right across the columns, y = toward the wrist
+   (along the rows), z = x × y. tip_cam = the sticker origin in the camera frame (OpenCV axes). */
+export const STICKER = Object.freeze({ dotMm: 4, rowsMm: Object.freeze([10, 16]), columnsMm: 8.8, widthMm: 16, heightMm: 20.5 });
+// ROI in content pixels (640 x 360): bottom centre, where the fingertip sits in the image of the v8 holder
+export const STICKER_ROI = Object.freeze({ x0: 225, y0: 275, x1: 440, y1: 360 });
+export const STICKER_GATES = Object.freeze({ reprojPx: 0.5, gapPx: 0.5, stdMm: 0.5, minFrames: 3, minArea: 60, maxAspect: 3.5 });
+
+export function stickerObject(st = STICKER) {
+  const s = st.columnsMm / 2000, [a, b] = st.rowsMm.map((v) => v / 1000);
+  return [[-s, a, 0], [s, a, 0], [-s, b, 0], [s, b, 0]];
+}
+
+// rows of the 640 x 360 content inside a decoded frame: rebot-vision snapshots may be letterboxed to a square
+// (640 x 640, content rows 140..499); other sizes are scaled to 640 wide
+export function contentBand(w, h, size = IMAGE) {
+  const scale = size.width / w, ch = size.height / scale;
+  return { scale, y0: h > ch + 1 ? Math.round((h - ch) / 2) : 0, height: Math.min(h, Math.round(ch)) };
+}
+// RGBA pixels of a decoded frame -> 8-bit gray of the content image (640 x 360) using ITU-R BT.601 luma
+export function grayContent(rgba, w, h, size = IMAGE) {
+  const { scale, y0 } = contentBand(w, h, size), W = size.width, H = size.height, g = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) {
+    const sy = Math.min(h - 1, y0 + Math.floor(y / scale));
+    for (let x = 0; x < W; x++) {
+      const sx = Math.min(w - 1, Math.floor(x / scale)), i = (sy * w + sx) * 4;
+      g[y * W + x] = Math.round(0.299 * rgba[i] + 0.587 * rgba[i + 1] + 0.114 * rgba[i + 2]);
+    }
+  }
+  return g;
+}
+// Otsu threshold of 8-bit values (as cv::threshold THRESH_OTSU): the level t maximising the between-class variance
+// of {v <= t} and {v > t}
+export function otsu(values) {
+  const hist = new Float64Array(256);
+  for (const v of values) hist[v]++;
+  const n = values.length, EPS = 1.1920929e-7;
+  let mu = 0; for (let i = 0; i < 256; i++) mu += i * hist[i] / n;
+  let q1 = 0, mu1 = 0, best = 0, t = 0;
+  for (let i = 0; i < 256; i++) {
+    const p = hist[i] / n;
+    mu1 *= q1; q1 += p;
+    const q2 = 1 - q1;
+    if (Math.min(q1, q2) < EPS || Math.max(q1, q2) > 1 - EPS) continue;
+    mu1 = (mu1 + i * p) / q1;
+    const mu2 = (mu - q1 * mu1) / q2, sigma = q1 * q2 * (mu1 - mu2) ** 2;
+    if (sigma > best) { best = sigma; t = i; }
+  }
+  return t;
+}
+// percentile with linear interpolation (numpy default)
+function percentile(values, p) {
+  const a = Float64Array.from(values).sort(), x = (a.length - 1) * p / 100, i = Math.floor(x);
+  return i + 1 < a.length ? a[i] + (a[i + 1] - a[i]) * (x - i) : a[i];
+}
+// 8-connected components of a 0/1 mask -> { labels (Int32Array, 0 = background), comps: [{ label, x, y, w, h, area }] }
+export function components(mask, w, h) {
+  const labels = new Int32Array(w * h), comps = [], stack = [];
+  for (let s = 0; s < w * h; s++) {
+    if (!mask[s] || labels[s]) continue;
+    const label = comps.length + 1; let x0 = w, y0 = h, x1 = -1, y1 = -1, area = 0;
+    labels[s] = label; stack.push(s);
+    while (stack.length) {
+      const p = stack.pop(), px = p % w, py = (p - px) / w;
+      area++; if (px < x0) x0 = px; if (px > x1) x1 = px; if (py < y0) y0 = py; if (py > y1) y1 = py;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = px + dx, ny = py + dy;
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+        const q = ny * w + nx;
+        if (mask[q] && !labels[q]) { labels[q] = label; stack.push(q); }
+      }
+    }
+    comps.push({ label, x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1, area });
+  }
+  return { labels, comps };
+}
+/* The four dot centroids in one content frame (gray 640 x 360). Returns { ok, points: [top-left, top-right,
+   bottom-left, bottom-right] (content px), blobs, threshold, why } with why = 'dots' (fewer than four blobs). */
+export function detectStickerDots(gray, { size = IMAGE, roi = STICKER_ROI, gates = STICKER_GATES, pad = 5 } = {}) {
+  const W = size.width, rw = roi.x1 - roi.x0, rh = roi.y1 - roi.y0, g = new Float32Array(rw * rh), g8 = new Uint8Array(rw * rh);
+  for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) { const v = gray[(roi.y0 + y) * W + roi.x0 + x]; g[y * rw + x] = v; g8[y * rw + x] = v; }
+  const t = otsu(g8), mask = new Uint8Array(rw * rh);
+  for (let i = 0; i < mask.length; i++) mask[i] = g8[i] <= t ? 1 : 0;
+  const { labels, comps } = components(mask, rw, rh), white = percentile(g, 90), blobs = [];
+  for (const c of comps) {
+    if (c.area < gates.minArea || c.w / c.h > gates.maxAspect || c.x === 0 || c.x + c.w >= rw) continue;
+    const sx = Math.max(c.x - pad, 0), sy = Math.max(c.y - pad, 0), ex = Math.min(c.x + c.w + pad, rw), ey = Math.min(c.y + c.h + pad, rh);
+    let s = 0, sxw = 0, syw = 0;
+    for (let y = sy; y < ey; y++) for (let x = sx; x < ex; x++) {
+      // dilation of the blob by a (2 pad + 1)^2 square inside the window
+      let inBlob = false;
+      for (let yy = Math.max(sy, y - pad); yy <= Math.min(ey - 1, y + pad) && !inBlob; yy++)
+        for (let xx = Math.max(sx, x - pad); xx <= Math.min(ex - 1, x + pad); xx++) if (labels[yy * rw + xx] === c.label) { inBlob = true; break; }
+      if (!inBlob) continue;
+      const wgt = Math.max(white - g[y * rw + x], 0);
+      s += wgt; sxw += wgt * x; syw += wgt * y;
+    }
+    if (s > 0) blobs.push({ area: c.area, u: sxw / s + roi.x0, v: syw / s + roi.y0, w: c.w, h: c.h });
+  }
+  blobs.sort((a, b) => b.area - a.area);
+  const four = blobs.slice(0, 4);
+  if (four.length < 4) return { ok: false, why: 'dots', blobs, threshold: t, points: null };
+  four.sort((a, b) => a.v - b.v);
+  const top = four.slice(0, 2).sort((a, b) => a.u - b.u), bot = four.slice(2).sort((a, b) => a.u - b.u);
+  return { ok: true, points: [...top, ...bot].map((b) => [b.u, b.v]), blobs: four, threshold: t, white };
+}
+
+/* IPPE (Collins & Bartoli 2014, "Infinitesimal Plane-Based Pose Estimation") for points on the z = 0 plane.
+   obj: [[X, Y, 0]] (n >= 4), nrm: ideal normalised image points. Returns both poses [{ R, t }] (T_cam_obj). */
+export function ippe(obj, nrm) {
+  const n = obj.length, m = [0, 0];
+  for (const p of obj) { m[0] += p[0] / n; m[1] += p[1] / n; }
+  const P = obj.map((p) => [p[0] - m[0], p[1] - m[1]]);
+  const H = homography(P, nrm);
+  if (!H) return [];
+  const h22 = H[2][2], Hn = H.map((r) => r.map((v) => v / h22));
+  const p = Hn[0][2], q = Hn[1][2];
+  const J = [[Hn[0][0] - Hn[2][0] * p, Hn[0][1] - Hn[2][1] * p], [Hn[1][0] - Hn[2][0] * q, Hn[1][1] - Hn[2][1] * q]];
+  // Rv: rotation taking the z axis onto the ray of the plane origin
+  const tz = unit([p, q, 1]), ax = cross([0, 0, 1], tz), sn = norm3(ax), cs = tz[2];
+  let Rv = I3();
+  if (sn > 1e-12) {
+    const k = scl3(ax, 1 / sn), Kx = [[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]], K2 = mm(Kx, Kx);
+    Rv = [0, 1, 2].map((i) => [0, 1, 2].map((j) => (i === j ? 1 : 0) + sn * Kx[i][j] + (1 - cs) * K2[i][j]));
+  }
+  // B = [I2 | -v] Rv[:, 0:2], A = B^-1 J
+  const B = [[Rv[0][0] - p * Rv[2][0], Rv[0][1] - p * Rv[2][1]], [Rv[1][0] - q * Rv[2][0], Rv[1][1] - q * Rv[2][1]]];
+  const det = B[0][0] * B[1][1] - B[0][1] * B[1][0];
+  if (Math.abs(det) < 1e-15) return [];
+  const Bi = [[B[1][1] / det, -B[0][1] / det], [-B[1][0] / det, B[0][0] / det]];
+  const A = [[Bi[0][0] * J[0][0] + Bi[0][1] * J[1][0], Bi[0][0] * J[0][1] + Bi[0][1] * J[1][1]], [Bi[1][0] * J[0][0] + Bi[1][1] * J[1][0], Bi[1][0] * J[0][1] + Bi[1][1] * J[1][1]]];
+  // largest singular value of A
+  const fro = A[0][0] ** 2 + A[0][1] ** 2 + A[1][0] ** 2 + A[1][1] ** 2, dA = A[0][0] * A[1][1] - A[0][1] * A[1][0];
+  const gamma = Math.sqrt((fro + Math.sqrt(Math.max(fro * fro - 4 * dA * dA, 0))) / 2);
+  const R2 = A.map((r) => r.map((v) => v / gamma));
+  const b0 = Math.sqrt(Math.max(1 - R2[0][0] ** 2 - R2[1][0] ** 2, 0));
+  let b1 = Math.sqrt(Math.max(1 - R2[0][1] ** 2 - R2[1][1] ** 2, 0));
+  if (R2[0][0] * R2[0][1] + R2[1][0] * R2[1][1] > 0) b1 = -b1; // columns orthogonal: b0 b1 = -(r00 r01 + r10 r11)
+  const sols = [];
+  for (const sgn of [1, -1]) {
+    const c1 = [R2[0][0], R2[1][0], sgn * b0], c2 = [R2[0][1], R2[1][1], sgn * b1], c3 = cross(c1, c2);
+    const Rl = [[c1[0], c2[0], c3[0]], [c1[1], c2[1], c3[1]], [c1[2], c2[2], c3[2]]];
+    const R = nearestRot(mm(Rv, Rl));
+    // translation: least squares of x (R P + t)_z = (R P + t)_x, y likewise
+    const M = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], rhs = [0, 0, 0];
+    P.forEach((pp, i) => {
+      const rp = mv3(R, [pp[0], pp[1], 0]), [u, v] = nrm[i];
+      for (const [row, b] of [[[1, 0, -u], u * rp[2] - rp[0]], [[0, 1, -v], v * rp[2] - rp[1]]]) {
+        for (let a = 0; a < 3; a++) { rhs[a] += row[a] * b; for (let c = 0; c < 3; c++) M[a][c] += row[a] * row[c]; }
+      }
+    });
+    const t = solve3(M, rhs);
+    if (!t) continue;
+    // back to the object frame: R (X - m) + t = R X + (t - R m)
+    const Rm = mv3(R, [m[0], m[1], 0]);
+    sols.push({ R, t: [t[0] - Rm[0], t[1] - Rm[1], t[2] - Rm[2]] });
+  }
+  return sols;
+}
+function solve3(M, b) {
+  const d = (A) => A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) - A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) + A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
+  const D0 = d(M);
+  if (Math.abs(D0) < 1e-18) return null;
+  return [0, 1, 2].map((k) => d(M.map((r, i) => r.map((v, j) => (j === k ? b[i] : v)))) / D0);
+}
+// reprojection error (px) of a pose as OpenCV's solvePnPGeneric reports it: sqrt(sum of squared residuals / 2n)
+export function reprojRms(K, R, t, obj, img) {
+  let s = 0;
+  obj.forEach((X, i) => { const p = project(K, R, t, X); s += (p[0] - img[i][0]) ** 2 + (p[1] - img[i][1]) ** 2; });
+  return Math.sqrt(s / (2 * obj.length));
+}
+// both IPPE poses of the sticker, best first: [{ R, t, reprojPx, front }]
+export function stickerPoses(points, K, st = STICKER) {
+  const obj = stickerObject(st), nrm = points.map(([u, v]) => undistort(K, u, v));
+  return ippe(obj, nrm).map((s) => ({ ...s, reprojPx: reprojRms(K, s.R, s.t, obj, points), front: obj.every((X) => mv3(s.R, X)[2] + s.t[2] > 0) }))
+    .sort((a, b) => (b.front - a.front) || (a.reprojPx - b.reprojPx));
+}
+/* Fingertip from the dot points of several stationary frames (each [4 x [u, v]]): the mean points give the pose;
+   per-frame poses give the spread. Returns { ok, gates, tip_cam_m, reprojPx, gapPx, stdMm, frames, poses } with
+   gates [{ key, ok, value, limit }]: frames, front (positive depth), reproj, ambiguity (runner-up gap), std. */
+export function measureTip(framePoints, K, { st = STICKER, gates = STICKER_GATES } = {}) {
+  const frames = framePoints.filter((p) => Array.isArray(p) && p.length === 4);
+  const out = { ok: false, frames: frames.length, gates: [] };
+  const gate = (key, ok, value, limit) => { out.gates.push({ key, ok, value, limit }); return ok; };
+  if (!gate('frames', frames.length >= gates.minFrames, frames.length, gates.minFrames)) return out;
+  const mean = [0, 1, 2, 3].map((k) => [0, 1].map((c) => frames.reduce((s, f) => s + f[k][c], 0) / frames.length));
+  const poses = stickerPoses(mean, K, st);
+  out.poses = poses.map((p) => ({ t: p.t, reprojPx: p.reprojPx, front: p.front }));
+  const best = poses[0], second = poses[1];
+  if (!gate('front', !!best && best.front, best ? +best.front : 0, 1)) return out;
+  out.tip_cam_m = best.t; out.R = best.R; out.reprojPx = best.reprojPx; out.points = mean;
+  out.gapPx = second ? second.reprojPx - best.reprojPx : Infinity;
+  const tips = frames.map((f) => { const ps = stickerPoses(f, K, st); return ps.length ? ps[0].t : null; }).filter(Boolean);
+  const std = [0, 1, 2].map((c) => { const m = tips.reduce((s, t) => s + t[c], 0) / tips.length; return Math.sqrt(tips.reduce((s, t) => s + (t[c] - m) ** 2, 0) / tips.length); });
+  out.stdMm = Math.max(...std) * 1000;
+  gate('reproj', best.reprojPx <= gates.reprojPx, best.reprojPx, gates.reprojPx);
+  gate('ambiguity', out.gapPx >= gates.gapPx, out.gapPx, gates.gapPx);
+  gate('std', out.stdMm <= gates.stdMm, out.stdMm, gates.stdMm);
+  out.ok = out.gates.every((g) => g.ok);
+  return out;
+}
+// stale frames: a snapshot repeats the previous frame for a while after motion; keep a frame only when its
+// frame_id is newer than the last kept one and its content key (e.g. a hash of the JPEG bytes) is new
+export function dedupeFrames(frames) {
+  const seen = new Set(), out = [];
+  let last = -Infinity;
+  for (const f of frames) {
+    const id = Number.isFinite(f.frame_id) ? f.frame_id : null;
+    if ((id !== null && id <= last) || (f.key != null && seen.has(f.key))) continue;
+    if (id !== null) last = id;
+    if (f.key != null) seen.add(f.key);
+    out.push(f);
+  }
+  return out;
 }
