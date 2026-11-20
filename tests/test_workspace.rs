@@ -725,7 +725,7 @@ fn tiny_displacement_below_eps_near_tight_boundary_catches_midpoint_dip() {
     // that local minimum sits just 2e-9 m below -WORKSPACE_EPS (exact floor_z_m = 0.0).
     let z_of = |q: &[f32; 7]| ArmModel::REBOT_DEV_ARM.fk_f32(q).unwrap().p[2];
     let find_min_j4 = |j2: f32| -> (f32, f64) {
-        let mut q = [0.0f32, j2, -0.8, 0.0, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
+        let mut q = [0.0f32, j2, -0.8, 0.0, 0.0, 0.0, 0.0];
         let mut best_j4 = 0.0f32;
         let mut best_z = f64::INFINITY;
         for k in 0..628 {
@@ -765,7 +765,7 @@ fn tiny_displacement_below_eps_near_tight_boundary_catches_midpoint_dip() {
     }
     let j2 = 0.5 * (j2_lo + j2_hi);
     let (best_j4, _) = find_min_j4(j2);
-    let q_base = [0.0f32, j2, -0.8, best_j4, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
+    let q_base = [0.0f32, j2, -0.8, best_j4, 0.0, 0.0, 0.0];
 
     let eval_probe = armd::chain::WorkspaceEvaluator::new(
         &ArmModel::REBOT_DEV_ARM,
@@ -972,7 +972,7 @@ fn b601dm_builtin_and_kit_profile_link_capsules_positive_and_negative() {
     }
 
     // Negative 1: link3 mid-segment hits a fixture keepout box while end_link remains clear
-    let q_l3_target: [f32; 7] = [0.0, -0.4, -0.8, 0.8, 0.0, std::f32::consts::FRAC_PI_2, 0.0];
+    let q_l3_target: [f32; 7] = [0.0, -0.4, -0.8, 0.8, 0.0, 0.0, 0.0];
     let f_l3_target = ArmModel::REBOT_DEV_ARM.frames_f32(&q_l3_target).unwrap();
     let l3_pose = ArmModel::REBOT_DEV_ARM.resolve_frame("link3").unwrap().pose(&f_l3_target);
     let l3_mid_target = l3_pose.transform_point(&[0.121, -0.030, -0.0311]);
@@ -1320,7 +1320,7 @@ fn self_collision_validation_positive_negative_sweep_and_servo() {
 
     // 3. Negative (B601-DM): folded self-collision pose triggers WORKSPACE_VIOLATION with self_collision:*
     // (keep end-effector well above floor_z=0 so self_collision is the only violated constraint)
-    let q_fold_dm: [f32; 7] = [0.0, -0.1, -0.1, 1.5, 1.5, std::f32::consts::FRAC_PI_2, 0.0];
+    let q_fold_dm: [f32; 7] = [0.0, -0.1, -0.1, 1.5, 1.5, 0.0, 0.0];
     let mut c_home = eval_dm.alloc_buf();
     let mut c_fold = eval_dm.alloc_buf();
     eval_dm.eval_into(&HOME, &mut c_home, "plan").unwrap();
@@ -1339,10 +1339,10 @@ fn self_collision_validation_positive_negative_sweep_and_servo() {
     assert!(detail.constraint_id.as_deref().is_some_and(|s| s.starts_with("self_collision:")), "{detail:?}");
 
     // 4. Swept self-collision (violation_phase == "sweep"): both endpoints clear, midpoint collides
-    // Keep J2=-0.3, J3=-0.2, J5=1.5, and sweep J4 from 0.0 to 3.14 so midpoint J4=1.57 swings into base_link.
-    let q_sw_a: [f32; 7] = [0.0, -0.3, -0.2, 0.0, 1.5, std::f32::consts::FRAC_PI_2, 0.0];
+    // Keep J2=-0.3, J3=-0.2, J5=1.5, and sweep J4 from 0.0 to 3.14 (inside the 3.14159 soft limit) so midpoint J4=1.57 swings into base_link.
+    let q_sw_a: [f32; 7] = [0.0, -0.3, -0.2, 0.0, 1.5, 0.0, 0.0];
     #[allow(clippy::approx_constant)] // 3.14: just inside the soft limit, not pi
-    let q_sw_b: [f32; 7] = [0.0, -0.3, -0.2, 3.14, 1.5, std::f32::consts::FRAC_PI_2, 0.0];
+    let q_sw_b: [f32; 7] = [0.0, -0.3, -0.2, 3.14, 1.5, 0.0, 0.0];
     assert_eval_clear(&ArmModel::REBOT_DEV_ARM, ws_dm, &dm.camera_mount, &q_sw_a, "DM sweep start");
     assert_eval_clear(&ArmModel::REBOT_DEV_ARM, ws_dm, &dm.camera_mount, &q_sw_b, "DM sweep end");
     let mut inner_sw = armed(dm.clone(), &q_sw_a);
@@ -1408,4 +1408,33 @@ fn self_collision_validation_positive_negative_sweep_and_servo() {
     };
     assert_eq!(detail.constraint_id.as_deref(), Some("self_collision:upper_arm_link:gripper_link"), "{detail:?}");
     assert_eq!(detail.geometry_id.as_deref(), Some("capsule:upper_arm_link"), "{detail:?}");
+}
+
+#[test]
+fn link_frames_of_the_geometry_checks_follow_the_kinematic_correction() {
+    // the link capsules and self-collision pairs are placed with `frames_f32` of the live model:
+    // with a correction installed they move with it (same end pose as the corrected FK)
+    let corr: kinematics::Correction = serde_json::from_value(serde_json::json!([
+        {"offset_rad": 0.0, "scale": 0.0, "tilt_rad": [0.0, 0.0], "origin_m": [0.0, 0.0, 0.0]},
+        {"offset_rad": 0.021, "scale": 0.012, "tilt_rad": [0.044, -0.014], "origin_m": [0.004, -0.006, 0.002]},
+        {"offset_rad": -0.035, "scale": -0.02, "tilt_rad": [0.009, 0.019], "origin_m": [-0.012, 0.003, 0.008]},
+        {"offset_rad": 0.054, "scale": 0.03, "tilt_rad": [-0.026, 0.012], "origin_m": [0.009, 0.011, -0.004]},
+        {"offset_rad": -0.0698, "scale": -0.05, "tilt_rad": [0.05, -0.05], "origin_m": [-0.02, 0.015, 0.025]},
+        {"offset_rad": 0.0, "scale": 0.0, "tilt_rad": [0.0, 0.0], "origin_m": [0.0, 0.0, 0.0]}])).unwrap();
+    let nominal = ArmModel::REBOT_DEV_ARM;
+    let corrected = nominal.with_correction(Some(&corr)).unwrap();
+    let q = INSPECT;
+    let (fn_, fc) = (nominal.frames_f32(&q).unwrap(), corrected.frames_f32(&q).unwrap());
+    assert_eq!(fn_.end, nominal.fk_f32(&q).unwrap());
+    assert_eq!(fc.end, corrected.fk_f32(&q).unwrap());
+    let moved = kinematics::norm(&kinematics::sub(&fc.origins[4], &fn_.origins[4]));
+    assert!(moved > 0.005, "J5 origin moved by {moved} m");
+    // HOME (J6 = 0 in the current convention) is clear of the B601-DM self-collision pairs
+    let dm = ArmConfig::rebot_dm();
+    let ws = dm.workspace.as_ref().unwrap();
+    assert!(ws.self_collision_covered());
+    let eval = armd::chain::WorkspaceEvaluator::new(&dm.arm_model, ws, &dm.camera_mount);
+    let mut buf = eval.alloc_buf();
+    eval.eval_into(&HOME, &mut buf, "plan").unwrap();
+    assert!(buf.as_slice().iter().all(|&c| c >= -kinematics::WORKSPACE_EPS), "HOME clearances {:?}", buf.as_slice());
 }

@@ -257,6 +257,8 @@ impl SupervisorInner {
                 "max_reach_m": ws.max_reach_m,
                 "check_points_end_m": ws.check_points_end_m,
                 "kinematics_configured": kinematics_configured,
+                // the geometry checks run on the live arm model (kinematic correction included)
+                "kinematics_corrected": self.config.arm_model.correction().is_some(),
                 "workspace_configured": workspace_configured,
                 "geometry_coverage": geometry_coverage,
                 "camera_mount_covered": cam.offset_m.is_some(),

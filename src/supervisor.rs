@@ -2970,7 +2970,9 @@ impl SupervisorInner {
         let model = self.config.arm_model.with_correction(corr)?;
         if model.correction() == self.config.arm_model.correction() { return Ok(()); }
         self.config.arm_model = model;
+        // the servo escape baseline was measured with the old model
         self.workspace_revision += 1;
+        self.servo_ws_min_depths = None;
         self.calibration_revision += 1;
         self.refresh_pose_tcps();
         Ok(())
