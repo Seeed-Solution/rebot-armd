@@ -67,6 +67,9 @@ AP_BAND="5g"     # 5g | 2g4
 AP_CHANNEL=""    # empty: 44 on 5g, 6 on 2g4
 STA_SSID=""
 STA_PASS=""
+# Operator PIN (console setting security.operator_pin, 4-12 digits). Empty: armd writes a random
+# PIN to /userdata/rebot-teleop/operator.pin (root only) at every start.
+OPERATOR_PIN=""
 
 CONFIG_JSON="/userdata/local/apps/$NAME.config.json"
 
@@ -82,6 +85,7 @@ try:
     arm = cfg.get('arm', {})
     net = cfg.get('network', {})
     app = cfg.get('app', {})
+    sec = cfg.get('security', {})
     if 'follower_model' in arm and arm['follower_model']: put('FOLLOWER_MODEL', arm['follower_model'])
     if 'serial_port' in arm and arm['serial_port']: put('FOLLOWER_PORT', arm['serial_port'])
     if 'port' in cfg and cfg['port']: put('PORT', cfg['port'])
@@ -94,6 +98,9 @@ try:
     if 'sta_password' in net: put('STA_PASS', net['sta_password'])
     if app.get('enabled') in (True, 'true', 'True', 1, '1', 'on'): put('APP_ENABLED', '1')
     if isinstance(app.get('name'), str) and re.fullmatch(r'[A-Za-z0-9._-]+', app['name']) and app['name'] not in ('.', '..'): put('APP_NAME', app['name'])
+    pin = str(sec.get('operator_pin', '') or '').strip()
+    if re.fullmatch(r'[0-9]{4,12}', pin): put('OPERATOR_PIN', pin)
+    elif pin: put('OPERATOR_PIN_INVALID', '1')
 except Exception:
     pass
 " "$1"
@@ -567,6 +574,21 @@ start_vision() {
     return 0
 }
 
+# Start armd in the background. A configured operator PIN reaches armd only as ARMD_OPERATOR_PIN in
+# its environment (the subshell keeps it away from vision and the user program), never on the
+# command line, which every process can read in /proc/<pid>/cmdline.
+launch_armd() {
+    (
+        if [ -n "$OPERATOR_PIN" ]; then
+            ARMD_OPERATOR_PIN=$OPERATOR_PIN
+            export ARMD_OPERATOR_PIN
+        else
+            unset ARMD_OPERATOR_PIN
+        fi
+        start-stop-daemon -S -b -m -p $PIDFILE -a /bin/sh -- -c "exec $DAEMON $DAEMON_OPTS >> $LOGFILE 2>&1"
+    )
+}
+
 start() {
     echo "Starting $NAME..."
     if [ -f $PIDFILE ]; then
@@ -642,7 +664,10 @@ start() {
     mkdir -p "$PERSIST_LOG_DIR" "$BLACKBOX_DIR" "$EPISODES_DIR" 2>/dev/null || true
     DAEMON_OPTS="$DAEMON_OPTS --log-dir $PERSIST_LOG_DIR --blackbox-dir $BLACKBOX_DIR --episodes-dir $EPISODES_DIR"
 
-    start-stop-daemon -S -b -m -p $PIDFILE -a /bin/sh -- -c "exec $DAEMON $DAEMON_OPTS >> $LOGFILE 2>&1"
+    if [ "$OPERATOR_PIN_INVALID" = 1 ]; then
+        echo "[rebot-teleop] Operator PIN setting ignored (use 4-12 digits); armd writes a random PIN to /userdata/rebot-teleop/operator.pin"
+    fi
+    launch_armd
     if [ $? -ne 0 ]; then
         echo "$NAME failed to start (start-stop-daemon error)"
         rm -f $PIDFILE

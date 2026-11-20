@@ -56,6 +56,20 @@
         ]
       },
       {
+        "key": "security",
+        "title": "Operator Access",
+        "title_zh": "操作员权限",
+        "items": [
+          {
+            "key": "operator_pin",
+            "type": "password",
+            "title": "Operator PIN (4-12 digits). The cockpit asks for it for gravity mode, calibration, detection, saving poses and resetting an E-stop. Empty: armd writes a new random PIN to /userdata/rebot-teleop/operator.pin (root only) at every start",
+            "title_zh": "操作员 PIN（4-12 位数字）。驾驶舱里的重力补偿、标定、识别、保存点位和复位急停需要输入。留空：armd 每次启动生成新的随机 PIN，写在 /userdata/rebot-teleop/operator.pin（仅 root 可读）",
+            "default": ""
+          }
+        ]
+      },
+      {
         "key": "network",
         "title": "Wi-Fi Hotspot & Client",
         "title_zh": "Wi-Fi 热点与联网配置",
