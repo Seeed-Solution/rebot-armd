@@ -450,6 +450,25 @@ impl SandboxState {
         self.policy_load_delay_ms.load(Ordering::Relaxed)
     }
 
+    /// Return the active `(scene_id, tool_id)`, defaulting empty strings to `"default"`.
+    pub async fn active_scene_and_tool(&self) -> (String, String) {
+        let st = self.active.read().await;
+        let scene = st.active_scene.trim();
+        let tool = st.active_tool.trim();
+        (
+            if scene.is_empty() {
+                "default".to_string()
+            } else {
+                scene.to_string()
+            },
+            if tool.is_empty() {
+                "default".to_string()
+            } else {
+                tool.to_string()
+            },
+        )
+    }
+
     pub fn new_shared() -> Arc<Self> {
         Arc::new(Self::new(default_storage_dir()))
     }

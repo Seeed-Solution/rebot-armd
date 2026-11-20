@@ -596,7 +596,7 @@ impl SupervisorInner {
             pr.modes = if self.policy_live_allowed() {
                 vec!["shadow".to_string(), "live_sim".to_string()]
             } else {
-                vec!["shadow".to_string()]
+                vec!["shadow".to_string(), "live_gated".to_string()]
             };
         }
         if schema.feetech_joints.is_none() {
@@ -814,8 +814,28 @@ impl SupervisorInner {
 
     /// Joint limits used for servo stepping: `config.limits` with `max_velocity` capped
     /// at `config.servo_max_velocity` per joint, except the 7-DOF gripper (index 6).
+    /// When a live policy run has a `verified_release_gate`, each joint's `max_velocity`
+    /// is further scaled by `gate.max_speed_scale().clamp(0.1, 1.0)`.
     pub fn servo_limits(&self) -> Vec<crate::model::JointLimit> {
-        self.config.servo_limits()
+        #[cfg(feature = "policy-runtime")]
+        {
+            let mut limits = self.config.servo_limits();
+            if let Some(ref run) = self.policy_run {
+                if run.mode == crate::policy_runtime::PolicyMode::Live {
+                    if let Some(ref gate) = run.verified_release_gate {
+                        let scale = (gate.max_speed_scale() as f32).clamp(0.1, 1.0);
+                        for limit in &mut limits {
+                            limit.max_velocity *= scale;
+                        }
+                    }
+                }
+            }
+            limits
+        }
+        #[cfg(not(feature = "policy-runtime"))]
+        {
+            self.config.servo_limits()
+        }
     }
 
     /// Store the motor error codes, logging each per-joint change once.
@@ -4666,12 +4686,31 @@ impl SupervisorInner {
 
 #[cfg(feature = "policy-runtime")]
 impl SupervisorInner {
-    /// Phase 1 real-arm gate: `Live` policy mode is only allowed for explicit mock or sim drivers.
+    /// Phase 1/3 real-arm gate: `Live` policy mode without release gate is only allowed for explicit mock or sim drivers.
     pub fn policy_live_allowed(&self) -> bool {
         matches!(
             (self.driver.is_some(), self.follower.as_deref()),
             (false, None) | (false, Some("mock")) | (_, Some("sim"))
         )
+    }
+
+    /// Deterministic SHA-256 digest of the active camera calibration state, or
+    /// `EMPTY_CALIBRATION_DIGEST` when uncalibrated.
+    pub fn active_calibration_digest(&self) -> String {
+        match &self.calibration {
+            None => crate::policy_runtime::EMPTY_CALIBRATION_DIGEST.to_string(),
+            Some(cal) => {
+                let bytes = serde_json::to_vec(cal).unwrap_or_default();
+                crate::gravity::compute_sha256(&bytes)
+            }
+        }
+    }
+
+    pub fn driver_feedback_confirmed(&self) -> bool {
+        match &self.driver {
+            None => false,
+            Some(d) => d.lock().is_ok_and(|drv| drv.is_feedback_valid()),
+        }
     }
 
     pub fn policy_run_active(&self) -> bool {
@@ -4726,6 +4765,17 @@ impl SupervisorInner {
         mode: crate::policy_runtime::PolicyMode,
         epoch_id: u64,
     ) -> Result<(), ArmError> {
+        self.check_policy_start_preconditions_with(mode, false, false, epoch_id)
+    }
+
+    /// Preconditions checked under lock with explicit `sim_only` and operator presence flags.
+    pub fn check_policy_start_preconditions_with(
+        &self,
+        mode: crate::policy_runtime::PolicyMode,
+        sim_only: bool,
+        i_am_at_the_arm: bool,
+        epoch_id: u64,
+    ) -> Result<(), ArmError> {
         use crate::policy_runtime::PolicyMode;
 
         if self.estop_pending() {
@@ -4741,6 +4791,13 @@ impl SupervisorInner {
         if self.handover_settling_since.is_some() {
             return Err(SafetyError::HandoverSettling.into());
         }
+        if sim_only && !self.policy_live_allowed() {
+            return Err(ArmError::Rejected {
+                status: 403,
+                code: "POLICY_SIM_ONLY".into(),
+                message: "live_sim mode is not permitted on real or unknown hardware drivers".into(),
+            });
+        }
         match self.safety.state() {
             SafetyState::EStop => return Err(SafetyError::EStopActive.into()),
             SafetyState::Fault(r) => return Err(SafetyError::FaultActive(r.clone()).into()),
@@ -4750,11 +4807,11 @@ impl SupervisorInner {
             _ => {}
         }
         if mode == PolicyMode::Live {
-            if !self.policy_live_allowed() {
+            if !self.policy_live_allowed() && !i_am_at_the_arm {
                 return Err(ArmError::Rejected {
                     status: 403,
-                    code: "POLICY_SHADOW_ONLY".into(),
-                    message: "Live policy execution is only allowed on mock or sim drivers".into(),
+                    code: "OPERATOR_CONFIRMATION_REQUIRED".into(),
+                    message: "Real-arm live policy execution requires explicit i_am_at_the_arm confirmation".into(),
                 });
             }
             self.gravity_comp_servo_busy().map_err(ArmError::Safety)?;
@@ -4793,9 +4850,57 @@ impl SupervisorInner {
         &mut self,
         req: crate::policy_runtime::PolicyRunStart,
     ) -> Result<u64, ArmError> {
-        use crate::policy_runtime::{PolicyRun, DEFAULT_MAX_FIRST_STEP_RAD};
+        use crate::policy_runtime::{PolicyMode, PolicyRun, DEFAULT_MAX_FIRST_STEP_RAD};
 
-        self.check_policy_start_preconditions(req.mode, req.epoch_id)?;
+        self.check_policy_start_preconditions_with(
+            req.mode,
+            req.sim_only,
+            req.i_am_at_the_arm,
+            req.epoch_id,
+        )?;
+        if req.mode == PolicyMode::Live && !self.policy_live_allowed() {
+            if !req.i_am_at_the_arm {
+                return Err(ArmError::Rejected {
+                    status: 403,
+                    code: "OPERATOR_CONFIRMATION_REQUIRED".into(),
+                    message: "Real-arm live policy execution requires explicit i_am_at_the_arm confirmation".into(),
+                });
+            }
+            let Some(ref gate) = req.verified_release_gate else {
+                return Err(ArmError::Rejected {
+                    status: 403,
+                    code: "RELEASE_GATE_REQUIRED".into(),
+                    message: "Real-arm live policy execution requires a verified rebot-release-gate/v1 bound to the policy artifact digest".into(),
+                });
+            };
+            if req.artifact_digest.is_empty()
+                || !gate.policy_sha256().eq_ignore_ascii_case(&req.artifact_digest)
+            {
+                return Err(ArmError::Rejected {
+                    status: 403,
+                    code: "RELEASE_GATE_REQUIRED".into(),
+                    message: "Real-arm live policy execution requires a verified rebot-release-gate/v1 bound to the policy artifact digest".into(),
+                });
+            }
+            let active_calib = self.active_calibration_digest();
+            if !gate.calibration_digest().eq_ignore_ascii_case(&active_calib) {
+                return Err(crate::policy_runtime::PolicyError::ReleaseGate(format!(
+                    "calibration_digest mismatch: gate declares {}, active calibration is {active_calib}",
+                    gate.calibration_digest()
+                ))
+                .into());
+            }
+            if !self.feedback_numeric_valid
+                || !self.driver_feedback_confirmed()
+                || self.policy_input_age_range_ms().is_none()
+            {
+                return Err(ArmError::Rejected {
+                    status: 409,
+                    code: "FEEDBACK_UNCONFIRMED".into(),
+                    message: "Real-arm live policy execution requires confirmed, valid hardware feedback".into(),
+                });
+            }
+        }
         if !self.validate_servo_lease(&req.connection_id, req.lease_generation) {
             return Err(ArmError::Rejected {
                 status: 409,
@@ -4829,6 +4934,8 @@ impl SupervisorInner {
             last_live_target: None,
             max_first_step_rad,
             max_step_rad: req.max_step_rad,
+            i_am_at_the_arm: req.i_am_at_the_arm,
+            verified_release_gate: req.verified_release_gate,
             stop_reason: None,
         };
         self.last_policy_obs = Some(run.to_observation(true));
@@ -4971,17 +5078,57 @@ impl SupervisorInner {
 
         // Live mode checks: real-arm gate, jump limits, and shared servo validation.
         if !self.policy_live_allowed() {
-            self.terminate_policy_run(
-                "POLICY_SHADOW_ONLY",
-                "failed",
-                Some("POLICY_SHADOW_ONLY"),
-                Some("Live policy execution is only allowed on mock or sim drivers".into()),
-            );
-            return Err(ArmError::Rejected {
-                status: 403,
-                code: "POLICY_SHADOW_ONLY".into(),
-                message: "Live policy execution is only allowed on mock or sim drivers".into(),
+            let (has_confirm, has_gate) = self.policy_run.as_ref().map_or((false, false), |run| {
+                (
+                    run.i_am_at_the_arm,
+                    run.verified_release_gate.as_ref().is_some_and(|g| {
+                        !run.artifact_digest.is_empty()
+                            && g.policy_sha256().eq_ignore_ascii_case(&run.artifact_digest)
+                    }),
+                )
             });
+            if !has_confirm {
+                self.terminate_policy_run(
+                    "OPERATOR_CONFIRMATION_REQUIRED",
+                    "failed",
+                    Some("OPERATOR_CONFIRMATION_REQUIRED"),
+                    Some("Real-arm live policy execution requires operator confirmation".into()),
+                );
+                return Err(ArmError::Rejected {
+                    status: 403,
+                    code: "OPERATOR_CONFIRMATION_REQUIRED".into(),
+                    message: "Real-arm live policy execution requires operator confirmation".into(),
+                });
+            }
+            if !has_gate {
+                self.terminate_policy_run(
+                    "RELEASE_GATE_REQUIRED",
+                    "failed",
+                    Some("RELEASE_GATE_REQUIRED"),
+                    Some("Real-arm live policy execution requires a verified release gate".into()),
+                );
+                return Err(ArmError::Rejected {
+                    status: 403,
+                    code: "RELEASE_GATE_REQUIRED".into(),
+                    message: "Real-arm live policy execution requires a verified release gate".into(),
+                });
+            }
+            if !self.feedback_numeric_valid
+                || !self.driver_feedback_confirmed()
+                || self.policy_input_age_range_ms().is_none()
+            {
+                self.terminate_policy_run(
+                    "FEEDBACK_UNCONFIRMED",
+                    "failed",
+                    Some("FEEDBACK_UNCONFIRMED"),
+                    Some("Hardware feedback is unconfirmed during live policy step".into()),
+                );
+                return Err(ArmError::Rejected {
+                    status: 409,
+                    code: "FEEDBACK_UNCONFIRMED".into(),
+                    message: "Hardware feedback is unconfirmed during live policy step".into(),
+                });
+            }
         }
 
         if prev_live.is_none() {

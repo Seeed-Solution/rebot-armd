@@ -13,6 +13,7 @@ use crate::motion::MotionError;
 use crate::supervisor::{ArmError, ArmSupervisor};
 
 use super::manifest::{PolicySnapshot, StrictPolicyContract, VisionStalePolicy};
+use super::release_gate::VerifiedReleaseGate;
 use super::units::{
     denormalize_action_into, normalize_state_into, policy_units_to_rad, rad_to_policy_units,
     JointPermutation,
@@ -64,6 +65,8 @@ pub struct PolicyRun {
     pub last_live_target: Option<Vec<f32>>,
     pub max_first_step_rad: f32,
     pub max_step_rad: Option<f32>,
+    pub i_am_at_the_arm: bool,
+    pub verified_release_gate: Option<VerifiedReleaseGate>,
     pub stop_reason: Option<String>,
 }
 
@@ -96,9 +99,12 @@ pub struct PolicyRunStart {
     pub artifact_digest: String,
     pub backend: String,
     pub mode: PolicyMode,
+    pub sim_only: bool,
     pub max_first_step_rad: Option<f32>,
     pub max_step_rad: Option<f32>,
     pub tag: Option<String>,
+    pub i_am_at_the_arm: bool,
+    pub verified_release_gate: Option<VerifiedReleaseGate>,
 }
 
 /// Parsed WS `/api/v1/action/policy/start` request.
@@ -106,9 +112,12 @@ pub struct PolicyRunStart {
 pub struct PolicyStartRequest {
     pub policy_id: String,
     pub mode: PolicyMode,
+    pub sim_only: bool,
     pub max_seconds: Option<f64>,
     pub fps: Option<f64>,
     pub tag: Option<String>,
+    pub i_am_at_the_arm: bool,
+    pub release_gate: Option<Value>,
 }
 
 /// Validate an effective policy rate for the requested execution mode.
@@ -161,9 +170,10 @@ pub fn parse_policy_start_request(body: &Value) -> Result<PolicyStartRequest, Mo
         )));
     }
 
-    let mode = match body.get("mode").and_then(Value::as_str) {
-        Some("shadow") => PolicyMode::Shadow,
-        Some("live") | Some("live_sim") => PolicyMode::Live,
+    let (mode, sim_only) = match body.get("mode").and_then(Value::as_str) {
+        Some("shadow") => (PolicyMode::Shadow, false),
+        Some("live_sim") => (PolicyMode::Live, true),
+        Some("live") | Some("live_gated") => (PolicyMode::Live, false),
         Some(other) => {
             return Err(MotionError::InvalidCommand(format!(
                 "unsupported policy mode '{other}'; expected 'shadow' or 'live'"
@@ -211,12 +221,32 @@ pub fn parse_policy_start_request(body: &Value) -> Result<PolicyStartRequest, Mo
         }
     };
 
+    let i_am_at_the_arm = match body.get("i_am_at_the_arm") {
+        None | Some(Value::Null) => false,
+        Some(v) => v.as_bool().ok_or_else(|| {
+            MotionError::InvalidCommand("i_am_at_the_arm must be a boolean".into())
+        })?,
+    };
+
+    let release_gate = match body.get("release_gate") {
+        None | Some(Value::Null) => None,
+        Some(v) if v.is_object() => Some(v.clone()),
+        Some(_) => {
+            return Err(MotionError::InvalidCommand(
+                "release_gate must be a JSON object".into(),
+            ));
+        }
+    };
+
     Ok(PolicyStartRequest {
         policy_id: policy_id.to_string(),
         mode,
+        sim_only,
         max_seconds,
         fps,
         tag,
+        i_am_at_the_arm,
+        release_gate,
     })
 }
 
@@ -228,6 +258,7 @@ impl From<PolicyError> for ArmError {
             PolicyError::BackendLoad(_) | PolicyError::InferenceFailed(_) => {
                 (422, "POLICY_LOAD_FAILED")
             }
+            PolicyError::ReleaseGate(_) => (403, "RELEASE_GATE_INVALID"),
             PolicyError::InvalidPath(_)
             | PolicyError::InvalidManifest(_)
             | PolicyError::ExternalOnnxData(_)

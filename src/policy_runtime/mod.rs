@@ -4,6 +4,7 @@
 
 pub mod manifest;
 pub mod mlp;
+pub mod release_gate;
 pub mod runner;
 #[cfg(feature = "policy-tract")]
 pub mod tract_backend;
@@ -21,6 +22,11 @@ pub use manifest::{
 pub use mlp::{
     encode_rmlp_bytes, Activation, MlpBackend, MlpLayerSpec, RMLP_MAGIC, MAX_DIM, MAX_LAYERS,
     MAX_MACS, MAX_PARAMS,
+};
+pub use release_gate::{
+    canonical_robot_id, load_release_gate_json, ActiveDeploymentContext, AuthorizationTier,
+    ReleaseGate, VerifiedReleaseGate, EMPTY_CALIBRATION_DIGEST, MIN_SIM_EVAL_SEEDS,
+    RELEASE_GATE_SCHEMA_VERSION, SUPERVISED_FIRST_RUN_MAX_SPEED_SCALE,
 };
 pub use runner::{
     compute_policy_deadline, parse_policy_start_request, prepare_policy, spawn_policy_runner,
@@ -63,6 +69,8 @@ pub enum PolicyError {
     UnsupportedBackend(String),
     #[error("inference execution failed: {0}")]
     InferenceFailed(String),
+    #[error("release gate verification failed: {0}")]
+    ReleaseGate(String),
 }
 
 /// Synchronous, single-vector inference backend for state-to-action policies.

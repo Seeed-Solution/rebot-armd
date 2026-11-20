@@ -182,6 +182,7 @@ struct PendingPolicyStart {
     request: crate::policy_runtime::PolicyStartRequest,
     config: crate::model::ArmConfig,
     epoch: u64,
+    policy_live_allowed: bool,
 }
 
 #[cfg(feature = "policy-runtime")]
@@ -354,11 +355,17 @@ fn prepare_action(
         "/api/v1/action/policy/start" => {
             let request = crate::policy_runtime::parse_policy_start_request(body).map_err(ArmError::from)?;
             let _ = crate::policy_runtime::compute_policy_deadline(request.max_seconds).map_err(ArmError::from)?;
-            inner.check_policy_start_preconditions(request.mode, epoch)?;
+            inner.check_policy_start_preconditions_with(
+                request.mode,
+                request.sim_only,
+                request.i_am_at_the_arm,
+                epoch,
+            )?;
             return Ok(ActionStart::Policy(PendingPolicyStart {
                 request,
                 config: inner.config.clone(),
                 epoch,
+                policy_live_allowed: inner.policy_live_allowed(),
             }));
         }
         #[cfg(feature = "policy-runtime")]
@@ -1106,21 +1113,70 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     let epoch_id = pending.epoch;
                     let policy_id = pending.request.policy_id.clone();
                     let config = pending.config;
+                    let request_mode = pending.request.mode;
+                    let request_sim_only = pending.request.sim_only;
+                    let request_fps = pending.request.fps;
+                    let inline_release_gate = pending.request.release_gate;
+                    let policy_live_allowed = pending.policy_live_allowed;
+                    let i_am_at_the_arm = pending.request.i_am_at_the_arm;
                     tokio::spawn(async move {
                         let _load_guard = load_guard;
                         let mut loading_guard = loading_guard;
                         let policy_id_load = policy_id.clone();
+                        let deployment = if request_mode == crate::policy_runtime::PolicyMode::Live && !policy_live_allowed {
+                            let (scene_id, tool_id) = sandbox_c.active_scene_and_tool().await;
+                            let calibration_digest = {
+                                let inner = sup.inner().read().await;
+                                inner.active_calibration_digest()
+                            };
+                            Some(crate::policy_runtime::ActiveDeploymentContext {
+                                scene_id,
+                                tool_id,
+                                calibration_digest,
+                            })
+                        } else {
+                            None
+                        };
+                        let sandbox_load = sandbox_c.clone();
                         let prepared = tokio::task::spawn_blocking(move || {
-                            let delay_ms = sandbox_c.policy_load_delay_ms();
+                            let delay_ms = sandbox_load.policy_load_delay_ms();
                             if delay_ms > 0 {
                                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                             }
-                            let dir = sandbox_c.policy_dir(&policy_id_load).ok_or_else(|| ArmError::Rejected {
+                            let dir = sandbox_load.policy_dir(&policy_id_load).ok_or_else(|| ArmError::Rejected {
                                 status: 404,
                                 code: "POLICY_NOT_FOUND".into(),
                                 message: format!("Policy pack '{policy_id_load}' not found"),
                             })?;
-                            crate::policy_runtime::prepare_policy(&dir, &config).map_err(ArmError::from)
+                            let prepared_policy = crate::policy_runtime::prepare_policy(&dir, &config).map_err(ArmError::from)?;
+                            let effective_fps = request_fps
+                                .or(prepared_policy.contract().fps)
+                                .unwrap_or(crate::policy_runtime::DEFAULT_POLICY_FPS);
+                            let effective_fps = crate::policy_runtime::validate_policy_fps(request_mode, effective_fps)
+                                .map_err(ArmError::from)?;
+                            let verified_release_gate = if let Some(ref deployment_ctx) = deployment {
+                                let raw_gate = match inline_release_gate {
+                                    Some(v) => Some(v),
+                                    None => crate::policy_runtime::load_release_gate_json(&dir).map_err(ArmError::from)?,
+                                };
+                                match raw_gate {
+                                    Some(raw) => Some(
+                                        crate::policy_runtime::ReleaseGate::parse_and_verify(
+                                            &raw,
+                                            prepared_policy.artifact_digest(),
+                                            &config,
+                                            prepared_policy.contract(),
+                                            effective_fps,
+                                            deployment_ctx,
+                                        )
+                                        .map_err(ArmError::from)?,
+                                    ),
+                                    None => None,
+                                }
+                            } else {
+                                None
+                            };
+                            Ok::<_, ArmError>((prepared_policy, effective_fps, verified_release_gate))
                         }).await;
 
                         if ws_closed_c.load(Ordering::SeqCst) {
@@ -1140,14 +1196,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 loading_guard.clear(&mut inner);
                                 command_reject(&inner, &request_id, error.into())
                             }
-                            Ok(Ok(prepared_policy)) => {
-                                let effective_fps = pending
-                                    .request
-                                    .fps
-                                    .or(prepared_policy.contract().fps)
-                                    .unwrap_or(crate::policy_runtime::DEFAULT_POLICY_FPS);
-                                let fps_res = crate::policy_runtime::validate_policy_fps(pending.request.mode, effective_fps)
-                                    .map_err(ArmError::from);
+                            Ok(Ok((prepared_policy, fps, verified_release_gate))) => {
                                 let deadline_res = crate::policy_runtime::compute_policy_deadline(pending.request.max_seconds)
                                     .map_err(ArmError::from);
 
@@ -1163,22 +1212,39 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 } else if stop_gen_c.load(Ordering::SeqCst) != my_stop_gen {
                                     json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"STOPPED", "message":"Stopped while loading policy", "error":"STOPPED", "epoch_id":inner.safety.epoch_id()})
                                 } else {
-                                    match fps_res.and_then(|fps| deadline_res.map(|dl| (fps, dl))) {
+                                    match deadline_res {
                                         Err(err) => command_reject(&inner, &request_id, err.into()),
-                                        Ok((fps, deadline)) => {
-                                            let start_req = crate::policy_runtime::PolicyRunStart {
-                                                epoch_id,
-                                                connection_id: conn,
-                                                lease_generation: generation,
-                                                policy_id: policy_id.clone(),
-                                                artifact_digest: prepared_policy.artifact_digest().to_string(),
-                                                backend: prepared_policy.backend_name().to_string(),
-                                                mode: pending.request.mode,
-                                                max_first_step_rad: prepared_policy.contract().max_first_step_rad,
-                                                max_step_rad: prepared_policy.contract().max_step_rad,
-                                                tag: pending.request.tag,
+                                        Ok(deadline) => {
+                                            let deployment_check = if let Some(ref gate) = verified_release_gate {
+                                                let (cur_scene, cur_tool) = sandbox_c.active_scene_and_tool().await;
+                                                let cur_ctx = crate::policy_runtime::ActiveDeploymentContext {
+                                                    scene_id: cur_scene,
+                                                    tool_id: cur_tool,
+                                                    calibration_digest: inner.active_calibration_digest(),
+                                                };
+                                                gate.verify_deployment(&cur_ctx).map_err(ArmError::from)
+                                            } else {
+                                                Ok(())
                                             };
-                                            match inner.begin_policy_run(start_req) {
+                                            if let Err(err) = deployment_check {
+                                                command_reject(&inner, &request_id, err.into())
+                                            } else {
+                                                let start_req = crate::policy_runtime::PolicyRunStart {
+                                                    epoch_id,
+                                                    connection_id: conn,
+                                                    lease_generation: generation,
+                                                    policy_id: policy_id.clone(),
+                                                    artifact_digest: prepared_policy.artifact_digest().to_string(),
+                                                    backend: prepared_policy.backend_name().to_string(),
+                                                    mode: request_mode,
+                                                    sim_only: request_sim_only,
+                                                    max_first_step_rad: prepared_policy.contract().max_first_step_rad,
+                                                    max_step_rad: prepared_policy.contract().max_step_rad,
+                                                    tag: pending.request.tag,
+                                                    i_am_at_the_arm,
+                                                    verified_release_gate,
+                                                };
+                                                match inner.begin_policy_run(start_req) {
                                                 Ok(action_id) => {
                                                     let digest = prepared_policy.artifact_digest().to_string();
                                                     let backend = prepared_policy.backend_name().to_string();
@@ -1209,6 +1275,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                                     ack
                                                 }
                                                 Err(error) => command_reject(&inner, &request_id, error.into()),
+                                                }
                                             }
                                         }
                                     }
