@@ -1408,6 +1408,9 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   }
   body.ui-simple .brand { display: none; }
   body.ui-simple.tb-compact-1 #state-badge, body.ui-simple.tb-compact-2 #link-badge { display: none !important; }
+  body.ui-simple.tb-compact-3 .op-btn .op-lbl { display: none; }
+  body.ui-simple.tb-compact-3 .topbar { gap: 4px; }
+  body.ui-simple.tb-compact-3 .op-btn { padding: 0 7px; }
   body.ui-simple .ui-switch { margin: 0; padding: 2px; background: rgba(255,255,255,0.3); border-color: transparent; border-radius: 13px; }
   body.ui-simple .ui-switch button { min-width: 0; min-height: 24px; padding: 0 10px; border-radius: 11px; font-size: 12px; color: #1f2937; }
   body.ui-simple .ui-switch button.on { background: rgba(255,255,255,0.9); }
@@ -1427,7 +1430,7 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   body.ui-simple .hud::before { display: none; }
   /* view switch: below the safety capsule (--safety-h is its measured height), in the pose card's header row */
   body.ui-simple .view-switch {
-    position: fixed; z-index: 160; top: calc(8px + var(--safety-h, 50px) + 6px + 3px); left: calc(max(12px, env(safe-area-inset-left)) + 4px);
+    position: fixed; z-index: 160; top: calc(8px + var(--safety-h, 50px) + var(--tb-below, 0px) + 6px + 3px); left: calc(max(12px, env(safe-area-inset-left)) + 4px);
     background: rgba(255,255,255,0.3); border-color: rgba(255,255,255,0.45); box-shadow: 0 6px 18px rgba(0,0,0,0.18);
   }
   body.ui-simple .view-switch button[aria-checked="false"] { color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,0.4); }
@@ -1436,7 +1439,7 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
      Video | 3D). The canvas shrinks so the card ends above the left joystick (and the pose toggle when it is shown);
      the layout script hides the card (.pc-nofit) when even the smallest canvas does not fit. */
   body.ui-simple .pose-card {
-    --pc-top: calc(8px + var(--safety-h, 50px) + 6px); --pc-btn: 0px;
+    --pc-top: calc(8px + var(--safety-h, 50px) + var(--tb-below, 0px) + 6px); --pc-btn: 0px;
     position: fixed; z-index: 155; top: var(--pc-top); left: max(12px, env(safe-area-inset-left)); width: 200px; box-sizing: border-box;
     padding: 2px 8px 6px; border-radius: 16px; background: rgba(255,255,255,0.72); border: 1px solid rgba(255,255,255,0.6);
     box-shadow: 0 6px 18px rgba(0,0,0,0.18); backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
@@ -13763,7 +13766,11 @@ function renderOpBadge() {
   if (!S.auth.enforced) return;
   const unlocked = S.auth.role === 'operator';
   b.classList.toggle('is-unlocked', unlocked);
-  b.textContent = unlocked ? t('op.unlocked') : t('op.locked');
+  // "🔒 操作员": icon and label apart, so the simple landscape island can drop the label (tb-compact-3)
+  const txt = unlocked ? t('op.unlocked') : t('op.locked'), sp = txt.indexOf(' ');
+  b.textContent = '';
+  if (sp > 0) b.append(cwEl('span', 'op-ic', txt.slice(0, sp)), ' ', cwEl('span', 'op-lbl', txt.slice(sp + 1)));
+  else b.textContent = txt;
   const tip = t(unlocked ? 'op.badge.unlocked' : 'op.badge.locked');
   b.title = tip; b.setAttribute('aria-label', tip);
   if (opIsOpen()) renderOperatorModal();
@@ -13984,7 +13991,8 @@ applyI18n();
     const lTop = L.length ? Math.min(...L.map((r) => r.top)) : H;
     if (pr && pr.bottom + 6 > lTop) body.classList.add('pc-nofit');
     // popover: centred between the left column and the presets, above every joystick / slider under it
-    const leftCol = [document.querySelector('.safety'), body.classList.contains('pc-nofit') ? null : pc, document.getElementById('view-switch')]
+    const leftCol = [document.querySelector('.safety'), body.classList.contains('pc-nofit') ? null : pc, document.getElementById('view-switch'),
+      root.style.getPropertyValue('--tb-below') ? tb : null]
       .map(shown).filter(Boolean).reduce((m, r) => Math.max(m, r.right), 0);
     const presets = shown(document.querySelector('.presets'));
     const lo = leftCol + 8, hi = (presets ? presets.left : W) - 8;
@@ -13996,13 +14004,14 @@ applyI18n();
   function place() {
     if (busy) return; busy = true;
     try {
-      body.classList.remove('tb-compact-1', 'tb-compact-2');
+      body.classList.remove('tb-compact-1', 'tb-compact-2', 'tb-compact-3');
+      root.style.removeProperty('--tb-below');
       if (body.classList.contains('ui-simple') && getComputedStyle(tb).position === 'fixed') placeThumbs();
       else body.classList.remove('pc-nofit');
       tb.style.left = ''; tb.style.top = ''; tb.style.transform = '';
       if (!body.classList.contains('ui-simple') || getComputedStyle(tb).position !== 'fixed') return;
       const gap = 8;
-      for (let level = 0; level <= 2; level++) {
+      for (let level = 0; level <= 3; level++) {
         if (level) body.classList.add('tb-compact-' + level);
         tb.style.left = ''; tb.style.transform = '';
         const s = safety.getBoundingClientRect(), t = tb.getBoundingClientRect();
@@ -14015,11 +14024,14 @@ applyI18n();
           return;
         }
       }
-      // no room beside the capsule: put the island under it, left-aligned
+      // no room beside the capsule: put the island under it, left-aligned, and move the view switch and the pose card
+      // (they sit under the capsule) below the island
       const s = safety.getBoundingClientRect();
       tb.style.left = Math.round(s.left) + 'px';
       tb.style.top = Math.round(s.bottom + gap) + 'px';
       tb.style.transform = 'none';
+      root.style.setProperty('--tb-below', Math.round(tb.getBoundingClientRect().height + gap) + 'px');
+      placeThumbs();
     } finally { busy = false; }
   }
   const ro = new ResizeObserver(() => requestAnimationFrame(place));
