@@ -191,7 +191,7 @@ pub enum SafetyError {
         value: f32,
         bound: f32,
         #[serde(default)]
-        detail: crate::kinematics::WorkspaceViolationDetail,
+        detail: Box<crate::kinematics::WorkspaceViolationDetail>,
     },
 }
 
@@ -215,7 +215,7 @@ impl SafetyError {
 
     pub fn workspace_detail(&self) -> Option<crate::kinematics::WorkspaceViolationDetail> {
         match self {
-            Self::WorkspaceViolation { detail, .. } => Some(detail.clone()),
+            Self::WorkspaceViolation { detail, .. } => Some((**detail).clone()),
             _ => None,
         }
     }

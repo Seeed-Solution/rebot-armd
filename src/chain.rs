@@ -960,7 +960,7 @@ pub struct WorkspaceFailure {
     pub limit: String,
     pub value: f64,
     pub bound: f64,
-    pub detail: k::WorkspaceViolationDetail,
+    pub detail: Box<k::WorkspaceViolationDetail>,
 }
 
 impl WorkspaceFailure {
@@ -970,12 +970,12 @@ impl WorkspaceFailure {
             limit: "invalid".into(),
             value: f64::NAN,
             bound: 0.0,
-            detail: k::WorkspaceViolationDetail {
+            detail: Box::new(k::WorkspaceViolationDetail {
                 constraint_id: Some("invalid".into()),
                 geometry_id: Some("end_origin".into()),
                 violation_phase: Some(phase.into()),
                 reason: Some(reason.into()),
-            },
+            }),
         }
     }
 
@@ -1169,12 +1169,12 @@ impl<'a> WorkspaceEvaluator<'a> {
                     limit: "invalid".into(),
                     value: f64::NAN,
                     bound: 0.0,
-                    detail: k::WorkspaceViolationDetail {
+                    detail: Box::new(k::WorkspaceViolationDetail {
                         constraint_id: Some("invalid".into()),
                         geometry_id: Some(format!("capsule:{}", cap.id)),
                         violation_phase: Some(phase.into()),
                         reason: Some(format!("unknown frame '{}' for capsule '{}'", cap.frame, cap.id)),
-                    },
+                    }),
                 });
             };
             let pose = fr.pose(&f);
@@ -1258,12 +1258,12 @@ impl<'a> WorkspaceEvaluator<'a> {
                 limit: format!("self_collision '{id_a}' vs '{id_b}'"),
                 value: self.self_collision_min_clearance + clr,
                 bound: self.self_collision_min_clearance,
-                detail: k::WorkspaceViolationDetail {
+                detail: Box::new(k::WorkspaceViolationDetail {
                     constraint_id: Some(cid),
                     geometry_id: Some(gid),
                     violation_phase: Some(phase.into()),
                     reason: Some(reason),
-                },
+                }),
             };
         }
         if self.has_reach && slot == self.num_geoms * self.slots_per_geom {
@@ -1275,12 +1275,12 @@ impl<'a> WorkspaceEvaluator<'a> {
                 limit: "reach".into(),
                 value: bound - clr,
                 bound,
-                detail: k::WorkspaceViolationDetail {
+                detail: Box::new(k::WorkspaceViolationDetail {
                     reason: Some(reason_for(&cid, &gid)),
                     constraint_id: Some(cid),
                     geometry_id: Some(gid),
                     violation_phase: Some(phase.into()),
-                },
+                }),
             };
         }
         let gi = slot / self.slots_per_geom;
@@ -1330,12 +1330,12 @@ impl<'a> WorkspaceEvaluator<'a> {
             limit,
             value,
             bound,
-            detail: k::WorkspaceViolationDetail {
+            detail: Box::new(k::WorkspaceViolationDetail {
                 constraint_id: Some(cid),
                 geometry_id: Some(gid),
                 violation_phase: Some(phase.into()),
                 reason: Some(reason),
-            },
+            }),
         }
     }
 
@@ -1443,12 +1443,12 @@ impl<'a> WorkspaceEvaluator<'a> {
             limit: format!("keepout check: the path needs more than {max_budget} FK evaluations to clear the workspace; bound"),
             value: 0.0,
             bound: k::WORKSPACE_EPS,
-            detail: k::WorkspaceViolationDetail {
+            detail: Box::new(k::WorkspaceViolationDetail {
                 constraint_id: Some("sweep_budget".into()),
                 geometry_id: Some("end_origin".into()),
                 violation_phase: Some(phase.into()),
                 reason: Some(format!("workspace sweep exceeded {max_budget} FK evaluations")),
-            },
+            }),
         }
     }
 

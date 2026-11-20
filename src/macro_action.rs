@@ -175,7 +175,7 @@ impl MacroCtx {
             Ok(p) => p,
             Err(e) => {
                 if let motion::MotionError::WorkspaceViolation { ref detail, .. } = e {
-                    self.sup.inner().write().await.set_action_workspace_violation(self.id, detail.clone());
+                    self.sup.inner().write().await.set_action_workspace_violation(self.id, (**detail).clone());
                 }
                 return Err(arm_fail(e.into()));
             }

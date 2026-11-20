@@ -29,7 +29,7 @@ pub enum MotionError {
         limit: String,
         value: f64,
         bound: f64,
-        detail: kinematics::WorkspaceViolationDetail,
+        detail: Box<kinematics::WorkspaceViolationDetail>,
     },
     #[error("Motion busy: {0}")]
     MotionBusy(String),

@@ -325,12 +325,12 @@ fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) ->
 enum PreparedConfigWrite {
     Keepout(crate::keepout::PreparedKeepout),
     Collision(crate::collision::PreparedCollision),
-    GripperCalib(crate::gripper_calib::PreparedGripperCalib),
+    GripperCalib(Box<crate::gripper_calib::PreparedGripperCalib>),
     PosesSave(crate::poses::PreparedPosesSave),
     PosesDelete(crate::poses::PreparedPosesDelete),
     PosesRename(crate::poses::PreparedPosesSave),
     Sequences(crate::sequences::PreparedSequences),
-    GraspSetup(crate::grasp::PreparedGraspSetup),
+    GraspSetup(Box<crate::grasp::PreparedGraspSetup>),
 }
 
 impl PreparedConfigWrite {
@@ -344,13 +344,13 @@ impl PreparedConfigWrite {
         Some(match path {
             "/api/v1/workspace/keepout" => crate::keepout::prepare_update_with(inner, body, require_expected_revision).map(Self::Keepout),
             "/api/v1/safety/collision" => crate::collision::prepare_update_with(inner, body, require_expected_revision).map(Self::Collision),
-            "/api/v1/gripper/calibration" => crate::gripper_calib::prepare_update_with(inner, body, require_expected_revision).map(Self::GripperCalib),
+            "/api/v1/gripper/calibration" => crate::gripper_calib::prepare_update_with(inner, body, require_expected_revision).map(|p| Self::GripperCalib(Box::new(p))),
             "/api/v1/poses/save" => crate::poses::prepare_save_with(inner, body, require_expected_revision).map(Self::PosesSave),
             "/api/v1/poses/delete" => crate::poses::prepare_delete_with(inner, body, require_expected_revision).map(Self::PosesDelete),
             "/api/v1/poses/rename" => crate::poses::prepare_rename_with(inner, body, require_expected_revision).map(Self::PosesRename),
             "/api/v1/sequences/save" => crate::sequences::prepare_save(inner, body).map(Self::Sequences),
             "/api/v1/sequences/delete" => crate::sequences::prepare_delete(inner, body).map(Self::Sequences),
-            "/api/v1/grasp/setup" => crate::grasp::prepare_setup_update(inner, body, setup_path, require_expected_revision).map(Self::GraspSetup),
+            "/api/v1/grasp/setup" => crate::grasp::prepare_setup_update(inner, body, setup_path, require_expected_revision).map(|p| Self::GraspSetup(Box::new(p))),
             _ => return None,
         })
     }
@@ -454,7 +454,7 @@ impl PreparedConfigWrite {
                 ])
             }
             Self::GripperCalib(p) => {
-                let (policy, revision) = crate::gripper_calib::commit_update(inner, p)?;
+                let (policy, revision) = crate::gripper_calib::commit_update(inner, *p)?;
                 Ok(vec![
                     ("policy", json!(policy)),
                     ("closed_rad", json!(policy.closed_rad)),
@@ -490,7 +490,7 @@ impl PreparedConfigWrite {
                 Ok(fields)
             }
             Self::GraspSetup(p) => {
-                let (setup, revision) = crate::grasp::commit_setup_update(inner, p)?;
+                let (setup, revision) = crate::grasp::commit_setup_update(inner, *p)?;
                 Ok(vec![
                     ("setup", json!(setup)),
                     ("revision", json!(revision)),

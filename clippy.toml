@@ -1,0 +1,3 @@
+# `api::rest::ApiError` (the HTTP / WS rejection type, error path only) carries the workspace
+# violation detail, the config revision and Retry-After next to its strings: 152 bytes.
+large-error-threshold = 160

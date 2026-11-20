@@ -49,7 +49,7 @@ pub enum ArmError {
     #[error("WORKSPACE_VIOLATION: {message}")]
     WorkspaceRejected {
         message: String,
-        detail: crate::kinematics::WorkspaceViolationDetail,
+        detail: Box<crate::kinematics::WorkspaceViolationDetail>,
     },
 
     /// Config write expected_revision does not match the current revision.
@@ -65,8 +65,8 @@ impl ArmError {
     pub fn workspace_detail(&self) -> Option<crate::kinematics::WorkspaceViolationDetail> {
         match self {
             Self::Safety(e) => e.workspace_detail(),
-            Self::Motion(MotionError::WorkspaceViolation { detail, .. }) => Some(detail.clone()),
-            Self::WorkspaceRejected { detail, .. } => Some(detail.clone()),
+            Self::Motion(MotionError::WorkspaceViolation { detail, .. }) => Some((**detail).clone()),
+            Self::WorkspaceRejected { detail, .. } => Some((**detail).clone()),
             _ => None,
         }
     }

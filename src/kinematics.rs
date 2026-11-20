@@ -681,6 +681,7 @@ pub const MAX_STACK_WORKSPACE_SLOTS: usize = 256;
 
 /// Stack-backed clearance/depth buffer for zero-allocation servo workspace checks.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // the stack buffer is the point: no allocation in the servo tick
 pub enum SlotBuf {
     Stack { data: [f64; MAX_STACK_WORKSPACE_SLOTS], len: usize },
     Heap(Vec<f64>),

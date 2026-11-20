@@ -119,7 +119,7 @@ pub struct ApiError {
     pub safety_state: Option<String>,
     /// Extra reply fields (an object) of [`ArmError::Detailed`].
     pub details: Option<Box<serde_json::Value>>,
-    pub workspace_violation: Option<crate::kinematics::WorkspaceViolationDetail>,
+    pub workspace_violation: Option<Box<crate::kinematics::WorkspaceViolationDetail>>,
     pub current_revision: Option<u64>,
     pub retry_after_s: Option<u64>,
 }

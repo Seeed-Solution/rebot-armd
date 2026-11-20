@@ -1046,6 +1046,7 @@ fn b601dm_builtin_and_kit_profile_link_capsules_positive_and_negative() {
 }
 
 #[test]
+#[allow(clippy::approx_constant)] // mesh origins copied from the URDF (3.14159, 1.5708)
 fn so101_profile_link_capsules_positive_and_negative() {
     let mut config = ArmConfig::from_profile_file("profiles/so_arm101.json").expect("so_arm101.json loads");
     config.validate().expect("so_arm101.json validates");
@@ -1340,6 +1341,7 @@ fn self_collision_validation_positive_negative_sweep_and_servo() {
     // 4. Swept self-collision (violation_phase == "sweep"): both endpoints clear, midpoint collides
     // Keep J2=-0.3, J3=-0.2, J5=1.5, and sweep J4 from 0.0 to 3.14 so midpoint J4=1.57 swings into base_link.
     let q_sw_a: [f32; 7] = [0.0, -0.3, -0.2, 0.0, 1.5, std::f32::consts::FRAC_PI_2, 0.0];
+    #[allow(clippy::approx_constant)] // 3.14: just inside the soft limit, not pi
     let q_sw_b: [f32; 7] = [0.0, -0.3, -0.2, 3.14, 1.5, std::f32::consts::FRAC_PI_2, 0.0];
     assert_eval_clear(&ArmModel::REBOT_DEV_ARM, ws_dm, &dm.camera_mount, &q_sw_a, "DM sweep start");
     assert_eval_clear(&ArmModel::REBOT_DEV_ARM, ws_dm, &dm.camera_mount, &q_sw_b, "DM sweep end");

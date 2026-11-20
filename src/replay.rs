@@ -322,7 +322,7 @@ fn workspace_reject(e: SafetyError) -> ArmError {
     let detail = e.workspace_detail().map(|d| d.with_phase("replay")).unwrap_or_default();
     ArmError::WorkspaceRejected {
         message: format!("episode leaves the allowed workspace: {e}"),
-        detail,
+        detail: Box::new(detail),
     }
 }
 
