@@ -251,7 +251,12 @@ impl SupervisorInner {
             let sc_covered = ws.self_collision_covered();
             let active_pairs: &[[String; 2]] = if sc_covered { &ws.self_collision_pairs } else { &[] };
             json!({
+                // the effective floor: max(profile floor, valid calibrated table height - 3 mm)
                 "floor_z_m": ws.floor_z_m,
+                "profile_floor_z_m": self.profile_floor_z_m,
+                "effective_floor_z_m": ws.floor_z_m,
+                "floor_source": self.floor_source,
+                "floor_rule": "effective floor = max(profile floor_z_m, table_z_m - 0.003) while a camera calibration is in effect and not stale; with table_z_source hover only while its acceptance is valid",
                 "box_min_m": ws.box_min_m,
                 "box_max_m": ws.box_max_m,
                 "max_reach_m": ws.max_reach_m,

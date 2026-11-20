@@ -16,6 +16,17 @@
 //! built-in chain ([`crate::kinematics::JointCorrection`] per joint). It is written in the same
 //! transaction and installed live in `config.arm_model` ([`SupervisorInner::set_kinematics_correction`]);
 //! changing it needs torque off and no action running (KINEMATICS_ARMED).
+//!
+//! Self-service verification (T20): `tool` holds the fingertip measured with the 4-dot sticker
+//! (`tip_cam_m`, camera frame) bound to the intrinsics and X it was measured with
+//! ([`x_fingerprint`]); `acceptance` holds the automatic hover acceptance bound to
+//! [`fingerprint`] (intrinsics, X, kinematics, joint zero, tool); `table_z_source` says whether
+//! `table_z_m` came from the board solve (`camera`) or the hovers (`hover`). A dry-run apply
+//! reports the candidate's fingerprints; an apply with a `tool` / `acceptance` whose binding does
+//! not match the candidate is refused (TOOL_STALE / ACCEPTANCE_STALE). A zero marks the
+//! acceptance invalidated; validity is always rechecked against the live state, so a restored
+//! backup measured with another joint zero is not valid. The effective floor
+//! ([`effective_floor`]) follows a valid calibrated table height.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -64,6 +75,140 @@ pub struct CalibrationFile {
     /// offsets 0. A file may hold only this (no camera calibration).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub joint_zero: Option<crate::joint_zero::JointZero>,
+    /// Where `table_z_m` comes from: `camera` (the board solve) or `hover` (the automatic
+    /// acceptance measured the fingertip above the board); None = a file written before T20
+    /// (treated as `camera`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_z_source: Option<String>,
+    /// Fingertip measured with the sticker, bound to the camera calibration it was measured with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<ToolCalibration>,
+    /// Automatic hover acceptance of this calibration; None = unknown (legacy or not run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<AcceptanceRecord>,
+}
+
+/// `calibration.json` `tool`: the fingertip measured with the 4-dot sticker. `tip_end = X · tip_cam`
+/// is derived on demand; the record is valid only while `x_fingerprint` matches the camera
+/// calibration in effect ([`x_fingerprint`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCalibration {
+    /// The profile's `calibration_tool.tool_id` the sticker sat on (or the client's id).
+    pub tool_id: String,
+    /// Sticker origin (bottom-edge centre, flush with the fingertip) in the camera frame (m).
+    pub tip_cam_m: [f64; 3],
+    /// Sticker edge above the tool's lowest point (m), from the profile's `calibration_tool`
+    /// when the ids match; None = unknown tool.
+    #[serde(default)]
+    pub edge_to_low_m: Option<f64>,
+    /// Gripper opening (fraction 0 closed .. 1 open) during the measurement.
+    #[serde(default)]
+    pub gripper_opening: Option<f64>,
+    /// UTC time of the measurement (RFC 3339).
+    pub measured_at: String,
+    /// [`x_fingerprint`] of the intrinsics and camera mount the tip was measured with.
+    pub x_fingerprint: String,
+    /// Measurement report (frames, reprojection, ambiguity gap, std), passed through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit: Option<Value>,
+}
+
+/// `calibration.json` `acceptance`: the automatic hover acceptance (tool-down hovers over board
+/// corners, camera-measured fingertip height above the paper).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceRecord {
+    /// [`fingerprint`] of the calibration (intrinsics, X, kinematics, joint zero, tool) it accepted.
+    pub fingerprint: String,
+    /// Version of the client's gates.
+    pub gate_version: u32,
+    pub passed: bool,
+    /// UTC time (RFC 3339).
+    pub measured_at: String,
+    /// Board identity (`cols`, `rows`, `marker_side_m`, `gap_m`), passed through.
+    pub board: Value,
+    /// Per-point results and observations (at most [`MAX_ACCEPTANCE_POINTS`]), passed through.
+    pub points: Vec<Value>,
+    /// Summary (height spread, max XY error, `table_z_m`, `optical_table_z_m`, gates), passed through.
+    pub summary: Value,
+    /// The device-side hover job the observations came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    /// Set by a zero: measured with the old zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalidated: Option<CalibrationStale>,
+}
+
+/// Most points in an acceptance record.
+pub const MAX_ACCEPTANCE_POINTS: usize = 16;
+/// Largest serialized acceptance record (bytes).
+const MAX_ACCEPTANCE_BYTES: usize = 64 * 1024;
+/// The effective floor sits this far below a valid calibrated table height (m).
+pub const FLOOR_BELOW_TABLE_M: f64 = 0.003;
+
+// ---- fingerprints ----
+
+/// FNV-1a 64 of `s`, 16 hex digits (change detection, not security).
+fn fnv64(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() { h ^= u64::from(b); h = h.wrapping_mul(0x0000_0100_0000_01b3); }
+    format!("{h:016x}")
+}
+
+/// Fingerprint of a camera calibration: the intrinsics (fx..k3) and X = T_end_cam
+/// (`q_end_cam`, `offset_m`). A fingertip measurement is bound to it.
+pub fn x_fingerprint(intrinsics: Option<&Value>, mount: &CameraMount) -> String {
+    let intr: Vec<Value> = INTRINSIC_KEYS.iter().map(|k| intrinsics.and_then(|i| i.get(*k)).and_then(Value::as_f64).map_or(Value::Null, |v| json!(v))).collect();
+    fnv64(&format!("x1|{}|{}|{}", Value::Array(intr), json!(mount.q_end_cam), json!(mount.offset_m)))
+}
+
+/// Fingerprint of everything an acceptance depends on: [`x_fingerprint`], the kinematic
+/// correction, the joint zero (offsets, method, time) and the tool (id, tip, opening, edge).
+pub fn fingerprint(x_fp: &str, kin: Option<&Correction>, offsets: &[f32], zero: Option<&crate::joint_zero::JointZero>, tool: Option<&ToolCalibration>) -> String {
+    let z = zero.map(|z| json!([z.method, z.set_at]));
+    let t = tool.map(|t| json!([t.tool_id, t.tip_cam_m, t.gripper_opening, t.edge_to_low_m]));
+    fnv64(&format!("f1|{x_fp}|{}|{}|{}|{}", json!(kin), json!(offsets), json!(z), json!(t)))
+}
+
+/// (x_fingerprint, fingerprint) of a calibration file with the camera mount `mount` and the
+/// live joint zero offsets.
+pub fn file_fingerprints(c: Option<&CalibrationFile>, mount: &CameraMount, offsets: &[f32]) -> (String, String) {
+    let x = x_fingerprint(c.and_then(|c| c.intrinsics.as_ref()), mount);
+    let f = fingerprint(&x, correction_of(c), offsets, c.and_then(|c| c.joint_zero.as_ref()), c.and_then(|c| c.tool.as_ref()));
+    (x, f)
+}
+
+/// (x_fingerprint, fingerprint) of the calibration in effect.
+pub fn live_fingerprints(inner: &SupervisorInner) -> (String, String) {
+    file_fingerprints(inner.calibration.as_ref(), &inner.config.camera_mount, &inner.joint_zero_offsets)
+}
+
+/// The stored fingertip is valid: bound to the camera calibration whose x fingerprint is `x_fp`.
+pub fn tool_valid(c: &CalibrationFile, x_fp: &str) -> bool { c.has_camera() && c.tool.as_ref().is_some_and(|t| t.x_fingerprint == x_fp) }
+
+/// The stored acceptance is valid: passed, not invalidated, the calibration not stale and its
+/// fingerprint `fp` unchanged.
+pub fn acceptance_valid(c: &CalibrationFile, fp: &str) -> bool {
+    c.has_camera() && c.stale.is_none() && c.acceptance.as_ref().is_some_and(|a| a.passed && a.invalidated.is_none() && a.fingerprint == fp)
+}
+
+/// Effective floor (design T20 D): `max(profile floor, valid calibrated table_z_m - 3 mm)`.
+/// A table height is valid when the camera calibration is in effect and not stale, and, for
+/// `table_z_source: hover`, its acceptance is valid. Returns (floor, source, table_z used).
+pub fn effective_floor(profile_floor: f32, c: Option<&CalibrationFile>, fp: &str) -> (f32, &'static str, Option<f64>) {
+    let table = c.filter(|c| c.has_camera() && c.stale.is_none()).and_then(|c| {
+        let z = c.table_z_m.filter(|z| z.is_finite())?;
+        match c.table_z_source.as_deref() {
+            Some("hover") => acceptance_valid(c, fp).then_some((z, "calibration_hover")),
+            _ => Some((z, "calibration_camera")),
+        }
+    });
+    match table {
+        Some((z, src)) if (z - FLOOR_BELOW_TABLE_M) as f32 > profile_floor => ((z - FLOOR_BELOW_TABLE_M) as f32, src, Some(z)),
+        Some((z, _)) => (profile_floor, "profile", Some(z)),
+        None => (profile_floor, "profile", None),
+    }
 }
 
 /// `calibration.json` `stale`.
@@ -117,8 +262,31 @@ impl CalibrationFile {
             return Err("calibration.json: table_z_m must be in [-0.5, 0.5] m".into());
         }
         if let Some(k) = &self.kinematics { k.validate().map_err(|e| format!("calibration.json: {e}"))?; }
+        if let Some(s) = &self.table_z_source { if !["camera", "hover"].contains(&s.as_str()) { return Err("calibration.json: table_z_source must be \"camera\" or \"hover\"".into()); } }
+        if let Some(t) = &self.tool { validate_tool(t).map_err(|e| format!("calibration.json: {e}"))?; }
+        if let Some(a) = &self.acceptance { validate_acceptance(a).map_err(|e| format!("calibration.json: {e}"))?; }
         Ok(())
     }
+}
+
+fn validate_tool(t: &ToolCalibration) -> Result<(), String> {
+    if !crate::model::valid_tool_id(&t.tool_id) { return Err("tool.tool_id must be 1..64 of A-Z a-z 0-9 _ - .".into()); }
+    if !t.tip_cam_m.iter().all(|v| v.is_finite() && v.abs() <= 0.3) || t.tip_cam_m[2] <= 0.0 {
+        return Err("tool.tip_cam_m must be three values within 0.3 m, in front of the camera (z > 0)".into());
+    }
+    if t.edge_to_low_m.is_some_and(|e| !e.is_finite() || !(0.0..=0.05).contains(&e)) { return Err("tool.edge_to_low_m must be in [0, 0.05] m".into()); }
+    if t.gripper_opening.is_some_and(|g| !g.is_finite() || !(0.0..=1.0).contains(&g)) { return Err("tool.gripper_opening must be in [0, 1]".into()); }
+    if t.x_fingerprint.is_empty() || t.x_fingerprint.len() > 64 || t.measured_at.len() > 64 { return Err("tool.x_fingerprint / measured_at: at most 64 bytes".into()); }
+    if t.fit.as_ref().is_some_and(|f| !f.is_object()) { return Err("tool.fit must be an object".into()); }
+    Ok(())
+}
+
+fn validate_acceptance(a: &AcceptanceRecord) -> Result<(), String> {
+    if a.fingerprint.is_empty() || a.fingerprint.len() > 64 || a.measured_at.len() > 64 { return Err("acceptance.fingerprint / measured_at: 1..64 bytes".into()); }
+    if a.points.len() > MAX_ACCEPTANCE_POINTS { return Err(format!("acceptance.points: at most {MAX_ACCEPTANCE_POINTS}")); }
+    if !a.board.is_object() || !a.summary.is_object() || a.points.iter().any(|p| !p.is_object()) { return Err("acceptance.board, summary and points must be objects".into()); }
+    if serde_json::to_string(a).map_or(usize::MAX, |t| t.len()) > MAX_ACCEPTANCE_BYTES { return Err(format!("acceptance: at most {MAX_ACCEPTANCE_BYTES} bytes")); }
+    Ok(())
 }
 
 /// Files and upstream of the calibration commands.
@@ -196,7 +364,7 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
                         file.kinematics = None;
                     }
                 }
-                inner.calibration = Some(file);
+                inner.set_calibration(Some(file));
                 return Ok(());
             }
             let q = crate::model::unit_quaternion(&file.camera_mount.q_end_cam.unwrap_or([1.0, 0.0, 0.0, 0.0])).unwrap_or([1.0, 0.0, 0.0, 0.0]);
@@ -218,7 +386,7 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path, setup_path: Opti
                     }
                 }
             }
-            inner.calibration = Some(file);
+            inner.set_calibration(Some(file));
             Ok(())
         }
         crate::persist::Loaded::Missing => {
@@ -373,12 +541,54 @@ pub struct ApplyRequest {
     /// `kinematics`: None = absent (a stored correction stays), Some(None) = null (removes it),
     /// Some(Some(k)) = install `k`.
     pub kinematics: Option<Option<KinematicsCalibration>>,
+    /// `table_z_source`: `camera` (default) or `hover` (needs a passed `acceptance` and a tool
+    /// with a known `edge_to_low_m`).
+    pub table_z_source: String,
+    /// `tool`: None = absent (a stored tool stays while its x fingerprint matches), Some(None) =
+    /// null (removes it), Some(Some(t)) = store `t` (its `x_fingerprint` must match the new calibration).
+    pub tool: Option<Option<ToolInput>>,
+    /// `acceptance`: stored when given (its `fingerprint` must match the new calibration); an
+    /// apply without it drops the stored one.
+    pub acceptance: Option<AcceptanceInput>,
+}
+
+/// Apply field `tool` (armd adds `edge_to_low_m` from the profile's `calibration_tool`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolInput {
+    pub tool_id: String,
+    pub tip_cam_m: [f64; 3],
+    #[serde(default)]
+    pub gripper_opening: Option<f64>,
+    /// `x_fingerprint` of the candidate the tip was measured with (from a dry run of this apply).
+    pub x_fingerprint: String,
+    #[serde(default)]
+    pub measured_at: Option<String>,
+    #[serde(default)]
+    pub fit: Option<Value>,
+}
+
+/// Apply field `acceptance`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceInput {
+    /// `fingerprint` of the candidate the hovers ran with (from a dry run of this apply).
+    pub fingerprint: String,
+    pub gate_version: u32,
+    pub passed: bool,
+    #[serde(default)]
+    pub measured_at: Option<String>,
+    pub board: Value,
+    pub points: Vec<Value>,
+    pub summary: Value,
+    #[serde(default)]
+    pub job_id: Option<String>,
 }
 
 pub fn parse_apply(body: &Value) -> Result<ApplyRequest, CalibError> {
     let o = body.as_object().ok_or_else(|| CalibError::invalid("Command body must be an object"))?;
     for k in o.keys() {
-        if !["intrinsics", "camera_mount", "table_z_m", "rms", "solved_at", "dry_run", "kinematics"].contains(&k.as_str()) {
+        if !["intrinsics", "camera_mount", "table_z_m", "rms", "solved_at", "dry_run", "kinematics", "table_z_source", "tool", "acceptance"].contains(&k.as_str()) {
             return Err(CalibError::invalid(format!("unknown field: {k}")));
         }
     }
@@ -415,7 +625,27 @@ pub fn parse_apply(body: &Value) -> Result<ApplyRequest, CalibError> {
             Some(Some(k))
         }
     };
+    let table_z_source = match o.get("table_z_source") {
+        None | Some(Value::Null) => "camera".to_string(),
+        Some(Value::String(s)) if s == "camera" || s == "hover" => s.clone(),
+        Some(_) => return Err(CalibError::invalid("table_z_source must be \"camera\" or \"hover\"")),
+    };
+    let tool = match o.get("tool") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(v) => Some(Some(serde_json::from_value::<ToolInput>(v.clone())
+            .map_err(|e| CalibError::invalid(format!("tool must be {{tool_id, tip_cam_m, x_fingerprint, gripper_opening?, measured_at?, fit?}}: {e}")))?)),
+    };
+    let acceptance = match o.get("acceptance") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(serde_json::from_value::<AcceptanceInput>(v.clone())
+            .map_err(|e| CalibError::invalid(format!("acceptance must be {{fingerprint, gate_version, passed, board, points, summary, measured_at?, job_id?}}: {e}")))?),
+    };
+    if acceptance.as_ref().is_some_and(|a| a.job_id.as_ref().is_some_and(|j| j.len() > 64)) { return Err(CalibError::invalid("acceptance.job_id: at most 64 bytes")); }
     Ok(ApplyRequest {
+        table_z_source,
+        tool,
+        acceptance,
         intrinsics,
         offset_m: [off[0] as f32, off[1] as f32, off[2] as f32],
         q_end_cam,
@@ -490,16 +720,59 @@ fn after_state(inner: &SupervisorInner, req: &ApplyRequest) -> Result<ArmdState,
     let grip_pixel_model = grip_pixel_norm(&cam, &setup);
     if let Some(p) = grip_pixel_model.filter(|p| p.iter().all(|v| (0.0..=1.0).contains(v))) { setup.grip_pixel_norm = p; }
     setup.validate().map_err(|e| CalibError::invalid(format!("grasp setup after the calibration: {e}")))?;
-    let file = CalibrationFile {
+    let now = || chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let intrinsics = Some(Value::Object(req.intrinsics.clone()));
+    let x_fp = x_fingerprint(intrinsics.as_ref(), &mount);
+    let tool = match &req.tool {
+        // a stored fingertip stays only while it is bound to the same camera calibration
+        None => inner.calibration.as_ref().and_then(|c| c.tool.clone()).filter(|t| t.x_fingerprint == x_fp),
+        Some(None) => None,
+        Some(Some(t)) => {
+            if t.x_fingerprint != x_fp {
+                return Err(CalibError::new(409, "TOOL_STALE", "tool.x_fingerprint does not match this calibration (intrinsics or camera mount changed since the fingertip was measured); measure the fingertip again"));
+            }
+            let spec = inner.config.calibration_tool.as_ref().filter(|s| s.tool_id == t.tool_id);
+            let tool = ToolCalibration { tool_id: t.tool_id.clone(), tip_cam_m: t.tip_cam_m, edge_to_low_m: spec.and_then(|s| s.edge_to_low_m),
+                gripper_opening: t.gripper_opening, measured_at: t.measured_at.clone().filter(|m| !m.is_empty()).unwrap_or_else(now),
+                x_fingerprint: t.x_fingerprint.clone(), fit: t.fit.clone() };
+            validate_tool(&tool).map_err(CalibError::invalid)?;
+            Some(tool)
+        }
+    };
+    let mut file = CalibrationFile {
         camera_mount: mount.clone(),
-        intrinsics: Some(Value::Object(req.intrinsics.clone())),
+        intrinsics,
         table_z_m: Some(req.table_z_m),
-        solved_at: Some(req.solved_at.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true))),
+        solved_at: Some(req.solved_at.clone().unwrap_or_else(now)),
         rms: req.rms.clone(),
         kinematics,
         stale: None,
         joint_zero: inner.calibration.as_ref().and_then(|c| c.joint_zero.clone()),
+        table_z_source: Some(req.table_z_source.clone()),
+        tool,
+        acceptance: None,
     };
+    let (_, fp) = file_fingerprints(Some(&file), &mount, &inner.joint_zero_offsets);
+    if let Some(a) = &req.acceptance {
+        if a.fingerprint != fp {
+            return Err(CalibError::new(409, "ACCEPTANCE_STALE", "acceptance.fingerprint does not match this calibration (camera, kinematics, joint zero or tool changed since the hovers); run the acceptance again"));
+        }
+        let rec = AcceptanceRecord { fingerprint: a.fingerprint.clone(), gate_version: a.gate_version, passed: a.passed,
+            measured_at: a.measured_at.clone().filter(|m| !m.is_empty()).unwrap_or_else(now), board: a.board.clone(), points: a.points.clone(),
+            summary: a.summary.clone(), job_id: a.job_id.clone(), invalidated: None };
+        validate_acceptance(&rec).map_err(CalibError::invalid)?;
+        file.acceptance = Some(rec);
+    }
+    if req.table_z_source == "hover" {
+        let ok = file.acceptance.as_ref().is_some_and(|a| a.passed) && file.tool.as_ref().is_some_and(|t| t.edge_to_low_m.is_some());
+        if !ok {
+            return Err(CalibError::new(400, "TABLE_Z_UNVERIFIED", "table_z_source hover needs a passed acceptance and a fingertip of a known tool (profile calibration_tool with edge_to_low_m)"));
+        }
+        let summary_z = file.acceptance.as_ref().and_then(|a| a.summary.get("table_z_m")).and_then(Value::as_f64);
+        if summary_z.is_none_or(|z| (z - req.table_z_m).abs() > 1e-6) {
+            return Err(CalibError::invalid("table_z_source hover: table_z_m must equal acceptance.summary.table_z_m"));
+        }
+    }
     Ok(ArmdState { camera_mount: mount, calibration: Some(file), grasp_setup: Some(setup), grip_pixel_model })
 }
 
@@ -730,6 +1003,10 @@ pub async fn invalidate_after_zero(sup: &ArmSupervisor, deps: &CalibrationDeps, 
         let camera_stale = file.as_ref().is_some_and(CalibrationFile::has_camera);
         if let Some(c) = file.as_mut().filter(|c| c.has_camera()) {
             c.stale = Some(CalibrationStale { reason: format!("{method} zero of joints {joints:?}; the camera calibration was measured with the old zero"), at: at.clone() });
+            // the hovers (and a hover table height) were measured with the old zero
+            if let Some(a) = c.acceptance.as_mut() {
+                a.invalidated = Some(CalibrationStale { reason: format!("{method} zero of joints {joints:?}; the acceptance was measured with the old zero"), at: at.clone() });
+            }
         }
         let mut file_changes = removed.is_some() || camera_stale;
         if let Some(z) = new_zero {
@@ -753,7 +1030,7 @@ pub async fn invalidate_after_zero(sup: &ArmSupervisor, deps: &CalibrationDeps, 
     let (poses_write, gripper_write, poses_stale, gripper_stale) = {
         let mut inner = sup.inner().write().await;
         if let Err(e) = inner.set_kinematics_correction(None) { error.get_or_insert(format!("kinematic correction not removed: {e}")); }
-        if file_changes { inner.calibration = file; }
+        if file_changes { inner.set_calibration(file); }
         let reason = format!("{method} zero of joints {moved:?}; taught with the old zero");
         let mut poses_stale = Vec::new();
         if !moved.is_empty() {
@@ -883,7 +1160,7 @@ impl Txn<'_> {
                 inner.set_kinematics_correction(kin.as_ref())
                     .map_err(|e| CalibError::new(400, "UNSUPPORTED", e).at("calibration_file"))?;
                 inner.set_camera_mount(after.camera_mount.clone());
-                inner.calibration = after.calibration.clone();
+                inner.set_calibration(after.calibration.clone());
                 self.live_written = true;
                 Some(dir_sync)
             }
@@ -903,7 +1180,7 @@ impl Txn<'_> {
                 inner.set_kinematics_correction(kin.as_ref())
                     .map_err(|e| CalibError::new(400, "UNSUPPORTED", e).at("calibration_file"))?;
                 inner.set_camera_mount(after.camera_mount.clone());
-                inner.calibration = after.calibration.clone();
+                inner.set_calibration(after.calibration.clone());
                 self.live_written = true;
                 if removed {
                     Some(crate::persist::PendingDirSync::for_path(&self.deps.path))
@@ -995,7 +1272,7 @@ impl Txn<'_> {
         if self.live_written {
             let mut inner = self.sup.inner().write().await;
             inner.set_camera_mount(self.before.camera_mount.clone());
-            inner.calibration = self.before.calibration.clone();
+            inner.set_calibration(self.before.calibration.clone());
             if let Err(e) = inner.set_kinematics_correction(correction_of(self.before.calibration.as_ref())) {
                 tracing::warn!("revert: kinematic correction not put back: {e}");
             }
@@ -1075,10 +1352,16 @@ impl Txn<'_> {
     }
 }
 
-fn diff_view(vision: &Value, state: &ArmdState) -> Value {
+fn diff_view(vision: &Value, state: &ArmdState, inner: &SupervisorInner) -> Value {
+    let c = state.calibration.as_ref();
+    let (x_fp, fp) = file_fingerprints(c, &state.camera_mount, &inner.joint_zero_offsets);
     let mut v = json!({"vision_intrinsics": vision, "camera_mount": mount_summary(&state.camera_mount),
-        "kinematics": state.calibration.as_ref().and_then(|c| c.kinematics.as_ref()),
-        "grasp": state.grasp_setup.as_ref().map(grasp_fields)});
+        "kinematics": c.and_then(|c| c.kinematics.as_ref()),
+        "grasp": state.grasp_setup.as_ref().map(grasp_fields),
+        "x_fingerprint": x_fp, "fingerprint": fp,
+        "table_z_m": c.and_then(|c| c.table_z_m), "table_z_source": c.and_then(|c| c.table_z_source.as_deref()),
+        "tool": c.and_then(|c| c.tool.as_ref()), "acceptance": c.and_then(|c| c.acceptance.as_ref()).map(|a| json!({"passed": a.passed, "fingerprint": a.fingerprint, "job_id": a.job_id})),
+        "floor": inner.profile_floor_z_m.map(|p| floor_view(p, c, &fp))});
     if let Some(p) = state.grip_pixel_model { v["grip_pixel_model"] = json!(p); }
     v
 }
@@ -1096,7 +1379,8 @@ pub async fn apply(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, req: ApplyR
     if req.dry_run {
         let mut va = vision_after.clone();
         va.remove("revision");
-        return Ok(json!({"dry_run": true, "before": diff_view(&vision_before, &before), "after": diff_view(&Value::Object(va), &after)}));
+        let inner = sup.inner().read().await;
+        return Ok(json!({"dry_run": true, "before": diff_view(&vision_before, &before, &inner), "after": diff_view(&Value::Object(va), &after, &inner)}));
     }
     let mut txn = Txn { sup, deps, check, before, vision_before, vision_written: None, vision_unknown: false, file_written: false, live_written: false, backup: None, durability_warnings: Vec::new() };
     let mut out = txn.run("apply", &req.intrinsics, &after).await?;
@@ -1146,6 +1430,30 @@ pub async fn restore(sup: &Arc<ArmSupervisor>, deps: &CalibrationDeps, body: &Va
     Ok(out)
 }
 
+/// `{profile_floor_z_m, effective_floor_z_m, source, table_z_m}` of the floor rule.
+pub fn floor_view(profile: f32, c: Option<&CalibrationFile>, fp: &str) -> Value {
+    let (eff, src, z) = effective_floor(profile, c, fp);
+    json!({"profile_floor_z_m": profile, "effective_floor_z_m": eff, "source": src, "table_z_m": z, "below_table_m": FLOOR_BELOW_TABLE_M})
+}
+
+/// `{x_fingerprint, fingerprint, tool_valid, acceptance_valid, tip_end_m?}` of the calibration in effect.
+pub fn verification_view(inner: &SupervisorInner) -> Value {
+    let (x_fp, fp) = live_fingerprints(inner);
+    let c = inner.calibration.as_ref();
+    let tool_ok = c.is_some_and(|c| tool_valid(c, &x_fp));
+    // tip_end = X · tip_cam with the X in effect
+    let tip_end = c.and_then(|c| c.tool.as_ref()).filter(|_| tool_ok).and_then(|t| {
+        let m = &inner.config.camera_mount;
+        let (q, o) = (m.q_end_cam?, m.offset_m?);
+        let r = crate::kinematics::quat_to_r(&q);
+        let p = crate::kinematics::mat_vec(&r, &t.tip_cam_m);
+        Some([p[0] + f64::from(o[0]), p[1] + f64::from(o[1]), p[2] + f64::from(o[2])])
+    });
+    json!({"x_fingerprint": x_fp, "fingerprint": fp, "tool_valid": tool_ok, "tip_end_m": tip_end,
+        "acceptance_valid": c.is_some_and(|c| acceptance_valid(c, &fp)),
+        "table_z_source": c.and_then(|c| c.table_z_source.as_deref()).unwrap_or(if c.is_some_and(CalibrationFile::has_camera) { "camera" } else { "none" })})
+}
+
 /// `GET /api/v1/calibration`.
 pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
     let inner = sup.inner().read().await;
@@ -1160,6 +1468,9 @@ pub async fn status(sup: &ArmSupervisor, deps: &CalibrationDeps) -> Value {
         "zero_reference": inner.config.zero_reference,
         "zero_convention": inner.config.zero_reference.as_ref().map(|_| &inner.zero_convention),
         "calibration_tools": inner.calibration_tools(),
+        "calibration_tool": inner.config.calibration_tool,
+        "verification": verification_view(&inner),
+        "floor": inner.profile_floor_z_m.map(|p| floor_view(p, inner.calibration.as_ref(), &live_fingerprints(&inner).1)),
         "grasp": inner.grasp_setup().map(|s| grasp_fields(&s)), "grasp_revision": inner.grasp_setup_revision,
         "backups": list_backups(deps)})
 }

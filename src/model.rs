@@ -1060,6 +1060,11 @@ pub struct ArmConfig {
     /// joint zero so that the arm reads it in this pose (src/joint_zero.rs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zero_reference: Option<ZeroReference>,
+    /// The tool the fingertip calibration measures (calibration wizard, src/calibration.rs):
+    /// its id and the height of the sticker edge above the tool's lowest point; None = no
+    /// known tool (the acceptance then reports sticker-edge heights and sets no table height).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_tool: Option<CalibrationToolSpec>,
     /// Arm model built from the fields above (not part of the profile JSON).
     #[serde(skip)]
     pub arm_model: crate::chain::ArmModel,
@@ -1138,6 +1143,7 @@ impl Default for ArmConfig {
             #[cfg(not(target_arch = "wasm32"))] feetech: None,
             zero_pose: None,
             zero_reference: None,
+            calibration_tool: None,
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -1315,6 +1321,7 @@ impl ArmConfig {
         if self.dof == 0 {
             return Err("DOF cannot be zero".into());
         }
+        if let Some(t) = &self.calibration_tool { t.validate()?; }
         if self.limits.len() != self.dof {
             return Err(format!("Limits length {} does not match DOF {}", self.limits.len(), self.dof));
         }
@@ -1683,6 +1690,7 @@ impl ArmConfig {
             #[cfg(not(target_arch = "wasm32"))] feetech: None,
             zero_pose: Some(ZeroPoseDoc::rebot_b601()),
             zero_reference: Some(zero_reference),
+            calibration_tool: Some(CalibrationToolSpec::b601dm_gripper()),
             arm_model: crate::chain::ArmModel::REBOT_DEV_ARM,
         }
     }
@@ -2204,6 +2212,37 @@ impl ZeroPoseDoc {
             source: Some("official convention (Seeed-Projects/reBotArm_control_py: URDF angle = motor angle, zero at the folded rest pose); built-in FK of assets/reBot-DevArm_gripper.urdf; gripper: wiki.seeedstudio.com/rebot_arm_b601_dm_lerobot (zero position = gripper fully closed)".into()),
         }
     }
+}
+
+/// Profile field `calibration_tool`: the tool whose fingertip the calibration wizard measures.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CalibrationToolSpec {
+    /// Tool identity (1..64 of A-Z a-z 0-9 _ - .); a stored fingertip measurement is bound to it.
+    pub tool_id: String,
+    /// Height (m) of the fingertip sticker's bottom edge above the tool's lowest point when
+    /// the tool points down; None = unknown.
+    #[serde(default)]
+    pub edge_to_low_m: Option<f64>,
+}
+
+impl CalibrationToolSpec {
+    /// B601-DM parallel gripper: sticker edge about 2.3 mm above the finger's lowest point
+    /// (two caliper readings on the office unit, 2026-11-20; approximate).
+    pub fn b601dm_gripper() -> Self { Self { tool_id: "b601dm_gripper".into(), edge_to_low_m: Some(0.0023) } }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !valid_tool_id(&self.tool_id) { return Err("calibration_tool.tool_id must be 1..64 of A-Z a-z 0-9 _ - .".into()); }
+        if self.edge_to_low_m.is_some_and(|e| !e.is_finite() || !(0.0..=0.05).contains(&e)) {
+            return Err("calibration_tool.edge_to_low_m must be in [0, 0.05] m".into());
+        }
+        Ok(())
+    }
+}
+
+/// 1..64 of A-Z a-z 0-9 _ - .
+pub fn valid_tool_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
 /// Profile field `zero_reference`: the pose the joint zero refers to.

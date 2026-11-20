@@ -292,6 +292,12 @@ pub struct SupervisorInner {
     /// Camera calibration in effect (`calibration.json`, `crate::calibration`); None = the
     /// profile's camera mount.
     pub calibration: Option<crate::calibration::CalibrationFile>,
+    /// The profile's `workspace.floor_z_m` (None without a workspace). `config.workspace.floor_z_m`
+    /// holds the effective floor ([`crate::calibration::effective_floor`]), recomputed by
+    /// [`refresh_effective_floor`](Self::refresh_effective_floor) whenever its inputs change.
+    pub profile_floor_z_m: Option<f32>,
+    /// Source of the effective floor: `profile`, `calibration_camera` or `calibration_hover`.
+    pub floor_source: &'static str,
     /// A calibration apply / restore transaction is running: motion commands are refused
     /// (MOTION_BUSY) and other configuration writes too (CONFIG_BUSY).
     pub calibration_busy: bool,
@@ -482,6 +488,7 @@ impl SupervisorInner {
 
         let base_gripper_policy = config.gripper_policy.clone();
         let profile_camera_mount = config.camera_mount.clone();
+        let profile_floor_z_m = config.workspace.as_ref().map(|w| w.floor_z_m);
         let profile_grasp = config.grasp.clone();
         let mock_gripper_stall_offset = std::env::var("ARMD_MOCK_GRIPPER_STALL_OFFSET").ok().and_then(|s| s.parse::<f32>().ok());
 
@@ -545,6 +552,8 @@ impl SupervisorInner {
             park_rejection: None,
             workspace_revision: 0,
             calibration: None,
+            profile_floor_z_m,
+            floor_source: "profile",
             calibration_busy: false,
             motor_zero_busy: false,
             calibration_load_error: None,
@@ -688,7 +697,7 @@ impl SupervisorInner {
             return Err(format!("joint zero needs {} finite offsets", self.config.dof));
         }
         let old = std::mem::replace(&mut self.joint_zero_offsets, offsets.to_vec());
-        if old != offsets { self.calibration_revision += 1; }
+        if old != offsets { self.calibration_revision += 1; self.refresh_effective_floor(); }
         if let Some(d) = self.driver.as_ref() {
             let mut drv = d.lock().map_err(|_| "driver unavailable".to_string())?;
             drv.set_joint_zero_offsets(offsets);
@@ -2949,6 +2958,31 @@ impl SupervisorInner {
         self.calibration.as_ref().is_some_and(|c| c.camera_mount.q_end_cam.is_some())
     }
 
+    /// Install the calibration in effect (load / apply / revert / restore / zero invalidation)
+    /// and recompute the effective floor.
+    pub fn set_calibration(&mut self, c: Option<crate::calibration::CalibrationFile>) {
+        self.calibration = c;
+        self.refresh_effective_floor();
+    }
+
+    /// Recompute `config.workspace.floor_z_m` = max(profile floor, valid calibrated table
+    /// height - 3 mm) (src/calibration.rs `effective_floor`). Every floor check (end points,
+    /// link capsules, swept paths, servo steps) reads that field. A change bumps the workspace
+    /// revision (plans made with the old floor fail PLAN_STALE).
+    pub fn refresh_effective_floor(&mut self) {
+        let Some(profile) = self.profile_floor_z_m else { return; };
+        let (_, fp) = crate::calibration::live_fingerprints(self);
+        let (floor, source, _) = crate::calibration::effective_floor(profile, self.calibration.as_ref(), &fp);
+        self.floor_source = source;
+        let Some(ws) = self.config.workspace.as_mut() else { return; };
+        if ws.floor_z_m != floor {
+            tracing::info!("Effective floor {:.4} m (was {:.4} m, profile {profile:.4} m, source {source})", floor, ws.floor_z_m);
+            ws.floor_z_m = floor;
+            self.workspace_revision += 1;
+            self.servo_ws_min_depths = None;
+        }
+    }
+
     /// Install a camera mount (calibration apply / restore / startup): bumps the workspace
     /// revision when it changes and keeps the grasp setup's tilt in sync with the mount's.
     pub fn set_camera_mount(&mut self, mount: crate::model::CameraMount) {
@@ -2959,6 +2993,7 @@ impl SupervisorInner {
         self.config.camera_mount = mount;
         let tilt = f64::from(self.config.camera_mount.tilt_deg);
         if let Some(g) = self.config.grasp.as_mut() { g.camera_tilt_deg = tilt; }
+        self.refresh_effective_floor();
     }
 
     /// Install the kinematic correction of the built-in model (calibration apply / restore /
@@ -2975,6 +3010,7 @@ impl SupervisorInner {
         self.servo_ws_min_depths = None;
         self.calibration_revision += 1;
         self.refresh_pose_tcps();
+        self.refresh_effective_floor();
         Ok(())
     }
 
