@@ -21,9 +21,9 @@ use armd::motion::MotionError;
 use armd::policy_runtime::{
     compute_policy_deadline, compute_release_digest, encode_rmlp_bytes,
     parse_policy_start_request, prepare_policy, spawn_policy_runner, validate_policy_fps,
-    Activation, MlpLayerSpec, PolicyBackend, PolicyError, PolicyMode, PolicyRunStart,
-    PolicySnapshot, PreparedPolicy, StrictPolicyContract, MAX_POLICY_FPS, MAX_POLICY_SECONDS,
-    MIN_LIVE_POLICY_FPS,
+    Activation, ActiveDeploymentContext, MlpLayerSpec, PolicyBackend, PolicyError, PolicyMode,
+    PolicyRunStart, PolicySnapshot, PreparedPolicy, ReleaseGate, StrictPolicyContract,
+    EMPTY_CALIBRATION_DIGEST, MAX_POLICY_FPS, MAX_POLICY_SECONDS, MIN_LIVE_POLICY_FPS,
 };
 use armd::{ArmError, ArmSupervisor, FaultReason, OperatorAuth, SafetyError, SafetyState};
 
@@ -171,9 +171,12 @@ async fn shadow_mode_runs_and_never_mutates_servo_target() {
                 artifact_digest: prepared.artifact_digest().to_string(),
                 backend: prepared.backend_name().to_string(),
                 mode: PolicyMode::Shadow,
+                sim_only: false,
                 max_first_step_rad: prepared.contract().max_first_step_rad,
                 max_step_rad: prepared.contract().max_step_rad,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap()
     };
@@ -254,9 +257,12 @@ async fn live_mode_moves_mock_arm_and_enforces_first_step_jump_limit() {
                 artifact_digest: prepared_ok.artifact_digest().to_string(),
                 backend: prepared_ok.backend_name().to_string(),
                 mode: PolicyMode::Live,
+                sim_only: false,
                 max_first_step_rad: prepared_ok.contract().max_first_step_rad,
                 max_step_rad: prepared_ok.contract().max_step_rad,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap()
     };
@@ -316,9 +322,12 @@ async fn live_mode_moves_mock_arm_and_enforces_first_step_jump_limit() {
                 artifact_digest: prepared_jump.artifact_digest().to_string(),
                 backend: prepared_jump.backend_name().to_string(),
                 mode: PolicyMode::Live,
+                sim_only: false,
                 max_first_step_rad: prepared_jump.contract().max_first_step_rad,
                 max_step_rad: prepared_jump.contract().max_step_rad,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap()
     };
@@ -351,9 +360,12 @@ async fn live_mode_moves_mock_arm_and_enforces_first_step_jump_limit() {
             artifact_digest: "abc".into(),
             backend: "mlp".into(),
             mode: PolicyMode::Live,
+            sim_only: false,
             max_first_step_rad: Some(0.10),
             max_step_rad: Some(0.04),
             tag: None,
+            i_am_at_the_arm: false,
+            verified_release_gate: None,
         })
         .unwrap();
     inner.policy_step(id_c, vec![0.05, 0.0, 0.0, 0.0, 0.0, 0.0], Some(0)).unwrap();
@@ -393,9 +405,12 @@ async fn late_frame_after_stop_estop_preempt_and_blocked_hold_is_rejected() {
                 artifact_digest: "d1".into(),
                 backend: "mlp".into(),
                 mode: PolicyMode::Live,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap();
         assert!(inner.stop_policy_run(Some(id), "STOPPED"));
@@ -430,9 +445,12 @@ async fn late_frame_after_stop_estop_preempt_and_blocked_hold_is_rejected() {
                 artifact_digest: "d2".into(),
                 backend: "mlp".into(),
                 mode: PolicyMode::Live,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap()
     };
@@ -470,9 +488,12 @@ async fn late_frame_after_stop_estop_preempt_and_blocked_hold_is_rejected() {
                 artifact_digest: "d3".into(),
                 backend: "mlp".into(),
                 mode: PolicyMode::Live,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap();
         inner.servo_blocked_hold = true;
@@ -509,9 +530,12 @@ async fn late_frame_after_stop_estop_preempt_and_blocked_hold_is_rejected() {
                 artifact_digest: "d4".into(),
                 backend: "mlp".into(),
                 mode: PolicyMode::Live,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap()
     };
@@ -552,9 +576,12 @@ async fn policy_frames_do_not_renew_external_lease_watchdog() {
                 artifact_digest: "dw".into(),
                 backend: "mlp".into(),
                 mode: PolicyMode::Live,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap()
     };
@@ -617,7 +644,11 @@ async fn real_driver_rejects_live_mode_but_allows_shadow() {
             "detector_top1_box_norm_v1".to_string()
         ]
     );
-    assert_eq!(pr.modes, vec!["shadow".to_string()], "real driver must only advertise shadow");
+    assert_eq!(
+        pr.modes,
+        vec!["shadow".to_string(), "live_gated".to_string()],
+        "real driver must advertise shadow and live_gated"
+    );
 
     let gen = sup.acquire_lease("conn-real").await.unwrap();
     sup.set_torque(true).await.unwrap();
@@ -634,14 +665,17 @@ async fn real_driver_rejects_live_mode_but_allows_shadow() {
             artifact_digest: "dr".into(),
             backend: "mlp".into(),
             mode: PolicyMode::Live,
+            sim_only: false,
             max_first_step_rad: None,
             max_step_rad: None,
             tag: None,
+            i_am_at_the_arm: false,
+            verified_release_gate: None,
         })
         .unwrap_err();
     assert!(
-        matches!(live_err, ArmError::Rejected { ref code, .. } if code == "POLICY_SHADOW_ONLY"),
-        "expected POLICY_SHADOW_ONLY, got {live_err:?}"
+        matches!(live_err, ArmError::Rejected { status: 403, ref code, .. } if code == "OPERATOR_CONFIRMATION_REQUIRED"),
+        "expected OPERATOR_CONFIRMATION_REQUIRED, got {live_err:?}"
     );
 
     let shadow_id = inner
@@ -653,9 +687,12 @@ async fn real_driver_rejects_live_mode_but_allows_shadow() {
             artifact_digest: "dr".into(),
             backend: "mlp".into(),
             mode: PolicyMode::Shadow,
+            sim_only: false,
             max_first_step_rad: None,
             max_step_rad: None,
             tag: None,
+            i_am_at_the_arm: false,
+            verified_release_gate: None,
         })
         .unwrap();
     inner
@@ -683,9 +720,12 @@ async fn mutual_exclusion_between_policy_and_other_motions() {
             artifact_digest: "dmx".into(),
             backend: "mlp".into(),
             mode: PolicyMode::Shadow,
+            sim_only: false,
             max_first_step_rad: None,
             max_step_rad: None,
             tag: None,
+            i_am_at_the_arm: false,
+            verified_release_gate: None,
         })
         .unwrap();
 
@@ -708,9 +748,12 @@ async fn mutual_exclusion_between_policy_and_other_motions() {
             artifact_digest: "dmx2".into(),
             backend: "mlp".into(),
             mode: PolicyMode::Shadow,
+            sim_only: false,
             max_first_step_rad: None,
             max_step_rad: None,
             tag: None,
+            i_am_at_the_arm: false,
+            verified_release_gate: None,
         })
         .unwrap_err();
     assert!(
@@ -733,9 +776,12 @@ async fn mutual_exclusion_between_policy_and_other_motions() {
             artifact_digest: "dmx3".into(),
             backend: "mlp".into(),
             mode: PolicyMode::Shadow,
+            sim_only: false,
             max_first_step_rad: None,
             max_step_rad: None,
             tag: None,
+            i_am_at_the_arm: false,
+            verified_release_gate: None,
         })
         .unwrap_err();
     assert!(
@@ -979,9 +1025,12 @@ async fn blocked_hold_during_tick_terminates_live_policy_and_is_not_cleared() {
             artifact_digest: "dbh".into(),
             backend: "mlp".into(),
             mode: PolicyMode::Live,
+            sim_only: false,
             max_first_step_rad: None,
             max_step_rad: None,
             tag: None,
+            i_am_at_the_arm: false,
+            verified_release_gate: None,
         }).unwrap()
     };
 
@@ -1329,9 +1378,12 @@ async fn inference_error_terminates_action_as_failed_with_code_and_message() {
                 artifact_digest: prepared.artifact_digest().to_string(),
                 backend: prepared.backend_name().to_string(),
                 mode: PolicyMode::Shadow,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap()
     };
@@ -1380,9 +1432,12 @@ async fn inference_error_terminates_action_as_failed_with_code_and_message() {
                 artifact_digest: prepared_fail.artifact_digest().to_string(),
                 backend: prepared_fail.backend_name().to_string(),
                 mode: PolicyMode::Shadow,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap()
     };
@@ -1437,9 +1492,12 @@ async fn expired_deadline_before_submission_finishes_done_and_applies_no_target(
                 artifact_digest: prepared_a.artifact_digest().to_string(),
                 backend: prepared_a.backend_name().to_string(),
                 mode: PolicyMode::Live,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap()
     };
@@ -1498,9 +1556,12 @@ async fn expired_deadline_before_submission_finishes_done_and_applies_no_target(
                 artifact_digest: prepared_b.artifact_digest().to_string(),
                 backend: prepared_b.backend_name().to_string(),
                 mode: PolicyMode::Live,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap()
     };
@@ -1554,9 +1615,12 @@ async fn deadline_races_tick_wait_and_slow_inference_wait() {
                 artifact_digest: prepared_a.artifact_digest().to_string(),
                 backend: prepared_a.backend_name().to_string(),
                 mode: PolicyMode::Shadow,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap()
     };
@@ -1615,9 +1679,12 @@ async fn deadline_races_tick_wait_and_slow_inference_wait() {
                 artifact_digest: prepared_b.artifact_digest().to_string(),
                 backend: prepared_b.backend_name().to_string(),
                 mode: PolicyMode::Live,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap()
     };
@@ -1685,9 +1752,12 @@ async fn live_policy_start_rejected_while_arm_braking_and_succeeds_when_settled(
                 artifact_digest: "d_brake".into(),
                 backend: "mlp".into(),
                 mode: PolicyMode::Live,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             }),
             Err(ArmError::Safety(SafetyError::MotionBusy))
         ));
@@ -1726,9 +1796,12 @@ async fn live_policy_start_rejected_while_arm_braking_and_succeeds_when_settled(
             artifact_digest: "d_brake".into(),
             backend: "mlp".into(),
             mode: PolicyMode::Live,
+            sim_only: false,
             max_first_step_rad: None,
             max_step_rad: None,
             tag: None,
+            i_am_at_the_arm: false,
+            verified_release_gate: None,
         })
         .expect("live policy start must succeed once velocities settle to 0");
     assert!(inner.is_policy_run_active(action_id));
@@ -1984,9 +2057,12 @@ async fn overlapping_policy_load_is_rejected_with_motion_busy() {
                 artifact_digest: "d".into(),
                 backend: "mlp".into(),
                 mode: PolicyMode::Shadow,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             }),
             Err(ArmError::Safety(SafetyError::MotionBusy))
         ));
@@ -2211,9 +2287,12 @@ async fn reciprocal_gravity_comp_and_policy_exclusion() {
                 artifact_digest: "d_gc".into(),
                 backend: "mlp".into(),
                 mode: PolicyMode::Shadow,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap();
         let blocker = inner.gravity_comp_blocker().expect("shadow policy must block gravity_comp");
@@ -2264,9 +2343,12 @@ async fn reciprocal_gravity_comp_and_policy_exclusion() {
                 artifact_digest: "d_gc2".into(),
                 backend: "mlp".into(),
                 mode: PolicyMode::Shadow,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             }),
             Err(ArmError::Safety(SafetyError::MotionBusy))
         ));
@@ -2350,9 +2432,12 @@ async fn slow_inference_updates_input_age_ms_and_does_not_block_current_thread_r
                 artifact_digest: prepared.artifact_digest().to_string(),
                 backend: prepared.backend_name().to_string(),
                 mode: PolicyMode::Shadow,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap()
     };
@@ -2438,9 +2523,12 @@ async fn slow_inference_updates_input_age_ms_and_does_not_block_current_thread_r
                 artifact_digest: prepared_none.artifact_digest().to_string(),
                 backend: prepared_none.backend_name().to_string(),
                 mode: PolicyMode::Shadow,
+                sim_only: false,
                 max_first_step_rad: None,
                 max_step_rad: None,
                 tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
             })
             .unwrap()
     };
@@ -2629,9 +2717,12 @@ mod tract_e2e {
                     artifact_digest: prepared.artifact_digest().to_string(),
                     backend: prepared.backend_name().to_string(),
                     mode: PolicyMode::Shadow,
+                    sim_only: false,
                     max_first_step_rad: None,
                     max_step_rad: None,
                     tag: None,
+                    i_am_at_the_arm: false,
+                    verified_release_gate: None,
                 })
                 .unwrap()
         };
@@ -2915,9 +3006,12 @@ mod phase2_vision {
                     artifact_digest: prepared.artifact_digest().to_string(),
                     backend: prepared.backend_name().to_string(),
                     mode: PolicyMode::Shadow,
+                    sim_only: false,
                     max_first_step_rad: None,
                     max_step_rad: None,
                     tag: None,
+                    i_am_at_the_arm: false,
+                    verified_release_gate: None,
                 })
                 .unwrap()
         };
@@ -2987,9 +3081,12 @@ mod phase2_vision {
                     artifact_digest: prepared2.artifact_digest().to_string(),
                     backend: prepared2.backend_name().to_string(),
                     mode: PolicyMode::Shadow,
+                    sim_only: false,
                     max_first_step_rad: None,
                     max_step_rad: None,
                     tag: None,
+                    i_am_at_the_arm: false,
+                    verified_release_gate: None,
                 })
                 .unwrap()
         };
@@ -3170,9 +3267,12 @@ mod phase2_vision {
                         artifact_digest: prepared.artifact_digest().to_string(),
                         backend: prepared.backend_name().to_string(),
                         mode: PolicyMode::Live,
+                        sim_only: false,
                         max_first_step_rad: None,
                         max_step_rad: None,
                         tag: None,
+                        i_am_at_the_arm: false,
+                        verified_release_gate: None,
                     })
                     .unwrap()
             };
@@ -3217,9 +3317,12 @@ mod phase2_vision {
                         artifact_digest: prepared.artifact_digest().to_string(),
                         backend: prepared.backend_name().to_string(),
                         mode: PolicyMode::Live,
+                        sim_only: false,
                         max_first_step_rad: None,
                         max_step_rad: None,
                         tag: None,
+                        i_am_at_the_arm: false,
+                        verified_release_gate: None,
                     })
                     .unwrap()
             };
@@ -3262,9 +3365,12 @@ mod phase2_vision {
                         artifact_digest: prepared.artifact_digest().to_string(),
                         backend: prepared.backend_name().to_string(),
                         mode: PolicyMode::Shadow,
+                        sim_only: false,
                         max_first_step_rad: None,
                         max_step_rad: None,
                         tag: None,
+                        i_am_at_the_arm: false,
+                        verified_release_gate: None,
                     })
                     .unwrap()
             };
@@ -3326,9 +3432,12 @@ mod phase2_vision {
                     artifact_digest: prepared.artifact_digest().to_string(),
                     backend: prepared.backend_name().to_string(),
                     mode: PolicyMode::Shadow,
+                    sim_only: false,
                     max_first_step_rad: None,
                     max_step_rad: None,
                     tag: None,
+                    i_am_at_the_arm: false,
+                    verified_release_gate: None,
                 })
                 .unwrap()
         };
@@ -3389,9 +3498,12 @@ mod phase2_vision {
                     artifact_digest: prepared_missing.artifact_digest().to_string(),
                     backend: prepared_missing.backend_name().to_string(),
                     mode: PolicyMode::Shadow,
+                    sim_only: false,
                     max_first_step_rad: None,
                     max_step_rad: None,
                     tag: None,
+                    i_am_at_the_arm: false,
+                    verified_release_gate: None,
                 })
                 .unwrap()
         };
@@ -3471,9 +3583,12 @@ mod phase2_vision {
                         artifact_digest: prepared.artifact_digest().to_string(),
                         backend: prepared.backend_name().to_string(),
                         mode: PolicyMode::Shadow,
+                        sim_only: false,
                         max_first_step_rad: None,
                         max_step_rad: None,
                         tag: None,
+                        i_am_at_the_arm: false,
+                        verified_release_gate: None,
                     })
                     .unwrap()
             };
@@ -3530,9 +3645,12 @@ mod phase2_vision {
                         artifact_digest: prepared.artifact_digest().to_string(),
                         backend: prepared.backend_name().to_string(),
                         mode: PolicyMode::Live,
+                        sim_only: false,
                         max_first_step_rad: None,
                         max_step_rad: None,
                         tag: None,
+                        i_am_at_the_arm: false,
+                        verified_release_gate: None,
                     })
                     .unwrap()
             };
@@ -3586,9 +3704,12 @@ mod phase2_vision {
                         artifact_digest: prepared.artifact_digest().to_string(),
                         backend: prepared.backend_name().to_string(),
                         mode: PolicyMode::Shadow,
+                        sim_only: false,
                         max_first_step_rad: None,
                         max_step_rad: None,
                         tag: None,
+                        i_am_at_the_arm: false,
+                        verified_release_gate: None,
                     })
                     .unwrap()
             };
@@ -3637,9 +3758,12 @@ mod phase2_vision {
                     artifact_digest: prepared.artifact_digest().to_string(),
                     backend: prepared.backend_name().to_string(),
                     mode: PolicyMode::Shadow,
+                    sim_only: false,
                     max_first_step_rad: None,
                     max_step_rad: None,
                     tag: None,
+                    i_am_at_the_arm: false,
+                    verified_release_gate: None,
                 })
                 .unwrap()
         };
@@ -3782,9 +3906,12 @@ mod phase2_vision {
                         artifact_digest: prepared.artifact_digest().to_string(),
                         backend: prepared.backend_name().to_string(),
                         mode: PolicyMode::Live,
+                        sim_only: false,
                         max_first_step_rad: None,
                         max_step_rad: None,
                         tag: None,
+                        i_am_at_the_arm: false,
+                        verified_release_gate: None,
                     })
                     .unwrap()
             };
@@ -3885,9 +4012,12 @@ mod phase2_vision {
                     artifact_digest: prepared.artifact_digest().to_string(),
                     backend: prepared.backend_name().to_string(),
                     mode: PolicyMode::Live,
+                    sim_only: false,
                     max_first_step_rad: None,
                     max_step_rad: None,
                     tag: None,
+                    i_am_at_the_arm: false,
+                    verified_release_gate: None,
                 })
                 .unwrap()
         };
@@ -4254,9 +4384,12 @@ mod phase2_vision {
                     artifact_digest: prepared.artifact_digest().to_string(),
                     backend: prepared.backend_name().to_string(),
                     mode: PolicyMode::Live,
+                    sim_only: false,
                     max_first_step_rad: None,
                     max_step_rad: None,
                     tag: None,
+                    i_am_at_the_arm: false,
+                    verified_release_gate: None,
                 })
                 .unwrap()
         };
@@ -4345,9 +4478,12 @@ mod phase2_vision {
                     artifact_digest: prepared.artifact_digest().to_string(),
                     backend: prepared.backend_name().to_string(),
                     mode: PolicyMode::Live,
+                    sim_only: false,
                     max_first_step_rad: None,
                     max_step_rad: None,
                     tag: None,
+                    i_am_at_the_arm: false,
+                    verified_release_gate: None,
                 })
                 .unwrap()
         };
@@ -4465,4 +4601,1309 @@ mod phase2_vision {
         }
     }
 }
+
+mod phase3_release_gate_tests {
+    use super::*;
+    use armd::policy_runtime::AuthorizationTier;
+    use std::sync::atomic::AtomicBool;
+
+    fn make_profiled_config(profile_id: Option<&str>) -> ArmConfig {
+        let mut cfg = make_6dof_config();
+        cfg.profile_id = profile_id.map(str::to_string);
+        cfg
+    }
+
+    fn make_contract(unit_mode: &str) -> StrictPolicyContract {
+        let pj = serde_json::json!({
+            "format": "rebot-onnx-policy/v1",
+            "name": "rg_policy",
+            "unit_mode": unit_mode,
+            "action_dim": 6,
+            "action_space": "joint_positions",
+            "joint_names": ["j1", "j2", "j3", "j4", "j5", "j6"],
+            "model_file": "model.rmlp"
+        });
+        StrictPolicyContract::parse(&serde_json::to_vec(&pj).unwrap()).unwrap()
+    }
+
+    fn make_valid_gate(
+        policy_sha256: &str,
+        tier: &str,
+        profile_id: &str,
+        fps: u64,
+        max_speed_scale: f64,
+        unit_mode: &str,
+    ) -> serde_json::Value {
+        let mut gate = serde_json::json!({
+            "schema_version": "rebot-release-gate/v1",
+            "authorization_tier": tier,
+            "policy_sha256": policy_sha256,
+            "scene_id": "pcb_suction",
+            "tool_id": "suction",
+            "profile_id": profile_id,
+            "calibration_digest": "c".repeat(64),
+            "runner_config": {
+                "fps": fps,
+                "max_speed_scale": max_speed_scale,
+                "unit_mode": unit_mode,
+                "action_space": "joint_positions"
+            },
+            "sim_eval": {
+                "seeds_total": 10,
+                "seeds_passed": 9,
+                "min_success_rate": 0.8,
+                "collisions": 0,
+                "keepout_violations": 0
+            },
+            "prerequisites": {
+                "calibration_verified": true,
+                "power_cut_witnessed": true,
+                "shadow_run_passed": true
+            }
+        });
+        if tier == "production_release" {
+            gate["supervised_real_run_record"] = serde_json::json!({
+                "run_id": "sup-run-001",
+                "passed": true,
+                "policy_sha256": policy_sha256
+            });
+        }
+        gate
+    }
+
+    #[test]
+    fn release_gate_strict_validation_cases() {
+        let sha = "a1b2c3d4".repeat(8);
+        let cfg = make_profiled_config(Some("rebot-dm"));
+        let contract = make_contract("rad");
+
+        // 1. Valid supervised_first_run (including uppercase SHA + alias profile "b601dm")
+        let deployment = ActiveDeploymentContext {
+            scene_id: "pcb_suction".into(),
+            tool_id: "suction".into(),
+            calibration_digest: "c".repeat(64),
+        };
+        let gate_sup = make_valid_gate(
+            &sha.to_ascii_uppercase(),
+            "supervised_first_run",
+            "b601dm",
+            20,
+            0.3,
+            "rad",
+        );
+        let verified_sup = ReleaseGate::parse_and_verify(
+            &gate_sup,
+            &sha,
+            &cfg,
+            &contract,
+            20.0,
+            &deployment,
+        )
+        .unwrap();
+        assert_eq!(
+            verified_sup.authorization_tier(),
+            AuthorizationTier::SupervisedFirstRun
+        );
+        assert_eq!(verified_sup.policy_sha256(), sha);
+        assert_eq!(verified_sup.canonical_profile_id(), "b601dm");
+        assert!((verified_sup.max_speed_scale() - 0.3).abs() < 1e-12);
+        assert_eq!(verified_sup.fps(), 20);
+        assert_eq!(verified_sup.scene_id(), "pcb_suction");
+        assert_eq!(verified_sup.tool_id(), "suction");
+        assert_eq!(verified_sup.calibration_digest(), "c".repeat(64));
+
+        // 2. Valid production_release (allows max_speed_scale > 0.3)
+        let gate_prod = make_valid_gate(
+            &sha,
+            "production_release",
+            "rebot_b601_dm",
+            25,
+            0.8,
+            "rad",
+        );
+        let verified_prod = ReleaseGate::parse_and_verify(
+            &gate_prod,
+            &sha,
+            &cfg,
+            &contract,
+            25.0,
+            &deployment,
+        )
+        .unwrap();
+        assert_eq!(
+            verified_prod.authorization_tier(),
+            AuthorizationTier::ProductionRelease
+        );
+
+        // 3. Rejected digest mismatch
+        let mut bad_digest = gate_sup.clone();
+        bad_digest["policy_sha256"] = serde_json::json!("f".repeat(64));
+        assert!(matches!(
+            ReleaseGate::parse_and_verify(&bad_digest, &sha, &cfg, &contract, 20.0, &deployment),
+            Err(PolicyError::ReleaseGate(_))
+        ));
+
+        // 4. Rejected profile mismatch & empty config profile
+        let mut bad_profile = gate_sup.clone();
+        bad_profile["profile_id"] = serde_json::json!("so-arm101");
+        assert!(matches!(
+            ReleaseGate::parse_and_verify(&bad_profile, &sha, &cfg, &contract, 20.0, &deployment),
+            Err(PolicyError::ReleaseGate(_))
+        ));
+        assert!(matches!(
+            ReleaseGate::parse_and_verify(
+                &gate_sup,
+                &sha,
+                &make_profiled_config(None),
+                &contract,
+                20.0,
+                &deployment,
+            ),
+            Err(PolicyError::ReleaseGate(_))
+        ));
+
+        // 5. Rejected sim_eval.collisions > 0 & keepout_violations > 0 & unmet success rate
+        let mut bad_coll = gate_sup.clone();
+        bad_coll["sim_eval"]["collisions"] = serde_json::json!(1);
+        assert!(ReleaseGate::parse_and_verify(&bad_coll, &sha, &cfg, &contract, 20.0, &deployment).is_err());
+
+        let mut bad_keepout = gate_sup.clone();
+        bad_keepout["sim_eval"]["keepout_violations"] = serde_json::json!(1);
+        assert!(ReleaseGate::parse_and_verify(&bad_keepout, &sha, &cfg, &contract, 20.0, &deployment).is_err());
+
+        let mut bad_rate = gate_sup.clone();
+        bad_rate["sim_eval"]["seeds_passed"] = serde_json::json!(7);
+        assert!(ReleaseGate::parse_and_verify(&bad_rate, &sha, &cfg, &contract, 20.0, &deployment).is_err());
+
+        // 6. Rejected seeds_total < 10
+        let mut bad_seeds = gate_sup.clone();
+        bad_seeds["sim_eval"]["seeds_total"] = serde_json::json!(9);
+        bad_seeds["sim_eval"]["seeds_passed"] = serde_json::json!(9);
+        assert!(ReleaseGate::parse_and_verify(&bad_seeds, &sha, &cfg, &contract, 20.0, &deployment).is_err());
+
+        // 7. Rejected supervised_first_run max_speed_scale > 0.3
+        let mut bad_speed = gate_sup.clone();
+        bad_speed["runner_config"]["max_speed_scale"] = serde_json::json!(0.35);
+        assert!(ReleaseGate::parse_and_verify(&bad_speed, &sha, &cfg, &contract, 20.0, &deployment).is_err());
+
+        // 8. Rejected missing prerequisites
+        for key in [
+            "calibration_verified",
+            "power_cut_witnessed",
+            "shadow_run_passed",
+        ] {
+            let mut bad_pre = gate_sup.clone();
+            bad_pre["prerequisites"][key] = serde_json::json!(false);
+            assert!(
+                ReleaseGate::parse_and_verify(&bad_pre, &sha, &cfg, &contract, 20.0, &deployment).is_err(),
+                "expected failure when prerequisites.{key} == false"
+            );
+        }
+
+        // 9. Rejected production_release missing or mismatched supervised_real_run_record
+        let mut missing_rec = gate_prod.clone();
+        missing_rec.as_object_mut().unwrap().remove("supervised_real_run_record");
+        assert!(ReleaseGate::parse_and_verify(&missing_rec, &sha, &cfg, &contract, 25.0, &deployment).is_err());
+
+        let mut mismatch_rec = gate_prod.clone();
+        mismatch_rec["supervised_real_run_record"]["policy_sha256"] =
+            serde_json::json!("0".repeat(64));
+        assert!(ReleaseGate::parse_and_verify(&mismatch_rec, &sha, &cfg, &contract, 25.0, &deployment).is_err());
+
+        let mut failed_rec = gate_prod.clone();
+        failed_rec["supervised_real_run_record"]["passed"] = serde_json::json!(false);
+        assert!(ReleaseGate::parse_and_verify(&failed_rec, &sha, &cfg, &contract, 25.0, &deployment).is_err());
+
+        // 10. Rejected fps mismatch, non-integer fps, unit_mode mismatch, action_space mismatch
+        assert!(ReleaseGate::parse_and_verify(&gate_sup, &sha, &cfg, &contract, 25.0, &deployment).is_err());
+        let mut float_fps = gate_sup.clone();
+        float_fps["runner_config"]["fps"] = serde_json::json!(20.5);
+        assert!(ReleaseGate::parse_and_verify(&float_fps, &sha, &cfg, &contract, 20.5, &deployment).is_err());
+
+        let mut bad_units = gate_sup.clone();
+        bad_units["runner_config"]["unit_mode"] = serde_json::json!("so101_norm");
+        assert!(ReleaseGate::parse_and_verify(&bad_units, &sha, &cfg, &contract, 20.0, &deployment).is_err());
+
+        let mut bad_space = gate_sup.clone();
+        bad_space["runner_config"]["action_space"] = serde_json::json!("joint_velocities");
+        assert!(ReleaseGate::parse_and_verify(&bad_space, &sha, &cfg, &contract, 20.0, &deployment).is_err());
+    }
+
+    #[tokio::test]
+    async fn real_driver_live_requires_operator_confirmation_release_gate_and_confirmed_feedback() {
+        struct ToggleFeedbackRealDriver {
+            q: Vec<f32>,
+            torqued: bool,
+            feedback_valid: Arc<AtomicBool>,
+        }
+        impl ArmDriver for ToggleFeedbackRealDriver {
+            fn capabilities(&self) -> DriverCapabilities {
+                DriverCapabilities {
+                    velocity_feedback: true,
+                    torque_feedback: false,
+                    temperature_feedback: true,
+                    torque_feedforward: false,
+                    enable_feedback: true,
+                    load_feedback: false,
+                }
+            }
+            fn enable_state(&self) -> EnableState {
+                if self.torqued {
+                    EnableState::Enabled
+                } else {
+                    EnableState::Disabled
+                }
+            }
+            fn is_feedback_valid(&self) -> bool {
+                self.feedback_valid.load(Ordering::SeqCst)
+            }
+            fn feedback_ages(&self) -> Vec<Option<Duration>> {
+                vec![Some(Duration::ZERO); self.q.len()]
+            }
+            fn read_joint_states(&mut self) -> Result<Vec<JointState>, ArmDriverError> {
+                Ok(self
+                    .q
+                    .iter()
+                    .map(|&p| JointState {
+                        position: p,
+                        velocity: 0.0,
+                        torque: 0.0,
+                        temperature: 30.0,
+                    })
+                    .collect())
+            }
+            fn write_joint_targets(&mut self, targets: &[JointTarget]) -> Result<(), ArmDriverError> {
+                for (i, t) in targets.iter().enumerate().take(self.q.len()) {
+                    self.q[i] = t.position;
+                }
+                Ok(())
+            }
+            fn set_torque(&mut self, enabled: bool) -> Result<(), ArmDriverError> {
+                self.torqued = enabled;
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let target = [0.12f32, -0.06, 0.04, 0.0, 0.0, 0.0];
+        let layers = vec![MlpLayerSpec::new(
+            6,
+            6,
+            Activation::None,
+            vec![0.0; 36],
+            target.to_vec(),
+        )];
+        let digest = write_rmlp_pack(
+            dir.path(),
+            &["j1", "j2", "j3", "j4", "j5", "j6"],
+            "rad",
+            &layers,
+            serde_json::json!({}),
+        );
+
+        let mut cfg = make_6dof_config();
+        cfg.profile_id = Some("so-arm101".into());
+        let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+        let mut raw_gate = make_valid_gate(
+            &digest,
+            "supervised_first_run",
+            "so101",
+            25,
+            0.3,
+            "rad",
+        );
+        raw_gate["calibration_digest"] = serde_json::json!(EMPTY_CALIBRATION_DIGEST);
+        let verified_gate = ReleaseGate::parse_and_verify(
+            &raw_gate,
+            &digest,
+            &cfg,
+            prepared.contract(),
+            25.0,
+            &ActiveDeploymentContext {
+                scene_id: "pcb_suction".into(),
+                tool_id: "suction".into(),
+                calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+            },
+        )
+        .unwrap();
+
+        let drv_fb_valid = Arc::new(AtomicBool::new(true));
+        let sup = Arc::new(
+            ArmSupervisor::new(cfg).with_driver(Box::new(ToggleFeedbackRealDriver {
+                q: vec![0.0; 6],
+                torqued: false,
+                feedback_valid: drv_fb_valid.clone(),
+            })),
+        );
+        sup.set_follower("so-arm101").await;
+
+        let gen = sup.acquire_lease("conn-triple").await.unwrap();
+        sup.set_torque(true).await.unwrap();
+        sup.tick(0.02).await;
+        let epoch = sup.get_observation().await.epoch_id;
+
+        {
+            let mut inner = sup.inner().write().await;
+
+            // 1. Live without i_am_at_the_arm -> OPERATOR_CONFIRMATION_REQUIRED (403)
+            let err1 = inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-triple".into(),
+                    lease_generation: gen,
+                    policy_id: "p_triple".into(),
+                    artifact_digest: digest.clone(),
+                    backend: "mlp".into(),
+                    mode: PolicyMode::Live,
+                    sim_only: false,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                    i_am_at_the_arm: false,
+                    verified_release_gate: Some(verified_gate.clone()),
+                })
+                .unwrap_err();
+            assert!(
+                matches!(err1, ArmError::Rejected { status: 403, ref code, .. } if code == "OPERATOR_CONFIRMATION_REQUIRED"),
+                "expected OPERATOR_CONFIRMATION_REQUIRED, got {err1:?}"
+            );
+
+            // 2. Live with i_am_at_the_arm: true but no release_gate (or mismatched digest) -> RELEASE_GATE_REQUIRED (403)
+            let err2 = inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-triple".into(),
+                    lease_generation: gen,
+                    policy_id: "p_triple".into(),
+                    artifact_digest: digest.clone(),
+                    backend: "mlp".into(),
+                    mode: PolicyMode::Live,
+                    sim_only: false,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                    i_am_at_the_arm: true,
+                    verified_release_gate: None,
+                })
+                .unwrap_err();
+            assert!(
+                matches!(err2, ArmError::Rejected { status: 403, ref code, .. } if code == "RELEASE_GATE_REQUIRED"),
+                "expected RELEASE_GATE_REQUIRED, got {err2:?}"
+            );
+
+            let err2b = inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-triple".into(),
+                    lease_generation: gen,
+                    policy_id: "p_triple".into(),
+                    artifact_digest: "0".repeat(64),
+                    backend: "mlp".into(),
+                    mode: PolicyMode::Live,
+                    sim_only: false,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                    i_am_at_the_arm: true,
+                    verified_release_gate: Some(verified_gate.clone()),
+                })
+                .unwrap_err();
+            assert!(
+                matches!(err2b, ArmError::Rejected { status: 403, ref code, .. } if code == "RELEASE_GATE_REQUIRED"),
+                "expected RELEASE_GATE_REQUIRED on digest mismatch, got {err2b:?}"
+            );
+
+            // 3. Live with i_am_at_the_arm: true + valid release_gate, but unconfirmed feedback -> FEEDBACK_UNCONFIRMED (409)
+            inner.feedback_numeric_valid = false;
+            let err3a = inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-triple".into(),
+                    lease_generation: gen,
+                    policy_id: "p_triple".into(),
+                    artifact_digest: digest.clone(),
+                    backend: "mlp".into(),
+                    mode: PolicyMode::Live,
+                    sim_only: false,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                    i_am_at_the_arm: true,
+                    verified_release_gate: Some(verified_gate.clone()),
+                })
+                .unwrap_err();
+            assert!(
+                matches!(err3a, ArmError::Rejected { status: 409, ref code, .. } if code == "FEEDBACK_UNCONFIRMED"),
+                "expected FEEDBACK_UNCONFIRMED when feedback_numeric_valid=false, got {err3a:?}"
+            );
+            inner.feedback_numeric_valid = true;
+
+            drv_fb_valid.store(false, Ordering::SeqCst);
+            let err3b = inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-triple".into(),
+                    lease_generation: gen,
+                    policy_id: "p_triple".into(),
+                    artifact_digest: digest.clone(),
+                    backend: "mlp".into(),
+                    mode: PolicyMode::Live,
+                    sim_only: false,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                    i_am_at_the_arm: true,
+                    verified_release_gate: Some(verified_gate.clone()),
+                })
+                .unwrap_err();
+            assert!(
+                matches!(err3b, ArmError::Rejected { status: 409, ref code, .. } if code == "FEEDBACK_UNCONFIRMED"),
+                "expected FEEDBACK_UNCONFIRMED when driver.is_feedback_valid()=false, got {err3b:?}"
+            );
+            drv_fb_valid.store(true, Ordering::SeqCst);
+        }
+
+        // 4. All 3 satisfied -> SUCCEEDS and executes cleanly!
+        let action_id = {
+            let mut inner = sup.inner().write().await;
+            inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-triple".into(),
+                    lease_generation: gen,
+                    policy_id: "p_triple".into(),
+                    artifact_digest: digest.clone(),
+                    backend: "mlp".into(),
+                    mode: PolicyMode::Live,
+                    sim_only: false,
+                    max_first_step_rad: prepared.contract().max_first_step_rad,
+                    max_step_rad: prepared.contract().max_step_rad,
+                    tag: None,
+                    i_am_at_the_arm: true,
+                    verified_release_gate: Some(verified_gate),
+                })
+                .unwrap()
+        };
+
+        let runner = spawn_policy_runner(
+            sup.clone(),
+            action_id,
+            prepared,
+            25.0,
+            compute_policy_deadline(Some(0.30)).unwrap(),
+            None,
+        );
+        for _ in 0..16 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            sup.tick(0.02).await;
+        }
+        let _ = runner.await;
+
+        let obs = sup.get_observation().await;
+        assert!(obs.positions[0] > 0.04, "expected j1 to move, got {}", obs.positions[0]);
+        let p = obs.policy.unwrap();
+        assert!(!p.active);
+        assert!(p.steps > 0);
+        assert_eq!(p.stop_reason.as_deref(), Some("MAX_SECONDS"));
+    }
+
+    #[tokio::test]
+    async fn ws_real_driver_live_policy_with_inline_and_pack_release_gate() {
+        let sandbox_dir = tempdir().unwrap();
+        let sandbox = Arc::new(SandboxState::new(sandbox_dir.path().to_path_buf()));
+        let mut cfg = make_6dof_config();
+        cfg.profile_id = Some("b601dm".into());
+        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(DummyRealDriver::new(6))));
+        sup.set_follower("rebot-dm").await;
+        let router = create_router_with_sandbox(sup.clone(), OperatorAuth::disabled(), sandbox.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let tick_sup = sup.clone();
+        let tick_stop = Arc::new(Mutex::new(false));
+        let tick_stop_c = tick_stop.clone();
+        let tick_task = tokio::spawn(async move {
+            loop {
+                if *tick_stop_c.lock().unwrap() {
+                    break;
+                }
+                tick_sup.tick(0.02).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let client = reqwest::Client::new();
+
+        // Check capabilities publish ["shadow", "live_gated"] on real hardware.
+        let schema: serde_json::Value = client
+            .get(format!("http://{addr}/api/v1/observation/schema"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            schema["capabilities"]["policy_runtime"]["modes"],
+            serde_json::json!(["shadow", "live_gated"])
+        );
+
+        // Upload policy pack 1 (no release_gate.json on disk; tested with inline release_gate).
+        let pack1_id = "ws_real_inline";
+        upload_rmlp_pack(
+            &client,
+            addr,
+            pack1_id,
+            vec![0.10, -0.05, 0.0, 0.0, 0.0, 0.0],
+            serde_json::json!({}),
+        )
+        .await;
+        let pack1_dir = sandbox.policy_dir(pack1_id).unwrap();
+        let digest1 = PolicySnapshot::load_from_dir(&pack1_dir).unwrap().release_digest;
+
+        let (mut ws, _) = connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+        ws.send(Message::Text(
+            serde_json::json!({"type": "acquire_lease", "client_id": "ws_real_test"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let gen = loop {
+            let msg: serde_json::Value =
+                serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+            if msg["type"] == "lease_granted" {
+                break msg["generation"].as_u64().unwrap();
+            }
+        };
+
+        async fn send_cmd(
+            ws: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            req_id: u64,
+            gen: u64,
+            epoch: u64,
+            path: &str,
+            body: serde_json::Value,
+        ) -> serde_json::Value {
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "type": "command",
+                    "request_id": req_id,
+                    "generation": gen,
+                    "epoch_id": epoch,
+                    "path": path,
+                    "body": body,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let txt = ws.next().await.unwrap().unwrap().into_text().unwrap();
+                    let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+                    if v["type"] == "command_ack" || v["type"] == "command_reject" {
+                        return v;
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        }
+
+        let ack_torque = send_cmd(
+            &mut ws,
+            1,
+            gen,
+            1,
+            "/api/v1/torque",
+            serde_json::json!({"enable": true}),
+        )
+        .await;
+        assert_eq!(ack_torque["type"], "command_ack");
+
+        // 1. Missing i_am_at_the_arm -> OPERATOR_CONFIRMATION_REQUIRED
+        let rej_op = send_cmd(
+            &mut ws,
+            2,
+            gen,
+            1,
+            "/api/v1/action/policy/start",
+            serde_json::json!({
+                "policy_id": pack1_id,
+                "mode": "live",
+                "fps": 25.0
+            }),
+        )
+        .await;
+        assert_eq!(rej_op["type"], "command_reject");
+        assert_eq!(rej_op["code"], "OPERATOR_CONFIRMATION_REQUIRED");
+
+        // 2. i_am_at_the_arm: true without release_gate -> RELEASE_GATE_REQUIRED
+        let rej_missing_gate = send_cmd(
+            &mut ws,
+            3,
+            gen,
+            1,
+            "/api/v1/action/policy/start",
+            serde_json::json!({
+                "policy_id": pack1_id,
+                "mode": "live",
+                "fps": 25.0,
+                "i_am_at_the_arm": true
+            }),
+        )
+        .await;
+        assert_eq!(rej_missing_gate["type"], "command_reject");
+        assert_eq!(rej_missing_gate["code"], "RELEASE_GATE_REQUIRED");
+
+        // 3. Invalid inline release_gate -> RELEASE_GATE_INVALID
+        let bad_inline_gate = make_valid_gate(
+            &"0".repeat(64),
+            "supervised_first_run",
+            "b601dm",
+            25,
+            0.3,
+            "rad",
+        );
+        let rej_bad_gate = send_cmd(
+            &mut ws,
+            4,
+            gen,
+            1,
+            "/api/v1/action/policy/start",
+            serde_json::json!({
+                "policy_id": pack1_id,
+                "mode": "live",
+                "fps": 25.0,
+                "i_am_at_the_arm": true,
+                "release_gate": bad_inline_gate
+            }),
+        )
+        .await;
+        assert_eq!(rej_bad_gate["type"], "command_reject");
+        assert_eq!(rej_bad_gate["code"], "RELEASE_GATE_INVALID");
+
+        // 4. Valid inline release_gate -> succeeds and moves arm!
+        let mut valid_inline_gate = make_valid_gate(
+            &digest1,
+            "supervised_first_run",
+            "rebot_dm",
+            25,
+            0.3,
+            "rad",
+        );
+        valid_inline_gate["scene_id"] = serde_json::json!("default");
+        valid_inline_gate["tool_id"] = serde_json::json!("default");
+        valid_inline_gate["calibration_digest"] = serde_json::json!(EMPTY_CALIBRATION_DIGEST);
+        let ack_inline = send_cmd(
+            &mut ws,
+            5,
+            gen,
+            1,
+            "/api/v1/action/policy/start",
+            serde_json::json!({
+                "policy_id": pack1_id,
+                "mode": "live_gated",
+                "fps": 25.0,
+                "max_seconds": 3.0,
+                "i_am_at_the_arm": true,
+                "release_gate": valid_inline_gate
+            }),
+        )
+        .await;
+        assert_eq!(ack_inline["type"], "command_ack", "{ack_inline}");
+
+        let mut moved_inline = false;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let obs = sup.get_observation().await;
+            if obs.policy.as_ref().is_some_and(|p| p.steps > 0) && obs.positions[0] > 0.02 {
+                moved_inline = true;
+                break;
+            }
+        }
+        assert!(moved_inline, "arm did not move with inline release_gate");
+
+        let ack_stop1 = send_cmd(
+            &mut ws,
+            6,
+            gen,
+            1,
+            "/api/v1/action/policy/stop",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(ack_stop1["type"], "command_ack");
+
+        // Wait for servo braking velocities to settle before starting the second live policy.
+        for _ in 0..50 {
+            if sup
+                .inner()
+                .read()
+                .await
+                .commanded_velocities
+                .iter()
+                .all(|v| v.abs() < 1e-3)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // 5. Pack-embedded release_gate.json (no inline release_gate) -> succeeds!
+        let pack2_id = "ws_real_pack_gate";
+        upload_rmlp_pack(
+            &client,
+            addr,
+            pack2_id,
+            vec![0.12, -0.05, 0.0, 0.0, 0.0, 0.0],
+            serde_json::json!({}),
+        )
+        .await;
+        let pack2_dir = sandbox.policy_dir(pack2_id).unwrap();
+        let digest2 = PolicySnapshot::load_from_dir(&pack2_dir).unwrap().release_digest;
+        let mut pack2_gate = make_valid_gate(
+            &digest2,
+            "production_release",
+            "b601dm",
+            25,
+            0.7,
+            "rad",
+        );
+        pack2_gate["scene_id"] = serde_json::json!("default");
+        pack2_gate["tool_id"] = serde_json::json!("default");
+        pack2_gate["calibration_digest"] = serde_json::json!(EMPTY_CALIBRATION_DIGEST);
+        fs::write(
+            pack2_dir.join("release_gate.json"),
+            serde_json::to_vec_pretty(&pack2_gate).unwrap(),
+        )
+        .unwrap();
+
+        let ack_pack = send_cmd(
+            &mut ws,
+            7,
+            gen,
+            1,
+            "/api/v1/action/policy/start",
+            serde_json::json!({
+                "policy_id": pack2_id,
+                "mode": "live",
+                "fps": 25.0,
+                "max_seconds": 3.0,
+                "i_am_at_the_arm": true
+            }),
+        )
+        .await;
+        assert_eq!(ack_pack["type"], "command_ack", "{ack_pack}");
+
+        let mut moved_pack = false;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let obs = sup.get_observation().await;
+            if obs.policy.as_ref().is_some_and(|p| p.policy_id == pack2_id && p.steps > 0)
+                && obs.positions[0] > 0.03
+            {
+                moved_pack = true;
+                break;
+            }
+        }
+        assert!(moved_pack, "arm did not move with pack release_gate.json");
+
+        let ack_stop2 = send_cmd(
+            &mut ws,
+            8,
+            gen,
+            1,
+            "/api/v1/action/policy/stop",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(ack_stop2["type"], "command_ack");
+
+        *tick_stop.lock().unwrap() = true;
+        let _ = tick_task.await;
+    }
+
+    #[tokio::test]
+    async fn real_driver_live_enforces_release_gate_max_speed_scale_during_ticks() {
+        let mut cfg = make_6dof_config();
+        cfg.profile_id = Some("so-arm101".into());
+        // High acceleration so the velocity cap (0.3 * 2.0 = 0.6 rad/s) saturates quickly.
+        for lim in &mut cfg.limits {
+            lim.max_acceleration = 100.0;
+        }
+        let normal_servo_max_velocity = cfg.servo_limits()[0].max_velocity;
+        assert!((normal_servo_max_velocity - 2.0).abs() < 1e-6);
+
+        let sha = "a1b2c3d4".repeat(8);
+        let contract = make_contract("rad");
+        let mut raw_gate = make_valid_gate(
+            &sha,
+            "supervised_first_run",
+            "so101",
+            25,
+            0.3,
+            "rad",
+        );
+        raw_gate["calibration_digest"] = serde_json::json!(EMPTY_CALIBRATION_DIGEST);
+        let verified_gate = ReleaseGate::parse_and_verify(
+            &raw_gate,
+            &sha,
+            &cfg,
+            &contract,
+            25.0,
+            &ActiveDeploymentContext {
+                scene_id: "pcb_suction".into(),
+                tool_id: "suction".into(),
+                calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+            },
+        )
+        .unwrap();
+
+        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(DummyRealDriver::new(6))));
+        sup.set_follower("so-arm101").await;
+
+        let gen = sup.acquire_lease("conn-speed-cap").await.unwrap();
+        sup.set_torque(true).await.unwrap();
+        sup.tick(0.02).await;
+        let epoch = sup.get_observation().await.epoch_id;
+
+        let action_id = {
+            let mut inner = sup.inner().write().await;
+            let id = inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-speed-cap".into(),
+                    lease_generation: gen,
+                    policy_id: "speed_cap_policy".into(),
+                    artifact_digest: sha.clone(),
+                    backend: "mlp".into(),
+                    mode: PolicyMode::Live,
+                    sim_only: false,
+                    max_first_step_rad: Some(0.25),
+                    max_step_rad: Some(0.25),
+                    tag: None,
+                    i_am_at_the_arm: true,
+                    verified_release_gate: Some(verified_gate),
+                })
+                .unwrap();
+            let capped = inner.servo_limits();
+            assert!(
+                (capped[0].max_velocity - 0.3 * normal_servo_max_velocity).abs() < 1e-5,
+                "expected servo_limits[0].max_velocity == {}, got {}",
+                0.3 * normal_servo_max_velocity,
+                capped[0].max_velocity
+            );
+            id
+        };
+
+        let dt = 0.02;
+        let max_allowed_step = 0.3 * f64::from(normal_servo_max_velocity) * dt + 1e-4;
+        let mut max_observed_step = 0.0_f64;
+
+        for _ in 0..8 {
+            let prev_q = f64::from(sup.get_observation().await.commanded_positions[0]);
+            {
+                let mut inner = sup.inner().write().await;
+                inner
+                    .policy_step(action_id, vec![0.20, 0.0, 0.0, 0.0, 0.0, 0.0], Some(0))
+                    .unwrap();
+            }
+            let obs = sup.tick(dt).await;
+            let next_q = f64::from(obs.commanded_positions[0]);
+            let delta = (next_q - prev_q).abs();
+            assert!(
+                delta <= max_allowed_step,
+                "tick displacement {delta:.6} exceeded 0.3 * normal_servo_max_velocity * dt ({max_allowed_step:.6})"
+            );
+            max_observed_step = max_observed_step.max(delta);
+        }
+
+        assert!(
+            max_observed_step > 0.25 * f64::from(normal_servo_max_velocity) * dt,
+            "expected arm to move at capped speed, max_observed_step={max_observed_step:.6}"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_gate_rejects_scene_tool_or_calibration_digest_mismatch() {
+        let sha = "a1b2c3d4".repeat(8);
+        let cfg = make_profiled_config(Some("b601dm"));
+        let contract = make_contract("rad");
+        let mut gate = make_valid_gate(&sha, "supervised_first_run", "b601dm", 20, 0.3, "rad");
+        gate["scene_id"] = serde_json::json!("default");
+        gate["tool_id"] = serde_json::json!("default");
+        gate["calibration_digest"] = serde_json::json!(EMPTY_CALIBRATION_DIGEST);
+
+        let matching = ActiveDeploymentContext {
+            scene_id: "default".into(),
+            tool_id: "default".into(),
+            calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+        };
+        assert!(ReleaseGate::parse_and_verify(&gate, &sha, &cfg, &contract, 20.0, &matching).is_ok());
+
+        let bad_scene = ActiveDeploymentContext {
+            scene_id: "pcb_suction".into(),
+            ..matching.clone()
+        };
+        assert!(matches!(
+            ReleaseGate::parse_and_verify(&gate, &sha, &cfg, &contract, 20.0, &bad_scene),
+            Err(PolicyError::ReleaseGate(msg)) if msg.contains("scene_id")
+        ));
+
+        let bad_tool = ActiveDeploymentContext {
+            tool_id: "suction".into(),
+            ..matching.clone()
+        };
+        assert!(matches!(
+            ReleaseGate::parse_and_verify(&gate, &sha, &cfg, &contract, 20.0, &bad_tool),
+            Err(PolicyError::ReleaseGate(msg)) if msg.contains("tool_id")
+        ));
+
+        let bad_calib = ActiveDeploymentContext {
+            calibration_digest: "d".repeat(64),
+            ..matching.clone()
+        };
+        assert!(matches!(
+            ReleaseGate::parse_and_verify(&gate, &sha, &cfg, &contract, 20.0, &bad_calib),
+            Err(PolicyError::ReleaseGate(msg)) if msg.contains("calibration_digest")
+        ));
+
+        // Also test mid-load sandbox scene switch invalidating the verified gate under WS lock.
+        let sandbox_dir = tempdir().unwrap();
+        let sandbox = Arc::new(SandboxState::new(sandbox_dir.path().to_path_buf()));
+        sandbox.set_policy_load_delay_ms(120);
+        let mut cfg_ws = make_6dof_config();
+        cfg_ws.profile_id = Some("b601dm".into());
+        let sup = Arc::new(ArmSupervisor::new(cfg_ws).with_driver(Box::new(DummyRealDriver::new(6))));
+        sup.set_follower("rebot-dm").await;
+        assert_eq!(
+            sup.inner().read().await.active_calibration_digest(),
+            EMPTY_CALIBRATION_DIGEST
+        );
+
+        let router = create_router_with_sandbox(sup.clone(), OperatorAuth::disabled(), sandbox.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let tick_sup = sup.clone();
+        let tick_stop = Arc::new(Mutex::new(false));
+        let tick_stop_c = tick_stop.clone();
+        let tick_task = tokio::spawn(async move {
+            loop {
+                if *tick_stop_c.lock().unwrap() {
+                    break;
+                }
+                tick_sup.tick(0.02).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let client = reqwest::Client::new();
+        upload_rmlp_pack(&client, addr, "ctx_switch_p", vec![0.05; 6], serde_json::json!({})).await;
+        let digest = PolicySnapshot::load_from_dir(&sandbox.policy_dir("ctx_switch_p").unwrap())
+            .unwrap()
+            .release_digest;
+
+        let (mut ws, _) = connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+        ws.send(Message::Text(
+            serde_json::json!({"type": "acquire_lease", "client_id": "ctx_test"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let gen = loop {
+            let msg: serde_json::Value =
+                serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+            if msg["type"] == "lease_granted" {
+                break msg["generation"].as_u64().unwrap();
+            }
+        };
+
+        ws.send(Message::Text(
+            serde_json::json!({
+                "type": "command",
+                "request_id": 1,
+                "generation": gen,
+                "epoch_id": 1,
+                "path": "/api/v1/torque",
+                "body": {"enable": true}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let msg: serde_json::Value =
+                serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+            if msg["type"] == "command_ack" {
+                break;
+            }
+        }
+
+        let mut gate_ws = make_valid_gate(&digest, "supervised_first_run", "b601dm", 20, 0.3, "rad");
+        gate_ws["scene_id"] = serde_json::json!("default");
+        gate_ws["tool_id"] = serde_json::json!("default");
+        gate_ws["calibration_digest"] = serde_json::json!(EMPTY_CALIBRATION_DIGEST);
+
+        ws.send(Message::Text(
+            serde_json::json!({
+                "type": "command",
+                "request_id": 2,
+                "generation": gen,
+                "epoch_id": 1,
+                "path": "/api/v1/action/policy/start",
+                "body": {
+                    "policy_id": "ctx_switch_p",
+                    "mode": "live_gated",
+                    "fps": 20.0,
+                    "i_am_at_the_arm": true,
+                    "release_gate": gate_ws
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        sandbox.active.write().await.active_scene = "pcb_suction".into();
+
+        let rej = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let txt = ws.next().await.unwrap().unwrap().into_text().unwrap();
+                let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+                if v["type"] == "command_ack" || v["type"] == "command_reject" {
+                    return v;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(rej["type"], "command_reject", "{rej}");
+        assert_eq!(rej["code"], "RELEASE_GATE_INVALID", "{rej}");
+
+        *tick_stop.lock().unwrap() = true;
+        let _ = tick_task.await;
+    }
+
+    #[tokio::test]
+    async fn live_sim_mode_rejected_on_real_driver_even_with_valid_gate() {
+        let req_sim = parse_policy_start_request(&serde_json::json!({
+            "policy_id": "p1",
+            "mode": "live_sim",
+            "fps": 20.0
+        }))
+        .unwrap();
+        assert_eq!(req_sim.mode, PolicyMode::Live);
+        assert!(req_sim.sim_only);
+
+        let req_live = parse_policy_start_request(&serde_json::json!({
+            "policy_id": "p1",
+            "mode": "live_gated",
+            "fps": 20.0
+        }))
+        .unwrap();
+        assert_eq!(req_live.mode, PolicyMode::Live);
+        assert!(!req_live.sim_only);
+
+        let sandbox_dir = tempdir().unwrap();
+        let sandbox = Arc::new(SandboxState::new(sandbox_dir.path().to_path_buf()));
+        let mut cfg = make_6dof_config();
+        cfg.profile_id = Some("b601dm".into());
+        let sup = Arc::new(ArmSupervisor::new(cfg.clone()).with_driver(Box::new(DummyRealDriver::new(6))));
+        sup.set_follower("rebot-dm").await;
+        let router = create_router_with_sandbox(sup.clone(), OperatorAuth::disabled(), sandbox.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let tick_sup = sup.clone();
+        let tick_stop = Arc::new(Mutex::new(false));
+        let tick_stop_c = tick_stop.clone();
+        let tick_task = tokio::spawn(async move {
+            loop {
+                if *tick_stop_c.lock().unwrap() {
+                    break;
+                }
+                tick_sup.tick(0.02).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let client = reqwest::Client::new();
+        upload_rmlp_pack(&client, addr, "live_sim_p", vec![0.05; 6], serde_json::json!({})).await;
+        let pack_dir = sandbox.policy_dir("live_sim_p").unwrap();
+        let digest = PolicySnapshot::load_from_dir(&pack_dir).unwrap().release_digest;
+
+        let mut gate_json = make_valid_gate(&digest, "supervised_first_run", "b601dm", 20, 0.3, "rad");
+        gate_json["scene_id"] = serde_json::json!("default");
+        gate_json["tool_id"] = serde_json::json!("default");
+        gate_json["calibration_digest"] = serde_json::json!(EMPTY_CALIBRATION_DIGEST);
+        let verified_gate = ReleaseGate::parse_and_verify(
+            &gate_json,
+            &digest,
+            &cfg,
+            &make_contract("rad"),
+            20.0,
+            &ActiveDeploymentContext {
+                scene_id: "default".into(),
+                tool_id: "default".into(),
+                calibration_digest: EMPTY_CALIBRATION_DIGEST.into(),
+            },
+        )
+        .unwrap();
+
+        let (mut ws, _) = connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+        ws.send(Message::Text(
+            serde_json::json!({"type": "acquire_lease", "client_id": "live_sim_test"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let gen = loop {
+            let msg: serde_json::Value =
+                serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+            if msg["type"] == "lease_granted" {
+                break msg["generation"].as_u64().unwrap();
+            }
+        };
+
+        ws.send(Message::Text(
+            serde_json::json!({
+                "type": "command",
+                "request_id": 1,
+                "generation": gen,
+                "epoch_id": 1,
+                "path": "/api/v1/torque",
+                "body": {"enable": true}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let msg: serde_json::Value =
+                serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+            if msg["type"] == "command_ack" {
+                break;
+            }
+        }
+
+        // Direct SupervisorInner check: sim_only rejected even with i_am_at_the_arm and valid gate.
+        {
+            let mut inner = sup.inner().write().await;
+            let err = inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: 1,
+                    connection_id: "direct".into(),
+                    lease_generation: gen,
+                    policy_id: "live_sim_p".into(),
+                    artifact_digest: digest.clone(),
+                    backend: "mlp".into(),
+                    mode: PolicyMode::Live,
+                    sim_only: true,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                    i_am_at_the_arm: true,
+                    verified_release_gate: Some(verified_gate),
+                })
+                .unwrap_err();
+            assert!(
+                matches!(err, ArmError::Rejected { status: 403, ref code, .. } if code == "POLICY_SIM_ONLY"),
+                "expected POLICY_SIM_ONLY, got {err:?}"
+            );
+        }
+
+        // WS command check: mode = "live_sim" rejected with POLICY_SIM_ONLY even with i_am_at_the_arm + valid gate.
+        ws.send(Message::Text(
+            serde_json::json!({
+                "type": "command",
+                "request_id": 2,
+                "generation": gen,
+                "epoch_id": 1,
+                "path": "/api/v1/action/policy/start",
+                "body": {
+                    "policy_id": "live_sim_p",
+                    "mode": "live_sim",
+                    "fps": 20.0,
+                    "i_am_at_the_arm": true,
+                    "release_gate": gate_json
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let rej = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let txt = ws.next().await.unwrap().unwrap().into_text().unwrap();
+                let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+                if v["type"] == "command_ack" || v["type"] == "command_reject" {
+                    return v;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(rej["type"], "command_reject", "{rej}");
+        assert_eq!(rej["status"], 403, "{rej}");
+        assert_eq!(rej["code"], "POLICY_SIM_ONLY", "{rej}");
+
+        *tick_stop.lock().unwrap() = true;
+        let _ = tick_task.await;
+    }
+
+    #[test]
+    fn release_gate_rejects_zero_seeds_passed_even_with_tiny_min_success_rate() {
+        let sha = "a1b2c3d4".repeat(8);
+        let cfg = make_profiled_config(Some("b601dm"));
+        let contract = make_contract("rad");
+        let deployment = ActiveDeploymentContext {
+            scene_id: "pcb_suction".into(),
+            tool_id: "suction".into(),
+            calibration_digest: "c".repeat(64),
+        };
+        let mut gate = make_valid_gate(&sha, "supervised_first_run", "b601dm", 20, 0.3, "rad");
+        gate["sim_eval"]["seeds_passed"] = serde_json::json!(0);
+        gate["sim_eval"]["seeds_total"] = serde_json::json!(10);
+        gate["sim_eval"]["min_success_rate"] = serde_json::json!(1e-13);
+
+        let err = ReleaseGate::parse_and_verify(&gate, &sha, &cfg, &contract, 20.0, &deployment)
+            .unwrap_err();
+        assert!(matches!(err, PolicyError::ReleaseGate(_)), "{err:?}");
+
+        // Also ensure no 1e-12 tolerance lets 7/10 pass min_success_rate = 0.7 + 5e-13.
+        let mut borderline = make_valid_gate(&sha, "supervised_first_run", "b601dm", 20, 0.3, "rad");
+        borderline["sim_eval"]["seeds_passed"] = serde_json::json!(7);
+        borderline["sim_eval"]["seeds_total"] = serde_json::json!(10);
+        borderline["sim_eval"]["min_success_rate"] = serde_json::json!(0.7 + 5e-13);
+        let err2 =
+            ReleaseGate::parse_and_verify(&borderline, &sha, &cfg, &contract, 20.0, &deployment)
+                .unwrap_err();
+        assert!(matches!(err2, PolicyError::ReleaseGate(_)), "{err2:?}");
+    }
+}
+
 
