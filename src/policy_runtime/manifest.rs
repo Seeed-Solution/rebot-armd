@@ -702,6 +702,33 @@ fn parse_strict_action_space(obj: &serde_json::Map<String, Value>) -> Result<Str
     }
 }
 
+/// A declared tensor shape must be `[D]` or `[1, D]` (one observation, batch 1) with
+/// `D == action_dim`; empty shapes, zero / non-integer axes, history or batch axes other
+/// than 1 and higher ranks are refused, since the runner feeds exactly one vector.
+fn validate_vector_shape(shape: &Value, action_dim: usize, label: &str) -> Result<(), PolicyError> {
+    let arr = shape
+        .as_array()
+        .ok_or_else(|| PolicyError::InvalidManifest(format!("{label} must be an array")))?;
+    let dims = arr
+        .iter()
+        .map(|v| v.as_u64().filter(|&d| d > 0).map(|d| d as usize))
+        .collect::<Option<Vec<usize>>>()
+        .ok_or_else(|| PolicyError::InvalidManifest(format!("{label} elements must be positive integers, got {shape}")))?;
+    let d = match dims.as_slice() {
+        [d] | [1, d] => *d,
+        [] => return Err(PolicyError::InvalidManifest(format!("{label} must not be empty"))),
+        _ => {
+            return Err(PolicyError::InvalidManifest(format!(
+                "{label} {shape} is not supported; expected [{action_dim}] or [1, {action_dim}]"
+            )))
+        }
+    };
+    if d != action_dim {
+        return Err(PolicyError::DimensionMismatch { expected: action_dim, actual: d });
+    }
+    Ok(())
+}
+
 fn validate_inputs_shape(inputs: &Value, action_dim: usize) -> Result<(), PolicyError> {
     let inputs_obj = inputs
         .as_object()
@@ -711,22 +738,7 @@ fn validate_inputs_shape(inputs: &Value, action_dim: usize) -> Result<(), Policy
             .as_object()
             .ok_or_else(|| PolicyError::InvalidManifest("inputs.state must be an object".into()))?;
         if let Some(shape) = state_obj.get("shape") {
-            let arr = shape.as_array().ok_or_else(|| {
-                PolicyError::InvalidManifest("inputs.state.shape must be an array".into())
-            })?;
-            if let Some(last) = arr.last() {
-                let d = last.as_u64().ok_or_else(|| {
-                    PolicyError::InvalidManifest(
-                        "inputs.state.shape elements must be positive integers".into(),
-                    )
-                })? as usize;
-                if d != action_dim {
-                    return Err(PolicyError::DimensionMismatch {
-                        expected: action_dim,
-                        actual: d,
-                    });
-                }
-            }
+            validate_vector_shape(shape, action_dim, "inputs.state.shape")?;
         }
     }
     Ok(())
@@ -741,22 +753,7 @@ fn validate_outputs_shape(outputs: &Value, action_dim: usize) -> Result<(), Poli
             .as_object()
             .ok_or_else(|| PolicyError::InvalidManifest("outputs.action must be an object".into()))?;
         if let Some(shape) = action_obj.get("shape") {
-            let arr = shape.as_array().ok_or_else(|| {
-                PolicyError::InvalidManifest("outputs.action.shape must be an array".into())
-            })?;
-            if let Some(last) = arr.last() {
-                let d = last.as_u64().ok_or_else(|| {
-                    PolicyError::InvalidManifest(
-                        "outputs.action.shape elements must be positive integers".into(),
-                    )
-                })? as usize;
-                if d != action_dim {
-                    return Err(PolicyError::DimensionMismatch {
-                        expected: action_dim,
-                        actual: d,
-                    });
-                }
-            }
+            validate_vector_shape(shape, action_dim, "outputs.action.shape")?;
         }
     }
     Ok(())

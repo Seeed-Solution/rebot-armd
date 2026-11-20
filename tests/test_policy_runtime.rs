@@ -6569,5 +6569,35 @@ mod review_fix_tests {
         let arm: ArmError = err.into();
         assert!(matches!(arm, ArmError::Rejected { status: 413, ref code, .. } if code == "POLICY_TOO_LARGE"));
     }
+
+    /// Item 6: full shape validation of inputs.state / outputs.action.
+    #[test]
+    fn manifest_shapes_are_validated_on_every_axis() {
+        let parse = |state: serde_json::Value, action: serde_json::Value| {
+            let pj = serde_json::json!({
+                "format": "rebot-onnx-policy/v1", "unit_mode": "rad", "action_dim": 6,
+                "action_space": "joint_positions", "joint_names": ["j1", "j2", "j3", "j4", "j5", "j6"],
+                "model_file": "model.rmlp",
+                "inputs": {"state": {"shape": state}}, "outputs": {"action": {"shape": action}}
+            });
+            StrictPolicyContract::parse(&serde_json::to_vec(&pj).unwrap())
+        };
+        let j = |v: serde_json::Value| v;
+        assert!(parse(j(serde_json::json!([6])), j(serde_json::json!([1, 6]))).is_ok());
+        assert!(parse(j(serde_json::json!([1, 6])), j(serde_json::json!([6]))).is_ok());
+        for bad in [
+            serde_json::json!([]),            // empty
+            serde_json::json!([10, 6]),       // history window
+            serde_json::json!([1, 1, 6]),     // extra axis
+            serde_json::json!([0, 6]),        // zero axis
+            serde_json::json!([-1, 6]),       // negative / dynamic
+            serde_json::json!(["batch", 6]),  // symbolic
+            serde_json::json!([1, 7]),        // wrong width
+            serde_json::json!([1.5, 6]),      // non-integer
+        ] {
+            assert!(parse(bad.clone(), serde_json::json!([1, 6])).is_err(), "state shape {bad} accepted");
+            assert!(parse(serde_json::json!([1, 6]), bad.clone()).is_err(), "action shape {bad} accepted");
+        }
+    }
 }
 
