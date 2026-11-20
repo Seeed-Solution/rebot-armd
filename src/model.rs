@@ -2037,6 +2037,11 @@ pub struct Capabilities {
     /// setup; URDF chains: false), `schema.kinematics_correction`.
     #[serde(default)]
     pub calibration_kinematics: bool,
+    /// Self-service verification (T20): apply fields `tool` / `acceptance` / `table_z_source`,
+    /// action `calib_hover` and `GET /api/v1/calibration/hover`; same value as `calibration_apply`
+    /// on the built-in model.
+    #[serde(default)]
+    pub calibration_verify: bool,
     /// Calibration tools of this arm (driver + profile): which ones it supports, their joints and
     /// requirements. Filled in by the supervisor's schema (it depends on the driver); None in a
     /// schema built from the profile alone. Present from capabilities version 10.
@@ -2309,6 +2314,7 @@ impl Capabilities {
             grasp_measure: grasp,
             calibration_apply: grasp,
             calibration_kinematics: grasp && config.arm_model.chain().is_none(),
+            calibration_verify: grasp && config.arm_model.chain().is_none(),
             calibration_tools: None,
             #[cfg(not(target_arch = "wasm32"))]
             teach: Some(TeachCapabilities { version: TEACH_VERSION, episodes: true, sequences: true }),

@@ -298,6 +298,9 @@ pub struct SupervisorInner {
     pub profile_floor_z_m: Option<f32>,
     /// Source of the effective floor: `profile`, `calibration_camera` or `calibration_hover`.
     pub floor_source: &'static str,
+    /// Calibration hover jobs (`crate::calib_hover`), newest last, at most
+    /// [`crate::calib_hover::KEEP_JOBS`].
+    pub hover_jobs: Vec<crate::calib_hover::HoverJob>,
     /// A calibration apply / restore transaction is running: motion commands are refused
     /// (MOTION_BUSY) and other configuration writes too (CONFIG_BUSY).
     pub calibration_busy: bool,
@@ -554,6 +557,7 @@ impl SupervisorInner {
             calibration: None,
             profile_floor_z_m,
             floor_source: "profile",
+            hover_jobs: Vec::new(),
             calibration_busy: false,
             motor_zero_busy: false,
             calibration_load_error: None,
@@ -3038,12 +3042,18 @@ impl SupervisorInner {
 
     /// Begin a sequence run (parent macro action of kind `sequence`, no Cartesian plan needed).
     pub fn begin_sequence_action(&mut self, tag: Option<String>, epoch: u64) -> Result<u64, ArmError> {
+        self.begin_orchestrated_action("sequence", tag, epoch)
+    }
+
+    /// Begin a parent action of `kind` whose orchestrator runs outside the lock (sequence,
+    /// calib_hover): epoch, preconditions, macro run record.
+    pub fn begin_orchestrated_action(&mut self, kind: &str, tag: Option<String>, epoch: u64) -> Result<u64, ArmError> {
         if epoch != self.safety.epoch_id() {
             return Err(SafetyError::EpochMismatch { expected: self.safety.epoch_id(), received: epoch }.into());
         }
         self.action_preconditions()?;
         self.gravity_comp_motion_busy()?;
-        let id = self.begin_action("sequence", tag);
+        let id = self.begin_action(kind, tag);
         self.macro_run = Some(MacroRun { id, epoch, sub: SubState::Idle, stop_requested: false, phase: None, phase_start: None });
         self.set_action_phase(id, "start", 0.0, None, None);
         Ok(id)

@@ -134,6 +134,8 @@ pub fn create_router_calibration_with_auth(
         .route("/api/v1/auth/unlock", post(rest::auth_unlock))
         .route("/api/v1/auth/lock", post(rest::auth_lock))
         .route("/api/v1/calibration", get(rest::get_calibration))
+        .route("/api/v1/calibration/hover", get(crate::calib_hover::get_jobs))
+        .route("/api/v1/calibration/hover/{id}", get(crate::calib_hover::get_job))
         .route(
             "/api/v1/calibration/sessions",
             get(crate::calibration_sessions::get_sessions)
