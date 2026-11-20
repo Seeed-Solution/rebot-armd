@@ -369,6 +369,7 @@ fn test_gripper_motion_torque_less_holding() {
         load_feedback: false,
         gripper_stalled: false,
         gripper_stall_sign: 1.0,
+        gripper_force_capped: false,
     };
 
     // Squeeze takes settled ticks to declare holding
@@ -736,6 +737,7 @@ fn test_gripper_motion_load_and_gap_holding() {
             load_feedback: true,
             gripper_stalled: false,
             gripper_stall_sign: 1.0,
+            gripper_force_capped: false,
         };
 
         let mut status = StepStatus::Running;
@@ -780,6 +782,7 @@ fn test_gripper_motion_load_and_gap_holding() {
             load_feedback: true,
             gripper_stalled: false,
             gripper_stall_sign: 1.0,
+            gripper_force_capped: false,
         };
 
         let mut status = StepStatus::Running;

@@ -65,7 +65,7 @@ async fn describe_route_has_the_v1_shape_without_a_lease() {
     assert!(d["limits"]["action_speed_max"]["linear_mps"].is_f64());
 
     let ids: Vec<&str> = d["stops"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, ["e_stop", "watchdog", "bus_loss", "control_deadline", "following_error", "thermal"]);
+    assert_eq!(ids, ["e_stop", "watchdog", "bus_loss", "control_deadline", "following_error", "thermal", "gripper_force_limit"]);
     for s in d["stops"].as_array().unwrap() {
         for key in ["trigger", "effect", "lease_required", "clear"] { assert!(!s[key].is_null(), "{}: {key}", s["id"]); }
     }
@@ -351,4 +351,26 @@ async fn self_collision_covered_is_independent_of_geometry_coverage() {
     let d_bad = describe(&sup_mut).await;
     assert_eq!(d_bad["limits"]["self_collision_covered"], false);
     assert_eq!(d_bad["limits"]["workspace"]["self_collision_pairs"], json!([]));
+}
+
+#[tokio::test]
+async fn gripper_force_limit_is_described_from_the_policy() {
+    let config = ArmConfig::rebot_dm();
+    let g = config.gripper_policy.clone().unwrap();
+    let d = describe(&ArmSupervisor::new(config)).await;
+    let s = stop(&d, "gripper_force_limit").expect("gripper_force_limit stop");
+    assert_eq!(s["max_close_torque_nm"], json!(g.max_close_torque_nm));
+    assert_eq!(s["persist_ticks"], json!(armd::supervisor::GRIPPER_FORCE_CAP_TICKS));
+    assert_eq!(s["joint"], 6);
+    assert_eq!(s["motion_limit_reason"], "gripper_force");
+    assert_eq!(s["effect"], "hold_gripper_at_measured_position");
+    let lim = &d["limits"]["gripper"];
+    assert_eq!(lim["max_close_torque_nm"], json!(g.max_close_torque_nm));
+    assert_eq!(lim["contact_torque_nm"], json!(g.contact_torque_nm));
+    assert_eq!(lim["max_lead_rad"], json!(g.max_lead_rad));
+    // a policy without the cap has no stop entry
+    let mut config = ArmConfig::rebot_dm();
+    config.gripper_policy.as_mut().unwrap().max_close_torque_nm = None;
+    let d = describe(&ArmSupervisor::new(config)).await;
+    assert!(stop(&d, "gripper_force_limit").is_none());
 }

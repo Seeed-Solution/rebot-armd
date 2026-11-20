@@ -93,6 +93,9 @@ pub const GRIPPER_STALL_LATCH_NM: f32 = 0.444;
 /// 0.40 × 10 / 18 = 0.2222). Raw torque 2093 decodes to exactly that value and was read
 /// as 0.39999962 < 0.40 before, so the bound sits just above it.
 pub const GRIPPER_STALL_RELEASE_NM: f32 = 0.2223;
+/// Gripper torque cap: consecutive ticks with |τ| above `gripper_policy.max_close_torque_nm`
+/// (fresh feedback, jaw driven closed) that latch the stall regardless of the jaw speed.
+pub const GRIPPER_FORCE_CAP_TICKS: u32 = 2;
 
 /// Feedback gap that latches BusLoss while torqued. The Damiao motors run with
 /// CAN TIMEOUT=0 and keep holding their last POS_VEL target through a gap, so a
@@ -273,6 +276,12 @@ pub struct SupervisorInner {
     pub gripper_low_torque_ticks: u32,
     pub gripper_stall_sign: f32,
     pub gripper_prev_hw_overload: bool,
+    /// The stall latch was set (or refreshed) by the gripper torque cap.
+    pub gripper_force_capped: bool,
+    /// Consecutive ticks above the gripper torque cap.
+    pub gripper_force_ticks: u32,
+    /// Gripper torque cap trips since start (`observation.gripper.force_limit_trips`).
+    pub gripper_force_trips: u64,
     /// J7 freeze during a whole-arm reference (joint quintic, path, replay): (hold, closing sign).
     /// Set once J7 stalls or an object is held; the reference may not drive J7 further in the
     /// stall direction until it ends or moves J7 the other way.
@@ -546,6 +555,9 @@ impl SupervisorInner {
             gripper_low_torque_ticks: 0,
             gripper_stall_sign: 0.0,
             gripper_prev_hw_overload: false,
+            gripper_force_capped: false,
+            gripper_force_ticks: 0,
+            gripper_force_trips: 0,
             gripper_motion_hold: None,
             park_gripper_contact: false,
             park_release: None,
@@ -781,6 +793,8 @@ impl SupervisorInner {
         self.gripper_prev_hw_overload = false;
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
+        self.gripper_force_capped = false;
+        self.gripper_force_ticks = 0;
     }
 
     pub fn with_driver(mut self, mut driver: Box<dyn ArmDriver>) -> Self {
@@ -1025,6 +1039,9 @@ impl SupervisorInner {
     /// [`MOTION_LIMIT_CLEAR_S`].
     fn expire_motion_limit(&mut self) {
         if let Some(h) = self.torque_guard.hold { self.note_motion_limit(MotionLimitReason::Torque, Some(h.joint)); }
+        if self.gripper_stalled && self.gripper_force_capped {
+            self.note_motion_limit(MotionLimitReason::GripperForce, self.config.gripper_index());
+        }
         if self.power.gov.hold.is_some() {
             let j = self.motion_limit.as_ref().filter(|l| l.reason == MotionLimitReason::Power).and_then(|l| l.joint);
             self.note_motion_limit(MotionLimitReason::Power, j);
@@ -1335,6 +1352,8 @@ impl SupervisorInner {
                     fraction,
                     opening_m,
                     stalled: self.gripper_stalled,
+                    force_limited: self.gripper_stalled && self.gripper_force_capped,
+                    force_limit_trips: self.gripper_force_trips,
                 })
             } else {
                 None
@@ -3816,6 +3835,25 @@ impl SupervisorInner {
         self.safety.trigger_fault_coded(FaultCode::ServoNoBrake, reason);
     }
 
+    /// Gripper lead cap (`gripper_policy.max_lead_rad`): with torque on and fresh feedback the
+    /// gripper command stays within the bound ahead of the measured position in the closing
+    /// direction, whatever wrote it (macro
+    /// gripper moves, servo streams, whole-arm references, gravity compensation), so a blocked
+    /// jaw cannot build a large position error.
+    fn gripper_lead_cap(&mut self) {
+        let (Some(g), Some(lead)) = (self.config.gripper_index(), self.config.gripper_policy.as_ref().and_then(|p| p.max_lead_rad)) else { return; };
+        if self.driver.is_none() || !self.is_torqued || !self.hardware_feedback_fresh(Duration::from_millis(100)) { return; }
+        let (Some(&meas), Some(&cmd)) = (self.measured_positions.get(g), self.commanded_positions.get(g)) else { return; };
+        if !meas.is_finite() || !cmd.is_finite() { return; }
+        // closing direction only: an open ends on the open stop, nothing to crush there
+        let dir = self.config.gripper_policy.as_ref().map_or(1.0, |p| if p.closed_rad >= p.open_rad { 1.0 } else { -1.0 });
+        if (cmd - meas) * dir > lead {
+            let capped = meas + dir * lead;
+            let l = &self.config.limits[g];
+            self.commanded_positions[g] = capped.clamp(l.min_position, l.max_position);
+        }
+    }
+
     /// J7 stall freeze for whole-arm references. A joint quintic (park, home, presets), path or
     /// replay writes all seven joints each tick; without this a J7 target past an object in the
     /// jaw is driven at full motor torque (the stall latch alone is overwritten next tick, and
@@ -4107,9 +4145,44 @@ impl SupervisorInner {
                 self.gripper_stall_sign == 0.0 || pushing_into_stall
             };
 
+            // Torque cap: |τ| above max_close_torque_nm while the jaw is driven closed latches
+            // the stall whatever the jaw speed (a deforming object or a flexing finger keeps
+            // the jaw moving, so the stall rule below never sees it still; 2026-11-20 a finger
+            // broke at 5 N·m). Every mode reads gripper_stalled: macro gripper moves, servo
+            // streams (teleop, policies) and whole-arm references (gripper_hold_filter).
+            if !self.gripper_stalled { self.gripper_force_capped = false; }
+            let v_cmd = self.commanded_velocities.get(g_idx).copied().unwrap_or(0.0);
+            let closing = (p_cmd - p_meas) * close_dir > 1e-3 || (desired_g - p_meas) * close_dir > 1e-3 || v_cmd * close_dir > 1e-3;
+            let force_cap = self.config.gripper_policy.as_ref().and_then(|p| p.max_close_torque_nm);
+            let over_cap = is_bus_fresh && has_torque_feedback && closing && force_cap.is_some_and(|cap| tau_g.abs() > cap);
+            self.gripper_force_ticks = if over_cap { self.gripper_force_ticks.saturating_add(1) } else { 0 };
+
             if !is_bus_fresh {
                 self.gripper_high_torque_ticks = 0;
                 self.gripper_low_torque_ticks = 0;
+            } else if self.gripper_force_ticks >= GRIPPER_FORCE_CAP_TICKS {
+                // latch, or refresh a latch that still presses, at the measured position
+                if !(self.gripper_stalled && self.gripper_force_capped) {
+                    self.gripper_force_trips += 1;
+                    tracing::warn!("Gripper torque cap: |tau| {:.2} N·m above {:.2} N·m at {p_meas:.3} rad; holding",
+                        tau_g.abs(), force_cap.unwrap_or(0.0));
+                }
+                self.gripper_stalled = true;
+                self.gripper_force_capped = true;
+                self.gripper_force_ticks = 0;
+                self.gripper_stall_sign = close_dir;
+                self.gripper_high_torque_ticks = 0;
+                self.gripper_low_torque_ticks = 0;
+                if p_meas.is_finite() {
+                    if g_idx < self.commanded_positions.len() { self.commanded_positions[g_idx] = p_meas; }
+                    if g_idx < self.commanded_velocities.len() { self.commanded_velocities[g_idx] = 0.0; }
+                    if g_idx < self.target_positions.len() { self.target_positions[g_idx] = p_meas; }
+                    if let Some(ref mut st) = self.servo_target {
+                        if st.len() > g_idx { st[g_idx] = p_meas; }
+                    }
+                    if let Some(h) = self.gripper_motion_hold.as_mut() { *h = (p_meas, close_dir); }
+                }
+                self.note_motion_limit(MotionLimitReason::GripperForce, Some(g_idx));
             } else if !self.gripper_stalled && gripper_hw_overload && should_latch_hw_overload {
                 self.gripper_stalled = true;
                 let dir = if gap.abs() > 1e-3 {
@@ -4425,6 +4498,7 @@ impl SupervisorInner {
                 load_feedback,
                 gripper_stalled: self.gripper_stalled,
                 gripper_stall_sign: self.gripper_stall_sign,
+                gripper_force_capped: self.gripper_stalled && self.gripper_force_capped,
             };
             let out = match &mut active.reference {
                 Reference::Quintic(traj) => {
@@ -4713,6 +4787,7 @@ impl SupervisorInner {
             }
         }
 
+        self.gripper_lead_cap();
         for i in 0..self.config.dof {
             self.commanded_accelerations[i] = if self.safety.state().is_stopped() { 0.0 }
                 else { (self.commanded_velocities[i] - before_velocities[i]) / servo_dt as f32 };

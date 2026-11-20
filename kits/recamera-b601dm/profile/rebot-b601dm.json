@@ -326,7 +326,10 @@
     "holding_gap_rad": 0.3,
     "holding_torque_nm": 0.0667,
     "squeeze_rad": 0.15,
-    "settle_ms": 300
+    "settle_ms": 300,
+    "max_close_torque_nm": 1.0,
+    "contact_torque_nm": 0.6,
+    "max_lead_rad": 0.35
   },
   "grasp": {
     "table_z_m": 0.0,

@@ -2508,6 +2508,7 @@ const I18N = {
     'ml.limit': '{j} 已到限位，该方向已停止', 'ml.slow_big': '大关节跟不上，已减速', 'ml.slow': '电机跟不上，已减速',
     'ml.blocked': '{j} 受阻，已停在当前位置', 'ml.workspace': '已到工作范围边界，该方向已停止',
     'ml.torque': '{j} 力矩过大，已停住；请反向移出',
+    'ml.grip_force': '夹爪力过大，已停止',
     'ml.power': '电源负载过高，已停住；请减小负载', 'ml.power_slow': '电源负载高，已减速',
     'pwr.label': '电源负载', 'pwr.aria': '电源负载（估算，额定电流的百分比）',
     'pwr.title': '估算电源电流 {a} A / 额定 {r} A（{pct}%），5 秒峰值 {pk} A。由电机力矩和速度估算，非实测。',
@@ -2710,6 +2711,7 @@ const I18N = {
     'ml.limit': '{j} at its limit; this direction stopped', 'ml.slow_big': 'Slowed to what the motors can follow', 'ml.slow': 'Slowed to what the motors can follow',
     'ml.blocked': '{j} blocked; holding position', 'ml.workspace': 'At the workspace boundary; this direction stopped',
     'ml.torque': '{j} torque limit; holding. Move it back out',
+    'ml.grip_force': 'Gripper force too high; stopped',
     'ml.power': 'Supply load too high; holding. Reduce the load', 'ml.power_slow': 'Supply load high; slowed down',
     'pwr.label': 'Supply load', 'pwr.aria': 'Supply load (estimate, percent of the rated current)',
     'pwr.title': 'Estimated supply current {a} A of {r} A rated ({pct}%), 5 s peak {pk} A. Estimated from motor torque and speed, not measured.',
@@ -7667,7 +7669,7 @@ function cartHoldStill() {
 }
 // observation.motion_limit (armd's servo guard) as a short hint chip. speed / lead show only
 // after 1 s, and every hint stays 1 s after the limit clears, so short limits do not flicker.
-const ML = { key: '', j: '', until: 0, blocked: false };
+const ML = { key: '', j: '', until: 0, blocked: false, gripTrips: null };
 // Supply load meter: o.power (estimate) in % of the rating; ticks at the governor's soft / hard
 // fractions (schema.power_budget.governor, defaults 0.8 / 0.95), peak marker = 5 s peak.
 var PWR = { key: "" };
@@ -7700,10 +7702,18 @@ function renderMotionLimit(o) {
   const el = $('ml-chip');
   if (!el) return;
   const ml = o.motion_limit, now = Date.now();
+  // gripper torque cap trips (observation.gripper.force_limit_trips): a toast per new trip, so a
+  // trip shorter than the observation interval is still reported
+  const trips = o.gripper && o.gripper.force_limit_trips;
+  if (typeof trips === 'number') {
+    if (ML.gripTrips != null && trips > ML.gripTrips) toast(t('ml.grip_force'), 'err', 'GRIPPER_FORCE');
+    ML.gripTrips = trips;
+  }
   if (ml) {
     const age = o.timestamp * 1000 - ml.since_ms;
     const key = ml.reason === 'joint_limit' ? 'ml.limit' : ml.reason === 'blocked' ? 'ml.blocked'
       : ml.reason === 'torque' ? 'ml.torque' : ml.reason === 'workspace' ? 'ml.workspace'
+      : ml.reason === 'gripper_force' ? 'ml.grip_force'
       : ml.reason === 'power' ? (o.power && o.power.hold ? 'ml.power' : 'ml.power_slow')
       : age >= 1000 ? (ml.joint != null && ml.joint < 3 ? 'ml.slow_big' : 'ml.slow') : '';
     if (key) { ML.key = key; ML.j = ml.joint == null ? '' : 'J' + (ml.joint + 1); ML.until = now + 1000; }
