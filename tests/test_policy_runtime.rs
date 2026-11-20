@@ -6321,5 +6321,67 @@ mod review_fix_tests {
         sup.inner().write().await.stop_policy_run(Some(id), "STOPPED");
         let _ = runner.await;
     }
+
+    /// Open-loop ramp on j1: `step_rad` more on every call, whatever the input.
+    struct RampBackend { k: f32, step_rad: f32 }
+    impl PolicyBackend for RampBackend {
+        fn backend_name(&self) -> &'static str { "mock-ramp" }
+        fn input_dim(&self) -> usize { 6 }
+        fn output_dim(&self) -> usize { 6 }
+        fn infer(&mut self, _input: &[f32], output: &mut [f32]) -> Result<(), PolicyError> {
+            self.k += 1.0;
+            output.fill(0.0);
+            output[0] = self.k * self.step_rad;
+            Ok(())
+        }
+    }
+
+    /// Item 4: increments that are each valid but outrun a slow joint make the control loop
+    /// discard the target; the policy action ends failed with that reason, not MAX_SECONDS.
+    #[tokio::test]
+    async fn control_loop_discard_ends_the_policy_action() {
+        let mut cfg = make_6dof_config();
+        for l in &mut cfg.limits { l.max_velocity = 0.3; }
+        let prepared = prepared_with(&cfg, Box::new(RampBackend { k: 0.0, step_rad: 0.1 }), serde_json::json!({}));
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let (id, epoch) = begin_live(&sup, "conn-discard", &prepared).await;
+        let runner = spawn_policy_runner(sup.clone(), id, prepared, 20.0, compute_policy_deadline(Some(1.5)).unwrap(), None);
+        for _ in 0..90 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = sup.heartbeat("conn-discard", epoch).await;
+            sup.tick(0.02).await;
+            if !sup.inner().read().await.policy_run_active() { break; }
+        }
+        let _ = runner.await;
+        let obs = sup.get_observation().await;
+        let p = obs.policy.unwrap();
+        assert_eq!(p.stop_reason.as_deref(), Some("SERVO_TARGET_DISCARDED"), "{p:?}");
+        let a = obs.action.unwrap();
+        assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("SERVO_TARGET_DISCARDED")));
+        assert!(sup.inner().read().await.servo_target.is_none());
+    }
+
+    /// Item 4: a runner that stops submitting (slower than the motion-frame timeout) ends the
+    /// action with TARGET_TIMEOUT when the control loop drops the target.
+    #[tokio::test]
+    async fn control_loop_frame_timeout_ends_the_policy_action() {
+        let cfg = make_6dof_config();
+        let mut inner_cfg = cfg.clone();
+        for l in &mut inner_cfg.limits { l.max_velocity = 0.3; }
+        let prepared = prepared_with(&inner_cfg, Box::new(DelayBackend { sleep_ms: 0, out: vec![0.2, 0.0, 0.0, 0.0, 0.0, 0.0], calls: Arc::new(AtomicUsize::new(0)) }), serde_json::json!({}));
+        let sup = Arc::new(ArmSupervisor::new(inner_cfg));
+        let (id, epoch) = begin_live(&sup, "conn-timeout", &prepared).await;
+        // one step by hand, then nothing: the target stays until the frame timeout
+        sup.inner().write().await.policy_step(id, vec![0.2, 0.0, 0.0, 0.0, 0.0, 0.0], Some(0)).unwrap();
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = sup.heartbeat("conn-timeout", epoch).await;
+            sup.tick(0.02).await;
+        }
+        let obs = sup.get_observation().await;
+        let a = obs.action.unwrap();
+        assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("TARGET_TIMEOUT")), "{:?}", obs.policy);
+        drop(prepared);
+    }
 }
 

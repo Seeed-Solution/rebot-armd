@@ -1118,6 +1118,17 @@ impl SupervisorInner {
         }
     }
 
+    /// The control loop dropped or could not follow a live policy target: end the owning
+    /// policy action as failed with `reason` (no-op without a live policy run).
+    #[allow(unused_variables)]
+    fn fail_live_policy_from_control(&mut self, reason: &str, message: String) {
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_run.as_ref().is_some_and(|r| r.mode == crate::policy_runtime::PolicyMode::Live) {
+            tracing::warn!("Policy run ended by the control loop: {reason}: {message}");
+            self.terminate_policy_run(reason, "failed", Some(reason), Some(message));
+        }
+    }
+
     fn clear_blocked_hold(&mut self) {
         self.servo_blocked_hold = false;
         if self.motion_limit.as_ref().is_some_and(|l| l.reason == MotionLimitReason::Blocked) {
@@ -3978,6 +3989,8 @@ impl SupervisorInner {
     /// limits. Latch a fault and retain holding torque; normal smoothing does
     /// not apply to this exceptional safety interruption.
     fn latch_servo_fault(&mut self, joint_idx: usize) {
+        self.fail_live_policy_from_control("SERVO_INFEASIBLE",
+            format!("Joint {} has an infeasible servo braking state", joint_idx + 1));
         let limit = &self.config.limits[joint_idx];
         let reason = FaultReason::Other(format!(
             "Joint '{}' has an invalid or infeasible servo braking state (q={}, v={}, limits=[{}, {}], vmax={}, amax={})",
@@ -4744,6 +4757,8 @@ impl SupervisorInner {
             if self.last_motion_frame.elapsed() > self.motion_frame_timeout {
                 self.servo_target = None;
                 self.servo_settled_ticks.fill(0);
+                self.fail_live_policy_from_control("TARGET_TIMEOUT",
+                    format!("No policy target for {} ms; the control loop dropped the target", self.motion_frame_timeout.as_millis()));
             } else {
                 // Check if any target joint has instantaneous jump > 0.35 rad relative to commanded_positions
                 // The 7-DOF gripper is exempt: its far targets are expected (POS_VEL needs a
@@ -4767,6 +4782,8 @@ impl SupervisorInner {
                     );
                     self.servo_target = None;
                     self.servo_settled_ticks.fill(0);
+                    self.fail_live_policy_from_control("SERVO_TARGET_DISCARDED",
+                        "The control loop discarded the policy target: it leads the commanded position by more than 0.35 rad".into());
                 } else {
                     reference_stepped = true;
                     let mut reached_flags = vec![false; self.config.dof];
@@ -5706,6 +5723,15 @@ impl SupervisorInner {
     pub fn finish_policy_run(&mut self, action_id: u64, reason: &str) -> bool {
         if !self.is_policy_run_active(action_id) {
             return false;
+        }
+        // a fault or E-stop that the runner has not seen yet is not a normal completion
+        if let SafetyState::Fault(r) = self.safety.state().clone() {
+            self.terminate_policy_run("FAULT", "failed", Some("FAULT"), Some(format!("Fault active: {r:?}")));
+            return true;
+        }
+        if self.estop_pending() || matches!(self.safety.state(), SafetyState::EStop) {
+            self.terminate_policy_run("ESTOP", "failed", Some("ESTOP_ACTIVE"), Some("E-stop latched".into()));
+            return true;
         }
         self.terminate_policy_run(reason, "done", None, None);
         true
