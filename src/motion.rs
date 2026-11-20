@@ -661,6 +661,14 @@ pub const SETTLE_VEL: f64 = 0.05;
 /// An open / move gripper action that stops within this distance of its target counts as done.
 pub const GRIPPER_STOP_SHORT_RAD: f32 = 0.25;
 pub const SETTLE_HOLD_S: f64 = 0.2;
+/// Grasp contact: consecutive ticks of torque rise or following error.
+pub const GRIPPER_CONTACT_TICKS: u32 = 2;
+/// Grasp contact from the following error: command at least this far ahead of the jaw (rad) ...
+pub const GRIPPER_CONTACT_LAG_RAD: f32 = 0.30;
+/// ... while the jaw closes slower than this fraction of the requested speed.
+pub const GRIPPER_CONTACT_SLOW_FRACTION: f32 = 0.3;
+/// J7 speed (rad/s) from contact to the contact stop.
+pub const GRIPPER_CONTACT_SPEED: f32 = 0.3;
 /// A grasp squeeze above the gripper torque cap is reduced to aim at this fraction of the cap.
 pub const SQUEEZE_CAP_FRACTION: f32 = 0.8;
 /// Squeeze after a torque cap trip: press in from the measured position, reaching squeeze_rad
@@ -775,6 +783,10 @@ pub struct GripperMotion {
     still_for: f64,
     moved: bool,
     phase: GripPhase,
+    /// Grasp: measured J7 where contact was detected; the command then stops at
+    /// `contact + squeeze_rad` (never past it) and closes at GRIPPER_CONTACT_SPEED.
+    pub contact_rad: Option<f32>,
+    contact_ticks: u32,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -790,7 +802,7 @@ impl GripperMotion {
             }
         }.clamp(limit.min_position, limit.max_position);
         let limit = JointLimit { max_velocity: request.speed as f32, ..limit };
-        let mut m = Self { request, policy, limit, target, start, gripper_index, elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, moved: false, phase: GripPhase::Moving };
+        let mut m = Self { request, policy, limit, target, start, gripper_index, elapsed: 0.0, timeout_s: 0.0, still_for: 0.0, moved: false, phase: GripPhase::Moving, contact_rad: None, contact_ticks: 0 };
         m.timeout_s = m.request.timeout_s
             .unwrap_or_else(|| GRIPPER_DEFAULT_TIMEOUT_S.max(m.expected_duration() + GRIPPER_TIMEOUT_MARGIN_S));
         m
@@ -799,6 +811,15 @@ impl GripperMotion {
     /// Expected duration (s) for the travel at the requested speed, plus settle.
     pub fn expected_duration(&self) -> f64 {
         f64::from((self.target - self.start).abs()) / self.request.speed + 0.5 + self.policy.settle_ms as f64 / 1000.0
+    }
+
+    /// Grasp: contact + squeeze_rad toward closed (not past closed_rad), once contact is known.
+    pub fn contact_stop(&self) -> Option<f32> {
+        let dir = self.close_dir();
+        self.contact_rad.map(|c| {
+            let stop = c + dir * self.policy.squeeze_rad;
+            if (stop - self.policy.closed_rad) * dir > 0.0 { self.policy.closed_rad } else { stop }
+        })
     }
 
     fn close_dir(&self) -> f32 { if self.policy.closed_rad >= self.policy.open_rad { 1.0 } else { -1.0 } }
@@ -878,9 +899,29 @@ impl GripperMotion {
                     "Gripper did not finish within {:.1} s (at {m_g:.3} rad, target {:.3} rad)", self.timeout_s, self.target) } };
         }
 
+        let grasping = self.request.command == GripperCommand::Close && self.request.grasp;
+        // Grasp contact: torque rise (contact_torque_nm, once the jaw has moved) or following
+        // error (command ahead while the jaw slows down) for GRIPPER_CONTACT_TICKS ticks.
+        if grasping && self.contact_rad.is_none() && ctx.feedback_fresh && !stalled {
+            let torque_hit = ctx.torque_feedback && self.moved
+                && self.policy.contact_torque_nm.is_some_and(|c| tau_g.abs() >= c);
+            let lag_hit = (q_g - m_g) * dir >= GRIPPER_CONTACT_LAG_RAD
+                && mv_g * dir < GRIPPER_CONTACT_SLOW_FRACTION * self.request.speed as f32;
+            self.contact_ticks = if torque_hit || lag_hit { self.contact_ticks + 1 } else { 0 };
+            if self.contact_ticks >= GRIPPER_CONTACT_TICKS {
+                self.contact_rad = Some(m_g);
+                self.limit.max_velocity = self.limit.max_velocity.min(GRIPPER_CONTACT_SPEED);
+            }
+        }
+        let stop = self.contact_stop();
+        let target = stop.unwrap_or(self.target);
         // Step gripper toward the target unless the stall latch holds it.
-        if !stalled {
-            match crate::supervisor::SupervisorInner::bounded_servo_step(q_g, self.target, v_gc, ctx.dt, &self.limit) {
+        if !stalled && stop.is_some_and(|stop| (q_g - stop) * dir > 0.0) {
+            // the command ran ahead of the contact stop: take it back there
+            if idx < positions.len() { positions[idx] = target; }
+            if idx < velocities.len() { velocities[idx] = 0.0; }
+        } else if !stalled {
+            match crate::supervisor::SupervisorInner::bounded_servo_step(q_g, target, v_gc, ctx.dt, &self.limit) {
                 Some((q, v, _)) => {
                     if idx < positions.len() { positions[idx] = q; }
                     if idx < velocities.len() { velocities[idx] = v; }
@@ -891,11 +932,10 @@ impl GripperMotion {
             }
         }
         if (m_g - self.start).abs() > 0.05 { self.moved = true; }
-        let cmd_at_target = idx < positions.len() && (positions[idx] - self.target).abs() < 1e-4;
+        let cmd_at_target = idx < positions.len() && (positions[idx] - target).abs() < 1e-4;
         if mv_g.abs() < SETTLE_VEL as f32 && (self.moved || cmd_at_target) { self.still_for += ctx.dt; } else { self.still_for = 0.0; }
         let still = self.still_for >= SETTLE_HOLD_S - 1e-9;
 
-        let grasping = self.request.command == GripperCommand::Close && self.request.grasp;
         let status = if grasping {
             if stalled || still {
                 // after a torque cap trip the jaw already presses harder than the cap: hold the
@@ -903,6 +943,8 @@ impl GripperMotion {
                 let capped = stalled && ctx.gripper_force_capped;
                 let squeeze = if capped { 0.0 } else { self.policy.squeeze_rad };
                 let squeezed = m_g + dir * squeeze;
+                // never past the contact stop
+                let squeezed = self.contact_stop().map_or(squeezed, |stop| if (squeezed - stop) * dir > 0.0 { stop } else { squeezed });
                 let hold = if dir > 0.0 { squeezed.min(self.policy.closed_rad) } else { squeezed.max(self.policy.closed_rad) }
                     .clamp(self.limit.min_position, self.limit.max_position);
                 if idx < positions.len() { positions[idx] = hold; }

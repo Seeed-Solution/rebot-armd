@@ -636,6 +636,11 @@ pub struct GripperPolicy {
     /// speed and holds the measured position. Absent: no cap (drivers without torque feedback).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_close_torque_nm: Option<f32>,
+    /// Grasp contact (close with grasp detection): |τ| at or above this (N·m) for 2 ticks while
+    /// closing marks the contact point; the jaw then closes slowly to contact + squeeze_rad and
+    /// never further. Absent: contact from the following error only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_torque_nm: Option<f32>,
 }
 
 impl GripperPolicy {
@@ -659,6 +664,8 @@ impl GripperPolicy {
             // rose to 5.0 N·m while the jaw kept moving at ~1 rad/s and a finger broke.
             // Cap 1.0 N·m: 2.2x the free-close peak, a fifth of the torque at the break.
             max_close_torque_nm: Some(1.0),
+            // same log: 1.3x the free-close peak, below the first contact sample (0.85)
+            contact_torque_nm: Some(0.6),
         }
     }
 
@@ -1450,8 +1457,13 @@ impl ArmConfig {
                 }
             }
             let positive = |v: Option<f32>| v.is_none_or(|v| v.is_finite() && v > 0.0);
-            if !positive(g.max_close_torque_nm) {
-                return Err("Invalid gripper policy: max_close_torque_nm must be positive".into());
+            if !positive(g.max_close_torque_nm) || !positive(g.contact_torque_nm) {
+                return Err("Invalid gripper policy: max_close_torque_nm and contact_torque_nm must be positive".into());
+            }
+            if let (Some(cap), Some(contact)) = (g.max_close_torque_nm, g.contact_torque_nm) {
+                if contact >= cap {
+                    return Err("Invalid gripper policy: contact_torque_nm must be below max_close_torque_nm".into());
+                }
             }
             if g.holding_mode == HoldingMode::LoadAndGap && g.holding_load_fraction.unwrap_or(0.0) <= 0.0 {
                 return Err("Invalid gripper policy: LoadAndGap holding mode requires holding_load_fraction > 0.0".into());

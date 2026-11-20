@@ -64,6 +64,7 @@ fn so_arm101_config() -> ArmConfig {
         holding_mode: HoldingMode::LoadAndGap,
         holding_load_fraction: Some(0.25),
         max_close_torque_nm: None,
+        contact_torque_nm: None,
     });
     c.grasp = Some(dm.grasp.unwrap());
     c.gravity_comp = None;

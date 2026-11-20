@@ -94,6 +94,14 @@ fn rig_with(config: ArmConfig, load: Load) -> (SupervisorInner, Arc<Mutex<Rig>>)
 
 fn rig(load: Load) -> (SupervisorInner, Arc<Mutex<Rig>>) { rig_with(ArmConfig::rebot_dm(), load) }
 
+/// Start with the jaw at closed (rig and supervisor command).
+fn jaw_closed(inner: &mut SupervisorInner, rig: &Arc<Mutex<Rig>>) {
+    rig.lock().unwrap().q[6] = 0.0;
+    inner.commanded_positions[6] = 0.0;
+    inner.target_positions[6] = 0.0;
+    inner.tick(DT);
+}
+
 fn reset_stats(rig: &Arc<Mutex<Rig>>) {
     let mut r = rig.lock().unwrap();
     r.peak_tau = 0.0;
@@ -121,11 +129,12 @@ fn cap() -> f32 { GripperPolicy::rebot_dm().max_close_torque_nm.unwrap() }
 /// rises 0.07 N·m per tick at 1.05 rad/s, plus one tick of feedback delay.
 const CAP_MARGIN_NM: f32 = 0.25;
 
-/// Without the cap, the incident profile breaks the finger (the rig reproduces the incident).
+/// Without the cap and the contact detection (rc10 behaviour), the incident profile breaks the
+/// finger: the rig reproduces the incident.
 #[test]
 fn incident_profile_breaks_the_finger_without_the_cap() {
     let mut config = ArmConfig::rebot_dm();
-    if let Some(p) = config.gripper_policy.as_mut() { p.max_close_torque_nm = None; }
+    if let Some(p) = config.gripper_policy.as_mut() { p.max_close_torque_nm = None; p.contact_torque_nm = None; }
     let (mut inner, rig) = rig_with(config, Load::Incident);
     let epoch = inner.safety.epoch_id();
     let (id, _) = inner.start_gripper(close(true), epoch).unwrap();
@@ -244,8 +253,7 @@ fn free_close_reaches_closed() {
 #[test]
 fn open_is_unaffected() {
     let (mut inner, rig) = rig(Load::Free);
-    { let mut r = rig.lock().unwrap(); r.q[6] = 0.0; }
-    inner.tick(DT);
+    jaw_closed(&mut inner, &rig);
     let epoch = inner.safety.epoch_id();
     let open = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(10.0), tag: None };
     let (id, _) = inner.start_gripper(open, epoch).unwrap();
@@ -253,4 +261,92 @@ fn open_is_unaffected() {
     assert_eq!(a.state, "done", "{a:?}");
     assert!((inner.measured_positions[6] - GripperPolicy::rebot_dm().open_rad).abs() < 0.05);
     assert_eq!(inner.gripper_force_trips, 0);
+}
+
+fn gripper_motion(inner: &SupervisorInner) -> Option<&armd::motion::GripperMotion> {
+    match inner.active_trajectory.as_ref().map(|a| &a.reference) {
+        Some(armd::motion::Reference::Gripper(g)) => Some(g),
+        _ => None,
+    }
+}
+
+/// Runs a grasp close; returns (action, contact_rad, contact stop, max command written after the
+/// contact was detected).
+fn grasp_tracking_contact(inner: &mut SupervisorInner, rig: &Arc<Mutex<Rig>>) -> (armd::motion::ActionStatus, Option<f32>, Option<f32>, f32) {
+    let epoch = inner.safety.epoch_id();
+    let (id, _) = inner.start_gripper(close(true), epoch).unwrap();
+    let (mut contact, mut stop) = (None, None);
+    for _ in 0..(12.0 / DT) as usize {
+        inner.tick(DT);
+        if contact.is_none() {
+            if let Some(g) = gripper_motion(inner).filter(|g| g.contact_rad.is_some()) {
+                contact = g.contact_rad;
+                stop = g.contact_stop();
+                reset_stats(rig);
+            }
+        }
+        let a = inner.last_action.clone().unwrap();
+        assert_eq!(a.id, id);
+        if !a.is_running() {
+            let max_cmd = rig.lock().unwrap().max_cmd;
+            return (a, contact, stop, max_cmd);
+        }
+    }
+    panic!("grasp still running");
+}
+
+/// Item 2: the grasp detects the contact from the torque rise and never commands past
+/// contact + squeeze_rad afterwards.
+#[test]
+fn incident_grasp_stops_at_contact_plus_squeeze() {
+    let (mut inner, rig) = rig(Load::Incident);
+    let (a, contact, stop, max_cmd) = grasp_tracking_contact(&mut inner, &rig);
+    eprintln!("incident contact {contact:?}, stop {stop:?}, max command after contact {max_cmd:.3}, J7 {:.3}, holding {:?}",
+        inner.measured_positions[6], a.holding);
+    let contact = contact.expect("contact detected");
+    assert!((contact - CONTACT_RAD).abs() < 0.08, "contact at {contact}");
+    let squeeze = GripperPolicy::rebot_dm().squeeze_rad;
+    assert!((stop.unwrap() - (contact + squeeze)).abs() < 1e-5);
+    assert!(max_cmd <= stop.unwrap() + 1e-4, "command {max_cmd} past the stop {stop:?}");
+    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+    assert!(inner.commanded_positions[6] <= stop.unwrap() + 1e-4);
+    let r = rig.lock().unwrap();
+    assert!(!r.broke && r.peak_tau < cap() + CAP_MARGIN_NM, "peak {:.3}", r.peak_tau);
+}
+
+/// Without torque contact detection and without the cap, the following error (command ahead,
+/// jaw stopped) finds the contact on a rigid object (soft enough that the stall rule, 0.444 N·m
+/// for 6 ticks, comes later).
+#[test]
+fn rigid_contact_from_following_error() {
+    let mut config = ArmConfig::rebot_dm();
+    if let Some(p) = config.gripper_policy.as_mut() { p.contact_torque_nm = None; p.max_close_torque_nm = None; }
+    let (mut inner, rig) = rig_with(config, Load::Rigid(-2.0, 1.0));
+    let (a, contact, stop, max_cmd) = grasp_tracking_contact(&mut inner, &rig);
+    let contact = contact.expect("contact detected");
+    assert!((contact + 2.0).abs() < 1e-3, "contact at {contact}");
+    assert!(max_cmd <= stop.unwrap() + 1e-4, "command {max_cmd} past the stop {stop:?}");
+    assert_eq!((a.state.as_str(), a.holding), ("done", Some(true)), "{a:?}");
+}
+
+/// Free close: no false contact, the jaw reaches closed.
+#[test]
+fn free_close_detects_no_contact() {
+    let (mut inner, rig) = rig(Load::Free);
+    let (a, contact, _, _) = grasp_tracking_contact(&mut inner, &rig);
+    assert_eq!(contact, None);
+    assert_eq!(a.holding, Some(false), "{a:?}");
+    assert!(inner.measured_positions[6] > -0.1);
+}
+
+/// The contact stop only takes a grasp command back: an open ramps its command (no jump to open).
+#[test]
+fn open_command_ramps() {
+    let (mut inner, rig) = rig(Load::Free);
+    jaw_closed(&mut inner, &rig);
+    let epoch = inner.safety.epoch_id();
+    let open = GripperRequest { command: GripperCommand::Open, fraction: None, grasp: false, speed: 1.0, timeout_s: Some(10.0), tag: None };
+    inner.start_gripper(open, epoch).unwrap();
+    for _ in 0..5 { inner.tick(DT); }
+    assert!(inner.commanded_positions[6] > -0.2, "J7 command {}", inner.commanded_positions[6]);
 }
