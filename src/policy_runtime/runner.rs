@@ -29,6 +29,21 @@ pub const MIN_LIVE_POLICY_FPS: f64 = 10.0;
 pub const MAX_POLICY_FPS: f64 = 50.0;
 pub const MAX_POLICY_SECONDS: f64 = 86_400.0;
 pub const DEFAULT_MAX_FIRST_STEP_RAD: f32 = 0.25;
+/// Bounds of [`max_policy_input_age_ms`].
+pub const MIN_POLICY_INPUT_AGE_MS: u64 = 50;
+pub const MAX_POLICY_INPUT_AGE_MS: u64 = 200;
+
+/// Largest age of the joint positions a live target was computed from, measured from the
+/// driver's feedback capture to the commit under the supervisor lock: two policy periods
+/// (one for inference, one of slack), clamped to 50..=200 ms. 200 ms equals the servo
+/// motion-frame timeout; 50 ms leaves room for feedback age and scheduling at 50 fps.
+/// A target older than this is refused and the run ends with `STALE_INPUT`.
+pub fn max_policy_input_age_ms(fps: f64) -> u64 {
+    if !fps.is_finite() || fps <= 0.0 {
+        return MAX_POLICY_INPUT_AGE_MS;
+    }
+    ((2000.0 / fps).round() as u64).clamp(MIN_POLICY_INPUT_AGE_MS, MAX_POLICY_INPUT_AGE_MS)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +83,9 @@ pub struct PolicyRun {
     pub i_am_at_the_arm: bool,
     pub verified_release_gate: Option<VerifiedReleaseGate>,
     pub stop_reason: Option<String>,
+    /// [`max_policy_input_age_ms`] for the run's rate (set by the runner; until then the
+    /// bound for [`MIN_LIVE_POLICY_FPS`]).
+    pub max_input_age_ms: u64,
 }
 
 impl PolicyRun {
@@ -541,6 +559,7 @@ pub fn spawn_policy_runner(
     let tokio_dl = deadline.map(tokio::time::Instant::from_std);
 
     tokio::spawn(async move {
+        supervisor.inner().write().await.set_policy_max_input_age(action_id, max_policy_input_age_ms(clamped_fps));
         let collector = vision_spec.as_ref().zip(vision_source).map(|(spec, src)| {
             let wait_ms = (spec.max_staleness_ms / 4).clamp(10, 50);
             VisionFeatureCollector::start(src, wait_ms)

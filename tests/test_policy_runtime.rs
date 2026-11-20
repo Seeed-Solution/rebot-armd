@@ -6146,3 +6146,104 @@ mod device_qualification_tests {
         assert!(sup.inner().read().await.policy_run.is_none());
     }
 }
+
+/// Review fixes 2-4 and 7: stale targets, stale-vision hold, control-loop discards, gripper cap.
+mod review_fix_tests {
+    use super::*;
+    use armd::policy_runtime::max_policy_input_age_ms;
+
+    /// Returns `out` after sleeping `sleep_ms` on every call.
+    pub(super) struct DelayBackend {
+        pub sleep_ms: u64,
+        pub out: Vec<f32>,
+        pub calls: Arc<AtomicUsize>,
+    }
+    impl PolicyBackend for DelayBackend {
+        fn backend_name(&self) -> &'static str { "mock-delay" }
+        fn input_dim(&self) -> usize { self.out.len() }
+        fn output_dim(&self) -> usize { self.out.len() }
+        fn infer(&mut self, _input: &[f32], output: &mut [f32]) -> Result<(), PolicyError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(self.sleep_ms));
+            output.copy_from_slice(&self.out);
+            Ok(())
+        }
+    }
+
+    pub(super) fn prepared_with(cfg: &ArmConfig, backend: Box<dyn PolicyBackend>, extra: serde_json::Value) -> PreparedPolicy {
+        let dir = tempdir().unwrap();
+        let n = cfg.dof;
+        let names: Vec<String> = cfg.limits.iter().map(|l| l.name.clone()).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let layers = vec![MlpLayerSpec::new(n, n, Activation::None, vec![0.0; n * n], vec![0.0; n])];
+        write_rmlp_pack(dir.path(), &names, "rad", &layers, extra);
+        let snap = PolicySnapshot::load_from_dir(dir.path()).unwrap();
+        let contract = StrictPolicyContract::parse(&snap.policy_json_bytes).unwrap();
+        PreparedPolicy::from_backend(snap, contract, backend, cfg).unwrap()
+    }
+
+    pub(super) async fn begin_live(sup: &Arc<ArmSupervisor>, conn: &str, prepared: &PreparedPolicy) -> (u64, u64) {
+        let gen = sup.acquire_lease(conn).await.unwrap();
+        sup.set_torque(true).await.unwrap();
+        sup.tick(0.02).await;
+        let epoch = sup.get_observation().await.epoch_id;
+        let mut inner = sup.inner().write().await;
+        let id = inner
+            .begin_policy_run(PolicyRunStart {
+                epoch_id: epoch,
+                connection_id: conn.into(),
+                lease_generation: gen,
+                policy_id: "review".into(),
+                artifact_digest: prepared.artifact_digest().to_string(),
+                backend: prepared.backend_name().to_string(),
+                mode: PolicyMode::Live,
+                sim_only: false,
+                max_first_step_rad: None,
+                max_step_rad: None,
+                tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
+            })
+            .unwrap();
+        (id, epoch)
+    }
+
+    #[test]
+    fn input_age_bound_follows_fps() {
+        assert_eq!(max_policy_input_age_ms(10.0), 200);
+        assert_eq!(max_policy_input_age_ms(20.0), 100);
+        assert_eq!(max_policy_input_age_ms(25.0), 80);
+        assert_eq!(max_policy_input_age_ms(50.0), 50);
+        assert_eq!(max_policy_input_age_ms(1.0), 200);
+        assert_eq!(max_policy_input_age_ms(f64::NAN), 200);
+    }
+
+    /// Item 2: inference slower than the bound while feedback, ticks and heartbeats continue:
+    /// the late result never becomes the servo target and the run ends STALE_INPUT.
+    #[tokio::test]
+    async fn slow_inference_target_is_refused_as_stale() {
+        let cfg = make_6dof_config();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prepared = prepared_with(&cfg, Box::new(DelayBackend { sleep_ms: 250, out: vec![0.1, 0.0, 0.0, 0.0, 0.0, 0.0], calls: calls.clone() }), serde_json::json!({}));
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let (id, epoch) = begin_live(&sup, "conn-stale", &prepared).await;
+        let start = sup.get_observation().await.positions.clone();
+        let runner = spawn_policy_runner(sup.clone(), id, prepared, 20.0, compute_policy_deadline(Some(2.0)).unwrap(), None);
+        let mut saw_target = false;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = sup.heartbeat("conn-stale", epoch).await;
+            sup.tick(0.02).await;
+            saw_target |= sup.inner().read().await.servo_target.is_some();
+        }
+        let _ = runner.await;
+        assert!(calls.load(Ordering::SeqCst) >= 1);
+        assert!(!saw_target, "a stale target reached the servo loop");
+        let obs = sup.get_observation().await;
+        let p = obs.policy.unwrap();
+        assert_eq!(p.stop_reason.as_deref(), Some("STALE_INPUT"));
+        assert_eq!(p.steps, 0);
+        assert_eq!(obs.positions, start, "the arm moved on a stale target");
+        assert_eq!(obs.action.as_ref().and_then(|a| a.code.as_deref()), Some("STALE_INPUT"));
+    }
+}

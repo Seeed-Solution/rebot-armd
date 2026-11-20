@@ -5376,6 +5376,7 @@ impl SupervisorInner {
             i_am_at_the_arm: req.i_am_at_the_arm,
             verified_release_gate: req.verified_release_gate,
             stop_reason: None,
+            max_input_age_ms: crate::policy_runtime::max_policy_input_age_ms(crate::policy_runtime::MIN_LIVE_POLICY_FPS),
         };
         self.last_policy_obs = Some(run.to_observation(true));
         self.policy_run = Some(run);
@@ -5406,7 +5407,7 @@ impl SupervisorInner {
     ) -> Result<(), ArmError> {
         use crate::policy_runtime::PolicyMode;
 
-        let (epoch_id, conn_id, lease_gen, mode, max_first, max_step, prev_live) = {
+        let (epoch_id, conn_id, lease_gen, mode, max_first, max_step, prev_live, max_input_age_ms) = {
             let Some(active) = self.policy_run.as_ref() else {
                 return Err(ArmError::Rejected {
                     status: 409,
@@ -5429,6 +5430,7 @@ impl SupervisorInner {
                 active.max_first_step_rad,
                 active.max_step_rad,
                 active.last_live_target.clone(),
+                active.max_input_age_ms,
             )
         };
 
@@ -5570,6 +5572,19 @@ impl SupervisorInner {
             }
         }
 
+        // Capture-to-commit age of the joint positions this target was computed from: a
+        // target from an old pose (slow inference while the arm moved) never reaches the servo.
+        let stale = match input_age_ms {
+            Some(age) => (age > max_input_age_ms).then(|| format!("{age} ms > {max_input_age_ms} ms")),
+            None if !self.policy_live_allowed() => Some("input age unknown".to_string()),
+            None => None,
+        };
+        if let Some(why) = stale {
+            let msg = format!("Live policy target computed from stale joint positions ({why})");
+            self.terminate_policy_run("STALE_INPUT", "failed", Some("STALE_INPUT"), Some(msg.clone()));
+            return Err(ArmError::Rejected { status: 409, code: "STALE_INPUT".into(), message: msg });
+        }
+
         if prev_live.is_none() {
             if self.measured_positions.len() != self.config.dof
                 || self.measured_positions.iter().any(|m| !m.is_finite())
@@ -5650,6 +5665,13 @@ impl SupervisorInner {
         }
 
         Ok(())
+    }
+
+    /// Set the run's [`crate::policy_runtime::max_policy_input_age_ms`] bound.
+    pub fn set_policy_max_input_age(&mut self, action_id: u64, max_ms: u64) {
+        if let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) {
+            run.max_input_age_ms = max_ms;
+        }
     }
 
     pub fn stop_policy_run(&mut self, action_id: Option<u64>, reason: &str) -> bool {
