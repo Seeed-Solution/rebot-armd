@@ -414,6 +414,8 @@ pub struct SandboxState {
     pub root: PathBuf,
     pub active: RwLock<ActiveState>,
     pub cached_mjcf: RwLock<String>,
+    #[cfg(feature = "policy-runtime")]
+    policy_load_delay_ms: AtomicU64,
 }
 
 impl SandboxState {
@@ -433,7 +435,19 @@ impl SandboxState {
             root,
             active: RwLock::new(active),
             cached_mjcf: RwLock::new(String::new()),
+            #[cfg(feature = "policy-runtime")]
+            policy_load_delay_ms: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub fn set_policy_load_delay_ms(&self, ms: u64) {
+        self.policy_load_delay_ms.store(ms, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub fn policy_load_delay_ms(&self) -> u64 {
+        self.policy_load_delay_ms.load(Ordering::Relaxed)
     }
 
     pub fn new_shared() -> Arc<Self> {
@@ -495,6 +509,14 @@ impl SandboxState {
             m.name = id.to_string();
         }
         Some(m)
+    }
+
+    pub fn policy_dir(&self, id: &str) -> Option<PathBuf> {
+        if !validate_pack_id(id) {
+            return None;
+        }
+        let dir = self.root.join("policies").join(id);
+        dir.is_dir().then_some(dir)
     }
 }
 

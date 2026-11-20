@@ -253,6 +253,15 @@ pub struct SupervisorInner {
     pub quintic_settle: Option<(u64, Settle)>,
     /// Running macro action (grasp, place); its sub-motions carry the action id.
     pub macro_run: Option<crate::macro_action::MacroRun>,
+    /// Active streaming policy run (`src/policy_runtime/runner.rs`).
+    #[cfg(feature = "policy-runtime")]
+    pub policy_run: Option<crate::policy_runtime::PolicyRun>,
+    /// True while a policy pack is being loaded/prepared outside the supervisor lock.
+    #[cfg(feature = "policy-runtime")]
+    pub policy_loading: bool,
+    /// Most recent policy observation telemetry (retained after policy run ends).
+    #[cfg(feature = "policy-runtime")]
+    pub last_policy_obs: Option<crate::model::PolicyObservation>,
     /// Test hook run once by the WS action handler between planning and install.
     #[doc(hidden)]
     pub before_install_hook: Option<Box<dyn FnOnce(&mut SupervisorInner) + Send + Sync>>,
@@ -493,6 +502,12 @@ impl SupervisorInner {
             next_action_id: 0,
             action_lease_generation: None,
             macro_run: None,
+            #[cfg(feature = "policy-runtime")]
+            policy_run: None,
+            #[cfg(feature = "policy-runtime")]
+            policy_loading: false,
+            #[cfg(feature = "policy-runtime")]
+            last_policy_obs: None,
             quintic_settle: None,
             before_install_hook: None,
             last_heartbeat: now,
@@ -576,6 +591,14 @@ impl SupervisorInner {
         schema.capabilities.torque_guard &= torque_feedback;
         schema.capabilities.power_budget &= torque_feedback;
         schema.capabilities.auto_yaw = self.config.arm_dof() == 5;
+        #[cfg(feature = "policy-runtime")]
+        if let Some(ref mut pr) = schema.capabilities.policy_runtime {
+            pr.modes = if self.policy_live_allowed() {
+                vec!["shadow".to_string(), "live_sim".to_string()]
+            } else {
+                vec!["shadow".to_string()]
+            };
+        }
         if schema.feetech_joints.is_none() {
             schema.feetech_joints = self.config.feetech.as_ref().map(|f| f.joints.clone());
         }
@@ -840,8 +863,16 @@ impl SupervisorInner {
             self.note_motion_limit(MotionLimitReason::Power, j);
         }
         if self.servo_blocked_hold {
-            let resumed = self.servo_target.is_some() || self.active_trajectory.is_some() || self.macro_run.is_some()
-                || self.gravity_comp.is_some() || !self.is_torqued || self.safety.state().is_stopped();
+            #[cfg(feature = "policy-runtime")]
+            let policy_active = self.policy_run.is_some();
+            #[cfg(not(feature = "policy-runtime"))]
+            let policy_active = false;
+            let resumed = (self.servo_target.is_some() && !policy_active)
+                || self.active_trajectory.is_some()
+                || self.macro_run.is_some()
+                || self.gravity_comp.is_some()
+                || !self.is_torqued
+                || self.safety.state().is_stopped();
             if resumed {
                 self.clear_blocked_hold();
             } else {
@@ -869,12 +900,26 @@ impl SupervisorInner {
         tracing::warn!(
             "Joint {} blocked during servo streaming ({why}; cmd {:.3} meas {:.3} rad): stream stopped, holding position",
             joint + 1, self.commanded_positions[joint], self.measured_positions[joint]);
+        #[cfg(feature = "policy-runtime")]
+        self.terminate_policy_run(
+            "BLOCKED_HOLD",
+            "cancelled",
+            Some("BLOCKED_HOLD"),
+            Some(format!("Joint {} blocked during policy streaming: {why}", joint + 1)),
+        );
         self.servo_hold(MotionLimitReason::Blocked, Some(joint));
     }
 
     /// The servo / braking step to `next` violates the workspace: same recoverable hold.
     fn enter_servo_keepout_hold(&mut self, e: &SafetyError) {
         tracing::warn!("Servo step violates workspace ({e}): stream stopped, holding position");
+        #[cfg(feature = "policy-runtime")]
+        self.terminate_policy_run(
+            "WORKSPACE_HOLD",
+            "cancelled",
+            Some("WORKSPACE_HOLD"),
+            Some(format!("Policy step violated workspace: {e}")),
+        );
         self.servo_hold(MotionLimitReason::Workspace, None);
         if self.motion_limit.as_ref().is_some_and(|m| m.reason == MotionLimitReason::Workspace) {
             self.workspace_violation = e.workspace_detail();
@@ -1084,6 +1129,8 @@ impl SupervisorInner {
 
     /// Explicit user release uses the same bounded deceleration as a stream timeout.
     pub fn stop_motion(&mut self) {
+        #[cfg(feature = "policy-runtime")]
+        self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Motion stopped".into()));
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
         self.servo_ws_min_depths = None;
@@ -1187,6 +1234,10 @@ impl SupervisorInner {
             tcp,
             gripper,
             loads: (driver_capabilities.load_feedback && self.loads.len() == self.config.dof).then(|| self.loads.clone()),
+            #[cfg(feature = "policy-runtime")]
+            policy: self.policy_observation(),
+            #[cfg(not(feature = "policy-runtime"))]
+            policy: None,
         }
     }
 
@@ -1599,6 +1650,21 @@ impl SupervisorInner {
     }
 
     pub fn apply_stop_policy(&mut self, policy: StopPolicy) {
+        #[cfg(feature = "policy-runtime")]
+        match policy {
+            StopPolicy::NormalUnload => {
+                self.terminate_policy_run("STOPPED", "cancelled", Some("STOPPED"), Some("Arm unloading".into()));
+            }
+            StopPolicy::EStopLatch => {
+                self.terminate_policy_run("ESTOP", "failed", Some("ESTOP_ACTIVE"), Some("E-stop latched".into()));
+            }
+            StopPolicy::ThermalTrip => {
+                self.terminate_policy_run("THERMAL_TRIP", "failed", Some("THERMAL_TRIP"), Some("Thermal trip".into()));
+            }
+            StopPolicy::BusLossFallback => {
+                self.terminate_policy_run("BUS_LOSS", "failed", Some("BUS_LOSS"), Some("CAN feedback lost".into()));
+            }
+        }
         if policy == StopPolicy::NormalUnload && !self.supports_automatic_unload() {
             tracing::warn!("NormalUnload unsupported: resting pose or confirmed velocity/torque/enable feedback unavailable; no unload motion started");
             return;
@@ -2039,6 +2105,9 @@ impl SupervisorInner {
 
         self.cancel_watchdog_park_for_new_lease(conn);
 
+        #[cfg(feature = "policy-runtime")]
+        self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease preempted".into()));
+
         // Four-category state categorization (strictly fail-closed, no unwrap/panic, driver lock poison returns false)
         let confirmed_hardware_disabled = match &self.driver {
             None => !self.is_torqued && !self.disable_pending && self.safety.state() == &SafetyState::Idle,
@@ -2097,6 +2166,8 @@ impl SupervisorInner {
         // A new controller never inherits an expired controller's queued motion,
         // nor a watchdog park started after the previous lease was released.
         self.cancel_watchdog_park_for_new_lease(client_id);
+        #[cfg(feature = "policy-runtime")]
+        self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease acquired by new controller".into()));
         if self.active_lease.is_some() { self.stop_motion(); }
         self.lease_generation_counter += 1;
         let gen = self.lease_generation_counter;
@@ -2186,6 +2257,8 @@ impl SupervisorInner {
     /// Previous watchdog behaviour: rigid hold at the measured (or commanded) position
     /// and latch Fault(WatchdogTimeout). Torque stays on.
     fn latch_watchdog_fault(&mut self) {
+        #[cfg(feature = "policy-runtime")]
+        self.terminate_policy_run("WATCHDOG_TIMEOUT", "failed", Some("WATCHDOG_TIMEOUT"), Some("Lease watchdog expired".into()));
         let hold_pos = if self.measured_positions.iter().all(|p| p.is_finite())
             && self.measured_positions.len() == self.config.dof
         {
@@ -2214,6 +2287,8 @@ impl SupervisorInner {
             if active.client_id == client_id && active.generation == generation {
                 let valid = active.acquired_at.elapsed() < self.lease_timeout;
                 self.active_lease = None;
+                #[cfg(feature = "policy-runtime")]
+                self.terminate_policy_run("LEASE_LOST", "cancelled", Some("LEASE_LOST"), Some("Control lease released".into()));
                 return valid;
             }
         }
@@ -2286,7 +2361,11 @@ impl SupervisorInner {
         Ok(())
     }
 
-    pub fn servo(&mut self, mut targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
+    fn validate_and_filter_servo_targets(
+        &mut self,
+        targets: &mut [f32],
+        epoch_id: u64,
+    ) -> Result<(), SafetyError> {
         self.gravity_comp_servo_busy()?;
         self.collision_hold_check()?;
         if self.handover_settling_since.is_some() {
@@ -2312,7 +2391,7 @@ impl SupervisorInner {
         }
 
         // 1. Validate motion command against epoch, safety state, and soft limits
-        if let Err(e) = self.safety.validate_motion_command(Some(epoch_id), &targets, &self.config.limits) {
+        if let Err(e) = self.safety.validate_motion_command(Some(epoch_id), targets, &self.config.limits) {
             if let SafetyError::SoftLimitExceeded { joint, .. } = &e {
                 let idx = self.config.limits.iter().position(|l| &l.name == joint);
                 self.note_motion_limit(MotionLimitReason::JointLimit, idx);
@@ -2321,24 +2400,18 @@ impl SupervisorInner {
         }
 
         // 1b. Cartesian workspace: the target may not leave the box further than now.
-        if let Err(e) = self.check_workspace_path(&self.commanded_positions, [targets.as_slice()]) {
+        if let Err(e) = self.check_workspace_path(&self.commanded_positions, [&*targets]) {
             let e = e.with_workspace_phase("servo_target");
             self.workspace_violation = e.workspace_detail();
             self.note_motion_limit(MotionLimitReason::Workspace, None);
             return Err(e);
         }
-        if self.servo_blocked_hold { self.clear_blocked_hold(); }
-        self.torque_hold_filter(&mut targets);
-        self.power_hold_filter(&mut targets);
+        self.torque_hold_filter(targets);
+        self.power_hold_filter(targets);
+        Ok(())
+    }
 
-        // Only renew lease and motion frame timestamp AFTER command validation succeeds
-        self.last_heartbeat = Instant::now();
-        self.last_motion_frame = Instant::now();
-        if let Some(ref mut l) = self.active_lease {
-            l.last_valid_motion_instant = Some(Instant::now());
-        }
-
-        // Gripper stall release check on reverse command
+    fn release_gripper_stall_on_reverse(&mut self, targets: &[f32]) {
         if let Some(g_idx) = self.config.gripper_index() {
             if self.gripper_stalled && targets.len() > g_idx && self.commanded_positions.len() > g_idx {
                 let delta = targets[g_idx] - self.commanded_positions[g_idx];
@@ -2350,6 +2423,25 @@ impl SupervisorInner {
                 }
             }
         }
+    }
+
+    pub fn servo(&mut self, mut targets: Vec<f32>, epoch_id: u64) -> Result<(), SafetyError> {
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_run.is_some() || self.policy_loading {
+            return Err(SafetyError::MotionBusy);
+        }
+        self.validate_and_filter_servo_targets(&mut targets, epoch_id)?;
+        if self.servo_blocked_hold { self.clear_blocked_hold(); }
+
+        // Only renew lease and motion frame timestamp AFTER command validation succeeds
+        self.last_heartbeat = Instant::now();
+        self.last_motion_frame = Instant::now();
+        if let Some(ref mut l) = self.active_lease {
+            l.last_valid_motion_instant = Some(Instant::now());
+        }
+
+        // Gripper stall release check on reverse command
+        self.release_gripper_stall_on_reverse(&targets);
 
         let _ = self.safety.mark_motion_started();
 
@@ -2396,6 +2488,14 @@ impl SupervisorInner {
     ) -> Result<(u64, u64, f64), ArmError> {
         let mut target_positions = target_positions;
         self.gravity_comp_motion_busy()?;
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_loading {
+            return Err(MotionError::MotionBusy("a policy is loading".into()).into());
+        }
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_run.is_some() {
+            return Err(MotionError::MotionBusy("a policy run is active".into()).into());
+        }
         self.collision_hold_check()?;
         if self.handover_settling_since.is_some() {
             return Err(ArmError::Safety(SafetyError::HandoverSettling));
@@ -2471,6 +2571,16 @@ impl SupervisorInner {
         let now = self.now_s();
         // any new action ends a running macro (its orchestrator sees the record cancelled)
         self.macro_run = None;
+        #[cfg(feature = "policy-runtime")]
+        if let Some(mut run) = self.policy_run.take() {
+            run.stop_reason = Some("SUPERSEDED".to_string());
+            if run.mode == crate::policy_runtime::PolicyMode::Live {
+                self.servo_target = None;
+                self.servo_settled_ticks.fill(0);
+                self.servo_ws_min_depths = None;
+            }
+            self.last_policy_obs = Some(run.to_observation(false));
+        }
         if let Some(mut old) = self.last_action.take() {
             if old.is_running() {
                 old.state = "cancelled".into();
@@ -2679,6 +2789,10 @@ impl SupervisorInner {
     fn busy_reason(&self) -> Option<String> {
         if self.calibration_busy { return Some("a calibration apply is running".into()); }
         if self.zero_check_persisting.is_some() { return Some("gripper calibration is being persisted".into()); }
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_loading { return Some("a policy is loading".into()); }
+        #[cfg(feature = "policy-runtime")]
+        if self.policy_run.is_some() { return Some("a policy run is active".into()); }
         if self.active_trajectory.is_some() { return Some("a trajectory is running".into()); }
         if self.servo_target.is_some() { return Some("servo streaming is active".into()); }
         if self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) { return Some("the arm is still moving".into()); }
@@ -3254,6 +3368,10 @@ impl SupervisorInner {
         let Some(action) = self.last_action.as_ref().filter(|a| a.is_running()) else { return; };
         let (id, kind) = (action.id, action.kind.clone());
         let is_macro = self.macro_run.as_ref().is_some_and(|m| m.id == id);
+        #[cfg(feature = "policy-runtime")]
+        let is_policy = self.policy_run.as_ref().is_some_and(|p| p.action_id == id);
+        #[cfg(not(feature = "policy-runtime"))]
+        let is_policy = false;
         let carried = self.active_trajectory.as_ref().is_some_and(|a| a.action_id == Some(id));
         let lease_now = self.active_lease.as_ref().map(|l| l.generation);
         let cause: Option<(&str, &str, String)> = match self.safety.state() {
@@ -3268,7 +3386,21 @@ impl SupervisorInner {
             // a macro sub-motion or a replay must not outlive its action
             if (is_macro || kind == "replay") && carried { self.stop_motion(); }
             if self.zero_check_persisting == Some(id) { self.zero_check_persisting = None; }
+            #[cfg(feature = "policy-runtime")]
+            if is_policy {
+                let reason = match code {
+                    "ESTOP_ACTIVE" => "ESTOP",
+                    "WATCHDOG" => "WATCHDOG_TIMEOUT",
+                    "LEASE_LOST" => "LEASE_LOST",
+                    _ => "FAULT",
+                };
+                self.terminate_policy_run(reason, state, Some(code), Some(message));
+                return;
+            }
             self.finish_action(id, state, Some(code), Some(message), None, None, None);
+            return;
+        }
+        if is_policy {
             return;
         }
         if let Some(run) = self.macro_run.as_ref().filter(|m| m.id == id) {
@@ -3975,6 +4107,8 @@ impl SupervisorInner {
             && !self.pending_normal_unload
             && self.last_heartbeat.elapsed() > self.lease_timeout
         {
+            #[cfg(feature = "policy-runtime")]
+            self.terminate_policy_run("WATCHDOG_TIMEOUT", "failed", Some("WATCHDOG_TIMEOUT"), Some("Lease watchdog expired".into()));
             // Watchdog expired with torque on. When the arm is healthy and has a resting
             // pose, run the normal unload (park at home, settle, torque off). Otherwise
             // rigid lock at the current position and latch the fault, keeping torque on.
@@ -4527,6 +4661,448 @@ impl SupervisorInner {
         }
 
         obs
+    }
+}
+
+#[cfg(feature = "policy-runtime")]
+impl SupervisorInner {
+    /// Phase 1 real-arm gate: `Live` policy mode is only allowed for explicit mock or sim drivers.
+    pub fn policy_live_allowed(&self) -> bool {
+        matches!(
+            (self.driver.is_some(), self.follower.as_deref()),
+            (false, None) | (false, Some("mock")) | (_, Some("sim"))
+        )
+    }
+
+    pub fn policy_run_active(&self) -> bool {
+        self.policy_run.is_some()
+    }
+
+    pub fn is_policy_run_active(&self, action_id: u64) -> bool {
+        self.policy_run
+            .as_ref()
+            .is_some_and(|r| r.action_id == action_id)
+    }
+
+    pub fn policy_observation(&self) -> Option<crate::model::PolicyObservation> {
+        if let Some(ref run) = self.policy_run {
+            Some(run.to_observation(true))
+        } else {
+            self.last_policy_obs.clone()
+        }
+    }
+
+    pub fn policy_input_age_ms(&self) -> Option<u64> {
+        match &self.driver {
+            None => Some(0),
+            Some(d) => d.lock().ok().and_then(|drv| {
+                let ages = drv.feedback_ages();
+                if ages.len() != self.config.dof {
+                    return None;
+                }
+                ages.into_iter()
+                    .collect::<Option<Vec<_>>>()
+                    .and_then(|v| v.into_iter().max())
+                    .map(|dur| dur.as_millis().min(u64::MAX as u128) as u64)
+            }),
+        }
+    }
+
+    /// Preconditions checked under lock before loading a policy pack outside the lock.
+    pub fn check_policy_start_preconditions(
+        &self,
+        mode: crate::policy_runtime::PolicyMode,
+        epoch_id: u64,
+    ) -> Result<(), ArmError> {
+        use crate::policy_runtime::PolicyMode;
+
+        if self.estop_pending() {
+            return Err(SafetyError::EStopActive.into());
+        }
+        if epoch_id != self.safety.epoch_id() {
+            return Err(SafetyError::EpochMismatch {
+                expected: self.safety.epoch_id(),
+                received: epoch_id,
+            }
+            .into());
+        }
+        if self.handover_settling_since.is_some() {
+            return Err(SafetyError::HandoverSettling.into());
+        }
+        match self.safety.state() {
+            SafetyState::EStop => return Err(SafetyError::EStopActive.into()),
+            SafetyState::Fault(r) => return Err(SafetyError::FaultActive(r.clone()).into()),
+            s if mode == PolicyMode::Live && !s.is_operational() => {
+                return Err(SafetyError::NotArmed(s.clone()).into());
+            }
+            _ => {}
+        }
+        if mode == PolicyMode::Live {
+            if !self.policy_live_allowed() {
+                return Err(ArmError::Rejected {
+                    status: 403,
+                    code: "POLICY_SHADOW_ONLY".into(),
+                    message: "Live policy execution is only allowed on mock or sim drivers".into(),
+                });
+            }
+            self.gravity_comp_servo_busy().map_err(ArmError::Safety)?;
+            self.collision_hold_check().map_err(ArmError::Safety)?;
+            if self.pending_rearm || self.pending_normal_unload || !self.is_torqued {
+                return Err(SafetyError::NotArmed(self.safety.state().clone()).into());
+            }
+            if self.servo_blocked_hold {
+                return Err(ArmError::Rejected {
+                    status: 409,
+                    code: "BLOCKED_HOLD".into(),
+                    message: "Cannot start live policy while servo blocked hold is active".into(),
+                });
+            }
+            if self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) {
+                return Err(ArmError::Safety(SafetyError::MotionBusy));
+            }
+        }
+        if self.calibration_busy
+            || self.zero_check_persisting.is_some()
+            || self.gravity_comp.is_some()
+            || self.pending_normal_unload
+            || self.active_trajectory.is_some()
+            || self.macro_run.is_some()
+            || self.policy_loading
+            || self.policy_run.is_some()
+            || self.servo_target.is_some()
+        {
+            return Err(ArmError::Safety(SafetyError::MotionBusy));
+        }
+        Ok(())
+    }
+
+    /// Install an exclusive streaming `PolicyRun` after lease, epoch, driver gate, and mutual exclusion checks.
+    pub fn begin_policy_run(
+        &mut self,
+        req: crate::policy_runtime::PolicyRunStart,
+    ) -> Result<u64, ArmError> {
+        use crate::policy_runtime::{PolicyRun, DEFAULT_MAX_FIRST_STEP_RAD};
+
+        self.check_policy_start_preconditions(req.mode, req.epoch_id)?;
+        if !self.validate_servo_lease(&req.connection_id, req.lease_generation) {
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "LEASE_LOST".into(),
+                message: "Connection does not own an active lease".into(),
+            });
+        }
+
+        let max_first_step_rad = req
+            .max_first_step_rad
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map_or(DEFAULT_MAX_FIRST_STEP_RAD, |v| {
+                v.min(DEFAULT_MAX_FIRST_STEP_RAD)
+            });
+
+        let action_id = self.begin_action("policy", req.tag);
+        let run = PolicyRun {
+            action_id,
+            epoch_id: req.epoch_id,
+            connection_id: req.connection_id,
+            lease_generation: req.lease_generation,
+            policy_id: req.policy_id,
+            artifact_digest: req.artifact_digest,
+            backend: req.backend,
+            mode: req.mode,
+            steps: 0,
+            last_input_age_ms: None,
+            last_shadow_target: None,
+            last_live_target: None,
+            max_first_step_rad,
+            max_step_rad: req.max_step_rad,
+            stop_reason: None,
+        };
+        self.last_policy_obs = Some(run.to_observation(true));
+        self.policy_run = Some(run);
+        Ok(action_id)
+    }
+
+    /// Submit one policy inference target frame.
+    ///
+    /// Enforces strict identity/epoch/lease checks, never renews `last_heartbeat`, never clears
+    /// `servo_blocked_hold`, enforces first-step and per-step jump caps in `Live` mode, and
+    /// shares `validate_and_filter_servo_targets` with `servo()`.
+    pub fn policy_step(
+        &mut self,
+        action_id: u64,
+        mut targets: Vec<f32>,
+        input_age_ms: Option<u64>,
+    ) -> Result<(), ArmError> {
+        use crate::policy_runtime::PolicyMode;
+
+        let (epoch_id, conn_id, lease_gen, mode, max_first, max_step, prev_live) = {
+            let Some(active) = self.policy_run.as_ref() else {
+                return Err(ArmError::Rejected {
+                    status: 409,
+                    code: "POLICY_NOT_ACTIVE".into(),
+                    message: "No active policy run".into(),
+                });
+            };
+            if active.action_id != action_id {
+                return Err(ArmError::Rejected {
+                    status: 409,
+                    code: "POLICY_NOT_ACTIVE".into(),
+                    message: "Stale policy action_id".into(),
+                });
+            }
+            (
+                active.epoch_id,
+                active.connection_id.clone(),
+                active.lease_generation,
+                active.mode,
+                active.max_first_step_rad,
+                active.max_step_rad,
+                active.last_live_target.clone(),
+            )
+        };
+
+        if self.estop_pending() || matches!(self.safety.state(), SafetyState::EStop) {
+            self.terminate_policy_run("ESTOP", "failed", Some("ESTOP_ACTIVE"), Some("E-stop latched".into()));
+            return Err(SafetyError::EStopActive.into());
+        }
+        if epoch_id != self.safety.epoch_id() {
+            let current = self.safety.epoch_id();
+            self.terminate_policy_run(
+                "STOPPED",
+                "cancelled",
+                Some("EPOCH_MISMATCH"),
+                Some("Epoch changed during policy run".into()),
+            );
+            return Err(SafetyError::EpochMismatch {
+                expected: current,
+                received: epoch_id,
+            }
+            .into());
+        }
+        if let SafetyState::Fault(r) = self.safety.state().clone() {
+            let reason = if matches!(r, FaultReason::WatchdogTimeout) {
+                "WATCHDOG_TIMEOUT"
+            } else {
+                "FAULT"
+            };
+            self.terminate_policy_run(
+                reason,
+                "failed",
+                Some(reason),
+                Some(format!("Fault active: {r:?}")),
+            );
+            return Err(SafetyError::FaultActive(r).into());
+        }
+
+        if !self.validate_servo_lease(&conn_id, lease_gen) {
+            self.terminate_policy_run(
+                "LEASE_LOST",
+                "cancelled",
+                Some("LEASE_LOST"),
+                Some("Control lease lost or expired".into()),
+            );
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "LEASE_LOST".into(),
+                message: "Control lease lost or expired".into(),
+            });
+        }
+
+        if self.servo_blocked_hold {
+            self.terminate_policy_run(
+                "BLOCKED_HOLD",
+                "cancelled",
+                Some("BLOCKED_HOLD"),
+                Some("Servo blocked hold active".into()),
+            );
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "BLOCKED_HOLD".into(),
+                message: "Servo blocked hold active".into(),
+            });
+        }
+
+        if targets.len() != self.config.dof || targets.iter().any(|v| !v.is_finite()) {
+            self.terminate_policy_run(
+                "INVALID_TARGET",
+                "failed",
+                Some("INVALID_TARGET"),
+                Some("Policy produced non-finite or wrong-dimension target".into()),
+            );
+            return Err(SafetyError::InvalidValue.into());
+        }
+
+        if mode == PolicyMode::Shadow {
+            if let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) {
+                run.steps += 1;
+                run.last_input_age_ms = input_age_ms;
+                run.last_shadow_target = Some(targets);
+                self.last_policy_obs = Some(run.to_observation(true));
+            }
+            return Ok(());
+        }
+
+        // Live mode checks: real-arm gate, jump limits, and shared servo validation.
+        if !self.policy_live_allowed() {
+            self.terminate_policy_run(
+                "POLICY_SHADOW_ONLY",
+                "failed",
+                Some("POLICY_SHADOW_ONLY"),
+                Some("Live policy execution is only allowed on mock or sim drivers".into()),
+            );
+            return Err(ArmError::Rejected {
+                status: 403,
+                code: "POLICY_SHADOW_ONLY".into(),
+                message: "Live policy execution is only allowed on mock or sim drivers".into(),
+            });
+        }
+
+        if prev_live.is_none() {
+            if self.measured_positions.len() != self.config.dof
+                || self.measured_positions.iter().any(|m| !m.is_finite())
+            {
+                self.terminate_policy_run(
+                    "INVALID_FEEDBACK",
+                    "failed",
+                    Some("INVALID_FEEDBACK"),
+                    Some("Measured joint positions are invalid on first live policy step".into()),
+                );
+                return Err(SafetyError::FeedbackUnavailable.into());
+            }
+            for i in 0..self.config.dof {
+                let delta = (targets[i] - self.measured_positions[i]).abs();
+                if delta > max_first {
+                    let msg = format!(
+                        "First live policy step on joint {} exceeds max_first_step_rad ({delta:.4} > {max_first:.4})",
+                        i + 1
+                    );
+                    self.terminate_policy_run("JUMP_LIMIT", "failed", Some("JUMP_LIMIT"), Some(msg.clone()));
+                    return Err(ArmError::Rejected {
+                        status: 422,
+                        code: "JUMP_LIMIT".into(),
+                        message: msg,
+                    });
+                }
+            }
+        } else if let (Some(prev), Some(step_cap)) = (prev_live.as_ref(), max_step) {
+            for i in 0..self.config.dof {
+                let delta = (targets[i] - prev[i]).abs();
+                if delta > step_cap {
+                    let msg = format!(
+                        "Live policy step on joint {} exceeds max_step_rad ({delta:.4} > {step_cap:.4})",
+                        i + 1
+                    );
+                    self.terminate_policy_run("STEP_LIMIT", "failed", Some("STEP_LIMIT"), Some(msg.clone()));
+                    return Err(ArmError::Rejected {
+                        status: 422,
+                        code: "STEP_LIMIT".into(),
+                        message: msg,
+                    });
+                }
+            }
+        }
+
+        if let Err(e) = self.validate_and_filter_servo_targets(&mut targets, epoch_id) {
+            let (reason, state, code) = match &e {
+                SafetyError::EStopActive => ("ESTOP", "failed", "ESTOP_ACTIVE"),
+                SafetyError::FaultActive(_) => ("FAULT", "failed", "FAULT_ACTIVE"),
+                SafetyError::CollisionHold(_) => ("COLLISION_HOLD", "cancelled", "COLLISION_HOLD"),
+                SafetyError::SoftLimitExceeded { .. } => ("SOFT_LIMIT_EXCEEDED", "failed", "SOFT_LIMIT_EXCEEDED"),
+                SafetyError::WorkspaceViolation { .. } => ("WORKSPACE_VIOLATION", "failed", "WORKSPACE_VIOLATION"),
+                SafetyError::NotArmed(_) => ("NOT_ARMED", "failed", "NOT_ARMED"),
+                _ => ("SAFETY_REJECTED", "failed", "SAFETY_ERROR"),
+            };
+            self.terminate_policy_run(reason, state, Some(code), Some(e.to_string()));
+            return Err(ArmError::Safety(e));
+        }
+
+        // CRITICAL 1: NEVER touch self.last_heartbeat here!
+        // CRITICAL 2: NEVER clear self.servo_blocked_hold here!
+        self.last_motion_frame = Instant::now();
+        self.release_gripper_stall_on_reverse(&targets);
+        let _ = self.safety.mark_motion_started();
+
+        self.target_positions = targets.clone();
+        self.servo_target = Some(targets.clone());
+        self.servo_settled_ticks.fill(0);
+
+        if let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) {
+            run.steps += 1;
+            run.last_input_age_ms = input_age_ms;
+            run.last_shadow_target = Some(targets.clone());
+            run.last_live_target = Some(targets);
+            self.last_policy_obs = Some(run.to_observation(true));
+        }
+
+        Ok(())
+    }
+
+    pub fn stop_policy_run(&mut self, action_id: Option<u64>, reason: &str) -> bool {
+        let matches = match (self.policy_run.as_ref(), action_id) {
+            (Some(_), None) => true,
+            (Some(r), Some(id)) => r.action_id == id,
+            (None, _) => false,
+        };
+        if !matches {
+            return false;
+        }
+        self.terminate_policy_run(
+            reason,
+            "cancelled",
+            Some(reason),
+            Some(format!("Policy stopped: {reason}")),
+        );
+        true
+    }
+
+    pub fn finish_policy_run(&mut self, action_id: u64, reason: &str) -> bool {
+        if !self.is_policy_run_active(action_id) {
+            return false;
+        }
+        self.terminate_policy_run(reason, "done", None, None);
+        true
+    }
+
+    pub fn fail_policy_run(
+        &mut self,
+        action_id: u64,
+        reason: &str,
+        message: impl Into<String>,
+    ) -> bool {
+        if !self.is_policy_run_active(action_id) {
+            return false;
+        }
+        self.terminate_policy_run(reason, "failed", Some(reason), Some(message.into()));
+        true
+    }
+
+    fn terminate_policy_run(
+        &mut self,
+        stop_reason: &str,
+        action_state: &str,
+        action_code: Option<&str>,
+        action_message: Option<String>,
+    ) {
+        let Some(mut run) = self.policy_run.take() else {
+            return;
+        };
+        run.stop_reason = Some(stop_reason.to_string());
+        if run.mode == crate::policy_runtime::PolicyMode::Live {
+            self.servo_target = None;
+            self.servo_settled_ticks.fill(0);
+            self.servo_ws_min_depths = None;
+            self.target_positions = self.commanded_positions.clone();
+        }
+        self.last_policy_obs = Some(run.to_observation(false));
+        self.finish_action(
+            run.action_id,
+            action_state,
+            action_code,
+            action_message,
+            None,
+            None,
+            None,
+        );
     }
 }
 

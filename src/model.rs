@@ -1730,6 +1730,28 @@ pub struct ArmObservation {
     /// Normalized servo load fraction per joint when `driver_capabilities.load_feedback` is true; omitted otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loads: Option<Vec<f32>>,
+    /// Active or most recent policy-runtime run; omitted when none has run or feature disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyObservation>,
+}
+
+/// Policy runtime execution state published in `observation.policy`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PolicyObservation {
+    pub active: bool,
+    pub action_id: u64,
+    pub policy_id: String,
+    pub artifact_digest: String,
+    pub backend: String,
+    pub mode: String,
+    pub steps: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_input_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_shadow_target: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 /// Gripper zero state published in `observation.gripper_zero`.
@@ -1957,6 +1979,33 @@ pub struct Capabilities {
     #[serde(default)]
     pub calibration_apply: bool,
     pub vision: VisionCapabilities,
+    /// On-device policy runtime capabilities; omitted unless compiled with `policy-runtime`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_runtime: Option<PolicyRuntimeCapabilities>,
+}
+
+/// Policy-runtime features compiled into this armd instance.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PolicyRuntimeCapabilities {
+    pub backends: Vec<String>,
+    pub inputs: Vec<String>,
+    pub modes: Vec<String>,
+}
+
+impl PolicyRuntimeCapabilities {
+    #[cfg(all(feature = "policy-runtime", not(target_arch = "wasm32")))]
+    pub fn compiled_default() -> Self {
+        let mut backends = vec!["mlp".to_string()];
+        if cfg!(feature = "policy-tract") {
+            backends.push("tract".to_string());
+        }
+        Self {
+            backends,
+            inputs: vec!["proprioception".to_string()],
+            modes: vec!["shadow".to_string(), "live_sim".to_string()],
+        }
+    }
 }
 
 impl Capabilities {
@@ -1971,6 +2020,10 @@ impl Capabilities {
         let grasp = arm_with_gripper && kin && config.gripper_policy.is_some() && config.grasp.is_some();
         #[cfg(target_arch = "wasm32")]
         let grasp = false;
+        #[cfg(all(feature = "policy-runtime", not(target_arch = "wasm32")))]
+        let policy_runtime = Some(PolicyRuntimeCapabilities::compiled_default());
+        #[cfg(not(all(feature = "policy-runtime", not(target_arch = "wasm32"))))]
+        let policy_runtime = None;
         Self {
             version: CAPABILITIES_VERSION,
             profile_version: config.profile_version,
@@ -2002,6 +2055,7 @@ impl Capabilities {
             auto_yaw: false,
             calibration_apply: grasp,
             vision: VisionCapabilities { detection_proxy: true, mode_endpoint: VISION_MODE_ENDPOINT.to_string(), ..Default::default() },
+            policy_runtime,
         }
     }
 }
