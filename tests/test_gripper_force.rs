@@ -386,3 +386,80 @@ fn open_command_ramps() {
     for _ in 0..5 { inner.tick(DT); }
     assert!(inner.commanded_positions[6] > -0.2, "J7 command {}", inner.commanded_positions[6]);
 }
+
+/// Review item 7: a live policy run streams through the same gripper force cap and lead cap
+/// as the servo stream (policy_step -> servo target -> tick). The follower is "sim" so the
+/// run needs no release gate; the rig is still a driver with torque feedback.
+#[cfg(feature = "policy-runtime")]
+mod policy_stream {
+    use super::*;
+    use armd::policy_runtime::{PolicyMode, PolicyRunStart};
+
+    fn begin(inner: &mut SupervisorInner) -> u64 {
+        inner.follower = Some("sim".into());
+        inner.lease_enabled = true;
+        let gen = inner.acquire_lease("policy-rig").unwrap();
+        let epoch = inner.safety.epoch_id();
+        inner.begin_policy_run(PolicyRunStart {
+            epoch_id: epoch, connection_id: "policy-rig".into(), lease_generation: gen, policy_id: "rig".into(),
+            artifact_digest: "0".repeat(64), backend: "mlp".into(), mode: PolicyMode::Live, sim_only: false,
+            max_first_step_rad: None, max_step_rad: None, tag: None, i_am_at_the_arm: false, verified_release_gate: None,
+        }).unwrap()
+    }
+
+    /// The incident profile through policy targets: the cap latches, the jaw command stays at
+    /// the latch position while the policy keeps asking for closed, the finger survives.
+    #[test]
+    fn incident_policy_stream_is_capped() {
+        let (mut inner, rig) = rig(Load::Incident);
+        let id = begin(&mut inner);
+        let mut target = INSPECT.to_vec();
+        let mut g = INSPECT[6];
+        let mut latched_cmd: Option<f32> = None;
+        for _ in 0..(8.0 / DT) as usize {
+            g = (g + DT as f32).min(0.0);
+            target[6] = g;
+            inner.policy_step(id, target.clone(), Some(0)).unwrap();
+            inner.tick(DT);
+            if inner.gripper_force_trips >= 1 {
+                let cmd = inner.commanded_positions[6];
+                // after the trip the jaw command never closes further than where it latched
+                match latched_cmd {
+                    None => latched_cmd = Some(cmd),
+                    Some(l) => assert!(cmd <= l + 1e-3, "jaw command moved on after the cap: {cmd} > {l}"),
+                }
+            }
+        }
+        let r = rig.lock().unwrap();
+        eprintln!("incident policy: peak {:.3} N·m, J7 {:.3} rad, cmd {:?}, trips {}", r.peak_tau, r.q[6], latched_cmd, inner.gripper_force_trips);
+        assert!(!r.broke, "finger broke");
+        assert!(r.peak_tau < cap() + CAP_MARGIN_NM, "peak {:.3} N·m", r.peak_tau);
+        assert!(inner.gripper_force_trips >= 1);
+        assert!(r.q[6] < CONTACT_RAD + 0.25, "J7 {}", r.q[6]);
+        assert!(inner.commanded_positions[6] < CONTACT_RAD + 0.25, "jaw command {}", inner.commanded_positions[6]);
+        assert!(inner.is_policy_run_active(id), "the cap holds the jaw; it does not end the run");
+    }
+
+    /// Policy targets at closed against a rigid block (cap off): the lead cap bounds the
+    /// command to max_lead_rad ahead of the measured jaw.
+    #[test]
+    fn blocked_policy_stream_lead_is_capped() {
+        let mut config = ArmConfig::rebot_dm();
+        if let Some(p) = config.gripper_policy.as_mut() { p.max_close_torque_nm = None; }
+        let (mut inner, rig) = rig_with(config, Load::Rigid(-2.0, 0.2));
+        let id = begin(&mut inner);
+        let mut target = INSPECT.to_vec();
+        reset_stats(&rig);
+        let mut g = INSPECT[6];
+        for _ in 0..(6.0 / DT) as usize {
+            g = (g + 0.2).min(0.0);
+            target[6] = g;
+            inner.policy_step(id, target.clone(), Some(0)).unwrap();
+            inner.tick(DT);
+        }
+        let r = rig.lock().unwrap();
+        eprintln!("blocked policy: max lead {:.3} rad, J7 {:.3}", r.max_lead, r.q[6]);
+        assert!(r.max_lead <= max_lead() + 1e-4, "lead {}", r.max_lead);
+        assert!((r.q[6] + 2.0).abs() < 1e-3);
+    }
+}
