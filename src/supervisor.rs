@@ -4723,6 +4723,18 @@ impl SupervisorInner {
             .is_some_and(|r| r.action_id == action_id)
     }
 
+    pub fn active_policy_release_gate(
+        &self,
+        action_id: u64,
+    ) -> Option<&crate::policy_runtime::VerifiedReleaseGate> {
+        self.policy_run
+            .as_ref()
+            .filter(|r| {
+                r.action_id == action_id && r.mode == crate::policy_runtime::PolicyMode::Live
+            })
+            .and_then(|r| r.verified_release_gate.as_ref())
+    }
+
     pub fn policy_observation(&self) -> Option<crate::model::PolicyObservation> {
         if let Some(ref run) = self.policy_run {
             Some(run.to_observation(true))
@@ -5076,7 +5088,51 @@ impl SupervisorInner {
             return Ok(());
         }
 
-        // Live mode checks: real-arm gate, jump limits, and shared servo validation.
+        // Live mode checks: stale measurement guard, release-gate calibration binding, real-arm gate, jump limits, and shared servo validation.
+        if let Some(age) =
+            input_age_ms.filter(|&age| age > crate::policy_runtime::MAX_LIVE_PROPRIO_AGE_MS)
+        {
+            let msg = format!(
+                "Joint measurement used for inference is stale ({age} ms > {} ms)",
+                crate::policy_runtime::MAX_LIVE_PROPRIO_AGE_MS
+            );
+            self.terminate_policy_run(
+                "INPUT_STALE",
+                "failed",
+                Some("INPUT_STALE"),
+                Some(msg.clone()),
+            );
+            return Err(ArmError::Rejected {
+                status: 409,
+                code: "INPUT_STALE".into(),
+                message: msg,
+            });
+        }
+        if let Some(gate) = self
+            .policy_run
+            .as_ref()
+            .filter(|r| r.action_id == action_id)
+            .and_then(|r| r.verified_release_gate.as_ref())
+        {
+            let active_calib = self.active_calibration_digest();
+            if !gate.calibration_digest().eq_ignore_ascii_case(&active_calib) {
+                let msg = format!(
+                    "calibration_digest mismatch: gate declares {}, active deployment is {active_calib}",
+                    gate.calibration_digest()
+                );
+                self.terminate_policy_run(
+                    "DEPLOYMENT_CHANGED",
+                    "failed",
+                    Some("DEPLOYMENT_CHANGED"),
+                    Some(msg.clone()),
+                );
+                return Err(ArmError::Rejected {
+                    status: 409,
+                    code: "DEPLOYMENT_CHANGED".into(),
+                    message: msg,
+                });
+            }
+        }
         if !self.policy_live_allowed() {
             let (has_confirm, has_gate) = self.policy_run.as_ref().map_or((false, false), |run| {
                 (
@@ -5127,6 +5183,21 @@ impl SupervisorInner {
                     status: 409,
                     code: "FEEDBACK_UNCONFIRMED".into(),
                     message: "Hardware feedback is unconfirmed during live policy step".into(),
+                });
+            }
+            if input_age_ms.is_none() {
+                let msg =
+                    "Joint measurement age is missing during real-arm live policy step".to_string();
+                self.terminate_policy_run(
+                    "INPUT_STALE",
+                    "failed",
+                    Some("INPUT_STALE"),
+                    Some(msg.clone()),
+                );
+                return Err(ArmError::Rejected {
+                    status: 409,
+                    code: "INPUT_STALE".into(),
+                    message: msg,
                 });
             }
         }
@@ -5211,6 +5282,16 @@ impl SupervisorInner {
         }
 
         Ok(())
+    }
+
+    pub fn hold_policy_run(&mut self, action_id: u64) {
+        if self.policy_run.as_ref().is_some_and(|r| {
+            r.action_id == action_id && r.mode == crate::policy_runtime::PolicyMode::Live
+        }) {
+            self.servo_target = None;
+            self.servo_settled_ticks.fill(0);
+            self.servo_ws_min_depths = None;
+        }
     }
 
     pub fn stop_policy_run(&mut self, action_id: Option<u64>, reason: &str) -> bool {

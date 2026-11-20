@@ -29,6 +29,7 @@ pub const MIN_LIVE_POLICY_FPS: f64 = 10.0;
 pub const MAX_POLICY_FPS: f64 = 50.0;
 pub const MAX_POLICY_SECONDS: f64 = 86_400.0;
 pub const DEFAULT_MAX_FIRST_STEP_RAD: f32 = 0.25;
+pub const MAX_LIVE_PROPRIO_AGE_MS: u64 = 250;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -519,6 +520,7 @@ pub fn spawn_policy_runner(
     fps: f64,
     deadline: Option<Instant>,
     vision_source: Option<Arc<dyn PolicyVisionSource>>,
+    sandbox: Option<Arc<crate::api::sandbox::SandboxState>>,
 ) -> tokio::task::JoinHandle<()> {
     let vision_spec = prepared.contract().vision.clone();
     if vision_spec.is_some() && vision_source.is_none() {
@@ -617,7 +619,11 @@ pub fn spawn_policy_runner(
                             frame.as_ref().and_then(|f| f.captured_at),
                             Some(frame_id),
                         ),
-                        VisionStepDecision::Hold => continue,
+                        VisionStepDecision::Hold => {
+                            let mut inner = supervisor.inner().write().await;
+                            inner.hold_policy_run(action_id);
+                            continue;
+                        }
                         VisionStepDecision::Stop { reason, message } => {
                             let mut inner = supervisor.inner().write().await;
                             inner.fail_policy_run(action_id, reason, message);
@@ -705,7 +711,10 @@ pub fn spawn_policy_runner(
                             );
                             break;
                         }
-                        VisionStalePolicy::Hold => continue,
+                        VisionStalePolicy::Hold => {
+                            inner.hold_policy_run(action_id);
+                            continue;
+                        }
                     }
                 }
                 Some(age_ms)
@@ -737,6 +746,22 @@ pub fn spawn_policy_runner(
                             break;
                         }
                     }
+                }
+            }
+            if let Some(gate) = inner.active_policy_release_gate(action_id).cloned() {
+                let (scene_id, tool_id) = match sandbox.as_ref() {
+                    Some(s) => s.active_scene_and_tool().await,
+                    None => (gate.scene_id().to_string(), gate.tool_id().to_string()),
+                };
+                let calibration_digest = inner.active_calibration_digest();
+                let cur_ctx = super::release_gate::ActiveDeploymentContext {
+                    scene_id,
+                    tool_id,
+                    calibration_digest,
+                };
+                if let Err(e) = gate.verify_deployment(&cur_ctx) {
+                    inner.fail_policy_run(action_id, "DEPLOYMENT_CHANGED", e.to_string());
+                    break;
                 }
             }
             let input_age_ms = base_input_age_ms.map(|base| {

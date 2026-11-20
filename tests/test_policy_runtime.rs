@@ -188,6 +188,7 @@ async fn shadow_mode_runs_and_never_mutates_servo_target() {
         25.0,
         compute_policy_deadline(Some(0.25)).unwrap(),
         None,
+        None,
     );
     for _ in 0..8 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -274,6 +275,7 @@ async fn live_mode_moves_mock_arm_and_enforces_first_step_jump_limit() {
         25.0,
         compute_policy_deadline(Some(0.35)).unwrap(),
         None,
+        None,
     );
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -338,6 +340,7 @@ async fn live_mode_moves_mock_arm_and_enforces_first_step_jump_limit() {
         prepared_jump,
         25.0,
         compute_policy_deadline(Some(0.5)).unwrap(),
+        None,
         None,
     );
     let _ = runner2.await;
@@ -1387,7 +1390,7 @@ async fn inference_error_terminates_action_as_failed_with_code_and_message() {
             })
             .unwrap()
     };
-    let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, None);
+    let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, None, None);
     let _ = runner.await;
 
     {
@@ -1441,7 +1444,7 @@ async fn inference_error_terminates_action_as_failed_with_code_and_message() {
             })
             .unwrap()
     };
-    let runner2 = spawn_policy_runner(sup2.clone(), action_id2, prepared_fail, 25.0, None, None);
+    let runner2 = spawn_policy_runner(sup2.clone(), action_id2, prepared_fail, 25.0, None, None, None);
     let _ = runner2.await;
 
     let inner2 = sup2.inner().read().await;
@@ -1502,7 +1505,7 @@ async fn expired_deadline_before_submission_finishes_done_and_applies_no_target(
             .unwrap()
     };
     let expired = Some(Instant::now() - Duration::from_millis(10));
-    let runner_a = spawn_policy_runner(sup_a.clone(), id_a, prepared_a, 25.0, expired, None);
+    let runner_a = spawn_policy_runner(sup_a.clone(), id_a, prepared_a, 25.0, expired, None, None);
     let _ = runner_a.await;
     {
         let inner = sup_a.inner().read().await;
@@ -1567,7 +1570,7 @@ async fn expired_deadline_before_submission_finishes_done_and_applies_no_target(
     };
     // Deadline is in the future at first check (~0ms), then expires while infer() sleeps 60ms.
     let tight_deadline = Some(Instant::now() + Duration::from_millis(20));
-    let runner_b = spawn_policy_runner(sup_b.clone(), id_b, prepared_b, 25.0, tight_deadline, None);
+    let runner_b = spawn_policy_runner(sup_b.clone(), id_b, prepared_b, 25.0, tight_deadline, None, None);
     let _ = runner_b.await;
 
     assert_eq!(calls.load(Ordering::SeqCst), 1, "infer() must have run once before post-inference deadline check");
@@ -1632,6 +1635,7 @@ async fn deadline_races_tick_wait_and_slow_inference_wait() {
         1.0,
         compute_policy_deadline(Some(0.05)).unwrap(),
         None,
+        None,
     );
     let _ = runner_a.await;
     let elapsed_a = t0_a.elapsed();
@@ -1695,6 +1699,7 @@ async fn deadline_races_tick_wait_and_slow_inference_wait() {
         prepared_b,
         25.0,
         compute_policy_deadline(Some(0.04)).unwrap(),
+        None,
         None,
     );
     let _ = runner_b.await;
@@ -2449,6 +2454,7 @@ async fn slow_inference_updates_input_age_ms_and_does_not_block_current_thread_r
         20.0,
         compute_policy_deadline(Some(0.25)).unwrap(),
         None,
+        None,
     );
 
     // Wait on the single-threaded Tokio executor until infer() is active, prove the event loop
@@ -2538,6 +2544,7 @@ async fn slow_inference_updates_input_age_ms_and_does_not_block_current_thread_r
         prepared_none,
         20.0,
         compute_policy_deadline(Some(0.15)).unwrap(),
+        None,
         None,
     );
     let _ = runner_none.await;
@@ -2734,6 +2741,7 @@ mod tract_e2e {
             25.0,
             compute_policy_deadline(Some(0.15)).unwrap(),
             None,
+            None,
         );
         let _ = runner.await;
 
@@ -2751,6 +2759,89 @@ mod tract_e2e {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn live_policy_rejects_stale_joint_measurement_from_slow_inference() {
+    struct SlowInferBackend;
+
+    impl PolicyBackend for SlowInferBackend {
+        fn backend_name(&self) -> &'static str {
+            "slow_infer_backend"
+        }
+        fn input_dim(&self) -> usize {
+            6
+        }
+        fn output_dim(&self) -> usize {
+            6
+        }
+        fn infer(&mut self, _input: &[f32], output: &mut [f32]) -> Result<(), PolicyError> {
+            std::thread::sleep(Duration::from_millis(280));
+            output.copy_from_slice(&[0.05, 0.0, 0.0, 0.0, 0.0, 0.0]);
+            Ok(())
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let layers = vec![MlpLayerSpec::new(
+        6,
+        6,
+        Activation::None,
+        vec![0.0; 36],
+        vec![0.0; 6],
+    )];
+    write_rmlp_pack(
+        dir.path(),
+        &["j1", "j2", "j3", "j4", "j5", "j6"],
+        "rad",
+        &layers,
+        serde_json::json!({}),
+    );
+    let snap = PolicySnapshot::load_from_dir(dir.path()).unwrap();
+    let contract = StrictPolicyContract::parse(&snap.policy_json_bytes).unwrap();
+    let cfg = make_6dof_config();
+    let prepared = PreparedPolicy::from_backend(snap, contract, Box::new(SlowInferBackend), &cfg).unwrap();
+
+    let sup = Arc::new(ArmSupervisor::new(cfg));
+    let gen = sup.acquire_lease("conn-slow-infer").await.unwrap();
+    sup.set_torque(true).await.unwrap();
+    sup.tick(0.02).await;
+    let epoch = sup.get_observation().await.epoch_id;
+
+    let action_id = {
+        let mut inner = sup.inner().write().await;
+        inner
+            .begin_policy_run(PolicyRunStart {
+                epoch_id: epoch,
+                connection_id: "conn-slow-infer".into(),
+                lease_generation: gen,
+                policy_id: "slow_infer_live".into(),
+                artifact_digest: prepared.artifact_digest().to_string(),
+                backend: prepared.backend_name().to_string(),
+                mode: PolicyMode::Live,
+                sim_only: false,
+                max_first_step_rad: None,
+                max_step_rad: None,
+                tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
+            })
+            .unwrap()
+    };
+
+    let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, None, None);
+    let _ = runner.await;
+
+    let inner = sup.inner().read().await;
+    assert!(
+        inner.servo_target.is_none(),
+        "stale joint measurement from slow inference must not set servo_target"
+    );
+    assert_eq!(inner.last_action.as_ref().unwrap().state, "failed");
+    let pol = inner.policy_observation().unwrap();
+    assert!(!pol.active);
+    assert_eq!(pol.steps, 0);
+    assert_eq!(pol.stop_reason.as_deref(), Some("INPUT_STALE"));
 }
 
 mod phase2_vision {
@@ -3041,6 +3132,7 @@ mod phase2_vision {
             25.0,
             compute_policy_deadline(Some(0.20)).unwrap(),
             Some(src),
+            None,
         );
         let _ = runner.await;
 
@@ -3090,7 +3182,7 @@ mod phase2_vision {
                 })
                 .unwrap()
         };
-        let runner2 = spawn_policy_runner(sup2.clone(), action_id2, prepared2, 25.0, None, None);
+        let runner2 = spawn_policy_runner(sup2.clone(), action_id2, prepared2, 25.0, None, None, None);
         let _ = runner2.await;
         let inner2 = sup2.inner().read().await;
         assert_eq!(inner2.last_action.as_ref().unwrap().state, "failed");
@@ -3287,7 +3379,7 @@ mod phase2_vision {
                     model_generation: Some(1),
                 }))
             });
-            let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(src));
+            let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(src), None);
             let _ = runner.await;
 
             let inner = sup.inner().read().await;
@@ -3337,7 +3429,7 @@ mod phase2_vision {
                     model_generation: Some(1),
                 }))
             });
-            let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(src));
+            let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(src), None);
             let _ = runner.await;
 
             let inner = sup.inner().read().await;
@@ -3386,7 +3478,7 @@ mod phase2_vision {
                     model_generation: Some(1),
                 }))
             });
-            let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(src));
+            let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(src), None);
             let _ = runner.await;
 
             let inner = sup.inner().read().await;
@@ -3461,7 +3553,7 @@ mod phase2_vision {
             })
         });
 
-        let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 30.0, None, Some(src));
+        let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 30.0, None, Some(src), None);
         for _ in 0..50 {
             if sup
                 .get_observation()
@@ -3518,7 +3610,7 @@ mod phase2_vision {
                 model_generation: None,
             }))
         });
-        let runner_m = spawn_policy_runner(sup_m.clone(), id_m, prepared_missing, 25.0, None, Some(src_m));
+        let runner_m = spawn_policy_runner(sup_m.clone(), id_m, prepared_missing, 25.0, None, Some(src_m), None);
         let _ = runner_m.await;
         let inner_m = sup_m.inner().read().await;
         assert_eq!(inner_m.last_action.as_ref().unwrap().state, "failed");
@@ -3599,6 +3691,7 @@ mod phase2_vision {
                 25.0,
                 compute_policy_deadline(Some(0.18)).unwrap(),
                 Some(empty_src()),
+                None,
             );
             let _ = runner.await;
             let pol = sup.get_observation().await.policy.unwrap();
@@ -3661,6 +3754,7 @@ mod phase2_vision {
                 25.0,
                 compute_policy_deadline(Some(0.18)).unwrap(),
                 Some(empty_src()),
+                None,
             );
             let _ = runner.await;
             let inner = sup.inner().read().await;
@@ -3713,7 +3807,7 @@ mod phase2_vision {
                     })
                     .unwrap()
             };
-            let runner = spawn_policy_runner(sup.clone(), id, prepared, 25.0, None, Some(empty_src()));
+            let runner = spawn_policy_runner(sup.clone(), id, prepared, 25.0, None, Some(empty_src()), None);
             let _ = runner.await;
             let inner = sup.inner().read().await;
             assert_eq!(inner.last_action.as_ref().unwrap().state, "failed");
@@ -3790,6 +3884,7 @@ mod phase2_vision {
             30.0,
             compute_policy_deadline(Some(0.35)).unwrap(),
             Some(src),
+            None,
         );
         let _ = runner.await;
 
@@ -3916,7 +4011,7 @@ mod phase2_vision {
                     .unwrap()
             };
 
-            let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(adapter));
+            let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(adapter), None);
             let _ = runner.await;
             server.abort();
 
@@ -4034,7 +4129,7 @@ mod phase2_vision {
             }))
         });
 
-        let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(src));
+        let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(src), None);
 
         // Wait until inference has started (after initial evaluate_vision_frame succeeded),
         // then hold the supervisor write lock past max_staleness_ms before allowing infer to return.
@@ -4394,7 +4489,7 @@ mod phase2_vision {
                 .unwrap()
         };
 
-        let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 12.0, None, Some(adapter));
+        let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 12.0, None, Some(adapter), None);
         let _ = runner.await;
         server.abort();
 
@@ -4514,7 +4609,7 @@ mod phase2_vision {
             })
         });
 
-        let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(src));
+        let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 25.0, None, Some(src), None);
         let _ = runner.await;
 
         let inner = sup.inner().read().await;
@@ -4591,6 +4686,200 @@ mod phase2_vision {
         let feats = extract_top1_box_norm_v1(&frame, &spec)
             .expect("valid detection B should be selected after skipping out-of-range A");
         let expected = [1.0f32, 0.4, 0.4, 0.4, 0.2, 0.7];
+        for i in 0..6 {
+            assert!(
+                (feats[i] - expected[i]).abs() < 1e-6,
+                "feats[{i}]={} vs expected={}",
+                feats[i],
+                expected[i]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_hold_clears_outstanding_live_servo_target() {
+        let dir = tempdir().unwrap();
+        let layers = make_12_to_6_layers();
+        write_rmlp_pack(
+            dir.path(),
+            &["j1", "j2", "j3", "j4", "j5", "j6"],
+            "rad",
+            &layers,
+            serde_json::json!({
+                "vision": {
+                    "source": "detector",
+                    "layout": "top1_box_norm_v1",
+                    "target_label": "cube",
+                    "max_staleness_ms": 500,
+                    "on_target_lost": "hold",
+                    "require_model_generation": false
+                }
+            }),
+        );
+        let cfg = make_6dof_config();
+        let prepared = prepare_policy(dir.path(), &cfg).unwrap();
+
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let gen = sup.acquire_lease("conn-vis-hold-clear").await.unwrap();
+        sup.set_torque(true).await.unwrap();
+        sup.tick(0.02).await;
+        let epoch = sup.get_observation().await.epoch_id;
+
+        let action_id = {
+            let mut inner = sup.inner().write().await;
+            inner
+                .begin_policy_run(PolicyRunStart {
+                    epoch_id: epoch,
+                    connection_id: "conn-vis-hold-clear".into(),
+                    lease_generation: gen,
+                    policy_id: "vis_hold_clear".into(),
+                    artifact_digest: prepared.artifact_digest().to_string(),
+                    backend: prepared.backend_name().to_string(),
+                    mode: PolicyMode::Live,
+                    sim_only: false,
+                    max_first_step_rad: None,
+                    max_step_rad: None,
+                    tag: None,
+                    i_am_at_the_arm: false,
+                    verified_release_gate: None,
+                })
+                .unwrap()
+        };
+
+        let stage = Arc::new(AtomicUsize::new(0));
+        let stage_c = stage.clone();
+        let src = MockVisionSource::new_async(move |after, _| {
+            let stage_c = stage_c.clone();
+            Box::pin(async move {
+                if stage_c.load(Ordering::SeqCst) == 0 {
+                    if after >= 1 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        return Ok(None);
+                    }
+                    return Ok(Some(PolicyVisionFrame {
+                        frame_id: 1,
+                        captured_at: Some(Instant::now()),
+                        detections: vec![make_detection("cube", 0.9, [0.2, 0.3, 0.6, 0.5])],
+                        model_generation: Some(1),
+                    }));
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                Ok(Some(PolicyVisionFrame {
+                    frame_id: after + 1,
+                    captured_at: Some(Instant::now()),
+                    detections: Vec::new(),
+                    model_generation: Some(1),
+                }))
+            })
+        });
+
+        let runner = spawn_policy_runner(sup.clone(), action_id, prepared, 50.0, None, Some(src), None);
+
+        let mut saw_live_target = false;
+        for _ in 0..100 {
+            {
+                let inner = sup.inner().read().await;
+                if inner.servo_target.is_some()
+                    && inner.policy_observation().is_some_and(|p| p.active && p.steps >= 1)
+                {
+                    saw_live_target = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(saw_live_target, "expected first frame with target to set servo_target");
+
+        stage.store(1, Ordering::SeqCst);
+
+        let mut cleared_while_active = false;
+        for _ in 0..100 {
+            {
+                let inner = sup.inner().read().await;
+                if inner.servo_target.is_none() {
+                    assert!(
+                        inner.policy_run_active(),
+                        "policy_run_active() must remain true on Hold"
+                    );
+                    cleared_while_active = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cleared_while_active,
+            "expected Hold on empty detections to clear servo_target while policy remains active"
+        );
+
+        {
+            let mut inner = sup.inner().write().await;
+            assert!(inner.stop_policy_run(Some(action_id), "STOPPED"));
+        }
+        let _ = runner.await;
+    }
+
+    #[tokio::test]
+    async fn http_detector_missing_score_is_rejected_even_with_min_score_zero() {
+        use armd::grasp::HttpDetectionSource;
+        use armd::policy_runtime::{
+            extract_top1_box_norm_v1, DetectionSourceAdapter, VisionFeatureSpec,
+        };
+        use axum::{routing::get, Json, Router};
+
+        let app = Router::new().route(
+            "/api/results/latest",
+            get(|| async {
+                Json(serde_json::json!({
+                    "frame_id": 1,
+                    "age_ms": 5.0,
+                    "width": 640,
+                    "height": 360,
+                    "model_generation": 1,
+                    "detections": [
+                        {"label": "cube", "box_norm": [0.0, 0.0, 0.1, 0.1]},
+                        {"label": "cube", "score": 0.0, "box_norm": [0.2, 0.3, 0.6, 0.5]}
+                    ]
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let http_src = Arc::new(HttpDetectionSource {
+            upstream: DetectorUpstream::parse(&format!("http://{addr}")).unwrap(),
+            image_size_px: [640.0, 360.0],
+        });
+        let adapter = DetectionSourceAdapter(http_src);
+        let frame = adapter
+            .next_frame(0, 200)
+            .await
+            .unwrap()
+            .expect("expected frame from local HTTP detector");
+        server.abort();
+
+        assert_eq!(frame.detections.len(), 2);
+        assert!(!frame.detections[0].raw_score_valid);
+        assert!(frame.detections[1].raw_score_valid);
+        assert!((frame.detections[1].score - 0.0).abs() < 1e-9);
+
+        let spec = VisionFeatureSpec {
+            source: VisionSourceKind::Detector,
+            layout: VisionLayout::Top1BoxNormV1,
+            target_label: Some("cube".into()),
+            min_score: 0.0,
+            max_staleness_ms: 200,
+            max_sync_skew_ms: 200,
+            on_target_lost: VisionTargetLostPolicy::Stop,
+            on_stale: VisionStalePolicy::Stop,
+            require_model_generation: false,
+        };
+        let feats = extract_top1_box_norm_v1(&frame, &spec)
+            .expect("detection B with explicit score 0.0 should be selected after skipping missing-score A");
+        let expected = [1.0f32, 0.4, 0.4, 0.4, 0.2, 0.0];
         for i in 0..6 {
             assert!(
                 (feats[i] - expected[i]).abs() < 1e-6,
@@ -5091,6 +5380,7 @@ mod phase3_release_gate_tests {
             prepared,
             25.0,
             compute_policy_deadline(Some(0.30)).unwrap(),
+            None,
             None,
         );
         for _ in 0..16 {
@@ -5903,6 +6193,165 @@ mod phase3_release_gate_tests {
             ReleaseGate::parse_and_verify(&borderline, &sha, &cfg, &contract, 20.0, &deployment)
                 .unwrap_err();
         assert!(matches!(err2, PolicyError::ReleaseGate(_)), "{err2:?}");
+    }
+
+    #[tokio::test]
+    async fn live_gated_policy_invalidated_on_mid_run_sandbox_scene_change() {
+        let sandbox_dir = tempdir().unwrap();
+        let sandbox = Arc::new(SandboxState::new(sandbox_dir.path().to_path_buf()));
+        let mut cfg = make_6dof_config();
+        cfg.profile_id = Some("b601dm".into());
+        let sup = Arc::new(ArmSupervisor::new(cfg).with_driver(Box::new(DummyRealDriver::new(6))));
+        sup.set_follower("rebot-dm").await;
+        let router = create_router_with_sandbox(sup.clone(), OperatorAuth::disabled(), sandbox.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let tick_sup = sup.clone();
+        let tick_stop = Arc::new(Mutex::new(false));
+        let tick_stop_c = tick_stop.clone();
+        let tick_task = tokio::spawn(async move {
+            loop {
+                if *tick_stop_c.lock().unwrap() {
+                    break;
+                }
+                tick_sup.tick(0.02).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let client = reqwest::Client::new();
+        upload_rmlp_pack(
+            &client,
+            addr,
+            "mid_run_scene_p",
+            vec![0.05, 0.0, 0.0, 0.0, 0.0, 0.0],
+            serde_json::json!({}),
+        )
+        .await;
+        let digest = PolicySnapshot::load_from_dir(&sandbox.policy_dir("mid_run_scene_p").unwrap())
+            .unwrap()
+            .release_digest;
+
+        let (mut ws, _) = connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+        ws.send(Message::Text(
+            serde_json::json!({"type": "acquire_lease", "client_id": "mid_run_scene_test"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let gen = loop {
+            let msg: serde_json::Value =
+                serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+            if msg["type"] == "lease_granted" {
+                break msg["generation"].as_u64().unwrap();
+            }
+        };
+
+        ws.send(Message::Text(
+            serde_json::json!({
+                "type": "command",
+                "request_id": 1,
+                "generation": gen,
+                "epoch_id": 1,
+                "path": "/api/v1/torque",
+                "body": {"enable": true}
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            let msg: serde_json::Value =
+                serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+            if msg["type"] == "command_ack" {
+                break;
+            }
+        }
+
+        let mut gate_ws = make_valid_gate(&digest, "supervised_first_run", "b601dm", 20, 0.3, "rad");
+        gate_ws["scene_id"] = serde_json::json!("default");
+        gate_ws["tool_id"] = serde_json::json!("default");
+        gate_ws["calibration_digest"] = serde_json::json!(EMPTY_CALIBRATION_DIGEST);
+
+        ws.send(Message::Text(
+            serde_json::json!({
+                "type": "command",
+                "request_id": 2,
+                "generation": gen,
+                "epoch_id": 1,
+                "path": "/api/v1/action/policy/start",
+                "body": {
+                    "policy_id": "mid_run_scene_p",
+                    "mode": "live_gated",
+                    "fps": 20.0,
+                    "i_am_at_the_arm": true,
+                    "release_gate": gate_ws
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        let ack = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let txt = ws.next().await.unwrap().unwrap().into_text().unwrap();
+                let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+                if v["type"] == "command_ack" || v["type"] == "command_reject" {
+                    return v;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+
+        let mut ran_step = false;
+        for _ in 0..100 {
+            let obs = sup.get_observation().await;
+            if obs.policy.as_ref().is_some_and(|p| p.active && p.steps >= 1) {
+                ran_step = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ran_step, "expected live_gated policy to complete at least 1 step");
+
+        sandbox.active.write().await.active_scene = "pcb_suction".into();
+
+        let mut terminated = false;
+        for _ in 0..150 {
+            let obs = sup.get_observation().await;
+            if obs.policy.as_ref().is_some_and(|p| !p.active) {
+                terminated = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(terminated, "expected live_gated policy to terminate after scene change");
+
+        {
+            let inner = sup.inner().read().await;
+            assert!(
+                inner.servo_target.is_none(),
+                "DEPLOYMENT_CHANGED must clear servo_target"
+            );
+            assert_eq!(inner.last_action.as_ref().unwrap().state, "failed");
+            let pol = inner.policy_observation().unwrap();
+            assert_eq!(pol.stop_reason.as_deref(), Some("DEPLOYMENT_CHANGED"));
+            assert!(pol.steps >= 1);
+        }
+
+        *tick_stop.lock().unwrap() = true;
+        let _ = tick_task.await;
     }
 }
 

@@ -31,8 +31,8 @@ pub use release_gate::{
 pub use runner::{
     compute_policy_deadline, parse_policy_start_request, prepare_policy, spawn_policy_runner,
     validate_policy_fps, PolicyMode, PolicyRun, PolicyRunStart, PolicyStartRequest, PreparedPolicy,
-    DEFAULT_MAX_FIRST_STEP_RAD, DEFAULT_POLICY_FPS, MAX_POLICY_FPS, MAX_POLICY_SECONDS,
-    MIN_LIVE_POLICY_FPS, MIN_POLICY_FPS,
+    DEFAULT_MAX_FIRST_STEP_RAD, DEFAULT_POLICY_FPS, MAX_LIVE_PROPRIO_AGE_MS, MAX_POLICY_FPS,
+    MAX_POLICY_SECONDS, MIN_LIVE_POLICY_FPS, MIN_POLICY_FPS,
 };
 #[cfg(feature = "policy-tract")]
 pub use tract_backend::TractBackend;
