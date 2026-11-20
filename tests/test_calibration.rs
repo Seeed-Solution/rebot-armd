@@ -67,7 +67,7 @@ fn calib_file(q: [f64; 4]) -> CalibrationFile {
     CalibrationFile {
         camera_mount: CameraMount { offset_m: Some([-0.0731, 0.0005, 0.066]), q_end_cam: Some(q), ..Default::default() },
         intrinsics: Some(json!({"fx": 830.0})), table_z_m: Some(0.01), solved_at: Some("2026-11-17T00:00:00Z".into()), rms: None,
-        kinematics: None, stale: None, joint_zero: None,
+        kinematics: None, stale: None, joint_zero: None, ..Default::default()
     }
 }
 
@@ -943,4 +943,216 @@ async fn revert_preserves_calibration_file_when_backup_read_fails() {
         r.deps.path.is_file(),
         "official calibration.json must NOT be deleted when backup read fails with a non-NotFound error"
     );
+}
+
+// ---- T20: fingertip, acceptance, table height source, effective floor ----
+
+fn tool_body(x_fp: &str) -> Value {
+    json!({"tool_id": "b601dm_gripper", "tip_cam_m": [-0.0001, 0.01058, 0.09541], "gripper_opening": 0.0, "x_fingerprint": x_fp,
+        "fit": {"frames": 16, "reproj_px": 0.06, "gap_px": 1.9, "std_mm": 0.014}})
+}
+
+fn acceptance_body(fp: &str, table_z: f64, passed: bool) -> Value {
+    json!({"fingerprint": fp, "gate_version": 1, "passed": passed, "board": {"cols": 4, "rows": 3, "marker_side_m": 0.025, "gap_m": 0.005},
+        "points": [{"corner": [0, 0], "height_mm": 12.1, "xy_err_mm": 1.2}], "summary": {"table_z_m": table_z, "optical_table_z_m": 0.022, "height_spread_mm": 1.3},
+        "job_id": "hv-1"})
+}
+
+/// Dry runs give the candidate's fingerprints; returns (x_fingerprint, fingerprint with the tool).
+async fn candidate_fingerprints(r: &mut Rig) -> (String, String) {
+    let dry = cmd(r, "/api/v1/calibration/apply", apply_body(true)).await;
+    let x_fp = dry["after"]["x_fingerprint"].as_str().unwrap().to_string();
+    let mut b = apply_body(true);
+    b["tool"] = tool_body(&x_fp);
+    let dry = cmd(r, "/api/v1/calibration/apply", b).await;
+    assert_eq!(dry["after"]["tool"]["edge_to_low_m"], json!(0.0023), "edge from the profile's calibration_tool: {dry}");
+    assert_eq!(dry["after"]["x_fingerprint"].as_str().unwrap(), x_fp);
+    (x_fp, dry["after"]["fingerprint"].as_str().unwrap().to_string())
+}
+
+fn hover_body(x_fp: &str, fp: &str, table_z: f64) -> Value {
+    let mut b = apply_body(false);
+    b["table_z_m"] = json!(table_z);
+    b["table_z_source"] = json!("hover");
+    b["tool"] = tool_body(x_fp);
+    b["acceptance"] = acceptance_body(fp, table_z, true);
+    b
+}
+
+async fn floor(r: &Rig) -> (f32, &'static str) {
+    let inner = r.sup.inner().read().await;
+    (inner.config.workspace.as_ref().unwrap().floor_z_m, inner.floor_source)
+}
+
+#[tokio::test]
+async fn floor_follows_the_calibrated_table_height_in_every_check() {
+    let mut r = rig().await;
+    assert_eq!(floor(&r).await, (0.0, "profile"));
+    let reply = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    assert_eq!(reply["type"], "command_ack", "{reply}");
+    let (f, src) = floor(&r).await;
+    assert!((f64::from(f) - 0.009).abs() < 1e-6 && src == "calibration_camera", "{f} {src}");
+    let inner = r.sup.inner().read().await;
+    // safety description and GET /api/v1/calibration report profile and effective floor
+    let ws = &inner.safety_describe()["limits"]["workspace"];
+    assert_eq!(ws["profile_floor_z_m"], json!(0.0), "{ws}");
+    assert!((ws["effective_floor_z_m"].as_f64().unwrap() - 0.009).abs() < 1e-6 && ws["floor_source"] == "calibration_camera", "{ws}");
+    // parity: the end-point check and the link-capsule check refuse a point between the profile floor
+    // and the effective floor
+    let (wsp, cam) = inner.workspace_policy().unwrap();
+    assert!((f64::from(wsp.floor_z_m) - 0.009).abs() < 1e-6);
+    let pose = k::Pose::new(crate_look_down(), [0.30, 0.0, 0.005]);
+    let v = k::workspace_violation_pose(&pose, wsp, cam);
+    assert!(v.worst.is_some_and(|w| w.limit == "floor" && (w.bound - 0.009).abs() < 1e-6), "{v:?}");
+    // joint positions that pass the profile floor and fail the effective one: the full check
+    // (end points + link capsules) and the swept-path check refuse them at the effective floor
+    let arm = &inner.config.arm_model;
+    let mut ws0 = wsp.clone();
+    ws0.floor_z_m = 0.0;
+    let mut seed: u64 = 0x5eed;
+    let mut rnd = |lo: f32, hi: f32| { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); lo + (hi - lo) * ((seed >> 40) as f32 / (1u64 << 24) as f32) };
+    let lim: Vec<(f32, f32)> = inner.config.limits.iter().map(|l| (l.min_position, l.max_position)).collect();
+    let found = (0..400_000).map(|_| lim.iter().map(|(lo, hi)| rnd(*lo, *hi)).collect::<Vec<f32>>()).find(|q| {
+        arm.workspace_violation(q, &ws0, cam).total == 0.0 && arm.workspace_violation(q, wsp, cam).worst.is_some_and(|w| w.limit == "floor")
+    });
+    let q = found.expect("a pose between the two floors");
+    let v = arm.workspace_violation(&q, wsp, cam);
+    assert!(v.worst.is_some_and(|w| (w.bound - 0.009).abs() < 1e-6), "{v:?}");
+    let start = inner.config.home_positions.clone();
+    assert!(inner.check_workspace_path(&start, [q.as_slice()]).is_err(), "swept-path check uses the effective floor");
+    drop(inner);
+    let status: Value = reqwest::get(format!("http://{}/api/v1/calibration", r.addr)).await.unwrap().json().await.unwrap();
+    assert_eq!(status["floor"]["source"], "calibration_camera", "{status}");
+    assert_eq!(status["verification"]["table_z_source"], "camera");
+    assert_eq!(status["calibration"]["table_z_source"], "camera");
+    // restore of the empty backup: the profile floor again
+    let name = Path::new(reply["backup"].as_str().unwrap()).file_name().unwrap().to_string_lossy().into_owned();
+    let back = cmd(&mut r, "/api/v1/calibration/restore", json!({"backup": name})).await;
+    assert_eq!(back["type"], "command_ack", "{back}");
+    assert_eq!(floor(&r).await, (0.0, "profile"));
+}
+
+fn crate_look_down() -> [[f64; 3]; 3] { armd::grasp::look_down(&k::IDENTITY) }
+
+#[tokio::test]
+async fn hover_table_height_needs_a_bound_tool_and_a_passed_acceptance() {
+    let mut r = rig().await;
+    let (x_fp, fp) = candidate_fingerprints(&mut r).await;
+    // stale bindings and missing pieces are refused before any write
+    let mut b = hover_body("0000000000000000", &fp, 0.0098);
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", b.clone()).await;
+    assert_eq!(rej["code"], "TOOL_STALE", "{rej}");
+    b = hover_body(&x_fp, "0000000000000000", 0.0098);
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", b).await;
+    assert_eq!(rej["code"], "ACCEPTANCE_STALE", "{rej}");
+    b = hover_body(&x_fp, &fp, 0.0098);
+    b["acceptance"]["passed"] = json!(false);
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", b).await;
+    assert_eq!(rej["code"], "TABLE_Z_UNVERIFIED", "{rej}");
+    b = hover_body(&x_fp, &fp, 0.0098);
+    b["acceptance"]["summary"]["table_z_m"] = json!(0.02);
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", b).await;
+    assert_eq!(rej["code"], "INVALID_COMMAND", "{rej}");
+    b = hover_body(&x_fp, &fp, 0.0098);
+    b["tool"]["edge_to_low_m"] = json!(0.001);
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", b).await;
+    assert_eq!(rej["code"], "INVALID_COMMAND", "edge_to_low_m comes from the profile: {rej}");
+    assert_eq!(backups(&r), 0);
+    assert_eq!(floor(&r).await, (0.0, "profile"));
+    // an unknown tool: stored without edge, a hover table height is refused
+    let mut b = hover_body(&x_fp, &fp, 0.0098);
+    b["tool"]["tool_id"] = json!("suction_v1");
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", b).await;
+    assert!(rej["code"] == "ACCEPTANCE_STALE" || rej["code"] == "TABLE_Z_UNVERIFIED", "{rej}");
+    // the real apply
+    let reply = cmd(&mut r, "/api/v1/calibration/apply", hover_body(&x_fp, &fp, 0.0098)).await;
+    assert_eq!(reply["type"], "command_ack", "{reply}");
+    let file: CalibrationFile = serde_json::from_str(&std::fs::read_to_string(&r.deps.path).unwrap()).unwrap();
+    assert_eq!(file.table_z_source.as_deref(), Some("hover"));
+    assert_eq!(file.tool.as_ref().unwrap().edge_to_low_m, Some(0.0023));
+    assert_eq!(file.acceptance.as_ref().unwrap().fingerprint, fp);
+    let (f, src) = floor(&r).await;
+    assert!((f64::from(f) - 0.0068).abs() < 1e-6 && src == "calibration_hover", "{f} {src}");
+    let status: Value = reqwest::get(format!("http://{}/api/v1/calibration", r.addr)).await.unwrap().json().await.unwrap();
+    let v = &status["verification"];
+    assert_eq!((v["tool_valid"].as_bool(), v["acceptance_valid"].as_bool(), v["fingerprint"].as_str()), (Some(true), Some(true), Some(fp.as_str())), "{v}");
+    // tip_end = X · tip_cam (X of the applied mount)
+    let tip_end = v["tip_end_m"].as_array().unwrap();
+    let q = q_tilt(-15.0);
+    let p = k::mat_vec(&k::quat_to_r(&q), &[-0.0001, 0.01058, 0.09541]);
+    let want = [p[0] - 0.0728, p[1] + 0.0012, p[2] + 0.0655];
+    for i in 0..3 { assert!((tip_end[i].as_f64().unwrap() - want[i]).abs() < 1e-6, "{tip_end:?} vs {want:?}"); }
+    assert_eq!(status["floor"]["source"], "calibration_hover");
+    // a camera re-apply with the same X keeps the fingertip and drops the acceptance
+    let reply = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    assert_eq!(reply["type"], "command_ack", "{reply}");
+    let inner = r.sup.inner().read().await;
+    let c = inner.calibration.as_ref().unwrap();
+    assert!(c.tool.is_some() && c.acceptance.is_none() && c.table_z_source.as_deref() == Some("camera"));
+    drop(inner);
+    // a new X drops the fingertip
+    let reply = cmd(&mut r, "/api/v1/calibration/apply", apply_body_q(false, q_tilt(-20.0))).await;
+    assert_eq!(reply["type"], "command_ack", "{reply}");
+    assert!(r.sup.inner().read().await.calibration.as_ref().unwrap().tool.is_none());
+}
+
+#[tokio::test]
+async fn zero_and_stale_restore_invalidate_the_hover_table_height() {
+    let mut r = rig().await;
+    let (x_fp, fp) = candidate_fingerprints(&mut r).await;
+    let reply = cmd(&mut r, "/api/v1/calibration/apply", hover_body(&x_fp, &fp, 0.0098)).await;
+    assert_eq!(reply["type"], "command_ack", "{reply}");
+    // a second apply backs up the accepted state
+    let reply = cmd(&mut r, "/api/v1/calibration/apply", apply_body(false)).await;
+    let accepted_backup = Path::new(reply["backup"].as_str().unwrap()).file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(floor(&r).await.1, "calibration_camera");
+    // restore it: acceptance valid again (same joint zero)
+    let back = cmd(&mut r, "/api/v1/calibration/restore", json!({"backup": accepted_backup})).await;
+    assert_eq!(back["type"], "command_ack", "{back}");
+    assert_eq!(floor(&r).await.1, "calibration_hover");
+    // a (software) zero: acceptance invalidated, calibration stale, profile floor
+    let zero = armd::joint_zero::JointZero::new(&[0.0; 7], "motor", "rest");
+    let inv = calibration::invalidate_after_zero(&r.sup, &r.deps, &[2], &[0.001], "motor", Some(Some(zero))).await;
+    assert_eq!(inv["camera_stale"], json!(true), "{inv}");
+    assert_eq!(floor(&r).await, (0.0, "profile"));
+    let file: CalibrationFile = serde_json::from_str(&std::fs::read_to_string(&r.deps.path).unwrap()).unwrap();
+    assert!(file.acceptance.as_ref().unwrap().invalidated.is_some());
+    // restoring the accepted backup after the zero: the live zero record is kept, the acceptance
+    // fingerprint no longer matches -> not valid, no hover floor
+    let back = cmd(&mut r, "/api/v1/calibration/restore", json!({"backup": accepted_backup})).await;
+    assert_eq!(back["type"], "command_ack", "{back}");
+    let inner = r.sup.inner().read().await;
+    let (_, live_fp) = calibration::live_fingerprints(&inner);
+    let c = inner.calibration.as_ref().unwrap();
+    assert!(c.stale.is_none() && c.acceptance.as_ref().is_some_and(|a| a.fingerprint != live_fp), "restored acceptance kept but stale");
+    assert!(!calibration::acceptance_valid(c, &live_fp));
+    assert_eq!((inner.config.workspace.as_ref().unwrap().floor_z_m, inner.floor_source), (0.0, "profile"));
+}
+
+#[tokio::test]
+async fn failed_hover_apply_rolls_the_floor_back() {
+    let mut r = rig_with(|d| { std::fs::create_dir(d.join("gs")).unwrap(); (d.join("calibration.json"), d.join("gs")) }).await;
+    let (x_fp, fp) = candidate_fingerprints(&mut r).await;
+    let rej = cmd(&mut r, "/api/v1/calibration/apply", hover_body(&x_fp, &fp, 0.0098)).await;
+    assert_eq!((rej["code"].as_str(), rej["reverted"].as_bool()), (Some("PERSIST_FAILED"), Some(true)), "{rej}");
+    assert_eq!(floor(&r).await, (0.0, "profile"));
+    assert_unchanged(&r).await;
+}
+
+#[test]
+fn legacy_calibration_files_read_with_acceptance_unknown() {
+    let legacy = r#"{"camera_mount": {"offset_m": [-0.07, 0.0, 0.066], "q_end_cam": [1, 0, 0, 0]}, "intrinsics": {"fx": 830.0}, "table_z_m": 0.024}"#;
+    let c: CalibrationFile = serde_json::from_str(legacy).unwrap();
+    c.validate().unwrap();
+    assert!(c.acceptance.is_none() && c.tool.is_none() && c.table_z_source.is_none());
+    let (eff, src, z) = calibration::effective_floor(0.0, Some(&c), "x");
+    assert!((f64::from(eff) - 0.021).abs() < 1e-6 && src == "calibration_camera" && z == Some(0.024));
+    // a table height below the profile floor leaves the profile floor
+    let low = CalibrationFile { table_z_m: Some(-0.01), ..c.clone() };
+    assert_eq!(calibration::effective_floor(0.0, Some(&low), "x").0, 0.0);
+    // hover source without a valid acceptance: profile floor
+    let hover = CalibrationFile { table_z_source: Some("hover".into()), ..c.clone() };
+    assert_eq!(calibration::effective_floor(0.0, Some(&hover), "x").1, "profile");
+    let bad = CalibrationFile { table_z_source: Some("manual".into()), ..c };
+    assert!(bad.validate().is_err());
 }

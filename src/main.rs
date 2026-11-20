@@ -311,6 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     armd::poses::load_into(&supervisor, &armd::poses::path_from_env()).await;
     armd::sequences::load_into(&supervisor, &armd::sequences::path_from_env()).await;
+    armd::calib_hover::load_into(&supervisor, &armd::calibration::path_from_env()).await;
     armd::collision::load_into(&supervisor, &armd::collision::path_from_env()).await;
     match follower {
         "rebot-rs" | "rebot-dm" => {

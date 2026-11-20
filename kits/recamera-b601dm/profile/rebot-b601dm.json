@@ -666,5 +666,9 @@
       0.0
     ],
     "name": "rest"
+  },
+  "calibration_tool": {
+    "tool_id": "b601dm_gripper",
+    "edge_to_low_m": 0.0023
   }
 }

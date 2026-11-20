@@ -134,6 +134,8 @@ pub fn create_router_calibration_with_auth(
         .route("/api/v1/auth/unlock", post(rest::auth_unlock))
         .route("/api/v1/auth/lock", post(rest::auth_lock))
         .route("/api/v1/calibration", get(rest::get_calibration))
+        .route("/api/v1/calibration/hover", get(crate::calib_hover::get_jobs))
+        .route("/api/v1/calibration/hover/{id}", get(crate::calib_hover::get_job))
         .route(
             "/api/v1/calibration/sessions",
             get(crate::calibration_sessions::get_sessions)
@@ -247,6 +249,7 @@ pub fn create_router_calibration_with_auth(
                 .layer(middleware::from_fn(require_operator_for_writes)),
         )
         .route("/api/v1/detection/latest", get(proxy::get_detection_latest))
+        .route("/api/v1/camera/snapshot", get(proxy::get_camera_snapshot))
         .route("/api/v1/detection/trigger", post(proxy::post_detection_trigger).layer(middleware::from_fn(require_operator)))
         .route(
             "/api/v1/detection/mask_focus",

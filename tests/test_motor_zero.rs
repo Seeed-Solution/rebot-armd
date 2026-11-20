@@ -161,7 +161,7 @@ fn calibrated(dir: &Path) {
     let file = CalibrationFile {
         camera_mount: CameraMount { offset_m: Some([-0.0731, 0.0005, 0.066]), q_end_cam: Some(q), ..Default::default() },
         intrinsics: Some(json!({"fx": 830.0})), table_z_m: Some(0.01), solved_at: Some("2026-11-17T00:00:00Z".into()), rms: None,
-        kinematics: Some(kin()), stale: None, joint_zero: None,
+        kinematics: Some(kin()), stale: None, joint_zero: None, ..Default::default()
     };
     std::fs::write(dir.join("calibration.json"), serde_json::to_string(&file).unwrap()).unwrap();
 }

@@ -44,7 +44,7 @@ fn dm_urdf_profile_matches_builtin_profile() {
     // built-in model only.
     let (cu, cb) = (armd::model::Capabilities::from_config(&urdf), armd::model::Capabilities::from_config(&builtin));
     assert!(!cu.calibration_kinematics && cb.calibration_kinematics);
-    assert_eq!(armd::model::Capabilities { calibration_kinematics: true, ..cu }, cb);
+    assert_eq!(armd::model::Capabilities { calibration_kinematics: true, calibration_verify: true, ..cu }, cb);
     // Same workspace check results over a sweep (reach origin differs by 1.6e-7 m).
     let ws = builtin.workspace.clone().unwrap();
     let mut x = 0.123f64;

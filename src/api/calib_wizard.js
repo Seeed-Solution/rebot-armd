@@ -147,6 +147,11 @@ export const rpyR = (r, p, y) => {
   const cr = Math.cos(r), sr = Math.sin(r), cp = Math.cos(p), sp = Math.sin(p), cy = Math.cos(y), sy = Math.sin(y);
   return [[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr], [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr], [-sp, cp * sr, cp * cr]];
 };
+// rpy (rad, URDF fixed axis, R = Rz(y) Ry(p) Rx(r)) that gives R back also at pitch +-90 deg (tool down): roll 0 there
+export function rpyOfR(R) {
+  if (Math.hypot(R[0][0], R[1][0]) < 1e-6) return [0, Math.asin(Math.min(1, Math.max(-1, -R[2][0]))), Math.atan2(-R[0][1], R[1][1])];
+  return [Math.atan2(R[2][1], R[2][2]), Math.asin(Math.min(1, Math.max(-1, -R[2][0]))), Math.atan2(R[1][0], R[0][0])];
+}
 export const rpyDeg = (R) => [Math.atan2(R[2][1], R[2][2]) * D, Math.asin(Math.min(1, Math.max(-1, -R[2][0]))) * D, Math.atan2(R[1][0], R[0][0]) * D];
 
 // ---------------------------------------------------------------- camera model
@@ -215,6 +220,38 @@ export function boardSvg(board, { title = 'reBot calibration board' } = {}) {
   s += `<text x="${rx}" y="${ry + 5}" font-size="3" font-family="sans-serif">100 mm: measure after printing (no page scaling)</text>`;
   return s + '</svg>';
 }
+
+// fingertip sticker (T20; constants and measurement in the "fingertip sticker" section below)
+// printable SVG at 1:1 scale (mm units): four stickers (solid outline to cut along, heavy bottom edge = tip edge),
+// a 50 mm ruler, the instructions in both languages
+export function stickerSvg(st = STICKER, { count = 4, title = 'reBot fingertip sticker / 指尖贴纸' } = {}) {
+  const W = st.widthMm, H = st.heightMm, r = st.dotMm / 2, gapX = 14, margin = 10, topY = margin + 30;
+  const pageW = Math.max(2 * margin + count * W + (count - 1) * gapX, 120), pageH = topY + H + 26;
+  const lines = [
+    'Print at 100 % (no fit-to-page). Check the 50 mm ruler. 打印比例 100%（不要缩放），用 50 mm 标尺核对。',
+    'Cut along the thin outline. Heavy edge flush with the fingertip, dots toward the wrist. 沿细线剪下，粗边与指尖平齐，圆点朝手腕。',
+    'The sticker must lie flat on the camera-facing finger face. 贴纸要平贴在朝向相机的手指面上。',
+  ];
+  let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${pageW}mm" height="${pageH}mm" viewBox="0 0 ${pageW} ${pageH}">`;
+  s += `<rect width="${pageW}" height="${pageH}" fill="#fff"/>`;
+  s += `<text x="${margin}" y="${margin + 4}" font-size="4.5" font-family="sans-serif">${title}</text>`;
+  lines.forEach((t, i) => { s += `<text x="${margin}" y="${margin + 10 + i * 4.2}" font-size="2.6" font-family="sans-serif">${t}</text>`; });
+  for (let k = 0; k < count; k++) {
+    const x0 = margin + k * (W + gapX), y1 = topY + H; // y1 = bottom edge (tip)
+    s += `<rect x="${x0}" y="${topY}" width="${W}" height="${H}" fill="none" stroke="#888" stroke-width="0.2"/>`;
+    for (const L of st.rowsMm) for (const dx of [-st.columnsMm / 2, st.columnsMm / 2]) {
+      s += `<circle cx="${(x0 + W / 2 + dx).toFixed(3)}" cy="${(y1 - L).toFixed(3)}" r="${r}" fill="#000"/>`;
+    }
+    s += `<path d="M ${x0} ${y1} h ${W}" stroke="#000" stroke-width="0.5"/>`;
+    s += `<text x="${x0}" y="${y1 + 4}" font-size="2.4" font-family="sans-serif">▲ tip / 指尖</text>`;
+  }
+  const rx = margin, ry = pageH - 8;
+  s += `<path d="M ${rx} ${ry} h 50" stroke="#000" stroke-width="0.4"/>`;
+  for (let k = 0; k <= 10; k++) s += `<path d="M ${rx + 5 * k} ${ry} v ${k % 2 ? -2.5 : -4}" stroke="#000" stroke-width="0.3"/>`;
+  s += `<text x="${rx + 53}" y="${ry}" font-size="3" font-family="sans-serif">50 mm · dots d ${st.dotMm} mm, rows ${st.rowsMm.join(' / ')} mm, columns ${st.columnsMm} mm</text>`;
+  return s + '</svg>';
+}
+
 
 // ---------------------------------------------------------------- correspondences
 // A view: { markers: [{ id, corners: [[u, v] x 4] }], q?: model angles, G?: T_base_end }
@@ -1316,4 +1353,408 @@ export function* solveFineSteps({ views, markerSide = BOARD_DEFAULT.markerSide, 
     ...(solvedAt ? { solved_at: solvedAt } : {}),
   };
   return res;
+}
+
+// ---------------------------------------------------------------- fingertip sticker (T20)
+/* A 2 x 2 dot sticker on the camera-facing finger face, its bottom edge flush with the fingertip, dots toward
+   the wrist. The camera is ~9 cm from it and heavily defocused, so the dots are measured as darkness-weighted
+   centroids (no edges): Otsu threshold in a bottom-centre ROI, connected components, the four largest blobs,
+   weights (white - gray) inside each blob dilated by 5 px. The camera looks forward-down: the TOP image row of
+   dots is the tip-side row (rows[0] mm from the edge). Planar PnP by IPPE gives two poses; the one with the
+   lower reprojection wins and the runner-up must be clearly worse (ambiguity gap). Sticker frame: origin = the
+   centre of the bottom edge (the fingertip), x = image left -> right across the columns, y = toward the wrist
+   (along the rows), z = x × y. tip_cam = the sticker origin in the camera frame (OpenCV axes). */
+export const STICKER = Object.freeze({ dotMm: 4, rowsMm: Object.freeze([10, 16]), columnsMm: 8.8, widthMm: 16, heightMm: 20.5 });
+// ROI in content pixels (640 x 360): bottom centre, where the fingertip sits in the image of the v8 holder
+export const STICKER_ROI = Object.freeze({ x0: 225, y0: 275, x1: 440, y1: 360 });
+export const STICKER_GATES = Object.freeze({ reprojPx: 0.5, gapPx: 0.5, stdMm: 0.5, minFrames: 3, minArea: 60, maxAspect: 3.5 });
+
+export function stickerObject(st = STICKER) {
+  const s = st.columnsMm / 2000, [a, b] = st.rowsMm.map((v) => v / 1000);
+  return [[-s, a, 0], [s, a, 0], [-s, b, 0], [s, b, 0]];
+}
+
+// rows of the 640 x 360 content inside a decoded frame: rebot-vision snapshots may be letterboxed to a square
+// (640 x 640, content rows 140..499); other sizes are scaled to 640 wide
+export function contentBand(w, h, size = IMAGE) {
+  const scale = size.width / w, ch = size.height / scale;
+  return { scale, y0: h > ch + 1 ? Math.round((h - ch) / 2) : 0, height: Math.min(h, Math.round(ch)) };
+}
+// RGBA pixels of a decoded frame -> 8-bit gray of the content image (640 x 360) using ITU-R BT.601 luma
+export function grayContent(rgba, w, h, size = IMAGE) {
+  const { scale, y0 } = contentBand(w, h, size), W = size.width, H = size.height, g = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++) {
+    const sy = Math.min(h - 1, y0 + Math.floor(y / scale));
+    for (let x = 0; x < W; x++) {
+      const sx = Math.min(w - 1, Math.floor(x / scale)), i = (sy * w + sx) * 4;
+      g[y * W + x] = Math.round(0.299 * rgba[i] + 0.587 * rgba[i + 1] + 0.114 * rgba[i + 2]);
+    }
+  }
+  return g;
+}
+// Otsu threshold of 8-bit values (as cv::threshold THRESH_OTSU): the level t maximising the between-class variance
+// of {v <= t} and {v > t}
+export function otsu(values) {
+  const hist = new Float64Array(256);
+  for (const v of values) hist[v]++;
+  const n = values.length, EPS = 1.1920929e-7;
+  let mu = 0; for (let i = 0; i < 256; i++) mu += i * hist[i] / n;
+  let q1 = 0, mu1 = 0, best = 0, t = 0;
+  for (let i = 0; i < 256; i++) {
+    const p = hist[i] / n;
+    mu1 *= q1; q1 += p;
+    const q2 = 1 - q1;
+    if (Math.min(q1, q2) < EPS || Math.max(q1, q2) > 1 - EPS) continue;
+    mu1 = (mu1 + i * p) / q1;
+    const mu2 = (mu - q1 * mu1) / q2, sigma = q1 * q2 * (mu1 - mu2) ** 2;
+    if (sigma > best) { best = sigma; t = i; }
+  }
+  return t;
+}
+// percentile with linear interpolation (numpy default)
+function percentile(values, p) {
+  const a = Float64Array.from(values).sort(), x = (a.length - 1) * p / 100, i = Math.floor(x);
+  return i + 1 < a.length ? a[i] + (a[i + 1] - a[i]) * (x - i) : a[i];
+}
+// 8-connected components of a 0/1 mask -> { labels (Int32Array, 0 = background), comps: [{ label, x, y, w, h, area }] }
+export function components(mask, w, h) {
+  const labels = new Int32Array(w * h), comps = [], stack = [];
+  for (let s = 0; s < w * h; s++) {
+    if (!mask[s] || labels[s]) continue;
+    const label = comps.length + 1; let x0 = w, y0 = h, x1 = -1, y1 = -1, area = 0;
+    labels[s] = label; stack.push(s);
+    while (stack.length) {
+      const p = stack.pop(), px = p % w, py = (p - px) / w;
+      area++; if (px < x0) x0 = px; if (px > x1) x1 = px; if (py < y0) y0 = py; if (py > y1) y1 = py;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = px + dx, ny = py + dy;
+        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+        const q = ny * w + nx;
+        if (mask[q] && !labels[q]) { labels[q] = label; stack.push(q); }
+      }
+    }
+    comps.push({ label, x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1, area });
+  }
+  return { labels, comps };
+}
+/* The four dot centroids in one content frame (gray 640 x 360). Returns { ok, points: [top-left, top-right,
+   bottom-left, bottom-right] (content px), blobs, threshold, why } with why = 'dots' (fewer than four blobs). */
+export function detectStickerDots(gray, { size = IMAGE, roi = STICKER_ROI, gates = STICKER_GATES, pad = 5 } = {}) {
+  const W = size.width, rw = roi.x1 - roi.x0, rh = roi.y1 - roi.y0, g = new Float32Array(rw * rh), g8 = new Uint8Array(rw * rh);
+  for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) { const v = gray[(roi.y0 + y) * W + roi.x0 + x]; g[y * rw + x] = v; g8[y * rw + x] = v; }
+  const t = otsu(g8), mask = new Uint8Array(rw * rh);
+  for (let i = 0; i < mask.length; i++) mask[i] = g8[i] <= t ? 1 : 0;
+  const { labels, comps } = components(mask, rw, rh), white = percentile(g, 90), blobs = [];
+  for (const c of comps) {
+    if (c.area < gates.minArea || c.w / c.h > gates.maxAspect || c.x === 0 || c.x + c.w >= rw) continue;
+    const sx = Math.max(c.x - pad, 0), sy = Math.max(c.y - pad, 0), ex = Math.min(c.x + c.w + pad, rw), ey = Math.min(c.y + c.h + pad, rh);
+    let s = 0, sxw = 0, syw = 0;
+    for (let y = sy; y < ey; y++) for (let x = sx; x < ex; x++) {
+      // dilation of the blob by a (2 pad + 1)^2 square inside the window
+      let inBlob = false;
+      for (let yy = Math.max(sy, y - pad); yy <= Math.min(ey - 1, y + pad) && !inBlob; yy++)
+        for (let xx = Math.max(sx, x - pad); xx <= Math.min(ex - 1, x + pad); xx++) if (labels[yy * rw + xx] === c.label) { inBlob = true; break; }
+      if (!inBlob) continue;
+      const wgt = Math.max(white - g[y * rw + x], 0);
+      s += wgt; sxw += wgt * x; syw += wgt * y;
+    }
+    if (s > 0) blobs.push({ area: c.area, u: sxw / s + roi.x0, v: syw / s + roi.y0, w: c.w, h: c.h });
+  }
+  blobs.sort((a, b) => b.area - a.area);
+  const four = blobs.slice(0, 4);
+  if (four.length < 4) return { ok: false, why: 'dots', blobs, threshold: t, points: null };
+  four.sort((a, b) => a.v - b.v);
+  const top = four.slice(0, 2).sort((a, b) => a.u - b.u), bot = four.slice(2).sort((a, b) => a.u - b.u);
+  return { ok: true, points: [...top, ...bot].map((b) => [b.u, b.v]), blobs: four, threshold: t, white };
+}
+
+/* IPPE (Collins & Bartoli 2014, "Infinitesimal Plane-Based Pose Estimation") for points on the z = 0 plane.
+   obj: [[X, Y, 0]] (n >= 4), nrm: ideal normalised image points. Returns both poses [{ R, t }] (T_cam_obj). */
+export function ippe(obj, nrm) {
+  const n = obj.length, m = [0, 0];
+  for (const p of obj) { m[0] += p[0] / n; m[1] += p[1] / n; }
+  const P = obj.map((p) => [p[0] - m[0], p[1] - m[1]]);
+  const H = homography(P, nrm);
+  if (!H) return [];
+  const h22 = H[2][2], Hn = H.map((r) => r.map((v) => v / h22));
+  const p = Hn[0][2], q = Hn[1][2];
+  const J = [[Hn[0][0] - Hn[2][0] * p, Hn[0][1] - Hn[2][1] * p], [Hn[1][0] - Hn[2][0] * q, Hn[1][1] - Hn[2][1] * q]];
+  // Rv: rotation taking the z axis onto the ray of the plane origin
+  const tz = unit([p, q, 1]), ax = cross([0, 0, 1], tz), sn = norm3(ax), cs = tz[2];
+  let Rv = I3();
+  if (sn > 1e-12) {
+    const k = scl3(ax, 1 / sn), Kx = [[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]], K2 = mm(Kx, Kx);
+    Rv = [0, 1, 2].map((i) => [0, 1, 2].map((j) => (i === j ? 1 : 0) + sn * Kx[i][j] + (1 - cs) * K2[i][j]));
+  }
+  // B = [I2 | -v] Rv[:, 0:2], A = B^-1 J
+  const B = [[Rv[0][0] - p * Rv[2][0], Rv[0][1] - p * Rv[2][1]], [Rv[1][0] - q * Rv[2][0], Rv[1][1] - q * Rv[2][1]]];
+  const det = B[0][0] * B[1][1] - B[0][1] * B[1][0];
+  if (Math.abs(det) < 1e-15) return [];
+  const Bi = [[B[1][1] / det, -B[0][1] / det], [-B[1][0] / det, B[0][0] / det]];
+  const A = [[Bi[0][0] * J[0][0] + Bi[0][1] * J[1][0], Bi[0][0] * J[0][1] + Bi[0][1] * J[1][1]], [Bi[1][0] * J[0][0] + Bi[1][1] * J[1][0], Bi[1][0] * J[0][1] + Bi[1][1] * J[1][1]]];
+  // largest singular value of A
+  const fro = A[0][0] ** 2 + A[0][1] ** 2 + A[1][0] ** 2 + A[1][1] ** 2, dA = A[0][0] * A[1][1] - A[0][1] * A[1][0];
+  const gamma = Math.sqrt((fro + Math.sqrt(Math.max(fro * fro - 4 * dA * dA, 0))) / 2);
+  const R2 = A.map((r) => r.map((v) => v / gamma));
+  const b0 = Math.sqrt(Math.max(1 - R2[0][0] ** 2 - R2[1][0] ** 2, 0));
+  let b1 = Math.sqrt(Math.max(1 - R2[0][1] ** 2 - R2[1][1] ** 2, 0));
+  if (R2[0][0] * R2[0][1] + R2[1][0] * R2[1][1] > 0) b1 = -b1; // columns orthogonal: b0 b1 = -(r00 r01 + r10 r11)
+  const sols = [];
+  for (const sgn of [1, -1]) {
+    const c1 = [R2[0][0], R2[1][0], sgn * b0], c2 = [R2[0][1], R2[1][1], sgn * b1], c3 = cross(c1, c2);
+    const Rl = [[c1[0], c2[0], c3[0]], [c1[1], c2[1], c3[1]], [c1[2], c2[2], c3[2]]];
+    const R = nearestRot(mm(Rv, Rl));
+    // translation: least squares of x (R P + t)_z = (R P + t)_x, y likewise
+    const M = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], rhs = [0, 0, 0];
+    P.forEach((pp, i) => {
+      const rp = mv3(R, [pp[0], pp[1], 0]), [u, v] = nrm[i];
+      for (const [row, b] of [[[1, 0, -u], u * rp[2] - rp[0]], [[0, 1, -v], v * rp[2] - rp[1]]]) {
+        for (let a = 0; a < 3; a++) { rhs[a] += row[a] * b; for (let c = 0; c < 3; c++) M[a][c] += row[a] * row[c]; }
+      }
+    });
+    const t = solve3(M, rhs);
+    if (!t) continue;
+    // back to the object frame: R (X - m) + t = R X + (t - R m)
+    const Rm = mv3(R, [m[0], m[1], 0]);
+    sols.push({ R, t: [t[0] - Rm[0], t[1] - Rm[1], t[2] - Rm[2]] });
+  }
+  return sols;
+}
+function solve3(M, b) {
+  const d = (A) => A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) - A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) + A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
+  const D0 = d(M);
+  if (Math.abs(D0) < 1e-18) return null;
+  return [0, 1, 2].map((k) => d(M.map((r, i) => r.map((v, j) => (j === k ? b[i] : v)))) / D0);
+}
+// reprojection error (px) of a pose as OpenCV's solvePnPGeneric reports it: sqrt(sum of squared residuals / 2n)
+export function reprojRms(K, R, t, obj, img) {
+  let s = 0;
+  obj.forEach((X, i) => { const p = project(K, R, t, X); s += (p[0] - img[i][0]) ** 2 + (p[1] - img[i][1]) ** 2; });
+  return Math.sqrt(s / (2 * obj.length));
+}
+// both IPPE poses of the sticker, best first: [{ R, t, reprojPx, front }]
+export function stickerPoses(points, K, st = STICKER) {
+  const obj = stickerObject(st), nrm = points.map(([u, v]) => undistort(K, u, v));
+  return ippe(obj, nrm).map((s) => ({ ...s, reprojPx: reprojRms(K, s.R, s.t, obj, points), front: obj.every((X) => mv3(s.R, X)[2] + s.t[2] > 0) }))
+    .sort((a, b) => (b.front - a.front) || (a.reprojPx - b.reprojPx));
+}
+/* Fingertip from the dot points of several stationary frames (each [4 x [u, v]]): the mean points give the pose;
+   per-frame poses give the spread. Returns { ok, gates, tip_cam_m, reprojPx, gapPx, stdMm, frames, poses } with
+   gates [{ key, ok, value, limit }]: frames, front (positive depth), reproj, ambiguity (runner-up gap), std. */
+export function measureTip(framePoints, K, { st = STICKER, gates = STICKER_GATES } = {}) {
+  const frames = framePoints.filter((p) => Array.isArray(p) && p.length === 4);
+  const out = { ok: false, frames: frames.length, gates: [] };
+  const gate = (key, ok, value, limit) => { out.gates.push({ key, ok, value, limit }); return ok; };
+  if (!gate('frames', frames.length >= gates.minFrames, frames.length, gates.minFrames)) return out;
+  const mean = [0, 1, 2, 3].map((k) => [0, 1].map((c) => frames.reduce((s, f) => s + f[k][c], 0) / frames.length));
+  const poses = stickerPoses(mean, K, st);
+  out.poses = poses.map((p) => ({ t: p.t, reprojPx: p.reprojPx, front: p.front }));
+  const best = poses[0], second = poses[1];
+  if (!gate('front', !!best && best.front, best ? +best.front : 0, 1)) return out;
+  out.tip_cam_m = best.t; out.R = best.R; out.reprojPx = best.reprojPx; out.points = mean;
+  out.gapPx = second ? second.reprojPx - best.reprojPx : Infinity;
+  const tips = frames.map((f) => { const ps = stickerPoses(f, K, st); return ps.length ? ps[0].t : null; }).filter(Boolean);
+  const std = [0, 1, 2].map((c) => { const m = tips.reduce((s, t) => s + t[c], 0) / tips.length; return Math.sqrt(tips.reduce((s, t) => s + (t[c] - m) ** 2, 0) / tips.length); });
+  out.stdMm = Math.max(...std) * 1000;
+  gate('reproj', best.reprojPx <= gates.reprojPx, best.reprojPx, gates.reprojPx);
+  gate('ambiguity', out.gapPx >= gates.gapPx, out.gapPx, gates.gapPx);
+  gate('std', out.stdMm <= gates.stdMm, out.stdMm, gates.stdMm);
+  out.ok = out.gates.every((g) => g.ok);
+  return out;
+}
+// stale frames: a snapshot repeats the previous frame for a while after motion; keep a frame only when its
+// frame_id is newer than the last kept one and its content key (e.g. a hash of the JPEG bytes) is new
+export function dedupeFrames(frames) {
+  const seen = new Set(), out = [];
+  let last = -Infinity;
+  for (const f of frames) {
+    const id = Number.isFinite(f.frame_id) ? f.frame_id : null;
+    if ((id !== null && id <= last) || (f.key != null && seen.has(f.key))) continue;
+    if (id !== null) last = id;
+    if (f.key != null) seen.add(f.key);
+    out.push(f);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- hover acceptance (T20)
+/* armd's calib_hover job brings the fingertip (tool down) above board corners and records the board markers seen
+   there with the measured joints. Here: the board pose T_cam_board per frame from the raw corners (IPPE for one
+   marker, homography + LM for more), the fingertip in the board frame p = inv(T_cb) · tip_cam (board z points
+   into the table, so the height of the sticker edge above the paper is -p.z), its XY error against the requested
+   corner, and h = -p.z - edge_to_low (the tool's lowest point). Working table height: table_z = mean(z_end - h)
+   with z_end from the CANDIDATE kinematics at the measured joints (the end_link height at which the lowest point
+   touches the paper); the optical board plane (T_base_end · X · T_cb, z of the board origin) is recorded beside it. */
+export const HOVER_GATES = Object.freeze({ version: 1, minPoints: 4, spreadM: 0.003, xyM: 0.005, confirmM: 0.003, minPredictedClearanceM: 0.010 });
+export const HOVER_PLAN = Object.freeze({ clearanceM: 0.012, approachM: 0.060, count: 6, minCount: 4, unknownEdgeM: 0.005, rpy: Object.freeze([0, Math.PI / 2, 0]) });
+
+// fingertip in the board frame
+export const tipInBoard = (T_cb, tipCam) => apply(inv(T_cb), tipCam);
+
+// board pose of one frame: { T (T_cam_board), reprojPx, points } or null
+export function fitBoardPose(markers, board, K, order = ORDERS[0]) {
+  const { obj, img } = correspondences({ markers: boardMarkers({ markers }, board) }, board, order);
+  if (obj.length < 4) return null;
+  if (obj.length === 4) {
+    const nrm = img.map(([u, v]) => undistort(K, u, v));
+    const sols = ippe(obj, nrm).map((s) => ({ ...s, e: reprojRms(K, s.R, s.t, obj, img), front: s.t[2] > 0 })).filter((s) => s.front).sort((a, b) => a.e - b.e);
+    if (!sols.length) return null;
+    return { T: make(sols[0].R, sols[0].t), reprojPx: sols[0].e, points: 4, gapPx: sols[1] ? sols[1].e - sols[0].e : Infinity };
+  }
+  const p = solvePnP(obj, img, K);
+  if (!p || !(p.t[2] > 0)) return null;
+  return { T: make(p.R, p.t), reprojPx: p.rms, points: obj.length };
+}
+
+/* One hover point. observations: [{ markers, joints?, q? }]; tipCam (m, camera frame); edgeToLow (m or null);
+   target: corner in the board frame [x, y] (m); Tend: T_base_end from the candidate kinematics at the measured
+   joints (optional; gives z_end_m and the optical plane); X: T_end_cam of the candidate. */
+export function hoverPoint({ observations, board, K, tipCam, edgeToLow = null, target = null, Tend = null, X = null, order = ORDERS[0] }) {
+  const fits = (observations || []).map((o) => fitBoardPose(o.markers || [], board, K, order)).filter(Boolean);
+  if (!fits.length) return { ok: false, why: 'markers', frames: 0 };
+  const ps = fits.map((f) => tipInBoard(f.T, tipCam));
+  const p = [0, 1, 2].map((c) => ps.reduce((s, q) => s + q[c], 0) / ps.length);
+  const edge = -p[2];
+  const out = { ok: true, frames: fits.length, tip_board_m: p, edge_height_m: edge, height_m: edgeToLow == null ? null : edge - edgeToLow,
+    reproj_px: Math.max(...fits.map((f) => f.reprojPx)), frame_spread_m: Math.max(...[0, 1, 2].map((c) => Math.max(...ps.map((q) => q[c])) - Math.min(...ps.map((q) => q[c])))) };
+  if (target) out.xy_err_m = [p[0] - target[0], p[1] - target[1]];
+  if (target) out.target_xy_m = target;
+  if (Tend) {
+    out.z_end_m = Tend[2][3];
+    if (X) { const Tbb = mm(mm(Tend, X), fits[0].T); out.optical_board_z_m = Tbb[2][3]; out.board_normal_z = Tbb[2][2]; }
+  }
+  return out;
+}
+
+/* Gates and the working table height over the hover points (results of hoverPoint with z_end_m). Returns
+   { ok, gates, table_z_m (null without a known tool), optical_table_z_m, height_spread_m, max_xy_m, points }. */
+export function evaluateHovers(points, { edgeToLow = null, gates = HOVER_GATES } = {}) {
+  const ok = points.filter((p) => p && p.ok);
+  const out = { gates: [], points: ok.length };
+  const gate = (key, pass, value, limit, blocking = true) => out.gates.push({ key, ok: pass, value, limit, blocking });
+  gate('points', ok.length >= gates.minPoints, ok.length, gates.minPoints);
+  const hs = ok.map((p) => (edgeToLow == null ? p.edge_height_m : p.height_m));
+  out.height_spread_m = hs.length ? Math.max(...hs) - Math.min(...hs) : NaN;
+  gate('spread', hs.length > 0 && out.height_spread_m <= gates.spreadM, out.height_spread_m, gates.spreadM);
+  out.max_xy_m = Math.max(0, ...ok.filter((p) => p.xy_err_m).map((p) => Math.hypot(p.xy_err_m[0], p.xy_err_m[1])));
+  gate('xy', out.max_xy_m <= gates.xyM, out.max_xy_m, gates.xyM);
+  out.min_height_m = hs.length ? Math.min(...hs) : NaN;
+  gate('clearance', hs.length > 0 && out.min_height_m > 0, out.min_height_m, 0);
+  gate('tool', edgeToLow != null, edgeToLow == null ? 'unknown' : edgeToLow, 'known edge_to_low_m', false);
+  const withZ = ok.filter((p) => Number.isFinite(p.z_end_m));
+  out.table_z_m = edgeToLow != null && withZ.length ? withZ.reduce((s, p) => s + p.z_end_m - p.height_m, 0) / withZ.length : null;
+  const opt = ok.filter((p) => Number.isFinite(p.optical_board_z_m));
+  out.optical_table_z_m = opt.length ? opt.reduce((s, p) => s + p.optical_board_z_m, 0) / opt.length : null;
+  out.ok = out.gates.every((g) => g.ok || !g.blocking);
+  return out;
+}
+
+// confirmation hovers at the new table height: measured lowest-point height within confirmM of the requested clearance
+export function confirmHovers(points, clearance, { gates = HOVER_GATES } = {}) {
+  const ok = points.filter((p) => p && p.ok && Number.isFinite(p.height_m));
+  const errs = ok.map((p) => p.height_m - clearance);
+  const worst = errs.length ? Math.max(...errs.map(Math.abs)) : Infinity;
+  return { ok: ok.length >= 1 && worst <= gates.confirmM, worst_m: worst, errors_m: errs, points: ok.length };
+}
+
+// joint-space IK of the kinematic model (candidate parameters k): damped least squares on position + orientation
+export function kinIk(ch, k, T, q0, { lo = null, hi = null, iters = 80, tolM = 1e-5, tolRad = 1e-4 } = {}) {
+  let q = q0.slice(0, 6);
+  const Rt = f3(rotOf(T)), pt = posOf(T);
+  const err = (q) => {
+    const f = kinFk(ch, q, k), Re = [f.R[0], f.R[3], f.R[6], f.R[1], f.R[4], f.R[7], f.R[2], f.R[5], f.R[8]]; // R^T
+    const E = mf(Re, Rt), w = logRot([[E[0], E[1], E[2]], [E[3], E[4], E[5]], [E[6], E[7], E[8]]]), wb = mvf(f.R, w);
+    return [pt[0] - f.p[0], pt[1] - f.p[1], pt[2] - f.p[2], wb[0], wb[1], wb[2]];
+  };
+  for (let it = 0; it < iters; it++) {
+    const e = err(q);
+    if (Math.hypot(e[0], e[1], e[2]) < tolM && Math.hypot(e[3], e[4], e[5]) < tolRad) return { q, ok: true };
+    const J = [0, 1, 2, 3, 4, 5].map((j) => { const qq = q.slice(); qq[j] += 1e-6; const e2 = err(qq); return e.map((v, r) => (v - e2[r]) / 1e-6); });
+    // (J^T J + l I) dq = J^T e, J[j] = column j
+    const A = [], b = [];
+    for (let i = 0; i < 6; i++) { A.push([]); b.push(J[i].reduce((s, v, r) => s + v * e[r], 0)); for (let j = 0; j < 6; j++) A[i].push(J[i].reduce((s, v, r) => s + v * J[j][r], 0) + (i === j ? 1e-6 : 0)); }
+    const L = chol(A.flat(), 6);
+    if (!L) return { q, ok: false };
+    const dq = cholSolve(L, 6, b);
+    q = q.map((v, j) => { let x = v + dq[j]; if (lo) x = Math.max(lo[j], x); if (hi) x = Math.min(hi[j], x); return x; });
+  }
+  const e = err(q);
+  return { q, ok: Math.hypot(e[0], e[1], e[2]) < 1e-4 && Math.hypot(e[3], e[4], e[5]) < 1e-3 };
+}
+const kinT = (ch, q, k) => { const f = kinFk(ch, q, k); return [[f.R[0], f.R[1], f.R[2], f.p[0]], [f.R[3], f.R[4], f.R[5], f.p[1]], [f.R[6], f.R[7], f.R[8], f.p[2]], [0, 0, 0, 1]]; };
+export const kinPose = kinT;
+
+/* Hover targets over board corners. Tbb: T_base_board of the candidate (re-observed stationary board); X: candidate
+   T_end_cam; tipCam: fingertip in the camera frame; edgeToLow: the tool's value (null: HOVER_PLAN.unknownEdgeM is
+   assumed for the clearance); ch / kCand / kLive: kinematic chain and parameter vectors of the candidate and of the
+   model armd runs now; q0: model angles to seed the IK; K: candidate intrinsics (a marker must be in view).
+   For each corner the end_link is placed so that the PREDICTED sticker edge (tip_end = X · tip_cam) is above the
+   corner and the tool's lowest point clearanceM above the paper; the candidate IK gives joints, the live FK of those
+   joints is the target armd moves to. Corners are ranked by spread (farthest point first from the board centre);
+   needs count >= minCount and both board axes covered (minCount 1 / count 2 for confirmation hovers, where tableZ
+   puts the end_link at tableZ + clearanceM, the working table semantics of evaluateHovers). Returns { ok, why, points: [{ id, corner, approach_m, hover_m,
+   rpy_rad, q, predicted_clearance_m, visible }] }. */
+export function planHover({ Tbb, X, tipCam, edgeToLow = null, ch, kCand, kLive, q0, K, board, lo = null, hi = null, plan = HOVER_PLAN, gates = HOVER_GATES, size = IMAGE, tableZ = null }) {
+  const tipEnd = apply(X, tipCam), drop = edgeToLow == null ? plan.unknownEdgeM : edgeToLow;
+  // tool down; the yaw about the vertical turns the camera toward the board (the camera sees only what lies ahead
+  // of the fingertip): per corner the yaw with the most markers in view, the smallest turn on a tie
+  const yaws = plan.yawsDeg || [0, 45, -45, 90, -90, 135, -135, 180];
+  const cands = [];
+  for (const m of board.markers) m.corners.forEach((c, ci) => {
+    const pb = apply(Tbb, c);
+    let best = null;
+    for (const yd of yaws) {
+      const R = mm(rpyR(0, 0, yd / D), rpyR(...plan.rpy)), rTip = mv3(R, tipEnd);
+      // end_link origin: sticker edge above the corner, lowest point clearanceM above the paper
+      // (tableZ, confirmation hovers: the end_link at tableZ + clearance, the working table semantics)
+      const pe = [pb[0] - rTip[0], pb[1] - rTip[1], tableZ != null ? tableZ + plan.clearanceM : pb[2] + plan.clearanceM + drop - rTip[2]];
+      const T = make(R, pe);
+      const vis = visibleMarkers(K, mm(T, X), Tbb, board, { size });
+      if (!vis.length || (best && vis.length <= best.vis.length)) continue;
+      const Ta = make(R, [pe[0], pe[1], pe[2] + plan.approachM]);
+      const ika = kinIk(ch, kCand, Ta, q0, { lo, hi });
+      const ikh = ika.ok ? kinIk(ch, kCand, T, ika.q, { lo, hi }) : ika;
+      if (!ikh.ok) continue;
+      best = { R, pe, vis, ika, ikh, yd };
+    }
+    if (!best) return;
+    const Tl = kinT(ch, best.ikh.q, kLive), Tla = kinT(ch, best.ika.q, kLive);
+    cands.push({ id: `m${m.id}c${ci}`, corner: c.slice(0, 2), base: pb, q: best.ikh.q, yaw_deg: best.yd,
+      approach_m: [Tl[0][3], Tl[1][3], Tla[2][3]], hover_m: posOf(Tl), rpy_rad: rpyOfR(rotOf(Tl)),
+      predicted_clearance_m: plan.clearanceM, visible: best.vis.map((v) => v.id) });
+  });
+  // vertical descent in the live frame: approach straight above the hover point
+  cands.forEach((c) => { c.approach_m = [c.hover_m[0], c.hover_m[1], Math.max(c.approach_m[2], c.hover_m[2] + 0.02)]; });
+  const chosen = [];
+  const left = cands.slice();
+  let ref = [0, 0];
+  while (chosen.length < plan.count && left.length) {
+    let bi = 0, bd = -1;
+    left.forEach((c, i) => { const d = chosen.length ? Math.min(...chosen.map((s) => Math.hypot(s.corner[0] - c.corner[0], s.corner[1] - c.corner[1]))) : Math.hypot(c.corner[0] - ref[0], c.corner[1] - ref[1]); if (d > bd) { bd = d; bi = i; } });
+    chosen.push(left.splice(bi, 1)[0]);
+  }
+  const xs = chosen.map((c) => c.corner[0]), ys = chosen.map((c) => c.corner[1]);
+  const spanOk = plan.minCount < 4 ? chosen.length > 0 : chosen.length && Math.max(...xs) - Math.min(...xs) >= board.width / 2 && Math.max(...ys) - Math.min(...ys) >= board.height / 2;
+  const ok = chosen.length >= plan.minCount && spanOk && plan.clearanceM >= gates.minPredictedClearanceM;
+  return { ok, why: ok ? null : chosen.length < plan.minCount ? 'reach' : 'spread', points: chosen, candidates: cands.length };
+}
+
+/* The apply body of a verified calibration: the candidate's apply body (solveFine) with the fingertip, the
+   acceptance record and, when the tool is known and the acceptance passed, the hover table height
+   (table_z_source hover; the camera value otherwise). tool: { tool_id, tip_cam_m, x_fingerprint, gripper_opening?,
+   fit? }; fingerprint: the candidate's (dry-run after.fingerprint with this tool); evaluation: evaluateHovers. */
+export function verifiedApplyBody(apply, { tool, fingerprint, evaluation, points, board, jobId = null, measuredAt = null, confirm = null, gates = HOVER_GATES }) {
+  const body = { ...apply, tool: { ...tool } };
+  const hover = !!(evaluation.ok && evaluation.table_z_m != null && (!confirm || confirm.ok));
+  const r = (v, n = 6) => (Number.isFinite(v) ? +v.toFixed(n) : v);
+  body.acceptance = {
+    fingerprint, gate_version: gates.version, passed: !!(evaluation.ok && (!confirm || confirm.ok)),
+    board: { cols: board.cols, rows: board.rows, marker_side_m: board.markerSide, gap_m: board.gap },
+    points: points.slice(0, 16).map((p) => ({ id: p.id, ok: !!p.ok, frames: p.frames, edge_height_m: r(p.edge_height_m), height_m: r(p.height_m), xy_err_m: p.xy_err_m && p.xy_err_m.map((v) => r(v)), z_end_m: r(p.z_end_m), optical_board_z_m: r(p.optical_board_z_m), skipped: p.skipped || undefined })),
+    summary: { table_z_m: hover ? evaluation.table_z_m : null, optical_table_z_m: r(evaluation.optical_table_z_m), height_spread_m: r(evaluation.height_spread_m), max_xy_m: r(evaluation.max_xy_m),
+      gates: evaluation.gates.map((g) => ({ key: g.key, ok: g.ok, value: typeof g.value === 'number' ? r(g.value) : g.value, limit: g.limit })), confirm: confirm ? { ok: confirm.ok, worst_m: r(confirm.worst_m) } : null },
+    ...(jobId ? { job_id: jobId } : {}), ...(measuredAt ? { measured_at: measuredAt } : {}),
+  };
+  if (hover) { body.table_z_m = evaluation.table_z_m; body.table_z_source = 'hover'; } else body.table_z_source = 'camera';
+  return body;
 }

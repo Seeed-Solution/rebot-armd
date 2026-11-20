@@ -178,7 +178,7 @@ struct PendingPlan {
     approach: Result<crate::backlash::Plan, Option<&'static str>>,
 }
 
-enum ActionStart { Started(u64, f64), Plan(PendingPlan), Macro(PendingMacro), Replay(crate::replay::ReplayInput), DryRunGrasp(Value), Sequence(Box<crate::sequences::RunPlan>) }
+enum ActionStart { Started(u64, f64), Plan(PendingPlan), Macro(PendingMacro), Replay(crate::replay::ReplayInput), DryRunGrasp(Value), Sequence(Box<crate::sequences::RunPlan>), CalibHover(Box<crate::calib_hover::HoverPlan>) }
 
 /// A macro action (crate::macro_action) checked under the lock, planned without it.
 enum PendingMacro { Grasp(crate::grasp::PendingGrasp), Place(crate::place::PendingPlace) }
@@ -297,6 +297,7 @@ fn prepare_action(
             return Ok(ActionStart::Started(id, duration));
         }
         "/api/v1/action/run_sequence" => return Ok(ActionStart::Sequence(Box::new(crate::sequences::prepare_run(inner, body, epoch)?))),
+        crate::calib_hover::PATH => return Ok(ActionStart::CalibHover(Box::new(crate::calib_hover::prepare(inner, body, epoch)?))),
         _ => return Err(invalid_command("Unknown action")),
     };
     let (spec, speed, tag) = parsed.map_err(ArmError::from)?;
@@ -972,6 +973,15 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             Ok(ActionStart::DryRunGrasp(body)) => { pending_dry_run_grasp = Some((value["request_id"].clone(), body)); None }
                                             Ok(ActionStart::Sequence(plan)) => Some(match crate::sequences::begin(&mut inner, &recv_supervisor, *plan) {
                                                 Ok(started) => command_ack(&inner, &value["request_id"], Some(started)),
+                                                Err(error) => command_reject(&inner, &value["request_id"], error.into()),
+                                            }),
+                                            Ok(ActionStart::CalibHover(plan)) => Some(match crate::calib_hover::begin(&mut inner, &recv_supervisor, *plan,
+                                                recv_calib.upstream.clone(), crate::calib_hover::jobs_dir(&recv_calib.path)) {
+                                                Ok((id, duration, job_id)) => {
+                                                    let mut ack = command_ack(&inner, &value["request_id"], Some((id, duration)));
+                                                    ack["job_id"] = json!(job_id);
+                                                    ack
+                                                }
                                                 Err(error) => command_reject(&inner, &value["request_id"], error.into()),
                                             }),
                                             Err(error) => Some(command_reject(&inner, &value["request_id"], error)),

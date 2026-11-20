@@ -151,11 +151,19 @@ impl MacroCtx {
     /// (src/backlash.rs): the path goes to the pre-target, the short segment (phase
     /// `final_approach`) to the goal; the outcome is in the action record.
     pub async fn move_arm_with(&self, phase: &str, spec: GoalSpec, speed: Speed, approach: Option<FinalApproach>) -> Result<SubDone, Stop> {
+        self.move_arm_staged(phase, spec, speed, approach).await.map_err(|(stop, _)| stop)
+    }
+
+    /// [`move_arm_with`](Self::move_arm_with) telling a refusal before any motion (`false`:
+    /// planning or install refused, the arm did not move) from a failure after the sub-motion
+    /// was installed (`true`).
+    pub async fn move_arm_staged(&self, phase: &str, spec: GoalSpec, speed: Speed, approach: Option<FinalApproach>) -> Result<SubDone, (Stop, bool)> {
+        let before = |s: Stop| (s, false);
         let (input, plan) = {
             let inner = self.sup.inner().read().await;
-            if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
+            if !inner.macro_alive(self.id) { return Err(before(Stop::Cancelled)); }
             let plan = approach.as_ref().map(|a| inner.approach_plan(a.use_, a.request));
-            (inner.plan_input().map_err(arm_fail)?, plan)
+            (inner.plan_input().map_err(arm_fail).map_err(before)?, plan)
         };
         let (goal, yaw_free) = motion::resolve_goal_ex(&input, &spec);
         let (input, planned) = tokio::task::spawn_blocking(move || {
@@ -170,26 +178,26 @@ impl MacroCtx {
             });
             (input, p)
         }).await
-            .map_err(|e| fail("INTERNAL", format!("planner task failed: {e}")))?;
+            .map_err(|e| before(fail("INTERNAL", format!("planner task failed: {e}"))))?;
         let (path, pre, plan) = match planned {
             Ok(p) => p,
             Err(e) => {
                 if let motion::MotionError::WorkspaceViolation { ref detail, .. } = e {
                     self.sup.inner().write().await.set_action_workspace_violation(self.id, (**detail).clone());
                 }
-                return Err(arm_fail(e.into()));
+                return Err(before(arm_fail(e.into())));
             }
         };
         let limit = {
             let mut inner = self.sup.inner().write().await;
-            if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
+            if !inner.macro_alive(self.id) { return Err(before(Stop::Cancelled)); }
             match inner.install_macro_path_same_side(self.id, &input, path, pre, plan.as_ref()) {
                 Ok(l) => l,
                 Err(e) => {
                     if let Some(detail) = e.workspace_detail() {
                         inner.set_action_workspace_violation(self.id, detail);
                     }
-                    return Err(arm_fail(e));
+                    return Err(before(arm_fail(e)));
                 }
             }
         };
@@ -222,7 +230,7 @@ impl MacroCtx {
                 }
             }
         }
-        sub_res
+        sub_res.map_err(|s| (s, true))
     }
 
     /// Run a gripper open / close sub-motion and wait for it.
