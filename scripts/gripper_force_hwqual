@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Supervised real-arm check of the gripper force limit (docs/control_safety_contract.md
+"Gripper force limit"). Moves only the gripper; the arm joints stay where they are.
+
+    REBOT_SDK_DIR=~/project/rebot-companion scripts/gripper_force_hwqual --host 192.168.42.1 \
+        --i-am-at-the-arm [--runs 3] [--speed 1.0] [--out DIR]
+
+Steps (each waits for Enter):
+  1. free close at 1.0 and 2.0 rad/s with nothing between the jaws (free-close torque, lag);
+  2. --runs grasp closes on a soft object the operator holds between the jaws (sponge, foam,
+     soft toy; never fingers, never something that breaks), opening after each;
+  3. one plain close (grasp false) on the same object.
+J7 position, command, velocity, torque, motion_limit and gripper.force_limited /
+force_limit_trips are polled from GET /api/v1/observation at 50 Hz into <out>/<step>.jsonl.
+The summary prints per step: peak |tau|, max command lead in the closing direction, trips,
+holding, and the contact / cap / lead checks against GET /api/v1/safety/describe.
+
+Python standard library plus the `rebot` SDK (rebot-companion, REBOT_SDK_DIR or PYTHONPATH).
+Requires armd with the gripper_force_limit stop. Stop at any time with Ctrl+C (the gripper
+command stops; torque stays on; the cockpit E-stop is the fallback). Not run in CI.
+"""
+import argparse
+import json
+import os
+import sys
+import threading
+import time
+import urllib.request
+
+sdk = os.environ.get("REBOT_SDK_DIR")
+if sdk:
+    sys.path.insert(0, os.path.expanduser(sdk))
+try:
+    from rebot import Arm, RebotError
+except ImportError:
+    sys.exit("rebot SDK not found: set REBOT_SDK_DIR to a rebot-companion checkout")
+
+POLL_HZ = 50
+
+
+def get(base, path, timeout=1.0):
+    with urllib.request.urlopen(base + path, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+class Logger(threading.Thread):
+    """Polls the observation at POLL_HZ and keeps J7 samples of the current step."""
+
+    def __init__(self, base, joint):
+        super().__init__(daemon=True)
+        self.base, self.joint = base, joint
+        self.samples, self.lock, self.stop_ev = [], threading.Lock(), threading.Event()
+        self.errors = 0
+
+    def run(self):
+        period = 1.0 / POLL_HZ
+        nxt = time.monotonic()
+        while not self.stop_ev.is_set():
+            try:
+                o = get(self.base, "/api/v1/observation", timeout=0.5)
+                j = self.joint
+                g = o.get("gripper") or {}
+                s = {
+                    "t": time.monotonic(),
+                    "ts": o.get("timestamp"),
+                    "q": o["positions"][j],
+                    "cmd": (o.get("commanded_positions") or [None] * (j + 1))[j],
+                    "v": o["velocities"][j],
+                    "tau": o["torques"][j],
+                    "motion_limit": o.get("motion_limit"),
+                    "force_limited": g.get("force_limited"),
+                    "trips": g.get("force_limit_trips"),
+                    "safety_state": o.get("safety_state"),
+                }
+                with self.lock:
+                    self.samples.append(s)
+            except Exception:  # noqa: BLE001 - keep polling; counted in the summary
+                self.errors += 1
+            nxt += period
+            time.sleep(max(0.0, nxt - time.monotonic()))
+
+    def take(self):
+        with self.lock:
+            out, self.samples = self.samples, []
+        return out
+
+
+def summarize(name, samples, result, lim, close_dir):
+    if not samples:
+        return {"step": name, "samples": 0}
+    peak = max(abs(s["tau"]) for s in samples)
+    leads = [(s["cmd"] - s["q"]) * close_dir for s in samples if s["cmd"] is not None]
+    trips = [s["trips"] for s in samples if isinstance(s["trips"], int)]
+    dt = samples[-1]["t"] - samples[0]["t"]
+    return {
+        "step": name,
+        "samples": len(samples),
+        "rate_hz": round((len(samples) - 1) / dt, 1) if dt > 0 else None,
+        "peak_tau_nm": round(peak, 3),
+        "max_close_lead_rad": round(max(leads), 3) if leads else None,
+        "trips": (trips[-1] - trips[0]) if trips else None,
+        "final_q_rad": round(samples[-1]["q"], 3),
+        "holding": getattr(result, "holding", None),
+        "state": getattr(getattr(result, "action", None), "state", None),
+        "cap_nm": lim.get("max_close_torque_nm"),
+        "contact_nm": lim.get("contact_torque_nm"),
+        "lead_cap_rad": lim.get("max_lead_rad"),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--host", default=os.environ.get("REBOT_HOST", "127.0.0.1"))
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--runs", type=int, default=3, help="grasp closes on the soft object (1..10)")
+    ap.add_argument("--speed", type=float, default=1.0, help="close speed for the object steps, rad/s (<= 1.0)")
+    ap.add_argument("--out", default=f".cache/gripper-force-hwqual/{time.strftime('%Y%m%d-%H%M%S')}")
+    ap.add_argument("--i-am-at-the-arm", action="store_true", help="required: the operator is at the arm and can cut power")
+    a = ap.parse_args()
+    if not a.i_am_at_the_arm:
+        sys.exit("refusing to move a real gripper without --i-am-at-the-arm")
+    if not 1 <= a.runs <= 10 or not 0.1 <= a.speed <= 1.0:
+        sys.exit("--runs must be 1..10 and --speed 0.1..1.0")
+    base = f"http://{a.host}:{a.port}"
+    desc = get(base, "/api/v1/safety/describe", timeout=3.0)
+    stop = next((s for s in desc.get("stops", []) if s.get("id") == "gripper_force_limit"), None)
+    lim = (desc.get("limits") or {}).get("gripper") or {}
+    if stop is None:
+        sys.exit("armd has no gripper_force_limit stop: update rebot-armd before this check")
+    joint = stop["joint"]
+    print(f"armd {desc['device']['armd_version']} follower {desc['device']['follower']}: "
+          f"cap {lim.get('max_close_torque_nm')} N·m, contact {lim.get('contact_torque_nm')} N·m, "
+          f"lead cap {lim.get('max_lead_rad')} rad, gripper joint {joint}")
+    os.makedirs(a.out, exist_ok=True)
+    log = Logger(base, joint)
+    log.start()
+    report = []
+    close_dir = 1.0
+
+    def step(name, prompt, fn):
+        input(f"\n[{name}] {prompt}\n  Enter to start, Ctrl+C to quit ")
+        log.take()
+        result = None
+        try:
+            result = fn()
+        except RebotError as e:
+            print(f"  {name}: {e.code} {e.message}")
+        time.sleep(0.5)  # tail of the hold
+        samples = log.take()
+        with open(os.path.join(a.out, f"{name}.jsonl"), "w") as f:
+            for s in samples:
+                f.write(json.dumps(s) + "\n")
+        summary = summarize(name, samples, result, lim, close_dir)
+        report.append(summary)
+        print("  " + json.dumps(summary))
+        return summary
+
+    with Arm(host=a.host, port=a.port, park_on_exit=False) as arm:
+        policy = arm.schema.gripper_policy or {}
+        closed, opened = policy.get("closed_rad", 0.0), policy.get("open_rad", -5.7)
+        close_dir = 1.0 if closed >= opened else -1.0  # read by step() for the lead summary
+        s = arm.session
+        step("open", "Gripper opens fully. Keep hands clear.", lambda: s.gripper("open", speed=1.0))
+        for v in (1.0, 2.0):
+            name = f"free_close_{v:.0f}"
+            step(name, f"Free close at {v} rad/s, NOTHING between the jaws.", lambda v=v: s.gripper("close", grasp=True, speed=v))
+            step(f"open_after_{name}", "Gripper opens.", lambda: s.gripper("open", speed=1.0))
+        for i in range(1, a.runs + 1):
+            step(f"grasp_{i}", f"Hold the SOFT object between the jaws (run {i}/{a.runs}); keep fingers out of the jaws.",
+                 lambda: s.gripper("close", grasp=True, speed=a.speed))
+            step(f"release_{i}", "Gripper opens; take the object out after it stops.", lambda: s.gripper("open", speed=1.0))
+        step("plain_close", "Soft object between the jaws again; plain close (no grasp detection).",
+             lambda: s.gripper("close", grasp=False, speed=a.speed))
+        step("release_plain", "Gripper opens; take the object out.", lambda: s.gripper("open", speed=1.0))
+
+    log.stop_ev.set()
+    cap = lim.get("max_close_torque_nm") or float("inf")
+    contact = lim.get("contact_torque_nm") or float("inf")
+    lead_cap = lim.get("max_lead_rad") or float("inf")
+    checks = []
+    for r in report:
+        if "peak_tau_nm" not in r:
+            continue
+        if r["step"].startswith("free_close"):
+            checks.append((r["step"], "free close below contact torque", r["peak_tau_nm"] < contact))
+            checks.append((r["step"], "free close no cap trip", r["trips"] == 0))
+        if r["step"].startswith(("grasp_", "plain_close")):
+            checks.append((r["step"], "peak below cap + 0.3 N·m", r["peak_tau_nm"] < cap + 0.3))
+        if r["step"].startswith("grasp_"):
+            checks.append((r["step"], "holding", r["holding"] is True))
+        if r["max_close_lead_rad"] is not None and not r["step"].startswith(("open", "release")):
+            checks.append((r["step"], "close lead within cap + 0.05 rad", r["max_close_lead_rad"] <= lead_cap + 0.05))
+    with open(os.path.join(a.out, "summary.json"), "w") as f:
+        json.dump({"describe_stop": stop, "limits_gripper": lim, "steps": report,
+                   "checks": [{"step": s, "check": c, "pass": p} for s, c, p in checks],
+                   "poll_errors": log.errors}, f, indent=2)
+    print("\nchecks:")
+    for s, c, p in checks:
+        print(f"  {'PASS' if p else 'FAIL'}  {s}: {c}")
+    print(f"poll errors {log.errors}; logs in {a.out}")
+    sys.exit(0 if all(p for _, _, p in checks) else 1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit("\ninterrupted")
