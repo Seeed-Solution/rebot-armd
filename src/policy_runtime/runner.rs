@@ -12,10 +12,13 @@ use crate::model::{ArmConfig, JointLimit, PolicyObservation};
 use crate::motion::MotionError;
 use crate::supervisor::{ArmError, ArmSupervisor};
 
-use super::manifest::{PolicySnapshot, StrictPolicyContract};
+use super::manifest::{PolicySnapshot, StrictPolicyContract, VisionStalePolicy};
 use super::units::{
     denormalize_action_into, normalize_state_into, policy_units_to_rad, rad_to_policy_units,
     JointPermutation,
+};
+use super::vision::{
+    evaluate_vision_frame, PolicyVisionSource, VisionFeatureCollector, VisionStepDecision,
 };
 use super::{load_backend, PolicyBackend, PolicyError};
 
@@ -55,6 +58,8 @@ pub struct PolicyRun {
     pub mode: PolicyMode,
     pub steps: u64,
     pub last_input_age_ms: Option<u64>,
+    pub last_vision_age_ms: Option<u64>,
+    pub vision_frame_id: Option<u64>,
     pub last_shadow_target: Option<Vec<f32>>,
     pub last_live_target: Option<Vec<f32>>,
     pub max_first_step_rad: f32,
@@ -73,6 +78,8 @@ impl PolicyRun {
             mode: self.mode.as_str().to_string(),
             steps: self.steps,
             last_input_age_ms: self.last_input_age_ms,
+            last_vision_age_ms: self.last_vision_age_ms,
+            vision_frame_id: self.vision_frame_id,
             last_shadow_target: self.last_shadow_target.clone(),
             stop_reason: self.stop_reason.clone(),
         }
@@ -273,9 +280,10 @@ impl PreparedPolicy {
                 actual: config.limits.len(),
             });
         }
-        if backend.input_dim() != contract.action_dim {
+        let expected_in = contract.expected_input_dim();
+        if backend.input_dim() != expected_in {
             return Err(PolicyError::DimensionMismatch {
-                expected: contract.action_dim,
+                expected: expected_in,
                 actual: backend.input_dim(),
             });
         }
@@ -306,7 +314,7 @@ impl PreparedPolicy {
             policy_gripper_idx,
             gripper_bounds,
             policy_state_rad: vec![0.0; dim],
-            infer_in: vec![0.0; dim],
+            infer_in: vec![0.0; expected_in],
             infer_out: vec![0.0; dim],
             policy_act_units: vec![0.0; dim],
             arm_target_rad: vec![0.0; dim],
@@ -327,7 +335,18 @@ impl PreparedPolicy {
 
     /// Run one full state -> units -> normalize -> infer -> denormalize -> radians -> reorder step.
     pub fn step_infer(&mut self, measured_arm_rad: &[f32]) -> Result<Vec<f32>, PolicyError> {
+        self.step_infer_with_vision(measured_arm_rad, None)
+    }
+
+    /// Run one full inference step, optionally appending pre-extracted vision features after the
+    /// normalized proprioception vector.
+    pub fn step_infer_with_vision(
+        &mut self,
+        measured_arm_rad: &[f32],
+        vision_features: Option<&[f32]>,
+    ) -> Result<Vec<f32>, PolicyError> {
         let dim = self.contract.action_dim;
+        let vision_dim = self.contract.vision_feature_dim();
         if measured_arm_rad.len() != dim {
             return Err(PolicyError::DimensionMismatch {
                 expected: dim,
@@ -339,6 +358,38 @@ impl PreparedPolicy {
                 return Err(PolicyError::NonFinite(format!(
                     "measured_positions[{idx}] is non-finite: {v}"
                 )));
+            }
+        }
+        match (vision_dim, vision_features) {
+            (0, None) => {}
+            (0, Some(vf)) => {
+                if !vf.is_empty() {
+                    return Err(PolicyError::DimensionMismatch {
+                        expected: 0,
+                        actual: vf.len(),
+                    });
+                }
+            }
+            (expected_v, None) => {
+                return Err(PolicyError::DimensionMismatch {
+                    expected: expected_v,
+                    actual: 0,
+                });
+            }
+            (expected_v, Some(vf)) => {
+                if vf.len() != expected_v {
+                    return Err(PolicyError::DimensionMismatch {
+                        expected: expected_v,
+                        actual: vf.len(),
+                    });
+                }
+                for (idx, &v) in vf.iter().enumerate() {
+                    if !v.is_finite() {
+                        return Err(PolicyError::NonFinite(format!(
+                            "vision_features[{idx}] is non-finite: {v}"
+                        )));
+                    }
+                }
             }
         }
 
@@ -357,9 +408,12 @@ impl PreparedPolicy {
             &self.contract.normalization.state_mean,
             &self.contract.normalization.state_std,
         ) {
-            normalize_state_into(&state_units, mean, std, &mut self.infer_in)?;
+            normalize_state_into(&state_units, mean, std, &mut self.infer_in[..dim])?;
         } else {
-            self.infer_in.copy_from_slice(&state_units);
+            self.infer_in[..dim].copy_from_slice(&state_units);
+        }
+        if let Some(vf) = vision_features.filter(|_| vision_dim > 0) {
+            self.infer_in[dim..dim + vision_dim].copy_from_slice(vf);
         }
 
         self.backend.infer(&self.infer_in, &mut self.infer_out)?;
@@ -426,14 +480,27 @@ pub fn prepare_policy(dir: &Path, config: &ArmConfig) -> Result<PreparedPolicy, 
 }
 
 /// Spawn the async policy runner task that executes inference outside the supervisor lock and
-/// submits targets via `SupervisorInner::policy_step`.
+/// submits targets via `SupervisorInner::policy_step_with_vision`.
 pub fn spawn_policy_runner(
     supervisor: Arc<ArmSupervisor>,
     action_id: u64,
     mut prepared: PreparedPolicy,
     fps: f64,
     deadline: Option<Instant>,
+    vision_source: Option<Arc<dyn PolicyVisionSource>>,
 ) -> tokio::task::JoinHandle<()> {
+    let vision_spec = prepared.contract().vision.clone();
+    if vision_spec.is_some() && vision_source.is_none() {
+        return tokio::spawn(async move {
+            let mut inner = supervisor.inner().write().await;
+            inner.fail_policy_run(
+                action_id,
+                "VISION_UNAVAILABLE",
+                "Policy requires vision input, but no vision source is available",
+            );
+        });
+    }
+
     let clamped_fps = if fps.is_finite() && fps > 0.0 {
         fps.clamp(MIN_POLICY_FPS, MAX_POLICY_FPS)
     } else {
@@ -443,6 +510,13 @@ pub fn spawn_policy_runner(
     let tokio_dl = deadline.map(tokio::time::Instant::from_std);
 
     tokio::spawn(async move {
+        let collector = vision_spec.as_ref().zip(vision_source).map(|(spec, src)| {
+            let wait_ms = (spec.max_staleness_ms / 4).clamp(10, 50);
+            VisionFeatureCollector::start(src, wait_ms)
+        });
+        let run_started_at = Instant::now();
+        let mut locked_generation: Option<u64> = None;
+
         let mut interval = tokio::time::interval(period);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -468,20 +542,66 @@ pub fn spawn_policy_runner(
                 }
             }
 
-            let (measured, base_input_age_ms, captured_at) = {
+            let (measured, prop_age_range_ms, captured_at) = {
                 let inner = supervisor.inner().read().await;
                 if !inner.is_policy_run_active(action_id) {
                     break;
                 }
                 (
                     inner.measured_positions.clone(),
-                    inner.policy_input_age_ms(),
+                    inner.policy_input_age_range_ms(),
                     Instant::now(),
                 )
             };
+            let base_input_age_ms = prop_age_range_ms.map(|(_, max_prop)| max_prop);
+
+            let (vision_features, vision_captured_at, vision_frame_id) =
+                if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
+                    let frame = col.latest();
+                    let now = Instant::now();
+                    let prop_elapsed_ms = now
+                        .saturating_duration_since(captured_at)
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64;
+                    let synced_prop_age_range_ms = prop_age_range_ms.map(|(lo, hi)| {
+                        (
+                            lo.saturating_add(prop_elapsed_ms),
+                            hi.saturating_add(prop_elapsed_ms),
+                        )
+                    });
+                    match evaluate_vision_frame(
+                        frame.as_ref(),
+                        spec,
+                        run_started_at,
+                        now,
+                        synced_prop_age_range_ms,
+                        &mut locked_generation,
+                    ) {
+                        VisionStepDecision::Ready {
+                            features,
+                            vision_age_ms: _,
+                            frame_id,
+                        } => (
+                            Some(features),
+                            frame.as_ref().and_then(|f| f.captured_at),
+                            Some(frame_id),
+                        ),
+                        VisionStepDecision::Hold => continue,
+                        VisionStepDecision::Stop { reason, message } => {
+                            let mut inner = supervisor.inner().write().await;
+                            inner.fail_policy_run(action_id, reason, message);
+                            break;
+                        }
+                    }
+                } else {
+                    (None, None, None)
+                };
 
             let infer_handle = tokio::task::spawn_blocking(move || {
-                let res = prepared.step_infer(&measured);
+                let res = prepared.step_infer_with_vision(
+                    &measured,
+                    vision_features.as_ref().map(|f| f.as_slice()),
+                );
                 (prepared, res)
             });
             let infer_result = if let Some(dl) = tokio_dl {
@@ -534,10 +654,70 @@ pub fn spawn_policy_runner(
                     break;
                 }
             }
+            let post_vision_age_ms = if let (Some(spec), Some(vis_cap)) =
+                (&vision_spec, vision_captured_at)
+            {
+                let age_ms = Instant::now()
+                    .saturating_duration_since(vis_cap)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
+                if age_ms > spec.max_staleness_ms {
+                    match spec.on_stale {
+                        VisionStalePolicy::Stop => {
+                            inner.fail_policy_run(
+                                action_id,
+                                "VISION_STALE",
+                                format!(
+                                    "Vision frame became stale before step commit ({age_ms} ms > {} ms)",
+                                    spec.max_staleness_ms
+                                ),
+                            );
+                            break;
+                        }
+                        VisionStalePolicy::Hold => continue,
+                    }
+                }
+                Some(age_ms)
+            } else {
+                None
+            };
+            if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
+                if spec.require_model_generation {
+                    if let Some(latest_frame) = col.latest() {
+                        if latest_frame.model_generation != locked_generation {
+                            let (reason, message) = match latest_frame.model_generation {
+                                None => (
+                                    "VISION_GENERATION_MISSING",
+                                    format!(
+                                        "Vision frame {} missing required model_generation before step commit",
+                                        latest_frame.frame_id
+                                    ),
+                                ),
+                                Some(new_gen) => (
+                                    "VISION_GENERATION_CHANGED",
+                                    format!(
+                                        "Vision model generation changed from {} to {new_gen} before step commit",
+                                        locked_generation
+                                            .map_or_else(|| "none".to_string(), |g| g.to_string())
+                                    ),
+                                ),
+                            };
+                            inner.fail_policy_run(action_id, reason, message);
+                            break;
+                        }
+                    }
+                }
+            }
             let input_age_ms = base_input_age_ms.map(|base| {
                 base.saturating_add(captured_at.elapsed().as_millis().min(u64::MAX as u128) as u64)
             });
-            if let Err(e) = inner.policy_step(action_id, target, input_age_ms) {
+            if let Err(e) = inner.policy_step_with_vision(
+                action_id,
+                target,
+                input_age_ms,
+                post_vision_age_ms,
+                vision_frame_id,
+            ) {
                 tracing::info!("Policy runner {action_id} exited on step: {e}");
                 break;
             }

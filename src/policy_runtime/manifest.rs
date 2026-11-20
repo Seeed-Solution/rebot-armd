@@ -16,7 +16,86 @@ use super::PolicyError;
 pub const POLICY_FORMAT_V1: &str = "rebot-onnx-policy/v1";
 pub const MAX_POLICY_JSON_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_MODEL_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_VISION_STALENESS_MS: u64 = 500;
+pub const DEFAULT_VISION_MIN_SCORE: f32 = 0.3;
 const MAX_ONNX_PROTO_DEPTH: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionSourceKind {
+    Detector,
+}
+
+impl VisionSourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Detector => "detector",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionLayout {
+    Top1BoxNormV1,
+}
+
+impl VisionLayout {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Top1BoxNormV1 => "top1_box_norm_v1",
+        }
+    }
+
+    pub fn feature_dim(self) -> usize {
+        match self {
+            Self::Top1BoxNormV1 => 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionTargetLostPolicy {
+    ZeroFeatures,
+    Hold,
+    Stop,
+}
+
+impl VisionTargetLostPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ZeroFeatures => "zero_features",
+            Self::Hold => "hold",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionStalePolicy {
+    Hold,
+    Stop,
+}
+
+impl VisionStalePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hold => "hold",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisionFeatureSpec {
+    pub source: VisionSourceKind,
+    pub layout: VisionLayout,
+    pub target_label: Option<String>,
+    pub min_score: f32,
+    pub max_staleness_ms: u64,
+    pub max_sync_skew_ms: u64,
+    pub on_target_lost: VisionTargetLostPolicy,
+    pub on_stale: VisionStalePolicy,
+    pub require_model_generation: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitMode {
@@ -55,6 +134,7 @@ pub struct StrictPolicyContract {
     pub fps: Option<f64>,
     pub max_step_rad: Option<f32>,
     pub max_first_step_rad: Option<f32>,
+    pub vision: Option<VisionFeatureSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +348,14 @@ pub fn compute_release_digest(
 }
 
 impl StrictPolicyContract {
+    pub fn vision_feature_dim(&self) -> usize {
+        self.vision.as_ref().map_or(0, |v| v.layout.feature_dim())
+    }
+
+    pub fn expected_input_dim(&self) -> usize {
+        self.action_dim + self.vision_feature_dim()
+    }
+
     /// Parse and strictly validate `policy.json` from raw JSON bytes without permissive defaults.
     pub fn parse(policy_json_bytes: &[u8]) -> Result<Self, PolicyError> {
         if policy_json_bytes.is_empty() {
@@ -351,6 +439,7 @@ impl StrictPolicyContract {
         let max_step_rad = parse_optional_positive_f32(obj.get("max_step_rad"), "max_step_rad")?;
         let max_first_step_rad =
             parse_optional_positive_f32(obj.get("max_first_step_rad"), "max_first_step_rad")?;
+        let vision = parse_vision_spec(obj.get("vision"))?;
 
         Ok(Self {
             format,
@@ -365,8 +454,158 @@ impl StrictPolicyContract {
             fps,
             max_step_rad,
             max_first_step_rad,
+            vision,
         })
     }
+}
+
+fn parse_vision_spec(val: Option<&Value>) -> Result<Option<VisionFeatureSpec>, PolicyError> {
+    let Some(raw) = val else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let obj = raw
+        .as_object()
+        .ok_or_else(|| PolicyError::InvalidManifest("vision must be a JSON object".into()))?;
+
+    let source_raw = require_non_empty_str(obj.get("source"), "vision.source")?;
+    let source = match source_raw.as_str() {
+        "detector" => VisionSourceKind::Detector,
+        other => {
+            return Err(PolicyError::InvalidManifest(format!(
+                "unsupported vision.source {other:?}; must be 'detector'"
+            )));
+        }
+    };
+
+    let layout_raw = require_non_empty_str(obj.get("layout"), "vision.layout")?;
+    let layout = match layout_raw.as_str() {
+        "top1_box_norm_v1" => VisionLayout::Top1BoxNormV1,
+        other => {
+            return Err(PolicyError::InvalidManifest(format!(
+                "unsupported vision.layout {other:?}; must be 'top1_box_norm_v1'"
+            )));
+        }
+    };
+
+    let target_label = match obj.get("target_label") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let s = v.as_str().ok_or_else(|| {
+                PolicyError::InvalidManifest("vision.target_label must be a non-empty string".into())
+            })?;
+            if s.trim().is_empty() {
+                return Err(PolicyError::InvalidManifest(
+                    "vision.target_label must be a non-empty string".into(),
+                ));
+            }
+            Some(s.to_string())
+        }
+    };
+
+    let min_score = match obj.get("min_score") {
+        None | Some(Value::Null) => DEFAULT_VISION_MIN_SCORE,
+        Some(v) => {
+            let f64_val = v.as_f64().ok_or_else(|| {
+                PolicyError::InvalidManifest(
+                    "vision.min_score must be a finite number in [0.0, 1.0]".into(),
+                )
+            })?;
+            let f32_val = f64_val as f32;
+            if !f64_val.is_finite() || !f32_val.is_finite() {
+                return Err(PolicyError::NonFinite(
+                    "vision.min_score is non-finite".into(),
+                ));
+            }
+            if !(0.0..=1.0).contains(&f64_val) || !(0.0..=1.0).contains(&f32_val) {
+                return Err(PolicyError::InvalidManifest(format!(
+                    "vision.min_score must be in [0.0, 1.0], got {f64_val}"
+                )));
+            }
+            f32_val
+        }
+    };
+
+    let max_staleness_raw = obj.get("max_staleness_ms").ok_or_else(|| {
+        PolicyError::InvalidManifest("missing required field 'vision.max_staleness_ms'".into())
+    })?;
+    let max_staleness_ms = max_staleness_raw.as_u64().ok_or_else(|| {
+        PolicyError::InvalidManifest(format!(
+            "vision.max_staleness_ms must be an integer in 1..={MAX_VISION_STALENESS_MS}"
+        ))
+    })?;
+    if !(1..=MAX_VISION_STALENESS_MS).contains(&max_staleness_ms) {
+        return Err(PolicyError::InvalidManifest(format!(
+            "vision.max_staleness_ms must be in 1..={MAX_VISION_STALENESS_MS}, got {max_staleness_ms}"
+        )));
+    }
+
+    let max_sync_skew_ms = match obj.get("max_sync_skew_ms") {
+        None | Some(Value::Null) => max_staleness_ms,
+        Some(v) => {
+            let skew = v.as_u64().ok_or_else(|| {
+                PolicyError::InvalidManifest(format!(
+                    "vision.max_sync_skew_ms must be an integer in 1..={MAX_VISION_STALENESS_MS}"
+                ))
+            })?;
+            if !(1..=MAX_VISION_STALENESS_MS).contains(&skew) {
+                return Err(PolicyError::InvalidManifest(format!(
+                    "vision.max_sync_skew_ms must be in 1..={MAX_VISION_STALENESS_MS}, got {skew}"
+                )));
+            }
+            skew
+        }
+    };
+
+    let on_target_lost = match obj.get("on_target_lost") {
+        None | Some(Value::Null) => VisionTargetLostPolicy::Hold,
+        Some(v) => match require_non_empty_str(Some(v), "vision.on_target_lost")?.as_str() {
+            "zero_features" => VisionTargetLostPolicy::ZeroFeatures,
+            "hold" => VisionTargetLostPolicy::Hold,
+            "stop" => VisionTargetLostPolicy::Stop,
+            other => {
+                return Err(PolicyError::InvalidManifest(format!(
+                    "unsupported vision.on_target_lost {other:?}; must be 'zero_features', 'hold', or 'stop'"
+                )));
+            }
+        },
+    };
+
+    let on_stale = match obj.get("on_stale") {
+        None | Some(Value::Null) => VisionStalePolicy::Stop,
+        Some(v) => match require_non_empty_str(Some(v), "vision.on_stale")?.as_str() {
+            "hold" => VisionStalePolicy::Hold,
+            "stop" => VisionStalePolicy::Stop,
+            other => {
+                return Err(PolicyError::InvalidManifest(format!(
+                    "unsupported vision.on_stale {other:?}; must be 'hold' or 'stop'"
+                )));
+            }
+        },
+    };
+
+    let require_model_generation = match obj.get("require_model_generation") {
+        None | Some(Value::Null) => true,
+        Some(v) => v.as_bool().ok_or_else(|| {
+            PolicyError::InvalidManifest(
+                "vision.require_model_generation must be a boolean".into(),
+            )
+        })?,
+    };
+
+    Ok(Some(VisionFeatureSpec {
+        source,
+        layout,
+        target_label,
+        min_score,
+        max_staleness_ms,
+        max_sync_skew_ms,
+        on_target_lost,
+        on_stale,
+        require_model_generation,
+    }))
 }
 
 fn validate_lexical_relative_path(rel: &str) -> Result<(), PolicyError> {

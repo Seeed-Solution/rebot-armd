@@ -783,6 +783,8 @@ fn refuse_calibrated_request(base: &GraspSetup, body: &Value) -> Result<(), Moti
 pub struct Detection {
     pub label: String,
     pub score: f64,
+    /// `true` when the upstream raw score was finite and in `[0.0, 1.0]` before clamping.
+    pub raw_score_valid: bool,
     /// Normalised [x0, y0, x1, y1].
     pub box_norm: [f64; 4],
     /// Orientation of the object's long side in the image (deg, from +x toward +y, y down,
@@ -822,6 +824,10 @@ pub struct DetectionFrame {
     pub frame_id: u64,
     /// Capture time on this host's clock (response time − `age_ms`).
     pub captured_at: Instant,
+    /// Conservative capture time for policy runtime staleness checks (`Some` when upstream
+    /// reported a valid non-negative finite `age_ms` and subtraction succeeded, penalized for
+    /// HTTP response latency beyond any server long-poll `wait_ms`).
+    pub policy_captured_at: Option<Instant>,
     pub image_size_px: [f64; 2],
     pub detections: Vec<Detection>,
     pub depth: Option<DepthFrameInfo>,
@@ -1032,14 +1038,37 @@ pub struct HttpDetectionSource {
 
 impl HttpDetectionSource {
     /// A result envelope (`latest` or `trigger`) as a frame; `None` when it carries no new frame.
-    fn frame(&self, v: &Value, after: Option<u64>, received: Instant) -> Option<DetectionFrame> {
+    fn frame(
+        &self,
+        v: &Value,
+        after: Option<u64>,
+        req_started: Instant,
+        received: Instant,
+        wait_ms: u64,
+    ) -> Option<DetectionFrame> {
         if v.get("timeout").and_then(Value::as_bool) == Some(true) || v.get("success").and_then(Value::as_bool) == Some(false) {
             return None;
         }
         let frame_id = v.get("frame_id").and_then(Value::as_u64)?;
         if after.is_some_and(|a| frame_id <= a) { return None; }
-        let age = v.get("age_ms").and_then(Value::as_f64).filter(|a| a.is_finite() && *a >= 0.0).unwrap_or(0.0);
-        let captured_at = received.checked_sub(Duration::from_secs_f64(age / 1000.0)).unwrap_or(received);
+        let age_dur = v
+            .get("age_ms")
+            .and_then(Value::as_f64)
+            .filter(|a| a.is_finite() && *a >= 0.0)
+            .and_then(|age_ms| Duration::try_from_secs_f64(age_ms / 1000.0).ok());
+        let captured_at = age_dur
+            .and_then(|dur| received.checked_sub(dur))
+            .unwrap_or(received);
+        let conservative_extra_delay = if after.is_none() || wait_ms == 0 {
+            received.saturating_duration_since(req_started)
+        } else {
+            received
+                .saturating_duration_since(req_started)
+                .saturating_sub(Duration::from_millis(wait_ms))
+        };
+        let policy_captured_at = age_dur
+            .and_then(|dur| dur.checked_add(conservative_extra_delay))
+            .and_then(|total_delay| received.checked_sub(total_delay));
         let size = match (v.get("width").and_then(Value::as_f64), v.get("height").and_then(Value::as_f64)) {
             (Some(w), Some(h)) if w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0 => [w, h],
             _ => self.image_size_px,
@@ -1064,7 +1093,7 @@ impl HttpDetectionSource {
         });
         let detections = parse_detections(v.get("detections").unwrap_or(&Value::Null), size);
         let model_generation = v.get("model_generation").and_then(Value::as_u64);
-        Some(DetectionFrame { frame_id, captured_at, image_size_px: size, detections, depth, model_generation })
+        Some(DetectionFrame { frame_id, captured_at, policy_captured_at, image_size_px: size, detections, depth, model_generation })
     }
 }
 
@@ -1175,6 +1204,7 @@ impl DetectionSource for HttpDetectionSource {
                 obj["mask_focus"] = mf;
             }
             let body = obj.to_string();
+            let req_started = Instant::now();
             let v = match crate::api::proxy::request_json(&self.upstream, "POST", "/api/trigger", Some(body.as_bytes()), Duration::from_millis(wait_ms + 2000)).await {
                 Ok(v) => v,
                 // an older rebot-vision ignores the unknown field; retry only on a rejected body
@@ -1185,7 +1215,7 @@ impl DetectionSource for HttpDetectionSource {
                 }
                 Err(e) => return Err(e),
             };
-            Ok(self.frame(&v, None, Instant::now()))
+            Ok(self.frame(&v, None, req_started, Instant::now(), wait_ms))
         })
     }
     fn set_mask_focus(&self, label: Option<String>, box_norm: [f64; 4], ttl_ms: u64) -> BoxFuture<'_, Result<(), String>> {
@@ -1242,8 +1272,9 @@ impl DetectionSource for HttpDetectionSource {
         Box::pin(async move {
             let wait_ms = wait_ms.min(5000);
             let path = format!("/api/results/latest?after={}&wait_ms={wait_ms}", after.unwrap_or(0));
+            let req_started = Instant::now();
             let v = crate::api::proxy::request_json(&self.upstream, "GET", &path, None, Duration::from_millis(wait_ms + 2000)).await?;
-            Ok(self.frame(&v, after, Instant::now()))
+            Ok(self.frame(&v, after, req_started, Instant::now(), wait_ms))
         })
     }
 }
@@ -1332,7 +1363,8 @@ pub fn parse_detections(raw: &Value, size: [f64; 2]) -> Vec<Detection> {
         let depth_angle_deg = item.is_object().then(|| f(item, &["depth_angle_deg"])).flatten().map(|a| (a + 90.0).rem_euclid(180.0) - 90.0);
         let depth_angle_conf = item.is_object().then(|| f(item, &["depth_angle_conf"])).flatten().map(|c| c.clamp(0.0, 1.0));
         let depth_width_px = item.is_object().then(|| f(item, &["depth_width_px"])).flatten().filter(|w| *w > 0.0);
-        out.push(Detection { label, score: score.clamp(0.0, 1.0), box_norm: b, angle_deg, angle_conf, grasp_width_px, mask_focus, disp_fg, disp_bg, depth_conf, length_px, jaw_clear,
+        let raw_score_valid = score.is_finite() && (0.0..=1.0).contains(&score);
+        out.push(Detection { label, score: score.clamp(0.0, 1.0), raw_score_valid, box_norm: b, angle_deg, angle_conf, grasp_width_px, mask_focus, disp_fg, disp_bg, depth_conf, length_px, jaw_clear,
             depth_angle_deg, depth_angle_conf, depth_width_px });
     }
     out
@@ -4174,7 +4206,7 @@ mod tests {
     }
 
     fn det(b: [f64; 4], angle: Option<(f64, f64)>) -> Detection {
-        Detection { label: "cup".into(), score: 0.9, box_norm: b, angle_deg: angle.map(|a| a.0), angle_conf: angle.map(|a| a.1), grasp_width_px: None, mask_focus: false, disp_fg: None, disp_bg: None, depth_conf: None, length_px: None, jaw_clear: None, depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None }
+        Detection { label: "cup".into(), score: 0.9, raw_score_valid: true, box_norm: b, angle_deg: angle.map(|a| a.0), angle_conf: angle.map(|a| a.1), grasp_width_px: None, mask_focus: false, disp_fg: None, disp_bg: None, depth_conf: None, length_px: None, jaw_clear: None, depth_angle_deg: None, depth_angle_conf: None, depth_width_px: None }
     }
 
     #[test]
@@ -4242,7 +4274,10 @@ mod tests {
     #[test]
     fn tracker_widens_the_gate_for_a_box_at_the_border() {
         let setup = GraspSetup::default();
-        let frame = |b: [f64; 4]| DetectionFrame { frame_id: 1, captured_at: Instant::now(), image_size_px: [640.0, 360.0], detections: vec![Detection { label: "cube".into(), ..det(b, None) }], depth: None, model_generation: None };
+        let frame = |b: [f64; 4]| {
+            let now = Instant::now();
+            DetectionFrame { frame_id: 1, captured_at: now, policy_captured_at: Some(now), image_size_px: [640.0, 360.0], detections: vec![Detection { label: "cube".into(), ..det(b, None) }], depth: None, model_generation: None }
+        };
         // predicted cut box (v 0.9..1.0) after a step; the box seen whole is 96 px higher
         let seen = frame([0.4, 300.0 / 360.0 - 0.3, 0.5, 300.0 / 360.0]);
         let cut = Tracker { label: "cube".into(), predicted: [0.4, 0.9, 0.5, 1.0], gate_px: setup.match_dist_px };
@@ -4744,6 +4779,7 @@ mod tests {
         let det = Detection {
             label: "cube".into(),
             score: 0.9,
+            raw_score_valid: true,
             box_norm: [0.45, 0.45, 0.55, 0.55],
             angle_deg: None,
             angle_conf: None,
@@ -4788,6 +4824,7 @@ mod tests {
         let det = Detection {
             label: "obj".into(),
             score: 0.9,
+            raw_score_valid: true,
             box_norm: [0.45, 0.45, 0.55, 0.55],
             angle_deg: Some(90.0),
             angle_conf: Some(0.9),
@@ -4835,7 +4872,8 @@ mod tests {
                 "grasp_width_px": 40.0,
             }]
         });
-        let mut frame = src.frame(&raw, None, Instant::now()).expect("frame parsed");
+        let now = Instant::now();
+        let mut frame = src.frame(&raw, None, now, now, 0).expect("frame parsed");
         assert_eq!(frame.image_size_px, [1280.0, 720.0]);
         assert_eq!(frame.depth.as_ref().unwrap().table_samples[0], [100.0, 200.0, 0.85]);
         assert_eq!(frame.detections[0].length_px, Some(80.0));
@@ -4869,13 +4907,16 @@ mod tests {
         assert!((meas_iso.width_m.unwrap() - expected_w_iso).abs() < 1e-9);
 
         // Anisotropic rescaling:
+        let now_aniso = Instant::now();
         let mut frame_aniso = DetectionFrame {
             frame_id: 2,
-            captured_at: Instant::now(),
+            captured_at: now_aniso,
+            policy_captured_at: Some(now_aniso),
             image_size_px: [640.0, 360.0],
             detections: vec![Detection {
                 label: "cup".into(),
                 score: 0.9,
+                raw_score_valid: true,
                 box_norm: [0.3, 0.3, 0.7, 0.7],
                 angle_deg: Some(45.0),
                 angle_conf: Some(0.9),
@@ -5074,7 +5115,10 @@ mod tests {
             depth_angle_deg: (!mask).then_some(30.0), depth_width_px: (!mask).then_some(40.0),
             ..det([0.4, 0.4, 0.6, 0.6], None)
         };
-        let frame = |d: Detection| DetectionFrame { frame_id: 1, captured_at: Instant::now(), image_size_px: [1280.0, 540.0], detections: vec![d], depth: None, model_generation: None };
+        let frame = |d: Detection| {
+            let now = Instant::now();
+            DetectionFrame { frame_id: 1, captured_at: now, policy_captured_at: Some(now), image_size_px: [1280.0, 540.0], detections: vec![d], depth: None, model_generation: None }
+        };
         let (mut fm, mut fd) = (frame(mk(true)), frame(mk(false)));
         rescale_frame_to_cam(&mut fm, &cam);
         rescale_frame_to_cam(&mut fd, &cam);

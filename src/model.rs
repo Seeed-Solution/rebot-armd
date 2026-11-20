@@ -1748,6 +1748,10 @@ pub struct PolicyObservation {
     pub steps: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_input_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_vision_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_frame_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_shadow_target: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2002,7 +2006,10 @@ impl PolicyRuntimeCapabilities {
         }
         Self {
             backends,
-            inputs: vec!["proprioception".to_string()],
+            inputs: vec![
+                "proprioception".to_string(),
+                "detector_top1_box_norm_v1".to_string(),
+            ],
             modes: vec!["shadow".to_string(), "live_sim".to_string()],
         }
     }

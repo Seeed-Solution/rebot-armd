@@ -1087,6 +1087,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 if let Some((request_id, pending, generation, loading_guard)) = pending_policy.take() {
                     let sup = recv_supervisor.clone();
                     let sandbox_c = recv_sandbox.clone();
+                    let vision_src = recv_deps.source.clone();
                     let conn = recv_connection.clone();
                     let gen_now = recv_generation.clone();
                     let tx = ack_tx.clone();
@@ -1182,12 +1183,23 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                                     let digest = prepared_policy.artifact_digest().to_string();
                                                     let backend = prepared_policy.backend_name().to_string();
                                                     let mode_str = pending.request.mode.as_str().to_string();
+                                                    let vision_source = prepared_policy
+                                                        .contract()
+                                                        .vision
+                                                        .as_ref()
+                                                        .map(|_| {
+                                                            Arc::new(crate::policy_runtime::DetectionSourceAdapter(
+                                                                vision_src.clone(),
+                                                            ))
+                                                                as Arc<dyn crate::policy_runtime::PolicyVisionSource>
+                                                        });
                                                     crate::policy_runtime::spawn_policy_runner(
                                                         sup.clone(),
                                                         action_id,
                                                         prepared_policy,
                                                         fps,
                                                         deadline,
+                                                        vision_source,
                                                     );
                                                     let mut ack = command_ack(&inner, &request_id, Some((action_id, pending.request.max_seconds.unwrap_or(0.0))));
                                                     ack["policy_id"] = json!(policy_id);

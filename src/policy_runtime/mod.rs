@@ -8,12 +8,15 @@ pub mod runner;
 #[cfg(feature = "policy-tract")]
 pub mod tract_backend;
 pub mod units;
+pub mod vision;
 
 use thiserror::Error;
 
 pub use manifest::{
     compute_release_digest, reject_external_onnx_data, NormalizationStats, PolicySnapshot,
-    StrictPolicyContract, UnitMode, MAX_MODEL_BYTES, MAX_POLICY_JSON_BYTES,
+    StrictPolicyContract, UnitMode, VisionFeatureSpec, VisionLayout, VisionSourceKind,
+    VisionStalePolicy, VisionTargetLostPolicy, DEFAULT_VISION_MIN_SCORE, MAX_MODEL_BYTES,
+    MAX_POLICY_JSON_BYTES, MAX_VISION_STALENESS_MS,
 };
 pub use mlp::{
     encode_rmlp_bytes, Activation, MlpBackend, MlpLayerSpec, RMLP_MAGIC, MAX_DIM, MAX_LAYERS,
@@ -30,6 +33,10 @@ pub use tract_backend::TractBackend;
 pub use units::{
     denormalize_action, denormalize_action_into, normalize_state, normalize_state_into,
     policy_units_to_rad, rad_to_policy_units, JointPermutation,
+};
+pub use vision::{
+    evaluate_vision_frame, extract_top1_box_norm_v1, DetectionSourceAdapter, PolicyVisionFrame,
+    PolicyVisionSource, VisionFeatureCollector, VisionStepDecision,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -68,7 +75,8 @@ pub trait PolicyBackend: Send {
 
 /// Dispatch and construct the appropriate [`PolicyBackend`] for a loaded snapshot and contract.
 ///
-/// Validates that the backend's input and output dimensions match `contract.action_dim`.
+/// Validates that the backend's input dimension matches `contract.expected_input_dim()`
+/// and output dimension matches `contract.action_dim`.
 pub fn load_backend(
     snapshot: &PolicySnapshot,
     contract: &StrictPolicyContract,
@@ -89,9 +97,10 @@ pub fn load_backend(
         )));
     };
 
-    if backend.input_dim() != contract.action_dim {
+    let expected_in = contract.expected_input_dim();
+    if backend.input_dim() != expected_in {
         return Err(PolicyError::DimensionMismatch {
-            expected: contract.action_dim,
+            expected: expected_in,
             actual: backend.input_dim(),
         });
     }

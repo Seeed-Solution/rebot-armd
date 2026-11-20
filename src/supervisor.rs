@@ -4693,17 +4693,29 @@ impl SupervisorInner {
     }
 
     pub fn policy_input_age_ms(&self) -> Option<u64> {
+        self.policy_input_age_range_ms().map(|(_, max_ms)| max_ms)
+    }
+
+    pub fn policy_input_age_range_ms(&self) -> Option<(u64, u64)> {
         match &self.driver {
-            None => Some(0),
+            None => Some((0, 0)),
             Some(d) => d.lock().ok().and_then(|drv| {
                 let ages = drv.feedback_ages();
                 if ages.len() != self.config.dof {
                     return None;
                 }
-                ages.into_iter()
-                    .collect::<Option<Vec<_>>>()
-                    .and_then(|v| v.into_iter().max())
-                    .map(|dur| dur.as_millis().min(u64::MAX as u128) as u64)
+                let durs = ages.into_iter().collect::<Option<Vec<_>>>()?;
+                let mut min_ms = u64::MAX;
+                let mut max_ms = 0u64;
+                for dur in durs {
+                    let ms = dur.as_millis().min(u64::MAX as u128) as u64;
+                    min_ms = min_ms.min(ms);
+                    max_ms = max_ms.max(ms);
+                }
+                if min_ms > max_ms {
+                    return None;
+                }
+                Some((min_ms, max_ms))
             }),
         }
     }
@@ -4811,6 +4823,8 @@ impl SupervisorInner {
             mode: req.mode,
             steps: 0,
             last_input_age_ms: None,
+            last_vision_age_ms: None,
+            vision_frame_id: None,
             last_shadow_target: None,
             last_live_target: None,
             max_first_step_rad,
@@ -4830,8 +4844,19 @@ impl SupervisorInner {
     pub fn policy_step(
         &mut self,
         action_id: u64,
+        targets: Vec<f32>,
+        input_age_ms: Option<u64>,
+    ) -> Result<(), ArmError> {
+        self.policy_step_with_vision(action_id, targets, input_age_ms, None, None)
+    }
+
+    pub fn policy_step_with_vision(
+        &mut self,
+        action_id: u64,
         mut targets: Vec<f32>,
         input_age_ms: Option<u64>,
+        vision_age_ms: Option<u64>,
+        vision_frame_id: Option<u64>,
     ) -> Result<(), ArmError> {
         use crate::policy_runtime::PolicyMode;
 
@@ -4936,6 +4961,8 @@ impl SupervisorInner {
             if let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) {
                 run.steps += 1;
                 run.last_input_age_ms = input_age_ms;
+                run.last_vision_age_ms = vision_age_ms;
+                run.vision_frame_id = vision_frame_id;
                 run.last_shadow_target = Some(targets);
                 self.last_policy_obs = Some(run.to_observation(true));
             }
@@ -5029,6 +5056,8 @@ impl SupervisorInner {
         if let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) {
             run.steps += 1;
             run.last_input_age_ms = input_age_ms;
+            run.last_vision_age_ms = vision_age_ms;
+            run.vision_frame_id = vision_frame_id;
             run.last_shadow_target = Some(targets.clone());
             run.last_live_target = Some(targets);
             self.last_policy_obs = Some(run.to_observation(true));
