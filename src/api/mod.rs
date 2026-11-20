@@ -249,6 +249,7 @@ pub fn create_router_calibration_with_auth(
                 .layer(middleware::from_fn(require_operator_for_writes)),
         )
         .route("/api/v1/detection/latest", get(proxy::get_detection_latest))
+        .route("/api/v1/camera/snapshot", get(proxy::get_camera_snapshot))
         .route("/api/v1/detection/trigger", post(proxy::post_detection_trigger).layer(middleware::from_fn(require_operator)))
         .route(
             "/api/v1/detection/mask_focus",

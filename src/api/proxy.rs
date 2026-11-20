@@ -483,6 +483,18 @@ fn trigger_body_wait_ms(body: &[u8]) -> Option<u64> {
     serde_json::from_slice::<serde_json::Value>(body).ok()?.get("wait_ms")?.as_u64().map(|w| w.min(MAX_WAIT_MS))
 }
 
+/// Port of rebot-vision's video server, which serves `/snapshot.jpg` (`ARMD_SNAPSHOT_PORT` overrides).
+pub const DEFAULT_SNAPSHOT_PORT: u16 = 8001;
+
+/// GET /api/v1/camera/snapshot -> rebot-vision `GET /snapshot.jpg` on the detector's host,
+/// port [`DEFAULT_SNAPSHOT_PORT`]: the current camera JPEG from armd's origin, so the cockpit can
+/// read its pixels (the fingertip sticker measurement of the calibration wizard).
+pub async fn get_camera_snapshot(Extension(up): Extension<DetectorUpstream>) -> Response {
+    let port = std::env::var("ARMD_SNAPSHOT_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(DEFAULT_SNAPSHOT_PORT);
+    let snap = DetectorUpstream { host: up.host.clone(), port, base_path: String::new() };
+    forward(&snap, Method::GET, "/snapshot.jpg".into(), None, Duration::from_secs(3)).await
+}
+
 /// GET /api/v1/detection/mask_focus -> upstream GET /api/mask_focus
 pub async fn get_detection_mask_focus(Extension(up): Extension<DetectorUpstream>) -> Response {
     forward(&up, Method::GET, "/api/mask_focus".to_string(), None, Duration::from_secs(2)).await
