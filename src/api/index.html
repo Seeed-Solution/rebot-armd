@@ -718,6 +718,10 @@ body.is-fs.ui-simple .ext-banner, body.is-hud.ui-simple .ext-banner { display: n
 #btn-task .live-dot { position: absolute; top: 4px; right: 4px; width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid #fff; background: var(--sc-color-primary); display: none; }
 #btn-task.is-live .live-dot { display: block; }
 #btn-task.is-live.warn .live-dot { background: #d48806; }
+/* narrow headers: the task button shows while something external runs (the video's #act-chip opens the drawer too);
+   on tablets the mode switch gives up some width so the header does not scroll sideways */
+@media (max-width: 479px) { #btn-task:not(.is-live) { display: none; } }
+@media (min-width: 640px) and (max-width: 999px) { .ui-switch button { min-width: 88px; } }
 .task-tabs { display: flex; }
 .task-tabs button { flex: 1 1 0; }
 .task-pane[hidden] { display: none; }
