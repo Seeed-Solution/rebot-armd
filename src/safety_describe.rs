@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 use crate::motion::{MAX_ANGULAR_RPS, MAX_LINEAR_MPS};
 use crate::safety::FaultCode;
 use crate::supervisor::{
-    SupervisorInner, BUS_LOSS_TIMEOUT, CONTROL_DEADLINE, PREEMPT_COOLDOWN, THERMAL_CLEAR_MARGIN_C,
+    SupervisorInner, BUS_LOSS_TIMEOUT, CONTROL_DEADLINE, GRIPPER_FORCE_CAP_TICKS, GRIPPER_STALL_RELEASE_NM,
+    PREEMPT_COOLDOWN, THERMAL_CLEAR_MARGIN_C,
     UNLOAD_SETTLE_HOLD, WATCHDOG_PARK_MARGIN, WATCHDOG_PARK_SETTLE_GRACE, WATCHDOG_PARK_TIMEOUT,
 };
 
@@ -162,6 +163,27 @@ impl SupervisorInner {
                 "clear": recovery(FaultCode::ThermalTrip),
             }),
         ];
+        let gripper = c.gripper_index().zip(c.gripper_policy.as_ref());
+        if let Some((joint, g)) = gripper.filter(|(_, g)| g.max_close_torque_nm.is_some()) {
+            stops.push(json!({
+                "id": "gripper_force_limit",
+                "trigger": "|gripper torque| above max_close_torque_nm for persist_ticks consecutive ticks on fresh feedback while the jaw is driven closed, whatever its speed",
+                "joint": joint,
+                "max_close_torque_nm": g.max_close_torque_nm,
+                "persist_ticks": GRIPPER_FORCE_CAP_TICKS,
+                "calibrated": false,
+                "applies_to": ["gripper_action", "grasp", "servo_stream", "joint_motion", "replay", "gravity_comp"],
+                "lease_required": false,
+                "effect": "hold_gripper_at_measured_position",
+                "motion_limit_reason": "gripper_force",
+                "observation": "gripper.force_limited, gripper.force_limit_trips",
+                "while_held": "gripper targets that close further are held; arm joints keep moving",
+                "release_below_nm": GRIPPER_STALL_RELEASE_NM,
+                "invalidates_commands": false,
+                "clear": ["open_gripper", "torque_below_release"],
+            }));
+        }
+
         if capabilities.collision_guard {
             let p = self.collision_policy();
             stops.push(json!({
@@ -321,6 +343,14 @@ impl SupervisorInner {
                 "keepout_source": keepout.source,
                 "keepout_rule": "boxes in force = profile boxes + runtime boxes (each tagged with its source); the runtime list cannot remove a profile box",
                 "speed_cap": cap,
+                "gripper": gripper.map(|(joint, g)| json!({
+                    "joint": joint,
+                    "max_close_torque_nm": g.max_close_torque_nm,
+                    "contact_torque_nm": g.contact_torque_nm,
+                    "max_lead_rad": g.max_lead_rad,
+                    "squeeze_rad": g.squeeze_rad,
+                    "contact_speed_rad_s": crate::motion::GRIPPER_CONTACT_SPEED,
+                })),
                 "action_speed_max": {
                     "linear_mps": cap.and_then(|s| s.linear_mps).map_or(MAX_LINEAR_MPS, |v| MAX_LINEAR_MPS.min(f64::from(v))),
                     "angular_rps": cap.and_then(|s| s.angular_rps).map_or(MAX_ANGULAR_RPS, |v| MAX_ANGULAR_RPS.min(f64::from(v))),
