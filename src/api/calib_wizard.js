@@ -230,7 +230,7 @@ export function stickerSvg(st = STICKER, { count = 4, title = 'reBot fingertip s
   const lines = [
     'Print at 100 % (no fit-to-page). Check the 50 mm ruler. 打印比例 100%（不要缩放），用 50 mm 标尺核对。',
     'Cut along the thin outline. Heavy edge flush with the fingertip, dots toward the wrist. 沿细线剪下，粗边与指尖平齐，圆点朝手腕。',
-    'The sticker must lie flat on the camera-facing finger face. 贴纸要平贴在朝向相机的手指面上。',
+    'Close the gripper; the sticker goes flat across both closed fingers, camera side. Remove it after the measurement. 合上夹爪，贴纸横贴在两根闭合手指朝向相机的一面；测量后撕下。',
   ];
   let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${pageW}mm" height="${pageH}mm" viewBox="0 0 ${pageW} ${pageH}">`;
   s += `<rect width="${pageW}" height="${pageH}" fill="#fff"/>`;
@@ -1356,8 +1356,8 @@ export function* solveFineSteps({ views, markerSide = BOARD_DEFAULT.markerSide, 
 }
 
 // ---------------------------------------------------------------- fingertip sticker (T20)
-/* A 2 x 2 dot sticker on the camera-facing finger face, its bottom edge flush with the fingertip, dots toward
-   the wrist. The camera is ~9 cm from it and heavily defocused, so the dots are measured as darkness-weighted
+/* A 2 x 2 dot sticker across both closed fingers (camera-facing side), its bottom edge flush with the fingertips,
+   dots toward the wrist; measured with the gripper closed, removed afterwards (the hovers use the board markers). The camera is ~9 cm from it and heavily defocused, so the dots are measured as darkness-weighted
    centroids (no edges): Otsu threshold in a bottom-centre ROI, connected components, the four largest blobs,
    weights (white - gray) inside each blob dilated by 5 px. The camera looks forward-down: the TOP image row of
    dots is the tip-side row (rows[0] mm from the edge). Planar PnP by IPPE gives two poses; the one with the

@@ -383,6 +383,7 @@ body.ui-simple #state-badge, body.ui-simple #vstat { display: none !important; }
 .cwiz-poses li.skip { opacity: 0.6; }
 .cwiz-msg { padding: 10px 12px; border-radius: var(--sc-radius-md); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 13px; }
 .cwiz-msg.ok { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); }
+.cwiz-grip { display: grid; gap: 8px; justify-items: start; }
 .cwiz-mode { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .cwiz-mode .btn { min-height: 44px; font-size: 13px; white-space: normal; line-height: 1.3; }
 .cwiz-mode .btn.on { background: var(--sc-color-primary-soft); outline: 1px solid var(--sc-color-primary); font-weight: 600; }
@@ -2923,8 +2924,10 @@ Object.assign(I18N.en, {
 Object.assign(I18N.zh, {
   'cw.fstep.board': '标定板', 'cw.fstep.place': '摆放 A', 'cw.fstep.capture': '采集 A', 'cw.fstep.move': '移板', 'cw.fstep.captureb': '采集 B', 'cw.fstep.solve': '求解', 'cw.fstep.review': '确认', 'cw.fstep.applied': '完成',
   'cw.fstep.tip': '指尖', 'cw.fstep.hover': '自动验收', 'cw.board.sticker': '打印指尖贴纸', 'cw.f.toTip': '下一步：测指尖',
-  'cw.tip.lead': '指尖：相机测量贴在手指上的 4 点贴纸，得到指尖相对相机的位置。',
-  'cw.tip.hint': '把打印的贴纸贴在朝向相机的那根手指上：粗边与指尖平齐，圆点朝手腕，整张贴纸平贴。机械臂保持在当前位置（电机使能），夹爪开合不要变。然后点「测量指尖」。',
+  'cw.tip.lead': '指尖：相机测量贴在两根闭合手指上的 4 点贴纸，得到指尖相对相机的位置。',
+  'cw.tip.hint': '先合上夹爪，再把打印的贴纸横贴在两根闭合的手指上（朝向相机的一面）：粗边与指尖平齐，圆点朝手腕，整张贴纸平贴。机械臂保持在当前位置（电机使能），夹爪保持闭合。然后点「测量指尖」。',
+  'cw.tip.close': '合上夹爪', 'cw.tip.open': '夹爪没有合上（开度 {f}）：贴纸横贴在两根闭合的手指上，先点「合上夹爪」。',
+  'cw.tip.remove': '测量完成，请撕下贴纸；之后的验收不需要贴纸。夹爪保持闭合：指尖是在夹爪闭合时测的。',
   'cw.tip.measure': '测量指尖', 'cw.tip.again': '重新测量', 'cw.tip.next': '下一步：自动验收', 'cw.tip.busy': '正在读取相机画面…', 'cw.tip.count': '已用画面：{n} / 16',
   'cw.tip.torque': '电机未使能：先使能，再测量（断电时手腕下垂，画面不可用）。', 'cw.tip.moved': '测量时机械臂在动',
   'cw.tip.notfound': '标记区域内没有找到 4 个圆点（找到 {b} 个）。', 'cw.tip.few': '只有 {n} 张可用画面，需要至少 8 张。', 'cw.tip.gates': '指尖测量未通过检查，见下表。',
@@ -2933,8 +2936,9 @@ Object.assign(I18N.zh, {
   'cw.tip.r.edge': '贴纸边比最低点高 {mm} mm', 'cw.tip.r.noedge': '未知工具：只报告贴纸边的高度，不设置桌面高度',
   'cw.g.tip_frames': '可用画面数', 'cw.g.tip_front': '贴纸在相机前方', 'cw.g.tip_reproj': '重投影误差', 'cw.g.tip_ambiguity': '两个解的差距', 'cw.g.tip_std': '画面间指尖抖动',
   'cw.hov.lead': '自动验收：机械臂让指尖朝下，悬停在标定板 4–6 个角点上方 12 mm，相机测量指尖离纸面的实际高度。',
-  'cw.hov.hint': '标定板不要动，人守在停止按钮旁。先点「规划」：相机重新看一次标定板并选出够得着的角点；再点「开始悬停」。动作由 armd 执行，页面断线时机械臂会自动停靠。',
+  'cw.hov.hint': '不需要贴纸，夹爪保持闭合。标定板不要动，人守在停止按钮旁。先点「规划」：相机重新看一次标定板并选出够得着的角点；再点「开始悬停」。动作由 armd 执行，页面断线时机械臂会自动停靠。',
   'cw.hov.noedge': '未知工具：验收照常进行，但只报告贴纸边的高度，不会设置桌面高度。',
+  'cw.hov.grip': '夹爪开度和测量指尖时不同（现在 {now}，测量时 {then}）：先合上夹爪，再继续。',
   'cw.hov.plan': '规划', 'cw.hov.planning': '正在看标定板并规划…', 'cw.hov.planned': '已选 {n} 个角点', 'cw.hov.start': '开始悬停', 'cw.hov.resume': '继续悬停',
   'cw.hov.confirm': '复核：按新桌面高度再悬停', 'cw.hov.board': '标定板标记不足（{n} 个，需要 4 个）：把相机移到能看到标定板的位置。',
   'cw.hov.why.reach': '指尖朝下时够得着的角点不足 4 个：把标定板移到离底座 20–35 cm 处。', 'cw.hov.why.spread': '够得着的角点没有覆盖标定板的两个方向：把标定板移近一些或转一下。',
@@ -2983,8 +2987,10 @@ Object.assign(I18N.zh, {
 Object.assign(I18N.en, {
   'cw.fstep.board': 'Board', 'cw.fstep.place': 'Place A', 'cw.fstep.capture': 'Capture A', 'cw.fstep.move': 'Move board', 'cw.fstep.captureb': 'Capture B', 'cw.fstep.solve': 'Solve', 'cw.fstep.review': 'Review', 'cw.fstep.applied': 'Applied',
   'cw.fstep.tip': 'Fingertip', 'cw.fstep.hover': 'Auto check', 'cw.board.sticker': 'Print fingertip sticker', 'cw.f.toTip': 'Next: fingertip',
-  'cw.tip.lead': 'Fingertip: the camera measures the 4-dot sticker on the finger and gets the fingertip relative to the camera.',
-  'cw.tip.hint': 'Stick the printed sticker on the finger that faces the camera: heavy edge flush with the fingertip, dots toward the wrist, the whole sticker flat. The arm stays where it is (torque on); do not change the gripper opening. Then tap "Measure fingertip".',
+  'cw.tip.lead': 'Fingertip: the camera measures the 4-dot sticker on the two closed fingers and gets the fingertip relative to the camera.',
+  'cw.tip.hint': 'Close the gripper first, then stick the printed sticker across both closed fingers (the side that faces the camera): heavy edge flush with the fingertips, dots toward the wrist, the whole sticker flat. The arm stays where it is (torque on) and the gripper stays closed. Then tap "Measure fingertip".',
+  'cw.tip.close': 'Close the gripper', 'cw.tip.open': 'The gripper is not closed (opening {f}): the sticker goes across both closed fingers; tap "Close the gripper" first.',
+  'cw.tip.remove': 'Measurement done: remove the sticker; the check that follows does not need it. Keep the gripper closed: the fingertip was measured with the gripper closed.',
   'cw.tip.measure': 'Measure fingertip', 'cw.tip.again': 'Measure again', 'cw.tip.next': 'Next: auto check', 'cw.tip.busy': 'Reading camera frames…', 'cw.tip.count': 'Frames used: {n} / 16',
   'cw.tip.torque': 'Torque is off: turn it on, then measure (with torque off the wrist droops and the frames are not usable).', 'cw.tip.moved': 'The arm moved during the measurement',
   'cw.tip.notfound': 'No 4 dots in the marked area ({b} found).', 'cw.tip.few': 'Only {n} usable frames, at least 8 needed.', 'cw.tip.gates': 'The fingertip measurement failed a check, see the table.',
@@ -2993,8 +2999,9 @@ Object.assign(I18N.en, {
   'cw.tip.r.edge': 'sticker edge {mm} mm above the lowest point', 'cw.tip.r.noedge': 'unknown tool: sticker-edge heights only, no table height is set',
   'cw.g.tip_frames': 'Usable frames', 'cw.g.tip_front': 'Sticker in front of the camera', 'cw.g.tip_reproj': 'Reprojection error', 'cw.g.tip_ambiguity': 'Gap to the second solution', 'cw.g.tip_std': 'Fingertip spread over frames',
   'cw.hov.lead': 'Auto check: the arm points the fingertip down and hovers 12 mm above 4–6 corners of the board; the camera measures the real height of the fingertip above the paper.',
-  'cw.hov.hint': 'Leave the board where it is and stay at the Stop button. Tap "Plan": the camera looks at the board again and picks reachable corners; then "Start hovers". armd runs the motion; if this page loses the connection the arm parks by itself.',
+  'cw.hov.hint': 'No sticker needed; keep the gripper closed. Leave the board where it is and stay at the Stop button. Tap "Plan": the camera looks at the board again and picks reachable corners; then "Start hovers". armd runs the motion; if this page loses the connection the arm parks by itself.',
   'cw.hov.noedge': 'Unknown tool: the check runs, but reports sticker-edge heights only and sets no table height.',
+  'cw.hov.grip': 'The gripper opening differs from the fingertip measurement (now {now}, measured at {then}): close the gripper, then continue.',
   'cw.hov.plan': 'Plan', 'cw.hov.planning': 'Looking at the board and planning…', 'cw.hov.planned': '{n} corners chosen', 'cw.hov.start': 'Start hovers', 'cw.hov.resume': 'Resume hovers',
   'cw.hov.confirm': 'Confirm: hover again at the new table height', 'cw.hov.board': 'Too few board markers ({n}, need 4): bring the camera to where it sees the board.',
   'cw.hov.why.reach': 'Fewer than 4 corners reachable with the fingertip down: put the board 20–35 cm in front of the base.', 'cw.hov.why.spread': 'The reachable corners do not cover both board directions: move the board closer or turn it.',
@@ -6282,6 +6289,32 @@ async function cwRestore() {
 const cwVerifyOn = () => cwFine() && !!(S.caps && S.caps.calibration_verify);
 const cwExpert = () => !document.body.classList.contains('ui-simple');
 const CWV = { tip: null, tipBusy: false, roi: null, frames: 0, hover: null, plan: null, job: null, poll: null, eval: null, confirm: null, confirmJob: null, phase: '', fp: null, xfp: null, edge: null, toolId: null, base: null };
+/* The sticker spans both closed fingers, so the fingertip is measured with the gripper closed and tip_cam holds for
+   that opening only: the measurement needs the gripper closed, the hovers (plan, start, resume, confirm) the opening
+   of the measurement. */
+const CWV_GRIP_CLOSED = 0.15, CWV_GRIP_TOL = 0.05;
+const cwvGrip = () => { const g = S.obs && S.obs.gripper; return g && Number.isFinite(g.fraction) ? g.fraction : null; };
+function cwvGripOff() {
+  const now = cwvGrip(), then = CWV.tool ? CWV.tool.gripper_opening : null;
+  return now != null && then != null && Math.abs(now - then) > CWV_GRIP_TOL ? { now, then } : null;
+}
+function cwvGripCheck() {
+  const off = cwvGripOff();
+  if (off) throw Object.assign(new Error(t('cw.hov.grip', { now: off.now.toFixed(2), then: off.then.toFixed(2) })), { code: 'GRIPPER_OPENING' });
+}
+async function cwvCloseGripper() {
+  if (CWZ.busy || CWV.tipBusy) return;
+  CWZ.busy = true; cwRender();
+  try {
+    await commandRPC('/api/v1/action/gripper', { command: 'close' }, true, 5000);
+    const t0 = Date.now();
+    while (Date.now() - t0 < 6000) { const g = cwvGrip(); if (g == null || g <= CWV_GRIP_CLOSED) break; await cwSleep(100); }
+    const g = cwvGrip();
+    CWZ.status = '';
+    if (g != null && g > CWV_GRIP_CLOSED) cwSetStatus(t('cw.tip.open', { f: g.toFixed(2) }), 'warn');
+  } catch (e) { cwSetStatus(t('cw.err', { m: (e.code ? e.code + ': ' : '') + e.message }), 'warn'); }
+  finally { CWZ.busy = false; cwRender(); }
+}
 function cwvReset() { Object.assign(CWV, { tip: null, tipBusy: false, roi: null, frames: 0, plan: null, job: null, eval: null, confirm: null, confirmJob: null, phase: '', fp: null, xfp: null, edge: null, toolId: null, base: null }); clearInterval(CWV.poll); CWV.poll = null; }
 // the candidate: intrinsics, X, kinematic parameter vectors (candidate and the model armd runs now)
 function cwvCand() {
@@ -6329,6 +6362,8 @@ async function cwvTipMeasure() {
   if (CWV.tipBusy || CWZ.busy) return;
   const CW = CWZ.CW, o = S.obs || {};
   if (!o.is_torqued) { cwSetStatus(t('cw.tip.torque'), 'warn'); return; }
+  const g0 = cwvGrip();
+  if (g0 != null && g0 > CWV_GRIP_CLOSED) { cwSetStatus(t('cw.tip.open', { f: g0.toFixed(2) }), 'warn'); cwRender(); return; }
   CWV.tipBusy = true; CWV.tip = null; CWV.roi = null; CWV.frames = 0; cwSetStatus(t('cw.tip.busy'));
   const want = 16, frames = [];
   let last = null, lastDet = null, tries = 0;
@@ -6387,6 +6422,7 @@ async function cwvPlan() {
   const CW = CWZ.CW;
   CWZ.busy = true; cwSetStatus(t('cw.hov.planning'));
   try {
+    cwvGripCheck();
     const b = await cwvBoardNow();
     const { K, X, kCand, kLive, ch } = cwvCand();
     const { lo, hi } = modelLimits6();
@@ -6405,6 +6441,7 @@ async function cwvStart(confirm = false, resume = null) {
   if (CWZ.busy) return;
   CWZ.busy = true; CWV.phase = confirm ? 'confirm' : 'hover';
   try {
+    cwvGripCheck();
     let body;
     if (resume) {
       // resume: back to the pose the plan looked at the board from (torque on first, e.g. after the watchdog park),
@@ -6428,6 +6465,7 @@ async function cwvStart(confirm = false, resume = null) {
       CWV.confirmPlan = cp;
       body = cwvBody(cp.points);
     } else body = cwvBody(CWV.plan.points);
+    cwvGripCheck();
     const ack = await commandRPC(CALIB_HOVER_PATH, body, true, 8000);
     const id = ack.job_id;
     if (confirm) { CWV.confirmJob = { id, state: 'running' }; CWV.confirm = null; } else { CWV.job = { id, state: 'running' }; CWV.eval = null; CWV.confirm = null; }
@@ -6487,6 +6525,13 @@ function cwvGateRow(key, g, unit, scale, pre) {
   tr.append(cwEl('td', '', t('cw.g.' + key)), cwEl('td', g.ok ? 'ok' : g.blocking === false ? 'note' : 'bad', (g.ok ? '✓ ' : g.blocking === false ? '· ' : '✗ ') + v), cwEl('td', '', lim));
   return tr;
 }
+// gripper not at the measured (closed) opening: the reason and a close button
+function cwvGripBox(body, msg) {
+  const box = cwEl('div', 'cwiz-msg cwiz-grip');
+  box.appendChild(cwEl('div', '', msg));
+  box.appendChild(cwBtn(t('cw.tip.close'), cwvCloseGripper, { id: 'cwiz-grip-close', disabled: CWZ.busy || CWV.tipBusy }));
+  body.appendChild(box);
+}
 function cwRenderTip(body, p, acts) {
   const CW = CWZ.CW, tip = CWV.tip;
   p(t('cw.tip.lead'), 'cwiz-lead');
@@ -6508,7 +6553,10 @@ function cwRenderTip(body, p, acts) {
     row(t('cw.tip.r.tool'), (CWV.toolId || '--') + ' · ' + (CWV.edge != null ? t('cw.tip.r.edge', { mm: (CWV.edge * 1000).toFixed(1) }) : t('cw.tip.r.noedge')));
     if (cwExpert()) row('fingerprint', (CWV.xfp || '--') + ' / ' + (CWV.fp || '--'));
     body.appendChild(box);
+    const rm = cwEl('div', 'cwiz-msg ok', t('cw.tip.remove')); rm.id = 'cwiz-tip-remove'; body.appendChild(rm);
   }
+  const g = cwvGrip();
+  if (!(tip && tip.ok) && g != null && g > CWV_GRIP_CLOSED) cwvGripBox(body, t('cw.tip.open', { f: g.toFixed(2) }));
   acts(cwBtn(t('cw.back'), () => { CWZ.step = 'solve'; CWZ.status = ''; cwRender(); }, { cls: 'act-back', disabled: CWV.tipBusy }),
     cwBtn(t('cw.board.sticker'), cwPrintSticker, { id: 'cwiz-sticker' }),
     cwBtn(t(tip ? 'cw.tip.again' : 'cw.tip.measure'), cwvTipMeasure, { cls: tip && tip.ok ? '' : 'btn-primary', disabled: CWV.tipBusy || CWZ.busy, id: 'cwiz-tip-measure' }),
@@ -6519,6 +6567,8 @@ function cwRenderHover(body, p, acts) {
   p(t('cw.hov.lead'), 'cwiz-lead');
   p(t('cw.hov.hint'));
   if (CWV.edge == null) body.appendChild(cwEl('div', 'cwiz-msg', t('cw.hov.noedge')));
+  const off = cwvGripOff();
+  if (off) cwvGripBox(body, t('cw.hov.grip', { now: off.now.toFixed(2), then: off.then.toFixed(2) }));
   if (CWV.plan && CWV.plan.points.length) {
     const ol = cwEl('ol', 'calib-list mono cwiz-poses');
     CWV.plan.points.forEach((pt, i) => {

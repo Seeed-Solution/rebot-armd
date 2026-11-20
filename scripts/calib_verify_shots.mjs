@@ -91,6 +91,7 @@ function setupVerify([ui, intr]) {
       W.calls.push([p, body]);
       if (p === '/api/v1/motion/stop') { if (W.job && W.job.state === 'running') { W.job.state = 'cancelled'; W.job.code = 'STOPPED'; } return {}; }
       if (p === '/api/v1/torque') { S.obs.is_torqued = !!body.enable; return {}; }
+      if (p === '/api/v1/action/gripper') { setTimeout(() => { S.obs.gripper.fraction = body.command === 'close' ? 0.01 : 1; }, 150); return { action_id: ++W.aid }; }
       if (p === '/api/v1/action/move_to') {
         const id = ++W.aid, T = CW.make(CW.quatR(body.orientation.quat), body.position), s = cwIk(T, cwModelQ(S.obs.positions));
         if (!s.ok) throw Object.assign(new Error('IK unreachable'), { code: 'IK_UNREACHABLE' });
@@ -213,6 +214,14 @@ for (const [vpName, viewport, ui] of VIEWS) {
     // fingertip: not found -> ROI guidance
     await page.evaluate(() => { CWZ.step = 'tip'; __V.snap = 'blank'; cwRender(); });
     await shot('2_tip');
+    // gripper open: the sticker spans both closed fingers -> refuse, offer "close the gripper"
+    await page.evaluate(() => { S.obs.gripper.fraction = 0.6; cwRender(); });
+    await page.click('#cwiz-tip-measure');
+    await page.waitForTimeout(200);
+    if (!(await page.evaluate(() => !!$('cwiz-grip-close') && !CWV.tip && !__V.calls.some((c) => c[0] === '/api/v1/calibration/apply')))) fail('tip with an open gripper ' + tag);
+    await shot('2b_tip_gripper_open');
+    await page.click('#cwiz-grip-close');
+    await waitFor(() => !CWZ.busy && S.obs.gripper.fraction < 0.15 && !$('cwiz-grip-close'), 8000, 'close gripper');
     await page.click('#cwiz-tip-measure');
     await waitFor(() => !CWV.tipBusy && CWV.tip && !CWV.tip.ok, 20000, 'tip not found');
     if (!(await page.evaluate(() => !!$('cwiz-tip-roi') && /Align the sticker edge with the fingertip|将贴纸底边与指尖对齐/.test($('cwiz-panel').innerText)))) fail('not-found guidance ' + tag);
@@ -224,6 +233,8 @@ for (const [vpName, viewport, ui] of VIEWS) {
     const tip = await page.evaluate(() => CWV.tip && CWV.tip.tip_cam_m);
     const ref = fixtures.sticker.tip_cam_mm;
     if (!tip || Math.hypot(...tip.map((v, k) => v * 1000 - ref[k])) > 0.3) fail(`tip ${tag}: ${tip && tip.map((v) => (v * 1000).toFixed(2))} vs ${ref.map((v) => v.toFixed(2))}`);
+    if (!(await page.evaluate(() => { const e = $('cwiz-tip-remove'); return !!e && /撕下贴纸|remove the sticker/.test(e.textContent); }))) fail('no remove-sticker message ' + tag);
+    await page.evaluate(() => $('cwiz-tip-remove').scrollIntoView({ block: 'center' }));
     await shot('4_tip_ok', `tip ${tip && tip.map((v) => (v * 1000).toFixed(2)).join(', ')} mm`);
     // hover: plan, run (Stop visible), result
     await page.click('#cwiz-tip-next');
@@ -231,6 +242,8 @@ for (const [vpName, viewport, ui] of VIEWS) {
     await waitFor(() => !CWZ.busy && CWV.plan, 20000, 'plan');
     const plan = await page.evaluate(() => ({ ok: CWV.plan.ok, n: CWV.plan.points.length, why: CWV.plan.why, c: CWV.plan.candidates, corners: CWV.plan.points.map((p) => [...p.corner.map((v) => Math.round(v * 1000)), p.yaw_deg]) }));
     if (!plan.ok) fail(`plan ${tag}: ${JSON.stringify(plan)}`);
+    // no sticker in the hover step: no print button, no sticker placement text
+    if (await page.evaluate(() => !!$('cwiz-sticker') || /贴在|Stick the printed/.test($('cwiz-panel').innerText))) fail('hover asks for the sticker ' + tag);
     await shot('5_hover_plan', `${plan.n} corners`);
     await page.click('#cwiz-hov-start');
     await waitFor(() => CWV.job && CWV.job.state === 'running' && CWV.job.points && CWV.job.points.some((p) => p.state === 'done'), 15000, 'running');
@@ -264,7 +277,18 @@ for (const [vpName, viewport, ui] of VIEWS) {
     await waitFor(() => CWV.job && CWV.job.state === 'cancelled', 15000, 'interrupted');
     await page.waitForTimeout(300);
     if (!(await page.evaluate(() => !!$('cwiz-hov-resume')))) fail('no resume button ' + tag);
+    if (await page.evaluate(() => /贴在|Stick the printed/.test($('cwiz-panel').innerText))) fail('resume asks for the sticker ' + tag);
     await shot('11_hover_interrupted');
+    // the gripper opened meanwhile: resume is refused until it is closed again
+    await page.evaluate(() => { S.obs.gripper.fraction = 0.5; cwRender(); });
+    const nCalls = await page.evaluate(() => __V.calls.filter((c) => c[0] === '/api/v1/action/calib_hover').length);
+    await page.click('#cwiz-hov-resume');
+    await page.waitForTimeout(300);
+    const gr = await page.evaluate((n) => ({ box: !!$('cwiz-grip-close'), sent: __V.calls.filter((c) => c[0] === '/api/v1/action/calib_hover').length - n, st: CWZ.status }), nCalls);
+    if (!gr.box || gr.sent !== 0) fail(`resume with the gripper open ${tag}: ${JSON.stringify(gr)}`);
+    await shot('11b_hover_gripper_open');
+    await page.click('#cwiz-grip-close');
+    await waitFor(() => !CWZ.busy && S.obs.gripper.fraction < 0.15, 8000, 'close gripper (hover)');
     await page.click('#cwiz-hov-resume');
     await waitFor(() => CWV.job && CWV.job.state === 'done' && CWV.eval, 20000, 'resumed');
     const rs = await page.evaluate(() => ({ runs: CWV.job.runs, ok: CWV.eval.ok, body: __V.calls.filter((c) => c[0] === '/api/v1/action/calib_hover').pop()[1] }));
