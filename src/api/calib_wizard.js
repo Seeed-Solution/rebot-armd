@@ -147,6 +147,11 @@ export const rpyR = (r, p, y) => {
   const cr = Math.cos(r), sr = Math.sin(r), cp = Math.cos(p), sp = Math.sin(p), cy = Math.cos(y), sy = Math.sin(y);
   return [[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr], [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr], [-sp, cp * sr, cp * cr]];
 };
+// rpy (rad, URDF fixed axis, R = Rz(y) Ry(p) Rx(r)) that gives R back also at pitch +-90 deg (tool down): roll 0 there
+export function rpyOfR(R) {
+  if (Math.hypot(R[0][0], R[1][0]) < 1e-6) return [0, Math.asin(Math.min(1, Math.max(-1, -R[2][0]))), Math.atan2(-R[0][1], R[1][1])];
+  return [Math.atan2(R[2][1], R[2][2]), Math.asin(Math.min(1, Math.max(-1, -R[2][0]))), Math.atan2(R[1][0], R[0][0])];
+}
 export const rpyDeg = (R) => [Math.atan2(R[2][1], R[2][2]) * D, Math.asin(Math.min(1, Math.max(-1, -R[2][0]))) * D, Math.atan2(R[1][0], R[0][0]) * D];
 
 // ---------------------------------------------------------------- camera model
@@ -1690,24 +1695,33 @@ export const kinPose = kinT;
    puts the end_link at tableZ + clearanceM, the working table semantics of evaluateHovers). Returns { ok, why, points: [{ id, corner, approach_m, hover_m,
    rpy_rad, q, predicted_clearance_m, visible }] }. */
 export function planHover({ Tbb, X, tipCam, edgeToLow = null, ch, kCand, kLive, q0, K, board, lo = null, hi = null, plan = HOVER_PLAN, gates = HOVER_GATES, size = IMAGE, tableZ = null }) {
-  const R = rpyR(...plan.rpy), tipEnd = apply(X, tipCam), drop = edgeToLow == null ? plan.unknownEdgeM : edgeToLow;
-  const rTip = mv3(R, tipEnd);
+  const tipEnd = apply(X, tipCam), drop = edgeToLow == null ? plan.unknownEdgeM : edgeToLow;
+  // tool down; the yaw about the vertical turns the camera toward the board (the camera sees only what lies ahead
+  // of the fingertip): per corner the yaw with the most markers in view, the smallest turn on a tie
+  const yaws = plan.yawsDeg || [0, 45, -45, 90, -90, 135, -135, 180];
   const cands = [];
   for (const m of board.markers) m.corners.forEach((c, ci) => {
     const pb = apply(Tbb, c);
-    // end_link origin: sticker edge above the corner, lowest point clearanceM above the paper
-    // tableZ (working table height, confirmation hovers): the end_link at tableZ + clearance
-    const pe = [pb[0] - rTip[0], pb[1] - rTip[1], tableZ != null ? tableZ + plan.clearanceM : pb[2] + plan.clearanceM + drop - rTip[2]];
-    const T = make(R, pe), Ta = make(R, [pe[0], pe[1], pe[2] + plan.approachM]);
-    const ika = kinIk(ch, kCand, Ta, q0, { lo, hi });
-    const ikh = ika.ok ? kinIk(ch, kCand, T, ika.q, { lo, hi }) : ika;
-    if (!ikh.ok) return;
-    const Tl = kinT(ch, ikh.q, kLive), Tla = kinT(ch, ika.q, kLive);
-    const vis = visibleMarkers(K, mm(T, X), Tbb, board, { size });
-    if (!vis.length) return;
-    cands.push({ id: `m${m.id}c${ci}`, corner: c.slice(0, 2), base: pb, q: ikh.q,
-      approach_m: [Tl[0][3], Tl[1][3], Tla[2][3]], hover_m: posOf(Tl), rpy_rad: rpyDeg(rotOf(Tl)).map((v) => v / D),
-      predicted_clearance_m: plan.clearanceM, visible: vis.map((v) => v.id) });
+    let best = null;
+    for (const yd of yaws) {
+      const R = mm(rpyR(0, 0, yd / D), rpyR(...plan.rpy)), rTip = mv3(R, tipEnd);
+      // end_link origin: sticker edge above the corner, lowest point clearanceM above the paper
+      // (tableZ, confirmation hovers: the end_link at tableZ + clearance, the working table semantics)
+      const pe = [pb[0] - rTip[0], pb[1] - rTip[1], tableZ != null ? tableZ + plan.clearanceM : pb[2] + plan.clearanceM + drop - rTip[2]];
+      const T = make(R, pe);
+      const vis = visibleMarkers(K, mm(T, X), Tbb, board, { size });
+      if (!vis.length || (best && vis.length <= best.vis.length)) continue;
+      const Ta = make(R, [pe[0], pe[1], pe[2] + plan.approachM]);
+      const ika = kinIk(ch, kCand, Ta, q0, { lo, hi });
+      const ikh = ika.ok ? kinIk(ch, kCand, T, ika.q, { lo, hi }) : ika;
+      if (!ikh.ok) continue;
+      best = { R, pe, vis, ika, ikh, yd };
+    }
+    if (!best) return;
+    const Tl = kinT(ch, best.ikh.q, kLive), Tla = kinT(ch, best.ika.q, kLive);
+    cands.push({ id: `m${m.id}c${ci}`, corner: c.slice(0, 2), base: pb, q: best.ikh.q, yaw_deg: best.yd,
+      approach_m: [Tl[0][3], Tl[1][3], Tla[2][3]], hover_m: posOf(Tl), rpy_rad: rpyOfR(rotOf(Tl)),
+      predicted_clearance_m: plan.clearanceM, visible: best.vis.map((v) => v.id) });
   });
   // vertical descent in the live frame: approach straight above the hover point
   cands.forEach((c) => { c.approach_m = [c.hover_m[0], c.hover_m[1], Math.max(c.approach_m[2], c.hover_m[2] + 0.02)]; });

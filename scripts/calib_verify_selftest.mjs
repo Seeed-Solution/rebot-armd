@@ -162,6 +162,8 @@ const synth = (R, t, Kx = K) => CW.stickerObject().map((X) => CW.project(Kx, R, 
     worst = Math.max(worst, Math.hypot(edge[0] - c[0][3], edge[1] - c[1][3]));
     hErr = Math.max(hErr, Math.abs(edge[2] - 0.0023 - c[2][3] - 0.012));
   }
+  const rpyErr = Math.max(...plan.points.map((p) => CW.rotDist(CW.rpyR(...p.rpy_rad), CW.rotOf(CW.kinPose(ch, p.q, zero)))));
+  check('g. target rpy gives the planned rotation back (tool down, pitch 90 deg)', rpyErr < 1e-4, `max ${rpyErr.toExponential(2)} deg, yaws ${plan.points.map((p) => p.yaw_deg)}`);
   const xs = plan.points.map((p) => p.corner[0]), ys = plan.points.map((p) => p.corner[1]);
   check('g. plan: >= 4 corners over both axes, edge above the corner, low point 12 mm up', plan.ok && plan.points.length >= 4 && worst < 1e-4 && hErr < 1e-4,
     `${plan.points.length} of ${plan.candidates} corners, x span ${((Math.max(...xs) - Math.min(...xs)) * 1000).toFixed(0)} mm, y span ${((Math.max(...ys) - Math.min(...ys)) * 1000).toFixed(0)} mm, xy ${(worst * 1000).toFixed(3)} mm, h ${(hErr * 1000).toFixed(3)} mm`);
