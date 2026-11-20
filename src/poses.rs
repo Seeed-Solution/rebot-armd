@@ -68,12 +68,32 @@ pub struct PoseList {
     pub poses: Vec<NamedPose>,
 }
 
+/// `GET /api/v1/poses` body (adds `revision` to [`PoseList`]).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct PoseListResponse {
+    #[serde(flatten)]
+    pub list: PoseList,
+    pub revision: u64,
+}
+
 /// Poses held by the supervisor.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PoseStore {
     pub list: PoseList,
     /// File the store is written to; None = not persisted.
     pub path: Option<PathBuf>,
+    /// Monotonic revision (starts at 1).
+    pub revision: u64,
+}
+
+impl Default for PoseStore {
+    fn default() -> Self {
+        Self {
+            list: PoseList::default(),
+            path: None,
+            revision: 1,
+        }
+    }
 }
 
 impl PoseStore {
@@ -275,9 +295,43 @@ impl SupervisorInner {
     }
 }
 
-/// WS command `/api/v1/poses/save` `{name, positions?, id?}`: replaces the pose `name`, or with
-/// `id` the pose with that id (rename: the id stays). Returns the pose and the file write.
-pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Option<PendingWrite>), ArmError> {
+/// Validated pose save prepared without mutating `SupervisorInner`.
+#[derive(Debug, Clone)]
+pub struct PreparedPosesSave {
+    pub base_revision: u64,
+    pub pose: NamedPose,
+    pub next_list: PoseList,
+    pub write: Option<PendingWrite>,
+}
+
+/// Validated pose delete prepared without mutating `SupervisorInner`.
+#[derive(Debug, Clone)]
+pub struct PreparedPosesDelete {
+    pub base_revision: u64,
+    pub next_list: PoseList,
+    pub write: Option<PendingWrite>,
+}
+
+fn check_pose_revision(inner: &SupervisorInner, body: &Value, require_expected_revision: bool) -> Result<u64, ArmError> {
+    if !body.is_object() {
+        return Err(invalid("Command body must be an object"));
+    }
+    if let Some(exp) = persist::parse_expected_revision(body, require_expected_revision).map_err(invalid)? {
+        if exp != inner.poses.revision {
+            return Err(ArmError::PolicyRevisionMismatch { expected: exp, current: inner.poses.revision });
+        }
+    }
+    Ok(inner.poses.revision)
+}
+
+/// Step 1 of atomic persist-before-commit for `/api/v1/poses/save` `{name, positions?, id?}`:
+/// replaces the pose `name`, or with `id` the pose with that id (rename: the id stays).
+pub fn prepare_save_with(
+    inner: &SupervisorInner,
+    body: &Value,
+    require_expected_revision: bool,
+) -> Result<PreparedPosesSave, ArmError> {
+    let base_revision = check_pose_revision(inner, body, require_expected_revision)?;
     let name = name_of(body)?;
     let by_id = match body.get("id") {
         None | Some(Value::Null) => None,
@@ -327,46 +381,131 @@ pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Opt
         joint_names: Some(joint_names.clone()),
         stale: None,
     };
-    inner.poses.list.profile_id = profile_id;
-    inner.poses.list.arm_dof = Some(arm_dof);
-    inner.poses.list.gripper_joint = gripper_joint;
-    inner.poses.list.joint_names = Some(joint_names);
-    let list = &mut inner.poses.list.poses;
-    match list.iter_mut().find(|p| p.id == pose.id) {
+    let mut next_list = inner.poses.list.clone();
+    next_list.profile_id = profile_id;
+    next_list.arm_dof = Some(arm_dof);
+    next_list.gripper_joint = gripper_joint;
+    next_list.joint_names = Some(joint_names);
+    match next_list.poses.iter_mut().find(|p| p.id == pose.id) {
         Some(p) => *p = pose.clone(),
-        None => list.push(pose.clone()),
+        None => next_list.poses.push(pose.clone()),
     }
-    Ok((pose, inner.poses_write()))
+    let write = inner.poses.path.clone().map(|path| {
+        PendingWrite::new(path, serde_json::to_string_pretty(&next_list).unwrap_or_default())
+    });
+    Ok(PreparedPosesSave { base_revision, pose, next_list, write })
 }
 
-/// WS command `/api/v1/poses/rename` `{id, name}`: the pose keeps its id, positions and
-/// stale mark; sequences reference the id and keep working. POSE_EXISTS when another pose has
-/// the name.
-pub fn rename(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Option<PendingWrite>), ArmError> {
+pub fn precheck_save(inner: &SupervisorInner, prepared: &PreparedPosesSave) -> Result<(), ArmError> {
+    if inner.poses.revision != prepared.base_revision {
+        return Err(ArmError::PolicyRevisionMismatch { expected: prepared.base_revision, current: inner.poses.revision });
+    }
+    if inner.calibration_busy {
+        return Err(ArmError::Rejected { status: 409, code: "CONFIG_BUSY".into(), message: "a camera calibration apply or restore is running".into() });
+    }
+    Ok(())
+}
+
+pub fn commit_save(inner: &mut SupervisorInner, prepared: PreparedPosesSave) -> Result<(NamedPose, u64), ArmError> {
+    if inner.poses.revision != prepared.base_revision {
+        return Err(ArmError::PolicyRevisionMismatch { expected: prepared.base_revision, current: inner.poses.revision });
+    }
+    inner.poses.list = prepared.next_list;
+    inner.poses.revision += 1;
+    Ok((prepared.pose, inner.poses.revision))
+}
+
+/// Step 1 of atomic persist-before-commit for `/api/v1/poses/delete`.
+pub fn prepare_delete_with(
+    inner: &SupervisorInner,
+    body: &Value,
+    require_expected_revision: bool,
+) -> Result<PreparedPosesDelete, ArmError> {
+    let base_revision = check_pose_revision(inner, body, require_expected_revision)?;
+    let name = name_of(body)?;
+    let mut next_list = inner.poses.list.clone();
+    let i = next_list.poses.iter().position(|p| p.name == name).ok_or_else(|| not_found(&name))?;
+    let users = inner.sequences_using_pose(&next_list.poses[i].id);
+    if !users.is_empty() {
+        return Err(ArmError::detailed(409, "IN_USE", format!("Pose '{name}' is used by {} sequence(s)", users.len()), serde_json::json!({"sequences": users})));
+    }
+    next_list.poses.remove(i);
+    let write = inner.poses.path.clone().map(|path| {
+        PendingWrite::new(path, serde_json::to_string_pretty(&next_list).unwrap_or_default())
+    });
+    Ok(PreparedPosesDelete { base_revision, next_list, write })
+}
+
+pub fn precheck_delete(inner: &SupervisorInner, prepared: &PreparedPosesDelete) -> Result<(), ArmError> {
+    if inner.poses.revision != prepared.base_revision {
+        return Err(ArmError::PolicyRevisionMismatch { expected: prepared.base_revision, current: inner.poses.revision });
+    }
+    // a sequence saved since the prepare may reference the pose now
+    for p in inner.poses.list.poses.iter().filter(|p| !prepared.next_list.poses.iter().any(|n| n.id == p.id)) {
+        let users = inner.sequences_using_pose(&p.id);
+        if !users.is_empty() {
+            return Err(ArmError::detailed(409, "IN_USE", format!("Pose '{}' is used by {} sequence(s)", p.name, users.len()), serde_json::json!({"sequences": users})));
+        }
+    }
+    if inner.calibration_busy {
+        return Err(ArmError::Rejected { status: 409, code: "CONFIG_BUSY".into(), message: "a camera calibration apply or restore is running".into() });
+    }
+    Ok(())
+}
+
+pub fn commit_delete(inner: &mut SupervisorInner, prepared: PreparedPosesDelete) -> Result<u64, ArmError> {
+    if inner.poses.revision != prepared.base_revision {
+        return Err(ArmError::PolicyRevisionMismatch { expected: prepared.base_revision, current: inner.poses.revision });
+    }
+    inner.poses.list = prepared.next_list;
+    inner.poses.revision += 1;
+    Ok(inner.poses.revision)
+}
+
+/// WS command `/api/v1/poses/save` `{name, positions?}`. Returns the pose and the file write.
+pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Option<PendingWrite>), ArmError> {
+    let mut prepared = prepare_save_with(inner, body, false)?;
+    let write = prepared.write.take();
+    let (pose, _) = commit_save(inner, prepared)?;
+    Ok((pose, write))
+}
+
+/// Step 1 of `/api/v1/poses/rename` `{id, name, expected_revision?}`: the pose keeps its id,
+/// positions and stale mark; sequences reference the id and keep working. POSE_EXISTS when
+/// another pose has the name. Committed with [`precheck_save`] / [`commit_save`].
+pub fn prepare_rename_with(inner: &SupervisorInner, body: &Value, require_expected_revision: bool) -> Result<PreparedPosesSave, ArmError> {
+    let base_revision = check_pose_revision(inner, body, require_expected_revision)?;
     let name = name_of(body)?;
     let id = body.get("id").and_then(Value::as_str).ok_or_else(|| invalid("id must be a string"))?;
     if inner.poses.list.poses.iter().any(|p| p.name == name && p.id != id) {
         return Err(ArmError::Rejected { status: 409, code: "POSE_EXISTS".into(), message: format!("Another pose is named '{name}'") });
     }
-    let pose = inner.poses.list.poses.iter_mut().find(|p| p.id == id)
+    let mut next_list = inner.poses.list.clone();
+    let pose = next_list.poses.iter_mut().find(|p| p.id == id)
         .ok_or_else(|| ArmError::Rejected { status: 404, code: "POSE_NOT_FOUND".into(), message: format!("No pose with id '{id}'") })?;
     pose.name = name;
     let pose = pose.clone();
-    Ok((pose, inner.poses_write()))
+    let write = inner.poses.path.clone().map(|path| {
+        PendingWrite::new(path, serde_json::to_string_pretty(&next_list).unwrap_or_default())
+    });
+    Ok(PreparedPosesSave { base_revision, pose, next_list, write })
+}
+
+/// WS command `/api/v1/poses/rename` `{id, name}` (in-process callers): prepare and commit.
+pub fn rename(inner: &mut SupervisorInner, body: &Value) -> Result<(NamedPose, Option<PendingWrite>), ArmError> {
+    let mut prepared = prepare_rename_with(inner, body, false)?;
+    let write = prepared.write.take();
+    let (pose, _) = commit_save(inner, prepared)?;
+    Ok((pose, write))
 }
 
 /// WS command `/api/v1/poses/delete` `{name}`. IN_USE `{sequences}` while a sequence
 /// references the pose (or a running sequence pinned it).
 pub fn delete(inner: &mut SupervisorInner, body: &Value) -> Result<Option<PendingWrite>, ArmError> {
-    let name = name_of(body)?;
-    let i = inner.poses.list.poses.iter().position(|p| p.name == name).ok_or_else(|| not_found(&name))?;
-    let id = inner.poses.list.poses[i].id.clone();
-    let users = inner.sequences_using_pose(&id);
-    if !users.is_empty() {
-        return Err(ArmError::detailed(409, "IN_USE", format!("Pose '{name}' is used by {} sequence(s)", users.len()), serde_json::json!({"sequences": users})));
-    }
-    inner.poses.list.poses.remove(i);
-    Ok(inner.poses_write())
+    let mut prepared = prepare_delete_with(inner, body, false)?;
+    let write = prepared.write.take();
+    let _ = commit_delete(inner, prepared)?;
+    Ok(write)
 }
 
 /// Optional `speed_scale` in [MIN_SPEED_SCALE, 1.0], default 1.0.

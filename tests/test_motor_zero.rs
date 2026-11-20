@@ -41,9 +41,9 @@ async fn rig(driver: Option<Box<dyn armd::driver::ArmDriver>>, setup: impl FnOnc
     deps.backup_dir = dir.path().join("backups");
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
     if let Some(d) = driver { sup.set_driver(d).await; }
-    calibration::load_into(&sup, &deps.path, None).await;
+    calibration::load_into(&sup, &deps.path, None).await.unwrap();
     let router = armd::api::create_router_calibration(sup.clone(), up.clone(), armd::grasp::GraspDeps::http(up, None),
-        armd::diagnostics::DiagnosticsState::global(), deps.clone());
+        armd::diagnostics::DiagnosticsState::global(), deps.clone(), armd::auth::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
@@ -199,7 +199,7 @@ async fn zero_removes_the_kinematic_correction_and_marks_the_camera_stale() {
     assert!(status["kinematics_correction"].is_null());
     // a restart keeps it stale
     let fresh = ArmSupervisor::new(ArmConfig::rebot_dm());
-    calibration::load_into(&fresh, &r.deps.path, None).await;
+    calibration::load_into(&fresh, &r.deps.path, None).await.unwrap();
     assert!(fresh.inner().read().await.calibration.as_ref().unwrap().stale.is_some());
     let log = std::fs::read_to_string(r.deps.backup_dir.join("motor_zero.jsonl")).unwrap();
     assert!(log.contains("\"kinematics_removed\":true"), "{log}");

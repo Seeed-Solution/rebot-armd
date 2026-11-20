@@ -20,7 +20,7 @@ async fn rig() -> Rig {
     let mut deps = CalibrationDeps::new(dir.path().join("calibration.json"), None, up.clone());
     deps.sessions_dir = dir.path().join("sessions");
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
-    let router = armd::api::create_router_calibration(sup, up.clone(), GraspDeps::http(up, None), armd::diagnostics::DiagnosticsState::global(), deps);
+    let router = armd::api::create_router_calibration(sup, up.clone(), GraspDeps::http(up, None), armd::diagnostics::DiagnosticsState::global(), deps, armd::auth::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });

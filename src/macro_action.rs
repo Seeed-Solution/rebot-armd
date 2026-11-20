@@ -171,11 +171,27 @@ impl MacroCtx {
             (input, p)
         }).await
             .map_err(|e| fail("INTERNAL", format!("planner task failed: {e}")))?;
-        let (path, pre, plan) = planned.map_err(|e| arm_fail(e.into()))?;
+        let (path, pre, plan) = match planned {
+            Ok(p) => p,
+            Err(e) => {
+                if let motion::MotionError::WorkspaceViolation { ref detail, .. } = e {
+                    self.sup.inner().write().await.set_action_workspace_violation(self.id, detail.clone());
+                }
+                return Err(arm_fail(e.into()));
+            }
+        };
         let limit = {
             let mut inner = self.sup.inner().write().await;
             if !inner.macro_alive(self.id) { return Err(Stop::Cancelled); }
-            inner.install_macro_path_same_side(self.id, &input, path, pre, plan.as_ref()).map_err(arm_fail)?
+            match inner.install_macro_path_same_side(self.id, &input, path, pre, plan.as_ref()) {
+                Ok(l) => l,
+                Err(e) => {
+                    if let Some(detail) = e.workspace_detail() {
+                        inner.set_action_workspace_violation(self.id, detail);
+                    }
+                    return Err(arm_fail(e));
+                }
+            }
         };
         let t0 = Instant::now();
         let sub_res = self.wait_sub(phase, limit * 2.0 + 5.0).await;

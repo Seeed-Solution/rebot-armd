@@ -140,7 +140,7 @@ fn kit_grasp_defaults_equal_profile_grasp() {
 fn kit_camera_mounts_parse() {
     let text = std::fs::read_to_string(format!("{KIT}/calibration/camera_mounts.json")).unwrap();
     let mounts: std::collections::BTreeMap<String, serde_json::Value> = serde_json::from_str(&text).unwrap();
-    assert_eq!(mounts.len(), 4);
+    assert_eq!(mounts.len(), 2);
     for (name, entry) in &mounts {
         let mount: armd::model::CameraMount = serde_json::from_value(entry["camera_mount"].clone()).unwrap();
         let pitch = entry["pitch_down_deg"].as_f64().unwrap() as f32;

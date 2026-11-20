@@ -172,6 +172,8 @@ pub enum GravityModel { RebotDevArm, Urdf }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum KinematicsModel { RebotDevArm, Urdf }
 
+fn is_zero_f32(v: &f32) -> bool { *v == 0.0 }
+
 /// Server-side Cartesian safety box, checked on the end_link pose (src/kinematics.rs).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkspacePolicy {
@@ -188,10 +190,38 @@ pub struct WorkspacePolicy {
     /// (`/api/v1/workspace/keepout`) replaces this one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keepout_boxes: Vec<KeepoutBox>,
+    /// Optional collision capsules attached to arm links / kinematic frames.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub link_capsules: Vec<LinkCapsule>,
+    /// Enable link-link self-collision checking across `self_collision_pairs`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub self_collision_enabled: bool,
+    /// Minimum required clearance (m) between self-collision capsule pairs (default 0.0).
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub self_collision_min_clearance_m: f32,
+    /// Non-adjacent `link_capsules` id pairs checked for self-collision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub self_collision_pairs: Vec<[String; 2]>,
 }
 
 /// Most keep-out boxes a profile or the runtime list may hold.
 pub const MAX_KEEPOUT_BOXES: usize = 16;
+
+/// Most link capsules a workspace policy may define.
+pub const MAX_LINK_CAPSULES: usize = 16;
+
+/// Most self-collision capsule pairs a workspace policy may define.
+pub const MAX_SELF_COLLISION_PAIRS: usize = 64;
+
+/// Capsule attached to a link/kinematic frame for workspace and keep-out checks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinkCapsule {
+    pub id: String,
+    pub frame: String,
+    pub a_m: [f32; 3],
+    pub b_m: [f32; 3],
+    pub radius_m: f32,
+}
 
 /// Axis-aligned keep-out box in the base frame (m).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -236,6 +266,104 @@ impl WorkspacePolicy {
             max_reach_m: Some(0.52),
             check_points_end_m: corners,
             keepout_boxes: Vec::new(),
+            // Link capsules enclosing sim/mujoco/models/rebot_b601dm_scene.xml collision boxes + ~4-5 mm margin,
+            // plus base_link pedestal + base_plate and link6 wrist housing for non-adjacent self-collision checks:
+            // - base_link: pedestal z>=0.014 (max_d 53.0 mm <= r=0.054), z_min=-0.002 (fixed base skips floor check)
+            // - base_plate: mounting flange [-0.07,0.07]x[-0.10,0.10]x[0,0.014] (max_d 83.2 mm <= r=0.084)
+            // - link2: box pos [-0.132, 0, -0.0316], size [0.1605, 0.0285, 0.0337] (half-diag 44.1 mm) -> r=0.050
+            // - link3: box pos [0.1222, -0.03, -0.0311], size [0.1489, 0.0525, 0.0401] (half-diag 66.1 mm) -> r=0.071
+            // - link4: box pos [0.0449, -0.03, -0.03], size [0.0729, 0.058, 0.0334] (half-diag 66.9 mm) -> r=0.072
+            // - link5: box pos [-0.0028, 0, 0.0355], size [0.035, 0.0385, 0.0425] (half-diag 52.0 mm) -> r=0.057
+            // - link6: box pos [0, 0, 0.0242], size [0.0385, 0.0318, 0.029] (max corner dist 51.6 mm) -> r=0.052
+            link_capsules: vec![
+                LinkCapsule {
+                    id: "base_link".into(),
+                    frame: "base_link".into(),
+                    a_m: [0.0, 0.0, 0.052],
+                    b_m: [0.0, 0.0, 0.08],
+                    radius_m: 0.054,
+                },
+                LinkCapsule {
+                    id: "base_plate".into(),
+                    frame: "base_link".into(),
+                    a_m: [0.0, -0.05, 0.007],
+                    b_m: [0.0, 0.05, 0.007],
+                    radius_m: 0.084,
+                },
+                LinkCapsule {
+                    id: "link2".into(),
+                    frame: "link2".into(),
+                    a_m: [0.020, 0.0, -0.0316],
+                    b_m: [-0.284, 0.0, -0.0316],
+                    radius_m: 0.050,
+                },
+                LinkCapsule {
+                    id: "link3".into(),
+                    frame: "link3".into(),
+                    a_m: [-0.015, -0.030, -0.0311],
+                    b_m: [0.260, -0.030, -0.0311],
+                    radius_m: 0.071,
+                },
+                LinkCapsule {
+                    id: "link4".into(),
+                    frame: "link4".into(),
+                    a_m: [-0.015, -0.030, -0.030],
+                    b_m: [0.105, -0.030, -0.030],
+                    radius_m: 0.072,
+                },
+                LinkCapsule {
+                    id: "link5".into(),
+                    frame: "link5".into(),
+                    a_m: [-0.0028, 0.0, 0.005],
+                    b_m: [-0.0028, 0.0, 0.066],
+                    radius_m: 0.057,
+                },
+                LinkCapsule {
+                    id: "link6".into(),
+                    frame: "link6".into(),
+                    a_m: [0.0, 0.0, 0.008],
+                    b_m: [0.0, 0.0, 0.04],
+                    radius_m: 0.052,
+                },
+            ],
+            self_collision_enabled: true,
+            self_collision_min_clearance_m: 0.0,
+            self_collision_pairs: vec![
+                ["base_link".into(), "link4".into()],
+                ["base_link".into(), "link5".into()],
+                ["base_link".into(), "link6".into()],
+                ["base_plate".into(), "link4".into()],
+                ["base_plate".into(), "link5".into()],
+                ["base_plate".into(), "link6".into()],
+            ],
+        }
+    }
+
+    /// Whether self-collision checking is actively configured with non-empty valid pairs.
+    pub fn self_collision_covered(&self) -> bool {
+        self.self_collision_enabled
+            && !self.self_collision_pairs.is_empty()
+            && self.self_collision_pairs.iter().all(|[a, b]| {
+                a != b
+                    && self.link_capsules.iter().any(|c| c.id == *a)
+                    && self.link_capsules.iter().any(|c| c.id == *b)
+            })
+    }
+
+    /// Copy with `floor_z`, outer `box`, and `max_reach` disabled (used by `park` so it
+    /// can escape outer workspace violations while still enforcing `keepout_boxes`).
+    pub fn keepout_only(&self) -> Self {
+        Self {
+            floor_z_m: f32::NEG_INFINITY,
+            box_min_m: [f32::NEG_INFINITY; 3],
+            box_max_m: [f32::INFINITY; 3],
+            max_reach_m: None,
+            check_points_end_m: self.check_points_end_m.clone(),
+            keepout_boxes: self.keepout_boxes.clone(),
+            link_capsules: self.link_capsules.clone(),
+            self_collision_enabled: self.self_collision_enabled,
+            self_collision_min_clearance_m: self.self_collision_min_clearance_m,
+            self_collision_pairs: self.self_collision_pairs.clone(),
         }
     }
 
@@ -247,6 +375,46 @@ impl WorkspacePolicy {
             || self.check_points_end_m.is_empty() || self.check_points_end_m.len() > 16
             || !self.check_points_end_m.iter().all(finite3) {
             return Err("Invalid workspace policy: finite values, box_min < box_max, 1..16 check points".into());
+        }
+        if self.link_capsules.len() > MAX_LINK_CAPSULES {
+            return Err(format!("Invalid workspace policy: at most {MAX_LINK_CAPSULES} link_capsules"));
+        }
+        let mut ids = std::collections::HashSet::with_capacity(self.link_capsules.len());
+        for (i, c) in self.link_capsules.iter().enumerate() {
+            if c.id.is_empty() || c.id.len() > 64 {
+                return Err(format!("Invalid workspace policy: link_capsules[{i}] id must be 1..64 bytes"));
+            }
+            if !ids.insert(c.id.as_str()) {
+                return Err(format!("Invalid workspace policy: duplicate link_capsule id '{}'", c.id));
+            }
+            if c.frame.is_empty() {
+                return Err(format!("Invalid workspace policy: link_capsules[{i}] ('{}') frame must not be empty", c.id));
+            }
+            if !finite3(&c.a_m) || !finite3(&c.b_m) || !c.radius_m.is_finite() || c.radius_m < 0.0 {
+                return Err(format!("Invalid workspace policy: link_capsules[{i}] ('{}') requires finite endpoints and radius_m >= 0", c.id));
+            }
+        }
+        if !self.self_collision_min_clearance_m.is_finite() || self.self_collision_min_clearance_m < 0.0 {
+            return Err("Invalid workspace policy: self_collision_min_clearance_m must be finite and >= 0".into());
+        }
+        if self.self_collision_pairs.len() > MAX_SELF_COLLISION_PAIRS {
+            return Err(format!("Invalid workspace policy: at most {MAX_SELF_COLLISION_PAIRS} self_collision_pairs"));
+        }
+        let mut pair_set = std::collections::HashSet::with_capacity(self.self_collision_pairs.len());
+        for (i, [a, b]) in self.self_collision_pairs.iter().enumerate() {
+            if !ids.contains(a.as_str()) {
+                return Err(format!("Invalid workspace policy: self_collision_pairs[{i}] references unknown link_capsule id '{a}'"));
+            }
+            if !ids.contains(b.as_str()) {
+                return Err(format!("Invalid workspace policy: self_collision_pairs[{i}] references unknown link_capsule id '{b}'"));
+            }
+            if a == b {
+                return Err(format!("Invalid workspace policy: self_collision_pairs[{i}] cannot pair '{a}' with itself"));
+            }
+            let key = if a.as_str() <= b.as_str() { (a.as_str(), b.as_str()) } else { (b.as_str(), a.as_str()) };
+            if !pair_set.insert(key) {
+                return Err(format!("Invalid workspace policy: duplicate self_collision_pairs[{i}] ('{a}', '{b}')"));
+            }
         }
         KeepoutBox::validate_list(&self.keepout_boxes)
     }
@@ -1240,7 +1408,17 @@ impl ArmConfig {
                 ));
             }
         }
-        if let Some(ws) = &self.workspace { ws.validate()?; }
+        if let Some(ws) = &self.workspace {
+            ws.validate()?;
+            for (i, c) in ws.link_capsules.iter().enumerate() {
+                if self.arm_model.resolve_frame(&c.frame).is_none() {
+                    return Err(format!(
+                        "Invalid workspace policy: link_capsules[{i}] ('{}') unknown frame '{}'",
+                        c.id, c.frame
+                    ));
+                }
+            }
+        }
         let cam = &self.camera_mount;
         if !cam.rot_deg.is_finite() || !cam.tilt_deg.is_finite()
             || cam.offset_m.is_some_and(|o| o.iter().any(|v| !v.is_finite())) {
@@ -1443,7 +1621,7 @@ impl ArmConfig {
         let home_positions = zero_reference.positions.iter().map(|v| *v as f32).collect();
 
         Self {
-            profile_id: None,
+            profile_id: Some("rebot_b601dm".to_string()),
             profile_version: ARM_PROFILE_VERSION,
             dof,
             joint_names,
@@ -1579,6 +1757,9 @@ pub struct ArmObservation {
     /// workspace, blocked hold); null when none applies. See docs/control_safety_contract.md.
     #[serde(default)]
     pub motion_limit: Option<MotionLimit>,
+    /// Structured workspace violation details when `motion_limit.reason == Workspace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_violation: Option<crate::kinematics::WorkspaceViolationDetail>,
     /// Per joint: the motor's reported fault code, or null. Empty when the driver
     /// reports no motor state (Damiao state codes 8-14).
     #[serde(default)]

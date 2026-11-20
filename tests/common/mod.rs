@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use armd::driver::{ArmDriver, ArmDriverError, DriverCapabilities, EnableState, JointMode, JointTarget};
 use armd::model::JointState;
-use armd::{create_router, ArmConfig, ArmSupervisor, SupervisorInner};
+use armd::{create_router, ArmConfig, ArmSupervisor, OperatorAuth, SupervisorInner};
 
 /// Inspection pose used across the motion tests (J7 closed).
 pub const INSPECT: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, 0.0];
@@ -31,7 +31,7 @@ pub type TestSocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::Mayb
 
 pub async fn spawn_server(config: ArmConfig) -> (SocketAddr, Arc<ArmSupervisor>) {
     let supervisor = Arc::new(ArmSupervisor::new(config));
-    let router = create_router(supervisor.clone());
+    let router = create_router(supervisor.clone(), OperatorAuth::disabled());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
@@ -94,7 +94,7 @@ pub async fn drain(ws: &mut TestSocket, ms: u64) {
 /// Server with a 50 Hz ticker, a lease holder and torque on, commanded/measured at `q`.
 /// Returns (socket, generation, epoch, supervisor, addr).
 pub async fn torqued_rig(supervisor: Arc<ArmSupervisor>, q: &[f32]) -> (TestSocket, u64, u64, Arc<ArmSupervisor>, SocketAddr) {
-    let router = create_router(supervisor.clone());
+    let router = create_router(supervisor.clone(), OperatorAuth::disabled());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });

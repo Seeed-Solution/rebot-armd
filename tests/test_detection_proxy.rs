@@ -155,7 +155,7 @@ async fn spawn_armd(detector: &str) -> SocketAddr {
         armd::JointLimit::new("joint_2", -2.0, 2.0, 2.0, 5.0),
     ];
     config.home_positions = vec![0.0, 0.0];
-    let router = create_router_with_detector(Arc::new(ArmSupervisor::new(config)), DetectorUpstream::parse(detector).unwrap());
+    let router = create_router_with_detector(Arc::new(ArmSupervisor::new(config)), DetectorUpstream::parse(detector).unwrap(), armd::OperatorAuth::disabled());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });

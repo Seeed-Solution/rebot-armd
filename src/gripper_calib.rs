@@ -55,6 +55,7 @@ pub struct GripperCalibrationResponse {
     /// The calibration was taught with an older gripper zero (null when current).
     #[serde(default)]
     pub stale: Option<crate::calibration::CalibrationStale>,
+    pub revision: u64,
 }
 
 /// Body for WS `/api/v1/gripper/calibration`.
@@ -64,17 +65,47 @@ pub struct CalibBody {
     pub jaw_opening: JawOpening,
     #[serde(default)]
     pub offset_rad: Option<f32>,
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
 }
 
-/// WS command `/api/v1/gripper/calibration` `{"jaw_opening": JawOpening, "offset_rad": f32?}`.
-/// Validates jaw_opening (monotonic, >= 2 points, inside J7 limits, openings in [0, 0.2]) and |offset_rad| <= 0.5.
-/// Returns the effective policy and the file write to run after the lock is released.
-pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(GripperPolicy, Option<PendingWrite>), ArmError> {
+/// Validated gripper calibration update prepared without mutating `SupervisorInner`.
+#[derive(Debug, Clone)]
+pub struct PreparedGripperCalib {
+    pub base_revision: u64,
+    pub offset_rad: Option<f32>,
+    pub jaw_opening: JawOpening,
+    pub candidate: Option<crate::supervisor::GripperCalibrationCandidate>,
+    pub effective_policy: GripperPolicy,
+    pub write: Option<PendingWrite>,
+}
+
+/// Step 1 of atomic persist-before-commit: validate payload, expected_revision, and
+/// driver limits without leaving `SupervisorInner` mutated.
+pub fn prepare_update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<PreparedGripperCalib, ArmError> {
+    prepare_update_with(inner, body, false)
+}
+
+/// Same as [`prepare_update`], optionally requiring `expected_revision` (enforced on real hardware).
+pub fn prepare_update_with(
+    inner: &mut SupervisorInner,
+    body: &serde_json::Value,
+    require_expected_revision: bool,
+) -> Result<PreparedGripperCalib, ArmError> {
     let b: CalibBody = serde_json::from_value(body.clone()).map_err(|e| {
         MotionError::InvalidCommand(format!(
             "gripper calibration body must have jaw_opening and optional offset_rad: {e}"
         ))
     })?;
+
+    if require_expected_revision && b.expected_revision.is_none() {
+        return Err(MotionError::InvalidCommand("expected_revision is required when operator auth is enforced".into()).into());
+    }
+    if let Some(exp) = b.expected_revision {
+        if exp != inner.gripper_calib_revision {
+            return Err(ArmError::PolicyRevisionMismatch { expected: exp, current: inner.gripper_calib_revision });
+        }
+    }
 
     if let Some(off) = b.offset_rad {
         if !off.is_finite() || off.abs() > 0.5 {
@@ -91,53 +122,90 @@ pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(
         return Err(MotionError::Unsupported("Gripper calibration requires a gripper policy".into()).into());
     }
 
-    let prev_config = inner.config.clone();
-    let prev_offset = inner.gripper_calib_offset;
-    let prev_jaw = inner.gripper_calib_jaw_opening.clone();
-    let prev_invalid = inner.gripper_calib_invalid;
-    let prev_err = inner.driver_config_error.clone();
-
     let offset = b.offset_rad.or(inner.gripper_calib_offset);
-    if let Err(e) = inner.apply_gripper_calibration(offset, Some(b.jaw_opening.clone())) {
-        inner.config = prev_config;
-        inner.gripper_calib_offset = prev_offset;
-        inner.gripper_calib_jaw_opening = prev_jaw;
-        inner.gripper_calib_invalid = prev_invalid;
-        inner.driver_config_error = prev_err;
-        return Err(MotionError::InvalidCommand(e).into());
-    }
-
-    if inner.driver.is_some() || inner.driver_config_error.is_some() {
-        let ok = inner.reapply_driver_limits();
-        if !ok || inner.gripper_calib_invalid || inner.driver_config_error.is_some() {
-            let reason = inner.driver_config_error.clone().unwrap_or_else(|| {
-                "Gripper calibration rejected by driver hardware limits".to_string()
-            });
-            inner.config = prev_config;
-            inner.gripper_calib_offset = prev_offset;
-            inner.gripper_calib_jaw_opening = prev_jaw;
-            inner.gripper_calib_invalid = prev_invalid;
-            inner.driver_config_error = prev_err;
-            return Err(MotionError::InvalidCommand(reason).into());
-        }
-    }
-
-    let effective = inner.config.gripper_policy.clone().ok_or_else(|| {
-        MotionError::Unsupported("Gripper calibration requires a gripper policy".into())
-    })?;
+    let (candidate, effective_policy) = inner
+        .build_gripper_calibration_candidate(offset, Some(b.jaw_opening.clone()))
+        .map_err(MotionError::InvalidCommand)?;
 
     let file = GripperCalibFile {
-        offset_rad: inner.gripper_calib_offset,
-        jaw_opening: Some(b.jaw_opening),
+        offset_rad: offset,
+        jaw_opening: Some(b.jaw_opening.clone()),
         ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())),
         stale: None,
     };
-    inner.gripper_calib_stale = None;
 
     let write = inner.gripper_calib_path.clone().or_else(|| Some(path_from_env())).map(|path| {
         PendingWrite::new(path, serde_json::to_string_pretty(&file).unwrap_or_default())
     });
 
+    Ok(PreparedGripperCalib {
+        base_revision: inner.gripper_calib_revision,
+        offset_rad: offset,
+        jaw_opening: b.jaw_opening,
+        candidate: Some(candidate),
+        effective_policy,
+        write,
+    })
+}
+
+/// Step 2.5 of atomic persist-before-commit (under supervisor lock, before rename):
+/// re-verify revision, busy flags, and hardware driver limits and refresh the candidate
+/// so post-rename commit is infallible.
+pub fn precheck_update(inner: &mut SupervisorInner, prepared: &mut PreparedGripperCalib) -> Result<(), ArmError> {
+    if inner.gripper_calib_revision != prepared.base_revision {
+        return Err(ArmError::PolicyRevisionMismatch {
+            expected: prepared.base_revision,
+            current: inner.gripper_calib_revision,
+        });
+    }
+    if inner.calibration_busy || inner.zero_check_persisting.is_some() {
+        return Err(ArmError::Rejected {
+            status: 409,
+            code: "CONFIG_BUSY".into(),
+            message: "another calibration operation is running".into(),
+        });
+    }
+    if inner.config.gripper_policy.is_none() {
+        return Err(MotionError::Unsupported("Gripper calibration requires a gripper policy".into()).into());
+    }
+    let (candidate, effective_policy) = inner
+        .build_gripper_calibration_candidate(prepared.offset_rad, Some(prepared.jaw_opening.clone()))
+        .map_err(MotionError::InvalidCommand)?;
+    prepared.candidate = Some(candidate);
+    prepared.effective_policy = effective_policy;
+    Ok(())
+}
+
+/// Step 3 of atomic persist-before-commit: re-verify revision and infallibly commit
+/// the pre-validated candidate built before rename.
+pub fn commit_update(inner: &mut SupervisorInner, mut prepared: PreparedGripperCalib) -> Result<(GripperPolicy, u64), ArmError> {
+    if inner.gripper_calib_revision != prepared.base_revision {
+        return Err(ArmError::PolicyRevisionMismatch { expected: prepared.base_revision, current: inner.gripper_calib_revision });
+    }
+    let cand = match prepared.candidate.take() {
+        Some(c) => c,
+        None => {
+            let (c, p) = inner
+                .build_gripper_calibration_candidate(prepared.offset_rad, Some(prepared.jaw_opening.clone()))
+                .map_err(MotionError::InvalidCommand)?;
+            prepared.effective_policy = p;
+            c
+        }
+    };
+    inner.commit_gripper_calibration_candidate(cand);
+    // the new calibration is taught with the current gripper zero
+    inner.gripper_calib_stale = None;
+    inner.gripper_calib_revision += 1;
+    Ok((prepared.effective_policy, inner.gripper_calib_revision))
+}
+
+/// WS command `/api/v1/gripper/calibration` `{"jaw_opening": JawOpening, "offset_rad": f32?}`.
+/// Validates jaw_opening (monotonic, >= 2 points, inside J7 limits, openings in [0, 0.2]) and |offset_rad| <= 0.5.
+/// Returns the effective policy and the file write to run after the lock is released.
+pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(GripperPolicy, Option<PendingWrite>), ArmError> {
+    let mut prepared = prepare_update(inner, body)?;
+    let write = prepared.write.take();
+    let (effective, _) = commit_update(inner, prepared)?;
     Ok((effective, write))
 }
 

@@ -145,7 +145,7 @@ pub struct CollisionHold {
 }
 
 /// Runtime guard state kept in the supervisor.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CollisionGuard {
     pub enabled: bool,
     pub sensitivity: Sensitivity,
@@ -164,6 +164,27 @@ pub struct CollisionGuard {
     trip_count: usize,
     /// Trips since start (black box / logs).
     pub trips_total: u64,
+    /// Monotonic revision (starts at 1).
+    pub revision: u64,
+}
+
+impl Default for CollisionGuard {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sensitivity: Sensitivity::default(),
+            runtime: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            path: None,
+            torque_feedback: false,
+            hold: None,
+            over: [0; 6],
+            trips: [0.0; MAX_TRIP_HISTORY],
+            trip_count: 0,
+            trips_total: 0,
+            revision: 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -247,6 +268,7 @@ pub struct CollisionConfig {
     /// `profile` or `runtime`.
     pub source: &'static str,
     pub active: bool,
+    pub revision: u64,
 }
 
 /// File body.
@@ -315,6 +337,7 @@ impl SupervisorInner {
             escalate_window_s: p.escalate_window_s,
             source: if self.collision.runtime { "runtime" } else { "profile" },
             active: self.collision.hold.is_some(),
+            revision: self.collision.revision,
         }
     }
 
@@ -416,26 +439,91 @@ impl SupervisorInner {
         }
         if let Some(s) = sensitivity { self.collision.sensitivity = s; }
         self.collision.runtime = true;
+        self.collision.revision += 1;
         Ok(())
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Body {
+    pub enabled: Option<bool>,
+    pub sensitivity: Option<Sensitivity>,
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+pub struct PreparedCollision {
+    pub base_revision: u64,
+    pub enabled: Option<bool>,
+    pub sensitivity: Option<Sensitivity>,
+    pub write: Option<PendingWrite>,
+}
+
+/// Step 1 of atomic persist-before-commit: validate payload, expected_revision, and
+/// availability without mutating `SupervisorInner`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn prepare_update(inner: &SupervisorInner, body: &serde_json::Value) -> Result<PreparedCollision, ArmError> {
+    prepare_update_with(inner, body, false)
+}
+
+/// Same as [`prepare_update`], optionally requiring `expected_revision` (enforced on real hardware).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn prepare_update_with(
+    inner: &SupervisorInner,
+    body: &serde_json::Value,
+    require_expected_revision: bool,
+) -> Result<PreparedCollision, ArmError> {
+    let b: Body = serde_json::from_value(body.clone()).map_err(|e| MotionError::InvalidCommand(format!(
+        "collision body must be {{\"enabled\": bool?, \"sensitivity\": \"low\"|\"medium\"|\"high\"?}}: {e}")))?;
+    if require_expected_revision && b.expected_revision.is_none() {
+        return Err(MotionError::InvalidCommand("expected_revision is required when operator auth is enforced".into()).into());
+    }
+    if let Some(exp) = b.expected_revision {
+        if exp != inner.collision.revision {
+            return Err(ArmError::PolicyRevisionMismatch { expected: exp, current: inner.collision.revision });
+        }
+    }
+    if b.enabled.is_none() && b.sensitivity.is_none() {
+        return Err(MotionError::InvalidCommand("collision body needs enabled and/or sensitivity".into()).into());
+    }
+    if b.enabled == Some(true) && !inner.collision_available() {
+        return Err(MotionError::Unsupported(
+            "The collision guard needs a profile gravity model and a driver that reports torque".into()).into());
+    }
+    let next_enabled = b.enabled.unwrap_or(inner.collision.enabled);
+    let next_sensitivity = b.sensitivity.unwrap_or(inner.collision.sensitivity);
+    let setting = CollisionSetting { enabled: next_enabled, sensitivity: next_sensitivity };
+    let write = inner.collision.path.clone().map(|path| PendingWrite::new(path, serde_json::to_string_pretty(&setting).unwrap_or_default()));
+    Ok(PreparedCollision {
+        base_revision: inner.collision.revision,
+        enabled: b.enabled,
+        sensitivity: b.sensitivity,
+        write,
+    })
+}
+
+/// Step 3 of atomic persist-before-commit: re-verify revision and commit.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn commit_update(inner: &mut SupervisorInner, prepared: PreparedCollision) -> Result<CollisionConfig, ArmError> {
+    if inner.collision.revision != prepared.base_revision {
+        return Err(ArmError::PolicyRevisionMismatch { expected: prepared.base_revision, current: inner.collision.revision });
+    }
+    inner.set_collision(prepared.enabled, prepared.sensitivity, true)?;
+    Ok(inner.collision_config())
 }
 
 /// WS command `/api/v1/safety/collision` `{"enabled": bool?, "sensitivity": "low"|"medium"|"high"?}`.
 /// Returns the new effective config and the file write to run after the lock is released.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn update(inner: &mut SupervisorInner, body: &serde_json::Value) -> Result<(CollisionConfig, Option<PendingWrite>), ArmError> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Body { enabled: Option<bool>, sensitivity: Option<Sensitivity> }
-    let b: Body = serde_json::from_value(body.clone()).map_err(|e| MotionError::InvalidCommand(format!(
-        "collision body must be {{\"enabled\": bool?, \"sensitivity\": \"low\"|\"medium\"|\"high\"?}}: {e}")))?;
-    if b.enabled.is_none() && b.sensitivity.is_none() {
-        return Err(MotionError::InvalidCommand("collision body needs enabled and/or sensitivity".into()).into());
-    }
-    inner.set_collision(b.enabled, b.sensitivity, true)?;
-    let setting = CollisionSetting { enabled: inner.collision.enabled, sensitivity: inner.collision.sensitivity };
-    let write = inner.collision.path.clone().map(|path| PendingWrite::new(path, serde_json::to_string_pretty(&setting).unwrap_or_default()));
-    Ok((inner.collision_config(), write))
+    let mut prepared = prepare_update(inner, body)?;
+    let write = prepared.write.take();
+    let cfg = commit_update(inner, prepared)?;
+    Ok((cfg, write))
 }
 
 /// Load the persisted runtime setting at startup (logs the outcome). An invalid file is
@@ -448,6 +536,7 @@ pub async fn load_into(supervisor: &ArmSupervisor, path: &Path) {
         Loaded::Loaded(s) => {
             tracing::info!("Collision guard setting loaded from {} (enabled {}, sensitivity {:?})", path.display(), s.enabled, s.sensitivity);
             let _ = inner.set_collision(Some(s.enabled), Some(s.sensitivity), false);
+            inner.collision.revision = 1;
         }
         Loaded::Missing => {}
         Loaded::Invalid(e) => tracing::warn!("Ignoring collision guard file: {e}; using the profile setting"),

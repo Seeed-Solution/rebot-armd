@@ -619,14 +619,39 @@ impl GraspDeps {
     }
 }
 
-/// WS command `/api/v1/grasp/setup`: apply a patch (and `table_z_from_tcp: true`, which sets
-/// `table_z_m` to the current commanded TCP height). Returns the new setup.
-pub fn update_setup(inner: &mut SupervisorInner, body: &Value) -> Result<GraspSetup, ArmError> {
+/// Validated grasp setup update prepared without mutating `SupervisorInner`.
+#[derive(Debug, Clone)]
+pub struct PreparedGraspSetup {
+    pub base_revision: u64,
+    pub setup: GraspSetup,
+    pub write: Option<crate::persist::PendingWrite>,
+}
+
+/// Step 1 of atomic persist-before-commit for `/api/v1/grasp/setup`.
+pub fn prepare_setup_update(
+    inner: &SupervisorInner,
+    body: &Value,
+    setup_path: Option<&PathBuf>,
+    require_expected_revision: bool,
+) -> Result<PreparedGraspSetup, ArmError> {
     let Some(base) = inner.grasp_setup() else {
         return Err(MotionError::Unsupported("This profile has no grasp setup".into()).into());
     };
-    let Some(obj) = body.as_object() else { return Err(MotionError::InvalidCommand("grasp setup must be a JSON object".into()).into()); };
+    let Some(obj) = body.as_object() else {
+        return Err(MotionError::InvalidCommand("grasp setup must be a JSON object".into()).into());
+    };
+    if let Some(exp) = crate::persist::parse_expected_revision(body, require_expected_revision)
+        .map_err(MotionError::InvalidCommand)?
+    {
+        if exp != inner.grasp_setup_revision {
+            return Err(ArmError::PolicyRevisionMismatch {
+                expected: exp,
+                current: inner.grasp_setup_revision,
+            });
+        }
+    }
     let mut patch = obj.clone();
+    patch.remove("expected_revision");
     match patch.remove("table_z_from_tcp") {
         None | Some(Value::Null) | Some(Value::Bool(false)) => {}
         Some(Value::Bool(true)) => {
@@ -638,7 +663,9 @@ pub fn update_setup(inner: &mut SupervisorInner, body: &Value) -> Result<GraspSe
         }
         Some(_) => return Err(MotionError::InvalidCommand("table_z_from_tcp must be boolean".into()).into()),
     }
-    if inner.camera_calibrated() { refuse_calibrated_fields(&base, &patch, "")?; }
+    if inner.camera_calibrated() {
+        refuse_calibrated_fields(&base, &patch, "")?;
+    }
     let setup = base.patched(&Value::Object(patch)).map_err(MotionError::InvalidCommand)?;
     // the camera tilt is workspace geometry (camera check point): it cannot change under an
     // accepted motion; other setup fields can
@@ -647,7 +674,60 @@ pub fn update_setup(inner: &mut SupervisorInner, body: &Value) -> Result<GraspSe
             return Err(MotionError::MotionBusy(format!("camera_tilt_deg cannot change while {reason}")).into());
         }
     }
-    inner.set_grasp_setup(setup.clone());
+    let write = setup_path.cloned().map(|p| {
+        crate::persist::PendingWrite::new(p, serde_json::to_string_pretty(&setup).unwrap_or_default())
+    });
+    Ok(PreparedGraspSetup {
+        base_revision: inner.grasp_setup_revision,
+        setup,
+        write,
+    })
+}
+
+/// Step 2.5 of atomic persist-before-commit (under supervisor lock, before publish).
+pub fn precheck_setup_update(inner: &SupervisorInner, prepared: &PreparedGraspSetup) -> Result<(), ArmError> {
+    if inner.grasp_setup_revision != prepared.base_revision {
+        return Err(ArmError::PolicyRevisionMismatch {
+            expected: prepared.base_revision,
+            current: inner.grasp_setup_revision,
+        });
+    }
+    if inner.calibration_busy {
+        return Err(ArmError::Rejected {
+            status: 409,
+            code: "CONFIG_BUSY".into(),
+            message: "a camera calibration apply or restore is running".into(),
+        });
+    }
+    if prepared.setup.camera_tilt_deg as f32 != inner.config.camera_mount.tilt_deg {
+        if let Some(reason) = inner.workspace_change_blocker() {
+            return Err(MotionError::MotionBusy(format!("camera_tilt_deg cannot change while {reason}")).into());
+        }
+    }
+    Ok(())
+}
+
+/// Step 3 of atomic persist-before-commit: re-verify revision and commit.
+pub fn commit_setup_update(
+    inner: &mut SupervisorInner,
+    prepared: PreparedGraspSetup,
+) -> Result<(GraspSetup, u64), ArmError> {
+    if inner.grasp_setup_revision != prepared.base_revision {
+        return Err(ArmError::PolicyRevisionMismatch {
+            expected: prepared.base_revision,
+            current: inner.grasp_setup_revision,
+        });
+    }
+    inner.set_grasp_setup(prepared.setup.clone());
+    inner.grasp_setup_revision += 1;
+    Ok((prepared.setup, inner.grasp_setup_revision))
+}
+
+/// WS command `/api/v1/grasp/setup`: apply a patch (and `table_z_from_tcp: true`, which sets
+/// `table_z_m` to the current commanded TCP height). Returns the new setup.
+pub fn update_setup(inner: &mut SupervisorInner, body: &Value) -> Result<GraspSetup, ArmError> {
+    let prepared = prepare_setup_update(inner, body, None, false)?;
+    let (setup, _) = commit_setup_update(inner, prepared)?;
     Ok(setup)
 }
 
@@ -1867,7 +1947,19 @@ pub fn table_violation(from: &Pose, to: &Pose, pts: &[Vec3], table_z: f64) -> Op
             .map(|(i, (p, f))| (i, pose.transform_point(p)[2], *f))
             .filter(|&(_, z, f)| z < f - 1e-6)
             .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(point, z, _)| MotionError::WorkspaceViolation { s, point, limit: "table_z_m + 0.005".into(), value: z, bound })
+            .map(|(point, z, _)| MotionError::WorkspaceViolation {
+                s,
+                point,
+                limit: "table_z_m + 0.005".into(),
+                value: z,
+                bound,
+                detail: kinematics::WorkspaceViolationDetail {
+                    constraint_id: Some("table_z".into()),
+                    geometry_id: Some(if point == 0 { "end_origin".into() } else { format!("end_point:{point}") }),
+                    violation_phase: Some("plan".into()),
+                    reason: Some(format!("new intrusion below table clearance {bound:.3}m at z={z:.3}m")),
+                },
+            })
     })
 }
 
@@ -2349,6 +2441,9 @@ impl Orchestrator {
         };
         let (goal, _yaw_free) = motion::resolve_goal_ex(&input, &spec);
         if let Some(e) = table_violation(&input.arm.fk(&input.q0), &goal, &self.envelope, self.setup.table_z_m) {
+            if let MotionError::WorkspaceViolation { ref detail, .. } = e {
+                self.sup.inner().write().await.set_action_workspace_violation(self.id, detail.clone());
+            }
             return Err(crate::macro_action::arm_fail(e.into()));
         }
         self.ctx.move_arm_with(phase, spec, Speed { linear, angular: motion::DEFAULT_ANGULAR_RPS }, approach).await

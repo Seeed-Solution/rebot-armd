@@ -77,7 +77,7 @@ async fn runtime_keepout_adds_to_the_profile_list_and_is_persisted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("keepout.json");
     let supervisor = Arc::new(ArmSupervisor::new(with_boxes(vec![cube("profile_box", [0.3, 0.3, 0.3])])));
-    armd::keepout::load_into(&supervisor, &path).await;
+    armd::keepout::load_into(&supervisor, &path).await.unwrap();
     let (mut ws, generation, epoch, _supervisor, addr) = common::torqued_rig(supervisor, &INSPECT).await;
     let get = || async { reqwest::get(format!("http://{addr}/api/v1/workspace/keepout")).await.unwrap().json::<serde_json::Value>().await.unwrap() };
     let state = get().await;
@@ -122,25 +122,23 @@ async fn runtime_keepout_adds_to_the_profile_list_and_is_persisted() {
 
     // A new start loads the runtime list.
     let again = ArmSupervisor::new(ArmConfig::rebot_dm());
-    armd::keepout::load_into(&again, &path).await;
+    armd::keepout::load_into(&again, &path).await.unwrap();
     let state = again.inner().read().await.keepout_state();
     assert_eq!((state.source, state.boxes[0].name.as_str()), ("runtime", "tray"));
 }
 
 #[tokio::test]
-async fn corrupt_keepout_file_is_ignored_and_moved_aside() {
+async fn corrupt_keepout_file_fails_closed_at_startup() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("keepout.json");
     std::fs::write(&path, "{\"boxes\": [ broken").unwrap();
     let supervisor = ArmSupervisor::new(with_boxes(vec![cube("p", [0.3, 0.3, 0.3])]));
-    armd::keepout::load_into(&supervisor, &path).await;
+    let err = armd::keepout::load_into(&supervisor, &path).await.unwrap_err();
+    assert!(err.contains("parse"), "{err}");
     let state = supervisor.inner().read().await.keepout_state();
-    assert_eq!((state.source, state.boxes.len()), ("profile", 1));
-    assert!(!path.exists());
-    let bad: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path()).collect();
-    assert_eq!(bad.len(), 1, "{bad:?}");
-    assert!(bad[0].file_name().unwrap().to_string_lossy().starts_with("keepout.json.bad-"), "{bad:?}");
-    assert_eq!(std::fs::read_to_string(&bad[0]).unwrap(), "{\"boxes\": [ broken");
+    assert_eq!((state.source, state.boxes.len(), state.revision), ("profile", 1, 1));
+    assert!(path.exists(), "corrupt keepout file must remain so restarts also fail closed");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"boxes\": [ broken");
 }
 
 /// A keep-out box on the park path from INSPECT (at the midpoint of the joint-space move home).
@@ -361,7 +359,7 @@ fn servo_step_check_catches_a_box_between_its_samples() {
     let b = KeepoutBox { name: "narrow".into(), min_m: c.map(|v| (v - 0.0005) as f32), max_m: c.map(|v| (v + 0.0005) as f32) };
     let probe = sim_at(ArmConfig::rebot_dm(), &INSPECT);
     assert!(clear_of(&probe, &b, &[INSPECT.to_vec(), lerp(0.5), next.to_vec()]), "box must sit between start, midpoint and end");
-    let inner = sim_at(with_boxes(vec![b]), &INSPECT);
+    let mut inner = sim_at(with_boxes(vec![b]), &INSPECT);
     let err = inner.servo_step_keepout(&next).unwrap_err();
     assert!(err.to_string().contains("keepout 'narrow'"), "{err}");
     let mut away = INSPECT;
@@ -380,7 +378,7 @@ async fn delayed_persist_ack_carries_the_epoch_at_send_time() {
     let _serial = ACK_TIMING.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let supervisor = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
-    armd::keepout::load_into(&supervisor, &dir.path().join("keepout.json")).await;
+    armd::keepout::load_into(&supervisor, &dir.path().join("keepout.json")).await.unwrap();
     let (mut ws, generation, epoch, sup, _) = common::torqued_rig(supervisor, &INSPECT).await;
     armd::persist::TEST_WRITE_DELAY_MS.store(300, std::sync::atomic::Ordering::Relaxed);
     common::send(&mut ws, json!({"type":"command", "request_id": 777, "generation": generation, "epoch_id": epoch,
@@ -399,13 +397,16 @@ async fn delayed_persist_ack_carries_the_epoch_at_send_time() {
     armd::persist::TEST_WRITE_DELAY_MS.store(0, std::sync::atomic::Ordering::Relaxed);
     let (ack, after_sync) = ack.unwrap();
     let sync = sync.unwrap();
-    assert_eq!(ack["persisted"], true, "{ack}");
+    // E-stop during staging aborts the staged write at the new epoch rather than publishing post-EStop.
+    assert_eq!(ack["type"], "command_reject", "{ack}");
+    assert_eq!(ack["code"], "EPOCH_MISMATCH", "{ack}");
     let now = sup.get_observation().await.epoch_id;
     assert_eq!(sync["epoch_id"].as_u64(), Some(now));
     if after_sync {
-        assert_eq!(ack["epoch_id"].as_u64(), Some(now), "ack after epoch_sync must not roll the epoch back: {ack}");
+        assert_eq!(ack["epoch_id"].as_u64(), Some(now), "reject after epoch_sync must not roll the epoch back: {ack}");
     }
-    assert!(after_sync, "the ack is sent after the write, after the immediate E-stop reply");
+    assert!(after_sync, "the reply is sent after the stage wait, after the immediate E-stop reply");
+    assert_eq!(sup.inner().read().await.keepout_state().boxes.len(), 0);
 }
 
 /// The bounds the sweep check rests on: the joint travel bound covers the sampled travel,
@@ -456,7 +457,7 @@ async fn delayed_ack_never_follows_a_newer_epoch_sync_with_an_older_epoch() {
     let _serial = ACK_TIMING.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let supervisor = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
-    armd::keepout::load_into(&supervisor, &dir.path().join("keepout.json")).await;
+    armd::keepout::load_into(&supervisor, &dir.path().join("keepout.json")).await.unwrap();
     let (mut ws, generation, epoch, _sup, _) = common::torqued_rig(supervisor, &INSPECT).await;
     armd::api::ws::TEST_ACK_STAMP_DELAY_MS.store(400, std::sync::atomic::Ordering::Relaxed);
     common::send(&mut ws, json!({"type":"command", "request_id": 778, "generation": generation, "epoch_id": epoch,

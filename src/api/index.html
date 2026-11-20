@@ -170,6 +170,11 @@ body.locked .pose-go { opacity: .45; filter: saturate(0); cursor: not-allowed; }
 .lang-btn { flex: none; display: inline-flex; align-items: center; justify-content: center; height: 36px; min-width: 36px; padding: 0 10px; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border-neutral); background: #fff; color: var(--sc-color-text-secondary); font: 600 12px/1 inherit; font-family: inherit; white-space: nowrap; cursor: pointer; touch-action: manipulation; transition: background .15s, color .15s, border-color .15s; }
 .lang-btn:hover { color: var(--sc-color-text-primary); border-color: var(--sc-color-primary); }
 .lang-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+.op-btn { flex: none; display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 10px; border-radius: 14px; border: 1px solid var(--sc-color-border-neutral); background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); font-size: 12px; font-weight: 600; white-space: nowrap; cursor: pointer; touch-action: manipulation; transition: background .15s, color .15s, border-color .15s; }
+.op-btn[hidden] { display: none; }
+.op-btn.is-unlocked { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); border-color: var(--sc-color-border); }
+.op-btn:hover { border-color: var(--sc-color-primary); }
+.op-btn:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
 .fs-btn svg { width: 18px; height: 18px; }
 .fs-btn .ic-exit, .fs-btn.on .ic-enter { display: none; }
 .fs-btn.on .ic-exit { display: block; }
@@ -667,6 +672,73 @@ body.offline .banner { display: block; }
 .gc-banner .btn.btn-gc-exit { background: #d48806; border-color: #d48806; color: #fff; font-weight: 700; }
 .gc-banner .btn.gc-rec { background: #fff; color: #1f2937; }
 .gc-banner .btn.gc-rec.rec-on { color: var(--sc-status-danger-fg); border-color: var(--sc-status-danger-fg); }
+/* ---------- external control: banner (#ext-banner), HUD chip, task drawer (#task) ---------- */
+.ext-banner { display: grid; gap: 8px; padding: 12px; border-radius: var(--sc-radius-lg); border: 1px solid var(--sc-color-border-neutral); border-left: 4px solid var(--sc-color-primary);
+  background: rgba(255,255,255,0.82); backdrop-filter: blur(12px) saturate(140%); -webkit-backdrop-filter: blur(12px) saturate(140%); box-shadow: var(--sc-shadow); }
+.ext-banner[hidden] { display: none; }
+.ext-banner.warn { border-left-color: #d48806; }
+.ext-banner.bad { border-left-color: var(--sc-status-danger-fg); background: rgba(255,241,240,0.9); }
+.ext-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.ext-dot { flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--sc-color-primary); }
+.ext-banner.live .ext-dot { animation: extpulse 1.4s ease-in-out infinite; }
+.ext-banner.warn .ext-dot { background: #d48806; }
+.ext-banner.bad .ext-dot { background: var(--sc-status-danger-fg); }
+@keyframes extpulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(140,192,32,0.55); } 50% { box-shadow: 0 0 0 6px rgba(140,192,32,0); } }
+@media (prefers-reduced-motion: reduce) { .ext-banner.live .ext-dot { animation: none; } }
+.ext-who { flex: 1 1 auto; min-width: 0; font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ext-pill { flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 10px; background: var(--sc-color-primary-soft); color: var(--sc-color-primary-dark); border: 1px solid var(--sc-color-border); }
+.ext-pill[hidden] { display: none; }
+.ext-x { flex: none; width: 32px; min-height: 32px; padding: 0; font-size: 18px; line-height: 1; }
+.ext-x[hidden] { display: none; }
+.ext-live { display: grid; gap: 6px; }
+.ext-step { font-size: 15px; font-weight: 600; color: var(--sc-color-text); overflow-wrap: anywhere; }
+.ext-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.ext-tags:empty { display: none; }
+.ext-tag { font-size: 11px; padding: 1px 7px; border-radius: var(--sc-radius-base); background: var(--sc-color-bg-sunken); color: var(--sc-color-text-secondary); border: 1px solid var(--sc-color-border-neutral); }
+.ext-tag.ok { background: var(--sc-status-normal-bg); color: var(--sc-status-normal-fg); border-color: transparent; }
+.ext-tag.warn { background: var(--sc-status-warning-bg); color: var(--sc-status-warning-fg); border-color: transparent; }
+.ext-prog[hidden], .ext-err[hidden], .ext-hint[hidden] { display: none; }
+.ext-err { font-size: 12px; line-height: 1.4; padding: 6px 8px; border-radius: var(--sc-radius-md); background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); overflow-wrap: anywhere; }
+.ext-err b { font-family: var(--mono); margin-right: 6px; }
+.ext-hint { font-size: 12px; color: var(--sc-status-warning-fg); }
+.ext-feed { list-style: none; display: grid; gap: 3px; font-size: 12px; }
+.ext-feed:empty { display: none; }
+.ext-feed li, .task-list li { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.ext-feed li { padding: 4px 8px; border-radius: var(--sc-radius-base); background: var(--sc-color-bg-sunken); color: var(--sc-color-text-secondary); }
+.ext-feed .lbl { flex: 1 1 auto; min-width: 0; color: var(--sc-color-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ext-feed .mono, .task-list .mono { font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+.st-ic { flex: none; width: 14px; text-align: center; font-weight: 700; }
+.st-running { color: var(--sc-color-primary-dark); } .st-done { color: var(--sc-status-normal-fg); }
+.st-failed, .st-cancelled { color: var(--sc-status-danger-fg); } .st-lease { color: var(--sc-color-text-tertiary); }
+.ext-open { justify-content: center; min-height: 40px; }
+#act-chip.ext { pointer-events: auto; cursor: pointer; }
+#act-chip.ext:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 2px; }
+body.is-fs.ui-simple .ext-banner, body.is-hud.ui-simple .ext-banner { display: none; }
+#btn-task { position: relative; }
+#btn-task .live-dot { position: absolute; top: 4px; right: 4px; width: 8px; height: 8px; border-radius: 50%; border: 1.5px solid #fff; background: var(--sc-color-primary); display: none; }
+#btn-task.is-live .live-dot { display: block; }
+#btn-task.is-live.warn .live-dot { background: #d48806; }
+.task-tabs { display: flex; }
+.task-tabs button { flex: 1 1 0; }
+.task-pane[hidden] { display: none; }
+.task-pane { display: grid; gap: 10px; align-content: start; }
+.task-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.task-bar .seg { flex: 1 1 auto; }
+.task-bar .btn { min-height: 36px; }
+.task-list { max-height: none; }
+.task-list li { flex-wrap: wrap; align-items: baseline; }
+.task-list li.bad { background: var(--sc-status-danger-bg); color: var(--sc-status-danger-fg); }
+.task-list .who { color: var(--sc-color-text-tertiary); max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-list .lbl { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.task-list .sub { flex-basis: 100%; padding-left: 20px; font-size: 11px; overflow-wrap: anywhere; }
+.task-empty { font-size: 12px; color: var(--sc-color-text-tertiary); padding: 6px 2px; }
+.task-env { display: grid; gap: 6px; }
+.task-env .row { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; padding: 6px 10px; border-radius: var(--sc-radius-base); background: var(--sc-color-bg-sunken); }
+.task-env .row span:first-child { color: var(--sc-color-text-secondary); flex: none; }
+.task-env .row span:last-child { text-align: right; overflow-wrap: anywhere; min-width: 0; }
+.task-env .row.bad span:last-child { color: var(--sc-status-danger-fg); font-weight: 600; }
+.task-env .row.warn span:last-child { color: var(--sc-status-warning-fg); }
+.task-env h4 { font-size: 12px; font-weight: 600; color: var(--sc-color-text-secondary); margin-top: 4px; }
 #gc-chip { display: none; background: #d48806; color: #fff; }
 body.gc #gc-chip { display: inline-flex; }
 body.gc .disc:not(#pad-sgrip), body.gc .pad, body.gc .preset, body.gc .pose-btn, body.gc .jrow:not(.grip) .jbtn, body.gc .cart-zone .jbtn { opacity: .35; filter: saturate(.3); }
@@ -1055,6 +1127,7 @@ kbd { display: inline-block; min-width: 20px; padding: 1px 5px; margin-right: 2p
   .ops { order: 2; }
   .side > .sc-card:not(.safety) { order: 3; }
   .side > .sc-card.pose-card { order: 1; } /* right below the safety card, before the controls */
+  .side > .sc-card.ext-banner { order: 1; } /* external control status: under the pinned safety card */
   .cart-ctl { grid-template-columns: minmax(0, 1fr); }
   .cart-read { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
@@ -1345,6 +1418,7 @@ body.locked .disc, body.locked .pose-btn, body.locked .grip-key, body.locked .pr
   body.ui-simple .gc-banner { position: fixed; z-index: 170; top: 50px; left: 50%; transform: translateX(-50%); width: min(92vw, 420px);
     backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%); background: rgba(255,247,230,0.92); box-shadow: 0 6px 18px rgba(0,0,0,0.25); }
   body.ui-simple.gc .gc-sw { display: none; }
+  body.ui-simple .ext-banner { display: none; } /* camera stays unobstructed; #act-chip in the HUD opens #task */
   /* the capsule is as wide as the Enable + E-stop row; the hand-guide switch takes that width and its short label */
   body.ui-simple .safety { width: max-content; }
   body.ui-simple .gc-sw { width: 0; min-width: 100%; }
@@ -1539,6 +1613,10 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
       <svg class="ic-enter" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
       <svg class="ic-exit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h3a2 2 0 0 0 2-2V3"/><path d="M21 8h-3a2 2 0 0 1-2-2V3"/><path d="M3 16h3a2 2 0 0 1 2 2v3"/><path d="M21 16h-3a2 2 0 0 0-2 2v3"/></svg>
     </button>
+    <button class="hd-btn" id="btn-task" type="button" aria-haspopup="dialog" aria-controls="task" aria-label="任务与策略" title="任务与策略" data-i18n-aria="task.title" data-i18n-title="task.title">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>
+      <i class="live-dot" aria-hidden="true"></i>
+    </button>
     <button class="hd-btn" id="btn-pset" type="button" aria-label="点位" title="点位" data-i18n-aria="pose.title" data-i18n-title="pose.title" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 19 9.5C19 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/></svg>
       <span class="hd-lbl" id="btn-pset-lbl" data-i18n="pose.title">点位</span><span class="hd-lbl-s" data-i18n="pose.title">点位</span>
@@ -1546,6 +1624,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <button class="hd-btn" id="btn-sset" type="button" aria-label="设置" title="设置" data-i18n-aria="sset.title" data-i18n-title="sset.title" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2l2.4 2.6 3.5-.4.4 3.5L21 10l-1.7 3 1 3.4-3.3 1.3-1.3 3.3-3.4-1-3 1.7-2.3-2.7-3.5.4-.4-3.5L1 14.5l1.7-3-1-3.4L5 6.8 6.3 3.5l3.4 1z" transform="scale(.9) translate(1.3 1.3)"/><circle cx="12" cy="12" r="3.2"/></svg>
     </button>
+    <button class="op-btn" id="btn-op" type="button" aria-label="操作员权限" title="操作员权限" data-i18n-aria="op.title" data-i18n-title="op.title" hidden></button>
     <button class="lang-btn" id="btn-lang" type="button" aria-label="Switch language">EN</button>
   </header>
 
@@ -1584,7 +1663,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
           <span class="sc-status-badge plain" id="det-chip" data-i18n="det.none" hidden>检测 --</span>
           <span class="sc-status-badge is-danger" id="rec-chip" data-i18n="rec.chip0">录制 00:00</span>
           <span class="sc-status-badge" id="gc-chip" data-i18n="gc.chip">拖动示教</span>
-          <span class="sc-status-badge" id="act-chip" role="status" aria-live="polite" hidden></span>
+          <span class="sc-status-badge" id="act-chip" role="button" tabindex="0" aria-haspopup="dialog" aria-controls="task" hidden></span>
           <span class="sc-status-badge is-info" id="ml-chip" role="status" aria-live="polite" hidden></span>
         </div>
         <div class="view3d" id="view3d" role="region" data-i18n-aria="v3.aria" aria-label="3D 视图" hidden>
@@ -1808,6 +1887,24 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
             <button class="btn gc-rec" id="btn-gc-rec" type="button"></button>
             <button class="btn btn-gc-exit" id="btn-gc-exit" type="button" data-i18n="gc.exit">退出并锁定位置</button>
           </div>
+        </div>
+      <!-- external controller / task status: in the cockpit after the safety block (simple) or right after #gc-banner (expert), moved by setUi -->
+        <div class="sc-card ext-banner" id="ext-banner" role="status" aria-live="polite" hidden>
+          <div class="ext-head">
+            <i class="ext-dot" aria-hidden="true"></i>
+            <span class="ext-who" id="ext-who">--</span>
+            <span class="ext-pill" id="ext-pill" hidden></span>
+            <button class="btn ext-x" id="ext-dismiss" type="button" data-i18n-aria="ext.dismiss" aria-label="关闭提示" hidden>×</button>
+          </div>
+          <div class="ext-live">
+            <div class="ext-step" id="ext-step">--</div>
+            <div class="ext-tags" id="ext-tags"></div>
+            <div class="calib-bar ext-prog" id="ext-prog" role="progressbar" aria-valuemin="0" aria-valuemax="100" hidden><i id="ext-prog-bar"></i></div>
+            <div class="ext-hint" id="ext-hint" hidden></div>
+            <div class="ext-err" id="ext-err" role="alert" hidden><b id="ext-err-code"></b><span id="ext-err-msg"></span></div>
+          </div>
+          <ol class="ext-feed" id="ext-feed"></ol>
+          <button class="btn ext-open" id="ext-open-task" type="button" aria-controls="task" data-i18n="ext.open">查看完整流水 &amp; 策略</button>
         </div>
       <!-- simple: one integrated cockpit (safety block is moved in here by setUi) -->
       <div class="sc-card cockpit only-simple" id="cockpit">
@@ -2093,6 +2190,34 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
   <button class="cal-stale-txt" id="cal-stale-open" type="button"></button>
   <button class="btn calib-x" id="cal-stale-x" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
 </div>
+<div class="calib-mask" id="task" hidden>
+  <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="task-h">
+    <div class="calib-head">
+      <h3 id="task-h" data-i18n="task.title">任务与策略</h3>
+      <button class="btn calib-x" id="task-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+    </div>
+    <div class="seg task-tabs" id="task-tabs" role="tablist" data-i18n-aria="task.title" aria-label="任务与策略">
+      <button type="button" role="tab" id="task-tab-act" data-tab="act" aria-controls="task-act" aria-selected="true" tabindex="0" data-i18n="task.tab.act">实时指令流</button><button type="button" role="tab" id="task-tab-env" data-tab="env" aria-controls="task-env" aria-selected="false" tabindex="-1" data-i18n="task.tab.env">策略与环境</button>
+    </div>
+    <div class="task-pane" id="task-act" role="tabpanel" aria-labelledby="task-tab-act">
+      <div class="task-bar">
+        <div class="seg seg-sm" id="task-filter" role="radiogroup" data-i18n-aria="task.filter" aria-label="筛选">
+          <button type="button" role="radio" data-f="all" data-i18n="task.f.all">全部</button><button type="button" role="radio" data-f="ext" data-i18n="task.f.ext">仅外部</button>
+        </div>
+        <button class="btn" id="task-copy" type="button" data-i18n="task.copy">复制日志</button>
+        <button class="btn" id="task-clear" type="button" data-i18n="task.clear">清空</button>
+      </div>
+      <ol class="calib-list task-list" id="task-list"></ol>
+      <div class="task-empty" id="task-empty" data-i18n="task.empty">还没有记录。外部程序发起动作或取得控制权时会显示在这里。</div>
+    </div>
+    <div class="task-pane" id="task-env" role="tabpanel" aria-labelledby="task-tab-env" hidden>
+      <p class="calib-hint" data-i18n="task.env.hint">只读。打开本面板时每 2 秒刷新一次。</p>
+      <div class="task-env" id="task-env-body"></div>
+      <button class="btn" id="task-open-poses" type="button" data-i18n="task.open_poses">打开点位管理</button>
+      <div class="calib-live mono" id="task-env-status">--</div>
+    </div>
+  </aside>
+</div>
 <div class="col-banner" id="col-banner" role="alert" aria-live="assertive" hidden>
   <b id="col-title"></b><span id="col-sub"></span>
   <button class="btn" id="col-clear" type="button" data-i18n="en.clear_fault" hidden>⚠️ 点击清除故障</button>
@@ -2146,6 +2271,23 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
       <small class="col-note" data-i18n="col.set.note">注意：这台机械臂的碰撞阈值还没有标定，灵敏度只作试用参考；碰撞保护不能代替急停。</small>
       <div class="calib-live mono" id="col-status">--</div>
     </div>
+  </aside>
+</div>
+<div class="calib-mask" id="op-modal" hidden>
+  <aside class="calib-drawer" role="dialog" aria-modal="true" aria-labelledby="op-h">
+    <div class="calib-head">
+      <h3 id="op-h" data-i18n="op.title">操作员解锁</h3>
+      <button class="btn calib-x" id="op-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
+    </div>
+    <p class="calib-hint" id="op-hint" data-i18n="op.hint">修改安全配置、清除非可恢复故障或强制抢占控制权需要操作员 PIN。</p>
+    <form class="gset-row" id="op-form">
+      <label class="field"><span data-i18n="op.pin">操作员 PIN</span><input id="op-pin" type="password" inputmode="numeric" autocomplete="off"></label>
+      <div class="calib-live mono" id="op-status">--</div>
+      <div class="calib-actions">
+        <button class="btn btn-primary" id="op-unlock" type="submit" data-i18n="op.unlock">解锁</button>
+        <button class="btn" id="op-lock" type="button" data-i18n="op.lock" hidden>锁定</button>
+      </div>
+    </form>
   </aside>
 </div>
 <script>
@@ -2348,6 +2490,7 @@ const I18N = {
     'toast.in_air': '机械臂悬空中，为防下坠已阻止直接断电。正在执行受控收纳...', 'toast.not_at_rest': '机械臂仍未到达收纳位，力矩保持开启', 'toast.torque_off_fail': '关闭力矩失败',
     'toast.torque_off_unconfirmed': '关闭力矩请求未确认，请检查连接和机械臂状态', 'toast.stowing': '正在平稳回零收起...', 'toast.enabled': '控制已开启，请确认机械臂反馈状态',
     'toast.enable_fail': '使能失败：', 'toast.enable_fail_def': '电机未就绪/通讯超时', 'toast.preset_fail': '预设指令执行失败: ', 'toast.rec_start': '开始录制 ',
+    'op.title': '操作员权限', 'op.locked': '🔒 已锁定', 'op.unlocked': '🔓 操作员', 'op.hint': '修改安全配置、清除不可自动恢复的故障或强制接管控制权需要操作员 PIN。', 'op.pin': '操作员 PIN', 'op.unlock': '解锁', 'op.lock': '锁定会话', 'op.unlocked_msg': '操作员权限已解锁', 'op.locked_msg': '操作员权限已锁定', 'op.lock_fail': '锁定未确认，请重试', 'op.bad_pin': 'PIN 错误', 'op.need_pin': '请输入操作员 PIN', 'err.operator_required': '需要操作员解锁后才能执行此操作',
   },
   en: {
     'doc.title': 'reBot Teleop',
@@ -2540,6 +2683,7 @@ const I18N = {
     'toast.in_air': 'Arm is in the air; direct power-off blocked to prevent a drop. Running controlled park...', 'toast.not_at_rest': 'Arm has not reached the park pose, torque stays on', 'toast.torque_off_fail': 'Failed to turn torque off',
     'toast.torque_off_unconfirmed': 'Torque-off request not confirmed, check the connection and the arm', 'toast.stowing': 'Smoothly homing and stowing...', 'toast.enabled': 'Control enabled, verify arm feedback',
     'toast.enable_fail': 'Enable failed: ', 'toast.enable_fail_def': 'motors not ready / communication timeout', 'toast.preset_fail': 'Preset failed: ', 'toast.rec_start': 'Recording started ',
+    'op.title': 'Operator access', 'op.locked': '🔒 Locked', 'op.unlocked': '🔓 Operator', 'op.hint': 'Changing safety config, clearing non-recoverable faults, or force-preempting control requires the operator PIN.', 'op.pin': 'Operator PIN', 'op.unlock': 'Unlock', 'op.lock': 'Lock session', 'op.unlocked_msg': 'Operator access unlocked', 'op.locked_msg': 'Operator access locked', 'op.lock_fail': 'Lock not confirmed; please retry', 'op.bad_pin': 'Invalid PIN', 'op.need_pin': 'Enter the operator PIN', 'err.operator_required': 'Operator unlock is required for this operation',
   },
 };
 // calibration tools (settings drawer, gripper tool)
@@ -2845,6 +2989,41 @@ Object.assign(I18N.en, {
   'tch.pick.prog': 'Playing · pose {i}/{n}', 'tch.start': 'Start teaching', 'tch.start.hint': 'Shows the "Save pose / Record" toolbar for the sticks or hand-guiding; it shows by itself while hand-guiding.',
   'tch.src.hand_guide': 'hand-guide', 'tch.src.jog': 'jog', 'tch.src.servo': 'teleop', 'tch.src.replay': 'replay', 'tch.src.sequence': 'motion', 'tch.src.import': 'import', 'tch.src.sdk': 'SDK',
 });
+// external control monitor (#ext-banner, #act-chip, #task)
+Object.assign(I18N.zh, {
+  'who.policy': '策略运行器（{id}）', 'who.app': '设备端程序（{id}）', 'who.wizard': '沙盒向导（{id}）', 'who.self': '本页面',
+  'whos.policy': '策略', 'whos.app': '设备端', 'whos.agent': '智能体', 'whos.wizard': '向导', 'whos.cockpit': '驾驶舱', 'whos.other': '外部',
+  'ext.dismiss': '关闭提示', 'ext.open': '查看完整流水 & 策略', 'ext.servo': '外部实时控制中', 'ext.servo.s': '实时控制',
+  'ext.policy': '策略 {id}', 'ext.mode': '沙盒 {m}', 'ext.phase': '阶段 {p}', 'ext.holding.yes': '已夹持', 'ext.holding.no': '未夹持',
+  'ext.ml': '运动限制：{m}', 'ext.chip.aria': '外部控制：{s}。打开任务与策略面板',
+  'ext.st.running': '运行中', 'ext.st.done': '完成', 'ext.st.failed': '失败', 'ext.st.cancelled': '已取消',
+  'task.title': '任务与策略', 'task.tab.act': '实时指令流', 'task.tab.env': '策略与环境', 'task.filter': '筛选', 'task.f.all': '全部', 'task.f.ext': '仅外部',
+  'task.copy': '复制日志', 'task.clear': '清空', 'task.copied': '日志已复制', 'task.copy_fail': '复制失败',
+  'task.empty': '还没有记录。外部程序发起动作或取得控制权时会显示在这里。', 'task.lease.acquire': '取得控制权', 'task.lease.release': '释放控制权',
+  'task.env.hint': '只读。打开本面板时每 2 秒刷新一次。', 'task.open_poses': '打开点位管理',
+  'task.env.sec.sandbox': '策略 / 沙盒', 'task.env.sec.safety': '安全', 'task.env.sec.cell': '工作单元',
+  'task.env.mode': '沙盒模式', 'task.env.scene': '场景', 'task.env.tool': '工具', 'task.env.policy': '策略', 'task.env.pstatus': '策略状态',
+  'task.env.safety': '安全状态', 'task.env.col': '碰撞保护', 'task.env.ml': '运动限制', 'task.env.ko': '禁入区', 'task.env.poses': '已存点位',
+  'task.env.col.hold': '触发保持（J{j}）', 'task.env.col.ok': '正常', 'task.env.count': '{n} 个',
+  'task.env.na': '不支持', 'task.env.none': '无', 'task.env.loading': '读取中…', 'task.env.updated': '更新于 {t}', 'task.env.err': '读取失败：{list}',
+});
+Object.assign(I18N.en, {
+  'who.policy': 'Policy runner ({id})', 'who.app': 'Device app ({id})', 'who.wizard': 'Sandbox wizard ({id})', 'who.self': 'this page',
+  'whos.policy': 'Policy', 'whos.app': 'Device app', 'whos.agent': 'Agent', 'whos.wizard': 'Wizard', 'whos.cockpit': 'Cockpit', 'whos.other': 'External',
+  'ext.dismiss': 'Dismiss', 'ext.open': 'Task & Policy Details', 'ext.servo': 'Servo stream (external real-time control)', 'ext.servo.s': 'Servo',
+  'ext.policy': 'Policy {id}', 'ext.mode': 'Sandbox {m}', 'ext.phase': 'phase {p}', 'ext.holding.yes': 'holding', 'ext.holding.no': 'not holding',
+  'ext.ml': 'Motion limit: {m}', 'ext.chip.aria': 'External control: {s}. Open Task & Policy',
+  'ext.st.running': 'running', 'ext.st.done': 'done', 'ext.st.failed': 'failed', 'ext.st.cancelled': 'cancelled',
+  'task.title': 'Task & Policy', 'task.tab.act': 'Activity', 'task.tab.env': 'Policy & Cell', 'task.filter': 'Filter', 'task.f.all': 'All', 'task.f.ext': 'External only',
+  'task.copy': 'Copy log', 'task.clear': 'Clear', 'task.copied': 'Log copied', 'task.copy_fail': 'Copy failed',
+  'task.empty': 'Nothing yet. Actions started by external clients and lease changes appear here.', 'task.lease.acquire': 'took control', 'task.lease.release': 'released control',
+  'task.env.hint': 'Read-only. Refreshes every 2 s while this panel is open.', 'task.open_poses': 'Open Poses',
+  'task.env.sec.sandbox': 'Policy / sandbox', 'task.env.sec.safety': 'Safety', 'task.env.sec.cell': 'Work cell',
+  'task.env.mode': 'Sandbox mode', 'task.env.scene': 'Scene', 'task.env.tool': 'Tool', 'task.env.policy': 'Policy', 'task.env.pstatus': 'Policy status',
+  'task.env.safety': 'Safety state', 'task.env.col': 'Collision guard', 'task.env.ml': 'Motion limit', 'task.env.ko': 'Keep-out boxes', 'task.env.poses': 'Saved poses',
+  'task.env.col.hold': 'holding after a hit (J{j})', 'task.env.col.ok': 'normal', 'task.env.count': '{n}',
+  'task.env.na': 'not supported', 'task.env.none': 'none', 'task.env.loading': 'Loading…', 'task.env.updated': 'Updated {t}', 'task.env.err': 'Failed: {list}',
+});
 let LANG = (() => {
   const saved = store('lang');
   if (saved === 'zh' || saved === 'en') return saved;
@@ -3104,6 +3283,7 @@ const S = {
   rest: null,
   hb: { n: 0, hz: 0, at: 0 }, // lease heartbeats sent: count this second, rate, last send time
   preset: null,               // { name, until } while a preset motion runs
+  auth: { enforced: false, role: 'program', expiresIn: null },
 };
 const isSoArmProfile = () => !!(S.profileId && S.profileId.startsWith('so_arm'));
 let schemaReady = null;
@@ -3162,6 +3342,11 @@ function rpcError(response) {
     message = t('err.park_unsupported');
   } else if (response.code === 'COLLISION_HOLD') {
     message = t('err.collision_hold');
+  } else if (response.code === 'OPERATOR_REQUIRED') {
+    message = t('err.operator_required');
+    if (typeof S === 'object' && S.auth) { S.auth.role = 'program'; S.auth.expiresIn = null; }
+    if (typeof renderOpBadge === 'function') renderOpBadge();
+    if (typeof openOperatorModal === 'function') openOperatorModal();
   } else {
     message = response.message || response.error || t('err.rejected');
   }
@@ -3259,6 +3444,7 @@ const gripNoWindup = (frac, measuredRad) => {
 /* =================================================================
    Telemetry WebSocket (50 Hz) + heartbeat
    ================================================================= */
+let wsOpenedOnce = false;
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${proto}//${location.host}/api/v1/ws`);
@@ -3266,6 +3452,11 @@ function connectWS() {
   clearActiveAcquire();
   resetLease();
   S.sequenceId = 0;
+  ws.onopen = () => {
+    if (S.ws !== ws) return;
+    if (wsOpenedOnce) loadAuthStatus();
+    wsOpenedOnce = true;
+  };
   // No acquire on open: the lease is taken on the first control input (ensureLease).
   ws.onmessage = (ev) => {
     let o; try { o = JSON.parse(ev.data); } catch (_) { return; }
@@ -3298,9 +3489,20 @@ function connectWS() {
     if (o.type === 'servo_reject') {
       syncEpoch(o.epoch_id);
       if (o.code === 'WORKSPACE_VIOLATION') {
-        // server-side Cartesian safety box (floor / boundary incl. the gripper envelope)
-        if (S.mode === 'cart') cartReject('floor');
-        else toastOnce({ message: t('err.workspace'), code: o.code });
+        const cid = o.constraint_id;
+        const gid = o.geometry_id;
+        const nonFloor = (cid && cid !== 'floor_z')
+          || (gid && gid.startsWith('capsule:'))
+          || (!cid && typeof o.message === 'string' && /keepout|box_|reach|capsule:/i.test(o.message));
+        const detail = o.reason || o.message;
+        if (nonFloor && detail) {
+          if (S.mode === 'cart') cartReject(detail);
+          else toastOnce({ message: detail, code: o.code });
+        } else {
+          // server-side Cartesian safety box (floor / boundary incl. the gripper envelope)
+          if (S.mode === 'cart') cartReject('floor');
+          else toastOnce({ message: t('err.workspace'), code: o.code });
+        }
         return;
       }
       const msg = o.code === 'HANDOVER_SETTLING'
@@ -3319,10 +3521,14 @@ function connectWS() {
       syncEpoch(o.epoch_id);
       S.presetRunning = false;
       S.preset = null;
+      const nonFloor = (o.constraint_id && o.constraint_id !== 'floor_z')
+        || (o.geometry_id && o.geometry_id.startsWith('capsule:'))
+        || (!o.constraint_id && typeof o.message === 'string' && /keepout|box_|reach|capsule:/i.test(o.message));
+      const wsMsg = nonFloor ? (o.reason || o.message || t('err.workspace')) : t('err.workspace');
       const msg = o.code === 'HANDOVER_SETTLING'
         ? t('err.settling3')
         : o.code === 'COLLISION_HOLD' ? t('err.collision_hold')
-        : o.code === 'WORKSPACE_VIOLATION' ? t('err.workspace')
+        : o.code === 'WORKSPACE_VIOLATION' ? wsMsg
         : (o.code === 'UNSUPPORTED' ? t('err.preset_unsupported') : t('err.preset_reject') + (o.message || o.error || o.reason || t('err.state_limit')));
       toast(msg, 'err');
       return;
@@ -3330,8 +3536,8 @@ function connectWS() {
     if (!Array.isArray(o.positions)) return;
     S.obs = o; S.obsAt = Date.now(); S.wsCount++;
     gcOnObs(o);
-    renderActionChip(o);
     renderMotionLimit(o);
+    tkOnObs(o); // after renderMotionLimit: the banner reuses the #ml-chip text
     renderPower(o);
     graspOnObs(o);
     epOnObs(o);
@@ -3432,8 +3638,11 @@ function leaseOther() {
 }
 function leaseHolderText(h) {
   if (h == null) return t('who.other');
-  if (/^web-/.test(h)) return t('who.cockpit');
+  if (/^rebot-policy/.test(h)) return t('who.policy', { id: h });
+  if (/^rebot-(app|teleop)/.test(h)) return t('who.app', { id: h });
   if (/^rebot-(mcp|companion)/.test(h)) return t('who.agent', { id: h });
+  if (/^cyclops_/.test(h)) return t('who.wizard', { id: h });
+  if (/^web-/.test(h)) return t('who.cockpit');
   return h ? t('who.named', { id: h }) : t('who.other');
 }
 const leaseBusyError = (h) => Object.assign(new Error(t('toast.lease_busy', { who: leaseHolderText(h) })), { code: 'LEASE_ACTIVE' });
@@ -3524,6 +3733,10 @@ function onAcquireResponse(ws, msg) {
     return;
   }
   if (req.force) { closePreemptModal(); toast(t('toast.take_rejected') + (msg.message || msg.error || t('unknown_reason')), 'err'); }
+  if (msg.code === 'OPERATOR_REQUIRED') {
+    S.auth.role = 'program'; S.auth.expiresIn = null; renderOpBadge();
+    if (typeof openOperatorModal === 'function') openOperatorModal();
+  }
   settleLeaseWaiters(Object.assign(new Error(t('err.rejected') + ': ' + (msg.message || msg.error || t('unknown_reason'))), { code: 'LEASE_REJECTED' }));
   renderPreemptModal();
 }
@@ -6752,6 +6965,7 @@ document.addEventListener('visibilitychange', () => {
     releaseAll();
     resetPoseMode();
   } else {
+    loadAuthStatus();
     // Returning from background/sleep: refresh telemetry & reconnect if half-open
     if (!S.ws || S.ws.readyState !== WebSocket.OPEN || Date.now() - S.obsAt > 1500) {
       if (S.ws) {
@@ -6905,23 +7119,6 @@ function cartHoldStill() {
   if (C.goal && C.cmd) C.goal = { ...C.cmd };
   if (C.T) C.Tg = C.T;
   C.wq = [0, 0];
-}
-// HUD line for actions started by an external client (agent / MCP); hidden 5 s after they end
-function renderActionChip(o) {
-  const el = $('act-chip');
-  if (!el) return;
-  const a = o.action;
-  // grasp status has its own bar on the video (#grasp-bar)
-  const external = a && !['joint_move', 'home', 'park', 'grasp'].includes(a.kind);
-  const recent = external && (a.state === 'running' || !(o.timestamp - (a.finished_at ?? o.timestamp) > 5));
-  el.hidden = !recent;
-  if (!recent) return;
-  const key = { running: 'act.running', done: 'act.done', failed: 'act.failed', cancelled: 'act.cancelled' }[a.state] || 'act.running';
-  const text = t(key, { code: a.code || '' });
-  if (el.textContent !== text) el.textContent = text;
-  el.classList.toggle('is-warn', a.state === 'running');
-  el.classList.toggle('is-ok', a.state === 'done');
-  el.classList.toggle('is-danger', a.state === 'failed' || a.state === 'cancelled');
 }
 // observation.motion_limit (armd's servo guard) as a short hint chip. speed / lead show only
 // after 1 s, and every hint stays 1 s after the limit clears, so short limits do not flicker.
@@ -8146,7 +8343,7 @@ async function runPreset(name) {
         name: name,
         positions: (name === 'home' || name === 'park') ? undefined : presetTarget(name),
         epoch_id: S.epoch,
-        client_id: S.clientId,
+        client_id: CLIENT_ID,
         generation: S.leaseGeneration,
       }));
     } else {
@@ -8187,8 +8384,10 @@ function setUi(ui) {
   else $('side').insertBefore($('safety'), $('side').firstChild);
   if (ui === 'simple') $('cockpit').insertBefore($('gc-banner'), $('cockpit').firstChild);
   else $('side').insertBefore($('gc-banner'), $('safety').nextSibling);
+  if (ui === 'simple') $('cockpit').insertBefore($('ext-banner'), $('s-ready'));
+  else $('side').insertBefore($('ext-banner'), $('gc-banner').nextSibling);
   if (ui === 'simple') $('ck-safety').appendChild($('pose-card'));
-  else $('side').insertBefore($('pose-card'), $('gc-banner').nextSibling);
+  else $('side').insertBefore($('pose-card'), $('ext-banner').nextSibling);
   if (ui === 'simple') setMode('cart', 'btn');
   else {
     const legacy = store('rebot.mode'); // pre-cartesian builds stored jog | stick
@@ -9110,7 +9309,7 @@ const GR = {
   toasted: 0,       // last grasp id whose result was shown
   gripSynced: 0,    // last gripper / grasp action id S.grip was synced from
   pickGrip: false,  // next video tap records the grip pixel
-  setup: null, path: null, supported: null,
+  setup: null, path: null, supported: null, rev: null,
 };
 const graspCodeKey = (code) => (/^IK_/.test(code || '') ? 'IK' : code);
 function graspCodeText(code, message) {
@@ -9320,6 +9519,7 @@ async function graspLoadSetup(quiet) {
     const d = await res.json();
     if (!res.ok) throw new Error(d && (d.message || d.error) || 'HTTP ' + res.status);
     GR.supported = !!d.supported; GR.setup = d.setup || null; GR.path = d.path || null;
+    if (typeof d.revision === 'number') GR.rev = d.revision;
     if (!quiet) gsetRender(!GR.supported ? t('gset.na') : GR.path ? t('gset.path', { p: GR.path }) : '--');
   } catch (e) {
     if (!quiet) gsetRender(t('gset.err', { e: e.message }));
@@ -9327,13 +9527,19 @@ async function graspLoadSetup(quiet) {
 }
 async function gsetWrite(patch) {
   try {
-    const ack = await graspRPC('/api/v1/grasp/setup', patch);
+    const body = GR.rev != null ? { ...patch, expected_revision: GR.rev } : patch;
+    const ack = await graspRPC('/api/v1/grasp/setup', body);
     if (ack.setup) GR.setup = ack.setup;
+    if (typeof ack.revision === 'number') GR.rev = ack.revision;
     const msg = ack.persisted === false ? t('gset.unsaved', { e: ack.persist_error || '' }) : t('gset.saved');
     gsetRender(msg);
     toast(msg, ack.persisted === false ? 'warn' : 'ok');
     return true;
-  } catch (e) { gsetRender(e.message); return false; }
+  } catch (e) {
+    if (e.code === 'POLICY_REVISION_MISMATCH') graspLoadSetup(true);
+    gsetRender(e.message);
+    return false;
+  }
 }
 function gsetOpen(open) {
   $('gset').hidden = !open;
@@ -9365,7 +9571,7 @@ graspLoadSetup(true);
    protective-stop banner, settings drawer section, residual torque bars (J1..J6).
    Everything stays hidden on an armd without the guard.
    ================================================================= */
-const COL = { cfg: null, thr: null, barAt: 0, busy: false };
+const COL = { cfg: null, thr: null, rev: null, barAt: 0, busy: false };
 const colAvail = () => (S.caps ? !!S.caps.collision_guard : !!(S.obs && S.obs.collision));
 function colThresholds(c) {
   if (!c) return null;
@@ -9389,6 +9595,7 @@ async function colLoad(quiet) {
     const d = await res.json();
     if (!res.ok) throw new Error(d && (d.message || d.error) || 'HTTP ' + res.status);
     COL.cfg = d; COL.thr = colThresholds(d);
+    if (typeof d.revision === 'number') COL.rev = d.revision;
     colRenderSet(quiet ? undefined : '');
   } catch (e) { if (!quiet) colRenderSet(t('col.st.err', { e: e.message })); }
 }
@@ -9415,11 +9622,14 @@ function colRenderSet(status) {
 async function colWrite(patch) {
   COL.busy = true; colRenderSet();
   try {
-    const ack = await commandRPC('/api/v1/safety/collision', patch);
+    const body = COL.rev != null ? { ...patch, expected_revision: COL.rev } : patch;
+    const ack = await commandRPC('/api/v1/safety/collision', body);
     syncEpoch(ack.epoch_id);
     const cfg = ack.collision || ack.config || (('enabled' in ack) ? ack : null);
     if (cfg) { COL.cfg = { ...(COL.cfg || {}), ...cfg }; COL.thr = colThresholds(COL.cfg) || COL.thr; }
     else if (COL.cfg) Object.assign(COL.cfg, patch);
+    const rev = ack.revision ?? (cfg && cfg.revision);
+    if (typeof rev === 'number') COL.rev = rev;
     COL.busy = false;
     toast(t('col.st.saved'), 'ok');
     colRenderSet();
@@ -9428,6 +9638,7 @@ async function colWrite(patch) {
     COL.busy = false;
     toast(e.message, 'err', e.code || '');
     colRenderSet(e.message);
+    if (e.code === 'POLICY_REVISION_MISMATCH') colLoad(true);
   }
 }
 function ssetOpen(open) {
@@ -9803,7 +10014,7 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('gtoo
    action /api/v1/action/move_to_pose.
    ================================================================= */
 const POSE_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const PS = { list: [], loaded: false, delArmed: null, delTimer: 0 };
+const PS = { list: [], loaded: false, rev: null, delArmed: null, delTimer: 0 };
 function posesOnCaps() { $('btn-pset').hidden = !(S.caps && S.caps.poses); }
 function poseErr(e) {
   const k = 'pose.code.' + (e.code || '');
@@ -9816,6 +10027,7 @@ async function posesLoad(quiet) {
     const d = await res.json();
     if (!res.ok) throw new Error(d && (d.message || d.error) || 'HTTP ' + res.status);
     PS.list = Array.isArray(d.poses) ? d.poses : [];
+    if (typeof d.revision === 'number') PS.rev = d.revision;
     PS.loaded = true;
     const nStale = PS.list.filter((p) => p.stale).length;
     posesRender(PS.list.length ? (nStale ? t('pose.stale.count', { n: PS.list.length, m: nStale }) : t('pose.count', { n: PS.list.length })) : '--');
@@ -9860,12 +10072,17 @@ async function poseSave() {
   if (!name) { $('pose-name').focus(); setText($('pose-rule'), t('pose.bad')); $('pose-rule').classList.add('bad'); return; }
   $('pose-save').disabled = true;
   try {
-    await commandRPC('/api/v1/poses/save', { name });
+    const body = PS.rev != null ? { name, expected_revision: PS.rev } : { name };
+    const ack = await commandRPC('/api/v1/poses/save', body);
+    if (typeof ack.revision === 'number') PS.rev = ack.revision;
     toast(t('pose.saved', { name }), 'ok');
     $('pose-name').value = '';
     await posesLoad(true);
     posesRender(t('pose.saved', { name }));
-  } catch (e) { const m = poseErr(e); toast(m, 'err', e.code || ''); posesRender(m); }
+  } catch (e) {
+    if (e.code === 'POLICY_REVISION_MISMATCH') posesLoad(true);
+    const m = poseErr(e); toast(m, 'err', e.code || ''); posesRender(m);
+  }
   finally { $('pose-save').disabled = false; }
 }
 async function poseDelete(name) {
@@ -9876,11 +10093,16 @@ async function poseDelete(name) {
   }
   PS.delArmed = null; clearTimeout(PS.delTimer);
   try {
-    await commandRPC('/api/v1/poses/delete', { name });
+    const body = PS.rev != null ? { name, expected_revision: PS.rev } : { name };
+    const ack = await commandRPC('/api/v1/poses/delete', body);
+    if (typeof ack.revision === 'number') PS.rev = ack.revision;
     toast(t('pose.deleted', { name }), 'ok');
     await posesLoad(true);
     posesRender(t('pose.deleted', { name }));
-  } catch (e) { const m = poseErr(e); toast(m, 'err', e.code || ''); posesRender(m); }
+  } catch (e) {
+    if (e.code === 'POLICY_REVISION_MISMATCH') posesLoad(true);
+    const m = poseErr(e); toast(m, 'err', e.code || ''); posesRender(m);
+  }
 }
 async function poseGo(name) {
   if (!isLive() || !canMove()) { toast(isLive() && !isStopped() && !colHold() && leaseOther() == null ? t('pose.enable_first') : lockReason(), 'err'); flashLock(); return; }
@@ -9948,6 +10170,13 @@ function teachCmd(path, body, timeoutMs = 5000) {
     catch (error) { clearTimeout(timer); pendingCommands.delete(request_id); reject(error); }
   });
 }
+// poses/save|rename|delete carry the pose store revision (armd requires it when operator auth is enforced)
+async function teachPoseCmd(path, body) {
+  if (PS.rev == null) { try { const d = await teachGet('/api/v1/poses'); if (typeof d.revision === 'number') PS.rev = d.revision; } catch (_) {} }
+  const ack = await commandRPC(path, PS.rev != null ? { ...body, expected_revision: PS.rev } : body);
+  if (ack && typeof ack.revision === 'number') PS.rev = ack.revision;
+  return ack;
+}
 async function teachGet(path) {
   const res = await fetch(path, { cache: 'no-store' });
   let d = null; try { d = await res.json(); } catch (_) {}
@@ -9982,6 +10211,7 @@ async function teachLoad(quiet) {
     const [sq, ps, ep, ds] = await Promise.all([teachGet('/api/v1/sequences'), teachGet('/api/v1/poses'), teachGet('/api/v1/episodes?limit=500'), teachGet('/api/v1/datasets')]);
     TCH.seqs = Array.isArray(sq.sequences) ? sq.sequences : [];
     TCH.poses = Array.isArray(ps.poses) ? ps.poses : [];
+    if (typeof ps.revision === 'number') PS.rev = ps.revision;
     TCH.eps = Array.isArray(ep.episodes) ? ep.episodes : [];
     // a just-saved episode stays listed until a list confirms it, or until a list requested more than 5 s after
     // its ack still lacks it (deleted elsewhere)
@@ -10507,9 +10737,10 @@ function teachAutoPoseName() {
 async function teachSavePose(name, append = false) {
   if (!POSE_NAME_RE.test(name || '')) { teachStatus(t('pose.bad'), true); return; }
   try {
-    const r = await commandRPC('/api/v1/poses/save', { name });
+    const r = await teachPoseCmd('/api/v1/poses/save', { name });
     const ps = await teachGet('/api/v1/poses').catch(() => null);
     if (ps && Array.isArray(ps.poses)) TCH.poses = ps.poses;
+    if (ps && typeof ps.revision === 'number') PS.rev = ps.revision;
     const p = (r && r.pose && r.pose.id) ? r.pose : TCH.poses.find((x) => x.name === name);
     toast(t('pose.saved', { name }), 'ok');
     if (append && TCH.cur && p && p.id) { teachAddStep({ type: 'pose', pose_id: p.id, speed_scale: 0.5, gripper: 'pose' }); await teachStripSave(); }
@@ -10525,7 +10756,7 @@ async function teachRenamePose(p, name) {
   if (!POSE_NAME_RE.test(name)) { teachStatus(t('pose.bad'), true); return; }
   if (name === p.name) { TCH.edit = null; teachRender(); return; }
   try {
-    await commandRPC('/api/v1/poses/rename', { id: p.id, name });
+    await teachPoseCmd('/api/v1/poses/rename', { id: p.id, name });
     TCH.edit = null; teachStatus(t('tch.renamed', { a: p.name, b: name }));
     await teachLoad(true);
   } catch (e) { teachStatus(e.code === 'UNKNOWN_COMMAND' || e.code === 'NOT_FOUND' || e.code === '404' || e.code === 'UNSUPPORTED' ? t('tch.e.rename_na') : teachErr(e), true); }
@@ -10533,14 +10764,14 @@ async function teachRenamePose(p, name) {
 async function teachDelPose(p) {
   if (!teachArm('pose:' + p.name)) return;
   try {
-    try { await commandRPC('/api/v1/poses/delete', { name: p.name }); }
+    try { await teachPoseCmd('/api/v1/poses/delete', { name: p.name }); }
     catch (e) {
       // only the quick-play slot uses it: drop the slot (it is rebuilt by the next play), then delete again
       const ids = e.code === 'IN_USE' && e.reply && Array.isArray(e.reply.sequences) ? e.reply.sequences : [];
       if (!ids.length || !ids.every((id) => teachQuick(TCH.seqs.find((x) => x.id === id)))) throw e;
       for (const id of ids) await commandRPC('/api/v1/sequences/delete', { id });
       TCH.seqs = TCH.seqs.filter((x) => !ids.includes(x.id));
-      await commandRPC('/api/v1/poses/delete', { name: p.name });
+      await teachPoseCmd('/api/v1/poses/delete', { name: p.name });
     }
     teachStatus(t('pose.deleted', { name: p.name }));
     await teachLoad(true);
@@ -10733,6 +10964,411 @@ function teachBarRender() {
   setInterval(() => { if (TCH.rec) teachBarRender(); }, 500);
   i18nHooks.push(() => { if (TCH.open) teachRender(); teachBarRender(); });
 })();
+
+/* =================================================================
+   External control monitor: #ext-banner (cockpit / side column), #act-chip (video HUD),
+   topbar #btn-task + #task drawer (activity ring buffer, read-only policy & cell view).
+   Every server-supplied string (lease_holder, tag, kind, phase, code, message, ids, names)
+   is written with textContent only.
+   ================================================================= */
+const TK_OWN_TAGS = new Set(['cockpit', 'calib-wizard']);
+const TK = {
+  log: [], max: 40, tracked: new Map(), epoch: null, seq: 0, ver: 0, // ring buffer of action / lease entries; ver bumps on any change
+  holder: undefined, lastExtHolder: null,  // last observed lease_holder; last external one
+  lastExt: null, dismissed: false,         // newest external action entry; banner dismissed by the user
+  k: null, key: '', listKey: '', envKey: '',
+  filterExt: store('rebot.task.f') === 'ext', tab: 'act', opener: null,
+  timer: 0, inflight: false, env: null, envAt: 0,
+};
+function tkWhoShort(h) {
+  if (h == null) return t('whos.other');
+  if (h === CLIENT_ID) return t('who.self');
+  if (/^rebot-policy/.test(h)) return t('whos.policy');
+  if (/^rebot-(app|teleop)/.test(h)) return t('whos.app');
+  if (/^rebot-(mcp|companion)/.test(h)) return t('whos.agent');
+  if (/^cyclops_/.test(h)) return t('whos.wizard');
+  if (/^web-/.test(h)) return t('whos.cockpit');
+  return t('whos.other');
+}
+const tkWho = (h) => (h === CLIENT_ID ? t('who.self') : leaseHolderText(h));
+const tkHms = (ms) => { const d = new Date(ms); return [d.getHours(), d.getMinutes(), d.getSeconds()].map((v) => String(v).padStart(2, '0')).join(':'); };
+const tkLabel = (e) => e.tag || e.kind || '--';
+const tkDur = (e) => (e.dur == null ? '' : e.state === 'running' ? Math.floor(e.dur) + ' s' : e.dur.toFixed(1) + ' s');
+const tkPct = (e) => Math.round(100 * clamp(Number(e.progress) || 0, 0, 1));
+const tkSt = (st) => (I18N.zh['ext.st.' + st] !== undefined ? t('ext.st.' + st) : String(st || '?'));
+const TK_ICON = { running: '●', done: '✓', failed: '✕', cancelled: '⊘' };
+function tkPush(e) {
+  TK.log.push(e);
+  if (TK.log.length > TK.max) TK.log.splice(0, TK.log.length - TK.max);
+  TK.ver++;
+}
+// Insert or update one action entry in place (keyed by action.id).
+function tkAction(a, o, now) {
+  if (!a || a.id == null) return null;
+  const id = 'a' + a.id;
+  let e = TK.tracked.get(id);
+  if (!e) {
+    // own: tagged by this page, or started while this page held the (exclusive) lease
+    const own = TK_OWN_TAGS.has(a.tag) || (!a.tag && S.leaseGeneration != null);
+    const h = o.lease_holder;
+    e = { id, aid: a.id, type: 'action', own, sig: '',
+      src: own ? CLIENT_ID : (h != null && h !== CLIENT_ID ? h : TK.lastExtHolder),
+      // client clock (lease events use it too): first sight minus the time already run
+      at: now - 1000 * (Number.isFinite(a.started_at) ? Math.max(0, (a.finished_at ?? o.timestamp) - a.started_at) : 0) };
+    TK.tracked.set(id, e);
+    if (TK.tracked.size > 64) {
+      for (const k of TK.tracked.keys()) {
+        if (TK.lastExt && TK.lastExt.id === k) continue;
+        TK.tracked.delete(k);
+        break;
+      }
+    }
+    tkPush(e);
+    if (!own) TK.dismissed = false;
+  }
+  e.seen = o.timestamp;
+  const dur = Number.isFinite(a.started_at) ? Math.max(0, (a.finished_at ?? o.timestamp) - a.started_at) : null;
+  const sig = [a.state, a.tag, a.kind, a.phase, a.code, a.message, a.holding, Math.round(100 * (a.progress || 0)),
+    dur == null ? '' : a.state === 'running' ? Math.floor(dur) : dur.toFixed(1)].join('|');
+  if (sig !== e.sig) {
+    e.sig = sig;
+    Object.assign(e, { kind: a.kind, tag: a.tag, state: a.state, phase: a.phase, code: a.code, message: a.message,
+      holding: a.holding, progress: a.progress, finished_at: a.finished_at, dur });
+    TK.ver++;
+  }
+  if (!e.own && (!TK.lastExt || Number(e.aid) >= Number(TK.lastExt.aid))) TK.lastExt = e;
+  return e;
+}
+function tkPill() {
+  const E = TK.env;
+  const sb = E && ((E.state && E.state.v) || (E.catalog && E.catalog.v));
+  if (!sb) return '';
+  if (sb.active_policy) return t('ext.policy', { id: String(sb.active_policy) });
+  return sb.mode && sb.mode !== 'none' ? t('ext.mode', { m: String(sb.mode) }) : '';
+}
+function tkOnObs(o) {
+  if (o.epoch_id != null && TK.epoch != null && o.epoch_id !== TK.epoch) {
+    TK.tracked.clear();
+    TK.lastExt = null;
+  }
+  if (o.epoch_id != null) TK.epoch = o.epoch_id;
+  const now = Date.now();
+  const h = o.lease_holder ?? null;
+  if (h !== TK.holder) {
+    if (TK.holder != null) tkPush({ id: 'l' + (++TK.seq), type: 'lease', ev: 'release', src: TK.holder, own: TK.holder === CLIENT_ID, at: now });
+    if (h != null) {
+      tkPush({ id: 'l' + (++TK.seq), type: 'lease', ev: 'acquire', src: h, own: h === CLIENT_ID, at: now });
+      if (h !== CLIENT_ID) { TK.lastExtHolder = h; TK.dismissed = false; }
+    }
+    TK.holder = h;
+  }
+  tkAction(o.previous_action, o, now);
+  tkAction(o.action, o, now);
+  const e = TK.lastExt;
+  const other = leaseOther();
+  const running = !!e && e.state === 'running' && e.seen === o.timestamp; // a running entry no longer reported is stale
+  const fin = !!e && e.state !== 'running' && !TK.dismissed;
+  const recent = fin && o.timestamp - (e.finished_at ?? o.timestamp) <= 10;
+  const sticky = fin && (e.state === 'failed' || e.state === 'cancelled');
+  const k = TK.k = { e, other, running, recent, sticky, show: other != null || running || recent || sticky,
+    // a lease held without a running action is a servo stream, unless the holder's own action just ended
+    mode: running || other == null || (recent && e.src === other) ? 'act' : 'servo' };
+  const ml = $('ml-chip');
+  k.ml = ml && !ml.hidden ? ml.textContent : '';
+  k.pill = tkPill();
+  const key = [k.show, k.mode, TK.ver, other, running, recent, sticky, TK.dismissed, k.ml, k.pill, LANG].join('|');
+  if (key !== TK.key) {
+    TK.key = key;
+    tkRenderBanner(k);
+    renderActionChip(k);
+    const b = $('btn-task'), live = running || other != null;
+    b.classList.toggle('is-live', live || sticky);
+    b.classList.toggle('warn', !live && sticky);
+  }
+  if (!$('task').hidden) { tkRenderList(); if (TK.tab === 'env') tkRenderEnv(); }
+}
+function tkTagEl(text, cls) {
+  const s = document.createElement('span');
+  s.className = 'ext-tag' + (cls ? ' ' + cls : '');
+  s.textContent = text;
+  return s;
+}
+function tkRenderBanner(k) {
+  const el = $('ext-banner');
+  if (!k.show) { el.hidden = true; return; }
+  const e = k.e, act = k.mode === 'act' && !!e;
+  const bad = act && !k.running && (e.state === 'failed' || e.state === 'cancelled');
+  el.hidden = false;
+  el.classList.toggle('live', k.running || k.other != null);
+  el.classList.toggle('bad', bad);
+  el.classList.toggle('warn', !bad && !!k.ml);
+  setText($('ext-who'), k.other != null ? leaseHolderText(k.other) : tkWho(e && e.src));
+  $('ext-pill').hidden = !k.pill;
+  setText($('ext-pill'), k.pill);
+  $('ext-dismiss').hidden = k.running || k.other != null;
+  const tags = $('ext-tags');
+  tags.textContent = '';
+  const prog = $('ext-prog'), err = $('ext-err'), hint = $('ext-hint');
+  if (act) {
+    setText($('ext-step'), tkLabel(e));
+    tags.appendChild(tkTagEl(tkSt(e.state), e.state === 'done' ? 'ok' : e.state === 'running' ? 'warn' : ''));
+    if (e.tag && e.kind) tags.appendChild(tkTagEl(e.kind));
+    if (e.phase) tags.appendChild(tkTagEl(t('ext.phase', { p: e.phase })));
+    if (e.holding === true) tags.appendChild(tkTagEl(t('ext.holding.yes'), 'ok'));
+    else if (e.holding === false) tags.appendChild(tkTagEl(t('ext.holding.no'), 'warn'));
+    const d = tkDur(e); if (d) tags.appendChild(tkTagEl(d));
+    prog.hidden = bad;
+    const pct = e.state === 'done' ? 100 : tkPct(e);
+    $('ext-prog-bar').style.width = pct + '%';
+    prog.setAttribute('aria-valuenow', String(pct));
+    err.hidden = !bad;
+    setText($('ext-err-code'), bad ? (e.code || e.state) : '');
+    setText($('ext-err-msg'), bad ? (e.message || '') : '');
+  } else {
+    setText($('ext-step'), t('ext.servo'));
+    prog.hidden = true; err.hidden = true;
+  }
+  hint.hidden = !k.ml;
+  setText(hint, k.ml ? t('ext.ml', { m: k.ml }) : '');
+  // compact feed: the 3 newest external actions
+  const feed = $('ext-feed');
+  feed.textContent = '';
+  let n = 0;
+  for (let i = TK.log.length - 1; i >= 0 && n < 3; i--) {
+    const x = TK.log[i];
+    if (x.type !== 'action' || x.own) continue;
+    n++;
+    const li = document.createElement('li');
+    const ic = document.createElement('span'); ic.className = 'st-ic st-' + x.state; ic.textContent = TK_ICON[x.state] || '·';
+    ic.title = tkSt(x.state);
+    const lb = document.createElement('span'); lb.className = 'lbl'; lb.textContent = tkLabel(x);
+    const du = document.createElement('span'); du.className = 'mono'; du.textContent = tkDur(x);
+    li.append(ic, lb, du);
+    const extra = x.state === 'failed' || x.state === 'cancelled' ? (x.code || '')
+      : x.holding === true ? t('ext.holding.yes') : x.holding === false ? t('ext.holding.no') : '';
+    if (extra) { const ex = document.createElement('span'); ex.className = 'mono'; ex.textContent = extra; li.appendChild(ex); }
+    feed.appendChild(li);
+  }
+}
+// HUD chip: compact summary of the external controller; opens #task (Enter / click; Space stays E-STOP).
+function renderActionChip(k) {
+  const el = $('act-chip');
+  if (!el) return;
+  el.hidden = !k.show;
+  el.classList.toggle('ext', k.show);
+  if (!k.show) return;
+  const e = k.e;
+  const who = tkWhoShort(k.other != null ? k.other : e && e.src);
+  let text, cls;
+  if (k.mode === 'act' && e) {
+    const lbl = tkLabel(e);
+    if (e.state === 'running') { text = who + ' · ' + lbl + ' ' + tkPct(e) + '%'; cls = 'is-warn'; }
+    else if (e.state === 'done') { text = who + ' · ' + lbl + ' ✓'; cls = 'is-ok'; }
+    else { text = who + ' · ' + lbl + ' ✕' + (e.code ? ' ' + e.code : ''); cls = 'is-danger'; }
+  } else { text = who + ' · ' + t('ext.servo.s'); cls = 'is-warn'; }
+  setText(el, text);
+  el.setAttribute('aria-label', t('ext.chip.aria', { s: text }));
+  el.classList.toggle('is-warn', cls === 'is-warn');
+  el.classList.toggle('is-ok', cls === 'is-ok');
+  el.classList.toggle('is-danger', cls === 'is-danger');
+}
+function tkRerender() { TK.key = ''; TK.listKey = ''; TK.envKey = ''; if (S.obs) tkOnObs(S.obs); }
+
+/* ---------- #task drawer ---------- */
+function tkLine(e) {
+  const parts = [tkHms(e.at), e.src == null ? '-' : e.src];
+  if (e.type === 'lease') parts.push('lease', e.ev);
+  else {
+    parts.push(e.state || '-', [e.tag, e.kind, e.phase].filter(Boolean).join('/') || '-', tkDur(e) || '-');
+    if (e.holding != null) parts.push('holding=' + e.holding);
+    if (e.code) parts.push(e.code);
+    if (e.message) parts.push(JSON.stringify(e.message));
+  }
+  return parts.join(' ');
+}
+const tkVisible = () => TK.log.filter((e) => !TK.filterExt || !e.own);
+function tkLi(e) {
+  const li = document.createElement('li');
+  const span = (cls, txt) => { const s = document.createElement('span'); if (cls) s.className = cls; s.textContent = txt; return s; };
+  li.appendChild(span('mono', tkHms(e.at)));
+  if (e.type === 'lease') {
+    li.append(span('st-ic st-lease', '⇄'), span('who', tkWho(e.src)), span('lbl', t(e.ev === 'acquire' ? 'task.lease.acquire' : 'task.lease.release')));
+    return li;
+  }
+  const ic = span('st-ic st-' + e.state, TK_ICON[e.state] || '·');
+  li.append(ic, span('who', tkWho(e.src)), span('lbl', [e.tag, e.kind, e.phase].filter(Boolean).join(' · ') || '--'));
+  li.appendChild(tkTagEl(tkSt(e.state), e.state === 'done' ? 'ok' : e.state === 'running' ? 'warn' : ''));
+  if (e.holding === true) li.appendChild(tkTagEl(t('ext.holding.yes'), 'ok'));
+  else if (e.holding === false) li.appendChild(tkTagEl(t('ext.holding.no'), 'warn'));
+  const d = tkDur(e); if (d) li.appendChild(span('mono', d));
+  if (e.state === 'failed' || e.state === 'cancelled') {
+    li.className = 'bad';
+    if (e.code || e.message) li.appendChild(span('sub mono', [e.code, e.message].filter(Boolean).join(': ')));
+  }
+  return li;
+}
+function tkRenderList() {
+  if ($('task').hidden || TK.tab !== 'act') return;
+  const key = [TK.ver, TK.filterExt, LANG].join('|');
+  if (key === TK.listKey) return;
+  TK.listKey = key;
+  const list = $('task-list'), items = tkVisible();
+  list.textContent = '';
+  for (let i = items.length - 1; i >= 0; i--) list.appendChild(tkLi(items[i]));
+  list.hidden = !items.length;
+  $('task-empty').hidden = items.length > 0;
+  for (const b of $('task-filter').children) {
+    const on = (b.dataset.f === 'ext') === TK.filterExt;
+    b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on));
+  }
+}
+async function tkGet(path) {
+  const ac = new AbortController(), tm = setTimeout(() => ac.abort(), 3000);
+  try {
+    const r = await fetch(path, { signal: ac.signal, cache: 'no-store' });
+    if (r.status === 404 || r.status === 405 || r.status === 501) return { na: true };
+    if (!r.ok) return { err: 'HTTP ' + r.status };
+    return { v: await r.json() };
+  } catch (e) { return { err: e && e.name === 'AbortError' ? 'timeout' : 'error' }; }
+  finally { clearTimeout(tm); }
+}
+async function tkEnvLoad() {
+  if (TK.inflight || $('task').hidden) return;
+  TK.inflight = true;
+  try {
+    const [catalog, state, keepout, poses] = await Promise.all(
+      ['/api/v1/sandbox/catalog', '/api/v1/sandbox/state', '/api/v1/workspace/keepout', '/api/v1/poses'].map(tkGet));
+    TK.env = { catalog, state, keepout, poses };
+    TK.envAt = Date.now();
+  } finally { TK.inflight = false; }
+  TK.key = ''; // the banner pill reads TK.env
+  if (S.obs) tkOnObs(S.obs);
+  tkRenderEnv();
+}
+function tkEnvRows() {
+  const E = TK.env, o = S.obs || {};
+  const none = t('task.env.none');
+  const val = (x) => (x == null || x === '' ? none : String(x));
+  const rows = [['h', t('task.env.sec.sandbox')]];
+  const sb = E && ((E.state && E.state.v) || (E.catalog && E.catalog.v));
+  if (!E) rows.push(['r', t('task.env.mode'), t('task.env.loading')]);
+  else if (!sb) rows.push(['r', t('task.env.mode'), E.state.na && E.catalog.na ? t('task.env.na') : '--']);
+  else {
+    rows.push(['r', t('task.env.mode'), sb.mode && sb.mode !== 'none' ? String(sb.mode) : none]);
+    rows.push(['r', t('task.env.scene'), val(sb.active_scene)]);
+    rows.push(['r', t('task.env.tool'), val(sb.active_tool)]);
+    rows.push(['r', t('task.env.policy'), val(sb.active_policy)]);
+    const ps = sb.policy_status ?? (sb.telemetry && typeof sb.telemetry === 'object' ? sb.telemetry.policy_status : undefined);
+    rows.push(['r', t('task.env.pstatus'), ps && typeof ps === 'object' ? JSON.stringify(ps) : val(ps)]);
+  }
+  rows.push(['h', t('task.env.sec.safety')]);
+  const st = parseState(o.safety_state);
+  rows.push(['r', t('task.env.safety'), st.name ? (st.detail ? st.name + ' · ' + st.detail : st.name) : '--', /fault|estop|stop/i.test(st.name || '') ? 'bad' : '']);
+  const col = o.collision;
+  rows.push(col && col.active ? ['r', t('task.env.col'), t('task.env.col.hold', { j: col.joint ?? '?' }), 'bad']
+    : ['r', t('task.env.col'), col ? t('task.env.col.ok') : none]);
+  const ml = $('ml-chip');
+  const mlt = ml && !ml.hidden ? ml.textContent : (o.motion_limit && o.motion_limit.reason ? String(o.motion_limit.reason) : '');
+  rows.push(['r', t('task.env.ml'), mlt || none, mlt ? 'warn' : '']);
+  rows.push(['h', t('task.env.sec.cell')]);
+  const cnt = (r, list, names) => !E ? t('task.env.loading') : r.na ? t('task.env.na') : r.err ? '--'
+    : t('task.env.count', { n: list.length }) + (names && list.length ? ' · ' + list.map((b) => (b && b.name != null ? String(b.name) : '?')).join(', ') : '');
+  const ko = E && E.keepout.v && Array.isArray(E.keepout.v.boxes) ? E.keepout.v.boxes : [];
+  const ps = E && E.poses.v && Array.isArray(E.poses.v.poses) ? E.poses.v.poses : [];
+  rows.push(['r', t('task.env.ko'), E ? cnt(E.keepout, ko, true) : t('task.env.loading')]);
+  rows.push(['r', t('task.env.poses'), E ? cnt(E.poses, ps, false) : t('task.env.loading')]);
+  return rows;
+}
+function tkRenderEnv() {
+  if ($('task').hidden || TK.tab !== 'env') return;
+  const rows = tkEnvRows(), E = TK.env;
+  const errs = E ? Object.entries(E).filter(([, r]) => r.err).map(([n, r]) => n + ' ' + r.err) : [];
+  const status = !E ? t('task.env.loading') : t('task.env.updated', { t: tkHms(TK.envAt) }) + (errs.length ? ' · ' + t('task.env.err', { list: errs.join(', ') }) : '');
+  const posesOk = !!(E && E.poses.v) && !$('btn-pset').hidden;
+  const key = JSON.stringify(rows) + '|' + status + '|' + posesOk;
+  if (key === TK.envKey) return;
+  TK.envKey = key;
+  const body = $('task-env-body');
+  body.textContent = '';
+  for (const [kind, a, b, cls] of rows) {
+    if (kind === 'h') { const h = document.createElement('h4'); h.textContent = a; body.appendChild(h); continue; }
+    const row = document.createElement('div');
+    row.className = 'row' + (cls ? ' ' + cls : '');
+    const ka = document.createElement('span'); ka.textContent = a;
+    const vb = document.createElement('span'); vb.textContent = b;
+    row.append(ka, vb);
+    body.appendChild(row);
+  }
+  setText($('task-env-status'), status);
+  $('task-open-poses').disabled = !posesOk;
+}
+function tkTab(tab, focus) {
+  TK.tab = tab === 'env' ? 'env' : 'act';
+  for (const b of $('task-tabs').children) {
+    const on = b.dataset.tab === TK.tab;
+    b.classList.toggle('on', on); b.setAttribute('aria-selected', String(on)); b.tabIndex = on ? 0 : -1;
+    if (on && focus) b.focus();
+  }
+  $('task-act').hidden = TK.tab !== 'act';
+  $('task-env').hidden = TK.tab !== 'env';
+  TK.listKey = ''; TK.envKey = '';
+  tkRenderList(); tkRenderEnv();
+}
+function taskOpen(open, keepFocus) {
+  clearInterval(TK.timer); TK.timer = 0;
+  if (open && $('task').hidden) TK.opener = document.activeElement;
+  $('task').hidden = !open;
+  if (open) {
+    tkTab(TK.tab);
+    tkEnvLoad();
+    TK.timer = setInterval(tkEnvLoad, 2000); // only while #task is open
+    $('task-close').focus({ preventScroll: true });
+    return;
+  }
+  if (keepFocus) return;
+  const back = TK.opener && TK.opener.isConnected && TK.opener.offsetParent !== null ? TK.opener : $('btn-task');
+  TK.opener = null;
+  back.focus({ preventScroll: true });
+}
+async function tkCopy() {
+  const txt = tkVisible().map(tkLine).join('\n');
+  let ok = false;
+  try { if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(txt); ok = true; } } catch (_) {}
+  if (!ok) {
+    const ta = document.createElement('textarea');
+    ta.value = txt; ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;-webkit-user-select:text;user-select:text;';
+    document.body.appendChild(ta); ta.select();
+    try { ok = document.execCommand('copy'); } catch (_) {}
+    ta.remove();
+    $('task-copy').focus({ preventScroll: true });
+  }
+  toast(t(ok ? 'task.copied' : 'task.copy_fail'), ok ? 'ok' : 'err');
+}
+$('btn-task').addEventListener('click', () => taskOpen(true));
+$('ext-open-task').addEventListener('click', () => taskOpen(true));
+$('act-chip').addEventListener('click', () => taskOpen(true));
+// Enter only: Space and Escape are the page-wide E-STOP keys (window keydown handler)
+$('act-chip').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); taskOpen(true); } });
+$('ext-dismiss').addEventListener('click', () => { TK.dismissed = true; tkRerender(); });
+$('task-close').addEventListener('click', () => taskOpen(false));
+$('task').addEventListener('click', (e) => { if (e.target === e.currentTarget) taskOpen(false); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('task').hidden) taskOpen(false); });
+$('task-tabs').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) tkTab(b.dataset.tab); });
+$('task-tabs').addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'Home' || e.key === 'End') { e.preventDefault(); tkTab(TK.tab === 'act' ? 'env' : 'act', true); }
+});
+$('task-filter').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  TK.filterExt = b.dataset.f === 'ext';
+  store('rebot.task.f', TK.filterExt ? 'ext' : 'all');
+  tkRenderList();
+});
+$('task-copy').addEventListener('click', tkCopy);
+$('task-clear').addEventListener('click', () => { TK.log = []; TK.ver++; tkRerender(); tkRenderList(); });
+$('task-open-poses').addEventListener('click', () => { taskOpen(false, true); psetOpen(true); });
+i18nHooks.push(() => { tkRerender(); tkRenderList(); tkRenderEnv(); });
 
 /* =================================================================
    3D arm view, loaded on first open: three.js + urdf-loader (/assets/three-urdf.min.js, embedded),
@@ -12250,16 +12886,26 @@ const WASM_SIM = window.WASM_SIM = (() => {
     },
 
     async pushTelemetry() {
-      if (this.telBusy || !this.ready) return;
+      if (this.telBusy || this.telBlocked || !this.ready) return;
       this.telBusy = true;
       try {
         const stPayload = this.getState();
         if (!stPayload) return;
-        await fetch('/api/v1/sandbox/telemetry', {
+        const r = await fetch('/api/v1/sandbox/telemetry', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(stPayload),
         });
+        if (!r.ok) {
+          if (r.status === 401 || r.status === 403) {
+            this.telBlocked = true;
+          } else if (!this.telErrLogged) {
+            this.telErrLogged = true;
+            console.warn('WASM_SIM telemetry post failed:', r.status);
+          }
+          return;
+        }
+        this.telErrLogged = false;
       } catch (_) {} finally {
         this.telBusy = false;
       }
@@ -12475,6 +13121,118 @@ async function initSandbox() {
 }
 
 /* =================================================================
+   Operator Auth Badge & Modal
+   ================================================================= */
+function reconnectWS() {
+  const old = S.ws;
+  connectWS();
+  if (old) { try { old.close(); } catch (_) {} }
+}
+function renderOpBadge() {
+  const b = $('btn-op');
+  if (!b) return;
+  b.hidden = !S.auth.enforced;
+  if (!S.auth.enforced) return;
+  const unlocked = S.auth.role === 'operator';
+  b.classList.toggle('is-unlocked', unlocked);
+  b.textContent = unlocked ? t('op.unlocked') : t('op.locked');
+  const lockBtn = $('op-lock');
+  if (lockBtn) lockBtn.hidden = !unlocked;
+}
+let authRefreshTimer = null;
+function scheduleAuthExpiryRefresh() {
+  if (authRefreshTimer) {
+    clearTimeout(authRefreshTimer);
+    authRefreshTimer = null;
+  }
+  if (S.auth.enforced && S.auth.role === 'operator' && typeof S.auth.expiresIn === 'number' && S.auth.expiresIn > 0) {
+    const delayMs = Math.min(S.auth.expiresIn * 1000 + 250, 2147483647);
+    authRefreshTimer = setTimeout(() => {
+      authRefreshTimer = null;
+      loadAuthStatus();
+    }, delayMs);
+  }
+}
+async function loadAuthStatus() {
+  try {
+    const res = await fetch('/api/v1/auth/status', { cache: 'no-store' });
+    if (!res.ok) return;
+    const d = await res.json();
+    S.auth.enforced = !!d.auth_enforced;
+    S.auth.role = d.role || 'program';
+    S.auth.expiresIn = d.expires_in_s ?? null;
+    scheduleAuthExpiryRefresh();
+    renderOpBadge();
+  } catch (_) {}
+}
+function openOperatorModal() {
+  if (!$('op-modal')) return;
+  $('op-modal').hidden = false;
+  $('op-pin').value = '';
+  setText($('op-status'), S.auth.role === 'operator' ? t('op.unlocked_msg') : '--');
+  $('op-lock').hidden = S.auth.role !== 'operator';
+  $('op-pin').focus({ preventScroll: true });
+}
+function closeOperatorModal() {
+  if ($('op-modal')) $('op-modal').hidden = true;
+}
+async function submitOperatorPin(ev) {
+  if (ev) ev.preventDefault();
+  const pin = $('op-pin').value || '';
+  if (!pin) { setText($('op-status'), t('op.need_pin')); return; }
+  $('op-unlock').disabled = true;
+  try {
+    const res = await fetch('/api/v1/auth/unlock', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setText($('op-status'), d.code === 'INVALID_PIN' ? t('op.bad_pin') : (d.message || t('op.bad_pin')));
+      return;
+    }
+    S.auth.role = d.role || 'operator';
+    S.auth.expiresIn = d.expires_in_s ?? null;
+    if (window.WASM_SIM) { window.WASM_SIM.telBlocked = false; window.WASM_SIM.telErrLogged = false; }
+    scheduleAuthExpiryRefresh();
+    renderOpBadge();
+    closeOperatorModal();
+    reconnectWS();
+    toast(t('op.unlocked_msg'), 'ok');
+  } catch (e) {
+    setText($('op-status'), e.message || t('err.reqfail'));
+  } finally {
+    $('op-unlock').disabled = false;
+  }
+}
+async function lockOperator() {
+  try {
+    const res = await fetch('/api/v1/auth/lock', { method: 'POST' });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || d.role !== 'program') {
+      toast(t('op.lock_fail'), 'err');
+      return;
+    }
+    S.auth.role = 'program';
+    S.auth.expiresIn = null;
+    scheduleAuthExpiryRefresh();
+    renderOpBadge();
+    closeOperatorModal();
+    reconnectWS();
+    toast(t('op.locked_msg'), 'warn');
+  } catch (_) {
+    toast(t('op.lock_fail'), 'err');
+  }
+}
+$('btn-op')?.addEventListener('click', openOperatorModal);
+$('op-close')?.addEventListener('click', closeOperatorModal);
+$('op-modal')?.addEventListener('click', (e) => { if (e.target === e.currentTarget) closeOperatorModal(); });
+$('op-form')?.addEventListener('submit', submitOperatorPin);
+$('op-lock')?.addEventListener('click', lockOperator);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && $('op-modal') && !$('op-modal').hidden) closeOperatorModal(); });
+
+/* =================================================================
    Boot
    ================================================================= */
 { const sp = store('rebot.speed'); setSpeed(sp != null && /^[0-2]$/.test(sp) ? Number(sp) : 1); }
@@ -12484,6 +13242,7 @@ async function initSandbox() {
   $('c-rmax').textContent = Math.round(CFG.cart.reachMax * 1000);
 }
 schemaReady = loadSchema();
+loadAuthStatus();
 initSandbox();
 connectWS();
 connectDetectionWS();
@@ -12496,7 +13255,7 @@ requestAnimationFrame(frame);
 
 /* i18n: re-render dynamic UI on language change */
 i18nHooks.push(
-  renderJogRows, renderGripCol, renderPoseUi,
+  renderJogRows, renderGripCol, renderPoseUi, renderOpBadge,
   () => setMode(S.ctl, S.input),
   () => { if (lastHint) videoHint(...lastHint); },
   () => {

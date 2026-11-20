@@ -210,6 +210,7 @@ impl SupervisorInner {
         let model = self.gravity_comp_model_torque(&policy, scale)
             .ok_or_else(|| Self::reject("GRAVITY_MODEL_UNAVAILABLE", "Gravity torque could not be computed".into()))?;
         let pose = arm6(&self.measured_positions);
+        self.servo_ws_min_depths = None;
         // Start from the torque the position loop is producing now, so the handover to MIT
         // has no torque step (simulation has no torque feedback: use the model).
         let mut entry_torque = if self.driver.is_some() { arm6(&self.torques) } else { model };

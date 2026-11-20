@@ -10,9 +10,92 @@ import mujoco
 import numpy as np
 
 from .camera import CameraMount
+from .domain_rand import (
+    ActionDelayBuffer,
+    DomainRandomizationConfig,
+    DomainRandomizer,
+    validate_seed,
+)
 from .model import load_model
 from .pack import PackScene, load_scene_pack, load_tool_pack
 from .server import Motors
+
+_OBS_SEED_SALT = 0x44525F4F4253  # "DR_OBS"
+_IMG_SEED_SALT = 0x44525F494D47  # "DR_IMG"
+
+
+def _is_real_scalar(val: Any) -> bool:
+    return isinstance(val, (int, float, np.integer, np.floating)) and not isinstance(
+        val, (bool, np.bool_)
+    )
+
+
+def validate_real_vector(
+    values: Any,
+    expected_len: int,
+    label: str = "action",
+    exc_type: type[ValueError] = ValueError,
+) -> np.ndarray:
+    """Validate a 1D (or batch-1 ``(1, N)``) real-numeric vector of exact length ``expected_len``."""
+    if values is None or isinstance(
+        values, (bool, np.bool_, str, bytes, bytearray, dict, set, complex, np.complexfloating)
+    ):
+        raise exc_type(
+            f"{label} must be a real-numeric 1D sequence/array of length {expected_len}, "
+            f"got {type(values).__name__}"
+        )
+
+    if not isinstance(values, np.ndarray):
+        if not isinstance(values, Sequence):
+            raise exc_type(
+                f"{label} must be a real-numeric 1D sequence/array of length {expected_len}, "
+                f"got {type(values).__name__}"
+            )
+        if len(values) == 1 and isinstance(values[0], (Sequence, np.ndarray)) and not isinstance(
+            values[0], (str, bytes, bytearray)
+        ):
+            inner = values[0]
+            if not isinstance(inner, np.ndarray):
+                for idx, item in enumerate(inner):
+                    if not _is_real_scalar(item):
+                        raise exc_type(
+                            f"{label}[0][{idx}] must be a real number, got {type(item).__name__}"
+                        )
+        else:
+            for idx, item in enumerate(values):
+                if not _is_real_scalar(item):
+                    raise exc_type(
+                        f"{label}[{idx}] must be a real number, got {type(item).__name__}"
+                    )
+
+    try:
+        raw = np.asarray(values)
+    except (TypeError, ValueError) as exc:
+        raise exc_type(f"{label} could not be converted to a numeric array: {exc}") from exc
+    if np.iscomplexobj(raw) or raw.dtype.kind not in ("i", "u", "f"):
+        raise exc_type(
+            f"{label} must contain real numeric values (int/float), got dtype {raw.dtype!r}"
+        )
+
+    if raw.ndim == 2 and raw.shape[0] == 1:
+        arr = raw[0]
+    elif raw.ndim == 1:
+        arr = raw
+    else:
+        raise exc_type(
+            f"Expected 1D {label} of length {expected_len} or shape (1, {expected_len}), "
+            f"got shape {raw.shape}"
+        )
+
+    if arr.shape[0] != expected_len:
+        raise exc_type(
+            f"{label} length mismatch: expected {expected_len}, got {arr.shape[0]}"
+        )
+
+    out = np.asarray(arr, dtype=np.float64)
+    if not np.all(np.isfinite(out)):
+        raise exc_type(f"{label} contains non-finite values (NaN or Inf)")
+    return out
 
 
 class SimEnv:
@@ -35,10 +118,15 @@ class SimEnv:
         render_width: int = 160,
         render_height: int = 120,
         headless: bool = True,
+        dr_config: DomainRandomizationConfig | None = None,
     ) -> None:
         if control_mode not in ("position", "velocity"):
             raise ValueError(
                 f"Unsupported control_mode {control_mode!r}: expected 'position' or 'velocity'"
+            )
+        if dr_config is not None and not isinstance(dr_config, DomainRandomizationConfig):
+            raise TypeError(
+                f"dr_config must be DomainRandomizationConfig or None, got {type(dr_config).__name__}"
             )
         self.scene_ref = scene
         self.robot = robot.lower()
@@ -50,6 +138,7 @@ class SimEnv:
         self.render_width = int(render_width)
         self.render_height = int(render_height)
         self.headless = headless
+        self.dr_config = dr_config
 
         self.scene_pack = load_scene_pack(scene) if scene is not None else None
         if tool is None and self.scene_pack is not None:
@@ -91,6 +180,45 @@ class SimEnv:
                 self.renderer = None
 
         self._prev_score = 0.0
+        self._randomizer: DomainRandomizer | None = None
+        self._action_delay_buffer: ActionDelayBuffer | None = None
+        self._obs_rng: np.random.Generator | None = None
+        self._img_rng: np.random.Generator | None = None
+        if self.dr_config is not None:
+            self._randomizer = DomainRandomizer(self.model, self.dr_config)
+            self._action_delay_buffer = ActionDelayBuffer(0)
+            if self.dr_config.enabled:
+                self._obs_rng = np.random.default_rng()
+                self._img_rng = np.random.default_rng()
+
+    @property
+    def domain_randomizer(self) -> DomainRandomizer | None:
+        """Active ``DomainRandomizer`` instance when ``dr_config`` is provided."""
+        return self._randomizer
+
+    @property
+    def n_joints(self) -> int:
+        """Number of controlled robot/tool joints exposed by the indexer."""
+        return self.indexer.dof
+
+    @property
+    def action_dim(self) -> int:
+        """Exact action vector length expected by ``step()``."""
+        return self.motors.dof if self.control_mode == "position" else self.model.nu
+
+    @property
+    def joint_names(self) -> list[str]:
+        """Ordered joint names matching ``obs['state']`` and ``action``."""
+        return list(self.indexer.joints)
+
+    def _validate_action(self, action: Sequence[float] | np.ndarray) -> np.ndarray:
+        """Validate action dimensionality, length, numeric type, and finiteness."""
+        return validate_real_vector(
+            action,
+            self.action_dim,
+            label=f"action ({self.control_mode} mode)",
+            exc_type=ValueError,
+        )
 
     def _get_obs(self) -> dict[str, Any]:
         obs: dict[str, Any] = {
@@ -106,10 +234,40 @@ class SimEnv:
         if self.render_camera is not None and self.renderer is not None:
             self.renderer.update_scene(self.data, camera=self.render_camera)
             obs["image"] = self.renderer.render()
+        if self._randomizer is not None and self.dr_config is not None and self.dr_config.enabled:
+            obs_rng = self._obs_rng if self._obs_rng is not None else np.random.default_rng()
+            obs = self._randomizer.apply_obs_noise(obs, obs_rng)
+            if "image" in obs:
+                img_rng = self._img_rng if self._img_rng is not None else np.random.default_rng()
+                obs["image"] = self._randomizer.apply_image_noise(obs["image"], img_rng)
         return obs
 
     def reset(self, seed: int | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
         """Reset arm joints to home neutral pose, reset scene objects, IO, and return (obs, info)."""
+        seed = validate_seed(seed)
+        dr_params: dict[str, Any] | None = None
+        if self._randomizer is not None and self.dr_config is not None:
+            if self.dr_config.enabled:
+                dr_params = self._randomizer.apply(self.model, seed=seed)
+                if seed is not None:
+                    self._obs_rng = np.random.default_rng(
+                        np.random.SeedSequence([seed, _OBS_SEED_SALT])
+                    )
+                    self._img_rng = np.random.default_rng(
+                        np.random.SeedSequence([seed, _IMG_SEED_SALT])
+                    )
+                else:
+                    self._obs_rng = np.random.default_rng()
+                    self._img_rng = np.random.default_rng()
+                if self._action_delay_buffer is not None:
+                    self._action_delay_buffer.reset(delay_steps=dr_params["action_delay_steps"])
+            else:
+                self._randomizer.restore_baseline(self.model)
+                self._obs_rng = None
+                self._img_rng = None
+                if self._action_delay_buffer is not None:
+                    self._action_delay_buffer.reset(delay_steps=0)
+
         self.data.time = 0.0
         self.data.qpos[:] = self.model.qpos0
         self.data.qvel[:] = 0.0
@@ -129,10 +287,12 @@ class SimEnv:
         self._prev_score = float(task.get("score", 0.0)) if task else 0.0
 
         obs = self._get_obs()
-        info = {
+        info: dict[str, Any] = {
             "task": task,
             "sim_time_s": float(self.data.time),
         }
+        if dr_params is not None:
+            info["dr_params"] = dr_params
         return obs, info
 
     def step(
@@ -141,33 +301,35 @@ class SimEnv:
         io_updates: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], float, bool, dict[str, Any]]:
         """Execute one control step (n_substeps physics steps) without real-time delays."""
-        act = np.asarray(action, dtype=float).ravel()
+        act = self._validate_action(action)
+        if (
+            self._action_delay_buffer is not None
+            and self.dr_config is not None
+            and self.dr_config.enabled
+        ):
+            act = self._action_delay_buffer.push(act)
         if io_updates:
             self.pack_scene.set_io(io_updates, self.data)
 
         if self.control_mode == "position":
-            q_t = self.motors.q_t.copy()
-            n = min(len(act), len(q_t))
-            q_t[:n] = act[:n]
-            self.motors.q_t = q_t
+            self.motors.q_t = act.copy()
             self.motors.mode = ["pos_vel"] * self.motors.dof
             for _ in range(self.n_substeps):
                 self.motors.apply()
                 mujoco.mj_step(self.model, self.data)
                 self.pack_scene.step_io(self.data)
         else:
-            n_act = min(len(act), self.model.nu)
-            for i in range(n_act):
-                val = act[i]
+            for i in range(self.model.nu):
+                val = float(act[i])
                 if self.model.actuator_ctrllimited[i]:
-                    val = np.clip(
-                        val,
-                        self.model.actuator_ctrlrange[i, 0],
-                        self.model.actuator_ctrlrange[i, 1],
+                    val = float(
+                        np.clip(
+                            val,
+                            self.model.actuator_ctrlrange[i, 0],
+                            self.model.actuator_ctrlrange[i, 1],
+                        )
                     )
                 self.data.ctrl[i] = val
-            if n_act < self.model.nu:
-                self.data.ctrl[n_act:] = 0.0
 
             for _ in range(self.n_substeps):
                 self.data.qfrc_applied[:] = 0.0

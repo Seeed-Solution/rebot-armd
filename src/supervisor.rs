@@ -44,11 +44,31 @@ pub enum ArmError {
     /// [`Rejected`](Self::Rejected) with extra reply fields (`owner`, `sequences`, `step`, `reason`).
     #[error("{code}: {message}")]
     Detailed { status: u16, code: String, message: String, details: Box<serde_json::Value> },
+
+    /// Workspace rejection preserving structured violation detail (e.g. replay).
+    #[error("WORKSPACE_VIOLATION: {message}")]
+    WorkspaceRejected {
+        message: String,
+        detail: crate::kinematics::WorkspaceViolationDetail,
+    },
+
+    /// Config write expected_revision does not match the current revision.
+    #[error("Policy revision mismatch: expected {expected}, current {current}")]
+    PolicyRevisionMismatch { expected: u64, current: u64 },
 }
 
 impl ArmError {
     pub fn detailed(status: u16, code: &str, message: impl Into<String>, details: serde_json::Value) -> Self {
         Self::Detailed { status, code: code.into(), message: message.into(), details: Box::new(details) }
+    }
+
+    pub fn workspace_detail(&self) -> Option<crate::kinematics::WorkspaceViolationDetail> {
+        match self {
+            Self::Safety(e) => e.workspace_detail(),
+            Self::Motion(MotionError::WorkspaceViolation { detail, .. }) => Some(detail.clone()),
+            Self::WorkspaceRejected { detail, .. } => Some(detail.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -216,10 +236,14 @@ pub struct SupervisorInner {
     pub motor_errors: Vec<Option<crate::model::MotorError>>,
     /// Published as `observation.motion_limit`.
     pub motion_limit: Option<MotionLimit>,
+    /// Structured details of the active `MotionLimitReason::Workspace` hold/rejection.
+    pub workspace_violation: Option<crate::kinematics::WorkspaceViolationDetail>,
     /// Observation-clock time (s) `motion_limit` last applied.
     pub motion_limit_seen_s: f64,
     /// Holding after a blocked servo stream (keeps `motion_limit` = blocked).
     pub servo_blocked_hold: bool,
+    /// Persistent monotonic escape baseline across a servo stream & its braking phase, tagged with `workspace_revision`.
+    pub servo_ws_min_depths: Option<(u64, crate::kinematics::SlotBuf)>,
     pub is_torqued: bool,
     pub pending_rearm: bool,
     pub active_trajectory: Option<ActiveTrajectory>,
@@ -364,15 +388,52 @@ pub struct SupervisorInner {
     pub driver_config_error: Option<String>,
     /// Running zero check parameters (id, store_offset, threshold_rad, base_closed_rad).
     pub zero_check_params: Option<ZeroCheckParams>,
+    /// Monotonic revision for gripper calibration (starts at 1).
+    pub gripper_calib_revision: u64,
+    /// Monotonic revision for grasp setup (starts at 1).
+    pub grasp_setup_revision: u64,
+    /// When true (inside ArmSupervisor::tick), zero_check(store_offset=true) defers disk persist
+    /// and memory commit until after the lock is released.
+    pub defer_zero_check_persist: bool,
+    /// Action id whose zero_check(store_offset=true) disk persist is currently in flight.
+    pub zero_check_persisting: Option<u64>,
+    /// Pending disk persist + commit payload produced by finish_action during ArmSupervisor::tick.
+    pub pending_zero_check_persist: Option<PendingZeroCheckPersist>,
+    /// Whether operator auth is enforced (exposed in GET /api/v1/safety/describe).
+    pub operator_auth_enforced: bool,
+}
+
+/// Complete validated gripper calibration snapshot ready for infallible commit after disk rename.
+#[derive(Debug, Clone)]
+pub struct GripperCalibrationCandidate {
+    config: ArmConfig,
+    base_gripper_policy: Option<crate::model::GripperPolicy>,
+    gripper_calib_offset: Option<f32>,
+    gripper_calib_jaw_opening: Option<crate::model::JawOpening>,
+    gripper_calib_invalid: bool,
+    driver_config_error: Option<String>,
 }
 
 /// Parameters of a running gripper zero check action.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ZeroCheckParams {
     pub action_id: u64,
     pub store_offset: bool,
     pub threshold_rad: f32,
     pub base_closed_rad: f32,
+    pub operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
+}
+
+/// Deferred atomic persist-before-commit job for `gripper_zero_check(store_offset=true)`.
+#[derive(Clone)]
+pub struct PendingZeroCheckPersist {
+    pub action_id: u64,
+    pub offset_rad: f32,
+    pub jaw_opening: Option<crate::model::JawOpening>,
+    pub base_revision: u64,
+    pub lease_owner: Option<(String, u64)>,
+    pub operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
+    pub write: crate::persist::PendingWrite,
 }
 
 impl SupervisorInner {
@@ -449,8 +510,10 @@ impl SupervisorInner {
             servo_lead_stall: vec![None; dof],
             motor_errors: Vec::new(),
             motion_limit: None,
+            workspace_violation: None,
             motion_limit_seen_s: 0.0,
             servo_blocked_hold: false,
+            servo_ws_min_depths: None,
             is_torqued: false,
             pending_rearm: false,
             active_trajectory: None,
@@ -534,6 +597,12 @@ impl SupervisorInner {
             mock_gripper_object: None,
             driver_config_error: None,
             zero_check_params: None,
+            gripper_calib_revision: 1,
+            grasp_setup_revision: 1,
+            defer_zero_check_persist: false,
+            zero_check_persisting: None,
+            pending_zero_check_persist: None,
+            operator_auth_enforced: false,
         }
     }
 
@@ -689,7 +758,7 @@ impl SupervisorInner {
         }
     }
 
-    fn estop_pending(&self) -> bool {
+    pub(crate) fn estop_pending(&self) -> bool {
         self.e_stop_latched.load(Ordering::SeqCst) || self.requested_estop_count.load(Ordering::SeqCst) != self.applied_estop_count
     }
 
@@ -932,6 +1001,9 @@ impl SupervisorInner {
                 return;
             }
         }
+        if reason != MotionLimitReason::Workspace {
+            self.workspace_violation = None;
+        }
         self.motion_limit = Some(MotionLimit { reason, joint, since_ms: (now * 1000.0) as u64 });
         self.motion_limit_seen_s = now;
     }
@@ -955,6 +1027,7 @@ impl SupervisorInner {
         }
         if self.motion_limit.is_some() && self.now_s() - self.motion_limit_seen_s > MOTION_LIMIT_CLEAR_S {
             self.motion_limit = None;
+            self.workspace_violation = None;
         }
     }
 
@@ -976,26 +1049,48 @@ impl SupervisorInner {
         self.servo_hold(MotionLimitReason::Blocked, Some(joint));
     }
 
-    /// The servo / braking step to `next` sweeps into a keep-out box: same recoverable hold.
+    /// The servo / braking step to `next` violates the workspace: same recoverable hold.
     fn enter_servo_keepout_hold(&mut self, e: &SafetyError) {
-        tracing::warn!("Servo step would enter a keep-out box ({e}): stream stopped, holding position");
+        tracing::warn!("Servo step violates workspace ({e}): stream stopped, holding position");
         self.servo_hold(MotionLimitReason::Workspace, None);
+        if self.motion_limit.as_ref().is_some_and(|m| m.reason == MotionLimitReason::Workspace) {
+            self.workspace_violation = e.workspace_detail();
+        }
     }
 
     /// Joint-space step from the commanded position to `next` (linear in joint space)
-    /// against the keep-out boxes: the conservative sweep check
-    /// ([`keepout_sweep`](Self::keepout_sweep)) with at most [`MAX_KEEPOUT_EVALS_PER_TICK`]
-    /// added FK evaluations, then the start / midpoint / end rule for boxes the step starts
-    /// in. No FK call without boxes.
-    pub fn servo_step_keepout(&self, next: &[f32]) -> Result<(), SafetyError> {
+    /// against the full workspace (floor, outer box, reach, keep-out boxes, link capsules),
+    /// using the persistent per-constraint monotonic escape rule and up to [`MAX_KEEPOUT_EVALS_PER_TICK`]
+    /// added FK evaluations.
+    pub fn servo_step_keepout(&mut self, next: &[f32]) -> Result<(), SafetyError> {
+        self.servo_step_workspace(next, "servo_step")
+    }
+
+    /// Full workspace sweep check for a servo streaming or braking tick.
+    pub fn servo_step_workspace(&mut self, next: &[f32], phase: &str) -> Result<(), SafetyError> {
         let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
-        if ws.keepout_boxes.is_empty() { return Ok(()); }
-        let a = &self.commanded_positions;
-        let lerp = |t: f64| -> Vec<f32> { a.iter().zip(next).map(|(x, y)| x + (t as f32) * (y - x)).collect() };
-        let travel = |t0: f64, t1: f64| -> Vec<f64> { a.iter().zip(next).map(|(x, y)| f64::from((y - x).abs()) * (t1 - t0)).collect() };
-        self.keepout_sweep(ws, cam, &lerp, &travel, &[0.0, 1.0], MAX_KEEPOUT_EVALS_PER_TICK)?;
-        let mid = lerp(0.5);
-        self.check_keepout_path(a, [mid.as_slice(), next])
+        let eval = crate::chain::WorkspaceEvaluator::new(&self.config.arm_model, ws, cam);
+        let mut c0 = eval.alloc_buf();
+        eval.eval_into(&self.commanded_positions, &mut c0, phase)
+            .map_err(SafetyError::from_workspace)?;
+        let mut cand_min_d = match &self.servo_ws_min_depths {
+            Some((rev, min_d)) if *rev == self.workspace_revision => min_d.clone(),
+            _ => eval.init_min_depths(&c0),
+        };
+        let mut budget = MAX_KEEPOUT_EVALS_PER_TICK;
+        eval.sweep_linear_step(
+            &self.commanded_positions,
+            next,
+            &c0,
+            &mut cand_min_d,
+            &mut budget,
+            MAX_KEEPOUT_EVALS_PER_TICK,
+            phase,
+            phase,
+        )
+        .map_err(|(_, f)| SafetyError::from_workspace(f))?;
+        self.servo_ws_min_depths = Some((self.workspace_revision, cand_min_d));
+        Ok(())
     }
 
     /// Conservative keep-out check of the joint path `at(t)` over `knots` (ascending).
@@ -1078,14 +1173,7 @@ impl SupervisorInner {
     ) -> Result<(), SafetyError> {
         let Some((ws, cam)) = self.workspace_policy() else { return Ok(()); };
         if ws.keepout_boxes.is_empty() { return Ok(()); }
-        let only = crate::model::WorkspacePolicy {
-            floor_z_m: f32::NEG_INFINITY,
-            box_min_m: [f32::NEG_INFINITY; 3],
-            box_max_m: [f32::INFINITY; 3],
-            max_reach_m: None,
-            check_points_end_m: ws.check_points_end_m.clone(),
-            keepout_boxes: ws.keepout_boxes.clone(),
-        };
+        let only = ws.keepout_only();
         self.check_path_against(&only, cam, start, samples)
     }
 
@@ -1108,22 +1196,34 @@ impl SupervisorInner {
         (0..=n).map(|k| traj.sample(traj.duration * k as f64 / n as f64).positions).collect()
     }
 
-    /// Workspace verification points of a joint-space trajectory: the 21 planner samples,
-    /// plus, with keep-out boxes, the samples of the conservative sweep check
+    /// Workspace verification points of a joint-space trajectory: the 21 planner samples
+    /// verified against the full workspace (floor, outer box, reach, keep-out boxes,
+    /// link capsules) via the conservative sweep check
     /// ([`keepout_sweep`](Self::keepout_sweep), at most [`MAX_KEEPOUT_EVALS_PER_PLAN`] added
-    /// FK evaluations; a path that needs more, or that enters a box, is WORKSPACE_VIOLATION).
+    /// FK evaluations; a path that needs more, or that violates, is WORKSPACE_VIOLATION).
     pub fn workspace_samples(&self, traj: &MultiJointQuinticTrajectory) -> Result<Vec<Vec<f32>>, SafetyError> {
         self.workspace_samples_with_budget(traj, MAX_KEEPOUT_EVALS_PER_PLAN)
     }
 
     /// [`workspace_samples`](Self::workspace_samples) with `budget` added FK evaluations.
     pub fn workspace_samples_with_budget(&self, traj: &MultiJointQuinticTrajectory, budget: usize) -> Result<Vec<Vec<f32>>, SafetyError> {
-        let Some((ws, cam)) = self.workspace_policy().filter(|(ws, _)| !ws.keepout_boxes.is_empty())
+        let Some((ws, cam)) = self.workspace_policy()
             else { return Ok(Self::trajectory_samples(traj)); };
         let knots: Vec<f64> = (0..=20).map(|k| traj.duration * k as f64 / 20.0).collect();
         let at = |t: f64| traj.sample(t).positions;
         let travel = |t0: f64, t1: f64| traj.travel_bound(t0, t1);
         self.keepout_sweep(ws, cam, &at, &travel, &knots, budget)
+    }
+
+    /// Keepout-only sweep samples for `park` (exempt from floor / outer box / reach, still enforces keep-out boxes).
+    pub fn keepout_samples(&self, traj: &MultiJointQuinticTrajectory) -> Result<Vec<Vec<f32>>, SafetyError> {
+        let Some((ws, cam)) = self.workspace_policy().filter(|(ws, _)| !ws.keepout_boxes.is_empty())
+            else { return Ok(Self::trajectory_samples(traj)); };
+        let only = ws.keepout_only();
+        let knots: Vec<f64> = (0..=20).map(|k| traj.duration * k as f64 / 20.0).collect();
+        let at = |t: f64| traj.sample(t).positions;
+        let travel = |t0: f64, t1: f64| traj.travel_bound(t0, t1);
+        self.keepout_sweep(&only, cam, &at, &travel, &knots, MAX_KEEPOUT_EVALS_PER_PLAN)
     }
 
     fn gravity_output_enabled(&self) -> bool {
@@ -1163,9 +1263,11 @@ impl SupervisorInner {
     pub fn stop_motion(&mut self) {
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
+        self.servo_ws_min_depths = None;
         self.active_trajectory = None;
         self.pending_normal_unload = false;
         self.unload_settle = None;
+        self.zero_check_persisting = None;
         self.target_positions = self.commanded_positions.clone();
     }
 
@@ -1252,6 +1354,7 @@ impl SupervisorInner {
             driver_range_check: self.driver.as_ref().and_then(|d| d.lock().ok().and_then(|drv| drv.range_check())),
             lease_holder: self.lease_holder(),
             motion_limit: self.motion_limit.clone(),
+            workspace_violation: self.workspace_violation.clone(),
             motor_errors: self.motor_errors.clone(),
             fault: self.safety.fault(),
             residual_torques: self.residual_torques,
@@ -1605,6 +1708,7 @@ impl SupervisorInner {
             self.unload_settle = None;
             self.watchdog_park = None;
             self.servo_target = None;
+            self.servo_ws_min_depths = None;
 
             let state = self.safety.set_torque(true)?;
             self.is_torqued = true;
@@ -1678,6 +1782,7 @@ impl SupervisorInner {
         }
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
+        self.servo_ws_min_depths = None;
         match policy {
             StopPolicy::NormalUnload => {
                 if self.handover_settling_since.is_some() {
@@ -1732,9 +1837,10 @@ impl SupervisorInner {
                         };
                         // Park is exempt from the floor / box / reach limits (it must remain
                         // possible from a violating pose) but not from the keep-out boxes.
-                        let samples = match self.workspace_samples(&traj) {
+                        let samples = match self.keepout_samples(&traj) {
                             Ok(s) => s,
                             Err(e) => {
+                                let e = e.with_workspace_phase("park");
                                 tracing::warn!("Park path cannot be verified against the keep-out boxes ({e}); not parking");
                                 self.park_rejection = Some(e);
                                 self.pending_normal_unload = false;
@@ -1744,6 +1850,7 @@ impl SupervisorInner {
                             }
                         };
                         if let Err(e) = self.check_keepout_path(&clamped_start, samples.iter().map(Vec::as_slice)) {
+                            let e = e.with_workspace_phase("park");
                             tracing::warn!("Park path enters a keep-out box ({e}); not parking");
                             self.park_rejection = Some(e);
                             self.pending_normal_unload = false;
@@ -2268,6 +2375,7 @@ impl SupervisorInner {
         self.unload_settle = None;
         self.active_trajectory = None;
         self.servo_target = None; self.servo_settled_ticks.fill(0);
+        self.servo_ws_min_depths = None;
         self.target_positions = hold_pos.clone();
         self.commanded_positions = hold_pos;
         self.commanded_velocities = vec![0.0; self.config.dof];
@@ -2391,6 +2499,8 @@ impl SupervisorInner {
 
         // 1b. Cartesian workspace: the target may not leave the box further than now.
         if let Err(e) = self.check_workspace_path(&self.commanded_positions, [targets.as_slice()]) {
+            let e = e.with_workspace_phase("servo_target");
+            self.workspace_violation = e.workspace_detail();
             self.note_motion_limit(MotionLimitReason::Workspace, None);
             return Err(e);
         }
@@ -2518,6 +2628,7 @@ impl SupervisorInner {
         self.last_heartbeat = Instant::now();
 
         self.servo_target = None;
+        self.servo_ws_min_depths = None;
         self.target_positions = target_positions;
         self.safety.mark_motion_started()?;
         let duration = traj.duration;
@@ -2561,6 +2672,8 @@ impl SupervisorInner {
             stop_rad: None, offset_rad: None, pass: None,
             approach: None, approach_reason: None, approach_signs: None, approach_flipped: None,
             phase_ms: std::collections::BTreeMap::new(), motions: Vec::new(),
+            constraint_id: None, geometry_id: None, violation_phase: None, reason: None,
+            durability_confirmed: None, durability_warning: None,
         });
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
         self.quintic_settle = None;
@@ -2570,12 +2683,18 @@ impl SupervisorInner {
     pub fn finish_action(&mut self, id: u64, state: &str, code: Option<&str>, message: Option<String>,
                      settled: Option<bool>, holding: Option<bool>, gap: Option<f32>) {
         let now = self.now_s();
-        let mut store_offset_val = None;
+        let mut store_offset_req: Option<(f32, Option<(crate::auth::OperatorAuth, Option<String>)>)> = None;
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
             a.state = state.into();
             a.code = code.map(Into::into);
             a.message = message;
             a.finished_at = Some(now);
+            if state != "failed" || code != Some("WORKSPACE_VIOLATION") {
+                a.constraint_id = None;
+                a.geometry_id = None;
+                a.violation_phase = None;
+                a.reason = None;
+            }
             if state == "done" { a.progress = 1.0; }
             if settled.is_some() { a.settled = settled; }
             if holding.is_some() { a.holding = holding; }
@@ -2593,7 +2712,7 @@ impl SupervisorInner {
                         self.last_zero_check_offset = Some(offset_rad);
                         if params.store_offset {
                             if offset_rad.abs() <= 0.5 {
-                                store_offset_val = Some(offset_rad);
+                                store_offset_req = Some((offset_rad, params.operator_auth));
                             } else {
                                 tracing::warn!("Gripper zero check offset {offset_rad:.4} exceeds 0.5 rad; storing refused");
                             }
@@ -2603,30 +2722,89 @@ impl SupervisorInner {
             }
             tracing::info!("Action {} ({}) {}{}", id, a.kind, state, code.map(|c| format!(" {c}")).unwrap_or_default());
         }
-        if let Some(offset_rad) = store_offset_val {
-            if let Err(e) = self.apply_gripper_calibration(Some(offset_rad), self.gripper_calib_jaw_opening.clone()) {
-                tracing::warn!("Failed to apply gripper calibration after zero_check: {e}");
-                if let Some(a) = self.last_action.as_mut() {
-                    if a.id == id {
+        if let Some((offset_rad, operator_auth)) = store_offset_req {
+            let candidate_jaw = self.gripper_calib_jaw_opening.clone();
+            match self.build_gripper_calibration_candidate(Some(offset_rad), candidate_jaw.clone()) {
+                Err(e) => {
+                    tracing::warn!("Failed to apply gripper calibration after zero_check: {e}");
+                    if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
                         a.state = "failed".into();
                         a.code = Some("INVALID_CALIBRATION".into());
                         a.message = Some(format!("Gripper calibration rejected: {e}"));
                     }
                 }
-            } else {
-                let path = self.gripper_calib_path.clone().unwrap_or_else(crate::gripper_calib::path_from_env);
-                let file = crate::gripper_calib::GripperCalibFile {
-                    offset_rad: Some(offset_rad),
-                    jaw_opening: self.gripper_calib_jaw_opening.clone(),
-                    ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())),
-                    stale: self.gripper_calib_stale.clone(),
-                };
-                let text = serde_json::to_string_pretty(&file).unwrap_or_default();
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let write = crate::persist::PendingWrite::new(path, text);
-                    handle.spawn(async move { let _ = write.run().await; });
-                } else {
-                    let _ = crate::persist::write_atomic(&path, &text);
+                Ok((cand, _)) => {
+                    let path = self.gripper_calib_path.clone().unwrap_or_else(crate::gripper_calib::path_from_env);
+                    let file = crate::gripper_calib::GripperCalibFile {
+                        offset_rad: Some(offset_rad),
+                        jaw_opening: candidate_jaw.clone(),
+                        ts: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())),
+                        stale: self.gripper_calib_stale.clone(),
+                    };
+                    let text = serde_json::to_string_pretty(&file).unwrap_or_default();
+                    if self.defer_zero_check_persist {
+                        // Hold action as running until atomic persist-before-commit completes outside the lock.
+                        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                            a.state = "running".into();
+                            a.finished_at = None;
+                        }
+                        self.zero_check_persisting = Some(id);
+                        self.pending_zero_check_persist = Some(PendingZeroCheckPersist {
+                            action_id: id,
+                            offset_rad,
+                            jaw_opening: candidate_jaw,
+                            base_revision: self.gripper_calib_revision,
+                            lease_owner: self.active_lease.as_ref().map(|l| (l.client_id.clone(), l.generation)),
+                            operator_auth,
+                            write: crate::persist::PendingWrite::new(path, text),
+                        });
+                    } else {
+                        let auth_ok = operator_auth.as_ref().is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
+                        if !auth_ok {
+                            if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                                a.state = "failed".into();
+                                a.code = Some("OPERATOR_REQUIRED".into());
+                                a.message = Some("Operator session expired or locked before gripper calibration persisted".into());
+                            }
+                        } else {
+                            match crate::persist::StagedWrite::stage(path, text) {
+                                Err(e) => {
+                                    tracing::warn!("Failed to stage gripper calibration after zero_check: {e}");
+                                    if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                                        a.state = "failed".into();
+                                        a.code = Some("PERSIST_FAILED".into());
+                                        a.message = Some(format!("Failed to persist gripper calibration: {e}"));
+                                    }
+                                }
+                                Ok(staged) => match staged.rename_only() {
+                                    Err(e) => {
+                                        tracing::warn!("Failed to publish gripper calibration after zero_check: {e}");
+                                        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                                            a.state = "failed".into();
+                                            a.code = Some("PERSIST_FAILED".into());
+                                            a.message = Some(format!("Failed to persist gripper calibration: {e}"));
+                                        }
+                                    }
+                                    Ok(dir_sync) => {
+                                        self.commit_gripper_calibration_candidate(cand);
+                                        self.gripper_calib_revision += 1;
+                                        let outcome = dir_sync.sync_parent_dir();
+                                        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id) {
+                                            match outcome {
+                                                crate::persist::PublishOutcome::Published => {
+                                                    a.durability_confirmed = Some(true);
+                                                }
+                                                crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) => {
+                                                    a.durability_confirmed = Some(false);
+                                                    a.durability_warning = Some(w);
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2680,6 +2858,7 @@ impl SupervisorInner {
 
     fn busy_reason(&self) -> Option<String> {
         if self.calibration_busy { return Some("a calibration apply is running".into()); }
+        if self.zero_check_persisting.is_some() { return Some("gripper calibration is being persisted".into()); }
         if self.active_trajectory.is_some() { return Some("a trajectory is running".into()); }
         if self.servo_target.is_some() { return Some("servo streaming is active".into()); }
         if self.commanded_velocities.iter().any(|v| v.abs() >= 1e-3) { return Some("the arm is still moving".into()); }
@@ -2747,6 +2926,7 @@ impl SupervisorInner {
         self.safety.validate_motion_command(Some(input.epoch), &last, &self.config.limits)?;
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
+        self.servo_ws_min_depths = None;
         self.target_positions = last;
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
@@ -2772,7 +2952,10 @@ impl SupervisorInner {
     /// Install a camera mount (calibration apply / restore / startup): bumps the workspace
     /// revision when it changes and keeps the grasp setup's tilt in sync with the mount's.
     pub fn set_camera_mount(&mut self, mount: crate::model::CameraMount) {
-        if self.config.camera_mount != mount { self.workspace_revision += 1; }
+        if self.config.camera_mount != mount {
+            self.workspace_revision += 1;
+            self.servo_ws_min_depths = None;
+        }
         self.config.camera_mount = mount;
         let tilt = f64::from(self.config.camera_mount.tilt_deg);
         if let Some(g) = self.config.grasp.as_mut() { g.camera_tilt_deg = tilt; }
@@ -2795,7 +2978,10 @@ impl SupervisorInner {
 
     /// Replace the runtime setup; `camera_tilt_deg` also sets `camera_mount.tilt_deg`.
     pub fn set_grasp_setup(&mut self, setup: crate::grasp::GraspSetup) {
-        if self.config.camera_mount.tilt_deg != setup.camera_tilt_deg as f32 { self.workspace_revision += 1; }
+        if self.config.camera_mount.tilt_deg != setup.camera_tilt_deg as f32 {
+            self.workspace_revision += 1;
+            self.servo_ws_min_depths = None;
+        }
         self.config.camera_mount.tilt_deg = setup.camera_tilt_deg as f32;
         self.config.grasp = Some(setup);
     }
@@ -2878,6 +3064,16 @@ impl SupervisorInner {
         if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) { f(a); }
     }
 
+    /// Record structured workspace violation details on running action `id`.
+    pub fn set_action_workspace_violation(&mut self, id: u64, detail: crate::kinematics::WorkspaceViolationDetail) {
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == id && a.is_running()) {
+            a.constraint_id = detail.constraint_id;
+            a.geometry_id = detail.geometry_id;
+            a.violation_phase = detail.violation_phase;
+            a.reason = detail.reason;
+        }
+    }
+
     /// Stop the running sub-motion of macro action `id` where the arm is (J1..J6 commanded to
     /// the measured positions, the gripper keeps its command) and report it done to the
     /// orchestrator. False when no sub-motion of `id` is running.
@@ -2949,6 +3145,7 @@ impl SupervisorInner {
         let duration = motion.expected_duration();
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
+        self.servo_ws_min_depths = None;
         let mut target = self.commanded_positions.clone();
         target[gripper_idx] = motion.target;
         self.target_positions = target;
@@ -3039,6 +3236,7 @@ impl SupervisorInner {
         let tag = motion.request.tag.clone();
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
+        self.servo_ws_min_depths = None;
         let mut target = self.commanded_positions.clone();
         target[gripper_idx] = motion.target;
         self.target_positions = target;
@@ -3051,6 +3249,15 @@ impl SupervisorInner {
 
     /// Start a gripper zero check action. Returns (action id, expected duration).
     pub fn start_gripper_zero_check(&mut self, body: &serde_json::Value, epoch: u64) -> Result<(u64, f64), ArmError> {
+        self.start_gripper_zero_check_with_auth(body, epoch, None)
+    }
+
+    pub fn start_gripper_zero_check_with_auth(
+        &mut self,
+        body: &serde_json::Value,
+        epoch: u64,
+        operator_auth: Option<(crate::auth::OperatorAuth, Option<String>)>,
+    ) -> Result<(u64, f64), ArmError> {
         let gripper_idx = self.config.gripper_index().ok_or_else(|| {
             MotionError::Unsupported("Gripper zero check needs a profile with a gripper joint".into())
         })?;
@@ -3093,6 +3300,7 @@ impl SupervisorInner {
         let duration = motion.expected_duration();
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
+        self.servo_ws_min_depths = None;
         let mut target = self.commanded_positions.clone();
         target[gripper_idx] = motion.target;
         self.target_positions = target;
@@ -3104,7 +3312,13 @@ impl SupervisorInner {
         self.gripper_stalled = false;
         self.gripper_high_torque_ticks = 0;
         self.gripper_low_torque_ticks = 0;
-        self.zero_check_params = Some(ZeroCheckParams { action_id: id, store_offset, threshold_rad, base_closed_rad });
+        self.zero_check_params = Some(ZeroCheckParams {
+            action_id: id,
+            store_offset,
+            threshold_rad,
+            base_closed_rad,
+            operator_auth,
+        });
         Ok((id, duration))
     }
 
@@ -3198,6 +3412,74 @@ impl SupervisorInner {
         })
     }
 
+    /// Validate a candidate gripper calibration (including hardware driver limits) without
+    /// leaving `self` mutated. Returns the resulting effective GripperPolicy on success.
+    /// Build and validate a complete gripper calibration candidate (including driver limit
+    /// re-application) without leaving `SupervisorInner` mutated.
+    pub fn build_gripper_calibration_candidate(
+        &mut self,
+        offset_rad: Option<f32>,
+        jaw_opening: Option<crate::model::JawOpening>,
+    ) -> Result<(GripperCalibrationCandidate, crate::model::GripperPolicy), String> {
+        let prev_config = self.config.clone();
+        let prev_base = self.base_gripper_policy.clone();
+        let prev_offset = self.gripper_calib_offset;
+        let prev_jaw = self.gripper_calib_jaw_opening.clone();
+        let prev_invalid = self.gripper_calib_invalid;
+        let prev_err = self.driver_config_error.clone();
+
+        let res = (|| {
+            self.apply_gripper_calibration(offset_rad, jaw_opening)?;
+            if self.driver.is_some() || self.driver_config_error.is_some() {
+                let ok = self.reapply_driver_limits();
+                if !ok || self.gripper_calib_invalid || self.driver_config_error.is_some() {
+                    return Err(self.driver_config_error.clone().unwrap_or_else(|| {
+                        "Gripper calibration rejected by driver hardware limits".to_string()
+                    }));
+                }
+            }
+            let policy = self.config.gripper_policy.clone().ok_or_else(|| {
+                "Gripper calibration requires a gripper policy".to_string()
+            })?;
+            let cand = GripperCalibrationCandidate {
+                config: self.config.clone(),
+                base_gripper_policy: self.base_gripper_policy.clone(),
+                gripper_calib_offset: self.gripper_calib_offset,
+                gripper_calib_jaw_opening: self.gripper_calib_jaw_opening.clone(),
+                gripper_calib_invalid: self.gripper_calib_invalid,
+                driver_config_error: self.driver_config_error.clone(),
+            };
+            Ok((cand, policy))
+        })();
+
+        self.config = prev_config;
+        self.base_gripper_policy = prev_base;
+        self.gripper_calib_offset = prev_offset;
+        self.gripper_calib_jaw_opening = prev_jaw;
+        self.gripper_calib_invalid = prev_invalid;
+        self.driver_config_error = prev_err;
+
+        res
+    }
+
+    /// Infallibly commit a pre-validated [`GripperCalibrationCandidate`] after disk rename.
+    pub fn commit_gripper_calibration_candidate(&mut self, cand: GripperCalibrationCandidate) {
+        self.config = cand.config;
+        self.base_gripper_policy = cand.base_gripper_policy;
+        self.gripper_calib_offset = cand.gripper_calib_offset;
+        self.gripper_calib_jaw_opening = cand.gripper_calib_jaw_opening;
+        self.gripper_calib_invalid = cand.gripper_calib_invalid;
+        self.driver_config_error = cand.driver_config_error;
+    }
+
+    pub fn validate_gripper_calibration_with_driver(
+        &mut self,
+        offset_rad: Option<f32>,
+        jaw_opening: Option<crate::model::JawOpening>,
+    ) -> Result<crate::model::GripperPolicy, String> {
+        self.build_gripper_calibration_candidate(offset_rad, jaw_opening).map(|(_, p)| p)
+    }
+
     pub fn gripper_calibration_response(&self) -> crate::gripper_calib::GripperCalibrationResponse {
         let policy = self.config.gripper_policy.clone();
         let calibrated = policy.as_ref().is_some_and(|p| p.is_calibrated());
@@ -3209,6 +3491,7 @@ impl SupervisorInner {
             policy,
             ts: None,
             stale: self.gripper_calib_stale.clone(),
+            revision: self.gripper_calib_revision,
         }
     }
 
@@ -3234,13 +3517,14 @@ impl SupervisorInner {
         if let Some((state, code, message)) = cause {
             // a macro sub-motion or a replay must not outlive its action
             if (is_macro || kind == "replay") && carried { self.stop_motion(); }
+            if self.zero_check_persisting == Some(id) { self.zero_check_persisting = None; }
             self.finish_action(id, state, Some(code), Some(message), None, None, None);
             return;
         }
         if let Some(run) = self.macro_run.as_ref().filter(|m| m.id == id) {
             // between sub-motions the orchestrator owns the action; it ends here only when
             // something else took the arm or a stop arrived
-            if carried { return; }
+            if carried || self.zero_check_persisting == Some(id) { return; }
             let superseded = self.active_trajectory.is_some() || self.servo_target.is_some();
             // a joint-space sub-motion (sequence pose step) settles before it counts as done
             if !superseded && !run.stop_requested && run.sub == SubState::Running && self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) {
@@ -3275,7 +3559,7 @@ impl SupervisorInner {
             }
             return;
         }
-        if carried { return; }
+        if carried || self.zero_check_persisting == Some(id) { return; }
         if self.quintic_settle.as_ref().is_some_and(|(sid, _)| *sid == id) {
             if superseded {
                 self.finish_action(id, "cancelled", Some("SUPERSEDED"), Some("Replaced by new motion".into()), None, None, None);
@@ -3464,6 +3748,7 @@ impl SupervisorInner {
         ));
         self.servo_target = None;
         self.servo_settled_ticks.fill(0);
+        self.servo_ws_min_depths = None;
         self.active_trajectory = None;
         self.commanded_velocities.fill(0.0);
         self.target_positions = self.commanded_positions.clone();
@@ -3930,6 +4215,7 @@ impl SupervisorInner {
                         self.unload_settle = None;
                         self.active_trajectory = None;
                         self.servo_target = None; self.servo_settled_ticks.fill(0);
+                        self.servo_ws_min_depths = None;
                         self.target_positions = hold_pos.clone();
                         self.commanded_positions = hold_pos;
                         self.commanded_velocities = vec![0.0; self.config.dof];
@@ -4291,7 +4577,7 @@ impl SupervisorInner {
                         self.latch_servo_fault(i);
                     } else if let Some(i) = blocked {
                         self.enter_servo_blocked_hold(i, "no progress at the lead cap");
-                    } else if let Err(e) = self.servo_step_keepout(&next_positions) {
+                    } else if let Err(e) = self.servo_step_workspace(&next_positions, "servo_step") {
                         self.enter_servo_keepout_hold(&e);
                     } else {
                         self.commanded_positions = next_positions;
@@ -4311,6 +4597,9 @@ impl SupervisorInner {
                         if self.servo_settled_ticks.iter().all(|&ticks| ticks >= 2) {
                             self.servo_target = None;
                             self.safety.mark_motion_finished();
+                            if self.commanded_velocities.iter().all(|&v| v == 0.0) {
+                                self.servo_ws_min_depths = None;
+                            }
                         }
                     }
                 }
@@ -4350,7 +4639,7 @@ impl SupervisorInner {
             let braking = self.commanded_velocities.iter().any(|&v| v != 0.0);
             if let Some(i) = infeasible {
                 self.latch_servo_fault(i);
-            } else if let Some(e) = braking.then(|| self.servo_step_keepout(&next_positions).err()).flatten() {
+            } else if let Some(e) = braking.then(|| self.servo_step_workspace(&next_positions, "braking").err()).flatten() {
                 self.enter_servo_keepout_hold(&e);
             } else {
                 self.commanded_positions = next_positions;
@@ -4358,6 +4647,7 @@ impl SupervisorInner {
                 self.target_positions = self.commanded_positions.clone();
                 if self.commanded_velocities.iter().all(|&v| v == 0.0) {
                     self.safety.mark_motion_finished();
+                    self.servo_ws_min_depths = None;
                 }
             }
         }
@@ -4531,84 +4821,14 @@ pub fn keepout_sweep_with(
     knots: &[f64],
     budget: usize,
 ) -> Result<Vec<Vec<f32>>, SafetyError> {
-    use crate::kinematics::WORKSPACE_EPS;
-    let n = model.arm_dof();
-    let local: Vec<[f64; 3]> = std::iter::once([0.0f32; 3]).chain(ws.check_points_end_m.iter().copied())
-        .chain(cam.offset_m).map(|p| p.map(f64::from)).collect();
-    let reach = model.joint_reach(local.iter().map(crate::kinematics::norm).fold(0.0, f64::max));
-    let boxes: Vec<([f64; 3], [f64; 3])> = ws.keepout_boxes.iter().map(|b| (b.min_m.map(f64::from), b.max_m.map(f64::from))).collect();
-    let invalid = || SafetyError::WorkspaceViolation { point: 0, limit: "invalid".into(), value: f32::NAN, bound: 0.0 };
-    // (outside distance, depth inside) of every point to every box at q
-    let measure = |q: &[f32]| -> Option<Vec<(f64, f64)>> {
-        let pose = model.fk_f32(q)?;
-        Some(local.iter().flat_map(|l| {
-            let p = pose.transform_point(l);
-            boxes.iter().map(move |(lo, hi)| {
-                let out = (0..3).map(|k| (lo[k] - p[k]).max(p[k] - hi[k]).max(0.0).powi(2)).sum::<f64>().sqrt();
-                let depth = (0..3).map(|k| (p[k] - lo[k]).min(hi[k] - p[k])).fold(f64::INFINITY, f64::min);
-                (out, depth)
-            })
-        }).collect())
-    };
-    let nb = boxes.len();
-    let first = at(knots[0]);
-    let m0 = measure(&first).ok_or_else(invalid)?;
-    let active: Vec<bool> = m0.iter().map(|&(_, depth)| depth <= 0.0).collect();
-    let check = |m: &[(f64, f64)]| -> Result<(), SafetyError> {
-        match m.iter().enumerate().filter(|(i, (_, depth))| active[*i] && *depth > WORKSPACE_EPS)
-            .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1)) {
-            Some((i, &(_, depth))) => Err(SafetyError::WorkspaceViolation {
-                point: i / nb,
-                limit: format!("keepout '{}'", ws.keepout_boxes[i % nb].name),
-                value: depth as f32, bound: 0.0,
-            }),
-            None => Ok(()),
-        }
-    };
-    let mut samples: Vec<(f64, Vec<f32>)> = vec![(knots[0], first)];
-    let mut ends: Vec<(f64, Vec<(f64, f64)>)> = vec![(knots[0], m0)];
-    for &t in &knots[1..] {
-        let q = at(t);
-        let m = measure(&q).ok_or_else(invalid)?;
-        check(&m)?;
-        samples.push((t, q));
-        ends.push((t, m));
-    }
-    let mut evals = 0usize;
-    let mut stack: Vec<((f64, Vec<(f64, f64)>), (f64, Vec<(f64, f64)>))> = Vec::new();
-    let mut ends = ends.into_iter();
-    let mut prev = ends.next().ok_or_else(invalid)?;
-    for e in ends { stack.push((prev, e.clone())); prev = e; }
-    while let Some(((t0, m0), (t1, m1))) = stack.pop() {
-        let tr = travel(t0, t1);
-        let bound: f64 = tr.iter().take(n).zip(&reach).map(|(d, r)| d * r).sum();
-        if !bound.is_finite() { return Err(invalid()); }
-        if bound <= WORKSPACE_EPS
-            || m0.iter().zip(&m1).zip(&active).all(|((a, b), &on)| !on || a.0 + b.0 > bound) {
-            continue;
-        }
-        if evals >= budget {
-            return Err(SafetyError::WorkspaceViolation {
-                point: 0,
-                limit: format!("keepout check: the path needs more than {budget} FK evaluations to clear the keep-out boxes; bound"),
-                value: bound as f32, bound: WORKSPACE_EPS as f32,
-            });
-        }
-        evals += 1;
-        let tm = 0.5 * (t0 + t1);
-        let q = at(tm);
-        let m = measure(&q).ok_or_else(invalid)?;
-        check(&m)?;
-        samples.push((tm, q));
-        stack.push(((tm, m.clone()), (t1, m1)));
-        stack.push(((t0, m0), (tm, m)));
-    }
-    samples.sort_by(|a, b| a.0.total_cmp(&b.0));
-    Ok(samples.into_iter().map(|(_, q)| q).collect())
+    crate::chain::WorkspaceEvaluator::new(model, ws, cam)
+        .sweep_knots(at, travel, knots, budget, "sweep")
+        .map_err(SafetyError::from_workspace)
 }
 
 /// Workspace rule of [`SupervisorInner::check_workspace_path`] with an explicit arm model:
-/// reject a sample that leaves the workspace further than `start` already is.
+/// reject a sample that worsens or newly intrudes on any `(geometry_id, constraint_id)`
+/// relative to `start` (per-constraint monotonic escape rule).
 pub fn check_path_with<'a>(
     model: &crate::chain::ArmModel,
     ws: &crate::model::WorkspacePolicy,
@@ -4616,15 +4836,14 @@ pub fn check_path_with<'a>(
     start: &[f32],
     samples: impl IntoIterator<Item = &'a [f32]>,
 ) -> Result<(), SafetyError> {
-    let v0 = model.workspace_violation(start, ws, cam);
+    let eval = crate::chain::WorkspaceEvaluator::new(model, ws, cam);
+    let mut c0 = eval.alloc_buf();
+    eval.eval_into(start, &mut c0, "plan").map_err(SafetyError::from_workspace)?;
+    let mut min_depths = eval.init_min_depths(&c0);
+    let mut clr = eval.alloc_buf();
     for q in samples {
-        let v = model.workspace_violation(q, ws, cam);
-        if crate::kinematics::workspace_rejects(&v, &v0) {
-            let w = v.worst.unwrap_or(crate::kinematics::ViolationDetail { point: 0, limit: "invalid", value: f64::NAN, bound: 0.0, keepout: None });
-            return Err(SafetyError::WorkspaceViolation {
-                point: w.point, limit: w.label(ws), value: w.value as f32, bound: w.bound as f32,
-            });
-        }
+        eval.eval_into(q, &mut clr, "plan").map_err(SafetyError::from_workspace)?;
+        eval.check_and_advance(&clr, &mut min_depths, "plan").map_err(SafetyError::from_workspace)?;
     }
     Ok(())
 }
@@ -4636,6 +4855,7 @@ pub struct ArmSupervisor {
     pub e_stop_latched: Arc<AtomicBool>,
     pub requested_estop_count: Arc<AtomicU64>,
     tick_stats: std::sync::Mutex<crate::diagnostics::tick::TickStats>,
+    config_write_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ArmSupervisor {
@@ -4652,7 +4872,16 @@ impl ArmSupervisor {
             e_stop_latched,
             requested_estop_count,
             tick_stats: std::sync::Mutex::new(crate::diagnostics::tick::TickStats::default()),
+            config_write_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    pub fn config_write_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.config_write_mutex)
+    }
+
+    pub async fn set_operator_auth_enforced(&self, enforced: bool) {
+        self.inner.write().await.operator_auth_enforced = enforced;
     }
 
     pub fn subscribe_telemetry(&self) -> broadcast::Receiver<ArmObservation> {
@@ -4918,12 +5147,230 @@ impl ArmSupervisor {
     /// Execute a control cycle step
     pub async fn tick(&self, dt: f64) -> ArmObservation {
         let started = Instant::now();
-        let (obs, lock_held, control_hz) = {
+        let (obs, lock_held, control_hz, pending_zc) = {
             let mut inner = self.inner.write().await;
             let locked = Instant::now();
+            inner.defer_zero_check_persist = true;
             let obs = inner.tick(dt);
-            (obs, locked.elapsed(), inner.config.control_frequency_hz)
+            inner.defer_zero_check_persist = false;
+            let pending_zc = inner.pending_zero_check_persist.take();
+            (obs, locked.elapsed(), inner.config.control_frequency_hz, pending_zc)
         };
+        if let Some(job) = pending_zc {
+            let sup_inner = Arc::clone(&self.inner);
+            let cw_lock = Arc::clone(&self.config_write_mutex);
+            tokio::spawn(async move {
+                let _cw = cw_lock.lock().await;
+                let path = job.write.path.clone();
+                let text = job.write.text.clone();
+                let staged_res = tokio::task::spawn_blocking(move || {
+                    crate::persist::StagedWrite::stage(path, text)
+                }).await;
+                let staged = match staged_res {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        tracing::warn!("Failed to stage gripper calibration after zero_check: {e}");
+                        let mut inner = sup_inner.write().await;
+                        if inner.zero_check_persisting == Some(job.action_id) {
+                            inner.zero_check_persisting = None;
+                        }
+                        let now = inner.now_s();
+                        if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
+                            a.state = "failed".into();
+                            a.code = Some("PERSIST_FAILED".into());
+                            a.message = Some(format!("Failed to persist gripper calibration: {e}"));
+                            a.finished_at = Some(now);
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Gripper calibration stage task failed: {e}");
+                        let mut inner = sup_inner.write().await;
+                        if inner.zero_check_persisting == Some(job.action_id) {
+                            inner.zero_check_persisting = None;
+                        }
+                        let now = inner.now_s();
+                        if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
+                            a.state = "failed".into();
+                            a.code = Some("PERSIST_FAILED".into());
+                            a.message = Some(format!("Failed to persist gripper calibration: {e}"));
+                            a.finished_at = Some(now);
+                        }
+                        return;
+                    }
+                };
+
+                let dir_sync = {
+                    let mut inner = sup_inner.write().await;
+                    let still_persisting = inner.zero_check_persisting == Some(job.action_id);
+                    let action_running = inner.last_action.as_ref().is_some_and(|a| a.id == job.action_id && a.is_running());
+                    let auth_ok = job.operator_auth.as_ref().is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
+                    let lease_ok = match &job.lease_owner {
+                        None => true,
+                        Some((c, g)) => inner.active_lease.as_ref().is_some_and(|l| {
+                            l.acquired_at.elapsed() < inner.lease_timeout && l.client_id == *c && l.generation == *g
+                        }),
+                    };
+                    let rev_ok = inner.gripper_calib_revision == job.base_revision;
+
+                    if !still_persisting || !action_running || !lease_ok {
+                        staged.abort();
+                        if inner.zero_check_persisting == Some(job.action_id) {
+                            inner.zero_check_persisting = None;
+                        }
+                        if action_running {
+                            let now = inner.now_s();
+                            if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
+                                a.state = "cancelled".into();
+                                a.code = Some(if !lease_ok { "LEASE_LOST" } else { "CANCELLED" }.into());
+                                a.message = Some(if !lease_ok {
+                                    "Control lease lost or expired before gripper calibration persisted".into()
+                                } else {
+                                    "Gripper zero check cancelled before calibration persisted".into()
+                                });
+                                a.finished_at = Some(now);
+                            }
+                        }
+                        return;
+                    }
+
+                    if !auth_ok {
+                        staged.abort();
+                        if inner.zero_check_persisting == Some(job.action_id) {
+                            inner.zero_check_persisting = None;
+                        }
+                        let now = inner.now_s();
+                        if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
+                            a.state = "failed".into();
+                            a.code = Some("OPERATOR_REQUIRED".into());
+                            a.message = Some("Operator session expired or locked before gripper calibration persisted".into());
+                            a.finished_at = Some(now);
+                        }
+                        return;
+                    }
+
+                    if !rev_ok {
+                        staged.abort();
+                        if inner.zero_check_persisting == Some(job.action_id) {
+                            inner.zero_check_persisting = None;
+                        }
+                        let now = inner.now_s();
+                        if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
+                            a.state = "failed".into();
+                            a.code = Some("POLICY_REVISION_MISMATCH".into());
+                            a.message = Some("Gripper calibration revision changed concurrently".into());
+                            a.finished_at = Some(now);
+                        }
+                        return;
+                    }
+
+                    // Build complete validated candidate BEFORE atomic rename so memory commit is infallible.
+                    let cand = match inner.build_gripper_calibration_candidate(Some(job.offset_rad), job.jaw_opening.clone()) {
+                        Ok((cand, _)) => cand,
+                        Err(e) => {
+                            staged.abort();
+                            if inner.zero_check_persisting == Some(job.action_id) {
+                                inner.zero_check_persisting = None;
+                            }
+                            let now = inner.now_s();
+                            if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
+                                a.state = "failed".into();
+                                a.code = Some("INVALID_CALIBRATION".into());
+                                a.message = Some(format!("Gripper calibration rejected: {e}"));
+                                a.finished_at = Some(now);
+                            }
+                            return;
+                        }
+                    };
+
+                    // Re-verify operator session & lease (not expired) immediately before atomic rename
+                    // because OperatorAuth or lease timeout can expire during driver limit validation.
+                    let auth_still_ok = job.operator_auth.as_ref().is_none_or(|(a, tok)| !a.is_enforced() || a.is_operator(tok.as_deref()));
+                    let lease_still_ok = match &job.lease_owner {
+                        None => true,
+                        Some((c, g)) => inner.active_lease.as_ref().is_some_and(|l| {
+                            l.acquired_at.elapsed() < inner.lease_timeout && l.client_id == *c && l.generation == *g
+                        }),
+                    };
+                    if !lease_still_ok {
+                        staged.abort();
+                        if inner.zero_check_persisting == Some(job.action_id) {
+                            inner.zero_check_persisting = None;
+                        }
+                        let now = inner.now_s();
+                        if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
+                            a.state = "cancelled".into();
+                            a.code = Some("LEASE_LOST".into());
+                            a.message = Some("Control lease lost or expired before gripper calibration persisted".into());
+                            a.finished_at = Some(now);
+                        }
+                        return;
+                    }
+                    if !auth_still_ok {
+                        staged.abort();
+                        if inner.zero_check_persisting == Some(job.action_id) {
+                            inner.zero_check_persisting = None;
+                        }
+                        let now = inner.now_s();
+                        if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
+                            a.state = "failed".into();
+                            a.code = Some("OPERATOR_REQUIRED".into());
+                            a.message = Some("Operator session expired or locked before gripper calibration persisted".into());
+                            a.finished_at = Some(now);
+                        }
+                        return;
+                    }
+
+                    let dir_sync = match staged.rename_only() {
+                        Ok(ds) => ds,
+                        Err(e) => {
+                            tracing::warn!("Failed to publish gripper calibration after zero_check: {e}");
+                            if inner.zero_check_persisting == Some(job.action_id) {
+                                inner.zero_check_persisting = None;
+                            }
+                            let now = inner.now_s();
+                            if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id && a.is_running()) {
+                                a.state = "failed".into();
+                                a.code = Some("PERSIST_FAILED".into());
+                                a.message = Some(format!("Failed to persist gripper calibration: {e}"));
+                                a.finished_at = Some(now);
+                            }
+                            return;
+                        }
+                    };
+
+                    // Infallible commit after atomic rename; keep zero_check_persisting set while parent dir fsync runs outside lock.
+                    inner.commit_gripper_calibration_candidate(cand);
+                    inner.gripper_calib_revision += 1;
+                    dir_sync
+                };
+
+                let outcome = tokio::task::spawn_blocking(move || dir_sync.sync_parent_dir())
+                    .await
+                    .unwrap_or_else(|e| crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(e.to_string()));
+                let mut inner = sup_inner.write().await;
+                if inner.zero_check_persisting == Some(job.action_id) {
+                    inner.zero_check_persisting = None;
+                }
+                let now = inner.now_s();
+                if let Some(a) = inner.last_action.as_mut().filter(|a| a.id == job.action_id) {
+                    if a.is_running() {
+                        a.state = "done".into();
+                        a.progress = 1.0;
+                        a.finished_at = Some(now);
+                    }
+                    match outcome {
+                        crate::persist::PublishOutcome::Published => {
+                            a.durability_confirmed = Some(true);
+                        }
+                        crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(w) => {
+                            a.durability_confirmed = Some(false);
+                            a.durability_warning = Some(w);
+                        }
+                    }
+                }
+            });
+        }
         // Broadcast observation to any active WebSocket listeners
         let _ = self.telemetry_tx.send(obs.clone());
         let late = !dt.is_finite() || dt > 2.0 / f64::from(control_hz.max(1));

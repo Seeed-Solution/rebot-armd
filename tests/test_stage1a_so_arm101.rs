@@ -35,6 +35,10 @@ fn so_arm101_config() -> ArmConfig {
         })).collect::<Vec<_>>(),
     }));
     o.remove("model_offsets_rad");
+    // the B601-DM link capsules name link6, which this 5-joint chain does not have
+    if let Some(ws) = o.get_mut("workspace").and_then(|w| w.as_object_mut()) {
+        for k in ["link_capsules", "self_collision_enabled", "self_collision_pairs"] { ws.remove(k); }
+    }
     let mut c: ArmConfig = serde_json::from_value(v).unwrap();
     c.dof = 6;
     c.zero_reference = None;
@@ -90,6 +94,10 @@ fn config_6_plus_0() -> ArmConfig {
         })).collect::<Vec<_>>(),
     }));
     o.remove("model_offsets_rad");
+    // the B601-DM link capsules name link6, which this 5-joint chain does not have
+    if let Some(ws) = o.get_mut("workspace").and_then(|w| w.as_object_mut()) {
+        for k in ["link_capsules", "self_collision_enabled", "self_collision_pairs"] { ws.remove(k); }
+    }
     let mut c: ArmConfig = serde_json::from_value(v).unwrap();
     c.dof = 6;
     c.zero_reference = None;

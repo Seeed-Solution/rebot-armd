@@ -414,6 +414,7 @@ async fn test_zero_check_store_offset_limit_rejection_marks_action_failed() {
         store_offset: true,
         threshold_rad: 0.5,
         base_closed_rad: 0.0,
+        operator_auth: None,
     });
     // Measured position 0.4 rad (offset = 0.4 rad <= threshold 0.5 rad, so mechanical check passes)
     inner.measured_positions[6] = 0.4;

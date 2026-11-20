@@ -1,4 +1,5 @@
 {
+  "profile_id": "rebot_b601dm",
   "profile_version": 1,
   "dof": 7,
   "joint_names": [
@@ -176,6 +177,140 @@
         0.0,
         0.0925,
         0.0347
+      ]
+    ],
+    "link_capsules": [
+      {
+        "id": "base_link",
+        "frame": "base_link",
+        "a_m": [
+          0.0,
+          0.0,
+          0.052
+        ],
+        "b_m": [
+          0.0,
+          0.0,
+          0.08
+        ],
+        "radius_m": 0.054
+      },
+      {
+        "id": "base_plate",
+        "frame": "base_link",
+        "a_m": [
+          0.0,
+          -0.05,
+          0.007
+        ],
+        "b_m": [
+          0.0,
+          0.05,
+          0.007
+        ],
+        "radius_m": 0.084
+      },
+      {
+        "id": "link2",
+        "frame": "link2",
+        "a_m": [
+          0.02,
+          0.0,
+          -0.0316
+        ],
+        "b_m": [
+          -0.284,
+          0.0,
+          -0.0316
+        ],
+        "radius_m": 0.05
+      },
+      {
+        "id": "link3",
+        "frame": "link3",
+        "a_m": [
+          -0.015,
+          -0.03,
+          -0.0311
+        ],
+        "b_m": [
+          0.26,
+          -0.03,
+          -0.0311
+        ],
+        "radius_m": 0.071
+      },
+      {
+        "id": "link4",
+        "frame": "link4",
+        "a_m": [
+          -0.015,
+          -0.03,
+          -0.03
+        ],
+        "b_m": [
+          0.105,
+          -0.03,
+          -0.03
+        ],
+        "radius_m": 0.072
+      },
+      {
+        "id": "link5",
+        "frame": "link5",
+        "a_m": [
+          -0.0028,
+          0.0,
+          0.005
+        ],
+        "b_m": [
+          -0.0028,
+          0.0,
+          0.066
+        ],
+        "radius_m": 0.057
+      },
+      {
+        "id": "link6",
+        "frame": "link6",
+        "a_m": [
+          0.0,
+          0.0,
+          0.008
+        ],
+        "b_m": [
+          0.0,
+          0.0,
+          0.04
+        ],
+        "radius_m": 0.052
+      }
+    ],
+    "self_collision_enabled": true,
+    "self_collision_pairs": [
+      [
+        "base_link",
+        "link4"
+      ],
+      [
+        "base_link",
+        "link5"
+      ],
+      [
+        "base_link",
+        "link6"
+      ],
+      [
+        "base_plate",
+        "link4"
+      ],
+      [
+        "base_plate",
+        "link5"
+      ],
+      [
+        "base_plate",
+        "link6"
       ]
     ]
   },

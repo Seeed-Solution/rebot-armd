@@ -170,6 +170,7 @@ impl SupervisorInner {
                 "enabled": self.collision.enabled,
                 "sensitivity": self.collision.sensitivity,
                 "source": if self.collision.runtime { "runtime" } else { "profile" },
+                "calibrated": false,
                 "thresholds_nm": self.collision_thresholds(),
                 "persist_ticks": p.persist_ticks,
                 "lease_required": false,
@@ -235,13 +236,35 @@ impl SupervisorInner {
         }
 
         let cap = c.speed_cap;
-        let workspace = self.workspace_policy().map(|(ws, _)| json!({
-            "floor_z_m": ws.floor_z_m,
-            "box_min_m": ws.box_min_m,
-            "box_max_m": ws.box_max_m,
-            "max_reach_m": ws.max_reach_m,
-            "check_points_end_m": ws.check_points_end_m,
-        }));
+        let kinematics_configured = c.kinematics.is_some();
+        let workspace_configured = c.workspace.is_some();
+        let workspace_policy = self.workspace_policy();
+        let workspace_active = workspace_policy.is_some();
+        let geometry_coverage = match workspace_policy {
+            Some((ws, _)) if !ws.link_capsules.is_empty() => "end_and_links",
+            Some(_) => "end_only",
+            None => "none",
+        };
+        let camera_mount_covered = workspace_active && c.camera_mount.offset_m.is_some();
+        let self_collision_covered = workspace_policy.is_some_and(|(ws, _)| ws.self_collision_covered());
+        let workspace = workspace_policy.map(|(ws, cam)| {
+            let sc_covered = ws.self_collision_covered();
+            let active_pairs: &[[String; 2]] = if sc_covered { &ws.self_collision_pairs } else { &[] };
+            json!({
+                "floor_z_m": ws.floor_z_m,
+                "box_min_m": ws.box_min_m,
+                "box_max_m": ws.box_max_m,
+                "max_reach_m": ws.max_reach_m,
+                "check_points_end_m": ws.check_points_end_m,
+                "kinematics_configured": kinematics_configured,
+                "workspace_configured": workspace_configured,
+                "geometry_coverage": geometry_coverage,
+                "camera_mount_covered": cam.offset_m.is_some(),
+                "self_collision_covered": sc_covered,
+                "self_collision_pairs": active_pairs,
+                "self_collision_min_clearance_m": ws.self_collision_min_clearance_m,
+            })
+        });
         let keepout = self.keepout_state();
         let hw = c.hardware.clone().unwrap_or_default();
         let notes = hw.notes.clone().unwrap_or_else(|| {
@@ -254,6 +277,7 @@ impl SupervisorInner {
         let hardware = json!({
             "physical_estop": hw.physical_estop,
             "torque_off_on_fault": false,
+            "operator_auth_enforced": self.operator_auth_enforced,
             "notes": notes,
         });
 
@@ -286,6 +310,11 @@ impl SupervisorInner {
                 "planned_max_velocity": c.planned_max_velocity,
                 "servo_max_velocity": c.servo_max_velocity,
                 "workspace": workspace,
+                "kinematics_configured": kinematics_configured,
+                "workspace_configured": workspace_configured,
+                "geometry_coverage": geometry_coverage,
+                "camera_mount_covered": camera_mount_covered,
+                "self_collision_covered": self_collision_covered,
                 "keepout_boxes": keepout.boxes,
                 "keepout_source": keepout.source,
                 "keepout_rule": "boxes in force = profile boxes + runtime boxes (each tagged with its source); the runtime list cannot remove a profile box",

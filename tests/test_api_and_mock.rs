@@ -9,7 +9,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use armd::{
     create_router, ArmConfig, ArmObservation, ArmSupervisor, JointLimit, ObservationSchema,
-    SafetyState,
+    OperatorAuth, SafetyState,
 };
 use armd::api::rest::{
     JogRequest, RecordActionResponse, SafetyResponse, ServoRequest, StartRecordRequest,
@@ -27,7 +27,7 @@ async fn spawn_test_server() -> (SocketAddr, Arc<ArmSupervisor>) {
     config.lease_timeout_ms = 1000;
 
     let supervisor = Arc::new(ArmSupervisor::new(config));
-    let router = create_router(supervisor.clone());
+    let router = create_router(supervisor.clone(), OperatorAuth::disabled());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

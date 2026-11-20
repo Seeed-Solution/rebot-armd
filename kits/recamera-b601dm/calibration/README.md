@@ -23,9 +23,10 @@ axis toward the jaws (image down) ([docs/agent_action_api.md](../../../docs/agen
 
 The v7 values apply the sign convention above to the CAD pitch; the sign and the value on a
 mounted camera are listed as "needs verification" in docs/agent_action_api.md. `rot_deg` is
-0 for all mounts: with v5 on the real arm the image was upright
-(`hardware/v7_tilt/README.txt`). `offset_m` is not set (null): the CAD gives a lens position
-in the MJCF `gripper_end` frame (`hardware/v7_tilt/README.txt` section 2.3), which has not
+0 for all mounts: with v5 on the real arm the image was upright (documented in upstream
+`Seeed-Projects/reBot-DevArm`, `hardware/camera-mounts/recamera-mounts/`; see also
+[../hardware/](../hardware/README.md)). `offset_m` is not set (null): the CAD gives a lens
+position in the MJCF `gripper_end` frame (upstream `reBot-DevArm` design notes), which has not
 been converted to the end_link frame armd uses or checked on the arm.
 
 To use a v7 mount, set `camera_tilt_deg` in the cockpit grasp settings (it also sets

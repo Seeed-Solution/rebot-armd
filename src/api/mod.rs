@@ -54,21 +54,39 @@ async fn serve_calib_wizard() -> impl axum::response::IntoResponse {
     )
 }
 
-/// Build the Axum router for the arm daemon. The detector control API upstream is
-/// `ARMD_DETECTOR_URL` (default `http://127.0.0.1:8090`).
-pub fn create_router(supervisor: Arc<ArmSupervisor>) -> Router {
-    create_router_with_detector(supervisor, proxy::DetectorUpstream::from_env())
+/// Build the Axum router for the arm daemon with explicit [`crate::auth::OperatorAuth`].
+/// The detector control API upstream is `ARMD_DETECTOR_URL` (default `http://127.0.0.1:8090`).
+pub fn create_router(supervisor: Arc<ArmSupervisor>, auth: crate::auth::OperatorAuth) -> Router {
+    create_router_with_auth(supervisor, auth)
+}
+
+/// Alias for [`create_router`] with explicit [`crate::auth::OperatorAuth`].
+pub fn create_router_with_auth(supervisor: Arc<ArmSupervisor>, auth: crate::auth::OperatorAuth) -> Router {
+    let detector = proxy::DetectorUpstream::from_env();
+    let grasp = crate::grasp::GraspDeps::http(detector.clone(), Some(crate::grasp::setup_path_from_env()));
+    let diagnostics = crate::diagnostics::DiagnosticsState::global();
+    let calibration = crate::calibration::CalibrationDeps::from_env(grasp.setup_path.clone(), detector.clone());
+    create_router_calibration_with_auth(supervisor, detector, grasp, diagnostics, calibration, auth)
 }
 
 /// [`create_router`] with an explicit detector control API upstream.
-pub fn create_router_with_detector(supervisor: Arc<ArmSupervisor>, detector: proxy::DetectorUpstream) -> Router {
+pub fn create_router_with_detector(
+    supervisor: Arc<ArmSupervisor>,
+    detector: proxy::DetectorUpstream,
+    auth: crate::auth::OperatorAuth,
+) -> Router {
     let grasp = crate::grasp::GraspDeps::http(detector.clone(), Some(crate::grasp::setup_path_from_env()));
-    create_router_with(supervisor, detector, grasp)
+    create_router_with(supervisor, detector, grasp, auth)
 }
 
 /// [`create_router_with_detector`] with explicit grasp dependencies (detection source, setup file).
-pub fn create_router_with(supervisor: Arc<ArmSupervisor>, detector: proxy::DetectorUpstream, grasp: crate::grasp::GraspDeps) -> Router {
-    create_router_full(supervisor, detector, grasp, crate::diagnostics::DiagnosticsState::global())
+pub fn create_router_with(
+    supervisor: Arc<ArmSupervisor>,
+    detector: proxy::DetectorUpstream,
+    grasp: crate::grasp::GraspDeps,
+    auth: crate::auth::OperatorAuth,
+) -> Router {
+    create_router_full(supervisor, detector, grasp, crate::diagnostics::DiagnosticsState::global(), auth)
 }
 
 /// [`create_router_with`] with explicit diagnostics files (`/api/v1/diagnostics/*`).
@@ -77,9 +95,10 @@ pub fn create_router_full(
     detector: proxy::DetectorUpstream,
     grasp: crate::grasp::GraspDeps,
     diagnostics: crate::diagnostics::DiagnosticsState,
+    auth: crate::auth::OperatorAuth,
 ) -> Router {
     let calibration = crate::calibration::CalibrationDeps::from_env(grasp.setup_path.clone(), detector.clone());
-    create_router_calibration(supervisor, detector, grasp, diagnostics, calibration)
+    create_router_calibration(supervisor, detector, grasp, diagnostics, calibration, auth)
 }
 
 /// [`create_router_full`] with explicit calibration files (`/api/v1/calibration*`).
@@ -89,8 +108,31 @@ pub fn create_router_calibration(
     grasp: crate::grasp::GraspDeps,
     diagnostics: crate::diagnostics::DiagnosticsState,
     calibration: crate::calibration::CalibrationDeps,
+    auth: crate::auth::OperatorAuth,
+) -> Router {
+    create_router_calibration_with_auth(
+        supervisor,
+        detector,
+        grasp,
+        diagnostics,
+        calibration,
+        auth,
+    )
+}
+
+/// [`create_router_calibration`] with explicit [`crate::auth::OperatorAuth`].
+pub fn create_router_calibration_with_auth(
+    supervisor: Arc<ArmSupervisor>,
+    detector: proxy::DetectorUpstream,
+    grasp: crate::grasp::GraspDeps,
+    diagnostics: crate::diagnostics::DiagnosticsState,
+    calibration: crate::calibration::CalibrationDeps,
+    auth: crate::auth::OperatorAuth,
 ) -> Router {
     Router::new()
+        .route("/api/v1/auth/status", get(rest::auth_status))
+        .route("/api/v1/auth/unlock", post(rest::auth_unlock))
+        .route("/api/v1/auth/lock", post(rest::auth_lock))
         .route("/api/v1/calibration", get(rest::get_calibration))
         .route(
             "/api/v1/calibration/sessions",
@@ -113,7 +155,8 @@ pub fn create_router_calibration(
             "/api/v1/sandbox/scenes",
             post(sandbox::upload_scene)
                 .layer(DefaultBodyLimit::max(sandbox::max_upload_body_bytes()))
-                .layer(middleware::from_fn(sandbox::upload_concurrency_middleware)),
+                .layer(middleware::from_fn(sandbox::upload_concurrency_middleware))
+                .layer(middleware::from_fn(require_operator)),
         )
         .route("/api/v1/sandbox/scenes/{id}", get(sandbox::get_scene))
         .route("/api/v1/sandbox/scenes/{id}/files/{*path}", get(sandbox::serve_scene_file))
@@ -121,7 +164,8 @@ pub fn create_router_calibration(
             "/api/v1/sandbox/tools",
             post(sandbox::upload_tool)
                 .layer(DefaultBodyLimit::max(sandbox::max_upload_body_bytes()))
-                .layer(middleware::from_fn(sandbox::upload_concurrency_middleware)),
+                .layer(middleware::from_fn(sandbox::upload_concurrency_middleware))
+                .layer(middleware::from_fn(require_operator)),
         )
         .route("/api/v1/sandbox/tools/{id}", get(sandbox::get_tool))
         .route("/api/v1/sandbox/tools/{id}/files/{*path}", get(sandbox::serve_tool_file))
@@ -129,16 +173,17 @@ pub fn create_router_calibration(
             "/api/v1/sandbox/policies",
             post(sandbox::upload_policy)
                 .layer(DefaultBodyLimit::max(sandbox::max_upload_body_bytes()))
-                .layer(middleware::from_fn(sandbox::upload_concurrency_middleware)),
+                .layer(middleware::from_fn(sandbox::upload_concurrency_middleware))
+                .layer(middleware::from_fn(require_operator)),
         )
         .route("/api/v1/sandbox/policies/{id}", get(sandbox::get_policy))
         .route("/api/v1/sandbox/policies/{id}/files/{*path}", get(sandbox::serve_policy_file))
-        .route("/api/v1/sandbox/activate", post(sandbox::activate))
+        .route("/api/v1/sandbox/activate", post(sandbox::activate).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/sandbox/bundle", get(sandbox::get_bundle))
         .route("/api/v1/sandbox/state", get(sandbox::get_state))
-        .route("/api/v1/sandbox/reset", post(sandbox::reset))
-        .route("/api/v1/sandbox/io", post(sandbox::set_io))
-        .route("/api/v1/sandbox/telemetry", post(sandbox::post_telemetry))
+        .route("/api/v1/sandbox/reset", post(sandbox::reset).layer(middleware::from_fn(require_operator)))
+        .route("/api/v1/sandbox/io", post(sandbox::set_io).layer(middleware::from_fn(require_operator)))
+        .route("/api/v1/sandbox/telemetry", post(sandbox::post_telemetry).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/observation", get(rest::get_observation))
         .route("/api/v1/observation/schema", get(rest::get_observation_schema))
         .route("/api/v1/torque", post(rest::set_torque))
@@ -166,11 +211,11 @@ pub fn create_router_calibration(
         .route("/api/v1/poses", get(rest::get_poses))
         .route("/api/v1/safety/e_stop", post(rest::safety_e_stop))
         .route("/api/v1/safety/clear_fault", post(rest::safety_clear_fault))
-        .route("/api/v1/dataset/record/start", post(rest::dataset_record_start))
-        .route("/api/v1/dataset/record/save", post(rest::dataset_record_save))
-        .route("/api/v1/dataset/record/discard", post(rest::dataset_record_discard))
+        .route("/api/v1/dataset/record/start", post(rest::dataset_record_start).layer(middleware::from_fn(require_operator)))
+        .route("/api/v1/dataset/record/save", post(rest::dataset_record_save).layer(middleware::from_fn(require_operator)))
+        .route("/api/v1/dataset/record/discard", post(rest::dataset_record_discard).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/dataset/episodes", get(rest::dataset_episodes))
-        .route("/api/v1/dataset/episodes/{id}", axum::routing::delete(rest::dataset_episode_delete))
+        .route("/api/v1/dataset/episodes/{id}", axum::routing::delete(rest::dataset_episode_delete).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/episodes", get(rest::get_episodes))
         .route("/api/v1/episodes/import", post(rest::episodes_import).layer(DefaultBodyLimit::max(IMPORT_BODY_LIMIT)))
         .route("/api/v1/episodes/{id}", get(rest::get_episode))
@@ -189,18 +234,27 @@ pub fn create_router_calibration(
         .route("/results", get(proxy::proxy_detection_ws))
         .route(
             "/api/v1/detection/inference",
-            get(proxy::get_detection_inference).post(proxy::post_detection_inference),
+            get(proxy::get_detection_inference)
+                .post(proxy::post_detection_inference)
+                .layer(middleware::from_fn(require_operator_for_writes)),
         )
         .route("/api/v1/detection/latest", get(proxy::get_detection_latest))
-        .route("/api/v1/detection/trigger", post(proxy::post_detection_trigger))
+        .route("/api/v1/detection/trigger", post(proxy::post_detection_trigger).layer(middleware::from_fn(require_operator)))
         .route(
             "/api/v1/detection/mask_focus",
-            get(proxy::get_detection_mask_focus).post(proxy::post_detection_mask_focus),
+            get(proxy::get_detection_mask_focus)
+                .post(proxy::post_detection_mask_focus)
+                .layer(middleware::from_fn(require_operator_for_writes)),
         )
-        .route("/api/v1/vision/mode", get(proxy::get_vision_mode).post(proxy::post_vision_mode))
-        .route("/api/v1/vision/subscribe", post(proxy::post_vision_subscribe))
-        .route("/api/v1/vision/subscribe/{id}", axum::routing::delete(proxy::delete_vision_subscribe))
-        .route("/api/v1/vision/subscribe/{id}/keepalive", post(proxy::post_vision_keepalive))
+        .route(
+            "/api/v1/vision/mode",
+            get(proxy::get_vision_mode)
+                .post(proxy::post_vision_mode)
+                .layer(middleware::from_fn(require_operator_for_writes)),
+        )
+        .route("/api/v1/vision/subscribe", post(proxy::post_vision_subscribe).layer(middleware::from_fn(require_operator)))
+        .route("/api/v1/vision/subscribe/{id}", axum::routing::delete(proxy::delete_vision_subscribe).layer(middleware::from_fn(require_operator)))
+        .route("/api/v1/vision/subscribe/{id}/keepalive", post(proxy::post_vision_keepalive).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/vision/subscriptions", get(proxy::get_vision_subscriptions))
         .layer(axum::Extension(detector))
         .layer(axum::Extension(proxy::VisionCache::default()))
@@ -208,9 +262,46 @@ pub fn create_router_calibration(
         .layer(axum::Extension(calibration))
         .layer(axum::Extension(diagnostics))
         .layer(axum::Extension(sandbox::SandboxState::new_shared()))
+        .layer(axum::Extension(auth))
         .layer(middleware::from_fn(same_origin))
         .layer(TraceLayer::new_for_http())
         .with_state(supervisor)
+}
+
+async fn require_operator(
+    axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if auth.is_enforced() {
+        let token = crate::auth::OperatorAuth::extract_token(request.headers());
+        if !auth.is_operator(token.as_deref()) {
+            return axum::response::IntoResponse::into_response(
+                rest::ApiError::operator_required(request.uri().path()),
+            );
+        }
+    }
+    next.run(request).await
+}
+
+async fn require_operator_for_writes(
+    axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let is_read = matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    );
+    if !is_read && auth.is_enforced() {
+        let token = crate::auth::OperatorAuth::extract_token(request.headers());
+        if !auth.is_operator(token.as_deref()) {
+            return axum::response::IntoResponse::into_response(
+                rest::ApiError::operator_required(request.uri().path()),
+            );
+        }
+    }
+    next.run(request).await
 }
 
 // Browser origin protection is not network authentication. Non-browser clients

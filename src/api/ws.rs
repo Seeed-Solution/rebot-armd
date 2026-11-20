@@ -35,8 +35,10 @@ async fn test_ack_stamp_delay() {
 /// 1..control_frequency_hz). Absent: every tick. Control replies are never decimated.
 pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSupervisor>>,
                         axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+                        headers: axum::http::HeaderMap,
                         axum::Extension(deps): axum::Extension<crate::grasp::GraspDeps>,
-                        axum::Extension(calib): axum::Extension<crate::calibration::CalibrationDeps>) -> axum::response::Response {
+                        axum::Extension(calib): axum::Extension<crate::calibration::CalibrationDeps>,
+                        axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>) -> axum::response::Response {
     let control_hz = supervisor.inner().read().await.config.control_frequency_hz.max(1);
     let obs_rate = match query.get("obs_hz") {
         None => None,
@@ -45,7 +47,8 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSu
             Err(_) => return (StatusCode::BAD_REQUEST, "obs_hz must be an integer >= 0 (0 and 1 mean 1 Hz; values above control_frequency_hz are clamped)").into_response(),
         },
     };
-    ws.on_upgrade(move |socket| handle_socket(socket, supervisor, deps, calib, obs_rate)).into_response()
+    let ws_token = crate::auth::OperatorAuth::extract_token(&headers);
+    ws.on_upgrade(move |socket| handle_socket(socket, supervisor, deps, calib, obs_rate, auth, ws_token)).into_response()
 }
 
 /// Per-connection observation rate limit.
@@ -65,10 +68,19 @@ fn invalid_command(message: &str) -> ApiError {
 }
 
 fn rejection(error: ApiError, kind: &str, epoch: u64) -> Value {
-    let mut reply = json!({"type":kind, "status":error.status.as_u16(), "code":error.code,
+    let mut v = json!({"type":kind, "status":error.status.as_u16(), "code":error.code,
         "error":error.error, "message":error.message, "safety_state":error.safety_state, "epoch_id":epoch});
-    if let Some(Value::Object(m)) = error.details.map(|d| *d) { for (k, v) in m { reply[k] = v; } }
-    reply
+    if let Some(rev) = error.current_revision {
+        v["current_revision"] = json!(rev);
+    }
+    if let Some(d) = error.workspace_violation {
+        if let Some(c) = d.constraint_id { v["constraint_id"] = json!(c); }
+        if let Some(g) = d.geometry_id { v["geometry_id"] = json!(g); }
+        if let Some(p) = d.violation_phase { v["violation_phase"] = json!(p); }
+        if let Some(r) = d.reason { v["reason"] = json!(r); }
+    }
+    if let Some(Value::Object(m)) = error.details.map(|d| *d) { for (k, val) in m { v[k] = val; } }
+    v
 }
 
 fn positions(value: Option<&Value>) -> Result<Vec<f32>, ApiError> {
@@ -243,7 +255,15 @@ fn cancelled_reply(value: &Value, code: &str, epoch: u64) -> Option<Value> {
 }
 
 // Under the write lock, after lease / epoch / request_id checks.
-fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: u64, request_id: &Value) -> Result<ActionStart, ApiError> {
+fn prepare_action(
+    inner: &mut SupervisorInner,
+    path: &str,
+    body: &Value,
+    epoch: u64,
+    request_id: &Value,
+    auth: &crate::auth::OperatorAuth,
+    ws_token: Option<&str>,
+) -> Result<ActionStart, ApiError> {
     if !body.is_object() { return Err(invalid_command("Command body must be an object")); }
     let (kind, parsed) = match path {
         "/api/v1/action/move_to" => ("move_to", motion::parse_move_to(body)),
@@ -254,7 +274,11 @@ fn prepare_action(inner: &mut SupervisorInner, path: &str, body: &Value, epoch: 
             return Ok(ActionStart::Started(id, duration));
         }
         "/api/v1/action/gripper_zero_check" => {
-            let (id, duration) = inner.start_gripper_zero_check(body, epoch)?;
+            let (id, duration) = inner.start_gripper_zero_check_with_auth(
+                body,
+                epoch,
+                Some((auth.clone(), ws_token.map(str::to_string))),
+            )?;
             return Ok(ActionStart::Started(id, duration));
         }
         "/api/v1/action/grasp" => {
@@ -296,35 +320,233 @@ fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) ->
     ack
 }
 
-/// Ack fields and the state-file write of a state-changing command.
-type StateReply = (Vec<(&'static str, Value)>, Option<crate::persist::PendingWrite>);
+/// Atomic persist-before-commit config write (Step 1 prepared under lock, Step 2 staged to
+/// disk without lock under `config_write_lock`, Step 3 prechecked + published + committed under lock).
+enum PreparedConfigWrite {
+    Keepout(crate::keepout::PreparedKeepout),
+    Collision(crate::collision::PreparedCollision),
+    GripperCalib(crate::gripper_calib::PreparedGripperCalib),
+    PosesSave(crate::poses::PreparedPosesSave),
+    PosesDelete(crate::poses::PreparedPosesDelete),
+    PosesRename(crate::poses::PreparedPosesSave),
+    Sequences(crate::sequences::PreparedSequences),
+    GraspSetup(crate::grasp::PreparedGraspSetup),
+}
 
-/// Commands that change persisted state (grasp setup, poses, collision setting, keep-out
-/// boxes). None for any other path.
-fn state_command(inner: &mut SupervisorInner, path: &str, body: &Value, setup_path: Option<&std::path::PathBuf>) -> Option<Result<StateReply, ArmError>> {
-    Some(match path {
-        "/api/v1/grasp/setup" => crate::grasp::update_setup(inner, body).map(|setup| {
-            let write = setup_path.cloned().map(|p| crate::persist::PendingWrite::new(p, serde_json::to_string_pretty(&setup).unwrap_or_default()));
-            (vec![("setup", json!(setup))], write)
-        }),
-        "/api/v1/poses/save" => crate::poses::save(inner, body).map(|(pose, write)| (vec![("pose", json!(pose))], write)),
-        "/api/v1/poses/rename" => crate::poses::rename(inner, body).map(|(pose, write)| (vec![("pose", json!(pose))], write)),
-        "/api/v1/poses/delete" => crate::poses::delete(inner, body).map(|write| (vec![], write)),
-        "/api/v1/sequences/save" => crate::sequences::save(inner, body).map(|(seq, write)| (vec![("sequence", json!(seq))], write)),
-        "/api/v1/sequences/delete" => crate::sequences::delete(inner, body).map(|write| (vec![], write)),
-        "/api/v1/safety/collision" => crate::collision::update(inner, body).map(|(config, write)| (vec![("collision", json!(config))], write)),
-        "/api/v1/workspace/keepout" => crate::keepout::update(inner, body)
-            .map(|(state, write)| (vec![("boxes", json!(state.boxes)), ("source", json!(state.source))], write)),
-        "/api/v1/gripper/calibration" => crate::gripper_calib::update(inner, body).map(|(policy, write)| {
-            (vec![
-                ("policy", json!(policy)),
-                ("closed_rad", json!(policy.closed_rad)),
-                ("open_rad", json!(policy.open_rad)),
-                ("jaw_opening", json!(policy.jaw_opening)),
-            ], write)
-        }),
-        _ => return None,
-    })
+impl PreparedConfigWrite {
+    fn prepare(
+        inner: &mut SupervisorInner,
+        path: &str,
+        body: &Value,
+        setup_path: Option<&std::path::PathBuf>,
+        require_expected_revision: bool,
+    ) -> Option<Result<Self, ArmError>> {
+        Some(match path {
+            "/api/v1/workspace/keepout" => crate::keepout::prepare_update_with(inner, body, require_expected_revision).map(Self::Keepout),
+            "/api/v1/safety/collision" => crate::collision::prepare_update_with(inner, body, require_expected_revision).map(Self::Collision),
+            "/api/v1/gripper/calibration" => crate::gripper_calib::prepare_update_with(inner, body, require_expected_revision).map(Self::GripperCalib),
+            "/api/v1/poses/save" => crate::poses::prepare_save_with(inner, body, require_expected_revision).map(Self::PosesSave),
+            "/api/v1/poses/delete" => crate::poses::prepare_delete_with(inner, body, require_expected_revision).map(Self::PosesDelete),
+            "/api/v1/poses/rename" => crate::poses::prepare_rename_with(inner, body, require_expected_revision).map(Self::PosesRename),
+            "/api/v1/sequences/save" => crate::sequences::prepare_save(inner, body).map(Self::Sequences),
+            "/api/v1/sequences/delete" => crate::sequences::prepare_delete(inner, body).map(Self::Sequences),
+            "/api/v1/grasp/setup" => crate::grasp::prepare_setup_update(inner, body, setup_path, require_expected_revision).map(Self::GraspSetup),
+            _ => return None,
+        })
+    }
+
+    fn path(&self) -> &'static str {
+        match self {
+            Self::Keepout(_) => "/api/v1/workspace/keepout",
+            Self::Collision(_) => "/api/v1/safety/collision",
+            Self::GripperCalib(_) => "/api/v1/gripper/calibration",
+            Self::PosesSave(_) => "/api/v1/poses/save",
+            Self::PosesDelete(_) => "/api/v1/poses/delete",
+            Self::PosesRename(_) => "/api/v1/poses/rename",
+            Self::Sequences(p) => if p.sequence.is_some() { "/api/v1/sequences/save" } else { "/api/v1/sequences/delete" },
+            Self::GraspSetup(_) => "/api/v1/grasp/setup",
+        }
+    }
+
+    fn has_write(&self) -> bool {
+        match self {
+            Self::Keepout(p) => p.write.is_some(),
+            Self::Collision(p) => p.write.is_some(),
+            Self::GripperCalib(p) => p.write.is_some(),
+            Self::PosesSave(p) => p.write.is_some(),
+            Self::PosesDelete(p) => p.write.is_some(),
+            Self::PosesRename(p) => p.write.is_some(),
+            Self::Sequences(p) => p.write.is_some(),
+            Self::GraspSetup(p) => p.write.is_some(),
+        }
+    }
+
+    fn take_write(&mut self) -> Option<crate::persist::PendingWrite> {
+        match self {
+            Self::Keepout(p) => p.write.take(),
+            Self::Collision(p) => p.write.take(),
+            Self::GripperCalib(p) => p.write.take(),
+            Self::PosesSave(p) => p.write.take(),
+            Self::PosesDelete(p) => p.write.take(),
+            Self::PosesRename(p) => p.write.take(),
+            Self::Sequences(p) => p.write.take(),
+            Self::GraspSetup(p) => p.write.take(),
+        }
+    }
+
+    fn precheck(&mut self, inner: &mut SupervisorInner) -> Option<ArmError> {
+        match self {
+            Self::Keepout(p) => {
+                if inner.keepout.revision != p.base_revision {
+                    return Some(ArmError::PolicyRevisionMismatch { expected: p.base_revision, current: inner.keepout.revision });
+                }
+                if inner.calibration_busy {
+                    return Some(ArmError::Rejected { status: 409, code: "CONFIG_BUSY".into(), message: "a camera calibration apply or restore is running".into() });
+                }
+                if inner.workspace_policy().is_none() {
+                    return Some(crate::motion::MotionError::Unsupported(
+                        "Keep-out boxes need a profile with kinematics and a workspace".into(),
+                    ).into());
+                }
+                if let Some(reason) = inner.workspace_change_blocker() {
+                    return Some(crate::motion::MotionError::MotionBusy(format!("keep-out boxes cannot change while {reason}")).into());
+                }
+                None
+            }
+            Self::Collision(p) => {
+                if inner.collision.revision != p.base_revision {
+                    return Some(ArmError::PolicyRevisionMismatch { expected: p.base_revision, current: inner.collision.revision });
+                }
+                if inner.calibration_busy {
+                    return Some(ArmError::Rejected { status: 409, code: "CONFIG_BUSY".into(), message: "a camera calibration apply or restore is running".into() });
+                }
+                if p.enabled == Some(true) && !inner.collision_available() {
+                    return Some(crate::motion::MotionError::Unsupported(
+                        "The collision guard needs a profile gravity model and a driver that reports torque".into(),
+                    ).into());
+                }
+                None
+            }
+            Self::GripperCalib(ref mut p) => crate::gripper_calib::precheck_update(inner, p).err(),
+            Self::PosesSave(p) => crate::poses::precheck_save(inner, p).err(),
+            Self::PosesDelete(p) => crate::poses::precheck_delete(inner, p).err(),
+            Self::PosesRename(p) => crate::poses::precheck_save(inner, p).err(),
+            Self::Sequences(p) => crate::sequences::precheck(inner, p).err(),
+            Self::GraspSetup(p) => crate::grasp::precheck_setup_update(inner, p).err(),
+        }
+    }
+
+    fn commit(self, inner: &mut SupervisorInner) -> Result<Vec<(&'static str, Value)>, ArmError> {
+        match self {
+            Self::Keepout(p) => {
+                let state = crate::keepout::commit_update(inner, p)?;
+                Ok(vec![
+                    ("boxes", json!(state.boxes)),
+                    ("source", json!(state.source)),
+                    ("revision", json!(state.revision)),
+                ])
+            }
+            Self::Collision(p) => {
+                let cfg = crate::collision::commit_update(inner, p)?;
+                Ok(vec![
+                    ("collision", json!(cfg)),
+                    ("revision", json!(cfg.revision)),
+                ])
+            }
+            Self::GripperCalib(p) => {
+                let (policy, revision) = crate::gripper_calib::commit_update(inner, p)?;
+                Ok(vec![
+                    ("policy", json!(policy)),
+                    ("closed_rad", json!(policy.closed_rad)),
+                    ("open_rad", json!(policy.open_rad)),
+                    ("jaw_opening", json!(policy.jaw_opening)),
+                    ("revision", json!(revision)),
+                ])
+            }
+            Self::PosesSave(p) => {
+                let (pose, revision) = crate::poses::commit_save(inner, p)?;
+                Ok(vec![
+                    ("pose", json!(pose)),
+                    ("revision", json!(revision)),
+                ])
+            }
+            Self::PosesDelete(p) => {
+                let revision = crate::poses::commit_delete(inner, p)?;
+                Ok(vec![
+                    ("revision", json!(revision)),
+                ])
+            }
+            Self::PosesRename(p) => {
+                let (pose, revision) = crate::poses::commit_save(inner, p)?;
+                Ok(vec![
+                    ("pose", json!(pose)),
+                    ("revision", json!(revision)),
+                ])
+            }
+            Self::Sequences(p) => {
+                let (seq, revision) = crate::sequences::commit(inner, p)?;
+                let mut fields = vec![("revision", json!(revision))];
+                if let Some(seq) = seq { fields.push(("sequence", json!(seq))); }
+                Ok(fields)
+            }
+            Self::GraspSetup(p) => {
+                let (setup, revision) = crate::grasp::commit_setup_update(inner, p)?;
+                Ok(vec![
+                    ("setup", json!(setup)),
+                    ("revision", json!(revision)),
+                ])
+            }
+        }
+    }
+}
+
+/// Check privileged-operations authorization under the supervisor write lock.
+/// Returns `Some(ApiError)` if rejected, `None` if allowed.
+fn check_operator_privilege(
+    auth: &crate::auth::OperatorAuth,
+    ws_token: Option<&str>,
+    inner: &mut SupervisorInner,
+    path: &str,
+    body: &Value,
+    epoch: u64,
+) -> Option<ApiError> {
+    if !auth.is_enforced() || auth.is_operator(ws_token) {
+        return None;
+    }
+    match path {
+        "/api/v1/workspace/keepout"
+        | "/api/v1/safety/collision"
+        | "/api/v1/mode/gravity_comp"
+        | "/api/v1/gripper/calibration"
+        | "/api/v1/calibration/apply"
+        | "/api/v1/calibration/restore"
+        | "/api/v1/poses/save"
+        | "/api/v1/poses/delete"
+        | "/api/v1/grasp/setup" => Some(ApiError::operator_required(path)),
+        "/api/v1/action/gripper_zero_check"
+            if body.get("store_offset").and_then(Value::as_bool) == Some(true) =>
+        {
+            Some(ApiError::operator_required("gripper_zero_check (store_offset=true)"))
+        }
+        "/api/v1/safety/clear_fault" => {
+            if inner.consume_pending_estop() && inner.safety.epoch_id() != epoch {
+                return Some(ArmError::Safety(SafetyError::EpochMismatch {
+                    expected: inner.safety.epoch_id(),
+                    received: epoch,
+                }).into());
+            }
+            if inner.e_stop_latched.load(Ordering::SeqCst) {
+                return Some(ApiError::operator_required("clear_fault (EStop latched)"));
+            }
+            if let Some(fault) = inner.safety.fault() {
+                if !fault.recoverable || fault.code == crate::safety::FaultCode::Collision {
+                    return Some(ApiError::operator_required("clear_fault (non-recoverable fault or EStop)"));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// A calibration command checked under the lock.
@@ -398,7 +620,7 @@ fn command_reject(inner: &SupervisorInner, request_id: &Value, error: ApiError) 
     reply
 }
 
-async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: crate::grasp::GraspDeps, calib: crate::calibration::CalibrationDeps, obs_rate: Option<ObsRate>) {
+async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: crate::grasp::GraspDeps, calib: crate::calibration::CalibrationDeps, obs_rate: Option<ObsRate>, auth: crate::auth::OperatorAuth, ws_token: Option<String>) {
     let (mut sender, mut receiver) = socket.split();
     let mut telemetry = supervisor.subscribe_telemetry();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(64);
@@ -559,7 +781,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             let mut pending_macro: Option<(Value, PendingMacro, u64)> = None;
             let mut pending_replay: Option<(Value, crate::replay::ReplayInput, u64)> = None;
             let mut pending_dry_run_grasp: Option<(Value, Value)> = None;
-            let mut pending_write: Option<crate::persist::PendingWrite> = None;
+            let mut pending_config_write: Option<(Value, PreparedConfigWrite, u64, u64)> = None;
             let mut pending_calibration: Option<(Value, CalibJob, u64, u64, bool)> = None;
             if kind == "estop" || kind == "e_stop" {
                 let (state, epoch) = recv_supervisor.trigger_e_stop().await;
@@ -591,28 +813,40 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 _ => {
                                     let force = force_val.and_then(Value::as_bool).unwrap_or(false);
                                     if force {
-                                        match inner.preempt_lease(&recv_connection, label) {
-                                            Ok((generation, evicted)) => {
-                                                let previous = recv_generation.swap(generation, Ordering::SeqCst);
-                                                client_label = Some(label.to_owned());
-                                                if previous != generation { last_sequence = None; }
-                                                let mut reply = json!({
-                                                    "type": "lease_granted",
-                                                    "client_id": label,
-                                                    "generation": generation
-                                                });
-                                                if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                response = Some(reply);
-                                                evicted_notify = evicted;
-                                            }
-                                            Err(crate::supervisor::PreemptError::Cooldown(remaining)) => {
-                                                let mut reply = json!({
-                                                    "type": "lease_rejected",
-                                                    "error": "preemption_cooldown",
-                                                    "remaining_ms": remaining
-                                                });
-                                                if let Some(s) = seq { reply["seq"] = json!(s); }
-                                                response = Some(reply);
+                                        if auth.is_enforced() && !auth.is_operator(ws_token.as_deref()) {
+                                            let mut reply = json!({
+                                                "type": "lease_rejected",
+                                                "status": 403,
+                                                "code": "OPERATOR_REQUIRED",
+                                                "error": "operator_required",
+                                                "message": "Operator unlock is required for force lease preemption"
+                                            });
+                                            if let Some(s) = seq { reply["seq"] = json!(s); }
+                                            response = Some(reply);
+                                        } else {
+                                            match inner.preempt_lease(&recv_connection, label) {
+                                                Ok((generation, evicted)) => {
+                                                    let previous = recv_generation.swap(generation, Ordering::SeqCst);
+                                                    client_label = Some(label.to_owned());
+                                                    if previous != generation { last_sequence = None; }
+                                                    let mut reply = json!({
+                                                        "type": "lease_granted",
+                                                        "client_id": label,
+                                                        "generation": generation
+                                                    });
+                                                    if let Some(s) = seq { reply["seq"] = json!(s); }
+                                                    response = Some(reply);
+                                                    evicted_notify = evicted;
+                                                }
+                                                Err(crate::supervisor::PreemptError::Cooldown(remaining)) => {
+                                                    let mut reply = json!({
+                                                        "type": "lease_rejected",
+                                                        "error": "preemption_cooldown",
+                                                        "remaining_ms": remaining
+                                                    });
+                                                    if let Some(s) = seq { reply["seq"] = json!(s); }
+                                                    response = Some(reply);
+                                                }
                                             }
                                         }
                                     } else {
@@ -683,7 +917,9 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 } else {
                                     last_request = request_id;
                                     let path = value.get("path").and_then(Value::as_str).unwrap_or("");
-                                    if let Some(code) = calibration_busy_code(&inner, path) {
+                                    if let Some(auth_err) = check_operator_privilege(&auth, ws_token.as_deref(), &mut inner, path, &value["body"], epoch) {
+                                        response = Some(command_reject(&inner, &value["request_id"], auth_err));
+                                    } else if let Some(code) = calibration_busy_code(&inner, path) {
                                         response = Some(command_reject(&inner, &value["request_id"],
                                             ApiError(StatusCode::CONFLICT, "a calibration apply, restore or motor zero is running".into(), code.into())));
                                     } else if path == "/api/v1/calibration/apply" || path == "/api/v1/calibration/restore" || path == crate::motor_zero::PATH
@@ -694,7 +930,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             Err(e) => Some(calibration_reject(&value["request_id"], &e)),
                                         };
                                     } else if path.starts_with("/api/v1/action/") {
-                                        response = match prepare_action(&mut inner, path, &value["body"], epoch, &value["request_id"]) {
+                                        response = match prepare_action(&mut inner, path, &value["body"], epoch, &value["request_id"], &auth, ws_token.as_deref()) {
                                             Ok(ActionStart::Started(id, duration)) => Some(command_ack(&inner, &value["request_id"], Some((id, duration)))),
                                             Ok(ActionStart::Plan(plan)) => { pending_plan = Some((plan, local_generation)); None }
                                             Ok(ActionStart::Macro(m)) => { pending_macro = Some((value["request_id"].clone(), m, local_generation)); None }
@@ -706,16 +942,32 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             }),
                                             Err(error) => Some(command_reject(&inner, &value["request_id"], error)),
                                         };
-                                    } else if let Some(result) = state_command(&mut inner, path, &value["body"], recv_deps.setup_path.as_ref()) {
-                                        response = Some(match result {
-                                            Ok((fields, write)) => {
-                                                let mut ack = command_ack(&inner, &value["request_id"], None);
-                                                for (key, field) in fields { ack[key] = field; }
-                                                pending_write = write;
-                                                ack
+                                    } else if let Some(result) = PreparedConfigWrite::prepare(
+                                        &mut inner,
+                                        path,
+                                        &value["body"],
+                                        recv_deps.setup_path.as_ref(),
+                                        auth.is_enforced(),
+                                    ) {
+                                        match result {
+                                            Ok(prepared) if !prepared.has_write() => {
+                                                response = Some(match prepared.commit(&mut inner) {
+                                                    Ok(fields) => {
+                                                        let mut ack = command_ack(&inner, &value["request_id"], None);
+                                                        for (key, field) in fields { ack[key] = field; }
+                                                        ack
+                                                    }
+                                                    Err(error) => command_reject(&inner, &value["request_id"], error.into()),
+                                                });
                                             }
-                                            Err(error) => command_reject(&inner, &value["request_id"], error.into()),
-                                        });
+                                            Ok(prepared) => {
+                                                pending_config_write = Some((value["request_id"].clone(), prepared, local_generation, epoch));
+                                                response = None;
+                                            }
+                                            Err(error) => {
+                                                response = Some(command_reject(&inner, &value["request_id"], error.into()));
+                                            }
+                                        }
                                     } else {
                                         let result = execute_command(&mut inner, path, &value["body"], epoch);
                                         response = Some(match result {
@@ -842,8 +1094,13 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 // this loop goes on (heartbeats, stop) and the reply comes back through ack_tx.
                 if let Some((request_id, job, generation, epoch, busy)) = pending_calibration.take() {
                     let (sup, calib, conn, gen_now, tx) = (recv_supervisor.clone(), recv_calib.clone(), recv_connection.clone(), recv_generation.clone(), ack_tx.clone());
+                    let auth_c = auth.clone();
+                    let token_c = ws_token.clone();
                     tokio::spawn(async move {
                         let check: crate::calibration::LeaseCheck = Box::new(move |inner: &mut SupervisorInner| {
+                            if auth_c.is_enforced() && !auth_c.is_operator(token_c.as_deref()) {
+                                return Err(crate::calibration::CalibError::new(403, "OPERATOR_REQUIRED", "Operator session expired or locked during calibration"));
+                            }
                             if gen_now.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&conn, generation) {
                                 return Err(crate::calibration::CalibError::new(409, "LEASE_LOST", "This connection lost the lease during the calibration"));
                             }
@@ -875,20 +1132,104 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                         let _ = tx.send(reply).await;
                     });
                 }
-                // State files are written by the single persist writer; this loop does not wait
-                // for the disk: the ack (with `persisted`) is sent when the write finished.
-                if let Some(write) = pending_write.take() {
-                    let reply = response.take();
+                // Atomic two-phase persist-before-commit config writes (keepout, collision, gripper_calibration, poses, grasp_setup).
+                // Phase 1 (stage) runs outside sup.inner() lock; Phase 2 (auth + lease + epoch + precheck + publish + commit) runs under sup.inner() write lock.
+                if let Some((request_id, mut prepared, generation, epoch)) = pending_config_write.take() {
+                    let sup = recv_supervisor.clone();
                     let tx = ack_tx.clone();
+                    let auth_c = auth.clone();
+                    let token_c = ws_token.clone();
+                    let conn_c = recv_connection.clone();
+                    let gen_now = recv_generation.clone();
+                    let op_path = prepared.path();
                     tokio::spawn(async move {
-                        let result = write.run().await;
-                        let Some(mut reply) = reply else { return; };
-                        match result {
-                            Ok(()) => reply["persisted"] = json!(true),
-                            Err(e) => { tracing::warn!("State file not saved: {e}"); reply["persisted"] = json!(false); reply["persist_error"] = json!(e); }
-                        }
-                        // the ack can follow later replies: the receive loop stamps it with the
-                        // state at send time, so a client never rolls its epoch back
+                        let cw_lock = sup.config_write_lock();
+                        let _cw = cw_lock.lock().await;
+                        let write = prepared.take_write().expect("checked has_write");
+                        let staged_res = tokio::task::spawn_blocking(move || {
+                            crate::persist::StagedWrite::stage(write.path, write.text)
+                        }).await;
+                        let reply = match staged_res {
+                            Err(e) => {
+                                tracing::warn!("State file stage task failed: {e}");
+                                let inner = sup.inner().read().await;
+                                command_reject(&inner, &request_id, ApiError::persist_failed(format!("Failed to persist configuration: {e}")))
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!("State file not staged: {e}");
+                                let inner = sup.inner().read().await;
+                                command_reject(&inner, &request_id, ApiError::persist_failed(format!("Failed to persist configuration: {e}")))
+                            }
+                            Ok(Ok(staged)) => {
+                                let (reply_or_ack, dir_sync_opt) = {
+                                    let mut inner = sup.inner().write().await;
+                                    if auth_c.is_enforced() && !auth_c.is_operator(token_c.as_deref()) {
+                                        staged.abort();
+                                        (command_reject(&inner, &request_id, ApiError::operator_required(op_path)), None)
+                                    } else if gen_now.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&conn_c, generation) {
+                                        staged.abort();
+                                        (json!({
+                                            "type": "command_reject",
+                                            "request_id": request_id,
+                                            "status": 409,
+                                            "code": "LEASE_LOST",
+                                            "message": "This connection lost the lease while persisting configuration",
+                                            "error": "LEASE_LOST",
+                                            "epoch_id": inner.safety.epoch_id()
+                                        }), None)
+                                    } else if inner.safety.epoch_id() != epoch {
+                                        staged.abort();
+                                        (json!({
+                                            "type": "command_reject",
+                                            "request_id": request_id,
+                                            "status": 409,
+                                            "code": "EPOCH_MISMATCH",
+                                            "message": "Command epoch is no longer current",
+                                            "error": "EPOCH_MISMATCH",
+                                            "epoch_id": inner.safety.epoch_id()
+                                        }), None)
+                                    } else if let Some(err) = prepared.precheck(&mut inner) {
+                                        staged.abort();
+                                        (command_reject(&inner, &request_id, err.into()), None)
+                                    } else {
+                                        match staged.rename_only() {
+                                            Err(e) => {
+                                                tracing::warn!("State file not published: {e}");
+                                                (command_reject(&inner, &request_id, ApiError::persist_failed(format!("Failed to persist configuration: {e}"))), None)
+                                            }
+                                            Ok(dir_sync) => match prepared.commit(&mut inner) {
+                                                Ok(fields) => {
+                                                    let mut ack = command_ack(&inner, &request_id, None);
+                                                    for (key, field) in fields { ack[key] = field; }
+                                                    ack["persisted"] = json!(true);
+                                                    (ack, Some(dir_sync))
+                                                }
+                                                Err(err) => (command_reject(&inner, &request_id, err.into()), None),
+                                            }
+                                        }
+                                    }
+                                };
+                                match dir_sync_opt {
+                                    Some(dir_sync) => {
+                                        let mut ack = reply_or_ack;
+                                        let outcome = tokio::task::spawn_blocking(move || dir_sync.sync_parent_dir())
+                                            .await
+                                            .unwrap_or_else(|e| crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(e.to_string()));
+                                        match outcome {
+                                            crate::persist::PublishOutcome::Published => {
+                                                ack["durability_confirmed"] = json!(true);
+                                            }
+                                            crate::persist::PublishOutcome::PublishedDurabilityUnconfirmed(warn_msg) => {
+                                                ack["durability_confirmed"] = json!(false);
+                                                ack["durability_warning"] = json!(warn_msg);
+                                            }
+                                        }
+                                        ack
+                                    }
+                                    None => reply_or_ack,
+                                }
+                            }
+                        };
                         let _ = tx.send(reply).await;
                     });
                 }

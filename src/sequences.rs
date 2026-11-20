@@ -119,6 +119,8 @@ pub struct SequenceStore {
     pub path: Option<PathBuf>,
     /// The running sequence's references.
     pub pins: Option<RunPins>,
+    /// Store revision: incremented by every committed save / delete (`expected_revision`).
+    pub revision: u64,
 }
 
 impl SequenceStore {
@@ -238,9 +240,78 @@ pub fn check_steps(inner: &SupervisorInner, steps: &Value) -> Result<Vec<Step>, 
     Ok(out)
 }
 
-/// WS `/api/v1/sequences/save {id?, name, description?, steps, rev?}` -> the sequence.
-pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(Sequence, Option<PendingWrite>), ArmError> {
+/// A sequences.json change checked under the lock and committed after its file is staged
+/// (main's two-phase write): `next` replaces the store when the revision is unchanged.
+#[derive(Debug, Clone)]
+pub struct PreparedSequences {
+    pub base_revision: u64,
+    pub next: SequenceFile,
+    /// The saved sequence (None for a delete).
+    pub sequence: Option<Sequence>,
+    pub write: Option<PendingWrite>,
+}
+
+fn check_store_revision(inner: &SupervisorInner, body: &Value) -> Result<u64, ArmError> {
     if !body.is_object() { return Err(invalid("Command body must be an object")); }
+    // sequences use their own `rev` (SEQUENCE_CONFLICT); a store-wide expected_revision is optional
+    if let Some(exp) = persist::parse_expected_revision(body, false).map_err(invalid)? {
+        if exp != inner.sequences.revision {
+            return Err(ArmError::PolicyRevisionMismatch { expected: exp, current: inner.sequences.revision });
+        }
+    }
+    Ok(inner.sequences.revision)
+}
+
+impl SupervisorInner {
+    fn prepared_sequences(&self, base_revision: u64, next: SequenceFile, sequence: Option<Sequence>) -> PreparedSequences {
+        let write = self.sequences.path.clone().map(|path| PendingWrite::new(path, serde_json::to_string_pretty(&next).unwrap_or_default()));
+        PreparedSequences { base_revision, next, sequence, write }
+    }
+}
+
+/// Under the lock before the rename: revision unchanged, no calibration running, and every
+/// pose / episode the saved sequence references still exists (a delete since the prepare).
+pub fn precheck(inner: &SupervisorInner, prepared: &PreparedSequences) -> Result<(), ArmError> {
+    if inner.sequences.revision != prepared.base_revision {
+        return Err(ArmError::PolicyRevisionMismatch { expected: prepared.base_revision, current: inner.sequences.revision });
+    }
+    if inner.calibration_busy {
+        return Err(rejected(409, "CONFIG_BUSY", "a camera calibration apply or restore is running"));
+    }
+    if let Some(seq) = &prepared.sequence {
+        let steps = serde_json::to_value(&seq.steps).unwrap_or(Value::Null);
+        check_steps(inner, &steps)?;
+    }
+    if let Some(p) = inner.sequences.pins.as_ref().filter(|p| !prepared.next.sequences.iter().any(|s| s.id == p.sequence_id)) {
+        if inner.sequences.get(&p.sequence_id).is_some() {
+            return Err(rejected(409, "SEQUENCE_RUNNING", "the sequence is running; stop it first"));
+        }
+    }
+    Ok(())
+}
+
+/// Install a prepared change (revision checked again). Returns the store revision.
+pub fn commit(inner: &mut SupervisorInner, prepared: PreparedSequences) -> Result<(Option<Sequence>, u64), ArmError> {
+    if inner.sequences.revision != prepared.base_revision {
+        return Err(ArmError::PolicyRevisionMismatch { expected: prepared.base_revision, current: inner.sequences.revision });
+    }
+    inner.sequences.file = prepared.next;
+    inner.sequences.revision += 1;
+    Ok((prepared.sequence, inner.sequences.revision))
+}
+
+/// WS `/api/v1/sequences/save {id?, name, description?, steps, rev?}` (in-process callers):
+/// prepare and commit. Returns the sequence and the file write.
+pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(Sequence, Option<PendingWrite>), ArmError> {
+    let mut prepared = prepare_save(inner, body)?;
+    let write = prepared.write.take();
+    let (seq, _) = commit(inner, prepared)?;
+    Ok((seq.expect("a save has its sequence"), write))
+}
+
+/// Step 1 of `/api/v1/sequences/save {id?, name, description?, steps, rev?}`.
+pub fn prepare_save(inner: &SupervisorInner, body: &Value) -> Result<PreparedSequences, ArmError> {
+    let base_revision = check_store_revision(inner, body)?;
     let name = body.get("name").and_then(Value::as_str).ok_or_else(|| invalid("name must be a string"))?.to_string();
     if !crate::recording::store::valid_display_name(&name) {
         return Err(invalid("name must be 1-64 characters from letters, digits, _ - space and Han characters"));
@@ -274,9 +345,10 @@ pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(Sequence, Opti
         return Err(rejected(409, "SEQUENCE_EXISTS", format!("Another sequence is named '{name}'")));
     }
     let now = now_rfc3339();
+    let mut next = inner.sequences.file.clone();
     let seq = match id {
         Some(id) => {
-            let s = inner.sequences.file.sequences.iter_mut().find(|s| s.id == id).expect("checked above");
+            let s = next.sequences.iter_mut().find(|s| s.id == id).expect("checked above");
             s.name = name;
             s.description = description;
             s.steps = steps;
@@ -285,25 +357,35 @@ pub fn save(inner: &mut SupervisorInner, body: &Value) -> Result<(Sequence, Opti
             s.clone()
         }
         None => {
-            if inner.sequences.file.sequences.len() >= MAX_SEQUENCES { return Err(invalid(format!("at most {MAX_SEQUENCES} sequences; delete one first"))); }
+            if next.sequences.len() >= MAX_SEQUENCES { return Err(invalid(format!("at most {MAX_SEQUENCES} sequences; delete one first"))); }
             let s = Sequence { id: crate::recording::new_ulid(), name, description, steps, created_at: now.clone(), updated_at: now, rev: 1 };
-            inner.sequences.file.sequences.push(s.clone());
+            next.sequences.push(s.clone());
             s
         }
     };
-    Ok((seq, inner.sequences_write()))
+    Ok(inner.prepared_sequences(base_revision, next, Some(seq)))
 }
 
-/// WS `/api/v1/sequences/delete {id}`; SEQUENCE_RUNNING while it runs.
+/// WS `/api/v1/sequences/delete {id}` (in-process callers): prepare and commit.
 pub fn delete(inner: &mut SupervisorInner, body: &Value) -> Result<Option<PendingWrite>, ArmError> {
+    let mut prepared = prepare_delete(inner, body)?;
+    let write = prepared.write.take();
+    commit(inner, prepared)?;
+    Ok(write)
+}
+
+/// Step 1 of `/api/v1/sequences/delete {id}`; SEQUENCE_RUNNING while it runs.
+pub fn prepare_delete(inner: &SupervisorInner, body: &Value) -> Result<PreparedSequences, ArmError> {
+    let base_revision = check_store_revision(inner, body)?;
     let id = body.get("id").and_then(Value::as_str).ok_or_else(|| invalid("id must be a string"))?;
     if inner.sequences.pins.as_ref().is_some_and(|p| p.sequence_id == id) {
         return Err(rejected(409, "SEQUENCE_RUNNING", "the sequence is running; stop it first"));
     }
-    let i = inner.sequences.file.sequences.iter().position(|s| s.id == id)
+    let mut next = inner.sequences.file.clone();
+    let i = next.sequences.iter().position(|s| s.id == id)
         .ok_or_else(|| rejected(404, "SEQUENCE_NOT_FOUND", format!("No sequence with id '{id}'")))?;
-    inner.sequences.file.sequences.remove(i);
-    Ok(inner.sequences_write())
+    next.sequences.remove(i);
+    Ok(inner.prepared_sequences(base_revision, next, None))
 }
 
 /// A sequence in `GET /api/v1/sequences`: the stored fields plus the steps whose pose /

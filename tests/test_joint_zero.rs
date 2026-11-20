@@ -134,9 +134,9 @@ async fn rig(setup: impl FnOnce(&Path)) -> Rig {
         inner.poses.path = Some(dir.path().join("poses.json"));
         inner.gripper_calib_path = Some(dir.path().join("gripper_calib.json"));
     }
-    calibration::load_into(&sup, &deps.path, None).await;
+    calibration::load_into(&sup, &deps.path, None).await.unwrap();
     let router = armd::api::create_router_calibration(sup.clone(), up.clone(), armd::grasp::GraspDeps::http(up, None),
-        armd::diagnostics::DiagnosticsState::global(), deps.clone());
+        armd::diagnostics::DiagnosticsState::global(), deps.clone(), armd::auth::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
@@ -246,7 +246,7 @@ async fn software_zero_captures_marks_poses_stale_and_restores() {
     assert!(s["calibration"].get("camera_mount").is_some());
     // a restart loads the offsets
     let sup2 = ArmSupervisor::new(ArmConfig::rebot_dm());
-    calibration::load_into(&sup2, &r.deps.path, None).await;
+    calibration::load_into(&sup2, &r.deps.path, None).await.unwrap();
     assert!((sup2.inner().read().await.joint_zero_offsets[5] - 1.574).abs() < 1e-5);
     // restore the backup: offsets 0 again, J6 reads its motor value
     let backup = ok["restore"]["backup"].as_str().unwrap().to_string();
