@@ -49,6 +49,10 @@ The single-shot button calls `/api/v1/detection/trigger` with the selector's pip
 
 「单次识别」按钮以所选流水线调用 `/api/v1/detection/trigger`；标定采样发送 `{"pipelines":["aruco"]}`。返回 404 时页面记住检测程序不支持该路由，改用 开启 → `latest` → 关闭，且只在推理是页面自己开启时才关闭。
 
+The **Depth (est.)** button next to the vision selector (in the recognition popover in simple mode) shows when the provider reports `available.depth`, and is enabled with a metric depth model. It fetches one map from `GET /api/v1/vision/depth` and draws it over the video in a turbo colour map (near red, far blue, scaled to the map's p2 / p98), aligned with the `mapping` of the map. The panel is titled "Depth (model estimate)"; the legend shows near and far as colours, with "≈ x.xx m (est.)" for p2 / p98 and the note "Uncalibrated, relative only"; a tap (or mouse hover) shows "≈ NNN mm (est.)" at that point. **Live** refreshes at most once per second while the page is visible; it stops when the arm moves (any joint but the gripper more than 0.01 rad from the map's pose; the map is dropped as it no longer lines up), when the page is hidden and when the depth view is closed. The panel shows the frame id and the map's age; the map canvas takes no pointer events. The view is for seeing relative structure, not for measuring distances (see [Depth map](#depth-map--深度图) for the measured error).
+
+视觉模式选择旁的 **深度（估计）** 按钮（简化模式下在识别弹出框内）在提供端报告 `available.depth` 时显示，加载度量深度模型时可用。点击后从 `GET /api/v1/vision/depth` 取一张深度图，按深度图的 `mapping` 对齐，以 turbo 色图叠加在视频上（近为红、远为蓝，按 p2 / p98 缩放）。面板标题为「深度（模型估计）」；图例以颜色表示近与远，p2 / p98 以「≈ x.xx m（估计）」标注，并注明「未校准，仅表示相对远近」；点按（或鼠标悬停）显示该点「≈ NNN mm（估计）」。**连续** 在页面可见时每秒最多刷新一次；机械臂移动（除夹爪外任一关节偏离取图时姿态超过 0.01 rad，此时深度图已不对齐，被清除）、页面隐藏或关闭深度显示时停止。面板显示帧号与深度图的时长；深度图画布不接收指针事件。该视图用于查看相对结构，不用于测距（实测误差见[深度图](#depth-map--深度图)）。
+
 ## Subscriptions (API version 2) / 订阅
 
 - Standby: with no active subscription (and the default one off) nothing is inferred. The inference channel's camera gate is at `idle_fps` (1); the H.264 stream and `/snapshot.jpg` keep running. 无订阅时不做推理，推理通道取帧 1 fps 待机，视频流与快照照常。

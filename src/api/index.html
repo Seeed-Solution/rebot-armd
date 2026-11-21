@@ -279,6 +279,42 @@ body.ui-expert .main {
 .vmode button:disabled { opacity: 0.45; cursor: default; }
 .vmode .vm-k { align-self: center; padding: 0 4px 0 8px; font-size: 12px; font-weight: 500; color: var(--sc-color-text-secondary); white-space: nowrap; }
 .vmode button:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 1px; }
+/* depth view (model estimate): the map canvas sits under the detection overlay and takes no pointer events; the
+   readout follows pointer events on the video box. Panel bottom-left, lifted above the grasp bar when that shows. */
+.det-btn.det-depth::before { background: linear-gradient(90deg, #d23105, #a4fc3c, #3e9bfe); border-radius: 2px; }
+.video .depth-ov { pointer-events: none; image-rendering: pixelated; }
+.video .depth-ov[hidden] { display: none; }
+.depth-panel { position: absolute; z-index: 6; left: 12px; bottom: 12px; width: max-content; max-width: min(320px, calc(100% - 24px)); box-sizing: border-box;
+  display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; border-radius: 12px; font-size: 12px; pointer-events: auto;
+  background: rgba(255,255,255,0.88); border: 1px solid rgba(255,255,255,0.6); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); box-shadow: 0 2px 8px rgba(0,0,0,0.12); }
+.depth-panel[hidden], .depth-read[hidden] { display: none; }
+.video:has(#grasp-bar:not([hidden])) .depth-panel { bottom: 72px; }
+.dp-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.dp-title { flex: 1 1 auto; font-weight: 600; white-space: nowrap; }
+.dp-btn { min-height: 26px; padding: 0 9px; border-radius: 13px; font-size: 12px; font-weight: 600; touch-action: manipulation; }
+.dp-btn[aria-pressed="true"] { background: var(--sc-color-primary-dark); border-color: var(--sc-color-primary-dark); color: #fff; }
+.dp-x { min-width: 26px; padding: 0; }
+.dp-leg { display: grid; grid-template-columns: auto minmax(48px, 1fr) auto; gap: 0 6px; align-items: center; }
+.dp-end { white-space: nowrap; }
+.dp-bar { display: block; height: 8px; border-radius: 4px; }
+/* small video (phone portrait): tighter panel so most of the map stays visible */
+.video { container-type: inline-size; }
+@container (max-width: 520px) {
+  .depth-panel { left: 6px; bottom: 6px; max-width: calc(100% - 12px); padding: 4px 6px; gap: 2px; font-size: 11px; }
+  .dp-row { gap: 4px; }
+  .dp-btn { min-height: 24px; padding: 0 8px; font-size: 11px; }
+  .dp-x { min-width: 24px; }
+  .dp-sub { font-size: 10px; }
+  .dp-op { width: 56px; }
+  /* the slider keeps its label for assistive tech; on a small video only the slider shows */
+  .dp-op-k { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+}
+.dp-op { width: 76px; margin: 0; }
+.dp-sub { font-size: 11px; color: var(--sc-color-text-secondary); }
+.dp-sub.is-warn { color: var(--sc-status-warning-fg); }
+.dp-status { margin-left: auto; white-space: nowrap; }
+.depth-read { position: absolute; z-index: 6; pointer-events: none; padding: 2px 7px; border-radius: 8px; white-space: nowrap; transform: translate(12px, -50%);
+  background: rgba(17,24,39,0.85); color: #fff; font: 600 12px var(--mono); }
 .det-btn.det-trig::before { background: var(--sc-color-primary-dark); border-radius: 2px; }
 .det-btn.det-trig.busy::before { animation: breathe 0.9s ease-in-out infinite; }
 /* camera power-state pill: idle (grey) / working (green) / snapshot (amber) */
@@ -764,6 +800,12 @@ body.offline .banner { display: block; }
 .ext-banner.warn .ext-dot { background: #d48806; }
 .ext-banner.bad .ext-dot { background: var(--sc-status-danger-fg); }
 @keyframes extpulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(140,192,32,0.55); } 50% { box-shadow: 0 0 0 6px rgba(140,192,32,0); } }
+@media (orientation: landscape) and (max-height: 1200px), body.is-fs.ui-simple, body.is-hud.ui-simple {
+  /* simple mode, full-screen video: the depth panel sits above the HUD row, between the thumb controls */
+  body.ui-simple .depth-panel { left: calc((var(--band-l, 176px) + 100vw - var(--band-r, 176px)) / 2); transform: translateX(-50%);
+    bottom: calc(16px + var(--hud-h, 28px) + 8px); max-width: calc(100vw - var(--band-l, 176px) - var(--band-r, 176px)); }
+  body.ui-simple .video:has(#grasp-bar:not([hidden])) .depth-panel { bottom: calc(16px + var(--hud-h, 28px) + 72px); }
+}
 @media (prefers-reduced-motion: reduce) { .ext-banner.live .ext-dot { animation: none; } }
 .ext-who { flex: 1 1 auto; min-width: 0; font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ext-pill { flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 10px; background: var(--sc-color-primary-soft); color: var(--sc-color-primary-dark); border: 1px solid var(--sc-color-border); }
@@ -1742,6 +1784,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
       <div class="video" id="video-box">
         <video id="video-stream" autoplay playsinline muted disablepictureinpicture></video>
         <img class="mjpeg" id="video-mjpeg" alt="">
+        <canvas class="overlay depth-ov" id="depth-overlay" hidden></canvas>
         <canvas class="overlay" id="video-overlay"></canvas>
         <div class="vhint connecting" id="vhint">
           <div class="vhint-inner">
@@ -1758,7 +1801,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
         </div>
         <div class="hud">
           <button class="btn det-btn vis-chip only-simple" id="btn-vis" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="det-ctl" hidden>识别</button>
-          <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button><span class="seg seg-sm vmode" id="vmode" role="radiogroup" aria-label="视觉模式" hidden><span class="vm-k" id="vm-k" aria-hidden="true" hidden>显示</span><button type="button" role="radio" data-vm="off" data-i18n="vm.off">关</button><button type="button" role="radio" data-vm="yolo" data-i18n="vm.yolo">YOLO</button><button type="button" role="radio" data-vm="aruco" data-i18n="vm.aruco">ArUco</button><button type="button" role="radio" data-vm="both" data-i18n="vm.both">两者</button></span><button class="btn det-btn det-trig" id="btn-trigger" type="button" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span><button class="btn det-btn det-gset" id="btn-gset" type="button" data-i18n="gset.open" hidden>抓取设置</button></span>
+          <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button><span class="seg seg-sm vmode" id="vmode" role="radiogroup" aria-label="视觉模式" hidden><span class="vm-k" id="vm-k" aria-hidden="true" hidden>显示</span><button type="button" role="radio" data-vm="off" data-i18n="vm.off">关</button><button type="button" role="radio" data-vm="yolo" data-i18n="vm.yolo">YOLO</button><button type="button" role="radio" data-vm="aruco" data-i18n="vm.aruco">ArUco</button><button type="button" role="radio" data-vm="both" data-i18n="vm.both">两者</button></span><button class="btn det-btn det-depth" id="btn-depth" type="button" aria-pressed="false" aria-controls="depth-panel" hidden>深度（估计）</button><button class="btn det-btn det-trig" id="btn-trigger" type="button" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span><button class="btn det-btn det-gset" id="btn-gset" type="button" data-i18n="gset.open" hidden>抓取设置</button></span>
           <span class="sc-status-badge" id="cam-chip" data-i18n="v.chip.connecting">连接中</span>
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
           <span class="sc-status-badge plain" id="det-chip" data-i18n="det.none" hidden>检测 --</span>
@@ -1781,6 +1824,12 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
             <button class="btn grasp-stop" id="grasp-stop" type="button" data-i18n="grasp.stop" hidden>停止</button>
           </div>
         </div>
+        <div class="depth-panel" id="depth-panel" role="group" aria-label="深度（模型估计）" hidden>
+          <div class="dp-row"><b class="dp-title" id="dp-title">深度（模型估计）</b><button class="btn dp-btn" id="dp-live" type="button" aria-pressed="false">连续</button><button class="btn dp-btn" id="dp-refresh" type="button">刷新</button><button class="btn dp-btn dp-x" id="dp-x" type="button" aria-label="关闭深度显示">×</button></div>
+          <div class="dp-leg"><span class="dp-end"><b id="dp-near">近</b> <span class="dp-sub" id="dp-near-m">--</span></span><i class="dp-bar" id="dp-bar"></i><span class="dp-end"><b id="dp-far">远</b> <span class="dp-sub" id="dp-far-m">--</span></span></div>
+          <div class="dp-row"><label class="dp-sub dp-op-k" for="dp-op" id="dp-op-k">不透明度</label><input class="dp-op" id="dp-op" type="range" min="10" max="100" step="5" value="60"><span class="dp-sub" id="dp-note">未校准，仅表示相对远近</span><span class="dp-sub dp-status" id="dp-status" role="status" aria-live="polite"></span></div>
+        </div>
+        <div class="depth-read" id="depth-read" hidden></div>
         <div class="grasp-pick" id="grasp-pick" role="status" hidden><span data-i18n="gset.grip.tap">点击画面中夹爪之间物体的中心</span><button class="btn" id="grasp-pick-x" type="button" data-i18n="grasp.cancel">取消</button></div>
         <div class="banner" data-i18n="banner.lock">遥测断开 · 控制已锁定</div>
       </div>
@@ -2423,6 +2472,13 @@ const I18N = {
     'det.on': '识别 · 开', 'det.off': '识别 · 关', 'det.na': '识别 · 不可用', 'vis.tip': '识别选项：开关、模式、单次识别、抓取设置',
     'det.tip.on': '物体识别已开启，点击关闭', 'det.tip.off': '物体识别已关闭，点击开启',
     'det.tip.na': '识别服务不可用（检测程序未运行或版本过旧）', 'det.fail': '切换识别失败',
+    'depth.btn': '深度（估计）', 'depth.tip': '深度图：模型估计，不是测量值', 'depth.tip.nm': '深度图需要度量深度模型（当前为相对深度）',
+    'depth.title': '深度（模型估计）', 'depth.live': '连续', 'depth.live.tip': '每秒最多刷新一次；机械臂移动、页面隐藏或关闭深度显示时停止',
+    'depth.refresh': '刷新', 'depth.close': '关闭深度显示', 'depth.opacity': '不透明度', 'depth.near': '近', 'depth.far': '远',
+    'depth.m': '≈ {m} m（估计）', 'depth.note': '未校准，仅表示相对远近', 'depth.read': '≈ {mm} mm（估计）', 'depth.read.none': '此处无深度',
+    'depth.frame': '帧 #{id} · {age} 前', 'depth.age': '{s} 秒', 'depth.st.load': '正在获取深度图…', 'depth.st.rate': '请求过快，稍后重试',
+    'depth.st.busy': '深度推理正忙', 'depth.st.na': '深度不可用', 'depth.st.fail': '获取深度图失败', 'depth.st.moved': '机械臂已移动，已停止刷新',
+    'depth.st.op': '需要操作员解锁', 'depth.st.hidden': '页面隐藏，已暂停',
     'vm.label': '视觉模式', 'vm.label.show': '本页画面显示', 'vm.show': '显示', 'vm.off': '关', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco', 'vm.both': '两者',
     'vm.tip': '视觉模式：YOLO 识别物体，ArUco 识别标记，或两者同时运行。选择后本页开启持续识别，「关」停止；不影响其他客户端',
     'vm.tip.na': '视觉模式不可用（视觉服务未运行）', 'vm.fail': '切换视觉模式失败', 'vm.noyolo': 'YOLO 模型未加载，只能使用 ArUco',
@@ -2629,6 +2685,13 @@ const I18N = {
     'det.on': 'Detect · On', 'det.off': 'Detect · Off', 'det.na': 'Detect · N/A', 'vis.tip': 'Detection options: on/off, mode, snapshot, grasp setup',
     'det.tip.on': 'Object detection is on. Click to turn it off', 'det.tip.off': 'Object detection is off. Click to turn it on',
     'det.tip.na': 'Detection service unavailable (detector not running or too old)', 'det.fail': 'Could not switch detection',
+    'depth.btn': 'Depth (est.)', 'depth.tip': 'Depth map: model estimate, not a measurement', 'depth.tip.nm': 'The depth map needs a metric depth model (the loaded one is relative)',
+    'depth.title': 'Depth (model estimate)', 'depth.live': 'Live', 'depth.live.tip': 'Refreshes at most once per second; stops when the arm moves, the page is hidden or the depth view is closed',
+    'depth.refresh': 'Refresh', 'depth.close': 'Close depth view', 'depth.opacity': 'Opacity', 'depth.near': 'Near', 'depth.far': 'Far',
+    'depth.m': '≈ {m} m (est.)', 'depth.note': 'Uncalibrated, relative only', 'depth.read': '≈ {mm} mm (est.)', 'depth.read.none': 'No depth here',
+    'depth.frame': 'Frame #{id} · {age} ago', 'depth.age': '{s} s', 'depth.st.load': 'Fetching depth map…', 'depth.st.rate': 'Too many requests, retrying',
+    'depth.st.busy': 'Depth inference busy', 'depth.st.na': 'Depth unavailable', 'depth.st.fail': 'Depth map failed', 'depth.st.moved': 'Arm moved: refresh stopped',
+    'depth.st.op': 'Operator unlock required', 'depth.st.hidden': 'Page hidden: paused',
     'vm.label': 'Vision mode', 'vm.label.show': 'Shown on this page', 'vm.show': 'Show', 'vm.off': 'Off', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco', 'vm.both': 'Both',
     'vm.tip': 'Vision mode: YOLO for objects, ArUco for markers, or both at once. Selecting one turns continuous detection on for this page; Off stops it. Other clients are not affected',
     'vm.tip.na': 'Vision mode unavailable (vision service not running)', 'vm.fail': 'Could not switch the vision mode', 'vm.noyolo': 'YOLO model not loaded; only ArUco is available',
@@ -3742,6 +3805,7 @@ function connectWS() {
     if (!Array.isArray(o.positions)) return;
     S.obs = o; S.obsAt = Date.now(); S.wsCount++;
     detHoldOnObs(o);
+    depthOnObs(o);
     gcOnObs(o);
     renderMotionLimit(o);
     tkOnObs(o); // after renderMotionLimit: the banner reuses the #ml-chip text
@@ -4646,7 +4710,7 @@ function initDetToggle() {
 const VM_MODES = ['off', 'yolo', 'aruco', 'both'];
 // subs: the provider has per-request pipelines and subscriptions (perception API 2); the selector
 // then picks this page's overlay pipelines instead of the provider's global mode
-const VM = { state: null, mode: null, yolo: true, busy: false, subs: false };
+const VM = { state: null, mode: null, yolo: true, busy: false, subs: false, depth: false, depthMetric: false };
 const vmPipelines = (m) => (m === 'both' ? ['yolo', 'aruco'] : [m]);
 
 /* Vision subscriptions (perception API 2): continuous inference per caller, kept alive every
@@ -4751,6 +4815,8 @@ function vmApply(data) {
   if (subs !== VM.subs) { VM.subs = subs; if (subs) ovSync(); }
   VM.mode = VM_MODES.includes(data.mode) ? data.mode : null;
   VM.yolo = !(data.available && data.available.yolo === false);
+  VM.depth = !!(data.available && data.available.depth === true);
+  VM.depthMetric = VM.depth && !!(data.depth_model && data.depth_model.metric === true);
   if (typeof data.enabled === 'boolean') detApply({ enabled: data.enabled, fps: data.fps, active_fps: data.active_fps, idle_fps: data.idle_fps });
   renderVisionMode();
 }
@@ -4779,6 +4845,7 @@ function renderVisionMode() {
     b.setAttribute('aria-checked', String(on));
     b.disabled = !ok || VM.busy || DET.snap || (!VM.yolo && (m === 'yolo' || m === 'both'));
   }
+  depthRender();
 }
 async function setVisionMode(mode) {
   if (VM.state === 'ok' && VM.subs && !VM.busy) {
@@ -4843,6 +4910,257 @@ function initVisionMode() {
     ovSync();
     subHold(CALSUB, CALVM.open && !document.hidden ? ['aruco'] : null);
   });
+}
+
+/* =================================================================
+   Depth view: GET /api/v1/vision/depth (rebot-vision runs one depth inference on a fresh frame and sends a
+   384x224 u16 millimetre map, "RDM1" body, docs/detection_api.md). One map per tap, or one per second at most
+   while Live is on, the page is visible and the arm holds still. The values are the depth model's estimate
+   (B601-DM, 2026-11-21: median error 89 mm at 0.32-0.45 m), so the legend is near / far in relative colour and
+   metres only as "≈ x.xx m (估计)". The map canvas takes no pointer events: the readout listens on the video box.
+   ================================================================= */
+// rebot-vision accepts one map request per second, timed where it receives them. The gap is counted from the end of
+// the previous exchange (DEPTH.lastAt), which is after the server received it, so jitter cannot cause a 429.
+const DEPTH_MIN_GAP_MS = 1000;
+const DEPTH = { on: false, live: false, busy: false, gen: 0, map: null, q: null, lastAt: -1e9, timer: null, st: '', stWarn: false, read: null };
+/* Parse an RDM1 body -> { w, h, mm (Uint16Array, 0 = no depth), meta, near, far } (near / far: p2 / p98 mm). */
+function depthParse(buf) {
+  const u8 = new Uint8Array(buf);
+  if (u8.length < 8 || String.fromCharCode(u8[0], u8[1], u8[2], u8[3]) !== 'RDM1') throw new Error('bad depth body');
+  const dv = new DataView(buf), n = dv.getUint32(4, true);
+  const meta = JSON.parse(new TextDecoder().decode(u8.subarray(8, 8 + n)));
+  const w = meta.width | 0, h = meta.height | 0, off = 8 + n;
+  if (w <= 0 || h <= 0 || u8.length < off + w * h * 2) throw new Error('short depth body');
+  const mm = new Uint16Array(w * h);
+  for (let i = 0; i < mm.length; i++) mm[i] = dv.getUint16(off + 2 * i, true);
+  const st = meta.stats || {};
+  let near = st.p2_mm, far = st.p98_mm;
+  if (!(near > 0 && far > 0)) { // older body without stats: percentiles here
+    const v = Array.from(mm).filter((x) => x > 0).sort((a, b) => a - b);
+    near = v.length ? v[Math.round(0.02 * (v.length - 1))] : 0; far = v.length ? v[Math.round(0.98 * (v.length - 1))] : 0;
+  }
+  const mp = meta.mapping || {};
+  const iw = mp.image_w || 640, ih = mp.image_h || 360;
+  // the grid's place on the visible image, normalised (rebot-vision: the whole image, stretched)
+  const box = [(mp.x0 ?? 0) / iw, (mp.y0 ?? 0) / ih, (mp.x1 ?? iw) / iw, (mp.y1 ?? ih) / ih];
+  return { w, h, mm, meta, near, far, box };
+}
+// turbo colour map (Mikhailov 2019, polynomial fit), 256 entries over turbo 0.06 .. 0.94 (the near-black ends left
+// out so far depths stay visible over the video); index 0 = far (blue) .. 255 = near (red)
+const TURBO = (() => {
+  const lut = new Uint8ClampedArray(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const x = 0.06 + 0.88 * i / 255;
+    lut[i * 3] = 255 * (0.13572138 + x * (4.6153926 + x * (-42.66032258 + x * (132.13108234 + x * (-152.94239396 + x * 59.28637943)))));
+    lut[i * 3 + 1] = 255 * (0.09140261 + x * (2.19418839 + x * (4.84296658 + x * (-14.18503333 + x * (4.27729857 + x * 2.82956604)))));
+    lut[i * 3 + 2] = 255 * (0.1066733 + x * (12.64194608 + x * (-60.58204836 + x * (110.36276771 + x * (-89.90310912 + x * 27.34824973)))));
+  }
+  return lut;
+})();
+// colour index of a depth: near (p2) -> 255, far (p98) -> 0, clamped
+const depthIdx = (map, v) => Math.round(255 * (1 - Math.min(1, Math.max(0, (v - map.near) / Math.max(1, map.far - map.near)))));
+function depthImage(map) {
+  const c = document.createElement('canvas'); c.width = map.w; c.height = map.h;
+  const g = c.getContext('2d'), img = g.createImageData(map.w, map.h), d = img.data;
+  for (let i = 0; i < map.mm.length; i++) {
+    const v = map.mm[i];
+    if (!v) continue; // transparent: no depth
+    const k = depthIdx(map, v) * 3;
+    d[i * 4] = TURBO[k]; d[i * 4 + 1] = TURBO[k + 1]; d[i * 4 + 2] = TURBO[k + 2]; d[i * 4 + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  return c;
+}
+function depthDraw() {
+  const cv = $('depth-overlay');
+  if (!cv || cv.hidden) return;
+  // sized from the canvas itself (the padding box of the video box, as the video element), not the bordered box
+  const { cssW, cssH, dpr } = fitCanvas(cv, cv);
+  const g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, cssW, cssH);
+  const m = DEPTH.map, r = getVideoContentRect(cssW, cssH);
+  if (!m || !r) return;
+  g.imageSmoothingEnabled = false; // one block per grid cell: what you see is what the readout reports
+  g.drawImage(m.img, r.x + m.box[0] * r.w, r.y + m.box[1] * r.h, (m.box[2] - m.box[0]) * r.w, (m.box[3] - m.box[1]) * r.h);
+}
+/* Depth (mm, 0 = none) at a point normalised to the video image, or null outside the grid. */
+function depthAt(u, v) {
+  const m = DEPTH.map;
+  if (!m) return null;
+  const gx = Math.floor((u - m.box[0]) / (m.box[2] - m.box[0]) * m.w), gy = Math.floor((v - m.box[1]) / (m.box[3] - m.box[1]) * m.h);
+  if (gx < 0 || gy < 0 || gx >= m.w || gy >= m.h) return null;
+  return m.mm[gy * m.w + gx];
+}
+/* Pointer -> point normalised to the video image (same frame as depthDraw: the canvas box). */
+function depthPoint(e) {
+  const c = $('depth-overlay').getBoundingClientRect(), r = getVideoContentRect(c.width, c.height);
+  if (!r) return null;
+  const u = (e.clientX - c.left - r.x) / r.w, v = (e.clientY - c.top - r.y) / r.h;
+  return u >= 0 && u <= 1 && v >= 0 && v <= 1 ? [u, v] : null;
+}
+function depthReadAt(e) {
+  const el = $('depth-read'), pt = DEPTH.map ? depthPoint(e) : null;
+  const mm = pt ? depthAt(pt[0], pt[1]) : null;
+  if (mm == null) { el.hidden = true; DEPTH.read = null; return; }
+  const box = $('video-box').getBoundingClientRect();
+  DEPTH.read = { u: pt[0], v: pt[1], mm };
+  setText(el, mm ? t('depth.read', { mm: String(mm) }) : t('depth.read.none'));
+  el.style.left = Math.round(e.clientX - box.left) + 'px'; el.style.top = Math.round(e.clientY - box.top) + 'px';
+  el.hidden = false;
+  // keep the readout inside the video box (flip to the left of the pointer near the right edge)
+  el.style.transform = e.clientX - box.left + el.offsetWidth + 16 > box.width ? 'translate(calc(-100% - 12px), -50%)' : '';
+}
+const depthM = (mm) => t('depth.m', { m: (mm / 1000).toFixed(2) });
+function depthRender() {
+  const btn = $('btn-depth'), panel = $('depth-panel');
+  if (!btn || !panel) return;
+  const avail = VM.state === 'ok' && VM.depth;
+  if (!avail && DEPTH.on) depthSet(false);
+  btn.hidden = !avail;
+  btn.disabled = !VM.depthMetric;
+  setText(btn, t('depth.btn'));
+  btn.title = t(VM.depthMetric ? 'depth.tip' : 'depth.tip.nm');
+  btn.classList.toggle('btn-primary', DEPTH.on);
+  btn.setAttribute('aria-pressed', String(DEPTH.on));
+  panel.hidden = !DEPTH.on;
+  $('depth-overlay').hidden = !DEPTH.on;
+  if (!DEPTH.on) { $('depth-read').hidden = true; return; }
+  panel.setAttribute('aria-label', t('depth.title'));
+  setText($('dp-title'), t('depth.title'));
+  const live = $('dp-live');
+  setText(live, t('depth.live')); live.title = t('depth.live.tip');
+  live.setAttribute('aria-pressed', String(DEPTH.live));
+  const rf = $('dp-refresh'); setText(rf, t('depth.refresh')); rf.disabled = DEPTH.busy;
+  $('dp-x').setAttribute('aria-label', t('depth.close')); $('dp-x').title = t('depth.close');
+  setText($('dp-op-k'), t('depth.opacity'));
+  setText($('dp-note'), t('depth.note'));
+  setText($('dp-near'), t('depth.near')); setText($('dp-far'), t('depth.far'));
+  const m = DEPTH.map;
+  setText($('dp-near-m'), m ? depthM(m.near) : '--'); setText($('dp-far-m'), m ? depthM(m.far) : '--');
+  const st = $('dp-status');
+  let txt = DEPTH.st ? t(DEPTH.st) : '';
+  if (!txt && m) txt = t('depth.frame', { id: m.meta.frame_id, age: t('depth.age', { s: Math.max(0, (performance.now() - m.at) / 1000).toFixed(1) }) });
+  setText(st, txt);
+  st.classList.toggle('is-warn', DEPTH.stWarn);
+}
+function depthStatus(key, warn = false) { DEPTH.st = key; DEPTH.stWarn = warn; depthRender(); }
+function depthClearMap() {
+  DEPTH.map = null; DEPTH.q = null; DEPTH.read = null;
+  $('depth-read').hidden = true;
+  depthDraw();
+}
+function depthStop() { clearTimeout(DEPTH.timer); DEPTH.timer = null; }
+const depthMoved = (q0, q) => !!(q0 && q && q.some((v, i) => i !== GRIP && i < q0.length && Math.abs(v - q0[i]) > SNAP_MOVE_RAD));
+/* Next request no sooner than DEPTH_MIN_GAP_MS after the previous one ended, and `ms` from now. */
+function depthSchedule(ms = 0) {
+  depthStop();
+  if (!DEPTH.on || !DEPTH.live || document.hidden) return;
+  const wait = Math.max(ms, DEPTH.lastAt + DEPTH_MIN_GAP_MS - performance.now(), 0);
+  DEPTH.timer = setTimeout(() => { DEPTH.timer = null; depthShot(); }, wait);
+}
+async function depthFetch(retried = false) {
+  const ctl = new AbortController();
+  const tm = setTimeout(() => ctl.abort(), 4500); // armd gives the detector 3 s
+  try {
+    const res = await fetch('/api/v1/vision/depth', { signal: ctl.signal, cache: 'no-store' });
+    if (res.ok) return { map: depthParse(await res.arrayBuffer()) };
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+    if (res.status === 403 && data && data.code === 'OPERATOR_REQUIRED') {
+      clearTimeout(tm);
+      if (!retried && await opRequire('/api/v1/vision/depth')) return depthFetch(true);
+      return { status: 403, key: 'depth.st.op' };
+    }
+    const ra = Number(res.headers.get('retry-after'));
+    const err = data && data.error;
+    const key = res.status === 429 ? 'depth.st.rate' : err === 'depth busy' ? 'depth.st.busy'
+      : err === 'depth unavailable' || err === 'depth not metric' || res.status === 404 ? 'depth.st.na' : 'depth.st.fail';
+    return { status: res.status, key, retryMs: (data && Number(data.retry_after_ms)) || (ra > 0 ? ra * 1000 : DEPTH_MIN_GAP_MS) };
+  } catch (_) {
+    return { status: 0, key: 'depth.st.fail' };
+  } finally { clearTimeout(tm); }
+}
+async function depthShot() {
+  if (!DEPTH.on || DEPTH.busy || document.hidden) return;
+  const wait = DEPTH.lastAt + DEPTH_MIN_GAP_MS - performance.now();
+  if (wait > 0) { // a tap within a second of the previous request: run it when the server takes it
+    clearTimeout(DEPTH.timer); DEPTH.timer = setTimeout(() => { DEPTH.timer = null; depthShot(); }, wait);
+    return;
+  }
+  const gen = DEPTH.gen, q0 = S.obs && Array.isArray(S.obs.positions) ? S.obs.positions.slice() : null;
+  DEPTH.busy = true; DEPTH.lastAt = performance.now();
+  if (!DEPTH.map) DEPTH.st = 'depth.st.load';
+  depthRender();
+  const r = await depthFetch();
+  DEPTH.busy = false; DEPTH.lastAt = performance.now();
+  if (gen !== DEPTH.gen || !DEPTH.on) { depthRender(); return; } // the view was closed meanwhile
+  const qNow = S.obs && Array.isArray(S.obs.positions) ? S.obs.positions : null;
+  if (r.map && depthMoved(q0, qNow)) { // the camera moved while the map was computed: it no longer lines up
+    DEPTH.live = false; depthClearMap(); depthStatus('depth.st.moved', true); return;
+  }
+  if (r.map) {
+    r.map.img = depthImage(r.map); r.map.at = performance.now();
+    DEPTH.map = r.map; DEPTH.q = q0; DEPTH.st = ''; DEPTH.stWarn = false;
+    $('depth-read').hidden = true; DEPTH.read = null;
+    depthDraw(); depthRender();
+    depthSchedule(DEPTH_MIN_GAP_MS);
+    return;
+  }
+  if (r.status === 403 || r.key === 'depth.st.na') DEPTH.live = false;
+  depthStatus(r.key, true);
+  depthSchedule(r.status === 429 ? r.retryMs : DEPTH_MIN_GAP_MS);
+}
+function depthSet(on) {
+  if (on === DEPTH.on) return;
+  DEPTH.on = on; DEPTH.gen++;
+  depthStop();
+  if (!on) { DEPTH.live = false; DEPTH.st = ''; depthClearMap(); }
+  depthRender();
+  if (on) { depthDraw(); depthShot(); }
+}
+function depthSetLive(on) {
+  DEPTH.live = on;
+  if (on && DEPTH.st === 'depth.st.moved') DEPTH.st = '';
+  depthRender();
+  if (on) { if (!DEPTH.busy) depthSchedule(0); } else depthStop();
+}
+/* Telemetry: the arm moved away from the map's pose -> the map no longer lines up; stop Live and drop it. */
+function depthOnObs(o) {
+  if (!DEPTH.on || !DEPTH.q || !depthMoved(DEPTH.q, o.positions)) return;
+  DEPTH.live = false; depthStop(); depthClearMap(); depthStatus('depth.st.moved', true);
+}
+function initDepth() {
+  const btn = $('btn-depth');
+  if (!btn) return;
+  btn.addEventListener('click', () => depthSet(!DEPTH.on));
+  $('dp-x').addEventListener('click', () => depthSet(false));
+  $('dp-live').addEventListener('click', () => depthSetLive(!DEPTH.live));
+  $('dp-refresh').addEventListener('click', () => { if (DEPTH.st === 'depth.st.moved') DEPTH.st = ''; depthShot(); });
+  const op = $('dp-op'), cv = $('depth-overlay');
+  const pref = Number(store('rebot.depth.opacity'));
+  if (pref >= 10 && pref <= 100) op.value = String(pref);
+  const applyOp = () => { cv.style.opacity = String(Number(op.value) / 100); };
+  op.addEventListener('input', () => { applyOp(); store('rebot.depth.opacity', op.value); });
+  applyOp();
+  // legend: near (red) on the left to far (blue) on the right
+  const stops = [];
+  for (let i = 0; i <= 8; i++) { const k = Math.round(255 * (1 - i / 8)) * 3; stops.push(`rgb(${TURBO[k]},${TURBO[k + 1]},${TURBO[k + 2]})`); }
+  $('dp-bar').style.background = `linear-gradient(90deg, ${stops.join(',')})`;
+  // readout: hover with a mouse, tap on touch; the canvas itself never takes pointer events
+  const vb = $('video-box');
+  vb.addEventListener('pointermove', (e) => { if (DEPTH.map && e.pointerType === 'mouse' && !(e.target.closest && e.target.closest('.hud, .depth-panel, .grasp-bar, .grasp-pick'))) depthReadAt(e); });
+  vb.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse') $('depth-read').hidden = true; });
+  vb.addEventListener('click', (e) => { if (DEPTH.map && !(e.target.closest && e.target.closest('.hud, .depth-panel, .grasp-bar, .grasp-pick, .vhint-btn'))) depthReadAt(e); });
+  if (window.ResizeObserver) new ResizeObserver(() => depthDraw()).observe(vb);
+  for (const el of [videoEl, mjpegEl]) if (el) el.addEventListener(el === videoEl ? 'loadedmetadata' : 'load', () => depthDraw());
+  setInterval(() => { if (DEPTH.on && DEPTH.map && !DEPTH.st) depthRender(); }, 1000); // frame age
+  document.addEventListener('visibilitychange', () => {
+    if (!DEPTH.on) return;
+    if (document.hidden) { depthStop(); if (DEPTH.live) depthStatus('depth.st.hidden'); }
+    else { if (DEPTH.st === 'depth.st.hidden') depthStatus(''); depthSchedule(0); }
+  });
+  i18nHooks.push(depthRender);
 }
 
 /* =================================================================
@@ -10018,7 +10336,7 @@ function graspVideoPoint(e) {
   return u >= 0 && u <= 1 && v >= 0 && v <= 1 ? [u, v] : null;
 }
 $('video-box').addEventListener('click', (e) => {
-  if (e.target.closest && e.target.closest('.hud, .grasp-bar, .grasp-pick, .vhint-btn')) return;
+  if (e.target.closest && e.target.closest('.hud, .grasp-bar, .grasp-pick, .vhint-btn, .depth-panel')) return;
   const pt = graspVideoPoint(e);
   if (!pt) return;
   if (GR.pickGrip) { graspSetGrip(pt); return; }
@@ -13844,7 +14162,7 @@ function opReasonKey(path, body) {
 // Run again after the unlock: only these user-initiated, repeatable requests; never a motion.
 function opCanRetry(path, body) {
   return (path === '/api/v1/mode/gravity_comp' && !!body && body.enable === true)
-    || path === '/api/v1/detection/trigger' || path === '/api/v1/safety/clear_fault' || path === '/api/v1/calibration/apply';
+    || path === '/api/v1/detection/trigger' || path === '/api/v1/vision/depth' || path === '/api/v1/safety/clear_fault' || path === '/api/v1/calibration/apply';
 }
 /* Ask for the operator PIN because `path` was refused. Resolves true after an unlock, false on cancel. */
 function opRequire(path, body) {
@@ -14064,6 +14382,7 @@ connectWS();
 connectDetectionWS();
 initDetToggle();
 initVisionMode();
+initDepth();
 initCalib();
 initCwiz();
 videoStart();
