@@ -395,4 +395,33 @@ mod tests {
         assert_eq!(g.step(&[0.1], &thresholds, 0.01, 1.06, &policy, true, true, &[0.1], &[0.0], None), None);
         assert!(g.hold.is_none());
     }
+
+    #[test]
+    fn back_off_is_bounded_by_the_first_trip_position() {
+        let h = TorqueHold { joint: 0, hold_q: 0.033, sign: 1.0, torque_nm: 20.0, threshold_nm: 16.8, since_s: 0.0,
+            anchor_q: 0.033, push_in: false, retreat: Retreat::Unused };
+        let b = TORQUE_HOLD_BACKOFF_RAD;
+        assert!((h.backed_off(0.033) - (0.033 - b)).abs() < 1e-6, "first trip: back off");
+        assert!((h.backed_off(0.033 - b) - (0.033 - b)).abs() < 1e-6, "repeated trip: no creep");
+        assert!((h.backed_off(0.033 - 0.002) - (0.033 - b)).abs() < 1e-6, "partly followed: up to the bound");
+        assert!((h.backed_off(0.020) - 0.020).abs() < 1e-6, "pushed back by the load: hold where it is");
+        assert!((h.backed_off(0.040) - (0.040 - b)).abs() < 1e-6, "further in: back off from there");
+        let neg = TorqueHold { sign: -1.0, anchor_q: -0.5, hold_q: -0.5, ..h };
+        assert!((neg.backed_off(-0.5) - (-0.5 + b)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn push_in_past_the_trip_position_trips_at_once() {
+        let policy = TorqueGuardPolicy { enabled: true, persist_ms: 100, ..Default::default() };
+        let thresholds = [Some(1.0), None, None, None, None, None];
+        let mut g = TorqueGuard::default();
+        g.step(&[2.0], &thresholds, 0.05, 1.0, &policy, true, true, &[0.0], &[0.0], None);
+        assert_eq!(g.step(&[2.0], &thresholds, 0.05, 1.05, &policy, true, true, &[0.0], &[0.0], None), Some(0));
+        let trips = g.trips_total;
+        // a command within TORQUE_PUSH_IN_RAD of the trip position (torque below the threshold) does not trip
+        assert_eq!(g.step(&[0.5], &thresholds, 0.02, 1.07, &policy, true, true, &[0.0], &[TORQUE_PUSH_IN_RAD * 0.9], Some(&[0.1])), None);
+        // past it: trips on the same tick
+        assert_eq!(g.step(&[0.5], &thresholds, 0.02, 1.09, &policy, true, true, &[0.0], &[TORQUE_PUSH_IN_RAD * 1.1], Some(&[0.1])), Some(0));
+        assert!(g.hold.unwrap().push_in && g.trips_total == trips + 1);
+    }
 }

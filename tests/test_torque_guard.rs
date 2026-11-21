@@ -42,6 +42,10 @@ struct ArmState {
     forced: [Option<f32>; 7],
     /// Feedback stale (bus loss): ages 600 ms, invalid.
     stale: bool,
+    /// Elastic obstacle per joint: (contact position, N·m per rad past it). The reported
+    /// torque adds stiffness x (q - contact) while q is past the contact, with the motor
+    /// holding the commanded position (integral action), so a held joint keeps pressing.
+    elastic: [Option<(f32, f32)>; 7],
 }
 
 #[derive(Clone)]
@@ -70,7 +74,8 @@ impl ArmDriver for StopArm {
         let g = armd::compute_gravity_torques(&q6).unwrap();
         Ok((0..7).map(|i| {
             let push = if s.torqued && !s.mit { s.stop_hi[i].map_or(0.0, |hi| STIFFNESS * (s.cmd[i] - hi).max(0.0)) } else { 0.0 };
-            let model = if i < 6 { g[i] } else { 0.0 } + push;
+            let contact = if s.torqued && !s.mit { s.elastic[i].map_or(0.0, |(c, k)| k * (s.q[i] - c).max(0.0)) } else { 0.0 };
+            let model = if i < 6 { g[i] } else { 0.0 } + push + contact;
             let torque = s.forced[i].unwrap_or(model.clamp(-TMAX[i], TMAX[i]));
             JointState { position: s.q[i], velocity: 0.0, temperature: 30.0, torque }
         }).collect())
@@ -464,3 +469,236 @@ fn bus_loss_then_motors_back_enabled_is_unchanged() {
     assert!(ticks(&mut inner, 2).is_torqued);
 }
 
+// ---- 2026-11-21 incident: J2 blocked by an elastic obstacle, then park / watchdog park ----
+
+const J2: usize = 1;
+/// J2 stops at 0.033 rad (measured at the trip on the real arm).
+const J2_BLOCK: f32 = 0.033;
+/// Contact at the rest position 0, 650 N·m/rad: 21.4 N·m at the block (the real trip read
+/// 20.14 N·m), 18.2 N·m at the backed-off hold, so the hold keeps pressing above 16.8 N·m.
+const J2_CONTACT_K: f32 = 650.0;
+
+/// B601-DM profile for the folded rest pose in this simulation: the model has no rest supports,
+/// so J3 reports its full model gravity (-7.6 N·m) at the rest pose, above the profile's 7.0 N·m
+/// support limit; the J2 support limit (2.333 N·m) stays checked.
+fn rest_profile() -> ArmConfig {
+    let mut c = profile();
+    if let Some(r) = c.resting_pose.as_mut() { r.support_torque_limits.retain(|(j, _)| *j == J2); }
+    c
+}
+
+/// Folded rest pose (all 0), J2 driven +0.12 rad into the obstacle by a joint_move (Action 12
+/// of the incident). Returns the rig after the trip.
+fn elastic_incident() -> (SupervisorInner, StopArm) {
+    let (mut inner, arm) = rig_at(rest_profile(), [0.0; 7]);
+    arm.with(|s| { s.stop_hi[J2] = Some(J2_BLOCK); s.elastic[J2] = Some((0.0, J2_CONTACT_K)); });
+    let mut t = vec![0.0; 7];
+    t[J2] = 0.12;
+    let (_, id, _) = inner.jog_action(t, None, None, "joint_move").unwrap();
+    for _ in 0..200 {
+        let obs = inner.tick(DT);
+        if obs.action.as_ref().is_some_and(|a| a.id == id && a.state != "running") {
+            let a = obs.action.unwrap();
+            assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("TORQUE_LIMIT")), "{a:?}");
+            assert!(a.message.as_deref().unwrap().contains("joint 2"), "{a:?}");
+            println!("SIM incident trip: {}", a.message.unwrap());
+            return (inner, arm);
+        }
+    }
+    panic!("no trip on J2");
+}
+
+fn run_until_done(inner: &mut SupervisorInner, id: u64, max_ticks: usize) -> (ArmObservation, usize) {
+    for k in 0..max_ticks {
+        let obs = inner.tick(DT);
+        if obs.action.as_ref().is_some_and(|a| a.id == id && a.state != "running") { return (obs, k + 1); }
+    }
+    panic!("action {id} still running after {max_ticks} ticks");
+}
+
+/// The hold backs J2 off by TORQUE_HOLD_BACKOFF_RAD; with the elastic obstacle it still presses
+/// above the threshold (as on the real arm). The SDK park (a move back toward 0) then succeeds
+/// and ends with torque off.
+#[test]
+fn elastic_incident_park_retreats_and_ends_with_torque_off() {
+    let (mut inner, _arm) = elastic_incident();
+    let h = inner.torque_guard.hold.expect("held");
+    assert_eq!((h.joint, h.sign), (J2, 1.0));
+    assert!((h.anchor_q - J2_BLOCK).abs() < 1e-4, "trip position {}", h.anchor_q);
+    let obs = ticks(&mut inner, 50);
+    println!("SIM hold after 1 s: J2 cmd {:.4} meas {:.4} rad, |τ2| {:.2} N·m (threshold {THR_BIG})",
+        obs.commanded_positions[J2], inner.measured_positions[J2], obs.torques[J2]);
+    assert!((obs.commanded_positions[J2] - (J2_BLOCK - TORQUE_HOLD_BACKOFF_RAD)).abs() < 1e-4, "{}", obs.commanded_positions[J2]);
+    assert!(obs.torques[J2] > THR_BIG, "the elastic obstacle keeps the held joint pressing: {}", obs.torques[J2]);
+    assert!(obs.torques[J2] < h.torque_nm, "the back-off lowers the torque: {} vs {}", obs.torques[J2], h.torque_nm);
+    let trips = inner.torque_guard.trips_total;
+    let id = inner.unload_action().unwrap().expect("park started");
+    let mut below = None;
+    let mut k_end = 0;
+    for k in 0..800 {
+        let obs = inner.tick(DT);
+        if below.is_none() && obs.torques[J2] < THR_BIG { below = Some(k as f64 * DT); }
+        assert!(obs.torques[J2] <= h.torque_nm + 0.1 * THR_BIG, "torque rose during the retreat: {}", obs.torques[J2]);
+        if obs.action.as_ref().is_some_and(|a| a.id == id && a.state != "running") { k_end = k + 1; break; }
+    }
+    let obs = inner.current_observation();
+    let a = obs.action.as_ref().unwrap();
+    println!("SIM park from the hold: |τ2| below {THR_BIG} N·m after {:.2} s; park {} after {:.2} s; torqued {}",
+        below.unwrap_or(f64::NAN), a.state, k_end as f64 * DT, obs.is_torqued);
+    assert_eq!((a.id, a.state.as_str()), (id, "done"), "{a:?}");
+    assert!(!obs.is_torqued && obs.fault.is_none(), "{:?}", obs.safety_state);
+    assert_eq!(inner.torque_guard.trips_total, trips, "no re-trip during the park");
+    assert!(below.unwrap() < 1.5, "torque relaxed within the retreat window");
+}
+
+/// Replay of a recorded J2 motion +0.1 rad from the current command (replay is not clamped).
+fn replay_j2_in(inner: &mut SupervisorInner) -> (ArmObservation, f32) {
+    let tmp = tempfile::tempdir().unwrap();
+    let start = inner.commanded_positions.clone();
+    let frames: Vec<RecordFrame> = (0..=100).map(|k| {
+        let mut q = start.clone();
+        q[J2] += 0.1 * k as f32 / 100.0;
+        RecordFrame { timestamp: 100.0 + k as f64 * DT, observation_state: q.clone(), action: q }
+    }).collect();
+    write_frames_to_parquet(&tmp.path().join("j2.parquet"), &frames).unwrap();
+    inner.episodes = armd::recording::EpisodeStore::new(Some(tmp.path().to_path_buf()));
+    let epoch = inner.safety.epoch_id();
+    let (id, _) = inner.start_replay(ReplayRequest { episode: "j2".into(), speed: 1.0, gripper: true, tag: None, allow_stale: false }, epoch).unwrap();
+    let mut max_cmd = f32::MIN;
+    for _ in 0..300 {
+        let o = inner.tick(DT);
+        max_cmd = max_cmd.max(o.commanded_positions[J2]);
+        if o.action.as_ref().is_some_and(|a| a.id == id && a.state != "running") { return (o, max_cmd); }
+    }
+    panic!("replay still running");
+}
+
+/// A motion that pushes J2 further into the obstacle: a joint_move is clamped at the hold
+/// position; a replay (not clamped) trips, by the persist rule while the obstacle still
+/// loads the joint, and at once on passing the trip position when it does not.
+#[test]
+fn elastic_incident_push_further_in_is_refused_or_trips() {
+    use armd::torque_guard::TORQUE_PUSH_IN_RAD;
+    let (mut inner, arm) = elastic_incident();
+    let hold_q = inner.torque_guard.hold.unwrap().hold_q;
+    let mut t = inner.commanded_positions.clone();
+    t[J2] = 0.2;
+    inner.jog_action(t, None, None, "joint_move").unwrap();
+    for _ in 0..60 {
+        let obs = inner.tick(DT);
+        assert!(obs.commanded_positions[J2] <= hold_q + 1e-5, "J2 pushed in: {}", obs.commanded_positions[J2]);
+    }
+    let anchor = inner.torque_guard.hold.unwrap().anchor_q;
+    let (obs, max_cmd) = replay_j2_in(&mut inner);
+    let a = obs.action.as_ref().unwrap();
+    println!("SIM replay into the elastic obstacle: {} {:?}: {}; J2 cmd peaked {max_cmd:.4} rad (trip position {anchor:.4})", a.state, a.code, a.message.as_deref().unwrap_or(""));
+    assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("TORQUE_LIMIT")), "{a:?}");
+    assert!(max_cmd <= anchor + TORQUE_PUSH_IN_RAD + 1e-4, "pushed {} past the trip position", max_cmd - anchor);
+    assert!(obs.is_torqued && obs.fault.is_none() && inner.torque_guard.hold.is_some_and(|h| h.joint == J2));
+    // the obstacle no longer loads the held joint (a rigid stop at the trip position remains):
+    // the replay trips on passing the trip position + TORQUE_PUSH_IN_RAD
+    arm.with(|s| s.elastic[J2] = None);
+    ticks(&mut inner, 5);
+    assert!(inner.torque_guard.hold.is_some_and(|h| h.joint == J2), "hold kept");
+    let (obs, max_cmd) = replay_j2_in(&mut inner);
+    let a = obs.action.as_ref().unwrap();
+    println!("SIM replay into a rigid stop after the trip: {} {:?}: {}; J2 cmd peaked {max_cmd:.4} rad, torque {:.2}", a.state, a.code, a.message.as_deref().unwrap_or(""), obs.torques[J2]);
+    assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("TORQUE_LIMIT")), "{a:?}");
+    assert!(a.message.as_deref().unwrap().contains("past the position of the torque trip"), "{a:?}");
+    assert!(max_cmd <= anchor + TORQUE_PUSH_IN_RAD + 0.003, "pushed {} past the trip position", max_cmd - anchor);
+}
+
+/// During the retreat park J2 is exempt, the other joints are not: a J4 saturation trips.
+#[test]
+fn elastic_incident_other_joint_still_trips_during_the_retreat() {
+    let (mut inner, arm) = elastic_incident();
+    let id = inner.unload_action().unwrap().unwrap();
+    ticks(&mut inner, 5);
+    arm.with(|s| s.forced[J4] = Some(9.5));
+    let (obs, k) = run_until_done(&mut inner, id, 50);
+    let a = obs.action.as_ref().unwrap();
+    println!("SIM J4 saturation during the retreat park: {} {:?} after {} ticks: {}", a.state, a.code, k, a.message.as_deref().unwrap_or(""));
+    assert_eq!((a.state.as_str(), a.code.as_deref()), ("failed", Some("TORQUE_LIMIT")), "{a:?}");
+    assert!(a.message.as_deref().unwrap().contains("joint 4"), "{a:?}");
+    assert!(k <= 6, "{k} ticks");
+    assert_eq!(inner.torque_guard.hold.unwrap().joint, J4);
+}
+
+/// The retreat allowance is bounded: a torque rising beyond the trip torque + margin trips at
+/// once; a torque that stays above the threshold trips once TORQUE_RETREAT_WINDOW_S has passed.
+#[test]
+fn elastic_incident_retreat_allowance_is_bounded() {
+    use armd::torque_guard::{TORQUE_RETREAT_MARGIN_RATIO, TORQUE_RETREAT_WINDOW_S};
+    // rise
+    let (mut inner, arm) = elastic_incident();
+    let trip = inner.torque_guard.hold.unwrap().torque_nm;
+    let id = inner.unload_action().unwrap().unwrap();
+    ticks(&mut inner, 3);
+    arm.with(|s| s.forced[J2] = Some(trip + TORQUE_RETREAT_MARGIN_RATIO * THR_BIG + 0.5));
+    let (obs, k) = run_until_done(&mut inner, id, 20);
+    println!("SIM torque rise during the retreat: {:?} after {k} ticks", obs.action.as_ref().unwrap().code);
+    assert_eq!(obs.action.as_ref().unwrap().code.as_deref(), Some("TORQUE_LIMIT"));
+    assert!(k <= 5, "trips within persist_ms of the rise: {k} ticks");
+    // a load that does not relax, during a 3 s joint_move back (the park trajectory is
+    // 1.5 s long, after which its settle phase is not watched)
+    let (mut inner, arm) = elastic_incident();
+    arm.with(|s| s.forced[J2] = Some(THR_BIG + 1.0));
+    let mut t = inner.commanded_positions.clone();
+    t[J2] = -0.2;
+    let (_, id, _) = inner.jog_action(t, Some(3.0), None, "joint_move").unwrap();
+    let (obs, k) = run_until_done(&mut inner, id, 200);
+    let t = k as f64 * DT;
+    println!("SIM constant {:.1} N·m during the retreat: {:?} after {t:.2} s", THR_BIG + 1.0, obs.action.as_ref().unwrap().code);
+    assert_eq!(obs.action.as_ref().unwrap().code.as_deref(), Some("TORQUE_LIMIT"));
+    assert!(t > TORQUE_RETREAT_WINDOW_S - DT && t <= TORQUE_RETREAT_WINDOW_S + 2.0 * DT, "{t}");
+}
+
+/// Lease loss after the trip (incident 01:03:38): the watchdog park retreats and completes
+/// with torque off, no WatchdogTimeout.
+#[test]
+fn elastic_incident_lease_loss_after_trip_watchdog_park_completes() {
+    let (mut inner, _arm) = elastic_incident();
+    ticks(&mut inner, 20);
+    inner.lease_enabled = true;
+    inner.lease_timeout = Duration::from_millis(10);
+    inner.last_heartbeat = std::time::Instant::now() - Duration::from_secs(1);
+    let obs = inner.tick(DT);
+    assert!(inner.watchdog_park.is_some() && inner.pending_normal_unload, "watchdog park started");
+    assert!(obs.fault.is_none());
+    let mut done = None;
+    for k in 0..800 {
+        let obs = inner.tick(DT);
+        assert!(obs.fault.is_none(), "fault {:?} at tick {k}", obs.fault);
+        if !obs.is_torqued { done = Some(k); break; }
+    }
+    let obs = inner.current_observation();
+    println!("SIM watchdog park after the trip: torque off after {:.2} s, safety {:?}, fault {:?}",
+        done.map_or(f64::NAN, |k| k as f64 * DT), obs.safety_state, obs.fault);
+    assert!(done.is_some() && !obs.is_torqued && obs.fault.is_none() && inner.watchdog_park.is_none());
+}
+
+/// Lease loss while the resting pose lies in the push direction of the hold: no park is
+/// started (it would push into the load); torque stays on at the backed-off hold and
+/// WatchdogTimeout is latched with that reason.
+#[test]
+fn lease_loss_with_the_rest_pose_behind_the_load_holds_and_latches() {
+    let mut q = [0.0; 7];
+    q[J2] = -0.2;
+    let (mut inner, arm) = rig_at(rest_profile(), q);
+    arm.with(|s| { s.stop_hi[J2] = Some(-0.1); s.elastic[J2] = Some((-0.133, J2_CONTACT_K)); });
+    let mut t = q.to_vec();
+    t[J2] = 0.0;
+    let (_, id, _) = inner.jog_action(t, None, None, "joint_move").unwrap();
+    let (obs, _) = run_until_done(&mut inner, id, 200);
+    assert_eq!(obs.action.as_ref().unwrap().code.as_deref(), Some("TORQUE_LIMIT"));
+    let hold_q = inner.torque_guard.hold.unwrap().hold_q;
+    inner.lease_enabled = true;
+    inner.lease_timeout = Duration::from_millis(10);
+    inner.last_heartbeat = std::time::Instant::now() - Duration::from_secs(1);
+    let obs = ticks(&mut inner, 3);
+    println!("SIM lease loss, rest behind the load: safety {:?}, torqued {}, J2 cmd {:.4} (hold {hold_q:.4})", obs.safety_state, obs.is_torqued, obs.commanded_positions[J2]);
+    assert!(inner.watchdog_park.is_none());
+    assert_eq!(obs.fault.as_ref().map(|f| f.code), Some(FaultCode::WatchdogTimeout));
+    assert!(obs.is_torqued);
+    assert!((obs.commanded_positions[J2] - hold_q).abs() < 1e-5, "kept the backed-off hold: {}", obs.commanded_positions[J2]);
+}
