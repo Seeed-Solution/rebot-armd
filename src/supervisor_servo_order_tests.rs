@@ -447,10 +447,9 @@ fn gripper_close_while_blocked() {
         assert!(r.peak_tau <= stiffness * lead + 1e-3, "peak {} > {}", r.peak_tau, stiffness * lead);
         if cap_on {
             // after the first latch, while the stream keeps asking for closed. On a rigid block the
-            // latch holds the measured jaw (torque ~0), the stall releases after 6 low-torque
-            // ticks and the jaw squeezes again up to the cap plus GRIPPER_FORCE_CAP_TICKS ticks
-            // of rise (k = 10: 1.34 N·m every 19 ticks). Same in both orders; the ceiling below
-            // guards that cycle from growing.
+            // latch holds the measured jaw (torque ~0); under a stream it releases only when the
+            // target opens by GRIPPER_FORCE_RELEASE_MARGIN_RAD, so the jaw does not squeeze again
+            // (before: released after 6 low-torque ticks, k = 10: 1.34 N·m every 19 ticks).
             let cap = config.gripper_policy.as_ref().unwrap().max_close_torque_nm.unwrap();
             let n = r.tau_log.len();
             let held = r.tau_log[n.saturating_sub(250)..n.saturating_sub(100)].iter().copied().fold(0.0, f32::max);

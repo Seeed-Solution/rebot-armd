@@ -96,6 +96,11 @@ pub const GRIPPER_STALL_RELEASE_NM: f32 = 0.2223;
 /// Gripper torque cap: consecutive ticks with |τ| above `gripper_policy.max_close_torque_nm`
 /// (fresh feedback, jaw driven closed) that latch the stall regardless of the jaw speed.
 pub const GRIPPER_FORCE_CAP_TICKS: u32 = 2;
+/// A torque-cap latch under a servo stream or live policy releases only when the stream's
+/// gripper target is at least this much more open than the latch hold (rad). Low torque does
+/// not release it there: on a rigid object the hold at the measured jaw reads ~0 N·m, and a
+/// release would let the stream squeeze again (a cycle every ~19 ticks in the sim rig).
+pub const GRIPPER_FORCE_RELEASE_MARGIN_RAD: f32 = 0.05;
 
 /// Feedback gap that latches BusLoss while torqued. The Damiao motors run with
 /// CAN TIMEOUT=0 and keep holding their last POS_VEL target through a gap, so a
@@ -299,6 +304,10 @@ pub struct SupervisorInner {
     /// Set once J7 stalls or an object is held; the reference may not drive J7 further in the
     /// stall direction until it ends or moves J7 the other way.
     pub gripper_motion_hold: Option<(f32, f32)>,
+    /// Gripper target of the running servo stream or live policy (last accepted frame); None
+    /// when no stream drives the gripper (no frame for `motion_frame_timeout`, an action or a
+    /// whole-arm reference runs, torque changes).
+    pub gripper_stream_target: Option<f32>,
     /// A park carried an object (J7 frozen short of closed): release it at the resting pose.
     pub park_gripper_contact: bool,
     pub park_release: Option<ParkRelease>,
@@ -580,6 +589,7 @@ impl SupervisorInner {
             gripper_force_ticks: 0,
             gripper_force_trips: 0,
             gripper_motion_hold: None,
+            gripper_stream_target: None,
             park_gripper_contact: false,
             park_release: None,
             pending_normal_unload: false,
@@ -824,6 +834,7 @@ impl SupervisorInner {
         self.gripper_low_torque_ticks = 0;
         self.gripper_force_capped = false;
         self.gripper_force_ticks = 0;
+        self.gripper_stream_target = None;
     }
 
     pub fn with_driver(mut self, mut driver: Box<dyn ArmDriver>) -> Self {
@@ -2667,12 +2678,21 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// Servo / policy intake of the gripper target: records it as the stream's gripper target and
+    /// releases the stall latch on a target away from the stall. A torque-cap latch needs the
+    /// target [`GRIPPER_FORCE_RELEASE_MARGIN_RAD`] more open than the hold.
     fn release_gripper_stall_on_reverse(&mut self, targets: &[f32]) {
         if let Some(g_idx) = self.config.gripper_index() {
+            self.gripper_stream_target = targets.get(g_idx).copied().filter(|t| t.is_finite());
             if self.gripper_stalled && targets.len() > g_idx && self.commanded_positions.len() > g_idx {
                 let delta = targets[g_idx] - self.commanded_positions[g_idx];
                 let tau_g = self.torques.get(g_idx).copied().unwrap_or(0.0);
-                if (delta * tau_g < -1e-4) || (delta * self.gripper_stall_sign < -1e-4) {
+                let reversed = if self.gripper_force_capped {
+                    delta * self.gripper_stall_sign <= -GRIPPER_FORCE_RELEASE_MARGIN_RAD
+                } else {
+                    (delta * tau_g < -1e-4) || (delta * self.gripper_stall_sign < -1e-4)
+                };
+                if reversed {
                     self.gripper_stalled = false;
                     self.gripper_high_torque_ticks = 0;
                     self.gripper_low_torque_ticks = 0;
@@ -4341,6 +4361,10 @@ impl SupervisorInner {
         let before_velocities = self.commanded_velocities.clone();
 
         // 0.1 Gripper stall protection state machine
+        if self.active_trajectory.is_some() || self.macro_run.is_some() || self.pending_normal_unload
+            || self.gravity_comp.is_some() || self.last_motion_frame.elapsed() > self.motion_frame_timeout {
+            self.gripper_stream_target = None;
+        }
         if let Some(g_idx) = self.config.gripper_index() {
             let (is_bus_fresh, has_torque_feedback, has_load_feedback) = if let Some(ref d) = self.driver {
                 if let Ok(driver) = d.lock() {
@@ -4497,6 +4521,10 @@ impl SupervisorInner {
                 } else {
                     self.gripper_high_torque_ticks = 0;
                 }
+            } else if self.gripper_stalled && self.gripper_force_capped && self.gripper_stream_target.is_some() {
+                // torque-cap latch under a stream: held until the stream opens (intake) or ends
+                self.gripper_high_torque_ticks = 0;
+                self.gripper_low_torque_ticks = 0;
             } else if self.gripper_stalled {
                 self.gripper_high_torque_ticks = 0;
                 let is_released = if has_torque_feedback {
