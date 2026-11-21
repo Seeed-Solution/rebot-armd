@@ -3497,7 +3497,7 @@ impl SupervisorInner {
         self.target_positions = target;
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
-        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(motion)));
+        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(Box::new(motion))));
         if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
         Ok(duration)
     }
@@ -3589,7 +3589,7 @@ impl SupervisorInner {
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
         let id = self.begin_action("gripper", tag);
-        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(motion)));
+        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(Box::new(motion))));
         Ok((id, duration))
     }
 
@@ -3653,7 +3653,7 @@ impl SupervisorInner {
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
         let id = self.begin_action("gripper_zero_check", None);
-        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(motion)));
+        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(Box::new(motion))));
         let base_closed_rad = self.base_gripper_policy.as_ref().map_or(0.0, |p| p.closed_rad);
         self.gripper_stalled = false;
         self.gripper_high_torque_ticks = 0;
@@ -4234,7 +4234,7 @@ impl SupervisorInner {
             gripper_idx + 1, self.commanded_positions[gripper_idx], motion.target);
         if let Some(park) = self.watchdog_park.as_mut() { park.budget_s += motion.timeout_s.max(duration); }
         self.target_positions[gripper_idx] = motion.target;
-        self.active_trajectory = Some(ActiveTrajectory::new(None, Reference::Gripper(motion)));
+        self.active_trajectory = Some(ActiveTrajectory::new(None, Reference::Gripper(Box::new(motion))));
         self.park_release = Some(next);
         true
     }

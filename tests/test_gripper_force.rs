@@ -283,7 +283,7 @@ fn open_is_unaffected() {
 
 fn gripper_motion(inner: &SupervisorInner) -> Option<&armd::motion::GripperMotion> {
     match inner.active_trajectory.as_ref().map(|a| &a.reference) {
-        Some(armd::motion::Reference::Gripper(g)) => Some(g),
+        Some(armd::motion::Reference::Gripper(g)) => Some(g.as_ref()),
         _ => None,
     }
 }

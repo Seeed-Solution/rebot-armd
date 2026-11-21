@@ -1244,7 +1244,7 @@ pub enum Reference {
     Quintic(MultiJointQuinticTrajectory),
     Path(PathTrajectory),
     #[cfg(not(target_arch = "wasm32"))]
-    Gripper(GripperMotion),
+    Gripper(Box<GripperMotion>),
     /// Episode replay (`crate::replay`).
     #[cfg(not(target_arch = "wasm32"))]
     Replay(Box<crate::replay::ReplayMotion>),
