@@ -261,6 +261,7 @@ try {
     // drawer: screenshot, refresh paused while the tab is hidden
     await A.page.click((await vis(A.page, 'btn-task')) ? '#btn-task' : '#ext-open-task');
     await A.page.waitForTimeout(400);
+    ok(await vis(A.page, 'task'), `${tag} drawer opens from ${(await vis(A.page, 'btn-task')) ? 'the task button' : 'the banner'}`);
     await shot(A.page, `task_drawer_act_${tag}`);
     await A.page.click('#task-tabs [data-tab="env"]');
     await A.page.waitForTimeout(500);
@@ -283,6 +284,19 @@ try {
     await mcp.release(); mcp.close();
     ok(!A.errs.length, `${tag} no page errors ${JSON.stringify(A.errs)}`);
     await A.ctx.close();
+    if (vp !== '375x812') continue;
+    // simple mode on the phone with an external holder: header fits, the task button opens the drawer
+    const Sm = await openPage({ lang, ui: 'simple', viewport });
+    const mcp2 = await extClient('rebot-mcp');
+    await mcp2.acquire();
+    await Sm.page.waitForTimeout(600);
+    const sl = await Sm.page.evaluate(() => ({ sw: document.scrollingElement.scrollWidth, iw: innerWidth, lang: document.getElementById('btn-lang').getBoundingClientRect().right,
+      task: getComputedStyle(document.getElementById('btn-task')).display !== 'none' }));
+    ok(sl.sw <= sl.iw && sl.lang <= sl.iw + 0.5, `${tag} simple, external holder: no horizontal scroll, language button in view ${JSON.stringify(sl)}`);
+    ok(sl.task, `${tag} simple, external holder: task button shown`);
+    await shot(Sm.page, `task_banner_simple_${tag}`);
+    await mcp2.release(); mcp2.close();
+    await Sm.ctx.close();
   }
 } finally {
   await browser.close();

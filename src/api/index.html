@@ -772,8 +772,9 @@ body.is-fs.ui-simple .ext-banner, body.is-hud.ui-simple .ext-banner { display: n
 #btn-task.is-live .live-dot { display: block; }
 #btn-task.is-live.warn .live-dot { background: #d48806; }
 /* narrow headers: the task button shows while something external runs (the video's #act-chip opens the drawer too);
-   on tablets the mode switch gives up some width so the header does not scroll sideways */
-@media (max-width: 479px) { #btn-task:not(.is-live) { display: none; } }
+   in expert mode the points and settings buttons leave no room, and #ext-banner (shown whenever the button would
+   be live) opens the drawer instead; on tablets the mode switch gives up some width so the header does not scroll sideways */
+@media (max-width: 479px) { #btn-task:not(.is-live), body.ui-expert #btn-task { display: none; } }
 @media (min-width: 640px) and (max-width: 999px) { .ui-switch button { min-width: 88px; } }
 .task-tabs { display: flex; }
 .task-tabs button { flex: 1 1 0; }
