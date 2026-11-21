@@ -844,6 +844,10 @@ async fn ws_policy_start_and_stop_end_to_end() {
         schema["capabilities"]["policy_runtime"]["inputs"],
         serde_json::json!(["proprioception", "detector_top1_box_norm_v1"])
     );
+    assert_eq!(
+        schema["capabilities"]["policy_runtime"]["features"],
+        serde_json::json!(["speed_gate", "policy_stats", "policy_delete"])
+    );
     assert!(schema["capabilities"]["policy_runtime"]["modes"]
         .as_array()
         .unwrap()

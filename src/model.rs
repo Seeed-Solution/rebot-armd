@@ -2136,6 +2136,10 @@ pub struct PolicyRuntimeCapabilities {
     pub backends: Vec<String>,
     pub inputs: Vec<String>,
     pub modes: Vec<String>,
+    /// `speed_gate`: a live start is refused with `POLICY_TOO_SLOW` after a warm-up, and the
+    /// start ACK carries `warmup_infer_us` / `too_slow`; `policy_stats`: per-step timing in the
+    /// `policy` action status; `policy_delete`: `DELETE /api/v1/sandbox/policies/{id}`.
+    pub features: Vec<String>,
 }
 
 impl PolicyRuntimeCapabilities {
@@ -2152,6 +2156,7 @@ impl PolicyRuntimeCapabilities {
                 "detector_top1_box_norm_v1".to_string(),
             ],
             modes: vec!["shadow".to_string(), "live_sim".to_string()],
+            features: ["speed_gate", "policy_stats", "policy_delete"].map(String::from).to_vec(),
         }
     }
 }
