@@ -32,7 +32,9 @@ enum Load {
     Rigid(f32, f32),
 }
 
-struct Rig { q: [f32; 7], v: [f32; 7], tau: [f32; 7], enabled: EnableState, load: Load, broke: bool, peak_tau: f32, max_lead: f32, max_cmd: f32 }
+struct Rig { q: [f32; 7], v: [f32; 7], tau: [f32; 7], enabled: EnableState, load: Load, broke: bool, peak_tau: f32, max_lead: f32, max_cmd: f32,
+    /// J7 per write: (command, position, torque)
+    log: Vec<(f32, f32, f32)> }
 struct RigDriver(Arc<Mutex<Rig>>);
 
 impl ArmDriver for RigDriver {
@@ -69,6 +71,7 @@ impl ArmDriver for RigDriver {
             r.v[6] = v;
             r.tau[6] = tau;
             r.peak_tau = r.peak_tau.max(tau);
+            r.log.push((t.position, q, tau));
             if r.load == Load::Incident && tau >= BREAK_NM {
                 // the finger breaks: the torque falls, the jaw runs on
                 r.broke = true;
@@ -84,7 +87,7 @@ impl ArmDriver for RigDriver {
 }
 
 fn rig_with(config: ArmConfig, load: Load) -> (SupervisorInner, Arc<Mutex<Rig>>) {
-    let rig = Arc::new(Mutex::new(Rig { q: INSPECT, v: [0.0; 7], tau: [0.0; 7], enabled: EnableState::Disabled, load, broke: false, peak_tau: 0.0, max_lead: 0.0, max_cmd: f32::NEG_INFINITY }));
+    let rig = Arc::new(Mutex::new(Rig { q: INSPECT, v: [0.0; 7], tau: [0.0; 7], enabled: EnableState::Disabled, load, broke: false, peak_tau: 0.0, max_lead: 0.0, max_cmd: f32::NEG_INFINITY, log: Vec::new() }));
     let mut inner = SupervisorInner::new(config).with_driver(Box::new(RigDriver(rig.clone())));
     inner.lease_enabled = false;
     inner.tick(DT);
@@ -478,5 +481,192 @@ mod policy_stream {
         eprintln!("blocked policy: max lead {:.3} rad, J7 {:.3}", r.max_lead, r.q[6]);
         assert!(r.max_lead <= max_lead() + 1e-4, "lead {}", r.max_lead);
         assert!((r.q[6] + 2.0).abs() < 1e-3);
+    }
+}
+
+/// What a closing stream did to J7 on the rig.
+#[derive(Debug, Default)]
+struct StreamRun {
+    /// First torque sample with the jaw at the block (the impact).
+    impact_nm: f32,
+    /// Max torque after the impact sample.
+    after_impact_nm: f32,
+    /// Max torque over the last 3 s of the hold.
+    held_nm: f32,
+    /// Re-squeeze cycles after the impact: torque below 0.2 N·m, then above 0.5 N·m again.
+    cycles: usize,
+    trips: u64,
+}
+
+/// Leader-like stream at 30 fps on the 50 Hz loop: the J7 target ramps toward closed at
+/// `speed` rad/s, then stays at closed until `secs`.
+fn close_stream(inner: &mut SupervisorInner, rig: &Arc<Mutex<Rig>>, speed: f32, secs: f64) -> StreamRun {
+    let epoch = inner.safety.epoch_id();
+    let mut target = INSPECT.to_vec();
+    let (mut t, mut next_frame) = (0.0f64, 0.0f64);
+    rig.lock().unwrap().log.clear();
+    for _ in 0..(secs / DT) as usize {
+        if t >= next_frame - 1e-9 {
+            next_frame += 1.0 / 30.0;
+            target[6] = (INSPECT[6] + speed * t as f32).min(0.0);
+            inner.servo(target.clone(), epoch).unwrap();
+        }
+        inner.tick(DT);
+        t += DT;
+    }
+    let r = rig.lock().unwrap();
+    let block = match r.load { Load::Rigid(b, _) => b, _ => 0.0 };
+    let log = &r.log;
+    let contact = log.iter().position(|&(_, q, _)| q >= block - 1e-6);
+    let mut run = StreamRun { trips: inner.gripper_force_trips, ..Default::default() };
+    if let Some(c) = contact {
+        run.impact_nm = log[c].2;
+        run.after_impact_nm = log[c + 1..].iter().map(|e| e.2).fold(0.0, f32::max);
+        let mut low = false;
+        for &(_, _, tau) in &log[c + 1..] {
+            if tau < 0.2 { low = true; } else if low && tau > 0.5 { run.cycles += 1; low = false; }
+        }
+    }
+    let n = log.len();
+    run.held_nm = log[n.saturating_sub((3.0 / DT) as usize)..].iter().map(|e| e.2).fold(0.0, f32::max);
+    run
+}
+
+/// Seconds of a stream from open to closed at `speed`, plus a 5 s hold.
+fn stream_secs(speed: f32) -> f64 { f64::from(-INSPECT[6] / speed) + 5.0 }
+
+/// Item 1: a torque-cap latch under a stream that keeps asking for closed holds (no
+/// re-squeeze); regulator off, so the latch is what bounds the force.
+#[test]
+fn stream_latch_does_not_release_while_closing() {
+    for stiffness in [3.0f32, 10.0, 30.0] {
+        let (mut inner, rig) = rig_with(without_regulator(), Load::Rigid(-2.0, stiffness));
+        let run = close_stream(&mut inner, &rig, 1.0, stream_secs(1.0));
+        eprintln!("latch only, k {stiffness}: {run:?}");
+        if run.trips > 0 {
+            assert_eq!(run.trips, 1, "k {stiffness}: one trip, no re-squeeze cycle: {run:?}");
+            assert_eq!(run.cycles, 0, "k {stiffness}: {run:?}");
+            assert!(inner.gripper_stalled && inner.gripper_force_capped);
+            assert!(run.held_nm < 0.05, "k {stiffness}: held at {:.3} N·m", run.held_nm);
+        } else {
+            // soft enough that the impact stays under the cap: the ordinary stall rule holds it
+            assert!(run.after_impact_nm <= cap() + 1e-3, "k {stiffness}: {run:?}");
+        }
+    }
+}
+
+/// Item 2 + 3: rigid block at 3 / 10 / 30 N·m/rad under a 30 fps closing stream at 1 rad/s
+/// (incident leader ramp) and 0.3 rad/s. After the impact sample the torque stays at or
+/// below 1.2 x cap and settles near contact_torque_nm; no re-squeeze cycles over the 5 s hold.
+/// The impact sample itself is stiffness x the POS_VEL lag at contact (no feedback precedes it);
+/// it stays under stiffness x max_lead_rad.
+#[test]
+fn rigid_stream_contact_is_regulated() {
+    let p = GripperPolicy::rebot_dm();
+    let contact = p.contact_torque_nm.unwrap();
+    for speed in [1.0f32, 0.3] {
+        for stiffness in [3.0f32, 10.0, 30.0] {
+            let (mut inner, rig) = rig(Load::Rigid(-2.0, stiffness));
+            let run = close_stream(&mut inner, &rig, speed, stream_secs(speed));
+            eprintln!("regulated, {speed} rad/s, k {stiffness}: impact {:.3} N·m, after impact {:.3}, held {:.3}, cycles {}, trips {}",
+                run.impact_nm, run.after_impact_nm, run.held_nm, run.cycles, run.trips);
+            assert!(run.impact_nm <= stiffness * max_lead() + 1e-3, "{run:?}");
+            assert!(run.after_impact_nm <= 1.2 * cap(), "k {stiffness} {speed} rad/s: {run:?}");
+            assert_eq!(run.cycles, 0, "k {stiffness} {speed} rad/s: {run:?}");
+            assert!(run.held_nm <= contact + 0.2 && run.held_nm >= 0.5 * contact, "k {stiffness} {speed} rad/s: held {:.3}", run.held_nm);
+            let r = rig.lock().unwrap();
+            assert!((r.q[6] + 2.0).abs() < 1e-3, "jaw at the block: {}", r.q[6]);
+        }
+    }
+}
+
+/// Opening after the hold works at once: the first open frame moves the command open.
+#[test]
+fn open_after_stream_hold_is_immediate() {
+    for config in [ArmConfig::rebot_dm(), without_regulator()] {
+        let (mut inner, rig) = rig_with(config, Load::Rigid(-2.0, 10.0));
+        close_stream(&mut inner, &rig, 1.0, stream_secs(1.0));
+        let epoch = inner.safety.epoch_id();
+        let hold = inner.commanded_positions[6];
+        let mut target = INSPECT.to_vec();
+        target[6] = -3.0;
+        inner.servo(target.clone(), epoch).unwrap();
+        assert!(!inner.gripper_stalled, "an open frame releases the latch");
+        // the jerk-limited stepper reverses within a few ticks (it may still creep closed at
+        // 0.02 rad/s under the contact regulator): 3 ticks = 60 ms
+        for _ in 0..3 { inner.tick(DT); }
+        assert!(inner.commanded_positions[6] < hold - 1e-4, "command {} hold {hold}", inner.commanded_positions[6]);
+        for _ in 0..7 { inner.servo(target.clone(), epoch).unwrap(); inner.tick(DT); }
+        assert!(inner.commanded_positions[6] < hold - 0.05, "after 0.2 s (jerk-limited start): command {} hold {hold}", inner.commanded_positions[6]);
+        for _ in 0..100 { inner.servo(target.clone(), epoch).unwrap(); inner.tick(DT); }
+        assert!((rig.lock().unwrap().q[6] + 3.0).abs() < 0.05, "J7 {}", rig.lock().unwrap().q[6]);
+    }
+}
+
+/// An open by less than the margin keeps a torque-cap latch; the jaw stays.
+#[test]
+fn small_open_keeps_the_stream_latch() {
+    let (mut inner, rig) = rig_with(without_regulator(), Load::Rigid(-2.0, 10.0));
+    let run = close_stream(&mut inner, &rig, 1.0, stream_secs(1.0));
+    assert_eq!(run.trips, 1, "{run:?}");
+    let epoch = inner.safety.epoch_id();
+    let hold = inner.commanded_positions[6];
+    let mut target = INSPECT.to_vec();
+    target[6] = hold - 0.5 * armd::supervisor::GRIPPER_FORCE_RELEASE_MARGIN_RAD;
+    for _ in 0..20 { inner.servo(target.clone(), epoch).unwrap(); inner.tick(DT); }
+    assert!(inner.gripper_stalled && inner.gripper_force_capped);
+    assert!((inner.commanded_positions[6] - hold).abs() < 1e-5);
+}
+
+/// Free close (no object): the regulator never engages; the stream reaches closed in the same
+/// ticks and with the same commands as without it, at 1 rad/s and at a slow 0.3 rad/s.
+#[test]
+fn free_stream_is_not_slowed() {
+    for speed in [1.0f32, 0.3] {
+        let mut logs = Vec::new();
+        for config in [ArmConfig::rebot_dm(), without_regulator()] {
+            let (mut inner, rig) = rig_with(config, Load::Free);
+            close_stream(&mut inner, &rig, speed, stream_secs(speed));
+            let r = rig.lock().unwrap();
+            let closed = r.log.iter().position(|&(_, q, _)| q > -0.05);
+            assert!(r.q[6] > -0.05, "J7 {}", r.q[6]);
+            let lag = r.log.iter().map(|&(c, q, _)| c - q).fold(0.0, f32::max);
+            eprintln!("free {speed} rad/s: closed after {closed:?} ticks, max lead {lag:.3} rad");
+            logs.push(r.log.clone());
+        }
+        assert_eq!(logs[0], logs[1], "{speed} rad/s: the regulator changed a free close");
+    }
+}
+
+/// Live policy targets at closed onto a rigid block: same regulation as the servo stream.
+#[cfg(feature = "policy-runtime")]
+#[test]
+fn rigid_policy_stream_is_regulated() {
+    use armd::policy_runtime::{PolicyMode, PolicyRunStart};
+    for stiffness in [3.0f32, 10.0, 30.0] {
+        let (mut inner, rig) = rig(Load::Rigid(-2.0, stiffness));
+        inner.follower = Some("sim".into());
+        inner.lease_enabled = true;
+        let gen = inner.acquire_lease("policy-rig").unwrap();
+        let epoch = inner.safety.epoch_id();
+        let id = inner.begin_policy_run(PolicyRunStart {
+            epoch_id: epoch, connection_id: "policy-rig".into(), lease_generation: gen, policy_id: "rig".into(),
+            artifact_digest: "0".repeat(64), backend: "mlp".into(), mode: PolicyMode::Live, sim_only: false,
+            max_first_step_rad: None, max_step_rad: None, tag: None, i_am_at_the_arm: false, verified_release_gate: None,
+        }).unwrap();
+        let mut target = INSPECT.to_vec();
+        let mut g = INSPECT[6];
+        for _ in 0..(stream_secs(1.0) / DT) as usize {
+            g = (g + DT as f32).min(0.0);
+            target[6] = g;
+            inner.policy_step(id, target.clone(), Some(0)).unwrap();
+            inner.tick(DT);
+        }
+        let r = rig.lock().unwrap();
+        let c = r.log.iter().position(|&(_, q, _)| q >= -2.0 - 1e-6).unwrap();
+        let after = r.log[c + 1..].iter().map(|e| e.2).fold(0.0, f32::max);
+        eprintln!("policy k {stiffness}: impact {:.3} N·m, after impact {after:.3}", r.log[c].2);
+        assert!(after <= 1.2 * cap(), "k {stiffness}: {after}");
+        assert!(inner.is_policy_run_active(id));
     }
 }
