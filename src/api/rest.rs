@@ -501,8 +501,8 @@ pub async fn action_requires_lease(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let token = crate::auth::OperatorAuth::extract_token(&headers);
     if auth.is_enforced() && !auth.is_operator(token.as_deref()) {
-        if uri.path() == "/api/v1/mode/gravity_comp" {
-            return Err(ApiError::operator_required("/api/v1/mode/gravity_comp"));
+        if uri.path() == "/api/v1/mode/gravity_comp" || uri.path() == crate::measure_multiview::PATH {
+            return Err(ApiError::operator_required(uri.path()));
         }
         #[cfg(feature = "policy-runtime")]
         if uri.path() == "/api/v1/action/policy/start" && !supervisor.inner().read().await.policy_live_allowed() {

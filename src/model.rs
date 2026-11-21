@@ -2130,6 +2130,11 @@ pub struct Capabilities {
     /// Absent (false) from older armd.
     #[serde(default)]
     pub grasp_measure: bool,
+    /// Action `/api/v1/action/measure_multiview` (lease, operator session): motion-stereo object
+    /// measurement from views around the object (`ActionStatus.measurement`); same value as `grasp`.
+    /// Absent (false) from older armd.
+    #[serde(default)]
+    pub measure_multiview: bool,
     /// Camera calibration wizard: `GET /api/v1/calibration`, WS `/api/v1/calibration/apply`
     /// and `/api/v1/calibration/restore`, `camera_mount.q_end_cam`; same value as `grasp`.
     #[serde(default)]
@@ -2454,6 +2459,7 @@ impl Capabilities {
             yaw_outward: arm_with_gripper && kin,
             move_path_joint: arm_with_gripper && kin,
             grasp_measure: grasp,
+            measure_multiview: grasp,
             calibration_apply: grasp,
             calibration_kinematics: grasp && config.arm_model.chain().is_none(),
             calibration_verify: grasp && config.arm_model.chain().is_none(),

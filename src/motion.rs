@@ -1528,6 +1528,10 @@ pub struct ActionStatus {
     /// Per-step timing of a `policy` action, while running and in the final result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_stats: Option<PolicyStats>,
+    /// `measure_multiview`: the measurement (`method`, `objects`, `table_check`, `views`, `why`;
+    /// src/measure_multiview.rs), set when the action ends after its captures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement: Option<serde_json::Value>,
 }
 
 /// `ActionStatus::policy_stats`: inferences done (`steps`), steps whose inference + commit

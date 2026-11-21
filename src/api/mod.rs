@@ -244,6 +244,7 @@ pub fn create_router_full_with_sandbox(
         .route("/api/v1/action/move_to_pose", post(rest::action_requires_lease))
         .route("/api/v1/action/place", post(rest::action_requires_lease))
         .route("/api/v1/action/replay", post(rest::action_requires_lease))
+        .route(crate::measure_multiview::PATH, post(rest::action_requires_lease))
         .route("/api/v1/mode/gravity_comp", post(rest::action_requires_lease));
     #[cfg(feature = "policy-runtime")]
     let router = router

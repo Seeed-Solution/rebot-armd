@@ -1027,6 +1027,11 @@ pub trait DetectionSource: Send + Sync {
     /// The next frame with `frame_id > after` (any frame when `after` is None), waiting up to
     /// `wait_ms`. `Ok(None)` = no new frame in time.
     fn next_frame(&self, after: Option<u64>, wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>>;
+    /// The current camera image as JPEG (rebot-vision `GET /snapshot.jpg`: the frame letterboxed
+    /// into a square, used by the multi-view measurement). Default: not available.
+    fn snapshot_jpeg(&self) -> BoxFuture<'_, Result<Vec<u8>, String>> {
+        Box::pin(async { Err("camera snapshots not supported by this detection source".to_string()) })
+    }
 }
 
 /// The camera app's detection API (the same upstream armd proxies under /api/v1/detection).
@@ -1267,6 +1272,9 @@ impl DetectionSource for HttpDetectionSource {
         Box::pin(async move {
             crate::api::proxy::request_json(&self.upstream, "POST", "/api/mode", Some(body.as_bytes()), Duration::from_secs(2)).await.map(|_| ())
         })
+    }
+    fn snapshot_jpeg(&self) -> BoxFuture<'_, Result<Vec<u8>, String>> {
+        Box::pin(crate::api::proxy::fetch_snapshot(&self.upstream, Duration::from_secs(3)))
     }
     fn next_frame(&self, after: Option<u64>, wait_ms: u64) -> BoxFuture<'_, Result<Option<DetectionFrame>, String>> {
         Box::pin(async move {

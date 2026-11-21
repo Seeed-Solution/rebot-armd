@@ -1,0 +1,215 @@
+//! Motion-stereo geometry (src/mview_stereo.rs) on rendered images: a textured table with a box,
+//! three views at a known lateral baseline, Gaussian intensity noise (sigma 2 grey levels) and one
+//! of two pixel-noise models:
+//! - random: Gaussian noise of 1 px per axis added to every matched pixel of every view before the
+//!   triangulation (`reconstruct_perturbed`; localisation noise; the acceptance case, height
+//!   error < 2 mm);
+//! - systematic: each view's image rendered with its principal point shifted by 1 px in a random
+//!   direction (a 1 px pose / calibration error per view; reported: it biases table and object
+//!   points alike, which `table_check` shows).
+mod render;
+
+use armd::kinematics;
+use armd::mview_stereo::{self, Params, View};
+use render::{BoxObj, Noise, Rng, Scene};
+
+const SIZE: [f64; 2] = [640.0, 360.0];
+const FX: f64 = 804.0;
+
+struct Case { height: f64, baseline: f64, distance: f64, seed: u64, px_noise: f64, shift_px: f64 }
+
+struct Out { m: mview_stereo::ObjectMeasure, t: mview_stereo::TableCheck, stats: mview_stereo::Stats, truth: BoxObj, ms: f64 }
+
+/// Views at chord offsets -B/2, 0, +B/2 around the box's top centre, start camera `distance` from
+/// it at 55 deg elevation from the base side.
+fn run(case: &Case) -> Out {
+    let b = BoxObj { xy: [0.30, 0.01], yaw: 20f64.to_radians(), size: [0.050, 0.030, case.height] };
+    let scene = Scene::new(0.0, vec![b]);
+    let pivot = [b.xy[0], b.xy[1], case.height * 0.5];
+    let el = 55f64.to_radians();
+    let c0 = [pivot[0] - case.distance * el.cos(), pivot[1], pivot[2] + case.distance * el.sin()];
+    let cam0 = render::look_at(c0, pivot, FX, SIZE);
+    let mut rng = Rng(case.seed * 7919 + 1);
+    let offsets = [-case.baseline / 2.0, 0.0, case.baseline / 2.0];
+    let views: Vec<View> = offsets.iter().enumerate().map(|(i, &o)| {
+        let cam = render::orbit(&cam0, pivot, o);
+        let a = 2.0 * std::f64::consts::PI * rng.next_f64();
+        let noise = Noise { shift_px: [case.shift_px * a.cos(), case.shift_px * a.sin()], sigma: 2.0 };
+        View { img: render::render(&scene, &cam, SIZE[0] as usize, SIZE[1] as usize, 2, noise, case.seed * 31 + i as u64), cam }
+    }).collect();
+    let bx = render::box_px(&scene, &b, &views[1].cam);
+    let (w, h) = (bx[2] - bx[0], bx[3] - bx[1]);
+    let region = [bx[0] - 0.5 * w, bx[1] - 0.5 * h, bx[2] + 0.5 * w, bx[3] + 0.5 * h];
+    let p = Params::new(0.0);
+    let t0 = std::time::Instant::now();
+    let mut nrng = Rng(case.seed * 104_729 + 3);
+    let sd = case.px_noise;
+    let rec = mview_stereo::reconstruct_perturbed(&views, 1, region, bx, &p, |_, q| [q[0] + sd * nrng.gauss(), q[1] + sd * nrng.gauss()]);
+    let m = mview_stereo::measure(&rec.points, &p).unwrap_or_else(|e| panic!("{e}: {:?}", rec.stats));
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    Out { t: mview_stereo::table_check(&rec.points, &p), m, stats: rec.stats, truth: b, ms }
+}
+
+fn yaw_err(a: f64, b: f64) -> f64 { ((a - b + 90.0).rem_euclid(180.0) - 90.0).abs() }
+
+fn table_row(height: f64, seed: u64, o: &Out) -> f64 {
+    let err = (o.m.height_m - height) * 1000.0;
+    println!("| {:.0} | {seed} | {:.2} | {:+.2} | {:+.1} | {:+.1} | {:.1} | {} | {:.2} | {} | {:.2} | {:.2} | {} | {} | {} | {} | {} | {:.0} |",
+        height * 1000.0, o.m.height_m * 1000.0, err, (o.m.length_m - o.truth.size[0]) * 1000.0, (o.m.width_m - o.truth.size[1]) * 1000.0,
+        yaw_err(o.m.yaw_deg, o.truth.yaw.to_degrees()), o.m.n_points, o.m.reproj_rms_px, o.t.n_points,
+        o.t.median_abs_mm.unwrap_or(f64::NAN), o.t.p90_abs_mm.unwrap_or(f64::NAN),
+        o.stats.features, o.stats.no_peak, o.stats.ambiguous, o.stats.lr_rejected, o.stats.reproj_rejected, o.ms);
+    err
+}
+
+const HEADER: &str = "| height mm | seed | measured mm | err mm | length err mm | width err mm | yaw err deg | n_points | reproj rms px | table n | table median mm | table p90 mm | features | no_peak | ambiguous | lr_rej | reproj_rej | compute ms |";
+
+#[test]
+fn heights_20_40_80_mm_within_2_mm_at_8_cm_baseline_35_cm_with_1_px_noise() {
+    println!("random 1 px noise\n{HEADER}");
+    let mut worst: f64 = 0.0;
+    for height in [0.020, 0.040, 0.080] {
+        for seed in 1..=3 {
+            let o = run(&Case { height, baseline: 0.08, distance: 0.35, seed, px_noise: 1.0, shift_px: 0.0 });
+            let err = table_row(height, seed, &o);
+            worst = worst.max(err.abs());
+            assert!(err.abs() < 2.0, "height {height}: error {err:.2} mm");
+            assert!(o.m.n_points >= 20, "{:?}", o.stats);
+            let c = kinematics::norm(&kinematics::sub(&[o.m.centroid_m[0], o.m.centroid_m[1], 0.0], &[o.truth.xy[0], o.truth.xy[1], 0.0]));
+            assert!(c < 0.005, "centroid off by {c:.4} m");
+            assert!(yaw_err(o.m.yaw_deg, o.truth.yaw.to_degrees()) < 10.0, "yaw {}", o.m.yaw_deg);
+            assert!(o.t.n_points >= 20 && o.t.median_mm.unwrap().abs() < 1.0 && o.t.median_abs_mm.unwrap() < 3.0, "{:?}", o.t);
+        }
+    }
+    println!("worst |height error| {worst:.2} mm");
+}
+
+#[test]
+fn a_1_px_pose_error_per_view_biases_object_and_table_alike() {
+    // reported, bounded loosely: the table check shows the same bias as the object height
+    println!("systematic 1 px shift per view\n{HEADER}");
+    for height in [0.020, 0.040, 0.080] {
+        for seed in 1..=3 {
+            let o = run(&Case { height, baseline: 0.08, distance: 0.35, seed, px_noise: 0.0, shift_px: 1.0 });
+            let err = table_row(height, seed, &o);
+            assert!(err.abs() < 5.0, "height {height}: error {err:.2} mm");
+            // the bias is common to table and object: relative to the triangulated table it cancels
+            let rel = err - o.t.median_mm.unwrap();
+            println!("  height - table median: error {rel:+.2} mm");
+            assert!(rel.abs() < 1.5, "height {height}: relative error {rel:.2} mm");
+        }
+    }
+}
+
+#[test]
+fn without_noise_the_height_error_is_sub_millimetre() {
+    for height in [0.020, 0.080] {
+        let o = run(&Case { height, baseline: 0.08, distance: 0.35, seed: 4, px_noise: 0.0, shift_px: 0.0 });
+        let err = (o.m.height_m - height) * 1000.0;
+        assert!(err.abs() < 1.0, "height {height}: {err:.2} mm ({:?})", o.stats);
+        assert!(o.m.reproj_rms_px < 0.5, "{}", o.m.reproj_rms_px);
+    }
+}
+
+#[test]
+fn triangulated_points_lie_on_the_rendered_surfaces() {
+    // epipolar matching check: every accepted point is within 3 mm of the table or the box surface
+    let height = 0.040;
+    let b = BoxObj { xy: [0.30, 0.01], yaw: 20f64.to_radians(), size: [0.050, 0.030, height] };
+    let scene = Scene::new(0.0, vec![b]);
+    let pivot = [0.30, 0.01, 0.02];
+    let cam0 = render::look_at([0.10, 0.01, 0.31], pivot, FX, SIZE);
+    let views: Vec<View> = [-0.04, 0.0, 0.04].iter().enumerate().map(|(i, &o)| {
+        let cam = render::orbit(&cam0, pivot, o);
+        View { img: render::render(&scene, &cam, 640, 360, 2, Noise { sigma: 2.0, ..Noise::default() }, 50 + i as u64), cam }
+    }).collect();
+    let bx = render::box_px(&scene, &b, &views[1].cam);
+    let region = [bx[0] - 40.0, bx[1] - 40.0, bx[2] + 40.0, bx[3] + 40.0];
+    let rec = mview_stereo::reconstruct(&views, 1, region, bx, &Params::new(0.0));
+    assert!(rec.points.len() > 100, "{:?}", rec.stats);
+    let (c, s) = (b.yaw.cos(), b.yaw.sin());
+    let mut worst: f64 = 0.0;
+    for q in &rec.points {
+        let rel = [q.x[0] - b.xy[0], q.x[1] - b.xy[1]];
+        let (u, v) = (c * rel[0] + s * rel[1], -s * rel[0] + c * rel[1]);
+        let (du, dv) = ((u.abs() - b.size[0] / 2.0).max(0.0), (v.abs() - b.size[1] / 2.0).max(0.0));
+        let outside = du.hypot(dv);
+        // distance to the box surface (outside: to the closest face; inside the footprint: to the top or a side)
+        let d_box = if outside > 0.0 { outside.hypot((q.x[2] - height).max(0.0)) } else {
+            (q.x[2] - height).abs().min(b.size[0] / 2.0 - u.abs()).min(b.size[1] / 2.0 - v.abs())
+        };
+        let d = d_box.min(q.x[2].abs());
+        worst = worst.max(d);
+        assert!(d < 0.003, "point {:?} is {:.1} mm from every surface", q.x, d * 1000.0);
+    }
+    println!("{} points, worst surface distance {:.2} mm, {:?}", rec.points.len(), worst * 1000.0, rec.stats);
+}
+
+#[test]
+fn repeated_texture_along_the_epipolar_lines_is_rejected_as_ambiguous() {
+    // a dot pattern of 4 mm period: each patch matches at every period along the epipolar line,
+    // so the ratio test must reject the matches instead of returning false depths
+    let mut scene = Scene::new(0.0, vec![]);
+    scene.periodic = true;
+    let pivot = [0.30, 0.0, 0.0];
+    let cam0 = render::look_at([0.10, 0.0, 0.29], pivot, FX, SIZE);
+    let views: Vec<View> = [-0.04, 0.0, 0.04].iter().enumerate().map(|(i, &o)| {
+        let cam = render::orbit(&cam0, pivot, o);
+        View { img: render::render(&scene, &cam, 640, 360, 2, Noise { sigma: 0.5, ..Noise::default() }, 70 + i as u64), cam }
+    }).collect();
+    let rec = mview_stereo::reconstruct(&views, 1, [200.0, 120.0, 440.0, 240.0], [280.0, 150.0, 360.0, 210.0], &Params::new(0.0));
+    let bad = rec.points.iter().filter(|q| q.x[2].abs() > 0.003).count();
+    println!("{:?}, {bad} points off the table", rec.stats);
+    assert!(rec.stats.features > 50, "{:?}", rec.stats);
+    assert!(rec.stats.ambiguous > rec.stats.features / 2, "{:?}", rec.stats);
+    assert!(bad * 10 <= rec.stats.features.max(1), "{bad} false points: {:?}", rec.stats);
+}
+
+/// Compute time of one measurement (3 and 5 views) and of a 640x640 snapshot decode. On the
+/// host: `cargo test --release --test test_mview_stereo bench -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn bench_compute_and_decode() {
+    let b = BoxObj { xy: [0.30, 0.01], yaw: 0.3, size: [0.05, 0.03, 0.04] };
+    let scene = Scene::new(0.0, vec![b]);
+    let pivot = [0.30, 0.01, 0.02];
+    let el = 55f64.to_radians();
+    let cam0 = render::look_at([pivot[0] - 0.35 * el.cos(), pivot[1], pivot[2] + 0.35 * el.sin()], pivot, FX, SIZE);
+    for n in [3usize, 5] {
+        let offsets = armd::measure_multiview::view_offsets(n, 0.08);
+        let views: Vec<View> = offsets.iter().enumerate().map(|(i, &o)| {
+            let cam = render::orbit(&cam0, pivot, o);
+            View { img: render::render(&scene, &cam, 640, 360, 2, Noise { sigma: 2.0, ..Noise::default() }, 90 + i as u64), cam }
+        }).collect();
+        let reference = n / 2;
+        let bx = render::box_px(&scene, &b, &views[reference].cam);
+        let (w, h) = (bx[2] - bx[0], bx[3] - bx[1]);
+        let region = [bx[0] - 0.5 * w - 16.0, bx[1] - 0.5 * h - 16.0, bx[2] + 0.5 * w + 16.0, bx[3] + 0.5 * h + 16.0];
+        let p = Params::new(0.0);
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let t0 = std::time::Instant::now();
+            let rec = mview_stereo::reconstruct(&views, reference, region, bx, &p);
+            let m = mview_stereo::measure(&rec.points, &p).unwrap();
+            times.push(t0.elapsed().as_secs_f64() * 1000.0);
+            assert!((m.height_m - 0.04).abs() < 0.002);
+        }
+        times.sort_by(f64::total_cmp);
+        println!("{n} views: compute median {:.1} ms (min {:.1}, max {:.1})", times[2], times[0], times[4]);
+    }
+    // snapshot decode: the frame letterboxed into 640x640, JPEG quality 90
+    let img = render::render(&scene, &cam0, 640, 360, 1, Noise { sigma: 2.0, ..Noise::default() }, 7);
+    let mut sq = vec![0u8; 640 * 640];
+    sq[140 * 640..500 * 640].copy_from_slice(&img.px);
+    let mut jpeg = Vec::new();
+    jpeg_encoder::Encoder::new(&mut jpeg, 90).encode(&sq, 640, 640, jpeg_encoder::ColorType::Luma).unwrap();
+    let mut rgb = Vec::with_capacity(640 * 640 * 3);
+    for v in &sq { rgb.extend_from_slice(&[*v, *v, *v]); }
+    let mut jpeg_rgb = Vec::new();
+    jpeg_encoder::Encoder::new(&mut jpeg_rgb, 90).encode(&rgb, 640, 640, jpeg_encoder::ColorType::Rgb).unwrap();
+    for (what, data) in [("luma", &jpeg), ("ycbcr 4:2:0", &jpeg_rgb)] {
+        let t0 = std::time::Instant::now();
+        for _ in 0..20 { armd::measure_multiview::decode_frame(data, SIZE).unwrap(); }
+        println!("decode 640x640 {what} ({} KB): {:.1} ms", data.len() / 1024, t0.elapsed().as_secs_f64() * 1000.0 / 20.0);
+    }
+}

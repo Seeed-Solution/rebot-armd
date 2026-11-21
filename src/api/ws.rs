@@ -247,6 +247,7 @@ enum ActionStart {
     DryRunGrasp(Value),
     Sequence(Box<crate::sequences::RunPlan>),
     CalibHover(Box<crate::calib_hover::HoverPlan>),
+    MeasureMultiview(Box<crate::measure_multiview::Plan>),
     #[cfg(feature = "policy-runtime")]
     Policy(Box<PendingPolicyStart>),
     #[cfg(feature = "policy-runtime")]
@@ -371,6 +372,7 @@ fn prepare_action(
         }
         "/api/v1/action/run_sequence" => return Ok(ActionStart::Sequence(Box::new(crate::sequences::prepare_run(inner, body, epoch)?))),
         crate::calib_hover::PATH => return Ok(ActionStart::CalibHover(Box::new(crate::calib_hover::prepare(inner, body, epoch)?))),
+        crate::measure_multiview::PATH => return Ok(ActionStart::MeasureMultiview(Box::new(crate::measure_multiview::prepare(inner, body, epoch)?))),
         #[cfg(feature = "policy-runtime")]
         "/api/v1/action/policy/start" => {
             let request = crate::policy_runtime::parse_policy_start_request(body).map_err(ArmError::from)?;
@@ -637,6 +639,8 @@ fn check_operator_privilege(
         | "/api/v1/sequences/save"
         | "/api/v1/sequences/delete"
         | "/api/v1/grasp/setup" => Some(ApiError::operator_required(path)),
+        // moves the arm and triggers the camera (like /api/v1/detection/trigger)
+        crate::measure_multiview::PATH => Some(ApiError::operator_required(path)),
         // a sequence run that records writes episodes (like /api/v1/dataset/record/*)
         "/api/v1/action/run_sequence"
             if body.get("record").is_some_and(|r| !r.is_null()) =>
@@ -1131,6 +1135,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                                     ack["job_id"] = json!(job_id);
                                                     ack
                                                 }
+                                                Err(error) => command_reject(&inner, &value["request_id"], error.into()),
+                                            }),
+                                            Ok(ActionStart::MeasureMultiview(plan)) => Some(match crate::measure_multiview::begin(&mut inner, &recv_supervisor, *plan, recv_deps.source.clone()) {
+                                                Ok(started) => command_ack(&inner, &value["request_id"], Some(started)),
                                                 Err(error) => command_reject(&inner, &value["request_id"], error.into()),
                                             }),
                                             #[cfg(feature = "policy-runtime")]
