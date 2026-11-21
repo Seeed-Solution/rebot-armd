@@ -1451,6 +1451,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                                         fps,
                                                         deadline,
                                                         vision_source,
+                                                        Some(sandbox_c.clone()),
                                                     );
                                                     let mut ack = command_ack(&inner, &request_id, Some((action_id, pending.request.max_seconds.unwrap_or(0.0))));
                                                     ack["policy_id"] = json!(policy_id);
