@@ -1,8 +1,10 @@
 //! Action `measure_multiview` against the in-process armd (built-in B601-DM config, no driver)
 //! with a fake vision provider that renders the scene (tests/render) from the camera pose of the
 //! measured joints: JPEG snapshots letterboxed like rebot-vision's 640x640 `/snapshot.jpg`, and a
-//! YOLO box of the object. Covers: success, target lost, a refused view pose (fallback offset)
-//! and the end on lease loss.
+//! YOLO box of the object. Like rebot-vision with inference idle, `/snapshot.jpg` returns the
+//! frame of the last trigger (a new render at the joints of that moment), not a fresh one.
+//! Covers: success, target lost, a refused view pose (fallback offset), the end on lease loss, a
+//! stale snapshot from another pose and a snapshot that never refreshes.
 mod common;
 mod render;
 
@@ -23,6 +25,11 @@ use serde_json::{json, Value};
 const START: [f32; 7] = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0, 0.0];
 const HEIGHT: f64 = 0.040;
 
+/// A rendered camera frame: its id (the trigger's `frame_id`), the joints it was rendered at,
+/// the JPEG and the object's box.
+#[derive(Clone)]
+struct Shot { id: u64, joints: Vec<f32>, jpeg: Vec<u8>, box_norm: Option<[f64; 4]> }
+
 struct FakeVision {
     sup: Arc<ArmSupervisor>,
     cam: CamModel,
@@ -33,32 +40,35 @@ struct FakeVision {
     snapshots: AtomicU64,
     /// Each snapshot takes this long (ms).
     snapshot_delay_ms: AtomicU64,
+    /// Each trigger takes this long (ms; real rebot-vision 1.0-1.5 s).
+    trigger_delay_ms: AtomicU64,
+    /// Triggers leave `/snapshot.jpg` alone (a camera whose snapshot never refreshes).
+    freeze_snapshot: AtomicBool,
     /// Set on the first snapshot (the arm settled): the creep driver starts shaking.
     shake_on_snapshot: Mutex<Option<Arc<Mutex<Creep>>>>,
     /// The creep driver's clock (stopped while rendering).
     clock: Mutex<Option<Arc<Mutex<Creep>>>>,
-    /// (joints, jpeg, box_norm) of the last render.
-    cache: Mutex<Option<(Vec<f32>, Vec<u8>, Option<[f64; 4]>)>>,
+    /// What `/snapshot.jpg` returns: the frame of the last trigger (rendered on the first
+    /// snapshot when there was none).
+    snapshot: Mutex<Option<Shot>>,
+    /// (frame id, joints) of every snapshot returned.
+    served: Mutex<Vec<(u64, Vec<f32>)>>,
 }
 
 impl FakeVision {
-    /// Render (or reuse) the view of the measured joints.
-    async fn view(&self) -> (Vec<f32>, Vec<u8>, Option<[f64; 4]>) {
+    /// Render frame `id` (its noise seed) at joints `q`, the measured joints when None.
+    async fn render(&self, id: u64, q: Option<Vec<f32>>) -> Shot {
         let (q, pose) = {
             let inner = self.sup.inner().read().await;
-            let q = inner.measured_positions.clone();
+            let q = q.unwrap_or_else(|| inner.measured_positions.clone());
             let pose = inner.config.arm_model.fk_f32(&q).unwrap();
             (q, pose)
         };
-        if let Some(c) = self.cache.lock().unwrap().as_ref().filter(|c| c.0.iter().zip(&q).all(|(a, b)| (a - b).abs() < 2e-4)) {
-            return c.clone();
-        }
         // rendering takes the camera no time: the creep clock stops meanwhile
         let paused = Instant::now();
         let cam = mm::camera_at(&self.cam, &pose);
         let (w, h) = (self.cam.size[0] as usize, self.cam.size[1] as usize);
-        let seed = self.frame.load(Ordering::SeqCst) + 1;
-        let img = render::render(&self.scene, &cam, w, h, 2, Noise { sigma: 1.0, ..Noise::default() }, seed);
+        let img = render::render(&self.scene, &cam, w, h, 2, Noise { sigma: 1.0, ..Noise::default() }, id);
         // letterbox into a w x w square, frame in the centred rows
         let top = (w - h) / 2;
         let mut sq = vec![0u8; w * w];
@@ -67,20 +77,24 @@ impl FakeVision {
         jpeg_encoder::Encoder::new(&mut jpeg, 95).encode(&sq, w as u16, w as u16, jpeg_encoder::ColorType::Luma).unwrap();
         let b = render::box_px(&self.scene, &self.scene.boxes[0], &cam);
         let inside = b[0] > 0.0 && b[1] > 0.0 && b[2] < w as f64 && b[3] < h as f64;
-        let bn = inside.then(|| [b[0] / w as f64, b[1] / h as f64, b[2] / w as f64, b[3] / h as f64]);
-        let v = (q, jpeg, bn);
-        *self.cache.lock().unwrap() = Some(v.clone());
+        let box_norm = inside.then(|| [b[0] / w as f64, b[1] / h as f64, b[2] / w as f64, b[3] / h as f64]);
         if let Some(c) = self.shake_on_snapshot.lock().unwrap().as_ref().or(self.clock.lock().unwrap().as_ref()) { c.lock().unwrap().paused += paused.elapsed(); }
-        v
+        Shot { id, joints: q, jpeg, box_norm }
     }
 
+    /// A trigger: a new frame at the current joints, which also becomes the snapshot.
     async fn frame_now(&self) -> DetectionFrame {
-        let (q, _, bn) = self.view().await;
-        let away = START.iter().zip(&q).any(|(a, b)| (a - b).abs() > 1e-3);
+        let d = self.trigger_delay_ms.load(Ordering::SeqCst);
+        if d > 0 { tokio::time::sleep(Duration::from_millis(d)).await; }
+        // frame ids (and noise seeds) 1, 2, ... per trigger
+        let shot = self.render(self.frame.fetch_add(1, Ordering::SeqCst) + 1, None).await;
+        let away = START.iter().zip(&shot.joints).any(|(a, b)| (a - b).abs() > 1e-3);
         let hidden = self.hide_after_start.load(Ordering::SeqCst) && away;
-        let detections = bn.filter(|_| !hidden).map(|b| vec![det("box", 0.9, b)]).unwrap_or_default();
+        let detections = shot.box_norm.filter(|_| !hidden).map(|b| vec![det("box", 0.9, b)]).unwrap_or_default();
+        let frame_id = shot.id;
+        if !self.freeze_snapshot.load(Ordering::SeqCst) { *self.snapshot.lock().unwrap() = Some(shot); }
         DetectionFrame {
-            frame_id: self.frame.fetch_add(1, Ordering::SeqCst) + 1, captured_at: Instant::now(), policy_captured_at: None,
+            frame_id, captured_at: Instant::now(), policy_captured_at: None,
             image_size_px: self.cam.size, detections, depth: None, model_generation: None,
         }
     }
@@ -108,10 +122,15 @@ impl DetectionSource for FakeVision {
         Box::pin(async move {
             self.snapshots.fetch_add(1, Ordering::SeqCst);
             if let Some(c) = self.shake_on_snapshot.lock().unwrap().as_ref() { c.lock().unwrap().shake = true; }
-            let v = self.view().await.1;
+            let cached = self.snapshot.lock().unwrap().clone();
+            let shot = match cached {
+                Some(s) => s,
+                None => { let s = self.render(0, None).await; *self.snapshot.lock().unwrap() = Some(s.clone()); s }
+            };
+            self.served.lock().unwrap().push((shot.id, shot.joints.clone()));
             let d = self.snapshot_delay_ms.load(Ordering::SeqCst);
             if d > 0 { tokio::time::sleep(Duration::from_millis(d)).await; }
-            Ok(v)
+            Ok(shot.jpeg)
         })
     }
 }
@@ -148,7 +167,8 @@ async fn rig_driven(config: ArmConfig, plain: bool, driver: Option<CreepArm>) ->
     let mut scene = Scene::new(0.0, vec![BoxObj { xy: [look[0], look[1]], yaw: 0.3, size: [0.05, 0.03, HEIGHT] }]);
     scene.plain_boxes = plain;
     let vision = Arc::new(FakeVision { sup: sup.clone(), cam, scene, hide_after_start: AtomicBool::new(false), frame: AtomicU64::new(0),
-        snapshots: AtomicU64::new(0), snapshot_delay_ms: AtomicU64::new(0), shake_on_snapshot: Mutex::new(None), clock: Mutex::new(None), cache: Mutex::new(None) });
+        snapshots: AtomicU64::new(0), snapshot_delay_ms: AtomicU64::new(0), trigger_delay_ms: AtomicU64::new(0), freeze_snapshot: AtomicBool::new(false),
+        shake_on_snapshot: Mutex::new(None), clock: Mutex::new(None), snapshot: Mutex::new(None), served: Mutex::new(Vec::new()) });
     let deps = GraspDeps { source: vision.clone(), setup_path: None };
     let router = armd::api::create_router_with(sup.clone(), armd::api::proxy::DetectorUpstream::parse("http://127.0.0.1:9").unwrap(), deps, armd::OperatorAuth::disabled());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -228,7 +248,11 @@ async fn measures_the_box_height_from_three_views_and_returns_to_start() {
     assert!(o["n_points"].as_u64().unwrap() >= 20 && m["table_check"]["n_points"].as_u64().unwrap() >= 10, "{m}");
     assert!((m["baseline_m"].as_f64().unwrap() - 0.08).abs() < 1e-6);
     assert!(r.at_start().await, "returned to the start joints");
-    assert!(r.vision.snapshots.load(Ordering::SeqCst) >= 9, "2 discarded + 1 per view");
+    // per view: the snapshot before the trigger, then at least one after it
+    assert!(r.vision.snapshots.load(Ordering::SeqCst) >= 6, "2 per view");
+    for v in m["views"].as_array().unwrap() {
+        assert!(v["trigger_ms"].is_number() && v["snapshot_wait_ms"].is_number() && v["snapshot_polls"].as_u64() == Some(0), "{v}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -461,12 +485,13 @@ async fn creep_and_a_slow_limit_cycle_do_not_stop_the_captures() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shaking_during_the_snapshots_retries_then_fails_moved() {
-    // still while settling; from the first snapshot on J4 drifts 30 mrad/s and each snapshot takes
-    // 60 ms: every bracket (100 ms lead + 60 ms) moves about 4.8 mrad
+    // still while settling; from the first snapshot on J4 drifts 30 mrad/s, each trigger takes
+    // 100 ms and each snapshot 60 ms: every bracket (trigger + snapshot) moves about 4.8 mrad
     let creep = Arc::new(Mutex::new(Creep { shake_rate: 0.03, ..Default::default() }));
     let d = CreepArm { inner: common::TestArm::new(), creep: creep.clone() };
     let mut r = rig_driven(ArmConfig::rebot_dm(), false, Some(d)).await;
     r.vision.snapshot_delay_ms.store(60, Ordering::SeqCst);
+    r.vision.trigger_delay_ms.store(100, Ordering::SeqCst);
     *r.vision.shake_on_snapshot.lock().unwrap() = Some(creep.clone());
     let ack = r.start(json!({})).await;
     let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
@@ -475,8 +500,9 @@ async fn shaking_during_the_snapshots_retries_then_fails_moved() {
     assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("MOVED")), "{a}");
     let msg = a["message"].as_str().unwrap();
     assert!(msg.contains("3 snapshots") && msg.contains("mrad"), "{msg}");
-    // 2 discarded + 3 tries at the start view
-    assert_eq!(r.vision.snapshots.load(Ordering::SeqCst), 5);
+    // at the start view: the snapshot before the first trigger, then one per try (each differs
+    // from the one before it at once)
+    assert_eq!(r.vision.snapshots.load(Ordering::SeqCst), 4);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -518,4 +544,61 @@ async fn debug_bundle_is_written_capped_and_replays_to_the_same_points() {
     let doc = &bundle.doc;
     assert_eq!(doc["points"].as_array().unwrap().len(), c.rec.points.len());
     assert!(doc["views"][1]["joints_rad"].as_array().unwrap().len() >= 6 && doc["views"][0]["detections"][0]["label"] == "box", "{}", doc["views"][0]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_snapshot_from_another_pose_is_not_used() {
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    // the snapshot holds a frame taken mid-motion: J1 0.05 rad and J2 0.03 rad away from the start
+    let mut q = START.to_vec();
+    q[0] += 0.05;
+    q[1] += 0.03;
+    let stale = r.vision.render(1000, Some(q.clone())).await;
+    let stale_id = stale.id;
+    *r.vision.snapshot.lock().unwrap() = Some(stale);
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 150.0).await;
+    let m = &a["measurement"];
+    assert_eq!(a["state"], "done", "{a}");
+    assert!((m["objects"][0]["height_m"].as_f64().unwrap() - HEIGHT).abs() < 0.003, "{m}");
+    let served = r.vision.served.lock().unwrap().clone();
+    // the stale frame was the snapshot before the first trigger, but no view used it
+    assert_eq!(served[0].0, stale_id);
+    for v in m["views"].as_array().unwrap() {
+        let f = v["frame_id"].as_u64().unwrap();
+        assert_ne!(f, stale_id, "{v}");
+        let joints: Vec<f32> = v["joints_rad"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
+        // the accepted snapshot is the frame the view's trigger rendered, at the view's joints
+        let (_, rendered_at) = served.iter().find(|s| s.0 == f).unwrap_or_else(|| panic!("frame {f} never served as a snapshot"));
+        let diff = rendered_at.iter().zip(&joints).take(6).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(diff < 2e-3, "frame {f} rendered {diff} rad from the view joints");
+        // the stale frame was rendered far from every view: used as the view's image it would
+        // have paired the image of one pose with the joints of another
+        let off = q.iter().zip(&joints).take(6).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(off > 0.02, "stale frame {off} rad from view {v}");
+    }
+    // after each view motion the snapshot first still held the previous view's frame
+    let views = m["views"].as_array().unwrap();
+    let ids: Vec<u64> = views.iter().map(|v| v["frame_id"].as_u64().unwrap()).collect();
+    let before: Vec<u64> = ids.iter().filter_map(|f| served.iter().position(|s| s.0 == *f)).filter_map(|i| i.checked_sub(1).map(|j| served[j].0)).collect();
+    assert_eq!(before.len(), ids.len());
+    assert_eq!(&before[1..], &ids[..ids.len() - 1], "the snapshot before each view's trigger was the previous view's frame");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_that_never_refreshes_fails_detection_unavailable() {
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    r.vision.freeze_snapshot.store(true, Ordering::SeqCst);
+    let ack = r.start(json!({"label": "box"})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let t = Instant::now();
+    let a = r.wait(id, 30.0).await;
+    println!("{} {} after {:?}", a["code"], a["message"], t.elapsed());
+    assert_eq!((a["state"].as_str(), a["code"].as_str()), (Some("failed"), Some("DETECTION_UNAVAILABLE")), "{a}");
+    assert!(a["message"].as_str().unwrap().contains("camera snapshot did not refresh"), "{a}");
+    // the snapshot before the trigger, then polls every 50 ms for 1.5 s
+    let n = r.vision.snapshots.load(Ordering::SeqCst);
+    assert!((20..=40).contains(&n), "{n} snapshots");
+    assert!(r.at_start().await);
 }
