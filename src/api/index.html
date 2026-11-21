@@ -522,6 +522,7 @@ body.ui-simple .tch-bar { position: fixed; z-index: 190; top: 8px; left: 50%; tr
 .gset-row { display: grid; gap: 8px; padding: 12px; border-radius: var(--sc-radius-md); border: 1px solid var(--sc-color-border); }
 .gset-k { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 14px; color: var(--sc-color-text); }
 .gset-k b { font-size: 15px; font-weight: 600; }
+.gset-k b.na { font-family: inherit; font-size: 13px; font-weight: 500; color: var(--sc-color-text-secondary); text-align: right; }
 .gset-row small { font-size: 12px; line-height: 1.5; color: var(--sc-color-text-secondary); }
 .gset-row .btn { min-height: 44px; touch-action: manipulation; }
 .gset-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
@@ -2232,7 +2233,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <div class="gset-row">
       <div class="gset-k"><span data-i18n="gset.grip">夹爪位置（画面）</span><b class="mono" id="gset-grip">--</b></div>
       <button class="btn" id="gset-grip-pick" type="button" data-i18n="gset.grip.pick">在画面上点选</button>
-      <small data-i18n="gset.grip.hint">夹爪朝下停在接近高度，张开，把物体放在桌面上两指正中间，然后点画面上物体的中心。</small>
+      <small id="gset-grip-hint">夹爪朝下停在接近高度，张开，把物体放在桌面上两指正中间，然后点画面上物体的中心。</small>
     </div>
     <div class="gset-grid">
       <label class="field"><span data-i18n="gset.approach">接近高度 mm</span><input type="number" id="gset-approach" inputmode="decimal" step="5" min="30" max="400"></label>
@@ -2410,6 +2411,7 @@ const I18N = {
     'gset.open': '抓取设置', 'gset.title': '抓取设置', 'gset.hint': '选择 YOLO 或「两者」（或开启「识别」）后点画面里的框即可抓取。下面三项每次换桌面或相机支架后设置一次，保存在机械臂上。',
     'gset.table': '桌面高度', 'gset.table.tcp': '用当前夹爪尖高度', 'gset.table.hint': '先把夹爪尖慢慢点动到刚好碰到桌面，再点上面的按钮。',
     'gset.grip': '夹爪位置（画面）', 'gset.grip.pick': '在画面上点选', 'gset.grip.hint': '夹爪朝下停在接近高度，张开，把物体放在桌面上两指正中间，然后点画面上物体的中心。', 'gset.grip.tap': '点击画面中夹爪之间物体的中心',
+    'gset.grip.cd': '未使用：相机朝下对准', 'gset.grip.cd.hint': '当前安装用相机朝下对准：抓取时相机先垂直朝下，把物体对准画面中心，再转为夹爪朝下。不使用这个点。',
     'gset.approach': '接近高度 mm', 'gset.grasp': '抓取高度 mm', 'gset.tilt': '相机俯角 °', 'gset.save': '保存高度', 'gset.reload': '重新读取',
     'gset.saved': '抓取设置已保存', 'gset.unsaved': '已生效，但未能写入文件：{e}', 'gset.loading': '读取中…', 'gset.na': '当前配置不支持抓取', 'gset.err': '读取失败：{e}', 'gset.path': '保存位置：{p}', 'gset.bad': '请输入有效数字',
     'calib.open': '相机标定', 'calib.title': '手眼标定', 'calib.close': '关闭',
@@ -2615,6 +2617,7 @@ const I18N = {
     'gset.open': 'Grasp setup', 'gset.title': 'Grasp setup', 'gset.hint': 'Select YOLO or Both (or turn on Detect), then tap a box in the video to grasp it. Set the three items below once per table or camera mount; they are stored on the arm.',
     'gset.table': 'Table height', 'gset.table.tcp': 'Use current TCP height', 'gset.table.hint': 'First jog the jaw tips down until they just touch the table, then tap the button above.',
     'gset.grip': 'Grip point (image)', 'gset.grip.pick': 'Tap on the image', 'gset.grip.hint': 'With the gripper pointing down at approach height and open, put an object on the table centred between the jaws, then tap its centre in the video.', 'gset.grip.tap': 'Tap the centre of the object between the jaws',
+    'gset.grip.cd': 'Not used: camera-down acquisition', 'gset.grip.cd.hint': 'This mount uses camera-down acquisition: a grasp first points the camera straight down and centres the object in the image, then turns the gripper down. This point is not used.',
     'gset.approach': 'Approach mm', 'gset.grasp': 'Grasp mm', 'gset.tilt': 'Camera tilt °', 'gset.save': 'Save heights', 'gset.reload': 'Reload',
     'gset.saved': 'Grasp setup saved', 'gset.unsaved': 'Applied but not written to file: {e}', 'gset.loading': 'Loading…', 'gset.na': 'This profile cannot grasp', 'gset.err': 'Read failed: {e}', 'gset.path': 'Stored at: {p}', 'gset.bad': 'Enter valid numbers',
     'calib.open': 'Camera Cal', 'calib.title': 'Hand-Eye Calibration', 'calib.close': 'Close',
@@ -9891,6 +9894,7 @@ const GR = {
   pickGrip: false,  // next video tap records the grip pixel
   tiltEdited: false, // the user typed in the camera tilt field since it was last filled
   setup: null, path: null, supported: null, rev: null,
+  camDown: null,    // GET /api/v1/grasp/setup camera_down: true = camera-down acquisition, grip pixel unused; null = unknown
 };
 const graspCodeKey = (code) => (/^IK_/.test(code || '') ? 'IK' : code);
 function graspCodeText(code, message) {
@@ -10015,7 +10019,7 @@ function graspDraw(g, rect, fresh) {
     g.restore();
   }
   // grip point marker while selecting, grasping or picking it
-  const gp = GR.setup && GR.setup.grip_pixel_norm;
+  const gp = GR.camDown !== true && GR.setup && GR.setup.grip_pixel_norm;
   if (gp && (s || GR.pickGrip || graspRunningAction() || !$('gset').hidden)) {
     const x = rect.x + gp[0] * rect.w, y = rect.y + gp[1] * rect.h;
     g.save();
@@ -10083,7 +10087,12 @@ const tilt1 = (v) => (Number.isFinite(v) ? (Math.round(v * 10) / 10).toFixed(1) 
 function gsetRender(status) {
   const s = GR.setup;
   setText($('gset-table'), s ? (mm(s.table_z_m) + ' mm') : '--');
-  setText($('gset-grip'), s ? s.grip_pixel_norm.map((v) => Math.round(v * 100) + '%').join(' , ') : '--');
+  // camera-down acquisition centres on the image centre: the grip pixel is not used, so it is not shown
+  const cd = !!s && GR.camDown === true;
+  setText($('gset-grip'), !s ? '--' : cd ? t('gset.grip.cd') : s.grip_pixel_norm.map((v) => Math.round(v * 100) + '%').join(' , '));
+  $('gset-grip').classList.toggle('na', cd);
+  setText($('gset-grip-hint'), t(cd ? 'gset.grip.cd.hint' : 'gset.grip.hint'));
+  $('gset-grip-pick').hidden = cd;
   for (const [id, v] of [['gset-approach', s && mm(s.approach_height_m)], ['gset-grasp', s && mm(s.grasp_height_m)], ['gset-tilt', s && tilt1(s.camera_tilt_deg)]]) {
     const el = $(id);
     if (document.activeElement !== el) { el.value = v == null ? '' : String(v); if (id === 'gset-tilt') GR.tiltEdited = false; }
@@ -10103,6 +10112,7 @@ async function graspLoadSetup(quiet) {
     const d = await res.json();
     if (!res.ok) throw new Error(d && (d.message || d.error) || 'HTTP ' + res.status);
     GR.supported = !!d.supported; GR.setup = d.setup || null; GR.path = d.path || null;
+    GR.camDown = typeof d.camera_down === 'boolean' ? d.camera_down : null;
     if (typeof d.revision === 'number') GR.rev = d.revision;
     if (!quiet) gsetRender(!GR.supported ? t('gset.na') : GR.path ? t('gset.path', { p: GR.path }) : '--');
   } catch (e) {
@@ -10118,6 +10128,8 @@ async function gsetWrite(patch) {
     const msg = ack.persisted === false ? t('gset.unsaved', { e: ack.persist_error || '' }) : t('gset.saved');
     gsetRender(msg);
     toast(msg, ack.persisted === false ? 'warn' : 'ok');
+    // the tilt decides camera-down acquisition (camera_down is only in the GET)
+    graspLoadSetup(true).then(() => { if (!$('gset').hidden) gsetRender(); });
     return true;
   } catch (e) {
     if (e.code === 'POLICY_REVISION_MISMATCH') graspLoadSetup(true);

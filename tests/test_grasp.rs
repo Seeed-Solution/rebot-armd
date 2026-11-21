@@ -833,6 +833,27 @@ async fn ws_grasp_rejects_workspace_and_bad_requests() {
 }
 
 #[tokio::test]
+async fn grasp_setup_get_reports_camera_down_acquisition() {
+    let mut w = ws_rig(None).await;
+    let get = |addr| async move { reqwest::get(format!("http://{addr}/api/v1/grasp/setup")).await.unwrap().json::<Value>().await.unwrap() };
+    let v = get(w.addr).await;
+    assert_eq!((v["camera_down"].clone(), v.get("camera_down_error")), (json!(false), None), "auto, level mount: grip pixel {v}");
+    for (patch, want) in [(json!({"camera_tilt_deg": -36.995}), true), (json!({"acquire_camera_down": "off"}), false), (json!({"acquire_camera_down": "auto", "camera_tilt_deg": 4.0}), false)] {
+        let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/grasp/setup", patch.clone()).await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        assert_eq!(get(w.addr).await["camera_down"], json!(want), "{patch}");
+    }
+    // "on" without a lens centre: grasps are refused, the GET says why
+    let truth = Truth { known_offset: false, ..Truth::same() };
+    let mut w = ws_rig_on(rig(GraspSetup::default(), truth, 0.0, [0.0, 0.0], true).await, None).await;
+    assert_eq!(get(w.addr).await["camera_down"], json!(false), "auto without a lens centre");
+    let ack = common::rpc(&mut w.ws, w.generation, w.epoch, "/api/v1/grasp/setup", json!({"acquire_camera_down": "on"})).await;
+    assert_eq!(ack["type"], "command_ack", "{ack}");
+    let v = get(w.addr).await;
+    assert!(v["camera_down"].is_null() && v["camera_down_error"].as_str().is_some_and(|e| e.contains("offset_m")), "{v}");
+}
+
+#[tokio::test]
 async fn grasp_setup_persists_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sub").join("grasp_setup.json");
