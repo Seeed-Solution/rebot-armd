@@ -330,7 +330,9 @@ fn ncc(img: &Gray, t: &Tmpl, x: f64, y: f64, bilinear: bool) -> Option<f32> {
     let r = t.r;
     if !img.inside(x, y, r, if bilinear { 1.0 } else { 0.5 }) { return None; }
     let n = 2 * r + 1;
-    let (mut s1, mut s2, mut dot) = (0.0f32, 0.0f32, 0.0f32);
+    // s1, s2 in f64: in f32 `s2 - s1*s1/sw` cancels (bright patches: s2 ~ 1e6 x n^2) and was off by up
+    // to 0.4 NCC on real reCamera frames.
+    let (mut s1, mut s2, mut dot) = (0.0f64, 0.0f64, 0.0f32);
     if bilinear {
         let (base, [w00, w10, w01, w11]) = patch_phase(img, x, y, r);
         for j in 0..n {
@@ -339,7 +341,7 @@ fn ncc(img: &Gray, t: &Tmpl, x: f64, y: f64, bilinear: bool) -> Option<f32> {
             for i in 0..n {
                 let v = w00 * f32::from(r0[i]) + w10 * f32::from(r0[i + 1]) + w01 * f32::from(r1[i]) + w11 * f32::from(r1[i + 1]);
                 let wv = t.w.as_ref().map_or(v, |w| w[j * n + i] * v);
-                s1 += wv; s2 += wv * v; dot += a[i] * v;
+                s1 += f64::from(wv); s2 += f64::from(wv * v); dot += a[i] * v;
             }
         }
     } else {
@@ -348,16 +350,17 @@ fn ncc(img: &Gray, t: &Tmpl, x: f64, y: f64, bilinear: bool) -> Option<f32> {
             let row = &img.px[(cy + j - r) * img.w + cx - r..][..n];
             let a = &t.a[j * n..(j + 1) * n];
             match &t.w {
-                None => for (&p, &ak) in row.iter().zip(a) { let v = f32::from(p); s1 += v; s2 += v * v; dot += ak * v; },
+                None => for (&p, &ak) in row.iter().zip(a) { let v = f32::from(p); s1 += f64::from(v); s2 += f64::from(v * v); dot += ak * v; },
                 Some(w) => {
                     let w = &w[j * n..(j + 1) * n];
-                    for ((&p, &ak), &wk) in row.iter().zip(a).zip(w) { let v = f32::from(p); let wv = wk * v; s1 += wv; s2 += wv * v; dot += ak * v; }
+                    for ((&p, &ak), &wk) in row.iter().zip(a).zip(w) { let v = f32::from(p); let wv = wk * v; s1 += f64::from(wv); s2 += f64::from(wv * v); dot += ak * v; }
                 }
             }
         }
     }
-    let var = s2 - s1 * s1 / t.sw;
-    Some(if var > 1e-3 * t.sw { dot / var.sqrt() } else { 0.0 })
+    let sw = f64::from(t.sw);
+    let var = s2 - s1 * s1 / sw;
+    Some(if var > 1e-3 * sw { dot / var.sqrt() as f32 } else { 0.0 })
 }
 
 // ---- features ----
