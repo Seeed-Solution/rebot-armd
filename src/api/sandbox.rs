@@ -517,18 +517,24 @@ fn is_optional_asset(entry: &serde_json::Value) -> bool {
     entry.get("required").and_then(|v| v.as_bool()) == Some(false)
 }
 
-fn verify_pack_assets(canon_pack_dir: &Path, assets: &[serde_json::Value]) -> Result<(), PackFileError> {
+fn verify_pack_assets_from_map(
+    files: &BTreeMap<String, Vec<u8>>,
+    assets: &[serde_json::Value],
+) -> Result<(), PackFileError> {
     for entry in assets {
         let rel = asset_entry_rel_path(entry)?;
+        if !is_safe_relative_path(rel) {
+            return Err(PackFileError::UnsafePath(format!(
+                "unsafe relative path '{rel}'"
+            )));
+        }
         if is_urdf_path(rel) {
             return Err(PackFileError::UnsupportedFormat(format!(
                 "URDF assets are not supported: '{rel}'"
             )));
         }
-        match check_safe_pack_file(canon_pack_dir, rel) {
-            Ok(_) => {}
-            Err(PackFileError::Missing(_)) if is_optional_asset(entry) => {}
-            Err(e) => return Err(e),
+        if !files.contains_key(rel) && !is_optional_asset(entry) {
+            return Err(PackFileError::Missing(format!("missing file '{rel}'")));
         }
     }
     Ok(())
@@ -716,31 +722,68 @@ fn collect_and_validate_pack_dir(
 }
 
 fn normalize_manifest_assets(
-    canon_pack_dir: Option<&Path>,
+    files: Option<&BTreeMap<String, Vec<u8>>>,
+    primary_xml_rel: Option<&str>,
     assets: Vec<serde_json::Value>,
 ) -> Vec<serde_json::Value> {
     let mut out = Vec::with_capacity(assets.len());
+    let mut seen_paths = HashSet::new();
+
     for entry in assets {
         let Ok(rel) = asset_entry_rel_path(&entry).map(|s| s.to_string()) else {
             continue;
         };
-        if let Some(dir) = canon_pack_dir {
-            if check_safe_pack_file(dir, &rel).is_err() {
-                // Skip absent optional assets (and anything unsafe/missing on disk).
+        let file_meta = if let Some(file_map) = files {
+            let Some(bytes) = file_map.get(&rel) else {
+                // Skip absent optional assets (and anything missing from the validated pack map).
+                continue;
+            };
+            Some((sha256_hex(bytes), bytes.len() as u64))
+        } else {
+            None
+        };
+        let mut map = match entry {
+            serde_json::Value::Object(map) => map,
+            serde_json::Value::String(_) => serde_json::Map::new(),
+            _ => continue,
+        };
+        seen_paths.insert(rel.clone());
+        map.insert("path".to_string(), serde_json::Value::String(rel));
+        if let Some((digest, size_bytes)) = file_meta {
+            map.insert("sha256".to_string(), serde_json::Value::String(digest));
+            map.insert("size_bytes".to_string(), serde_json::json!(size_bytes));
+        }
+        out.push(serde_json::Value::Object(map));
+    }
+
+    if let Some(file_map) = files {
+        for (xml_rel, xml_bytes) in file_map {
+            let is_xml = primary_xml_rel == Some(xml_rel.as_str())
+                || xml_rel.to_ascii_lowercase().ends_with(".xml");
+            if !is_xml {
                 continue;
             }
-        }
-        match entry {
-            serde_json::Value::Object(mut map) => {
-                map.insert("path".to_string(), serde_json::Value::String(rel));
-                out.push(serde_json::Value::Object(map));
+            let Ok(xml_str) = std::str::from_utf8(xml_bytes) else {
+                continue;
+            };
+            let Ok(summary) = validate_xml_and_collect_summary_for_path(xml_rel, xml_str, None) else {
+                continue;
+            };
+            for asset_ref in summary.refs {
+                if !seen_paths.insert(asset_ref.path.clone()) {
+                    continue;
+                }
+                if let Some(bytes) = file_map.get(&asset_ref.path) {
+                    out.push(serde_json::json!({
+                        "path": asset_ref.path,
+                        "sha256": sha256_hex(bytes),
+                        "size_bytes": bytes.len() as u64,
+                    }));
+                }
             }
-            serde_json::Value::String(_) => {
-                out.push(serde_json::json!({ "path": rel }));
-            }
-            _ => {}
         }
     }
+
     out
 }
 
@@ -822,10 +865,35 @@ pub fn search_builtin_roots() -> Vec<PathBuf> {
     roots
 }
 
+struct ValidBuiltinPack<M> {
+    root: PathBuf,
+    canon_dir: PathBuf,
+    manifest: M,
+    xml: String,
+    digest: String,
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+struct ValidUserPack<M> {
+    canon_dir: PathBuf,
+    manifest: M,
+    xml: String,
+    digest: String,
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+struct ResolvedPack<M> {
+    canon_dir: Option<PathBuf>,
+    manifest: M,
+    xml: String,
+    digest: Option<String>,
+    files: Option<BTreeMap<String, Vec<u8>>>,
+}
+
 fn find_valid_builtin_scene_dir(
     id: &str,
     roots: &[PathBuf],
-) -> (bool, Option<(PathBuf, PathBuf, SceneManifest, String, String)>) {
+) -> (bool, Option<ValidBuiltinPack<SceneManifest>>) {
     let spec = builtin_scene_spec(id);
     let mut saw_disk_manifest = false;
 
@@ -849,7 +917,7 @@ fn find_valid_builtin_scene_dir(
         let Some(world_xml) = files.get(&manifest.world_xml).and_then(|b| std::str::from_utf8(b).ok()).map(|s| s.to_string()) else {
             continue;
         };
-        if verify_pack_assets(&canon_dir, &manifest.assets).is_err() {
+        if verify_pack_assets_from_map(&files, &manifest.assets).is_err() {
             continue;
         }
         if let Some(s) = spec {
@@ -858,7 +926,17 @@ fn find_valid_builtin_scene_dir(
         } else if manifest.id.is_empty() {
             manifest.id = id.to_string();
         }
-        return (saw_disk_manifest, Some((root.clone(), canon_dir, manifest, world_xml, digest)));
+        return (
+            saw_disk_manifest,
+            Some(ValidBuiltinPack {
+                root: root.clone(),
+                canon_dir,
+                manifest,
+                xml: world_xml,
+                digest,
+                files,
+            }),
+        );
     }
     (saw_disk_manifest, None)
 }
@@ -898,8 +976,8 @@ pub fn load_builtin_scene_in_roots(id: &str, roots: &[PathBuf]) -> Option<(Scene
 
     // Check on-disk builtin scenes directory first so full scene manifests stay authoritative.
     let (saw_disk_manifest, found) = find_valid_builtin_scene_dir(id, roots);
-    if let Some((_, _, manifest, world_xml, _)) = found {
-        return Some((manifest, world_xml));
+    if let Some(pack) = found {
+        return Some((pack.manifest, pack.xml));
     }
 
     if id == "pcb_suction" && !saw_disk_manifest {
@@ -972,7 +1050,7 @@ pub fn load_builtin_scene(id: &str) -> Option<(SceneManifest, String)> {
 fn find_valid_builtin_tool_dir(
     id: &str,
     roots: &[PathBuf],
-) -> (bool, Option<(PathBuf, PathBuf, ToolManifest, String, String)>) {
+) -> (bool, Option<ValidBuiltinPack<ToolManifest>>) {
     let spec = builtin_tool_spec(id);
     let mut saw_disk_manifest = false;
 
@@ -996,7 +1074,7 @@ fn find_valid_builtin_tool_dir(
         let Some(tool_xml) = files.get(&manifest.tool_xml).and_then(|b| std::str::from_utf8(b).ok()).map(|s| s.to_string()) else {
             continue;
         };
-        if verify_pack_assets(&canon_dir, &manifest.assets).is_err() {
+        if verify_pack_assets_from_map(&files, &manifest.assets).is_err() {
             continue;
         }
         if let Some(s) = spec {
@@ -1005,7 +1083,17 @@ fn find_valid_builtin_tool_dir(
         } else if manifest.id.is_empty() {
             manifest.id = id.to_string();
         }
-        return (saw_disk_manifest, Some((root.clone(), canon_dir, manifest, tool_xml, digest)));
+        return (
+            saw_disk_manifest,
+            Some(ValidBuiltinPack {
+                root: root.clone(),
+                canon_dir,
+                manifest,
+                xml: tool_xml,
+                digest,
+                files,
+            }),
+        );
     }
     (saw_disk_manifest, None)
 }
@@ -1019,8 +1107,8 @@ pub fn load_builtin_tool_in_roots(id: &str, roots: &[PathBuf]) -> Option<(ToolMa
     }
 
     let (saw_disk_manifest, found) = find_valid_builtin_tool_dir(id, roots);
-    if let Some((_, _, manifest, tool_xml, _)) = found {
-        return Some((manifest, tool_xml));
+    if let Some(pack) = found {
+        return Some((pack.manifest, pack.xml));
     }
 
     if !saw_disk_manifest {
@@ -1371,7 +1459,7 @@ impl SandboxState {
         &self,
         id: &str,
         check_assets: bool,
-    ) -> Result<(PathBuf, SceneManifest, String, String), PackFileError> {
+    ) -> Result<ValidUserPack<SceneManifest>, PackFileError> {
         let scenes_root = self.root.join("scenes");
         let dir = scenes_root.join(id);
         let canon_dir = check_safe_pack_dir(&scenes_root, &dir)?;
@@ -1387,16 +1475,22 @@ impl SandboxState {
             .ok_or_else(|| PackFileError::InvalidPack("world XML is not valid UTF-8".into()))?
             .to_string();
         if check_assets {
-            verify_pack_assets(&canon_dir, &manifest.assets)?;
+            verify_pack_assets_from_map(&files, &manifest.assets)?;
         }
-        Ok((canon_dir, manifest, world_xml, digest))
+        Ok(ValidUserPack {
+            canon_dir,
+            manifest,
+            xml: world_xml,
+            digest,
+            files,
+        })
     }
 
     fn load_user_tool_checked(
         &self,
         id: &str,
         check_assets: bool,
-    ) -> Result<(PathBuf, ToolManifest, String, String), PackFileError> {
+    ) -> Result<ValidUserPack<ToolManifest>, PackFileError> {
         let tools_root = self.root.join("tools");
         let dir = tools_root.join(id);
         let canon_dir = check_safe_pack_dir(&tools_root, &dir)?;
@@ -1411,9 +1505,15 @@ impl SandboxState {
             .ok_or_else(|| PackFileError::InvalidPack("tool XML is not valid UTF-8".into()))?
             .to_string();
         if check_assets {
-            verify_pack_assets(&canon_dir, &manifest.assets)?;
+            verify_pack_assets_from_map(&files, &manifest.assets)?;
         }
-        Ok((canon_dir, manifest, tool_xml, digest))
+        Ok(ValidUserPack {
+            canon_dir,
+            manifest,
+            xml: tool_xml,
+            digest,
+            files,
+        })
     }
 
     pub fn resolve_scene(&self, id: &str) -> Option<(SceneManifest, String)> {
@@ -1431,14 +1531,14 @@ impl SandboxState {
         if is_reserved_builtin_id("scene", id) {
             return load_builtin_scene_in_roots(id, &self.effective_builtin_roots());
         }
-        let (_, manifest, world_xml, _) = self.load_user_scene_checked(id, true).ok()?;
-        Some((manifest, world_xml))
+        let pack = self.load_user_scene_checked(id, true).ok()?;
+        Some((pack.manifest, pack.xml))
     }
 
     fn resolve_scene_checked_full(
         &self,
         id: &str,
-    ) -> Result<(Option<PathBuf>, SceneManifest, String, Option<String>), (StatusCode, Json<serde_json::Value>)> {
+    ) -> Result<ResolvedPack<SceneManifest>, (StatusCode, Json<serde_json::Value>)> {
         if !validate_pack_id(id) {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1466,14 +1566,24 @@ impl SandboxState {
         if is_reserved_builtin_id("scene", id) {
             let roots = self.effective_builtin_roots();
             if id != "default" {
-                if let (_, Some((_, canon_dir, manifest, world_xml, digest))) =
-                    find_valid_builtin_scene_dir(id, &roots)
-                {
-                    return Ok((Some(canon_dir), manifest, world_xml, Some(digest)));
+                if let (_, Some(pack)) = find_valid_builtin_scene_dir(id, &roots) {
+                    return Ok(ResolvedPack {
+                        canon_dir: Some(pack.canon_dir),
+                        manifest: pack.manifest,
+                        xml: pack.xml,
+                        digest: Some(pack.digest),
+                        files: Some(pack.files),
+                    });
                 }
             }
             return load_builtin_scene_in_roots(id, &roots)
-                .map(|(m, w)| (None, m, w, None))
+                .map(|(m, w)| ResolvedPack {
+                    canon_dir: None,
+                    manifest: m,
+                    xml: w,
+                    digest: None,
+                    files: None,
+                })
                 .ok_or_else(|| {
                     (
                         StatusCode::NOT_FOUND,
@@ -1485,26 +1595,24 @@ impl SandboxState {
                     )
                 });
         }
-        let (canon_dir, manifest, world_xml, digest) = self
+        let pack = self
             .load_user_scene_checked(id, true)
             .map_err(|e| e.into_http_error("SCENE_NOT_FOUND", &format!("Scene pack '{id}'")))?;
-        Ok((Some(canon_dir), manifest, world_xml, Some(digest)))
-    }
-
-    fn resolve_scene_checked_with_dir(
-        &self,
-        id: &str,
-    ) -> Result<(Option<PathBuf>, SceneManifest, String), (StatusCode, Json<serde_json::Value>)> {
-        let (dir, manifest, world_xml, _) = self.resolve_scene_checked_full(id)?;
-        Ok((dir, manifest, world_xml))
+        Ok(ResolvedPack {
+            canon_dir: Some(pack.canon_dir),
+            manifest: pack.manifest,
+            xml: pack.xml,
+            digest: Some(pack.digest),
+            files: Some(pack.files),
+        })
     }
 
     pub fn resolve_scene_checked(
         &self,
         id: &str,
     ) -> Result<(SceneManifest, String), (StatusCode, Json<serde_json::Value>)> {
-        let (_, manifest, world_xml, _) = self.resolve_scene_checked_full(id)?;
-        Ok((manifest, world_xml))
+        let pack = self.resolve_scene_checked_full(id)?;
+        Ok((pack.manifest, pack.xml))
     }
 
     pub fn resolve_tool(&self, id: &str) -> Option<(ToolManifest, String)> {
@@ -1522,14 +1630,14 @@ impl SandboxState {
         if is_reserved_builtin_id("tool", id) {
             return load_builtin_tool_in_roots(id, &self.effective_builtin_roots());
         }
-        let (_, manifest, tool_xml, _) = self.load_user_tool_checked(id, true).ok()?;
-        Some((manifest, tool_xml))
+        let pack = self.load_user_tool_checked(id, true).ok()?;
+        Some((pack.manifest, pack.xml))
     }
 
     fn resolve_tool_checked_full(
         &self,
         id: &str,
-    ) -> Result<(Option<PathBuf>, ToolManifest, String, Option<String>), (StatusCode, Json<serde_json::Value>)> {
+    ) -> Result<ResolvedPack<ToolManifest>, (StatusCode, Json<serde_json::Value>)> {
         if !validate_pack_id(id) {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1557,14 +1665,24 @@ impl SandboxState {
         if is_reserved_builtin_id("tool", id) {
             let roots = self.effective_builtin_roots();
             if id != "default" {
-                if let (_, Some((_, canon_dir, manifest, tool_xml, digest))) =
-                    find_valid_builtin_tool_dir(id, &roots)
-                {
-                    return Ok((Some(canon_dir), manifest, tool_xml, Some(digest)));
+                if let (_, Some(pack)) = find_valid_builtin_tool_dir(id, &roots) {
+                    return Ok(ResolvedPack {
+                        canon_dir: Some(pack.canon_dir),
+                        manifest: pack.manifest,
+                        xml: pack.xml,
+                        digest: Some(pack.digest),
+                        files: Some(pack.files),
+                    });
                 }
             }
             return load_builtin_tool_in_roots(id, &roots)
-                .map(|(m, w)| (None, m, w, None))
+                .map(|(m, w)| ResolvedPack {
+                    canon_dir: None,
+                    manifest: m,
+                    xml: w,
+                    digest: None,
+                    files: None,
+                })
                 .ok_or_else(|| {
                     (
                         StatusCode::NOT_FOUND,
@@ -1576,26 +1694,24 @@ impl SandboxState {
                     )
                 });
         }
-        let (canon_dir, manifest, tool_xml, digest) = self
+        let pack = self
             .load_user_tool_checked(id, true)
             .map_err(|e| e.into_http_error("TOOL_NOT_FOUND", &format!("Tool pack '{id}'")))?;
-        Ok((Some(canon_dir), manifest, tool_xml, Some(digest)))
-    }
-
-    fn resolve_tool_checked_with_dir(
-        &self,
-        id: &str,
-    ) -> Result<(Option<PathBuf>, ToolManifest, String), (StatusCode, Json<serde_json::Value>)> {
-        let (dir, manifest, tool_xml, _) = self.resolve_tool_checked_full(id)?;
-        Ok((dir, manifest, tool_xml))
+        Ok(ResolvedPack {
+            canon_dir: Some(pack.canon_dir),
+            manifest: pack.manifest,
+            xml: pack.xml,
+            digest: Some(pack.digest),
+            files: Some(pack.files),
+        })
     }
 
     pub fn resolve_tool_checked(
         &self,
         id: &str,
     ) -> Result<(ToolManifest, String), (StatusCode, Json<serde_json::Value>)> {
-        let (_, manifest, tool_xml, _) = self.resolve_tool_checked_full(id)?;
-        Ok((manifest, tool_xml))
+        let pack = self.resolve_tool_checked_full(id)?;
+        Ok((pack.manifest, pack.xml))
     }
 
     fn resolve_policy_checked(
@@ -1767,17 +1883,17 @@ fn build_catalog_blocking(
                         continue;
                     }
                     if !scenes_out.iter().any(|s| s["id"] == id) {
-                        if let Ok((canon_dir, m, _, _)) = state.load_user_scene_checked(&id, false) {
-                            let assets_ok = verify_pack_assets(&canon_dir, &m.assets).is_ok();
+                        if let Ok(pack) = state.load_user_scene_checked(&id, false) {
+                            let assets_ok = verify_pack_assets_from_map(&pack.files, &pack.manifest.assets).is_ok();
                             scenes_out.push(serde_json::json!({
                                 "id": id,
-                                "name": m.name,
-                                "version": m.version,
+                                "name": pack.manifest.name,
+                                "version": pack.manifest.version,
                                 "builtin": false,
                                 "virtual": false,
                                 "installed": assets_ok,
-                                "robots": m.robots,
-                                "default_tool": m.default_tool,
+                                "robots": pack.manifest.robots,
+                                "default_tool": pack.manifest.default_tool,
                             }));
                         }
                     }
@@ -1838,17 +1954,17 @@ fn build_catalog_blocking(
                         continue;
                     }
                     if !tools_out.iter().any(|t| t["id"] == id) {
-                        if let Ok((canon_dir, m, _, _)) = state.load_user_tool_checked(&id, false) {
-                            let assets_ok = verify_pack_assets(&canon_dir, &m.assets).is_ok();
+                        if let Ok(pack) = state.load_user_tool_checked(&id, false) {
+                            let assets_ok = verify_pack_assets_from_map(&pack.files, &pack.manifest.assets).is_ok();
                             tools_out.push(serde_json::json!({
                                 "id": id,
-                                "name": m.name,
-                                "kind": m.kind,
-                                "version": m.version,
+                                "name": pack.manifest.name,
+                                "kind": pack.manifest.kind,
+                                "version": pack.manifest.version,
                                 "builtin": false,
                                 "virtual": false,
                                 "installed": assets_ok,
-                                "robots": m.robots,
+                                "robots": pack.manifest.robots,
                             }));
                         }
                     }
@@ -2617,7 +2733,7 @@ pub async fn get_scene(
     } else if !is_virtual {
         find_valid_builtin_scene_dir(&id, &state.effective_builtin_roots())
             .1
-            .map(|(_, canon_dir, _, _, _)| canon_dir)
+            .map(|p| p.canon_dir)
     } else {
         None
     };
@@ -2655,7 +2771,7 @@ pub async fn get_tool(
     } else if !is_virtual {
         find_valid_builtin_tool_dir(&id, &state.effective_builtin_roots())
             .1
-            .map(|(_, canon_dir, _, _, _)| canon_dir)
+            .map(|p| p.canon_dir)
     } else {
         None
     };
@@ -2784,10 +2900,10 @@ pub async fn serve_scene_file(
         return (StatusCode::NOT_FOUND, "scene pack or file not found").into_response();
     }
     if id != "default" {
-        if let (_, Some((root, bdir, _, _, _))) =
+        if let (_, Some(p)) =
             find_valid_builtin_scene_dir(&id, &state.effective_builtin_roots())
         {
-            return serve_file_from_dir(&root, &bdir, &rel).await;
+            return serve_file_from_dir(&p.root, &p.canon_dir, &rel).await;
         }
     }
     (StatusCode::NOT_FOUND, "scene pack or file not found").into_response()
@@ -2820,10 +2936,10 @@ pub async fn serve_tool_file(
         return (StatusCode::NOT_FOUND, "tool pack or file not found").into_response();
     }
     if id != "default" {
-        if let (_, Some((root, bdir, _, _, _))) =
+        if let (_, Some(p)) =
             find_valid_builtin_tool_dir(&id, &state.effective_builtin_roots())
         {
-            return serve_file_from_dir(&root, &bdir, &rel).await;
+            return serve_file_from_dir(&p.root, &p.canon_dir, &rel).await;
         }
     }
     (StatusCode::NOT_FOUND, "tool pack or file not found").into_response()
@@ -3060,21 +3176,31 @@ fn inspect_base_mesh_assets(base_mjcf_xml: &str) -> BaseMeshInspection {
                     _ => file.to_string(),
                 };
 
-                let (local_exists, candidate_rel) = if is_safe_base_mesh_file(file) {
+                let (local_exists, candidate_rel, sha256, size_bytes) = if is_safe_base_mesh_file(file) {
                     let rel = match meshdir_leaf.as_deref() {
                         Some(leaf) => format!("{leaf}/{file}"),
                         None => file.to_string(),
                     };
-                    let exists = is_safe_relative_path(&rel)
-                        && is_safe_base_asset_ext(&rel)
-                        && canon_asset_root.as_ref().is_some_and(|root| {
+                    let canon_file = if is_safe_relative_path(&rel) && is_safe_base_asset_ext(&rel) {
+                        canon_asset_root.as_ref().and_then(|root| {
                             root.join(&rel)
                                 .canonicalize()
-                                .is_ok_and(|f| f.starts_with(root) && f.is_file())
-                        });
-                    (exists, Some(rel))
+                                .ok()
+                                .filter(|f| f.starts_with(root) && f.is_file())
+                        })
+                    } else {
+                        None
+                    };
+                    let file_meta = canon_file
+                        .as_deref()
+                        .and_then(|f| std::fs::read(f).ok())
+                        .map(|bytes| (sha256_hex(&bytes), bytes.len() as u64));
+                    match file_meta {
+                        Some((digest, len)) => (true, Some(rel), Some(digest), Some(len)),
+                        None => (false, Some(rel), None, None),
+                    }
                 } else {
-                    (false, None)
+                    (false, None, None, None)
                 };
 
                 let resolved_url = if local_exists {
@@ -3099,6 +3225,8 @@ fn inspect_base_mesh_assets(base_mjcf_xml: &str) -> BaseMeshInspection {
                     "local_exists": local_exists,
                     "http_accessible": http_accessible,
                     "url": resolved_url,
+                    "sha256": sha256,
+                    "size_bytes": size_bytes,
                 }));
             }
         }
@@ -3698,15 +3826,20 @@ fn resolve_remote_target_locally(
     r_sd: Option<String>,
     r_td: Option<String>,
 ) -> (bool, String, Option<String>, Option<String>) {
-    if let (Ok((_, _, sw, sd)), Ok((_, tm, tw, td)), Ok(base_xml)) = (
+    if let (Ok(scene_pack), Ok(tool_pack), Ok(base_xml)) = (
         state.resolve_scene_checked_full(r_scene),
         state.resolve_tool_checked_full(r_tool),
         get_base_robot_xml_for_robot(running_robot),
     ) {
-        if sd == r_sd && td == r_td {
-            if let Ok(composed) = compose_mjcf(&base_xml, Some(&sw), Some(&tm), Some(&tw)) {
+        if scene_pack.digest == r_sd && tool_pack.digest == r_td {
+            if let Ok(composed) = compose_mjcf(
+                &base_xml,
+                Some(&scene_pack.xml),
+                Some(&tool_pack.manifest),
+                Some(&tool_pack.xml),
+            ) {
                 if !composed.trim().is_empty() {
-                    return (true, composed, sd, td);
+                    return (true, composed, scene_pack.digest, tool_pack.digest);
                 }
             }
         }
@@ -4102,10 +4235,20 @@ pub async fn activate(
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Invalid tool pack id '{tool_id}'")}))));
     }
 
-    let (scene_dir, scene_manifest, scene_world_xml, scene_digest) =
-        state.resolve_scene_checked_full(&scene_id)?;
-    let (tool_dir, tool_manifest, tool_xml, tool_digest) =
-        state.resolve_tool_checked_full(&tool_id)?;
+    let ResolvedPack {
+        canon_dir: scene_dir,
+        manifest: scene_manifest,
+        xml: scene_world_xml,
+        digest: scene_digest,
+        files: _,
+    } = state.resolve_scene_checked_full(&scene_id)?;
+    let ResolvedPack {
+        canon_dir: tool_dir,
+        manifest: tool_manifest,
+        xml: tool_xml,
+        digest: tool_digest,
+        files: _,
+    } = state.resolve_tool_checked_full(&tool_id)?;
 
     validate_robot_compatibility(
         &running_robot,
@@ -5115,8 +5258,20 @@ pub async fn get_bundle(
 
     let current = state.active.read().await.clone();
 
-    let (scene_dir, mut scene_manifest, sw) = state.resolve_scene_checked_with_dir(&current.active_scene)?;
-    let (tool_dir, mut tool_manifest, tw) = state.resolve_tool_checked_with_dir(&current.active_tool)?;
+    let ResolvedPack {
+        canon_dir: _,
+        manifest: mut scene_manifest,
+        xml: sw,
+        digest: scene_digest,
+        files: scene_files,
+    } = state.resolve_scene_checked_full(&current.active_scene)?;
+    let ResolvedPack {
+        canon_dir: _,
+        manifest: mut tool_manifest,
+        xml: tw,
+        digest: tool_digest,
+        files: tool_files,
+    } = state.resolve_tool_checked_full(&current.active_tool)?;
 
     validate_robot_compatibility(
         &running_robot,
@@ -5141,9 +5296,18 @@ pub async fn get_bundle(
         compose_mjcf(&base_xml, Some(&sw), Some(&tool_manifest), Some(&tw))
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?
     };
+    let composed_xml_sha256 = sha256_hex(composed_xml.as_bytes());
 
-    scene_manifest.assets = normalize_manifest_assets(scene_dir.as_deref(), scene_manifest.assets);
-    tool_manifest.assets = normalize_manifest_assets(tool_dir.as_deref(), tool_manifest.assets);
+    scene_manifest.assets = normalize_manifest_assets(
+        scene_files.as_ref(),
+        Some(&scene_manifest.world_xml),
+        scene_manifest.assets,
+    );
+    tool_manifest.assets = normalize_manifest_assets(
+        tool_files.as_ref(),
+        Some(&tool_manifest.tool_xml),
+        tool_manifest.assets,
+    );
 
     let mesh_info = inspect_base_mesh_assets(&base_xml);
     let policy_model_url = policy_manifest.as_ref().map(|pm| format!("/api/v1/sandbox/policies/{}/files/{}", pm.id, pm.model_file));
@@ -5158,7 +5322,10 @@ pub async fn get_bundle(
         "seed": current.seed,
         "reset_seq": current.reset_seq,
         "io_seq": current.io_seq,
+        "scene_digest": scene_digest,
+        "tool_digest": tool_digest,
         "composed_xml": composed_xml,
+        "composed_xml_sha256": composed_xml_sha256,
         "base_meshdir": mesh_info.meshdir,
         "base_assets": mesh_info.base_assets,
         "missing_base_assets": mesh_info.missing_base_assets,
@@ -6621,5 +6788,213 @@ mod tests {
         assert_eq!(st.desired_io.as_object().unwrap().len(), MAX_IO_KEYS);
         assert_eq!(st.desired_io["io0"], 7);
         assert!(st.desired_io.get("one_too_many").is_none());
+    }
+
+    #[tokio::test]
+    async fn bundle_includes_pack_digests_and_asset_sha256() {
+        let _guard = TEST_UPLOAD_MUTEX.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let empty_builtins = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            SandboxState::new(tmp.path().to_path_buf())
+                .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+        );
+        let app = test_router(state.clone());
+
+        // 1. Stock virtual presets have null scene_digest and tool_digest
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/sandbox/bundle")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let default_bundle: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(default_bundle["scene_digest"].is_null(), "{default_bundle}");
+        assert!(default_bundle["tool_digest"].is_null(), "{default_bundle}");
+        assert_eq!(
+            default_bundle["composed_xml_sha256"].as_str(),
+            Some(sha256_hex(default_bundle["composed_xml"].as_str().unwrap().as_bytes()).as_str()),
+        );
+
+        // 2. Base assets with local_exists == true include 64-char hex sha256 and size_bytes matching disk bytes
+        let mut so101_cfg: crate::model::ArmConfig =
+            serde_json::from_str(include_str!("../../profiles/so_arm101.json")).unwrap();
+        so101_cfg
+            .init_arm_model_in_memory(Some(include_str!("../../assets/so101_new_calib.urdf")))
+            .unwrap();
+        let so101_state = Arc::new(
+            SandboxState::new(tmp.path().to_path_buf())
+                .with_builtin_roots(vec![empty_builtins.path().to_path_buf()]),
+        );
+        let so101_app = test_router_with(
+            so101_state,
+            Arc::new(crate::supervisor::ArmSupervisor::new(so101_cfg)),
+        );
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/sandbox/bundle?robot=so-arm101")
+            .body(Body::empty())
+            .unwrap();
+        let res = so101_app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let so101_bundle: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(so101_bundle["scene_digest"].is_null());
+        assert!(so101_bundle["tool_digest"].is_null());
+        if let Some(asset_root) = base_assets_dir() {
+            let base_assets = so101_bundle["base_assets"].as_array().unwrap();
+            assert!(!base_assets.is_empty());
+            for entry in base_assets {
+                if entry["local_exists"] == true {
+                    let rel = entry["path"].as_str().unwrap();
+                    let disk_bytes = std::fs::read(asset_root.join(rel)).unwrap();
+                    let expected = sha256_hex(&disk_bytes);
+                    assert_eq!(entry["sha256"].as_str(), Some(expected.as_str()), "{entry}");
+                    assert_eq!(entry["size_bytes"], disk_bytes.len() as u64, "{entry}");
+                }
+            }
+        }
+
+        // 3. Custom scene + tool packs return 64-char hex digests, composed_xml_sha256,
+        // and include both declared and XML-referenced pack assets with sha256 + size_bytes
+        let scene_stl = b"solid scene_prop\n  facet normal 0 0 1\n    outer loop\n      vertex 0 0 0\n      vertex 0.02 0 0\n      vertex 0 0.03 0\n    endloop\n  endfacet\nendsolid scene_prop\n";
+        let scene_tex = b"\x89PNG\r\n\x1a\nfake_texture_payload_1234";
+        let scene_tex_xml_only = b"\x89PNG\r\n\x1a\nxml_only_texture_payload_5678";
+        let tool_stl = b"solid tool_jaw\n  facet normal 0 0 1\n    outer loop\n      vertex 0 0 0\n      vertex 0.01 0 0\n      vertex 0 0.04 0\n    endloop\n  endfacet\nendsolid tool_jaw\n";
+
+        let encode_b64_obj = |bytes: &[u8]| -> serde_json::Value {
+            const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut s = String::with_capacity(bytes.len() * 4 / 3 + 4);
+            for chunk in bytes.chunks(3) {
+                let b0 = chunk[0];
+                let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+                let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+                s.push(B64[(b0 >> 2) as usize] as char);
+                s.push(B64[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+                s.push(if chunk.len() > 1 { B64[(((b1 & 0x0F) << 2) | (b2 >> 6)) as usize] as char } else { '=' });
+                s.push(if chunk.len() > 2 { B64[(b2 & 0x3F) as usize] as char } else { '=' });
+            }
+            serde_json::json!({ "encoding": "base64", "data": s })
+        };
+
+        let scene_payload = serde_json::json!({
+            "id": "digest_scene",
+            "scene_json": {
+                "id": "digest_scene",
+                "name": "Digest Scene",
+                "world_xml": "world.xml",
+                "robots": ["b601dm"],
+                "assets": [
+                    "meshes/prop.stl",
+                    {"target": "textures/tex.png"},
+                    {"path": "meshes/absent_opt.stl", "required": false}
+                ]
+            },
+            "world_xml": r#"<mujoco model="digest_world"><compiler meshdir="meshes"/><asset><mesh name="prop" file="prop.stl"/><texture name="tex2" type="2d" file="textures/tex_xml_only.png"/></asset><worldbody><body name="part" pos="0.25 0 0.02"><freejoint/><geom type="mesh" mesh="prop"/></body></worldbody></mujoco>"#,
+            "assets": {
+                "meshes/prop.stl": encode_b64_obj(scene_stl),
+                "textures/tex.png": encode_b64_obj(scene_tex),
+                "textures/tex_xml_only.png": encode_b64_obj(scene_tex_xml_only)
+            }
+        });
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/sandbox/scenes")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&scene_payload).unwrap()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let scene_up: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        let expected_scene_digest = scene_up["pack_digest"].as_str().unwrap().to_string();
+        assert_eq!(expected_scene_digest.len(), 64);
+
+        let tool_payload = serde_json::json!({
+            "id": "digest_tool",
+            "tool_json": {
+                "id": "digest_tool",
+                "name": "Digest Tool",
+                "kind": "gripper",
+                "tool_xml": "tool.xml",
+                "robots": ["b601dm"],
+                "assets": []
+            },
+            "tool_xml": r#"<mujoco model="digest_tool"><compiler meshdir="meshes"/><asset><mesh name="jaw" file="jaw.stl"/></asset><worldbody><geom name="jaw_geom" type="mesh" mesh="jaw"/></worldbody></mujoco>"#,
+            "assets": {
+                "meshes/jaw.stl": encode_b64_obj(tool_stl)
+            }
+        });
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/sandbox/tools")
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&tool_payload).unwrap()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let tool_up: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        let expected_tool_digest = tool_up["pack_digest"].as_str().unwrap().to_string();
+        assert_eq!(expected_tool_digest.len(), 64);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/sandbox/activate")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "mode": "wasm",
+                    "scene": "digest_scene",
+                    "tool": "digest_tool"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/sandbox/bundle")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bundle: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(bundle["scene_digest"].as_str(), Some(expected_scene_digest.as_str()));
+        assert_eq!(bundle["tool_digest"].as_str(), Some(expected_tool_digest.as_str()));
+        assert_eq!(
+            bundle["composed_xml_sha256"].as_str(),
+            Some(sha256_hex(bundle["composed_xml"].as_str().unwrap().as_bytes()).as_str()),
+        );
+
+        let scene_assets = bundle["scene_manifest"]["assets"].as_array().unwrap();
+        assert_eq!(scene_assets.len(), 3, "{scene_assets:?}");
+        assert_eq!(scene_assets[0]["path"], "meshes/prop.stl");
+        assert_eq!(scene_assets[0]["sha256"].as_str(), Some(sha256_hex(scene_stl).as_str()));
+        assert_eq!(scene_assets[0]["size_bytes"], scene_stl.len() as u64);
+        assert_eq!(scene_assets[1]["path"], "textures/tex.png");
+        assert_eq!(scene_assets[1]["sha256"].as_str(), Some(sha256_hex(scene_tex).as_str()));
+        assert_eq!(scene_assets[1]["size_bytes"], scene_tex.len() as u64);
+        assert_eq!(scene_assets[2]["path"], "textures/tex_xml_only.png");
+        assert_eq!(
+            scene_assets[2]["sha256"].as_str(),
+            Some(sha256_hex(scene_tex_xml_only).as_str()),
+        );
+        assert_eq!(scene_assets[2]["size_bytes"], scene_tex_xml_only.len() as u64);
+
+        let tool_assets = bundle["tool_manifest"]["assets"].as_array().unwrap();
+        assert_eq!(tool_assets.len(), 1, "{tool_assets:?}");
+        assert_eq!(tool_assets[0]["path"], "meshes/jaw.stl");
+        assert_eq!(tool_assets[0]["sha256"].as_str(), Some(sha256_hex(tool_stl).as_str()));
+        assert_eq!(tool_assets[0]["size_bytes"], tool_stl.len() as u64);
     }
 }
