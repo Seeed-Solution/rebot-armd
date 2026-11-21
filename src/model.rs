@@ -2100,6 +2100,11 @@ pub struct Capabilities {
     /// `cartesian`. Absent (false) from older armd.
     #[serde(default)]
     pub yaw_outward: bool,
+    /// `move_to` and `move_relative` accept `path: "joint"` (IK of the goal, then the joint-space
+    /// quintic of `move_to_pose` with `speed_scale`; `motion::PathMode`); same value as
+    /// `cartesian`. Absent (false) from older armd.
+    #[serde(default)]
+    pub move_path_joint: bool,
     /// `POST /api/v1/grasp/measure` and the WS command of that path (no lease): one depth
     /// measurement at the current pose with the frame's table fit; same value as `grasp`.
     /// Absent (false) from older armd.
@@ -2427,6 +2432,7 @@ impl Capabilities {
             backlash_approach: true,
             auto_yaw: false,
             yaw_outward: arm_with_gripper && kin,
+            move_path_joint: arm_with_gripper && kin,
             grasp_measure: grasp,
             calibration_apply: grasp,
             calibration_kinematics: grasp && config.arm_model.chain().is_none(),

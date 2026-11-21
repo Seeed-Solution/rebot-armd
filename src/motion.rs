@@ -23,6 +23,9 @@ pub enum MotionError {
     IkUnreachable { s: f64, ep: f64, er: f64, yaw_off_deg: Option<f64> },
     #[error("IK branch flip at s={s:.3}: joint {joint} jumps {dq:.3} rad between samples (limit 0.10){}", yaw_hint(*.yaw_off_deg))]
     IkBranchFlip { s: f64, joint: usize, dq: f64, yaw_off_deg: Option<f64> },
+    /// `path: "joint"`: no IK seed reached the goal pose within the joint limits (best of `seeds`).
+    #[error("No IK solution for the goal pose within the joint limits (best of {seeds} seeds: position error {ep:.4} m, rotation error {er:.4} rad)")]
+    IkGoalUnreachable { ep: f64, er: f64, seeds: usize },
     #[error("Path leaves the safe workspace at s={s:.3}: check point {point} {limit} {value:.3} m beyond bound {bound:.3} m")]
     WorkspaceViolation {
         s: f64,
@@ -48,7 +51,7 @@ pub enum MotionError {
 impl MotionError {
     pub fn code(&self) -> &'static str {
         match self {
-            Self::IkUnreachable { .. } => "IK_UNREACHABLE",
+            Self::IkUnreachable { .. } | Self::IkGoalUnreachable { .. } => "IK_UNREACHABLE",
             Self::IkBranchFlip { .. } => "IK_BRANCH_FLIP",
             Self::WorkspaceViolation { .. } => "WORKSPACE_VIOLATION",
             Self::MotionBusy(_) => "MOTION_BUSY",
@@ -417,6 +420,124 @@ pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: Pa
             fit.scale, fit.peak_a, fit.peak_full_a, fit.limit_a, fit.samples, t0.elapsed().as_micros());
     }
     Ok(path)
+}
+
+// ---- joint-space path to a Cartesian goal (`path: "joint"`) ----
+
+/// Path of `move_to` / `move_relative`: `"linear"` (default) plans the straight line of
+/// [`plan_cartesian_opts`]; `"joint"` solves the IK for the goal only and moves with the
+/// joint-space quintic of `move_to_pose` (the TCP path is then not a straight line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PathMode { #[default] Linear, Joint }
+
+/// Optional `path`: `"linear"` | `"joint"`; absent or null → linear.
+pub fn parse_path_mode(body: &Value) -> Result<PathMode, MotionError> {
+    match body.get("path") {
+        None | Some(Value::Null) => Ok(PathMode::Linear),
+        Some(Value::String(s)) if s == "linear" => Ok(PathMode::Linear),
+        Some(Value::String(s)) if s == "joint" => Ok(PathMode::Joint),
+        Some(_) => Err(MotionError::InvalidCommand("path must be \"linear\", \"joint\" or null".into())),
+    }
+}
+
+/// DLS rounds of [`solve_goal_joints`] per seed ([`kinematics::PAR`] iterations each).
+pub const GOAL_IK_ROUNDS: usize = 40;
+
+/// The seeds of [`solve_goal_joints`] besides the current joints: the current joints with J1
+/// turned by the azimuth change from the current TCP to the goal, and each of `extra` (home,
+/// rest) with J1 turned by the azimuth change from its own TCP to the goal.
+pub fn goal_seeds(input: &PlanInput, goal: &Pose, extra: &[[f64; 6]]) -> Vec<[f64; 6]> {
+    let turned = |q: &[f64; 6]| -> [f64; 6] {
+        let p = input.arm.fk(q).p;
+        let mut s = *q;
+        if p[0].hypot(p[1]) >= OUTWARD_MIN_RADIUS_M && goal.p[0].hypot(goal.p[1]) >= OUTWARD_MIN_RADIUS_M {
+            s[0] = wrap_pi(q[0] + azimuth_delta(&p, &goal.p));
+        }
+        s
+    };
+    let mut seeds = vec![input.q0, turned(&input.q0)];
+    for q in extra { seeds.push(*q); seeds.push(turned(q)); }
+    seeds
+}
+
+/// IK of `goal` for a joint-space move: solved from each of `seeds` (the first one should be the
+/// current joints, see [`goal_seeds`]); a solution counts when it reaches the goal within the IK
+/// tolerance, lies within the joint limits and (with a workspace policy) passes the workspace
+/// rule at the goal. Of those, the one with the smallest Σ |q − q0| / max_velocity over the arm
+/// joints wins. None: the workspace violation of the first solution within the joint limits
+/// that failed the workspace rule, else [`MotionError::IkGoalUnreachable`] with the best errors seen.
+pub fn solve_goal_joints(input: &PlanInput, goal: &Pose, opts: PathOpts, seeds: &[[f64; 6]]) -> Result<[f64; 6], MotionError> {
+    let arm_dof = input.arm.arm_dof();
+    if input.limits.len() < arm_dof + 1 {
+        return Err(MotionError::Unsupported(format!("Cartesian actions need at least {} joints", arm_dof + 1)));
+    }
+    if !goal.p.iter().chain(goal.r.iter().flatten()).all(|v| v.is_finite()) {
+        return Err(MotionError::InvalidCommand("goal pose must be finite".into()));
+    }
+    if opts.yaw_outward && goal.p[0].hypot(goal.p[1]) < OUTWARD_MIN_RADIUS_M {
+        return Err(MotionError::InvalidCommand(format!(
+            "yaw \"outward\" is undefined near the base z axis: the goal is {:.3} m from it (minimum {OUTWARD_MIN_RADIUS_M} m)",
+            goal.p[0].hypot(goal.p[1]))));
+    }
+    let lim = |i: usize| input.limits.get(i).filter(|_| i < arm_dof);
+    let lo: [f64; 6] = std::array::from_fn(|i| lim(i).map_or(-std::f64::consts::PI, |l| f64::from(l.min_position) + IK_LIMIT_MARGIN));
+    let hi: [f64; 6] = std::array::from_fn(|i| lim(i).map_or(std::f64::consts::PI, |l| f64::from(l.max_position) - IK_LIMIT_MARGIN));
+    // workspace rule at the goal as for a path sample: no constraint deeper than at the start
+    let ws_eval = input.ws.as_ref().map(|ws| crate::chain::WorkspaceEvaluator::new(&input.arm, ws, &input.cam));
+    let mut ws_state = match &ws_eval {
+        Some(ev) => {
+            let start_q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { input.q0[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });
+            let mut c0 = ev.alloc_buf();
+            ev.eval_into(&start_q32, &mut c0, "plan").map_err(|f| MotionError::WorkspaceViolation {
+                s: 0.0, point: f.point, limit: f.limit, value: f.value, bound: f.bound, detail: f.detail })?;
+            Some((ev.init_min_depths(&c0), c0))
+        }
+        None => None,
+    };
+    let cost = |q: &[f64; 6]| -> f64 {
+        (0..arm_dof).map(|i| {
+            let v = f64::from(input.limits[i].max_velocity);
+            (q[i] - input.q0[i]).abs() / if v > 0.0 { v } else { 1.0 }
+        }).sum()
+    };
+    let mut best: Option<([f64; 6], f64)> = None;
+    let (mut best_ep, mut best_er) = (f64::INFINITY, f64::INFINITY);
+    let mut ws_failure: Option<MotionError> = None;
+    for seed in seeds {
+        // the seed itself within the search limits (a seed past them would widen them)
+        let mut q: [f64; 6] = std::array::from_fn(|i| if i < arm_dof { seed[i].clamp(lo[i], hi[i]) } else { seed[i] });
+        let mut sol = input.arm.solve_dls_ex(goal, &q, &lo, &hi, kinematics::PAR.w, opts.yaw_free);
+        for _ in 1..GOAL_IK_ROUNDS {
+            if sol.ok { break; }
+            let before = sol.ep + kinematics::PAR.w * sol.er;
+            q = sol.q;
+            let next = input.arm.solve_dls_ex(goal, &q, &lo, &hi, kinematics::PAR.w, opts.yaw_free);
+            let stalled = next.ep + kinematics::PAR.w * next.er > before - 1e-9;
+            sol = next;
+            if stalled && !sol.ok { break; }
+        }
+        if sol.ep + sol.er < best_ep + best_er { best_ep = sol.ep; best_er = sol.er; }
+        if !sol.ok { continue; }
+        let within = (0..arm_dof).all(|i| {
+            let l = &input.limits[i];
+            sol.q[i].is_finite() && sol.q[i] >= f64::from(l.min_position) && sol.q[i] <= f64::from(l.max_position)
+        });
+        if !within { continue; }
+        if let (Some(ev), Some((min_d, buf))) = (&ws_eval, ws_state.as_mut()) {
+            let q32: [f32; 7] = std::array::from_fn(|i| if i < arm_dof { sol.q[i] as f32 } else if i == arm_dof { input.j7 } else { 0.0 });
+            if let Err(f) = ev.eval_into(&q32, buf, "plan").and_then(|()| ev.check_readonly(buf, min_d, "plan")) {
+                ws_failure.get_or_insert(MotionError::WorkspaceViolation { s: 1.0, point: f.point, limit: f.limit, value: f.value, bound: f.bound, detail: f.detail });
+                continue;
+            }
+        }
+        let c = cost(&sol.q);
+        if best.is_none_or(|(_, bc)| c < bc) { best = Some((sol.q, c)); }
+    }
+    match (best, ws_failure) {
+        (Some((q, _)), _) => Ok(q),
+        (None, Some(e)) => Err(e),
+        (None, None) => Err(MotionError::IkGoalUnreachable { ep: best_ep, er: best_er, seeds: seeds.len() }),
+    }
 }
 
 // ---- goal requests ----

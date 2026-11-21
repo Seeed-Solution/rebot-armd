@@ -3105,8 +3105,59 @@ impl SupervisorInner {
         Ok((id, duration + 0.5))
     }
 
+    /// Joint-space goal seeds besides the current joints ([`crate::motion::goal_seeds`]): the
+    /// profile home and the resting pose (when it differs), arm joints only.
+    pub fn goal_seed_poses(&self) -> Vec<[f64; 6]> {
+        let arm_dof = self.config.arm_dof();
+        let q6 = |q: &[f32]| crate::kinematics::q6(&q[..arm_dof.min(q.len())]);
+        let mut seeds = vec![q6(&self.config.home_positions)];
+        let rest = q6(self.config.resting_positions());
+        if rest != seeds[0] { seeds.push(rest); }
+        seeds
+    }
+
+    /// `move_to` / `move_relative` with `path: "joint"`: the joint-space quintic of
+    /// `move_to_pose` from the commanded joints to the arm joints `q` (gripper kept), with the
+    /// arm joints' planning velocity times `speed_scale`. The quintic is checked like every joint
+    /// move (swept workspace, keep-out boxes, link capsules, power budget, torque and collision
+    /// holds). `same_side`: end with the same-side approach of `move_to_precise`.
+    /// Returns (action id, expected duration).
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_joint_goal(&mut self, input: &PlanInput, q: &[f64; 6], speed_scale: f64, kind: &str, tag: Option<String>,
+        same_side: Option<crate::backlash::Request>) -> Result<(u64, f64), ArmError> {
+        self.check_plan_fresh(input)?;
+        let target = self.joint_goal_target(q);
+        let limits = self.joint_goal_limits(speed_scale);
+        let (_, id, duration) = match same_side {
+            Some(request) => self.start_quintic_same_side(target, Some(input.epoch), kind, tag, &limits, "move_to_precise", request)?,
+            None => self.start_quintic(target, None, Some(input.epoch), kind, tag, &limits)?,
+        };
+        Ok((id, duration))
+    }
+
+    /// The commanded joints with the arm joints replaced by `q` (gripper and extra joints kept).
+    fn joint_goal_target(&self, q: &[f64; 6]) -> Vec<f32> {
+        let arm_dof = self.config.arm_dof();
+        let gripper_idx = self.config.gripper_index();
+        let mut target = self.commanded_positions.clone();
+        for (i, t) in target.iter_mut().enumerate().take(arm_dof.min(6)) {
+            if Some(i) != gripper_idx { *t = q[i] as f32; }
+        }
+        target
+    }
+
+    /// `planning_limits()` with the non-gripper velocities times `speed_scale` (as `move_to_pose`).
+    fn joint_goal_limits(&self, speed_scale: f64) -> Vec<crate::model::JointLimit> {
+        let gripper_idx = self.config.gripper_index();
+        let mut limits = self.planning_limits();
+        for (i, l) in limits.iter_mut().enumerate() {
+            if Some(i) != gripper_idx { l.max_velocity *= speed_scale as f32; }
+        }
+        limits
+    }
+
     /// PLAN_STALE checks shared by every installed plan.
-    fn check_plan_fresh(&self, input: &PlanInput) -> Result<(), ArmError> {
+    pub(crate) fn check_plan_fresh(&self, input: &PlanInput) -> Result<(), ArmError> {
         if self.safety.epoch_id() != input.epoch {
             return Err(MotionError::PlanStale("epoch changed while planning".into()).into());
         }

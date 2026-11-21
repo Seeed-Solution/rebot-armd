@@ -25,8 +25,8 @@ The existing `/api/v1/motion/jog`, `/motion/home`, `/motion/unload` commands and
 
 | path | body |
 |---|---|
-| `/api/v1/action/move_to` | `{"position":[x,y,z], "orientation": {"rpy":[r,p,y]} \| {"quat":[w,x,y,z]} \| null, "speed": {"linear":m/s, "angular":rad/s}?, "precise":bool? (default false), "approach":"same_side"\|"direct"?, "yaw":"outward"?, "tag": str?}` — `precise` / `approach`: see [Same-side final approach](#same-side-final-approach--同侧接近); `yaw`: see [Outward yaw](#outward-yaw--朝外偏航) |
-| `/api/v1/action/move_relative` | `{"frame":"base"\|"tool"\|"camera", "d":[dx,dy,dz]?, "dyaw":rad?, "dpitch":rad?, "droll":rad?, "level":bool?, "speed"?, "precise"?, "approach"?, "yaw":"outward"?, "tag"?}` — `yaw`: see [Outward yaw](#outward-yaw--朝外偏航) |
+| `/api/v1/action/move_to` | `{"position":[x,y,z], "orientation": {"rpy":[r,p,y]} \| {"quat":[w,x,y,z]} \| null, "speed": {"linear":m/s, "angular":rad/s}?, "precise":bool? (default false), "approach":"same_side"\|"direct"?, "yaw":"outward"?, "path":"linear"\|"joint"? (default "linear"), "speed_scale":0.1..1.0? (path "joint" only, default 1.0), "tag": str?}` — `precise` / `approach`: see [Same-side final approach](#same-side-final-approach--同侧接近); `yaw`: see [Outward yaw](#outward-yaw--朝外偏航); `path`: see [Joint path](#joint-path--关节空间路径) |
+| `/api/v1/action/move_relative` | `{"frame":"base"\|"tool"\|"camera", "d":[dx,dy,dz]?, "dyaw":rad?, "dpitch":rad?, "droll":rad?, "level":bool?, "speed"?, "precise"?, "approach"?, "yaw":"outward"?, "path"?, "speed_scale"?, "tag"?}` — `yaw`: see [Outward yaw](#outward-yaw--朝外偏航); `path`: see [Joint path](#joint-path--关节空间路径) |
 | `/api/v1/action/gripper` | `{"command":"open"\|"close"\|"move", "fraction":0..1? (move only; 0 closed, 1 open), "grasp":bool? (close only, default true), "speed":rad/s? (≤2.0, default 1.0), "timeout_s":? (≤30; default max(6, expected duration + 2 s), expected duration = travel / speed + 0.5 s + settle_ms, e.g. 8.5 s for the full 5.7 rad stroke at 1 rad/s; an explicit value applies as given), "tag"?}` |
 | `/api/v1/action/gripper_zero_check` | `{"store_offset":bool? (default false), "threshold_rad":float? (default 0.10), "tag":str?}` — see [Gripper zero check and calibration](#gripper-zero-check-and-calibration--夹爪零位检查与标定) |
 | `/api/v1/gripper/calibration` | `{"offset_rad":float?, "jaw_opening":{"points":[[rad,m],...],"calibrated":bool?}?}` (WS command, lease required; REST `GET` exposed without lease) — see [Gripper zero check and calibration](#gripper-zero-check-and-calibration--夹爪零位检查与标定) |
@@ -81,6 +81,26 @@ The camera rotation is R_base_cam = R_base_end · R_end_cam, R_end_cam from `con
 - `place`：放置姿态取目标点的朝外偏航；`approach` 与 `descend` 按朝外路径规划，`lift` 与 `retreat`（竖直移动，保持姿态）不按朝外路径规划。
 - 5 轴机械臂：`auto_yaw` 行为不变（与不带 `yaw` 时一样，IK 放开偏航）；`yaw: "outward"` 另外按上述规则设定目标姿态。
 - 提示：机械臂关节数 ≥ 6 时，不带 `yaw: "outward"` 规划的路径若报 `IK_UNREACHABLE` 或 `IK_BRANCH_FLIP`，且起点或失败点之前（含失败点）任一采样点的偏航与 atan2(y, x) 相差超过 15°，消息末尾加 `; yaw differs from the outward direction by N°; try yaw: "outward"`（N 为其中最大的差值；离基座轴 0.03 m 以内或工具竖直的采样点不计）。示例（B601-DM，mock）：`move_to` (0.18, 0.10, 0.30) rpy (0, 40°, 0) 结束时 J1 为 1.194 rad（atan2 为 0.507），再直线移动到 (0.18, −0.10, 0.30) 返回 `IK branch flip at s=0.425: joint 1 jumps 0.105 rad between samples (limit 0.10); yaw differs from the outward direction by 29°; try yaw: "outward"`。带 `yaw: "outward"` 时两次移动都成功，每个采样点 J1 与 atan2(y, x) 相差不超过 0.005 rad（`tests/test_yaw_outward.rs`）。
+
+### Joint path / 关节空间路径
+
+`"path": "joint"` on `move_to` and `move_relative` (capability `move_path_joint`, same value as `cartesian`; absent on older armd) moves to the goal pose in joint space instead of along a straight line. `"linear"` or no `path` keeps the straight line. Any other value is `INVALID_COMMAND`.
+
+- **The TCP path is not a straight line.** The joints move from the start to the goal joints along one quintic (the trajectory of `move_to_pose`). Only the start and the goal pose are Cartesian; the TCP and orientation between them follow from the joint interpolation.
+- Goal: resolved as for the straight line (`orientation`, `yaw: "outward"`, `move_relative` frames, 5-DOF `auto_yaw`). The IK is solved for the goal only, from several seeds: the current joints; the current joints with J1 turned by the azimuth change from the current TCP to the goal; the profile home and the resting pose (when it differs), each as is and with J1 turned the same way. A seed's result counts when it reaches the goal within the IK tolerance (1 mm, 0.5°), lies within the joint limits and passes the workspace rule at the goal. Of those, armd takes the one with the smallest Σ |q − q_start| / max_velocity over the arm joints. None: when a seed's result was within the joint limits but failed the workspace rule at the goal, that `WORKSPACE_VIOLATION`; else `IK_UNREACHABLE` `No IK solution for the goal pose within the joint limits (best of N seeds: position error … m, rotation error … rad)`. With `yaw: "outward"` a goal within 0.03 m of the base z axis is `INVALID_COMMAND`.
+- Speed: `speed_scale` (0.1..1.0, default 1.0) multiplies the joint planning velocity as for `move_to_pose` (`planned_max_velocity`, the profile `speed_cap.joint_velocity_scale`; gripper excluded). `speed` (m/s) is `INVALID_COMMAND` with `path: "joint"`.
+- Checks: the same as `move_to_pose` and joint moves: the swept workspace check of the quintic (floor, outer box, reach, keep-out boxes, link capsules, self-collision; `WORKSPACE_VIOLATION`), the power budget, the torque and collision holds, and the plan freshness check (`PLAN_STALE`). The gripper keeps its command.
+- `precise: true` / `approach: "same_side"`: the quintic ends with the same-side approach of `move_to_precise` as in `move_to_pose` (see [Same-side final approach](#same-side-final-approach--同侧接近)).
+- Action kind stays `move_to` / `move_relative`.
+
+`move_to` 与 `move_relative` 的 `"path": "joint"`（能力 `move_path_joint`，与 `cartesian` 取值相同；旧版 armd 无此字段）在关节空间移动到目标位姿，不走直线。`"linear"` 或不给 `path` 时仍走直线。其他取值返回 `INVALID_COMMAND`。
+
+- **TCP 路径不是直线。** 各关节从起点到目标关节角按同一条五次多项式运动（与 `move_to_pose` 相同的轨迹）。只有起点和目标位姿是笛卡尔约束，中间的 TCP 位置和姿态由关节插值决定。
+- 目标：与直线相同的方式解析（`orientation`、`yaw: "outward"`、`move_relative` 坐标系、5 轴 `auto_yaw`）。只对目标位姿求 IK，使用多个初值：当前关节角；当前关节角并把 J1 转过当前 TCP 到目标的方位角差；profile 的 home 和静置位姿（与 home 不同时），各自原样及按同样方式转 J1。某个初值的解满足以下条件才计入：在 IK 容差内（1 mm、0.5°）到达目标、在关节限位内、目标处通过工作空间检查。其中取各臂关节 Σ |q − q_start| / max_velocity 最小的解。没有可用解时：若有初值的解在关节限位内但目标处未通过工作空间检查，返回该 `WORKSPACE_VIOLATION`；否则返回 `IK_UNREACHABLE` `No IK solution for the goal pose within the joint limits (best of N seeds: position error … m, rotation error … rad)`。带 `yaw: "outward"` 时，目标离基座 z 轴不到 0.03 m 返回 `INVALID_COMMAND`。
+- 速度：`speed_scale`（0.1..1.0，默认 1.0）与 `move_to_pose` 一样乘到关节规划速度上（`planned_max_velocity`、profile 的 `speed_cap.joint_velocity_scale`；夹爪除外）。`path: "joint"` 时给 `speed`（m/s）返回 `INVALID_COMMAND`。
+- 检查：与 `move_to_pose` 和关节运动相同：五次多项式轨迹的扫掠工作空间检查（地面、外框、可达范围、禁入盒、连杆胶囊体、自碰撞；`WORKSPACE_VIOLATION`）、电源功率预算、力矩保护与碰撞保护的保持状态，以及规划时效检查（`PLAN_STALE`）。夹爪保持当前指令。
+- `precise: true` / `approach: "same_side"`：与 `move_to_pose` 一样，五次多项式末段按 `move_to_precise` 做同侧接近（见[同侧接近](#same-side-final-approach--同侧接近)）。
+- 动作类型仍为 `move_to` / `move_relative`。
 
 ### Speed / 速度
 

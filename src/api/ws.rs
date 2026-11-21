@@ -179,6 +179,16 @@ struct PendingPlan {
     /// Same-side approach (`precise: true` / `approach`, src/backlash.rs): settings or the
     /// reason for a direct motion (None = off).
     approach: Result<crate::backlash::Plan, Option<&'static str>>,
+    /// `path: "joint"`: the IK seeds ([`motion::goal_seeds`]), the `speed_scale` of the joint
+    /// quintic and the same-side approach request (None = off). None: the straight line.
+    joint: Option<JointGoal>,
+}
+
+/// `path: "joint"` part of a [`PendingPlan`].
+struct JointGoal {
+    seeds: Vec<[f64; 6]>,
+    speed_scale: f64,
+    same_side: Option<crate::backlash::Request>,
 }
 
 #[cfg(feature = "policy-runtime")]
@@ -388,10 +398,23 @@ fn prepare_action(
     // `applies_to` move_to_precise) or `approach: "same_side"` end it with the short segment
     let precise = motion::flag(body, "precise", false).map_err(ArmError::from)?;
     let request = crate::backlash::parse_request(body).map_err(ArmError::from)?;
-    let approach = if precise || request != crate::backlash::Request::Profile { inner.approach_plan("move_to_precise", request) } else { Err(None) };
+    let path_mode = motion::parse_path_mode(body).map_err(ArmError::from)?;
+    let same_side = precise || request != crate::backlash::Request::Profile;
+    if path_mode == motion::PathMode::Joint && body.get("speed").is_some_and(|v| !v.is_null()) {
+        return Err(invalid_command("speed applies to path \"linear\"; path \"joint\" takes speed_scale (0.1..1.0)"));
+    }
+    let approach = if same_side && path_mode == motion::PathMode::Linear { inner.approach_plan("move_to_precise", request) } else { Err(None) };
     let input = inner.plan_input()?;
     let (goal, opts) = motion::resolve_goal_opts(&input, &spec);
-    Ok(ActionStart::Plan(PendingPlan { request_id: request_id.clone(), kind, input, goal, speed, tag, opts, approach }))
+    let joint = match path_mode {
+        motion::PathMode::Linear => None,
+        motion::PathMode::Joint => Some(JointGoal {
+            seeds: motion::goal_seeds(&input, &goal, &inner.goal_seed_poses()),
+            speed_scale: crate::poses::speed_scale(body)?,
+            same_side: same_side.then_some(request),
+        }),
+    };
+    Ok(ActionStart::Plan(PendingPlan { request_id: request_id.clone(), kind, input, goal, speed, tag, opts, approach, joint }))
 }
 
 fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) -> Value {
@@ -1208,32 +1231,58 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 // Cartesian plan: IK runs on a blocking thread without the supervisor lock,
                 // so the control tick is never blocked by it; install re-checks everything.
                 if let Some((plan, generation)) = pending_plan.take() {
-                    let PendingPlan { request_id, kind, input, goal, speed, tag, opts, approach } = plan;
-                    let planned = tokio::task::spawn_blocking(move || {
-                        let result = motion::plan_cartesian_opts(&input, goal, speed, opts);
-                        let pre = match (&approach, &result) {
-                            (Ok(plan), Ok(direct)) => crate::backlash::plan_cartesian_pre(&input, direct, plan, None, speed, opts),
-                            (Err(Some(r)), _) => crate::backlash::Pre::Direct((*r).to_string()),
-                            _ => crate::backlash::Pre::Off,
-                        };
-                        (input, result.map(|path| (path, pre, approach.ok())))
-                    }).await;
-                    let mut inner = recv_supervisor.inner().write().await;
-                    if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
-                    response = Some(match planned {
-                        Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
-                        Ok((_, Err(error))) => command_reject(&inner, &request_id, ArmError::from(error).into()),
-                        Ok((input, Ok((path, pre, approach)))) => {
-                            if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
-                                json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
-                            } else {
-                                match inner.install_path_same_side(&input, path, pre, approach.as_ref(), kind, tag) {
-                                    Ok(started) => command_ack(&inner, &request_id, Some(started)),
-                                    Err(error) => command_reject(&inner, &request_id, error.into()),
+                    let PendingPlan { request_id, kind, input, goal, speed, tag, opts, approach, joint } = plan;
+                    if let Some(joint) = joint {
+                        // path "joint": IK of the goal only (several seeds) without the lock,
+                        // then the move_to_pose quintic, checked under the lock
+                        let seeds = joint.seeds;
+                        let solved = tokio::task::spawn_blocking(move || {
+                            let q = motion::solve_goal_joints(&input, &goal, opts, &seeds);
+                            (input, q)
+                        }).await;
+                        let mut inner = recv_supervisor.inner().write().await;
+                        if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
+                        response = Some(match solved {
+                            Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
+                            Ok((_, Err(error))) => command_reject(&inner, &request_id, ArmError::from(error).into()),
+                            Ok((input, Ok(q))) => {
+                                if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
+                                    json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
+                                } else {
+                                    match inner.install_joint_goal(&input, &q, joint.speed_scale, kind, tag, joint.same_side) {
+                                        Ok(started) => command_ack(&inner, &request_id, Some(started)),
+                                        Err(error) => command_reject(&inner, &request_id, error.into()),
+                                    }
                                 }
                             }
-                        }
-                    });
+                        });
+                    } else {
+                        let planned = tokio::task::spawn_blocking(move || {
+                            let result = motion::plan_cartesian_opts(&input, goal, speed, opts);
+                            let pre = match (&approach, &result) {
+                                (Ok(plan), Ok(direct)) => crate::backlash::plan_cartesian_pre(&input, direct, plan, None, speed, opts),
+                                (Err(Some(r)), _) => crate::backlash::Pre::Direct((*r).to_string()),
+                                _ => crate::backlash::Pre::Off,
+                            };
+                            (input, result.map(|path| (path, pre, approach.ok())))
+                        }).await;
+                        let mut inner = recv_supervisor.inner().write().await;
+                        if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
+                        response = Some(match planned {
+                            Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
+                            Ok((_, Err(error))) => command_reject(&inner, &request_id, ArmError::from(error).into()),
+                            Ok((input, Ok((path, pre, approach)))) => {
+                                if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
+                                    json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})
+                                } else {
+                                    match inner.install_path_same_side(&input, path, pre, approach.as_ref(), kind, tag) {
+                                        Ok(started) => command_ack(&inner, &request_id, Some(started)),
+                                        Err(error) => command_reject(&inner, &request_id, error.into()),
+                                    }
+                                }
+                            }
+                        });
+                    }
                 }
 
                 // Macro actions (grasp, place): the first motions are planned without the lock
