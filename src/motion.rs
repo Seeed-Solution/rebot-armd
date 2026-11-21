@@ -59,6 +59,49 @@ impl MotionError {
     }
 }
 
+// ---- outward yaw ----
+
+/// `yaw: "outward"` is refused when the path passes closer than this to the base z axis
+/// (atan2(y, x) is undefined there); same radius as the 5-DOF auto_yaw.
+pub const OUTWARD_MIN_RADIUS_M: f64 = 0.03;
+/// Orientation options of a Cartesian path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PathOpts {
+    /// 5-DOF auto_yaw: the IK leaves yaw free.
+    pub yaw_free: bool,
+    /// `yaw: "outward"`: every sample's yaw is atan2(y, x) of its position plus the start's
+    /// offset from it, which goes to 0 along the path (see [`plan_cartesian_opts`]).
+    pub yaw_outward: bool,
+}
+
+impl From<bool> for PathOpts {
+    fn from(yaw_free: bool) -> Self { Self { yaw_free, yaw_outward: false } }
+}
+
+/// `r` with its rpy yaw (heading of the end_link x axis, atan2(R[1][0], R[0][0])) replaced by
+/// atan2(y, x) of `p`: Rz(atan2(y, x) − yaw) · r, which keeps roll and pitch of
+/// R = Rz(yaw)·Ry(pitch)·Rx(roll). With the tool x axis vertical
+/// ([`crate::chain::is_tool_vertical`], pitch ±90°) yaw and roll are one rotation and `r` is
+/// returned unchanged.
+pub fn with_outward_yaw(p: &[f64; 3], r: &kinematics::Mat3) -> kinematics::Mat3 {
+    if crate::chain::is_tool_vertical(r) { return *r; }
+    let dyaw = p[1].atan2(p[0]) - r[1][0].atan2(r[0][0]);
+    kinematics::mat_mul(&kinematics::axis_r(&[0.0, 0.0, 1.0], dyaw), r)
+}
+
+/// Distance of the segment a → b, projected on the xy plane, from the base z axis.
+fn segment_axis_distance(a: &[f64; 3], b: &[f64; 3]) -> f64 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 1e-18 { (-(a[0] * dx + a[1] * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+    (a[0] + dx * t).hypot(a[1] + dy * t)
+}
+
+/// Signed angle about base z from the xy direction of `a` to that of `b`.
+fn azimuth_delta(a: &[f64; 3], b: &[f64; 3]) -> f64 {
+    (a[0] * b[1] - a[1] * b[0]).atan2(a[0] * b[0] + a[1] * b[1])
+}
+
 // ---- speed ----
 
 pub const DEFAULT_LINEAR_MPS: f64 = 0.05;
@@ -164,6 +207,18 @@ pub fn plan_cartesian(input: &PlanInput, goal: Pose, speed: Speed) -> Result<Joi
 
 /// Plan a Cartesian path from `fk(q0)` to `goal`, with optional `yaw_free` for 5-DOF arms.
 pub fn plan_cartesian_ex(input: &PlanInput, goal: Pose, speed: Speed, yaw_free: bool) -> Result<JointPath, MotionError> {
+    plan_cartesian_opts(input, goal, speed, PathOpts { yaw_free, yaw_outward: false })
+}
+
+/// Plan a Cartesian path from `fk(q0)` to `goal` with [`PathOpts`].
+///
+/// With `yaw_outward` the orientation is interpolated in the outward frame: with
+/// ψ(s) = atan2(y, x) of sample s (unwrapped along the line), R(s) = Rz(ψ(s)) · Rrel(s), where
+/// Rrel slerps from Rz(−ψ(0)) · R_start to Rz(−ψ(1)) · R_goal. A start already at the outward yaw
+/// keeps its yaw at atan2(y, x) of every sample. A path passing within
+/// [`OUTWARD_MIN_RADIUS_M`] of the base z axis is `INVALID_COMMAND`.
+pub fn plan_cartesian_opts(input: &PlanInput, goal: Pose, speed: Speed, opts: PathOpts) -> Result<JointPath, MotionError> {
+    let yaw_free = opts.yaw_free;
     let arm_dof = input.arm.arm_dof();
     if input.limits.len() < arm_dof + 1 {
         return Err(MotionError::Unsupported(format!("Cartesian actions need at least {} joints", arm_dof + 1)));
@@ -185,8 +240,22 @@ pub fn plan_cartesian_ex(input: &PlanInput, goal: Pose, speed: Speed, yaw_free: 
     let start = input.arm.fk(&input.q0);
     let dp = kinematics::sub(&goal.p, &start.p);
     let length = kinematics::norm(&dp);
-    let w_rel = kinematics::log_v(&kinematics::mul_t(&goal.r, &start.r));
-    let theta = kinematics::norm(&w_rel);
+    // outward: (ψ(0), Δψ over the path, Rrel(0)); rotations below are then in the outward frame
+    let outward = if opts.yaw_outward {
+        let d = segment_axis_distance(&start.p, &goal.p);
+        if d < OUTWARD_MIN_RADIUS_M {
+            return Err(MotionError::InvalidCommand(format!(
+                "yaw \"outward\" is undefined near the base z axis: the path passes {d:.3} m from it (minimum {OUTWARD_MIN_RADIUS_M} m)")));
+        }
+        let psi0 = start.p[1].atan2(start.p[0]);
+        Some((psi0, azimuth_delta(&start.p, &goal.p), kinematics::mat_mul(&kinematics::axis_r(&[0.0, 0.0, 1.0], -psi0), &start.r)))
+    } else { None };
+    let (r_from, r_to) = match outward {
+        Some((psi0, dpsi, rel0)) => (rel0, kinematics::mat_mul(&kinematics::axis_r(&[0.0, 0.0, 1.0], -(psi0 + dpsi)), &goal.r)),
+        None => (start.r, goal.r),
+    };
+    let w_rel = kinematics::log_v(&kinematics::mul_t(&r_to, &r_from));
+    let theta = kinematics::norm(&w_rel) + outward.map_or(0.0, |(_, dpsi, _)| dpsi.abs());
     let raw = ((length / SAMPLE_SPACING_M).ceil()).max((theta / SAMPLE_SPACING_RAD).ceil()).max(1.0);
     if raw > MAX_SAMPLES as f64 {
         return Err(MotionError::InvalidCommand(format!(
@@ -237,7 +306,11 @@ pub fn plan_cartesian_ex(input: &PlanInput, goal: Pose, speed: Speed, yaw_free: 
         let s = k as f64 / n as f64;
         let p = [start.p[0] + dp[0] * s, start.p[1] + dp[1] * s, start.p[2] + dp[2] * s];
         let r = if k == n { goal.r } else {
-            kinematics::mat_mul(&kinematics::exp_r(&[w_rel[0] * s, w_rel[1] * s, w_rel[2] * s]), &start.r)
+            let r_s = kinematics::mat_mul(&kinematics::exp_r(&[w_rel[0] * s, w_rel[1] * s, w_rel[2] * s]), &r_from);
+            match outward {
+                Some((psi0, _, _)) => kinematics::mat_mul(&kinematics::axis_r(&[0.0, 0.0, 1.0], psi0 + azimuth_delta(&start.p, &p)), &r_s),
+                None => r_s,
+            }
         };
         let sol = input.arm.solve_dls_ex(&Pose::new(r, p), &prev, &lo, &hi, kinematics::PAR.w, yaw_free);
         if !sol.ok {
@@ -323,6 +396,9 @@ pub enum GoalSpec {
     Absolute { p: [f64; 3], r: Option<kinematics::Mat3> },
     AbsoluteEx { p: [f64; 3], r: Option<kinematics::Mat3>, auto_yaw: bool },
     Relative { frame: RelFrame, d: [f64; 3], dyaw: f64, dpitch: f64, droll: f64, level: bool, auto_yaw: Option<bool> },
+    /// `yaw: "outward"`: the inner goal with its rpy yaw replaced by atan2(y, x) of the goal
+    /// position (roll and pitch kept), and a path whose yaw follows atan2(y, x).
+    YawOutward(Box<GoalSpec>),
 }
 
 /// Resolve a goal request against the start pose `fk(q0)`.
@@ -356,8 +432,26 @@ pub fn align_auto_yaw(goal_p: &[f64; 3], target_r: kinematics::Mat3) -> kinemati
 
 /// Resolve a goal request against the start pose `fk(q0)`, returning `(pose, yaw_free)`.
 pub fn resolve_goal_ex(input: &PlanInput, spec: &GoalSpec) -> (Pose, bool) {
+    let (pose, opts) = resolve_goal_opts(input, spec);
+    (pose, opts.yaw_free)
+}
+
+/// Resolve a goal request against the start pose `fk(q0)`, returning the pose and the path options
+/// for [`plan_cartesian_opts`].
+pub fn resolve_goal_opts(input: &PlanInput, spec: &GoalSpec) -> (Pose, PathOpts) {
+    if let GoalSpec::YawOutward(inner) = spec {
+        let (mut pose, opts) = resolve_goal_opts(input, inner);
+        pose.r = with_outward_yaw(&pose.p, &pose.r);
+        return (pose, PathOpts { yaw_outward: true, ..opts });
+    }
+    let (pose, yaw_free) = resolve_goal_base(input, spec);
+    (pose, yaw_free.into())
+}
+
+fn resolve_goal_base(input: &PlanInput, spec: &GoalSpec) -> (Pose, bool) {
     let start = input.arm.fk(&input.q0);
     match spec {
+        GoalSpec::YawOutward(_) => unreachable!("handled by resolve_goal_opts"),
         GoalSpec::Absolute { p, r } => {
             let auto_yaw = input.arm.arm_dof() == 5 && r.is_none();
             let mut target_r = r.unwrap_or(start.r);
@@ -500,7 +594,20 @@ pub fn parse_move_to(body: &Value) -> Result<(GoalSpec, Speed, Option<String>), 
         Some(ay) => GoalSpec::AbsoluteEx { p, r, auto_yaw: ay },
         None => GoalSpec::Absolute { p, r },
     };
-    Ok((spec, parse_speed(body)?, tag(body)?))
+    Ok((outward_spec(spec, parse_yaw_mode(body)?), parse_speed(body)?, tag(body)?))
+}
+
+/// Optional `yaw`: `"outward"` → true; absent or null → false.
+pub fn parse_yaw_mode(body: &Value) -> Result<bool, MotionError> {
+    match body.get("yaw") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(s)) if s == "outward" => Ok(true),
+        Some(_) => Err(MotionError::InvalidCommand("yaw must be \"outward\" or null".into())),
+    }
+}
+
+fn outward_spec(spec: GoalSpec, outward: bool) -> GoalSpec {
+    if outward { GoalSpec::YawOutward(Box::new(spec)) } else { spec }
 }
 
 /// `position: [x, y, z]` (finite numbers).
@@ -551,7 +658,11 @@ pub fn parse_move_relative(body: &Value) -> Result<(GoalSpec, Speed, Option<Stri
         Some(Value::Bool(b)) => Some(*b),
         Some(_) => return Err(MotionError::InvalidCommand("auto_yaw must be boolean".into())),
     };
-    Ok((GoalSpec::Relative { frame, d, dyaw, dpitch, droll, level, auto_yaw }, parse_speed(body)?, tag(body)?))
+    let outward = parse_yaw_mode(body)?;
+    if outward && dyaw != 0.0 {
+        return Err(MotionError::InvalidCommand("dyaw cannot be combined with yaw \"outward\"".into()));
+    }
+    Ok((outward_spec(GoalSpec::Relative { frame, d, dyaw, dpitch, droll, level, auto_yaw }, outward), parse_speed(body)?, tag(body)?))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

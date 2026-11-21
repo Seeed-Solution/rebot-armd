@@ -25,8 +25,8 @@ The existing `/api/v1/motion/jog`, `/motion/home`, `/motion/unload` commands and
 
 | path | body |
 |---|---|
-| `/api/v1/action/move_to` | `{"position":[x,y,z], "orientation": {"rpy":[r,p,y]} \| {"quat":[w,x,y,z]} \| null, "speed": {"linear":m/s, "angular":rad/s}?, "precise":bool? (default false), "approach":"same_side"\|"direct"?, "tag": str?}` — `precise` / `approach`: see [Same-side final approach](#same-side-final-approach--同侧接近) |
-| `/api/v1/action/move_relative` | `{"frame":"base"\|"tool"\|"camera", "d":[dx,dy,dz]?, "dyaw":rad?, "dpitch":rad?, "droll":rad?, "level":bool?, "speed"?, "precise"?, "approach"?, "tag"?}` |
+| `/api/v1/action/move_to` | `{"position":[x,y,z], "orientation": {"rpy":[r,p,y]} \| {"quat":[w,x,y,z]} \| null, "speed": {"linear":m/s, "angular":rad/s}?, "precise":bool? (default false), "approach":"same_side"\|"direct"?, "yaw":"outward"?, "tag": str?}` — `precise` / `approach`: see [Same-side final approach](#same-side-final-approach--同侧接近); `yaw`: see [Outward yaw](#outward-yaw--朝外偏航) |
+| `/api/v1/action/move_relative` | `{"frame":"base"\|"tool"\|"camera", "d":[dx,dy,dz]?, "dyaw":rad?, "dpitch":rad?, "droll":rad?, "level":bool?, "speed"?, "precise"?, "approach"?, "yaw":"outward"?, "tag"?}` — `yaw`: see [Outward yaw](#outward-yaw--朝外偏航) |
 | `/api/v1/action/gripper` | `{"command":"open"\|"close"\|"move", "fraction":0..1? (move only; 0 closed, 1 open), "grasp":bool? (close only, default true), "speed":rad/s? (≤2.0, default 1.0), "timeout_s":? (≤30; default max(6, expected duration + 2 s), expected duration = travel / speed + 0.5 s + settle_ms, e.g. 8.5 s for the full 5.7 rad stroke at 1 rad/s; an explicit value applies as given), "tag"?}` |
 | `/api/v1/action/gripper_zero_check` | `{"store_offset":bool? (default false), "threshold_rad":float? (default 0.10), "tag":str?}` — see [Gripper zero check and calibration](#gripper-zero-check-and-calibration--夹爪零位检查与标定) |
 | `/api/v1/gripper/calibration` | `{"offset_rad":float?, "jaw_opening":{"points":[[rad,m],...],"calibrated":bool?}?}` (WS command, lease required; REST `GET` exposed without lease) — see [Gripper zero check and calibration](#gripper-zero-check-and-calibration--夹爪零位检查与标定) |
@@ -36,7 +36,7 @@ The existing `/api/v1/motion/jog`, `/motion/home`, `/motion/unload` commands and
 | `/api/v1/calibration/apply`, `/api/v1/calibration/restore` | camera calibration transaction, see [Camera calibration](#camera-calibration-wizard--相机标定向导) (acknowledged without `action_id` when it has finished) |
 | `/api/v1/calibration/motor_zero` | `{"joints":[1-based], "dry_run":bool?, "force":bool?, "method":"software"\|"motor"?}`; `/api/v1/calibration/joint_zero/restore` `{"backup":str}` — see [Calibration tools and motor zero](#calibration-tools-and-motor-zero--标定工具与电机零位) (acknowledged without `action_id` when it has finished) |
 | `/api/v1/action/move_to_pose` | `{"name":str, "include_gripper":bool? (default false), "speed_scale":0.1..1.0? (default 1.0), "approach":"same_side"\|"direct"?, "tag"?}` — see [Named poses](#named-poses--命名姿态) |
-| `/api/v1/action/place` | `{"pose":str? \| "position":[x,y,z]?, "orientation"?, "approach_height_m":0.02..0.30? (default 0.08), "release":bool? (default true), "retreat":bool? (default true), "speed_scale":0.1..1.0? (default 1.0), "approach":"same_side"\|"direct"?, "tag"?}` — see [Place](#place--放置) |
+| `/api/v1/action/place` | `{"pose":str? \| "position":[x,y,z]?, "orientation"?, "approach_height_m":0.02..0.30? (default 0.08), "release":bool? (default true), "retreat":bool? (default true), "speed_scale":0.1..1.0? (default 1.0), "approach":"same_side"\|"direct"?, "yaw":"outward"?, "tag"?}` — see [Place](#place--放置) |
 | `/api/v1/poses/save`, `/api/v1/poses/rename`, `/api/v1/poses/delete` | `{"name":str, "positions":[dof]?, "id":str?}` / `{"id":str, "name":str}` / `{"name":str}` (not actions: acknowledged without `action_id`) |
 | `/api/v1/workspace/keepout` | `{"boxes":[{"name":str, "min_m":[x,y,z], "max_m":[x,y,z]}]}` — see [Keep-out boxes](#keep-out-boxes--禁入盒) (not an action) |
 | `/api/v1/action/replay` | `{"episode":str, "speed":0.5\|1.0? (default 0.5), "gripper":bool? (default true), "tag"?}` — see [Replay](#replay--回放) |
@@ -60,6 +60,26 @@ The camera rotation is R_base_cam = R_base_end · R_end_cam, R_end_cam from `con
 
 相机旋转 R_base_cam = R_base_end · R_end_cam，R_end_cam 来自 `config.camera_mount`（`flip`、`rot_deg`、`tilt_deg`；默认值同 cockpit，光轴 = end_link x）。`rot_deg` 0、`flip` false 时，图像 y（向下）= −end_link z，图像 x = −end_link y，即相机位于夹爪上方、静置位姿下图像正立（安装以收纳姿态为参考：含 J6 在内 URDF 角均为 0，即 profile 的 `zero_reference`）。`level` 只用于 `camera`。
 
+### Outward yaw / 朝外偏航
+
+`"yaw": "outward"` on `move_to`, `move_relative` and `place` (capability `yaw_outward`, same value as `cartesian`; absent on older armd) sets the yaw to ψ = atan2(y, x) of the target position, about the base z axis. Any other value than `"outward"` or null is `INVALID_COMMAND`.
+
+- Combination with the orientation: the orientation is resolved as without `yaw` (`orientation` rpy or quat, the current orientation when null, `move_relative`'s rotations, a named pose's orientation for `place`); then its rpy yaw is replaced by ψ and its rpy roll and pitch are kept: R = Rz(ψ − yaw) · R, yaw = atan2(R[1][0], R[0][0]) (heading of the end_link x axis). With `{"rpy":[r,p,y]}` the result is rpy `[r, p, ψ]`; the given `y` is ignored. When the end_link x axis is within 2.6° of vertical (pitch ±90°, `is_tool_vertical`) yaw and roll are the same rotation and the orientation is used unchanged.
+- `move_relative` with `yaw: "outward"` and a non-zero `dyaw` is `INVALID_COMMAND`.
+- Path: with ψ(s) = atan2(y, x) of path sample s (unwrapped along the line), the sample orientation is R(s) = Rz(ψ(s)) · Rrel(s), where Rrel slerps from Rz(−ψ(0)) · R_start to Rz(−ψ(1)) · R_goal. A start whose yaw is already outward keeps the yaw at atan2(y, x) of every sample; another start's offset from outward goes linearly (slerp) to 0. The sample count and duration use the slerp angle plus |ψ(1) − ψ(0)|.
+- A path whose xy projection passes within 0.03 m of the base z axis (atan2 undefined) is refused before planning: `INVALID_COMMAND` `yaw "outward" is undefined near the base z axis: the path passes 0.006 m from it (minimum 0.03 m)`.
+- `place`: the place orientation gets the outward yaw of the target; `approach` and `descend` are planned with the outward path, `lift` and `retreat` (straight up, orientation kept) are not.
+- 5-DOF arms: `auto_yaw` keeps its behaviour (the IK leaves yaw free, as without `yaw`); `yaw: "outward"` sets the targets as above in addition.
+
+`move_to`、`move_relative`、`place` 的 `"yaw": "outward"`（能力 `yaw_outward`，与 `cartesian` 取值相同；旧版 armd 无此字段）把偏航设为目标位置的 ψ = atan2(y, x)，绕基座 z 轴。`"outward"` 与 null 以外的值返回 `INVALID_COMMAND`。
+
+- 与姿态的组合：先按没有 `yaw` 时的规则得到姿态（`orientation` 的 rpy 或 quat；为 null 时取当前姿态；`move_relative` 的旋转；`place` 的命名姿态的姿态），再把它的 rpy 偏航换成 ψ，保留 rpy 的横滚与俯仰：R = Rz(ψ − yaw) · R，yaw = atan2(R[1][0], R[0][0])（end_link x 轴的朝向）。给 `{"rpy":[r,p,y]}` 时结果为 rpy `[r, p, ψ]`，给定的 `y` 不使用。end_link x 轴与竖直方向夹角在 2.6° 以内时（俯仰 ±90°，`is_tool_vertical`）偏航与横滚是同一个旋转，姿态按原样使用。
+- `move_relative` 同时给 `yaw: "outward"` 和非零 `dyaw` 返回 `INVALID_COMMAND`。
+- 路径：ψ(s) 为路径采样点 s 的 atan2(y, x)（沿直线连续展开），采样点姿态 R(s) = Rz(ψ(s)) · Rrel(s)，Rrel 从 Rz(−ψ(0)) · R_start 球面插值到 Rz(−ψ(1)) · R_goal。起点偏航已朝外时，每个采样点的偏航都等于该点的 atan2(y, x)；否则起点相对朝外方向的偏差沿路径（球面插值）线性减到 0。采样数和时长按球面插值角度加 |ψ(1) − ψ(0)| 计算。
+- 路径在 xy 平面上的投影离基座 z 轴不到 0.03 m（atan2 无定义）时，规划前拒绝：`INVALID_COMMAND` `yaw "outward" is undefined near the base z axis: the path passes 0.006 m from it (minimum 0.03 m)`。
+- `place`：放置姿态取目标点的朝外偏航；`approach` 与 `descend` 按朝外路径规划，`lift` 与 `retreat`（竖直移动，保持姿态）不按朝外路径规划。
+- 5 轴机械臂：`auto_yaw` 行为不变（与不带 `yaw` 时一样，IK 放开偏航）；`yaw: "outward"` 另外按上述规则设定目标姿态。
+
 ### Speed / 速度
 
 Defaults linear 0.05 m/s (max 0.15), angular 0.5 rad/s (max 1.0). Joint speed is capped by `planned_max_velocity` (0.45 rad/s on rebot-dm), joint acceleration by min(limit, 3.0 rad/s²).
@@ -73,7 +93,7 @@ profile 的 `speed_cap`（`linear_mps`、`angular_rps`、`joint_velocity_scale`�
 ## Planning and execution / 规划与执行
 
 1. Under the lock: lease, epoch, `request_id`, then preconditions — Armed/Moving, no pending re-arm / park / handover, no trajectory, no servo target, all commanded velocities < 1e-3 (else `MOTION_BUSY`).
-2. Without the lock (blocking thread): straight line in position, slerp in rotation, one sample per 5 mm / 2° (≤ 400), DLS IK per sample seeded with the previous one, within joint limits − 0.02 rad. A joint change > 0.10 rad between samples is `IK_BRANCH_FLIP`; every sample passes the workspace rule. One quintic time scaling over the whole path.
+2. Without the lock (blocking thread): straight line in position, slerp in rotation (with `yaw: "outward"` in the outward frame, see [Outward yaw](#outward-yaw--朝外偏航)), one sample per 5 mm / 2° (≤ 400), DLS IK per sample seeded with the previous one, within joint limits − 0.02 rad. A joint change > 0.10 rad between samples is `IK_BRANCH_FLIP`; every sample passes the workspace rule. One quintic time scaling over the whole path.
 3. Lock again: same lease and generation, epoch unchanged, still idle and commanded positions unchanged (< 1e-4 rad), else `PLAN_STALE`. Then the path is installed and acknowledged.
 
 Execution: each tick advances path time by dt·rate with rate = clamp((0.45 − lag)/(0.45 − 0.38), 0, 1), lag = max over J1..J6 of |commanded − measured|. Geometry stays the same, only speed drops. Rate 0 for 1 s ends the action as `TRACKING_STALL` (commanded reset to measured, no Fault). After the path: settle until |commanded − measured| < 0.05 rad and |v| < 0.05 rad/s for 200 ms (`settled:true`), at most 2 s (`settled:false`). J7 holds its commanded value during arm paths.
@@ -628,6 +648,7 @@ WS 指令 `/api/v1/calibration/motor_zero` `{"joints": [关节编号，从 1 开
 | `pose` | — | named pose; its stored TCP (`tcp.position`, `tcp.rpy`) is the place point and orientation. A pose saved without a TCP uses FK of its positions |
 | `position` | — | place point `[x,y,z]` (end_link origin, base frame, m). Exactly one of `pose` / `position` |
 | `orientation` | null | `{"rpy":[r,p,y]}` or `{"quat":[w,x,y,z]}`; null = the pose's orientation (`pose`) or the current one (`position`) |
+| `yaw` | null | `"outward"`: the orientation's yaw becomes atan2(y, x) of the place point, approach and descent keep the yaw outward ([Outward yaw](#outward-yaw--朝外偏航)) |
 | `approach_height_m` | 0.08 | 0.02..0.30; height above the place point for the approach and the retreat |
 | `release` | true | open the gripper at the place point |
 | `retreat` | true | move straight up by `approach_height_m` after the release |

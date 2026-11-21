@@ -2095,6 +2095,11 @@ pub struct Capabilities {
     pub backlash_approach: bool,
     #[serde(default)]
     pub auto_yaw: bool,
+    /// `move_to`, `move_relative` and `place` accept `yaw: "outward"` (yaw = atan2(y, x) of the
+    /// target, the path's yaw follows atan2(y, x); `motion::PathOpts`); same value as
+    /// `cartesian`. Absent (false) from older armd.
+    #[serde(default)]
+    pub yaw_outward: bool,
     /// `POST /api/v1/grasp/measure` and the WS command of that path (no lease): one depth
     /// measurement at the current pose with the frame's table fit; same value as `grasp`.
     /// Absent (false) from older armd.
@@ -2421,6 +2426,7 @@ impl Capabilities {
             power_budget: config.power_budget.as_ref().is_some_and(|p| p.enabled),
             backlash_approach: true,
             auto_yaw: false,
+            yaw_outward: arm_with_gripper && kin,
             grasp_measure: grasp,
             calibration_apply: grasp,
             calibration_kinematics: grasp && config.arm_model.chain().is_none(),

@@ -165,12 +165,12 @@ impl MacroCtx {
             let plan = approach.as_ref().map(|a| inner.approach_plan(a.use_, a.request));
             (inner.plan_input().map_err(arm_fail).map_err(before)?, plan)
         };
-        let (goal, yaw_free) = motion::resolve_goal_ex(&input, &spec);
+        let (goal, opts) = motion::resolve_goal_opts(&input, &spec);
         let (input, planned) = tokio::task::spawn_blocking(move || {
-            let p = motion::plan_cartesian_ex(&input, goal, speed, yaw_free).map(|direct| {
+            let p = motion::plan_cartesian_opts(&input, goal, speed, opts).map(|direct| {
                 let pre = match &plan {
                     Some(Ok(plan)) => crate::backlash::plan_cartesian_pre(&input, &direct, plan,
-                        approach.as_ref().map(|a| &a.rules), speed, yaw_free),
+                        approach.as_ref().map(|a| &a.rules), speed, opts),
                     Some(Err(Some(r))) => crate::backlash::Pre::Direct((*r).to_string()),
                     _ => crate::backlash::Pre::Off,
                 };

@@ -175,7 +175,7 @@ struct PendingPlan {
     goal: crate::kinematics::Pose,
     speed: crate::motion::Speed,
     tag: Option<String>,
-    yaw_free: bool,
+    opts: crate::motion::PathOpts,
     /// Same-side approach (`precise: true` / `approach`, src/backlash.rs): settings or the
     /// reason for a direct motion (None = off).
     approach: Result<crate::backlash::Plan, Option<&'static str>>,
@@ -390,8 +390,8 @@ fn prepare_action(
     let request = crate::backlash::parse_request(body).map_err(ArmError::from)?;
     let approach = if precise || request != crate::backlash::Request::Profile { inner.approach_plan("move_to_precise", request) } else { Err(None) };
     let input = inner.plan_input()?;
-    let (goal, yaw_free) = motion::resolve_goal_ex(&input, &spec);
-    Ok(ActionStart::Plan(PendingPlan { request_id: request_id.clone(), kind, input, goal, speed, tag, yaw_free, approach }))
+    let (goal, opts) = motion::resolve_goal_opts(&input, &spec);
+    Ok(ActionStart::Plan(PendingPlan { request_id: request_id.clone(), kind, input, goal, speed, tag, opts, approach }))
 }
 
 fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) -> Value {
@@ -1208,11 +1208,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 // Cartesian plan: IK runs on a blocking thread without the supervisor lock,
                 // so the control tick is never blocked by it; install re-checks everything.
                 if let Some((plan, generation)) = pending_plan.take() {
-                    let PendingPlan { request_id, kind, input, goal, speed, tag, yaw_free, approach } = plan;
+                    let PendingPlan { request_id, kind, input, goal, speed, tag, opts, approach } = plan;
                     let planned = tokio::task::spawn_blocking(move || {
-                        let result = motion::plan_cartesian_ex(&input, goal, speed, yaw_free);
+                        let result = motion::plan_cartesian_opts(&input, goal, speed, opts);
                         let pre = match (&approach, &result) {
-                            (Ok(plan), Ok(direct)) => crate::backlash::plan_cartesian_pre(&input, direct, plan, None, speed, yaw_free),
+                            (Ok(plan), Ok(direct)) => crate::backlash::plan_cartesian_pre(&input, direct, plan, None, speed, opts),
                             (Err(Some(r)), _) => crate::backlash::Pre::Direct((*r).to_string()),
                             _ => crate::backlash::Pre::Off,
                         };
