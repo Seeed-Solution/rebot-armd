@@ -2482,7 +2482,7 @@ const I18N = {
     'vm.label': '视觉模式', 'vm.label.show': '本页画面显示', 'vm.show': '显示', 'vm.off': '关', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco', 'vm.both': '两者',
     'vm.tip': '视觉模式：YOLO 识别物体，ArUco 识别标记，或两者同时运行。选择后本页开启持续识别，「关」停止；不影响其他客户端',
     'vm.tip.na': '视觉模式不可用（视觉服务未运行）', 'vm.fail': '切换视觉模式失败', 'vm.noyolo': 'YOLO 模型未加载，只能使用 ArUco',
-    'aru.sum': 'ArUco 标记 {n} 个', 'aru.tap': '点击标记查看位姿', 'aru.sum.s': 'ArUco {n}', 'aru.picked': '已选定，再点一次恢复自动',
+    'aru.sum': 'ArUco 标定板标记 {n} 个', 'aru.unk': '{n} 个不在标定板上（疑似误检）：{ids}', 'aru.tap': '点击标记查看位姿', 'aru.sum.s': '标定板 {n}', 'aru.unk.s': '误检 {ids}', 'aru.picked': '已选定，再点一次恢复自动',
     'det.trig': '单次识别', 'det.trig.busy': '识别中…', 'det.trig.tip': '临时开启识别，抓拍一帧结果后恢复原状态',
     'det.trig.none': '单次识别未返回目标', 'det.trig.ok': '单次识别：{n} 个目标', 'det.trig.fail': '单次识别失败', 'det.restore.fail': '识别未能关闭，请手动关闭持续识别',
     'det.fps.idle': '待机 {n} FPS', 'det.fps.work': '工作 {n} FPS', 'det.fps.snap': '抓拍中', 'det.fps.tip': '相机推理帧率：待机 {idle} FPS / 工作 {active} FPS',
@@ -2696,7 +2696,7 @@ const I18N = {
     'vm.label': 'Vision mode', 'vm.label.show': 'Shown on this page', 'vm.show': 'Show', 'vm.off': 'Off', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco', 'vm.both': 'Both',
     'vm.tip': 'Vision mode: YOLO for objects, ArUco for markers, or both at once. Selecting one turns continuous detection on for this page; Off stops it. Other clients are not affected',
     'vm.tip.na': 'Vision mode unavailable (vision service not running)', 'vm.fail': 'Could not switch the vision mode', 'vm.noyolo': 'YOLO model not loaded; only ArUco is available',
-    'aru.sum': 'ArUco markers: {n}', 'aru.tap': 'Tap a marker for its pose', 'aru.sum.s': 'ArUco {n}', 'aru.picked': 'Selected; tap it again for auto',
+    'aru.sum': 'ArUco board markers: {n}', 'aru.unk': '{n} not on the board (likely false): {ids}', 'aru.tap': 'Tap a marker for its pose', 'aru.sum.s': 'Board {n}', 'aru.unk.s': 'false {ids}', 'aru.picked': 'Selected; tap it again for auto',
     'det.trig': 'Snapshot', 'det.trig.busy': 'Detecting…', 'det.trig.tip': 'Turn detection on briefly, grab one result, then restore the previous state',
     'det.trig.none': 'Snapshot returned no targets', 'det.trig.ok': 'Snapshot: {n} targets', 'det.trig.fail': 'Snapshot failed', 'det.restore.fail': 'Could not switch detection back off, turn it off manually',
     'det.fps.idle': 'Idle {n} FPS', 'det.fps.work': 'Active {n} FPS', 'det.fps.snap': 'Capturing', 'det.fps.tip': 'Camera inference rate: idle {idle} FPS / active {active} FPS',
@@ -5919,7 +5919,7 @@ function cwLiveCount() {
   const { age } = calMarker();
   if (!(age < 1500)) return 0;
   const ids = new Set();
-  for (const d of S.detections || []) if (d.aruco && Number(d.aruco.id) >= 0 && Number(d.aruco.id) < 12) ids.add(Number(d.aruco.id));
+  for (const d of S.detections || []) if (d.aruco && Number(d.aruco.id) >= 0 && Number(d.aruco.id) < ARU_BOARD_IDS) ids.add(Number(d.aruco.id));
   return ids.size;
 }
 // why a running wizard must stop now (null: carry on); CW.runAbortReason has the rules
@@ -9950,10 +9950,18 @@ function drawOverlay() {
    With many markers in view (the 12-marker calibration board) one ID / Z / R P Y HUD at a time: the marker under
    the mouse, else the tapped one (tap again for automatic), else the expected marker nearest the image centre. Every
    other marker gets a compact ID tag; tags are placed greedily (slot around the marker that stays in the frame and
-   clear of the HUD, the summary and earlier tags), a tag that fits nowhere is skipped. */
+   clear of the HUD, the summary and earlier tags), a tag that fits nowhere is skipped. Ids outside the expected set
+   (calibration board ids, plus the marker the hand-eye calibration locked) are drawn dimmed with "?" and no pose:
+   DICT_4X4_50 decodes look-alikes (a real arm reported 17, 27, 34, 40 next to board ids 0..11). */
 const AXIS_COLORS = ['#ef4444', '#22c55e', '#3b82f6'];
-const ARU = { pick: null, hover: null, items: [], layout: null };
-const aruExpected = () => true;
+const ARU_BOARD_IDS = 12; // calib_wizard.js BOARD_DEFAULT cols x rows (4 x 3): ids 0..11; scripts/calib_wizard_selftest.mjs checks it
+const ARU = { pick: null, hover: null, items: [], layout: null, sumAt: null, sumMiss: null };
+function aruExpected(id) {
+  if (id == null || id === '') return false;
+  const n = Number(id);
+  if (Number.isInteger(n) && n >= 0 && n < ARU_BOARD_IDS) return true;
+  return typeof CAL !== 'undefined' && CAL.markerId != null && String(CAL.markerId) === String(id);
+}
 // screen geometry of one marker: corners (or null), centre, axis length, bounding box
 function aruGeom(d, rect) {
   const a = d.aruco;
@@ -10016,6 +10024,7 @@ function aruLayout(g, list, rect, cssW, cssH) {
   const ui = aruObstacles(cssW, cssH);
   const mid = [rect.x + rect.w / 2, rect.y + rect.h / 2], dist = (it) => Math.hypot(it.geo.c[0] - mid[0], it.geo.c[1] - mid[1]);
   const ok = items.filter((it) => it.ok).sort((p, q) => dist(p) - dist(q));
+  const unk = items.filter((it) => !it.ok);
   const by = (k) => (k == null ? null : ok.find((it) => it.id === k) || null);
   const sel = by(ARU.hover) || by(ARU.pick) || ok[0] || null;
   const boxes = items.map((it) => it.geo.box);
@@ -10052,13 +10061,15 @@ function aruLayout(g, list, rect, cssW, cssH) {
       placed.push({ x: p[0] + ox / on * 11 - 7, y: p[1] + oy / on * 11 - 7, w: 14, h: 14 });
     }
   }
-  // summary: marker count, how to pick. The first variant (full, one line, two short lines) and place
+  // summary: board count, look-alike ids, how to pick. The first variant (full, one line, two short lines) and place
   // (below / above / beside the cluster of markers, the picture's corners, then any spot nearest the cluster) that is
   // free and off the markers; else a free spot on markers; else left out
   let summary = null;
-  if (items.length > 1) {
-    const variants = [[t('aru.sum.s', { n: ok.length })]];
-    if (!narrow) variants.unshift([t('aru.sum', { n: ok.length }), ...(ok.length > 1 ? [t(ARU.pick != null && by(ARU.pick) ? 'aru.picked' : 'aru.tap')] : [])]);
+  if (items.length > 1 || unk.length) {
+    const ids = unk.map((it) => (it.id != null ? it.id : '?')).join(' ');
+    const short = [t('aru.sum.s', { n: ok.length }), ...(unk.length ? [t('aru.unk.s', { ids })] : [])];
+    const variants = [short.length > 1 ? [short.join(' · ')] : short, ...(short.length > 1 ? [short] : [])];
+    if (!narrow) variants.unshift([t('aru.sum', { n: ok.length }), ...(unk.length ? [t('aru.unk', { n: unk.length, ids })] : []), ...(ok.length > 1 ? [t(ARU.pick != null && by(ARU.pick) ? 'aru.picked' : 'aru.tap')] : [])]);
     const U = items.reduce((u, it) => { const q = it.geo.box; return { x0: Math.min(u.x0, q.x), y0: Math.min(u.y0, q.y), x1: Math.max(u.x1, q.x + q.w), y1: Math.max(u.y1, q.y + q.h) }; }, { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity });
     const ucx = (U.x0 + U.x1) / 2, ucy = (U.y0 + U.y1) / 2, R = rect, m = 8;
     const cands = variants.map((lines) => {
@@ -10085,12 +10096,12 @@ function aruLayout(g, list, rect, cssW, cssH) {
     ARU.sumAt = r ? { x: r.x, y: r.y, key: JSON.stringify(r.lines) } : null;
     if (r) { summary = { x: r.x, y: r.y, w: r.w, h: r.h, lines: r.lines }; placed.push(summary); }
   }
-  // compact tags: markers nearest the centre first; a small marker gets its tag on top of
+  // compact tags: expected markers nearest the centre first, then look-alikes; a small marker gets its tag on top of
   // it first (neighbours' tags cannot collide there), a large one above it
   let skipped = 0;
-  for (const it of ok) {
+  for (const it of [...ok, ...unk]) {
     if (it === sel) continue;
-    const text = it.id != null ? it.id : '?';
+    const text = (it.id != null ? it.id : '') + (it.ok ? '' : '?');
     const w = Math.ceil(g.measureText(text).width) + 10, h = 16, b = it.geo.box, cx = b.x + b.w / 2, cy = b.y + b.h / 2;
     const inside = { x: cx - w / 2, y: cy - h / 2, w, h };
     const around = [[cx - w / 2, b.y - h - 3], [b.x + b.w + 3, cy - h / 2], [cx - w / 2, b.y + b.h + 3], [b.x - w - 3, cy - h / 2],
@@ -10113,14 +10124,16 @@ function aruPill(g, r, stroke, fill = 'rgba(0, 0, 0, 0.75)') {
 function drawArucoAll(g, list, rect, alpha, cssW, cssH) {
   const L = aruLayout(g, list, rect, cssW, cssH);
   ARU.items = L.items;
-  for (const it of L.items) drawAruco(g, it, alpha, getLabelColor(it.d.label), it === L.sel);
+  // dimmed look-alikes first so board markers stay on top
+  for (const it of L.items) if (!it.ok) drawAruco(g, it, alpha, '#9ca3af');
+  for (const it of L.items) if (it.ok) drawAruco(g, it, alpha, getLabelColor(it.d.label), it === L.sel);
   g.save();
   g.globalAlpha = alpha; g.font = ARU_FONT; g.textBaseline = 'middle';
   for (const it of L.items) {
     if (it.tag) {
       const r = it.tag;
-      aruPill(g, r, getLabelColor(it.d.label), 'rgba(0, 0, 0, 0.72)');
-      g.fillStyle = '#fff'; g.fillText(r.text, r.x + 5, r.y + r.h / 2 + 0.5);
+      aruPill(g, r, it.ok ? getLabelColor(it.d.label) : 'rgba(156,163,175,0.7)', it.ok ? 'rgba(0, 0, 0, 0.72)' : 'rgba(0, 0, 0, 0.45)');
+      g.fillStyle = it.ok ? '#fff' : 'rgba(229,231,235,0.75)'; g.fillText(r.text, r.x + 5, r.y + r.h / 2 + 0.5);
     }
     if (it.hud) {
       const r = it.hud, color = getLabelColor(it.d.label);
@@ -10131,34 +10144,39 @@ function drawArucoAll(g, list, rect, alpha, cssW, cssH) {
   if (L.summary) {
     const r = L.summary;
     aruPill(g, r, 'rgba(255,255,255,0.35)', 'rgba(0, 0, 0, 0.6)');
-    r.lines.forEach((l, i) => { g.fillStyle = '#fff'; g.fillText(l, r.x + 7, r.y + 3 + 7.5 + i * 15); });
+    r.lines.forEach((l, i) => { g.fillStyle = i === 1 && L.items.some((x) => !x.ok) ? '#d1d5db' : '#fff'; g.fillText(l, r.x + 7, r.y + 3 + 7.5 + i * 15); });
   }
   g.restore();
   // for tests: the labels drawn this frame (CSS px in the overlay canvas)
   const box = (r) => ({ x: Math.round(r.x * 10) / 10, y: Math.round(r.y * 10) / 10, w: Math.round(r.w * 10) / 10, h: Math.round(r.h * 10) / 10 });
   ARU.layout = { n: L.items.length, hud: L.sel ? L.sel.id : null, skipped: L.skipped, summary: L.summary ? { ...box(L.summary), lines: L.summary.lines } : null,
-    labels: L.items.flatMap((it) => [it.tag && { id: it.id, kind: 'tag', text: it.tag.text, ...box(it.tag) }, it.hud && { id: it.id, kind: 'hud', lines: it.hud.lines, ...box(it.hud) }].filter(Boolean)),
-    markers: L.items.map((it) => ({ id: it.id, ...box(it.geo.box) })) };
+    labels: L.items.flatMap((it) => [it.tag && { id: it.id, kind: 'tag', dim: !it.ok, text: it.tag.text, ...box(it.tag) }, it.hud && { id: it.id, kind: 'hud', dim: false, lines: it.hud.lines, ...box(it.hud) }].filter(Boolean)),
+    markers: L.items.map((it) => ({ id: it.id, dim: !it.ok, ...box(it.geo.box) })) };
 }
-// marker under a page point (tap / hover), or undefined; also matches its tag or HUD
+// expected marker under a page point (tap / hover), or undefined; also matches its tag or HUD
 function aruAt(clientX, clientY) {
   const r = $('video-box').getBoundingClientRect(), x = clientX - r.left, y = clientY - r.top;
   const inPoly = (pts) => { let c = false; for (let i = 0, j = 3; i < 4; j = i++) { const [xi, yi] = pts[i], [xj, yj] = pts[j]; if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) c = !c; } return c; };
   const inBox = (b) => b && x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h;
-  const cand = ARU.items.filter((o) => o.id != null);
+  const cand = ARU.items.filter((o) => o.ok && o.id != null);
   const it = cand.find((o) => (o.geo.pts ? inPoly(o.geo.pts) : inBox(o.geo.box))) || cand.find((o) => inBox(o.tag) || inBox(o.hud));
   return it ? it.id : undefined;
 }
 function drawAruco(g, it, alpha, color, full = false) {
-  const { d } = it, a = d.aruco, { pts, c, L } = it.geo;
+  const { d } = it, a = d.aruco, { pts, c, L } = it.geo, dim = !it.ok;
   g.save();
-  g.globalAlpha = alpha;
+  g.globalAlpha = dim ? alpha * 0.55 : alpha;
   g.lineJoin = 'round';
 
-  // 1. outline: corner polygon (fallback: bbox)
+  // 1. outline: corner polygon (fallback: bbox); look-alikes dashed
   g.beginPath();
   if (pts) { g.moveTo(...pts[0]); for (let i = 1; i < 4; i++) g.lineTo(...pts[i]); g.closePath(); }
   else g.rect(it.geo.box.x, it.geo.box.y, it.geo.box.w, it.geo.box.h);
+  if (dim) {
+    g.setLineDash([4, 3]); g.strokeStyle = color; g.lineWidth = 1.5; g.stroke(); g.setLineDash([]);
+    g.restore();
+    return;
+  }
   g.fillStyle = color; g.globalAlpha = alpha * (full ? 0.2 : 0.12); g.fill(); g.globalAlpha = alpha;
   g.strokeStyle = 'rgba(255,255,255,0.85)'; g.lineWidth = full ? 5 : 4; g.stroke();
   g.strokeStyle = color; g.lineWidth = full ? 3 : 2; g.stroke();
