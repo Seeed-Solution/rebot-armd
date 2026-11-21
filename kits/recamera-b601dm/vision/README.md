@@ -5,9 +5,15 @@ The reCamera kit's camera process (C++, SG2002). One process owns the camera and
 - H.264 video over WebSocket on `:8001` (`/`; each binary message is one access unit followed by
   an 8-byte little-endian Unix-ms timestamp), the overlay stream `/results` and `/snapshot.jpg`;
 - the perception provider API v2 on `:8090` (`/api/inference`, `/api/results/latest`,
-  `/api/trigger`, `/api/mode`, `/api/subscribe`, `/api/subscriptions`), which armd proxies under
-  `/api/v1/detection/*` and `/api/v1/vision/*`. API and result shapes:
+  `/api/trigger`, `/api/mode`, `/api/subscribe`, `/api/subscriptions`, `/api/depth`), which armd
+  proxies under `/api/v1/detection/*` and `/api/v1/vision/*`. API and result shapes:
   [docs/detection_api.md](../../../docs/detection_api.md).
+- `GET /api/depth`: one depth inference on the next frame (a depth trigger, so it shares the frame
+  thread's single depth stage), returned as a 384x224 u16 millimetre map with a JSON header
+  (`main/depth_map.{h,cpp}`). One request at a time (409 `depth busy`), at most one per second
+  (429 with `Retry-After`); no continuous depth mode. The values are the model's estimate, not a
+  measurement: on the B601-DM unit (2026-11-21) the median absolute error against the calibrated
+  table plane was 89 mm at 0.32-0.45 m (see docs/detection_api.md "Depth map").
 
 Vision runs on demand per caller. YOLO runs on the TPU on the 640x640 inference frame; ArUco runs
 on the CPU on a zero-copy crop of the visible 640x360 band of the same frame.

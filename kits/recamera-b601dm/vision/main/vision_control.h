@@ -7,11 +7,15 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <atomic>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "depth_map.h"
 #include "intrinsics.h"
 #include "mask_geom.h"
 #include "model_catalogue.h"
@@ -122,6 +126,10 @@ struct VisionResult {
     std::string markers_json = "[]";  ///< pixels in width x height
     std::string aruco_stages_json;    ///< pipelines.aruco.stages object (ms per stage); empty: omitted
     std::string depth_json;           ///< top-level depth object; empty: omitted
+    /** The depth grid (disparity) of this frame; only set while a depth map request waits. */
+    std::shared_ptr<const std::vector<float>> depth_disp;
+    int depth_grid_w = 0;
+    int depth_grid_h = 0;
     // Frame thread timeline (mono_ms()), reported in a trigger's "timing" object.
     uint64_t wait_ms = 0;     ///< the frame thread started waiting for this frame
     uint64_t grab_ms = 0;     ///< retrieveFrame() returned it
@@ -337,6 +345,12 @@ public:
     TriggerScope trigger_scope(uint64_t request_ms, Pipelines p, const MaskFocus* focus = nullptr) {
         return TriggerScope(*this, request_ms, p, focus);
     }
+    /** GET /api/depth: one map request at a time, at most one per second. */
+    DepthMapGate& depth_map_gate() noexcept { return depth_map_gate_; }
+    /** Map requests waiting for a frame: while > 0 the frame thread attaches the depth grid. */
+    void depth_map_wait(bool on) noexcept { depth_map_wanted_.fetch_add(on ? 1 : -1); }
+    bool depth_map_wanted() const noexcept { return depth_map_wanted_.load() > 0; }
+
     TriggerScope trigger_scope(uint64_t request_ms) {
         return TriggerScope(*this, request_ms, default_trigger_pipelines(), nullptr);
     }
@@ -404,6 +418,8 @@ private:
     Intrinsics intrinsics_;
     uint64_t intrinsics_rev_ = 1;
     uint64_t intrinsics_applied_ = 1;
+    DepthMapGate depth_map_gate_{1000};
+    std::atomic<int> depth_map_wanted_{0};
 };
 
 /** When the HTTP server accepted the connection and finished reading the request (mono_ms()). */
@@ -413,8 +429,12 @@ struct RequestTimes {
 };
 
 struct HttpReply {
+    HttpReply() = default;
+    HttpReply(int s, std::string b) : status(s), body(std::move(b)) {}
     int status = 200;
     std::string body;
+    std::string content_type = "application/json";
+    std::vector<std::pair<std::string, std::string>> headers;  ///< extra response headers
 };
 
 /** Who sent the request. Loopback = 127.0.0.0/8, ::1 or ::ffff:127.0.0.0/104. */
@@ -431,6 +451,9 @@ struct RequestPeer {
  *   POST /api/subscribe {"client", "pipelines", "fps"?, "ttl_ms"?, "id"?}
  *   POST /api/subscribe/<id>/keepalive  DELETE /api/subscribe/<id>  GET /api/subscriptions
  *   POST /api/models {"detector"?: name|null, "depth"?: name|null}  (202 {"generation"})
+ *   GET  /api/depth[?wait_ms=<0..5000>]  one depth inference on a fresh frame; 200
+ *        application/octet-stream (depth_map_body), 409 depth unavailable / not metric /
+ *        busy, 429 + Retry-After (more than 1 per s), 504 no frame in time
  *   GET  /api/calibration/intrinsics    PUT /api/calibration/intrinsics (loopback peer only)
  *        {fx, fy, cx, cy, k1, k2, p1, p2, k3, width, height, marker_size?, expected_revision}
  *        200 the GET body once applied, 202 {"revision"} when not applied within 2 s,

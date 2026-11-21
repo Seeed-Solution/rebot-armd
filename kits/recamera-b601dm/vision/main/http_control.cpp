@@ -48,8 +48,10 @@ static const char* status_text(int code) {
         case 405: return "Method Not Allowed";
         case 409: return "Conflict";
         case 415: return "Unsupported Media Type";
+        case 429: return "Too Many Requests";
         case 500: return "Internal Server Error";
         case 503: return "Service Unavailable";
+        case 504: return "Gateway Timeout";
         default: return "Error";
     }
 }
@@ -87,9 +89,10 @@ bool is_loopback_address(const sockaddr* addr, socklen_t len) {
 static void send_reply(int fd, const HttpReply& r) {
     std::ostringstream ss;
     ss << "HTTP/1.1 " << r.status << " " << status_text(r.status) << "\r\n"
-       << "Content-Type: application/json\r\n"
-       << "Content-Length: " << r.body.size() << "\r\n"
-       << "Cache-Control: no-store\r\n"
+       << "Content-Type: " << r.content_type << "\r\n"
+       << "Content-Length: " << r.body.size() << "\r\n";
+    for (const auto& h : r.headers) ss << h.first << ": " << h.second << "\r\n";
+    ss << "Cache-Control: no-store\r\n"
        << "Connection: close\r\n\r\n"
        << r.body;
     const std::string out = ss.str();

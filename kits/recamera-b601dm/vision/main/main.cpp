@@ -798,6 +798,13 @@ int main(int argc, char** argv) {
             if (sub.valid() && depth_stage->run(static_cast<const uint8_t*>(sub.data()), sub.width, sub.height, static_cast<int>(sub.stride()))) {
                 vr.ran_depth = true;
                 vr.depth_ms = ms_since(t0);
+                if (ctl.depth_map_wanted()) {  // GET /api/depth waits: hand the grid over (copy, 344 KB)
+                    const float* m = depth_stage->depth_map();
+                    vr.depth_grid_w = depth_stage->grid_w();
+                    vr.depth_grid_h = depth_stage->grid_h();
+                    vr.depth_disp = std::make_shared<const std::vector<float>>(
+                        m, m + static_cast<size_t>(vr.depth_grid_w) * static_cast<size_t>(vr.depth_grid_h));
+                }
 
                 // Convert DetBoxes to DepthBoxes in content pixel coordinates
                 std::vector<rv::DepthBox> all_depth_boxes;

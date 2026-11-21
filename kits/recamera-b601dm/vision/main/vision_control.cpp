@@ -1030,6 +1030,81 @@ static HttpReply trigger_reply(VisionControl& ctl, const std::string& query, con
     return {200, s.str()};
 }
 
+static nlohmann::json depth_error_json(const char* code, const std::string& detail) {
+    return {{"api_version", kApiVersion}, {"error", code}, {"detail", detail}};
+}
+
+static HttpReply depth_error(int status, const char* code, const std::string& detail) {
+    return {status, depth_error_json(code, detail).dump()};
+}
+
+/**
+ * GET /api/depth: one depth inference on the first frame after the request (a depth trigger;
+ * the frame thread runs the depth stage, so it never runs twice at once), returned as the
+ * millimetre map of depth_map_body(). One request at a time, at most one per second.
+ */
+static HttpReply depth_map_reply(VisionControl& ctl, const std::string& query, uint64_t now) {
+    int wait_ms = 2500;
+    if (!wait_ms_param(query, wait_ms)) return {400, error_body("wait_ms must be a non-negative integer")};
+    const ModelSet ms = ctl.models();
+    if (!ms.depth_available) return depth_unavailable_reply();
+    if (!ms.depth_metric)
+        return depth_error(409, "depth not metric", "the loaded depth model gives relative depth; no map in mm");
+    uint64_t retry_ms = 0;
+    switch (ctl.depth_map_gate().begin(now, retry_ms)) {
+        case DepthMapGate::Admit::Busy:
+            return depth_error(409, "depth busy", "another depth map request is running");
+        case DepthMapGate::Admit::RateLimited: {
+            nlohmann::json j = depth_error_json("depth rate limited", "at most one depth map per second");
+            j["retry_after_ms"] = retry_ms;
+            HttpReply r{429, j.dump()};
+            r.headers.push_back({"Retry-After", std::to_string((retry_ms + 999) / 1000)});
+            return r;
+        }
+        case DepthMapGate::Admit::Ok: break;
+    }
+    struct GateEnd {
+        VisionControl& c;
+        ~GateEnd() { c.depth_map_gate().end(); }
+    } gate_end{ctl};
+
+    const Pipelines want{false, false, true};
+    VisionResult current;
+    ctl.latest(false, 0, 0, current);
+    const uint32_t baseline = current.frame_id;
+    ctl.depth_map_wait(true);
+    const uint64_t request_ms = mono_ms();
+    VisionResult r;
+    bool timeout = false;
+    {
+        auto scope = ctl.trigger_scope(request_ms, want, nullptr);
+        timeout = ctl.wait_fresh(baseline, request_ms, want, wait_ms, r);
+    }
+    ctl.depth_map_wait(false);
+    if (timeout || r.frame_id <= baseline) return depth_error(504, "depth timeout", "no depth frame within wait_ms");
+    if (!r.depth_disp || r.depth_grid_w <= 0 || r.depth_grid_h <= 0 ||
+        r.depth_disp->size() != static_cast<size_t>(r.depth_grid_w) * static_cast<size_t>(r.depth_grid_h))
+        return depth_error(503, "depth failed", "the depth stage gave no map for this frame");
+
+    const IntrinsicsState in = ctl.intrinsics();
+    DepthMapMeta meta;
+    meta.width = r.depth_grid_w;
+    meta.height = r.depth_grid_h;
+    meta.image_w = r.width;
+    meta.image_h = r.height;
+    meta.frame_id = r.frame_id;
+    meta.ts_ms = r.ts_ms;
+    meta.inference_ms = r.depth_ms;
+    meta.model = ms.depth_model_name;
+    meta.fx = in.in.cam.fx;
+    meta.scale_m = depth_scale_m(in.in.cam.fx, kIntrinsicsWidth);
+    std::vector<uint16_t> mm;
+    const DepthMapStats st = encode_depth_mm(r.depth_disp->data(), meta.width, meta.height, meta.scale_m, mm);
+    HttpReply out{200, depth_map_body(meta, st, mm)};
+    out.content_type = "application/octet-stream";
+    return out;
+}
+
 static HttpReply status_reply(VisionControl::Status st, const std::string& ok_body) {
     switch (st) {
         case VisionControl::Status::BadFps:
@@ -1173,6 +1248,8 @@ HttpReply handle_control_request(VisionControl& ctl, const std::string& method, 
         return latest_reply(ctl, query, now_ms);
     } else if (path == "/api/trigger" && method == "POST") {
         return trigger_reply(ctl, query, body, now_ms, times);
+    } else if (path == "/api/depth" && method == "GET") {
+        return depth_map_reply(ctl, query, now);
     } else if (path == "/api/models" && method == "POST") {
         return post_models(ctl, body);
     } else if (path == "/api/calibration/intrinsics") {

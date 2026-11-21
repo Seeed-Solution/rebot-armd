@@ -29,6 +29,7 @@ set(srcs
     ${CMAKE_CURRENT_LIST_DIR}/obb_geom.cpp
     ${CMAKE_CURRENT_LIST_DIR}/obb_model.cpp
     ${CMAKE_CURRENT_LIST_DIR}/depth_geom.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/depth_map.cpp
     ${CMAKE_CURRENT_LIST_DIR}/depth_stage.cpp
 )
 
