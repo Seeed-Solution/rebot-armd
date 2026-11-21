@@ -286,3 +286,35 @@ fn plain_boxes_are_measured_from_their_edges() {
         println!("worst |height error| {:.2} mm", worst * 1000.0);
     }
 }
+
+/// A scene like the real-arm run of 2026-11-22 (an elongated object filling ~80 % of the image
+/// height at Z ~0.47 m, fx 804, 3 views orbit x and 5 views orbit xy, JPEG q85), written as replay
+/// bundles to `$MVIEW_BUNDLE_OUT/{x3,xy5}` for `examples/mview_replay` (host and riscv / qemu).
+#[test]
+#[ignore]
+fn write_realistic_bundles() {
+    let Some(out) = std::env::var_os("MVIEW_BUNDLE_OUT") else { return };
+    // long side along base x (away from the arm): it spans the image height, foreshortened
+    let b = BoxObj { xy: [0.62, 0.08], yaw: 0.0, size: [0.22, 0.05, 0.035] };
+    let scene = Scene::new(0.0098, vec![b]);
+    let pivot = [b.xy[0], b.xy[1], 0.0098 + 0.02];
+    let el = 41f64.to_radians();
+    let cam0 = render::look_at([pivot[0] - 0.47 * el.cos(), pivot[1], pivot[2] + 0.47 * el.sin()], pivot, FX, SIZE);
+    use armd::measure_multiview::{view_offsets, write_replay_bundle, Axes};
+    for (name, n, axes) in [("x3", 3usize, Axes::X), ("xy5", 5, Axes::Xy)] {
+        let offsets = view_offsets(n, 0.08, axes);
+        let cams: Vec<mview_stereo::Camera> = offsets.iter().map(|o| render::orbit_xy(&cam0, pivot, *o)).collect();
+        let jpegs: Vec<Vec<u8>> = cams.iter().enumerate().map(|(i, c)| {
+            let img = render::render(&scene, c, 640, 360, 2, Noise { sigma: 2.0, ..Noise::default() }, 300 + i as u64);
+            let mut sq = vec![0u8; 640 * 640];
+            sq[140 * 640..500 * 640].copy_from_slice(&img.px);
+            let mut j = Vec::new();
+            jpeg_encoder::Encoder::new(&mut j, 85).encode(&sq, 640, 640, jpeg_encoder::ColorType::Luma).unwrap();
+            j
+        }).collect();
+        let reference = offsets.iter().position(|o| o[0] == 0.0 && o[1] == 0.0).unwrap();
+        let bx = render::box_px(&scene, &b, &cams[reference]);
+        println!("{name}: box {bx:?} ({:.0} % of the height)", (bx[3] - bx[1]) / 3.6);
+        write_replay_bundle(&std::path::Path::new(&out).join(name), &jpegs, &cams, SIZE, reference, bx, 0.0098).unwrap();
+    }
+}

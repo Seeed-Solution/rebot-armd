@@ -478,3 +478,44 @@ async fn shaking_during_the_snapshots_retries_then_fails_moved() {
     // 2 discarded + 3 tries at the start view
     assert_eq!(r.vision.snapshots.load(Ordering::SeqCst), 5);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn debug_bundle_is_written_capped_and_replays_to_the_same_points() {
+    let dir = tempfile::tempdir().unwrap();
+    // the only test of this binary that requests debug bundles
+    std::env::set_var("ARMD_MVIEW_DEBUG_DIR", dir.path());
+    // six stale bundles: the newest five are kept
+    for k in 0..6 {
+        let d = dir.path().join(format!("old{k}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("bundle.json"), "{}").unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    let mut r = rig(ArmConfig::rebot_dm()).await;
+    let ack = r.start(json!({"label": "box", "speed_scale": 0.5, "debug": true})).await;
+    let id = ack["action_id"].as_u64().unwrap_or_else(|| panic!("{ack}"));
+    let a = r.wait(id, 150.0).await;
+    let m = &a["measurement"];
+    assert_eq!(a["state"], "done", "{a}");
+    assert_eq!(m["debug"]["written"], true, "{}", m["debug"]);
+    let b = dir.path().join(id.to_string());
+    for k in 0..3 { assert!(b.join(format!("view_{k}.jpg")).exists()); }
+    let mut left: Vec<String> = std::fs::read_dir(dir.path()).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    left.sort();
+    assert_eq!(left.len(), mm::MAX_DEBUG_BUNDLES, "{left:?}");
+    assert_eq!(left, vec![id.to_string(), "old3".into(), "old4".into(), "old5".into(), "old2".into()].into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>(), "the newest 5");
+    // the measurement carries the in-box height distribution and the outcome counts
+    assert!(m["in_box"]["n"].as_u64().unwrap() >= m["objects"][0]["n_points"].as_u64().unwrap(), "{}", m["in_box"]);
+    assert!(m["in_box"]["max_mm"].as_f64().unwrap() > 30.0, "{}", m["in_box"]);
+    assert!(m["outcomes"]["corner_box"]["point"].as_u64().unwrap() > 0, "{}", m["outcomes"]);
+    // replay: the same points from the stored JPEGs and poses
+    let (bundle, c) = mm::replay_bundle(&b).unwrap();
+    assert_eq!(bundle.views.len(), 3);
+    assert_eq!(c.rec.stats.points as u64, m["stats"]["points"].as_u64().unwrap());
+    let h = c.measure.unwrap().height_m;
+    assert!((h - m["objects"][0]["height_m"].as_f64().unwrap()).abs() < 1e-4, "{h}");
+    let doc = &bundle.doc;
+    assert_eq!(doc["points"].as_array().unwrap().len(), c.rec.points.len());
+    assert!(doc["views"][1]["joints_rad"].as_array().unwrap().len() >= 6 && doc["views"][0]["detections"][0]["label"] == "box", "{}", doc["views"][0]);
+}
