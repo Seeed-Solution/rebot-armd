@@ -379,7 +379,7 @@ the header).
   7-DOF arm, always drives in the view frame; expert adds the view / base frame switch, the
   joint / Cartesian mode switch, link status, the joint state table, dataset recording and
   keyboard shortcuts. In simple mode the video HUD has two chips: *Detect* opens a popover with
-  the on/off switch, the vision mode (Off / YOLO / ArUco / Both), single shot, the camera rate
+  the on/off switch, the display toggles (Off / YOLO / ArUco / Depth (est.)), single shot, the camera rate
   (standby / working FPS) and grasp setup; the camera chip shows live, stream fps and latency.
   The header island has no robot-state chip (the Enable switch shows it). On a landscape screen
   the HUD chips sit between the two thumb controls; on a phone in portrait Enable and E-stop
@@ -403,9 +403,10 @@ the header).
     only (up / down = J4, left / right = J5), so J1–J3 and J6 stay where they are;
   - *base frame*: directions follow the arm's base axes.
   The target follows the measured pose and is streamed over the WebSocket lease.
-- **Detection overlay**: YOLO boxes and ArUco markers drawn on the video. Choose YOLO, ArUco
-  or both; the page holds a vision subscription only while the overlay is on and the page is
-  visible. Single-shot snapshot.
+- **Detection overlay**: YOLO boxes and ArUco markers drawn on the video. YOLO, ArUco and
+  Depth (est.) are independent toggles that can be on together (boxes and markers over the depth
+  map); Off turns all of them off. The page holds a vision subscription only while YOLO or ArUco
+  is on and the page is visible. Single-shot snapshot.
 - **Hand-eye calibration drawer** (Advanced in the calibration wizard, below): eye-in-hand (camera on the gripper) or eye-to-hand (fixed
   camera) with an ArUco marker; capture poses, solve, export JSON that rebot-companion's
   `HandEyeCalibration.load_result` reads.

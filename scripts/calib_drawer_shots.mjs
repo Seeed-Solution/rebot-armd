@@ -156,7 +156,7 @@ for (const [vpName, viewport] of [['desktop', { width: 1400, height: 900 }], ['p
     const seg = await page.evaluate(() => [...document.querySelectorAll('#vmode button.on')].map((b) => b.dataset.vm));
     await page.evaluate(() => calOpen(false));
     await page.waitForTimeout(300);
-    const vmOk = during.mode === 'both' && during.enabled && VMODE.mode === 'yolo' && !VMODE.enabled && seg.join() === 'both'
+    const vmOk = during.mode === 'both' && during.enabled && VMODE.mode === 'yolo' && !VMODE.enabled && seg.join() === 'yolo,aruco'
       && JSON.stringify(VPOSTS) === JSON.stringify([{ mode: 'both', enabled: true }, { mode: 'yolo', enabled: false }]);
     // from off: aruco while open, off after
     VMODE = { mode: 'off', enabled: false };

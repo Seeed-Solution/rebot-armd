@@ -12,7 +12,8 @@
 // with their reason, retried after unlock (detector stubbed behind armd's operator check). Lock goes back to
 // program on the same socket. First, the header at 360 / 375 / 390 / 414 / 430 px, expert and simple, zh and en, with
 // the operator chip, with a live task button, and with auth off: no horizontal scroll, every header control and the
-// E-stop is the element at its centre. PNGs to OUT (default .cache/operator-shots/). Exits non-zero if a check fails.
+// E-stop is the element at its centre; the recognition popover (vision stubbed: perception API 2 with a metric depth
+// model) with its four selector toggles Off / YOLO / ArUco / Depth (est.) fits the viewport, each control at its centre. PNGs to OUT (default .cache/operator-shots/). Exits non-zero if a check fails.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -68,6 +69,14 @@ for (const ui of ['expert', 'simple']) for (const lang of ['zh', 'en']) for (con
   await ctx.addInitScript((l) => { try { localStorage.setItem('lang', l); } catch (_) {} }, lang);
   const page = await ctx.newPage();
   page.on('pageerror', (e) => { console.log('  pageerror ' + e.message); ok(false, name + ' pageerror'); });
+  await page.route(/\/api\/v1\/(vision|detection)\//, (route) => {
+    const u = new URL(route.request().url()).pathname;
+    const f = (o, st = 200) => route.fulfill({ status: st, contentType: 'application/json', body: JSON.stringify(o) });
+    if (u === '/api/v1/detection/inference') return f({ enabled: false, fps: 1, active_fps: 5, idle_fps: 1 });
+    if (u === '/api/v1/vision/mode') return f({ api_version: 2, mode: 'off', modes: ['off', 'yolo', 'aruco', 'both'], enabled: false, fps: 1, trigger: true, per_request_pipelines: true, subscriptions: true,
+      available: { yolo: true, aruco: true, depth: true }, depth_model: { name: 'zipdepth', path: '/userdata/local/models/zipdepth.cvimodel', metric: true } });
+    return f({ error: 'not found' }, 404);
+  });
   await page.goto(base + '?ui=' + ui, { waitUntil: 'domcontentloaded' });
   ok(await waitFor(page, () => S.obs && S.dof > 0 && S.auth.enforced && !$('btn-op').hidden, null, 15000), name + ' auth enforced, operator chip shown');
   await page.waitForTimeout(300);
@@ -81,6 +90,18 @@ for (const ui of ['expert', 'simple']) for (const lang of ['zh', 'en']) for (con
     ok(need.every((id) => h.ids.includes(id)) && !h.covered.length, `${name} ${variant} header controls and E-stop reachable ${JSON.stringify(h)}`);
     if (variant === 'auth' && (w === 375 || w === 360)) await page.screenshot({ path: path.join(out, `${name}.png`), clip: { x: 0, y: 0, width: w, height: 160 } });
   }
+  // recognition popover: every control, the four selector toggles included, inside the viewport and at its centre
+  await waitFor(page, () => VM.state === 'ok' && !$('vmode').hidden, null, 6000);
+  await page.evaluate(() => { const b = $('btn-vis'); if (!document.body.classList.contains('vis-open') && b && !b.hidden && getComputedStyle(b).display !== 'none') b.click(); });
+  await page.waitForTimeout(200);
+  const pop = await page.evaluate(() => {
+    const els = [...document.querySelectorAll('#det-ctl button')].filter((e) => { const r = e.getBoundingClientRect(); return !e.closest('[hidden]') && r.width > 0 && r.height > 0; });
+    const bad = els.map((e) => { const r = e.getBoundingClientRect(), h = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return { id: e.id || 'vm-' + e.dataset.vm, ok: !!h && (h === e || e.contains(h)) && r.left >= 0 && r.right <= innerWidth + 0.5 && r.top >= 0 && r.bottom <= innerHeight + 0.5 }; }).filter((x) => !x.ok);
+    return { ids: els.map((e) => e.id || 'vm-' + e.dataset.vm), bad, sw: document.scrollingElement.scrollWidth, iw: innerWidth };
+  });
+  ok(['vm-off', 'vm-yolo', 'vm-aruco', 'vm-depth'].every((id) => pop.ids.includes(id)) && !pop.bad.length && pop.sw <= pop.iw, `${name} recognition popover fits, every control reachable ${JSON.stringify(pop)}`);
+  if (w === 360 || w === 430) await page.screenshot({ path: path.join(out, `${name}_popover.png`), clip: { x: 0, y: 0, width: w, height: 400 } });
   console.log(`${name}: header ok`);
   await ctx.close();
 }

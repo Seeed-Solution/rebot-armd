@@ -281,7 +281,6 @@ body.ui-expert .main {
 .vmode button:focus-visible { outline: 2px solid var(--sc-color-primary); outline-offset: 1px; }
 /* depth view (model estimate): the map canvas sits under the detection overlay and takes no pointer events; the
    readout follows pointer events on the video box. Panel bottom-left, lifted above the grasp bar when that shows. */
-.det-btn.det-depth::before { background: linear-gradient(90deg, #d23105, #a4fc3c, #3e9bfe); border-radius: 2px; }
 .video .depth-ov { pointer-events: none; image-rendering: pixelated; }
 .video .depth-ov[hidden] { display: none; }
 .depth-panel { position: absolute; z-index: 6; left: 12px; bottom: 12px; width: max-content; max-width: min(320px, calc(100% - 24px)); box-sizing: border-box;
@@ -336,7 +335,7 @@ body.ui-simple.vis-open #det-ctl:not([hidden]) {
   background: rgba(255,255,255,0.5); border: 1px solid rgba(255,255,255,0.6); box-shadow: 0 8px 24px rgba(0,0,0,0.25);
   backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
 }
-body.ui-simple.vis-open #det-ctl .vmode { order: -1; flex: 1 0 100%; display: flex; }
+body.ui-simple.vis-open #det-ctl .vmode { order: -1; flex: 1 0 100%; display: flex; flex-wrap: wrap; }
 body.ui-simple.vis-open #det-ctl .vmode[hidden] { display: none; }
 body.ui-simple.vis-open #det-ctl .vmode button { flex: 1 1 auto; }
 body.ui-simple.vis-open .hud { z-index: 9; }
@@ -711,7 +710,7 @@ body.offline .banner { display: block; }
     background: rgba(255,255,255,0.5); border: 1px solid rgba(255,255,255,0.6); box-shadow: 0 8px 24px rgba(0,0,0,0.25);
     backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
   }
-  body.ui-expert.vis-open #det-ctl .vmode { order: -1; flex: 1 0 100%; display: flex; }
+  body.ui-expert.vis-open #det-ctl .vmode { order: -1; flex: 1 0 100%; display: flex; flex-wrap: wrap; }
   body.ui-expert.vis-open #det-ctl .vmode[hidden] { display: none; }
   body.ui-expert.vis-open #det-ctl .vmode button { flex: 1 1 auto; }
   body.ui-expert.vis-open .hud { z-index: 9; }
@@ -1801,7 +1800,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
         </div>
         <div class="hud">
           <button class="btn det-btn vis-chip only-simple" id="btn-vis" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="det-ctl" hidden>识别</button>
-          <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button><span class="seg seg-sm vmode" id="vmode" role="radiogroup" aria-label="视觉模式" hidden><span class="vm-k" id="vm-k" aria-hidden="true" hidden>显示</span><button type="button" role="radio" data-vm="off" data-i18n="vm.off">关</button><button type="button" role="radio" data-vm="yolo" data-i18n="vm.yolo">YOLO</button><button type="button" role="radio" data-vm="aruco" data-i18n="vm.aruco">ArUco</button><button type="button" role="radio" data-vm="both" data-i18n="vm.both">两者</button></span><button class="btn det-btn det-depth" id="btn-depth" type="button" aria-pressed="false" aria-controls="depth-panel" hidden>深度（估计）</button><button class="btn det-btn det-trig" id="btn-trigger" type="button" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span><button class="btn det-btn det-gset" id="btn-gset" type="button" data-i18n="gset.open" hidden>抓取设置</button></span>
+          <span class="det-ctl" id="det-ctl" hidden><button class="btn det-btn" id="btn-det" type="button" aria-pressed="false" disabled>识别</button><span class="seg seg-sm vmode" id="vmode" role="group" aria-label="视觉模式" hidden><span class="vm-k" id="vm-k" aria-hidden="true" hidden>显示</span><button type="button" aria-pressed="false" data-vm="off" data-i18n="vm.off">关</button><button type="button" aria-pressed="false" data-vm="yolo" data-i18n="vm.yolo">YOLO</button><button type="button" aria-pressed="false" data-vm="aruco" data-i18n="vm.aruco">ArUco</button><button type="button" aria-pressed="false" data-vm="depth" data-i18n="depth.btn" aria-controls="depth-panel">深度（估计）</button></span><button class="btn det-btn det-trig" id="btn-trigger" type="button" disabled>单次识别</button><span class="fps-pill" id="fps-pill" role="status" aria-live="polite">待机 -- FPS</span><button class="btn det-btn det-gset" id="btn-gset" type="button" data-i18n="gset.open" hidden>抓取设置</button></span>
           <span class="sc-status-badge" id="cam-chip" data-i18n="v.chip.connecting">连接中</span>
           <span class="sc-status-badge plain" id="vstat" hidden>-- ms</span>
           <span class="sc-status-badge plain" id="det-chip" data-i18n="det.none" hidden>检测 --</span>
@@ -2302,7 +2301,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
       <h3 id="gset-title" data-i18n="gset.title">抓取设置</h3>
       <button class="btn calib-x" id="gset-close" type="button" data-i18n-aria="calib.close" aria-label="关闭">×</button>
     </div>
-    <p class="calib-hint" data-i18n="gset.hint">选择 YOLO 或「两者」（或开启「识别」）后点画面里的框即可抓取。下面三项每次换桌面或相机支架后设置一次，保存在机械臂上。</p>
+    <p class="calib-hint" data-i18n="gset.hint">选择 YOLO（或开启「识别」）后点画面里的框即可抓取。下面三项每次换桌面或相机支架后设置一次，保存在机械臂上。</p>
     <div class="gset-row">
       <div class="gset-k"><span data-i18n="gset.table">桌面高度</span><b class="mono" id="gset-table">--</b></div>
       <button class="btn" id="gset-table-tcp" type="button" data-i18n="gset.table.tcp">用当前夹爪尖高度</button>
@@ -2472,15 +2471,16 @@ const I18N = {
     'det.on': '识别 · 开', 'det.off': '识别 · 关', 'det.na': '识别 · 不可用', 'vis.tip': '识别选项：开关、模式、单次识别、抓取设置',
     'det.tip.on': '物体识别已开启，点击关闭', 'det.tip.off': '物体识别已关闭，点击开启',
     'det.tip.na': '识别服务不可用（检测程序未运行或版本过旧）', 'det.fail': '切换识别失败',
-    'depth.btn': '深度（估计）', 'depth.tip': '深度图：模型估计，不是测量值', 'depth.tip.nm': '深度图需要度量深度模型（当前为相对深度）',
+    'depth.btn': '深度（估计）', 'depth.tip': '深度图：模型估计，不是测量值', 'depth.tip.nm': '深度图需要度量深度模型（当前为相对深度）', 'depth.tip.none': '未加载深度模型', 'vm.tip.noyolo': '未加载 YOLO 模型',
+    'vm.tip.ion': '{what}不可用：ION 预算不足（需要 {need} MB，上限 {limit} MB）', 'vm.what.depth': '深度', 'vm.what.yolo': 'YOLO',
     'depth.title': '深度（模型估计）', 'depth.live': '连续', 'depth.live.tip': '每秒最多刷新一次；机械臂移动、页面隐藏或关闭深度显示时停止',
     'depth.refresh': '刷新', 'depth.close': '关闭深度显示', 'depth.opacity': '不透明度', 'depth.near': '近', 'depth.far': '远',
     'depth.m': '≈ {m} m（估计）', 'depth.note': '未校准，仅表示相对远近', 'depth.read': '≈ {mm} mm（估计）', 'depth.read.none': '此处无深度',
     'depth.frame': '帧 #{id} · {age} 前', 'depth.age': '{s} 秒', 'depth.st.load': '正在获取深度图…', 'depth.st.rate': '请求过快，稍后重试',
     'depth.st.busy': '深度推理正忙', 'depth.st.na': '深度不可用', 'depth.st.fail': '获取深度图失败', 'depth.st.moved': '机械臂已移动，已停止刷新',
     'depth.st.op': '需要操作员解锁', 'depth.st.hidden': '页面隐藏，已暂停',
-    'vm.label': '视觉模式', 'vm.label.show': '本页画面显示', 'vm.show': '显示', 'vm.off': '关', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco', 'vm.both': '两者',
-    'vm.tip': '视觉模式：YOLO 识别物体，ArUco 识别标记，或两者同时运行。选择后本页开启持续识别，「关」停止；不影响其他客户端',
+    'vm.label': '视觉模式', 'vm.label.show': '本页画面显示', 'vm.show': '显示', 'vm.off': '关', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco',
+    'vm.tip': '本页画面显示：YOLO 识别物体，ArUco 识别标记，深度（估计）显示模型估计的深度图；可同时开启，叠加显示。开启 YOLO 或 ArUco 时本页开启持续识别；「关」全部关闭。不影响其他客户端',
     'vm.tip.na': '视觉模式不可用（视觉服务未运行）', 'vm.fail': '切换视觉模式失败', 'vm.noyolo': 'YOLO 模型未加载，只能使用 ArUco',
     'aru.sum': 'ArUco 标定板标记 {n} 个', 'aru.unk': '{n} 个不在标定板上（疑似误检）：{ids}', 'aru.tap': '点击标记查看位姿', 'aru.sum.s': '标定板 {n}', 'aru.unk.s': '误检 {ids}', 'aru.picked': '已选定，再点一次恢复自动',
     'det.trig': '单次识别', 'det.trig.busy': '识别中…', 'det.trig.tip': '临时开启识别，抓拍一帧结果后恢复原状态',
@@ -2494,7 +2494,7 @@ const I18N = {
     'grasp.code.DETECTION_UNAVAILABLE': '识别服务不可用', 'grasp.code.IK': '目标超出机械臂可达范围', 'grasp.code.WORKSPACE_VIOLATION': '目标超出安全工作空间（地面/边界）',
     'grasp.code.TRACKING_STALL': '机械臂跟不上轨迹', 'grasp.code.ESTOP_ACTIVE': '急停', 'grasp.code.LEASE_LOST': '控制权已变化', 'grasp.code.STOPPED': '手动停止', 'grasp.code.SUPERSEDED': '被新的操作替代',
     'grasp.code.WATCHDOG': '控制连接超时', 'grasp.code.FAULT': '故障', 'grasp.code.MOTION_BUSY': '机械臂正在运动', 'grasp.code.UNSUPPORTED': '当前配置不支持抓取', 'grasp.code.INVALID_COMMAND': '参数无效',
-    'gset.open': '抓取设置', 'gset.title': '抓取设置', 'gset.hint': '选择 YOLO 或「两者」（或开启「识别」）后点画面里的框即可抓取。下面三项每次换桌面或相机支架后设置一次，保存在机械臂上。',
+    'gset.open': '抓取设置', 'gset.title': '抓取设置', 'gset.hint': '选择 YOLO（或开启「识别」）后点画面里的框即可抓取。下面三项每次换桌面或相机支架后设置一次，保存在机械臂上。',
     'gset.table': '桌面高度', 'gset.table.tcp': '用当前夹爪尖高度', 'gset.table.hint': '先把夹爪尖慢慢点动到刚好碰到桌面，再点上面的按钮。',
     'gset.grip': '夹爪位置（画面）', 'gset.grip.pick': '在画面上点选', 'gset.grip.hint': '夹爪朝下停在接近高度，张开，把物体放在桌面上两指正中间，然后点画面上物体的中心。', 'gset.grip.tap': '点击画面中夹爪之间物体的中心',
     'gset.grip.cd': '未使用：相机朝下对准', 'gset.grip.cd.hint': '当前安装用相机朝下对准：抓取时相机先垂直朝下，把物体对准画面中心，再转为夹爪朝下。不使用这个点。',
@@ -2686,15 +2686,16 @@ const I18N = {
     'det.on': 'Detect · On', 'det.off': 'Detect · Off', 'det.na': 'Detect · N/A', 'vis.tip': 'Detection options: on/off, mode, snapshot, grasp setup',
     'det.tip.on': 'Object detection is on. Click to turn it off', 'det.tip.off': 'Object detection is off. Click to turn it on',
     'det.tip.na': 'Detection service unavailable (detector not running or too old)', 'det.fail': 'Could not switch detection',
-    'depth.btn': 'Depth (est.)', 'depth.tip': 'Depth map: model estimate, not a measurement', 'depth.tip.nm': 'The depth map needs a metric depth model (the loaded one is relative)',
+    'depth.btn': 'Depth (est.)', 'depth.tip': 'Depth map: model estimate, not a measurement', 'depth.tip.nm': 'The depth map needs a metric depth model (the loaded one is relative)', 'depth.tip.none': 'No depth model loaded', 'vm.tip.noyolo': 'No YOLO model loaded',
+    'vm.tip.ion': '{what} unavailable: over the ION budget (needs {need} MB of {limit} MB)', 'vm.what.depth': 'Depth', 'vm.what.yolo': 'YOLO',
     'depth.title': 'Depth (model estimate)', 'depth.live': 'Live', 'depth.live.tip': 'Refreshes at most once per second; stops when the arm moves, the page is hidden or the depth view is closed',
     'depth.refresh': 'Refresh', 'depth.close': 'Close depth view', 'depth.opacity': 'Opacity', 'depth.near': 'Near', 'depth.far': 'Far',
     'depth.m': '≈ {m} m (est.)', 'depth.note': 'Uncalibrated, relative only', 'depth.read': '≈ {mm} mm (est.)', 'depth.read.none': 'No depth here',
     'depth.frame': 'Frame #{id} · {age} ago', 'depth.age': '{s} s', 'depth.st.load': 'Fetching depth map…', 'depth.st.rate': 'Too many requests, retrying',
     'depth.st.busy': 'Depth inference busy', 'depth.st.na': 'Depth unavailable', 'depth.st.fail': 'Depth map failed', 'depth.st.moved': 'Arm moved: refresh stopped',
     'depth.st.op': 'Operator unlock required', 'depth.st.hidden': 'Page hidden: paused',
-    'vm.label': 'Vision mode', 'vm.label.show': 'Shown on this page', 'vm.show': 'Show', 'vm.off': 'Off', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco', 'vm.both': 'Both',
-    'vm.tip': 'Vision mode: YOLO for objects, ArUco for markers, or both at once. Selecting one turns continuous detection on for this page; Off stops it. Other clients are not affected',
+    'vm.label': 'Vision mode', 'vm.label.show': 'Shown on this page', 'vm.show': 'Show', 'vm.off': 'Off', 'vm.yolo': 'YOLO', 'vm.aruco': 'ArUco',
+    'vm.tip': 'Shown on this page: YOLO for objects, ArUco for markers, Depth (est.) for the model\'s depth estimate; any of them can be on together, drawn over each other. YOLO or ArUco turns continuous detection on for this page; Off turns everything off. Other clients are not affected',
     'vm.tip.na': 'Vision mode unavailable (vision service not running)', 'vm.fail': 'Could not switch the vision mode', 'vm.noyolo': 'YOLO model not loaded; only ArUco is available',
     'aru.sum': 'ArUco board markers: {n}', 'aru.unk': '{n} not on the board (likely false): {ids}', 'aru.tap': 'Tap a marker for its pose', 'aru.sum.s': 'Board {n}', 'aru.unk.s': 'false {ids}', 'aru.picked': 'Selected; tap it again for auto',
     'det.trig': 'Snapshot', 'det.trig.busy': 'Detecting…', 'det.trig.tip': 'Turn detection on briefly, grab one result, then restore the previous state',
@@ -2708,7 +2709,7 @@ const I18N = {
     'grasp.code.DETECTION_UNAVAILABLE': 'detection service unavailable', 'grasp.code.IK': 'target out of reach', 'grasp.code.WORKSPACE_VIOLATION': 'target outside the safe workspace (floor/boundary)',
     'grasp.code.TRACKING_STALL': 'arm could not follow the path', 'grasp.code.ESTOP_ACTIVE': 'E-Stop', 'grasp.code.LEASE_LOST': 'control lease changed', 'grasp.code.STOPPED': 'stopped by user', 'grasp.code.SUPERSEDED': 'replaced by another command',
     'grasp.code.WATCHDOG': 'control connection timed out', 'grasp.code.FAULT': 'fault', 'grasp.code.MOTION_BUSY': 'arm is moving', 'grasp.code.UNSUPPORTED': 'this profile cannot grasp', 'grasp.code.INVALID_COMMAND': 'invalid parameters',
-    'gset.open': 'Grasp setup', 'gset.title': 'Grasp setup', 'gset.hint': 'Select YOLO or Both (or turn on Detect), then tap a box in the video to grasp it. Set the three items below once per table or camera mount; they are stored on the arm.',
+    'gset.open': 'Grasp setup', 'gset.title': 'Grasp setup', 'gset.hint': 'Select YOLO (or turn on Detect), then tap a box in the video to grasp it. Set the three items below once per table or camera mount; they are stored on the arm.',
     'gset.table': 'Table height', 'gset.table.tcp': 'Use current TCP height', 'gset.table.hint': 'First jog the jaw tips down until they just touch the table, then tap the button above.',
     'gset.grip': 'Grip point (image)', 'gset.grip.pick': 'Tap on the image', 'gset.grip.hint': 'With the gripper pointing down at approach height and open, put an object on the table centred between the jaws, then tap its centre in the video.', 'gset.grip.tap': 'Tap the centre of the object between the jaws',
     'gset.grip.cd': 'Not used: camera-down acquisition', 'gset.grip.cd.hint': 'This mount uses camera-down acquisition: a grasp first points the camera straight down and centres the object in the image, then turns the gripper down. This point is not used.',
@@ -4708,11 +4709,16 @@ function initDetToggle() {
 /* Vision mode (rebot-vision): GET/POST /api/v1/vision/mode, off | yolo | aruco | both.
    VM.state: null = not probed, 'ok', 'na' (route failed, shown disabled), 'none' (404: provider has no
    mode API, selector hidden). Selecting a mode other than Off also turns continuous inference on; the
-   reply carries enabled/fps like /detection/inference and updates the Detect toggle. */
+   reply carries enabled/fps like /detection/inference and updates the Detect toggle.
+   The "Show" selector (#vmode) is a group of toggles: YOLO, ArUco and Depth (est.) can be on together (boxes and
+   markers over the depth map); Off turns all of them off. YOLO + ArUco is the pipeline set / device mode "both".
+   Depth is this page's display only (GET /api/v1/vision/depth): it never goes into a subscription or the device mode.
+   Persistence as before: the YOLO / ArUco choice (rebot.vision.pipes) is remembered, on/off and Depth are not, so a
+   reload starts no inference (API 1: the selector shows the device mode). */
 const VM_MODES = ['off', 'yolo', 'aruco', 'both'];
 // subs: the provider has per-request pipelines and subscriptions (perception API 2); the selector
 // then picks this page's overlay pipelines instead of the provider's global mode
-const VM = { state: null, mode: null, yolo: true, busy: false, subs: false, depth: false, depthMetric: false };
+const VM = { state: null, mode: null, yolo: true, busy: false, subs: false, depth: false, depthMetric: false, models: null, ion: null };
 const vmPipelines = (m) => (m === 'both' ? ['yolo', 'aruco'] : [m]);
 
 /* Vision subscriptions (perception API 2): continuous inference per caller, kept alive every
@@ -4819,6 +4825,8 @@ function vmApply(data) {
   VM.yolo = !(data.available && data.available.yolo === false);
   VM.depth = !!(data.available && data.available.depth === true);
   VM.depthMetric = VM.depth && !!(data.depth_model && data.depth_model.metric === true);
+  VM.models = data.models && typeof data.models === 'object' ? data.models : null;
+  VM.ion = data.ion && typeof data.ion === 'object' ? data.ion : null;
   if (typeof data.enabled === 'boolean') detApply({ enabled: data.enabled, fps: data.fps, active_fps: data.active_fps, idle_fps: data.idle_fps });
   renderVisionMode();
 }
@@ -4829,6 +4837,43 @@ function vmFailed(e) {
 async function vmRefresh() {
   try { vmApply(await vmRequest('GET')); } catch (e) { vmFailed(e); }
 }
+/* ION budget (rebot-vision with model switching: models.catalogue[].ion_mb, ion.base_mb / used_mb / total_mb /
+   reserve_mb; docs/detection_api.md "Model switching"). slot 'depth' or 'detector'. A slot without a loaded model:
+   would the smallest catalogue model of that slot fit next to the resident ones? The depth slot with a model loaded:
+   does the resident set itself fit (an older provider could load segment + depth: 3 MB ION left, the encoder hung)?
+   -> { need, limit } MB when over the budget, else null (also when the provider reports no budget). */
+function vmBudget(slot) {
+  const num = (v) => (typeof v === 'number' && isFinite(v) ? v : null);
+  const ion = VM.ion, cat = VM.models && Array.isArray(VM.models.catalogue) ? VM.models.catalogue.filter((e) => e && typeof e === 'object') : null;
+  const total = ion ? num(ion.total_mb) : null;
+  if (!cat || total == null) return null;
+  const reserve = num(ion.reserve_mb) || 0;
+  const inSlot = (e) => (slot === 'depth') === (e.kind === 'depth');
+  if (cat.some((e) => e.resident && inSlot(e))) {
+    const used = num(ion.used_mb);
+    return slot === 'depth' && used != null && used + reserve > total ? { need: used + reserve, limit: total } : null;
+  }
+  const base = num(ion.base_mb);
+  const sizes = cat.filter((e) => inSlot(e) && num(e.ion_mb) != null && (slot !== 'depth' || e.metric !== false)).map((e) => e.ion_mb);
+  if (base == null || !sizes.length) return null;
+  const need = base + reserve + Math.min(...sizes) + cat.filter((e) => e.resident && !inSlot(e)).reduce((a, e) => a + (num(e.ion_mb) || 0), 0);
+  return need > total ? { need, limit: total } : null;
+}
+const vmIonTip = (what, b) => t('vm.tip.ion', { what: t(what), need: b.need.toFixed(1), limit: b.limit.toFixed(1) });
+/* Why the Depth toggle is off limits ('' = available): no depth model, a relative one, or over the ION budget. */
+function depthBlock() {
+  if (VM.state !== 'ok') return t('vm.tip.na');
+  const b = vmBudget('depth');
+  if (!VM.depth) return b ? vmIonTip('vm.what.depth', b) : t('depth.tip.none');
+  if (!VM.depthMetric) return t('depth.tip.nm');
+  return b ? vmIonTip('vm.what.depth', b) : '';
+}
+/* YOLO / ArUco shown: API 2 this page's overlay, API 1 the device mode. */
+function vmSel() {
+  const m = VM.subs ? (OV.on ? OV.pipes : 'off') : VM.mode;
+  return { yolo: m === 'yolo' || m === 'both', aruco: m === 'aruco' || m === 'both' };
+}
+const vmModeOf = (yolo, aruco) => (yolo && aruco ? 'both' : yolo ? 'yolo' : aruco ? 'aruco' : 'off');
 function renderVisionMode() {
   const wrap = $('vmode');
   if (!wrap) return;
@@ -4840,16 +4885,32 @@ function renderVisionMode() {
   const k = $('vm-k');
   if (k) { k.hidden = !VM.subs; setText(k, t('vm.show')); }
   wrap.setAttribute('aria-label', t(VM.subs ? 'vm.label.show' : 'vm.label'));
-  const shown = VM.subs ? (OV.on ? OV.pipes : 'off') : VM.mode;
+  const sel = vmSel(), dBlock = depthBlock();
   for (const b of wrap.querySelectorAll('button[data-vm]')) {
-    const m = b.dataset.vm, on = ok && m === shown;
+    const m = b.dataset.vm;
+    const on = ok && (m === 'off' ? !sel.yolo && !sel.aruco && !DEPTH.on : m === 'depth' ? DEPTH.on : sel[m]);
     b.classList.toggle('on', on);
-    b.setAttribute('aria-checked', String(on));
-    b.disabled = !ok || VM.busy || DET.snap || (!VM.yolo && (m === 'yolo' || m === 'both'));
+    b.setAttribute('aria-pressed', String(on));
+    let off = !ok || VM.busy || DET.snap, tip = '';
+    if (m === 'yolo' && ok && !VM.yolo) { off = true; const bb = vmBudget('detector'); tip = bb ? vmIonTip('vm.what.yolo', bb) : t('vm.tip.noyolo'); }
+    // Depth is this page's display: independent of a pending subscription change or a single shot
+    if (m === 'depth') { off = !!dBlock; tip = dBlock || t('depth.tip'); }
+    b.disabled = off;
+    if (tip) b.title = tip; else b.removeAttribute('title');
   }
   depthRender();
 }
+/* A tap on the selector: Off clears everything, YOLO / ArUco / Depth toggle independently. */
+function vmToggle(m) {
+  if (VM.state !== 'ok') return;
+  if (m === 'depth') { if (DEPTH.on || !depthBlock()) depthSet(!DEPTH.on); return; }
+  if (m === 'off') depthSet(false);
+  const cur = vmSel();
+  return setVisionMode(m === 'off' ? 'off' : vmModeOf(m === 'yolo' ? !cur.yolo : cur.yolo, m === 'aruco' ? !cur.aruco : cur.aruco));
+}
+/* Detection pipelines (mode off | yolo | aruco | both): API 2 this page's overlay subscription, API 1 the device mode. */
 async function setVisionMode(mode) {
+  if (!VM_MODES.includes(mode)) return; // never send anything else (Depth is page-only)
   if (VM.state === 'ok' && VM.subs && !VM.busy) {
     VM.busy = true; renderVisionMode();
     try { await (mode === 'off' ? ovSet(false) : ovSet(true, mode)); } finally { VM.busy = false; renderVisionMode(); }
@@ -4899,7 +4960,7 @@ function calVisionMode(open) {
   return CALVM.task;
 }
 function initVisionMode() {
-  $('vmode').addEventListener('click', (e) => { const b = e.target.closest('button[data-vm]'); if (b) setVisionMode(b.dataset.vm); });
+  $('vmode').addEventListener('click', (e) => { const b = e.target.closest('button[data-vm]'); if (b && !b.disabled) vmToggle(b.dataset.vm); });
   i18nHooks.push(renderVisionMode);
   // a closed tab must not leave the camera in the calibration mode, nor keep its subscriptions
   window.addEventListener('pagehide', () => {
@@ -5015,16 +5076,10 @@ function depthReadAt(e) {
 }
 const depthM = (mm) => t('depth.m', { m: (mm / 1000).toFixed(2) });
 function depthRender() {
-  const btn = $('btn-depth'), panel = $('depth-panel');
-  if (!btn || !panel) return;
-  const avail = VM.state === 'ok' && VM.depth;
-  if (!avail && DEPTH.on) depthSet(false);
-  btn.hidden = !avail;
-  btn.disabled = !VM.depthMetric;
-  setText(btn, t('depth.btn'));
-  btn.title = t(VM.depthMetric ? 'depth.tip' : 'depth.tip.nm');
-  btn.classList.toggle('btn-primary', DEPTH.on);
-  btn.setAttribute('aria-pressed', String(DEPTH.on));
+  const panel = $('depth-panel');
+  if (!panel) return;
+  // the selector's Depth toggle (renderVisionMode) shows the state; depth lost (model unloaded, over budget) ends the view
+  if (DEPTH.on && depthBlock()) { depthSet(false); return; }
   panel.hidden = !DEPTH.on;
   $('depth-overlay').hidden = !DEPTH.on;
   if (!DEPTH.on) { $('depth-read').hidden = true; return; }
@@ -5118,7 +5173,7 @@ function depthSet(on) {
   DEPTH.on = on; DEPTH.gen++;
   depthStop();
   if (!on) { DEPTH.live = false; DEPTH.st = ''; depthClearMap(); }
-  depthRender();
+  renderVisionMode(); // the Depth toggle and the panel
   if (on) { depthDraw(); depthShot(); }
 }
 function depthSetLive(on) {
@@ -5133,9 +5188,7 @@ function depthOnObs(o) {
   DEPTH.live = false; depthStop(); depthClearMap(); depthStatus('depth.st.moved', true);
 }
 function initDepth() {
-  const btn = $('btn-depth');
-  if (!btn) return;
-  btn.addEventListener('click', () => depthSet(!DEPTH.on));
+  // on / off: the Depth toggle of the vision selector (vmToggle); the panel's x turns it off
   $('dp-x').addEventListener('click', () => depthSet(false));
   $('dp-live').addEventListener('click', () => depthSetLive(!DEPTH.live));
   $('dp-refresh').addEventListener('click', () => { if (DEPTH.st === 'depth.st.moved') DEPTH.st = ''; depthShot(); });
@@ -13377,7 +13430,7 @@ function renderCart(live, op) {
 
 // Expose core detection & overlay symbols for testing and telemetry inspection
 window.parseDetections = parseDetections;
-window.__vision = { VM, CALVM, OV, OVSUB, CALSUB, calVisionMode, setVisionMode, vmRefresh, ovSet };
+window.__vision = { VM, CALVM, OV, OVSUB, CALSUB, calVisionMode, setVisionMode, vmToggle, vmBudget, vmRefresh, ovSet };
 window.getVideoContentRect = getVideoContentRect;
 window.fitCanvas = fitCanvas;
 window.drawOverlay = drawOverlay;

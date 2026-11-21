@@ -13,7 +13,10 @@
 //   - Detect once with the overlay off: the boxes stay for SNAP_HOLD_MS (4 s) through the detection state
 //     poll (refreshDetState, which used to clear them), then go; they go at once when an arm joint moves
 //     more than SNAP_MOVE_RAD (not for jitter below it or gripper motion) or the user taps the video
-//   - toolbar: at 375 and 390 px, simple and expert, every toolbar button is the element at its centre
+//   - toolbar: at 360, 375, 390, 414 and 430 px, simple and expert, zh and en, with the recognition popover open: every
+//     toolbar button, including the four toggles of the vision selector (Off / YOLO / ArUco / Depth (est.)), is the
+//     element at its centre and inside the viewport and the popover; again with YOLO, ArUco and Depth all on (the
+//     depth panel open)
 // Writes PNGs (default .cache/vision-polish-shots/).
 import fs from 'node:fs';
 import http from 'node:http';
@@ -32,6 +35,16 @@ const SETUP = { table_z_m: 0.012, approach_height_m: 0.15, grasp_height_m: 0.015
   image_size_px: [640, 360], fx_px: 600, fy_px: 600, centre_tol_px: 10, acquire_camera_down: 'auto' };
 const V = { mode: 'yolo', subs: new Map(), trig: 0 };
 const json = (res, o, code = 200) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
+// a small RDM1 depth map (48x28, 300..600 mm left to right) for the Depth toggle
+function depthMap() {
+  const W = 48, H = 28;
+  let js = JSON.stringify({ format: 'u16le_mm', width: W, height: H, units: 'mm', invalid: 0, frame_id: 7, ts_ms: Date.now(), mapping: { image_w: 640, image_h: 360, fit: 'stretch', x0: 0, y0: 0, x1: 640, y1: 360 } });
+  while ((8 + Buffer.byteLength(js)) % 8) js += ' ';
+  const jb = Buffer.from(js), buf = Buffer.alloc(8 + jb.length + W * H * 2);
+  buf.write('RDM1', 0, 'latin1'); buf.writeUInt32LE(jb.length, 4); jb.copy(buf, 8);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) buf.writeUInt16LE(Math.round(300 + 300 * x / (W - 1)), 8 + jb.length + 2 * (y * W + x));
+  return buf;
+}
 const srv = http.createServer((req, res) => {
   const u = req.url.split('?')[0];
   if (u === '/' || u === '/index.html') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(html); return; }
@@ -42,7 +55,9 @@ const srv = http.createServer((req, res) => {
     const j = b ? JSON.parse(b) : null;
     if (u === '/api/v1/detection/inference') return json(res, { enabled: false, fps: 1, active_fps: 5, idle_fps: 1, mode: V.mode });
     if (u === '/api/v1/vision/mode') return json(res, { api_version: 2, mode: V.mode, modes: ['off', 'yolo', 'aruco', 'both'], enabled: false, fps: 1, active_fps: 5, idle_fps: 1,
-      trigger: true, available: { yolo: true, aruco: true }, per_request_pipelines: true, subscriptions: true });
+      trigger: true, available: { yolo: true, aruco: true, depth: true }, depth_model: { name: 'zipdepth', path: '/userdata/local/models/zipdepth.cvimodel', metric: true },
+      per_request_pipelines: true, subscriptions: true });
+    if (u === '/api/v1/vision/depth') { res.writeHead(200, { 'content-type': 'application/octet-stream' }); res.end(depthMap()); return; }
     if (u === '/api/v1/vision/subscribe' && req.method === 'POST') { V.subs.set('s1', j.pipelines); return json(res, { api_version: 2, id: 's1', client: j.client, pipelines: j.pipelines, fps: 5, ttl_ms: j.ttl_ms }); }
     if (u.startsWith('/api/v1/vision/subscribe/')) { if (req.method === 'DELETE') V.subs.delete('s1'); return json(res, { api_version: 2, id: 's1' }); }
     if (u === '/api/v1/detection/trigger') {
@@ -151,14 +166,17 @@ const toolbarHits = (page) => page.evaluate(() => {
     const r = e.getBoundingClientRect(), cs = getComputedStyle(e);
     return !e.closest('[hidden]') && r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden';
   });
+  const pop = document.getElementById('det-ctl').getBoundingClientRect();
   return els.map((e) => {
     const r = e.getBoundingClientRect(), h = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-    return { id: e.id || 'vm-' + e.dataset.vm, ok: h === e || e.contains(h), hit: h ? (h.id || h.className || h.tagName) : null };
+    const inPop = !document.getElementById('det-ctl').contains(e) || (r.left >= pop.left - 0.5 && r.right <= pop.right + 0.5 && r.top >= pop.top - 0.5 && r.bottom <= pop.bottom + 0.5);
+    return { id: e.id || 'vm-' + e.dataset.vm, ok: (h === e || e.contains(h)) && r.left >= 0 && r.right <= innerWidth + 0.5 && inPop && !e.disabled,
+      hit: h ? (h.id || h.className || h.tagName) : null, x: [Math.round(r.left), Math.round(r.right)], inPop };
   });
 });
-const WANT = { simple: ['vs-video', 'vs-3d', 'btn-vis', 'btn-det', 'vm-off', 'vm-yolo', 'vm-aruco', 'vm-both', 'btn-trigger', 'btn-gset'],
-  expert: ['vs-video', 'vs-3d', 'btn-vis', 'btn-det', 'vm-off', 'vm-yolo', 'vm-aruco', 'vm-both', 'btn-trigger', 'btn-gset'] };
-for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (const w of [375, 390]) {
+const WANT = { simple: ['vs-video', 'vs-3d', 'btn-vis', 'btn-det', 'vm-off', 'vm-yolo', 'vm-aruco', 'vm-depth', 'btn-trigger', 'btn-gset'],
+  expert: ['vs-video', 'vs-3d', 'btn-vis', 'btn-det', 'vm-off', 'vm-yolo', 'vm-aruco', 'vm-depth', 'btn-trigger', 'btn-gset'] };
+for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (const w of [360, 375, 390, 414, 430]) {
   const tag = `toolbar_${ui}_${lang}_${w}`;
   const ctx = await browser.newContext({ viewport: { width: w, height: 812 }, deviceScaleFactor: 1 });
   await ctx.addInitScript(([l]) => { try { localStorage.clear(); localStorage.setItem('lang', l); } catch (_) {} }, [lang]);
@@ -167,12 +185,22 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
   await page.evaluate(feed, [SETUP, true]);
   await page.waitForTimeout(800);
   await openVis(page); await page.waitForTimeout(150);
+  const sc0 = await noHScroll(page);
   const hits = await toolbarHits(page);
   const ids = hits.map((x) => x.id);
   check(`${tag} toolbar buttons present`, WANT[ui].every((id) => ids.includes(id)), JSON.stringify(ids));
-  check(`${tag} toolbar buttons uncovered`, hits.every((x) => x.ok), JSON.stringify(hits.filter((x) => !x.ok)));
+  check(`${tag} toolbar buttons uncovered, inside the viewport and the popover, enabled`, hits.every((x) => x.ok), JSON.stringify(hits.filter((x) => !x.ok)));
+  check(`${tag} no h-scroll`, sc0.sw <= sc0.iw, JSON.stringify(sc0));
   const file = path.join(out, `${tag}.png`); await page.screenshot({ path: file, clip: { x: 0, y: 0, width: w, height: 360 } }); shots.push(file);
   console.log(`${tag}  ${hits.length} buttons, covered: ${JSON.stringify(hits.filter((x) => !x.ok))}`);
+  // YOLO, ArUco and Depth all on (longest state; the depth panel opens over the video): still reachable
+  for (const m of ['yolo', 'aruco', 'depth']) { await openVis(page); await page.click(`#vmode button[data-vm="${m}"]`); await page.waitForTimeout(250); }
+  await openVis(page); await page.waitForTimeout(300);
+  const st = await page.evaluate(() => ({ pressed: [...document.querySelectorAll('#vmode button[aria-pressed="true"]')].map((b) => b.dataset.vm), panel: !document.getElementById('depth-panel').hidden }));
+  const hits2 = await toolbarHits(page);
+  check(`${tag} all three on`, st.pressed.join() === 'yolo,aruco,depth' && st.panel, JSON.stringify(st));
+  check(`${tag} toolbar buttons uncovered with all three on`, WANT[ui].every((id) => hits2.some((x) => x.id === id)) && hits2.every((x) => x.ok), JSON.stringify(hits2.filter((x) => !x.ok)));
+  const file2 = path.join(out, `${tag}_all_on.png`); await page.screenshot({ path: file2, clip: { x: 0, y: 0, width: w, height: 480 } }); shots.push(file2);
   await ctx.close();
 }
 

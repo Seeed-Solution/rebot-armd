@@ -7,7 +7,8 @@
 // enforces one accepted request per second (429 + Retry-After otherwise). The page's telemetry WebSocket is answered
 // with observations at 20 Hz (routeWebSocket).
 // For simple / expert x zh / en x desktop 1280x800, phone portrait 390x844 and phone landscape 844x390:
-// - the 深度（估计）/ Depth (est.) button sits with the vision selector (in the recognition popover in simple mode);
+// - 深度（估计）/ Depth (est.) is an aria-pressed toggle of the vision selector #vmode (in the recognition popover in simple
+//   mode, and in expert mode on a phone);
 // - one tap fetches one map; the panel is labelled as a model estimate, the legend reads near / far with
 //   "≈ x.xx m (估计 / est.)" from the map's p2 / p98 and the not-calibrated note;
 // - colour map alignment: canvas pixels at the screen centres of known cells have the colour of that cell (both sides
@@ -18,7 +19,8 @@
 // - Live: requests at most 1 per second (start to start >= 1000 ms), never a 429 from the page's own schedule;
 //   a forced 429 is retried after Retry-After;
 // - the arm moves -> the map is dropped, Live turns off, "机械臂已移动" / "Arm moved" shows, no further requests;
-// - the page hidden -> no requests; visible again -> Live resumes; closing the depth view -> no requests;
+// - the page hidden -> no requests; visible again -> Live resumes; closing the depth view (the panel's x, or the Depth
+//   toggle again) -> the toggle released, no requests;
 // - the E-stop is reachable (elementFromPoint at its centre, a real tap runs eStop) with the depth panel open;
 // - no horizontal scroll, the panel inside the viewport.
 // Writes PNGs (default .cache/depth-view-shots/). Exits non-zero if a check fails.
@@ -101,9 +103,9 @@ let bad = 0, checks = 0;
 const ok = (c, m) => { checks++; if (!c) { bad++; console.log('  FAIL ' + m); } return c; };
 const shots = [];
 const TXT = {
-  zh: { btn: '深度（估计）', title: '深度（模型估计）', near: '近', far: '远', m: (mm) => `≈ ${(mm / 1000).toFixed(2)} m（估计）`, read: (mm) => `≈ ${mm} mm（估计）`,
+  zh: { btn: '深度（估计）', tip: '深度图：模型估计，不是测量值', title: '深度（模型估计）', near: '近', far: '远', m: (mm) => `≈ ${(mm / 1000).toFixed(2)} m（估计）`, read: (mm) => `≈ ${mm} mm（估计）`,
     none: '此处无深度', note: '未校准，仅表示相对远近', moved: '机械臂已移动，已停止刷新', frame: '帧 #', live: '连续' },
-  en: { btn: 'Depth (est.)', title: 'Depth (model estimate)', near: 'Near', far: 'Far', m: (mm) => `≈ ${(mm / 1000).toFixed(2)} m (est.)`, read: (mm) => `≈ ${mm} mm (est.)`,
+  en: { btn: 'Depth (est.)', tip: 'Depth map: model estimate, not a measurement', title: 'Depth (model estimate)', near: 'Near', far: 'Far', m: (mm) => `≈ ${(mm / 1000).toFixed(2)} m (est.)`, read: (mm) => `≈ ${mm} mm (est.)`,
     none: 'No depth here', note: 'Uncalibrated, relative only', moved: 'Arm moved: refresh stopped', frame: 'Frame #', live: 'Live' },
 };
 const REST = [0, -0.4, 0.8, 0, 0, 0.1, 0];
@@ -169,15 +171,17 @@ try {
     // ---- button with the vision selector
     await openVis();
     await page.waitForTimeout(200);
-    const b = await page.evaluate(() => { const e = document.getElementById('btn-depth'), r = e.getBoundingClientRect(); const ctl = document.getElementById('det-ctl');
-      return { shown: !e.hidden && r.width > 0, txt: e.textContent, inCtl: ctl.contains(e), next: e.previousElementSibling && e.previousElementSibling.id, disabled: e.disabled, inView: r.left >= 0 && r.right <= innerWidth && r.top >= 0 && r.bottom <= innerHeight }; });
-    ok(b.shown && b.inView, `${tag} depth button visible in the viewport`);
-    ok(b.txt === L.btn, `${tag} depth button label "${b.txt}"`);
-    ok(b.inCtl && b.next === 'vmode' && !b.disabled, `${tag} depth button next to the vision selector, enabled`);
+    const b = await page.evaluate(() => { const e = document.querySelector('#vmode button[data-vm="depth"]'), r = e.getBoundingClientRect();
+      const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return { shown: !e.closest('[hidden]') && r.width > 0, txt: e.textContent, group: e.parentElement.getAttribute('role'), pressed: e.getAttribute('aria-pressed'), top: !!at && e.contains(at),
+        prev: e.previousElementSibling && e.previousElementSibling.dataset.vm, disabled: e.disabled, title: e.title, inView: r.left >= 0 && r.right <= innerWidth && r.top >= 0 && r.bottom <= innerHeight }; });
+    ok(b.shown && b.inView && b.top, `${tag} depth toggle visible in the viewport, not covered`);
+    ok(b.txt === L.btn, `${tag} depth toggle label "${b.txt}"`);
+    ok(b.group === 'group' && b.prev === 'aruco' && b.pressed === 'false' && !b.disabled && b.title === L.tip, `${tag} depth toggle in the selector after ArUco, enabled, released, tip "${b.title}"`);
 
     // ---- one tap: one map
     const t0 = performance.now();
-    await tapSel('#btn-depth');
+    await tapSel('#vmode button[data-vm="depth"]');
     await page.waitForFunction(() => !!(DEPTH.map && DEPTH.map.img), null, { timeout: 4000 }).catch(() => {});
     await page.evaluate(() => visPopOpen(false));
     await page.waitForTimeout(500);
@@ -187,7 +191,7 @@ try {
         nearM: document.getElementById('dp-near-m').textContent, farM: document.getElementById('dp-far-m').textContent, note: document.getElementById('dp-note').textContent,
         status: document.getElementById('dp-status').textContent, inView: r.left >= 0 && r.right <= innerWidth + 0.5 && r.top >= 0 && r.bottom <= innerHeight + 0.5
           && r.left >= v.left && r.right <= v.right && r.top >= v.top && r.bottom <= v.bottom, share: (r.width * r.height) / (v.width * v.height),
-        sw: document.scrollingElement.scrollWidth, iw: innerWidth, aria: document.getElementById('btn-depth').getAttribute('aria-pressed') }; });
+        sw: document.scrollingElement.scrollWidth, iw: innerWidth, aria: document.querySelector('#vmode button[data-vm="depth"]').getAttribute('aria-pressed') }; });
     ok(pan.shown && pan.inView, `${tag} panel visible inside the video box and the viewport`);
     ok(pan.share <= 0.35, `${tag} panel covers ${(pan.share * 100).toFixed(0)} % of the video (<= 35 %)`);
     ok(pan.title === L.title, `${tag} panel title "${pan.title}"`);
@@ -195,7 +199,7 @@ try {
     ok(pan.nearM === L.m(STATS.p2_mm) && pan.farM === L.m(STATS.p98_mm), `${tag} legend metres "${pan.nearM}" / "${pan.farM}" want p2 ${STATS.p2_mm} / p98 ${STATS.p98_mm}`);
     ok(pan.note === L.note, `${tag} not-calibrated note "${pan.note}"`);
     ok(pan.status.startsWith(L.frame + frameId), `${tag} frame / age "${pan.status}"`);
-    ok(pan.aria === 'true', `${tag} depth button pressed`);
+    ok(pan.aria === 'true', `${tag} depth toggle pressed`);
     ok(pan.sw <= pan.iw, `${tag} no horizontal scroll (${pan.sw} > ${pan.iw})`);
 
     // ---- colour map alignment
@@ -309,9 +313,29 @@ try {
     await page.waitForTimeout(300);
     const tx = performance.now();
     await page.waitForTimeout(2200);
-    const gone = await page.evaluate(() => ({ panel: document.getElementById('depth-panel').hidden, cv: document.getElementById('depth-overlay').hidden, aria: document.getElementById('btn-depth').getAttribute('aria-pressed') }));
-    ok(gone.panel && gone.cv && gone.aria === 'false', `${tag} closed: panel and map hidden, button released`);
+    const gone = await page.evaluate(() => ({ panel: document.getElementById('depth-panel').hidden, cv: document.getElementById('depth-overlay').hidden, aria: document.querySelector('#vmode button[data-vm="depth"]').getAttribute('aria-pressed'),
+      off: document.querySelector('#vmode button[data-vm="off"]').getAttribute('aria-pressed') }));
+    ok(gone.panel && gone.cv && gone.aria === 'false' && gone.off === 'true', `${tag} closed: panel and map hidden, toggle released, Off shown`);
     ok(reqsSince(tx).length === 0, `${tag} closed: no requests (${reqsSince(tx).length})`);
+    // the toggle again: on (one map), then off from the selector itself
+    await openVis();
+    await page.waitForTimeout(150);
+    const t2 = performance.now();
+    // the earlier steps scrolled the page's scroller (phone landscape): bring the selector back
+    await page.evaluate(() => document.querySelector('#vmode button[data-vm="depth"]').scrollIntoView({ block: 'nearest' }));
+    await tapSel('#vmode button[data-vm="depth"]');
+    await page.waitForTimeout(600);
+    const re = await page.evaluate(() => ({ on: DEPTH.on, panel: !document.getElementById('depth-panel').hidden }));
+    ok(re.on && re.panel && reqsSince(t2).length === 1, `${tag} toggle on again: panel and one request (${reqsSince(t2).length})`);
+    await openVis();
+    await page.waitForTimeout(150);
+    await page.evaluate(() => document.querySelector('#vmode button[data-vm="depth"]').scrollIntoView({ block: 'nearest' }));
+    await tapSel('#vmode button[data-vm="depth"]');
+    await page.waitForTimeout(300);
+    const t3 = performance.now();
+    await page.waitForTimeout(1500);
+    const re2 = await page.evaluate(() => ({ on: DEPTH.on, panel: !document.getElementById('depth-panel').hidden }));
+    ok(!re2.on && !re2.panel && reqsSince(t3).length === 0, `${tag} toggle off from the selector: panel hidden, no requests`);
 
     ok(errs.length === 0, `${tag} page errors: ${errs.join(' | ')}`);
     await ctx.close();
