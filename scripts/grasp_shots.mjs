@@ -6,7 +6,8 @@
 // detections. For simple / expert x zh / en x 1280x800 / 375x812 it taps a box, starts a grasp, shows
 // the running phase, opens the grasp setup drawer, and writes PNGs (default .cache/grasp-shots/).
 // Asserts: selection + confirm bar, the grasp command body, phase text and stop button, stop on key
-// input / stop button, the E-stop frame, result toasts, the setup drawer reads and writes, grip-pixel
+// input / stop button, the E-stop frame, result toasts, the setup drawer reads and writes (camera tilt shown with
+// 1 decimal and written only after an edit), grip-pixel
 // picking, S.grip synced from commanded_positions[6] after gripper / grasp actions, no horizontal scroll.
 // Vision (perception API 2 mock): Detect creates this page's overlay subscription with ["yolo"] and keeps
 // it alive; the grasp (armd triggers its own frames) changes neither the global mode nor the subscription.
@@ -22,7 +23,7 @@ fs.mkdirSync(out, { recursive: true });
 const html = fs.readFileSync(path.join(root, 'src/api/index.html'));
 const LIMITS = [[-3.14159, 3.14159, 2], [-2.0944, 2.0944, 2], [-2.61799, 2.61799, 2], [-3.14159, 3.14159, 3], [-2.0944, 2.0944, 3], [-6.28318, 6.28318, 4], [-5, 5, 3]]
   .map(([a, b, v]) => ({ min_position: a, max_position: b, max_velocity: v }));
-const SETUP = { table_z_m: 0.012, approach_height_m: 0.15, grasp_height_m: 0.015, lift_height_m: 0.12, grip_pixel_norm: [0.52, 0.64], camera_tilt_deg: -20,
+const SETUP = { table_z_m: 0.012, approach_height_m: 0.15, grasp_height_m: 0.015, lift_height_m: 0.12, grip_pixel_norm: [0.52, 0.64], camera_tilt_deg: -36.995338439941406,
   image_size_px: [640, 360], fx_px: 600, fy_px: 600, centre_tol_px: 10 };
 const VCALLS = []; // /api/v1/vision/* requests: [method, path, body]
 const json = (res, o) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
@@ -252,7 +253,7 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
       dOverflow: d.scrollWidth > d.clientWidth + 1 };
   });
   sc = await noHScroll(page);
-  check(`${tag} setup drawer`, info.open && info.table === '12 mm' && info.grip === '52% , 64%' && info.approach === '150' && info.tilt === '-20' && info.title === L.gset && !info.dOverflow, JSON.stringify(info));
+  check(`${tag} setup drawer`, info.open && info.table === '12 mm' && info.grip === '52% , 64%' && info.approach === '150' && info.tilt === '-37.0' && info.title === L.gset && !info.dOverflow, JSON.stringify(info));
   check(`${tag} no h-scroll (setup)`, sc.sw <= sc.iw, JSON.stringify(sc));
   file = path.join(out, `grasp_setup_${tag}.png`); await page.screenshot({ path: file }); shots.push(file);
   console.log(`${tag}  setup table=${info.table} grip=${info.grip} approach=${info.approach} tilt=${info.tilt}`);
@@ -263,7 +264,13 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
   await page.fill('#gset-approach', '170'); await page.fill('#gset-grasp', '20');
   await page.click('#gset-save'); await page.waitForTimeout(150);
   const w2 = (await sent(page, '/api/v1/grasp/setup')).at(-1);
-  check(`${tag} save heights`, w2 && Math.abs(w2.body.approach_height_m - 0.17) < 1e-9 && Math.abs(w2.body.grasp_height_m - 0.02) < 1e-9 && w2.body.camera_tilt_deg === -20, JSON.stringify(w2 && w2.body));
+  // the rounded tilt display is not written back unless the user edits the field
+  check(`${tag} save heights`, w2 && Math.abs(w2.body.approach_height_m - 0.17) < 1e-9 && Math.abs(w2.body.grasp_height_m - 0.02) < 1e-9 && !('camera_tilt_deg' in w2.body)
+    && await page.evaluate(() => window.__setup.camera_tilt_deg) === -36.995338439941406, JSON.stringify(w2 && w2.body));
+  await page.fill('#gset-tilt', '-30.5');
+  await page.click('#gset-save'); await page.waitForTimeout(150);
+  const w2t = (await sent(page, '/api/v1/grasp/setup')).at(-1);
+  check(`${tag} save edited tilt`, w2t && w2t.body.camera_tilt_deg === -30.5 && await page.evaluate(() => document.getElementById('gset-tilt').value) === '-30.5', JSON.stringify(w2t && w2t.body));
 
   // grip pixel: pick mode, tap, drawer reopens with the new value
   await page.click('#gset-grip-pick'); await page.waitForTimeout(200);

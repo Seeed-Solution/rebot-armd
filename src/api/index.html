@@ -2237,7 +2237,7 @@ body.cart-view #btn-pose, body.cart-view .cap-base, body:not(.cart-view) .cap-vi
     <div class="gset-grid">
       <label class="field"><span data-i18n="gset.approach">接近高度 mm</span><input type="number" id="gset-approach" inputmode="decimal" step="5" min="30" max="400"></label>
       <label class="field"><span data-i18n="gset.grasp">抓取高度 mm</span><input type="number" id="gset-grasp" inputmode="decimal" step="1" min="5" max="200"></label>
-      <label class="field"><span data-i18n="gset.tilt">相机俯角 °</span><input type="number" id="gset-tilt" inputmode="decimal" step="1" min="-60" max="60"></label>
+      <label class="field"><span data-i18n="gset.tilt">相机俯角 °</span><input type="number" id="gset-tilt" inputmode="decimal" step="any" min="-60" max="60"></label>
     </div>
     <div class="calib-live mono" id="gset-status">--</div>
     <div class="calib-actions">
@@ -9889,6 +9889,7 @@ const GR = {
   toasted: 0,       // last grasp id whose result was shown
   gripSynced: 0,    // last gripper / grasp action id S.grip was synced from
   pickGrip: false,  // next video tap records the grip pixel
+  tiltEdited: false, // the user typed in the camera tilt field since it was last filled
   setup: null, path: null, supported: null, rev: null,
 };
 const graspCodeKey = (code) => (/^IK_/.test(code || '') ? 'IK' : code);
@@ -10076,13 +10077,16 @@ $('grasp-stop').addEventListener('click', () => graspStop('button'));
 
 // ---- grasp setup drawer ----
 const mm = (m) => (Number.isFinite(m) ? Math.round(m * 1000) : null);
+// the tilt field shows 1 decimal; Save sends camera_tilt_deg only after the user edited the field,
+// so a calibrated mount's derived tilt (e.g. -36.995338) is not overwritten by its rounded display
+const tilt1 = (v) => (Number.isFinite(v) ? (Math.round(v * 10) / 10).toFixed(1) : null);
 function gsetRender(status) {
   const s = GR.setup;
   setText($('gset-table'), s ? (mm(s.table_z_m) + ' mm') : '--');
   setText($('gset-grip'), s ? s.grip_pixel_norm.map((v) => Math.round(v * 100) + '%').join(' , ') : '--');
-  for (const [id, v] of [['gset-approach', s && mm(s.approach_height_m)], ['gset-grasp', s && mm(s.grasp_height_m)], ['gset-tilt', s && s.camera_tilt_deg]]) {
+  for (const [id, v] of [['gset-approach', s && mm(s.approach_height_m)], ['gset-grasp', s && mm(s.grasp_height_m)], ['gset-tilt', s && tilt1(s.camera_tilt_deg)]]) {
     const el = $(id);
-    if (document.activeElement !== el) el.value = v == null ? '' : String(v);
+    if (document.activeElement !== el) { el.value = v == null ? '' : String(v); if (id === 'gset-tilt') GR.tiltEdited = false; }
     el.disabled = !s;
   }
   for (const id of ['gset-table-tcp', 'gset-grip-pick', 'gset-save']) $(id).disabled = !s;
@@ -10138,10 +10142,13 @@ $('gset-reload').addEventListener('click', () => graspLoadSetup(false));
 $('gset-table-tcp').addEventListener('click', () => gsetWrite({ table_z_from_tcp: true }));
 $('gset-grip-pick').addEventListener('click', () => { gsetOpen(false); GR.pickGrip = true; renderGrasp(); });
 $('grasp-pick-x').addEventListener('click', () => { GR.pickGrip = false; renderGrasp(); gsetOpen(true); });
+$('gset-tilt').addEventListener('input', () => { GR.tiltEdited = true; });
 $('gset-save').addEventListener('click', () => {
   const a = Number($('gset-approach').value), g = Number($('gset-grasp').value), tl = Number($('gset-tilt').value);
   if (![a, g, tl].every(Number.isFinite) || $('gset-approach').value === '' || $('gset-grasp').value === '' || $('gset-tilt').value === '') { gsetRender(t('gset.bad')); return; }
-  gsetWrite({ approach_height_m: a / 1000, grasp_height_m: g / 1000, camera_tilt_deg: tl });
+  const patch = { approach_height_m: a / 1000, grasp_height_m: g / 1000 };
+  if (GR.tiltEdited) patch.camera_tilt_deg = tl;
+  gsetWrite(patch);
 });
 i18nHooks.push(() => { renderGrasp(); if (!$('gset').hidden) gsetRender(); });
 graspLoadSetup(true);
