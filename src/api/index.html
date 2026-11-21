@@ -660,6 +660,26 @@ body.offline .banner { display: block; }
 .view-switch button[aria-checked="true"] { background: var(--sc-color-primary-dark, #5B7D15); color: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.18); }
 .view-switch button:focus-visible { outline: 2px solid var(--sc-color-primary, #8CC020); outline-offset: 1px; }
 .hud::before { content: ''; flex: none; width: 116px; height: 1px; }
+/* Expert mode on a phone: Detect, the vision selector, single shot and grasp setup did not fit beside the view
+   switch; the wrapped row started 7 px below the HUD top, so the switch covered Detect, and the rows covered most
+   of the video. As in simple mode they open from the recognition chip (#btn-vis) as a popover; a spacer as tall as
+   the switch keeps any wrapped row (status chips) below it. */
+@media (max-width: 600px) {
+  body.ui-expert .hud { align-items: flex-start; }
+  body.ui-expert .hud::before { height: 32px; }
+  body.ui-expert #btn-vis:not([hidden]) { display: inline-flex !important; }
+  body.ui-expert #det-ctl { display: none; }
+  body.ui-expert.vis-open #det-ctl:not([hidden]) {
+    display: flex; position: absolute; z-index: 30; top: calc(100% + 8px); left: 0; width: max-content; max-width: min(300px, calc(100vw - 24px));
+    flex-wrap: wrap; align-items: center; gap: 8px 6px; padding: 8px; border-radius: 16px;
+    background: rgba(255,255,255,0.5); border: 1px solid rgba(255,255,255,0.6); box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+    backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
+  }
+  body.ui-expert.vis-open #det-ctl .vmode { order: -1; flex: 1 0 100%; display: flex; }
+  body.ui-expert.vis-open #det-ctl .vmode[hidden] { display: none; }
+  body.ui-expert.vis-open #det-ctl .vmode button { flex: 1 1 auto; }
+  body.ui-expert.vis-open .hud { z-index: 9; }
+}
 .view3d { position: absolute; inset: 0; z-index: 6; background: #eef2ea; border-radius: inherit; overflow: hidden; }
 .view3d canvas { width: 100%; height: 100%; display: block; touch-action: none; }
 .v3-legend { position: absolute; left: 10px; bottom: 8px; display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: #374151; pointer-events: none; }

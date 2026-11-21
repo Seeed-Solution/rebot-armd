@@ -128,17 +128,26 @@ const T = {
 };
 const noHScroll = (page) => page.evaluate(() => ({ sw: document.scrollingElement.scrollWidth, iw: window.innerWidth }));
 const sent = (page, p) => page.evaluate((p) => window.__sent.filter((m) => m.type === 'command' && m.path === p), p);
-// client point of a normalised video coordinate
-const videoPoint = (page, u, v) => page.evaluate(([u, v]) => {
+// client point [x, y, u, v] of a normalised video coordinate. On a phone the HUD controls cover much of the
+// video; when (u, v) is covered, the nearest uncovered point inside `region` [u0, v0, u1, v1] (as a user would tap)
+const videoPoint = (page, u, v, region = null) => page.evaluate(([u, v, region]) => {
   const r = document.getElementById('video-box').getBoundingClientRect();
   const c = getVideoContentRect(r.width, r.height);
-  return [r.left + c.x + u * c.w, r.top + c.y + v * c.h];
-}, [u, v]);
+  const at = (a, b) => [r.left + c.x + a * c.w, r.top + c.y + b * c.h, a, b];
+  const free = ([x, y]) => { const h = document.elementFromPoint(x, y); return !!h && ['video-overlay', 'video-stream', 'video-box'].includes(h.id); };
+  if (!region || free(at(u, v))) return at(u, v);
+  const cand = [];
+  for (let a = region[0]; a <= region[2] + 1e-9; a += 0.01) for (let b = region[1]; b <= region[3] + 1e-9; b += 0.01) cand.push([a, b]);
+  cand.sort((p, q) => Math.hypot(p[0] - u, p[1] - v) - Math.hypot(q[0] - u, q[1] - v));
+  const hit = cand.find(([a, b]) => free(at(a, b)));
+  return hit ? at(hit[0], hit[1]) : at(u, v);
+}, [u, v, region]);
 
-// simple mode: Detect, the vision mode selector, single shot and grasp setup live in the recognition popover (#btn-vis)
+// simple mode, and expert mode on a phone: Detect, the vision mode selector, single shot and grasp setup live in the
+// recognition popover (#btn-vis)
 const openVis = (page) => page.evaluate(() => {
   const b = document.getElementById('btn-vis');
-  if (document.body.classList.contains('ui-simple') && !document.body.classList.contains('vis-open') && b && !b.hidden) b.click();
+  if (!document.body.classList.contains('vis-open') && b && !b.hidden && getComputedStyle(b).display !== 'none') b.click();
 });
 const closeVis = (page) => page.evaluate(() => { if (document.body.classList.contains('vis-open')) document.getElementById('btn-vis').click(); });
 
@@ -163,7 +172,7 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
 
   // 1. tap the cup box (popover closed first: it can cover the video on a phone)
   await closeVis(page);
-  const [cx, cy] = await videoPoint(page, 250 / 640, 200 / 360);
+  const [cx, cy] = await videoPoint(page, 250 / 640, 200 / 360, [205 / 640, 145 / 360, 295 / 640, 255 / 360]);
   await page.mouse.click(cx, cy);
   await page.waitForTimeout(200);
   await openVis(page);
@@ -184,7 +193,7 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
   console.log(`${tag}  select=${info.sel} bar=${info.bar} go="${info.go}" score=${info.score} inside=${info.barInside} scroll=${sc.sw}<=${sc.iw}`);
 
   // tapping empty video clears the selection, tapping the bottle selects it, back to the cup
-  const [ex, ey] = await videoPoint(page, 0.56, 0.55);
+  const [ex, ey] = await videoPoint(page, 0.56, 0.55, [0.5, 0.05, 0.62, 0.95]);
   await page.mouse.click(ex, ey); await page.waitForTimeout(100);
   check(`${tag} tap empty clears`, await page.evaluate(() => GR.sel === null));
   await page.mouse.click(cx, cy); await page.waitForTimeout(100);
@@ -277,11 +286,12 @@ for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (con
   info = await page.evaluate(() => ({ drawer: !document.getElementById('gset').hidden, pick: !document.getElementById('grasp-pick').hidden, text: document.querySelector('#grasp-pick span').textContent }));
   check(`${tag} pick mode`, !info.drawer && info.pick && info.text === L.pick, JSON.stringify(info));
   if (lang === 'en' || vp === '375x812') { file = path.join(out, `grasp_pick_${tag}.png`); await page.screenshot({ path: file }); shots.push(file); }
-  const [gx, gy] = await videoPoint(page, 0.25, 0.75);
+  const [gx, gy, gu, gv] = await videoPoint(page, 0.25, 0.75, [0.05, 0.5, 0.95, 0.95]);
   await page.mouse.click(gx, gy); await page.waitForTimeout(250);
   const w3 = (await sent(page, '/api/v1/grasp/setup')).at(-1);
   info = await page.evaluate(() => ({ drawer: !document.getElementById('gset').hidden, grip: document.getElementById('gset-grip').textContent, sel: GR.sel }));
-  check(`${tag} grip pixel set`, w3 && Math.abs(w3.body.grip_pixel_norm[0] - 0.25) < 0.01 && Math.abs(w3.body.grip_pixel_norm[1] - 0.75) < 0.01 && info.drawer && info.grip === '25% , 75%' && info.sel === null,
+  check(`${tag} grip pixel set`, w3 && Math.abs(w3.body.grip_pixel_norm[0] - gu) < 0.01 && Math.abs(w3.body.grip_pixel_norm[1] - gv) < 0.01 && info.drawer
+    && info.grip === `${Math.round(w3.body.grip_pixel_norm[0] * 100)}% , ${Math.round(w3.body.grip_pixel_norm[1] * 100)}%` && info.sel === null,
     JSON.stringify([w3 && w3.body, info]));
   sc = await noHScroll(page);
   check(`${tag} no h-scroll (end)`, sc.sw <= sc.iw, JSON.stringify(sc));

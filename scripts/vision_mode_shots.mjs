@@ -118,10 +118,11 @@ const hud = (page) => page.evaluate(() => {
     sw: document.scrollingElement.scrollWidth, iw: window.innerWidth };
 });
 
-// simple mode: Detect, the vision mode selector, single shot and grasp setup live in the recognition popover (#btn-vis)
+// simple mode, and expert mode on a phone: Detect, the vision mode selector, single shot and grasp setup live in the
+// recognition popover (#btn-vis)
 const openVis = (page) => page.evaluate(() => {
   const b = document.getElementById('btn-vis');
-  if (document.body.classList.contains('ui-simple') && !document.body.classList.contains('vis-open') && b && !b.hidden) b.click();
+  if (!document.body.classList.contains('vis-open') && b && !b.hidden && getComputedStyle(b).display !== 'none') b.click();
 });
 const subCalls = () => CALLS.filter(([, u]) => u.startsWith('/api/v1/vision/subscribe'));
 const setHidden = (page, hidden) => page.evaluate((h) => {

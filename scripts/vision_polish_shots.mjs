@@ -4,7 +4,7 @@
 // Serves src/api/index.html with a mocked 7-DOF schema, a grasp setup as a calibrated B601-DM reports it
 // (camera_tilt_deg -36.995338439941406, grip_pixel_norm [0.5, 0.5]) and a perception API 2 rebot-vision
 // mock whose global mode is "yolo"; replaces the control WebSocket with an in-page mock that
-// acknowledges commands. For simple x zh / en x 1280x800 / 375x812 (and expert at 1280x800) it checks:
+// acknowledges commands. For simple / expert x zh / en x 1280x800 / 375x812 it checks:
 //   - grasp setup drawer: the tilt field shows 1 decimal; Save without an edit sends no camera_tilt_deg
 //   - camera_down true: the grip point reads "not used: camera-down acquisition", the pick button is
 //     hidden and no grip ring is drawn; camera_down false: the value, the pick button and the ring
@@ -13,6 +13,7 @@
 //   - Detect once with the overlay off: the boxes stay for SNAP_HOLD_MS (4 s) through the detection state
 //     poll (refreshDetState, which used to clear them), then go; they go at once when an arm joint moves
 //     more than SNAP_MOVE_RAD (not for jitter below it or gripper motion) or the user taps the video
+//   - toolbar: at 375 and 390 px, simple and expert, every toolbar button is the element at its centre
 // Writes PNGs (default .cache/vision-polish-shots/).
 import fs from 'node:fs';
 import http from 'node:http';
@@ -122,7 +123,7 @@ const noHScroll = (page) => page.evaluate(() => ({ sw: document.scrollingElement
 const sent = (page, p) => page.evaluate((p) => window.__sent.filter((m) => m.type === 'command' && m.path === p), p);
 const openVis = (page) => page.evaluate(() => {
   const b = document.getElementById('btn-vis');
-  if (document.body.classList.contains('ui-simple') && !document.body.classList.contains('vis-open') && b && !b.hidden) b.click();
+  if (!document.body.classList.contains('vis-open') && b && !b.hidden && getComputedStyle(b).display !== 'none') b.click();
 });
 const closeVis = (page) => page.evaluate(() => { if (document.body.classList.contains('vis-open')) document.getElementById('btn-vis').click(); });
 const drawer = (page) => page.evaluate(() => {
@@ -143,11 +144,40 @@ const shoot = async (page) => {
 };
 const rings = async (page) => { await page.evaluate(() => { window.__rings = 0; }); await page.waitForTimeout(300); return page.evaluate(() => window.__rings); };
 
-const combos = [];
-for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (const vp of ['1280x800', '375x812']) {
-  // expert at 375x812: the view switch covers the Detect controls (pre-existing, see grasp_shots.mjs)
-  if (!(ui === 'expert' && vp === '375x812')) combos.push([ui, lang, vp]);
+// every toolbar button (view switch, recognition chip, Detect, vision selector, single shot, grasp setup)
+// is the element at its own centre, i.e. nothing covers it; with the recognition popover open (simple mode, expert on a phone)
+const toolbarHits = (page) => page.evaluate(() => {
+  const els = [...document.querySelectorAll('#view-switch button, #btn-vis, #det-ctl button')].filter((e) => {
+    const r = e.getBoundingClientRect(), cs = getComputedStyle(e);
+    return !e.closest('[hidden]') && r.width > 0 && r.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden';
+  });
+  return els.map((e) => {
+    const r = e.getBoundingClientRect(), h = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return { id: e.id || 'vm-' + e.dataset.vm, ok: h === e || e.contains(h), hit: h ? (h.id || h.className || h.tagName) : null };
+  });
+});
+const WANT = { simple: ['vs-video', 'vs-3d', 'btn-vis', 'btn-det', 'vm-off', 'vm-yolo', 'vm-aruco', 'vm-both', 'btn-trigger', 'btn-gset'],
+  expert: ['vs-video', 'vs-3d', 'btn-vis', 'btn-det', 'vm-off', 'vm-yolo', 'vm-aruco', 'vm-both', 'btn-trigger', 'btn-gset'] };
+for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (const w of [375, 390]) {
+  const tag = `toolbar_${ui}_${lang}_${w}`;
+  const ctx = await browser.newContext({ viewport: { width: w, height: 812 }, deviceScaleFactor: 1 });
+  await ctx.addInitScript(([l]) => { try { localStorage.clear(); localStorage.setItem('lang', l); } catch (_) {} }, [lang]);
+  const page = await ctx.newPage();
+  await page.goto(base + (ui === 'expert' ? '?ui=expert' : ''), { waitUntil: 'domcontentloaded' });
+  await page.evaluate(feed, [SETUP, true]);
+  await page.waitForTimeout(800);
+  await openVis(page); await page.waitForTimeout(150);
+  const hits = await toolbarHits(page);
+  const ids = hits.map((x) => x.id);
+  check(`${tag} toolbar buttons present`, WANT[ui].every((id) => ids.includes(id)), JSON.stringify(ids));
+  check(`${tag} toolbar buttons uncovered`, hits.every((x) => x.ok), JSON.stringify(hits.filter((x) => !x.ok)));
+  const file = path.join(out, `${tag}.png`); await page.screenshot({ path: file, clip: { x: 0, y: 0, width: w, height: 360 } }); shots.push(file);
+  console.log(`${tag}  ${hits.length} buttons, covered: ${JSON.stringify(hits.filter((x) => !x.ok))}`);
+  await ctx.close();
 }
+
+const combos = [];
+for (const ui of ['simple', 'expert']) for (const lang of ['zh', 'en']) for (const vp of ['1280x800', '375x812']) combos.push([ui, lang, vp]);
 for (const [ui, lang, vp] of combos) {
   const tag = `${ui}_${lang}_${vp}`;
   const L = T[lang];
@@ -224,8 +254,17 @@ for (const [ui, lang, vp] of combos) {
 
   // a tap on the video dismisses it
   await shoot(page);
-  const tap = await page.evaluate(() => { const r = document.getElementById('video-box').getBoundingClientRect(); const c = getVideoContentRect(r.width, r.height); return [r.left + c.x + 0.62 * c.w, r.top + c.y + 0.55 * c.h]; });
-  await page.mouse.click(tap[0], tap[1]); await page.waitForTimeout(150);
+  // a point of the video that no control covers (on a phone the HUD takes much of the small video box)
+  const tap = await page.evaluate(() => {
+    const r = document.getElementById('video-box').getBoundingClientRect(), c = getVideoContentRect(r.width, r.height);
+    for (let v = 0.95; v > 0.05; v -= 0.05) for (let u = 0.95; u > 0.05; u -= 0.05) {
+      const x = r.left + c.x + u * c.w, y = r.top + c.y + v * c.h, h = document.elementFromPoint(x, y);
+      if (h && ['video-overlay', 'video-stream', 'video-box'].includes(h.id)) return [x, y];
+    }
+    return null;
+  });
+  check(`${tag} free video point`, !!tap);
+  if (tap) await page.mouse.click(tap[0], tap[1]); await page.waitForTimeout(150);
   o = await overlay(page);
   check(`${tag} dismissed by a tap`, o.n === 0 && !o.held && o.px === 0, JSON.stringify(o));
 
