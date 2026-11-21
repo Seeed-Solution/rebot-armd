@@ -40,6 +40,9 @@ pub struct PlaceRequest {
     pub release: bool,
     pub retreat: bool,
     pub auto_yaw: Option<bool>,
+    /// `yaw: "outward"`: the place orientation's yaw is atan2(y, x) of the target and the
+    /// approach and descent paths keep the yaw outward (`motion::PathOpts::yaw_outward`).
+    pub yaw_outward: bool,
     pub speed_scale: f64,
     pub tag: Option<String>,
     /// Request field `approach` for the descent (src/backlash.rs, `place_final`).
@@ -91,6 +94,7 @@ pub fn parse_place(inner: &SupervisorInner, body: &Value) -> Result<PlaceRequest
         release: motion::flag(body, "release", true)?,
         retreat: motion::flag(body, "retreat", true)?,
         auto_yaw,
+        yaw_outward: motion::parse_yaw_mode(body)?,
         speed_scale,
         tag: motion::tag(body)?,
         approach: crate::backlash::parse_request(body)?,
@@ -156,6 +160,9 @@ pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
     } else if yaw_free && request.orientation.is_some() {
         r_place = motion::align_auto_yaw(&request.target, r_place);
     }
+    if request.yaw_outward {
+        r_place = motion::with_outward_yaw(&request.target, &r_place);
+    }
     let mut orientation_levelled = false;
     if held_spill_safe {
         let tool_z = kinematics::column(&r_place, 0)[2];
@@ -166,23 +173,23 @@ pub fn plan(pending: PendingPlace) -> Result<PlannedPlace, ArmError> {
         }
     }
     let mut cur = input.clone();
-    let step = |cur: &mut PlanInput, goal: Pose| -> Result<f64, ArmError> {
-        let path = motion::plan_cartesian_ex(cur, goal, speed, yaw_free)?;
+    let step = |cur: &mut PlanInput, goal: Pose, yaw_outward: bool| -> Result<f64, ArmError> {
+        let path = motion::plan_cartesian_opts(cur, goal, speed, motion::PathOpts { yaw_free, yaw_outward })?;
         let last = path.last();
         cur.q0 = std::array::from_fn(|i| f64::from(last[i]));
         Ok(path.duration)
     };
     let z = lift_z(start.p[2], &request);
-    let lift = if z - start.p[2] > LIFT_EPS_M { step(&mut cur, Pose::new(start.r, [start.p[0], start.p[1], z]))? } else { 0.0 };
-    let approach = step(&mut cur, Pose::new(r_place, above(&request)))?;
+    let lift = if z - start.p[2] > LIFT_EPS_M { step(&mut cur, Pose::new(start.r, [start.p[0], start.p[1], z]), false)? } else { 0.0 };
+    let approach = step(&mut cur, Pose::new(r_place, above(&request)), request.yaw_outward)?;
     let r_descend = if yaw_free && request.orientation.is_none() { cur.arm.fk(&cur.q0).r } else { r_place };
-    let descend = step(&mut cur, Pose::new(r_descend, request.target))?;
+    let descend = step(&mut cur, Pose::new(r_descend, request.target), request.yaw_outward)?;
     if request.release { cur.j7 = open_rad; }
     // as the runtime phase: straight up by approach_m from where descend ended, same orientation
     let retreat = if request.retreat {
         let p = cur.arm.fk(&cur.q0).p;
         let goal = motion::resolve_goal(&cur, &GoalSpec::Absolute { p: [p[0], p[1], p[2] + request.approach_m], r: None });
-        step(&mut cur, goal)?
+        step(&mut cur, goal, false)?
     } else { 0.0 };
     Ok(PlannedPlace { input, request, r_place, durations: [lift, approach, descend, retreat], orientation_levelled })
 }
@@ -232,14 +239,15 @@ async fn phases(ctx: &MacroCtx, planned: &PlannedPlace) -> Result<(), Stop> {
     }
 
     ctx.phase("approach", 0.2).await?;
-    ctx.move_arm("approach", GoalSpec::AbsoluteEx { p: above(req), r: Some(planned.r_place), auto_yaw: yaw_free }, speed).await?;
+    let outward = |spec: GoalSpec| if req.yaw_outward { GoalSpec::YawOutward(Box::new(spec)) } else { spec };
+    ctx.move_arm("approach", outward(GoalSpec::AbsoluteEx { p: above(req), r: Some(planned.r_place), auto_yaw: yaw_free }), speed).await?;
 
     ctx.phase("descend", 0.55).await?;
     let r_descend = if yaw_free && req.orientation.is_none() { None } else { Some(planned.r_place) };
     // same-side approach (`place_final`, src/backlash.rs): the descent ends at the pre-target, the
     // short segment (phase final_approach) reaches the target, never rising to it from below
     let final_approach = crate::macro_action::FinalApproach { use_: "place_final", request: req.approach, rules: crate::backlash::DescentRules::tcp() };
-    ctx.move_arm_with("descend", GoalSpec::AbsoluteEx { p: req.target, r: r_descend, auto_yaw: yaw_free }, speed, Some(final_approach)).await?;
+    ctx.move_arm_with("descend", outward(GoalSpec::AbsoluteEx { p: req.target, r: r_descend, auto_yaw: yaw_free }), speed, Some(final_approach)).await?;
 
     if req.release { ctx.gripper_phase("open", 0.75, GripperCommand::Open).await?; }
 

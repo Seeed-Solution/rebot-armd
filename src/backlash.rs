@@ -322,15 +322,15 @@ pub enum Pre {
 /// Outside the lock: from the `direct` path (to the goal), the pre-target of its end and the
 /// Cartesian path to the pre-target's pose. `rules`: the grasp / place descent rules.
 pub fn plan_cartesian_pre(input: &crate::motion::PlanInput, direct: &crate::motion::JointPath, plan: &Plan,
-    rules: Option<&DescentRules>, speed: crate::motion::Speed, yaw_free: bool) -> Pre {
-    match plan_cartesian_pre_inner(input, direct, plan, rules, speed, yaw_free) {
+    rules: Option<&DescentRules>, speed: crate::motion::Speed, opts: impl Into<crate::motion::PathOpts>) -> Pre {
+    match plan_cartesian_pre_inner(input, direct, plan, rules, speed, opts.into()) {
         Ok(p) => Pre::Ready(Box::new(p)),
         Err(r) => Pre::Direct(r),
     }
 }
 
 fn plan_cartesian_pre_inner(input: &crate::motion::PlanInput, direct: &crate::motion::JointPath, plan: &Plan,
-    rules: Option<&DescentRules>, speed: crate::motion::Speed, yaw_free: bool) -> Result<CartesianPre, String> {
+    rules: Option<&DescentRules>, speed: crate::motion::Speed, opts: crate::motion::PathOpts) -> Result<CartesianPre, String> {
     let target = direct.last_slice().to_vec();
     let delta = plan.policy.delta_rad();
     let (mut pre, mut signs) = pre_target(&target, &plan.joints, delta, &input.limits)?;
@@ -341,7 +341,7 @@ fn plan_cartesian_pre_inner(input: &crate::motion::PlanInput, direct: &crate::mo
         segment_from_above(&target, &pre, lowest)?;
     }
     let goal = input.arm.fk_f32(&pre).ok_or_else(|| "pre_target: no kinematic model".to_string())?;
-    let path = crate::motion::plan_cartesian_ex(input, goal, speed, yaw_free).map_err(|e| format!("pre_target: {}", e.code()))?;
+    let path = crate::motion::plan_cartesian_opts(input, goal, speed, opts).map_err(|e| format!("pre_target: {}", e.code()))?;
     if !reached_pre(path.last_slice(), &pre, delta) {
         return Err("pre_target: the path to the pre-target ends elsewhere (IK)".into());
     }
