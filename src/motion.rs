@@ -440,6 +440,10 @@ pub fn parse_path_mode(body: &Value) -> Result<PathMode, MotionError> {
     }
 }
 
+/// Appended to the message of a straight-line `IK_BRANCH_FLIP` when the joint-space move to the
+/// same goal has an IK solution and passes the swept workspace check.
+pub const JOINT_PATH_HINT: &str = "; a joint-space move reaches it: try path: \"joint\"";
+
 /// DLS rounds of [`solve_goal_joints`] per seed ([`kinematics::PAR`] iterations each).
 pub const GOAL_IK_ROUNDS: usize = 40;
 

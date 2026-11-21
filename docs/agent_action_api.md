@@ -92,6 +92,7 @@ The camera rotation is R_base_cam = R_base_end · R_end_cam, R_end_cam from `con
 - Checks: the same as `move_to_pose` and joint moves: the swept workspace check of the quintic (floor, outer box, reach, keep-out boxes, link capsules, self-collision; `WORKSPACE_VIOLATION`), the power budget, the torque and collision holds, and the plan freshness check (`PLAN_STALE`). The gripper keeps its command.
 - `precise: true` / `approach: "same_side"`: the quintic ends with the same-side approach of `move_to_precise` as in `move_to_pose` (see [Same-side final approach](#same-side-final-approach--同侧接近)).
 - Action kind stays `move_to` / `move_relative`.
+- Hint: when a straight-line `move_to` / `move_relative` is refused with `IK_BRANCH_FLIP` and the joint-space move to the same goal has an IK solution (seeds as above) whose quintic passes the joint limits and the swept workspace check, the message ends with `; a joint-space move reaches it: try path: "joint"`. The check costs one goal IK and one sweep check; nothing moves.
 
 `move_to` 与 `move_relative` 的 `"path": "joint"`（能力 `move_path_joint`，与 `cartesian` 取值相同；旧版 armd 无此字段）在关节空间移动到目标位姿，不走直线。`"linear"` 或不给 `path` 时仍走直线。其他取值返回 `INVALID_COMMAND`。
 
@@ -101,6 +102,7 @@ The camera rotation is R_base_cam = R_base_end · R_end_cam, R_end_cam from `con
 - 检查：与 `move_to_pose` 和关节运动相同：五次多项式轨迹的扫掠工作空间检查（地面、外框、可达范围、禁入盒、连杆胶囊体、自碰撞；`WORKSPACE_VIOLATION`）、电源功率预算、力矩保护与碰撞保护的保持状态，以及规划时效检查（`PLAN_STALE`）。夹爪保持当前指令。
 - `precise: true` / `approach: "same_side"`：与 `move_to_pose` 一样，五次多项式末段按 `move_to_precise` 做同侧接近（见[同侧接近](#same-side-final-approach--同侧接近)）。
 - 动作类型仍为 `move_to` / `move_relative`。
+- 提示：直线 `move_to` / `move_relative` 因 `IK_BRANCH_FLIP` 被拒绝时，若到同一目标的关节空间移动有 IK 解（初值同上）且其五次多项式轨迹通过关节限位和扫掠工作空间检查，消息末尾加 `; a joint-space move reaches it: try path: "joint"`。这项检查只做一次目标 IK 和一次扫掠检查，不产生运动。
 
 ### Speed / 速度
 
@@ -967,7 +969,7 @@ SG2002 上电原因 `reset_reason`）；`blackbox?seconds=N` 返回本次启动�
 
 | code | status |
 |---|---|
-| `IK_UNREACHABLE`, `IK_BRANCH_FLIP` (message may end with the `yaw: "outward"` hint, see [Outward yaw](#outward-yaw--朝外偏航)), `WORKSPACE_VIOLATION`, `POWER_BUDGET` | 422 |
+| `IK_UNREACHABLE`, `IK_BRANCH_FLIP` (message may end with the `yaw: "outward"` hint, see [Outward yaw](#outward-yaw--朝外偏航), or with the `path: "joint"` hint, see [Joint path](#joint-path--关节空间路径)), `WORKSPACE_VIOLATION`, `POWER_BUDGET` | 422 |
 | `TASK_UNSUPPORTED` (grasp task requirements not met by the vision provider, or its model switch refused; command rejection, not a fault) | 422 |
 | `REPLAY_EMPTY`, `REPLAY_JOINT_COUNT`, `REPLAY_INVALID_EPISODE`, `REPLAY_TOO_LONG`, `REPLAY_TOO_FAST` | 422 |
 | `SOFT_LIMIT_EXCEEDED`, `INVALID_EPISODE_ID`, `INVALID_OUTPUT_PATH` | 400 |

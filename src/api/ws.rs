@@ -182,11 +182,13 @@ struct PendingPlan {
     /// `path: "joint"`: the IK seeds ([`motion::goal_seeds`]), the `speed_scale` of the joint
     /// quintic and the same-side approach request (None = off). None: the straight line.
     joint: Option<JointGoal>,
+    /// IK seeds of the goal ([`motion::goal_seeds`]): the joint-space solve of `path: "joint"`,
+    /// and for a straight line the check behind the `path: "joint"` hint of `IK_BRANCH_FLIP`.
+    seeds: Vec<[f64; 6]>,
 }
 
 /// `path: "joint"` part of a [`PendingPlan`].
 struct JointGoal {
-    seeds: Vec<[f64; 6]>,
     speed_scale: f64,
     same_side: Option<crate::backlash::Request>,
 }
@@ -409,12 +411,12 @@ fn prepare_action(
     let joint = match path_mode {
         motion::PathMode::Linear => None,
         motion::PathMode::Joint => Some(JointGoal {
-            seeds: motion::goal_seeds(&input, &goal, &inner.goal_seed_poses()),
             speed_scale: crate::poses::speed_scale(body)?,
             same_side: same_side.then_some(request),
         }),
     };
-    Ok(ActionStart::Plan(PendingPlan { request_id: request_id.clone(), kind, input, goal, speed, tag, opts, approach, joint }))
+    let seeds = motion::goal_seeds(&input, &goal, &inner.goal_seed_poses());
+    Ok(ActionStart::Plan(PendingPlan { request_id: request_id.clone(), kind, input, goal, speed, tag, opts, approach, joint, seeds }))
 }
 
 fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) -> Value {
@@ -1231,11 +1233,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 // Cartesian plan: IK runs on a blocking thread without the supervisor lock,
                 // so the control tick is never blocked by it; install re-checks everything.
                 if let Some((plan, generation)) = pending_plan.take() {
-                    let PendingPlan { request_id, kind, input, goal, speed, tag, opts, approach, joint } = plan;
+                    let PendingPlan { request_id, kind, input, goal, speed, tag, opts, approach, joint, seeds } = plan;
                     if let Some(joint) = joint {
                         // path "joint": IK of the goal only (several seeds) without the lock,
                         // then the move_to_pose quintic, checked under the lock
-                        let seeds = joint.seeds;
                         let solved = tokio::task::spawn_blocking(move || {
                             let q = motion::solve_goal_joints(&input, &goal, opts, &seeds);
                             (input, q)
@@ -1264,13 +1265,22 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 (Err(Some(r)), _) => crate::backlash::Pre::Direct((*r).to_string()),
                                 _ => crate::backlash::Pre::Off,
                             };
-                            (input, result.map(|path| (path, pre, approach.ok())))
+                            // a branch flip: would the joint-space move reach the goal (hint)?
+                            let joint_goal = match &result {
+                                Err(motion::MotionError::IkBranchFlip { .. }) => motion::solve_goal_joints(&input, &goal, opts, &seeds).ok(),
+                                _ => None,
+                            };
+                            (input, result.map(|path| (path, pre, approach.ok())).map_err(|e| (e, joint_goal)))
                         }).await;
                         let mut inner = recv_supervisor.inner().write().await;
                         if let Some(hook) = inner.before_install_hook.take() { hook(&mut inner); }
                         response = Some(match planned {
                             Err(e) => command_reject(&inner, &request_id, ArmError::Internal(format!("planner task failed: {e}")).into()),
-                            Ok((_, Err(error))) => command_reject(&inner, &request_id, ArmError::from(error).into()),
+                            Ok((_, Err((error, joint_goal)))) => {
+                                let mut api: ApiError = ArmError::from(error).into();
+                                if joint_goal.is_some_and(|q| inner.joint_goal_feasible(&q)) { api.message.push_str(motion::JOINT_PATH_HINT); }
+                                command_reject(&inner, &request_id, api)
+                            }
                             Ok((input, Ok((path, pre, approach)))) => {
                                 if recv_generation.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&recv_connection, generation) {
                                     json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"LEASE_LOST", "message":"This connection lost the lease while planning", "error":"LEASE_LOST", "epoch_id":inner.safety.epoch_id()})

@@ -3135,6 +3135,23 @@ impl SupervisorInner {
         Ok((id, duration))
     }
 
+    /// Whether the joint-space quintic to the arm joints `q` would pass the checks of
+    /// [`start_quintic`](Self::start_quintic) that depend on the path (soft limits, swept
+    /// workspace); nothing starts. Used for the `path: "joint"` hint of a failed straight line.
+    pub fn joint_goal_feasible(&self, q: &[f64; 6]) -> bool {
+        let target = self.joint_goal_target(q);
+        let limits = self.planning_limits();
+        if target.iter().zip(&self.config.limits).any(|(t, l)| !t.is_finite() || *t < l.min_position || *t > l.max_position) {
+            return false;
+        }
+        let Ok(traj) = crate::trajectory::TrajectoryPlanner::plan(
+            &self.commanded_positions, &vec![0.0; self.config.dof], &target, &vec![0.0; self.config.dof], None, &limits) else { return false; };
+        match self.workspace_samples(&traj) {
+            Ok(samples) => self.check_workspace_path(&self.commanded_positions, samples.iter().map(Vec::as_slice)).is_ok(),
+            Err(_) => false,
+        }
+    }
+
     /// The commanded joints with the arm joints replaced by `q` (gripper and extra joints kept).
     fn joint_goal_target(&self, q: &[f64; 6]) -> Vec<f32> {
         let arm_dof = self.config.arm_dof();
