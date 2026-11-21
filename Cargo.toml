@@ -36,6 +36,7 @@ roxmltree = "0.21"
 # armd.wasm (MJCF composition, used by rebot-companion's bundle_export):
 #   cargo rustc --lib --release --target wasm32-unknown-unknown --crate-type cdylib
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+mview-stereo = { path = "crates/mview-stereo" }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws", "json", "http1", "multipart"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -67,6 +68,10 @@ type_complexity = "allow"
 tokio-tungstenite = "0.29"
 reqwest = { version = "0.12", features = ["json"] }
 jpeg-encoder = "0.6"
+
+[workspace]
+members = ["crates/mview-stereo"]
+default-members = [".", "crates/mview-stereo"]
 
 [profile.release]
 lto = "fat"
@@ -100,3 +105,8 @@ opt-level = 3
 [target.'cfg(target_os = "linux")'.dependencies]
 socketcan = { version = "4", default-features = false }
 libc = "0.2"
+
+# The multi-view measurement's image matching (crates/mview-stereo) at opt-level 3: armd itself at
+# opt-level 3 is 34.5 MB instead of 16.4 MB (riscv64, 2026-11-22); this crate alone adds little.
+[profile.release.package.mview-stereo]
+opt-level = 3

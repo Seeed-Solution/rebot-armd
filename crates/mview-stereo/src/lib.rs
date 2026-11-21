@@ -1,4 +1,5 @@
-//! Motion-stereo geometry of the action `measure_multiview` (src/measure_multiview.rs): object
+//! Motion-stereo geometry of armd's action `measure_multiview` (src/measure_multiview.rs, re-exported
+//! there as `armd::mview_stereo`; a crate of its own so that it builds at opt-level 3): object
 //! points triangulated from grayscale images taken at known camera poses. Pure computation, no
 //! I/O; the action runs it in `spawn_blocking`.
 //!
@@ -39,7 +40,9 @@
 //!   [-0.05, `object_min_h_m`] m of the plane are table points (`table_check`).
 use std::time::Instant;
 
-use crate::kinematics::{self, Mat3, Vec3};
+pub mod kinematics;
+
+use kinematics::{Mat3, Vec3};
 
 /// Patch radius at full resolution (9x9 patches).
 pub const PATCH_R: usize = 4;

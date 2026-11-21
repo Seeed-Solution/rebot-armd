@@ -21,7 +21,7 @@ pub mod kinematics;
 #[cfg(not(target_arch = "wasm32"))] pub mod macro_action;
 #[cfg(not(target_arch = "wasm32"))] pub mod measure_multiview;
 #[cfg(not(target_arch = "wasm32"))] pub mod motor_zero;
-#[cfg(not(target_arch = "wasm32"))] pub mod mview_stereo;
+#[cfg(not(target_arch = "wasm32"))] pub use ::mview_stereo;
 pub mod mjcf_compose;
 pub mod model;
 pub mod motion;
