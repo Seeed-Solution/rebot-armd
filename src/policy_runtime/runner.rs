@@ -10,16 +10,17 @@ use serde_json::Value;
 use crate::api::sandbox::validate_pack_id;
 use crate::model::{ArmConfig, JointLimit, PolicyObservation};
 use crate::motion::MotionError;
-use crate::supervisor::{ArmError, ArmSupervisor};
+use crate::supervisor::{ArmError, ArmSupervisor, SupervisorInner};
 
-use super::manifest::{PolicySnapshot, StrictPolicyContract, VisionStalePolicy};
+use super::manifest::{PolicySnapshot, StrictPolicyContract, VideoEmbeddingSpec, VisionStalePolicy};
 use super::release_gate::VerifiedReleaseGate;
 use super::units::{
     denormalize_action_into, normalize_state_into, policy_units_to_rad, rad_to_policy_units,
     JointPermutation,
 };
 use super::vision::{
-    evaluate_vision_frame, PolicyVisionSource, VisionFeatureCollector, VisionStepDecision,
+    embedding_hub_for_supervisor, evaluate_vision_frame, EmbeddingSampleDecision, HubCommitGuard,
+    PolicyVisionSource, VideoEmbeddingHub, VisionFeatureCollector, VisionStepDecision,
 };
 use super::{load_backend, PolicyBackend, PolicyError};
 
@@ -712,6 +713,261 @@ pub fn prepare_policy(dir: &Path, config: &ArmConfig) -> Result<PreparedPolicy, 
     PreparedPolicy::from_backend(snapshot, contract, backend, config)
 }
 
+/// Immutable per-step inference ticket captured before inference and re-verified
+/// synchronously inside the target-commit critical section before emitting any target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferenceTicket {
+    policy_instance_id: u64,
+    lease_generation: u64,
+    producer_epoch: u64,
+    model_generation: Option<u64>,
+    invalidation_generation: u64,
+    clock_handshake_generation: u64,
+    clock_handshake_expires_at_ms: u64,
+    window_newest_deadline_ms: u64,
+    window_oldest_deadline_ms: u64,
+}
+
+impl InferenceTicket {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        policy_instance_id: u64,
+        lease_generation: u64,
+        producer_epoch: u64,
+        model_generation: Option<u64>,
+        invalidation_generation: u64,
+        clock_handshake_generation: u64,
+        clock_handshake_expires_at_ms: u64,
+        window_newest_deadline_ms: u64,
+        window_oldest_deadline_ms: u64,
+    ) -> Self {
+        Self {
+            policy_instance_id,
+            lease_generation,
+            producer_epoch,
+            model_generation,
+            invalidation_generation,
+            clock_handshake_generation,
+            clock_handshake_expires_at_ms,
+            window_newest_deadline_ms,
+            window_oldest_deadline_ms,
+        }
+    }
+
+    pub fn policy_instance_id(&self) -> u64 {
+        self.policy_instance_id
+    }
+
+    pub fn lease_generation(&self) -> u64 {
+        self.lease_generation
+    }
+
+    pub fn producer_epoch(&self) -> u64 {
+        self.producer_epoch
+    }
+
+    pub fn model_generation(&self) -> Option<u64> {
+        self.model_generation
+    }
+
+    pub fn invalidation_generation(&self) -> u64 {
+        self.invalidation_generation
+    }
+
+    pub fn clock_handshake_generation(&self) -> u64 {
+        self.clock_handshake_generation
+    }
+
+    pub fn clock_handshake_expires_at_ms(&self) -> u64 {
+        self.clock_handshake_expires_at_ms
+    }
+
+    pub fn window_newest_deadline_ms(&self) -> u64 {
+        self.window_newest_deadline_ms
+    }
+
+    pub fn window_oldest_deadline_ms(&self) -> u64 {
+        self.window_oldest_deadline_ms
+    }
+
+    pub fn verify(&self, live: &TicketVerificationContext) -> Result<(), TicketViolation> {
+        if live.policy_instance_id != Some(self.policy_instance_id) {
+            return Err(TicketViolation::PolicyInstanceMismatch {
+                expected: self.policy_instance_id,
+                actual: live.policy_instance_id,
+            });
+        }
+        if live.lease_generation != Some(self.lease_generation) {
+            return Err(TicketViolation::LeaseGenerationMismatch {
+                expected: self.lease_generation,
+                actual: live.lease_generation,
+            });
+        }
+        if live.producer_epoch != Some(self.producer_epoch) {
+            return Err(TicketViolation::ProducerEpochMismatch {
+                expected: self.producer_epoch,
+                actual: live.producer_epoch,
+            });
+        }
+        if live.model_generation != self.model_generation {
+            return Err(TicketViolation::ModelGenerationMismatch {
+                expected: self.model_generation,
+                actual: live.model_generation,
+            });
+        }
+        if live.invalidation_generation != self.invalidation_generation {
+            return Err(TicketViolation::InvalidationGenerationMismatch {
+                expected: self.invalidation_generation,
+                actual: live.invalidation_generation,
+            });
+        }
+        if live.clock_handshake_generation != self.clock_handshake_generation {
+            return Err(TicketViolation::ClockHandshakeGenerationMismatch {
+                expected: self.clock_handshake_generation,
+                actual: live.clock_handshake_generation,
+            });
+        }
+        if live.now_armd_ms > self.clock_handshake_expires_at_ms {
+            return Err(TicketViolation::ClockHandshakeExpired {
+                now_ms: live.now_armd_ms,
+                expires_at_ms: self.clock_handshake_expires_at_ms,
+            });
+        }
+        if live.now_armd_ms > self.window_newest_deadline_ms {
+            return Err(TicketViolation::WindowNewestExpired {
+                now_ms: live.now_armd_ms,
+                deadline_ms: self.window_newest_deadline_ms,
+            });
+        }
+        if live.now_armd_ms > self.window_oldest_deadline_ms {
+            return Err(TicketViolation::WindowOldestExpired {
+                now_ms: live.now_armd_ms,
+                deadline_ms: self.window_oldest_deadline_ms,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketVerificationContext {
+    pub policy_instance_id: Option<u64>,
+    pub lease_generation: Option<u64>,
+    pub producer_epoch: Option<u64>,
+    pub model_generation: Option<u64>,
+    pub invalidation_generation: u64,
+    pub clock_handshake_generation: u64,
+    pub now_armd_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TicketViolation {
+    PolicyInstanceMismatch { expected: u64, actual: Option<u64> },
+    LeaseGenerationMismatch { expected: u64, actual: Option<u64> },
+    ProducerEpochMismatch { expected: u64, actual: Option<u64> },
+    ModelGenerationMismatch { expected: Option<u64>, actual: Option<u64> },
+    InvalidationGenerationMismatch { expected: u64, actual: u64 },
+    ClockHandshakeGenerationMismatch { expected: u64, actual: u64 },
+    ClockHandshakeExpired { now_ms: u64, expires_at_ms: u64 },
+    WindowNewestExpired { now_ms: u64, deadline_ms: u64 },
+    WindowOldestExpired { now_ms: u64, deadline_ms: u64 },
+}
+
+impl TicketViolation {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::PolicyInstanceMismatch { .. } => "POLICY_INSTANCE_CHANGED",
+            Self::LeaseGenerationMismatch { .. } => "LEASE_LOST",
+            Self::ProducerEpochMismatch { .. } => "PRODUCER_EPOCH_CHANGED",
+            Self::ModelGenerationMismatch { .. } => "VISION_GENERATION_CHANGED",
+            Self::InvalidationGenerationMismatch { .. } => "WINDOW_INVALIDATED",
+            Self::ClockHandshakeGenerationMismatch { .. } => "HANDSHAKE_MISMATCH",
+            Self::ClockHandshakeExpired { .. } => "HANDSHAKE_EXPIRED",
+            Self::WindowNewestExpired { .. } | Self::WindowOldestExpired { .. } => "VISION_STALE",
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::PolicyInstanceMismatch { expected, actual } => format!(
+                "InferenceTicket policy_instance_id changed mid-inference (expected {expected}, got {actual:?})"
+            ),
+            Self::LeaseGenerationMismatch { expected, actual } => format!(
+                "InferenceTicket lease_generation changed mid-inference (expected {expected}, got {actual:?})"
+            ),
+            Self::ProducerEpochMismatch { expected, actual } => format!(
+                "InferenceTicket producer_epoch changed mid-inference (expected {expected}, got {actual:?})"
+            ),
+            Self::ModelGenerationMismatch { expected, actual } => format!(
+                "InferenceTicket model_generation changed mid-inference (expected {expected:?}, got {actual:?})"
+            ),
+            Self::InvalidationGenerationMismatch { expected, actual } => format!(
+                "InferenceTicket invalidation_generation changed mid-inference (expected {expected}, got {actual})"
+            ),
+            Self::ClockHandshakeGenerationMismatch { expected, actual } => format!(
+                "InferenceTicket clock_handshake_generation changed mid-inference (expected {expected}, got {actual})"
+            ),
+            Self::ClockHandshakeExpired { now_ms, expires_at_ms } => format!(
+                "InferenceTicket clock handshake expired before commit ({now_ms} ms > {expires_at_ms} ms)"
+            ),
+            Self::WindowNewestExpired { now_ms, deadline_ms } => format!(
+                "InferenceTicket window_newest_deadline_ms expired before commit ({now_ms} ms > {deadline_ms} ms)"
+            ),
+            Self::WindowOldestExpired { now_ms, deadline_ms } => format!(
+                "InferenceTicket window_oldest_deadline_ms expired before commit ({now_ms} ms > {deadline_ms} ms)"
+            ),
+        }
+    }
+}
+
+fn active_run_lease_generation(inner: &SupervisorInner, action_id: u64) -> Option<u64> {
+    let run = inner.policy_run.as_ref().filter(|r| r.action_id == action_id)?;
+    let lease_gen = inner.active_lease.as_ref().map(|l| l.generation)?;
+    (run.lease_generation == lease_gen).then_some(lease_gen)
+}
+
+fn verify_ticket_in_critical_section(
+    inner: &SupervisorInner,
+    action_id: u64,
+    ticket: &InferenceTicket,
+    hub_guard: &HubCommitGuard<'_>,
+) -> Result<u64, TicketViolation> {
+    let live_hub = hub_guard.live_ticket_state();
+    let live_lease = active_run_lease_generation(inner, action_id);
+    let ctx = TicketVerificationContext {
+        policy_instance_id: live_hub.policy_instance_id,
+        lease_generation: live_lease,
+        producer_epoch: live_hub.producer_epoch,
+        model_generation: live_hub.model_generation,
+        invalidation_generation: live_hub.invalidation_generation,
+        clock_handshake_generation: live_hub.clock_handshake_generation,
+        now_armd_ms: live_hub.now_armd_ms,
+    };
+    ticket.verify(&ctx)?;
+    Ok(live_hub.now_armd_ms)
+}
+
+fn verify_embedding_release_gate(
+    gate: &VerifiedReleaseGate,
+    emb: &VideoEmbeddingSpec,
+) -> Result<(), String> {
+    if gate.encoder_artifact_sha256() != Some(emb.encoder_artifact_sha256.as_str()) {
+        return Err(format!(
+            "release gate encoder_artifact_sha256 ({:?}) does not match active policy ({})",
+            gate.encoder_artifact_sha256(),
+            emb.encoder_artifact_sha256
+        ));
+    }
+    if gate.preprocess_config_sha256() != Some(emb.preprocess_config_sha256.as_str()) {
+        return Err(format!(
+            "release gate preprocess_config_sha256 ({:?}) does not match active policy ({})",
+            gate.preprocess_config_sha256(),
+            emb.preprocess_config_sha256
+        ));
+    }
+    Ok(())
+}
+
 /// Spawn the async policy runner task that executes inference outside the supervisor lock and
 /// submits targets via `SupervisorInner::policy_step_with_vision`.
 pub fn spawn_policy_runner(
@@ -723,8 +979,9 @@ pub fn spawn_policy_runner(
     vision_source: Option<Arc<dyn PolicyVisionSource>>,
     sandbox: Option<Arc<crate::api::sandbox::SandboxState>>,
 ) -> tokio::task::JoinHandle<()> {
+    let video_embedding_spec = prepared.contract().video_embedding.clone();
     let vision_spec = prepared.contract().vision.clone();
-    if vision_spec.is_some() && vision_source.is_none() {
+    if video_embedding_spec.is_none() && vision_spec.is_some() && vision_source.is_none() {
         return tokio::spawn(async move {
             let mut inner = supervisor.inner().write().await;
             inner.fail_policy_run(
@@ -744,15 +1001,60 @@ pub fn spawn_policy_runner(
     let tokio_dl = deadline.map(tokio::time::Instant::from_std);
 
     tokio::spawn(async move {
-        {
+        struct UnbindGuard {
+            hub: Arc<VideoEmbeddingHub>,
+            action_id: u64,
+        }
+        impl Drop for UnbindGuard {
+            fn drop(&mut self) {
+                self.hub.unbind_policy(self.action_id);
+            }
+        }
+
+        let embedding_hub = video_embedding_spec
+            .as_ref()
+            .map(|_| embedding_hub_for_supervisor(&supervisor));
+
+        let _unbind_guard = {
             let mut inner = supervisor.inner().write().await;
+            if !inner.is_policy_run_active(action_id) {
+                return;
+            }
+            if let (Some(ref emb), Some(gate)) = (
+                &video_embedding_spec,
+                inner.active_policy_release_gate(action_id),
+            ) {
+                if let Err(msg) = verify_embedding_release_gate(gate, emb) {
+                    inner.fail_policy_run(action_id, "RELEASE_GATE_INVALID", msg);
+                    return;
+                }
+            }
             inner.set_policy_max_input_age(action_id, max_policy_input_age_ms(clamped_fps));
             inner.set_policy_period_us(action_id, period_us_for_fps(clamped_fps));
-        }
-        let collector = vision_spec.as_ref().zip(vision_source).map(|(spec, src)| {
-            let wait_ms = (spec.max_staleness_ms / 4).clamp(10, 50);
-            VisionFeatureCollector::start(src, wait_ms)
-        });
+
+            embedding_hub
+                .as_ref()
+                .zip(video_embedding_spec.as_ref())
+                .map(|(hub, spec)| {
+                    hub.bind_policy(action_id, spec.clone(), clamped_fps);
+                    UnbindGuard {
+                        hub: hub.clone(),
+                        action_id,
+                    }
+                })
+        };
+        let emb_run_started_ms = embedding_hub
+            .as_ref()
+            .map_or(0, |h| h.now_armd_ms());
+
+        let collector = if video_embedding_spec.is_none() {
+            vision_spec.as_ref().zip(vision_source).map(|(spec, src)| {
+                let wait_ms = (spec.max_staleness_ms / 4).clamp(10, 50);
+                VisionFeatureCollector::start(src, wait_ms)
+            })
+        } else {
+            None
+        };
         let run_started_at = Instant::now();
         let mut locked_generation: Option<u64> = None;
 
@@ -782,7 +1084,7 @@ pub fn spawn_policy_runner(
                 }
             }
 
-            let (measured, prop_age_range_ms, captured_at) = {
+            let (measured, prop_age_range_ms, captured_at, snap_lease_gen) = {
                 let inner = supervisor.inner().read().await;
                 if !inner.is_policy_run_active(action_id) {
                     break;
@@ -791,12 +1093,54 @@ pub fn spawn_policy_runner(
                     inner.measured_positions.clone(),
                     inner.policy_input_age_range_ms(),
                     Instant::now(),
+                    active_run_lease_generation(&inner, action_id),
                 )
             };
             let base_input_age_ms = prop_age_range_ms.map(|(_, max_prop)| max_prop);
 
-            let (vision_features, vision_captured_at, vision_frame_id) =
-                if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
+            let (vision_features, vision_captured_at, vision_frame_id, emb_ticket, emb_mapped_ms) =
+                if let (Some(emb_spec), Some(hub)) = (&video_embedding_spec, &embedding_hub) {
+                    let Some(lease_gen) = snap_lease_gen else {
+                        let mut inner = supervisor.inner().write().await;
+                        inner.fail_policy_run(
+                            action_id,
+                            "LEASE_LOST",
+                            "Control lease lost or expired before embedding step",
+                        );
+                        break;
+                    };
+                    match hub.sample_window(emb_spec, emb_run_started_ms) {
+                        EmbeddingSampleDecision::Ready(win) => {
+                            let ticket = InferenceTicket::new(
+                                action_id,
+                                lease_gen,
+                                win.producer_epoch,
+                                win.model_generation,
+                                win.invalidation_generation,
+                                win.clock_handshake_generation,
+                                win.clock_handshake_expires_at_ms,
+                                win.window_newest_deadline_ms,
+                                win.window_oldest_deadline_ms,
+                            );
+                            (
+                                Some(win.features),
+                                None,
+                                Some(win.newest_frame_id),
+                                Some(ticket),
+                                Some(win.newest_mapped_at_ms),
+                            )
+                        }
+                        EmbeddingSampleDecision::Hold => {
+                            supervisor.inner().write().await.hold_policy_run(action_id);
+                            continue;
+                        }
+                        EmbeddingSampleDecision::Stop { reason, message } => {
+                            let mut inner = supervisor.inner().write().await;
+                            inner.fail_policy_run(action_id, reason, message);
+                            break;
+                        }
+                    }
+                } else if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
                     let frame = col.latest();
                     let now = Instant::now();
                     let prop_elapsed_ms = now
@@ -822,9 +1166,11 @@ pub fn spawn_policy_runner(
                             vision_age_ms: _,
                             frame_id,
                         } => (
-                            Some(features),
+                            Some(features.to_vec()),
                             frame.as_ref().and_then(|f| f.captured_at),
                             Some(frame_id),
+                            None,
+                            None,
                         ),
                         VisionStepDecision::Hold => {
                             supervisor.inner().write().await.hold_policy_run(action_id);
@@ -837,14 +1183,14 @@ pub fn spawn_policy_runner(
                         }
                     }
                 } else {
-                    (None, None, None)
+                    (None, None, None, None, None)
                 };
 
             let infer_handle = tokio::task::spawn_blocking(move || {
                 let t0 = Instant::now();
                 let res = prepared.step_infer_with_vision(
                     &measured,
-                    vision_features.as_ref().map(|f| f.as_slice()),
+                    vision_features.as_deref(),
                 );
                 let infer_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
                 (prepared, res.map(|t| (t, infer_us)))
@@ -899,69 +1245,93 @@ pub fn spawn_policy_runner(
                     break;
                 }
             }
-            // the commit below runs under this lock without awaiting, so the step time ends here
-            let step_us = step_started_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
-            inner.record_policy_step_timing(action_id, infer_us, step_us);
-            let post_vision_age_ms = if let (Some(spec), Some(vis_cap)) =
-                (&vision_spec, vision_captured_at)
-            {
-                let age_ms = Instant::now()
-                    .saturating_duration_since(vis_cap)
-                    .as_millis()
-                    .min(u64::MAX as u128) as u64;
-                if age_ms > spec.max_staleness_ms {
-                    match spec.on_stale {
-                        VisionStalePolicy::Stop => {
-                            inner.fail_policy_run(
-                                action_id,
-                                "VISION_STALE",
-                                format!(
-                                    "Vision frame became stale before step commit ({age_ms} ms > {} ms)",
-                                    spec.max_staleness_ms
-                                ),
-                            );
-                            break;
-                        }
-                        VisionStalePolicy::Hold => {
-                            inner.hold_policy_run(action_id);
-                            continue;
-                        }
-                    }
+            // Read active deployment context under the supervisor write lock before
+            // acquiring the synchronous hub commit lock (consistent lock order, no `.await`
+            // while holding `HubCommitGuard`).
+            let active_gate = inner.active_policy_release_gate(action_id).cloned();
+            let sandbox_scene_tool = if active_gate.is_some() {
+                match sandbox.as_ref() {
+                    Some(s) => Some(s.active_scene_and_tool().await),
+                    None => None,
                 }
-                Some(age_ms)
             } else {
                 None
             };
-            if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
-                if spec.require_model_generation {
-                    if let Some(latest_frame) = col.latest() {
-                        if latest_frame.model_generation != locked_generation {
-                            let (reason, message) = match latest_frame.model_generation {
-                                None => (
-                                    "VISION_GENERATION_MISSING",
+
+            // Synchronous target-commit checks under the supervisor write lock.
+            let step_us = step_started_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            inner.record_policy_step_timing(action_id, infer_us, step_us);
+
+            let detector_post_vision_age_ms = if video_embedding_spec.is_none() {
+                if let (Some(spec), Some(vis_cap)) = (&vision_spec, vision_captured_at) {
+                    let age_ms = Instant::now()
+                        .saturating_duration_since(vis_cap)
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64;
+                    if age_ms > spec.max_staleness_ms {
+                        match spec.on_stale {
+                            VisionStalePolicy::Stop => {
+                                inner.fail_policy_run(
+                                    action_id,
+                                    "VISION_STALE",
                                     format!(
-                                        "Vision frame {} missing required model_generation before step commit",
-                                        latest_frame.frame_id
+                                        "Vision frame became stale before step commit ({age_ms} ms > {} ms)",
+                                        spec.max_staleness_ms
                                     ),
-                                ),
-                                Some(new_gen) => (
-                                    "VISION_GENERATION_CHANGED",
-                                    format!(
-                                        "Vision model generation changed from {} to {new_gen} before step commit",
-                                        locked_generation
-                                            .map_or_else(|| "none".to_string(), |g| g.to_string())
+                                );
+                                break;
+                            }
+                            VisionStalePolicy::Hold => {
+                                inner.hold_policy_run(action_id);
+                                continue;
+                            }
+                        }
+                    }
+                    Some(age_ms)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if video_embedding_spec.is_none() {
+                if let (Some(spec), Some(col)) = (&vision_spec, &collector) {
+                    if spec.require_model_generation {
+                        if let Some(latest_frame) = col.latest() {
+                            if latest_frame.model_generation != locked_generation {
+                                let (reason, message) = match latest_frame.model_generation {
+                                    None => (
+                                        "VISION_GENERATION_MISSING",
+                                        format!(
+                                            "Vision frame {} missing required model_generation before step commit",
+                                            latest_frame.frame_id
+                                        ),
                                     ),
-                                ),
-                            };
-                            inner.fail_policy_run(action_id, reason, message);
-                            break;
+                                    Some(new_gen) => (
+                                        "VISION_GENERATION_CHANGED",
+                                        format!(
+                                            "Vision model generation changed from {} to {new_gen} before step commit",
+                                            locked_generation
+                                                .map_or_else(|| "none".to_string(), |g| g.to_string())
+                                        ),
+                                    ),
+                                };
+                                inner.fail_policy_run(action_id, reason, message);
+                                break;
+                            }
                         }
                     }
                 }
             }
-            if let Some(gate) = inner.active_policy_release_gate(action_id).cloned() {
-                let (scene_id, tool_id) = match sandbox.as_ref() {
-                    Some(s) => s.active_scene_and_tool().await,
+            if let Some(gate) = active_gate {
+                if let Some(ref emb) = video_embedding_spec {
+                    if let Err(msg) = verify_embedding_release_gate(&gate, emb) {
+                        inner.fail_policy_run(action_id, "RELEASE_GATE_INVALID", msg);
+                        break;
+                    }
+                }
+                let (scene_id, tool_id) = match sandbox_scene_tool {
+                    Some((s, t)) => (s, t),
                     None => (gate.scene_id().to_string(), gate.tool_id().to_string()),
                 };
                 let calibration_digest = inner.active_calibration_digest();
@@ -975,6 +1345,28 @@ pub fn spawn_policy_runner(
                     break;
                 }
             }
+
+            // Final critical-section check (A-R2-1): hold `HubCommitGuard` together with
+            // `inner`, re-verify ALL `InferenceTicket` fields + monotonic deadlines AFTER
+            // calibration hashing / release-gate / deployment checks, and immediately commit
+            // `policy_step_with_vision` with zero intervening work.
+            let _hub_guard = embedding_hub.as_ref().map(|hub| hub.lock_for_commit());
+            let emb_commit_now_ms = if let (Some(ref ticket), Some(ref guard)) = (&emb_ticket, &_hub_guard) {
+                match verify_ticket_in_critical_section(&inner, action_id, ticket, guard) {
+                    Ok(now_ms) => Some(now_ms),
+                    Err(violation) => {
+                        inner.fail_policy_run(action_id, violation.code(), violation.message());
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+            let post_vision_age_ms = if let (Some(now_ms), Some(mapped_ms)) = (emb_commit_now_ms, emb_mapped_ms) {
+                Some(now_ms.saturating_sub(mapped_ms))
+            } else {
+                detector_post_vision_age_ms
+            };
             let input_age_ms = base_input_age_ms.map(|base| {
                 base.saturating_add(captured_at.elapsed().as_millis().min(u64::MAX as u128) as u64)
             });

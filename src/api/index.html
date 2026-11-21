@@ -3257,7 +3257,7 @@ Object.assign(I18N.zh, {
   'task.empty': '还没有记录。外部程序发起动作或取得控制权时会显示在这里。', 'task.lease.acquire': '取得控制权', 'task.lease.release': '释放控制权',
   'task.env.hint': '只读。打开本面板时每 2 秒刷新一次。', 'task.open_poses': '打开点位管理',
   'task.env.sec.sandbox': '策略 / 沙盒', 'task.env.sec.safety': '安全', 'task.env.sec.cell': '工作单元',
-  'task.env.mode': '沙盒模式', 'task.env.scene': '场景', 'task.env.tool': '工具', 'task.env.policy': '策略', 'task.env.pstatus': '策略状态',
+  'task.env.mode': '沙盒模式', 'task.env.scene': '场景', 'task.env.tool': '工具', 'task.env.policy': '策略', 'task.env.pstatus': '策略状态', 'task.env.pvision': '策略视觉输入',
   'task.env.safety': '安全状态', 'task.env.col': '碰撞保护', 'task.env.ml': '运动限制', 'task.env.ko': '禁入区', 'task.env.poses': '已存点位',
   'task.env.col.hold': '触发保持（J{j}）', 'task.env.col.ok': '正常', 'task.env.count': '{n} 个',
   'task.env.na': '不支持', 'task.env.none': '无', 'task.env.loading': '读取中…', 'task.env.updated': '更新于 {t}', 'task.env.err': '读取失败：{list}',
@@ -3274,7 +3274,7 @@ Object.assign(I18N.en, {
   'task.empty': 'Nothing yet. Actions started by external clients and lease changes appear here.', 'task.lease.acquire': 'took control', 'task.lease.release': 'released control',
   'task.env.hint': 'Read-only. Refreshes every 2 s while this panel is open.', 'task.open_poses': 'Open Poses',
   'task.env.sec.sandbox': 'Policy / sandbox', 'task.env.sec.safety': 'Safety', 'task.env.sec.cell': 'Work cell',
-  'task.env.mode': 'Sandbox mode', 'task.env.scene': 'Scene', 'task.env.tool': 'Tool', 'task.env.policy': 'Policy', 'task.env.pstatus': 'Policy status',
+  'task.env.mode': 'Sandbox mode', 'task.env.scene': 'Scene', 'task.env.tool': 'Tool', 'task.env.policy': 'Policy', 'task.env.pstatus': 'Policy status', 'task.env.pvision': 'Policy vision',
   'task.env.safety': 'Safety state', 'task.env.col': 'Collision guard', 'task.env.ml': 'Motion limit', 'task.env.ko': 'Keep-out boxes', 'task.env.poses': 'Saved poses',
   'task.env.col.hold': 'holding after a hit (J{j})', 'task.env.col.ok': 'normal', 'task.env.count': '{n}',
   'task.env.na': 'not supported', 'task.env.none': 'none', 'task.env.loading': 'Loading…', 'task.env.updated': 'Updated {t}', 'task.env.err': 'Failed: {list}',
@@ -12498,6 +12498,11 @@ function tkEnvRows() {
     rows.push(['r', t('task.env.policy'), val(sb.active_policy)]);
     const ps = sb.policy_status ?? (sb.telemetry && typeof sb.telemetry === 'object' ? sb.telemetry.policy_status : undefined);
     rows.push(['r', t('task.env.pstatus'), ps && typeof ps === 'object' ? JSON.stringify(ps) : val(ps)]);
+    const pmVis = (sb.policy_manifest && sb.policy_manifest.vision) || (typeof WASM_SIM !== 'undefined' && WASM_SIM.bundle && WASM_SIM.bundle.policy_manifest && WASM_SIM.bundle.policy_manifest.vision);
+    if (pmVis && pmVis.source === 'video_embedding') {
+      const dim = pmVis.embedding_dim != null && pmVis.history_len != null ? ` (${pmVis.embedding_dim}×${pmVis.history_len})` : '';
+      rows.push(['r', t('task.env.pvision'), 'video_embedding' + dim]);
+    }
   }
   rows.push(['h', t('task.env.sec.safety')]);
   const st = parseState(o.safety_state);

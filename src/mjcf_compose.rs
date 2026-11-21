@@ -972,6 +972,8 @@ pub struct PolicyManifest {
     pub description: String,
     #[serde(default)]
     pub metadata: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<serde_json::Value>,
 }
 // ---------------------------------------------------------------------------
 // Builtin presets (matching sim/mujoco/src/rebot_sim/pack.py verbatim)

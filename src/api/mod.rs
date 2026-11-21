@@ -252,7 +252,7 @@ pub fn create_router_full_with_sandbox(
     let router = router
         .route("/api/v1/action/policy/start", post(rest::action_requires_lease))
         .route("/api/v1/action/policy/stop", post(rest::action_requires_lease));
-    router
+    let router = router
         .route("/api/v1/gripper/calibration", get(rest::get_gripper_calibration))
         .route("/api/v1/grasp/setup", get(rest::get_grasp_setup))
         .route(crate::depth_measure::PATH, post(rest::post_grasp_measure).layer(middleware::from_fn(require_operator)))
@@ -313,7 +313,21 @@ pub fn create_router_full_with_sandbox(
         .route("/api/v1/vision/subscribe/{id}", axum::routing::delete(proxy::delete_vision_subscribe).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/vision/subscribe/{id}/keepalive", post(proxy::post_vision_keepalive).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/vision/subscriptions", get(proxy::get_vision_subscriptions))
-        .route("/api/v1/vision/depth", get(proxy::get_vision_depth).layer(middleware::from_fn(require_operator)))
+        .route("/api/v1/vision/depth", get(proxy::get_vision_depth).layer(middleware::from_fn(require_operator)));
+    #[cfg(feature = "policy-runtime")]
+    let router = router
+        .route(
+            "/api/v1/vision/clock-handshake",
+            post(post_vision_clock_handshake).layer(middleware::from_fn(require_operator)),
+        )
+        .route(
+            "/api/v1/vision/embedding",
+            post(post_vision_embedding).layer(middleware::from_fn(require_operator)),
+        )
+        .layer(axum::Extension(
+            crate::policy_runtime::vision::embedding_hub_for_supervisor(&supervisor),
+        ));
+    router
         .layer(axum::Extension(detector))
         .layer(axum::Extension(proxy::VisionCache::default()))
         .layer(axum::Extension(grasp))
@@ -385,4 +399,148 @@ async fn same_origin(
         ));
     }
     next.run(request).await
+}
+
+#[cfg(feature = "policy-runtime")]
+fn header_forwarded_non_loopback(headers: &axum::http::HeaderMap) -> bool {
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        for part in xff.split(',') {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let ip_str = trimmed
+                .strip_prefix('[')
+                .and_then(|s| s.split(']').next())
+                .unwrap_or_else(|| {
+                    if trimmed.matches(':').count() == 1 {
+                        trimmed.split(':').next().unwrap_or(trimmed)
+                    } else {
+                        trimmed
+                    }
+                });
+            if !ip_str
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+            {
+                return true;
+            }
+        }
+    }
+    if let Some(fwd) = headers.get(axum::http::header::FORWARDED).and_then(|v| v.to_str().ok()) {
+        for elem in fwd.split(',') {
+            for dir in elem.split(';') {
+                if let Some((k, v)) = dir.trim().split_once('=') {
+                    if k.trim().eq_ignore_ascii_case("for") {
+                        let raw = v.trim().trim_matches('"');
+                        let ip_str = raw
+                            .strip_prefix('[')
+                            .and_then(|s| s.split(']').next())
+                            .unwrap_or_else(|| {
+                                if raw.matches(':').count() == 1 {
+                                    raw.split(':').next().unwrap_or(raw)
+                                } else {
+                                    raw
+                                }
+                            });
+                        if !ip_str
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback())
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(feature = "policy-runtime")]
+fn infer_same_host(
+    peer_addr: Option<std::net::SocketAddr>,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    if header_forwarded_non_loopback(headers) {
+        return false;
+    }
+    if let Some(addr) = peer_addr {
+        return addr.ip().is_loopback();
+    }
+    let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return true;
+    };
+    let hostname = host
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.split(']').next())
+        .unwrap_or_else(|| host.trim().split(':').next().unwrap_or(""));
+    hostname.eq_ignore_ascii_case("localhost")
+        || hostname == "127.0.0.1"
+        || hostname == "::1"
+}
+
+#[cfg(feature = "policy-runtime")]
+struct OptionalPeerAddr(Option<std::net::SocketAddr>);
+
+#[cfg(feature = "policy-runtime")]
+impl<S> axum::extract::FromRequestParts<S> for OptionalPeerAddr
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let addr = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0);
+        Ok(Self(addr))
+    }
+}
+
+#[cfg(feature = "policy-runtime")]
+async fn post_vision_clock_handshake(
+    axum::Extension(hub): axum::Extension<
+        Arc<crate::policy_runtime::vision::VideoEmbeddingHub>,
+    >,
+    OptionalPeerAddr(peer_addr): OptionalPeerAddr,
+    headers: axum::http::HeaderMap,
+    axum::Json(req): axum::Json<crate::policy_runtime::vision::ClockHandshakeRequest>,
+) -> Result<
+    axum::Json<crate::policy_runtime::vision::ClockHandshakeResponse>,
+    rest::ApiError,
+> {
+    let socket_same_host = infer_same_host(peer_addr, &headers);
+    hub.clock_handshake(req, socket_same_host)
+        .map(axum::Json)
+        .map_err(|e| {
+            let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_REQUEST);
+            rest::ApiError(status, e.message, e.code.to_string())
+        })
+}
+
+#[cfg(feature = "policy-runtime")]
+async fn post_vision_embedding(
+    axum::Extension(hub): axum::Extension<
+        Arc<crate::policy_runtime::vision::VideoEmbeddingHub>,
+    >,
+    axum::Json(req): axum::Json<crate::policy_runtime::vision::EmbeddingIngestRequest>,
+) -> Result<
+    axum::Json<crate::policy_runtime::vision::EmbeddingIngestResponse>,
+    rest::ApiError,
+> {
+    hub.ingest_embedding(req)
+        .map(axum::Json)
+        .map_err(|e| {
+            let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_REQUEST);
+            rest::ApiError(status, e.message, e.code.to_string())
+        })
 }

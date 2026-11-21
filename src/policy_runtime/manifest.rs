@@ -22,18 +22,22 @@ pub const MAX_POLICY_JSON_BYTES: usize = 4 * 1024 * 1024;
 /// `onnx_resource_budget`.
 pub const MAX_MODEL_BYTES: usize = 8 * 1024 * 1024 + 4096;
 pub const MAX_VISION_STALENESS_MS: u64 = 500;
+pub const MAX_VIDEO_WINDOW_SPAN_MS: u64 = 2000;
+pub const MAX_POLICY_INPUT_WIDTH: usize = 1024;
 pub const DEFAULT_VISION_MIN_SCORE: f32 = 0.3;
 const MAX_ONNX_PROTO_DEPTH: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisionSourceKind {
     Detector,
+    VideoEmbedding,
 }
 
 impl VisionSourceKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Detector => "detector",
+            Self::VideoEmbedding => "video_embedding",
         }
     }
 }
@@ -41,18 +45,21 @@ impl VisionSourceKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VisionLayout {
     Top1BoxNormV1,
+    EmbeddingV1,
 }
 
 impl VisionLayout {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Top1BoxNormV1 => "top1_box_norm_v1",
+            Self::EmbeddingV1 => "embedding_v1",
         }
     }
 
     pub fn feature_dim(self) -> usize {
         match self {
             Self::Top1BoxNormV1 => 6,
+            Self::EmbeddingV1 => 0,
         }
     }
 }
@@ -102,6 +109,55 @@ pub struct VisionFeatureSpec {
     pub require_model_generation: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddingNorm {
+    pub mean: Vec<f32>,
+    pub std: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoEmbeddingSpec {
+    pub embedding_dim: usize,
+    pub history_len: usize,
+    pub max_staleness_ms: u64,
+    pub max_window_span_ms: u64,
+    pub fps_staleness_budget_ms: Option<u64>,
+    pub encoder_artifact_sha256: String,
+    pub preprocess_config_sha256: String,
+    pub embedding_norm: Option<EmbeddingNorm>,
+    pub on_stale: VisionStalePolicy,
+}
+
+impl VideoEmbeddingSpec {
+    pub fn feature_dim(&self) -> usize {
+        self.embedding_dim.saturating_mul(self.history_len)
+    }
+
+    pub fn effective_staleness_ms(&self) -> u64 {
+        match self.fps_staleness_budget_ms {
+            Some(budget) => self.max_staleness_ms.min(budget).min(MAX_VISION_STALENESS_MS),
+            None => self.max_staleness_ms.min(MAX_VISION_STALENESS_MS),
+        }
+    }
+
+    /// Effective newest-frame freshness limit bounded by `fps_staleness_budget_ms` or
+    /// the runner's control-loop period budget (`2000.0 / runner_fps`, clamped to `50..=500 ms`),
+    /// capped at `MAX_VISION_STALENESS_MS` (500 ms).
+    pub fn effective_staleness_ms_for_fps(&self, runner_fps: f64) -> u64 {
+        let budget = match self.fps_staleness_budget_ms {
+            Some(b) => b,
+            None => {
+                if runner_fps.is_finite() && runner_fps > 0.0 {
+                    ((2000.0 / runner_fps).round() as u64).clamp(50, MAX_VISION_STALENESS_MS)
+                } else {
+                    MAX_VISION_STALENESS_MS
+                }
+            }
+        };
+        self.max_staleness_ms.min(budget).min(MAX_VISION_STALENESS_MS)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitMode {
     Rad,
@@ -140,6 +196,7 @@ pub struct StrictPolicyContract {
     pub max_step_rad: Option<f32>,
     pub max_first_step_rad: Option<f32>,
     pub vision: Option<VisionFeatureSpec>,
+    pub video_embedding: Option<VideoEmbeddingSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -354,7 +411,11 @@ pub fn compute_release_digest(
 
 impl StrictPolicyContract {
     pub fn vision_feature_dim(&self) -> usize {
-        self.vision.as_ref().map_or(0, |v| v.layout.feature_dim())
+        if let Some(ref emb) = self.video_embedding {
+            emb.feature_dim()
+        } else {
+            self.vision.as_ref().map_or(0, |v| v.layout.feature_dim())
+        }
     }
 
     pub fn expected_input_dim(&self) -> usize {
@@ -444,7 +505,7 @@ impl StrictPolicyContract {
         let max_step_rad = parse_optional_positive_f32(obj.get("max_step_rad"), "max_step_rad")?;
         let max_first_step_rad =
             parse_optional_positive_f32(obj.get("max_first_step_rad"), "max_first_step_rad")?;
-        let vision = parse_vision_spec(obj.get("vision"))?;
+        let (vision, video_embedding) = parse_vision_section(obj.get("vision"), action_dim)?;
 
         Ok(Self {
             format,
@@ -460,30 +521,62 @@ impl StrictPolicyContract {
             max_step_rad,
             max_first_step_rad,
             vision,
+            video_embedding,
         })
     }
 }
 
-fn parse_vision_spec(val: Option<&Value>) -> Result<Option<VisionFeatureSpec>, PolicyError> {
+fn parse_vision_section(
+    val: Option<&Value>,
+    state_dim: usize,
+) -> Result<(Option<VisionFeatureSpec>, Option<VideoEmbeddingSpec>), PolicyError> {
     let Some(raw) = val else {
-        return Ok(None);
+        return Ok((None, None));
     };
     if raw.is_null() {
-        return Ok(None);
+        return Ok((None, None));
     }
     let obj = raw
         .as_object()
         .ok_or_else(|| PolicyError::InvalidManifest("vision must be a JSON object".into()))?;
 
     let source_raw = require_non_empty_str(obj.get("source"), "vision.source")?;
-    let source = match source_raw.as_str() {
-        "detector" => VisionSourceKind::Detector,
-        other => {
-            return Err(PolicyError::InvalidManifest(format!(
-                "unsupported vision.source {other:?}; must be 'detector'"
-            )));
+    match source_raw.as_str() {
+        "detector" => {
+            let spec = parse_detector_vision_spec(obj)?;
+            let total = state_dim + spec.layout.feature_dim();
+            if total > MAX_POLICY_INPUT_WIDTH {
+                return Err(PolicyError::InvalidManifest(format!(
+                    "unified policy input width ({total}) exceeds budget ({MAX_POLICY_INPUT_WIDTH})"
+                )));
+            }
+            Ok((Some(spec), None))
         }
-    };
+        "video_embedding" => {
+            let emb = parse_video_embedding_spec(obj, state_dim)?;
+            let feat = VisionFeatureSpec {
+                source: VisionSourceKind::VideoEmbedding,
+                layout: VisionLayout::EmbeddingV1,
+                target_label: None,
+                min_score: DEFAULT_VISION_MIN_SCORE,
+                max_staleness_ms: emb.max_staleness_ms,
+                max_sync_skew_ms: emb.max_staleness_ms,
+                on_target_lost: VisionTargetLostPolicy::Hold,
+                on_stale: emb.on_stale,
+                require_model_generation: false,
+            };
+            Ok((Some(feat), Some(emb)))
+        }
+        other => Err(PolicyError::InvalidManifest(format!(
+            "unsupported vision.source {other:?}; must be 'detector' or 'video_embedding'"
+        ))),
+    }
+}
+
+fn parse_detector_vision_spec(
+    obj: &serde_json::Map<String, Value>,
+) -> Result<VisionFeatureSpec, PolicyError> {
+    let source = VisionSourceKind::Detector;
 
     let layout_raw = require_non_empty_str(obj.get("layout"), "vision.layout")?;
     let layout = match layout_raw.as_str() {
@@ -600,7 +693,7 @@ fn parse_vision_spec(val: Option<&Value>) -> Result<Option<VisionFeatureSpec>, P
         })?,
     };
 
-    Ok(Some(VisionFeatureSpec {
+    Ok(VisionFeatureSpec {
         source,
         layout,
         target_label,
@@ -610,7 +703,163 @@ fn parse_vision_spec(val: Option<&Value>) -> Result<Option<VisionFeatureSpec>, P
         on_target_lost,
         on_stale,
         require_model_generation,
-    }))
+    })
+}
+
+fn parse_video_embedding_spec(
+    obj: &serde_json::Map<String, Value>,
+    state_dim: usize,
+) -> Result<VideoEmbeddingSpec, PolicyError> {
+    let layout_raw = require_non_empty_str(obj.get("layout"), "vision.layout")?;
+    if layout_raw != "embedding_v1" {
+        return Err(PolicyError::InvalidManifest(format!(
+            "unsupported vision.layout {layout_raw:?} for video_embedding; must be 'embedding_v1'"
+        )));
+    }
+
+    let embedding_dim_u64 = obj
+        .get("embedding_dim")
+        .and_then(Value::as_u64)
+        .filter(|&d| d >= 1)
+        .ok_or_else(|| {
+            PolicyError::InvalidManifest("vision.embedding_dim must be an integer >= 1".into())
+        })?;
+    let embedding_dim = usize::try_from(embedding_dim_u64).map_err(|_| {
+        PolicyError::InvalidManifest("vision.embedding_dim exceeds platform usize".into())
+    })?;
+
+    let history_len_u64 = obj
+        .get("history_len")
+        .and_then(Value::as_u64)
+        .filter(|&t| t >= 1)
+        .ok_or_else(|| {
+            PolicyError::InvalidManifest("vision.history_len must be an integer >= 1".into())
+        })?;
+    let history_len = usize::try_from(history_len_u64).map_err(|_| {
+        PolicyError::InvalidManifest("vision.history_len exceeds platform usize".into())
+    })?;
+
+    let vision_width = embedding_dim.checked_mul(history_len).ok_or_else(|| {
+        PolicyError::InvalidManifest(format!(
+            "vision.embedding_dim ({embedding_dim}) * vision.history_len ({history_len}) overflows"
+        ))
+    })?;
+    let total_width = state_dim.checked_add(vision_width).ok_or_else(|| {
+        PolicyError::InvalidManifest("unified policy input width overflows".into())
+    })?;
+    if total_width > MAX_POLICY_INPUT_WIDTH {
+        return Err(PolicyError::InvalidManifest(format!(
+            "unified input width state_dim ({state_dim}) + embedding_dim ({embedding_dim}) * history_len ({history_len}) = {total_width} exceeds budget ({MAX_POLICY_INPUT_WIDTH})"
+        )));
+    }
+
+    let max_staleness_ms = obj
+        .get("max_staleness_ms")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            PolicyError::InvalidManifest(format!(
+                "vision.max_staleness_ms must be an integer in 1..={MAX_VISION_STALENESS_MS}"
+            ))
+        })?;
+    if !(1..=MAX_VISION_STALENESS_MS).contains(&max_staleness_ms) {
+        return Err(PolicyError::InvalidManifest(format!(
+            "vision.max_staleness_ms must be in 1..={MAX_VISION_STALENESS_MS}, got {max_staleness_ms}"
+        )));
+    }
+
+    let max_window_span_ms = obj
+        .get("max_window_span_ms")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            PolicyError::InvalidManifest(format!(
+                "vision.max_window_span_ms must be an integer in 1..={MAX_VIDEO_WINDOW_SPAN_MS}"
+            ))
+        })?;
+    if !(1..=MAX_VIDEO_WINDOW_SPAN_MS).contains(&max_window_span_ms) {
+        return Err(PolicyError::InvalidManifest(format!(
+            "vision.max_window_span_ms must be in 1..={MAX_VIDEO_WINDOW_SPAN_MS}, got {max_window_span_ms}"
+        )));
+    }
+    if history_len > 1 && max_window_span_ms < max_staleness_ms {
+        return Err(PolicyError::InvalidManifest(format!(
+            "vision.max_window_span_ms ({max_window_span_ms}) must be >= vision.max_staleness_ms ({max_staleness_ms}) when history_len ({history_len}) > 1"
+        )));
+    }
+
+    let fps_staleness_budget_ms = match obj.get("fps_staleness_budget_ms") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let b = v.as_u64().ok_or_else(|| {
+                PolicyError::InvalidManifest(
+                    "vision.fps_staleness_budget_ms must be an integer >= 1".into(),
+                )
+            })?;
+            if b == 0 {
+                return Err(PolicyError::InvalidManifest(
+                    "vision.fps_staleness_budget_ms must be >= 1".into(),
+                ));
+            }
+            Some(b)
+        }
+    };
+
+    let encoder_artifact_sha256 =
+        require_sha256_hex_manifest(obj.get("encoder_artifact_sha256"), "vision.encoder_artifact_sha256")?;
+    let preprocess_config_sha256 =
+        require_sha256_hex_manifest(obj.get("preprocess_config_sha256"), "vision.preprocess_config_sha256")?;
+
+    let embedding_norm = match obj.get("embedding_norm") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let norm_obj = v.as_object().ok_or_else(|| {
+                PolicyError::InvalidManifest("vision.embedding_norm must be an object".into())
+            })?;
+            let mean_val = norm_obj.get("mean").ok_or_else(|| {
+                PolicyError::InvalidManifest("vision.embedding_norm.mean is required".into())
+            })?;
+            let std_val = norm_obj.get("std").ok_or_else(|| {
+                PolicyError::InvalidManifest("vision.embedding_norm.std is required".into())
+            })?;
+            let mean = parse_f32_vec(mean_val, "vision.embedding_norm.mean", embedding_dim, false)?;
+            let std = parse_f32_vec(std_val, "vision.embedding_norm.std", embedding_dim, true)?;
+            Some(EmbeddingNorm { mean, std })
+        }
+    };
+
+    let on_stale = match obj.get("on_stale") {
+        None | Some(Value::Null) => VisionStalePolicy::Stop,
+        Some(v) => match require_non_empty_str(Some(v), "vision.on_stale")?.as_str() {
+            "hold" => VisionStalePolicy::Hold,
+            "stop" => VisionStalePolicy::Stop,
+            other => {
+                return Err(PolicyError::InvalidManifest(format!(
+                    "unsupported vision.on_stale {other:?}; must be 'hold' or 'stop'"
+                )));
+            }
+        },
+    };
+
+    Ok(VideoEmbeddingSpec {
+        embedding_dim,
+        history_len,
+        max_staleness_ms,
+        max_window_span_ms,
+        fps_staleness_budget_ms,
+        encoder_artifact_sha256,
+        preprocess_config_sha256,
+        embedding_norm,
+        on_stale,
+    })
+}
+
+fn require_sha256_hex_manifest(val: Option<&Value>, label: &str) -> Result<String, PolicyError> {
+    let s = require_non_empty_str(val, label)?;
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(PolicyError::InvalidManifest(format!(
+            "{label} must be a 64-character hex SHA-256 digest"
+        )));
+    }
+    Ok(s.to_ascii_lowercase())
 }
 
 fn validate_lexical_relative_path(rel: &str) -> Result<(), PolicyError> {

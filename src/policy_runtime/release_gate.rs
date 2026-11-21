@@ -59,6 +59,8 @@ pub struct VerifiedReleaseGate {
     max_speed_scale: f64,
     unit_mode: UnitMode,
     action_space: String,
+    encoder_artifact_sha256: Option<String>,
+    preprocess_config_sha256: Option<String>,
 }
 
 impl VerifiedReleaseGate {
@@ -108,6 +110,14 @@ impl VerifiedReleaseGate {
 
     pub fn action_space(&self) -> &str {
         &self.action_space
+    }
+
+    pub fn encoder_artifact_sha256(&self) -> Option<&str> {
+        self.encoder_artifact_sha256.as_deref()
+    }
+
+    pub fn preprocess_config_sha256(&self) -> Option<&str> {
+        self.preprocess_config_sha256.as_deref()
     }
 
     /// Re-verify that this gate still matches the active scene, tool, and calibration digest.
@@ -357,6 +367,27 @@ impl ReleaseGate {
         // `sim_eval` and `prerequisites` above are publisher declarations; they can only
         // reject a gate, never authorize a run on real hardware.
 
+        let (encoder_artifact_sha256, preprocess_config_sha256) =
+            if let Some(ref emb) = contract.video_embedding {
+                let enc = extract_gate_sha256(obj, "encoder_artifact_sha256")?;
+                if enc != emb.encoder_artifact_sha256 {
+                    return Err(PolicyError::ReleaseGate(format!(
+                        "encoder_artifact_sha256 mismatch: gate declares {enc}, policy requires {}",
+                        emb.encoder_artifact_sha256
+                    )));
+                }
+                let prep = extract_gate_sha256(obj, "preprocess_config_sha256")?;
+                if prep != emb.preprocess_config_sha256 {
+                    return Err(PolicyError::ReleaseGate(format!(
+                        "preprocess_config_sha256 mismatch: gate declares {prep}, policy requires {}",
+                        emb.preprocess_config_sha256
+                    )));
+                }
+                (Some(enc), Some(prep))
+            } else {
+                (None, None)
+            };
+
         Ok(VerifiedReleaseGate {
             schema_version,
             authorization_tier,
@@ -370,7 +401,42 @@ impl ReleaseGate {
             max_speed_scale,
             unit_mode: contract.unit_mode,
             action_space,
+            encoder_artifact_sha256,
+            preprocess_config_sha256,
         })
+    }
+}
+
+fn extract_gate_sha256(
+    obj: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<String, PolicyError> {
+    let top = match obj.get(field) {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(require_sha256_hex(v, field)?),
+    };
+    let nested = match obj
+        .get("vision")
+        .and_then(Value::as_object)
+        .and_then(|v| v.get(field))
+    {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(require_sha256_hex(v, &format!("vision.{field}"))?),
+    };
+    match (top, nested) {
+        (Some(t), Some(n)) => {
+            if t != n {
+                return Err(PolicyError::ReleaseGate(format!(
+                    "conflicting {field} ({t}) and vision.{field} ({n})"
+                )));
+            }
+            Ok(t)
+        }
+        (Some(t), None) => Ok(t),
+        (None, Some(n)) => Ok(n),
+        (None, None) => Err(PolicyError::ReleaseGate(format!(
+            "missing required {field} for video_embedding policy"
+        ))),
     }
 }
 
