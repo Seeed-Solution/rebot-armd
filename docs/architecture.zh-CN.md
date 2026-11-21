@@ -103,6 +103,7 @@ armd 不做推理，而是在自身端口下代理检测程序的 HTTP API，使
 | `POST /api/v1/vision/subscribe` | `/api/subscribe` | 创建或更新某个调用方的持续推理（版本 2） |
 | `POST /api/v1/vision/subscribe/{id}/keepalive`、`DELETE /api/v1/vision/subscribe/{id}` | `/api/subscribe/{id}[/keepalive]` | 续期、结束订阅（版本 2） |
 | `GET /api/v1/vision/subscriptions` | `/api/subscriptions` | 有效订阅及实际运行内容（版本 2） |
+| `GET /api/v1/vision/depth` | `/api/depth?wait_ms=2500` | 对新帧做一次深度推理，返回 u16 毫米深度图（模型估计）；需操作员会话，每秒最多一次 |
 | `GET /api/v1/detection/ws`、`/results` | `ws://127.0.0.1:8001/results` | 检测结果流（固定地址） |
 
 状态码和响应体原样透传；上游不可达返回 502。视频不经代理：驾驶舱直接播放相机的 H.264 WebSocket 流（`ws://<host>:8001/`）。reCamera 上的感知服务是套件的 `rebot-vision`（相机自带的 `yolo-detector` 或 `aruco-detector` 也可作为版本 0 的服务）。`rebot-vision`（`kits/recamera-b601dm/vision/`，设计见 [dev_flow_spec_vision_runtime.md](dev_flow_spec_vision_runtime.md)）自 `rebot-teleop` 1.2.0 起包含在安装包内：一个进程占用相机，在同一帧上运行 YOLO（TPU）和 ArUco（CPU）。1.3.0（版本 2）起没有调用方时不做推理：单次触发运行其指定的流水线；持续推理运行所有有效订阅流水线的并集，帧率取请求的最大值并受配置帧率限制。结果始终同时包含 `detections` 和 `markers`。

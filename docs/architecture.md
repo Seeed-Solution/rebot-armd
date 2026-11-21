@@ -142,6 +142,7 @@ cockpit and agents use one origin (`src/api/proxy.rs`, [detection_api.md](detect
 | `POST /api/v1/vision/subscribe` | `/api/subscribe` | start or update a caller's continuous inference (version 2) |
 | `POST /api/v1/vision/subscribe/{id}/keepalive`, `DELETE /api/v1/vision/subscribe/{id}` | `/api/subscribe/{id}[/keepalive]` | keep a subscription alive, end it (version 2) |
 | `GET /api/v1/vision/subscriptions` | `/api/subscriptions` | active subscriptions and what runs (version 2) |
+| `GET /api/v1/vision/depth` | `/api/depth?wait_ms=2500` | one depth inference on a fresh frame as a u16 mm map (model estimate); operator session, at most 1 per second |
 | `GET /api/v1/detection/ws`, `/results` | `ws://127.0.0.1:8001/results` | detection stream (fixed address) |
 
 Status and body pass through; an unreachable upstream gives 502. Video is not proxied: the

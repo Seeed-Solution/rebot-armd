@@ -310,6 +310,7 @@ pub fn create_router_full_with_sandbox(
         .route("/api/v1/vision/subscribe/{id}", axum::routing::delete(proxy::delete_vision_subscribe).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/vision/subscribe/{id}/keepalive", post(proxy::post_vision_keepalive).layer(middleware::from_fn(require_operator)))
         .route("/api/v1/vision/subscriptions", get(proxy::get_vision_subscriptions))
+        .route("/api/v1/vision/depth", get(proxy::get_vision_depth).layer(middleware::from_fn(require_operator)))
         .layer(axum::Extension(detector))
         .layer(axum::Extension(proxy::VisionCache::default()))
         .layer(axum::Extension(grasp))

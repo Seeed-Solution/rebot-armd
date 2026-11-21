@@ -30,6 +30,7 @@ Every `rebot-vision` response body has `"api_version"`: 2 from 1.3.0, 1 in 1.2. 
 | `/api/v1/vision/subscribe/{id}/keepalive` | `POST` | `POST /api/subscribe/{id}/keepalive` | subscription body; 404 when unknown or expired. armd answers 400 for an id that is not `[A-Za-z0-9_-]{1,32}` |
 | `/api/v1/vision/subscribe/{id}` | `DELETE` | `DELETE /api/subscribe/{id}` | `{"deleted":id,"continuous":{...}}`; 404 when unknown |
 | `/api/v1/vision/subscriptions` | `GET` | `GET /api/subscriptions` | list body below |
+| `/api/v1/vision/depth` | `GET` | `GET /api/depth?wait_ms=2500` | One depth inference on a fresh frame, `application/octet-stream` map (see [Depth map](#depth-map--深度图)). Operator session required when armd enforces the operator PIN. 409 unavailable / not metric / busy, 429 + `Retry-After`, 502, 504 |
 
 - Status code and JSON body are passed through unchanged. 状态码和 JSON 原样透传。
 - `mask_focus` (API version 2): sets persistent focus on the grasp target object. `POST /api/v1/detection/mask_focus` takes `{"label"?: string, "box_norm": [x0, y0, x1, y1], "ttl_ms"?: 100..10000}` (default 2000 ms). Empty `{}` or `ttl_ms: 0` clears it. `GET /api/v1/detection/mask_focus` returns the active focus and its remaining TTL. When active, segmentation models decode the matching target box first (IoU >= 0.1) before taking other boxes by score. Detections decoded via mask focus carry `"mask_focus": true`. `POST /api/v1/detection/trigger` also accepts an optional `"mask_focus"` field in its body, applying to that trigger's frame only without persisting.
@@ -196,6 +197,38 @@ Catalogue in `vision.json` (optional) / `vision.json` 中的目录（可选）:
 - Measured on a reCamera (SG2002), 20 cycles det+depth → seg → obb+depth → det+depth (60 swaps, 2026-11-15, rebot-vision md5 39ec34a1): ION per model set identical in every cycle (39.90 / 48.73 / 49.21 MB), back to 0 after exit; internal swap time median 199 ms (→ seg), 511 ms (→ obb+depth), 552 ms (→ det+depth), POST to idle 514–909 ms median. 实机测量（reCamera SG2002，det+depth → seg → obb+depth → det+depth 循环 20 次共 60 次切换，2026-11-15）：每套模型的 ION 每轮完全一致（39.90 / 48.73 / 49.21 MB），退出后回到 0；内部切换耗时中位数 199 ms（→ seg）、511 ms（→ obb+depth）、552 ms（→ det+depth），POST 到空闲中位数 514–909 ms。
 
 The MuJoCo simulator's perception server has the same route and budget numbers (catalogue `seg`, `det`, `depth`; [simulation](simulation.md)). MuJoCo 仿真的感知服务提供同样的路由与预算数值（目录 `seg`、`det`、`depth`）。
+
+## Depth map / 深度图
+
+`GET /api/v1/vision/depth` (armd, operator session required when the operator PIN is enforced, like `POST /api/v1/detection/trigger`) → rebot-vision `GET /api/depth?wait_ms=2500`. rebot-vision registers a depth trigger, so the next camera frame runs the depth stage once (the frame thread owns the only depth stage; a map never runs twice at once and shares a frame with a concurrent depth trigger), and returns that frame's grid. There is no continuous depth mode.
+
+`GET /api/v1/vision/depth`（armd；armd 启用操作员 PIN 时需操作员会话，与 `POST /api/v1/detection/trigger` 相同）→ rebot-vision `GET /api/depth?wait_ms=2500`。rebot-vision 登记一次深度触发，下一帧运行一次深度阶段（深度阶段只有一个且由帧线程独占，深度图请求不会并发运行，并与同时到达的深度触发共用一帧），返回该帧的网格。没有持续深度模式。
+
+The values are the depth model's estimate, not a measurement. On the B601-DM unit (2026-11-21; 48 table samples x 3 shots x 5 poses against the table plane from the validated camera model and hand-eye calibration) the true depth was 0.32-0.45 m and the model reported 0.43-0.55 m: median absolute error 89 mm, median ratio 1.24, slope of reported against true depth about 0 across poses; shot-to-shot repeatability 3-12 mm. The map shows relative structure; do not use it to measure distances.
+
+数值是深度模型的估计，不是测量值。在 B601-DM 实机上（2026-11-21；48 个桌面采样点 x 3 次拍摄 x 5 个姿态，对照由已验证的相机模型与手眼标定得到的桌面平面）真实深度为 0.32-0.45 m，模型给出 0.43-0.55 m：绝对误差中位数 89 mm，比值中位数 1.24，跨姿态的「模型值-真实值」斜率约为 0；同一姿态重复拍摄差异 3-12 mm。深度图只反映相对结构，不要用于测距。
+
+Body (little-endian) / 响应体（小端）:
+
+| Bytes / 字节 | Content / 内容 |
+|---|---|
+| 0..3 | `RDM1` |
+| 4..7 | `n`, u32: length of the JSON header / JSON 头长度 |
+| 8..8+n | JSON header, padded with spaces so the map starts at a multiple of 8 / JSON 头，以空格补齐，使深度数据起始偏移为 8 的倍数 |
+| 8+n.. | `width` x `height` u16, row-major, millimetres; 0 = no depth / 行优先 u16 毫米值，0 表示无深度 |
+
+```json
+{"format":"u16le_mm","width":384,"height":224,"units":"mm","invalid":0,
+ "frame_id":1234,"ts_ms":1763712000123,"inference_ms":173.0,"model":"zipdepth_metric_384x224_bf16_rgb",
+ "scale":{"depth_m":"scale_m / disparity","scale_m":1.3733,"fx":824.0,"fx_width":640},
+ "mapping":{"image_w":640,"image_h":360,"fit":"stretch","x0":0,"y0":0,"x1":640,"y1":360},
+ "stats":{"valid":86016,"min_mm":402,"p2_mm":431,"p50_mm":478,"p98_mm":552,"max_mm":611}}
+```
+
+- `mapping`: the grid is the whole visible image (`image_w` x `image_h`, the image that `detections` are normalised to) resized to `width` x `height` (bilinear, pixel centres aligned; no crop, no letterbox, the aspect ratio is not kept). Cell (i, j) covers image x in [i, i+1) x `image_w` / `width` and y in [j, j+1) x `image_h` / `height`. 网格是整幅可见画面（`image_w` x `image_h`，即 `detections` 归一化所用画面）缩放到 `width` x `height`（双线性，像素中心对齐；不裁剪、不加黑边，不保持宽高比）。单元 (i, j) 覆盖画面 x ∈ [i, i+1) x `image_w` / `width`，y ∈ [j, j+1) x `image_h` / `height`。
+- `scale`: depth_m = `scale_m` / disparity of the model output, with `scale_m` = (`fx` / 640) x 640 / 600 from the current intrinsics (the nominal metric scale armd's grasp code uses before its table fit); values outside 0.02-65 m are 0. `stats`: valid cells and percentiles in mm. `ts_ms`: frame capture time (Unix ms); `inference_ms`: depth stage time. `scale`：深度（米）= `scale_m` / 模型输出视差，`scale_m` = (`fx` / 640) x 640 / 600，取自当前内参（armd 抓取代码在桌面拟合前使用的名义度量比例）；超出 0.02-65 m 的值为 0。`stats`：有效单元数与毫米百分位数。`ts_ms`：帧采集时间（Unix 毫秒）；`inference_ms`：深度阶段耗时。
+- Errors (JSON, passed through by armd) / 错误（JSON，经 armd 原样透传）: 409 `{"error":"depth unavailable"}` (no depth model / 未加载深度模型), 409 `{"error":"depth not metric"}` (relative model loaded / 加载的是相对深度模型), 409 `{"error":"depth busy"}` (another map request is running / 另一深度图请求进行中), 429 `{"error":"depth rate limited","retry_after_ms":n}` with `Retry-After: <s>` (more than one accepted request per second / 每秒超过一次), 503 `{"error":"depth failed"}` (the depth stage failed on the frame / 该帧深度阶段失败), 504 `{"error":"depth timeout"}` (no frame within `wait_ms` / `wait_ms` 内无帧). armd: unreachable 502 `{"error":"detector unreachable"}`, no reply within 3 s 504 `{"error":"detector timed out"}`; 403 `OPERATOR_REQUIRED` without an operator session. armd：不可达 502，3 秒内无回复 504；无操作员会话 403 `OPERATOR_REQUIRED`。
+- Cost: one depth inference (173 ms measured with the resident metric model on 2026-11-21) plus a 344 KB copy of the grid on the frame thread and the mm encoding on the request thread; the body is 172 KB. 开销：一次深度推理（2026-11-21 实测常驻度量模型 173 ms），帧线程复制 344 KB 网格，请求线程做毫米编码；响应体 172 KB。
 
 ## Camera intrinsics / 相机内参
 

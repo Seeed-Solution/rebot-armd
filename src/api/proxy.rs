@@ -197,6 +197,8 @@ impl DetectorUpstream {
 pub(crate) struct UpstreamResponse {
     pub(crate) status: StatusCode,
     pub(crate) content_type: Option<HeaderValue>,
+    /// `Retry-After` of a 429 / 503, passed through to the client.
+    pub(crate) retry_after: Option<HeaderValue>,
     pub(crate) body: Vec<u8>,
 }
 
@@ -267,7 +269,7 @@ fn parse_response(raw: &[u8], eof: bool) -> Option<UpstreamResponse> {
         return None;
     }
     let status = StatusCode::from_u16(parts.next()?.parse().ok()?).ok()?;
-    let (mut content_length, mut chunked, mut content_type) = (None, false, None);
+    let (mut content_length, mut chunked, mut content_type, mut retry_after) = (None, false, None, None);
     for line in lines {
         let Some((k, v)) = line.split_once(':') else { continue };
         let v = v.trim();
@@ -277,6 +279,8 @@ fn parse_response(raw: &[u8], eof: bool) -> Option<UpstreamResponse> {
             chunked = v.to_ascii_lowercase().contains("chunked");
         } else if k.eq_ignore_ascii_case("content-type") {
             content_type = HeaderValue::from_str(v).ok();
+        } else if k.eq_ignore_ascii_case("retry-after") {
+            retry_after = HeaderValue::from_str(v).ok();
         }
     }
     let body = if chunked {
@@ -291,7 +295,7 @@ fn parse_response(raw: &[u8], eof: bool) -> Option<UpstreamResponse> {
     } else {
         return None;
     };
-    Some(UpstreamResponse { status, content_type, body })
+    Some(UpstreamResponse { status, content_type, retry_after, body })
 }
 
 /// Decodes a chunked body; `None` until the terminating zero-size chunk has arrived.
@@ -336,8 +340,13 @@ async fn fetch(
 
 fn passthrough(r: UpstreamResponse) -> Response {
     let ct = r.content_type.unwrap_or_else(|| HeaderValue::from_static("application/json"));
-    (r.status, [(header::CONTENT_TYPE, ct), (header::CACHE_CONTROL, HeaderValue::from_static("no-store"))], r.body)
-        .into_response()
+    let mut resp =
+        (r.status, [(header::CONTENT_TYPE, ct), (header::CACHE_CONTROL, HeaderValue::from_static("no-store"))], r.body)
+            .into_response();
+    if let Some(ra) = r.retry_after {
+        resp.headers_mut().insert(header::RETRY_AFTER, ra);
+    }
+    resp
 }
 
 async fn forward(
@@ -481,6 +490,28 @@ pub async fn post_detection_trigger(
 /// `wait_ms` from a trigger's JSON body, clamped to the upstream cap (the body wins over the query).
 fn trigger_body_wait_ms(body: &[u8]) -> Option<u64> {
     serde_json::from_slice::<serde_json::Value>(body).ok()?.get("wait_ms")?.as_u64().map(|w| w.min(MAX_WAIT_MS))
+}
+
+/// Upstream `/api/depth` waits this long for its frame; armd gives the exchange [`DEPTH_TIMEOUT`].
+const DEPTH_WAIT_MS: u64 = 2500;
+const DEPTH_TIMEOUT: Duration = Duration::from_millis(3000);
+
+/// GET /api/v1/vision/depth -> upstream GET /api/depth?wait_ms=2500: one depth inference on a
+/// fresh frame, returned as rebot-vision's binary millimetre map (`application/octet-stream`,
+/// "RDM1" body, see docs/detection_api.md). Status, body, `Content-Type` and `Retry-After` pass
+/// through (409 unavailable / not metric / busy, 429 more than one per second, 503, 504);
+/// unreachable -> 502, no reply within 3 s -> 504 `{"error":"detector timed out"}`.
+pub async fn get_vision_depth(Extension(up): Extension<DetectorUpstream>) -> Response {
+    let path = format!("/api/depth?wait_ms={DEPTH_WAIT_MS}");
+    match tokio::time::timeout(DEPTH_TIMEOUT, upstream_request(&up, Method::GET, &path, None)).await {
+        Ok(Ok(r)) => passthrough(r),
+        Ok(Err(e)) => {
+            tracing::debug!("detector upstream {path} failed: {e}");
+            detector_unreachable()
+        }
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, axum::Json(serde_json::json!({"error": "detector timed out"})))
+            .into_response(),
+    }
 }
 
 /// Port of rebot-vision's video server, which serves `/snapshot.jpg` (`ARMD_SNAPSHOT_PORT` overrides).
