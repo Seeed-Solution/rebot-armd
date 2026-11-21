@@ -6,20 +6,21 @@
 //!   the reference view, spread by a minimum distance, with separate quotas inside the object box
 //!   and in the margin around it (table).
 //! - Matching: for each feature the ray through it is swept in inverse depth between the planes
-//!   `table_z - DEPTH_BELOW_TABLE_M` and `table_z + max_height_m`; each depth projects into every
-//!   other view (the epipolar segment the known poses give) and scores the mean zero-normalised
-//!   cross-correlation (NCC) of a 9x9 patch. The best depth must score `sweep_min` and pass a ratio
-//!   test against the best separate peak (`(1 - best) <= ratio * (1 - second)`). Each other view
-//!   then refines its match in 2D (sub-pixel, free of the epipolar constraint, so calibration
-//!   errors show in the reprojection error; NCC at least `ncc_min`) and passes a left-right check: its patch swept back
-//!   along its own ray must land within `lr_tol_px` of the feature in the reference view.
+//!   `table_z - DEPTH_BELOW_TABLE_M` and `table_z + max_height_m`; each depth projects into the
+//!   [`SWEEP_VIEWS`] views farthest from the reference (the epipolar segments the known poses
+//!   give) and scores the mean zero-normalised cross-correlation (NCC) of a 9x9 patch. The best
+//!   depth must score `sweep_min` and pass a ratio test against the best separate peak
+//!   (`(1 - best) <= ratio * (1 - second)`). Every other view then refines its match in 2D
+//!   (sub-pixel, free of the epipolar constraint, so calibration errors show in the reprojection
+//!   error; NCC at least `ncc_min`); the swept views also pass a left-right check: their patch
+//!   swept back along their own ray must land within `lr_tol_px` of the feature.
 //! - Triangulation: least-squares midpoint of the rays of all views that matched; points with a
 //!   reprojection error above `reproj_max_px` in any view are dropped.
 //! - Measurement ([`measure`]): points more than `object_min_h_m` above the table plane whose
 //!   reference pixel lies in the object box are object points; the top is the p90 of their
 //!   locally median-filtered heights, the footprint their oriented extent (PCA of x, y, 2nd to
-//!   98th percentile). Points within [-0.05, `object_min_h_m`] m of
-//!   the plane are table points (`table_check`).
+//!   98th percentile). Points within [-0.05, `object_min_h_m`] m of the plane are table points
+//!   (`table_check`).
 use crate::kinematics::{self, Mat3, Vec3};
 
 /// Patch radius (9x9 patches).
@@ -27,6 +28,8 @@ pub const PATCH_R: usize = 4;
 const PATCH_N: usize = (2 * PATCH_R + 1) * (2 * PATCH_R + 1);
 /// The ray sweep starts this far below the table plane (m).
 pub const DEPTH_BELOW_TABLE_M: f64 = 0.03;
+/// Views (besides the reference) the ray sweep and the left-right check use: the farthest ones.
+pub const SWEEP_VIEWS: usize = 2;
 /// Neighbours (the point included) of the local median before the top percentile.
 pub const TOP_NEIGHBOURS: usize = 9;
 /// Table points: at most this far below the plane (m).
@@ -473,12 +476,22 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
     let other_idx: Vec<usize> = (0..views.len()).filter(|i| *i != reference).collect();
     let others: Vec<&View> = other_idx.iter().map(|&i| &views[i]).collect();
     if others.is_empty() { return rec; }
+    // the sweep and the left-right check use the (at most) SWEEP_VIEWS views farthest from the
+    // reference (the widest baselines); the others are matched in 2D at the swept depth and
+    // checked by the reprojection gate. Keeps 4 and 5 views near the cost of 3.
+    let mut by_dist: Vec<usize> = (0..others.len()).collect();
+    by_dist.sort_by(|&a, &b| {
+        let d = |k: usize| kinematics::norm(&kinematics::sub(&others[k].cam.c, &rv.cam.c));
+        d(b).total_cmp(&d(a))
+    });
+    let swept: Vec<usize> = by_dist.into_iter().take(SWEEP_VIEWS).collect();
+    let sweep_views: Vec<&View> = swept.iter().map(|&k| others[k]).collect();
     let feats = corners(&rv.img, region, object_box, p.max_object_features, p.max_table_features, p.min_feature_dist_px);
     rec.stats.features = feats.len();
     for f in feats {
         let px = [f[0] as f64, f[1] as f64];
         let Some(t) = template_int(&rv.img, f[0], f[1]) else { rec.stats.no_peak += 1; continue; };
-        let s = match sweep(&rv.cam, px, &t, &others, p) {
+        let s = match sweep(&rv.cam, px, &t, &sweep_views, p) {
             Ok(s) => s,
             Err(SweepEnd::NoPeak) => { rec.stats.no_peak += 1; continue; }
             Err(SweepEnd::Ambiguous) => { rec.stats.ambiguous += 1; continue; }
@@ -488,10 +501,15 @@ pub fn reconstruct_perturbed(views: &[View], reference: usize, region: [f64; 4],
         let mut cams = vec![rv.cam];
         let mut pxs = vec![perturb(reference, px)];
         let mut lr_fail = false;
-        for (&vi, v) in other_idx.iter().zip(&others) {
+        for (k, (&vi, v)) in other_idx.iter().zip(&others).enumerate() {
             let Some(q0) = v.cam.project(&x0) else { lr_fail = true; break; };
             let Some((q, score)) = refine_2d(&v.img, &t, q0) else { lr_fail = true; break; };
             if score < p.ncc_min { lr_fail = true; break; }
+            if !swept.contains(&k) {
+                cams.push(v.cam);
+                pxs.push(perturb(vi, q));
+                continue;
+            }
             // left-right: this view's patch swept back along its own ray into the reference
             let back = template_bilinear(&v.img, q[0], q[1])
                 .and_then(|tb| sweep(&v.cam, q, &tb, &[rv], p).ok())
