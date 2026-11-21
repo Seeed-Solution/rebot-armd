@@ -50,8 +50,15 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(supervisor): State<Arc<ArmSu
             Err(_) => return (StatusCode::BAD_REQUEST, "obs_hz must be an integer >= 0 (0 and 1 mean 1 Hz; values above control_frequency_hz are clamped)").into_response(),
         },
     };
-    let ws_token = crate::auth::OperatorAuth::extract_token(&headers);
-    ws.on_upgrade(move |socket| handle_socket(socket, supervisor, deps, calib, sandbox, obs_rate, auth, ws_token)).into_response()
+    let explicit_auth = query
+        .get("auth")
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("explicit"));
+    let ws_token = if explicit_auth {
+        None
+    } else {
+        crate::auth::OperatorAuth::extract_token(&headers)
+    };
+    ws.on_upgrade(move |socket| handle_socket(socket, supervisor, deps, calib, sandbox, obs_rate, auth, ws_token, explicit_auth)).into_response()
 }
 
 /// Per-connection observation rate limit.
@@ -431,6 +438,28 @@ fn command_ack(inner: &SupervisorInner, request_id: &Value, started: Started) ->
     ack
 }
 
+fn pose_ack_fields(inner: &SupervisorInner, pose: &crate::poses::NamedPose, revision: u64) -> Vec<(&'static str, Value)> {
+    let default_joint_names = inner
+        .poses
+        .list
+        .joint_names
+        .clone()
+        .unwrap_or_else(|| inner.joint_names());
+    let pose_val = crate::poses::pose_response_value(pose, &default_joint_names);
+    let pose_id = pose_val.get("pose_id").cloned().unwrap_or_else(|| json!(pose.id));
+    let content_sha256 = pose_val.get("content_sha256").cloned().unwrap_or(Value::Null);
+    let joint_names = pose_val.get("joint_names").cloned().unwrap_or_else(|| json!(default_joint_names));
+    let stale = pose_val.get("stale").cloned().unwrap_or(Value::Null);
+    vec![
+        ("pose", pose_val),
+        ("pose_id", pose_id),
+        ("content_sha256", content_sha256),
+        ("joint_names", joint_names),
+        ("stale", stale),
+        ("revision", json!(revision)),
+    ]
+}
+
 /// Atomic persist-before-commit config write (Step 1 prepared under lock, Step 2 staged to
 /// disk without lock under `config_write_lock`, Step 3 prechecked + published + committed under lock).
 enum PreparedConfigWrite {
@@ -576,10 +605,7 @@ impl PreparedConfigWrite {
             }
             Self::PosesSave(p) => {
                 let (pose, revision) = crate::poses::commit_save(inner, p)?;
-                Ok(vec![
-                    ("pose", json!(pose)),
-                    ("revision", json!(revision)),
-                ])
+                Ok(pose_ack_fields(inner, &pose, revision))
             }
             Self::PosesDelete(p) => {
                 let revision = crate::poses::commit_delete(inner, p)?;
@@ -589,10 +615,7 @@ impl PreparedConfigWrite {
             }
             Self::PosesRename(p) => {
                 let (pose, revision) = crate::poses::commit_save(inner, p)?;
-                Ok(vec![
-                    ("pose", json!(pose)),
-                    ("revision", json!(revision)),
-                ])
+                Ok(pose_ack_fields(inner, &pose, revision))
             }
             Self::Sequences(p) => {
                 let (seq, revision) = crate::sequences::commit(inner, p)?;
@@ -611,17 +634,68 @@ impl PreparedConfigWrite {
     }
 }
 
+struct WsAuthState {
+    auth: crate::auth::OperatorAuth,
+    token: Option<String>,
+    explicit_auth: bool,
+    explicit_authed: bool,
+}
+
+#[derive(Clone)]
+struct WsAuth(Arc<std::sync::RwLock<WsAuthState>>);
+
+impl WsAuth {
+    fn new(auth: crate::auth::OperatorAuth, token: Option<String>, explicit_auth: bool) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(WsAuthState {
+            auth,
+            token,
+            explicit_auth,
+            explicit_authed: false,
+        })))
+    }
+
+    fn is_operator(&self) -> bool {
+        let s = self.0.read().unwrap_or_else(|e| e.into_inner());
+        if s.explicit_auth && !s.explicit_authed {
+            return false;
+        }
+        !s.auth.is_enforced() || s.auth.is_operator(s.token.as_deref())
+    }
+
+    fn is_enforced(&self) -> bool {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).auth.is_enforced()
+    }
+
+    fn auth_and_token(&self) -> (crate::auth::OperatorAuth, Option<String>) {
+        let s = self.0.read().unwrap_or_else(|e| e.into_inner());
+        (s.auth.clone(), s.token.clone())
+    }
+
+    fn update_token(&self, token: Option<String>) -> crate::auth::AuthStatus {
+        let mut s = self.0.write().unwrap_or_else(|e| e.into_inner());
+        s.token = token;
+        let status = s.auth.status(s.token.as_deref());
+        if s.explicit_auth {
+            s.explicit_authed = if s.auth.is_enforced() {
+                status.role == crate::auth::Role::Operator
+            } else {
+                true
+            };
+        }
+        status
+    }
+}
+
 /// Check privileged-operations authorization under the supervisor write lock.
 /// Returns `Some(ApiError)` if rejected, `None` if allowed.
 fn check_operator_privilege(
-    auth: &crate::auth::OperatorAuth,
-    ws_token: Option<&str>,
+    ws_auth: &WsAuth,
     inner: &mut SupervisorInner,
     path: &str,
     body: &Value,
     epoch: u64,
 ) -> Option<ApiError> {
-    if !auth.is_enforced() || auth.is_operator(ws_token) {
+    if ws_auth.is_operator() {
         return None;
     }
     match path {
@@ -684,8 +758,8 @@ fn check_operator_privilege(
 /// camera, so it needs an operator session when auth is enforced, like
 /// `/api/v1/dataset/record/*` and `/api/v1/detection/trigger`; the owner can always end a
 /// recording without saving it (`record/stop {save: false}`).
-fn lease_free_operator_check(auth: &crate::auth::OperatorAuth, ws_token: Option<&str>, path: &str, body: &Value) -> Option<ApiError> {
-    if !auth.is_enforced() || auth.is_operator(ws_token) { return None; }
+fn lease_free_operator_check(ws_auth: &WsAuth, path: &str, body: &Value) -> Option<ApiError> {
+    if ws_auth.is_operator() { return None; }
     if path == "/api/v1/record/stop" && body.get("save").and_then(Value::as_bool) == Some(false) { return None; }
     Some(ApiError::operator_required(path))
 }
@@ -761,7 +835,7 @@ fn command_reject(inner: &SupervisorInner, request_id: &Value, error: ApiError) 
     reply
 }
 
-async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: crate::grasp::GraspDeps, calib: crate::calibration::CalibrationDeps, sandbox: Arc<crate::api::sandbox::SandboxState>, obs_rate: Option<ObsRate>, auth: crate::auth::OperatorAuth, ws_token: Option<String>) {
+async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: crate::grasp::GraspDeps, calib: crate::calibration::CalibrationDeps, sandbox: Arc<crate::api::sandbox::SandboxState>, obs_rate: Option<ObsRate>, auth: crate::auth::OperatorAuth, ws_token: Option<String>, explicit_auth: bool) {
     #[cfg(not(feature = "policy-runtime"))]
     let _ = &sandbox;
     let (mut sender, mut receiver) = socket.split();
@@ -819,7 +893,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
     let recv_sandbox = sandbox;
     let mut recv_task = tokio::spawn(async move {
         // the operator session of this connection: from the upgrade request, replaced by `auth` messages
-        let mut ws_token = ws_token;
+        let ws_auth = WsAuth::new(auth, ws_token, explicit_auth);
         let mut client_label: Option<String> = None;
         let mut last_sequence: Option<u64> = None;
         let mut last_request: Option<u64> = None;
@@ -905,8 +979,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
             // (a browser unlocks over REST; reconnecting would drop the lease and park a torqued arm).
             // The token is checked on every privileged use, as from the upgrade request.
             if kind == "auth" {
-                ws_token = value.get("token").and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string);
-                let status = auth.status(ws_token.as_deref());
+                let next_token = value.get("token").and_then(Value::as_str).filter(|t| !t.is_empty()).map(str::to_string);
+                let status = ws_auth.update_token(next_token);
                 let reply = json!({"type":"auth_ack", "seq":value.get("seq"), "auth_enforced":status.auth_enforced,
                     "role":status.role, "expires_in_s":status.expires_in_s});
                 if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
@@ -921,7 +995,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     continue;
                 }
                 last_request = request_id;
-                if let Some(e) = lease_free_operator_check(&auth, ws_token.as_deref(), crate::depth_measure::PATH, &value["body"]) {
+                if let Some(e) = lease_free_operator_check(&ws_auth, crate::depth_measure::PATH, &value["body"]) {
                     let mut reply = rejection(e, "command_reject", recv_supervisor.inner().read().await.safety.epoch_id());
                     reply["request_id"] = value["request_id"].clone();
                     if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
@@ -943,7 +1017,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     continue;
                 }
                 last_request = request_id;
-                if let Some(e) = lease_free_operator_check(&auth, ws_token.as_deref(), value["path"].as_str().unwrap_or(""), &value["body"]) {
+                if let Some(e) = lease_free_operator_check(&ws_auth, value["path"].as_str().unwrap_or(""), &value["body"]) {
                     let mut reply = rejection(e, "command_reject", recv_supervisor.inner().read().await.safety.epoch_id());
                     reply["request_id"] = value["request_id"].clone();
                     if out_tx.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
@@ -1001,7 +1075,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 _ => {
                                     let force = force_val.and_then(Value::as_bool).unwrap_or(false);
                                     if force {
-                                        if auth.is_enforced() && !auth.is_operator(ws_token.as_deref()) {
+                                        if !ws_auth.is_operator() {
                                             let mut reply = json!({
                                                 "type": "lease_rejected",
                                                 "status": 403,
@@ -1105,7 +1179,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 } else {
                                     last_request = request_id;
                                     let path = value.get("path").and_then(Value::as_str).unwrap_or("");
-                                    if let Some(auth_err) = check_operator_privilege(&auth, ws_token.as_deref(), &mut inner, path, &value["body"], epoch) {
+                                    if let Some(auth_err) = check_operator_privilege(&ws_auth, &mut inner, path, &value["body"], epoch) {
                                         response = Some(command_reject(&inner, &value["request_id"], auth_err));
                                     } else if let Some(code) = calibration_busy_code(&inner, path) {
                                         response = Some(command_reject(&inner, &value["request_id"],
@@ -1118,7 +1192,8 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                             Err(e) => Some(calibration_reject(&value["request_id"], &e)),
                                         };
                                     } else if path.starts_with("/api/v1/action/") {
-                                        response = match prepare_action(&mut inner, path, &value["body"], epoch, &value["request_id"], &auth, ws_token.as_deref()) {
+                                        let (auth_snap, token_snap) = ws_auth.auth_and_token();
+                                        response = match prepare_action(&mut inner, path, &value["body"], epoch, &value["request_id"], &auth_snap, token_snap.as_deref()) {
                                             Ok(ActionStart::Started(id, duration)) => Some(command_ack(&inner, &value["request_id"], Some((id, duration)))),
                                             Ok(ActionStart::Plan(plan)) => { pending_plan = Some((plan, local_generation)); None }
                                             Ok(ActionStart::Macro(m)) => { pending_macro = Some((value["request_id"].clone(), m, local_generation)); None }
@@ -1163,7 +1238,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                         path,
                                         &value["body"],
                                         recv_deps.setup_path.as_ref(),
-                                        auth.is_enforced(),
+                                        ws_auth.is_enforced(),
                                     ) {
                                         match result {
                                             Ok(prepared) if !prepared.has_write() => {
@@ -1366,8 +1441,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                     let inline_release_gate = pending.request.release_gate;
                     let policy_live_allowed = pending.policy_live_allowed;
                     let i_am_at_the_arm = pending.request.i_am_at_the_arm;
-                    let auth_c = auth.clone();
-                    let ws_token_c = ws_token.clone();
+                    let ws_auth_c = ws_auth.clone();
                     tokio::spawn(async move {
                         let _load_guard = load_guard;
                         let mut loading_guard = loading_guard;
@@ -1469,7 +1543,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                     json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"EPOCH_MISMATCH", "message":"Epoch changed while loading policy", "error":"EPOCH_MISMATCH", "epoch_id":inner.safety.epoch_id()})
                                 } else if stop_gen_c.load(Ordering::SeqCst) != my_stop_gen {
                                     json!({"type":"command_reject", "request_id":request_id, "status":409, "code":"STOPPED", "message":"Stopped while loading policy", "error":"STOPPED", "epoch_id":inner.safety.epoch_id()})
-                                } else if auth_c.is_enforced() && !inner.policy_live_allowed() && !auth_c.is_operator(ws_token_c.as_deref()) {
+                                } else if !inner.policy_live_allowed() && !ws_auth_c.is_operator() {
                                     // the operator session may have expired or been locked while loading
                                     command_reject(&inner, &request_id, ApiError::operator_required("policy/start (real arm)"))
                                 } else if let Err(err) = speed.check(request_mode) {
@@ -1563,11 +1637,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 // this loop goes on (heartbeats, stop) and the reply comes back through ack_tx.
                 if let Some((request_id, job, generation, epoch, busy)) = pending_calibration.take() {
                     let (sup, calib, conn, gen_now, tx) = (recv_supervisor.clone(), recv_calib.clone(), recv_connection.clone(), recv_generation.clone(), ack_tx.clone());
-                    let auth_c = auth.clone();
-                    let token_c = ws_token.clone();
+                    let ws_auth_c = ws_auth.clone();
                     tokio::spawn(async move {
                         let check: crate::calibration::LeaseCheck = Box::new(move |inner: &mut SupervisorInner| {
-                            if auth_c.is_enforced() && !auth_c.is_operator(token_c.as_deref()) {
+                            if !ws_auth_c.is_operator() {
                                 return Err(crate::calibration::CalibError::new(403, "OPERATOR_REQUIRED", "Operator session expired or locked during calibration"));
                             }
                             if gen_now.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&conn, generation) {
@@ -1606,8 +1679,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                 if let Some((request_id, mut prepared, generation, epoch)) = pending_config_write.take() {
                     let sup = recv_supervisor.clone();
                     let tx = ack_tx.clone();
-                    let auth_c = auth.clone();
-                    let token_c = ws_token.clone();
+                    let ws_auth_c = ws_auth.clone();
                     let conn_c = recv_connection.clone();
                     let gen_now = recv_generation.clone();
                     let op_path = prepared.path();
@@ -1632,7 +1704,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             Ok(Ok(staged)) => {
                                 let (reply_or_ack, dir_sync_opt) = {
                                     let mut inner = sup.inner().write().await;
-                                    if auth_c.is_enforced() && !auth_c.is_operator(token_c.as_deref()) {
+                                    if !ws_auth_c.is_operator() {
                                         staged.abort();
                                         (command_reject(&inner, &request_id, ApiError::operator_required(op_path)), None)
                                     } else if gen_now.load(Ordering::SeqCst) != generation || !inner.validate_servo_lease(&conn_c, generation) {

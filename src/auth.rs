@@ -45,8 +45,167 @@ struct OperatorAuthInner {
     enforced: bool,
     pin: String,
     ttl: Duration,
-    sessions: Mutex<HashMap<String, Instant>>,
-    rate_limit: Mutex<UnlockRateLimit>,
+    public_origin: Option<String>,
+    trust_forwarded_proto: bool,
+    sessions: Arc<Mutex<HashMap<String, Instant>>>,
+    rate_limit: Arc<Mutex<UnlockRateLimit>>,
+}
+
+/// Extracted authentication credential preserving whether `Authorization: Bearer` was present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthCredential {
+    /// Request carried an `Authorization` header (e.g. `Bearer <token>`). Never falls back to Cookie.
+    Bearer(Option<String>),
+    /// No `Authorization` header; request carried a `rebot_op` cookie.
+    Cookie(String),
+    /// Neither `Authorization` nor `rebot_op` cookie was present.
+    None,
+}
+
+/// Normalized `(scheme, host, effective_port)` origin tuple.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginTuple {
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+}
+
+fn default_port(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    }
+}
+
+fn parse_authority(raw: &str, default_scheme: &str) -> Option<(String, u16)> {
+    let default_p = default_port(default_scheme)?;
+    if raw.is_empty()
+        || raw.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        || raw.contains(['/', '?', '#', '@', '\\'])
+    {
+        return None;
+    }
+    if let Some(after_open) = raw.strip_prefix('[') {
+        let close_idx = after_open.find(']')?;
+        let host_raw = &after_open[..close_idx];
+        let ip: std::net::Ipv6Addr = host_raw.parse().ok()?;
+        let rest = &after_open[close_idx + 1..];
+        let port = if rest.is_empty() {
+            default_p
+        } else {
+            let port_str = rest.strip_prefix(':')?;
+            if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let p: u16 = port_str.parse().ok()?;
+            if p == 0 {
+                return None;
+            }
+            p
+        };
+        return Some((ip.to_string(), port));
+    }
+    if raw.contains(['[', ']']) {
+        return None;
+    }
+    if let Some((host_raw, port_str)) = raw.split_once(':') {
+        // Reject unbracketed IPv6 or extra colons
+        if host_raw.is_empty()
+            || port_str.is_empty()
+            || port_str.contains(':')
+            || !port_str.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        let p: u16 = port_str.parse().ok()?;
+        if p == 0 {
+            return None;
+        }
+        Some((host_raw.to_ascii_lowercase(), p))
+    } else {
+        Some((raw.to_ascii_lowercase(), default_p))
+    }
+}
+
+/// Parse an HTTP `Origin` header (`scheme://host[:port]`) into a normalized `(scheme, host, effective_port)`.
+pub fn parse_origin(raw: &str) -> Option<OriginTuple> {
+    let s = raw.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("null") {
+        return None;
+    }
+    let (scheme_raw, rest) = s.split_once("://")?;
+    let scheme = scheme_raw.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return None;
+    }
+    let (host, port) = parse_authority(rest, &scheme)?;
+    Some(OriginTuple { scheme, host, port })
+}
+
+/// Parse an HTTP `Host` header into `(scheme, host, effective_port)` using `scheme`.
+pub fn parse_host_header(raw: &str, scheme: &str) -> Option<OriginTuple> {
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return None;
+    }
+    let (host, port) = parse_authority(raw.trim(), &scheme)?;
+    Some(OriginTuple { scheme, host, port })
+}
+
+/// Validate a request's `Origin` header against `Host` and optional `REBOT_PUBLIC_ORIGIN` override.
+pub fn validate_origin_headers(headers: &HeaderMap, configured_public_origin: Option<&str>) -> bool {
+    let mut origins = headers.get_all(axum::http::header::ORIGIN).iter();
+    let Some(origin_hdr) = origins.next() else {
+        return true;
+    };
+    if origins.next().is_some() {
+        return false;
+    }
+    let Some(origin) = origin_hdr.to_str().ok().and_then(parse_origin) else {
+        return false;
+    };
+
+    let host_hdr = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok());
+
+    let env_origin;
+    let public_raw = match configured_public_origin.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(v) => Some(v),
+        None => {
+            env_origin = std::env::var("REBOT_PUBLIC_ORIGIN").ok();
+            env_origin.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        }
+    };
+
+    if let Some(pub_raw) = public_raw {
+        if pub_raw.eq_ignore_ascii_case("http") || pub_raw.eq_ignore_ascii_case("https") {
+            let expected_scheme = pub_raw.to_ascii_lowercase();
+            return host_hdr
+                .and_then(|h| parse_host_header(h, &expected_scheme))
+                .is_some_and(|expected| expected == origin);
+        }
+        let Some(pub_origin) = parse_origin(pub_raw.trim_end_matches('/')) else {
+            return false;
+        };
+        if origin == pub_origin {
+            return true;
+        }
+        // Allow direct local HTTP Cockpit requests only when Host does not target the configured public origin.
+        return host_hdr
+            .and_then(|h| parse_host_header(h, "http"))
+            .is_some_and(|expected| {
+                let shadows_public = expected.host == pub_origin.host
+                    && (expected.port == pub_origin.port
+                        || (expected.port == 80 && pub_origin.port == 443));
+                expected == origin && !shadows_public
+            });
+    }
+
+    host_hdr
+        .and_then(|h| parse_host_header(h, "http"))
+        .is_some_and(|expected| expected == origin)
 }
 
 /// Shared operator authentication handle used by HTTP routes, WS connections, and `safety/describe`.
@@ -76,11 +235,13 @@ impl OperatorAuth {
             enforced: false,
             pin: String::new(),
             ttl: Duration::from_secs(DEFAULT_TTL_S),
-            sessions: Mutex::new(HashMap::new()),
-            rate_limit: Mutex::new(UnlockRateLimit {
+            public_origin: None,
+            trust_forwarded_proto: false,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit: Arc::new(Mutex::new(UnlockRateLimit {
                 consecutive_failures: 0,
                 locked_until: None,
-            }),
+            })),
         }))
     }
 
@@ -90,12 +251,78 @@ impl OperatorAuth {
             enforced: true,
             pin: pin.into(),
             ttl: Duration::from_secs(ttl_s),
-            sessions: Mutex::new(HashMap::new()),
-            rate_limit: Mutex::new(UnlockRateLimit {
+            public_origin: None,
+            trust_forwarded_proto: false,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit: Arc::new(Mutex::new(UnlockRateLimit {
                 consecutive_failures: 0,
                 locked_until: None,
-            }),
+            })),
         }))
+    }
+
+    /// Override the trusted public origin (otherwise read from `REBOT_PUBLIC_ORIGIN`, defaulting to `http` + `Host`).
+    pub fn with_public_origin(self, origin: Option<String>) -> Self {
+        Self(Arc::new(OperatorAuthInner {
+            enforced: self.0.enforced,
+            pin: self.0.pin.clone(),
+            ttl: self.0.ttl,
+            public_origin: origin,
+            trust_forwarded_proto: self.0.trust_forwarded_proto,
+            sessions: Arc::clone(&self.0.sessions),
+            rate_limit: Arc::clone(&self.0.rate_limit),
+        }))
+    }
+
+    /// Trust `X-Forwarded-Proto` / `Forwarded` headers from a reverse proxy when deriving `; Secure` cookies.
+    pub fn with_trust_forwarded_proto(self, trust: bool) -> Self {
+        Self(Arc::new(OperatorAuthInner {
+            enforced: self.0.enforced,
+            pin: self.0.pin.clone(),
+            ttl: self.0.ttl,
+            public_origin: self.0.public_origin.clone(),
+            trust_forwarded_proto: trust,
+            sessions: Arc::clone(&self.0.sessions),
+            rate_limit: Arc::clone(&self.0.rate_limit),
+        }))
+    }
+
+    pub fn validate_origin(&self, headers: &HeaderMap) -> bool {
+        validate_origin_headers(headers, self.0.public_origin.as_deref())
+    }
+
+    /// Whether `Set-Cookie` should include `; Secure`.
+    /// Only enabled when `public_origin` / `REBOT_PUBLIC_ORIGIN` is HTTPS (and request `Origin`, if present, is not plain `http`)
+    /// OR when trusted-proxy forwarding (`with_trust_forwarded_proto(true)` / `REBOT_TRUST_FORWARDED_PROTO`) is enabled
+    /// and the forwarded headers indicate `https`.
+    pub fn should_set_secure_cookie(&self, headers: &HeaderMap) -> bool {
+        let env_origin;
+        let public_raw = match self.0.public_origin.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(v) => Some(v),
+            None => {
+                env_origin = std::env::var("REBOT_PUBLIC_ORIGIN").ok();
+                env_origin.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            }
+        };
+        if let Some(pub_raw) = public_raw {
+            let pub_is_https = pub_raw.eq_ignore_ascii_case("https")
+                || parse_origin(pub_raw.trim_end_matches('/')).is_some_and(|o| o.scheme == "https");
+            if pub_is_https {
+                let plain_http_origin = headers
+                    .get(axum::http::header::ORIGIN)
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(parse_origin)
+                    .is_some_and(|o| o.scheme == "http");
+                if !plain_http_origin {
+                    return true;
+                }
+            }
+        }
+        let trust_forwarded = self.0.trust_forwarded_proto
+            || std::env::var("REBOT_TRUST_FORWARDED_PROTO")
+                .ok()
+                .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+        trust_forwarded && is_https_forwarded(headers)
     }
 
     pub fn is_enforced(&self) -> bool {
@@ -190,17 +417,25 @@ impl OperatorAuth {
         }
     }
 
-    /// Extract token from `Authorization: Bearer <token>` first, then `Cookie: ...; rebot_op=<token>`.
-    pub fn extract_token(headers: &HeaderMap) -> Option<String> {
-        for value in headers.get_all(axum::http::header::AUTHORIZATION) {
-            if let Ok(s) = value.to_str() {
-                if s.len() > 7 && s[..7].eq_ignore_ascii_case("bearer ") {
-                    let tok = s[7..].trim();
-                    if !tok.is_empty() {
-                        return Some(tok.to_string());
+    /// Extract credential preserving Bearer vs Cookie isolation:
+    /// when any `Authorization` header is present, NEVER fall back to `Cookie`.
+    pub fn extract_credential(headers: &HeaderMap) -> AuthCredential {
+        if headers.contains_key(axum::http::header::AUTHORIZATION) {
+            for value in headers.get_all(axum::http::header::AUTHORIZATION) {
+                if let Ok(s) = value.to_str() {
+                    if s.len() >= 6 && s[..6].eq_ignore_ascii_case("bearer") {
+                        let rest = &s[6..];
+                        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                            let tok = rest.trim();
+                            if !tok.is_empty() {
+                                return AuthCredential::Bearer(Some(tok.to_string()));
+                            }
+                            return AuthCredential::Bearer(None);
+                        }
                     }
                 }
             }
+            return AuthCredential::Bearer(None);
         }
         for value in headers.get_all(axum::http::header::COOKIE) {
             if let Ok(s) = value.to_str() {
@@ -209,14 +444,52 @@ impl OperatorAuth {
                     if let Some(val) = part.strip_prefix(&format!("{SESSION_COOKIE_NAME}=")) {
                         let tok = val.trim();
                         if !tok.is_empty() {
-                            return Some(tok.to_string());
+                            return AuthCredential::Cookie(tok.to_string());
                         }
                     }
                 }
             }
         }
-        None
+        AuthCredential::None
     }
+
+    /// Extract token from `Authorization: Bearer <token>` if an `Authorization` header is present
+    /// (without falling back to `Cookie`), otherwise from `Cookie: ...; rebot_op=<token>`.
+    pub fn extract_token(headers: &HeaderMap) -> Option<String> {
+        match Self::extract_credential(headers) {
+            AuthCredential::Bearer(tok) => tok,
+            AuthCredential::Cookie(tok) => Some(tok),
+            AuthCredential::None => None,
+        }
+    }
+}
+
+fn is_https_forwarded(headers: &HeaderMap) -> bool {
+    for val in headers.get_all("x-forwarded-proto") {
+        if let Ok(s) = val.to_str() {
+            if s.split(',').next().is_some_and(|p| p.trim().eq_ignore_ascii_case("https")) {
+                return true;
+            }
+        }
+    }
+    for val in headers.get_all(axum::http::header::FORWARDED) {
+        if let Ok(s) = val.to_str() {
+            for elem in s.split(',') {
+                for dir in elem.split(';') {
+                    let dir = dir.trim();
+                    if let Some((k, v)) = dir.split_once('=') {
+                        if k.trim().eq_ignore_ascii_case("proto") {
+                            let v = v.trim().trim_matches('"');
+                            if v.eq_ignore_ascii_case("https") {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

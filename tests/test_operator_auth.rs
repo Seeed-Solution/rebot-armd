@@ -149,7 +149,7 @@ async fn auth_endpoints_token_cookie_lock_and_origin() {
         .unwrap();
     assert_eq!(st_cookie["role"], "operator");
 
-    // Lock revokes token and clears cookie
+    // Bearer lock revokes token and does NOT emit Set-Cookie
     let lock_resp = client
         .post(format!("{base}/api/v1/auth/lock"))
         .header(AUTHORIZATION.as_str(), format!("Bearer {token}"))
@@ -157,10 +157,40 @@ async fn auth_endpoints_token_cookie_lock_and_origin() {
         .await
         .unwrap();
     assert_eq!(lock_resp.status(), 200);
-    let lock_cookie = lock_resp.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
-    assert!(lock_cookie.contains("Max-Age=0"), "{lock_cookie}");
+    assert!(lock_resp.headers().get("set-cookie").is_none());
     let lock_body: Value = lock_resp.json().await.unwrap();
     assert_eq!(lock_body["role"], "program");
+
+    // Cookie-only lock revokes cookie session and clears cookie with Max-Age=0
+    let ok2: Value = client
+        .post(format!("{base}/api/v1/auth/unlock"))
+        .json(&json!({"pin": "123456"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let cookie_token = ok2["token"].as_str().unwrap().to_string();
+    let cookie_lock_resp = client
+        .post(format!("{base}/api/v1/auth/lock"))
+        .header(COOKIE.as_str(), format!("rebot_op={cookie_token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cookie_lock_resp.status(), 200);
+    let lock_cookie = cookie_lock_resp.headers().get("set-cookie").unwrap().to_str().unwrap().to_string();
+    assert!(lock_cookie.contains("Max-Age=0"), "{lock_cookie}");
+    let st_cookie_after: Value = client
+        .get(format!("{base}/api/v1/auth/status"))
+        .header(COOKIE.as_str(), format!("rebot_op={cookie_token}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st_cookie_after["role"], "program");
 
     // After lock, token is no longer operator
     let st_after: Value = client
@@ -800,7 +830,7 @@ async fn zero_check_cancelled_before_persist_finishes_leaves_disk_and_memory_unc
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unlock_rate_limit_secure_cookie_and_clear_fault_pending_estop_epoch() {
     let sup = Arc::new(ArmSupervisor::new(ArmConfig::rebot_dm()));
-    let auth = OperatorAuth::enforced("123456", 1800);
+    let auth = OperatorAuth::enforced("123456", 1800).with_trust_forwarded_proto(true);
     let addr = spawn_auth_server(sup.clone(), auth).await;
     let client = reqwest::Client::new();
     let base = format!("http://{addr}");
@@ -842,10 +872,10 @@ async fn unlock_rate_limit_secure_cookie_and_clear_fault_pending_estop_epoch() {
     assert!(set_cookie.contains("; Secure"), "{set_cookie}");
     let tok = ok.json::<Value>().await.unwrap()["token"].as_str().unwrap().to_string();
 
-    // Lock under Forwarded: proto=https also appends ; Secure
+    // Cookie lock under Forwarded: proto=https also appends ; Secure
     let lock_https = client
         .post(format!("{base}/api/v1/auth/lock"))
-        .header(AUTHORIZATION.as_str(), format!("Bearer {tok}"))
+        .header(COOKIE.as_str(), format!("rebot_op={tok}"))
         .header("Forwarded", "for=192.0.2.1;proto=https")
         .send()
         .await

@@ -816,10 +816,31 @@ pub async fn get_keepout(State(supervisor): State<Arc<ArmSupervisor>>) -> Respon
 /// `GET /api/v1/poses`: stored named poses (no lease).
 pub async fn get_poses(State(supervisor): State<Arc<ArmSupervisor>>) -> Response {
     let inner = supervisor.inner().read().await;
-    Json(crate::poses::PoseListResponse {
+    let default_joint_names = inner
+        .poses
+        .list
+        .joint_names
+        .clone()
+        .unwrap_or_else(|| inner.joint_names());
+    let poses: Vec<serde_json::Value> = inner
+        .poses
+        .list
+        .poses
+        .iter()
+        .map(|p| crate::poses::pose_response_value(p, &default_joint_names))
+        .collect();
+    let mut resp = serde_json::to_value(crate::poses::PoseListResponse {
         list: inner.poses.list.clone(),
         revision: inner.poses.revision,
-    }).into_response()
+    })
+    .unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = resp.as_object_mut() {
+        obj.insert("poses".into(), serde_json::Value::Array(poses));
+        if !obj.contains_key("joint_names") {
+            obj.insert("joint_names".into(), serde_json::json!(default_joint_names));
+        }
+    }
+    Json(resp).into_response()
 }
 
 /// `GET /api/v1/safety/collision`: effective collision guard config (scaled thresholds).
@@ -847,6 +868,8 @@ pub async fn get_gripper_calibration(State(supervisor): State<Arc<ArmSupervisor>
 #[derive(Debug, Deserialize)]
 pub struct UnlockRequest {
     pub pin: String,
+    #[serde(default)]
+    pub set_cookie: Option<bool>,
 }
 
 /// `GET /api/v1/auth/status`: current operator auth status (no lease).
@@ -858,35 +881,7 @@ pub async fn auth_status(
     Json(auth.status(token.as_deref()))
 }
 
-fn is_https_forwarded(headers: &axum::http::HeaderMap) -> bool {
-    for val in headers.get_all("x-forwarded-proto") {
-        if let Ok(s) = val.to_str() {
-            if s.split(',').next().is_some_and(|p| p.trim().eq_ignore_ascii_case("https")) {
-                return true;
-            }
-        }
-    }
-    for val in headers.get_all(axum::http::header::FORWARDED) {
-        if let Ok(s) = val.to_str() {
-            for elem in s.split(',') {
-                for dir in elem.split(';') {
-                    let dir = dir.trim();
-                    if let Some((k, v)) = dir.split_once('=') {
-                        if k.trim().eq_ignore_ascii_case("proto") {
-                            let v = v.trim().trim_matches('"');
-                            if v.eq_ignore_ascii_case("https") {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
-/// `POST /api/v1/auth/unlock`: validate operator PIN, issue session token + HttpOnly cookie.
+/// `POST /api/v1/auth/unlock`: validate operator PIN, issue session token + optional HttpOnly cookie.
 pub async fn auth_unlock(
     axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>,
     headers: axum::http::HeaderMap,
@@ -909,30 +904,44 @@ pub async fn auth_unlock(
             "INTERNAL_ERROR".into(),
         ),
     })?;
-    let secure = if is_https_forwarded(&headers) { "; Secure" } else { "" };
-    let cookie = format!(
-        "{}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={expires_in_s}{secure}",
-        crate::auth::SESSION_COOKIE_NAME
-    );
     let mut resp = Json(serde_json::json!({
         "role": "operator",
         "token": token,
         "expires_in_s": expires_in_s,
     })).into_response();
-    if let Ok(val) = axum::http::HeaderValue::from_str(&cookie) {
-        resp.headers_mut().insert(axum::http::header::SET_COOKIE, val);
+    if req.set_cookie != Some(false) {
+        let secure = if auth.should_set_secure_cookie(&headers) { "; Secure" } else { "" };
+        let cookie = format!(
+            "{}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={expires_in_s}{secure}",
+            crate::auth::SESSION_COOKIE_NAME
+        );
+        if let Ok(val) = axum::http::HeaderValue::from_str(&cookie) {
+            resp.headers_mut().insert(axum::http::header::SET_COOKIE, val);
+        }
     }
     Ok(resp)
 }
 
-/// `POST /api/v1/auth/lock`: revoke token from Bearer header or Cookie and clear cookie.
+/// `POST /api/v1/auth/lock`: revoke Bearer session (no cookie clearing) or Cockpit Cookie session (clears cookie).
 pub async fn auth_lock(
     axum::Extension(auth): axum::Extension<crate::auth::OperatorAuth>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let token = crate::auth::OperatorAuth::extract_token(&headers);
-    auth.lock(token.as_deref());
-    let secure = if is_https_forwarded(&headers) { "; Secure" } else { "" };
+    match crate::auth::OperatorAuth::extract_credential(&headers) {
+        crate::auth::AuthCredential::Bearer(tok) => {
+            auth.lock(tok.as_deref());
+            Json(serde_json::json!({"role": "program"})).into_response()
+        }
+        crate::auth::AuthCredential::Cookie(tok) => {
+            auth.lock(Some(&tok));
+            lock_response_clearing_cookie(&auth, &headers)
+        }
+        crate::auth::AuthCredential::None => lock_response_clearing_cookie(&auth, &headers),
+    }
+}
+
+fn lock_response_clearing_cookie(auth: &crate::auth::OperatorAuth, headers: &axum::http::HeaderMap) -> Response {
+    let secure = if auth.should_set_secure_cookie(headers) { "; Secure" } else { "" };
     let clear_cookie = format!(
         "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}",
         crate::auth::SESSION_COOKIE_NAME

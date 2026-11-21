@@ -68,6 +68,42 @@ pub struct PoseList {
     pub poses: Vec<NamedPose>,
 }
 
+/// Compute the canonical SHA-256 hex digest of a pose's identity, joint names, and joint angles.
+pub fn compute_pose_content_sha256(pose_id: &str, joint_names: &[String], joints: &[f64]) -> String {
+    let mut hasher = crate::gravity::Sha256::new();
+    hasher.update(pose_id.as_bytes());
+    hasher.update(&[0x00]);
+    for name in joint_names {
+        hasher.update(name.as_bytes());
+        hasher.update(&[0x00]);
+    }
+    hasher.update(&[0x01]);
+    for &v in joints {
+        let canonical = if v == 0.0 { 0.0_f64 } else { v };
+        hasher.update(&canonical.to_le_bytes());
+    }
+    hasher.finalize_hex()
+}
+
+/// Serialize a [`NamedPose`] enriched with `pose_id`, `content_sha256`, and `joint_names`.
+pub fn pose_response_value(pose: &NamedPose, default_joint_names: &[String]) -> Value {
+    let effective_joint_names: Vec<String> = pose
+        .joint_names
+        .clone()
+        .unwrap_or_else(|| default_joint_names.to_vec());
+    let joints_f64: Vec<f64> = pose.positions.iter().map(|&v| f64::from(v)).collect();
+    let content_sha256 = compute_pose_content_sha256(&pose.id, &effective_joint_names, &joints_f64);
+    let mut val = serde_json::to_value(pose).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("pose_id".into(), Value::String(pose.id.clone()));
+        obj.insert("content_sha256".into(), Value::String(content_sha256));
+        if !obj.contains_key("joint_names") {
+            obj.insert("joint_names".into(), serde_json::json!(effective_joint_names));
+        }
+    }
+    val
+}
+
 /// `GET /api/v1/poses` body (adds `revision` to [`PoseList`]).
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PoseListResponse {
