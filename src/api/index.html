@@ -3713,6 +3713,7 @@ function connectWS() {
     }
     if (!Array.isArray(o.positions)) return;
     S.obs = o; S.obsAt = Date.now(); S.wsCount++;
+    detHoldOnObs(o);
     gcOnObs(o);
     renderMotionLimit(o);
     tkOnObs(o); // after renderMotionLimit: the banner reuses the #ml-chip text
@@ -4376,7 +4377,7 @@ function detApply(data) {
   DET.enabled = VM.subs ? !!(data && OV.on) : !!(data && data.enabled);
   const n = (v) => (Number.isFinite(Number(v)) && v !== null ? Number(v) : null);
   DET.fps = n(data && data.fps); DET.activeFps = n(data && data.active_fps); DET.idleFps = n(data && data.idle_fps);
-  if (DET.avail && !DET.enabled) detClearOverlay();
+  if (DET.avail && !DET.enabled && !detHeld()) detClearOverlay(); // a held single-shot result stays (detHoldOnObs)
   renderDetToggle();
 }
 /* simple mode: recognition popover (#det-ctl) opened from the HUD chip; closes on the chip, an outside tap, a mode switch
@@ -4445,6 +4446,16 @@ function renderDetToggle() {
    GET /detection/latest?wait_ms (newer than the pre-trigger result) -> POST enabled:false.
    A result taken while inference was off stays on screen for SNAP_HOLD_MS. Resolves to the parsed detections. */
 const SNAP_HOLD_MS = 4000;
+// The held result is dropped early when an arm joint (not the gripper) moved more than this from where the
+// shot was taken (the boxes no longer match the camera view), and when the user taps the video.
+const SNAP_MOVE_RAD = 0.01;
+const detHeld = () => performance.now() < (S.detHoldUntil || 0);
+function detHoldOnObs(o) {
+  if (!detHeld()) return;
+  const q0 = S.detHoldQ, q = o.positions;
+  if (!q0) { S.detHoldQ = q.slice(); return; }
+  if (q.some((v, i) => i !== GRIP && i < q0.length && Math.abs(v - q0[i]) > SNAP_MOVE_RAD)) detClearOverlay();
+}
 const TRIG_WAIT_MS = 3000;
 async function detLatest(query) {
   const ctl = new AbortController();
@@ -4515,6 +4526,7 @@ async function triggerDet({ quiet = false, pipelines = null } = {}) {
   if (!DET.avail || DET.busy || DET.snap) return null;
   DET.snap = true; renderDetToggle();
   const wasOn = DET.enabled;
+  const qShot = S.obs && Array.isArray(S.obs.positions) ? S.obs.positions.slice() : null; // arm pose of the shot
   const ctx = { enabledByUs: false, wasOn };
   let parsed = null, err = null, parsedReceivedAt = 0, devAge = null;
   try {
@@ -4558,7 +4570,7 @@ async function triggerDet({ quiet = false, pipelines = null } = {}) {
   if (parsed) {
     S.detections = parsed; S.detSource = 'snapshot'; S.detLastReceivedAt = parsedReceivedAt || performance.now();
     S.detDevAge = devAge;
-    if (!ctx.wasOn) S.detHoldUntil = performance.now() + SNAP_HOLD_MS;
+    if (!ctx.wasOn) { S.detHoldUntil = performance.now() + SNAP_HOLD_MS; S.detHoldQ = qShot; }
     if (!quiet) toast(parsed.length ? t('det.trig.ok', { n: parsed.length }) : t('det.trig.none'), parsed.length ? '' : 'warn');
   } else if (!quiet) toast(t('det.trig.fail'), 'err', err && err.status ? String(err.status) : '');
   renderDetToggle();
@@ -9982,6 +9994,7 @@ $('video-box').addEventListener('click', (e) => {
   const pt = graspVideoPoint(e);
   if (!pt) return;
   if (GR.pickGrip) { graspSetGrip(pt); return; }
+  if (!graspDetOn() && detHeld()) { detClearOverlay(); return; } // tap dismisses a held single-shot result
   if (!graspDetOn() || graspRunningAction() || GR.sending) return;
   const [u, v] = pt;
   const hits = (S.detections || []).filter((d) => !d.aruco && u >= d.x0 && u <= d.x1 && v >= d.y0 && v <= d.y1)

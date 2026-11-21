@@ -10,6 +10,9 @@
 //     hidden and no grip ring is drawn; camera_down false: the value, the pick button and the ring
 //   - vision mode selector: with the provider's global mode "yolo" and this page's overlay off, the
 //     selector reads "Show: Off" (it is this page's overlay, not the device mode)
+//   - Detect once with the overlay off: the boxes stay for SNAP_HOLD_MS (4 s) through the detection state
+//     poll (refreshDetState, which used to clear them), then go; they go at once when an arm joint moves
+//     more than SNAP_MOVE_RAD (not for jitter below it or gripper motion) or the user taps the video
 // Writes PNGs (default .cache/vision-polish-shots/).
 import fs from 'node:fs';
 import http from 'node:http';
@@ -99,7 +102,7 @@ const feed = ([setup, camDown]) => {
     const o = { positions: q.slice(), commanded_positions: q.slice(), velocities: [0, 0, 0, 0, 0, 0, 0], safety_state: 'Armed', enable_state: 'Enabled', is_torqued: true,
       feedback_age_ms: [5, 5, 5, 5, 5, 5, 5], epoch_id: 1, timestamp: performance.now() / 1000, action: null, previous_action: null };
     S.obs = o; S.obsAt = Date.now(); S.state = 'Armed'; S.epoch = 1; S.leaseGeneration = 1;
-    renderActionChip(o); graspOnObs(o);
+    renderActionChip(o); graspOnObs(o); detHoldOnObs(o); // as the observation handler does
     const vh = document.getElementById('vhint'); if (vh) vh.classList.add('hide');
   }, 30);
   // records every grip-ring draw (graspDraw strokes a 9 px arc at the grip pixel)
@@ -128,6 +131,16 @@ const drawer = (page) => page.evaluate(() => {
   return { open: !document.getElementById('gset').hidden, grip: document.getElementById('gset-grip').textContent, pick: vis('gset-grip-pick'),
     hint: document.getElementById('gset-grip-hint').textContent, tilt: document.getElementById('gset-tilt').value, dOverflow: d.scrollWidth > d.clientWidth + 1 };
 });
+// overlay state: detections, hold, and painted pixels of the overlay canvas
+const overlay = (page) => page.evaluate(() => {
+  const c = ov.cv, d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+  let px = 0;
+  for (let i = 3; i < d.length; i += 4) if (d[i] > 0) px++;
+  return { n: S.detections.length, held: detHeld(), px, src: S.detSource };
+});
+const shoot = async (page) => {
+  await openVis(page); await page.click('#btn-trigger'); await page.waitForTimeout(250); await closeVis(page); await page.waitForTimeout(100);
+};
 const rings = async (page) => { await page.evaluate(() => { window.__rings = 0; }); await page.waitForTimeout(300); return page.evaluate(() => window.__rings); };
 
 const combos = [];
@@ -186,6 +199,35 @@ for (const [ui, lang, vp] of combos) {
   await page.click('#gset-close'); await page.waitForTimeout(100);
   await page.evaluate(() => { window.__camDown = true; graspLoadSetup(true); });
   await page.waitForTimeout(150);
+
+  // 4. Detect once: held, survives the detection state poll, gone after 4 s
+  await shoot(page);
+  let o = await overlay(page);
+  check(`${tag} single shot shown`, V.trig === 1 && o.n === 1 && o.held && o.px > 200 && o.src === 'snapshot', JSON.stringify(o));
+  file = path.join(out, `detect_once_${tag}.png`); await page.screenshot({ path: file }); shots.push(file);
+  console.log(`${tag}  detect once n=${o.n} held=${o.held} px=${o.px}`);
+  await page.evaluate(() => refreshDetState()); await page.waitForTimeout(1500);
+  o = await overlay(page);
+  check(`${tag} kept through the state poll (1.8 s)`, o.n === 1 && o.held && o.px > 200, JSON.stringify(o));
+  await page.evaluate(() => { window.__q[0] += 0.003; window.__q[6] += 0.5; }); await page.waitForTimeout(200);
+  o = await overlay(page);
+  check(`${tag} kept through jitter and gripper motion`, o.n === 1 && o.held && o.px > 200, JSON.stringify(o));
+  await page.waitForTimeout(2600);
+  o = await overlay(page);
+  check(`${tag} gone after 4 s`, !o.held && o.px === 0, JSON.stringify(o));
+
+  // arm motion drops it
+  await shoot(page);
+  await page.evaluate(() => { window.__q[1] += 0.02; }); await page.waitForTimeout(200);
+  o = await overlay(page);
+  check(`${tag} cleared by arm motion`, o.n === 0 && !o.held && o.px === 0, JSON.stringify(o));
+
+  // a tap on the video dismisses it
+  await shoot(page);
+  const tap = await page.evaluate(() => { const r = document.getElementById('video-box').getBoundingClientRect(); const c = getVideoContentRect(r.width, r.height); return [r.left + c.x + 0.62 * c.w, r.top + c.y + 0.55 * c.h]; });
+  await page.mouse.click(tap[0], tap[1]); await page.waitForTimeout(150);
+  o = await overlay(page);
+  check(`${tag} dismissed by a tap`, o.n === 0 && !o.held && o.px === 0, JSON.stringify(o));
 
   check(`${tag} page errors`, errs.length === 0, [...new Set(errs)].join(' | ').slice(0, 300));
   await ctx.close();
