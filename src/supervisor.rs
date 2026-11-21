@@ -6454,3 +6454,7 @@ impl ArmSupervisor {
         self.inner.read().await.gripper_calibration_response()
     }
 }
+
+#[cfg(test)]
+#[path = "supervisor_servo_order_tests.rs"]
+mod servo_order_tests;
