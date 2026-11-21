@@ -30,9 +30,12 @@
 //!   0.5 of the offset on either side; when all are refused the action fails with the refusal code.
 //! - Times: `measurement.stats` carries the stage times of the reconstruction and `decode_ms`
 //!   (all views); every view its own `decode_ms`.
-//! - Capture: settle >= [`MIN_SETTLE_S`] after the motion settled, joints still, discard
-//!   [`DISCARD_SNAPSHOTS`] snapshots, then one snapshot and one YOLO trigger (a frame newer than
-//!   the request); the joints must not move during the capture (`MOVED`).
+//! - Capture: after the motion settled, [`MIN_SETTLE_S`], then the settle rule ([`is_still`] over a
+//!   sliding window, until [`MAX_SETTLE_S`], else `NOT_SETTLED`); discard [`DISCARD_SNAPSHOTS`]
+//!   snapshots; then a snapshot bracketed by joint samples ([`BRACKET_LEAD`] before the request and
+//!   after the reply). The view's pose is the FK of the bracket's mean joints; a bracket that moved
+//!   more than [`BRACKET_RAD`] is retried, at most [`SNAPSHOT_TRIES`] times, then `MOVED`. Then one
+//!   YOLO trigger (a frame newer than the request) for the target box.
 //! - A fault, collision, torque limit, stop, E-stop or lease loss ends the action where the arm is
 //!   (the supervisor ends it; [`recheck`] between steps). A measurement failure after motion
 //!   ([`RETURN_AFTER`], `TOO_FEW_POINTS`) returns to the start joints first when `return_to_start`.
@@ -77,8 +80,25 @@ pub const RETURN_AFTER: [&str; 8] = ["TARGET_LOST", "DETECTION_UNAVAILABLE", "UN
 pub const MIN_FRAME_MARGIN_PX: f64 = 8.0;
 /// The two farthest view offsets must stay at least this far apart (m) after fallbacks.
 pub const MIN_EFFECTIVE_BASELINE_M: f64 = 0.02;
-/// Every arm joint within this of the settled position during a capture (rad).
-pub const STILL_RAD: f32 = 0.003;
+/// Settle check after [`MIN_SETTLE_S`]: a window of [`STILL_WINDOW`] joint samples
+/// [`STILL_SAMPLE`] apart is still when, for every arm joint, the median |velocity| is at most
+/// [`STILL_VEL`] and the position range at most [`STILL_RANGE_RAD`]. Windows slide until
+/// [`MAX_SETTLE_S`] after the motion, then `NOT_SETTLED`. (Real B601-DM, 2026-11-22: after a
+/// joint move at speed_scale 0.3 the joints creep 2-4 mrad over seconds and J4 / J5 can hold a
+/// limit cycle of a few mrad; single |velocity| samples reach 0.037 rad/s.)
+pub const STILL_WINDOW: usize = 10;
+pub const STILL_SAMPLE: Duration = Duration::from_millis(20);
+pub const STILL_VEL: f32 = 0.03;
+pub const STILL_RANGE_RAD: f32 = 0.003;
+pub const MAX_SETTLE_S: f64 = 4.0;
+/// The snapshot's pose: the joints sampled [`BRACKET_LEAD`] before the snapshot request and right
+/// after its reply, averaged. When any arm joint differs by more than [`BRACKET_RAD`] between the
+/// two, the snapshot is retried [`SNAPSHOT_GAP_RETRY`] later, at most [`SNAPSHOT_TRIES`] times,
+/// then `MOVED`.
+pub const BRACKET_LEAD: Duration = Duration::from_millis(100);
+pub const BRACKET_RAD: f32 = 0.002;
+pub const SNAPSHOT_TRIES: usize = 3;
+pub const SNAPSHOT_GAP_RETRY: Duration = Duration::from_millis(500);
 pub const FEEDBACK_MAX_AGE: Duration = Duration::from_millis(250);
 /// A view's target detection: centre at most this far (normalised image units) from where the
 /// start view saw it, moved by the shift of the look-at point in that view.
@@ -189,6 +209,7 @@ pub fn parse_request(body: &Value) -> Result<Request, ArmError> {
         Some(Value::Bool(b)) => *b,
         Some(_) => return Err(invalid("return_to_start must be a boolean")),
     };
+
     Ok(Request {
         label,
         min_score: num(o, "min_score", 0.3, 0.0, 1.0)?,
@@ -341,7 +362,8 @@ pub fn prepare(inner: &SupervisorInner, body: &Value, epoch: u64) -> Result<Plan
     // bound: per view one joint move (up to 2 rad at the slowest planning speed), settle, captures
     let vmin = inner.planning_limits().iter().take(inner.config.arm_dof()).map(|l| l.max_velocity).fold(f32::INFINITY, f32::min).max(0.05);
     let move_s = 2.0 / (f64::from(vmin) * request.speed_scale) + crate::motion::SETTLE_MAX_S;
-    let capture_s = MIN_SETTLE_S + (DISCARD_SNAPSHOTS + 1) as f64 * 3.5 + TRIGGERS as f64 * (TRIGGER_WAIT_MS as f64 / 1000.0 + 2.0);
+    let capture_s = MAX_SETTLE_S + DISCARD_SNAPSHOTS as f64 * 3.5 + SNAPSHOT_TRIES as f64 * (3.5 + SNAPSHOT_GAP_RETRY.as_secs_f64())
+        + TRIGGERS as f64 * (TRIGGER_WAIT_MS as f64 / 1000.0 + 2.0);
     let moves = request.views + 1 + 2 * FALLBACK_SCALES.len();
     let deadline_s = moves as f64 * move_s + request.views as f64 * capture_s + 30.0;
     Ok(Plan {
@@ -385,11 +407,50 @@ async fn recheck(ctx: &MacroCtx, plan: &Plan) -> Result<(), Stop> {
     Ok(())
 }
 
-/// Measured joints and whether every arm joint is still.
-async fn measured(ctx: &MacroCtx) -> (Vec<f32>, bool) {
+/// Measured joints (all) and velocities (arm joints).
+async fn sample(ctx: &MacroCtx) -> (Vec<f32>, Vec<f32>) {
     let inner = ctx.sup.inner().read().await;
-    let still = inner.config.arm_joint_indices().iter().all(|&i| inner.measured_velocities.get(i).is_none_or(|v| v.abs() <= 0.02));
-    (inner.measured_positions.clone(), still)
+    let arm = inner.config.arm_joint_indices();
+    (inner.measured_positions.clone(), arm.iter().map(|&i| inner.measured_velocities.get(i).copied().unwrap_or(0.0)).collect())
+}
+
+/// Wait until the arm is still (see [`STILL_WINDOW`]): `MIN_SETTLE_S`, then sliding windows until
+/// `MAX_SETTLE_S`. Returns the seconds it took.
+async fn settle(ctx: &MacroCtx, plan: &Plan) -> Result<f64, Stop> {
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs_f64(MIN_SETTLE_S);
+    while Instant::now() < until {
+        ctx.check().await?;
+        tokio::time::sleep(POLL).await;
+    }
+    recheck(ctx, plan).await?;
+    let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
+    let mut win: std::collections::VecDeque<(Vec<f32>, Vec<f32>)> = std::collections::VecDeque::new();
+    loop {
+        ctx.check().await?;
+        win.push_back(sample(ctx).await);
+        if win.len() > STILL_WINDOW { win.pop_front(); }
+        if win.len() == STILL_WINDOW && is_still(&win, &arm) { return Ok(t0.elapsed().as_secs_f64()); }
+        if t0.elapsed().as_secs_f64() > MAX_SETTLE_S {
+            return Err(fail("NOT_SETTLED", format!("the arm did not come to rest within {MAX_SETTLE_S} s (median |velocity| <= {STILL_VEL} rad/s and range <= {STILL_RANGE_RAD} rad over {STILL_WINDOW} samples)")));
+        }
+        tokio::time::sleep(STILL_SAMPLE).await;
+    }
+}
+
+/// The settle rule over a window of (positions, arm velocities) samples.
+pub fn is_still(win: &std::collections::VecDeque<(Vec<f32>, Vec<f32>)>, arm: &[usize]) -> bool {
+    arm.iter().enumerate().all(|(k, &j)| {
+        let mut v: Vec<f32> = win.iter().map(|s| s.1.get(k).copied().unwrap_or(0.0).abs()).collect();
+        v.sort_by(f32::total_cmp);
+        let (lo, hi) = win.iter().filter_map(|s| s.0.get(j)).fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
+        v[v.len() / 2] <= STILL_VEL && hi - lo <= STILL_RANGE_RAD
+    })
+}
+
+/// Largest difference of the arm joints between two samples (rad).
+pub fn bracket_spread(a: &[f32], b: &[f32], arm: &[usize]) -> f32 {
+    arm.iter().map(|&i| (a.get(i).copied().unwrap_or(0.0) - b.get(i).copied().unwrap_or(0.0)).abs()).fold(0.0, f32::max)
 }
 
 /// One view's capture.
@@ -404,44 +465,63 @@ struct Capture {
     /// the predicted target box to the image border (px).
     shift_px: [f64; 2],
     margin_px: f64,
+    /// Joints of the pose (bracket mean), the bracket samples, the bracket spread of every
+    /// snapshot try (rad) and the settle time (s).
+    joints: Vec<f32>,
+    bracket: [Vec<f32>; 2],
+    snapshot_tries: Vec<f32>,
+    settle_s: f64,
 }
 
 fn source_fail(e: impl std::fmt::Display) -> Stop { fail("DETECTION_UNAVAILABLE", e.to_string()) }
 
-/// Settle, discard snapshots, take a snapshot and a detection at still joints.
+/// Settle, discard snapshots, take a snapshot bracketed by joint samples (retried while the
+/// bracket moved), then a detection. The pose is the FK of the bracket's mean joints.
 async fn capture(ctx: &MacroCtx, plan: &Plan, src: &dyn DetectionSource, offset: [f64; 2], shift_px: [f64; 2], margin_px: f64) -> Result<Capture, Stop> {
-    let until = Instant::now() + Duration::from_secs_f64(MIN_SETTLE_S);
-    while Instant::now() < until {
-        ctx.check().await?;
-        tokio::time::sleep(POLL).await;
-    }
-    recheck(ctx, plan).await?;
-    let (settled, still) = measured(ctx).await;
-    if !still { return Err(fail("NOT_SETTLED", "the arm is still moving after the settle time")); }
+    let settle_s = settle(ctx, plan).await?;
     for _ in 0..DISCARD_SNAPSHOTS {
         src.snapshot_jpeg().await.map_err(|e| source_fail(format!("snapshot: {e}")))?;
         tokio::time::sleep(SNAPSHOT_GAP).await;
         ctx.check().await?;
     }
-    let jpeg = src.snapshot_jpeg().await.map_err(|e| source_fail(format!("snapshot: {e}")))?;
+    let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
+    let mut tries = Vec::new();
+    let mut got = None;
+    for k in 0..SNAPSHOT_TRIES {
+        if k > 0 { tokio::time::sleep(SNAPSHOT_GAP_RETRY).await; }
+        recheck(ctx, plan).await?;
+        let (a, _) = sample(ctx).await;
+        tokio::time::sleep(BRACKET_LEAD).await;
+        let jpeg = src.snapshot_jpeg().await.map_err(|e| source_fail(format!("snapshot: {e}")))?;
+        let (b, _) = sample(ctx).await;
+        let spread = bracket_spread(&a, &b, &arm);
+        tries.push(spread);
+        if spread <= BRACKET_RAD {
+            let mean: Vec<f32> = a.iter().zip(&b).map(|(x, y)| 0.5 * (x + y)).collect();
+            got = Some((jpeg, mean, a, b));
+            break;
+        }
+    }
+    let Some((jpeg, joints, bracket_a, bracket_b)) = got else {
+        let mrad: Vec<String> = tries.iter().map(|t| format!("{:.1}", t * 1000.0)).collect();
+        return Err(fail("MOVED", format!("the arm moved during {SNAPSHOT_TRIES} snapshots (largest joint change across each snapshot: {} mrad, limit {:.1})", mrad.join(", "), BRACKET_RAD * 1000.0)));
+    };
     let mut frame = None;
     for _ in 0..TRIGGERS {
         ctx.check().await?;
         if let Some(f) = src.trigger(YOLO, TRIGGER_WAIT_MS).await.map_err(|e| source_fail(format!("trigger: {e}")))? { frame = Some(f); break; }
     }
     let mut frame = frame.ok_or_else(|| fail("DETECTION_UNAVAILABLE", format!("no detection frame in {TRIGGERS} triggers")))?;
-    let (joints, still) = measured(ctx).await;
-    let arm = { ctx.sup.inner().read().await.config.arm_joint_indices() };
-    if !still || arm.iter().any(|&i| (joints[i] - settled[i]).abs() > STILL_RAD) { return Err(fail("MOVED", "the arm moved during the capture")); }
     recheck(ctx, plan).await?;
-    let pose = { ctx.sup.inner().read().await.config.arm_model.fk_f32(&settled) }
+    let pose = { ctx.sup.inner().read().await.config.arm_model.fk_f32(&joints) }
         .ok_or_else(|| fail("INTERNAL", "no FK pose for the measured joints"))?;
     grasp::rescale_frame_to_cam(&mut frame, &plan.cam);
     let size = plan.cam.size;
     let (img, decode_ms) = tokio::task::spawn_blocking(move || { let t0 = Instant::now(); let r = decode_frame(&jpeg, size); (r, t0.elapsed().as_secs_f64() * 1000.0) }).await
         .map_err(|e| fail("INTERNAL", format!("decode task failed: {e}")))?;
     let img = img.map_err(|e| fail("DETECTION_UNAVAILABLE", e))?;
-    Ok(Capture { offset, pose, img, frame_id: frame.frame_id, detections: frame.detections, decode_ms, shift_px, margin_px })
+    Ok(Capture { offset, pose, img, frame_id: frame.frame_id, detections: frame.detections, decode_ms, shift_px, margin_px,
+        joints, bracket: [bracket_a, bracket_b], snapshot_tries: tries, settle_s })
 }
 
 fn label_ok(d: &Detection, label: Option<&str>) -> bool { label.is_none_or(|l| d.label.eq_ignore_ascii_case(l)) }
@@ -517,6 +597,10 @@ fn measurement_value(plan: &Plan, caps: &[Capture], target: &Detection, result: 
         "tcp": {"xyz_m": c.pose.p.map(r4), "quat_wxyz": kinematics::r_to_quat(&c.pose.r)},
         "frame_id": c.frame_id, "offset_m": c.offset.map(r4),
         "predicted_shift_px": c.shift_px.map(r1), "frame_margin_px": r1(c.margin_px), "decode_ms": (c.decode_ms * 100.0).round() / 100.0,
+        "joints_rad": c.joints.iter().map(|q| (f64::from(*q) * 1e5).round() / 1e5).collect::<Vec<f64>>(),
+        "snapshot_tries_mrad": c.snapshot_tries.iter().map(|t| r1(f64::from(*t) * 1000.0)).collect::<Vec<f64>>(),
+        "bracket_rad": c.bracket.iter().map(|b| b.iter().map(|q| (f64::from(*q) * 1e5).round() / 1e5).collect::<Vec<f64>>()).collect::<Vec<_>>(),
+        "settle_s": (c.settle_s * 100.0).round() / 100.0,
     })).collect();
     let (objects, why) = match result {
         Ok(m) => (vec![json!({
@@ -856,6 +940,47 @@ mod tests {
             let expect = (cam.size[0] / 2.0 - 50.0 - sh[0].abs()).min(cam.size[1] / 2.0 - 30.0 - sh[1].abs());
             assert!((m - expect).abs() < 1e-6 && (sh[0].hypot(sh[1]) - cam.fx * o[0].hypot(o[1]) / z).abs() < 0.5, "{sh:?} {m}");
         }
+    }
+
+    /// How far a joint error moves the image (fx 804, a point 0.45 m in front of the camera on
+    /// the optical axis) and the depth error that shift means at baseline 0.08 m.
+    #[test]
+    fn joint_errors_in_pixels() {
+        let arm = crate::chain::ArmModel::default();
+        let setup = GraspSetup { fx_px: 804.0, fy_px: 804.0, ..GraspSetup::default() };
+        let cam = CamModel::assumed(&arm, &setup, &crate::model::CameraMount::default());
+        let q0 = [0.0, -1.167, -1.565, 1.435, 0.0, 0.0];
+        let c0 = camera_at(&cam, &arm.fk(&q0));
+        let z = 0.45;
+        let x = kinematics::add(&c0.c, &kinematics::mat_vec(&c0.r, &[0.0, 0.0, z]));
+        let p0 = c0.project(&x).unwrap();
+        let mut shifts = [0.0; 6];
+        for (j, s) in shifts.iter_mut().enumerate() {
+            let mut q = q0;
+            q[j] += 0.0035;
+            let p = camera_at(&cam, &arm.fk(&q)).project(&x).unwrap();
+            *s = (p[0] - p0[0]).hypot(p[1] - p0[1]);
+            println!("J{} +3.5 mrad: {:.2} px, depth error at B 0.08 m {:.1} mm", j + 1, *s, z * z * *s / (804.0 * 0.08) * 1000.0);
+        }
+        // a few mrad on a wrist joint is several px: the pose must be the one of the snapshot
+        assert!(shifts[3] > 2.0 && shifts[3] < 6.0, "{shifts:?}");
+    }
+
+    #[test]
+    fn settle_rule_and_bracket() {
+        let arm = [0usize, 1, 2, 3, 4, 5];
+        let win = |f: &dyn Fn(usize) -> (Vec<f32>, Vec<f32>)| -> std::collections::VecDeque<(Vec<f32>, Vec<f32>)> { (0..STILL_WINDOW).map(f).collect() };
+        // creep of 2.7 mrad over 2 s (0.27 mrad per 200 ms window) and one velocity spike of 0.037: still
+        let w = win(&|k| (vec![0.00027 * k as f32 / 10.0; 7], vec![if k == 3 { 0.037 } else { 0.005 }; 6]));
+        assert!(is_still(&w, &arm));
+        // a joint moving 4 mrad within the window, or a median |velocity| of 0.05: not still
+        assert!(!is_still(&win(&|k| { let mut p = vec![0.0; 7]; p[3] = 0.0004 * k as f32; (p, vec![0.0; 6]) }), &arm));
+        assert!(!is_still(&win(&|_| (vec![0.0; 7], vec![0.05; 6])), &arm));
+        let a = vec![0.0f32; 7];
+        let mut b = a.clone();
+        b[4] = 0.0025;
+        b[6] = 0.5; // the gripper is not an arm joint
+        assert!((bracket_spread(&a, &b, &arm) - 0.0025).abs() < 1e-7);
     }
 
     #[test]
