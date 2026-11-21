@@ -96,6 +96,24 @@ pub const GRIPPER_STALL_RELEASE_NM: f32 = 0.2223;
 /// Gripper torque cap: consecutive ticks with |τ| above `gripper_policy.max_close_torque_nm`
 /// (fresh feedback, jaw driven closed) that latch the stall regardless of the jaw speed.
 pub const GRIPPER_FORCE_CAP_TICKS: u32 = 2;
+/// A torque-cap latch under a servo stream or live policy releases only when the stream's
+/// gripper target is at least this much more open than the latch hold (rad). Low torque does
+/// not release it there: on a rigid object the hold at the measured jaw reads ~0 N·m, and a
+/// release would let the stream squeeze again (a cycle every ~19 ticks in the sim rig).
+pub const GRIPPER_FORCE_RELEASE_MARGIN_RAD: f32 = 0.05;
+/// Stream contact regulator: the contact ends when the jaw closes this far past the contact
+/// point with |τ| below half of `contact_torque_nm` (the object gave way or slipped).
+pub const GRIPPER_STREAM_CONTACT_LOST_RAD: f32 = 0.1;
+
+/// Contact regulator state of a servo stream / live policy on the gripper
+/// (`gripper_policy.stream_contact_speed_rad_s`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GripperStreamContact {
+    /// Measured jaw at the contact (rad).
+    pub at_rad: f32,
+    /// Most-closed J7 command allowed (rad), applied by `gripper_lead_cap`.
+    pub limit_rad: f32,
+}
 
 /// Feedback gap that latches BusLoss while torqued. The Damiao motors run with
 /// CAN TIMEOUT=0 and keep holding their last POS_VEL target through a gap, so a
@@ -299,6 +317,12 @@ pub struct SupervisorInner {
     /// Set once J7 stalls or an object is held; the reference may not drive J7 further in the
     /// stall direction until it ends or moves J7 the other way.
     pub gripper_motion_hold: Option<(f32, f32)>,
+    /// Gripper target of the running servo stream or live policy (last accepted frame); None
+    /// when no stream drives the gripper (no frame for `motion_frame_timeout`, an action or a
+    /// whole-arm reference runs, torque changes).
+    pub gripper_stream_target: Option<f32>,
+    /// Contact regulator of the stream (`gripper_policy.stream_contact_speed_rad_s`).
+    pub gripper_stream_contact: Option<GripperStreamContact>,
     /// A park carried an object (J7 frozen short of closed): release it at the resting pose.
     pub park_gripper_contact: bool,
     pub park_release: Option<ParkRelease>,
@@ -580,6 +604,8 @@ impl SupervisorInner {
             gripper_force_ticks: 0,
             gripper_force_trips: 0,
             gripper_motion_hold: None,
+            gripper_stream_target: None,
+            gripper_stream_contact: None,
             park_gripper_contact: false,
             park_release: None,
             pending_normal_unload: false,
@@ -824,6 +850,8 @@ impl SupervisorInner {
         self.gripper_low_torque_ticks = 0;
         self.gripper_force_capped = false;
         self.gripper_force_ticks = 0;
+        self.gripper_stream_target = None;
+        self.gripper_stream_contact = None;
     }
 
     pub fn with_driver(mut self, mut driver: Box<dyn ArmDriver>) -> Self {
@@ -2667,12 +2695,21 @@ impl SupervisorInner {
         Ok(())
     }
 
+    /// Servo / policy intake of the gripper target: records it as the stream's gripper target and
+    /// releases the stall latch on a target away from the stall. A torque-cap latch needs the
+    /// target [`GRIPPER_FORCE_RELEASE_MARGIN_RAD`] more open than the hold.
     fn release_gripper_stall_on_reverse(&mut self, targets: &[f32]) {
         if let Some(g_idx) = self.config.gripper_index() {
+            self.gripper_stream_target = targets.get(g_idx).copied().filter(|t| t.is_finite());
             if self.gripper_stalled && targets.len() > g_idx && self.commanded_positions.len() > g_idx {
                 let delta = targets[g_idx] - self.commanded_positions[g_idx];
                 let tau_g = self.torques.get(g_idx).copied().unwrap_or(0.0);
-                if (delta * tau_g < -1e-4) || (delta * self.gripper_stall_sign < -1e-4) {
+                let reversed = if self.gripper_force_capped {
+                    delta * self.gripper_stall_sign <= -GRIPPER_FORCE_RELEASE_MARGIN_RAD
+                } else {
+                    (delta * tau_g < -1e-4) || (delta * self.gripper_stall_sign < -1e-4)
+                };
+                if reversed {
                     self.gripper_stalled = false;
                     self.gripper_high_torque_ticks = 0;
                     self.gripper_low_torque_ticks = 0;
@@ -3460,7 +3497,7 @@ impl SupervisorInner {
         self.target_positions = target;
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
-        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(motion)));
+        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(Box::new(motion))));
         if let Some(m) = self.macro_run.as_mut() { m.sub = SubState::Running; }
         Ok(duration)
     }
@@ -3552,7 +3589,7 @@ impl SupervisorInner {
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
         let id = self.begin_action("gripper", tag);
-        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(motion)));
+        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(Box::new(motion))));
         Ok((id, duration))
     }
 
@@ -3616,7 +3653,7 @@ impl SupervisorInner {
         self.safety.mark_motion_started()?;
         self.last_heartbeat = Instant::now();
         let id = self.begin_action("gripper_zero_check", None);
-        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(motion)));
+        self.active_trajectory = Some(ActiveTrajectory::new(Some(id), Reference::Gripper(Box::new(motion))));
         let base_closed_rad = self.base_gripper_policy.as_ref().map_or(0.0, |p| p.closed_rad);
         self.gripper_stalled = false;
         self.gripper_high_torque_ticks = 0;
@@ -4096,6 +4133,18 @@ impl SupervisorInner {
         if !meas.is_finite() || !cmd.is_finite() { return; }
         // closing direction only: an open ends on the open stop, nothing to crush there
         let dir = self.config.gripper_policy.as_ref().map_or(1.0, |p| if p.closed_rad >= p.open_rad { 1.0 } else { -1.0 });
+        // stream contact regulator: the closing command stops at its limit
+        let cmd = match self.gripper_stream_contact.filter(|c| self.gripper_stream_target.is_some() && c.limit_rad.is_finite()) {
+            Some(c) if (cmd - c.limit_rad) * dir > 1e-6 => {
+                let l = &self.config.limits[g];
+                self.commanded_positions[g] = c.limit_rad.clamp(l.min_position, l.max_position);
+                // the stepper restarts from rest at the limit (an open frame reverses at once)
+                if let Some(v) = self.commanded_velocities.get_mut(g) { *v = 0.0; }
+                self.note_motion_limit(MotionLimitReason::GripperForce, Some(g));
+                self.commanded_positions[g]
+            }
+            _ => cmd,
+        };
         if (cmd - meas) * dir > lead {
             let capped = meas + dir * lead;
             let l = &self.config.limits[g];
@@ -4185,7 +4234,7 @@ impl SupervisorInner {
             gripper_idx + 1, self.commanded_positions[gripper_idx], motion.target);
         if let Some(park) = self.watchdog_park.as_mut() { park.budget_s += motion.timeout_s.max(duration); }
         self.target_positions[gripper_idx] = motion.target;
-        self.active_trajectory = Some(ActiveTrajectory::new(None, Reference::Gripper(motion)));
+        self.active_trajectory = Some(ActiveTrajectory::new(None, Reference::Gripper(Box::new(motion))));
         self.park_release = Some(next);
         true
     }
@@ -4341,6 +4390,10 @@ impl SupervisorInner {
         let before_velocities = self.commanded_velocities.clone();
 
         // 0.1 Gripper stall protection state machine
+        if self.active_trajectory.is_some() || self.macro_run.is_some() || self.pending_normal_unload
+            || self.gravity_comp.is_some() || self.last_motion_frame.elapsed() > self.motion_frame_timeout {
+            self.gripper_stream_target = None;
+        }
         if let Some(g_idx) = self.config.gripper_index() {
             let (is_bus_fresh, has_torque_feedback, has_load_feedback) = if let Some(ref d) = self.driver {
                 if let Ok(driver) = d.lock() {
@@ -4393,6 +4446,47 @@ impl SupervisorInner {
             } else {
                 self.gripper_stall_sign == 0.0 || pushing_into_stall
             };
+
+            // Stream contact regulator (gripper_policy.stream_contact_speed_rad_s): from the contact
+            // the closing command creeps at the contact speed while |τ| < contact_torque_nm and
+            // its lead over the jaw is scaled by contact_torque_nm / |τ| above it, so the grip
+            // settles near contact_torque_nm whatever the stiffness. The impact sample itself is
+            // stiffness x the POS_VEL lag at contact: no feedback precedes it.
+            let regulator = self.config.gripper_policy.as_ref()
+                .and_then(|p| Some((p.contact_torque_nm?, p.stream_contact_speed_rad_s?)))
+                .filter(|_| has_torque_feedback && self.is_torqued);
+            match (regulator, self.gripper_stream_target) {
+                (Some((target_nm, speed)), Some(stream_g)) if is_bus_fresh && p_meas.is_finite() && p_cmd.is_finite() => {
+                    let tau = tau_g.abs();
+                    self.gripper_stream_contact = match self.gripper_stream_contact {
+                        None => {
+                            let pushing = (p_cmd - p_meas) * close_dir > 1e-3 || (stream_g - p_meas) * close_dir > 1e-3;
+                            let still = tau >= GRIPPER_STALL_LATCH_NM && v_g.abs() < 0.10;
+                            (pushing && (tau >= target_nm || still)).then(|| {
+                                let lead = ((p_cmd - p_meas) * close_dir).max(0.0);
+                                let scale = if tau > target_nm { target_nm / tau } else { 1.0 };
+                                GripperStreamContact { at_rad: p_meas, limit_rad: p_meas + close_dir * lead * scale }
+                            })
+                        }
+                        // the jaw opened past the contact point, or closed on with little torque
+                        Some(c) if (p_meas - c.at_rad) * close_dir <= -GRIPPER_FORCE_RELEASE_MARGIN_RAD => None,
+                        Some(c) if tau < 0.5 * target_nm && (p_meas - c.at_rad) * close_dir > GRIPPER_STREAM_CONTACT_LOST_RAD => None,
+                        Some(mut c) => {
+                            if tau >= target_nm {
+                                let lead = ((c.limit_rad - p_meas) * close_dir).max(0.0);
+                                c.limit_rad = p_meas + close_dir * lead * (target_nm / tau);
+                            } else {
+                                // at most one step ahead of what was written last tick
+                                let base = if (c.limit_rad - p_cmd) * close_dir > 0.0 { p_cmd } else { c.limit_rad };
+                                c.limit_rad = base + close_dir * speed * dt as f32;
+                            }
+                            Some(c)
+                        }
+                    };
+                }
+                (Some(_), Some(_)) => {} // late feedback: keep the limit (gripper_lead_cap needs fresh feedback)
+                _ => self.gripper_stream_contact = None,
+            }
 
             // Torque cap: |τ| above max_close_torque_nm while the jaw is driven closed latches
             // the stall whatever the jaw speed (a deforming object or a flexing finger keeps
@@ -4465,7 +4559,10 @@ impl SupervisorInner {
                 }
             } else if !self.gripper_stalled && !gripper_hw_overload {
                 let is_stalled = if has_torque_feedback {
-                    tau_g.abs() >= GRIPPER_STALL_LATCH_NM && v_g.abs() < 0.10
+                    // the stream contact regulator holds the grip instead of the stall hold at
+                    // the measured jaw (which reads ~0 N·m on a rigid object and re-squeezes)
+                    self.gripper_stream_contact.is_none()
+                        && tau_g.abs() >= GRIPPER_STALL_LATCH_NM && v_g.abs() < 0.10
                 } else {
                     let stall_load_thresh = self.config.gripper_policy.as_ref()
                         .filter(|p| p.holding_mode == crate::model::HoldingMode::LoadAndGap)
@@ -4497,6 +4594,10 @@ impl SupervisorInner {
                 } else {
                     self.gripper_high_torque_ticks = 0;
                 }
+            } else if self.gripper_stalled && self.gripper_force_capped && self.gripper_stream_target.is_some() {
+                // torque-cap latch under a stream: held until the stream opens (intake) or ends
+                self.gripper_high_torque_ticks = 0;
+                self.gripper_low_torque_ticks = 0;
             } else if self.gripper_stalled {
                 self.gripper_high_torque_ticks = 0;
                 let is_released = if has_torque_feedback {

@@ -446,16 +446,16 @@ fn gripper_close_while_blocked() {
         // transient bound: the gripper lead cap limits the squeeze to stiffness x max_lead_rad
         assert!(r.peak_tau <= stiffness * lead + 1e-3, "peak {} > {}", r.peak_tau, stiffness * lead);
         if cap_on {
-            // after the first latch, while the stream keeps asking for closed. On a rigid block the
-            // latch holds the measured jaw (torque ~0), the stall releases after 6 low-torque
-            // ticks and the jaw squeezes again up to the cap plus GRIPPER_FORCE_CAP_TICKS ticks
-            // of rise (k = 10: 1.34 N·m every 19 ticks). Same in both orders; the ceiling below
-            // guards that cycle from growing.
+            // after the impact, while the stream keeps asking for closed: the stream contact
+            // regulator holds the grip near contact_torque_nm (no re-squeeze cycle). Before
+            // f292b07 the torque-cap latch released after 6 low-torque ticks and the stream
+            // squeezed again (k = 10: 1.34 N·m every 19 ticks).
             let cap = config.gripper_policy.as_ref().unwrap().max_close_torque_nm.unwrap();
             let n = r.tau_log.len();
             let held = r.tau_log[n.saturating_sub(250)..n.saturating_sub(100)].iter().copied().fold(0.0, f32::max);
-            eprintln!("  peak {:.3} N·m (bound {:.3}), max after the first latch {held:.3} N·m, cap {cap}", r.peak_tau, stiffness * lead);
-            assert!(held <= cap + 0.35, "held at {held} N·m");
+            let low = r.tau_log[n.saturating_sub(250)..n.saturating_sub(100)].iter().copied().fold(f32::MAX, f32::min);
+            eprintln!("  peak {:.3} N·m (bound {:.3}), held {low:.3}..{held:.3} N·m, cap {cap}", r.peak_tau, stiffness * lead);
+            assert!(held <= 1.2 * cap && low >= 0.3, "held at {low}..{held} N·m");
         }
     }
 }
