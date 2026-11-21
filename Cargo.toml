@@ -64,6 +64,28 @@ opt-level = "z"
 strip = true
 panic = "abort"
 
+# The policy runtime's numeric kernels are optimised for speed; the rest of armd stays size-optimised.
+# Measured on the SG2002 (2026-11-21): the 1.98 M-parameter MLP takes 47.5 ms per step in armd with tract at
+# opt-level "z" and 13.8 ms at opt-level 3 (binary 12.8 -> 16.0 MB).
+[profile.release.package.tract-core]
+opt-level = 3
+[profile.release.package.tract-data]
+opt-level = 3
+[profile.release.package.tract-hir]
+opt-level = 3
+[profile.release.package.tract-linalg]
+opt-level = 3
+[profile.release.package.tract-nnef]
+opt-level = 3
+[profile.release.package.tract-onnx]
+opt-level = 3
+[profile.release.package.tract-onnx-opl]
+opt-level = 3
+[profile.release.package.ndarray]
+opt-level = 3
+[profile.release.package.matrixmultiply]
+opt-level = 3
+
 [target.'cfg(target_os = "linux")'.dependencies]
 socketcan = { version = "4", default-features = false }
 libc = "0.2"
