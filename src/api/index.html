@@ -3142,7 +3142,7 @@ Object.assign(I18N.en, {
 Object.assign(I18N.zh, {
   'who.policy': '策略运行器（{id}）', 'who.app': '设备端程序（{id}）', 'who.wizard': '沙盒向导（{id}）', 'who.self': '本页面',
   'whos.policy': '策略', 'whos.app': '设备端', 'whos.agent': '智能体', 'whos.wizard': '向导', 'whos.cockpit': '驾驶舱', 'whos.other': '外部',
-  'ext.dismiss': '关闭提示', 'ext.open': '查看完整流水 & 策略', 'ext.servo': '外部实时控制中', 'ext.servo.s': '实时控制',
+  'ext.dismiss': '关闭提示', 'ext.open': '查看完整流水 & 策略', 'ext.servo': '外部实时控制中', 'ext.servo.s': '实时控制', 'ext.idle': '持有控制权，空闲', 'ext.idle.s': '空闲',
   'ext.policy': '策略 {id}', 'ext.mode': '沙盒 {m}', 'ext.phase': '阶段 {p}', 'ext.holding.yes': '已夹持', 'ext.holding.no': '未夹持',
   'ext.ml': '运动限制：{m}', 'ext.chip.aria': '外部控制：{s}。打开任务与策略面板',
   'ext.st.running': '运行中', 'ext.st.done': '完成', 'ext.st.failed': '失败', 'ext.st.cancelled': '已取消',
@@ -3159,7 +3159,7 @@ Object.assign(I18N.zh, {
 Object.assign(I18N.en, {
   'who.policy': 'Policy runner ({id})', 'who.app': 'Device app ({id})', 'who.wizard': 'Sandbox wizard ({id})', 'who.self': 'this page',
   'whos.policy': 'Policy', 'whos.app': 'Device app', 'whos.agent': 'Agent', 'whos.wizard': 'Wizard', 'whos.cockpit': 'Cockpit', 'whos.other': 'External',
-  'ext.dismiss': 'Dismiss', 'ext.open': 'Task & Policy Details', 'ext.servo': 'Servo stream (external real-time control)', 'ext.servo.s': 'Servo',
+  'ext.dismiss': 'Dismiss', 'ext.open': 'Task & Policy Details', 'ext.servo': 'Servo stream (external real-time control)', 'ext.servo.s': 'Servo', 'ext.idle': 'Holds control, idle', 'ext.idle.s': 'idle',
   'ext.policy': 'Policy {id}', 'ext.mode': 'Sandbox {m}', 'ext.phase': 'phase {p}', 'ext.holding.yes': 'holding', 'ext.holding.no': 'not holding',
   'ext.ml': 'Motion limit: {m}', 'ext.chip.aria': 'External control: {s}. Open Task & Policy',
   'ext.st.running': 'running', 'ext.st.done': 'done', 'ext.st.failed': 'failed', 'ext.st.cancelled': 'cancelled',
@@ -11546,6 +11546,7 @@ const TK_OWN_TAGS = new Set(['cockpit', 'calib-wizard']);
 const TK = {
   log: [], max: 40, tracked: new Map(), lastTs: null, seq: 0, ver: 0, // ring buffer of action / lease entries; ver bumps on any change
   holder: undefined, lastExtHolder: null,  // last observed lease_holder; last external one
+  cmdRef: null, cmdAt: -Infinity,          // commanded positions at their last change; observation time of that change
   lastExt: null, dismissed: new Set(),     // newest external action entry; action ids whose banner the user dismissed
   k: null, key: '', listKey: '', envKey: '',
   filterExt: store('rebot.task.f') === 'ext', tab: 'act', opener: null,
@@ -11635,6 +11636,15 @@ function tkOnObs(o) {
   }
   tkAction(o.previous_action, o, now);
   tkAction(o.action, o, now);
+  // streaming evidence: commanded positions moved (> 2 mrad from the last change) while torqued in the last 1 s,
+  // or an onboard policy run is active
+  const cmd = o.commanded_positions;
+  if (Array.isArray(cmd) && o.is_torqued) {
+    const ref = TK.cmdRef;
+    if (!ref || ref.length !== cmd.length) TK.cmdRef = cmd.slice();
+    else if (cmd.some((v, i) => Math.abs(v - ref[i]) > 0.002)) { TK.cmdRef = cmd.slice(); TK.cmdAt = o.timestamp; }
+  } else TK.cmdRef = null;
+  const streaming = (Number.isFinite(o.timestamp) && o.timestamp - TK.cmdAt >= 0 && o.timestamp - TK.cmdAt <= 1) || !!(o.policy && o.policy.active);
   const e = TK.lastExt;
   const other = leaseOther();
   const running = !!e && e.state === 'running' && e.seen === o.timestamp; // a running entry no longer reported is stale
@@ -11642,8 +11652,9 @@ function tkOnObs(o) {
   const recent = fin && o.timestamp - (e.finished_at ?? o.timestamp) <= 10;
   const sticky = fin && (e.state === 'failed' || e.state === 'cancelled');
   const k = TK.k = { e, other, running, recent, sticky, show: other != null || running || recent || sticky,
-    // a lease held without a running action is a servo stream, unless the holder's own action just ended
-    mode: running || other == null || (recent && e.src === other) ? 'act' : 'servo' };
+    // a lease held without a running action: a servo stream when the arm is being commanded, else an idle holder,
+    // unless the holder's own action just ended
+    mode: running || other == null || (recent && e.src === other) ? 'act' : streaming ? 'servo' : 'idle' };
   const ml = $('ml-chip');
   k.ml = ml && !ml.hidden ? ml.textContent : '';
   k.pill = tkPill();
@@ -11670,7 +11681,7 @@ function tkRenderBanner(k) {
   const e = k.e, act = k.mode === 'act' && !!e;
   const bad = act && !k.running && (e.state === 'failed' || e.state === 'cancelled');
   el.hidden = false;
-  el.classList.toggle('live', k.running || k.other != null);
+  el.classList.toggle('live', k.running || k.mode === 'servo');
   el.classList.toggle('bad', bad);
   el.classList.toggle('warn', !bad && !!k.ml);
   setText($('ext-who'), k.other != null ? leaseHolderText(k.other) : tkWho(e && e.src));
@@ -11696,7 +11707,7 @@ function tkRenderBanner(k) {
     setText($('ext-err-code'), bad ? (e.code || e.state) : '');
     setText($('ext-err-msg'), bad ? (e.message || '') : '');
   } else {
-    setText($('ext-step'), t('ext.servo'));
+    setText($('ext-step'), t(k.mode === 'servo' ? 'ext.servo' : 'ext.idle'));
     prog.hidden = true; err.hidden = true;
   }
   hint.hidden = !k.ml;
@@ -11736,7 +11747,8 @@ function renderActionChip(k) {
     if (e.state === 'running') { text = who + ' · ' + lbl + ' ' + tkPct(e) + '%'; cls = 'is-warn'; }
     else if (e.state === 'done') { text = who + ' · ' + lbl + ' ✓'; cls = 'is-ok'; }
     else { text = who + ' · ' + lbl + ' ✕' + (e.code ? ' ' + e.code : ''); cls = 'is-danger'; }
-  } else { text = who + ' · ' + t('ext.servo.s'); cls = 'is-warn'; }
+  } else if (k.mode === 'servo') { text = who + ' · ' + t('ext.servo.s'); cls = 'is-warn'; }
+  else { text = who + ' · ' + t('ext.idle.s'); cls = ''; }
   setText(el, text);
   el.setAttribute('aria-label', t('ext.chip.aria', { s: text }));
   el.classList.toggle('is-warn', cls === 'is-warn');
