@@ -332,7 +332,7 @@ impl SupervisorInner {
                 j + 1, p.ratio * 100.0, p.persist_ms)
         };
         let running = self.last_action.as_ref().filter(|a| a.is_running()).map(|a| a.id);
-        if again && !push_in && running.is_none() {
+        if again && !push_in && running.is_none() && self.watchdog_park.is_none() {
             tracing::debug!("{message}; holding the new measured position");
         } else {
             tracing::warn!("{message} (cmd {:.3} meas {:.3} rad); motion stopped, holding position",
@@ -352,6 +352,17 @@ impl SupervisorInner {
                 self.target_positions[j] = self.commanded_positions[j];
             }
             h.hold_q = self.commanded_positions[j];
+        }
+        // A watchdog park stopped by the guard: the park path loads the held joint (it pushes
+        // into the load, or the retreat allowance ended). Hold torque at the backed-off pose
+        // and latch WatchdogTimeout, naming the cause (torque off would drop the arm).
+        if self.watchdog_park.is_some() {
+            tracing::warn!("Watchdog park stopped by the torque guard on joint {} ({}); holding torque at the backed-off pose and latching WatchdogTimeout",
+                j + 1, if push_in { "the park path pushes into the load" } else { "the load did not relax during the park" });
+            let hold = self.commanded_positions.clone();
+            self.latch_watchdog_fault();
+            self.target_positions = hold.clone();
+            self.commanded_positions = hold;
         }
     }
 

@@ -2490,6 +2490,12 @@ impl SupervisorInner {
         if !self.supports_automatic_unload() { return Some("driver lacks velocity/torque/enable feedback".into()); }
         if self.e_stop_latched.load(Ordering::SeqCst) { return Some("E-stop latched".into()); }
         if self.collision.hold.is_some() { return Some("collision hold".into()); }
+        if let Some(h) = self.torque_guard.hold {
+            let rest = self.config.resting_positions().get(h.joint).copied().unwrap_or(h.hold_q);
+            if (rest - h.anchor_q) * h.sign > crate::torque_guard::TORQUE_PUSH_IN_RAD {
+                return Some(format!("torque hold on joint {}: the resting pose lies in the push direction", h.joint + 1));
+            }
+        }
         if !self.safety.state().is_operational() { return Some(format!("safety state {:?}", self.safety.state())); }
         if self.pending_rearm || self.disable_pending || self.output_suspended || self.handover_settling_since.is_some() {
             return Some("re-arm, disable, output suspension or handover pending".into());
@@ -2502,16 +2508,20 @@ impl SupervisorInner {
 
     /// Previous watchdog behaviour: rigid hold at the measured (or commanded) position
     /// and latch Fault(WatchdogTimeout). Torque stays on.
-    fn latch_watchdog_fault(&mut self) {
+    pub(crate) fn latch_watchdog_fault(&mut self) {
         #[cfg(feature = "policy-runtime")]
         self.terminate_policy_run("WATCHDOG_TIMEOUT", "failed", Some("WATCHDOG_TIMEOUT"), Some("Lease watchdog expired".into()));
-        let hold_pos = if self.measured_positions.iter().all(|p| p.is_finite())
+        let mut hold_pos = if self.measured_positions.iter().all(|p| p.is_finite())
             && self.measured_positions.len() == self.config.dof
         {
             self.measured_positions.clone()
         } else {
             self.commanded_positions.clone()
         };
+        // a torque hold keeps its backed-off command (src/torque_guard.rs)
+        if let Some(h) = self.torque_guard.hold {
+            if let (Some(p), Some(c)) = (hold_pos.get_mut(h.joint), self.commanded_positions.get(h.joint)) { *p = *c; }
+        }
         self.watchdog_park = None;
         self.pending_normal_unload = false;
         self.unload_settle = None;
