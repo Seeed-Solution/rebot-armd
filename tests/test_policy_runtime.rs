@@ -5885,6 +5885,7 @@ mod phase3_release_gate_tests {
                     steps: 10,
                     stop_reason: "MAX_SECONDS".into(),
                     passed: true,
+                    policy_stats: None,
                 },
             )
             .unwrap();
@@ -6659,6 +6660,8 @@ mod device_qualification_tests {
 
         // a supervised run that is stopped is recorded as a failure and revokes the release
         let id = inner.begin_policy_run(start(epoch, gen, &digest, &supervised)).unwrap();
+        inner.set_policy_period_us(id, 40_000);
+        inner.record_policy_step_timing(id, 1_500, 60_000);
         assert!(inner.stop_policy_run(Some(id), "STOPPED"));
         let e = inner.begin_policy_run(start(epoch, gen, &digest, &production)).unwrap_err();
         assert_eq!(code(&e), "QUALIFICATION_REQUIRED", "{e:?}");
@@ -6673,6 +6676,9 @@ mod device_qualification_tests {
         assert_eq!(last.tier, "supervised_first_run");
         assert!((last.max_speed_scale - 0.3).abs() < 1e-12);
         assert_eq!((last.scene_id.as_str(), last.tool_id.as_str(), last.fps), ("pcb_suction", "suction", 25));
+        let stats = last.policy_stats.expect("policy_stats in the ledger record");
+        assert_eq!((stats.steps, stats.overruns, stats.skipped, stats.period_us), (1, 1, 1, 40_000));
+        assert_eq!(stats.infer_us.max, 1_500);
     }
 
     async fn send_cmd(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -7193,6 +7199,156 @@ mod speed_gate_tests {
         assert!(ack["max_fps"].as_u64().unwrap() <= 16, "{ack}");
         let stop = ws_cmd(&mut ws, 21, gen, "/api/v1/action/policy/stop", serde_json::json!({})).await;
         assert_eq!(stop["stopped"], true, "{stop}");
+    }
+}
+
+/// `policy_stats` in the action status of a `policy` action.
+mod policy_stats_tests {
+    use super::review_fix_tests::{prepared_with, DelayBackend};
+    use super::*;
+    use armd::policy_runtime::{PolicyStepStats, POLICY_STATS_RING};
+
+    /// Sleeps `slow_ms` on every `every`-th call, else `fast_ms`.
+    struct SometimesSlow {
+        calls: Arc<AtomicUsize>,
+        every: usize,
+        fast_ms: u64,
+        slow_ms: u64,
+    }
+    impl PolicyBackend for SometimesSlow {
+        fn backend_name(&self) -> &'static str { "mock-sometimes-slow" }
+        fn input_dim(&self) -> usize { 6 }
+        fn output_dim(&self) -> usize { 6 }
+        fn infer(&mut self, _input: &[f32], output: &mut [f32]) -> Result<(), PolicyError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            std::thread::sleep(Duration::from_millis(if n.is_multiple_of(self.every) { self.slow_ms } else { self.fast_ms }));
+            output.fill(0.0);
+            Ok(())
+        }
+    }
+
+    async fn begin_shadow(sup: &Arc<ArmSupervisor>, prepared: &PreparedPolicy) -> u64 {
+        let gen = sup.acquire_lease("conn-stats").await.unwrap();
+        sup.tick(0.02).await;
+        let epoch = sup.get_observation().await.epoch_id;
+        let mut inner = sup.inner().write().await;
+        inner
+            .begin_policy_run(PolicyRunStart {
+                epoch_id: epoch,
+                connection_id: "conn-stats".into(),
+                lease_generation: gen,
+                policy_id: "stats".into(),
+                artifact_digest: prepared.artifact_digest().to_string(),
+                backend: prepared.backend_name().to_string(),
+                mode: PolicyMode::Shadow,
+                sim_only: false,
+                max_first_step_rad: None,
+                max_step_rad: None,
+                tag: None,
+                i_am_at_the_arm: false,
+                verified_release_gate: None,
+            })
+            .unwrap()
+    }
+
+    /// Run until the deadline, keeping the lease alive; returns the final action status.
+    async fn run_to_end(sup: &Arc<ArmSupervisor>, id: u64, prepared: PreparedPolicy, fps: f64, secs: f64) -> (armd::motion::ActionStatus, Vec<armd::motion::PolicyStats>) {
+        let epoch = sup.get_observation().await.epoch_id;
+        let runner = spawn_policy_runner(sup.clone(), id, prepared, fps, compute_policy_deadline(Some(secs)).unwrap(), None, None);
+        let mut running = Vec::new();
+        while !runner.is_finished() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = sup.heartbeat("conn-stats", epoch).await;
+            let obs = sup.get_observation().await;
+            if let Some(a) = obs.action.as_ref().filter(|a| a.id == id && a.state == "running") {
+                running.extend(a.policy_stats);
+            }
+        }
+        let _ = runner.await;
+        let obs = sup.get_observation().await;
+        (obs.action.clone().unwrap(), running)
+    }
+
+    #[test]
+    fn step_stats_ring_and_percentiles() {
+        let mut s = PolicyStepStats::default();
+        s.set_period_us(10_000);
+        assert_eq!(s.report().infer_us, armd::motion::PolicyInferUs::default());
+        for i in 1..=100u64 {
+            s.record(i * 10, 1_000);
+        }
+        let r = s.report();
+        assert_eq!((r.steps, r.overruns, r.skipped, r.period_us), (100, 0, 0, 10_000));
+        assert_eq!((r.infer_us.p50, r.infer_us.p99, r.infer_us.max), (500, 990, 1000));
+        // a step of 2.5 periods: one overrun, two periods without a target
+        s.record(9_000, 25_000);
+        let r = s.report();
+        assert_eq!((r.steps, r.overruns, r.skipped), (101, 1, 2));
+        assert_eq!(r.infer_us.max, 9_000);
+        // the ring keeps only the last POLICY_STATS_RING inferences
+        for _ in 0..POLICY_STATS_RING {
+            s.record(7, 1_000);
+        }
+        let r = s.report();
+        assert_eq!((r.infer_us.p50, r.infer_us.p99, r.infer_us.max), (7, 7, 7));
+        assert_eq!(r.steps, 101 + POLICY_STATS_RING as u64);
+    }
+
+    #[tokio::test]
+    async fn fast_backend_counts_steps_without_overruns() {
+        let cfg = make_6dof_config();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let prepared = prepared_with(&cfg, Box::new(DelayBackend { sleep_ms: 1, out: vec![0.0; 6], calls: calls.clone() }), serde_json::json!({}));
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let id = begin_shadow(&sup, &prepared).await;
+        let (action, running) = run_to_end(&sup, id, prepared, 10.0, 1.0).await;
+        assert_eq!(action.kind, "policy");
+        assert_eq!(action.state, "done", "{action:?}");
+        let stats = action.policy_stats.expect("final policy_stats");
+        assert_eq!(stats.steps, calls.load(Ordering::SeqCst) as u64);
+        assert!(stats.steps >= 5, "{stats:?}");
+        assert_eq!(stats.overruns, 0, "{stats:?}");
+        assert_eq!(stats.skipped, 0, "{stats:?}");
+        assert_eq!(stats.period_us, 100_000);
+        assert!(stats.infer_us.p50 >= 1_000 && stats.infer_us.p99 >= stats.infer_us.p50 && stats.infer_us.max >= stats.infer_us.p99, "{stats:?}");
+        assert!(!running.is_empty() && running.iter().any(|s| s.steps > 0), "policy_stats while running: {running:?}");
+        // serialized for the SDK
+        let v = serde_json::to_value(&action).unwrap();
+        assert_eq!(v["policy_stats"]["steps"], stats.steps);
+        for k in ["overruns", "skipped", "period_us"] {
+            assert!(v["policy_stats"][k].is_u64(), "{v}");
+        }
+        for k in ["p50", "p99", "max"] {
+            assert!(v["policy_stats"]["infer_us"][k].is_u64(), "{v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sometimes_slow_backend_counts_overruns_and_skipped_periods() {
+        let cfg = make_6dof_config();
+        let calls = Arc::new(AtomicUsize::new(0));
+        // 20 fps (50 ms); every third inference takes 130 ms
+        let backend = SometimesSlow { calls: calls.clone(), every: 3, fast_ms: 1, slow_ms: 130 };
+        let prepared = prepared_with(&cfg, Box::new(backend), serde_json::json!({}));
+        let sup = Arc::new(ArmSupervisor::new(cfg));
+        let id = begin_shadow(&sup, &prepared).await;
+        let (action, _) = run_to_end(&sup, id, prepared, 20.0, 1.5).await;
+        let stats = action.policy_stats.expect("final policy_stats");
+        assert_eq!(stats.period_us, 50_000);
+        assert!(stats.overruns > 0, "{stats:?}");
+        assert!(stats.overruns < stats.steps, "{stats:?}");
+        assert!(stats.skipped >= 2 * stats.overruns, "130 ms steps skip two 50 ms periods: {stats:?}");
+        assert!(stats.infer_us.max >= 130_000, "{stats:?}");
+    }
+
+    #[test]
+    fn non_policy_actions_carry_no_policy_stats() {
+        let mut inner = armd::SupervisorInner::new(make_6dof_config());
+        let id = inner.begin_action("move_to", None);
+        let a = inner.last_action.clone().unwrap();
+        assert_eq!(a.id, id);
+        assert!(a.policy_stats.is_none());
+        assert!(serde_json::to_value(&a).unwrap().get("policy_stats").is_none());
     }
 }
 

@@ -39,6 +39,8 @@ pub const WARMUP_INFERENCES: usize = 10;
 pub const WARMUP_MAX_TOTAL: Duration = Duration::from_secs(5);
 /// A live run is refused when the warm-up p50 exceeds this fraction of the period.
 pub const SPEED_GATE_PERIOD_FRACTION: f64 = 0.5;
+/// Length of the per-step inference-time ring behind `policy_stats.infer_us`.
+pub const POLICY_STATS_RING: usize = 256;
 
 /// Largest age of the joint positions a live target was computed from, measured from the
 /// driver's feedback capture to the commit under the supervisor lock: two policy periods
@@ -93,6 +95,8 @@ pub struct PolicyRun {
     /// [`max_policy_input_age_ms`] for the run's rate (set by the runner; until then the
     /// bound for [`MIN_LIVE_POLICY_FPS`]).
     pub max_input_age_ms: u64,
+    /// Per-step timing behind `ActionStatus::policy_stats`.
+    pub step_stats: PolicyStepStats,
 }
 
 impl PolicyRun {
@@ -175,6 +179,70 @@ pub fn period_us_for_fps(fps: f64) -> u64 {
         return 0;
     }
     (1e6 / fps).round() as u64
+}
+
+/// Per-step timing of a policy run: counters plus a fixed ring of the last
+/// [`POLICY_STATS_RING`] inference times. No allocation per step.
+#[derive(Debug, Clone)]
+pub struct PolicyStepStats {
+    ring: [u32; POLICY_STATS_RING],
+    len: usize,
+    head: usize,
+    steps: u64,
+    overruns: u64,
+    skipped: u64,
+    period_us: u64,
+}
+
+impl Default for PolicyStepStats {
+    fn default() -> Self {
+        Self { ring: [0; POLICY_STATS_RING], len: 0, head: 0, steps: 0, overruns: 0, skipped: 0, period_us: 0 }
+    }
+}
+
+impl PolicyStepStats {
+    pub fn set_period_us(&mut self, period_us: u64) {
+        self.period_us = period_us;
+    }
+
+    /// One inference done. `infer_us` is the inference alone; `step_us` runs from the period
+    /// tick to the commit point (inference + commit). A step longer than the period is an
+    /// overrun; the runner skips missed ticks, so floor(step_us / period_us) periods get no target.
+    pub fn record(&mut self, infer_us: u64, step_us: u64) {
+        self.steps += 1;
+        self.ring[self.head] = infer_us.min(u32::MAX as u64) as u32;
+        self.head = (self.head + 1) % POLICY_STATS_RING;
+        self.len = (self.len + 1).min(POLICY_STATS_RING);
+        if self.period_us > 0 && step_us > self.period_us {
+            self.overruns += 1;
+            self.skipped += step_us / self.period_us;
+        }
+    }
+
+    pub fn report(&self) -> crate::motion::PolicyStats {
+        let mut sorted = [0u32; POLICY_STATS_RING];
+        let n = self.len;
+        sorted[..n].copy_from_slice(&self.ring[..n]);
+        sorted[..n].sort_unstable();
+        let rank = |q: f64| -> u64 {
+            if n == 0 {
+                return 0;
+            }
+            let idx = ((q * n as f64).ceil() as usize).clamp(1, n) - 1;
+            sorted[idx] as u64
+        };
+        crate::motion::PolicyStats {
+            steps: self.steps,
+            overruns: self.overruns,
+            skipped: self.skipped,
+            infer_us: crate::motion::PolicyInferUs {
+                p50: rank(0.5),
+                p99: rank(0.99),
+                max: if n == 0 { 0 } else { sorted[n - 1] as u64 },
+            },
+            period_us: self.period_us,
+        }
+    }
 }
 
 /// Parameters for `SupervisorInner::begin_policy_run`.
@@ -676,7 +744,11 @@ pub fn spawn_policy_runner(
     let tokio_dl = deadline.map(tokio::time::Instant::from_std);
 
     tokio::spawn(async move {
-        supervisor.inner().write().await.set_policy_max_input_age(action_id, max_policy_input_age_ms(clamped_fps));
+        {
+            let mut inner = supervisor.inner().write().await;
+            inner.set_policy_max_input_age(action_id, max_policy_input_age_ms(clamped_fps));
+            inner.set_policy_period_us(action_id, period_us_for_fps(clamped_fps));
+        }
         let collector = vision_spec.as_ref().zip(vision_source).map(|(spec, src)| {
             let wait_ms = (spec.max_staleness_ms / 4).clamp(10, 50);
             VisionFeatureCollector::start(src, wait_ms)
@@ -701,6 +773,7 @@ pub fn spawn_policy_runner(
             } else {
                 interval.tick().await;
             }
+            let step_started_at = Instant::now();
             if let Some(dl) = deadline {
                 if Instant::now() >= dl {
                     let mut inner = supervisor.inner().write().await;
@@ -768,11 +841,13 @@ pub fn spawn_policy_runner(
                 };
 
             let infer_handle = tokio::task::spawn_blocking(move || {
+                let t0 = Instant::now();
                 let res = prepared.step_infer_with_vision(
                     &measured,
                     vision_features.as_ref().map(|f| f.as_slice()),
                 );
-                (prepared, res)
+                let infer_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                (prepared, res.map(|t| (t, infer_us)))
             });
             let infer_result = if let Some(dl) = tokio_dl {
                 tokio::select! {
@@ -788,7 +863,7 @@ pub fn spawn_policy_runner(
                 infer_handle.await
             };
 
-            let target = match infer_result {
+            let (target, infer_us) = match infer_result {
                 Err(e) => {
                     tracing::warn!("Policy inference task failed for action {action_id}: {e}");
                     let mut inner = supervisor.inner().write().await;
@@ -824,6 +899,9 @@ pub fn spawn_policy_runner(
                     break;
                 }
             }
+            // the commit below runs under this lock without awaiting, so the step time ends here
+            let step_us = step_started_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            inner.record_policy_step_timing(action_id, infer_us, step_us);
             let post_vision_age_ms = if let (Some(spec), Some(vis_cap)) =
                 (&vision_spec, vision_captured_at)
             {

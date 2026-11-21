@@ -47,6 +47,9 @@ pub struct QualificationRecord {
     pub steps: u64,
     pub stop_reason: String,
     pub passed: bool,
+    /// Per-step timing of the run (absent in older records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_stats: Option<crate::motion::PolicyStats>,
 }
 
 impl QualificationRecord {
@@ -69,7 +72,13 @@ impl QualificationRecord {
             steps,
             stop_reason: stop_reason.into(),
             passed,
+            policy_stats: None,
         }
+    }
+
+    pub fn with_policy_stats(mut self, stats: crate::motion::PolicyStats) -> Self {
+        self.policy_stats = Some(stats);
+        self
     }
 
     /// Same artifact, deployment (scene, tool, calibration), profile and rate as `gate`.

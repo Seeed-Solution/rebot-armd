@@ -33,8 +33,8 @@ pub use runner::{
     compute_policy_deadline, parse_policy_start_request, prepare_policy, spawn_policy_runner,
     validate_policy_fps, PolicyMode, PolicyRun, PolicyRunStart, PolicyStartRequest, PreparedPolicy,
     max_policy_input_age_ms, DEFAULT_MAX_FIRST_STEP_RAD, DEFAULT_POLICY_FPS, MAX_POLICY_FPS, MAX_POLICY_SECONDS,
-    MIN_LIVE_POLICY_FPS, MIN_POLICY_FPS, period_us_for_fps, SpeedGateReport, WarmupInferUs,
-    SPEED_GATE_PERIOD_FRACTION, WARMUP_INFERENCES, WARMUP_MAX_TOTAL,
+    MIN_LIVE_POLICY_FPS, MIN_POLICY_FPS, period_us_for_fps, PolicyStepStats, SpeedGateReport, WarmupInferUs,
+    POLICY_STATS_RING, SPEED_GATE_PERIOD_FRACTION, WARMUP_INFERENCES, WARMUP_MAX_TOTAL,
 };
 #[cfg(feature = "policy-tract")]
 pub use tract_backend::TractBackend;

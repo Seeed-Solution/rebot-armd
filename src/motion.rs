@@ -1254,6 +1254,32 @@ pub struct ActionStatus {
     pub durability_confirmed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durability_warning: Option<String>,
+    /// Per-step timing of a `policy` action, while running and in the final result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_stats: Option<PolicyStats>,
+}
+
+/// `ActionStatus::policy_stats`: inferences done (`steps`), steps whose inference + commit
+/// took longer than the period (`overruns`), periods without a committed target because the
+/// previous inference had not finished (`skipped`), inference time over the last 256 steps,
+/// and the run's period.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PolicyStats {
+    pub steps: u64,
+    pub overruns: u64,
+    pub skipped: u64,
+    pub infer_us: PolicyInferUs,
+    pub period_us: u64,
+}
+
+/// Inference time percentiles in microseconds.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PolicyInferUs {
+    pub p50: u64,
+    pub p99: u64,
+    pub max: u64,
 }
 
 /// Execution diagnostics for one sub-motion in a macro action (grasp, place).

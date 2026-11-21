@@ -2852,7 +2852,7 @@ impl SupervisorInner {
             approach: None, approach_reason: None, approach_signs: None, approach_flipped: None,
             phase_ms: std::collections::BTreeMap::new(), motions: Vec::new(),
             constraint_id: None, geometry_id: None, violation_phase: None, reason: None,
-            durability_confirmed: None, durability_warning: None,
+            durability_confirmed: None, durability_warning: None, policy_stats: None,
         });
         self.action_lease_generation = self.active_lease.as_ref().map(|l| l.generation);
         self.quintic_settle = None;
@@ -5406,8 +5406,10 @@ impl SupervisorInner {
             verified_release_gate: req.verified_release_gate,
             stop_reason: None,
             max_input_age_ms: crate::policy_runtime::max_policy_input_age_ms(crate::policy_runtime::MIN_LIVE_POLICY_FPS),
+            step_stats: crate::policy_runtime::PolicyStepStats::default(),
         };
         self.last_policy_obs = Some(run.to_observation(true));
+        self.set_action_policy_stats(action_id, run.step_stats.report());
         self.policy_run = Some(run);
         Ok(action_id)
     }
@@ -5741,6 +5743,29 @@ impl SupervisorInner {
         }
     }
 
+    /// Set the run's period (`policy_stats.period_us`).
+    pub fn set_policy_period_us(&mut self, action_id: u64, period_us: u64) {
+        let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) else { return; };
+        run.step_stats.set_period_us(period_us);
+        let stats = run.step_stats.report();
+        self.set_action_policy_stats(action_id, stats);
+    }
+
+    /// Record one inference of the run (see [`crate::policy_runtime::PolicyStepStats::record`])
+    /// and publish `policy_stats` in the action status.
+    pub fn record_policy_step_timing(&mut self, action_id: u64, infer_us: u64, step_us: u64) {
+        let Some(run) = self.policy_run.as_mut().filter(|r| r.action_id == action_id) else { return; };
+        run.step_stats.record(infer_us, step_us);
+        let stats = run.step_stats.report();
+        self.set_action_policy_stats(action_id, stats);
+    }
+
+    fn set_action_policy_stats(&mut self, action_id: u64, stats: crate::motion::PolicyStats) {
+        if let Some(a) = self.last_action.as_mut().filter(|a| a.id == action_id) {
+            a.policy_stats = Some(stats);
+        }
+    }
+
     pub fn stop_policy_run(&mut self, action_id: Option<u64>, reason: &str) -> bool {
         let matches = match (self.policy_run.as_ref(), action_id) {
             (Some(_), None) => true,
@@ -5800,7 +5825,8 @@ impl SupervisorInner {
             return;
         };
         let passed = stop_reason == "MAX_SECONDS" && action_state == "done";
-        let record = qualification::QualificationRecord::for_run(gate, run.action_id, run.steps, stop_reason, passed);
+        let record = qualification::QualificationRecord::for_run(gate, run.action_id, run.steps, stop_reason, passed)
+            .with_policy_stats(run.step_stats.report());
         if let Err(e) = qualification::append_record(path, &record) {
             tracing::warn!("Cannot append policy qualification record to {}: {e}", path.display());
         }
@@ -5817,6 +5843,7 @@ impl SupervisorInner {
             return;
         };
         run.stop_reason = Some(stop_reason.to_string());
+        self.set_action_policy_stats(run.action_id, run.step_stats.report());
         self.record_policy_qualification(&run, stop_reason, action_state);
         if run.mode == crate::policy_runtime::PolicyMode::Live {
             self.servo_target = None;
