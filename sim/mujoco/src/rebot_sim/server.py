@@ -41,6 +41,12 @@ from .pack import (
     normalize_robot_id,
     validate_pack_security,
 )
+from .perception import (
+    DomainRandomizationConfig,
+    SimDomainRandomizer,
+    coerce_dr_config,
+    normalize_detector_mode,
+)
 from .scene import Scene, parse_objects
 
 PROTOCOL_VERSION = 1
@@ -267,6 +273,13 @@ class Simulator:
         robot: str = "b601dm",
         scene: str | None = None,
         tool: str | None = None,
+        dr_config: DomainRandomizationConfig | dict | None = None,
+        detector_mode: str = "gt",
+        detector_model: str | None = None,
+        detector_labels: list[str] | tuple[str, ...] | None = None,
+        detector_callable=None,
+        detector_conf: float = 0.25,
+        detector_iou: float = 0.45,
     ):
         self.robot = (robot or os.environ.get("REBOT_SIM_ROBOT") or "b601dm").lower()
         self.robot_id = normalize_robot_id(self.robot) or "b601dm"
@@ -277,10 +290,19 @@ class Simulator:
         self.scene_ref = scene
         self.tool_ref = tool
         self.objects_spec = objects
+        self.detector_mode = normalize_detector_mode(detector_mode)
+        self.detector_model = detector_model
+        self.detector_labels = list(detector_labels or [])
+        self.detector_callable = detector_callable
+        self.detector_conf = float(detector_conf)
+        self.detector_iou = float(detector_iou)
+        self.dr_config = coerce_dr_config(dr_config)
+        self.dr: SimDomainRandomizer | None = None
+        self.dr_summary: dict | None = None
         # physics and the scene resets run under this lock; sim_state reads under it
         self.lock = threading.Lock()
         self.stopping = False
-        self._resets: list[tuple[int | None, threading.Event, dict]] = []
+        self._resets: list[tuple] = []
         self.shared = None  # SharedState for the camera process
         self._old_shared = []
         self.cam_conn = None
@@ -311,6 +333,12 @@ class Simulator:
             self.tool_pack,
             self.objects,
         ) = self._build_world(scene=scene, tool=tool, objects=objects, seed=seed)
+        self.dr = SimDomainRandomizer(self.model, self.dr_config)
+        self.dr_generation = 0
+        self.dr_seed: int | None = None
+        if self.dr_config.enabled:
+            self._apply_dr_locked(seed)
+            mujoco.mj_forward(self.model, self.data)
         self.active_scene_digest: str | None = getattr(self.scene_pack, "digest", None)
         self.active_tool_digest: str | None = getattr(self.tool_pack, "digest", None)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -472,10 +500,21 @@ class Simulator:
 
     def step(self) -> None:
         with self.lock:
-            for seed, done, out in self._resets:
-                out.update(self._reset_locked(seed))
-                done.set()
-            self._resets.clear()
+            try:
+                for item in self._resets:
+                    if len(item) == 4:
+                        seed, dr_cfg, done, out = item
+                    else:
+                        seed, done, out = item
+                        dr_cfg = None
+                    try:
+                        out.update(self._reset_locked(seed, dr=dr_cfg))
+                    except Exception as exc:
+                        out["error"] = f"reset failed: {exc}"
+                    finally:
+                        done.set()
+            finally:
+                self._resets.clear()
             self.motors.apply()
             mujoco.mj_step(self.model, self.data)
             if hasattr(self.scene, "step_io"):
@@ -495,25 +534,94 @@ class Simulator:
             self.steps_since_cmd += 1
 
     # ---- scene control (HTTP threads)
-    def request_reset(self, seed: int | None, timeout: float = 2.0) -> dict:
+    @staticmethod
+    def _validate_seed_arg(seed) -> int | None:
+        if seed is None:
+            return None
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise ValueError("seed must be a non-negative integer or null")
+        return seed
+
+    def request_reset(self, seed: int | None, timeout: float = 2.0, dr=None) -> dict:
         """Place the objects for `seed` at the next physics step; returns the state after it."""
+        self._validate_seed_arg(seed)
+        dr_cfg = coerce_dr_config(dr) if dr is not None else None
         done, out = threading.Event(), {}
+        item = (seed, dr_cfg, done, out) if dr_cfg is not None else (seed, done, out)
         with self.lock:
-            self._resets.append((seed, done, out))
+            self._resets.append(item)
         if not done.wait(timeout):  # physics loop not running (tests): apply here
             with self.lock:
-                if (seed, done, out) in self._resets:
-                    self._resets.remove((seed, done, out))
-                    out.update(self._reset_locked(seed))
+                if item in self._resets:
+                    self._resets.remove(item)
+                    out.update(self._reset_locked(seed, dr=dr_cfg))
         return out
 
-    def _reset_locked(self, seed) -> dict:
+    def _apply_dr_locked(self, seed: int | None) -> None:
+        if self.dr is None:
+            self.dr = SimDomainRandomizer(self.model, self.dr_config)
+        self.dr.config = self.dr_config
+        self.dr_generation += 1
+        if self.dr_config.enabled:
+            eff_seed = seed if seed is not None else int(np.random.SeedSequence().entropy & 0x7FFFFFFF)
+            self.dr_seed = eff_seed
+            summary = self.dr.apply(self.model, seed=eff_seed)
+            summary["generation"] = self.dr_generation
+            self.dr_summary = summary
+        else:
+            self.dr_seed = None
+            self.dr.restore_baseline(self.model)
+            self.dr_summary = None
+        mujoco.mj_forward(self.model, self.data)
+
+    def _refresh_dr_baseline_locked(self, *, seed: int | None = None) -> None:
+        """Re-snapshot DR baseline from the current `self.model` after a scene/model commit."""
+        self.dr = SimDomainRandomizer(self.model, self.dr_config)
+        if self.dr_config.enabled:
+            self._apply_dr_locked(seed if seed is not None else self.scene.seed)
+        else:
+            self.dr_seed = None
+            self.dr_summary = None
+
+    def _reset_locked(self, seed, dr=None) -> dict:
         """Reset the scene; a seed the scene rejects gives {"error": ...} and changes nothing."""
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int) or seed < 0):
+            return {"error": f"reset with seed {seed!r} failed: seed must be a non-negative integer or null"}
+        if dr is not None:
+            try:
+                new_dr = coerce_dr_config(dr)
+            except (ValueError, TypeError) as exc:
+                return {"error": f"invalid dr config: {exc}"}
+        else:
+            new_dr = None
         try:
             self.scene.reset(self.data, seed)
         except (ValueError, TypeError, OverflowError) as exc:
             return {"error": f"reset with seed {seed!r} failed: {exc}"}
+        if new_dr is not None:
+            self.dr_config = new_dr
+        if self.dr_config.enabled or (self.dr is not None and self.dr._dirty):
+            self._apply_dr_locked(seed)
         return self._state_locked()
+
+    def get_dr(self) -> dict:
+        with self.lock:
+            return {
+                "enabled": self.dr_config.enabled,
+                "config": self.dr_config.to_dict(),
+                "summary": self.dr_summary,
+                "generation": self.dr_generation,
+            }
+
+    def set_dr(self, dr_config, seed: int | None = None, *, use_seed: bool = False) -> dict:
+        if use_seed:
+            self._validate_seed_arg(seed)
+        new_dr = coerce_dr_config(dr_config)
+        with self.lock:
+            self.dr_config = new_dr
+            eff_seed = seed if use_seed else self.scene.seed
+            self._apply_dr_locked(eff_seed)
+            return self._state_locked()
 
     def _state_locked(self) -> dict:
         d = self.data
@@ -529,6 +637,7 @@ class Simulator:
             "scene": self.scene_pack.id if self.scene_pack else "default",
             "tool": self.tool_pack.id,
             "robot": self.robot_id,
+            "detector_mode": self.detector_mode,
             "tx_id": self.active_tx_id,
             "camera_tx_id": self.camera_tx_id,
             "scene_digest": self.active_scene_digest,
@@ -536,6 +645,8 @@ class Simulator:
             "activation_state": self.activation_state,
             "degraded": self.activation_state == "DEGRADED_SPLIT",
         }
+        if self.dr_config.enabled and self.dr_summary is not None:
+            out["dr"] = self.dr_summary
         if hasattr(self.scene, "io_state"):
             out["io"] = self.scene.io_state(d)
         if hasattr(self.scene, "task_state"):
@@ -627,6 +738,10 @@ class Simulator:
             "camera_tx_id": self.camera_tx_id,
             "scene_digest": self.active_scene_digest,
             "tool_digest": self.active_tool_digest,
+            "dr": self.dr,
+            "dr_summary": self.dr_summary,
+            "dr_seed": self.dr_seed,
+            "dr_generation": self.dr_generation,
         }
 
     def _restore_snapshot_locked(self, snap: dict) -> None:
@@ -647,6 +762,10 @@ class Simulator:
         self.camera_tx_id = snap["camera_tx_id"]
         self.active_scene_digest = snap["scene_digest"]
         self.active_tool_digest = snap["tool_digest"]
+        self.dr = snap["dr"]
+        self.dr_summary = snap["dr_summary"]
+        self.dr_seed = snap["dr_seed"]
+        self.dr_generation = snap["dr_generation"]
 
     def _close_old_shared_locked(self) -> None:
         for old_s in self._old_shared:
@@ -1065,6 +1184,7 @@ class Simulator:
             self.active_tool_digest = staged["tool_digest"]
             if staged["new_shared"] is not None:
                 self.shared = staged["new_shared"]
+            self._refresh_dr_baseline_locked(seed=self.scene.seed)
             staged["prev_snapshot"] = snap
             staged["physics_committed"] = True
         except Exception as exc:
@@ -1466,6 +1586,7 @@ class Simulator:
             if old_shared is not None:
                 self._old_shared.append(old_shared)
         self._close_old_shared_locked()
+        self._refresh_dr_baseline_locked(seed=self.scene.seed)
 
         self._cleanup_staged_tx_locked()
         legacy_tx = f"legacy-{uuid.uuid4().hex[:12]}"
@@ -1534,55 +1655,104 @@ class Simulator:
         depth: dict | None = None,
         mask_angle: bool = True,
         aruco_board: dict | None = None,
+        detector_mode: str | None = None,
+        detector_model: str | None = None,
+        detector_labels: list[str] | tuple[str, ...] | None = None,
+        detector_callable=None,
+        detector_conf: float | None = None,
+        detector_iou: float | None = None,
+        dr_config: DomainRandomizationConfig | dict | None = None,
     ) -> dict:
         """Spawn the camera process (perception.camera_main); returns its ready message.
         `aruco_board`: the virtual GridBoard ({x, y, yaw_deg, side_m, noise_px, seed}) or None."""
         import multiprocessing as mp
+        import pickle
 
         from .perception import SharedState, camera_main
 
+        eff_mode = normalize_detector_mode(detector_mode) if detector_mode is not None else self.detector_mode
+        eff_model = detector_model if detector_model is not None else self.detector_model
+        eff_labels = list(detector_labels) if detector_labels is not None else self.detector_labels
+        eff_callable = detector_callable if detector_callable is not None else self.detector_callable
+        eff_conf = float(detector_conf) if detector_conf is not None else self.detector_conf
+        eff_iou = float(detector_iou) if detector_iou is not None else self.detector_iou
+
+        # Validate detector inputs and picklability BEFORE allocating shared memory or pipes.
+        if eff_mode == "onnx" and not eff_model:
+            raise ValueError("detector_mode='onnx' requires detector_model")
+        if eff_mode == "callable":
+            if eff_callable is None:
+                raise ValueError("detector_mode='callable' requires detector_callable")
+            if not isinstance(eff_callable, str):
+                if not callable(eff_callable):
+                    raise TypeError("detector_callable must be callable or 'module:func'")
+                pickle.dumps(eff_callable)
+        if dr_config is not None:
+            self.set_dr(dr_config, seed=self.scene.seed, use_seed=True)
+
         ctx = mp.get_context("spawn")
-        self.shared = SharedState(self.model.nq, self.model.nv, lock=ctx.Lock())
-        self.shared.write(self.data)
-        self.cam_conn, child = ctx.Pipe()
-        ready_r, ready_w = ctx.Pipe(duplex=False)
-        m = self.mount
-        cfg = {
-            "fps": fps,
-            "size": list(size),
-            "host": host,
-            "video_port": video_port,
-            "perception_port": perception_port,
-            "scene_stream": scene_stream,
-            "objects": objects,
-            "mount": m.ipc(),  # flip, rot_deg, tilt_deg, offset_m, q_end_cam, fx_px
-            "aruco_board": aruco_board,
-            "has_meshes": self.has_meshes,
-            "noise": noise or {},
-            "depth": depth or {},
-            "mask_angle": mask_angle,
-            "robot": self.robot,
-            "scene": self.scene_ref,
-            "tool": self.tool_ref
-            if self.tool_ref is not None
-            else self.tool_pack.source_ref,
-        }
-        self.cam_proc = ctx.Process(
-            target=camera_main,
-            name="rebot-sim-camera",
-            daemon=True,
-            args=(
-                cfg,
-                self.shared.shm.name,
-                self.shared.lock,
-                self.model.nq,
-                self.model.nv,
-                child,
-                ready_w,
-                os.getpid(),
-            ),
-        )
-        self.cam_proc.start()
+        child = ready_r = ready_w = None
+        try:
+            self.shared = SharedState(self.model.nq, self.model.nv, lock=ctx.Lock())
+            self.shared.write(self.data)
+            self.cam_conn, child = ctx.Pipe()
+            ready_r, ready_w = ctx.Pipe(duplex=False)
+            m = self.mount
+            cfg = {
+                "fps": fps,
+                "size": list(size),
+                "host": host,
+                "video_port": video_port,
+                "perception_port": perception_port,
+                "scene_stream": scene_stream,
+                "objects": objects,
+                "mount": m.ipc(),  # flip, rot_deg, tilt_deg, offset_m, q_end_cam, fx_px
+                "aruco_board": aruco_board,
+                "has_meshes": self.has_meshes,
+                "noise": noise or {},
+                "depth": depth or {},
+                "mask_angle": mask_angle,
+                "robot": self.robot,
+                "scene": self.scene_ref,
+                "tool": self.tool_ref
+                if self.tool_ref is not None
+                else self.tool_pack.source_ref,
+                "detector_mode": eff_mode,
+                "detector_model": eff_model,
+                "detector_labels": eff_labels,
+                "detector_callable": eff_callable,
+                "detector_conf": eff_conf,
+                "detector_iou": eff_iou,
+                "dr": self.dr_config.to_dict(),
+                "seed": self.scene.seed,
+                "dr_seed": self.dr_seed,
+                "dr_generation": self.dr_generation,
+            }
+            self.cam_proc = ctx.Process(
+                target=camera_main,
+                name="rebot-sim-camera",
+                daemon=True,
+                args=(
+                    cfg,
+                    self.shared.shm.name,
+                    self.shared.lock,
+                    self.model.nq,
+                    self.model.nv,
+                    child,
+                    ready_w,
+                    os.getpid(),
+                ),
+            )
+            self.cam_proc.start()
+        except Exception:
+            for conn in (child, ready_w, ready_r):
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            self.stop_camera()
+            raise
         child.close()
         ready_w.close()
         try:
@@ -1653,7 +1823,15 @@ class Simulator:
                 msg = self.cam_conn.recv()
                 rid, op = msg[0], msg[1]
                 if op == "reset":
-                    self.cam_conn.send((rid, self._reset_locked(msg[2])))
+                    dr_arg = msg[3] if len(msg) > 3 else None
+                    self.cam_conn.send((rid, self._reset_locked(msg[2], dr=dr_arg)))
+                elif op == "dr_set":
+                    dr_arg = msg[2]
+                    seed_arg = msg[3] if len(msg) > 3 else None
+                    use_seed_arg = bool(msg[4]) if len(msg) > 4 else False
+                    self.cam_conn.send((rid, self.set_dr(dr_arg, seed=seed_arg, use_seed=use_seed_arg)))
+                elif op == "dr_get":
+                    self.cam_conn.send((rid, self.get_dr()))
                 elif op == "scene_get":
                     self.cam_conn.send((rid, self._scene_info_locked()))
                 elif op == "scene_prepare":
@@ -2071,6 +2249,74 @@ def main(argv: list[str] | None = None) -> None:
         metavar="C",
         help="depth_conf reported per detection",
     )
+    det_eval = parser.add_argument_group(
+        "detector evaluation backend (optional real-detector mode; default gt)"
+    )
+    det_eval.add_argument(
+        "--detector",
+        choices=("gt", "onnx", "callable"),
+        default="gt",
+        help="detector backend: gt (synthetic ground truth, default), onnx, or callable",
+    )
+    det_eval.add_argument(
+        "--detector-model",
+        default=None,
+        metavar="PATH",
+        help="path to ONNX detector model when --detector onnx",
+    )
+    det_eval.add_argument(
+        "--detector-labels",
+        default=None,
+        metavar="L1,L2,...",
+        help="comma-separated class label names for --detector onnx/callable",
+    )
+    det_eval.add_argument(
+        "--detector-callable",
+        default=None,
+        metavar="MOD:FUNC",
+        help="module:func callable path when --detector callable",
+    )
+    det_eval.add_argument(
+        "--detector-conf",
+        type=float,
+        default=0.25,
+        help="confidence threshold for ONNX detector (default 0.25)",
+    )
+    det_eval.add_argument(
+        "--detector-iou",
+        type=float,
+        default=0.45,
+        help="NMS IoU threshold for ONNX detector (default 0.45)",
+    )
+    dr_grp = parser.add_argument_group(
+        "domain randomization (seed-driven; disabled by default)"
+    )
+    dr_grp.add_argument(
+        "--dr-lighting",
+        action="store_true",
+        help="enable deterministic per-seed MuJoCo lighting domain randomization",
+    )
+    dr_grp.add_argument(
+        "--dr-camera-jitter-m",
+        type=float,
+        default=0.0,
+        metavar="M",
+        help="max camera position jitter in metres (default 0.0)",
+    )
+    dr_grp.add_argument(
+        "--dr-camera-jitter-deg",
+        type=float,
+        default=0.0,
+        metavar="DEG",
+        help="max camera orientation jitter in degrees (default 0.0)",
+    )
+    dr_grp.add_argument(
+        "--dr-latency-ms",
+        type=float,
+        default=0.0,
+        metavar="MS",
+        help="simulated perception/observation delay in ms (default 0.0)",
+    )
     args = parser.parse_args(argv)
     if not 1 <= args.fps <= 30:
         parser.error("--fps must be 1..30")
@@ -2151,6 +2397,28 @@ def main(argv: list[str] | None = None) -> None:
     }
     if args.depth_scale <= 0 or args.depth_noise_rel < 0 or args.depth_a <= 0 or not 0.0 <= args.depth_conf <= 1.0:
         parser.error("--depth-scale and --depth-a must be > 0, --depth-noise-rel >= 0, --depth-conf 0..1")
+    if args.detector == "onnx" and not args.detector_model:
+        parser.error("--detector onnx requires --detector-model")
+    if args.dr_camera_jitter_m < 0 or not 0.0 <= args.dr_camera_jitter_deg <= 180.0 or args.dr_latency_ms < 0:
+        parser.error("--dr-camera-jitter-m and --dr-latency-ms must be >= 0, --dr-camera-jitter-deg 0..180")
+    detector_labels = (
+        [s.strip() for s in args.detector_labels.split(",") if s.strip()]
+        if args.detector_labels
+        else []
+    )
+    dr_enabled = bool(
+        args.dr_lighting
+        or args.dr_camera_jitter_m > 0.0
+        or args.dr_camera_jitter_deg > 0.0
+        or args.dr_latency_ms > 0.0
+    )
+    dr_config = DomainRandomizationConfig(
+        enabled=dr_enabled,
+        lighting=args.dr_lighting,
+        camera_jitter_m=args.dr_camera_jitter_m,
+        camera_jitter_deg=args.dr_camera_jitter_deg,
+        latency_ms=args.dr_latency_ms,
+    )
     depth = {
         "kind": args.depth,
         "scale": args.depth_scale,
@@ -2185,6 +2453,13 @@ def main(argv: list[str] | None = None) -> None:
         robot=args.robot,
         scene=args.scene,
         tool=args.tool,
+        dr_config=dr_config,
+        detector_mode=args.detector,
+        detector_model=args.detector_model,
+        detector_labels=detector_labels,
+        detector_callable=args.detector_callable,
+        detector_conf=args.detector_conf,
+        detector_iou=args.detector_iou,
     )
     print(
         f"rebot-sim listening on udp://{args.host}:{args.port} (session {sim.session})",

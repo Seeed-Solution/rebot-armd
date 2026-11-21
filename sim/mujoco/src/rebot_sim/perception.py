@@ -20,14 +20,20 @@
 
 from __future__ import annotations
 
+import importlib
 import itertools
 import json
+import math
 import os
 import queue
 import sys
 import threading
 import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import numpy as np
@@ -35,6 +41,7 @@ import numpy as np
 API_VERSION = 2
 PIPELINES = ("yolo", "aruco")
 MODES = ("off", "yolo", "aruco", "both")
+DETECTOR_MODES = ("gt", "onnx", "callable")
 MAX_SUBSCRIPTIONS = 16
 IDLE_FPS = 1
 MODE_PIPELINES = {
@@ -47,6 +54,759 @@ MODE_PIPELINES = {
 MODELS = {"seg": ("segment", 19.5), "det": ("detect", 8.5), "depth": ("depth", 20.5)}
 ION = {"base_mb": 21.5, "total_mb": 62.9, "reserve_mb": 8.0}
 MASK_FIELDS = ("angle_deg", "angle_conf", "grasp_width_px")
+_SIM_DR_SALT = 0x5245424F545F4452  # "REBOT_DR"
+
+
+def _is_bool(val: Any) -> bool:
+    return isinstance(val, (bool, np.bool_))
+
+
+def _is_real_scalar(val: Any) -> bool:
+    return isinstance(val, (int, float, np.integer, np.floating)) and not _is_bool(val)
+
+
+def _validate_dr_range(name: str, val: Any, *, min_val: float = 0.0, max_val: float | None = None) -> tuple[float, float]:
+    if isinstance(val, (str, bytes, bytearray)) or not isinstance(val, (Sequence, np.ndarray)):
+        raise ValueError(f"{name} must be a 2-element sequence of numbers")
+    if len(val) != 2 or not _is_real_scalar(val[0]) or not _is_real_scalar(val[1]):
+        raise ValueError(f"{name} must contain 2 finite real numbers")
+    lo, hi = float(val[0]), float(val[1])
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        raise ValueError(f"{name} bounds must be finite")
+    if lo < min_val or lo > hi or (max_val is not None and hi > max_val):
+        raise ValueError(f"{name} bounds out of range: ({lo}, {hi})")
+    return (lo, hi)
+
+
+def _validate_dr_float(name: str, val: Any, *, min_val: float = 0.0, max_val: float | None = None) -> float:
+    if not _is_real_scalar(val):
+        raise ValueError(f"{name} must be a finite real number, got {type(val).__name__}")
+    f = float(val)
+    if not math.isfinite(f) or f < min_val or (max_val is not None and f > max_val):
+        raise ValueError(f"{name} out of range: {f}")
+    return f
+
+
+@dataclass(frozen=True)
+class DomainRandomizationConfig:
+    """Deterministic, seed-driven Domain Randomization config for rebot-sim (disabled by default)."""
+
+    enabled: bool = False
+    lighting: bool = False
+    light_diffuse_range: tuple[float, float] = (0.6, 1.4)
+    light_specular_range: tuple[float, float] = (0.5, 1.5)
+    light_ambient_range: tuple[float, float] = (0.5, 1.5)
+    light_ambient_delta: float = 0.12
+    light_pos_jitter_m: float = 0.15
+    camera_jitter_m: float = 0.0
+    camera_jitter_deg: float = 0.0
+    latency_ms: float = 0.0
+    latency_ms_range: tuple[float, float] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError(f"enabled must be a bool, got {type(self.enabled).__name__}")
+        if not isinstance(self.lighting, bool):
+            raise ValueError(f"lighting must be a bool, got {type(self.lighting).__name__}")
+        object.__setattr__(
+            self, "light_diffuse_range",
+            _validate_dr_range("light_diffuse_range", self.light_diffuse_range, min_val=0.0, max_val=10.0),
+        )
+        object.__setattr__(
+            self, "light_specular_range",
+            _validate_dr_range("light_specular_range", self.light_specular_range, min_val=0.0, max_val=10.0),
+        )
+        object.__setattr__(
+            self, "light_ambient_range",
+            _validate_dr_range("light_ambient_range", self.light_ambient_range, min_val=0.0, max_val=10.0),
+        )
+        object.__setattr__(
+            self, "light_ambient_delta",
+            _validate_dr_float("light_ambient_delta", self.light_ambient_delta, min_val=0.0, max_val=1.0),
+        )
+        object.__setattr__(
+            self, "light_pos_jitter_m",
+            _validate_dr_float("light_pos_jitter_m", self.light_pos_jitter_m, min_val=0.0, max_val=5.0),
+        )
+        object.__setattr__(
+            self, "camera_jitter_m",
+            _validate_dr_float("camera_jitter_m", self.camera_jitter_m, min_val=0.0, max_val=1.0),
+        )
+        object.__setattr__(
+            self, "camera_jitter_deg",
+            _validate_dr_float("camera_jitter_deg", self.camera_jitter_deg, min_val=0.0, max_val=180.0),
+        )
+        object.__setattr__(
+            self, "latency_ms",
+            _validate_dr_float("latency_ms", self.latency_ms, min_val=0.0, max_val=5000.0),
+        )
+        if self.latency_ms_range is not None:
+            object.__setattr__(
+                self, "latency_ms_range",
+                _validate_dr_range("latency_ms_range", self.latency_ms_range, min_val=0.0, max_val=5000.0),
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "lighting": self.lighting,
+            "light_diffuse_range": list(self.light_diffuse_range),
+            "light_specular_range": list(self.light_specular_range),
+            "light_ambient_range": list(self.light_ambient_range),
+            "light_ambient_delta": self.light_ambient_delta,
+            "light_pos_jitter_m": self.light_pos_jitter_m,
+            "camera_jitter_m": self.camera_jitter_m,
+            "camera_jitter_deg": self.camera_jitter_deg,
+            "latency_ms": self.latency_ms,
+            "latency_ms_range": list(self.latency_ms_range) if self.latency_ms_range is not None else None,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any] | None) -> "DomainRandomizationConfig":
+        if raw is None:
+            return cls(enabled=False)
+        if not isinstance(raw, dict):
+            raise ValueError("dr config must be a JSON object or null")
+        known = {
+            "enabled", "lighting", "light_diffuse_range", "light_specular_range",
+            "light_ambient_range", "light_ambient_delta", "light_pos_jitter_m",
+            "camera_jitter_m", "cam_pos_jitter_m", "camera_jitter_deg", "cam_rot_jitter_deg",
+            "latency_ms", "latency_ms_range",
+        }
+        unknown = set(raw) - known
+        if unknown:
+            raise ValueError(f"unknown DR config keys: {sorted(unknown)}")
+        kwargs: dict[str, Any] = {}
+        for k in (
+            "lighting", "light_diffuse_range", "light_specular_range",
+            "light_ambient_range", "light_ambient_delta", "light_pos_jitter_m",
+            "latency_ms", "latency_ms_range",
+        ):
+            if k in raw:
+                kwargs[k] = raw[k]
+        if "camera_jitter_m" in raw:
+            kwargs["camera_jitter_m"] = raw["camera_jitter_m"]
+        elif "cam_pos_jitter_m" in raw:
+            kwargs["camera_jitter_m"] = raw["cam_pos_jitter_m"]
+        if "camera_jitter_deg" in raw:
+            kwargs["camera_jitter_deg"] = raw["camera_jitter_deg"]
+        elif "cam_rot_jitter_deg" in raw:
+            kwargs["camera_jitter_deg"] = raw["cam_rot_jitter_deg"]
+        if "enabled" in raw:
+            kwargs["enabled"] = raw["enabled"]
+        else:
+            # Enable automatically when any active DR field is specified in a partial update.
+            has_active = bool(
+                kwargs.get("lighting")
+                or float(kwargs.get("camera_jitter_m", 0.0) or 0.0) > 0.0
+                or float(kwargs.get("camera_jitter_deg", 0.0) or 0.0) > 0.0
+                or float(kwargs.get("latency_ms", 0.0) or 0.0) > 0.0
+                or kwargs.get("latency_ms_range") is not None
+            )
+            kwargs["enabled"] = has_active
+        return cls(**kwargs)
+
+
+def coerce_dr_config(cfg: DomainRandomizationConfig | dict | Any | None) -> DomainRandomizationConfig:
+    """Coerce None, dict, or domain_rand.DomainRandomizationConfig into a perception DomainRandomizationConfig."""
+    if cfg is None:
+        return DomainRandomizationConfig(enabled=False)
+    if isinstance(cfg, DomainRandomizationConfig):
+        return cfg
+    if isinstance(cfg, dict):
+        return DomainRandomizationConfig.from_dict(cfg)
+    # Support domain_rand.DomainRandomizationConfig instances cleanly.
+    if hasattr(cfg, "enabled") and hasattr(cfg, "cam_pos_jitter_m"):
+        return DomainRandomizationConfig(
+            enabled=bool(cfg.enabled),
+            lighting=True,
+            light_diffuse_range=tuple(getattr(cfg, "light_intensity_scale_range", (0.6, 1.4))),
+            light_ambient_range=tuple(getattr(cfg, "light_intensity_scale_range", (0.5, 1.5))),
+            camera_jitter_m=float(getattr(cfg, "cam_pos_jitter_m", 0.0)),
+            camera_jitter_deg=float(getattr(cfg, "cam_rot_jitter_deg", 0.0)),
+        )
+    raise TypeError(f"dr_config must be DomainRandomizationConfig, dict, or None, got {type(cfg).__name__}")
+
+
+def _unit_vec3(rng: np.random.Generator) -> np.ndarray:
+    v = rng.normal(size=3)
+    norm = float(np.linalg.norm(v))
+    if norm < 1e-12:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    return v / norm
+
+
+class SimDomainRandomizer:
+    """Snapshots MuJoCo lighting & camera extrinsics baseline and applies drift-free per-seed DR."""
+
+    def __init__(self, model, config: DomainRandomizationConfig | None = None) -> None:
+        self.config = coerce_dr_config(config)
+        self._baseline: dict[str, np.ndarray] = {
+            "light_diffuse": model.light_diffuse.copy(),
+            "light_specular": model.light_specular.copy(),
+            "light_ambient": model.light_ambient.copy(),
+            "light_pos": model.light_pos.copy(),
+            "cam_pos": model.cam_pos.copy(),
+            "cam_quat": model.cam_quat.copy(),
+        }
+        self._dirty = False
+        self.last_summary: dict[str, Any] | None = None
+
+    def restore_baseline(self, model) -> None:
+        """Restore exact nominal lighting & camera extrinsics back to baseline."""
+        if self._dirty:
+            model.light_diffuse[:] = self._baseline["light_diffuse"]
+            model.light_specular[:] = self._baseline["light_specular"]
+            model.light_ambient[:] = self._baseline["light_ambient"]
+            model.light_pos[:] = self._baseline["light_pos"]
+            model.cam_pos[:] = self._baseline["cam_pos"]
+            model.cam_quat[:] = self._baseline["cam_quat"]
+            self._dirty = False
+        self.last_summary = None
+
+    def apply(self, model, seed: int | None = None) -> dict[str, Any]:
+        """Apply deterministic per-seed DR to `model` (or restore baseline if disabled)."""
+        import mujoco
+
+        if seed is not None:
+            if _is_bool(seed) or not isinstance(seed, (int, np.integer)) or int(seed) < 0:
+                raise ValueError(f"seed must be a non-negative int or None, got {seed!r}")
+            seed = int(seed)
+        cfg = self.config
+        if not cfg.enabled:
+            self.restore_baseline(model)
+            return {"enabled": False, "seed": seed, "latency_ms": 0.0}
+
+        rng = (
+            np.random.default_rng(np.random.SeedSequence([seed, _SIM_DR_SALT]))
+            if seed is not None
+            else np.random.default_rng()
+        )
+
+        # Always start staged arrays from exact nominal baseline (zero drift across resets).
+        light_diffuse_new = self._baseline["light_diffuse"].copy()
+        light_specular_new = self._baseline["light_specular"].copy()
+        light_ambient_new = self._baseline["light_ambient"].copy()
+        light_pos_new = self._baseline["light_pos"].copy()
+        cam_pos_new = self._baseline["cam_pos"].copy()
+        cam_quat_new = self._baseline["cam_quat"].copy()
+
+        diffuse_scales = np.ones_like(light_diffuse_new, dtype=np.float32)
+        specular_scales = np.ones_like(light_specular_new, dtype=np.float32)
+        light_pos_offsets = np.zeros_like(light_pos_new, dtype=np.float64)
+
+        if cfg.lighting and model.nlight > 0:
+            diffuse_scales = rng.uniform(
+                *cfg.light_diffuse_range, size=(model.nlight, 3)
+            ).astype(np.float32)
+            specular_scales = rng.uniform(
+                *cfg.light_specular_range, size=(model.nlight, 3)
+            ).astype(np.float32)
+            ambient_scales = rng.uniform(
+                *cfg.light_ambient_range, size=(model.nlight, 3)
+            ).astype(np.float32)
+            ambient_deltas = rng.uniform(
+                0.0, cfg.light_ambient_delta, size=(model.nlight, 3)
+            ).astype(np.float32)
+            light_diffuse_new = np.clip(light_diffuse_new * diffuse_scales, 0.05, 2.0)
+            light_specular_new = np.clip(light_specular_new * specular_scales, 0.0, 2.0)
+            light_ambient_new = np.clip(light_ambient_new * ambient_scales + ambient_deltas, 0.0, 0.5)
+            if cfg.light_pos_jitter_m > 0.0:
+                light_pos_offsets = rng.uniform(
+                    -cfg.light_pos_jitter_m, cfg.light_pos_jitter_m, size=(model.nlight, 3)
+                )
+                light_pos_new = light_pos_new + light_pos_offsets
+                light_pos_new[:, 2] = np.maximum(light_pos_new[:, 2], 0.01)
+                light_pos_offsets = light_pos_new - self._baseline["light_pos"]
+
+        cam_pos_offsets = np.zeros((model.ncam, 3), dtype=np.float64)
+        cam_rot_angles_deg: list[float] = [0.0] * model.ncam
+        if model.ncam > 0:
+            q_delta = np.empty(4, dtype=np.float64)
+            q_out = np.empty(4, dtype=np.float64)
+            for i in range(model.ncam):
+                if cfg.camera_jitter_m > 0.0:
+                    u = _unit_vec3(rng)
+                    r = float(rng.uniform(0.0, cfg.camera_jitter_m))
+                    cam_pos_offsets[i] = u * r
+                    cam_pos_new[i] = self._baseline["cam_pos"][i] + cam_pos_offsets[i]
+                if cfg.camera_jitter_deg > 0.0:
+                    axis = _unit_vec3(rng)
+                    angle_deg = float(rng.uniform(0.0, cfg.camera_jitter_deg))
+                    angle_rad = math.radians(angle_deg)
+                    if angle_rad > 1e-12:
+                        mujoco.mju_axisAngle2Quat(q_delta, axis, angle_rad)
+                        mujoco.mju_mulQuat(q_out, self._baseline["cam_quat"][i], q_delta)
+                        norm = float(np.linalg.norm(q_out))
+                        if norm > 0.0:
+                            q_out /= norm
+                        cam_quat_new[i] = q_out
+                    cam_rot_angles_deg[i] = round(angle_deg, 6)
+
+        if cfg.latency_ms_range is not None:
+            latency_ms = float(rng.uniform(*cfg.latency_ms_range))
+        else:
+            latency_ms = float(cfg.latency_ms)
+
+        # Atomic commit to model
+        model.light_diffuse[:] = light_diffuse_new
+        model.light_specular[:] = light_specular_new
+        model.light_ambient[:] = light_ambient_new
+        model.light_pos[:] = light_pos_new
+        model.cam_pos[:] = cam_pos_new
+        model.cam_quat[:] = cam_quat_new
+        self._dirty = True
+
+        summary: dict[str, Any] = {
+            "enabled": True,
+            "seed": seed,
+            "config": cfg.to_dict(),
+            "lighting": cfg.lighting,
+            "light_diffuse_scales": [[round(float(v), 6) for v in row] for row in diffuse_scales] if cfg.lighting else [],
+            "light_specular_scales": [[round(float(v), 6) for v in row] for row in specular_scales] if cfg.lighting else [],
+            "light_ambient_values": [[round(float(v), 6) for v in row] for row in light_ambient_new] if cfg.lighting else [],
+            "light_pos_offsets_m": [[round(float(v), 6) for v in row] for row in light_pos_offsets] if cfg.lighting else [],
+            "cam_pos_offsets_m": [[round(float(v), 6) for v in row] for row in cam_pos_offsets],
+            "cam_rot_angles_deg": cam_rot_angles_deg,
+            "latency_ms": round(latency_ms, 3),
+        }
+        self.last_summary = summary
+        return summary
+
+
+def normalize_detector_mode(mode: str | None) -> str:
+    if mode is None:
+        return "gt"
+    m = str(mode).strip().lower()
+    if m not in DETECTOR_MODES:
+        raise ValueError(f"detector_mode must be one of {DETECTOR_MODES}, got {mode!r}")
+    return m
+
+
+def load_callable(spec: str) -> Callable[[np.ndarray], list[dict]]:
+    """Load a callable from `'module.path:attr'`."""
+    if not isinstance(spec, str) or ":" not in spec:
+        raise ValueError(f"detector callable spec must be 'module:func', got {spec!r}")
+    mod_name, attr = spec.split(":", 1)
+    mod = importlib.import_module(mod_name.strip())
+    fn = getattr(mod, attr.strip())
+    if not callable(fn):
+        raise TypeError(f"{spec!r} is not callable")
+    return fn
+
+
+def normalize_detection(
+    det: dict[str, Any],
+    index: int = 0,
+    labels: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Normalize a detector output dict into rebot-vision `xywh_center` schema."""
+    if not isinstance(det, dict):
+        raise ValueError(f"detection must be a dict, got {type(det).__name__}")
+    out = dict(det)
+    cid = int(out.get("class_id", index))
+    cname = out.get("class_name") or out.get("label")
+    if not cname:
+        if labels and 0 <= cid < len(labels):
+            cname = str(labels[cid])
+        else:
+            cname = out.get("name") or f"class_{cid}"
+    name = out.get("name") or cname
+    conf = float(out.get("confidence", out.get("score", 1.0)))
+
+    if all(k in out for k in ("x", "y", "w", "h")):
+        cx, cy, bw, bh = float(out["x"]), float(out["y"]), float(out["w"]), float(out["h"])
+    elif "box_norm" in out and len(out["box_norm"]) == 4:
+        x0, y0, x1, y1 = (float(v) for v in out["box_norm"])
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        bw, bh = max(0.0, x1 - x0), max(0.0, y1 - y0)
+    else:
+        raise ValueError("detection must include x,y,w,h or box_norm")
+
+    out["class_id"] = cid
+    out["format"] = out.get("format", "xywh_center")
+    out["class_name"] = str(cname)
+    out["name"] = str(name)
+    out["confidence"] = round(conf, 4)
+    out["x"] = round(cx, 4)
+    out["y"] = round(cy, 4)
+    out["w"] = round(bw, 4)
+    out["h"] = round(bh, 4)
+    return out
+
+
+def _nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> list[int]:
+    if len(boxes) == 0:
+        return []
+    order = np.argsort(-scores)
+    keep: list[int] = []
+    while order.size > 0:
+        i = int(order[0])
+        keep.append(i)
+        if order.size == 1:
+            break
+        rest = order[1:]
+        xx0 = np.maximum(boxes[i, 0], boxes[rest, 0])
+        yy0 = np.maximum(boxes[i, 1], boxes[rest, 1])
+        xx1 = np.minimum(boxes[i, 2], boxes[rest, 2])
+        yy1 = np.minimum(boxes[i, 3], boxes[rest, 3])
+        inter = np.maximum(0.0, xx1 - xx0) * np.maximum(0.0, yy1 - yy0)
+        area_i = max(0.0, boxes[i, 2] - boxes[i, 0]) * max(0.0, boxes[i, 3] - boxes[i, 1])
+        area_r = np.maximum(0.0, boxes[rest, 2] - boxes[rest, 0]) * np.maximum(0.0, boxes[rest, 3] - boxes[rest, 1])
+        union = area_i + area_r - inter
+        iou = np.where(union > 0.0, inter / union, 0.0)
+        order = rest[iou <= iou_threshold]
+    return keep
+
+
+class CallableDetector:
+    """Adapter around an injectable Python callable `fn(rgb) -> list[dict]`."""
+
+    def __init__(self, fn: Callable[[np.ndarray], Sequence[dict]], labels: Sequence[str] | None = None):
+        if not callable(fn):
+            raise TypeError("detector callable must be callable")
+        self.fn = fn
+        self.labels = list(labels or [])
+
+    def detect(self, rgb: np.ndarray) -> list[dict]:
+        raw = self.fn(rgb)
+        return [normalize_detection(d, index=i, labels=self.labels) for i, d in enumerate(raw or ())]
+
+    def __call__(self, rgb: np.ndarray) -> list[dict]:
+        return self.detect(rgb)
+
+
+class OnnxDetector:
+    """ONNXRuntime object detector running on rendered RGB uint8 frames (YOLO-compatible)."""
+
+    OUTPUT_FORMATS = ("auto", "nms_xyxy", "yolov8", "yolov5")
+
+    def __init__(
+        self,
+        model_path: str | Path,
+        labels: Sequence[str] | None = None,
+        conf_threshold: float = 0.25,
+        iou_threshold: float = 0.45,
+        input_size: tuple[int, int] | None = None,
+        output_format: str = "auto",
+    ) -> None:
+        self.model_path = str(model_path)
+        self.labels = list(labels or [])
+        self.conf_threshold = float(conf_threshold)
+        self.iou_threshold = float(iou_threshold)
+        fmt = str(output_format).strip().lower()
+        if fmt not in self.OUTPUT_FORMATS:
+            raise ValueError(f"output_format must be one of {self.OUTPUT_FORMATS}, got {output_format!r}")
+        self.output_format = fmt
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise RuntimeError(
+                "onnxruntime is required for detector_mode='onnx'; install onnxruntime or use detector_mode='callable'/'gt'"
+            ) from exc
+        if not Path(self.model_path).is_file():
+            raise FileNotFoundError(f"ONNX detector model not found: {self.model_path}")
+        providers = ["CPUExecutionProvider"]
+        avail = set(ort.get_available_providers())
+        use_providers = [p for p in providers if p in avail] or list(avail)
+        self.session = ort.InferenceSession(self.model_path, providers=use_providers)
+        inp = self.session.get_inputs()[0]
+        self.input_name = inp.name
+        if input_size is not None:
+            self.input_hw = (int(input_size[0]), int(input_size[1]))
+        elif (
+            isinstance(inp.shape, (list, tuple))
+            and len(inp.shape) == 4
+            and isinstance(inp.shape[2], int)
+            and isinstance(inp.shape[3], int)
+        ):
+            self.input_hw = (int(inp.shape[2]), int(inp.shape[3]))
+        else:
+            self.input_hw = (640, 640)
+
+    def preprocess(self, rgb: np.ndarray) -> tuple[np.ndarray, float, tuple[float, float]]:
+        h_src, w_src = rgb.shape[:2]
+        h_in, w_in = self.input_hw
+        scale = min(w_in / w_src, h_in / h_src)
+        new_w, new_h = max(1, int(round(w_src * scale))), max(1, int(round(h_src * scale)))
+        pad_x = (w_in - new_w) / 2.0
+        pad_y = (h_in - new_h) / 2.0
+
+        try:
+            from PIL import Image
+
+            resized = np.asarray(
+                Image.fromarray(rgb, mode="RGB").resize((new_w, new_h), Image.BILINEAR),
+                dtype=np.uint8,
+            )
+        except ImportError:
+            yi = np.minimum((np.arange(new_h) / scale).astype(int), h_src - 1)
+            xi = np.minimum((np.arange(new_w) / scale).astype(int), w_src - 1)
+            resized = rgb[np.ix_(yi, xi)]
+
+        canvas = np.full((h_in, w_in, 3), 114, dtype=np.uint8)
+        top, left = int(round(pad_y)), int(round(pad_x))
+        canvas[top : top + new_h, left : left + new_w] = resized
+        tensor = (canvas.astype(np.float32) / 255.0).transpose(2, 0, 1)[None, ...]
+        return np.ascontiguousarray(tensor), scale, (float(left), float(top))
+
+    def _resolve_output_format(self, raw: np.ndarray) -> tuple[str, np.ndarray]:
+        fmt = self.output_format
+        if fmt == "nms_xyxy":
+            return "nms_xyxy", raw
+        if fmt == "yolov5":
+            return "yolov5", raw
+        if fmt == "auto" and raw.shape[1] == 6 and not (self.labels and len(self.labels) == 1):
+            is_int_cls = bool(np.all(np.abs(raw[:, 5] - np.round(raw[:, 5])) < 1e-4))
+            is_xyxy = bool(np.all(raw[:, 2] >= raw[:, 0]) and np.all(raw[:, 3] >= raw[:, 1]))
+            if raw.shape[0] <= 300 and is_int_cls and is_xyxy:
+                return "nms_xyxy", raw
+            if raw.shape[0] > 6 or not is_int_cls:
+                return "yolov5", raw
+            return "nms_xyxy", raw
+        if fmt == "auto" and self.labels:
+            if raw.shape[1] == 5 + len(self.labels):
+                return "yolov5", raw
+            if raw.shape[1] == 4 + len(self.labels):
+                return "yolov8", raw
+        preds = raw.T if (raw.shape[0] < raw.shape[1] and raw.shape[0] <= 256) else raw
+        if fmt != "auto":
+            return fmt, preds
+        ncols = preds.shape[1]
+        if self.labels:
+            if ncols == 5 + len(self.labels):
+                return "yolov5", preds
+            if ncols == 4 + len(self.labels):
+                return "yolov8", preds
+        if raw.shape[0] < raw.shape[1] and raw.shape[0] <= 256:
+            return "yolov8", preds
+        if ncols >= 6 and np.all((preds[:, 4] >= 0.0) & (preds[:, 4] <= 1.0)) and np.all(
+            (preds[:, 5:] >= 0.0) & (preds[:, 5:] <= 1.0)
+        ):
+            if raw.shape[0] > 300:
+                return "yolov5", preds
+        return "yolov8", preds
+
+    def postprocess(
+        self,
+        outputs: Sequence[np.ndarray],
+        src_hw: tuple[int, int],
+        scale: float,
+        pad: tuple[float, float],
+    ) -> list[dict]:
+        if not outputs:
+            return []
+        raw = np.asarray(outputs[0], dtype=np.float32)
+        if raw.ndim == 3:
+            raw = raw[0]
+        if raw.ndim != 2 or raw.size == 0:
+            return []
+
+        h_src, w_src = src_hw
+        pad_x, pad_y = pad
+        boxes_xyxy: list[list[float]] = []
+        scores_list: list[float] = []
+        cls_list: list[int] = []
+
+        fmt, preds = self._resolve_output_format(raw)
+        if fmt == "nms_xyxy":
+            if preds.shape[1] < 6:
+                return []
+            for row in preds:
+                sc = float(row[4])
+                if sc < self.conf_threshold:
+                    continue
+                x0 = (float(row[0]) - pad_x) / scale
+                y0 = (float(row[1]) - pad_y) / scale
+                x1 = (float(row[2]) - pad_x) / scale
+                y1 = (float(row[3]) - pad_y) / scale
+                boxes_xyxy.append([x0, y0, x1, y1])
+                scores_list.append(sc)
+                cls_list.append(int(round(float(row[5]))))
+        else:
+            ncols = preds.shape[1]
+            if fmt == "yolov5":
+                if ncols < 6:
+                    return []
+                cls_scores = preds[:, 4:5] * preds[:, 5:]
+            else:
+                if ncols < 5:
+                    return []
+                cls_scores = preds[:, 4:]
+            best_cls = np.argmax(cls_scores, axis=1)
+            best_score = cls_scores[np.arange(len(preds)), best_cls]
+            mask = best_score >= self.conf_threshold
+            preds = preds[mask]
+            best_cls = best_cls[mask]
+            best_score = best_score[mask]
+            for row, sc, cid in zip(preds, best_score, best_cls):
+                cx, cy, bw, bh = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+                x0 = (cx - bw / 2.0 - pad_x) / scale
+                y0 = (cy - bh / 2.0 - pad_y) / scale
+                x1 = (cx + bw / 2.0 - pad_x) / scale
+                y1 = (cy + bh / 2.0 - pad_y) / scale
+                boxes_xyxy.append([x0, y0, x1, y1])
+                scores_list.append(float(sc))
+                cls_list.append(int(cid))
+
+        if not boxes_xyxy:
+            return []
+        boxes_arr = np.asarray(boxes_xyxy, dtype=np.float32)
+        scores_arr = np.asarray(scores_list, dtype=np.float32)
+        cls_arr = np.asarray(cls_list, dtype=np.int64)
+
+        keep_all: list[int] = []
+        for cid in np.unique(cls_arr):
+            idxs = np.nonzero(cls_arr == cid)[0]
+            kept_sub = _nms_xyxy(boxes_arr[idxs], scores_arr[idxs], self.iou_threshold)
+            keep_all.extend(int(idxs[k]) for k in kept_sub)
+        keep_all.sort(key=lambda idx: float(scores_arr[idx]), reverse=True)
+
+        dets: list[dict] = []
+        for idx in keep_all:
+            x0 = float(np.clip(boxes_arr[idx, 0] / w_src, 0.0, 1.0))
+            y0 = float(np.clip(boxes_arr[idx, 1] / h_src, 0.0, 1.0))
+            x1 = float(np.clip(boxes_arr[idx, 2] / w_src, 0.0, 1.0))
+            y1 = float(np.clip(boxes_arr[idx, 3] / h_src, 0.0, 1.0))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            cid = int(cls_arr[idx])
+            dets.append(
+                normalize_detection(
+                    {
+                        "class_id": cid,
+                        "confidence": float(scores_arr[idx]),
+                        "x": (x0 + x1) / 2.0,
+                        "y": (y0 + y1) / 2.0,
+                        "w": x1 - x0,
+                        "h": y1 - y0,
+                    },
+                    index=cid,
+                    labels=self.labels,
+                )
+            )
+        return dets
+
+    def detect(self, rgb: np.ndarray) -> list[dict]:
+        tensor, scale, pad = self.preprocess(rgb)
+        outputs = self.session.run(None, {self.input_name: tensor})
+        return self.postprocess(outputs, rgb.shape[:2], scale, pad)
+
+    def __call__(self, rgb: np.ndarray) -> list[dict]:
+        return self.detect(rgb)
+
+
+def depth_result_from_boxes(
+    z: np.ndarray,
+    dets: Sequence[dict],
+    model,
+    frame_id: int = 0,
+    fx_per_w: float | None = None,
+) -> dict:
+    """Compute depth fields & table samples purely from rendered depth `z` and predicted bboxes (no GT leakage)."""
+    from .camera import DEPTH_GRID, DETECTION_SIZE, _mad, _plane_fit, grid_cells
+
+    w, h = DETECTION_SIZE
+    gw, gh = DEPTH_GRID
+    cw, ch = w / gw, h / gh
+    u, v, ix, iy = grid_cells()
+    z_g = z[np.ix_(iy, ix)].astype(np.float64)
+    finite = bool(np.isfinite(z_g).all() and (z_g > 0).all())
+    disp = model.disparity(z_g, frame_id, fx_per_w)
+    uu, vv = np.meshgrid(u, v)
+    valid = np.isfinite(disp)
+
+    boxes: list[tuple[float, float, float, float]] = []
+    any_box = np.zeros_like(valid)
+    excl = np.zeros_like(valid)
+    for d in dets:
+        cx, cy, bw, bh = float(d["x"]) * w, float(d["y"]) * h, float(d["w"]) * w, float(d["h"]) * h
+        x0, y0 = max(0.0, cx - bw / 2.0), max(0.0, cy - bh / 2.0)
+        x1, y1 = min(float(w), cx + bw / 2.0), min(float(h), cy + bh / 2.0)
+        boxes.append((x0, y0, x1, y1))
+        any_box |= (uu >= x0) & (uu <= x1) & (vv >= y0) & (vv <= y1)
+        excl |= (uu >= x0 - 0.15 * bw) & (uu <= x1 + 0.15 * bw) & (vv >= y0 - 0.15 * bh) & (vv <= y1 + 0.15 * bh)
+
+    by_index: dict[int, dict[str, Any]] = {}
+    for idx, (x0, y0, x1, y1) in enumerate(boxes):
+        in_box = (uu >= x0) & (uu <= x1) & (vv >= y0) & (vv <= y1) & valid
+        if in_box.sum() < 4:
+            continue
+        mx, my = max(0.25 * (x1 - x0), 4 * cw), max(0.25 * (y1 - y0), 4 * ch)
+        in_ring = (uu >= x0 - mx) & (uu <= x1 + mx) & (vv >= y0 - my) & (vv <= y1 + my)
+        ring = in_ring & ~any_box & valid
+        if not ring.any():
+            continue
+        uc, vc = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        p0, pu, pv = _plane_fit(uu[ring] - uc, vv[ring] - vc, disp[ring])
+        bu, bv, bd = uu[in_box], vv[in_box], disp[in_box]
+        deltas = bd - (p0 + pu * (bu - uc) + pv * (bv - vc))
+        fg_mask = deltas > 0.0
+        if fg_mask.sum() < 2:
+            fg_mask = deltas >= float(np.median(deltas))
+        fu, fv, fdeltas = bu[fg_mask], bv[fg_mask], deltas[fg_mask]
+        disp_bg = max(0.0, p0 + pu * (float(fu.mean()) - uc) + pv * (float(fv.mean()) - vc))
+        disp_fg = disp_bg + max(0.0, float(np.percentile(fdeltas, 75)))
+        clear = True
+        for j, (ox0, oy0, ox1, oy1) in enumerate(boxes):
+            if j != idx and ox0 < x1 + 18.0 and ox1 > x0 - 18.0 and oy0 < y1 + 18.0 and oy1 > y0 - 18.0:
+                clear = False
+                break
+        by_index[idx] = {
+            "disp_fg": round(disp_fg, 5),
+            "disp_bg": round(disp_bg, 5),
+            "depth_conf": model.conf,
+            "length_px": round(float(max(x1 - x0, y1 - y0)), 2),
+            "jaw_clear": clear,
+            "depth_width_px": round(float(min(x1 - x0, y1 - y0)), 2),
+        }
+
+    usable = valid & ~excl
+    samples = []
+    for jy in range(6):
+        cgy = int(round((0.08 + 0.84 * jy / 5) * (gh - 1)))
+        for jx in range(8):
+            cgx = int(round((0.08 + 0.84 * jx / 7) * (gw - 1)))
+            sl = (slice(max(cgy - 2, 0), cgy + 3), slice(max(cgx - 2, 0), cgx + 3))
+            keep = usable[sl]
+            if keep.sum() < 9:
+                continue
+            d = disp[sl][keep]
+            med = float(np.median(d))
+            if not math.isfinite(med) or _mad(d) > 0.05 * max(med, 1e-3):
+                continue
+            samples.append([round(float(uu[sl][keep].mean()), 2), round(float(vv[sl][keep].mean()), 2), round(med, 5)])
+    return {"table_samples": samples, "objects": {}, "by_index": by_index, "finite": finite}
+
+
+def build_detector_backend(
+    mode: str,
+    *,
+    model_path: str | Path | None = None,
+    labels: Sequence[str] | None = None,
+    callable_fn: Callable[[np.ndarray], Sequence[dict]] | str | None = None,
+    conf_threshold: float = 0.25,
+    iou_threshold: float = 0.45,
+    output_format: str = "auto",
+):
+    """Build detector backend for `mode` ('gt' -> None, 'onnx' -> OnnxDetector, 'callable' -> CallableDetector)."""
+    m = normalize_detector_mode(mode)
+    if m == "gt":
+        return None
+    if m == "onnx":
+        if not model_path:
+            raise ValueError("detector_mode='onnx' requires detector_model")
+        return OnnxDetector(
+            model_path,
+            labels=labels,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+            output_format=output_format,
+        )
+    if callable_fn is None:
+        raise ValueError("detector_mode='callable' requires a callable")
+    fn = load_callable(callable_fn) if isinstance(callable_fn, str) else callable_fn
+    return CallableDetector(fn, labels=labels)
 
 
 def _box_iou(b1: list[float], b2: list[float]) -> float:
@@ -181,7 +941,16 @@ def serve_video(host: str, port: int, streams: dict[str, VideoStream]):
 class Perception:
     """Perception API v2 state: default subscription (mode), subscriptions, frames, triggers."""
 
-    def __init__(self, max_fps: int, depth=None, model_kind: str = "segment", nominal_fx: float = 824.0):
+    def __init__(
+        self,
+        max_fps: int,
+        depth=None,
+        model_kind: str = "segment",
+        nominal_fx: float = 824.0,
+        detector_mode: str = "gt",
+        detector_model: str | None = None,
+        detector_labels: Sequence[str] | None = None,
+    ):
         self.max_fps = max_fps
         # X8: the ESTIMATED intrinsics (rebot-vision's /api/calibration/intrinsics); the truth is
         # the camera model in camera.py. Starts at the nominal stream values, like rebot-vision.
@@ -191,6 +960,9 @@ class Perception:
         self._depth = depth if depth is not None and depth.enabled else None  # what `depth` loads
         # resident models: "seg" (mask angle and width) or "det" (--no-mask-angle), and "depth"
         self.detector: str | None = "seg" if model_kind == "segment" else "det"
+        self.detector_mode = normalize_detector_mode(detector_mode)
+        self.detector_model = detector_model
+        self.detector_labels = list(detector_labels or [])
         self.depth_model = self._depth
         self.catalogue = {n: v for n, v in MODELS.items() if n != "depth" or self._depth}
         self.generation = 0
@@ -341,11 +1113,13 @@ class Perception:
         physics_step: int = 0,
         depth: dict | None = None,
         markers: list[dict] | None = None,
+        inference_time_ms: float | None = None,
     ) -> None:
         """A rendered wrist frame (called by the render thread); `captured` = time.monotonic()
         when the simulator state (physics step `physics_step` at `physics_time` s) was copied.
         `depth`: camera.depth_result of the same render (with its physics_step), or None."""
         now = time.monotonic()
+        delivery_delay_s = max(0.0, now - captured)
         with self.cond:
             if self.swap is not None:
                 self._apply_swap()
@@ -358,6 +1132,8 @@ class Perception:
                 "physics_step": physics_step,
                 "depth": depth,
                 "markers": markers or [],
+                "inference_time_ms": 0.1 if inference_time_ms is None else float(inference_time_ms),
+                "delivery_delay_s": delivery_delay_s,
             }
             self.frames_in = [t for t in self.frames_in if now - t < 2.0] + [now]
             # One plan per frame, as rebot-vision's frame_plan: the continuous pipelines when the
@@ -408,17 +1184,25 @@ class Perception:
                 for d in detections
             ]
         if ran.get("depth"):
-            detections = [
-                {**d, **depth["objects"][d.get("name")]}
-                if d.get("name") in depth["objects"]
-                else d
-                for d in detections
-            ]
+            by_idx = depth.get("by_index") if isinstance(depth, dict) else None
+            if by_idx is not None:
+                detections = [
+                    {**d, **by_idx[idx]} if idx in by_idx else d
+                    for idx, d in enumerate(detections)
+                ]
+            else:
+                detections = [
+                    {**d, **depth["objects"][d.get("name")]}
+                    if d.get("name") in depth["objects"]
+                    else d
+                    for d in detections
+                ]
         markers = []
         if ran.get("aruco"):  # pose with the estimated intrinsics, as rebot-vision
             from .aruco import marker_json
 
             markers = [marker_json(m, self.intrinsics, self.intrinsics["marker_size"]) for m in frame.get("markers", [])]
+        inf_ms = round(float(frame.get("inference_time_ms", 0.1)), 3)
         body = {
             "api_version": API_VERSION,
             "success": True,
@@ -428,11 +1212,11 @@ class Perception:
             "mono": frame["mono"],
             "physics_time": frame["physics_time"],
             "physics_step": frame["physics_step"],
-            "inference_time_ms": 0.1,
+            "inference_time_ms": inf_ms,
             "width": 640,
             "height": 360,
             "pipelines": {
-                p: {"ran": ran[p], "ms": 0.1 if ran[p] else 0.0}
+                p: {"ran": ran[p], "ms": (inf_ms if p == "yolo" else 0.1) if ran[p] else 0.0}
                 for p in self.pipelines
             },
             "detections": detections,
@@ -466,10 +1250,18 @@ class Perception:
     def mode_body(self) -> dict:
         cont = self.continuous()
         now = time.monotonic()
+        if self.detector_mode == "gt":
+            model_name, model_path = "rebot-sim-ground-truth", None
+        elif self.detector_mode == "onnx":
+            model_name = os.path.basename(self.detector_model) if self.detector_model else "onnx"
+            model_path = self.detector_model
+        else:
+            model_name, model_path = "rebot-sim-callable", None
         body = {
             "api_version": API_VERSION,
             "mode": self.mode,
             "modes": list(MODES),
+            "detector_mode": self.detector_mode,
             "pipelines": {"yolo": True, "aruco": True},
             "last_active_mode": self.last_active,
             "enabled": self.enabled,
@@ -494,8 +1286,8 @@ class Perception:
             "continuous": cont,
             "available": {"yolo": self.detector is not None, "aruco": True},
             "model": {
-                "name": "rebot-sim-ground-truth",
-                "path": None,
+                "name": model_name,
+                "path": model_path,
                 "kind": self.model_kind,
                 "mask_max_boxes": 3,
             },
@@ -826,8 +1618,89 @@ class PerceptionServer:
                 isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
             ):
                 raise ValueError("seed must be a non-negative integer or null")
-            out = self.sim.request_reset(seed)
+            if "dr" in body:
+                dr_cfg = DomainRandomizationConfig.from_dict(body.get("dr"))
+                if not hasattr(self.sim, "request_reset"):
+                    return 404, {"error": "not found"}
+                import inspect
+
+                sig = inspect.signature(self.sim.request_reset)
+                if "dr" not in sig.parameters and not any(
+                    par.kind == inspect.Parameter.VAR_KEYWORD for par in sig.parameters.values()
+                ):
+                    raise ValueError("simulator does not support per-reset dr config")
+                out = self.sim.request_reset(seed, dr=dr_cfg)
+            else:
+                out = self.sim.request_reset(seed)
             return (500 if "error" in out else 200), out
+        if path == "/sim/dr":
+            if method == "GET":
+                if not hasattr(self.sim, "get_dr"):
+                    return 404, {"error": "not found"}
+                return 200, self.sim.get_dr()
+            if method == "POST":
+                if not hasattr(self.sim, "set_dr"):
+                    return 404, {"error": "not found"}
+                has_seed = "seed" in body
+                seed = body.get("seed")
+                if seed is not None and (
+                    isinstance(seed, bool) or not isinstance(seed, int) or seed < 0
+                ):
+                    raise ValueError("seed must be a non-negative integer or null")
+                dr_body = {k: v for k, v in body.items() if k != "seed"}
+                dr_cfg = DomainRandomizationConfig.from_dict(dr_body)
+                return 200, self.sim.set_dr(dr_cfg, seed=seed, use_seed=has_seed)
+        if path == "/sim/detector":
+            if method == "GET":
+                registered = (
+                    self.sim.registered_detector_ids()
+                    if hasattr(self.sim, "registered_detector_ids")
+                    else []
+                )
+                with p.cond:
+                    return 200, {
+                        "detector_mode": p.detector_mode,
+                        "detector_model": p.detector_model,
+                        "detector_labels": list(p.detector_labels),
+                        "registered": registered,
+                    }
+            if method == "POST":
+                forbidden = {
+                    "callable",
+                    "detector_callable",
+                    "module",
+                    "model_path",
+                    "detector_model",
+                    "model",
+                }
+                present_forbidden = sorted(forbidden & set(body))
+                if present_forbidden:
+                    return 403, {
+                        "error": (
+                            "dynamic detector loading/import over HTTP is forbidden "
+                            f"({', '.join(present_forbidden)})"
+                        ),
+                        "code": "FORBIDDEN",
+                    }
+                allowed = {"detector_mode", "mode", "detector_id", "id", "labels", "detector_labels"}
+                unknown = sorted(set(body) - allowed)
+                if unknown:
+                    raise ValueError(f"unknown detector fields: {unknown}")
+                if not hasattr(self.sim, "select_detector"):
+                    return 404, {"error": "not found"}
+                det_id = body.get("detector_id", body.get("id"))
+                raw_mode = body.get("detector_mode", body.get("mode"))
+                mode = normalize_detector_mode(raw_mode) if raw_mode is not None else None
+                labels = body.get("labels", body.get("detector_labels"))
+                if isinstance(labels, str):
+                    labels = [s.strip() for s in labels.split(",") if s.strip()]
+                elif labels is not None and not isinstance(labels, list):
+                    raise ValueError("labels must be a list of strings or comma-separated string")
+                return 200, self.sim.select_detector(
+                    mode=mode,
+                    detector_id=det_id,
+                    labels=labels,
+                )
         if path == "/sim/state" and method == "GET":
             return 200, self.sim.sim_state()
         if path == "/sim/camera" and method == "GET":
@@ -1133,9 +2006,9 @@ class SimLink:
 
 class CameraRig:
     """Renders the wrist (and optionally scene) camera from the shared state, computes
-    ground-truth detections, encodes and publishes. Runs in the camera process."""
+    ground-truth or real-detector detections, encodes and publishes. Runs in the camera process."""
 
-    def __init__(self, cfg: dict, state: SharedState, link: SimLink):
+    def __init__(self, cfg: dict, state: SharedState, link: SimLink, detector_fn=None):
         from . import camera as cam
 
         self.cfg, self.state, self.link = cfg, state, link
@@ -1159,15 +2032,69 @@ class CameraRig:
             tool_ref=cfg.get("tool"),
             objects_str=cfg.get("objects", "cube"),
         )
+        self.detector_mode = normalize_detector_mode(cfg.get("detector_mode", "gt"))
+        self.detector_model = cfg.get("detector_model")
+        raw_labels = cfg.get("detector_labels")
+        if isinstance(raw_labels, str):
+            self.detector_labels = [s.strip() for s in raw_labels.split(",") if s.strip()]
+        else:
+            self.detector_labels = list(raw_labels or [])
+        self.detector_conf = float(cfg.get("detector_conf", 0.25))
+        self.detector_iou = float(cfg.get("detector_iou", 0.45))
+        self.detector_output_format = str(cfg.get("detector_output_format", "auto"))
+        self._detector_generation = 0
+        self._delayed_lock = threading.Lock()
+        self._delayed_gens: list[int] = []
+        self._detector_backend = build_detector_backend(
+            self.detector_mode,
+            model_path=self.detector_model,
+            labels=self.detector_labels,
+            callable_fn=detector_fn if detector_fn is not None else cfg.get("detector_callable"),
+            conf_threshold=self.detector_conf,
+            iou_threshold=self.detector_iou,
+            output_format=self.detector_output_format,
+        )
+        self._registered_detectors: dict[str, dict[str, Any]] = {
+            "gt": {"mode": "gt", "backend": None, "model": None, "labels": []},
+        }
+        if self.detector_mode != "gt":
+            entry = {
+                "mode": self.detector_mode,
+                "backend": self._detector_backend,
+                "model": self.detector_model,
+                "labels": list(self.detector_labels),
+            }
+            self._registered_detectors[self.detector_mode] = entry
+            if cfg.get("detector_id"):
+                self._registered_detectors[str(cfg["detector_id"])] = entry
+        self.last_inference_ms = 0.1
+        self.dr_config = coerce_dr_config(cfg.get("dr"))
+        self.dr = SimDomainRandomizer(self.model, self.dr_config)
+        self.dr_summary: dict | None = None
+        self.dr_generation = int(cfg.get("dr_generation", 0) or 0)
+        self.dr_seed = cfg.get("dr_seed")
+        self._dr_latency_ms = 0.0
+        if self.dr_config.enabled:
+            init_seed = self.dr_seed if self.dr_seed is not None else cfg.get("seed")
+            self.dr_summary = self.dr.apply(self.model, seed=init_seed)
+            if self.dr_generation:
+                self.dr_summary["generation"] = self.dr_generation
+            self._dr_latency_ms = float(self.dr_summary.get("latency_ms", 0.0))
         self.streams = {"/": VideoStream()}
         if cfg["scene_stream"]:
             self.streams["/scene"] = VideoStream()
         self.depth_model = cam.DepthModel(**cfg.get("depth", {}))
         # False: a plain detection model (no mask, model "det"): detections carry no angle_deg /
         # angle_conf / grasp_width_px (the depth pipeline still reports its depth_* fields)
-        self.perception = Perception(max_fps=min(15, self.fps), depth=self.depth_model,
-                                     model_kind="segment" if cfg.get("mask_angle", True) else "detect",
-                                     nominal_fx=round(cam.focal_px(cam.DETECTION_SIZE[1]), 2))
+        self.perception = Perception(
+            max_fps=min(15, self.fps),
+            depth=self.depth_model,
+            model_kind="segment" if cfg.get("mask_angle", True) else "detect",
+            nominal_fx=round(cam.focal_px(cam.DETECTION_SIZE[1]), 2),
+            detector_mode=self.detector_mode,
+            detector_model=self.detector_model,
+            detector_labels=self.detector_labels,
+        )
         # virtual GridBoard (--aruco-board): {"x", "y", "yaw_deg", "side_m", "noise_px", "seed"} or None
         board = cfg.get("aruco_board")
         if board:
@@ -1180,7 +2107,7 @@ class CameraRig:
         self.noise = cam.DetNoise(**cfg.get("noise", {}))
         self.delayed: list[
             tuple
-        ] = []  # frames (on_frame arguments) waiting out noise.latency_ms
+        ] = []  # frames (on_frame arguments) waiting out latency_ms
         self.frame_id = 0
         self.physics_step: int | None = None  # physics step of the newest frame
         self.skipped = 0  # camera ticks without a new physics state (nothing published)
@@ -1262,8 +2189,222 @@ class CameraRig:
         return model, data, scene, labels
 
     # PerceptionServer's simulator interface
-    def request_reset(self, seed):
-        return self.link.call(("reset", seed))
+    def apply_dr(
+        self,
+        seed: int | None = None,
+        dr_config: DomainRandomizationConfig | dict | None = None,
+        *,
+        generation: int | None = None,
+    ) -> dict:
+        """Apply (or disable & restore baseline) DR on the camera model under reload_lock."""
+        new_cfg = coerce_dr_config(dr_config) if dr_config is not None else None
+        with self.reload_lock:
+            if new_cfg is not None:
+                self.dr_config = new_cfg
+            if self.dr is None:
+                self.dr = SimDomainRandomizer(self.model, self.dr_config)
+            self.dr.config = self.dr_config
+            if generation is not None:
+                self.dr_generation = int(generation)
+            else:
+                self.dr_generation += 1
+            if self.dr_config.enabled:
+                summary = self.dr.apply(self.model, seed=seed)
+                summary["generation"] = self.dr_generation
+                self.dr_seed = summary.get("seed")
+                self.dr_summary = summary
+                self._dr_latency_ms = float(summary.get("latency_ms", 0.0))
+            else:
+                self.dr.restore_baseline(self.model)
+                self.dr_seed = None
+                self.dr_summary = None
+                self._dr_latency_ms = 0.0
+                summary = {"enabled": False, "seed": seed, "latency_ms": 0.0}
+            self.cfg["dr"] = self.dr_config.to_dict()
+            self.cfg["seed"] = seed
+            self.cfg["dr_seed"] = self.dr_seed
+            self.cfg["dr_generation"] = self.dr_generation
+            return summary
+
+    def _clear_delayed_queue(self) -> None:
+        lock = getattr(self, "_delayed_lock", None)
+        if lock is not None:
+            with lock:
+                self.delayed.clear()
+                if hasattr(self, "_delayed_gens"):
+                    self._delayed_gens.clear()
+        else:
+            self.delayed.clear()
+
+    def _apply_detector_entry(self, entry: dict[str, Any], labels: Sequence[str] | None = None) -> dict:
+        m = entry["mode"]
+        eff_labels = list(labels) if labels is not None else list(entry.get("labels") or [])
+        eff_model = entry.get("model")
+        backend = entry.get("backend")
+        if backend is not None and labels is not None and hasattr(backend, "labels"):
+            backend.labels = list(eff_labels)
+        with self.reload_lock:
+            self._detector_generation += 1
+            self.detector_mode = m
+            self.detector_model = eff_model
+            self.detector_labels = eff_labels
+            self._detector_backend = backend
+            self.cfg["detector_mode"] = m
+            self.cfg["detector_model"] = eff_model
+            self.cfg["detector_labels"] = eff_labels
+        self._clear_delayed_queue()
+        with self.perception.cond:
+            self.perception.detector_mode = m
+            self.perception.detector_model = eff_model
+            self.perception.detector_labels = list(eff_labels)
+        self.perception.clear_latest()
+        return {
+            "detector_mode": m,
+            "detector_model": eff_model,
+            "detector_labels": list(eff_labels),
+            "detector_generation": self._detector_generation,
+        }
+
+    def registered_detector_ids(self) -> list[str]:
+        with self.reload_lock:
+            return sorted(self._registered_detectors.keys())
+
+    def register_detector(
+        self,
+        detector_id: str,
+        mode: str,
+        *,
+        fn=None,
+        model_path: str | Path | None = None,
+        labels: Sequence[str] | None = None,
+        conf_threshold: float = 0.25,
+        iou_threshold: float = 0.45,
+        output_format: str = "auto",
+    ) -> str:
+        """Trusted startup/test helper to pre-register a detector backend under `detector_id`."""
+        if not isinstance(detector_id, str) or not detector_id.strip():
+            raise ValueError("detector_id must be a non-empty string")
+        m = normalize_detector_mode(mode)
+        eff_labels = list(labels or [])
+        eff_model = str(model_path) if model_path is not None else None
+        backend = build_detector_backend(
+            m,
+            model_path=eff_model,
+            labels=eff_labels,
+            callable_fn=fn,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+            output_format=output_format,
+        )
+        key = detector_id.strip()
+        entry = {
+            "mode": m,
+            "backend": backend,
+            "model": eff_model,
+            "labels": eff_labels,
+        }
+        with self.reload_lock:
+            self._registered_detectors[key] = entry
+        return key
+
+    def select_detector(
+        self,
+        *,
+        mode: str | None = None,
+        detector_id: str | None = None,
+        labels: Sequence[str] | None = None,
+    ) -> dict:
+        """HTTP-safe switcher: selects only between 'gt' and pre-registered detector IDs/modes."""
+        key = detector_id.strip() if isinstance(detector_id, str) and detector_id.strip() else mode
+        if key is None:
+            key = self.detector_mode
+        with self.reload_lock:
+            entry = self._registered_detectors.get(key)
+        if entry is None:
+            raise ValueError(f"detector {key!r} is not registered")
+        if mode is not None and entry["mode"] != normalize_detector_mode(mode):
+            raise ValueError(f"detector_id {key!r} has mode {entry['mode']!r}, not {mode!r}")
+        return self._apply_detector_entry(entry, labels=labels)
+
+    def set_detector(
+        self,
+        mode: str,
+        *,
+        fn=None,
+        model_path: str | Path | None = None,
+        labels: Sequence[str] | None = None,
+        conf_threshold: float = 0.25,
+        iou_threshold: float = 0.45,
+        output_format: str = "auto",
+        detector_id: str | None = None,
+    ) -> dict:
+        """Trusted Python detector mode / backend switcher."""
+        m = normalize_detector_mode(mode)
+        eff_labels = list(labels) if labels is not None else self.detector_labels
+        eff_model = str(model_path) if model_path is not None else self.detector_model
+        backend = build_detector_backend(
+            m,
+            model_path=eff_model,
+            labels=eff_labels,
+            callable_fn=fn,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+            output_format=output_format,
+        )
+        entry = {
+            "mode": m,
+            "backend": backend,
+            "model": eff_model,
+            "labels": list(eff_labels),
+        }
+        with self.reload_lock:
+            self.detector_conf = float(conf_threshold)
+            self.detector_iou = float(iou_threshold)
+            self.detector_output_format = str(output_format)
+            self._registered_detectors[m] = entry
+            if detector_id:
+                self._registered_detectors[str(detector_id)] = entry
+        return self._apply_detector_entry(entry, labels=eff_labels)
+
+    def request_reset(self, seed, dr: DomainRandomizationConfig | None = None):
+        if dr is not None:
+            out = self.link.call(("reset", seed, dr.to_dict()))
+        else:
+            out = self.link.call(("reset", seed))
+        if "error" not in out:
+            dr_info = out.get("dr") if isinstance(out, dict) else None
+            eff_seed = dr_info["seed"] if isinstance(dr_info, dict) and "seed" in dr_info else seed
+            dr_gen = dr_info.get("generation") if isinstance(dr_info, dict) else None
+            self.apply_dr(eff_seed, dr_config=dr, generation=dr_gen)
+            if self.dr_config.enabled and self.dr_summary is not None:
+                out["dr"] = self.dr_summary
+            else:
+                out.pop("dr", None)
+        return out
+
+    def get_dr(self) -> dict:
+        with self.reload_lock:
+            return {
+                "enabled": self.dr_config.enabled,
+                "config": self.dr_config.to_dict(),
+                "summary": self.dr_summary,
+                "generation": self.dr_generation,
+            }
+
+    def set_dr(self, dr_config: DomainRandomizationConfig | dict | None, seed: int | None = None, *, use_seed: bool = False) -> dict:
+        cfg = coerce_dr_config(dr_config)
+        out = self.link.call(("dr_set", cfg.to_dict(), seed, use_seed))
+        dr_info = out.get("dr") if isinstance(out, dict) else None
+        if isinstance(dr_info, dict) and "seed" in dr_info:
+            eff_seed = dr_info["seed"]
+        elif use_seed:
+            eff_seed = seed
+        else:
+            eff_seed = out.get("seed") if isinstance(out, dict) else None
+        dr_gen = dr_info.get("generation") if isinstance(dr_info, dict) else None
+        self.apply_dr(eff_seed, dr_config=cfg, generation=dr_gen)
+        self._flush_delayed()
+        return self.sim_state()
 
     def get_scene(self):
         return self.link.call(("scene_get",))
@@ -1380,6 +2521,20 @@ class CameraRig:
             if hasattr(exc, "code"):
                 err_box["code"] = exc.code
 
+    def _refresh_dr_for_current_model_locked(self) -> None:
+        """Re-snapshot DR baseline from `self.model` after a scene/model commit under reload_lock."""
+        self.dr = SimDomainRandomizer(self.model, self.dr_config)
+        if self.dr_config.enabled:
+            seed = self.dr_seed if self.dr_seed is not None else self.cfg.get("seed")
+            summary = self.dr.apply(self.model, seed=seed)
+            if self.dr_generation:
+                summary["generation"] = self.dr_generation
+            self.dr_summary = summary
+            self._dr_latency_ms = float(summary.get("latency_ms", 0.0))
+        else:
+            self.dr_summary = None
+            self._dr_latency_ms = 0.0
+
     def _commit_staged_camera_tx(self, req: dict) -> None:
         err_box = req["err_box"]
         tx_id = req["tx_id"]
@@ -1407,6 +2562,11 @@ class CameraRig:
                     "scene_ref": self.cfg.get("scene"),
                     "tool_ref": self.cfg.get("tool"),
                     "objects_str": self.cfg.get("objects"),
+                    "dr": self.dr,
+                    "dr_summary": self.dr_summary,
+                    "dr_seed": self.dr_seed,
+                    "dr_generation": self.dr_generation,
+                    "dr_latency_ms": self._dr_latency_ms,
                 }
 
                 self.state = staged["state"]
@@ -1420,7 +2580,8 @@ class CameraRig:
                 self.cfg["tool"] = staged["tool_ref"]
                 self.cfg["objects"] = staged["objects_str"]
                 self.physics_step = None
-                self.delayed.clear()
+                self._refresh_dr_for_current_model_locked()
+                self._clear_delayed_queue()
                 self.perception.clear_latest()
                 for stream in self.streams.values():
                     with stream.lock:
@@ -1472,8 +2633,13 @@ class CameraRig:
                 self.cfg["scene"] = prev["scene_ref"]
                 self.cfg["tool"] = prev["tool_ref"]
                 self.cfg["objects"] = prev["objects_str"]
+                self.dr = prev["dr"]
+                self.dr_summary = prev["dr_summary"]
+                self.dr_seed = prev["dr_seed"]
+                self.dr_generation = prev["dr_generation"]
+                self._dr_latency_ms = prev["dr_latency_ms"]
                 self.physics_step = None
-                self.delayed.clear()
+                self._clear_delayed_queue()
                 self.perception.clear_latest()
                 for stream in self.streams.values():
                     with stream.lock:
@@ -1537,8 +2703,13 @@ class CameraRig:
                 self.cfg["scene"] = prev["scene_ref"]
                 self.cfg["tool"] = prev["tool_ref"]
                 self.cfg["objects"] = prev["objects_str"]
+                self.dr = prev["dr"]
+                self.dr_summary = prev["dr_summary"]
+                self.dr_seed = prev["dr_seed"]
+                self.dr_generation = prev["dr_generation"]
+                self._dr_latency_ms = prev["dr_latency_ms"]
                 self.physics_step = None
-                self.delayed.clear()
+                self._clear_delayed_queue()
                 self.perception.clear_latest()
                 for stream in self.streams.values():
                     with stream.lock:
@@ -1919,6 +3090,11 @@ class CameraRig:
                     "scene_ref": self.cfg.get("scene"),
                     "tool_ref": self.cfg.get("tool"),
                     "objects_str": self.cfg.get("objects"),
+                    "dr": self.dr,
+                    "dr_summary": self.dr_summary,
+                    "dr_seed": self.dr_seed,
+                    "dr_generation": self.dr_generation,
+                    "dr_latency_ms": self._dr_latency_ms,
                 }
 
                 self.state = new_state
@@ -1935,7 +3111,8 @@ class CameraRig:
                     objects_str,
                 )
                 self.physics_step = None
-                self.delayed.clear()
+                self._refresh_dr_for_current_model_locked()
+                self._clear_delayed_queue()
                 self.perception.clear_latest()
                 for stream in self.streams.values():
                     with stream.lock:
@@ -1963,7 +3140,9 @@ class CameraRig:
         with self.perception.cond:
             frame = self.perception.frame
         lag = float(self.state.arr[1]) - frame["physics_time"] if frame else None
-        out["camera"] = {
+        if lag is not None and self._dr_latency_ms > 0.0 and frame is not None:
+            lag = max(lag, float(frame.get("delivery_delay_s", 0.0)))
+        cam_body = {
             "frame_id": frame["frame_id"] if frame else 0,
             "physics_time": frame["physics_time"] if frame else None,
             "physics_step": frame["physics_step"] if frame else None,
@@ -1973,6 +3152,15 @@ class CameraRig:
             "seg_last_error": self.seg_last_error,
             "stale": frame is None or lag > 2.0 / self.fps,
         }
+        if frame is not None and self._dr_latency_ms > 0.0:
+            cam_body["age_ms"] = int((time.monotonic() - frame["mono"]) * 1000)
+            cam_body["delivery_delay_ms"] = round(float(frame.get("delivery_delay_s", 0.0)) * 1000.0, 3)
+        out["camera"] = cam_body
+        out["detector_mode"] = self.detector_mode
+        if self.dr_config.enabled and self.dr_summary is not None:
+            out["dr"] = self.dr_summary
+        else:
+            out.pop("dr", None)
         return out
 
     def camera_info(self) -> dict:
@@ -2059,14 +3247,41 @@ class CameraRig:
     SEG_MAX_CONSECUTIVE = 10
 
     def detect(self, want_depth: bool = False, physics_step: int = 0) -> list[dict] | None:
-        """Ground-truth detections of the wrist view of self.data, or None when the segmentation
-        render failed (logged and counted; the frame then gets no result). Raises RuntimeError
-        after SEG_MAX_CONSECUTIVE failures in a row. `want_depth` (with a depth model): a second
-        pass on the same scene renders depth, and self.frame_depth gets its depth_result tagged
-        with `physics_step` (None when the depth was not finite)."""
+        """Detections of the wrist view of self.data using either ground truth (`gt`) or real-detector
+        evaluation backend (`onnx` / `callable`). Returns None when segmentation fails in GT mode."""
         self.frame_depth = None
         r = self.seg_renderer
         r.update_scene(self.data, camera="wrist", scene_option=self.opt)
+        if self.detector_mode != "gt":
+            rgb = np.ascontiguousarray(r.render(), dtype=np.uint8)
+            t0 = time.perf_counter()
+            raw_dets = self._detector_backend(rgb) if self._detector_backend is not None else []
+            self.last_inference_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+            dets = [
+                normalize_detection(d, index=i, labels=self.detector_labels)
+                for i, d in enumerate(raw_dets or ())
+            ]
+            if want_depth and self.depth_model.enabled:
+                t_d = time.perf_counter()
+                z = self._cam.render_depth(r)
+                d = depth_result_from_boxes(
+                    z,
+                    dets,
+                    self.depth_model,
+                    self.frame_id + 1,
+                    fx_per_w=self.mount.focal() / self._cam.DETECTION_SIZE[0],
+                )
+                if d["finite"]:
+                    self.frame_depth = {**d, "physics_step": physics_step}
+                else:
+                    self.depth_failures += 1
+                    print(
+                        f"rebot-sim camera: depth render not finite on frame {self.frame_id + 1}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                self.depth_ms = (self.depth_ms + [(time.perf_counter() - t_d) * 1000])[-100:]
+            return dets
         try:
             ids = self._cam.render_segmentation(r)
         except Exception as exc:  # SegmentationError (bad readback) or a GL error
@@ -2087,6 +3302,7 @@ class CameraRig:
                 ) from exc
             return None
         self.seg_consecutive = 0
+        self.last_inference_ms = 0.1
         if want_depth and self.depth_model.enabled:
             t0 = time.perf_counter()
             z = self._cam.render_depth(r)  # same mjvScene as the segmentation: same physics state
@@ -2113,27 +3329,135 @@ class CameraRig:
         return visible_markers(self.board, r_cv, self.data.cam_xpos[cid].copy(), self.mount.focal(),
                                noise, seed, frame_id)
 
-    def publish_frame(self, frame: tuple) -> None:
-        """Hand a frame (on_frame's arguments) to perception, noise.latency_ms after its capture:
+    def _effective_latency_ms(self) -> float:
+        noise_obj = getattr(self, "noise", None)
+        noise_ms = float(getattr(noise_obj, "latency_ms", 0.0) or 0.0)
+        dr_ms = float(getattr(self, "_dr_latency_ms", 0.0) or 0.0)
+        return noise_ms + dr_ms
+
+    def _flush_delayed(self) -> None:
+        latency_s = CameraRig._effective_latency_ms(self) / 1000.0
+        now = time.monotonic()
+        ready: list[tuple] = []
+        lock = getattr(self, "_delayed_lock", None)
+        if lock is not None:
+            with lock:
+                cur_gen = getattr(self, "_detector_generation", 0)
+                gens = getattr(self, "_delayed_gens", None)
+                while self.delayed and now - self.delayed[0][2] >= latency_s:
+                    frame = self.delayed.pop(0)
+                    f_gen = gens.pop(0) if gens else cur_gen
+                    if f_gen == cur_gen:
+                        ready.append(frame)
+        else:
+            while self.delayed and now - self.delayed[0][2] >= latency_s:
+                ready.append(self.delayed.pop(0))
+        for frame in ready:
+            self.perception.on_frame(*frame)
+
+    def _next_delayed_due_t(self) -> float | None:
+        latency_s = CameraRig._effective_latency_ms(self) / 1000.0
+        lock = getattr(self, "_delayed_lock", None)
+        if lock is not None:
+            with lock:
+                if not self.delayed:
+                    return None
+                captured = self.delayed[0][2]
+        else:
+            if not self.delayed:
+                return None
+            captured = self.delayed[0][2]
+        rem_s = max(0.0, latency_s - (time.monotonic() - captured))
+        return time.perf_counter() + rem_s
+
+    def publish_frame(self, frame: tuple, detector_generation: int | None = None) -> None:
+        """Hand a frame (on_frame's arguments) to perception, latency_ms after its capture:
         the frame keeps its capture time, so its age_ms includes the delay."""
-        if self.noise.latency_ms <= 0:
+        latency_ms = CameraRig._effective_latency_ms(self)
+        if latency_ms <= 0:
+            if detector_generation is not None and detector_generation != getattr(self, "_detector_generation", 0):
+                return
             self.perception.on_frame(*frame)
             return
-        self.delayed.append(frame)
-        now = time.monotonic()
-        while (
-            self.delayed and now - self.delayed[0][2] >= self.noise.latency_ms / 1000.0
-        ):
-            self.perception.on_frame(*self.delayed.pop(0))
+        lock = getattr(self, "_delayed_lock", None)
+        if lock is not None:
+            with lock:
+                cur_gen = getattr(self, "_detector_generation", 0)
+                if detector_generation is not None and detector_generation != cur_gen:
+                    return
+                self.delayed.append(frame)
+                if hasattr(self, "_delayed_gens"):
+                    self._delayed_gens.append(cur_gen if detector_generation is None else detector_generation)
+        else:
+            self.delayed.append(frame)
+        CameraRig._flush_delayed(self)
 
-    def run(self, parent_pid: int) -> None:
+    def process_once(self) -> bool:
+        """Read latest shared state, render/detect/publish one frame if physics stepped; returns True if rendered."""
         import mujoco
 
-        opt, encoders = self.opt, self.encoders
+        t0 = time.perf_counter()
+        self._flush_delayed()
+        with self.reload_lock:
+            renderer = self.renderer
+            opt = self.opt
+            encoders = self.encoders
+            det_gen = self._detector_generation
+            det_mode = self.detector_mode
+            step = self.state.read(self.data)
+            if (
+                step is None or step == self.physics_step
+            ):  # no new physics: publish nothing
+                self.skipped += 1
+                return False
+            if self.activation_state in {"DEGRADED_SPLIT", "COMMITTING"}:
+                # Never publish mixed-generation detections or video frames while degraded/committing
+                self.physics_step = step
+                return False
+            self.physics_step = step
+            captured = time.monotonic()
+            ts_ms = int(time.time() * 1000)
+            mujoco.mj_forward(self.model, self.data)
+            dets = self.detect(self.perception.wants_depth(captured), step)
+            self.frame_id += 1
+            if (
+                dets is not None
+            ):  # a failed segmentation: the video frame goes out, no result
+                if det_mode == "gt":
+                    dets = self._cam.perturb(
+                        dets, self.noise, self.frame_id, self.labels
+                    )
+                self.publish_frame(
+                    (self.frame_id, ts_ms, captured, dets, self.data.time, step, self.frame_depth,
+                     self.board_markers(self.frame_id), self.last_inference_ms),
+                    detector_generation=det_gen,
+                )
+            for path, stream in self.streams.items():
+                if not stream.active:
+                    continue
+                renderer.update_scene(
+                    self.data,
+                    camera="wrist" if path == "/" else "scene",
+                    scene_option=opt,
+                )
+                au = encoders[path].encode(
+                    renderer.render(), keyframe=stream.take_idr_request()
+                )
+                if au:
+                    stream.publish(au, ts_ms, 5 in _nal_types(au))
+            self.render_ms = (self.render_ms + [(time.perf_counter() - t0) * 1000])[
+                -100:
+            ]
+            self.state.arr[2], self.state.arr[3] = (
+                self.frame_id,
+                float(np.mean(self.render_ms)),
+            )
+            return True
+
+    def run(self, parent_pid: int) -> None:
         period = 1.0 / self.fps
-        next_t = time.perf_counter()
+        next_capture_t = time.perf_counter()
         while os.getppid() == parent_pid:
-            t0 = time.perf_counter()
             req = None
             with self.reload_lock:
                 if self._reload_req is not None:
@@ -2165,59 +3489,24 @@ class CameraRig:
                     self._apply_reload(req)
                     done.set()
 
-            renderer = self.renderer
-            step = self.state.read(self.data)
-            if (
-                step is None or step == self.physics_step
-            ):  # no new physics: publish nothing
-                self.skipped += 1
-            elif self.activation_state in {"DEGRADED_SPLIT", "COMMITTING"}:
-                # Never publish mixed-generation detections or video frames while degraded/committing
-                self.physics_step = step
-            else:
-                self.physics_step = step
-                captured = time.monotonic()
-                ts_ms = int(time.time() * 1000)
-                mujoco.mj_forward(self.model, self.data)
-                dets = self.detect(self.perception.wants_depth(captured), step)
-                self.frame_id += 1
-                if (
-                    dets is not None
-                ):  # a failed segmentation: the video frame goes out, no result
-                    dets = self._cam.perturb(
-                        dets, self.noise, self.frame_id, self.labels
-                    )
-                    self.publish_frame(
-                        (self.frame_id, ts_ms, captured, dets, self.data.time, step, self.frame_depth,
-                         self.board_markers(self.frame_id))
-                    )
-                for path, stream in self.streams.items():
-                    if not stream.active:
-                        continue
-                    renderer.update_scene(
-                        self.data,
-                        camera="wrist" if path == "/" else "scene",
-                        scene_option=opt,
-                    )
-                    au = encoders[path].encode(
-                        renderer.render(), keyframe=stream.take_idr_request()
-                    )
-                    if au:
-                        stream.publish(au, ts_ms, 5 in _nal_types(au))
-                self.render_ms = (self.render_ms + [(time.perf_counter() - t0) * 1000])[
-                    -100:
-                ]
-                self.state.arr[2], self.state.arr[3] = (
-                    self.frame_id,
-                    float(np.mean(self.render_ms)),
-                )
-            next_t += period
             now = time.perf_counter()
-            if next_t > now:
-                self.reload_wake_event.wait(timeout=next_t - now)
-                self.reload_wake_event.clear()
+            if now >= next_capture_t:
+                self.process_once()
+                next_capture_t += period
+                after = time.perf_counter()
+                if next_capture_t <= after:
+                    next_capture_t = after + period
             else:
-                next_t = now
+                self._flush_delayed()
+
+            now = time.perf_counter()
+            wake_t = next_capture_t
+            next_delivery_t = self._next_delayed_due_t()
+            if next_delivery_t is not None:
+                wake_t = min(wake_t, next_delivery_t)
+            if wake_t > now:
+                self.reload_wake_event.wait(timeout=wake_t - now)
+                self.reload_wake_event.clear()
 
     def stats(self) -> dict:
         ms = np.array(self.render_ms) if self.render_ms else np.zeros(1)
