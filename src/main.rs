@@ -256,14 +256,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     });
+    let stdout_writer = armd::diagnostics::logwriter::NonBlocking::spawn("armd-log-stdout", std::io::stdout()).ok();
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "armd=info,tower_http=info".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
-        .with(log_file.map(|file| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(file))))
+        // Both writers run on threads of their own: the control tick logs while it holds the
+        // supervisor lock, and a write to stdout or the flash took up to 45 ms (logwriter.rs).
+        .with(stdout_writer.clone().map(|w| tracing_subscriber::fmt::layer().with_writer(w)))
+        .with(stdout_writer.is_none().then(tracing_subscriber::fmt::layer))
+        .with(log_file.and_then(|file| armd::diagnostics::logwriter::NonBlocking::spawn("armd-log-file", file).ok())
+            .map(|w| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(w)))
         .init();
+    // Writes the queued log lines when main returns, also with an error.
+    let _flush_log = armd::diagnostics::logwriter::FlushOnDrop(Duration::from_millis(500));
     if let Some(warning) = log_warning {
         warn!("{warning}");
     }
@@ -414,6 +421,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(e) = tick_res {
                 control_supervisor.e_stop_latched.store(true, Ordering::SeqCst);
                 error!("Control thread panicked during tick: {:?}", e);
+                armd::diagnostics::logwriter::flush_all(Duration::from_millis(500));
                 std::process::exit(1);
             }
         }

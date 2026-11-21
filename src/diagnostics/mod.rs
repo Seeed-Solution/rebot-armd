@@ -3,6 +3,7 @@
 
 pub mod blackbox;
 pub mod boot;
+pub mod logwriter;
 pub mod rotating;
 pub mod tick;
 
