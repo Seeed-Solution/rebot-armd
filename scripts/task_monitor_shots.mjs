@@ -31,7 +31,10 @@ if (!base) {
   const port = await new Promise((r) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => r(p)); }); });
   armd = spawn(process.env.ARMD_BIN || path.join(root, 'target/debug/armd'),
     ['--follower', 'mock', '--config', path.join(root, 'kits/recamera-b601dm/profile/rebot-b601dm.json'), '--port', String(port),
-      '--log-dir', 'off', '--blackbox-dir', 'off', '--episodes-dir', 'off'], { stdio: ['ignore', 'ignore', 'inherit'] });
+      '--log-dir', 'off', '--blackbox-dir', 'off', '--episodes-dir', 'off'],
+    // cwd = repo root: armd finds assets/reBot-DevArm_gripper.urdf, so the gravity model loads and the
+    // safety card has its gravity-comp switch (the tallest safety card the layout checks must handle)
+    { cwd: root, stdio: ['ignore', 'ignore', 'inherit'] });
   base = `http://127.0.0.1:${port}/`;
   for (let i = 0; i < 100; i++) { try { if ((await fetch(base + 'api/v1/observation')).ok) break; } catch (_) {} await sleep(100); }
 }
@@ -93,6 +96,44 @@ async function openPage({ lang = 'en', ui = 'expert', viewport = { width: 1280, 
 }
 const tkActs = (page) => page.evaluate(() => TK.log.filter((e) => e.type === 'action').map((e) => ({ aid: e.aid, src: e.src, own: e.own, state: e.state })));
 const dupes = (acts) => { const n = {}; for (const a of acts) n[a.aid] = (n[a.aid] || 0) + 1; return Object.entries(n).filter(([, c]) => c > 1); };
+// E-stop fully inside the viewport and the topmost element at its centre; banner top edge not under another element.
+// Run at the initial scroll, with the banner scrolled to the top of its scroller and to the centre, and with every
+// scroller at its end. The banner is checked where it is scrolled to (initial, start, centre); at the end of the
+// scroll it has moved up under the pinned safety card like any other content.
+async function layoutCheck(page, tag) {
+  const probe = (checkBanner) => page.evaluate((cb) => {
+    const es = document.getElementById('btn-estop'), r = es.getBoundingClientRect();
+    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    const estop = { inView: r.width > 0 && r.top >= -0.5 && r.left >= -0.5 && r.bottom <= innerHeight + 0.5 && r.right <= innerWidth + 0.5,
+      top: hit === es || es.contains(hit), hit: hit ? (hit.id || hit.className) : null, r: [r.left, r.top, r.right, r.bottom].map(Math.round) };
+    const b = document.getElementById('ext-banner'), br = b.getBoundingClientRect();
+    const shown = !b.hidden && getComputedStyle(b).display !== 'none' && br.height > 0;
+    let banner = { shown };
+    if (cb && shown) {
+      const y = br.top + 6, xs = [br.left + 12, br.left + br.width / 2, br.right - 12];
+      const hits = xs.map((x) => document.elementFromPoint(x, y));
+      banner = { shown, top: Math.round(br.top), inView: br.top >= 0 && br.top < innerHeight,
+        clear: hits.every((h) => h && b.contains(h)), hits: hits.map((h) => (h ? (h.id || h.className) : null)) };
+    }
+    return { estop, banner };
+  }, checkBanner);
+  const results = [];
+  results.push(['initial', await probe(true)]);
+  await page.evaluate(() => document.getElementById('ext-banner').scrollIntoView({ block: 'start' }));
+  await page.waitForTimeout(150);
+  results.push(['banner at start', await probe(true)]);
+  await page.evaluate(() => document.getElementById('ext-banner').scrollIntoView({ block: 'center' }));
+  await page.waitForTimeout(150);
+  results.push(['banner at centre', await probe(true)]);
+  await page.evaluate(() => { for (const e of [document.scrollingElement, ...document.querySelectorAll('*')]) if (e.scrollHeight > e.clientHeight + 1) e.scrollTop = e.scrollHeight; });
+  await page.waitForTimeout(150);
+  results.push(['scrolled to the end', await probe(false)]);
+  for (const [st, r] of results) {
+    ok(r.estop.inView && r.estop.top, `${tag} ${st}: E-stop fully in view and on top ${JSON.stringify(r.estop)}`);
+    if (r.banner.top !== undefined && r.banner.inView) ok(r.banner.clear, `${tag} ${st}: banner top not covered ${JSON.stringify(r.banner)}`);
+  }
+  await page.evaluate(() => { for (const e of [document.scrollingElement, ...document.querySelectorAll('*')]) if (e.scrollTop) e.scrollTop = 0; });
+}
 const vis = (page, id) => page.evaluate((i) => { const el = document.getElementById(i); if (!el) return false; const r = el.getBoundingClientRect(); return !el.hidden && getComputedStyle(el).display !== 'none' && r.width > 0 && r.height > 0; }, id);
 
 try {
@@ -249,6 +290,8 @@ try {
     ok(lay.sw <= lay.iw, `${tag} expert, external action running: no horizontal scroll (${lay.sw} > ${lay.iw}? off-screen: ${lay.wide.join(',')})`);
     ok(lay.lang.r <= lay.iw + 0.5 && lay.lang.l >= 0, `${tag} language button inside the viewport ${JSON.stringify(lay.lang)}`);
     ok(lay.estop.shown && lay.estop.w > 0 && lay.estop.r <= lay.iw + 0.5, `${tag} E-stop shown and inside the viewport width ${JSON.stringify(lay.estop)}`);
+    ok(await A.page.evaluate(() => !$('btn-gc').hidden), `${tag} gravity-comp row present in the safety card`);
+    await layoutCheck(A.page, `${tag} expert`);
     await A.page.evaluate(() => { const el = $('ext-banner'); el.scrollIntoView({ block: 'center' }); });
     await A.page.waitForTimeout(150);
     ok(await vis(A.page, 'ext-banner'), `${tag} banner shown while the external action runs`);
@@ -284,8 +327,7 @@ try {
     await mcp.release(); mcp.close();
     ok(!A.errs.length, `${tag} no page errors ${JSON.stringify(A.errs)}`);
     await A.ctx.close();
-    if (vp !== '375x812') continue;
-    // simple mode on the phone with an external holder: header fits, the task button opens the drawer
+    // simple mode with an external holder: header fits, the task button shows, E-stop and banner layout
     const Sm = await openPage({ lang, ui: 'simple', viewport });
     const mcp2 = await extClient('rebot-mcp');
     await mcp2.acquire();
@@ -294,6 +336,8 @@ try {
       task: getComputedStyle(document.getElementById('btn-task')).display !== 'none' }));
     ok(sl.sw <= sl.iw && sl.lang <= sl.iw + 0.5, `${tag} simple, external holder: no horizontal scroll, language button in view ${JSON.stringify(sl)}`);
     ok(sl.task, `${tag} simple, external holder: task button shown`);
+    ok(await Sm.page.evaluate(() => !$('btn-gc').hidden), `${tag} simple: gravity-comp row present`);
+    await layoutCheck(Sm.page, `${tag} simple`);
     await shot(Sm.page, `task_banner_simple_${tag}`);
     await mcp2.release(); mcp2.close();
     await Sm.ctx.close();
