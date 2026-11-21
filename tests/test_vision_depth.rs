@@ -66,7 +66,7 @@ async fn spawn_upstream(mode: Arc<Mutex<Mode>>) -> (SocketAddr, Arc<Mutex<Vec<St
                     ),
                     Mode::Busy => ("409 Conflict", "application/json", "", br#"{"api_version":2,"error":"depth busy"}"#.to_vec()),
                     Mode::Slow => {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        tokio::time::sleep(Duration::from_secs(8)).await;
                         ("200 OK", "application/octet-stream", "", depth_body())
                     }
                 };
@@ -109,7 +109,7 @@ async fn depth_map_passes_through_binary() {
     assert_eq!(r.headers()["cache-control"], "no-store");
     let body = r.bytes().await.unwrap();
     assert_eq!(body.as_ref(), depth_body().as_slice());
-    assert_eq!(seen.lock().unwrap().as_slice(), ["GET /api/depth?wait_ms=2500 HTTP/1.1"]);
+    assert_eq!(seen.lock().unwrap().as_slice(), ["GET /api/depth?wait_ms=4500 HTTP/1.1"]);
 }
 
 #[tokio::test]
@@ -162,7 +162,7 @@ async fn depth_map_upstream_errors_pass_through() {
 }
 
 #[tokio::test]
-async fn depth_map_times_out_at_3_s_and_502_when_down() {
+async fn depth_map_times_out_at_6_s_and_502_when_down() {
     let mode = Arc::new(Mutex::new(Mode::Slow));
     let (up, _) = spawn_upstream(mode).await;
     let addr = spawn_armd(&format!("http://{up}"), OperatorAuth::disabled()).await;
@@ -171,7 +171,7 @@ async fn depth_map_times_out_at_3_s_and_502_when_down() {
     let dt = t0.elapsed();
     assert_eq!(r.status(), 504);
     assert_eq!(r.json::<serde_json::Value>().await.unwrap(), serde_json::json!({"error": "detector timed out"}));
-    assert!(dt >= Duration::from_millis(2900) && dt < Duration::from_millis(4000), "timeout {dt:?}");
+    assert!(dt >= Duration::from_millis(5900) && dt < Duration::from_millis(7000), "timeout {dt:?}");
 
     let port = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
     let addr = spawn_armd(&format!("http://127.0.0.1:{port}"), OperatorAuth::disabled()).await;

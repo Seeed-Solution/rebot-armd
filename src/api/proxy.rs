@@ -493,14 +493,14 @@ fn trigger_body_wait_ms(body: &[u8]) -> Option<u64> {
 }
 
 /// Upstream `/api/depth` waits this long for its frame; armd gives the exchange [`DEPTH_TIMEOUT`].
-const DEPTH_WAIT_MS: u64 = 2500;
-const DEPTH_TIMEOUT: Duration = Duration::from_millis(3000);
+const DEPTH_WAIT_MS: u64 = 4500;
+const DEPTH_TIMEOUT: Duration = Duration::from_millis(6000);
 
-/// GET /api/v1/vision/depth -> upstream GET /api/depth?wait_ms=2500: one depth inference on a
+/// GET /api/v1/vision/depth -> upstream GET /api/depth?wait_ms=4500: one depth inference on a
 /// fresh frame, returned as rebot-vision's binary millimetre map (`application/octet-stream`,
 /// "RDM1" body, see docs/detection_api.md). Status, body, `Content-Type` and `Retry-After` pass
 /// through (409 unavailable / not metric / busy, 429 more than one per second, 503, 504);
-/// unreachable -> 502, no reply within 3 s -> 504 `{"error":"detector timed out"}`.
+/// unreachable -> 502, no reply within 6 s -> 504 `{"error":"detector timed out"}`.
 pub async fn get_vision_depth(Extension(up): Extension<DetectorUpstream>) -> Response {
     let path = format!("/api/depth?wait_ms={DEPTH_WAIT_MS}");
     match tokio::time::timeout(DEPTH_TIMEOUT, upstream_request(&up, Method::GET, &path, None)).await {
