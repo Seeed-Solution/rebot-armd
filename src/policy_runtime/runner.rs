@@ -32,6 +32,13 @@ pub const DEFAULT_MAX_FIRST_STEP_RAD: f32 = 0.25;
 /// Bounds of [`max_policy_input_age_ms`].
 pub const MIN_POLICY_INPUT_AGE_MS: u64 = 50;
 pub const MAX_POLICY_INPUT_AGE_MS: u64 = 200;
+/// Warm-up inferences run before a policy run starts; the first one is discarded.
+pub const WARMUP_INFERENCES: usize = 10;
+/// Upper bound of the whole warm-up. Inference cannot be interrupted, so the warm-up stops
+/// after the inference that crosses this bound and reports the samples taken so far.
+pub const WARMUP_MAX_TOTAL: Duration = Duration::from_secs(5);
+/// A live run is refused when the warm-up p50 exceeds this fraction of the period.
+pub const SPEED_GATE_PERIOD_FRACTION: f64 = 0.5;
 
 /// Largest age of the joint positions a live target was computed from, measured from the
 /// driver's feedback capture to the commit under the supervisor lock: two policy periods
@@ -105,6 +112,69 @@ impl PolicyRun {
             stop_reason: self.stop_reason.clone(),
         }
     }
+}
+
+/// Warm-up inference time, published in the start ACK as `warmup_infer_us`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WarmupInferUs {
+    pub p50: u64,
+    pub max: u64,
+    /// Samples behind `p50` / `max` (the first inference is discarded when more than one ran).
+    pub n: u64,
+}
+
+/// Result of the start speed gate: the warm-up against the run's period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeedGateReport {
+    pub warmup: WarmupInferUs,
+    pub period_us: u64,
+    /// Highest rate the model holds by the gate rule: floor(0.5 / p50).
+    pub max_fps: u64,
+    /// p50 above [`SPEED_GATE_PERIOD_FRACTION`] of the period.
+    pub too_slow: bool,
+}
+
+impl SpeedGateReport {
+    pub fn new(warmup: WarmupInferUs, fps: f64) -> Self {
+        let period_us = period_us_for_fps(fps);
+        let too_slow = warmup.p50 as f64 > SPEED_GATE_PERIOD_FRACTION * period_us as f64;
+        let max_fps = (SPEED_GATE_PERIOD_FRACTION * 1e6 / warmup.p50.max(1) as f64).floor() as u64;
+        Self { warmup, period_us, max_fps, too_slow }
+    }
+
+    /// A live run (any mode that commands the arm, `live_sim` included) is refused with
+    /// `POLICY_TOO_SLOW` when the model is too slow; a shadow run starts.
+    pub fn check(&self, mode: PolicyMode) -> Result<(), ArmError> {
+        if mode != PolicyMode::Live || !self.too_slow {
+            return Ok(());
+        }
+        Err(ArmError::Rejected {
+            status: 422,
+            code: "POLICY_TOO_SLOW".into(),
+            message: format!(
+                "Policy inference is too slow for this rate: warm-up p50 {} us, max {} us (n={}) exceeds 50% of the {} us period; this model holds at most {} fps on this device",
+                self.warmup.p50, self.warmup.max, self.warmup.n, self.period_us, self.max_fps
+            ),
+        })
+    }
+
+    /// Fields added to the start ACK (and to a `POLICY_TOO_SLOW` reject).
+    pub fn ack_fields(&self) -> [(&'static str, Value); 4] {
+        [
+            ("warmup_infer_us", serde_json::json!(self.warmup)),
+            ("too_slow", Value::Bool(self.too_slow)),
+            ("period_us", serde_json::json!(self.period_us)),
+            ("max_fps", serde_json::json!(self.max_fps)),
+        ]
+    }
+}
+
+/// Period in microseconds for a positive finite rate (0 otherwise).
+pub fn period_us_for_fps(fps: f64) -> u64 {
+    if !fps.is_finite() || fps <= 0.0 {
+        return 0;
+    }
+    (1e6 / fps).round() as u64
 }
 
 /// Parameters for `SupervisorInner::begin_policy_run`.
@@ -381,6 +451,51 @@ impl PreparedPolicy {
 
     pub fn contract(&self) -> &StrictPolicyContract {
         &self.contract
+    }
+
+    /// Test hook: every inference sleeps `delay` first (see
+    /// `SandboxState::set_policy_infer_delay_ms`).
+    #[doc(hidden)]
+    pub fn with_infer_delay(mut self, delay: Duration) -> Self {
+        struct Delayed(Box<dyn PolicyBackend>, Duration);
+        impl PolicyBackend for Delayed {
+            fn backend_name(&self) -> &'static str { self.0.backend_name() }
+            fn input_dim(&self) -> usize { self.0.input_dim() }
+            fn output_dim(&self) -> usize { self.0.output_dim() }
+            fn infer(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), PolicyError> {
+                std::thread::sleep(self.1);
+                self.0.infer(input, output)
+            }
+        }
+        let inner = self.backend;
+        self.backend = Box::new(Delayed(inner, delay));
+        self
+    }
+
+    /// Run `n` inferences on the model's input shape and measure them; the first one is
+    /// discarded when more than one ran. Stops early once `max_total` has elapsed.
+    pub fn warmup(&mut self, n: usize, max_total: Duration) -> Result<WarmupInferUs, PolicyError> {
+        let n = n.clamp(1, WARMUP_INFERENCES);
+        let mut samples = [0u64; WARMUP_INFERENCES];
+        let mut taken = 0usize;
+        let started = Instant::now();
+        for _ in 0..n {
+            let t0 = Instant::now();
+            self.backend.infer(&self.infer_in, &mut self.infer_out)?;
+            samples[taken] = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            taken += 1;
+            if started.elapsed() >= max_total {
+                break;
+            }
+        }
+        self.infer_out.fill(0.0);
+        let kept = if taken > 1 { &mut samples[1..taken] } else { &mut samples[..taken] };
+        kept.sort_unstable();
+        Ok(WarmupInferUs {
+            p50: kept[(kept.len() - 1) / 2],
+            max: kept[kept.len() - 1],
+            n: kept.len() as u64,
+        })
     }
 
     /// Run one full state -> units -> normalize -> infer -> denormalize -> radians -> reorder step.

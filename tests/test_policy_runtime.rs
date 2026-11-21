@@ -7050,3 +7050,149 @@ mod review_fix_tests {
     }
 }
 
+
+/// Start speed gate: warm-up inference time against the run's period.
+mod speed_gate_tests {
+    use super::review_fix_tests::{prepared_with, DelayBackend};
+    use super::*;
+    use armd::policy_runtime::{SpeedGateReport, WARMUP_INFERENCES, WARMUP_MAX_TOTAL};
+
+    type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+    pub(super) async fn ws_cmd(ws: &mut Ws, req_id: u64, gen: u64, path: &str, body: serde_json::Value) -> serde_json::Value {
+        ws.send(Message::Text(
+            serde_json::json!({"type": "command", "request_id": req_id, "generation": gen, "epoch_id": 1, "path": path, "body": body})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let txt = ws.next().await.unwrap().unwrap().into_text().unwrap();
+                let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+                if (v["type"] == "command_ack" || v["type"] == "command_reject") && v["request_id"] == req_id {
+                    return v;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Server with a 50 Hz tick, one uploaded pack and a WS holding the lease with torque on.
+    pub(super) async fn rig(policy_id: &str) -> (Arc<ArmSupervisor>, Arc<SandboxState>, SocketAddr, Ws, u64, tempfile::TempDir) {
+        let sandbox_dir = tempdir().unwrap();
+        let sandbox = Arc::new(SandboxState::new(sandbox_dir.path().to_path_buf()));
+        let sup = Arc::new(ArmSupervisor::new(make_6dof_config()));
+        let router = create_router_with_sandbox(sup.clone(), OperatorAuth::disabled(), sandbox.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let tick_sup = sup.clone();
+        tokio::spawn(async move {
+            loop {
+                tick_sup.tick(0.02).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let client = reqwest::Client::new();
+        upload_rmlp_pack(&client, addr, policy_id, vec![0.0; 6], serde_json::json!({})).await;
+        let (mut ws, _) = connect_async(format!("ws://{addr}/api/v1/ws")).await.unwrap();
+        ws.send(Message::Text(serde_json::json!({"type": "acquire_lease", "client_id": "speed"}).to_string().into()))
+            .await
+            .unwrap();
+        let gen = loop {
+            let msg: serde_json::Value = serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+            if msg["type"] == "lease_granted" {
+                break msg["generation"].as_u64().unwrap();
+            }
+        };
+        let ack = ws_cmd(&mut ws, 1, gen, "/api/v1/torque", serde_json::json!({"enable": true})).await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        (sup, sandbox, addr, ws, gen, sandbox_dir)
+    }
+
+    #[test]
+    fn slow_backend_is_too_slow_for_live_and_allowed_for_shadow() {
+        let cfg = make_6dof_config();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut prepared = prepared_with(&cfg, Box::new(DelayBackend { sleep_ms: 30, out: vec![0.0; 6], calls: calls.clone() }), serde_json::json!({}));
+        let warmup = prepared.warmup(WARMUP_INFERENCES, WARMUP_MAX_TOTAL).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), WARMUP_INFERENCES);
+        assert_eq!(warmup.n, (WARMUP_INFERENCES - 1) as u64, "first inference discarded");
+        assert!(warmup.p50 >= 30_000 && warmup.max >= warmup.p50, "{warmup:?}");
+
+        // 25 fps: period 40 ms, the gate is p50 > 20 ms
+        let report = SpeedGateReport::new(warmup, 25.0);
+        assert_eq!(report.period_us, 40_000);
+        assert!(report.too_slow);
+        assert_eq!(report.max_fps, 500_000 / warmup.p50);
+        assert!(report.max_fps <= 16, "{report:?}");
+        let err = report.check(PolicyMode::Live).unwrap_err();
+        let ArmError::Rejected { status, code, message } = err else { panic!("unexpected {err:?}") };
+        assert_eq!((status, code.as_str()), (422, "POLICY_TOO_SLOW"));
+        for part in [
+            format!("p50 {} us", warmup.p50),
+            format!("max {} us", warmup.max),
+            "40000 us period".to_string(),
+            format!("at most {} fps", report.max_fps),
+        ] {
+            assert!(message.contains(&part), "{message} lacks {part}");
+        }
+        report.check(PolicyMode::Shadow).unwrap();
+
+        // the same model at 5 fps (period 200 ms) passes
+        let slow_rate = SpeedGateReport::new(warmup, 5.0);
+        assert!(!slow_rate.too_slow);
+        slow_rate.check(PolicyMode::Live).unwrap();
+    }
+
+    #[test]
+    fn warmup_stops_at_its_time_bound() {
+        let cfg = make_6dof_config();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut prepared = prepared_with(&cfg, Box::new(DelayBackend { sleep_ms: 100, out: vec![0.0; 6], calls: calls.clone() }), serde_json::json!({}));
+        let warmup = prepared.warmup(WARMUP_INFERENCES, Duration::from_millis(250)).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(warmup.n, 2);
+    }
+
+    #[tokio::test]
+    async fn ws_live_start_refused_when_too_slow_and_shadow_starts_flagged() {
+        let (_sup, sandbox, _addr, mut ws, gen, _dir) = rig("slow_pol").await;
+
+        // fast model: the ACK carries the warm-up and too_slow false
+        let ack = ws_cmd(&mut ws, 2, gen, "/api/v1/action/policy/start", serde_json::json!({"policy_id": "slow_pol", "mode": "live", "fps": 25.0, "max_seconds": 5.0})).await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        assert_eq!(ack["too_slow"], false, "{ack}");
+        assert_eq!(ack["warmup_infer_us"]["n"], 9, "{ack}");
+        assert!(ack["warmup_infer_us"]["p50"].as_u64().is_some() && ack["warmup_infer_us"]["max"].as_u64().is_some(), "{ack}");
+        assert_eq!(ack["period_us"], 40_000);
+        let stop = ws_cmd(&mut ws, 3, gen, "/api/v1/action/policy/stop", serde_json::json!({})).await;
+        assert_eq!(stop["type"], "command_ack", "{stop}");
+
+        // every inference now takes >= 30 ms; at 25 fps the gate is 20 ms
+        sandbox.set_policy_infer_delay_ms(30);
+        for (i, mode) in ["live", "live_sim"].into_iter().enumerate() {
+            let rej = ws_cmd(&mut ws, 10 + i as u64, gen, "/api/v1/action/policy/start", serde_json::json!({"policy_id": "slow_pol", "mode": mode, "fps": 25.0, "max_seconds": 5.0})).await;
+            assert_eq!(rej["type"], "command_reject", "{mode}: {rej}");
+            assert_eq!(rej["code"], "POLICY_TOO_SLOW", "{mode}: {rej}");
+            assert_eq!(rej["too_slow"], true, "{rej}");
+            let p50 = rej["warmup_infer_us"]["p50"].as_u64().unwrap();
+            assert!(p50 >= 30_000, "{rej}");
+            let msg = rej["message"].as_str().unwrap();
+            assert!(msg.contains(&format!("p50 {p50} us")) && msg.contains("40000 us period") && msg.contains(&format!("at most {} fps", rej["max_fps"])), "{msg}");
+        }
+
+        let ack = ws_cmd(&mut ws, 20, gen, "/api/v1/action/policy/start", serde_json::json!({"policy_id": "slow_pol", "mode": "shadow", "fps": 25.0, "max_seconds": 5.0})).await;
+        assert_eq!(ack["type"], "command_ack", "{ack}");
+        assert_eq!(ack["too_slow"], true, "{ack}");
+        assert!(ack["warmup_infer_us"]["p50"].as_u64().unwrap() >= 30_000, "{ack}");
+        assert_eq!(ack["warmup_infer_us"]["n"], 9, "{ack}");
+        assert!(ack["max_fps"].as_u64().unwrap() <= 16, "{ack}");
+        let stop = ws_cmd(&mut ws, 21, gen, "/api/v1/action/policy/stop", serde_json::json!({})).await;
+        assert_eq!(stop["stopped"], true, "{stop}");
+    }
+}
+

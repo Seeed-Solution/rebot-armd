@@ -1330,7 +1330,11 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 code: "POLICY_NOT_FOUND".into(),
                                 message: format!("Policy pack '{policy_id_load}' not found"),
                             })?;
-                            let prepared_policy = crate::policy_runtime::prepare_policy(&dir, &config).map_err(ArmError::from)?;
+                            let mut prepared_policy = crate::policy_runtime::prepare_policy(&dir, &config).map_err(ArmError::from)?;
+                            let infer_delay_ms = sandbox_load.policy_infer_delay_ms();
+                            if infer_delay_ms > 0 {
+                                prepared_policy = prepared_policy.with_infer_delay(std::time::Duration::from_millis(infer_delay_ms));
+                            }
                             let effective_fps = request_fps
                                 .or(prepared_policy.contract().fps)
                                 .unwrap_or(crate::policy_runtime::DEFAULT_POLICY_FPS);
@@ -1358,7 +1362,12 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                             } else {
                                 None
                             };
-                            Ok::<_, ArmError>((prepared_policy, effective_fps, verified_release_gate))
+                            // speed gate: measured here, off the supervisor lock and the control tick
+                            let warmup = prepared_policy
+                                .warmup(crate::policy_runtime::WARMUP_INFERENCES, crate::policy_runtime::WARMUP_MAX_TOTAL)
+                                .map_err(ArmError::from)?;
+                            let speed = crate::policy_runtime::SpeedGateReport::new(warmup, effective_fps);
+                            Ok::<_, ArmError>((prepared_policy, effective_fps, verified_release_gate, speed))
                         }).await;
 
                         if ws_closed_c.load(Ordering::SeqCst) {
@@ -1378,7 +1387,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 loading_guard.clear(&mut inner);
                                 command_reject(&inner, &request_id, error.into())
                             }
-                            Ok(Ok((prepared_policy, fps, verified_release_gate))) => {
+                            Ok(Ok((prepared_policy, fps, verified_release_gate, speed))) => {
                                 let deadline_res = crate::policy_runtime::compute_policy_deadline(pending.request.max_seconds)
                                     .map_err(ArmError::from);
 
@@ -1396,6 +1405,10 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                 } else if auth_c.is_enforced() && !inner.policy_live_allowed() && !auth_c.is_operator(ws_token_c.as_deref()) {
                                     // the operator session may have expired or been locked while loading
                                     command_reject(&inner, &request_id, ApiError::operator_required("policy/start (real arm)"))
+                                } else if let Err(err) = speed.check(request_mode) {
+                                    let mut reply = command_reject(&inner, &request_id, err.into());
+                                    for (k, v) in speed.ack_fields() { reply[k] = v; }
+                                    reply
                                 } else {
                                     match deadline_res {
                                         Err(err) => command_reject(&inner, &request_id, err.into()),
@@ -1458,6 +1471,7 @@ async fn handle_socket(socket: WebSocket, supervisor: Arc<ArmSupervisor>, deps: 
                                                     ack["artifact_digest"] = json!(digest);
                                                     ack["backend"] = json!(backend);
                                                     ack["mode"] = json!(mode_str);
+                                                    for (k, v) in speed.ack_fields() { ack[k] = v; }
                                                     ack
                                                 }
                                                 Err(error) => command_reject(&inner, &request_id, error.into()),

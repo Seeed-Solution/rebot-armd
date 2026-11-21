@@ -416,6 +416,8 @@ pub struct SandboxState {
     pub cached_mjcf: RwLock<String>,
     #[cfg(feature = "policy-runtime")]
     policy_load_delay_ms: AtomicU64,
+    #[cfg(feature = "policy-runtime")]
+    policy_infer_delay_ms: AtomicU64,
 }
 
 impl SandboxState {
@@ -437,6 +439,8 @@ impl SandboxState {
             cached_mjcf: RwLock::new(String::new()),
             #[cfg(feature = "policy-runtime")]
             policy_load_delay_ms: AtomicU64::new(0),
+            #[cfg(feature = "policy-runtime")]
+            policy_infer_delay_ms: AtomicU64::new(0),
         }
     }
 
@@ -448,6 +452,18 @@ impl SandboxState {
     #[cfg(feature = "policy-runtime")]
     pub fn policy_load_delay_ms(&self) -> u64 {
         self.policy_load_delay_ms.load(Ordering::Relaxed)
+    }
+
+    /// Test hook: policies loaded for a run sleep this long before every inference
+    /// (warm-up included). 0 = off.
+    #[cfg(feature = "policy-runtime")]
+    pub fn set_policy_infer_delay_ms(&self, ms: u64) {
+        self.policy_infer_delay_ms.store(ms, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "policy-runtime")]
+    pub fn policy_infer_delay_ms(&self) -> u64 {
+        self.policy_infer_delay_ms.load(Ordering::Relaxed)
     }
 
     /// Return the active `(scene_id, tool_id)`, defaulting empty strings to `"default"`.
